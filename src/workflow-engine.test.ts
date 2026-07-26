@@ -566,15 +566,16 @@ import type { LocalAgentProfile } from "./local-agent-profiles.js";
   await writeFile(
     childPath,
     `
-export const meta = { name: 'child', description: 'nested' }
+export const meta = { name: 'child', description: 'nested', defaultProvider: 'claude' }
 return await agent('nested-prompt')
 `,
   );
 
   const prompts: string[] = [];
+  const providers: string[] = [];
   const { result, callCount } = await executeWorkflow({
     source: `
-export const meta = { name: 'parent', description: 'p' }
+export const meta = { name: 'parent', description: 'p', defaultProvider: 'codex' }
 const a = await agent('parent-prompt')
 const nested = await workflow({ scriptPath: ${JSON.stringify(childPath)} })
 return { a, nested }
@@ -582,9 +583,10 @@ return { a, nested }
     runId: run.id,
     journal: store,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    enabledProviders: ["codex", "claude"],
     runProvider: async (input) => {
       prompts.push(input.prompt);
+      providers.push(input.provider);
       return { finalResponse: `R:${input.prompt}` };
     },
     resolveNestedSource: async (ref) => {
@@ -602,6 +604,7 @@ return { a, nested }
   });
   assert.equal(callCount, 2);
   assert.deepEqual(prompts, ["parent-prompt", "nested-prompt"]);
+  assert.deepEqual(providers, ["codex", "claude"]);
 
   // depth 2 must fail
   await assert.rejects(

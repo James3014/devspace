@@ -172,6 +172,7 @@ export interface WorkflowApiDeps {
     nestDepth: number;
   }) => Promise<unknown>;
   nestDepth?: number;
+  runtime?: WorkflowApiRuntime;
 }
 
 export interface WorkflowApi extends WorkflowSandboxApi {
@@ -242,6 +243,18 @@ export class WorkflowSemaphore {
   }
 }
 
+export interface WorkflowApiRuntime {
+  semaphore: WorkflowSemaphore;
+  callIndex: number;
+}
+
+export function createWorkflowApiRuntime(concurrency: number): WorkflowApiRuntime {
+  return {
+    semaphore: new WorkflowSemaphore(Math.max(1, concurrency)),
+    callIndex: 0,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // API factory
 // ---------------------------------------------------------------------------
@@ -250,8 +263,8 @@ const phaseAls = new AsyncLocalStorage<string>();
 
 export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
   const nestDepth = deps.nestDepth ?? 0;
-  const semaphore = new WorkflowSemaphore(Math.max(1, deps.concurrency));
-  let callIndex = 0;
+  const runtime = deps.runtime ?? createWorkflowApiRuntime(deps.concurrency);
+  const semaphore = runtime.semaphore;
 
   const agent = async (prompt: unknown, opts: unknown = {}): Promise<unknown> => {
     if (typeof prompt !== "string" || !prompt.trim()) {
@@ -272,8 +285,8 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
     const phase = agentOpts.phase ?? phaseAls.getStore();
     const isolation: AgentIsolationMode =
       agentOpts.isolation === "worktree" ? "worktree" : "shared";
-    const index = callIndex;
-    callIndex += 1;
+    const index = runtime.callIndex;
+    runtime.callIndex += 1;
 
     const cacheKeyInput = buildAgentCacheKeyInput({
       prompt,
@@ -664,7 +677,7 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
     budget: createStubBudget(),
     workflow: workflow as WorkflowSandboxApi["workflow"],
     meta: deps.meta,
-    getCallCount: () => callIndex,
+    getCallCount: () => runtime.callIndex,
     getNestDepth: () => nestDepth,
   };
 }
