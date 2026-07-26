@@ -85,6 +85,7 @@ try {
     callIndex: 0,
     responseText: "done",
     structuredJson: JSON.stringify({ ok: true }),
+    returnValueJson: JSON.stringify({ ok: true, exact: true }),
     providerSessionId: "sess_1",
     dirty: true,
   });
@@ -95,6 +96,7 @@ try {
   assert.equal(call?.providerSessionId, "sess_1");
   assert.equal(call?.effort, "high");
   assert.equal(call?.prompt, "review");
+  assert.equal(call?.returnValueJson, JSON.stringify({ ok: true, exact: true }));
   assert.equal(call?.replayReason, "identity_changed:prompt");
 
   store.beginAgentCall({

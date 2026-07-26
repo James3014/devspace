@@ -60,6 +60,7 @@ export const WORKFLOW_LIMITS = {
   eventDataJsonBytes: 8 * 1024,
   responseTextBytes: 1 * 1024 * 1024,
   structuredJsonBytes: 256 * 1024,
+  replayValueJsonBytes: 1 * 1024 * 1024,
   resultJsonBytes: 256 * 1024,
   argsJsonBytes: 64 * 1024,
   scriptSourceBytes: 512 * 1024,
@@ -149,6 +150,7 @@ export interface WorkflowAgentCallRecord {
   providerSessionId?: string;
   responseText?: string;
   structuredJson?: string;
+  returnValueJson?: string;
   error?: string;
   errorKind?: WorkflowErrorKind;
   replayMatch?: "same_index" | "compatible_key";

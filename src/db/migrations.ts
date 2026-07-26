@@ -37,6 +37,11 @@ const migrations: Migration[] = [
     name: "workflow-replay-provenance",
     up: migrateWorkflowReplayProvenance,
   },
+  {
+    version: 7,
+    name: "workflow-exact-replay",
+    up: migrateWorkflowExactReplay,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -270,6 +275,7 @@ function migrateWorkflowJournal(sqlite: Database.Database): void {
       provider_session_id text,
       response_text text,
       structured_json text,
+      return_value_json text,
       error text,
       isolation text not null default 'shared',
       worktree_path text,
@@ -300,6 +306,10 @@ function migrateWorkflowReplayProvenance(sqlite: Database.Database): void {
     create index if not exists workflow_agent_calls_replay_source_idx
       on workflow_agent_calls(replayed_from_run_id, replayed_from_call_index);
   `);
+}
+
+function migrateWorkflowExactReplay(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "workflow_agent_calls", "return_value_json", "text");
 }
 
 function addColumnIfMissing(

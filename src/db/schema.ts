@@ -169,6 +169,7 @@ export const workflowAgentCalls = sqliteTable(
     providerSessionId: text("provider_session_id"),
     responseText: text("response_text"),
     structuredJson: text("structured_json"),
+    returnValueJson: text("return_value_json"),
     error: text("error"),
     errorKind: text("error_kind"),
     replayMatch: text("replay_match"),
