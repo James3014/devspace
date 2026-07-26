@@ -100,14 +100,16 @@ Failed and cancelled runs are terminal. Recovery creates a **new** run:
 4. Run `devspace workflow run --resume <runId>` (optionally with
    `--script-path <path>`).
 
-Replay first matches the same call index and cache key, then consumes one
-compatible prior cache key after reordering. The new run records whether each
-call was reused by same-index or compatible-key matching, and where it came
-from. Failed, interrupted, changed, or unmatched calls execute live.
+Replay walks the prior run in call-index order and reuses the longest unchanged
+prefix. The first failed, interrupted, changed, missing, corrupt, or unavailable
+result executes live and closes replay for every later call, even when a later
+cache key happens to match. Exact return values are stored separately from
+bounded UI previews.
 
-Replay restores an agent's **return value**. It does not recreate shared-checkout
-edits or reapply a prior worktree diff. Verify required filesystem state before
-depending on a replayed mutating call.
+Replay restores an agent's **return value**, not its execution. Shared-checkout
+calls assume their existing filesystem effects are still present. Worktree calls
+are never reused unless their exact worktree can be restored, so they currently
+end the reusable prefix and run live.
 
 ### Cancel
 
