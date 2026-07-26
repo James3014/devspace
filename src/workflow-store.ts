@@ -749,27 +749,26 @@ export class WorkflowStore {
   }
 
   /**
-   * Mark running runs with a dead worker as failed.
-   * staleBeforeMs: heartbeat older than this AND pid not alive.
+   * Mark abandoned starting runs and running runs with a dead worker as failed.
+   * staleBeforeMs: start/update or heartbeat older than this and no live pid.
    */
   reapStale(staleBeforeMs = 60_000, nowMs = Date.now()): WorkflowRunRecord[] {
     const cutoff = new Date(nowMs - staleBeforeMs).toISOString();
     const candidates = this.database.sqlite
       .prepare(
         `select * from workflow_runs
-         where status = 'running'
-           and heartbeat_at is not null
-           and heartbeat_at < ?`,
+         where (status = 'running' and heartbeat_at is not null and heartbeat_at < ?)
+            or (status = 'starting' and updated_at < ?)`,
       )
-      .all(cutoff) as WorkflowRunRow[];
+      .all(cutoff, cutoff) as WorkflowRunRow[];
 
     const reaped: WorkflowRunRecord[] = [];
     for (const row of candidates) {
       if (row.pid !== null && isPidAlive(row.pid)) continue;
       const latest = this.getRun(row.id);
-      if (!latest || latest.status !== "running") continue;
+      if (!latest || (latest.status !== "running" && latest.status !== "starting")) continue;
       const failed = this.failRun(row.id, {
-        error: "worker heartbeat lost",
+        error: latest.status === "starting" ? "workflow worker failed to start" : "worker heartbeat lost",
         errorKind: "heartbeat",
       });
       if (failed.status === "failed" && failed.errorKind === "heartbeat") {

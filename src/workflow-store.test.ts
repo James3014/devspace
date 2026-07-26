@@ -193,6 +193,25 @@ try {
   assert.equal(store.getRun(run3.id)?.errorKind, "heartbeat");
   assert.equal(store.listEvents(run3.id).at(-1)?.type, "run_failed");
 
+  const runStarting = store.createRun({
+    name: "never-started",
+    source: "inline",
+    scriptPath: join(root, "never.js"),
+    scriptHash: "never",
+    workspaceRoot: join(root, "project"),
+  });
+  const staleStartingDb = openDatabase(root);
+  try {
+    staleStartingDb.sqlite
+      .prepare(`update workflow_runs set updated_at = ? where id = ?`)
+      .run(new Date(Date.now() - 120_000).toISOString(), runStarting.id);
+  } finally {
+    staleStartingDb.close();
+  }
+  const reapedStarting = store.reapStale(60_000);
+  assert.ok(reapedStarting.some((entry) => entry.id === runStarting.id));
+  assert.equal(store.getRun(runStarting.id)?.status, "failed");
+
   const run4 = store.createRun({
     name: "seq",
     source: "inline",

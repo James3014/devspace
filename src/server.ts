@@ -48,6 +48,7 @@ import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 import { summarizeLocalAgentProfile } from "./local-agent-profiles.js";
 import { registerWorkflowTools } from "./workflow-tools.js";
+import { startWorkflowReaper } from "./workflow-lifecycle.js";
 import { createWorkflowStore } from "./workflow-store.js";
 import { loadActiveWorkflowSummaries } from "./workflow-ui.js";
 import {
@@ -1659,6 +1660,15 @@ export function createServer(config = loadConfig()): RunningServer {
   const localAgentProviders = config.subagents
     ? getLocalAgentProviderAvailabilitySnapshot()
     : [];
+  const workflowReaper = config.subagents
+    ? startWorkflowReaper(config, {
+        onError: (error) => {
+          logEvent(config.logging, "warn", "workflow_reaper_failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        },
+      })
+    : undefined;
 
   const logSessionCloseResults = (
     reason: "idle_timeout" | "server_shutdown",
@@ -1846,6 +1856,7 @@ export function createServer(config = loadConfig()): RunningServer {
     close: () => {
       closePromise ??= (async () => {
         clearInterval(sessionCleanupTimer);
+        workflowReaper?.close();
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
         processSessions.shutdown();

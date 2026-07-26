@@ -21,6 +21,7 @@ import {
 } from "./workflow-types.js";
 import { resolveWorkspaceHead } from "./workflow-worktrees.js";
 import { spawnWorkflowWorkerFromCli } from "./workflow-cli.js";
+import { cancelWorkflowRun } from "./workflow-lifecycle.js";
 import { getLocalAgentProviderAvailabilitySnapshot } from "./local-agent-availability.js";
 import {
   isLocalAgentProvider,
@@ -268,17 +269,7 @@ export function registerWorkflowTools(
     async ({ runId }) => {
       const store = createWorkflowStore(config);
       try {
-        const requested = store.requestCancelResult(runId);
-        if (requested.isErr()) throw requested.error;
-        const run = requested.value;
-        if (run.pid && (run.status === "running" || run.status === "starting")) {
-          try {
-            process.kill(run.pid, "SIGTERM");
-          } catch {
-            // already gone
-          }
-        }
-        const latest = store.getRun(runId)!;
+        const latest = await cancelWorkflowRun(store, runId);
         return {
           content: [{ type: "text" as const, text: JSON.stringify({ runId, status: latest.status }) }],
           structuredContent: { runId, status: latest.status },

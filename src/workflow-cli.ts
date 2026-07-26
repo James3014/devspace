@@ -21,10 +21,13 @@ import {
   resolveWorkflowScriptFromPathOrNameResult,
 } from "./workflow-files.js";
 import { createWorkflowReplay } from "./workflow-replay.js";
+import {
+  cancelWorkflowRun,
+  reapStaleWorkflows,
+} from "./workflow-lifecycle.js";
 import { parseWorkflowScript } from "./workflow-script.js";
 import { createWorkflowStore, type WorkflowStore } from "./workflow-store.js";
 import {
-  WORKFLOW_CANCEL_HARD_MS,
   WORKFLOW_HEARTBEAT_MS,
   WORKFLOW_LIMITS,
   resolveWorkflowConcurrency,
@@ -234,6 +237,7 @@ async function runWorkflowStatus(args: string[], config: ServerConfig): Promise<
 
   const store = createWorkflowStore(config);
   try {
+    reapStaleWorkflows(store);
     const runResult = store.getRunResult(runId);
     if (runResult.isErr()) throw runResult.error;
     const run = runResult.value;
@@ -256,36 +260,8 @@ async function runWorkflowCancel(args: string[], config: ServerConfig): Promise<
   if (!runId) throw new Error("Usage: devspace workflow cancel <runId>");
   const store = createWorkflowStore(config);
   try {
-    const requested = store.requestCancelResult(runId);
-    if (requested.isErr()) throw requested.error;
-    const run = requested.value;
-    console.log(formatRunLine(run));
-    if (run.pid && (run.status === "running" || run.status === "starting")) {
-      try {
-        process.kill(run.pid, "SIGTERM");
-      } catch {
-        // already dead
-      }
-      await sleep(WORKFLOW_CANCEL_HARD_MS);
-      const again = store.getRun(runId);
-      if (again && (again.status === "running" || again.status === "starting") && again.pid) {
-        try {
-          process.kill(-again.pid, "SIGKILL");
-        } catch {
-          try {
-            process.kill(again.pid, "SIGKILL");
-          } catch {
-            // gone
-          }
-        }
-        const latest = store.getRun(runId);
-        if (latest && (latest.status === "running" || latest.status === "starting")) {
-          const cancelled = store.cancelRunResult(runId, "cancelled (hard kill)");
-          if (cancelled.isErr()) throw cancelled.error;
-        }
-      }
-    }
-    console.log(formatRunLine(store.getRun(runId)!));
+    reapStaleWorkflows(store);
+    console.log(formatRunLine(await cancelWorkflowRun(store, runId)));
   } finally {
     store.close();
   }
@@ -294,6 +270,7 @@ async function runWorkflowCancel(args: string[], config: ServerConfig): Promise<
 async function runWorkflowList(config: ServerConfig): Promise<void> {
   const store = createWorkflowStore(config);
   try {
+    reapStaleWorkflows(store);
     const runs = store.listRuns(50);
     if (runs.length === 0) {
       console.log("No workflow runs.");
