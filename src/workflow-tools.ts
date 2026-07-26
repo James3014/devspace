@@ -47,7 +47,7 @@ const WORKFLOW_UI_WAIT_MAX_MS = 30_000;
 const WORKFLOW_API_CHEATSHEET = `
 Workflow scripts (JS only):
   export const meta = { name, description, phases?, defaultProvider?, concurrency? }
-  agent(prompt, { label?, phase?, schema?, model?, effort?, provider?, isolation?: 'worktree' })
+  agent(prompt, { label?, phase?, schema?, model?, effort?, profile? | provider?, isolation?: 'worktree' })
   parallel(thunks) → Array<T|null>   // barrier; throw → null
   pipeline(items, ...stages)        // no cross-item barrier
   phase(title); log(msg); args
