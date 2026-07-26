@@ -23,6 +23,8 @@ function call(
 function identity(prompt = "prompt") {
   return {
     prompt,
+    profileName: null,
+    profileFingerprint: null,
     provider: "codex" as const,
     model: null,
     effort: null,

@@ -60,10 +60,20 @@ export const agentOptsSchema = z
     schema: jsonSchemaSchema.optional(),
     model: z.string().trim().min(1).optional(),
     effort: z.string().trim().min(1).optional(),
+    profile: z.string().trim().min(1).optional(),
     provider: localAgentProviderSchema.optional(),
     isolation: z.literal("worktree").optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    if (value.profile && value.provider) {
+      context.addIssue({
+        code: "custom",
+        path: ["provider"],
+        message: "profile and provider are mutually exclusive",
+      });
+    }
+  });
 
 export type AgentOpts<S extends JsonSchema | undefined = JsonSchema | undefined> = Omit<
   z.infer<typeof agentOptsSchema>,
@@ -115,6 +125,7 @@ export const workflowErrorKindSchema = z.enum([
   "provider_unavailable",
   "no_provider",
   "provider",
+  "profile",
   "schema",
   "cancelled",
   "timeout",

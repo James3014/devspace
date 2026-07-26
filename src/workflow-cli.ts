@@ -9,6 +9,7 @@ import { runLocalAgentProviderResult } from "./local-agent-adapters.js";
 import { getLocalAgentProviderAvailabilitySnapshot } from "./local-agent-availability.js";
 import {
   isLocalAgentProvider,
+  loadLocalAgentProfiles,
   LOCAL_AGENT_PROVIDERS,
   type LocalAgentProvider,
 } from "./local-agent-profiles.js";
@@ -346,6 +347,7 @@ export async function runWorkflowWorker(
     const source = await readFile(claimed.scriptPath, "utf8");
     const parsed = parseWorkflowScript(source, { filename: claimed.scriptPath });
     const enabledProviders = resolveEnabledProviders(config.agentProviders);
+    const agentProfiles = await loadLocalAgentProfiles(config, claimed.workspaceRoot);
     const concurrency = resolveWorkflowConcurrency(
       parsed.meta.concurrency,
       availableParallelism(),
@@ -378,6 +380,7 @@ export async function runWorkflowWorker(
       workspaceRoot: claimed.workspaceRoot,
       baseSha: claimed.baseSha,
       enabledProviders,
+      agentProfiles,
       createWorktree,
       replay,
       runProvider: async (input) => {

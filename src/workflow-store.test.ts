@@ -75,6 +75,8 @@ try {
     provider: "codex",
     model: "gpt-5.4",
     effort: "high",
+    profileName: "reviewer",
+    profileFingerprint: "profile-hash",
     phase: "Review",
     isolation: "worktree",
     worktreePath: "/tmp/wt",
@@ -95,6 +97,8 @@ try {
   assert.equal(call?.dirty, true);
   assert.equal(call?.providerSessionId, "sess_1");
   assert.equal(call?.effort, "high");
+  assert.equal(call?.profileName, "reviewer");
+  assert.equal(call?.profileFingerprint, "profile-hash");
   assert.equal(call?.prompt, "review");
   assert.equal(call?.returnValueJson, JSON.stringify({ ok: true, exact: true }));
   assert.equal(call?.replayReason, "identity_changed:prompt");

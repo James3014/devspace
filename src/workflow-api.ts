@@ -1,7 +1,12 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import type { WorkflowSandboxApi } from "./workflow-sandbox.js";
-import type { LocalAgentProvider } from "./local-agent-profiles.js";
+import {
+  buildLocalAgentProfilePrompt,
+  fingerprintLocalAgentProfile,
+  type LocalAgentProfile,
+  type LocalAgentProvider,
+} from "./local-agent-profiles.js";
 import type { JsonSchema, JsonValue } from "./json-types.js";
 import { jsonValueSchema } from "./json-types.js";
 import {
@@ -109,6 +114,8 @@ export interface WorkflowJournal {
     provider: LocalAgentProvider;
     model?: string;
     effort?: string;
+    profileName?: string;
+    profileFingerprint?: string;
     label?: string;
     phase?: string;
     isolation?: AgentIsolationMode;
@@ -151,6 +158,8 @@ export interface WorkflowApiDeps {
   baseSha?: string;
   /** Already-filtered enabled ∩ live provider ids, preference order. */
   enabledProviders: LocalAgentProvider[];
+  /** Loaded, enabled profiles exposed by open_workspace for this project. */
+  agentProfiles?: LocalAgentProfile[];
   runProvider: WorkflowRunProvider;
   createWorktree?: CreateAgentWorktree;
   replay?: WorkflowReplay;
@@ -177,6 +186,7 @@ export class WorkflowEngineError extends Error {
       | "provider_disabled"
       | "provider_unavailable"
       | "no_provider"
+      | "profile"
       | "nest_depth"
       | "worktree"
       | "schema"
@@ -250,7 +260,15 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
     const agentOpts = normalizeAgentOpts(opts);
     throwIfCancelled(deps);
 
-    const provider = resolveProvider(agentOpts.provider, deps.meta, deps.enabledProviders);
+    const target = resolveAgentTarget(prompt, agentOpts, deps);
+    const {
+      provider,
+      model,
+      effort,
+      profileName,
+      profileFingerprint,
+      providerPrompt,
+    } = target;
     const phase = agentOpts.phase ?? phaseAls.getStore();
     const isolation: AgentIsolationMode =
       agentOpts.isolation === "worktree" ? "worktree" : "shared";
@@ -259,9 +277,11 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
 
     const cacheKeyInput = buildAgentCacheKeyInput({
       prompt,
+      profileName,
+      profileFingerprint,
       provider,
-      model: agentOpts.model,
-      effort: agentOpts.effort,
+      model,
+      effort,
       schema: agentOpts.schema,
       isolation,
     });
@@ -277,8 +297,10 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
           prompt,
           schemaJson: agentOpts.schema ? JSON.stringify(agentOpts.schema) : undefined,
           provider,
-          model: agentOpts.model,
-          effort: agentOpts.effort,
+          model,
+          effort,
+          profileName,
+          profileFingerprint,
           label: agentOpts.label,
           phase,
           isolation,
@@ -349,8 +371,10 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
         prompt,
         schemaJson: agentOpts.schema ? JSON.stringify(agentOpts.schema) : undefined,
         provider,
-        model: agentOpts.model,
-        effort: agentOpts.effort,
+        model,
+        effort,
+        profileName,
+        profileFingerprint,
         label: agentOpts.label,
         phase,
         isolation,
@@ -377,9 +401,9 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
       const cwd = worktreePath ?? deps.workspaceRoot;
       const providerBase = {
         provider,
-        prompt,
-        model: agentOpts.model,
-        effort: agentOpts.effort,
+        prompt: providerPrompt,
+        model,
+        effort,
         workspace: cwd,
         signal: deps.signal,
         label: agentOpts.label,
@@ -395,7 +419,7 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
         const { enforceAgentSchema } = await import("./workflow-schema.js");
         const enforced = await enforceAgentSchema({
           schema: agentOpts.schema,
-          prompt,
+          prompt: providerPrompt,
           provider,
           run: (p, options) =>
             deps.runProvider({
@@ -690,6 +714,54 @@ export function resolveProvider(
   return first;
 }
 
+interface ResolvedAgentTarget {
+  provider: LocalAgentProvider;
+  model?: string;
+  effort?: string;
+  profileName?: string;
+  profileFingerprint?: string;
+  providerPrompt: string;
+}
+
+function resolveAgentTarget(
+  prompt: string,
+  opts: AgentOpts,
+  deps: Pick<WorkflowApiDeps, "agentProfiles" | "enabledProviders" | "meta">,
+): ResolvedAgentTarget {
+  if (!opts.profile) {
+    return {
+      provider: resolveProvider(opts.provider, deps.meta, deps.enabledProviders),
+      model: opts.model,
+      effort: opts.effort,
+      providerPrompt: prompt,
+    };
+  }
+
+  const profile = deps.agentProfiles?.find((candidate) => candidate.name === opts.profile);
+  if (!profile) {
+    const available = deps.agentProfiles?.map((candidate) => candidate.name).join(", ");
+    throw new WorkflowEngineError(
+      "profile",
+      `Unknown agent profile: ${opts.profile}${available ? `. Available profiles: ${available}` : ""}`,
+    );
+  }
+  if (!deps.enabledProviders.includes(profile.provider)) {
+    throw new WorkflowEngineError(
+      "provider_unavailable",
+      `Agent profile ${profile.name} requires unavailable provider ${profile.provider}`,
+    );
+  }
+
+  return {
+    provider: profile.provider,
+    model: opts.model ?? profile.model,
+    effort: opts.effort ?? profile.effort,
+    profileName: profile.name,
+    profileFingerprint: fingerprintLocalAgentProfile(profile),
+    providerPrompt: buildLocalAgentProfilePrompt(profile, prompt),
+  };
+}
+
 function normalizeAgentOpts(opts: unknown): AgentOpts {
   if (opts === undefined || opts === null) return {};
   if (typeof opts === "object" && opts !== null && "writeMode" in opts) {
@@ -699,7 +771,13 @@ function normalizeAgentOpts(opts: unknown): AgentOpts {
   if (parsed.success) return parsed.data;
   const issue = parsed.error.issues[0];
   const path = issue?.path.join(".") || "opts";
-  const kind = path === "schema" ? "schema" : path === "isolation" ? "worktree" : "internal";
+  const kind = path === "schema"
+    ? "schema"
+    : path === "isolation"
+      ? "worktree"
+      : path === "profile" || issue?.message.includes("profile and provider")
+        ? "profile"
+        : "internal";
   throw new WorkflowEngineError(
     kind,
     `Invalid agent ${path}: ${issue?.message ?? "validation failed"}`,

@@ -1,5 +1,8 @@
 import { availableParallelism } from "node:os";
-import type { LocalAgentProvider } from "./local-agent-profiles.js";
+import type {
+  LocalAgentProfile,
+  LocalAgentProvider,
+} from "./local-agent-profiles.js";
 import type { JsonValue } from "./json-types.js";
 import { parseWorkflowScript, type ParsedWorkflowScript } from "./workflow-script.js";
 import { runWorkflowSandbox } from "./workflow-sandbox.js";
@@ -36,6 +39,7 @@ export interface ExecuteWorkflowOptions {
   workspaceRoot: string;
   baseSha?: string;
   enabledProviders: LocalAgentProvider[];
+  agentProfiles?: LocalAgentProfile[];
   runProvider: WorkflowRunProvider;
   createWorktree?: CreateAgentWorktree;
   replay?: WorkflowReplay;
@@ -81,6 +85,7 @@ export async function executeWorkflow(
     workspaceRoot: options.workspaceRoot,
     baseSha: options.baseSha,
     enabledProviders: options.enabledProviders,
+    agentProfiles: options.agentProfiles,
     runProvider: options.runProvider,
     createWorktree: options.createWorktree,
     replay: options.replay,

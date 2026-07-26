@@ -13,6 +13,7 @@ import {
   type CreateAgentWorktree,
 } from "./workflow-api.js";
 import { createStubBudget, WORKFLOW_LIMITS } from "./workflow-types.js";
+import type { LocalAgentProfile } from "./local-agent-profiles.js";
 
 // ---------------------------------------------------------------------------
 // Semaphore
@@ -323,6 +324,96 @@ import { createStubBudget, WORKFLOW_LIMITS } from "./workflow-types.js";
     async () => api.agent("z", { writeMode: "allowed" } as never),
     /writeMode is not supported/,
   );
+  store.close();
+  await rm(dir, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// configured profile selection, defaults, overrides, and prompt instructions
+// ---------------------------------------------------------------------------
+{
+  const dir = await mkdtemp(join(tmpdir(), "wf-profile-"));
+  const store = new WorkflowStore(dir);
+  const run = store.createRun({
+    name: "profile",
+    source: "inline",
+    scriptPath: "inline",
+    scriptHash: "h",
+    workspaceRoot: dir,
+  });
+  const profile: LocalAgentProfile = {
+    name: "reviewer",
+    description: "Review changes",
+    provider: "claude",
+    model: "sonnet",
+    effort: "medium",
+    filePath: join(dir, "reviewer.md"),
+    body: "Act as an adversarial reviewer.",
+    disabled: false,
+  };
+  const calls: WorkflowProviderRunInput[] = [];
+  const api = createWorkflowApi({
+    runId: run.id,
+    journal: store,
+    meta: { name: "profile", description: "d", defaultProvider: "codex" },
+    args: undefined,
+    concurrency: 1,
+    signal: new AbortController().signal,
+    workspaceRoot: dir,
+    enabledProviders: ["codex", "claude"],
+    agentProfiles: [profile],
+    runProvider: async (input) => {
+      calls.push(input);
+      return { finalResponse: "reviewed" };
+    },
+  });
+
+  assert.equal(
+    await api.agent("Review auth", {
+      profile: "reviewer",
+      model: "opus",
+      effort: "high",
+    }),
+    "reviewed",
+  );
+  assert.equal(calls[0]?.provider, "claude");
+  assert.equal(calls[0]?.model, "opus");
+  assert.equal(calls[0]?.effort, "high");
+  assert.equal(
+    calls[0]?.prompt,
+    "Act as an adversarial reviewer.\n\nTask:\nReview auth",
+  );
+  assert.equal(store.getAgentCall(run.id, 0)?.profileName, "reviewer");
+  assert.equal(store.getAgentCall(run.id, 0)?.profileFingerprint?.length, 64);
+
+  const callAgent = api.agent as (prompt: string, opts?: unknown) => Promise<unknown>;
+  await assert.rejects(
+    () => callAgent("x", { profile: "reviewer", provider: "codex" }),
+    /mutually exclusive/,
+  );
+  await assert.rejects(() => callAgent("x", { profile: "missing" }), /Unknown agent profile/);
+
+  const unavailableApi = createWorkflowApi({
+    runId: run.id,
+    journal: store,
+    meta: { name: "profile", description: "d" },
+    args: undefined,
+    concurrency: 1,
+    signal: new AbortController().signal,
+    workspaceRoot: dir,
+    enabledProviders: ["codex"],
+    agentProfiles: [profile],
+    runProvider: async () => ({ finalResponse: "unreachable" }),
+  });
+  await assert.rejects(
+    () =>
+      (unavailableApi.agent as (prompt: string, opts?: unknown) => Promise<unknown>)(
+        "x",
+        { profile: "reviewer" },
+      ),
+    /requires unavailable provider claude/,
+  );
+
   store.close();
   await rm(dir, { recursive: true, force: true });
 }
