@@ -28,7 +28,7 @@ devspace workflow call <runId> <callIndex>
 devspace workflow tui [runId]
 ```
 
-Named scripts: `.devspace/workflows/<name>.js` or `workflows/<name>.js`.
+Project named scripts live under `.devspace/workflows/<name>.js`.
 
 ## Script shape
 

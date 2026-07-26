@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   parseWorkflowArgFlags,
   persistWorkflowScript,
+  readProjectWorkflowScriptFile,
   resolveNamedWorkflowScript,
   resolveWorkflowScriptFromPathOrName,
   WorkflowPathError,
@@ -52,6 +53,33 @@ import { hashSource } from "./workflow-script.js";
   });
   assert.equal(named.origin, "named");
   assert.match(named.source, /named/);
+  assert.equal(
+    (
+      await readProjectWorkflowScriptFile({
+        scriptPath: join(dir, ".devspace", "workflows", "named.js"),
+        workspaceRoot: dir,
+      })
+    ).nameHint,
+    "named",
+  );
+  await assert.rejects(
+    () =>
+      readProjectWorkflowScriptFile({
+        scriptPath: path,
+        workspaceRoot: dir,
+      }),
+    /must be inside/,
+  );
+
+  await mkdir(join(dir, "workflows"), { recursive: true });
+  await writeFile(
+    join(dir, "workflows", "legacy.js"),
+    "export const meta = { name: 'legacy', description: 'd' }\nreturn 3\n",
+  );
+  await assert.rejects(
+    () => resolveNamedWorkflowScript({ name: "legacy", workspaceRoot: dir }),
+    WorkflowPathError,
+  );
 
   await assert.rejects(
     () => resolveNamedWorkflowScript({ name: "missing", workspaceRoot: dir }),

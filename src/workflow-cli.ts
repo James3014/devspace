@@ -17,6 +17,7 @@ import { executeWorkflow, mapEngineErrorKind } from "./workflow-engine.js";
 import {
   parseWorkflowArgFlagsResult,
   persistWorkflowScriptResult,
+  readProjectWorkflowScriptFile,
   readWorkflowScriptFileResult,
   resolveNamedWorkflowScript,
   resolveWorkflowScriptFromPathOrNameResult,
@@ -416,7 +417,12 @@ export async function runWorkflowWorker(
           });
           return named.source;
         }
-        return readFile(ref.scriptPath, "utf8");
+        return (
+          await readProjectWorkflowScriptFile({
+            scriptPath: ref.scriptPath,
+            workspaceRoot: claimed.workspaceRoot,
+          })
+        ).source;
       },
     });
 
