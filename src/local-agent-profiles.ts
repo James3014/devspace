@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
@@ -75,6 +76,29 @@ export function summarizeLocalAgentProfile(
     model: profile.model,
     effort: profile.effort,
   };
+}
+
+export function fingerprintLocalAgentProfile(profile: LocalAgentProfile): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        name: profile.name,
+        description: profile.description,
+        provider: profile.provider,
+        model: profile.model ?? null,
+        effort: profile.effort ?? null,
+        body: profile.body,
+      }),
+    )
+    .digest("hex");
+}
+
+export function buildLocalAgentProfilePrompt(
+  profile: Pick<LocalAgentProfile, "body">,
+  task: string,
+): string {
+  const body = profile.body.trim();
+  return body ? `${body}\n\nTask:\n${task}` : task;
 }
 
 async function loadProfilesFromDirectory(directory: string): Promise<LocalAgentProfile[]> {

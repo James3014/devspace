@@ -13,6 +13,7 @@ import { satisfies } from "semver";
 import { loadConfig } from "./config.js";
 import { runLocalAgentProvider } from "./local-agent-adapters.js";
 import {
+  buildLocalAgentProfilePrompt,
   isLocalAgentProvider,
   loadLocalAgentProfiles,
   LOCAL_AGENT_PROVIDERS,
@@ -569,8 +570,7 @@ async function runLocalAgentProfile(
   record: LocalAgentRecord,
   prompt: string,
 ): Promise<LocalAgentRunResult> {
-  const body = profile.body.trim();
-  const fullPrompt = body ? `${body}\n\nTask:\n${prompt}` : prompt;
+  const fullPrompt = buildLocalAgentProfilePrompt(profile, prompt);
   return runLocalAgentProvider(profile.provider, {
     prompt: fullPrompt,
     workspace: record.workspaceRoot,
