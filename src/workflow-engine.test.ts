@@ -12,7 +12,7 @@ import {
   type WorkflowProviderRunInput,
   type CreateAgentWorktree,
 } from "./workflow-api.js";
-import { createStubBudget } from "./workflow-types.js";
+import { createStubBudget, WORKFLOW_LIMITS } from "./workflow-types.js";
 
 // ---------------------------------------------------------------------------
 // Semaphore
@@ -73,6 +73,8 @@ import { createStubBudget } from "./workflow-types.js";
   ]);
   assert.deepEqual(results, ["ok:a", null, "ok:b"]);
   assert.equal(api.getCallCount(), 3);
+  assert.equal(store.getAgentCall(run.id, 0)?.returnValueJson, JSON.stringify("ok:a"));
+  assert.equal(store.getAgentCall(run.id, 2)?.returnValueJson, JSON.stringify("ok:b"));
   store.close();
   await rm(dir, { recursive: true, force: true });
 }
@@ -373,7 +375,40 @@ import { createStubBudget } from "./workflow-types.js";
   assert.equal(calls[0]?.providerSessionId, undefined);
   assert.equal(calls[1]?.schema, undefined);
   assert.equal(calls[1]?.providerSessionId, "sess-1");
+  assert.equal(store.getAgentCall(run.id, 0)?.returnValueJson, JSON.stringify({ n: 2 }));
 
+  store.close();
+  await rm(dir, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// oversized exact replay values do not fail the live call
+// ---------------------------------------------------------------------------
+{
+  const dir = await mkdtemp(join(tmpdir(), "wf-replay-size-"));
+  const store = new WorkflowStore(dir);
+  const run = store.createRun({
+    name: "replay-size",
+    source: "inline",
+    scriptPath: "inline",
+    scriptHash: "h",
+    workspaceRoot: dir,
+  });
+  const response = "x".repeat(WORKFLOW_LIMITS.replayValueJsonBytes + 1);
+  const api = createWorkflowApi({
+    runId: run.id,
+    journal: store,
+    meta: { name: "replay-size", description: "d" },
+    args: undefined,
+    concurrency: 1,
+    signal: new AbortController().signal,
+    workspaceRoot: dir,
+    enabledProviders: ["codex"],
+    runProvider: async () => ({ finalResponse: response }),
+  });
+
+  assert.equal(await api.agent("large"), response);
+  assert.equal(store.getAgentCall(run.id, 0)?.returnValueJson, undefined);
   store.close();
   await rm(dir, { recursive: true, force: true });
 }

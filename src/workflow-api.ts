@@ -64,6 +64,7 @@ export interface WorkflowReplayHit {
   value: JsonValue;
   responseText?: string;
   structuredJson?: string;
+  returnValueJson: string;
   providerSessionId?: string;
   replayMatch: "same_index" | "compatible_key";
   replayedFromRunId: string;
@@ -75,7 +76,11 @@ export interface WorkflowReplayMiss {
     | "no_compatible_call"
     | "prior_call_not_replayable"
     | "compatible_result_consumed"
-    | "identity_changed";
+    | "identity_changed"
+    | "prefix_diverged"
+    | "worktree_not_restored"
+    | "result_not_persisted"
+    | "stored_result_invalid";
   changedFields?: Array<keyof AgentCacheKeyInput>;
 }
 
@@ -118,6 +123,7 @@ export interface WorkflowJournal {
     callIndex: number;
     responseText?: string;
     structuredJson?: string;
+    returnValueJson?: string;
     providerSessionId?: string;
     dirty?: boolean;
     worktreePath?: string;
@@ -285,6 +291,7 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
           callIndex: index,
           responseText: hit.responseText,
           structuredJson: hit.structuredJson,
+          returnValueJson: hit.returnValueJson,
           providerSessionId: hit.providerSessionId,
           fromCache: true,
         });
@@ -444,9 +451,8 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
         runId: deps.runId,
         callIndex: index,
         responseText: truncate(result.finalResponse, WORKFLOW_LIMITS.responseTextBytes),
-        structuredJson: structuredJson
-          ? truncate(structuredJson, WORKFLOW_LIMITS.structuredJsonBytes)
-          : undefined,
+        structuredJson: boundedStructuredJson(structuredJson),
+        returnValueJson: serializeReplayValue(returnValue),
         providerSessionId: result.providerSessionId,
         dirty,
         worktreePath,
@@ -721,10 +727,30 @@ function cancelledError(): WorkflowEngineError {
 
 function truncate(text: string, maxBytes: number): string {
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-  // rough char truncate for journal safety
-  let end = Math.min(text.length, maxBytes);
-  while (end > 0 && Buffer.byteLength(text.slice(0, end), "utf8") > maxBytes) end -= 1;
-  return `${text.slice(0, end)}…`;
+  const marker = "…";
+  const budget = Math.max(0, maxBytes - Buffer.byteLength(marker, "utf8"));
+  let end = Math.min(text.length, budget);
+  while (end > 0 && Buffer.byteLength(text.slice(0, end), "utf8") > budget) end -= 1;
+  return `${text.slice(0, end)}${marker}`;
+}
+
+function boundedStructuredJson(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  return Buffer.byteLength(value, "utf8") <= WORKFLOW_LIMITS.structuredJsonBytes
+    ? value
+    : undefined;
+}
+
+function serializeReplayValue(value: unknown): string | undefined {
+  try {
+    const json = JSON.stringify(value);
+    if (json === undefined) return undefined;
+    return Buffer.byteLength(json, "utf8") <= WORKFLOW_LIMITS.replayValueJsonBytes
+      ? json
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Minimal JSON extract for schema path until Ajv module lands. */
