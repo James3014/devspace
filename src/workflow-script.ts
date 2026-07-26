@@ -48,14 +48,6 @@ export function parseWorkflowScript(
   // Strip only the leading `export ` so line numbers stay aligned (7 spaces).
   const body = normalized.replace(META_EXPORT, "       const meta =");
 
-  // Reject further imports / exports after transform
-  if (/\bimport\s+/.test(body) || /\bexport\s+/.test(body)) {
-    throw new WorkflowScriptError(
-      "syntax",
-      "Workflow scripts may not use import or additional export statements",
-    );
-  }
-
   // Workflow APIs are installed as context-realm globals by the sandbox child.
   // Keeping the factory argument-free avoids handing host-realm functions or
   // constructors directly to model-authored workflow code.
@@ -114,17 +106,7 @@ function extractMetaLiteral(source: string): { metaLiteral: string; metaEndIndex
   const end = scanBalancedObject(source, objectStart);
   const metaLiteral = source.slice(objectStart, end + 1);
 
-  // Purity: no calls, spreads, templates inside meta (rough static checks)
-  if (/[`$]/.test(metaLiteral) && /\$\{/.test(metaLiteral)) {
-    throw new WorkflowScriptError("meta", "meta must be a pure literal (no template interpolation)");
-  }
-  if (/\.\.\./.test(metaLiteral)) {
-    throw new WorkflowScriptError("meta", "meta must be a pure literal (no spreads)");
-  }
-  // Disallow identifier references that look like calls: word(
-  if (/\b[A-Za-z_$][\w$]*\s*\(/.test(metaLiteral)) {
-    throw new WorkflowScriptError("meta", "meta must be a pure literal (no function calls)");
-  }
+  assertPureMetaLiteral(metaLiteral);
 
   return { metaLiteral, metaEndIndex: end + 1 };
 }
@@ -132,9 +114,23 @@ function extractMetaLiteral(source: string): { metaLiteral: string; metaEndIndex
 function scanBalancedObject(source: string, start: number): number {
   let depth = 0;
   let inString: '"' | "'" | null = null;
+  let inLineComment = false;
+  let inBlockComment = false;
   let escape = false;
   for (let i = start; i < source.length; i += 1) {
     const ch = source[i]!;
+    const next = source[i + 1];
+    if (inLineComment) {
+      if (ch === "\n") inLineComment = false;
+      continue;
+    }
+    if (inBlockComment) {
+      if (ch === "*" && next === "/") {
+        inBlockComment = false;
+        i += 1;
+      }
+      continue;
+    }
     if (inString) {
       if (escape) {
         escape = false;
@@ -145,6 +141,16 @@ function scanBalancedObject(source: string, start: number): number {
         continue;
       }
       if (ch === inString) inString = null;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      inLineComment = true;
+      i += 1;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      inBlockComment = true;
+      i += 1;
       continue;
     }
     if (ch === '"' || ch === "'") {
@@ -158,6 +164,94 @@ function scanBalancedObject(source: string, start: number): number {
     }
   }
   throw new WorkflowScriptError("meta", "Unclosed meta object literal");
+}
+
+function assertPureMetaLiteral(literal: string): void {
+  for (let i = 0; i < literal.length; i += 1) {
+    const ch = literal[i]!;
+    const next = literal[i + 1];
+    if (ch === '"' || ch === "'") {
+      i = skipQuoted(literal, i, ch);
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      i = skipLineComment(literal, i + 2);
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      i = skipBlockComment(literal, i + 2);
+      continue;
+    }
+    if (ch === "`") {
+      throw new WorkflowScriptError("meta", "meta must be a pure literal (no templates)");
+    }
+    if (literal.startsWith("...", i)) {
+      throw new WorkflowScriptError("meta", "meta must be a pure literal (no spreads)");
+    }
+    if (literal.startsWith("=>", i)) {
+      throw new WorkflowScriptError("meta", "meta must be a pure literal (no functions)");
+    }
+    if (!/[A-Za-z_$]/.test(ch)) continue;
+
+    const identifierStart = i;
+    i += 1;
+    while (i < literal.length && /[\w$]/.test(literal[i]!)) i += 1;
+    const identifier = literal.slice(identifierStart, i);
+    if (identifier === "function" || identifier === "class" || identifier === "new") {
+      throw new WorkflowScriptError("meta", "meta must be a pure literal (no executable values)");
+    }
+    i = skipTrivia(literal, i) - 1;
+    if (literal[i + 1] === "(") {
+      throw new WorkflowScriptError("meta", "meta must be a pure literal (no function calls)");
+    }
+  }
+}
+
+function skipQuoted(source: string, start: number, quote: '"' | "'"): number {
+  let escape = false;
+  for (let i = start + 1; i < source.length; i += 1) {
+    const ch = source[i]!;
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escape = true;
+      continue;
+    }
+    if (ch === quote) return i;
+  }
+  return source.length - 1;
+}
+
+function skipLineComment(source: string, start: number): number {
+  const newline = source.indexOf("\n", start);
+  return newline < 0 ? source.length - 1 : newline;
+}
+
+function skipBlockComment(source: string, start: number): number {
+  const end = source.indexOf("*/", start);
+  return end < 0 ? source.length - 1 : end + 1;
+}
+
+function skipTrivia(source: string, start: number): number {
+  let i = start;
+  while (i < source.length) {
+    if (/\s/.test(source[i]!)) {
+      i += 1;
+      continue;
+    }
+    if (source.startsWith("//", i)) {
+      i = skipLineComment(source, i + 2) + 1;
+      continue;
+    }
+    if (source.startsWith("/*", i)) {
+      i = skipBlockComment(source, i + 2) + 1;
+      continue;
+    }
+    break;
+  }
+  return i;
 }
 
 function isOnlyPreamble(text: string): boolean {
@@ -185,7 +279,7 @@ function evaluateMetaLiteral(literal: string, filename: string): unknown {
 }
 
 function validateMeta(value: unknown): WorkflowMeta {
-  const parsed = workflowMetaSchema.safeParse(value);
+  const parsed = workflowMetaSchema.safeParse(value, { reportInput: true });
   if (parsed.success) return parsed.data;
 
   const issue = parsed.error.issues[0];
