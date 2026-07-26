@@ -457,12 +457,7 @@ export async function runWorkflowWorker(
       }
     }
 
-    store.completeRun(runId, { resultJson });
-    store.appendEvent({
-      runId,
-      type: "run_completed",
-      data: { callCount },
-    });
+    store.completeRun(runId, { resultJson, callCount });
   } catch (error) {
     if (store.isCancelRequested(runId) || abort.signal.aborted) {
       try {
@@ -476,11 +471,6 @@ export async function runWorkflowWorker(
     const errorKind = mapEngineErrorKind(error);
     try {
       store.failRun(runId, { error: message, errorKind });
-      store.appendEvent({
-        runId,
-        type: "run_failed",
-        data: { error: message, errorKind },
-      });
     } catch {
       // terminal race
     }

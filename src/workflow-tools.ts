@@ -400,12 +400,14 @@ async function yieldEvents(
   run: WorkflowRunRecord;
   events: WorkflowEventRecord[];
   nextSeq: number;
+  hasMore: boolean;
   terminal: boolean;
   callSummary: ReturnType<typeof summarizeCalls>;
 }> {
   const deadline = Date.now() + Math.min(yieldMs, WORKFLOW_MCP_YIELD_MS);
   let cursor = sinceSeq;
   let events: WorkflowEventRecord[] = [];
+  let hasMore = false;
   let terminal = false;
   let run = store.getRun(runId)!;
 
@@ -413,9 +415,11 @@ async function yieldEvents(
     const page = store.drainEvents(runId, cursor, WORKFLOW_LIMITS.eventDrainDefault);
     events = events.concat(page.events);
     cursor = page.nextSeq;
+    hasMore = page.hasMore;
     terminal = page.terminal;
     run = page.run;
     if (terminal || Date.now() >= deadline) break;
+    if (hasMore) continue;
     await sleep(250);
   }
 
@@ -423,6 +427,7 @@ async function yieldEvents(
     run,
     events,
     nextSeq: cursor,
+    hasMore,
     terminal,
     callSummary: summarizeCalls(store.listAgentCalls(runId)),
   };
@@ -432,6 +437,7 @@ function toolResult(page: {
   run: WorkflowRunRecord;
   events: WorkflowEventRecord[];
   nextSeq: number;
+  hasMore: boolean;
   terminal: boolean;
   callSummary: ReturnType<typeof summarizeCalls>;
 }, tool: "run_workflow" | "workflow_status") {
@@ -452,6 +458,7 @@ function toolResult(page: {
       dataJson: e.dataJson,
     })),
     nextSeq: page.nextSeq,
+    hasMore: page.hasMore,
     result: page.run.resultJson ? safeJson(page.run.resultJson) : undefined,
     error: page.run.error,
     errorKind: page.run.errorKind,
