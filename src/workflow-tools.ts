@@ -116,7 +116,9 @@ export function registerWorkflowTools(
         let runSource: "inline" | "named" | "resume" = "inline";
 
         if (resumeFromRunId) {
-          const prior = store.getRun(resumeFromRunId);
+          const priorResult = store.getRunResult(resumeFromRunId);
+          if (priorResult.isErr()) throw priorResult.error;
+          const prior = priorResult.value;
           if (!prior) throw new WorkflowNotFoundError(resumeFromRunId);
           priorRunId = prior.id;
           const overridePath = scriptPath;
@@ -141,7 +143,7 @@ export function registerWorkflowTools(
             if (resolvedResult.isErr()) throw resolvedResult.error;
             source = resolvedResult.value.source;
             scriptHash = resolvedResult.value.scriptHash;
-            nameHint = prior.name;
+            nameHint = overridePath ? resolvedResult.value.nameHint : prior.name;
           }
           runSource = "resume";
           if (args === undefined && prior.argsJson && prior.argsJson !== "null") {
@@ -242,7 +244,9 @@ export function registerWorkflowTools(
     async ({ runId, sinceSeq, yieldTimeMs }) => {
       const store = createWorkflowStore(config);
       try {
-        if (!store.getRun(runId)) throw new WorkflowNotFoundError(runId);
+        const runResult = store.getRunResult(runId);
+        if (runResult.isErr()) throw runResult.error;
+        if (!runResult.value) throw new WorkflowNotFoundError(runId);
         const page = await yieldEvents(store, runId, sinceSeq ?? 0, yieldTimeMs ?? 0);
         return toolResult(page, "workflow_status");
       } catch (error) {

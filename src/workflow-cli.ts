@@ -163,8 +163,8 @@ async function runWorkflowRun(args: string[], config: ServerConfig): Promise<voi
       const resolved = overrideResult.value;
       source = resolved.source;
       scriptHash = resolved.scriptHash;
-      nameHint = "nameHint" in resolved ? resolved.nameHint : prior.name;
-      priorScriptPath = file ?? prior.scriptPath;
+      nameHint = file || name ? resolved.nameHint : prior.name;
+      priorScriptPath = resolved.scriptPath;
       runSource = "resume";
       if (!Object.keys(workflowArgs).length && prior.argsJson && prior.argsJson !== "null") {
         try {
