@@ -414,6 +414,50 @@ import { createStubBudget, WORKFLOW_LIMITS } from "./workflow-types.js";
 }
 
 // ---------------------------------------------------------------------------
+// oversized structured results remain intact without persisting invalid JSON
+// ---------------------------------------------------------------------------
+{
+  const dir = await mkdtemp(join(tmpdir(), "wf-structured-size-"));
+  const store = new WorkflowStore(dir);
+  const run = store.createRun({
+    name: "structured-size",
+    source: "inline",
+    scriptPath: "inline",
+    scriptHash: "h",
+    workspaceRoot: dir,
+  });
+  const big = "x".repeat(WORKFLOW_LIMITS.structuredJsonBytes + 1);
+  const api = createWorkflowApi({
+    runId: run.id,
+    journal: store,
+    meta: { name: "structured-size", description: "d" },
+    args: undefined,
+    concurrency: 1,
+    signal: new AbortController().signal,
+    workspaceRoot: dir,
+    enabledProviders: ["codex"],
+    runProvider: async () => ({
+      finalResponse: JSON.stringify({ big }),
+      structured: { big },
+    }),
+  });
+
+  assert.deepEqual(
+    await api.agent("large structured", {
+      schema: {
+        type: "object",
+        properties: { big: { type: "string" } },
+        required: ["big"],
+      },
+    }),
+    { big },
+  );
+  assert.equal(store.getAgentCall(run.id, 0)?.structuredJson, undefined);
+  store.close();
+  await rm(dir, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
 // executeWorkflow end-to-end with sandbox + nest depth
 // ---------------------------------------------------------------------------
 {
