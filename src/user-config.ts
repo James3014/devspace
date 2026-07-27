@@ -8,7 +8,6 @@ import {
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
-import type { AgentProvidersConfig } from "./workflow-types.js";
 
 export interface DevspaceUserConfig {
   host?: string;
@@ -20,8 +19,6 @@ export interface DevspaceUserConfig {
   worktreeRoot?: string;
   agentDir?: string;
   subagents?: boolean;
-  /** Ordered enable-list for local agent providers used by workflows/subagents. */
-  agentProviders?: AgentProvidersConfig;
 }
 
 export interface DevspaceAuthConfig {
