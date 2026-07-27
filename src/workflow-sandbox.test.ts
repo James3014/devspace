@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { parseWorkflowScript } from "./workflow-script.js";
+import { WorkflowEngineError } from "./workflow-api.js";
 import {
   createStubBudget,
   type WorkflowMeta,
@@ -115,10 +116,79 @@ return 'still-alive'
     () =>
       runWorkflowSandbox({
         parsed: parseWorkflowScript(`
+export const meta = { name: 'date-constructor-ban', description: 'd' }
+return new Date(0).constructor.now()
+`),
+        api: api({ name: "date-constructor-ban", description: "d" }),
+      }),
+    (error: unknown) =>
+      error instanceof WorkflowDeterminismError && /Date\.now/.test(error.message),
+  );
+}
+
+{
+  await assert.rejects(
+    () =>
+      runWorkflowSandbox({
+        parsed: parseWorkflowScript(`
 export const meta = { name: 'constructor-escape', description: 'd' }
 return Object.constructor('return process.version')()
 `),
         api: api({ name: "constructor-escape", description: "d" }),
+      }),
+    /process is not defined/,
+  );
+}
+
+{
+  await assert.rejects(
+    () =>
+      runWorkflowSandbox({
+        parsed: parseWorkflowScript(`
+export const meta = { name: 'promise-realm-escape', description: 'd' }
+const pending = agent('x')
+return pending.constructor.constructor('return process')()
+`),
+        api: api({ name: "promise-realm-escape", description: "d" }),
+      }),
+    /process is not defined/,
+  );
+}
+
+{
+  const hostApi = api({ name: "result-realm-escape", description: "d" });
+  hostApi.agent = async () => ({ ok: true }) as never;
+  await assert.rejects(
+    () =>
+      runWorkflowSandbox({
+        parsed: parseWorkflowScript(`
+export const meta = { name: 'result-realm-escape', description: 'd' }
+const value = await agent('x')
+return value.constructor.constructor('return process')()
+`),
+        api: hostApi,
+      }),
+    /process is not defined/,
+  );
+}
+
+{
+  const hostApi = api({ name: "error-realm-escape", description: "d" });
+  hostApi.agent = async () => {
+    throw new WorkflowEngineError("internal", "boom");
+  };
+  await assert.rejects(
+    () =>
+      runWorkflowSandbox({
+        parsed: parseWorkflowScript(`
+export const meta = { name: 'error-realm-escape', description: 'd' }
+try {
+  await agent('x')
+} catch (error) {
+  return error.constructor.constructor('return process')()
+}
+`),
+        api: hostApi,
       }),
     /process is not defined/,
   );

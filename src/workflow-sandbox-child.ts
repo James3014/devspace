@@ -31,10 +31,22 @@ interface SerializedError {
   kind?: string;
 }
 
+interface BridgeSuccessEnvelope {
+  ok: true;
+  value?: unknown;
+}
+
+interface BridgeErrorEnvelope {
+  ok: false;
+  error: SerializedError;
+}
+
+type BridgeEnvelope = BridgeSuccessEnvelope | BridgeErrorEnvelope;
+
 let nextCallId = 1;
 const pending = new Map<
   number,
-  { resolve(value: unknown): void; reject(error: unknown): void }
+  { resolve(value: string): void }
 >();
 
 process.on("message", (message: StartMessage | CallResultMessage) => {
@@ -42,8 +54,10 @@ process.on("message", (message: StartMessage | CallResultMessage) => {
     const waiter = pending.get(message.id);
     if (!waiter) return;
     pending.delete(message.id);
-    if (message.error) waiter.reject(deserializeError(message.error));
-    else waiter.resolve(message.value);
+    const envelope: BridgeEnvelope = message.error
+      ? { ok: false, error: message.error }
+      : { ok: true, value: message.value };
+    waiter.resolve(JSON.stringify(envelope));
     return;
   }
   void execute(message);
@@ -60,8 +74,8 @@ async function execute(message: StartMessage): Promise<void> {
       const id = nextCallId;
       nextCallId += 1;
       process.send?.({ type: "call", id, method, args });
-      return new Promise<unknown>((resolve, reject) => {
-        pending.set(id, { resolve, reject });
+      return new Promise<string>((resolve) => {
+        pending.set(id, { resolve });
       });
     };
 
@@ -119,18 +133,51 @@ function installContextApi(context: vm.Context, message: StartMessage): void {
           "new Date() without arguments is banned in workflow scripts (pass an ISO string)",
         );
       }
-      return Reflect.construct(RealDate, dateArgs, RealDate);
+      return Reflect.construct(RealDate, dateArgs, DateShim);
     }
     DateShim.now = () => {
       throw new WorkflowDeterminismError("Date.now() is banned in workflow scripts");
     };
     DateShim.parse = RealDate.parse.bind(RealDate);
     DateShim.UTC = RealDate.UTC.bind(RealDate);
-    DateShim.prototype = RealDate.prototype;
+    DateShim.prototype = Object.create(RealDate.prototype, {
+      constructor: {
+        value: DateShim,
+        writable: false,
+        configurable: false,
+      },
+    });
+    Object.freeze(DateShim.prototype);
     Object.freeze(DateShim);
 
-    const agent = (...callArgs) => bridge("agent", callArgs);
-    const workflow = (...callArgs) => bridge("workflow", callArgs);
+    const rehydrateError = (input) => {
+      const error = input?.name === "WorkflowDeterminismError"
+        ? new WorkflowDeterminismError(input.message)
+        : input?.name === "WorkflowEngineError" && typeof input.kind === "string"
+          ? new WorkflowEngineError(input.kind, input.message)
+          : new Error(input?.message ?? "Workflow bridge call failed");
+      if (typeof input?.name === "string") error.name = input.name;
+      if (typeof input?.stack === "string") error.stack = input.stack;
+      return error;
+    };
+    const call = (method, callArgs) => new Promise((resolve, reject) => {
+      bridge(method, callArgs).then(
+        (payloadJson) => {
+          let payload;
+          try {
+            payload = JSON.parse(payloadJson);
+          } catch {
+            reject(new WorkflowEngineError("internal", "Workflow bridge returned invalid JSON"));
+            return;
+          }
+          if (payload?.ok === true) resolve(payload.value);
+          else reject(rehydrateError(payload?.error));
+        },
+        () => reject(new WorkflowEngineError("internal", "Workflow bridge call failed")),
+      );
+    });
+    const agent = (...callArgs) => call("agent", callArgs);
+    const workflow = (...callArgs) => call("workflow", callArgs);
     const phase = (title) => {
       if (typeof title !== "string" || !title.trim()) {
         throw new WorkflowEngineError("internal", "phase(title) requires a non-empty string");
@@ -238,14 +285,6 @@ function serializeError(error: unknown): SerializedError {
     stack: typeof record.stack === "string" ? record.stack : undefined,
     kind: typeof record.kind === "string" ? record.kind : undefined,
   };
-}
-
-function deserializeError(input: SerializedError): Error {
-  const error = new Error(input.message);
-  error.name = input.name;
-  if (input.stack) error.stack = input.stack;
-  if (input.kind) Object.assign(error, { kind: input.kind });
-  return error;
 }
 
 function disconnect(): void {
