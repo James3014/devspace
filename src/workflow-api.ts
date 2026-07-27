@@ -450,6 +450,11 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
 
       throwIfCancelled(deps);
 
+      const returnValueJson = serializeReplayValueOrThrow(returnValue);
+      if (structuredJson !== undefined) {
+        assertStructuredJsonBudget(structuredJson);
+      }
+
       let dirty: boolean | undefined;
       if (worktree) {
         const finalized = await worktree.finalize("success");
@@ -473,8 +478,8 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
         runId: deps.runId,
         callIndex: index,
         responseText: truncate(result.finalResponse, WORKFLOW_LIMITS.responseTextBytes),
-        structuredJson: boundedStructuredJson(structuredJson),
-        returnValueJson: serializeReplayValue(returnValue),
+        structuredJson,
+        returnValueJson,
         providerSessionId: result.providerSessionId,
         dirty,
         worktreePath,
@@ -776,23 +781,30 @@ function truncate(text: string, maxBytes: number): string {
   return `${text.slice(0, end)}${marker}`;
 }
 
-function boundedStructuredJson(value: string | undefined): string | undefined {
-  if (value === undefined) return undefined;
-  return Buffer.byteLength(value, "utf8") <= WORKFLOW_LIMITS.structuredJsonBytes
-    ? value
-    : undefined;
+function assertStructuredJsonBudget(value: string): void {
+  if (Buffer.byteLength(value, "utf8") <= WORKFLOW_LIMITS.structuredJsonBytes) return;
+  throw new WorkflowEngineError(
+    "result_too_large",
+    `agent() structured result exceeds ${WORKFLOW_LIMITS.structuredJsonBytes} bytes; return a smaller object or write large artifacts to disk and return paths`,
+  );
 }
 
-function serializeReplayValue(value: unknown): string | undefined {
+function serializeReplayValueOrThrow(value: unknown): string | undefined {
+  let json: string | undefined;
   try {
-    const json = JSON.stringify(value);
-    if (json === undefined) return undefined;
-    return Buffer.byteLength(json, "utf8") <= WORKFLOW_LIMITS.replayValueJsonBytes
-      ? json
-      : undefined;
+    json = JSON.stringify(value);
   } catch {
-    return undefined;
+    throw new WorkflowEngineError(
+      "result_too_large",
+      "agent() return value is not JSON-serializable and cannot be replayed",
+    );
   }
+  if (json === undefined) return undefined;
+  if (Buffer.byteLength(json, "utf8") <= WORKFLOW_LIMITS.replayValueJsonBytes) return json;
+  throw new WorkflowEngineError(
+    "result_too_large",
+    `agent() return value exceeds ${WORKFLOW_LIMITS.replayValueJsonBytes} bytes replay budget; return a smaller summary or write large artifacts to disk and return paths`,
+  );
 }
 
 /** Minimal JSON extract for schema path until Ajv module lands. */
