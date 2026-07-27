@@ -208,6 +208,17 @@ try {
     ),
     true,
   );
+  const subagentsSkill = loadWorkspaceSkills(experimentalConfig, projectRoot).skills.find(
+    (skill) => skill.name === "subagents",
+  );
+  assert.ok(subagentsSkill);
+  const codexReference = join(subagentsSkill.baseDir, "references", "codex.md");
+  assert.equal(resolveSkillReadPath([subagentsSkill], new Set(), codexReference), undefined);
+  assert.equal(
+    resolveSkillReadPath([subagentsSkill], new Set([subagentsSkill.baseDir]), codexReference)
+      ?.absolutePath,
+    codexReference,
+  );
 
   const duplicateConfig = loadConfig({
     DEVSPACE_ALLOWED_ROOTS: projectRoot,
