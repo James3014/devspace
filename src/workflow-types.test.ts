@@ -22,6 +22,8 @@ assert.deepEqual(
   }),
   {
     prompt: "hi",
+    profileName: null,
+    profileFingerprint: null,
     provider: "codex",
     model: null,
     effort: "high",
@@ -37,6 +39,8 @@ assert.deepEqual(
   }),
   {
     prompt: "x",
+    profileName: null,
+    profileFingerprint: null,
     provider: "claude",
     model: null,
     effort: null,
