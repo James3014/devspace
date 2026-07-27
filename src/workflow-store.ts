@@ -764,9 +764,9 @@ export class WorkflowStore {
 
     const reaped: WorkflowRunRecord[] = [];
     for (const row of candidates) {
-      if (row.pid !== null && isPidAlive(row.pid)) continue;
       const latest = this.getRun(row.id);
       if (!latest || (latest.status !== "running" && latest.status !== "starting")) continue;
+      if (latest.pid !== undefined && isPidAlive(latest.pid)) continue;
       const failed = this.failRun(row.id, {
         error: latest.status === "starting" ? "workflow worker failed to start" : "worker heartbeat lost",
         errorKind: "heartbeat",

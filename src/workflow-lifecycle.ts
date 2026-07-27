@@ -115,13 +115,14 @@ export function startWorkflowReaper(
   const staleAfterMs = Math.max(1, options.staleAfterMs ?? DEFAULT_STALE_AFTER_MS);
 
   const tick = (): void => {
-    const store = createWorkflowStore(config);
+    let store: WorkflowStore | undefined;
     try {
+      store = createWorkflowStore(config);
       reapStaleWorkflows(store, staleAfterMs);
     } catch (error) {
       options.onError?.(error);
     } finally {
-      store.close();
+      store?.close();
     }
   };
 
