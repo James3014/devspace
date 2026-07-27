@@ -76,7 +76,7 @@ export interface WorkflowReplayHit {
   structuredJson?: string;
   returnValueJson: string;
   providerSessionId?: string;
-  replayMatch: "same_index" | "compatible_key";
+  replayMatch: "same_index";
   replayedFromRunId: string;
   replayedFromCallIndex: number;
 }
@@ -125,7 +125,7 @@ export interface WorkflowJournal {
     phase?: string;
     isolation?: AgentIsolationMode;
     worktreePath?: string;
-    replayMatch?: "same_index" | "compatible_key";
+    replayMatch?: "same_index";
     replayedFromRunId?: string;
     replayedFromCallIndex?: number;
     replayReason?: string;
