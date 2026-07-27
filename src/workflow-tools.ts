@@ -410,7 +410,7 @@ async function yieldEvents(
     terminal = page.terminal;
     run = page.run;
     if (terminal || Date.now() >= deadline) break;
-    if (hasMore) continue;
+    if (hasMore) break;
     await sleep(250);
   }
 
