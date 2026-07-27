@@ -17,9 +17,9 @@ import { executeWorkflow, mapEngineErrorKind } from "./workflow-engine.js";
 import {
   parseWorkflowArgFlagsResult,
   persistWorkflowScriptResult,
-  readProjectWorkflowScriptFile,
+  readProjectWorkflowScriptFileResult,
   readWorkflowScriptFileResult,
-  resolveNamedWorkflowScript,
+  resolveNamedWorkflowScriptResult,
   resolveWorkflowScriptFromPathOrNameResult,
 } from "./workflow-files.js";
 import { createWorkflowReplay } from "./workflow-replay.js";
@@ -415,19 +415,20 @@ export async function runWorkflowWorker(
       },
       resolveNestedSource: async (ref) => {
         if (typeof ref === "string") {
-          const named = await resolveNamedWorkflowScript({
+          const named = await resolveNamedWorkflowScriptResult({
             name: ref,
             workspaceRoot: claimed.workspaceRoot,
             stateDir: config.stateDir,
           });
-          return named.source;
+          if (named.isErr()) throw named.error;
+          return named.value.source;
         }
-        return (
-          await readProjectWorkflowScriptFile({
-            scriptPath: ref.scriptPath,
-            workspaceRoot: claimed.workspaceRoot,
-          })
-        ).source;
+        const nested = await readProjectWorkflowScriptFileResult({
+          scriptPath: ref.scriptPath,
+          workspaceRoot: claimed.workspaceRoot,
+        });
+        if (nested.isErr()) throw nested.error;
+        return nested.value.source;
       },
     });
 
