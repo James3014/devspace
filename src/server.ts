@@ -46,7 +46,11 @@ import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
-import { summarizeLocalAgentProfile } from "./local-agent-profiles.js";
+import { buildLocalAgentCatalog } from "./local-agent-catalog.js";
+import { registerWorkflowTools } from "./workflow-tools.js";
+import { startWorkflowReaper } from "./workflow-lifecycle.js";
+import { createWorkflowStore } from "./workflow-store.js";
+import { loadActiveWorkflowSummaries } from "./workflow-ui.js";
 import {
   formatLocalAgentProviderAvailabilitySummary,
   getLocalAgentProviderAvailabilitySnapshot,
@@ -206,19 +210,10 @@ function formatVisibleAgent(agent: {
   provider: string;
   model?: string;
   effort?: string;
-  providerAvailable?: boolean;
-  providerUnavailableReason?: string;
 }): string {
   const model = agent.model ? `, model ${agent.model}` : "";
   const effort = agent.effort ? `, effort ${agent.effort}` : "";
-  const availability = agent.providerAvailable === false
-    ? `, unavailable: ${agent.providerUnavailableReason ?? "provider unavailable"}`
-    : "";
-  return `${agent.name} (${agent.provider}${model}${effort}${availability})`;
-}
-
-function formatUnavailableAgentProvider(provider: LocalAgentProviderAvailability): string {
-  return `${provider.name} (${provider.reason ?? "unavailable"})`;
+  return `${agent.name} (${agent.provider}${model}${effort})`;
 }
 
 function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
@@ -249,18 +244,74 @@ const workspaceLocalAgentOutputSchema = z.object({
   provider: z.string(),
   model: z.string().optional(),
   effort: z.string().optional(),
-  providerAvailable: z.boolean().optional(),
-  providerUnavailableReason: z.string().optional(),
 });
 
 const workspaceLocalAgentProviderOutputSchema = z.object({
   name: z.string(),
-  available: z.boolean(),
-  reason: z.string().optional(),
+  model: z.object({
+    supported: z.boolean(),
+    discovery: z.enum(["provider_static", "model_dependent", "session_dynamic"]),
+  }),
+  effort: z.object({
+    supported: z.boolean(),
+    semantics: z.enum(["reasoning_effort", "thinking_level", "model_variant"]),
+    discovery: z.enum(["provider_static", "model_dependent", "session_dynamic"]),
+  }),
 });
+
+export function openWorkspaceOutputSchema(config: ServerConfig): z.ZodRawShape {
+  return {
+    workspaceId: z.string(),
+    root: z.string(),
+    mode: z.enum(["checkout", "worktree"]),
+    sourceRoot: z.string().optional(),
+    worktree: z
+      .object({
+        path: z.string(),
+        baseRef: z.string(),
+        baseSha: z.string(),
+        dirtySource: z.boolean(),
+        detached: z.boolean(),
+        managed: z.boolean(),
+      })
+      .optional(),
+    agentsFiles: z.array(workspaceAgentsFileOutputSchema),
+    availableAgentsFiles: z.array(workspaceAvailableAgentsFileOutputSchema),
+    skills: z.array(workspaceSkillOutputSchema),
+    ...(config.subagents
+      ? {
+          agentProviders: z.array(workspaceLocalAgentProviderOutputSchema),
+          agents: z.array(workspaceLocalAgentOutputSchema),
+        }
+      : {}),
+    skillDiagnostics: z.array(z.unknown()),
+    ...(config.workflows
+      ? { activeWorkflows: z.array(workflowRunSummaryOutputSchema) }
+      : {}),
+    instruction: z.string(),
+  };
+}
 
 const workspaceAvailableAgentsFileOutputSchema = z.object({
   path: z.string(),
+});
+
+const workflowCallCountsOutputSchema = z.object({
+  running: z.number(),
+  completed: z.number(),
+  cached: z.number(),
+  failed: z.number(),
+  cancelled: z.number(),
+  observed: z.number(),
+});
+
+const workflowRunSummaryOutputSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  status: z.enum(["starting", "running", "completed", "failed", "cancelled"]),
+  currentPhase: z.string().optional(),
+  calls: workflowCallCountsOutputSchema,
+  updatedAt: z.string(),
 });
 
 const reviewFileOutputSchema = z.object({
@@ -704,10 +755,10 @@ function createMcpServer(
 
   registerAppResource(
     server,
-    "DevSpace Diff Card",
+    "DevSpace App",
     WORKSPACE_APP_URI,
     {
-      description: "Interactive card for viewing DevSpace file diffs.",
+      description: "Interactive DevSpace workspace, workflow, and file-change views.",
       _meta: {
         ui: {
           csp: appCsp(config),
@@ -757,29 +808,7 @@ function createMcpServer(
           .optional()
           .describe("Git ref to base a worktree on. Only used with mode=\"worktree\". Defaults to HEAD."),
       },
-      outputSchema: {
-        workspaceId: z.string(),
-        root: z.string(),
-        mode: z.enum(["checkout", "worktree"]),
-        sourceRoot: z.string().optional(),
-        worktree: z
-          .object({
-            path: z.string(),
-            baseRef: z.string(),
-            baseSha: z.string(),
-            dirtySource: z.boolean(),
-            detached: z.boolean(),
-            managed: z.boolean(),
-          })
-          .optional(),
-        agentsFiles: z.array(workspaceAgentsFileOutputSchema),
-        availableAgentsFiles: z.array(workspaceAvailableAgentsFileOutputSchema),
-        skills: z.array(workspaceSkillOutputSchema),
-        agentProviders: z.array(workspaceLocalAgentProviderOutputSchema),
-        agents: z.array(workspaceLocalAgentOutputSchema),
-        skillDiagnostics: z.array(z.unknown()),
-        instruction: z.string(),
-      },
+      outputSchema: openWorkspaceOutputSchema(config),
       ...toolWidgetDescriptorMeta(config, "workspace"),
       annotations: { readOnlyHint: true },
     },
@@ -799,16 +828,11 @@ function createMcpServer(
           description: skill.description,
           path: formatPathForPrompt(skill.filePath),
         }));
-      const visibleAgentProviders = config.subagents ? localAgentProviders : [];
-      const visibleAgents = workspace.agentProfiles.map((profile) => {
-        const summary = summarizeLocalAgentProfile(profile);
-        const availability = visibleAgentProviders.find((provider) => provider.name === summary.provider);
-        return {
-          ...summary,
-          providerAvailable: availability?.available,
-          providerUnavailableReason: availability?.reason,
-        };
-      });
+      const agentCatalog = config.subagents
+        ? buildLocalAgentCatalog(workspace.agentProfiles, localAgentProviders)
+        : undefined;
+      const visibleAgentProviders = agentCatalog?.providers ?? [];
+      const visibleAgents = agentCatalog?.profiles ?? [];
       const loadedAgentsFiles = agentsFiles.map((file) => ({
         path: formatAgentsPath(file.path, workspace.root),
         content: file.content,
@@ -816,6 +840,16 @@ function createMcpServer(
       const availableAgentsFileOutputs = availableAgentsFiles.map((file) => ({
         path: formatAgentsPath(file.path, workspace.root),
       }));
+      const activeWorkflows = config.workflows
+        ? (() => {
+            const workflowStore = createWorkflowStore(config);
+            try {
+              return loadActiveWorkflowSummaries(workflowStore, workspace.root);
+            } finally {
+              workflowStore.close();
+            }
+          })()
+        : undefined;
       const instruction = config.skillsEnabled
         ? "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file. When a task matches an available skill in skills, read its path before proceeding."
         : "Use this workspaceId in all subsequent tool calls for this project. Do not call open_workspace again for this same folder unless this workspaceId stops working, the user asks to reopen, or you switch to a different folder/worktree. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file.";
@@ -835,11 +869,8 @@ function createMcpServer(
             visibleSkills.length > 0
               ? `Available skills: ${visibleSkills.map((skill) => skill.name).join(", ")}`
               : undefined,
-            visibleAgentProviders.some((provider) => provider.available)
-              ? `Available subagent providers: ${visibleAgentProviders.filter((provider) => provider.available).map((provider) => provider.name).join(", ")}`
-              : undefined,
-            visibleAgentProviders.some((provider) => !provider.available)
-              ? `Unavailable subagent providers: ${visibleAgentProviders.filter((provider) => !provider.available).map(formatUnavailableAgentProvider).join(", ")}`
+            visibleAgentProviders.length > 0
+              ? `Available subagent providers: ${visibleAgentProviders.map((provider) => provider.name).join(", ")}`
               : undefined,
             visibleAgents.length > 0
               ? `Available subagent profiles: ${visibleAgents.map(formatVisibleAgent).join(", ")}`
@@ -869,8 +900,15 @@ function createMcpServer(
               agentsFiles: loadedAgentsFiles.length,
               availableAgentsFiles: availableAgentsFileOutputs.length,
               skills: visibleSkills.length,
-              agentProviders: visibleAgentProviders.length,
-              agents: visibleAgents.length,
+              ...(config.workflows
+                ? { activeWorkflows: activeWorkflows?.length ?? 0 }
+                : {}),
+              ...(config.subagents
+                ? {
+                    agentProviders: visibleAgentProviders.length,
+                    agents: visibleAgents.length,
+                  }
+                : {}),
               skillDiagnostics: workspace.skillDiagnostics.length,
             },
           },
@@ -884,8 +922,13 @@ function createMcpServer(
           agentsFiles: loadedAgentsFiles,
           availableAgentsFiles: availableAgentsFileOutputs,
           skills: visibleSkills,
-          agentProviders: visibleAgentProviders,
-          agents: visibleAgents,
+          ...(config.workflows ? { activeWorkflows: activeWorkflows ?? [] } : {}),
+          ...(config.subagents
+            ? {
+                agentProviders: visibleAgentProviders,
+                agents: visibleAgents,
+              }
+            : {}),
           skillDiagnostics: workspace.skillDiagnostics,
           instruction,
         },
@@ -1594,6 +1637,10 @@ function createMcpServer(
     registerCodexProcessTools(server, config, workspaces, processSessions);
   }
 
+  if (config.workflows) {
+    registerWorkflowTools(server, config, workspaces);
+  }
+
   return server;
 }
 
@@ -1621,6 +1668,15 @@ export function createServer(config = loadConfig()): RunningServer {
   const localAgentProviders = config.subagents
     ? getLocalAgentProviderAvailabilitySnapshot()
     : [];
+  const workflowReaper = config.workflows
+    ? startWorkflowReaper(config, {
+        onError: (error) => {
+          logEvent(config.logging, "warn", "workflow_reaper_failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        },
+      })
+    : undefined;
 
   const logSessionCloseResults = (
     reason: "idle_timeout" | "server_shutdown",
@@ -1808,6 +1864,7 @@ export function createServer(config = loadConfig()): RunningServer {
     close: () => {
       closePromise ??= (async () => {
         clearInterval(sessionCleanupTimer);
+        workflowReaper?.close();
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
         processSessions.shutdown();
