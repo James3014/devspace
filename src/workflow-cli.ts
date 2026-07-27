@@ -54,6 +54,11 @@ export async function runWorkflowCommand(
   config: ServerConfig,
 ): Promise<void> {
   const [subcommand, ...rest] = args;
+  if (!config.workflows) {
+    throw new Error(
+      "Dynamic workflows are disabled. Set DEVSPACE_WORKFLOWS=1 to enable the experimental feature.",
+    );
+  }
   switch (subcommand) {
     case "run":
       await runWorkflowRun(rest, config);

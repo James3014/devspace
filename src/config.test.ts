@@ -26,10 +26,23 @@ assert.equal(loadConfig(baseEnv).skillsEnabled, true);
 assert.equal(loadConfig(baseEnv).devspaceSkillsDir, join(emptyConfigDir, "skills"));
 assert.equal(loadConfig(baseEnv).devspaceAgentsDir, join(emptyConfigDir, "agents"));
 assert.equal(loadConfig(baseEnv).subagents, false);
+assert.equal(loadConfig(baseEnv).workflows, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "0" }).skillsEnabled, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "1" }).skillsEnabled, true);
 assert.equal(
   loadConfig({ ...baseEnv, DEVSPACE_SUBAGENTS: "1" }).subagents,
+  true,
+);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_SUBAGENTS: "1" }).workflows,
+  true,
+);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_SUBAGENTS: "1", DEVSPACE_WORKFLOWS: "0" }).workflows,
+  false,
+);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_WORKFLOWS: "1" }).workflows,
   true,
 );
 assert.equal(resolveSubagentsFlag({}, {}), undefined);

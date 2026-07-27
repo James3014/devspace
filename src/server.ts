@@ -839,7 +839,7 @@ function createMcpServer(
       const availableAgentsFileOutputs = availableAgentsFiles.map((file) => ({
         path: formatAgentsPath(file.path, workspace.root),
       }));
-      const activeWorkflows = config.subagents
+      const activeWorkflows = config.workflows
         ? (() => {
             const workflowStore = createWorkflowStore(config);
             try {
@@ -1629,7 +1629,7 @@ function createMcpServer(
     registerCodexProcessTools(server, config, workspaces, processSessions);
   }
 
-  if (config.subagents) {
+  if (config.workflows) {
     registerWorkflowTools(server, config, workspaces);
   }
 
@@ -1660,7 +1660,7 @@ export function createServer(config = loadConfig()): RunningServer {
   const localAgentProviders = config.subagents
     ? getLocalAgentProviderAvailabilitySnapshot()
     : [];
-  const workflowReaper = config.subagents
+  const workflowReaper = config.workflows
     ? startWorkflowReaper(config, {
         onError: (error) => {
           logEvent(config.logging, "warn", "workflow_reaper_failed", {

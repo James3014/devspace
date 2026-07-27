@@ -282,6 +282,7 @@ async function runDoctor(): Promise<void> {
     console.log(`Allowed roots: ${config.allowedRoots.join(", ")}`);
     console.log(`Allowed hosts: ${config.allowedHosts.join(", ")}`);
     console.log(`Subagents: ${config.subagents ? "enabled" : "disabled"}`);
+    console.log(`Workflows: ${config.workflows ? "enabled" : "disabled"}`);
     if (config.subagents) {
       const snapshot = getLocalAgentProviderAvailabilitySnapshot();
       console.log(

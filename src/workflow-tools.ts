@@ -59,7 +59,7 @@ export function registerWorkflowTools(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
 ): void {
-  if (!config.subagents) return;
+  if (!config.workflows) return;
 
   registerAppTool(
     server,
