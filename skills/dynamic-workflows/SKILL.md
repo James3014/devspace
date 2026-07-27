@@ -28,7 +28,7 @@ devspace workflow call <runId> <callIndex>
 devspace workflow tui [runId]
 ```
 
-Named scripts: `.devspace/workflows/<name>.js` or `workflows/<name>.js`.
+Project named scripts live under `.devspace/workflows/<name>.js`.
 
 ## Script shape
 
@@ -56,7 +56,7 @@ return { summary, findings }
 
 | API | Notes |
 |---|---|
-| `agent(prompt, opts?)` | Throws on failure. `opts`: `label`, `phase`, `schema`, `model`, `effort`, `provider`, `isolation: 'worktree'` |
+| `agent(prompt, opts?)` | Throws on failure. `opts`: `label`, `phase`, `schema`, `model`, `effort`, `profile` or `provider`, `isolation: 'worktree'` |
 | `parallel(thunks)` | Barrier; throw → `null` slot |
 | `pipeline(items, ...stages)` | Per-item chains; no cross-item barrier |
 | `phase(title)` / `log(msg)` | Progress; journaled |
@@ -85,7 +85,13 @@ const out = await agent('Return JSON findings', {
 
 ### Providers
 
-Default: first **enabled ∩ available** provider (`agentProviders.enabled` in config, else all live providers in product order). Override with `opts.provider` or `meta.defaultProvider`.
+Profiles exposed by `open_workspace` may be selected with `opts.profile`. The
+profile supplies instructions, provider, model, and effort defaults; per-call
+`model` and `effort` override those defaults. `profile` and `provider` are
+mutually exclusive.
+
+Without a profile, default provider resolution is `opts.provider` →
+`meta.defaultProvider` → first currently available provider.
 
 ### Resume
 

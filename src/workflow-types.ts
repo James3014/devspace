@@ -68,28 +68,7 @@ export const WORKFLOW_LIMITS = {
   eventDrainMax: 500,
 } as const;
 
-// ---------------------------------------------------------------------------
-// Provider config (user config / ServerConfig)
-// ---------------------------------------------------------------------------
-
 export type AgentProviderId = LocalAgentProvider;
-
-export interface AgentProviderProbe {
-  id: AgentProviderId;
-  available: boolean;
-  detail?: string;
-}
-
-/**
- * Ordered enable-list. index 0 = default fallback after live availability filter.
- * Missing block on disk → compat all-available in product order.
- * Explicit enabled: [] → no providers; first agent() fails.
- */
-export interface AgentProvidersConfig {
-  enabled: AgentProviderId[];
-  detectedAt?: string;
-  lastProbe?: AgentProviderProbe[];
-}
 
 // ---------------------------------------------------------------------------
 // Status / events
@@ -143,6 +122,8 @@ export interface WorkflowAgentCallRecord {
   provider: AgentProviderId;
   model?: string;
   effort?: string;
+  profileName?: string;
+  profileFingerprint?: string;
   label?: string;
   phase?: string;
   status: WorkflowAgentCallStatus;
@@ -176,6 +157,8 @@ export interface WorkflowAgentCallRecord {
  */
 export interface AgentCacheKeyInput {
   prompt: string;
+  profileName: string | null;
+  profileFingerprint: string | null;
   provider: AgentProviderId;
   model: string | null;
   effort: string | null;
@@ -185,6 +168,8 @@ export interface AgentCacheKeyInput {
 
 export function buildAgentCacheKeyInput(input: {
   prompt: string;
+  profileName?: string | null;
+  profileFingerprint?: string | null;
   provider: AgentProviderId;
   model?: string | null;
   effort?: string | null;
@@ -195,6 +180,8 @@ export function buildAgentCacheKeyInput(input: {
     input.isolation === "worktree" ? "worktree" : "shared";
   return {
     prompt: input.prompt,
+    profileName: input.profileName ?? null,
+    profileFingerprint: input.profileFingerprint ?? null,
     provider: input.provider,
     model: input.model ?? null,
     effort: input.effort ?? null,

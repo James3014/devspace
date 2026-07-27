@@ -13,6 +13,7 @@ import {
   type CreateAgentWorktree,
 } from "./workflow-api.js";
 import { createStubBudget, WORKFLOW_LIMITS } from "./workflow-types.js";
+import type { LocalAgentProfile } from "./local-agent-profiles.js";
 
 // ---------------------------------------------------------------------------
 // Semaphore
@@ -56,7 +57,7 @@ import { createStubBudget, WORKFLOW_LIMITS } from "./workflow-types.js";
     concurrency: 4,
     signal: new AbortController().signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    availableProviders: ["codex"],
     runProvider: async (input) => {
       order.push(`start:${input.prompt}`);
       await new Promise((r) => setTimeout(r, 10));
@@ -101,7 +102,7 @@ import { createStubBudget, WORKFLOW_LIMITS } from "./workflow-types.js";
     concurrency: 4,
     signal: new AbortController().signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    availableProviders: ["codex"],
     runProvider: async () => ({ finalResponse: "x" }),
   });
 
@@ -164,7 +165,7 @@ import { createStubBudget, WORKFLOW_LIMITS } from "./workflow-types.js";
     concurrency: 4,
     signal: new AbortController().signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    availableProviders: ["codex"],
     runProvider: async (input: WorkflowProviderRunInput) => {
       seen.push({ prompt: input.prompt, phase: input.phase });
       await new Promise((r) => setTimeout(r, 15));
@@ -225,7 +226,7 @@ import { createStubBudget, WORKFLOW_LIMITS } from "./workflow-types.js";
     concurrency: 2,
     signal: new AbortController().signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    availableProviders: ["codex"],
     createWorktree,
     runProvider: async (input) => {
       assert.equal(input.workspace, worktrees[0]);
@@ -264,7 +265,7 @@ import { createStubBudget, WORKFLOW_LIMITS } from "./workflow-types.js";
     concurrency: 1,
     signal: new AbortController().signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    availableProviders: ["codex"],
     createWorktree: async () => {
       throw new Error("expected worktree setup failure");
     },
@@ -311,7 +312,7 @@ import { createStubBudget, WORKFLOW_LIMITS } from "./workflow-types.js";
     concurrency: 1,
     signal: new AbortController().signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex", "claude"],
+    availableProviders: ["codex", "claude"],
     runProvider: async (input) => {
       used.push(input.provider);
       return { finalResponse: input.provider };
@@ -323,6 +324,96 @@ import { createStubBudget, WORKFLOW_LIMITS } from "./workflow-types.js";
     async () => api.agent("z", { writeMode: "allowed" } as never),
     /writeMode is not supported/,
   );
+  store.close();
+  await rm(dir, { recursive: true, force: true });
+}
+
+// ---------------------------------------------------------------------------
+// configured profile selection, defaults, overrides, and prompt instructions
+// ---------------------------------------------------------------------------
+{
+  const dir = await mkdtemp(join(tmpdir(), "wf-profile-"));
+  const store = new WorkflowStore(dir);
+  const run = store.createRun({
+    name: "profile",
+    source: "inline",
+    scriptPath: "inline",
+    scriptHash: "h",
+    workspaceRoot: dir,
+  });
+  const profile: LocalAgentProfile = {
+    name: "reviewer",
+    description: "Review changes",
+    provider: "claude",
+    model: "sonnet",
+    effort: "medium",
+    filePath: join(dir, "reviewer.md"),
+    body: "Act as an adversarial reviewer.",
+    disabled: false,
+  };
+  const calls: WorkflowProviderRunInput[] = [];
+  const api = createWorkflowApi({
+    runId: run.id,
+    journal: store,
+    meta: { name: "profile", description: "d", defaultProvider: "codex" },
+    args: undefined,
+    concurrency: 1,
+    signal: new AbortController().signal,
+    workspaceRoot: dir,
+    availableProviders: ["codex", "claude"],
+    agentProfiles: [profile],
+    runProvider: async (input) => {
+      calls.push(input);
+      return { finalResponse: "reviewed" };
+    },
+  });
+
+  assert.equal(
+    await api.agent("Review auth", {
+      profile: "reviewer",
+      model: "opus",
+      effort: "high",
+    }),
+    "reviewed",
+  );
+  assert.equal(calls[0]?.provider, "claude");
+  assert.equal(calls[0]?.model, "opus");
+  assert.equal(calls[0]?.effort, "high");
+  assert.equal(
+    calls[0]?.prompt,
+    "Act as an adversarial reviewer.\n\nTask:\nReview auth",
+  );
+  assert.equal(store.getAgentCall(run.id, 0)?.profileName, "reviewer");
+  assert.equal(store.getAgentCall(run.id, 0)?.profileFingerprint?.length, 64);
+
+  const callAgent = api.agent as (prompt: string, opts?: unknown) => Promise<unknown>;
+  await assert.rejects(
+    () => callAgent("x", { profile: "reviewer", provider: "codex" }),
+    /mutually exclusive/,
+  );
+  await assert.rejects(() => callAgent("x", { profile: "missing" }), /Unknown agent profile/);
+
+  const unavailableApi = createWorkflowApi({
+    runId: run.id,
+    journal: store,
+    meta: { name: "profile", description: "d" },
+    args: undefined,
+    concurrency: 1,
+    signal: new AbortController().signal,
+    workspaceRoot: dir,
+    availableProviders: ["codex"],
+    agentProfiles: [profile],
+    runProvider: async () => ({ finalResponse: "unreachable" }),
+  });
+  await assert.rejects(
+    () =>
+      (unavailableApi.agent as (prompt: string, opts?: unknown) => Promise<unknown>)(
+        "x",
+        { profile: "reviewer" },
+      ),
+    /requires unavailable provider claude/,
+  );
+
   store.close();
   await rm(dir, { recursive: true, force: true });
 }
@@ -349,7 +440,7 @@ import { createStubBudget, WORKFLOW_LIMITS } from "./workflow-types.js";
     concurrency: 1,
     signal: new AbortController().signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    availableProviders: ["codex"],
     runProvider: async (input) => {
       calls.push(input);
       if (calls.length === 1) {
@@ -403,7 +494,7 @@ import { createStubBudget, WORKFLOW_LIMITS } from "./workflow-types.js";
     concurrency: 1,
     signal: new AbortController().signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    availableProviders: ["codex"],
     runProvider: async () => ({ finalResponse: response }),
   });
 
@@ -435,7 +526,7 @@ import { createStubBudget, WORKFLOW_LIMITS } from "./workflow-types.js";
     concurrency: 1,
     signal: new AbortController().signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    availableProviders: ["codex"],
     runProvider: async () => ({
       finalResponse: JSON.stringify({ big }),
       structured: { big },
@@ -475,15 +566,16 @@ import { createStubBudget, WORKFLOW_LIMITS } from "./workflow-types.js";
   await writeFile(
     childPath,
     `
-export const meta = { name: 'child', description: 'nested' }
+export const meta = { name: 'child', description: 'nested', defaultProvider: 'claude' }
 return await agent('nested-prompt')
 `,
   );
 
   const prompts: string[] = [];
+  const providers: string[] = [];
   const { result, callCount } = await executeWorkflow({
     source: `
-export const meta = { name: 'parent', description: 'p' }
+export const meta = { name: 'parent', description: 'p', defaultProvider: 'codex' }
 const a = await agent('parent-prompt')
 const nested = await workflow({ scriptPath: ${JSON.stringify(childPath)} })
 return { a, nested }
@@ -491,9 +583,10 @@ return { a, nested }
     runId: run.id,
     journal: store,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    availableProviders: ["codex", "claude"],
     runProvider: async (input) => {
       prompts.push(input.prompt);
+      providers.push(input.provider);
       return { finalResponse: `R:${input.prompt}` };
     },
     resolveNestedSource: async (ref) => {
@@ -511,6 +604,7 @@ return { a, nested }
   });
   assert.equal(callCount, 2);
   assert.deepEqual(prompts, ["parent-prompt", "nested-prompt"]);
+  assert.deepEqual(providers, ["codex", "claude"]);
 
   // depth 2 must fail
   await assert.rejects(
@@ -526,7 +620,7 @@ return await workflow({ scriptPath: ${JSON.stringify(childPath)} }).then(async (
         runId: run.id,
         journal: store,
         workspaceRoot: dir,
-        enabledProviders: ["codex"],
+        availableProviders: ["codex"],
         runProvider: async () => ({ finalResponse: "x" }),
         resolveNestedSource: async () => `
 export const meta = { name: 'mid', description: 'm' }
@@ -563,7 +657,7 @@ return await workflow({ scriptPath: 'x' })
     concurrency: 1,
     signal: ac.signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    availableProviders: ["codex"],
     runProvider: async () => {
       ac.abort();
       return { finalResponse: "late" };

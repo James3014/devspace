@@ -3,7 +3,12 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
-import { loadLocalAgentProfiles, summarizeLocalAgentProfile } from "./local-agent-profiles.js";
+import {
+  buildLocalAgentProfilePrompt,
+  fingerprintLocalAgentProfile,
+  loadLocalAgentProfiles,
+  summarizeLocalAgentProfile,
+} from "./local-agent-profiles.js";
 import type { ServerConfig } from "./config.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-agent-profiles-test-"));
@@ -73,6 +78,15 @@ try {
   assert.equal(profiles[0]?.model, "sonnet");
   assert.equal(profiles[0]?.effort, "high");
   assert.equal(profiles[0]?.body, "Project body.");
+  assert.equal(
+    buildLocalAgentProfilePrompt(profiles[0]!, "Review auth"),
+    "Project body.\n\nTask:\nReview auth",
+  );
+  assert.equal(fingerprintLocalAgentProfile(profiles[0]!).length, 64);
+  assert.notEqual(
+    fingerprintLocalAgentProfile(profiles[0]!),
+    fingerprintLocalAgentProfile({ ...profiles[0]!, body: "Changed body." }),
+  );
   assert.deepEqual(summarizeLocalAgentProfile(profiles[0]!), {
     name: "reviewer",
     description: "Project reviewer #1.",

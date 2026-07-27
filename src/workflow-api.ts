@@ -1,7 +1,14 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import type { WorkflowSandboxApi } from "./workflow-sandbox.js";
-import type { LocalAgentProvider } from "./local-agent-profiles.js";
+import {
+  type LocalAgentProfile,
+  type LocalAgentProvider,
+} from "./local-agent-profiles.js";
+import {
+  LocalAgentResolutionError,
+  resolveLocalAgentExecution,
+} from "./local-agent-resolution.js";
 import type { JsonSchema, JsonValue } from "./json-types.js";
 import { jsonValueSchema } from "./json-types.js";
 import {
@@ -109,6 +116,8 @@ export interface WorkflowJournal {
     provider: LocalAgentProvider;
     model?: string;
     effort?: string;
+    profileName?: string;
+    profileFingerprint?: string;
     label?: string;
     phase?: string;
     isolation?: AgentIsolationMode;
@@ -149,8 +158,10 @@ export interface WorkflowApiDeps {
   signal: AbortSignal;
   workspaceRoot: string;
   baseSha?: string;
-  /** Already-filtered enabled ∩ live provider ids, preference order. */
-  enabledProviders: LocalAgentProvider[];
+  /** Currently available provider ids in stable preference order. */
+  availableProviders: LocalAgentProvider[];
+  /** Loaded profiles available to this project. */
+  agentProfiles?: LocalAgentProfile[];
   runProvider: WorkflowRunProvider;
   createWorktree?: CreateAgentWorktree;
   replay?: WorkflowReplay;
@@ -163,6 +174,7 @@ export interface WorkflowApiDeps {
     nestDepth: number;
   }) => Promise<unknown>;
   nestDepth?: number;
+  runtime?: WorkflowApiRuntime;
 }
 
 export interface WorkflowApi extends WorkflowSandboxApi {
@@ -174,9 +186,9 @@ export class WorkflowEngineError extends Error {
   constructor(
     readonly kind:
       | "cancelled"
-      | "provider_disabled"
       | "provider_unavailable"
       | "no_provider"
+      | "profile"
       | "nest_depth"
       | "worktree"
       | "schema"
@@ -232,6 +244,18 @@ export class WorkflowSemaphore {
   }
 }
 
+export interface WorkflowApiRuntime {
+  semaphore: WorkflowSemaphore;
+  callIndex: number;
+}
+
+export function createWorkflowApiRuntime(concurrency: number): WorkflowApiRuntime {
+  return {
+    semaphore: new WorkflowSemaphore(Math.max(1, concurrency)),
+    callIndex: 0,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // API factory
 // ---------------------------------------------------------------------------
@@ -240,8 +264,8 @@ const phaseAls = new AsyncLocalStorage<string>();
 
 export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
   const nestDepth = deps.nestDepth ?? 0;
-  const semaphore = new WorkflowSemaphore(Math.max(1, deps.concurrency));
-  let callIndex = 0;
+  const runtime = deps.runtime ?? createWorkflowApiRuntime(deps.concurrency);
+  const semaphore = runtime.semaphore;
 
   const agent = async (prompt: unknown, opts: unknown = {}): Promise<unknown> => {
     if (typeof prompt !== "string" || !prompt.trim()) {
@@ -250,18 +274,28 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
     const agentOpts = normalizeAgentOpts(opts);
     throwIfCancelled(deps);
 
-    const provider = resolveProvider(agentOpts.provider, deps.meta, deps.enabledProviders);
+    const target = resolveAgentTarget(prompt, agentOpts, deps);
+    const {
+      provider,
+      model,
+      effort,
+      profileName,
+      profileFingerprint,
+      providerPrompt,
+    } = target;
     const phase = agentOpts.phase ?? phaseAls.getStore();
     const isolation: AgentIsolationMode =
       agentOpts.isolation === "worktree" ? "worktree" : "shared";
-    const index = callIndex;
-    callIndex += 1;
+    const index = runtime.callIndex;
+    runtime.callIndex += 1;
 
     const cacheKeyInput = buildAgentCacheKeyInput({
       prompt,
+      profileName,
+      profileFingerprint,
       provider,
-      model: agentOpts.model,
-      effort: agentOpts.effort,
+      model,
+      effort,
       schema: agentOpts.schema,
       isolation,
     });
@@ -277,8 +311,10 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
           prompt,
           schemaJson: agentOpts.schema ? JSON.stringify(agentOpts.schema) : undefined,
           provider,
-          model: agentOpts.model,
-          effort: agentOpts.effort,
+          model,
+          effort,
+          profileName,
+          profileFingerprint,
           label: agentOpts.label,
           phase,
           isolation,
@@ -349,8 +385,10 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
         prompt,
         schemaJson: agentOpts.schema ? JSON.stringify(agentOpts.schema) : undefined,
         provider,
-        model: agentOpts.model,
-        effort: agentOpts.effort,
+        model,
+        effort,
+        profileName,
+        profileFingerprint,
         label: agentOpts.label,
         phase,
         isolation,
@@ -377,9 +415,9 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
       const cwd = worktreePath ?? deps.workspaceRoot;
       const providerBase = {
         provider,
-        prompt,
-        model: agentOpts.model,
-        effort: agentOpts.effort,
+        prompt: providerPrompt,
+        model,
+        effort,
         workspace: cwd,
         signal: deps.signal,
         label: agentOpts.label,
@@ -395,7 +433,7 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
         const { enforceAgentSchema } = await import("./workflow-schema.js");
         const enforced = await enforceAgentSchema({
           schema: agentOpts.schema,
-          prompt,
+          prompt: providerPrompt,
           provider,
           run: (p, options) =>
             deps.runProvider({
@@ -640,7 +678,7 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
     budget: createStubBudget(),
     workflow: workflow as WorkflowSandboxApi["workflow"],
     meta: deps.meta,
-    getCallCount: () => callIndex,
+    getCallCount: () => runtime.callIndex,
     getNestDepth: () => nestDepth,
   };
 }
@@ -660,34 +698,48 @@ export function hashCacheKey(input: ReturnType<typeof buildAgentCacheKeyInput>):
   return createHash("sha256").update(JSON.stringify(input)).digest("hex");
 }
 
-export function resolveProvider(
-  optsProvider: LocalAgentProvider | undefined,
-  meta: WorkflowMeta,
-  enabledProviders: LocalAgentProvider[],
-): LocalAgentProvider {
-  if (optsProvider) {
-    if (!enabledProviders.includes(optsProvider)) {
-      throw new WorkflowEngineError(
-        "provider_disabled",
-        `Provider ${optsProvider} is not enabled or not available`,
-      );
-    }
-    return optsProvider;
+interface ResolvedAgentTarget {
+  provider: LocalAgentProvider;
+  model?: string;
+  effort?: string;
+  profileName?: string;
+  profileFingerprint?: string;
+  providerPrompt: string;
+}
+
+function resolveAgentTarget(
+  prompt: string,
+  opts: AgentOpts,
+  deps: Pick<WorkflowApiDeps, "agentProfiles" | "availableProviders" | "meta">,
+): ResolvedAgentTarget {
+  try {
+    const resolved = resolveLocalAgentExecution({
+      prompt,
+      profile: opts.profile,
+      provider: opts.provider,
+      defaultProvider: deps.meta.defaultProvider,
+      model: opts.model,
+      effort: opts.effort,
+      profiles: deps.agentProfiles ?? [],
+      availableProviders: deps.availableProviders,
+    });
+    return {
+      provider: resolved.provider,
+      model: resolved.model,
+      effort: resolved.effort,
+      profileName: resolved.profileName,
+      profileFingerprint: resolved.profileFingerprint,
+      providerPrompt: resolved.prompt,
+    };
+  } catch (error) {
+    if (!(error instanceof LocalAgentResolutionError)) throw error;
+    const kind = error.kind === "profile_not_found"
+      ? "profile"
+      : error.kind === "no_provider"
+        ? "no_provider"
+        : "provider_unavailable";
+    throw new WorkflowEngineError(kind, error.message);
   }
-  if (meta.defaultProvider) {
-    if (!enabledProviders.includes(meta.defaultProvider)) {
-      throw new WorkflowEngineError(
-        "provider_unavailable",
-        `meta.defaultProvider ${meta.defaultProvider} is not enabled or not available`,
-      );
-    }
-    return meta.defaultProvider;
-  }
-  const first = enabledProviders[0];
-  if (!first) {
-    throw new WorkflowEngineError("no_provider", "No agent providers enabled");
-  }
-  return first;
 }
 
 function normalizeAgentOpts(opts: unknown): AgentOpts {
@@ -699,7 +751,13 @@ function normalizeAgentOpts(opts: unknown): AgentOpts {
   if (parsed.success) return parsed.data;
   const issue = parsed.error.issues[0];
   const path = issue?.path.join(".") || "opts";
-  const kind = path === "schema" ? "schema" : path === "isolation" ? "worktree" : "internal";
+  const kind = path === "schema"
+    ? "schema"
+    : path === "isolation"
+      ? "worktree"
+      : path === "profile" || issue?.message.includes("profile and provider")
+        ? "profile"
+        : "internal";
   throw new WorkflowEngineError(
     kind,
     `Invalid agent ${path}: ${issue?.message ?? "validation failed"}`,

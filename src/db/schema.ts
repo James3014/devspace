@@ -162,6 +162,8 @@ export const workflowAgentCalls = sqliteTable(
     provider: text("provider").notNull(),
     model: text("model"),
     effort: text("effort"),
+    profileName: text("profile_name"),
+    profileFingerprint: text("profile_fingerprint"),
     label: text("label"),
     phase: text("phase"),
     status: text("status").notNull(),

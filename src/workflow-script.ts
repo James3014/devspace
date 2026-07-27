@@ -48,14 +48,6 @@ export function parseWorkflowScript(
   // Strip only the leading `export ` so line numbers stay aligned (7 spaces).
   const body = normalized.replace(META_EXPORT, "       const meta =");
 
-  // Reject further imports / exports after transform
-  if (/\bimport\s+/.test(body) || /\bexport\s+/.test(body)) {
-    throw new WorkflowScriptError(
-      "syntax",
-      "Workflow scripts may not use import or additional export statements",
-    );
-  }
-
   // Workflow APIs are installed as context-realm globals by the sandbox child.
   // Keeping the factory argument-free avoids handing host-realm functions or
   // constructors directly to model-authored workflow code.
@@ -114,27 +106,29 @@ function extractMetaLiteral(source: string): { metaLiteral: string; metaEndIndex
   const end = scanBalancedObject(source, objectStart);
   const metaLiteral = source.slice(objectStart, end + 1);
 
-  // Purity: no calls, spreads, templates inside meta (rough static checks)
-  if (/[`$]/.test(metaLiteral) && /\$\{/.test(metaLiteral)) {
-    throw new WorkflowScriptError("meta", "meta must be a pure literal (no template interpolation)");
-  }
-  if (/\.\.\./.test(metaLiteral)) {
-    throw new WorkflowScriptError("meta", "meta must be a pure literal (no spreads)");
-  }
-  // Disallow identifier references that look like calls: word(
-  if (/\b[A-Za-z_$][\w$]*\s*\(/.test(metaLiteral)) {
-    throw new WorkflowScriptError("meta", "meta must be a pure literal (no function calls)");
-  }
-
   return { metaLiteral, metaEndIndex: end + 1 };
 }
 
 function scanBalancedObject(source: string, start: number): number {
   let depth = 0;
   let inString: '"' | "'" | null = null;
+  let inLineComment = false;
+  let inBlockComment = false;
   let escape = false;
   for (let i = start; i < source.length; i += 1) {
     const ch = source[i]!;
+    const next = source[i + 1];
+    if (inLineComment) {
+      if (ch === "\n") inLineComment = false;
+      continue;
+    }
+    if (inBlockComment) {
+      if (ch === "*" && next === "/") {
+        inBlockComment = false;
+        i += 1;
+      }
+      continue;
+    }
     if (inString) {
       if (escape) {
         escape = false;
@@ -145,6 +139,16 @@ function scanBalancedObject(source: string, start: number): number {
         continue;
       }
       if (ch === inString) inString = null;
+      continue;
+    }
+    if (ch === "/" && next === "/") {
+      inLineComment = true;
+      i += 1;
+      continue;
+    }
+    if (ch === "/" && next === "*") {
+      inBlockComment = true;
+      i += 1;
       continue;
     }
     if (ch === '"' || ch === "'") {
@@ -169,23 +173,210 @@ function isOnlyPreamble(text: string): boolean {
   return stripped.length === 0;
 }
 
-function evaluateMetaLiteral(literal: string, filename: string): unknown {
+function evaluateMetaLiteral(literal: string, _filename: string): unknown {
   try {
-    const value = vm.runInNewContext(`(${literal})`, Object.create(null), {
-      filename: `${filename}:meta`,
-      timeout: 1000,
-    });
-    // Rehydrate into the host realm — vm values keep context prototypes which
-    // break assert.deepEqual and other host identity checks.
-    return JSON.parse(JSON.stringify(value));
+    return new PureMetaLiteralParser(literal).parse();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new WorkflowScriptError("meta", `Invalid meta literal: ${message}`);
   }
 }
 
+class PureMetaLiteralParser {
+  private index = 0;
+
+  constructor(private readonly source: string) {}
+
+  parse(): unknown {
+    this.skipTrivia();
+    const value = this.parseValue();
+    this.skipTrivia();
+    if (this.index !== this.source.length) {
+      this.fail(`unexpected token ${JSON.stringify(this.source[this.index])}`);
+    }
+    return value;
+  }
+
+  private parseValue(): unknown {
+    this.skipTrivia();
+    const ch = this.source[this.index];
+    if (ch === "{") return this.parseObject();
+    if (ch === "[") return this.parseArray();
+    if (ch === '"' || ch === "'") return this.parseString();
+    if (ch === "-" || (ch !== undefined && /\d/.test(ch))) return this.parseNumber();
+    if (ch !== undefined && /[A-Za-z_$]/.test(ch)) {
+      const identifier = this.parseIdentifier();
+      if (identifier === "true") return true;
+      if (identifier === "false") return false;
+      if (identifier === "null") return null;
+      this.fail(`identifier ${identifier} is not a literal value`);
+    }
+    this.fail(`expected a literal value, got ${JSON.stringify(ch)}`);
+  }
+
+  private parseObject(): Record<string, unknown> {
+    this.expect("{");
+    const value: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    this.skipTrivia();
+    if (this.consume("}")) return value;
+
+    for (;;) {
+      this.skipTrivia();
+      const ch = this.source[this.index];
+      const key = ch === '"' || ch === "'" ? this.parseString() : this.parseIdentifier();
+      this.skipTrivia();
+      this.expect(":");
+      value[key] = this.parseValue();
+      this.skipTrivia();
+      if (this.consume("}")) return value;
+      this.expect(",");
+      this.skipTrivia();
+      if (this.consume("}")) return value;
+    }
+  }
+
+  private parseArray(): unknown[] {
+    this.expect("[");
+    const value: unknown[] = [];
+    this.skipTrivia();
+    if (this.consume("]")) return value;
+
+    for (;;) {
+      value.push(this.parseValue());
+      this.skipTrivia();
+      if (this.consume("]")) return value;
+      this.expect(",");
+      this.skipTrivia();
+      if (this.consume("]")) return value;
+    }
+  }
+
+  private parseString(): string {
+    const quote = this.source[this.index];
+    if (quote !== '"' && quote !== "'") this.fail("expected a quoted string");
+    this.index += 1;
+    let value = "";
+
+    while (this.index < this.source.length) {
+      const ch = this.source[this.index++]!;
+      if (ch === quote) return value;
+      if (ch === "\n" || ch === "\r") this.fail("unterminated string literal");
+      if (ch !== "\\") {
+        value += ch;
+        continue;
+      }
+
+      if (this.index >= this.source.length) this.fail("unterminated string escape");
+      const escaped = this.source[this.index++]!;
+      const simpleEscapes: Record<string, string> = {
+        "\\": "\\",
+        "\"": "\"",
+        "'": "'",
+        n: "\n",
+        r: "\r",
+        t: "\t",
+        b: "\b",
+        f: "\f",
+        v: "\v",
+        "0": "\0",
+      };
+      if (escaped in simpleEscapes) {
+        value += simpleEscapes[escaped];
+        continue;
+      }
+      if (escaped === "x") {
+        value += String.fromCodePoint(this.parseHexDigits(2));
+        continue;
+      }
+      if (escaped === "u") {
+        if (this.consume("{")) {
+          const end = this.source.indexOf("}", this.index);
+          if (end < 0) this.fail("unterminated Unicode escape");
+          const digits = this.source.slice(this.index, end);
+          if (!/^[0-9a-fA-F]{1,6}$/.test(digits)) this.fail("invalid Unicode escape");
+          this.index = end + 1;
+          const codePoint = Number.parseInt(digits, 16);
+          if (codePoint > 0x10ffff) this.fail("Unicode escape is out of range");
+          value += String.fromCodePoint(codePoint);
+        } else {
+          value += String.fromCodePoint(this.parseHexDigits(4));
+        }
+        continue;
+      }
+      if (escaped === "\n") continue;
+      if (escaped === "\r") {
+        this.consume("\n");
+        continue;
+      }
+      value += escaped;
+    }
+    this.fail("unterminated string literal");
+  }
+
+  private parseNumber(): number {
+    const match = this.source
+      .slice(this.index)
+      .match(/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/);
+    if (!match) this.fail("invalid number literal");
+    this.index += match[0].length;
+    const value = Number(match[0]);
+    if (!Number.isFinite(value)) this.fail("number literal must be finite");
+    return value;
+  }
+
+  private parseIdentifier(): string {
+    const match = this.source.slice(this.index).match(/^[A-Za-z_$][\w$]*/);
+    if (!match) this.fail("expected a static property name");
+    this.index += match[0].length;
+    return match[0];
+  }
+
+  private parseHexDigits(length: number): number {
+    const digits = this.source.slice(this.index, this.index + length);
+    if (digits.length !== length || !/^[0-9a-fA-F]+$/.test(digits)) {
+      this.fail("invalid hexadecimal escape");
+    }
+    this.index += length;
+    return Number.parseInt(digits, 16);
+  }
+
+  private skipTrivia(): void {
+    for (;;) {
+      while (this.index < this.source.length && /\s/.test(this.source[this.index]!)) {
+        this.index += 1;
+      }
+      if (this.source.startsWith("//", this.index)) {
+        const end = this.source.indexOf("\n", this.index + 2);
+        this.index = end < 0 ? this.source.length : end + 1;
+        continue;
+      }
+      if (this.source.startsWith("/*", this.index)) {
+        const end = this.source.indexOf("*/", this.index + 2);
+        if (end < 0) this.fail("unterminated block comment");
+        this.index = end + 2;
+        continue;
+      }
+      return;
+    }
+  }
+
+  private expect(token: string): void {
+    if (!this.consume(token)) this.fail(`expected ${JSON.stringify(token)}`);
+  }
+
+  private consume(token: string): boolean {
+    if (!this.source.startsWith(token, this.index)) return false;
+    this.index += token.length;
+    return true;
+  }
+
+  private fail(message: string): never {
+    throw new Error(`${message} at offset ${this.index}`);
+  }
+}
+
 function validateMeta(value: unknown): WorkflowMeta {
-  const parsed = workflowMetaSchema.safeParse(value);
+  const parsed = workflowMetaSchema.safeParse(value, { reportInput: true });
   if (parsed.success) return parsed.data;
 
   const issue = parsed.error.issues[0];

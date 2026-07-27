@@ -1,12 +1,17 @@
 import { availableParallelism } from "node:os";
-import type { LocalAgentProvider } from "./local-agent-profiles.js";
+import type {
+  LocalAgentProfile,
+  LocalAgentProvider,
+} from "./local-agent-profiles.js";
 import type { JsonValue } from "./json-types.js";
 import { parseWorkflowScript, type ParsedWorkflowScript } from "./workflow-script.js";
 import { runWorkflowSandbox } from "./workflow-sandbox.js";
 import {
   createWorkflowApi,
+  createWorkflowApiRuntime,
   type CreateAgentWorktree,
   type WorkflowApi,
+  type WorkflowApiRuntime,
   type WorkflowJournal,
   type WorkflowReplay,
   type WorkflowRunProvider,
@@ -35,13 +40,16 @@ export interface ExecuteWorkflowOptions {
   signal?: AbortSignal;
   workspaceRoot: string;
   baseSha?: string;
-  enabledProviders: LocalAgentProvider[];
+  availableProviders: LocalAgentProvider[];
+  agentProfiles?: LocalAgentProfile[];
   runProvider: WorkflowRunProvider;
   createWorktree?: CreateAgentWorktree;
   replay?: WorkflowReplay;
   resolveNestedSource?: (nameOrRef: string | { scriptPath: string }) => string | Promise<string>;
   nestDepth?: number;
   timeoutMs?: number;
+  /** Shared call counter/semaphore for nested workflow execution. */
+  runtime?: WorkflowApiRuntime;
   /** Optional hooks after API construction (tests). */
   onApi?: (api: WorkflowApi) => void;
 }
@@ -69,6 +77,7 @@ export async function executeWorkflow(
     resolveWorkflowConcurrency(parsed.meta.concurrency, availableParallelism());
 
   const resolveNestedSource = options.resolveNestedSource;
+  const runtime = options.runtime ?? createWorkflowApiRuntime(concurrency);
 
   // Shared callIndex/semaphore for nested scripts via parent API path.
   const api = createWorkflowApi({
@@ -80,21 +89,30 @@ export async function executeWorkflow(
     signal,
     workspaceRoot: options.workspaceRoot,
     baseSha: options.baseSha,
-    enabledProviders: options.enabledProviders,
+    availableProviders: options.availableProviders,
+    agentProfiles: options.agentProfiles,
     runProvider: options.runProvider,
     createWorktree: options.createWorktree,
     replay: options.replay,
+    runtime,
     nestDepth,
     resolveNestedSource,
     executeNested: resolveNestedSource
       ? async (input) =>
-          executeNestedOnApi({
-            parentOptions: options,
-            parentApi: api,
-            source: input.source,
-            args: input.args,
-            nestDepth: input.nestDepth,
-          })
+          (
+            await executeWorkflow({
+              ...options,
+              parsed: undefined,
+              source: input.source,
+              filename: "workflow:nested",
+              args: input.args,
+              signal,
+              concurrency,
+              runtime,
+              nestDepth: input.nestDepth,
+              onApi: undefined,
+            })
+          ).result
       : undefined,
   });
   options.onApi?.(api);
@@ -130,62 +148,6 @@ export async function executeWorkflow(
     throw error;
   }
 }
-
-/**
- * Nested script execution reusing parent's agent() call counter + semaphore
- * by constructing a child API that shares internal state via re-entry.
- *
- * Implementation: run child sandbox with a new API that has nestDepth+1 but
- * delegates agent/parallel/pipeline to the parent API (same callIndex).
- */
-async function executeNestedOnApi(input: {
-  parentOptions: ExecuteWorkflowOptions;
-  parentApi: WorkflowApi;
-  source: string;
-  args: JsonValue | undefined;
-  nestDepth: number;
-}): Promise<unknown> {
-  if (input.nestDepth > WORKFLOW_MAX_NEST_DEPTH_LOCAL) {
-    throw new WorkflowEngineError(
-      "nest_depth",
-      `workflow() nesting limited to ${WORKFLOW_MAX_NEST_DEPTH_LOCAL} level`,
-    );
-  }
-  const parsed = parseWorkflowScript(input.source, {
-    filename: "workflow:nested",
-  });
-
-  // Child surface: reuse parent agent/parallel/pipeline/phase/log/budget/workflow
-  // so callIndex + semaphore stay shared. Override args + meta for the child body.
-  const childApi: WorkflowApi = {
-    agent: input.parentApi.agent,
-    parallel: input.parentApi.parallel,
-    pipeline: input.parentApi.pipeline,
-    phase: input.parentApi.phase,
-    log: input.parentApi.log,
-    args: input.args,
-    budget: input.parentApi.budget,
-    // Child workflow() must see nestDepth via a wrapper that throws at depth>1.
-    workflow: async (...args: unknown[]) => {
-      throw new WorkflowEngineError(
-        "nest_depth",
-        `workflow() nesting limited to ${WORKFLOW_MAX_NEST_DEPTH_LOCAL} level`,
-      );
-    },
-    meta: parsed.meta,
-    getCallCount: () => input.parentApi.getCallCount(),
-    getNestDepth: () => input.nestDepth,
-  };
-
-  return runWorkflowSandbox({
-    parsed,
-    api: childApi,
-    timeoutMs: input.parentOptions.timeoutMs ?? WORKFLOW_HOST_TIMEOUT_MS,
-    signal: input.parentOptions.signal,
-  });
-}
-
-const WORKFLOW_MAX_NEST_DEPTH_LOCAL = 1;
 
 export function mapEngineErrorKind(error: unknown): WorkflowErrorKind {
   if (error instanceof WorkflowEngineError) {

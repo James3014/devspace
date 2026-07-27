@@ -84,6 +84,10 @@ function changedIdentityFields(
 ): Array<keyof AgentCacheKeyInput> {
   const changed: Array<keyof AgentCacheKeyInput> = [];
   if (prior.prompt !== current.prompt) changed.push("prompt");
+  if ((prior.profileName ?? null) !== current.profileName) changed.push("profileName");
+  if ((prior.profileFingerprint ?? null) !== current.profileFingerprint) {
+    changed.push("profileFingerprint");
+  }
   if (prior.provider !== current.provider) changed.push("provider");
   if ((prior.model ?? null) !== current.model) changed.push("model");
   if ((prior.effort ?? null) !== current.effort) changed.push("effort");

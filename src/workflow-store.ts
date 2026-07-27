@@ -55,6 +55,8 @@ export interface BeginAgentCallInput {
   provider: string;
   model?: string;
   effort?: string;
+  profileName?: string;
+  profileFingerprint?: string;
   label?: string;
   phase?: string;
   isolation?: AgentIsolationMode;
@@ -147,6 +149,8 @@ interface WorkflowAgentCallRow {
   provider: string;
   model: string | null;
   effort: string | null;
+  profile_name: string | null;
+  profile_fingerprint: string | null;
   label: string | null;
   phase: string | null;
   status: string;
@@ -638,11 +642,12 @@ export class WorkflowStore {
     this.database.sqlite
       .prepare(
         `insert into workflow_agent_calls (
-          run_id, call_index, cache_key, prompt, schema_json, provider, model, effort, label, phase,
+          run_id, call_index, cache_key, prompt, schema_json, provider, model, effort,
+          profile_name, profile_fingerprint, label, phase,
           status, from_cache, isolation, worktree_path, replay_match,
           replayed_from_run_id, replayed_from_call_index, replay_reason,
           created_at, started_at, updated_at
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 'false', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 'false', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.runId,
@@ -653,6 +658,8 @@ export class WorkflowStore {
         input.provider,
         input.model ?? null,
         input.effort ?? null,
+        input.profileName ?? null,
+        input.profileFingerprint ?? null,
         input.label ?? null,
         input.phase ?? null,
         isolation,
@@ -898,6 +905,8 @@ function rowToAgentCall(row: WorkflowAgentCallRow): WorkflowAgentCallRecord {
     provider: localAgentProviderSchema.parse(row.provider),
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
+    profileName: row.profile_name ?? undefined,
+    profileFingerprint: row.profile_fingerprint ?? undefined,
     label: row.label ?? undefined,
     phase: row.phase ?? undefined,
     status: workflowAgentCallStatusSchema.parse(row.status),

@@ -42,6 +42,11 @@ const migrations: Migration[] = [
     name: "workflow-exact-replay",
     up: migrateWorkflowExactReplay,
   },
+  {
+    version: 8,
+    name: "workflow-agent-profiles",
+    up: migrateWorkflowAgentProfiles,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -268,6 +273,8 @@ function migrateWorkflowJournal(sqlite: Database.Database): void {
       provider text not null,
       model text,
       effort text,
+      profile_name text,
+      profile_fingerprint text,
       label text,
       phase text,
       status text not null,
@@ -310,6 +317,11 @@ function migrateWorkflowReplayProvenance(sqlite: Database.Database): void {
 
 function migrateWorkflowExactReplay(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "workflow_agent_calls", "return_value_json", "text");
+}
+
+function migrateWorkflowAgentProfiles(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "workflow_agent_calls", "profile_name", "text");
+  addColumnIfMissing(sqlite, "workflow_agent_calls", "profile_fingerprint", "text");
 }
 
 function addColumnIfMissing(

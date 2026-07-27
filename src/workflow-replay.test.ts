@@ -20,15 +20,59 @@ function call(
   };
 }
 
-function identity(prompt = "prompt") {
+function identity(
+  prompt = "prompt",
+  profile: { name: string | null; fingerprint: string | null } = {
+    name: null,
+    fingerprint: null,
+  },
+) {
   return {
     prompt,
+    profileName: profile.name,
+    profileFingerprint: profile.fingerprint,
     provider: "codex" as const,
     model: null,
     effort: null,
     schema: null,
     isolation: "shared" as const,
   };
+}
+
+{
+  const replay = createWorkflowReplay([
+    call({
+      callIndex: 0,
+      cacheKey: "profile",
+      profileName: "reviewer",
+      profileFingerprint: "fp-1",
+    }),
+  ]);
+  const miss = replay.decide(
+    0,
+    "profile-name-changed",
+    identity("prompt", { name: "implementer", fingerprint: "fp-1" }),
+  ).miss;
+  assert.equal(miss?.reason, "identity_changed");
+  assert.deepEqual(miss?.changedFields, ["profileName"]);
+}
+
+{
+  const replay = createWorkflowReplay([
+    call({
+      callIndex: 0,
+      cacheKey: "profile",
+      profileName: "reviewer",
+      profileFingerprint: "fp-1",
+    }),
+  ]);
+  const miss = replay.decide(
+    0,
+    "profile-fingerprint-changed",
+    identity("prompt", { name: "reviewer", fingerprint: "fp-2" }),
+  ).miss;
+  assert.equal(miss?.reason, "identity_changed");
+  assert.deepEqual(miss?.changedFields, ["profileFingerprint"]);
 }
 
 {
