@@ -21,27 +21,22 @@ export interface SkillReadResolution {
   isSkillFile: boolean;
 }
 
-const SUBAGENT_DELEGATION_NAME = "subagent-delegation";
-const SUBAGENT_DELEGATION_SKILL = join(SUBAGENT_DELEGATION_NAME, "SKILL.md");
+const SUBAGENTS_NAME = "subagents";
+const LEGACY_SUBAGENT_DELEGATION_NAME = "subagent-delegation";
+const DYNAMIC_WORKFLOWS_NAME = "dynamic-workflows";
 
 function bundledSkillsDir(): string {
   return fileURLToPath(new URL("../skills", import.meta.url));
 }
 
-function hasSubagentDelegationSkill(skillDir: string): boolean {
-  return existsSync(join(skillDir, SUBAGENT_DELEGATION_SKILL));
-}
-
+/** Package skills are defaults; user/project copies win by path order. */
 export function effectiveSkillPaths(config: ServerConfig, cwd: string): string[] {
-  const bundledSkills = bundledSkillsDir();
   const defaultPathCandidates = [
     join(homedir(), ".agents", "skills"),
     resolve(cwd, ".agents", "skills"),
     config.devspaceSkillsDir,
     join(config.agentDir, "skills"),
-    config.subagents && !hasSubagentDelegationSkill(config.devspaceSkillsDir)
-      ? bundledSkills
-      : undefined,
+    config.subagents || config.workflows ? bundledSkillsDir() : undefined,
   ];
   const defaultPaths = defaultPathCandidates.filter(
     (path): path is string => path !== undefined && existsSync(path),
@@ -71,13 +66,17 @@ export function loadWorkspaceSkills(config: ServerConfig, cwd: string): LoadedSk
     includeDefaults: false,
   });
 
-  if (config.subagents) return result;
-
+  const gated = new Set<string>([LEGACY_SUBAGENT_DELEGATION_NAME]);
+  if (!config.subagents) gated.add(SUBAGENTS_NAME);
+  if (!config.workflows) gated.add(DYNAMIC_WORKFLOWS_NAME);
   return {
-    skills: result.skills.filter((skill) => skill.name !== SUBAGENT_DELEGATION_NAME),
+    skills: result.skills.filter((skill) => !gated.has(skill.name)),
     diagnostics: result.diagnostics.filter((diagnostic) => {
       const collision = diagnostic.collision;
-      return !(collision?.resourceType === "skill" && collision.name === SUBAGENT_DELEGATION_NAME);
+      return !(
+        collision?.resourceType === "skill" &&
+        gated.has(collision.name)
+      );
     }),
   };
 }

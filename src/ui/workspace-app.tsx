@@ -5,6 +5,7 @@ import {
   applyHostStyleVariables,
 } from "@modelcontextprotocol/ext-apps";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { WorkflowProjectView, WorkflowRunView } from "../workflow-view.js";
 import {
   isEditTool,
   isExpandableCard,
@@ -13,6 +14,7 @@ import {
   isReviewTool,
   isToolName,
   isToolResultCard,
+  isWorkflowTool,
   isWriteTool,
   payloadText,
   type HostContext,
@@ -25,6 +27,10 @@ import {
   getToolHeaderSummary,
   type ToolDisplay,
 } from "./tool-display.js";
+import {
+  renderWorkflowDashboard,
+  renderWorkspaceDashboard,
+} from "./workflow-dashboard.js";
 import "./workspace-app.css";
 
 interface MountedPayload {
@@ -47,6 +53,10 @@ let reviewFilesExpanded = false;
 let errorMessage: string | null = null;
 let currentPayload: MountedPayload | null = null;
 let currentPayloadContainer: HTMLElement | null = null;
+let workflowProject: WorkflowProjectView | null = null;
+let workflowRun: WorkflowRunView | null = null;
+let workflowRefreshKey: string | null = null;
+let workflowRefreshGeneration = 0;
 
 const maybeAppRoot = document.querySelector<HTMLElement>("#app");
 
@@ -75,6 +85,7 @@ async function boot(): Promise<void> {
     const tool = toolNameFromMeta(result);
 
     if (!tool || !isToolResultCard(structured)) {
+      stopWorkflowRefresh();
       card = null;
       expanded = false;
       reviewFilesExpanded = false;
@@ -84,8 +95,11 @@ async function boot(): Promise<void> {
     }
 
     const nextCard = { ...structured, tool };
+    stopWorkflowRefresh();
+    workflowProject = null;
+    workflowRun = null;
     card = nextCard;
-    expanded = isReviewTool(tool) && isExpandableCard(nextCard);
+    expanded = (isReviewTool(tool) || isWorkflowTool(tool)) && isExpandableCard(nextCard);
     reviewFilesExpanded = false;
     errorMessage = null;
     render();
@@ -97,10 +111,11 @@ async function boot(): Promise<void> {
       ...ctx,
     };
     applyHostContext();
-    renderPayloadIfNeeded();
+    render();
   };
 
   app.onteardown = async () => {
+    stopWorkflowRefresh();
     unmountPayload();
     return {};
   };
@@ -121,6 +136,7 @@ async function boot(): Promise<void> {
 }
 
 function applyHostContext(): void {
+  document.documentElement.dataset.displayMode = hostContext?.displayMode ?? "inline";
   if (hostContext?.theme) applyDocumentTheme(hostContext.theme);
   if (hostContext?.styles?.variables) {
     applyHostStyleVariables(hostContext.styles.variables);
@@ -172,6 +188,7 @@ function render(): void {
   if (expandable) {
     button.addEventListener("click", () => {
       expanded = !expanded;
+      if (!expanded) stopWorkflowRefresh();
       render();
     });
   }
@@ -226,7 +243,14 @@ async function renderPayloadIfNeeded(): Promise<void> {
   }
 
   if (card.tool === "open_workspace") {
-    renderPrePayload(target, workspacePayloadText(card), "open_workspace");
+    renderWorkspaceDashboard(target, card, workflowProject, dashboardDisplayOptions());
+    ensureWorkflowRefresh();
+    return;
+  }
+
+  if (isWorkflowTool(card.tool)) {
+    renderWorkflowDashboard(target, workflowRun, card, dashboardDisplayOptions());
+    ensureWorkflowRefresh();
     return;
   }
 
@@ -296,6 +320,139 @@ async function renderPayloadIfNeeded(): Promise<void> {
 
 function shouldUseHeavyPayload(card: ToolResultCard): boolean {
   return isReadTool(card.tool) || isEditTool(card.tool) || isWriteTool(card.tool);
+}
+
+function dashboardDisplayOptions() {
+  const fullscreen = hostContext?.displayMode === "fullscreen";
+  return {
+    canFullscreen: Boolean(hostContext?.availableDisplayModes?.includes("fullscreen")),
+    fullscreen,
+    onToggleFullscreen: () => {
+      void toggleFullscreen();
+    },
+  };
+}
+
+async function toggleFullscreen(): Promise<void> {
+  if (!app) return;
+  const fullscreen = hostContext?.displayMode === "fullscreen";
+  const mode = fullscreen ? "inline" : "fullscreen";
+  if (!fullscreen && !hostContext?.availableDisplayModes?.includes("fullscreen")) return;
+
+  try {
+    const result = await app.requestDisplayMode({ mode });
+    hostContext = {
+      ...hostContext,
+      displayMode: result.mode,
+    };
+    applyHostContext();
+    render();
+  } catch (displayError) {
+    errorMessage = displayError instanceof Error
+      ? displayError.message
+      : "Unable to change display mode.";
+    renderPayloadIfNeeded();
+  }
+}
+
+function ensureWorkflowRefresh(): void {
+  if (!app || !card || !expanded) return;
+
+  const request = card.tool === "open_workspace" && card.workspaceId
+    ? {
+        key: `workspace:${card.workspaceId}`,
+        name: "workspace_workflow_activity",
+        args: { workspaceId: card.workspaceId },
+        kind: "project" as const,
+      }
+    : isWorkflowTool(card.tool) && card.runId
+      ? {
+          key: `run:${card.runId}`,
+          name: "workflow_ui_snapshot",
+          args: { runId: card.runId },
+          kind: "run" as const,
+        }
+      : null;
+
+  if (!request || workflowRefreshKey === request.key) return;
+  workflowRefreshKey = request.key;
+  const generation = ++workflowRefreshGeneration;
+  void refreshWorkflowLoop(request, generation);
+}
+
+async function refreshWorkflowLoop(
+  request: {
+    key: string;
+    name: string;
+    args: Record<string, unknown>;
+    kind: "project" | "run";
+  },
+  generation: number,
+): Promise<void> {
+  let knownVersion = request.kind === "project"
+    ? workflowProject?.version
+    : workflowRun?.version;
+
+  while (
+    app &&
+    expanded &&
+    workflowRefreshGeneration === generation &&
+    workflowRefreshKey === request.key
+  ) {
+    try {
+      const result = await app.callServerTool({
+        name: request.name,
+        arguments: {
+          ...request.args,
+          knownVersion,
+          waitMs: 20_000,
+        },
+      });
+      if (
+        workflowRefreshGeneration !== generation ||
+        workflowRefreshKey !== request.key
+      ) {
+        return;
+      }
+
+      if (request.kind === "project") {
+        const structured = getStructuredContent<{ project?: WorkflowProjectView }>(result);
+        if (structured?.project) {
+          workflowProject = structured.project;
+          knownVersion = structured.project.version;
+        }
+      } else {
+        const structured = getStructuredContent<{ run?: WorkflowRunView }>(result);
+        if (structured?.run) {
+          workflowRun = structured.run;
+          knownVersion = structured.run.version;
+        }
+      }
+
+      await renderPayloadIfNeeded();
+      if (
+        request.kind === "run" &&
+        workflowRun &&
+        ["completed", "failed", "cancelled"].includes(workflowRun.status)
+      ) {
+        workflowRefreshKey = null;
+        return;
+      }
+    } catch (refreshError) {
+      if (workflowRefreshGeneration !== generation) return;
+      errorMessage = refreshError instanceof Error
+        ? refreshError.message
+        : "Unable to refresh workflow activity.";
+      workflowRefreshKey = null;
+      await renderPayloadIfNeeded();
+      return;
+    }
+  }
+}
+
+function stopWorkflowRefresh(): void {
+  workflowRefreshKey = null;
+  workflowRefreshGeneration += 1;
 }
 
 function unmountPayload(): void {
@@ -443,39 +600,6 @@ function setPayloadLoading(container: HTMLElement, loading: boolean): void {
 
   const button = header instanceof HTMLButtonElement ? header : null;
   if (button) button.setAttribute("aria-busy", String(loading));
-}
-
-function workspacePayloadText(card: ToolResultCard): string {
-  const agentsFiles = card.agentsFiles ?? [];
-  const availableAgentsFiles = card.availableAgentsFiles ?? [];
-  const skills = card.skills ?? [];
-  const lines = [
-    card.workspaceId ? `Workspace: ${card.workspaceId}` : undefined,
-    card.root ? `Root: ${card.root}` : undefined,
-    skills.length > 0
-      ? `Skills: ${skills.map((skill) => skill.name ?? skill.path ?? "unnamed").join(", ")}`
-      : "Skills: none",
-    availableAgentsFiles.length > 0
-      ? `Nested instructions: ${availableAgentsFiles.map((file) => file.path ?? "unknown").join(", ")}`
-      : undefined,
-    agentsFiles.length > 0
-      ? `\n${formatAgentsFilesForPayload(agentsFiles)}`
-      : "\nAGENTS.md: none loaded",
-  ].filter((line): line is string => typeof line === "string");
-
-  return lines.join("\n");
-}
-
-function formatAgentsFilesForPayload(
-  agentsFiles: NonNullable<ToolResultCard["agentsFiles"]>,
-): string {
-  return agentsFiles
-    .map((file) => {
-      const path = file.path ?? "AGENTS.md";
-      const content = file.content?.trim();
-      return content ? `${path}\n\n${content}` : `${path}\n\nNo content loaded.`;
-    })
-    .join("\n\n");
 }
 
 function toolNameFromMeta(result: CallToolResult): ToolName | undefined {

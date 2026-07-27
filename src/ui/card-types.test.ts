@@ -7,7 +7,13 @@ import {
   isToolName,
 } from "./card-types.js";
 
-for (const tool of ["apply_patch", "exec_command", "write_stdin"]) {
+for (const tool of [
+  "apply_patch",
+  "exec_command",
+  "write_stdin",
+  "run_workflow",
+  "workflow_status",
+]) {
   assert.equal(isToolName(tool), true, `${tool} should be a recognized card tool`);
 }
 
@@ -23,3 +29,26 @@ assert.equal(
   true,
 );
 assert.equal(isExpandableCard({ tool: "apply_patch" }), false);
+assert.equal(isExpandableCard({ tool: "run_workflow", runId: "wfr_1" }), true);
+assert.equal(
+  isExpandableCard({
+    tool: "open_workspace",
+    activeWorkflows: [
+      {
+        id: "wfr_1",
+        name: "Review",
+        status: "running",
+        calls: {
+          running: 1,
+          completed: 0,
+          cached: 0,
+          failed: 0,
+          cancelled: 0,
+          observed: 1,
+        },
+        updatedAt: "2026-07-26T00:00:00.000Z",
+      },
+    ],
+  }),
+  true,
+);

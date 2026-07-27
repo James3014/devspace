@@ -157,9 +157,13 @@ export const workflowAgentCalls = sqliteTable(
       .references(() => workflowRuns.id, { onDelete: "cascade" }),
     callIndex: integer("call_index").notNull(),
     cacheKey: text("cache_key").notNull(),
+    prompt: text("prompt").notNull().default(""),
+    schemaJson: text("schema_json"),
     provider: text("provider").notNull(),
     model: text("model"),
     effort: text("effort"),
+    profileName: text("profile_name"),
+    profileFingerprint: text("profile_fingerprint"),
     label: text("label"),
     phase: text("phase"),
     status: text("status").notNull(),
@@ -167,7 +171,13 @@ export const workflowAgentCalls = sqliteTable(
     providerSessionId: text("provider_session_id"),
     responseText: text("response_text"),
     structuredJson: text("structured_json"),
+    returnValueJson: text("return_value_json"),
     error: text("error"),
+    errorKind: text("error_kind"),
+    replayMatch: text("replay_match"),
+    replayedFromRunId: text("replayed_from_run_id"),
+    replayedFromCallIndex: integer("replayed_from_call_index"),
+    replayReason: text("replay_reason"),
     isolation: text("isolation").notNull().default("shared"),
     worktreePath: text("worktree_path"),
     dirty: text("dirty"),
@@ -179,6 +189,10 @@ export const workflowAgentCalls = sqliteTable(
   (table) => [
     primaryKey({ columns: [table.runId, table.callIndex] }),
     index("workflow_agent_calls_cache_key_idx").on(table.runId, table.cacheKey),
+    index("workflow_agent_calls_replay_source_idx").on(
+      table.replayedFromRunId,
+      table.replayedFromCallIndex,
+    ),
   ],
 );
 
