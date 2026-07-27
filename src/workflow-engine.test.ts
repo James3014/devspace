@@ -538,15 +538,19 @@ import type { LocalAgentProfile } from "./local-agent-profiles.js";
     }),
   });
 
-  await assert.rejects(
-    () =>
-      api.agent("large structured", {
+  const oversizedStructured = () =>
+    (api.agent as (prompt: string, opts?: object) => Promise<unknown>)(
+      "large structured",
+      {
         schema: {
           type: "object",
           properties: { big: { type: "string" } },
           required: ["big"],
         },
-      }),
+      },
+    );
+  await assert.rejects(
+    oversizedStructured,
     (error: unknown) =>
       error instanceof WorkflowEngineError && error.kind === "result_too_large",
   );
