@@ -526,7 +526,7 @@ import type { LocalAgentProfile } from "./local-agent-profiles.js";
     concurrency: 1,
     signal: new AbortController().signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    availableProviders: ["codex"],
     runProvider: async () => ({
       finalResponse: JSON.stringify({ big }),
       structured: { big },
