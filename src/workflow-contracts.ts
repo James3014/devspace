@@ -60,10 +60,20 @@ export const agentOptsSchema = z
     schema: jsonSchemaSchema.optional(),
     model: z.string().trim().min(1).optional(),
     effort: z.string().trim().min(1).optional(),
+    profile: z.string().trim().min(1).optional(),
     provider: localAgentProviderSchema.optional(),
     isolation: z.literal("worktree").optional(),
   })
-  .strict();
+  .strict()
+  .superRefine((value, context) => {
+    if (value.profile && value.provider) {
+      context.addIssue({
+        code: "custom",
+        path: ["provider"],
+        message: "profile and provider are mutually exclusive",
+      });
+    }
+  });
 
 export type AgentOpts<S extends JsonSchema | undefined = JsonSchema | undefined> = Omit<
   z.infer<typeof agentOptsSchema>,
@@ -111,10 +121,10 @@ export const workflowErrorKindSchema = z.enum([
   "syntax",
   "meta",
   "determinism",
-  "provider_disabled",
   "provider_unavailable",
   "no_provider",
   "provider",
+  "profile",
   "schema",
   "cancelled",
   "timeout",
@@ -186,6 +196,7 @@ export const workflowEventPayloadSchemas = {
     .object({
       callIndex: z.number().int().nonnegative(),
       error: z.string(),
+      cleanupError: z.string().optional(),
       isolation: agentIsolationModeSchema,
       worktreePath: z.string().optional(),
     })
@@ -195,6 +206,9 @@ export const workflowEventPayloadSchemas = {
       callIndex: z.number().int().nonnegative(),
       cacheKey: z.string(),
       provider: localAgentProviderSchema,
+      replayMatch: z.enum(["same_index", "compatible_key"]),
+      replayedFromRunId: z.string(),
+      replayedFromCallIndex: z.number().int().nonnegative(),
     })
     .strict(),
   schema_retry: z

@@ -9,9 +9,12 @@ import {
   FolderOpen,
   FolderTree,
   LoaderCircle,
+  Maximize2,
+  Minimize2,
   Search,
   SquareTerminal,
   Terminal,
+  Workflow,
   createElement,
   type IconNode,
 } from "lucide";
@@ -25,10 +28,13 @@ export const toolIcons = {
   folderOpen: FolderOpen,
   folderTree: FolderTree,
   loading: LoaderCircle,
+  maximize: Maximize2,
+  minimize: Minimize2,
   readFile: FileText,
   search: Search,
   terminal: Terminal,
   terminalSquare: SquareTerminal,
+  workflow: Workflow,
   writeFile: FilePlus,
 } as const satisfies Record<string, IconNode>;
 

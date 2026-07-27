@@ -84,6 +84,30 @@ try {
   assert.doesNotMatch(output, /profile reviewer/);
   assert.doesNotMatch(output, new RegExp(other.id));
 
+  const targets = JSON.parse(execFileSync(
+    "node",
+    ["--import", "tsx", "src/cli.ts", "agents", "targets", "--json"],
+    {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        DEVSPACE_CONFIG_DIR: configDir,
+        DEVSPACE_ALLOWED_ROOTS: projectRoot,
+        DEVSPACE_STATE_DIR: stateDir,
+        DEVSPACE_WORKSPACE_ROOT: projectRoot,
+        DEVSPACE_SUBAGENTS: "1",
+        DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+      },
+    },
+  )) as {
+    profiles: Array<{ name: string; provider: string }>;
+    providers: Array<{ name: string }>;
+  };
+  assert.deepEqual(targets.profiles.map((profile) => profile.name), ["reviewer"]);
+  assert.equal(targets.profiles[0]?.provider, "codex");
+  assert.equal(targets.providers.some((provider) => provider.name === "codex"), true);
+
   assert.equal(loadConfig({
     DEVSPACE_CONFIG_DIR: configDir,
     DEVSPACE_ALLOWED_ROOTS: projectRoot,

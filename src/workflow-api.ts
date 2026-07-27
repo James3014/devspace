@@ -1,7 +1,14 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import type { WorkflowSandboxApi } from "./workflow-sandbox.js";
-import type { LocalAgentProvider } from "./local-agent-profiles.js";
+import {
+  type LocalAgentProfile,
+  type LocalAgentProvider,
+} from "./local-agent-profiles.js";
+import {
+  LocalAgentResolutionError,
+  resolveLocalAgentExecution,
+} from "./local-agent-resolution.js";
 import type { JsonSchema, JsonValue } from "./json-types.js";
 import { jsonValueSchema } from "./json-types.js";
 import {
@@ -11,6 +18,7 @@ import {
   buildAgentCacheKeyInput,
   createStubBudget,
   type AgentIsolationMode,
+  type AgentCacheKeyInput,
   type AgentOpts,
   type AppendWorkflowEventInput,
   type WorkflowMeta,
@@ -63,11 +71,36 @@ export interface WorkflowReplayHit {
   value: JsonValue;
   responseText?: string;
   structuredJson?: string;
+  returnValueJson: string;
   providerSessionId?: string;
+  replayMatch: "same_index" | "compatible_key";
+  replayedFromRunId: string;
+  replayedFromCallIndex: number;
 }
 
+export interface WorkflowReplayMiss {
+  reason:
+    | "no_compatible_call"
+    | "prior_call_not_replayable"
+    | "compatible_result_consumed"
+    | "identity_changed"
+    | "prefix_diverged"
+    | "worktree_not_restored"
+    | "result_not_persisted"
+    | "stored_result_invalid";
+  changedFields?: Array<keyof AgentCacheKeyInput>;
+}
+
+export type WorkflowReplayDecision =
+  | { hit: WorkflowReplayHit; miss?: never }
+  | { hit?: never; miss: WorkflowReplayMiss };
+
 export interface WorkflowReplay {
-  match(callIndex: number, cacheKey: string): WorkflowReplayHit | null;
+  decide(
+    callIndex: number,
+    cacheKey: string,
+    input: AgentCacheKeyInput,
+  ): WorkflowReplayDecision;
 }
 
 export interface WorkflowJournal {
@@ -78,19 +111,28 @@ export interface WorkflowJournal {
     runId: string;
     callIndex: number;
     cacheKey: string;
+    prompt: string;
+    schemaJson?: string;
     provider: LocalAgentProvider;
     model?: string;
     effort?: string;
+    profileName?: string;
+    profileFingerprint?: string;
     label?: string;
     phase?: string;
     isolation?: AgentIsolationMode;
     worktreePath?: string;
+    replayMatch?: "same_index" | "compatible_key";
+    replayedFromRunId?: string;
+    replayedFromCallIndex?: number;
+    replayReason?: string;
   }): unknown;
   completeAgentCall(input: {
     runId: string;
     callIndex: number;
     responseText?: string;
     structuredJson?: string;
+    returnValueJson?: string;
     providerSessionId?: string;
     dirty?: boolean;
     worktreePath?: string;
@@ -100,6 +142,7 @@ export interface WorkflowJournal {
     runId: string;
     callIndex: number;
     error: string;
+    errorKind?: import("./workflow-types.js").WorkflowErrorKind;
     worktreePath?: string;
     dirty?: boolean;
   }): unknown;
@@ -115,8 +158,10 @@ export interface WorkflowApiDeps {
   signal: AbortSignal;
   workspaceRoot: string;
   baseSha?: string;
-  /** Already-filtered enabled ∩ live provider ids, preference order. */
-  enabledProviders: LocalAgentProvider[];
+  /** Currently available provider ids in stable preference order. */
+  availableProviders: LocalAgentProvider[];
+  /** Loaded profiles available to this project. */
+  agentProfiles?: LocalAgentProfile[];
   runProvider: WorkflowRunProvider;
   createWorktree?: CreateAgentWorktree;
   replay?: WorkflowReplay;
@@ -129,6 +174,7 @@ export interface WorkflowApiDeps {
     nestDepth: number;
   }) => Promise<unknown>;
   nestDepth?: number;
+  runtime?: WorkflowApiRuntime;
 }
 
 export interface WorkflowApi extends WorkflowSandboxApi {
@@ -140,9 +186,9 @@ export class WorkflowEngineError extends Error {
   constructor(
     readonly kind:
       | "cancelled"
-      | "provider_disabled"
       | "provider_unavailable"
       | "no_provider"
+      | "profile"
       | "nest_depth"
       | "worktree"
       | "schema"
@@ -198,6 +244,18 @@ export class WorkflowSemaphore {
   }
 }
 
+export interface WorkflowApiRuntime {
+  semaphore: WorkflowSemaphore;
+  callIndex: number;
+}
+
+export function createWorkflowApiRuntime(concurrency: number): WorkflowApiRuntime {
+  return {
+    semaphore: new WorkflowSemaphore(Math.max(1, concurrency)),
+    callIndex: 0,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // API factory
 // ---------------------------------------------------------------------------
@@ -206,8 +264,8 @@ const phaseAls = new AsyncLocalStorage<string>();
 
 export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
   const nestDepth = deps.nestDepth ?? 0;
-  const semaphore = new WorkflowSemaphore(Math.max(1, deps.concurrency));
-  let callIndex = 0;
+  const runtime = deps.runtime ?? createWorkflowApiRuntime(deps.concurrency);
+  const semaphore = runtime.semaphore;
 
   const agent = async (prompt: unknown, opts: unknown = {}): Promise<unknown> => {
     if (typeof prompt !== "string" || !prompt.trim()) {
@@ -216,42 +274,60 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
     const agentOpts = normalizeAgentOpts(opts);
     throwIfCancelled(deps);
 
-    const provider = resolveProvider(agentOpts.provider, deps.meta, deps.enabledProviders);
+    const target = resolveAgentTarget(prompt, agentOpts, deps);
+    const {
+      provider,
+      model,
+      effort,
+      profileName,
+      profileFingerprint,
+      providerPrompt,
+    } = target;
     const phase = agentOpts.phase ?? phaseAls.getStore();
     const isolation: AgentIsolationMode =
       agentOpts.isolation === "worktree" ? "worktree" : "shared";
-    const index = callIndex;
-    callIndex += 1;
+    const index = runtime.callIndex;
+    runtime.callIndex += 1;
 
     const cacheKeyInput = buildAgentCacheKeyInput({
       prompt,
+      profileName,
+      profileFingerprint,
       provider,
-      model: agentOpts.model,
-      effort: agentOpts.effort,
+      model,
+      effort,
       schema: agentOpts.schema,
       isolation,
     });
     const cacheKey = hashCacheKey(cacheKeyInput);
 
-    if (deps.replay) {
-      const hit = deps.replay.match(index, cacheKey);
-      if (hit) {
+    const replayDecision = deps.replay?.decide(index, cacheKey, cacheKeyInput);
+    if (replayDecision?.hit) {
+      const hit = replayDecision.hit;
         deps.journal.beginAgentCall({
           runId: deps.runId,
           callIndex: index,
           cacheKey,
+          prompt,
+          schemaJson: agentOpts.schema ? JSON.stringify(agentOpts.schema) : undefined,
           provider,
-          model: agentOpts.model,
-          effort: agentOpts.effort,
+          model,
+          effort,
+          profileName,
+          profileFingerprint,
           label: agentOpts.label,
           phase,
           isolation,
+          replayMatch: hit.replayMatch,
+          replayedFromRunId: hit.replayedFromRunId,
+          replayedFromCallIndex: hit.replayedFromCallIndex,
         });
         deps.journal.completeAgentCall({
           runId: deps.runId,
           callIndex: index,
           responseText: hit.responseText,
           structuredJson: hit.structuredJson,
+          returnValueJson: hit.returnValueJson,
           providerSessionId: hit.providerSessionId,
           fromCache: true,
         });
@@ -260,15 +336,22 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
           type: "agent_call_cached",
           phase,
           label: agentOpts.label,
-          data: { callIndex: index, cacheKey, provider },
+          data: {
+            callIndex: index,
+            cacheKey,
+            provider,
+            replayMatch: hit.replayMatch,
+            replayedFromRunId: hit.replayedFromRunId,
+            replayedFromCallIndex: hit.replayedFromCallIndex,
+          },
         });
         return hit.value;
-      }
     }
 
     await semaphore.acquire(deps.signal);
     let worktree: WorkflowWorktreeHandle | null = null;
     let worktreePath: string | undefined;
+    let agentCallBegun = false;
     try {
       throwIfCancelled(deps);
 
@@ -299,14 +382,22 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
         runId: deps.runId,
         callIndex: index,
         cacheKey,
+        prompt,
+        schemaJson: agentOpts.schema ? JSON.stringify(agentOpts.schema) : undefined,
         provider,
-        model: agentOpts.model,
-        effort: agentOpts.effort,
+        model,
+        effort,
+        profileName,
+        profileFingerprint,
         label: agentOpts.label,
         phase,
         isolation,
         worktreePath,
+        replayReason: replayDecision?.miss
+          ? formatReplayMiss(replayDecision.miss)
+          : undefined,
       });
+      agentCallBegun = true;
       deps.journal.appendEvent({
         runId: deps.runId,
         type: "agent_call_started",
@@ -324,9 +415,9 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
       const cwd = worktreePath ?? deps.workspaceRoot;
       const providerBase = {
         provider,
-        prompt,
-        model: agentOpts.model,
-        effort: agentOpts.effort,
+        prompt: providerPrompt,
+        model,
+        effort,
         workspace: cwd,
         signal: deps.signal,
         label: agentOpts.label,
@@ -342,7 +433,7 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
         const { enforceAgentSchema } = await import("./workflow-schema.js");
         const enforced = await enforceAgentSchema({
           schema: agentOpts.schema,
-          prompt,
+          prompt: providerPrompt,
           provider,
           run: (p, options) =>
             deps.runProvider({
@@ -398,9 +489,8 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
         runId: deps.runId,
         callIndex: index,
         responseText: truncate(result.finalResponse, WORKFLOW_LIMITS.responseTextBytes),
-        structuredJson: structuredJson
-          ? truncate(structuredJson, WORKFLOW_LIMITS.structuredJsonBytes)
-          : undefined,
+        structuredJson: boundedStructuredJson(structuredJson),
+        returnValueJson: serializeReplayValue(returnValue),
         providerSessionId: result.providerSessionId,
         dirty,
         worktreePath,
@@ -422,6 +512,7 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
       return returnValue;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      let cleanupError: string | undefined;
       if (worktree) {
         try {
           const finalized = await worktree.finalize("failure");
@@ -438,22 +529,34 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
               outcome: "failure",
             },
           });
-        } catch {
-          // preserve original error
+        } catch (cleanupFailure) {
+          cleanupError =
+            cleanupFailure instanceof Error
+              ? cleanupFailure.message
+              : String(cleanupFailure);
         }
       }
-      deps.journal.failAgentCall({
-        runId: deps.runId,
-        callIndex: index,
-        error: message,
-        worktreePath,
-      });
+      if (agentCallBegun) {
+        deps.journal.failAgentCall({
+          runId: deps.runId,
+          callIndex: index,
+          error: message,
+          errorKind: error instanceof WorkflowEngineError ? error.kind : "internal",
+          worktreePath,
+        });
+      }
       deps.journal.appendEvent({
         runId: deps.runId,
         type: "agent_call_failed",
         phase,
         label: agentOpts.label,
-        data: { callIndex: index, error: message, isolation, worktreePath },
+        data: {
+          callIndex: index,
+          error: message,
+          cleanupError,
+          isolation,
+          worktreePath,
+        },
       });
       throw error;
     } finally {
@@ -575,9 +678,15 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
     budget: createStubBudget(),
     workflow: workflow as WorkflowSandboxApi["workflow"],
     meta: deps.meta,
-    getCallCount: () => callIndex,
+    getCallCount: () => runtime.callIndex,
     getNestDepth: () => nestDepth,
   };
+}
+
+function formatReplayMiss(miss: WorkflowReplayMiss): string {
+  return miss.reason === "identity_changed" && miss.changedFields?.length
+    ? `${miss.reason}:${miss.changedFields.join(",")}`
+    : miss.reason;
 }
 
 /** Test helper: read current ALS phase (undefined outside phase). */
@@ -589,34 +698,48 @@ export function hashCacheKey(input: ReturnType<typeof buildAgentCacheKeyInput>):
   return createHash("sha256").update(JSON.stringify(input)).digest("hex");
 }
 
-export function resolveProvider(
-  optsProvider: LocalAgentProvider | undefined,
-  meta: WorkflowMeta,
-  enabledProviders: LocalAgentProvider[],
-): LocalAgentProvider {
-  if (optsProvider) {
-    if (!enabledProviders.includes(optsProvider)) {
-      throw new WorkflowEngineError(
-        "provider_disabled",
-        `Provider ${optsProvider} is not enabled or not available`,
-      );
-    }
-    return optsProvider;
+interface ResolvedAgentTarget {
+  provider: LocalAgentProvider;
+  model?: string;
+  effort?: string;
+  profileName?: string;
+  profileFingerprint?: string;
+  providerPrompt: string;
+}
+
+function resolveAgentTarget(
+  prompt: string,
+  opts: AgentOpts,
+  deps: Pick<WorkflowApiDeps, "agentProfiles" | "availableProviders" | "meta">,
+): ResolvedAgentTarget {
+  try {
+    const resolved = resolveLocalAgentExecution({
+      prompt,
+      profile: opts.profile,
+      provider: opts.provider,
+      defaultProvider: deps.meta.defaultProvider,
+      model: opts.model,
+      effort: opts.effort,
+      profiles: deps.agentProfiles ?? [],
+      availableProviders: deps.availableProviders,
+    });
+    return {
+      provider: resolved.provider,
+      model: resolved.model,
+      effort: resolved.effort,
+      profileName: resolved.profileName,
+      profileFingerprint: resolved.profileFingerprint,
+      providerPrompt: resolved.prompt,
+    };
+  } catch (error) {
+    if (!(error instanceof LocalAgentResolutionError)) throw error;
+    const kind = error.kind === "profile_not_found"
+      ? "profile"
+      : error.kind === "no_provider"
+        ? "no_provider"
+        : "provider_unavailable";
+    throw new WorkflowEngineError(kind, error.message);
   }
-  if (meta.defaultProvider) {
-    if (!enabledProviders.includes(meta.defaultProvider)) {
-      throw new WorkflowEngineError(
-        "provider_unavailable",
-        `meta.defaultProvider ${meta.defaultProvider} is not enabled or not available`,
-      );
-    }
-    return meta.defaultProvider;
-  }
-  const first = enabledProviders[0];
-  if (!first) {
-    throw new WorkflowEngineError("no_provider", "No agent providers enabled");
-  }
-  return first;
 }
 
 function normalizeAgentOpts(opts: unknown): AgentOpts {
@@ -628,7 +751,13 @@ function normalizeAgentOpts(opts: unknown): AgentOpts {
   if (parsed.success) return parsed.data;
   const issue = parsed.error.issues[0];
   const path = issue?.path.join(".") || "opts";
-  const kind = path === "schema" ? "schema" : path === "isolation" ? "worktree" : "internal";
+  const kind = path === "schema"
+    ? "schema"
+    : path === "isolation"
+      ? "worktree"
+      : path === "profile" || issue?.message.includes("profile and provider")
+        ? "profile"
+        : "internal";
   throw new WorkflowEngineError(
     kind,
     `Invalid agent ${path}: ${issue?.message ?? "validation failed"}`,
@@ -656,10 +785,30 @@ function cancelledError(): WorkflowEngineError {
 
 function truncate(text: string, maxBytes: number): string {
   if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
-  // rough char truncate for journal safety
-  let end = Math.min(text.length, maxBytes);
-  while (end > 0 && Buffer.byteLength(text.slice(0, end), "utf8") > maxBytes) end -= 1;
-  return `${text.slice(0, end)}…`;
+  const marker = "…";
+  const budget = Math.max(0, maxBytes - Buffer.byteLength(marker, "utf8"));
+  let end = Math.min(text.length, budget);
+  while (end > 0 && Buffer.byteLength(text.slice(0, end), "utf8") > budget) end -= 1;
+  return `${text.slice(0, end)}${marker}`;
+}
+
+function boundedStructuredJson(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  return Buffer.byteLength(value, "utf8") <= WORKFLOW_LIMITS.structuredJsonBytes
+    ? value
+    : undefined;
+}
+
+function serializeReplayValue(value: unknown): string | undefined {
+  try {
+    const json = JSON.stringify(value);
+    if (json === undefined) return undefined;
+    return Buffer.byteLength(json, "utf8") <= WORKFLOW_LIMITS.replayValueJsonBytes
+      ? json
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Minimal JSON extract for schema path until Ajv module lands. */

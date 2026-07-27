@@ -51,6 +51,10 @@ assert.throws(
   () => agentOptsSchema.parse({ provider: "made-up" }),
   /Invalid option/,
 );
+assert.throws(
+  () => agentOptsSchema.parse({ profile: "reviewer", provider: "codex" }),
+  /mutually exclusive/,
+);
 assert.throws(() => agentOptsSchema.parse({ schema: [] }), /expected record/i);
 assert.throws(() => jsonValueSchema.parse(new Date()), /invalid input/i);
 assert.throws(() => jsonValueSchema.parse(() => undefined), /invalid input/i);
@@ -112,6 +116,8 @@ if (false) {
 
   // @ts-expect-error providers are exhaustive
   await agent("x", { provider: "made-up" });
+
+  await agent("review", { profile: "reviewer", effort: "high" });
 
   const tuple = await parallel([
     async () => "text",
