@@ -26,7 +26,9 @@ export function renderWorkspaceDashboard(
 
   root.append(
     renderDashboardToolbar("Workspace overview", display),
-    renderWorkflowSummarySection(runs),
+    ...(card.activeWorkflows !== undefined || project !== null
+      ? [renderWorkflowSummarySection(runs)]
+      : []),
     renderAccordion(
       "Workspace",
       true,
@@ -70,28 +72,27 @@ export function renderWorkspaceDashboard(
         "No nested instruction files discovered.",
       ),
     ),
-    renderAccordion(
-      `Agent providers · ${card.agentProviders?.filter((provider) => provider.available).length ?? 0} available`,
-      false,
-      renderProviderList(card),
-    ),
-    renderAccordion(
-      `Agent profiles · ${card.agents?.length ?? 0}`,
-      false,
-      renderList(
-        card.agents?.map((agent) => ({
-          title: agent.name ?? "Unnamed profile",
-          description: [
-            agent.provider,
-            agent.model,
-            agent.effort,
-            agent.providerAvailable === false ? agent.providerUnavailableReason ?? "Unavailable" : undefined,
-          ].filter(Boolean).join(" · "),
-          meta: agent.description,
-        })) ?? [],
-        "No agent profiles loaded.",
-      ),
-    ),
+    ...(card.agentProviders !== undefined
+      ? [renderAccordion(
+          `Agent providers · ${card.agentProviders.length}`,
+          false,
+          renderProviderList(card),
+        )]
+      : []),
+    ...(card.agents !== undefined
+      ? [renderAccordion(
+          `Agent profiles · ${card.agents.length}`,
+          false,
+          renderList(
+            card.agents.map((agent) => ({
+              title: agent.name ?? "Unnamed profile",
+              description: [agent.provider, agent.model, agent.effort].filter(Boolean).join(" · "),
+              meta: agent.description,
+            })),
+            "No agent profiles loaded.",
+          ),
+        )]
+      : []),
     renderAccordion(
       `Warnings · ${card.skillDiagnostics?.length ?? 0}`,
       false,
@@ -307,7 +308,12 @@ function renderProviderList(card: ToolResultCard): HTMLElement {
   return renderList(
     card.agentProviders?.map((provider) => ({
       title: provider.name ?? "Unknown provider",
-      description: provider.available ? "Available" : provider.reason ?? "Unavailable",
+      description: [
+        provider.model?.supported ? `model: ${provider.model.discovery ?? "supported"}` : undefined,
+        provider.effort?.supported
+          ? `effort: ${provider.effort.semantics ?? "supported"} (${provider.effort.discovery ?? "unknown"})`
+          : undefined,
+      ].filter(Boolean).join(" · "),
     })) ?? [],
     "No subagent providers exposed.",
   );

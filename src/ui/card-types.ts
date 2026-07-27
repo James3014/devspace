@@ -71,8 +71,15 @@ export interface ToolResultCard {
   };
   agentProviders?: Array<{
     name?: string;
-    available?: boolean;
-    reason?: string;
+    model?: {
+      supported?: boolean;
+      discovery?: string;
+    };
+    effort?: {
+      supported?: boolean;
+      semantics?: string;
+      discovery?: string;
+    };
   }>;
   agents?: Array<{
     name?: string;
@@ -80,8 +87,6 @@ export interface ToolResultCard {
     provider?: string;
     model?: string;
     effort?: string;
-    providerAvailable?: boolean;
-    providerUnavailableReason?: string;
   }>;
   skillDiagnostics?: unknown[];
   instruction?: string;
