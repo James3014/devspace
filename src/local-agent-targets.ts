@@ -1,9 +1,12 @@
 import {
-  isLocalAgentProvider,
   LOCAL_AGENT_PROVIDERS,
   type LocalAgentProfile,
   type LocalAgentProvider,
 } from "./local-agent-profiles.js";
+import {
+  resolveLocalAgentExecution,
+  type ResolvedLocalAgentExecution,
+} from "./local-agent-resolution.js";
 
 export interface ParsedLocalAgentRunArgs {
   target: string;
@@ -12,22 +15,7 @@ export interface ParsedLocalAgentRunArgs {
   effort?: string;
 }
 
-export type LocalAgentTarget =
-  | {
-      kind: "profile";
-      name: string;
-      provider: LocalAgentProvider;
-      model?: string;
-      effort?: string;
-      profile: LocalAgentProfile;
-    }
-  | {
-      kind: "provider";
-      name: LocalAgentProvider;
-      provider: LocalAgentProvider;
-      model?: string;
-      effort?: string;
-    };
+export type LocalAgentTarget = ResolvedLocalAgentExecution;
 
 const USAGE =
   'Usage: devspace agents run <profile-or-provider-or-id> [--model <model>] [--effort <level>] "<prompt>"';
@@ -92,37 +80,31 @@ export function resolveLocalAgentTarget(
   profiles: LocalAgentProfile[],
   modelOverride?: string,
   effortOverride?: string,
+  availableProviders: LocalAgentProvider[] = [...LOCAL_AGENT_PROVIDERS],
 ): LocalAgentTarget | undefined {
-  const profile = profiles.find((candidate) => candidate.name === target);
-  if (profile) {
-    return {
-      kind: "profile",
-      name: profile.name,
-      provider: profile.provider,
-      model: modelOverride ?? profile.model,
-      effort: effortOverride ?? profile.effort,
-      profile,
-    };
-  }
-
-  if (isLocalAgentProvider(target)) {
-    return {
-      kind: "provider",
-      name: target,
-      provider: target,
+  try {
+    return resolveLocalAgentExecution({
+      target,
+      prompt: "",
+      profiles,
+      availableProviders,
       model: modelOverride,
       effort: effortOverride,
-    };
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "LocalAgentResolutionError") return undefined;
+    throw error;
   }
-
-  return undefined;
 }
 
-export function formatAvailableLocalAgentTargets(profiles: LocalAgentProfile[]): string {
+export function formatAvailableLocalAgentTargets(
+  profiles: LocalAgentProfile[],
+  providers: LocalAgentProvider[] = [...LOCAL_AGENT_PROVIDERS],
+): string {
   const profileNames = profiles.map((profile) => profile.name);
   const parts = [
     profileNames.length > 0 ? `profiles: ${profileNames.join(", ")}` : undefined,
-    `providers: ${LOCAL_AGENT_PROVIDERS.join(", ")}`,
+    providers.length > 0 ? `providers: ${providers.join(", ")}` : "providers: none",
   ].filter(Boolean);
   return parts.join("; ");
 }

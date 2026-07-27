@@ -1,19 +1,20 @@
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { ServerConfig } from "./config.js";
 
-export type LocalAgentProvider = "codex" | "claude" | "opencode" | "pi" | "cursor" | "copilot";
-
-export const LOCAL_AGENT_PROVIDERS: readonly LocalAgentProvider[] = [
+export const LOCAL_AGENT_PROVIDERS = [
   "codex",
   "claude",
   "opencode",
   "pi",
   "cursor",
   "copilot",
-];
+] as const;
+
+export type LocalAgentProvider = (typeof LOCAL_AGENT_PROVIDERS)[number];
 
 export interface LocalAgentProfile {
   name: string;
@@ -46,7 +47,7 @@ export async function loadLocalAgentProfiles(
   config: ServerConfig,
   workspaceRoot: string,
 ): Promise<LocalAgentProfile[]> {
-  if (!config.subagents) return [];
+  if (!config.subagents && !config.workflows) return [];
 
   const profileDirs = [
     config.devspaceAgentsDir,
@@ -75,6 +76,29 @@ export function summarizeLocalAgentProfile(
     model: profile.model,
     effort: profile.effort,
   };
+}
+
+export function fingerprintLocalAgentProfile(profile: LocalAgentProfile): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify({
+        name: profile.name,
+        description: profile.description,
+        provider: profile.provider,
+        model: profile.model ?? null,
+        effort: profile.effort ?? null,
+        body: profile.body,
+      }),
+    )
+    .digest("hex");
+}
+
+export function buildLocalAgentProfilePrompt(
+  profile: Pick<LocalAgentProfile, "body">,
+  task: string,
+): string {
+  const body = profile.body.trim();
+  return body ? `${body}\n\nTask:\n${task}` : task;
 }
 
 async function loadProfilesFromDirectory(directory: string): Promise<LocalAgentProfile[]> {

@@ -32,6 +32,21 @@ const migrations: Migration[] = [
     name: "workflow-journal",
     up: migrateWorkflowJournal,
   },
+  {
+    version: 6,
+    name: "workflow-replay-provenance",
+    up: migrateWorkflowReplayProvenance,
+  },
+  {
+    version: 7,
+    name: "workflow-exact-replay",
+    up: migrateWorkflowExactReplay,
+  },
+  {
+    version: 8,
+    name: "workflow-agent-profiles",
+    up: migrateWorkflowAgentProfiles,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -258,6 +273,8 @@ function migrateWorkflowJournal(sqlite: Database.Database): void {
       provider text not null,
       model text,
       effort text,
+      profile_name text,
+      profile_fingerprint text,
       label text,
       phase text,
       status text not null,
@@ -265,6 +282,7 @@ function migrateWorkflowJournal(sqlite: Database.Database): void {
       provider_session_id text,
       response_text text,
       structured_json text,
+      return_value_json text,
       error text,
       isolation text not null default 'shared',
       worktree_path text,
@@ -282,9 +300,33 @@ function migrateWorkflowJournal(sqlite: Database.Database): void {
   `);
 }
 
+function migrateWorkflowReplayProvenance(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "workflow_agent_calls", "prompt", "text not null default ''");
+  addColumnIfMissing(sqlite, "workflow_agent_calls", "schema_json", "text");
+  addColumnIfMissing(sqlite, "workflow_agent_calls", "error_kind", "text");
+  addColumnIfMissing(sqlite, "workflow_agent_calls", "replay_match", "text");
+  addColumnIfMissing(sqlite, "workflow_agent_calls", "replayed_from_run_id", "text");
+  addColumnIfMissing(sqlite, "workflow_agent_calls", "replayed_from_call_index", "integer");
+  addColumnIfMissing(sqlite, "workflow_agent_calls", "replay_reason", "text");
+
+  sqlite.exec(`
+    create index if not exists workflow_agent_calls_replay_source_idx
+      on workflow_agent_calls(replayed_from_run_id, replayed_from_call_index);
+  `);
+}
+
+function migrateWorkflowExactReplay(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "workflow_agent_calls", "return_value_json", "text");
+}
+
+function migrateWorkflowAgentProfiles(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "workflow_agent_calls", "profile_name", "text");
+  addColumnIfMissing(sqlite, "workflow_agent_calls", "profile_fingerprint", "text");
+}
+
 function addColumnIfMissing(
   sqlite: Database.Database,
-  table: "workspace_sessions" | "local_agent_sessions",
+  table: "workspace_sessions" | "local_agent_sessions" | "workflow_agent_calls",
   column: string,
   definition: string,
 ): void {

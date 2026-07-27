@@ -18,6 +18,14 @@ export function getLocalAgentProviderAvailabilitySnapshot(
   return LOCAL_AGENT_PROVIDERS.map((provider) => checkLocalAgentProviderAvailability(provider, env));
 }
 
+export function getAvailableLocalAgentProviders(
+  env: NodeJS.ProcessEnv = process.env,
+): LocalAgentProvider[] {
+  return getLocalAgentProviderAvailabilitySnapshot(env)
+    .filter((provider) => provider.available)
+    .map((provider) => provider.name);
+}
+
 export function checkLocalAgentProviderAvailability(
   provider: LocalAgentProvider,
   env: NodeJS.ProcessEnv = process.env,

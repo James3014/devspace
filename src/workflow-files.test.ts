@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   parseWorkflowArgFlags,
   persistWorkflowScript,
+  readProjectWorkflowScriptFile,
   resolveNamedWorkflowScript,
   resolveWorkflowScriptFromPathOrName,
   WorkflowPathError,
@@ -32,7 +33,7 @@ import { hashSource } from "./workflow-script.js";
     source: "export const meta = { name: 'x', description: 'd' }\nreturn 1\n",
     preferredName: "demo",
   });
-  assert.match(path, /workflow-scripts\/wfr_test\/demo\.js$/);
+  assert.match(path.replaceAll("\\", "/"), /workflow-scripts\/wfr_test\/demo\.js$/);
 
   const file = await resolveWorkflowScriptFromPathOrName({
     file: path,
@@ -52,6 +53,58 @@ import { hashSource } from "./workflow-script.js";
   });
   assert.equal(named.origin, "named");
   assert.match(named.source, /named/);
+  assert.equal(
+    (
+      await readProjectWorkflowScriptFile({
+        scriptPath: join(dir, ".devspace", "workflows", "named.js"),
+        workspaceRoot: dir,
+      })
+    ).nameHint,
+    "named",
+  );
+  await assert.rejects(
+    () =>
+      readProjectWorkflowScriptFile({
+        scriptPath: path,
+        workspaceRoot: dir,
+      }),
+    /must be inside/,
+  );
+
+  if (process.platform !== "win32") {
+    const outside = await mkdtemp(join(tmpdir(), "wf-files-outside-"));
+    try {
+      const outsideScript = join(outside, "escape.js");
+      await writeFile(
+        outsideScript,
+        "export const meta = { name: 'escape', description: 'd' }\nreturn 4\n",
+      );
+      await symlink(
+        outsideScript,
+        join(dir, ".devspace", "workflows", "escape.js"),
+      );
+      await assert.rejects(
+        () =>
+          readProjectWorkflowScriptFile({
+            scriptPath: "escape.js",
+            workspaceRoot: dir,
+          }),
+        /resolves outside/,
+      );
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  }
+
+  await mkdir(join(dir, "workflows"), { recursive: true });
+  await writeFile(
+    join(dir, "workflows", "legacy.js"),
+    "export const meta = { name: 'legacy', description: 'd' }\nreturn 3\n",
+  );
+  await assert.rejects(
+    () => resolveNamedWorkflowScript({ name: "legacy", workspaceRoot: dir }),
+    WorkflowPathError,
+  );
 
   await assert.rejects(
     () => resolveNamedWorkflowScript({ name: "missing", workspaceRoot: dir }),

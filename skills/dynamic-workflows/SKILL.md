@@ -17,14 +17,18 @@ review, migrate-and-verify, research panels — **not** a single subagent turn.
 
 ```bash
 devspace workflow run --file path/to/script.js [--arg k=v]... [--follow]
+devspace workflow run --script-path path/to/script.js [--resume <runId>] [--follow]
 devspace workflow run --name review-auth [--follow]
 devspace workflow run --resume <runId>
 devspace workflow status <runId> [--follow]
 devspace workflow cancel <runId>
 devspace workflow ls
+devspace workflow calls <runId>
+devspace workflow call <runId> <callIndex>
+devspace workflow tui [runId]
 ```
 
-Named scripts: `.devspace/workflows/<name>.js` or `workflows/<name>.js`.
+Project named scripts live under `.devspace/workflows/<name>.js`.
 
 ## Script shape
 
@@ -52,12 +56,11 @@ return { summary, findings }
 
 | API | Notes |
 |---|---|
-| `agent(prompt, opts?)` | Throws on failure. `opts`: `label`, `phase`, `schema`, `model`, `effort`, `provider`, `isolation: 'worktree'` |
+| `agent(prompt, opts?)` | Throws on failure. `opts`: `label`, `phase`, `schema`, `model`, `effort`, `profile` or `provider`, `isolation: 'worktree'` |
 | `parallel(thunks)` | Barrier; throw → `null` slot |
 | `pipeline(items, ...stages)` | Per-item chains; no cross-item barrier |
 | `phase(title)` / `log(msg)` | Progress; journaled |
 | `args` | Run input (object preferred) |
-| `budget` | Stub: `total: null`, `remaining(): Infinity` — do not loop on budget alone |
 | `workflow(name\|{scriptPath}, args?)` | Nested, depth 1, shared call index |
 
 **No `writeMode`.** Teach read-only vs write in the prompt. Use `isolation: 'worktree'` when parallel mutators would conflict (git required).
@@ -77,15 +80,42 @@ const out = await agent('Return JSON findings', {
   },
 })
 // out is validated object; engine retries ≤2 on invalid JSON
+// codex/claude: native structured output first, then prompt repair; others: prompt+Ajv
 ```
 
 ### Providers
 
-Default: first **enabled ∩ available** provider (`agentProviders.enabled` in config, else all live providers in product order). Override with `opts.provider` or `meta.defaultProvider`.
+Profiles exposed by `open_workspace` may be selected with `opts.profile`. The
+profile supplies instructions, provider, model, and effort defaults; per-call
+`model` and `effort` override those defaults. `profile` and `provider` are
+mutually exclusive.
+
+Without a profile, default provider resolution is `opts.provider` →
+`meta.defaultProvider` → first currently available provider.
 
 ### Resume
 
-`devspace workflow run --resume <runId>` creates a **new** run that replays completed agent calls by cache key (callIndex+key, then consume-once by key).
+Failed and cancelled runs are terminal. Recovery creates a **new** run:
+
+1. Inspect the prior run with `workflow status`, `workflow calls`, and
+   `workflow call`.
+2. Edit the persisted `scriptPath` reported by the run, or pass a different
+   `--script-path`.
+3. Keep prompts and agent options stable for completed calls whose return values
+   should be reused.
+4. Run `devspace workflow run --resume <runId>` (optionally with
+   `--script-path <path>`).
+
+Replay walks the prior run in call-index order and reuses the longest unchanged
+prefix. The first failed, interrupted, changed, missing, corrupt, or unavailable
+result executes live and closes replay for every later call, even when a later
+cache key happens to match. Exact return values are stored separately from
+bounded UI previews.
+
+Replay restores an agent's **return value**, not its execution. Shared-checkout
+calls assume their existing filesystem effects are still present. Worktree calls
+are never reused unless their exact worktree can be restored, so they currently
+end the reusable prefix and run live.
 
 ### Cancel
 
@@ -94,7 +124,8 @@ Default: first **enabled ∩ available** provider (`agentProviders.enabled` in c
 ## When to use CLI vs MCP
 
 - **CLI**: host agent can shell; prefer for long runs + `--follow`.
-- **MCP**: ChatGPT plans; call `run_workflow`, then `workflow_status` until terminal. Disconnecting MCP does **not** kill the worker.
+- **TUI**: `devspace workflow tui` opens a read-only live view for workflows associated with the current working directory.
+- **MCP**: ChatGPT plans; call `run_workflow`, then `workflow_status` until terminal. With full widgets enabled, workflow tool cards and the `open_workspace` dashboard show read-only live activity, including workflows launched through the CLI. Disconnecting MCP does **not** kill the worker.
 
 ## Worked mini-examples
 
