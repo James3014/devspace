@@ -83,7 +83,7 @@ sessions.
 
 | Value | Behavior |
 | --- | --- |
-| `full` | Default. Widget UI is attached to exposed workspace, file, edit, and shell tools. |
+| `full` | Default. Widget UI is attached to exposed workspace, workflow, file, edit, and shell tools, including read-only live workflow dashboards. |
 | `changes` | Enables the aggregate `show_changes` tool and attaches widget UI to `open_workspace` and `show_changes`. |
 | `off` | Disables widget UI. |
 
@@ -93,6 +93,7 @@ sessions.
 | --- | --- |
 | `DEVSPACE_SKILLS` | Set to `0` to hide skills. Enabled by default. |
 | `DEVSPACE_SUBAGENTS` | Set to `1` to expose configured agent profiles as Subagents. Experimental and disabled by default. |
+| `DEVSPACE_WORKFLOWS` | Experimental Dynamic Workflows gate. When unset, it follows the effective Subagents setting, including persisted config and any environment override. |
 | `DEVSPACE_AGENT_DIR` | Defaults to `~/.codex`; its `skills` child is loaded for compatibility. |
 | `DEVSPACE_SKILL_PATHS` | Optional comma-separated additional skill directories. |
 
@@ -102,11 +103,15 @@ DevSpace discovers standard Agent Skills from:
 - project `.agents/skills`
 - `~/.devspace/skills`
 
-It also keeps compatibility with:
+It also includes:
 
-- the bundled `subagent-delegation` skill when `DEVSPACE_SUBAGENTS=1`, unless `~/.devspace/skills/subagent-delegation/SKILL.md` exists
+- the package-managed `subagents` skill when the Subagents capability is enabled
+- the package-managed `dynamic-workflows` skill when the Dynamic Workflows capability is enabled
 - `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
 - additional paths from `DEVSPACE_SKILL_PATHS`
+
+User and project skills with the same name take precedence over bundled skills.
+DevSpace does not copy bundled skills into `~/.devspace/skills` during setup.
 
 When Subagents are enabled, DevSpace discovers agent profiles
 from:
@@ -115,12 +120,18 @@ from:
 - project `.devspace/agents/*.md`
 
 `open_workspace` returns a compact catalog containing profile names,
-descriptions, providers, and optional models/thinking levels so the host model can choose an
+descriptions, providers, and optional models/effort levels so the host model can choose an
 agent without reading provider-specific launch details. `devspace agents ls`
 lists existing subagent sessions for the current workspace, scoped by the
-workspace environment injected into shell commands. The `subagent-delegation`
-skill teaches the model to use only the minimal `devspace agents ls`,
-`devspace agents run`, and `devspace agents show` workflow.
+workspace environment injected into shell commands. The `subagents`
+skill teaches the model to discover targets with `devspace agents targets`,
+then use the minimal `devspace agents run`, `devspace agents show`, and
+`devspace agents ls` workflow.
+
+Provider availability is detected at runtime. DevSpace does not persist probe
+timestamps, availability snapshots, or an experimental provider enable-list in
+`config.json`. Final provider policy and onboarding are deferred until the
+Subagents and Dynamic Workflows features are finalized.
 
 Starter profile templates are available under `examples/agents/`. Copy or adapt
 them into one of the active profile directories before use.

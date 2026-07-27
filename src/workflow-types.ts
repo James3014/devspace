@@ -10,6 +10,38 @@
  */
 
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
+import type { JsonSchema } from "./json-types.js";
+import type {
+  AgentIsolationMode,
+  AgentOpts,
+  WorkflowErrorKind,
+  WorkflowAgentCallStatus,
+  WorkflowEventType,
+  WorkflowMeta,
+  WorkflowPhaseMeta,
+  WorkflowRunSource,
+  WorkflowRunStatus,
+} from "./workflow-contracts.js";
+
+export type { JsonObject, JsonPrimitive, JsonSchema, JsonValue } from "./json-types.js";
+export type {
+  AgentIsolationMode,
+  AgentOpts,
+  AppendWorkflowEventInput,
+  WorkflowAgent,
+  WorkflowAgentCallStatus,
+  WorkflowErrorKind,
+  WorkflowEventPayloads,
+  WorkflowEventType,
+  WorkflowMeta,
+  WorkflowNested,
+  WorkflowParallel,
+  WorkflowPhaseMeta,
+  WorkflowPipeline,
+  WorkflowRunSource,
+  WorkflowRunStatus,
+  WorkflowTask,
+} from "./workflow-contracts.js";
 
 // ---------------------------------------------------------------------------
 // Limits
@@ -28,6 +60,7 @@ export const WORKFLOW_LIMITS = {
   eventDataJsonBytes: 8 * 1024,
   responseTextBytes: 1 * 1024 * 1024,
   structuredJsonBytes: 256 * 1024,
+  replayValueJsonBytes: 1 * 1024 * 1024,
   resultJsonBytes: 256 * 1024,
   argsJsonBytes: 64 * 1024,
   scriptSourceBytes: 512 * 1024,
@@ -35,123 +68,15 @@ export const WORKFLOW_LIMITS = {
   eventDrainMax: 500,
 } as const;
 
-// ---------------------------------------------------------------------------
-// Provider config (user config / ServerConfig)
-// ---------------------------------------------------------------------------
-
 export type AgentProviderId = LocalAgentProvider;
-
-export interface AgentProviderProbe {
-  id: AgentProviderId;
-  available: boolean;
-  detail?: string;
-}
-
-/**
- * Ordered enable-list. index 0 = default fallback after live availability filter.
- * Missing block on disk → compat all-available in product order.
- * Explicit enabled: [] → no providers; first agent() fails.
- */
-export interface AgentProvidersConfig {
-  enabled: AgentProviderId[];
-  detectedAt?: string;
-  lastProbe?: AgentProviderProbe[];
-}
-
-// ---------------------------------------------------------------------------
-// Script meta + agent opts
-// ---------------------------------------------------------------------------
-
-export interface WorkflowPhaseMeta {
-  title: string;
-  detail?: string;
-}
-
-export interface WorkflowMeta {
-  name: string;
-  description: string;
-  phases?: WorkflowPhaseMeta[];
-  whenToUse?: string;
-  /** DevSpace extension */
-  defaultProvider?: AgentProviderId;
-  /** DevSpace extension; clamped to engine max */
-  concurrency?: number;
-}
-
-/**
- * Public agent() options. Deliberately no writeMode.
- */
-export interface AgentOpts {
-  label?: string;
-  phase?: string;
-  schema?: object;
-  model?: string;
-  /** Provider-native effort/reasoning level (was thinking). */
-  effort?: string;
-  provider?: AgentProviderId | string;
-  isolation?: "worktree";
-}
-
-export type AgentIsolationMode = "shared" | "worktree";
 
 // ---------------------------------------------------------------------------
 // Status / events
 // ---------------------------------------------------------------------------
 
-export type WorkflowRunStatus =
-  | "starting"
-  | "running"
-  | "completed"
-  | "failed"
-  | "cancelled";
-
-export type WorkflowAgentCallStatus =
-  | "running"
-  | "completed"
-  | "failed"
-  | "cancelled"
-  | "from_cache";
-
-export type WorkflowEventType =
-  | "run_started"
-  | "run_completed"
-  | "run_failed"
-  | "run_cancelled"
-  | "phase_started"
-  | "log"
-  | "agent_call_started"
-  | "agent_call_completed"
-  | "agent_call_failed"
-  | "agent_call_cached"
-  | "schema_retry"
-  | "worktree_created"
-  | "worktree_finalized";
-
-export type WorkflowErrorKind =
-  | "syntax"
-  | "meta"
-  | "determinism"
-  | "provider_disabled"
-  | "provider_unavailable"
-  | "no_provider"
-  | "provider"
-  | "schema"
-  | "cancelled"
-  | "timeout"
-  | "heartbeat"
-  | "worktree"
-  | "nest_depth"
-  | "path"
-  | "result_too_large"
-  | "args_too_large"
-  | "script_too_large"
-  | "internal";
-
 // ---------------------------------------------------------------------------
 // Journal row shapes (behavioral; store maps snake_case)
 // ---------------------------------------------------------------------------
-
-export type WorkflowRunSource = "inline" | "named" | "resume";
 
 export interface WorkflowRunRecord {
   id: string;
@@ -192,9 +117,13 @@ export interface WorkflowAgentCallRecord {
   runId: string;
   callIndex: number;
   cacheKey: string;
-  provider: string;
+  prompt: string;
+  schemaJson?: string;
+  provider: AgentProviderId;
   model?: string;
   effort?: string;
+  profileName?: string;
+  profileFingerprint?: string;
   label?: string;
   phase?: string;
   status: WorkflowAgentCallStatus;
@@ -202,7 +131,13 @@ export interface WorkflowAgentCallRecord {
   providerSessionId?: string;
   responseText?: string;
   structuredJson?: string;
+  returnValueJson?: string;
   error?: string;
+  errorKind?: WorkflowErrorKind;
+  replayMatch?: "same_index" | "compatible_key";
+  replayedFromRunId?: string;
+  replayedFromCallIndex?: number;
+  replayReason?: string;
   isolation: AgentIsolationMode;
   worktreePath?: string;
   dirty?: boolean;
@@ -222,25 +157,31 @@ export interface WorkflowAgentCallRecord {
  */
 export interface AgentCacheKeyInput {
   prompt: string;
-  provider: string;
+  profileName: string | null;
+  profileFingerprint: string | null;
+  provider: AgentProviderId;
   model: string | null;
   effort: string | null;
-  schema: object | null;
+  schema: JsonSchema | null;
   isolation: AgentIsolationMode;
 }
 
 export function buildAgentCacheKeyInput(input: {
   prompt: string;
-  provider: string;
+  profileName?: string | null;
+  profileFingerprint?: string | null;
+  provider: AgentProviderId;
   model?: string | null;
   effort?: string | null;
-  schema?: object | null;
+  schema?: JsonSchema | null;
   isolation?: AgentIsolationMode | "worktree" | null;
 }): AgentCacheKeyInput {
   const isolation: AgentIsolationMode =
     input.isolation === "worktree" ? "worktree" : "shared";
   return {
     prompt: input.prompt,
+    profileName: input.profileName ?? null,
+    profileFingerprint: input.profileFingerprint ?? null,
     provider: input.provider,
     model: input.model ?? null,
     effort: input.effort ?? null,

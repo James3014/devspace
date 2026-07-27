@@ -3,10 +3,10 @@ import {
   augmentPromptForSchema,
   enforceAgentSchema,
   formatAjvErrors,
-  NATIVE_SCHEMA_PROVIDERS,
 } from "./workflow-schema.js";
 import { WorkflowEngineError } from "./workflow-api.js";
 import { ProviderSchemaUnsupportedError } from "./local-agent-runtime.js";
+import { supportsNativeStructuredOutput } from "./local-agent-capabilities.js";
 
 {
   const prompt = augmentPromptForSchema("find bugs", {
@@ -23,9 +23,9 @@ assert.equal(
   "/n must be number",
 );
 
-assert.ok(NATIVE_SCHEMA_PROVIDERS.has("codex"));
-assert.ok(NATIVE_SCHEMA_PROVIDERS.has("claude"));
-assert.ok(!NATIVE_SCHEMA_PROVIDERS.has("opencode"));
+assert.ok(supportsNativeStructuredOutput("codex"));
+assert.ok(supportsNativeStructuredOutput("claude"));
+assert.ok(!supportsNativeStructuredOutput("opencode"));
 
 {
   let attempts = 0;
@@ -37,6 +37,7 @@ assert.ok(!NATIVE_SCHEMA_PROVIDERS.has("opencode"));
       additionalProperties: false,
     },
     prompt: "give n",
+    provider: "opencode",
     run: async () => {
       attempts += 1;
       if (attempts === 1) return { finalResponse: '{"n":"x"}' };
@@ -55,6 +56,7 @@ assert.ok(!NATIVE_SCHEMA_PROVIDERS.has("opencode"));
       enforceAgentSchema({
         schema: { type: "object", properties: { n: { type: "number" } }, required: ["n"] },
         prompt: "x",
+        provider: "opencode",
         maxRetries: 1,
         run: async () => ({ finalResponse: "not json" }),
       }),
@@ -205,6 +207,7 @@ assert.ok(!NATIVE_SCHEMA_PROVIDERS.has("opencode"));
     enforceAgentSchema({
       schema: { type: "object" },
       prompt: "x",
+      provider: "opencode",
       maxRetries: 0,
       onRetry: ({ attempt }) => retries.push(attempt),
       run: async () => ({ finalResponse: "not json" }),

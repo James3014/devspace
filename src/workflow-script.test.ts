@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { parseWorkflowScript, WorkflowScriptError } from "./workflow-script.js";
 import { createStubBudget } from "./workflow-types.js";
-import { runWorkflowSandbox, WorkflowDeterminismError } from "./workflow-sandbox.js";
+import {
+  runWorkflowSandbox,
+  WorkflowDeterminismError,
+  type WorkflowSandboxApi,
+} from "./workflow-sandbox.js";
 
 {
   const parsed = parseWorkflowScript(`
@@ -30,6 +34,63 @@ return { ok: true, name: meta.name }
       error instanceof WorkflowScriptError &&
       error.kind === "meta" &&
       /first statement/.test(error.message),
+  );
+}
+
+{
+  assert.throws(
+    () =>
+      parseWorkflowScript(`
+export const meta = {
+  name: 'bracket-call',
+  description: ({})['constructor']['constructor']('return process')(),
+}
+`),
+    (error: unknown) =>
+      error instanceof WorkflowScriptError &&
+      error.kind === "meta" &&
+      /literal value/.test(error.message),
+  );
+}
+
+{
+  assert.throws(
+    () =>
+      parseWorkflowScript(`
+export const meta = {
+  name: 'computed-key',
+  ['description']: 'd',
+}
+`),
+    (error: unknown) =>
+      error instanceof WorkflowScriptError &&
+      error.kind === "meta" &&
+      /static property name/.test(error.message),
+  );
+}
+
+{
+  const parsed = parseWorkflowScript(`
+export const meta = {
+  name: 'literal-text',
+  description: 'Text such as noCall( and export is data, not executable syntax',
+}
+return meta.description
+`);
+  assert.match(parsed.meta.description, /noCall\(/);
+}
+
+{
+  assert.throws(
+    () =>
+      parseWorkflowScript(`
+export const meta = { name: 'wrong-type', description: 'd', concurrency: 'many' }
+return 1
+`),
+    (error: unknown) =>
+      error instanceof WorkflowScriptError &&
+      /meta\.concurrency/.test(error.message) &&
+      !/is required/.test(error.message),
   );
 }
 
@@ -91,7 +152,7 @@ async function runBody(source: string): Promise<unknown> {
       budget: createStubBudget(),
       workflow: async () => null,
       meta: parsed.meta,
-    },
+    } as WorkflowSandboxApi,
   });
 }
 
@@ -103,6 +164,54 @@ log('hi ' + args.n)
 return { v: 1 + 1, fromAgent: await agent('p') }
 `);
   assert.deepEqual(result, { v: 2, fromAgent: "agent-result" });
+}
+
+{
+  const result = await runBody(`
+export const meta = { name: 'module-words', description: 'd' }
+// import and export in comments are harmless
+const text = 'Explain export syntax and import maps'
+const template = \`import/export: \${text}\`
+const pattern = /import|export/
+return { text, template, matches: pattern.test(text) }
+`);
+  assert.deepEqual(result, {
+    text: "Explain export syntax and import maps",
+    template: "import/export: Explain export syntax and import maps",
+    matches: true,
+  });
+}
+
+{
+  assert.throws(
+    () =>
+      parseWorkflowScript(`
+export const meta = { name: 'static-import', description: 'd' }
+import value from './value.js'
+return value
+`),
+    (error: unknown) => error instanceof WorkflowScriptError && error.kind === "syntax",
+  );
+  assert.throws(
+    () =>
+      parseWorkflowScript(`
+export const meta = { name: 'extra-export', description: 'd' }
+export const value = 1
+return value
+`),
+    (error: unknown) => error instanceof WorkflowScriptError && error.kind === "syntax",
+  );
+}
+
+{
+  await assert.rejects(
+    () =>
+      runBody(`
+export const meta = { name: 'dynamic-import', description: 'd' }
+return import('node:fs')
+`),
+    /dynamic import callback/i,
+  );
 }
 
 {

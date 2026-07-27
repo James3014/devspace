@@ -7,6 +7,18 @@ import type {
   ThreadOptions,
   TurnOptions,
 } from "@openai/codex-sdk";
+import type { JsonSchema } from "./json-types.js";
+import type { LocalAgentProvider } from "./local-agent-profiles.js";
+import {
+  isNativeSchemaUnsupportedFailure,
+  ProviderSchemaUnsupportedError,
+} from "./local-agent-errors.js";
+
+export {
+  isNativeSchemaUnsupportedFailure,
+  isProviderSchemaUnsupportedError,
+  ProviderSchemaUnsupportedError,
+} from "./local-agent-errors.js";
 
 export type LocalAgentWriteMode = "read_only" | "allowed" | "full_access";
 
@@ -19,11 +31,11 @@ export interface LocalAgentRunInput {
   /** Provider-native effort / reasoning level (was thinking). */
   effort?: string;
   /** JSON Schema for native structured output (codex/claude). */
-  schema?: object;
+  schema?: JsonSchema;
 }
 
 export interface LocalAgentRunResult {
-  provider: string;
+  provider: LocalAgentProvider;
   providerSessionId: string | null;
   finalResponse: string;
   items: unknown[];
@@ -32,41 +44,8 @@ export interface LocalAgentRunResult {
 }
 
 export interface LocalAgentRuntime {
-  readonly provider: string;
+  readonly provider: LocalAgentProvider;
   run(input: LocalAgentRunInput): Promise<LocalAgentRunResult>;
-}
-
-export class ProviderSchemaUnsupportedError extends Error {
-  constructor(
-    readonly provider: string,
-    readonly cause: unknown,
-  ) {
-    super(`${provider} does not support the requested native output schema: ${errorMessage(cause)}`);
-    this.name = "ProviderSchemaUnsupportedError";
-  }
-}
-
-export function isProviderSchemaUnsupportedError(
-  error: unknown,
-): error is ProviderSchemaUnsupportedError {
-  return error instanceof ProviderSchemaUnsupportedError;
-}
-
-export function isNativeSchemaUnsupportedFailure(error: unknown): boolean {
-  const message = errorMessage(error).toLowerCase();
-  const mentionsSchema =
-    /output[ _-]?schema/.test(message) ||
-    /json[ _-]?schema/.test(message) ||
-    /structured[ _-]?output/.test(message) ||
-    /output[ _-]?format/.test(message);
-  const unsupported =
-    /not supported/.test(message) ||
-    /unsupported/.test(message) ||
-    /invalid (?:output|json )?schema/.test(message) ||
-    /schema (?:is )?invalid/.test(message) ||
-    /unknown (?:field|parameter|option)/.test(message) ||
-    /not available/.test(message);
-  return mentionsSchema && unsupported;
 }
 
 interface CodexThreadLike {
@@ -156,8 +135,4 @@ export async function createCodexSdkLocalAgentRuntime(
 async function defaultCodexFactory(): Promise<CodexFactory> {
   const module = await import("@openai/codex-sdk");
   return (options) => new module.Codex(options) as Codex;
-}
-
-function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error);
 }

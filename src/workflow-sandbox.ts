@@ -1,6 +1,16 @@
-import vm from "node:vm";
+import { fork, type ChildProcess } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { WorkflowEngineError } from "./workflow-api.js";
 import type { ParsedWorkflowScript } from "./workflow-script.js";
-import type { WorkflowBudget, WorkflowMeta } from "./workflow-types.js";
+import type { JsonValue } from "./json-types.js";
+import type {
+  WorkflowAgent,
+  WorkflowBudget,
+  WorkflowMeta,
+  WorkflowNested,
+  WorkflowParallel,
+  WorkflowPipeline,
+} from "./workflow-types.js";
 
 export class WorkflowDeterminismError extends Error {
   constructor(message: string) {
@@ -10,14 +20,14 @@ export class WorkflowDeterminismError extends Error {
 }
 
 export interface WorkflowSandboxApi {
-  agent: (...args: unknown[]) => unknown;
-  parallel: (...args: unknown[]) => unknown;
-  pipeline: (...args: unknown[]) => unknown;
-  phase: (...args: unknown[]) => unknown;
+  agent: WorkflowAgent;
+  parallel: WorkflowParallel;
+  pipeline: WorkflowPipeline;
+  phase: (title: string) => void;
   log: (...args: unknown[]) => unknown;
-  args: unknown;
+  args: JsonValue | undefined;
   budget: WorkflowBudget;
-  workflow: (...args: unknown[]) => unknown;
+  workflow: WorkflowNested;
   /** Host bookkeeping only; script binds its own `const meta`. */
   meta: WorkflowMeta;
 }
@@ -27,190 +37,237 @@ export interface RunWorkflowSandboxOptions {
   api: WorkflowSandboxApi;
   /** Host wall-clock max for the whole script (ms). Default 6h. */
   timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
+type SandboxMethod = "agent" | "workflow" | "phase" | "log";
+
+interface SandboxStartMessage {
+  type: "start";
+  source: string;
+  filename: string;
+  args: JsonValue | undefined;
+  budget: {
+    total: number | null;
+    spent: number;
+    remaining: number;
+  };
+}
+
+interface SandboxCallMessage {
+  type: "call";
+  id: number;
+  method: Extract<SandboxMethod, "agent" | "workflow">;
+  args: unknown[];
+}
+
+interface SandboxNotifyMessage {
+  type: "notify";
+  method: Extract<SandboxMethod, "phase" | "log">;
+  args: unknown[];
+}
+
+interface SandboxResultMessage {
+  type: "result";
+  value: unknown;
+}
+
+interface SandboxErrorMessage {
+  type: "error";
+  error: SerializedError;
+}
+
+interface SandboxCallResultMessage {
+  type: "call_result";
+  id: number;
+  value?: unknown;
+  error?: SerializedError;
+}
+
+interface SerializedError {
+  name: string;
+  message: string;
+  stack?: string;
+  kind?: string;
+}
+
+type MessageFromChild =
+  | SandboxCallMessage
+  | SandboxNotifyMessage
+  | SandboxResultMessage
+  | SandboxErrorMessage;
+
 /**
- * Execute a compiled workflow script in a restricted node:vm context.
- * Not a hostile multi-tenant security boundary — determinism + capability reduction.
+ * Execute a workflow in a disposable child process. The child owns the vm
+ * context and can be terminated even when model-authored JavaScript blocks its
+ * event loop with synchronous code.
  */
 export async function runWorkflowSandbox(
   options: RunWorkflowSandboxOptions,
 ): Promise<unknown> {
-  const { parsed, api } = options;
   const timeoutMs = options.timeoutMs ?? 6 * 60 * 60 * 1000;
+  const child = spawnSandboxChild();
 
-  const consoleProxy = {
-    log: (...args: unknown[]) => {
-      api.log(args.map(stringifyConsoleArg).join(" "));
-    },
-    warn: (...args: unknown[]) => {
-      api.log(args.map(stringifyConsoleArg).join(" "));
-    },
-    error: (...args: unknown[]) => {
-      api.log(args.map(stringifyConsoleArg).join(" "));
-    },
-    info: (...args: unknown[]) => {
-      api.log(args.map(stringifyConsoleArg).join(" "));
-    },
-    debug: (...args: unknown[]) => {
-      api.log(args.map(stringifyConsoleArg).join(" "));
-    },
-  };
+  return new Promise<unknown>((resolve, reject) => {
+    let settled = false;
 
-  // Script params: host APIs only. `meta`/`console` are not params (meta is script-local;
-  // console lives on sandbox globals so console.log works).
-  const sandboxApi = {
-    agent: api.agent,
-    parallel: api.parallel,
-    pipeline: api.pipeline,
-    phase: api.phase,
-    log: api.log,
-    args: api.args,
-    budget: api.budget,
-    workflow: api.workflow,
-  };
+    const finish = (outcome: { value: unknown } | { error: unknown }): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", onAbort);
+      child.removeAllListeners();
+      if (child.connected) child.disconnect();
+      if (!child.killed && child.exitCode === null) child.kill("SIGKILL");
+      if ("error" in outcome) reject(outcome.error);
+      else resolve(outcome.value);
+    };
 
-  const context = vm.createContext(createSandboxGlobals(consoleProxy));
-  const factory = parsed.script.runInContext(context, {
-    timeout: 5_000,
-    displayErrors: true,
-  }) as (api: typeof sandboxApi) => Promise<unknown>;
+    const terminate = (error: Error): void => {
+      finish({ error });
+    };
 
-  if (typeof factory !== "function") {
-    throw new Error("Workflow script did not compile to a function");
-  }
+    const onAbort = (): void => {
+      terminate(new WorkflowEngineError("cancelled", "Workflow cancelled"));
+    };
 
-  const result = await withTimeout(
-    Promise.resolve().then(() => factory(sandboxApi)),
-    timeoutMs,
-  );
-  // Context objects keep the sandbox realm's prototypes; rehydrate for host use.
-  return rehydrateHostValue(result);
-}
-
-/** Copy a sandbox value into the host realm (plain objects / arrays / primitives). */
-export function rehydrateHostValue(value: unknown): unknown {
-  if (value === null || value === undefined) return value;
-  const t = typeof value;
-  if (t === "string" || t === "number" || t === "boolean" || t === "bigint") return value;
-  if (t === "function" || t === "symbol") return value;
-  if (Array.isArray(value)) {
-    return Array.from(value as unknown[], (item) => rehydrateHostValue(item));
-  }
-  if (value instanceof Date) {
-    return new Date(value.getTime());
-  }
-  const out: Record<string, unknown> = {};
-  for (const [key, entry] of Object.entries(value as Record<string, unknown>)) {
-    out[key] = rehydrateHostValue(entry);
-  }
-  return out;
-}
-
-function createSandboxGlobals(
-  consoleProxy: Record<string, (...args: unknown[]) => void>,
-): Record<string, unknown> {
-  return {
-    Object,
-    Array,
-    String,
-    Number,
-    Boolean,
-    Map,
-    Set,
-    WeakMap,
-    WeakSet,
-    JSON,
-    Math: createBannedMath(),
-    Date: createBannedDate(),
-    RegExp,
-    Error,
-    TypeError,
-    RangeError,
-    SyntaxError,
-    URIError,
-    EvalError,
-    Promise,
-    Symbol,
-    Proxy,
-    Reflect,
-    parseInt,
-    parseFloat,
-    isNaN,
-    isFinite,
-    encodeURI,
-    decodeURI,
-    encodeURIComponent,
-    decodeURIComponent,
-    undefined,
-    NaN,
-    Infinity,
-    console: consoleProxy,
-    // Explicitly absent: require, process, fetch, Buffer, setTimeout, setInterval, ...
-  };
-}
-
-function createBannedDate(): typeof Date {
-  const RealDate = Date;
-
-  function DateShim(this: unknown, ...args: unknown[]): string | Date {
-    if (new.target) {
-      if (args.length === 0) {
-        throw new WorkflowDeterminismError(
-          "new Date() without arguments is banned in workflow scripts (pass an ISO string)",
-        );
-      }
-      return new (RealDate as unknown as new (...a: unknown[]) => Date)(...args);
-    }
-    throw new WorkflowDeterminismError("Date() is banned in workflow scripts");
-  }
-
-  DateShim.now = function bannedNow(): number {
-    throw new WorkflowDeterminismError("Date.now() is banned in workflow scripts");
-  };
-  DateShim.parse = RealDate.parse.bind(RealDate);
-  DateShim.UTC = RealDate.UTC.bind(RealDate);
-  Object.setPrototypeOf(DateShim, RealDate);
-  DateShim.prototype = RealDate.prototype;
-  return DateShim as unknown as typeof Date;
-}
-
-function createBannedMath(): Math {
-  return new Proxy(Math, {
-    get(target, prop, receiver) {
-      if (prop === "random") {
-        return () => {
-          throw new WorkflowDeterminismError("Math.random() is banned in workflow scripts");
-        };
-      }
-      return Reflect.get(target, prop, receiver);
-    },
-  });
-}
-
-function stringifyConsoleArg(value: unknown): string {
-  if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return String(value);
-  }
-}
-
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => {
-      reject(new Error(`Workflow script exceeded host timeout (${ms}ms)`));
-    }, ms);
-    promise.then(
-      (value) => {
-        clearTimeout(timer);
-        resolve(value);
+      terminate(new Error(`Workflow script exceeded host timeout (${timeoutMs}ms)`));
+    }, timeoutMs);
+    timer.unref?.();
+
+    if (options.signal?.aborted) {
+      onAbort();
+      return;
+    }
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+
+    child.on("message", (message: MessageFromChild) => {
+      void handleChildMessage(child, options.api, message, finish);
+    });
+    child.once("error", (error) => finish({ error }));
+    child.once("exit", (code, signal) => {
+      if (settled) return;
+      finish({
+        error: new Error(
+          `Workflow sandbox exited before returning a result (code=${String(code)}, signal=${String(signal)})`,
+        ),
+      });
+    });
+
+    const start: SandboxStartMessage = {
+      type: "start",
+      source: options.parsed.source,
+      filename: options.parsed.filename,
+      args: options.api.args,
+      budget: {
+        total: options.api.budget.total,
+        spent: options.api.budget.spent(),
+        remaining: options.api.budget.remaining(),
       },
-      (error) => {
-        clearTimeout(timer);
-        reject(error);
-      },
-    );
+    };
+    safeSend(child, start);
   });
+}
+
+async function handleChildMessage(
+  child: ChildProcess,
+  api: WorkflowSandboxApi,
+  message: MessageFromChild,
+  finish: (outcome: { value: unknown } | { error: unknown }) => void,
+): Promise<void> {
+  switch (message.type) {
+    case "result":
+      finish({ value: message.value });
+      return;
+    case "error":
+      finish({ error: deserializeError(message.error) });
+      return;
+    case "notify":
+      try {
+        if (message.method === "phase") {
+          api.phase(message.args[0] as string);
+        } else {
+          api.log(...message.args);
+        }
+      } catch (error) {
+        if (!child.killed) child.kill("SIGKILL");
+        finish({ error });
+      }
+      return;
+    case "call": {
+      const reply: SandboxCallResultMessage = {
+        type: "call_result",
+        id: message.id,
+      };
+      try {
+        reply.value = message.method === "agent"
+          ? await api.agent(message.args[0] as string, message.args[1] as never)
+          : await api.workflow(message.args[0] as never, message.args[1] as never);
+      } catch (error) {
+        reply.error = serializeError(error);
+      }
+      safeSend(child, reply);
+      return;
+    }
+  }
+}
+
+function spawnSandboxChild(): ChildProcess {
+  const selfUrl = import.meta.url;
+  const childUrl = selfUrl.replace(
+    /workflow-sandbox\.(ts|js)$/,
+    "workflow-sandbox-child.$1",
+  );
+  if (childUrl === selfUrl) {
+    throw new Error(`Unable to resolve workflow sandbox child entry from ${selfUrl}`);
+  }
+  const childEntry = fileURLToPath(childUrl);
+  return fork(childEntry, [], {
+    execArgv: process.execArgv,
+    stdio: ["ignore", "ignore", "ignore", "ipc"],
+    serialization: "advanced",
+    env: {
+      NODE_ENV: process.env.NODE_ENV ?? "production",
+    },
+  });
+}
+
+function safeSend(child: ChildProcess, message: object): void {
+  if (!child.connected) return;
+  try {
+    child.send(message, () => {
+      // The sandbox may close while an agent call is completing.
+    });
+  } catch {
+    // The child is already being torn down.
+  }
+}
+
+function serializeError(error: unknown): SerializedError {
+  if (!(error instanceof Error)) {
+    return { name: "Error", message: String(error) };
+  }
+  const kind = "kind" in error && typeof error.kind === "string" ? error.kind : undefined;
+  return {
+    name: error.name,
+    message: error.message,
+    stack: error.stack,
+    kind,
+  };
+}
+
+function deserializeError(input: SerializedError): Error {
+  const error = input.name === "WorkflowDeterminismError"
+    ? new WorkflowDeterminismError(input.message)
+    : input.name === "WorkflowEngineError" && input.kind
+      ? new WorkflowEngineError(
+          input.kind as ConstructorParameters<typeof WorkflowEngineError>[0],
+          input.message,
+        )
+      : new Error(input.message);
+  error.name = input.name;
+  if (input.stack) error.stack = input.stack;
+  if (input.kind) Object.assign(error, { kind: input.kind });
+  return error;
 }

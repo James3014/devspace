@@ -21,26 +21,22 @@ export interface SkillReadResolution {
   isSkillFile: boolean;
 }
 
-const SUBAGENT_DELEGATION_NAME = "subagent-delegation";
+const SUBAGENTS_NAME = "subagents";
+const LEGACY_SUBAGENT_DELEGATION_NAME = "subagent-delegation";
 const DYNAMIC_WORKFLOWS_NAME = "dynamic-workflows";
 
 function bundledSkillsDir(): string {
   return fileURLToPath(new URL("../skills", import.meta.url));
 }
 
-/**
- * Always include the bundled skills root when subagents are enabled.
- * Previously the whole dir was dropped if the user had seeded
- * subagent-delegation — that hid later skills (e.g. dynamic-workflows).
- * User/devspace copies still win via earlier path order + name collisions.
- */
+/** Package skills are defaults; user/project copies win by path order. */
 export function effectiveSkillPaths(config: ServerConfig, cwd: string): string[] {
   const defaultPathCandidates = [
     join(homedir(), ".agents", "skills"),
     resolve(cwd, ".agents", "skills"),
     config.devspaceSkillsDir,
     join(config.agentDir, "skills"),
-    config.subagents ? bundledSkillsDir() : undefined,
+    config.subagents || config.workflows ? bundledSkillsDir() : undefined,
   ];
   const defaultPaths = defaultPathCandidates.filter(
     (path): path is string => path !== undefined && existsSync(path),
@@ -70,9 +66,9 @@ export function loadWorkspaceSkills(config: ServerConfig, cwd: string): LoadedSk
     includeDefaults: false,
   });
 
-  if (config.subagents) return result;
-
-  const gated = new Set<string>([SUBAGENT_DELEGATION_NAME, DYNAMIC_WORKFLOWS_NAME]);
+  const gated = new Set<string>([LEGACY_SUBAGENT_DELEGATION_NAME]);
+  if (!config.subagents) gated.add(SUBAGENTS_NAME);
+  if (!config.workflows) gated.add(DYNAMIC_WORKFLOWS_NAME);
   return {
     skills: result.skills.filter((skill) => !gated.has(skill.name)),
     diagnostics: result.diagnostics.filter((diagnostic) => {

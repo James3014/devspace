@@ -1,7 +1,16 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
-import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
+import { Result, type Result as BetterResult } from "better-result";
+import type {
+  EffortLevel,
+  OutputFormat,
+} from "@anthropic-ai/claude-agent-sdk";
+import type { JsonSchema } from "./json-types.js";
+import {
+  classifyAgentProviderError,
+  type AgentProviderError,
+} from "./local-agent-errors.js";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
 import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
 import {
@@ -27,7 +36,19 @@ export async function runLocalAgentProvider(
   provider: LocalAgentProvider,
   input: LocalAgentRunInput,
 ): Promise<LocalAgentRunResult> {
-  return createLocalAgentAdapter(provider).run(input);
+  const result = await runLocalAgentProviderResult(provider, input);
+  if (result.isErr()) throw result.error;
+  return result.value;
+}
+
+export async function runLocalAgentProviderResult(
+  provider: LocalAgentProvider,
+  input: LocalAgentRunInput,
+): Promise<BetterResult<LocalAgentRunResult, AgentProviderError>> {
+  return Result.tryPromise({
+    try: () => createLocalAgentAdapter(provider).run(input),
+    catch: (cause) => classifyAgentProviderError(provider, cause),
+  });
 }
 
 export function createLocalAgentAdapter(provider: LocalAgentProvider): LocalAgentAdapter {
@@ -116,8 +137,8 @@ class ClaudeLocalAgentAdapter implements LocalAgentAdapter {
 
 /** Build Claude SDK outputFormat when a JSON Schema is requested. */
 export function claudeOutputFormatOptions(
-  schema: object | undefined,
-): { outputFormat: { type: "json_schema"; schema: Record<string, unknown> } } | Record<string, never> {
+  schema: JsonSchema | undefined,
+): { outputFormat: OutputFormat } | Record<string, never> {
   if (!schema) return {};
   return {
     outputFormat: {
