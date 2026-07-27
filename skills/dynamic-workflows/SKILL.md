@@ -25,9 +25,10 @@ devspace workflow cancel <runId>
 devspace workflow ls
 devspace workflow calls <runId>
 devspace workflow call <runId> <callIndex>
+devspace workflow tui [runId]
 ```
 
-Named scripts: `.devspace/workflows/<name>.js` or `workflows/<name>.js`.
+Project named scripts live under `.devspace/workflows/<name>.js`.
 
 ## Script shape
 
@@ -55,7 +56,7 @@ return { summary, findings }
 
 | API | Notes |
 |---|---|
-| `agent(prompt, opts?)` | Throws on failure. `opts`: `label`, `phase`, `schema`, `model`, `effort`, `provider`, `isolation: 'worktree'` |
+| `agent(prompt, opts?)` | Throws on failure. `opts`: `label`, `phase`, `schema`, `model`, `effort`, `profile` or `provider`, `isolation: 'worktree'` |
 | `parallel(thunks)` | Barrier; throw → `null` slot |
 | `pipeline(items, ...stages)` | Per-item chains; no cross-item barrier |
 | `phase(title)` / `log(msg)` | Progress; journaled |
@@ -84,7 +85,13 @@ const out = await agent('Return JSON findings', {
 
 ### Providers
 
-Default: first **enabled ∩ available** provider (`agentProviders.enabled` in config, else all live providers in product order). Override with `opts.provider` or `meta.defaultProvider`.
+Profiles exposed by `open_workspace` may be selected with `opts.profile`. The
+profile supplies instructions, provider, model, and effort defaults; per-call
+`model` and `effort` override those defaults. `profile` and `provider` are
+mutually exclusive.
+
+Without a profile, default provider resolution is `opts.provider` →
+`meta.defaultProvider` → first currently available provider.
 
 ### Resume
 
@@ -99,14 +106,16 @@ Failed and cancelled runs are terminal. Recovery creates a **new** run:
 4. Run `devspace workflow run --resume <runId>` (optionally with
    `--script-path <path>`).
 
-Replay first matches the same call index and cache key, then consumes one
-compatible prior cache key after reordering. The new run records whether each
-call was reused by same-index or compatible-key matching, and where it came
-from. Failed, interrupted, changed, or unmatched calls execute live.
+Replay walks the prior run in call-index order and reuses the longest unchanged
+prefix. The first failed, interrupted, changed, missing, corrupt, or unavailable
+result executes live and closes replay for every later call, even when a later
+cache key happens to match. Exact return values are stored separately from
+bounded UI previews.
 
-Replay restores an agent's **return value**. It does not recreate shared-checkout
-edits or reapply a prior worktree diff. Verify required filesystem state before
-depending on a replayed mutating call.
+Replay restores an agent's **return value**, not its execution. Shared-checkout
+calls assume their existing filesystem effects are still present. Worktree calls
+are never reused unless their exact worktree can be restored, so they currently
+end the reusable prefix and run live.
 
 ### Cancel
 
@@ -115,7 +124,8 @@ depending on a replayed mutating call.
 ## When to use CLI vs MCP
 
 - **CLI**: host agent can shell; prefer for long runs + `--follow`.
-- **MCP**: ChatGPT plans; call `run_workflow`, then `workflow_status` until terminal. Disconnecting MCP does **not** kill the worker.
+- **TUI**: `devspace workflow tui` opens a read-only live view for workflows associated with the current working directory.
+- **MCP**: ChatGPT plans; call `run_workflow`, then `workflow_status` until terminal. With full widgets enabled, workflow tool cards and the `open_workspace` dashboard show read-only live activity, including workflows launched through the CLI. Disconnecting MCP does **not** kill the worker.
 
 ## Worked mini-examples
 

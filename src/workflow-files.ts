@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, realpath, writeFile } from "node:fs/promises";
 import { basename, dirname, extname, isAbsolute, join, resolve } from "node:path";
 import { Result, type Result as BetterResult } from "better-result";
 import { hashSource } from "./workflow-script.js";
@@ -11,6 +11,7 @@ import {
   WorkflowFileReadError,
   WorkflowFileWriteError,
 } from "./workflow-errors.js";
+import { isPathInsideRoot } from "./roots.js";
 
 export class WorkflowPathError extends Error {
   constructor(message: string) {
@@ -97,12 +98,65 @@ export async function readWorkflowScriptFileResult(
   });
 }
 
+export async function readProjectWorkflowScriptFile(input: {
+  scriptPath: string;
+  workspaceRoot: string;
+}): Promise<ResolvedWorkflowScript> {
+  const result = await readProjectWorkflowScriptFileResult(input);
+  if (result.isErr()) throwPathCompatibilityError(result.error);
+  return result.value;
+}
+
+/** Resolve an explicit nested script only inside `<project>/.devspace/workflows`. */
+export async function readProjectWorkflowScriptFileResult(input: {
+  scriptPath: string;
+  workspaceRoot: string;
+}): Promise<BetterResult<ResolvedWorkflowScript, WorkflowFileResolveError>> {
+  const projectWorkflowRoot = resolve(input.workspaceRoot, ".devspace", "workflows");
+  const requestedPath = isAbsolute(input.scriptPath)
+    ? resolve(input.scriptPath)
+    : resolve(projectWorkflowRoot, input.scriptPath);
+
+  if (!isPathInsideRoot(requestedPath, projectWorkflowRoot)) {
+    return Result.err(
+      new InvalidWorkflowInputError({
+        code: "invalid_path",
+        message: `Nested workflow script must be inside ${projectWorkflowRoot}`,
+      }),
+    );
+  }
+
+  let canonicalRoot: string;
+  let canonicalPath: string;
+  try {
+    [canonicalRoot, canonicalPath] = await Promise.all([
+      realpath(projectWorkflowRoot),
+      realpath(requestedPath),
+    ]);
+  } catch (cause) {
+    return Result.err(
+      isFileNotFound(cause)
+        ? new WorkflowFileNotFoundError(requestedPath)
+        : new WorkflowFileReadError(requestedPath, cause),
+    );
+  }
+
+  if (!isPathInsideRoot(canonicalPath, canonicalRoot)) {
+    return Result.err(
+      new InvalidWorkflowInputError({
+        code: "invalid_path",
+        message: `Nested workflow script resolves outside ${projectWorkflowRoot}`,
+      }),
+    );
+  }
+  return readWorkflowScriptFileResult(canonicalPath);
+}
+
 /**
  * Resolve named workflow script.
  * Search order:
  * 1. `<cwd>/.devspace/workflows/<name>.js`
- * 2. `<cwd>/workflows/<name>.js`
- * 3. `<stateDir>/workflows/<name>.js` (if stateDir provided)
+ * 2. `<stateDir>/workflows/<name>.js` (if stateDir provided)
  */
 export async function resolveNamedWorkflowScript(input: {
   name: string;
@@ -130,7 +184,6 @@ export async function resolveNamedWorkflowScriptResult(input: {
   }
   const candidates = [
     join(input.workspaceRoot, ".devspace", "workflows", `${name}.js`),
-    join(input.workspaceRoot, "workflows", `${name}.js`),
   ];
   if (input.stateDir) {
     candidates.push(join(input.stateDir, "workflows", `${name}.js`));

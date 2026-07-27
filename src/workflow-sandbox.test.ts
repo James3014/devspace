@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { parseWorkflowScript } from "./workflow-script.js";
+import { WorkflowEngineError } from "./workflow-api.js";
 import {
   createStubBudget,
   type WorkflowMeta,
@@ -81,6 +82,147 @@ return Math.random()
       }),
     (error: unknown) =>
       error instanceof WorkflowDeterminismError && /Math\.random/.test(error.message),
+  );
+}
+
+{
+  const started = Date.now();
+  await assert.rejects(
+    () =>
+      runWorkflowSandbox({
+        parsed: parseWorkflowScript(`
+export const meta = { name: 'sync-loop', description: 'd' }
+while (true) {}
+`),
+        api: api({ name: "sync-loop", description: "d" }),
+        timeoutMs: 100,
+      }),
+    /exceeded host timeout/,
+  );
+  assert.ok(Date.now() - started < 5_000, "synchronous loop should be externally terminated");
+
+  const followup = parseWorkflowScript(`
+export const meta = { name: 'after-loop', description: 'd' }
+return 'still-alive'
+`);
+  assert.equal(
+    await runWorkflowSandbox({ parsed: followup, api: api(followup.meta) }),
+    "still-alive",
+  );
+}
+
+{
+  const controller = new AbortController();
+  const running = runWorkflowSandbox({
+    parsed: parseWorkflowScript(`
+export const meta = { name: 'abort-loop', description: 'd' }
+while (true) {}
+`),
+    api: api({ name: "abort-loop", description: "d" }),
+    signal: controller.signal,
+  });
+  setTimeout(() => controller.abort(), 50);
+  await assert.rejects(
+    () => running,
+    (error: unknown) =>
+      error instanceof WorkflowEngineError && error.kind === "cancelled",
+  );
+}
+
+{
+  await assert.rejects(
+    () =>
+      runWorkflowSandbox({
+        parsed: parseWorkflowScript(`
+export const meta = { name: 'date-constructor-ban', description: 'd' }
+return new Date(0).constructor.now()
+`),
+        api: api({ name: "date-constructor-ban", description: "d" }),
+      }),
+    (error: unknown) =>
+      error instanceof WorkflowDeterminismError && /Date\.now/.test(error.message),
+  );
+}
+
+{
+  await assert.rejects(
+    () =>
+      runWorkflowSandbox({
+        parsed: parseWorkflowScript(`
+export const meta = { name: 'constructor-escape', description: 'd' }
+return Object.constructor('return process.version')()
+`),
+        api: api({ name: "constructor-escape", description: "d" }),
+      }),
+    /process is not defined/,
+  );
+}
+
+{
+  await assert.rejects(
+    () =>
+      runWorkflowSandbox({
+        parsed: parseWorkflowScript(`
+export const meta = { name: 'promise-realm-escape', description: 'd' }
+const pending = agent('x')
+return pending.constructor.constructor('return process')()
+`),
+        api: api({ name: "promise-realm-escape", description: "d" }),
+      }),
+    /process is not defined/,
+  );
+}
+
+{
+  const hostApi = api({ name: "result-realm-escape", description: "d" });
+  hostApi.agent = async () => ({ ok: true }) as never;
+  await assert.rejects(
+    () =>
+      runWorkflowSandbox({
+        parsed: parseWorkflowScript(`
+export const meta = { name: 'result-realm-escape', description: 'd' }
+const value = await agent('x')
+return value.constructor.constructor('return process')()
+`),
+        api: hostApi,
+      }),
+    /process is not defined/,
+  );
+}
+
+{
+  const hostApi = api({ name: "error-realm-escape", description: "d" });
+  hostApi.agent = async () => {
+    throw new WorkflowEngineError("internal", "boom");
+  };
+  await assert.rejects(
+    () =>
+      runWorkflowSandbox({
+        parsed: parseWorkflowScript(`
+export const meta = { name: 'error-realm-escape', description: 'd' }
+try {
+  await agent('x')
+} catch (error) {
+  return error.constructor.constructor('return process')()
+}
+`),
+        api: hostApi,
+      }),
+    /process is not defined/,
+  );
+}
+
+{
+  await assert.rejects(
+    () =>
+      runWorkflowSandbox({
+        parsed: parseWorkflowScript(`
+export const meta = { name: 'api-constructor-escape', description: 'd' }
+return agent.constructor('return process.version')()
+`),
+        api: api({ name: "api-constructor-escape", description: "d" }),
+      }),
+    /process is not defined/,
   );
 }
 

@@ -19,7 +19,7 @@ Subagents stay **CLI-only**. Workflows get **CLI + MCP** over shared primitives.
 | `budget` stub v1 | `{ total: null, spent: () => 0, remaining: () => Infinity }`. |
 | Dual surface | `devspace workflow *` **and** MCP `run_workflow` / `workflow_status` / `workflow_cancel`. |
 | All 6 providers v1 | codex/claude/opencode/pi/cursor/copilot via existing adapters. |
-| `agentProviders.enabled` | Ordered config from onboarding; default provider = first enabled ∩ live. |
+| Provider policy | Runtime uses currently available providers in stable product order. Durable provider policy and onboarding are deferred. |
 | Resume-by-replay right after engine core | Same milestone order as locked plan. |
 
 ---
@@ -119,28 +119,28 @@ runProvider({ provider, prompt, workspace, model, effort, providerSessionId? })
 - If product later wants unified list, add a flag — not v1.
 - `workspace` is either shared `workspaceRoot` or a managed worktree path when `opts.isolation === 'worktree'`.
 
-### 4.3 Provider resolution + config
+### 4.3 Provider resolution now; policy later
 
-Config add (see primitives-spec §3):
+Current experimental runtime:
 
-```ts
-agentProviders?: {
-  enabled: AgentProviderId[]   // order = preference; [0] = default
-  detectedAt?: string
-  lastProbe?: Array<{ id, available, detail? }>
-}
-```
+- Probe provider availability at execution time.
+- Resolve `opts.provider` → `meta.defaultProvider` → first available provider
+  in stable product order.
+- Keep probe timestamps and unavailable reasons in diagnostics only; do not
+  persist them in user configuration.
+- Unknown or unavailable explicit providers fail that `agent()` call.
 
-Algorithm: `opts.provider` → `meta.defaultProvider` → first of `enabled ∩ liveAvailable`.  
-Missing `agentProviders` → compat all-available in code order.  
-Onboarding (`init`/`doctor`) probes PATH and writes `enabled`.  
-Unknown/unavailable: fail that `agent()` (throw → parallel null).
+The final onboarding release may add an ordered array of provider policy
+objects with `id`, `enabled`, `defaultModel`, and `defaultEffort`. That contract
+is deliberately deferred so the workflow stack does not publish an unfinished
+configuration shape.
 
 ### 4.4 Skills gating fix (required, not optional)
 
-Today `effectiveSkillPaths` drops **entire** bundled dir if user has seeded `subagent-delegation` — hides any new bundled skill.
-
-v1: include bundled **per-skill** (user copy wins on name collision). Seed `dynamic-workflows` in `user-config` next to subagent skill.
+Bundled `subagents` and `dynamic-workflows` skills remain package-managed.
+User/project copies win on name collision. Setup does not copy bundled skills
+into `~/.devspace/skills`, which prevents generated copies from shadowing later
+package updates. The legacy `subagent-delegation` name is suppressed.
 
 ### 4.5 MCP vs CLI symmetry
 
@@ -240,9 +240,9 @@ Provider-native strings pass through unchanged.
 | **3 Engine** | `isolation` path with fake/temp git repos in tests |
 | **4 Worker+CLI** | real worktree create/cleanup; journal fields |
 | **5 Resume** | cache key includes isolation |
-| **8 Teach** | skill isolation + effort; seed `agentProviders` docs |
+| **8 Teach** | skill isolation + effort; document deferred provider policy |
 | Cross-cutting | rename `thinking`→`effort` in profile/CLI/store/adapters (can land with M3–4) |
-| Config | `agentProviders` on user-config + init probe (with M4 or M8) |
+| Config | Keep provider availability runtime-only until final onboarding. |
 
 ---
 
@@ -305,8 +305,8 @@ E2E: `npm test` + `npm run typecheck`; live fan-out 2 providers CLI; same MCP; c
 | `cli.ts` `spawnAgentWorker` / `agents __worker` | copy for `workflow __worker` |
 | `process-platform.terminateProcessTree` | hard cancel |
 | `db/client` WAL + busy_timeout 5000 | multi-process journal |
-| `server.ts` `registerAppTool` + `config.subagents` gate | tools only if subagents on |
-| `skills.ts` / `user-config.ts` | gate fix + seed |
+| `server.ts` `registerAppTool` + workflow capability gate | tools only if workflows are enabled |
+| `skills.ts` | independent package-managed skill gates |
 | `process-sessions` yield bounds | MCP status yield caps |
 
 ---
@@ -356,7 +356,7 @@ Do not open MCP before CLI smoke — debug path must work headless without a hos
 
 ## Resolved questions (see also [primitives-spec.md](./primitives-spec.md))
 
-1. **Default provider:** `opts.provider` → `meta.defaultProvider` → first of **onboarding-configured** `agentProviders.enabled` ∩ live available. Full config schema in primitives-spec §3.  
+1. **Default provider:** `opts.provider` → `meta.defaultProvider` → first live provider in stable product order. Final provider defaults and enablement are deferred to onboarding finalization.
 2. **writeMode:** **not in v1 API**; skill teaches prompt-based RO/write.  
 3. **Isolation:** **`isolation?: 'worktree'` is v1 must-have** on `agent()`; default shared; no auto-merge.  
 4. **Effort rename:** `thinking` → **`effort`** across profiles, CLI, store, adapters, `agent()` opts, cache keys.  

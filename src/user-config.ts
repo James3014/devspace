@@ -6,9 +6,8 @@ import {
   writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
-import type { AgentProvidersConfig } from "./workflow-types.js";
 
 export interface DevspaceUserConfig {
   host?: string;
@@ -20,8 +19,6 @@ export interface DevspaceUserConfig {
   worktreeRoot?: string;
   agentDir?: string;
   subagents?: boolean;
-  /** Ordered enable-list for local agent providers used by workflows/subagents. */
-  agentProviders?: AgentProvidersConfig;
 }
 
 export interface DevspaceAuthConfig {
@@ -98,25 +95,6 @@ export function writeDevspaceAuth(
 
 export function generateOwnerToken(): string {
   return randomBytes(32).toString("base64url");
-}
-
-const DEFAULT_SKILLS = ["subagent-delegation", "dynamic-workflows"] as const;
-
-export function ensureDevspaceDefaultSkills(env: NodeJS.ProcessEnv = process.env): string[] {
-  const seeded: string[] = [];
-  for (const name of DEFAULT_SKILLS) {
-    const targetPath = join(devspaceSkillsDir(env), name, "SKILL.md");
-    if (existsSync(targetPath)) continue;
-    const sourcePath = new URL(`../skills/${name}/SKILL.md`, import.meta.url);
-    try {
-      mkdirSync(dirname(targetPath), { recursive: true });
-      writeFileSync(targetPath, readFileSync(sourcePath, "utf8"), { mode: 0o644 });
-      seeded.push(targetPath);
-    } catch {
-      // skill may not exist in package yet; skip
-    }
-  }
-  return seeded;
 }
 
 export function resolveSubagentsFlag(

@@ -10,7 +10,7 @@ Pairs with [plan.md](./plan.md). Subagents remain CLI-only; this document is **w
 | Goal | Surface |
 |---|---|
 | DW for coding agents that lack Workflow (pi, codex, opencode, cursor, …) | **CLI + skill** — host agent authors script, runs `devspace workflow *` |
-| ChatGPT as orchestrator, not implementer | **MCP workflow tools** (togglable with subagents) — plan + `run_workflow` / status / cancel |
+| ChatGPT as orchestrator, not implementer | **MCP workflow tools** behind the workflow capability gate — plan + `run_workflow` / status / cancel |
 | Ship both in dev | One engine; two entrypoints; converge later on performance/UX |
 
 ```
@@ -24,7 +24,7 @@ ChatGPT      ── MCP tools  ──► engine ── agent() ──► adapter
 
 | # | Topic | Decision |
 |---|---|---|
-| 1 | Default provider | **Configured enabled provider list** (onboarding auto-detect CLIs → `config.json`). Runtime: `opts.provider` → `meta.defaultProvider` → **first entry of enabled+available list**. |
+| 1 | Default provider | Runtime: `opts.provider` → `meta.defaultProvider` → first currently available provider in stable product order. Final provider policy is deferred. |
 | 2 | Access / writeMode | **Not in v1 API.** No `writeMode`. Skill teaches **prompt-based** RO vs write. Isolation handles *where* writes land (see isolation). |
 | 3 | List runs | **No MCP list tool v1.** **CLI** `devspace workflow ls` yes. |
 | 4 | Size caps | Soft/hard bounds on journal + results (§8). |
@@ -60,136 +60,66 @@ ChatGPT      ── MCP tools  ──► engine ── agent() ──► adapter
 
 ---
 
-## 3. Config: agent providers (what to add)
+## 3. Provider availability now; policy after finalization
 
-### Today (`DevspaceUserConfig` / `.devspace/config.json`)
+### Current experimental contract
 
-Existing fields (unchanged conceptually):
+There is no user-facing `agentProviders` block and no
+`DEVSPACE_AGENT_PROVIDERS` environment variable. DevSpace probes implemented
+providers at runtime, keeps availability details in memory, and orders usable
+providers by `LOCAL_AGENT_PROVIDERS`:
 
-```ts
-// src/user-config.ts — today
-interface DevspaceUserConfig {
-  host?: string
-  port?: number
-  allowedRoots?: string[]
-  publicBaseUrl?: string | null
-  allowedHosts?: string[]
-  stateDir?: string
-  worktreeRoot?: string
-  agentDir?: string
-  subagents?: boolean          // master switch only
-}
+```text
+codex → claude → opencode → pi → cursor → copilot
 ```
 
-There is **no** persisted enable-list. Runtime exposes every implemented provider that is **currently on PATH** (`getLocalAgentProviderAvailabilitySnapshot`). Order is code order of `LOCAL_AGENT_PROVIDERS`, not user preference. No onboarding write-back.
+`devspace init` does not configure providers. `devspace doctor` may report live
+availability but remains read-only. Probe timestamps and unavailable-provider
+reasons are diagnostics, not durable user intent.
 
-### Add: `agentProviders` on user config
+Default resolution is:
+
+```text
+explicit agent() provider
+  → workflow meta.defaultProvider
+  → first currently available provider
+```
+
+An explicit provider or profile whose harness is unavailable fails with a clear
+typed error. Direct `devspace agents` calls and workflow `agent()` calls use the
+same target resolver.
+
+### Deferred final provider policy
+
+When Subagents and Dynamic Workflows are finalized and incorporated into
+onboarding, the intended durable shape is an ordered array of user choices:
 
 ```ts
-/** Known built-in ids — keep in sync with LocalAgentProvider */
-type AgentProviderId =
-  | "codex"
-  | "claude"
-  | "opencode"
-  | "pi"
-  | "cursor"
-  | "copilot"
-
-interface AgentProvidersConfig {
-  /**
-   * Ordered enable-list. Order = preference.
-   * index 0 = default fallback for agent() when provider omitted.
-   * Only ids in this list may be used by workflows/subagents (if present).
-   * Missing/empty → fall back to "all currently available" (compat) OR
-   * require init (prefer: treat missing as "auto = all available in code order").
-   */
-  enabled: AgentProviderId[]
-
-  /** ISO time of last successful probe (init/doctor). Optional. */
-  detectedAt?: string
-
-  /**
-   * Optional last probe snapshot for doctor UI (not required at runtime).
-   * Do not use as source of truth for enablement — `enabled` is.
-   */
-  lastProbe?: Array<{
-    id: AgentProviderId
-    available: boolean
-    detail?: string          // path or error
-  }>
+interface AgentProviderPolicy {
+  id: AgentProviderId
+  enabled: boolean
+  defaultModel?: string
+  defaultEffort?: string
 }
 
 interface DevspaceUserConfig {
-  // ...existing...
-  subagents?: boolean
-  agentProviders?: AgentProvidersConfig   // NEW
+  // ...existing fields...
+  agentProviders?: AgentProviderPolicy[]
 }
 ```
 
-### Example `~/.devspace/config.json`
+Array order can define fallback preference. Resolution will then be:
 
-```json
-{
-  "host": "127.0.0.1",
-  "port": 7676,
-  "allowedRoots": ["/home/you/work"],
-  "subagents": true,
-  "agentProviders": {
-    "enabled": ["codex", "claude", "opencode", "pi"],
-    "detectedAt": "2026-07-21T12:00:00.000Z",
-    "lastProbe": [
-      { "id": "codex", "available": true, "detail": "/usr/bin/codex" },
-      { "id": "claude", "available": true, "detail": "/home/you/.local/bin/claude" },
-      { "id": "opencode", "available": true },
-      { "id": "pi", "available": true },
-      { "id": "cursor", "available": false, "detail": "not found" },
-      { "id": "copilot", "available": false, "detail": "not found" }
-    ]
-  }
-}
+```text
+call model/effort override
+  → profile model/effort
+  → provider defaultModel/defaultEffort
+  → provider-native defaults
 ```
 
-### Semantics
-
-| Concern | Spec |
-|---|---|
-| **Master switch** | `subagents: true` still required for workflow tools + agent CLI + skills. |
-| **Enable-list** | `agentProviders.enabled` is the only user-facing allowlist. |
-| **Order** | First entry = default `agent()` provider after availability filter. |
-| **Live ∩ config** | `candidates = enabled.filter(id => currentlyAvailable(id))`. Stale enable of uninstalled CLI → skipped with doctor warning, not hard-fail until no candidates. |
-| **Unknown ids** | Reject on write/init; ignore-with-warn at read if config hand-edited. |
-| **Missing `agentProviders`** | Compat: `enabled` effective = all available in built-in order (today’s behavior). Init should still write the block. |
-| **Empty `enabled: []`** | Error at first `agent()` / `agents run`: “no providers enabled”. |
-| **Env override (optional)** | `DEVSPACE_AGENT_PROVIDERS=codex,claude` replaces `enabled` for process (ops/debug). |
-| **ServerConfig** | Load into `ServerConfig.agentProviders: { enabled: AgentProviderId[] }` resolved at boot. |
-
-### Onboarding (`devspace init` / `doctor`)
-
-1. Probe all six providers (reuse `local-agent-availability`).  
-2. Set `enabled` = available ids in **stable product order**:  
-   `codex → claude → opencode → pi → cursor → copilot` (only those available).  
-3. Write `detectedAt` + optional `lastProbe`.  
-4. `doctor` re-probes; offers to refresh `enabled` (add newly installed; optionally keep user-disabled by not auto-re-adding removed ids — v1: refresh = rewrite available set, document that).  
-
-### Default provider algorithm
-
-```
-resolveProvider(opts, meta, config):
-  enabled = config.agentProviders?.enabled
-            ?? ALL_IMPLEMENTED_IN_CODE_ORDER
-  candidates = enabled ∩ liveAvailable(PATH)
-  if opts.provider:
-    if opts.provider ∉ enabled → throw (disabled in config)
-    if opts.provider ∉ liveAvailable → throw (not installed)
-    return opts.provider
-  if meta.defaultProvider:
-    same checks against candidates
-    return meta.defaultProvider
-  if candidates[0] → return candidates[0]
-  throw NoProviderError
-```
-
-Skill: “Pass `provider` when you care; else first enabled+available provider.”
+Availability snapshots still must not be persisted inside this policy. The
+onboarding, config commands, documentation, and provider-management UI should
+land together rather than exposing another intermediate configuration shape.
 ---
 
 ## 4. Entry surfaces
@@ -215,7 +145,7 @@ devspace workflow __worker <runId>   # hidden
 
 Spawn: same pattern as `agents __worker` (detached, stdio ignore, unref). Inputs only from run row.
 
-### 4.2 MCP (togglable with `config.subagents`)
+### 4.2 MCP (togglable with the workflow capability)
 
 | Tool | Input | Output (conceptual) |
 |---|---|---|
@@ -230,7 +160,7 @@ Tool description embeds ~25-line API cheat-sheet (CC-style education in-band).
 
 ### 4.3 Skill
 
-`skills/dynamic-workflows/SKILL.md` (+ seed on init):
+`skills/dynamic-workflows/SKILL.md` (package-managed; not copied on init):
 
 - When to use CLI vs when host is ChatGPT (MCP).  
 - Full primitive reference.  
