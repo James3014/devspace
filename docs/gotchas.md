@@ -201,12 +201,12 @@ DevSpace looks in standard Agent Skills locations:
 
 It also checks compatibility and custom paths:
 
-- the package-managed `subagents` skill when `DEVSPACE_SUBAGENTS=1`
-- the package-managed `dynamic-workflows` skill when Dynamic Workflows are enabled
+- the package-managed `subagents` skill when the Subagents capability is enabled
+- the package-managed `dynamic-workflows` skill when the Dynamic Workflows capability is enabled
 - `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
 - additional paths from `DEVSPACE_SKILL_PATHS`
 
-When `DEVSPACE_SUBAGENTS=1`, DevSpace loads agent profiles from
+When the Subagents capability is enabled, DevSpace loads agent profiles from
 `~/.devspace/agents/*.md` and project `.devspace/agents/*.md`, then exposes a
 compact profile catalog through `open_workspace`. The bundled
 `subagents` skill keeps the model-facing workflow to

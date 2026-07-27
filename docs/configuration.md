@@ -93,7 +93,7 @@ sessions.
 | --- | --- |
 | `DEVSPACE_SKILLS` | Set to `0` to hide skills. Enabled by default. |
 | `DEVSPACE_SUBAGENTS` | Set to `1` to expose configured agent profiles as Subagents. Experimental and disabled by default. |
-| `DEVSPACE_WORKFLOWS` | Experimental Dynamic Workflows gate. When unset, it follows `DEVSPACE_SUBAGENTS` for compatibility. |
+| `DEVSPACE_WORKFLOWS` | Experimental Dynamic Workflows gate. When unset, it follows the effective Subagents setting, including persisted config and any environment override. |
 | `DEVSPACE_AGENT_DIR` | Defaults to `~/.codex`; its `skills` child is loaded for compatibility. |
 | `DEVSPACE_SKILL_PATHS` | Optional comma-separated additional skill directories. |
 
@@ -105,8 +105,8 @@ DevSpace discovers standard Agent Skills from:
 
 It also includes:
 
-- the package-managed `subagents` skill when `DEVSPACE_SUBAGENTS=1`
-- the package-managed `dynamic-workflows` skill when Dynamic Workflows are enabled
+- the package-managed `subagents` skill when the Subagents capability is enabled
+- the package-managed `dynamic-workflows` skill when the Dynamic Workflows capability is enabled
 - `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
 - additional paths from `DEVSPACE_SKILL_PATHS`
 

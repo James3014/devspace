@@ -87,8 +87,8 @@ DevSpace discovers standard Agent Skills from:
 
 It also includes:
 
-- the package-managed `subagents` skill when `DEVSPACE_SUBAGENTS=1`
-- the package-managed `dynamic-workflows` skill when Dynamic Workflows are enabled
+- the package-managed `subagents` skill when the Subagents capability is enabled
+- the package-managed `dynamic-workflows` skill when the Dynamic Workflows capability is enabled
 - `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
 - additional paths from `DEVSPACE_SKILL_PATHS`
 
@@ -120,9 +120,10 @@ workflow. The catalog comes from `open_workspace`; `devspace agents ls` lists
 existing subagent sessions for that workspace.
 
 Set `DEVSPACE_WORKFLOWS=1` to enable Dynamic Workflows independently. When the
-variable is omitted it follows `DEVSPACE_SUBAGENTS` for compatibility. Disabled
-features are omitted from the `open_workspace` schema and response rather than
-returned as empty capability arrays.
+variable is omitted, Dynamic Workflows follows the effective Subagents setting,
+including persisted config and any environment override. Disabled features are
+omitted from the `open_workspace` schema and response rather than returned as
+empty capability arrays.
 
 ## Tool Names
 
