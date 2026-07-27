@@ -612,6 +612,8 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
     if (typeof title !== "string" || !title.trim()) {
       throw new WorkflowEngineError("internal", "phase(title) requires a non-empty string");
     }
+    // In-process tests still use host ALS. Sandbox scripts track phase in the
+    // child and inject opts.phase / log payloads across IPC.
     phaseAls.enterWith(title);
     deps.journal.appendEvent({
       runId: deps.runId,
@@ -622,11 +624,27 @@ export function createWorkflowApi(deps: WorkflowApiDeps): WorkflowApi {
   };
 
   const log = (...args: unknown[]): void => {
-    const message = args.map(String).join(" ");
+    let message: string;
+    let phaseTitle = phaseAls.getStore();
+    if (
+      args.length === 1 &&
+      args[0] &&
+      typeof args[0] === "object" &&
+      !Array.isArray(args[0]) &&
+      "message" in (args[0] as object)
+    ) {
+      const payload = args[0] as { message?: unknown; phase?: unknown };
+      message = String(payload.message ?? "");
+      if (typeof payload.phase === "string" && payload.phase.trim()) {
+        phaseTitle = payload.phase;
+      }
+    } else {
+      message = args.map(String).join(" ");
+    }
     deps.journal.appendEvent({
       runId: deps.runId,
       type: "log",
-      phase: phaseAls.getStore(),
+      phase: phaseTitle,
       data: { message: truncate(message, WORKFLOW_LIMITS.eventDataJsonBytes) },
     });
   };
