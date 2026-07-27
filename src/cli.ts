@@ -13,25 +13,26 @@ import { satisfies } from "semver";
 import { loadConfig } from "./config.js";
 import { runLocalAgentProvider } from "./local-agent-adapters.js";
 import {
+  buildLocalAgentCatalog,
+  formatLocalAgentCatalog,
+} from "./local-agent-catalog.js";
+import {
   isLocalAgentProvider,
   loadLocalAgentProfiles,
-  LOCAL_AGENT_PROVIDERS,
-  type LocalAgentProfile,
 } from "./local-agent-profiles.js";
 import {
   assertLocalAgentProviderAvailable,
   formatLocalAgentProviderAvailabilitySummary,
+  getAvailableLocalAgentProviders,
   getLocalAgentProviderAvailabilitySnapshot,
 } from "./local-agent-availability.js";
 import {
   formatAvailableLocalAgentTargets,
   parseLocalAgentRunArgs,
-  resolveLocalAgentTarget,
 } from "./local-agent-targets.js";
+import { resolveLocalAgentExecution } from "./local-agent-resolution.js";
 import { createLocalAgentStore, type LocalAgentRecord } from "./local-agent-store.js";
-import type { LocalAgentRunResult } from "./local-agent-runtime.js";
 import {
-  ensureDevspaceDefaultSkills,
   generateOwnerToken,
   loadDevspaceFiles,
   resolveSubagentsFlag,
@@ -73,6 +74,11 @@ async function main(argv: string[]): Promise<void> {
       runConfigCommand(args);
       return;
     case "agents":
+      if (!loadConfig().subagents) {
+        throw new Error(
+          "Subagents are disabled. Set DEVSPACE_SUBAGENTS=1 to enable the experimental feature.",
+        );
+      }
       await runAgentsCommand(args);
       return;
     case "workflow":
@@ -175,18 +181,12 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       validate: validateRequiredPublicBaseUrl,
     }));
 
-    const subagents = resolveSubagentsFlag(files.config);
-    const agentProviders =
-      subagents === true
-        ? probeAndBuildAgentProviders(files.config.agentProviders)
-        : files.config.agentProviders;
     const config: DevspaceUserConfig = {
       host: files.config.host ?? "127.0.0.1",
       port,
       allowedRoots,
       publicBaseUrl,
-      subagents,
-      ...(agentProviders ? { agentProviders } : {}),
+      subagents: resolveSubagentsFlag(files.config),
     };
     const auth = {
       ownerToken: files.auth.ownerToken ?? generateOwnerToken(),
@@ -194,12 +194,9 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
 
     const configPath = writeDevspaceConfig(config);
     const authPath = writeDevspaceAuth(auth);
-    const seededSkillPaths = config.subagents ? ensureDevspaceDefaultSkills() : [];
-
     const lines = [
       `Config: ${configPath}`,
       `Auth: ${authPath}`,
-      ...seededSkillPaths.map((path) => `Default skill: ${path}`),
       `Local MCP URL: http://${config.host}:${config.port}/mcp`,
       ...(publicBaseUrl ? [`Public MCP URL: ${publicBaseUrl}/mcp`] : []),
     ];
@@ -290,68 +287,16 @@ async function runDoctor(): Promise<void> {
     console.log(`Allowed roots: ${config.allowedRoots.join(", ")}`);
     console.log(`Allowed hosts: ${config.allowedHosts.join(", ")}`);
     console.log(`Subagents: ${config.subagents ? "enabled" : "disabled"}`);
+    console.log(`Workflows: ${config.workflows ? "enabled" : "disabled"}`);
     if (config.subagents) {
       const snapshot = getLocalAgentProviderAvailabilitySnapshot();
       console.log(
         `Agent providers (live): ${formatLocalAgentProviderAvailabilitySummary(snapshot)}`,
       );
-      if (config.agentProviders) {
-        console.log(
-          `Agent providers (enabled): ${
-            config.agentProviders.enabled.length
-              ? config.agentProviders.enabled.join(", ")
-              : "(empty — no providers)"
-          }`,
-        );
-        if (config.agentProviders.detectedAt) {
-          console.log(`Agent providers last probe: ${config.agentProviders.detectedAt}`);
-        }
-      } else {
-        console.log("Agent providers (config): missing (compat = all available)");
-      }
-
-      // Refresh lastProbe write-back when subagents on and config exists
-      if (files.configExists) {
-        const refreshed = probeAndBuildAgentProviders(files.config.agentProviders);
-        writeDevspaceConfig({
-          ...files.config,
-          agentProviders: {
-            // keep user enable-list if set; only refresh probe metadata + available adds when empty
-            enabled:
-              files.config.agentProviders?.enabled ?? refreshed.enabled,
-            detectedAt: refreshed.detectedAt,
-            lastProbe: refreshed.lastProbe,
-          },
-        });
-        console.log(`Agent providers probe written to ${files.configPath}`);
-      }
     }
   } catch (error) {
     console.log(`Config status: ${error instanceof Error ? error.message : String(error)}`);
   }
-}
-
-/** Probe PATH and build AgentProvidersConfig (available ids in product order). */
-function probeAndBuildAgentProviders(
-  existing?: DevspaceUserConfig["agentProviders"],
-): NonNullable<DevspaceUserConfig["agentProviders"]> {
-  const snapshot = getLocalAgentProviderAvailabilitySnapshot();
-  const available = new Set(
-    snapshot.filter((row) => row.available).map((row) => row.name),
-  );
-  const enabled =
-    existing?.enabled && existing.enabled.length > 0
-      ? existing.enabled.filter((id) => LOCAL_AGENT_PROVIDERS.includes(id as never))
-      : LOCAL_AGENT_PROVIDERS.filter((id) => available.has(id));
-  return {
-    enabled,
-    detectedAt: new Date().toISOString(),
-    lastProbe: snapshot.map((row) => ({
-      id: row.name,
-      available: row.available,
-      detail: row.reason,
-    })),
-  };
 }
 
 function runConfigCommand(args: string[]): void {
@@ -413,6 +358,9 @@ async function runAgentsCommand(args: string[]): Promise<void> {
     case "list":
       await runAgentsList();
       return;
+    case "targets":
+      await runAgentsTargets(rest);
+      return;
     case "run":
       await runAgentsRun(rest);
       return;
@@ -448,6 +396,26 @@ async function runAgentsList(): Promise<void> {
   }
 }
 
+async function runAgentsTargets(args: string[]): Promise<void> {
+  const unknownArgs = args.filter((arg) => arg !== "--json");
+  if (unknownArgs.length > 0) {
+    throw new Error("Usage: devspace agents targets [--json]");
+  }
+
+  const config = loadConfig();
+  const workspaceRoot = resolveCurrentWorkspaceRoot();
+  const profiles = await loadLocalAgentProfiles(config, workspaceRoot);
+  const catalog = buildLocalAgentCatalog(
+    profiles,
+    getLocalAgentProviderAvailabilitySnapshot(),
+  );
+  console.log(
+    args.includes("--json")
+      ? JSON.stringify(catalog, null, 2)
+      : formatLocalAgentCatalog(catalog),
+  );
+}
+
 async function runAgentsRun(args: string[]): Promise<void> {
   const parsed = parseLocalAgentRunArgs(args);
 
@@ -480,13 +448,21 @@ async function runAgentsRun(args: string[]): Promise<void> {
   }
 
   const profiles = await loadLocalAgentProfiles(config, workspaceRoot);
-  const target = resolveLocalAgentTarget(parsed.target, profiles, parsed.model, parsed.effort);
-  if (!target) {
-    throw new Error(
-      `Unknown subagent profile, provider, or id: ${parsed.target}. Available ${formatAvailableLocalAgentTargets(profiles)}`,
-    );
+  const availableProviders = getAvailableLocalAgentProviders();
+  let target;
+  try {
+    target = resolveLocalAgentExecution({
+      target: parsed.target,
+      prompt: parsed.prompt,
+      profiles,
+      availableProviders,
+      model: parsed.model,
+      effort: parsed.effort,
+    });
+  } catch (error) {
+    const suffix = ` Available ${formatAvailableLocalAgentTargets(profiles, availableProviders)}`;
+    throw new Error(`${error instanceof Error ? error.message : String(error)}.${suffix}`);
   }
-  assertLocalAgentProviderAvailable(target.provider);
 
   const promptFile = writeAgentPromptFile(parsed.prompt);
   const record = store.create({
@@ -545,11 +521,23 @@ async function runAgentsWorker(args: string[]): Promise<void> {
   store.update(record.id, { status: "running", error: undefined });
   try {
     const profiles = await loadLocalAgentProfiles(config, record.workspaceRoot);
-    const profile = profiles.find((candidate) => candidate.name === record.profileName);
     const prompt = await readFile(promptFile, "utf8");
-    const result = profile
-      ? await runLocalAgentProfile(profile, record, prompt)
-      : await runRawLocalAgentProvider(record, prompt);
+    const target = resolveLocalAgentExecution({
+      target: record.profileName,
+      prompt,
+      profiles,
+      availableProviders: getAvailableLocalAgentProviders(),
+      model: record.model,
+      effort: record.effort,
+    });
+    const result = await runLocalAgentProvider(target.provider, {
+      prompt: target.prompt,
+      workspace: record.workspaceRoot,
+      providerSessionId: record.providerSessionId,
+      writeMode: "allowed",
+      model: target.model,
+      effort: target.effort,
+    });
     store.update(record.id, {
       providerSessionId: result.providerSessionId ?? undefined,
       status: "idle",
@@ -562,41 +550,6 @@ async function runAgentsWorker(args: string[]): Promise<void> {
       error: error instanceof Error ? error.message : String(error),
     });
   }
-}
-
-async function runLocalAgentProfile(
-  profile: LocalAgentProfile,
-  record: LocalAgentRecord,
-  prompt: string,
-): Promise<LocalAgentRunResult> {
-  const body = profile.body.trim();
-  const fullPrompt = body ? `${body}\n\nTask:\n${prompt}` : prompt;
-  return runLocalAgentProvider(profile.provider, {
-    prompt: fullPrompt,
-    workspace: record.workspaceRoot,
-    providerSessionId: record.providerSessionId,
-    writeMode: "allowed",
-    model: record.model ?? profile.model,
-    effort: record.effort ?? profile.effort,
-  });
-}
-
-async function runRawLocalAgentProvider(
-  record: LocalAgentRecord,
-  prompt: string,
-): Promise<LocalAgentRunResult> {
-  if (record.profileName !== record.provider || !isLocalAgentProvider(record.provider)) {
-    throw new Error(`Subagent profile not found: ${record.profileName}`);
-  }
-
-  return runLocalAgentProvider(record.provider, {
-    prompt,
-    workspace: record.workspaceRoot,
-    providerSessionId: record.providerSessionId,
-    writeMode: "allowed",
-    model: record.model,
-    effort: record.effort,
-  });
 }
 
 function spawnAgentWorker(agentId: string, promptFile: string): void {
@@ -654,6 +607,7 @@ function printAgentsHelp(): void {
       "",
       "Usage:",
       "  devspace agents ls",
+      "  devspace agents targets [--json]",
       "  devspace agents run <profile-or-provider-or-id> [--model <model>] [--effort <level>] <prompt>",
       "  devspace agents show <id>",
     ].join("\n"),

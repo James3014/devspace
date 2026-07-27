@@ -15,15 +15,14 @@ import { createWorkflowStore } from "./workflow-store.js";
 import {
   WORKFLOW_MCP_YIELD_MS,
   WORKFLOW_LIMITS,
-  type AgentProvidersConfig,
   type WorkflowEventRecord,
   type WorkflowRunRecord,
 } from "./workflow-types.js";
 import { resolveWorkspaceHead } from "./workflow-worktrees.js";
 import { spawnWorkflowWorkerFromCli } from "./workflow-cli.js";
+import { cancelWorkflowRun } from "./workflow-lifecycle.js";
 import { getLocalAgentProviderAvailabilitySnapshot } from "./local-agent-availability.js";
 import {
-  isLocalAgentProvider,
   LOCAL_AGENT_PROVIDERS,
   type LocalAgentProvider,
 } from "./local-agent-profiles.js";
@@ -46,7 +45,7 @@ const WORKFLOW_UI_WAIT_MAX_MS = 30_000;
 const WORKFLOW_API_CHEATSHEET = `
 Workflow scripts (JS only):
   export const meta = { name, description, phases?, defaultProvider?, concurrency? }
-  agent(prompt, { label?, phase?, schema?, model?, effort?, provider?, isolation?: 'worktree' })
+  agent(prompt, { label?, phase?, schema?, model?, effort?, profile? | provider?, isolation?: 'worktree' })
   parallel(thunks) → Array<T|null>   // barrier; throw → null
   pipeline(items, ...stages)        // no cross-item barrier
   phase(title); log(msg); args
@@ -60,7 +59,7 @@ export function registerWorkflowTools(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
 ): void {
-  if (!config.subagents) return;
+  if (!config.workflows) return;
 
   registerAppTool(
     server,
@@ -115,7 +114,9 @@ export function registerWorkflowTools(
         let runSource: "inline" | "named" | "resume" = "inline";
 
         if (resumeFromRunId) {
-          const prior = store.getRun(resumeFromRunId);
+          const priorResult = store.getRunResult(resumeFromRunId);
+          if (priorResult.isErr()) throw priorResult.error;
+          const prior = priorResult.value;
           if (!prior) throw new WorkflowNotFoundError(resumeFromRunId);
           priorRunId = prior.id;
           const overridePath = scriptPath;
@@ -140,7 +141,7 @@ export function registerWorkflowTools(
             if (resolvedResult.isErr()) throw resolvedResult.error;
             source = resolvedResult.value.source;
             scriptHash = resolvedResult.value.scriptHash;
-            nameHint = prior.name;
+            nameHint = overridePath ? resolvedResult.value.nameHint : prior.name;
           }
           runSource = "resume";
           if (args === undefined && prior.argsJson && prior.argsJson !== "null") {
@@ -241,7 +242,9 @@ export function registerWorkflowTools(
     async ({ runId, sinceSeq, yieldTimeMs }) => {
       const store = createWorkflowStore(config);
       try {
-        if (!store.getRun(runId)) throw new WorkflowNotFoundError(runId);
+        const runResult = store.getRunResult(runId);
+        if (runResult.isErr()) throw runResult.error;
+        if (!runResult.value) throw new WorkflowNotFoundError(runId);
         const page = await yieldEvents(store, runId, sinceSeq ?? 0, yieldTimeMs ?? 0);
         return toolResult(page, "workflow_status");
       } catch (error) {
@@ -268,17 +271,7 @@ export function registerWorkflowTools(
     async ({ runId }) => {
       const store = createWorkflowStore(config);
       try {
-        const requested = store.requestCancelResult(runId);
-        if (requested.isErr()) throw requested.error;
-        const run = requested.value;
-        if (run.pid && (run.status === "running" || run.status === "starting")) {
-          try {
-            process.kill(run.pid, "SIGTERM");
-          } catch {
-            // already gone
-          }
-        }
-        const latest = store.getRun(runId)!;
+        const latest = await cancelWorkflowRun(store, runId);
         return {
           content: [{ type: "text" as const, text: JSON.stringify({ runId, status: latest.status }) }],
           structuredContent: { runId, status: latest.status },
@@ -400,12 +393,14 @@ async function yieldEvents(
   run: WorkflowRunRecord;
   events: WorkflowEventRecord[];
   nextSeq: number;
+  hasMore: boolean;
   terminal: boolean;
   callSummary: ReturnType<typeof summarizeCalls>;
 }> {
   const deadline = Date.now() + Math.min(yieldMs, WORKFLOW_MCP_YIELD_MS);
   let cursor = sinceSeq;
   let events: WorkflowEventRecord[] = [];
+  let hasMore = false;
   let terminal = false;
   let run = store.getRun(runId)!;
 
@@ -413,9 +408,11 @@ async function yieldEvents(
     const page = store.drainEvents(runId, cursor, WORKFLOW_LIMITS.eventDrainDefault);
     events = events.concat(page.events);
     cursor = page.nextSeq;
+    hasMore = page.hasMore;
     terminal = page.terminal;
     run = page.run;
     if (terminal || Date.now() >= deadline) break;
+    if (hasMore) break;
     await sleep(250);
   }
 
@@ -423,6 +420,7 @@ async function yieldEvents(
     run,
     events,
     nextSeq: cursor,
+    hasMore,
     terminal,
     callSummary: summarizeCalls(store.listAgentCalls(runId)),
   };
@@ -432,6 +430,7 @@ function toolResult(page: {
   run: WorkflowRunRecord;
   events: WorkflowEventRecord[];
   nextSeq: number;
+  hasMore: boolean;
   terminal: boolean;
   callSummary: ReturnType<typeof summarizeCalls>;
 }, tool: "run_workflow" | "workflow_status") {
@@ -452,6 +451,7 @@ function toolResult(page: {
       dataJson: e.dataJson,
     })),
     nextSeq: page.nextSeq,
+    hasMore: page.hasMore,
     result: page.run.resultJson ? safeJson(page.run.resultJson) : undefined,
     error: page.run.error,
     errorKind: page.run.errorKind,
@@ -558,18 +558,11 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/** Resolve enabled ∩ live providers for workflows. */
-export function resolveWorkflowEnabledProviders(
-  agentProviders: AgentProvidersConfig | undefined,
-): LocalAgentProvider[] {
+/** Resolve live providers in stable product order for workflows. */
+export function resolveWorkflowEnabledProviders(): LocalAgentProvider[] {
   const snapshot = getLocalAgentProviderAvailabilitySnapshot();
   const live = new Set(
     snapshot.filter((row) => row.available).map((row) => row.name),
   );
-  if (!agentProviders) {
-    return LOCAL_AGENT_PROVIDERS.filter((id) => live.has(id));
-  }
-  return agentProviders.enabled.filter(
-    (id): id is LocalAgentProvider => isLocalAgentProvider(id) && live.has(id),
-  );
+  return LOCAL_AGENT_PROVIDERS.filter((id): id is LocalAgentProvider => live.has(id));
 }

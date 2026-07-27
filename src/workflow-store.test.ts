@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -56,12 +57,14 @@ try {
   const page1 = store.drainEvents(run.id, 0, 2);
   assert.equal(page1.events.length, 2);
   assert.equal(page1.nextSeq, 2);
+  assert.equal(page1.hasMore, true);
   assert.equal(page1.terminal, false);
 
   const page2 = store.drainEvents(run.id, 2, 10);
   assert.equal(page2.events.length, 1);
   assert.equal(page2.events[0]?.seq, 3);
   assert.equal(page2.nextSeq, 3);
+  assert.equal(page2.hasMore, false);
 
   store.beginAgentCall({
     runId: run.id,
@@ -72,6 +75,8 @@ try {
     provider: "codex",
     model: "gpt-5.4",
     effort: "high",
+    profileName: "reviewer",
+    profileFingerprint: "profile-hash",
     phase: "Review",
     isolation: "worktree",
     worktreePath: "/tmp/wt",
@@ -82,6 +87,7 @@ try {
     callIndex: 0,
     responseText: "done",
     structuredJson: JSON.stringify({ ok: true }),
+    returnValueJson: JSON.stringify({ ok: true, exact: true }),
     providerSessionId: "sess_1",
     dirty: true,
   });
@@ -91,7 +97,10 @@ try {
   assert.equal(call?.dirty, true);
   assert.equal(call?.providerSessionId, "sess_1");
   assert.equal(call?.effort, "high");
+  assert.equal(call?.profileName, "reviewer");
+  assert.equal(call?.profileFingerprint, "profile-hash");
   assert.equal(call?.prompt, "review");
+  assert.equal(call?.returnValueJson, JSON.stringify({ ok: true, exact: true }));
   assert.equal(call?.replayReason, "identity_changed:prompt");
 
   store.beginAgentCall({
@@ -120,7 +129,12 @@ try {
   assert.equal(terminal.errorKind, "cancelled");
   assert.equal(store.cancelRun(run.id).status, "cancelled");
 
+  const terminalPage1 = store.drainEvents(run.id, 0, 2);
+  assert.equal(terminalPage1.hasMore, true);
+  assert.equal(terminalPage1.terminal, false);
   const drainDone = store.drainEvents(run.id, 0, 100);
+  assert.equal(drainDone.events.at(-1)?.type, "run_cancelled");
+  assert.equal(drainDone.hasMore, false);
   assert.equal(drainDone.terminal, true);
 
   const run2 = store.createRun({
@@ -159,7 +173,7 @@ try {
     store.listRunsForWorkspace(join(root, "other-project"))[0]?.id,
     otherProjectRun.id,
   );
-  assert.deepEqual(store.listEvents(run.id, 2).map((event) => event.seq), [2, 3]);
+  assert.deepEqual(store.listEvents(run.id, 2).map((event) => event.seq), [3, 4]);
 
   // Reap: stale heartbeat + dead pid (force heartbeat via shared sqlite handle)
   const run3 = store.createRun({
@@ -169,7 +183,9 @@ try {
     scriptHash: "h3",
     workspaceRoot: join(root, "project"),
   });
-  store.claimRun(run3.id, 2_147_483_646);
+  const dead = spawnSync(process.execPath, ["-e", ""]);
+  assert.ok(dead.pid);
+  store.claimRun(run3.id, dead.pid);
   const db = openDatabase(root);
   try {
     db.sqlite
@@ -181,6 +197,26 @@ try {
   const reaped = store.reapStale(60_000);
   assert.ok(reaped.some((r) => r.id === run3.id && r.status === "failed"));
   assert.equal(store.getRun(run3.id)?.errorKind, "heartbeat");
+  assert.equal(store.listEvents(run3.id).at(-1)?.type, "run_failed");
+
+  const runStarting = store.createRun({
+    name: "never-started",
+    source: "inline",
+    scriptPath: join(root, "never.js"),
+    scriptHash: "never",
+    workspaceRoot: join(root, "project"),
+  });
+  const staleStartingDb = openDatabase(root);
+  try {
+    staleStartingDb.sqlite
+      .prepare(`update workflow_runs set updated_at = ? where id = ?`)
+      .run(new Date(Date.now() - 120_000).toISOString(), runStarting.id);
+  } finally {
+    staleStartingDb.close();
+  }
+  const reapedStarting = store.reapStale(60_000);
+  assert.ok(reapedStarting.some((entry) => entry.id === runStarting.id));
+  assert.equal(store.getRun(runStarting.id)?.status, "failed");
 
   const run4 = store.createRun({
     name: "seq",
