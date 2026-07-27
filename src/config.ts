@@ -26,6 +26,7 @@ export interface ServerConfig {
   devspaceSkillsDir: string;
   devspaceAgentsDir: string;
   subagents: boolean;
+  workflows: boolean;
   agentDir: string;
   logging: LoggingConfig;
 }
@@ -214,6 +215,16 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     new URL(publicBaseUrl).hostname,
     ...(files.config.allowedHosts ?? []),
   ];
+  const subagents =
+    env.DEVSPACE_SUBAGENTS === undefined
+      ? files.config.subagents === true
+      : parseBoolean(env.DEVSPACE_SUBAGENTS);
+  // Experimental compatibility: workflows follow the existing subagents gate
+  // unless explicitly overridden for runtime testing.
+  const workflows =
+    env.DEVSPACE_WORKFLOWS === undefined
+      ? subagents
+      : parseBoolean(env.DEVSPACE_WORKFLOWS);
 
   return {
     host,
@@ -230,10 +241,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     skillPaths: parsePathList(env.DEVSPACE_SKILL_PATHS),
     devspaceSkillsDir: devspaceSkillsDir(env),
     devspaceAgentsDir: devspaceAgentsDir(env),
-    subagents:
-      env.DEVSPACE_SUBAGENTS === undefined
-        ? files.config.subagents === true
-        : parseBoolean(env.DEVSPACE_SUBAGENTS),
+    subagents,
+    workflows,
     agentDir: resolve(expandHomePath(env.DEVSPACE_AGENT_DIR ?? files.config.agentDir ?? defaultAgentDir())),
     logging: parseLoggingConfig(env),
   };
