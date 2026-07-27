@@ -38,6 +38,38 @@ return { ok: true, name: meta.name }
 }
 
 {
+  assert.throws(
+    () =>
+      parseWorkflowScript(`
+export const meta = {
+  name: 'bracket-call',
+  description: ({})['constructor']['constructor']('return process')(),
+}
+`),
+    (error: unknown) =>
+      error instanceof WorkflowScriptError &&
+      error.kind === "meta" &&
+      /literal value/.test(error.message),
+  );
+}
+
+{
+  assert.throws(
+    () =>
+      parseWorkflowScript(`
+export const meta = {
+  name: 'computed-key',
+  ['description']: 'd',
+}
+`),
+    (error: unknown) =>
+      error instanceof WorkflowScriptError &&
+      error.kind === "meta" &&
+      /static property name/.test(error.message),
+  );
+}
+
+{
   const parsed = parseWorkflowScript(`
 export const meta = {
   name: 'literal-text',

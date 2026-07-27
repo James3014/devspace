@@ -106,8 +106,6 @@ function extractMetaLiteral(source: string): { metaLiteral: string; metaEndIndex
   const end = scanBalancedObject(source, objectStart);
   const metaLiteral = source.slice(objectStart, end + 1);
 
-  assertPureMetaLiteral(metaLiteral);
-
   return { metaLiteral, metaEndIndex: end + 1 };
 }
 
@@ -166,94 +164,6 @@ function scanBalancedObject(source: string, start: number): number {
   throw new WorkflowScriptError("meta", "Unclosed meta object literal");
 }
 
-function assertPureMetaLiteral(literal: string): void {
-  for (let i = 0; i < literal.length; i += 1) {
-    const ch = literal[i]!;
-    const next = literal[i + 1];
-    if (ch === '"' || ch === "'") {
-      i = skipQuoted(literal, i, ch);
-      continue;
-    }
-    if (ch === "/" && next === "/") {
-      i = skipLineComment(literal, i + 2);
-      continue;
-    }
-    if (ch === "/" && next === "*") {
-      i = skipBlockComment(literal, i + 2);
-      continue;
-    }
-    if (ch === "`") {
-      throw new WorkflowScriptError("meta", "meta must be a pure literal (no templates)");
-    }
-    if (literal.startsWith("...", i)) {
-      throw new WorkflowScriptError("meta", "meta must be a pure literal (no spreads)");
-    }
-    if (literal.startsWith("=>", i)) {
-      throw new WorkflowScriptError("meta", "meta must be a pure literal (no functions)");
-    }
-    if (!/[A-Za-z_$]/.test(ch)) continue;
-
-    const identifierStart = i;
-    i += 1;
-    while (i < literal.length && /[\w$]/.test(literal[i]!)) i += 1;
-    const identifier = literal.slice(identifierStart, i);
-    if (identifier === "function" || identifier === "class" || identifier === "new") {
-      throw new WorkflowScriptError("meta", "meta must be a pure literal (no executable values)");
-    }
-    i = skipTrivia(literal, i) - 1;
-    if (literal[i + 1] === "(") {
-      throw new WorkflowScriptError("meta", "meta must be a pure literal (no function calls)");
-    }
-  }
-}
-
-function skipQuoted(source: string, start: number, quote: '"' | "'"): number {
-  let escape = false;
-  for (let i = start + 1; i < source.length; i += 1) {
-    const ch = source[i]!;
-    if (escape) {
-      escape = false;
-      continue;
-    }
-    if (ch === "\\") {
-      escape = true;
-      continue;
-    }
-    if (ch === quote) return i;
-  }
-  return source.length - 1;
-}
-
-function skipLineComment(source: string, start: number): number {
-  const newline = source.indexOf("\n", start);
-  return newline < 0 ? source.length - 1 : newline;
-}
-
-function skipBlockComment(source: string, start: number): number {
-  const end = source.indexOf("*/", start);
-  return end < 0 ? source.length - 1 : end + 1;
-}
-
-function skipTrivia(source: string, start: number): number {
-  let i = start;
-  while (i < source.length) {
-    if (/\s/.test(source[i]!)) {
-      i += 1;
-      continue;
-    }
-    if (source.startsWith("//", i)) {
-      i = skipLineComment(source, i + 2) + 1;
-      continue;
-    }
-    if (source.startsWith("/*", i)) {
-      i = skipBlockComment(source, i + 2) + 1;
-      continue;
-    }
-    break;
-  }
-  return i;
-}
-
 function isOnlyPreamble(text: string): boolean {
   // strip block comments, line comments, whitespace
   const stripped = text
@@ -263,18 +173,205 @@ function isOnlyPreamble(text: string): boolean {
   return stripped.length === 0;
 }
 
-function evaluateMetaLiteral(literal: string, filename: string): unknown {
+function evaluateMetaLiteral(literal: string, _filename: string): unknown {
   try {
-    const value = vm.runInNewContext(`(${literal})`, Object.create(null), {
-      filename: `${filename}:meta`,
-      timeout: 1000,
-    });
-    // Rehydrate into the host realm — vm values keep context prototypes which
-    // break assert.deepEqual and other host identity checks.
-    return JSON.parse(JSON.stringify(value));
+    return new PureMetaLiteralParser(literal).parse();
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     throw new WorkflowScriptError("meta", `Invalid meta literal: ${message}`);
+  }
+}
+
+class PureMetaLiteralParser {
+  private index = 0;
+
+  constructor(private readonly source: string) {}
+
+  parse(): unknown {
+    this.skipTrivia();
+    const value = this.parseValue();
+    this.skipTrivia();
+    if (this.index !== this.source.length) {
+      this.fail(`unexpected token ${JSON.stringify(this.source[this.index])}`);
+    }
+    return value;
+  }
+
+  private parseValue(): unknown {
+    this.skipTrivia();
+    const ch = this.source[this.index];
+    if (ch === "{") return this.parseObject();
+    if (ch === "[") return this.parseArray();
+    if (ch === '"' || ch === "'") return this.parseString();
+    if (ch === "-" || (ch !== undefined && /\d/.test(ch))) return this.parseNumber();
+    if (ch !== undefined && /[A-Za-z_$]/.test(ch)) {
+      const identifier = this.parseIdentifier();
+      if (identifier === "true") return true;
+      if (identifier === "false") return false;
+      if (identifier === "null") return null;
+      this.fail(`identifier ${identifier} is not a literal value`);
+    }
+    this.fail(`expected a literal value, got ${JSON.stringify(ch)}`);
+  }
+
+  private parseObject(): Record<string, unknown> {
+    this.expect("{");
+    const value: Record<string, unknown> = Object.create(null) as Record<string, unknown>;
+    this.skipTrivia();
+    if (this.consume("}")) return value;
+
+    for (;;) {
+      this.skipTrivia();
+      const ch = this.source[this.index];
+      const key = ch === '"' || ch === "'" ? this.parseString() : this.parseIdentifier();
+      this.skipTrivia();
+      this.expect(":");
+      value[key] = this.parseValue();
+      this.skipTrivia();
+      if (this.consume("}")) return value;
+      this.expect(",");
+      this.skipTrivia();
+      if (this.consume("}")) return value;
+    }
+  }
+
+  private parseArray(): unknown[] {
+    this.expect("[");
+    const value: unknown[] = [];
+    this.skipTrivia();
+    if (this.consume("]")) return value;
+
+    for (;;) {
+      value.push(this.parseValue());
+      this.skipTrivia();
+      if (this.consume("]")) return value;
+      this.expect(",");
+      this.skipTrivia();
+      if (this.consume("]")) return value;
+    }
+  }
+
+  private parseString(): string {
+    const quote = this.source[this.index];
+    if (quote !== '"' && quote !== "'") this.fail("expected a quoted string");
+    this.index += 1;
+    let value = "";
+
+    while (this.index < this.source.length) {
+      const ch = this.source[this.index++]!;
+      if (ch === quote) return value;
+      if (ch === "\n" || ch === "\r") this.fail("unterminated string literal");
+      if (ch !== "\\") {
+        value += ch;
+        continue;
+      }
+
+      if (this.index >= this.source.length) this.fail("unterminated string escape");
+      const escaped = this.source[this.index++]!;
+      const simpleEscapes: Record<string, string> = {
+        "\\": "\\",
+        "\"": "\"",
+        "'": "'",
+        n: "\n",
+        r: "\r",
+        t: "\t",
+        b: "\b",
+        f: "\f",
+        v: "\v",
+        "0": "\0",
+      };
+      if (escaped in simpleEscapes) {
+        value += simpleEscapes[escaped];
+        continue;
+      }
+      if (escaped === "x") {
+        value += String.fromCodePoint(this.parseHexDigits(2));
+        continue;
+      }
+      if (escaped === "u") {
+        if (this.consume("{")) {
+          const end = this.source.indexOf("}", this.index);
+          if (end < 0) this.fail("unterminated Unicode escape");
+          const digits = this.source.slice(this.index, end);
+          if (!/^[0-9a-fA-F]{1,6}$/.test(digits)) this.fail("invalid Unicode escape");
+          this.index = end + 1;
+          const codePoint = Number.parseInt(digits, 16);
+          if (codePoint > 0x10ffff) this.fail("Unicode escape is out of range");
+          value += String.fromCodePoint(codePoint);
+        } else {
+          value += String.fromCodePoint(this.parseHexDigits(4));
+        }
+        continue;
+      }
+      if (escaped === "\n") continue;
+      if (escaped === "\r") {
+        this.consume("\n");
+        continue;
+      }
+      value += escaped;
+    }
+    this.fail("unterminated string literal");
+  }
+
+  private parseNumber(): number {
+    const match = this.source
+      .slice(this.index)
+      .match(/^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?/);
+    if (!match) this.fail("invalid number literal");
+    this.index += match[0].length;
+    const value = Number(match[0]);
+    if (!Number.isFinite(value)) this.fail("number literal must be finite");
+    return value;
+  }
+
+  private parseIdentifier(): string {
+    const match = this.source.slice(this.index).match(/^[A-Za-z_$][\w$]*/);
+    if (!match) this.fail("expected a static property name");
+    this.index += match[0].length;
+    return match[0];
+  }
+
+  private parseHexDigits(length: number): number {
+    const digits = this.source.slice(this.index, this.index + length);
+    if (digits.length !== length || !/^[0-9a-fA-F]+$/.test(digits)) {
+      this.fail("invalid hexadecimal escape");
+    }
+    this.index += length;
+    return Number.parseInt(digits, 16);
+  }
+
+  private skipTrivia(): void {
+    for (;;) {
+      while (this.index < this.source.length && /\s/.test(this.source[this.index]!)) {
+        this.index += 1;
+      }
+      if (this.source.startsWith("//", this.index)) {
+        const end = this.source.indexOf("\n", this.index + 2);
+        this.index = end < 0 ? this.source.length : end + 1;
+        continue;
+      }
+      if (this.source.startsWith("/*", this.index)) {
+        const end = this.source.indexOf("*/", this.index + 2);
+        if (end < 0) this.fail("unterminated block comment");
+        this.index = end + 2;
+        continue;
+      }
+      return;
+    }
+  }
+
+  private expect(token: string): void {
+    if (!this.consume(token)) this.fail(`expected ${JSON.stringify(token)}`);
+  }
+
+  private consume(token: string): boolean {
+    if (!this.source.startsWith(token, this.index)) return false;
+    this.index += token.length;
+    return true;
+  }
+
+  private fail(message: string): never {
+    throw new Error(`${message} at offset ${this.index}`);
   }
 }
 
