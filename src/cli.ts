@@ -13,23 +13,21 @@ import { satisfies } from "semver";
 import { loadConfig } from "./config.js";
 import { runLocalAgentProvider } from "./local-agent-adapters.js";
 import {
-  buildLocalAgentProfilePrompt,
   isLocalAgentProvider,
   loadLocalAgentProfiles,
-  type LocalAgentProfile,
 } from "./local-agent-profiles.js";
 import {
   assertLocalAgentProviderAvailable,
   formatLocalAgentProviderAvailabilitySummary,
+  getAvailableLocalAgentProviders,
   getLocalAgentProviderAvailabilitySnapshot,
 } from "./local-agent-availability.js";
 import {
   formatAvailableLocalAgentTargets,
   parseLocalAgentRunArgs,
-  resolveLocalAgentTarget,
 } from "./local-agent-targets.js";
+import { resolveLocalAgentExecution } from "./local-agent-resolution.js";
 import { createLocalAgentStore, type LocalAgentRecord } from "./local-agent-store.js";
-import type { LocalAgentRunResult } from "./local-agent-runtime.js";
 import {
   ensureDevspaceDefaultSkills,
   generateOwnerToken,
@@ -421,13 +419,21 @@ async function runAgentsRun(args: string[]): Promise<void> {
   }
 
   const profiles = await loadLocalAgentProfiles(config, workspaceRoot);
-  const target = resolveLocalAgentTarget(parsed.target, profiles, parsed.model, parsed.effort);
-  if (!target) {
-    throw new Error(
-      `Unknown subagent profile, provider, or id: ${parsed.target}. Available ${formatAvailableLocalAgentTargets(profiles)}`,
-    );
+  const availableProviders = getAvailableLocalAgentProviders();
+  let target;
+  try {
+    target = resolveLocalAgentExecution({
+      target: parsed.target,
+      prompt: parsed.prompt,
+      profiles,
+      availableProviders,
+      model: parsed.model,
+      effort: parsed.effort,
+    });
+  } catch (error) {
+    const suffix = ` Available ${formatAvailableLocalAgentTargets(profiles, availableProviders)}`;
+    throw new Error(`${error instanceof Error ? error.message : String(error)}.${suffix}`);
   }
-  assertLocalAgentProviderAvailable(target.provider);
 
   const promptFile = writeAgentPromptFile(parsed.prompt);
   const record = store.create({
@@ -486,11 +492,23 @@ async function runAgentsWorker(args: string[]): Promise<void> {
   store.update(record.id, { status: "running", error: undefined });
   try {
     const profiles = await loadLocalAgentProfiles(config, record.workspaceRoot);
-    const profile = profiles.find((candidate) => candidate.name === record.profileName);
     const prompt = await readFile(promptFile, "utf8");
-    const result = profile
-      ? await runLocalAgentProfile(profile, record, prompt)
-      : await runRawLocalAgentProvider(record, prompt);
+    const target = resolveLocalAgentExecution({
+      target: record.profileName,
+      prompt,
+      profiles,
+      availableProviders: getAvailableLocalAgentProviders(),
+      model: record.model,
+      effort: record.effort,
+    });
+    const result = await runLocalAgentProvider(target.provider, {
+      prompt: target.prompt,
+      workspace: record.workspaceRoot,
+      providerSessionId: record.providerSessionId,
+      writeMode: "allowed",
+      model: target.model,
+      effort: target.effort,
+    });
     store.update(record.id, {
       providerSessionId: result.providerSessionId ?? undefined,
       status: "idle",
@@ -503,40 +521,6 @@ async function runAgentsWorker(args: string[]): Promise<void> {
       error: error instanceof Error ? error.message : String(error),
     });
   }
-}
-
-async function runLocalAgentProfile(
-  profile: LocalAgentProfile,
-  record: LocalAgentRecord,
-  prompt: string,
-): Promise<LocalAgentRunResult> {
-  const fullPrompt = buildLocalAgentProfilePrompt(profile, prompt);
-  return runLocalAgentProvider(profile.provider, {
-    prompt: fullPrompt,
-    workspace: record.workspaceRoot,
-    providerSessionId: record.providerSessionId,
-    writeMode: "allowed",
-    model: record.model ?? profile.model,
-    effort: record.effort ?? profile.effort,
-  });
-}
-
-async function runRawLocalAgentProvider(
-  record: LocalAgentRecord,
-  prompt: string,
-): Promise<LocalAgentRunResult> {
-  if (record.profileName !== record.provider || !isLocalAgentProvider(record.provider)) {
-    throw new Error(`Subagent profile not found: ${record.profileName}`);
-  }
-
-  return runLocalAgentProvider(record.provider, {
-    prompt,
-    workspace: record.workspaceRoot,
-    providerSessionId: record.providerSessionId,
-    writeMode: "allowed",
-    model: record.model,
-    effort: record.effort,
-  });
 }
 
 function spawnAgentWorker(agentId: string, promptFile: string): void {
