@@ -70,6 +70,11 @@ async function main(argv: string[]): Promise<void> {
       runConfigCommand(args);
       return;
     case "agents":
+      if (!loadConfig().subagents) {
+        throw new Error(
+          "Subagents are disabled. Set DEVSPACE_SUBAGENTS=1 to enable the experimental feature.",
+        );
+      }
       await runAgentsCommand(args);
       return;
     case "workflow":

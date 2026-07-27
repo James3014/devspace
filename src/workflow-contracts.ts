@@ -121,7 +121,6 @@ export const workflowErrorKindSchema = z.enum([
   "syntax",
   "meta",
   "determinism",
-  "provider_disabled",
   "provider_unavailable",
   "no_provider",
   "provider",

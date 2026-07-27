@@ -40,7 +40,7 @@ export interface ExecuteWorkflowOptions {
   signal?: AbortSignal;
   workspaceRoot: string;
   baseSha?: string;
-  enabledProviders: LocalAgentProvider[];
+  availableProviders: LocalAgentProvider[];
   agentProfiles?: LocalAgentProfile[];
   runProvider: WorkflowRunProvider;
   createWorktree?: CreateAgentWorktree;
@@ -89,7 +89,7 @@ export async function executeWorkflow(
     signal,
     workspaceRoot: options.workspaceRoot,
     baseSha: options.baseSha,
-    enabledProviders: options.enabledProviders,
+    availableProviders: options.availableProviders,
     agentProfiles: options.agentProfiles,
     runProvider: options.runProvider,
     createWorktree: options.createWorktree,

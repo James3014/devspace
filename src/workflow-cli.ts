@@ -352,7 +352,7 @@ export async function runWorkflowWorker(
   try {
     const source = await readFile(claimed.scriptPath, "utf8");
     const parsed = parseWorkflowScript(source, { filename: claimed.scriptPath });
-    const enabledProviders = resolveEnabledProviders();
+    const availableProviders = resolveAvailableProviders();
     const agentProfiles = await loadLocalAgentProfiles(config, claimed.workspaceRoot);
     const concurrency = resolveWorkflowConcurrency(
       parsed.meta.concurrency,
@@ -385,7 +385,7 @@ export async function runWorkflowWorker(
       signal: abort.signal,
       workspaceRoot: claimed.workspaceRoot,
       baseSha: claimed.baseSha,
-      enabledProviders,
+      availableProviders,
       agentProfiles,
       createWorktree,
       replay,
@@ -600,7 +600,7 @@ function safeParseJson(text: string): unknown {
   }
 }
 
-function resolveEnabledProviders(): LocalAgentProvider[] {
+function resolveAvailableProviders(): LocalAgentProvider[] {
   const snapshot = getLocalAgentProviderAvailabilitySnapshot();
   const live = new Set(snapshot.filter((row) => row.available).map((row) => row.name));
   return LOCAL_AGENT_PROVIDERS.filter((id) => live.has(id));

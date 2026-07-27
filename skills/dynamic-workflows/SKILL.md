@@ -91,7 +91,7 @@ profile supplies instructions, provider, model, and effort defaults; per-call
 mutually exclusive.
 
 Without a profile, default provider resolution is `opts.provider` →
-`meta.defaultProvider` → first **enabled ∩ available** provider.
+`meta.defaultProvider` → first currently available provider.
 
 ### Resume
 

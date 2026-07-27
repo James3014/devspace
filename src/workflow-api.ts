@@ -158,9 +158,9 @@ export interface WorkflowApiDeps {
   signal: AbortSignal;
   workspaceRoot: string;
   baseSha?: string;
-  /** Already-filtered enabled ∩ live provider ids, preference order. */
-  enabledProviders: LocalAgentProvider[];
-  /** Loaded, enabled profiles exposed by open_workspace for this project. */
+  /** Currently available provider ids in stable preference order. */
+  availableProviders: LocalAgentProvider[];
+  /** Loaded profiles available to this project. */
   agentProfiles?: LocalAgentProfile[];
   runProvider: WorkflowRunProvider;
   createWorktree?: CreateAgentWorktree;
@@ -186,7 +186,6 @@ export class WorkflowEngineError extends Error {
   constructor(
     readonly kind:
       | "cancelled"
-      | "provider_disabled"
       | "provider_unavailable"
       | "no_provider"
       | "profile"
@@ -711,7 +710,7 @@ interface ResolvedAgentTarget {
 function resolveAgentTarget(
   prompt: string,
   opts: AgentOpts,
-  deps: Pick<WorkflowApiDeps, "agentProfiles" | "enabledProviders" | "meta">,
+  deps: Pick<WorkflowApiDeps, "agentProfiles" | "availableProviders" | "meta">,
 ): ResolvedAgentTarget {
   try {
     const resolved = resolveLocalAgentExecution({
@@ -722,7 +721,7 @@ function resolveAgentTarget(
       model: opts.model,
       effort: opts.effort,
       profiles: deps.agentProfiles ?? [],
-      availableProviders: deps.enabledProviders,
+      availableProviders: deps.availableProviders,
     });
     return {
       provider: resolved.provider,
