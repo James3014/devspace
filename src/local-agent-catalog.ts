@@ -16,6 +16,26 @@ export interface LocalAgentCatalog {
   profiles: ReturnType<typeof summarizeLocalAgentProfile>[];
 }
 
+export function formatLocalAgentCatalog(catalog: LocalAgentCatalog): string {
+  const profileLines = catalog.profiles.length > 0
+    ? [
+        "Profiles:",
+        ...catalog.profiles.map((profile) => {
+          const details = [
+            profile.provider,
+            profile.model ? `model=${profile.model}` : undefined,
+            profile.effort ? `effort=${profile.effort}` : undefined,
+          ].filter(Boolean).join(", ");
+          return `  ${profile.name} (${details}) — ${profile.description}`;
+        }),
+      ]
+    : ["Profiles: none"];
+  const providerLines = catalog.providers.length > 0
+    ? ["Providers:", ...catalog.providers.map((provider) => `  ${provider.name}`)]
+    : ["Providers: none"];
+  return [...profileLines, "", ...providerLines].join("\n");
+}
+
 /** Build the compact model-facing catalog from currently usable providers. */
 export function buildLocalAgentCatalog(
   profiles: LocalAgentProfile[],

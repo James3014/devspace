@@ -124,8 +124,9 @@ descriptions, providers, and optional models/effort levels so the host model can
 agent without reading provider-specific launch details. `devspace agents ls`
 lists existing subagent sessions for the current workspace, scoped by the
 workspace environment injected into shell commands. The `subagents`
-skill teaches the model to use only the minimal `devspace agents ls`,
-`devspace agents run`, and `devspace agents show` workflow.
+skill teaches the model to discover targets with `devspace agents targets`,
+then use the minimal `devspace agents run`, `devspace agents show`, and
+`devspace agents ls` workflow.
 
 Provider availability is detected at runtime. DevSpace does not persist probe
 timestamps, availability snapshots, or an experimental provider enable-list in

@@ -209,10 +209,9 @@ It also checks compatibility and custom paths:
 When the Subagents capability is enabled, DevSpace loads agent profiles from
 `~/.devspace/agents/*.md` and project `.devspace/agents/*.md`, then exposes a
 compact profile catalog through `open_workspace`. The bundled
-`subagents` skill keeps the model-facing workflow to
-`devspace agents ls`, `devspace agents run`, and `devspace agents show`.
-`devspace agents ls` lists existing subagent sessions, not profile
-definitions.
+`subagents` skill can also discover the same usable targets through
+`devspace agents targets` in CLI-only hosts. `devspace agents ls` lists existing
+subagent sessions, not profile definitions.
 
 Bundled skills remain package-managed and are not copied into
 `~/.devspace/skills`. A user-owned skill with the same name intentionally

@@ -7,9 +7,15 @@ Each subagent is headless, has its own context window, cannot see the parent con
 
 ## Choose a target
 
-Prefer a matching named profile from `open_workspace`. Use a raw provider when
-the user names that harness or no profile fits. Choose only profiles and
-providers returned by `open_workspace`.
+Prefer a configured profile that matches the task. Use a raw provider when the
+user explicitly names that harness or no profile fits. Use target information
+already available in the current host. When the choices are not known, run:
+
+```bash
+devspace agents targets
+```
+
+Do not guess profile names or provider identifiers.
 
 ## Write the brief
 
@@ -20,15 +26,17 @@ repeat project instructions that the child can discover from the repository.
 ## Run and continue
 
 ```bash
+devspace agents targets [--json]
 devspace agents run <profile-or-provider> "<brief>"
 devspace agents show <id>
 devspace agents run <id> "<follow-up>"
 devspace agents ls
 ```
 
-`run` with a profile or provider starts a child and returns its id. `show`
-reads its latest status and response. `run` with an existing id continues the
-same child session. `ls` lists sessions for the current project.
+`targets` lists currently usable profiles and providers. `run` with a profile
+or provider starts a child and returns its id. `show` reads its latest status
+and response. `run` with an existing id continues the same child session. `ls`
+lists sessions for the current project.
 
 Do not invoke provider CLIs directly; use `devspace agents` so DevSpace keeps
 session and provider handling consistent.

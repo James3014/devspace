@@ -13,6 +13,10 @@ import { satisfies } from "semver";
 import { loadConfig } from "./config.js";
 import { runLocalAgentProvider } from "./local-agent-adapters.js";
 import {
+  buildLocalAgentCatalog,
+  formatLocalAgentCatalog,
+} from "./local-agent-catalog.js";
+import {
   isLocalAgentProvider,
   loadLocalAgentProfiles,
 } from "./local-agent-profiles.js";
@@ -354,6 +358,9 @@ async function runAgentsCommand(args: string[]): Promise<void> {
     case "list":
       await runAgentsList();
       return;
+    case "targets":
+      await runAgentsTargets(rest);
+      return;
     case "run":
       await runAgentsRun(rest);
       return;
@@ -387,6 +394,26 @@ async function runAgentsList(): Promise<void> {
   for (const agent of agents) {
     console.log(formatAgentLine(agent));
   }
+}
+
+async function runAgentsTargets(args: string[]): Promise<void> {
+  const unknownArgs = args.filter((arg) => arg !== "--json");
+  if (unknownArgs.length > 0) {
+    throw new Error("Usage: devspace agents targets [--json]");
+  }
+
+  const config = loadConfig();
+  const workspaceRoot = resolveCurrentWorkspaceRoot();
+  const profiles = await loadLocalAgentProfiles(config, workspaceRoot);
+  const catalog = buildLocalAgentCatalog(
+    profiles,
+    getLocalAgentProviderAvailabilitySnapshot(),
+  );
+  console.log(
+    args.includes("--json")
+      ? JSON.stringify(catalog, null, 2)
+      : formatLocalAgentCatalog(catalog),
+  );
 }
 
 async function runAgentsRun(args: string[]): Promise<void> {
@@ -580,6 +607,7 @@ function printAgentsHelp(): void {
       "",
       "Usage:",
       "  devspace agents ls",
+      "  devspace agents targets [--json]",
       "  devspace agents run <profile-or-provider-or-id> [--model <model>] [--effort <level>] <prompt>",
       "  devspace agents show <id>",
     ].join("\n"),

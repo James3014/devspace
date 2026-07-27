@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import { buildLocalAgentCatalog } from "./local-agent-catalog.js";
+import {
+  buildLocalAgentCatalog,
+  formatLocalAgentCatalog,
+} from "./local-agent-catalog.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
 
 const profiles: LocalAgentProfile[] = [
@@ -29,5 +32,7 @@ const catalog = buildLocalAgentCatalog(profiles, [
 assert.deepEqual(catalog.providers.map((provider) => provider.name), ["codex"]);
 assert.deepEqual(catalog.profiles.map((profile) => profile.name), ["reviewer"]);
 assert.equal(catalog.providers[0]?.effort.semantics, "reasoning_effort");
+assert.match(formatLocalAgentCatalog(catalog), /reviewer \(codex\) — Review changes\./);
+assert.match(formatLocalAgentCatalog(catalog), /Providers:\n  codex/);
 
 console.log("local-agent-catalog.test.ts: ok");

@@ -114,10 +114,9 @@ Skill paths may be outside the workspace. DevSpace only permits reading:
 
 Set `DEVSPACE_SKILLS=0` to hide skills from workspace output. Set
 `DEVSPACE_SUBAGENTS=1` to expose the experimental subagent catalog and
-`subagents` skill. That skill teaches the minimal
-`devspace agents ls`, `devspace agents run`, and `devspace agents show`
-workflow. The catalog comes from `open_workspace`; `devspace agents ls` lists
-existing subagent sessions for that workspace.
+`subagents` skill. That skill can use target information already supplied by the
+host or discover it with `devspace agents targets`. `devspace agents ls` lists
+existing subagent sessions for the current workspace.
 
 Set `DEVSPACE_WORKFLOWS=1` to enable Dynamic Workflows independently. When the
 variable is omitted, Dynamic Workflows follows the effective Subagents setting,
