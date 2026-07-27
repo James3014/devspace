@@ -24,6 +24,9 @@ import {
   type WorkflowMeta,
 } from "./workflow-types.js";
 import { agentOptsSchema } from "./workflow-contracts.js";
+import { WorkflowEngineError } from "./workflow-errors.js";
+
+export { WorkflowEngineError } from "./workflow-errors.js";
 
 // ---------------------------------------------------------------------------
 // Host deps (injected by engine; fakes OK in tests)
@@ -180,25 +183,6 @@ export interface WorkflowApiDeps {
 export interface WorkflowApi extends WorkflowSandboxApi {
   getCallCount(): number;
   getNestDepth(): number;
-}
-
-export class WorkflowEngineError extends Error {
-  constructor(
-    readonly kind:
-      | "cancelled"
-      | "provider_unavailable"
-      | "no_provider"
-      | "profile"
-      | "nest_depth"
-      | "worktree"
-      | "schema"
-      | "path"
-      | "internal",
-    message: string,
-  ) {
-    super(message);
-    this.name = "WorkflowEngineError";
-  }
 }
 
 // ---------------------------------------------------------------------------
