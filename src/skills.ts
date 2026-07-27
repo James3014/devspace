@@ -21,7 +21,8 @@ export interface SkillReadResolution {
   isSkillFile: boolean;
 }
 
-const SUBAGENT_DELEGATION_NAME = "subagent-delegation";
+const SUBAGENTS_NAME = "subagents";
+const LEGACY_SUBAGENT_DELEGATION_NAME = "subagent-delegation";
 const DYNAMIC_WORKFLOWS_NAME = "dynamic-workflows";
 
 function bundledSkillsDir(): string {
@@ -72,7 +73,11 @@ export function loadWorkspaceSkills(config: ServerConfig, cwd: string): LoadedSk
 
   if (config.subagents) return result;
 
-  const gated = new Set<string>([SUBAGENT_DELEGATION_NAME, DYNAMIC_WORKFLOWS_NAME]);
+  const gated = new Set<string>([
+    SUBAGENTS_NAME,
+    LEGACY_SUBAGENT_DELEGATION_NAME,
+    DYNAMIC_WORKFLOWS_NAME,
+  ]);
   return {
     skills: result.skills.filter((skill) => !gated.has(skill.name)),
     diagnostics: result.diagnostics.filter((diagnostic) => {

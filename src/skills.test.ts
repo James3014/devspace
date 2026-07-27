@@ -204,7 +204,7 @@ try {
   });
   assert.equal(
     loadWorkspaceSkills(experimentalConfig, projectRoot).skills.some(
-      (skill) => skill.name === "subagent-delegation",
+      (skill) => skill.name === "subagents",
     ),
     true,
   );

@@ -97,7 +97,7 @@ export function generateOwnerToken(): string {
   return randomBytes(32).toString("base64url");
 }
 
-const DEFAULT_SKILLS = ["subagent-delegation", "dynamic-workflows"] as const;
+const DEFAULT_SKILLS = ["subagents", "dynamic-workflows"] as const;
 
 export function ensureDevspaceDefaultSkills(env: NodeJS.ProcessEnv = process.env): string[] {
   const seeded: string[] = [];
