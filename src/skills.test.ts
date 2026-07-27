@@ -199,16 +199,15 @@ try {
     DEVSPACE_ALLOWED_ROOTS: projectRoot,
     DEVSPACE_AGENT_DIR: agentDir,
     DEVSPACE_SUBAGENTS: "1",
+    DEVSPACE_WORKFLOWS: "0",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
-  assert.equal(
-    loadWorkspaceSkills(experimentalConfig, projectRoot).skills.some(
-      (skill) => skill.name === "subagents",
-    ),
-    true,
-  );
-  const subagentsSkill = loadWorkspaceSkills(experimentalConfig, projectRoot).skills.find(
+  const subagentSkills = loadWorkspaceSkills(experimentalConfig, projectRoot).skills;
+  assert.equal(subagentSkills.some((skill) => skill.name === "subagents"), true);
+  assert.equal(subagentSkills.some((skill) => skill.name === "dynamic-workflows"), false);
+  assert.equal(subagentSkills.some((skill) => skill.name === "subagent-delegation"), false);
+  const subagentsSkill = subagentSkills.find(
     (skill) => skill.name === "subagents",
   );
   assert.ok(subagentsSkill);
@@ -219,6 +218,19 @@ try {
       ?.absolutePath,
     codexReference,
   );
+
+  const workflowsOnlyConfig = loadConfig({
+    DEVSPACE_ALLOWED_ROOTS: projectRoot,
+    DEVSPACE_AGENT_DIR: agentDir,
+    DEVSPACE_SUBAGENTS: "0",
+    DEVSPACE_WORKFLOWS: "1",
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  const workflowSkills = loadWorkspaceSkills(workflowsOnlyConfig, projectRoot).skills;
+  assert.equal(workflowSkills.some((skill) => skill.name === "subagents"), false);
+  assert.equal(workflowSkills.some((skill) => skill.name === "dynamic-workflows"), true);
+  assert.equal(workflowSkills.some((skill) => skill.name === "subagent-delegation"), false);
 
   const duplicateConfig = loadConfig({
     DEVSPACE_ALLOWED_ROOTS: projectRoot,

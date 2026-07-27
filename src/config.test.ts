@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
-import { ensureDevspaceDefaultSkills, resolveSubagentsFlag } from "./user-config.js";
+import { resolveSubagentsFlag } from "./user-config.js";
 
 const emptyConfigDir = mkdtempSync(join(tmpdir(), "devspace-empty-config-test-"));
 const baseEnv = {
@@ -49,18 +49,6 @@ assert.equal(resolveSubagentsFlag({}, {}), undefined);
 assert.equal(resolveSubagentsFlag({ subagents: true }, {}), true);
 assert.equal(resolveSubagentsFlag({ subagents: true }, { DEVSPACE_SUBAGENTS: "0" }), false);
 assert.equal(resolveSubagentsFlag({}, { DEVSPACE_SUBAGENTS: "1" }), true);
-
-const seededConfigDir = mkdtempSync(join(tmpdir(), "devspace-seeded-skills-test-"));
-const seededSkillPaths = ensureDevspaceDefaultSkills({ DEVSPACE_CONFIG_DIR: seededConfigDir });
-assert.deepEqual(seededSkillPaths, [
-  join(seededConfigDir, "skills", "subagents", "SKILL.md"),
-  join(seededConfigDir, "skills", "dynamic-workflows", "SKILL.md"),
-]);
-assert.equal(existsSync(seededSkillPaths[0]), true);
-assert.equal(existsSync(seededSkillPaths[1]), true);
-assert.match(readFileSync(seededSkillPaths[0], "utf8"), /name: subagents/);
-assert.match(readFileSync(seededSkillPaths[1], "utf8"), /name: dynamic-workflows/);
-assert.deepEqual(ensureDevspaceDefaultSkills({ DEVSPACE_CONFIG_DIR: seededConfigDir }), []);
 
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "invalid" }),

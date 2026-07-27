@@ -29,7 +29,6 @@ import {
 import { resolveLocalAgentExecution } from "./local-agent-resolution.js";
 import { createLocalAgentStore, type LocalAgentRecord } from "./local-agent-store.js";
 import {
-  ensureDevspaceDefaultSkills,
   generateOwnerToken,
   loadDevspaceFiles,
   resolveSubagentsFlag,
@@ -186,12 +185,9 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
 
     const configPath = writeDevspaceConfig(config);
     const authPath = writeDevspaceAuth(auth);
-    const seededSkillPaths = config.subagents ? ensureDevspaceDefaultSkills() : [];
-
     const lines = [
       `Config: ${configPath}`,
       `Auth: ${authPath}`,
-      ...seededSkillPaths.map((path) => `Default skill: ${path}`),
       `Local MCP URL: http://${config.host}:${config.port}/mcp`,
       ...(publicBaseUrl ? [`Public MCP URL: ${publicBaseUrl}/mcp`] : []),
     ];
