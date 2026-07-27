@@ -50,13 +50,21 @@ export interface BeginAgentCallInput {
   runId: string;
   callIndex: number;
   cacheKey: string;
+  prompt: string;
+  schemaJson?: string;
   provider: string;
   model?: string;
   effort?: string;
+  profileName?: string;
+  profileFingerprint?: string;
   label?: string;
   phase?: string;
   isolation?: AgentIsolationMode;
   worktreePath?: string;
+  replayMatch?: "same_index" | "compatible_key";
+  replayedFromRunId?: string;
+  replayedFromCallIndex?: number;
+  replayReason?: string;
 }
 
 export interface CompleteAgentCallInput {
@@ -64,6 +72,7 @@ export interface CompleteAgentCallInput {
   callIndex: number;
   responseText?: string;
   structuredJson?: string;
+  returnValueJson?: string;
   providerSessionId?: string;
   dirty?: boolean;
   worktreePath?: string;
@@ -74,12 +83,14 @@ export interface FailAgentCallInput {
   runId: string;
   callIndex: number;
   error: string;
+  errorKind?: WorkflowErrorKind;
   worktreePath?: string;
   dirty?: boolean;
 }
 
 export interface CompleteRunInput {
   resultJson?: string;
+  callCount?: number;
 }
 
 export interface FailRunInput {
@@ -90,6 +101,7 @@ export interface FailRunInput {
 export interface DrainEventsResult {
   events: WorkflowEventRecord[];
   nextSeq: number;
+  hasMore: boolean;
   terminal: boolean;
   run: WorkflowRunRecord;
 }
@@ -132,9 +144,13 @@ interface WorkflowAgentCallRow {
   run_id: string;
   call_index: number;
   cache_key: string;
+  prompt: string;
+  schema_json: string | null;
   provider: string;
   model: string | null;
   effort: string | null;
+  profile_name: string | null;
+  profile_fingerprint: string | null;
   label: string | null;
   phase: string | null;
   status: string;
@@ -142,7 +158,13 @@ interface WorkflowAgentCallRow {
   provider_session_id: string | null;
   response_text: string | null;
   structured_json: string | null;
+  return_value_json: string | null;
   error: string | null;
+  error_kind: string | null;
+  replay_match: string | null;
+  replayed_from_run_id: string | null;
+  replayed_from_call_index: number | null;
+  replay_reason: string | null;
   isolation: string;
   worktree_path: string | null;
   dirty: string | null;
@@ -231,6 +253,40 @@ export class WorkflowStore {
     const rows = this.database.sqlite
       .prepare("select * from workflow_runs order by updated_at desc limit ?")
       .all(Math.max(1, Math.min(limit, 500))) as WorkflowRunRow[];
+    return rows.map(rowToRun);
+  }
+
+  listRunsForWorkspace(
+    workspaceRoot: string,
+    options: {
+      statuses?: WorkflowRunStatus[];
+      limit?: number;
+    } = {},
+  ): WorkflowRunRecord[] {
+    const root = resolve(workspaceRoot);
+    const limit = Math.max(1, Math.min(options.limit ?? 50, 500));
+    const statuses = options.statuses?.filter((status, index, values) =>
+      values.indexOf(status) === index,
+    );
+
+    if (!statuses?.length) {
+      const rows = this.database.sqlite
+        .prepare(
+          "select * from workflow_runs where workspace_root = ? order by updated_at desc limit ?",
+        )
+        .all(root, limit) as WorkflowRunRow[];
+      return rows.map(rowToRun);
+    }
+
+    const placeholders = statuses.map(() => "?").join(", ");
+    const rows = this.database.sqlite
+      .prepare(
+        `select * from workflow_runs
+         where workspace_root = ? and status in (${placeholders})
+         order by updated_at desc
+         limit ?`,
+      )
+      .all(root, ...statuses, limit) as WorkflowRunRow[];
     return rows.map(rowToRun);
   }
 
@@ -361,11 +417,14 @@ export class WorkflowStore {
     const updated = Result.try({
       try: () => {
         const now = isoNow();
-        this.database.sqlite
+        const update = this.database.sqlite
           .prepare(
-            `update workflow_runs set cancel_requested = 'true', updated_at = ? where id = ?`,
+            `update workflow_runs
+             set cancel_requested = 'true', updated_at = ?
+             where id = ? and status in ('starting', 'running')`,
           )
           .run(now, id);
+        if (update.changes === 0) return this.getRun(id);
         return this.getRun(id);
       },
       catch: (cause) => new WorkflowStoreError("request_cancel", cause),
@@ -391,18 +450,31 @@ export class WorkflowStore {
     return this.transitionRunResult(id, "complete", () => {
       if (input.resultJson !== undefined) assertResultSize(input.resultJson);
       const now = isoNow();
-      return this.database.sqlite
-        .prepare(
-          `update workflow_runs set
-            status = 'completed',
-            result_json = ?,
-            completed_at = ?,
-            updated_at = ?,
-            error = null,
-            error_kind = null
-           where id = ? and status in ('starting', 'running')`,
-        )
-        .run(input.resultJson ?? null, now, now, id).changes;
+      const transaction = this.database.sqlite.transaction(() => {
+        const changes = this.database.sqlite
+          .prepare(
+            `update workflow_runs set
+              status = 'completed',
+              result_json = ?,
+              completed_at = ?,
+              updated_at = ?,
+              error = null,
+              error_kind = null
+             where id = ? and status in ('starting', 'running')`,
+          )
+          .run(input.resultJson ?? null, now, now, id).changes;
+        if (changes === 0) return 0;
+        this.insertEventRow(
+          {
+            runId: id,
+            type: "run_completed",
+            data: { callCount: input.callCount ?? 0 },
+          },
+          now,
+        );
+        return changes;
+      });
+      return transaction.immediate();
     });
   }
 
@@ -416,17 +488,31 @@ export class WorkflowStore {
   ): BetterResult<WorkflowRunRecord, WorkflowRunTransitionError> {
     return this.transitionRunResult(id, "fail", () => {
       const now = isoNow();
-      return this.database.sqlite
-        .prepare(
-          `update workflow_runs set
-            status = 'failed',
-            error = ?,
-            error_kind = ?,
-            completed_at = ?,
-            updated_at = ?
-           where id = ? and status in ('starting', 'running')`,
-        )
-        .run(input.error, input.errorKind ?? "internal", now, now, id).changes;
+      const errorKind = input.errorKind ?? "internal";
+      const transaction = this.database.sqlite.transaction(() => {
+        const changes = this.database.sqlite
+          .prepare(
+            `update workflow_runs set
+              status = 'failed',
+              error = ?,
+              error_kind = ?,
+              completed_at = ?,
+              updated_at = ?
+             where id = ? and status in ('starting', 'running')`,
+          )
+          .run(input.error, errorKind, now, now, id).changes;
+        if (changes === 0) return 0;
+        this.insertEventRow(
+          {
+            runId: id,
+            type: "run_failed",
+            data: { error: input.error, errorKind },
+          },
+          now,
+        );
+        return changes;
+      });
+      return transaction.immediate();
     });
   }
 
@@ -440,18 +526,31 @@ export class WorkflowStore {
   ): BetterResult<WorkflowRunRecord, WorkflowRunTransitionError> {
     return this.transitionRunResult(id, "cancel", () => {
       const now = isoNow();
-      return this.database.sqlite
-        .prepare(
-          `update workflow_runs set
-            status = 'cancelled',
-            error = ?,
-            error_kind = 'cancelled',
-            cancel_requested = 'true',
-            completed_at = ?,
-            updated_at = ?
-           where id = ? and status in ('starting', 'running')`,
-        )
-        .run(error, now, now, id).changes;
+      const transaction = this.database.sqlite.transaction(() => {
+        const changes = this.database.sqlite
+          .prepare(
+            `update workflow_runs set
+              status = 'cancelled',
+              error = ?,
+              error_kind = 'cancelled',
+              cancel_requested = 'true',
+              completed_at = ?,
+              updated_at = ?
+             where id = ? and status in ('starting', 'running')`,
+          )
+          .run(error, now, now, id).changes;
+        if (changes === 0) return 0;
+        this.insertEventRow(
+          {
+            runId: id,
+            type: "run_cancelled",
+            data: { reason: error },
+          },
+          now,
+        );
+        return changes;
+      });
+      return transaction.immediate();
     });
   }
 
@@ -492,47 +591,11 @@ export class WorkflowStore {
   }
 
   appendEvent(input: AppendWorkflowEventInput): WorkflowEventRecord {
-    const payload = parseWorkflowEventPayload(input.type, input.data);
-    const dataJson = truncateJson(payload, WORKFLOW_LIMITS.eventDataJsonBytes);
     const createdAt = isoNow();
-
-    const insert = this.database.sqlite.transaction(() => {
-      const next = this.database.sqlite
-        .prepare(
-          `select coalesce(max(seq), 0) + 1 as next_seq from workflow_events where run_id = ?`,
-        )
-        .get(input.runId) as { next_seq: number };
-      const seq = next.next_seq;
-      this.database.sqlite
-        .prepare(
-          `insert into workflow_events (run_id, seq, type, phase, label, data_json, created_at)
-           values (?, ?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          input.runId,
-          seq,
-          input.type,
-          input.phase ?? null,
-          input.label ?? null,
-          dataJson,
-          createdAt,
-        );
-      this.database.sqlite
-        .prepare(`update workflow_runs set updated_at = ? where id = ?`)
-        .run(createdAt, input.runId);
-      return seq;
-    });
-
-    const seq = insert();
-    return {
-      runId: input.runId,
-      seq,
-      type: input.type,
-      phase: input.phase,
-      label: input.label,
-      dataJson,
-      createdAt,
-    };
+    const transaction = this.database.sqlite.transaction(() =>
+      this.insertEventRow(input, createdAt),
+    );
+    return transaction.immediate();
   }
 
   drainEvents(runId: string, sinceSeq = 0, limit: number = WORKFLOW_LIMITS.eventDrainDefault): DrainEventsResult {
@@ -545,15 +608,32 @@ export class WorkflowStore {
          order by seq asc
          limit ?`,
       )
-      .all(runId, sinceSeq, capped) as WorkflowEventRow[];
-    const events = rows.map(rowToEvent);
+      .all(runId, sinceSeq, capped + 1) as WorkflowEventRow[];
+    const hasMore = rows.length > capped;
+    const events = rows.slice(0, capped).map(rowToEvent);
     const nextSeq = events.length > 0 ? events[events.length - 1]!.seq : sinceSeq;
     return {
       events,
       nextSeq,
-      terminal: TERMINAL_STATUSES.has(run.status),
+      hasMore,
+      terminal: TERMINAL_STATUSES.has(run.status) && !hasMore,
       run,
     };
+  }
+
+  listEvents(runId: string, limit = 100): WorkflowEventRecord[] {
+    const capped = Math.max(1, Math.min(limit, WORKFLOW_LIMITS.eventDrainMax));
+    const rows = this.database.sqlite
+      .prepare(
+        `select * from (
+           select * from workflow_events
+           where run_id = ?
+           order by seq desc
+           limit ?
+         ) order by seq asc`,
+      )
+      .all(runId, capped) as WorkflowEventRow[];
+    return rows.map(rowToEvent);
   }
 
   beginAgentCall(input: BeginAgentCallInput): WorkflowAgentCallRecord {
@@ -562,21 +642,32 @@ export class WorkflowStore {
     this.database.sqlite
       .prepare(
         `insert into workflow_agent_calls (
-          run_id, call_index, cache_key, provider, model, effort, label, phase,
-          status, from_cache, isolation, worktree_path, created_at, started_at, updated_at
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, 'running', 'false', ?, ?, ?, ?, ?)`,
+          run_id, call_index, cache_key, prompt, schema_json, provider, model, effort,
+          profile_name, profile_fingerprint, label, phase,
+          status, from_cache, isolation, worktree_path, replay_match,
+          replayed_from_run_id, replayed_from_call_index, replay_reason,
+          created_at, started_at, updated_at
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 'false', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.runId,
         input.callIndex,
         input.cacheKey,
+        input.prompt,
+        input.schemaJson ?? null,
         input.provider,
         input.model ?? null,
         input.effort ?? null,
+        input.profileName ?? null,
+        input.profileFingerprint ?? null,
         input.label ?? null,
         input.phase ?? null,
         isolation,
         input.worktreePath ?? null,
+        input.replayMatch ?? null,
+        input.replayedFromRunId ?? null,
+        input.replayedFromCallIndex ?? null,
+        input.replayReason ?? null,
         now,
         now,
         now,
@@ -591,6 +682,13 @@ export class WorkflowStore {
     if (input.structuredJson !== undefined) {
       assertTextSize(input.structuredJson, WORKFLOW_LIMITS.structuredJsonBytes, "structuredJson");
     }
+    if (input.returnValueJson !== undefined) {
+      assertTextSize(
+        input.returnValueJson,
+        WORKFLOW_LIMITS.replayValueJsonBytes,
+        "returnValueJson",
+      );
+    }
     const now = isoNow();
     const status: WorkflowAgentCallStatus = input.fromCache ? "from_cache" : "completed";
     this.database.sqlite
@@ -600,6 +698,7 @@ export class WorkflowStore {
           from_cache = ?,
           response_text = ?,
           structured_json = ?,
+          return_value_json = ?,
           provider_session_id = coalesce(?, provider_session_id),
           worktree_path = coalesce(?, worktree_path),
           dirty = ?,
@@ -612,6 +711,7 @@ export class WorkflowStore {
         input.fromCache ? "true" : "false",
         input.responseText ?? null,
         input.structuredJson ?? null,
+        input.returnValueJson ?? null,
         input.providerSessionId ?? null,
         input.worktreePath ?? null,
         input.dirty === undefined ? null : input.dirty ? "true" : "false",
@@ -630,6 +730,7 @@ export class WorkflowStore {
         `update workflow_agent_calls set
           status = 'failed',
           error = ?,
+          error_kind = ?,
           worktree_path = coalesce(?, worktree_path),
           dirty = ?,
           completed_at = ?,
@@ -638,6 +739,7 @@ export class WorkflowStore {
       )
       .run(
         input.error,
+        input.errorKind ?? "internal",
         input.worktreePath ?? null,
         input.dirty === undefined ? null : input.dirty ? "true" : "false",
         now,
@@ -665,31 +767,73 @@ export class WorkflowStore {
   }
 
   /**
-   * Mark running runs with a dead worker as failed.
-   * staleBeforeMs: heartbeat older than this AND pid not alive.
+   * Mark abandoned starting runs and running runs with a dead worker as failed.
+   * staleBeforeMs: start/update or heartbeat older than this and no live pid.
    */
   reapStale(staleBeforeMs = 60_000, nowMs = Date.now()): WorkflowRunRecord[] {
     const cutoff = new Date(nowMs - staleBeforeMs).toISOString();
     const candidates = this.database.sqlite
       .prepare(
         `select * from workflow_runs
-         where status = 'running'
-           and heartbeat_at is not null
-           and heartbeat_at < ?`,
+         where (status = 'running' and heartbeat_at is not null and heartbeat_at < ?)
+            or (status = 'starting' and updated_at < ?)`,
       )
-      .all(cutoff) as WorkflowRunRow[];
+      .all(cutoff, cutoff) as WorkflowRunRow[];
 
     const reaped: WorkflowRunRecord[] = [];
     for (const row of candidates) {
-      if (row.pid !== null && isPidAlive(row.pid)) continue;
-      reaped.push(
-        this.failRun(row.id, {
-          error: "worker heartbeat lost",
-          errorKind: "heartbeat",
-        }),
-      );
+      const latest = this.getRun(row.id);
+      if (!latest || (latest.status !== "running" && latest.status !== "starting")) continue;
+      if (latest.pid !== undefined && isPidAlive(latest.pid)) continue;
+      const failed = this.failRun(row.id, {
+        error: latest.status === "starting" ? "workflow worker failed to start" : "worker heartbeat lost",
+        errorKind: "heartbeat",
+      });
+      if (failed.status === "failed" && failed.errorKind === "heartbeat") {
+        reaped.push(failed);
+      }
     }
     return reaped;
+  }
+
+  private insertEventRow(
+    input: AppendWorkflowEventInput,
+    createdAt: string,
+  ): WorkflowEventRecord {
+    const payload = parseWorkflowEventPayload(input.type, input.data);
+    const dataJson = truncateJson(payload, WORKFLOW_LIMITS.eventDataJsonBytes);
+    const next = this.database.sqlite
+      .prepare(
+        `select coalesce(max(seq), 0) + 1 as next_seq from workflow_events where run_id = ?`,
+      )
+      .get(input.runId) as { next_seq: number };
+    const seq = next.next_seq;
+    this.database.sqlite
+      .prepare(
+        `insert into workflow_events (run_id, seq, type, phase, label, data_json, created_at)
+         values (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        input.runId,
+        seq,
+        input.type,
+        input.phase ?? null,
+        input.label ?? null,
+        dataJson,
+        createdAt,
+      );
+    this.database.sqlite
+      .prepare(`update workflow_runs set updated_at = ? where id = ?`)
+      .run(createdAt, input.runId);
+    return {
+      runId: input.runId,
+      seq,
+      type: input.type,
+      phase: input.phase,
+      label: input.label,
+      dataJson,
+      createdAt,
+    };
   }
 
   close(): void {
@@ -756,9 +900,13 @@ function rowToAgentCall(row: WorkflowAgentCallRow): WorkflowAgentCallRecord {
     runId: row.run_id,
     callIndex: row.call_index,
     cacheKey: row.cache_key,
+    prompt: row.prompt,
+    schemaJson: row.schema_json ?? undefined,
     provider: localAgentProviderSchema.parse(row.provider),
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
+    profileName: row.profile_name ?? undefined,
+    profileFingerprint: row.profile_fingerprint ?? undefined,
     label: row.label ?? undefined,
     phase: row.phase ?? undefined,
     status: workflowAgentCallStatusSchema.parse(row.status),
@@ -766,7 +914,16 @@ function rowToAgentCall(row: WorkflowAgentCallRow): WorkflowAgentCallRecord {
     providerSessionId: row.provider_session_id ?? undefined,
     responseText: row.response_text ?? undefined,
     structuredJson: row.structured_json ?? undefined,
+    returnValueJson: row.return_value_json ?? undefined,
     error: row.error ?? undefined,
+    errorKind: (row.error_kind as WorkflowErrorKind | null) ?? undefined,
+    replayMatch:
+      row.replay_match === "same_index" || row.replay_match === "compatible_key"
+        ? row.replay_match
+        : undefined,
+    replayedFromRunId: row.replayed_from_run_id ?? undefined,
+    replayedFromCallIndex: row.replayed_from_call_index ?? undefined,
+    replayReason: row.replay_reason ?? undefined,
     isolation: row.isolation === "worktree" ? "worktree" : "shared",
     worktreePath: row.worktree_path ?? undefined,
     dirty: row.dirty === null ? undefined : row.dirty === "true",
@@ -785,7 +942,8 @@ function isPidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
-  } catch {
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EPERM") return true;
     return false;
   }
 }
