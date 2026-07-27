@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -70,6 +70,31 @@ import { hashSource } from "./workflow-script.js";
       }),
     /must be inside/,
   );
+
+  if (process.platform !== "win32") {
+    const outside = await mkdtemp(join(tmpdir(), "wf-files-outside-"));
+    try {
+      const outsideScript = join(outside, "escape.js");
+      await writeFile(
+        outsideScript,
+        "export const meta = { name: 'escape', description: 'd' }\nreturn 4\n",
+      );
+      await symlink(
+        outsideScript,
+        join(dir, ".devspace", "workflows", "escape.js"),
+      );
+      await assert.rejects(
+        () =>
+          readProjectWorkflowScriptFile({
+            scriptPath: "escape.js",
+            workspaceRoot: dir,
+          }),
+        /resolves outside/,
+      );
+    } finally {
+      await rm(outside, { recursive: true, force: true });
+    }
+  }
 
   await mkdir(join(dir, "workflows"), { recursive: true });
   await writeFile(
