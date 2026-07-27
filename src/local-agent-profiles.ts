@@ -47,7 +47,7 @@ export async function loadLocalAgentProfiles(
   config: ServerConfig,
   workspaceRoot: string,
 ): Promise<LocalAgentProfile[]> {
-  if (!config.subagents) return [];
+  if (!config.subagents && !config.workflows) return [];
 
   const profileDirs = [
     config.devspaceAgentsDir,

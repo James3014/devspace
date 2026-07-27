@@ -68,28 +68,7 @@ export const WORKFLOW_LIMITS = {
   eventDrainMax: 500,
 } as const;
 
-// ---------------------------------------------------------------------------
-// Provider config (user config / ServerConfig)
-// ---------------------------------------------------------------------------
-
 export type AgentProviderId = LocalAgentProvider;
-
-export interface AgentProviderProbe {
-  id: AgentProviderId;
-  available: boolean;
-  detail?: string;
-}
-
-/**
- * Ordered enable-list. index 0 = default fallback after live availability filter.
- * Missing block on disk → compat all-available in product order.
- * Explicit enabled: [] → no providers; first agent() fails.
- */
-export interface AgentProvidersConfig {
-  enabled: AgentProviderId[];
-  detectedAt?: string;
-  lastProbe?: AgentProviderProbe[];
-}
 
 // ---------------------------------------------------------------------------
 // Status / events

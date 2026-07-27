@@ -15,7 +15,6 @@ import { createWorkflowStore } from "./workflow-store.js";
 import {
   WORKFLOW_MCP_YIELD_MS,
   WORKFLOW_LIMITS,
-  type AgentProvidersConfig,
   type WorkflowEventRecord,
   type WorkflowRunRecord,
 } from "./workflow-types.js";
@@ -24,7 +23,6 @@ import { spawnWorkflowWorkerFromCli } from "./workflow-cli.js";
 import { cancelWorkflowRun } from "./workflow-lifecycle.js";
 import { getLocalAgentProviderAvailabilitySnapshot } from "./local-agent-availability.js";
 import {
-  isLocalAgentProvider,
   LOCAL_AGENT_PROVIDERS,
   type LocalAgentProvider,
 } from "./local-agent-profiles.js";
@@ -61,7 +59,7 @@ export function registerWorkflowTools(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
 ): void {
-  if (!config.subagents) return;
+  if (!config.workflows) return;
 
   registerAppTool(
     server,
@@ -560,18 +558,11 @@ function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-/** Resolve enabled ∩ live providers for workflows. */
-export function resolveWorkflowEnabledProviders(
-  agentProviders: AgentProvidersConfig | undefined,
-): LocalAgentProvider[] {
+/** Resolve live providers in stable product order for workflows. */
+export function resolveWorkflowEnabledProviders(): LocalAgentProvider[] {
   const snapshot = getLocalAgentProviderAvailabilitySnapshot();
   const live = new Set(
     snapshot.filter((row) => row.available).map((row) => row.name),
   );
-  if (!agentProviders) {
-    return LOCAL_AGENT_PROVIDERS.filter((id) => live.has(id));
-  }
-  return agentProviders.enabled.filter(
-    (id): id is LocalAgentProvider => isLocalAgentProvider(id) && live.has(id),
-  );
+  return LOCAL_AGENT_PROVIDERS.filter((id): id is LocalAgentProvider => live.has(id));
 }

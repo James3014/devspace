@@ -2,11 +2,13 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { createHash } from "node:crypto";
 import type { WorkflowSandboxApi } from "./workflow-sandbox.js";
 import {
-  buildLocalAgentProfilePrompt,
-  fingerprintLocalAgentProfile,
   type LocalAgentProfile,
   type LocalAgentProvider,
 } from "./local-agent-profiles.js";
+import {
+  LocalAgentResolutionError,
+  resolveLocalAgentExecution,
+} from "./local-agent-resolution.js";
 import type { JsonSchema, JsonValue } from "./json-types.js";
 import { jsonValueSchema } from "./json-types.js";
 import {
@@ -156,9 +158,9 @@ export interface WorkflowApiDeps {
   signal: AbortSignal;
   workspaceRoot: string;
   baseSha?: string;
-  /** Already-filtered enabled ∩ live provider ids, preference order. */
-  enabledProviders: LocalAgentProvider[];
-  /** Loaded, enabled profiles exposed by open_workspace for this project. */
+  /** Currently available provider ids in stable preference order. */
+  availableProviders: LocalAgentProvider[];
+  /** Loaded profiles available to this project. */
   agentProfiles?: LocalAgentProfile[];
   runProvider: WorkflowRunProvider;
   createWorktree?: CreateAgentWorktree;
@@ -184,7 +186,6 @@ export class WorkflowEngineError extends Error {
   constructor(
     readonly kind:
       | "cancelled"
-      | "provider_disabled"
       | "provider_unavailable"
       | "no_provider"
       | "profile"
@@ -697,36 +698,6 @@ export function hashCacheKey(input: ReturnType<typeof buildAgentCacheKeyInput>):
   return createHash("sha256").update(JSON.stringify(input)).digest("hex");
 }
 
-export function resolveProvider(
-  optsProvider: LocalAgentProvider | undefined,
-  meta: WorkflowMeta,
-  enabledProviders: LocalAgentProvider[],
-): LocalAgentProvider {
-  if (optsProvider) {
-    if (!enabledProviders.includes(optsProvider)) {
-      throw new WorkflowEngineError(
-        "provider_disabled",
-        `Provider ${optsProvider} is not enabled or not available`,
-      );
-    }
-    return optsProvider;
-  }
-  if (meta.defaultProvider) {
-    if (!enabledProviders.includes(meta.defaultProvider)) {
-      throw new WorkflowEngineError(
-        "provider_unavailable",
-        `meta.defaultProvider ${meta.defaultProvider} is not enabled or not available`,
-      );
-    }
-    return meta.defaultProvider;
-  }
-  const first = enabledProviders[0];
-  if (!first) {
-    throw new WorkflowEngineError("no_provider", "No agent providers enabled");
-  }
-  return first;
-}
-
 interface ResolvedAgentTarget {
   provider: LocalAgentProvider;
   model?: string;
@@ -739,40 +710,36 @@ interface ResolvedAgentTarget {
 function resolveAgentTarget(
   prompt: string,
   opts: AgentOpts,
-  deps: Pick<WorkflowApiDeps, "agentProfiles" | "enabledProviders" | "meta">,
+  deps: Pick<WorkflowApiDeps, "agentProfiles" | "availableProviders" | "meta">,
 ): ResolvedAgentTarget {
-  if (!opts.profile) {
-    return {
-      provider: resolveProvider(opts.provider, deps.meta, deps.enabledProviders),
+  try {
+    const resolved = resolveLocalAgentExecution({
+      prompt,
+      profile: opts.profile,
+      provider: opts.provider,
+      defaultProvider: deps.meta.defaultProvider,
       model: opts.model,
       effort: opts.effort,
-      providerPrompt: prompt,
+      profiles: deps.agentProfiles ?? [],
+      availableProviders: deps.availableProviders,
+    });
+    return {
+      provider: resolved.provider,
+      model: resolved.model,
+      effort: resolved.effort,
+      profileName: resolved.profileName,
+      profileFingerprint: resolved.profileFingerprint,
+      providerPrompt: resolved.prompt,
     };
+  } catch (error) {
+    if (!(error instanceof LocalAgentResolutionError)) throw error;
+    const kind = error.kind === "profile_not_found"
+      ? "profile"
+      : error.kind === "no_provider"
+        ? "no_provider"
+        : "provider_unavailable";
+    throw new WorkflowEngineError(kind, error.message);
   }
-
-  const profile = deps.agentProfiles?.find((candidate) => candidate.name === opts.profile);
-  if (!profile) {
-    const available = deps.agentProfiles?.map((candidate) => candidate.name).join(", ");
-    throw new WorkflowEngineError(
-      "profile",
-      `Unknown agent profile: ${opts.profile}${available ? `. Available profiles: ${available}` : ""}`,
-    );
-  }
-  if (!deps.enabledProviders.includes(profile.provider)) {
-    throw new WorkflowEngineError(
-      "provider_unavailable",
-      `Agent profile ${profile.name} requires unavailable provider ${profile.provider}`,
-    );
-  }
-
-  return {
-    provider: profile.provider,
-    model: opts.model ?? profile.model,
-    effort: opts.effort ?? profile.effort,
-    profileName: profile.name,
-    profileFingerprint: fingerprintLocalAgentProfile(profile),
-    providerPrompt: buildLocalAgentProfilePrompt(profile, prompt),
-  };
 }
 
 function normalizeAgentOpts(opts: unknown): AgentOpts {

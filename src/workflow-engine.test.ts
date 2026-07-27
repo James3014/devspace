@@ -57,7 +57,7 @@ import type { LocalAgentProfile } from "./local-agent-profiles.js";
     concurrency: 4,
     signal: new AbortController().signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    availableProviders: ["codex"],
     runProvider: async (input) => {
       order.push(`start:${input.prompt}`);
       await new Promise((r) => setTimeout(r, 10));
@@ -102,7 +102,7 @@ import type { LocalAgentProfile } from "./local-agent-profiles.js";
     concurrency: 4,
     signal: new AbortController().signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    availableProviders: ["codex"],
     runProvider: async () => ({ finalResponse: "x" }),
   });
 
@@ -165,7 +165,7 @@ import type { LocalAgentProfile } from "./local-agent-profiles.js";
     concurrency: 4,
     signal: new AbortController().signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    availableProviders: ["codex"],
     runProvider: async (input: WorkflowProviderRunInput) => {
       seen.push({ prompt: input.prompt, phase: input.phase });
       await new Promise((r) => setTimeout(r, 15));
@@ -226,7 +226,7 @@ import type { LocalAgentProfile } from "./local-agent-profiles.js";
     concurrency: 2,
     signal: new AbortController().signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    availableProviders: ["codex"],
     createWorktree,
     runProvider: async (input) => {
       assert.equal(input.workspace, worktrees[0]);
@@ -265,7 +265,7 @@ import type { LocalAgentProfile } from "./local-agent-profiles.js";
     concurrency: 1,
     signal: new AbortController().signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    availableProviders: ["codex"],
     createWorktree: async () => {
       throw new Error("expected worktree setup failure");
     },
@@ -312,7 +312,7 @@ import type { LocalAgentProfile } from "./local-agent-profiles.js";
     concurrency: 1,
     signal: new AbortController().signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex", "claude"],
+    availableProviders: ["codex", "claude"],
     runProvider: async (input) => {
       used.push(input.provider);
       return { finalResponse: input.provider };
@@ -360,7 +360,7 @@ import type { LocalAgentProfile } from "./local-agent-profiles.js";
     concurrency: 1,
     signal: new AbortController().signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex", "claude"],
+    availableProviders: ["codex", "claude"],
     agentProfiles: [profile],
     runProvider: async (input) => {
       calls.push(input);
@@ -401,7 +401,7 @@ import type { LocalAgentProfile } from "./local-agent-profiles.js";
     concurrency: 1,
     signal: new AbortController().signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    availableProviders: ["codex"],
     agentProfiles: [profile],
     runProvider: async () => ({ finalResponse: "unreachable" }),
   });
@@ -440,7 +440,7 @@ import type { LocalAgentProfile } from "./local-agent-profiles.js";
     concurrency: 1,
     signal: new AbortController().signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    availableProviders: ["codex"],
     runProvider: async (input) => {
       calls.push(input);
       if (calls.length === 1) {
@@ -494,7 +494,7 @@ import type { LocalAgentProfile } from "./local-agent-profiles.js";
     concurrency: 1,
     signal: new AbortController().signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    availableProviders: ["codex"],
     runProvider: async () => ({ finalResponse: response }),
   });
 
@@ -526,7 +526,7 @@ import type { LocalAgentProfile } from "./local-agent-profiles.js";
     concurrency: 1,
     signal: new AbortController().signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    availableProviders: ["codex"],
     runProvider: async () => ({
       finalResponse: JSON.stringify({ big }),
       structured: { big },
@@ -583,7 +583,7 @@ return { a, nested }
     runId: run.id,
     journal: store,
     workspaceRoot: dir,
-    enabledProviders: ["codex", "claude"],
+    availableProviders: ["codex", "claude"],
     runProvider: async (input) => {
       prompts.push(input.prompt);
       providers.push(input.provider);
@@ -620,7 +620,7 @@ return await workflow({ scriptPath: ${JSON.stringify(childPath)} }).then(async (
         runId: run.id,
         journal: store,
         workspaceRoot: dir,
-        enabledProviders: ["codex"],
+        availableProviders: ["codex"],
         runProvider: async () => ({ finalResponse: "x" }),
         resolveNestedSource: async () => `
 export const meta = { name: 'mid', description: 'm' }
@@ -657,7 +657,7 @@ return await workflow({ scriptPath: 'x' })
     concurrency: 1,
     signal: ac.signal,
     workspaceRoot: dir,
-    enabledProviders: ["codex"],
+    availableProviders: ["codex"],
     runProvider: async () => {
       ac.abort();
       return { finalResponse: "late" };

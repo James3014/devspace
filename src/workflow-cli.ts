@@ -54,6 +54,11 @@ export async function runWorkflowCommand(
   config: ServerConfig,
 ): Promise<void> {
   const [subcommand, ...rest] = args;
+  if (!config.workflows) {
+    throw new Error(
+      "Dynamic workflows are disabled. Set DEVSPACE_WORKFLOWS=1 to enable the experimental feature.",
+    );
+  }
   switch (subcommand) {
     case "run":
       await runWorkflowRun(rest, config);
@@ -347,7 +352,7 @@ export async function runWorkflowWorker(
   try {
     const source = await readFile(claimed.scriptPath, "utf8");
     const parsed = parseWorkflowScript(source, { filename: claimed.scriptPath });
-    const enabledProviders = resolveEnabledProviders(config.agentProviders);
+    const availableProviders = resolveAvailableProviders();
     const agentProfiles = await loadLocalAgentProfiles(config, claimed.workspaceRoot);
     const concurrency = resolveWorkflowConcurrency(
       parsed.meta.concurrency,
@@ -380,7 +385,7 @@ export async function runWorkflowWorker(
       signal: abort.signal,
       workspaceRoot: claimed.workspaceRoot,
       baseSha: claimed.baseSha,
-      enabledProviders,
+      availableProviders,
       agentProfiles,
       createWorktree,
       replay,
@@ -595,15 +600,10 @@ function safeParseJson(text: string): unknown {
   }
 }
 
-function resolveEnabledProviders(
-  agentProviders?: ServerConfig["agentProviders"],
-): LocalAgentProvider[] {
+function resolveAvailableProviders(): LocalAgentProvider[] {
   const snapshot = getLocalAgentProviderAvailabilitySnapshot();
   const live = new Set(snapshot.filter((row) => row.available).map((row) => row.name));
-  if (!agentProviders) {
-    return LOCAL_AGENT_PROVIDERS.filter((id) => live.has(id));
-  }
-  return agentProviders.enabled.filter((id) => live.has(id));
+  return LOCAL_AGENT_PROVIDERS.filter((id) => live.has(id));
 }
 
 function splitFlags(args: string[]): {
