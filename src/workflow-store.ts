@@ -55,6 +55,8 @@ export interface BeginAgentCallInput {
   provider: string;
   model?: string;
   effort?: string;
+  profileName?: string;
+  profileFingerprint?: string;
   label?: string;
   phase?: string;
   isolation?: AgentIsolationMode;
@@ -70,6 +72,7 @@ export interface CompleteAgentCallInput {
   callIndex: number;
   responseText?: string;
   structuredJson?: string;
+  returnValueJson?: string;
   providerSessionId?: string;
   dirty?: boolean;
   worktreePath?: string;
@@ -146,6 +149,8 @@ interface WorkflowAgentCallRow {
   provider: string;
   model: string | null;
   effort: string | null;
+  profile_name: string | null;
+  profile_fingerprint: string | null;
   label: string | null;
   phase: string | null;
   status: string;
@@ -153,6 +158,7 @@ interface WorkflowAgentCallRow {
   provider_session_id: string | null;
   response_text: string | null;
   structured_json: string | null;
+  return_value_json: string | null;
   error: string | null;
   error_kind: string | null;
   replay_match: string | null;
@@ -636,11 +642,12 @@ export class WorkflowStore {
     this.database.sqlite
       .prepare(
         `insert into workflow_agent_calls (
-          run_id, call_index, cache_key, prompt, schema_json, provider, model, effort, label, phase,
+          run_id, call_index, cache_key, prompt, schema_json, provider, model, effort,
+          profile_name, profile_fingerprint, label, phase,
           status, from_cache, isolation, worktree_path, replay_match,
           replayed_from_run_id, replayed_from_call_index, replay_reason,
           created_at, started_at, updated_at
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 'false', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'running', 'false', ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.runId,
@@ -651,6 +658,8 @@ export class WorkflowStore {
         input.provider,
         input.model ?? null,
         input.effort ?? null,
+        input.profileName ?? null,
+        input.profileFingerprint ?? null,
         input.label ?? null,
         input.phase ?? null,
         isolation,
@@ -673,6 +682,13 @@ export class WorkflowStore {
     if (input.structuredJson !== undefined) {
       assertTextSize(input.structuredJson, WORKFLOW_LIMITS.structuredJsonBytes, "structuredJson");
     }
+    if (input.returnValueJson !== undefined) {
+      assertTextSize(
+        input.returnValueJson,
+        WORKFLOW_LIMITS.replayValueJsonBytes,
+        "returnValueJson",
+      );
+    }
     const now = isoNow();
     const status: WorkflowAgentCallStatus = input.fromCache ? "from_cache" : "completed";
     this.database.sqlite
@@ -682,6 +698,7 @@ export class WorkflowStore {
           from_cache = ?,
           response_text = ?,
           structured_json = ?,
+          return_value_json = ?,
           provider_session_id = coalesce(?, provider_session_id),
           worktree_path = coalesce(?, worktree_path),
           dirty = ?,
@@ -694,6 +711,7 @@ export class WorkflowStore {
         input.fromCache ? "true" : "false",
         input.responseText ?? null,
         input.structuredJson ?? null,
+        input.returnValueJson ?? null,
         input.providerSessionId ?? null,
         input.worktreePath ?? null,
         input.dirty === undefined ? null : input.dirty ? "true" : "false",
@@ -887,6 +905,8 @@ function rowToAgentCall(row: WorkflowAgentCallRow): WorkflowAgentCallRecord {
     provider: localAgentProviderSchema.parse(row.provider),
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
+    profileName: row.profile_name ?? undefined,
+    profileFingerprint: row.profile_fingerprint ?? undefined,
     label: row.label ?? undefined,
     phase: row.phase ?? undefined,
     status: workflowAgentCallStatusSchema.parse(row.status),
@@ -894,6 +914,7 @@ function rowToAgentCall(row: WorkflowAgentCallRow): WorkflowAgentCallRecord {
     providerSessionId: row.provider_session_id ?? undefined,
     responseText: row.response_text ?? undefined,
     structuredJson: row.structured_json ?? undefined,
+    returnValueJson: row.return_value_json ?? undefined,
     error: row.error ?? undefined,
     errorKind: (row.error_kind as WorkflowErrorKind | null) ?? undefined,
     replayMatch:

@@ -13,7 +13,12 @@ import type {
 export class InvalidWorkflowInputError extends TaggedError(
   "InvalidWorkflowInputError",
 )<{
-  code: "ambiguous_source" | "missing_source" | "invalid_name" | "invalid_argument";
+  code:
+    | "ambiguous_source"
+    | "missing_source"
+    | "invalid_name"
+    | "invalid_argument"
+    | "invalid_path";
   message: string;
 }>() {}
 
