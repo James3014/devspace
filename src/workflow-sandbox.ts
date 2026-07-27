@@ -118,19 +118,17 @@ export async function runWorkflowSandbox(
       options.signal?.removeEventListener("abort", onAbort);
       child.removeAllListeners();
       if (child.connected) child.disconnect();
+      if (!child.killed && child.exitCode === null) child.kill("SIGKILL");
       if ("error" in outcome) reject(outcome.error);
       else resolve(outcome.value);
     };
 
     const terminate = (error: Error): void => {
-      if (!child.killed) child.kill("SIGKILL");
       finish({ error });
     };
 
     const onAbort = (): void => {
-      const error = new Error("Workflow cancelled");
-      error.name = "AbortError";
-      terminate(error);
+      terminate(new WorkflowEngineError("cancelled", "Workflow cancelled"));
     };
 
     const timer = setTimeout(() => {
@@ -168,7 +166,7 @@ export async function runWorkflowSandbox(
         remaining: options.api.budget.remaining(),
       },
     };
-    child.send(start);
+    safeSend(child, start);
   });
 }
 
@@ -209,16 +207,22 @@ async function handleChildMessage(
       } catch (error) {
         reply.error = serializeError(error);
       }
-      if (child.connected) child.send(reply);
+      safeSend(child, reply);
       return;
     }
   }
 }
 
 function spawnSandboxChild(): ChildProcess {
-  const childEntry = fileURLToPath(
-    import.meta.url.replace(/workflow-sandbox\.(ts|js)$/, "workflow-sandbox-child.$1"),
+  const selfUrl = import.meta.url;
+  const childUrl = selfUrl.replace(
+    /workflow-sandbox\.(ts|js)$/,
+    "workflow-sandbox-child.$1",
   );
+  if (childUrl === selfUrl) {
+    throw new Error(`Unable to resolve workflow sandbox child entry from ${selfUrl}`);
+  }
+  const childEntry = fileURLToPath(childUrl);
   return fork(childEntry, [], {
     execArgv: process.execArgv,
     stdio: ["ignore", "ignore", "ignore", "ipc"],
@@ -227,6 +231,17 @@ function spawnSandboxChild(): ChildProcess {
       NODE_ENV: process.env.NODE_ENV ?? "production",
     },
   });
+}
+
+function safeSend(child: ChildProcess, message: object): void {
+  if (!child.connected) return;
+  try {
+    child.send(message, () => {
+      // The sandbox may close while an agent call is completing.
+    });
+  } catch {
+    // The child is already being torn down.
+  }
 }
 
 function serializeError(error: unknown): SerializedError {

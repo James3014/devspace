@@ -112,6 +112,24 @@ return 'still-alive'
 }
 
 {
+  const controller = new AbortController();
+  const running = runWorkflowSandbox({
+    parsed: parseWorkflowScript(`
+export const meta = { name: 'abort-loop', description: 'd' }
+while (true) {}
+`),
+    api: api({ name: "abort-loop", description: "d" }),
+    signal: controller.signal,
+  });
+  setTimeout(() => controller.abort(), 50);
+  await assert.rejects(
+    () => running,
+    (error: unknown) =>
+      error instanceof WorkflowEngineError && error.kind === "cancelled",
+  );
+}
+
+{
   await assert.rejects(
     () =>
       runWorkflowSandbox({
