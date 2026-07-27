@@ -85,16 +85,17 @@ DevSpace discovers standard Agent Skills from:
 - project `.agents/skills`
 - `~/.devspace/skills`
 
-It also keeps compatibility with:
+It also includes:
 
-- the bundled `subagent-delegation` skill when `DEVSPACE_SUBAGENTS=1`, unless `~/.devspace/skills/subagent-delegation/SKILL.md` exists
+- the package-managed `subagents` skill when `DEVSPACE_SUBAGENTS=1`
+- the package-managed `dynamic-workflows` skill when Dynamic Workflows are enabled
 - `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
 - additional paths from `DEVSPACE_SKILL_PATHS`
 
 When Subagents are enabled, DevSpace discovers agent profiles
 from `~/.devspace/agents/*.md` and project `.devspace/agents/*.md`.
 `open_workspace` exposes a compact catalog with profile names, descriptions,
-providers, and optional models/thinking levels so the model can choose a configured agent
+providers, and optional models/effort levels so the model can choose a configured agent
 without seeing provider-specific launch details.
 
 Example profiles are packaged under `examples/agents/` for users who want
@@ -113,10 +114,15 @@ Skill paths may be outside the workspace. DevSpace only permits reading:
 
 Set `DEVSPACE_SKILLS=0` to hide skills from workspace output. Set
 `DEVSPACE_SUBAGENTS=1` to expose the experimental subagent catalog and
-`subagent-delegation` skill. That skill teaches the minimal
+`subagents` skill. That skill teaches the minimal
 `devspace agents ls`, `devspace agents run`, and `devspace agents show`
 workflow. The catalog comes from `open_workspace`; `devspace agents ls` lists
 existing subagent sessions for that workspace.
+
+Set `DEVSPACE_WORKFLOWS=1` to enable Dynamic Workflows independently. When the
+variable is omitted it follows `DEVSPACE_SUBAGENTS` for compatibility. Disabled
+features are omitted from the `open_workspace` schema and response rather than
+returned as empty capability arrays.
 
 ## Tool Names
 
