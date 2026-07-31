@@ -31,10 +31,11 @@ import { execSync } from "node:child_process";
 try {
   execSync("git init", { cwd: testDir, stdio: "pipe" });
 } catch {}
-execSync("git add -A && (git commit -m 'test fixtures' || true)", {
-  cwd: testDir,
-  stdio: "pipe",
-});
+execSync("git add -A", { cwd: testDir, stdio: "pipe" });
+execSync(
+  "git -c user.name=test -c user.email=test@test.com commit --no-verify -m test",
+  { cwd: testDir, stdio: "pipe" },
+);
 
 let passed = 0;
 let failed = 0;
@@ -109,7 +110,91 @@ test("different root", () => {
 });
 
 // ============================================================
-console.log("\n=== searchTextTool tests ===");
+console.log("\n=== searchTextTool root mode tests ===");
+
+await asyncTest("path omitted → root search succeeds", async () => {
+  const result = await searchTextTool(
+    { pattern: "artifact_authority" },
+    { cwd: testDir },
+  );
+  const data = JSON.parse(result.content[0].text);
+  assert.ok(data.match_count >= 2, "Expected at least 2 matches");
+});
+
+await asyncTest("path='' → behaves like omitted (root search)", async () => {
+  const result = await searchTextTool(
+    { pattern: "artifact_authority", path: "" },
+    { cwd: testDir },
+  );
+  assert.ok(!result.isError, "Should not be an error");
+  const data = JSON.parse(result.content[0].text);
+  assert.ok(data.match_count >= 2, "Expected at least 2 matches");
+});
+
+await asyncTest("path='.' → behaves like root search", async () => {
+  const result = await searchTextTool(
+    { pattern: "artifact_authority", path: "." },
+    { cwd: testDir },
+  );
+  assert.ok(!result.isError, "Should not be an error");
+  const data = JSON.parse(result.content[0].text);
+  assert.ok(data.match_count >= 2, "Expected at least 2 matches");
+});
+
+await asyncTest("path='', max_results=50 → no git option-order error", async () => {
+  const result = await searchTextTool(
+    { pattern: "workspace_snapshot", path: "", max_results: 50 },
+    { cwd: testDir },
+  );
+  // This should NOT produce "option '--max-count' must come before non-option arguments"
+  assert.ok(!result.isError, `Should not be an error: ${result.content[0].text}`);
+  const data = JSON.parse(result.content[0].text);
+  // No matches is fine, just no option-order error
+  assert.ok(typeof data.match_count === "number", "match_count must be a number");
+});
+
+await asyncTest("path omitted, include='*.md' → only Markdown", async () => {
+  const result = await searchTextTool(
+    { pattern: "artifact_authority", include: "*.md" },
+    { cwd: testDir },
+  );
+  assert.ok(!result.isError, "Should not be an error");
+  const data = JSON.parse(result.content[0].text);
+  for (const m of data.matches) {
+    assert.ok(
+      m.file.endsWith(".md"),
+      `Expected file "${m.file}" to end with ".md"`,
+    );
+  }
+});
+
+await asyncTest("path='', include='*.json' → only JSON", async () => {
+  const result = await searchTextTool(
+    { pattern: "key", path: "", include: "*.json" },
+    { cwd: testDir },
+  );
+  assert.ok(!result.isError, "Should not be an error");
+  const data = JSON.parse(result.content[0].text);
+  for (const m of data.matches) {
+    assert.ok(
+      m.file.endsWith(".json"),
+      `Expected file "${m.file}" to end with ".json"`,
+    );
+  }
+});
+
+await asyncTest("path='', legal no-match → success with empty results", async () => {
+  const result = await searchTextTool(
+    { pattern: "nonexistent_pattern_xyz_12345", path: "" },
+    { cwd: testDir },
+  );
+  assert.ok(!result.isError, "No-match should not be an error");
+  const data = JSON.parse(result.content[0].text);
+  assert.equal(data.match_count, 0);
+});
+
+// ============================================================
+console.log("\n=== searchTextTool scoped mode tests ===");
 
 await asyncTest("path=tasks returns only files under tasks/", async () => {
   const result = await searchTextTool(
@@ -199,18 +284,6 @@ await asyncTest("absolute path outside workspace is rejected", async () => {
   assert.ok(result.isError, "Expected error for absolute path outside workspace");
 });
 
-await asyncTest("no path searches full workspace", async () => {
-  const result = await searchTextTool(
-    { pattern: "artifact_authority" },
-    { cwd: testDir },
-  );
-  const data = JSON.parse(result.content[0].text);
-  assert.ok(
-    data.match_count >= 2,
-    "Expected at least 2 matches without path restriction",
-  );
-});
-
 await asyncTest("no-match returns success with empty results", async () => {
   const result = await searchTextTool(
     { pattern: "nonexistent_pattern_xyz_12345" },
@@ -234,6 +307,40 @@ await asyncTest("nested file found with path=tasks, include=*.md", async () => {
     ),
     "Expected tasks/campaign/01-card.md in results",
   );
+});
+
+await asyncTest("path=tasks candidate=tasks2/example.md excluded by containment", async () => {
+  const result = await searchTextTool(
+    { pattern: "artifact_authority", path: "tasks" },
+    { cwd: testDir },
+  );
+  const data = JSON.parse(result.content[0].text);
+  const tasks2 = data.matches.filter(
+    (m: { file: string }) => m.file === "tasks2/example.md",
+  );
+  assert.equal(tasks2.length, 0, "tasks2/example.md must not appear");
+});
+
+// ============================================================
+console.log("\n=== searchTextTool max_results tests ===");
+
+await asyncTest("max_results limits output count", async () => {
+  const result = await searchTextTool(
+    { pattern: "artifact_authority", max_results: 2 },
+    { cwd: testDir },
+  );
+  const data = JSON.parse(result.content[0].text);
+  assert.ok(data.match_count <= 2, `Expected at most 2 matches, got ${data.match_count}`);
+});
+
+await asyncTest("max_results in scoped mode works", async () => {
+  const result = await searchTextTool(
+    { pattern: "artifact_authority", path: "tasks", max_results: 1 },
+    { cwd: testDir },
+  );
+  assert.ok(!result.isError, "Should not be an error");
+  const data = JSON.parse(result.content[0].text);
+  assert.ok(data.match_count <= 1, "Expected at most 1 match");
 });
 
 // ============================================================
@@ -264,6 +371,52 @@ await asyncTest("worktree count matches array length", async () => {
   const result = await gitWorktreesTool({}, { cwd: testDir });
   const data = JSON.parse(result.content[0].text);
   assert.equal(data.count, data.worktrees.length);
+});
+
+// ============================================================
+console.log("\n=== workspaceSnapshotTool identity tests ===");
+
+await asyncTest("workspace_snapshot returns server_identity", async () => {
+  const result = await workspaceSnapshotTool({}, { cwd: testDir });
+  const data = JSON.parse(result.content[0].text);
+  assert.ok(data.server_identity, "server_identity must be present");
+  assert.ok(
+    typeof data.server_identity.package_name === "string",
+    "package_name must be a string",
+  );
+  assert.ok(
+    typeof data.server_identity.package_version === "string",
+    "package_version must be a string",
+  );
+  assert.ok(
+    typeof data.server_identity.source_commit === "string",
+    "source_commit must be a string",
+  );
+  assert.ok(
+    typeof data.server_identity.tool_count === "number",
+    "tool_count must be a number",
+  );
+});
+
+await asyncTest("workspace_snapshot identity tool_count == 16", async () => {
+  const result = await workspaceSnapshotTool({}, { cwd: testDir });
+  const data = JSON.parse(result.content[0].text);
+  assert.equal(data.server_identity.tool_count, 16);
+});
+
+await asyncTest("workspace_snapshot identity tool_surface is nexus-mcp-16-v1", async () => {
+  const result = await workspaceSnapshotTool({}, { cwd: testDir });
+  const data = JSON.parse(result.content[0].text);
+  assert.equal(data.server_identity.tool_surface, "nexus-mcp-16-v1");
+});
+
+await asyncTest("workspace_snapshot identity source_commit is non-empty", async () => {
+  const result = await workspaceSnapshotTool({}, { cwd: testDir });
+  const data = JSON.parse(result.content[0].text);
+  assert.ok(
+    data.server_identity.source_commit.length > 0,
+    "source_commit must not be empty",
+  );
 });
 
 // ============================================================

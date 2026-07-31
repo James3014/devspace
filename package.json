@@ -1,6 +1,6 @@
 {
   "name": "@nexus-local/devspace",
-  "version": "1.0.1-nexus.1",
+  "version": "1.0.1-nexus.2",
   "description": "DevSpace MCP fork with Nexus read-only git and lifecycle tools. Based on @waishnav/devspace v1.0.1.",
   "type": "module",
   "main": "dist/server.js",
@@ -12,6 +12,7 @@
   },
   "files": [
     "dist",
+    "generated",
     "docs",
     "scripts",
     "README.md"
@@ -21,7 +22,7 @@
   },
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
-    "build": "npm run clean && npm run build:app && tsc -p tsconfig.build.json",
+    "build": "npm run clean && node scripts/generate-build-identity.js && npm run build:app && tsc -p tsconfig.build.json",
     "build:app": "vite build",
     "dev": "node scripts/dev-server.mjs",
     "start": "node dist/cli.js serve",

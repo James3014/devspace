@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { readFile, readdir, stat } from "node:fs/promises";
-import { join, normalize, relative, resolve } from "node:path";
+import { readFile, readdir, stat, access } from "node:fs/promises";
+import { join, normalize, relative, resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const execFileAsync = promisify(execFile);
 
@@ -73,6 +74,20 @@ function isPathInsideDir(filePath: string, dir: string): boolean {
   );
 }
 
+// --- build identity reader ---
+async function readBuildIdentity(): Promise<Record<string, unknown> | null> {
+  try {
+    // Try to find build-identity.json relative to this module
+    const thisDir = dirname(fileURLToPath(import.meta.url));
+    const identityPath = join(thisDir, "..", "generated", "build-identity.json");
+    await access(identityPath);
+    const raw = await readFile(identityPath, "utf-8");
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
 // --- workspace_snapshot ---
 export async function workspaceSnapshotTool(
   input: Record<string, never>,
@@ -94,6 +109,9 @@ export async function workspaceSnapshotTool(
         return { status: xy.trim(), path: filePath };
       });
 
+    // Include runtime build identity
+    const buildIdentity = await readBuildIdentity();
+
     return toMcpContent(
       JSON.stringify(
         {
@@ -103,6 +121,14 @@ export async function workspaceSnapshotTool(
           changed_count: changedFiles.length,
           changed_files: changedFiles.slice(0, 50),
           dirty: changedFiles.length > 0,
+          server_identity: buildIdentity || {
+            package_name: "unknown",
+            package_version: "unknown",
+            source_commit: "unknown",
+            build_id: "unknown",
+            tool_surface: "unknown",
+            tool_count: 16,
+          },
         },
         null,
         2,
@@ -128,28 +154,44 @@ export async function searchTextTool(
   try {
     const cwd = context.cwd;
 
+    // Normalize: "" and "." mean root mode (search entire workspace)
+    const rawPath = input.path?.trim();
+    const effectivePath =
+      rawPath && rawPath !== "." ? rawPath : undefined;
+
     // Validate path: reject traversal and absolute paths outside workspace
-    const pathError = validateSearchPath(input.path, cwd);
+    const pathError = validateSearchPath(effectivePath, cwd);
     if (pathError) {
       return toMcpError(pathError);
     }
 
-    const args = ["grep", "-n", "-i", input.pattern];
+    // Build git grep args: options BEFORE "--" and pathspec
+    const args: string[] = ["grep", "-n", "-i"];
+
+    // max-count must come before "--" and pathspec
+    if (input.max_results) {
+      args.push(`--max-count=${input.max_results}`);
+    }
+
+    args.push(input.pattern);
 
     // Build pathspec: combine path and include into single pathspec
-    if (input.path && input.include) {
-      const dir = input.path.replace(/\/+$/, "");
+    if (effectivePath && input.include) {
+      const dir = effectivePath.replace(/\/+$/, "");
       const pattern = input.include.startsWith("*")
         ? input.include
         : `*${input.include}`;
       args.push("--", `${dir}/${pattern}`);
-    } else if (input.path) {
-      args.push("--", input.path);
+    } else if (effectivePath) {
+      args.push("--", effectivePath);
+    } else if (input.include) {
+      // Root mode with include filter
+      const pattern = input.include.startsWith("*")
+        ? input.include
+        : `*${input.include}`;
+      args.push("--", pattern);
     }
-
-    if (input.max_results) {
-      args.push(`--max-count=${input.max_results}`);
-    }
+    // Root mode without include: no pathspec, search entire workspace
 
     const { stdout } = await git(cwd, args);
     const lines = stdout
@@ -158,10 +200,10 @@ export async function searchTextTool(
       .slice(0, input.max_results || 100);
 
     // Post-filter: path-segment-aware containment check
-    const filtered = input.path
+    const filtered = effectivePath
       ? lines.filter((line) => {
           const file = line.split(":")[0];
-          return isPathInsideDir(file, input.path!);
+          return isPathInsideDir(file, effectivePath);
         })
       : lines;
 
