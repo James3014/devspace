@@ -79,10 +79,25 @@ async function readBuildIdentity(): Promise<Record<string, unknown> | null> {
   try {
     // Try to find build-identity.json relative to this module
     const thisDir = dirname(fileURLToPath(import.meta.url));
-    const identityPath = join(thisDir, "..", "generated", "build-identity.json");
+    const generatedDir = join(thisDir, "..", "generated");
+    const identityPath = join(generatedDir, "build-identity.json");
     await access(identityPath);
     const raw = await readFile(identityPath, "utf-8");
-    return JSON.parse(raw);
+    const identity = JSON.parse(raw);
+
+    // Also read artifact_sha256 from separate file if it exists
+    try {
+      const sha256Path = join(generatedDir, "artifact-sha256.txt");
+      await access(sha256Path);
+      const sha256 = (await readFile(sha256Path, "utf-8")).trim();
+      if (sha256) {
+        identity.artifact_sha256 = sha256;
+      }
+    } catch {
+      // artifact-sha256.txt not found; that's OK
+    }
+
+    return identity;
   } catch {
     return null;
   }
@@ -125,6 +140,7 @@ export async function workspaceSnapshotTool(
             package_name: "unknown",
             package_version: "unknown",
             source_commit: "unknown",
+            artifact_sha256: "unknown",
             build_id: "unknown",
             tool_surface: "unknown",
             tool_count: 16,

@@ -18,11 +18,19 @@ const sourceCommit = execSync("git rev-parse HEAD", { cwd: root })
   .toString()
   .trim();
 const shortCommit = sourceCommit.slice(0, 8);
-const timestamp = new Date().toISOString();
+
+// Use git commit author date for deterministic builds (not current time)
+const commitTimestamp = execSync(
+  "git log -1 --format=%aI HEAD",
+  { cwd: root },
+)
+  .toString()
+  .trim();
+
 const buildId = `nexus-${pkg.version}-${shortCommit}`;
 
 const identity = {
-  generated_at: timestamp,
+  generated_at: commitTimestamp,
   source_commit: sourceCommit,
   package_name: pkg.name,
   package_version: pkg.version,

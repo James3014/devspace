@@ -419,6 +419,19 @@ await asyncTest("workspace_snapshot identity source_commit is non-empty", async 
   );
 });
 
+await asyncTest("workspace_snapshot identity includes artifact_sha256", async () => {
+  const result = await workspaceSnapshotTool({}, { cwd: testDir });
+  const data = JSON.parse(result.content[0].text);
+  assert.ok(
+    typeof data.server_identity.artifact_sha256 === "string",
+    "artifact_sha256 must be a string",
+  );
+  assert.ok(
+    data.server_identity.artifact_sha256.length > 0,
+    "artifact_sha256 must not be empty",
+  );
+});
+
 // ============================================================
 console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
 process.exit(failed > 0 ? 1 : 0);

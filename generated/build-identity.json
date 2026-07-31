@@ -1,9 +1,9 @@
 {
-  "generated_at": "2026-07-31T17:25:12.697Z",
-  "source_commit": "0ecf2315e90e4ac74c56bae5f3c14bcdea13cc4d",
+  "generated_at": "2026-08-01T00:31:11+07:00",
+  "source_commit": "751673e4f5cc7ecc3e101968c7fb369c9d5b8e77",
   "package_name": "@nexus-local/devspace",
   "package_version": "1.0.1-nexus.2",
   "tool_surface": "nexus-mcp-16-v1",
   "tool_count": 16,
-  "build_id": "nexus-1.0.1-nexus.2-0ecf2315"
+  "build_id": "nexus-1.0.1-nexus.2-751673e4"
 }
