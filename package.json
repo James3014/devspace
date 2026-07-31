@@ -1,14 +1,14 @@
 {
-  "name": "@waishnav/devspace",
-  "version": "1.0.1",
-  "description": "Expose a secure local coding workspace through an MCP server.",
+  "name": "@nexus-local/devspace",
+  "version": "1.0.1-nexus.1",
+  "description": "DevSpace MCP fork with Nexus read-only git and lifecycle tools. Based on @waishnav/devspace v1.0.1.",
   "type": "module",
   "main": "dist/server.js",
   "engines": {
     "node": ">=20.12 <27"
   },
   "bin": {
-    "devspace": "dist/cli.js"
+    "nexus-devspace": "dist/cli.js"
   },
   "files": [
     "dist",
@@ -17,7 +17,7 @@
     "README.md"
   ],
   "publishConfig": {
-    "access": "public"
+    "access": "restricted"
   },
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
@@ -25,7 +25,7 @@
     "build:app": "vite build",
     "dev": "node scripts/dev-server.mjs",
     "start": "node dist/cli.js serve",
-    "test": "tsx src/config.test.ts && tsx src/roots.test.ts && tsx src/skills.test.ts && tsx src/workspaces.test.ts && tsx src/review-checkpoints.test.ts",
+    "test": "tsx src/config.test.ts && tsx src/roots.test.ts && tsx src/skills.test.ts && tsx src/workspaces.test.ts && tsx src/review-checkpoints.test.ts && tsx src/nexus-git-tools.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "keywords": [],

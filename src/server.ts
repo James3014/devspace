@@ -39,6 +39,19 @@ import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
+import {
+  workspaceSnapshotTool,
+  searchTextTool,
+  listTreeTool,
+  gitStatusTool,
+  gitDiffTool,
+  gitLogTool,
+  gitShowTool,
+  gitWorktreesTool,
+  readTaskCardTool,
+  readCandidateTool,
+  readReceiptTool,
+} from "./nexus-git-tools.js";
 
 type Transport = StreamableHTTPServerTransport;
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
@@ -1257,6 +1270,436 @@ function createMcpServer(
         structuredContent: {
           result: contentText(response.content),
         },
+      };
+    },
+  );
+
+  // --- Nexus read-only tools ---
+
+  const NEXUS_READ_ONLY_ANNOTATIONS = { readOnlyHint: true };
+
+  registerAppTool(
+    server,
+    "workspace_snapshot",
+    {
+      title: "Workspace snapshot",
+      description:
+        "Return workspace state summary: branch, HEAD, changed files count. Read-only.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+      },
+      annotations: NEXUS_READ_ONLY_ANNOTATIONS,
+    },
+    async ({ workspaceId }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await workspaceSnapshotTool(
+        {},
+        { cwd: workspace.root },
+      );
+      logToolCall(config, {
+        tool: "workspace_snapshot",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "search_text",
+    {
+      title: "Search text",
+      description:
+        "Search file contents using git grep. Read-only. Use open_workspace first and pass workspaceId.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        pattern: z.string().describe("Search pattern (regex supported)."),
+        path: z
+          .string()
+          .optional()
+          .describe(
+            "Optional directory path relative to workspace root to restrict search scope.",
+          ),
+        include: z
+          .string()
+          .optional()
+          .describe('Optional file glob (e.g., "*.py").'),
+        max_results: z
+          .number()
+          .optional()
+          .describe("Max results to return (default 100)."),
+      },
+      annotations: NEXUS_READ_ONLY_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await searchTextTool(
+        input as Parameters<typeof searchTextTool>[0],
+        { cwd: workspace.root },
+      );
+      logToolCall(config, {
+        tool: "search_text",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "list_tree",
+    {
+      title: "List tree",
+      description:
+        "List directory tree with file metadata. Read-only. Use open_workspace first and pass workspaceId.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        path: z
+          .string()
+          .optional()
+          .describe("Directory path relative to workspace root."),
+        max_depth: z
+          .number()
+          .optional()
+          .describe("Max depth (default 3)."),
+      },
+      annotations: NEXUS_READ_ONLY_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await listTreeTool(input, { cwd: workspace.root });
+      logToolCall(config, {
+        tool: "list_tree",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "git_status",
+    {
+      title: "Git status",
+      description:
+        "Return porcelain git status with counts. Read-only. Use open_workspace first and pass workspaceId.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        include_detail: z
+          .boolean()
+          .optional()
+          .describe("Include full file list (default false)."),
+      },
+      annotations: NEXUS_READ_ONLY_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await gitStatusTool(input, { cwd: workspace.root });
+      logToolCall(config, {
+        tool: "git_status",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "git_diff",
+    {
+      title: "Git diff",
+      description:
+        "Return diff between refs or working tree. Read-only. Use open_workspace first and pass workspaceId.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        ref_a: z
+          .string()
+          .optional()
+          .describe("Base ref (or only ref for working diff)."),
+        ref_b: z.string().optional().describe("Target ref."),
+        path: z
+          .string()
+          .optional()
+          .describe("Path filter relative to workspace root."),
+        stat_only: z
+          .boolean()
+          .optional()
+          .describe("Return only diffstat."),
+      },
+      annotations: NEXUS_READ_ONLY_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await gitDiffTool(input, { cwd: workspace.root });
+      logToolCall(config, {
+        tool: "git_diff",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "git_log",
+    {
+      title: "Git log",
+      description:
+        "Return commit history. Read-only. Use open_workspace first and pass workspaceId.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        count: z
+          .number()
+          .optional()
+          .describe("Number of commits (default 20)."),
+        path: z
+          .string()
+          .optional()
+          .describe("Path filter relative to workspace root."),
+      },
+      annotations: NEXUS_READ_ONLY_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await gitLogTool(input, { cwd: workspace.root });
+      logToolCall(config, {
+        tool: "git_log",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "git_show",
+    {
+      title: "Git show",
+      description:
+        "Show commit details or patch. Read-only. Use open_workspace first and pass workspaceId.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        ref: z.string().optional().describe("Git ref (default HEAD)."),
+        format: z
+          .enum(["stat", "patch"])
+          .optional()
+          .describe("Output format (default stat)."),
+      },
+      annotations: NEXUS_READ_ONLY_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await gitShowTool(input, { cwd: workspace.root });
+      logToolCall(config, {
+        tool: "git_show",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "git_worktrees",
+    {
+      title: "Git worktrees",
+      description:
+        "List managed git worktrees. Read-only. Use open_workspace first and pass workspaceId.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+      },
+      annotations: NEXUS_READ_ONLY_ANNOTATIONS,
+    },
+    async ({ workspaceId }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await gitWorktreesTool({}, { cwd: workspace.root });
+      logToolCall(config, {
+        tool: "git_worktrees",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "read_task_card",
+    {
+      title: "Read task card",
+      description:
+        "Read a Nexus task card from tasks/ directory. Read-only. Use open_workspace first and pass workspaceId.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        campaign_id: z
+          .string()
+          .describe("Campaign ID (e.g., v24-task)."),
+        card_id: z.string().describe("Card ID (e.g., 01-setup)."),
+      },
+      annotations: NEXUS_READ_ONLY_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await readTaskCardTool(
+        input as Parameters<typeof readTaskCardTool>[0],
+        { cwd: workspace.root },
+      );
+      logToolCall(config, {
+        tool: "read_task_card",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "read_candidate",
+    {
+      title: "Read candidate",
+      description:
+        "Read a Nexus candidate receipt from .nexus/candidates/. Read-only. Use open_workspace first and pass workspaceId.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        candidate_id: z.string().describe("Candidate ID."),
+      },
+      annotations: NEXUS_READ_ONLY_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await readCandidateTool(
+        input as Parameters<typeof readCandidateTool>[0],
+        { cwd: workspace.root },
+      );
+      logToolCall(config, {
+        tool: "read_candidate",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "read_receipt",
+    {
+      title: "Read receipt",
+      description:
+        "Read a Nexus execution receipt from .nexus/receipts/. Read-only. Use open_workspace first and pass workspaceId.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        receipt_id: z.string().describe("Receipt ID."),
+      },
+      annotations: NEXUS_READ_ONLY_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await readReceiptTool(
+        input as Parameters<typeof readReceiptTool>[0],
+        { cwd: workspace.root },
+      );
+      logToolCall(config, {
+        tool: "read_receipt",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
       };
     },
   );
