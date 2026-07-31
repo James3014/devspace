@@ -78,6 +78,7 @@ function isPathInsideDir(filePath: string, dir: string): boolean {
 async function readBuildIdentity(): Promise<Record<string, unknown> | null> {
   try {
     // Try to find build-identity.json relative to this module
+    // Works in both source (src/) and compiled (dist/) contexts
     const thisDir = dirname(fileURLToPath(import.meta.url));
     const generatedDir = join(thisDir, "..", "generated");
     const identityPath = join(generatedDir, "build-identity.json");
@@ -189,7 +190,8 @@ export async function searchTextTool(
       args.push(`--max-count=${input.max_results}`);
     }
 
-    args.push(input.pattern);
+    // Use -e to explicitly mark pattern (avoids option-order conflicts)
+    args.push("-e", input.pattern);
 
     // Build pathspec: combine path and include into single pathspec
     if (effectivePath && input.include) {

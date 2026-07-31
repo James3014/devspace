@@ -1,6 +1,6 @@
 {
   "name": "@nexus-local/devspace",
-  "version": "1.0.1-nexus.2",
+  "version": "1.0.1-nexus.3",
   "description": "DevSpace MCP fork with Nexus read-only git and lifecycle tools. Based on @waishnav/devspace v1.0.1.",
   "type": "module",
   "main": "dist/server.js",

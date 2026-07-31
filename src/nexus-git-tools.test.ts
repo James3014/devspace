@@ -6,6 +6,9 @@ import {
   searchTextTool,
   gitWorktreesTool,
   workspaceSnapshotTool,
+  readTaskCardTool,
+  readCandidateTool,
+  readReceiptTool,
   validateSearchPath,
   isPathInsideDir,
 } from "./nexus-git-tools.js";
@@ -430,6 +433,152 @@ await asyncTest("workspace_snapshot identity includes artifact_sha256", async ()
     data.server_identity.artifact_sha256.length > 0,
     "artifact_sha256 must not be empty",
   );
+});
+
+// ============================================================
+console.log("\n=== readTaskCardTool tests ===");
+
+// Create task card fixture
+mkdirSync(join(testDir, "tasks", "test_campaign"), { recursive: true });
+writeFileSync(
+  join(testDir, "tasks", "test_campaign", "01-fix-bug.md"),
+  `---
+task_id: FIX-BUG-001
+status: active
+---
+# Fix Bug 001
+Fix the critical bug.`,
+);
+
+await asyncTest("read_task_card: valid fixture returns content", async () => {
+  const result = await readTaskCardTool(
+    { campaign_id: "test_campaign", card_id: "01-fix-bug" },
+    { cwd: testDir },
+  );
+  assert.ok(!result.isError, "Should not be an error");
+  const data = JSON.parse(result.content[0].text);
+  assert.equal(data.campaign_id, "test_campaign");
+  assert.equal(data.card_id, "01-fix-bug");
+  assert.ok(data.content.includes("Fix Bug 001"), "Content must contain card text");
+});
+
+await asyncTest("read_task_card: nonexistent card returns error", async () => {
+  const result = await readTaskCardTool(
+    { campaign_id: "test_campaign", card_id: "99-nonexistent" },
+    { cwd: testDir },
+  );
+  assert.ok(result.isError, "Should be an error for nonexistent card");
+});
+
+await asyncTest("read_task_card: traversal rejected", async () => {
+  const result = await readTaskCardTool(
+    { campaign_id: "../etc", card_id: "passwd" },
+    { cwd: testDir },
+  );
+  assert.ok(result.isError, "Should reject traversal");
+});
+
+// ============================================================
+console.log("\n=== readCandidateTool tests ===");
+
+// Create candidate fixture
+mkdirSync(join(testDir, ".nexus", "candidates"), { recursive: true });
+writeFileSync(
+  join(testDir, ".nexus", "candidates", "cand-001.json"),
+  JSON.stringify({
+    candidate_id: "cand-001",
+    task_id: "FIX-BUG-001",
+    commit_sha: "abc123",
+    status: "pending",
+  }),
+);
+
+await asyncTest("read_candidate: valid fixture returns parsed JSON", async () => {
+  const result = await readCandidateTool(
+    { candidate_id: "cand-001" },
+    { cwd: testDir },
+  );
+  assert.ok(!result.isError, "Should not be an error");
+  const data = JSON.parse(result.content[0].text);
+  assert.equal(data.candidate_id, "cand-001");
+  assert.equal(data.data.task_id, "FIX-BUG-001");
+});
+
+await asyncTest("read_candidate: nonexistent fixture returns error", async () => {
+  const result = await readCandidateTool(
+    { candidate_id: "nonexistent" },
+    { cwd: testDir },
+  );
+  assert.ok(result.isError, "Should be an error for nonexistent candidate");
+});
+
+await asyncTest("read_candidate: malformed JSON returns error", async () => {
+  writeFileSync(join(testDir, ".nexus", "candidates", "bad.json"), "{invalid json");
+  const result = await readCandidateTool(
+    { candidate_id: "bad" },
+    { cwd: testDir },
+  );
+  assert.ok(result.isError, "Should be an error for malformed JSON");
+});
+
+await asyncTest("read_candidate: traversal rejected", async () => {
+  const result = await readCandidateTool(
+    { candidate_id: "../etc/passwd" },
+    { cwd: testDir },
+  );
+  assert.ok(result.isError, "Should reject traversal");
+});
+
+// ============================================================
+console.log("\n=== readReceiptTool tests ===");
+
+// Create receipt fixture
+mkdirSync(join(testDir, ".nexus", "receipts"), { recursive: true });
+writeFileSync(
+  join(testDir, ".nexus", "receipts", "rec-001.json"),
+  JSON.stringify({
+    receipt_id: "rec-001",
+    candidate_id: "cand-001",
+    gate: "artifact_gate",
+    passed: true,
+    timestamp: "2026-08-01T00:00:00Z",
+  }),
+);
+
+await asyncTest("read_receipt: valid fixture returns parsed JSON", async () => {
+  const result = await readReceiptTool(
+    { receipt_id: "rec-001" },
+    { cwd: testDir },
+  );
+  assert.ok(!result.isError, "Should not be an error");
+  const data = JSON.parse(result.content[0].text);
+  assert.equal(data.receipt_id, "rec-001");
+  assert.equal(data.data.candidate_id, "cand-001");
+});
+
+await asyncTest("read_receipt: nonexistent fixture returns error", async () => {
+  const result = await readReceiptTool(
+    { receipt_id: "nonexistent" },
+    { cwd: testDir },
+  );
+  assert.ok(result.isError, "Should be an error for nonexistent receipt");
+});
+
+await asyncTest("read_receipt: malformed JSON returns error", async () => {
+  writeFileSync(join(testDir, ".nexus", "receipts", "bad.json"), "not json");
+  const result = await readReceiptTool(
+    { receipt_id: "bad" },
+    { cwd: testDir },
+  );
+  assert.ok(result.isError, "Should be an error for malformed JSON");
+});
+
+await asyncTest("read_receipt: traversal rejected", async () => {
+  const result = await readReceiptTool(
+    { receipt_id: "../etc/hostname" },
+    { cwd: testDir },
+  );
+  assert.ok(result.isError, "Should reject traversal");
 });
 
 // ============================================================
