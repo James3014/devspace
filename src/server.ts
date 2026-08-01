@@ -466,13 +466,13 @@ async function assertWorkspaceAppAssets(): Promise<void> {
   }
 }
 
-function createMcpServer(
+async function createMcpServer(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
   reviewCheckpoints: ReturnType<typeof createReviewCheckpointManager>,
-): McpServer {
+): Promise<McpServer> {
   if (config.gatewayProxyUrl) {
-    return createNexusGatewayProxyServer(config);
+    return await createNexusGatewayProxyServer(config);
   }
   const toolNames = toolNamesFor(config);
   const server = new McpServer(
@@ -1892,7 +1892,7 @@ export function createServer(config = loadConfig()): RunningServer {
           }
         };
 
-        const server = createMcpServer(config, workspaces, reviewCheckpoints);
+        const server = await createMcpServer(config, workspaces, reviewCheckpoints);
         await server.connect(transport);
       } else {
         sendJsonRpcError(res, 400, -32000, "No valid MCP session");

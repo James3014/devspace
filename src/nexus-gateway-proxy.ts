@@ -4,39 +4,38 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import * as z from "zod/v4";
 import type { ServerConfig } from "./config.js";
 
-export const NEXUS_GATEWAY_TOOL_NAMES = [
-  "nexus_gateway_status",
-  "nexus_workspace_snapshot",
-  "nexus_read",
-  "nexus_search",
-  "nexus_git_diff",
-  "nexus_task_run",
-  "nexus_task_status",
-  "nexus_task_wait",
-  "nexus_task_finish",
-  "nexus_task_cancel",
-] as const;
+type JsonSchema = {
+  type?: string | string[];
+  title?: string;
+  description?: string;
+  required?: string[];
+  properties?: Record<string, JsonSchema>;
+  items?: JsonSchema;
+  enum?: unknown[];
+  const?: unknown;
+  additionalProperties?: boolean | JsonSchema;
+  default?: unknown;
+  [key: string]: unknown;
+};
 
-const GATEWAY_TOOL_DESCRIPTIONS: Record<string, string> = {
-  nexus_gateway_status: "Read the canonical Nexus gateway identity and lifecycle counts.",
-  nexus_workspace_snapshot: "Read the canonical Nexus checkout snapshot without creating a Target.",
-  nexus_read: "Read a bounded file inside the canonical Nexus checkout.",
-  nexus_search: "Search bounded literal text inside the canonical Nexus checkout.",
-  nexus_git_diff: "Read a bounded canonical Git diff.",
-  nexus_task_run: "Route one bounded task through CapabilityPlanner and the governed three-lane lifecycle.",
-  nexus_task_status: "Read one governed task status and next action.",
-  nexus_task_wait: "Poll one bounded governed task until attention, terminal, or timeout.",
-  nexus_task_finish: "Finish a Direct receipt or owner-finish an exact isolated Candidate binding.",
-  nexus_task_cancel: "Cancel one governed task through formal lifecycle cleanup.",
+export interface NexusGatewayToolSpec {
+  name: string;
+  description?: string;
+  inputSchema: JsonSchema;
+}
+
+type JsonRpcResponse = {
+  result?: unknown;
+  error?: { code?: number; message?: string };
 };
 
 export class NexusGatewayProxyError extends Error {}
 
-export async function forwardNexusGatewayTool(
+async function gatewayJsonRpc(
   config: ServerConfig,
-  name: string,
-  arguments_: Record<string, unknown>,
-): Promise<CallToolResult> {
+  method: string,
+  params: Record<string, unknown>,
+): Promise<JsonRpcResponse> {
   if (!config.gatewayProxyUrl || !config.gatewayProxyToken) {
     throw new NexusGatewayProxyError("gateway proxy is not configured");
   }
@@ -50,8 +49,8 @@ export async function forwardNexusGatewayTool(
     body: JSON.stringify({
       jsonrpc: "2.0",
       id: randomUUID(),
-      method: "tools/call",
-      params: { name, arguments: arguments_ },
+      method,
+      params,
     }),
     signal: AbortSignal.timeout(15_000),
   });
@@ -66,10 +65,105 @@ export async function forwardNexusGatewayTool(
   if (!response.ok) {
     throw new NexusGatewayProxyError(`gateway returned HTTP ${response.status}`);
   }
-  if (!payload || typeof payload !== "object" || !("result" in payload)) {
+  if (!payload || typeof payload !== "object") {
     throw new NexusGatewayProxyError("gateway returned an invalid JSON-RPC response");
   }
-  const result = (payload as { result?: unknown }).result;
+  const result = payload as JsonRpcResponse;
+  if (result.error) {
+    throw new NexusGatewayProxyError(`gateway JSON-RPC error ${result.error.code ?? "unknown"}: ${result.error.message ?? "unknown"}`);
+  }
+  return result;
+}
+
+/**
+ * Read the canonical gateway manifest at runtime.  The external connector does
+ * not maintain a second tool-name or schema registry: if the canonical gateway
+ * cannot be reached, initialization fails closed instead of advertising stale
+ * tools to ChatGPT.
+ */
+export async function fetchNexusGatewayToolManifest(config: ServerConfig): Promise<NexusGatewayToolSpec[]> {
+  const response = await gatewayJsonRpc(config, "tools/list", {});
+  const result = response.result;
+  if (!result || typeof result !== "object" || !Array.isArray((result as { tools?: unknown }).tools)) {
+    throw new NexusGatewayProxyError("gateway tools/list returned an invalid manifest");
+  }
+  const tools = (result as { tools: unknown[] }).tools.map((tool): NexusGatewayToolSpec => {
+    if (!tool || typeof tool !== "object") {
+      throw new NexusGatewayProxyError("gateway tools/list contains a malformed tool");
+    }
+    const value = tool as Record<string, unknown>;
+    if (typeof value.name !== "string" || !value.name || !value.inputSchema || typeof value.inputSchema !== "object") {
+      throw new NexusGatewayProxyError("gateway tools/list contains a tool without a valid name/schema");
+    }
+    return {
+      name: value.name,
+      description: typeof value.description === "string" ? value.description : undefined,
+      inputSchema: value.inputSchema as JsonSchema,
+    };
+  });
+  const names = new Set<string>();
+  for (const tool of tools) {
+    if (names.has(tool.name)) throw new NexusGatewayProxyError(`gateway tools/list contains duplicate tool ${tool.name}`);
+    names.add(tool.name);
+  }
+  if (tools.length === 0) throw new NexusGatewayProxyError("gateway tools/list returned an empty manifest");
+  return tools;
+}
+
+function schemaToZod(schema: JsonSchema): any {
+  let result: any;
+  if (schema.const !== undefined) {
+    result = z.literal(schema.const as any);
+  } else if (Array.isArray(schema.enum) && schema.enum.length > 0) {
+    result = schema.enum.length === 1
+      ? z.literal(schema.enum[0] as any)
+      : z.union(schema.enum.map((value) => z.literal(value as any)) as [any, any, ...any[]]);
+  } else if (Array.isArray(schema.type)) {
+    const variants = schema.type.map((type) => schemaToZod({ type }));
+    result = variants.length === 1 ? variants[0] : z.union(variants as [any, any, ...any[]]);
+  } else {
+    switch (schema.type) {
+      case "string":
+        result = z.string();
+        break;
+      case "integer":
+        result = z.number().int();
+        break;
+      case "number":
+        result = z.number();
+        break;
+      case "boolean":
+        result = z.boolean();
+        break;
+      case "array":
+        result = z.array(schema.items ? schemaToZod(schema.items) : z.unknown());
+        break;
+      case "object":
+      default: {
+        const shape: Record<string, any> = {};
+        for (const [name, property] of Object.entries(schema.properties ?? {})) {
+          const required = (schema.required ?? []).includes(name);
+          shape[name] = required ? schemaToZod(property) : schemaToZod(property).optional();
+        }
+        result = z.object(shape);
+        if (schema.additionalProperties === false) result = result.strict();
+        else result = result.passthrough();
+        break;
+      }
+    }
+  }
+  if (schema.description) result = result.describe(schema.description);
+  if (schema.default !== undefined) result = result.default(schema.default as any);
+  return result;
+}
+
+export async function forwardNexusGatewayTool(
+  config: ServerConfig,
+  name: string,
+  arguments_: Record<string, unknown>,
+): Promise<CallToolResult> {
+  const payload = await gatewayJsonRpc(config, "tools/call", { name, arguments: arguments_ });
+  const result = payload.result;
   if (!result || typeof result !== "object") {
     throw new NexusGatewayProxyError("gateway returned a missing tool result");
   }
@@ -81,7 +175,8 @@ export async function forwardNexusGatewayTool(
  * The outer OAuth/Streamable HTTP transport remains DevSpace's responsibility;
  * all workspace and lifecycle semantics are owned by the canonical gateway.
  */
-export function createNexusGatewayProxyServer(config: ServerConfig): McpServer {
+export async function createNexusGatewayProxyServer(config: ServerConfig): Promise<McpServer> {
+  const toolSpecs = await fetchNexusGatewayToolManifest(config);
   const server = new McpServer(
     {
       name: "nexus-mcp-gateway",
@@ -95,14 +190,18 @@ export function createNexusGatewayProxyServer(config: ServerConfig): McpServer {
     },
   );
 
-  for (const name of NEXUS_GATEWAY_TOOL_NAMES) {
-    server.registerTool(
+  for (const spec of toolSpecs) {
+    const name = spec.name;
+    // The manifest is runtime JSON and therefore cannot preserve a static
+    // Zod callback type.  The SDK registration itself still receives the
+    // generated Zod schema; only the compile-time callback boundary is erased.
+    (server.registerTool as any)(
       name,
       {
-        description: GATEWAY_TOOL_DESCRIPTIONS[name],
-        inputSchema: z.object({}).passthrough(),
+        description: spec.description ?? `Forward ${name} to the canonical Nexus gateway.`,
+        inputSchema: schemaToZod(spec.inputSchema),
       },
-      async (arguments_) => {
+      async (arguments_: Record<string, unknown>): Promise<CallToolResult> => {
         try {
           return await forwardNexusGatewayTool(config, name, arguments_ as Record<string, unknown>);
         } catch (error) {
