@@ -12,6 +12,11 @@ import {
   validateSearchPath,
   isPathInsideDir,
 } from "./nexus-git-tools.js";
+import {
+  NEXUS_MCP_TOOL_COUNT,
+  NEXUS_MCP_TOOL_SURFACE,
+  NEXUS_MCP_TOOL_NAMES,
+} from "./nexus-tools.js";
 
 // Create a test workspace with git init
 const testDir = mkdtempSync(join(tmpdir(), "nexus-git-tools-test-"));
@@ -66,6 +71,52 @@ async function asyncTest(name: string, fn: () => Promise<void>) {
     console.log(`    ${(e as Error).message}`);
   }
 }
+
+// ============================================================
+console.log("\n=== Nexus MCP tool registry tests (G5) ===");
+
+test("registry defines exactly 16 tools (5 core + 11 nexus)", () => {
+  assert.equal(NEXUS_MCP_TOOL_COUNT, 16);
+});
+
+test("registry surface matches count-derived contract", () => {
+  assert.equal(NEXUS_MCP_TOOL_SURFACE, "nexus-mcp-16-v1");
+  assert.equal(
+    NEXUS_MCP_TOOL_SURFACE,
+    `nexus-mcp-${NEXUS_MCP_TOOL_COUNT}-v1`,
+  );
+});
+
+test("registry has no duplicate tool names", () => {
+  const seen = new Set<string>();
+  for (const name of NEXUS_MCP_TOOL_NAMES) {
+    assert.ok(!seen.has(name), `duplicate tool name: ${name}`);
+    seen.add(name);
+  }
+  assert.equal(seen.size, NEXUS_MCP_TOOL_COUNT);
+});
+
+test("registry covers the 11 nexus read-only tools", () => {
+  const nexusTools = [
+    "workspace_snapshot",
+    "search_text",
+    "list_tree",
+    "git_status",
+    "git_diff",
+    "git_log",
+    "git_show",
+    "git_worktrees",
+    "read_task_card",
+    "read_candidate",
+    "read_receipt",
+  ];
+  for (const name of nexusTools) {
+    assert.ok(
+      NEXUS_MCP_TOOL_NAMES.includes(name as (typeof NEXUS_MCP_TOOL_NAMES)[number]),
+      `registry missing nexus tool: ${name}`,
+    );
+  }
+});
 
 // ============================================================
 console.log("\n=== validateSearchPath unit tests ===");
@@ -401,16 +452,16 @@ await asyncTest("workspace_snapshot returns server_identity", async () => {
   );
 });
 
-await asyncTest("workspace_snapshot identity tool_count == 16", async () => {
+await asyncTest("workspace_snapshot identity tool_count == registry count", async () => {
   const result = await workspaceSnapshotTool({}, { cwd: testDir });
   const data = JSON.parse(result.content[0].text);
-  assert.equal(data.server_identity.tool_count, 16);
+  assert.equal(data.server_identity.tool_count, NEXUS_MCP_TOOL_COUNT);
 });
 
-await asyncTest("workspace_snapshot identity tool_surface is nexus-mcp-16-v1", async () => {
+await asyncTest("workspace_snapshot identity tool_surface == registry surface", async () => {
   const result = await workspaceSnapshotTool({}, { cwd: testDir });
   const data = JSON.parse(result.content[0].text);
-  assert.equal(data.server_identity.tool_surface, "nexus-mcp-16-v1");
+  assert.equal(data.server_identity.tool_surface, NEXUS_MCP_TOOL_SURFACE);
 });
 
 await asyncTest("workspace_snapshot identity source_commit is non-empty", async () => {
@@ -462,20 +513,24 @@ await asyncTest("read_task_card: valid fixture returns content", async () => {
   assert.ok(data.content.includes("Fix Bug 001"), "Content must contain card text");
 });
 
-await asyncTest("read_task_card: nonexistent card returns error", async () => {
+await asyncTest("read_task_card: nonexistent card returns NOT_FOUND error", async () => {
   const result = await readTaskCardTool(
     { campaign_id: "test_campaign", card_id: "99-nonexistent" },
     { cwd: testDir },
   );
   assert.ok(result.isError, "Should be an error for nonexistent card");
+  const data = JSON.parse(result.content[0].text);
+  assert.equal(data.code, "NOT_FOUND", "in-bound missing must be NOT_FOUND, not traversal");
 });
 
-await asyncTest("read_task_card: traversal rejected", async () => {
+await asyncTest("read_task_card: traversal rejected with PATH_OUTSIDE_ALLOWED_STORE", async () => {
   const result = await readTaskCardTool(
     { campaign_id: "../etc", card_id: "passwd" },
     { cwd: testDir },
   );
   assert.ok(result.isError, "Should reject traversal");
+  const data = JSON.parse(result.content[0].text);
+  assert.equal(data.code, "PATH_OUTSIDE_ALLOWED_STORE");
 });
 
 // ============================================================
@@ -504,12 +559,14 @@ await asyncTest("read_candidate: valid fixture returns parsed JSON", async () =>
   assert.equal(data.data.task_id, "FIX-BUG-001");
 });
 
-await asyncTest("read_candidate: nonexistent fixture returns error", async () => {
+await asyncTest("read_candidate: nonexistent fixture returns NOT_FOUND error", async () => {
   const result = await readCandidateTool(
     { candidate_id: "nonexistent" },
     { cwd: testDir },
   );
   assert.ok(result.isError, "Should be an error for nonexistent candidate");
+  const data = JSON.parse(result.content[0].text);
+  assert.equal(data.code, "NOT_FOUND", "in-bound missing must be NOT_FOUND, not traversal");
 });
 
 await asyncTest("read_candidate: malformed JSON returns error", async () => {
@@ -521,12 +578,30 @@ await asyncTest("read_candidate: malformed JSON returns error", async () => {
   assert.ok(result.isError, "Should be an error for malformed JSON");
 });
 
-await asyncTest("read_candidate: traversal rejected", async () => {
+await asyncTest("read_candidate: traversal rejected with PATH_OUTSIDE_ALLOWED_STORE", async () => {
   const result = await readCandidateTool(
     { candidate_id: "../etc/passwd" },
     { cwd: testDir },
   );
   assert.ok(result.isError, "Should reject traversal");
+  const data = JSON.parse(result.content[0].text);
+  assert.equal(data.code, "PATH_OUTSIDE_ALLOWED_STORE");
+});
+
+await asyncTest("read_candidate: cannot read a real file outside the store (PWN case)", async () => {
+  // A real, readable file just outside the candidates store.
+  writeFileSync(join(testDir, "secret.json"), '{"secret":true}');
+  const result = await readCandidateTool(
+    { candidate_id: "../secret" },
+    { cwd: testDir },
+  );
+  assert.ok(result.isError, "Traversal to real file must be rejected");
+  const data = JSON.parse(result.content[0].text);
+  assert.equal(data.code, "PATH_OUTSIDE_ALLOWED_STORE");
+  assert.ok(
+    !JSON.stringify(result.content).includes("secret"),
+    "secret content must not leak",
+  );
 });
 
 // ============================================================
@@ -556,12 +631,14 @@ await asyncTest("read_receipt: valid fixture returns parsed JSON", async () => {
   assert.equal(data.data.candidate_id, "cand-001");
 });
 
-await asyncTest("read_receipt: nonexistent fixture returns error", async () => {
+await asyncTest("read_receipt: nonexistent fixture returns NOT_FOUND error", async () => {
   const result = await readReceiptTool(
     { receipt_id: "nonexistent" },
     { cwd: testDir },
   );
   assert.ok(result.isError, "Should be an error for nonexistent receipt");
+  const data = JSON.parse(result.content[0].text);
+  assert.equal(data.code, "NOT_FOUND", "in-bound missing must be NOT_FOUND, not traversal");
 });
 
 await asyncTest("read_receipt: malformed JSON returns error", async () => {
@@ -573,12 +650,14 @@ await asyncTest("read_receipt: malformed JSON returns error", async () => {
   assert.ok(result.isError, "Should be an error for malformed JSON");
 });
 
-await asyncTest("read_receipt: traversal rejected", async () => {
+await asyncTest("read_receipt: traversal rejected with PATH_OUTSIDE_ALLOWED_STORE", async () => {
   const result = await readReceiptTool(
     { receipt_id: "../etc/hostname" },
     { cwd: testDir },
   );
   assert.ok(result.isError, "Should reject traversal");
+  const data = JSON.parse(result.content[0].text);
+  assert.equal(data.code, "PATH_OUTSIDE_ALLOWED_STORE");
 });
 
 // ============================================================

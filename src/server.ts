@@ -35,6 +35,7 @@ import {
   writeFileTool,
 } from "./pi-tools.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
+import { NEXUS_MCP_TOOL_COUNT, NEXUS_MCP_TOOL_NAMES } from "./nexus-tools.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
@@ -1703,6 +1704,38 @@ function createMcpServer(
       };
     },
   );
+
+  // Runtime registry-consistency check (G5): the always-on core tools plus the
+  // 11 Nexus tools must match the canonical registry, so tools/list derives
+  // from the same single source of truth as the generator and tests.
+  const registeredTools = (server as unknown as {
+    _registeredTools?: Record<string, unknown>;
+  })._registeredTools;
+  if (registeredTools) {
+    // Always-on core tools resolve via toolNames (short vs legacy); the 11
+    // Nexus tools use fixed registry names independent of naming mode.
+    const NEXUS_FIXED_TOOLS = NEXUS_MCP_TOOL_NAMES.slice(5);
+    const alwaysOn = new Set<string>([
+      "open_workspace",
+      toolNames.read,
+      toolNames.write,
+      toolNames.edit,
+      toolNames.shell,
+      ...NEXUS_FIXED_TOOLS,
+    ]);
+
+    const missing = [...alwaysOn].filter((name) => !registeredTools[name]);
+    if (missing.length > 0) {
+      throw new Error(
+        `Nexus MCP tool surface mismatch: registered tools missing ${missing.join(", ")}`,
+      );
+    }
+    if (alwaysOn.size !== NEXUS_MCP_TOOL_COUNT) {
+      throw new Error(
+        `Nexus MCP tool surface mismatch: expected ${NEXUS_MCP_TOOL_COUNT} always-on tools, got ${alwaysOn.size}`,
+      );
+    }
+  }
 
   return server;
 }

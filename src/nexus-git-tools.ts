@@ -1,8 +1,12 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { readFile, readdir, stat, access } from "node:fs/promises";
+import { readFile, readdir, stat, access, realpath } from "node:fs/promises";
 import { join, normalize, relative, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  NEXUS_MCP_TOOL_COUNT,
+  NEXUS_MCP_TOOL_SURFACE,
+} from "./nexus-tools.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -93,15 +97,98 @@ async function readBuildIdentity(): Promise<Record<string, unknown> | null> {
       const sha256 = (await readFile(sha256Path, "utf-8")).trim();
       if (sha256) {
         identity.artifact_sha256 = sha256;
+      } else {
+        identity.artifact_sha256 = "unknown";
       }
     } catch {
-      // artifact-sha256.txt not found; that's OK
+      identity.artifact_sha256 = "unknown";
     }
 
     return identity;
   } catch {
     return null;
   }
+}
+
+// --- structured store path containment (G3) ---
+const PATH_OUTSIDE_ALLOWED_STORE = "PATH_OUTSIDE_ALLOWED_STORE";
+const STORE_NOT_FOUND = "STORE_NOT_FOUND";
+
+/**
+ * Resolve a user-supplied relative target against an allowed store directory
+ * inside the workspace, enforcing absolute-path + separator-boundary
+ * containment plus realpath symlink-escape defense.
+ *
+ * Returns either the canonical target path or a stable error code:
+ *  - PATH_OUTSIDE_ALLOWED_STORE when the target escapes the store
+ *  - STORE_NOT_FOUND when the store directory itself does not exist
+ */
+async function resolveInsideStore(
+  cwd: string,
+  storeRelDir: string,
+  relativeTarget: string,
+): Promise<{ ok: true; path: string } | { ok: false; code: string; message: string }> {
+  const allowedDir = resolve(cwd, storeRelDir);
+
+  let realAllowed: string;
+  try {
+    realAllowed = await realpath(allowedDir);
+  } catch {
+    return {
+      ok: false,
+      code: STORE_NOT_FOUND,
+      message: `store directory not found: ${storeRelDir}`,
+    };
+  }
+  realAllowed = realAllowed.replace(/\/+$/, "");
+
+  // Resolve the user-supplied relative target from the store root.
+  const target = resolve(realAllowed, relativeTarget);
+
+  // Absolute-path + separator-boundary containment (NOT a raw ".." string check).
+  if (
+    target !== realAllowed &&
+    !target.startsWith(realAllowed + "/")
+  ) {
+    return {
+      ok: false,
+      code: PATH_OUTSIDE_ALLOWED_STORE,
+      message: `path outside allowed store: ${storeRelDir}`,
+    };
+  }
+
+  // Symlink escape defense: if the target exists, verify its real path stays
+  // inside the store.
+  try {
+    const realTarget = await realpath(target);
+    if (
+      realTarget !== realAllowed &&
+      !realTarget.startsWith(realAllowed + "/")
+    ) {
+      return {
+        ok: false,
+        code: PATH_OUTSIDE_ALLOWED_STORE,
+        message: `path outside allowed store: ${storeRelDir}`,
+      };
+    }
+  } catch {
+    // target does not exist; NOT_FOUND is handled by the caller
+  }
+
+  return { ok: true, path: target };
+}
+
+function toMcpStructuredError(code: string, message: string): ToolResult {
+  return {
+    content: [
+      { type: "text", text: JSON.stringify({ error: message, code }) },
+    ],
+    isError: true,
+  };
+}
+
+function toMcpNotFound(kind: string, id: string): ToolResult {
+  return toMcpStructuredError("NOT_FOUND", `${kind} ${id} not found`);
 }
 
 // --- workspace_snapshot ---
@@ -143,8 +230,8 @@ export async function workspaceSnapshotTool(
             source_commit: "unknown",
             artifact_sha256: "unknown",
             build_id: "unknown",
-            tool_surface: "unknown",
-            tool_count: 16,
+            tool_surface: NEXUS_MCP_TOOL_SURFACE,
+            tool_count: NEXUS_MCP_TOOL_COUNT,
           },
         },
         null,
@@ -524,8 +611,17 @@ export async function readTaskCardTool(
 ): Promise<ToolResult> {
   try {
     const cwd = context.cwd;
-    const cardPath = join(cwd, "tasks", input.campaign_id, `${input.card_id}.md`);
-    const content = await readFile(cardPath, "utf-8");
+    // Build a relative target strictly inside the tasks/ store. campaign_id and
+    // card_id are treated as path components; containment rejects traversal.
+    const resolved = await resolveInsideStore(
+      cwd,
+      "tasks",
+      join(input.campaign_id, `${input.card_id}.md`),
+    );
+    if (!resolved.ok) {
+      return toMcpStructuredError(resolved.code, resolved.message);
+    }
+    const content = await readFile(resolved.path, "utf-8");
 
     return toMcpContent(
       JSON.stringify(
@@ -540,7 +636,12 @@ export async function readTaskCardTool(
       ),
     );
   } catch (e) {
-    return toMcpError(
+    const code = (e as { code?: string }).code;
+    if (code === "ENOENT") {
+      return toMcpNotFound("task card", `${input.campaign_id}/${input.card_id}`);
+    }
+    return toMcpStructuredError(
+      "READ_FAILED",
       `read_task_card failed: ${e instanceof Error ? e.message : String(e)}`,
     );
   }
@@ -553,13 +654,15 @@ export async function readCandidateTool(
 ): Promise<ToolResult> {
   try {
     const cwd = context.cwd;
-    const candidatePath = join(
+    const resolved = await resolveInsideStore(
       cwd,
-      ".nexus",
-      "candidates",
+      join(".nexus", "candidates"),
       `${input.candidate_id}.json`,
     );
-    const content = await readFile(candidatePath, "utf-8");
+    if (!resolved.ok) {
+      return toMcpStructuredError(resolved.code, resolved.message);
+    }
+    const content = await readFile(resolved.path, "utf-8");
 
     return toMcpContent(
       JSON.stringify(
@@ -572,7 +675,12 @@ export async function readCandidateTool(
       ),
     );
   } catch (e) {
-    return toMcpError(
+    const code = (e as { code?: string }).code;
+    if (code === "ENOENT") {
+      return toMcpNotFound("candidate", input.candidate_id);
+    }
+    return toMcpStructuredError(
+      "READ_FAILED",
       `read_candidate failed: ${e instanceof Error ? e.message : String(e)}`,
     );
   }
@@ -585,13 +693,15 @@ export async function readReceiptTool(
 ): Promise<ToolResult> {
   try {
     const cwd = context.cwd;
-    const receiptPath = join(
+    const resolved = await resolveInsideStore(
       cwd,
-      ".nexus",
-      "receipts",
+      join(".nexus", "receipts"),
       `${input.receipt_id}.json`,
     );
-    const content = await readFile(receiptPath, "utf-8");
+    if (!resolved.ok) {
+      return toMcpStructuredError(resolved.code, resolved.message);
+    }
+    const content = await readFile(resolved.path, "utf-8");
 
     return toMcpContent(
       JSON.stringify(
@@ -604,7 +714,12 @@ export async function readReceiptTool(
       ),
     );
   } catch (e) {
-    return toMcpError(
+    const code = (e as { code?: string }).code;
+    if (code === "ENOENT") {
+      return toMcpNotFound("receipt", input.receipt_id);
+    }
+    return toMcpStructuredError(
+      "READ_FAILED",
       `read_receipt failed: ${e instanceof Error ? e.message : String(e)}`,
     );
   }
