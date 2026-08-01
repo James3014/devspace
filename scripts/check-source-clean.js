@@ -22,8 +22,7 @@ const root = join(__dirname, "..");
 let porcelain;
 try {
   porcelain = execSync("git status --porcelain=v1", { cwd: root })
-    .toString()
-    .trim();
+    .toString();
 } catch {
   console.error(
     JSON.stringify({

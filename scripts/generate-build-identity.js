@@ -42,8 +42,7 @@ const buildId = `nexus-${pkg.version}-${shortCommit}`;
 // artifact is self-describing. The gate (scripts/check-source-clean.js) has
 // already rejected dirty builds before this generator runs.
 const porcelain = execSync("git status --porcelain=v1", { cwd: root })
-  .toString()
-  .trim();
+  .toString();
 const sourceDirty = porcelain
   .split("\n")
   .filter(Boolean)
