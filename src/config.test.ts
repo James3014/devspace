@@ -26,6 +26,40 @@ assert.equal(loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "1" }).minimalTool
 assert.equal(loadConfig(baseEnv).skillsEnabled, true);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "0" }).skillsEnabled, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "1" }).skillsEnabled, true);
+assert.equal(loadConfig(baseEnv).gatewayProxyUrl, undefined);
+assert.equal(loadConfig(baseEnv).gatewayProxyToken, undefined);
+assert.equal(
+  loadConfig({
+    ...baseEnv,
+    NEXUS_GATEWAY_PROXY_URL: "https://127.0.0.1:8766///?ignored=1",
+    NEXUS_GATEWAY_PROXY_TOKEN: "gateway-token-that-is-long-enough",
+  }).gatewayProxyUrl,
+  "https://127.0.0.1:8766",
+);
+assert.equal(
+  loadConfig({
+    ...baseEnv,
+    NEXUS_GATEWAY_PROXY_URL: "https://127.0.0.1:8766",
+    NEXUS_GATEWAY_PROXY_TOKEN: "gateway-token-that-is-long-enough",
+  }).gatewayProxyToken,
+  "gateway-token-that-is-long-enough",
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, NEXUS_GATEWAY_PROXY_URL: "https://127.0.0.1:8766" }),
+  /NEXUS_GATEWAY_PROXY_TOKEN is required/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, NEXUS_GATEWAY_PROXY_URL: "ftp://127.0.0.1:8766", NEXUS_GATEWAY_PROXY_TOKEN: "gateway-token-that-is-long-enough" }),
+  /NEXUS_GATEWAY_PROXY_URL must use http or https/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, NEXUS_GATEWAY_PROXY_URL: "https://user:pass@127.0.0.1:8766", NEXUS_GATEWAY_PROXY_TOKEN: "gateway-token-that-is-long-enough" }),
+  /must not contain credentials/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, NEXUS_GATEWAY_PROXY_URL: "https://127.0.0.1:8766", NEXUS_GATEWAY_PROXY_TOKEN: "too-short" }),
+  /NEXUS_GATEWAY_PROXY_TOKEN must be at least 16 characters long/,
+);
 
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "invalid" }),

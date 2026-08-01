@@ -48,6 +48,23 @@ Then configure your MCP client with:
 https://your-tunnel-host.example.com/mcp
 ```
 
+### Nexus single-gateway mode
+
+For the Nexus installation, keep DevSpace as the single authenticated MCP
+connector and enable proxy mode so every public tool call reaches the canonical
+Nexus gateway. The proxy does not expose DevSpace workspace, edit, or shell
+tools and never creates a second workspace:
+
+```bash
+export NEXUS_GATEWAY_PROXY_URL=http://127.0.0.1:8766
+export NEXUS_GATEWAY_PROXY_TOKEN='<the canonical Nexus gateway token>'
+nexus-devspace serve
+```
+
+The public `/mcp` endpoint remains protected by DevSpace OAuth. The backend
+gateway token is only used on the local loopback hop. Health checks identify
+this mode as `nexus-mcp-gateway` and report the configured gateway URL.
+
 When the client connects, DevSpace opens an Owner password approval page. Enter
 the Owner password printed by `devspace init`. It is also stored in:
 

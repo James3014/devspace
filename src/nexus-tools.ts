@@ -45,6 +45,12 @@ export interface BuildManifestBody {
   build_id: string;
   tool_surface: string;
   tool_count: number;
+  gateway_name?: string;
+  gateway_version?: string;
+  gateway_commit?: string;
+  lifecycle_commit?: string;
+  gateway_tool_manifest_revision?: string;
+  gateway_tool_count?: number;
 }
 
 /**

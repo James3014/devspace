@@ -37,6 +37,12 @@ const commitTimestamp = execSync(
   .trim();
 
 const buildId = `nexus-${pkg.version}-${shortCommit}`;
+const gatewayName = process.env.NEXUS_GATEWAY_NAME || "unknown";
+const gatewayVersion = process.env.NEXUS_GATEWAY_VERSION || "unknown";
+const gatewayCommit = process.env.NEXUS_GATEWAY_COMMIT || "unknown";
+const lifecycleCommit = process.env.NEXUS_LIFECYCLE_COMMIT || "unknown";
+const gatewayToolManifestRevision = process.env.NEXUS_GATEWAY_TOOL_MANIFEST_REVISION || "unknown";
+const gatewayToolCount = Number(process.env.NEXUS_GATEWAY_TOOL_COUNT || 0);
 
 // Mirror the source-cleanliness gate: the manifest records source_dirty so the
 // artifact is self-describing. The gate (scripts/check-source-clean.js) has
@@ -59,6 +65,12 @@ const manifestBody = {
   build_id: buildId,
   tool_surface: NEXUS_MCP_TOOL_SURFACE,
   tool_count: NEXUS_MCP_TOOL_COUNT,
+  gateway_name: gatewayName,
+  gateway_version: gatewayVersion,
+  gateway_commit: gatewayCommit,
+  lifecycle_commit: lifecycleCommit,
+  gateway_tool_manifest_revision: gatewayToolManifestRevision,
+  gateway_tool_count: gatewayToolCount,
 };
 
 const identity = {
@@ -78,4 +90,5 @@ console.log(`build-identity: ${buildId}`);
 console.log(`  commit: ${sourceCommit}`);
 console.log(`  package: ${pkg.name}@${pkg.version}`);
 console.log(`  surface: ${NEXUS_MCP_TOOL_SURFACE} (${NEXUS_MCP_TOOL_COUNT} tools)`);
+console.log(`  gateway: ${gatewayName}@${gatewayVersion} (${gatewayToolCount} tools)`);
 console.log(`  manifest_sha256: ${identity.build_manifest_sha256}`);

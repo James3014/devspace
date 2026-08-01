@@ -53,6 +53,7 @@ import {
   readCandidateTool,
   readReceiptTool,
 } from "./nexus-git-tools.js";
+import { createNexusGatewayProxyServer } from "./nexus-gateway-proxy.js";
 
 type Transport = StreamableHTTPServerTransport;
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
@@ -470,6 +471,9 @@ function createMcpServer(
   workspaces: WorkspaceRegistry,
   reviewCheckpoints: ReturnType<typeof createReviewCheckpointManager>,
 ): McpServer {
+  if (config.gatewayProxyUrl) {
+    return createNexusGatewayProxyServer(config);
+  }
   const toolNames = toolNamesFor(config);
   const server = new McpServer(
     {
@@ -1795,7 +1799,7 @@ export function createServer(config = loadConfig()): RunningServer {
       baseUrl: new URL(config.publicBaseUrl),
       resourceServerUrl,
       scopesSupported: config.oauth.scopes,
-      resourceName: "DevSpace",
+      resourceName: config.gatewayProxyUrl ? "Nexus MCP Gateway" : "DevSpace",
     }),
   );
 
@@ -1815,7 +1819,12 @@ export function createServer(config = loadConfig()): RunningServer {
   );
 
   app.get("/healthz", (_req, res) => {
-    res.json({ ok: true, name: "devspace" });
+    res.json({
+      ok: true,
+      name: config.gatewayProxyUrl ? "nexus-mcp-gateway" : "devspace",
+      proxy_mode: Boolean(config.gatewayProxyUrl),
+      gateway_url: config.gatewayProxyUrl ?? null,
+    });
   });
 
   app.all("/mcp", async (req, res) => {

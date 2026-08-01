@@ -25,6 +25,8 @@ export interface ServerConfig {
   skillsEnabled: boolean;
   skillPaths: string[];
   agentDir: string;
+  gatewayProxyUrl?: string;
+  gatewayProxyToken?: string;
   logging: LoggingConfig;
 }
 
@@ -170,6 +172,29 @@ function parseRequiredSecret(value: string | undefined, name: string): string {
   return secret;
 }
 
+function parseGatewayProxyUrl(value: string | undefined): string | undefined {
+  const raw = value?.trim();
+  if (!raw) return undefined;
+  const parsed = new URL(raw);
+  if (!['http:', 'https:'].includes(parsed.protocol)) {
+    throw new Error('NEXUS_GATEWAY_PROXY_URL must use http or https');
+  }
+  if (parsed.username || parsed.password || parsed.hash) {
+    throw new Error('NEXUS_GATEWAY_PROXY_URL must not contain credentials or a fragment');
+  }
+  parsed.pathname = parsed.pathname.replace(/\/+$/, '');
+  parsed.search = '';
+  return parsed.toString().replace(/\/$/, '');
+}
+
+function parseGatewayProxyToken(value: string | undefined, url: string | undefined): string | undefined {
+  if (!url) return undefined;
+  const token = value?.trim();
+  if (!token) throw new Error('NEXUS_GATEWAY_PROXY_TOKEN is required when gateway proxy mode is enabled');
+  if (token.length < 16) throw new Error('NEXUS_GATEWAY_PROXY_TOKEN must be at least 16 characters long');
+  return token;
+}
+
 function parseOAuthConfig(env: NodeJS.ProcessEnv, ownerToken: string | undefined): OAuthConfig {
   return {
     ownerToken: parseRequiredSecret(env.DEVSPACE_OAUTH_OWNER_TOKEN ?? ownerToken, "DEVSPACE_OAUTH_OWNER_TOKEN"),
@@ -211,6 +236,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const publicBaseUrl = parsePublicBaseUrl(
     env.DEVSPACE_PUBLIC_BASE_URL ?? files.config.publicBaseUrl ?? localPublicBaseUrl(host, port),
   );
+  const gatewayProxyUrl = parseGatewayProxyUrl(env.NEXUS_GATEWAY_PROXY_URL);
   const derivedAllowedHosts = [
     "localhost",
     "127.0.0.1",
@@ -235,6 +261,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     skillsEnabled: env.DEVSPACE_SKILLS === undefined ? true : parseBoolean(env.DEVSPACE_SKILLS),
     skillPaths: parsePathList(env.DEVSPACE_SKILL_PATHS),
     agentDir: resolve(expandHomePath(env.DEVSPACE_AGENT_DIR ?? files.config.agentDir ?? defaultAgentDir())),
+    gatewayProxyUrl,
+    gatewayProxyToken: parseGatewayProxyToken(env.NEXUS_GATEWAY_PROXY_TOKEN, gatewayProxyUrl),
     logging: parseLoggingConfig(env),
   };
 }
