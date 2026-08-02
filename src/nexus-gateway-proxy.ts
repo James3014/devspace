@@ -1,6 +1,5 @@
-import { randomUUID } from "node:crypto";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import { createHash, randomUUID } from "node:crypto";
+import { McpServer, type CallToolResult } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
 import type { ServerConfig } from "./config.js";
 
@@ -24,6 +23,42 @@ export interface NexusGatewayToolSpec {
   inputSchema: JsonSchema;
 }
 
+export interface NexusGatewayToolManifest extends Array<NexusGatewayToolSpec> {
+  readonly revision: string;
+  readonly sha256: string;
+}
+
+export interface NexusGatewayManifestIdentity {
+  count: number;
+  revision: string;
+  sha256: string;
+}
+
+export interface NexusGatewayForwardContext {
+  requestId?: string;
+  traceparent?: string;
+  tracestate?: string;
+  baggage?: string;
+  clientId?: string;
+  principal?: string;
+  protocolVersion?: string;
+  taskId?: string;
+  attemptId?: string;
+}
+
+const RAW_DEVSPACE_TOOL_NAMES = new Set([
+  "open_workspace",
+  "read",
+  "write",
+  "edit",
+  "shell",
+  "grep",
+  "glob",
+  "ls",
+  "open_worktree",
+  "show_changes",
+]);
+
 type JsonRpcResponse = {
   result?: unknown;
   error?: { code?: number; message?: string };
@@ -31,21 +66,62 @@ type JsonRpcResponse = {
 
 export class NexusGatewayProxyError extends Error {}
 
+function stableJson(value: unknown): string {
+  if (value === undefined) return "null";
+  if (value === null || typeof value !== "object") return JSON.stringify(value) ?? "null";
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(",")}}`;
+}
+
+export function nexusGatewayToolManifestSha256(tools: readonly NexusGatewayToolSpec[]): string {
+  return createHash("sha256").update(stableJson(tools)).digest("hex");
+}
+
+export function nexusGatewayManifestIdentity(
+  tools: readonly NexusGatewayToolSpec[],
+  revision?: string,
+): NexusGatewayManifestIdentity {
+  const sha256 = nexusGatewayToolManifestSha256(tools);
+  return {
+    count: tools.length,
+    revision: revision?.trim() || `sha256:${sha256}`,
+    sha256,
+  };
+}
+
 async function gatewayJsonRpc(
   config: ServerConfig,
   method: string,
   params: Record<string, unknown>,
+  context?: NexusGatewayForwardContext,
 ): Promise<JsonRpcResponse> {
   if (!config.gatewayProxyUrl || !config.gatewayProxyToken) {
     throw new NexusGatewayProxyError("gateway proxy is not configured");
   }
 
+  const headers = new Headers({
+    Authorization: `Bearer ${config.gatewayProxyToken}`,
+    "Content-Type": "application/json",
+  });
+  const propagatedHeaders: Array<[string, string | undefined]> = [
+    ["X-Request-ID", context?.requestId],
+    ["traceparent", context?.traceparent],
+    ["tracestate", context?.tracestate],
+    ["baggage", context?.baggage],
+    ["X-Nexus-MCP-Client-ID", context?.clientId],
+    ["X-Nexus-MCP-Principal", context?.principal],
+    ["MCP-Protocol-Version", context?.protocolVersion],
+    ["X-Nexus-Task-ID", context?.taskId],
+    ["X-Nexus-Attempt-ID", context?.attemptId],
+  ];
+  for (const [name, value] of propagatedHeaders) {
+    if (value && !/[\r\n]/.test(value)) headers.set(name, value);
+  }
+
   const response = await fetch(`${config.gatewayProxyUrl}/mcp`, {
     method: "POST",
-    headers: {
-      Authorization: `Bearer ${config.gatewayProxyToken}`,
-      "Content-Type": "application/json",
-    },
+    headers,
     body: JSON.stringify({
       jsonrpc: "2.0",
       id: randomUUID(),
@@ -81,7 +157,7 @@ async function gatewayJsonRpc(
  * cannot be reached, initialization fails closed instead of advertising stale
  * tools to ChatGPT.
  */
-export async function fetchNexusGatewayToolManifest(config: ServerConfig): Promise<NexusGatewayToolSpec[]> {
+export async function fetchNexusGatewayToolManifest(config: ServerConfig): Promise<NexusGatewayToolManifest> {
   const response = await gatewayJsonRpc(config, "tools/list", {});
   const result = response.result;
   if (!result || typeof result !== "object" || !Array.isArray((result as { tools?: unknown }).tools)) {
@@ -95,6 +171,9 @@ export async function fetchNexusGatewayToolManifest(config: ServerConfig): Promi
     if (typeof value.name !== "string" || !value.name || !value.inputSchema || typeof value.inputSchema !== "object") {
       throw new NexusGatewayProxyError("gateway tools/list contains a tool without a valid name/schema");
     }
+    if (RAW_DEVSPACE_TOOL_NAMES.has(value.name)) {
+      throw new NexusGatewayProxyError(`gateway tools/list exposes raw DevSpace tool ${value.name}`);
+    }
     return {
       name: value.name,
       description: typeof value.description === "string" ? value.description : undefined,
@@ -107,7 +186,22 @@ export async function fetchNexusGatewayToolManifest(config: ServerConfig): Promi
     names.add(tool.name);
   }
   if (tools.length === 0) throw new NexusGatewayProxyError("gateway tools/list returned an empty manifest");
-  return tools;
+  const orderedTools = tools.slice().sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0);
+  const gatewayResult = result as Record<string, unknown>;
+  const suppliedRevision = [
+    gatewayResult.manifest_revision,
+    gatewayResult.manifestRevision,
+    gatewayResult.revision,
+    (gatewayResult._meta as Record<string, unknown> | undefined)?.manifest_revision,
+    (gatewayResult._meta as Record<string, unknown> | undefined)?.revision,
+  ].find((value): value is string => typeof value === "string" && value.trim().length > 0);
+  const identity = nexusGatewayManifestIdentity(orderedTools, suppliedRevision);
+  const manifest = orderedTools as NexusGatewayToolManifest;
+  Object.defineProperties(manifest, {
+    revision: { value: identity.revision, enumerable: false },
+    sha256: { value: identity.sha256, enumerable: false },
+  });
+  return manifest;
 }
 
 function schemaToZod(schema: JsonSchema): any {
@@ -161,8 +255,9 @@ export async function forwardNexusGatewayTool(
   config: ServerConfig,
   name: string,
   arguments_: Record<string, unknown>,
+  context?: NexusGatewayForwardContext,
 ): Promise<CallToolResult> {
-  const payload = await gatewayJsonRpc(config, "tools/call", { name, arguments: arguments_ });
+  const payload = await gatewayJsonRpc(config, "tools/call", { name, arguments: arguments_ }, context);
   const result = payload.result;
   if (!result || typeof result !== "object") {
     throw new NexusGatewayProxyError("gateway returned a missing tool result");
@@ -175,8 +270,11 @@ export async function forwardNexusGatewayTool(
  * The outer OAuth/Streamable HTTP transport remains DevSpace's responsibility;
  * all workspace and lifecycle semantics are owned by the canonical gateway.
  */
-export async function createNexusGatewayProxyServer(config: ServerConfig): Promise<McpServer> {
-  const toolSpecs = await fetchNexusGatewayToolManifest(config);
+export async function createNexusGatewayProxyServer(
+  config: ServerConfig,
+  preparedManifest?: NexusGatewayToolManifest,
+): Promise<McpServer> {
+  const toolSpecs = preparedManifest ?? await fetchNexusGatewayToolManifest(config);
   const server = new McpServer(
     {
       name: "nexus-mcp-gateway",
@@ -201,9 +299,29 @@ export async function createNexusGatewayProxyServer(config: ServerConfig): Promi
         description: spec.description ?? `Forward ${name} to the canonical Nexus gateway.`,
         inputSchema: schemaToZod(spec.inputSchema),
       },
-      async (arguments_: Record<string, unknown>): Promise<CallToolResult> => {
+      async (arguments_: Record<string, unknown>, ctx: any): Promise<CallToolResult> => {
         try {
-          return await forwardNexusGatewayTool(config, name, arguments_ as Record<string, unknown>);
+          const request = ctx?.http?.req as Request | undefined;
+          const authInfo = ctx?.http?.authInfo as {
+            clientId?: string;
+            extra?: Record<string, unknown>;
+          } | undefined;
+          const taskId = typeof arguments_.task_id === "string" ? arguments_.task_id : undefined;
+          const attemptId = typeof arguments_.attempt_id === "string" ? arguments_.attempt_id : undefined;
+          const extra = authInfo?.extra;
+          return await forwardNexusGatewayTool(config, name, arguments_, {
+            requestId: request?.headers.get("x-request-id") ?? undefined,
+            traceparent: request?.headers.get("traceparent") ?? undefined,
+            tracestate: request?.headers.get("tracestate") ?? undefined,
+            baggage: request?.headers.get("baggage") ?? undefined,
+            clientId: authInfo?.clientId,
+            principal:
+              (typeof extra?.principal === "string" ? extra.principal : undefined)
+              ?? (typeof extra?.subject === "string" ? extra.subject : undefined),
+            protocolVersion: request?.headers.get("mcp-protocol-version") ?? undefined,
+            taskId,
+            attemptId,
+          });
         } catch (error) {
           return {
             content: [

@@ -18,6 +18,7 @@ import {
   NEXUS_MCP_TOOL_SURFACE,
   buildManifestSha256,
 } from "../src/nexus-tools.js";
+import { getConfiguredSurfaceIdentity } from "../src/config.js";
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const root = join(__dirname, "..");
@@ -43,6 +44,15 @@ const gatewayCommit = process.env.NEXUS_GATEWAY_COMMIT || "unknown";
 const lifecycleCommit = process.env.NEXUS_LIFECYCLE_COMMIT || "unknown";
 const gatewayToolManifestRevision = process.env.NEXUS_GATEWAY_TOOL_MANIFEST_REVISION || "unknown";
 const gatewayToolCount = Number(process.env.NEXUS_GATEWAY_TOOL_COUNT || 0);
+const gatewayToolManifestSha256 = process.env.NEXUS_GATEWAY_TOOL_MANIFEST_SHA256 || "unknown";
+const observedManifest = gatewayToolCount > 0 || gatewayToolManifestRevision !== "unknown" || gatewayToolManifestSha256 !== "unknown"
+  ? {
+      count: gatewayToolCount,
+      revision: gatewayToolManifestRevision,
+      sha256: gatewayToolManifestSha256,
+    }
+  : undefined;
+const surfaceIdentity = getConfiguredSurfaceIdentity(process.env, observedManifest);
 
 // Mirror the source-cleanliness gate: the manifest records source_dirty so the
 // artifact is self-describing. The gate (scripts/check-source-clean.js) has
@@ -63,14 +73,32 @@ const manifestBody = {
   source_commit: sourceCommit,
   source_dirty: sourceDirty,
   build_id: buildId,
+  // These legacy fields describe the tool registry compiled into this package.
+  // Runtime/public exposure is configuration-dependent and is recorded
+  // separately below so a canonical proxy build cannot make raw workspace
+  // snapshots falsely claim that their embedded registry contains 24 tools.
   tool_surface: NEXUS_MCP_TOOL_SURFACE,
   tool_count: NEXUS_MCP_TOOL_COUNT,
+  effective_tool_surface: surfaceIdentity.surface_profile === "canonical_gateway_proxy"
+    ? "nexus-canonical-gateway-proxy"
+    : NEXUS_MCP_TOOL_SURFACE,
+  effective_tool_count: surfaceIdentity.surface_profile === "canonical_gateway_proxy"
+    ? gatewayToolCount
+    : NEXUS_MCP_TOOL_COUNT,
+  surface_profile: surfaceIdentity.surface_profile,
+  protocol_mode: surfaceIdentity.protocol_mode,
+  tool_source: surfaceIdentity.tool_source,
+  proxy_mode: surfaceIdentity.proxy_mode,
+  observed_manifest_count: surfaceIdentity.observed_manifest_count,
+  observed_manifest_revision: surfaceIdentity.observed_manifest_revision,
+  observed_manifest_sha256: surfaceIdentity.observed_manifest_sha256,
   gateway_name: gatewayName,
   gateway_version: gatewayVersion,
   gateway_commit: gatewayCommit,
   lifecycle_commit: lifecycleCommit,
   gateway_tool_manifest_revision: gatewayToolManifestRevision,
   gateway_tool_count: gatewayToolCount,
+  gateway_tool_manifest_sha256: gatewayToolManifestSha256,
 };
 
 const identity = {
@@ -89,6 +117,7 @@ writeFileSync(
 console.log(`build-identity: ${buildId}`);
 console.log(`  commit: ${sourceCommit}`);
 console.log(`  package: ${pkg.name}@${pkg.version}`);
-console.log(`  surface: ${NEXUS_MCP_TOOL_SURFACE} (${NEXUS_MCP_TOOL_COUNT} tools)`);
+console.log(`  surface: ${manifestBody.tool_surface} (${manifestBody.tool_count} tools)`);
 console.log(`  gateway: ${gatewayName}@${gatewayVersion} (${gatewayToolCount} tools)`);
+console.log(`  identity: ${surfaceIdentity.surface_profile}/${surfaceIdentity.protocol_mode} (${surfaceIdentity.tool_source})`);
 console.log(`  manifest_sha256: ${identity.build_manifest_sha256}`);

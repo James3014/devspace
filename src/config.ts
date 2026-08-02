@@ -3,10 +3,13 @@ import { join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
 import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
-import { loadDevspaceFiles } from "./user-config.js";
+import { loadDevspaceFiles, type DevspaceFiles } from "./user-config.js";
 
 export type ToolNamingMode = "legacy" | "short";
 export type WidgetMode = "off" | "changes" | "full";
+export type SurfaceProfile = "raw_devspace" | "canonical_gateway_proxy";
+export type ProtocolMode = "legacy" | "dual" | "modern";
+export type ToolSource = "devspace_builtin" | "canonical_gateway_manifest";
 const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 
@@ -25,9 +28,28 @@ export interface ServerConfig {
   skillsEnabled: boolean;
   skillPaths: string[];
   agentDir: string;
+  surfaceProfile: SurfaceProfile;
+  protocolMode: ProtocolMode;
   gatewayProxyUrl?: string;
   gatewayProxyToken?: string;
   logging: LoggingConfig;
+}
+
+export interface ObservedManifestIdentity {
+  count: number;
+  revision: string;
+  sha256?: string;
+}
+
+export interface SurfaceIdentity {
+  surface_profile: SurfaceProfile;
+  protocol_mode: ProtocolMode;
+  tool_source: ToolSource;
+  observed_manifest_count: number | null;
+  observed_manifest_revision: string | null;
+  observed_manifest_sha256: string | null;
+  proxy_mode: boolean;
+  gateway_url: string | null;
 }
 
 function parsePort(value: string | number | undefined): number {
@@ -161,6 +183,21 @@ function parseWidgetMode(value: string | undefined): WidgetMode {
   throw new Error(`Invalid DEVSPACE_WIDGETS: ${value}`);
 }
 
+function parseSurfaceProfile(value: string | undefined): SurfaceProfile | undefined {
+  if (!value) return undefined;
+  if (value === "raw_devspace" || value === "canonical_gateway_proxy") return value;
+
+  throw new Error(`Invalid NEXUS_MCP_SURFACE_PROFILE: ${value}`);
+}
+
+function parseProtocolMode(value: string | undefined): ProtocolMode {
+  if (!value || value === "dual") return "dual";
+  if (value === "legacy") return "legacy";
+  if (value === "dual" || value === "modern") return value;
+
+  throw new Error(`Invalid MCP_PROTOCOL_MODE: ${value}`);
+}
+
 function parseRequiredSecret(value: string | undefined, name: string): string {
   const secret = value?.trim();
   if (!secret) {
@@ -188,11 +225,83 @@ function parseGatewayProxyUrl(value: string | undefined): string | undefined {
 }
 
 function parseGatewayProxyToken(value: string | undefined, url: string | undefined): string | undefined {
-  if (!url) return undefined;
   const token = value?.trim();
+  if (!url) {
+    throw new Error("NEXUS_GATEWAY_PROXY_URL is required when canonical gateway proxy surface is selected");
+  }
   if (!token) throw new Error('NEXUS_GATEWAY_PROXY_TOKEN is required when gateway proxy mode is enabled');
   if (token.length < 16) throw new Error('NEXUS_GATEWAY_PROXY_TOKEN must be at least 16 characters long');
   return token;
+}
+
+function isLocalPublicBaseUrl(value: string): boolean {
+  const hostname = new URL(value).hostname.toLowerCase();
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+}
+
+function resolveSurfaceProfile(
+  env: NodeJS.ProcessEnv,
+  publicBaseUrl: string,
+  gatewayProxyUrl: string | undefined,
+  gatewayProxyToken: string | undefined,
+): SurfaceProfile {
+  const explicit = parseSurfaceProfile(env.NEXUS_MCP_SURFACE_PROFILE ?? env.DEVSPACE_SURFACE_PROFILE);
+  if (explicit) {
+    if (explicit === "canonical_gateway_proxy" && !gatewayProxyUrl) {
+      throw new Error("NEXUS_GATEWAY_PROXY_URL is required when canonical gateway proxy surface is selected");
+    }
+    if (explicit === "raw_devspace" && (gatewayProxyUrl || gatewayProxyToken)) {
+      throw new Error("NEXUS_GATEWAY_PROXY_* must be unset for the raw_devspace maintenance surface");
+    }
+    if (explicit === "raw_devspace" && !isLocalPublicBaseUrl(publicBaseUrl)) {
+      throw new Error("raw_devspace maintenance surface requires a loopback public base URL");
+    }
+    return explicit;
+  }
+
+  // A configured gateway or a non-loopback public origin is a public candidate
+  // and therefore defaults to the canonical surface. Loopback stays usable for
+  // local maintenance without silently advertising a public gateway.
+  if (gatewayProxyUrl || gatewayProxyToken || !isLocalPublicBaseUrl(publicBaseUrl)) {
+    return "canonical_gateway_proxy";
+  }
+  return "raw_devspace";
+}
+
+export function getSurfaceIdentity(
+  config: Pick<ServerConfig, "surfaceProfile" | "protocolMode" | "gatewayProxyUrl">,
+  observedManifest?: ObservedManifestIdentity,
+): SurfaceIdentity {
+  const proxyMode = config.surfaceProfile === "canonical_gateway_proxy";
+  return {
+    surface_profile: config.surfaceProfile,
+    protocol_mode: config.protocolMode,
+    tool_source: proxyMode ? "canonical_gateway_manifest" : "devspace_builtin",
+    observed_manifest_count: observedManifest?.count ?? null,
+    observed_manifest_revision: observedManifest?.revision ?? null,
+    observed_manifest_sha256: observedManifest?.sha256 ?? null,
+    proxy_mode: proxyMode,
+    gateway_url: config.gatewayProxyUrl ?? null,
+  };
+}
+
+/** Build-time identity helper without loading OAuth or user config files. */
+export function getConfiguredSurfaceIdentity(
+  env: NodeJS.ProcessEnv = process.env,
+  observedManifest?: ObservedManifestIdentity,
+): SurfaceIdentity {
+  const profile = parseSurfaceProfile(env.NEXUS_MCP_SURFACE_PROFILE ?? env.DEVSPACE_SURFACE_PROFILE)
+    ?? (env.NEXUS_GATEWAY_PROXY_URL || env.NEXUS_GATEWAY_PROXY_TOKEN
+      ? "canonical_gateway_proxy"
+      : "raw_devspace");
+  return getSurfaceIdentity(
+    {
+      surfaceProfile: profile,
+      protocolMode: parseProtocolMode(env.MCP_PROTOCOL_MODE ?? env.NEXUS_MCP_PROTOCOL_MODE),
+      gatewayProxyUrl: env.NEXUS_GATEWAY_PROXY_URL?.trim() || undefined,
+    },
+    observedManifest,
+  );
 }
 
 function parseOAuthConfig(env: NodeJS.ProcessEnv, ownerToken: string | undefined): OAuthConfig {
@@ -230,13 +339,19 @@ function defaultAgentDir(): string {
 }
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
-  const files = loadDevspaceFiles(env);
+  // Programmatic callers that pass an explicit environment receive an
+  // isolated configuration unless they also opt into a DEVSPACE_CONFIG_DIR.
+  // This prevents tests and embedding hosts from silently inheriting a public
+  // tunnel URL or credentials from the interactive user's home directory.
+  const files: Pick<DevspaceFiles, "config" | "auth"> = env === process.env || env.DEVSPACE_CONFIG_DIR !== undefined
+    ? loadDevspaceFiles(env)
+    : { config: {}, auth: {} };
   const host = env.HOST ?? files.config.host ?? "127.0.0.1";
   const port = parsePort(env.PORT ?? files.config.port);
   const publicBaseUrl = parsePublicBaseUrl(
     env.DEVSPACE_PUBLIC_BASE_URL ?? files.config.publicBaseUrl ?? localPublicBaseUrl(host, port),
   );
-  const gatewayProxyUrl = parseGatewayProxyUrl(env.NEXUS_GATEWAY_PROXY_URL);
+  const gatewayProxyUrlCandidate = parseGatewayProxyUrl(env.NEXUS_GATEWAY_PROXY_URL);
   const derivedAllowedHosts = [
     "localhost",
     "127.0.0.1",
@@ -245,6 +360,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     new URL(publicBaseUrl).hostname,
     ...(files.config.allowedHosts ?? []),
   ];
+
+  const gatewayProxyTokenCandidate = env.NEXUS_GATEWAY_PROXY_TOKEN?.trim();
+  const surfaceProfile = resolveSurfaceProfile(
+    env,
+    publicBaseUrl,
+    gatewayProxyUrlCandidate,
+    gatewayProxyTokenCandidate,
+  );
+  const gatewayProxyUrl = surfaceProfile === "canonical_gateway_proxy" ? gatewayProxyUrlCandidate : undefined;
+  const gatewayProxyToken = surfaceProfile === "canonical_gateway_proxy"
+    ? parseGatewayProxyToken(gatewayProxyTokenCandidate, gatewayProxyUrl)
+    : undefined;
 
   return {
     host,
@@ -261,8 +388,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     skillsEnabled: env.DEVSPACE_SKILLS === undefined ? true : parseBoolean(env.DEVSPACE_SKILLS),
     skillPaths: parsePathList(env.DEVSPACE_SKILL_PATHS),
     agentDir: resolve(expandHomePath(env.DEVSPACE_AGENT_DIR ?? files.config.agentDir ?? defaultAgentDir())),
+    surfaceProfile,
+    protocolMode: parseProtocolMode(env.MCP_PROTOCOL_MODE ?? env.NEXUS_MCP_PROTOCOL_MODE),
     gatewayProxyUrl,
-    gatewayProxyToken: parseGatewayProxyToken(env.NEXUS_GATEWAY_PROXY_TOKEN, gatewayProxyUrl),
+    gatewayProxyToken,
     logging: parseLoggingConfig(env),
   };
 }

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadConfig } from "./config.js";
+import { getSurfaceIdentity, loadConfig } from "./config.js";
 
 const emptyConfigDir = mkdtempSync(join(tmpdir(), "devspace-empty-config-test-"));
 const baseEnv = {
@@ -28,6 +28,18 @@ assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "0" }).skillsEnabled, fal
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "1" }).skillsEnabled, true);
 assert.equal(loadConfig(baseEnv).gatewayProxyUrl, undefined);
 assert.equal(loadConfig(baseEnv).gatewayProxyToken, undefined);
+assert.equal(loadConfig(baseEnv).surfaceProfile, "raw_devspace");
+assert.equal(loadConfig(baseEnv).protocolMode, "dual");
+assert.deepEqual(getSurfaceIdentity(loadConfig(baseEnv)), {
+  surface_profile: "raw_devspace",
+  protocol_mode: "dual",
+  tool_source: "devspace_builtin",
+  observed_manifest_count: null,
+  observed_manifest_revision: null,
+  observed_manifest_sha256: null,
+  proxy_mode: false,
+  gateway_url: null,
+});
 assert.equal(
   loadConfig({
     ...baseEnv,
@@ -43,6 +55,55 @@ assert.equal(
     NEXUS_GATEWAY_PROXY_TOKEN: "gateway-token-that-is-long-enough",
   }).gatewayProxyToken,
   "gateway-token-that-is-long-enough",
+);
+assert.equal(
+  loadConfig({
+    ...baseEnv,
+    NEXUS_MCP_SURFACE_PROFILE: "canonical_gateway_proxy",
+    NEXUS_GATEWAY_PROXY_URL: "https://127.0.0.1:8766",
+    NEXUS_GATEWAY_PROXY_TOKEN: "gateway-token-that-is-long-enough",
+    MCP_PROTOCOL_MODE: "dual",
+  }).surfaceProfile,
+  "canonical_gateway_proxy",
+);
+assert.equal(
+  loadConfig({
+    ...baseEnv,
+    NEXUS_MCP_SURFACE_PROFILE: "canonical_gateway_proxy",
+    NEXUS_GATEWAY_PROXY_URL: "https://127.0.0.1:8766",
+    NEXUS_GATEWAY_PROXY_TOKEN: "gateway-token-that-is-long-enough",
+    MCP_PROTOCOL_MODE: "dual",
+  }).protocolMode,
+  "dual",
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, NEXUS_MCP_SURFACE_PROFILE: "canonical_gateway_proxy" }),
+  /NEXUS_GATEWAY_PROXY_URL is required when canonical gateway proxy surface is selected/,
+);
+assert.throws(
+  () => loadConfig({
+    ...baseEnv,
+    NEXUS_MCP_SURFACE_PROFILE: "raw_devspace",
+    NEXUS_GATEWAY_PROXY_URL: "https://127.0.0.1:8766",
+    NEXUS_GATEWAY_PROXY_TOKEN: "gateway-token-that-is-long-enough",
+  }),
+  /must be unset for the raw_devspace maintenance surface/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_PUBLIC_BASE_URL: "https://public.example.com" }),
+  /NEXUS_GATEWAY_PROXY_URL is required when canonical gateway proxy surface is selected/,
+);
+assert.throws(
+  () => loadConfig({
+    ...baseEnv,
+    DEVSPACE_PUBLIC_BASE_URL: "https://public.example.com",
+    NEXUS_MCP_SURFACE_PROFILE: "raw_devspace",
+  }),
+  /raw_devspace maintenance surface requires a loopback public base URL/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, MCP_PROTOCOL_MODE: "invalid" }),
+  /Invalid MCP_PROTOCOL_MODE: invalid/,
 );
 assert.throws(
   () => loadConfig({ ...baseEnv, NEXUS_GATEWAY_PROXY_URL: "https://127.0.0.1:8766" }),
@@ -164,11 +225,23 @@ assert.equal(loadConfig(baseEnv).publicBaseUrl, "http://127.0.0.1:7676");
 assert.deepEqual(loadConfig(baseEnv).allowedHosts, ["localhost", "127.0.0.1", "::1"]);
 
 assert.equal(
-  loadConfig({ ...baseEnv, DEVSPACE_PUBLIC_BASE_URL: "https://abc.trycloudflare.com/" }).publicBaseUrl,
+  loadConfig({
+    ...baseEnv,
+    DEVSPACE_PUBLIC_BASE_URL: "https://abc.trycloudflare.com/",
+    NEXUS_MCP_SURFACE_PROFILE: "canonical_gateway_proxy",
+    NEXUS_GATEWAY_PROXY_URL: "http://127.0.0.1:8766",
+    NEXUS_GATEWAY_PROXY_TOKEN: "gateway-token-that-is-long-enough",
+  }).publicBaseUrl,
   "https://abc.trycloudflare.com",
 );
 assert.deepEqual(
-  loadConfig({ ...baseEnv, DEVSPACE_PUBLIC_BASE_URL: "https://abc.trycloudflare.com/" }).allowedHosts,
+  loadConfig({
+    ...baseEnv,
+    DEVSPACE_PUBLIC_BASE_URL: "https://abc.trycloudflare.com/",
+    NEXUS_MCP_SURFACE_PROFILE: "canonical_gateway_proxy",
+    NEXUS_GATEWAY_PROXY_URL: "http://127.0.0.1:8766",
+    NEXUS_GATEWAY_PROXY_TOKEN: "gateway-token-that-is-long-enough",
+  }).allowedHosts,
   ["localhost", "127.0.0.1", "::1", "abc.trycloudflare.com"],
 );
 assert.deepEqual(
@@ -192,7 +265,12 @@ writeFileSync(
   }),
 );
 
-const fileConfig = loadConfig({ DEVSPACE_CONFIG_DIR: configDir });
+const fileConfig = loadConfig({
+  DEVSPACE_CONFIG_DIR: configDir,
+  NEXUS_MCP_SURFACE_PROFILE: "canonical_gateway_proxy",
+  NEXUS_GATEWAY_PROXY_URL: "http://127.0.0.1:8766",
+  NEXUS_GATEWAY_PROXY_TOKEN: "gateway-token-that-is-long-enough",
+});
 assert.equal(fileConfig.port, 8787);
 assert.equal(fileConfig.oauth.ownerToken, "persisted-owner-token-long-enough");
 assert.equal(fileConfig.publicBaseUrl, "https://devspace.example.com");

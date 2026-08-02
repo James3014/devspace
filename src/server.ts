@@ -2,13 +2,12 @@ import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { access, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer } from "@modelcontextprotocol/server";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
-import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
+import { toWebRequest } from "@modelcontextprotocol/node";
 import {
   registerAppResource,
   registerAppTool,
@@ -17,13 +16,18 @@ import {
 import express from "express";
 import type { Request, Response } from "express";
 import * as z from "zod/v4";
-import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
+import {
+  getSurfaceIdentity,
+  loadConfig,
+  type ObservedManifestIdentity,
+  type ServerConfig,
+  type WidgetMode,
+} from "./config.js";
 import {
   logEvent,
   requestIp,
   requestPath,
   commandPreview,
-  sessionIdPrefix,
 } from "./logger.js";
 import {
   editFileTool,
@@ -53,9 +57,17 @@ import {
   readCandidateTool,
   readReceiptTool,
 } from "./nexus-git-tools.js";
-import { createNexusGatewayProxyServer } from "./nexus-gateway-proxy.js";
+import {
+  createNexusGatewayProxyServer,
+  fetchNexusGatewayToolManifest,
+  nexusGatewayManifestIdentity,
+  type NexusGatewayToolManifest,
+} from "./nexus-gateway-proxy.js";
+import {
+  createMcpTransportBoundary,
+  extractMcpRequestTraceContext,
+} from "./mcp-transport.js";
 
-type Transport = StreamableHTTPServerTransport;
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
 const WRITE_TOOL_ANNOTATIONS = {
@@ -80,6 +92,7 @@ const SHELL_TOOL_ANNOTATIONS = {
 interface RunningServer {
   app: ReturnType<typeof createMcpExpressApp>;
   config: ServerConfig;
+  close(): Promise<void>;
 }
 
 type ToolContent =
@@ -470,9 +483,13 @@ async function createMcpServer(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
   reviewCheckpoints: ReturnType<typeof createReviewCheckpointManager>,
+  gatewayManifest?: NexusGatewayToolManifest,
 ): Promise<McpServer> {
-  if (config.gatewayProxyUrl) {
-    return await createNexusGatewayProxyServer(config);
+  if (config.surfaceProfile === "canonical_gateway_proxy") {
+    if (!gatewayManifest) {
+      throw new Error("canonical gateway manifest is unavailable; public MCP remains fail-closed");
+    }
+    return await createNexusGatewayProxyServer(config, gatewayManifest);
   }
   const toolNames = toolNamesFor(config);
   const server = new McpServer(
@@ -489,7 +506,7 @@ async function createMcpServer(
   );
 
   registerAppResource(
-    server,
+    server as never,
     "DevSpace Diff Card",
     WORKSPACE_APP_URI,
     {
@@ -520,7 +537,7 @@ async function createMcpServer(
   );
 
   registerAppTool(
-    server,
+    server as never,
     "open_workspace",
     {
       title: "Open workspace",
@@ -654,7 +671,7 @@ async function createMcpServer(
   );
 
   registerAppTool(
-    server,
+    server as never,
     toolNames.read,
     {
       title: "Read file",
@@ -751,7 +768,7 @@ async function createMcpServer(
   );
 
   registerAppTool(
-    server,
+    server as never,
     toolNames.write,
     {
       title: "Write file",
@@ -825,7 +842,7 @@ async function createMcpServer(
   );
 
   registerAppTool(
-    server,
+    server as never,
     toolNames.edit,
     {
       title: "Edit file",
@@ -916,7 +933,7 @@ async function createMcpServer(
 
   if (config.widgets === "changes") {
     registerAppTool(
-      server,
+      server as never,
       "show_changes",
       {
         title: "Show changes",
@@ -980,7 +997,7 @@ async function createMcpServer(
 
   if (!config.minimalTools) {
     registerAppTool(
-      server,
+      server as never,
       toolNames.grep,
       {
         title: config.toolNaming === "short" ? "Grep" : "Grep files",
@@ -1053,7 +1070,7 @@ async function createMcpServer(
     );
 
     registerAppTool(
-      server,
+      server as never,
       toolNames.glob,
       {
         title: config.toolNaming === "short" ? "Glob" : "Find files",
@@ -1123,7 +1140,7 @@ async function createMcpServer(
     );
 
     registerAppTool(
-      server,
+      server as never,
       toolNames.ls,
       {
         title: config.toolNaming === "short" ? "Ls" : "List directory",
@@ -1190,7 +1207,7 @@ async function createMcpServer(
   }
 
   registerAppTool(
-    server,
+    server as never,
     toolNames.shell,
     {
       title: config.toolNaming === "short" ? "Bash" : "Run shell",
@@ -1284,7 +1301,7 @@ async function createMcpServer(
   const NEXUS_READ_ONLY_ANNOTATIONS = { readOnlyHint: true };
 
   registerAppTool(
-    server,
+    server as never,
     "workspace_snapshot",
     {
       title: "Workspace snapshot",
@@ -1319,7 +1336,7 @@ async function createMcpServer(
   );
 
   registerAppTool(
-    server,
+    server as never,
     "search_text",
     {
       title: "Search text",
@@ -1369,7 +1386,7 @@ async function createMcpServer(
   );
 
   registerAppTool(
-    server,
+    server as never,
     "list_tree",
     {
       title: "List tree",
@@ -1409,7 +1426,7 @@ async function createMcpServer(
   );
 
   registerAppTool(
-    server,
+    server as never,
     "git_status",
     {
       title: "Git status",
@@ -1445,7 +1462,7 @@ async function createMcpServer(
   );
 
   registerAppTool(
-    server,
+    server as never,
     "git_diff",
     {
       title: "Git diff",
@@ -1490,7 +1507,7 @@ async function createMcpServer(
   );
 
   registerAppTool(
-    server,
+    server as never,
     "git_log",
     {
       title: "Git log",
@@ -1530,7 +1547,7 @@ async function createMcpServer(
   );
 
   registerAppTool(
-    server,
+    server as never,
     "git_show",
     {
       title: "Git show",
@@ -1567,7 +1584,7 @@ async function createMcpServer(
   );
 
   registerAppTool(
-    server,
+    server as never,
     "git_worktrees",
     {
       title: "Git worktrees",
@@ -1599,7 +1616,7 @@ async function createMcpServer(
   );
 
   registerAppTool(
-    server,
+    server as never,
     "read_task_card",
     {
       title: "Read task card",
@@ -1638,7 +1655,7 @@ async function createMcpServer(
   );
 
   registerAppTool(
-    server,
+    server as never,
     "read_candidate",
     {
       title: "Read candidate",
@@ -1674,7 +1691,7 @@ async function createMcpServer(
   );
 
   registerAppTool(
-    server,
+    server as never,
     "read_receipt",
     {
       title: "Read receipt",
@@ -1752,7 +1769,6 @@ export function createServer(config = loadConfig()): RunningServer {
     host: config.host,
     ...(allowedHosts ? { allowedHosts } : {}),
   });
-  const transports = new Map<string, Transport>();
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
   const oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl);
@@ -1764,6 +1780,33 @@ export function createServer(config = loadConfig()): RunningServer {
   const workspaceStore = createWorkspaceStore(config.stateDir);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
+  let observedManifest: ObservedManifestIdentity | undefined;
+  let manifestError: Error | undefined;
+  const gatewayManifestReady: Promise<NexusGatewayToolManifest | undefined> =
+    config.surfaceProfile === "canonical_gateway_proxy"
+      ? fetchNexusGatewayToolManifest(config)
+          .then((manifest) => {
+            observedManifest = nexusGatewayManifestIdentity(manifest, manifest.revision);
+            return manifest;
+          })
+          .catch((error: unknown) => {
+            manifestError = error instanceof Error ? error : new Error(String(error));
+            return undefined;
+          })
+      : Promise.resolve(undefined);
+  const mcpBoundary = createMcpTransportBoundary(
+    async () => {
+      const gatewayManifest = await gatewayManifestReady;
+      if (manifestError) throw manifestError;
+      return createMcpServer(config, workspaces, reviewCheckpoints, gatewayManifest);
+    },
+    config.protocolMode,
+    (error) => {
+      logEvent(config.logging, "error", "mcp_transport_error", {
+        error: error.message,
+      });
+    },
+  );
 
   if (config.logging.trustProxy) {
     app.set("trust proxy", true);
@@ -1818,20 +1861,26 @@ export function createServer(config = loadConfig()): RunningServer {
     }),
   );
 
-  app.get("/healthz", (_req, res) => {
-    res.json({
-      ok: true,
-      name: config.gatewayProxyUrl ? "nexus-mcp-gateway" : "devspace",
-      proxy_mode: Boolean(config.gatewayProxyUrl),
-      gateway_url: config.gatewayProxyUrl ?? null,
+  app.get("/healthz", async (_req, res) => {
+    await gatewayManifestReady;
+    const identity = getSurfaceIdentity(config, observedManifest);
+    const ready = !manifestError;
+    res.status(ready ? 200 : 503).json({
+      ok: ready,
+      name: identity.proxy_mode ? "nexus-mcp-gateway" : "devspace",
+      ...identity,
+      manifest_status: ready ? (identity.proxy_mode ? "verified" : "not_applicable") : "unavailable",
+      ...(ready ? {} : { disposition: "PUBLIC_SURFACE_FAIL_CLOSED" }),
     });
   });
 
   app.all("/mcp", async (req, res) => {
     const requestId = res.locals.requestId as string | undefined;
-    const sessionId = req.header("mcp-session-id");
-    const initializeRequest = req.method === "POST" && isInitializeRequest(req.body);
 
+    // Process-memory OAuth is intentionally retained in this card. A token
+    // lost on restart receives a typed reauthentication disposition without
+    // weakening the bearer gate or persisting credentials out of scope.
+    res.setHeader("X-Nexus-Auth-Disposition", "REAUTH_REQUIRED");
     await new Promise<void>((resolve, reject) => {
       bearerAuth(req, res, (error?: unknown) => {
         if (error) reject(error);
@@ -1839,6 +1888,7 @@ export function createServer(config = loadConfig()): RunningServer {
       });
     });
     if (res.headersSent) return;
+    res.removeHeader("X-Nexus-Auth-Disposition");
 
     if (!req.auth?.resource || !checkResourceAllowed({ requestedResource: req.auth.resource, configuredResource: resourceServerUrl })) {
       logEvent(config.logging, "warn", "auth_denied", {
@@ -1852,54 +1902,16 @@ export function createServer(config = loadConfig()): RunningServer {
       return;
     }
 
-    logEvent(config.logging, "debug", "mcp_request", {
-      requestId,
-      method: req.method,
-      sessionIdPresent: Boolean(sessionId),
-      sessionIdPrefix: sessionIdPrefix(sessionId),
-      isInitialize: initializeRequest,
-    });
-
     try {
-      let transport: Transport | undefined;
-
-      if (sessionId) {
-        transport = transports.get(sessionId);
-        if (!transport) {
-          sendJsonRpcError(res, 404, -32000, "Unknown MCP session");
-          return;
-        }
-      } else if (initializeRequest) {
-        transport = new StreamableHTTPServerTransport({
-          sessionIdGenerator: () => randomUUID(),
-          onsessioninitialized: (newSessionId) => {
-            if (transport) transports.set(newSessionId, transport);
-            logEvent(config.logging, "info", "mcp_session_created", {
-              requestId,
-              sessionIdPrefix: sessionIdPrefix(newSessionId),
-              ...requestLogFields(req, config),
-            });
-          },
-        });
-
-        transport.onclose = () => {
-          const closedSessionId = transport?.sessionId;
-          if (closedSessionId) {
-            transports.delete(closedSessionId);
-            logEvent(config.logging, "info", "mcp_session_closed", {
-              sessionIdPrefix: sessionIdPrefix(closedSessionId),
-            });
-          }
-        };
-
-        const server = await createMcpServer(config, workspaces, reviewCheckpoints);
-        await server.connect(transport);
-      } else {
-        sendJsonRpcError(res, 400, -32000, "No valid MCP session");
-        return;
-      }
-
-      await transport.handleRequest(req, res, req.body);
+      const webRequest = await toWebRequest(req, req.body);
+      const trace = extractMcpRequestTraceContext(webRequest, req.body, req.auth as never);
+      logEvent(config.logging, "debug", "mcp_request", {
+        requestId,
+        method: req.method,
+        protocolMode: config.protocolMode,
+        ...trace,
+      });
+      await mcpBoundary.node(req, res, req.body);
     } catch (error) {
       logEvent(config.logging, "error", "mcp_request_error", {
         requestId,
@@ -1911,7 +1923,14 @@ export function createServer(config = loadConfig()): RunningServer {
     }
   });
 
-  return { app, config };
+  return {
+    app,
+    config,
+    async close(): Promise<void> {
+      await mcpBoundary.close();
+      workspaceStore.close?.();
+    },
+  };
 }
 
 async function isMainModule(): Promise<boolean> {

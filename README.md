@@ -65,6 +65,45 @@ The public `/mcp` endpoint remains protected by DevSpace OAuth. The backend
 gateway token is only used on the local loopback hop. Health checks identify
 this mode as `nexus-mcp-gateway` and report the configured gateway URL.
 
+The public candidate surface is selected with `NEXUS_MCP_SURFACE_PROFILE`:
+
+```text
+canonical_gateway_proxy   public candidate; requires URL and token
+raw_devspace              explicit loopback/local maintenance only
+```
+
+When the public base URL is non-loopback, DevSpace defaults to
+`canonical_gateway_proxy` and exits before serving if the gateway URL or token
+is missing. A loopback-only process may use the raw surface for local
+maintenance, but it must not be presented as the public Connector surface.
+`MCP_PROTOCOL_MODE` is recorded in the identity and defaults to `dual`; set it
+to `legacy` only for the immediate compatibility rollback, or `modern` for an
+explicit modern-only candidate.
+
+At startup proxy mode fetches the canonical `tools/list` response, rejects raw
+DevSpace names such as `write`, `edit`, and `shell`, preserves only the
+canonical dynamic manifest, orders it deterministically, and records its
+observed count, revision, and SHA-256. The expected current count is not
+hard-coded in DevSpace.
+
+Build identity keeps `tool_surface` and `tool_count` bound to the embedded raw
+DevSpace registry for workspace snapshot compatibility. The configured runtime
+boundary is reported separately as `effective_tool_surface`,
+`effective_tool_count`, `surface_profile`, and the observed manifest identity;
+public proxy claims must use those effective and observed fields.
+
+Rollback for local maintenance is explicit and loopback-only:
+
+```bash
+export NEXUS_MCP_SURFACE_PROFILE=raw_devspace
+unset NEXUS_GATEWAY_PROXY_URL NEXUS_GATEWAY_PROXY_TOKEN
+```
+
+Do not use that rollback profile for the public tunnel. To return to the
+canonical public candidate, set
+`NEXUS_MCP_SURFACE_PROFILE=canonical_gateway_proxy` and provide both gateway
+settings; a missing setting is a fail-closed startup error.
+
 When the client connects, DevSpace opens an Owner password approval page. Enter
 the Owner password printed by `devspace init`. It is also stored in:
 
