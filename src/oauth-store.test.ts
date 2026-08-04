@@ -7,6 +7,7 @@ import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/sdk/
 import { databasePath, openDatabase } from "./db/client.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
+import { SqliteWorkspaceStore } from "./workspace-store.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-oauth-test-"));
 const oauthConfig = {
@@ -57,19 +58,23 @@ function testConversationBootstrapMigration(stateDir: string): void {
     initial.close();
   }
 
-  const migrated = openDatabase(stateDir);
+  const migrated = new SqliteWorkspaceStore(stateDir);
   try {
     assert.deepEqual(
-      migrated.sqlite.prepare(`
-        select conversation_scope_id, project_key, created_at, last_used_at
-        from workspace_conversation_bootstraps
-      `).all(),
-      [{
-        conversation_scope_id: "chat-existing",
-        project_key: "/tmp/project",
-        created_at: "2026-01-01T00:00:00.000Z",
-        last_used_at: "2026-01-02T00:00:00.000Z",
-      }],
+      {
+        existingProjectAlreadyClaimed: migrated.claimConversationBootstrap(
+          "chat-existing",
+          "/tmp/project",
+        ),
+        newProjectCanClaim: migrated.claimConversationBootstrap(
+          "chat-existing",
+          "/tmp/other-project",
+        ),
+      },
+      {
+        existingProjectAlreadyClaimed: false,
+        newProjectCanClaim: true,
+      },
     );
   } finally {
     migrated.close();
