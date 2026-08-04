@@ -17,8 +17,8 @@ The model-facing workflow is workspace based. MCP clients should call
 `open_workspace` once per local project directory or worktree, then reuse the
 returned `workspaceId` for subsequent tool calls in that same folder. Do not
 call `open_workspace` again for the same folder unless the `workspaceId` is
-rejected as unknown, the client switches folders/worktrees or checkout/worktree
-mode, or the user explicitly asks to reopen. `AGENTS.md` files are returned
+rejected as unknown or the client switches folders/worktrees or checkout/worktree
+mode. `AGENTS.md` files are returned
 automatically by `open_workspace` and by later tool calls when the requested path
 enters a directory with instructions that have not been loaded for that
 workspace.
