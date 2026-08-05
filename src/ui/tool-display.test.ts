@@ -6,7 +6,7 @@ import { getToolDisplay, getToolHeaderSummary } from "./tool-display.js";
 const displayCases: Array<[ToolResultCard, { title: string; tone: string }]> = [
   [{ tool: "open_workspace", root: "/tmp/project" }, { title: "Opened workspace", tone: "workspace" }],
   [{ tool: "open_workspace", root: "/tmp/project", workspaceReused: true }, { title: "Reused workspace", tone: "workspace" }],
-  [{ tool: "open_workspace", root: "/tmp/project", mode: "worktree" }, { title: "Opened worktree", tone: "workspace" }],
+  [{ tool: "open_workspace", root: "/tmp/project", mode: "worktree" }, { title: "Opened workspace", tone: "workspace" }],
   [{ tool: "read", path: "src/read.ts" }, { title: "Read file", tone: "read" }],
   [{ tool: "write", path: "src/write.ts" }, { title: "Wrote file", tone: "write" }],
   [{ tool: "edit", path: "src/edit.ts" }, { title: "Edited file", tone: "edit" }],
@@ -28,6 +28,10 @@ for (const [card, expected] of displayCases) {
 
 assert.equal(getToolDisplay({ tool: "open_workspace", root: "/tmp/project" }).label, "/tmp/project");
 assert.equal(
+  getToolDisplay({ tool: "open_workspace", root: "/tmp/project", mode: "worktree" }).icon,
+  toolIcons.gitBranch,
+);
+assert.equal(
   getToolDisplay({ tool: "grep", summary: { pattern: "needle", scope: "src" } }).label,
   "needle in src",
 );
@@ -36,19 +40,19 @@ assert.deepEqual(
   pickDisplay(getToolDisplay({
     tool: "show_changes",
     files: [
-      { path: "src/a.ts", operation: "update" },
-      { path: "src/b.ts", operation: "update" },
+      { path: "src/a.ts", type: "change", additions: 1, removals: 1 },
+      { path: "src/b.ts", type: "change", additions: 2, removals: 0 },
     ],
   })),
-  { title: "Edited 2 files", tone: "review" },
+  { title: "Changed 2 files", tone: "review" },
 );
 
 assert.deepEqual(
   pickDisplay(getToolDisplay({
     tool: "show_changes",
     files: [
-      { path: "src/a.ts", operation: "add" },
-      { path: "src/b.ts", operation: "update" },
+      { path: "src/a.ts", type: "new", additions: 2, removals: 0 },
+      { path: "src/b.ts", type: "change", additions: 1, removals: 1 },
     ],
   })),
   { title: "Changed 2 files", tone: "review" },
@@ -95,7 +99,28 @@ assert.deepEqual(
     tool: "open_workspace",
     summary: { mode: "worktree", agentsFiles: 1, skills: 4 },
   }),
-  { kind: "text", text: "worktree · 1 instruction · 4 skills" },
+  { kind: "text", text: "1 instruction · 4 skills" },
+);
+assert.deepEqual(
+  getToolHeaderSummary({
+    tool: "open_workspace",
+    agentsFiles: [{ path: "AGENTS.md" }],
+    skills: [{ name: "frontend" }, { name: "testing" }],
+  }),
+  { kind: "text", text: "1 instruction · 2 skills" },
+);
+
+assert.equal(
+  getToolDisplay({ tool: "show_changes" }).title,
+  "No changes",
+);
+assert.equal(
+  getToolDisplay({
+    tool: "show_changes",
+    summary: { files: 3 },
+    files: [{ path: "src/only-one.ts", type: "change" }],
+  }).title,
+  "Changed 3 files",
 );
 
 assert.deepEqual(

@@ -914,8 +914,6 @@ export function createMcpServer(
             skills: cardSkills,
             agentProviders: cardAgentProviders,
             agents: cardAgents,
-            skillDiagnostics: workspace.skillDiagnostics,
-            instruction: cardInstruction,
             summary: {
               mode: workspace.mode,
               agentsFiles: cardAgentsFiles.length,
@@ -923,7 +921,6 @@ export function createMcpServer(
               skills: cardSkills.length,
               agentProviders: cardAgentProviders.length,
               agents: cardAgents.length,
-              skillDiagnostics: workspace.skillDiagnostics.length,
             },
           },
         },

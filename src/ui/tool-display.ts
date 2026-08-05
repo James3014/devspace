@@ -15,6 +15,7 @@ export interface ToolDisplay {
   title: string;
   label?: string;
   tone: string;
+  iconLabel?: string;
 }
 
 export type ToolHeaderSummary =
@@ -26,14 +27,11 @@ export function getToolDisplay(card: ToolResultCard): ToolDisplay {
   switch (card.tool) {
     case "open_workspace":
       return {
-        icon: toolIcons.folderOpen,
-        title: card.workspaceReused
-          ? "Reused workspace"
-          : card.mode === "worktree"
-            ? "Opened worktree"
-            : "Opened workspace",
+        icon: card.mode === "worktree" ? toolIcons.gitBranch : toolIcons.folderOpen,
+        title: card.workspaceReused ? "Reused workspace" : "Opened workspace",
         label: card.root ?? card.path,
         tone: "workspace",
+        iconLabel: card.mode === "worktree" ? "Worktree workspace" : "Checkout workspace",
       };
     case "read":
       return {
@@ -103,10 +101,10 @@ export function getToolDisplay(card: ToolResultCard): ToolDisplay {
         tone: "shell",
       };
     case "show_changes": {
-      const display = getPatchDisplayParts(card);
+      const fileCount = summaryNumber(card.summary, "files") ?? card.files?.length ?? 0;
       return {
         icon: toolIcons.diff,
-        title: (card.files?.length ?? 0) > 0 ? display.title : "No changes",
+        title: fileCount > 0 ? `Changed ${fileCount} ${fileNoun(fileCount)}` : "No changes",
         tone: "review",
       };
     }
@@ -125,10 +123,11 @@ export function getToolHeaderSummary(card: ToolResultCard): ToolHeaderSummary {
   }
 
   if (card.tool === "open_workspace") {
+    const instructionCount = summaryNumber(summary, "agentsFiles") ?? card.agentsFiles?.length;
+    const skillCount = summaryNumber(summary, "skills") ?? card.skills?.length;
     const parts = [
-      typeof summary.mode === "string" ? summary.mode : undefined,
-      countLabel(summaryNumber(summary, "agentsFiles"), "instruction"),
-      countLabel(summaryNumber(summary, "skills"), "skill"),
+      countLabel(instructionCount, "instruction"),
+      countLabel(skillCount, "skill"),
     ].filter((part): part is string => Boolean(part));
     return parts.length > 0 ? { kind: "text", text: parts.join(" · ") } : { kind: "empty" };
   }
@@ -194,6 +193,10 @@ function processLabel(card: ToolResultCard): string | undefined {
 function countLabel(count: number | undefined, noun: string): string | undefined {
   if (count === undefined) return undefined;
   return `${count} ${noun}${count === 1 ? "" : "s"}`;
+}
+
+function fileNoun(count: number): "file" | "files" {
+  return count === 1 ? "file" : "files";
 }
 
 function durationLabel(durationMs: number | undefined): string | undefined {

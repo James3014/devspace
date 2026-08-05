@@ -11,20 +11,27 @@ import {
   isPatchTool,
   isReadTool,
   isReviewTool,
+  shouldAutoExpandCard,
   isToolName,
   isToolResultCard,
   isWriteTool,
   payloadText,
+  summaryNumber,
   type HostContext,
   type ToolName,
   type ToolResultCard,
 } from "./card-types.js";
-import { renderIcon, toolIcons } from "./icons.js";
+import { renderIcon, toolIcons, type ToolIcon } from "./icons.js";
 import {
   getToolDisplay,
   getToolHeaderSummary,
   type ToolDisplay,
 } from "./tool-display.js";
+import {
+  toggleWorkspaceDisclosure,
+  toggleWorkspaceDocument,
+  type WorkspaceDisclosureKey,
+} from "./workspace-disclosures.js";
 import "./workspace-app.css";
 
 interface MountedPayload {
@@ -47,6 +54,8 @@ let reviewFilesExpanded = false;
 let errorMessage: string | null = null;
 let currentPayload: MountedPayload | null = null;
 let currentPayloadContainer: HTMLElement | null = null;
+let openWorkspaceDisclosures = new Set<WorkspaceDisclosureKey>();
+let openWorkspaceDocuments = new Set<string>();
 
 const maybeAppRoot = document.querySelector<HTMLElement>("#app");
 
@@ -67,11 +76,7 @@ async function boot(): Promise<void> {
   );
 
   app.ontoolresult = (result) => {
-    const structuredContent = getStructuredContent<Partial<ToolResultCard>>(result);
-    const metaCard = cardFromMeta(result);
-    const structured = metaCard
-      ? { ...structuredContent, ...metaCard }
-      : structuredContent;
+    const structured = cardForUi(result);
     const tool = toolNameFromMeta(result);
 
     if (!tool || !isToolResultCard(structured)) {
@@ -84,8 +89,12 @@ async function boot(): Promise<void> {
     }
 
     const nextCard = { ...structured, tool };
+    if (!isSameWorkspaceCard(card, nextCard)) {
+      openWorkspaceDisclosures = new Set();
+      openWorkspaceDocuments = new Set();
+    }
     card = nextCard;
-    expanded = isReviewTool(tool) && isExpandableCard(nextCard);
+    expanded = shouldAutoExpandCard(nextCard);
     reviewFilesExpanded = false;
     errorMessage = null;
     render();
@@ -161,7 +170,15 @@ function render(): void {
 
   const expandable = isExpandableCard(card);
   const main = element("main", { className: "shell" });
-  const section = element("section", { className: `tool-card ${display.tone}` });
+  const stateClass = cardStateClass(card);
+  const section = element("section", {
+    className: [
+      "tool-card",
+      display.tone,
+      card.mode === "worktree" ? "worktree" : undefined,
+      stateClass,
+    ].filter(Boolean).join(" "),
+  });
   const button = element("button", {
     className: "tool-header",
     type: "button",
@@ -177,6 +194,11 @@ function render(): void {
   }
 
   const icon = element("span", { className: "tool-icon", ariaHidden: "true" });
+  if (display.iconLabel) {
+    icon.setAttribute("role", "img");
+    icon.setAttribute("aria-label", display.iconLabel);
+    icon.removeAttribute("aria-hidden");
+  }
   icon.append(renderIcon(display.icon));
 
   const toolMain = element("span", { className: "tool-main" });
@@ -215,6 +237,16 @@ function renderEmpty(message: string, tone: "muted" | "error" = "muted"): void {
   appRoot.replaceChildren(main);
 }
 
+function cardStateClass(card: ToolResultCard): "running" | "failed" | undefined {
+  if (card.tool !== "bash" && card.tool !== "exec_command" && card.tool !== "write_stdin") {
+    return undefined;
+  }
+  if (card.summary?.running === true) return "running";
+
+  const exitCode = summaryNumber(card.summary, "exitCode");
+  return exitCode !== undefined && exitCode !== 0 ? "failed" : undefined;
+}
+
 async function renderPayloadIfNeeded(): Promise<void> {
   if (!card || !currentPayloadContainer || !expanded) return;
 
@@ -226,7 +258,7 @@ async function renderPayloadIfNeeded(): Promise<void> {
   }
 
   if (card.tool === "open_workspace") {
-    renderPrePayload(target, workspacePayloadText(card), "open_workspace");
+    renderWorkspacePayload(target, card);
     return;
   }
 
@@ -324,7 +356,10 @@ function renderPrePayload(
   tool: string,
 ): void {
   unmountCurrentPayload();
-  container.replaceChildren(element("pre", { className: `text-payload ${tool}`, text }));
+  container.replaceChildren(element("pre", {
+    className: `text-payload pretty-scrollbar ${tool}`,
+    text,
+  }));
 }
 
 function renderHeaderSummary(card: ToolResultCard): HTMLElement {
@@ -445,94 +480,213 @@ function setPayloadLoading(container: HTMLElement, loading: boolean): void {
   if (button) button.setAttribute("aria-busy", String(loading));
 }
 
-function workspacePayloadText(card: ToolResultCard): string {
+function renderWorkspacePayload(container: HTMLElement, card: ToolResultCard): void {
+  unmountCurrentPayload();
+
+  const details = element("div", { className: "workspace-disclosures" });
+
   const agentsFiles = card.agentsFiles ?? [];
   const availableAgentsFiles = card.availableAgentsFiles ?? [];
-  const skills = card.skills ?? [];
-  const agentProviders = card.agentProviders ?? [];
-  const agents = card.agents ?? [];
-  const diagnostics = card.skillDiagnostics ?? [];
-  const lines = [
-    card.workspaceId ? `Workspace: ${card.workspaceId}` : undefined,
-    card.root ? `Root: ${card.root}` : undefined,
-    card.mode ? `Mode: ${card.mode}` : undefined,
-    card.sourceRoot ? `Source root: ${card.sourceRoot}` : undefined,
-    card.worktree ? formatWorktree(card.worktree) : undefined,
-    skills.length > 0
-      ? `Skills: ${skills.map((skill) => skill.name ?? skill.path ?? "unnamed").join(", ")}`
-      : "Skills: none",
-    agentProviders.length > 0
-      ? `Agent providers: ${agentProviders.map(formatAgentProvider).join(", ")}`
-      : undefined,
-    agents.length > 0
-      ? `Agents: ${agents.map(formatAgent).join(", ")}`
-      : undefined,
-    diagnostics.length > 0
-      ? `Skill diagnostics: ${diagnostics.map(formatDiagnostic).join("; ")}`
-      : undefined,
-    availableAgentsFiles.length > 0
-      ? `Nested instructions: ${availableAgentsFiles.map((file) => file.path ?? "unknown").join(", ")}`
-      : undefined,
-    agentsFiles.length > 0
-      ? `\n${formatAgentsFilesForPayload(agentsFiles)}`
-      : "\nAGENTS.md: none loaded",
-    card.instruction ? `\nInstruction: ${card.instruction}` : undefined,
-  ].filter((line): line is string => typeof line === "string");
-
-  return lines.join("\n");
-}
-
-function formatWorktree(worktree: NonNullable<ToolResultCard["worktree"]>): string {
-  const details = [
-    worktree.baseRef ? `base ${worktree.baseRef}` : undefined,
-    worktree.baseSha ? `at ${worktree.baseSha.slice(0, 12)}` : undefined,
-    worktree.managed === true ? "managed" : undefined,
-    worktree.detached === true ? "detached" : undefined,
-    worktree.dirtySource === true ? "dirty source" : undefined,
-  ].filter((detail): detail is string => Boolean(detail));
-  return `Worktree: ${worktree.path ?? "unknown"}${details.length > 0 ? ` (${details.join(", ")})` : ""}`;
-}
-
-function formatAgentProvider(
-  provider: NonNullable<ToolResultCard["agentProviders"]>[number],
-): string {
-  const name = provider.name ?? "unknown";
-  if (provider.available !== false) return name;
-  return provider.reason ? `${name} unavailable: ${provider.reason}` : `${name} unavailable`;
-}
-
-function formatAgent(agent: NonNullable<ToolResultCard["agents"]>[number]): string {
-  const details = [
-    agent.provider,
-    agent.model,
-    agent.thinking ? `thinking ${agent.thinking}` : undefined,
-    agent.providerAvailable === false
-      ? agent.providerUnavailableReason ?? "provider unavailable"
-      : undefined,
-  ].filter((detail): detail is string => Boolean(detail));
-  return `${agent.name ?? "unnamed"}${details.length > 0 ? ` (${details.join(", ")})` : ""}`;
-}
-
-function formatDiagnostic(diagnostic: unknown): string {
-  if (typeof diagnostic === "string") return diagnostic;
-  if (diagnostic instanceof Error) return diagnostic.message;
-  try {
-    return JSON.stringify(diagnostic) ?? String(diagnostic);
-  } catch {
-    return String(diagnostic);
+  if (agentsFiles.length > 0 || availableAgentsFiles.length > 0) {
+    details.append(renderWorkspaceInstructions(agentsFiles, availableAgentsFiles));
   }
+
+  const skills = card.skills ?? [];
+  if (skills.length > 0) {
+    details.append(renderWorkspaceSkills(skills));
+  }
+
+  const agents = card.agents ?? [];
+  const providers = card.agentProviders ?? [];
+  if (agents.length > 0 || providers.length > 0) {
+    details.append(renderWorkspaceAgents(agents, providers));
+  }
+
+  container.replaceChildren(details);
 }
 
-function formatAgentsFilesForPayload(
-  agentsFiles: NonNullable<ToolResultCard["agentsFiles"]>,
-): string {
-  return agentsFiles
-    .map((file) => {
-      const path = file.path ?? "AGENTS.md";
-      const content = file.content?.trim();
-      return content ? `${path}\n\n${content}` : `${path}\n\nNo content loaded.`;
-    })
-    .join("\n\n");
+function renderWorkspaceInfoRow(
+  icon: ToolIcon,
+  label: string,
+  value: string,
+  action?: HTMLElement,
+): HTMLElement {
+  const row = element("div", {
+    className: "workspace-info-row",
+  });
+  const iconNode = element("span", { className: "workspace-info-icon", ariaHidden: "true" });
+  iconNode.append(renderIcon(icon));
+  const valueGroup = element("span", { className: "workspace-info-value-group" });
+  valueGroup.append(element("code", { className: "workspace-info-value", text: value, title: value }));
+  if (action) valueGroup.append(action);
+  row.append(
+    iconNode,
+    element("span", { className: "workspace-info-label", text: label }),
+    valueGroup,
+  );
+  return row;
+}
+
+function renderWorkspaceInstructions(
+  loaded: NonNullable<ToolResultCard["agentsFiles"]>,
+  available: NonNullable<ToolResultCard["availableAgentsFiles"]>,
+): HTMLElement {
+  const body = element("div", { className: "workspace-disclosure-body" });
+  const fileList = element("div", { className: "workspace-file-list pretty-scrollbar" });
+
+  for (const [index, file] of loaded.entries()) {
+    const item = element("div", { className: "workspace-file-item" });
+    const path = file.path ?? "AGENTS.md";
+    const content = file.content?.trim();
+    if (content) {
+      const documentKey = `${index}:${path}`;
+      const documentId = workspaceDocumentId(path, index);
+      const open = openWorkspaceDocuments.has(documentKey);
+      const toggle = element("button", {
+        className: "workspace-document-toggle",
+        type: "button",
+        text: "View",
+        ariaExpanded: String(open),
+      });
+      toggle.setAttribute("aria-controls", documentId);
+      const pre = element("pre", { className: "workspace-document pretty-scrollbar", text: content });
+      pre.id = documentId;
+      pre.hidden = !open;
+      pre.setAttribute("role", "region");
+      toggle.addEventListener("click", (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        openWorkspaceDocuments = toggleWorkspaceDocument(openWorkspaceDocuments, documentKey);
+        const nextOpen = openWorkspaceDocuments.has(documentKey);
+        toggle.setAttribute("aria-expanded", String(nextOpen));
+        pre.hidden = !nextOpen;
+      });
+      item.append(
+        renderWorkspaceInfoRow(toolIcons.instructions, "Loaded", path, toggle),
+        pre,
+      );
+    } else {
+      item.append(renderWorkspaceInfoRow(toolIcons.instructions, "Loaded", path));
+    }
+    fileList.append(item);
+  }
+
+  for (const file of available) {
+    fileList.append(renderWorkspaceInfoRow(
+      toolIcons.instructions,
+      "Available",
+      file.path ?? "AGENTS.md",
+    ));
+  }
+
+  body.append(fileList);
+  return renderWorkspaceDisclosure(
+    "Instructions",
+    `${loaded.length} loaded${available.length > 0 ? ` · ${available.length} available` : ""}`,
+    body,
+    "instructions",
+  );
+}
+
+function workspaceDocumentId(path: string, index: number): string {
+  const safePath = path.replace(/[^a-zA-Z0-9_-]+/g, "-");
+  return `workspace-document-${index}-${safePath}`;
+}
+
+function renderWorkspaceSkills(
+  skills: NonNullable<ToolResultCard["skills"]>,
+): HTMLElement {
+  const body = element("div", { className: "workspace-disclosure-body" });
+  const list = element("div", { className: "workspace-chip-list pretty-scrollbar" });
+  for (const skill of skills) {
+    const name = skill.name ?? skill.path ?? "Unnamed skill";
+    list.append(element("span", { className: "workspace-chip", text: name, title: skill.description ?? name }));
+  }
+  body.append(list);
+  return renderWorkspaceDisclosure("Skills", `${skills.length} available`, body, "skills");
+}
+
+function renderWorkspaceAgents(
+  agents: NonNullable<ToolResultCard["agents"]>,
+  providers: NonNullable<ToolResultCard["agentProviders"]>,
+): HTMLElement {
+  const body = element("div", { className: "workspace-disclosure-body workspace-agent-list" });
+  for (const provider of providers) {
+    body.append(renderWorkspaceInfoRow(
+      provider.available === false ? toolIcons.alert : toolIcons.check,
+      "Provider",
+      provider.name ?? "Unknown provider",
+    ));
+  }
+  for (const agent of agents) {
+    body.append(renderWorkspaceInfoRow(
+      agent.providerAvailable === false ? toolIcons.alert : toolIcons.agents,
+      "Agent",
+      agent.name ?? "Unnamed agent",
+    ));
+  }
+  return renderWorkspaceDisclosure(
+    "Agents",
+    `${agents.length} agents · ${providers.length} providers`,
+    body,
+    "agents",
+  );
+}
+
+function renderWorkspaceDisclosure(
+  title: string,
+  summaryText: string,
+  body: HTMLElement,
+  key: WorkspaceDisclosureKey,
+): HTMLElement {
+  const open = openWorkspaceDisclosures.has(key);
+  const disclosure = element("section", {
+    className: `workspace-disclosure${open ? " open" : ""}`,
+  });
+  const summary = element("button", {
+    className: "workspace-disclosure-summary",
+    type: "button",
+    ariaExpanded: String(open),
+  });
+  const bodyId = `workspace-disclosure-${key}`;
+  body.id = bodyId;
+  body.hidden = !open;
+  body.setAttribute("role", "region");
+  summary.setAttribute("aria-controls", bodyId);
+  const chevron = element("span", { className: "workspace-disclosure-chevron", ariaHidden: "true" });
+  chevron.append(renderIcon(toolIcons.chevronRight));
+  summary.append(
+    element("span", { className: "workspace-disclosure-title", text: title }),
+    element("span", { className: "workspace-disclosure-count", text: summaryText }),
+    chevron,
+  );
+  summary.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    openWorkspaceDisclosures = toggleWorkspaceDisclosure(openWorkspaceDisclosures, key);
+    const nextOpen = openWorkspaceDisclosures.has(key);
+    disclosure.classList.toggle("open", nextOpen);
+    summary.setAttribute("aria-expanded", String(nextOpen));
+    body.hidden = !nextOpen;
+  });
+  disclosure.append(summary, body);
+  return disclosure;
+}
+
+function workspaceCardIdentity(
+  value: { tool?: ToolName; workspaceId?: string; root?: string; path?: string } | null,
+): string | undefined {
+  if (value?.tool !== "open_workspace") return undefined;
+  return value.workspaceId ?? value.root ?? value.path;
+}
+
+function isSameWorkspaceCard(
+  previous: { tool?: ToolName; workspaceId?: string; root?: string; path?: string } | null,
+  next: { tool?: ToolName; workspaceId?: string; root?: string; path?: string },
+): boolean {
+  const previousIdentity = workspaceCardIdentity(previous);
+  const nextIdentity = workspaceCardIdentity(next);
+  return previousIdentity !== undefined && previousIdentity === nextIdentity;
 }
 
 function toolNameFromMeta(result: CallToolResult): ToolName | undefined {
@@ -544,11 +698,35 @@ function toolNameFromMeta(result: CallToolResult): ToolName | undefined {
 function cardFromMeta(result: CallToolResult): Partial<ToolResultCard> | undefined {
   const meta = result._meta as Record<string, unknown> | undefined;
   const metaCard = meta?.card;
-  return metaCard && typeof metaCard === "object" ? metaCard : undefined;
+  return metaCard && typeof metaCard === "object"
+    ? metaCard as Partial<ToolResultCard>
+    : undefined;
 }
 
 function getStructuredContent<T>(result: CallToolResult): T | undefined {
   return result.structuredContent as T | undefined;
+}
+
+function cardForUi(result: CallToolResult): Partial<ToolResultCard> | undefined {
+  // Model-facing workspace context is intentionally kept out of the card
+  // projection. In particular, diagnostics and instructions can be large or
+  // actionable for the model but are not user-facing card content.
+  const source = cardFromMeta(result) ?? getStructuredContent<Partial<ToolResultCard>>(result);
+  if (!source) return undefined;
+
+  const uiCard = { ...source } as Partial<ToolResultCard> & Record<string, unknown>;
+  delete uiCard.skillDiagnostics;
+  delete uiCard.diagnostics;
+  delete uiCard.instruction;
+
+  if (uiCard.summary && typeof uiCard.summary === "object") {
+    const summary = { ...uiCard.summary } as Record<string, unknown>;
+    delete summary.skillDiagnostics;
+    delete summary.diagnostics;
+    uiCard.summary = summary;
+  }
+
+  return uiCard;
 }
 
 function element<K extends keyof HTMLElementTagNameMap>(
@@ -575,4 +753,3 @@ function element<K extends keyof HTMLElementTagNameMap>(
   }
   return node;
 }
-

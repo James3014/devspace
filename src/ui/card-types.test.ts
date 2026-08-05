@@ -5,6 +5,7 @@ import {
   isExpandableCard,
   isPatchTool,
   isShellTool,
+  shouldAutoExpandCard,
   isToolName,
 } from "./card-types.js";
 
@@ -29,6 +30,31 @@ test("a patch card expands only when it contains patch content", () => {
     true,
   );
   assert.equal(isExpandableCard({ tool: "apply_patch" }), false);
+});
+
+test("single-file mutation cards open their result immediately", () => {
+  assert.equal(
+    shouldAutoExpandCard({
+      tool: "apply_patch",
+      files: [{ path: "src/one.ts", operation: "update" }],
+      payload: { patch: "diff --git a/src/one.ts b/src/one.ts" },
+    }),
+    true,
+  );
+  assert.equal(
+    shouldAutoExpandCard({
+      tool: "apply_patch",
+      files: [
+        { path: "src/one.ts", operation: "update" },
+        { path: "src/two.ts", operation: "update" },
+      ],
+      payload: { patch: "diff --git a/src/one.ts b/src/one.ts" },
+    }),
+    false,
+  );
+  assert.equal(shouldAutoExpandCard({ tool: "write", payload: { patch: "diff" } }), true);
+  assert.equal(shouldAutoExpandCard({ tool: "edit", payload: { diff: "diff" } }), true);
+  assert.equal(shouldAutoExpandCard({ tool: "read", payload: { content: [] } }), false);
 });
 
 test("a workspace card expands when it contains provider metadata", () => {
@@ -63,4 +89,18 @@ test("a workspace card expands when it contains available instruction files", ()
 
 test("an empty workspace card stays collapsed", () => {
   assert.equal(isExpandableCard({ tool: "open_workspace" }), false);
+});
+
+test("workspace source metadata alone does not create an empty expandable panel", () => {
+  assert.equal(
+    isExpandableCard({ tool: "open_workspace", worktree: { path: "/tmp/worktree" } }),
+    false,
+  );
+});
+
+test("workspace diagnostics do not make a card expandable", () => {
+  assert.equal(
+    isExpandableCard({ tool: "open_workspace", summary: { skillDiagnostics: 3 } }),
+    false,
+  );
 });
