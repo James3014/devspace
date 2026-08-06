@@ -4,7 +4,11 @@ import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Response } from "express";
-import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import {
+  InvalidGrantError,
+  InvalidRequestError,
+  InvalidTokenError,
+} from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { databasePath, openDatabase } from "./db/client.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
@@ -223,11 +227,13 @@ async function testClientRegistrationRecovery(stateDir: string): Promise<void> {
       scopes: ["devspace"],
       resource: mcpUrl,
     };
+    const rejectedResponse = authorizationResponse("wrong-owner-token");
     await recoveredProvider.authorize(
       recovered,
       params,
-      authorizationResponse("wrong-owner-token"),
+      rejectedResponse,
     );
+    assert.equal(rejectedResponse.statusCode, 401);
 
     const afterRejectedApproval = new SqliteOAuthStore(emptyStateDir);
     assert.equal(afterRejectedApproval.getClient(client.client_id), undefined);
@@ -246,6 +252,14 @@ async function testClientRegistrationRecovery(stateDir: string): Promise<void> {
     const afterApproval = new SqliteOAuthStore(emptyStateDir);
     assert.equal(afterApproval.getClient(client.client_id)?.client_name, "ChatGPT");
     afterApproval.close();
+
+    const policyStore = new SqliteOAuthStore(join(stateDir, "restore-policy"));
+    assert.throws(
+      () => policyStore.restoreClient(recovered, ["example.com"]),
+      InvalidRequestError,
+    );
+    assert.equal(policyStore.getClient(client.client_id), undefined);
+    policyStore.close();
   } finally {
     recoveredProvider.close();
   }
@@ -260,6 +274,23 @@ async function testClientRegistrationRecovery(stateDir: string): Promise<void> {
   } finally {
     changedPolicyProvider.close();
   }
+
+  const oversizedProvider = new SingleUserOAuthProvider(
+    oauthConfig,
+    mcpUrl,
+    join(stateDir, "oversized"),
+  );
+  try {
+    assert.throws(
+      () => oversizedProvider.clientsStore.registerClient?.({
+        redirect_uris: [redirectUri],
+        client_name: "x".repeat(5000),
+      }),
+      InvalidRequestError,
+    );
+  } finally {
+    oversizedProvider.close();
+  }
 }
 
 function authorizationResponse(
@@ -268,7 +299,9 @@ function authorizationResponse(
 ): Response {
   const response = {
     req: { method: "POST", body: { owner_token: ownerToken } },
-    status() {
+    statusCode: 200,
+    status(code: number) {
+      response.statusCode = code;
       return response;
     },
     setHeader() {
@@ -277,7 +310,8 @@ function authorizationResponse(
     send() {
       return response;
     },
-    redirect(_status: number, location: string) {
+    redirect(status: number, location: string) {
+      response.statusCode = status;
       onRedirect?.(location);
     },
   };

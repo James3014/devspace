@@ -74,19 +74,32 @@ export class SqliteOAuthStore {
       grant_types: client.grant_types ?? ["authorization_code", "refresh_token"],
       response_types: client.response_types ?? ["code"],
     };
-    const registered: OAuthClientInformationFull = {
-      ...registration,
-      client_id:
-        createRecoverableClientId(registration, clientRegistrationKey) ??
-        `devspace-${randomUUID()}`,
-    };
+    const recoverable = createRecoverableClientId(registration, clientRegistrationKey);
+    if (recoverable.kind === "too_large") {
+      throw new InvalidRequestError(
+        `Client registration is too large for a recoverable client identifier (${recoverable.length} > ${recoverable.maxLength})`,
+      );
+    }
+
+    const registered: OAuthClientInformationFull = recoverable.kind === "recoverable"
+      ? {
+          ...recoverable.registration,
+          client_id: recoverable.clientId,
+        }
+      : {
+          ...registration,
+          client_id: `devspace-${randomUUID()}`,
+        };
 
     this.saveClient(registered);
 
     return registered;
   }
 
-  restoreClient(client: OAuthClientInformationFull): void {
+  restoreClient(client: OAuthClientInformationFull, allowedRedirectHosts: string[]): void {
+    if (!client.redirect_uris.every((uri) => redirectHostAllowed(String(uri), allowedRedirectHosts))) {
+      throw new InvalidRequestError("Client redirect_uri is not allowed for this DevSpace server");
+    }
     this.saveClient(client);
   }
 

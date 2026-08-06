@@ -14,8 +14,10 @@ const client = {
   response_types: ["code"],
 };
 
-const clientId = createRecoverableClientId(client, signingKey);
-assert.ok(clientId);
+const created = createRecoverableClientId(client, signingKey);
+assert.equal(created.kind, "recoverable");
+if (created.kind !== "recoverable") throw new Error("Expected recoverable client ID");
+const clientId = created.clientId;
 assert.match(clientId, /^devspace-v1\./);
 
 const recovered = recoverClientRegistration(clientId, signingKey);
@@ -37,8 +39,13 @@ assert.equal(
 );
 assert.equal(recoverClientRegistration(clientId, `${signingKey}-wrong`), undefined);
 assert.equal(recoverClientRegistration(`devspace-v1.${"x".repeat(5000)}.signature`, signingKey), undefined);
-
 assert.equal(
+  recoverClientRegistration("devspace-0b3f9c1e-2d4a-4f77-9c0e-1a2b3c4d5e6f", signingKey),
+  undefined,
+);
+assert.equal(recoverClientRegistration(`${clientId}.extra`, signingKey), undefined);
+
+assert.deepEqual(
   createRecoverableClientId(
     {
       ...client,
@@ -47,5 +54,11 @@ assert.equal(
     },
     signingKey,
   ),
-  undefined,
+  { kind: "unsupported" },
 );
+
+const oversized = createRecoverableClientId(
+  { ...client, client_name: "x".repeat(5000) },
+  signingKey,
+);
+assert.equal(oversized.kind, "too_large");

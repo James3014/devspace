@@ -173,7 +173,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     }
 
     if (!this.oauthStore.getClient(client.client_id)) {
-      this.oauthStore.restoreClient(client);
+      this.oauthStore.restoreClient(client, this.config.allowedRedirectHosts);
     }
 
     const code = `code-${randomUUID()}`;

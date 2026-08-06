@@ -9,22 +9,45 @@ const MAX_CLIENT_ID_LENGTH = 4096;
 
 type ClientRegistrationPayload = Omit<OAuthClientInformationFull, "client_id">;
 
+export type RecoverableClientIdResult =
+  | {
+      kind: "recoverable";
+      clientId: string;
+      registration: ClientRegistrationPayload;
+    }
+  | { kind: "unsupported" }
+  | { kind: "too_large"; length: number; maxLength: number };
+
 export function createRecoverableClientId(
   client: ClientRegistrationPayload,
   signingKey: string,
-): string | undefined {
+): RecoverableClientIdResult {
   const parsed = OAuthClientInformationFullSchema.safeParse({
     ...client,
     client_id: "pending",
   });
-  if (!parsed.success || !isPublicClient(parsed.data)) return undefined;
+  if (!parsed.success || !isPublicClient(parsed.data)) {
+    return { kind: "unsupported" };
+  }
 
   const { client_id: _clientId, ...validatedRegistration } = parsed.data;
   const payload = Buffer.from(JSON.stringify(validatedRegistration)).toString("base64url");
   const signedValue = `${CLIENT_ID_PREFIX}.${payload}`;
   const signature = sign(signedValue, signingKey);
   const clientId = `${signedValue}.${signature}`;
-  return clientId.length <= MAX_CLIENT_ID_LENGTH ? clientId : undefined;
+  if (clientId.length > MAX_CLIENT_ID_LENGTH) {
+    return {
+      kind: "too_large",
+      length: clientId.length,
+      maxLength: MAX_CLIENT_ID_LENGTH,
+    };
+  }
+
+  return {
+    kind: "recoverable",
+    clientId,
+    registration: validatedRegistration,
+  };
 }
 
 export function recoverClientRegistration(
