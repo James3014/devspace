@@ -43,10 +43,17 @@ reach.
 When an MCP client connects, DevSpace shows an approval page. Enter the Owner
 password only when you intentionally want that client to access this server.
 
+The same private file stores a random key used to authenticate recoverable OAuth
+client registrations. The resulting client identifier is public and is not a
+credential: recovery still requires an exact registered redirect URI, PKCE, the
+current redirect-host allowlist, and a fresh Owner password approval. Access and
+refresh tokens are not recoverable and remain revocable server-side state.
+
 For env-driven deployments, set a long random value:
 
 ```bash
 DEVSPACE_OAUTH_OWNER_TOKEN="$(openssl rand -base64 32)"
+DEVSPACE_OAUTH_CLIENT_REGISTRATION_KEY="$(openssl rand -base64 32)"
 ```
 
 ## Public URL And Host Allowlist
