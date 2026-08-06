@@ -167,13 +167,17 @@ function parseWidgetMode(value: string | undefined): WidgetMode {
   throw new Error(`Invalid DEVSPACE_WIDGETS: ${value}`);
 }
 
-function parseRequiredSecret(value: string | undefined, name: string): string {
+function parseRequiredSecret(
+  value: string | undefined,
+  name: string,
+  minimumLength = 16,
+): string {
   const secret = value?.trim();
   if (!secret) {
     throw new Error(`${name} is required for DevSpace OAuth. Run: devspace init`);
   }
-  if (secret.length < 16) {
-    throw new Error(`${name} must be at least 16 characters long.`);
+  if (secret.length < minimumLength) {
+    throw new Error(`${name} must be at least ${minimumLength} characters long.`);
   }
   return secret;
 }
@@ -194,6 +198,7 @@ function parseOAuthConfig(
         clientRegistrationKey ??
         deriveClientRegistrationKey(resolvedOwnerToken),
       "DEVSPACE_OAUTH_CLIENT_REGISTRATION_KEY",
+      32,
     ),
     accessTokenTtlSeconds: parsePositiveInteger(
       env.DEVSPACE_OAUTH_ACCESS_TOKEN_TTL_SECONDS,

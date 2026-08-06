@@ -114,6 +114,14 @@ assert.equal(
   }).oauth.clientRegistrationKey,
   "explicit-client-registration-key-long-enough",
 );
+assert.throws(
+  () =>
+    loadConfig({
+      ...baseEnv,
+      DEVSPACE_OAUTH_CLIENT_REGISTRATION_KEY: "too-short",
+    }),
+  /DEVSPACE_OAUTH_CLIENT_REGISTRATION_KEY must be at least 32 characters long/,
+);
 assert.deepEqual(loadConfig(baseEnv).oauth.scopes, ["devspace"]);
 assert.deepEqual(loadConfig(baseEnv).oauth.allowedRedirectHosts, [
   "chatgpt.com",

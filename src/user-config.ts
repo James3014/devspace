@@ -1,4 +1,4 @@
-import { createHmac, randomBytes } from "node:crypto";
+import { randomBytes, scryptSync } from "node:crypto";
 import {
   existsSync,
   mkdirSync,
@@ -105,9 +105,11 @@ export function generateClientRegistrationKey(): string {
 }
 
 export function deriveClientRegistrationKey(ownerToken: string): string {
-  return createHmac("sha256", ownerToken)
-    .update("devspace-oauth-client-registration-v1")
-    .digest("base64url");
+  return scryptSync(
+    ownerToken,
+    "devspace-oauth-client-registration-v1",
+    32,
+  ).toString("base64url");
 }
 
 export function ensureDevspaceDefaultSkills(env: NodeJS.ProcessEnv = process.env): string[] {
