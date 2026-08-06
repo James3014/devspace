@@ -14,6 +14,7 @@ import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
 
 export interface OAuthConfig {
   ownerToken: string;
+  clientRegistrationKey: string;
   accessTokenTtlSeconds: number;
   refreshTokenTtlSeconds: number;
   scopes: string[];

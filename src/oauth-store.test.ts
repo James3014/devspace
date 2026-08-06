@@ -11,6 +11,7 @@ import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
 const root = await mkdtemp(join(tmpdir(), "devspace-oauth-test-"));
 const oauthConfig = {
   ownerToken: "test-owner-token-that-is-long-enough",
+  clientRegistrationKey: "test-client-registration-key-that-is-long-enough",
   accessTokenTtlSeconds: 3600,
   refreshTokenTtlSeconds: 2592000,
   scopes: ["devspace"],

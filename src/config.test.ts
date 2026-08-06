@@ -104,6 +104,7 @@ assert.throws(
 );
 
 assert.equal(loadConfig(baseEnv).oauth.ownerToken, "test-owner-token-that-is-long-enough");
+assert.equal(loadConfig(baseEnv).oauth.clientRegistrationKey.length, 43);
 assert.deepEqual(loadConfig(baseEnv).oauth.scopes, ["devspace"]);
 assert.deepEqual(loadConfig(baseEnv).oauth.allowedRedirectHosts, [
   "chatgpt.com",
@@ -188,6 +189,7 @@ writeFileSync(
 const fileConfig = loadConfig({ DEVSPACE_CONFIG_DIR: configDir });
 assert.equal(fileConfig.port, 8787);
 assert.equal(fileConfig.oauth.ownerToken, "persisted-owner-token-long-enough");
+assert.equal(fileConfig.oauth.clientRegistrationKey.length, 43);
 assert.equal(fileConfig.publicBaseUrl, "https://devspace.example.com");
 assert.equal(fileConfig.subagents, true);
 assert.equal(fileConfig.artifactsEnabled, true);
