@@ -51,6 +51,10 @@ exact registered redirect URI, PKCE, the current redirect-host allowlist, and a
 fresh Owner password approval. Access and refresh tokens are not recoverable and
 remain revocable server-side state.
 
+Repository coverage exercises this recovery through `SingleUserOAuthProvider`
+in process. A packaged reconnect through a real MCP host has not yet been
+verified.
+
 For env-driven deployments, set a long random value:
 
 ```bash

@@ -105,10 +105,13 @@ export function generateClientRegistrationKey(): string {
 }
 
 export function deriveClientRegistrationKey(ownerToken: string): string {
+  // Compatibility keys are bound to the Owner password. Rotating that password
+  // before persisting a separate key invalidates previously issued signed IDs.
   return scryptSync(
     ownerToken,
     "devspace-oauth-client-registration-v1",
     32,
+    { N: 16_384, r: 8, p: 1 },
   ).toString("base64url");
 }
 
