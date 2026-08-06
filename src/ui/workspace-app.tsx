@@ -28,6 +28,7 @@ import {
   type ToolDisplay,
 } from "./tool-display.js";
 import {
+  isSameWorkspaceCard,
   toggleWorkspaceDisclosure,
   toggleWorkspaceDocument,
   type WorkspaceDisclosureKey,
@@ -671,22 +672,6 @@ function renderWorkspaceDisclosure(
   });
   disclosure.append(summary, body);
   return disclosure;
-}
-
-function workspaceCardIdentity(
-  value: { tool?: ToolName; workspaceId?: string; root?: string; path?: string } | null,
-): string | undefined {
-  if (value?.tool !== "open_workspace") return undefined;
-  return value.workspaceId ?? value.root ?? value.path;
-}
-
-function isSameWorkspaceCard(
-  previous: { tool?: ToolName; workspaceId?: string; root?: string; path?: string } | null,
-  next: { tool?: ToolName; workspaceId?: string; root?: string; path?: string },
-): boolean {
-  const previousIdentity = workspaceCardIdentity(previous);
-  const nextIdentity = workspaceCardIdentity(next);
-  return previousIdentity !== undefined && previousIdentity === nextIdentity;
 }
 
 function toolNameFromMeta(result: CallToolResult): ToolName | undefined {

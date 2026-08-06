@@ -503,7 +503,7 @@ body {
   font-size: var(--font-text-sm-size, 12px);
   line-height: 1.55;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .text-payload.bash {
@@ -513,6 +513,7 @@ body {
 
 .workspace-disclosures {
   --workspace-inline-padding: 14px;
+
   display: grid;
   padding: 0 0 6px;
 }
@@ -686,7 +687,7 @@ body {
   font-size: 11px;
   line-height: 1.5;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .workspace-chip-list {
