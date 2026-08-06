@@ -19,7 +19,8 @@ export function createRecoverableClientId(
   });
   if (!parsed.success || !isPublicClient(parsed.data)) return undefined;
 
-  const payload = Buffer.from(JSON.stringify(client)).toString("base64url");
+  const { client_id: _clientId, ...validatedRegistration } = parsed.data;
+  const payload = Buffer.from(JSON.stringify(validatedRegistration)).toString("base64url");
   const signedValue = `${CLIENT_ID_PREFIX}.${payload}`;
   const signature = sign(signedValue, signingKey);
   const clientId = `${signedValue}.${signature}`;

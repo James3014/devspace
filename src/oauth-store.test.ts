@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Response } from "express";
 import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { databasePath, openDatabase } from "./db/client.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
@@ -25,6 +26,7 @@ try {
   testPersistenceAndTokenHashing(join(root, "persistence"));
   testExpiredTokenCleanup(join(root, "expiration"));
   testTransactionalTokenRotation(join(root, "rotation"));
+  await testClientRegistrationRecovery(join(root, "registration-recovery"));
   await testProviderRestartRotationAndRevocation(join(root, "provider"));
 } finally {
   await rm(root, { recursive: true, force: true });
@@ -61,7 +63,11 @@ function testPersistenceAndTokenHashing(stateDir: string): void {
   const accessToken = "access-token-example";
   const refreshToken = "refresh-token-example";
   const firstStore = new SqliteOAuthStore(stateDir);
-  const firstClients = new SqliteOAuthClientsStore(firstStore, oauthConfig.allowedRedirectHosts);
+  const firstClients = new SqliteOAuthClientsStore(
+    firstStore,
+    oauthConfig.allowedRedirectHosts,
+    oauthConfig.clientRegistrationKey,
+  );
   const client = firstClients.registerClient({
     redirect_uris: [redirectUri],
     client_name: "ChatGPT",
@@ -116,9 +122,11 @@ function testPersistenceAndTokenHashing(stateDir: string): void {
 
 function testExpiredTokenCleanup(stateDir: string): void {
   const store = new SqliteOAuthStore(stateDir);
-  const client = new SqliteOAuthClientsStore(store, oauthConfig.allowedRedirectHosts).registerClient({
-    redirect_uris: [redirectUri],
-  });
+  const client = new SqliteOAuthClientsStore(
+    store,
+    oauthConfig.allowedRedirectHosts,
+    oauthConfig.clientRegistrationKey,
+  ).registerClient({ redirect_uris: [redirectUri] });
   const expiredAt = Math.floor(Date.now() / 1000) - 1;
   store.saveTokenPair({
     accessTokenHash: "expired-access-hash",
@@ -140,9 +148,11 @@ function testExpiredTokenCleanup(stateDir: string): void {
 function testTransactionalTokenRotation(stateDir: string): void {
   const store = new SqliteOAuthStore(stateDir);
   try {
-    const client = new SqliteOAuthClientsStore(store, oauthConfig.allowedRedirectHosts).registerClient({
-      redirect_uris: [redirectUri],
-    });
+    const client = new SqliteOAuthClientsStore(
+      store,
+      oauthConfig.allowedRedirectHosts,
+      oauthConfig.clientRegistrationKey,
+    ).registerClient({ redirect_uris: [redirectUri] });
     const expiresAt = Math.floor(Date.now() / 1000) + 3600;
     store.saveRefreshToken("old-refresh-hash", {
       clientId: client.client_id,
@@ -183,6 +193,95 @@ function testTransactionalTokenRotation(stateDir: string): void {
   } finally {
     store.close();
   }
+}
+
+async function testClientRegistrationRecovery(stateDir: string): Promise<void> {
+  const registrationStateDir = join(stateDir, "registered");
+  const emptyStateDir = join(stateDir, "empty");
+  const firstProvider = new SingleUserOAuthProvider(oauthConfig, mcpUrl, registrationStateDir);
+  const client = await firstProvider.clientsStore.registerClient?.({
+    redirect_uris: [redirectUri],
+    client_name: "ChatGPT",
+  });
+  assert.ok(client);
+  assert.match(client.client_id, /^devspace-v1\./);
+  firstProvider.close();
+
+  const recoveredProvider = new SingleUserOAuthProvider(oauthConfig, mcpUrl, emptyStateDir);
+  try {
+    const recovered = await recoveredProvider.clientsStore.getClient(client.client_id);
+    assert.ok(recovered);
+    assert.equal(recovered.client_id, client.client_id);
+
+    const beforeApproval = new SqliteOAuthStore(emptyStateDir);
+    assert.equal(beforeApproval.getClient(client.client_id), undefined);
+    beforeApproval.close();
+
+    const params = {
+      redirectUri,
+      codeChallenge: "challenge",
+      scopes: ["devspace"],
+      resource: mcpUrl,
+    };
+    await recoveredProvider.authorize(
+      recovered,
+      params,
+      authorizationResponse("wrong-owner-token"),
+    );
+
+    const afterRejectedApproval = new SqliteOAuthStore(emptyStateDir);
+    assert.equal(afterRejectedApproval.getClient(client.client_id), undefined);
+    afterRejectedApproval.close();
+
+    let redirectLocation: string | undefined;
+    await recoveredProvider.authorize(
+      recovered,
+      params,
+      authorizationResponse(oauthConfig.ownerToken, (location) => {
+        redirectLocation = location;
+      }),
+    );
+    assert.ok(redirectLocation);
+
+    const afterApproval = new SqliteOAuthStore(emptyStateDir);
+    assert.equal(afterApproval.getClient(client.client_id)?.client_name, "ChatGPT");
+    afterApproval.close();
+  } finally {
+    recoveredProvider.close();
+  }
+
+  const changedPolicyProvider = new SingleUserOAuthProvider(
+    { ...oauthConfig, allowedRedirectHosts: ["example.com"] },
+    mcpUrl,
+    join(stateDir, "changed-policy"),
+  );
+  try {
+    assert.equal(await changedPolicyProvider.clientsStore.getClient(client.client_id), undefined);
+  } finally {
+    changedPolicyProvider.close();
+  }
+}
+
+function authorizationResponse(
+  ownerToken: string,
+  onRedirect?: (location: string) => void,
+): Response {
+  const response = {
+    req: { method: "POST", body: { owner_token: ownerToken } },
+    status() {
+      return response;
+    },
+    setHeader() {
+      return response;
+    },
+    send() {
+      return response;
+    },
+    redirect(_status: number, location: string) {
+      onRedirect?.(location);
+    },
+  };
+  return response as unknown as Response;
 }
 
 async function testProviderRestartRotationAndRevocation(stateDir: string): Promise<void> {
