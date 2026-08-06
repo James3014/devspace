@@ -104,7 +104,16 @@ assert.throws(
 );
 
 assert.equal(loadConfig(baseEnv).oauth.ownerToken, "test-owner-token-that-is-long-enough");
-assert.equal(loadConfig(baseEnv).oauth.clientRegistrationKey.length, 43);
+const derivedClientRegistrationKey = loadConfig(baseEnv).oauth.clientRegistrationKey;
+assert.equal(derivedClientRegistrationKey.length, 43);
+assert.equal(loadConfig(baseEnv).oauth.clientRegistrationKey, derivedClientRegistrationKey);
+assert.equal(
+  loadConfig({
+    ...baseEnv,
+    DEVSPACE_OAUTH_CLIENT_REGISTRATION_KEY: "explicit-client-registration-key-long-enough",
+  }).oauth.clientRegistrationKey,
+  "explicit-client-registration-key-long-enough",
+);
 assert.deepEqual(loadConfig(baseEnv).oauth.scopes, ["devspace"]);
 assert.deepEqual(loadConfig(baseEnv).oauth.allowedRedirectHosts, [
   "chatgpt.com",
@@ -183,13 +192,17 @@ writeFileSync(
   join(configDir, "auth.json"),
   JSON.stringify({
     ownerToken: "persisted-owner-token-long-enough",
+    clientRegistrationKey: "persisted-client-registration-key-long-enough",
   }),
 );
 
 const fileConfig = loadConfig({ DEVSPACE_CONFIG_DIR: configDir });
 assert.equal(fileConfig.port, 8787);
 assert.equal(fileConfig.oauth.ownerToken, "persisted-owner-token-long-enough");
-assert.equal(fileConfig.oauth.clientRegistrationKey.length, 43);
+assert.equal(
+  fileConfig.oauth.clientRegistrationKey,
+  "persisted-client-registration-key-long-enough",
+);
 assert.equal(fileConfig.publicBaseUrl, "https://devspace.example.com");
 assert.equal(fileConfig.subagents, true);
 assert.equal(fileConfig.artifactsEnabled, true);
