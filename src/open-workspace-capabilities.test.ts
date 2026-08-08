@@ -52,8 +52,22 @@ const parsed = enabledSchema.parse({
   agentsFiles: [],
   availableAgentsFiles: [],
   skills: [],
-  agentProviders: ["codex"],
-  agents: [{ name: "reviewer", description: "Review changes." }],
+  agentProviders: [{
+    name: "codex",
+    model: { supported: true, discovery: "model_dependent" },
+    effort: {
+      supported: true,
+      semantics: "reasoning_effort",
+      discovery: "model_dependent",
+    },
+  }],
+  agents: [{
+    name: "reviewer",
+    description: "Review changes.",
+    provider: "codex",
+    model: "gpt-5.4",
+    effort: "high",
+  }],
   activeWorkflows: [{
     id: "wfr_1",
     name: "Review",
@@ -62,8 +76,22 @@ const parsed = enabledSchema.parse({
   }],
   instruction: "Reuse this workspace.",
 });
-assert.deepEqual(parsed.agentProviders, ["codex"]);
-assert.deepEqual(parsed.agents, [{ name: "reviewer", description: "Review changes." }]);
+assert.deepEqual(parsed.agentProviders, [{
+  name: "codex",
+  model: { supported: true, discovery: "model_dependent" },
+  effort: {
+    supported: true,
+    semantics: "reasoning_effort",
+    discovery: "model_dependent",
+  },
+}]);
+assert.deepEqual(parsed.agents, [{
+  name: "reviewer",
+  description: "Review changes.",
+  provider: "codex",
+  model: "gpt-5.4",
+  effort: "high",
+}]);
 assert.deepEqual(parsed.activeWorkflows, [{
   id: "wfr_1",
   name: "Review",

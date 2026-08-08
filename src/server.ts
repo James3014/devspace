@@ -229,6 +229,22 @@ const workspaceAgentsFileOutputSchema = z.object({
 const workspaceLocalAgentOutputSchema = z.object({
   name: z.string(),
   description: z.string(),
+  provider: z.string(),
+  model: z.string().optional(),
+  effort: z.string().optional(),
+});
+
+const workspaceLocalAgentProviderOutputSchema = z.object({
+  name: z.string(),
+  model: z.object({
+    supported: z.boolean(),
+    discovery: z.enum(["provider_static", "model_dependent", "session_dynamic"]),
+  }),
+  effort: z.object({
+    supported: z.boolean(),
+    semantics: z.enum(["reasoning_effort", "thinking_level", "model_variant"]),
+    discovery: z.enum(["provider_static", "model_dependent", "session_dynamic"]),
+  }),
 });
 
 export function openWorkspaceOutputSchema(config: ServerConfig): z.ZodRawShape {
@@ -252,7 +268,7 @@ export function openWorkspaceOutputSchema(config: ServerConfig): z.ZodRawShape {
     skills: z.array(workspaceSkillOutputSchema),
     ...(config.subagents
       ? {
-          agentProviders: z.array(z.string()),
+          agentProviders: z.array(workspaceLocalAgentProviderOutputSchema),
           agents: z.array(workspaceLocalAgentOutputSchema),
         }
       : {}),
@@ -797,11 +813,8 @@ function createMcpServer(
       const agentCatalog = config.subagents
         ? buildLocalAgentCatalog(workspace.agentProfiles, localAgentProviders)
         : undefined;
-      const visibleAgentProviders = agentCatalog?.providers.map((provider) => provider.name) ?? [];
-      const visibleAgents = agentCatalog?.profiles.map((agent) => ({
-        name: agent.name,
-        description: agent.description,
-      })) ?? [];
+      const visibleAgentProviders = agentCatalog?.providers ?? [];
+      const visibleAgents = agentCatalog?.profiles ?? [];
       const loadedAgentsFiles = agentsFiles.map((file) => ({
         path: formatAgentsPath(file.path, workspace.root),
         content: file.content,
@@ -842,7 +855,7 @@ function createMcpServer(
               ? `Available skills: ${visibleSkills.map((skill) => skill.name).join(", ")}`
               : undefined,
             visibleAgentProviders.length > 0
-              ? `Available subagent providers: ${visibleAgentProviders.join(", ")}`
+              ? `Available subagent providers: ${visibleAgentProviders.map((provider) => provider.name).join(", ")}`
               : undefined,
             visibleAgents.length > 0
               ? `Available subagent profiles: ${visibleAgents.map((agent) => `${agent.name} — ${agent.description}`).join(", ")}`
