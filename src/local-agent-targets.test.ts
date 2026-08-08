@@ -143,4 +143,6 @@ assert.throws(
 
 assert.equal(resolveLocalAgentTarget("missing", profiles), undefined);
 assert.match(formatAvailableLocalAgentTargets(profiles), /profiles: reviewer, claude/);
+assert.match(formatAvailableLocalAgentTargets(profiles, ["codex"]), /profiles: reviewer/);
+assert.doesNotMatch(formatAvailableLocalAgentTargets(profiles, ["codex"]), /claude/);
 assert.match(formatAvailableLocalAgentTargets([]), /providers: codex, claude, opencode, pi, cursor, copilot/);

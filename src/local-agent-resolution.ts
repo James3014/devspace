@@ -73,7 +73,10 @@ export function resolveLocalAgentExecution(
   if (input.profile) {
     const profile = input.profiles.find((candidate) => candidate.name === input.profile);
     if (!profile) {
-      const available = input.profiles.map((candidate) => candidate.name).join(", ");
+      const available = input.profiles
+        .filter((candidate) => input.availableProviders.includes(candidate.provider))
+        .map((candidate) => candidate.name)
+        .join(", ");
       throw new LocalAgentResolutionError(
         "profile_not_found",
         `Unknown agent profile: ${input.profile}${available ? `. Available profiles: ${available}` : ""}`,

@@ -103,7 +103,10 @@ export function formatAvailableLocalAgentTargets(
   profiles: LocalAgentProfile[],
   providers: LocalAgentProvider[] = [...LOCAL_AGENT_PROVIDERS],
 ): string {
-  const profileNames = profiles.map((profile) => profile.name);
+  const availableProviders = new Set(providers);
+  const profileNames = profiles
+    .filter((profile) => availableProviders.has(profile.provider))
+    .map((profile) => profile.name);
   const parts = [
     profileNames.length > 0 ? `profiles: ${profileNames.join(", ")}` : undefined,
     providers.length > 0 ? `providers: ${providers.join(", ")}` : "providers: none",
