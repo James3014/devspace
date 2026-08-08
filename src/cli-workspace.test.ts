@@ -14,10 +14,15 @@ try {
   const nested = join(repository, "packages", "app");
   mkdirSync(nested, { recursive: true });
   execFileSync("git", ["init", "--quiet", repository]);
+  const gitRoot = execFileSync(
+    "git",
+    ["-C", nested, "rev-parse", "--show-toplevel"],
+    { encoding: "utf8" },
+  ).trim();
 
   assert.deepEqual(resolveCliWorkspaceContext({}, nested), {
     workspaceId: undefined,
-    workspaceRoot: resolve(repository),
+    workspaceRoot: resolve(gitRoot),
   });
 
   mkdirSync(join(repository, "packages", ".devspace"));
