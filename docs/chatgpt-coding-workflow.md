@@ -93,8 +93,9 @@ setup installs in `~/.devspace/skills` when agent tooling is enabled, plus:
 
 When agent tooling is enabled, DevSpace discovers agent profiles from
 `~/.devspace/agents/*.md` and project `.devspace/agents/*.md`.
-`open_workspace` exposes only usable provider names and profile names with
-descriptions. Disabled or unavailable providers and their profiles are omitted.
+`open_workspace` exposes only usable provider capability hints and profiles with
+their provider and optional model/effort defaults. Disabled or unavailable
+providers and their profiles are omitted.
 
 Example profiles are packaged under `examples/agents/` for users who want
 starter templates. Copy or adapt them into one of the active profile directories

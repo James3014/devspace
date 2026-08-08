@@ -119,8 +119,8 @@ When agent tooling is enabled, DevSpace discovers agent profiles from:
 - `~/.devspace/agents/*.md`
 - project `.devspace/agents/*.md`
 
-`open_workspace` returns only usable provider names and profile names with
-descriptions. `devspace agents ls` lists existing subagent sessions for the
+`open_workspace` returns only usable provider capability hints and profiles with
+their provider and optional model/effort defaults. `devspace agents ls` lists existing subagent sessions for the
 current workspace, scoped by the workspace environment injected into shell
 commands. The `subagents` skill teaches the model to discover targets with
 `devspace agents targets`, then use the minimal `devspace agents run`,

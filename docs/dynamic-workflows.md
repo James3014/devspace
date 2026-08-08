@@ -73,9 +73,25 @@ When agent tooling is enabled, `open_workspace` stays deliberately small:
 
 ```json
 {
-  "agentProviders": ["codex", "claude"],
+  "agentProviders": [
+    {
+      "name": "codex",
+      "model": { "supported": true, "discovery": "model_dependent" },
+      "effort": {
+        "supported": true,
+        "semantics": "reasoning_effort",
+        "discovery": "model_dependent"
+      }
+    }
+  ],
   "agents": [
-    { "name": "reviewer", "description": "Review changes and test gaps." }
+    {
+      "name": "reviewer",
+      "description": "Review changes and test gaps.",
+      "provider": "codex",
+      "model": "gpt-5.4",
+      "effort": "high"
+    }
   ],
   "activeWorkflows": [
     {
@@ -88,7 +104,9 @@ When agent tooling is enabled, `open_workspace` stays deliberately small:
 }
 ```
 
-Provider capability metadata, models, effort semantics, session identifiers,
-workflow phases, and internal counters are intentionally absent. Models obtain
-execution details only when needed through `devspace agents targets --json` or
-the workflow inspection commands.
+Provider entries contain compact model and effort capability hints. Profiles
+expose only their name, description, provider, and optional model/effort
+defaults. Unavailable or unselected providers and profiles are omitted.
+Workflow entries keep only the run id, name, live status, and call counters
+needed to decide whether to inspect or poll; detailed calls remain available
+through the CLI inspection commands.

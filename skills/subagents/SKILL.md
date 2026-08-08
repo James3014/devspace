@@ -19,6 +19,11 @@ Prefer a configured profile whose description matches the task. Use a provider t
 
 Profiles carry their own provider, instructions, model, and effort defaults. Only pass `--model` or `--effort` when the user supplied an exact value or the value is already known to be valid for that target.
 
+`--model <value>` selects a provider model. `--effort <value>` selects the
+provider's reasoning/thinking level (`--thinking` is an alias). Both are
+optional; use values reported by `agents targets --json` or a configured
+profile.
+
 ## Start work
 
 Give the child a self-contained brief. Include the objective, relevant paths, constraints, decisions from the parent conversation, and the expected result. A child cannot see the parent conversation or ask the user for missing context.
@@ -41,6 +46,9 @@ devspace agents ls --json
 - `show` returns the current status and includes the response or error when available.
 - `run <id>` continues the same agent session with a new prompt.
 - `ls` returns sessions belonging to the current project.
+
+Use `--json` on every command when the calling harness needs machine-readable
+ids, status, responses, or errors.
 
 Poll `show --json` while the status is `starting` or `running`. `idle` means the response is ready; `error` and `stopped` are terminal without a successful response. Use a continuation only when the same context is valuable; start a new subagent for independent work.
 

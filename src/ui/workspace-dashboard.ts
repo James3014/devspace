@@ -81,6 +81,11 @@ export function renderWorkspaceDashboard(
             card.agents.map((agent) => ({
               title: agent.name ?? "Unnamed profile",
               description: agent.description,
+              meta: [
+                agent.provider,
+                agent.model && `model=${agent.model}`,
+                agent.effort && `effort=${agent.effort}`,
+              ].filter(Boolean).join(", "),
             })),
             "No agent profiles loaded.",
           ),
@@ -157,7 +162,19 @@ function renderKeyValues(entries: Array<[string, string]>): HTMLElement {
 
 function renderProviderList(card: ToolResultCard): HTMLElement {
   return renderList(
-    card.agentProviders?.map((provider) => ({ title: provider })) ?? [],
+    card.agentProviders?.map((provider) => ({
+      title: provider.name ?? "Unknown provider",
+      meta: [
+        provider.model?.supported === false
+          ? "model unsupported"
+          : provider.model?.discovery && `model (${provider.model.discovery})`,
+        provider.effort?.supported === false
+          ? "effort unsupported"
+          : provider.effort?.semantics && provider.effort.discovery
+            ? `effort (${provider.effort.semantics}, ${provider.effort.discovery})`
+            : undefined,
+      ].filter(Boolean).join("; "),
+    })) ?? [],
     "No subagent providers exposed.",
   );
 }

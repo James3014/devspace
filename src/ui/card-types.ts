@@ -57,10 +57,24 @@ export interface ToolResultCard {
     path?: string;
   }>;
   activeWorkflows?: ActiveWorkflowSummary[];
-  agentProviders?: string[];
+  agentProviders?: Array<{
+    name?: string;
+    model?: {
+      supported?: boolean;
+      discovery?: string;
+    };
+    effort?: {
+      supported?: boolean;
+      semantics?: string;
+      discovery?: string;
+    };
+  }>;
   agents?: Array<{
     name?: string;
     description?: string;
+    provider?: string;
+    model?: string;
+    effort?: string;
   }>;
   instruction?: string;
 }
