@@ -1,4 +1,6 @@
 import { timingSafeEqual, randomBytes, randomUUID, createHash } from "node:crypto";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { Response } from "express";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
 import type { OAuthServerProvider, AuthorizationParams } from "@modelcontextprotocol/sdk/server/auth/provider.js";
@@ -41,7 +43,55 @@ interface RefreshTokenRecord {
   resource?: URL;
 }
 
+interface PersistedTokenRecord {
+  clientId: string;
+  scopes: string[];
+  expiresAt: number;
+  resourceHref?: string;
+}
+
+interface PersistedOAuthState {
+  clients: OAuthClientInformationFull[];
+  accessTokens: Record<string, PersistedTokenRecord>;
+  refreshTokens: Record<string, PersistedTokenRecord>;
+}
+
 const CODE_TTL_MS = 5 * 60 * 1000;
+
+function persistedTokenRecord(record: AccessTokenRecord | RefreshTokenRecord): PersistedTokenRecord {
+  return {
+    clientId: record.clientId,
+    scopes: record.scopes,
+    expiresAt: record.expiresAt,
+    ...(record.resource ? { resourceHref: record.resource.href } : {}),
+  };
+}
+
+function loadPersistedOAuthState(path: string): PersistedOAuthState | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return undefined;
+  }
+  try {
+    const parsed = JSON.parse(raw) as Partial<PersistedOAuthState>;
+    return {
+      clients: Array.isArray(parsed.clients) ? parsed.clients : [],
+      accessTokens: parsed.accessTokens && typeof parsed.accessTokens === "object" ? parsed.accessTokens : {},
+      refreshTokens: parsed.refreshTokens && typeof parsed.refreshTokens === "object" ? parsed.refreshTokens : {},
+    };
+  } catch {
+    return undefined;
+  }
+}
+
+function savePersistedOAuthState(path: string, state: PersistedOAuthState): void {
+  const tmp = `${path}.tmp`;
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
+  renameSync(tmp, path);
+}
 
 function randomToken(): string {
   return randomBytes(32).toString("base64url");
@@ -166,6 +216,33 @@ export class InMemoryOAuthClientsStore implements OAuthRegisteredClientsStore {
     this.clients.set(registered.client_id, registered);
     return registered;
   }
+
+  listClients(): OAuthClientInformationFull[] {
+    return [...this.clients.values()];
+  }
+
+  seedClients(clients: OAuthClientInformationFull[]): void {
+    for (const client of clients) {
+      if (client.client_id) this.clients.set(client.client_id, client);
+    }
+  }
+}
+
+export class PersistentOAuthClientsStore extends InMemoryOAuthClientsStore {
+  private readonly onPersist: () => void;
+
+  constructor(allowedRedirectHosts: string[], onPersist: () => void) {
+    super(allowedRedirectHosts);
+    this.onPersist = onPersist;
+  }
+
+  registerClient(
+    client: Omit<OAuthClientInformationFull, "client_id" | "client_id_issued_at">,
+  ): OAuthClientInformationFull {
+    const registered = super.registerClient(client);
+    this.onPersist();
+    return registered;
+  }
 }
 
 export class SingleUserOAuthProvider implements OAuthServerProvider {
@@ -174,13 +251,54 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   private readonly accessTokens = new Map<string, AccessTokenRecord>();
   private readonly refreshTokens = new Map<string, RefreshTokenRecord>();
   private readonly resourceServerUrl: URL;
+  private readonly persistencePath?: string;
 
   constructor(
     private readonly config: OAuthConfig,
     resourceServerUrl: URL,
+    persistencePath?: string,
   ) {
     this.resourceServerUrl = resourceUrlFromServerUrl(resourceServerUrl);
-    this.clientsStore = new InMemoryOAuthClientsStore(config.allowedRedirectHosts);
+    this.persistencePath = persistencePath;
+
+    const persisted = persistencePath ? loadPersistedOAuthState(persistencePath) : undefined;
+    this.clientsStore = new PersistentOAuthClientsStore(config.allowedRedirectHosts, () => this.persist());
+
+    if (persisted) {
+      (this.clientsStore as PersistentOAuthClientsStore).seedClients(persisted.clients);
+      for (const [hash, record] of Object.entries(persisted.accessTokens)) {
+        this.accessTokens.set(hash, {
+          token: "",
+          clientId: record.clientId,
+          scopes: record.scopes,
+          expiresAt: record.expiresAt,
+          resource: record.resourceHref ? new URL(record.resourceHref) : undefined,
+        });
+      }
+      for (const [hash, record] of Object.entries(persisted.refreshTokens)) {
+        this.refreshTokens.set(hash, {
+          token: "",
+          clientId: record.clientId,
+          scopes: record.scopes,
+          expiresAt: record.expiresAt,
+          resource: record.resourceHref ? new URL(record.resourceHref) : undefined,
+        });
+      }
+    }
+  }
+
+  private persist(): void {
+    if (!this.persistencePath) return;
+    const state: PersistedOAuthState = {
+      clients: (this.clientsStore as PersistentOAuthClientsStore).listClients(),
+      accessTokens: Object.fromEntries(
+        [...this.accessTokens.entries()].map(([hash, record]) => [hash, persistedTokenRecord(record)]),
+      ),
+      refreshTokens: Object.fromEntries(
+        [...this.refreshTokens.entries()].map(([hash, record]) => [hash, persistedTokenRecord(record)]),
+      ),
+    };
+    savePersistedOAuthState(this.persistencePath, state);
   }
 
   async authorize(
@@ -305,6 +423,7 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     const hashed = hashToken(request.token);
     this.accessTokens.delete(hashed);
     this.refreshTokens.delete(hashed);
+    this.persist();
   }
 
   private validCodeRecord(
@@ -339,6 +458,8 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       expiresAt: refreshExpiresAt,
       resource,
     });
+
+    this.persist();
 
     return {
       access_token: accessToken,
