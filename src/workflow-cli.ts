@@ -4,6 +4,10 @@ import {
   resolveCliWorkspaceContext,
   type CliWorkspaceContext,
 } from "./cli-workspace.js";
+import {
+  workflowCallOutput,
+  workflowRunOutput,
+} from "./cli-output.js";
 import type { ServerConfig } from "./config.js";
 import { parseWorkflowArgFlagsResult } from "./workflow-files.js";
 import {
@@ -58,7 +62,7 @@ export async function runWorkflowCommand(
       return;
     case "ls":
     case "list":
-      await runWorkflowList(config);
+      await runWorkflowList(rest, config);
       return;
     case "calls":
       await runWorkflowCalls(rest, config);
@@ -95,12 +99,12 @@ export function printWorkflowHelp(): void {
       "",
       "Usage:",
       "  devspace workflow run [--file|--script-path <path> | --name <name>] [--resume <runId>]",
-      "                        [--arg key=value]... [--follow]",
-      "  devspace workflow status <runId> [--follow]",
-      "  devspace workflow cancel <runId>",
-      "  devspace workflow ls",
-      "  devspace workflow calls <runId>",
-      "  devspace workflow call <runId> <callIndex>",
+      "                        [--arg key=value]... [--follow] [--json]",
+      "  devspace workflow status <runId> [--follow] [--json]",
+      "  devspace workflow cancel <runId> [--json]",
+      "  devspace workflow ls [--json]",
+      "  devspace workflow calls <runId> [--json]",
+      "  devspace workflow call <runId> <callIndex> [--json]",
       "  devspace workflow tui [runId]  # current working directory",
     ].join("\n"),
   );
@@ -109,6 +113,13 @@ export function printWorkflowHelp(): void {
 async function runWorkflowRun(args: string[], config: ServerConfig): Promise<void> {
   const { flags } = splitFlags(args);
   const follow = flags.has("follow");
+  const json = flags.has("json");
+  if (follow && json) {
+    throw new InvalidWorkflowInputError({
+      code: "invalid_argument",
+      message: "Use either --follow or --json, then poll workflow status.",
+    });
+  }
   const file = flagValue(flags, "script-path") ?? flagValue(flags, "file");
   const name = flagValue(flags, "name");
   const resumeFrom = flagValue(flags, "resume");
@@ -161,7 +172,8 @@ async function runWorkflowRun(args: string[], config: ServerConfig): Promise<voi
     });
     if (launched.isErr()) throw launched.error;
 
-    console.log(formatRunLine(launched.value.run));
+    if (json) printJson({ workflow: workflowRunOutput(launched.value.run) });
+    else console.log(formatRunLine(launched.value.run));
 
     if (follow) {
       await followRun(store, launched.value.run.id);
@@ -194,6 +206,13 @@ function buildCliLaunchSource(input: {
 
 async function runWorkflowStatus(args: string[], config: ServerConfig): Promise<void> {
   const follow = args.includes("--follow");
+  const json = args.includes("--json");
+  if (follow && json) {
+    throw new InvalidWorkflowInputError({
+      code: "invalid_argument",
+      message: "Use either --follow or --json, then poll workflow status.",
+    });
+  }
   const runId = args.find((a) => !a.startsWith("-"));
   if (!runId) {
     throw new InvalidWorkflowInputError({
@@ -211,8 +230,13 @@ async function runWorkflowStatus(args: string[], config: ServerConfig): Promise<
     const run = runResult.value;
     if (!run) throw new WorkflowNotFoundError(runId);
     assertWorkflowInCurrentProject(run, workspace);
+    const calls = store.listAgentCalls(runId);
+    if (json) {
+      printJson({ workflow: workflowRunOutput(run, calls) });
+      return;
+    }
     console.log(formatRunLine(run));
-    console.log(formatCallSummary(store.listAgentCalls(runId)));
+    console.log(formatCallSummary(calls));
     if (follow) {
       await followRun(store, runId);
       return;
@@ -225,11 +249,18 @@ async function runWorkflowStatus(args: string[], config: ServerConfig): Promise<
 }
 
 async function runWorkflowCancel(args: string[], config: ServerConfig): Promise<void> {
-  const runId = args[0];
+  const json = args.includes("--json");
+  const [runId, ...unknownArgs] = args.filter((arg) => arg !== "--json");
   if (!runId) {
     throw new InvalidWorkflowInputError({
       code: "invalid_argument",
       message: "Usage: devspace workflow cancel <runId>",
+    });
+  }
+  if (unknownArgs.length > 0) {
+    throw new InvalidWorkflowInputError({
+      code: "invalid_argument",
+      message: "Usage: devspace workflow cancel <runId> [--json]",
     });
   }
   const store = createWorkflowStore(config);
@@ -238,19 +269,26 @@ async function runWorkflowCancel(args: string[], config: ServerConfig): Promise<
     const run = store.getRun(runId);
     if (!run) throw new WorkflowNotFoundError(runId);
     assertWorkflowInCurrentProject(run, resolveCliWorkspaceContext());
-    console.log(formatRunLine(await cancelWorkflowRun(store, runId)));
+    const cancelled = await cancelWorkflowRun(store, runId);
+    if (json) printJson({ workflow: workflowRunOutput(cancelled) });
+    else console.log(formatRunLine(cancelled));
   } finally {
     store.close();
   }
 }
 
-async function runWorkflowList(config: ServerConfig): Promise<void> {
+async function runWorkflowList(args: string[], config: ServerConfig): Promise<void> {
+  const json = parseJsonOnlyOption(args, "devspace workflow ls [--json]");
   const store = createWorkflowStore(config);
   try {
     reapStaleWorkflows(store);
     const runs = store.listRunsForScope(resolveCliWorkspaceContext(), {
       limit: 50,
     });
+    if (json) {
+      printJson({ workflows: runs.map((run) => workflowRunOutput(run)) });
+      return;
+    }
     if (runs.length === 0) {
       console.log("No workflow runs.");
       return;
@@ -262,11 +300,18 @@ async function runWorkflowList(config: ServerConfig): Promise<void> {
 }
 
 async function runWorkflowCalls(args: string[], config: ServerConfig): Promise<void> {
-  const runId = args[0];
+  const json = args.includes("--json");
+  const [runId, ...unknownArgs] = args.filter((arg) => arg !== "--json");
   if (!runId) {
     throw new InvalidWorkflowInputError({
       code: "invalid_argument",
       message: "Usage: devspace workflow calls <runId>",
+    });
+  }
+  if (unknownArgs.length > 0) {
+    throw new InvalidWorkflowInputError({
+      code: "invalid_argument",
+      message: "Usage: devspace workflow calls <runId> [--json]",
     });
   }
   const store = createWorkflowStore(config);
@@ -275,6 +320,13 @@ async function runWorkflowCalls(args: string[], config: ServerConfig): Promise<v
     if (!run) throw new WorkflowNotFoundError(runId);
     assertWorkflowInCurrentProject(run, resolveCliWorkspaceContext());
     const calls = store.listAgentCalls(runId);
+    if (json) {
+      printJson({
+        workflowId: runId,
+        calls: calls.map((call) => workflowCallOutput(call)),
+      });
+      return;
+    }
     if (calls.length === 0) {
       console.log("No workflow agent calls.");
       return;
@@ -286,12 +338,19 @@ async function runWorkflowCalls(args: string[], config: ServerConfig): Promise<v
 }
 
 async function runWorkflowCall(args: string[], config: ServerConfig): Promise<void> {
-  const runId = args[0];
-  const callIndex = Number(args[1]);
+  const json = args.includes("--json");
+  const [runId, callIndexValue, ...unknownArgs] = args.filter((arg) => arg !== "--json");
+  const callIndex = Number(callIndexValue);
   if (!runId || !Number.isInteger(callIndex) || callIndex < 0) {
     throw new InvalidWorkflowInputError({
       code: "invalid_argument",
       message: "Usage: devspace workflow call <runId> <callIndex>",
+    });
+  }
+  if (unknownArgs.length > 0) {
+    throw new InvalidWorkflowInputError({
+      code: "invalid_argument",
+      message: "Usage: devspace workflow call <runId> <callIndex> [--json]",
     });
   }
   const store = createWorkflowStore(config);
@@ -306,7 +365,8 @@ async function runWorkflowCall(args: string[], config: ServerConfig): Promise<vo
         message: `Unknown workflow agent call: ${runId}#${callIndex}`,
       });
     }
-    console.log(JSON.stringify(formatCallDetail(call), null, 2));
+    if (json) printJson({ call: workflowCallOutput(call, { detailed: true }) });
+    else console.log(JSON.stringify(formatCallDetail(call), null, 2));
   } finally {
     store.close();
   }
@@ -317,6 +377,20 @@ function assertWorkflowInCurrentProject(
   workspace: CliWorkspaceContext,
 ): void {
   assertRecordInCliWorkspace(run, workspace, "Workflow run");
+}
+
+function parseJsonOnlyOption(args: string[], usage: string): boolean {
+  if (args.some((arg) => arg !== "--json")) {
+    throw new InvalidWorkflowInputError({
+      code: "invalid_argument",
+      message: `Usage: ${usage}`,
+    });
+  }
+  return args.includes("--json");
+}
+
+function printJson(value: unknown): void {
+  console.log(JSON.stringify(value, null, 2));
 }
 
 async function followRun(store: WorkflowStore, runId: string): Promise<void> {
@@ -455,7 +529,7 @@ function splitFlags(args: string[]): {
       }
       const key = token.slice(2);
       const next = args[i + 1];
-      if (next && !next.startsWith("-") && key !== "follow") {
+      if (next && !next.startsWith("-") && key !== "follow" && key !== "json") {
         flags.set(key, next);
         i += 1;
       } else {

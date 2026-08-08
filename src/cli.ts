@@ -46,6 +46,10 @@ import {
   assertRecordInCliWorkspace,
   resolveCliWorkspaceContext,
 } from "./cli-workspace.js";
+import {
+  localAgentOutput,
+  localAgentTargetsOutput,
+} from "./cli-output.js";
 
 import { runWorkflowCommand } from "./workflow-cli.js";
 import {
@@ -360,7 +364,7 @@ async function runAgentsCommand(args: string[]): Promise<void> {
   switch (subcommand) {
     case "ls":
     case "list":
-      await runAgentsList();
+      await runAgentsList(rest);
       return;
     case "targets":
       await runAgentsTargets(rest);
@@ -385,11 +389,16 @@ async function runAgentsCommand(args: string[]): Promise<void> {
   }
 }
 
-async function runAgentsList(): Promise<void> {
+async function runAgentsList(args: string[]): Promise<void> {
+  const json = parseJsonOnlyOption(args, "devspace agents ls [--json]");
   const config = loadConfig();
   const store = createLocalAgentStore(config);
   const agents = store.list(resolveCliWorkspaceContext());
 
+  if (json) {
+    printJson({ agents: agents.map((agent) => localAgentOutput(agent)) });
+    return;
+  }
   if (agents.length === 0) {
     console.log("No subagent sessions found for this workspace.");
     return;
@@ -415,13 +424,14 @@ async function runAgentsTargets(args: string[]): Promise<void> {
   );
   console.log(
     args.includes("--json")
-      ? JSON.stringify(catalog, null, 2)
+      ? JSON.stringify(localAgentTargetsOutput(catalog), null, 2)
       : formatLocalAgentCatalog(catalog),
   );
 }
 
 async function runAgentsRun(args: string[]): Promise<void> {
-  const parsed = parseLocalAgentRunArgs(args);
+  const json = args.includes("--json");
+  const parsed = parseLocalAgentRunArgs(args.filter((arg) => arg !== "--json"));
 
   const config = loadConfig();
   const workspace = resolveCliWorkspaceContext();
@@ -444,12 +454,14 @@ async function runAgentsRun(args: string[]): Promise<void> {
       error: undefined,
     });
     spawnAgentWorker(existing.id, promptFile);
-    console.log(formatAgentLine({
+    const running = {
       ...existing,
       status: "running",
       model: parsed.model ?? existing.model,
       effort: parsed.effort ?? existing.effort,
-    }));
+    } as LocalAgentRecord;
+    if (json) printJson({ agent: localAgentOutput(running) });
+    else console.log(formatAgentLine(running));
     return;
   }
 
@@ -481,12 +493,16 @@ async function runAgentsRun(args: string[]): Promise<void> {
   });
 
   spawnAgentWorker(record.id, promptFile);
-  console.log(formatAgentLine({ ...record, status: "running" }));
+  const running = { ...record, status: "running" } as LocalAgentRecord;
+  if (json) printJson({ agent: localAgentOutput(running) });
+  else console.log(formatAgentLine(running));
 }
 
 async function runAgentsShow(args: string[]): Promise<void> {
-  const [id] = args;
+  const json = args.includes("--json");
+  const [id, ...unknownArgs] = args.filter((arg) => arg !== "--json");
   if (!id) throw new Error("Usage: devspace agents show <id>");
+  if (unknownArgs.length > 0) throw new Error("Usage: devspace agents show <id> [--json]");
 
   const config = loadConfig();
   const store = createLocalAgentStore(config);
@@ -495,10 +511,17 @@ async function runAgentsShow(args: string[]): Promise<void> {
   if (!record) throw new Error(`Unknown subagent id: ${id}`);
   assertRecordInCliWorkspace(record, workspace, "Subagent session");
 
-  const deadline = Date.now() + 15_000;
-  while ((record.status === "starting" || record.status === "running") && Date.now() < deadline) {
-    await sleep(500);
-    record = store.get(id) ?? record;
+  if (!json) {
+    const deadline = Date.now() + 15_000;
+    while ((record.status === "starting" || record.status === "running") && Date.now() < deadline) {
+      await sleep(500);
+      record = store.get(id) ?? record;
+    }
+  }
+
+  if (json) {
+    printJson({ agent: localAgentOutput(record, { includeResult: true }) });
+    return;
   }
 
   console.log(formatAgentLine(record));
@@ -593,6 +616,15 @@ function formatAgentLine(agent: Pick<
   return `${agent.id} ${agent.status} ${agent.profileName} ${agent.provider}${model}${effort}`;
 }
 
+function parseJsonOnlyOption(args: string[], usage: string): boolean {
+  if (args.some((arg) => arg !== "--json")) throw new Error(`Usage: ${usage}`);
+  return args.includes("--json");
+}
+
+function printJson(value: unknown): void {
+  console.log(JSON.stringify(value, null, 2));
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 }
@@ -603,10 +635,10 @@ function printAgentsHelp(): void {
       "DevSpace agents",
       "",
       "Usage:",
-      "  devspace agents ls",
+      "  devspace agents ls [--json]",
       "  devspace agents targets [--json]",
-      "  devspace agents run <profile-or-provider-or-id> [--model <model>] [--effort <level>] <prompt>",
-      "  devspace agents show <id>",
+      "  devspace agents run <profile-or-provider-or-id> [--model <model>] [--effort <level>] <prompt> [--json]",
+      "  devspace agents show <id> [--json]",
     ].join("\n"),
   );
 }
