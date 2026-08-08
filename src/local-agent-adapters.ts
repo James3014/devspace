@@ -295,9 +295,11 @@ class OpencodeLocalAgentAdapter implements LocalAgentAdapter {
       const sessionId = input.providerSessionId ?? await createOpencodeSession(client, input);
       observer?.onSession?.(sessionId);
       const promptResult = await promptOpencodeSession(client, sessionId, input);
+      // The prompt response is scoped to this turn; the messages endpoint returns
+      // the whole session and would reattribute historical tools on resume.
+      const usage = observeOpenCodeResult(promptResult, observer);
       await waitForOpencodeSession(client, sessionId);
       const messages = await readOpencodeMessages(client, sessionId);
-      const usage = observeOpenCodeResult(messages, observer);
       const finalResponse = requireFinalResponse(
         "OpenCode",
         extractOpenCodeFinalResponse(messages) || extractOpenCodeFinalResponse(promptResult),
