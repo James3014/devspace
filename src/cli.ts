@@ -42,6 +42,10 @@ import {
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
+import {
+  assertRecordInCliWorkspace,
+  resolveCliWorkspaceContext,
+} from "./cli-workspace.js";
 
 import { runWorkflowCommand } from "./workflow-cli.js";
 import {
@@ -384,7 +388,7 @@ async function runAgentsCommand(args: string[]): Promise<void> {
 async function runAgentsList(): Promise<void> {
   const config = loadConfig();
   const store = createLocalAgentStore(config);
-  const agents = store.list(resolveCurrentWorkspaceScope());
+  const agents = store.list(resolveCliWorkspaceContext());
 
   if (agents.length === 0) {
     console.log("No subagent sessions found for this workspace.");
@@ -403,7 +407,7 @@ async function runAgentsTargets(args: string[]): Promise<void> {
   }
 
   const config = loadConfig();
-  const workspaceRoot = resolveCurrentWorkspaceRoot();
+  const { workspaceRoot } = resolveCliWorkspaceContext();
   const profiles = await loadLocalAgentProfiles(config, workspaceRoot);
   const catalog = buildLocalAgentCatalog(
     profiles,
@@ -420,11 +424,13 @@ async function runAgentsRun(args: string[]): Promise<void> {
   const parsed = parseLocalAgentRunArgs(args);
 
   const config = loadConfig();
-  const workspaceRoot = resolveCurrentWorkspaceRoot();
+  const workspace = resolveCliWorkspaceContext();
+  const workspaceRoot = workspace.workspaceRoot;
   const store = createLocalAgentStore(config);
   const existing = store.get(parsed.target);
 
   if (existing) {
+    assertRecordInCliWorkspace(existing, workspace, "Subagent session");
     if (!isLocalAgentProvider(existing.provider)) {
       throw new Error(`Unknown subagent provider for existing session: ${existing.provider}`);
     }
@@ -466,7 +472,7 @@ async function runAgentsRun(args: string[]): Promise<void> {
 
   const promptFile = writeAgentPromptFile(parsed.prompt);
   const record = store.create({
-    workspaceId: process.env.DEVSPACE_WORKSPACE_ID,
+    workspaceId: workspace.workspaceId,
     workspaceRoot,
     profileName: target.name,
     provider: target.provider,
@@ -484,8 +490,10 @@ async function runAgentsShow(args: string[]): Promise<void> {
 
   const config = loadConfig();
   const store = createLocalAgentStore(config);
+  const workspace = resolveCliWorkspaceContext();
   let record = store.get(id);
   if (!record) throw new Error(`Unknown subagent id: ${id}`);
+  assertRecordInCliWorkspace(record, workspace, "Subagent session");
 
   const deadline = Date.now() + 15_000;
   while ((record.status === "starting" || record.status === "running") && Date.now() < deadline) {
@@ -574,17 +582,6 @@ function writeAgentPromptFile(prompt: string): string {
   const filePath = join(directory, "prompt.txt");
   writeFileSync(filePath, prompt, { mode: 0o600 });
   return filePath;
-}
-
-function resolveCurrentWorkspaceRoot(): string {
-  return resolve(process.env.DEVSPACE_WORKSPACE_ROOT || process.cwd());
-}
-
-function resolveCurrentWorkspaceScope(): { workspaceId?: string; workspaceRoot: string } {
-  return {
-    workspaceId: process.env.DEVSPACE_WORKSPACE_ID,
-    workspaceRoot: resolveCurrentWorkspaceRoot(),
-  };
 }
 
 function formatAgentLine(agent: Pick<

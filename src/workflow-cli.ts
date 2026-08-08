@@ -1,5 +1,9 @@
-import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  assertRecordInCliWorkspace,
+  resolveCliWorkspaceContext,
+  type CliWorkspaceContext,
+} from "./cli-workspace.js";
 import type { ServerConfig } from "./config.js";
 import { parseWorkflowArgFlagsResult } from "./workflow-files.js";
 import {
@@ -129,7 +133,13 @@ async function runWorkflowRun(args: string[], config: ServerConfig): Promise<voi
   const source = buildCliLaunchSource({ file, name, resumeFrom });
   const store = createWorkflowStore(config);
   try {
-    const workspaceRoot = resolve(process.env.DEVSPACE_WORKSPACE_ROOT || process.cwd());
+    const workspace = resolveCliWorkspaceContext();
+    const workspaceRoot = workspace.workspaceRoot;
+    if (resumeFrom) {
+      const prior = store.getRun(resumeFrom);
+      if (!prior) throw new WorkflowNotFoundError(resumeFrom);
+      assertWorkflowInCurrentProject(prior, workspace);
+    }
     let argsValue = Object.keys(workflowArgs).length ? workflowArgs : undefined;
 
     // Resume without explicit --arg reuses prior args inside launch; if CLI
@@ -144,7 +154,7 @@ async function runWorkflowRun(args: string[], config: ServerConfig): Promise<voi
       store,
       config,
       workspaceRoot,
-      workspaceId: process.env.DEVSPACE_WORKSPACE_ID,
+      workspaceId: workspace.workspaceId,
       source,
       args: argsValue,
       cliEntry: fileURLToPath(import.meta.url.replace(/workflow-cli\.(ts|js)$/, "cli.$1")),
@@ -195,10 +205,12 @@ async function runWorkflowStatus(args: string[], config: ServerConfig): Promise<
   const store = createWorkflowStore(config);
   try {
     reapStaleWorkflows(store);
+    const workspace = resolveCliWorkspaceContext();
     const runResult = store.getRunResult(runId);
     if (runResult.isErr()) throw runResult.error;
     const run = runResult.value;
     if (!run) throw new WorkflowNotFoundError(runId);
+    assertWorkflowInCurrentProject(run, workspace);
     console.log(formatRunLine(run));
     console.log(formatCallSummary(store.listAgentCalls(runId)));
     if (follow) {
@@ -223,6 +235,9 @@ async function runWorkflowCancel(args: string[], config: ServerConfig): Promise<
   const store = createWorkflowStore(config);
   try {
     reapStaleWorkflows(store);
+    const run = store.getRun(runId);
+    if (!run) throw new WorkflowNotFoundError(runId);
+    assertWorkflowInCurrentProject(run, resolveCliWorkspaceContext());
     console.log(formatRunLine(await cancelWorkflowRun(store, runId)));
   } finally {
     store.close();
@@ -233,7 +248,9 @@ async function runWorkflowList(config: ServerConfig): Promise<void> {
   const store = createWorkflowStore(config);
   try {
     reapStaleWorkflows(store);
-    const runs = store.listRuns(50);
+    const runs = store.listRunsForScope(resolveCliWorkspaceContext(), {
+      limit: 50,
+    });
     if (runs.length === 0) {
       console.log("No workflow runs.");
       return;
@@ -254,7 +271,9 @@ async function runWorkflowCalls(args: string[], config: ServerConfig): Promise<v
   }
   const store = createWorkflowStore(config);
   try {
-    if (!store.getRun(runId)) throw new WorkflowNotFoundError(runId);
+    const run = store.getRun(runId);
+    if (!run) throw new WorkflowNotFoundError(runId);
+    assertWorkflowInCurrentProject(run, resolveCliWorkspaceContext());
     const calls = store.listAgentCalls(runId);
     if (calls.length === 0) {
       console.log("No workflow agent calls.");
@@ -277,7 +296,9 @@ async function runWorkflowCall(args: string[], config: ServerConfig): Promise<vo
   }
   const store = createWorkflowStore(config);
   try {
-    if (!store.getRun(runId)) throw new WorkflowNotFoundError(runId);
+    const run = store.getRun(runId);
+    if (!run) throw new WorkflowNotFoundError(runId);
+    assertWorkflowInCurrentProject(run, resolveCliWorkspaceContext());
     const call = store.getAgentCall(runId, callIndex);
     if (!call) {
       throw new InvalidWorkflowInputError({
@@ -289,6 +310,13 @@ async function runWorkflowCall(args: string[], config: ServerConfig): Promise<vo
   } finally {
     store.close();
   }
+}
+
+function assertWorkflowInCurrentProject(
+  run: WorkflowRunRecord,
+  workspace: CliWorkspaceContext,
+): void {
+  assertRecordInCliWorkspace(run, workspace, "Workflow run");
 }
 
 async function followRun(store: WorkflowStore, runId: string): Promise<void> {

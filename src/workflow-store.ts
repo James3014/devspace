@@ -117,6 +117,11 @@ export interface DrainEventsResult {
   run: WorkflowRunRecord;
 }
 
+export interface WorkflowRunScope {
+  workspaceId?: string;
+  workspaceRoot: string;
+}
+
 interface WorkflowRunRow {
   id: string;
   name: string;
@@ -298,6 +303,40 @@ export class WorkflowStore {
          limit ?`,
       )
       .all(root, ...statuses, limit) as WorkflowRunRow[];
+    return rows.map(rowToRun);
+  }
+
+  listRunsForScope(
+    scope: WorkflowRunScope,
+    options: {
+      statuses?: WorkflowRunStatus[];
+      limit?: number;
+    } = {},
+  ): WorkflowRunRecord[] {
+    if (!scope.workspaceId) return this.listRunsForWorkspace(scope.workspaceRoot, options);
+
+    const limit = Math.max(1, Math.min(options.limit ?? 50, 500));
+    const statuses = options.statuses?.filter((status, index, values) =>
+      values.indexOf(status) === index,
+    );
+    if (!statuses?.length) {
+      const rows = this.database.sqlite
+        .prepare(
+          "select * from workflow_runs where workspace_id = ? order by updated_at desc limit ?",
+        )
+        .all(scope.workspaceId, limit) as WorkflowRunRow[];
+      return rows.map(rowToRun);
+    }
+
+    const placeholders = statuses.map(() => "?").join(", ");
+    const rows = this.database.sqlite
+      .prepare(
+        `select * from workflow_runs
+         where workspace_id = ? and status in (${placeholders})
+         order by updated_at desc
+         limit ?`,
+      )
+      .all(scope.workspaceId, ...statuses, limit) as WorkflowRunRow[];
     return rows.map(rowToRun);
   }
 
