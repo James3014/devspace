@@ -724,7 +724,7 @@ function createMcpServer(
     "DevSpace App",
     WORKSPACE_APP_URI,
     {
-      description: "Interactive DevSpace workspace, workflow, and file-change views.",
+      description: "Interactive DevSpace workspace and file-change views.",
       _meta: {
         ui: {
           csp: appCsp(config),
