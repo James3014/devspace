@@ -425,8 +425,14 @@ try {
   observer.onUsage?.({ inputTokens: 100, outputTokens: 20, totalTokens: 120, state: "partial" });
   observer.onUsage?.({ inputTokens: 180, outputTokens: 40, totalTokens: 220, state: "final" });
   observer.close();
+
+  const retryObserver = createWorkflowAgentObserver(store, observedRun.id, 0, 60_000);
+  retryObserver.onUsage?.({ inputTokens: 50, outputTokens: 30, totalTokens: 80, state: "final" });
+  retryObserver.close();
   assert.equal(store.getAgentCall(observedRun.id, 0)?.providerSessionId, "session_123");
-  assert.equal(store.getAgentCall(observedRun.id, 0)?.usage?.totalTokens, 220);
+  assert.equal(store.getAgentCall(observedRun.id, 0)?.usage?.inputTokens, 230);
+  assert.equal(store.getAgentCall(observedRun.id, 0)?.usage?.outputTokens, 70);
+  assert.equal(store.getAgentCall(observedRun.id, 0)?.usage?.totalTokens, 300);
   assert.equal(store.getAgentCall(observedRun.id, 0)?.usage?.state, "final");
   assert.equal(store.listAgentActivity(observedRun.id, 0)[0]?.label, "npm test");
 

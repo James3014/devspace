@@ -9,6 +9,7 @@ export function createWorkflowAgentObserver(
   callIndex: number,
   intervalMs = USAGE_WRITE_INTERVAL_MS,
 ): LocalAgentObserver & { close(): void } {
+  const baseline = store.getAgentCall(runId, callIndex)?.usage;
   let lastUsageWrite = 0;
   let pendingUsage: LocalAgentUsageSnapshot | undefined;
   let timer: NodeJS.Timeout | undefined;
@@ -18,7 +19,17 @@ export function createWorkflowAgentObserver(
     if (timer) clearTimeout(timer);
     timer = undefined;
     lastUsageWrite = Date.now();
-    store.updateAgentUsage(runId, callIndex, usage);
+    store.updateAgentUsage(runId, callIndex, {
+      inputTokens: sumOptional(baseline?.inputTokens, usage.inputTokens),
+      cachedInputTokens: sumOptional(baseline?.cachedInputTokens, usage.cachedInputTokens),
+      cacheCreationInputTokens: sumOptional(
+        baseline?.cacheCreationInputTokens,
+        usage.cacheCreationInputTokens,
+      ),
+      outputTokens: sumOptional(baseline?.outputTokens, usage.outputTokens),
+      totalTokens: (baseline?.totalTokens ?? 0) + usage.totalTokens,
+      state: usage.state,
+    });
   };
 
   const scheduleUsage = (): void => {
@@ -51,4 +62,8 @@ export function createWorkflowAgentObserver(
       timer = undefined;
     },
   };
+}
+
+function sumOptional(left: number | undefined, right: number | undefined): number | undefined {
+  return left === undefined && right === undefined ? undefined : (left ?? 0) + (right ?? 0);
 }
