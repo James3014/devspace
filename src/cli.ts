@@ -84,7 +84,7 @@ async function main(argv: string[]): Promise<void> {
     case "agents":
       if (!loadConfig().subagents) {
         throw new Error(
-          "Subagents are disabled. Set DEVSPACE_SUBAGENTS=1 to enable the experimental feature.",
+          "Agent tooling is disabled. Run `devspace init --force` or set DEVSPACE_SUBAGENTS=1.",
         );
       }
       await runAgentsCommand(args);
@@ -297,7 +297,10 @@ async function runDoctor(): Promise<void> {
     console.log(`Subagents: ${config.subagents ? "enabled" : "disabled"}`);
     console.log(`Workflows: ${config.workflows ? "enabled" : "disabled"}`);
     if (config.subagents) {
-      const snapshot = getLocalAgentProviderAvailabilitySnapshot();
+      const snapshot = getLocalAgentProviderAvailabilitySnapshot(
+        process.env,
+        config.agentProviders,
+      );
       console.log(
         `Agent providers (live): ${formatLocalAgentProviderAvailabilitySummary(snapshot)}`,
       );
@@ -420,7 +423,7 @@ async function runAgentsTargets(args: string[]): Promise<void> {
   const profiles = await loadLocalAgentProfiles(config, workspaceRoot);
   const catalog = buildLocalAgentCatalog(
     profiles,
-    getLocalAgentProviderAvailabilitySnapshot(),
+    getLocalAgentProviderAvailabilitySnapshot(process.env, config.agentProviders),
   );
   console.log(
     args.includes("--json")
@@ -443,7 +446,7 @@ async function runAgentsRun(args: string[]): Promise<void> {
     if (!isLocalAgentProvider(existing.provider)) {
       throw new Error(`Unknown subagent provider for existing session: ${existing.provider}`);
     }
-    assertLocalAgentProviderAvailable(existing.provider);
+    assertLocalAgentProviderAvailable(existing.provider, process.env, config.agentProviders);
     const promptFile = writeAgentPromptFile(parsed.prompt);
     store.update(existing.id, {
       status: "starting",
@@ -465,7 +468,10 @@ async function runAgentsRun(args: string[]): Promise<void> {
   }
 
   const profiles = await loadLocalAgentProfiles(config, workspaceRoot);
-  const availableProviders = getAvailableLocalAgentProviders();
+  const availableProviders = getAvailableLocalAgentProviders(
+    process.env,
+    config.agentProviders,
+  );
   let target;
   try {
     target = resolveLocalAgentExecution({
@@ -556,7 +562,10 @@ async function runAgentsWorker(args: string[]): Promise<void> {
       target: record.profileName,
       prompt,
       profiles,
-      availableProviders: getAvailableLocalAgentProviders(),
+      availableProviders: getAvailableLocalAgentProviders(
+        process.env,
+        config.agentProviders,
+      ),
       model: record.model,
       effort: record.effort,
     });

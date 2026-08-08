@@ -1632,7 +1632,7 @@ export function createServer(config = loadConfig()): RunningServer {
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
   const localAgentProviders = config.subagents
-    ? getLocalAgentProviderAvailabilitySnapshot()
+    ? getLocalAgentProviderAvailabilitySnapshot(process.env, config.agentProviders)
     : [];
   const workflowReaper = config.workflows
     ? startWorkflowReaper(config, {
