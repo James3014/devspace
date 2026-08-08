@@ -430,8 +430,7 @@ async function runAgentsTargets(args: string[]): Promise<void> {
 }
 
 async function runAgentsRun(args: string[]): Promise<void> {
-  const json = args.includes("--json");
-  const parsed = parseLocalAgentRunArgs(args.filter((arg) => arg !== "--json"));
+  const parsed = parseLocalAgentRunArgs(args);
 
   const config = loadConfig();
   const workspace = resolveCliWorkspaceContext();
@@ -460,7 +459,7 @@ async function runAgentsRun(args: string[]): Promise<void> {
       model: parsed.model ?? existing.model,
       effort: parsed.effort ?? existing.effort,
     } as LocalAgentRecord;
-    if (json) printJson({ agent: localAgentOutput(running) });
+    if (parsed.json) printJson({ agent: localAgentOutput(running) });
     else console.log(formatAgentLine(running));
     return;
   }
@@ -494,7 +493,7 @@ async function runAgentsRun(args: string[]): Promise<void> {
 
   spawnAgentWorker(record.id, promptFile);
   const running = { ...record, status: "running" } as LocalAgentRecord;
-  if (json) printJson({ agent: localAgentOutput(running) });
+  if (parsed.json) printJson({ agent: localAgentOutput(running) });
   else console.log(formatAgentLine(running));
 }
 
