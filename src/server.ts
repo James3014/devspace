@@ -813,7 +813,10 @@ function createMcpServer(
         ? (() => {
             const workflowStore = createWorkflowStore(config);
             try {
-              return loadActiveWorkflowSummaries(workflowStore, workspace.root);
+              return loadActiveWorkflowSummaries(workflowStore, {
+                workspaceId: workspace.id,
+                workspaceRoot: workspace.root,
+              });
             } finally {
               workflowStore.close();
             }

@@ -1,4 +1,4 @@
-import type { WorkflowStore } from "./workflow-store.js";
+import type { WorkflowRunScope, WorkflowStore } from "./workflow-store.js";
 import type { WorkflowRunStatus } from "./workflow-types.js";
 
 const ACTIVE_WORKFLOW_STATUSES = ["starting", "running"] as const satisfies readonly WorkflowRunStatus[];
@@ -17,10 +17,10 @@ export interface ActiveWorkflowSummary {
 
 export function loadActiveWorkflowSummaries(
   store: WorkflowStore,
-  workspaceRoot: string,
+  scope: WorkflowRunScope,
 ): ActiveWorkflowSummary[] {
   return store
-    .listRunsForWorkspace(workspaceRoot, {
+    .listRunsForScope(scope, {
       statuses: [...ACTIVE_WORKFLOW_STATUSES],
       limit: 50,
     })

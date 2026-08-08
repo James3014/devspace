@@ -64,11 +64,12 @@ const parsed = enabledSchema.parse({
 });
 assert.deepEqual(parsed.agentProviders, ["codex"]);
 assert.deepEqual(parsed.agents, [{ name: "reviewer", description: "Review changes." }]);
-assert.deepEqual(parsed.activeWorkflows?.[0]?.calls, {
-  running: 1,
-  completed: 2,
-  failed: 0,
-});
+assert.deepEqual(parsed.activeWorkflows, [{
+  id: "wfr_1",
+  name: "Review",
+  status: "running",
+  calls: { running: 1, completed: 2, failed: 0 },
+}]);
 assert.equal("skillDiagnostics" in parsed, false);
 
 console.log("open-workspace-capabilities.test.ts: ok");
