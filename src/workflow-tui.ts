@@ -38,9 +38,9 @@ export async function runWorkflowTui(args: string[], config: ServerConfig): Prom
   const requestedRunId = args.find((arg) => !arg.startsWith("-"));
   const workspaceRoot = resolveWorkflowTuiWorkspaceRoot();
   const store = createWorkflowStore(config);
-  const load = (): WorkflowProjectView =>
+  const load = (includeTerminal = false): WorkflowProjectView =>
     loadWorkflowProjectView(store, workspaceRoot, {
-      statuses: requestedRunId ? undefined : [...ACTIVE_WORKFLOW_STATUSES],
+      statuses: requestedRunId || includeTerminal ? undefined : [...ACTIVE_WORKFLOW_STATUSES],
       limit: 50,
       eventLimit: 100,
     });
@@ -72,8 +72,9 @@ export async function runWorkflowTui(args: string[], config: ServerConfig): Prom
     if (rendering || closed) return;
     rendering = true;
     try {
-      project = load();
-      state = clampWorkflowTuiState(project, state);
+      const previousProject = project;
+      project = load(state.screen !== "workflows");
+      state = reconcileWorkflowTuiState(previousProject, project, state);
       process.stdout.write(
         `\u001b[H\u001b[2J${renderWorkflowTui(
           project,
@@ -171,7 +172,7 @@ export function reduceWorkflowTuiState(
     if (state.focus === "phases") {
       if (key === "up" || key === "k") return { ...state, phaseIndex: Math.max(0, state.phaseIndex - 1), callIndex: 0 };
       if (key === "down" || key === "j") {
-        return { ...state, phaseIndex: Math.min(Math.max(0, run.phases.length - 1), state.phaseIndex + 1), callIndex: 0 };
+        return { ...state, phaseIndex: Math.min(Math.max(0, navigatorPhases(run).length - 1), state.phaseIndex + 1), callIndex: 0 };
       }
       if (key === "return" || key === "right") return { ...state, focus: "calls" };
     } else {
@@ -205,13 +206,15 @@ export function renderWorkflowTui(
   rows: number,
   options: { ansi?: boolean; activity?: WorkflowAgentActivityRecord[] } = {},
 ): string {
+  project = sanitizeTerminalValue(project);
+  const activity = sanitizeTerminalValue(options.activity ?? []);
   const width = Math.max(48, columns);
   const ansi = options.ansi !== false;
   const lines = state.screen === "workflows"
     ? renderWorkflowList(project, state, width, ansi)
     : state.screen === "workflow"
       ? renderNavigator(project, state, width, ansi)
-      : renderCallInspector(project, state, width, ansi, options.activity ?? []);
+      : renderCallInspector(project, state, width, ansi, activity);
   return fitRows(lines, rows).join("\n");
 }
 
@@ -247,17 +250,18 @@ function renderNavigator(
     truncate(`${statusGlyph(run.status)} ${run.status.toUpperCase()}  ${elapsedLabel(run)}  ·  ${callSummary(run)}${run.totalTokens ? `  ·  ${formatTokens(run.totalTokens)} tokens observed` : ""}`, width),
     rule(width),
   ];
-  const phase = run.phases[state.phaseIndex];
+  const phases = navigatorPhases(run);
+  const phase = phases[state.phaseIndex];
   const calls = callsForPhase(run, state.phaseIndex);
   if (width < 80) {
     lines.push(style(state.focus === "phases" ? "PHASES" : `AGENTS · ${phase?.title ?? "Other"}`, "heading", ansi));
-    if (state.focus === "phases") appendPhaseLines(lines, run.phases, state.phaseIndex, width);
+    if (state.focus === "phases") appendPhaseLines(lines, phases, state.phaseIndex, width);
     else appendCallLines(lines, calls, state.callIndex, width);
   } else {
     const leftWidth = Math.min(32, Math.floor(width * 0.35));
     const rightWidth = width - leftWidth - 3;
     lines.push(`${style("PHASES".padEnd(leftWidth), "heading", ansi)} │ ${style(`AGENTS · ${phase?.title ?? "Other"}`, "heading", ansi)}`);
-    const left = phaseRows(run.phases, state.phaseIndex, leftWidth);
+    const left = phaseRows(phases, state.phaseIndex, leftWidth);
     const right = callRows(calls, state.callIndex, rightWidth);
     const count = Math.max(left.length, right.length, 1);
     for (let index = 0; index < count; index += 1) {
@@ -323,11 +327,24 @@ function inspectorBody(tab: InspectorTab, call: WorkflowCallView, activity: Work
   ];
 }
 
-function clampWorkflowTuiState(project: WorkflowProjectView, state: WorkflowTuiState): WorkflowTuiState {
-  const runIndex = Math.min(Math.max(0, state.runIndex), Math.max(0, project.runs.length - 1));
+export function reconcileWorkflowTuiState(
+  previousProject: WorkflowProjectView,
+  project: WorkflowProjectView,
+  state: WorkflowTuiState,
+): WorkflowTuiState {
+  const previousRunId = previousProject.runs[state.runIndex]?.id;
+  const matchingRunIndex = previousRunId
+    ? project.runs.findIndex((run) => run.id === previousRunId)
+    : -1;
+  const runIndex = matchingRunIndex >= 0
+    ? matchingRunIndex
+    : Math.min(Math.max(0, state.runIndex), Math.max(0, project.runs.length - 1));
   if (state.screen === "workflows") return { ...state, runIndex };
   const run = project.runs[runIndex];
-  const phaseIndex = Math.min(Math.max(0, state.phaseIndex), Math.max(0, (run?.phases.length ?? 1) - 1));
+  const phaseIndex = Math.min(
+    Math.max(0, state.phaseIndex),
+    Math.max(0, (run ? navigatorPhases(run).length : 1) - 1),
+  );
   const calls = run ? callsForPhase(run, phaseIndex) : [];
   const callIndex = Math.min(Math.max(0, state.callIndex), Math.max(0, calls.length - 1));
   return { ...state, runIndex, phaseIndex, callIndex };
@@ -339,7 +356,7 @@ function selectedCall(project: WorkflowProjectView, state: { runIndex: number; p
 }
 
 function callsForPhase(run: WorkflowRunView, phaseIndex: number): WorkflowCallView[] {
-  return run.phases[phaseIndex]?.calls ?? run.unphasedCalls;
+  return navigatorPhases(run)[phaseIndex]?.calls ?? [];
 }
 
 function initialPhaseIndex(run: WorkflowRunView): number {
@@ -347,6 +364,19 @@ function initialPhaseIndex(run: WorkflowRunView): number {
     ? run.phases.findIndex((phase) => phase.title === run.currentPhase)
     : -1;
   return index < 0 ? 0 : index;
+}
+
+function navigatorPhases(run: WorkflowRunView): WorkflowPhaseView[] {
+  if (run.unphasedCalls.length === 0) return run.phases;
+  const calls = run.unphasedCalls;
+  const status: WorkflowPhaseView["status"] = calls.some((call) => call.status === "failed")
+    ? "failed"
+    : calls.some((call) => call.status === "running")
+      ? "running"
+      : calls.every((call) => call.status === "cancelled")
+        ? "cancelled"
+        : "completed";
+  return [...run.phases, { title: "Other", status, calls }];
 }
 
 function appendPhaseLines(lines: string[], phases: WorkflowPhaseView[], selected: number, width: number): void {
@@ -436,4 +466,19 @@ function style(value: string, tone: "bold" | "heading" | "muted", ansi: boolean)
   if (tone === "bold") return `\u001b[1m${value}\u001b[0m`;
   if (tone === "heading") return `\u001b[1;36m${value}\u001b[0m`;
   return `\u001b[2m${value}\u001b[0m`;
+}
+
+function sanitizeTerminalValue<T>(value: T): T {
+  if (typeof value === "string") {
+    return value.replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, (character) =>
+      `\\x${character.charCodeAt(0).toString(16).padStart(2, "0")}`,
+    ) as T;
+  }
+  if (Array.isArray(value)) return value.map(sanitizeTerminalValue) as T;
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, child]) => [key, sanitizeTerminalValue(child)]),
+    ) as T;
+  }
+  return value;
 }

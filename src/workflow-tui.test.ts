@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import {
   createWorkflowTuiState,
   reduceWorkflowTuiState,
+  reconcileWorkflowTuiState,
   renderWorkflowTui,
   resolveWorkflowTuiWorkspaceRoot,
 } from "./workflow-tui.js";
@@ -61,7 +62,17 @@ const project: WorkflowProjectView = {
           ],
         },
       ],
-      unphasedCalls: [],
+      unphasedCalls: [{
+        callIndex: 2,
+        status: "completed",
+        provider: "claude",
+        label: "Summarize rollout",
+        isolation: "shared",
+        fromCache: false,
+        prompt: "Summarize the rollout",
+        responseText: "Ready",
+        updatedAt: "2026-07-26T10:00:03.000Z",
+      }],
       recentActivity: [
         {
           seq: 1,
@@ -90,6 +101,7 @@ rendered = renderWorkflowTui(project, state, 100, 30, { ansi: false });
 assert.match(rendered, /Workflow › Review auth/);
 assert.match(rendered, /PHASES\s+│ AGENTS · Implementation/);
 assert.match(rendered, /Patch auth  codex  2\.4k/);
+assert.match(rendered, /Other  1\/1/);
 
 state = reduceWorkflowTuiState(project, state, "tab");
 state = reduceWorkflowTuiState(project, state, "return");
@@ -109,6 +121,33 @@ rendered = renderWorkflowTui(project, state, 72, 30, {
 });
 assert.match(rendered, /Workflow › Implementation › Patch auth/);
 assert.match(rendered, /tool\s+bash · npm test/);
+
+let unphasedState = createWorkflowTuiState(project, "wfr_1");
+unphasedState = reduceWorkflowTuiState(project, unphasedState, "down");
+assert.equal(unphasedState.screen === "workflow" && unphasedState.phaseIndex, 2);
+unphasedState = reduceWorkflowTuiState(project, unphasedState, "tab");
+unphasedState = reduceWorkflowTuiState(project, unphasedState, "return");
+assert.equal(unphasedState.screen, "call");
+assert.match(renderWorkflowTui(project, unphasedState, 80, 20, { ansi: false }), /Other › Summarize rollout/);
+
+const reorderedProject = { ...project, runs: [{ ...project.runs[0]!, id: "wfr_new" }, project.runs[0]!] };
+const reconciled = reconcileWorkflowTuiState(project, reorderedProject, {
+  screen: "workflow",
+  runIndex: 0,
+  phaseIndex: 1,
+  callIndex: 0,
+  focus: "calls",
+});
+assert.equal(reconciled.runIndex, 1);
+
+const unsafeProject = {
+  ...project,
+  workspaceRoot: "/tmp/project\u001b]52;c;clipboard\u0007",
+  runs: [{ ...project.runs[0]!, name: "Review\u001b[2Jauth" }],
+};
+const safeRender = renderWorkflowTui(unsafeProject, createWorkflowTuiState(unsafeProject), 100, 20, { ansi: false });
+assert.doesNotMatch(safeRender, /\u001b|\u0007/);
+assert.match(safeRender, /\\x1b/);
 
 const narrow = renderWorkflowTui(project, {
   screen: "workflow",
