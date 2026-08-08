@@ -11,8 +11,6 @@ for (const tool of [
   "apply_patch",
   "exec_command",
   "write_stdin",
-  "run_workflow",
-  "workflow_status",
 ]) {
   assert.equal(isToolName(tool), true, `${tool} should be a recognized card tool`);
 }
@@ -29,7 +27,6 @@ assert.equal(
   true,
 );
 assert.equal(isExpandableCard({ tool: "apply_patch" }), false);
-assert.equal(isExpandableCard({ tool: "run_workflow", runId: "wfr_1" }), true);
 assert.equal(
   isExpandableCard({
     tool: "open_workspace",
