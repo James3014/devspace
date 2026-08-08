@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import {
+  createWorkflowTuiState,
+  reduceWorkflowTuiState,
   renderWorkflowTui,
   resolveWorkflowTuiWorkspaceRoot,
 } from "./workflow-tui.js";
@@ -26,17 +28,34 @@ const project: WorkflowProjectView = {
         cancelled: 0,
         observed: 2,
       },
+      totalTokens: 2_400,
       phases: [
         {
+          title: "Planning",
+          status: "completed",
+          calls: [],
+        },
+        {
           title: "Implementation",
+          status: "running",
           calls: [
             {
               callIndex: 1,
               status: "running",
               provider: "codex",
               label: "Patch auth",
+              phase: "Implementation",
               isolation: "worktree",
               fromCache: false,
+              prompt: "Patch the auth flow",
+              providerSessionId: "session_1",
+              usage: {
+                inputTokens: 1_600,
+                outputTokens: 800,
+                totalTokens: 2_400,
+                state: "partial",
+                updatedAt: "2026-07-26T10:00:02.000Z",
+              },
               updatedAt: "2026-07-26T10:00:02.000Z",
             },
           ],
@@ -60,12 +79,47 @@ const project: WorkflowProjectView = {
   ],
 };
 
-const rendered = renderWorkflowTui(project, 0, 100, 30, { ansi: false });
-assert.match(rendered, /DevSpace workflows · \/tmp\/project/);
-assert.match(rendered, /Review auth · Implementation/);
-assert.match(rendered, /Patch auth  codex · worktree/);
-assert.match(rendered, /Running tests/);
-assert.match(rendered, /refreshes automatically/);
-assert.equal(resolveWorkflowTuiWorkspaceRoot("./test-project").endsWith("test-project"), true);
+let state = createWorkflowTuiState(project);
+let rendered = renderWorkflowTui(project, state, 100, 30, { ansi: false });
+assert.match(rendered, /Workflows · \/tmp\/project/);
+assert.match(rendered, /Review auth  Implementation/);
+
+state = reduceWorkflowTuiState(project, state, "return");
+assert.equal(state.screen, "workflow");
+rendered = renderWorkflowTui(project, state, 100, 30, { ansi: false });
+assert.match(rendered, /Workflow › Review auth/);
+assert.match(rendered, /PHASES\s+│ AGENTS · Implementation/);
+assert.match(rendered, /Patch auth  codex  2\.4k/);
+
+state = reduceWorkflowTuiState(project, state, "tab");
+state = reduceWorkflowTuiState(project, state, "return");
+assert.equal(state.screen, "call");
+rendered = renderWorkflowTui(project, state, 72, 30, {
+  ansi: false,
+  activity: [{
+    runId: "wfr_1",
+    callIndex: 1,
+    seq: 1,
+    kind: "tool",
+    status: "completed",
+    label: "bash",
+    detail: "npm test",
+    createdAt: "2026-07-26T10:00:03.000Z",
+  }],
+});
+assert.match(rendered, /Workflow › Implementation › Patch auth/);
+assert.match(rendered, /tool\s+bash · npm test/);
+
+const narrow = renderWorkflowTui(project, {
+  screen: "workflow",
+  runIndex: 0,
+  phaseIndex: 1,
+  callIndex: 0,
+  focus: "phases",
+}, 60, 20, { ansi: false });
+assert.match(narrow, /PHASES/);
+assert.doesNotMatch(narrow, /AGENTS · Implementation/);
+
+assert.equal(resolveWorkflowTuiWorkspaceRoot(process.cwd()), process.cwd());
 
 console.log("workflow-tui.test.ts: ok");
