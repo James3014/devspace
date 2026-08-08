@@ -95,6 +95,8 @@ devspace workflow run --resume <run-id> --file <updated-script> --json
 
 Keep completed calls' prompts and options stable when their results should be reused. Resume reuses the unchanged successful prefix and executes from the first call that failed, changed, or cannot be reused.
 
+A completed `isolation: 'worktree'` call cannot be reused because its checkout is not restored. When resume reaches one, that call and every later call execute again, even if their inputs are unchanged. Do not assume mutations from the prior isolated checkout are present in the resumed run.
+
 ## Good uses
 
 - Fan out a change review across correctness, security, and tests, then synthesize it.

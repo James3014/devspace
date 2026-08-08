@@ -42,7 +42,7 @@ devspace agents ls --json
 - `run <id>` continues the same agent session with a new prompt.
 - `ls` returns sessions belonging to the current project.
 
-Poll `show --json` until the status is terminal. Use a continuation only when the same context is valuable; start a new subagent for independent work.
+Poll `show --json` while the status is `starting` or `running`. `idle` means the response is ready; `error` and `stopped` are terminal without a successful response. Use a continuation only when the same context is valuable; start a new subagent for independent work.
 
 ## Good uses
 
