@@ -1,4 +1,4 @@
-import type { WorkflowRunSummaryView } from "../workflow-ui.js";
+import type { ActiveWorkflowSummary } from "../workflow-summary.js";
 import type { ToolResultCard } from "./card-types.js";
 import { renderIcon, toolIcons } from "./icons.js";
 
@@ -80,24 +80,12 @@ export function renderWorkspaceDashboard(
           renderList(
             card.agents.map((agent) => ({
               title: agent.name ?? "Unnamed profile",
-              description: [agent.provider, agent.model, agent.effort].filter(Boolean).join(" · "),
-              meta: agent.description,
+              description: agent.description,
             })),
             "No agent profiles loaded.",
           ),
         )]
       : []),
-    renderAccordion(
-      `Warnings · ${card.skillDiagnostics?.length ?? 0}`,
-      false,
-      renderList(
-        card.skillDiagnostics?.map((diagnostic, index) => ({
-          title: `Diagnostic ${index + 1}`,
-          description: summarizeDiagnostic(diagnostic),
-        })) ?? [],
-        "No workspace warnings.",
-      ),
-    ),
     renderAccordion(
       "Model handoff",
       false,
@@ -128,7 +116,7 @@ function renderDashboardToolbar(
 }
 
 function renderWorkflowSummarySection(
-  runs: Array<WorkflowRunView | WorkflowRunSummaryView>,
+  runs: ActiveWorkflowSummary[],
 ): HTMLElement {
   const section = node("section", { className: "active-workflows" });
   section.append(node("h3", { text: `Active workflows · ${runs.length}` }));
@@ -143,7 +131,7 @@ function renderWorkflowSummarySection(
       node("div", { className: "active-workflow-copy" }, [
         node("strong", { text: run.name }),
         node("span", {
-          text: `${run.currentPhase ?? run.status} · ${summaryCounts(run.calls)}`,
+          text: `${run.status} · ${summaryCounts(run.calls)}`,
         }),
       ]),
     );
@@ -169,15 +157,7 @@ function renderKeyValues(entries: Array<[string, string]>): HTMLElement {
 
 function renderProviderList(card: ToolResultCard): HTMLElement {
   return renderList(
-    card.agentProviders?.map((provider) => ({
-      title: provider.name ?? "Unknown provider",
-      description: [
-        provider.model?.supported ? `model: ${provider.model.discovery ?? "supported"}` : undefined,
-        provider.effort?.supported
-          ? `effort: ${provider.effort.semantics ?? "supported"} (${provider.effort.discovery ?? "unknown"})`
-          : undefined,
-      ].filter(Boolean).join(" · "),
-    })) ?? [],
+    card.agentProviders?.map((provider) => ({ title: provider })) ?? [],
     "No subagent providers exposed.",
   );
 }
@@ -203,10 +183,9 @@ function renderList(
   return list;
 }
 
-function summaryCounts(calls: WorkflowRunSummaryView["calls"]): string {
+function summaryCounts(calls: ActiveWorkflowSummary["calls"]): string {
   const parts = [
     calls.completed ? `${calls.completed} done` : undefined,
-    calls.cached ? `${calls.cached} replayed` : undefined,
     calls.running ? `${calls.running} running` : undefined,
     calls.failed ? `${calls.failed} failed` : undefined,
   ].filter((part): part is string => Boolean(part));
@@ -217,15 +196,6 @@ function summarizeText(value: string | undefined): string | undefined {
   if (!value) return undefined;
   const compact = value.replace(/\s+/g, " ").trim();
   return compact.length > 140 ? `${compact.slice(0, 139)}…` : compact;
-}
-
-function summarizeDiagnostic(value: unknown): string {
-  if (typeof value === "string") return value;
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return "Unserializable diagnostic";
-  }
 }
 
 function stringValue(value: unknown): string | undefined {

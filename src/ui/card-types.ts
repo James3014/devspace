@@ -1,5 +1,5 @@
 import type { App } from "@modelcontextprotocol/ext-apps";
-import type { WorkflowRunSummaryView } from "../workflow-ui.js";
+import type { ActiveWorkflowSummary } from "../workflow-summary.js";
 
 export type ToolName =
   | "open_workspace"
@@ -56,27 +56,12 @@ export interface ToolResultCard {
     description?: string;
     path?: string;
   }>;
-  activeWorkflows?: WorkflowRunSummaryView[];
-  agentProviders?: Array<{
-    name?: string;
-    model?: {
-      supported?: boolean;
-      discovery?: string;
-    };
-    effort?: {
-      supported?: boolean;
-      semantics?: string;
-      discovery?: string;
-    };
-  }>;
+  activeWorkflows?: ActiveWorkflowSummary[];
+  agentProviders?: string[];
   agents?: Array<{
     name?: string;
     description?: string;
-    provider?: string;
-    model?: string;
-    effort?: string;
   }>;
-  skillDiagnostics?: unknown[];
   instruction?: string;
 }
 
@@ -167,14 +152,12 @@ export function isExpandableCard(card: ToolResultCard): boolean {
     return (
       Number(card.summary?.agentsFiles ?? 0) > 0 ||
       Number(card.summary?.skills ?? 0) > 0 ||
-      Number(card.summary?.skillDiagnostics ?? 0) > 0 ||
       Boolean(card.agentsFiles?.length) ||
       Boolean(card.availableAgentsFiles?.length) ||
       Boolean(card.skills?.length) ||
       Boolean(card.activeWorkflows?.length) ||
       Boolean(card.agentProviders?.length) ||
-      Boolean(card.agents?.length) ||
-      Boolean(card.skillDiagnostics?.length)
+      Boolean(card.agents?.length)
     );
   }
 

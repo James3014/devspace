@@ -38,12 +38,8 @@ assert.equal(
         calls: {
           running: 1,
           completed: 0,
-          cached: 0,
           failed: 0,
-          cancelled: 0,
-          observed: 1,
         },
-        updatedAt: "2026-07-26T00:00:00.000Z",
       },
     ],
   }),
