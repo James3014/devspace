@@ -296,6 +296,33 @@ const workflowRunSummaryOutputSchema = z.object({
   calls: workflowCallCountsOutputSchema,
 });
 
+function formatVisibleAgentProvider(provider: {
+  name: string;
+  model: { supported: boolean; discovery: string };
+  effort: { supported: boolean; semantics: string; discovery: string };
+}): string {
+  const model = provider.model.supported
+    ? `model (${provider.model.discovery})`
+    : "model unsupported";
+  const effort = provider.effort.supported
+    ? `effort (${provider.effort.semantics}, ${provider.effort.discovery})`
+    : "effort unsupported";
+  return `${provider.name} — ${model}; ${effort}`;
+}
+
+function formatVisibleAgent(agent: {
+  name: string;
+  description: string;
+  provider: string;
+  model?: string;
+  effort?: string;
+}): string {
+  const target = [agent.provider, agent.model && `model=${agent.model}`, agent.effort && `effort=${agent.effort}`]
+    .filter(Boolean)
+    .join(", ");
+  return `${agent.name} (${target}) — ${agent.description}`;
+}
+
 const reviewFileOutputSchema = z.object({
   path: z.string(),
   previousPath: z.string().optional(),
@@ -855,10 +882,10 @@ function createMcpServer(
               ? `Available skills: ${visibleSkills.map((skill) => skill.name).join(", ")}`
               : undefined,
             visibleAgentProviders.length > 0
-              ? `Available subagent providers: ${visibleAgentProviders.map((provider) => provider.name).join(", ")}`
+              ? `Available subagent providers: ${visibleAgentProviders.map(formatVisibleAgentProvider).join("; ")}`
               : undefined,
             visibleAgents.length > 0
-              ? `Available subagent profiles: ${visibleAgents.map((agent) => `${agent.name} — ${agent.description}`).join(", ")}`
+              ? `Available subagent profiles: ${visibleAgents.map(formatVisibleAgent).join("; ")}`
               : undefined,
             instruction,
           ].filter(Boolean).join("\n"),
