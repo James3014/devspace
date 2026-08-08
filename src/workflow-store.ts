@@ -353,7 +353,7 @@ export class WorkflowStore {
     scriptPath: string,
   ): BetterResult<WorkflowRunRecord, WorkflowRunTransitionError> {
     const current = this.getRunResult(id);
-    if (current.isErr()) return current;
+    if (current.isErr()) return Result.err(current.error);
     const run = current.value;
     if (!run) return Result.err(new WorkflowNotFoundError(id));
     const updated = Result.try({
@@ -368,7 +368,7 @@ export class WorkflowStore {
       },
       catch: (cause) => new WorkflowStoreError("set_script_path", cause),
     });
-    if (updated.isErr()) return updated;
+    if (updated.isErr()) return Result.err(updated.error);
     return updated.value
       ? Result.ok(updated.value)
       : Result.err(new WorkflowNotFoundError(id));
@@ -391,7 +391,7 @@ export class WorkflowStore {
     pid: number,
   ): BetterResult<WorkflowRunRecord, WorkflowRunTransitionError> {
     const currentResult = this.getRunResult(id);
-    if (currentResult.isErr()) return currentResult;
+    if (currentResult.isErr()) return Result.err(currentResult.error);
     const current = currentResult.value;
     if (!current) return Result.err(new WorkflowNotFoundError(id));
     if (current.status !== "starting") {
@@ -422,10 +422,10 @@ export class WorkflowStore {
       },
       catch: (cause) => new WorkflowStoreError("claim_run", cause),
     });
-    if (claimed.isErr()) return claimed;
+    if (claimed.isErr()) return Result.err(claimed.error);
     if (claimed.value === 0) {
       const latestResult = this.getRunResult(id);
-      if (latestResult.isErr()) return latestResult;
+      if (latestResult.isErr()) return Result.err(latestResult.error);
       const latest = latestResult.value;
       return latest
         ? Result.err(
@@ -438,7 +438,7 @@ export class WorkflowStore {
         : Result.err(new WorkflowNotFoundError(id));
     }
     const runResult = this.getRunResult(id);
-    if (runResult.isErr()) return runResult;
+    if (runResult.isErr()) return Result.err(runResult.error);
     const run = runResult.value;
     return run ? Result.ok(run) : Result.err(new WorkflowNotFoundError(id));
   }
@@ -459,7 +459,7 @@ export class WorkflowStore {
     id: string,
   ): BetterResult<WorkflowRunRecord, WorkflowRunTransitionError> {
     const current = this.getRunResult(id);
-    if (current.isErr()) return current;
+    if (current.isErr()) return Result.err(current.error);
     const run = current.value;
     if (!run) return Result.err(new WorkflowNotFoundError(id));
     if (TERMINAL_STATUSES.has(run.status)) return Result.ok(run);
@@ -479,7 +479,7 @@ export class WorkflowStore {
       },
       catch: (cause) => new WorkflowStoreError("request_cancel", cause),
     });
-    if (updated.isErr()) return updated;
+    if (updated.isErr()) return Result.err(updated.error);
     return updated.value
       ? Result.ok(updated.value)
       : Result.err(new WorkflowNotFoundError(id));
@@ -610,7 +610,7 @@ export class WorkflowStore {
     update: () => number,
   ): BetterResult<WorkflowRunRecord, WorkflowRunTransitionError> {
     const currentResult = this.getRunResult(id);
-    if (currentResult.isErr()) return currentResult;
+    if (currentResult.isErr()) return Result.err(currentResult.error);
     const current = currentResult.value;
     if (!current) return Result.err(new WorkflowNotFoundError(id));
     if (TERMINAL_STATUSES.has(current.status)) return Result.ok(current);
@@ -619,10 +619,10 @@ export class WorkflowStore {
       try: update,
       catch: (cause) => new WorkflowStoreError(`${operation}_run`, cause),
     });
-    if (updated.isErr()) return updated;
+    if (updated.isErr()) return Result.err(updated.error);
     if (updated.value === 0) {
       const latestResult = this.getRunResult(id);
-      if (latestResult.isErr()) return latestResult;
+      if (latestResult.isErr()) return Result.err(latestResult.error);
       const latest = latestResult.value;
       if (!latest) return Result.err(new WorkflowNotFoundError(id));
       if (TERMINAL_STATUSES.has(latest.status)) return Result.ok(latest);
@@ -635,7 +635,7 @@ export class WorkflowStore {
       );
     }
     const runResult = this.getRunResult(id);
-    if (runResult.isErr()) return runResult;
+    if (runResult.isErr()) return Result.err(runResult.error);
     const run = runResult.value;
     return run ? Result.ok(run) : Result.err(new WorkflowNotFoundError(id));
   }
