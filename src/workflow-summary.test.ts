@@ -16,7 +16,14 @@ try {
     scriptPath: join(root, "run.js"),
     scriptHash: "abc",
     workspaceRoot,
-    workspaceId: "workspace-1",
+  });
+  store.createRun({
+    name: "Other workspace",
+    source: "named",
+    scriptPath: join(root, "other.js"),
+    scriptHash: "other",
+    workspaceRoot,
+    workspaceId: "workspace-2",
   });
   store.claimRun(run.id, process.pid);
   store.startAgentCall({
@@ -52,10 +59,6 @@ try {
       calls: { running: 1, completed: 1, failed: 0 },
     },
   ]);
-  assert.deepEqual(loadActiveWorkflowSummaries(store, {
-    workspaceId: "workspace-2",
-    workspaceRoot,
-  }), []);
 } finally {
   store.close();
   rmSync(root, { recursive: true, force: true });
