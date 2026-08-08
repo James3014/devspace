@@ -315,6 +315,7 @@ export class WorkflowStore {
   ): WorkflowRunRecord[] {
     if (!scope.workspaceId) return this.listRunsForWorkspace(scope.workspaceRoot, options);
 
+    const root = resolve(scope.workspaceRoot);
     const limit = Math.max(1, Math.min(options.limit ?? 50, 500));
     const statuses = options.statuses?.filter((status, index, values) =>
       values.indexOf(status) === index,
@@ -322,9 +323,11 @@ export class WorkflowStore {
     if (!statuses?.length) {
       const rows = this.database.sqlite
         .prepare(
-          "select * from workflow_runs where workspace_id = ? order by updated_at desc limit ?",
+          `select * from workflow_runs
+           where workspace_id = ? or (workspace_id is null and workspace_root = ?)
+           order by updated_at desc limit ?`,
         )
-        .all(scope.workspaceId, limit) as WorkflowRunRow[];
+        .all(scope.workspaceId, root, limit) as WorkflowRunRow[];
       return rows.map(rowToRun);
     }
 
@@ -332,11 +335,12 @@ export class WorkflowStore {
     const rows = this.database.sqlite
       .prepare(
         `select * from workflow_runs
-         where workspace_id = ? and status in (${placeholders})
+         where (workspace_id = ? or (workspace_id is null and workspace_root = ?))
+           and status in (${placeholders})
          order by updated_at desc
          limit ?`,
       )
-      .all(scope.workspaceId, ...statuses, limit) as WorkflowRunRow[];
+      .all(scope.workspaceId, root, ...statuses, limit) as WorkflowRunRow[];
     return rows.map(rowToRun);
   }
 

@@ -180,11 +180,21 @@ try {
     [run.id, run2.id, otherWorkspaceRun.id].sort(),
   );
   assert.deepEqual(
+    store
+      .listRunsForScope({
+        workspaceId: "ws_1",
+        workspaceRoot: join(root, "project"),
+      })
+      .map((entry) => entry.id)
+      .sort(),
+    [run.id, run2.id].sort(),
+  );
+  assert.deepEqual(
     store.listRunsForScope({
       workspaceId: "ws_1",
       workspaceRoot: join(root, "project"),
-    }).map((entry) => entry.id),
-    [run.id],
+    }, { statuses: ["completed"] }).map((entry) => entry.id),
+    [run2.id],
   );
   assert.deepEqual(
     store
