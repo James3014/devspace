@@ -225,7 +225,9 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       allowedRoots,
       publicBaseUrl,
       subagents,
-      agentProviders,
+      // Disabling the capability should not turn provider defaults into an
+      // explicit deny-all list if it is later enabled through the environment.
+      agentProviders: subagents ? agentProviders : files.config.agentProviders,
     };
     const auth = {
       ownerToken: files.auth.ownerToken ?? generateOwnerToken(),

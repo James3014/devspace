@@ -207,3 +207,20 @@ assert.deepEqual(fileConfig.allowedHosts, [
   "::1",
   "devspace.example.com",
 ]);
+
+const disabledAgentConfigDir = mkdtempSync(join(tmpdir(), "devspace-disabled-agent-config-test-"));
+writeFileSync(
+  join(disabledAgentConfigDir, "config.json"),
+  JSON.stringify({
+    allowedRoots: [process.cwd()],
+    subagents: false,
+  }),
+);
+writeFileSync(
+  join(disabledAgentConfigDir, "auth.json"),
+  JSON.stringify({ ownerToken: "persisted-owner-token-long-enough" }),
+);
+assert.deepEqual(loadConfig({
+  DEVSPACE_CONFIG_DIR: disabledAgentConfigDir,
+  DEVSPACE_SUBAGENTS: "1",
+}).agentProviders, ["codex", "claude", "opencode", "pi", "cursor", "copilot"]);
