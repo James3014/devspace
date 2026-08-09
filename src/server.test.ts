@@ -305,3 +305,52 @@ function responseCard(result: Awaited<ReturnType<Client["callTool"]>>): Record<s
   assert.ok(card && typeof card === "object");
   return card as Record<string, unknown>;
 }
+
+function callTool(
+  client: Client,
+  name: string,
+  argumentsValue: Record<string, unknown>,
+): Promise<Awaited<ReturnType<Client["callTool"]>>> {
+  const params = {
+    name,
+    arguments: argumentsValue,
+  } as Parameters<Client["callTool"]>[0];
+  return client.callTool(params);
+}
+
+test("show_changes reviews the change journal in a non-git workspace and re-baselines", async (t) => {
+  const context = await fixture(t, { widgets: "changes" });
+  const open = await callOpen(context.client, context.project, "chat-1");
+  const workspaceId = structuredContent(open).workspaceId as string;
+
+  const writeRelative = "notes.txt";
+  await callTool(context.client, "write", {
+    workspaceId,
+    path: writeRelative,
+    content: "alpha\n",
+  });
+
+  const first = await callTool(context.client, "show_changes", { workspaceId });
+  assert.equal(responseText(first), "Changed 1 file (+1 -0).");
+  const firstCard = responseCard(first);
+  assert.equal((firstCard.files as Array<Record<string, unknown>>)[0]?.type, "new");
+  assert.match((firstCard.payload as Record<string, unknown>).patch as string, /diff --git/);
+
+  await callTool(context.client, "write", {
+    workspaceId,
+    path: writeRelative,
+    content: "alpha\nbeta\n",
+  });
+
+  const second = await callTool(context.client, "show_changes", { workspaceId });
+  assert.equal(responseText(second), "Changed 1 file (+1 -0).");
+  const secondCard = responseCard(second);
+  assert.equal((secondCard.files as Array<Record<string, unknown>>)[0]?.type, "change");
+  assert.match((secondCard.payload as Record<string, unknown>).patch as string, /\+beta/);
+
+  const third = await callTool(context.client, "show_changes", { workspaceId });
+  assert.equal(responseText(third), "No changes since last shown changes.");
+
+  const fourth = await callTool(context.client, "show_changes", { workspaceId });
+  assert.equal(responseText(fourth), "No changes since last shown changes.");
+});
