@@ -47,7 +47,6 @@ import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 import { buildLocalAgentCatalog } from "./local-agent-catalog.js";
-import { registerWorkflowTools } from "./workflow-tools.js";
 import { startWorkflowReaper } from "./workflow-lifecycle.js";
 import { createWorkflowStore } from "./workflow-store.js";
 import { loadActiveWorkflowSummaries } from "./workflow-ui.js";
@@ -1626,10 +1625,6 @@ function createMcpServer(
 
   if (config.toolMode === "codex") {
     registerCodexProcessTools(server, config, workspaces, processSessions);
-  }
-
-  if (config.workflows) {
-    registerWorkflowTools(server, config, workspaces);
   }
 
   return server;
