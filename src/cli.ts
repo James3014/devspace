@@ -3,9 +3,9 @@ import { createRequire } from "node:module";
 import { stdin as input, stdout as output } from "node:process";
 import { spawn } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, unlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
@@ -75,9 +75,10 @@ async function main(argv: string[]): Promise<void> {
       runConfigCommand(args);
       return;
     case "agents":
-      if (!loadConfig().subagents) {
+      const config = loadConfig();
+      if (!config.subagents && !config.workflows) {
         throw new Error(
-          "Subagents are disabled. Set DEVSPACE_SUBAGENTS=1 to enable the experimental feature.",
+          "Subagents and Dynamic Workflows are disabled. Set DEVSPACE_SUBAGENTS=1 or DEVSPACE_WORKFLOWS=1 to enable agent tooling.",
         );
       }
       await runAgentsCommand(args);
@@ -495,27 +496,31 @@ async function runAgentsShow(args: string[]): Promise<void> {
 
   const config = loadConfig();
   const store = createLocalAgentStore(config);
-  let record = store.get(id);
-  if (!record) throw new Error(`Unknown subagent id: ${id}`);
-  assertAgentInScope(record, resolveCurrentWorkspaceScope(config));
+  try {
+    let record = store.get(id);
+    if (!record) throw new Error(`Unknown subagent id: ${id}`);
+    assertAgentInScope(record, resolveCurrentWorkspaceScope(config));
 
-  const deadline = Date.now() + 15_000;
-  while ((record.status === "starting" || record.status === "running") && Date.now() < deadline) {
-    await sleep(500);
-    record = store.get(id) ?? record;
-  }
+    const deadline = Date.now() + 15_000;
+    while ((record.status === "starting" || record.status === "running") && Date.now() < deadline) {
+      await sleep(500);
+      record = store.get(id) ?? record;
+    }
 
-  console.log(formatAgentLine(record));
-  if (record.latestResponse) {
-    console.log(record.latestResponse);
-    return;
-  }
-  if (record.error) {
-    console.log(record.error);
-    return;
-  }
-  if (record.status === "starting" || record.status === "running") {
-    console.log(`No final response yet. Call \`devspace agents show ${record.id}\` again later.`);
+    console.log(formatAgentLine(record));
+    if (record.latestResponse) {
+      console.log(record.latestResponse);
+      return;
+    }
+    if (record.error) {
+      console.log(record.error);
+      return;
+    }
+    if (record.status === "starting" || record.status === "running") {
+      console.log(`No final response yet. Call \`devspace agents show ${record.id}\` again later.`);
+    }
+  } finally {
+    store.close();
   }
 }
 
@@ -527,11 +532,11 @@ async function runAgentsWorker(args: string[]): Promise<void> {
 
   const config = loadConfig();
   const store = createLocalAgentStore(config);
-  const record = store.get(id);
-  if (!record) throw new Error(`Unknown subagent id: ${id}`);
-
-  store.update(record.id, { status: "running", error: undefined });
   try {
+    const record = store.get(id);
+    if (!record) throw new Error(`Unknown subagent id: ${id}`);
+
+    store.update(record.id, { status: "running", error: undefined });
     const profiles = await loadLocalAgentProfiles(config, record.workspaceRoot);
     const prompt = await readFile(promptFile, "utf8");
     const target = resolveLocalAgentExecution({
@@ -557,10 +562,18 @@ async function runAgentsWorker(args: string[]): Promise<void> {
       error: undefined,
     });
   } catch (error) {
-    store.update(record.id, {
-      status: "error",
-      error: error instanceof Error ? error.message : String(error),
-    });
+    const record = store.get(id);
+    if (record) {
+      store.update(record.id, {
+        status: "error",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  } finally {
+    if (isGeneratedPromptFile(promptFile)) {
+      await unlink(promptFile).catch(() => undefined);
+    }
+    store.close();
   }
 }
 
@@ -586,6 +599,12 @@ function writeAgentPromptFile(prompt: string): string {
   const filePath = join(directory, "prompt.txt");
   writeFileSync(filePath, prompt, { mode: 0o600 });
   return filePath;
+}
+
+function isGeneratedPromptFile(filePath: string): boolean {
+  const resolvedPath = resolve(filePath);
+  const prefix = `${resolve(tmpdir())}${process.platform === "win32" ? "\\" : "/"}devspace-agent-prompt-`;
+  return resolvedPath.startsWith(prefix) && basename(resolvedPath) === "prompt.txt";
 }
 
 function resolveCurrentWorkspaceRoot(config: ReturnType<typeof loadConfig>): string {
