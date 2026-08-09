@@ -16,6 +16,19 @@ export interface LocalAgentCatalog {
   profiles: ReturnType<typeof summarizeLocalAgentProfile>[];
 }
 
+export interface LocalAgentTargetCatalog {
+  providers: Array<{ name: string }>;
+  profiles: ReturnType<typeof summarizeLocalAgentProfile>[];
+}
+
+/** Keep model-facing target discovery focused on selectable values. */
+export function compactLocalAgentCatalog(catalog: LocalAgentCatalog): LocalAgentTargetCatalog {
+  return {
+    providers: catalog.providers.map(({ name }) => ({ name })),
+    profiles: catalog.profiles,
+  };
+}
+
 export function formatLocalAgentCatalog(catalog: LocalAgentCatalog): string {
   const profileLines = catalog.profiles.length > 0
     ? [

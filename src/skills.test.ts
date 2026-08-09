@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import assert from "node:assert/strict";
@@ -279,3 +279,11 @@ try {
   else process.env.USERPROFILE = originalUserProfile;
   await rm(root, { recursive: true, force: true });
 }
+
+const subagentsGuide = await readFile(new URL("../skills/subagents/SKILL.md", import.meta.url), "utf8");
+const workflowsGuide = await readFile(new URL("../skills/dynamic-workflows/SKILL.md", import.meta.url), "utf8");
+assert.match(subagentsGuide, /devspace agents run/);
+assert.doesNotMatch(subagentsGuide, /MCP/i);
+assert.match(workflowsGuide, /devspace workflow run/);
+assert.doesNotMatch(workflowsGuide, /workflow tui/i);
+assert.doesNotMatch(workflowsGuide, /MCP|replay walks|determinism bans/i);

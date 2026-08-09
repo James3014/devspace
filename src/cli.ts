@@ -15,6 +15,7 @@ import { loadConfig } from "./config.js";
 import { runLocalAgentProvider } from "./local-agent-adapters.js";
 import {
   buildLocalAgentCatalog,
+  compactLocalAgentCatalog,
   formatLocalAgentCatalog,
 } from "./local-agent-catalog.js";
 import {
@@ -417,7 +418,7 @@ async function runAgentsTargets(args: string[]): Promise<void> {
   );
   console.log(
     args.includes("--json")
-      ? JSON.stringify(catalog, null, 2)
+      ? JSON.stringify(compactLocalAgentCatalog(catalog), null, 2)
       : formatLocalAgentCatalog(catalog),
   );
 }
