@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { satisfies } from "semver";
+import { resolveCliWorkspaceScope } from "./cli-workspace.js";
 import { loadConfig } from "./config.js";
 import { runLocalAgentProvider } from "./local-agent-adapters.js";
 import {
@@ -384,15 +385,19 @@ async function runAgentsCommand(args: string[]): Promise<void> {
 async function runAgentsList(): Promise<void> {
   const config = loadConfig();
   const store = createLocalAgentStore(config);
-  const agents = store.list(resolveCurrentWorkspaceScope());
+  try {
+    const agents = store.list(resolveCurrentWorkspaceScope(config));
 
-  if (agents.length === 0) {
-    console.log("No subagent sessions found for this workspace.");
-    return;
-  }
+    if (agents.length === 0) {
+      console.log("No subagent sessions found for this workspace.");
+      return;
+    }
 
-  for (const agent of agents) {
-    console.log(formatAgentLine(agent));
+    for (const agent of agents) {
+      console.log(formatAgentLine(agent));
+    }
+  } finally {
+    store.close();
   }
 }
 
@@ -403,7 +408,7 @@ async function runAgentsTargets(args: string[]): Promise<void> {
   }
 
   const config = loadConfig();
-  const workspaceRoot = resolveCurrentWorkspaceRoot();
+  const workspaceRoot = resolveCurrentWorkspaceRoot(config);
   const profiles = await loadLocalAgentProfiles(config, workspaceRoot);
   const catalog = buildLocalAgentCatalog(
     profiles,
@@ -420,62 +425,68 @@ async function runAgentsRun(args: string[]): Promise<void> {
   const parsed = parseLocalAgentRunArgs(args);
 
   const config = loadConfig();
-  const workspaceRoot = resolveCurrentWorkspaceRoot();
+  const scope = resolveCurrentWorkspaceScope(config);
+  const workspaceRoot = scope.workspaceRoot;
   const store = createLocalAgentStore(config);
-  const existing = store.get(parsed.target);
-
-  if (existing) {
-    if (!isLocalAgentProvider(existing.provider)) {
-      throw new Error(`Unknown subagent provider for existing session: ${existing.provider}`);
-    }
-    assertLocalAgentProviderAvailable(existing.provider);
-    const promptFile = writeAgentPromptFile(parsed.prompt);
-    store.update(existing.id, {
-      status: "starting",
-      model: parsed.model ?? existing.model,
-      effort: parsed.effort ?? existing.effort,
-      latestResponse: undefined,
-      error: undefined,
-    });
-    spawnAgentWorker(existing.id, promptFile);
-    console.log(formatAgentLine({
-      ...existing,
-      status: "running",
-      model: parsed.model ?? existing.model,
-      effort: parsed.effort ?? existing.effort,
-    }));
-    return;
-  }
-
-  const profiles = await loadLocalAgentProfiles(config, workspaceRoot);
-  const availableProviders = getAvailableLocalAgentProviders();
-  let target;
   try {
-    target = resolveLocalAgentExecution({
-      target: parsed.target,
-      prompt: parsed.prompt,
-      profiles,
-      availableProviders,
-      model: parsed.model,
-      effort: parsed.effort,
+    const existing = store.get(parsed.target);
+
+    if (existing) {
+      assertAgentInScope(existing, scope);
+      if (!isLocalAgentProvider(existing.provider)) {
+        throw new Error(`Unknown subagent provider for existing session: ${existing.provider}`);
+      }
+      assertLocalAgentProviderAvailable(existing.provider);
+      const promptFile = writeAgentPromptFile(parsed.prompt);
+      store.update(existing.id, {
+        status: "starting",
+        model: parsed.model ?? existing.model,
+        effort: parsed.effort ?? existing.effort,
+        latestResponse: undefined,
+        error: undefined,
+      });
+      spawnAgentWorker(existing.id, promptFile);
+      console.log(formatAgentLine({
+        ...existing,
+        status: "running",
+        model: parsed.model ?? existing.model,
+        effort: parsed.effort ?? existing.effort,
+      }));
+      return;
+    }
+
+    const profiles = await loadLocalAgentProfiles(config, workspaceRoot);
+    const availableProviders = getAvailableLocalAgentProviders();
+    let target;
+    try {
+      target = resolveLocalAgentExecution({
+        target: parsed.target,
+        prompt: parsed.prompt,
+        profiles,
+        availableProviders,
+        model: parsed.model,
+        effort: parsed.effort,
+      });
+    } catch (error) {
+      const suffix = ` Available ${formatAvailableLocalAgentTargets(profiles, availableProviders)}`;
+      throw new Error(`${error instanceof Error ? error.message : String(error)}.${suffix}`);
+    }
+
+    const promptFile = writeAgentPromptFile(parsed.prompt);
+    const record = store.create({
+      workspaceId: scope.workspaceId,
+      workspaceRoot,
+      profileName: target.name,
+      provider: target.provider,
+      model: target.model,
+      effort: target.effort,
     });
-  } catch (error) {
-    const suffix = ` Available ${formatAvailableLocalAgentTargets(profiles, availableProviders)}`;
-    throw new Error(`${error instanceof Error ? error.message : String(error)}.${suffix}`);
+
+    spawnAgentWorker(record.id, promptFile);
+    console.log(formatAgentLine({ ...record, status: "running" }));
+  } finally {
+    store.close();
   }
-
-  const promptFile = writeAgentPromptFile(parsed.prompt);
-  const record = store.create({
-    workspaceId: process.env.DEVSPACE_WORKSPACE_ID,
-    workspaceRoot,
-    profileName: target.name,
-    provider: target.provider,
-    model: target.model,
-    effort: target.effort,
-  });
-
-  spawnAgentWorker(record.id, promptFile);
-  console.log(formatAgentLine({ ...record, status: "running" }));
 }
 
 async function runAgentsShow(args: string[]): Promise<void> {
@@ -486,6 +497,7 @@ async function runAgentsShow(args: string[]): Promise<void> {
   const store = createLocalAgentStore(config);
   let record = store.get(id);
   if (!record) throw new Error(`Unknown subagent id: ${id}`);
+  assertAgentInScope(record, resolveCurrentWorkspaceScope(config));
 
   const deadline = Date.now() + 15_000;
   while ((record.status === "starting" || record.status === "running") && Date.now() < deadline) {
@@ -576,15 +588,26 @@ function writeAgentPromptFile(prompt: string): string {
   return filePath;
 }
 
-function resolveCurrentWorkspaceRoot(): string {
-  return resolve(process.env.DEVSPACE_WORKSPACE_ROOT || process.cwd());
+function resolveCurrentWorkspaceRoot(config: ReturnType<typeof loadConfig>): string {
+  return resolveCliWorkspaceScope(config.allowedRoots).workspaceRoot;
 }
 
-function resolveCurrentWorkspaceScope(): { workspaceId?: string; workspaceRoot: string } {
-  return {
-    workspaceId: process.env.DEVSPACE_WORKSPACE_ID,
-    workspaceRoot: resolveCurrentWorkspaceRoot(),
-  };
+function resolveCurrentWorkspaceScope(
+  config: ReturnType<typeof loadConfig>,
+): { workspaceId?: string; workspaceRoot: string } {
+  return resolveCliWorkspaceScope(config.allowedRoots);
+}
+
+function assertAgentInScope(
+  agent: Pick<LocalAgentRecord, "workspaceId" | "workspaceRoot">,
+  scope: { workspaceId?: string; workspaceRoot: string },
+): void {
+  if (scope.workspaceId && agent.workspaceId && agent.workspaceId !== scope.workspaceId) {
+    throw new Error(`Subagent does not belong to workspace ${scope.workspaceId}.`);
+  }
+  if (resolve(agent.workspaceRoot) !== resolve(scope.workspaceRoot)) {
+    throw new Error(`Subagent does not belong to workspace ${scope.workspaceRoot}.`);
+  }
 }
 
 function formatAgentLine(agent: Pick<
