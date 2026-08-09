@@ -1,5 +1,6 @@
 import type { App } from "@modelcontextprotocol/ext-apps";
 import type { WorkflowRunSummaryView } from "../workflow-ui.js";
+import type { WorkflowCallCounts } from "../workflow-view.js";
 
 export type ToolName =
   | "open_workspace"
@@ -18,6 +19,15 @@ export type ToolName =
   | "bash";
 
 export type HostContext = NonNullable<ReturnType<App["getHostContext"]>>;
+
+export interface WorkspaceWorkflowSummary {
+  id: string;
+  name: string;
+  status: string;
+  currentPhase?: string;
+  calls?: WorkflowCallCounts;
+  updatedAt?: string;
+}
 
 export type PatchOperation = "add" | "update" | "delete" | "move";
 
@@ -61,7 +71,7 @@ export interface ToolResultCard {
     description?: string;
     path?: string;
   }>;
-  activeWorkflows?: WorkflowRunSummaryView[];
+  activeWorkflows?: Array<WorkflowRunSummaryView | WorkspaceWorkflowSummary>;
   callSummary?: {
     reused?: number;
     live?: number;
@@ -71,15 +81,6 @@ export interface ToolResultCard {
   };
   agentProviders?: Array<{
     name?: string;
-    model?: {
-      supported?: boolean;
-      discovery?: string;
-    };
-    effort?: {
-      supported?: boolean;
-      semantics?: string;
-      discovery?: string;
-    };
   }>;
   agents?: Array<{
     name?: string;

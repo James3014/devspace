@@ -4,7 +4,7 @@ import type {
   WorkflowProjectView,
   WorkflowRunView,
 } from "../workflow-view.js";
-import type { ToolResultCard } from "./card-types.js";
+import type { ToolResultCard, WorkspaceWorkflowSummary } from "./card-types.js";
 import { renderIcon, toolIcons } from "./icons.js";
 
 export interface DashboardDisplayOptions {
@@ -22,7 +22,7 @@ export function renderWorkspaceDashboard(
   const root = node("div", {
     className: `workspace-dashboard ${display.fullscreen ? "fullscreen" : "inline"}`,
   });
-  const runs = project?.runs ?? card.activeWorkflows ?? [];
+  const runs: Array<WorkflowRunView | WorkspaceWorkflowSummary> = project?.runs ?? card.activeWorkflows ?? [];
 
   root.append(
     renderDashboardToolbar("Workspace overview", display),
@@ -224,7 +224,7 @@ function renderDashboardToolbar(
 }
 
 function renderWorkflowSummarySection(
-  runs: Array<WorkflowRunView | WorkflowRunSummaryView>,
+  runs: Array<WorkflowRunView | WorkflowRunSummaryView | WorkspaceWorkflowSummary>,
 ): HTMLElement {
   const section = node("section", { className: "active-workflows" });
   section.append(node("h3", { text: `Active workflows · ${runs.length}` }));
@@ -239,7 +239,7 @@ function renderWorkflowSummarySection(
       node("div", { className: "active-workflow-copy" }, [
         node("strong", { text: run.name }),
         node("span", {
-          text: `${run.currentPhase ?? run.status} · ${summaryCounts(run.calls)}`,
+          text: `${run.currentPhase ?? run.status}${run.calls ? ` · ${summaryCounts(run.calls)}` : ""}`,
         }),
       ]),
     );
@@ -308,12 +308,6 @@ function renderProviderList(card: ToolResultCard): HTMLElement {
   return renderList(
     card.agentProviders?.map((provider) => ({
       title: provider.name ?? "Unknown provider",
-      description: [
-        provider.model?.supported ? `model: ${provider.model.discovery ?? "supported"}` : undefined,
-        provider.effort?.supported
-          ? `effort: ${provider.effort.semantics ?? "supported"} (${provider.effort.discovery ?? "unknown"})`
-          : undefined,
-      ].filter(Boolean).join(" · "),
     })) ?? [],
     "No subagent providers exposed.",
   );
