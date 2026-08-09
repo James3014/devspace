@@ -183,6 +183,42 @@ test("journal-owned reviews exclude unrelated working-tree changes and keep Git 
   assert.match(responseText(nextReview), /No changes since last shown changes/);
 });
 
+test("apply_patch moves are journaled as one net rename outside Git", async (t) => {
+  const context = await fixture(t, { toolMode: "codex", widgets: "changes" });
+  await writeFile(join(context.project, "before.txt"), "before\n");
+  const opened = await callOpen(context.client, context.project, "chat-1");
+  const workspaceId = structuredContent(opened).workspaceId as string;
+
+  await context.client.callTool({
+    name: "apply_patch",
+    arguments: {
+      workspaceId,
+      patch: `*** Begin Patch
+*** Update File: before.txt
+*** Move to: after.txt
+@@
+-before
++after
+*** End Patch`,
+    },
+  });
+  const review = await context.client.callTool({
+    name: "show_changes",
+    arguments: { workspaceId },
+  });
+
+  const card = responseCard(review);
+  assert.deepEqual(card.files, [
+    {
+      path: "after.txt",
+      previousPath: "before.txt",
+      type: "rename-changed",
+      additions: 1,
+      removals: 1,
+    },
+  ]);
+});
+
 test("checkout reuse and context suppression survive a registry restart", async (t) => {
   const context = await fixture(t);
   const first = await callOpen(context.client, context.project, "chat-1");
@@ -235,7 +271,11 @@ interface ServerFixture {
 
 async function fixture(
   t: TestContext,
-  options: { git?: boolean; widgets?: "full" | "changes" } = {},
+  options: {
+    git?: boolean;
+    widgets?: "full" | "changes";
+    toolMode?: "full" | "codex";
+  } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
   const project = join(root, "project");
@@ -270,7 +310,7 @@ async function fixture(
     DEVSPACE_WORKTREE_ROOT: join(root, ".worktrees"),
     DEVSPACE_AGENT_DIR: agentDir,
     DEVSPACE_WIDGETS: options.widgets ?? "full",
-    DEVSPACE_TOOL_MODE: "full",
+    DEVSPACE_TOOL_MODE: options.toolMode ?? "full",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
