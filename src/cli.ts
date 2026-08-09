@@ -85,21 +85,20 @@ async function main(argv: string[]): Promise<void> {
     case "config":
       runConfigCommand(args);
       return;
-    case "agents":
-      {
-        const agentConfig = loadConfig();
-        if (
-          args[0] !== "__worker" &&
-          !(args[0] === "targets" && agentConfig.workflows) &&
-          !agentConfig.subagents
-        ) {
+    case "agents": {
+      const agentConfig = loadConfig();
+      if (
+        args[0] !== "__worker" &&
+        !(args[0] === "targets" && agentConfig.workflows) &&
+        !agentConfig.subagents
+      ) {
         throw new Error(
           "Agent tooling is disabled. Run `devspace init --force` or set DEVSPACE_SUBAGENTS=1.",
         );
-        }
       }
       await runAgentsCommand(args);
       return;
+    }
     case "workflow":
       await runWorkflowCommand(args, loadConfig());
       return;
@@ -450,7 +449,6 @@ async function runAgentsCommand(args: string[]): Promise<void> {
       throw new Error(`Unknown agents command: ${subcommand}`);
   }
 }
-
 
 async function runAgentsList(args: string[]): Promise<void> {
   const json = parseJsonOnlyOption(args, "devspace agents ls [--json]");
