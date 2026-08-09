@@ -49,6 +49,10 @@ import {
   type McpSessionCloseResult,
 } from "./mcp-sessions.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
+import {
+  createReviewChangeJournal,
+  type ReviewMutationCapture,
+} from "./review-change-journal.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { openAiConversationScopeId } from "./request-meta.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
@@ -704,6 +708,7 @@ export function createMcpServer(
   processSessions: ProcessSessionManager,
   localAgentProviders: LocalAgentProviderAvailability[],
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
+  reviewJournal = createReviewChangeJournal(),
 ): McpServer {
   const server = new McpServer(
     {
@@ -717,6 +722,19 @@ export function createMcpServer(
       instructions: serverInstructions(config),
     },
   );
+
+  const prepareReviewMutation = async (
+    workspaceId: string,
+    root: string,
+    paths: readonly string[],
+  ): Promise<ReviewMutationCapture | undefined> => {
+    if (config.widgets !== "changes") return undefined;
+    return reviewJournal.prepareMutation({ workspaceId, root, paths });
+  };
+
+  const commitReviewMutation = (capture: ReviewMutationCapture | undefined): void => {
+    if (capture) reviewJournal.commitMutation(capture);
+  };
 
   registerAppResource(
     server,
@@ -813,6 +831,10 @@ export function createMcpServer(
       );
       if (config.widgets === "changes") {
         await reviewCheckpoints.initializeWorkspace({
+          workspaceId: workspace.id,
+          root: workspace.root,
+        });
+        reviewJournal.initializeWorkspace({
           workspaceId: workspace.id,
           root: workspace.root,
         });
@@ -1071,7 +1093,8 @@ export function createMcpServer(
     async ({ workspaceId, ...input }) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
-      workspaces.resolvePath(workspace, input.path);
+      const path = workspaces.resolvePath(workspace, input.path);
+      const reviewMutation = await prepareReviewMutation(workspaceId, workspace.root, [path]);
       const response = await writeFileTool(input, {
         cwd: workspace.root,
         root: workspace.root,
@@ -1085,6 +1108,7 @@ export function createMcpServer(
         }, response.content, startedAt);
         return response;
       }
+      commitReviewMutation(reviewMutation);
 
       const patch = newFilePatch(input.path, input.content);
       const stats = countDiffStats(patch);
@@ -1158,7 +1182,8 @@ export function createMcpServer(
     async ({ workspaceId, ...input }) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
-      workspaces.resolvePath(workspace, input.path);
+      const path = workspaces.resolvePath(workspace, input.path);
+      const reviewMutation = await prepareReviewMutation(workspaceId, workspace.root, [path]);
       const response = await editFileTool(input, {
         cwd: workspace.root,
         root: workspace.root,
@@ -1172,6 +1197,7 @@ export function createMcpServer(
         }, response.content, startedAt);
         return response;
       }
+      commitReviewMutation(reviewMutation);
 
       const stats = countDiffStats(
         response.details?.patch ?? response.details?.diff,
@@ -1690,6 +1716,7 @@ export function createServer(
   const workspaceStore = createWorkspaceStore(config.stateDir);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
+  const reviewJournal = createReviewChangeJournal();
   const processSessions = new ProcessSessionManager();
   const localAgentProviders = config.subagents
     ? getLocalAgentProviderAvailabilitySnapshot()
@@ -1855,6 +1882,7 @@ export function createServer(
           processSessions,
           localAgentProviders,
           incomingArtifactAdapters,
+          reviewJournal,
         );
         await server.connect(transport);
       } else {
