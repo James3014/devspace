@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import {
+  assertCliWorkspaceAllowed,
   assertRecordInCliWorkspace,
   resolveCliWorkspaceContext,
 } from "./cli-workspace.js";
@@ -59,6 +60,14 @@ try {
       "Subagent",
     ),
     /does not belong to the current project/,
+  );
+  assert.doesNotThrow(() => assertCliWorkspaceAllowed(
+    { workspaceRoot: nested },
+    [root],
+  ));
+  assert.throws(
+    () => assertCliWorkspaceAllowed({ workspaceRoot: "/outside" }, [root]),
+    /outside DevSpace allowed roots/,
   );
 } finally {
   rmSync(root, { recursive: true, force: true });

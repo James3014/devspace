@@ -1,5 +1,6 @@
 import { fileURLToPath } from "node:url";
 import {
+  assertCliWorkspaceAllowed,
   assertRecordInCliWorkspace,
   resolveCliWorkspaceContext,
   type CliWorkspaceContext,
@@ -49,6 +50,9 @@ export async function runWorkflowCommand(
       message:
         "Dynamic Workflows are disabled. Run `devspace init --force` or set DEVSPACE_WORKFLOWS=1.",
     });
+  }
+  if (subcommand !== "__worker") {
+    assertCliWorkspaceAllowed(resolveCliWorkspaceContext(), config.allowedRoots);
   }
   switch (subcommand) {
     case "run":

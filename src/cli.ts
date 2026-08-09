@@ -45,6 +45,7 @@ import {
 import { expandHomePath } from "./roots.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import {
+  assertCliWorkspaceAllowed,
   assertRecordInCliWorkspace,
   resolveCliWorkspaceContext,
 } from "./cli-workspace.js";
@@ -410,6 +411,10 @@ function printHelp(): void {
 }
 
 async function runAgentsCommand(args: string[]): Promise<void> {
+  if (args[0] !== "__worker") {
+    const config = loadConfig();
+    assertCliWorkspaceAllowed(resolveCliWorkspaceContext(), config.allowedRoots);
+  }
   const [subcommand, ...rest] = args;
   switch (subcommand) {
     case "ls":
@@ -438,6 +443,7 @@ async function runAgentsCommand(args: string[]): Promise<void> {
       throw new Error(`Unknown agents command: ${subcommand}`);
   }
 }
+
 
 async function runAgentsList(args: string[]): Promise<void> {
   const json = parseJsonOnlyOption(args, "devspace agents ls [--json]");

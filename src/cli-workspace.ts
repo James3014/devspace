@@ -2,6 +2,7 @@ import { spawnSync } from "node:child_process";
 import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, resolve } from "node:path";
+import { isPathInsideRoot } from "./roots.js";
 
 export interface CliWorkspaceContext {
   workspaceId?: string;
@@ -49,6 +50,15 @@ export function assertRecordInCliWorkspace(
   if (!isRecordInCliWorkspace(record, context)) {
     throw new Error(`${label} does not belong to the current project.`);
   }
+}
+
+/** Keep CLI orchestration within the same allowlist as MCP workspaces. */
+export function assertCliWorkspaceAllowed(
+  context: CliWorkspaceContext,
+  allowedRoots: readonly string[],
+): void {
+  if (allowedRoots.some((root) => isPathInsideRoot(context.workspaceRoot, root))) return;
+  throw new Error(`Current project is outside DevSpace allowed roots: ${context.workspaceRoot}`);
 }
 
 function findDevspaceProjectRoot(
