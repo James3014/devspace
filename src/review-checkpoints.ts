@@ -1,6 +1,5 @@
 import { mkdtemp, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { isAbsolute, join } from "node:path";
 import { git, getGitEligibility, safeWorkspaceRefSegment } from "./git.js";
 
 export type ReviewSince = "last_shown" | "workspace_open";
@@ -33,6 +32,8 @@ interface WorkspaceReviewState {
   baselineRef: string;
   openRefAvailable: boolean;
   baselineRefAvailable: boolean;
+  headSha?: string;
+  headTracked?: boolean;
   diagnostic?: string;
 }
 
@@ -43,6 +44,7 @@ export interface ReviewCheckpointManager {
     root: string;
     since?: ReviewSince;
     markReviewed?: boolean;
+    ignoreWhitespace?: boolean;
   }): Promise<ReviewChangesResult>;
 }
 
@@ -78,7 +80,7 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
       }
     },
 
-    async reviewChanges({ workspaceId, root, since = "last_shown", markReviewed = true }) {
+    async reviewChanges({ workspaceId, root, since = "last_shown", markReviewed = true, ignoreWhitespace = true }) {
       let state = states.get(workspaceId);
       assertWorkspaceRoot(state, workspaceId, root);
       if (!isReadyState(state)) {
@@ -89,6 +91,22 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
 
       if (!state?.gitRoot) {
         throw new Error(state?.diagnostic ?? "show_changes requires a Git workspace in this version.");
+      }
+
+      const currentHead = await headSha(state.gitRoot);
+      if (state.headTracked && state.headSha !== currentHead) {
+        const snapshot = await createWorkingTreeSnapshot(state.gitRoot);
+        await git(state.gitRoot, ["update-ref", state.openRef, snapshot.commit]);
+        await git(state.gitRoot, ["update-ref", state.baselineRef, snapshot.commit]);
+        state.headSha = snapshot.headSha;
+        state.openRefAvailable = true;
+        state.baselineRefAvailable = true;
+        return {
+          result: "The repository HEAD moved since the last review, so the review checkpoints were re-anchored to the latest commit. No changes since then.",
+          summary: { files: 0, additions: 0, removals: 0 },
+          files: [],
+          patch: "",
+        };
       }
 
       let effectiveSince = since;
@@ -108,39 +126,38 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
       const baselineRef = effectiveSince === "workspace_open" ? state.openRef : state.baselineRef;
       const baseline = (await git(state.gitRoot, ["rev-parse", "--verify", `${baselineRef}^{commit}`])).stdout.trim();
       const current = await createWorkingTreeSnapshot(state.gitRoot);
-      const patch = (await git(state.gitRoot, [
-        "diff",
-        "--no-color",
-        "--no-ext-diff",
-        "--no-textconv",
-        baseline,
-        current,
-      ], {
-        maxBuffer: 50 * 1024 * 1024,
-      })).stdout;
-      const numstat = (await git(state.gitRoot, ["diff", "--numstat", "-z", baseline, current], {
-        maxBuffer: 50 * 1024 * 1024,
+      const whitespaceArgs = ignoreWhitespace ? ["--ignore-all-space"] : [];
+      const patch = await diffOrDegrade(
+        state.gitRoot,
+        ["diff", ...whitespaceArgs, "--no-color", "--no-ext-diff", "--no-textconv", baseline, current.commit],
+      );
+      const numstat = (await git(state.gitRoot, ["diff", ...whitespaceArgs, "--numstat", "-z", baseline, current.commit], {
+        maxBuffer: 10 * 1024 * 1024,
       })).stdout;
       const files = parseNumstat(numstat);
       const summary = summarizeFiles(files);
 
       if (markReviewed) {
-        await git(state.gitRoot, ["update-ref", state.baselineRef, current]);
+        await git(state.gitRoot, ["update-ref", state.baselineRef, current.commit]);
         state.baselineRefAvailable = true;
+        state.headSha = current.headSha;
       }
 
       const fallbackNote = usedWorkspaceOpenFallback
         ? ` The last-shown checkpoint was missing, so changes were compared from workspace open${markReviewed ? " and the baseline was re-established" : ""}.`
+        : "";
+      const degradedNote = patch.degraded && summary.files > 0
+        ? " The diff was too large to render, so a file list is shown instead."
         : "";
       return {
         result: `${
           summary.files === 0
             ? `No changes since ${effectiveSince === "workspace_open" ? "workspace open" : "last shown changes"}.`
             : `Changed ${summary.files} ${summary.files === 1 ? "file" : "files"} (+${summary.additions} -${summary.removals}).`
-        }${fallbackNote}`,
+        }${fallbackNote}${degradedNote}`,
         summary,
         files,
-        patch,
+        patch: patch.text,
       };
     },
   };
@@ -171,28 +188,31 @@ async function initializeWorkspaceState(
 
   try {
     const eligibility = await getGitEligibility(root);
-    if (!eligibility.ok || !eligibility.gitRoot) {
+    if (!eligibility.gitRoot) {
       state.diagnostic = eligibility.message ?? "show_changes requires a Git workspace in this version.";
       return;
     }
+    const gitRoot = eligibility.gitRoot;
 
     const [openCommit, baselineCommit] = await Promise.all([
-      commitForRef(eligibility.gitRoot, state.openRef),
-      commitForRef(eligibility.gitRoot, state.baselineRef),
+      commitForRef(gitRoot, state.openRef),
+      commitForRef(gitRoot, state.baselineRef),
     ]);
 
     if (!openCommit && !baselineCommit) {
-      const initialCommit = await createWorkingTreeSnapshot(eligibility.gitRoot);
-      await git(eligibility.gitRoot, ["update-ref", state.openRef, initialCommit]);
-      await git(eligibility.gitRoot, ["update-ref", state.baselineRef, initialCommit]);
+      const initialCommit = await createWorkingTreeSnapshot(gitRoot);
+      await git(gitRoot, ["update-ref", state.openRef, initialCommit.commit]);
+      await git(gitRoot, ["update-ref", state.baselineRef, initialCommit.commit]);
       state.openRefAvailable = true;
       state.baselineRefAvailable = true;
+      state.headSha = initialCommit.headSha;
+      state.headTracked = true;
     } else {
       state.openRefAvailable = openCommit !== undefined;
       state.baselineRefAvailable = baselineCommit !== undefined;
     }
 
-    state.gitRoot = eligibility.gitRoot;
+    state.gitRoot = gitRoot;
   } catch (error) {
     state.diagnostic = error instanceof Error ? error.message : String(error);
   } finally {
@@ -222,19 +242,50 @@ function reviewRefs(
   };
 }
 
-async function createWorkingTreeSnapshot(gitRoot: string): Promise<string> {
-  const tempDir = await mkdtemp(join(tmpdir(), "devspace-review-index-"));
+async function createWorkingTreeSnapshot(gitRoot: string): Promise<{ commit: string; headSha?: string }> {
+  const head = await headSha(gitRoot);
+  const commonDir = (await git(gitRoot, ["rev-parse", "--git-common-dir"])).stdout.trim();
+  const commonDirPath = isAbsolute(commonDir) ? commonDir : join(gitRoot, commonDir);
+  const tempDir = await mkdtemp(join(commonDirPath, "devspace-review-index-"));
   const indexPath = join(tempDir, "index");
   const env = checkpointEnv(indexPath);
+  const fsFlags = ["-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false"];
 
   try {
-    await git(gitRoot, ["read-tree", "HEAD"], { env });
-    await git(gitRoot, ["add", "-A", "--", "."], { env });
+    if (head) {
+      await git(gitRoot, ["read-tree", "HEAD"], { env });
+    } else {
+      await git(gitRoot, ["read-tree", "--empty"], { env });
+    }
+    await git(gitRoot, [...fsFlags, "add", "-A", "--", "."], { env });
     const tree = (await git(gitRoot, ["write-tree"], { env })).stdout.trim();
-    const parent = (await git(gitRoot, ["rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim();
-    return (await git(gitRoot, ["commit-tree", tree, "-p", parent, "-m", "DevSpace review snapshot"], { env })).stdout.trim();
+    const commit = (await git(gitRoot, ["commit-tree", tree, "-m", "DevSpace review snapshot"], { env })).stdout.trim();
+    return { commit, headSha: head };
   } finally {
     await rm(tempDir, { recursive: true, force: true });
+  }
+}
+
+async function headSha(gitRoot: string): Promise<string | undefined> {
+  try {
+    return (await git(gitRoot, ["rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim();
+  } catch {
+    return undefined;
+  }
+}
+
+async function diffOrDegrade(
+  gitRoot: string,
+  args: string[],
+): Promise<{ text: string; degraded: boolean }> {
+  try {
+    const patch = await git(gitRoot, args, { maxBuffer: 10 * 1024 * 1024 });
+    return { text: patch.stdout, degraded: false };
+  } catch (error) {
+    if (String(error).includes("maxBuffer")) {
+      return { text: "", degraded: true };
+    }
+    throw error;
   }
 }
 
