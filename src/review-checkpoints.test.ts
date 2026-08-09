@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -48,6 +48,34 @@ test("show_changes reports and advances the last-shown checkpoint", async (t) =>
   const afterReviewed = await manager.reviewChanges({ workspaceId: "ws_incremental", root });
   assert.equal(afterReviewed.summary.files, 0);
   assert.equal(afterReviewed.patch, "");
+});
+
+test("a nested workspace only reviews changes inside its workspace root", async (t) => {
+  const repositoryRoot = await committedRepository(t);
+  const workspaceRoot = join(repositoryRoot, "packages", "app");
+  const siblingRoot = join(repositoryRoot, "packages", "other");
+  await mkdir(workspaceRoot, { recursive: true });
+  await mkdir(siblingRoot, { recursive: true });
+  await writeFile(join(workspaceRoot, "app.txt"), "app\n");
+  await writeFile(join(siblingRoot, "other.txt"), "other\n");
+  await git(repositoryRoot, ["add", "."]);
+  await git(repositoryRoot, ["commit", "-m", "Add packages"]);
+
+  const manager = createReviewCheckpointManager();
+  await manager.initializeWorkspace({ workspaceId: "ws_nested", root: workspaceRoot });
+
+  await writeFile(join(workspaceRoot, "app.txt"), "app changed\n");
+  await writeFile(join(siblingRoot, "other.txt"), "other changed\n");
+
+  const review = await manager.reviewChanges({
+    workspaceId: "ws_nested",
+    root: workspaceRoot,
+    markReviewed: false,
+  });
+
+  assert.deepEqual(review.files.map((file) => file.path), ["app.txt"]);
+  assert.match(review.patch, /app changed/);
+  assert.doesNotMatch(review.patch, /other changed/);
 });
 
 test("review checkpoints survive a manager restart", async (t) => {

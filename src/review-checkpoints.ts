@@ -107,11 +107,11 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
 
       const baselineRef = effectiveSince === "workspace_open" ? state.openRef : state.baselineRef;
       const baseline = (await git(state.gitRoot, ["rev-parse", "--verify", `${baselineRef}^{commit}`])).stdout.trim();
-      const current = await createWorkingTreeSnapshot(state.gitRoot);
-      const patch = (await git(state.gitRoot, ["diff", "--binary", "--no-color", baseline, current], {
+      const current = await createWorkingTreeSnapshot(state.gitRoot, state.root);
+      const patch = (await git(state.root, ["diff", "--relative", "--binary", "--no-color", baseline, current], {
         maxBuffer: 50 * 1024 * 1024,
       })).stdout;
-      const numstat = (await git(state.gitRoot, ["diff", "--numstat", "-z", baseline, current], {
+      const numstat = (await git(state.root, ["diff", "--relative", "--numstat", "-z", baseline, current], {
         maxBuffer: 50 * 1024 * 1024,
       })).stdout;
       const files = parseNumstat(numstat);
@@ -175,7 +175,7 @@ async function initializeWorkspaceState(
     ]);
 
     if (!openCommit && !baselineCommit) {
-      const initialCommit = await createWorkingTreeSnapshot(eligibility.gitRoot);
+      const initialCommit = await createWorkingTreeSnapshot(eligibility.gitRoot, root);
       await git(eligibility.gitRoot, ["update-ref", state.openRef, initialCommit]);
       await git(eligibility.gitRoot, ["update-ref", state.baselineRef, initialCommit]);
       state.openRefAvailable = true;
@@ -215,14 +215,14 @@ function reviewRefs(
   };
 }
 
-async function createWorkingTreeSnapshot(gitRoot: string): Promise<string> {
+async function createWorkingTreeSnapshot(gitRoot: string, workspaceRoot: string): Promise<string> {
   const tempDir = await mkdtemp(join(tmpdir(), "devspace-review-index-"));
   const indexPath = join(tempDir, "index");
   const env = checkpointEnv(indexPath);
 
   try {
     await git(gitRoot, ["read-tree", "HEAD"], { env });
-    await git(gitRoot, ["add", "-A", "--", "."], { env });
+    await git(workspaceRoot, ["add", "-A", "--", "."], { env });
     const tree = (await git(gitRoot, ["write-tree"], { env })).stdout.trim();
     const parent = (await git(gitRoot, ["rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim();
     return (await git(gitRoot, ["commit-tree", tree, "-p", parent, "-m", "DevSpace review snapshot"], { env })).stdout.trim();
