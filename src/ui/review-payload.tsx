@@ -62,16 +62,30 @@ function ReviewPayload({
 
   if (errorMessage) return <StatusLine message={errorMessage} tone="error" />;
   if (card.error) return <StatusLine message={card.error} tone="error" />;
-  if (!patch) return <StatusLine message="Diff payload is not available." />;
+  const cardFiles = card.files ?? [];
+  if (!patch) {
+    if (cardFiles.length === 0) return <StatusLine message="Diff payload is not available." />;
+    return <FallbackReviewList card={card} />;
+  }
   if (!reviewParse.ok) return <FallbackReviewList card={card} />;
-  if (files.length === 0) return <StatusLine message="No diff hunks to review." />;
+  if (files.length === 0) {
+    if (cardFiles.length === 0) return <StatusLine message="No diff hunks to review." />;
+    return <FallbackReviewList card={card} />;
+  }
 
   const options = diffOptions(themeType);
+  const binaryFiles = reviewParse.binaryFiles;
 
   if (files.length === 1) {
     const fileDiff = files[0];
     if (fileDiff.hunks.length === 0) {
-      return <BinaryFileList files={[fileDiff]} card={card} />;
+      return (
+        <BinaryFileList
+          files={[fileDiff]}
+          card={card}
+          note={binaryFiles.has(fileDiff.name) ? "Binary file — diff preview hidden" : undefined}
+        />
+      );
     }
     return (
       <div className="review-single-file">
@@ -118,7 +132,9 @@ function ReviewPayload({
                   name={fileDiff.name}
                   additions={stats.additions}
                   removals={stats.removals}
-                  note="Binary file — diff preview hidden"
+                  note={binaryFiles.has(fileDiff.name)
+                    ? "Binary file — diff preview hidden"
+                    : undefined}
                 />
               ) : (
                 <>
@@ -154,6 +170,25 @@ function ReviewPayload({
             </div>
           );
         })}
+        {cardFiles
+          .filter((cardFile) => (
+            !files.some((fileDiff) => (
+              fileDiff.name === cardFile.path ||
+              fileDiff.name === cardFile.previousPath
+            ))
+          ))
+          .map((cardFile, index) => (
+            <div className="review-diff-file" key={cardFile.path ?? `card-file-${index}`}>
+              <FileSummaryRow
+                kind={getFileChangeKind(cardFile)}
+                pathDisplay={getFileChangePathDisplay(cardFile)}
+                name={cardFile.path ?? cardFile.previousPath ?? "Unknown file"}
+                additions={cardFile.additions ?? 0}
+                removals={cardFile.removals ?? 0}
+                note="Diff preview hidden"
+              />
+            </div>
+          ))}
       </div>
     </div>
   );
@@ -198,9 +233,11 @@ function FallbackReviewList({ card }: { card: ToolResultCard }) {
 function BinaryFileList({
   files,
   card,
+  note,
 }: {
   files: FileDiffMetadata[];
   card: ToolResultCard;
+  note?: string;
 }) {
   return (
     <div className="review-diff pretty-scrollbar">
@@ -224,7 +261,7 @@ function BinaryFileList({
                 name={fileDiff.name}
                 additions={0}
                 removals={0}
-                note="Binary file — diff preview hidden"
+                note={note}
               />
             </div>
           );
@@ -247,18 +284,21 @@ function FileSummaryRow({
   name: string;
   additions: number;
   removals: number;
-  note: string;
+  note?: string;
 }) {
+  const row = (
+    <div className="review-diff-file-header static" aria-disabled="true">
+      <FileSummaryLabel kind={kind} pathDisplay={pathDisplay} name={name} />
+      <span className="review-diff-file-stats">
+        <span className="add">+{additions}</span>
+        <span className="remove">-{removals}</span>
+      </span>
+    </div>
+  );
   return (
     <div className="review-diff-file-group">
-      <div className="review-diff-file-header static" aria-disabled="true">
-        <FileSummaryLabel kind={kind} pathDisplay={pathDisplay} name={name} />
-        <span className="review-diff-file-stats">
-          <span className="add">+{additions}</span>
-          <span className="remove">-{removals}</span>
-        </span>
-      </div>
-      <div className="review-binary-note">{note}</div>
+      {row}
+      {note ? <div className="review-binary-note">{note}</div> : null}
     </div>
   );
 }

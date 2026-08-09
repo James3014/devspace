@@ -222,10 +222,65 @@ assert.equal(parsedReview.files[0]?.hunks.length, 1);
 assert.equal(parsedReview.files[0]?.hunks[0]?.additionLines, 1);
 assert.equal(parsedReview.files[0]?.hunks[0]?.deletionLines, 1);
 
-assert.deepEqual(parseReviewPatchFiles(undefined), { files: [], ok: true });
-assert.deepEqual(parseReviewPatchFiles("   \n  "), { files: [], ok: true });
-assert.deepEqual(parseReviewPatchFiles("garbage that is not a patch"), { files: [], ok: true });
+assert.deepEqual(parseReviewPatchFiles(undefined), { files: [], binaryFiles: new Set(), ok: true });
+{
+  const whitespaceOnly = parseReviewPatchFiles("   \n  ");
+  assert.deepEqual(whitespaceOnly.files, []);
+  assert.equal(whitespaceOnly.ok, true);
+}
+assert.equal(parseReviewPatchFiles("garbage that is not a patch").ok, true);
 
 const crlfReviewPatch = reviewPatch.replace(/\n/g, "\r\n");
 assert.equal(parseReviewPatchFiles(crlfReviewPatch).ok, true);
 assert.equal(parseReviewPatchFiles(crlfReviewPatch).files.length, 1);
+
+const binaryPatch = `diff --git a/logo.png b/logo.png
+index 1111111..2222222 100644
+Binary files a/logo.png and b/logo.png differ
+`;
+{
+  const parsed = parseReviewPatchFiles(binaryPatch);
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.files.length, 1);
+  assert.equal(parsed.files[0]?.hunks.length, 0);
+  assert.deepEqual([...parsed.binaryFiles], ["logo.png"]);
+}
+
+const renamePatch = `diff --git a/old.txt b/new.txt
+similarity index 100%
+rename from old.txt
+rename to new.txt
+`;
+{
+  const parsed = parseReviewPatchFiles(renamePatch);
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.files[0]?.type, "rename-pure");
+  assert.deepEqual([...parsed.binaryFiles], []);
+}
+
+const modePatch = `diff --git a/run.sh b/run.sh
+old mode 100644
+new mode 100755
+`;
+{
+  const parsed = parseReviewPatchFiles(modePatch);
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.files[0]?.hunks.length, 0);
+  assert.equal(parsed.files[0]?.prevMode, "100644");
+  assert.equal(parsed.files[0]?.mode, "100755");
+  assert.deepEqual([...parsed.binaryFiles], []);
+}
+
+const trailingSpacePatch = `diff --git a/f.txt b/f.txt
+index 1111111..2222222 100644
+--- a/f.txt
++++ b/f.txt
+@@ -1 +1 @@
+-old
++new 
+`;
+{
+  const parsed = parseReviewPatchFiles(trailingSpacePatch);
+  assert.equal(parsed.ok, true);
+  assert.equal(parsed.files[0]?.additionLines[0], "new ");
+}

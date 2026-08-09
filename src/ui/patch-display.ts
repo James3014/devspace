@@ -3,6 +3,7 @@ import type { ToolResultCard } from "./card-types.js";
 
 export interface ReviewPatchParse {
   files: FileDiffMetadata[];
+  binaryFiles: Set<string>;
   ok: boolean;
 }
 
@@ -170,19 +171,32 @@ export function fileChangeKindLabel(kind: FileChangeKind): string {
  * Parse a review patch without ever throwing, so a malformed or unexpected
  * patch cannot take down the whole card render. A parse failure surfaces as
  * `ok: false` so the caller can fall back to a file-summary-only card.
+ *
+ * Diffs without hunks are normal for renames, mode changes, and binary
+ * files. Binary files are detected from their explicit git markers
+ * ("Binary files ... differ" or "GIT binary patch") so hunkless renames and
+ * mode changes are not mistaken for binary content.
  */
 export function parseReviewPatchFiles(patch: string | undefined): ReviewPatchParse {
-  if (!patch) return { files: [], ok: true };
-  const normalized = patch.replace(/\r\n/g, "\n").trim();
-  if (normalized.length === 0) return { files: [], ok: true };
+  if (!patch) return { files: [], binaryFiles: new Set(), ok: true };
+  const normalized = patch.replace(/\r\n/g, "\n").replace(/^\n+|\n+$/g, "");
+  if (/^\s*$/.test(normalized)) return { files: [], binaryFiles: new Set(), ok: true };
 
   try {
     const files = parsePatchFiles(normalized, "review", true).flatMap(
       (parsedPatch) => parsedPatch.files,
     );
-    return { files, ok: true };
+    const binaryFiles = new Set<string>();
+    for (const section of patch.split(/^diff --git /m)) {
+      if (!section || !/Binary files|GIT binary patch/.test(section)) continue;
+      const firstLine = section.split("\n")[0] ?? "";
+      const binaryPath = firstLine.match(/ b\/(.+?)\s*$/)?.[1]?.replace(/^"|"$/g, "")
+        ?? firstLine.split(" ")[1]?.slice(2);
+      if (binaryPath) binaryFiles.add(binaryPath);
+    }
+    return { files, binaryFiles, ok: true };
   } catch {
-    return { files: [], ok: false };
+    return { files: [], binaryFiles: new Set(), ok: false };
   }
 }
 
