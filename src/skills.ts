@@ -36,7 +36,9 @@ export function effectiveSkillPaths(config: ServerConfig, cwd: string): string[]
     resolve(cwd, ".agents", "skills"),
     config.devspaceSkillsDir,
     join(config.agentDir, "skills"),
-    config.subagents || config.workflows ? bundledSkillsDir() : undefined,
+    // The MCP workspace guide is useful even when agent execution is off;
+    // subagent/workflow guides are filtered below by their feature gates.
+    bundledSkillsDir(),
   ];
   const defaultPaths = defaultPathCandidates.filter(
     (path): path is string => path !== undefined && existsSync(path),

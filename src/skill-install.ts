@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 import { devspaceSkillsDir } from "./user-config.js";
 
 const BUNDLED_AGENT_SKILLS = ["subagents", "dynamic-workflows"] as const;
+const BUNDLED_MCP_SKILLS = ["mcp-workspace"] as const;
 const MANAGED_MARKER = ".devspace-managed";
 
 export interface AgentSkillInstallResult {
@@ -25,6 +26,19 @@ export interface AgentSkillInstallResult {
 export function installBundledAgentSkills(
   env: NodeJS.ProcessEnv = process.env,
 ): AgentSkillInstallResult {
+  return installBundledSkills(BUNDLED_AGENT_SKILLS, env);
+}
+
+export function installBundledMcpSkill(
+  env: NodeJS.ProcessEnv = process.env,
+): AgentSkillInstallResult {
+  return installBundledSkills(BUNDLED_MCP_SKILLS, env);
+}
+
+function installBundledSkills(
+  names: readonly string[],
+  env: NodeJS.ProcessEnv,
+): AgentSkillInstallResult {
   const sourceRoot = fileURLToPath(new URL("../skills", import.meta.url));
   const directory = devspaceSkillsDir(env);
   mkdirSync(directory, { recursive: true });
@@ -35,7 +49,7 @@ export function installBundledAgentSkills(
     directory,
   };
 
-  for (const name of BUNDLED_AGENT_SKILLS) {
+  for (const name of names) {
     const source = join(sourceRoot, name);
     const destination = join(directory, name);
     const marker = join(destination, MANAGED_MARKER);

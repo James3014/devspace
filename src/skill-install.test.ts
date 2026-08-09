@@ -9,7 +9,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { installBundledAgentSkills } from "./skill-install.js";
+import { installBundledAgentSkills, installBundledMcpSkill } from "./skill-install.js";
 
 const root = mkdtempSync(join(tmpdir(), "devspace-skill-install-test-"));
 const env = { DEVSPACE_CONFIG_DIR: root };
@@ -21,6 +21,13 @@ try {
   const subagentsFile = join(subagentsDir, "SKILL.md");
   assert.equal(existsSync(join(subagentsDir, ".devspace-managed")), true);
   assert.match(readFileSync(subagentsFile, "utf8"), /devspace agents targets --json/);
+
+  const mcp = installBundledMcpSkill(env);
+  assert.deepEqual(mcp.installed, ["mcp-workspace"]);
+  assert.match(
+    readFileSync(join(mcp.directory, "mcp-workspace", "SKILL.md"), "utf8"),
+    /open_workspace/,
+  );
 
   writeFileSync(subagentsFile, "stale managed copy\n");
   const updated = installBundledAgentSkills(env);
