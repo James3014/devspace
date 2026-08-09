@@ -273,7 +273,7 @@ async function serve(): Promise<void> {
     }
     console.log("auth: Owner password approval required");
     console.log(`logging: ${config.logging.level} ${config.logging.format}`);
-    if (config.subagents) {
+    if (config.subagents || config.workflows) {
       console.log(`subagent providers: ${formatLocalAgentProviderAvailabilitySummary(localAgentProviders)}`);
     }
   });
@@ -315,7 +315,7 @@ async function runDoctor(): Promise<void> {
     console.log(`Allowed hosts: ${config.allowedHosts.join(", ")}`);
     console.log(`Subagents: ${config.subagents ? "enabled" : "disabled"}`);
     console.log(`Workflows: ${config.workflows ? "enabled" : "disabled"}`);
-    if (config.subagents) {
+    if (config.subagents || config.workflows) {
       const snapshot = getLocalAgentProviderAvailabilitySnapshot();
       console.log(
         `Agent providers (live): ${formatLocalAgentProviderAvailabilitySummary(snapshot)}`,
