@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -97,6 +97,33 @@ test("binary changes use a renderable review patch instead of a Git binary patch
   assert.deepEqual(review.files.map((file) => file.path), ["asset.bin"]);
   assert.match(review.patch, /Binary files/);
   assert.doesNotMatch(review.patch, /GIT binary patch/);
+});
+
+test("review metadata preserves pure renames from the rendered patch", async (t) => {
+  const root = await committedRepository(t);
+  await writeFile(join(root, "before.txt"), "same content\n");
+  await git(root, ["add", "before.txt"]);
+  await git(root, ["commit", "-m", "Add rename source"]);
+
+  const manager = createReviewCheckpointManager();
+  await manager.initializeWorkspace({ workspaceId: "ws_rename", root });
+  await rename(join(root, "before.txt"), join(root, "after.txt"));
+
+  const review = await manager.reviewChanges({
+    workspaceId: "ws_rename",
+    root,
+    markReviewed: false,
+  });
+
+  assert.deepEqual(review.files, [
+    {
+      path: "after.txt",
+      previousPath: "before.txt",
+      type: "rename-pure",
+      additions: 0,
+      removals: 0,
+    },
+  ]);
 });
 
 test("review checkpoints survive a manager restart", async (t) => {
