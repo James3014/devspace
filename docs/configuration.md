@@ -119,6 +119,29 @@ sessions.
 | `changes` | Enables the aggregate `show_changes` tool and attaches widget UI to `open_workspace` and `show_changes`. |
 | `off` | Disables widget UI. |
 
+## Change review
+
+`show_changes` (enabled by `DEVSPACE_WIDGETS=changes`) reviews the changes
+made in the current work session. By default it diffs a change journal that
+records the original state of every file the write, edit, and apply_patch
+tools first touch, so review works in any workspace, git or not, and never
+scans the repository.
+
+Set `DEVSPACE_REVIEW_MODE=git` to use the git-backed review instead. It
+compares the working tree against persisted review checkpoints:
+
+- Checkpoints are commits created from a temporary index inside the git
+  common directory and stored under the
+  `refs/devspace/review/<workspace>/open` and
+  `refs/devspace/review/<workspace>/baseline` refs.
+- The baseline advances whenever changes are shown.
+- If the repository's HEAD moves between reviews, checkpoints are re-anchored
+  to the latest commit rather than diffed across different histories.
+- Diffs ignore whitespace-only changes and degrade to a file list when the
+  patch would exceed 10 MB.
+
+The git-backed review is the fallback path; the journal is the default.
+
 ## Skills
 
 | Variable | Purpose |
