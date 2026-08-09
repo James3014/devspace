@@ -114,23 +114,26 @@ User and project skills with the same name take precedence. Setup updates only
 copies marked as DevSpace-managed and preserves unmarked, user-owned skill
 directories.
 
-When agent tooling is enabled, DevSpace discovers agent profiles from:
+When agent or workflow tooling is enabled, DevSpace discovers agent profiles from:
 
 - `~/.devspace/agents/*.md`
 - project `.devspace/agents/*.md`
 
-`open_workspace` returns only usable provider names and profile names with
-descriptions. `devspace agents ls` lists existing subagent sessions for the
-current workspace, scoped by the workspace environment injected into shell
-commands. The `subagents` skill teaches the model to discover targets with
-`devspace agents targets`, then use the minimal `devspace agents run`,
-`devspace agents show`, and `devspace agents ls` workflow.
+`open_workspace` returns a compact model-facing catalog: usable providers with
+their model and effort capability hints, and usable profiles with their
+provider/model/effort defaults. `devspace agents ls` lists existing subagent
+sessions for the current workspace, scoped by the workspace environment
+injected into shell commands. The `subagents` skill teaches the model to
+discover targets with `devspace agents targets --json`, then use the minimal
+`devspace agents run`, `devspace agents show`, and `devspace agents ls` workflow.
 
 Provider availability is detected at runtime. Setup persists the selected
 provider names in `config.json`; unavailable and unselected providers and their
 profiles are omitted from model-facing results. `devspace agents targets --json`
 shows the complete usable CLI target catalog when a model needs provider,
-model, or effort defaults for execution.
+model, or effort defaults for execution. If only Dynamic Workflows are enabled,
+the same catalog is still available because workflow scripts need it to choose
+agent calls.
 
 Starter profile templates are available under `examples/agents/`. Copy or adapt
 them into one of the active profile directories before use.

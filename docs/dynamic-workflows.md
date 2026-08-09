@@ -1,51 +1,45 @@
-# Subagents And Dynamic Workflows
+# Subagents and Dynamic Workflows
 
-DevSpace exposes one agent execution layer through its CLI. Coding harnesses
-such as Codex, Pi, OpenCode, or Cursor can call it directly. ChatGPT and Claude
-can call the same commands through DevSpace's ordinary shell or process tools.
-There are no dedicated subagent or workflow-execution MCP tools.
+DevSpace provides one local agent execution layer through the CLI. Codex, Pi,
+OpenCode, Cursor, ChatGPT, and Claude can use the same commands from a project
+directory. There are no dedicated MCP execution tools for subagents or
+workflows; an MCP host can invoke the CLI through its normal shell/process
+tool.
 
 ## Setup
 
-Run `devspace init` and enable agent tooling. Setup probes the supported
-providers, asks which ones DevSpace may use, and installs two skills in
-`~/.devspace/skills`:
+Run `devspace init`, enable agent tooling, and choose the providers DevSpace may
+use. Setup installs the `subagents` and `dynamic-workflows` skills under
+`~/.devspace/skills`. Provider availability is checked again when a command
+runs, so disabled or unavailable providers are not offered.
 
-- `subagents` for one bounded delegation and later follow-ups
-- `dynamic-workflows` for programmed multi-agent orchestration
+## Scope
 
-Provider selection is stored as `agentProviders` in
-`~/.devspace/config.json`. Runtime availability is checked again before a
-provider is shown or used.
+Run CLI commands from the project they should operate on. A standalone CLI
+invocation uses an explicit DevSpace workspace root when supplied, otherwise
+the nearest project marker, Git repository root, or current directory. When an
+MCP shell launches the CLI, DevSpace carries the opened workspace identity into
+that process.
 
-## Project Scope
-
-Run agent commands from the intended project. When an MCP host invokes the CLI,
-DevSpace injects the opened workspace identity. In a standalone harness,
-DevSpace discovers the current Git repository or project directory. Lists,
-lookups, continuations, status checks, and cancellations stay inside that
-scope.
-
-## Direct Subagents
+## Direct subagents
 
 ```bash
 devspace agents targets --json
 devspace agents run <profile-or-provider> "<brief>" --json
-devspace agents show <id> --json
-devspace agents run <id> "<follow-up>" --json
+devspace agents show <agent-id> --json
+devspace agents run <agent-id> "<follow-up>" --json
 devspace agents ls --json
 ```
 
 Use a direct subagent for one focused implementation, investigation, review, or
-verification task. Profiles can supply role instructions and provider/model
-defaults. The child runs independently and returns an id that the orchestrator
-polls or continues.
+verification task. Profiles provide reusable role instructions and optional
+provider/model/effort defaults. Keep the brief self-contained.
 
-## Dynamic Workflows
+## Dynamic workflows
 
 ```bash
-devspace workflow run --name <name> --json
-devspace workflow run --file <script.js> --arg key=value --json
+devspace workflow run --name <name> [--arg key=value]... --json
+devspace workflow run --file <script.js> [--arg key=value]... --json
 devspace workflow status <run-id> --json
 devspace workflow calls <run-id> --json
 devspace workflow call <run-id> <call-index> --json
@@ -53,29 +47,47 @@ devspace workflow cancel <run-id> --json
 devspace workflow ls --json
 ```
 
-Named scripts live in `.devspace/workflows/<name>.js`. A script can combine
-`agent`, `parallel`, `pipeline`, `phase`, `log`, and one-level nested
-`workflow` calls. Agent calls can request structured JSON or an isolated Git
-worktree.
+Named scripts live in `.devspace/workflows/<name>.js`; `--script-path` is an
+alias for `--file`. Use `--json` to start promptly and poll by id, or use
+`--follow` from a terminal that can remain attached. A failed or cancelled run
+can be started again with `workflow run --resume <run-id>`.
 
-Agent harnesses should prefer `--json`, retain the returned id, and poll status.
-This avoids coupling a long workflow lifetime to one tool-call timeout.
-`--follow` remains available for interactive terminals with long-running
-process support.
+Workflow scripts can combine `agent`, `parallel`, `pipeline`, `phase`, `log`,
+and `workflow`. Agent calls support profiles or providers, optional model and
+effort overrides, structured `schema` results, and `isolation: 'worktree'` for
+parallel writers. Use `--arg key=value` for run-specific inputs.
 
-Failed and cancelled workflows are terminal. `workflow run --resume <run-id>`
-creates a new run, reuses the unchanged successful prefix when safe, and
-continues live from the first failed or changed call.
+Common uses include fan-out reviews followed by a summary, per-file analysis
+and verification pipelines, and comparing independent implementations in
+isolated worktrees.
 
-## MCP Workspace Summary
+## MCP workspace summary
 
-When agent tooling is enabled, `open_workspace` stays deliberately small:
+`open_workspace` exposes only the information needed to choose a target and
+decide whether to inspect a running workflow. When enabled, its compact agent
+fields look like this:
 
 ```json
 {
-  "agentProviders": ["codex", "claude"],
+  "agentProviders": [
+    {
+      "name": "codex",
+      "model": { "supported": true, "discovery": "model_dependent" },
+      "effort": {
+        "supported": true,
+        "semantics": "reasoning_effort",
+        "discovery": "model_dependent"
+      }
+    }
+  ],
   "agents": [
-    { "name": "reviewer", "description": "Review changes and test gaps." }
+    {
+      "name": "reviewer",
+      "description": "Review changes and test gaps.",
+      "provider": "codex",
+      "model": "gpt-5.4",
+      "effort": "high"
+    }
   ],
   "activeWorkflows": [
     {
@@ -88,7 +100,5 @@ When agent tooling is enabled, `open_workspace` stays deliberately small:
 }
 ```
 
-Provider capability metadata, models, effort semantics, session identifiers,
-workflow phases, and internal counters are intentionally absent. Models obtain
-execution details only when needed through `devspace agents targets --json` or
-the workflow inspection commands.
+Only usable configured providers and profiles are included. Detailed execution
+results remain available through the CLI commands above.

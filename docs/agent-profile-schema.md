@@ -131,31 +131,53 @@ Recommended body content:
 
 ## Model-facing workflow
 
-The Subagent skill teaches only:
+The CLI skill teaches the model to discover usable targets and then use only
+the small session surface it needs:
 
 ```bash
+devspace agents targets --json
 devspace agents ls
-devspace agents run <profile-or-id> "<prompt>"
-devspace agents show <id>
+devspace agents run <profile-or-provider> "<prompt>"
+devspace agents show <agent-id>
+devspace agents run <agent-id> "<follow-up>"
 ```
 
-`open_workspace` exposes compact profile metadata:
+`open_workspace` exposes compact, model-relevant capability metadata when agent
+or workflow tooling is enabled:
 
 ```json
 {
-  "name": "reviewer",
-  "description": "Read-only reviewer for bugs, security risks, and missing tests.",
-  "provider": "codex",
-  "model": "gpt-5.4",
-  "effort": "high"
+  "agentProviders": [
+    {
+      "name": "codex",
+      "model": { "supported": true, "discovery": "model_dependent" },
+      "effort": {
+        "supported": true,
+        "semantics": "reasoning_effort",
+        "discovery": "model_dependent"
+      }
+    }
+  ],
+  "agents": [
+    {
+      "name": "reviewer",
+      "description": "Read-only reviewer for bugs, security risks, and missing tests.",
+      "provider": "codex",
+      "model": "gpt-5.4",
+      "effort": "high"
+    }
+  ]
 }
 ```
 
-`devspace agents ls` lists existing subagent sessions for the current workspace;
-it does not list profile definitions.
+Only enabled providers that pass the local availability check are returned;
+profiles using a disabled or unavailable provider are omitted. The
+`activeWorkflows` field, when workflows are enabled, contains only active run
+ids, names, statuses, and running/completed/failed call counts.
 
-The full profile body stays out of the model context until DevSpace launches the
-profile.
+`devspace agents ls` lists existing subagent sessions for the current workspace;
+it does not list profile definitions. The full profile body stays out of the
+model context until DevSpace launches the profile.
 
 ## Current non-goals
 

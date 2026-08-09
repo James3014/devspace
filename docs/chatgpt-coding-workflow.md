@@ -91,10 +91,11 @@ setup installs in `~/.devspace/skills` when agent tooling is enabled, plus:
 - `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
 - additional paths from `DEVSPACE_SKILL_PATHS`
 
-When agent tooling is enabled, DevSpace discovers agent profiles from
-`~/.devspace/agents/*.md` and project `.devspace/agents/*.md`.
-`open_workspace` exposes only usable provider names and profile names with
-descriptions. Disabled or unavailable providers and their profiles are omitted.
+When agent or workflow tooling is enabled, DevSpace discovers agent profiles
+from `~/.devspace/agents/*.md` and project `.devspace/agents/*.md`.
+`open_workspace` exposes a compact catalog of usable providers (model and
+effort capability hints) and profiles (provider/model/effort defaults).
+Disabled or unavailable providers and their profiles are omitted.
 
 Example profiles are packaged under `examples/agents/` for users who want
 starter templates. Copy or adapt them into one of the active profile directories
@@ -118,8 +119,10 @@ usable execution catalog with `devspace agents targets --json`.
 
 `DEVSPACE_AGENT_PROVIDERS` can narrow the configured provider allowlist.
 `DEVSPACE_WORKFLOWS` remains an optional runtime override; normally workflows
-follow the agent-tooling setting. Disabled features are omitted from the
-`open_workspace` schema and response.
+follow the agent-tooling setting. When workflows alone are enabled, the same
+target catalog is returned because workflow scripts still need agent provider
+and profile choices. Disabled features are omitted from the `open_workspace`
+schema and response.
 
 ## Tool Names
 
