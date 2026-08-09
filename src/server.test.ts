@@ -8,6 +8,8 @@ import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { loadConfig, type ServerConfig } from "./config.js";
+import { openDatabase } from "./db/client.js";
+import { createChangeJournalManager } from "./change-journal.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { createMcpServer } from "./server.js";
@@ -133,10 +135,13 @@ test("checkout reuse and context suppression survive a registry restart", async 
   await context.close();
 
   const restoredStore = new SqliteWorkspaceStore(context.stateDir);
+  const restoredJournalDatabase = openDatabase(context.stateDir);
   const restoredServer = createMcpServer(
     context.config,
     new WorkspaceRegistry(context.config, restoredStore),
     createReviewCheckpointManager(),
+    createChangeJournalManager(restoredJournalDatabase.db),
+    "journal",
     new ProcessSessionManager(),
     [],
     [],
@@ -150,6 +155,7 @@ test("checkout reuse and context suppression survive a registry restart", async 
     await restoredClient.close();
     await restoredServer.close();
     restoredStore.close();
+    restoredJournalDatabase.close();
   };
   t.after(closeRestored);
 
@@ -175,7 +181,10 @@ interface ServerFixture {
   close: () => Promise<void>;
 }
 
-async function fixture(t: TestContext, options: { git?: boolean } = {}): Promise<ServerFixture> {
+async function fixture(
+  t: TestContext,
+  options: { git?: boolean; widgets?: "off" | "changes" | "full" } = {},
+): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
   const project = join(root, "project");
   const agentDir = join(root, "agent");
@@ -208,17 +217,21 @@ async function fixture(t: TestContext, options: { git?: boolean } = {}): Promise
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_WORKTREE_ROOT: join(root, ".worktrees"),
     DEVSPACE_AGENT_DIR: agentDir,
-    DEVSPACE_WIDGETS: "full",
+    DEVSPACE_WIDGETS: options.widgets ?? "full",
     DEVSPACE_TOOL_MODE: "full",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
+  const journalDatabase = openDatabase(stateDir);
+  const changeJournal = createChangeJournalManager(journalDatabase.db);
   const store = new SqliteWorkspaceStore(stateDir);
   const workspaces = new WorkspaceRegistry(config, store);
   const server = createMcpServer(
     config,
     workspaces,
     createReviewCheckpointManager(),
+    changeJournal,
+    "journal",
     new ProcessSessionManager(),
     [],
     [],
@@ -241,6 +254,7 @@ async function fixture(t: TestContext, options: { git?: boolean } = {}): Promise
 
   t.after(async () => {
     await close();
+    journalDatabase.close();
     await rm(root, { recursive: true, force: true });
   });
 

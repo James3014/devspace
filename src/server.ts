@@ -17,7 +17,7 @@ import {
 import express from "express";
 import type { Request, Response } from "express";
 import * as z from "zod/v4";
-import { applyPatch } from "./apply-patch.js";
+import { applyPatch, parsePatch } from "./apply-patch.js";
 import {
   isArtifactDownloadSupportedPlatform,
   registerArtifactTools,
@@ -53,6 +53,8 @@ import {
   createReviewCheckpointManager,
   type ReviewChangesResult,
 } from "./review-checkpoints.js";
+import { createChangeJournalManager, type ChangeJournalManager } from "./change-journal.js";
+import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import { openAiConversationScopeId } from "./request-meta.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
@@ -700,14 +702,19 @@ function registerCodexProcessTools(
   );
 }
 
+export type ReviewSource = "git" | "journal";
+
 export function createMcpServer(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
   reviewCheckpoints: ReturnType<typeof createReviewCheckpointManager>,
+  changeJournal: ChangeJournalManager,
+  reviewSource: ReviewSource,
   processSessions: ProcessSessionManager,
   localAgentProviders: LocalAgentProviderAvailability[],
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
 ): McpServer {
+  const journalTouches = config.widgets === "changes" && reviewSource === "journal";
   const server = new McpServer(
     {
       name: "devspace",
@@ -1075,6 +1082,13 @@ export function createMcpServer(
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       workspaces.resolvePath(workspace, input.path);
+      if (journalTouches) {
+        await changeJournal.recordTouch({
+          workspaceId,
+          root: workspace.root,
+          path: input.path,
+        });
+      }
       const response = await writeFileTool(input, {
         cwd: workspace.root,
         root: workspace.root,
@@ -1162,6 +1176,13 @@ export function createMcpServer(
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       workspaces.resolvePath(workspace, input.path);
+      if (journalTouches) {
+        await changeJournal.recordTouch({
+          workspaceId,
+          root: workspace.root,
+          path: input.path,
+        });
+      }
       const response = await editFileTool(input, {
         cwd: workspace.root,
         root: workspace.root,
@@ -1249,6 +1270,31 @@ export function createMcpServer(
       async ({ workspaceId, patch }) => {
         const startedAt = performance.now();
         const workspace = workspaces.getWorkspace(workspaceId);
+        if (journalTouches) {
+          const actions = parsePatch(patch);
+          for (const action of actions) {
+            if (action.kind === "delete") {
+              await changeJournal.recordTouch({
+                workspaceId,
+                root: workspace.root,
+                path: action.path,
+              });
+            } else if (action.kind === "update" && action.moveTo) {
+              await changeJournal.recordTouch({
+                workspaceId,
+                root: workspace.root,
+                path: action.moveTo,
+                previousPath: action.path,
+              });
+            } else {
+              await changeJournal.recordTouch({
+                workspaceId,
+                root: workspace.root,
+                path: action.path,
+              });
+            }
+          }
+        }
         const applied = await applyPatch(workspace.root, patch);
         const paths = applied.files.map((file) => file.path).join(", ");
         const result = `Applied patch to ${applied.files.length} file(s): ${paths}`;
@@ -1314,11 +1360,17 @@ export function createMcpServer(
 
         let review: ReviewChangesResult;
         try {
-          review = await reviewCheckpoints.reviewChanges({
-            workspaceId,
-            root: workspace.root,
-            markReviewed: true,
-          });
+          review = reviewSource === "git"
+            ? await reviewCheckpoints.reviewChanges({
+                workspaceId,
+                root: workspace.root,
+                markReviewed: true,
+              })
+            : await changeJournal.reviewChanges({
+                workspaceId,
+                root: workspace.root,
+                markReviewed: true,
+              });
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error);
           const content = [textBlock(`show_changes failed: ${message}`)];
@@ -1721,6 +1773,9 @@ export function createServer(
   const workspaceStore = createWorkspaceStore(config.stateDir);
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
+  const reviewSource: ReviewSource = process.env.DEVSPACE_REVIEW_MODE === "git" ? "git" : "journal";
+  const journalDatabase = openDatabase(config.stateDir);
+  const changeJournal = createChangeJournalManager(journalDatabase.db);
   const processSessions = new ProcessSessionManager();
   const localAgentProviders = config.subagents
     ? getLocalAgentProviderAvailabilitySnapshot()
@@ -1883,6 +1938,8 @@ export function createServer(
           config,
           workspaces,
           reviewCheckpoints,
+          changeJournal,
+          reviewSource,
           processSessions,
           localAgentProviders,
           incomingArtifactAdapters,
@@ -1918,6 +1975,7 @@ export function createServer(
         processSessions.shutdown();
         oauthProvider.close();
         workspaceStore.close?.();
+        journalDatabase.close();
       })();
       return closePromise;
     },
