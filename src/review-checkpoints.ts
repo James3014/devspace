@@ -221,11 +221,12 @@ async function createWorkingTreeSnapshot(gitRoot: string, workspaceRoot: string)
   const env = checkpointEnv(indexPath);
 
   try {
-    await git(gitRoot, ["read-tree", "HEAD"], { env });
+    if (await commitForRef(gitRoot, "HEAD")) {
+      await git(gitRoot, ["read-tree", "HEAD"], { env });
+    }
     await git(workspaceRoot, ["add", "-A", "--", "."], { env });
     const tree = (await git(gitRoot, ["write-tree"], { env })).stdout.trim();
-    const parent = (await git(gitRoot, ["rev-parse", "--verify", "HEAD^{commit}"])).stdout.trim();
-    return (await git(gitRoot, ["commit-tree", tree, "-p", parent, "-m", "DevSpace review snapshot"], { env })).stdout.trim();
+    return (await git(gitRoot, ["commit-tree", tree, "-m", "DevSpace review snapshot"], { env })).stdout.trim();
   } finally {
     await rm(tempDir, { recursive: true, force: true });
   }

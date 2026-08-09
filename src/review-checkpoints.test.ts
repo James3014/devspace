@@ -201,27 +201,21 @@ test("a concurrent review rejects a different root after initialization", async 
   }
 });
 
-test("an unborn repository becomes reviewable after its first commit", async (t) => {
+test("an unborn repository is reviewable without creating a commit", async (t) => {
   const root = await unbornRepository(t);
   const manager = createReviewCheckpointManager();
 
   await manager.initializeWorkspace({ workspaceId: "ws_unborn", root });
-  await assert.rejects(
-    () => manager.reviewChanges({ workspaceId: "ws_unborn", root }),
-    /repository has no HEAD commit/,
-  );
+  await writeFile(join(root, "README.md"), "first file\n");
 
-  await writeFile(join(root, "README.md"), "first commit\n");
-  await git(root, ["add", "README.md"]);
-  await git(root, ["commit", "-m", "Initial commit"]);
-
-  const afterFirstCommit = await manager.reviewChanges({
+  const review = await manager.reviewChanges({
     workspaceId: "ws_unborn",
     root,
     markReviewed: false,
   });
-  assert.equal(afterFirstCommit.summary.files, 0);
-  assert.equal(afterFirstCommit.patch, "");
+  assert.deepEqual(review.files.map((file) => file.path), ["README.md"]);
+  assert.equal(review.files[0]?.type, "new");
+  assert.match(review.patch, /first file/);
 });
 
 async function committedRepository(t: TestContext): Promise<string> {
