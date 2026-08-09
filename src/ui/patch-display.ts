@@ -1,4 +1,10 @@
+import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
 import type { ToolResultCard } from "./card-types.js";
+
+export interface ReviewPatchParse {
+  files: FileDiffMetadata[];
+  ok: boolean;
+}
 
 export type FileChangeKind =
   | "added"
@@ -158,6 +164,26 @@ export function getRenderedFileChangePathDisplay(
 
 export function fileChangeKindLabel(kind: FileChangeKind): string {
   return kind === "unknown" ? "Changed" : fileChangeLabels[kind];
+}
+
+/**
+ * Parse a review patch without ever throwing, so a malformed or unexpected
+ * patch cannot take down the whole card render. A parse failure surfaces as
+ * `ok: false` so the caller can fall back to a file-summary-only card.
+ */
+export function parseReviewPatchFiles(patch: string | undefined): ReviewPatchParse {
+  if (!patch) return { files: [], ok: true };
+  const normalized = patch.replace(/\r\n/g, "\n").trim();
+  if (normalized.length === 0) return { files: [], ok: true };
+
+  try {
+    const files = parsePatchFiles(normalized, "review", true).flatMap(
+      (parsedPatch) => parsedPatch.files,
+    );
+    return { files, ok: true };
+  } catch {
+    return { files: [], ok: false };
+  }
 }
 
 function countChangedFiles(files: NonNullable<ToolResultCard["files"]>): number {

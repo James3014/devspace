@@ -42,6 +42,7 @@ export interface ToolResultCard {
     managed?: boolean;
   };
   status?: string;
+  error?: string;
   summary?: Record<string, unknown>;
   files?: Array<{
     path?: string;
@@ -180,7 +181,9 @@ export function isExpandableCard(card: ToolResultCard): boolean {
     );
   }
 
-  if (isReviewTool(card.tool)) return Boolean(card.files?.length || card.payload?.patch);
+  if (isReviewTool(card.tool)) {
+    return Boolean(card.files?.length || card.payload?.patch || card.error);
+  }
   if (isPatchTool(card.tool)) return Boolean(card.payload?.patch);
 
   return Boolean(card.payload);

@@ -4,6 +4,7 @@ import {
   getPatchDisplayParts,
   getRenderedFileChangeKind,
   getRenderedFileChangePathDisplay,
+  parseReviewPatchFiles,
 } from "./patch-display.js";
 
 assert.deepEqual(getPatchDisplayParts({}), {
@@ -203,3 +204,28 @@ assert.deepEqual(
     tone: "edit",
   },
 );
+
+const reviewPatch = `diff --git a/src/a.ts b/src/a.ts
+index 1111111..2222222 100644
+--- a/src/a.ts
++++ b/src/a.ts
+@@ -1,3 +1,3 @@
+-const x = 1;
++const x = 2;
+`;
+
+const parsedReview = parseReviewPatchFiles(reviewPatch);
+assert.equal(parsedReview.ok, true);
+assert.equal(parsedReview.files.length, 1);
+assert.equal(parsedReview.files[0]?.name, "src/a.ts");
+assert.equal(parsedReview.files[0]?.hunks.length, 1);
+assert.equal(parsedReview.files[0]?.hunks[0]?.additionLines, 1);
+assert.equal(parsedReview.files[0]?.hunks[0]?.deletionLines, 1);
+
+assert.deepEqual(parseReviewPatchFiles(undefined), { files: [], ok: true });
+assert.deepEqual(parseReviewPatchFiles("   \n  "), { files: [], ok: true });
+assert.deepEqual(parseReviewPatchFiles("garbage that is not a patch"), { files: [], ok: true });
+
+const crlfReviewPatch = reviewPatch.replace(/\n/g, "\r\n");
+assert.equal(parseReviewPatchFiles(crlfReviewPatch).ok, true);
+assert.equal(parseReviewPatchFiles(crlfReviewPatch).files.length, 1);
