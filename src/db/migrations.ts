@@ -27,6 +27,11 @@ const migrations: Migration[] = [
     name: "workspace-conversation-bindings",
     up: migrateWorkspaceConversationBindings,
   },
+  {
+    version: 5,
+    name: "change-journal",
+    up: migrateChangeJournal,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -195,6 +200,24 @@ function migrateWorkspaceConversationBindings(sqlite: Database.Database): void {
 
     create index if not exists workspace_conversation_bindings_workspace_idx
       on workspace_conversation_bindings(workspace_session_id);
+  `);
+}
+
+function migrateChangeJournal(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists change_journal (
+      workspace_session_id text not null,
+      path text not null,
+      previous_path text,
+      original_content text,
+      original_binary integer not null default 0,
+      is_new integer not null default 0,
+      touched_at text not null,
+      primary key (workspace_session_id, path),
+      foreign key (workspace_session_id)
+        references workspace_sessions(id)
+        on delete cascade
+    );
   `);
 }
 

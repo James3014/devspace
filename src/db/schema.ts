@@ -38,6 +38,24 @@ export const loadedAgentFiles = sqliteTable(
   ],
 );
 
+export const changeJournal = sqliteTable(
+  "change_journal",
+  {
+    workspaceSessionId: text("workspace_session_id")
+      .notNull()
+      .references(() => workspaceSessions.id, { onDelete: "cascade" }),
+    path: text("path").notNull(),
+    previousPath: text("previous_path"),
+    originalContent: text("original_content"),
+    originalBinary: integer("original_binary").notNull().default(0),
+    isNew: integer("is_new").notNull().default(0),
+    touchedAt: text("touched_at").notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.workspaceSessionId, table.path] }),
+  ],
+);
+
 export const workspaceConversationBindings = sqliteTable(
   "workspace_conversation_bindings",
   {
@@ -118,6 +136,8 @@ export type WorkspaceSessionRow = typeof workspaceSessions.$inferSelect;
 export type NewWorkspaceSessionRow = typeof workspaceSessions.$inferInsert;
 export type LoadedAgentFileRow = typeof loadedAgentFiles.$inferSelect;
 export type NewLoadedAgentFileRow = typeof loadedAgentFiles.$inferInsert;
+export type ChangeJournalRow = typeof changeJournal.$inferSelect;
+export type NewChangeJournalRow = typeof changeJournal.$inferInsert;
 export type WorkspaceConversationBindingRow = typeof workspaceConversationBindings.$inferSelect;
 export type NewWorkspaceConversationBindingRow = typeof workspaceConversationBindings.$inferInsert;
 export type LocalAgentSessionRow = typeof localAgentSessions.$inferSelect;
