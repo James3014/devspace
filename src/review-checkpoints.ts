@@ -108,7 +108,14 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
       const baselineRef = effectiveSince === "workspace_open" ? state.openRef : state.baselineRef;
       const baseline = (await git(state.gitRoot, ["rev-parse", "--verify", `${baselineRef}^{commit}`])).stdout.trim();
       const current = await createWorkingTreeSnapshot(state.gitRoot);
-      const patch = (await git(state.gitRoot, ["diff", "--binary", "--no-color", baseline, current], {
+      const patch = (await git(state.gitRoot, [
+        "diff",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        baseline,
+        current,
+      ], {
         maxBuffer: 50 * 1024 * 1024,
       })).stdout;
       const numstat = (await git(state.gitRoot, ["diff", "--numstat", "-z", baseline, current], {
