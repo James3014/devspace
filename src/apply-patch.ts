@@ -440,7 +440,7 @@ async function writeTextFile(destination: string, content: string, mode?: number
   }
 }
 
-function unifiedFilePatch(
+export function unifiedFilePatch(
   oldPath: string,
   newPath: string,
   oldContent: string | null,
