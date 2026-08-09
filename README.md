@@ -84,8 +84,9 @@ During setup, DevSpace asks for:
 - whether ChatGPT or Claude will connect remotely; only remote MCP users need a public HTTPS URL
 - whether to enable subagents and Dynamic Workflows, and which available providers may run
 
-Setup installs the `subagents` and `dynamic-workflows` skills in
-`~/.devspace/skills` when agent tooling is enabled. Coding harnesses can use the
+Setup installs the `mcp-workspace` skill in `~/.devspace/skills` for MCP
+workspace usage. When CLI agent tooling is enabled, it also installs the
+`subagents` and `dynamic-workflows` skills there. Coding harnesses can use the
 DevSpace CLI directly; MCP users invoke the same CLI through DevSpace's shell or
 process tools.
 

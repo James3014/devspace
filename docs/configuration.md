@@ -106,7 +106,9 @@ DevSpace discovers standard Agent Skills from:
 
 It also includes:
 
-- managed `subagents` and `dynamic-workflows` skills installed by setup in `~/.devspace/skills`
+- managed `mcp-workspace` skill installed by setup in `~/.devspace/skills`
+- managed `subagents` and `dynamic-workflows` skills installed by setup in
+  `~/.devspace/skills`
 - `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
 - additional paths from `DEVSPACE_SKILL_PATHS`
 

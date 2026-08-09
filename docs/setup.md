@@ -75,11 +75,18 @@ https://your-tunnel-host.example.com/mcp
 
 ### Agent Tooling
 
-Enable agent tooling to use both direct subagents and Dynamic Workflows. Setup
-shows currently available providers and persists only the providers you select.
-Unavailable and unselected providers are not exposed to models.
+Setup always installs the `mcp-workspace` skill for direct MCP workspace use.
+Enable CLI agent tooling to use both direct subagents and Dynamic Workflows.
+Setup shows currently available providers and persists only the providers you
+select. Unavailable and unselected providers are not exposed to models.
 
-The two model skills are installed in:
+The MCP skill is installed in:
+
+```text
+~/.devspace/skills/mcp-workspace
+```
+
+When CLI agent tooling is enabled, the two agent skills are installed in:
 
 ```text
 ~/.devspace/skills/subagents
@@ -90,7 +97,9 @@ DevSpace updates its managed copies on later forced setup runs and preserves a
 same-named directory that does not carry the DevSpace management marker.
 
 Coding harnesses can now run `devspace agents` and `devspace workflow` from a
-project directory without starting the MCP server.
+project directory without starting the MCP server. MCP hosts use the
+`mcp-workspace` skill for direct workspace tools and invoke the same CLI through
+their normal shell/process tool when agent tooling is enabled.
 
 ## Start The Server
 

@@ -9,9 +9,10 @@ tool.
 ## Setup
 
 Run `devspace init`, enable agent tooling, and choose the providers DevSpace may
-use. Setup installs the `subagents` and `dynamic-workflows` skills under
-`~/.devspace/skills`. Provider availability is checked again when a command
-runs, so disabled or unavailable providers are not offered.
+use. Setup always installs the `mcp-workspace` skill and installs the
+`subagents` and `dynamic-workflows` skills when agent tooling is enabled, all
+under `~/.devspace/skills`. Provider availability is checked again when a
+command runs, so disabled or unavailable providers are not offered.
 
 ## Scope
 

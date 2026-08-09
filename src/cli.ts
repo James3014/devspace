@@ -53,7 +53,7 @@ import {
   localAgentOutput,
   localAgentTargetsOutput,
 } from "./cli-output.js";
-import { installBundledAgentSkills } from "./skill-install.js";
+import { installBundledAgentSkills, installBundledMcpSkill } from "./skill-install.js";
 
 import { runWorkflowCommand } from "./workflow-cli.js";
 import {
@@ -197,7 +197,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       : null;
 
     const agentToolingAnswer = await prompts.confirm({
-      message: "Enable subagents and Dynamic Workflows?",
+      message: "Enable CLI subagents and Dynamic Workflows?",
       initialValue: resolveSubagentsFlag(files.config) ?? true,
     });
     if (prompts.isCancel(agentToolingAnswer)) throw new SetupCancelledError();
@@ -242,16 +242,16 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
 
     const configPath = writeDevspaceConfig(config);
     const authPath = writeDevspaceAuth(auth);
-    const installedSkills = subagents ? installBundledAgentSkills() : undefined;
+    const mcpSkills = installBundledMcpSkill();
+    const agentSkills = subagents ? installBundledAgentSkills() : undefined;
     const lines = [
       `Config: ${configPath}`,
       `Auth: ${authPath}`,
       `Local MCP URL: http://${config.host}:${config.port}/mcp`,
       ...(publicBaseUrl ? [`Public MCP URL: ${publicBaseUrl}/mcp`] : []),
       `Agent tooling: ${subagents ? `enabled (${agentProviders.join(", ")})` : "disabled"}`,
-      ...(installedSkills
-        ? [`Agent skills: ${installedSkills.directory}`]
-        : []),
+      `MCP workspace skill: ${mcpSkills.directory}/mcp-workspace`,
+      ...(agentSkills ? [`Agent skills: ${agentSkills.directory}`] : []),
     ];
     prompts.note(lines.join("\n"), "DevSpace configured");
     prompts.note(
@@ -262,9 +262,13 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       ].join("\n"),
       "Owner password",
     );
-    if (installedSkills?.skipped.length) {
+    const skippedSkills = [
+      ...mcpSkills.skipped,
+      ...(agentSkills?.skipped ?? []),
+    ];
+    if (skippedSkills.length) {
       prompts.log.warn(
-        `Kept user-owned skills unchanged: ${installedSkills.skipped.join(", ")}`,
+        `Kept user-owned skills unchanged: ${skippedSkills.join(", ")}`,
       );
     }
     prompts.outro(
