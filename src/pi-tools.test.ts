@@ -9,7 +9,7 @@ try {
   const result = await runShellTool(
     {
       command:
-        `${process.execPath} -e "console.log(process.env.DEVSPACE_WORKSPACE_ID + ',' + process.env.DEVSPACE_WORKSPACE_ROOT)"`,
+        `node -e "console.log(process.env.DEVSPACE_WORKSPACE_ID + ',' + process.env.DEVSPACE_WORKSPACE_ROOT)"`,
       timeout: 10,
     },
     {
@@ -24,7 +24,8 @@ try {
 
   assert.equal(result.isError, undefined);
   assert.match(result.content[0]?.type === "text" ? result.content[0].text : "", /ws_shell/);
-  assert.match(result.content[0]?.type === "text" ? result.content[0].text : "", new RegExp(root));
+  const output = result.content[0]?.type === "text" ? result.content[0].text : "";
+  assert.ok(output.includes(root));
 } finally {
   rmSync(root, { recursive: true, force: true });
 }
