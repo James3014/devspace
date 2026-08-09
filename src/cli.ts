@@ -3,9 +3,9 @@ import { createRequire } from "node:module";
 import { stdin as input, stdout as output } from "node:process";
 import { spawn } from "node:child_process";
 import { mkdtempSync, writeFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
@@ -85,7 +85,7 @@ async function main(argv: string[]): Promise<void> {
       runConfigCommand(args);
       return;
     case "agents":
-      if (!loadConfig().subagents) {
+      if (args[0] !== "__worker" && !loadConfig().subagents) {
         throw new Error(
           "Agent tooling is disabled. Run `devspace init --force` or set DEVSPACE_SUBAGENTS=1.",
         );
@@ -443,19 +443,23 @@ async function runAgentsList(args: string[]): Promise<void> {
   const json = parseJsonOnlyOption(args, "devspace agents ls [--json]");
   const config = loadConfig();
   const store = createLocalAgentStore(config);
-  const agents = store.list(resolveCliWorkspaceContext());
+  try {
+    const agents = store.list(resolveCliWorkspaceContext());
 
-  if (json) {
-    printJson({ agents: agents.map((agent) => localAgentOutput(agent)) });
-    return;
-  }
-  if (agents.length === 0) {
-    console.log("No subagent sessions found for this workspace.");
-    return;
-  }
+    if (json) {
+      printJson({ agents: agents.map((agent) => localAgentOutput(agent)) });
+      return;
+    }
+    if (agents.length === 0) {
+      console.log("No subagent sessions found for this workspace.");
+      return;
+    }
 
-  for (const agent of agents) {
-    console.log(formatAgentLine(agent));
+    for (const agent of agents) {
+      console.log(formatAgentLine(agent));
+    }
+  } finally {
+    store.close();
   }
 }
 
@@ -486,68 +490,72 @@ async function runAgentsRun(args: string[]): Promise<void> {
   const workspace = resolveCliWorkspaceContext();
   const workspaceRoot = workspace.workspaceRoot;
   const store = createLocalAgentStore(config);
-  const existing = store.get(parsed.target);
+  try {
+    const existing = store.get(parsed.target);
 
-  if (existing) {
-    assertRecordInCliWorkspace(existing, workspace, "Subagent session");
-    if (!isLocalAgentProvider(existing.provider)) {
-      throw new Error(`Unknown subagent provider for existing session: ${existing.provider}`);
+    if (existing) {
+      assertRecordInCliWorkspace(existing, workspace, "Subagent session");
+      if (!isLocalAgentProvider(existing.provider)) {
+        throw new Error(`Unknown subagent provider for existing session: ${existing.provider}`);
+      }
+      assertLocalAgentProviderAvailable(existing.provider, process.env, config.agentProviders);
+      const promptFile = writeAgentPromptFile(parsed.prompt);
+      store.update(existing.id, {
+        status: "starting",
+        model: parsed.model ?? existing.model,
+        effort: parsed.effort ?? existing.effort,
+        latestResponse: undefined,
+        error: undefined,
+      });
+      spawnAgentWorker(existing.id, promptFile);
+      const running = {
+        ...existing,
+        status: "running",
+        model: parsed.model ?? existing.model,
+        effort: parsed.effort ?? existing.effort,
+      } as LocalAgentRecord;
+      if (parsed.json) printJson({ agent: localAgentOutput(running) });
+      else console.log(formatAgentLine(running));
+      return;
     }
-    assertLocalAgentProviderAvailable(existing.provider, process.env, config.agentProviders);
+
+    const profiles = await loadLocalAgentProfiles(config, workspaceRoot);
+    const availableProviders = getAvailableLocalAgentProviders(
+      process.env,
+      config.agentProviders,
+    );
+    let target;
+    try {
+      target = resolveLocalAgentExecution({
+        target: parsed.target,
+        prompt: parsed.prompt,
+        profiles,
+        availableProviders,
+        model: parsed.model,
+        effort: parsed.effort,
+      });
+    } catch (error) {
+      const suffix = ` Available ${formatAvailableLocalAgentTargets(profiles, availableProviders)}`;
+      throw new Error(`${error instanceof Error ? error.message : String(error)}.${suffix}`);
+    }
+
     const promptFile = writeAgentPromptFile(parsed.prompt);
-    store.update(existing.id, {
-      status: "starting",
-      model: parsed.model ?? existing.model,
-      effort: parsed.effort ?? existing.effort,
-      latestResponse: undefined,
-      error: undefined,
+    const record = store.create({
+      workspaceId: workspace.workspaceId,
+      workspaceRoot,
+      profileName: target.name,
+      provider: target.provider,
+      model: target.model,
+      effort: target.effort,
     });
-    spawnAgentWorker(existing.id, promptFile);
-    const running = {
-      ...existing,
-      status: "running",
-      model: parsed.model ?? existing.model,
-      effort: parsed.effort ?? existing.effort,
-    } as LocalAgentRecord;
+
+    spawnAgentWorker(record.id, promptFile);
+    const running = { ...record, status: "running" } as LocalAgentRecord;
     if (parsed.json) printJson({ agent: localAgentOutput(running) });
     else console.log(formatAgentLine(running));
-    return;
+  } finally {
+    store.close();
   }
-
-  const profiles = await loadLocalAgentProfiles(config, workspaceRoot);
-  const availableProviders = getAvailableLocalAgentProviders(
-    process.env,
-    config.agentProviders,
-  );
-  let target;
-  try {
-    target = resolveLocalAgentExecution({
-      target: parsed.target,
-      prompt: parsed.prompt,
-      profiles,
-      availableProviders,
-      model: parsed.model,
-      effort: parsed.effort,
-    });
-  } catch (error) {
-    const suffix = ` Available ${formatAvailableLocalAgentTargets(profiles, availableProviders)}`;
-    throw new Error(`${error instanceof Error ? error.message : String(error)}.${suffix}`);
-  }
-
-  const promptFile = writeAgentPromptFile(parsed.prompt);
-  const record = store.create({
-    workspaceId: workspace.workspaceId,
-    workspaceRoot,
-    profileName: target.name,
-    provider: target.provider,
-    model: target.model,
-    effort: target.effort,
-  });
-
-  spawnAgentWorker(record.id, promptFile);
-  const running = { ...record, status: "running" } as LocalAgentRecord;
-  if (parsed.json) printJson({ agent: localAgentOutput(running) });
-  else console.log(formatAgentLine(running));
 }
 
 async function runAgentsShow(args: string[]): Promise<void> {
@@ -559,34 +567,38 @@ async function runAgentsShow(args: string[]): Promise<void> {
   const config = loadConfig();
   const store = createLocalAgentStore(config);
   const workspace = resolveCliWorkspaceContext();
-  let record = store.get(id);
-  if (!record) throw new Error(`Unknown subagent id: ${id}`);
-  assertRecordInCliWorkspace(record, workspace, "Subagent session");
+  try {
+    let record = store.get(id);
+    if (!record) throw new Error(`Unknown subagent id: ${id}`);
+    assertRecordInCliWorkspace(record, workspace, "Subagent session");
 
-  if (!json) {
-    const deadline = Date.now() + 15_000;
-    while ((record.status === "starting" || record.status === "running") && Date.now() < deadline) {
-      await sleep(500);
-      record = store.get(id) ?? record;
+    if (!json) {
+      const deadline = Date.now() + 15_000;
+      while ((record.status === "starting" || record.status === "running") && Date.now() < deadline) {
+        await sleep(500);
+        record = store.get(id) ?? record;
+      }
     }
-  }
 
-  if (json) {
-    printJson({ agent: localAgentOutput(record, { includeResult: true }) });
-    return;
-  }
+    if (json) {
+      printJson({ agent: localAgentOutput(record, { includeResult: true }) });
+      return;
+    }
 
-  console.log(formatAgentLine(record));
-  if (record.latestResponse) {
-    console.log(record.latestResponse);
-    return;
-  }
-  if (record.error) {
-    console.log(record.error);
-    return;
-  }
-  if (record.status === "starting" || record.status === "running") {
-    console.log(`No final response yet. Call \`devspace agents show ${record.id}\` again later.`);
+    console.log(formatAgentLine(record));
+    if (record.latestResponse) {
+      console.log(record.latestResponse);
+      return;
+    }
+    if (record.error) {
+      console.log(record.error);
+      return;
+    }
+    if (record.status === "starting" || record.status === "running") {
+      console.log(`No final response yet. Call \`devspace agents show ${record.id}\` again later.`);
+    }
+  } finally {
+    store.close();
   }
 }
 
@@ -598,43 +610,49 @@ async function runAgentsWorker(args: string[]): Promise<void> {
 
   const config = loadConfig();
   const store = createLocalAgentStore(config);
-  const record = store.get(id);
-  if (!record) throw new Error(`Unknown subagent id: ${id}`);
-
-  store.update(record.id, { status: "running", error: undefined });
   try {
-    const profiles = await loadLocalAgentProfiles(config, record.workspaceRoot);
-    const prompt = await readFile(promptFile, "utf8");
-    const target = resolveLocalAgentExecution({
-      target: record.profileName,
-      prompt,
-      profiles,
-      availableProviders: getAvailableLocalAgentProviders(
-        process.env,
-        config.agentProviders,
-      ),
-      model: record.model,
-      effort: record.effort,
-    });
-    const result = await runLocalAgentProvider(target.provider, {
-      prompt: target.prompt,
-      workspace: record.workspaceRoot,
-      providerSessionId: record.providerSessionId,
-      writeMode: "allowed",
-      model: target.model,
-      effort: target.effort,
-    });
-    store.update(record.id, {
-      providerSessionId: result.providerSessionId ?? undefined,
-      status: "idle",
-      latestResponse: result.finalResponse,
-      error: undefined,
-    });
-  } catch (error) {
-    store.update(record.id, {
-      status: "error",
-      error: error instanceof Error ? error.message : String(error),
-    });
+    const record = store.get(id);
+    if (!record) throw new Error(`Unknown subagent id: ${id}`);
+
+    store.update(record.id, { status: "running", error: undefined });
+    try {
+      const profiles = await loadLocalAgentProfiles(config, record.workspaceRoot);
+      const prompt = await readFile(promptFile, "utf8");
+      const target = resolveLocalAgentExecution({
+        target: record.profileName,
+        prompt,
+        profiles,
+        availableProviders: getAvailableLocalAgentProviders(
+          process.env,
+          config.agentProviders,
+        ),
+        model: record.model,
+        effort: record.effort,
+      });
+      const result = await runLocalAgentProvider(target.provider, {
+        prompt: target.prompt,
+        workspace: record.workspaceRoot,
+        providerSessionId: record.providerSessionId,
+        writeMode: "allowed",
+        model: target.model,
+        effort: target.effort,
+      });
+      store.update(record.id, {
+        providerSessionId: result.providerSessionId ?? undefined,
+        status: "idle",
+        latestResponse: result.finalResponse,
+        error: undefined,
+      });
+    } catch (error) {
+      store.update(record.id, {
+        status: "error",
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  } finally {
+    store.close();
+    await rm(promptFile, { force: true }).catch(() => undefined);
+    await rm(dirname(promptFile), { recursive: true, force: true }).catch(() => undefined);
   }
 }
 

@@ -43,7 +43,7 @@ export async function runWorkflowCommand(
   config: ServerConfig,
 ): Promise<void> {
   const [subcommand, ...rest] = args;
-  if (!config.workflows) {
+  if (subcommand !== "__worker" && !config.workflows) {
     throw new InvalidWorkflowInputError({
       code: "invalid_argument",
       message:
@@ -396,6 +396,9 @@ function printJson(value: unknown): void {
 async function followRun(store: WorkflowStore, runId: string): Promise<void> {
   let sinceSeq = 0;
   for (;;) {
+    // A standalone CLI may be the only supervisor. Reap a crashed detached
+    // worker while polling so --follow cannot wait forever on stale state.
+    reapStaleWorkflows(store);
     const page = store.drainEvents(runId, sinceSeq, WORKFLOW_LIMITS.eventDrainDefault);
     for (const event of page.events) printEvent(event);
     sinceSeq = page.nextSeq;
