@@ -96,18 +96,18 @@ export function registerArtifactTools(
     server,
     "download_artifact",
     {
-      title: "Download attached or generated file",
+      title: "Download file",
       description:
-        "Stream one MCP-host-provided native file to a requested relative path inside an already-open workspace. Existing destinations, arbitrary URLs, absolute paths, traversal, symlinked parents, local source paths, and malformed file objects are rejected.",
+        "Stream one host-provided file to a relative path inside an open workspace. Existing destinations, arbitrary URLs, absolute paths, traversal, symlinked parents, source paths, and malformed file objects are rejected.",
       inputSchema: {
         file: openAIFileReferenceInputSchema.describe(
           "Native file value authorized and supplied by the MCP host.",
         ),
         workspaceId: z.string().min(1).describe(
-          "Workspace identifier returned by open_workspace.",
+          "Workspace handle returned by open_workspace.",
         ),
         path: z.string().min(1).describe(
-          "Relative destination path inside the selected workspace. The destination must not already exist.",
+          "Relative destination path inside the workspace. It must not already exist.",
         ),
       },
       outputSchema: {

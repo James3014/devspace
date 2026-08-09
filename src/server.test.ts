@@ -18,6 +18,14 @@ const execFileAsync = promisify(execFile);
 
 test("open_workspace keeps lifecycle flags out of model output and preserves complete card metadata", async (t) => {
   const context = await fixture(t);
+  assert.equal(
+    context.client.getServerVersion()?.description,
+    "Workspace-scoped coding tools.",
+  );
+  const instructions = context.client.getInstructions();
+  assert.ok(instructions);
+  assert.ok(instructions.length < 700);
+  assert.doesNotMatch(instructions, /\blocal\b/i);
   const first = await callOpen(context.client, context.project, "chat-1");
   const repeated = await callOpen(context.client, context.project, "chat-1");
 
@@ -26,15 +34,19 @@ test("open_workspace keeps lifecycle flags out of model output and preserves com
   const outputProperties = (openTool?.outputSchema as { properties?: Record<string, unknown> } | undefined)?.properties;
   assert.equal(outputProperties && "workspaceReused" in outputProperties, false);
   assert.equal(outputProperties && "includeBootstrapContext" in outputProperties, false);
+  assert.equal(outputProperties && "agentProviders" in outputProperties, false);
+  assert.equal(outputProperties && "agents" in outputProperties, true);
+  assert.equal(outputProperties && "skillDiagnostics" in outputProperties, false);
 
   const firstStructured = structuredContent(first);
   assert.equal(firstStructured.workspaceId, structuredContent(repeated).workspaceId);
   assert.ok(Array.isArray(firstStructured.agentsFiles));
   assert.ok(Array.isArray(firstStructured.availableAgentsFiles));
   assert.ok(Array.isArray(firstStructured.skills));
-  assert.ok(Array.isArray(firstStructured.agentProviders));
   assert.ok(Array.isArray(firstStructured.agents));
-  assert.ok(Array.isArray(firstStructured.skillDiagnostics));
+  assert.equal(firstStructured.agentProviders, undefined);
+  assert.equal(firstStructured.skillDiagnostics, undefined);
+  assert.equal((firstStructured.agents as Array<Record<string, unknown>>)[0]?.provider, undefined);
   assert.equal("workspaceReused" in firstStructured, false);
   assert.equal("includeBootstrapContext" in firstStructured, false);
 
@@ -42,18 +54,17 @@ test("open_workspace keeps lifecycle flags out of model output and preserves com
   assert.equal(repeatedStructured.agentsFiles, undefined);
   assert.equal(repeatedStructured.availableAgentsFiles, undefined);
   assert.equal(repeatedStructured.skills, undefined);
-  assert.equal(repeatedStructured.agentProviders, undefined);
   assert.equal(repeatedStructured.agents, undefined);
+  assert.equal(repeatedStructured.agentProviders, undefined);
   assert.equal(repeatedStructured.skillDiagnostics, undefined);
   assert.equal("workspaceReused" in repeatedStructured, false);
   assert.equal("includeBootstrapContext" in repeatedStructured, false);
 
   const repeatedText = responseText(repeated);
-  assert.match(repeatedText, /Workspace already open as/);
-  assert.match(repeatedText, /same checkout previously opened/);
-  assert.match(repeatedText, /Reuse this workspaceId for subsequent tool calls/);
-  assert.match(repeatedText, /previously provided for this workspace/);
-  assert.match(repeatedText, /not repeated here/);
+  assert.match(repeatedText, /Project already open/);
+  assert.match(repeatedText, /Continue using it/);
+  assert.match(repeatedText, /instructions and skills remain active/);
+  assert.doesNotMatch(repeatedText, /workspaceId|previously provided|not repeated here/i);
 
   const card = responseCard(repeated);
   assert.equal(card.workspaceReused, true);
@@ -63,6 +74,26 @@ test("open_workspace keeps lifecycle flags out of model output and preserves com
   assert.ok(Array.isArray(card.skills));
   assert.ok(Array.isArray(card.agentProviders));
   assert.ok(Array.isArray(card.agents));
+});
+
+test("codex process tools keep terminal and timing defaults inside DevSpace", async (t) => {
+  const context = await fixture(t, { toolMode: "codex" });
+  const tools = await context.client.listTools();
+  const execTool = tools.tools.find((tool) => tool.name === "exec_command");
+  const writeTool = tools.tools.find((tool) => tool.name === "write_stdin");
+  assert.ok(execTool);
+  assert.ok(writeTool);
+
+  const execProperties = (execTool.inputSchema as { properties?: Record<string, unknown> }).properties;
+  const writeProperties = (writeTool.inputSchema as { properties?: Record<string, unknown> }).properties;
+  for (const property of ["columns", "rows", "yieldTimeMs", "maxOutputTokens"]) {
+    assert.equal(property in (execProperties ?? {}), false);
+    assert.equal(property in (writeProperties ?? {}), false);
+  }
+  assert.equal("tty" in (execProperties ?? {}), true);
+  assert.equal("workingDirectory" in (execProperties ?? {}), true);
+  assert.equal("chars" in (writeProperties ?? {}), true);
+  assert.doesNotMatch(JSON.stringify([execTool, writeTool]), /\blocal\b/i);
 });
 
 test("concurrent checkout opens return one full context and one reuse instruction", async (t) => {
@@ -78,7 +109,7 @@ test("concurrent checkout opens return one full context and one reuse instructio
     1,
   );
   assert.equal(
-    [first, second].filter((result) => responseText(result).includes("Workspace already open as")).length,
+    [first, second].filter((result) => responseText(result).includes("Project already open")).length,
     1,
   );
 });
@@ -98,13 +129,14 @@ test("new worktrees always receive a fresh workspace and complete worktree conte
     assert.ok(Array.isArray(structured.agentsFiles));
     assert.ok(Array.isArray(structured.availableAgentsFiles));
     assert.ok(Array.isArray(structured.skills));
-    assert.ok(Array.isArray(structured.agentProviders));
     assert.ok(Array.isArray(structured.agents));
-    assert.ok(Array.isArray(structured.skillDiagnostics));
-    assert.match(responseText(result), /Opened isolated worktree workspace/);
+    assert.equal(structured.agentProviders, undefined);
+    assert.equal(structured.skillDiagnostics, undefined);
+    assert.equal((structured.agents as Array<Record<string, unknown>>)[0]?.provider, undefined);
+    assert.match(responseText(result), /Isolated worktree ready/);
   }
   assert.equal(structuredContent(checkoutAgain).agentsFiles, undefined);
-  assert.match(responseText(checkoutAgain), /same checkout previously opened/);
+  assert.match(responseText(checkoutAgain), /Project already open/);
 });
 
 test("checkout opened after a worktree receives its own complete context", async (t) => {
@@ -119,7 +151,7 @@ test("checkout opened after a worktree receives its own complete context", async
   assert.ok(Array.isArray(structuredContent(checkout).agentsFiles));
   assert.equal(structuredContent(checkoutAgain).workspaceId, structuredContent(checkout).workspaceId);
   assert.equal(structuredContent(checkoutAgain).agentsFiles, undefined);
-  assert.match(responseText(checkoutAgain), /same checkout previously opened/);
+  assert.match(responseText(checkoutAgain), /Project already open/);
 });
 
 test("a host without conversation metadata receives normal explicit-workspace behavior", async (t) => {
@@ -171,7 +203,7 @@ test("checkout reuse and context suppression survive a registry restart", async 
     const restored = await callOpen(restoredClient, context.project, "chat-1");
     assert.equal(structuredContent(restored).workspaceId, firstWorkspaceId);
     assert.equal(structuredContent(restored).agentsFiles, undefined);
-    assert.match(responseText(restored), /same checkout previously opened/);
+    assert.match(responseText(restored), /Project already open/);
   } finally {
     await closeRestored();
   }
@@ -185,7 +217,10 @@ interface ServerFixture {
   close: () => Promise<void>;
 }
 
-async function fixture(t: TestContext, options: { git?: boolean } = {}): Promise<ServerFixture> {
+async function fixture(
+  t: TestContext,
+  options: { git?: boolean; toolMode?: ServerConfig["toolMode"] } = {},
+): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
   const project = join(root, "project");
   const agentDir = join(root, "agent");
@@ -219,7 +254,7 @@ async function fixture(t: TestContext, options: { git?: boolean } = {}): Promise
     DEVSPACE_WORKTREE_ROOT: join(root, ".worktrees"),
     DEVSPACE_AGENT_DIR: agentDir,
     DEVSPACE_WIDGETS: "full",
-    DEVSPACE_TOOL_MODE: "full",
+    DEVSPACE_TOOL_MODE: options.toolMode ?? "full",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
   });
