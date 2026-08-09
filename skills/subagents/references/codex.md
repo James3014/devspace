@@ -1,19 +1,9 @@
-# Codex overrides
+# Codex target options
 
-DevSpace passes `--model` to the Codex SDK and maps `--effort` to model
-reasoning effort.
-
-The SDK accepts these effort labels:
-
-- `minimal`
-- `low`
-- `medium`
-- `high`
-- `xhigh`
-
-The selected model may support only a subset. Prefer the profile or provider
-default. Omit `--effort` when the exact model capability is unknown.
+Use the configured profile defaults whenever possible. Model and effort values
+are installation- and model-dependent; pass an override only when the user or
+the target catalog provides the exact value.
 
 ```bash
-devspace agents run codex --model <model> --effort <supported-level> "<brief>"
+devspace agents run codex --model <known-model> --effort <known-effort> "<brief>"
 ```

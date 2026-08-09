@@ -1,12 +1,9 @@
-# OpenCode overrides
+# OpenCode target options
 
-DevSpace passes `--model` to OpenCode. A model may be written as
-`<provider>/<model>` when the OpenCode provider id is needed.
-
-DevSpace maps `--effort` to the OpenCode model `variant` field. Variant names
-are model-specific; there is no safe global effort list. Omit `--effort` unless
-the exact variant is already known from the user's configuration or request.
+Use the configured profile defaults whenever possible. Model and effort values
+are installation- and model-dependent; pass an override only when the user or
+the target catalog provides the exact value.
 
 ```bash
-devspace agents run opencode --model <provider/model> --effort <exact-variant> "<brief>"
+devspace agents run opencode --model <known-model> --effort <known-effort> "<brief>"
 ```

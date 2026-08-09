@@ -1,20 +1,9 @@
-# Claude overrides
+# Claude target options
 
-DevSpace passes `--model` to the Claude Agent SDK. When `--effort` is present,
-DevSpace passes the SDK effort value with adaptive thinking enabled.
-
-The SDK effort vocabulary is:
-
-- `low`
-- `medium`
-- `high`
-- `xhigh`
-- `max`
-
-Support is model-dependent. Some Claude models expose only part of this set or
-do not support the effort option. Prefer configured defaults and omit an
-override when the selected model's capability is unknown.
+Use the configured profile defaults whenever possible. Model and effort values
+are installation- and model-dependent; pass an override only when the user or
+the target catalog provides the exact value.
 
 ```bash
-devspace agents run claude --model <model> --effort <supported-level> "<brief>"
+devspace agents run claude --model <known-model> --effort <known-effort> "<brief>"
 ```

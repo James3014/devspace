@@ -1,20 +1,9 @@
-# Pi overrides
+# Pi target options
 
-DevSpace passes `--model` to Pi and maps `--effort` to Pi's native
-`--thinking` option.
-
-Pi accepts these thinking labels:
-
-- `off`
-- `minimal`
-- `low`
-- `medium`
-- `high`
-- `xhigh`
-
-Pi applies model-specific capability rules, so a selected model may expose or
-honor only a subset. Prefer the profile or provider default when uncertain.
+Use the configured profile defaults whenever possible. Model and effort values
+are installation- and model-dependent; pass an override only when the user or
+the target catalog provides the exact value.
 
 ```bash
-devspace agents run pi --model <model> --effort <supported-level> "<brief>"
+devspace agents run pi --model <known-model> --effort <known-effort> "<brief>"
 ```

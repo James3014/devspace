@@ -1,12 +1,9 @@
-# Copilot overrides
+# Copilot target options
 
-DevSpace connects to Copilot through ACP. `--model` selects the ACP `model`
-option and `--effort` selects the ACP `thought_level` option.
-
-Both option sets are announced by the running Copilot ACP session and may vary
-by version or account. Do not invent a value. Omit the override unless the user
-provided an exact value known to that Copilot installation.
+Use the configured profile defaults whenever possible. Model and effort values
+are installation- and account-dependent; pass an override only when the user
+or the target catalog provides the exact value.
 
 ```bash
-devspace agents run copilot --model <exact-model> --effort <exact-thought-level> "<brief>"
+devspace agents run copilot --model <known-model> --effort <known-effort> "<brief>"
 ```
