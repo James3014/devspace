@@ -64,6 +64,9 @@ export function parseLocalAgentRunArgs(args: string[]): ParsedLocalAgentRunArgs 
       effort = value;
       continue;
     }
+    if (part?.startsWith("--")) {
+      throw new Error(`Unknown option: ${part}\n${USAGE}`);
+    }
     promptParts.push(part ?? "");
   }
 

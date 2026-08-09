@@ -81,6 +81,11 @@ assert.throws(
   /Missing value for --effort/,
 );
 
+assert.throws(
+  () => parseLocalAgentRunArgs(["codex", "--unknown", "hello"]),
+  /Unknown option: --unknown/,
+);
+
 {
   const target = resolveLocalAgentTarget("reviewer", profiles);
   assert.equal(target?.kind, "profile");
