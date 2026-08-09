@@ -1,7 +1,12 @@
 # DevSpace Dynamic Workflow Engine — Plan
 
-Builds on the locked bigger-model plan. Scope = **this worktree only**.  
-Subagents stay **CLI-only**. Workflows get **CLI + MCP** over shared primitives.
+Builds on the locked bigger-model plan. Scope = **this worktree only**.
+
+> Current product contract: Subagents and Dynamic Workflows are both
+> CLI-only. The MCP workflow registration described in older design notes is
+> intentionally not part of the shipped surface. Hosts that can call MCP use
+> the ordinary shell tool to invoke the same CLI, while coding harnesses call
+> the CLI directly.
 
 ---
 
@@ -11,13 +16,13 @@ Subagents stay **CLI-only**. Workflows get **CLI + MCP** over shared primitives.
 |---|---|
 | No MCP `agent_run` / `agent_wait` / `agent_show` | Subagent feature surface remains `devspace agents *` (+ skill + shell). |
 | Workflow workers call adapters **in-process** | `runLocalAgentProvider` / same registry as CLI worker. No shell-out to `agents run` for `agent()`. |
-| No dashboard v1 | Events via store drain + CLI `--follow` / MCP status long-poll. |
+| No dashboard v1 | Events via the store and CLI `--follow`; hosts can poll with the CLI. |
 | CC script API parity | `meta`, `agent`, `parallel`, `pipeline`, `phase`, `log`, `args`, `budget`, `workflow` + determinism bans. |
 | Yolo sub-agents | Fixed write-capable adapter policy; **no** `writeMode` on `agent()`. |
 | `isolation: 'worktree'` | **Must-have** on `agent()` (CC-like); default shared checkout. |
 | `effort` (not `thinking`) | Profiles, CLI, store, adapters, `agent()` opts — rename across stack. |
 | `budget` stub v1 | `{ total: null, spent: () => 0, remaining: () => Infinity }`. |
-| Dual surface | `devspace workflow *` **and** MCP `run_workflow` / `workflow_status` / `workflow_cancel`. |
+| CLI surface | `devspace workflow *` is the execution surface for every harness. |
 | All 6 providers v1 | codex/claude/opencode/pi/cursor/copilot via existing adapters. |
 | Provider policy | Runtime uses currently available providers in stable product order. Durable provider policy and onboarding are deferred. |
 | Resume-by-replay right after engine core | Same milestone order as locked plan. |
@@ -32,7 +37,7 @@ A) One-shot subagents (existing, unchanged API)
               → detached __worker → adapters → local_agent_sessions
 
 B) Dynamic workflows (new)
-   host MCP / CLI → run row + spawn workflow __worker
+   host shell → devspace workflow → run row + spawn workflow __worker
                  → sandboxed script
                  → agent() → adapters (in-process)
                  → workflow_* tables (not local_agent_sessions)
@@ -45,11 +50,11 @@ B) Dynamic workflows (new)
 ## 2. Architecture
 
 ```
-┌─ CLI: workflow run|status|cancel|ls ─┐     ┌─ MCP: run_workflow|status|cancel ─┐
-│  parse / create run / spawn          │     │  same primitives via workflow-tools │
-└──────────────────┬───────────────────┘     └──────────────────┬────────────────┘
-                   ▼                                            │
-            WorkflowStore (SQLite WAL) ◄────────────────────────┘
+┌─ CLI: workflow run|status|cancel|ls ─┐
+│  parse / create run / spawn          │
+└──────────────────┬───────────────────┘
+                   ▼
+            WorkflowStore (SQLite WAL)
                    │
                    │ detached: node cli.js workflow __worker <runId>
                    ▼
@@ -81,16 +86,15 @@ Keep their file split (flat `src/`):
 | `workflow-replay.ts` | resume cache |
 | `workflow-schema.ts` | Ajv + retries |
 | `workflow-files.ts` | named + persist scriptPath |
-| `workflow-tools.ts` | MCP registration |
+| `workflow-tools.ts` | retired MCP registration (not shipped) |
 | `skills/dynamic-workflows/SKILL.md` | teaching |
 
 DB migration **v4** (v3 = `local_agent_sessions` ✓).  
 Tables: `workflow_runs`, `workflow_events`, `workflow_agent_calls` as specified.  
 Spawn pattern copy `spawnAgentWorker` (detached, stdio ignore, unref).
 
-API semantics: keep their CC-parity table (throws vs parallel→null, pipeline stages, ALS for phase, nested workflow depth 1, budget stub).
-
-MCP contracts + yield windows: keep (status max ~110s matches `MAX_POLL_YIELD_MS`).
+API semantics: keep their CC-parity table (throws vs parallel→null, pipeline
+stages, ALS for phase, nested workflow depth 1, budget stub).
 
 Milestones 1→8: keep order and verifiability.
 
@@ -104,7 +108,8 @@ In SKILL + serverInstructions + tool descriptions:
 
 - Workflows = multi-agent **graphs**.  
 - One-off second opinions = still `devspace agents run` (CLI/skill).  
-- Do **not** tell models to implement workflows by shelling many `agents run` when `run_workflow` exists.
+- Do **not** tell models to implement workflows by shelling many `agents run`;
+  use one `devspace workflow` command for a graph.
 
 ### 4.2 `agent()` backend = adapters, not CLI
 
@@ -121,7 +126,7 @@ runProvider({ provider, prompt, workspace, model, effort, providerSessionId? })
 
 ### 4.3 Provider resolution now; policy later
 
-Current experimental runtime:
+Current runtime:
 
 - Probe provider availability at execution time.
 - Resolve `opts.provider` → `meta.defaultProvider` → first available provider
@@ -130,28 +135,27 @@ Current experimental runtime:
   persist them in user configuration.
 - Unknown or unavailable explicit providers fail that `agent()` call.
 
-The final onboarding release may add an ordered array of provider policy
-objects with `id`, `enabled`, `defaultModel`, and `defaultEffort`. That contract
-is deliberately deferred so the workflow stack does not publish an unfinished
-configuration shape.
+Onboarding controls whether the CLI capabilities are enabled. Provider
+availability remains a live local check; disabled or unavailable providers are
+not advertised to the model.
 
 ### 4.4 Skills gating fix (required, not optional)
 
-Bundled `subagents` and `dynamic-workflows` skills remain package-managed.
-User/project copies win on name collision. Setup does not copy bundled skills
-into `~/.devspace/skills`, which prevents generated copies from shadowing later
-package updates. The legacy `subagent-delegation` name is suppressed.
+`devspace init` asks about Subagents and Dynamic Workflows independently and
+installs enabled skills into `~/.devspace/skills`. A user-owned copy wins on
+name collision; only directories marked as DevSpace-managed are updated. The
+legacy `subagent-delegation` name is suppressed.
 
-### 4.5 MCP vs CLI symmetry
+### 4.5 CLI lifecycle
 
-| Op | CLI | MCP |
-|---|---|---|
-| Start | `workflow run --file\|--name\|--resume` | `run_workflow` |
-| Poll | `status --follow` | `workflow_status` long-poll |
-| Cancel | `cancel` | `workflow_cancel` |
-| List | `ls` | (optional later; status by id enough v1) |
+| Op | CLI |
+|---|---|
+| Start | `workflow run --file\|--name\|--resume` |
+| Poll | `status --follow` |
+| Cancel | `cancel` |
+| List | `ls` |
 
-Same store. Detached worker survives MCP session death (critical acceptance test).
+Same store. Detached workers continue when the parent shell exits.
 
 ### 4.6 Replay: document deliberate CC divergence
 
@@ -180,7 +184,8 @@ Document `PI_AGENT_TIMEOUT_MS = 120_000` in SKILL. Follow-up: make configurable 
 
 ### 4.10 Script authoring feedback
 
-`run_workflow` / CLI parse **before** spawn. Syntax/meta errors return cheat-sheet snippet (tool desc + error). Line numbers preserved via export-strip + lineOffset.
+CLI commands parse **before** spawn. Syntax/meta errors return a concise
+usage hint. Line numbers are preserved via export-strip + lineOffset.
 
 ### 4.11 Concurrency
 
@@ -288,10 +293,10 @@ Determinism bans: `Date.now`, `Math.random`, argless `new Date` → `WorkflowDet
 | **4 Worker+CLI** | router, spawn, heartbeat, cancel, files | `--follow` log-only + 1 real provider; kill -9 → reap; cancel → group empty |
 | **5 Resume** | replay + `--resume` | cancel mid-run; resume shows cached prefix events |
 | **6 Schema** | ajv enforce + retries | bad JSON → schema_retry → success/exhaust |
-| **7 MCP** | 3 tools + server wiring | Inspector: run+status; **kill MCP, worker still finishes** |
+| **7 CLI hardening** | scope, flags, lifecycle | run/status/cancel/list stay workspace-scoped; worker survives parent exit |
 | **8 Teach** | skill, seed, skills.ts fix, instructions | fresh + pre-seeded config both advertise skill |
 
-E2E: `npm test` + `npm run typecheck`; live fan-out 2 providers CLI; same MCP; cancel+resume.
+E2E: `npm test` + `npm run typecheck`; live fan-out 2 providers through the CLI; cancel+resume.
 
 ---
 
@@ -305,9 +310,7 @@ E2E: `npm test` + `npm run typecheck`; live fan-out 2 providers CLI; same MCP; c
 | `cli.ts` `spawnAgentWorker` / `agents __worker` | copy for `workflow __worker` |
 | `process-platform.terminateProcessTree` | hard cancel |
 | `db/client` WAL + busy_timeout 5000 | multi-process journal |
-| `server.ts` `registerAppTool` + workflow capability gate | tools only if workflows are enabled |
-| `skills.ts` | independent package-managed skill gates |
-| `process-sessions` yield bounds | MCP status yield caps |
+| `skills.ts` | independent CLI skill gates |
 
 ---
 
@@ -320,8 +323,8 @@ E2E: `npm test` + `npm run typecheck`; live fan-out 2 providers CLI; same MCP; c
 | Pi 120s cap | SKILL note |
 | Replay key fallback ≠ CC | document |
 | Laptop sleep heartbeat false fail | `kill(pid,0)` before reap |
-| Host model still shells `agents run` for graphs | skill + tool cheat-sheet steer to `run_workflow` |
-| Long MCP poll vs proxy timeouts | yield ≤110s; client re-calls status |
+| Host model shells many `agents run` calls for graphs | skill steers it to one `workflow run` command |
+| Parent shell exits during a run | detached worker plus status polling |
 
 ---
 
@@ -347,20 +350,21 @@ E2E: `npm test` + `npm run typecheck`; live fan-out 2 providers CLI; same MCP; c
 4. Wire CLI worker to real adapters.  
 5. Replay.  
 6. Schema.  
-7. MCP.  
+7. CLI contract and workspace scoping.
 8. Skill/docs/gating.
 
-Do not open MCP before CLI smoke — debug path must work headless without a host.
+Keep CLI smoke tests independent of any host integration; the same path must
+work headlessly.
 
 ---
 
 ## Resolved questions (see also [primitives-spec.md](./primitives-spec.md))
 
-1. **Default provider:** `opts.provider` → `meta.defaultProvider` → first live provider in stable product order. Final provider defaults and enablement are deferred to onboarding finalization.
+1. **Default provider:** `opts.provider` → `meta.defaultProvider` → first live provider in stable product order. Unavailable providers are omitted.
 2. **writeMode:** **not in v1 API**; skill teaches prompt-based RO/write.  
 3. **Isolation:** **`isolation?: 'worktree'` is v1 must-have** on `agent()`; default shared; no auto-merge.  
 4. **Effort rename:** `thinking` → **`effort`** across profiles, CLI, store, adapters, `agent()` opts, cache keys.  
-5. **MCP list:** skip; **CLI** `workflow ls` yes.  
+5. **Run list:** **CLI** `workflow ls` is workspace-scoped.
 6. **Size caps:** transport/storage bounds (§8 of primitives-spec); not “coverage” truncation.  
 7. **Nested workflow:** CC-like `name | { scriptPath }`, depth 1, shared journal/semaphore.  
 8. **Cancel:** cooperative flag → then group-kill.  

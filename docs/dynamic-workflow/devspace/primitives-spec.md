@@ -1,7 +1,9 @@
 # DevSpace Dynamic Workflow — Primitives & API Spec
 
-Implementation + contract spec for every surface, inspired by Claude Code’s Workflow environment.  
-Pairs with [plan.md](./plan.md). Subagents remain CLI-only; this document is **workflow only**.
+Implementation + contract spec for the CLI workflow surface, inspired by
+Claude Code’s Workflow environment.
+Pairs with [plan.md](./plan.md). Subagents remain CLI-only; this document is
+**workflow only**.
 
 ---
 
@@ -10,12 +12,12 @@ Pairs with [plan.md](./plan.md). Subagents remain CLI-only; this document is **w
 | Goal | Surface |
 |---|---|
 | DW for coding agents that lack Workflow (pi, codex, opencode, cursor, …) | **CLI + skill** — host agent authors script, runs `devspace workflow *` |
-| ChatGPT as orchestrator, not implementer | **MCP workflow tools** behind the workflow capability gate — plan + `run_workflow` / status / cancel |
-| Ship both in dev | One engine; two entrypoints; converge later on performance/UX |
+| ChatGPT as orchestrator, not implementer | Use the ordinary MCP shell tool to invoke the CLI; no workflow execution tools are registered. |
+| Ship one execution surface | One engine behind `devspace workflow`; every harness gets the same CLI contract. |
 
 ```
 coding agent ── skill + CLI ──► engine ── agent() ──► adapters
-ChatGPT      ── MCP tools  ──► engine ── agent() ──► adapters
+ChatGPT      ── MCP shell  ──► CLI ──► engine ── agent() ──► adapters
 ```
 
 ---
@@ -26,7 +28,7 @@ ChatGPT      ── MCP tools  ──► engine ── agent() ──► adapter
 |---|---|---|
 | 1 | Default provider | Runtime: `opts.provider` → `meta.defaultProvider` → first currently available provider in stable product order. Final provider policy is deferred. |
 | 2 | Access / writeMode | **Not in v1 API.** No `writeMode`. Skill teaches **prompt-based** RO vs write. Isolation handles *where* writes land (see isolation). |
-| 3 | List runs | **No MCP list tool v1.** **CLI** `devspace workflow ls` yes. |
+| 3 | List runs | **CLI** `devspace workflow ls`. |
 | 4 | Size caps | Soft/hard bounds on journal + results (§8). |
 | 5 | Nested `workflow()` | CC-inspired: `name \| { scriptPath }`, depth 1, shared journal/semaphore (§7.8). |
 | 6 | Cancel | Cooperative flag → worker abort → hard `terminateProcessTree` (§9). |
@@ -41,7 +43,7 @@ ChatGPT      ── MCP tools  ──► engine ── agent() ──► adapter
 
 | CC concept | CC behavior (model-facing) | DevSpace v1 |
 |---|---|---|
-| `Workflow` tool | Host tool; async; script/name/scriptPath/args/resume | CLI `workflow run` + MCP `run_workflow` |
+| `Workflow` tool | Host tool; async; script/name/scriptPath/args/resume | CLI `workflow run` |
 | `export const meta` | Pure literal; name, description, phases | Same + optional `defaultProvider`, `concurrency` |
 | `agent(prompt, opts)` | Spawn worker; string or schema object; null on skip/death in combinators | Same return contract; **throw** on failure; `parallel` → null |
 | `opts.schema` | StructuredOutput / validated object | Ajv enforce + retry in engine |
@@ -50,7 +52,7 @@ ChatGPT      ── MCP tools  ──► engine ── agent() ──► adapter
 | Access / sandbox | Session permission mode; not `writeMode` on agent() | Prompt RO/write + **isolation for write containment** |
 | `pipeline` | No barrier; per-item chains | Same |
 | `parallel` | Barrier; null slots | Same |
-| `phase` / `log` | Progress UX | Journal events + CLI follow / MCP drain |
+| `phase` / `log` | Progress UX | Journal events + CLI follow |
 | `args` | Verbatim tool args | Same |
 | `budget` | Shared host token hard ceiling | **Stub** `{ total: null, spent:0, remaining: Infinity }` |
 | `workflow()` | Nested name/scriptPath; depth 1; shared caps | Same spirit |
@@ -64,7 +66,7 @@ ChatGPT      ── MCP tools  ──► engine ── agent() ──► adapter
 
 ### Current experimental contract
 
-There is no user-facing `agentProviders` block and no
+There is no user-facing provider capability block and no
 `DEVSPACE_AGENT_PROVIDERS` environment variable. DevSpace probes implemented
 providers at runtime, keeps availability details in memory, and orders usable
 providers by `LOCAL_AGENT_PROVIDERS`:
@@ -145,24 +147,19 @@ devspace workflow __worker <runId>   # hidden
 
 Spawn: same pattern as `agents __worker` (detached, stdio ignore, unref). Inputs only from run row.
 
-### 4.2 MCP (togglable with the workflow capability)
+### 4.2 MCP hosts
 
-| Tool | Input | Output (conceptual) |
-|---|---|---|
-| `run_workflow` | `workspaceId`, `script?` \| `name?` \| `resumeFromRunId?`, `args?`, `yieldTimeMs?` | `{ runId, status, events, nextSeq, result? }` after parse+spawn+short yield |
-| `workflow_status` | `runId`, `sinceSeq?`, `yieldTimeMs?` | long-poll events / terminal |
-| `workflow_cancel` | `runId` | `{ runId, status }` |
-
-**No** `workflow_ls` on MCP v1.  
-**No** `agent_*` MCP tools.
-
-Tool description embeds ~25-line API cheat-sheet (CC-style education in-band).
+MCP hosts do not receive workflow execution tools. When a host needs to run a
+workflow, it invokes the same CLI through its ordinary shell tool and polls
+with `workflow status --follow` or `workflow status`. This keeps long-running
+work out of MCP request timeouts and gives shell-capable coding harnesses the
+same contract.
 
 ### 4.3 Skill
 
-`skills/dynamic-workflows/SKILL.md` (package-managed; not copied on init):
+`skills/dynamic-workflows/SKILL.md` (installed by `devspace init` when enabled):
 
-- When to use CLI vs when host is ChatGPT (MCP).  
+- CLI commands, options, and workflow use cases.  
 - Full primitive reference.  
 - Prompt patterns for read-only vs write (instead of writeMode).  
 - Provider list / default fallback.  
@@ -241,8 +238,8 @@ Allowed: normal JS, `JSON`, `Array`, `Map`, `Set`, `Date.parse`, `new Date(isoSt
 
 | Source | Resolution |
 |---|---|
-| Inline (`--file` content / MCP `script`) | Persist to `<stateDir>/workflows/runs/<runId>.js` |
-| Named (`--name` / MCP `name`) | (1) `<workspace>/.devspace/workflows/<name>.js` (2) `~/.devspace/workflows/<name>.js` |
+| File (`--file` / `--script-path`) | Persist to `<stateDir>/workflows/runs/<runId>.js` |
+| Named (`--name`) | (1) `<workspace>/.devspace/workflows/<name>.js` (2) `~/.devspace/workflows/<name>.js` |
 | Resume | Load persisted path on prior run (user may edit that copy) |
 
 Name sanitization: `^[a-z0-9-]+$`.  
@@ -457,7 +454,7 @@ function phase(title: string): void
 | Effect | Sets **current phase** for subsequent agents without `opts.phase`. |
 | Events | Journal `phase_started` (and optional end on next phase). |
 | Concurrency | **AsyncLocalStorage** so concurrent pipeline chains don’t race. |
-| UI | CLI `--follow` / MCP events group by phase; match `meta.phases[].title` when possible. |
+| UI | CLI `--follow` groups events by phase; match `meta.phases[].title` when possible. |
 
 ```js
 function phase(title) {
@@ -496,7 +493,6 @@ const args: unknown  // frozen; from run input; undefined if omitted
 
 | Rule | Spec |
 |---|---|
-| MCP | Pass real JSON object/array — not stringified JSON string. |
 | CLI | `--arg k=v` → object; values JSON-parsed when valid. |
 | Freeze | `Object.freeze` deep where practical. |
 | Resume | Same args required for max cache hits when prompts embed args. |
@@ -515,7 +511,7 @@ const budget = Object.freeze({
 })
 ```
 
-| Future | Wire `total` from CLI/MCP optional `maxAgentCalls` or token directive; hard-throw when exceeded. |
+| Future | Wire `total` from a CLI option or token directive; hard-throw when exceeded. |
 | v1 | Shape present so scripts/skills match CC; loops must still use dry-round or count, not infinite budget loops. |
 
 Skill warns: do not `while (budget.remaining() > x)` without other exit — remaining is Infinity.
@@ -751,7 +747,7 @@ return pipeline(
 | store | `workflow-store.ts` | seq, reap, cancel |
 | replay | `workflow-replay.ts` | deterministic call-index prefix |
 | CLI | `cli.ts` | run/status/cancel/ls/__worker |
-| MCP | `workflow-tools.ts` | yield, survive disconnect |
+| CLI | `workflow-cli.ts` | run/status/cancel/list and workspace scope |
 | skill | `skills/dynamic-workflows` | education |
 | providers config | `user-config` / init / availability | ordered default |
 
@@ -759,12 +755,12 @@ return pipeline(
 
 ## 16. Non-goals recap (v1)
 
-- MCP raw agent tools  
+- Raw agent execution tools outside the CLI  
 - `writeMode` on `agent()` (isolation **is** in scope)  
 - Auto-merge of worktrees into source checkout  
 - Real host token budget  
 - Auto file-change / diff events per stage  
-- MCP run list  
+- Workflow dashboard
 - Dashboard  
 - Dual-write `local_agent_sessions`  
 

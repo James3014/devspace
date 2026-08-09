@@ -22,7 +22,10 @@ Run:
 npx @waishnav/devspace init
 ```
 
-The setup flow asks one question at a time.
+The setup flow asks one question at a time, including separate prompts for CLI
+Subagents and Dynamic Workflows. Enabled skills are copied to
+`~/.devspace/skills` (or the configured `DEVSPACE_CONFIG_DIR/skills`) so coding
+harnesses can use them through their shell tools.
 
 ### Project Roots
 

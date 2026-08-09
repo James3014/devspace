@@ -201,22 +201,22 @@ DevSpace looks in standard Agent Skills locations:
 
 It also checks compatibility and custom paths:
 
-- the package-managed `subagents` skill when the Subagents capability is enabled
-- the package-managed `dynamic-workflows` skill when the Dynamic Workflows capability is enabled
+- the bundled `subagents` skill when the Subagents capability is enabled
+- the bundled `dynamic-workflows` skill when the Dynamic Workflows capability is enabled
 - `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
 - additional paths from `DEVSPACE_SKILL_PATHS`
 
-When the Subagents capability is enabled, DevSpace loads agent profiles from
+When the Subagents or Dynamic Workflows capability is enabled, DevSpace loads agent profiles from
 `~/.devspace/agents/*.md` and project `.devspace/agents/*.md`, then exposes a
 compact profile catalog through `open_workspace`. The bundled
 `subagents` skill can also discover the same usable targets through
 `devspace agents targets` in CLI-only hosts. `devspace agents ls` lists existing
 subagent sessions, not profile definitions.
 
-Bundled skills remain package-managed and are not copied into
-`~/.devspace/skills`. A user-owned skill with the same name intentionally
-overrides the bundled copy. The legacy `subagent-delegation` name is no longer
-advertised.
+`devspace init` installs enabled bundled skills into `~/.devspace/skills` (or
+the configured `DEVSPACE_CONFIG_DIR/skills`) and updates only directories it
+previously marked as managed. A user-owned skill with the same name is
+preserved. The legacy `subagent-delegation` name is no longer advertised.
 
 Packaged agent profile examples under `examples/agents/` are starter templates.
 Copy or adapt them into one of the active profile directories before use.

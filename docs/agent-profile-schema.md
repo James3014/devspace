@@ -68,15 +68,9 @@ provider: cursor
 provider: copilot
 ```
 
-Unsupported or custom providers are rejected. DevSpace maps providers to their
-native integration:
-
-- `codex`: Codex SDK
-- `claude`: Claude Code SDK
-- `opencode`: OpenCode SDK
-- `pi`: Pi RPC mode
-- `cursor`: ACP
-- `copilot`: ACP
+Unsupported or custom providers are rejected. Use a provider name reported by
+`devspace agents targets`; availability depends on the local tools installed on
+the machine.
 
 ### `model`
 
@@ -134,20 +128,26 @@ Recommended body content:
 The Subagent skill teaches only:
 
 ```bash
+devspace agents targets
 devspace agents ls
 devspace agents run <profile-or-id> "<prompt>"
 devspace agents show <id>
 ```
 
-`open_workspace` exposes compact profile metadata:
+`open_workspace` exposes compact profile metadata. Provider entries contain only
+the provider name; profiles retain their configured defaults because those are
+the model's selection inputs:
 
 ```json
 {
-  "name": "reviewer",
-  "description": "Read-only reviewer for bugs, security risks, and missing tests.",
-  "provider": "codex",
-  "model": "gpt-5.4",
-  "effort": "high"
+  "agentProviders": [{ "name": "codex" }],
+  "agents": [{
+    "name": "reviewer",
+    "description": "Read-only reviewer for bugs, security risks, and missing tests.",
+    "provider": "codex",
+    "model": "gpt-5.4",
+    "effort": "high"
+  }]
 }
 ```
 
@@ -163,5 +163,5 @@ profile.
 - Inferring changed files, tests, or diffs from worker output.
 - Exposing raw provider transcripts by default.
 - Teaching the model provider-specific CLIs.
-- First-class MCP agent tools. Future tools should wrap the same provider
-  adapter registry used by `devspace agents`.
+- MCP agent and workflow execution tools. Use the CLI from a shell-capable
+  harness; MCP remains the workspace/file/shell surface.
