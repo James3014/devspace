@@ -49,7 +49,10 @@ import {
   type McpSessionCloseResult,
 } from "./mcp-sessions.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
-import { createReviewCheckpointManager } from "./review-checkpoints.js";
+import {
+  createReviewCheckpointManager,
+  type ReviewChangesResult,
+} from "./review-checkpoints.js";
 import { openAiConversationScopeId } from "./request-meta.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
@@ -1308,11 +1311,39 @@ export function createMcpServer(
       async ({ workspaceId }) => {
         const startedAt = performance.now();
         const workspace = workspaces.getWorkspace(workspaceId);
-        const review = await reviewCheckpoints.reviewChanges({
-          workspaceId,
-          root: workspace.root,
-          markReviewed: true,
-        });
+
+        let review: ReviewChangesResult;
+        try {
+          review = await reviewCheckpoints.reviewChanges({
+            workspaceId,
+            root: workspace.root,
+            markReviewed: true,
+          });
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          const content = [textBlock(`show_changes failed: ${message}`)];
+          logFailedToolResponse(config, {
+            tool: "show_changes",
+            workspaceId,
+          }, content, startedAt);
+          return {
+            isError: true,
+            content,
+            _meta: {
+              tool: "show_changes",
+              card: {
+                workspaceId,
+                summary: { files: 0, additions: 0, removals: 0 },
+                files: [],
+                payload: {},
+                error: message,
+              },
+            },
+            structuredContent: {
+              result: contentText(content),
+            },
+          };
+        }
 
         const content = [textBlock(review.result)];
         logToolCall(config, {
