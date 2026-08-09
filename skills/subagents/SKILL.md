@@ -1,58 +1,87 @@
 ---
 name: subagents
-description: Delegate focused work to isolated DevSpace coding agents.
+description: Delegate focused coding work to DevSpace subagents from a shell.
 ---
 
-Each subagent is headless, has its own context window, cannot see the parent conversation, cannot ask the user, and cannot spawn subagents or workflows. Give every child a self-contained prompt with paths, constraints, and the expected report.
+# DevSpace subagents
 
-## Choose a target
+Use a subagent for one focused piece of work: a second opinion, a narrow
+investigation, a test plan, or an isolated implementation. Use a dynamic
+workflow when the task needs several stages or programmable fan-out.
 
-Prefer a configured profile that matches the task. Use a raw provider when the
-user explicitly names that harness or no profile fits. Use target information
-already available in the current host. When the choices are not known, run:
+This skill uses the DevSpace CLI from any coding harness that can run shell
+commands.
+
+## Discover available targets
+
+Run this before choosing a profile or provider when the available targets are
+not already known:
 
 ```bash
 devspace agents targets
+devspace agents targets --json
 ```
 
-Do not guess profile names or provider identifiers.
+Configured profiles are preferred because they provide a reusable description
+and defaults. A raw provider is useful when the user names a specific harness
+or no matching profile exists. Do not guess a profile name.
 
-## Write the brief
-
-Describe the task directly. Include decisions and constraints that exist only
-in the parent conversation. Mention relevant paths or scope when useful. Do not
-repeat project instructions that the child can discover from the repository.
-
-## Run and continue
+## Start and inspect work
 
 ```bash
-devspace agents targets [--json]
-devspace agents run <profile-or-provider> "<brief>"
-devspace agents show <id>
-devspace agents run <id> "<follow-up>"
+devspace agents run <profile-or-provider> "<self-contained brief>"
+devspace agents show <agent-id>
 devspace agents ls
 ```
 
-`targets` lists currently usable profiles and providers. `run` with a profile
-or provider starts a child and returns its id. `show` reads its latest status
-and response. `run` with an existing id continues the same child session. `ls`
-lists sessions for the current project.
+The `run` command returns an agent id immediately. Use `show` to wait for the
+final response or to read a later update. `ls` lists sessions for the current
+project scope. Running the command from a subdirectory uses the enclosing Git
+checkout; a non-Git directory uses the current directory.
 
-Do not invoke provider CLIs directly; use `devspace agents` so DevSpace keeps
-session and provider handling consistent.
-
-## Model and effort overrides
-
-Normally omit `--model` and `--effort`. When an exact override is needed, read
-`references/<provider>.md` first. Do not guess values or transfer an effort
-name between providers merely because both use the same word.
+To continue the same session, use its id as the target:
 
 ```bash
-devspace agents run <target> --model <model> --effort <effort> "<brief>"
+devspace agents run <agent-id> "Follow up by checking the failing test and report the cause."
 ```
 
-## Direct subagent or workflow
+## Write a useful brief
 
-Use a direct subagent for one focused delegation or a follow-up with the same
-child. Use a dynamic workflow when the task needs programmed fan-out, stages,
-branching, nesting, or replay.
+Give the child everything it needs without relying on the parent conversation:
+
+- the exact goal and expected output;
+- relevant files, commands, or boundaries;
+- whether it may modify files;
+- the checks it should run before reporting back.
+
+The child’s final response is the handoff. Ask for concise findings, paths, or
+patch-ready changes rather than a broad narrative.
+
+## Optional model controls
+
+Profiles normally supply model and effort defaults. When an exact override is
+needed, pass:
+
+```bash
+devspace agents run <target> --model <model> --effort <level> "<brief>"
+```
+
+Only use values supplied by the user, a configured profile, or the target
+catalog. Omit overrides when the provider’s accepted values are unknown.
+
+## Common uses
+
+```bash
+# Ask for an independent security review.
+devspace agents run reviewer "Review the authentication changes for vulnerabilities. Return findings with file paths and severity."
+
+# Delegate a small implementation and ask for verification.
+devspace agents run implementer "Add a regression test for the parser bug. Run the focused test and report the result."
+
+# Continue after the parent has inspected the first response.
+devspace agents run agt_1234abcd "The test still fails on Windows. Investigate only the path handling and report a fix."
+```
+
+Keep direct delegation to one focused child at a time. For independent
+reviewers, staged implementation, or repeatable fan-out, use the
+`dynamic-workflows` skill.

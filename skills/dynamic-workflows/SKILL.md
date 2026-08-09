@@ -1,167 +1,108 @@
 ---
 name: dynamic-workflows
-description: Orchestrate multi-agent coding workflows via DevSpace Dynamic Workflows (CLI or MCP).
+description: Run programmable multi-agent workflows through the DevSpace CLI.
 ---
 
-# Dynamic Workflows
+# DevSpace Dynamic Workflows
 
-Use this skill when the user wants multi-step, multi-agent orchestration — fan-out
-review, migrate-and-verify, research panels — **not** a single subagent turn.
+Use a workflow when the work benefits from a repeatable program: parallel
+reviews, fan-out research, staged implementation, per-file pipelines, or a
+review-and-fix loop. Use a direct subagent for one focused delegation.
 
-## Entry points
+This skill is CLI-only. A coding harness should create or select a workflow
+script and invoke it with `devspace workflow`.
 
-| Host | Surface |
-|---|---|
-| Coding agent (Claude Code, Codex, pi, …) | CLI + this skill |
-| ChatGPT / MCP client | MCP tools `run_workflow` / `workflow_status` / `workflow_cancel` |
+## CLI
 
 ```bash
-devspace workflow run --file path/to/script.js [--arg k=v]... [--follow]
-devspace workflow run --script-path path/to/script.js [--resume <runId>] [--follow]
-devspace workflow run --name review-auth [--follow]
-devspace workflow run --resume <runId>
-devspace workflow status <runId> [--follow]
-devspace workflow cancel <runId>
+devspace workflow run --file path/to/workflow.js [--arg key=value]... [--follow]
+devspace workflow run --script-path path/to/workflow.js [--resume <run-id>] [--follow]
+devspace workflow run --name <name> [--arg key=value]... [--follow]
+devspace workflow status <run-id> [--follow]
+devspace workflow cancel <run-id>
 devspace workflow ls
-devspace workflow calls <runId>
-devspace workflow call <runId> <callIndex>
-devspace workflow tui [runId]
+devspace workflow calls <run-id>
+devspace workflow call <run-id> <call-index>
 ```
 
-Project named scripts live under `.devspace/workflows/<name>.js`.
+Named scripts are stored in the project’s `.devspace/workflows/` directory.
+Workflow commands are scoped to the current Git checkout (or the current
+directory when it is not a Git project). Use `--follow` for a live terminal
+handoff; otherwise poll with `status`.
 
-## Script shape
+`--arg key=value` passes JSON values when the value is valid JSON and otherwise
+passes a string. A failed or cancelled run can be started again with
+`workflow run --resume <run-id>` after reviewing its status and call results.
+
+## Script capabilities
+
+Workflow scripts are JavaScript modules with a metadata export and an async
+body. The orchestration API includes:
+
+| Capability | Use |
+| --- | --- |
+| `agent(prompt, options?)` | Ask one configured profile or provider to perform a unit of work. |
+| `parallel(thunks)` | Run independent units together and collect their results. |
+| `pipeline(items, ...stages)` | Apply the same sequence of agent stages to each item. |
+| `phase(title)` | Group later work under a named stage. |
+| `log(message)` | Emit progress text for the supervising harness. |
+| `args` | Read values passed with `--arg`. |
+| `workflow(nameOrPath, args?)` | Compose a named or project workflow as a step. |
+
+An `agent` can select `profile` or `provider`, and can set `label`, `phase`,
+`schema`, `model`, `effort`, or `isolation: 'worktree'`. Use a profile when one
+is configured; use `provider` only when the target is intentional. `profile`
+and `provider` are alternatives, not a combination.
+
+The optional `schema` describes a JSON result, which is useful when later
+stages consume structured findings. Prompts should say whether a child may
+change files and what it should return.
+
+## Basic script
 
 ```js
 export const meta = {
-  name: 'review-auth',
-  description: 'Fan-out review of auth changes',
-  phases: [{ title: 'Review' }, { title: 'Synthesize' }],
-  // optional DevSpace:
-  // defaultProvider: 'codex',
-  // concurrency: 4,
+  name: 'review-changes',
+  description: 'Independent correctness and security review',
 }
 
 phase('Review')
-const findings = await parallel([
-  () => agent('Review for correctness…', { label: 'correctness' }),
-  () => agent('Review for security…', { label: 'security' }),
+const [correctness, security] = await parallel([
+  () => agent('Review the diff for correctness bugs. Return file paths and concrete findings.', { label: 'correctness' }),
+  () => agent('Review the diff for security issues. Return file paths, severity, and evidence.', { label: 'security' }),
 ])
-phase('Synthesize')
-const summary = await agent(`Synthesize: ${JSON.stringify(findings)}`)
-return { summary, findings }
+
+return { correctness, security }
 ```
 
-### Primitives
+Run it with:
 
-| API | Notes |
-|---|---|
-| `agent(prompt, opts?)` | Throws on failure. `opts`: `label`, `phase`, `schema`, `model`, `effort`, `profile` or `provider`, `isolation: 'worktree'` |
-| `parallel(thunks)` | Barrier; throw → `null` slot |
-| `pipeline(items, ...stages)` | Per-item chains; no cross-item barrier |
-| `phase(title)` / `log(msg)` | Progress; journaled |
-| `args` | Run input (object preferred) |
-| `workflow(name\|{scriptPath}, args?)` | Nested, depth 1, shared call index |
-
-**No `writeMode`.** Teach read-only vs write in the prompt. Use `isolation: 'worktree'` when parallel mutators would conflict (git required).
-
-### Determinism bans
-
-`Date.now()`, `Math.random()`, and `new Date()` without args throw. Pass timestamps via `args` if needed.
-
-### Schema
-
-```js
-const out = await agent('Return JSON findings', {
-  schema: {
-    type: 'object',
-    properties: { bugs: { type: 'array', items: { type: 'string' } } },
-    required: ['bugs'],
-  },
-})
-// out is validated object; engine retries ≤2 on invalid JSON
-// codex/claude: native structured output first, then prompt repair; others: prompt+Ajv
+```bash
+devspace workflow run --file .devspace/workflows/review-changes.js --follow
 ```
 
-### Providers
-
-Profiles exposed by `open_workspace` may be selected with `opts.profile`. The
-profile supplies instructions, provider, model, and effort defaults; per-call
-`model` and `effort` override those defaults. `profile` and `provider` are
-mutually exclusive.
-
-Without a profile, default provider resolution is `opts.provider` →
-`meta.defaultProvider` → first currently available provider.
-
-### Resume
-
-Failed and cancelled runs are terminal. Recovery creates a **new** run:
-
-1. Inspect the prior run with `workflow status`, `workflow calls`, and
-   `workflow call`.
-2. Edit the persisted `scriptPath` reported by the run, or pass a different
-   `--script-path`.
-3. Keep prompts and agent options stable for completed calls whose return values
-   should be reused.
-4. Run `devspace workflow run --resume <runId>` (optionally with
-   `--script-path <path>`).
-
-Replay walks the prior run in call-index order and reuses the longest unchanged
-prefix. The first failed, interrupted, changed, missing, corrupt, or unavailable
-result executes live and closes replay for every later call, even when a later
-cache key happens to match. Exact return values are stored separately from
-bounded UI previews.
-
-Replay restores an agent's **return value**, not its execution. Shared-checkout
-calls assume their existing filesystem effects are still present. Worktree calls
-are never reused unless their exact worktree can be restored, so they currently
-end the reusable prefix and run live.
-
-Return values must fit the replay budget (~1 MiB JSON). Oversized returns fail
-the `agent()` call with `result_too_large` — prefer summaries or paths to large
-artifacts on disk.
-
-### Cancel
-
-`workflow cancel` sets a cooperative flag; worker aborts then hard-kills if needed.
-
-## When to use CLI vs MCP
-
-- **CLI**: host agent can shell; prefer for long runs + `--follow`.
-- **TUI**: `devspace workflow tui` opens a read-only live view for workflows associated with the current working directory.
-- **MCP**: ChatGPT plans; call `run_workflow`, then `workflow_status` until terminal. With full widgets enabled, workflow tool cards and the `open_workspace` dashboard show read-only live activity, including workflows launched through the CLI. Disconnecting MCP does **not** kill the worker.
-
-## Worked mini-examples
-
-**1. Parallel review**
+## Structured pipeline
 
 ```js
-export const meta = { name: 'p-review', description: 'Two reviewers' }
-const [a, b] = await parallel([
-  () => agent('Correctness review of the diff', { label: 'corr' }),
-  () => agent('Security review of the diff', { label: 'sec' }),
-])
-return { a, b }
-```
+export const meta = { name: 'test-plan', description: 'Find and prioritize test gaps' }
 
-**2. Pipeline with schema**
-
-```js
-export const meta = { name: 'pipe', description: 'Find then fix plan' }
 return await pipeline(
   args.files,
-  (file) => agent(`List bugs in ${file}`, { schema: { type: 'object', properties: { bugs: { type: 'array', items: { type: 'string' } } }, required: ['bugs'] } }),
-  (findings, file) => agent(`Plan fixes for ${file}: ${JSON.stringify(findings)}`),
+  (file) => agent(`Find test gaps in ${file}`, {
+    schema: {
+      type: 'object',
+      properties: { gaps: { type: 'array', items: { type: 'string' } } },
+      required: ['gaps'],
+    },
+  }),
+  (findings, file) => agent(`Prioritize these gaps for ${file}: ${JSON.stringify(findings)}`),
 )
 ```
 
-**3. Isolation for parallel writers**
-
-```js
-export const meta = { name: 'iso', description: 'Parallel mutators' }
-await parallel([
-  () => agent('Implement feature A in isolation', { isolation: 'worktree', label: 'a' }),
-  () => agent('Implement feature B in isolation', { isolation: 'worktree', label: 'b' }),
-])
-// dirty worktrees preserved; compose via return text / shared follow-up
+```bash
+devspace workflow run --name test-plan --arg files='["src/parser.ts","src/parser.test.ts"]' --follow
 ```
+
+For parallel writers, request `isolation: 'worktree'` and make the prompt
+describe how the result should be handed back. For sequential edits that must
+see one another’s files, keep the stages in a pipeline or ordinary sequence.
