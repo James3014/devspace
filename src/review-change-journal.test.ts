@@ -95,6 +95,19 @@ test("markReviewed advances the journal without requiring Git", async (t) => {
   assert.equal(review.summary.files, 0);
 });
 
+test("journal preserves empty-file additions as additions", async (t) => {
+  const root = await workspace(t);
+  const path = join(root, "empty.txt");
+  const journal = createReviewChangeJournal();
+  const mutation = await journal.prepareMutation({ workspaceId: "ws_empty", root, paths: [path] });
+  await writeFile(path, "");
+  journal.commitMutation(mutation);
+
+  const review = await journal.reviewChanges({ workspaceId: "ws_empty", root });
+  assert.equal(review.files[0]?.type, "new");
+  assert.match(review.patch, /new file mode/);
+});
+
 async function workspace(t: TestContext): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "devspace-review-journal-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));

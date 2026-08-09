@@ -179,7 +179,7 @@ function filePatch(oldPath: string, newPath: string, before: FileState, after: F
   const oldText = stateText(before);
   const newText = stateText(after);
   if (oldText !== undefined && newText !== undefined) {
-    return createTwoFilesPatch(
+    const patch = createTwoFilesPatch(
       before.kind === "missing" ? "/dev/null" : oldPath,
       after.kind === "missing" ? "/dev/null" : newPath,
       oldText,
@@ -188,14 +188,31 @@ function filePatch(oldPath: string, newPath: string, before: FileState, after: F
       "",
       { context: 3, headerOptions: FILE_HEADERS_ONLY },
     );
+    return withFileModeHeader(oldPath, newPath, before, after, patch);
   }
 
   const oldLabel = before.kind === "missing" ? "/dev/null" : `a/${oldPath}`;
   const newLabel = after.kind === "missing" ? "/dev/null" : `b/${newPath}`;
-  return [
+  return withFileModeHeader(oldPath, newPath, before, after, [
     `diff --git a/${oldPath} b/${newPath}`,
     `Binary files ${oldLabel} and ${newLabel} differ`,
-  ].join("\n");
+  ].join("\n"));
+}
+
+function withFileModeHeader(
+  oldPath: string,
+  newPath: string,
+  before: FileState,
+  after: FileState,
+  patch: string,
+): string {
+  if (before.kind === "missing" && after.kind !== "missing") {
+    return `diff --git a/${newPath} b/${newPath}\nnew file mode 100644\n${patch}`;
+  }
+  if (before.kind !== "missing" && after.kind === "missing") {
+    return `diff --git a/${oldPath} b/${oldPath}\ndeleted file mode 100644\n${patch}`;
+  }
+  return patch;
 }
 
 function stateText(state: FileState): string | undefined {
