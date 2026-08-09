@@ -266,7 +266,7 @@ export function openWorkspaceOutputSchema(config: ServerConfig): z.ZodRawShape {
     agentsFiles: z.array(workspaceAgentsFileOutputSchema),
     availableAgentsFiles: z.array(workspaceAvailableAgentsFileOutputSchema),
     skills: z.array(workspaceSkillOutputSchema),
-    ...(config.subagents
+    ...(config.subagents || config.workflows
       ? {
           agentProviders: z.array(workspaceLocalAgentProviderOutputSchema),
           agents: z.array(workspaceLocalAgentOutputSchema),
@@ -810,7 +810,7 @@ function createMcpServer(
           description: skill.description,
           path: formatPathForPrompt(skill.filePath),
         }));
-      const agentCatalog = config.subagents
+      const agentCatalog = config.subagents || config.workflows
         ? buildLocalAgentCatalog(workspace.agentProfiles, localAgentProviders)
         : undefined;
       const visibleAgentProviders = agentCatalog?.providers ?? [];
@@ -888,7 +888,7 @@ function createMcpServer(
               ...(config.workflows
                 ? { activeWorkflows: activeWorkflows?.length ?? 0 }
                 : {}),
-              ...(config.subagents
+              ...(config.subagents || config.workflows
                 ? {
                     agentProviders: visibleAgentProviders.length,
                     agents: visibleAgents.length,
@@ -907,7 +907,7 @@ function createMcpServer(
           availableAgentsFiles: availableAgentsFileOutputs,
           skills: visibleSkills,
           ...(config.workflows ? { activeWorkflows: activeWorkflows ?? [] } : {}),
-          ...(config.subagents
+          ...(config.subagents || config.workflows
             ? {
                 agentProviders: visibleAgentProviders,
                 agents: visibleAgents,
@@ -1644,7 +1644,7 @@ export function createServer(config = loadConfig()): RunningServer {
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
-  const localAgentProviders = config.subagents
+  const localAgentProviders = config.subagents || config.workflows
     ? getLocalAgentProviderAvailabilitySnapshot(process.env, config.agentProviders)
     : [];
   const workflowReaper = config.workflows

@@ -36,8 +36,8 @@ const workflowsOnly = fields({
   DEVSPACE_SUBAGENTS: "0",
   DEVSPACE_WORKFLOWS: "1",
 });
-assert.equal(workflowsOnly.has("agentProviders"), false);
-assert.equal(workflowsOnly.has("agents"), false);
+assert.equal(workflowsOnly.has("agentProviders"), true);
+assert.equal(workflowsOnly.has("agents"), true);
 assert.equal(workflowsOnly.has("activeWorkflows"), true);
 
 const enabledSchema = z.object(openWorkspaceOutputSchema(loadConfig({
