@@ -3,7 +3,12 @@ import { join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
 import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
-import { devspaceAgentsDir, devspaceSkillsDir, loadDevspaceFiles } from "./user-config.js";
+import {
+  devspaceAgentsDir,
+  devspaceSkillsDir,
+  loadDevspaceFiles,
+  resolveWorkflowsFlag,
+} from "./user-config.js";
 
 export type ToolMode = "minimal" | "full" | "codex";
 export type WidgetMode = "off" | "changes" | "full";
@@ -219,12 +224,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     env.DEVSPACE_SUBAGENTS === undefined
       ? files.config.subagents === true
       : parseBoolean(env.DEVSPACE_SUBAGENTS);
-  // Experimental compatibility: workflows follow the existing subagents gate
-  // unless explicitly overridden for runtime testing.
-  const workflows =
-    env.DEVSPACE_WORKFLOWS === undefined
-      ? subagents
-      : parseBoolean(env.DEVSPACE_WORKFLOWS);
+  const workflows = resolveWorkflowsFlag({ ...files.config, subagents }, env) ?? false;
 
   return {
     host,

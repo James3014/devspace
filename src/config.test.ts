@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
-import { resolveSubagentsFlag } from "./user-config.js";
+import { resolveSubagentsFlag, resolveWorkflowsFlag } from "./user-config.js";
 
 const emptyConfigDir = mkdtempSync(join(tmpdir(), "devspace-empty-config-test-"));
 const baseEnv = {
@@ -49,6 +49,11 @@ assert.equal(resolveSubagentsFlag({}, {}), undefined);
 assert.equal(resolveSubagentsFlag({ subagents: true }, {}), true);
 assert.equal(resolveSubagentsFlag({ subagents: true }, { DEVSPACE_SUBAGENTS: "0" }), false);
 assert.equal(resolveSubagentsFlag({}, { DEVSPACE_SUBAGENTS: "1" }), true);
+assert.equal(resolveWorkflowsFlag({}, {}), undefined);
+assert.equal(resolveWorkflowsFlag({ subagents: true }, {}), true);
+assert.equal(resolveWorkflowsFlag({ subagents: true, workflows: false }, {}), false);
+assert.equal(resolveWorkflowsFlag({}, { DEVSPACE_WORKFLOWS: "1" }), true);
+assert.equal(resolveWorkflowsFlag({ workflows: true }, { DEVSPACE_WORKFLOWS: "0" }), false);
 
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "invalid" }),
@@ -169,6 +174,7 @@ writeFileSync(
     allowedRoots: [process.cwd()],
     publicBaseUrl: "https://devspace.example.com",
     subagents: true,
+    workflows: false,
   }),
 );
 writeFileSync(
@@ -183,6 +189,7 @@ assert.equal(fileConfig.port, 8787);
 assert.equal(fileConfig.oauth.ownerToken, "persisted-owner-token-long-enough");
 assert.equal(fileConfig.publicBaseUrl, "https://devspace.example.com");
 assert.equal(fileConfig.subagents, true);
+assert.equal(fileConfig.workflows, false);
 assert.deepEqual(fileConfig.allowedHosts, [
   "localhost",
   "127.0.0.1",

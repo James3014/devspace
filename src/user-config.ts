@@ -19,6 +19,7 @@ export interface DevspaceUserConfig {
   worktreeRoot?: string;
   agentDir?: string;
   subagents?: boolean;
+  workflows?: boolean;
 }
 
 export interface DevspaceAuthConfig {
@@ -103,6 +104,18 @@ export function resolveSubagentsFlag(
 ): boolean | undefined {
   if (env.DEVSPACE_SUBAGENTS === undefined) return config.subagents;
   return ["1", "true", "yes", "on"].includes(env.DEVSPACE_SUBAGENTS.toLowerCase());
+}
+
+export function resolveWorkflowsFlag(
+  config: Pick<DevspaceUserConfig, "subagents" | "workflows">,
+  env: NodeJS.ProcessEnv = process.env,
+): boolean | undefined {
+  if (env.DEVSPACE_WORKFLOWS !== undefined) {
+    return ["1", "true", "yes", "on"].includes(env.DEVSPACE_WORKFLOWS.toLowerCase());
+  }
+  // Older config files only had the subagents toggle. Preserve their behavior
+  // while allowing new setups to persist an independent workflow choice.
+  return config.workflows ?? config.subagents;
 }
 
 function readJsonFile<T>(filePath: string): T {

@@ -36,14 +36,17 @@ import { resolveLocalAgentExecution } from "./local-agent-resolution.js";
 import { createLocalAgentStore, type LocalAgentRecord } from "./local-agent-store.js";
 import {
   generateOwnerToken,
+  devspaceSkillsDir,
   loadDevspaceFiles,
   resolveSubagentsFlag,
+  resolveWorkflowsFlag,
   writeDevspaceAuth,
   writeDevspaceConfig,
   type DevspaceUserConfig,
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
+import { installManagedSkills } from "./skill-installer.js";
 
 import { runWorkflowCommand } from "./workflow-cli.js";
 import {
@@ -184,12 +187,22 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       validate: validateRequiredPublicBaseUrl,
     }));
 
+    const subagents = await confirmPrompt({
+      message: "Enable CLI subagents?",
+      initialValue: resolveSubagentsFlag(files.config) ?? false,
+    });
+    const workflows = await confirmPrompt({
+      message: "Enable Dynamic Workflows?",
+      initialValue: resolveWorkflowsFlag({ ...files.config, subagents }) ?? subagents,
+    });
+
     const config: DevspaceUserConfig = {
       host: files.config.host ?? "127.0.0.1",
       port,
       allowedRoots,
       publicBaseUrl,
-      subagents: resolveSubagentsFlag(files.config),
+      subagents,
+      workflows,
     };
     const auth = {
       ownerToken: files.auth.ownerToken ?? generateOwnerToken(),
@@ -197,6 +210,11 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
 
     const configPath = writeDevspaceConfig(config);
     const authPath = writeDevspaceAuth(auth);
+    const installedSkills = await installManagedSkills({
+      destination: devspaceSkillsDir(),
+      subagents,
+      workflows,
+    });
     const lines = [
       `Config: ${configPath}`,
       `Auth: ${authPath}`,
@@ -204,6 +222,12 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       ...(publicBaseUrl ? [`Public MCP URL: ${publicBaseUrl}/mcp`] : []),
     ];
     prompts.note(lines.join("\n"), "DevSpace configured");
+    if (installedSkills.length > 0) {
+      prompts.note(
+        installedSkills.map((skill) => `${skill.name}: ${skill.status} (${skill.path})`).join("\n"),
+        "CLI skills",
+      );
+    }
     prompts.note(
       [
         `Owner password: ${auth.ownerToken}`,
@@ -338,14 +362,14 @@ function printHelp(): void {
       "Usage:",
       "  devspace                 Run first-time setup if needed, then start the server",
       "  devspace serve           Start the server",
-      "  devspace init            Create or update ~/.devspace/config.json and auth.json",
+      "  devspace init            Create or update config, auth, and enabled CLI skills",
       "  devspace doctor          Show config, runtime, and native dependency status",
       "  devspace config get      Print persisted config",
       "  devspace config set publicBaseUrl <url|null>",
       "  devspace agents ls       List subagent sessions",
       "  devspace agents run <profile-or-provider-or-id> [--model <model>] <prompt>",
       "  devspace agents show <id>",
-      "  devspace workflow run|status|cancel|ls",
+      "  devspace workflow run|status|cancel|ls|calls|call",
       "  devspace -v, --version   Print the installed version",
       "",
       "For temporary tunnels:",
@@ -695,6 +719,12 @@ async function textPrompt(options: TextPromptOptions): Promise<string> {
   if (prompts.isCancel(result)) throw new SetupCancelledError();
   const value = String(result).trim();
   return value || options.defaultValue;
+}
+
+async function confirmPrompt(options: Parameters<typeof prompts.confirm>[0]): Promise<boolean> {
+  const result = await prompts.confirm(options);
+  if (prompts.isCancel(result)) throw new SetupCancelledError();
+  return Boolean(result);
 }
 
 function validatePort(value: string | undefined): string | undefined {
