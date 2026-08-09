@@ -64,10 +64,10 @@ export class LocalAgentStore {
       rows = this.database.sqlite
         .prepare(
           `select * from local_agent_sessions
-           where workspace_id = ?
+           where workspace_id = ? or (workspace_id is null and workspace_root = ?)
            order by updated_at desc`,
         )
-        .all(scope.workspaceId) as LocalAgentRow[];
+        .all(scope.workspaceId, scope.workspaceRoot ? resolve(scope.workspaceRoot) : "") as LocalAgentRow[];
     } else if (scope.workspaceRoot) {
       rows = this.database.sqlite
         .prepare(

@@ -32,7 +32,12 @@ export function isRecordInCliWorkspace(
   record: WorkspaceScopedRecord,
   context: CliWorkspaceContext,
 ): boolean {
-  if (context.workspaceId) return record.workspaceId === context.workspaceId;
+  if (context.workspaceId) {
+    if (record.workspaceId === context.workspaceId) return true;
+    // Records created before MCP propagated workspace ids are still safe to
+    // use when their canonical project root matches the opened workspace.
+    return !record.workspaceId && resolve(record.workspaceRoot) === context.workspaceRoot;
+  }
   return resolve(record.workspaceRoot) === context.workspaceRoot;
 }
 

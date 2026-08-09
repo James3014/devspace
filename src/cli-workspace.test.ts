@@ -47,6 +47,11 @@ try {
     { workspaceId: "ws_injected", workspaceRoot: nested },
     "Subagent",
   ));
+  assert.doesNotThrow(() => assertRecordInCliWorkspace(
+    { workspaceRoot: nested },
+    { workspaceId: "ws_injected", workspaceRoot: nested },
+    "Legacy subagent",
+  ));
   assert.throws(
     () => assertRecordInCliWorkspace(
       { workspaceId: "ws_other", workspaceRoot: nested },

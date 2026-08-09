@@ -42,6 +42,17 @@ try {
     [undefined],
   );
   assert.deepEqual(store.list({ workspaceId: "ws_1" }).map((agent) => agent.id), [created.id]);
+  const legacy = store.create({
+    workspaceRoot: join(root, "project"),
+    profileName: "legacy",
+    provider: "codex",
+  });
+  assert.deepEqual(
+    store.list({ workspaceId: "ws_1", workspaceRoot: join(root, "project") })
+      .map((agent) => agent.id)
+      .sort(),
+    [created.id, legacy.id].sort(),
+  );
   assert.deepEqual(store.list({ workspaceId: "ws_other" }), []);
   assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
 
