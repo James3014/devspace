@@ -51,6 +51,7 @@ import {
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
 import {
   createReviewChangeJournal,
+  type ReviewMove,
   type ReviewMutationCapture,
 } from "./review-change-journal.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
@@ -732,8 +733,11 @@ export function createMcpServer(
     return reviewJournal.prepareMutation({ workspaceId, root, paths });
   };
 
-  const commitReviewMutation = (capture: ReviewMutationCapture | undefined): void => {
-    if (capture) reviewJournal.commitMutation(capture);
+  const commitReviewMutation = (
+    capture: ReviewMutationCapture | undefined,
+    moves: readonly ReviewMove[] = [],
+  ): void => {
+    if (capture) reviewJournal.commitMutation(capture, moves);
   };
 
   registerAppResource(
@@ -1272,7 +1276,20 @@ export function createMcpServer(
       async ({ workspaceId, patch }) => {
         const startedAt = performance.now();
         const workspace = workspaces.getWorkspace(workspaceId);
-        const applied = await applyPatch(workspace.root, patch);
+        let reviewMutation: ReviewMutationCapture | undefined;
+        const applied = await applyPatch(workspace.root, patch, {
+          beforeApply: async ({ paths }) => {
+            reviewMutation = await prepareReviewMutation(workspaceId, workspace.root, paths);
+          },
+        });
+        commitReviewMutation(
+          reviewMutation,
+          applied.files.flatMap((file) =>
+            file.operation === "move" && file.previousPath
+              ? [{ fromPath: file.previousPath, toPath: file.path }]
+              : [],
+          ),
+        );
         const paths = applied.files.map((file) => file.path).join(", ");
         const result = `Applied patch to ${applied.files.length} file(s): ${paths}`;
         const content = [textBlock(result)];
