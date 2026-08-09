@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveCliWorkspaceScope } from "./cli-workspace.js";
 import type { ServerConfig } from "./config.js";
 import { parseWorkflowArgFlagsResult } from "./workflow-files.js";
 import {
@@ -27,6 +28,7 @@ import {
   spawnWorkflowWorker,
   spawnWorkflowWorkerFromCli,
 } from "./workflow-worker.js";
+import { isPathInsideRoot } from "./roots.js";
 
 export { runWorkflowWorker, spawnWorkflowWorker, spawnWorkflowWorkerFromCli };
 
@@ -104,6 +106,8 @@ export function printWorkflowHelp(): void {
 
 async function runWorkflowRun(args: string[], config: ServerConfig): Promise<void> {
   const { flags } = splitFlags(args);
+  assertKnownFlags(flags, ["follow", "script-path", "file", "name", "resume", "arg"],
+    "Usage: devspace workflow run [--file|--script-path <path> | --name <name>] [--resume <runId>] [--arg key=value]... [--follow]");
   const follow = flags.has("follow");
   const file = flagValue(flags, "script-path") ?? flagValue(flags, "file");
   const name = flagValue(flags, "name");
@@ -126,10 +130,15 @@ async function runWorkflowRun(args: string[], config: ServerConfig): Promise<voi
     });
   }
 
-  const source = buildCliLaunchSource({ file, name, resumeFrom });
+  const scope = resolveCliWorkspaceScope(config.allowedRoots);
+  const source = buildCliLaunchSource({
+    file: file ? resolveWorkflowFilePath(file, scope.workspaceRoot) : undefined,
+    name,
+    resumeFrom,
+  });
   const store = createWorkflowStore(config);
   try {
-    const workspaceRoot = resolve(process.env.DEVSPACE_WORKSPACE_ROOT || process.cwd());
+    const workspaceRoot = scope.workspaceRoot;
     let argsValue = Object.keys(workflowArgs).length ? workflowArgs : undefined;
 
     // Resume without explicit --arg reuses prior args inside launch; if CLI
@@ -144,7 +153,7 @@ async function runWorkflowRun(args: string[], config: ServerConfig): Promise<voi
       store,
       config,
       workspaceRoot,
-      workspaceId: process.env.DEVSPACE_WORKSPACE_ID,
+      workspaceId: scope.workspaceId,
       source,
       args: argsValue,
       cliEntry: fileURLToPath(import.meta.url.replace(/workflow-cli\.(ts|js)$/, "cli.$1")),
@@ -183,8 +192,10 @@ function buildCliLaunchSource(input: {
 }
 
 async function runWorkflowStatus(args: string[], config: ServerConfig): Promise<void> {
-  const follow = args.includes("--follow");
-  const runId = args.find((a) => !a.startsWith("-"));
+  const { flags, positionals } = splitFlags(args);
+  assertKnownFlags(flags, ["follow"], "Usage: devspace workflow status <runId> [--follow]");
+  const follow = flags.has("follow");
+  const runId = positionals[0];
   if (!runId) {
     throw new InvalidWorkflowInputError({
       code: "invalid_argument",
@@ -199,6 +210,7 @@ async function runWorkflowStatus(args: string[], config: ServerConfig): Promise<
     if (runResult.isErr()) throw runResult.error;
     const run = runResult.value;
     if (!run) throw new WorkflowNotFoundError(runId);
+    assertWorkflowInScope(run, resolveCliWorkspaceScope(config.allowedRoots));
     console.log(formatRunLine(run));
     console.log(formatCallSummary(store.listAgentCalls(runId)));
     if (follow) {
@@ -213,7 +225,9 @@ async function runWorkflowStatus(args: string[], config: ServerConfig): Promise<
 }
 
 async function runWorkflowCancel(args: string[], config: ServerConfig): Promise<void> {
-  const runId = args[0];
+  const { flags, positionals } = splitFlags(args);
+  assertKnownFlags(flags, [], "Usage: devspace workflow cancel <runId>");
+  const runId = positionals[0];
   if (!runId) {
     throw new InvalidWorkflowInputError({
       code: "invalid_argument",
@@ -223,6 +237,9 @@ async function runWorkflowCancel(args: string[], config: ServerConfig): Promise<
   const store = createWorkflowStore(config);
   try {
     reapStaleWorkflows(store);
+    const run = store.getRun(runId);
+    if (!run) throw new WorkflowNotFoundError(runId);
+    assertWorkflowInScope(run, resolveCliWorkspaceScope(config.allowedRoots));
     console.log(formatRunLine(await cancelWorkflowRun(store, runId)));
   } finally {
     store.close();
@@ -233,7 +250,8 @@ async function runWorkflowList(config: ServerConfig): Promise<void> {
   const store = createWorkflowStore(config);
   try {
     reapStaleWorkflows(store);
-    const runs = store.listRuns(50);
+    const scope = resolveCliWorkspaceScope(config.allowedRoots);
+    const runs = store.listRunsForWorkspace(scope.workspaceRoot, { limit: 50 });
     if (runs.length === 0) {
       console.log("No workflow runs.");
       return;
@@ -245,7 +263,9 @@ async function runWorkflowList(config: ServerConfig): Promise<void> {
 }
 
 async function runWorkflowCalls(args: string[], config: ServerConfig): Promise<void> {
-  const runId = args[0];
+  const { flags, positionals } = splitFlags(args);
+  assertKnownFlags(flags, [], "Usage: devspace workflow calls <runId>");
+  const runId = positionals[0];
   if (!runId) {
     throw new InvalidWorkflowInputError({
       code: "invalid_argument",
@@ -254,7 +274,9 @@ async function runWorkflowCalls(args: string[], config: ServerConfig): Promise<v
   }
   const store = createWorkflowStore(config);
   try {
-    if (!store.getRun(runId)) throw new WorkflowNotFoundError(runId);
+    const run = store.getRun(runId);
+    if (!run) throw new WorkflowNotFoundError(runId);
+    assertWorkflowInScope(run, resolveCliWorkspaceScope(config.allowedRoots));
     const calls = store.listAgentCalls(runId);
     if (calls.length === 0) {
       console.log("No workflow agent calls.");
@@ -267,8 +289,10 @@ async function runWorkflowCalls(args: string[], config: ServerConfig): Promise<v
 }
 
 async function runWorkflowCall(args: string[], config: ServerConfig): Promise<void> {
-  const runId = args[0];
-  const callIndex = Number(args[1]);
+  const { flags, positionals } = splitFlags(args);
+  assertKnownFlags(flags, [], "Usage: devspace workflow call <runId> <callIndex>");
+  const runId = positionals[0];
+  const callIndex = Number(positionals[1]);
   if (!runId || !Number.isInteger(callIndex) || callIndex < 0) {
     throw new InvalidWorkflowInputError({
       code: "invalid_argument",
@@ -277,7 +301,9 @@ async function runWorkflowCall(args: string[], config: ServerConfig): Promise<vo
   }
   const store = createWorkflowStore(config);
   try {
-    if (!store.getRun(runId)) throw new WorkflowNotFoundError(runId);
+    const run = store.getRun(runId);
+    if (!run) throw new WorkflowNotFoundError(runId);
+    assertWorkflowInScope(run, resolveCliWorkspaceScope(config.allowedRoots));
     const call = store.getAgentCall(runId, callIndex);
     if (!call) {
       throw new InvalidWorkflowInputError({
@@ -294,6 +320,7 @@ async function runWorkflowCall(args: string[], config: ServerConfig): Promise<vo
 async function followRun(store: WorkflowStore, runId: string): Promise<void> {
   let sinceSeq = 0;
   for (;;) {
+    reapStaleWorkflows(store);
     const page = store.drainEvents(runId, sinceSeq, WORKFLOW_LIMITS.eventDrainDefault);
     for (const event of page.events) printEvent(event);
     sinceSeq = page.nextSeq;
@@ -438,6 +465,50 @@ function splitFlags(args: string[]): {
     positionals.push(token);
   }
   return { flags, positionals };
+}
+
+function assertKnownFlags(
+  flags: Map<string, string | true>,
+  allowed: string[],
+  usage: string,
+): void {
+  const allowedSet = new Set(allowed);
+  const unknown = [...flags.keys()].filter((flag) => !allowedSet.has(flag));
+  if (unknown.length > 0) {
+    throw new InvalidWorkflowInputError({
+      code: "invalid_argument",
+      message: `${usage}\nUnknown option: --${unknown[0]}`,
+    });
+  }
+}
+
+function resolveWorkflowFilePath(path: string, workspaceRoot: string): string {
+  const resolvedPath = resolve(workspaceRoot, path);
+  if (!isPathInsideRoot(resolvedPath, workspaceRoot)) {
+    throw new InvalidWorkflowInputError({
+      code: "invalid_path",
+      message: `Workflow file must be inside the workspace: ${workspaceRoot}`,
+    });
+  }
+  return resolvedPath;
+}
+
+function assertWorkflowInScope(
+  run: Pick<WorkflowRunRecord, "workspaceRoot" | "workspaceId">,
+  scope: { workspaceRoot: string; workspaceId?: string },
+): void {
+  if (resolve(run.workspaceRoot) !== resolve(scope.workspaceRoot)) {
+    throw new InvalidWorkflowInputError({
+      code: "invalid_argument",
+      message: `Workflow run belongs to a different workspace: ${scope.workspaceRoot}`,
+    });
+  }
+  if (scope.workspaceId && run.workspaceId && run.workspaceId !== scope.workspaceId) {
+    throw new InvalidWorkflowInputError({
+      code: "invalid_argument",
+      message: `Workflow run belongs to a different workspaceId: ${scope.workspaceId}`,
+    });
+  }
 }
 
 function flagValue(flags: Map<string, string | true>, key: string): string | undefined {
