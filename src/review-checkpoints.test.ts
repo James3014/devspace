@@ -78,6 +78,27 @@ test("a nested workspace only reviews changes inside its workspace root", async 
   assert.doesNotMatch(review.patch, /other changed/);
 });
 
+test("binary changes use a renderable review patch instead of a Git binary patch", async (t) => {
+  const root = await committedRepository(t);
+  await writeFile(join(root, "asset.bin"), Buffer.from([0, 1, 2, 3]));
+  await git(root, ["add", "asset.bin"]);
+  await git(root, ["commit", "-m", "Add binary asset"]);
+
+  const manager = createReviewCheckpointManager();
+  await manager.initializeWorkspace({ workspaceId: "ws_binary", root });
+  await writeFile(join(root, "asset.bin"), Buffer.from([0, 1, 9, 3]));
+
+  const review = await manager.reviewChanges({
+    workspaceId: "ws_binary",
+    root,
+    markReviewed: false,
+  });
+
+  assert.deepEqual(review.files.map((file) => file.path), ["asset.bin"]);
+  assert.match(review.patch, /Binary files/);
+  assert.doesNotMatch(review.patch, /GIT binary patch/);
+});
+
 test("review checkpoints survive a manager restart", async (t) => {
   const root = await committedRepository(t);
   const manager = createReviewCheckpointManager();

@@ -1,6 +1,7 @@
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parsePatchFiles } from "@pierre/diffs";
 import { git, getGitEligibility, safeWorkspaceRefSegment } from "./git.js";
 
 export type ReviewSince = "last_shown" | "workspace_open";
@@ -47,6 +48,7 @@ export interface ReviewCheckpointManager {
 }
 
 const REVIEW_REF_PREFIX = "refs/devspace/review";
+const REVIEW_DIFF_MAX_BUFFER = 10_000_000;
 
 export function createReviewCheckpointManager(): ReviewCheckpointManager {
   const states = new Map<string, WorkspaceReviewState>();
@@ -108,11 +110,21 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
       const baselineRef = effectiveSince === "workspace_open" ? state.openRef : state.baselineRef;
       const baseline = (await git(state.gitRoot, ["rev-parse", "--verify", `${baselineRef}^{commit}`])).stdout.trim();
       const current = await createWorkingTreeSnapshot(state.gitRoot, state.root);
-      const patch = (await git(state.root, ["diff", "--relative", "--binary", "--no-color", baseline, current], {
-        maxBuffer: 50 * 1024 * 1024,
+      const patch = (await git(state.root, [
+        "diff",
+        "--relative",
+        "--patch",
+        "--no-color",
+        "--no-ext-diff",
+        "--no-textconv",
+        baseline,
+        current,
+      ], {
+        maxBuffer: REVIEW_DIFF_MAX_BUFFER,
       })).stdout;
+      assertRenderableReviewPatch(patch);
       const numstat = (await git(state.root, ["diff", "--relative", "--numstat", "-z", baseline, current], {
-        maxBuffer: 50 * 1024 * 1024,
+        maxBuffer: REVIEW_DIFF_MAX_BUFFER,
       })).stdout;
       const files = parseNumstat(numstat);
       const summary = summarizeFiles(files);
@@ -137,6 +149,17 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
       };
     },
   };
+}
+
+function assertRenderableReviewPatch(patch: string): void {
+  if (patch.length === 0) return;
+
+  try {
+    parsePatchFiles(patch, "review", true);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Review diff could not be rendered: ${detail}`);
+  }
 }
 
 function assertWorkspaceRoot(
