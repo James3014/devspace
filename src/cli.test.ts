@@ -133,6 +133,29 @@ try {
   assert.deepEqual(filteredTargets.profiles, []);
   assert.deepEqual(filteredTargets.providers.map((provider) => provider.name), ["claude"]);
 
+  const workflowOnlyTargets = JSON.parse(execFileSync(
+    "node",
+    ["--import", "tsx", "src/cli.ts", "agents", "targets", "--json"],
+    {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        DEVSPACE_CONFIG_DIR: configDir,
+        DEVSPACE_ALLOWED_ROOTS: projectRoot,
+        DEVSPACE_STATE_DIR: stateDir,
+        DEVSPACE_WORKSPACE_ROOT: projectRoot,
+        DEVSPACE_SUBAGENTS: "0",
+        DEVSPACE_WORKFLOWS: "1",
+        DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+      },
+    },
+  )) as {
+    profiles: Array<{ name: string }>;
+    providers: Array<{ name: string }>;
+  };
+  assert.deepEqual(workflowOnlyTargets.profiles.map((profile) => profile.name), ["reviewer"]);
+
   const agentsJson = JSON.parse(execFileSync(
     "node",
     ["--import", "tsx", "src/cli.ts", "agents", "ls", "--json"],

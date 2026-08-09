@@ -86,10 +86,17 @@ async function main(argv: string[]): Promise<void> {
       runConfigCommand(args);
       return;
     case "agents":
-      if (args[0] !== "__worker" && !loadConfig().subagents) {
+      {
+        const agentConfig = loadConfig();
+        if (
+          args[0] !== "__worker" &&
+          !(args[0] === "targets" && agentConfig.workflows) &&
+          !agentConfig.subagents
+        ) {
         throw new Error(
           "Agent tooling is disabled. Run `devspace init --force` or set DEVSPACE_SUBAGENTS=1.",
         );
+        }
       }
       await runAgentsCommand(args);
       return;
