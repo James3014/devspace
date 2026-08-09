@@ -173,27 +173,94 @@ test("a concurrent review rejects a different root after initialization", async 
   }
 });
 
-test("an unborn repository becomes reviewable after its first commit", async (t) => {
+test("an unborn repository is reviewable and re-anchors after its first commit", async (t) => {
   const root = await unbornRepository(t);
   const manager = createReviewCheckpointManager();
 
   await manager.initializeWorkspace({ workspaceId: "ws_unborn", root });
-  await assert.rejects(
-    () => manager.reviewChanges({ workspaceId: "ws_unborn", root }),
-    /repository has no HEAD commit/,
-  );
+  const initial = await manager.reviewChanges({ workspaceId: "ws_unborn", root, markReviewed: false });
+  assert.equal(initial.summary.files, 0);
 
-  await writeFile(join(root, "README.md"), "first commit\n");
-  await git(root, ["add", "README.md"]);
-  await git(root, ["commit", "-m", "Initial commit"]);
-
-  const afterFirstCommit = await manager.reviewChanges({
+  await writeFile(join(root, "README.md"), "working tree only\n");
+  const beforeCommit = await manager.reviewChanges({
     workspaceId: "ws_unborn",
     root,
     markReviewed: false,
   });
-  assert.equal(afterFirstCommit.summary.files, 0);
-  assert.equal(afterFirstCommit.patch, "");
+  assert.equal(beforeCommit.files.length, 1);
+  assert.equal(beforeCommit.files[0]?.type, "new");
+
+  await git(root, ["add", "README.md"]);
+  await git(root, ["commit", "-m", "Initial commit"]);
+
+  const reanchored = await manager.reviewChanges({
+    workspaceId: "ws_unborn",
+    root,
+    markReviewed: false,
+  });
+  assert.equal(reanchored.summary.files, 0);
+  assert.match(reanchored.result, /re-anchored/);
+
+  await writeFile(join(root, "notes.txt"), "after commit\n");
+  const afterCommit = await manager.reviewChanges({
+    workspaceId: "ws_unborn",
+    root,
+    markReviewed: false,
+  });
+  assert.deepEqual(afterCommit.files.map((file) => file.path), ["notes.txt"]);
+});
+
+test("whitespace-only changes are ignored by default and visible when requested", async (t) => {
+  const root = await committedRepository(t);
+  const manager = createReviewCheckpointManager();
+  await manager.initializeWorkspace({ workspaceId: "ws_whitespace", root });
+
+  await writeFile(join(root, "README.md"), "hello  \n");
+
+  const ignored = await manager.reviewChanges({
+    workspaceId: "ws_whitespace",
+    root,
+    markReviewed: false,
+  });
+  assert.equal(ignored.summary.files, 0);
+  assert.equal(ignored.patch, "");
+
+  const visible = await manager.reviewChanges({
+    workspaceId: "ws_whitespace",
+    root,
+    markReviewed: false,
+    ignoreWhitespace: false,
+  });
+  assert.equal(visible.summary.files, 1);
+  assert.equal(visible.summary.additions, 1);
+});
+
+test("an oversized diff degrades to a file list instead of failing", async (t) => {
+  const lineCount = 1_500_000;
+  const root = await committedRepository(t);
+  await writeFile(join(root, "big.txt"), `${"aaa\n".repeat(lineCount)}`);
+  await git(root, ["add", "big.txt"]);
+  await git(root, ["commit", "-m", "Add big file"]);
+  const manager = createReviewCheckpointManager();
+  await manager.initializeWorkspace({ workspaceId: "ws_oversized", root });
+
+  await writeFile(join(root, "big.txt"), `${"bbb\n".repeat(lineCount)}`);
+
+  const review = await manager.reviewChanges({
+    workspaceId: "ws_oversized",
+    root,
+    markReviewed: true,
+  });
+  assert.equal(review.files.length, 1);
+  assert.equal(review.patch, "");
+  assert.match(review.result, /file list/);
+
+  const after = await manager.reviewChanges({
+    workspaceId: "ws_oversized",
+    root,
+    markReviewed: false,
+  });
+  assert.equal(after.summary.files, 0);
 });
 
 async function committedRepository(t: TestContext): Promise<string> {
