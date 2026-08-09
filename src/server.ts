@@ -1351,11 +1351,41 @@ export function createMcpServer(
       async ({ workspaceId }) => {
         const startedAt = performance.now();
         const workspace = workspaces.getWorkspace(workspaceId);
-        const review = await reviewCheckpoints.reviewChanges({
-          workspaceId,
-          root: workspace.root,
-          markReviewed: true,
-        });
+        const review = reviewJournal.hasTrackedMutations(workspaceId)
+          ? await (async () => {
+              const journalReview = await reviewJournal.reviewChanges({
+                workspaceId,
+                root: workspace.root,
+              });
+              try {
+                const checkpointReview = await reviewCheckpoints.reviewChanges({
+                  workspaceId,
+                  root: workspace.root,
+                  markReviewed: true,
+                });
+                const journalFiles = reviewFileKeys(journalReview.files);
+                const checkpointFiles = reviewFileKeys(checkpointReview.files);
+                if (journalFiles.join("\0") !== checkpointFiles.join("\0")) {
+                  logEvent(config.logging, "debug", "review_source_mismatch", {
+                    workspaceId,
+                    journalFiles,
+                    checkpointFiles,
+                  });
+                }
+              } catch (error) {
+                logEvent(config.logging, "debug", "review_checkpoint_comparison_unavailable", {
+                  workspaceId,
+                  error: error instanceof Error ? error.message : String(error),
+                });
+              }
+              reviewJournal.markReviewed({ workspaceId, root: workspace.root });
+              return journalReview;
+            })()
+          : await reviewCheckpoints.reviewChanges({
+              workspaceId,
+              root: workspace.root,
+              markReviewed: true,
+            });
 
         const content = [textBlock(review.result)];
         logToolCall(config, {
@@ -1936,6 +1966,14 @@ export function createServer(
       return closePromise;
     },
   };
+}
+
+function reviewFileKeys(
+  files: ReadonlyArray<{ path: string; previousPath?: string }>,
+): string[] {
+  return files
+    .map((file) => file.previousPath ? `${file.previousPath}->${file.path}` : file.path)
+    .sort();
 }
 
 async function isMainModule(): Promise<boolean> {
