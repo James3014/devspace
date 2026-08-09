@@ -1586,6 +1586,10 @@ function createMcpServer(
       const response = await runShellTool(input, {
         cwd,
         root: workspace.root,
+        env: {
+          DEVSPACE_WORKSPACE_ID: workspaceId,
+          DEVSPACE_WORKSPACE_ROOT: workspace.root,
+        },
       });
 
       if (response.isError) {
