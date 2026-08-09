@@ -28,6 +28,7 @@ export type ToolResponse<TDetails = unknown> = {
 interface ToolContext {
   cwd: string;
   root: string;
+  workspaceId?: string;
   readRoots?: string[];
 }
 
@@ -119,7 +120,18 @@ export async function listDirectoryTool(input: LsToolInput, context: ToolContext
 }
 
 export async function runShellTool(input: BashToolInput, context: ToolContext): Promise<ToolResponse> {
-  const tool = createBashTool(context.cwd);
+  const tool = createBashTool(context.cwd, {
+    // CLI orchestration launched through MCP must retain the workspace scope,
+    // even when the opened directory is nested inside a larger repository.
+    spawnHook: ({ env, ...spawn }) => ({
+      ...spawn,
+      env: {
+        ...env,
+        ...(context.workspaceId ? { DEVSPACE_WORKSPACE_ID: context.workspaceId } : {}),
+        DEVSPACE_WORKSPACE_ROOT: context.root,
+      },
+    }),
+  });
   const timeout = input.timeout === undefined ? 30 : Math.min(input.timeout, 300);
 
   return runTool((params) => tool.execute("run_shell", params), {
