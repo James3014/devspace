@@ -50,13 +50,26 @@ export function resolveCliWorkspaceScope(
 
 function findGitRoot(cwd: string): string | undefined {
   try {
+    // `--show-toplevel` can return a physical path on platforms where the
+    // temporary directory is symlinked (for example macOS `/var`). Derive the
+    // root from the caller's path so the returned scope stays consistent with
+    // the configured allowlist and workspace ids.
     const output = execFileSync(
       "git",
-      ["rev-parse", "--show-toplevel"],
+      ["rev-parse", "--show-cdup"],
       { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
     ).trim();
-    return output || undefined;
+    return resolve(cwd, output || ".");
   } catch {
-    return undefined;
+    try {
+      const output = execFileSync(
+        "git",
+        ["rev-parse", "--show-toplevel"],
+        { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] },
+      ).trim();
+      return output || undefined;
+    } catch {
+      return undefined;
+    }
   }
 }
