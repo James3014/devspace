@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
 import { join } from "node:path";
 import { and, eq } from "drizzle-orm";
 import { unifiedFilePatch } from "./apply-patch.js";
@@ -69,8 +69,8 @@ export function createChangeJournalManager(database: AppDatabase): ChangeJournal
       if (exists.length > 0) return;
 
       const original = previousPath
-        ? await readFileIfPresent(join(root, previousPath))
-        : await readFileIfPresent(join(root, path));
+        ? await readFileIfPresent(root, previousPath)
+        : await readFileIfPresent(root, path);
       const binary = original !== null && isBinary(original);
       const row: NewJournalRow = {
         workspaceSessionId: workspaceId,
@@ -89,7 +89,7 @@ export function createChangeJournalManager(database: AppDatabase): ChangeJournal
       const entries: JournalEntry[] = [];
       for (const row of rows) {
         assertJournalPath(root, row.path);
-        const current = await readFileIfPresent(join(root, row.path));
+        const current = await readFileIfPresent(root, row.path);
         entries.push({
           row,
           currentContent: current === null ? null : current.toString("utf8"),
@@ -106,14 +106,14 @@ export function createChangeJournalManager(database: AppDatabase): ChangeJournal
         const { row, currentContent, currentBinary } = entry;
 
         if (!row.previousPath) {
-          if (currentContent === null && row.originalContent === null) continue;
-          if (row.originalContent === currentContent) continue;
+          if (currentContent === null && row.originalContent === null && !row.originalBinary) continue;
+          if (row.originalContent === currentContent && !row.originalBinary) continue;
         }
 
         const originalBytes = row.originalBinary
           ? 0
           : Buffer.byteLength(row.originalContent ?? "");
-        const oversized = originalBytes + (currentContent?.length ?? 0) > MAX_JOURNAL_DIFF_BYTES;
+        const oversized = originalBytes + Buffer.byteLength(currentContent ?? "") > MAX_JOURNAL_DIFF_BYTES;
         const preview = !row.originalBinary && !currentBinary && !oversized;
 
         let fileAdditions = 0;
@@ -226,9 +226,14 @@ async function rebaseline(
   }
 }
 
-async function readFileIfPresent(path: string): Promise<Buffer | null> {
+async function readFileIfPresent(root: string, relativePath: string): Promise<Buffer | null> {
+  const joined = join(root, relativePath);
   try {
-    return await readFile(path);
+    const resolved = await realpath(joined);
+    if (!isPathInsideRoot(resolved, await realpath(root))) {
+      throw new Error(`Path is outside workspace root: ${relativePath}`);
+    }
+    return await readFile(resolved);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
     throw error;

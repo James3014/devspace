@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -202,6 +202,70 @@ test("the journal survives a database restart", async (t) => {
   const review = await restarted.reviewChanges({ workspaceId: "w1", root: project, markReviewed: false });
   assert.equal(review.files.length, 1);
   assert.equal(review.files[0]?.type, "new");
+});
+
+test("a touched binary file deleted before review reports a deletion", async (t) => {
+  const { journal, project } = await fixture(t);
+  await write(project, "logo.png", "PNG\x00\x01\x02");
+
+  await journal.recordTouch({ workspaceId: "w1", root: project, path: "logo.png" });
+  await rm(join(project, "logo.png"));
+
+  const review = await journal.reviewChanges({ workspaceId: "w1", root: project, markReviewed: true });
+  assert.equal(review.files.length, 1);
+  assert.equal(review.files[0]?.path, "logo.png");
+  assert.equal(review.files[0]?.type, "deleted");
+
+  const again = await journal.reviewChanges({ workspaceId: "w1", root: project, markReviewed: false });
+  assert.equal(again.files.length, 0);
+});
+
+test("symlinks cannot smuggle content from outside the workspace into a review", async (t) => {
+  const { root, journal, project } = await fixture(t);
+  const outsideDir = join(root, "outside");
+  await mkdir(outsideDir);
+  await writeFile(join(outsideDir, "secret.txt"), "external secrets\n");
+
+  await symlink(join(outsideDir, "secret.txt"), join(project, "link.txt"));
+  await assert.rejects(
+    journal.recordTouch({ workspaceId: "w1", root: project, path: "link.txt" }),
+    /outside workspace root/,
+  );
+
+  await write(project, "plain.txt", "alpha\n");
+  await journal.recordTouch({ workspaceId: "w1", root: project, path: "plain.txt" });
+  await rm(join(project, "plain.txt"));
+  await symlink(join(outsideDir, "secret.txt"), join(project, "plain.txt"));
+  await assert.rejects(
+    journal.reviewChanges({ workspaceId: "w1", root: project }),
+    /outside workspace root/,
+  );
+});
+
+test("a symlink to a file inside the workspace is reviewable", async (t) => {
+  const { journal, project } = await fixture(t);
+  await write(project, "real.txt", "alpha\n");
+  await symlink(join(project, "real.txt"), join(project, "alias.txt"));
+
+  await journal.recordTouch({ workspaceId: "w1", root: project, path: "alias.txt" });
+  await write(project, "real.txt", "alpha\nbeta\n");
+  const review = await journal.reviewChanges({ workspaceId: "w1", root: project, markReviewed: false });
+  assert.equal(review.files.length, 1);
+  assert.equal(review.files[0]?.path, "alias.txt");
+  assert.equal(review.summary.additions, 1);
+});
+
+test("the diff cap counts bytes, not UTF-16 code units", async (t) => {
+  const { journal, project } = await fixture(t);
+  const chunk = "é".repeat(Math.ceil(MAX_JOURNAL_DIFF_BYTES / 2));
+
+  await journal.recordTouch({ workspaceId: "w1", root: project, path: "uni.txt" });
+  await write(project, "uni.txt", `${chunk}\n`);
+
+  const review = await journal.reviewChanges({ workspaceId: "w1", root: project, markReviewed: false });
+  assert.equal(review.files.length, 1);
+  assert.equal(review.patch, "");
+  assert.equal(review.summary.additions, 0);
 });
 
 test("path containment is enforced", async (t) => {
