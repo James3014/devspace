@@ -263,6 +263,55 @@ test("an oversized diff degrades to a file list instead of failing", async (t) =
   assert.equal(after.summary.files, 0);
 });
 
+test("re-anchoring after a HEAD move keeps unreviewed pending edits visible", async (t) => {
+  const root = await committedRepository(t);
+  const manager = createReviewCheckpointManager();
+  await manager.initializeWorkspace({ workspaceId: "ws_reanchor_edits", root });
+
+  await writeFile(join(root, "pending.txt"), "uncommitted work\n");
+  await writeFile(join(root, "committed.txt"), "committed later\n");
+  await git(root, ["add", "committed.txt"]);
+  await git(root, ["commit", "-m", "Move HEAD"]);
+
+  const reanchored = await manager.reviewChanges({
+    workspaceId: "ws_reanchor_edits",
+    root,
+    markReviewed: false,
+  });
+  assert.equal(reanchored.summary.files, 0);
+  assert.match(reanchored.result, /re-anchored/);
+
+  const after = await manager.reviewChanges({
+    workspaceId: "ws_reanchor_edits",
+    root,
+    markReviewed: false,
+  });
+  assert.deepEqual(after.files.map((file) => file.path), ["pending.txt"]);
+  assert.match(after.patch, /uncommitted work/);
+});
+
+test("HEAD moves after a restart are absorbed by re-anchoring", async (t) => {
+  const root = await committedRepository(t);
+  const manager = createReviewCheckpointManager();
+  await manager.initializeWorkspace({ workspaceId: "ws_restart_track", root });
+  await manager.reviewChanges({ workspaceId: "ws_restart_track", root, markReviewed: true });
+
+  const restartedManager = createReviewCheckpointManager();
+  await restartedManager.initializeWorkspace({ workspaceId: "ws_restart_track", root });
+
+  await writeFile(join(root, "committed.txt"), "new\n");
+  await git(root, ["add", "committed.txt"]);
+  await git(root, ["commit", "-m", "Move HEAD after restart"]);
+
+  const review = await restartedManager.reviewChanges({
+    workspaceId: "ws_restart_track",
+    root,
+    markReviewed: false,
+  });
+  assert.equal(review.summary.files, 0);
+  assert.match(review.result, /re-anchored/);
+});
+
 async function committedRepository(t: TestContext): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "devspace-review-checkpoints-test-"));
   t.after(() => rm(root, { recursive: true, force: true }));

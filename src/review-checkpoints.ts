@@ -94,15 +94,12 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
       }
 
       const currentHead = await headSha(state.gitRoot);
-      if (state.headTracked && state.headSha !== currentHead) {
-        const snapshot = await createWorkingTreeSnapshot(state.gitRoot);
-        await git(state.gitRoot, ["update-ref", state.openRef, snapshot.commit]);
-        await git(state.gitRoot, ["update-ref", state.baselineRef, snapshot.commit]);
-        state.headSha = snapshot.headSha;
-        state.openRefAvailable = true;
+      if (state.headTracked && currentHead && state.headSha !== currentHead) {
+        await git(state.gitRoot, ["update-ref", state.baselineRef, currentHead]);
+        state.headSha = currentHead;
         state.baselineRefAvailable = true;
         return {
-          result: "The repository HEAD moved since the last review, so the review checkpoints were re-anchored to the latest commit. No changes since then.",
+          result: "The repository HEAD moved since the last review, so the review baseline was re-anchored to the latest commit.",
           summary: { files: 0, additions: 0, removals: 0 },
           files: [],
           patch: "",
@@ -131,10 +128,24 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
         state.gitRoot,
         ["diff", ...whitespaceArgs, "--no-color", "--no-ext-diff", "--no-textconv", baseline, current.commit],
       );
-      const numstat = (await git(state.gitRoot, ["diff", ...whitespaceArgs, "--numstat", "-z", baseline, current.commit], {
-        maxBuffer: 10 * 1024 * 1024,
-      })).stdout;
-      const files = parseNumstat(numstat);
+      let files: ReviewFile[] = [];
+      if (patch.degraded) {
+        const names = await diffOrDegrade(
+          state.gitRoot,
+          ["diff", ...whitespaceArgs, "--name-only", "-z", baseline, current.commit],
+        );
+        if (!names.degraded) {
+          files = names.text
+            .split("\0")
+            .filter((path) => path.length > 0)
+            .map((path) => ({ path, type: "change", additions: 0, removals: 0 }));
+        }
+      } else {
+        const numstat = (await git(state.gitRoot, ["diff", ...whitespaceArgs, "--numstat", "-z", baseline, current.commit], {
+          maxBuffer: 10 * 1024 * 1024,
+        })).stdout;
+        files = parseNumstat(numstat);
+      }
       const summary = summarizeFiles(files);
 
       if (markReviewed) {
@@ -150,11 +161,13 @@ export function createReviewCheckpointManager(): ReviewCheckpointManager {
         ? " The diff was too large to render, so a file list is shown instead."
         : "";
       return {
-        result: `${
-          summary.files === 0
-            ? `No changes since ${effectiveSince === "workspace_open" ? "workspace open" : "last shown changes"}.`
-            : `Changed ${summary.files} ${summary.files === 1 ? "file" : "files"} (+${summary.additions} -${summary.removals}).`
-        }${fallbackNote}${degradedNote}`,
+        result: patch.degraded && summary.files === 0
+          ? "The diff was too large to render, so a file list is shown instead."
+          : `${
+            summary.files === 0
+              ? `No changes since ${effectiveSince === "workspace_open" ? "workspace open" : "last shown changes"}.`
+              : `Changed ${summary.files} ${summary.files === 1 ? "file" : "files"} (+${summary.additions} -${summary.removals}).`
+          }${fallbackNote}${degradedNote}`,
         summary,
         files,
         patch: patch.text,
@@ -210,6 +223,11 @@ async function initializeWorkspaceState(
     } else {
       state.openRefAvailable = openCommit !== undefined;
       state.baselineRefAvailable = baselineCommit !== undefined;
+      const head = await headSha(gitRoot);
+      if (head) {
+        state.headSha = head;
+        state.headTracked = true;
+      }
     }
 
     state.gitRoot = gitRoot;
