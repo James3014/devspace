@@ -284,3 +284,23 @@ index 1111111..2222222 100644
   assert.equal(parsed.ok, true);
   assert.equal(parsed.files[0]?.additionLines[0], "new ");
 }
+
+const binarySpacePathPatch = `diff --git a/logo mark.png b/logo mark.png
+index 1111111..2222222 100644
+Binary files a/logo mark.png and b/logo mark.png differ
+`;
+{
+  const parsed = parseReviewPatchFiles(binarySpacePathPatch);
+  assert.equal(parsed.ok, true);
+  assert.deepEqual([...parsed.binaryFiles], ["logo mark.png"]);
+}
+
+const quotedBinaryPatch = `diff --git a/"logo mark.png" b/"logo mark.png"
+index 1111111..2222222 100644
+Binary files a/"logo mark.png" and b/"logo mark.png" differ
+`;
+{
+  const parsed = parseReviewPatchFiles(quotedBinaryPatch);
+  assert.equal(parsed.ok, true);
+  assert.deepEqual([...parsed.binaryFiles], ["logo mark.png"]);
+}

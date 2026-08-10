@@ -190,8 +190,7 @@ export function parseReviewPatchFiles(patch: string | undefined): ReviewPatchPar
     for (const section of patch.split(/^diff --git /m)) {
       if (!section || !/Binary files|GIT binary patch/.test(section)) continue;
       const firstLine = section.split("\n")[0] ?? "";
-      const binaryPath = firstLine.match(/ b\/(.+?)\s*$/)?.[1]?.replace(/^"|"$/g, "")
-        ?? firstLine.split(" ")[1]?.slice(2);
+      const binaryPath = firstLine.match(/ b\/(.+?)\s*$/)?.[1]?.replace(/^"|"$/g, "");
       if (binaryPath) binaryFiles.add(binaryPath);
     }
     return { files, binaryFiles, ok: true };
