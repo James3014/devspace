@@ -4,12 +4,9 @@ import { Readable, Writable } from "node:stream";
 import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
 import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
-import {
-  createCodexSdkLocalAgentRuntime,
-  type LocalAgentRunInput,
-  type LocalAgentRunResult,
-} from "./local-agent-runtime.js";
+import type { LocalAgentRunInput, LocalAgentRunResult } from "./local-agent-runtime.js";
 import type { HarnessDriver, HarnessRuntime } from "./local-agent-runtime-pool.js";
+import { createCodexHarnessDriver } from "./local-agent-codex/runtime.js";
 
 export interface LocalAgentAdapter {
   readonly provider: LocalAgentProvider;
@@ -49,8 +46,12 @@ class CodexLocalAgentAdapter implements LocalAgentAdapter {
   readonly provider = "codex" as const;
 
   async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
-    const runtime = await createCodexSdkLocalAgentRuntime();
-    return runtime.run(input);
+    const runtime = await createCodexHarnessDriver().createRuntime(input);
+    try {
+      return await runtime.run(input);
+    } finally {
+      await runtime.close();
+    }
   }
 }
 

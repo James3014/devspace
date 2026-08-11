@@ -1,6 +1,7 @@
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
 import type { LocalAgentRunInput, LocalAgentRunResult } from "./local-agent-runtime.js";
 import { createLocalAgentAdapter, createOpencodeHarnessDriver } from "./local-agent-adapters.js";
+import { createCodexHarnessDriver } from "./local-agent-codex/runtime.js";
 import {
   HarnessRuntimePool,
   type HarnessDriver,
@@ -8,6 +9,7 @@ import {
 
 interface LocalAgentRuntimeRegistryOptions {
   pool?: HarnessRuntimePool;
+  codexDriver?: HarnessDriver;
   opencodeDriver?: HarnessDriver;
 }
 
@@ -17,10 +19,12 @@ interface LocalAgentRuntimeRegistryOptions {
  */
 export class LocalAgentRuntimeRegistry {
   private readonly pool: HarnessRuntimePool;
+  private readonly codexDriver: HarnessDriver;
   private readonly opencodeDriver: HarnessDriver;
 
   constructor(options: LocalAgentRuntimeRegistryOptions = {}) {
     this.pool = options.pool ?? new HarnessRuntimePool();
+    this.codexDriver = options.codexDriver ?? createCodexHarnessDriver();
     this.opencodeDriver = options.opencodeDriver ?? createOpencodeHarnessDriver();
   }
 
@@ -28,6 +32,9 @@ export class LocalAgentRuntimeRegistry {
     provider: LocalAgentProvider,
     input: LocalAgentRunInput,
   ): Promise<LocalAgentRunResult> {
+    if (provider === "codex") {
+      return this.pool.run(this.codexDriver, input);
+    }
     if (provider === "opencode") {
       return this.pool.run(this.opencodeDriver, input);
     }
