@@ -9,6 +9,7 @@ import {
   type LocalAgentRunInput,
   type LocalAgentRunResult,
 } from "./local-agent-runtime.js";
+import type { HarnessDriver, HarnessRuntime } from "./local-agent-runtime-pool.js";
 
 export interface LocalAgentAdapter {
   readonly provider: LocalAgentProvider;
@@ -142,27 +143,62 @@ class OpencodeLocalAgentAdapter implements LocalAgentAdapter {
   readonly provider = "opencode" as const;
 
   async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
-    const { createOpencode } = await import("@opencode-ai/sdk/v2");
-    const { client, server } = await createOpencode();
+    const runtime = await createOpencodeHarnessDriver().createRuntime(input);
     try {
-      const sessionId = input.providerSessionId ?? await createOpencodeSession(client, input);
-      const promptResult = await promptOpencodeSession(client, sessionId, input);
-      await waitForOpencodeSession(client, sessionId);
-      const messages = await readOpencodeMessages(client, sessionId);
-      const finalResponse = requireFinalResponse(
-        "OpenCode",
-        extractOpenCodeFinalResponse(messages) || extractOpenCodeFinalResponse(promptResult),
-      );
-      return {
-        provider: this.provider,
-        providerSessionId: sessionId,
-        finalResponse,
-        items: [promptResult, messages],
-      };
+      return await runtime.run(input);
     } finally {
-      server.close();
+      await runtime.close();
     }
   }
+}
+
+class OpencodeHarnessRuntime implements HarnessRuntime {
+  private closed = false;
+
+  constructor(
+    private readonly client: unknown,
+    private readonly closeServer: () => void,
+  ) {}
+
+  async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
+    if (this.closed) throw new Error("OpenCode runtime is closed.");
+    const sessionId = input.providerSessionId ?? await createOpencodeSession(this.client, input);
+    const promptResult = await promptOpencodeSession(this.client, sessionId, input);
+    await waitForOpencodeSession(this.client, sessionId);
+    const messages = await readOpencodeMessages(this.client, sessionId);
+    const finalResponse = requireFinalResponse(
+      "OpenCode",
+      extractOpenCodeFinalResponse(messages) || extractOpenCodeFinalResponse(promptResult),
+    );
+    return {
+      provider: "opencode",
+      providerSessionId: sessionId,
+      finalResponse,
+      items: [promptResult, messages],
+    };
+  }
+
+  isUsable(): boolean {
+    return !this.closed;
+  }
+
+  async close(): Promise<void> {
+    if (this.closed) return;
+    this.closed = true;
+    this.closeServer();
+  }
+}
+
+export function createOpencodeHarnessDriver(): HarnessDriver {
+  return {
+    provider: "opencode",
+    runtimeKey: () => "default",
+    createRuntime: async () => {
+      const { createOpencode } = await import("@opencode-ai/sdk/v2");
+      const { client, server } = await createOpencode();
+      return new OpencodeHarnessRuntime(client, () => server.close());
+    },
+  };
 }
 
 class AcpLocalAgentAdapter implements LocalAgentAdapter {
