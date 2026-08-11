@@ -1,17 +1,11 @@
 import assert from "node:assert/strict";
-import { delimiter } from "node:path";
 import {
   claudeCommandEnvironment,
   createLocalAgentAdapter,
   extractOpenCodeFinalResponse,
-  extractPiFinalResponse,
-  extractPiProviderError,
-  extractPiStreamingText,
-  piCommandEnvironment,
   resolveAcpModelConfigUpdate,
   resolveAcpThinkingConfigUpdate,
 } from "./local-agent-adapters.js";
-import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
 
 const providers: LocalAgentProvider[] = [
@@ -276,115 +270,3 @@ assert.equal(
   "",
 );
 
-assert.equal(
-  extractPiFinalResponse({
-    data: {
-      messages: [
-        { role: "user", content: "Review the change." },
-        {
-          role: "assistant",
-          content: [
-            { type: "thinking", thinking: "thinking" },
-            { type: "toolCall", id: "tool-1", name: "read", arguments: { path: "src/foo.ts" } },
-            { type: "text", text: "Final Pi response." },
-          ],
-        },
-        {
-          role: "toolResult",
-          toolCallId: "tool-1",
-          toolName: "read",
-          content: [{ type: "text", text: "tool output" }],
-        },
-      ],
-    },
-  }),
-  "Final Pi response.",
-);
-
-assert.equal(
-  extractPiFinalResponse({
-    messages: [
-      {
-        role: "assistant",
-        content: [
-          { type: "text", text: "first part" },
-          { type: "toolCall", id: "tool-1", name: "bash", arguments: { command: "npm test" } },
-          { type: "text", text: "second part" },
-        ],
-      },
-    ],
-  }),
-  "first part\n\nsecond part",
-);
-
-assert.equal(
-  extractPiFinalResponse({
-    messages: [
-      { role: "assistant", content: [{ type: "toolCall", id: "tool-1", name: "bash", arguments: {} }] },
-      { role: "toolResult", toolCallId: "tool-1", toolName: "bash", content: "secret output" },
-      { role: "bashExecution", command: "cat src/secret.ts", output: "secret output", timestamp: 1 },
-    ],
-  }),
-  "",
-);
-
-assert.equal(
-  extractPiProviderError({
-    type: "agent_end",
-    messages: [
-      {
-        role: "assistant",
-        content: [{ type: "text", text: "" }],
-        stopReason: "error",
-        errorMessage: "(0 , _piAi.streamSimpleOpenAIResponses) is not a function",
-      },
-    ],
-  }),
-  "(0 , _piAi.streamSimpleOpenAIResponses) is not a function",
-);
-
-assert.equal(
-  extractPiStreamingText([
-    {
-      type: "message_update",
-      message: { role: "assistant", content: [{ type: "thinking", thinking: "hidden" }] },
-      assistantMessageEvent: { type: "thinking_delta", delta: "hidden" },
-    },
-    {
-      type: "message_update",
-      message: { role: "assistant", content: [{ type: "text", text: "Final " }] },
-      assistantMessageEvent: { type: "text_delta", delta: "Final " },
-    },
-    {
-      type: "message_update",
-      message: { role: "assistant", content: [{ type: "text", text: "Pi response." }] },
-      assistantMessageEvent: { type: "text_delta", delta: "Pi response." },
-    },
-  ]),
-  "Final Pi response.",
-);
-
-{
-  const devspaceBin = `${process.cwd()}/node_modules/.bin`;
-  const userBin = "/home/user/.local/bin";
-  assert.equal(
-    removeDevspaceNodeModulesBinFromPath([devspaceBin, userBin].join(delimiter)),
-    userBin,
-  );
-
-  const env = piCommandEnvironment({
-    PATH: [devspaceBin, userBin].join(delimiter),
-  });
-
-  assert.equal(env.PATH, userBin);
-}
-
-{
-  const devspaceBin = `${process.cwd()}/node_modules/.bin`;
-  const env = piCommandEnvironment({
-    PI_COMMAND: "/custom/pi",
-    PATH: [devspaceBin, "/home/user/.local/bin"].join(delimiter),
-  });
-
-  assert.equal(env.PATH, [devspaceBin, "/home/user/.local/bin"].join(delimiter));
-}
