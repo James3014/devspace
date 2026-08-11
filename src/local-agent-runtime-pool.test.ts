@@ -5,6 +5,7 @@ import type { LocalAgentRunInput, LocalAgentRunResult } from "./local-agent-runt
 
 class FakeRuntime implements HarnessRuntime {
   readonly prompts: string[] = [];
+  readonly reaps: number[] = [];
   closed = false;
   private sessionCount = 0;
 
@@ -24,6 +25,10 @@ class FakeRuntime implements HarnessRuntime {
 
   isUsable(): boolean {
     return !this.closed;
+  }
+
+  async reapIdleSessions(now: number): Promise<void> {
+    this.reaps.push(now);
   }
 
   async close(): Promise<void> {
@@ -75,10 +80,12 @@ try {
   now = 9;
   await pool.reapIdle();
   assert.equal(runtimes[0]?.closed, false);
+  assert.deepEqual(runtimes[0]?.reaps, [9]);
 
   now = 10;
   await pool.reapIdle();
   assert.equal(runtimes[0]?.closed, true, "idle runtimes should be reclaimable without touching durable session ids");
+  assert.deepEqual(runtimes[0]?.reaps, [9, 10]);
 
   await registry.run("opencode", input("/tmp/a", "third", second.providerSessionId ?? undefined));
   assert.equal(created, 2, "a later run should recreate an evicted runtime");

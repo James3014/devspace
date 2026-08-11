@@ -22,6 +22,7 @@ import {
 
 const STDERR_LIMIT = 32_000;
 const SHUTDOWN_GRACE_MS = 2_000;
+const ACP_SESSION_IDLE_MS = 5 * 60 * 1_000;
 
 type AcpProvider = "cursor" | "copilot";
 
@@ -29,8 +30,13 @@ interface PendingAcpTurn {
   textParts: string[];
 }
 
+interface AcpSessionEntry extends AcpSessionConfigState {
+  active: boolean;
+  lastUsedAt: number;
+}
+
 export class AcpHarnessRuntime implements HarnessRuntime {
-  private readonly sessions = new Map<string, AcpSessionConfigState>();
+  private readonly sessions = new Map<string, AcpSessionEntry>();
   private readonly pendingTurns = new Map<string, PendingAcpTurn>();
   private closed = false;
 
@@ -49,33 +55,38 @@ export class AcpHarnessRuntime implements HarnessRuntime {
       if (this.pendingTurns.has(session.sessionId)) {
         throw new Error(`${this.provider} ACP session ${session.sessionId} already has a turn in progress.`);
       }
-
-      if (input.model) {
-        await this.connection.agent.request("session/set_config_option", {
-          ...resolveAcpModelConfigUpdate(session, input.model, this.provider),
-        });
-      }
-      if (input.thinking) {
-        await this.connection.agent.request("session/set_config_option", {
-          ...resolveAcpThinkingConfigUpdate(session, input.thinking, this.provider),
-        });
-      }
-
-      const pending: PendingAcpTurn = { textParts: [] };
-      this.pendingTurns.set(session.sessionId, pending);
+      session.active = true;
       try {
-        await this.connection.agent.request("session/prompt", {
-          sessionId: session.sessionId,
-          prompt: [{ type: "text", text: input.prompt }],
-        });
-        return {
-          provider: this.provider,
-          providerSessionId: session.sessionId,
-          finalResponse: pending.textParts.join("").trim(),
-          items: [],
-        };
+        if (input.model) {
+          await this.connection.agent.request("session/set_config_option", {
+            ...resolveAcpModelConfigUpdate(session, input.model, this.provider),
+          });
+        }
+        if (input.thinking) {
+          await this.connection.agent.request("session/set_config_option", {
+            ...resolveAcpThinkingConfigUpdate(session, input.thinking, this.provider),
+          });
+        }
+
+        const pending: PendingAcpTurn = { textParts: [] };
+        this.pendingTurns.set(session.sessionId, pending);
+        try {
+          await this.connection.agent.request("session/prompt", {
+            sessionId: session.sessionId,
+            prompt: [{ type: "text", text: input.prompt }],
+          });
+          return {
+            provider: this.provider,
+            providerSessionId: session.sessionId,
+            finalResponse: pending.textParts.join("").trim(),
+            items: [],
+          };
+        } finally {
+          this.pendingTurns.delete(session.sessionId);
+        }
       } finally {
-        this.pendingTurns.delete(session.sessionId);
+        session.active = false;
+        session.lastUsedAt = Date.now();
       }
     } catch (error) {
       const detail = this.stderr().trim();
@@ -100,6 +111,19 @@ export class AcpHarnessRuntime implements HarnessRuntime {
       && this.child.signalCode === null;
   }
 
+  async reapIdleSessions(now: number): Promise<void> {
+    if (!this.initializeResponse.agentCapabilities?.sessionCapabilities?.close) return;
+    for (const [sessionId, session] of this.sessions) {
+      if (session.active || now - session.lastUsedAt < ACP_SESSION_IDLE_MS) continue;
+      try {
+        await this.connection.agent.request("session/close", { sessionId });
+        this.sessions.delete(sessionId);
+      } catch {
+        // The connection remains useful; retry this session on a later reap.
+      }
+    }
+  }
+
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
@@ -118,22 +142,25 @@ export class AcpHarnessRuntime implements HarnessRuntime {
     }
   }
 
-  private async ensureSession(input: LocalAgentRunInput): Promise<AcpSessionConfigState> {
+  private async ensureSession(input: LocalAgentRunInput): Promise<AcpSessionEntry> {
     if (input.providerSessionId) {
       const existing = this.sessions.get(input.providerSessionId);
       if (existing) return existing;
       const resumed = await this.resumeSession(input.providerSessionId, input.workspace);
-      this.sessions.set(input.providerSessionId, resumed);
-      return resumed;
+      const entry = withActivity(resumed);
+      this.sessions.set(input.providerSessionId, entry);
+      return entry;
     }
 
     const response = await this.connection.agent.request("session/new", {
       cwd: input.workspace,
       mcpServers: [],
     }) as NewSessionResponse;
-    const session: AcpSessionConfigState = {
+    const session: AcpSessionEntry = {
       sessionId: response.sessionId,
       configOptions: response.configOptions,
+      active: false,
+      lastUsedAt: Date.now(),
     };
     this.sessions.set(session.sessionId, session);
     return session;
@@ -161,6 +188,10 @@ export class AcpHarnessRuntime implements HarnessRuntime {
       `${this.provider} ACP agent cannot resume session ${sessionId}; it advertises neither session/resume nor session/load.`,
     );
   }
+}
+
+function withActivity(session: AcpSessionConfigState): AcpSessionEntry {
+  return { ...session, active: false, lastUsedAt: Date.now() };
 }
 
 export function createAcpHarnessDriver(

@@ -106,6 +106,18 @@ try {
     }),
     /completed without a final response/,
   );
+
+  await runtime.reapIdleSessions(Date.now() + 5 * 60 * 1_000 + 1);
+  assert.equal(sessions.get("pi_1")?.disposed, true);
+  assert.equal(sessions.get("pi_2")?.disposed, true);
+
+  const resumedAfterReap = await runtime.run({
+    workspace: "/tmp/a",
+    prompt: "after reap",
+    providerSessionId: "pi_1",
+  });
+  assert.equal(created, 3, "an evicted Pi session should be recreated from its durable session id");
+  assert.equal(resumedAfterReap.providerSessionId, "pi_1");
 } finally {
   await runtime.close();
 }

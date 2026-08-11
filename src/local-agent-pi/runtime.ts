@@ -1,6 +1,8 @@
 import type { LocalAgentRunInput, LocalAgentRunResult } from "../local-agent-runtime.js";
 import type { HarnessDriver, HarnessRuntime } from "../local-agent-runtime-pool.js";
 
+const PI_SESSION_IDLE_MS = 5 * 60 * 1_000;
+
 interface PiSessionLike {
   readonly sessionId: string;
   readonly messages: unknown[];
@@ -20,6 +22,8 @@ interface PiSessionEntry {
   workspace: string;
   session: PiSessionLike;
   tail: Promise<void>;
+  active: boolean;
+  lastUsedAt: number;
 }
 
 type PiSessionSlot =
@@ -37,7 +41,15 @@ export class PiHarnessRuntime implements HarnessRuntime {
     const entry = await this.ensureSession(input);
     const turn = entry.tail
       .catch(() => undefined)
-      .then(() => this.runTurn(entry.session, input));
+      .then(async () => {
+        entry.active = true;
+        try {
+          return await this.runTurn(entry.session, input);
+        } finally {
+          entry.active = false;
+          entry.lastUsedAt = Date.now();
+        }
+      });
     entry.tail = turn.then(() => undefined, () => undefined);
     return turn;
   }
@@ -66,6 +78,20 @@ export class PiHarnessRuntime implements HarnessRuntime {
 
   isUsable(): boolean {
     return !this.closed;
+  }
+
+  async reapIdleSessions(now: number): Promise<void> {
+    for (const [sessionId, slot] of this.sessions) {
+      if (slot.status !== "ready") continue;
+      const entry = slot.entry;
+      if (entry.active || now - entry.lastUsedAt < PI_SESSION_IDLE_MS) continue;
+      try {
+        entry.session.dispose();
+        this.sessions.delete(sessionId);
+      } catch {
+        // Keep the entry so a later reap can retry disposal.
+      }
+    }
   }
 
   async close(): Promise<void> {
@@ -141,7 +167,13 @@ export class PiHarnessRuntime implements HarnessRuntime {
 }
 
 function createPiSessionEntry(workspace: string, session: PiSessionLike): PiSessionEntry {
-  return { workspace, session, tail: Promise.resolve() };
+  return {
+    workspace,
+    session,
+    tail: Promise.resolve(),
+    active: false,
+    lastUsedAt: Date.now(),
+  };
 }
 
 export function createPiHarnessDriver(): HarnessDriver {

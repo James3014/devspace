@@ -47,6 +47,7 @@ class FakeCodexConnection implements CodexAppServerConnection {
       });
       return { turn: { id: turnId } };
     }
+    if (method === "thread/unsubscribe") return {};
     throw new Error(`Unexpected request: ${method}`);
   }
 
@@ -136,6 +137,14 @@ try {
 
   const finalTurn = connection.requests.filter((request) => request.method === "turn/start").at(-1);
   assert.equal(asRecord(finalTurn?.params)?.effort, "xhigh");
+
+  await runtime.reapIdleSessions(Date.now() + 5 * 60 * 1_000 + 1);
+  const unsubscribes = connection.requests.filter((request) => request.method === "thread/unsubscribe");
+  assert.deepEqual(
+    unsubscribes.map((request) => asRecord(request.params)?.threadId).sort(),
+    ["thread_1", "thread_2"],
+    "idle Codex threads should be released while the shared App Server stays alive",
+  );
 } finally {
   await runtime.close();
 }

@@ -7,6 +7,7 @@ import {
 import { resolveCodexCommand } from "./command.js";
 
 type CodexSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
+const CODEX_THREAD_IDLE_MS = 5 * 60 * 1_000;
 
 interface PendingTurn {
   turnId?: string;
@@ -29,6 +30,7 @@ interface TurnCompletion {
  */
 export class CodexAppServerRuntime implements HarnessRuntime {
   private readonly pendingTurns = new Map<string, PendingTurn>();
+  private readonly threadActivity = new Map<string, { active: boolean; lastUsedAt: number }>();
   private readonly unsubscribe: () => void;
   private readonly unsubscribeClose: () => void;
   private closed = false;
@@ -52,6 +54,9 @@ export class CodexAppServerRuntime implements HarnessRuntime {
       throw new Error(`Codex thread ${threadId} already has a turn in progress.`);
     }
 
+    const activity = this.threadActivity.get(threadId) ?? { active: false, lastUsedAt: Date.now() };
+    activity.active = true;
+    this.threadActivity.set(threadId, activity);
     const pending = createPendingTurn();
     this.pendingTurns.set(threadId, pending);
     try {
@@ -84,11 +89,26 @@ export class CodexAppServerRuntime implements HarnessRuntime {
     } catch (error) {
       if (this.pendingTurns.get(threadId) === pending) this.pendingTurns.delete(threadId);
       throw error;
+    } finally {
+      activity.active = false;
+      activity.lastUsedAt = Date.now();
     }
   }
 
   isUsable(): boolean {
     return !this.closed && this.connection.isUsable();
+  }
+
+  async reapIdleSessions(now: number): Promise<void> {
+    for (const [threadId, activity] of this.threadActivity) {
+      if (activity.active || now - activity.lastUsedAt < CODEX_THREAD_IDLE_MS) continue;
+      try {
+        await this.connection.request("thread/unsubscribe", { threadId });
+        this.threadActivity.delete(threadId);
+      } catch {
+        // Keep it tracked so a later reap can retry if the connection recovers.
+      }
+    }
   }
 
   async close(): Promise<void> {
@@ -98,6 +118,7 @@ export class CodexAppServerRuntime implements HarnessRuntime {
     this.unsubscribeClose();
     const error = new Error("Codex app-server runtime closed.");
     this.rejectPendingTurns(error);
+    this.threadActivity.clear();
     await this.connection.close();
   }
 

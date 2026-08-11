@@ -6,6 +6,7 @@ const DEFAULT_REAP_INTERVAL_MS = 30 * 1_000;
 export interface HarnessRuntime {
   run(input: LocalAgentRunInput): Promise<LocalAgentRunResult>;
   isUsable(): boolean;
+  reapIdleSessions?(now: number): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -81,6 +82,7 @@ export class HarnessRuntimePool {
     const closing: HarnessRuntime[] = [];
     for (const [key, slot] of this.slots) {
       if (slot.status !== "ready" || slot.activeRuns > 0) continue;
+      await slot.runtime.reapIdleSessions?.(now).catch(() => undefined);
       if (now - slot.lastUsedAt < this.idleMs) continue;
       this.slots.delete(key);
       closing.push(slot.runtime);
