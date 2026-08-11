@@ -61,6 +61,8 @@ import {
   getLocalAgentProviderAvailabilitySnapshot,
   type LocalAgentProviderAvailability,
 } from "./local-agent-availability.js";
+import { LocalAgentManager } from "./local-agent-manager.js";
+import { LocalAgentControlServer } from "./local-agent-control.js";
 
 type Transport = StreamableHTTPServerTransport;
 // MCP clients can reconnect without closing the previous transport. Bound stale
@@ -92,6 +94,7 @@ interface RunningServer {
   app: ReturnType<typeof createMcpExpressApp>;
   config: ServerConfig;
   localAgentProviders: LocalAgentProviderAvailability[];
+  startAgentControl(): Promise<void>;
   close(): Promise<void>;
 }
 
@@ -1694,6 +1697,10 @@ export function createServer(
   const localAgentProviders = config.subagents
     ? getLocalAgentProviderAvailabilitySnapshot()
     : [];
+  const localAgentManager = config.subagents ? new LocalAgentManager(config) : undefined;
+  const localAgentControl = localAgentManager
+    ? new LocalAgentControlServer(config, localAgentManager)
+    : undefined;
 
   const logSessionCloseResults = (
     reason: "idle_timeout" | "server_shutdown",
@@ -1879,12 +1886,17 @@ export function createServer(
     app,
     config,
     localAgentProviders,
+    startAgentControl: async () => {
+      await localAgentControl?.start();
+    },
     close: () => {
       closePromise ??= (async () => {
         clearInterval(sessionCleanupTimer);
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
         processSessions.shutdown();
+        await localAgentControl?.close();
+        await localAgentManager?.shutdown();
         oauthProvider.close();
         workspaceStore.close?.();
       })();
@@ -1902,7 +1914,8 @@ async function isMainModule(): Promise<boolean> {
 }
 
 if (await isMainModule()) {
-  const { app, config, close, localAgentProviders } = createServer();
+  const { app, config, close, localAgentProviders, startAgentControl } = createServer();
+  await startAgentControl();
   const httpServer = app.listen(config.port, config.host, () => {
     console.log(
       `devspace listening on http://${config.host}:${config.port}/mcp`,
