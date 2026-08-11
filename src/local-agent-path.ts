@@ -1,4 +1,4 @@
-import { existsSync, readFileSync } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import { delimiter, resolve, sep } from "node:path";
 
 export function removeDevspaceNodeModulesBinFromPath(pathValue: string): string {
@@ -6,6 +6,42 @@ export function removeDevspaceNodeModulesBinFromPath(pathValue: string): string 
     .split(delimiter)
     .filter((entry) => entry && !isDevspaceNodeModulesBin(entry))
     .join(delimiter);
+}
+
+export function resolveLocalAgentExecutable(
+  command: string,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  if (command.includes("/") || command.includes("\\")) {
+    const candidate = resolve(command);
+    return executableExists(candidate) ? candidate : undefined;
+  }
+
+  const path = env.PATH;
+  if (!path) return undefined;
+  const extensions = process.platform === "win32"
+    ? (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
+      .split(";")
+      .filter(Boolean)
+    : [""];
+
+  for (const directory of path.split(delimiter)) {
+    if (!directory) continue;
+    for (const extension of extensions) {
+      const candidate = resolve(directory, `${command}${extension}`);
+      if (executableExists(candidate)) return candidate;
+    }
+  }
+  return undefined;
+}
+
+function executableExists(path: string): boolean {
+  try {
+    accessSync(path, process.platform === "win32" ? constants.F_OK : constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function isDevspaceNodeModulesBin(pathEntry: string): boolean {

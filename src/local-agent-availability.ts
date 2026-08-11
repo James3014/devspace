@@ -1,6 +1,8 @@
-import { spawnSync } from "node:child_process";
-import { delimiter, resolve } from "node:path";
-import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
+import {
+  removeDevspaceNodeModulesBinFromPath,
+  resolveLocalAgentExecutable,
+} from "./local-agent-path.js";
+import { checkCodexAppServerAvailability } from "./local-agent-codex/command.js";
 import {
   LOCAL_AGENT_PROVIDERS,
   type LocalAgentProvider,
@@ -24,7 +26,7 @@ export function checkLocalAgentProviderAvailability(
 ): LocalAgentProviderAvailability {
   switch (provider) {
     case "codex":
-      return packageAvailability(provider, "@openai/codex-sdk");
+      return codexAvailability(env);
     case "claude":
       return packageAvailability(provider, "@anthropic-ai/claude-agent-sdk");
     case "opencode":
@@ -87,7 +89,7 @@ function commandAvailability(
   command: string,
   options: { env?: NodeJS.ProcessEnv } = {},
 ): LocalAgentProviderAvailability {
-  const executable = resolveCommand(command, options.env);
+  const executable = resolveLocalAgentExecutable(command, options.env);
   if (!executable) {
     return {
       name: provider,
@@ -99,45 +101,11 @@ function commandAvailability(
   return { name: provider, available: true };
 }
 
-function resolveCommand(command: string, env: NodeJS.ProcessEnv = process.env): string | undefined {
-  const commandHasPath = command.includes("/") || command.includes("\\");
-  if (commandHasPath) return executableExists(command, env) ? command : undefined;
-
-  for (const candidate of candidateCommandPaths(command, env)) {
-    if (executableExists(candidate, env)) return candidate;
-  }
-  return undefined;
-}
-
-function candidateCommandPaths(command: string, env: NodeJS.ProcessEnv): string[] {
-  const path = env.PATH;
-  if (!path) return [];
-  const extensions = process.platform === "win32"
-    ? (env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
-      .split(";")
-      .filter(Boolean)
-    : [""];
-  const candidates: string[] = [];
-  for (const directory of path.split(delimiter)) {
-    if (!directory) continue;
-    for (const extension of extensions) {
-      candidates.push(resolve(directory, `${command}${extension}`));
-    }
-  }
-  return candidates;
-}
-
-function executableExists(command: string, env: NodeJS.ProcessEnv): boolean {
-  const result = spawnSync(command, ["--version"], {
-    encoding: "utf8",
-    env,
-    windowsHide: true,
-    timeout: 5_000,
-  });
-  const code = typeof result.error === "object" && result.error && "code" in result.error
-    ? result.error.code
-    : undefined;
-  return code !== "ENOENT";
+function codexAvailability(env: NodeJS.ProcessEnv): LocalAgentProviderAvailability {
+  const result = checkCodexAppServerAvailability(env);
+  return result.available
+    ? { name: "codex", available: true }
+    : { name: "codex", available: false, reason: result.reason };
 }
 
 function piAvailabilityEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
