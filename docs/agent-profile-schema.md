@@ -74,7 +74,7 @@ native integration:
 - `codex`: the user's Codex CLI through `codex app-server`
 - `claude`: Claude Code SDK
 - `opencode`: OpenCode SDK
-- `pi`: Pi RPC mode
+- `pi`: embedded Pi `AgentSession` runtime
 - `cursor`: ACP
 - `copilot`: ACP
 
@@ -103,7 +103,7 @@ DevSpace passes this through to providers that expose a matching control:
 
 - `claude`: SDK effort with adaptive thinking.
 - `codex`: App Server turn reasoning effort.
-- `pi`: `--thinking`.
+- `pi`: in-process session thinking level.
 - `opencode`: model variant.
 - `cursor` and `copilot`: ACP thought-level config when supported.
 
