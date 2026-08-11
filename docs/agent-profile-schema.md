@@ -72,7 +72,7 @@ Unsupported or custom providers are rejected. DevSpace maps providers to their
 native integration:
 
 - `codex`: the user's Codex CLI through `codex app-server`
-- `claude`: Claude Code SDK
+- `claude`: warm Claude Code SDK streaming session
 - `opencode`: OpenCode SDK
 - `pi`: embedded Pi `AgentSession` runtime
 - `cursor`: ACP

@@ -80,6 +80,7 @@ try {
   await waitFor(() => calls.length === 2);
 
   assert.equal(calls[0]?.provider, "codex");
+  assert.equal(calls[0]?.input.agentId, first.id);
   assert.equal(calls[0]?.input.prompt, "first");
   assert.equal(calls[0]?.input.model, "gpt-test");
   assert.equal(calls[1]?.input.prompt, "second");
