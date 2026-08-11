@@ -63,6 +63,7 @@ import {
 } from "./local-agent-availability.js";
 import { LocalAgentManager } from "./local-agent-manager.js";
 import { LocalAgentControlServer } from "./local-agent-control.js";
+import { LocalAgentRuntimeRegistry } from "./local-agent-runtime-registry.js";
 
 type Transport = StreamableHTTPServerTransport;
 // MCP clients can reconnect without closing the previous transport. Bound stale
@@ -1697,7 +1698,12 @@ export function createServer(
   const localAgentProviders = config.subagents
     ? getLocalAgentProviderAvailabilitySnapshot()
     : [];
-  const localAgentManager = config.subagents ? new LocalAgentManager(config) : undefined;
+  const localAgentRuntimes = config.subagents ? new LocalAgentRuntimeRegistry() : undefined;
+  const localAgentManager = config.subagents
+    ? new LocalAgentManager(config, {
+        runProvider: (provider, input) => localAgentRuntimes!.run(provider, input),
+      })
+    : undefined;
   const localAgentControl = localAgentManager
     ? new LocalAgentControlServer(config, localAgentManager)
     : undefined;
@@ -1890,6 +1896,7 @@ export function createServer(
       processSessions.shutdown();
       await localAgentControl?.close();
       await localAgentManager?.shutdown();
+      await localAgentRuntimes?.shutdown();
       oauthProvider.close();
       workspaceStore.close?.();
     })();
