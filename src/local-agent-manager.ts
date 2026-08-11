@@ -186,6 +186,7 @@ export class LocalAgentManager {
     const profile = profiles.find((candidate) => candidate.name === record.profileName);
     const prompt = profile ? profilePrompt(profile, turn.prompt) : rawProviderPrompt(record, turn.prompt);
     const result = await this.runProvider(record.provider, {
+      agentId: record.id,
       prompt,
       workspace: workspaceRoot,
       providerSessionId: record.providerSessionId,

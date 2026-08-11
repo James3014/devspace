@@ -1,6 +1,7 @@
 export type LocalAgentWriteMode = "read_only" | "allowed" | "full_access";
 
 export interface LocalAgentRunInput {
+  agentId?: string;
   prompt: string;
   workspace: string;
   providerSessionId?: string;
