@@ -1,7 +1,4 @@
-import {
-  removeDevspaceNodeModulesBinFromPath,
-  resolveLocalAgentExecutable,
-} from "./local-agent-path.js";
+import { resolveLocalAgentExecutable } from "./local-agent-path.js";
 import { checkCodexAppServerAvailability } from "./local-agent-codex/command.js";
 import {
   LOCAL_AGENT_PROVIDERS,
@@ -32,9 +29,7 @@ export function checkLocalAgentProviderAvailability(
     case "opencode":
       return packageAvailability(provider, "@opencode-ai/sdk/v2");
     case "pi":
-      return commandAvailability(provider, env.PI_COMMAND ?? "pi", {
-        env: piAvailabilityEnvironment(env),
-      });
+      return packageAvailability(provider, "@earendil-works/pi-coding-agent");
     case "cursor":
       return commandAvailability(provider, "cursor-agent");
     case "copilot":
@@ -108,12 +103,3 @@ function codexAvailability(env: NodeJS.ProcessEnv): LocalAgentProviderAvailabili
     : { name: "codex", available: false, reason: result.reason };
 }
 
-function piAvailabilityEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  if (env.PI_COMMAND) return env;
-  const path = env.PATH;
-  if (!path) return env;
-  return {
-    ...env,
-    PATH: removeDevspaceNodeModulesBinFromPath(path),
-  };
-}

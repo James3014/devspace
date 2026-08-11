@@ -3,6 +3,7 @@ import type { LocalAgentRunInput, LocalAgentRunResult } from "./local-agent-runt
 import { createLocalAgentAdapter, createOpencodeHarnessDriver } from "./local-agent-adapters.js";
 import { createCodexHarnessDriver } from "./local-agent-codex/runtime.js";
 import { createAcpHarnessDriver } from "./local-agent-acp/runtime.js";
+import { createPiHarnessDriver } from "./local-agent-pi/runtime.js";
 import {
   HarnessRuntimePool,
   type HarnessDriver,
@@ -14,6 +15,7 @@ interface LocalAgentRuntimeRegistryOptions {
   opencodeDriver?: HarnessDriver;
   cursorDriver?: HarnessDriver;
   copilotDriver?: HarnessDriver;
+  piDriver?: HarnessDriver;
 }
 
 /**
@@ -26,6 +28,7 @@ export class LocalAgentRuntimeRegistry {
   private readonly opencodeDriver: HarnessDriver;
   private readonly cursorDriver: HarnessDriver;
   private readonly copilotDriver: HarnessDriver;
+  private readonly piDriver: HarnessDriver;
 
   constructor(options: LocalAgentRuntimeRegistryOptions = {}) {
     this.pool = options.pool ?? new HarnessRuntimePool();
@@ -33,6 +36,7 @@ export class LocalAgentRuntimeRegistry {
     this.opencodeDriver = options.opencodeDriver ?? createOpencodeHarnessDriver();
     this.cursorDriver = options.cursorDriver ?? createAcpHarnessDriver("cursor", ["cursor-agent", "acp"]);
     this.copilotDriver = options.copilotDriver ?? createAcpHarnessDriver("copilot", ["copilot", "--acp"]);
+    this.piDriver = options.piDriver ?? createPiHarnessDriver();
   }
 
   async run(
@@ -50,6 +54,9 @@ export class LocalAgentRuntimeRegistry {
     }
     if (provider === "copilot") {
       return this.pool.run(this.copilotDriver, input);
+    }
+    if (provider === "pi") {
+      return this.pool.run(this.piDriver, input);
     }
     return createLocalAgentAdapter(provider).run(input);
   }

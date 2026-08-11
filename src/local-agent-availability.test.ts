@@ -51,24 +51,17 @@ import { buildCodexProcessLaunch } from "./local-agent-codex/command.js";
 }
 
 {
-  const availability = checkLocalAgentProviderAvailability("pi", {
-    ...process.env,
-    PI_COMMAND: "/definitely/missing/devspace-pi",
-  });
-  assert.equal(availability.available, false);
-  assert.match(availability.reason ?? "", /executable not found/);
+  const availability = checkLocalAgentProviderAvailability("pi", process.env);
+  assert.equal(availability.available, true);
 }
 
 {
-  const snapshot = getLocalAgentProviderAvailabilitySnapshot({
-    ...process.env,
-    PI_COMMAND: "/definitely/missing/devspace-pi",
-  });
+  const snapshot = getLocalAgentProviderAvailabilitySnapshot(process.env);
   assert.deepEqual(
     snapshot.map((provider) => provider.name),
     ["codex", "claude", "opencode", "pi", "cursor", "copilot"],
   );
-  assert.equal(snapshot.find((provider) => provider.name === "pi")?.available, false);
+  assert.equal(snapshot.find((provider) => provider.name === "pi")?.available, true);
 }
 
 assert.equal(
