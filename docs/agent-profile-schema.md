@@ -71,7 +71,7 @@ provider: copilot
 Unsupported or custom providers are rejected. DevSpace maps providers to their
 native integration:
 
-- `codex`: Codex SDK
+- `codex`: the user's Codex CLI through `codex app-server`
 - `claude`: Claude Code SDK
 - `opencode`: OpenCode SDK
 - `pi`: Pi RPC mode
@@ -102,7 +102,7 @@ thinking: xhigh
 DevSpace passes this through to providers that expose a matching control:
 
 - `claude`: SDK effort with adaptive thinking.
-- `codex`: SDK model reasoning effort.
+- `codex`: App Server turn reasoning effort.
 - `pi`: `--thinking`.
 - `opencode`: model variant.
 - `cursor` and `copilot`: ACP thought-level config when supported.

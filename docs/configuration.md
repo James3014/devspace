@@ -161,6 +161,10 @@ terminal.
 Starter profile templates are available under `examples/agents/`. Copy or adapt
 them into one of the active profile directories before use.
 
+Codex subagents use the user's installed `codex` CLI and its existing login,
+configuration, and `CODEX_HOME`. Set `CODEX_COMMAND` to an explicit executable
+when DevSpace should use a non-default Codex installation.
+
 Legacy project paths such as `.pi/skills` can be added through `DEVSPACE_SKILL_PATHS` when needed.
 
 Example:
