@@ -116,11 +116,42 @@ try {
   }
 }
 
+{
+  let cursorCreated = 0;
+  let copilotCreated = 0;
+  const acpPool = new HarnessRuntimePool({ reapIntervalMs: 0 });
+  const acpRegistry = new LocalAgentRuntimeRegistry({
+    pool: acpPool,
+    cursorDriver: countingDriver("cursor", () => ++cursorCreated),
+    copilotDriver: countingDriver("copilot", () => ++copilotCreated),
+  });
+  try {
+    await acpRegistry.run("cursor", input("/tmp/a", "cursor one"));
+    await acpRegistry.run("cursor", input("/tmp/b", "cursor two"));
+    await acpRegistry.run("copilot", input("/tmp/a", "copilot one"));
+
+    assert.equal(cursorCreated, 1, "Cursor sessions should share one ACP runtime");
+    assert.equal(copilotCreated, 1, "Copilot should use its own ACP runtime");
+  } finally {
+    await acpRegistry.shutdown();
+  }
+}
+
 function input(workspace: string, prompt: string, providerSessionId?: string): LocalAgentRunInput {
   return {
     workspace,
     prompt,
     providerSessionId,
     writeMode: "allowed",
+  };
+}
+
+function countingDriver(provider: string, next: () => number): HarnessDriver {
+  return {
+    provider,
+    runtimeKey: () => "shared",
+    async createRuntime() {
+      return new FakeRuntime(`${provider}-runtime-${next()}`);
+    },
   };
 }
