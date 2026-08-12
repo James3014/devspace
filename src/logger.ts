@@ -10,7 +10,7 @@ export interface LoggingConfig {
   assets: boolean;
   toolCalls: boolean;
   shellCommands: boolean;
-  trustProxy: boolean;
+  trustProxyHops: number;
 }
 
 type LogFields = Record<string, unknown>;
@@ -52,16 +52,8 @@ export function logEvent(
   }
 }
 
-export function requestIp(req: Request, trustProxy: boolean): string | undefined {
-  if (trustProxy) {
-    const cfConnectingIp = firstHeaderValue(req.header("cf-connecting-ip"));
-    if (cfConnectingIp) return cfConnectingIp;
-
-    const forwardedFor = firstHeaderValue(req.header("x-forwarded-for"));
-    if (forwardedFor) return forwardedFor;
-  }
-
-  return req.ip ?? req.socket.remoteAddress;
+export function requestIp(req: Request, _trustProxyHops?: number): string | undefined {
+  return req.ip ?? req.socket?.remoteAddress;
 }
 
 export function requestPath(req: Request): string {
@@ -75,10 +67,6 @@ export function sessionIdPrefix(sessionId: string | undefined): string | undefin
 export function commandPreview(command: string): string {
   const normalized = command.replace(/\s+/g, " ").trim();
   return normalized.length > 120 ? `${normalized.slice(0, 117)}...` : normalized;
-}
-
-function firstHeaderValue(value: string | undefined): string | undefined {
-  return value?.split(",")[0]?.trim() || undefined;
 }
 
 function formatPretty(entry: LogFields): string {

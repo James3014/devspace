@@ -100,15 +100,16 @@ npx @waishnav/devspace serve
 
 ## Logging
 
-| Variable | Default |
-| --- | --- |
-| `DEVSPACE_LOG_LEVEL` | `info` |
-| `DEVSPACE_LOG_FORMAT` | `json` |
-| `DEVSPACE_LOG_REQUESTS` | `1` |
-| `DEVSPACE_LOG_ASSETS` | `0` |
-| `DEVSPACE_LOG_TOOL_CALLS` | `1` |
-| `DEVSPACE_LOG_SHELL_COMMANDS` | `0` |
-| `DEVSPACE_TRUST_PROXY` | `0` |
+| Variable | Default | Description |
+| --- | --- | --- |
+| `DEVSPACE_LOG_LEVEL` | `info` | Log level (`silent`, `error`, `warn`, `info`, `debug`). |
+| `DEVSPACE_LOG_FORMAT` | `json` | Log format (`json` or `pretty`). |
+| `DEVSPACE_LOG_REQUESTS` | `1` | Enable request logging (`1` or `0`). |
+| `DEVSPACE_LOG_ASSETS` | `0` | Enable asset request logging (`1` or `0`). |
+| `DEVSPACE_LOG_TOOL_CALLS` | `1` | Enable tool call logging (`1` or `0`). |
+| `DEVSPACE_LOG_SHELL_COMMANDS` | `0` | Enable shell command preview logging (`1` or `0`). |
+| `DEVSPACE_TRUST_PROXY_HOPS` | `0` | Bounded number of trusted reverse proxy hops (e.g. `1`). |
+| `DEVSPACE_TRUST_PROXY` | `0` | Legacy compatibility fallback for 1-hop proxy (`1` or `0`). |
 
 Set `DEVSPACE_LOG_FORMAT=pretty` for local debugging.
 

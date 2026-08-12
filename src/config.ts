@@ -164,6 +164,37 @@ function parseToolNaming(value: string | undefined): ToolNamingMode {
   throw new Error(`Invalid DEVSPACE_TOOL_NAMING: ${value}`);
 }
 
+function parseTrustProxyHops(env: NodeJS.ProcessEnv): number {
+  const rawHops = env.DEVSPACE_TRUST_PROXY_HOPS?.trim();
+  if (rawHops !== undefined && rawHops !== "") {
+    const hops = Number(rawHops);
+    if (!Number.isInteger(hops) || hops < 0) {
+      throw new Error(`Invalid DEVSPACE_TRUST_PROXY_HOPS: ${env.DEVSPACE_TRUST_PROXY_HOPS}`);
+    }
+    return hops;
+  }
+
+  const rawLegacy = env.DEVSPACE_TRUST_PROXY?.trim();
+  if (rawLegacy === undefined || rawLegacy === "") {
+    return 0;
+  }
+
+  const lower = rawLegacy.toLowerCase();
+  if (["1", "true", "yes", "on"].includes(lower)) {
+    return 1;
+  }
+  if (["0", "false", "no", "off"].includes(lower)) {
+    return 0;
+  }
+
+  const legacyNum = Number(rawLegacy);
+  if (Number.isInteger(legacyNum) && legacyNum >= 0) {
+    return legacyNum;
+  }
+
+  throw new Error(`Invalid DEVSPACE_TRUST_PROXY: ${env.DEVSPACE_TRUST_PROXY}`);
+}
+
 function parseLoggingConfig(env: NodeJS.ProcessEnv): LoggingConfig {
   return {
     level: parseLogLevel(env.DEVSPACE_LOG_LEVEL),
@@ -172,7 +203,7 @@ function parseLoggingConfig(env: NodeJS.ProcessEnv): LoggingConfig {
     assets: parseBoolean(env.DEVSPACE_LOG_ASSETS),
     toolCalls: env.DEVSPACE_LOG_TOOL_CALLS === undefined ? true : parseBoolean(env.DEVSPACE_LOG_TOOL_CALLS),
     shellCommands: parseBoolean(env.DEVSPACE_LOG_SHELL_COMMANDS),
-    trustProxy: parseBoolean(env.DEVSPACE_TRUST_PROXY),
+    trustProxyHops: parseTrustProxyHops(env),
   };
 }
 

@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import express from "express";
 import { getSurfaceIdentity, loadConfig } from "./config.js";
+import { requestIp } from "./logger.js";
 
 const emptyConfigDir = mkdtempSync(join(tmpdir(), "devspace-empty-config-test-"));
 const baseEnv = {
@@ -150,7 +152,7 @@ assert.deepEqual(loadConfig(baseEnv).logging, {
   assets: false,
   toolCalls: true,
   shellCommands: false,
-  trustProxy: false,
+  trustProxyHops: 0,
 });
 
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_LEVEL: "silent" }).logging.level, "silent");
@@ -166,7 +168,41 @@ assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_REQUESTS: "0" }).logging.requ
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_ASSETS: "1" }).logging.assets, true);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_TOOL_CALLS: "0" }).logging.toolCalls, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_SHELL_COMMANDS: "1" }).logging.shellCommands, true);
-assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY: "1" }).logging.trustProxy, true);
+
+// Trust proxy regression coverage: disabled, one-hop, multi-hop, legacy compatibility
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY_HOPS: "0" }).logging.trustProxyHops, 0);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY_HOPS: "1" }).logging.trustProxyHops, 1);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY_HOPS: "2" }).logging.trustProxyHops, 2);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY: "1" }).logging.trustProxyHops, 1);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY: "true" }).logging.trustProxyHops, 1);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY: "0" }).logging.trustProxyHops, 0);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY: "false" }).logging.trustProxyHops, 0);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY_HOPS: "3", DEVSPACE_TRUST_PROXY: "1" }).logging.trustProxyHops,
+  3,
+);
+
+// Fail closed on invalid trust proxy values
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY_HOPS: "invalid" }),
+  /Invalid DEVSPACE_TRUST_PROXY_HOPS: invalid/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY_HOPS: "-1" }),
+  /Invalid DEVSPACE_TRUST_PROXY_HOPS: -1/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY_HOPS: "true" }),
+  /Invalid DEVSPACE_TRUST_PROXY_HOPS: true/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY_HOPS: "1.5" }),
+  /Invalid DEVSPACE_TRUST_PROXY_HOPS: 1.5/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY: "invalid" }),
+  /Invalid DEVSPACE_TRUST_PROXY: invalid/,
+);
 
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_LOG_LEVEL: "trace" }),
@@ -280,3 +316,40 @@ assert.deepEqual(fileConfig.allowedHosts, [
   "::1",
   "devspace.example.com",
 ]);
+
+// Regression coverage for requestIp client-IP trust semantics and Express trust proxy config
+{
+  const mockReqExpress = {
+    ip: "2.2.2.2",
+    header: (name: string) => (name.toLowerCase() === "x-forwarded-for" ? "1.1.1.1, 2.2.2.2" : undefined),
+    socket: { remoteAddress: "127.0.0.1" },
+  } as any;
+  assert.equal(requestIp(mockReqExpress), "2.2.2.2");
+
+  const mockReqSpoofed = {
+    ip: undefined,
+    header: (name: string) => {
+      const lower = name.toLowerCase();
+      if (lower === "x-forwarded-for") return "1.1.1.1, 2.2.2.2";
+      if (lower === "cf-connecting-ip") return "9.9.9.9";
+      return undefined;
+    },
+    socket: { remoteAddress: "127.0.0.1" },
+  } as any;
+  assert.equal(requestIp(mockReqSpoofed), "127.0.0.1");
+
+  const appDisabled = express();
+  appDisabled.set("trust proxy", false);
+  assert.equal(appDisabled.get("trust proxy"), false);
+
+  const appHops1 = express();
+  const hopsConfig1 = loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY_HOPS: "1" });
+  if (hopsConfig1.logging.trustProxyHops > 0) {
+    appHops1.set("trust proxy", hopsConfig1.logging.trustProxyHops);
+  } else {
+    appHops1.set("trust proxy", false);
+  }
+  const trustProxySetting = appHops1.get("trust proxy");
+  assert.notEqual(trustProxySetting, true);
+  assert.ok(typeof trustProxySetting === "function" || trustProxySetting === 1);
+}
