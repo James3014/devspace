@@ -400,6 +400,20 @@ import { tmpdir } from "node:os";
 const mockAgySource = `#!/usr/bin/env node
 const args = process.argv.slice(2);
 
+// Secret leak check (Sentinel)
+if (process.env.DEVSPACE_OAUTH_OWNER_TOKEN) {
+  console.error("LEAKED_SECRET_FOUND: DEVSPACE_OAUTH_OWNER_TOKEN is present!");
+  process.exit(98);
+}
+if (process.env.DEVSPACE_OAUTH_SCOPES) {
+  console.error("LEAKED_SECRET_FOUND: DEVSPACE_OAUTH_SCOPES is present!");
+  process.exit(98);
+}
+if (process.env.DEVSPACE_SENSITIVE_SECRET) {
+  console.error("LEAKED_SECRET_FOUND: DEVSPACE_SENSITIVE_SECRET is present!");
+  process.exit(98);
+}
+
 if (args.includes("--dangerously-skip-permissions")) {
   process.exit(99);
 }
@@ -447,13 +461,19 @@ const tempMockPath = join(tmpdir(), `mock-agy-${Date.now()}.js`);
 writeFileSync(tempMockPath, mockAgySource, { mode: 0o755 });
 
 try {
-  const testEnv = { ...process.env, AGY_COMMAND: tempMockPath };
+  const testEnv = {
+    ...process.env,
+    AGY_COMMAND: tempMockPath,
+    DEVSPACE_OAUTH_OWNER_TOKEN: "DO_NOT_LEAK",
+    DEVSPACE_OAUTH_SCOPES: "devspace",
+    DEVSPACE_SENSITIVE_SECRET: "DO_NOT_LEAK",
+  };
   const originalEnv = process.env;
   process.env = testEnv;
 
   const adapter = createLocalAgentAdapter("agy");
 
-  // A. 新會話測試
+  // A. 新會話測試 (同時也驗證了環境變數隔離，如果隔離失敗，mockAgy 會以 98 退出，此處會拋出異常)
   {
     const result = await adapter.run({
       prompt: "hello-task",
@@ -536,6 +556,42 @@ try {
     }),
     /missing response content/,
   );
+
+  // I. Focused Test - Timeout clearance and resource disposal on exit
+  {
+    const createdTimers = new Set<NodeJS.Timeout>();
+    const clearedTimers = new Set<NodeJS.Timeout>();
+
+    const originalSetTimeout = global.setTimeout;
+    const originalClearTimeout = global.clearTimeout;
+
+    global.setTimeout = ((cb: any, ms: number, ...args: any[]) => {
+      const timer = originalSetTimeout(cb, ms, ...args);
+      createdTimers.add(timer);
+      return timer;
+    }) as any;
+
+    global.clearTimeout = ((timer: any) => {
+      if (timer) clearedTimers.add(timer);
+      originalClearTimeout(timer);
+    }) as any;
+
+    try {
+      await adapter.run({
+        prompt: "hello-timer-test",
+        workspace: process.cwd(),
+        writeMode: "read_only",
+      });
+    } finally {
+      global.setTimeout = originalSetTimeout;
+      global.clearTimeout = originalClearTimeout;
+    }
+
+    assert.ok(createdTimers.size > 0, "Expected at least one timer to be created");
+    for (const timer of createdTimers) {
+      assert.ok(clearedTimers.has(timer), "Expected timer to be cleared on exit");
+    }
+  }
 
   process.env = originalEnv;
 } finally {

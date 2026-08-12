@@ -100,6 +100,31 @@ class ClaudeLocalAgentAdapter implements LocalAgentAdapter {
   }
 }
 
+export function agyCommandEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const next = { ...env };
+  const keysToRemove = [
+    "DEVSPACE_OAUTH_OWNER_TOKEN",
+    "DEVSPACE_OAUTH_SCOPES",
+  ];
+  for (const key of keysToRemove) {
+    delete next[key];
+  }
+  for (const key of Object.keys(next)) {
+    const upper = key.toUpperCase();
+    if (
+      upper.startsWith("DEVSPACE_") &&
+      (upper.includes("TOKEN") ||
+       upper.includes("SECRET") ||
+       upper.includes("AUTH") ||
+       upper.includes("KEY") ||
+       upper.includes("PASSWORD"))
+    ) {
+      delete next[key];
+    }
+  }
+  return next;
+}
+
 class AgyLocalAgentAdapter implements LocalAgentAdapter {
   readonly provider = "agy" as const;
 
@@ -129,7 +154,7 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
 
     const child = spawn(agyExecutable, args, {
       cwd: input.workspace,
-      env: process.env,
+      env: agyCommandEnvironment(process.env),
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -152,9 +177,14 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
       });
     });
 
+    let timeoutId: NodeJS.Timeout | undefined;
+
     const timeoutPromise = new Promise<never>((_, reject) => {
-      setTimeout(() => {
-        child.kill();
+      timeoutId = setTimeout(async () => {
+        child.kill("SIGTERM");
+        try {
+          await exitPromise;
+        } catch {}
         reject(new Error("Agy execution timed out after 250 seconds."));
       }, 250_000);
     });
@@ -162,8 +192,10 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
     let exitInfo: { code: number | null; signal: NodeJS.Signals | null };
     try {
       exitInfo = await Promise.race([exitPromise, timeoutPromise]);
-    } catch (error) {
-      throw error;
+    } finally {
+      if (timeoutId) {
+        clearTimeout(timeoutId);
+      }
     }
 
     if (exitInfo.code !== 0) {
