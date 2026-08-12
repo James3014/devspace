@@ -154,6 +154,7 @@ class OpencodeLocalAgentAdapter implements LocalAgentAdapter {
 
 class OpencodeHarnessRuntime implements HarnessRuntime {
   private closed = false;
+  private failed = false;
 
   constructor(
     private readonly client: unknown,
@@ -162,24 +163,32 @@ class OpencodeHarnessRuntime implements HarnessRuntime {
 
   async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
     if (this.closed) throw new Error("OpenCode runtime is closed.");
-    const sessionId = input.providerSessionId ?? await createOpencodeSession(this.client, input);
-    const promptResult = await promptOpencodeSession(this.client, sessionId, input);
-    await waitForOpencodeSession(this.client, sessionId);
-    const messages = await readOpencodeMessages(this.client, sessionId);
-    const finalResponse = requireFinalResponse(
-      "OpenCode",
-      extractOpenCodeFinalResponse(messages) || extractOpenCodeFinalResponse(promptResult),
-    );
-    return {
-      provider: "opencode",
-      providerSessionId: sessionId,
-      finalResponse,
-      items: [promptResult, messages],
-    };
+    try {
+      const sessionId = input.providerSessionId ?? await createOpencodeSession(this.client, input);
+      const promptResult = await promptOpencodeSession(this.client, sessionId, input);
+      await waitForOpencodeSession(this.client, sessionId);
+      const messages = await readOpencodeMessages(this.client, sessionId);
+      const finalResponse = requireFinalResponse(
+        "OpenCode",
+        extractOpenCodeFinalResponse(messages) || extractOpenCodeFinalResponse(promptResult),
+      );
+      return {
+        provider: "opencode",
+        providerSessionId: sessionId,
+        finalResponse,
+        items: [promptResult, messages],
+      };
+    } catch (error) {
+      // The SDK does not expose the child server's exit state. Treat a failed
+      // turn as poisoning this pooled runtime so the next turn gets a fresh
+      // server instead of repeatedly reusing a dead transport.
+      this.failed = true;
+      throw error;
+    }
   }
 
   isUsable(): boolean {
-    return !this.closed;
+    return !this.closed && !this.failed;
   }
 
   async close(): Promise<void> {

@@ -31,6 +31,22 @@ class FakeRuntime implements HarnessRuntime {
   }
 }
 
+class FailingRuntime extends FakeRuntime {
+  failed = false;
+
+  override async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
+    if (input.prompt === "fail") {
+      this.failed = true;
+      throw new Error("runtime transport failed");
+    }
+    return super.run(input);
+  }
+
+  override isUsable(): boolean {
+    return !this.closed && !this.failed;
+  }
+}
+
 let now = 0;
 let created = 0;
 const runtimes: FakeRuntime[] = [];
@@ -69,6 +85,35 @@ try {
   assert.equal(runtimes[1]?.prompts[0], "third");
 } finally {
   await registry.shutdown();
+}
+
+{
+  let failureCreates = 0;
+  const failedRuntimes: FailingRuntime[] = [];
+  const failureDriver: HarnessDriver = {
+    provider: "opencode",
+    runtimeKey: () => "failure-recovery",
+    async createRuntime() {
+      const runtime = new FailingRuntime(`failure-runtime-${++failureCreates}`);
+      failedRuntimes.push(runtime);
+      return runtime;
+    },
+  };
+  const failurePool = new HarnessRuntimePool({ reapIntervalMs: 0 });
+
+  try {
+    await assert.rejects(
+      failurePool.run(failureDriver, input("/tmp/a", "fail")),
+      /runtime transport failed/,
+    );
+    assert.equal(failedRuntimes[0]?.closed, true, "an unusable failed runtime should be evicted immediately");
+
+    const recovered = await failurePool.run(failureDriver, input("/tmp/a", "recover"));
+    assert.equal(failureCreates, 2, "the next turn should create a fresh runtime after a transport failure");
+    assert.equal(recovered.finalResponse, "failure-runtime-2:recover");
+  } finally {
+    await failurePool.shutdown();
+  }
 }
 
 function input(workspace: string, prompt: string, providerSessionId?: string): LocalAgentRunInput {
