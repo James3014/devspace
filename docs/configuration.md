@@ -154,8 +154,9 @@ workspace environment injected into shell commands. The `subagent-delegation`
 skill teaches the model to use only the minimal `devspace agents ls`,
 `devspace agents run`, and `devspace agents show` workflow.
 `devspace agents run` submits work to the running DevSpace server so subagent
-execution can reuse long-lived provider resources; start `devspace serve` before
-using the agent commands directly from another terminal.
+execution can reuse long-lived provider resources. Start `devspace serve` with
+`DEVSPACE_SUBAGENTS=1` before using the agent commands directly from another
+terminal.
 
 Starter profile templates are available under `examples/agents/`. Copy or adapt
 them into one of the active profile directories before use.

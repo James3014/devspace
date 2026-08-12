@@ -1882,26 +1882,33 @@ export function createServer(
   });
 
   let closePromise: Promise<void> | undefined;
+  const close = () => {
+    closePromise ??= (async () => {
+      clearInterval(sessionCleanupTimer);
+      const results = await transports.closeAll();
+      logSessionCloseResults("server_shutdown", results);
+      processSessions.shutdown();
+      await localAgentControl?.close();
+      await localAgentManager?.shutdown();
+      oauthProvider.close();
+      workspaceStore.close?.();
+    })();
+    return closePromise;
+  };
+
   return {
     app,
     config,
     localAgentProviders,
     startAgentControl: async () => {
-      await localAgentControl?.start();
+      try {
+        await localAgentControl?.start();
+      } catch (error) {
+        await close().catch(() => undefined);
+        throw error;
+      }
     },
-    close: () => {
-      closePromise ??= (async () => {
-        clearInterval(sessionCleanupTimer);
-        const results = await transports.closeAll();
-        logSessionCloseResults("server_shutdown", results);
-        processSessions.shutdown();
-        await localAgentControl?.close();
-        await localAgentManager?.shutdown();
-        oauthProvider.close();
-        workspaceStore.close?.();
-      })();
-      return closePromise;
-    },
+    close,
   };
 }
 
