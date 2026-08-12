@@ -1,5 +1,4 @@
 import type { ServerConfig } from "./config.js";
-import { runLocalAgentProvider } from "./local-agent-adapters.js";
 import { assertLocalAgentProviderAvailable } from "./local-agent-availability.js";
 import {
   isLocalAgentProvider,
@@ -15,7 +14,7 @@ import {
   type LocalAgentRecord,
   type LocalAgentStore,
 } from "./local-agent-store.js";
-import type { LocalAgentRunResult } from "./local-agent-runtime.js";
+import type { LocalAgentRunInput, LocalAgentRunResult } from "./local-agent-runtime.js";
 import { assertAllowedPath } from "./roots.js";
 
 export interface LocalAgentRunCommand {
@@ -29,12 +28,12 @@ export interface LocalAgentRunCommand {
 
 type RunProvider = (
   provider: LocalAgentProfile["provider"],
-  input: Parameters<typeof runLocalAgentProvider>[1],
+  input: LocalAgentRunInput,
 ) => Promise<LocalAgentRunResult>;
 
 interface LocalAgentManagerOptions {
   store?: LocalAgentStore;
-  runProvider?: RunProvider;
+  runProvider: RunProvider;
   assertProviderAvailable?: typeof assertLocalAgentProviderAvailable;
 }
 
@@ -64,10 +63,10 @@ export class LocalAgentManager {
 
   constructor(
     private readonly config: ServerConfig,
-    options: LocalAgentManagerOptions = {},
+    options: LocalAgentManagerOptions,
   ) {
     this.store = options.store ?? createLocalAgentStore(config);
-    this.runProvider = options.runProvider ?? runLocalAgentProvider;
+    this.runProvider = options.runProvider;
     this.assertProviderAvailable = options.assertProviderAvailable ?? assertLocalAgentProviderAvailable;
   }
 
