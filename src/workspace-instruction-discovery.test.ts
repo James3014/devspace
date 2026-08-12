@@ -82,3 +82,21 @@ test("instruction discovery discards partial results when its count or byte budg
     paths: [],
   });
 });
+
+test("instruction discovery reports an exhausted deadline without returning partial paths", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-instruction-deadline-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  assert.deepEqual(
+    await discoverInstructionPaths(root, {
+      finder: "node",
+      limits: { maxDurationMs: 0 },
+    }),
+    {
+      status: "incomplete",
+      finder: "node",
+      reason: "deadline_exceeded",
+      paths: [],
+    },
+  );
+});

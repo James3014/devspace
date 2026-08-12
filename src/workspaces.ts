@@ -27,7 +27,15 @@ import {
   loadLocalAgentProfiles,
   type LocalAgentProfile,
 } from "./local-agent-profiles.js";
-import { discoverInstructionPaths } from "./workspace-instruction-discovery.js";
+import {
+  discoverInstructionPaths,
+  type IncompleteInstructionDiscoveryReason,
+  type InstructionPathFinder,
+} from "./workspace-instruction-discovery.js";
+
+const MAX_NESTED_INSTRUCTION_FILES = 100;
+const MAX_NESTED_INSTRUCTION_PATH_BYTES = 16 * 1024;
+const MAX_NESTED_INSTRUCTION_DISCOVERY_MS = 2_000;
 
 export interface LoadedAgentsFile {
   path: string;
@@ -36,6 +44,22 @@ export interface LoadedAgentsFile {
 
 export interface AvailableAgentsFile {
   path: string;
+}
+
+export type WorkspaceInstructionDiscovery =
+  | {
+      status: "complete";
+      finder: InstructionPathFinder;
+    }
+  | {
+      status: "incomplete";
+      finder: InstructionPathFinder;
+      reason: IncompleteInstructionDiscoveryReason;
+    };
+
+interface WorkspaceInstructionSnapshot {
+  availableAgentsFiles: AvailableAgentsFile[];
+  discovery: WorkspaceInstructionDiscovery;
 }
 
 export interface WorkspaceWorktree {
@@ -57,12 +81,14 @@ export interface Workspace {
   skillDiagnostics: LoadedSkills["diagnostics"];
   agentProfiles: LocalAgentProfile[];
   activatedSkillDirs: Set<string>;
+  instructionSnapshot?: WorkspaceInstructionSnapshot;
 }
 
 export interface WorkspaceContext {
   workspace: Workspace;
   agentsFiles: LoadedAgentsFile[];
   availableAgentsFiles: AvailableAgentsFile[];
+  instructionDiscovery: WorkspaceInstructionDiscovery;
   workspaceReused: boolean;
   includeBootstrapContext: boolean;
 }
@@ -232,12 +258,15 @@ export class WorkspaceRegistry {
   private async reusedWorkspaceContext(workspace: Workspace): Promise<WorkspaceContext> {
     workspace.agentProfiles = await loadLocalAgentProfiles(this.config, workspace.root);
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
-    const availableAgentsFiles = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
+    const snapshot = workspace.instructionSnapshot
+      ?? await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
+    workspace.instructionSnapshot = snapshot;
 
     return {
       workspace,
       agentsFiles,
-      availableAgentsFiles,
+      availableAgentsFiles: snapshot.availableAgentsFiles,
+      instructionDiscovery: snapshot.discovery,
       workspaceReused: true,
       includeBootstrapContext: true,
     };
@@ -379,12 +408,14 @@ export class WorkspaceRegistry {
     });
     this.workspaces.set(workspace.id, workspace);
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
-    const availableAgentsFiles = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
+    const snapshot = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
+    workspace.instructionSnapshot = snapshot;
 
     return {
       workspace,
       agentsFiles,
-      availableAgentsFiles,
+      availableAgentsFiles: snapshot.availableAgentsFiles,
+      instructionDiscovery: snapshot.discovery,
       workspaceReused: false,
       includeBootstrapContext: true,
     };
@@ -439,23 +470,41 @@ export class WorkspaceRegistry {
   private async findAvailableAgentsFiles(
     root: string,
     loadedFiles: LoadedAgentsFile[],
-  ): Promise<AvailableAgentsFile[]> {
+  ): Promise<WorkspaceInstructionSnapshot> {
     const loadedPaths = new Set(loadedFiles.map((file) => resolve(file.path)));
     const loadedRealPaths = new Set<string>();
     for (const file of loadedFiles) {
       const realPath = await tryRealpath(file.path);
       if (realPath) loadedRealPaths.add(realPath);
     }
-    const discovery = await discoverInstructionPaths(root, { excludedPaths: loadedPaths });
-    const discovered: AvailableAgentsFile[] = [];
-    for (const path of discovery.paths) {
-      const realPath = await tryRealpath(path);
-      if (realPath && loadedRealPaths.has(realPath)) continue;
-
-      discovered.push({ path });
+    const discovery = await discoverInstructionPaths(root, {
+      excludedPaths: loadedPaths,
+      limits: {
+        maxFiles: MAX_NESTED_INSTRUCTION_FILES,
+        maxPathBytes: MAX_NESTED_INSTRUCTION_PATH_BYTES,
+        maxDurationMs: MAX_NESTED_INSTRUCTION_DISCOVERY_MS,
+      },
+    });
+    if (discovery.status === "incomplete") {
+      return {
+        availableAgentsFiles: [],
+        discovery: {
+          status: "incomplete",
+          finder: discovery.finder,
+          reason: discovery.reason,
+        },
+      };
     }
 
-    return discovered;
+    const candidates = await Promise.all(
+      discovery.paths.map(async (path) => ({ path, realPath: await tryRealpath(path) })),
+    );
+    return {
+      availableAgentsFiles: candidates
+        .filter(({ realPath }) => !realPath || !loadedRealPaths.has(realPath))
+        .map(({ path }) => ({ path })),
+      discovery: { status: "complete", finder: discovery.finder },
+    };
   }
 }
 
