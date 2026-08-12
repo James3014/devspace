@@ -63,6 +63,19 @@ class BlockingReapRuntime extends FakeRuntime {
   }
 }
 
+class BlockingRunRuntime extends FakeRuntime {
+  readonly runStarted = deferred<void>();
+  readonly finishRun = deferred<void>();
+
+  override async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
+    if (input.prompt === "hold") {
+      this.runStarted.resolve();
+      await this.finishRun.promise;
+    }
+    return super.run(input);
+  }
+}
+
 let now = 0;
 let created = 0;
 const runtimes: FakeRuntime[] = [];
@@ -197,6 +210,36 @@ try {
     assert.equal(result.finalResponse, "reap-runtime-2:during reap");
   } finally {
     await racePool.shutdown();
+  }
+}
+
+{
+  let deferredNow = 0;
+  const runtime = new BlockingRunRuntime("deferred-reap");
+  const deferredDriver: HarnessDriver = {
+    provider: "opencode",
+    runtimeKey: () => "deferred-reap",
+    createRuntime: async () => runtime,
+  };
+  const deferredPool = new HarnessRuntimePool({ idleMs: 100, reapIntervalMs: 0, now: () => deferredNow });
+
+  try {
+    const activeRun = deferredPool.run(deferredDriver, input("/tmp/a", "hold"));
+    await runtime.runStarted.promise;
+    deferredNow = 10;
+    await deferredPool.reapIdle();
+    assert.deepEqual(runtime.reaps, [], "maintenance must not overlap an active provider turn");
+
+    runtime.finishRun.resolve();
+    await activeRun;
+    await immediate();
+    assert.deepEqual(
+      runtime.reaps,
+      [10],
+      "a reap requested during activity should run when the runtime next becomes idle",
+    );
+  } finally {
+    await deferredPool.shutdown();
   }
 }
 

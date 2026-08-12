@@ -27,6 +27,7 @@ type RuntimeSlot =
       activeRuns: number;
       lastUsedAt: number;
       maintenance?: Promise<void>;
+      reapRequested: boolean;
     };
 
 interface HarnessRuntimePoolOptions {
@@ -74,6 +75,14 @@ export class HarnessRuntimePool {
       if (slot.activeRuns === 0 && !slot.runtime.isUsable()) {
         if (this.slots.get(key) === slot) this.slots.delete(key);
         await slot.runtime.close().catch(() => undefined);
+      } else if (
+        slot.activeRuns === 0
+        && slot.reapRequested
+        && !slot.maintenance
+        && this.slots.get(key) === slot
+      ) {
+        slot.reapRequested = false;
+        this.beginMaintenance(key, slot, this.now());
       }
     }
   }
@@ -81,16 +90,13 @@ export class HarnessRuntimePool {
   async reapIdle(now = this.now()): Promise<void> {
     const maintenance: Promise<void>[] = [];
     for (const [key, slot] of this.slots) {
-      if (slot.status !== "ready" || slot.activeRuns > 0 || slot.maintenance) continue;
-      const task = this.maintainSlot(key, slot, now);
-      slot.maintenance = task;
-      maintenance.push((async () => {
-        try {
-          await task;
-        } finally {
-          if (slot.maintenance === task) slot.maintenance = undefined;
-        }
-      })());
+      if (slot.status !== "ready" || slot.maintenance) continue;
+      if (slot.activeRuns > 0) {
+        slot.reapRequested = true;
+        continue;
+      }
+      slot.reapRequested = false;
+      maintenance.push(this.beginMaintenance(key, slot, now));
     }
     await Promise.allSettled(maintenance);
   }
@@ -152,6 +158,7 @@ export class HarnessRuntimePool {
           runtime,
           activeRuns: 1,
           lastUsedAt: this.now(),
+          reapRequested: false,
         };
         this.slots.set(key, ready);
         return ready;
@@ -172,5 +179,18 @@ export class HarnessRuntimePool {
     if (now - slot.lastUsedAt < this.idleMs) return;
     this.slots.delete(key);
     await slot.runtime.close();
+  }
+
+  private beginMaintenance(
+    key: string,
+    slot: Extract<RuntimeSlot, { status: "ready" }>,
+    now: number,
+  ): Promise<void> {
+    const task = this.maintainSlot(key, slot, now);
+    slot.maintenance = task;
+    void task.finally(() => {
+      if (slot.maintenance === task) slot.maintenance = undefined;
+    }).catch(() => undefined);
+    return task;
   }
 }
