@@ -4,6 +4,7 @@ import { Readable, Writable } from "node:stream";
 import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
 import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
+import { resolveAgyExecutable } from "./local-agent-availability.js";
 import {
   createCodexSdkLocalAgentRuntime,
   type LocalAgentRunInput,
@@ -41,6 +42,8 @@ export function createLocalAgentAdapter(provider: LocalAgentProvider): LocalAgen
     case "cursor":
     case "copilot":
       return new AcpLocalAgentAdapter(provider, ACP_COMMANDS[provider]);
+    case "agy":
+      return new AgyLocalAgentAdapter();
   }
 }
 
@@ -93,6 +96,112 @@ class ClaudeLocalAgentAdapter implements LocalAgentAdapter {
       providerSessionId,
       finalResponse,
       items,
+    };
+  }
+}
+
+class AgyLocalAgentAdapter implements LocalAgentAdapter {
+  readonly provider = "agy" as const;
+
+  async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
+    const agyExecutable = resolveAgyExecutable(process.env);
+    if (!agyExecutable) {
+      throw new Error("Agy executable not found.");
+    }
+
+    const args: string[] = [];
+    if (input.providerSessionId) {
+      args.push("--conversation", input.providerSessionId);
+    }
+    if (input.model) {
+      args.push("--model", input.model);
+    }
+    if (input.thinking) {
+      args.push("--effort", input.thinking);
+    }
+    args.push("--sandbox");
+
+    const mode = input.writeMode === "allowed" ? "accept-edits" : "plan";
+    args.push("--mode", mode);
+    args.push("--output-format", "json");
+    args.push("--print-timeout", "240s");
+    args.push("--print", input.prompt);
+
+    const child = spawn(agyExecutable, args, {
+      cwd: input.workspace,
+      env: process.env,
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+
+    assertPipedChild(child);
+
+    let stdout = "";
+    let stderr = "";
+
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+
+    const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+      child.on("exit", (code, signal) => {
+        resolve({ code, signal });
+      });
+    });
+
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => {
+        child.kill();
+        reject(new Error("Agy execution timed out after 250 seconds."));
+      }, 250_000);
+    });
+
+    let exitInfo: { code: number | null; signal: NodeJS.Signals | null };
+    try {
+      exitInfo = await Promise.race([exitPromise, timeoutPromise]);
+    } catch (error) {
+      throw error;
+    }
+
+    if (exitInfo.code !== 0) {
+      throw new Error(
+        `Agy exited with non-zero code ${exitInfo.code ?? "null"} (signal: ${exitInfo.signal ?? "null"}). Stderr: ${stderr.trim()}`,
+      );
+    }
+
+    let parsed: any;
+    try {
+      parsed = JSON.parse(stdout.trim());
+    } catch (error) {
+      throw new Error(`Failed to parse Agy JSON output: ${errorMessage(error)}. Raw stdout: ${stdout}`);
+    }
+
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      throw new Error(`Agy JSON output is not an object. Raw stdout: ${stdout}`);
+    }
+
+    const { status, conversation_id, response } = parsed;
+
+    if (status !== "SUCCESS") {
+      throw new Error(`Agy execution status is not SUCCESS: ${status}. Full output: ${JSON.stringify(parsed)}`);
+    }
+
+    if (!conversation_id || typeof conversation_id !== "string") {
+      throw new Error(`Agy execution response is missing conversation_id or it is not a string.`);
+    }
+
+    if (!response || typeof response !== "string" || !response.trim()) {
+      throw new Error(`Agy execution response is missing response content or it is empty.`);
+    }
+
+    return {
+      provider: this.provider,
+      providerSessionId: conversation_id,
+      finalResponse: response.trim(),
+      items: [parsed],
     };
   }
 }

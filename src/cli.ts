@@ -489,7 +489,7 @@ async function runLocalAgentProfile(
     prompt: fullPrompt,
     workspace: record.workspaceRoot,
     providerSessionId: record.providerSessionId,
-    writeMode: "allowed",
+    writeMode: profile.write_mode === "allowed" ? "allowed" : "read_only",
     model: record.model ?? profile.model,
     thinking: record.thinking ?? profile.thinking,
   });
@@ -507,7 +507,7 @@ async function runRawLocalAgentProvider(
     prompt,
     workspace: record.workspaceRoot,
     providerSessionId: record.providerSessionId,
-    writeMode: "allowed",
+    writeMode: "read_only",
     model: record.model,
     thinking: record.thinking,
   });

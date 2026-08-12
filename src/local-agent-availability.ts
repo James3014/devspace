@@ -37,6 +37,8 @@ export function checkLocalAgentProviderAvailability(
       return commandAvailability(provider, "cursor-agent");
     case "copilot":
       return commandAvailability(provider, "copilot");
+    case "agy":
+      return checkAgyAvailability(env);
   }
 }
 
@@ -148,4 +150,31 @@ function piAvailabilityEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     ...env,
     PATH: removeDevspaceNodeModulesBinFromPath(path),
   };
+}
+
+export function resolveAgyExecutable(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (env.AGY_COMMAND) {
+    const resolved = resolveCommand(env.AGY_COMMAND, env);
+    if (resolved) return resolved;
+  }
+  const resolvedPath = resolveCommand("agy", env);
+  if (resolvedPath) return resolvedPath;
+
+  const fallback = "/Users/jameschen/.local/bin/agy";
+  if (executableExists(fallback, env)) {
+    return fallback;
+  }
+  return undefined;
+}
+
+function checkAgyAvailability(env: NodeJS.ProcessEnv): LocalAgentProviderAvailability {
+  const executable = resolveAgyExecutable(env);
+  if (!executable) {
+    return {
+      name: "agy",
+      available: false,
+      reason: "agy executable not found",
+    };
+  }
+  return { name: "agy", available: true };
 }

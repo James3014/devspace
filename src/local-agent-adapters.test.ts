@@ -21,6 +21,7 @@ const providers: LocalAgentProvider[] = [
   "pi",
   "cursor",
   "copilot",
+  "agy",
 ];
 
 for (const provider of providers) {
@@ -387,4 +388,158 @@ assert.equal(
   });
 
   assert.equal(env.PATH, [devspaceBin, "/home/user/.local/bin"].join(delimiter));
+}
+
+// ==========================================
+// Agy Local Agent Adapter Tests
+// ==========================================
+import { writeFileSync, chmodSync, unlinkSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+
+const mockAgySource = `#!/usr/bin/env node
+const args = process.argv.slice(2);
+
+if (args.includes("--dangerously-skip-permissions")) {
+  process.exit(99);
+}
+
+if (args.includes("--version")) {
+  console.log("1.1.12");
+  process.exit(0);
+}
+
+if (args.includes("--print")) {
+  const promptIdx = args.indexOf("--print") + 1;
+  const prompt = args[promptIdx];
+
+  if (prompt === "FORCE_ERROR") {
+    process.exit(1);
+  }
+  if (prompt === "MALFORMED_JSON") {
+    console.log("{malformed");
+    process.exit(0);
+  }
+  if (prompt === "STATUS_FAILED") {
+    console.log(JSON.stringify({ status: "FAILED", conversation_id: "123", response: "hello" }));
+    process.exit(0);
+  }
+  if (prompt === "MISSING_CONV") {
+    console.log(JSON.stringify({ status: "SUCCESS", response: "hello" }));
+    process.exit(0);
+  }
+  if (prompt === "MISSING_RESP") {
+    console.log(JSON.stringify({ status: "SUCCESS", conversation_id: "123" }));
+    process.exit(0);
+  }
+
+  const responseObj = {
+    status: "SUCCESS",
+    conversation_id: args.includes("--conversation") ? args[args.indexOf("--conversation") + 1] : "new-conv-id",
+    response: \`Processed: \${prompt} (mode=\${args[args.indexOf("--mode") + 1] || ""}, model=\${args[args.indexOf("--model") + 1] || ""}, effort=\${args[args.indexOf("--effort") + 1] || ""})\`,
+  };
+  console.log(JSON.stringify(responseObj));
+  process.exit(0);
+}
+`;
+
+const tempMockPath = join(tmpdir(), `mock-agy-${Date.now()}.js`);
+writeFileSync(tempMockPath, mockAgySource, { mode: 0o755 });
+
+try {
+  const testEnv = { ...process.env, AGY_COMMAND: tempMockPath };
+  const originalEnv = process.env;
+  process.env = testEnv;
+
+  const adapter = createLocalAgentAdapter("agy");
+
+  // A. 新會話測試
+  {
+    const result = await adapter.run({
+      prompt: "hello-task",
+      workspace: process.cwd(),
+      writeMode: "allowed",
+      model: "gemini-3.6",
+      thinking: "high",
+    });
+    assert.equal(result.provider, "agy");
+    assert.equal(result.providerSessionId, "new-conv-id");
+    assert.match(result.finalResponse, /Processed: hello-task/);
+    assert.match(result.finalResponse, /mode=accept-edits/);
+    assert.match(result.finalResponse, /model=gemini-3.6/);
+    assert.match(result.finalResponse, /effort=high/);
+  }
+
+  // B. 唯讀新會話測試
+  {
+    const result = await adapter.run({
+      prompt: "hello-task",
+      workspace: process.cwd(),
+      writeMode: "read_only",
+    });
+    assert.equal(result.providerSessionId, "new-conv-id");
+    assert.match(result.finalResponse, /mode=plan/);
+  }
+
+  // C. 恢復會話測試 (Resume)
+  {
+    const result = await adapter.run({
+      prompt: "resume-task",
+      workspace: process.cwd(),
+      providerSessionId: "existing-session-123",
+      writeMode: "allowed",
+    });
+    assert.equal(result.providerSessionId, "existing-session-123");
+  }
+
+  // D. 錯誤處理測試 - exit code != 0
+  await assert.rejects(
+    () => adapter.run({
+      prompt: "FORCE_ERROR",
+      workspace: process.cwd(),
+    }),
+    /Agy exited with non-zero code 1/,
+  );
+
+  // E. 錯誤處理測試 - Malformed JSON
+  await assert.rejects(
+    () => adapter.run({
+      prompt: "MALFORMED_JSON",
+      workspace: process.cwd(),
+    }),
+    /Failed to parse Agy JSON output/,
+  );
+
+  // F. 錯誤處理測試 - status != SUCCESS
+  await assert.rejects(
+    () => adapter.run({
+      prompt: "STATUS_FAILED",
+      workspace: process.cwd(),
+    }),
+    /Agy execution status is not SUCCESS/,
+  );
+
+  // G. 錯誤處理測試 - missing conversation_id
+  await assert.rejects(
+    () => adapter.run({
+      prompt: "MISSING_CONV",
+      workspace: process.cwd(),
+    }),
+    /missing conversation_id/,
+  );
+
+  // H. 錯誤處理測試 - missing response
+  await assert.rejects(
+    () => adapter.run({
+      prompt: "MISSING_RESP",
+      workspace: process.cwd(),
+    }),
+    /missing response content/,
+  );
+
+  process.env = originalEnv;
+} finally {
+  try {
+    unlinkSync(tempMockPath);
+  } catch {}
 }
