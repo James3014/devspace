@@ -64,6 +64,15 @@ try {
     prompt: "third",
   });
 
+  await assert.rejects(
+    runtime.run({
+      workspace: "/tmp/b",
+      prompt: "wrong workspace",
+      providerSessionId: first.providerSessionId ?? undefined,
+    }),
+    /belongs to workspace \/tmp\/a, not \/tmp\/b/,
+  );
+
   assert.equal(created, 2, "one in-process Pi runtime should retain active logical sessions");
   assert.equal(first.providerSessionId, "pi_1");
   assert.equal(second.providerSessionId, "pi_1");

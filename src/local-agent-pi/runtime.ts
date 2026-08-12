@@ -17,7 +17,7 @@ type PiSessionFactory = (
 ) => Promise<PiSessionLike>;
 
 export class PiHarnessRuntime implements HarnessRuntime {
-  private readonly sessions = new Map<string, PiSessionLike>();
+  private readonly sessions = new Map<string, { workspace: string; session: PiSessionLike }>();
   private closed = false;
 
   constructor(private readonly createSession: PiSessionFactory) {}
@@ -48,17 +48,24 @@ export class PiHarnessRuntime implements HarnessRuntime {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    for (const session of this.sessions.values()) session.dispose();
+    for (const { session } of this.sessions.values()) session.dispose();
     this.sessions.clear();
   }
 
   private async ensureSession(input: LocalAgentRunInput): Promise<PiSessionLike> {
     if (input.providerSessionId) {
       const existing = this.sessions.get(input.providerSessionId);
-      if (existing) return existing;
+      if (existing) {
+        if (existing.workspace !== input.workspace) {
+          throw new Error(
+            `Pi session ${input.providerSessionId} belongs to workspace ${existing.workspace}, not ${input.workspace}.`,
+          );
+        }
+        return existing.session;
+      }
     }
     const session = await this.createSession(input, input.providerSessionId);
-    this.sessions.set(session.sessionId, session);
+    this.sessions.set(session.sessionId, { workspace: input.workspace, session });
     return session;
   }
 }
