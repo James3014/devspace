@@ -185,7 +185,7 @@ interface ServerFixture {
   close: () => Promise<void>;
 }
 
-async function fixture(t: TestContext, options: { git?: boolean } = {}): Promise<ServerFixture> {
+async function fixture(t: TestContext, options: { git?: boolean; subagents?: boolean } = {}): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
   const project = join(root, "project");
   const agentDir = join(root, "agent");
@@ -222,9 +222,15 @@ async function fixture(t: TestContext, options: { git?: boolean } = {}): Promise
     DEVSPACE_TOOL_MODE: "full",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
+    DEVSPACE_SUBAGENTS: options.subagents ? "true" : "false",
+    DEVSPACE_STATE_DIR: stateDir,
   });
   const store = new SqliteWorkspaceStore(stateDir);
   const workspaces = new WorkspaceRegistry(config, store);
+  const { LocalAgentSessionManager } = await import("./local-agent-sessions.js");
+  const agentSessionManager = config.subagents
+    ? new LocalAgentSessionManager(config, async () => {})
+    : undefined;
   const server = createMcpServer(
     config,
     workspaces,
@@ -232,6 +238,7 @@ async function fixture(t: TestContext, options: { git?: boolean } = {}): Promise
     new ProcessSessionManager(),
     [],
     [],
+    agentSessionManager,
   );
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "devspace-test-client", version: "1.0.0" });
@@ -301,3 +308,133 @@ function responseCard(result: Awaited<ReturnType<Client["callTool"]>>): Record<s
   assert.ok(card && typeof card === "object");
   return card as Record<string, unknown>;
 }
+
+test("subagents disabled: agent tools are absent", async (t) => {
+  const context = await fixture(t, { subagents: false });
+  const tools = await context.client.listTools();
+  const agentTools = tools.tools.filter((tool) => tool.name.startsWith("agent_"));
+  assert.equal(agentTools.length, 0);
+});
+
+test("subagents enabled: agent tools are present and functional", async (t) => {
+  const context = await fixture(t, { subagents: true });
+  const tools = await context.client.listTools();
+  const agentTools = tools.tools.filter((tool) => tool.name.startsWith("agent_"));
+  assert.equal(agentTools.length, 4);
+
+  const startTool = agentTools.find((tool) => tool.name === "agent_start");
+  const continueTool = agentTools.find((tool) => tool.name === "agent_continue");
+  const statusTool = agentTools.find((tool) => tool.name === "agent_status");
+  const listTool = agentTools.find((tool) => tool.name === "agent_list");
+
+  assert.ok(startTool);
+  assert.ok(continueTool);
+  assert.ok(statusTool);
+  assert.ok(listTool);
+
+  // Verify start annotations
+  assert.equal(startTool.annotations?.readOnlyHint, false);
+  assert.equal(startTool.annotations?.destructiveHint, true);
+  assert.equal(startTool.annotations?.idempotentHint, false);
+  assert.equal(startTool.annotations?.openWorldHint, true);
+
+  // Open workspace to get workspaceId
+  const openResult = await callOpen(context.client, context.project, "chat-1");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+  assert.ok(workspaceId);
+
+  // Schema Security Checks: verify no workspaceRoot or provider/profile leakage
+  const startProps = startTool.inputSchema.properties as Record<string, any>;
+  assert.equal(startProps.workspaceRoot, undefined);
+  assert.equal(startProps.provider, undefined);
+
+  const continueProps = continueTool.inputSchema.properties as Record<string, any>;
+  assert.equal(continueProps.workspaceRoot, undefined);
+  assert.equal(continueProps.provider, undefined);
+  assert.equal(continueProps.profile, undefined);
+
+  const statusProps = statusTool.inputSchema.properties as Record<string, any>;
+  assert.equal(statusProps.workspaceRoot, undefined);
+
+  const listProps = listTool.inputSchema.properties as Record<string, any>;
+  assert.equal(listProps.workspaceRoot, undefined);
+
+  // Call agent_start
+  const startResult = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "hello review tests",
+    },
+  });
+
+  const startStructured = startResult.structuredContent as Record<string, any>;
+  assert.ok(startStructured.agentId);
+  assert.equal(startStructured.status, "starting");
+  assert.equal(startStructured.profileName, "reviewer");
+
+  // Call agent_status
+  const statusResult = await context.client.callTool({
+    name: "agent_status",
+    arguments: {
+      workspaceId,
+      agentId: startStructured.agentId,
+      waitMs: 0,
+    },
+  });
+
+  const statusStructured = statusResult.structuredContent as Record<string, any>;
+  assert.equal(statusStructured.agentId, startStructured.agentId);
+  assert.equal(statusStructured.status, "starting");
+
+  // Call agent_list
+  const listResult = await context.client.callTool({
+    name: "agent_list",
+    arguments: {
+      workspaceId,
+      limit: 10,
+    },
+  });
+
+  const listStructured = listResult.structuredContent as { agents: any[] };
+  assert.equal(listStructured.agents.length, 1);
+  assert.equal(listStructured.agents[0].agentId, startStructured.agentId);
+  assert.equal(listStructured.agents[0].latestResponse, undefined); // Excluded
+
+  // Test agent_continue
+  // Update status to idle using a fresh store connection
+  const { LocalAgentStore } = await import("./local-agent-store.js");
+  const store = new LocalAgentStore(context.stateDir);
+  try {
+    store.update(startStructured.agentId, { status: "idle" });
+  } finally {
+    store.close();
+  }
+
+  const continueResult = await context.client.callTool({
+    name: "agent_continue",
+    arguments: {
+      workspaceId,
+      agentId: startStructured.agentId,
+      prompt: "hello follow up prompt",
+    },
+  });
+
+  const continueStructured = continueResult.structuredContent as Record<string, any>;
+  assert.equal(continueStructured.agentId, startStructured.agentId);
+  assert.equal(continueStructured.status, "starting");
+  assert.equal(continueStructured.continued, true);
+
+  // Verify list count is still 1 (no duplicate record created)
+  const listResultAfter = await context.client.callTool({
+    name: "agent_list",
+    arguments: {
+      workspaceId,
+      limit: 10,
+    },
+  });
+  const listStructuredAfter = listResultAfter.structuredContent as { agents: any[] };
+  assert.equal(listStructuredAfter.agents.length, 1);
+  assert.equal(listStructuredAfter.agents[0].agentId, startStructured.agentId);
+});

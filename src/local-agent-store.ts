@@ -200,7 +200,7 @@ export class LocalAgentStore {
     this.database.close();
   }
 
-  private getById(id: string): LocalAgentRecord | undefined {
+  getById(id: string): LocalAgentRecord | undefined {
     const row = this.database.sqlite
       .prepare("select * from local_agent_sessions where id = ?")
       .get(id) as LocalAgentRow | undefined;

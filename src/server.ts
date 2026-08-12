@@ -55,12 +55,20 @@ import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
-import { summarizeLocalAgentProfile } from "./local-agent-profiles.js";
+import { summarizeLocalAgentProfile, loadLocalAgentProfiles } from "./local-agent-profiles.js";
 import {
   formatLocalAgentProviderAvailabilitySummary,
   getLocalAgentProviderAvailabilitySnapshot,
   type LocalAgentProviderAvailability,
 } from "./local-agent-availability.js";
+import {
+  LocalAgentSessionManager,
+  AgentSessionError,
+  isTerminalStatus,
+  AGENT_STATUS_MAX_WAIT_MS,
+  AGENT_LIST_MAX_LIMIT,
+  AGENT_LIST_DEFAULT_LIMIT,
+} from "./local-agent-sessions.js";
 
 type Transport = StreamableHTTPServerTransport;
 // MCP clients can reconnect without closing the previous transport. Bound stale
@@ -196,8 +204,12 @@ function serverInstructions(config: ServerConfig): string {
       ? " If the turn successfully modifies files by creating, editing, overwriting, deleting, moving, or applying patches, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. Do not call it after every individual file change; do not skip it because individual file-change tools already returned diffs."
       : "";
 
+  const agentToolsInstruction = config.subagents
+    ? " Use agent_start to launch an advertised agent profile as a background subagent. Use agent_status to retrieve result or progress. Use agent_continue for evidence-guided repair in the same session. Use agent_list to inspect current workspace agent sessions. Do NOT use bash to call `devspace agents` when native agent tools are available."
+    : "";
+
   if (config.toolMode === "codex") {
-    return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Open it again when the workspaceId is invalid, the project changes, checkout/worktree mode changes, or another isolated worktree is needed. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}`;
+    return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Open it again when the workspaceId is invalid, the project changes, checkout/worktree mode changes, or another isolated worktree is needed. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}${agentToolsInstruction}`;
   }
 
   const inspection = config.toolMode !== "full"
@@ -210,7 +222,7 @@ function serverInstructions(config: ServerConfig): string {
 
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
 
-  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching to a different project folder, changing checkout/worktree mode, the workspaceId is rejected as unknown, or a new isolated worktree is requested. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}`;
+  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching to a different project folder, changing checkout/worktree mode, the workspaceId is rejected as unknown, or a new isolated worktree is requested. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}${agentToolsInstruction}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -261,6 +273,7 @@ const workspaceLocalAgentOutputSchema = z.object({
   provider: z.string(),
   model: z.string().optional(),
   thinking: z.string().optional(),
+  write_mode: z.enum(["read_only", "allowed"]).optional(),
   providerAvailable: z.boolean().optional(),
   providerUnavailableReason: z.string().optional(),
 });
@@ -701,6 +714,7 @@ export function createMcpServer(
   processSessions: ProcessSessionManager,
   localAgentProviders: LocalAgentProviderAvailability[],
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
+  agentSessionManager?: LocalAgentSessionManager,
 ): McpServer {
   const server = new McpServer(
     {
@@ -1557,9 +1571,13 @@ export function createMcpServer(
     toolNames.shell,
     {
       title: "Bash",
-      description: config.toolMode !== "full"
-        ? `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, search, file discovery, and directory inspection. In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use command-line tools such as grep, rg, find, ls, and tree for those read-only inspection actions. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read} for direct file reads. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`
-        : `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`,
+      description: config.subagents
+        ? (config.toolMode !== "full"
+          ? `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, search, file discovery, and directory inspection. In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use command-line tools such as grep, rg, find, ls, and tree for those read-only inspection actions. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read} for direct file reads. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication. Do not use bash to call \`devspace agents\` when native agent tools are available.`
+          : `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication. Do not use bash to call \`devspace agents\` when native agent tools are available.`)
+        : (config.toolMode !== "full"
+          ? `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, search, file discovery, and directory inspection. In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use command-line tools such as grep, rg, find, ls, and tree for those read-only inspection actions. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read} for direct file reads. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`
+          : `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`),
       inputSchema: {
         workspaceId: z
           .string()
@@ -1655,6 +1673,218 @@ export function createMcpServer(
     });
   }
 
+  // ── Native Agent MCP Tools (only when subagents enabled) ──────────────────
+  if (config.subagents && agentSessionManager) {
+    const AGENT_TOOL_ANNOTATIONS_WRITE = {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    };
+
+    registerAppTool(
+      server,
+      "agent_start",
+      {
+        title: "Start agent",
+        description:
+          "Start a bounded background subagent using an advertised agent profile in an already-open workspace. Returns immediately with a durable agent ID. Use agent_status to retrieve progress/result.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          profile: z.string().describe("Name of an advertised agent profile to run."),
+          prompt: z.string().describe("Task prompt for the agent."),
+        },
+        outputSchema: {
+          agentId: z.string(),
+          status: z.string(),
+          profileName: z.string(),
+          provider: z.string(),
+          model: z.string().optional(),
+          thinking: z.string().optional(),
+          workspaceId: z.string().optional(),
+          workspaceRoot: z.string(),
+          createdAt: z.string(),
+          updatedAt: z.string(),
+        },
+        _meta: {},
+        annotations: AGENT_TOOL_ANNOTATIONS_WRITE,
+      },
+      async ({ workspaceId, profile, prompt }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const profiles = await loadLocalAgentProfiles(config, workspace.root);
+        const output = await agentSessionManager.startAgent({
+          workspaceId,
+          workspaceRoot: workspace.root,
+          profileName: profile,
+          prompt,
+          profiles,
+        });
+        logToolCall(config, {
+          tool: "agent_start",
+          workspaceId,
+          success: true,
+          durationMs: 0,
+        });
+        return {
+          content: [textBlock(`Started agent ${output.agentId} (${output.profileName}). Use agent_status to check progress.`)],
+          structuredContent: output as unknown as Record<string, unknown>,
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
+      "agent_continue",
+      {
+        title: "Continue agent",
+        description:
+          "Continue one exact durable subagent session in the same physical workspace. Reuses the provider session/conversation and returns immediately.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          agentId: z.string().describe("Exact agent ID returned by agent_start."),
+          prompt: z.string().describe("Follow-up prompt for the agent."),
+        },
+        outputSchema: {
+          agentId: z.string(),
+          status: z.string(),
+          profileName: z.string(),
+          provider: z.string(),
+          model: z.string().optional(),
+          thinking: z.string().optional(),
+          workspaceId: z.string().optional(),
+          workspaceRoot: z.string(),
+          createdAt: z.string(),
+          updatedAt: z.string(),
+          continued: z.boolean(),
+        },
+        _meta: {},
+        annotations: AGENT_TOOL_ANNOTATIONS_WRITE,
+      },
+      async ({ workspaceId, agentId, prompt }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const output = await agentSessionManager.continueAgent({
+          workspaceId,
+          workspaceRoot: workspace.root,
+          agentId,
+          prompt,
+        });
+        logToolCall(config, {
+          tool: "agent_continue",
+          workspaceId,
+          success: true,
+          durationMs: 0,
+        });
+        return {
+          content: [textBlock(`Continuing agent ${output.agentId} (${output.profileName}). Use agent_status to check progress.`)],
+          structuredContent: output as unknown as Record<string, unknown>,
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
+      "agent_status",
+      {
+        title: "Agent status",
+        description:
+          "Retrieve the status and result of a durable subagent session. Optionally poll for up to waitMs milliseconds.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          agentId: z.string().describe("Exact agent ID returned by agent_start."),
+          waitMs: z
+            .number()
+            .int()
+            .min(0)
+            .max(AGENT_STATUS_MAX_WAIT_MS)
+            .optional()
+            .describe(`Milliseconds to poll for completion. Default 0, max ${AGENT_STATUS_MAX_WAIT_MS}.`),
+        },
+        outputSchema: {
+          agentId: z.string(),
+          workspaceId: z.string().optional(),
+          workspaceRoot: z.string(),
+          profileName: z.string(),
+          provider: z.string(),
+          model: z.string().optional(),
+          thinking: z.string().optional(),
+          providerSessionId: z.string().optional(),
+          status: z.string(),
+          terminal: z.boolean(),
+          latestResponse: z.string().optional(),
+          error: z.string().optional(),
+          createdAt: z.string(),
+          updatedAt: z.string(),
+        },
+        _meta: {},
+        annotations: { readOnlyHint: true },
+      },
+      async ({ workspaceId, agentId, waitMs }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const output = await agentSessionManager.getAgentStatus({
+          workspaceId,
+          workspaceRoot: workspace.root,
+          agentId,
+          waitMs,
+        });
+        const statusLine = output.terminal
+          ? `Agent ${agentId} is ${output.status}.`
+          : `Agent ${agentId} is ${output.status} (still running).`;
+        const responseLine = output.latestResponse ? `\nResponse: ${output.latestResponse}` : "";
+        const errorLine = output.error ? `\nError: ${output.error}` : "";
+        return {
+          content: [textBlock(`${statusLine}${responseLine}${errorLine}`)],
+          structuredContent: output as unknown as Record<string, unknown>,
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
+      "agent_list",
+      {
+        title: "List agents",
+        description:
+          "List recent durable subagent sessions in the current workspace. Use agent_status for full response/error retrieval.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          limit: z
+            .number()
+            .int()
+            .min(1)
+            .max(AGENT_LIST_MAX_LIMIT)
+            .optional()
+            .describe(`Maximum number of agents to return. Default ${AGENT_LIST_DEFAULT_LIMIT}, max ${AGENT_LIST_MAX_LIMIT}.`),
+        },
+        outputSchema: {
+          agents: z.array(
+            z.object({
+              agentId: z.string(),
+              profileName: z.string(),
+              provider: z.string(),
+              model: z.string().optional(),
+              thinking: z.string().optional(),
+              status: z.string(),
+              updatedAt: z.string(),
+            }),
+          ),
+        },
+        _meta: {},
+        annotations: { readOnlyHint: true },
+      },
+      async ({ workspaceId, limit }) => {
+        const workspace = workspaces.getWorkspace(workspaceId); // boundary check
+        const agents = agentSessionManager.listAgents({ workspaceId, workspaceRoot: workspace.root, limit });
+        const summary = agents.length === 0
+          ? "No agent sessions found for this workspace."
+          : `${agents.length} agent session(s) in this workspace.`;
+        return {
+          content: [textBlock(summary)],
+          structuredContent: { agents },
+        };
+      },
+    );
+  }
+
   return server;
 }
 
@@ -1691,6 +1921,9 @@ export function createServer(
   const localAgentProviders = config.subagents
     ? getLocalAgentProviderAvailabilitySnapshot()
     : [];
+  const agentSessionManager = config.subagents
+    ? new LocalAgentSessionManager(config)
+    : undefined;
 
   const logSessionCloseResults = (
     reason: "idle_timeout" | "server_shutdown",
