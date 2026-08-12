@@ -41,6 +41,25 @@ try {
   });
   await waitFor(() => calls.length === 1);
 
+  await assert.rejects(
+    manager.enqueue({
+      workspaceId: "ws_test",
+      workspaceRoot: join(root, "other-workspace"),
+      target: first.id,
+      prompt: "wrong workspace",
+    }),
+    /belongs to a different workspace/,
+  );
+
+  await assert.rejects(
+    manager.enqueue({
+      workspaceRoot: join(root, "..", "outside-root"),
+      target: "codex",
+      prompt: "outside",
+    }),
+    /outside allowed roots/,
+  );
+
   const queued = await manager.enqueue({
     workspaceId: "ws_test",
     workspaceRoot: root,

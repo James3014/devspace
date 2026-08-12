@@ -152,6 +152,23 @@ export class LocalAgentStore {
     return matches.length === 1 ? rowToLocalAgentRecord(matches[0]!) : undefined;
   }
 
+  getByAgentId(idOrPrefix: string): LocalAgentRecord | undefined {
+    const exact = this.database.sqlite
+      .prepare("select * from local_agent_sessions where id = ?")
+      .get(idOrPrefix) as LocalAgentRow | undefined;
+    if (exact) return rowToLocalAgentRecord(exact);
+
+    const matches = this.database.sqlite
+      .prepare(
+        `select * from local_agent_sessions
+         where id like ? escape '\\'
+         order by updated_at desc`,
+      )
+      .all(`${escapeLike(idOrPrefix)}%`) as LocalAgentRow[];
+
+    return matches.length === 1 ? rowToLocalAgentRecord(matches[0]!) : undefined;
+  }
+
   update(id: string, patch: Partial<Omit<LocalAgentRecord, "id" | "createdAt">>): LocalAgentRecord {
     const current = this.getById(id);
     if (!current) throw new Error(`Unknown subagent id: ${id}`);
