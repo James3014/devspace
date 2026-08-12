@@ -18,6 +18,7 @@ class FakePiSession {
 
   async prompt(text: string): Promise<void> {
     this.messages.push({ role: "user", content: [{ type: "text", text }] });
+    if (text === "silent") return;
     this.messages.push({
       role: "assistant",
       content: [{ type: "text", text: `response:${text}` }],
@@ -79,8 +80,62 @@ try {
   assert.equal(third.providerSessionId, "pi_2");
   assert.equal(first.finalResponse, "response:first");
   assert.equal(second.finalResponse, "response:second");
+  assert.equal(first.items.length, 2);
+  assert.equal(second.items.length, 2, "continued turns should return only messages produced by that turn");
   assert.equal(sessions.get("pi_1")?.selectedModel, "openai/gpt-test");
   assert.equal(sessions.get("pi_1")?.thinking, "high");
+
+  await assert.rejects(
+    runtime.run({
+      workspace: "/tmp/a",
+      prompt: "silent",
+      providerSessionId: first.providerSessionId ?? undefined,
+    }),
+    /completed without a final response/,
+  );
 } finally {
   await runtime.close();
+}
+
+{
+  let coldCreates = 0;
+  const creationGate = deferred<void>();
+  const coldRuntime = new PiHarnessRuntime(async (_input, providerSessionId) => {
+    coldCreates += 1;
+    await creationGate.promise;
+    return new FakePiSession(providerSessionId ?? `cold_${coldCreates}`);
+  });
+
+  try {
+    const first = coldRuntime.run({
+      workspace: "/tmp/a",
+      prompt: "first resume",
+      providerSessionId: "pi_existing",
+    });
+    const second = coldRuntime.run({
+      workspace: "/tmp/a",
+      prompt: "second resume",
+      providerSessionId: "pi_existing",
+    });
+    await immediate();
+    assert.equal(coldCreates, 1, "concurrent cold resumes of one Pi session should share session creation");
+    creationGate.resolve();
+    const [firstResult, secondResult] = await Promise.all([first, second]);
+    assert.equal(firstResult.finalResponse, "response:first resume");
+    assert.equal(secondResult.finalResponse, "response:second resume");
+  } finally {
+    await coldRuntime.close();
+  }
+}
+
+function deferred<T>(): { promise: Promise<T>; resolve(value?: T): void } {
+  let resolve!: (value?: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise as (value?: T) => void;
+  });
+  return { promise, resolve };
+}
+
+function immediate(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }

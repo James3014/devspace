@@ -16,28 +16,51 @@ type PiSessionFactory = (
   providerSessionId?: string,
 ) => Promise<PiSessionLike>;
 
+interface PiSessionEntry {
+  workspace: string;
+  session: PiSessionLike;
+  tail: Promise<void>;
+}
+
+type PiSessionSlot =
+  | { status: "starting"; workspace: string; promise: Promise<PiSessionEntry> }
+  | { status: "ready"; entry: PiSessionEntry };
+
 export class PiHarnessRuntime implements HarnessRuntime {
-  private readonly sessions = new Map<string, { workspace: string; session: PiSessionLike }>();
+  private readonly sessions = new Map<string, PiSessionSlot>();
   private closed = false;
 
   constructor(private readonly createSession: PiSessionFactory) {}
 
   async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
     if (this.closed) throw new Error("Pi runtime is closed.");
-    const session = await this.ensureSession(input);
+    const entry = await this.ensureSession(input);
+    const turn = entry.tail
+      .catch(() => undefined)
+      .then(() => this.runTurn(entry.session, input));
+    entry.tail = turn.then(() => undefined, () => undefined);
+    return turn;
+  }
+
+  private async runTurn(
+    session: PiSessionLike,
+    input: LocalAgentRunInput,
+  ): Promise<LocalAgentRunResult> {
     if (input.model) {
       await session.setModel(resolvePiModel(session.listModels(), input.model));
     }
     if (input.thinking) session.setThinkingLevel(input.thinking);
 
+    const startIndex = session.messages.length;
     await session.prompt(input.prompt);
-    const finalResponse = finalPiAssistantMessage(session.messages);
+    const turnMessages = session.messages.slice(startIndex);
+    const finalResponse = finalPiAssistantMessage(turnMessages);
     if (!finalResponse) throw new Error("Pi completed without a final response.");
     return {
       provider: "pi",
       providerSessionId: session.sessionId,
       finalResponse,
-      items: session.messages,
+      items: turnMessages,
     };
   }
 
@@ -48,26 +71,77 @@ export class PiHarnessRuntime implements HarnessRuntime {
   async close(): Promise<void> {
     if (this.closed) return;
     this.closed = true;
-    for (const { session } of this.sessions.values()) session.dispose();
+    const slots = Array.from(this.sessions.values());
     this.sessions.clear();
+
+    const entries = await Promise.all(slots.map(async (slot) => {
+      if (slot.status === "ready") return slot.entry;
+      return slot.promise.catch(() => undefined);
+    }));
+    let firstError: unknown;
+    for (const entry of entries) {
+      if (!entry) continue;
+      await entry.tail.catch(() => undefined);
+      try {
+        entry.session.dispose();
+      } catch (error) {
+        firstError ??= error;
+      }
+    }
+    if (firstError) throw firstError;
   }
 
-  private async ensureSession(input: LocalAgentRunInput): Promise<PiSessionLike> {
+  private async ensureSession(input: LocalAgentRunInput): Promise<PiSessionEntry> {
     if (input.providerSessionId) {
       const existing = this.sessions.get(input.providerSessionId);
       if (existing) {
-        if (existing.workspace !== input.workspace) {
+        const workspace = existing.status === "ready" ? existing.entry.workspace : existing.workspace;
+        if (workspace !== input.workspace) {
           throw new Error(
-            `Pi session ${input.providerSessionId} belongs to workspace ${existing.workspace}, not ${input.workspace}.`,
+            `Pi session ${input.providerSessionId} belongs to workspace ${workspace}, not ${input.workspace}.`,
           );
         }
-        return existing.session;
+        return existing.status === "ready" ? existing.entry : existing.promise;
+      }
+
+      let starting!: Extract<PiSessionSlot, { status: "starting" }>;
+      const promise = this.createSession(input, input.providerSessionId)
+        .then((session) => this.finishSessionStart(input.workspace, input.providerSessionId!, session, starting));
+      starting = { status: "starting", workspace: input.workspace, promise };
+      this.sessions.set(input.providerSessionId, starting);
+      try {
+        return await promise;
+      } catch (error) {
+        if (this.sessions.get(input.providerSessionId) === starting) {
+          this.sessions.delete(input.providerSessionId);
+        }
+        throw error;
       }
     }
+
     const session = await this.createSession(input, input.providerSessionId);
-    this.sessions.set(session.sessionId, { workspace: input.workspace, session });
-    return session;
+    const entry = createPiSessionEntry(input.workspace, session);
+    this.sessions.set(session.sessionId, { status: "ready", entry });
+    return entry;
   }
+
+  private finishSessionStart(
+    workspace: string,
+    requestedSessionId: string,
+    session: PiSessionLike,
+    starting: Extract<PiSessionSlot, { status: "starting" }>,
+  ): PiSessionEntry {
+    const entry = createPiSessionEntry(workspace, session);
+    if (this.sessions.get(requestedSessionId) === starting) {
+      this.sessions.delete(requestedSessionId);
+      this.sessions.set(session.sessionId, { status: "ready", entry });
+    }
+    return entry;
+  }
+}
+
+function createPiSessionEntry(workspace: string, session: PiSessionLike): PiSessionEntry {
+  return { workspace, session, tail: Promise.resolve() };
 }
 
 export function createPiHarnessDriver(): HarnessDriver {
