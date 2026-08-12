@@ -37,9 +37,10 @@ profile is needed. Built-in providers are listed by `open_workspace`.
 running, `show` waits briefly. If there is still no final response, call `show`
 again later.
 
-Do not run provider CLIs such as `codex`, `claude`, `opencode`, `pi`,
+Do not run provider executables such as `codex`, `claude`, `opencode`,
 `cursor-agent`, or `copilot` directly unless you are explicitly debugging
-DevSpace agent integration.
+DevSpace agent integration. Pi is embedded in DevSpace and should likewise be
+reached through `devspace agents`.
 
 ## Choosing a profile
 
