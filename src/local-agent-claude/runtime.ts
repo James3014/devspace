@@ -35,12 +35,17 @@ interface LiveClaudeQuery {
 export class ClaudeWarmRuntime implements HarnessRuntime {
   private live: LiveClaudeQuery | undefined;
   private providerSessionId: string | undefined;
+  private workspace: string | undefined;
   private closed = false;
 
   constructor(private readonly createQuery: ClaudeQueryFactory) {}
 
   async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
     if (this.closed) throw new Error("Claude runtime is closed.");
+    if (this.workspace && this.workspace !== input.workspace) {
+      throw new Error(`Claude agent runtime belongs to workspace ${this.workspace}, not ${input.workspace}.`);
+    }
+    this.workspace ??= input.workspace;
     this.providerSessionId = input.providerSessionId ?? this.providerSessionId;
 
     const live = this.ensureQuery(input);

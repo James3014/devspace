@@ -95,6 +95,18 @@ try {
   assert.deepEqual(efforts, ["high", "xhigh"]);
   assert.equal(changedEffort.providerSessionId, "claude_1");
   assert.equal(changedEffort.finalResponse, "response:third");
+
+  await assert.rejects(
+    runtime.run({
+      agentId: "agt_claude",
+      workspace: "/tmp/other-project",
+      prompt: "wrong workspace",
+      providerSessionId: changedEffort.providerSessionId ?? undefined,
+      thinking: "xhigh",
+    }),
+    /belongs to workspace \/tmp\/project, not \/tmp\/other-project/,
+  );
+  assert.equal(queries.length, 2, "workspace mismatch must not create or reuse a query in another cwd");
 } finally {
   await runtime.close();
 }
