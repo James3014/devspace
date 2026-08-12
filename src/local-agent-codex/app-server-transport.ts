@@ -154,8 +154,7 @@ class StdioCodexAppServerConnection implements CodexAppServerConnection {
     try {
       message = JSON.parse(line) as unknown;
     } catch {
-      this.usable = false;
-      this.failPending(new Error(`Codex app-server emitted invalid JSON: ${line.slice(0, 500)}`));
+      this.failConnection(new Error(`Codex app-server emitted invalid JSON: ${line.slice(0, 500)}`));
       return;
     }
     if (!isRecord(message)) return;
@@ -192,10 +191,9 @@ class StdioCodexAppServerConnection implements CodexAppServerConnection {
   private write(payload: unknown, reject?: (error: Error) => void): void {
     this.child.stdin.write(`${JSON.stringify(payload)}\n`, (error) => {
       if (!error) return;
-      this.usable = false;
       const wrapped = new Error(`Failed to write to Codex app-server: ${error.message}`);
       reject?.(wrapped);
-      this.failPending(wrapped);
+      this.failConnection(wrapped);
     });
   }
 
