@@ -30,11 +30,15 @@ interface TurnCompletion {
 export class CodexAppServerRuntime implements HarnessRuntime {
   private readonly pendingTurns = new Map<string, PendingTurn>();
   private readonly unsubscribe: () => void;
+  private readonly unsubscribeClose: () => void;
   private closed = false;
 
   constructor(private readonly connection: CodexAppServerConnection) {
     this.unsubscribe = connection.onNotification((method, params) => {
       this.handleNotification(method, params);
+    });
+    this.unsubscribeClose = connection.onClose((error) => {
+      this.rejectPendingTurns(error);
     });
   }
 
@@ -91,9 +95,9 @@ export class CodexAppServerRuntime implements HarnessRuntime {
     if (this.closed) return;
     this.closed = true;
     this.unsubscribe();
+    this.unsubscribeClose();
     const error = new Error("Codex app-server runtime closed.");
-    for (const pending of this.pendingTurns.values()) pending.reject(error);
-    this.pendingTurns.clear();
+    this.rejectPendingTurns(error);
     await this.connection.close();
   }
 
@@ -136,6 +140,11 @@ export class CodexAppServerRuntime implements HarnessRuntime {
     if (pending.turnId && pending.turnId !== completion.turnId) return;
     this.pendingTurns.delete(completion.threadId);
     pending.resolve(completion.result);
+  }
+
+  private rejectPendingTurns(error: Error): void {
+    for (const pending of this.pendingTurns.values()) pending.reject(error);
+    this.pendingTurns.clear();
   }
 }
 

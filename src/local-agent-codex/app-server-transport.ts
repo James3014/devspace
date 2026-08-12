@@ -1,7 +1,10 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { createInterface } from "node:readline";
 import { terminateProcessTree } from "../process-platform.js";
-import type { ResolvedCodexCommand } from "./command.js";
+import {
+  buildCodexProcessLaunch,
+  type ResolvedCodexCommand,
+} from "./command.js";
 
 const STDERR_LIMIT = 32_000;
 const SHUTDOWN_GRACE_MS = 2_000;
@@ -10,6 +13,7 @@ export interface CodexAppServerConnection {
   request(method: string, params?: unknown): Promise<unknown>;
   notify(method: string, params?: unknown): void;
   onNotification(handler: (method: string, params: unknown) => void): () => void;
+  onClose(handler: (error: Error) => void): () => void;
   isUsable(): boolean;
   close(): Promise<void>;
 }
@@ -44,27 +48,28 @@ class StdioCodexAppServerConnection implements CodexAppServerConnection {
   private readonly child: ChildProcessWithoutNullStreams;
   private readonly pending = new Map<string, PendingRequest>();
   private readonly notificationHandlers = new Set<(method: string, params: unknown) => void>();
+  private readonly closeHandlers = new Set<(error: Error) => void>();
   private readonly closePromise: Promise<void>;
   private nextRequestId = 1;
   private stderr = "";
   private usable = true;
   private closing = false;
+  private connectionFailure: Error | undefined;
 
   constructor(command: ResolvedCodexCommand) {
     const detached = process.platform !== "win32";
-    this.child = spawn(command.executable, ["app-server"], {
+    const launch = buildCodexProcessLaunch(command, ["app-server"]);
+    this.child = spawn(launch.executable, launch.args, {
       env: command.env,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
       detached,
-      shell: process.platform === "win32",
     });
 
     this.closePromise = new Promise<void>((resolve) => {
       this.child.once("close", (code, signal) => {
-        this.usable = false;
         const suffix = this.stderr.trim() ? `\n${this.stderr.trim()}` : "";
-        this.failPending(new Error(
+        this.failConnection(new Error(
           `Codex app-server exited${code !== null ? ` with code ${code}` : signal ? ` from ${signal}` : ""}.${suffix}`,
         ));
         resolve();
@@ -72,8 +77,7 @@ class StdioCodexAppServerConnection implements CodexAppServerConnection {
     });
 
     this.child.once("error", (error) => {
-      this.usable = false;
-      this.failPending(new Error(`Codex app-server failed to start: ${error.message}`));
+      this.failConnection(new Error(`Codex app-server failed to start: ${error.message}`));
     });
     this.child.stderr.on("data", (chunk: Buffer) => {
       this.stderr = takeTail(this.stderr + chunk.toString("utf8"), STDERR_LIMIT);
@@ -103,6 +107,16 @@ class StdioCodexAppServerConnection implements CodexAppServerConnection {
   onNotification(handler: (method: string, params: unknown) => void): () => void {
     this.notificationHandlers.add(handler);
     return () => this.notificationHandlers.delete(handler);
+  }
+
+  onClose(handler: (error: Error) => void): () => void {
+    if (this.connectionFailure) {
+      const failure = this.connectionFailure;
+      queueMicrotask(() => handler(failure));
+      return () => undefined;
+    }
+    this.closeHandlers.add(handler);
+    return () => this.closeHandlers.delete(handler);
   }
 
   isUsable(): boolean {
@@ -188,6 +202,15 @@ class StdioCodexAppServerConnection implements CodexAppServerConnection {
   private failPending(error: Error): void {
     for (const pending of this.pending.values()) pending.reject(error);
     this.pending.clear();
+  }
+
+  private failConnection(error: Error): void {
+    if (this.connectionFailure) return;
+    this.connectionFailure = error;
+    this.usable = false;
+    this.failPending(error);
+    for (const handler of this.closeHandlers) handler(error);
+    this.closeHandlers.clear();
   }
 }
 

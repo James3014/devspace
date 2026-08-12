@@ -5,9 +5,11 @@ import type { CodexAppServerConnection } from "./app-server-transport.js";
 class FakeCodexConnection implements CodexAppServerConnection {
   readonly requests: Array<{ method: string; params: unknown }> = [];
   private readonly handlers = new Set<(method: string, params: unknown) => void>();
+  private readonly closeHandlers = new Set<(error: Error) => void>();
   private threadCount = 0;
   private turnCount = 0;
   private usable = true;
+  autoCompleteTurns = true;
 
   async request(method: string, params?: unknown): Promise<unknown> {
     this.requests.push({ method, params });
@@ -23,7 +25,7 @@ class FakeCodexConnection implements CodexAppServerConnection {
       const threadId = stringValue(record?.threadId) ?? "missing";
       const prompt = firstPrompt(record?.input);
       const turnId = `turn_${++this.turnCount}`;
-      queueMicrotask(() => {
+      if (this.autoCompleteTurns) queueMicrotask(() => {
         this.emit("item/completed", {
           threadId,
           turnId,
@@ -55,12 +57,22 @@ class FakeCodexConnection implements CodexAppServerConnection {
     return () => this.handlers.delete(handler);
   }
 
+  onClose(handler: (error: Error) => void): () => void {
+    this.closeHandlers.add(handler);
+    return () => this.closeHandlers.delete(handler);
+  }
+
   isUsable(): boolean {
     return this.usable;
   }
 
   async close(): Promise<void> {
     this.usable = false;
+  }
+
+  emitClose(error: Error): void {
+    this.usable = false;
+    for (const handler of this.closeHandlers) handler(error);
   }
 
   private emit(method: string, params: unknown): void {
@@ -128,6 +140,24 @@ try {
   await runtime.close();
 }
 
+{
+  const closingConnection = new FakeCodexConnection();
+  closingConnection.autoCompleteTurns = false;
+  const closingRuntime = new CodexAppServerRuntime(closingConnection);
+  try {
+    const run = closingRuntime.run({
+      workspace: "/tmp/a",
+      prompt: "wait for close",
+      writeMode: "allowed",
+    });
+    await waitForRequest(closingConnection, "turn/start");
+    closingConnection.emitClose(new Error("Codex app-server exited unexpectedly."));
+    await assert.rejects(run, /exited unexpectedly/);
+  } finally {
+    await closingRuntime.close();
+  }
+}
+
 function firstPrompt(value: unknown): string {
   if (!Array.isArray(value)) return "";
   return stringValue(asRecord(value[0])?.text) ?? "";
@@ -141,4 +171,12 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+async function waitForRequest(connection: FakeCodexConnection, method: string): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (connection.requests.some((request) => request.method === method)) return;
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  throw new Error(`Timed out waiting for ${method}.`);
 }

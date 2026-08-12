@@ -4,6 +4,7 @@ import {
   formatLocalAgentProviderAvailabilitySummary,
   getLocalAgentProviderAvailabilitySnapshot,
 } from "./local-agent-availability.js";
+import { buildCodexProcessLaunch } from "./local-agent-codex/command.js";
 
 {
   const availability = checkLocalAgentProviderAvailability("codex", {
@@ -12,6 +13,41 @@ import {
   });
   assert.equal(availability.available, false);
   assert.match(availability.reason ?? "", /executable not found/);
+}
+
+{
+  const native = buildCodexProcessLaunch({
+    executable: "C:\\Program Files\\Codex\\codex.exe",
+    env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" },
+    runtimeKey: "native",
+  }, ["app-server"], "win32");
+  assert.deepEqual(native, {
+    executable: "C:\\Program Files\\Codex\\codex.exe",
+    args: ["app-server"],
+  });
+
+  const shim = buildCodexProcessLaunch({
+    executable: "C:\\Users\\me\\App Data\\npm\\codex.cmd",
+    env: { ComSpec: "C:\\Windows\\System32\\cmd.exe" },
+    runtimeKey: "shim",
+  }, ["app-server", "--help"], "win32");
+  assert.deepEqual(shim, {
+    executable: "C:\\Windows\\System32\\cmd.exe",
+    args: [
+      "/d",
+      "/s",
+      "/c",
+      '""C:\\Users\\me\\App Data\\npm\\codex.cmd" app-server --help"',
+    ],
+  });
+  assert.throws(
+    () => buildCodexProcessLaunch({
+      executable: "C:\\Users\\me&bad\\codex.cmd",
+      env: { ComSpec: "cmd.exe" },
+      runtimeKey: "unsafe",
+    }, ["app-server"], "win32"),
+    /cannot be launched safely/,
+  );
 }
 
 {
