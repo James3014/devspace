@@ -8,6 +8,10 @@ import {
 } from "./local-agent-manager.js";
 import type { LocalAgentRecord } from "./local-agent-store.js";
 
+const MAX_CONTROL_REQUEST_BYTES = 512 * 1024;
+const CONTROL_SOCKET_IDLE_TIMEOUT_MS = 30_000;
+const CONTROL_REQUEST_TIMEOUT_MS = 30_000;
+
 type ControlRequest = { type: "run"; command: LocalAgentRunCommand };
 type ControlResponse =
   | { ok: true; record: LocalAgentRecord }
@@ -19,6 +23,7 @@ export interface LocalAgentCommandHandler {
 
 export class LocalAgentControlServer {
   private server: Server | undefined;
+  private readonly sockets = new Set<Socket>();
 
   constructor(
     private readonly config: ServerConfig,
@@ -53,6 +58,8 @@ export class LocalAgentControlServer {
   async close(): Promise<void> {
     const server = this.server;
     this.server = undefined;
+    for (const socket of this.sockets) socket.destroy();
+    this.sockets.clear();
     if (server) {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
@@ -62,17 +69,29 @@ export class LocalAgentControlServer {
   }
 
   private handleConnection(socket: Socket): void {
+    this.sockets.add(socket);
+    socket.once("close", () => this.sockets.delete(socket));
+    socket.on("error", () => undefined);
+    socket.setTimeout(CONTROL_SOCKET_IDLE_TIMEOUT_MS, () => socket.destroy());
     socket.setEncoding("utf8");
     let input = "";
+    let handled = false;
     socket.on("data", (chunk: string) => {
+      if (handled) return;
       input += chunk;
+      if (Buffer.byteLength(input, "utf8") > MAX_CONTROL_REQUEST_BYTES) {
+        handled = true;
+        socket.end(`${JSON.stringify({ ok: false, error: "DevSpace subagent control request is too large." })}\n`);
+        return;
+      }
       const newline = input.indexOf("\n");
       if (newline === -1) return;
       const line = input.slice(0, newline);
+      handled = true;
       socket.pause();
       void this.handleLine(line).then((response) => {
-        socket.end(`${JSON.stringify(response)}\n`);
-      });
+        if (!socket.destroyed) socket.end(`${JSON.stringify(response)}\n`);
+      }).catch(() => socket.destroy());
     });
   }
 
@@ -110,8 +129,18 @@ async function requestControl(address: string, request: ControlRequest): Promise
     const socket = createConnection(address);
     socket.setEncoding("utf8");
     let response = "";
+    let settled = false;
+    const fail = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      reject(error);
+    };
+    socket.setTimeout(CONTROL_REQUEST_TIMEOUT_MS, () => {
+      fail(new Error("DevSpace subagent runtime did not respond in time."));
+    });
     socket.once("error", (error) => {
-      reject(new Error(
+      fail(new Error(
         `DevSpace subagent runtime is unavailable. Start \`devspace serve\` and try again. (${error.message})`,
       ));
     });
@@ -119,6 +148,8 @@ async function requestControl(address: string, request: ControlRequest): Promise
       response += chunk;
     });
     socket.on("end", () => {
+      if (settled) return;
+      settled = true;
       try {
         resolve(parseControlResponse(JSON.parse(response.trim()) as unknown));
       } catch (error) {

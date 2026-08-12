@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
 import {
   LocalAgentControlServer,
+  localAgentControlAddress,
   requestLocalAgentRun,
   type LocalAgentCommandHandler,
 } from "./local-agent-control.js";
@@ -64,6 +66,16 @@ try {
     thinking: "high",
   });
   assert.deepEqual(record, expected);
+
+  const idleSocket = createConnection(localAgentControlAddress(config.stateDir));
+  await new Promise<void>((resolve, reject) => {
+    idleSocket.once("connect", resolve);
+    idleSocket.once("error", reject);
+  });
+  const socketClosed = new Promise<void>((resolve) => idleSocket.once("close", () => resolve()));
+  await server.close();
+  await socketClosed;
+  assert.equal(idleSocket.destroyed, true);
 } finally {
   await server.close();
   rmSync(root, { recursive: true, force: true });
