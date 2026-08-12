@@ -6,6 +6,7 @@ class FakePiSession {
   selectedModel: string | undefined;
   thinking: string | undefined;
   disposed = false;
+  disposeError: Error | undefined;
 
   constructor(readonly sessionId: string) {}
 
@@ -35,7 +36,19 @@ class FakePiSession {
   }
 
   dispose(): void {
+    if (this.disposeError) throw this.disposeError;
     this.disposed = true;
+  }
+}
+
+class BlockingPiSession extends FakePiSession {
+  readonly promptStarts: string[] = [];
+  readonly firstPromptGate = deferred<void>();
+
+  override async prompt(text: string): Promise<void> {
+    this.promptStarts.push(text);
+    if (text === "first queued") await this.firstPromptGate.promise;
+    await super.prompt(text);
   }
 }
 
@@ -126,6 +139,50 @@ try {
   } finally {
     await coldRuntime.close();
   }
+}
+
+{
+  const session = new BlockingPiSession("pi_serialized");
+  const serializedRuntime = new PiHarnessRuntime(async () => session);
+
+  try {
+    const first = serializedRuntime.run({
+      workspace: "/tmp/a",
+      prompt: "first queued",
+      providerSessionId: session.sessionId,
+    });
+    await immediate();
+    const second = serializedRuntime.run({
+      workspace: "/tmp/a",
+      prompt: "second queued",
+      providerSessionId: session.sessionId,
+    });
+    await immediate();
+    assert.deepEqual(session.promptStarts, ["first queued"], "turns on one Pi session must not overlap");
+
+    session.firstPromptGate.resolve();
+    await Promise.all([first, second]);
+    assert.deepEqual(session.promptStarts, ["first queued", "second queued"]);
+  } finally {
+    await serializedRuntime.close();
+  }
+}
+
+{
+  const first = new FakePiSession("pi_dispose_1");
+  const second = new FakePiSession("pi_dispose_2");
+  first.disposeError = new Error("dispose failed");
+  const byId = new Map([[first.sessionId, first], [second.sessionId, second]]);
+  const cleanupRuntime = new PiHarnessRuntime(async (_input, providerSessionId) => {
+    const session = providerSessionId ? byId.get(providerSessionId) : undefined;
+    if (!session) throw new Error("missing test session");
+    return session;
+  });
+
+  await cleanupRuntime.run({ workspace: "/tmp/a", prompt: "one", providerSessionId: first.sessionId });
+  await cleanupRuntime.run({ workspace: "/tmp/a", prompt: "two", providerSessionId: second.sessionId });
+  await assert.rejects(cleanupRuntime.close(), /dispose failed/);
+  assert.equal(second.disposed, true, "one dispose failure must not strand later Pi sessions");
 }
 
 function deferred<T>(): { promise: Promise<T>; resolve(value?: T): void } {
