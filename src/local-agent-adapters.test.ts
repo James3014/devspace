@@ -427,6 +427,13 @@ if (args.includes("--print")) {
   const promptIdx = args.indexOf("--print") + 1;
   const prompt = args[promptIdx];
 
+  if (prompt === "TEST_HOSTILE_TIMEOUT") {
+    process.on("SIGTERM", () => {
+      console.error("MOCK_AGY: IGNORED_SIGTERM");
+    });
+    setInterval(() => {}, 10000);
+    return;
+  }
   if (prompt === "FORCE_ERROR") {
     process.exit(1);
   }
@@ -590,6 +597,54 @@ try {
     assert.ok(createdTimers.size > 0, "Expected at least one timer to be created");
     for (const timer of createdTimers) {
       assert.ok(clearedTimers.has(timer), "Expected timer to be cleared on exit");
+    }
+  }
+
+  // J. Hostile timeout test (SIGTERM ignored, SIGKILL fallback)
+  {
+    const createdTimers = new Set<NodeJS.Timeout>();
+    const clearedTimers = new Set<NodeJS.Timeout>();
+
+    const originalSetTimeout = global.setTimeout;
+    const originalClearTimeout = global.clearTimeout;
+
+    global.setTimeout = ((cb: any, ms: number, ...args: any[]) => {
+      const timer = originalSetTimeout(cb, ms, ...args);
+      createdTimers.add(timer);
+      return timer;
+    }) as any;
+
+    global.clearTimeout = ((timer: any) => {
+      if (timer) clearedTimers.add(timer);
+      originalClearTimeout(timer);
+    }) as any;
+
+    const hostileEnv = {
+      ...process.env,
+      DEVSPACE_AGY_TIMEOUT_MS: "100",
+      DEVSPACE_AGY_GRACE_MS: "100",
+    };
+    const savedEnv = process.env;
+    process.env = hostileEnv;
+
+    try {
+      await assert.rejects(
+        () => adapter.run({
+          prompt: "TEST_HOSTILE_TIMEOUT",
+          workspace: process.cwd(),
+          writeMode: "read_only",
+        }),
+        /Agy execution timed out\./,
+      );
+    } finally {
+      process.env = savedEnv;
+      global.setTimeout = originalSetTimeout;
+      global.clearTimeout = originalClearTimeout;
+    }
+
+    assert.ok(createdTimers.size > 0, "Expected timers to be created in hostile timeout");
+    for (const timer of createdTimers) {
+      assert.ok(clearedTimers.has(timer), "Expected timer to be cleared in hostile timeout exit");
     }
   }
 

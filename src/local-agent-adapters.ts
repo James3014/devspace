@@ -177,25 +177,51 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
       });
     });
 
+    const timeoutMs = process.env.DEVSPACE_AGY_TIMEOUT_MS
+      ? parseInt(process.env.DEVSPACE_AGY_TIMEOUT_MS, 10)
+      : 250_000;
+    const graceMs = process.env.DEVSPACE_AGY_GRACE_MS
+      ? parseInt(process.env.DEVSPACE_AGY_GRACE_MS, 10)
+      : 3_000;
+
     let timeoutId: NodeJS.Timeout | undefined;
+    let graceTermId: NodeJS.Timeout | undefined;
+    let graceKillId: NodeJS.Timeout | undefined;
+    let isTimedOut = false;
 
     const timeoutPromise = new Promise<never>((_, reject) => {
       timeoutId = setTimeout(async () => {
+        isTimedOut = true;
         child.kill("SIGTERM");
+
+        const waitGraceExit = new Promise<void>((resolveGrace) => {
+          graceTermId = setTimeout(() => {
+            child.kill("SIGKILL");
+            graceKillId = setTimeout(() => {
+              resolveGrace();
+            }, graceMs);
+          }, graceMs);
+        });
+
         try {
-          await exitPromise;
+          await Promise.race([exitPromise, waitGraceExit]);
         } catch {}
-        reject(new Error("Agy execution timed out after 250 seconds."));
-      }, 250_000);
+
+        reject(new Error("Agy execution timed out."));
+      }, timeoutMs);
     });
 
     let exitInfo: { code: number | null; signal: NodeJS.Signals | null };
     try {
       exitInfo = await Promise.race([exitPromise, timeoutPromise]);
     } finally {
-      if (timeoutId) {
-        clearTimeout(timeoutId);
-      }
+      if (timeoutId) clearTimeout(timeoutId);
+      if (graceTermId) clearTimeout(graceTermId);
+      if (graceKillId) clearTimeout(graceKillId);
+    }
+
+    if (isTimedOut) {
+      throw new Error("Agy execution timed out.");
     }
 
     if (exitInfo.code !== 0) {
