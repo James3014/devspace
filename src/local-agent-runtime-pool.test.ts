@@ -52,6 +52,17 @@ class FailingRuntime extends FakeRuntime {
   }
 }
 
+class BlockingReapRuntime extends FakeRuntime {
+  readonly reapStarted = deferred<void>();
+  readonly finishReap = deferred<void>();
+
+  override async reapIdleSessions(now: number): Promise<void> {
+    this.reaps.push(now);
+    this.reapStarted.resolve();
+    await this.finishReap.promise;
+  }
+}
+
 let now = 0;
 let created = 0;
 const runtimes: FakeRuntime[] = [];
@@ -144,6 +155,51 @@ try {
   }
 }
 
+{
+  let raceNow = 0;
+  let raceCreates = 0;
+  const raceRuntimes: FakeRuntime[] = [];
+  const raceDriver: HarnessDriver = {
+    provider: "opencode",
+    runtimeKey: () => "reap-race",
+    async createRuntime() {
+      raceCreates += 1;
+      const runtime = raceCreates === 1
+        ? new BlockingReapRuntime("reap-runtime-1")
+        : new FakeRuntime(`reap-runtime-${raceCreates}`);
+      raceRuntimes.push(runtime);
+      return runtime;
+    },
+  };
+  const racePool = new HarnessRuntimePool({ idleMs: 10, reapIntervalMs: 0, now: () => raceNow });
+
+  try {
+    await racePool.run(raceDriver, input("/tmp/a", "seed"));
+    const firstRuntime = raceRuntimes[0] as BlockingReapRuntime;
+    raceNow = 10;
+    const reaping = racePool.reapIdle();
+    await firstRuntime.reapStarted.promise;
+
+    const concurrentRun = racePool.run(raceDriver, input("/tmp/a", "during reap"));
+    await immediate();
+    assert.deepEqual(
+      firstRuntime.prompts,
+      ["seed"],
+      "a provider turn must not overlap runtime/session maintenance",
+    );
+
+    firstRuntime.finishReap.resolve();
+    await reaping;
+    const result = await concurrentRun;
+
+    assert.equal(firstRuntime.closed, true, "the previously idle runtime may be reclaimed after maintenance");
+    assert.equal(raceCreates, 2, "a waiting turn should reacquire a fresh runtime after idle reclamation");
+    assert.equal(result.finalResponse, "reap-runtime-2:during reap");
+  } finally {
+    await racePool.shutdown();
+  }
+}
+
 function input(workspace: string, prompt: string, providerSessionId?: string): LocalAgentRunInput {
   return {
     workspace,
@@ -161,4 +217,19 @@ function countingDriver(provider: string, next: () => number): HarnessDriver {
       return new FakeRuntime(`${provider}-runtime-${next()}`);
     },
   };
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve(value: T): void;
+} {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
+}
+
+function immediate(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
 }

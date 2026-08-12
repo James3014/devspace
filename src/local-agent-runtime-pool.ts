@@ -26,6 +26,7 @@ type RuntimeSlot =
       runtime: HarnessRuntime;
       activeRuns: number;
       lastUsedAt: number;
+      maintenance?: Promise<void>;
     };
 
 interface HarnessRuntimePoolOptions {
@@ -64,8 +65,7 @@ export class HarnessRuntimePool {
   ): Promise<LocalAgentRunResult> {
     if (this.closing) throw new Error("Harness runtime pool is shutting down.");
     const key = `${driver.provider}\0${driver.runtimeKey(input)}`;
-    const slot = await this.acquire(key, driver, input);
-    slot.activeRuns += 1;
+    const slot = await this.acquireForRun(key, driver, input);
     try {
       return await slot.runtime.run(input);
     } finally {
@@ -79,15 +79,20 @@ export class HarnessRuntimePool {
   }
 
   async reapIdle(now = this.now()): Promise<void> {
-    const closing: HarnessRuntime[] = [];
+    const maintenance: Promise<void>[] = [];
     for (const [key, slot] of this.slots) {
-      if (slot.status !== "ready" || slot.activeRuns > 0) continue;
-      await slot.runtime.reapIdleSessions?.(now).catch(() => undefined);
-      if (now - slot.lastUsedAt < this.idleMs) continue;
-      this.slots.delete(key);
-      closing.push(slot.runtime);
+      if (slot.status !== "ready" || slot.activeRuns > 0 || slot.maintenance) continue;
+      const task = this.maintainSlot(key, slot, now);
+      slot.maintenance = task;
+      maintenance.push((async () => {
+        try {
+          await task;
+        } finally {
+          if (slot.maintenance === task) slot.maintenance = undefined;
+        }
+      })());
     }
-    await Promise.allSettled(closing.map((runtime) => runtime.close()));
+    await Promise.allSettled(maintenance);
   }
 
   async shutdown(): Promise<void> {
@@ -99,11 +104,12 @@ export class HarnessRuntimePool {
 
     await Promise.allSettled(slots.map(async (slot) => {
       const runtime = slot.status === "ready" ? slot.runtime : await slot.promise;
+      if (slot.status === "ready") await slot.maintenance?.catch(() => undefined);
       await runtime.close();
     }));
   }
 
-  private async acquire(
+  private async acquireForRun(
     key: string,
     driver: HarnessDriver,
     input: LocalAgentRunInput,
@@ -112,7 +118,14 @@ export class HarnessRuntimePool {
       if (this.closing) throw new Error("Harness runtime pool is shutting down.");
       const existing = this.slots.get(key);
       if (existing?.status === "ready") {
-        if (existing.runtime.isUsable()) return existing;
+        if (existing.maintenance) {
+          await existing.maintenance.catch(() => undefined);
+          continue;
+        }
+        if (existing.runtime.isUsable()) {
+          existing.activeRuns += 1;
+          return existing;
+        }
         this.slots.delete(key);
         await existing.runtime.close().catch(() => undefined);
         continue;
@@ -137,7 +150,7 @@ export class HarnessRuntimePool {
         const ready: Extract<RuntimeSlot, { status: "ready" }> = {
           status: "ready",
           runtime,
-          activeRuns: 0,
+          activeRuns: 1,
           lastUsedAt: this.now(),
         };
         this.slots.set(key, ready);
@@ -147,5 +160,17 @@ export class HarnessRuntimePool {
         throw error;
       }
     }
+  }
+
+  private async maintainSlot(
+    key: string,
+    slot: Extract<RuntimeSlot, { status: "ready" }>,
+    now: number,
+  ): Promise<void> {
+    await slot.runtime.reapIdleSessions?.(now).catch(() => undefined);
+    if (this.slots.get(key) !== slot || slot.activeRuns > 0) return;
+    if (now - slot.lastUsedAt < this.idleMs) return;
+    this.slots.delete(key);
+    await slot.runtime.close();
   }
 }
