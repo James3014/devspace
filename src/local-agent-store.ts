@@ -166,6 +166,9 @@ export class LocalAgentStore {
       )
       .all(`${escapeLike(idOrPrefix)}%`) as LocalAgentRow[];
 
+    if (matches.length > 1) {
+      throw new Error(`Ambiguous subagent id prefix: ${idOrPrefix}`);
+    }
     return matches.length === 1 ? rowToLocalAgentRecord(matches[0]!) : undefined;
   }
 

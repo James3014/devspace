@@ -56,6 +56,11 @@ try {
     provider: "claude",
   });
 
+  assert.throws(
+    () => store.getByAgentId("agt_"),
+    /Ambiguous subagent id prefix: agt_/,
+  );
+
   assert.deepEqual(
     store.list({ workspaceId: "ws_1" }).map((agent) => agent.id).sort(),
     [created.id, createdFromOtherStore.id].sort(),
