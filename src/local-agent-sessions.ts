@@ -513,11 +513,83 @@ function defaultWorkerLauncher(agentId: string, promptFile: string, workerToken:
   });
 }
 
+export type ProcessOwnership = "owned" | "absent" | "foreign" | "unknown";
+
+export function getWorkerProcessOwnership(
+  pid: number,
+  agentId: string,
+  workerToken: string,
+  platform: NodeJS.Platform = process.platform,
+): ProcessOwnership {
+  if (platform === "win32") {
+    try {
+      process.kill(pid, 0);
+      return "unknown";
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+        return "absent";
+      }
+      return "unknown";
+    }
+  }
+
+  try {
+    process.kill(pid, 0);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return "absent";
+    if (code === "EPERM") return "foreign";
+    return "unknown";
+  }
+
+  const result = spawnSync("ps", ["-p", String(pid), "-o", "command="], {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 2_000,
+  });
+
+  if (result.error || result.status !== 0) {
+    try {
+      process.kill(pid, 0);
+      return "unknown";
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ESRCH") return "absent";
+      return "unknown";
+    }
+  }
+
+  const command = result.stdout.trim();
+  if (!command) {
+    try {
+      process.kill(pid, 0);
+      return "unknown";
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ESRCH") return "absent";
+      return "unknown";
+    }
+  }
+
+  const isOwned =
+    command.includes("agents __worker") &&
+    command.includes(agentId) &&
+    command.includes("--worker-token") &&
+    command.includes(workerToken);
+
+  return isOwned ? "owned" : "foreign";
+}
+
 async function terminateOwnedWorker(record: LocalAgentRecord): Promise<boolean> {
   const pid = record.workerPid;
   const workerToken = record.workerToken;
   if (!pid || !workerToken) return true;
-  if (!isOwnedWorkerProcess(pid, record.id, workerToken)) return false;
+
+  const initialOwnership = getWorkerProcessOwnership(pid, record.id, workerToken);
+  if (initialOwnership === "absent") {
+    return true;
+  }
+  if (initialOwnership !== "owned") {
+    return false;
+  }
 
   const killable: KillableProcess = {
     pid,
@@ -532,48 +604,34 @@ async function terminateOwnedWorker(record: LocalAgentRecord): Promise<boolean> 
   };
 
   terminateProcessTree(killable, "SIGTERM", process.platform !== "win32");
-  if (await waitForWorkerExit(pid, record.id, workerToken, 1_000)) return true;
+  const postTermState = await waitForWorkerExitOrForeign(pid, record.id, workerToken, 1_000);
+  if (postTermState === "absent" || postTermState === "foreign") {
+    return true;
+  }
+  if (postTermState !== "owned") {
+    return false;
+  }
+
   terminateProcessTree(killable, "SIGKILL", process.platform !== "win32");
-  return waitForWorkerExit(pid, record.id, workerToken, 500);
+  const postKillState = await waitForWorkerExitOrForeign(pid, record.id, workerToken, 500);
+  return postKillState === "absent" || postKillState === "foreign";
 }
 
-async function waitForWorkerExit(
+async function waitForWorkerExitOrForeign(
   pid: number,
   agentId: string,
   workerToken: string,
   timeoutMs: number,
-): Promise<boolean> {
+): Promise<ProcessOwnership> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    if (!isOwnedWorkerProcess(pid, agentId, workerToken)) return true;
+    const ownership = getWorkerProcessOwnership(pid, agentId, workerToken);
+    if (ownership !== "owned") {
+      return ownership;
+    }
     await sleep(50);
   }
-  return !isOwnedWorkerProcess(pid, agentId, workerToken);
-}
-
-function isOwnedWorkerProcess(pid: number, agentId: string, workerToken: string): boolean {
-  if (process.platform === "win32") {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  const result = spawnSync("ps", ["-p", String(pid), "-o", "command="], {
-    encoding: "utf8",
-    windowsHide: true,
-    timeout: 2_000,
-  });
-  if (result.status !== 0 || !result.stdout.trim()) return false;
-  const command = result.stdout.trim();
-  return (
-    command.includes("agents __worker") &&
-    command.includes(agentId) &&
-    command.includes("--worker-token") &&
-    command.includes(workerToken)
-  );
+  return getWorkerProcessOwnership(pid, agentId, workerToken);
 }
 
 async function runLocalAgentProfile(

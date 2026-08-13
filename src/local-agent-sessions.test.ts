@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import test from "node:test";
-import { LocalAgentSessionManager, AgentSessionError } from "./local-agent-sessions.js";
+import { LocalAgentSessionManager, AgentSessionError, getWorkerProcessOwnership } from "./local-agent-sessions.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
 
 function setupFixture() {
@@ -311,6 +311,85 @@ test("LocalAgentSessionManager - cancel passes exact running worker ownership", 
   } finally {
     clean();
   }
+});
+
+test("LocalAgentSessionManager - cancel with default terminator: absent PID succeeds", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-agent-sessions-test-"));
+  const config = { stateDir, subagents: true, oauth: { scopes: ["devspace"] } } as any;
+  const spawnedWorkers: { agentId: string; promptFile: string; workerToken: string }[] = [];
+  const mockLauncher = async (agentId: string, promptFile: string, workerToken: string) => {
+    spawnedWorkers.push({ agentId, promptFile, workerToken });
+  };
+  const manager = new LocalAgentSessionManager(config, mockLauncher);
+  try {
+    const workspaceRoot = "/Users/jameschen/Workspace/nexus";
+    const record = await manager.startAgent({
+      workspaceId: "ws_test",
+      workspaceRoot,
+      profileName: "reviewer",
+      prompt: "absent test",
+      profiles: mockProfiles,
+    });
+    const workerToken = spawnedWorkers[0]!.workerToken;
+    manager.updateRecord(record.agentId, { status: "running", workerPid: 9999999, workerToken });
+
+    const cancelled = await manager.cancelAgent({ workspaceId: "ws_test", workspaceRoot, agentId: record.agentId });
+    assert.equal(cancelled.status, "stopped");
+    assert.equal(cancelled.terminal, true);
+    const inDb = manager.getRecordByPrefixOrId(record.agentId);
+    assert.equal(inDb?.status, "stopped");
+    assert.equal(inDb?.workerPid, undefined);
+    assert.equal(inDb?.workerToken, undefined);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("LocalAgentSessionManager - cancel with default terminator: foreign PID fails closed without signaling", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-agent-sessions-test-"));
+  const config = { stateDir, subagents: true, oauth: { scopes: ["devspace"] } } as any;
+  const spawnedWorkers: { agentId: string; promptFile: string; workerToken: string }[] = [];
+  const mockLauncher = async (agentId: string, promptFile: string, workerToken: string) => {
+    spawnedWorkers.push({ agentId, promptFile, workerToken });
+  };
+  const manager = new LocalAgentSessionManager(config, mockLauncher);
+  try {
+    const workspaceRoot = "/Users/jameschen/Workspace/nexus";
+    const record = await manager.startAgent({
+      workspaceId: "ws_test",
+      workspaceRoot,
+      profileName: "reviewer",
+      prompt: "foreign test",
+      profiles: mockProfiles,
+    });
+    const workerToken = spawnedWorkers[0]!.workerToken;
+    manager.updateRecord(record.agentId, { status: "running", workerPid: process.pid, workerToken });
+
+    await assert.rejects(
+      manager.cancelAgent({ workspaceId: "ws_test", workspaceRoot, agentId: record.agentId }),
+      (err: any) => {
+        assert.equal(err.code, "WORKER_TERMINATION_FAILED");
+        return true;
+      },
+    );
+
+    const inDb = manager.getRecordByPrefixOrId(record.agentId);
+    assert.equal(inDb?.status, "stopped");
+    assert.match(inDb?.error ?? "", /could not be verified/);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("getWorkerProcessOwnership - ownership inspection and platform branches", async () => {
+  assert.equal(getWorkerProcessOwnership(9999999, "agt_test", "tok_test"), "absent");
+
+  if (process.platform !== "win32") {
+    assert.equal(getWorkerProcessOwnership(process.pid, "agt_test", "tok_test"), "foreign");
+  }
+
+  assert.equal(getWorkerProcessOwnership(process.pid, "agt_test", "tok_test", "win32"), "unknown");
+  assert.equal(getWorkerProcessOwnership(9999999, "agt_test", "tok_test", "win32"), "absent");
 });
 
 test("LocalAgentSessionManager - prompt cleanup paths", async () => {
