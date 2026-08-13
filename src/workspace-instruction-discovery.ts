@@ -254,10 +254,10 @@ async function traverseWithNode(
         worker,
       ),
     );
+    if (stopReason) return incomplete("node", stopReason);
     if (isCancelled() || performance.now() >= deadline) {
       return incomplete("node", "deadline_exceeded");
     }
-    if (stopReason) return incomplete("node", stopReason);
     directories = nextDirectories;
   }
 

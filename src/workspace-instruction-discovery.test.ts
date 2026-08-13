@@ -148,3 +148,25 @@ test("node discovery checks its deadline before reporting completion", async (t)
     },
   );
 });
+
+test("node discovery preserves a result limit reached before its deadline", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-instruction-first-limit-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  await writeFile(join(root, "AGENTS.md"), "instructions\n");
+
+  const timestamps = [0, 0, 0, 0, 20_000];
+  t.mock.method(performance, "now", () => timestamps.shift() ?? 20_000);
+
+  assert.deepEqual(
+    await discoverInstructionPaths(root, {
+      finder: "node",
+      limits: { maxFiles: 0, maxDurationMs: 10_000 },
+    }),
+    {
+      status: "incomplete",
+      finder: "node",
+      reason: "result_limit_exceeded",
+      paths: [],
+    },
+  );
+});
