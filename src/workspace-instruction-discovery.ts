@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { readdir } from "node:fs/promises";
+import { opendir } from "node:fs/promises";
 import { basename, relative, resolve } from "node:path";
 import { isPathInsideRoot } from "./roots.js";
 
@@ -117,7 +117,10 @@ async function discoverWithFd(
     const stop = (reason: IncompleteInstructionDiscoveryReason): void => {
       if (stopReason) return;
       stopReason = reason;
+      child.stdout.destroy();
       child.kill();
+      child.unref();
+      finish(incomplete("fd", reason));
     };
     const processOutput = (): void => {
       while (!stopReason) {
@@ -164,10 +167,38 @@ async function discoverWithNode(
   deadline: number,
 ): Promise<InstructionPathDiscoveryResult> {
   const accumulator = createCandidateAccumulator(root, options);
+  const remainingMs = deadline - performance.now();
+  if (remainingMs <= 0) {
+    return incomplete("node", "deadline_exceeded");
+  }
+
+  let cancelled = false;
+  let timer: NodeJS.Timeout | undefined;
+  const traversal = traverseWithNode(root, accumulator, deadline, () => cancelled);
+  if (!Number.isFinite(remainingMs)) return traversal;
+
+  const deadlineResult = new Promise<InstructionPathDiscoveryResult>((resolveResult) => {
+    timer = setTimeout(() => {
+      cancelled = true;
+      resolveResult(incomplete("node", "deadline_exceeded"));
+    }, remainingMs);
+    timer.unref();
+  });
+  const result = await Promise.race([traversal, deadlineResult]);
+  if (timer) clearTimeout(timer);
+  return result;
+}
+
+async function traverseWithNode(
+  root: string,
+  accumulator: CandidateAccumulator,
+  deadline: number,
+  isCancelled: () => boolean,
+): Promise<InstructionPathDiscoveryResult> {
   let directories = [root];
 
   while (directories.length > 0) {
-    if (performance.now() >= deadline) {
+    if (isCancelled() || performance.now() >= deadline) {
       return incomplete("node", "deadline_exceeded");
     }
 
@@ -177,30 +208,38 @@ async function discoverWithNode(
     let stopReason: IncompleteInstructionDiscoveryReason | undefined;
 
     const worker = async (): Promise<void> => {
-      while (!stopReason && cursor < currentDirectories.length) {
+      while (!isCancelled() && !stopReason && cursor < currentDirectories.length) {
         const directory = currentDirectories[cursor++];
         let entries;
         try {
-          entries = await readdir(directory, { withFileTypes: true });
+          entries = await opendir(directory);
         } catch {
           continue;
         }
 
-        if (performance.now() >= deadline) {
-          stopReason = "deadline_exceeded";
-          return;
-        }
+        try {
+          while (!isCancelled() && !stopReason) {
+            const entry = await entries.read();
+            if (isCancelled() || stopReason) return;
+            if (!entry) break;
+            if (performance.now() >= deadline) {
+              stopReason = "deadline_exceeded";
+              return;
+            }
 
-        for (const entry of entries) {
-          if (stopReason) return;
-          const path = resolve(directory, entry.name);
-          if (entry.isDirectory()) {
-            if (!SKIPPED_CONTEXT_DIR_SET.has(entry.name)) nextDirectories.push(path);
-            continue;
+            const path = resolve(directory, entry.name);
+            if (entry.isDirectory()) {
+              if (!SKIPPED_CONTEXT_DIR_SET.has(entry.name)) nextDirectories.push(path);
+              continue;
+            }
+            if (!entry.isFile() || !CONTEXT_FILE_NAMES.has(entry.name)) continue;
+
+            stopReason = accumulator.add(path);
           }
-          if (!entry.isFile() || !CONTEXT_FILE_NAMES.has(entry.name)) continue;
-
-          stopReason = accumulator.add(path);
+        } catch {
+          // Unreadable directories do not prevent discovery elsewhere in the workspace.
+        } finally {
+          await entries.close().catch(() => undefined);
         }
       }
     };
@@ -211,6 +250,7 @@ async function discoverWithNode(
         worker,
       ),
     );
+    if (isCancelled()) return incomplete("node", "deadline_exceeded");
     if (stopReason) return incomplete("node", stopReason);
     directories = nextDirectories;
   }

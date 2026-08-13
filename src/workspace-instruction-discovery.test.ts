@@ -100,3 +100,27 @@ test("instruction discovery reports an exhausted deadline without returning part
     },
   );
 });
+
+test("node discovery checks its deadline while iterating a wide directory", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-instruction-wide-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  await Promise.all(
+    Array.from({ length: 64 }, (_, index) => mkdir(join(root, `project-${index}`))),
+  );
+  let now = 0;
+  t.mock.method(performance, "now", () => now++);
+
+  assert.deepEqual(
+    await discoverInstructionPaths(root, {
+      finder: "node",
+      limits: { maxDurationMs: 3 },
+    }),
+    {
+      status: "incomplete",
+      finder: "node",
+      reason: "deadline_exceeded",
+      paths: [],
+    },
+  );
+});
