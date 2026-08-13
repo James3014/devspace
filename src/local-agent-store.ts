@@ -14,6 +14,8 @@ export interface LocalAgentRecord {
   model?: string;
   thinking?: string;
   providerSessionId?: string;
+  workerPid?: number;
+  workerToken?: string;
   status: LocalAgentStatus;
   latestResponse?: string;
   error?: string;
@@ -44,6 +46,8 @@ interface LocalAgentRow {
   model: string | null;
   thinking: string | null;
   provider_session_id: string | null;
+  worker_pid: number | null;
+  worker_token: string | null;
   status: string;
   latest_response: string | null;
   error: string | null;
@@ -60,7 +64,15 @@ export class LocalAgentStore {
 
   list(scope: LocalAgentListScope = {}): LocalAgentRecord[] {
     let rows: LocalAgentRow[];
-    if (scope.workspaceId) {
+    if (scope.workspaceId && scope.workspaceRoot) {
+      rows = this.database.sqlite
+        .prepare(
+          `select * from local_agent_sessions
+           where workspace_id = ? and workspace_root = ?
+           order by updated_at desc`,
+        )
+        .all(scope.workspaceId, resolve(scope.workspaceRoot)) as LocalAgentRow[];
+    } else if (scope.workspaceId) {
       rows = this.database.sqlite
         .prepare(
           `select * from local_agent_sessions
@@ -172,6 +184,8 @@ export class LocalAgentStore {
           model = ?,
           thinking = ?,
           provider_session_id = ?,
+          worker_pid = ?,
+          worker_token = ?,
           status = ?,
           latest_response = ?,
           error = ?,
@@ -186,6 +200,8 @@ export class LocalAgentStore {
         updated.model ?? null,
         updated.thinking ?? null,
         updated.providerSessionId ?? null,
+        updated.workerPid ?? null,
+        updated.workerToken ?? null,
         updated.status,
         updated.latestResponse ?? null,
         updated.error ?? null,
@@ -194,6 +210,87 @@ export class LocalAgentStore {
       );
 
     return updated;
+  }
+
+  prepareWorker(id: string, workerToken: string): LocalAgentRecord {
+    const current = this.getById(id);
+    if (!current) throw new Error(`Unknown subagent id: ${id}`);
+    if (current.status !== "starting") {
+      throw new Error(`Agent ${id} is ${current.status}, not starting.`);
+    }
+    return this.update(id, {
+      workerPid: undefined,
+      workerToken,
+    });
+  }
+
+  claimWorker(id: string, workerToken: string, workerPid: number): LocalAgentRecord | undefined {
+    const now = new Date().toISOString();
+    const result = this.database.sqlite
+      .prepare(
+        `update local_agent_sessions set
+          status = 'running',
+          worker_pid = ?,
+          updated_at = ?
+         where id = ? and status = 'starting' and worker_token = ?`,
+      )
+      .run(workerPid, now, id, workerToken);
+    return result.changes === 1 ? this.getById(id) : undefined;
+  }
+
+  finishWorker(
+    id: string,
+    workerToken: string,
+    patch: {
+      status: "idle" | "error";
+      providerSessionId?: string;
+      latestResponse?: string;
+      error?: string;
+    },
+  ): LocalAgentRecord {
+    const now = new Date().toISOString();
+    this.database.sqlite
+      .prepare(
+        `update local_agent_sessions set
+          provider_session_id = coalesce(?, provider_session_id),
+          status = ?,
+          latest_response = ?,
+          error = ?,
+          worker_pid = null,
+          worker_token = null,
+          updated_at = ?
+         where id = ? and status = 'running' and worker_token = ?`,
+      )
+      .run(
+        patch.providerSessionId ?? null,
+        patch.status,
+        patch.latestResponse ?? null,
+        patch.error ?? null,
+        now,
+        id,
+        workerToken,
+      );
+    const current = this.getById(id);
+    if (!current) throw new Error(`Unknown subagent id: ${id}`);
+    return current;
+  }
+
+  cancelActive(id: string): { previous: LocalAgentRecord; current: LocalAgentRecord } {
+    const cancel = this.database.sqlite.transaction(() => {
+      const previous = this.getById(id);
+      if (!previous) throw new Error(`Unknown subagent id: ${id}`);
+      if (previous.status !== "starting" && previous.status !== "running") {
+        return { previous, current: previous };
+      }
+      const current = this.update(id, {
+        status: "stopped",
+        workerPid: undefined,
+        workerToken: undefined,
+        error: "cancelled by operator",
+      });
+      return { previous, current };
+    });
+    return cancel.immediate();
   }
 
   close(): void {
@@ -222,6 +319,8 @@ function rowToLocalAgentRecord(row: LocalAgentRow): LocalAgentRecord {
     model: row.model ?? undefined,
     thinking: row.thinking ?? undefined,
     providerSessionId: row.provider_session_id ?? undefined,
+    workerPid: row.worker_pid ?? undefined,
+    workerToken: row.worker_token ?? undefined,
     status: readStatus(row.status),
     latestResponse: row.latest_response ?? undefined,
     error: row.error ?? undefined,

@@ -1,8 +1,9 @@
+import { randomUUID } from "node:crypto";
 import { mkdtempSync, unlinkSync, rmdirSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, dirname, join, resolve as resolvePath } from "node:path";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { ServerConfig } from "./config.js";
 import {
@@ -17,6 +18,8 @@ import {
 } from "./local-agent-availability.js";
 import { runLocalAgentProvider } from "./local-agent-adapters.js";
 import type { LocalAgentRunResult } from "./local-agent-runtime.js";
+import { terminateProcessTree, type KillableProcess } from "./process-platform.js";
+import { canonicalizePath } from "./roots.js";
 
 // ─── Error codes ────────────────────────────────────────────────────────────
 
@@ -28,7 +31,8 @@ export type AgentErrorCode =
   | "AGENT_WORKSPACE_MISMATCH"
   | "AGENT_ALREADY_RUNNING"
   | "INVALID_WAIT_MS"
-  | "WORKER_LAUNCH_FAILED";
+  | "WORKER_LAUNCH_FAILED"
+  | "WORKER_TERMINATION_FAILED";
 
 export class AgentSessionError extends Error {
   constructor(
@@ -62,6 +66,12 @@ export interface GetAgentStatusInput {
   workspaceRoot: string;
   agentId: string;
   waitMs?: number;
+}
+
+export interface CancelAgentInput {
+  workspaceId: string;
+  workspaceRoot: string;
+  agentId: string;
 }
 
 export interface ListAgentsInput {
@@ -124,7 +134,8 @@ export interface ContinueAgentOutput extends StartAgentOutput {
  * Async contract: resolves when the worker process has successfully spawned,
  * rejects if the OS-level spawn fails. Does NOT wait for the worker to finish.
  */
-export type WorkerLauncher = (agentId: string, promptFile: string) => Promise<void>;
+export type WorkerLauncher = (agentId: string, promptFile: string, workerToken: string) => Promise<void>;
+export type WorkerTerminator = (record: LocalAgentRecord) => Promise<boolean>;
 
 // ─── Owned temp cleanup ──────────────────────────────────────────────────────
 
@@ -162,13 +173,16 @@ function cleanupOwnedPromptFile(promptFile: string): void {
 export class LocalAgentSessionManager {
   private readonly store: LocalAgentStore;
   private readonly launcher: WorkerLauncher;
+  private readonly terminator: WorkerTerminator;
 
   constructor(
     private readonly config: ServerConfig,
     testLauncher?: WorkerLauncher,
+    testTerminator?: WorkerTerminator,
   ) {
     this.store = createLocalAgentStore(config);
     this.launcher = testLauncher ?? defaultWorkerLauncher;
+    this.terminator = testTerminator ?? terminateOwnedWorker;
   }
 
   /**
@@ -205,22 +219,8 @@ export class LocalAgentSessionManager {
       thinking: profile.thinking,
     });
 
-    const promptFile = writeAgentPromptFile(prompt);
-    try {
-      await this.launcher(record.id, promptFile);
-    } catch (launchErr) {
-      cleanupOwnedPromptFile(promptFile);
-      this.store.update(record.id, {
-        status: "error",
-        error: `Worker launch failed: ${launchErr instanceof Error ? launchErr.message : String(launchErr)}`,
-      });
-      throw new AgentSessionError(
-        "WORKER_LAUNCH_FAILED",
-        `Failed to launch worker for agent ${record.id}: ${launchErr instanceof Error ? launchErr.message : String(launchErr)}`,
-      );
-    }
-
-    return recordToStartOutput(record);
+    await this.launchPrompt(record.id, prompt);
+    return recordToStartOutput(this.store.getById(record.id) ?? record);
   }
 
   /**
@@ -229,7 +229,7 @@ export class LocalAgentSessionManager {
    * Fail-closed: if worker fails to launch, record is set to error status.
    */
   async continueAgent(input: ContinueAgentInput): Promise<ContinueAgentOutput> {
-    const { workspaceId, workspaceRoot, agentId, prompt } = input;
+    const { workspaceId: _workspaceId, workspaceRoot, agentId, prompt } = input;
 
     // Exact id lookup only (no prefix matching through MCP)
     const record = this.store.getById(agentId);
@@ -237,7 +237,7 @@ export class LocalAgentSessionManager {
       throw new AgentSessionError("UNKNOWN_AGENT", `Unknown agent id: ${agentId}`);
     }
 
-    if (record.workspaceRoot !== workspaceRoot) {
+    if (canonicalizePath(record.workspaceRoot) !== canonicalizePath(workspaceRoot)) {
       throw new AgentSessionError(
         "AGENT_WORKSPACE_MISMATCH",
         `Agent ${agentId} belongs to workspace root '${record.workspaceRoot}', not '${workspaceRoot}'`,
@@ -252,28 +252,14 @@ export class LocalAgentSessionManager {
     }
 
     // Preserve provider/profile/session identity; reset response/error; restart
+    // Note: workspaceId is NOT updated to preserve original workspaceId provenance.
     this.store.update(record.id, {
-      workspaceId,
       status: "starting",
       latestResponse: undefined,
       error: undefined,
     });
 
-    const promptFile = writeAgentPromptFile(prompt);
-    try {
-      await this.launcher(record.id, promptFile);
-    } catch (launchErr) {
-      cleanupOwnedPromptFile(promptFile);
-      this.store.update(record.id, {
-        status: "error",
-        error: `Worker launch failed: ${launchErr instanceof Error ? launchErr.message : String(launchErr)}`,
-      });
-      throw new AgentSessionError(
-        "WORKER_LAUNCH_FAILED",
-        `Failed to launch worker for agent ${record.id}: ${launchErr instanceof Error ? launchErr.message : String(launchErr)}`,
-      );
-    }
-
+    await this.launchPrompt(record.id, prompt);
     const updated = this.store.getById(record.id) ?? record;
     return { ...recordToStartOutput(updated), continued: true as const };
   }
@@ -296,7 +282,7 @@ export class LocalAgentSessionManager {
       throw new AgentSessionError("UNKNOWN_AGENT", `Unknown agent id: ${agentId}`);
     }
 
-    if (record.workspaceRoot !== workspaceRoot) {
+    if (canonicalizePath(record.workspaceRoot) !== canonicalizePath(workspaceRoot)) {
       throw new AgentSessionError(
         "AGENT_WORKSPACE_MISMATCH",
         `Agent ${agentId} belongs to workspace root '${record.workspaceRoot}', not '${workspaceRoot}'`,
@@ -314,6 +300,35 @@ export class LocalAgentSessionManager {
     return recordToStatusOutput(record);
   }
 
+  async cancelAgent(input: CancelAgentInput): Promise<AgentStatusOutput> {
+    const { workspaceRoot, agentId } = input;
+    const record = this.store.getById(agentId);
+    if (!record) {
+      throw new AgentSessionError("UNKNOWN_AGENT", `Unknown agent id: ${agentId}`);
+    }
+    if (canonicalizePath(record.workspaceRoot) !== canonicalizePath(workspaceRoot)) {
+      throw new AgentSessionError(
+        "AGENT_WORKSPACE_MISMATCH",
+        `Agent ${agentId} belongs to workspace root '${record.workspaceRoot}', not '${workspaceRoot}'`,
+      );
+    }
+
+    const { previous, current } = this.store.cancelActive(agentId);
+    if (previous.status === "starting" || previous.status === "running") {
+      const terminated = await this.terminator(previous);
+      if (!terminated) {
+        this.store.update(agentId, {
+          error: "cancellation persisted but owned worker termination could not be verified",
+        });
+        throw new AgentSessionError(
+          "WORKER_TERMINATION_FAILED",
+          `Agent ${agentId} is stopped, but its owned worker process could not be verified as terminated.`,
+        );
+      }
+    }
+    return recordToStatusOutput(current);
+  }
+
   /**
    * List agents scoped to a workspace, newest first.
    * workspaceRoot optionally narrows to a physical root.
@@ -322,8 +337,17 @@ export class LocalAgentSessionManager {
     const { workspaceId, workspaceRoot, limit = AGENT_LIST_DEFAULT_LIMIT } = input;
     const effectiveLimit = Math.min(Math.max(1, limit), AGENT_LIST_MAX_LIMIT);
 
-    const records = this.store.list({ workspaceId, workspaceRoot });
-    return records.slice(0, effectiveLimit).map(recordToSummary);
+    if (!workspaceRoot) {
+      const records = this.store.list({ workspaceId });
+      return records.slice(0, effectiveLimit).map(recordToSummary);
+    }
+
+    const canonicalCurrent = canonicalizePath(workspaceRoot);
+    const records = this.store.list();
+    const matched = records.filter(
+      (record) => canonicalizePath(record.workspaceRoot) === canonicalCurrent
+    );
+    return matched.slice(0, effectiveLimit).map(recordToSummary);
   }
 
   /**
@@ -331,35 +355,52 @@ export class LocalAgentSessionManager {
    * Used by CLI __worker subcommand.
    * Cleans up the owned prompt temp file after execution (success or failure).
    */
-  async runWorkerTurnFromFile(agentId: string, promptFile: string): Promise<void> {
-    const record = this.store.getById(agentId);
-    if (!record) throw new Error(`Unknown subagent id: ${agentId}`);
+  async runWorkerTurnFromFile(agentId: string, promptFile: string, workerToken: string): Promise<void> {
+    const initial = this.store.getById(agentId);
+    if (!initial) throw new Error(`Unknown subagent id: ${agentId}`);
+
+    const claimed = this.store.claimWorker(agentId, workerToken, process.pid);
+    if (!claimed) {
+      cleanupOwnedPromptFile(promptFile);
+      return;
+    }
 
     const prompt = await readFile(promptFile, "utf8");
-
-    this.store.update(record.id, { status: "running", error: undefined });
     try {
-      const profiles = await loadLocalAgentProfiles(this.config, record.workspaceRoot);
-      const profile = profiles.find((p) => p.name === record.profileName);
+      const profiles = await loadLocalAgentProfiles(this.config, claimed.workspaceRoot);
+      const profile = profiles.find((p) => p.name === claimed.profileName);
       let result: LocalAgentRunResult;
       if (profile) {
-        result = await runLocalAgentProfile(profile, record, prompt);
+        result = await runLocalAgentProfile(profile, claimed, prompt);
       } else {
-        result = await runRawLocalAgentProvider(record, prompt);
+        result = await runRawLocalAgentProvider(claimed, prompt);
       }
-      this.store.update(record.id, {
+      this.store.finishWorker(agentId, workerToken, {
         providerSessionId: result.providerSessionId ?? undefined,
         status: "idle",
         latestResponse: result.finalResponse,
         error: undefined,
       });
     } catch (error) {
-      this.store.update(record.id, {
+      this.store.finishWorker(agentId, workerToken, {
         status: "error",
         error: error instanceof Error ? error.message : String(error),
       });
     } finally {
       cleanupOwnedPromptFile(promptFile);
+    }
+  }
+
+  private async launchPrompt(agentId: string, prompt: string): Promise<void> {
+    const promptFile = writeAgentPromptFile(prompt);
+    try {
+      await this.spawnWorker(agentId, promptFile);
+    } catch (launchErr) {
+      cleanupOwnedPromptFile(promptFile);
+      throw new AgentSessionError(
+        "WORKER_LAUNCH_FAILED",
+        `Failed to launch worker for agent ${agentId}: ${launchErr instanceof Error ? launchErr.message : String(launchErr)}`,
+      );
     }
   }
 
@@ -388,8 +429,20 @@ export class LocalAgentSessionManager {
    * Create a prompt file and spawn a background worker.
    * Used directly by CLI for profile-less raw provider runs.
    */
-  spawnWorker(agentId: string, promptFile: string): Promise<void> {
-    return this.launcher(agentId, promptFile);
+  async spawnWorker(agentId: string, promptFile: string): Promise<void> {
+    const workerToken = randomUUID();
+    this.store.prepareWorker(agentId, workerToken);
+    try {
+      await this.launcher(agentId, promptFile, workerToken);
+    } catch (error) {
+      this.store.update(agentId, {
+        status: "error",
+        workerPid: undefined,
+        workerToken: undefined,
+        error: `Worker launch failed: ${error instanceof Error ? error.message : String(error)}`,
+      });
+      throw error;
+    }
   }
 
   /**
@@ -429,7 +482,7 @@ function writeAgentPromptFile(prompt: string): string {
   return filePath;
 }
 
-function defaultWorkerLauncher(agentId: string, promptFile: string): Promise<void> {
+function defaultWorkerLauncher(agentId: string, promptFile: string, workerToken: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
@@ -441,6 +494,8 @@ function defaultWorkerLauncher(agentId: string, promptFile: string): Promise<voi
         agentId,
         "--prompt-file",
         promptFile,
+        "--worker-token",
+        workerToken,
       ],
       {
         detached: true,
@@ -456,6 +511,69 @@ function defaultWorkerLauncher(agentId: string, promptFile: string): Promise<voi
       reject(err);
     });
   });
+}
+
+async function terminateOwnedWorker(record: LocalAgentRecord): Promise<boolean> {
+  const pid = record.workerPid;
+  const workerToken = record.workerToken;
+  if (!pid || !workerToken) return true;
+  if (!isOwnedWorkerProcess(pid, record.id, workerToken)) return false;
+
+  const killable: KillableProcess = {
+    pid,
+    kill(signal = "SIGTERM") {
+      try {
+        process.kill(pid, signal);
+        return true;
+      } catch (error) {
+        return (error as NodeJS.ErrnoException).code === "ESRCH";
+      }
+    },
+  };
+
+  terminateProcessTree(killable, "SIGTERM", process.platform !== "win32");
+  if (await waitForWorkerExit(pid, record.id, workerToken, 1_000)) return true;
+  terminateProcessTree(killable, "SIGKILL", process.platform !== "win32");
+  return waitForWorkerExit(pid, record.id, workerToken, 500);
+}
+
+async function waitForWorkerExit(
+  pid: number,
+  agentId: string,
+  workerToken: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (!isOwnedWorkerProcess(pid, agentId, workerToken)) return true;
+    await sleep(50);
+  }
+  return !isOwnedWorkerProcess(pid, agentId, workerToken);
+}
+
+function isOwnedWorkerProcess(pid: number, agentId: string, workerToken: string): boolean {
+  if (process.platform === "win32") {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  const result = spawnSync("ps", ["-p", String(pid), "-o", "command="], {
+    encoding: "utf8",
+    windowsHide: true,
+    timeout: 2_000,
+  });
+  if (result.status !== 0 || !result.stdout.trim()) return false;
+  const command = result.stdout.trim();
+  return (
+    command.includes("agents __worker") &&
+    command.includes(agentId) &&
+    command.includes("--worker-token") &&
+    command.includes(workerToken)
+  );
 }
 
 async function runLocalAgentProfile(

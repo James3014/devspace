@@ -10,6 +10,7 @@ import {
   type LocalAgentRunInput,
   type LocalAgentRunResult,
 } from "./local-agent-runtime.js";
+import { runOmpAcpLocalAgent } from "./local-agent-omp.js";
 
 export interface LocalAgentAdapter {
   readonly provider: LocalAgentProvider;
@@ -44,6 +45,16 @@ export function createLocalAgentAdapter(provider: LocalAgentProvider): LocalAgen
       return new AcpLocalAgentAdapter(provider, ACP_COMMANDS[provider]);
     case "agy":
       return new AgyLocalAgentAdapter();
+    case "omp":
+      return new OmpLocalAgentAdapter();
+  }
+}
+
+class OmpLocalAgentAdapter implements LocalAgentAdapter {
+  readonly provider = "omp" as const;
+
+  run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
+    return runOmpAcpLocalAgent(input);
   }
 }
 

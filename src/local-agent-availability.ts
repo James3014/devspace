@@ -29,6 +29,8 @@ export function checkLocalAgentProviderAvailability(
       return packageAvailability(provider, "@anthropic-ai/claude-agent-sdk");
     case "opencode":
       return packageAvailability(provider, "@opencode-ai/sdk/v2");
+    case "omp":
+      return commandAvailability(provider, env.OMP_COMMAND ?? "omp");
     case "pi":
       return commandAvailability(provider, env.PI_COMMAND ?? "pi", {
         env: piAvailabilityEnvironment(env),

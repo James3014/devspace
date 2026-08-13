@@ -27,6 +27,11 @@ const migrations: Migration[] = [
     name: "workspace-conversation-bindings",
     up: migrateWorkspaceConversationBindings,
   },
+  {
+    version: 5,
+    name: "local-agent-worker-ownership",
+    up: migrateLocalAgentWorkerOwnership,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -177,6 +182,11 @@ function migrateLocalAgentSessions(sqlite: Database.Database): void {
   `);
 
   addColumnIfMissing(sqlite, "local_agent_sessions", "thinking", "text");
+}
+
+function migrateLocalAgentWorkerOwnership(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "local_agent_sessions", "worker_pid", "integer");
+  addColumnIfMissing(sqlite, "local_agent_sessions", "worker_token", "text");
 }
 
 function migrateWorkspaceConversationBindings(sqlite: Database.Database): void {

@@ -63,6 +63,7 @@ Required built-in provider id:
 provider: codex
 provider: claude
 provider: opencode
+provider: omp
 provider: pi
 provider: cursor
 provider: copilot
@@ -74,6 +75,7 @@ native integration:
 - `codex`: Codex SDK
 - `claude`: Claude Code SDK
 - `opencode`: OpenCode SDK
+- `omp`: Oh My Pi ACP (`omp acp`)
 - `pi`: Pi RPC mode
 - `cursor`: ACP
 - `copilot`: ACP
@@ -85,6 +87,7 @@ Optional provider model id or alias.
 ```yaml
 model: gpt-5.4
 model: sonnet
+model: google/gemini-2.5-flash-lite
 ```
 
 ### `thinking`
@@ -104,6 +107,7 @@ DevSpace passes this through to providers that expose a matching control:
 - `claude`: SDK effort with adaptive thinking.
 - `codex`: SDK model reasoning effort.
 - `pi`: `--thinking`.
+- `omp`: OMP `--thinking`, with the model/provider selector passed through to OMP.
 - `opencode`: model variant.
 - `cursor` and `copilot`: ACP thought-level config when supported.
 
@@ -135,6 +139,7 @@ The Subagent skill teaches only:
 devspace agents ls
 devspace agents run <profile-or-id> "<prompt>"
 devspace agents show <id>
+devspace agents cancel <id>
 ```
 
 `open_workspace` exposes compact profile metadata:

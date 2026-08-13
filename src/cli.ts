@@ -305,6 +305,7 @@ function printHelp(): void {
       "  devspace agents ls       List subagent sessions",
       "  devspace agents run <profile-or-provider-or-id> [--model <model>] <prompt>",
       "  devspace agents show <id>",
+      "  devspace agents cancel <id>",
       "  devspace -v, --version   Print the installed version",
       "",
       "For temporary tunnels:",
@@ -325,6 +326,9 @@ async function runAgentsCommand(args: string[]): Promise<void> {
       return;
     case "show":
       await runAgentsShow(rest);
+      return;
+    case "cancel":
+      await runAgentsCancel(rest);
       return;
     case "__worker":
       await runAgentsWorker(rest);
@@ -376,10 +380,10 @@ async function runAgentsRun(args: string[]): Promise<void> {
       latestResponse: undefined,
       error: undefined,
     });
-    manager.spawnWorker(existing.id, promptFile);
+    await manager.spawnWorker(existing.id, promptFile);
     console.log(formatAgentLine({
       ...existing,
-      status: "running",
+      status: "starting",
       model: parsed.model ?? existing.model,
       thinking: parsed.thinking ?? existing.thinking,
     }));
@@ -405,8 +409,8 @@ async function runAgentsRun(args: string[]): Promise<void> {
     thinking: target.thinking,
   });
 
-  manager.spawnWorker(record.id, promptFile);
-  console.log(formatAgentLine({ ...record, status: "running" }));
+  await manager.spawnWorker(record.id, promptFile);
+  console.log(formatAgentLine({ ...record, status: "starting" }));
 }
 
 async function runAgentsShow(args: string[]): Promise<void> {
@@ -438,15 +442,37 @@ async function runAgentsShow(args: string[]): Promise<void> {
   }
 }
 
+async function runAgentsCancel(args: string[]): Promise<void> {
+  const [id] = args;
+  if (!id) throw new Error("Usage: devspace agents cancel <id>");
+
+  const config = loadConfig();
+  const manager = new LocalAgentSessionManager(config);
+  const record = manager.getRecordByPrefixOrId(id);
+  if (!record) throw new Error(`Unknown subagent id: ${id}`);
+  const output = await manager.cancelAgent({
+    workspaceId: record.workspaceId ?? "cli",
+    workspaceRoot: record.workspaceRoot,
+    agentId: record.id,
+  });
+  console.log(`${output.agentId} ${output.status} ${output.profileName} ${output.provider}`);
+}
+
 async function runAgentsWorker(args: string[]): Promise<void> {
-  const [id, promptFileFlag, promptFile] = args;
-  if (!id || promptFileFlag !== "--prompt-file" || !promptFile) {
-    throw new Error("Usage: devspace agents __worker <id> --prompt-file <path>");
+  const [id, promptFileFlag, promptFile, workerTokenFlag, workerToken] = args;
+  if (
+    !id ||
+    promptFileFlag !== "--prompt-file" ||
+    !promptFile ||
+    workerTokenFlag !== "--worker-token" ||
+    !workerToken
+  ) {
+    throw new Error("Usage: devspace agents __worker <id> --prompt-file <path> --worker-token <token>");
   }
 
   const config = loadConfig();
   const manager = new LocalAgentSessionManager(config);
-  await manager.runWorkerTurnFromFile(id, promptFile);
+  await manager.runWorkerTurnFromFile(id, promptFile, workerToken);
 }
 
 function resolveCurrentWorkspaceRoot(): string {
@@ -482,6 +508,7 @@ function printAgentsHelp(): void {
       "  devspace agents ls",
       "  devspace agents run <profile-or-provider-or-id> [--model <model>] [--thinking <level>] <prompt>",
       "  devspace agents show <id>",
+      "  devspace agents cancel <id>",
     ].join("\n"),
   );
 }

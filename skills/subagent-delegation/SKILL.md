@@ -20,6 +20,7 @@ Use only these commands for normal delegation:
 devspace agents ls
 devspace agents run <profile-or-provider-or-id> "<prompt>"
 devspace agents show <id>
+devspace agents cancel <id>
 ```
 
 `ls` shows existing subagent sessions for the current workspace. DevSpace scopes
@@ -37,9 +38,11 @@ profile is needed. Built-in providers are listed by `open_workspace`.
 running, `show` waits briefly. If there is still no final response, call `show`
 again later.
 
+`cancel <id>` persists the agent as stopped and terminates only the worker owned by that exact agent session. Use it when the user asks to stop a delegated task or when a bounded worker must not continue.
+
 Do not run provider CLIs such as `codex`, `claude`, `opencode`, `pi`,
 `cursor-agent`, or `copilot` directly unless you are explicitly debugging
-DevSpace agent integration.
+DevSpace agent integration. OMP is exposed through DevSpace as the `omp` provider; do not call the `omp` CLI directly for ordinary delegation.
 
 ## Choosing a profile
 

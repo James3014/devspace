@@ -101,6 +101,8 @@ export const localAgentSessions = sqliteTable(
     model: text("model"),
     thinking: text("thinking"),
     providerSessionId: text("provider_session_id"),
+    workerPid: integer("worker_pid"),
+    workerToken: text("worker_token"),
     status: text("status").notNull(),
     latestResponse: text("latest_response"),
     error: text("error"),

@@ -7,6 +7,7 @@ import {
 } from "./local-agent-availability.js";
 
 assert.equal(checkLocalAgentProviderAvailability("codex").available, true);
+assert.equal(checkLocalAgentProviderAvailability("omp").available, true);
 
 {
   const availability = checkLocalAgentProviderAvailability("pi", {
@@ -24,7 +25,7 @@ assert.equal(checkLocalAgentProviderAvailability("codex").available, true);
   });
   assert.deepEqual(
     snapshot.map((provider) => provider.name),
-    ["codex", "claude", "opencode", "pi", "cursor", "copilot", "agy"],
+    ["codex", "claude", "opencode", "omp", "pi", "cursor", "copilot", "agy"],
   );
   assert.equal(snapshot.find((provider) => provider.name === "pi")?.available, false);
 }

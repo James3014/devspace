@@ -18,6 +18,7 @@ const providers: LocalAgentProvider[] = [
   "codex",
   "claude",
   "opencode",
+  "omp",
   "pi",
   "cursor",
   "copilot",

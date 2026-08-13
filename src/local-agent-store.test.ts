@@ -45,6 +45,51 @@ try {
   assert.deepEqual(store.list({ workspaceId: "ws_other" }), []);
   assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
 
+  const failedContinuation = store.create({
+    workspaceId: "ws_1",
+    workspaceRoot: join(root, "project"),
+    profileName: "continued-worker",
+    provider: "omp",
+  });
+  store.update(failedContinuation.id, {
+    providerSessionId: "omp-session-existing",
+    status: "starting",
+  });
+  store.prepareWorker(failedContinuation.id, "token-failure");
+  store.claimWorker(failedContinuation.id, "token-failure", 1000);
+  const failed = store.finishWorker(failedContinuation.id, "token-failure", {
+    status: "error",
+    error: "provider failed",
+  });
+  assert.equal(failed.providerSessionId, "omp-session-existing");
+
+  const fenced = store.create({
+    workspaceId: "ws_1",
+    workspaceRoot: join(root, "project"),
+    profileName: "omp-worker",
+    provider: "omp",
+  });
+  const prepared = store.prepareWorker(fenced.id, "token-a");
+  assert.equal(prepared.workerToken, "token-a");
+  assert.equal(prepared.workerPid, undefined);
+  assert.equal(store.claimWorker(fenced.id, "wrong-token", 1001), undefined);
+  const claimed = store.claimWorker(fenced.id, "token-a", 1001);
+  assert.equal(claimed?.status, "running");
+  assert.equal(claimed?.workerPid, 1001);
+  const cancelled = store.cancelActive(fenced.id);
+  assert.equal(cancelled.previous.workerToken, "token-a");
+  assert.equal(cancelled.previous.workerPid, 1001);
+  assert.equal(cancelled.current.status, "stopped");
+  assert.equal(cancelled.current.workerToken, undefined);
+  assert.equal(cancelled.current.workerPid, undefined);
+  assert.equal(
+    store.finishWorker(fenced.id, "token-a", {
+      status: "idle",
+      latestResponse: "late completion",
+    }).status,
+    "stopped",
+  );
+
   const otherStore = new LocalAgentStore(root);
   stores.push(otherStore);
   const createdFromOtherStore = otherStore.create({
@@ -56,7 +101,7 @@ try {
 
   assert.deepEqual(
     store.list({ workspaceId: "ws_1" }).map((agent) => agent.id).sort(),
-    [created.id, createdFromOtherStore.id].sort(),
+    [created.id, failedContinuation.id, fenced.id, createdFromOtherStore.id].sort(),
   );
 } finally {
   for (const store of stores) {

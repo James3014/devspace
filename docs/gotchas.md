@@ -224,7 +224,8 @@ When `DEVSPACE_SUBAGENTS=1`, DevSpace loads agent profiles from
 `~/.devspace/agents/*.md` and project `.devspace/agents/*.md`, then exposes a
 compact profile catalog through `open_workspace`. The bundled
 `subagent-delegation` skill keeps the model-facing workflow to
-`devspace agents ls`, `devspace agents run`, and `devspace agents show`.
+`devspace agents ls`, `devspace agents run`, `devspace agents show`, and
+`devspace agents cancel`.
 `devspace agents ls` lists existing subagent sessions, not profile
 definitions.
 

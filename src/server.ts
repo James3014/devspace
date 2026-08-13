@@ -206,7 +206,7 @@ function serverInstructions(config: ServerConfig): string {
       : "";
 
   const agentToolsInstruction = config.subagents
-    ? " Use agent_start to launch an advertised agent profile as a background subagent. Use agent_status to retrieve result or progress. Use agent_continue for evidence-guided repair in the same session. Use agent_list to inspect current workspace agent sessions. Do NOT use bash to call `devspace agents` when native agent tools are available."
+    ? " Use agent_start to launch an advertised agent profile as a background subagent. Use agent_status to retrieve result or progress. Use agent_continue for evidence-guided repair in the same session. Use agent_cancel to stop the exact owned worker. Use agent_list to inspect current workspace agent sessions. Do NOT use bash to call `devspace agents` when native agent tools are available."
     : "";
 
   const gitCandidatesInstruction = config.gitCandidatesEnabled
@@ -1838,6 +1838,61 @@ export function createMcpServer(
         const errorLine = output.error ? `\nError: ${output.error}` : "";
         return {
           content: [textBlock(`${statusLine}${responseLine}${errorLine}`)],
+          structuredContent: output as unknown as Record<string, unknown>,
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
+      "agent_cancel",
+      {
+        title: "Cancel agent",
+        description:
+          "Cancel one exact durable subagent session. Persists stopped state first, then terminates only the worker process owned by that agent's PID/token fence.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          agentId: z.string().describe("Exact agent ID returned by agent_start."),
+        },
+        outputSchema: {
+          agentId: z.string(),
+          workspaceId: z.string().optional(),
+          workspaceRoot: z.string(),
+          profileName: z.string(),
+          provider: z.string(),
+          model: z.string().optional(),
+          thinking: z.string().optional(),
+          providerSessionId: z.string().optional(),
+          status: z.string(),
+          terminal: z.boolean(),
+          latestResponse: z.string().optional(),
+          error: z.string().optional(),
+          createdAt: z.string(),
+          updatedAt: z.string(),
+        },
+        _meta: {},
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ workspaceId, agentId }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const output = await agentSessionManager.cancelAgent({
+          workspaceId,
+          workspaceRoot: workspace.root,
+          agentId,
+        });
+        logToolCall(config, {
+          tool: "agent_cancel",
+          workspaceId,
+          success: true,
+          durationMs: 0,
+        });
+        return {
+          content: [textBlock(`Agent ${agentId} is ${output.status}.`)],
           structuredContent: output as unknown as Record<string, unknown>,
         };
       },

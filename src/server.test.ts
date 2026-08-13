@@ -321,16 +321,18 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   const context = await fixture(t, { subagents: true });
   const tools = await context.client.listTools();
   const agentTools = tools.tools.filter((tool) => tool.name.startsWith("agent_"));
-  assert.equal(agentTools.length, 4);
+  assert.equal(agentTools.length, 5);
 
   const startTool = agentTools.find((tool) => tool.name === "agent_start");
   const continueTool = agentTools.find((tool) => tool.name === "agent_continue");
   const statusTool = agentTools.find((tool) => tool.name === "agent_status");
+  const cancelTool = agentTools.find((tool) => tool.name === "agent_cancel");
   const listTool = agentTools.find((tool) => tool.name === "agent_list");
 
   assert.ok(startTool);
   assert.ok(continueTool);
   assert.ok(statusTool);
+  assert.ok(cancelTool);
   assert.ok(listTool);
 
   // Verify start annotations
@@ -356,6 +358,12 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
 
   const statusProps = statusTool.inputSchema.properties as Record<string, any>;
   assert.equal(statusProps.workspaceRoot, undefined);
+
+  const cancelProps = cancelTool.inputSchema.properties as Record<string, any>;
+  assert.equal(cancelProps.workspaceRoot, undefined);
+  assert.equal(cancelProps.workerPid, undefined);
+  assert.equal(cancelProps.workerToken, undefined);
+  assert.equal(cancelProps.signal, undefined);
 
   const listProps = listTool.inputSchema.properties as Record<string, any>;
   assert.equal(listProps.workspaceRoot, undefined);
@@ -438,6 +446,79 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   const listStructuredAfter = listResultAfter.structuredContent as { agents: any[] };
   assert.equal(listStructuredAfter.agents.length, 1);
   assert.equal(listStructuredAfter.agents[0].agentId, startStructured.agentId);
+
+  const cancelResult = await context.client.callTool({
+    name: "agent_cancel",
+    arguments: {
+      workspaceId,
+      agentId: startStructured.agentId,
+    },
+  });
+  const cancelStructured = cancelResult.structuredContent as Record<string, any>;
+  assert.equal(cancelStructured.agentId, startStructured.agentId);
+  assert.equal(cancelStructured.status, "stopped");
+  assert.equal(cancelStructured.terminal, true);
+});
+
+test("subagents: unknown/invalid workspaceId fails closed before durable-agent access", async (t) => {
+  const context = await fixture(t, { subagents: true });
+  const invalidWorkspaceId = "ws_invalid_nonexistent";
+
+  // 1. agent_start with invalid workspaceId fails closed
+  const startRes = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId: invalidWorkspaceId,
+      profile: "reviewer",
+      prompt: "fail prompt",
+    },
+  });
+  assert.equal(startRes.isError, true);
+  assert.match(responseText(startRes), /Unknown workspace/);
+
+  // 2. agent_status with invalid workspaceId fails closed
+  const statusRes = await context.client.callTool({
+    name: "agent_status",
+    arguments: {
+      workspaceId: invalidWorkspaceId,
+      agentId: "agt_12345678",
+    },
+  });
+  assert.equal(statusRes.isError, true);
+  assert.match(responseText(statusRes), /Unknown workspace/);
+
+  // 3. agent_continue with invalid workspaceId fails closed
+  const continueRes = await context.client.callTool({
+    name: "agent_continue",
+    arguments: {
+      workspaceId: invalidWorkspaceId,
+      agentId: "agt_12345678",
+      prompt: "continue prompt",
+    },
+  });
+  assert.equal(continueRes.isError, true);
+  assert.match(responseText(continueRes), /Unknown workspace/);
+
+  // 4. agent_cancel with invalid workspaceId fails closed
+  const cancelRes = await context.client.callTool({
+    name: "agent_cancel",
+    arguments: {
+      workspaceId: invalidWorkspaceId,
+      agentId: "agt_12345678",
+    },
+  });
+  assert.equal(cancelRes.isError, true);
+  assert.match(responseText(cancelRes), /Unknown workspace/);
+
+  // 5. agent_list with invalid workspaceId fails closed
+  const listRes = await context.client.callTool({
+    name: "agent_list",
+    arguments: {
+      workspaceId: invalidWorkspaceId,
+    },
+  });
+  assert.equal(listRes.isError, true);
+  assert.match(responseText(listRes), /Unknown workspace/);
 });
 
 test("gitCandidates disabled: git tools are absent", async (t) => {
