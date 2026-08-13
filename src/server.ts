@@ -2226,6 +2226,7 @@ export function createServer(
           processSessions,
           localAgentProviders,
           incomingArtifactAdapters,
+          agentSessionManager,
         );
         await server.connect(transport);
       } else {
