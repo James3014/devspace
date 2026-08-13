@@ -149,6 +149,10 @@ async function discoverWithFd(
         finish({ status: "unavailable" });
         return;
       }
+      if (performance.now() >= deadline) {
+        finish(incomplete("fd", "deadline_exceeded"));
+        return;
+      }
 
       processOutput();
       finish(accumulator.complete("fd"));
@@ -250,7 +254,9 @@ async function traverseWithNode(
         worker,
       ),
     );
-    if (isCancelled()) return incomplete("node", "deadline_exceeded");
+    if (isCancelled() || performance.now() >= deadline) {
+      return incomplete("node", "deadline_exceeded");
+    }
     if (stopReason) return incomplete("node", stopReason);
     directories = nextDirectories;
   }

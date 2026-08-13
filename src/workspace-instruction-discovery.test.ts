@@ -127,3 +127,24 @@ test("node discovery checks its deadline while iterating a wide directory", asyn
     },
   );
 });
+
+test("node discovery checks its deadline before reporting completion", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-instruction-completion-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+
+  const timestamps = [0, 0, 0, 20_000];
+  t.mock.method(performance, "now", () => timestamps.shift() ?? 20_000);
+
+  assert.deepEqual(
+    await discoverInstructionPaths(root, {
+      finder: "node",
+      limits: { maxDurationMs: 10_000 },
+    }),
+    {
+      status: "incomplete",
+      finder: "node",
+      reason: "deadline_exceeded",
+      paths: [],
+    },
+  );
+});
