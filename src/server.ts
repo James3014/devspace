@@ -18,6 +18,7 @@ import express from "express";
 import type { Request, Response } from "express";
 import * as z from "zod/v4";
 import { applyPatch } from "./apply-patch.js";
+import { commitCandidate, pushCandidate, GitCandidateError } from "./git-candidate.js";
 import {
   isArtifactDownloadSupportedPlatform,
   registerArtifactTools,
@@ -208,8 +209,12 @@ function serverInstructions(config: ServerConfig): string {
     ? " Use agent_start to launch an advertised agent profile as a background subagent. Use agent_status to retrieve result or progress. Use agent_continue for evidence-guided repair in the same session. Use agent_list to inspect current workspace agent sessions. Do NOT use bash to call `devspace agents` when native agent tools are available."
     : "";
 
+  const gitCandidatesInstruction = config.gitCandidatesEnabled
+    ? " Use git_commit to form a scoped Candidate from exact paths. Use git_push to publish Candidate HEAD to a non-default branch. Do not use bash for git mutation."
+    : "";
+
   if (config.toolMode === "codex") {
-    return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Open it again when the workspaceId is invalid, the project changes, checkout/worktree mode changes, or another isolated worktree is needed. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}${agentToolsInstruction}`;
+    return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Open it again when the workspaceId is invalid, the project changes, checkout/worktree mode changes, or another isolated worktree is needed. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}${agentToolsInstruction}${gitCandidatesInstruction}`;
   }
 
   const inspection = config.toolMode !== "full"
@@ -222,7 +227,7 @@ function serverInstructions(config: ServerConfig): string {
 
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
 
-  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching to a different project folder, changing checkout/worktree mode, the workspaceId is rejected as unknown, or a new isolated worktree is requested. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}${agentToolsInstruction}`;
+  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching to a different project folder, changing checkout/worktree mode, the workspaceId is rejected as unknown, or a new isolated worktree is requested. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}${agentToolsInstruction}${gitCandidatesInstruction}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -1881,6 +1886,142 @@ export function createMcpServer(
           content: [textBlock(summary)],
           structuredContent: { agents },
         };
+      },
+    );
+  }
+
+  // ── Native Git Candidate MCP Tools (only when gitCandidatesEnabled is true) ──
+  if (config.gitCandidatesEnabled) {
+    registerAppTool(
+      server,
+      "git_commit",
+      {
+        title: "Git Commit Candidate",
+        description:
+          "Create a scoped Candidate commit from exactly specified paths inside a managed DevSpace worktree.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          expectedHead: z
+            .string()
+            .regex(/^[0-9a-fA-F]{40}$/)
+            .describe("Exact 40-character Git commit hash expected at current HEAD."),
+          message: z.string().min(1).describe("Bounded commit message describing the changes."),
+          paths: z
+            .array(z.string().min(1))
+            .min(1)
+            .max(100)
+            .describe("Workspace-relative file paths to stage and commit."),
+        },
+        outputSchema: {
+          workspaceId: z.string(),
+          previousHead: z.string(),
+          commitSha: z.string(),
+          treeSha: z.string(),
+          message: z.string(),
+          paths: z.array(z.string()),
+          detached: z.boolean(),
+          created: z.literal(true),
+        },
+        _meta: {},
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+      },
+      async ({ workspaceId, expectedHead, message, paths }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        if (workspace.mode !== "worktree" || !workspace.worktree?.managed) {
+          throw new Error(
+            "[GIT_MANAGED_WORKTREE_REQUIRED] Git candidate mutations are only allowed on DevSpace-managed worktrees.",
+          );
+        }
+        try {
+          const result = await commitCandidate({
+            workspaceId,
+            workspaceRoot: workspace.root,
+            expectedHead,
+            message,
+            paths,
+          });
+          return {
+            content: [textBlock(`Successfully created Candidate commit ${result.commitSha}`)],
+            structuredContent: {
+              workspaceId: result.workspaceId,
+              previousHead: result.previousHead,
+              commitSha: result.commitSha,
+              treeSha: result.treeSha,
+              message: result.message,
+              paths: result.paths,
+              detached: result.detached,
+              created: true as const,
+            },
+          };
+        } catch (err: any) {
+          const code = err instanceof GitCandidateError ? err.code : "GIT_EXECUTION_ERROR";
+          throw new Error(`[${code}] ${err.message}`);
+        }
+      },
+    );
+
+    registerAppTool(
+      server,
+      "git_push",
+      {
+        title: "Git Push Candidate",
+        description:
+          "Publish current Candidate HEAD from a managed DevSpace worktree to a non-default remote branch.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          expectedHead: z
+            .string()
+            .regex(/^[0-9a-fA-F]{40}$/)
+            .describe("Exact 40-character Git commit hash expected at current HEAD."),
+          remote: z.string().describe("Configured Git remote name (e.g. 'origin')."),
+          branch: z.string().describe("Name of the target non-default remote branch to push to."),
+        },
+        outputSchema: {
+          remote: z.string(),
+          branch: z.string(),
+          pushedSha: z.string(),
+        },
+        _meta: {},
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: false,
+          openWorldHint: true,
+        },
+      },
+      async ({ workspaceId, expectedHead, remote, branch }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        if (workspace.mode !== "worktree" || !workspace.worktree?.managed) {
+          throw new Error(
+            "[GIT_MANAGED_WORKTREE_REQUIRED] Git candidate mutations are only allowed on DevSpace-managed worktrees.",
+          );
+        }
+        try {
+          const result = await pushCandidate({
+            workspaceRoot: workspace.root,
+            expectedHead,
+            remote,
+            branch,
+          });
+          return {
+            content: [
+              textBlock(`Successfully pushed ${result.pushedSha} to ${result.remote}/${result.branch}`),
+            ],
+            structuredContent: {
+              remote: result.remote,
+              branch: result.branch,
+              pushedSha: result.pushedSha,
+            },
+          };
+        } catch (err: any) {
+          const code = err instanceof GitCandidateError ? err.code : "GIT_EXECUTION_ERROR";
+          throw new Error(`[${code}] ${err.message}`);
+        }
       },
     );
   }

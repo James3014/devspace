@@ -185,7 +185,7 @@ interface ServerFixture {
   close: () => Promise<void>;
 }
 
-async function fixture(t: TestContext, options: { git?: boolean; subagents?: boolean } = {}): Promise<ServerFixture> {
+async function fixture(t: TestContext, options: { git?: boolean; subagents?: boolean; gitCandidates?: boolean } = {}): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
   const project = join(root, "project");
   const agentDir = join(root, "agent");
@@ -224,6 +224,7 @@ async function fixture(t: TestContext, options: { git?: boolean; subagents?: boo
     PORT: "1",
     DEVSPACE_SUBAGENTS: options.subagents ? "true" : "false",
     DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_GIT_CANDIDATES: options.gitCandidates ? "true" : "false",
   });
   const store = new SqliteWorkspaceStore(stateDir);
   const workspaces = new WorkspaceRegistry(config, store);
@@ -437,4 +438,68 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   const listStructuredAfter = listResultAfter.structuredContent as { agents: any[] };
   assert.equal(listStructuredAfter.agents.length, 1);
   assert.equal(listStructuredAfter.agents[0].agentId, startStructured.agentId);
+});
+
+test("gitCandidates disabled: git tools are absent", async (t) => {
+  const context = await fixture(t, { gitCandidates: false });
+  const tools = await context.client.listTools();
+  const gitTools = tools.tools.filter((tool) => tool.name.startsWith("git_"));
+  assert.equal(gitTools.length, 0);
+});
+
+test("gitCandidates enabled: git tools are present with schema validation", async (t) => {
+  const context = await fixture(t, { git: true, gitCandidates: true });
+  const tools = await context.client.listTools();
+  const gitTools = tools.tools.filter((tool) => tool.name.startsWith("git_"));
+  assert.equal(gitTools.length, 2);
+
+  const commitTool = gitTools.find((tool) => tool.name === "git_commit");
+  const pushTool = gitTools.find((tool) => tool.name === "git_push");
+
+  assert.ok(commitTool);
+  assert.ok(pushTool);
+
+  // Security schemas verification: NO workspaceRoot, cwd, remoteUrl, refspec, rawArgs, force, noVerify, delete, all
+  const commitProps = commitTool.inputSchema.properties as Record<string, any>;
+  assert.equal(commitProps.workspaceRoot, undefined);
+  assert.equal(commitProps.cwd, undefined);
+  assert.equal(commitProps.rawArgs, undefined);
+  assert.equal(commitProps.force, undefined);
+  assert.equal(commitProps.noVerify, undefined);
+
+  const pushProps = pushTool.inputSchema.properties as Record<string, any>;
+  assert.equal(pushProps.workspaceRoot, undefined);
+  assert.equal(pushProps.remoteUrl, undefined);
+  assert.equal(pushProps.refspec, undefined);
+  assert.equal(pushProps.force, undefined);
+  assert.equal(pushProps.delete, undefined);
+  assert.equal(pushProps.all, undefined);
+
+  // Annotations check
+  assert.equal(commitTool.annotations?.readOnlyHint, false);
+  assert.equal(commitTool.annotations?.destructiveHint, true);
+  assert.equal(commitTool.annotations?.idempotentHint, false);
+  assert.equal(commitTool.annotations?.openWorldHint, false);
+
+  assert.equal(pushTool.annotations?.readOnlyHint, false);
+  assert.equal(pushTool.annotations?.destructiveHint, true);
+  assert.equal(pushTool.annotations?.idempotentHint, false);
+  assert.equal(pushTool.annotations?.openWorldHint, true);
+
+  // Open workspace in default checkout mode
+  const openResult = await callOpen(context.client, context.project, "chat-1", "checkout");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+  assert.ok(workspaceId);
+
+  const res = await context.client.callTool({
+    name: "git_commit",
+    arguments: {
+      workspaceId,
+      expectedHead: "a".repeat(40),
+      message: "test",
+      paths: ["README.md"],
+    },
+  });
+  assert.equal(res.isError, true);
+  assert.match(responseText(res), /GIT_MANAGED_WORKTREE_REQUIRED/);
 });

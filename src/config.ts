@@ -31,6 +31,7 @@ export interface ServerConfig {
   subagents: boolean;
   agentDir: string;
   logging: LoggingConfig;
+  gitCandidatesEnabled: boolean;
 }
 
 function parsePort(value: string | number | undefined): number {
@@ -253,6 +254,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
         : parseBoolean(env.DEVSPACE_SUBAGENTS),
     agentDir: resolve(expandHomePath(env.DEVSPACE_AGENT_DIR ?? files.config.agentDir ?? defaultAgentDir())),
     logging: parseLoggingConfig(env),
+    gitCandidatesEnabled:
+      env.DEVSPACE_GIT_CANDIDATES === undefined
+        ? false
+        : parseBoolean(env.DEVSPACE_GIT_CANDIDATES),
   };
 }
 
