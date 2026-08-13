@@ -503,3 +503,79 @@ test("gitCandidates enabled: git tools are present with schema validation", asyn
   assert.equal(res.isError, true);
   assert.match(responseText(res), /GIT_MANAGED_WORKTREE_REQUIRED/);
 });
+
+test("git candidates tools - MCP managed worktree end-to-end integration test", async (t) => {
+  const context = await fixture(t, { git: true, gitCandidates: true });
+
+  // 1. Create a remote bare repository in the temp root
+  const bareDir = join(context.project, "../bare.git");
+  await mkdir(bareDir, { recursive: true });
+  await execFileAsync("git", ["init", "--bare", "--initial-branch=main"], { cwd: bareDir });
+
+  // 2. Point our local project's origin to this bare repo and push main
+  await execFileAsync("git", ["remote", "add", "origin", bareDir], { cwd: context.project });
+  await execFileAsync("git", ["push", "origin", "main"], { cwd: context.project });
+
+  // 3. Open via MCP in worktree mode - DevSpace will create a managed worktree internally
+  const openRes = await context.client.callTool({
+    name: "open_workspace",
+    arguments: { path: context.project, mode: "worktree" },
+  });
+  assert.equal(openRes.isError, undefined);
+  const ws = structuredContent(openRes);
+  const workspaceId = ws.workspaceId as string;
+  assert.ok(workspaceId);
+  assert.equal(ws.mode, "worktree");
+  assert.equal((ws.worktree as any)?.managed, true);
+
+  // 4. The actual managed worktree path is in ws.root
+  const worktreeRoot = ws.root as string;
+  assert.ok(worktreeRoot);
+
+  // Configure git identity in the managed worktree
+  await execFileAsync("git", ["config", "user.email", "mcp-test@example.com"], { cwd: worktreeRoot });
+  await execFileAsync("git", ["config", "user.name", "MCP Test User"], { cwd: worktreeRoot });
+  await execFileAsync("git", ["config", "remote.origin.url", bareDir], { cwd: worktreeRoot });
+
+  const initialHead = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: worktreeRoot })).stdout.trim();
+
+  // 5. Write a file in the managed worktree
+  await writeFile(join(worktreeRoot, "mcp-canary.txt"), "mcp content\n");
+
+  // 6. Execute git_commit via MCP
+  const commitRes = await context.client.callTool({
+    name: "git_commit",
+    arguments: {
+      workspaceId,
+      expectedHead: initialHead,
+      message: "feat: add mcp-canary.txt",
+      paths: ["mcp-canary.txt"],
+    },
+  });
+  assert.equal(commitRes.isError, undefined);
+  const commitResult = structuredContent(commitRes);
+  const commitSha = commitResult.commitSha as string;
+  assert.ok(commitSha);
+  assert.notEqual(commitSha, initialHead);
+  assert.equal(commitResult.previousHead, initialHead);
+
+  // 7. Execute git_push via MCP
+  const pushRes = await context.client.callTool({
+    name: "git_push",
+    arguments: {
+      workspaceId,
+      expectedHead: commitSha,
+      remote: "origin",
+      branch: "candidate/mcp-test-1",
+    },
+  });
+  assert.equal(pushRes.isError, undefined);
+  const pushResult = structuredContent(pushRes);
+  assert.equal(pushResult.remote, "origin");
+  assert.equal(pushResult.branch, "candidate/mcp-test-1");
+  assert.equal(pushResult.pushedSha, commitSha);
+
+  // 8. Verify the bare repo SHA equals the committed & pushed SHA
+  const { stdout: bareSha } = await execFileAsync("git", ["rev-parse", "refs/heads/candidate/mcp-test-1"], { cwd: bareDir });
+  assert.equal(bareSha.trim(), commitSha);
+});

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,7 +8,7 @@ import { commitCandidate, pushCandidate, GitCandidateError } from "./git-candida
 
 // Helper to run raw git commands for setup/verification
 function runGitRaw(args: string[], cwd: string): string {
-  return execSync(`git ${args.join(" ")}`, { cwd, encoding: "utf8", env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } }).trim();
+  return execFileSync("git", args, { cwd, encoding: "utf8", env: { ...process.env, GIT_TERMINAL_PROMPT: "0" } }).trim();
 }
 
 function setupGitFixture() {
@@ -35,12 +35,11 @@ function setupGitFixture() {
   const initialHead = runGitRaw(["rev-parse", "HEAD"], cloneDir);
 
   // 4. Create git worktree (simulating managed worktree)
-  runGitRaw(["worktree", "add", worktreeDir, "main"], cloneDir);
+  runGitRaw(["worktree", "add", "--detach", worktreeDir], cloneDir);
   runGitRaw(["config", "user.email", "test@example.com"], worktreeDir);
   runGitRaw(["config", "user.name", "Test User"], worktreeDir);
-
-  // Detach worktree head to simulate detached candidate run
-  runGitRaw(["checkout", "--detach"], worktreeDir);
+  // Force local hooks path to bypass any user global core.hooksPath configuration
+  runGitRaw(["config", "core.hooksPath", join(cloneDir, ".git", "hooks")], worktreeDir);
   const worktreeHead = runGitRaw(["rev-parse", "HEAD"], worktreeDir);
 
   const clean = () => {
@@ -377,6 +376,198 @@ test("pushCandidate - non-fast-forward push failure", async () => {
         return true;
       }
     );
+  } finally {
+    f.clean();
+  }
+});
+
+test("commitCandidate - git secret isolation hook sentinel test", async () => {
+  const f = setupGitFixture();
+  try {
+    // Write pre-commit hook that fails if secret leaks
+    const hooksDir = join(f.cloneDir, ".git", "hooks");
+    mkdirSync(hooksDir, { recursive: true });
+    const hookPath = join(hooksDir, "pre-commit");
+
+    writeFileSync(
+      hookPath,
+      `#!/bin/sh
+if [ -n "$DEVSPACE_OAUTH_OWNER_TOKEN" ] || [ -n "$DEVSPACE_SENSITIVE_SECRET" ] || [ -n "$DEVSPACE_OAUTH_SCOPES" ]; then
+  exit 99
+fi
+exit 0
+`
+    );
+    execFileSync("chmod", ["+x", hookPath]);
+
+    // Setup dummy file
+    writeFileSync(join(f.worktreeDir, "secret-test.txt"), "secret test");
+
+    // Inject secrets to process.env
+    process.env.DEVSPACE_OAUTH_OWNER_TOKEN = "DO_NOT_LEAK";
+    process.env.DEVSPACE_SENSITIVE_SECRET = "DO_NOT_LEAK";
+    process.env.DEVSPACE_OAUTH_SCOPES = "DO_NOT_LEAK";
+
+    // Should succeed because runGit strips them
+    const result = await commitCandidate({
+      workspaceId: "ws",
+      workspaceRoot: f.worktreeDir,
+      expectedHead: f.worktreeHead,
+      message: "commit with secret isolation check",
+      paths: ["secret-test.txt"],
+    });
+
+    assert.ok(result.commitSha);
+  } finally {
+    delete process.env.DEVSPACE_OAUTH_OWNER_TOKEN;
+    delete process.env.DEVSPACE_SENSITIVE_SECRET;
+    delete process.env.DEVSPACE_OAUTH_SCOPES;
+    f.clean();
+  }
+});
+
+test("commitCandidate - no automatic reset on fail", async () => {
+  const f = setupGitFixture();
+  try {
+    const hooksDir = join(f.cloneDir, ".git", "hooks");
+    mkdirSync(hooksDir, { recursive: true });
+    const hookPath = join(hooksDir, "pre-commit");
+    writeFileSync(hookPath, `#!/bin/sh\nexit 1\n`);
+    execFileSync("chmod", ["+x", hookPath]);
+
+    writeFileSync(join(f.worktreeDir, "fail.txt"), "fail content");
+
+    await assert.rejects(
+      commitCandidate({
+        workspaceId: "ws",
+        workspaceRoot: f.worktreeDir,
+        expectedHead: f.worktreeHead,
+        message: "failed commit test",
+        paths: ["fail.txt"],
+      })
+    );
+
+    // Verify index is NOT reset (fail.txt should remain staged)
+    const staged = execFileSync("git", ["diff", "--cached", "--name-only"], { cwd: f.worktreeDir }).toString().trim();
+    assert.equal(staged, "fail.txt");
+  } finally {
+    f.clean();
+  }
+});
+
+test("commitCandidate - expected HEAD parent verification", async () => {
+  const f = setupGitFixture();
+  try {
+    writeFileSync(join(f.worktreeDir, "adv.txt"), "advance");
+    const result = await commitCandidate({
+      workspaceId: "ws",
+      workspaceRoot: f.worktreeDir,
+      expectedHead: f.worktreeHead,
+      message: "advancing commit",
+      paths: ["adv.txt"],
+    });
+
+    assert.ok(result.commitSha);
+    assert.notEqual(result.commitSha, f.worktreeHead);
+
+    const parent = execFileSync("git", ["rev-parse", "HEAD^1"], { cwd: f.worktreeDir }).toString().trim();
+    assert.equal(parent, f.worktreeHead);
+  } finally {
+    f.clean();
+  }
+});
+
+test("pushCandidate - exact refspec and ls-remote verification", async () => {
+  const f = setupGitFixture();
+  try {
+    writeFileSync(join(f.worktreeDir, "p1.txt"), "v1");
+    const commit = await commitCandidate({
+      workspaceId: "ws",
+      workspaceRoot: f.worktreeDir,
+      expectedHead: f.worktreeHead,
+      message: "commit for push verify",
+      paths: ["p1.txt"],
+    });
+
+    await assert.rejects(
+      pushCandidate({
+        workspaceRoot: f.worktreeDir,
+        expectedHead: commit.commitSha,
+        remote: "-invalid-remote",
+        branch: "candidate-branch-ok",
+      })
+    );
+
+    const pushResult = await pushCandidate({
+      workspaceRoot: f.worktreeDir,
+      expectedHead: commit.commitSha,
+      remote: "origin",
+      branch: "candidate-branch-ok",
+    });
+
+    assert.equal(pushResult.pushedSha, commit.commitSha);
+
+    const remoteRef = execFileSync("git", ["ls-remote", "--heads", "origin", "refs/heads/candidate-branch-ok"], { cwd: f.worktreeDir }).toString().trim();
+    assert.ok(remoteRef.startsWith(commit.commitSha));
+  } finally {
+    f.clean();
+  }
+});
+
+test("commitCandidate - hung hook timeout test", async () => {
+  const f = setupGitFixture();
+  try {
+    const hooksDir = join(f.cloneDir, ".git", "hooks");
+    mkdirSync(hooksDir, { recursive: true });
+    const hookPath = join(hooksDir, "pre-commit");
+
+    writeFileSync(hookPath, `#!/bin/sh\nsleep 100\n`);
+    execFileSync("chmod", ["+x", hookPath]);
+
+    writeFileSync(join(f.worktreeDir, "timeout-test.txt"), "timeout content");
+
+    const startTime = Date.now();
+    await assert.rejects(
+      commitCandidate({
+        workspaceId: "ws",
+        workspaceRoot: f.worktreeDir,
+        expectedHead: f.worktreeHead,
+        message: "should timeout commit",
+        paths: ["timeout-test.txt"],
+      }),
+      (err: any) => {
+        assert.match(err.message, /timed out/);
+        return true;
+      }
+    );
+
+    const duration = Date.now() - startTime;
+    assert.ok(duration >= 25000 && duration < 40000, `Expected timeout around 30s, got ${duration}ms`);
+  } finally {
+    f.clean();
+  }
+});
+
+test("commitCandidate - macOS var/private/var alias verification", async () => {
+  const f = setupGitFixture();
+  try {
+    let aliasPath = f.worktreeDir;
+    if (f.worktreeDir.startsWith("/private/var/")) {
+      aliasPath = f.worktreeDir.replace("/private/var/", "/var/");
+    } else if (f.worktreeDir.startsWith("/var/")) {
+      aliasPath = "/private" + f.worktreeDir;
+    }
+
+    writeFileSync(join(f.worktreeDir, "alias.txt"), "alias");
+    const result = await commitCandidate({
+      workspaceId: "ws",
+      workspaceRoot: aliasPath,
+      expectedHead: f.worktreeHead,
+      message: "alias test commit",
+      paths: ["alias.txt"],
+    });
+
+    assert.ok(result.commitSha);
   } finally {
     f.clean();
   }
