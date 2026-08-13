@@ -12,12 +12,15 @@ test("instruction discovery preserves filename, skip, and symlink semantics", as
   const rootInstructions = join(root, "AGENTS.md");
   const supported = [
     join(root, "apps", "AGENTS.md"),
-    join(root, "apps", "AGENTS.MD"),
+    join(root, "apps-uppercase", "AGENTS.MD"),
     join(root, "packages", "CLAUDE.md"),
-    join(root, "packages", "CLAUDE.MD"),
+    join(root, "packages-uppercase", "CLAUDE.MD"),
   ];
-  await mkdir(join(root, "apps"), { recursive: true });
-  await mkdir(join(root, "packages"), { recursive: true });
+  await Promise.all(
+    ["apps", "apps-uppercase", "packages", "packages-uppercase"].map((directory) =>
+      mkdir(join(root, directory), { recursive: true }),
+    ),
+  );
   await mkdir(join(root, "node_modules", "dependency"), { recursive: true });
   await writeFile(rootInstructions, "root\n");
   await Promise.all(supported.map((path) => writeFile(path, "nested\n")));
