@@ -944,3 +944,37 @@ test("symlink fingerprint derives from link target text, not external target byt
     f.clean();
   }
 });
+
+// 11. PATHSpec MAGIC NAME: a filename that looks like Git pathspec magic
+// (`:(glob)*.txt`) must be fingerprinted literally, not as a glob pattern. Its
+// gitStateHash is computed with `--literal-pathspecs`, so changing only an
+// unrelated `.txt` file's Git state (worktree + index) must not change the
+// magic-name path's fingerprint.
+test("pathspec-magic-looking filename is fingerprinted literally", async () => {
+  const f = setupGitFixture();
+  try {
+    const magicName = ":(glob)*.txt";
+    writeFileSync(join(f.repo, magicName), "magic v1");
+    writeFileSync(join(f.repo, "unrelated.txt"), "A");
+    runGitRaw(["add", "."], f.repo);
+    runGitRaw(["commit", "-m", "seed magic-name and unrelated paths"], f.repo);
+
+    writeFileSync(join(f.repo, magicName), "magic v2");
+    const first = await inspectWorkspacePhysicalState(f.repo);
+    const firstFp = first.fingerprints?.[magicName];
+    assert.ok(firstFp);
+    assert.equal(firstFp.kind, "modified");
+    assert.ok(typeof firstFp.gitStateHash === "string" && firstFp.gitStateHash.length > 0);
+
+    writeFileSync(join(f.repo, "unrelated.txt"), "B");
+    runGitRaw(["add", "unrelated.txt"], f.repo);
+
+    const second = await inspectWorkspacePhysicalState(f.repo);
+    const secondFp = second.fingerprints?.[magicName];
+    assert.ok(secondFp);
+    assert.equal(secondFp.gitStateHash, firstFp.gitStateHash);
+    assert.equal(secondFp.contentHash, firstFp.contentHash);
+  } finally {
+    f.clean();
+  }
+});
