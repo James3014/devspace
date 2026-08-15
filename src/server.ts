@@ -70,12 +70,15 @@ import {
   AGENT_LIST_MAX_LIMIT,
   AGENT_LIST_DEFAULT_LIMIT,
 } from "./local-agent-sessions.js";
+import { parseExecutionContract } from "./local-agent-contract.js";
+import { runToolchainVerifier, resolveToolchainExecutable } from "./local-agent-toolchains.js";
 
 type Transport = StreamableHTTPServerTransport;
 // MCP clients can reconnect without closing the previous transport. Bound stale
 // session retention so abandoned MCP servers do not accumulate for the life of the process.
 const MCP_SESSION_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
+const AGENT_SUPERVISION_INTERVAL_MS = 2_000;
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
 const WRITE_TOOL_ANNOTATIONS = {
@@ -1698,6 +1701,36 @@ export function createMcpServer(
           workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
           profile: z.string().describe("Name of an advertised agent profile to run."),
           prompt: z.string().describe("Task prompt for the agent."),
+          executionContract: z
+            .object({
+              expectedHead: z
+                .string()
+                .describe("40-character commit SHA. If supplied, agent_start fails closed when workspace HEAD no longer matches."),
+              writePaths: z
+                .array(z.string())
+                .describe("Exact intended writable paths relative to the workspace root. Observed and aborted on violation; not a hard sandbox."),
+              maxFiles: z
+                .number()
+                .int()
+                .min(1)
+                .describe("Maximum number of files the worker may change."),
+              toolchainId: z
+                .string()
+                .describe("Toolchain id used to resolve verifier executables. Must already be configured; Dev MCP does not install toolchains."),
+              maxWallMs: z
+                .number()
+                .int()
+                .min(1)
+                .describe("Optional wall-clock bound for the whole agent turn."),
+              idleTimeoutMs: z
+                .number()
+                .int()
+                .min(1)
+                .describe("Recorded and surfaced; not auto-enforced (no mid-run activity signal)."),
+            })
+            .partial()
+            .optional()
+            .describe("Optional structured execution contract. Records and enforces where/how the worker may run."),
         },
         outputSchema: {
           agentId: z.string(),
@@ -1714,15 +1747,25 @@ export function createMcpServer(
         _meta: {},
         annotations: AGENT_TOOL_ANNOTATIONS_WRITE,
       },
-      async ({ workspaceId, profile, prompt }) => {
+      async ({ workspaceId, profile, prompt, executionContract }) => {
         const workspace = workspaces.getWorkspace(workspaceId);
         const profiles = await loadLocalAgentProfiles(config, workspace.root);
+        let contract;
+        try {
+          contract = parseExecutionContract(executionContract);
+        } catch (error) {
+          throw new AgentSessionError(
+            "INVALID_EXECUTION_CONTRACT",
+            error instanceof Error ? error.message : String(error),
+          );
+        }
         const output = await agentSessionManager.startAgent({
           workspaceId,
           workspaceRoot: workspace.root,
           profileName: profile,
           prompt,
           profiles,
+          executionContract: contract,
         });
         logToolCall(config, {
           tool: "agent_start",
@@ -1819,6 +1862,14 @@ export function createMcpServer(
           error: z.string().optional(),
           createdAt: z.string(),
           updatedAt: z.string(),
+          startedAt: z.string().optional(),
+          lastActivityAt: z.string().optional(),
+          lastFileMutationAt: z.number().optional(),
+          wallMs: z.number().optional(),
+          idleMs: z.number().optional(),
+          changedPaths: z.array(z.string()).optional(),
+          terminalReason: z.string().optional(),
+          scopeState: z.string().optional(),
         },
         _meta: {},
         annotations: { readOnlyHint: true },
@@ -1940,6 +1991,207 @@ export function createMcpServer(
         return {
           content: [textBlock(summary)],
           structuredContent: { agents },
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
+      "agent_preflight",
+      {
+        title: "Agent preflight",
+        description:
+          "Read-only readiness evidence for an exact workspace + agent profile before dispatch. Provider 'configured' is not the same as dispatch-ready; unknown evidence stays unknown. Never exposes credentials and grants no routing/admission authority.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          profile: z.string().describe("Name of an advertised agent profile to check."),
+          toolchainId: z.string().optional().describe("Optional toolchain id to check availability for."),
+        },
+        outputSchema: {
+          workspace: z.object({
+            workspaceId: z.string(),
+            root: z.string(),
+            head: z.string().optional(),
+            dirty: z.boolean(),
+            isolated: z.boolean(),
+          }),
+          worker: z.object({
+            profile: z.string(),
+            provider: z.string(),
+            model: z.string().optional(),
+            thinking: z.string().optional(),
+            executionIdentity: z.string(),
+            runtimeVersion: z.string().optional(),
+          }),
+          readiness: z.object({
+            profileResolved: z.boolean(),
+            providerConfigured: z.boolean(),
+            authReady: z.union([z.boolean(), z.string()]),
+            providerReachable: z.union([z.boolean(), z.string()]),
+            runtimeReady: z.boolean(),
+            capacityAvailable: z.boolean(),
+            dispatchState: z.enum(["READY", "BLOCKED", "UNKNOWN"]),
+          }),
+          toolchain: z.object({
+            id: z.string(),
+            available: z.boolean(),
+            executables: z.record(z.string(), z.string()).optional(),
+          }),
+          blockers: z.array(z.object({ code: z.string(), detail: z.string() })),
+          unknowns: z.array(z.string()),
+        },
+        _meta: {},
+        annotations: { readOnlyHint: true },
+      },
+      async ({ workspaceId, profile, toolchainId }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const profiles = await loadLocalAgentProfiles(config, workspace.root);
+        const output = await agentSessionManager.preflightAgent({
+          workspaceId,
+          workspaceRoot: workspace.root,
+          isolated: workspace.mode === "worktree",
+          profileName: profile,
+          profiles,
+          toolchainId,
+        });
+        const blockerSummary =
+          output.blockers.length > 0
+            ? ` Blockers: ${output.blockers.map((blocker) => blocker.code).join(", ")}`
+            : "";
+        return {
+          content: [
+            textBlock(
+              `Preflight for ${profile}: dispatchState=${output.readiness.dispatchState}.${blockerSummary}`,
+            ),
+          ],
+          structuredContent: output as unknown as Record<string, unknown>,
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
+      "agent_reconcile",
+      {
+        title: "Reconcile agent",
+        description:
+          "Read-only physical reconciliation for an exact durable agent. Reports what actually happened in the workspace regardless of provider/session status. A provider timeout/error does NOT imply no candidate exists. Never retries mutation.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          agentId: z.string().describe("Exact agent ID returned by agent_start."),
+        },
+        outputSchema: {
+          agentId: z.string(),
+          agentState: z.string(),
+          providerState: z.string().optional(),
+          providerSessionId: z.string().optional(),
+          terminalReason: z.string().optional(),
+          workspace: z.object({ head: z.string().optional(), dirty: z.boolean() }),
+          candidate: z.object({
+            present: z.boolean(),
+            changedPaths: z.array(z.string()),
+            unexpectedPaths: z.array(z.string()),
+            diffHash: z.string().optional(),
+            scopeState: z.string(),
+          }),
+          activity: z.object({
+            startedAt: z.string(),
+            lastActivityAt: z.string(),
+            lastFileMutationAt: z.number().optional(),
+            wallMs: z.number(),
+            idleMs: z.number(),
+          }),
+        },
+        _meta: {},
+        annotations: { readOnlyHint: true },
+      },
+      async ({ workspaceId, agentId }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const output = await agentSessionManager.reconcileAgent({
+          workspaceId,
+          workspaceRoot: workspace.root,
+          isolated: workspace.mode === "worktree",
+          agentId,
+        });
+        const candidateLine = output.candidate.present
+          ? `Candidate present (${output.candidate.changedPaths.length} changed path(s), scope=${output.candidate.scopeState}).`
+          : "No physical candidate changes detected.";
+        return {
+          content: [
+            textBlock(
+              `Agent ${output.agentId} state=${output.agentState}. ${candidateLine}`,
+            ),
+          ],
+          structuredContent: output as unknown as Record<string, unknown>,
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
+      "workspace_verify",
+      {
+        title: "Verify workspace",
+        description:
+          "Run an allowlisted verifier executable from a configured toolchain inside the workspace. Bounded cwd, bounded timeout, structured exit code. Always available; when no compatible toolchain is configured it returns a structured TOOLCHAIN_UNAVAILABLE result instead of installing or repairing toolchains.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          toolchainId: z.string().describe("Configured toolchain id."),
+          verifier: z.string().describe("Verifier name defined by the toolchain, e.g. pytest or ruff."),
+          args: z.array(z.string()).default([]).describe("Arguments passed to the verifier executable."),
+          timeoutMs: z.number().int().min(1).optional().describe("Timeout in milliseconds."),
+        },
+        outputSchema: {
+          ok: z.boolean(),
+          error: z
+            .object({ code: z.string(), message: z.string() })
+            .optional(),
+          toolchainId: z.string().optional(),
+          verifier: z.string().optional(),
+          executable: z.string().optional(),
+          exitCode: z.number().nullable().optional(),
+          timedOut: z.boolean().optional(),
+          durationMs: z.number().optional(),
+          stdout: z.string().optional(),
+          stderr: z.string().optional(),
+        },
+        _meta: {},
+        annotations: { readOnlyHint: true },
+      },
+      async ({ workspaceId, toolchainId, verifier, args, timeoutMs }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const resolved = resolveToolchainExecutable(config.toolchains, toolchainId, verifier);
+        if (!resolved) {
+          return {
+            content: [
+              textBlock(
+                `TOOLCHAIN_UNAVAILABLE: toolchain '${toolchainId}' verifier '${verifier}' is not configured or not resolvable.`,
+              ),
+            ],
+            structuredContent: {
+              ok: false,
+              error: {
+                code: "TOOLCHAIN_UNAVAILABLE",
+                message: `Toolchain '${toolchainId}' verifier '${verifier}' is not configured or not resolvable.`,
+              },
+            },
+          };
+        }
+        const result = await runToolchainVerifier({
+          toolchains: config.toolchains,
+          toolchainId,
+          verifier,
+          args,
+          cwd: workspace.root,
+          timeoutMs,
+        });
+        return {
+          content: [
+            textBlock(
+              `${verifier} exited with code ${result.exitCode ?? "null"} in ${result.durationMs}ms.`,
+            ),
+          ],
+          structuredContent: { ok: true, ...result } as unknown as Record<string, unknown>,
         };
       },
     );
@@ -2120,6 +2372,17 @@ export function createServer(
   const agentSessionManager = config.subagents
     ? new LocalAgentSessionManager(config)
     : undefined;
+
+  const agentSupervisionTimer = agentSessionManager
+    ? setInterval(() => {
+        void agentSessionManager.superviseActiveAgents().catch((error) => {
+          logEvent(config.logging, "error", "agent_supervision_error", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      }, AGENT_SUPERVISION_INTERVAL_MS)
+    : undefined;
+  agentSupervisionTimer?.unref();
 
   const logSessionCloseResults = (
     reason: "idle_timeout" | "server_shutdown",
@@ -2309,6 +2572,7 @@ export function createServer(
     close: () => {
       closePromise ??= (async () => {
         clearInterval(sessionCleanupTimer);
+        if (agentSupervisionTimer) clearInterval(agentSupervisionTimer);
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
         processSessions.shutdown();

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { chmodSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -185,7 +186,10 @@ interface ServerFixture {
   close: () => Promise<void>;
 }
 
-async function fixture(t: TestContext, options: { git?: boolean; subagents?: boolean; gitCandidates?: boolean } = {}): Promise<ServerFixture> {
+async function fixture(
+  t: TestContext,
+  options: { git?: boolean; subagents?: boolean; gitCandidates?: boolean; toolchains?: string } = {},
+): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
   const project = join(root, "project");
   const agentDir = join(root, "agent");
@@ -225,6 +229,7 @@ async function fixture(t: TestContext, options: { git?: boolean; subagents?: boo
     DEVSPACE_SUBAGENTS: options.subagents ? "true" : "false",
     DEVSPACE_STATE_DIR: stateDir,
     DEVSPACE_GIT_CANDIDATES: options.gitCandidates ? "true" : "false",
+    DEVSPACE_TOOLCHAINS: options.toolchains,
   });
   const store = new SqliteWorkspaceStore(stateDir);
   const workspaces = new WorkspaceRegistry(config, store);
@@ -321,19 +326,23 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   const context = await fixture(t, { subagents: true });
   const tools = await context.client.listTools();
   const agentTools = tools.tools.filter((tool) => tool.name.startsWith("agent_"));
-  assert.equal(agentTools.length, 5);
+  assert.equal(agentTools.length, 7);
 
   const startTool = agentTools.find((tool) => tool.name === "agent_start");
   const continueTool = agentTools.find((tool) => tool.name === "agent_continue");
   const statusTool = agentTools.find((tool) => tool.name === "agent_status");
   const cancelTool = agentTools.find((tool) => tool.name === "agent_cancel");
   const listTool = agentTools.find((tool) => tool.name === "agent_list");
+  const preflightTool = agentTools.find((tool) => tool.name === "agent_preflight");
+  const reconcileTool = agentTools.find((tool) => tool.name === "agent_reconcile");
 
   assert.ok(startTool);
   assert.ok(continueTool);
   assert.ok(statusTool);
   assert.ok(cancelTool);
   assert.ok(listTool);
+  assert.ok(preflightTool);
+  assert.ok(reconcileTool);
 
   // Verify start annotations
   assert.equal(startTool.annotations?.readOnlyHint, false);
@@ -519,6 +528,172 @@ test("subagents: unknown/invalid workspaceId fails closed before durable-agent a
   });
   assert.equal(listRes.isError, true);
   assert.match(responseText(listRes), /Unknown workspace/);
+});
+
+test("subagents: agent_preflight returns structured readiness without secrets", async (t) => {
+  const context = await fixture(t, { git: true, subagents: true });
+  const openResult = await callOpen(context.client, context.project, "chat-preflight");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+
+  const preflightResult = await context.client.callTool({
+    name: "agent_preflight",
+    arguments: { workspaceId, profile: "reviewer" },
+  });
+  assert.equal(preflightResult.isError, undefined);
+  const preflight = structuredContent(preflightResult);
+  assert.equal((preflight.workspace as Record<string, unknown>).isolated, false);
+  assert.equal((preflight.workspace as Record<string, unknown>).dirty, false);
+  assert.equal((preflight.worker as Record<string, unknown>).profile, "reviewer");
+  const readiness = preflight.readiness as Record<string, unknown>;
+  assert.equal(readiness.profileResolved, true);
+  assert.equal(readiness.authReady, "unknown");
+  assert.equal(readiness.providerReachable, "unknown");
+  assert.equal(readiness.dispatchState, "UNKNOWN");
+  const serialized = JSON.stringify(preflight);
+  assert.ok(!serialized.includes("test-owner-token"));
+  assert.ok(!serialized.includes("DEVSPACE_OAUTH"));
+});
+
+test("subagents: agent_start executionContract expectedHead mismatch fails closed", async (t) => {
+  const context = await fixture(t, { git: true, subagents: true });
+  const openResult = await callOpen(context.client, context.project, "chat-contract");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+
+  const staleResult = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "work",
+      executionContract: { expectedHead: "a".repeat(40), writePaths: ["src"] },
+    },
+  });
+  assert.equal(staleResult.isError, true);
+  assert.match(responseText(staleResult), /expected HEAD|stale workspace/i);
+
+  const head = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: context.project });
+  const startResult = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "work",
+      executionContract: { expectedHead: head.stdout.trim(), writePaths: ["src"] },
+    },
+  });
+  assert.equal(startResult.isError, undefined);
+  assert.equal((structuredContent(startResult) as Record<string, unknown>).status, "starting");
+});
+
+test("subagents: agent_reconcile reports physical diff as candidate evidence", async (t) => {
+  const context = await fixture(t, { git: true, subagents: true });
+  const openResult = await callOpen(context.client, context.project, "chat-reconcile");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+
+  const startResult = await context.client.callTool({
+    name: "agent_start",
+    arguments: { workspaceId, profile: "reviewer", prompt: "do work" },
+  });
+  const agentId = (structuredContent(startResult) as Record<string, unknown>).agentId as string;
+
+  await writeFile(join(context.project, "candidate.ts"), "export const x = 1;\n");
+
+  const reconcileResult = await context.client.callTool({
+    name: "agent_reconcile",
+    arguments: { workspaceId, agentId },
+  });
+  assert.equal(reconcileResult.isError, undefined);
+  const reconciled = structuredContent(reconcileResult);
+  assert.equal((reconciled.agentId as string), agentId);
+  const candidate = reconciled.candidate as Record<string, unknown>;
+  assert.equal(candidate.present, true);
+  assert.ok((candidate.changedPaths as string[]).includes("candidate.ts"));
+  assert.equal(candidate.scopeState, "UNKNOWN");
+
+  const statusResult = await context.client.callTool({
+    name: "agent_status",
+    arguments: { workspaceId, agentId },
+  });
+  const status = structuredContent(statusResult) as Record<string, unknown>;
+  assert.ok(typeof status.startedAt === "string");
+  assert.ok(typeof status.wallMs === "number");
+});
+
+test("subagents: workspace_verify always present, returns structured TOOLCHAIN_UNAVAILABLE without config", async (t) => {
+  const context = await fixture(t, { subagents: true });
+  const tools = await context.client.listTools();
+  assert.equal(tools.tools.some((tool) => tool.name === "workspace_verify"), true);
+
+  const openResult = await callOpen(context.client, context.project, "chat-verify-unconfigured");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+
+  const unconfigured = await context.client.callTool({
+    name: "workspace_verify",
+    arguments: { workspaceId, toolchainId: "nexus-python", verifier: "pytest", args: [] },
+  });
+  assert.equal(unconfigured.isError, undefined);
+  const body = structuredContent(unconfigured);
+  assert.equal(body.ok, false);
+  const error = body.error as Record<string, unknown>;
+  assert.equal(error.code, "TOOLCHAIN_UNAVAILABLE");
+  assert.match(responseText(unconfigured), /TOOLCHAIN_UNAVAILABLE/);
+});
+
+test("subagents: workspace_verify structured TOOLCHAIN_UNAVAILABLE when a toolchain exists but the verifier does not", async (t) => {
+  const toolchainRoot = await mkdtemp(join(tmpdir(), "devspace-server-toolchain-"));
+  const toolchains = JSON.stringify([
+    { id: "nexus-python", root: toolchainRoot, verifiers: { pytest: ".venv/bin/pytest" } },
+  ]);
+  const context = await fixture(t, { subagents: true, toolchains });
+  try {
+    const tools = await context.client.listTools();
+    assert.equal(tools.tools.some((tool) => tool.name === "workspace_verify"), true);
+
+    const openResult = await callOpen(context.client, context.project, "chat-verify-unresolved");
+    const workspaceId = structuredContent(openResult).workspaceId as string;
+
+    const unconfigured = await context.client.callTool({
+      name: "workspace_verify",
+      arguments: { workspaceId, toolchainId: "nexus-python", verifier: "ruff", args: [] },
+    });
+    assert.equal(unconfigured.isError, undefined);
+    const body = structuredContent(unconfigured);
+    assert.equal(body.ok, false);
+    assert.equal((body.error as Record<string, unknown>).code, "TOOLCHAIN_UNAVAILABLE");
+  } finally {
+    await rm(toolchainRoot, { recursive: true, force: true });
+  }
+});
+
+test("subagents: workspace_verify executes a configured verifier normally", async (t) => {
+  const toolchainRoot = await mkdtemp(join(tmpdir(), "devspace-server-toolchain-"));
+  const bin = join(toolchainRoot, ".venv", "bin");
+  await mkdir(bin, { recursive: true });
+  const verifierPath = join(bin, "pytest");
+  await writeFile(verifierPath, "#!/bin/sh\necho \"verifier-ran\"\nexit 0\n", { mode: 0o755 });
+  chmodSync(verifierPath, 0o755);
+  const toolchains = JSON.stringify([
+    { id: "nexus-python", root: toolchainRoot, verifiers: { pytest: ".venv/bin/pytest" } },
+  ]);
+  const context = await fixture(t, { git: true, subagents: true, toolchains });
+  try {
+    const openResult = await callOpen(context.client, context.project, "chat-verify-ok");
+    const workspaceId = structuredContent(openResult).workspaceId as string;
+
+    const result = await context.client.callTool({
+      name: "workspace_verify",
+      arguments: { workspaceId, toolchainId: "nexus-python", verifier: "pytest", args: ["-q"] },
+    });
+    assert.equal(result.isError, undefined);
+    const body = structuredContent(result);
+    assert.equal(body.ok, true);
+    assert.equal(body.exitCode, 0);
+    assert.equal(body.toolchainId, "nexus-python");
+    assert.match(body.stdout as string, /verifier-ran/);
+    assert.match(responseText(result), /exited with code 0/);
+  } finally {
+    await rm(toolchainRoot, { recursive: true, force: true });
+  }
 });
 
 test("gitCandidates disabled: git tools are absent", async (t) => {

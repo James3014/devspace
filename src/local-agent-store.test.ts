@@ -103,6 +103,35 @@ try {
     store.list({ workspaceId: "ws_1" }).map((agent) => agent.id).sort(),
     [created.id, failedContinuation.id, fenced.id, createdFromOtherStore.id].sort(),
   );
+
+  const contracted = store.create({
+    workspaceId: "ws_1",
+    workspaceRoot: join(root, "project"),
+    profileName: "implementer",
+    provider: "codex",
+    executionContract: {
+      writePaths: ["src"],
+      maxFiles: 3,
+      maxWallMs: 60_000,
+      toolchainId: "nexus-python",
+    },
+  });
+  assert.deepEqual(store.getById(contracted.id)?.executionContract?.writePaths, ["src"]);
+  assert.equal(store.getById(contracted.id)?.executionContract?.maxWallMs, 60_000);
+  assert.equal(store.getById(contracted.id)?.executionContract?.toolchainId, "nexus-python");
+
+  const completed = store.update(contracted.id, {
+    status: "error",
+    terminalReason: "scope_violation",
+    scopeState: "SCOPE_VIOLATION",
+    scopeBaseline: { changedPaths: [], head: "abc123" },
+  });
+  assert.equal(completed.terminalReason, "scope_violation");
+  assert.equal(completed.scopeState, "SCOPE_VIOLATION");
+  assert.deepEqual(completed.scopeBaseline, { changedPaths: [], head: "abc123" });
+  assert.equal(store.getById(contracted.id)?.scopeState, "SCOPE_VIOLATION");
+  assert.equal(store.getById(contracted.id)?.terminalReason, "scope_violation");
+  assert.equal(store.getById(contracted.id)?.scopeBaseline?.head, "abc123");
 } finally {
   for (const store of stores) {
     store.close();

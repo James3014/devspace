@@ -2,6 +2,14 @@ import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import type { ServerConfig } from "./config.js";
+import {
+  type AgentTerminalReason,
+  type ExecutionContract,
+  type ScopeBaseline,
+  type ScopeState,
+  deserializeExecutionContract,
+  serializeExecutionContract,
+} from "./local-agent-contract.js";
 
 export type LocalAgentStatus = "starting" | "running" | "idle" | "error" | "stopped";
 
@@ -16,6 +24,10 @@ export interface LocalAgentRecord {
   providerSessionId?: string;
   workerPid?: number;
   workerToken?: string;
+  executionContract?: ExecutionContract;
+  terminalReason?: AgentTerminalReason;
+  scopeState?: ScopeState;
+  scopeBaseline?: ScopeBaseline;
   status: LocalAgentStatus;
   latestResponse?: string;
   error?: string;
@@ -30,6 +42,7 @@ export interface CreateLocalAgentRecordInput {
   provider: string;
   model?: string;
   thinking?: string;
+  executionContract?: ExecutionContract;
 }
 
 export interface LocalAgentListScope {
@@ -48,6 +61,10 @@ interface LocalAgentRow {
   provider_session_id: string | null;
   worker_pid: number | null;
   worker_token: string | null;
+  execution_contract: string | null;
+  terminal_reason: string | null;
+  scope_state: string | null;
+  scope_baseline: string | null;
   status: string;
   latest_response: string | null;
   error: string | null;
@@ -107,6 +124,7 @@ export class LocalAgentStore {
       provider: input.provider,
       model: input.model,
       thinking: input.thinking,
+      executionContract: input.executionContract,
       status: "starting",
       createdAt: now,
       updatedAt: now,
@@ -122,10 +140,11 @@ export class LocalAgentStore {
           provider,
           model,
           thinking,
+          execution_contract,
           status,
           created_at,
           updated_at
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         record.id,
@@ -135,6 +154,7 @@ export class LocalAgentStore {
         record.provider,
         record.model ?? null,
         record.thinking ?? null,
+        serializeExecutionContract(record.executionContract),
         record.status,
         record.createdAt,
         record.updatedAt,
@@ -186,6 +206,10 @@ export class LocalAgentStore {
           provider_session_id = ?,
           worker_pid = ?,
           worker_token = ?,
+          execution_contract = ?,
+          terminal_reason = ?,
+          scope_state = ?,
+          scope_baseline = ?,
           status = ?,
           latest_response = ?,
           error = ?,
@@ -202,6 +226,10 @@ export class LocalAgentStore {
         updated.providerSessionId ?? null,
         updated.workerPid ?? null,
         updated.workerToken ?? null,
+        serializeExecutionContract(updated.executionContract),
+        updated.terminalReason ?? null,
+        updated.scopeState ?? null,
+        updated.scopeBaseline ? JSON.stringify(updated.scopeBaseline) : null,
         updated.status,
         updated.latestResponse ?? null,
         updated.error ?? null,
@@ -246,6 +274,8 @@ export class LocalAgentStore {
       providerSessionId?: string;
       latestResponse?: string;
       error?: string;
+      terminalReason?: AgentTerminalReason;
+      scopeState?: ScopeState;
     },
   ): LocalAgentRecord {
     const now = new Date().toISOString();
@@ -256,6 +286,8 @@ export class LocalAgentStore {
           status = ?,
           latest_response = ?,
           error = ?,
+          terminal_reason = ?,
+          scope_state = ?,
           worker_pid = null,
           worker_token = null,
           updated_at = ?
@@ -266,6 +298,8 @@ export class LocalAgentStore {
         patch.status,
         patch.latestResponse ?? null,
         patch.error ?? null,
+        patch.terminalReason ?? null,
+        patch.scopeState ?? null,
         now,
         id,
         workerToken,
@@ -287,6 +321,7 @@ export class LocalAgentStore {
         workerPid: undefined,
         workerToken: undefined,
         error: "cancelled by operator",
+        terminalReason: "cancelled",
       });
       return { previous, current };
     });
@@ -321,6 +356,10 @@ function rowToLocalAgentRecord(row: LocalAgentRow): LocalAgentRecord {
     providerSessionId: row.provider_session_id ?? undefined,
     workerPid: row.worker_pid ?? undefined,
     workerToken: row.worker_token ?? undefined,
+    executionContract: deserializeExecutionContract(row.execution_contract),
+    terminalReason: readTerminalReason(row.terminal_reason),
+    scopeState: readScopeState(row.scope_state),
+    scopeBaseline: readScopeBaseline(row.scope_baseline),
     status: readStatus(row.status),
     latestResponse: row.latest_response ?? undefined,
     error: row.error ?? undefined,
@@ -340,6 +379,43 @@ function readStatus(status: string): LocalAgentStatus {
     return status;
   }
   return "error";
+}
+
+function readTerminalReason(value: string | null | undefined): AgentTerminalReason | undefined {
+  if (!value) return undefined;
+  const reasons: AgentTerminalReason[] = [
+    "completed",
+    "cancelled",
+    "timeout",
+    "idle_timeout",
+    "scope_violation",
+    "provider_error",
+    "launch_failed",
+    "unknown",
+  ];
+  return reasons.includes(value as AgentTerminalReason) ? (value as AgentTerminalReason) : "unknown";
+}
+
+function readScopeState(value: string | null | undefined): ScopeState | undefined {
+  if (!value) return undefined;
+  if (value === "WITHIN_SCOPE" || value === "SCOPE_VIOLATION" || value === "UNKNOWN") {
+    return value;
+  }
+  return "UNKNOWN";
+}
+
+function readScopeBaseline(value: string | null | undefined): ScopeBaseline | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    const changedPaths = Array.isArray(parsed.changedPaths)
+      ? parsed.changedPaths.filter((entry): entry is string => typeof entry === "string")
+      : [];
+    const head = typeof parsed.head === "string" || parsed.head === null ? parsed.head : null;
+    return { changedPaths, head };
+  } catch {
+    return undefined;
+  }
 }
 
 function escapeLike(value: string): string {

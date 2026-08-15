@@ -180,3 +180,52 @@ function checkAgyAvailability(env: NodeJS.ProcessEnv): LocalAgentProviderAvailab
   }
   return { name: "agy", available: true };
 }
+
+/**
+ * Resolve the concrete executable for a provider, when the provider runs an
+ * external command. Package-providers (codex/claude/opencode) return undefined.
+ */
+export function resolveLocalAgentProviderExecutable(
+  provider: LocalAgentProvider,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  switch (provider) {
+    case "omp":
+      return resolveCommand(env.OMP_COMMAND ?? "omp", env);
+    case "pi":
+      return resolveCommand(env.PI_COMMAND ?? "pi", piAvailabilityEnvironment(env));
+    case "cursor":
+      return resolveCommand("cursor-agent", env);
+    case "copilot":
+      return resolveCommand("copilot", env);
+    case "agy":
+      return resolveAgyExecutable(env);
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Best-effort runtime version for a provider, from `--version` on the resolved
+ * executable. Package-providers report undefined. Never throws.
+ */
+export function getLocalAgentProviderRuntimeVersion(
+  provider: LocalAgentProvider,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const executable = resolveLocalAgentProviderExecutable(provider, env);
+  if (!executable) return undefined;
+  try {
+    const result = spawnSync(executable, ["--version"], {
+      encoding: "utf8",
+      env,
+      windowsHide: true,
+      timeout: 5_000,
+    });
+    if (result.error) return undefined;
+    const version = (result.stdout ?? "").trim() || (result.stderr ?? "").trim();
+    return version.slice(0, 120) || undefined;
+  } catch {
+    return undefined;
+  }
+}

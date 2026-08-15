@@ -15,11 +15,25 @@ import {
 import { loadLocalAgentProfiles, type LocalAgentProfile } from "./local-agent-profiles.js";
 import {
   checkLocalAgentProviderAvailability,
+  getLocalAgentProviderRuntimeVersion,
+  resolveLocalAgentProviderExecutable,
 } from "./local-agent-availability.js";
 import { runLocalAgentProvider } from "./local-agent-adapters.js";
 import type { LocalAgentRunResult } from "./local-agent-runtime.js";
 import { terminateProcessTree, type KillableProcess } from "./process-platform.js";
 import { canonicalizePath } from "./roots.js";
+import {
+  type AgentTerminalReason,
+  type ExecutionContract,
+  type ScopeState,
+} from "./local-agent-contract.js";
+import { describeToolchainExecutables } from "./local-agent-toolchains.js";
+import {
+  classifyScopeState,
+  inspectWorkspacePhysicalState,
+  readWorkspaceHead,
+  workerChangedPathsSinceBaseline,
+} from "./workspace-reconciliation.js";
 
 // ─── Error codes ────────────────────────────────────────────────────────────
 
@@ -32,7 +46,11 @@ export type AgentErrorCode =
   | "AGENT_ALREADY_RUNNING"
   | "INVALID_WAIT_MS"
   | "WORKER_LAUNCH_FAILED"
-  | "WORKER_TERMINATION_FAILED";
+  | "WORKER_TERMINATION_FAILED"
+  | "STALE_WORKSPACE"
+  | "NO_EXECUTION_CAPACITY"
+  | "TOOLCHAIN_UNAVAILABLE"
+  | "INVALID_EXECUTION_CONTRACT";
 
 export class AgentSessionError extends Error {
   constructor(
@@ -52,6 +70,7 @@ export interface StartAgentInput {
   profileName: string;
   prompt: string;
   profiles: LocalAgentProfile[];
+  executionContract?: ExecutionContract;
 }
 
 export interface ContinueAgentInput {
@@ -99,6 +118,94 @@ export interface AgentStatusOutput {
   error?: string;
   createdAt: string;
   updatedAt: string;
+  startedAt?: string;
+  lastActivityAt?: string;
+  lastFileMutationAt?: number;
+  wallMs?: number;
+  idleMs?: number;
+  changedPaths?: string[];
+  terminalReason?: AgentTerminalReason;
+  scopeState?: ScopeState;
+}
+
+export interface ReconcileAgentInput {
+  workspaceId: string;
+  workspaceRoot: string;
+  isolated: boolean;
+  agentId: string;
+}
+
+export interface ReconcileAgentOutput {
+  agentId: string;
+  agentState: LocalAgentStatus;
+  providerState?: string;
+  providerSessionId?: string;
+  terminalReason?: AgentTerminalReason;
+  workspace: {
+    head?: string;
+    dirty: boolean;
+  };
+  candidate: {
+    present: boolean;
+    changedPaths: string[];
+    unexpectedPaths: string[];
+    diffHash?: string;
+    scopeState: ScopeState;
+  };
+  activity: {
+    startedAt: string;
+    lastActivityAt: string;
+    lastFileMutationAt?: number;
+    wallMs: number;
+    idleMs: number;
+  };
+}
+
+export type ReadinessValue = boolean | "unknown";
+
+export type DispatchReadinessState = "READY" | "BLOCKED" | "UNKNOWN";
+
+export interface AgentPreflightInput {
+  workspaceId: string;
+  workspaceRoot: string;
+  isolated: boolean;
+  profileName: string;
+  profiles: LocalAgentProfile[];
+  toolchainId?: string;
+}
+
+export interface AgentPreflightOutput {
+  workspace: {
+    workspaceId: string;
+    root: string;
+    head?: string;
+    dirty: boolean;
+    isolated: boolean;
+  };
+  worker: {
+    profile: string;
+    provider: string;
+    model?: string;
+    thinking?: string;
+    executionIdentity: string;
+    runtimeVersion?: string;
+  };
+  readiness: {
+    profileResolved: boolean;
+    providerConfigured: boolean;
+    authReady: ReadinessValue;
+    providerReachable: ReadinessValue;
+    runtimeReady: boolean;
+    capacityAvailable: boolean;
+    dispatchState: DispatchReadinessState;
+  };
+  toolchain: {
+    id: string;
+    available: boolean;
+    executables?: Record<string, string>;
+  };
+  blockers: Array<{ code: string; detail: string }>;
+  unknowns: string[];
 }
 
 export interface AgentSummary {
@@ -109,6 +216,17 @@ export interface AgentSummary {
   thinking?: string;
   status: LocalAgentStatus;
   updatedAt: string;
+}
+
+interface LifecycleEvidence {
+  startedAt: string;
+  lastActivityAt: string;
+  lastFileMutationAt?: number;
+  wallMs: number;
+  idleMs: number;
+  changedPaths?: string[];
+  terminalReason?: AgentTerminalReason;
+  scopeState?: ScopeState;
 }
 
 export interface StartAgentOutput {
@@ -191,7 +309,7 @@ export class LocalAgentSessionManager {
    * Fail-closed: if worker fails to launch, record is set to error status.
    */
   async startAgent(input: StartAgentInput): Promise<StartAgentOutput> {
-    const { workspaceId, workspaceRoot, profileName, prompt, profiles } = input;
+    const { workspaceId, workspaceRoot, profileName, prompt, profiles, executionContract } = input;
 
     const profile = profiles.find((p) => p.name === profileName);
     if (!profile) {
@@ -210,6 +328,43 @@ export class LocalAgentSessionManager {
       );
     }
 
+    if (!this.hasExecutionCapacity()) {
+      throw new AgentSessionError(
+        "NO_EXECUTION_CAPACITY",
+        `Execution capacity exhausted: ${this.runningCount()} of ${this.config.agentMaxConcurrent} configured agent(s) active.`,
+      );
+    }
+
+    // Optional structured execution contract (execution-control only).
+    if (executionContract?.toolchainId) {
+      const toolchain = this.config.toolchains.find((candidate) => candidate.id === executionContract.toolchainId);
+      if (!toolchain) {
+        throw new AgentSessionError(
+          "TOOLCHAIN_UNAVAILABLE",
+          `Execution contract toolchain '${executionContract.toolchainId}' is not configured. ` +
+            `Configure DEVSPACE_TOOLCHAINS or omit toolchainId. Dev MCP will not install or repair toolchains.`,
+        );
+      }
+    }
+
+    if (executionContract?.expectedHead) {
+      const currentHead = await readWorkspaceHead(workspaceRoot);
+      if (!currentHead) {
+        throw new AgentSessionError(
+          "STALE_WORKSPACE",
+          `Execution contract expected HEAD ${executionContract.expectedHead}, but the workspace HEAD could not be resolved. ` +
+            `Refusing to start the worker against an unverifiable workspace.`,
+        );
+      }
+      if (currentHead !== executionContract.expectedHead.toLowerCase()) {
+        throw new AgentSessionError(
+          "STALE_WORKSPACE",
+          `Execution contract expected HEAD ${executionContract.expectedHead}, current workspace HEAD is ${currentHead}. ` +
+            `Refusing to start the worker against a stale workspace.`,
+        );
+      }
+    }
+
     const record = this.store.create({
       workspaceId,
       workspaceRoot,
@@ -217,6 +372,7 @@ export class LocalAgentSessionManager {
       provider: profile.provider,
       model: profile.model,
       thinking: profile.thinking,
+      executionContract,
     });
 
     await this.launchPrompt(record.id, prompt);
@@ -297,7 +453,7 @@ export class LocalAgentSessionManager {
       }
     }
 
-    return recordToStatusOutput(record);
+    return recordToStatusOutput(record, await this.buildLifecycleEvidence(record));
   }
 
   async cancelAgent(input: CancelAgentInput): Promise<AgentStatusOutput> {
@@ -351,6 +507,346 @@ export class LocalAgentSessionManager {
   }
 
   /**
+   * Read-only preflight for an exact workspace + agent profile.
+   * Reports readiness evidence without routing, admission, or mutation
+   * authority. Never exposes credentials. Unknown evidence stays unknown.
+   */
+  async preflightAgent(input: AgentPreflightInput): Promise<AgentPreflightOutput> {
+    const { workspaceId, workspaceRoot, isolated, profileName, profiles, toolchainId } = input;
+    const blockers: Array<{ code: string; detail: string }> = [];
+    const unknowns: string[] = [];
+
+    const workspaceState = await inspectWorkspacePhysicalState(workspaceRoot);
+    const workspace = {
+      workspaceId,
+      root: workspaceRoot,
+      head: workspaceState.head,
+      dirty: workspaceState.dirty,
+      isolated,
+    };
+
+    const profile = profiles.find((candidate) => candidate.name === profileName);
+    const profileResolved = Boolean(profile);
+    if (!profile) {
+      blockers.push({
+        code: "UNKNOWN_PROFILE",
+        detail: `Profile '${profileName}' is not advertised for this workspace.`,
+      });
+    }
+
+    let providerConfigured = false;
+    let runtimeReady = false;
+    let runtimeVersion: string | undefined;
+    let executionIdentity = "none";
+    if (profile) {
+      const availability = checkLocalAgentProviderAvailability(profile.provider);
+      providerConfigured = availability.available;
+      runtimeReady = availability.available;
+      executionIdentity = profile.provider;
+      if (!availability.available) {
+        blockers.push({
+          code: "RUNTIME_STARTUP_NOT_READY",
+          detail: `Provider '${profile.provider}' runtime is not configured: ${availability.reason ?? "unknown reason"}`,
+        });
+      } else {
+        runtimeVersion = getLocalAgentProviderRuntimeVersion(profile.provider);
+        const executable = resolveLocalAgentProviderExecutable(profile.provider);
+        if (executable) executionIdentity = executable;
+      }
+    }
+
+    // Authentication and provider reachability cannot be verified without an
+    // expensive provider call; there is no existing safe readiness probe.
+    // They must remain unknown rather than silently become true.
+    unknowns.push(
+      "authReady is unknown: Dev MCP cannot verify provider authentication without invoking the provider.",
+    );
+    unknowns.push(
+      "providerReachable is unknown: no safe readiness probe exists that does not spawn a provider runtime.",
+    );
+
+    const capacityAvailable = this.hasExecutionCapacity();
+    if (!capacityAvailable) {
+      blockers.push({
+        code: "NO_EXECUTION_CAPACITY",
+        detail: `${this.runningCount()} of ${this.config.agentMaxConcurrent} configured agent(s) are active.`,
+      });
+    }
+
+    let toolchainAvailable = false;
+    let executables: Record<string, string> | undefined;
+    if (toolchainId) {
+      const toolchain = this.config.toolchains.find((candidate) => candidate.id === toolchainId);
+      if (!toolchain) {
+        blockers.push({
+          code: "TOOLCHAIN_UNAVAILABLE",
+          detail: `Toolchain '${toolchainId}' is not configured.`,
+        });
+      } else {
+        toolchainAvailable = true;
+        executables = describeToolchainExecutables(this.config.toolchains, toolchainId);
+      }
+    }
+
+    // Tri-state dispatch readiness. UNKNOWN is never collapsed into a known
+    // failure and never promoted to READY without positive evidence.
+    const authReady: ReadinessValue = "unknown";
+    const providerReachable: ReadinessValue = "unknown";
+    const allRequiredPositive =
+      profileResolved &&
+      providerConfigured &&
+      runtimeReady &&
+      capacityAvailable &&
+      (toolchainId === undefined || toolchainAvailable);
+    const readinessSignalsPositive = isReadinessPositive(authReady) && isReadinessPositive(providerReachable);
+    const dispatchState: DispatchReadinessState = blockers.length > 0
+      ? "BLOCKED"
+      : allRequiredPositive && readinessSignalsPositive
+        ? "READY"
+        : "UNKNOWN";
+
+    return {
+      workspace,
+      worker: {
+        profile: profileName,
+        provider: profile?.provider ?? "unknown",
+        model: profile?.model,
+        thinking: profile?.thinking,
+        executionIdentity,
+        runtimeVersion,
+      },
+      readiness: {
+        profileResolved,
+        providerConfigured,
+        authReady,
+        providerReachable,
+        runtimeReady,
+        capacityAvailable,
+        dispatchState,
+      },
+      toolchain: toolchainId
+        ? { id: toolchainId, available: toolchainAvailable, executables }
+        : { id: "none", available: false },
+      blockers,
+      unknowns,
+    };
+  }
+
+  /**
+   * Read-only reconciliation: regardless of provider/session status, what
+   * physically happened in the workspace? Provider timeout/error must not
+   * imply "no candidate". Never retries mutation from here.
+   */
+  async reconcileAgent(input: ReconcileAgentInput): Promise<ReconcileAgentOutput> {
+    const { workspaceRoot, agentId, isolated: _isolated } = input;
+    const record = this.store.getById(agentId);
+    if (!record) {
+      throw new AgentSessionError("UNKNOWN_AGENT", `Unknown agent id: ${agentId}`);
+    }
+    if (canonicalizePath(record.workspaceRoot) !== canonicalizePath(workspaceRoot)) {
+      throw new AgentSessionError(
+        "AGENT_WORKSPACE_MISMATCH",
+        `Agent ${agentId} belongs to workspace root '${record.workspaceRoot}', not '${workspaceRoot}'`,
+      );
+    }
+
+    const physical = await inspectWorkspacePhysicalState(record.workspaceRoot);
+    const workerChanged = workerChangedPathsSinceBaseline(
+      physical.changedPaths,
+      record.scopeBaseline?.changedPaths,
+    );
+    const contract = record.executionContract;
+    const headAdvanced = Boolean(
+      record.scopeBaseline?.head &&
+        physical.head &&
+        record.scopeBaseline.head !== physical.head,
+    );
+
+    const { scopeState, unexpectedPaths } = this.classifyWorkerScope(
+      workerChanged,
+      contract?.writePaths,
+      contract?.maxFiles,
+    );
+
+    const startedAtMs = Date.parse(record.createdAt);
+    const updatedAtMs = Date.parse(record.updatedAt);
+    const now = Date.now();
+
+    return {
+      agentId: record.id,
+      agentState: record.status,
+      providerState: record.status,
+      providerSessionId: record.providerSessionId,
+      terminalReason: record.terminalReason,
+      workspace: {
+        head: physical.head,
+        dirty: physical.dirty,
+      },
+      candidate: {
+        present: workerChanged.length > 0 || headAdvanced,
+        changedPaths: workerChanged,
+        unexpectedPaths,
+        diffHash: physical.diffHash,
+        scopeState,
+      },
+      activity: {
+        startedAt: record.createdAt,
+        lastActivityAt: record.updatedAt,
+        lastFileMutationAt: physical.lastFileMutationAt,
+        wallMs: Math.max(0, now - startedAtMs),
+        idleMs: Math.max(0, now - updatedAtMs),
+      },
+    };
+  }
+
+  /**
+   * Supervise active agent sessions that carry an execution contract.
+   * Enforces maxWallMs and write-scope (OBSERVE_AND_ABORT) by terminating the
+   * owned worker. Called periodically by the server; safe to call directly in
+   * tests.
+   */
+  async superviseActiveAgents(): Promise<void> {
+    const now = Date.now();
+    for (const record of this.store.list()) {
+      if (record.status !== "running" && record.status !== "starting") continue;
+      const contract = record.executionContract;
+      if (!contract) continue;
+
+      const startedAtMs = Date.parse(record.createdAt);
+      if (contract.maxWallMs && now - startedAtMs > contract.maxWallMs) {
+        await this.terminateActiveAgent(
+          record.id,
+          "timeout",
+          `Agent exceeded execution contract maxWallMs of ${contract.maxWallMs}ms.`,
+        );
+        continue;
+      }
+
+      if (contract.writePaths?.length && record.status === "running") {
+        const baseline = record.scopeBaseline;
+        if (baseline) {
+          const physical = await inspectWorkspacePhysicalState(record.workspaceRoot);
+          if (physical.gitAvailable) {
+            const workerChanged = workerChangedPathsSinceBaseline(
+              physical.changedPaths,
+              baseline.changedPaths,
+            );
+            const { scopeState, unexpectedPaths } = this.classifyWorkerScope(
+              workerChanged,
+              contract.writePaths,
+              contract.maxFiles,
+            );
+            if (scopeState === "SCOPE_VIOLATION") {
+              await this.terminateActiveAgent(
+                record.id,
+                "scope_violation",
+                `Worker wrote outside the declared write scope. Offending paths: ${unexpectedPaths.join(", ")}`,
+              );
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /** Number of agents currently starting or running. */
+  runningCount(): number {
+    return this.store
+      .list()
+      .filter((record) => record.status === "starting" || record.status === "running").length;
+  }
+
+  private hasExecutionCapacity(): boolean {
+    const max = this.config.agentMaxConcurrent;
+    if (max === undefined || max === null || max <= 0) return true;
+    return this.runningCount() < max;
+  }
+
+  private async buildLifecycleEvidence(
+    record: LocalAgentRecord,
+  ): Promise<LifecycleEvidence | undefined> {
+    const physical = await inspectWorkspacePhysicalState(record.workspaceRoot);
+    const now = Date.now();
+    const startedAtMs = Date.parse(record.createdAt);
+    const updatedAtMs = Date.parse(record.updatedAt);
+
+    const workerChanged = workerChangedPathsSinceBaseline(
+      physical.changedPaths,
+      record.scopeBaseline?.changedPaths,
+    );
+    const changedPaths = record.scopeBaseline ? workerChanged : physical.changedPaths;
+
+    return {
+      startedAt: record.createdAt,
+      lastActivityAt: record.updatedAt,
+      lastFileMutationAt: physical.lastFileMutationAt,
+      wallMs: Math.max(0, now - startedAtMs),
+      idleMs: Math.max(0, now - updatedAtMs),
+      changedPaths: physical.gitAvailable ? changedPaths : undefined,
+      terminalReason: record.terminalReason,
+      scopeState: record.scopeState,
+    };
+  }
+
+  private async evaluateScope(agentId: string): Promise<{
+    scopeState: ScopeState;
+    unexpectedPaths: string[];
+  }> {
+    const record = this.store.getById(agentId);
+    if (!record) return { scopeState: "UNKNOWN", unexpectedPaths: [] };
+    const contract = record.executionContract;
+    if (!contract?.writePaths?.length && !contract?.maxFiles) {
+      return { scopeState: "UNKNOWN", unexpectedPaths: [] };
+    }
+    const physical = await inspectWorkspacePhysicalState(record.workspaceRoot);
+    if (!physical.gitAvailable) return { scopeState: "UNKNOWN", unexpectedPaths: [] };
+    const workerChanged = workerChangedPathsSinceBaseline(
+      physical.changedPaths,
+      record.scopeBaseline?.changedPaths,
+    );
+    return this.classifyWorkerScope(workerChanged, contract.writePaths, contract.maxFiles);
+  }
+
+  private classifyWorkerScope(
+    workerChanged: string[],
+    writePaths: string[] | undefined,
+    maxFiles: number | undefined,
+  ): { scopeState: ScopeState; unexpectedPaths: string[] } {
+    const pathResult = classifyScopeState(workerChanged, writePaths);
+    if (pathResult.scopeState === "SCOPE_VIOLATION") return pathResult;
+    if (maxFiles !== undefined && workerChanged.length > maxFiles) {
+      return { scopeState: "SCOPE_VIOLATION", unexpectedPaths: workerChanged };
+    }
+    return { scopeState: pathResult.scopeState, unexpectedPaths: pathResult.unexpectedPaths };
+  }
+
+  private async terminateActiveAgent(
+    agentId: string,
+    reason: AgentTerminalReason,
+    message: string,
+  ): Promise<void> {
+    const record = this.store.getById(agentId);
+    if (!record) return;
+    const wasActive = record.status === "starting" || record.status === "running";
+    const terminated = wasActive ? await this.terminator(record) : true;
+    const scopeState: ScopeState | undefined =
+      reason === "scope_violation" ? "SCOPE_VIOLATION" : record.scopeState;
+    this.store.update(agentId, {
+      status: "error",
+      workerPid: undefined,
+      workerToken: undefined,
+      error: message,
+      terminalReason: reason,
+      scopeState,
+    });
+    if (!terminated) {
+      this.store.update(agentId, {
+        error: `${message} Worker termination could not be verified.`,
+      });
+    }
+  }
+
+  /**
    * Run the worker turn for an agent, reading the prompt from a temp file.
    * Used by CLI __worker subcommand.
    * Cleans up the owned prompt temp file after execution (success or failure).
@@ -367,6 +863,15 @@ export class LocalAgentSessionManager {
 
     const prompt = await readFile(promptFile, "utf8");
     try {
+      // Snapshot the physical workspace BEFORE any provider mutation so that
+      // pre-existing changes are never attributed to this worker turn.
+      if (claimed.executionContract?.writePaths?.length) {
+        const state = await inspectWorkspacePhysicalState(claimed.workspaceRoot);
+        this.store.update(claimed.id, {
+          scopeBaseline: { changedPaths: state.changedPaths, head: state.head ?? null },
+        });
+      }
+
       const profiles = await loadLocalAgentProfiles(this.config, claimed.workspaceRoot);
       const profile = profiles.find((p) => p.name === claimed.profileName);
       let result: LocalAgentRunResult;
@@ -375,16 +880,27 @@ export class LocalAgentSessionManager {
       } else {
         result = await runRawLocalAgentProvider(claimed, prompt);
       }
+
+      const scope = await this.evaluateScope(claimed.id);
+      const scopeViolated = scope.scopeState === "SCOPE_VIOLATION";
       this.store.finishWorker(agentId, workerToken, {
         providerSessionId: result.providerSessionId ?? undefined,
         status: "idle",
         latestResponse: result.finalResponse,
-        error: undefined,
+        error: scopeViolated
+          ? `Agent wrote outside the declared write scope. Offending paths: ${scope.unexpectedPaths.join(", ")}`
+          : undefined,
+        terminalReason: scopeViolated ? "scope_violation" : "completed",
+        scopeState: scope.scopeState,
       });
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const scope = await this.evaluateScope(agentId);
       this.store.finishWorker(agentId, workerToken, {
         status: "error",
-        error: error instanceof Error ? error.message : String(error),
+        error: message,
+        terminalReason: classifyProviderError(message),
+        scopeState: scope.scopeState,
       });
     } finally {
       cleanupOwnedPromptFile(promptFile);
@@ -465,6 +981,16 @@ export class LocalAgentSessionManager {
 
 export function isTerminalStatus(status: LocalAgentStatus): boolean {
   return status === "idle" || status === "error" || status === "stopped";
+}
+
+export function isReadinessPositive(value: ReadinessValue): boolean {
+  return value === true;
+}
+
+export function classifyProviderError(message: string): AgentTerminalReason {
+  if (/timed out|timeout|timedout/i.test(message)) return "timeout";
+  if (/scope|writePaths|write scope/i.test(message)) return "scope_violation";
+  return "provider_error";
 }
 
 function isActiveStatus(status: LocalAgentStatus): boolean {
@@ -686,7 +1212,10 @@ function recordToStartOutput(record: LocalAgentRecord): StartAgentOutput {
   return output;
 }
 
-function recordToStatusOutput(record: LocalAgentRecord): AgentStatusOutput {
+function recordToStatusOutput(
+  record: LocalAgentRecord,
+  lifecycle?: LifecycleEvidence,
+): AgentStatusOutput {
   const output: AgentStatusOutput = {
     agentId: record.id,
     workspaceRoot: record.workspaceRoot,
@@ -703,6 +1232,16 @@ function recordToStatusOutput(record: LocalAgentRecord): AgentStatusOutput {
   if (record.providerSessionId !== undefined) output.providerSessionId = record.providerSessionId;
   if (record.latestResponse !== undefined) output.latestResponse = record.latestResponse;
   if (record.error !== undefined) output.error = record.error;
+  if (lifecycle) {
+    output.startedAt = lifecycle.startedAt;
+    output.lastActivityAt = lifecycle.lastActivityAt;
+    if (lifecycle.lastFileMutationAt !== undefined) output.lastFileMutationAt = lifecycle.lastFileMutationAt;
+    output.wallMs = lifecycle.wallMs;
+    output.idleMs = lifecycle.idleMs;
+    if (lifecycle.changedPaths !== undefined) output.changedPaths = lifecycle.changedPaths;
+    if (lifecycle.terminalReason !== undefined) output.terminalReason = lifecycle.terminalReason;
+    if (lifecycle.scopeState !== undefined) output.scopeState = lifecycle.scopeState;
+  }
   return output;
 }
 

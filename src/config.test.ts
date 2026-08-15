@@ -28,6 +28,19 @@ assert.equal(loadConfig(baseEnv).devspaceAgentsDir, join(emptyConfigDir, "agents
 assert.equal(loadConfig(baseEnv).subagents, false);
 assert.equal(loadConfig(baseEnv).artifactsEnabled, false);
 assert.equal(loadConfig(baseEnv).artifactMaxFileBytes, 100 * 1024 * 1024);
+assert.equal(loadConfig(baseEnv).agentMaxConcurrent, 4);
+assert.deepEqual(loadConfig(baseEnv).toolchains, []);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_MAX_CONCURRENT_AGENTS: "2" }).agentMaxConcurrent, 2);
+assert.equal(
+  loadConfig({
+    ...baseEnv,
+    DEVSPACE_TOOLCHAINS: JSON.stringify([
+      { id: "nexus-python", root: "/toolchain", verifiers: { pytest: ".venv/bin/pytest" } },
+    ]),
+  }).toolchains.length,
+  1,
+);
+assert.throws(() => loadConfig({ ...baseEnv, DEVSPACE_TOOLCHAINS: "{not json" }), /not valid JSON/);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_ARTIFACTS: "1" }).artifactsEnabled, true);
 assert.equal(
   loadConfig({ ...baseEnv, DEVSPACE_ARTIFACT_MAX_FILE_BYTES: "123" }).artifactMaxFileBytes,

@@ -3,6 +3,8 @@ import { join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
 import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
+import type { ToolchainSpec } from "./local-agent-toolchains.js";
+import { parseToolchains } from "./local-agent-toolchains.js";
 import { devspaceAgentsDir, devspaceSkillsDir, loadDevspaceFiles } from "./user-config.js";
 
 export type ToolMode = "minimal" | "full" | "codex";
@@ -32,6 +34,8 @@ export interface ServerConfig {
   agentDir: string;
   logging: LoggingConfig;
   gitCandidatesEnabled: boolean;
+  toolchains: ToolchainSpec[];
+  agentMaxConcurrent: number;
 }
 
 function parsePort(value: string | number | undefined): number {
@@ -258,6 +262,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       env.DEVSPACE_GIT_CANDIDATES === undefined
         ? false
         : parseBoolean(env.DEVSPACE_GIT_CANDIDATES),
+    toolchains: parseToolchains(env.DEVSPACE_TOOLCHAINS),
+    agentMaxConcurrent: parsePositiveInteger(
+      env.DEVSPACE_MAX_CONCURRENT_AGENTS,
+      4,
+      "DEVSPACE_MAX_CONCURRENT_AGENTS",
+    ),
   };
 }
 
