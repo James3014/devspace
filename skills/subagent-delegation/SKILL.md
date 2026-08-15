@@ -38,7 +38,7 @@ running, `show` waits briefly. If there is still no final response, call `show`
 again later.
 
 Do not run provider CLIs such as `codex`, `claude`, `opencode`, `pi`,
-`cursor-agent`, or `copilot` directly unless you are explicitly debugging
+`cursor-agent`, `copilot`, or `agy` directly unless you are explicitly debugging
 DevSpace agent integration.
 
 ## Choosing a profile
