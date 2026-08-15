@@ -264,11 +264,13 @@ function isContainedWithin(root: string, candidate: string): boolean {
  * required Git call fails or times out so a partial hash is never produced.
  */
 async function computePathGitStateHash(workspaceRoot: string, rel: string): Promise<string | undefined> {
-  const diff = await runGit(["diff", "--binary", "--", rel], workspaceRoot);
+  // `--literal-pathspecs` forces Git to treat `rel` as a literal filename even
+  // when it looks like pathspec magic such as `:(glob)...`.
+  const diff = await runGit(["--literal-pathspecs", "diff", "--binary", "--", rel], workspaceRoot);
   if (!diff.ok) return undefined;
-  const staged = await runGit(["diff", "--cached", "--binary", "--", rel], workspaceRoot);
+  const staged = await runGit(["--literal-pathspecs", "diff", "--cached", "--binary", "--", rel], workspaceRoot);
   if (!staged.ok) return undefined;
-  const indexEntry = await runGit(["ls-files", "--stage", "--", rel], workspaceRoot);
+  const indexEntry = await runGit(["--literal-pathspecs", "ls-files", "--stage", "--", rel], workspaceRoot);
   if (!indexEntry.ok) return undefined;
   const hash = createHash("sha256");
   hash.update("diff:");
