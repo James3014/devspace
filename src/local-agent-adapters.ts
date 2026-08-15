@@ -41,6 +41,8 @@ export function createLocalAgentAdapter(provider: LocalAgentProvider): LocalAgen
     case "cursor":
     case "copilot":
       return new AcpLocalAgentAdapter(provider, ACP_COMMANDS[provider]);
+    case "antigravity":
+      return new AntigravityCliLocalAgentAdapter();
   }
 }
 
@@ -379,6 +381,112 @@ class PiRpcLocalAgentAdapter implements LocalAgentAdapter {
   }
 }
 
+export class AntigravityCliLocalAgentAdapter implements LocalAgentAdapter {
+  readonly provider = "antigravity" as const;
+
+  async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
+    const args = buildAntigravityArgs(input);
+    const command = process.env.AGY_COMMAND ?? "agy";
+    const child = spawn(command, args, {
+      cwd: input.workspace,
+      env: process.env,
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    assertPipedChild(child);
+
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString("utf8");
+    });
+
+    const exitCode = await new Promise<number | null>((resolve, reject) => {
+      child.on("error", reject);
+      child.on("exit", (code) => resolve(code));
+    });
+
+    if (exitCode !== 0 && !stdout.trim()) {
+      throw new Error(`Antigravity CLI exited with code ${exitCode ?? "null"}${stderr ? `:\n${stderr.trim()}` : "."}`);
+    }
+
+    const record = parseAntigravityOutput(stdout);
+    const status = typeof record.status === "string" ? record.status : undefined;
+    const isError = status === "ERROR" || status === "FAILED" || record.is_error === true;
+    if (isError && !record.response) {
+      const errorMsg = directString(record.error) ?? directString(record.message) ?? status ?? "Antigravity returned an error.";
+      throw new Error(`Antigravity returned an error: ${errorMsg}`);
+    }
+
+    const providerSessionId =
+      directString(record.conversation_id) ??
+      directString(record.session_id) ??
+      input.providerSessionId ??
+      null;
+
+    const finalResponse = requireFinalResponse("Antigravity", extractAntigravityFinalResponse(record));
+
+    return {
+      provider: this.provider,
+      providerSessionId,
+      finalResponse,
+      items: [record],
+    };
+  }
+}
+
+export function buildAntigravityArgs(input: LocalAgentRunInput): string[] {
+  const args = [
+    "--dangerously-skip-permissions",
+    "--output-format",
+    "json",
+  ];
+  if (input.providerSessionId) {
+    args.push("--conversation", input.providerSessionId);
+  }
+  if (input.model) {
+    args.push("--model", input.model);
+  }
+  if (input.thinking) {
+    args.push("--effort", input.thinking);
+  }
+  if (input.workspace) {
+    args.push("--add-dir", input.workspace);
+  }
+  args.push("--print", input.prompt);
+  return args;
+}
+
+export function parseAntigravityOutput(stdout: string): Record<string, unknown> {
+  const trimmed = stdout.trim();
+  if (!trimmed) {
+    throw new Error("Antigravity CLI returned empty output.");
+  }
+  try {
+    const parsed = JSON.parse(trimmed) as unknown;
+    if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+      return parsed as Record<string, unknown>;
+    }
+  } catch {
+    const lastOpenBrace = trimmed.lastIndexOf("{");
+    const lastCloseBrace = trimmed.lastIndexOf("}");
+    if (lastOpenBrace !== -1 && lastCloseBrace > lastOpenBrace) {
+      try {
+        const parsed = JSON.parse(trimmed.slice(lastOpenBrace, lastCloseBrace + 1)) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          return parsed as Record<string, unknown>;
+        }
+      } catch {
+        // Fall through
+      }
+    }
+  }
+  throw new Error(`Antigravity CLI emitted malformed JSON: ${trimmed}`);
+}
+
 export function piCommandEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   if (env.PI_COMMAND) return env;
   const path = env.PATH;
@@ -557,7 +665,26 @@ function parseOpencodeModel(model: string): { providerID: string; modelID: strin
 }
 
 export function extractLocalAgentResponseText(value: unknown): string {
-  return extractOpenCodeFinalResponse(value) || extractPiFinalResponse(value);
+  return (
+    extractAntigravityFinalResponse(value) ||
+    extractOpenCodeFinalResponse(value) ||
+    extractPiFinalResponse(value)
+  );
+}
+
+export function extractAntigravityFinalResponse(value: unknown): string {
+  if (typeof value === "string" && value.trim()) return value.trim();
+  const root = unwrapProviderPayload(value);
+  if (typeof root === "string" && root.trim()) return root.trim();
+  const record = asRecord(root);
+  if (!record) return "";
+  if (typeof record.response === "string" && record.response.trim()) {
+    return record.response.trim();
+  }
+  if (typeof record.result === "string" && record.result.trim()) {
+    return record.result.trim();
+  }
+  return "";
 }
 
 function assertPipedChild(child: ReturnType<typeof spawn>): asserts child is ChildProcessWithoutNullStreams {

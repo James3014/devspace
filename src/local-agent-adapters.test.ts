@@ -1,12 +1,15 @@
 import assert from "node:assert/strict";
 import { delimiter } from "node:path";
 import {
+  buildAntigravityArgs,
   claudeCommandEnvironment,
   createLocalAgentAdapter,
+  extractAntigravityFinalResponse,
   extractOpenCodeFinalResponse,
   extractPiFinalResponse,
   extractPiProviderError,
   extractPiStreamingText,
+  parseAntigravityOutput,
   piCommandEnvironment,
   resolveAcpModelConfigUpdate,
   resolveAcpThinkingConfigUpdate,
@@ -21,6 +24,7 @@ const providers: LocalAgentProvider[] = [
   "pi",
   "cursor",
   "copilot",
+  "antigravity",
 ];
 
 for (const provider of providers) {
@@ -388,3 +392,85 @@ assert.equal(
 
   assert.equal(env.PATH, [devspaceBin, "/home/user/.local/bin"].join(delimiter));
 }
+
+assert.deepEqual(
+  buildAntigravityArgs({
+    prompt: "check git status",
+    workspace: "/home/user/project",
+  }),
+  [
+    "--dangerously-skip-permissions",
+    "--output-format",
+    "json",
+    "--add-dir",
+    "/home/user/project",
+    "--print",
+    "check git status",
+  ],
+);
+
+assert.deepEqual(
+  buildAntigravityArgs({
+    prompt: "fix issue",
+    workspace: "/home/user/project",
+    providerSessionId: "session-123",
+    model: "gemini-3.7-flash-high",
+    thinking: "high",
+  }),
+  [
+    "--dangerously-skip-permissions",
+    "--output-format",
+    "json",
+    "--conversation",
+    "session-123",
+    "--model",
+    "gemini-3.7-flash-high",
+    "--effort",
+    "high",
+    "--add-dir",
+    "/home/user/project",
+    "--print",
+    "fix issue",
+  ],
+);
+
+assert.deepEqual(
+  parseAntigravityOutput('{"conversation_id":"c-1","status":"SUCCESS","response":"Done."}'),
+  { conversation_id: "c-1", status: "SUCCESS", response: "Done." },
+);
+
+assert.deepEqual(
+  parseAntigravityOutput('Some CLI warnings...\n{"conversation_id":"c-2","status":"SUCCESS","response":"Done 2."}'),
+  { conversation_id: "c-2", status: "SUCCESS", response: "Done 2." },
+);
+
+assert.throws(
+  () => parseAntigravityOutput("   "),
+  /returned empty output/,
+);
+
+assert.throws(
+  () => parseAntigravityOutput("invalid json string"),
+  /emitted malformed JSON/,
+);
+
+assert.equal(
+  extractAntigravityFinalResponse({
+    conversation_id: "c-1",
+    status: "SUCCESS",
+    response: "  Clean final response.  ",
+  }),
+  "Clean final response.",
+);
+
+assert.equal(
+  extractAntigravityFinalResponse({
+    result: "Result fallback response.",
+  }),
+  "Result fallback response.",
+);
+
+assert.equal(
+  extractAntigravityFinalResponse({}),
+  "",
+);
