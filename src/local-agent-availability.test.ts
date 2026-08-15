@@ -23,9 +23,18 @@ assert.equal(checkLocalAgentProviderAvailability("codex").available, true);
   });
   assert.deepEqual(
     snapshot.map((provider) => provider.name),
-    ["codex", "claude", "opencode", "pi", "cursor", "copilot"],
+    ["codex", "claude", "opencode", "pi", "cursor", "copilot", "antigravity"],
   );
   assert.equal(snapshot.find((provider) => provider.name === "pi")?.available, false);
+}
+
+{
+  const availability = checkLocalAgentProviderAvailability("antigravity", {
+    ...process.env,
+    AGY_COMMAND: "/definitely/missing/devspace-agy",
+  });
+  assert.equal(availability.available, false);
+  assert.match(availability.reason ?? "", /executable not found/);
 }
 
 assert.equal(

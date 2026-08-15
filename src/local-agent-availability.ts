@@ -37,6 +37,8 @@ export function checkLocalAgentProviderAvailability(
       return commandAvailability(provider, "cursor-agent");
     case "copilot":
       return commandAvailability(provider, "copilot");
+    case "antigravity":
+      return commandAvailability(provider, env.AGY_COMMAND ?? "agy");
   }
 }
 
