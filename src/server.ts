@@ -2156,7 +2156,7 @@ export function createMcpServer(
           stderr: z.string().optional(),
         },
         _meta: {},
-        annotations: { readOnlyHint: true },
+        annotations: SHELL_TOOL_ANNOTATIONS,
       },
       async ({ workspaceId, toolchainId, verifier, args, timeoutMs }) => {
         const workspace = workspaces.getWorkspace(workspaceId);

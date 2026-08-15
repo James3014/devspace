@@ -5,6 +5,7 @@ import type { ServerConfig } from "./config.js";
 import {
   type AgentTerminalReason,
   type ExecutionContract,
+  type PathStateFingerprint,
   type ScopeBaseline,
   type ScopeState,
   deserializeExecutionContract,
@@ -412,10 +413,44 @@ function readScopeBaseline(value: string | null | undefined): ScopeBaseline | un
       ? parsed.changedPaths.filter((entry): entry is string => typeof entry === "string")
       : [];
     const head = typeof parsed.head === "string" || parsed.head === null ? parsed.head : null;
-    return { changedPaths, head };
+    const fingerprints = readScopeBaselineFingerprints(parsed.fingerprints);
+    return fingerprints ? { changedPaths, head, fingerprints } : { changedPaths, head };
   } catch {
     return undefined;
   }
+}
+
+function readScopeBaselineFingerprints(value: unknown): Record<string, PathStateFingerprint> | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const fingerprints: Record<string, PathStateFingerprint> = {};
+  for (const [path, entry] of Object.entries(value as Record<string, unknown>)) {
+    const fingerprint = readPathStateFingerprint(entry);
+    if (fingerprint) fingerprints[path] = fingerprint;
+  }
+  return Object.keys(fingerprints).length > 0 ? fingerprints : undefined;
+}
+
+function readPathStateFingerprint(value: unknown): PathStateFingerprint | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.kind !== "modified" && record.kind !== "untracked" && record.kind !== "deleted") {
+    return undefined;
+  }
+  if (record.contentHash !== null && typeof record.contentHash !== "string") return undefined;
+  if (typeof record.size !== "number" || !Number.isFinite(record.size) || record.size < 0) {
+    return undefined;
+  }
+  // Entries lacking a non-empty gitStateHash are legacy/incomplete: ignoring
+  // them leaves fingerprint coverage partial so attribution degrades UNKNOWN.
+  if (typeof record.gitStateHash !== "string" || record.gitStateHash.length === 0) {
+    return undefined;
+  }
+  return {
+    kind: record.kind,
+    contentHash: record.contentHash,
+    size: record.size,
+    gitStateHash: record.gitStateHash,
+  };
 }
 
 function escapeLike(value: string): string {

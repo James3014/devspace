@@ -623,6 +623,9 @@ test("subagents: workspace_verify always present, returns structured TOOLCHAIN_U
   const context = await fixture(t, { subagents: true });
   const tools = await context.client.listTools();
   assert.equal(tools.tools.some((tool) => tool.name === "workspace_verify"), true);
+  const verifyTool = tools.tools.find((tool) => tool.name === "workspace_verify");
+  assert.equal(verifyTool?.annotations?.readOnlyHint, false);
+  assert.equal(verifyTool?.annotations?.destructiveHint, true);
 
   const openResult = await callOpen(context.client, context.project, "chat-verify-unconfigured");
   const workspaceId = structuredContent(openResult).workspaceId as string;

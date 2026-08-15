@@ -30,9 +30,10 @@ import {
 import { describeToolchainExecutables } from "./local-agent-toolchains.js";
 import {
   classifyScopeState,
+  computeWorkerDelta,
   inspectWorkspacePhysicalState,
   readWorkspaceHead,
-  workerChangedPathsSinceBaseline,
+  type WorkerAttribution,
 } from "./workspace-reconciliation.js";
 
 // ─── Error codes ────────────────────────────────────────────────────────────
@@ -651,10 +652,8 @@ export class LocalAgentSessionManager {
     }
 
     const physical = await inspectWorkspacePhysicalState(record.workspaceRoot);
-    const workerChanged = workerChangedPathsSinceBaseline(
-      physical.changedPaths,
-      record.scopeBaseline?.changedPaths,
-    );
+    const delta = computeWorkerDelta(physical, record.scopeBaseline);
+    const workerChanged = delta.changedPaths;
     const contract = record.executionContract;
     const headAdvanced = Boolean(
       record.scopeBaseline?.head &&
@@ -666,6 +665,7 @@ export class LocalAgentSessionManager {
       workerChanged,
       contract?.writePaths,
       contract?.maxFiles,
+      delta.attribution,
     );
 
     const startedAtMs = Date.parse(record.createdAt);
@@ -722,19 +722,17 @@ export class LocalAgentSessionManager {
         continue;
       }
 
-      if (contract.writePaths?.length && record.status === "running") {
+      if ((contract.writePaths?.length || contract.maxFiles !== undefined) && record.status === "running") {
         const baseline = record.scopeBaseline;
         if (baseline) {
           const physical = await inspectWorkspacePhysicalState(record.workspaceRoot);
           if (physical.gitAvailable) {
-            const workerChanged = workerChangedPathsSinceBaseline(
-              physical.changedPaths,
-              baseline.changedPaths,
-            );
+            const delta = computeWorkerDelta(physical, baseline);
             const { scopeState, unexpectedPaths } = this.classifyWorkerScope(
-              workerChanged,
+              delta.changedPaths,
               contract.writePaths,
               contract.maxFiles,
+              delta.attribution,
             );
             if (scopeState === "SCOPE_VIOLATION") {
               await this.terminateActiveAgent(
@@ -770,11 +768,9 @@ export class LocalAgentSessionManager {
     const startedAtMs = Date.parse(record.createdAt);
     const updatedAtMs = Date.parse(record.updatedAt);
 
-    const workerChanged = workerChangedPathsSinceBaseline(
-      physical.changedPaths,
-      record.scopeBaseline?.changedPaths,
-    );
-    const changedPaths = record.scopeBaseline ? workerChanged : physical.changedPaths;
+    const changedPaths = record.scopeBaseline
+      ? computeWorkerDelta(physical, record.scopeBaseline).changedPaths
+      : physical.changedPaths;
 
     return {
       startedAt: record.createdAt,
@@ -800,22 +796,28 @@ export class LocalAgentSessionManager {
     }
     const physical = await inspectWorkspacePhysicalState(record.workspaceRoot);
     if (!physical.gitAvailable) return { scopeState: "UNKNOWN", unexpectedPaths: [] };
-    const workerChanged = workerChangedPathsSinceBaseline(
-      physical.changedPaths,
-      record.scopeBaseline?.changedPaths,
+    const delta = computeWorkerDelta(physical, record.scopeBaseline);
+    return this.classifyWorkerScope(
+      delta.changedPaths,
+      contract.writePaths,
+      contract.maxFiles,
+      delta.attribution,
     );
-    return this.classifyWorkerScope(workerChanged, contract.writePaths, contract.maxFiles);
   }
 
   private classifyWorkerScope(
     workerChanged: string[],
     writePaths: string[] | undefined,
     maxFiles: number | undefined,
+    attribution: WorkerAttribution,
   ): { scopeState: ScopeState; unexpectedPaths: string[] } {
     const pathResult = classifyScopeState(workerChanged, writePaths);
     if (pathResult.scopeState === "SCOPE_VIOLATION") return pathResult;
     if (maxFiles !== undefined && workerChanged.length > maxFiles) {
       return { scopeState: "SCOPE_VIOLATION", unexpectedPaths: workerChanged };
+    }
+    if (attribution === "UNKNOWN") {
+      return { scopeState: "UNKNOWN", unexpectedPaths: pathResult.unexpectedPaths };
     }
     return { scopeState: pathResult.scopeState, unexpectedPaths: pathResult.unexpectedPaths };
   }
@@ -865,10 +867,14 @@ export class LocalAgentSessionManager {
     try {
       // Snapshot the physical workspace BEFORE any provider mutation so that
       // pre-existing changes are never attributed to this worker turn.
-      if (claimed.executionContract?.writePaths?.length) {
+      if (claimed.executionContract?.writePaths?.length || claimed.executionContract?.maxFiles !== undefined) {
         const state = await inspectWorkspacePhysicalState(claimed.workspaceRoot);
         this.store.update(claimed.id, {
-          scopeBaseline: { changedPaths: state.changedPaths, head: state.head ?? null },
+          scopeBaseline: {
+            changedPaths: state.changedPaths,
+            head: state.head ?? null,
+            fingerprints: state.fingerprints,
+          },
         });
       }
 

@@ -41,11 +41,33 @@ export interface ExecutionContract {
   idleTimeoutMs?: number;
 }
 
+/**
+ * Per-path physical fingerprint captured at a snapshot point. Persisted in the
+ * baseline so a later snapshot can distinguish an untouched pre-existing dirty
+ * path from the same path being modified again by the worker.
+ */
+export interface PathStateFingerprint {
+  /** Tracked-modified, untracked, or tracked-deleted at snapshot time. */
+  kind: "modified" | "untracked" | "deleted";
+  /** sha256 hex over the file bytes; null when the path is absent (deleted). */
+  contentHash: string | null;
+  /** File size in bytes; 0 when the path is absent (deleted). */
+  size: number;
+  /** SHA-256 identity of the exact path's Git/index/staged+unstaged state, used to detect index-only/mode mutations. */
+  gitStateHash: string;
+}
+
 export interface ScopeBaseline {
   /** Workspace-relative changed paths present before the worker turn started. */
   changedPaths: string[];
   /** HEAD at baseline snapshot time (or null when Git is unavailable). */
   head: string | null;
+  /**
+   * Per-path physical fingerprints keyed by workspace-relative changed path.
+   * Absent on legacy persisted rows: exact attribution is then impossible and
+   * scope must degrade to UNKNOWN instead of falsely claiming WITHIN_SCOPE.
+   */
+  fingerprints?: Record<string, PathStateFingerprint>;
 }
 
 export function parseExecutionContract(value: unknown): ExecutionContract | undefined {

@@ -1,12 +1,20 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { LocalAgentSessionManager, AgentSessionError } from "./local-agent-sessions.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
-import { classifyScopeState, workerChangedPathsSinceBaseline } from "./workspace-reconciliation.js";
+import type { ScopeBaseline } from "./local-agent-contract.js";
+import {
+  classifyScopeState,
+  computeWorkerDelta,
+  inspectWorkspacePhysicalState,
+  workerChangedPathsSinceBaseline,
+} from "./workspace-reconciliation.js";
+import type { WorkspacePhysicalState } from "./workspace-reconciliation.js";
 
 function runGitRaw(args: string[], cwd: string): string {
   return execFileSync("git", args, {
@@ -536,5 +544,403 @@ test("agent_start returns NO_EXECUTION_CAPACITY when at capacity", async () => {
   } finally {
     f.clean();
     clean();
+  }
+});
+
+// ─── Dirty-baseline fingerprint/delta regression tests ───────────────────────
+
+type PhysicalState = Awaited<ReturnType<typeof inspectWorkspacePhysicalState>>;
+
+function baselineFromState(state: PhysicalState): ScopeBaseline {
+  return { changedPaths: state.changedPaths, head: state.head ?? null, fingerprints: state.fingerprints };
+}
+
+// 1. PHYSICAL SNAPSHOT: kind derivation for modified/untracked/deleted paths.
+test("physical snapshot fingerprints modified, untracked, and deleted paths", async () => {
+  const f = setupGitFixture();
+  try {
+    writeFileSync(join(f.repo, "tracked.txt"), "tracked v1");
+    writeFileSync(join(f.repo, "delete-me.txt"), "delete me");
+    runGitRaw(["add", "tracked.txt", "delete-me.txt"], f.repo);
+    runGitRaw(["commit", "-m", "seed tracked files"], f.repo);
+
+    writeFileSync(join(f.repo, "tracked.txt"), "tracked v2");
+    writeFileSync(join(f.repo, "untracked.txt"), "untracked content");
+    rmSync(join(f.repo, "delete-me.txt"));
+
+    const state = await inspectWorkspacePhysicalState(f.repo);
+    assert.ok(state.fingerprints);
+
+    const modified = state.fingerprints["tracked.txt"];
+    assert.ok(modified);
+    assert.equal(modified.kind, "modified");
+    assert.match(modified.contentHash ?? "", /^[0-9a-f]{64}$/);
+    assert.ok(modified.size > 0);
+
+    const untracked = state.fingerprints["untracked.txt"];
+    assert.ok(untracked);
+    assert.equal(untracked.kind, "untracked");
+    assert.ok(untracked.contentHash && untracked.contentHash.length === 64);
+    assert.ok(untracked.size > 0);
+
+    const deleted = state.fingerprints["delete-me.txt"];
+    assert.ok(deleted);
+    assert.equal(deleted.kind, "deleted");
+    assert.equal(deleted.contentHash, null);
+    assert.equal(deleted.size, 0);
+  } finally {
+    f.clean();
+  }
+});
+
+// 2. DELTA UNTOUCHED: a pre-existing dirty path unchanged after the modern
+// baseline is NOT attributed to the worker, with attribution KNOWN.
+test("delta does not attribute an untouched pre-existing dirty path", async () => {
+  const f = setupGitFixture();
+  try {
+    writeFileSync(join(f.repo, "pre-existing-outside.txt"), "v1");
+    const baseline = baselineFromState(await inspectWorkspacePhysicalState(f.repo));
+    assert.ok(baseline.fingerprints);
+
+    const current = await inspectWorkspacePhysicalState(f.repo);
+    const delta = computeWorkerDelta(current, baseline);
+    assert.equal(delta.attribution, "KNOWN");
+    assert.ok(!delta.changedPaths.includes("pre-existing-outside.txt"));
+  } finally {
+    f.clean();
+  }
+});
+
+// 3. DELTA MODIFIED AGAIN: the same pre-existing dirty path modified after the
+// modern baseline IS attributed to the worker, with attribution KNOWN.
+test("delta attributes a pre-existing dirty path modified again", async () => {
+  const f = setupGitFixture();
+  try {
+    writeFileSync(join(f.repo, "pre-existing-outside.txt"), "v1");
+    const baseline = baselineFromState(await inspectWorkspacePhysicalState(f.repo));
+    assert.ok(baseline.fingerprints);
+
+    writeFileSync(join(f.repo, "pre-existing-outside.txt"), "v2");
+    const current = await inspectWorkspacePhysicalState(f.repo);
+    const delta = computeWorkerDelta(current, baseline);
+    assert.equal(delta.attribution, "KNOWN");
+    assert.ok(delta.changedPaths.includes("pre-existing-outside.txt"));
+  } finally {
+    f.clean();
+  }
+});
+
+// 4. END-TO-END SUPERVISOR: a modern fingerprint baseline protects a
+// pre-existing dirty out-of-scope file until the worker touches it again.
+test("supervisor ignores untouched pre-existing dirty path and terminates on re-modification", async () => {
+  const f = setupGitFixture();
+  const { manager, terminated, clean } = setupManager();
+  try {
+    const leaked = join(f.repo, "leaked-outside.txt");
+    writeFileSync(leaked, "v1");
+    const baseline = baselineFromState(await inspectWorkspacePhysicalState(f.repo));
+
+    const started = await manager.startAgent({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "do work",
+      profiles: mockProfiles,
+      executionContract: { writePaths: ["src"] },
+    });
+    const record = manager.getRecordByPrefixOrId(started.agentId);
+    assert.ok(record);
+    manager.updateRecord(record.id, {
+      status: "running",
+      workerPid: 9999998,
+      workerToken: "tok",
+      scopeBaseline: baseline,
+    });
+
+    // Untouched pre-existing dirty path: must not terminate.
+    await manager.superviseActiveAgents();
+    const untouched = manager.getRecordByPrefixOrId(record.id);
+    assert.equal(untouched?.status, "running");
+    assert.equal(terminated.length, 0);
+
+    // Modify the same pre-existing dirty path again: definite violation.
+    writeFileSync(leaked, "v2");
+    await manager.superviseActiveAgents();
+    const after = manager.getRecordByPrefixOrId(record.id);
+    assert.ok(after);
+    assert.equal(after.status, "error");
+    assert.equal(after.terminalReason, "scope_violation");
+    assert.equal(after.scopeState, "SCOPE_VIOLATION");
+    assert.match(after.error ?? "", /leaked-outside\.txt/);
+    assert.ok(terminated.some((entry) => entry.id === record.id));
+
+    const reconciled = await manager.reconcileAgent({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      isolated: true,
+      agentId: record.id,
+    });
+    assert.equal(reconciled.candidate.scopeState, "SCOPE_VIOLATION");
+    assert.ok(reconciled.candidate.unexpectedPaths.includes("leaked-outside.txt"));
+  } finally {
+    f.clean();
+    clean();
+  }
+});
+
+// maxFiles-only contract: no writePaths claimed, but the file-count bound is
+// independently enforced by the supervisor against a modern baseline.
+test("supervisor enforces maxFiles-only file-count bound", async () => {
+  const f = setupGitFixture();
+  const { manager, terminated, clean } = setupManager();
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "do work",
+      profiles: mockProfiles,
+      executionContract: { maxFiles: 1 },
+    });
+    const record = manager.getRecordByPrefixOrId(started.agentId);
+    assert.ok(record);
+
+    const baseline = baselineFromState(await inspectWorkspacePhysicalState(f.repo));
+    manager.updateRecord(record.id, {
+      status: "running",
+      workerPid: 9999997,
+      workerToken: "tok",
+      scopeBaseline: baseline,
+    });
+
+    writeFileSync(join(f.repo, "a.txt"), "a");
+    writeFileSync(join(f.repo, "b.txt"), "b");
+
+    await manager.superviseActiveAgents();
+
+    const after = manager.getRecordByPrefixOrId(record.id);
+    assert.ok(after);
+    assert.equal(after.status, "error");
+    assert.equal(after.terminalReason, "scope_violation");
+    assert.equal(after.scopeState, "SCOPE_VIOLATION");
+    assert.ok(terminated.some((entry) => entry.id === record.id));
+  } finally {
+    f.clean();
+    clean();
+  }
+});
+
+// 5. LEGACY BASELINE: non-empty changedPaths without fingerprints can never
+// prove attribution, so delta and reconcile report UNKNOWN (never WITHIN_SCOPE)
+// while newly dirty paths still appear as definite changedPaths.
+test("legacy baseline without fingerprints yields UNKNOWN, never false WITHIN_SCOPE", async () => {
+  const f = setupGitFixture();
+  const { manager, clean } = setupManager();
+  try {
+    writeFileSync(join(f.repo, "pre-existing.txt"), "pre");
+    const legacyBaseline: ScopeBaseline = { changedPaths: ["pre-existing.txt"], head: f.head };
+
+    mkdirSync(join(f.repo, "src"), { recursive: true });
+    writeFileSync(join(f.repo, "src", "new.ts"), "new within scope");
+
+    const current = await inspectWorkspacePhysicalState(f.repo);
+    const delta = computeWorkerDelta(current, legacyBaseline);
+    assert.equal(delta.attribution, "UNKNOWN");
+    assert.ok(delta.changedPaths.includes("src/new.ts"));
+    assert.ok(!delta.changedPaths.includes("pre-existing.txt"));
+
+    const started = await manager.startAgent({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "do work",
+      profiles: mockProfiles,
+      executionContract: { writePaths: ["src"] },
+    });
+    manager.updateRecord(started.agentId, { scopeBaseline: legacyBaseline });
+
+    // Within-scope new path: still UNKNOWN because overlap cannot be proven.
+    const within = await manager.reconcileAgent({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      isolated: true,
+      agentId: started.agentId,
+    });
+    assert.equal(within.candidate.scopeState, "UNKNOWN");
+    assert.ok(within.candidate.changedPaths.includes("src/new.ts"));
+
+    // A newly dirty out-of-scope path is a proven violation even under legacy.
+    writeFileSync(join(f.repo, "leaked.txt"), "bad");
+    const leaked = await manager.reconcileAgent({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      isolated: true,
+      agentId: started.agentId,
+    });
+    assert.equal(leaked.candidate.scopeState, "SCOPE_VIOLATION");
+    assert.ok(leaked.candidate.unexpectedPaths.includes("leaked.txt"));
+  } finally {
+    f.clean();
+    clean();
+  }
+});
+
+// 6. PARTIAL fingerprint baseline: one missing baseline fingerprint degrades
+// attribution to UNKNOWN while definite paths are still reported. The one valid
+// fingerprint carries a non-empty gitStateHash so it stays comparable; the
+// other path has no fingerprint entry at all and keeps attribution UNKNOWN.
+test("partial fingerprint baseline yields UNKNOWN but reports definite changed paths", async () => {
+  const f = setupGitFixture();
+  try {
+    writeFileSync(join(f.repo, "pre-existing-a.txt"), "a");
+    writeFileSync(join(f.repo, "pre-existing-b.txt"), "b");
+    writeFileSync(join(f.repo, "new.txt"), "new");
+
+    const partialBaseline: ScopeBaseline = {
+      changedPaths: ["pre-existing-a.txt", "pre-existing-b.txt"],
+      head: f.head,
+      fingerprints: {
+        "pre-existing-a.txt": {
+          kind: "untracked",
+          contentHash: "bogus-hash",
+          size: 1,
+          gitStateHash: "bogus-git-state-hash",
+        },
+      },
+    };
+
+    const current = await inspectWorkspacePhysicalState(f.repo);
+    const delta = computeWorkerDelta(current, partialBaseline);
+    assert.equal(delta.attribution, "UNKNOWN");
+    assert.ok(delta.changedPaths.includes("pre-existing-a.txt"));
+    assert.ok(delta.changedPaths.includes("new.txt"));
+    assert.ok(!delta.changedPaths.includes("pre-existing-b.txt"));
+  } finally {
+    f.clean();
+  }
+});
+
+// 7. STAGE-ONLY REGRESSION: an index-only mutation (git add with unchanged
+// bytes) must still be detected. The baseline fingerprint carries a
+// gitStateHash so staging the new blob flips the fingerprint even though the
+// working-tree file bytes never changed.
+test("delta detects a stage-only mutation via gitStateHash", async () => {
+  const f = setupGitFixture();
+  try {
+    writeFileSync(join(f.repo, "outside.txt"), "A");
+    runGitRaw(["add", "outside.txt"], f.repo);
+    runGitRaw(["commit", "-m", "seed outside"], f.repo);
+
+    writeFileSync(join(f.repo, "outside.txt"), "B");
+    const baseline = baselineFromState(await inspectWorkspacePhysicalState(f.repo));
+    const baselineFingerprint = baseline.fingerprints?.["outside.txt"];
+    assert.ok(baselineFingerprint);
+    assert.ok(
+      typeof baselineFingerprint.gitStateHash === "string" &&
+        baselineFingerprint.gitStateHash.length > 0,
+    );
+
+    runGitRaw(["add", "outside.txt"], f.repo);
+
+    const current = await inspectWorkspacePhysicalState(f.repo);
+    const delta = computeWorkerDelta(current, baseline);
+    assert.equal(delta.attribution, "KNOWN");
+    assert.ok(delta.changedPaths.includes("outside.txt"));
+  } finally {
+    f.clean();
+  }
+});
+
+// 8. LEGACY FINGERPRINT WITHOUT GIT STATE: a fingerprint lacking gitStateHash
+// is incomplete and must degrade attribution to UNKNOWN instead of falsely
+// claiming KNOWN overlap for the same dirty path.
+test("baseline fingerprint without gitStateHash degrades attribution to UNKNOWN", async () => {
+  const f = setupGitFixture();
+  try {
+    writeFileSync(join(f.repo, "pre-existing.txt"), "pre");
+
+    const legacyFingerprint = {
+      kind: "untracked" as const,
+      contentHash: "deadbeef",
+      size: 3,
+    };
+    const legacyBaseline = {
+      changedPaths: ["pre-existing.txt"],
+      head: f.head,
+      fingerprints: { "pre-existing.txt": legacyFingerprint },
+    } as unknown as ScopeBaseline;
+
+    const current = await inspectWorkspacePhysicalState(f.repo);
+    const delta = computeWorkerDelta(current, legacyBaseline);
+    assert.equal(delta.attribution, "UNKNOWN");
+  } finally {
+    f.clean();
+  }
+});
+
+// 9. OVERLAP WITHOUT CURRENT FINGERPRINT: when the same path is present in both
+// baseline and current, the baseline fingerprint is complete, but the current
+// fingerprint is missing/incomplete, the path must NOT be claimed as definite
+// worker change and attribution must degrade to UNKNOWN (no false-positive
+// SCOPE_VIOLATION).
+test("overlap with missing current fingerprint is not definite and yields UNKNOWN", () => {
+  const baseline: ScopeBaseline = {
+    changedPaths: ["pre-existing.txt"],
+    head: "abc123",
+    fingerprints: {
+      "pre-existing.txt": {
+        kind: "modified",
+        contentHash: "aa11bb22",
+        size: 5,
+        gitStateHash: "baseline-git-state-hash",
+      },
+    },
+  };
+  const current: WorkspacePhysicalState = {
+    gitAvailable: true,
+    dirty: true,
+    changedPaths: ["pre-existing.txt"],
+  };
+  const delta = computeWorkerDelta(current, baseline);
+  assert.ok(!delta.changedPaths.includes("pre-existing.txt"));
+  assert.equal(delta.attribution, "UNKNOWN");
+});
+
+// 10. SECURITY: a symlink inside the repo pointing outside the workspace is
+// fingerprinted by its link-target text, never by the external target's bytes.
+test("symlink fingerprint derives from link target text, not external target bytes", async () => {
+  const f = setupGitFixture();
+  try {
+    const externalTarget = join(f.root, "external-target.txt");
+    const linkPath = join(f.repo, "external-link.txt");
+    writeFileSync(externalTarget, "external v1");
+    symlinkSync(externalTarget, linkPath);
+
+    const linkRel = "external-link.txt";
+    const first = await inspectWorkspacePhysicalState(f.repo);
+    assert.ok(first.fingerprints);
+    const firstFp = first.fingerprints[linkRel];
+    assert.ok(firstFp);
+    assert.equal(firstFp.kind, "untracked");
+    assert.equal(
+      firstFp.contentHash,
+      createHash("sha256").update(externalTarget).digest("hex"),
+    );
+    assert.equal(firstFp.size, Buffer.byteLength(externalTarget, "utf8"));
+
+    writeFileSync(externalTarget, "external v2");
+    const second = await inspectWorkspacePhysicalState(f.repo);
+    assert.ok(second.fingerprints);
+    const secondFp = second.fingerprints[linkRel];
+    assert.ok(secondFp);
+    assert.equal(secondFp.kind, "untracked");
+    assert.equal(secondFp.contentHash, firstFp.contentHash);
+    assert.equal(secondFp.size, firstFp.size);
+    assert.notEqual(
+      firstFp.contentHash,
+      createHash("sha256").update("external v2").digest("hex"),
+    );
+  } finally {
+    f.clean();
   }
 });

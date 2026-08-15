@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { LocalAgentStore } from "./local-agent-store.js";
+import type { ScopeBaseline } from "./local-agent-contract.js";
 
 const root = mkdtempSync(join(tmpdir(), "devspace-local-agent-store-test-"));
 const stores: LocalAgentStore[] = [];
@@ -132,6 +133,51 @@ try {
   assert.equal(store.getById(contracted.id)?.scopeState, "SCOPE_VIOLATION");
   assert.equal(store.getById(contracted.id)?.terminalReason, "scope_violation");
   assert.equal(store.getById(contracted.id)?.scopeBaseline?.head, "abc123");
+
+  const fingerprintsBaseline: ScopeBaseline = {
+    changedPaths: ["src/a.ts", "src/b.ts"],
+    head: "abc123",
+    fingerprints: {
+      "src/a.ts": {
+        kind: "modified",
+        contentHash: "aa11bb22",
+        size: 42,
+        gitStateHash: "1111111111111111111111111111111111111111111111111111111111111111",
+      },
+      "src/b.ts": {
+        kind: "deleted",
+        contentHash: null,
+        size: 0,
+        gitStateHash: "2222222222222222222222222222222222222222222222222222222222222222",
+      },
+    },
+  };
+  const roundTrip = store.update(contracted.id, { scopeBaseline: fingerprintsBaseline });
+  assert.deepEqual(roundTrip.scopeBaseline, fingerprintsBaseline);
+  assert.deepEqual(store.getById(contracted.id)?.scopeBaseline, fingerprintsBaseline);
+  const persistedFingerprints = store.getById(contracted.id)?.scopeBaseline?.fingerprints;
+  assert.deepEqual(persistedFingerprints, fingerprintsBaseline.fingerprints);
+  assert.equal(persistedFingerprints?.["src/a.ts"]?.kind, "modified");
+  assert.equal(persistedFingerprints?.["src/a.ts"]?.contentHash, "aa11bb22");
+  assert.equal(persistedFingerprints?.["src/a.ts"]?.size, 42);
+  assert.equal(
+    persistedFingerprints?.["src/a.ts"]?.gitStateHash,
+    "1111111111111111111111111111111111111111111111111111111111111111",
+  );
+  assert.equal(persistedFingerprints?.["src/b.ts"]?.kind, "deleted");
+  assert.equal(persistedFingerprints?.["src/b.ts"]?.contentHash, null);
+  assert.equal(persistedFingerprints?.["src/b.ts"]?.size, 0);
+  assert.equal(
+    persistedFingerprints?.["src/b.ts"]?.gitStateHash,
+    "2222222222222222222222222222222222222222222222222222222222222222",
+  );
+
+  const legacyBaseline = store.update(contracted.id, {
+    scopeBaseline: { changedPaths: ["src/old.ts"], head: "deadbeef" },
+  });
+  assert.deepEqual(legacyBaseline.scopeBaseline, { changedPaths: ["src/old.ts"], head: "deadbeef" });
+  assert.equal(store.getById(contracted.id)?.scopeBaseline?.head, "deadbeef");
+  assert.equal(store.getById(contracted.id)?.scopeBaseline?.fingerprints, undefined);
 } finally {
   for (const store of stores) {
     store.close();
