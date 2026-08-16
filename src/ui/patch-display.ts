@@ -22,13 +22,13 @@ export interface FileChangePathDisplay {
   title: string;
 }
 
-const fileChangeLabels: Record<Exclude<FileChangeKind, "unknown">, string> = {
+const fileChangeLabels = {
   added: "Added",
   edited: "Edited",
   deleted: "Deleted",
   renamed: "Renamed",
   "renamed-edited": "Renamed and edited",
-};
+} satisfies Record<Exclude<FileChangeKind, "unknown">, string>;
 
 export function getPatchDisplayParts(
   card: Pick<ToolResultCard, "files">,

@@ -78,7 +78,10 @@ function testOneToolContract(): void {
   assert.deepEqual(Object.keys(descriptor.outputSchema as object), ["path"]);
   assert.equal((descriptor.annotations as { destructiveHint?: boolean }).destructiveHint, false);
 
-  const fileSchema = (descriptor.inputSchema as z.ZodRawShape).file as z.ZodType;
+  const inputSchema = descriptor.inputSchema as Parameters<typeof z.object>[0];
+  assert.ok(inputSchema);
+  const fileSchema = inputSchema.file;
+  assert.ok(fileSchema);
   const valid = {
     download_url: "https://files.oaiusercontent.com/file_123/download?sig=secret",
     file_id: "file_123",

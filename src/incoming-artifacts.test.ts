@@ -10,7 +10,7 @@ import {
 
 await testRegistryFailsClosed();
 await testOpenAIFileAdapter();
-testLogShapeRedaction();
+testLogStructureRedaction();
 
 async function testRegistryFailsClosed(): Promise<void> {
   const registry = new IncomingArtifactAdapterRegistry();
@@ -192,7 +192,7 @@ async function testOpenAIFileAdapter(): Promise<void> {
   );
 }
 
-function testLogShapeRedaction(): void {
+function testLogStructureRedaction(): void {
   const value = {
     download_url: "https://files.oaiusercontent.com/file_123/download?sig=super-secret",
     file_id: "file_secret",

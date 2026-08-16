@@ -15,10 +15,10 @@ export interface LocalAgentAdapter {
   run(input: LocalAgentRunInput): Promise<LocalAgentRunResult>;
 }
 
-const ACP_COMMANDS: Record<"cursor" | "copilot", [string, ...string[]]> = {
+const ACP_COMMANDS = {
   cursor: ["cursor-agent", "acp"],
   copilot: ["copilot", "--acp"],
-};
+} satisfies Record<"cursor" | "copilot", [string, ...string[]]>;
 const PI_AGENT_TIMEOUT_MS = 120_000;
 
 export async function runLocalAgentProvider(
@@ -64,12 +64,13 @@ class ClaudeLocalAgentAdapter implements LocalAgentAdapter {
       options: {
         cwd: input.workspace,
         model: input.model,
-        ...(input.thinking ? { thinking: { type: "adaptive" } as const, effort: input.thinking as EffortLevel } : {}),
+        thinking: input.thinking ? { type: "adaptive" } as const : undefined,
+        effort: input.thinking as EffortLevel | undefined,
         resume: input.providerSessionId,
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
         env: claudeCommandEnvironment(process.env),
-        ...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
+        pathToClaudeCodeExecutable: claudeExecutable,
       },
     });
 
@@ -279,7 +280,7 @@ function resolveAcpSelectConfigUpdate(
     provider: string;
     value: string;
   },
-): { sessionId: string; configId: string; value: string } {
+) {
   const record = asRecord(session);
   if (!record) throw new Error(`${options.provider} ACP session did not return session metadata.`);
   const sessionId = typeof record?.sessionId === "string" ? record.sessionId : undefined;
@@ -495,7 +496,7 @@ async function createOpencodeSession(client: unknown, input: LocalAgentRunInput)
   const result = await sessionClient.session.create({
     directory: input.workspace,
     location: { directory: input.workspace },
-    ...(input.model ? { model: parseOpencodeModel(input.model) } : {}),
+    model: input.model ? parseOpencodeModel(input.model) : undefined,
   }, { throwOnError: true });
   const id =
     readNestedString(result, ["id"]) ??
@@ -523,8 +524,8 @@ async function promptOpencodeSession(
     directory: input.workspace,
     prompt: { parts: [{ type: "text", text: input.prompt }] },
     parts: [{ type: "text", text: input.prompt }],
-    ...(input.model ? { model: parseOpencodeModel(input.model) } : {}),
-    ...(input.thinking ? { variant: input.thinking } : {}),
+    model: input.model ? parseOpencodeModel(input.model) : undefined,
+    variant: input.thinking,
   };
   return session.prompt(promptInput, { throwOnError: true });
 }
@@ -547,7 +548,7 @@ async function readOpencodeMessages(client: unknown, sessionId: string): Promise
   return session.messages({ sessionID: sessionId, order: "asc", limit: 100 }, { throwOnError: true });
 }
 
-function parseOpencodeModel(model: string): { providerID: string; modelID: string } {
+function parseOpencodeModel(model: string) {
   const separator = model.indexOf("/");
   if (separator === -1) return { providerID: "opencode", modelID: model };
   return {

@@ -15,13 +15,13 @@ export interface LoggingConfig {
 
 type LogFields = Record<string, unknown>;
 
-const LEVEL_WEIGHT: Record<LogLevel, number> = {
+const LEVEL_WEIGHT = {
   silent: 0,
   error: 1,
   warn: 2,
   info: 3,
   debug: 4,
-};
+} satisfies Record<LogLevel, number>;
 
 export function shouldLog(config: LoggingConfig, level: Exclude<LogLevel, "silent">): boolean {
   return LEVEL_WEIGHT[config.level] >= LEVEL_WEIGHT[level];

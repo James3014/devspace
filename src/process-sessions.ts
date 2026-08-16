@@ -71,6 +71,8 @@ interface ProcessSessionManagerOptions {
   completedSessionTtlMs?: number;
 }
 
+type ProcessEnvironment = NodeJS.ProcessEnv;
+
 function boundedInteger(value: number | undefined, fallback: number, maximum: number): number {
   if (value === undefined) return fallback;
   if (!Number.isFinite(value) || value < 0) {
@@ -90,8 +92,8 @@ function terminalSize(value: number | undefined, fallback: number): number {
 function processEnvironment(input?: {
   workspaceId?: string;
   workspaceRoot?: string;
-}): Record<string, string> {
-  return {
+}) {
+  const environment: ProcessEnvironment = {
     ...Object.fromEntries(
       Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
     ),
@@ -103,9 +105,10 @@ function processEnvironment(input?: {
     CODEX_CI: "1",
     LANG: process.env.LANG ?? "C.UTF-8",
     LC_ALL: process.env.LC_ALL ?? "C.UTF-8",
-    ...(input?.workspaceId ? { DEVSPACE_WORKSPACE_ID: input.workspaceId } : {}),
-    ...(input?.workspaceRoot ? { DEVSPACE_WORKSPACE_ROOT: input.workspaceRoot } : {}),
   };
+  if (input?.workspaceId) environment.DEVSPACE_WORKSPACE_ID = input.workspaceId;
+  if (input?.workspaceRoot) environment.DEVSPACE_WORKSPACE_ROOT = input.workspaceRoot;
+  return environment;
 }
 
 function codePointLength(value: string): number {
@@ -127,7 +130,7 @@ function takeTail(value: string, count: number): string {
   return characters.slice(Math.max(0, characters.length - count)).join("");
 }
 
-function splitBudget(maxCharacters: number): { head: number; tail: number } {
+function splitBudget(maxCharacters: number) {
   return {
     head: Math.ceil(maxCharacters / 2),
     tail: Math.floor(maxCharacters / 2),
@@ -176,7 +179,7 @@ export class HeadTailBuffer {
     return this.totalCharacters > 0;
   }
 
-  drain(maxCharacters: number): { output: string; truncated: boolean } {
+  drain(maxCharacters: number) {
     if (!Number.isInteger(maxCharacters) || maxCharacters < 1) {
       throw new Error("Output limit must be a positive integer.");
     }
@@ -197,7 +200,7 @@ export class HeadTailBuffer {
   }
 }
 
-function truncateOutput(output: string, maxCharacters: number): { output: string; truncated: boolean } {
+function truncateOutput(output: string, maxCharacters: number) {
   const outputCharacters = codePointLength(output);
   if (outputCharacters <= maxCharacters) return { output, truncated: false };
 

@@ -197,24 +197,25 @@ export function createOpenAIIncomingArtifactAdapter(
         name: normalizeOpenAIFileName(reference.file_name, reference.file_id, mimeType),
         mimeType,
         size: responseSize ?? reference.size,
-        stream: Readable.fromWeb(response.body as unknown as NodeReadableStream),
+        // SAFETY: the Fetch response body is a WHATWG byte stream, which is the input contract of Readable.fromWeb.
+        stream: Readable.fromWeb(response.body as NodeReadableStream),
       };
     },
   };
 }
 
-export type IncomingArtifactValueShape =
+export type IncomingArtifactValueDescription =
   | { type: "null" }
   | { type: "undefined" }
   | { type: "boolean" }
   | { type: "number"; finite: boolean }
   | { type: "bigint" }
   | { type: "string"; kind: "absolute-path" | "url" | "data-url" | "text"; length: number }
-  | { type: "array"; length: number; items: IncomingArtifactValueShape[]; truncated: boolean }
+  | { type: "array"; length: number; items: IncomingArtifactValueDescription[]; truncated: boolean }
   | {
       type: "object";
       constructor?: string;
-      entries: Record<string, IncomingArtifactValueShape>;
+      entries: Record<string, IncomingArtifactValueDescription>;
       truncated: boolean;
     }
   | { type: "function" | "symbol" }
@@ -224,10 +225,10 @@ export function describeIncomingArtifactValue(
   value: unknown,
   maxDepth = 4,
   maxEntries = 20,
-): IncomingArtifactValueShape {
+): IncomingArtifactValueDescription {
   const seen = new WeakSet<object>();
 
-  const describe = (current: unknown, depth: number): IncomingArtifactValueShape => {
+  const describe = (current: unknown, depth: number): IncomingArtifactValueDescription => {
     if (current === null) return { type: "null" };
     if (current === undefined) return { type: "undefined" };
     if (typeof current === "boolean") return { type: "boolean" };
@@ -267,7 +268,7 @@ export function describeIncomingArtifactValue(
         truncated: keys.length > 0,
       };
     }
-    const entries: Record<string, IncomingArtifactValueShape> = {};
+    const entries: Record<string, IncomingArtifactValueDescription> = {};
     for (const [index, key] of keys.slice(0, maxEntries).entries()) {
       let entryValue: unknown;
       try {
@@ -519,7 +520,7 @@ function safeValueEntryKey(value: string, index: number): string {
     : `<redacted-key-${index + 1}>`;
 }
 
-function safeConstructorName(value: object): string | undefined {
+function safeConstructorName(value: { constructor?: { name?: string } }): string | undefined {
   try {
     const name = value.constructor?.name;
     return typeof name === "string" && name.length <= 80 ? name : undefined;

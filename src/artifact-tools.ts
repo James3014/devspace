@@ -285,12 +285,10 @@ export async function downloadIncomingArtifact({
   }
 }
 
-export function artifactToolLogFields(
-  input: Record<string, unknown>,
-): Record<string, unknown> {
+export function artifactToolLogFields(input: Record<string, unknown>) {
   return {
     fileProvided: input.file !== undefined,
-    fileReferenceShape: describeIncomingArtifactValue(input.file),
+    fileReferenceDescription: describeIncomingArtifactValue(input.file),
     downloadUrlHostname: incomingFileDownloadHostname(input.file),
     workspaceId: input.workspaceId,
     path: input.path,
@@ -576,7 +574,7 @@ function incomingFileDownloadHostname(value: unknown): string | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return undefined;
   }
-  const rawUrl = (value as Record<string, unknown>).download_url;
+  const rawUrl = Object(value).download_url;
   if (typeof rawUrl !== "string") return undefined;
   try {
     const hostname = new URL(rawUrl).hostname.toLowerCase();

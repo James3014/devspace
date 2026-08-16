@@ -236,7 +236,9 @@ function formatUnavailableAgentProvider(provider: LocalAgentProviderAvailability
   return `${provider.name} (${provider.reason ?? "unavailable"})`;
 }
 
-function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
+type SchemaFields = Parameters<typeof z.object>[0];
+
+function resultOutputSchema(extra: SchemaFields = {}) {
   return {
     result: z
       .string()
@@ -305,7 +307,7 @@ function sendJsonRpcError(
   });
 }
 
-function requestLogFields(req: Request, config: ServerConfig): Record<string, unknown> {
+function requestLogFields(req: Request, config: ServerConfig) {
   return {
     ip: requestIp(req, config.logging.trustProxy),
     host: req.header("host"),
@@ -359,10 +361,7 @@ function textBlock(text: string): ToolContent {
   return { type: "text", text };
 }
 
-function textSummary(content: ToolContent[]): {
-  lines: number;
-  characters: number;
-} {
+function textSummary(content: ToolContent[]) {
   const text = contentText(content);
   return {
     lines: text.length === 0 ? 0 : text.split("\n").length,
@@ -469,10 +468,7 @@ ${stylesheets}
 </html>`;
 }
 
-function appCsp(config: ServerConfig): {
-  resourceDomains: string[];
-  connectDomains: string[];
-} {
+function appCsp(config: ServerConfig) {
   const publicBaseUrl = config.publicBaseUrl.replace(/\/+$/, "");
   return {
     resourceDomains: [publicBaseUrl],
@@ -511,7 +507,7 @@ function processResult(snapshot: ProcessSnapshot): string {
   return snapshot.output ? `${snapshot.output.replace(/\n$/, "")}\n${status}` : status;
 }
 
-function processOutputSchema(): z.ZodRawShape {
+function processOutputSchema() {
   return resultOutputSchema({
     sessionId: z.number().optional(),
     running: z.boolean(),
@@ -1676,7 +1672,7 @@ export function createServer(
     : Array.from(new Set([config.host, ...config.allowedHosts]));
   const app = createMcpExpressApp({
     host: config.host,
-    ...(allowedHosts ? { allowedHosts } : {}),
+    allowedHosts,
   });
   const transports = new McpSessionRegistry<Transport>();
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);

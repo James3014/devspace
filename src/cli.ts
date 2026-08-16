@@ -541,7 +541,7 @@ function resolveCurrentWorkspaceRoot(): string {
   return resolve(process.env.DEVSPACE_WORKSPACE_ROOT || process.cwd());
 }
 
-function resolveCurrentWorkspaceScope(): { workspaceId?: string; workspaceRoot: string } {
+function resolveCurrentWorkspaceScope() {
   return {
     workspaceId: process.env.DEVSPACE_WORKSPACE_ID,
     workspaceRoot: resolveCurrentWorkspaceRoot(),
