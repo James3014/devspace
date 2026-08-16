@@ -2,6 +2,28 @@ import { basename, isAbsolute } from "node:path";
 import { Readable } from "node:stream";
 import type { ReadableStream as NodeReadableStream } from "node:stream/web";
 import { ArtifactError } from "./artifact-error.js";
+import {
+  isBigInt,
+  isBoolean,
+  isFunction,
+  isNumber,
+  isObject,
+  isString,
+  isSymbol,
+} from "./value-types.js";
+
+type IncomingValue =
+  | string
+  | number
+  | boolean
+  | bigint
+  | symbol
+  | null
+  | undefined
+  | (() => void)
+  | IncomingValue[]
+  | IncomingRecord;
+type IncomingRecord = { [key: string]: IncomingValue };
 
 const ADAPTER_ID_PATTERN = /^[a-z0-9][a-z0-9._-]{0,63}$/u;
 const OPENAI_FILE_HOSTS = new Set([
@@ -33,8 +55,8 @@ export interface IncomingArtifactSource {
 
 export interface IncomingArtifactAdapter {
   readonly id: string;
-  canHandle(value: unknown): boolean;
-  open(value: unknown): Promise<IncomingArtifactSource>;
+  canHandle<T>(value: T): boolean;
+  open<T>(value: T): Promise<IncomingArtifactSource>;
 }
 
 export interface OpenedIncomingArtifact extends IncomingArtifactSource {
@@ -64,7 +86,7 @@ export class IncomingArtifactAdapterRegistry {
     this.adapters = [...adapters];
   }
 
-  async open(value: unknown): Promise<OpenedIncomingArtifact> {
+  async open<T>(value: T): Promise<OpenedIncomingArtifact> {
     const matching: IncomingArtifactAdapter[] = [];
     for (const adapter of this.adapters) {
       let handles = false;
@@ -141,7 +163,7 @@ export function createOpenAIIncomingArtifactAdapter(
   return {
     id: "openai-file",
     canHandle: isOpenAIFileReferenceCandidate,
-    async open(value: unknown): Promise<IncomingArtifactSource> {
+    async open<T>(value: T): Promise<IncomingArtifactSource> {
       const reference = normalizeOpenAIFileReference(value);
 
       let downloadUrl = validateOpenAIFileUrl(reference.download_url);
@@ -221,22 +243,22 @@ export type IncomingArtifactValueDescription =
   | { type: "function" | "symbol" }
   | { type: "cycle" };
 
-export function describeIncomingArtifactValue(
-  value: unknown,
+export function describeIncomingArtifactValue<T>(
+  value: T,
   maxDepth = 4,
   maxEntries = 20,
 ): IncomingArtifactValueDescription {
   const seen = new WeakSet<object>();
 
-  const describe = (current: unknown, depth: number): IncomingArtifactValueDescription => {
+  const describe = (current: IncomingValue, depth: number): IncomingArtifactValueDescription => {
     if (current === null) return { type: "null" };
     if (current === undefined) return { type: "undefined" };
-    if (typeof current === "boolean") return { type: "boolean" };
-    if (typeof current === "number") return { type: "number", finite: Number.isFinite(current) };
-    if (typeof current === "bigint") return { type: "bigint" };
-    if (typeof current === "function") return { type: "function" };
-    if (typeof current === "symbol") return { type: "symbol" };
-    if (typeof current === "string") {
+    if (isBoolean(current)) return { type: "boolean" };
+    if (isNumber(current)) return { type: "number", finite: Number.isFinite(current) };
+    if (isBigInt(current)) return { type: "bigint" };
+    if (isFunction(current)) return { type: "function" };
+    if (isSymbol(current)) return { type: "symbol" };
+    if (isString(current)) {
       return {
         type: "string",
         kind: classifyValueString(current),
@@ -270,9 +292,10 @@ export function describeIncomingArtifactValue(
     }
     const entries: Record<string, IncomingArtifactValueDescription> = {};
     for (const [index, key] of keys.slice(0, maxEntries).entries()) {
-      let entryValue: unknown;
+      let entryValue: IncomingValue;
       try {
-        entryValue = (current as Record<string, unknown>)[key];
+        // SAFETY: Object.keys returned keys from this record, so indexed values are represented by IncomingValue.
+        entryValue = (current as IncomingRecord)[key];
       } catch {
         entryValue = undefined;
       }
@@ -286,23 +309,24 @@ export function describeIncomingArtifactValue(
     };
   };
 
-  return describe(value, 0);
+  // SAFETY: the describer handles every runtime representation and only reads object keys after checking the shape.
+  return describe(value as IncomingValue, 0);
 }
 
 function validateIncomingArtifactSource(source: IncomingArtifactSource): void {
-  if (!source || typeof source !== "object") {
+  if (!isObject(source)) {
     throw new ArtifactError(
       "invalid_incoming_artifact_source",
       "Incoming artifact adapter returned an invalid source.",
     );
   }
-  if (typeof source.name !== "string" || source.name.length === 0) {
+  if (!isString(source.name) || source.name.length === 0) {
     throw new ArtifactError(
       "invalid_incoming_artifact_source",
       "Incoming artifact adapter must provide a filename.",
     );
   }
-  if (source.mimeType !== undefined && typeof source.mimeType !== "string") {
+  if (source.mimeType !== undefined && !isString(source.mimeType)) {
     throw new ArtifactError(
       "invalid_incoming_artifact_source",
       "Incoming artifact adapter returned an invalid MIME hint.",
@@ -317,8 +341,9 @@ function validateIncomingArtifactSource(source: IncomingArtifactSource): void {
       "Incoming artifact adapter returned an invalid byte size.",
     );
   }
+  // SAFETY: source.stream is validated as an async-readable stream immediately below.
   const stream = source.stream as Partial<Readable> | undefined;
-  if (!stream || typeof stream[Symbol.asyncIterator] !== "function") {
+  if (!stream || !isFunction(stream[Symbol.asyncIterator])) {
     throw new ArtifactError(
       "invalid_incoming_artifact_source",
       "Incoming artifact adapter must provide an async-readable stream.",
@@ -326,7 +351,7 @@ function validateIncomingArtifactSource(source: IncomingArtifactSource): void {
   }
 }
 
-function isOpenAIFileReferenceCandidate(value: unknown): value is Record<string, unknown> {
+function isOpenAIFileReferenceCandidate<T>(value: T): value is T & IncomingRecord {
   if (!isRecord(value)) return false;
   const keys = Object.keys(value);
   return keys.length >= 2
@@ -335,7 +360,7 @@ function isOpenAIFileReferenceCandidate(value: unknown): value is Record<string,
     && Object.hasOwn(value, "file_id");
 }
 
-function normalizeOpenAIFileReference(value: unknown): OpenAIFileReference {
+function normalizeOpenAIFileReference<T>(value: T): OpenAIFileReference {
   if (!isOpenAIFileReferenceCandidate(value)) {
     throw new ArtifactError(
       "invalid_openai_file_reference",
@@ -346,8 +371,8 @@ function normalizeOpenAIFileReference(value: unknown): OpenAIFileReference {
   const downloadUrl = value.download_url;
   const fileId = value.file_id;
   if (
-    typeof downloadUrl !== "string"
-    || typeof fileId !== "string"
+    !isString(downloadUrl)
+    || !isString(fileId)
     || !isValidOpenAIFileId(fileId)
   ) {
     throw new ArtifactError(
@@ -381,7 +406,7 @@ function normalizeOpenAIFileReference(value: unknown): OpenAIFileReference {
   let size: number | undefined;
   const rawSize = value.size;
   if (rawSize !== undefined && rawSize !== null) {
-    if (typeof rawSize !== "number" || !Number.isSafeInteger(rawSize) || rawSize < 0) {
+    if (!isNumber(rawSize) || !Number.isSafeInteger(rawSize) || rawSize < 0) {
       throw new ArtifactError(
         "invalid_openai_file_reference",
         "ChatGPT file reference is malformed.",
@@ -399,9 +424,9 @@ function normalizeOpenAIFileReference(value: unknown): OpenAIFileReference {
   };
 }
 
-function nullableString(value: unknown): string | undefined | null {
+function nullableString<T>(value: T): string | undefined | null {
   if (value === undefined || value === null) return undefined;
-  return typeof value === "string" ? value : null;
+  return isString(value) ? value : null;
 }
 
 function normalizeOpenAIFileName(
@@ -496,8 +521,8 @@ function responseContentLength(response: Response): number | undefined {
   return Number.isSafeInteger(size) ? size : undefined;
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+function isRecord<T>(value: T): value is T & IncomingRecord {
+  return isObject(value) && !Array.isArray(value);
 }
 
 function classifyValueString(
@@ -523,7 +548,7 @@ function safeValueEntryKey(value: string, index: number): string {
 function safeConstructorName(value: { constructor?: { name?: string } }): string | undefined {
   try {
     const name = value.constructor?.name;
-    return typeof name === "string" && name.length <= 80 ? name : undefined;
+    return isString(name) && name.length <= 80 ? name : undefined;
   } catch {
     return undefined;
   }
