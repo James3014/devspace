@@ -26,6 +26,16 @@ export type ReviewFileType =
 
 import { isNumber, isObject } from "../value-types.js";
 
+type CardValue =
+  | string
+  | number
+  | boolean
+  | null
+  | undefined
+  | CardValue[]
+  | { [key: string]: CardValue };
+type CardSummary = { [key: string]: CardValue };
+
 export interface ToolResultCard {
   tool: ToolName;
   workspaceId?: string;
@@ -44,7 +54,7 @@ export interface ToolResultCard {
     managed?: boolean;
   };
   status?: string;
-  summary?: Record<string, unknown>;
+  summary?: CardSummary;
   files?: Array<{
     path?: string;
     previousPath?: string;
@@ -96,7 +106,7 @@ export interface ToolPayload {
   patch?: string;
 }
 
-export function isToolName(value: unknown): value is ToolName {
+export function isToolName<T>(value: T): value is T & ToolName {
   return (
     value === "open_workspace" ||
     value === "show_changes" ||
@@ -141,7 +151,7 @@ export function isReviewTool(tool: ToolName): boolean {
   return tool === "show_changes";
 }
 
-export function isToolResultCard(value: unknown): value is Omit<ToolResultCard, "tool"> {
+export function isToolResultCard<T>(value: T): value is T & Omit<ToolResultCard, "tool"> {
   return isObject(value);
 }
 
@@ -158,7 +168,7 @@ export function payloadText(payload: ToolPayload | undefined): string {
 }
 
 export function summaryNumber(
-  summary: Record<string, unknown> | undefined,
+  summary: CardSummary | undefined,
   key: string,
 ): number | undefined {
   const value = summary?.[key];

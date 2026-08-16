@@ -26,6 +26,7 @@ import {
   getToolHeaderSummary,
   type ToolDisplay,
 } from "./tool-display.js";
+import { isObject, type JsonObject } from "../value-types.js";
 import "./workspace-app.css";
 
 interface MountedPayload {
@@ -868,18 +869,23 @@ function renderWorkspaceChips(chips: WorkspaceChip[]): HTMLElement {
 }
 
 function toolNameFromMeta(result: CallToolResult): ToolName | undefined {
-  const meta = result._meta as Record<string, unknown> | undefined;
+  // SAFETY: MCP metadata is a JSON object and this card only reads optional fields from it.
+  const meta = result._meta as JsonObject | undefined;
   const tool = meta?.tool;
   return isToolName(tool) ? tool : undefined;
 }
 
 function cardFromMeta(result: CallToolResult): Partial<ToolResultCard> | undefined {
-  const meta = result._meta as Record<string, unknown> | undefined;
+  // SAFETY: MCP metadata is a JSON object and this card only reads optional fields from it.
+  const meta = result._meta as JsonObject | undefined;
   const metaCard = meta?.card;
-  return metaCard && typeof metaCard === "object" ? metaCard : undefined;
+  if (!isObject(metaCard)) return undefined;
+  // SAFETY: the card metadata is validated by isToolResultCard before rendering.
+  return metaCard as Partial<ToolResultCard>;
 }
 
 function getStructuredContent<T>(result: CallToolResult): T | undefined {
+  // SAFETY: callers provide the schema-specific structured content type for this tool result.
   return result.structuredContent as T | undefined;
 }
 
@@ -905,6 +911,7 @@ function element<K extends keyof HTMLElementTagNameMap>(
   if (options.ariaLabel !== undefined) node.setAttribute("aria-label", options.ariaLabel);
   if (options.ariaExpanded !== undefined) node.setAttribute("aria-expanded", options.ariaExpanded);
   if (options.disabled !== undefined && "disabled" in node) {
+    // SAFETY: the DOM property exists because the element was checked for disabled above.
     (node as HTMLButtonElement).disabled = options.disabled;
   }
   return node;

@@ -50,23 +50,32 @@ try {
 }
 
 function testOneToolContract(): void {
-  const registered = new Map<string, { descriptor: Record<string, unknown>; callback: (input: never) => unknown }>();
+  type ToolDescriptor = {
+    _meta?: object;
+    inputSchema?: Parameters<typeof z.object>[0];
+    outputSchema?: object;
+    annotations?: { destructiveHint?: boolean };
+  };
+  const registered = new Map<string, { descriptor: ToolDescriptor; callback: (input: never) => void }>();
   const server = {
     registerTool(
       name: string,
-      descriptor: Record<string, unknown>,
-      callback: (input: never) => unknown,
+      descriptor: ToolDescriptor,
+      callback: (input: never) => void,
     ) {
       registered.set(name, { descriptor, callback });
       return {};
     },
   };
 
+  // SAFETY: this mock intentionally implements only the registerTool surface used by the contract test.
   registerArtifactTools(server as never, {
     config: {
       artifactMaxFileBytes: 1024,
       logging: { toolCalls: false },
+    // SAFETY: the test exercises registration metadata and does not invoke the runtime config.
     } as never,
+    // SAFETY: the test does not execute the registered download callback.
     workspaces: {} as never,
   });
 
@@ -74,11 +83,11 @@ function testOneToolContract(): void {
   const descriptor = registered.get("download_artifact")?.descriptor;
   assert.ok(descriptor);
   assert.deepEqual(descriptor._meta, { "openai/fileParams": ["file"] });
-  assert.deepEqual(Object.keys(descriptor.inputSchema as object).sort(), ["file", "path", "workspaceId"]);
-  assert.deepEqual(Object.keys(descriptor.outputSchema as object), ["path"]);
-  assert.equal((descriptor.annotations as { destructiveHint?: boolean }).destructiveHint, false);
+  assert.deepEqual(Object.keys(descriptor.inputSchema ?? {}).sort(), ["file", "path", "workspaceId"]);
+  assert.deepEqual(Object.keys(descriptor.outputSchema ?? {}), ["path"]);
+  assert.equal(descriptor.annotations?.destructiveHint, false);
 
-  const inputSchema = descriptor.inputSchema as Parameters<typeof z.object>[0];
+  const inputSchema = descriptor.inputSchema;
   assert.ok(inputSchema);
   const fileSchema = inputSchema.file;
   assert.ok(fileSchema);
@@ -386,6 +395,6 @@ function registryFor(source: {
 async function expectArtifactError(promise: Promise<unknown>, code: string): Promise<void> {
   await assert.rejects(
     promise,
-    (error: unknown) => error instanceof ArtifactError && error.code === code,
+    (error: Error) => error instanceof ArtifactError && error.code === code,
   );
 }

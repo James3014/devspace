@@ -5,6 +5,7 @@ import { mkdir, realpath, rm, stat } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
 import type { ServerConfig } from "./config.js";
 import { assertAllowedPath, isPathInsideRoot } from "./roots.js";
+import { isObject } from "./value-types.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -104,7 +105,7 @@ async function resolveGitRoot(path: string, allowedRoots: string[]): Promise<str
 
     throw new GitWorktreeError(
       "GIT_REPOSITORY_NOT_FOUND",
-      `Cannot open workspace in worktree mode because this path is not inside a Git repository: ${path}. Use mode=\"checkout\" to work directly in this directory, or initialize Git and create an initial commit first.`,
+      `Cannot open workspace in worktree mode because this path is not inside a Git repository: ${path}. Use mode="checkout" to work directly in this directory, or initialize Git and create an initial commit first.`,
     );
   }
 }
@@ -131,11 +132,11 @@ async function assertGitRootAllowed(gitRoot: string, allowedRoots: string[]): Pr
 async function resolveBaseCommit(sourceRoot: string, baseRef: string): Promise<string> {
   try {
     return (await git(["rev-parse", "--verify", `${baseRef}^{commit}`], sourceRoot)).trim();
-  } catch (error) {
+  } catch {
     if (baseRef === "HEAD") {
       throw new GitWorktreeError(
         "GIT_REPOSITORY_HAS_NO_COMMITS",
-        "Cannot open workspace in worktree mode because the repository has no commits yet. Create an initial commit first, or use mode=\"checkout\".",
+        `Cannot open workspace in worktree mode because the repository has no commits yet. Create an initial commit first, or use mode="checkout".`,
       );
     }
 
@@ -169,22 +170,19 @@ async function git(args: string[], cwd: string): Promise<string> {
   } catch (error) {
     if (isGitUnavailable(error)) throw error;
 
-    const stderr = typeof error === "object" && error && "stderr" in error
-      ? String((error as { stderr?: unknown }).stderr ?? "").trim()
+    const stderr = isObject(error) && "stderr" in error
+      ? String(error.stderr ?? "").trim()
       : "";
-    const stdout = typeof error === "object" && error && "stdout" in error
-      ? String((error as { stdout?: unknown }).stdout ?? "").trim()
+    const stdout = isObject(error) && "stdout" in error
+      ? String(error.stdout ?? "").trim()
       : "";
     const details = stderr || stdout || (error instanceof Error ? error.message : String(error));
     throw new Error(details);
   }
 }
 
-function isGitUnavailable(error: unknown): boolean {
+function isGitUnavailable<T>(error: T): boolean {
   return Boolean(
-    typeof error === "object" &&
-      error &&
-      "code" in error &&
-      (error as { code?: unknown }).code === "ENOENT",
+    isObject(error) && "code" in error && error.code === "ENOENT",
   );
 }

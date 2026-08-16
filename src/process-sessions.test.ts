@@ -66,7 +66,7 @@ const background = await manager.start({
 });
 assert.equal(background.running, true);
 assert.ok(background.sessionId);
-assert.equal(typeof background.sessionId, "number");
+assert.ok(Number.isInteger(background.sessionId));
 
 await assert.rejects(
   manager.write({
@@ -94,7 +94,7 @@ const interactive = await manager.start({
 });
 assert.equal(interactive.running, true);
 assert.ok(interactive.sessionId);
-assert.equal(typeof interactive.sessionId, "number");
+assert.ok(Number.isInteger(interactive.sessionId));
 
 const inputResult = await manager.write({
   workspaceId: "workspace-a",

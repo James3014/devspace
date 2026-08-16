@@ -61,6 +61,7 @@ export class LocalAgentStore {
   list(scope: LocalAgentListScope = {}): LocalAgentRecord[] {
     let rows: LocalAgentRow[];
     if (scope.workspaceId) {
+      // SAFETY: the selected columns match LocalAgentRow in the local_agent_sessions migration.
       rows = this.database.sqlite
         .prepare(
           `select * from local_agent_sessions
@@ -69,6 +70,7 @@ export class LocalAgentStore {
         )
         .all(scope.workspaceId) as LocalAgentRow[];
     } else if (scope.workspaceRoot) {
+      // SAFETY: the selected columns match LocalAgentRow in the local_agent_sessions migration.
       rows = this.database.sqlite
         .prepare(
           `select * from local_agent_sessions
@@ -77,6 +79,7 @@ export class LocalAgentStore {
         )
         .all(resolve(scope.workspaceRoot)) as LocalAgentRow[];
     } else {
+      // SAFETY: the selected columns match LocalAgentRow in the local_agent_sessions migration.
       rows = this.database.sqlite
         .prepare("select * from local_agent_sessions order by updated_at desc")
         .all() as LocalAgentRow[];
@@ -132,6 +135,7 @@ export class LocalAgentStore {
   }
 
   get(idOrPrefix: string): LocalAgentRecord | undefined {
+    // SAFETY: the selected columns match LocalAgentRow in the local_agent_sessions migration.
     const exact = this.database.sqlite
       .prepare(
         `select * from local_agent_sessions
@@ -141,6 +145,7 @@ export class LocalAgentStore {
       .get(idOrPrefix, idOrPrefix) as LocalAgentRow | undefined;
     if (exact) return rowToLocalAgentRecord(exact);
 
+    // SAFETY: the selected columns match LocalAgentRow in the local_agent_sessions migration.
     const matches = this.database.sqlite
       .prepare(
         `select * from local_agent_sessions
@@ -201,6 +206,7 @@ export class LocalAgentStore {
   }
 
   private getById(id: string): LocalAgentRecord | undefined {
+    // SAFETY: the selected columns match LocalAgentRow in the local_agent_sessions migration.
     const row = this.database.sqlite
       .prepare("select * from local_agent_sessions where id = ?")
       .get(id) as LocalAgentRow | undefined;

@@ -1,4 +1,5 @@
 import type { Request } from "express";
+import { isString } from "./value-types.js";
 
 export type LogLevel = "silent" | "error" | "warn" | "info" | "debug";
 export type LogFormat = "json" | "pretty";
@@ -13,7 +14,15 @@ export interface LoggingConfig {
   trustProxy: boolean;
 }
 
-type LogFields = Record<string, unknown>;
+type LogFieldValue =
+  | string
+  | number
+  | boolean
+  | null
+  | undefined
+  | LogFieldValue[]
+  | { [key: string]: LogFieldValue };
+type LogFields = { [key: string]: LogFieldValue };
 
 const LEVEL_WEIGHT = {
   silent: 0,
@@ -93,7 +102,7 @@ function formatPretty(entry: LogFields): string {
   return rest ? `${ts} ${level} ${event} ${rest}` : `${ts} ${level} ${event}`;
 }
 
-function formatPrettyValue(value: unknown): string {
-  if (typeof value === "string") return JSON.stringify(value);
+function formatPrettyValue(value: LogFieldValue): string {
+  if (isString(value)) return JSON.stringify(value);
   return JSON.stringify(value);
 }

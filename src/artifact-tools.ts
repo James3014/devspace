@@ -22,6 +22,7 @@ import {
 } from "./incoming-artifacts.js";
 import { logEvent } from "./logger.js";
 import type { WorkspaceRegistry } from "./workspaces.js";
+import { isObject, isString } from "./value-types.js";
 
 const ARTIFACT_WRITE_ANNOTATIONS = {
   readOnlyHint: false,
@@ -57,6 +58,8 @@ export interface DownloadIncomingArtifactInput {
   workspaceId: string;
   path: string;
 }
+
+type ArtifactToolInput = DownloadIncomingArtifactInput;
 
 export interface DownloadIncomingArtifactResult {
   path: string;
@@ -285,7 +288,7 @@ export async function downloadIncomingArtifact({
   }
 }
 
-export function artifactToolLogFields(input: Record<string, unknown>) {
+export function artifactToolLogFields(input: ArtifactToolInput) {
   return {
     fileProvided: input.file !== undefined,
     fileReferenceDescription: describeIncomingArtifactValue(input.file),
@@ -297,7 +300,7 @@ export function artifactToolLogFields(input: Record<string, unknown>) {
 
 async function executeArtifactTool(
   config: ServerConfig,
-  input: Record<string, unknown>,
+  input: ArtifactToolInput,
   operation: () => Promise<{
     publicResult: { path: string };
     logResult: DownloadIncomingArtifactResult;
@@ -570,12 +573,12 @@ async function writeAll(
   }
 }
 
-function incomingFileDownloadHostname(value: unknown): string | undefined {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+function incomingFileDownloadHostname<T>(value: T): string | undefined {
+  if (!isObject(value) || Array.isArray(value)) {
     return undefined;
   }
-  const rawUrl = Object(value).download_url;
-  if (typeof rawUrl !== "string") return undefined;
+  const rawUrl = "download_url" in value ? value.download_url : undefined;
+  if (!isString(rawUrl)) return undefined;
   try {
     const hostname = new URL(rawUrl).hostname.toLowerCase();
     return hostname.length > 0 && hostname.length <= 253 ? hostname : undefined;
@@ -584,9 +587,9 @@ function incomingFileDownloadHostname(value: unknown): string | undefined {
   }
 }
 
-function incomingStreamChunk(value: unknown): Buffer {
+function incomingStreamChunk<T>(value: T): Buffer {
   if (Buffer.isBuffer(value)) return value;
-  if (typeof value === "string") return Buffer.from(value);
+  if (isString(value)) return Buffer.from(value);
   if (value instanceof Uint8Array) {
     return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
   }
@@ -605,6 +608,6 @@ async function lstatOrUndefined(path: string) {
   }
 }
 
-function isNodeError(error: unknown): error is NodeJS.ErrnoException {
+function isNodeError<T>(error: T): error is T & NodeJS.ErrnoException {
   return error instanceof Error && "code" in error;
 }

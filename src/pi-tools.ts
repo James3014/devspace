@@ -53,7 +53,7 @@ function formatToolError<T>(error: T): McpContent[] {
 async function runTool<TInput, TDetails = unknown>(
   execute: (input: TInput) => Promise<AgentToolResult<TDetails>>,
   input: TInput,
-  context: ToolContext,
+  _context: ToolContext,
 ): Promise<ToolResponse<TDetails>> {
   try {
     const result = await execute(input);

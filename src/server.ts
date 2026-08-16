@@ -50,7 +50,7 @@ import {
 } from "./mcp-sessions.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
-import { isString } from "./value-types.js";
+import { isString, type JsonObject } from "./value-types.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
@@ -122,14 +122,14 @@ type ToolWidgetKind =
   | "shell"
   | "show_changes";
 
-interface ToolDefinitionMeta extends Record<string, unknown> {
+interface ToolDefinitionMeta extends JsonObject {
   ui: {
     resourceUri: string;
     visibility: ["model"];
   };
 }
 
-type EmptyToolDefinitionMeta = Record<string, unknown> & {
+type EmptyToolDefinitionMeta = JsonObject & {
   "ui/resourceUri"?: string;
 };
 
@@ -280,20 +280,6 @@ const workspaceAvailableAgentsFileOutputSchema = z.object({
   path: z.string(),
 });
 
-const reviewFileOutputSchema = z.object({
-  path: z.string(),
-  previousPath: z.string().optional(),
-  type: z.enum(["change", "rename-pure", "rename-changed", "new", "deleted"]),
-  additions: z.number(),
-  removals: z.number(),
-});
-
-const reviewSummaryOutputSchema = z.object({
-  files: z.number(),
-  additions: z.number(),
-  removals: z.number(),
-});
-
 function sendJsonRpcError(
   res: Response,
   status: number,
@@ -423,6 +409,7 @@ function uiManifestUrl(): URL {
 }
 
 function readWorkspaceAppManifest(): WorkspaceAppManifest {
+  // SAFETY: the generated Vite manifest is read from the package's own dist directory.
   return JSON.parse(readFileSync(uiManifestUrl(), "utf8")) as WorkspaceAppManifest;
 }
 
@@ -522,7 +509,7 @@ function processToolResponse(
   tool: "exec_command" | "write_stdin",
   workspaceId: string,
   snapshot: ProcessSnapshot,
-  summary: Record<string, unknown>,
+  summary: JsonObject,
 ) {
   const result = processResult(snapshot);
   const content = [textBlock(result)];
@@ -895,6 +882,25 @@ export function createMcpServer(
         durationMs: Math.round(performance.now() - startedAt),
       });
 
+      const structuredContent = {
+        workspaceId: workspace.id,
+        root: workspace.root,
+        mode: workspace.mode,
+        sourceRoot: workspace.sourceRoot,
+        worktree: workspace.worktree,
+        instruction,
+      };
+      if (includeBootstrapContext) {
+        Object.assign(structuredContent, {
+          agentsFiles: loadedAgentsFiles,
+          availableAgentsFiles: availableAgentsFileOutputs,
+          skills: visibleSkills,
+          agentProviders: visibleAgentProviders,
+          agents: visibleAgents,
+          skillDiagnostics: workspace.skillDiagnostics,
+        });
+      }
+
       return {
         content: resultContent,
         _meta: {
@@ -924,24 +930,7 @@ export function createMcpServer(
             },
           },
         },
-        structuredContent: {
-          workspaceId: workspace.id,
-          root: workspace.root,
-          mode: workspace.mode,
-          sourceRoot: workspace.sourceRoot,
-          worktree: workspace.worktree,
-          ...(includeBootstrapContext
-            ? {
-                agentsFiles: loadedAgentsFiles,
-                availableAgentsFiles: availableAgentsFileOutputs,
-                skills: visibleSkills,
-                agentProviders: visibleAgentProviders,
-                agents: visibleAgents,
-                skillDiagnostics: workspace.skillDiagnostics,
-              }
-            : {}),
-          instruction,
-        },
+        structuredContent,
       };
     },
   );
@@ -1780,12 +1769,12 @@ export function createServer(
   });
 
   app.all("/mcp", async (req, res) => {
-    const requestId = res.locals.requestId as string | undefined;
+    const requestId: string | undefined = res.locals.requestId;
     const sessionId = req.header("mcp-session-id");
     const initializeRequest = req.method === "POST" && isInitializeRequest(req.body);
 
     await new Promise<void>((resolve, reject) => {
-      bearerAuth(req, res, (error?: unknown) => {
+      bearerAuth(req, res, (error?: Error | string) => {
         if (error) reject(error);
         else resolve();
       });

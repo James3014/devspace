@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { loadConfig } from "./config.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 
+// SAFETY: package.json is read from the package root and the test only consumes its version field.
 const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
   version: string;
 };

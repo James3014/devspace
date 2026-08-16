@@ -210,6 +210,7 @@ async function resolveConfinedPath(root: string, input: string): Promise<string>
       }
       break;
     } catch (error) {
+      // SAFETY: filesystem failures expose Node's errno code used for the missing-parent case.
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== "ENOENT") throw error;
       const parent = dirname(existing);
@@ -334,6 +335,7 @@ export async function isSamePatchFile(
     ]);
     return sourceIdentity.dev === destinationIdentity.dev && sourceIdentity.ino === destinationIdentity.ino;
   } catch (error) {
+    // SAFETY: filesystem failures expose Node's errno code used for missing paths.
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ENOENT" || code === "ENOTDIR") return false;
     throw error;

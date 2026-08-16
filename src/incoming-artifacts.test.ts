@@ -45,11 +45,11 @@ async function testRegistryFailsClosed(): Promise<void> {
 
   assert.throws(
     () => new IncomingArtifactAdapterRegistry([{ ...ambiguous, id: "UPPER" }]),
-    (error: unknown) => error instanceof ArtifactError && error.code === "invalid_incoming_adapter",
+    (error: Error) => error instanceof ArtifactError && error.code === "invalid_incoming_adapter",
   );
   assert.throws(
     () => new IncomingArtifactAdapterRegistry([ambiguous, ambiguous]),
-    (error: unknown) => error instanceof ArtifactError && error.code === "duplicate_incoming_adapter",
+    (error: Error) => error instanceof ArtifactError && error.code === "duplicate_incoming_adapter",
   );
 }
 
@@ -219,6 +219,6 @@ async function collect(stream: Readable): Promise<Buffer> {
 async function expectArtifactError(promise: Promise<unknown>, code: string): Promise<void> {
   await assert.rejects(
     promise,
-    (error: unknown) => error instanceof ArtifactError && error.code === code,
+    (error: Error) => error instanceof ArtifactError && error.code === code,
   );
 }

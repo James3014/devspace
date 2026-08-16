@@ -39,6 +39,7 @@ import {
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
+import { isString, type JsonObject } from "./value-types.js";
 
 type Command = "serve" | "init" | "doctor" | "config" | "agents" | "help" | "version";
 const require = createRequire(import.meta.url);
@@ -575,8 +576,9 @@ function printAgentsHelp(): void {
 }
 
 function printVersion(): void {
-  const packageJson = require("../package.json") as { version?: unknown };
-  if (typeof packageJson.version !== "string") {
+  // SAFETY: package.json is loaded from this package root and only its version field is consumed.
+  const packageJson = require("../package.json") as JsonObject;
+  if (!isString(packageJson.version)) {
     throw new Error("Unable to read DevSpace package version.");
   }
 
@@ -662,6 +664,7 @@ class SetupCancelledError extends Error {}
 
 function checkSqliteNative(): string {
   try {
+    // SAFETY: the dependency is loaded by the package setup and exposes the documented Database constructor.
     const Database = require("better-sqlite3") as typeof import("better-sqlite3");
     const db = new Database(":memory:");
     db.close();
@@ -673,6 +676,7 @@ function checkSqliteNative(): string {
 
 function checkGitAvailable(): string {
   try {
+    // SAFETY: Node's child_process module provides the documented execFileSync function.
     const { execFileSync } = require("node:child_process") as typeof import("node:child_process");
     return execFileSync("git", ["--version"], { encoding: "utf8" }).trim();
   } catch (error) {

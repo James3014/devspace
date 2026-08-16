@@ -41,6 +41,7 @@ export function migrateDatabase(sqlite: Database.Database): void {
 
     const applied = new Set(
       (
+        // SAFETY: the query selects the numeric version column created above.
         sqlite.prepare("select version from devspace_schema_migrations").all() as Array<{
           version: number;
         }>
@@ -204,6 +205,7 @@ function addColumnIfMissing(
   column: string,
   definition: string,
 ): void {
+  // SAFETY: pragma table_info always includes the name column used by this migration.
   const columns = sqlite.prepare(`pragma table_info(${table})`).all() as Array<{ name: string }>;
   if (columns.some((existingColumn) => existingColumn.name === column)) return;
 

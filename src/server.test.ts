@@ -13,6 +13,7 @@ import { ProcessSessionManager } from "./process-sessions.js";
 import { createMcpServer } from "./server.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
+import { isObject, isString, type JsonObject } from "./value-types.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -23,7 +24,7 @@ test("open_workspace keeps lifecycle flags out of model output and preserves com
 
   const tools = await context.client.listTools();
   const openTool = tools.tools.find((tool) => tool.name === "open_workspace");
-  const outputProperties = (openTool?.outputSchema as { properties?: Record<string, unknown> } | undefined)?.properties;
+  const outputProperties = openTool?.outputSchema?.properties;
   assert.equal(outputProperties && "workspaceReused" in outputProperties, false);
   assert.equal(outputProperties && "includeBootstrapContext" in outputProperties, false);
 
@@ -257,37 +258,37 @@ async function callOpen(
   conversationScopeId?: string,
   mode?: "checkout" | "worktree",
 ): Promise<Awaited<ReturnType<Client["callTool"]>>> {
-  const params = {
+  const toolArguments = { path, mode } satisfies { path: string; mode?: "checkout" | "worktree" };
+  const params: Parameters<Client["callTool"]>[0] = {
     name: "open_workspace",
-    arguments: {
-      path,
-      ...(mode ? { mode } : {}),
-    },
-    ...(conversationScopeId
-      ? { _meta: { "openai/session": conversationScopeId } }
-      : {}),
-  } as Parameters<Client["callTool"]>[0];
+    arguments: toolArguments,
+  };
+  if (conversationScopeId) {
+    params._meta = { "openai/session": conversationScopeId };
+  }
   return client.callTool(params);
 }
 
-function structuredContent(result: Awaited<ReturnType<Client["callTool"]>>): Record<string, unknown> {
+function structuredContent(result: Awaited<ReturnType<Client["callTool"]>>): JsonObject {
   assert.ok(result.structuredContent);
-  return result.structuredContent as Record<string, unknown>;
+  // SAFETY: the open_workspace response schema is the source of this structured content.
+  return result.structuredContent as JsonObject;
 }
 
 function responseText(result: Awaited<ReturnType<Client["callTool"]>>): string {
-  const content = (result as { content?: unknown }).content;
+  const content = result.content;
   assert.ok(Array.isArray(content));
-  const first = content[0] as { type?: unknown; text?: unknown } | undefined;
-  assert.equal(first?.type, "text");
-  assert.equal(typeof first?.text, "string");
-  return first?.text as string;
+  const first = content[0];
+  assert.ok(first && first.type === "text");
+  assert.ok(isString(first.text));
+  return first.text;
 }
 
-function responseCard(result: Awaited<ReturnType<Client["callTool"]>>): Record<string, unknown> {
+function responseCard(result: Awaited<ReturnType<Client["callTool"]>>): JsonObject {
   const metadata = result._meta;
-  assert.ok(metadata && typeof metadata === "object");
-  const card = (metadata as Record<string, unknown>).card;
-  assert.ok(card && typeof card === "object");
-  return card as Record<string, unknown>;
+  assert.ok(isObject(metadata));
+  const card = "card" in metadata ? metadata.card : undefined;
+  assert.ok(isObject(card));
+  // SAFETY: the response card is produced by the server's structured card contract.
+  return card as JsonObject;
 }

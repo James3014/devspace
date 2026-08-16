@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef } from "react";
-import { createRoot, type Root } from "react-dom/client";
+import { createRoot } from "react-dom/client";
 import { FileStream, getFiletypeFromFileName } from "@pierre/diffs";
 import type { FileStreamOptions } from "@pierre/diffs";
 import { PatchDiff } from "@pierre/diffs/react";

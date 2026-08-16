@@ -86,10 +86,12 @@ function testPersistenceAndTokenHashing(stateDir: string): void {
 
   const database = openDatabase(stateDir);
   try {
+    // SAFETY: each query selects the token_hash column from the store's token tables.
     const accessHashes = database.sqlite
       .prepare("select token_hash from oauth_access_tokens")
       .pluck()
       .all() as string[];
+    // SAFETY: each query selects the token_hash column from the store's token tables.
     const refreshHashes = database.sqlite
       .prepare("select token_hash from oauth_refresh_tokens")
       .pluck()

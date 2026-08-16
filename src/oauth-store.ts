@@ -46,10 +46,12 @@ export class SqliteOAuthStore {
   }
 
   getClient(clientId: string): OAuthClientInformationFull | undefined {
+    // SAFETY: the query selects the single client_json column defined by the oauth_clients migration.
     const row = this.database.sqlite
       .prepare("select client_json from oauth_clients where client_id = ?")
       .get(clientId) as { client_json: string } | undefined;
 
+    // SAFETY: registered clients are serialized from OAuthClientInformationFull before insertion.
     return row ? (JSON.parse(row.client_json) as OAuthClientInformationFull) : undefined;
   }
 
@@ -99,6 +101,7 @@ export class SqliteOAuthStore {
   }
 
   getAccessToken(tokenHash: string): PersistedAccessTokenRecord | undefined {
+    // SAFETY: the query columns match the access-token row shape below.
     const row = this.database.sqlite
       .prepare(
         "select client_id, scopes_json, expires_at, resource from oauth_access_tokens where token_hash = ?",
@@ -157,6 +160,7 @@ export class SqliteOAuthStore {
   }
 
   getRefreshToken(tokenHash: string): PersistedRefreshTokenRecord | undefined {
+    // SAFETY: the query columns match the refresh-token row shape below.
     const row = this.database.sqlite
       .prepare(
         "select client_id, scopes_json, expires_at, resource from oauth_refresh_tokens where token_hash = ?",
@@ -212,6 +216,7 @@ function rowToAccessTokenRecord(row: {
 }): PersistedAccessTokenRecord {
   return {
     clientId: row.client_id,
+    // SAFETY: scopes_json is written from the string[] scopes field by this store.
     scopes: JSON.parse(row.scopes_json) as string[],
     expiresAt: row.expires_at,
     resource: row.resource ?? undefined,
@@ -226,6 +231,7 @@ function rowToRefreshTokenRecord(row: {
 }): PersistedRefreshTokenRecord {
   return {
     clientId: row.client_id,
+    // SAFETY: scopes_json is written from the string[] scopes field by this store.
     scopes: JSON.parse(row.scopes_json) as string[],
     expiresAt: row.expires_at,
     resource: row.resource ?? undefined,

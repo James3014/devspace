@@ -119,6 +119,7 @@ export function resolveSubagentsFlag(
 
 function readJsonFile<T>(filePath: string): T {
   try {
+    // SAFETY: callers select the config/auth owner type for the corresponding known JSON file.
     return JSON.parse(readFileSync(filePath, "utf8")) as T;
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
@@ -126,6 +127,10 @@ function readJsonFile<T>(filePath: string): T {
   }
 }
 
-function writeJsonFile(filePath: string, value: unknown, mode: number): void {
+function writeJsonFile(
+  filePath: string,
+  value: DevspaceUserConfig | DevspaceAuthConfig,
+  mode: number,
+): void {
   writeFileSync(filePath, JSON.stringify(value, null, 2) + "\n", { mode });
 }

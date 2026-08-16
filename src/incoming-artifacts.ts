@@ -34,7 +34,7 @@ const OPENAI_FILE_HOSTS = new Set([
 const OPENAI_REGIONAL_BLOB_HOST_PATTERN = /^oaisdmntpr[a-z0-9]+\.blob\.core\.windows\.net$/u;
 const OPENAI_FILENAME_SAFE_FILE_ID_PATTERN = /^file[-_][A-Za-z0-9][A-Za-z0-9._-]{0,255}$/u;
 const OPENAI_FILE_ID_MAX_LENGTH = 512;
-const OPENAI_FILE_ID_CONTROL_PATTERN = /[\u0000-\u001F\u007F]/u;
+const OPENAI_FILE_ID_CONTROL_PATTERN = /\p{Cc}/u;
 const OPENAI_FILE_KEYS = new Set([
   "download_url",
   "file_id",
