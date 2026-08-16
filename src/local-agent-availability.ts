@@ -5,7 +5,6 @@ import {
   LOCAL_AGENT_PROVIDERS,
   type LocalAgentProvider,
 } from "./local-agent-profiles.js";
-import { isObject } from "./value-types.js";
 
 export interface LocalAgentProviderAvailability {
   name: LocalAgentProvider;
@@ -135,7 +134,7 @@ function executableExists(command: string, env: NodeJS.ProcessEnv): boolean {
     windowsHide: true,
     timeout: 5_000,
   });
-  const code = isObject(result.error) && "code" in result.error
+  const code = result.error instanceof Error && "code" in result.error
     ? result.error.code
     : undefined;
   return code !== "ENOENT";
