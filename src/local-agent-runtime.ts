@@ -60,6 +60,7 @@ function threadOptionsFor(input: LocalAgentRunInput): ThreadOptions {
     sandboxMode: sandboxModeFor(input.writeMode),
     approvalPolicy: "never",
     model: input.model,
+    // SAFETY: the configured thinking value is passed through to the Codex SDK, whose accepted values are ModelReasoningEffort.
     modelReasoningEffort: input.thinking as ModelReasoningEffort | undefined,
   };
 }
@@ -98,5 +99,6 @@ export async function createCodexSdkLocalAgentRuntime(
 
 async function defaultCodexFactory(): Promise<CodexFactory> {
   const module = await import("@openai/codex-sdk");
+  // SAFETY: the dynamically imported SDK exposes the Codex constructor required by CodexFactory.
   return (options) => new module.Codex(options) as Codex;
 }

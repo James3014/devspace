@@ -9,6 +9,27 @@ import {
   type LocalAgentRunInput,
   type LocalAgentRunResult,
 } from "./local-agent-runtime.js";
+import { isObject, isString } from "./value-types.js";
+
+type ProviderValue =
+  | string
+  | number
+  | boolean
+  | null
+  | undefined
+  | ProviderValue[]
+  | ProviderRecord;
+type ProviderRecord = { [key: string]: ProviderValue };
+type ProviderRequest = { [key: string]: ProviderValue };
+
+interface OpenCodeClient {
+  session: {
+    create(parameters?: ProviderRequest, options?: ProviderRequest): Promise<ProviderValue>;
+    prompt(parameters?: ProviderRequest, options?: ProviderRequest): Promise<ProviderValue>;
+    wait?(parameters?: ProviderRequest, options?: ProviderRequest): Promise<ProviderValue>;
+    messages?(parameters?: ProviderRequest, options?: ProviderRequest): Promise<ProviderValue>;
+  };
+}
 
 export interface LocalAgentAdapter {
   readonly provider: LocalAgentProvider;
@@ -64,7 +85,9 @@ class ClaudeLocalAgentAdapter implements LocalAgentAdapter {
       options: {
         cwd: input.workspace,
         model: input.model,
+        // SAFETY: Claude's SDK accepts the adaptive thinking object when the profile enables thinking.
         thinking: input.thinking ? { type: "adaptive" } as const : undefined,
+        // SAFETY: Claude's SDK uses EffortLevel for the profile's validated thinking value.
         effort: input.thinking as EffortLevel | undefined,
         resume: input.providerSessionId,
         permissionMode: "bypassPermissions",
@@ -79,9 +102,10 @@ class ClaudeLocalAgentAdapter implements LocalAgentAdapter {
     const items: unknown[] = [];
     for await (const message of messages) {
       items.push(message);
-      const record = message as Record<string, unknown>;
-      if (typeof record.session_id === "string") providerSessionId = record.session_id;
-      if (record.type === "result" && typeof record.result === "string") {
+      // SAFETY: Claude emits JSON-shaped result messages; only the fields below are consumed.
+      const record = message as ProviderRecord;
+      if (isString(record.session_id)) providerSessionId = record.session_id;
+      if (record.type === "result" && isString(record.result)) {
         const resultError = claudeResultError(record);
         if (resultError) throw new Error(resultError);
         finalResponse = record.result;
@@ -98,8 +122,8 @@ class ClaudeLocalAgentAdapter implements LocalAgentAdapter {
   }
 }
 
-function claudeResultError(record: Record<string, unknown>): string | undefined {
-  const subtype = typeof record.subtype === "string" ? record.subtype : undefined;
+function claudeResultError(record: ProviderRecord): string | undefined {
+  const subtype = isString(record.subtype) ? record.subtype : undefined;
   const isError = record.is_error === true || subtype?.startsWith("error");
   if (!isError) return undefined;
   const message =
@@ -111,8 +135,8 @@ function claudeResultError(record: Record<string, unknown>): string | undefined 
   return `Claude returned an error result: ${message}`;
 }
 
-function directString(value: unknown): string | undefined {
-  return typeof value === "string" && value.trim() ? value.trim() : undefined;
+function directString(value: ProviderValue): string | undefined {
+  return isString(value) && value.trim() ? value.trim() : undefined;
 }
 
 function resolveExecutable(command: string): string | undefined {
@@ -145,11 +169,42 @@ class OpencodeLocalAgentAdapter implements LocalAgentAdapter {
   async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
     const { createOpencode } = await import("@opencode-ai/sdk/v2");
     const { client, server } = await createOpencode();
+    const providerClient: OpenCodeClient = {
+      session: {
+        async create(parameters, options) {
+          // SAFETY: OpenCode accepts the JSON request assembled by this adapter.
+          const result = await client.session.create(
+            // SAFETY: OpenCode's generated client accepts this JSON-shaped request.
+            parameters as never,
+            // SAFETY: OpenCode's generated client accepts these request options.
+            options as never,
+          );
+          return decodeProviderResponse(result);
+        },
+        async prompt(parameters, options) {
+          // SAFETY: OpenCode accepts the JSON request assembled by this adapter.
+          const result = await client.session.prompt(
+            // SAFETY: OpenCode's generated client accepts this JSON-shaped request.
+            parameters as never,
+            // SAFETY: OpenCode's generated client accepts these request options.
+            options as never,
+          );
+          return decodeProviderResponse(result);
+        },
+        wait: undefined,
+        async messages(parameters, options) {
+          if (!client.session.messages) return undefined;
+          // SAFETY: OpenCode accepts the JSON request assembled by this adapter.
+          const result = await client.session.messages(parameters as never, options as never);
+          return decodeProviderResponse(result);
+        },
+      },
+    };
     try {
-      const sessionId = input.providerSessionId ?? await createOpencodeSession(client, input);
-      const promptResult = await promptOpencodeSession(client, sessionId, input);
-      await waitForOpencodeSession(client, sessionId);
-      const messages = await readOpencodeMessages(client, sessionId);
+      const sessionId = input.providerSessionId ?? await createOpencodeSession(providerClient, input);
+      const promptResult = await promptOpencodeSession(providerClient, sessionId, input);
+      await waitForOpencodeSession(providerClient, sessionId);
+      const messages = await readOpencodeMessages(providerClient, sessionId);
       const finalResponse = requireFinalResponse(
         "OpenCode",
         extractOpenCodeFinalResponse(messages) || extractOpenCodeFinalResponse(promptResult),
@@ -190,7 +245,9 @@ class AcpLocalAgentAdapter implements LocalAgentAdapter {
     });
 
     const stream = ndJsonStream(
+      // SAFETY: assertPipedChild verified the child streams are writable/readable Node streams.
       Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
+      // SAFETY: assertPipedChild verified the child streams are writable/readable Node streams.
       Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
     );
     try {
@@ -207,11 +264,11 @@ class AcpLocalAgentAdapter implements LocalAgentAdapter {
           providerSessionId = session.sessionId;
           try {
             if (input.model) {
-              const config = resolveAcpModelConfigUpdate(session, input.model, this.provider);
+              const config = resolveAcpModelConfigUpdate(decodeProviderResponse(session), input.model, this.provider);
               await context.request(methods.agent.session.setConfigOption, config);
             }
             if (input.thinking) {
-              const config = resolveAcpThinkingConfigUpdate(session, input.thinking, this.provider);
+              const config = resolveAcpThinkingConfigUpdate(decodeProviderResponse(session), input.thinking, this.provider);
               await context.request(methods.agent.session.setConfigOption, config);
             }
             const prompt = session.prompt(input.prompt);
@@ -247,7 +304,7 @@ class AcpLocalAgentAdapter implements LocalAgentAdapter {
 }
 
 export function resolveAcpModelConfigUpdate(
-  session: unknown,
+  session: ProviderValue,
   model: string,
   provider: string,
 ): { sessionId: string; configId: string; value: string } {
@@ -260,7 +317,7 @@ export function resolveAcpModelConfigUpdate(
 }
 
 export function resolveAcpThinkingConfigUpdate(
-  session: unknown,
+  session: ProviderValue,
   thinking: string,
   provider: string,
 ): { sessionId: string; configId: string; value: string } {
@@ -273,7 +330,7 @@ export function resolveAcpThinkingConfigUpdate(
 }
 
 function resolveAcpSelectConfigUpdate(
-  session: unknown,
+  session: ProviderValue,
   options: {
     category: string;
     label: string;
@@ -283,7 +340,7 @@ function resolveAcpSelectConfigUpdate(
 ) {
   const record = asRecord(session);
   if (!record) throw new Error(`${options.provider} ACP session did not return session metadata.`);
-  const sessionId = typeof record?.sessionId === "string" ? record.sessionId : undefined;
+  const sessionId = isString(record?.sessionId) ? record.sessionId : undefined;
   if (!sessionId) throw new Error(`${options.provider} ACP session did not return a session id.`);
 
   const response = asRecord(record.newSessionResponse);
@@ -307,7 +364,7 @@ function resolveAcpSelectConfigUpdate(
   return { sessionId, configId, value: options.value };
 }
 
-function flattenAcpSelectValues(option: Record<string, unknown>): string[] {
+function flattenAcpSelectValues(option: ProviderRecord): string[] {
   const values: string[] = [];
   for (const item of readArray(option, "options") ?? []) {
     const record = asRecord(item);
@@ -347,7 +404,7 @@ class PiRpcLocalAgentAdapter implements LocalAgentAdapter {
     });
     assertPipedChild(child);
     const rpc = new JsonLineRpc(child);
-    const events: unknown[] = [];
+    const events: ProviderValue[] = [];
     rpc.onEvent((event) => events.push(event));
     try {
       const state = await rpc.request({ type: "get_state" });
@@ -393,10 +450,10 @@ export function piCommandEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv 
 
 class JsonLineRpc {
   private readonly pending = new Map<string, {
-    resolve: (value: unknown) => void;
+    resolve: (value: ProviderValue) => void;
     reject: (error: Error) => void;
   }>();
-  private readonly eventSubscribers = new Set<(event: unknown) => void>();
+  private readonly eventSubscribers = new Set<(event: ProviderValue) => void>();
   private buffer = "";
   private nextId = 1;
   private stderr = "";
@@ -412,7 +469,7 @@ class JsonLineRpc {
     });
   }
 
-  request(command: Record<string, unknown>): Promise<unknown> {
+  request(command: ProviderRequest): Promise<ProviderValue> {
     if (this.fatalError) {
       return Promise.reject(this.fatalError);
     }
@@ -424,12 +481,12 @@ class JsonLineRpc {
     });
   }
 
-  onEvent(callback: (event: unknown) => void): () => void {
+  onEvent(callback: (event: ProviderValue) => void): () => void {
     this.eventSubscribers.add(callback);
     return () => this.eventSubscribers.delete(callback);
   }
 
-  waitForEvent(predicate: (event: unknown) => boolean, timeoutMs: number): Promise<unknown> {
+  waitForEvent(predicate: (event: ProviderValue) => boolean, timeoutMs: number): Promise<ProviderValue> {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         unsubscribe();
@@ -452,9 +509,10 @@ class JsonLineRpc {
       const line = this.buffer.slice(0, newline).trim();
       this.buffer = this.buffer.slice(newline + 1);
       if (!line) continue;
-      let message: Record<string, unknown>;
+      let message: ProviderRecord;
       try {
-        message = JSON.parse(line) as Record<string, unknown>;
+        // SAFETY: the RPC transport emits one JSON object per line.
+        message = JSON.parse(line) as ProviderRecord;
       } catch {
         this.stderr += `${line}\n`;
         this.failAll(new Error(`Pi RPC emitted malformed JSON on stdout: ${line}`));
@@ -465,7 +523,7 @@ class JsonLineRpc {
         continue;
       }
 
-      const id = typeof message.id === "string" ? message.id : undefined;
+      const id = isString(message.id) ? message.id : undefined;
       if (!id) continue;
       const pending = this.pending.get(id);
       if (!pending) continue;
@@ -487,12 +545,8 @@ class JsonLineRpc {
   }
 }
 
-async function createOpencodeSession(client: unknown, input: LocalAgentRunInput): Promise<string> {
-  const sessionClient = client as {
-    session: {
-      create(parameters?: unknown, options?: unknown): Promise<unknown>;
-    };
-  };
+async function createOpencodeSession(client: OpenCodeClient, input: LocalAgentRunInput): Promise<string> {
+  const sessionClient = client;
   const result = await sessionClient.session.create({
     directory: input.workspace,
     location: { directory: input.workspace },
@@ -503,22 +557,18 @@ async function createOpencodeSession(client: unknown, input: LocalAgentRunInput)
     readNestedString(result, ["data", "id"]) ??
     readNestedString(result, ["session", "id"]) ??
     readNestedString(result, ["data", "session", "id"]);
-  if (typeof id !== "string") {
+  if (!id) {
     throw new Error("OpenCode did not return a session id.");
   }
   return id;
 }
 
 async function promptOpencodeSession(
-  client: unknown,
+  client: OpenCodeClient,
   sessionId: string,
   input: LocalAgentRunInput,
-): Promise<unknown> {
-  const session = (client as {
-    session: {
-      prompt(parameters?: unknown, options?: unknown): Promise<unknown>;
-    };
-  }).session;
+): Promise<ProviderValue> {
+  const session = client.session;
   const promptInput = {
     sessionID: sessionId,
     directory: input.workspace,
@@ -530,20 +580,14 @@ async function promptOpencodeSession(
   return session.prompt(promptInput, { throwOnError: true });
 }
 
-async function waitForOpencodeSession(client: unknown, sessionId: string): Promise<void> {
-  const session = (client as {
-    session?: { wait?: (parameters?: unknown, options?: unknown) => Promise<unknown> };
-  }).session;
+async function waitForOpencodeSession(client: OpenCodeClient, sessionId: string): Promise<void> {
+  const session = client.session;
   if (!session?.wait) return;
   await session.wait({ sessionID: sessionId }, { throwOnError: true });
 }
 
-async function readOpencodeMessages(client: unknown, sessionId: string): Promise<unknown> {
-  const session = (client as {
-    session?: {
-      messages?: (parameters?: unknown, options?: unknown) => Promise<unknown>;
-    };
-  }).session;
+async function readOpencodeMessages(client: OpenCodeClient, sessionId: string): Promise<ProviderValue> {
+  const session = client.session;
   if (!session?.messages) return undefined;
   return session.messages({ sessionID: sessionId, order: "asc", limit: 100 }, { throwOnError: true });
 }
@@ -557,7 +601,12 @@ function parseOpencodeModel(model: string) {
   };
 }
 
-export function extractLocalAgentResponseText(value: unknown): string {
+function decodeProviderResponse<T>(value: T): ProviderValue {
+  const serialized = JSON.stringify(value);
+  return serialized === undefined ? undefined : JSON.parse(serialized);
+}
+
+export function extractLocalAgentResponseText(value: ProviderValue): string {
   return extractOpenCodeFinalResponse(value) || extractPiFinalResponse(value);
 }
 
@@ -567,14 +616,14 @@ function assertPipedChild(child: ReturnType<typeof spawn>): asserts child is Chi
   }
 }
 
-export function extractOpenCodeFinalResponse(value: unknown): string {
+export function extractOpenCodeFinalResponse(value: ProviderValue): string {
   const root = unwrapProviderPayload(value);
   const messages = Array.isArray(root) ? root : readArray(root, "messages");
   if (messages) return extractLastOpenCodeAssistantMessageText(messages);
   return extractOpenCodeAssistantMessageText(root);
 }
 
-export function extractPiFinalResponse(value: unknown): string {
+export function extractPiFinalResponse(value: ProviderValue): string {
   const root = unwrapProviderPayload(value);
   const messages = Array.isArray(root) ? root : readArray(root, "messages");
   if (!messages) return "";
@@ -588,21 +637,21 @@ export function extractPiFinalResponse(value: unknown): string {
   return "";
 }
 
-export function extractPiStreamingText(events: unknown[]): string {
+export function extractPiStreamingText(events: ProviderValue[]): string {
   return events
     .map((event) => {
       const record = asRecord(event);
       if (!record || record.type !== "message_update") return "";
       const update = asRecord(record.assistantMessageEvent);
       if (!update || update.type !== "text_delta") return "";
-      return typeof update.delta === "string" ? update.delta : "";
+      return isString(update.delta) ? update.delta : "";
     })
     .filter(Boolean)
     .join("")
     .trim();
 }
 
-export function extractPiProviderError(value: unknown): string {
+export function extractPiProviderError(value: ProviderValue): string {
   const root = unwrapProviderPayload(value);
   if (Array.isArray(root)) {
     for (let index = root.length - 1; index >= 0; index -= 1) {
@@ -619,16 +668,16 @@ export function extractPiProviderError(value: unknown): string {
   const record = asRecord(message);
   if (!record) return "";
   const error = record.errorMessage ?? record.error;
-  return typeof error === "string" ? error.trim() : "";
+  return isString(error) ? error.trim() : "";
 }
 
-function extractLastOpenCodeAssistantMessageText(messages: unknown[]): string {
+function extractLastOpenCodeAssistantMessageText(messages: ProviderValue[]): string {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = asRecord(messages[index]);
     if (!message) continue;
     const info = asRecord(message.info);
-    const role = typeof info?.role === "string" ? info.role : message.role;
-    const type = typeof message.type === "string" ? message.type : undefined;
+    const role = isString(info?.role) ? info.role : message.role;
+    const type = isString(message.type) ? message.type : undefined;
     if (role !== "assistant" && type !== "assistant") continue;
     const text = extractOpenCodeAssistantMessageText(message);
     if (text) return text;
@@ -636,7 +685,7 @@ function extractLastOpenCodeAssistantMessageText(messages: unknown[]): string {
   return "";
 }
 
-function extractOpenCodeAssistantMessageText(value: unknown): string {
+function extractOpenCodeAssistantMessageText(value: ProviderValue): string {
   const message = asRecord(value);
   if (!message) return "";
 
@@ -646,7 +695,7 @@ function extractOpenCodeAssistantMessageText(value: unknown): string {
       .map((part) => {
         const partRecord = asRecord(part);
         if (!partRecord || partRecord.type !== "text") return "";
-        return typeof partRecord.text === "string" ? partRecord.text : "";
+        return isString(partRecord.text) ? partRecord.text : "";
       })
       .filter(Boolean)
       .join("");
@@ -659,7 +708,7 @@ function extractOpenCodeAssistantMessageText(value: unknown): string {
       .map((part) => {
         const partRecord = asRecord(part);
         if (!partRecord || partRecord.type !== "text") return "";
-        return typeof partRecord.text === "string" ? partRecord.text : "";
+        return isString(partRecord.text) ? partRecord.text : "";
       })
       .filter(Boolean)
       .join("");
@@ -670,51 +719,52 @@ function extractOpenCodeAssistantMessageText(value: unknown): string {
   return stringifyStructuredAssistantMessage(info.structured);
 }
 
-function extractPiAssistantMessageText(message: Record<string, unknown>): string {
+function extractPiAssistantMessageText(message: ProviderRecord): string {
   const content = message.content;
   if (!Array.isArray(content)) return "";
   return content
     .map((part) => {
       const partRecord = asRecord(part);
       if (!partRecord || partRecord.type !== "text") return "";
-      return typeof partRecord.text === "string" ? partRecord.text : "";
+      return isString(partRecord.text) ? partRecord.text : "";
     })
     .filter(Boolean)
     .join("\n\n")
     .trim();
 }
 
-function stringifyStructuredAssistantMessage(value: unknown): string {
+function stringifyStructuredAssistantMessage(value: ProviderValue): string {
   if (value === undefined || value === null) return "";
-  if (typeof value === "string") return value.trim();
+  if (isString(value)) return value.trim();
   return JSON.stringify(value);
 }
 
-function unwrapProviderPayload(value: unknown): unknown {
+function unwrapProviderPayload(value: ProviderValue): ProviderValue {
   const record = asRecord(value);
   if (!record) return value;
   return record.data ?? record.result ?? value;
 }
 
-function readArray(record: unknown, key: string): unknown[] | undefined {
+function readArray(record: ProviderValue, key: string): ProviderValue[] | undefined {
   const value = asRecord(record)?.[key];
   return Array.isArray(value) ? value : undefined;
 }
 
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
-  return value as Record<string, unknown>;
+function asRecord(value: ProviderValue): ProviderRecord | undefined {
+  if (!isObject(value)) return undefined;
+  // SAFETY: provider payload records are JSON-shaped objects and are accessed only by optional keys.
+  return value as ProviderRecord;
 }
 
-function readNestedString(value: unknown, path: string[]): string | undefined {
-  let current: unknown = value;
+function readNestedString(value: ProviderValue, path: string[]): string | undefined {
+  let current: ProviderValue = value;
   for (const key of path) {
     current = asRecord(current)?.[key];
   }
-  return typeof current === "string" ? current : undefined;
+  return isString(current) ? current : undefined;
 }
 
-function errorMessage(error: unknown): string {
+function errorMessage<T>(error: T): string {
   return error instanceof Error ? error.message : String(error);
 }
 
