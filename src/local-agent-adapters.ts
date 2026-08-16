@@ -1,5 +1,4 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
@@ -140,9 +139,8 @@ function directString(value: ProviderValue): string | undefined {
 }
 
 function resolveExecutable(command: string): string | undefined {
-  const result = spawnSync(process.platform === "win32" ? "where.exe" : "command", [
-    ...(process.platform === "win32" ? [command] : ["-v", command]),
-  ], {
+  const args = process.platform === "win32" ? [command] : ["-v", command];
+  const result = spawnSync(process.platform === "win32" ? "where.exe" : "command", args, {
     encoding: "utf8",
     shell: process.platform !== "win32",
   });

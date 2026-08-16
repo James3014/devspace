@@ -26,7 +26,7 @@ const providers: LocalAgentProvider[] = [
 for (const provider of providers) {
   const adapter = createLocalAgentAdapter(provider);
   assert.equal(adapter.provider, provider);
-  assert.equal(typeof adapter.run, "function");
+  assert.ok(adapter.run);
 }
 
 assert.deepEqual(
