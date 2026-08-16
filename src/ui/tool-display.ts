@@ -12,6 +12,7 @@ import {
   getFileChangePathDisplay,
   getPatchDisplayParts,
 } from "./patch-display.js";
+import { isNumber, isString } from "../value-types.js";
 
 export interface ToolDisplay {
   icon: ToolIcon;
@@ -175,8 +176,8 @@ function singleFilePath(card: ToolResultCard): string | undefined {
 function searchLabel(card: ToolResultCard): string | undefined {
   const pattern = card.summary?.pattern;
   const scope = card.summary?.scope;
-  if (typeof pattern !== "string") return card.path;
-  return typeof scope === "string" && scope !== "." ? `${pattern} in ${scope}` : pattern;
+  if (!isString(pattern)) return card.path;
+  return isString(scope) && scope !== "." ? `${pattern} in ${scope}` : pattern;
 }
 
 function processTitle(card: ToolResultCard, subject: "command" | "process"): string {
@@ -201,9 +202,9 @@ function processState(card: ToolResultCard): ToolDisplay["state"] {
 
 function processLabel(card: ToolResultCard): string | undefined {
   const command = card.summary?.command;
-  if (typeof command === "string") return command;
+  if (isString(command)) return command;
   const sessionId = card.summary?.sessionId;
-  if (typeof sessionId === "number" || typeof sessionId === "string") {
+  if (isNumber(sessionId) || isString(sessionId)) {
     return `Session ${String(sessionId)}`;
   }
   return card.path;

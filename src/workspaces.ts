@@ -27,6 +27,7 @@ import {
   loadLocalAgentProfiles,
   type LocalAgentProfile,
 } from "./local-agent-profiles.js";
+import { isString } from "./value-types.js";
 
 export interface LoadedAgentsFile {
   path: string;
@@ -85,7 +86,7 @@ export interface OpenWorkspaceOptions {
 type PathStats = Stats;
 type DirectoryOps = {
   stat: (path: string) => Promise<PathStats>;
-  mkdir: (path: string, options: { recursive: true }) => Promise<unknown>;
+  mkdir: (path: string, options: { recursive: true }) => Promise<string | undefined>;
 };
 
 export class WorkspaceRegistry {
@@ -101,7 +102,7 @@ export class WorkspaceRegistry {
     input: string | OpenWorkspaceInput,
     openOptions: OpenWorkspaceOptions = {},
   ): Promise<WorkspaceContext> {
-    const workspaceInput = typeof input === "string" ? { path: input } : input;
+    const workspaceInput = isString(input) ? { path: input } : input;
     const conversationScopeId = openOptions.conversationScopeId;
     if (!conversationScopeId || !this.store) {
       return this.openNewWorkspace(workspaceInput);
@@ -579,6 +580,6 @@ async function walkWorkspace(
   }
 }
 
-function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
+function isErrnoException<T>(error: T): error is T & NodeJS.ErrnoException {
   return error instanceof Error && "code" in error;
 }

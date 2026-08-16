@@ -24,6 +24,8 @@ export type ReviewFileType =
   | "new"
   | "deleted";
 
+import { isNumber, isObject } from "../value-types.js";
+
 export interface ToolResultCard {
   tool: ToolName;
   workspaceId?: string;
@@ -140,7 +142,7 @@ export function isReviewTool(tool: ToolName): boolean {
 }
 
 export function isToolResultCard(value: unknown): value is Omit<ToolResultCard, "tool"> {
-  return Boolean(value && typeof value === "object");
+  return isObject(value);
 }
 
 export function payloadText(payload: ToolPayload | undefined): string {
@@ -160,7 +162,7 @@ export function summaryNumber(
   key: string,
 ): number | undefined {
   const value = summary?.[key];
-  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+  return isNumber(value) && Number.isFinite(value) ? value : undefined;
 }
 
 export function isExpandableCard(card: ToolResultCard): boolean {

@@ -69,6 +69,7 @@ export function terminateProcessTree(
       runtime.killGroup(child.pid, signal);
       return;
     } catch (error) {
+      // SAFETY: killGroup only throws Node system errors, whose code identifies the missing process case.
       if ((error as NodeJS.ErrnoException).code === "ESRCH") return;
     }
   }

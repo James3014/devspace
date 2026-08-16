@@ -50,7 +50,7 @@ import {
 } from "./mcp-sessions.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
-import { openAiConversationScopeId } from "./request-meta.js";
+import { isString } from "./value-types.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
@@ -805,7 +805,7 @@ export function createMcpServer(
         includeBootstrapContext,
       } = await workspaces.openWorkspace(
         { path, mode, baseRef },
-        { conversationScopeId: openAiConversationScopeId(_meta) },
+        { conversationScopeId: isString(_meta?.["openai/session"]) ? _meta["openai/session"] : undefined },
       );
       if (config.widgets === "changes") {
         await reviewCheckpoints.initializeWorkspace({

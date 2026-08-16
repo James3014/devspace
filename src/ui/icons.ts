@@ -60,10 +60,12 @@ const providerLogos = {
   opencode: new URL("./assets/provider-logos/opencode-dark.svg", import.meta.url).href,
   pi: new URL("./assets/provider-logos/pi-on-dark.svg", import.meta.url).href,
 } as const;
+const providerNames = ["claude", "codex", "copilot", "cursor", "opencode", "pi"] as const;
 
 export function getProviderLogo(name: string): string | undefined {
-  const normalizedName = name.trim().toLowerCase() as keyof typeof providerLogos;
-  return providerLogos[normalizedName];
+  const normalizedName = name.trim().toLowerCase();
+  const providerName = providerNames.find((candidate) => candidate === normalizedName);
+  return providerName ? providerLogos[providerName] : undefined;
 }
 
 export function renderIcon(icon: ToolIcon, className = "icon-svg"): SVGElement {

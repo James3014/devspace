@@ -10,6 +10,7 @@ import {
   type FileChangeKind,
 } from "./patch-display.js";
 import { pierrePrettyScrollbarCss } from "./scrollbar.js";
+import { isNumber } from "../value-types.js";
 
 type ThemeType = "light" | "dark";
 
@@ -51,7 +52,7 @@ function ReviewPayload({
   const patch = card.payload?.patch;
   const themeType: ThemeType = hostContext?.theme === "light" ? "light" : "dark";
   const files = useMemo(() => parseFiles(patch), [patch]);
-  const visibleFiles = typeof visibleFileCount === "number"
+  const visibleFiles = isNumber(visibleFileCount)
     ? files.slice(0, visibleFileCount)
     : files;
   const [openFiles, setOpenFiles] = useState(() => new Set<string>());

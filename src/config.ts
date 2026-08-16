@@ -10,6 +10,7 @@ export type WidgetMode = "off" | "changes" | "full";
 const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_ARTIFACT_MAX_FILE_BYTES = 100 * 1024 * 1024;
+const LOG_LEVELS = ["silent", "error", "warn", "debug"] as const satisfies readonly LogLevel[];
 
 export interface ServerConfig {
   host: string;
@@ -97,7 +98,8 @@ function parseToolMode(env: NodeJS.ProcessEnv): ToolMode {
 
 function parseLogLevel(value: string | undefined): LogLevel {
   if (!value || value === "info") return "info";
-  if (["silent", "error", "warn", "debug"].includes(value)) return value as LogLevel;
+  const level = LOG_LEVELS.find((candidate) => candidate === value);
+  if (level) return level;
 
   throw new Error(`Invalid DEVSPACE_LOG_LEVEL: ${value}`);
 }

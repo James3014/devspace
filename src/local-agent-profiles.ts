@@ -3,6 +3,7 @@ import { readdir, readFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { ServerConfig } from "./config.js";
+import { isObject, isString, type JsonObject } from "./value-types.js";
 
 export type LocalAgentProvider = "codex" | "claude" | "opencode" | "pi" | "cursor" | "copilot";
 
@@ -35,13 +36,11 @@ export interface LocalAgentProfileSummary {
 }
 
 interface ParsedFrontmatter {
-  frontmatter: Record<string, unknown>;
+  frontmatter: JsonObject;
   body: string;
 }
 
 const FRONTMATTER_DELIMITER = "---";
-const PROVIDERS = new Set<LocalAgentProvider>(LOCAL_AGENT_PROVIDERS);
-
 export async function loadLocalAgentProfiles(
   config: ServerConfig,
   workspaceRoot: string,
@@ -125,7 +124,7 @@ function parseFrontmatter(content: string, filePath: string): ParsedFrontmatter 
   };
 }
 
-function parseProfileYaml(source: string, filePath: string): Record<string, unknown> {
+function parseProfileYaml(source: string, filePath: string): JsonObject {
   let parsed: unknown;
   try {
     parsed = parseYaml(source) ?? {};
@@ -133,15 +132,16 @@ function parseProfileYaml(source: string, filePath: string): Record<string, unkn
     throw new Error(`Unable to parse subagent profile frontmatter: ${filePath}: ${errorMessage(error)}`);
   }
 
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+  if (!isObject(parsed)) {
     throw new Error(`Subagent profile frontmatter must be a mapping: ${filePath}`);
   }
 
-  return parsed as Record<string, unknown>;
+  // SAFETY: yaml mappings are plain objects after the object-shape check above.
+  return parsed as JsonObject;
 }
 
 function profileFromFrontmatter(
-  frontmatter: Record<string, unknown>,
+  frontmatter: JsonObject,
   body: string,
   filePath: string,
 ): LocalAgentProfile {
@@ -164,30 +164,31 @@ function profileFromFrontmatter(
   };
 }
 
-function readProvider(frontmatter: Record<string, unknown>, filePath: string): LocalAgentProvider {
+function readProvider(frontmatter: JsonObject, filePath: string): LocalAgentProvider {
   const provider = readString(frontmatter, "provider");
   if (!provider) {
     throw new Error(`Subagent profile is missing provider: ${filePath}`);
   }
-  if (!PROVIDERS.has(provider as LocalAgentProvider)) {
+  const providerName = LOCAL_AGENT_PROVIDERS.find((candidate) => candidate === provider);
+  if (!providerName) {
     throw new Error(
       `Subagent profile provider must be codex, claude, opencode, pi, cursor, or copilot: ${filePath}`,
     );
   }
-  return provider as LocalAgentProvider;
+  return providerName;
 }
 
 export function isLocalAgentProvider(value: string): value is LocalAgentProvider {
-  return PROVIDERS.has(value as LocalAgentProvider);
+  return LOCAL_AGENT_PROVIDERS.some((candidate) => candidate === value);
 }
 
-function readString(frontmatter: Record<string, unknown>, key: string): string | undefined {
+function readString(frontmatter: JsonObject, key: string): string | undefined {
   const value = frontmatter[key];
-  if (typeof value !== "string") return undefined;
+  if (!isString(value)) return undefined;
   const trimmed = value.trim();
   return trimmed || undefined;
 }
 
-function errorMessage(error: unknown): string {
+function errorMessage<T>(error: T): string {
   return error instanceof Error ? error.message : String(error);
 }

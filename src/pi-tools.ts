@@ -45,7 +45,7 @@ function toMcpContent(result: AgentToolResult<unknown>): McpContent[] {
   });
 }
 
-function formatToolError(error: unknown): McpContent[] {
+function formatToolError<T>(error: T): McpContent[] {
   const message = error instanceof Error ? error.message : String(error);
   return [{ type: "text", text: message }];
 }
