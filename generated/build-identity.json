@@ -1,14 +1,14 @@
 {
-  "generated_at": "2026-08-09T00:41:48+07:00",
+  "generated_at": "2026-08-18T00:21:01+07:00",
   "package_name": "@nexus-local/devspace",
-  "package_version": "1.0.1-nexus.3",
-  "source_commit": "8c091c398dd5121288cd998b1158d8820eaad630",
+  "package_version": "1.0.1-nexus.4",
+  "source_commit": "14f46b4a29c079004bc61012a743e423d152cc45",
   "source_dirty": false,
-  "build_id": "nexus-1.0.1-nexus.3-8c091c39",
-  "tool_surface": "nexus-mcp-16-v1",
-  "tool_count": 16,
-  "effective_tool_surface": "nexus-mcp-16-v1",
-  "effective_tool_count": 16,
+  "build_id": "nexus-1.0.1-nexus.4-14f46b4a",
+  "tool_surface": "nexus-mcp-17-v1",
+  "tool_count": 17,
+  "effective_tool_surface": "nexus-mcp-17-v1",
+  "effective_tool_count": 17,
   "surface_profile": "raw_devspace",
   "protocol_mode": "dual",
   "tool_source": "devspace_builtin",
@@ -23,5 +23,5 @@
   "gateway_tool_manifest_revision": "unknown",
   "gateway_tool_count": 0,
   "gateway_tool_manifest_sha256": "unknown",
-  "build_manifest_sha256": "8a23fd1aa08402f968499df1108a96b6bfe180068d148649e52dcfa78bf3a7d2"
+  "build_manifest_sha256": "ccae006461727245d2f49e27a8d6b9cc7b9ea2258d8a0d1a7754a58563f134c3"
 }
