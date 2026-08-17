@@ -59,6 +59,12 @@ import {
   readReceiptTool,
 } from "./nexus-git-tools.js";
 import {
+  gitMergePullRequestTool,
+  defaultIntegrationTargetResolver,
+  type GitHubPullRequestTransport,
+  type IntegrationTargetResolver,
+} from "./git-pr-merge.js";
+import {
   createNexusGatewayProxyServer,
   fetchNexusGatewayToolManifest,
   nexusGatewayManifestIdentity,
@@ -84,6 +90,12 @@ const EDIT_TOOL_ANNOTATIONS = {
   openWorldHint: false,
 };
 const SHELL_TOOL_ANNOTATIONS = {
+  readOnlyHint: false,
+  destructiveHint: true,
+  idempotentHint: false,
+  openWorldHint: true,
+};
+const PR_MERGE_TOOL_ANNOTATIONS = {
   readOnlyHint: false,
   destructiveHint: true,
   idempotentHint: false,
@@ -480,11 +492,23 @@ async function assertWorkspaceAppAssets(): Promise<void> {
   }
 }
 
-async function createMcpServer(
+/**
+ * Optional seams for DevSpace MCP server construction. Production callers pass
+ * nothing (the registered `git_merge_pull_request` action then uses the real
+ * `gh`-backed transport factory). Tests inject a fake transport to prove the
+ * production wiring actually calls through the transport abstraction.
+ */
+export interface DevSpaceMcpServerOverrides {
+  gitMergeTransportFactory?: () => GitHubPullRequestTransport;
+  gitMergeTargetResolver?: () => IntegrationTargetResolver;
+}
+
+export async function createMcpServer(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
   reviewCheckpoints: ReturnType<typeof createReviewCheckpointManager>,
   gatewayManifest?: NexusGatewayToolManifest,
+  overrides?: DevSpaceMcpServerOverrides,
 ): Promise<McpServer> {
   if (config.surfaceProfile === "canonical_gateway_proxy") {
     if (!gatewayManifest) {
@@ -1727,6 +1751,67 @@ async function createMcpServer(
     },
   );
 
+  registerAppTool(
+    server as never,
+    "git_merge_pull_request",
+    {
+      title: "Git merge pull request (protected fallback)",
+      description:
+        "Merge ONE exact, independently accepted pull request head into the trusted integration repository's default branch. Primary path remains the GitHub connector merge_pull_request(expected_head_sha=...); this tool is a bounded fallback for when the GitHub connector is unavailable. It is not a generic git merge/push primitive: the integration repository is resolved by a server-controlled trusted target resolver (never a caller-chosen remote/repo/branch/URL), the exact base and head SHAs are re-verified fresh against GitHub, required checks must all be in reliable terminal success (effective branch rules + classic protection, check runs + commit statuses), and only ownerConfirmation=true authorizes execution. Draft PRs are rejected. Refuses (fail closed) on any head/base drift, unreadable required checks, or transport gaps. Call open_workspace first and pass workspaceId.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        prNumber: z
+          .number()
+          .int()
+          .positive()
+          .describe("Pull request number to merge."),
+        expectedBaseSha: z
+          .string()
+          .regex(/^[0-9a-f]{40}$/)
+          .describe("Exact full 40-hex SHA of the repository default branch at acceptance time."),
+        expectedHeadSha: z
+          .string()
+          .regex(/^[0-9a-f]{40}$/)
+          .describe("Exact full 40-hex SHA of the accepted PR head. This exact head is the only one that may be merged."),
+        mergeMethod: z
+          .enum(["merge", "squash", "rebase"])
+          .describe("GitHub merge method."),
+        ownerConfirmation: z
+          .boolean()
+          .optional()
+          .describe("Must be exactly true to authorize the merge. False or missing is rejected."),
+      },
+      annotations: PR_MERGE_TOOL_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const transport = overrides?.gitMergeTransportFactory?.();
+      const targetResolver = overrides?.gitMergeTargetResolver?.() ?? defaultIntegrationTargetResolver();
+      const response = await gitMergePullRequestTool(
+        input as Record<string, unknown>,
+        {
+          cwd: workspace.root,
+          ...(transport ? { transport } : {}),
+          targetResolver,
+        },
+      );
+      logToolCall(config, {
+        tool: "git_merge_pull_request",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
+
   // Runtime registry-consistency check (G5): the always-on core tools plus the
   // 11 Nexus tools must match the canonical registry, so tools/list derives
   // from the same single source of truth as the generator and tests.
@@ -1734,7 +1819,7 @@ async function createMcpServer(
     _registeredTools?: Record<string, unknown>;
   })._registeredTools;
   if (registeredTools) {
-    // Always-on core tools resolve via toolNames (short vs legacy); the 11
+    // Always-on core tools resolve via toolNames (short vs legacy); the 12
     // Nexus tools use fixed registry names independent of naming mode.
     const NEXUS_FIXED_TOOLS = NEXUS_MCP_TOOL_NAMES.slice(5);
     const alwaysOn = new Set<string>([
@@ -1762,7 +1847,10 @@ async function createMcpServer(
   return server;
 }
 
-export function createServer(config = loadConfig()): RunningServer {
+export function createServer(
+  config = loadConfig(),
+  overrides?: DevSpaceMcpServerOverrides,
+): RunningServer {
   const allowedHosts = config.allowedHosts.includes("*")
     ? undefined
     : Array.from(new Set([config.host, ...config.allowedHosts]));
@@ -1803,7 +1891,7 @@ export function createServer(config = loadConfig()): RunningServer {
     async () => {
       const gatewayManifest = await gatewayManifestReady;
       if (manifestError) throw manifestError;
-      return createMcpServer(config, workspaces, reviewCheckpoints, gatewayManifest);
+      return createMcpServer(config, workspaces, reviewCheckpoints, gatewayManifest, overrides);
     },
     config.protocolMode,
     (error) => {

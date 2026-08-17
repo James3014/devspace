@@ -75,12 +75,12 @@ async function asyncTest(name: string, fn: () => Promise<void>) {
 // ============================================================
 console.log("\n=== Nexus MCP tool registry tests (G5) ===");
 
-test("registry defines exactly 16 tools (5 core + 11 nexus)", () => {
-  assert.equal(NEXUS_MCP_TOOL_COUNT, 16);
+test("registry defines exactly 17 tools (5 core + 12 nexus)", () => {
+  assert.equal(NEXUS_MCP_TOOL_COUNT, 17);
 });
 
 test("registry surface matches count-derived contract", () => {
-  assert.equal(NEXUS_MCP_TOOL_SURFACE, "nexus-mcp-16-v1");
+  assert.equal(NEXUS_MCP_TOOL_SURFACE, "nexus-mcp-17-v1");
   assert.equal(
     NEXUS_MCP_TOOL_SURFACE,
     `nexus-mcp-${NEXUS_MCP_TOOL_COUNT}-v1`,
@@ -116,6 +116,13 @@ test("registry covers the 11 nexus read-only tools", () => {
       `registry missing nexus tool: ${name}`,
     );
   }
+});
+
+test("registry includes the protected PR merge fallback", () => {
+  assert.ok(
+    NEXUS_MCP_TOOL_NAMES.includes("git_merge_pull_request"),
+    "registry must include git_merge_pull_request",
+  );
 });
 
 // ============================================================

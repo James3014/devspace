@@ -86,6 +86,32 @@ Filesystem path containment applies to DevSpace file tools. Shell commands run
 as local commands and can do what your user account can do. This is why the MCP
 client must be trusted and the Owner password must stay private.
 
+## Protected PR Integration Fallback
+
+`git_merge_pull_request` is a narrow protected integration action, not a
+generic git mutation capability. It is the bounded fallback for when the
+primary GitHub connector is unavailable.
+
+- Repository identity is derived from the workspace canonical origin remote and
+  cross-verified against GitHub; the caller cannot select an arbitrary target
+  repository, branch, refspec, or remote.
+- Before merging, the action re-reads fresh state: PR open / not draft / base
+  is the repository default branch / head matches the expected SHA / default
+  branch SHA matches the expected base / PR mergeable / required status checks
+  all terminal success. `ownerConfirmation` must be exactly `true`.
+- The merge uses GitHub's native exact-head CAS (`sha`), and the base branch is
+  re-read immediately before the merge. A drifted head or base fails closed
+  (`EXPECTED_HEAD_MISMATCH` / `EXPECTED_BASE_MISMATCH`); the action never
+  re-validates a changed head, never force-pushes, and never falls back to an
+  unrestricted shell.
+- The GitHub CLI runs through `execFile` with a fixed, typed argv (no shell, no
+  caller-supplied suffix). If the transport is unavailable or required checks
+  cannot be reliably determined, the action fails closed with a deterministic
+  error code.
+
+This action never bypasses branch protection, required checks, or admin merge
+guards.
+
 ## Worktrees
 
 Managed worktrees reduce accidental edits to your active checkout, but they are

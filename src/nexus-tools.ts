@@ -11,9 +11,10 @@ import { createHash } from "node:crypto";
  *  - src/nexus-git-tools.test.ts (tests)
  *
  * The surface is defined as the always-on tool set under default config:
- * 5 core tools (open_workspace, read, write, edit, shell) + 11 Nexus
- * read-only git/lifecycle tools. Conditional tools (grep/glob/ls, show_changes)
- * are NOT part of this canonical surface.
+ * 5 core tools (open_workspace, read, write, edit, shell) + 12 Nexus tools
+ * (11 read-only git/lifecycle tools + 1 protected PR integration fallback).
+ * Conditional tools (grep/glob/ls, show_changes) are NOT part of this
+ * canonical surface.
  */
 export const NEXUS_MCP_TOOL_NAMES = [
   "open_workspace",
@@ -32,6 +33,7 @@ export const NEXUS_MCP_TOOL_NAMES = [
   "read_task_card",
   "read_candidate",
   "read_receipt",
+  "git_merge_pull_request",
 ] as const;
 
 export const NEXUS_MCP_TOOL_COUNT = NEXUS_MCP_TOOL_NAMES.length;

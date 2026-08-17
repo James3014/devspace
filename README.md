@@ -128,6 +128,27 @@ DevSpace provides tools for:
 - exposing local agent skills from your skill folders
 - showing ChatGPT Apps tool cards, with an opt-in aggregate `show_changes` card
 
+### Protected PR integration fallback (`git_merge_pull_request`)
+
+`git_merge_pull_request` is a narrow, protected fallback for when the primary
+GitHub connector is temporarily unavailable. It merges ONE exact,
+independently accepted pull request head into the repository default branch
+after the Coordinator obtains Owner authorization (`ownerConfirmation=true`).
+
+- Primary path remains the GitHub connector
+  (`merge_pull_request(expected_head_sha=...)`). This action is a bounded
+  fallback only.
+- It is **not** a generic git merge/push primitive. The target repository is
+  derived from the workspace origin remote and cross-verified against GitHub;
+  the exact base and head SHAs are re-read fresh and the merge uses GitHub's
+  native exact-head CAS. Required status checks must all be in a terminal
+  success state. Draft PRs are rejected. Any drift, unreadable required
+  checks, or transport gap fails closed with a deterministic error code and
+  never falls back to unrestricted shell.
+- The GitHub CLI is invoked with `execFile` (argv only, never a shell); the
+  action accepts no arbitrary remote, refspec, branch, force flag, or shell
+  string from the caller.
+
 The default local endpoint is:
 
 ```text
