@@ -867,16 +867,17 @@ export class LocalAgentSessionManager {
     try {
       // Snapshot the physical workspace BEFORE any provider mutation so that
       // pre-existing changes are never attributed to this worker turn.
-      if (claimed.executionContract?.writePaths?.length || claimed.executionContract?.maxFiles !== undefined) {
-        const state = await inspectWorkspacePhysicalState(claimed.workspaceRoot);
-        this.store.update(claimed.id, {
-          scopeBaseline: {
-            changedPaths: state.changedPaths,
-            head: state.head ?? null,
-            fingerprints: state.fingerprints,
-          },
-        });
-      }
+      // The baseline is always captured: reconciliation must be able to report a
+      // physical diff as candidate evidence even when no execution contract
+      // bounds writes (e.g. a manually started agent with no writePaths/maxFiles).
+      const state = await inspectWorkspacePhysicalState(claimed.workspaceRoot);
+      this.store.update(claimed.id, {
+        scopeBaseline: {
+          changedPaths: state.changedPaths,
+          head: state.head ?? null,
+          fingerprints: state.fingerprints,
+        },
+      });
 
       const profiles = await loadLocalAgentProfiles(this.config, claimed.workspaceRoot);
       const profile = profiles.find((p) => p.name === claimed.profileName);

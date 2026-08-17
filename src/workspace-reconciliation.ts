@@ -387,7 +387,14 @@ export function computeWorkerDelta(
   const currentFingerprints = current.fingerprints ?? {};
 
   if (!baseline) {
-    return { changedPaths: [], attribution: "UNKNOWN" };
+    // No baseline yet: with no pre-existing changes to subtract, every current
+    // dirty path is worker-observable candidate evidence. With pre-existing
+    // dirty state the delta cannot be attributed, so it must stay UNKNOWN and
+    // present=false rather than fabricating scope truth.
+    return {
+      changedPaths: currentPaths.length === 0 ? [] : currentPaths,
+      attribution: currentPaths.length === 0 ? "KNOWN" : "UNKNOWN",
+    };
   }
 
   const baselinePaths = [...(baseline.changedPaths ?? [])].sort();
