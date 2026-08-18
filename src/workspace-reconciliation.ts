@@ -368,7 +368,8 @@ export interface WorkerDelta {
  * Compute the definite worker-caused delta between a baseline snapshot and the
  * current physical workspace state.
  *
- * - No baseline -> UNKNOWN, no paths claimed.
+ * - No baseline -> UNKNOWN attribution, while observed physical paths are
+ *   still reported as candidate evidence without claiming worker ownership.
  * - Baseline with empty `changedPaths` -> KNOWN, every current dirty path is
  *   worker-caused.
  * - Baseline whose `changedPaths` is not fully covered by valid fingerprints ->
@@ -387,14 +388,7 @@ export function computeWorkerDelta(
   const currentFingerprints = current.fingerprints ?? {};
 
   if (!baseline) {
-    // No baseline yet: with no pre-existing changes to subtract, every current
-    // dirty path is worker-observable candidate evidence. With pre-existing
-    // dirty state the delta cannot be attributed, so it must stay UNKNOWN and
-    // present=false rather than fabricating scope truth.
-    return {
-      changedPaths: currentPaths.length === 0 ? [] : currentPaths,
-      attribution: currentPaths.length === 0 ? "KNOWN" : "UNKNOWN",
-    };
+    return { changedPaths: currentPaths, attribution: "UNKNOWN" };
   }
 
   const baselinePaths = [...(baseline.changedPaths ?? [])].sort();
