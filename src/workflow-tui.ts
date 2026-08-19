@@ -68,45 +68,53 @@ export async function runWorkflowTui(args: string[], config: ServerConfig): Prom
 
   let closed = false;
   let rendering = false;
-  const render = (): void => {
-    if (rendering || closed) return;
-    rendering = true;
-    try {
-      const previousProject = project;
-      project = load(state.screen !== "workflows");
-      state = reconcileWorkflowTuiState(previousProject, project, state);
-      process.stdout.write(
-        `\u001b[H\u001b[2J${renderWorkflowTui(
-          project,
-          state,
-          process.stdout.columns || 100,
-          process.stdout.rows || 40,
-          { ansi: true, activity: activityForState() },
-        )}`,
-      );
-    } finally {
-      rendering = false;
-    }
-  };
-
-  await new Promise<void>((done) => {
-    let timer: NodeJS.Timeout;
-    const finish = (): void => {
+  await new Promise<void>((done, reject) => {
+    let timer: NodeJS.Timeout | undefined;
+    const finish = (error?: unknown): void => {
       if (closed) return;
       closed = true;
-      clearInterval(timer);
+      if (timer) clearInterval(timer);
       process.stdin.off("keypress", onKeypress);
       process.stdout.off("resize", render);
       process.off("SIGINT", finish);
-      process.stdin.setRawMode(false);
-      process.stdin.pause();
-      process.stdout.write("\u001b[?25h\u001b[?1049l");
-      store.close();
-      done();
+      try {
+        process.stdin.setRawMode(false);
+        process.stdin.pause();
+        process.stdout.write("\u001b[?25h\u001b[?1049l");
+      } catch (cleanupError) {
+        error ??= cleanupError;
+      } finally {
+        store.close();
+      }
+      if (error) reject(error);
+      else done();
     };
-    const onKeypress = (_input: string, key: { name?: string; ctrl?: boolean }): void => {
+    const render = (): void => {
+      if (rendering || closed) return;
+      rendering = true;
+      try {
+        const previousProject = project;
+        project = load(state.screen !== "workflows");
+        state = reconcileWorkflowTuiState(previousProject, project, state);
+        process.stdout.write(
+          `\u001b[H\u001b[2J${renderWorkflowTui(
+            project,
+            state,
+            process.stdout.columns || 100,
+            process.stdout.rows || 40,
+            { ansi: true, activity: activityForState() },
+          )}`,
+        );
+      } catch (error) {
+        finish(error);
+      } finally {
+        rendering = false;
+      }
+    };
+    const onKeypress = (_input: string, key?: { name?: string; ctrl?: boolean }): void => {
+      if (!key) return;
       if ((key.ctrl && key.name === "c") || key.name === "q") return finish();
-      state = reduceWorkflowTuiState(project, state, key.name ?? "");
+      state = reduceWorkflowTuiState(project, state, key.name ?? "", activityForState());
       render();
     };
     emitKeypressEvents(process.stdin);
@@ -147,6 +155,7 @@ export function reduceWorkflowTuiState(
   project: WorkflowProjectView,
   state: WorkflowTuiState,
   key: string,
+  activity: WorkflowAgentActivityRecord[] = [],
 ): WorkflowTuiState {
   const run = project.runs[state.runIndex];
   if (state.screen === "workflows") {
@@ -195,7 +204,12 @@ export function reduceWorkflowTuiState(
     return { ...state, tab: INSPECTOR_TABS[(index + 1) % INSPECTOR_TABS.length]!, scroll: 0 };
   }
   if (key === "up" || key === "k") return { ...state, scroll: Math.max(0, state.scroll - 1) };
-  if (key === "down" || key === "j") return { ...state, scroll: state.scroll + 1 };
+  if (key === "down" || key === "j") {
+    const run = project.runs[state.runIndex];
+    const call = run ? selectedCall(project, state) : undefined;
+    const maxScroll = call ? Math.max(0, inspectorBody(state.tab, call, activity).length - 1) : 0;
+    return { ...state, scroll: Math.min(maxScroll, state.scroll + 1) };
+  }
   return state;
 }
 
@@ -244,7 +258,13 @@ function renderNavigator(
   ansi: boolean,
 ): string[] {
   const run = project.runs[state.runIndex];
-  if (!run) return ["Workflow is no longer available."];
+  if (!run) {
+    return [
+      "Workflow is no longer available.",
+      rule(width),
+      style("Esc back · q quit", "muted", ansi),
+    ];
+  }
   const lines = [
     style(`Workflow › ${run.name}`, "bold", ansi),
     truncate(`${statusGlyph(run.status)} ${run.status.toUpperCase()}  ${elapsedLabel(run)}  ·  ${callSummary(run)}${run.totalTokens ? `  ·  ${formatTokens(run.totalTokens)} tokens observed` : ""}`, width),
@@ -281,7 +301,13 @@ function renderCallInspector(
 ): string[] {
   const run = project.runs[state.runIndex];
   const call = run ? selectedCall(project, state) : undefined;
-  if (!run || !call) return ["Agent call is no longer available."];
+  if (!run || !call) {
+    return [
+      "Agent call is no longer available.",
+      rule(width),
+      style("Esc back · q quit", "muted", ansi),
+    ];
+  }
   const label = call.label ?? `Agent #${call.callIndex}`;
   const target = call.model ? `${call.provider}/${call.model}` : call.provider;
   const lines = [
@@ -459,7 +485,10 @@ function truncate(value: string, width: number): string {
   return value.length <= width ? value : `${value.slice(0, Math.max(0, width - 1))}…`;
 }
 function fitRows(lines: string[], rows: number): string[] {
-  return rows > 0 && lines.length > rows ? lines.slice(0, Math.max(1, rows)) : lines;
+  if (rows <= 0 || lines.length <= rows) return lines;
+  const keep = Math.max(1, rows);
+  if (keep <= 2) return lines.slice(-keep);
+  return [...lines.slice(0, keep - 2), ...lines.slice(-2)];
 }
 function style(value: string, tone: "bold" | "heading" | "muted", ansi: boolean): string {
   if (!ansi) return value;

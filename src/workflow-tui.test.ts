@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import {
   createWorkflowTuiState,
   reduceWorkflowTuiState,
@@ -159,6 +162,36 @@ const narrow = renderWorkflowTui(project, {
 assert.match(narrow, /PHASES/);
 assert.doesNotMatch(narrow, /AGENTS · Implementation/);
 
-assert.equal(resolveWorkflowTuiWorkspaceRoot(process.cwd()), process.cwd());
+const longPromptProject = {
+  ...project,
+  runs: [{
+    ...project.runs[0]!,
+    phases: [{
+      ...project.runs[0]!.phases[1]!,
+      calls: [{ ...project.runs[0]!.phases[1]!.calls[0]!, prompt: "one\ntwo\nthree" }],
+    }],
+  }],
+};
+let scrollState = createWorkflowTuiState(longPromptProject, "wfr_1");
+scrollState = reduceWorkflowTuiState(longPromptProject, scrollState, "return");
+scrollState = reduceWorkflowTuiState(longPromptProject, scrollState, "return");
+scrollState = reduceWorkflowTuiState(longPromptProject, scrollState, "tab");
+for (let index = 0; index < 10; index += 1) {
+  scrollState = reduceWorkflowTuiState(longPromptProject, scrollState, "down");
+}
+assert.equal(scrollState.screen === "call" && scrollState.scroll, 2);
+const overflow = renderWorkflowTui(longPromptProject, scrollState, 80, 7, { ansi: false });
+assert.match(overflow, /Esc back · q quit$/);
+
+const previousRoot = process.env.DEVSPACE_WORKSPACE_ROOT;
+const isolated = mkdtempSync(join(tmpdir(), "devspace-tui-root-"));
+delete process.env.DEVSPACE_WORKSPACE_ROOT;
+try {
+  assert.equal(resolveWorkflowTuiWorkspaceRoot(isolated), resolve(isolated));
+} finally {
+  if (previousRoot === undefined) delete process.env.DEVSPACE_WORKSPACE_ROOT;
+  else process.env.DEVSPACE_WORKSPACE_ROOT = previousRoot;
+  rmSync(isolated, { recursive: true });
+}
 
 console.log("workflow-tui.test.ts: ok");
