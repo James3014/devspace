@@ -1,9 +1,9 @@
-import { fileURLToPath } from "node:url";
+import { resolve } from "node:path";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import * as z from "zod/v4";
 import type { ServerConfig } from "./config.js";
-import { jsonValueSchema, parseJsonText, type JsonValue } from "./json-types.js";
+import { jsonValueSchema, type JsonValue } from "./json-types.js";
 import type { WorkspaceRegistry } from "./workspaces.js";
 import { createWorkflowStore } from "./workflow-store.js";
 import {
@@ -29,6 +29,7 @@ import {
   type LaunchWorkflowSource,
 } from "./workflow-launch.js";
 import { resolveWorkflowLiveProviders } from "./workflow-providers.js";
+import { resolveCliEntry } from "./workflow-cli-entry.js";
 
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
 const WORKFLOW_UI_WAIT_MAX_MS = 30_000;
@@ -110,9 +111,8 @@ export function registerWorkflowTools(
           workspaceId,
           source,
           args,
-          cliEntry: fileURLToPath(
-            import.meta.url.replace(/workflow-tools\.(ts|js)$/, "cli.$1"),
-          ),
+          scriptFileScope: "project-workflows",
+          cliEntry: resolveCliEntry(),
         });
         if (launched.isErr()) {
           if (isWorkflowOperationError(launched.error)) return workflowToolError(launched.error);
@@ -138,6 +138,7 @@ export function registerWorkflowTools(
       title: "Workflow status",
       description: "Drain events for a workflow run; optional long-poll yield.",
       inputSchema: {
+        workspaceId: z.string().describe("Workspace id from open_workspace."),
         runId: z.string(),
         sinceSeq: z.number().int().min(0).optional(),
         yieldTimeMs: z
@@ -151,12 +152,14 @@ export function registerWorkflowTools(
       annotations: { readOnlyHint: true },
       _meta: workflowWidgetMeta(config),
     },
-    async ({ runId, sinceSeq, yieldTimeMs }) => {
+    async ({ workspaceId, runId, sinceSeq, yieldTimeMs }) => {
+      const workspace = workspaces.getWorkspace(workspaceId);
       const store = createWorkflowStore(config);
       try {
         const runResult = store.getRunResult(runId);
         if (runResult.isErr()) throw runResult.error;
         if (!runResult.value) throw new WorkflowNotFoundError(runId);
+        requireWorkflowRunInWorkspace(runResult.value, workspaceId, workspace.root);
         const page = await yieldEvents(store, runId, sinceSeq ?? 0, yieldTimeMs ?? 0);
         return toolResult(page, "workflow_status");
       } catch (error) {
@@ -175,14 +178,20 @@ export function registerWorkflowTools(
       title: "Cancel workflow",
       description: "Request cooperative cancel of a running workflow.",
       inputSchema: {
+        workspaceId: z.string().describe("Workspace id from open_workspace."),
         runId: z.string(),
       },
       annotations: { readOnlyHint: false },
       _meta: {},
     },
-    async ({ runId }) => {
+    async ({ workspaceId, runId }) => {
+      const workspace = workspaces.getWorkspace(workspaceId);
       const store = createWorkflowStore(config);
       try {
+        const runResult = store.getRunResult(runId);
+        if (runResult.isErr()) throw runResult.error;
+        if (!runResult.value) throw new WorkflowNotFoundError(runId);
+        requireWorkflowRunInWorkspace(runResult.value, workspaceId, workspace.root);
         const latest = await cancelWorkflowRun(store, runId);
         return {
           content: [{ type: "text" as const, text: JSON.stringify({ runId, status: latest.status }) }],
@@ -200,6 +209,17 @@ export function registerWorkflowTools(
   if (config.widgets !== "off") {
     registerWorkflowUiTools(server, config, workspaces);
   }
+}
+
+export function requireWorkflowRunInWorkspace(
+  run: Pick<WorkflowRunRecord, "id" | "workspaceId" | "workspaceRoot">,
+  workspaceId: string,
+  workspaceRoot: string,
+): void {
+  const owned = run.workspaceId
+    ? run.workspaceId === workspaceId
+    : resolve(run.workspaceRoot) === resolve(workspaceRoot);
+  if (!owned) throw new WorkflowNotFoundError(run.id);
 }
 
 function registerWorkflowUiTools(

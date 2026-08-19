@@ -613,7 +613,7 @@ Adapters: no individual abort API — accepted; group-kill is backstop.
 | Piece | Spec |
 |---|---|
 | New run | `--resume` / `resumeFromRunId` creates new run with `resumedFromRunId`. |
-| Cache key | `sha256(canonicalJson({ prompt, provider, model, effort, schema, isolation }))` |
+| Cache key | `sha256(canonicalJson({ prompt, provider, model, effort, profileName, profileFingerprint, schema, isolation }))` |
 | Match | Same callIndex + cache key while the prefix remains open. |
 | Close | First failed, interrupted, changed, missing, corrupt, worktree, or unpersisted result executes live and closes replay for later calls. |
 | Record | Cache hits written as new rows `from_cache=1` so chains chain. |
