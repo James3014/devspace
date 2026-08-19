@@ -1,5 +1,4 @@
-import type { ActiveWorkflowSummary } from "../workflow-summary.js";
-import type { ToolResultCard } from "./card-types.js";
+import type { CardActiveWorkflowSummary, ToolResultCard } from "./card-types.js";
 import { renderIcon, toolIcons } from "./icons.js";
 
 export interface DashboardDisplayOptions {
@@ -116,7 +115,7 @@ function renderDashboardToolbar(
 }
 
 function renderWorkflowSummarySection(
-  runs: ActiveWorkflowSummary[],
+  runs: CardActiveWorkflowSummary[],
 ): HTMLElement {
   const section = node("section", { className: "active-workflows" });
   section.append(node("h3", { text: `Active workflows · ${runs.length}` }));
@@ -125,13 +124,14 @@ function renderWorkflowSummarySection(
     return section;
   }
   for (const run of runs) {
+    const summary = workflowSummaryText(run);
     const row = node("div", { className: "active-workflow-row" });
     row.append(
-      node("span", { className: `workflow-status-dot ${run.status}`, ariaHidden: "true" }),
+      node("span", { className: `workflow-status-dot ${summary.status}`, ariaHidden: "true" }),
       node("div", { className: "active-workflow-copy" }, [
-        node("strong", { text: run.name }),
+        node("strong", { text: summary.name }),
         node("span", {
-          text: `${run.status} · ${summaryCounts(run.calls)}`,
+          text: `${summary.status} · ${summary.calls}`,
         }),
       ]),
     );
@@ -183,13 +183,25 @@ function renderList(
   return list;
 }
 
-function summaryCounts(calls: ActiveWorkflowSummary["calls"]): string {
+function summaryCounts(calls: CardActiveWorkflowSummary["calls"]): string {
   const parts = [
-    calls.completed ? `${calls.completed} done` : undefined,
-    calls.running ? `${calls.running} running` : undefined,
-    calls.failed ? `${calls.failed} failed` : undefined,
+    calls?.completed ? `${calls.completed} done` : undefined,
+    calls?.running ? `${calls.running} running` : undefined,
+    calls?.failed ? `${calls.failed} failed` : undefined,
   ].filter((part): part is string => Boolean(part));
   return parts.join(" · ") || "no calls yet";
+}
+
+export function workflowSummaryText(run: CardActiveWorkflowSummary): {
+  name: string;
+  status: string;
+  calls: string;
+} {
+  return {
+    name: run.name ?? "Unnamed workflow",
+    status: run.status ?? "unknown",
+    calls: summaryCounts(run.calls),
+  };
 }
 
 function summarizeText(value: string | undefined): string | undefined {
