@@ -64,12 +64,14 @@ This avoids coupling a long workflow lifetime to one tool-call timeout.
 `--follow` remains available for interactive terminals with long-running
 process support.
 
-`workflow tui` opens a project-scoped, read-only Navigator. The first screen
-lists workflows. Opening a run shows its declared phases beside the agent calls
-in the selected phase; opening a call exposes normalized activity, prompt,
-result, worktree details, and provider metadata. Use arrow keys (or `j`/`k`) to
-navigate, `Tab` to switch panes or inspector sections, `Enter` to open, `Esc`
-to go back, and `q` to quit.
+`workflow tui` opens a project-scoped, read-only Navigator. Without a run id it
+starts on the workflow list; with a run id it opens that run directly. Opening a
+run shows its declared phases beside the agent calls in the selected phase.
+Calls without a declared phase are grouped under `Other`. Terminals narrower
+than 80 columns show one pane at a time, with `Tab` switching panes. Opening a
+call exposes normalized activity, prompt, result, worktree details, and provider
+metadata. Use arrow keys (or `j`/`k`) to navigate, `Tab` to switch panes or
+inspector sections, `Enter` to open, `Esc` to go back, and `q` to quit.
 
 Elapsed time is derived from persisted call timestamps. Token counts are
 best-effort provider observations: a running call may show a partial snapshot,
