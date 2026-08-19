@@ -51,7 +51,7 @@ export const workflowAgentCallStatusSchema = z.enum([
 ]);
 export type WorkflowAgentCallStatus = z.infer<typeof workflowAgentCallStatusSchema>;
 
-export const workflowRunSourceSchema = z.enum(["inline", "named", "resume"]);
+export const workflowRunSourceSchema = z.enum(["inline", "file", "named", "resume"]);
 export type WorkflowRunSource = z.infer<typeof workflowRunSourceSchema>;
 
 export const agentOptsSchema = z

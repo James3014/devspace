@@ -70,6 +70,13 @@ assert.deepEqual(parsed.activeWorkflows, [{
   status: "running",
   calls: { running: 1, completed: 2, failed: 0 },
 }]);
-assert.equal("skillDiagnostics" in parsed, false);
+assert.equal(
+  fields({
+    ...baseEnv,
+    DEVSPACE_SUBAGENTS: "1",
+    DEVSPACE_WORKFLOWS: "1",
+  }).has("skillDiagnostics"),
+  false,
+);
 
 console.log("open-workspace-capabilities.test.ts: ok");
