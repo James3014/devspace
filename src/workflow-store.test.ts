@@ -198,6 +198,12 @@ try {
   );
   assert.deepEqual(
     store
+      .listRunsForScope({ workspaceRoot: join(root, "project") })
+      .map((entry) => entry.id),
+    [run2.id],
+  );
+  assert.deepEqual(
+    store
       .listRunsForWorkspace(join(root, "project"), { statuses: ["completed"] })
       .map((entry) => entry.id),
     [run2.id],
