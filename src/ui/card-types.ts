@@ -1,5 +1,4 @@
 import type { App } from "@modelcontextprotocol/ext-apps";
-import type { ActiveWorkflowSummary } from "../workflow-summary.js";
 
 export type ToolName =
   | "open_workspace"
@@ -18,6 +17,17 @@ export type ToolName =
 export type HostContext = NonNullable<ReturnType<App["getHostContext"]>>;
 
 export type PatchOperation = "add" | "update" | "delete" | "move";
+
+export interface CardActiveWorkflowSummary {
+  id?: string;
+  name?: string;
+  status?: string;
+  calls?: Partial<{
+    running: number;
+    completed: number;
+    failed: number;
+  }>;
+}
 
 export interface ToolResultCard {
   tool: ToolName;
@@ -56,7 +66,7 @@ export interface ToolResultCard {
     description?: string;
     path?: string;
   }>;
-  activeWorkflows?: ActiveWorkflowSummary[];
+  activeWorkflows?: CardActiveWorkflowSummary[];
   agentProviders?: string[];
   agents?: Array<{
     name?: string;
