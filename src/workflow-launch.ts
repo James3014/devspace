@@ -110,13 +110,13 @@ export async function launchWorkflowRun(
     });
     if (persisted.isErr()) {
       failStartedRun(input.store, run.id, persisted.error);
-      return persisted;
+      return Result.err(persisted.error);
     }
 
     const updated = input.store.setScriptPathResult(run.id, persisted.value);
     if (updated.isErr()) {
       failStartedRun(input.store, run.id, updated.error);
-      return updated;
+      return Result.err(updated.error);
     }
 
     if (input.spawn !== false) {
@@ -191,7 +191,7 @@ async function resolveLaunchSource(
       filename = named.value.scriptPath;
     } else if (source.override?.kind === "file") {
       const file = await resolveExplicitWorkflowFile(input, source.override.path);
-      if (file.isErr()) return file;
+      if (file.isErr()) return Result.err(file.error);
       sourceText = file.value.source;
       scriptHash = file.value.scriptHash;
       nameHint = file.value.nameHint;
@@ -257,7 +257,7 @@ async function resolveLaunchSource(
 
   if (source.kind === "file") {
     const file = await resolveExplicitWorkflowFile(input, source.path);
-    if (file.isErr()) return file;
+    if (file.isErr()) return Result.err(file.error);
     return Result.ok({
       sourceText: file.value.source,
       scriptHash: file.value.scriptHash,
