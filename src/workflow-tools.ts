@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
@@ -7,6 +8,7 @@ import { jsonValueSchema, parseJsonText, type JsonValue } from "./json-types.js"
 import type { WorkspaceRegistry } from "./workspaces.js";
 import {
   persistWorkflowScriptResult,
+  readProjectWorkflowScriptFileResult,
   resolveNamedWorkflowScriptResult,
   readWorkflowScriptFileResult,
 } from "./workflow-files.js";
@@ -118,6 +120,7 @@ export function registerWorkflowTools(
           if (priorResult.isErr()) throw priorResult.error;
           const prior = priorResult.value;
           if (!prior) throw new WorkflowNotFoundError(resumeFromRunId);
+          requireWorkflowRunInWorkspace(prior, workspaceId, workspace.root);
           priorRunId = prior.id;
           const overridePath = scriptPath;
           if (script !== undefined) {
@@ -137,7 +140,12 @@ export function registerWorkflowTools(
             nameHint = resolvedResult.value.nameHint;
           } else {
             priorScriptPath = overridePath ?? prior.scriptPath;
-            const resolvedResult = await readWorkflowScriptFileResult(priorScriptPath);
+            const resolvedResult = overridePath
+              ? await readProjectWorkflowScriptFileResult({
+                  scriptPath: overridePath,
+                  workspaceRoot: workspace.root,
+                })
+              : await readWorkflowScriptFileResult(priorScriptPath);
             if (resolvedResult.isErr()) throw resolvedResult.error;
             source = resolvedResult.value.source;
             scriptHash = resolvedResult.value.scriptHash;
@@ -164,7 +172,10 @@ export function registerWorkflowTools(
           nameHint = resolved.nameHint;
           runSource = "named";
         } else if (scriptPath) {
-          const resolvedResult = await readWorkflowScriptFileResult(scriptPath);
+          const resolvedResult = await readProjectWorkflowScriptFileResult({
+            scriptPath,
+            workspaceRoot: workspace.root,
+          });
           if (resolvedResult.isErr()) throw resolvedResult.error;
           source = resolvedResult.value.source;
           scriptHash = resolvedResult.value.scriptHash;
@@ -226,6 +237,7 @@ export function registerWorkflowTools(
       title: "Workflow status",
       description: "Drain events for a workflow run; optional long-poll yield.",
       inputSchema: {
+        workspaceId: z.string().describe("Workspace id from open_workspace."),
         runId: z.string(),
         sinceSeq: z.number().int().min(0).optional(),
         yieldTimeMs: z
@@ -239,12 +251,14 @@ export function registerWorkflowTools(
       annotations: { readOnlyHint: true },
       _meta: workflowWidgetMeta(config),
     },
-    async ({ runId, sinceSeq, yieldTimeMs }) => {
+    async ({ workspaceId, runId, sinceSeq, yieldTimeMs }) => {
+      const workspace = workspaces.getWorkspace(workspaceId);
       const store = createWorkflowStore(config);
       try {
         const runResult = store.getRunResult(runId);
         if (runResult.isErr()) throw runResult.error;
         if (!runResult.value) throw new WorkflowNotFoundError(runId);
+        requireWorkflowRunInWorkspace(runResult.value, workspaceId, workspace.root);
         const page = await yieldEvents(store, runId, sinceSeq ?? 0, yieldTimeMs ?? 0);
         return toolResult(page, "workflow_status");
       } catch (error) {
@@ -263,14 +277,20 @@ export function registerWorkflowTools(
       title: "Cancel workflow",
       description: "Request cooperative cancel of a running workflow.",
       inputSchema: {
+        workspaceId: z.string().describe("Workspace id from open_workspace."),
         runId: z.string(),
       },
       annotations: { readOnlyHint: false },
       _meta: {},
     },
-    async ({ runId }) => {
+    async ({ workspaceId, runId }) => {
+      const workspace = workspaces.getWorkspace(workspaceId);
       const store = createWorkflowStore(config);
       try {
+        const runResult = store.getRunResult(runId);
+        if (runResult.isErr()) throw runResult.error;
+        if (!runResult.value) throw new WorkflowNotFoundError(runId);
+        requireWorkflowRunInWorkspace(runResult.value, workspaceId, workspace.root);
         const latest = await cancelWorkflowRun(store, runId);
         return {
           content: [{ type: "text" as const, text: JSON.stringify({ runId, status: latest.status }) }],
@@ -288,6 +308,17 @@ export function registerWorkflowTools(
   if (config.widgets !== "off") {
     registerWorkflowUiTools(server, config, workspaces);
   }
+}
+
+export function requireWorkflowRunInWorkspace(
+  run: Pick<WorkflowRunRecord, "id" | "workspaceId" | "workspaceRoot">,
+  workspaceId: string,
+  workspaceRoot: string,
+): void {
+  const owned = run.workspaceId
+    ? run.workspaceId === workspaceId
+    : resolve(run.workspaceRoot) === resolve(workspaceRoot);
+  if (!owned) throw new WorkflowNotFoundError(run.id);
 }
 
 function registerWorkflowUiTools(
