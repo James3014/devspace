@@ -6,6 +6,7 @@ import {
   isShellTool,
   isToolName,
 } from "./card-types.js";
+import { workflowSummaryText } from "./workflow-dashboard.js";
 
 for (const tool of [
   "apply_patch",
@@ -26,6 +27,12 @@ assert.equal(
   isExpandableCard({ tool: "apply_patch", payload: { patch: "diff --git a/a b/a" } }),
   true,
 );
+
+assert.deepEqual(workflowSummaryText({}), {
+  name: "Unnamed workflow",
+  status: "unknown",
+  calls: "no calls yet",
+});
 assert.equal(isExpandableCard({ tool: "apply_patch" }), false);
 assert.equal(
   isExpandableCard({

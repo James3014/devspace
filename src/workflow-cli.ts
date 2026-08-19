@@ -4,10 +4,7 @@ import {
   resolveCliWorkspaceContext,
   type CliWorkspaceContext,
 } from "./cli-workspace.js";
-import {
-  workflowCallOutput,
-  workflowRunOutput,
-} from "./cli-output.js";
+import { workflowCallOutput, workflowRunOutput } from "./cli-output.js";
 import type { ServerConfig } from "./config.js";
 import { parseWorkflowArgFlagsResult } from "./workflow-files.js";
 import {
@@ -35,6 +32,7 @@ import {
   spawnWorkflowWorker,
   spawnWorkflowWorkerFromCli,
 } from "./workflow-worker.js";
+import { resolveCliEntry } from "./workflow-cli-entry.js";
 
 export { runWorkflowWorker, spawnWorkflowWorker, spawnWorkflowWorkerFromCli };
 
@@ -151,15 +149,8 @@ async function runWorkflowRun(args: string[], config: ServerConfig): Promise<voi
       if (!prior) throw new WorkflowNotFoundError(resumeFrom);
       assertWorkflowInCurrentProject(prior, workspace);
     }
-    let argsValue = Object.keys(workflowArgs).length ? workflowArgs : undefined;
-
-    // Resume without explicit --arg reuses prior args inside launch; if CLI
-    // provided empty object and resume, leave undefined so launch reloads prior.
-    if (resumeFrom && argsValue === undefined) {
-      // launch handles prior args
-    } else if (resumeFrom && argsValue && Object.keys(workflowArgs).length === 0) {
-      argsValue = undefined;
-    }
+    // Undefined args on resume make launch reload the prior run's args.
+    const argsValue = Object.keys(workflowArgs).length ? workflowArgs : undefined;
 
     const launched = await launchWorkflowRun({
       store,
@@ -168,7 +159,8 @@ async function runWorkflowRun(args: string[], config: ServerConfig): Promise<voi
       workspaceId: workspace.workspaceId,
       source,
       args: argsValue,
-      cliEntry: fileURLToPath(import.meta.url.replace(/workflow-cli\.(ts|js)$/, "cli.$1")),
+      scriptFileScope: "local",
+      cliEntry: resolveCliEntry(),
     });
     if (launched.isErr()) throw launched.error;
 
