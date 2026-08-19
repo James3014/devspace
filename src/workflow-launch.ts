@@ -1,25 +1,27 @@
+import { resolve } from "node:path";
 import type { ServerConfig } from "./config.js";
 import { parseJsonText, type JsonObject, type JsonValue } from "./json-types.js";
 import {
   persistWorkflowScriptResult,
+  readProjectWorkflowScriptFileResult,
   readWorkflowScriptFileResult,
   resolveNamedWorkflowScriptResult,
   resolveWorkflowScriptFromPathOrNameResult,
 } from "./workflow-files.js";
-import { parseWorkflowScript } from "./workflow-script.js";
+import { parseWorkflowScript, WorkflowScriptError } from "./workflow-script.js";
 import type { WorkflowStore } from "./workflow-store.js";
 import type { WorkflowRunRecord, WorkflowRunSource } from "./workflow-types.js";
 import {
   InvalidWorkflowInputError,
   WorkflowNotFoundError,
   WorkflowStoredDataError,
+  isWorkflowOperationError,
   type WorkflowOperationError,
+  type WorkflowFileWriteError,
 } from "./workflow-errors.js";
 import { resolveWorkspaceHead } from "./workflow-worktrees.js";
 import { spawnWorkflowWorker } from "./workflow-worker.js";
 import { Result, type Result as BetterResult } from "better-result";
-import type { WorkflowScriptError } from "./workflow-script.js";
-import type { WorkflowFileWriteError } from "./workflow-errors.js";
 import type { WorkflowRunTransitionError } from "./workflow-store.js";
 
 export type LaunchWorkflowSource =
@@ -43,6 +45,8 @@ export interface LaunchWorkflowRunInput {
   workspaceId?: string;
   source: LaunchWorkflowSource;
   args?: JsonValue;
+  /** Local CLI paths or MCP paths constrained to the project's workflow directory. */
+  scriptFileScope: "local" | "project-workflows";
   /** Absolute path to cli entry used to spawn `workflow __worker`. */
   cliEntry: string;
   /** When false, create the run row but do not spawn (tests). Default true. */
@@ -104,13 +108,24 @@ export async function launchWorkflowRun(
       source: sourceText,
       preferredName,
     });
-    if (persisted.isErr()) return persisted;
+    if (persisted.isErr()) {
+      failStartedRun(input.store, run.id, persisted.error);
+      return persisted;
+    }
 
     const updated = input.store.setScriptPathResult(run.id, persisted.value);
-    if (updated.isErr()) return updated;
+    if (updated.isErr()) {
+      failStartedRun(input.store, run.id, updated.error);
+      return updated;
+    }
 
     if (input.spawn !== false) {
-      spawnWorkflowWorker(run.id, input.cliEntry);
+      try {
+        await spawnWorkflowWorker(run.id, input.cliEntry);
+      } catch (error) {
+        failStartedRun(input.store, run.id, error);
+        throw error;
+      }
     }
 
     return Result.ok({
@@ -146,6 +161,9 @@ async function resolveLaunchSource(
     if (priorResult.isErr()) return priorResult;
     const prior = priorResult.value;
     if (!prior) return Result.err(new WorkflowNotFoundError(source.runId));
+    if (!runBelongsToWorkspace(prior, input.workspaceId, workspaceRoot)) {
+      return Result.err(new WorkflowNotFoundError(source.runId));
+    }
 
     let sourceText: string;
     let scriptHash: string;
@@ -172,7 +190,7 @@ async function resolveLaunchSource(
       nameHint = named.value.nameHint;
       filename = named.value.scriptPath;
     } else if (source.override?.kind === "file") {
-      const file = await readWorkflowScriptFileResult(source.override.path);
+      const file = await resolveExplicitWorkflowFile(input, source.override.path);
       if (file.isErr()) return file;
       sourceText = file.value.source;
       scriptHash = file.value.scriptHash;
@@ -238,17 +256,13 @@ async function resolveLaunchSource(
   }
 
   if (source.kind === "file") {
-    const file = await resolveWorkflowScriptFromPathOrNameResult({
-      file: source.path,
-      workspaceRoot,
-      stateDir: config.stateDir,
-    });
+    const file = await resolveExplicitWorkflowFile(input, source.path);
     if (file.isErr()) return file;
     return Result.ok({
       sourceText: file.value.source,
       scriptHash: file.value.scriptHash,
       nameHint: file.value.nameHint,
-      runSource: file.value.origin === "named" ? "named" : "inline",
+      runSource: "file",
       filename: file.value.scriptPath,
       args,
     });
@@ -263,12 +277,40 @@ async function resolveLaunchSource(
 }
 
 function isLaunchError(error: unknown): error is LaunchWorkflowError {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "name" in error &&
-    (error as { name?: string }).name === "WorkflowScriptError"
-  );
+  return error instanceof WorkflowScriptError || isWorkflowOperationError(error);
+}
+
+function resolveExplicitWorkflowFile(
+  input: LaunchWorkflowRunInput,
+  path: string,
+) {
+  if (input.scriptFileScope === "project-workflows") {
+    return readProjectWorkflowScriptFileResult({
+      scriptPath: path,
+      workspaceRoot: input.workspaceRoot,
+    });
+  }
+  return resolveWorkflowScriptFromPathOrNameResult({
+    file: path,
+    workspaceRoot: input.workspaceRoot,
+    stateDir: input.config.stateDir,
+  });
+}
+
+function runBelongsToWorkspace(
+  run: Pick<WorkflowRunRecord, "workspaceId" | "workspaceRoot">,
+  workspaceId: string | undefined,
+  workspaceRoot: string,
+): boolean {
+  if (run.workspaceId) return run.workspaceId === workspaceId;
+  return resolve(run.workspaceRoot) === resolve(workspaceRoot);
+}
+
+function failStartedRun(store: WorkflowStore, runId: string, error: unknown): void {
+  store.failRunResult(runId, {
+    error: error instanceof Error ? error.message : String(error),
+    errorKind: "internal",
+  });
 }
 
 export function isJsonObject(value: JsonValue): value is JsonObject {
