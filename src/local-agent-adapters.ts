@@ -107,6 +107,7 @@ class ClaudeLocalAgentAdapter implements LocalAgentAdapter {
       let providerSessionId = input.providerSessionId ?? null;
       let finalResponse = "";
       let structured: unknown | undefined;
+      let usage: LocalAgentUsageSnapshot | undefined;
       const items: unknown[] = [];
       for await (const message of messages) {
         items.push(message);
@@ -116,6 +117,7 @@ class ClaudeLocalAgentAdapter implements LocalAgentAdapter {
           observer?.onSession?.(record.session_id);
         }
         notifyClaudeActivity(record, observer);
+        usage = observeClaudeUsage(record, usage, observer);
         if (record.type !== "result") continue;
         const resultError = claudeResultError(record);
         if (resultError) throw new Error(resultError);
@@ -124,15 +126,9 @@ class ClaudeLocalAgentAdapter implements LocalAgentAdapter {
           finalResponse = extracted.finalResponse;
           structured = extracted.structured;
         }
-        const usage = claudeUsage(record.usage, "final");
-        if (usage) observer?.onUsage?.(usage);
       }
 
       finalResponse = requireFinalResponse("Claude", finalResponse);
-      const usage = [...items]
-        .reverse()
-        .map((item) => claudeUsage((item as Record<string, unknown>).usage, "final"))
-        .find((snapshot) => snapshot !== undefined);
       return {
         provider: this.provider,
         providerSessionId,
@@ -148,6 +144,21 @@ class ClaudeLocalAgentAdapter implements LocalAgentAdapter {
       throw error;
     }
   }
+}
+
+export function observeClaudeUsage(
+  record: Record<string, unknown>,
+  accumulated: LocalAgentUsageSnapshot | undefined,
+  observer?: LocalAgentObserver,
+): LocalAgentUsageSnapshot | undefined {
+  const final = record.type === "result";
+  const message = record.message as Record<string, unknown> | undefined;
+  const current = claudeUsage(final ? record.usage : message?.usage, final ? "final" : "partial");
+  if (!current) return accumulated;
+
+  const usage = final ? current : addUsage(accumulated, current);
+  observer?.onUsage?.(usage);
+  return usage;
 }
 
 function notifyClaudeActivity(record: Record<string, unknown>, observer?: LocalAgentObserver): void {
@@ -186,16 +197,48 @@ function claudeUsage(value: unknown, state: "partial" | "final"): LocalAgentUsag
   if (!value || typeof value !== "object") return undefined;
   const usage = value as Record<string, unknown>;
   const inputTokens = nonNegativeInteger(usage.input_tokens);
+  const cachedInputTokens = nonNegativeInteger(usage.cache_read_input_tokens);
+  const cacheCreationInputTokens = nonNegativeInteger(usage.cache_creation_input_tokens);
   const outputTokens = nonNegativeInteger(usage.output_tokens);
-  if (inputTokens === undefined && outputTokens === undefined) return undefined;
+  if (
+    inputTokens === undefined &&
+    cachedInputTokens === undefined &&
+    cacheCreationInputTokens === undefined &&
+    outputTokens === undefined
+  ) return undefined;
   return {
     inputTokens,
-    cachedInputTokens: nonNegativeInteger(usage.cache_read_input_tokens),
-    cacheCreationInputTokens: nonNegativeInteger(usage.cache_creation_input_tokens),
+    cachedInputTokens,
+    cacheCreationInputTokens,
     outputTokens,
-    totalTokens: (inputTokens ?? 0) + (outputTokens ?? 0),
+    totalTokens:
+      (inputTokens ?? 0) +
+      (cachedInputTokens ?? 0) +
+      (cacheCreationInputTokens ?? 0) +
+      (outputTokens ?? 0),
     state,
   };
+}
+
+function addUsage(
+  accumulated: LocalAgentUsageSnapshot | undefined,
+  current: LocalAgentUsageSnapshot,
+): LocalAgentUsageSnapshot {
+  return {
+    inputTokens: sumOptional(accumulated?.inputTokens, current.inputTokens),
+    cachedInputTokens: sumOptional(accumulated?.cachedInputTokens, current.cachedInputTokens),
+    cacheCreationInputTokens: sumOptional(
+      accumulated?.cacheCreationInputTokens,
+      current.cacheCreationInputTokens,
+    ),
+    outputTokens: sumOptional(accumulated?.outputTokens, current.outputTokens),
+    totalTokens: (accumulated?.totalTokens ?? 0) + current.totalTokens,
+    state: current.state,
+  };
+}
+
+function sumOptional(left: number | undefined, right: number | undefined): number | undefined {
+  return left === undefined && right === undefined ? undefined : (left ?? 0) + (right ?? 0);
 }
 
 function nonNegativeInteger(value: unknown): number | undefined {
