@@ -1,4 +1,3 @@
-import { fileURLToPath } from "node:url";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import * as z from "zod/v4";
@@ -29,6 +28,7 @@ import {
   type LaunchWorkflowSource,
 } from "./workflow-launch.js";
 import { resolveWorkflowLiveProviders } from "./workflow-providers.js";
+import { resolveCliEntry } from "./workflow-cli-entry.js";
 
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
 const WORKFLOW_UI_WAIT_MAX_MS = 30_000;
@@ -110,9 +110,8 @@ export function registerWorkflowTools(
           workspaceId,
           source,
           args,
-          cliEntry: fileURLToPath(
-            import.meta.url.replace(/workflow-tools\.(ts|js)$/, "cli.$1"),
-          ),
+          scriptFileScope: "project-workflows",
+          cliEntry: resolveCliEntry(),
         });
         if (launched.isErr()) {
           if (isWorkflowOperationError(launched.error)) return workflowToolError(launched.error);
