@@ -389,6 +389,7 @@ class AcpLocalAgentAdapter implements LocalAgentAdapter {
     );
     try {
       let providerSessionId = input.providerSessionId ?? null;
+      let usage: LocalAgentUsageSnapshot | undefined;
       const finalResponse = await client({ name: "DevSpace" })
         .onRequest(methods.client.session.requestPermission, (context) => {
           const selected = selectAcpAllowPermissionOption(context.params.options);
@@ -415,7 +416,7 @@ class AcpLocalAgentAdapter implements LocalAgentAdapter {
               const message = await session.nextUpdate();
               if (message.kind === "stop") {
                 const response = await prompt;
-                const usage = tokenUsage(asRecord(response.usage), "final");
+                usage = tokenUsage(asRecord(response.usage), "final");
                 if (usage) observer?.onUsage?.(usage);
                 return textParts.join("").trim();
               }
@@ -436,6 +437,7 @@ class AcpLocalAgentAdapter implements LocalAgentAdapter {
         providerSessionId,
         finalResponse: finalResponse.trim(),
         items: [],
+        ...(usage ? { usage } : {}),
       };
     } catch (error) {
       throw new Error(`${this.provider} ACP run failed: ${errorMessage(error)}${stderr ? `\n${stderr.trim()}` : ""}`);
@@ -550,9 +552,10 @@ class PiRpcLocalAgentAdapter implements LocalAgentAdapter {
     assertPipedChild(child);
     const rpc = new JsonLineRpc(child);
     const events: unknown[] = [];
+    let usage: LocalAgentUsageSnapshot | undefined;
     rpc.onEvent((event) => {
       events.push(event);
-      observePiEvent(event, observer);
+      usage = observePiEvent(event, observer) ?? usage;
     });
     try {
       const state = await rpc.request({ type: "get_state" });
@@ -579,6 +582,7 @@ class PiRpcLocalAgentAdapter implements LocalAgentAdapter {
         providerSessionId,
         finalResponse,
         items: [...events, sessionMessages],
+        ...(usage ? { usage } : {}),
       };
     } finally {
       child.kill();
@@ -613,14 +617,17 @@ export function observeOpenCodeResult(
   return usage;
 }
 
-export function observePiEvent(event: unknown, observer?: LocalAgentObserver): void {
+export function observePiEvent(
+  event: unknown,
+  observer?: LocalAgentObserver,
+): LocalAgentUsageSnapshot | undefined {
   const record = asRecord(event);
-  if (!record) return;
+  if (!record) return undefined;
   const usage = tokenUsage(asRecord(record.usage) ?? asRecord(asRecord(record.message)?.usage), record.type === "agent_end" ? "final" : "partial");
   if (usage) observer?.onUsage?.(usage);
   const tool = asRecord(record.tool) ?? asRecord(record.toolCall) ?? asRecord(record.toolExecution);
   const name = directString(record.toolName) ?? directString(tool?.name);
-  if (!name) return;
+  if (!name) return usage;
   const detail = directString(record.command) ?? directString(asRecord(tool?.arguments)?.command);
   observer?.onActivity?.({
     kind: toolKind(name),
@@ -628,6 +635,7 @@ export function observePiEvent(event: unknown, observer?: LocalAgentObserver): v
     label: name,
     ...(detail ? { detail } : {}),
   });
+  return usage;
 }
 
 export function observeAcpUpdate(update: unknown, observer?: LocalAgentObserver): void {

@@ -38,11 +38,33 @@ const openCodeUsage = observeOpenCodeResult({
   }],
 }, observer);
 assert.equal(openCodeUsage?.totalTokens, 1_250);
+assert.deepEqual(observedUsage.shift(), {
+  inputTokens: 1_000,
+  cachedInputTokens: 400,
+  cacheCreationInputTokens: 50,
+  outputTokens: 250,
+  totalTokens: 1_250,
+  state: "final",
+});
 assert.deepEqual(observedActivity.shift(), {
   kind: "command",
   status: "completed",
   label: "bash",
 });
+
+const piUsage = observePiEvent({
+  type: "agent_end",
+  usage: { input: 800, output: 200, total: 1_000 },
+}, observer);
+assert.deepEqual(piUsage, {
+  inputTokens: 800,
+  cachedInputTokens: undefined,
+  cacheCreationInputTokens: undefined,
+  outputTokens: 200,
+  totalTokens: 1_000,
+  state: "final",
+});
+assert.deepEqual(observedUsage.shift(), piUsage);
 
 observePiEvent({
   type: "tool_execution_start",
