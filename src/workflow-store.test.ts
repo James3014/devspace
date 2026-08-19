@@ -35,6 +35,18 @@ try {
     { title: "Planning", detail: "Understand the change" },
     { title: "Review" },
   ]);
+  assert.throws(
+    () =>
+      store.createRun({
+        name: "invalid phases",
+        source: "inline",
+        scriptPath: join(root, "invalid.js"),
+        scriptHash: "invalid-phases",
+        workspaceRoot: join(root, "project"),
+        phases: [{ title: "" }],
+      }),
+    /Too small/,
+  );
 
   const claimed = store.claimRun(run.id, process.pid);
   assert.equal(claimed?.status, "running");
@@ -99,6 +111,15 @@ try {
     state: "partial",
   });
   assert.equal(partialUsage.state, "partial");
+  assert.throws(
+    () =>
+      store.updateAgentUsage(run.id, 0, {
+        totalTokens: 1_300,
+        state: "unknown" as never,
+      }),
+    /Invalid option/,
+  );
+  assert.equal(store.getAgentCall(run.id, 0)?.usage?.totalTokens, 1_200);
   store.appendAgentActivity({
     runId: run.id,
     callIndex: 0,
@@ -118,6 +139,18 @@ try {
     store.listAgentActivity(run.id, 0).map((activity) => activity.status),
     ["running", "completed"],
   );
+  assert.throws(
+    () =>
+      store.appendAgentActivity({
+        runId: run.id,
+        callIndex: 0,
+        kind: "network" as never,
+        status: "running",
+        label: "invalid activity",
+      }),
+    /Invalid option/,
+  );
+  assert.equal(store.listAgentActivity(run.id, 0).length, 2);
   store.completeAgentCall({
     runId: run.id,
     callIndex: 0,
