@@ -185,17 +185,23 @@ export async function runWorkflowWorker(
   }
 }
 
-export function spawnWorkflowWorker(runId: string, cliEntry: string): void {
-  const child = spawn(
-    process.execPath,
-    [...process.execArgv, cliEntry, "workflow", "__worker", runId],
-    {
-      detached: true,
-      stdio: "ignore",
-      env: process.env,
-    },
-  );
-  child.unref();
+export function spawnWorkflowWorker(runId: string, cliEntry: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      [...process.execArgv, cliEntry, "workflow", "__worker", runId],
+      {
+        detached: true,
+        stdio: "ignore",
+        env: process.env,
+      },
+    );
+    child.once("error", reject);
+    child.once("spawn", () => {
+      child.unref();
+      resolve();
+    });
+  });
 }
 
 /** @deprecated Use spawnWorkflowWorker */
