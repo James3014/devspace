@@ -5,7 +5,7 @@ import { databasePath } from "../src/db/client.js";
 import { WorkflowStore } from "../src/workflow-store.js";
 import type { WorkflowRunRecord } from "../src/workflow-types.js";
 
-const FIXTURE_VERSION = "large-v1";
+const FIXTURE_VERSION = "large-v2";
 const WORKFLOW_NAME = "Ship multi-service authentication";
 
 const fixtureNames = [
@@ -80,6 +80,9 @@ function seedFixture(
       .listRunsForWorkspace(workspace)
       .find((run) => run.scriptHash === scriptHash);
     if (existing) return { name, stateDir, run: existing };
+    const replayParent = name === "replayed"
+      ? seedReplayParent(store, stateDir, workspace, scriptHash)
+      : undefined;
 
     const run = store.createRun({
       name: WORKFLOW_NAME,
@@ -87,7 +90,7 @@ function seedFixture(
       scriptPath: join(stateDir, "fixtures", `${name}.js`),
       scriptHash,
       workspaceRoot: workspace,
-      resumedFromRunId: name === "replayed" ? "wfr_previous_fixture" : undefined,
+      resumedFromRunId: replayParent?.id,
     });
 
     if (name === "starting") return { name, stateDir, run };
@@ -127,12 +130,12 @@ function seedFixture(
       });
     } else if (name === "replayed") {
       startPhase(store, run.id, "Discovery");
-      addCachedCall(store, run.id, 0, "Discovery", "Map authentication services", "codex");
-      addCachedCall(store, run.id, 1, "Discovery", "Audit token storage", "claude");
-      addCachedCall(store, run.id, 2, "Discovery", "Trace client login flows", "codex");
+      addCachedCall(store, run.id, replayParent!.id, 0, "Discovery", "Map authentication services", "codex");
+      addCachedCall(store, run.id, replayParent!.id, 1, "Discovery", "Audit token storage", "claude");
+      addCachedCall(store, run.id, replayParent!.id, 2, "Discovery", "Trace client login flows", "codex");
       startPhase(store, run.id, "Architecture");
-      addCachedCall(store, run.id, 3, "Architecture", "Design session boundaries", "claude");
-      addCachedCall(store, run.id, 4, "Architecture", "Plan database migration", "codex");
+      addCachedCall(store, run.id, replayParent!.id, 3, "Architecture", "Design session boundaries", "claude");
+      addCachedCall(store, run.id, replayParent!.id, 4, "Architecture", "Plan database migration", "codex");
       startPhase(store, run.id, "Backend implementation");
       startCall(store, run.id, 5, "Implement OAuth store", "codex", "Backend implementation", true);
       startCall(store, run.id, 6, "Add session rotation", "claude", "Backend implementation");
@@ -228,7 +231,9 @@ function startCall(
     label,
     phase,
     isolation: worktree ? "worktree" : "shared",
-    worktreePath: worktree ? `/tmp/devspace-fixture-worktree-${callIndex}` : undefined,
+    worktreePath: worktree
+      ? join(tmpdir(), `devspace-fixture-worktree-${callIndex}`)
+      : undefined,
   });
 }
 
@@ -270,6 +275,7 @@ function addCompletedPhase(
 function addCachedCall(
   store: WorkflowStore,
   runId: string,
+  replayedFromRunId: string,
   callIndex: number,
   phase: string,
   label: string,
@@ -285,10 +291,35 @@ function addCachedCall(
     label,
     phase,
     replayMatch: "same_index",
-    replayedFromRunId: "wfr_previous_fixture",
+    replayedFromRunId,
     replayedFromCallIndex: callIndex,
     responseText: `${label} reused from the previous run`,
   });
+}
+
+function seedReplayParent(
+  store: WorkflowStore,
+  stateDir: string,
+  workspaceRoot: string,
+  childScriptHash: string,
+): WorkflowRunRecord {
+  const scriptHash = `${childScriptHash}:parent`;
+  const existing = store
+    .listRunsForWorkspace(workspaceRoot)
+    .find((run) => run.scriptHash === scriptHash);
+  if (existing) return existing;
+
+  const parent = store.createRun({
+    name: `${WORKFLOW_NAME} (previous run)`,
+    source: "inline",
+    scriptPath: join(stateDir, "fixtures", "replayed-parent.js"),
+    scriptHash,
+    workspaceRoot,
+  });
+  store.claimRun(parent.id, process.pid);
+  seedCompletedWorkflow(store, parent.id);
+  store.completeRun(parent.id, { resultJson: JSON.stringify({ ok: true }), callCount: 12 });
+  return store.getRun(parent.id) ?? parent;
 }
 
 function seedCompletedWorkflow(store: WorkflowStore, runId: string): void {
@@ -324,5 +355,6 @@ function seedCompletedWorkflow(store: WorkflowStore, runId: string): void {
 }
 
 function fail(message: string): never {
-  throw new Error(message);
+  console.error(message);
+  process.exit(1);
 }
