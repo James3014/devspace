@@ -26,6 +26,7 @@ assert.equal(
   isExpandableCard({ tool: "apply_patch", payload: { patch: "diff --git a/a b/a" } }),
   true,
 );
+
 assert.equal(isExpandableCard({ tool: "apply_patch" }), false);
 assert.equal(
   isExpandableCard({

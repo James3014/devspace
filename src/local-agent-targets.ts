@@ -19,7 +19,7 @@ export interface ParsedLocalAgentRunArgs {
 export type LocalAgentTarget = ResolvedLocalAgentExecution;
 
 const USAGE =
-  'Usage: devspace agents run <profile-or-provider-or-id> [--model <model>] [--effort <level>] "<prompt>"';
+  'Usage: devspace agents run <profile-or-provider-or-id> [--model <model>] [--effort <level>] "<prompt>" [--json]';
 
 export function parseLocalAgentRunArgs(args: string[]): ParsedLocalAgentRunArgs {
   const json = args.at(-1) === "--json";
