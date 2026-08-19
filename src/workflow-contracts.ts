@@ -5,6 +5,9 @@ import type { LocalAgentProvider } from "./local-agent-profiles.js";
 import { jsonSchemaSchema, type JsonSchema, type JsonValue } from "./json-types.js";
 
 export const localAgentProviderSchema = z.enum(LOCAL_AGENT_PROVIDERS);
+export const workflowTokenUsageStateSchema = z.enum(["partial", "final"]);
+export const workflowAgentActivityKindSchema = z.enum(["tool", "command", "file", "status"]);
+export const workflowAgentActivityStatusSchema = z.enum(["running", "completed", "failed"]);
 
 export const workflowPhaseMetaSchema = z
   .object({

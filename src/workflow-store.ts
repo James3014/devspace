@@ -26,9 +26,12 @@ import {
   parseWorkflowEventPayload,
   workflowAgentCallStatusSchema,
   workflowEventTypeSchema,
+  workflowAgentActivityKindSchema,
+  workflowAgentActivityStatusSchema,
   workflowRunSourceSchema,
   workflowRunStatusSchema,
   workflowPhaseMetaSchema,
+  workflowTokenUsageStateSchema,
 } from "./workflow-contracts.js";
 import {
   InvalidRunTransitionError,
@@ -242,7 +245,8 @@ export class WorkflowStore {
   createRun(input: CreateWorkflowRunInput): WorkflowRunRecord {
     const now = isoNow();
     const argsJson = input.argsJson ?? "null";
-    const phasesJson = JSON.stringify(input.phases ?? []);
+    const phases = z.array(workflowPhaseMetaSchema).parse(input.phases ?? []);
+    const phasesJson = JSON.stringify(phases);
     assertArgsSize(argsJson);
 
     const record: WorkflowRunRecord = {
@@ -254,7 +258,7 @@ export class WorkflowStore {
       workspaceRoot: resolve(input.workspaceRoot),
       workspaceId: input.workspaceId,
       argsJson,
-      phases: input.phases ?? [],
+      phases,
       status: "starting",
       cancelRequested: false,
       resumedFromRunId: input.resumedFromRunId,
@@ -1011,6 +1015,7 @@ export class WorkflowStore {
     callIndex: number,
     usage: Omit<WorkflowTokenUsage, "updatedAt">,
   ): WorkflowTokenUsage {
+    const state = workflowTokenUsageStateSchema.parse(usage.state);
     for (const value of [
       usage.inputTokens,
       usage.cachedInputTokens,
@@ -1042,17 +1047,19 @@ export class WorkflowStore {
         usage.cacheCreationInputTokens ?? null,
         usage.outputTokens ?? null,
         usage.totalTokens,
-        usage.state,
+        state,
         now,
         now,
         runId,
         callIndex,
       );
     if (update.changes === 0) this.requireAgentCall(runId, callIndex);
-    return { ...usage, updatedAt: now };
+    return { ...usage, state, updatedAt: now };
   }
 
   appendAgentActivity(input: AppendWorkflowAgentActivityInput): WorkflowAgentActivityRecord {
+    const kind = workflowAgentActivityKindSchema.parse(input.kind);
+    const status = workflowAgentActivityStatusSchema.parse(input.status);
     const now = isoNow();
     const transaction = this.database.sqlite.transaction(() => {
       this.requireAgentCall(input.runId, input.callIndex);
@@ -1073,8 +1080,8 @@ export class WorkflowStore {
           input.runId,
           input.callIndex,
           next.next_seq,
-          input.kind,
-          input.status,
+          kind,
+          status,
           input.label,
           input.detail ?? null,
           input.startedAt ?? null,
@@ -1089,6 +1096,8 @@ export class WorkflowStore {
         .run(input.runId, input.callIndex, next.next_seq - WORKFLOW_LIMITS.activityPerCall);
       return {
         ...input,
+        kind,
+        status,
         seq: next.next_seq,
         createdAt: now,
       };
@@ -1269,7 +1278,7 @@ function rowToAgentCall(row: WorkflowAgentCallRow): WorkflowAgentCallRecord {
           cacheCreationInputTokens: row.usage_cache_creation_input_tokens ?? undefined,
           outputTokens: row.usage_output_tokens ?? undefined,
           totalTokens: row.usage_total_tokens,
-          state: row.usage_state === "final" ? "final" : "partial",
+          state: workflowTokenUsageStateSchema.parse(row.usage_state),
           updatedAt: row.usage_updated_at,
         },
     responseText: row.response_text ?? undefined,
@@ -1295,20 +1304,12 @@ function rowToAgentCall(row: WorkflowAgentCallRow): WorkflowAgentCallRecord {
 }
 
 function rowToAgentActivity(row: WorkflowAgentActivityRow): WorkflowAgentActivityRecord {
-  const kinds: WorkflowAgentActivityKind[] = ["tool", "command", "file", "status"];
-  const statuses: WorkflowAgentActivityStatus[] = ["running", "completed", "failed"];
-  if (!kinds.includes(row.kind as WorkflowAgentActivityKind)) {
-    throw new Error(`Unknown workflow agent activity kind: ${row.kind}`);
-  }
-  if (!statuses.includes(row.status as WorkflowAgentActivityStatus)) {
-    throw new Error(`Unknown workflow agent activity status: ${row.status}`);
-  }
   return {
     runId: row.run_id,
     callIndex: row.call_index,
     seq: row.seq,
-    kind: row.kind as WorkflowAgentActivityKind,
-    status: row.status as WorkflowAgentActivityStatus,
+    kind: workflowAgentActivityKindSchema.parse(row.kind),
+    status: workflowAgentActivityStatusSchema.parse(row.status),
     label: row.label,
     detail: row.detail ?? undefined,
     startedAt: row.started_at ?? undefined,
