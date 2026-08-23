@@ -1,3 +1,11 @@
+import * as z from "zod/v4";
+
+export const presentationConfigSchema = z.discriminatedUnion("mode", [
+  z.object({ mode: z.literal("off") }),
+  z.object({ mode: z.literal("inline") }),
+  z.object({ mode: z.literal("change-review") }),
+]);
+
 export type PresentationConfig =
   | { mode: "off" }
   | { mode: "inline" }

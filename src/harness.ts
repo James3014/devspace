@@ -1,3 +1,17 @@
+import * as z from "zod/v4";
+
+export const harnessConfigSchema = z.discriminatedUnion("kind", [
+  z.object({
+    kind: z.literal("claude-code").describe("Expose the Claude Code-style coding harness."),
+    inspection: z
+      .enum(["shell", "dedicated"])
+      .describe("Use shell inspection or expose dedicated grep/glob/ls tools."),
+  }),
+  z.object({
+    kind: z.literal("codex").describe("Expose the Codex-style coding harness."),
+  }),
+]);
+
 export type HarnessConfig =
   | {
       kind: "claude-code";
