@@ -25,6 +25,21 @@ export interface LocalAgentRunResult {
   items: unknown[];
 }
 
+export class LocalAgentProviderError extends Error {
+  readonly providerSessionId?: string;
+  readonly finalResponse?: string;
+
+  constructor(
+    message: string,
+    evidence: { providerSessionId?: string | null; finalResponse?: string } = {},
+  ) {
+    super(message);
+    this.name = "LocalAgentProviderError";
+    this.providerSessionId = evidence.providerSessionId ?? undefined;
+    this.finalResponse = evidence.finalResponse?.trim() || undefined;
+  }
+}
+
 export interface LocalAgentRuntime {
   readonly provider: string;
   run(input: LocalAgentRunInput): Promise<LocalAgentRunResult>;
@@ -77,7 +92,15 @@ export class CodexSdkLocalAgentRuntime implements LocalAgentRuntime {
     const thread = input.providerSessionId
       ? this.codex.resumeThread(input.providerSessionId, options)
       : this.codex.startThread(options);
-    const turn = await thread.run(input.prompt);
+    let turn: RunResult;
+    try {
+      turn = await thread.run(input.prompt);
+    } catch (error) {
+      throw new LocalAgentProviderError(
+        error instanceof Error ? error.message : String(error),
+        { providerSessionId: thread.id },
+      );
+    }
 
     return {
       provider: this.provider,

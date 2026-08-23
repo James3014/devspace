@@ -1,5 +1,7 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { resolve } from "node:path";
+import { realpathSync } from "node:fs";
+import { createServer } from "node:net";
+import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import { Readable, Writable } from "node:stream";
 import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
@@ -7,6 +9,7 @@ import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
 import { resolveAgyExecutable } from "./local-agent-availability.js";
 import {
   createCodexSdkLocalAgentRuntime,
+  LocalAgentProviderError,
   type LocalAgentRunInput,
   type LocalAgentRunResult,
 } from "./local-agent-runtime.js";
@@ -22,6 +25,11 @@ const ACP_COMMANDS: Record<"cursor" | "copilot", [string, ...string[]]> = {
   copilot: ["copilot", "--acp"],
 };
 const PI_AGENT_TIMEOUT_MS = 120_000;
+const AGY_PRINT_TIMEOUT_SECONDS = 600;
+const AGY_AGENT_TIMEOUT_MS = 610_000;
+const OPENCODE_AGENT_TIMEOUT_MS = 900_000;
+const OPENCODE_STATUS_POLL_MS = 250;
+const OPENCODE_SERVER_START_ATTEMPTS = 4;
 
 export async function runLocalAgentProvider(
   provider: LocalAgentProvider,
@@ -96,7 +104,12 @@ class ClaudeLocalAgentAdapter implements LocalAgentAdapter {
       if (typeof record.session_id === "string") providerSessionId = record.session_id;
       if (record.type === "result" && typeof record.result === "string") {
         const resultError = claudeResultError(record);
-        if (resultError) throw new Error(resultError);
+        if (resultError) {
+          throw new LocalAgentProviderError(resultError, {
+            providerSessionId,
+            finalResponse: typeof record.result === "string" ? record.result : undefined,
+          });
+        }
         finalResponse = record.result;
       }
     }
@@ -136,6 +149,61 @@ export function agyCommandEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv
   return next;
 }
 
+export function resolveAgyGitMetadataDirs(workspace: string): string[] {
+  const revParse = spawnSync(
+    "git",
+    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    {
+      cwd: workspace,
+      encoding: "utf8",
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      windowsHide: true,
+    },
+  );
+  if (revParse.status !== 0) return [];
+
+  const rawCommonDir = revParse.stdout.trim().split(/\r?\n/, 1)[0]?.trim();
+  if (!rawCommonDir) return [];
+
+  const workspaceRoot = canonicalizeExistingPath(workspace);
+  const commonDir = canonicalizeExistingPath(resolve(workspaceRoot, rawCommonDir));
+  if (isPathWithin(commonDir, workspaceRoot)) return [];
+  if (basename(commonDir) !== ".git") return [];
+
+  const membership = spawnSync(
+    "git",
+    [`--git-dir=${commonDir}`, "worktree", "list", "--porcelain"],
+    {
+      cwd: workspaceRoot,
+      encoding: "utf8",
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      windowsHide: true,
+    },
+  );
+  if (membership.status !== 0) return [];
+
+  const ownsWorkspace = membership.stdout
+    .split(/\r?\n/)
+    .filter((line) => line.startsWith("worktree "))
+    .map((line) => canonicalizeExistingPath(line.slice("worktree ".length).trim()))
+    .includes(workspaceRoot);
+
+  return ownsWorkspace ? [commonDir] : [];
+}
+
+function canonicalizeExistingPath(path: string): string {
+  try {
+    return realpathSync.native(path);
+  } catch {
+    return resolve(path);
+  }
+}
+
+function isPathWithin(candidate: string, root: string): boolean {
+  const rel = relative(root, candidate);
+  return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
+}
+
 class AgyLocalAgentAdapter implements LocalAgentAdapter {
   readonly provider = "agy" as const;
 
@@ -148,19 +216,33 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
     const args: string[] = [];
     if (input.providerSessionId) {
       args.push("--conversation", input.providerSessionId);
+    } else {
+      args.push("--new-project");
     }
     if (input.model) {
       args.push("--model", input.model);
     }
-    if (input.thinking) {
+    // Agy 1.1.18 rejects a separate --effort for this preset model because
+    // the reasoning tier is already encoded in the model identity.
+    if (input.thinking && input.model !== "gemini-3.7-flash-medium") {
       args.push("--effort", input.thinking);
     }
     args.push("--sandbox");
+    // DevSpace invokes Agy in non-interactive --print mode. Without this flag,
+    // any command/file confirmation that Agy cannot prompt for is soft-denied
+    // and the durable worker exits before it can perform bounded work. The
+    // workspace/add-dir scope and DevSpace execution contract remain the
+    // outer containment boundaries for the delegated turn.
+    args.push("--dangerously-skip-permissions");
+    args.push("--add-dir", input.workspace);
+    for (const gitMetadataDir of resolveAgyGitMetadataDirs(input.workspace)) {
+      args.push("--add-dir", gitMetadataDir);
+    }
 
     const mode = input.writeMode === "allowed" ? "accept-edits" : "plan";
     args.push("--mode", mode);
     args.push("--output-format", "json");
-    args.push("--print-timeout", "240s");
+    args.push("--print-timeout", `${AGY_PRINT_TIMEOUT_SECONDS}s`);
     args.push("--print", input.prompt);
 
     const child = spawn(agyExecutable, args, {
@@ -190,7 +272,7 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
 
     const timeoutMs = process.env.DEVSPACE_AGY_TIMEOUT_MS
       ? parseInt(process.env.DEVSPACE_AGY_TIMEOUT_MS, 10)
-      : 250_000;
+      : AGY_AGENT_TIMEOUT_MS;
     const graceMs = process.env.DEVSPACE_AGY_GRACE_MS
       ? parseInt(process.env.DEVSPACE_AGY_GRACE_MS, 10)
       : 3_000;
@@ -255,7 +337,13 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
     const { status, conversation_id, response } = parsed;
 
     if (status !== "SUCCESS") {
-      throw new Error(`Agy execution status is not SUCCESS: ${status}. Full output: ${JSON.stringify(parsed)}`);
+      throw new LocalAgentProviderError(
+        `Agy execution status is not SUCCESS: ${status}. Full output: ${JSON.stringify(parsed)}`,
+        {
+          providerSessionId: typeof conversation_id === "string" ? conversation_id : undefined,
+          finalResponse: typeof response === "string" ? response : undefined,
+        },
+      );
     }
 
     if (!conversation_id || typeof conversation_id !== "string") {
@@ -320,13 +408,16 @@ class OpencodeLocalAgentAdapter implements LocalAgentAdapter {
   readonly provider = "opencode" as const;
 
   async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
-    const { createOpencode } = await import("@opencode-ai/sdk/v2");
-    const { client, server } = await createOpencode();
+    const runtime = await createIsolatedOpencodeRuntime();
+    const { client, server } = runtime;
+    let sessionId = input.providerSessionId;
+    let promptResult: unknown;
+    let messages: unknown;
     try {
-      const sessionId = input.providerSessionId ?? await createOpencodeSession(client, input);
-      const promptResult = await promptOpencodeSession(client, sessionId, input);
-      await waitForOpencodeSession(client, sessionId);
-      const messages = await readOpencodeMessages(client, sessionId);
+      sessionId ??= await createOpencodeSession(client, input);
+      promptResult = await promptOpencodeSessionAsync(client, sessionId, input);
+      await waitForOpencodeTurn(client, sessionId, input.workspace, opencodeAgentTimeoutMs(process.env));
+      messages = await readOpencodeMessages(client, sessionId, input.workspace);
       const finalResponse = requireFinalResponse(
         "OpenCode",
         extractOpenCodeFinalResponse(messages) || extractOpenCodeFinalResponse(promptResult),
@@ -337,6 +428,20 @@ class OpencodeLocalAgentAdapter implements LocalAgentAdapter {
         finalResponse,
         items: [promptResult, messages],
       };
+    } catch (error) {
+      if (sessionId && messages === undefined) {
+        try {
+          messages = await readOpencodeMessages(client, sessionId, input.workspace);
+        } catch {
+          // Preserve the original provider failure when evidence recovery fails.
+        }
+      }
+      if (sessionId) await abortOpencodeSession(client, sessionId, input.workspace);
+      if (error instanceof LocalAgentProviderError) throw error;
+      throw new LocalAgentProviderError(errorMessage(error), {
+        providerSessionId: sessionId,
+        finalResponse: extractOpenCodeFinalResponse(messages) || extractOpenCodeFinalResponse(promptResult),
+      });
     } finally {
       server.close();
     }
@@ -365,13 +470,14 @@ class AcpLocalAgentAdapter implements LocalAgentAdapter {
     child.stderr.on("data", (chunk: Buffer) => {
       stderr += chunk.toString("utf8");
     });
+    let providerSessionId = input.providerSessionId ?? null;
+    const textParts: string[] = [];
 
     const stream = ndJsonStream(
       Writable.toWeb(child.stdin) as WritableStream<Uint8Array>,
       Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
     );
     try {
-      let providerSessionId = input.providerSessionId ?? null;
       const finalResponse = await client({ name: "DevSpace" })
         .onRequest(methods.client.session.requestPermission, (context) => {
           const selected = selectAcpAllowPermissionOption(context.params.options);
@@ -392,7 +498,6 @@ class AcpLocalAgentAdapter implements LocalAgentAdapter {
               await context.request(methods.agent.session.setConfigOption, config);
             }
             const prompt = session.prompt(input.prompt);
-            const textParts: string[] = [];
             for (;;) {
               const message = await session.nextUpdate();
               if (message.kind === "stop") {
@@ -416,7 +521,13 @@ class AcpLocalAgentAdapter implements LocalAgentAdapter {
         items: [],
       };
     } catch (error) {
-      throw new Error(`${this.provider} ACP run failed: ${errorMessage(error)}${stderr ? `\n${stderr.trim()}` : ""}`);
+      throw new LocalAgentProviderError(
+        `${this.provider} ACP run failed: ${errorMessage(error)}${stderr ? `\n${stderr.trim()}` : ""}`,
+        {
+          providerSessionId,
+          finalResponse: textParts.join("").trim(),
+        },
+      );
     } finally {
       child.kill();
     }
@@ -542,7 +653,12 @@ class PiRpcLocalAgentAdapter implements LocalAgentAdapter {
           extractPiProviderError(agentEnd) ||
           extractPiProviderError(sessionMessages) ||
           extractPiProviderError(events);
-        if (providerError) throw new Error(`Pi returned an error: ${providerError}`);
+        if (providerError) {
+          throw new LocalAgentProviderError(`Pi returned an error: ${providerError}`, {
+            providerSessionId,
+            finalResponse: extractPiStreamingText(events),
+          });
+        }
       }
       requireFinalResponse("Pi", finalResponse);
       return {
@@ -664,6 +780,43 @@ class JsonLineRpc {
   }
 }
 
+async function createIsolatedOpencodeRuntime(): Promise<{
+  client: unknown;
+  server: { close(): void };
+}> {
+  const { createOpencode } = await import("@opencode-ai/sdk/v2");
+  let lastError: unknown;
+  for (let attempt = 0; attempt < OPENCODE_SERVER_START_ATTEMPTS; attempt += 1) {
+    const port = await findFreeTcpPort();
+    try {
+      return await createOpencode({ hostname: "127.0.0.1", port });
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw new Error(
+    `OpenCode server failed to start on an isolated port after ${OPENCODE_SERVER_START_ATTEMPTS} attempts: ${errorMessage(lastError)}`,
+  );
+}
+
+async function findFreeTcpPort(): Promise<number> {
+  return new Promise((resolvePort, reject) => {
+    const probe = createServer();
+    probe.unref();
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      if (!address || typeof address === "string") {
+        probe.close();
+        reject(new Error("Unable to allocate an isolated OpenCode TCP port."));
+        return;
+      }
+      const port = address.port;
+      probe.close((error) => error ? reject(error) : resolvePort(port));
+    });
+  });
+}
+
 async function createOpencodeSession(client: unknown, input: LocalAgentRunInput): Promise<string> {
   const sessionClient = client as {
     session: {
@@ -673,7 +826,9 @@ async function createOpencodeSession(client: unknown, input: LocalAgentRunInput)
   const result = await sessionClient.session.create({
     directory: input.workspace,
     location: { directory: input.workspace },
-    ...(input.model ? { model: parseOpencodeModel(input.model) } : {}),
+    ...(input.model
+      ? { model: opencodeSessionCreateModelRef(parseOpencodeModel(input.model)) }
+      : {}),
   }, { throwOnError: true });
   const id =
     readNestedString(result, ["id"]) ??
@@ -686,43 +841,149 @@ async function createOpencodeSession(client: unknown, input: LocalAgentRunInput)
   return id;
 }
 
-async function promptOpencodeSession(
+async function promptOpencodeSessionAsync(
   client: unknown,
   sessionId: string,
   input: LocalAgentRunInput,
 ): Promise<unknown> {
   const session = (client as {
     session: {
+      promptAsync?: (parameters?: unknown, options?: unknown) => Promise<unknown>;
       prompt(parameters?: unknown, options?: unknown): Promise<unknown>;
     };
   }).session;
   const promptInput = {
     sessionID: sessionId,
     directory: input.workspace,
-    prompt: { parts: [{ type: "text", text: input.prompt }] },
     parts: [{ type: "text", text: input.prompt }],
     ...(input.model ? { model: parseOpencodeModel(input.model) } : {}),
     ...(input.thinking ? { variant: input.thinking } : {}),
   };
-  return session.prompt(promptInput, { throwOnError: true });
+  if (session.promptAsync) {
+    return session.promptAsync(promptInput, { throwOnError: true });
+  }
+  return promiseWithTimeout(
+    session.prompt(promptInput, { throwOnError: true }),
+    opencodeAgentTimeoutMs(process.env),
+    "OpenCode prompt",
+  );
 }
 
-async function waitForOpencodeSession(client: unknown, sessionId: string): Promise<void> {
+async function waitForOpencodeTurn(
+  client: unknown,
+  sessionId: string,
+  workspace: string,
+  timeoutMs: number,
+): Promise<void> {
+  const startedAt = Date.now();
+  let sawBusy = false;
+  for (;;) {
+    const blocker = await readOpencodeInteractiveBlocker(client, sessionId, workspace);
+    if (blocker) throw new Error(blocker);
+
+    const status = await readOpencodeSessionStatus(client, sessionId, workspace);
+    if (status === "busy" || status === "retry") sawBusy = true;
+    if (status === "idle") return;
+    if (status === "inactive" && (sawBusy || Date.now() - startedAt >= 750)) {
+      const messages = await readOpencodeMessages(client, sessionId, workspace);
+      if (extractOpenCodeFinalResponse(messages)) return;
+    }
+
+    if (Date.now() - startedAt >= timeoutMs) {
+      throw new Error(`OpenCode session ${sessionId} timed out after ${timeoutMs}ms.`);
+    }
+    await sleep(OPENCODE_STATUS_POLL_MS);
+  }
+}
+
+async function readOpencodeInteractiveBlocker(
+  client: unknown,
+  sessionId: string,
+  workspace: string,
+): Promise<string | undefined> {
+  const typed = client as {
+    permission?: { list?: (parameters?: unknown, options?: unknown) => Promise<unknown> };
+    question?: { list?: (parameters?: unknown, options?: unknown) => Promise<unknown> };
+  };
+  if (typed.permission?.list) {
+    const response = await typed.permission.list({ directory: workspace }, { throwOnError: true });
+    const permissions = unwrapProviderPayload(response);
+    if (Array.isArray(permissions)) {
+      const pending = permissions.map(asRecord).find((item) => item?.sessionID === sessionId);
+      if (pending) {
+        const permission = directString(pending.permission) ?? "unknown";
+        const patterns = Array.isArray(pending.patterns)
+          ? pending.patterns.filter((item) => typeof item === "string")
+          : [];
+        const suffix = patterns.length > 0 ? ` for ${patterns.join(", ")}` : "";
+        return `OpenCode session ${sessionId} is blocked on permission '${permission}'${suffix}; DevSpace does not auto-approve interactive permission escalation.`;
+      }
+    }
+  }
+  if (typed.question?.list) {
+    const response = await typed.question.list({ directory: workspace }, { throwOnError: true });
+    const questions = unwrapProviderPayload(response);
+    if (Array.isArray(questions)) {
+      const pending = questions.map(asRecord).find((item) => item?.sessionID === sessionId);
+      if (pending) {
+        return `OpenCode session ${sessionId} is blocked on an interactive question; subagent prompts must be self-contained.`;
+      }
+    }
+  }
+  return undefined;
+}
+
+async function readOpencodeSessionStatus(
+  client: unknown,
+  sessionId: string,
+  workspace: string,
+): Promise<"busy" | "retry" | "idle" | "inactive"> {
   const session = (client as {
-    session?: { wait?: (parameters?: unknown, options?: unknown) => Promise<unknown> };
+    session?: { status?: (parameters?: unknown, options?: unknown) => Promise<unknown> };
   }).session;
-  if (!session?.wait) return;
-  await session.wait({ sessionID: sessionId }, { throwOnError: true });
+  if (!session?.status) return "inactive";
+  const response = await session.status({ directory: workspace }, { throwOnError: true });
+  const statuses = unwrapProviderPayload(response);
+  const entry = asRecord(statuses)?.[sessionId];
+  const type = directString(asRecord(entry)?.type);
+  if (type === "busy" || type === "retry" || type === "idle") return type;
+  return "inactive";
 }
 
-async function readOpencodeMessages(client: unknown, sessionId: string): Promise<unknown> {
+async function abortOpencodeSession(client: unknown, sessionId: string, workspace: string): Promise<void> {
+  const session = (client as {
+    session?: { abort?: (parameters?: unknown, options?: unknown) => Promise<unknown> };
+  }).session;
+  if (!session?.abort) return;
+  try {
+    await session.abort({ sessionID: sessionId, directory: workspace }, { throwOnError: true });
+  } catch {
+    // Preserve the original provider error; runtime close still terminates the owned server.
+  }
+}
+
+async function readOpencodeMessages(client: unknown, sessionId: string, workspace?: string): Promise<unknown> {
   const session = (client as {
     session?: {
       messages?: (parameters?: unknown, options?: unknown) => Promise<unknown>;
     };
   }).session;
   if (!session?.messages) return undefined;
-  return session.messages({ sessionID: sessionId, order: "asc", limit: 100 }, { throwOnError: true });
+  return session.messages(
+    { sessionID: sessionId, ...(workspace ? { directory: workspace } : {}), order: "asc", limit: 100 },
+    { throwOnError: true },
+  );
+}
+
+function opencodeAgentTimeoutMs(env: NodeJS.ProcessEnv): number {
+  const configured = Number.parseInt(env.DEVSPACE_OPENCODE_TIMEOUT_MS ?? "", 10);
+  return Number.isFinite(configured) && configured > 0 ? configured : OPENCODE_AGENT_TIMEOUT_MS;
+}
+
+function opencodeSessionCreateModelRef(
+  model: { providerID: string; modelID: string },
+): { providerID: string; id: string } {
+  return { providerID: model.providerID, id: model.modelID };
 }
 
 function parseOpencodeModel(model: string): { providerID: string; modelID: string } {
@@ -732,6 +993,26 @@ function parseOpencodeModel(model: string): { providerID: string; modelID: strin
     providerID: model.slice(0, separator),
     modelID: model.slice(separator + 1),
   };
+}
+
+function promiseWithTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  return new Promise<T>((resolvePromise, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms.`)), timeoutMs);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolvePromise(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 }
 
 export function extractLocalAgentResponseText(value: unknown): string {

@@ -359,6 +359,7 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   const startProps = startTool.inputSchema.properties as Record<string, any>;
   assert.equal(startProps.workspaceRoot, undefined);
   assert.equal(startProps.provider, undefined);
+  assert.ok(startProps.attemptKey);
 
   const continueProps = continueTool.inputSchema.properties as Record<string, any>;
   assert.equal(continueProps.workspaceRoot, undefined);
@@ -384,6 +385,7 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
       workspaceId,
       profile: "reviewer",
       prompt: "hello review tests",
+      attemptKey: "server-functional-attempt",
     },
   });
 
@@ -391,6 +393,33 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   assert.ok(startStructured.agentId);
   assert.equal(startStructured.status, "starting");
   assert.equal(startStructured.profileName, "reviewer");
+
+  const replayResult = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "hello review tests",
+      attemptKey: "server-functional-attempt",
+    },
+  });
+  assert.equal(replayResult.isError, undefined);
+  assert.equal(
+    (replayResult.structuredContent as Record<string, unknown>).agentId,
+    startStructured.agentId,
+  );
+
+  const replayConflict = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "materially different prompt",
+      attemptKey: "server-functional-attempt",
+    },
+  });
+  assert.equal(replayConflict.isError, true);
+  assert.match(responseText(replayConflict), /materially different request/);
 
   // Call agent_status
   const statusResult = await context.client.callTool({

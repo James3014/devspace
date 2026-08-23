@@ -3,7 +3,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable, Writable } from "node:stream";
-import type { LocalAgentRunInput, LocalAgentRunResult } from "./local-agent-runtime.js";
+import { LocalAgentProviderError, type LocalAgentRunInput, type LocalAgentRunResult } from "./local-agent-runtime.js";
 
 const DEFAULT_OMP_TIMEOUT_MS = 600_000;
 const OMP_WRITE_TOOLS = "read,edit,write,grep,glob,todo";
@@ -184,7 +184,13 @@ export async function runOmpAcpLocalAgent(input: LocalAgentRunInput): Promise<Lo
     };
   } catch (error) {
     const detail = stderr.trim();
-    throw new Error(`OMP ACP run failed: ${errorMessage(error)}${detail ? `\n${detail}` : ""}`);
+    throw new LocalAgentProviderError(
+      `OMP ACP run failed: ${errorMessage(error)}${detail ? `\n${detail}` : ""}`,
+      {
+        providerSessionId: activeSessionId,
+        finalResponse: textParts.join("").trim(),
+      },
+    );
   } finally {
     if (timeout) clearTimeout(timeout);
     child.kill("SIGTERM");

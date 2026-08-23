@@ -8,6 +8,9 @@ import test from "node:test";
 import { LocalAgentSessionManager, AgentSessionError } from "./local-agent-sessions.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
 import type { ScopeBaseline } from "./local-agent-contract.js";
+import { LocalAgentProviderError } from "./local-agent-runtime.js";
+import { SqliteWorkspaceStore } from "./workspace-store.js";
+import { WorkspaceRegistry } from "./workspaces.js";
 import {
   classifyScopeState,
   computeWorkerDelta,
@@ -432,6 +435,43 @@ test("AC-10 continueAgent preserves provider session binding", async () => {
   }
 });
 
+test("AC-10b continuation maxWallMs fences the new turn, not durable session age", async () => {
+  const f = setupGitFixture();
+  const { manager, clean, terminated } = setupManager();
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "hello 1",
+      profiles: mockProfiles,
+      executionContract: { maxWallMs: 100 },
+    });
+    manager.updateRecord(started.agentId, {
+      status: "idle",
+      latestResponse: "done",
+      providerSessionId: "provider-session-abc",
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    await manager.continueAgent({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      agentId: started.agentId,
+      prompt: "hello 2",
+    });
+    await manager.superviseActiveAgents();
+
+    const record = manager.getRecordByPrefixOrId(started.agentId);
+    assert.equal(record?.status, "starting");
+    assert.equal(terminated.length, 0);
+  } finally {
+    f.clean();
+    clean();
+  }
+});
+
 // AC-5: missing toolchain fails explicitly; Dev MCP never repairs the environment.
 test("AC-5 missing toolchain fails explicitly without creating .venv or mutating repo", async () => {
   const f = setupGitFixture();
@@ -547,6 +587,262 @@ test("agent_start returns NO_EXECUTION_CAPACITY when at capacity", async () => {
   }
 });
 
+test("agent_start attemptKey concurrently reuses one durable launch", async () => {
+  const f = setupGitFixture();
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-replay-state-"));
+  let launches = 0;
+  const manager = new LocalAgentSessionManager(
+    {
+      stateDir,
+      subagents: true,
+      oauth: { scopes: ["devspace"] },
+      agentMaxConcurrent: 1,
+      toolchains: [],
+    } as any,
+    async () => { launches += 1; },
+  );
+  try {
+    const input = {
+      workspaceId: "ws_replay",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "bounded work",
+      profiles: mockProfiles,
+      attemptKey: "issue-517-attempt-1",
+      executionContract: { expectedHead: f.head, writePaths: ["src"], maxFiles: 1 },
+    };
+    const [first, replay] = await Promise.all([
+      manager.startAgent(input),
+      manager.startAgent(input),
+    ]);
+
+    assert.equal(replay.agentId, first.agentId);
+    assert.equal(launches, 1);
+    assert.equal(manager.listAgents({ workspaceId: "ws_replay" }).length, 1);
+  } finally {
+    f.clean();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("agent_start attemptKey binding survives store reopen and rejects material conflicts", async () => {
+  const f = setupGitFixture();
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-replay-reopen-state-"));
+  const config = {
+    stateDir,
+    subagents: true,
+    oauth: { scopes: ["devspace"] },
+    agentMaxConcurrent: 8,
+    toolchains: [],
+  } as any;
+  let firstLaunches = 0;
+  let reopenedLaunches = 0;
+  const firstManager = new LocalAgentSessionManager(config, async () => { firstLaunches += 1; });
+  const reopenedManager = new LocalAgentSessionManager(config, async () => { reopenedLaunches += 1; });
+  const baseProfile = mockProfiles[0]!;
+  const baseInput = {
+    workspaceId: "ws_replay_reload",
+    workspaceRoot: f.repo,
+    profileName: "reviewer",
+    prompt: "bounded work",
+    profiles: mockProfiles,
+    attemptKey: "durable-attempt",
+    executionContract: { writePaths: ["src"], maxFiles: 2 },
+  };
+  try {
+    const first = await firstManager.startAgent(baseInput);
+    const replay = await reopenedManager.startAgent(baseInput);
+    assert.equal(replay.agentId, first.agentId);
+    assert.equal(firstLaunches, 1);
+    assert.equal(reopenedLaunches, 0);
+
+    const conflicts = [
+      { ...baseInput, prompt: "different prompt" },
+      { ...baseInput, profileName: "other", profiles: [{ ...baseProfile, name: "other" }] },
+      { ...baseInput, profiles: [{ ...baseProfile, model: "different-model" }] },
+      { ...baseInput, profiles: [{ ...baseProfile, thinking: "xhigh" }] },
+      { ...baseInput, profiles: [{ ...baseProfile, write_mode: "allowed" as const }] },
+      { ...baseInput, executionContract: { writePaths: ["src", "test"], maxFiles: 2 } },
+    ];
+    for (const conflict of conflicts) {
+      await assert.rejects(
+        reopenedManager.startAgent(conflict),
+        (error: any) => error.code === "ATTEMPT_REPLAY_CONFLICT",
+      );
+    }
+  } finally {
+    f.clean();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("agent_start replay survives restart when reopen returns a new workspaceId for the same physical checkout", async () => {
+  const f = setupGitFixture();
+  const other = setupGitFixture();
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-replay-workspace-reopen-state-"));
+  const config = {
+    stateDir,
+    subagents: true,
+    oauth: { scopes: ["devspace"] },
+    agentMaxConcurrent: 8,
+    toolchains: [],
+    allowedRoots: [f.root, other.root],
+    worktreeRoot: join(stateDir, "worktrees"),
+    agentDir: join(stateDir, "agents"),
+    devspaceAgentsDir: join(stateDir, "agents"),
+  } as any;
+  let firstLaunches = 0;
+  let reopenedLaunches = 0;
+  const firstWorkspaceStore = new SqliteWorkspaceStore(stateDir);
+  const firstRegistry = new WorkspaceRegistry(config, firstWorkspaceStore);
+  const firstWorkspace = await firstRegistry.openWorkspace(f.repo);
+  const firstManager = new LocalAgentSessionManager(config, async () => { firstLaunches += 1; });
+  try {
+    const input = {
+      workspaceId: firstWorkspace.workspace.id,
+      workspaceRoot: firstWorkspace.workspace.root,
+      profileName: "reviewer",
+      prompt: "restart-safe work",
+      profiles: mockProfiles,
+      attemptKey: "restart-safe-attempt",
+      executionContract: { writePaths: ["src"] },
+    };
+    const first = await firstManager.startAgent(input);
+    firstWorkspaceStore.close();
+
+    const reopenedWorkspaceStore = new SqliteWorkspaceStore(stateDir);
+    try {
+      const reopenedRegistry = new WorkspaceRegistry(config, reopenedWorkspaceStore);
+      const reopenedWorkspace = await reopenedRegistry.openWorkspace(f.repo);
+      assert.notEqual(reopenedWorkspace.workspace.id, firstWorkspace.workspace.id);
+
+      const reopenedManager = new LocalAgentSessionManager(config, async () => { reopenedLaunches += 1; });
+      const replay = await reopenedManager.startAgent({
+        ...input,
+        workspaceId: reopenedWorkspace.workspace.id,
+        workspaceRoot: reopenedWorkspace.workspace.root,
+      });
+      assert.equal(replay.agentId, first.agentId);
+      assert.equal(firstLaunches, 1);
+      assert.equal(reopenedLaunches, 0);
+
+      await assert.rejects(
+        reopenedManager.startAgent({
+          ...input,
+          workspaceId: reopenedWorkspace.workspace.id,
+          workspaceRoot: reopenedWorkspace.workspace.root,
+          prompt: "conflicting restart work",
+        }),
+        (error: any) => error.code === "ATTEMPT_REPLAY_CONFLICT",
+      );
+      assert.equal(reopenedLaunches, 0);
+
+      const otherWorkspace = await reopenedRegistry.openWorkspace(other.repo);
+      const otherAttempt = await reopenedManager.startAgent({
+        ...input,
+        workspaceId: otherWorkspace.workspace.id,
+        workspaceRoot: otherWorkspace.workspace.root,
+      });
+      assert.notEqual(otherAttempt.agentId, first.agentId);
+      assert.equal(reopenedLaunches, 1);
+    } finally {
+      reopenedWorkspaceStore.close();
+    }
+  } finally {
+    f.clean();
+    other.clean();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("agent_start without attemptKey remains non-idempotent", async () => {
+  const f = setupGitFixture();
+  const { manager, clean } = setupManager();
+  try {
+    const input = {
+      workspaceId: "ws_no_replay",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "same request",
+      profiles: mockProfiles,
+    };
+    const first = await manager.startAgent(input);
+    const second = await manager.startAgent(input);
+    assert.notEqual(second.agentId, first.agentId);
+    assert.equal(manager.listAgents({ workspaceId: "ws_no_replay" }).length, 2);
+  } finally {
+    f.clean();
+    clean();
+  }
+});
+
+test("provider failure preserves session, response evidence, and physical candidate", async () => {
+  const f = setupGitFixture();
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-provider-evidence-state-"));
+  let launched: { promptFile: string; workerToken: string } | undefined;
+  const manager = new LocalAgentSessionManager(
+    {
+      stateDir,
+      subagents: true,
+      oauth: { scopes: ["devspace"] },
+      agentMaxConcurrent: 8,
+      toolchains: [],
+      devspaceAgentsDir: join(stateDir, "agents"),
+    } as any,
+    async (_agentId, promptFile, workerToken) => {
+      launched = { promptFile, workerToken };
+    },
+    undefined,
+    async () => {
+      mkdirSync(join(f.repo, "src"), { recursive: true });
+      writeFileSync(join(f.repo, "src", "candidate.ts"), "export const candidate = true;\n");
+      throw new LocalAgentProviderError("provider timed out after the completed turn", {
+        providerSessionId: "conversation-usable-123",
+        finalResponse: "I changed src/candidate.ts before the provider rejected the turn.",
+      });
+    },
+  );
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_provider_evidence",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "make the bounded change",
+      profiles: mockProfiles,
+      executionContract: { writePaths: ["src"] },
+    });
+    assert.ok(launched);
+    await manager.runWorkerTurnFromFile(started.agentId, launched.promptFile, launched.workerToken);
+
+    const status = await manager.getAgentStatus({
+      workspaceId: "ws_provider_evidence",
+      workspaceRoot: f.repo,
+      agentId: started.agentId,
+    });
+    assert.equal(status.status, "error");
+    assert.equal(status.terminalReason, "provider_error");
+    assert.equal(status.providerSessionId, "conversation-usable-123");
+    assert.equal(status.latestResponse, "I changed src/candidate.ts before the provider rejected the turn.");
+    assert.match(status.error ?? "", /provider timed out/);
+
+    const reconciled = await manager.reconcileAgent({
+      workspaceId: "ws_provider_evidence",
+      workspaceRoot: f.repo,
+      isolated: true,
+      agentId: started.agentId,
+    });
+    assert.equal(reconciled.agentState, "error");
+    assert.equal(reconciled.terminalReason, "provider_error");
+    assert.equal(reconciled.providerSessionId, "conversation-usable-123");
+    assert.equal(reconciled.candidate.present, true);
+    assert.deepEqual(reconciled.candidate.changedPaths, ["src/candidate.ts"]);
+    assert.equal(reconciled.candidate.scopeState, "WITHIN_SCOPE");
+  } finally {
+    f.clean();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 // ─── Dirty-baseline fingerprint/delta regression tests ───────────────────────
 
 type PhysicalState = Awaited<ReturnType<typeof inspectWorkspacePhysicalState>>;
@@ -588,6 +884,26 @@ test("physical snapshot fingerprints modified, untracked, and deleted paths", as
     assert.equal(deleted.kind, "deleted");
     assert.equal(deleted.contentHash, null);
     assert.equal(deleted.size, 0);
+  } finally {
+    f.clean();
+  }
+});
+
+test("candidate diffHash changes with untracked bytes at a stable path", async () => {
+  const f = setupGitFixture();
+  try {
+    const candidate = join(f.repo, "untracked.txt");
+    writeFileSync(candidate, "first bytes");
+    const first = await inspectWorkspacePhysicalState(f.repo);
+    const unchanged = await inspectWorkspacePhysicalState(f.repo);
+    assert.ok(first.diffHash);
+    assert.equal(unchanged.diffHash, first.diffHash);
+    assert.deepEqual(unchanged.changedPaths, first.changedPaths);
+
+    writeFileSync(candidate, "other bytes");
+    const mutated = await inspectWorkspacePhysicalState(f.repo);
+    assert.deepEqual(mutated.changedPaths, first.changedPaths);
+    assert.notEqual(mutated.diffHash, first.diffHash);
   } finally {
     f.clean();
   }

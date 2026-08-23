@@ -13,6 +13,7 @@ import {
 } from "./local-agent-adapters.js";
 import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
+import { LocalAgentProviderError } from "./local-agent-runtime.js";
 
 const providers: LocalAgentProvider[] = [
   "codex",
@@ -394,12 +395,17 @@ assert.equal(
 // ==========================================
 // Agy Local Agent Adapter Tests
 // ==========================================
-import { writeFileSync, chmodSync, unlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
 const mockAgySource = `#!/usr/bin/env node
+const { realpathSync } = require("node:fs");
 const args = process.argv.slice(2);
+const canonical = (path) => {
+  try { return realpathSync(path); } catch { return path; }
+};
 
 // Secret leak check (Sentinel)
 if (process.env.DEVSPACE_OAUTH_OWNER_TOKEN) {
@@ -415,7 +421,8 @@ if (process.env.DEVSPACE_SENSITIVE_SECRET) {
   process.exit(98);
 }
 
-if (args.includes("--dangerously-skip-permissions")) {
+if (!args.includes("--dangerously-skip-permissions")) {
+  console.error("MISSING_DANGEROUSLY_SKIP_PERMISSIONS");
   process.exit(99);
 }
 
@@ -427,6 +434,21 @@ if (args.includes("--version")) {
 if (args.includes("--print")) {
   const promptIdx = args.indexOf("--print") + 1;
   const prompt = args[promptIdx];
+  const addDirs = args.flatMap((arg, index) => arg === "--add-dir" ? [args[index + 1]] : []);
+  if (!addDirs.map(canonical).includes(canonical(process.cwd()))) {
+    console.error("MISSING_OR_WRONG_ADD_DIR");
+    process.exit(97);
+  }
+  if (process.env.EXPECTED_AGY_GIT_DIR && !addDirs.map(canonical).includes(canonical(process.env.EXPECTED_AGY_GIT_DIR))) {
+    console.error("MISSING_GIT_METADATA_ADD_DIR");
+    process.exit(96);
+  }
+  const model = args.includes("--model") ? args[args.indexOf("--model") + 1] : "";
+  const effort = args.includes("--effort") ? args[args.indexOf("--effort") + 1] : "";
+  if (model === "gemini-3.7-flash-medium" && args.includes("--effort")) {
+    console.error("UNSUPPORTED_EFFORT_FOR_PRESET_MODEL");
+    process.exit(95);
+  }
 
   if (prompt === "TEST_HOSTILE_TIMEOUT") {
     process.on("SIGTERM", () => {
@@ -458,15 +480,17 @@ if (args.includes("--print")) {
   const responseObj = {
     status: "SUCCESS",
     conversation_id: args.includes("--conversation") ? args[args.indexOf("--conversation") + 1] : "new-conv-id",
-    response: \`Processed: \${prompt} (mode=\${args[args.indexOf("--mode") + 1] || ""}, model=\${args[args.indexOf("--model") + 1] || ""}, effort=\${args[args.indexOf("--effort") + 1] || ""})\`,
+    response: \`Processed: \${prompt} (mode=\${args[args.indexOf("--mode") + 1] || ""}, model=\${args[args.indexOf("--model") + 1] || ""}, effort=\${effort}, newProject=\${args.includes("--new-project")})\`,
   };
   console.log(JSON.stringify(responseObj));
   process.exit(0);
 }
 `;
 
-const tempMockPath = join(tmpdir(), `mock-agy-${Date.now()}.js`);
+const tempMockDir = mkdtempSync(join(tmpdir(), "devspace-mock-agy-"));
+const tempMockPath = join(tempMockDir, "mock-agy.js");
 writeFileSync(tempMockPath, mockAgySource, { mode: 0o755 });
+const originalEnv = process.env;
 
 try {
   const testEnv = {
@@ -476,7 +500,6 @@ try {
     DEVSPACE_OAUTH_SCOPES: "devspace",
     DEVSPACE_SENSITIVE_SECRET: "DO_NOT_LEAK",
   };
-  const originalEnv = process.env;
   process.env = testEnv;
 
   const adapter = createLocalAgentAdapter("agy");
@@ -496,9 +519,23 @@ try {
     assert.match(result.finalResponse, /mode=accept-edits/);
     assert.match(result.finalResponse, /model=gemini-3.6/);
     assert.match(result.finalResponse, /effort=high/);
+    assert.match(result.finalResponse, /newProject=true/);
   }
 
-  // B. 唯讀新會話測試
+  // B. Agy 1.1.18 preset model must not receive a redundant --effort flag.
+  {
+    const result = await adapter.run({
+      prompt: "preset-model-task",
+      workspace: process.cwd(),
+      writeMode: "allowed",
+      model: "gemini-3.7-flash-medium",
+      thinking: "medium",
+    });
+    assert.match(result.finalResponse, /model=gemini-3.7-flash-medium/);
+    assert.match(result.finalResponse, /effort=,/);
+  }
+
+  // C. 唯讀新會話測試
   {
     const result = await adapter.run({
       prompt: "hello-task",
@@ -509,7 +546,7 @@ try {
     assert.match(result.finalResponse, /mode=plan/);
   }
 
-  // C. 恢復會話測試 (Resume)
+  // D. 恢復會話測試 (Resume)
   {
     const result = await adapter.run({
       prompt: "resume-task",
@@ -518,6 +555,7 @@ try {
       writeMode: "allowed",
     });
     assert.equal(result.providerSessionId, "existing-session-123");
+    assert.match(result.finalResponse, /newProject=false/);
   }
 
   // D. 錯誤處理測試 - exit code != 0
@@ -544,7 +582,13 @@ try {
       prompt: "STATUS_FAILED",
       workspace: process.cwd(),
     }),
-    /Agy execution status is not SUCCESS/,
+    (error: unknown) => {
+      assert.ok(error instanceof LocalAgentProviderError);
+      assert.match(error.message, /Agy execution status is not SUCCESS/);
+      assert.equal(error.providerSessionId, "123");
+      assert.equal(error.finalResponse, "hello");
+      return true;
+    },
   );
 
   // G. 錯誤處理測試 - missing conversation_id
@@ -649,9 +693,43 @@ try {
     }
   }
 
-  process.env = originalEnv;
+  // K. Managed linked worktrees expose only their verified external Git common directory.
+  {
+    const root = mkdtempSync(join(tmpdir(), "devspace-agy-worktree-"));
+    const sourceRepo = join(root, "source");
+    const linkedWorktree = join(root, "worktree");
+    mkdirSync(sourceRepo);
+    try {
+      const git = (args: string[], cwd: string) => execFileSync("git", args, {
+        cwd,
+        encoding: "utf8",
+        env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      }).trim();
+      git(["init", "--initial-branch=main"], sourceRepo);
+      git(["config", "user.email", "test@example.com"], sourceRepo);
+      git(["config", "user.name", "Test User"], sourceRepo);
+      writeFileSync(join(sourceRepo, "readme.md"), "# test\n");
+      git(["add", "."], sourceRepo);
+      git(["commit", "-m", "initial"], sourceRepo);
+      git(["worktree", "add", "--detach", linkedWorktree, "HEAD"], sourceRepo);
+
+      process.env = {
+        ...testEnv,
+        EXPECTED_AGY_GIT_DIR: join(sourceRepo, ".git"),
+      };
+      const result = await adapter.run({
+        prompt: "linked-worktree",
+        workspace: linkedWorktree,
+        writeMode: "read_only",
+      });
+      assert.equal(result.providerSessionId, "new-conv-id");
+    } finally {
+      process.env = testEnv;
+      rmSync(root, { recursive: true, force: true });
+    }
+  }
+
 } finally {
-  try {
-    unlinkSync(tempMockPath);
-  } catch {}
+  process.env = originalEnv;
+  rmSync(tempMockDir, { recursive: true, force: true });
 }

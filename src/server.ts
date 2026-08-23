@@ -1701,6 +1701,11 @@ export function createMcpServer(
           workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
           profile: z.string().describe("Name of an advertised agent profile to run."),
           prompt: z.string().describe("Task prompt for the agent."),
+          attemptKey: z
+            .string()
+            .regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
+            .optional()
+            .describe("Optional physical-workspace-scoped replay identity. Exact request replays reuse one durable agent; conflicting reuse fails closed."),
           executionContract: z
             .object({
               expectedHead: z
@@ -1747,7 +1752,7 @@ export function createMcpServer(
         _meta: {},
         annotations: AGENT_TOOL_ANNOTATIONS_WRITE,
       },
-      async ({ workspaceId, profile, prompt, executionContract }) => {
+      async ({ workspaceId, profile, prompt, attemptKey, executionContract }) => {
         const workspace = workspaces.getWorkspace(workspaceId);
         const profiles = await loadLocalAgentProfiles(config, workspace.root);
         let contract;
@@ -1765,6 +1770,7 @@ export function createMcpServer(
           profileName: profile,
           prompt,
           profiles,
+          attemptKey,
           executionContract: contract,
         });
         logToolCall(config, {

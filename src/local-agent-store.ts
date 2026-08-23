@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import type { ServerConfig } from "./config.js";
+import { canonicalizePath } from "./roots.js";
 import {
   type AgentTerminalReason,
   type ExecutionContract,
@@ -26,6 +27,7 @@ export interface LocalAgentRecord {
   workerPid?: number;
   workerToken?: string;
   executionContract?: ExecutionContract;
+  startReplay?: StartReplayBinding;
   terminalReason?: AgentTerminalReason;
   scopeState?: ScopeState;
   scopeBaseline?: ScopeBaseline;
@@ -44,6 +46,19 @@ export interface CreateLocalAgentRecordInput {
   model?: string;
   thinking?: string;
   executionContract?: ExecutionContract;
+  startReplay?: StartReplayBinding;
+}
+
+export interface StartReplayBinding {
+  key: string;
+  requestHash: string;
+}
+
+export class LocalAgentReplayConflictError extends Error {
+  constructor(readonly existingAgentId: string) {
+    super(`Attempt replay key is already bound to a materially different agent_start request.`);
+    this.name = "LocalAgentReplayConflictError";
+  }
 }
 
 export interface LocalAgentListScope {
@@ -126,6 +141,7 @@ export class LocalAgentStore {
       model: input.model,
       thinking: input.thinking,
       executionContract: input.executionContract,
+      startReplay: input.startReplay,
       status: "starting",
       createdAt: now,
       updatedAt: now,
@@ -155,13 +171,48 @@ export class LocalAgentStore {
         record.provider,
         record.model ?? null,
         record.thinking ?? null,
-        serializeExecutionContract(record.executionContract),
+        serializeStoredExecutionState(record.executionContract, record.startReplay),
         record.status,
         record.createdAt,
         record.updatedAt,
       );
 
     return record;
+  }
+
+  resolveStartReplay(
+    workspaceRoot: string,
+    binding: StartReplayBinding,
+  ): LocalAgentRecord | undefined {
+    const rows = this.database.sqlite
+      .prepare("select * from local_agent_sessions")
+      .all() as LocalAgentRow[];
+    const canonicalRoot = canonicalizePath(workspaceRoot);
+    const matches = rows.filter((row) =>
+      canonicalizePath(row.workspace_root) === canonicalRoot &&
+      readStoredExecutionState(row.execution_contract).startReplay?.key === binding.key
+    );
+    if (matches.length > 1) {
+      throw new LocalAgentReplayConflictError(matches[0]!.id);
+    }
+    const existing = matches[0];
+    if (!existing) return undefined;
+    const record = rowToLocalAgentRecord(existing);
+    if (record.startReplay?.requestHash !== binding.requestHash) {
+      throw new LocalAgentReplayConflictError(record.id);
+    }
+    return record;
+  }
+
+  createOrReplay(
+    input: CreateLocalAgentRecordInput & { workspaceId: string; startReplay: StartReplayBinding },
+  ): { record: LocalAgentRecord; created: boolean } {
+    const create = this.database.sqlite.transaction(() => {
+      const existing = this.resolveStartReplay(input.workspaceRoot, input.startReplay);
+      if (existing) return { record: existing, created: false };
+      return { record: this.create(input), created: true };
+    });
+    return create.immediate();
   }
 
   get(idOrPrefix: string): LocalAgentRecord | undefined {
@@ -227,7 +278,7 @@ export class LocalAgentStore {
         updated.providerSessionId ?? null,
         updated.workerPid ?? null,
         updated.workerToken ?? null,
-        serializeExecutionContract(updated.executionContract),
+        serializeStoredExecutionState(updated.executionContract, updated.startReplay),
         updated.terminalReason ?? null,
         updated.scopeState ?? null,
         updated.scopeBaseline ? JSON.stringify(updated.scopeBaseline) : null,
@@ -346,6 +397,7 @@ export function createLocalAgentStore(config: ServerConfig): LocalAgentStore {
 }
 
 function rowToLocalAgentRecord(row: LocalAgentRow): LocalAgentRecord {
+  const storedExecution = readStoredExecutionState(row.execution_contract);
   return {
     id: row.id,
     workspaceId: row.workspace_id ?? undefined,
@@ -357,7 +409,8 @@ function rowToLocalAgentRecord(row: LocalAgentRow): LocalAgentRecord {
     providerSessionId: row.provider_session_id ?? undefined,
     workerPid: row.worker_pid ?? undefined,
     workerToken: row.worker_token ?? undefined,
-    executionContract: deserializeExecutionContract(row.execution_contract),
+    executionContract: storedExecution.executionContract,
+    startReplay: storedExecution.startReplay,
     terminalReason: readTerminalReason(row.terminal_reason),
     scopeState: readScopeState(row.scope_state),
     scopeBaseline: readScopeBaseline(row.scope_baseline),
@@ -367,6 +420,41 @@ function rowToLocalAgentRecord(row: LocalAgentRow): LocalAgentRecord {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function serializeStoredExecutionState(
+  executionContract: ExecutionContract | undefined,
+  startReplay: StartReplayBinding | undefined,
+): string | null {
+  if (!startReplay) return serializeExecutionContract(executionContract);
+  return JSON.stringify({
+    storedExecutionStateVersion: 1,
+    executionContract: executionContract ?? null,
+    startReplay,
+  });
+}
+
+function readStoredExecutionState(value: string | null | undefined): {
+  executionContract?: ExecutionContract;
+  startReplay?: StartReplayBinding;
+} {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    if (parsed.storedExecutionStateVersion !== 1) {
+      return { executionContract: deserializeExecutionContract(value) };
+    }
+    const replay = parsed.startReplay as Record<string, unknown> | undefined;
+    const startReplay = replay && typeof replay.key === "string" && typeof replay.requestHash === "string"
+      ? { key: replay.key, requestHash: replay.requestHash }
+      : undefined;
+    const executionContract = parsed.executionContract === null
+      ? undefined
+      : deserializeExecutionContract(JSON.stringify(parsed.executionContract));
+    return { executionContract, startReplay };
+  } catch {
+    return {};
+  }
 }
 
 function readStatus(status: string): LocalAgentStatus {

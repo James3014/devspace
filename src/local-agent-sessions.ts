@@ -1,4 +1,4 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { mkdtempSync, unlinkSync, rmdirSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import type { ServerConfig } from "./config.js";
 import {
   createLocalAgentStore,
+  LocalAgentReplayConflictError,
   LocalAgentStore,
   type LocalAgentRecord,
   type LocalAgentStatus,
@@ -19,7 +20,7 @@ import {
   resolveLocalAgentProviderExecutable,
 } from "./local-agent-availability.js";
 import { runLocalAgentProvider } from "./local-agent-adapters.js";
-import type { LocalAgentRunResult } from "./local-agent-runtime.js";
+import { LocalAgentProviderError, type LocalAgentRunResult } from "./local-agent-runtime.js";
 import { terminateProcessTree, type KillableProcess } from "./process-platform.js";
 import { canonicalizePath } from "./roots.js";
 import {
@@ -51,7 +52,9 @@ export type AgentErrorCode =
   | "STALE_WORKSPACE"
   | "NO_EXECUTION_CAPACITY"
   | "TOOLCHAIN_UNAVAILABLE"
-  | "INVALID_EXECUTION_CONTRACT";
+  | "INVALID_EXECUTION_CONTRACT"
+  | "INVALID_ATTEMPT_KEY"
+  | "ATTEMPT_REPLAY_CONFLICT";
 
 export class AgentSessionError extends Error {
   constructor(
@@ -72,6 +75,7 @@ export interface StartAgentInput {
   prompt: string;
   profiles: LocalAgentProfile[];
   executionContract?: ExecutionContract;
+  attemptKey?: string;
 }
 
 export interface ContinueAgentInput {
@@ -255,6 +259,11 @@ export interface ContinueAgentOutput extends StartAgentOutput {
  */
 export type WorkerLauncher = (agentId: string, promptFile: string, workerToken: string) => Promise<void>;
 export type WorkerTerminator = (record: LocalAgentRecord) => Promise<boolean>;
+export type AgentTurnRunner = (
+  profile: LocalAgentProfile | undefined,
+  record: LocalAgentRecord,
+  prompt: string,
+) => Promise<LocalAgentRunResult>;
 
 // ─── Owned temp cleanup ──────────────────────────────────────────────────────
 
@@ -293,15 +302,18 @@ export class LocalAgentSessionManager {
   private readonly store: LocalAgentStore;
   private readonly launcher: WorkerLauncher;
   private readonly terminator: WorkerTerminator;
+  private readonly turnRunner?: AgentTurnRunner;
 
   constructor(
     private readonly config: ServerConfig,
     testLauncher?: WorkerLauncher,
     testTerminator?: WorkerTerminator,
+    testTurnRunner?: AgentTurnRunner,
   ) {
     this.store = createLocalAgentStore(config);
     this.launcher = testLauncher ?? defaultWorkerLauncher;
     this.terminator = testTerminator ?? terminateOwnedWorker;
+    this.turnRunner = testTurnRunner;
   }
 
   /**
@@ -310,7 +322,7 @@ export class LocalAgentSessionManager {
    * Fail-closed: if worker fails to launch, record is set to error status.
    */
   async startAgent(input: StartAgentInput): Promise<StartAgentOutput> {
-    const { workspaceId, workspaceRoot, profileName, prompt, profiles, executionContract } = input;
+    const { workspaceId, workspaceRoot, profileName, prompt, profiles, executionContract, attemptKey } = input;
 
     const profile = profiles.find((p) => p.name === profileName);
     if (!profile) {
@@ -319,6 +331,29 @@ export class LocalAgentSessionManager {
         "UNKNOWN_PROFILE",
         `Unknown agent profile: ${profileName}. Available: ${available || "none"}`,
       );
+    }
+
+    const replayBinding = attemptKey === undefined
+      ? undefined
+      : buildStartReplayBinding(attemptKey, {
+          workspaceRoot,
+          profile,
+          prompt,
+          executionContract,
+        });
+    if (replayBinding) {
+      try {
+        const replay = this.store.resolveStartReplay(workspaceRoot, replayBinding);
+        if (replay) return recordToStartOutput(replay);
+      } catch (error) {
+        if (error instanceof LocalAgentReplayConflictError) {
+          throw new AgentSessionError(
+            "ATTEMPT_REPLAY_CONFLICT",
+            `attemptKey '${attemptKey}' is already bound to agent ${error.existingAgentId} with a materially different request.`,
+          );
+        }
+        throw error;
+      }
     }
 
     const availability = checkLocalAgentProviderAvailability(profile.provider);
@@ -366,17 +401,44 @@ export class LocalAgentSessionManager {
       }
     }
 
-    const record = this.store.create({
-      workspaceId,
-      workspaceRoot,
-      profileName: profile.name,
-      provider: profile.provider,
-      model: profile.model,
-      thinking: profile.thinking,
-      executionContract,
-    });
+    let record: LocalAgentRecord;
+    let created = true;
+    try {
+      if (replayBinding) {
+        const result = this.store.createOrReplay({
+          workspaceId,
+          workspaceRoot,
+          profileName: profile.name,
+          provider: profile.provider,
+          model: profile.model,
+          thinking: profile.thinking,
+          executionContract,
+          startReplay: replayBinding,
+        });
+        record = result.record;
+        created = result.created;
+      } else {
+        record = this.store.create({
+          workspaceId,
+          workspaceRoot,
+          profileName: profile.name,
+          provider: profile.provider,
+          model: profile.model,
+          thinking: profile.thinking,
+          executionContract,
+        });
+      }
+    } catch (error) {
+      if (error instanceof LocalAgentReplayConflictError) {
+        throw new AgentSessionError(
+          "ATTEMPT_REPLAY_CONFLICT",
+          `attemptKey '${attemptKey}' is already bound to agent ${error.existingAgentId} with a materially different request.`,
+        );
+      }
+      throw error;
+    }
 
-    await this.launchPrompt(record.id, prompt);
+    if (created) await this.launchPrompt(record.id, prompt);
     return recordToStartOutput(this.store.getById(record.id) ?? record);
   }
 
@@ -712,8 +774,12 @@ export class LocalAgentSessionManager {
       const contract = record.executionContract;
       if (!contract) continue;
 
-      const startedAtMs = Date.parse(record.createdAt);
-      if (contract.maxWallMs && now - startedAtMs > contract.maxWallMs) {
+      // `updatedAt` is refreshed when each worker turn is prepared/claimed.
+      // A durable provider conversation may be continued long after the agent
+      // record was first created, so maxWallMs must fence the active turn rather
+      // than the lifetime of the durable session.
+      const activeTurnStartedAtMs = Date.parse(record.updatedAt);
+      if (contract.maxWallMs && now - activeTurnStartedAtMs > contract.maxWallMs) {
         await this.terminateActiveAgent(
           record.id,
           "timeout",
@@ -882,7 +948,9 @@ export class LocalAgentSessionManager {
       const profiles = await loadLocalAgentProfiles(this.config, claimed.workspaceRoot);
       const profile = profiles.find((p) => p.name === claimed.profileName);
       let result: LocalAgentRunResult;
-      if (profile) {
+      if (this.turnRunner) {
+        result = await this.turnRunner(profile, claimed, prompt);
+      } else if (profile) {
         result = await runLocalAgentProfile(profile, claimed, prompt);
       } else {
         result = await runRawLocalAgentProvider(claimed, prompt);
@@ -904,9 +972,11 @@ export class LocalAgentSessionManager {
       const message = error instanceof Error ? error.message : String(error);
       const scope = await this.evaluateScope(agentId);
       this.store.finishWorker(agentId, workerToken, {
+        providerSessionId: error instanceof LocalAgentProviderError ? error.providerSessionId : undefined,
         status: "error",
+        latestResponse: error instanceof LocalAgentProviderError ? error.finalResponse : undefined,
         error: message,
-        terminalReason: classifyProviderError(message),
+        terminalReason: error instanceof LocalAgentProviderError ? "provider_error" : classifyProviderError(message),
         scopeState: scope.scopeState,
       });
     } finally {
@@ -998,6 +1068,38 @@ export function classifyProviderError(message: string): AgentTerminalReason {
   if (/timed out|timeout|timedout/i.test(message)) return "timeout";
   if (/scope|writePaths|write scope/i.test(message)) return "scope_violation";
   return "provider_error";
+}
+
+function buildStartReplayBinding(
+  attemptKey: string,
+  input: {
+    workspaceRoot: string;
+    profile: LocalAgentProfile;
+    prompt: string;
+    executionContract?: ExecutionContract;
+  },
+): { key: string; requestHash: string } {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(attemptKey)) {
+    throw new AgentSessionError(
+      "INVALID_ATTEMPT_KEY",
+      "attemptKey must be 1-128 characters and contain only letters, numbers, '.', '_', ':', '/', or '-'.",
+    );
+  }
+  const request = JSON.stringify({
+    workspaceRoot: canonicalizePath(input.workspaceRoot),
+    profileName: input.profile.name,
+    provider: input.profile.provider,
+    model: input.profile.model ?? null,
+    thinking: input.profile.thinking ?? null,
+    writeMode: input.profile.write_mode ?? "read_only",
+    profileBody: input.profile.body,
+    prompt: input.prompt,
+    executionContract: input.executionContract ?? null,
+  });
+  return {
+    key: attemptKey,
+    requestHash: createHash("sha256").update(request).digest("hex"),
+  };
 }
 
 function isActiveStatus(status: LocalAgentStatus): boolean {

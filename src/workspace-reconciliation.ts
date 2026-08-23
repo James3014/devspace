@@ -26,7 +26,7 @@ export interface WorkspacePhysicalState {
    * root) are skipped entirely.
    */
   fingerprints?: Record<string, PathStateFingerprint>;
-  /** Stable hash over the combined diff + untracked file names. */
+  /** Stable hash over Git diffs plus the exact fingerprint of every changed path. */
   diffHash?: string;
   /** Maximum mtime (epoch ms) among changed files, when known. */
   lastFileMutationAt?: number;
@@ -157,7 +157,7 @@ export async function inspectWorkspacePhysicalState(workspaceRoot: string): Prom
     state.changedPaths = Array.from(new Set([...tracked, ...untracked])).sort();
   }
 
-  const diffHash = await computeDiffHash(workspaceRoot, state.changedPaths);
+  const diffHash = await computeDiffHash(workspaceRoot, state.changedPaths, state.fingerprints);
   if (diffHash) state.diffHash = diffHash;
 
   if (state.changedPaths.length > 0) {
@@ -288,6 +288,7 @@ async function computePathGitStateHash(workspaceRoot: string, rel: string): Prom
 async function computeDiffHash(
   workspaceRoot: string,
   changedPaths: string[],
+  fingerprints: Record<string, PathStateFingerprint> | undefined,
 ): Promise<string | undefined> {
   if (changedPaths.length === 0) return undefined;
   const hash = createHash("sha256");
@@ -297,7 +298,20 @@ async function computeDiffHash(
   const staged = await runGit(["diff", "--cached"], workspaceRoot);
   hash.update(staged.stdout);
   for (const path of changedPaths) {
+    const fingerprint = fingerprints?.[path];
     hash.update(path);
+    hash.update("\0");
+    if (fingerprint) {
+      hash.update(fingerprint.kind);
+      hash.update("\0");
+      hash.update(fingerprint.contentHash ?? "deleted");
+      hash.update("\0");
+      hash.update(String(fingerprint.size));
+      hash.update("\0");
+      hash.update(fingerprint.gitStateHash);
+    } else {
+      hash.update("fingerprint-unavailable");
+    }
     hash.update("\0");
   }
   return hash.digest("hex");
