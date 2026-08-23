@@ -80,6 +80,30 @@ test("open_workspace keeps lifecycle flags out of model output and preserves com
   assert.ok(Array.isArray(card.agents));
 });
 
+test("legacy tool modes resolve to the intended coding harness tool contracts", async (t) => {
+  const cases = [
+    {
+      mode: "minimal" as const,
+      tools: ["open_workspace", "read", "write", "edit", "bash"],
+    },
+    {
+      mode: "full" as const,
+      tools: ["open_workspace", "read", "write", "edit", "grep", "glob", "ls", "bash"],
+    },
+    {
+      mode: "codex" as const,
+      tools: ["open_workspace", "read", "apply_patch", "exec_command", "write_stdin"],
+    },
+  ];
+
+  for (const { mode, tools } of cases) {
+    const context = await fixture(t, { toolMode: mode });
+    const listed = await context.client.listTools();
+    assert.deepEqual(listed.tools.map((tool) => tool.name), tools);
+    await context.close();
+  }
+});
+
 test("open_workspace refreshes provider availability for each catalog", async (t) => {
   let available = false;
   const context = await fixture(t, {
@@ -247,6 +271,7 @@ async function fixture(
     git?: boolean;
     localAgentProviders?: LocalAgentProviderAvailability[] | (() => LocalAgentProviderAvailability[]);
     subagents?: SubagentsConfig;
+    toolMode?: "minimal" | "full" | "codex";
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -285,7 +310,7 @@ async function fixture(
     DEVSPACE_WORKTREE_ROOT: join(root, ".worktrees"),
     DEVSPACE_AGENT_DIR: agentDir,
     DEVSPACE_WIDGETS: "full",
-    DEVSPACE_TOOL_MODE: "full",
+    DEVSPACE_TOOL_MODE: options.toolMode ?? "full",
     DEVSPACE_SUBAGENTS: options.localAgentProviders ? "1" : "0",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
