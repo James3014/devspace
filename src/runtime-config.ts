@@ -1,4 +1,4 @@
-import { isArtifactDownloadSupportedPlatform } from "./artifact-tools.js";
+import { isArtifactDownloadSupportedPlatform } from "./artifact-platform.js";
 import type { ResolvedConfig, ToolMode, WidgetMode } from "./config.js";
 
 export const toolNames = {

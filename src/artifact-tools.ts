@@ -14,6 +14,8 @@ import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v4";
 import { ArtifactError } from "./artifact-error.js";
+import { isArtifactDownloadSupportedPlatform } from "./artifact-platform.js";
+export { isArtifactDownloadSupportedPlatform } from "./artifact-platform.js";
 import type { ServerConfig } from "./config.js";
 import {
   describeIncomingArtifactValue,
@@ -35,7 +37,6 @@ const PARTIAL_PREFIX = ".devspace-download-";
 const PARTIAL_SUFFIX = ".partial";
 const STALE_PARTIAL_AGE_MS = 24 * 60 * 60 * 1_000;
 const MAX_STALE_PARTIAL_CLEANUP = 32;
-const ARTIFACT_DOWNLOAD_PLATFORMS = new Set<NodeJS.Platform>(["linux"]);
 
 const openAIFileReferenceInputSchema = z.strictObject({
   download_url: z.string(),
@@ -64,12 +65,6 @@ export interface DownloadIncomingArtifactResult {
   path: string;
   size: number;
   sha256: string;
-}
-
-export function isArtifactDownloadSupportedPlatform(
-  platform: NodeJS.Platform = process.platform,
-): boolean {
-  return ARTIFACT_DOWNLOAD_PLATFORMS.has(platform);
 }
 
 interface SecureDestinationDirectory {
