@@ -15,12 +15,29 @@ assert.equal(loadConfig(baseEnv).widgets, "full");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "changes" }).widgets, "changes");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "full" }).widgets, "full");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "off" }).widgets, "off");
-assert.equal(loadConfig(baseEnv).toolMode, "minimal");
-assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "minimal" }).toolMode, "minimal");
-assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "full" }).toolMode, "full");
-assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "codex" }).toolMode, "codex");
-assert.equal(loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "0" }).toolMode, "full");
-assert.equal(loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "1" }).toolMode, "minimal");
+assert.deepEqual(loadConfig(baseEnv).harness, {
+  kind: "claude-code",
+  inspection: "shell",
+});
+assert.deepEqual(loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "minimal" }).harness, {
+  kind: "claude-code",
+  inspection: "shell",
+});
+assert.deepEqual(loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "full" }).harness, {
+  kind: "claude-code",
+  inspection: "dedicated",
+});
+assert.deepEqual(loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "codex" }).harness, {
+  kind: "codex",
+});
+assert.deepEqual(loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "0" }).harness, {
+  kind: "claude-code",
+  inspection: "dedicated",
+});
+assert.deepEqual(loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "1" }).harness, {
+  kind: "claude-code",
+  inspection: "shell",
+});
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "maybe" }),
   /Invalid DEVSPACE_MINIMAL_TOOLS: maybe/,

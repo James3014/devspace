@@ -5,8 +5,12 @@ import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
 import { devspaceAgentsDir, devspaceSkillsDir, loadDevspaceFiles } from "./user-config.js";
 import { resolveSubagentsConfig, type SubagentsConfig } from "./local-agent-config.js";
+import {
+  harnessFromLegacyToolMode,
+  type HarnessConfig,
+  type LegacyToolMode,
+} from "./harness.js";
 
-export type ToolMode = "minimal" | "full" | "codex";
 export type WidgetMode = "off" | "changes" | "full";
 const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
@@ -19,7 +23,7 @@ export interface ServerConfig {
   allowedRoots: string[];
   allowedHosts: string[];
   publicBaseUrl: string;
-  toolMode: ToolMode;
+  harness: HarnessConfig;
   widgets: WidgetMode;
   stateDir: string;
   worktreeRoot: string;
@@ -90,7 +94,7 @@ function parseBoolean(value: string | undefined, name: string): boolean {
   throw new Error(`Invalid ${name}: ${value}`);
 }
 
-function parseToolMode(env: NodeJS.ProcessEnv): ToolMode {
+function parseLegacyToolMode(env: NodeJS.ProcessEnv): LegacyToolMode {
   const mode = env.DEVSPACE_TOOL_MODE;
   if (mode === "minimal" || mode === "full" || mode === "codex") return mode;
   if (mode) throw new Error(`Invalid DEVSPACE_TOOL_MODE: ${mode}`);
@@ -240,7 +244,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     allowedRoots: parseAllowedRoots(env.DEVSPACE_ALLOWED_ROOTS ?? files.config.allowedRoots),
     allowedHosts: parseAllowedHosts(env.DEVSPACE_ALLOWED_HOSTS, derivedAllowedHosts),
     publicBaseUrl,
-    toolMode: parseToolMode(env),
+    harness: harnessFromLegacyToolMode(parseLegacyToolMode(env)),
     widgets: parseWidgetMode(env.DEVSPACE_WIDGETS),
     stateDir: resolve(expandHomePath(env.DEVSPACE_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),
     worktreeRoot: resolve(expandHomePath(env.DEVSPACE_WORKTREE_ROOT ?? files.config.worktreeRoot ?? defaultWorktreeRoot())),

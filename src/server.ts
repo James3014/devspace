@@ -23,6 +23,7 @@ import {
   registerArtifactTools,
 } from "./artifact-tools.js";
 import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
+import { usesDedicatedInspection } from "./harness.js";
 import {
   createOpenAIIncomingArtifactAdapter,
   type IncomingArtifactAdapter,
@@ -202,11 +203,11 @@ function serverInstructions(config: ServerConfig): string {
       ? " If the turn successfully modifies files by creating, editing, overwriting, deleting, moving, or applying patches, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. Do not call it after every individual file change; do not skip it because individual file-change tools already returned diffs."
       : "";
 
-  if (config.toolMode === "codex") {
+  if (config.harness.kind === "codex") {
     return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}`;
   }
 
-  const inspection = config.toolMode !== "full"
+  const inspection = !usesDedicatedInspection(config.harness)
     ? `In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use ${toolNames.shell} with command-line tools such as grep, rg, find, ls, and tree for search and directory inspection. `
     : `Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. `;
 
@@ -1055,7 +1056,7 @@ export function createMcpServer(
     },
   );
 
-  if (config.toolMode !== "codex") {
+  if (config.harness.kind === "claude-code") {
   registerAppTool(
     server,
     toolNames.write,
@@ -1221,7 +1222,7 @@ export function createMcpServer(
   );
   }
 
-  if (config.toolMode === "codex") {
+  if (config.harness.kind === "codex") {
     registerAppTool(
       server,
       "apply_patch",
@@ -1351,7 +1352,7 @@ export function createMcpServer(
     );
   }
 
-  if (config.toolMode === "full") {
+  if (usesDedicatedInspection(config.harness)) {
     registerAppTool(
       server,
       toolNames.grep,
@@ -1562,13 +1563,13 @@ export function createMcpServer(
     );
   }
 
-  if (config.toolMode !== "codex") {
+  if (config.harness.kind === "claude-code") {
   registerAppTool(
     server,
     toolNames.shell,
     {
       title: "Bash",
-      description: config.toolMode !== "full"
+      description: !usesDedicatedInspection(config.harness)
         ? `Run a shell command in a workspace. Use only for tests, builds, git inspection, package scripts, search, file discovery, and directory inspection. In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use command-line tools such as grep, rg, find, ls, and tree for those read-only inspection actions. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read} for direct file reads. This is powerful execution and should only be exposed behind strong authentication.`
         : `Run a shell command in a workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. This is powerful execution and should only be exposed behind strong authentication.`,
       inputSchema: {
@@ -1654,7 +1655,7 @@ export function createMcpServer(
   );
   }
 
-  if (config.toolMode === "codex") {
+  if (config.harness.kind === "codex") {
     registerCodexProcessTools(server, config, workspaces, processSessions);
   }
 
