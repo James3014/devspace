@@ -33,10 +33,6 @@ export function harnessFromLegacyToolMode(mode: LegacyToolMode): HarnessConfig {
   }
 }
 
-export function usesDedicatedInspection(harness: HarnessConfig): boolean {
-  return harness.kind === "claude-code" && harness.inspection === "dedicated";
-}
-
 export function compileHarness(
   harness: HarnessConfig,
   options: { skillsEnabled: boolean },
