@@ -8,6 +8,11 @@ import {
   type LoadSkillsResult,
 } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
+export type SkillsConfig = Pick<
+  ServerConfig,
+  "skillsEnabled" | "devspaceSkillsDir" | "agentDir" | "subagents" | "skillPaths"
+>;
+
 import { expandHomePath, isPathInsideRoot } from "./roots.js";
 
 export interface LoadedSkills {
@@ -32,7 +37,7 @@ function hasSubagentsSkill(skillDir: string): boolean {
   return existsSync(join(skillDir, SUBAGENTS_SKILL));
 }
 
-export function effectiveSkillPaths(config: ServerConfig, cwd: string): string[] {
+export function effectiveSkillPaths(config: SkillsConfig, cwd: string): string[] {
   const bundledSkills = bundledSkillsDir();
   const defaultPathCandidates = [
     join(homedir(), ".agents", "skills"),
@@ -61,7 +66,7 @@ function resolveSkillPath(path: string, cwd: string): string {
   return resolve(cwd, expandHomePath(path));
 }
 
-export function loadWorkspaceSkills(config: ServerConfig, cwd: string): LoadedSkills {
+export function loadWorkspaceSkills(config: SkillsConfig, cwd: string): LoadedSkills {
   if (!config.skillsEnabled) return { skills: [], diagnostics: [] };
 
   const result = loadSkills({

@@ -46,8 +46,10 @@ const openAIFileReferenceInputSchema = z.strictObject({
   size: z.number().int().nonnegative().nullable().optional(),
 });
 
+type ArtifactToolsConfig = Pick<ServerConfig, "artifactMaxFileBytes" | "logging">;
+
 export interface ArtifactToolRegistrationOptions {
-  config: ServerConfig;
+  config: ArtifactToolsConfig;
   workspaces: WorkspaceRegistry;
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
 }
@@ -298,7 +300,7 @@ export function artifactToolLogFields(
 }
 
 async function executeArtifactTool(
-  config: ServerConfig,
+  config: ArtifactToolsConfig,
   input: Record<string, unknown>,
   operation: () => Promise<{
     publicResult: { path: string };

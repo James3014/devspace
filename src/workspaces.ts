@@ -82,6 +82,18 @@ export interface OpenWorkspaceOptions {
   conversationScopeId?: string;
 }
 
+type WorkspaceRegistryConfig = Pick<
+  ServerConfig,
+  | "allowedRoots"
+  | "worktreeRoot"
+  | "agentDir"
+  | "skillsEnabled"
+  | "devspaceSkillsDir"
+  | "skillPaths"
+  | "subagents"
+  | "devspaceAgentsDir"
+>;
+
 type PathStats = Stats;
 type DirectoryOps = {
   stat: (path: string) => Promise<PathStats>;
@@ -93,7 +105,7 @@ export class WorkspaceRegistry {
   private readonly pendingCheckoutOpens = new Map<string, Promise<WorkspaceContext>>();
 
   constructor(
-    private readonly config: ServerConfig,
+    private readonly config: WorkspaceRegistryConfig,
     private readonly store?: WorkspaceStore,
   ) {}
 

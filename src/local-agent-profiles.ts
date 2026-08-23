@@ -3,6 +3,8 @@ import { readdir, readFile } from "node:fs/promises";
 import { basename, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { ServerConfig } from "./config.js";
+export type LocalAgentProfilesConfig = Pick<ServerConfig, "subagents" | "devspaceAgentsDir">;
+
 
 export type LocalAgentProvider = "codex" | "claude" | "opencode" | "pi" | "cursor" | "copilot" | "grok";
 
@@ -44,7 +46,7 @@ const FRONTMATTER_DELIMITER = "---";
 const PROVIDERS = new Set<LocalAgentProvider>(LOCAL_AGENT_PROVIDERS);
 
 export async function loadLocalAgentProfiles(
-  config: ServerConfig,
+  config: LocalAgentProfilesConfig,
   workspaceRoot: string,
   options: { includeDisabled?: boolean } = {},
 ): Promise<LocalAgentProfile[]> {

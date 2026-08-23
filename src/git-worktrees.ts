@@ -4,6 +4,8 @@ import { promisify } from "node:util";
 import { mkdir, realpath, rm, stat } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
 import type { ServerConfig } from "./config.js";
+export type WorktreeConfig = Pick<ServerConfig, "allowedRoots" | "worktreeRoot">;
+
 import { assertAllowedPath, isPathInsideRoot } from "./roots.js";
 
 const execFileAsync = promisify(execFile);
@@ -36,7 +38,7 @@ export interface ManagedWorktree {
 export async function createManagedWorktree(input: {
   sourcePath: string;
   baseRef?: string;
-  config: ServerConfig;
+  config: WorktreeConfig;
 }): Promise<ManagedWorktree> {
   const sourcePath = assertAllowedPath(input.sourcePath, input.config.allowedRoots);
 
