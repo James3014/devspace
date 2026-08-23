@@ -7,7 +7,7 @@ import test, { type TestContext } from "node:test";
 import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { loadConfig, type ServerConfig } from "./config.js";
+import { loadConfig, type ServerConfig, type ToolMode, type WidgetMode } from "./config.js";
 import type { LocalAgentProviderAvailability } from "./local-agent-availability.js";
 import { buildLocalAgentProviderStatuses } from "./local-agent-catalog.js";
 import type { SubagentsConfig } from "./local-agent-config.js";
@@ -18,6 +18,63 @@ import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 
 const execFileAsync = promisify(execFile);
+
+test("tool modes expose the expected host-facing tool surface", async (t) => {
+  const cases: Array<{
+    mode: ToolMode;
+    expected: string[];
+  }> = [
+    {
+      mode: "minimal",
+      expected: ["open_workspace", "read", "write", "edit", "bash"],
+    },
+    {
+      mode: "full",
+      expected: ["open_workspace", "read", "write", "edit", "bash", "grep", "glob", "ls"],
+    },
+    {
+      mode: "codex",
+      expected: ["open_workspace", "read", "apply_patch", "exec_command", "write_stdin"],
+    },
+  ];
+
+  for (const { mode, expected } of cases) {
+    await t.test(mode, async (nested) => {
+      const context = await fixture(nested, { toolMode: mode, widgets: "off" });
+      const tools = await context.client.listTools();
+
+      assert.deepEqual(
+        tools.tools.map((tool) => tool.name).sort(),
+        expected.sort(),
+      );
+    });
+  }
+});
+
+test("widget modes compose independently from tool modes", async (t) => {
+  const cases: Array<{
+    widgets: WidgetMode;
+    showChanges: boolean;
+    workspaceCard: boolean;
+  }> = [
+    { widgets: "off", showChanges: false, workspaceCard: false },
+    { widgets: "changes", showChanges: true, workspaceCard: true },
+    { widgets: "full", showChanges: false, workspaceCard: true },
+  ];
+
+  for (const { widgets, showChanges, workspaceCard } of cases) {
+    await t.test(widgets, async (nested) => {
+      const context = await fixture(nested, { toolMode: "full", widgets });
+      const tools = await context.client.listTools();
+      const workspace = tools.tools.find((tool) => tool.name === "open_workspace");
+      const changes = tools.tools.find((tool) => tool.name === "show_changes");
+      const workspaceMeta = workspace?._meta as { ui?: unknown } | undefined;
+
+      assert.equal(Boolean(changes), showChanges);
+      assert.equal(Boolean(workspaceMeta?.ui), workspaceCard);
+    });
+  }
+});
 
 test("open_workspace keeps lifecycle flags out of model output and preserves complete card metadata", async (t) => {
   const providerNote = "available";
@@ -247,6 +304,8 @@ async function fixture(
     git?: boolean;
     localAgentProviders?: LocalAgentProviderAvailability[] | (() => LocalAgentProviderAvailability[]);
     subagents?: SubagentsConfig;
+    toolMode?: ToolMode;
+    widgets?: WidgetMode;
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -284,8 +343,8 @@ async function fixture(
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_WORKTREE_ROOT: join(root, ".worktrees"),
     DEVSPACE_AGENT_DIR: agentDir,
-    DEVSPACE_WIDGETS: "full",
-    DEVSPACE_TOOL_MODE: "full",
+    DEVSPACE_WIDGETS: options.widgets ?? "full",
+    DEVSPACE_TOOL_MODE: options.toolMode ?? "full",
     DEVSPACE_SUBAGENTS: options.localAgentProviders ? "1" : "0",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
