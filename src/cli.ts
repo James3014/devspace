@@ -230,7 +230,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
       ownerToken: files.auth.ownerToken ?? generateOwnerToken(),
     };
 
-    writeDevspaceConfig(config);
+    writeDevspaceConfig(config, process.env, files.configDocument);
     writeDevspaceAuth(auth);
 
     const lines = [
@@ -372,7 +372,7 @@ function runConfigCommand(args: string[]): void {
   writeDevspaceConfig({
     ...files.config,
     publicBaseUrl: normalizeOptionalPublicBaseUrl(value),
-  });
+  }, process.env, files.configDocument);
   console.log(`Updated ${files.configPath}`);
 }
 
