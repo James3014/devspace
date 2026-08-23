@@ -105,6 +105,29 @@ test("legacy tool modes resolve to the intended coding harness tool contracts", 
   }
 });
 
+test("legacy widget modes resolve to the intended presentation contracts", async (t) => {
+  const full = await fixture(t, { widgetMode: "full" });
+  const fullTools = await full.client.listTools();
+  assert.equal(fullTools.tools.some((tool) => tool.name === "show_changes"), false);
+  assert.ok(toolUiMeta(fullTools.tools.find((tool) => tool.name === "open_workspace")));
+  assert.ok(toolUiMeta(fullTools.tools.find((tool) => tool.name === "read")));
+  await full.close();
+
+  const changes = await fixture(t, { widgetMode: "changes" });
+  const changeTools = await changes.client.listTools();
+  assert.ok(toolUiMeta(changeTools.tools.find((tool) => tool.name === "open_workspace")));
+  assert.equal(toolUiMeta(changeTools.tools.find((tool) => tool.name === "read")), undefined);
+  assert.ok(toolUiMeta(changeTools.tools.find((tool) => tool.name === "show_changes")));
+  await changes.close();
+
+  const off = await fixture(t, { widgetMode: "off" });
+  const offTools = await off.client.listTools();
+  assert.equal(offTools.tools.some((tool) => tool.name === "show_changes"), false);
+  assert.equal(toolUiMeta(offTools.tools.find((tool) => tool.name === "open_workspace")), undefined);
+  assert.equal(toolUiMeta(offTools.tools.find((tool) => tool.name === "read")), undefined);
+  await off.close();
+});
+
 test("open_workspace refreshes provider availability for each catalog", async (t) => {
   let available = false;
   const context = await fixture(t, {
@@ -273,6 +296,7 @@ async function fixture(
     localAgentProviders?: LocalAgentProviderAvailability[] | (() => LocalAgentProviderAvailability[]);
     subagents?: SubagentsConfig;
     toolMode?: "minimal" | "full" | "codex";
+    widgetMode?: "off" | "changes" | "full";
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -310,7 +334,7 @@ async function fixture(
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_WORKTREE_ROOT: join(root, ".worktrees"),
     DEVSPACE_AGENT_DIR: agentDir,
-    DEVSPACE_WIDGETS: "full",
+    DEVSPACE_WIDGETS: options.widgetMode ?? "full",
     DEVSPACE_TOOL_MODE: options.toolMode ?? "full",
     DEVSPACE_SUBAGENTS: options.localAgentProviders ? "1" : "0",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
@@ -368,6 +392,10 @@ async function fixture(
   });
 
   return { client, project, config, stateDir, close };
+}
+
+function toolUiMeta(tool: { _meta?: Record<string, unknown> } | undefined): unknown {
+  return tool?._meta?.ui;
 }
 
 async function git(cwd: string, args: string[]): Promise<void> {

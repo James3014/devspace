@@ -22,8 +22,13 @@ import {
   isArtifactDownloadSupportedPlatform,
   registerArtifactTools,
 } from "./artifact-tools.js";
-import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
+import { loadConfig, type ServerConfig } from "./config.js";
 import type { HarnessToolGroup } from "./harness.js";
+import type {
+  PresentationToolGroup,
+  PresentationToolKind,
+  WorkspacePresentationBehavior,
+} from "./presentation.js";
 import { compileRuntime, type RuntimeConfig } from "./runtime-config.js";
 import {
   createOpenAIIncomingArtifactAdapter,
@@ -117,16 +122,6 @@ interface DiffStats {
   removals: number;
 }
 
-type ToolWidgetKind =
-  | "workspace"
-  | "read"
-  | "write"
-  | "edit"
-  | "search"
-  | "directory"
-  | "shell"
-  | "show_changes";
-
 interface ToolDefinitionMeta extends Record<string, unknown> {
   ui: {
     resourceUri: string;
@@ -142,22 +137,11 @@ interface ToolWidgetDescriptorMeta {
   _meta: ToolDefinitionMeta | EmptyToolDefinitionMeta;
 }
 
-function shouldAttachWidget(mode: WidgetMode, kind: ToolWidgetKind): boolean {
-  switch (mode) {
-    case "off":
-      return false;
-    case "changes":
-      return kind === "workspace" || kind === "show_changes";
-    case "full":
-      return true;
-  }
-}
-
 function toolWidgetDescriptorMeta(
-  config: ServerConfig,
-  kind: ToolWidgetKind,
+  config: RuntimeConfig,
+  kind: PresentationToolKind,
 ): ToolWidgetDescriptorMeta {
-  if (!shouldAttachWidget(config.widgets, kind)) return { _meta: {} };
+  if (!config.runtimePresentation.widgetKinds.includes(kind)) return { _meta: {} };
 
   return {
     _meta: {
@@ -199,12 +183,7 @@ function serverInstructions(config: RuntimeConfig): string {
   const artifactInstruction = config.artifactCapability.status === "available"
     ? " When the user supplies or generates a file that is not present on the DevSpace host, use download_artifact with its native file value, the existing workspace ID, and a suitable relative destination path chosen from the user's request and project structure. The tool refuses to overwrite an existing destination and returns the normalized workspace-relative path. Use normal workspace tools when explicit inspection, replacement, movement, renaming, or deletion is needed. Do not recreate binary files with write/edit calls or place signed URLs, native file objects, base64 content, or invented host paths in shell commands or logs."
     : "";
-  const showChangesInstruction =
-    config.widgets === "changes"
-      ? " If the turn successfully modifies files by creating, editing, overwriting, deleting, moving, or applying patches, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. Do not call it after every individual file change; do not skip it because individual file-change tools already returned diffs."
-      : "";
-
-  return `${config.runtimeHarness.instructions}${artifactInstruction}${showChangesInstruction}`;
+  return `${config.runtimeHarness.instructions}${artifactInstruction}${config.runtimePresentation.instructions}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -550,7 +529,7 @@ function processToolResponse(
 
 function registerCodexProcessTools(
   server: McpServer,
-  config: ServerConfig,
+  config: RuntimeConfig,
   workspaces: WorkspaceRegistry,
   processSessions: ProcessSessionManager,
 ): void {
@@ -806,11 +785,14 @@ export function createMcpServer(
         { path, mode, baseRef },
         { conversationScopeId: openAiConversationScopeId(_meta) },
       );
-      if (config.widgets === "changes") {
-        await reviewCheckpoints.initializeWorkspace({
+      const presentationBehaviors: Record<WorkspacePresentationBehavior, () => Promise<void>> = {
+        "initialize-review": () => reviewCheckpoints.initializeWorkspace({
           workspaceId: workspace.id,
           root: workspace.root,
-        });
+        }),
+      };
+      for (const behavior of config.runtimePresentation.workspaceBehaviors) {
+        await presentationBehaviors[behavior]();
       }
       const cardSkills = workspace.skills
         .filter((skill) => !skill.disableModelInvocation)
@@ -1284,7 +1266,7 @@ export function createMcpServer(
     );
   };
 
-  if (config.widgets === "changes") {
+  const registerChangeReviewTool = () => {
     registerAppTool(
       server,
       "show_changes",
@@ -1337,7 +1319,7 @@ export function createMcpServer(
         };
       },
     );
-  }
+  };
 
   const registerDedicatedInspectionTools = () => {
     registerAppTool(
@@ -1649,6 +1631,13 @@ export function createMcpServer(
   };
   for (const group of config.runtimeHarness.toolGroups) {
     harnessRegistrations[group]();
+  }
+
+  const presentationRegistrations: Record<PresentationToolGroup, () => void> = {
+    "change-review": registerChangeReviewTool,
+  };
+  for (const group of config.runtimePresentation.toolGroups) {
+    presentationRegistrations[group]();
   }
 
   if (config.artifactCapability.status === "available") {
