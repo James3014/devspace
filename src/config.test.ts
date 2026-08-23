@@ -221,3 +221,69 @@ assert.deepEqual(fileConfig.allowedHosts, [
   "::1",
   "devspace.example.com",
 ]);
+
+const jsoncConfigDir = mkdtempSync(join(tmpdir(), "devspace-jsonc-load-config-test-"));
+writeFileSync(
+  join(jsoncConfigDir, "config.jsonc"),
+  `{
+    // Structured v1 configuration.
+    "version": 1,
+    "server": {
+      "port": 8989,
+      "allowedRoots": [${JSON.stringify(process.cwd())}],
+      "publicBaseUrl": "https://jsonc.devspace.example.com"
+    },
+    "harness": {
+      "kind": "codex"
+    },
+    "presentation": {
+      "mode": "change-review"
+    },
+    "skills": {
+      "enabled": false,
+      "paths": ["~/.custom-skills"]
+    },
+    "artifacts": {
+      "enabled": true,
+      "maxFileBytes": 456
+    },
+    "logging": {
+      "level": "debug",
+      "requests": false
+    },
+    "oauth": {
+      "accessTokenTtlSeconds": 120,
+      "scopes": ["devspace", "admin"]
+    }
+  }`,
+);
+writeFileSync(
+  join(jsoncConfigDir, "auth.json"),
+  JSON.stringify({ ownerToken: "jsonc-owner-token-long-enough" }),
+);
+
+const jsoncConfig = loadConfig({ DEVSPACE_CONFIG_DIR: jsoncConfigDir });
+assert.equal(jsoncConfig.port, 8989);
+assert.equal(jsoncConfig.publicBaseUrl, "https://jsonc.devspace.example.com");
+assert.deepEqual(jsoncConfig.harness, { kind: "codex" });
+assert.deepEqual(jsoncConfig.presentation, { mode: "change-review" });
+assert.equal(jsoncConfig.skillsEnabled, false);
+assert.deepEqual(jsoncConfig.skillPaths, ["~/.custom-skills"]);
+assert.equal(jsoncConfig.artifactsEnabled, true);
+assert.equal(jsoncConfig.artifactMaxFileBytes, 456);
+assert.equal(jsoncConfig.logging.level, "debug");
+assert.equal(jsoncConfig.logging.requests, false);
+assert.equal(jsoncConfig.oauth.accessTokenTtlSeconds, 120);
+assert.deepEqual(jsoncConfig.oauth.scopes, ["devspace", "admin"]);
+
+const envOverride = loadConfig({
+  DEVSPACE_CONFIG_DIR: jsoncConfigDir,
+  DEVSPACE_TOOL_MODE: "full",
+  DEVSPACE_WIDGETS: "off",
+  DEVSPACE_SKILLS: "1",
+  DEVSPACE_LOG_LEVEL: "warn",
+});
+assert.deepEqual(envOverride.harness, { kind: "claude-code", inspection: "dedicated" });
+assert.deepEqual(envOverride.presentation, { mode: "off" });
+assert.equal(envOverride.skillsEnabled, true);
+assert.equal(envOverride.logging.level, "warn");
