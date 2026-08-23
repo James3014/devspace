@@ -7,7 +7,7 @@ import test, { type TestContext } from "node:test";
 import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { loadConfig, type ServerConfig } from "./config.js";
+import { loadConfig, type ServerConfig, type ToolMode, type WidgetMode } from "./config.js";
 import type { LocalAgentProviderAvailability } from "./local-agent-availability.js";
 import { buildLocalAgentProviderStatuses } from "./local-agent-catalog.js";
 import type { SubagentsConfig } from "./local-agent-config.js";
@@ -18,6 +18,36 @@ import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 
 const execFileAsync = promisify(execFile);
+
+test("configured tool modes expose one coherent tool surface", async (t) => {
+  const expectedByMode: Record<ToolMode, string[]> = {
+    minimal: ["bash", "edit", "open_workspace", "read", "write"],
+    full: ["bash", "edit", "glob", "grep", "ls", "open_workspace", "read", "write"],
+    codex: ["apply_patch", "exec_command", "open_workspace", "read", "write_stdin"],
+  };
+
+  for (const mode of ["minimal", "full", "codex"] as const) {
+    const context = await fixture(t, { toolMode: mode, widgets: "off" });
+    const tools = await context.client.listTools();
+    assert.deepEqual(
+      tools.tools.map((tool) => tool.name).sort(),
+      expectedByMode[mode],
+    );
+    await context.close();
+  }
+});
+
+test("changes presentation adds only the aggregate review tool", async (t) => {
+  const full = await fixture(t, { toolMode: "minimal", widgets: "full" });
+  const changes = await fixture(t, { toolMode: "minimal", widgets: "changes" });
+  const off = await fixture(t, { toolMode: "minimal", widgets: "off" });
+
+  assert.equal((await full.client.listTools()).tools.some((tool) => tool.name === "show_changes"), false);
+  assert.equal((await off.client.listTools()).tools.some((tool) => tool.name === "show_changes"), false);
+  assert.equal((await changes.client.listTools()).tools.some((tool) => tool.name === "show_changes"), true);
+
+  await Promise.all([full.close(), changes.close(), off.close()]);
+});
 
 test("open_workspace keeps lifecycle flags out of model output and preserves complete card metadata", async (t) => {
   const providerNote = "available";
@@ -245,6 +275,8 @@ async function fixture(
   t: TestContext,
   options: {
     git?: boolean;
+    toolMode?: ToolMode;
+    widgets?: WidgetMode;
     localAgentProviders?: LocalAgentProviderAvailability[] | (() => LocalAgentProviderAvailability[]);
     subagents?: SubagentsConfig;
   } = {},
@@ -284,8 +316,8 @@ async function fixture(
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_WORKTREE_ROOT: join(root, ".worktrees"),
     DEVSPACE_AGENT_DIR: agentDir,
-    DEVSPACE_WIDGETS: "full",
-    DEVSPACE_TOOL_MODE: "full",
+    DEVSPACE_WIDGETS: options.widgets ?? "full",
+    DEVSPACE_TOOL_MODE: options.toolMode ?? "full",
     DEVSPACE_SUBAGENTS: options.localAgentProviders ? "1" : "0",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",

@@ -28,6 +28,10 @@ assert.equal(resolveSubagentsConfig(config, { DEVSPACE_SUBAGENTS: "0" }).enabled
 assert.equal(resolveSubagentsConfig({ ...config, enabled: false }, {
   DEVSPACE_SUBAGENTS: "1",
 }).enabled, true);
+assert.throws(
+  () => resolveSubagentsConfig(config, { DEVSPACE_SUBAGENTS: "maybe" }),
+  /Invalid DEVSPACE_SUBAGENTS: maybe/,
+);
 assert.equal(resolveSubagentsConfig(undefined, {}).providers.length, 0);
 assert.equal(resolveSubagentsConfig(true, {}).providers.length, 7);
 

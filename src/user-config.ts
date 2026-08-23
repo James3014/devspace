@@ -7,26 +7,30 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import * as z from "zod/v4";
 import { expandHomePath } from "./roots.js";
-import type { StoredSubagentsConfig } from "./local-agent-config.js";
+import { storedSubagentsConfigSchema } from "./local-agent-config.js";
 
-export interface DevspaceUserConfig {
-  host?: string;
-  port?: number;
-  allowedRoots?: string[];
-  publicBaseUrl?: string | null;
-  allowedHosts?: string[];
-  stateDir?: string;
-  worktreeRoot?: string;
-  artifactsEnabled?: boolean;
-  artifactMaxFileBytes?: number;
-  agentDir?: string;
-  subagents?: StoredSubagentsConfig;
-}
+const devspaceUserConfigSchema = z.object({
+  host: z.string().optional(),
+  port: z.number().optional(),
+  allowedRoots: z.array(z.string()).optional(),
+  publicBaseUrl: z.string().nullable().optional(),
+  allowedHosts: z.array(z.string()).optional(),
+  stateDir: z.string().optional(),
+  worktreeRoot: z.string().optional(),
+  artifactsEnabled: z.boolean().optional(),
+  artifactMaxFileBytes: z.number().optional(),
+  agentDir: z.string().optional(),
+  subagents: storedSubagentsConfigSchema.optional(),
+}).passthrough();
 
-export interface DevspaceAuthConfig {
-  ownerToken?: string;
-}
+const devspaceAuthConfigSchema = z.object({
+  ownerToken: z.string().optional(),
+}).passthrough();
+
+export type DevspaceUserConfig = z.infer<typeof devspaceUserConfigSchema>;
+export type DevspaceAuthConfig = z.infer<typeof devspaceAuthConfigSchema>;
 
 export interface DevspaceFiles {
   dir: string;
@@ -71,8 +75,8 @@ export function loadDevspaceFiles(env: NodeJS.ProcessEnv = process.env): Devspac
     authPath,
     configExists,
     authExists,
-    config: configExists ? readJsonFile<DevspaceUserConfig>(configPath) : {},
-    auth: authExists ? readJsonFile<DevspaceAuthConfig>(authPath) : {},
+    config: configExists ? readJsonFile(configPath, devspaceUserConfigSchema) : {},
+    auth: authExists ? readJsonFile(authPath, devspaceAuthConfigSchema) : {},
   };
 }
 
@@ -100,9 +104,9 @@ export function generateOwnerToken(): string {
   return randomBytes(32).toString("base64url");
 }
 
-function readJsonFile<T>(filePath: string): T {
+function readJsonFile<T>(filePath: string, schema: z.ZodType<T>): T {
   try {
-    return JSON.parse(readFileSync(filePath, "utf8")) as T;
+    return schema.parse(JSON.parse(readFileSync(filePath, "utf8")) as unknown);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
     throw new Error(`Unable to read ${filePath}: ${reason}`);

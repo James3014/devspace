@@ -1,6 +1,7 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
+import { parseEnvBoolean } from "./env-config.js";
 import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
 import { devspaceAgentsDir, devspaceSkillsDir, loadDevspaceFiles } from "./user-config.js";
@@ -81,17 +82,13 @@ function normalizeAllowedHosts(rawHosts: string[], derivedHosts: string[]): stri
   return Array.from(new Set(hosts.map((host) => host.trim()).filter(Boolean)));
 }
 
-function parseBoolean(value: string | undefined): boolean {
-  return ["1", "true", "yes", "on"].includes(value?.toLowerCase() ?? "");
-}
-
 function parseToolMode(env: NodeJS.ProcessEnv): ToolMode {
   const mode = env.DEVSPACE_TOOL_MODE;
   if (mode === "minimal" || mode === "full" || mode === "codex") return mode;
   if (mode) throw new Error(`Invalid DEVSPACE_TOOL_MODE: ${mode}`);
 
   if (env.DEVSPACE_MINIMAL_TOOLS !== undefined) {
-    return parseBoolean(env.DEVSPACE_MINIMAL_TOOLS) ? "minimal" : "full";
+    return parseEnvBoolean(env.DEVSPACE_MINIMAL_TOOLS, "DEVSPACE_MINIMAL_TOOLS") ? "minimal" : "full";
   }
   return "minimal";
 }
@@ -148,11 +145,21 @@ function parseLoggingConfig(env: NodeJS.ProcessEnv): LoggingConfig {
   return {
     level: parseLogLevel(env.DEVSPACE_LOG_LEVEL),
     format: parseLogFormat(env.DEVSPACE_LOG_FORMAT),
-    requests: env.DEVSPACE_LOG_REQUESTS === undefined ? true : parseBoolean(env.DEVSPACE_LOG_REQUESTS),
-    assets: parseBoolean(env.DEVSPACE_LOG_ASSETS),
-    toolCalls: env.DEVSPACE_LOG_TOOL_CALLS === undefined ? true : parseBoolean(env.DEVSPACE_LOG_TOOL_CALLS),
-    shellCommands: parseBoolean(env.DEVSPACE_LOG_SHELL_COMMANDS),
-    trustProxy: parseBoolean(env.DEVSPACE_TRUST_PROXY),
+    requests: env.DEVSPACE_LOG_REQUESTS === undefined
+      ? true
+      : parseEnvBoolean(env.DEVSPACE_LOG_REQUESTS, "DEVSPACE_LOG_REQUESTS"),
+    assets: env.DEVSPACE_LOG_ASSETS === undefined
+      ? false
+      : parseEnvBoolean(env.DEVSPACE_LOG_ASSETS, "DEVSPACE_LOG_ASSETS"),
+    toolCalls: env.DEVSPACE_LOG_TOOL_CALLS === undefined
+      ? true
+      : parseEnvBoolean(env.DEVSPACE_LOG_TOOL_CALLS, "DEVSPACE_LOG_TOOL_CALLS"),
+    shellCommands: env.DEVSPACE_LOG_SHELL_COMMANDS === undefined
+      ? false
+      : parseEnvBoolean(env.DEVSPACE_LOG_SHELL_COMMANDS, "DEVSPACE_LOG_SHELL_COMMANDS"),
+    trustProxy: env.DEVSPACE_TRUST_PROXY === undefined
+      ? false
+      : parseEnvBoolean(env.DEVSPACE_TRUST_PROXY, "DEVSPACE_TRUST_PROXY"),
   };
 }
 
@@ -238,13 +245,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     artifactsEnabled:
       env.DEVSPACE_ARTIFACTS === undefined
         ? files.config.artifactsEnabled === true
-        : parseBoolean(env.DEVSPACE_ARTIFACTS),
+        : parseEnvBoolean(env.DEVSPACE_ARTIFACTS, "DEVSPACE_ARTIFACTS"),
     artifactMaxFileBytes: parsePositiveInteger(
       env.DEVSPACE_ARTIFACT_MAX_FILE_BYTES ?? numberConfigValue(files.config.artifactMaxFileBytes),
       DEFAULT_ARTIFACT_MAX_FILE_BYTES,
       "DEVSPACE_ARTIFACT_MAX_FILE_BYTES",
     ),
-    skillsEnabled: env.DEVSPACE_SKILLS === undefined ? true : parseBoolean(env.DEVSPACE_SKILLS),
+    skillsEnabled: env.DEVSPACE_SKILLS === undefined
+      ? true
+      : parseEnvBoolean(env.DEVSPACE_SKILLS, "DEVSPACE_SKILLS"),
     skillPaths: parsePathList(env.DEVSPACE_SKILL_PATHS),
     devspaceSkillsDir: devspaceSkillsDir(env),
     devspaceAgentsDir: devspaceAgentsDir(env),

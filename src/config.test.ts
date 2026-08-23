@@ -3,6 +3,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
+import { loadDevspaceFiles } from "./user-config.js";
 
 const emptyConfigDir = mkdtempSync(join(tmpdir(), "devspace-empty-config-test-"));
 const baseEnv = {
@@ -54,6 +55,17 @@ assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "invalid" }),
   /Invalid DEVSPACE_TOOL_MODE: invalid/,
 );
+for (const [name, value] of [
+  ["DEVSPACE_ARTIFACTS", "treu"],
+  ["DEVSPACE_SKILLS", "maybe"],
+  ["DEVSPACE_MINIMAL_TOOLS", "sometimes"],
+  ["DEVSPACE_LOG_REQUESTS", "enabled"],
+] as const) {
+  assert.throws(
+    () => loadConfig({ ...baseEnv, [name]: value }),
+    new RegExp(`Invalid ${name}: ${value}`),
+  );
+}
 
 assert.deepEqual(loadConfig(baseEnv).logging, {
   level: "info",
@@ -186,3 +198,21 @@ assert.deepEqual(fileConfig.allowedHosts, [
   "::1",
   "devspace.example.com",
 ]);
+
+const passthroughConfigDir = mkdtempSync(join(tmpdir(), "devspace-config-passthrough-test-"));
+writeFileSync(
+  join(passthroughConfigDir, "config.json"),
+  JSON.stringify({ host: "127.0.0.1", futureSetting: { enabled: true } }),
+);
+assert.deepEqual(
+  (loadDevspaceFiles({ DEVSPACE_CONFIG_DIR: passthroughConfigDir }).config as Record<string, unknown>)
+    .futureSetting,
+  { enabled: true },
+);
+
+const invalidConfigDir = mkdtempSync(join(tmpdir(), "devspace-invalid-config-test-"));
+writeFileSync(join(invalidConfigDir, "config.json"), JSON.stringify({ port: "8787" }));
+assert.throws(
+  () => loadDevspaceFiles({ DEVSPACE_CONFIG_DIR: invalidConfigDir }),
+  /Unable to read .*config\.json:[\s\S]*port/i,
+);

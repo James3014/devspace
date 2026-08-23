@@ -1,4 +1,5 @@
 import * as z from "zod/v4";
+import { parseEnvBoolean } from "./env-config.js";
 import {
   LOCAL_AGENT_PROVIDERS,
   type LocalAgentProvider,
@@ -30,7 +31,8 @@ const subagentsSchema = z.object({
 
 export type SubagentProviderConfig = z.infer<typeof providerSchema>;
 export type SubagentsConfig = z.infer<typeof subagentsSchema>;
-export type StoredSubagentsConfig = boolean | SubagentsConfig;
+export const storedSubagentsConfigSchema = z.union([z.boolean(), subagentsSchema]);
+export type StoredSubagentsConfig = z.infer<typeof storedSubagentsConfigSchema>;
 
 export function resolveSubagentsConfig(
   value: unknown,
@@ -45,7 +47,7 @@ export function resolveSubagentsConfig(
     ...stored,
     enabled: env.DEVSPACE_SUBAGENTS === undefined
       ? stored.enabled
-      : parseBoolean(env.DEVSPACE_SUBAGENTS),
+      : parseEnvBoolean(env.DEVSPACE_SUBAGENTS, "DEVSPACE_SUBAGENTS"),
   };
 }
 
@@ -70,8 +72,4 @@ function legacySubagentsConfig(enabled: boolean): SubagentsConfig {
       ? LOCAL_AGENT_PROVIDERS.map((id) => ({ id, enabled: true }))
       : [],
   };
-}
-
-function parseBoolean(value: string): boolean {
-  return ["1", "true", "yes", "on"].includes(value.toLowerCase());
 }
