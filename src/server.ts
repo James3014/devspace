@@ -23,7 +23,8 @@ import {
   registerArtifactTools,
 } from "./artifact-tools.js";
 import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
-import { usesDedicatedInspection } from "./harness.js";
+import type { HarnessToolGroup } from "./harness.js";
+import { compileRuntime, type RuntimeConfig } from "./runtime-config.js";
 import {
   createOpenAIIncomingArtifactAdapter,
   type IncomingArtifactAdapter,
@@ -194,8 +195,8 @@ interface ToolLogFields {
   error?: string;
 }
 
-function serverInstructions(config: ServerConfig): string {
-  const artifactInstruction = config.artifactsEnabled && isArtifactDownloadSupportedPlatform()
+function serverInstructions(config: RuntimeConfig): string {
+  const artifactInstruction = config.artifactCapability.status === "available"
     ? " When the user supplies or generates a file that is not present on the DevSpace host, use download_artifact with its native file value, the existing workspace ID, and a suitable relative destination path chosen from the user's request and project structure. The tool refuses to overwrite an existing destination and returns the normalized workspace-relative path. Use normal workspace tools when explicit inspection, replacement, movement, renaming, or deletion is needed. Do not recreate binary files with write/edit calls or place signed URLs, native file objects, base64 content, or invented host paths in shell commands or logs."
     : "";
   const showChangesInstruction =
@@ -203,21 +204,7 @@ function serverInstructions(config: ServerConfig): string {
       ? " If the turn successfully modifies files by creating, editing, overwriting, deleting, moving, or applying patches, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. Do not call it after every individual file change; do not skip it because individual file-change tools already returned diffs."
       : "";
 
-  if (config.harness.kind === "codex") {
-    return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}`;
-  }
-
-  const inspection = !usesDedicatedInspection(config.harness)
-    ? `In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use ${toolNames.shell} with command-line tools such as grep, rg, find, ls, and tree for search and directory inspection. `
-    : `Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. `;
-
-  const skills = config.skillsEnabled
-    ? `When ${toolNames.openWorkspace} returns available skills and a task matches a skill, use ${toolNames.read} to read that skill's path before proceeding. Skill paths may be outside the workspace, but ${toolNames.read} only permits advertised SKILL.md files and files under already-loaded skill directories. `
-    : "";
-
-  const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
-
-  return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}`;
+  return `${config.runtimeHarness.instructions}${artifactInstruction}${showChangesInstruction}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -706,7 +693,7 @@ function registerCodexProcessTools(
 }
 
 export function createMcpServer(
-  config: ServerConfig,
+  config: RuntimeConfig,
   workspaces: WorkspaceRegistry,
   reviewCheckpoints: ReturnType<typeof createReviewCheckpointManager>,
   processSessions: ProcessSessionManager,
@@ -1056,7 +1043,7 @@ export function createMcpServer(
     },
   );
 
-  if (config.harness.kind === "claude-code") {
+  const registerWriteEditTools = () => {
   registerAppTool(
     server,
     toolNames.write,
@@ -1220,9 +1207,9 @@ export function createMcpServer(
       };
     },
   );
-  }
+  };
 
-  if (config.harness.kind === "codex") {
+  const registerApplyPatchTool = () => {
     registerAppTool(
       server,
       "apply_patch",
@@ -1295,7 +1282,7 @@ export function createMcpServer(
         };
       },
     );
-  }
+  };
 
   if (config.widgets === "changes") {
     registerAppTool(
@@ -1352,7 +1339,7 @@ export function createMcpServer(
     );
   }
 
-  if (usesDedicatedInspection(config.harness)) {
+  const registerDedicatedInspectionTools = () => {
     registerAppTool(
       server,
       toolNames.grep,
@@ -1561,17 +1548,15 @@ export function createMcpServer(
         };
       },
     );
-  }
+  };
 
-  if (config.harness.kind === "claude-code") {
+  const registerBashTool = () => {
   registerAppTool(
     server,
     toolNames.shell,
     {
       title: "Bash",
-      description: !usesDedicatedInspection(config.harness)
-        ? `Run a shell command in a workspace. Use only for tests, builds, git inspection, package scripts, search, file discovery, and directory inspection. In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use command-line tools such as grep, rg, find, ls, and tree for those read-only inspection actions. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read} for direct file reads. This is powerful execution and should only be exposed behind strong authentication.`
-        : `Run a shell command in a workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. This is powerful execution and should only be exposed behind strong authentication.`,
+      description: config.runtimeHarness.bashDescription ?? "Run a shell command in a workspace.",
       inputSchema: {
         workspaceId: z
           .string()
@@ -1653,13 +1638,20 @@ export function createMcpServer(
       };
     },
   );
+  };
+
+  const harnessRegistrations: Record<HarnessToolGroup, () => void> = {
+    "write-edit": registerWriteEditTools,
+    "dedicated-inspection": registerDedicatedInspectionTools,
+    bash: registerBashTool,
+    "apply-patch": registerApplyPatchTool,
+    "process-session": () => registerCodexProcessTools(server, config, workspaces, processSessions),
+  };
+  for (const group of config.runtimeHarness.toolGroups) {
+    harnessRegistrations[group]();
   }
 
-  if (config.harness.kind === "codex") {
-    registerCodexProcessTools(server, config, workspaces, processSessions);
-  }
-
-  if (config.artifactsEnabled && isArtifactDownloadSupportedPlatform()) {
+  if (config.artifactCapability.status === "available") {
     registerArtifactTools(server, {
       config,
       workspaces,
@@ -1678,6 +1670,9 @@ export function createServer(
   config = loadConfig(),
   options: CreateServerOptions = {},
 ): RunningServer {
+  const runtime = compileRuntime(config, {
+    artifactDownloadSupported: isArtifactDownloadSupportedPlatform(),
+  });
   const incomingArtifactAdapters = options.incomingArtifactAdapters
     ?? [createOpenAIIncomingArtifactAdapter()];
   const allowedHosts = config.allowedHosts.includes("*")
@@ -1863,7 +1858,7 @@ export function createServer(
         };
 
         const server = createMcpServer(
-          config,
+          runtime,
           workspaces,
           reviewCheckpoints,
           processSessions,
