@@ -254,3 +254,9 @@ npm test
 npm run build
 npm run start
 ```
+
+`npm run test:host:claude` is an explicit, paid acceptance test for the real
+Claude Code → OAuth → MCP → DevSpace path. It requires an authenticated Claude
+Code installation, starts the production server with isolated temporary state,
+exposes only `open_workspace` and `read`, limits model spend to $0.25, and cleans
+up its server and files. It is intentionally excluded from `npm test` and CI.
