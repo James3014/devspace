@@ -15,6 +15,7 @@ const requiredPackageFiles = [
   "dist/local-agent-daemon-main.js",
   "dist/db/migrations.js",
   "dist/ui/workspace-app.html",
+  "scripts/test-claude-host.mjs",
   "scripts/fix-node-pty-permissions.mjs",
   "skills/subagents/SKILL.md",
 ];
