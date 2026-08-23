@@ -10,8 +10,12 @@ import {
   type HarnessConfig,
   type LegacyToolMode,
 } from "./harness.js";
+import {
+  presentationFromLegacyWidgetMode,
+  type LegacyWidgetMode,
+  type PresentationConfig,
+} from "./presentation.js";
 
-export type WidgetMode = "off" | "changes" | "full";
 const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_ARTIFACT_MAX_FILE_BYTES = 100 * 1024 * 1024;
@@ -24,7 +28,7 @@ export interface ServerConfig {
   allowedHosts: string[];
   publicBaseUrl: string;
   harness: HarnessConfig;
-  widgets: WidgetMode;
+  presentation: PresentationConfig;
   stateDir: string;
   worktreeRoot: string;
   artifactsEnabled: boolean;
@@ -169,7 +173,7 @@ function parseLoggingConfig(env: NodeJS.ProcessEnv): LoggingConfig {
   };
 }
 
-function parseWidgetMode(value: string | undefined): WidgetMode {
+function parseLegacyWidgetMode(value: string | undefined): LegacyWidgetMode {
   if (!value || value === "full") return "full";
   if (value === "off" || value === "changes") return value;
 
@@ -245,7 +249,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     allowedHosts: parseAllowedHosts(env.DEVSPACE_ALLOWED_HOSTS, derivedAllowedHosts),
     publicBaseUrl,
     harness: harnessFromLegacyToolMode(parseLegacyToolMode(env)),
-    widgets: parseWidgetMode(env.DEVSPACE_WIDGETS),
+    presentation: presentationFromLegacyWidgetMode(parseLegacyWidgetMode(env.DEVSPACE_WIDGETS)),
     stateDir: resolve(expandHomePath(env.DEVSPACE_STATE_DIR ?? files.config.stateDir ?? defaultStateDir())),
     worktreeRoot: resolve(expandHomePath(env.DEVSPACE_WORKTREE_ROOT ?? files.config.worktreeRoot ?? defaultWorktreeRoot())),
     artifactsEnabled:

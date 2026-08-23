@@ -11,10 +11,16 @@ const baseEnv = {
   DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
 };
 
-assert.equal(loadConfig(baseEnv).widgets, "full");
-assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "changes" }).widgets, "changes");
-assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "full" }).widgets, "full");
-assert.equal(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "off" }).widgets, "off");
+assert.deepEqual(loadConfig(baseEnv).presentation, { mode: "inline" });
+assert.deepEqual(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "changes" }).presentation, {
+  mode: "change-review",
+});
+assert.deepEqual(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "full" }).presentation, {
+  mode: "inline",
+});
+assert.deepEqual(loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "off" }).presentation, {
+  mode: "off",
+});
 assert.deepEqual(loadConfig(baseEnv).harness, {
   kind: "claude-code",
   inspection: "shell",

@@ -1,5 +1,6 @@
 import type { ServerConfig } from "./config.js";
 import { compileHarness, type CompiledHarness } from "./harness.js";
+import { compilePresentation, type CompiledPresentation } from "./presentation.js";
 
 export type ArtifactCapability =
   | {
@@ -13,6 +14,7 @@ export type ArtifactCapability =
 
 export interface RuntimeConfig extends ServerConfig {
   runtimeHarness: CompiledHarness;
+  runtimePresentation: CompiledPresentation;
   artifactCapability: ArtifactCapability;
 }
 
@@ -23,6 +25,7 @@ export function compileRuntime(
   return {
     ...config,
     runtimeHarness: compileHarness(config.harness, { skillsEnabled: config.skillsEnabled }),
+    runtimePresentation: compilePresentation(config.presentation),
     artifactCapability: !config.artifactsEnabled
       ? { status: "unavailable", reason: "disabled" }
       : environment.artifactDownloadSupported
