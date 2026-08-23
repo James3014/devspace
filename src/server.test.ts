@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
-import { chmodSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test, { type TestContext } from "node:test";
+import test, { after, type TestContext } from "node:test";
 import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { loadConfig, type ServerConfig } from "./config.js";
+import { MINIMUM_CODEX_RUNTIME_VERSION } from "./codex-runtime.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { createMcpServer } from "./server.js";
@@ -16,6 +17,29 @@ import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 
 const execFileAsync = promisify(execFile);
+
+// Hermetic Codex runtime so dispatch gates see a valid, inspectable runtime
+// and spawned workers fail fast locally instead of invoking a real provider.
+const originalDependencyRoot = process.env.DEVSPACE_DEPENDENCY_ROOT;
+const codexRuntimeRoot = mkdtempSync(join(tmpdir(), "devspace-server-codex-runtime-"));
+mkdirSync(join(codexRuntimeRoot, "node_modules", "@openai", "codex-sdk"), { recursive: true });
+mkdirSync(join(codexRuntimeRoot, "node_modules", "@openai", "codex", "bin"), { recursive: true });
+writeFileSync(
+  join(codexRuntimeRoot, "node_modules", "@openai", "codex-sdk", "package.json"),
+  JSON.stringify({ name: "@openai/codex-sdk", version: MINIMUM_CODEX_RUNTIME_VERSION }),
+);
+writeFileSync(
+  join(codexRuntimeRoot, "node_modules", "@openai", "codex", "bin", "codex.js"),
+  `#!/bin/sh\necho 'codex-cli ${MINIMUM_CODEX_RUNTIME_VERSION}'\n`,
+  { mode: 0o755 },
+);
+process.env.DEVSPACE_DEPENDENCY_ROOT = codexRuntimeRoot;
+
+after(async () => {
+  if (originalDependencyRoot === undefined) delete process.env.DEVSPACE_DEPENDENCY_ROOT;
+  else process.env.DEVSPACE_DEPENDENCY_ROOT = originalDependencyRoot;
+  await rm(codexRuntimeRoot, { recursive: true, force: true });
+});
 
 test("open_workspace keeps lifecycle flags out of model output and preserves complete card metadata", async (t) => {
   const context = await fixture(t);

@@ -14,6 +14,7 @@ import {
   type LocalAgentRunResult,
 } from "./local-agent-runtime.js";
 import { runOmpAcpLocalAgent } from "./local-agent-omp.js";
+import { inspectCodexRuntime } from "./codex-runtime.js";
 
 export interface LocalAgentAdapter {
   readonly provider: LocalAgentProvider;
@@ -30,6 +31,16 @@ const AGY_AGENT_TIMEOUT_MS = 610_000;
 const OPENCODE_AGENT_TIMEOUT_MS = 900_000;
 const OPENCODE_STATUS_POLL_MS = 250;
 const OPENCODE_SERVER_START_ATTEMPTS = 4;
+
+function inputEnvironment(input: LocalAgentRunInput): NodeJS.ProcessEnv {
+  return input.environment ?? process.env;
+}
+
+function definedEnvironment(env: NodeJS.ProcessEnv): Record<string, string> {
+  return Object.fromEntries(
+    Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === "string"),
+  );
+}
 
 export async function runLocalAgentProvider(
   provider: LocalAgentProvider,
@@ -70,7 +81,15 @@ class CodexLocalAgentAdapter implements LocalAgentAdapter {
   readonly provider = "codex" as const;
 
   async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
-    const runtime = await createCodexSdkLocalAgentRuntime();
+    const environment = definedEnvironment(inputEnvironment(input));
+    const identity = inspectCodexRuntime({ env: environment });
+    if (!identity.ready || !identity.executable) {
+      throw new Error(`Codex runtime is not ready: ${identity.reason ?? "runtime inspection failed"}`);
+    }
+    const runtime = await createCodexSdkLocalAgentRuntime({
+      codexPathOverride: identity.executable,
+      env: environment,
+    });
     return runtime.run(input);
   }
 }
@@ -80,7 +99,8 @@ class ClaudeLocalAgentAdapter implements LocalAgentAdapter {
 
   async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
     const { query } = await import("@anthropic-ai/claude-agent-sdk");
-    const claudeExecutable = process.env.CLAUDE_COMMAND ?? resolveExecutable("claude");
+    const environment = inputEnvironment(input);
+    const claudeExecutable = environment.CLAUDE_COMMAND ?? resolveExecutable("claude", environment);
     const messages = query({
       prompt: input.prompt,
       options: {
@@ -90,7 +110,7 @@ class ClaudeLocalAgentAdapter implements LocalAgentAdapter {
         resume: input.providerSessionId,
         permissionMode: "bypassPermissions",
         allowDangerouslySkipPermissions: true,
-        env: claudeCommandEnvironment(process.env),
+        env: claudeCommandEnvironment(environment),
         ...(claudeExecutable ? { pathToClaudeCodeExecutable: claudeExecutable } : {}),
       },
     });
@@ -208,7 +228,8 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
   readonly provider = "agy" as const;
 
   async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
-    const agyExecutable = resolveAgyExecutable(process.env);
+    const environment = inputEnvironment(input);
+    const agyExecutable = resolveAgyExecutable(environment);
     if (!agyExecutable) {
       throw new Error("Agy executable not found.");
     }
@@ -247,7 +268,7 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
 
     const child = spawn(agyExecutable, args, {
       cwd: input.workspace,
-      env: agyCommandEnvironment(process.env),
+      env: agyCommandEnvironment(environment),
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -270,11 +291,11 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
       });
     });
 
-    const timeoutMs = process.env.DEVSPACE_AGY_TIMEOUT_MS
-      ? parseInt(process.env.DEVSPACE_AGY_TIMEOUT_MS, 10)
+    const timeoutMs = environment.DEVSPACE_AGY_TIMEOUT_MS
+      ? parseInt(environment.DEVSPACE_AGY_TIMEOUT_MS, 10)
       : AGY_AGENT_TIMEOUT_MS;
-    const graceMs = process.env.DEVSPACE_AGY_GRACE_MS
-      ? parseInt(process.env.DEVSPACE_AGY_GRACE_MS, 10)
+    const graceMs = environment.DEVSPACE_AGY_GRACE_MS
+      ? parseInt(environment.DEVSPACE_AGY_GRACE_MS, 10)
       : 3_000;
 
     let timeoutId: NodeJS.Timeout | undefined;
@@ -380,11 +401,12 @@ function directString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
-function resolveExecutable(command: string): string | undefined {
+function resolveExecutable(command: string, environment: NodeJS.ProcessEnv = process.env): string | undefined {
   const result = spawnSync(process.platform === "win32" ? "where.exe" : "command", [
     ...(process.platform === "win32" ? [command] : ["-v", command]),
   ], {
     encoding: "utf8",
+    env: environment,
     shell: process.platform !== "win32",
   });
   const executable = result.stdout?.split(/\r?\n/).find((line) => line.trim());
@@ -408,7 +430,8 @@ class OpencodeLocalAgentAdapter implements LocalAgentAdapter {
   readonly provider = "opencode" as const;
 
   async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
-    const runtime = await createIsolatedOpencodeRuntime();
+    const environment = inputEnvironment(input);
+    const runtime = await createIsolatedOpencodeRuntime(environment);
     const { client, server } = runtime;
     let sessionId = input.providerSessionId;
     let promptResult: unknown;
@@ -416,7 +439,7 @@ class OpencodeLocalAgentAdapter implements LocalAgentAdapter {
     try {
       sessionId ??= await createOpencodeSession(client, input);
       promptResult = await promptOpencodeSessionAsync(client, sessionId, input);
-      await waitForOpencodeTurn(client, sessionId, input.workspace, opencodeAgentTimeoutMs(process.env));
+      await waitForOpencodeTurn(client, sessionId, input.workspace, opencodeAgentTimeoutMs(environment));
       messages = await readOpencodeMessages(client, sessionId, input.workspace);
       const finalResponse = requireFinalResponse(
         "OpenCode",
@@ -461,7 +484,7 @@ class AcpLocalAgentAdapter implements LocalAgentAdapter {
     const [command, ...args] = this.command;
     const child = spawn(command, args, {
       cwd: input.workspace,
-      env: process.env,
+      env: inputEnvironment(input),
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -627,9 +650,10 @@ class PiRpcLocalAgentAdapter implements LocalAgentAdapter {
     if (input.model) args.push("--model", input.model);
     if (input.thinking) args.push("--thinking", input.thinking);
     if (input.providerSessionId) args.push("--session", input.providerSessionId);
-    const child = spawn(process.env.PI_COMMAND ?? "pi", args, {
+    const environment = inputEnvironment(input);
+    const child = spawn(environment.PI_COMMAND ?? "pi", args, {
       cwd: input.workspace,
-      env: piCommandEnvironment(process.env),
+      env: piCommandEnvironment(environment),
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     });
@@ -780,23 +804,94 @@ class JsonLineRpc {
   }
 }
 
-async function createIsolatedOpencodeRuntime(): Promise<{
+async function createIsolatedOpencodeRuntime(environment: NodeJS.ProcessEnv): Promise<{
   client: unknown;
   server: { close(): void };
 }> {
-  const { createOpencode } = await import("@opencode-ai/sdk/v2");
+  const { createOpencodeClient } = await import("@opencode-ai/sdk/v2/client");
   let lastError: unknown;
   for (let attempt = 0; attempt < OPENCODE_SERVER_START_ATTEMPTS; attempt += 1) {
     const port = await findFreeTcpPort();
+    const child = spawn(environment.OPENCODE_COMMAND ?? "opencode", [
+      "serve",
+      "--hostname=127.0.0.1",
+      `--port=${port}`,
+    ], {
+      env: {
+        ...environment,
+        OPENCODE_CONFIG_CONTENT: environment.OPENCODE_CONFIG_CONTENT ?? "{}",
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+    child.stdin.end();
     try {
-      return await createOpencode({ hostname: "127.0.0.1", port });
+      const url = await waitForOpencodeServer(child, port);
+      return {
+        client: createOpencodeClient({ baseUrl: url }),
+        server: {
+          close() {
+            try {
+              child.kill("SIGTERM");
+            } catch {
+              // best-effort parity with the SDK server close operation
+            }
+          },
+        },
+      };
     } catch (error) {
       lastError = error;
+      try {
+        child.kill("SIGTERM");
+      } catch {
+        // best-effort between bounded port attempts
+      }
     }
   }
   throw new Error(
     `OpenCode server failed to start on an isolated port after ${OPENCODE_SERVER_START_ATTEMPTS} attempts: ${errorMessage(lastError)}`,
   );
+}
+
+async function waitForOpencodeServer(
+  child: ChildProcessWithoutNullStreams,
+  port: number,
+): Promise<string> {
+  return new Promise((resolveServer, reject) => {
+    let output = "";
+    let settled = false;
+    const finish = (error?: Error, url?: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      child.removeListener("error", onError);
+      child.removeListener("exit", onExit);
+      child.stdout.removeListener("data", inspect);
+      child.stderr.removeListener("data", inspect);
+      if (error) reject(error);
+      else resolveServer(url ?? `http://127.0.0.1:${port}`);
+    };
+    const inspect = (chunk: Buffer | string) => {
+      output += chunk.toString();
+      const match = /opencode server listening[^\n]*on\s+(https?:\/\/[^\s]+)/.exec(output);
+      if (match) finish(undefined, match[1]);
+    };
+    const onError = (error: Error) => finish(error);
+    const onExit = (code: number | null, signal: NodeJS.Signals | null) => {
+      finish(new Error(
+        `OpenCode server exited before readiness with ${signal ? `signal ${signal}` : `code ${code ?? 1}`}${
+          output.trim() ? `: ${output.trim()}` : ""
+        }`,
+      ));
+    };
+    const timeout = setTimeout(() => {
+      finish(new Error(`Timeout waiting for OpenCode server on port ${port}.`));
+    }, 5_000);
+    child.stdout.on("data", inspect);
+    child.stderr.on("data", inspect);
+    child.once("error", onError);
+    child.once("exit", onExit);
+  });
 }
 
 async function findFreeTcpPort(): Promise<number> {
@@ -864,7 +959,7 @@ async function promptOpencodeSessionAsync(
   }
   return promiseWithTimeout(
     session.prompt(promptInput, { throwOnError: true }),
-    opencodeAgentTimeoutMs(process.env),
+    opencodeAgentTimeoutMs(inputEnvironment(input)),
     "OpenCode prompt",
   );
 }

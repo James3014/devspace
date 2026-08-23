@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 import { LocalAgentSessionManager, AgentSessionError } from "./local-agent-sessions.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
 import type { ScopeBaseline } from "./local-agent-contract.js";
@@ -18,6 +18,38 @@ import {
   workerChangedPathsSinceBaseline,
 } from "./workspace-reconciliation.js";
 import type { WorkspacePhysicalState } from "./workspace-reconciliation.js";
+
+const originalDependencyRoot = process.env.DEVSPACE_DEPENDENCY_ROOT;
+const codexRuntimeRoot = mkdtempSync(join(tmpdir(), "devspace-contract-codex-runtime-"));
+const codexSdkPackagePath = join(
+  codexRuntimeRoot,
+  "node_modules",
+  "@openai",
+  "codex-sdk",
+  "package.json",
+);
+const codexExecutable = join(
+  codexRuntimeRoot,
+  "node_modules",
+  "@openai",
+  "codex",
+  "bin",
+  "codex.js",
+);
+mkdirSync(join(codexRuntimeRoot, "node_modules", "@openai", "codex-sdk"), { recursive: true });
+mkdirSync(join(codexRuntimeRoot, "node_modules", "@openai", "codex", "bin"), { recursive: true });
+writeFileSync(
+  codexSdkPackagePath,
+  JSON.stringify({ name: "@openai/codex-sdk", version: "0.149.0" }),
+);
+writeFileSync(codexExecutable, "#!/bin/sh\necho 'codex-cli 0.149.0'\n", { mode: 0o755 });
+process.env.DEVSPACE_DEPENDENCY_ROOT = codexRuntimeRoot;
+
+after(() => {
+  if (originalDependencyRoot === undefined) delete process.env.DEVSPACE_DEPENDENCY_ROOT;
+  else process.env.DEVSPACE_DEPENDENCY_ROOT = originalDependencyRoot;
+  rmSync(codexRuntimeRoot, { recursive: true, force: true });
+});
 
 function runGitRaw(args: string[], cwd: string): string {
   return execFileSync("git", args, {
@@ -181,6 +213,35 @@ test("AC-1 preflight dispatchState is UNKNOWN when auth/readiness are unresolved
     assert.ok(output.unknowns.some((entry) => entry.startsWith("authReady")));
     assert.ok(output.unknowns.some((entry) => entry.startsWith("providerReachable")));
   } finally {
+    f.clean();
+    clean();
+  }
+});
+
+test("AC-1 Codex preflight fails closed when the configured executable is invalid", async () => {
+  const f = setupGitFixture();
+  const { manager, clean } = setupManager();
+  const originalExecutable = process.env.DEVSPACE_CODEX_EXECUTABLE;
+  try {
+    process.env.DEVSPACE_CODEX_EXECUTABLE = join(f.root, "missing-codex");
+    const output = await manager.preflightAgent({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      isolated: true,
+      profileName: "reviewer",
+      profiles: mockProfiles,
+    });
+    assert.equal(output.readiness.runtimeReady, false);
+    assert.equal(output.readiness.dispatchState, "BLOCKED");
+    assert.ok(
+      output.blockers.some(
+        (blocker) => blocker.code === "RUNTIME_STARTUP_NOT_READY" &&
+          /codex/i.test(blocker.detail),
+      ),
+    );
+  } finally {
+    if (originalExecutable === undefined) delete process.env.DEVSPACE_CODEX_EXECUTABLE;
+    else process.env.DEVSPACE_CODEX_EXECUTABLE = originalExecutable;
     f.clean();
     clean();
   }
@@ -493,6 +554,42 @@ test("AC-5 missing toolchain fails explicitly without creating .venv or mutating
     assert.equal(before, after);
     assert.equal(manager.listAgents({ workspaceId: "ws_1" }).length, 0);
   } finally {
+    f.clean();
+    clean();
+  }
+});
+
+test("AC-5 dependency bridge rejects stale workspace evidence before worker launch", async () => {
+  const f = setupGitFixture();
+  const dependencyRoot = mkdtempSync(join(tmpdir(), "devspace-contract-dependencies-"));
+  const lock = JSON.stringify({ name: "expected", lockfileVersion: 3 });
+  const lockfileSha256 = createHash("sha256").update(lock).digest("hex");
+  writeFileSync(join(dependencyRoot, "package-lock.json"), lock);
+  mkdirSync(join(dependencyRoot, "node_modules", ".bin"), { recursive: true });
+  writeFileSync(join(f.repo, "package-lock.json"), `${lock}\n`);
+  const { manager, clean } = setupManager({
+    toolchains: [{
+      id: "node",
+      root: dependencyRoot,
+      verifiers: {},
+      dependencyBridge: { lockfileSha256, packages: {} },
+    }],
+  });
+  try {
+    await assert.rejects(
+      manager.startAgent({
+        workspaceId: "ws_1",
+        workspaceRoot: f.repo,
+        profileName: "reviewer",
+        prompt: "do work",
+        profiles: mockProfiles,
+        executionContract: { toolchainId: "node" },
+      }),
+      (err: any) => err.code === "TOOLCHAIN_UNAVAILABLE" && /workspace lockfile is stale/.test(err.message),
+    );
+    assert.equal(manager.listAgents({ workspaceId: "ws_1" }).length, 0);
+  } finally {
+    rmSync(dependencyRoot, { recursive: true, force: true });
     f.clean();
     clean();
   }

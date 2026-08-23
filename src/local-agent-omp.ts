@@ -85,10 +85,11 @@ export async function runOmpAcpLocalAgent(input: LocalAgentRunInput): Promise<Lo
   const configPath = join(tempRoot, "omp-devspace.yml");
   await writeFile(configPath, OMP_DEVSPACE_CONFIG, { encoding: "utf8", mode: 0o600 });
 
-  const command = process.env.OMP_COMMAND ?? "omp";
+  const environment = input.environment ?? process.env;
+  const command = environment.OMP_COMMAND ?? "omp";
   const child = spawn(command, buildOmpAcpArgs(input, configPath), {
     cwd: input.workspace,
-    env: ompCommandEnvironment(process.env),
+    env: ompCommandEnvironment(environment),
     stdio: ["pipe", "pipe", "pipe"],
     windowsHide: true,
   });
@@ -107,7 +108,7 @@ export async function runOmpAcpLocalAgent(input: LocalAgentRunInput): Promise<Lo
     Readable.toWeb(child.stdout) as ReadableStream<Uint8Array>,
   );
 
-  const timeoutMs = readPositiveTimeout(process.env.DEVSPACE_OMP_TIMEOUT_MS);
+  const timeoutMs = readPositiveTimeout(environment.DEVSPACE_OMP_TIMEOUT_MS);
   let timeout: NodeJS.Timeout | undefined;
   try {
     const run = client({ name: "DevSpace" })

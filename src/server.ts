@@ -20,6 +20,11 @@ import * as z from "zod/v4";
 import { applyPatch } from "./apply-patch.js";
 import { commitCandidate, pushCandidate, GitCandidateError } from "./git-candidate.js";
 import {
+  integrateCandidate,
+  inspectIntegrationReadiness,
+  probeRemoteWritability,
+} from "./git-integration.js";
+import {
   isArtifactDownloadSupportedPlatform,
   registerArtifactTools,
 } from "./artifact-tools.js";
@@ -2202,6 +2207,166 @@ export function createMcpServer(
       },
     );
   }
+
+  // ── Candidate integration readiness / typed integration (workspace level) ──
+  const candidateRangeInputSchema = {
+    sourceWorkspaceId: z.string().describe("Workspace that produced the accepted Candidate commits."),
+    candidateBase: z
+      .string()
+      .regex(/^[0-9a-fA-F]{40}$/)
+      .describe("Exact base SHA of the accepted Candidate range (ancestor of candidateHead)."),
+    candidateHead: z
+      .string()
+      .regex(/^[0-9a-fA-F]{40}$/)
+      .describe("Exact head SHA of the accepted Candidate range."),
+    destinationWorkspaceId: z.string().describe("Destination checkout workspace that should receive the Candidate range."),
+    expectedDestinationHead: z
+      .string()
+      .regex(/^[0-9a-fA-F]{40}$/)
+      .describe("Exact HEAD the destination must currently be at."),
+    dirtyPolicy: z.enum(["allow_unrelated", "pristine"]).optional(),
+  };
+
+  registerAppTool(
+    server,
+    "candidate_integration_readiness",
+    {
+      title: "Candidate integration readiness",
+      description:
+        "Read-only readiness evidence for integrating one exact immutable committed Candidate range (candidateBase..candidateHead) into a destination checkout. Verifies commit/tree/base identities, ancestor relation, destination base, and dirty overlap. Acceptance authority is external and never granted here; technical readiness and Owner acceptance are reported separately. No mutation happens.",
+      inputSchema: candidateRangeInputSchema,
+      outputSchema: {
+        candidateCommitVerified: z.boolean(),
+        candidateTreeId: z.string().optional(),
+        candidateBaseVerified: z.boolean(),
+        candidateBaseIsAncestor: z.boolean(),
+        candidateChangedPaths: z.array(z.string()),
+        destinationBaseMatches: z.boolean(),
+        destinationOverlap: z.string(),
+        overlappingPaths: z.array(z.string()),
+        unrelatedDestinationDirtyPaths: z.array(z.string()),
+        gitStateAvailable: z.boolean(),
+        operationExpressible: z.boolean(),
+        technicallyReadyToApply: z.boolean(),
+        acceptanceStatus: z.string(),
+        blockers: z.array(z.object({ code: z.string(), detail: z.string() })),
+        unknowns: z.array(z.string()),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: true },
+    },
+    async ({ sourceWorkspaceId, candidateBase, candidateHead, destinationWorkspaceId, expectedDestinationHead, dirtyPolicy }) => {
+      const source = workspaces.getWorkspace(sourceWorkspaceId);
+      const destination = workspaces.getWorkspace(destinationWorkspaceId);
+      const output = await inspectIntegrationReadiness({
+        sourceWorkspaceRoot: source.root,
+        candidateBase,
+        candidateHead,
+        destinationWorkspaceRoot: destination.root,
+        expectedDestinationHead,
+        dirtyPolicy,
+      });
+      const blockerSummary = output.blockers.length > 0
+        ? ` Blockers: ${output.blockers.map((blocker) => blocker.code).join(", ")}`
+        : "";
+      return {
+        content: [
+          textBlock(
+            `Integration readiness: technicallyReadyToApply=${output.technicallyReadyToApply}, ownerAcceptance=${output.acceptanceStatus}.${blockerSummary}`,
+          ),
+        ],
+        structuredContent: output as unknown as Record<string, unknown>,
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "candidate_integrate",
+    {
+      title: "Integrate candidate",
+      description:
+        "Apply one exact immutable committed Candidate range (candidateBase..candidateHead) onto a destination checkout after every identity gate passes (commit/tree existence, base ancestry, destination base, dirty-overlap policy). The payload comes only from the committed range; untracked workspace files are never included. Fails closed with the destination unchanged on any mismatch.",
+      inputSchema: {
+        ...candidateRangeInputSchema,
+        confirmApply: z
+          .boolean()
+          .describe("Must be true to apply. Without it the operation stays read-only preparation."),
+      },
+      outputSchema: {
+        applied: z.boolean(),
+        appliedRange: z.object({ base: z.string(), head: z.string() }),
+        appliedTrackedFiles: z.number(),
+        blockers: z.array(z.object({ code: z.string(), detail: z.string() })),
+      },
+      _meta: {},
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ sourceWorkspaceId, candidateBase, candidateHead, destinationWorkspaceId, expectedDestinationHead, dirtyPolicy, confirmApply }) => {
+      const source = workspaces.getWorkspace(sourceWorkspaceId);
+      const destination = workspaces.getWorkspace(destinationWorkspaceId);
+      const output = await integrateCandidate({
+        sourceWorkspaceRoot: source.root,
+        candidateBase,
+        candidateHead,
+        destinationWorkspaceRoot: destination.root,
+        expectedDestinationHead,
+        dirtyPolicy,
+        confirmApply,
+      });
+      const summary = output.applied
+        ? `Candidate range integrated (${output.appliedTrackedFiles} changed file(s)).`
+        : `Not applied${output.blockers.length > 0 ? `: ${output.blockers.map((blocker) => blocker.code).join(", ")}` : "."}`;
+      return {
+        content: [textBlock(summary)],
+        structuredContent: output as unknown as Record<string, unknown>,
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "remote_writability_probe",
+    {
+      title: "Remote writability probe",
+      description:
+        "Read-only Git remote readiness for a workspace. Reports whether a remote is configured, reachability/auth evidence when safely observable, upstream binding, and never claims push permission: proving it would require a mutating push.",
+      inputSchema: {
+        workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+        remoteName: z.string().optional().describe("Remote name. Defaults to origin."),
+      },
+      outputSchema: {
+        remoteName: z.string().optional(),
+        remoteUrl: z.string().optional(),
+        remoteConfigured: z.boolean(),
+        reachable: z.union([z.boolean(), z.string()]),
+        credentialsEvidence: z.string(),
+        upstreamBranch: z.string().optional(),
+        upstreamConfigured: z.boolean(),
+        pushPermissionProven: z.string(),
+        notes: z.array(z.string()),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: true },
+    },
+    async ({ workspaceId, remoteName }) => {
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const output = await probeRemoteWritability(workspace.root, remoteName ?? "origin");
+      return {
+        content: [
+          textBlock(
+            `Remote '${remoteName ?? "origin"}': configured=${output.remoteConfigured}, reachable=${String(output.reachable)}, push permission proven=${output.pushPermissionProven}.`,
+          ),
+        ],
+        structuredContent: output as unknown as Record<string, unknown>,
+      };
+    },
+  );
 
   // ── Native Git Candidate MCP Tools (only when gitCandidatesEnabled is true) ──
   if (config.gitCandidatesEnabled) {

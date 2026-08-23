@@ -37,6 +37,11 @@ const migrations: Migration[] = [
     name: "local-agent-execution-contract",
     up: migrateLocalAgentExecutionContract,
   },
+  {
+    version: 7,
+    name: "local-agent-lifecycle-state",
+    up: migrateLocalAgentLifecycleState,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -199,6 +204,10 @@ function migrateLocalAgentExecutionContract(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "local_agent_sessions", "terminal_reason", "text");
   addColumnIfMissing(sqlite, "local_agent_sessions", "scope_state", "text");
   addColumnIfMissing(sqlite, "local_agent_sessions", "scope_baseline", "text");
+}
+
+function migrateLocalAgentLifecycleState(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "local_agent_sessions", "lifecycle_state", "text");
 }
 
 function migrateWorkspaceConversationBindings(sqlite: Database.Database): void {

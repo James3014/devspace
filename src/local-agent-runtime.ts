@@ -16,6 +16,8 @@ export interface LocalAgentRunInput {
   writeMode?: LocalAgentWriteMode;
   model?: string;
   thinking?: string;
+  /** Per-turn environment after any configured read-only toolchain bridge. */
+  environment?: NodeJS.ProcessEnv;
 }
 
 export interface LocalAgentRunResult {

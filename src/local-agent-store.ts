@@ -15,6 +15,20 @@ import {
 
 export type LocalAgentStatus = "starting" | "running" | "idle" | "error" | "stopped";
 
+/**
+ * Durable cross-turn scope lifecycle evidence persisted beside the baseline.
+ *
+ * - `cumulativeChangedPaths`: worker-attributed paths from every completed
+ *   turn, so writePaths/maxFiles stay enforced across continuation turns.
+ * - `turnEndBaseline`: physical snapshot captured after a turn finishes, so
+ *   foreign edits made while the agent is terminal are detectable (and never
+ *   attributed to the worker) at continuation admission.
+ */
+export interface AgentLifecycleState {
+  cumulativeChangedPaths?: string[];
+  turnEndBaseline?: ScopeBaseline;
+}
+
 export interface LocalAgentRecord {
   id: string;
   workspaceId?: string;
@@ -31,6 +45,7 @@ export interface LocalAgentRecord {
   terminalReason?: AgentTerminalReason;
   scopeState?: ScopeState;
   scopeBaseline?: ScopeBaseline;
+  lifecycleState?: AgentLifecycleState;
   status: LocalAgentStatus;
   latestResponse?: string;
   error?: string;
@@ -81,6 +96,7 @@ interface LocalAgentRow {
   terminal_reason: string | null;
   scope_state: string | null;
   scope_baseline: string | null;
+  lifecycle_state: string | null;
   status: string;
   latest_response: string | null;
   error: string | null;
@@ -262,6 +278,7 @@ export class LocalAgentStore {
           terminal_reason = ?,
           scope_state = ?,
           scope_baseline = ?,
+          lifecycle_state = ?,
           status = ?,
           latest_response = ?,
           error = ?,
@@ -282,6 +299,7 @@ export class LocalAgentStore {
         updated.terminalReason ?? null,
         updated.scopeState ?? null,
         updated.scopeBaseline ? JSON.stringify(updated.scopeBaseline) : null,
+        updated.lifecycleState ? JSON.stringify(updated.lifecycleState) : null,
         updated.status,
         updated.latestResponse ?? null,
         updated.error ?? null,
@@ -414,6 +432,7 @@ function rowToLocalAgentRecord(row: LocalAgentRow): LocalAgentRecord {
     terminalReason: readTerminalReason(row.terminal_reason),
     scopeState: readScopeState(row.scope_state),
     scopeBaseline: readScopeBaseline(row.scope_baseline),
+    lifecycleState: readLifecycleState(row.lifecycle_state),
     status: readStatus(row.status),
     latestResponse: row.latest_response ?? undefined,
     error: row.error ?? undefined,
@@ -493,8 +512,7 @@ function readScopeState(value: string | null | undefined): ScopeState | undefine
   return "UNKNOWN";
 }
 
-function readScopeBaseline(value: string | null | undefined): ScopeBaseline | undefined {
-  if (!value) return undefined;
+function readScopeBaseline(value: string | null | undefined): ScopeBaseline | undefined {  if (!value) return undefined;
   try {
     const parsed = JSON.parse(value) as Record<string, unknown>;
     const changedPaths = Array.isArray(parsed.changedPaths)
@@ -543,4 +561,25 @@ function readPathStateFingerprint(value: unknown): PathStateFingerprint | undefi
 
 function escapeLike(value: string): string {
   return value.replaceAll("\\", "\\\\").replaceAll("%", "\\%").replaceAll("_", "\\_");
+}
+
+function readLifecycleState(value: string | null | undefined): AgentLifecycleState | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = JSON.parse(value) as Record<string, unknown>;
+    const state: AgentLifecycleState = {};
+    if (Array.isArray(parsed.cumulativeChangedPaths)) {
+      const paths = parsed.cumulativeChangedPaths.filter((entry): entry is string => typeof entry === "string");
+      if (paths.length > 0) state.cumulativeChangedPaths = paths;
+    }
+    if (parsed.turnEndBaseline !== undefined && parsed.turnEndBaseline !== null) {
+      // Reuse the strict baseline reader by round-tripping through JSON so a
+      // corrupt or legacy turn-end snapshot degrades to absent evidence.
+      const baseline = readScopeBaseline(JSON.stringify(parsed.turnEndBaseline));
+      if (baseline) state.turnEndBaseline = baseline;
+    }
+    return Object.keys(state).length > 0 ? state : undefined;
+  } catch {
+    return undefined;
+  }
 }

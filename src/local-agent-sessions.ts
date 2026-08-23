@@ -22,13 +22,21 @@ import {
 import { runLocalAgentProvider } from "./local-agent-adapters.js";
 import { LocalAgentProviderError, type LocalAgentRunResult } from "./local-agent-runtime.js";
 import { terminateProcessTree, type KillableProcess } from "./process-platform.js";
-import { canonicalizePath } from "./roots.js";
 import {
   type AgentTerminalReason,
   type ExecutionContract,
   type ScopeState,
 } from "./local-agent-contract.js";
-import { describeToolchainExecutables } from "./local-agent-toolchains.js";
+import { buildToolchainEnvironment, describeToolchainExecutables } from "./local-agent-toolchains.js";
+import { inspectCodexRuntime, type CodexRuntimeIdentity } from "./codex-runtime.js";
+import {
+  cleanupProviderScratch,
+  createProviderScratch,
+  SCRATCH_DIR_PREFIX,
+  type CleanupResult,
+  type ScratchHandle,
+} from "./provider-scratch.js";
+import { canonicalizePath, isPathInsideRoot } from "./roots.js";
 import {
   classifyScopeState,
   computeWorkerDelta,
@@ -54,7 +62,8 @@ export type AgentErrorCode =
   | "TOOLCHAIN_UNAVAILABLE"
   | "INVALID_EXECUTION_CONTRACT"
   | "INVALID_ATTEMPT_KEY"
-  | "ATTEMPT_REPLAY_CONFLICT";
+  | "ATTEMPT_REPLAY_CONFLICT"
+  | "CONTINUATION_ADMISSION_FAILED";
 
 export class AgentSessionError extends Error {
   constructor(
@@ -63,6 +72,38 @@ export class AgentSessionError extends Error {
   ) {
     super(message);
     this.name = "AgentSessionError";
+  }
+}
+
+/** Raised when the worker workspace fails the canonical containment gate. */
+export class WorkspaceContainmentError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "WorkspaceContainmentError";
+  }
+}
+
+/**
+ * Canonical containment gate for worker execution: the workspace root must
+ * resolve to its canonical physical path and stay inside one configured
+ * allowed root. Git linked worktrees are legitimate: their canonical path is
+ * the linked worktree itself, which may be a configured allowed root.
+ */
+function assertWorkspaceContainment(config: ServerConfig, workspaceRoot: string): void {
+  let canonical: string;
+  try {
+    canonical = canonicalizePath(workspaceRoot);
+  } catch (error) {
+    throw new Error(
+      `Workspace root could not be canonicalized: ${workspaceRoot} (${error instanceof Error ? error.message : String(error)})`,
+    );
+  }
+  const roots = config.allowedRoots ?? [];
+  const contained = roots.some((root) => isPathInsideRoot(canonical, canonicalizePath(root)));
+  if (roots.length > 0 && !contained) {
+    throw new Error(
+      `Workspace root ${canonical} is outside every configured allowed root; refusing to run a worker against it.`,
+    );
   }
 }
 
@@ -356,14 +397,6 @@ export class LocalAgentSessionManager {
       }
     }
 
-    const availability = checkLocalAgentProviderAvailability(profile.provider);
-    if (!availability.available) {
-      throw new AgentSessionError(
-        "PROVIDER_UNAVAILABLE",
-        `Agent provider '${profile.provider}' is unavailable: ${availability.reason ?? "unknown reason"}`,
-      );
-    }
-
     if (!this.hasExecutionCapacity()) {
       throw new AgentSessionError(
         "NO_EXECUTION_CAPACITY",
@@ -372,6 +405,7 @@ export class LocalAgentSessionManager {
     }
 
     // Optional structured execution contract (execution-control only).
+    let providerEnvironment = process.env;
     if (executionContract?.toolchainId) {
       const toolchain = this.config.toolchains.find((candidate) => candidate.id === executionContract.toolchainId);
       if (!toolchain) {
@@ -381,6 +415,31 @@ export class LocalAgentSessionManager {
             `Configure DEVSPACE_TOOLCHAINS or omit toolchainId. Dev MCP will not install or repair toolchains.`,
         );
       }
+      try {
+        providerEnvironment = buildToolchainEnvironment(
+          this.config.toolchains,
+          executionContract.toolchainId,
+          workspaceRoot,
+        );
+      } catch (error) {
+        throw new AgentSessionError(
+          "TOOLCHAIN_UNAVAILABLE",
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    }
+
+    const availability = checkLocalAgentProviderAvailability(profile.provider, providerEnvironment);
+    const codexRuntime = profile.provider === "codex" && availability.available
+      ? inspectCodexRuntime({ env: providerEnvironment })
+      : undefined;
+    if (!availability.available || (codexRuntime && !codexRuntime.ready)) {
+      throw new AgentSessionError(
+        "PROVIDER_UNAVAILABLE",
+        `Agent provider '${profile.provider}' is unavailable: ${
+          availability.reason ?? codexRuntime?.reason ?? "unknown reason"
+        }`,
+      );
     }
 
     if (executionContract?.expectedHead) {
@@ -445,7 +504,12 @@ export class LocalAgentSessionManager {
   /**
    * Continue an existing agent session with a new prompt.
    * Provider session ID is preserved.
-   * Fail-closed: if worker fails to launch, record is set to error status.
+   *
+   * Admission is revalidated BEFORE any mutation or worker relaunch:
+   * durable identity, canonical workspace, persisted execution contract,
+   * current scope state, foreign workspace mutation, execution capacity, and
+   * HEAD lineage. A provider session ID by itself is not authority; stale or
+   * contradictory admission evidence fails closed before mutation.
    */
   async continueAgent(input: ContinueAgentInput): Promise<ContinueAgentOutput> {
     const { workspaceId: _workspaceId, workspaceRoot, agentId, prompt } = input;
@@ -467,6 +531,77 @@ export class LocalAgentSessionManager {
       throw new AgentSessionError(
         "AGENT_ALREADY_RUNNING",
         `Agent ${agentId} is currently ${record.status}. Wait for it to complete before continuing.`,
+      );
+    }
+
+    // ── Continuation admission gates (all read-only; run before mutation) ──
+    const admissionFailures: string[] = [];
+
+    if (!this.hasExecutionCapacity()) {
+      admissionFailures.push(
+        `Execution capacity exhausted: ${this.runningCount()} of ${this.config.agentMaxConcurrent} configured agent(s) active.`,
+      );
+    }
+
+    const contract = record.executionContract;
+    const lineageBaseline = record.lifecycleState?.turnEndBaseline ?? record.scopeBaseline;
+
+    const physical = await inspectWorkspacePhysicalState(record.workspaceRoot);
+
+    const requiresLineageEvidence =
+      Boolean(contract?.expectedHead) || Boolean(lineageBaseline?.head);
+    if (!physical.gitAvailable && requiresLineageEvidence) {
+      admissionFailures.push(
+        "Workspace Git state is unavailable; recorded continuation lineage cannot be verified.",
+      );
+    } else if (physical.gitAvailable) {
+      if (contract?.expectedHead) {
+        if (physical.head !== contract.expectedHead.toLowerCase()) {
+          admissionFailures.push(
+            `Execution contract expected HEAD ${contract.expectedHead}, current workspace HEAD is ${physical.head ?? "unknown"}.`,
+          );
+        }
+      } else if (
+        lineageBaseline?.head &&
+        physical.head &&
+        lineageBaseline.head !== physical.head
+      ) {
+        admissionFailures.push(
+          `Workspace HEAD advanced from the recorded turn-end lineage ${lineageBaseline.head} to ${physical.head}.`,
+        );
+      }
+    }
+
+    if (record.scopeState === "SCOPE_VIOLATION") {
+      admissionFailures.push("The previous turn ended in SCOPE_VIOLATION; continuing would extend violated authority.");
+    }
+
+    if (physical.gitAvailable && lineageBaseline) {
+      const postTurnDelta = computeWorkerDelta(physical, lineageBaseline);
+      // ANY workspace mutation after the turn-end baseline is foreign for
+      // continuation admission — including mutations to paths this worker
+      // itself changed in earlier turns. A path is never whitelisted merely
+      // because it appears in cumulativeChangedPaths. Incomplete evidence is
+      // also fail-closed: an unprovable delta cannot prove absence of foreign
+      // mutation. Provider scratch lives outside the workspace and needs no
+      // exemption here.
+      const foreignMutations = [...postTurnDelta.changedPaths];
+      if (postTurnDelta.attribution === "UNKNOWN") {
+        admissionFailures.push(
+          "Post-turn workspace attribution is UNKNOWN; continuing would require evidence that cannot be proven.",
+        );
+      }
+      if (foreignMutations.length > 0) {
+        admissionFailures.push(
+          `Foreign workspace mutation detected after the terminal turn (not attributable to this agent): ${foreignMutations.join(", ")}.`,
+        );
+      }
+    }
+
+    if (admissionFailures.length > 0) {
+      throw new AgentSessionError(
+        "CONTINUATION_ADMISSION_FAILED",
+        `Continuation of agent ${agentId} was rejected before any mutation: ${admissionFailures.join(" ")}`,
       );
     }
 
@@ -597,27 +732,6 @@ export class LocalAgentSessionManager {
       });
     }
 
-    let providerConfigured = false;
-    let runtimeReady = false;
-    let runtimeVersion: string | undefined;
-    let executionIdentity = "none";
-    if (profile) {
-      const availability = checkLocalAgentProviderAvailability(profile.provider);
-      providerConfigured = availability.available;
-      runtimeReady = availability.available;
-      executionIdentity = profile.provider;
-      if (!availability.available) {
-        blockers.push({
-          code: "RUNTIME_STARTUP_NOT_READY",
-          detail: `Provider '${profile.provider}' runtime is not configured: ${availability.reason ?? "unknown reason"}`,
-        });
-      } else {
-        runtimeVersion = getLocalAgentProviderRuntimeVersion(profile.provider);
-        const executable = resolveLocalAgentProviderExecutable(profile.provider);
-        if (executable) executionIdentity = executable;
-      }
-    }
-
     // Authentication and provider reachability cannot be verified without an
     // expensive provider call; there is no existing safe readiness probe.
     // They must remain unknown rather than silently become true.
@@ -638,6 +752,7 @@ export class LocalAgentSessionManager {
 
     let toolchainAvailable = false;
     let executables: Record<string, string> | undefined;
+    let providerEnvironment = process.env;
     if (toolchainId) {
       const toolchain = this.config.toolchains.find((candidate) => candidate.id === toolchainId);
       if (!toolchain) {
@@ -646,8 +761,50 @@ export class LocalAgentSessionManager {
           detail: `Toolchain '${toolchainId}' is not configured.`,
         });
       } else {
-        toolchainAvailable = true;
-        executables = describeToolchainExecutables(this.config.toolchains, toolchainId);
+        try {
+          providerEnvironment = buildToolchainEnvironment(
+            this.config.toolchains,
+            toolchainId,
+            workspaceRoot,
+          );
+          toolchainAvailable = true;
+          executables = describeToolchainExecutables(this.config.toolchains, toolchainId);
+        } catch (error) {
+          blockers.push({
+            code: "TOOLCHAIN_UNAVAILABLE",
+            detail: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
+    }
+
+    let providerConfigured = false;
+    let runtimeReady = false;
+    let runtimeVersion: string | undefined;
+    let executionIdentity = "none";
+    if (profile) {
+      const availability = checkLocalAgentProviderAvailability(profile.provider, providerEnvironment);
+      const codexRuntime: CodexRuntimeIdentity | undefined =
+        profile.provider === "codex" && availability.available
+          ? inspectCodexRuntime({ env: providerEnvironment })
+          : undefined;
+      providerConfigured = availability.available;
+      runtimeReady = availability.available && (codexRuntime?.ready ?? true);
+      executionIdentity = codexRuntime?.executable ?? profile.provider;
+      runtimeVersion = codexRuntime?.binaryVersion ?? getLocalAgentProviderRuntimeVersion(
+        profile.provider,
+        providerEnvironment,
+      );
+      if (!runtimeReady) {
+        blockers.push({
+          code: "RUNTIME_STARTUP_NOT_READY",
+          detail: `Provider '${profile.provider}' runtime is not configured: ${
+            availability.reason ?? codexRuntime?.reason ?? "unknown reason"
+          }`,
+        });
+      } else if (!codexRuntime) {
+        const executable = resolveLocalAgentProviderExecutable(profile.provider, providerEnvironment);
+        if (executable) executionIdentity = executable;
       }
     }
 
@@ -850,25 +1007,39 @@ export class LocalAgentSessionManager {
     };
   }
 
-  private async evaluateScope(agentId: string): Promise<{
-    scopeState: ScopeState;
-    unexpectedPaths: string[];
-  }> {
+  /**
+   * Evaluate scope for the agent's whole durable lifecycle: the current turn's
+   * worker delta is unioned with every previously attributed path so that
+   * writePaths/maxFiles stay enforced across continuation turns. A continuation
+   * cannot widen authority by resetting the accounting with a fresh baseline.
+   */
+  private async computeCumulativeScopeEvidence(
+    agentId: string,
+  ): Promise<{ scopeState: ScopeState; unexpectedPaths: string[]; workerChangedPaths: string[] }> {
     const record = this.store.getById(agentId);
-    if (!record) return { scopeState: "UNKNOWN", unexpectedPaths: [] };
-    const contract = record.executionContract;
-    if (!contract?.writePaths?.length && !contract?.maxFiles) {
-      return { scopeState: "UNKNOWN", unexpectedPaths: [] };
+    if (!record) {
+      return { scopeState: "UNKNOWN" as ScopeState, unexpectedPaths: [], workerChangedPaths: [] };
     }
     const physical = await inspectWorkspacePhysicalState(record.workspaceRoot);
-    if (!physical.gitAvailable) return { scopeState: "UNKNOWN", unexpectedPaths: [] };
+    if (!physical.gitAvailable) {
+      return { scopeState: "UNKNOWN" as ScopeState, unexpectedPaths: [], workerChangedPaths: [] };
+    }
     const delta = computeWorkerDelta(physical, record.scopeBaseline);
-    return this.classifyWorkerScope(
-      delta.changedPaths,
-      contract.writePaths,
-      contract.maxFiles,
+    const cumulative = new Set(record.lifecycleState?.cumulativeChangedPaths ?? []);
+    for (const path of delta.changedPaths) cumulative.add(path);
+    const workerChangedPaths = [...cumulative].sort();
+    const contract = record.executionContract;
+    const classification = this.classifyWorkerScope(
+      workerChangedPaths,
+      contract?.writePaths,
+      contract?.maxFiles,
       delta.attribution,
     );
+    return {
+      scopeState: classification.scopeState,
+      unexpectedPaths: classification.unexpectedPaths,
+      workerChangedPaths,
+    };
   }
 
   private classifyWorkerScope(
@@ -930,7 +1101,22 @@ export class LocalAgentSessionManager {
     }
 
     const prompt = await readFile(promptFile, "utf8");
+    let scratch: ScratchHandle | undefined;
     try {
+      // Containment gate (fail closed): the workspace root must resolve to its
+      // canonical physical path and stay inside a configured allowed root.
+      // Git linked worktrees remain legitimate: canonicalization resolves their
+      // real path, and an allowed root may itself be the linked worktree.
+      try {
+        assertWorkspaceContainment(this.config, claimed.workspaceRoot);
+      } catch (error) {
+        throw new WorkspaceContainmentError(
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+
+      scratch = createProviderScratch(claimed.id);
+
       // Snapshot the physical workspace BEFORE any provider mutation so that
       // pre-existing changes are never attributed to this worker turn.
       // The baseline is always captured: reconciliation must be able to report a
@@ -951,13 +1137,24 @@ export class LocalAgentSessionManager {
       if (this.turnRunner) {
         result = await this.turnRunner(profile, claimed, prompt);
       } else if (profile) {
-        result = await runLocalAgentProfile(profile, claimed, prompt);
+        result = await runLocalAgentProfile(this.config, profile, claimed, prompt, scratch);
       } else {
-        result = await runRawLocalAgentProvider(claimed, prompt);
+        result = await runRawLocalAgentProvider(this.config, claimed, prompt, scratch);
       }
 
-      const scope = await this.evaluateScope(claimed.id);
+      // End-of-turn snapshot: everything that changed after this point is no
+      // longer attributable to the worker (foreign mutation detection at the
+      // next continuation admission).
+      const endState = await inspectWorkspacePhysicalState(claimed.workspaceRoot);
+      const turnEndBaseline = {
+        changedPaths: endState.changedPaths,
+        head: endState.head ?? null,
+        fingerprints: endState.fingerprints,
+      };
+      const scope = await this.computeCumulativeScopeEvidence(claimed.id);
       const scopeViolated = scope.scopeState === "SCOPE_VIOLATION";
+      const cumulative = new Set(this.store.getById(claimed.id)?.lifecycleState?.cumulativeChangedPaths ?? []);
+      for (const path of scope.workerChangedPaths ?? []) cumulative.add(path);
       this.store.finishWorker(agentId, workerToken, {
         providerSessionId: result.providerSessionId ?? undefined,
         status: "idle",
@@ -968,19 +1165,49 @@ export class LocalAgentSessionManager {
         terminalReason: scopeViolated ? "scope_violation" : "completed",
         scopeState: scope.scopeState,
       });
+      this.store.update(agentId, {
+        lifecycleState: {
+          ...this.store.getById(agentId)?.lifecycleState,
+          cumulativeChangedPaths: [...cumulative].sort(),
+          turnEndBaseline,
+        },
+      });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      const scope = await this.evaluateScope(agentId);
+      const scope = await this.computeCumulativeScopeEvidence(agentId);
       this.store.finishWorker(agentId, workerToken, {
         providerSessionId: error instanceof LocalAgentProviderError ? error.providerSessionId : undefined,
         status: "error",
         latestResponse: error instanceof LocalAgentProviderError ? error.finalResponse : undefined,
         error: message,
-        terminalReason: error instanceof LocalAgentProviderError ? "provider_error" : classifyProviderError(message),
+        terminalReason:
+          error instanceof WorkspaceContainmentError
+            ? "launch_failed"
+            : error instanceof LocalAgentProviderError
+              ? "provider_error"
+              : classifyProviderError(message),
         scopeState: scope.scopeState,
       });
+      const endState = await inspectWorkspacePhysicalState(
+        this.store.getById(agentId)?.workspaceRoot ?? claimed.workspaceRoot,
+      ).catch(() => undefined);
+      if (endState) {
+        this.store.update(agentId, {
+          lifecycleState: {
+            ...this.store.getById(agentId)?.lifecycleState,
+            turnEndBaseline: {
+              changedPaths: endState.changedPaths,
+              head: endState.head ?? null,
+              fingerprints: endState.fingerprints,
+            },
+          },
+        });
+      }
     } finally {
       cleanupOwnedPromptFile(promptFile);
+      if (scratch) {
+        cleanupProviderScratch(scratch.root);
+      }
     }
   }
 
@@ -995,6 +1222,27 @@ export class LocalAgentSessionManager {
         `Failed to launch worker for agent ${agentId}: ${launchErr instanceof Error ? launchErr.message : String(launchErr)}`,
       );
     }
+  }
+
+  /**
+   * Typed cleanup for one agent's provider scratch. Refuses to run while the
+   * agent's worker is active, refuses unowned paths, and never touches
+   * Candidate or worktree state: this cleans DevSpace-owned scratch only.
+   * Idempotent; returns structured evidence.
+   */
+  async cleanupAgentScratch(agentId: string): Promise<CleanupResult> {
+    const record = this.store.getById(agentId);
+    if (!record) {
+      throw new AgentSessionError("UNKNOWN_AGENT", `Unknown agent id: ${agentId}`);
+    }
+    if (isActiveStatus(record.status)) {
+      throw new AgentSessionError(
+        "AGENT_ALREADY_RUNNING",
+        `Agent ${agentId} is ${record.status}: refusing destructive cleanup while its owned worker is active.`,
+      );
+    }
+    const root = join(tmpdir(), `${SCRATCH_DIR_PREFIX}${agentId.replaceAll(/[^A-Za-z0-9_-]/g, "_")}`);
+    return cleanupProviderScratch(root);
   }
 
   /**
@@ -1270,13 +1518,16 @@ async function waitForWorkerExitOrForeign(
 }
 
 async function runLocalAgentProfile(
+  config: ServerConfig,
   profile: LocalAgentProfile,
   record: LocalAgentRecord,
   prompt?: string,
+  scratch?: ScratchHandle,
 ): Promise<LocalAgentRunResult> {
   const effectivePrompt = prompt ?? "";
   const body = profile.body.trim();
   const fullPrompt = body ? `${body}\n\nTask:\n${effectivePrompt}` : effectivePrompt;
+  const environment = providerEnvironment(config, record, scratch);
   return runLocalAgentProvider(profile.provider, {
     prompt: fullPrompt,
     workspace: record.workspaceRoot,
@@ -1284,17 +1535,21 @@ async function runLocalAgentProfile(
     writeMode: profile.write_mode === "allowed" ? "allowed" : "read_only",
     model: record.model ?? profile.model,
     thinking: record.thinking ?? profile.thinking,
+    environment,
   });
 }
 
 async function runRawLocalAgentProvider(
+  config: ServerConfig,
   record: LocalAgentRecord,
   prompt?: string,
+  scratch?: ScratchHandle,
 ): Promise<LocalAgentRunResult> {
   const { isLocalAgentProvider } = await import("./local-agent-profiles.js");
   if (record.profileName !== record.provider || !isLocalAgentProvider(record.provider)) {
     throw new Error(`Subagent profile not found: ${record.profileName}`);
   }
+  const environment = providerEnvironment(config, record, scratch);
   return runLocalAgentProvider(record.provider, {
     prompt: prompt ?? "",
     workspace: record.workspaceRoot,
@@ -1302,7 +1557,38 @@ async function runRawLocalAgentProvider(
     writeMode: "read_only",
     model: record.model,
     thinking: record.thinking,
+    environment,
   });
+}
+
+/**
+ * Per-turn provider environment: the verified toolchain bridge environment when
+ * an execution contract binds one, plus the owned provider-scratch location.
+ * Providers that honor DEVSPACE_PROVIDER_SCRATCH keep their transient state
+ * outside the product repository.
+ */
+function providerEnvironment(
+  config: ServerConfig,
+  record: LocalAgentRecord,
+  scratch?: ScratchHandle,
+): NodeJS.ProcessEnv {
+  let environment: NodeJS.ProcessEnv = process.env;
+  if (record.executionContract?.toolchainId) {
+    try {
+      environment = buildToolchainEnvironment(
+        config.toolchains,
+        record.executionContract.toolchainId,
+        record.workspaceRoot,
+      );
+    } catch {
+      // The turn proceeds with the server environment; the toolchain bridge was
+      // already validated at start/preflight. Verification will surface drift.
+      environment = { ...process.env };
+    }
+  }
+  return scratch
+    ? { ...environment, DEVSPACE_PROVIDER_SCRATCH: scratch.root }
+    : environment;
 }
 
 function recordToStartOutput(record: LocalAgentRecord): StartAgentOutput {
