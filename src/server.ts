@@ -19,10 +19,9 @@ import type { Request, Response } from "express";
 import * as z from "zod/v4";
 import { applyPatch } from "./apply-patch.js";
 import {
-  isArtifactDownloadSupportedPlatform,
   registerArtifactTools,
 } from "./artifact-tools.js";
-import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
+import { loadConfig, type ServerConfig } from "./config.js";
 import {
   createOpenAIIncomingArtifactAdapter,
   type IncomingArtifactAdapter,
@@ -53,6 +52,13 @@ import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { openAiConversationScopeId } from "./request-meta.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
+import {
+  compileRuntime,
+  shouldAttachWidget,
+  toolNames,
+  type RuntimeConfig,
+  type ToolWidgetKind,
+} from "./runtime-config.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 import {
@@ -94,6 +100,7 @@ const SHELL_TOOL_ANNOTATIONS = {
 interface RunningServer {
   app: ReturnType<typeof createMcpExpressApp>;
   config: ServerConfig;
+  runtime: RuntimeConfig;
   localAgentProviders: LocalAgentProviderStatus[];
   close(): Promise<void>;
 }
@@ -115,16 +122,6 @@ interface DiffStats {
   removals: number;
 }
 
-type ToolWidgetKind =
-  | "workspace"
-  | "read"
-  | "write"
-  | "edit"
-  | "search"
-  | "directory"
-  | "shell"
-  | "show_changes";
-
 interface ToolDefinitionMeta extends Record<string, unknown> {
   ui: {
     resourceUri: string;
@@ -140,22 +137,11 @@ interface ToolWidgetDescriptorMeta {
   _meta: ToolDefinitionMeta | EmptyToolDefinitionMeta;
 }
 
-function shouldAttachWidget(mode: WidgetMode, kind: ToolWidgetKind): boolean {
-  switch (mode) {
-    case "off":
-      return false;
-    case "changes":
-      return kind === "workspace" || kind === "show_changes";
-    case "full":
-      return true;
-  }
-}
-
 function toolWidgetDescriptorMeta(
-  config: ServerConfig,
+  runtime: RuntimeConfig,
   kind: ToolWidgetKind,
 ): ToolWidgetDescriptorMeta {
-  if (!shouldAttachWidget(config.widgets, kind)) return { _meta: {} };
+  if (!shouldAttachWidget(runtime.presentation, kind)) return { _meta: {} };
 
   return {
     _meta: {
@@ -166,17 +152,6 @@ function toolWidgetDescriptorMeta(
     },
   };
 }
-
-const toolNames = {
-  openWorkspace: "open_workspace",
-  read: "read",
-  write: "write",
-  edit: "edit",
-  grep: "grep",
-  glob: "glob",
-  ls: "ls",
-  shell: "bash",
-} as const;
 
 const workspaceIdDescription =
   "Workspace to use. Reuse the current project's workspaceId.";
@@ -191,32 +166,6 @@ interface ToolLogFields {
   success: boolean;
   durationMs: number;
   error?: string;
-}
-
-function serverInstructions(config: ServerConfig): string {
-  const artifactInstruction = config.artifactsEnabled && isArtifactDownloadSupportedPlatform()
-    ? " When the user supplies or generates a file that is not present on the DevSpace host, use download_artifact with its native file value, the existing workspace ID, and a suitable relative destination path chosen from the user's request and project structure. The tool refuses to overwrite an existing destination and returns the normalized workspace-relative path. Use normal workspace tools when explicit inspection, replacement, movement, renaming, or deletion is needed. Do not recreate binary files with write/edit calls or place signed URLs, native file objects, base64 content, or invented host paths in shell commands or logs."
-    : "";
-  const showChangesInstruction =
-    config.widgets === "changes"
-      ? " If the turn successfully modifies files by creating, editing, overwriting, deleting, moving, or applying patches, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. Do not call it after every individual file change; do not skip it because individual file-change tools already returned diffs."
-      : "";
-
-  if (config.toolMode === "codex") {
-    return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}`;
-  }
-
-  const inspection = config.toolMode !== "full"
-    ? `In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use ${toolNames.shell} with command-line tools such as grep, rg, find, ls, and tree for search and directory inspection. `
-    : `Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. `;
-
-  const skills = config.skillsEnabled
-    ? `When ${toolNames.openWorkspace} returns available skills and a task matches a skill, use ${toolNames.read} to read that skill's path before proceeding. Skill paths may be outside the workspace, but ${toolNames.read} only permits advertised SKILL.md files and files under already-loaded skill directories. `
-    : "";
-
-  const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
-
-  return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -562,10 +511,11 @@ function processToolResponse(
 
 function registerCodexProcessTools(
   server: McpServer,
-  config: ServerConfig,
+  runtime: RuntimeConfig,
   workspaces: WorkspaceRegistry,
   processSessions: ProcessSessionManager,
 ): void {
+  const { config } = runtime;
   registerAppTool(
     server,
     "exec_command",
@@ -602,7 +552,7 @@ function registerCodexProcessTools(
           .describe("Approximate output token budget. Defaults to 10000."),
       },
       outputSchema: processOutputSchema(),
-      ...toolWidgetDescriptorMeta(config, "shell"),
+      ...toolWidgetDescriptorMeta(runtime, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
     async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens }) => {
@@ -670,7 +620,7 @@ function registerCodexProcessTools(
           .describe("Approximate output token budget. Defaults to 10000."),
       },
       outputSchema: processOutputSchema(),
-      ...toolWidgetDescriptorMeta(config, "shell"),
+      ...toolWidgetDescriptorMeta(runtime, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
     async ({ workspaceId, sessionId, chars, columns, rows, yieldTimeMs, maxOutputTokens }) => {
@@ -705,13 +655,14 @@ function registerCodexProcessTools(
 }
 
 export function createMcpServer(
-  config: ServerConfig,
+  runtime: RuntimeConfig,
   workspaces: WorkspaceRegistry,
   reviewCheckpoints: ReturnType<typeof createReviewCheckpointManager>,
   processSessions: ProcessSessionManager,
   resolveLocalAgentProviders: () => LocalAgentProviderStatus[],
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
 ): McpServer {
+  const { config } = runtime;
   const server = new McpServer(
     {
       name: "devspace",
@@ -721,7 +672,7 @@ export function createMcpServer(
         "Coding tools for project workspaces. Open each project or worktree once, then reuse its workspaceId.",
     },
     {
-      instructions: serverInstructions(config),
+      instructions: runtime.instructions,
     },
   );
 
@@ -803,7 +754,7 @@ export function createMcpServer(
         skillDiagnostics: z.array(z.unknown()).optional(),
         instruction: z.string(),
       },
-      ...toolWidgetDescriptorMeta(config, "workspace"),
+      ...toolWidgetDescriptorMeta(runtime, "workspace"),
       annotations: { readOnlyHint: true },
     },
     async ({ path, mode, baseRef }, { _meta }) => {
@@ -818,7 +769,7 @@ export function createMcpServer(
         { path, mode, baseRef },
         { conversationScopeId: openAiConversationScopeId(_meta) },
       );
-      if (config.widgets === "changes") {
+      if (runtime.presentation.kind === "changes") {
         await reviewCheckpoints.initializeWorkspace({
           workspaceId: workspace.id,
           root: workspace.root,
@@ -857,9 +808,7 @@ export function createMcpServer(
       const visibleAgents = includeBootstrapContext ? cardAgents : [];
       const loadedAgentsFiles = includeBootstrapContext ? cardAgentsFiles : [];
       const availableAgentsFileOutputs = includeBootstrapContext ? cardAvailableAgentsFiles : [];
-      const cardInstruction = config.skillsEnabled
-        ? "Use this workspaceId for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file. When a task matches an available skill in skills, read its path before proceeding."
-        : "Use this workspaceId for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file.";
+      const cardInstruction = runtime.skills.workspaceInstruction;
       const instruction = workspaceReused
         ? [
             `Workspace already open as ${workspace.id}.`,
@@ -967,9 +916,7 @@ export function createMcpServer(
         [
           "Read a file in a workspace. Use this for file inspection instead of shell commands like cat or sed.",
           "Use this tool to inspect relevant AGENTS.md or CLAUDE.md files listed by open_workspace before working in nested directories.",
-          config.skillsEnabled
-            ? "If available skills were returned and a task matches one, read that skill's path before proceeding. Skill paths may be outside the workspace; only advertised SKILL.md files and files under already-loaded skill directories are readable."
-            : "",
+          runtime.skills.readDescription,
         ]
           .filter(Boolean)
           .join(" "),
@@ -980,9 +927,7 @@ export function createMcpServer(
         path: z
           .string()
           .describe(
-            config.skillsEnabled
-              ? "File path to read, relative to the workspace root. May also be an advertised skill path from open_workspace skills."
-              : "File path to read, relative to the workspace root.",
+            runtime.skills.readPathDescription,
           ),
         offset: z
           .number()
@@ -998,7 +943,7 @@ export function createMcpServer(
           .describe("Maximum number of lines to read."),
       },
       outputSchema: resultOutputSchema(),
-      ...toolWidgetDescriptorMeta(config, "read"),
+      ...toolWidgetDescriptorMeta(runtime, "read"),
       annotations: { readOnlyHint: true },
     },
     async ({ workspaceId, ...input }) => {
@@ -1055,7 +1000,7 @@ export function createMcpServer(
     },
   );
 
-  if (config.toolMode !== "codex") {
+  if (runtime.tools.kind === "classic") {
   registerAppTool(
     server,
     toolNames.write,
@@ -1073,7 +1018,7 @@ export function createMcpServer(
         content: z.string().describe("Complete new file content."),
       },
       outputSchema: resultOutputSchema(),
-      ...toolWidgetDescriptorMeta(config, "write"),
+      ...toolWidgetDescriptorMeta(runtime, "write"),
       annotations: WRITE_TOOL_ANNOTATIONS,
     },
     async ({ workspaceId, ...input }) => {
@@ -1160,7 +1105,7 @@ export function createMcpServer(
       outputSchema: resultOutputSchema({
         status: z.literal("applied"),
       }),
-      ...toolWidgetDescriptorMeta(config, "edit"),
+      ...toolWidgetDescriptorMeta(runtime, "edit"),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
     async ({ workspaceId, ...input }) => {
@@ -1221,7 +1166,7 @@ export function createMcpServer(
   );
   }
 
-  if (config.toolMode === "codex") {
+  if (runtime.tools.kind === "codex") {
     registerAppTool(
       server,
       "apply_patch",
@@ -1248,7 +1193,7 @@ export function createMcpServer(
             }),
           ),
         }),
-        ...toolWidgetDescriptorMeta(config, "edit"),
+        ...toolWidgetDescriptorMeta(runtime, "edit"),
         annotations: EDIT_TOOL_ANNOTATIONS,
       },
       async ({ workspaceId, patch }) => {
@@ -1296,7 +1241,7 @@ export function createMcpServer(
     );
   }
 
-  if (config.widgets === "changes") {
+  if (runtime.presentation.kind === "changes") {
     registerAppTool(
       server,
       "show_changes",
@@ -1310,7 +1255,7 @@ export function createMcpServer(
             .describe(workspaceIdDescription),
         },
         outputSchema: resultOutputSchema(),
-        ...toolWidgetDescriptorMeta(config, "show_changes"),
+        ...toolWidgetDescriptorMeta(runtime, "show_changes"),
         annotations: { readOnlyHint: true },
       },
       async ({ workspaceId }) => {
@@ -1351,7 +1296,7 @@ export function createMcpServer(
     );
   }
 
-  if (config.toolMode === "full") {
+  if (runtime.tools.kind === "classic" && runtime.tools.inspection === "dedicated") {
     registerAppTool(
       server,
       toolNames.grep,
@@ -1373,7 +1318,7 @@ export function createMcpServer(
           include: z.string().optional().describe("Optional include glob."),
         },
         outputSchema: resultOutputSchema(),
-        ...toolWidgetDescriptorMeta(config, "search"),
+        ...toolWidgetDescriptorMeta(runtime, "search"),
         annotations: { readOnlyHint: true },
       },
       async ({ workspaceId, ...input }) => {
@@ -1443,7 +1388,7 @@ export function createMcpServer(
             .describe("Optional path scope relative to the workspace root."),
         },
         outputSchema: resultOutputSchema(),
-        ...toolWidgetDescriptorMeta(config, "search"),
+        ...toolWidgetDescriptorMeta(runtime, "search"),
         annotations: { readOnlyHint: true },
       },
       async ({ workspaceId, ...input }) => {
@@ -1513,7 +1458,7 @@ export function createMcpServer(
             ),
         },
         outputSchema: resultOutputSchema(),
-        ...toolWidgetDescriptorMeta(config, "directory"),
+        ...toolWidgetDescriptorMeta(runtime, "directory"),
         annotations: { readOnlyHint: true },
       },
       async ({ workspaceId, ...input }) => {
@@ -1562,15 +1507,13 @@ export function createMcpServer(
     );
   }
 
-  if (config.toolMode !== "codex") {
+  if (runtime.tools.kind === "classic") {
   registerAppTool(
     server,
     toolNames.shell,
     {
       title: "Bash",
-      description: config.toolMode !== "full"
-        ? `Run a shell command in a workspace. Use only for tests, builds, git inspection, package scripts, search, file discovery, and directory inspection. In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use command-line tools such as grep, rg, find, ls, and tree for those read-only inspection actions. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read} for direct file reads. This is powerful execution and should only be exposed behind strong authentication.`
-        : `Run a shell command in a workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. This is powerful execution and should only be exposed behind strong authentication.`,
+      description: runtime.tools.shellDescription,
       inputSchema: {
         workspaceId: z
           .string()
@@ -1594,7 +1537,7 @@ export function createMcpServer(
           .describe("Timeout in seconds. Defaults to 30, max 300."),
       },
       outputSchema: resultOutputSchema(),
-      ...toolWidgetDescriptorMeta(config, "shell"),
+      ...toolWidgetDescriptorMeta(runtime, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
     async ({ workspaceId, workingDirectory, ...input }) => {
@@ -1654,11 +1597,11 @@ export function createMcpServer(
   );
   }
 
-  if (config.toolMode === "codex") {
-    registerCodexProcessTools(server, config, workspaces, processSessions);
+  if (runtime.tools.kind === "codex") {
+    registerCodexProcessTools(server, runtime, workspaces, processSessions);
   }
 
-  if (config.artifactsEnabled && isArtifactDownloadSupportedPlatform()) {
+  if (runtime.artifacts.status === "available") {
     registerArtifactTools(server, {
       config,
       workspaces,
@@ -1677,6 +1620,7 @@ export function createServer(
   config = loadConfig(),
   options: CreateServerOptions = {},
 ): RunningServer {
+  const runtime = compileRuntime(config);
   const incomingArtifactAdapters = options.incomingArtifactAdapters
     ?? [createOpenAIIncomingArtifactAdapter()];
   const allowedHosts = config.allowedHosts.includes("*")
@@ -1862,7 +1806,7 @@ export function createServer(
         };
 
         const server = createMcpServer(
-          config,
+          runtime,
           workspaces,
           reviewCheckpoints,
           processSessions,
@@ -1891,6 +1835,7 @@ export function createServer(
   return {
     app,
     config,
+    runtime,
     localAgentProviders,
     close: () => {
       closePromise ??= (async () => {
@@ -1915,7 +1860,7 @@ async function isMainModule(): Promise<boolean> {
 }
 
 if (await isMainModule()) {
-  const { app, config, close, localAgentProviders } = createServer();
+  const { app, config, runtime, close, localAgentProviders } = createServer();
   const httpServer = app.listen(config.port, config.host, () => {
     console.log(
       `devspace listening on http://${config.host}:${config.port}/mcp`,
@@ -1926,10 +1871,10 @@ if (await isMainModule()) {
     console.log(`request logging: ${config.logging.requests ? "enabled" : "disabled"}`);
     console.log(`asset logging: ${config.logging.assets ? "enabled" : "disabled"}`);
     console.log(`trust proxy: ${config.logging.trustProxy ? "enabled" : "disabled"}`);
-    const artifactDownloadStatus = !config.artifactsEnabled
-      ? "disabled"
-      : isArtifactDownloadSupportedPlatform()
-        ? "enabled"
+    const artifactDownloadStatus = runtime.artifacts.status === "available"
+      ? "enabled"
+      : runtime.artifacts.reason === "disabled"
+        ? "disabled"
         : `unsupported on ${process.platform}`;
     console.log(`native artifact download: ${artifactDownloadStatus}`);
     console.log(`subagent providers: ${formatLocalAgentProviderStatusSummary(localAgentProviders)}`);

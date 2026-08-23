@@ -12,6 +12,7 @@ import type { LocalAgentProviderAvailability } from "./local-agent-availability.
 import { buildLocalAgentProviderStatuses } from "./local-agent-catalog.js";
 import type { SubagentsConfig } from "./local-agent-config.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
+import { compileRuntime } from "./runtime-config.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { createMcpServer } from "./server.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
@@ -230,7 +231,7 @@ test("checkout reuse and context suppression survive a registry restart", async 
 
   const restoredStore = new SqliteWorkspaceStore(context.stateDir);
   const restoredServer = createMcpServer(
-    context.config,
+    compileRuntime(context.config),
     new WorkspaceRegistry(context.config, restoredStore),
     createReviewCheckpointManager(),
     new ProcessSessionManager(),
@@ -345,7 +346,7 @@ async function fixture(
   const store = new SqliteWorkspaceStore(stateDir);
   const workspaces = new WorkspaceRegistry(config, store);
   const server = createMcpServer(
-    config,
+    compileRuntime(config),
     workspaces,
     createReviewCheckpointManager(),
     new ProcessSessionManager(),

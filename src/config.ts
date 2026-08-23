@@ -13,7 +13,7 @@ const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_ARTIFACT_MAX_FILE_BYTES = 100 * 1024 * 1024;
 
-export interface ServerConfig {
+export interface ResolvedConfig {
   host: string;
   port: number;
   oauth: OAuthConfig;
@@ -34,6 +34,8 @@ export interface ServerConfig {
   agentDir: string;
   logging: LoggingConfig;
 }
+
+export type ServerConfig = ResolvedConfig;
 
 function parsePort(value: string | number | undefined): number {
   if (value === undefined || value === "") return 7676;
@@ -215,7 +217,7 @@ function defaultAgentDir(): string {
   return join(homedir(), ".codex");
 }
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): ResolvedConfig {
   const files = loadDevspaceFiles(env);
   const host = env.HOST ?? files.config.host ?? "127.0.0.1";
   const port = parsePort(env.PORT ?? files.config.port);
