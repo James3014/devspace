@@ -21,6 +21,10 @@ assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "full" }).toolMode, "f
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TOOL_MODE: "codex" }).toolMode, "codex");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "0" }).toolMode, "full");
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "1" }).toolMode, "minimal");
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_MINIMAL_TOOLS: "maybe" }),
+  /Invalid DEVSPACE_MINIMAL_TOOLS: maybe/,
+);
 assert.equal(loadConfig(baseEnv).skillsEnabled, true);
 assert.equal(loadConfig(baseEnv).devspaceSkillsDir, join(emptyConfigDir, "skills"));
 assert.equal(loadConfig(baseEnv).devspaceAgentsDir, join(emptyConfigDir, "agents"));
@@ -34,10 +38,18 @@ assert.equal(
 );
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "0" }).skillsEnabled, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "1" }).skillsEnabled, true);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "treu" }),
+  /Invalid DEVSPACE_SKILLS: treu/,
+);
 assert.deepEqual(loadConfig({ ...baseEnv, DEVSPACE_SUBAGENTS: "1" }).subagents, {
   enabled: true,
   providers: [],
 });
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_SUBAGENTS: "sometimes" }),
+  /Invalid DEVSPACE_SUBAGENTS: sometimes/,
+);
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "invalid" }),
   /Invalid DEVSPACE_WIDGETS: invalid/,
