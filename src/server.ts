@@ -50,6 +50,10 @@ import {
   type McpSessionCloseResult,
 } from "./mcp-sessions.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
+import {
+  CodexGoalSessionManager,
+  type CodexGoalState,
+} from "./codex-goal-sessions.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { openAiConversationScopeId } from "./request-meta.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
@@ -216,8 +220,12 @@ function serverInstructions(config: ServerConfig): string {
     ? " Use git_commit to form a scoped Candidate from exact paths. Use git_push to publish Candidate HEAD to a non-default branch. Do not use bash for git mutation."
     : "";
 
+  const codexGoalsInstruction = config.codexGoalsEnabled
+    ? " When a task should be delegated to the real interactive Codex CLI, use codex_goal_start to launch a /goal session in an open workspace, then poll codex_goal_status, send follow-ups with codex_goal_continue, and stop it with codex_goal_cancel."
+    : "";
+
   if (config.toolMode === "codex") {
-    return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Open it again when the workspaceId is invalid, the project changes, checkout/worktree mode changes, or another isolated worktree is needed. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}${agentToolsInstruction}${gitCandidatesInstruction}`;
+    return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree and reuse its workspaceId. Open it again when the workspaceId is invalid, the project changes, checkout/worktree mode changes, or another isolated worktree is needed. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}${agentToolsInstruction}${gitCandidatesInstruction}${codexGoalsInstruction}`;
   }
 
   const inspection = config.toolMode !== "full"
@@ -230,7 +238,7 @@ function serverInstructions(config: ServerConfig): string {
 
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
 
-  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching to a different project folder, changing checkout/worktree mode, the workspaceId is rejected as unknown, or a new isolated worktree is requested. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}${agentToolsInstruction}${gitCandidatesInstruction}`;
+  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching to a different project folder, changing checkout/worktree mode, the workspaceId is rejected as unknown, or a new isolated worktree is requested. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}${agentToolsInstruction}${gitCandidatesInstruction}${codexGoalsInstruction}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -715,6 +723,273 @@ function registerCodexProcessTools(
   );
 }
 
+function codexGoalStateStructured(state: CodexGoalState): Record<string, unknown> {
+  return {
+    goalId: state.goalId,
+    workspaceId: state.workspaceId,
+    running: state.running,
+    terminal: state.terminal,
+    exitCode: state.exitCode,
+    signal: state.signal,
+    goalActiveObserved: state.goalActiveObserved,
+    wallTimeMs: state.wallTimeMs,
+    outputChunk: state.outputChunk,
+    outputTruncated: state.outputTruncated,
+    model: state.model,
+    reasoningEffort: state.reasoningEffort,
+    baseHead: state.baseHead,
+    terminalReason: state.terminalReason,
+  };
+}
+
+function codexGoalResultText(action: string, state: CodexGoalState): string {
+  const status = state.terminal
+    ? `terminal (${state.terminalReason ?? "exited"}, exitCode=${state.exitCode ?? "unknown"})`
+    : state.goalActiveObserved
+      ? "running with Goal Mode active"
+      : "running";
+  const output = state.outputChunk.trim();
+  return [
+    `Codex goal ${state.goalId} ${action}: ${status}.`,
+    output ? `Output:\n${output}` : undefined,
+  ].filter(Boolean).join("\n");
+}
+
+function registerCodexGoalTools(
+  server: McpServer,
+  config: ServerConfig,
+  workspaces: WorkspaceRegistry,
+  goals: CodexGoalSessionManager,
+): void {
+  const GOAL_START_ANNOTATIONS = {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: false,
+    openWorldHint: true,
+  };
+
+  registerAppTool(
+    server,
+    "codex_goal_start",
+    {
+      title: "Start Codex goal",
+      description:
+        "Launch a real interactive Codex CLI session in an open workspace and activate its /goal mode with the given goal text. Runs the actual Codex CLI binary in a PTY inside the exact opened workspace; never uses bash or the Codex SDK. The workspace must be clean, and expectedHead must match the current Git HEAD when provided. Only one active Codex goal is allowed per workspace.",
+      inputSchema: {
+        workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+        goal: z
+          .string()
+          .min(1)
+          .max(20_000)
+          .describe("Goal text passed to the interactive /goal command."),
+        model: z.string().optional().describe("Codex model to select (for example gpt-5.6-sol). Omit for the CLI default."),
+        reasoningEffort: z
+          .enum(["minimal", "low", "medium", "high", "xhigh"])
+          .optional()
+          .describe("Reasoning effort for the selected model."),
+        expectedHead: z
+          .string()
+          .regex(/^[0-9a-fA-F]{40}$/, "expectedHead must be a valid 40-character commit SHA.")
+          .optional()
+          .describe("Exact 40-character Git HEAD the workspace must be at before launch. The start fails closed on mismatch."),
+      },
+      outputSchema: {
+        goalId: z.string(),
+        workspaceId: z.string(),
+        running: z.boolean(),
+        terminal: z.boolean(),
+        exitCode: z.number().int().optional(),
+        signal: z.string().optional(),
+        goalActiveObserved: z.boolean(),
+        wallTimeMs: z.number().nonnegative(),
+        outputChunk: z.string(),
+        outputTruncated: z.boolean(),
+        model: z.string().optional(),
+        reasoningEffort: z.string().optional(),
+        baseHead: z.string().optional(),
+        terminalReason: z.string().optional(),
+      },
+      _meta: {},
+      annotations: GOAL_START_ANNOTATIONS,
+    },
+    async ({ workspaceId, goal, model, reasoningEffort, expectedHead }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      let state: CodexGoalState;
+      try {
+        state = await goals.start({
+          workspaceId,
+          workspaceRoot: workspace.root,
+          goal,
+          ...(model ? { model } : {}),
+          ...(reasoningEffort ? { reasoningEffort } : {}),
+          ...(expectedHead ? { expectedHead } : {}),
+        });
+      } catch (error) {
+        logFailedToolResponse(config, {
+          tool: "codex_goal_start",
+          workspaceId,
+        }, [textBlock(error instanceof Error ? error.message : String(error))], startedAt);
+        throw error;
+      }
+      logToolCall(config, {
+        tool: "codex_goal_start",
+        workspaceId,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        content: [textBlock(codexGoalResultText("started", state))],
+        structuredContent: codexGoalStateStructured(state),
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "codex_goal_status",
+    {
+      title: "Codex goal status",
+      description:
+        "Poll one exact Codex CLI goal session owned by this workspace. Returns running/terminal state, whether Goal Mode was observed active, wall time, and new output since the last poll. Never creates a replacement Codex process.",
+      inputSchema: {
+        workspaceId: z.string().describe("Workspace identifier used to start the goal."),
+        goalId: z.string().describe("Exact goal ID returned by codex_goal_start."),
+        waitMs: z.number().int().min(0).max(30_000).optional().describe("Milliseconds to poll for new output. Default 0."),
+      },
+      outputSchema: {
+        goalId: z.string(),
+        workspaceId: z.string(),
+        running: z.boolean(),
+        terminal: z.boolean(),
+        exitCode: z.number().int().optional(),
+        signal: z.string().optional(),
+        goalActiveObserved: z.boolean(),
+        wallTimeMs: z.number().nonnegative(),
+        outputChunk: z.string(),
+        outputTruncated: z.boolean(),
+        model: z.string().optional(),
+        reasoningEffort: z.string().optional(),
+        baseHead: z.string().optional(),
+        terminalReason: z.string().optional(),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: true },
+    },
+    async ({ workspaceId, goalId, waitMs }) => {
+      workspaces.getWorkspace(workspaceId);
+      const state = await goals.status(workspaceId, goalId, { waitMs });
+      return {
+        content: [textBlock(codexGoalResultText("status", state))],
+        structuredContent: codexGoalStateStructured(state),
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "codex_goal_continue",
+    {
+      title: "Continue Codex goal",
+      description:
+        "Send a follow-up message into the same live Codex CLI goal session. Rejects unknown, cross-workspace, or already-terminal goals and never spawns a second Codex process.",
+      inputSchema: {
+        workspaceId: z.string().describe("Workspace identifier used to start the goal."),
+        goalId: z.string().describe("Exact goal ID returned by codex_goal_start."),
+        message: z.string().min(1).max(20_000).describe("Follow-up message for the active goal."),
+      },
+      outputSchema: {
+        goalId: z.string(),
+        workspaceId: z.string(),
+        running: z.boolean(),
+        terminal: z.boolean(),
+        exitCode: z.number().int().optional(),
+        signal: z.string().optional(),
+        goalActiveObserved: z.boolean(),
+        wallTimeMs: z.number().nonnegative(),
+        outputChunk: z.string(),
+        outputTruncated: z.boolean(),
+        model: z.string().optional(),
+        reasoningEffort: z.string().optional(),
+        baseHead: z.string().optional(),
+        terminalReason: z.string().optional(),
+      },
+      _meta: {},
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async ({ workspaceId, goalId, message }) => {
+      workspaces.getWorkspace(workspaceId);
+      const state = await goals.continue(workspaceId, goalId, message);
+      logToolCall(config, {
+        tool: "codex_goal_continue",
+        workspaceId,
+        success: true,
+        durationMs: 0,
+      });
+      return {
+        content: [textBlock(codexGoalResultText("continued", state))],
+        structuredContent: codexGoalStateStructured(state),
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "codex_goal_cancel",
+    {
+      title: "Cancel Codex goal",
+      description:
+        "Terminate exactly the Codex CLI process owned by this goal session. Cancelling an already-terminal goal returns its preserved final state. Repeated calls are safe.",
+      inputSchema: {
+        workspaceId: z.string().describe("Workspace identifier used to start the goal."),
+        goalId: z.string().describe("Exact goal ID returned by codex_goal_start."),
+      },
+      outputSchema: {
+        goalId: z.string(),
+        workspaceId: z.string(),
+        running: z.boolean(),
+        terminal: z.boolean(),
+        exitCode: z.number().int().optional(),
+        signal: z.string().optional(),
+        goalActiveObserved: z.boolean(),
+        wallTimeMs: z.number().nonnegative(),
+        outputChunk: z.string(),
+        outputTruncated: z.boolean(),
+        model: z.string().optional(),
+        reasoningEffort: z.string().optional(),
+        baseHead: z.string().optional(),
+        terminalReason: z.string().optional(),
+      },
+      _meta: {},
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ workspaceId, goalId }) => {
+      workspaces.getWorkspace(workspaceId);
+      const state = await goals.cancel(workspaceId, goalId);
+      logToolCall(config, {
+        tool: "codex_goal_cancel",
+        workspaceId,
+        success: true,
+        durationMs: 0,
+      });
+      return {
+        content: [textBlock(codexGoalResultText("cancelled", state))],
+        structuredContent: codexGoalStateStructured(state),
+      };
+    },
+  );
+}
+
 export function createMcpServer(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
@@ -723,6 +998,7 @@ export function createMcpServer(
   localAgentProviders: LocalAgentProviderAvailability[],
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
   agentSessionManager?: LocalAgentSessionManager,
+  codexGoals?: CodexGoalSessionManager,
 ): McpServer {
   const server = new McpServer(
     {
@@ -1673,6 +1949,13 @@ export function createMcpServer(
     registerCodexProcessTools(server, config, workspaces, processSessions);
   }
 
+  // Narrow opt-in Codex Goal capability. Available in every tool mode, but it
+  // exposes only special-purpose goal actions; generic exec_command/write_stdin
+  // stay hidden outside codex mode.
+  if (config.codexGoalsEnabled && codexGoals) {
+    registerCodexGoalTools(server, config, workspaces, codexGoals);
+  }
+
   if (config.artifactsEnabled && isArtifactDownloadSupportedPlatform()) {
     registerArtifactTools(server, {
       config,
@@ -2372,6 +2655,9 @@ export function createServer(
   const agentSessionManager = config.subagents
     ? new LocalAgentSessionManager(config)
     : undefined;
+  const codexGoals = config.codexGoalsEnabled
+    ? new CodexGoalSessionManager(processSessions, { codexBin: config.codexBin })
+    : undefined;
 
   const agentSupervisionTimer = agentSessionManager
     ? setInterval(() => {
@@ -2545,6 +2831,7 @@ export function createServer(
           localAgentProviders,
           incomingArtifactAdapters,
           agentSessionManager,
+          codexGoals,
         );
         await server.connect(transport);
       } else {
@@ -2575,6 +2862,7 @@ export function createServer(
         if (agentSupervisionTimer) clearInterval(agentSupervisionTimer);
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
+        codexGoals?.shutdown();
         processSessions.shutdown();
         oauthProvider.close();
         workspaceStore.close?.();
@@ -2612,6 +2900,9 @@ if (await isMainModule()) {
     console.log(`native artifact download: ${artifactDownloadStatus}`);
     if (config.subagents) {
       console.log(`subagent providers: ${formatLocalAgentProviderAvailabilitySummary(localAgentProviders)}`);
+    }
+    if (config.codexGoalsEnabled) {
+      console.log(`codex goal tools: enabled${config.codexBin ? ` (${config.codexBin})` : ""}`);
     }
   });
 
