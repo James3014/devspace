@@ -310,6 +310,15 @@ test("codex mode compatibility: goal tools coexist with exec_command/write_stdin
   }
   assert.equal(tools.tools.some((tool) => tool.name === "exec_command"), true);
   assert.equal(tools.tools.some((tool) => tool.name === "write_stdin"), true);
+
+  const startTool = tools.tools.find((tool) => tool.name === "codex_goal_start");
+  const continueTool = tools.tools.find((tool) => tool.name === "codex_goal_continue");
+  const statusTool = tools.tools.find((tool) => tool.name === "codex_goal_status");
+  const cancelTool = tools.tools.find((tool) => tool.name === "codex_goal_cancel");
+  assert.equal(startTool?.annotations?.destructiveHint, true);
+  assert.equal(continueTool?.annotations?.destructiveHint, true);
+  assert.equal(statusTool?.annotations?.readOnlyHint, true);
+  assert.equal(cancelTool?.annotations?.destructiveHint, true);
 });
 
 // ── Start fences ─────────────────────────────────────────────────────────────
@@ -322,6 +331,19 @@ test("invalid workspace rejected without spawning Codex", async (t) => {
   });
   assert.equal(result.isError, true);
   assert.match(textOf(result), /Unknown workspace/);
+  assert.equal(spawnCount(context.spawnLogPath), 0);
+});
+
+test("missing expectedHead is rejected for Git workspaces before the Codex process is created", async (t) => {
+  const context = await goalFixture(t);
+  const workspaceId = await openWorkspace(context.client, context.projectA);
+
+  const result = await callTool(context.client, "codex_goal_start", {
+    workspaceId,
+    goal: "inspect the repo",
+  });
+  assert.equal(result.isError, true);
+  assert.match(textOf(result), /expectedHead is required/);
   assert.equal(spawnCount(context.spawnLogPath), 0);
 });
 
@@ -436,7 +458,9 @@ test("large goal input is typed in chunks instead of one swallowed paste", async
 });
 
 test("start fails closed when Goal activation is never observed", async (t) => {
-  const context = await goalFixture(t, { emitGoalMarker: false, startupTimeoutMs: 800 });
+  // Generous startup window so the fake TUI fully boots; the point under test
+  // is that Goal activation itself is never observed.
+  const context = await goalFixture(t, { emitGoalMarker: false, startupTimeoutMs: 4_000 });
   const workspaceId = await openWorkspace(context.client, context.projectA);
 
   const started = await callTool(context.client, "codex_goal_start", {
@@ -459,6 +483,7 @@ test("start fails clearly when no Codex binary can be resolved", async (t) => {
   const result = await callTool(context.client, "codex_goal_start", {
     workspaceId,
     goal: "anything",
+    expectedHead: await headSha(context.projectA),
   });
   assert.equal(result.isError, true);
   assert.match(textOf(result), /not an executable file|not found/);

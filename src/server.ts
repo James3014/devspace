@@ -763,7 +763,7 @@ function registerCodexGoalTools(
 ): void {
   const GOAL_START_ANNOTATIONS = {
     readOnlyHint: false,
-    destructiveHint: false,
+    destructiveHint: true,
     idempotentHint: false,
     openWorldHint: true,
   };
@@ -774,7 +774,7 @@ function registerCodexGoalTools(
     {
       title: "Start Codex goal",
       description:
-        "Launch a real interactive Codex CLI session in an open workspace and activate its /goal mode with the given goal text. Runs the actual Codex CLI binary in a PTY inside the exact opened workspace; never uses bash or the Codex SDK. The workspace must be clean, and expectedHead must match the current Git HEAD when provided. Only one active Codex goal is allowed per workspace.",
+        "Launch a real interactive Codex CLI session in an open workspace and activate its /goal mode with the given goal text. Runs the actual Codex CLI binary in a PTY inside the exact opened workspace; never uses bash or the Codex SDK. Git workspaces must be clean and must provide expectedHead matching the current Git HEAD. Only one active Codex goal is allowed per workspace.",
       inputSchema: {
         workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
         goal: z
@@ -791,7 +791,7 @@ function registerCodexGoalTools(
           .string()
           .regex(/^[0-9a-fA-F]{40}$/, "expectedHead must be a valid 40-character commit SHA.")
           .optional()
-          .describe("Exact 40-character Git HEAD the workspace must be at before launch. The start fails closed on mismatch."),
+          .describe("Exact 40-character Git HEAD the workspace must be at before launch. Required for Git workspaces; start fails closed when missing or mismatched."),
       },
       outputSchema: {
         goalId: z.string(),
@@ -917,7 +917,7 @@ function registerCodexGoalTools(
       _meta: {},
       annotations: {
         readOnlyHint: false,
-        destructiveHint: false,
+        destructiveHint: true,
         idempotentHint: false,
         openWorldHint: true,
       },

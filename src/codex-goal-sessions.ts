@@ -246,11 +246,14 @@ export class CodexGoalSessionManager {
 
     let baseHead: string | undefined;
     if (await isInsideGitRepository(input.workspaceRoot)) {
+      if (!input.expectedHead) {
+        throw new Error("expectedHead is required when starting a Codex goal in a Git workspace.");
+      }
       baseHead = await readWorkspaceHead(input.workspaceRoot);
       if (!baseHead) {
         throw new Error("Workspace is a Git repository without a resolvable HEAD commit.");
       }
-      if (input.expectedHead && input.expectedHead.toLowerCase() !== baseHead.toLowerCase()) {
+      if (input.expectedHead.toLowerCase() !== baseHead.toLowerCase()) {
         throw new Error(
           `expectedHead mismatch: workspace HEAD is ${baseHead}, expected ${input.expectedHead}.`,
         );
