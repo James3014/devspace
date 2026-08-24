@@ -29,6 +29,11 @@ assert.equal(loadConfig(baseEnv).subagents, false);
 assert.equal(loadConfig(baseEnv).artifactsEnabled, false);
 assert.equal(loadConfig(baseEnv).artifactMaxFileBytes, 100 * 1024 * 1024);
 assert.equal(loadConfig(baseEnv).agentMaxConcurrent, 4);
+assert.equal(loadConfig(baseEnv).codexGoalsEnabled, false);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_CODEX_GOALS: "1" }).codexGoalsEnabled, true);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_CODEX_GOALS: "0" }).codexGoalsEnabled, false);
+assert.equal(loadConfig(baseEnv).codexBin, undefined);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_CODEX_BIN: "/custom/codex" }).codexBin, "/custom/codex");
 assert.deepEqual(loadConfig(baseEnv).toolchains, []);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_MAX_CONCURRENT_AGENTS: "2" }).agentMaxConcurrent, 2);
 assert.equal(

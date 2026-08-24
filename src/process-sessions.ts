@@ -12,6 +12,8 @@ const COMPLETED_SESSION_TTL_MS = 5 * 60 * 1_000;
 const DEFAULT_COLUMNS = 80;
 const DEFAULT_ROWS = 24;
 
+export type ProcessEnvironmentPolicy = "inherit" | "sanitized";
+
 export interface StartCommandInput {
   workspaceId: string;
   command: string;
@@ -22,6 +24,19 @@ export interface StartCommandInput {
   rows?: number;
   yieldTimeMs?: number;
   maxOutputTokens?: number;
+  /**
+   * Spawn this exact executable with these arguments instead of interpreting
+   * `command` through a shell. Use for untrusted or structured invocations.
+   */
+  executable?: string;
+  args?: string[];
+  /**
+   * `inherit` copies the DevSpace process environment (default, unchanged
+   * behavior). `sanitized` passes only an allowlist of variables needed for
+   * normal local CLI operation so secrets such as OAuth tokens are never
+   * inherited by model-controlled subprocesses.
+   */
+  environmentPolicy?: ProcessEnvironmentPolicy;
 }
 
 export interface WriteStdinInput {
@@ -87,22 +102,46 @@ function terminalSize(value: number | undefined, fallback: number): number {
   return value;
 }
 
-function processEnvironment(input?: {
-  workspaceId?: string;
-  workspaceRoot?: string;
-}): Record<string, string> {
+const SANITIZED_ENVIRONMENT_ALLOWLIST = new Set([
+  "HOME",
+  "PATH",
+  "USER",
+  "LOGNAME",
+  "SHELL",
+  "TMPDIR",
+  "CODEX_HOME",
+]);
+
+export function processEnvironment(
+  policy: ProcessEnvironmentPolicy = "inherit",
+  input?: {
+    workspaceId?: string;
+    workspaceRoot?: string;
+  },
+): Record<string, string> {
+  const source = Object.fromEntries(
+    Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
+  );
+  const base = policy === "sanitized"
+    ? Object.fromEntries(
+        Object.entries(source).filter(
+          ([key]) =>
+            SANITIZED_ENVIRONMENT_ALLOWLIST.has(key) ||
+            key.startsWith("LC_") ||
+            key.startsWith("XDG_"),
+        ),
+      )
+    : source;
+
   return {
-    ...Object.fromEntries(
-      Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
-    ),
-    NO_COLOR: "1",
-    TERM: "dumb",
+    ...base,
+    ...(policy === "sanitized" ? { TERM: base.TERM ?? source.TERM ?? "xterm-256color" } : { NO_COLOR: "1", TERM: "dumb" }),
     PAGER: "cat",
     GIT_PAGER: "cat",
     GH_PAGER: "cat",
     CODEX_CI: "1",
-    LANG: process.env.LANG ?? "C.UTF-8",
-    LC_ALL: process.env.LC_ALL ?? "C.UTF-8",
+    LANG: source.LANG ?? "C.UTF-8",
+    LC_ALL: source.LC_ALL ?? "C.UTF-8",
     ...(input?.workspaceId ? { DEVSPACE_WORKSPACE_ID: input.workspaceId } : {}),
     ...(input?.workspaceRoot ? { DEVSPACE_WORKSPACE_ROOT: input.workspaceRoot } : {}),
   };
@@ -323,19 +362,30 @@ export class ProcessSessionManager {
   }
 
   private startPipe(session: ProcessSession, input: StartCommandInput): void {
-    const shell = resolveShellCommand(input.command);
     const detached = process.platform !== "win32";
-    const child = spawn(input.command, {
-      cwd: input.cwd,
-      env: processEnvironment({
-        workspaceId: input.workspaceId,
-        workspaceRoot: input.workspaceRoot,
-      }),
-      stdio: "pipe",
-      windowsHide: true,
-      detached,
-      shell: shell.executable,
+    const env = processEnvironment(input.environmentPolicy, {
+      workspaceId: input.workspaceId,
+      workspaceRoot: input.workspaceRoot,
     });
+    const child = input.executable
+      ? spawn(input.executable, input.args ?? [], {
+          cwd: input.cwd,
+          env,
+          stdio: "pipe",
+          windowsHide: true,
+          detached,
+        })
+      : (() => {
+          const shell = resolveShellCommand(input.command);
+          return spawn(input.command, {
+            cwd: input.cwd,
+            env,
+            stdio: "pipe",
+            windowsHide: true,
+            detached,
+            shell: shell.executable,
+          });
+        })();
 
     session.process = {
       write: (data) => child.stdin.write(data),
@@ -356,19 +406,30 @@ export class ProcessSessionManager {
       throw new Error("PTY support requires the optional node-pty dependency.");
     }
 
-    const shell = resolveShellCommand(input.command);
+    const env = processEnvironment(input.environmentPolicy, {
+      workspaceId: input.workspaceId,
+      workspaceRoot: input.workspaceRoot,
+    });
     let pty: import("node-pty").IPty;
     try {
-      pty = nodePty.spawn(shell.executable, shell.args, {
-        cwd: input.cwd,
-        env: processEnvironment({
-          workspaceId: input.workspaceId,
-          workspaceRoot: input.workspaceRoot,
-        }),
-        name: "xterm-256color",
-        cols: session.columns,
-        rows: session.rows,
-      });
+      if (input.executable) {
+        pty = nodePty.spawn(input.executable, input.args ?? [], {
+          cwd: input.cwd,
+          env,
+          name: "xterm-256color",
+          cols: session.columns,
+          rows: session.rows,
+        });
+      } else {
+        const shell = resolveShellCommand(input.command);
+        pty = nodePty.spawn(shell.executable, shell.args, {
+          cwd: input.cwd,
+          env,
+          name: "xterm-256color",
+          cols: session.columns,
+          rows: session.rows,
+        });
+      }
     } catch (error) {
       throw error;
     }

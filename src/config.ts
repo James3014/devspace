@@ -36,6 +36,8 @@ export interface ServerConfig {
   gitCandidatesEnabled: boolean;
   toolchains: ToolchainSpec[];
   agentMaxConcurrent: number;
+  codexGoalsEnabled: boolean;
+  codexBin?: string;
 }
 
 function parsePort(value: string | number | undefined): number {
@@ -268,6 +270,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       4,
       "DEVSPACE_MAX_CONCURRENT_AGENTS",
     ),
+    codexGoalsEnabled: parseBoolean(env.DEVSPACE_CODEX_GOALS),
+    codexBin: env.DEVSPACE_CODEX_BIN?.trim() || undefined,
   };
 }
 
