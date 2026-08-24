@@ -29,7 +29,7 @@ assert.equal(resolveSubagentsConfig({ ...config, enabled: false }, {
   DEVSPACE_SUBAGENTS: "1",
 }).enabled, true);
 assert.equal(resolveSubagentsConfig(undefined, {}).providers.length, 0);
-assert.equal(resolveSubagentsConfig(true, {}).providers.length, 7);
+assert.equal(resolveSubagentsConfig(true, {}).providers.length, 9);
 
 assert.throws(
   () => resolveSubagentsConfig({

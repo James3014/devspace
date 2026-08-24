@@ -4,17 +4,30 @@ import { basename, join, resolve } from "node:path";
 import { parse as parseYaml } from "yaml";
 import type { ServerConfig } from "./config.js";
 
-export type LocalAgentProvider = "codex" | "claude" | "opencode" | "pi" | "cursor" | "copilot" | "grok";
+export type LocalAgentProvider =
+  | "codex"
+  | "claude"
+  | "opencode"
+  | "omp"
+  | "pi"
+  | "cursor"
+  | "copilot"
+  | "grok"
+  | "agy";
 
 export const LOCAL_AGENT_PROVIDERS: readonly LocalAgentProvider[] = [
   "codex",
   "claude",
   "opencode",
+  "omp",
   "pi",
   "cursor",
   "copilot",
   "grok",
+  "agy",
 ];
+
+export type WriteMode = "read_only" | "allowed";
 
 export interface LocalAgentProfile {
   name: string;
@@ -22,6 +35,7 @@ export interface LocalAgentProfile {
   provider: LocalAgentProvider;
   model?: string;
   effort?: string;
+  write_mode?: WriteMode;
   filePath: string;
   body: string;
   disabled: boolean;
@@ -33,6 +47,7 @@ export interface LocalAgentProfileSummary {
   provider: LocalAgentProvider;
   model?: string;
   effort?: string;
+  write_mode?: WriteMode;
 }
 
 interface ParsedFrontmatter {
@@ -76,6 +91,7 @@ export function summarizeLocalAgentProfile(
     provider: profile.provider,
     model: profile.model,
     effort: profile.effort,
+    write_mode: profile.write_mode,
   };
 }
 
@@ -159,7 +175,8 @@ function profileFromFrontmatter(
     description,
     provider,
     model: readString(frontmatter, "model"),
-    effort: readString(frontmatter, "effort"),
+    effort: readString(frontmatter, "effort") ?? readString(frontmatter, "thinking"),
+    write_mode: readWriteMode(frontmatter, filePath),
     filePath,
     body,
     disabled: frontmatter.disabled === true,
@@ -173,7 +190,7 @@ function readProvider(frontmatter: Record<string, unknown>, filePath: string): L
   }
   if (!PROVIDERS.has(provider as LocalAgentProvider)) {
     throw new Error(
-      `Subagent profile provider must be codex, claude, opencode, pi, cursor, copilot, or grok: ${filePath}`,
+      `Subagent profile provider must be codex, claude, opencode, omp, pi, cursor, copilot, grok, or agy: ${filePath}`,
     );
   }
   return provider as LocalAgentProvider;
@@ -181,6 +198,15 @@ function readProvider(frontmatter: Record<string, unknown>, filePath: string): L
 
 export function isLocalAgentProvider(value: string): value is LocalAgentProvider {
   return PROVIDERS.has(value as LocalAgentProvider);
+}
+
+function readWriteMode(frontmatter: Record<string, unknown>, filePath: string): WriteMode {
+  const value = readString(frontmatter, "write_mode");
+  if (!value) return "read_only";
+  if (value !== "read_only" && value !== "allowed") {
+    throw new Error(`Subagent profile write_mode must be read_only or allowed: ${filePath}`);
+  }
+  return value as WriteMode;
 }
 
 function readString(frontmatter: Record<string, unknown>, key: string): string | undefined {

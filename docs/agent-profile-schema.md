@@ -70,6 +70,7 @@ Required built-in provider id:
 provider: codex
 provider: claude
 provider: opencode
+provider: omp
 provider: pi
 provider: cursor
 provider: copilot
@@ -82,7 +83,9 @@ native integration:
 - `codex`: the host-installed `codex app-server` command
 - `claude`: Claude Code SDK
 - `opencode`: OpenCode SDK
-- `pi`: the installed Pi coding-agent SDK, one in-process session per DevSpace agent
+- `omp`: Oh My Pi ACP (`omp acp`)
+- `pi`: the installed Pi coding-agent SDK
+- `agy`: the Agy CLI in non-interactive `--print` JSON mode
 - `cursor`: ACP
 - `copilot`: ACP
 - `grok`: Grok Build ACP (`grok agent stdio`)
@@ -100,6 +103,7 @@ Optional provider model id or alias.
 ```yaml
 model: gpt-5.4
 model: sonnet
+model: google/gemini-2.5-flash-lite
 ```
 
 ### `effort`
@@ -117,8 +121,10 @@ effort: xhigh
 DevSpace passes this through to providers that expose a matching control:
 
 - `claude`: SDK effort with adaptive thinking.
-- `codex`: app-server model reasoning effort.
+- `codex`: model reasoning effort.
 - `pi`: the AgentSession thinking-level control.
+- `omp`: OMP thinking flag, with the model/provider selector passed through to OMP.
+- `agy`: `--effort`, skipped for preset models whose reasoning tier is fixed.
 - `opencode`: model variant.
 - `cursor` and `copilot`: ACP thought-level config when supported.
 - `grok`: `--reasoning-effort` on startup and xAI's ACP model metadata for resumed sessions.
@@ -153,6 +159,7 @@ devspace agents targets --json
 devspace agents run <profile-or-provider> "<prompt>" --json
 devspace agents continue <id> "<prompt>" --json
 devspace agents show <id> --json
+devspace agents cancel <id> --json
 ```
 
 `open_workspace` exposes compact profile metadata:

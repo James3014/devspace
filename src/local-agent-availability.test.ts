@@ -3,6 +3,7 @@ import {
   checkLocalAgentProviderAvailability,
   formatLocalAgentProviderAvailabilitySummary,
   getLocalAgentProviderAvailabilitySnapshot,
+  resolveAgyExecutable,
 } from "./local-agent-availability.js";
 
 {
@@ -13,6 +14,7 @@ import {
     assert.equal(availability.note, "available");
   }
 }
+assert.equal(checkLocalAgentProviderAvailability("omp").available, true);
 
 {
   const availability = checkLocalAgentProviderAvailability("codex", {
@@ -34,7 +36,7 @@ import {
   });
   assert.deepEqual(
     snapshot.map((provider) => provider.name),
-    ["codex", "claude", "opencode", "pi", "cursor", "copilot", "grok"],
+    ["codex", "claude", "opencode", "omp", "pi", "cursor", "copilot", "grok", "agy"],
   );
   assert.equal(snapshot.find((provider) => provider.name === "pi")?.available, true);
 }
@@ -46,3 +48,11 @@ assert.equal(
   ]),
   "available: codex (available); unavailable: pi (pi executable not found)",
 );
+
+{
+  const agyPath = resolveAgyExecutable({
+    ...process.env,
+    AGY_COMMAND: "/bin/sh",
+  });
+  assert.equal(agyPath, "/bin/sh");
+}

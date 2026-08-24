@@ -3,6 +3,8 @@ import { join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
 import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
+import type { ToolchainSpec } from "./local-agent-toolchains.js";
+import { parseToolchains } from "./local-agent-toolchains.js";
 import { devspaceAgentsDir, devspaceSkillsDir, loadDevspaceFiles } from "./user-config.js";
 import { resolveSubagentsConfig, type SubagentsConfig } from "./local-agent-config.js";
 
@@ -32,6 +34,11 @@ export interface ServerConfig {
   subagents: SubagentsConfig;
   agentDir: string;
   logging: LoggingConfig;
+  gitCandidatesEnabled: boolean;
+  toolchains: ToolchainSpec[];
+  agentMaxConcurrent: number;
+  codexGoalsEnabled: boolean;
+  codexBin?: string;
 }
 
 function parsePort(value: string | number | undefined): number {
@@ -251,6 +258,18 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     subagents: resolveSubagentsConfig(files.config.subagents, env),
     agentDir: resolve(expandHomePath(env.DEVSPACE_AGENT_DIR ?? files.config.agentDir ?? defaultAgentDir())),
     logging: parseLoggingConfig(env),
+    gitCandidatesEnabled:
+      env.DEVSPACE_GIT_CANDIDATES === undefined
+        ? false
+        : parseBoolean(env.DEVSPACE_GIT_CANDIDATES),
+    toolchains: parseToolchains(env.DEVSPACE_TOOLCHAINS),
+    agentMaxConcurrent: parsePositiveInteger(
+      env.DEVSPACE_MAX_CONCURRENT_AGENTS,
+      4,
+      "DEVSPACE_MAX_CONCURRENT_AGENTS",
+    ),
+    codexGoalsEnabled: parseBoolean(env.DEVSPACE_CODEX_GOALS),
+    codexBin: env.DEVSPACE_CODEX_BIN?.trim() || undefined,
   };
 }
 

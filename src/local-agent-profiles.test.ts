@@ -56,6 +56,34 @@ try {
       "",
     ].join("\n"),
   );
+  await writeFile(
+    join(workspaceRoot, ".devspace", "agents", "writer.md"),
+    [
+      "---",
+      "name: writer",
+      "description: Writer agent.",
+      "provider: agy",
+      "write_mode: allowed",
+      "---",
+      "",
+      "Writer body.",
+      "",
+    ].join("\n"),
+  );
+  await writeFile(
+    join(workspaceRoot, ".devspace", "agents", "invalid-mode.md"),
+    [
+      "---",
+      "name: invalid-mode",
+      "description: Invalid write mode agent.",
+      "provider: agy",
+      "write_mode: dangerous",
+      "---",
+      "",
+      "Invalid body.",
+      "",
+    ].join("\n"),
+  );
 
   const enabledConfig = loadConfig({
     DEVSPACE_CONFIG_DIR: configDir,
@@ -65,20 +93,25 @@ try {
   });
   const profiles = await loadLocalAgentProfiles(enabledConfig, workspaceRoot);
 
-  assert.equal(profiles.length, 1);
+  assert.equal(profiles.length, 2);
   assert.equal(profiles[0]?.name, "reviewer");
   assert.equal(profiles[0]?.description, "Project reviewer #1.");
   assert.equal(profiles[0]?.provider, "claude");
   assert.equal(profiles[0]?.model, "sonnet");
   assert.equal(profiles[0]?.effort, "high");
   assert.equal(profiles[0]?.body, "Project body.");
+  assert.equal(profiles[0]?.write_mode, "read_only");
   assert.deepEqual(summarizeLocalAgentProfile(profiles[0]!), {
     name: "reviewer",
     description: "Project reviewer #1.",
     provider: "claude",
     model: "sonnet",
     effort: "high",
+    write_mode: "read_only",
   });
+
+  assert.equal(profiles[1]?.name, "writer");
+  assert.equal(profiles[1]?.write_mode, "allowed");
 
   await writeFile(
     join(workspaceRoot, ".devspace", "agents", "custom.md"),
@@ -94,7 +127,7 @@ try {
     ].join("\n"),
   );
   const profilesWithInvalid = await loadLocalAgentProfiles(enabledConfig, workspaceRoot);
-  assert.deepEqual(profilesWithInvalid.map((profile) => profile.name), ["reviewer"]);
+  assert.deepEqual(profilesWithInvalid.map((profile) => profile.name), ["reviewer", "writer"]);
 
   const disabledConfig = loadConfig({
     DEVSPACE_CONFIG_DIR: configDir,

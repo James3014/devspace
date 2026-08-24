@@ -148,4 +148,4 @@ assert.deepEqual(parseLocalAgentRunArgs(["codex", "--", "--json", "literal"]), {
 
 assert.equal(resolveLocalAgentTarget("missing", profiles), undefined);
 assert.match(formatAvailableLocalAgentTargets(profiles), /profiles: reviewer, claude/);
-assert.match(formatAvailableLocalAgentTargets([]), /providers: codex, claude, opencode, pi, cursor, copilot, grok/);
+assert.match(formatAvailableLocalAgentTargets([]), /providers: codex, claude, opencode, omp, pi, cursor, copilot, grok, agy/);
