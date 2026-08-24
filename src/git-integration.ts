@@ -9,8 +9,11 @@ import { canonicalizePath } from "./roots.js";
  *
  *   candidateBase .. candidateHead
  *
- * Both identities are exact SHAs supplied by the accepting authority. The
- * integration payload is derived entirely from that committed range; nothing
+ * Both identities are exact 40-character hex commit SHAs supplied by the
+ * accepting authority. Mutable or ref-shaped values ("HEAD", "main",
+ * "candidate/foo", "HEAD~1", "refs/heads/x") are rejected fail-closed, and a
+ * supplied SHA must resolve to exactly itself in the source repository. The
+ * integration payload is derived entirely from those frozen SHAs; nothing
  * from the source worktree's current dirty or untracked state can enter the
  * payload, so execution metadata (e.g. `.devspace/`) can never leak into a
  * destination.
@@ -45,6 +48,7 @@ export interface CandidateRangeIdentity {
 export interface IntegrationBlocker {
   code:
     | "SOURCE_DESTINATION_ALIAS"
+    | "CANDIDATE_IDENTITY_NOT_IMMUTABLE"
     | "CANDIDATE_COMMIT_MISSING"
     | "CANDIDATE_BASE_INVALID"
     | "CANDIDATE_BASE_NOT_ANCESTOR"
@@ -132,6 +136,60 @@ function splitLines(value: string): string[] {
   return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
 }
 
+const EXACT_COMMIT_SHA_PATTERN = /^[0-9a-f]{40}$/;
+
+/**
+ * Candidate identities are immutable object identities supplied by the
+ * accepting authority. A mutable or ref-shaped value ("HEAD", "main",
+ * "candidate/foo", "HEAD~1", "refs/heads/x") must never satisfy the immutable
+ * Candidate fence, so identities must be exact 40-character lowercase-hex
+ * commit SHAs that resolve to themselves.
+ */
+export function normalizeExactCommitSha(
+  value: string,
+  field: "candidateBase" | "candidateHead",
+): { sha: string } | { blocker: IntegrationBlocker } {
+  const normalized = value.trim().toLowerCase();
+  if (!EXACT_COMMIT_SHA_PATTERN.test(normalized)) {
+    return {
+      blocker: {
+        code: "CANDIDATE_IDENTITY_NOT_IMMUTABLE",
+        detail: `Candidate ${field} '${value}' is not an exact 40-character hex commit SHA; mutable or ref-shaped identities are never accepted.`,
+      },
+    };
+  }
+  return { sha: normalized };
+}
+
+/**
+ * Resolve a validated SHA and require it to name itself exactly. This rejects
+ * e.g. an annotated-tag object SHA (which peels to a different commit) and any
+ * repository where the supplied bytes are not the id of a commit in it.
+ */
+async function resolveSelfVerifyingSha(
+  sha: string,
+  field: "candidateBase" | "candidateHead",
+  source: string,
+): Promise<{ verified: true } | { verified: false; missing: boolean; blocker?: IntegrationBlocker }> {
+  const resolved = await runGit(
+    ["rev-parse", "--verify", "--end-of-options", `${sha}^{commit}`],
+    source,
+  );
+  if (!resolved.ok) return { verified: false, missing: true };
+  const resolvedSha = resolved.stdout.trim().toLowerCase();
+  if (resolvedSha !== sha) {
+    return {
+      verified: false,
+      missing: false,
+      blocker: {
+        code: "CANDIDATE_IDENTITY_NOT_IMMUTABLE",
+        detail: `Candidate ${field} '${sha}' resolves to ${resolvedSha}; identities must resolve to exactly the supplied immutable SHA.`,
+      },
+    };
+  }
+  return { verified: true };
+}
+
 /**
  * Read-only integration readiness for one exact immutable Candidate range.
  * Missing evidence stays UNKNOWN and never folds into technical readiness.
@@ -155,47 +213,82 @@ export async function inspectIntegrationReadiness(
     });
   }
 
-  const headResult = await runGit(["rev-parse", "--verify", "--end-of-options", `${input.candidateHead}^{commit}`], source);
-  const baseResult = await runGit(["rev-parse", "--verify", "--end-of-options", `${input.candidateBase}^{commit}`], source);
-  const candidateCommitVerified = headResult.ok && splitLines(headResult.stdout).length > 0;
-  const candidateBaseVerified = baseResult.ok && splitLines(baseResult.stdout).length > 0;
+  // Immutable Candidate fence: only exact self-resolving commit SHAs pass.
+  const baseIdentity = normalizeExactCommitSha(input.candidateBase, "candidateBase");
+  const headIdentity = normalizeExactCommitSha(input.candidateHead, "candidateHead");
+  if ("blocker" in baseIdentity) blockers.push(baseIdentity.blocker);
+  if ("blocker" in headIdentity) blockers.push(headIdentity.blocker);
+  if (!("sha" in baseIdentity) || !("sha" in headIdentity)) {
+    return {
+      candidateCommitVerified: false,
+      candidateBaseVerified: false,
+      candidateBaseIsAncestor: false,
+      candidateChangedPaths: [],
+      destinationBaseMatches: false,
+      destinationOverlap: "unknown",
+      overlappingPaths: [],
+      unrelatedDestinationDirtyPaths: [],
+      gitStateAvailable: false,
+      operationExpressible: false,
+      technicallyReadyToApply: false,
+      acceptanceStatus: "external_not_granted_here",
+      blockers,
+      unknowns,
+    };
+  }
+  const candidateBaseSha = baseIdentity.sha;
+  const candidateHeadSha = headIdentity.sha;
+
+  const headResolution = await resolveSelfVerifyingSha(candidateHeadSha, "candidateHead", source);
+  const baseResolution = await resolveSelfVerifyingSha(candidateBaseSha, "candidateBase", source);
+  const candidateCommitVerified = headResolution.verified;
+  const candidateBaseVerified = baseResolution.verified;
+  if (!headResolution.verified) {
+    if (headResolution.missing) {
+      blockers.push({
+        code: "CANDIDATE_COMMIT_MISSING",
+        detail: `Candidate commit ${candidateHeadSha} does not exist in ${source}.`,
+      });
+    } else if (headResolution.blocker) {
+      blockers.push(headResolution.blocker);
+    }
+  }
+  if (!baseResolution.verified) {
+    if (baseResolution.missing) {
+      blockers.push({
+        code: "CANDIDATE_BASE_INVALID",
+        detail: `Candidate base ${candidateBaseSha} does not exist in ${source}.`,
+      });
+    } else if (baseResolution.blocker) {
+      blockers.push(baseResolution.blocker);
+    }
+  }
 
   let candidateTreeId: string | undefined;
-  if (!candidateCommitVerified) {
-    blockers.push({
-      code: "CANDIDATE_COMMIT_MISSING",
-      detail: `Candidate commit ${input.candidateHead} does not exist in ${source}.`,
-    });
-  } else {
-    const tree = await runGit(["rev-parse", `${input.candidateHead}^{tree}`], source);
+  if (candidateCommitVerified) {
+    const tree = await runGit(["rev-parse", `${candidateHeadSha}^{tree}`], source);
     candidateTreeId = tree.ok ? tree.stdout.trim() || undefined : undefined;
     if (!candidateTreeId) {
       unknowns.push("candidate tree identity could not be read.");
     }
-  }
-  if (!candidateBaseVerified) {
-    blockers.push({
-      code: "CANDIDATE_BASE_INVALID",
-      detail: `Candidate base ${input.candidateBase} does not exist in ${source}.`,
-    });
   }
 
   let candidateBaseIsAncestor = false;
   let candidateChangedPaths: string[] = [];
   if (candidateCommitVerified && candidateBaseVerified) {
     const ancestor = await runGit(
-      ["merge-base", "--is-ancestor", input.candidateBase, input.candidateHead],
+      ["merge-base", "--is-ancestor", candidateBaseSha, candidateHeadSha],
       source,
     );
     candidateBaseIsAncestor = ancestor.ok;
     if (!ancestor.ok) {
       blockers.push({
         code: "CANDIDATE_BASE_NOT_ANCESTOR",
-        detail: `Candidate base ${input.candidateBase} is not an ancestor of candidate head ${input.candidateHead}.`,
+        detail: `Candidate base ${candidateBaseSha} is not an ancestor of candidate head ${candidateHeadSha}.`,
       });
     } else {
       const diffNames = await runGit(
-        ["diff", "--name-only", `${input.candidateBase}..${input.candidateHead}`],
+        ["diff", "--name-only", `${candidateBaseSha}..${candidateHeadSha}`],
         source,
       );
       if (!diffNames.ok) {
@@ -278,7 +371,7 @@ export async function inspectIntegrationReadiness(
     !(dirtyPolicy === "pristine" && unrelatedDestinationDirtyPaths.length > 0)
   ) {
     const patch = await runGit(
-      ["diff", "--binary", input.candidateBase, input.candidateHead],
+      ["diff", "--binary", candidateBaseSha, candidateHeadSha],
       source,
     );
     if (!patch.ok || !patch.stdout.trim()) {
@@ -331,21 +424,111 @@ export async function inspectIntegrationReadiness(
 }
 
 /**
+ * Deterministic test/observation seam: invoked by integrateCandidate AFTER its
+ * internal readiness has passed and BEFORE the pre-mutation re-fence and
+ * physical apply. It lets controlled tests mutate destination state inside the
+ * same call, proving the check-to-mutation fence actually fires. Production
+ * callers omit it.
+ */
+export type BeforeMutationHook = () => void | Promise<void>;
+
+export interface CandidateApplyInput extends CandidateRangeIdentity {
+  confirmApply?: boolean;
+  beforeMutationHook?: BeforeMutationHook;
+}
+
+/**
+ * Bounded same-call re-fence bound to the physical mutation: re-reads the
+ * destination HEAD and the Candidate-overlap dirty state immediately before
+ * producing the patch and applying it. Fails closed on any drift that the
+ * initial readiness would have refused.
+ */
+async function refenceDestinationBeforeMutation(
+  destination: string,
+  identity: CandidateRangeIdentity,
+  candidateChangedPaths: readonly string[],
+): Promise<IntegrationBlocker[]> {
+  const blockers: IntegrationBlocker[] = [];
+  const dirtyPolicy = identity.dirtyPolicy ?? "allow_unrelated";
+
+  const destHead = await runGit(["rev-parse", "HEAD"], destination);
+  if (!destHead.ok || !destHead.stdout.trim()) {
+    blockers.push({
+      code: "DESTINATION_UNAVAILABLE",
+      detail: `Destination checkout Git state could not be read before mutation: ${destination}`,
+    });
+    return blockers;
+  }
+  if (destHead.stdout.trim().toLowerCase() !== identity.expectedDestinationHead.toLowerCase()) {
+    blockers.push({
+      code: "DESTINATION_HEAD_MISMATCH",
+      detail: `Destination HEAD advanced to ${destHead.stdout.trim()} after readiness; expected ${identity.expectedDestinationHead}.`,
+    });
+    return blockers;
+  }
+
+  const tracked = await runGit(["diff", "--name-only"], destination);
+  const staged = await runGit(["diff", "--cached", "--name-only"], destination);
+  const untracked = await runGit(["ls-files", "--others", "--exclude-standard"], destination);
+  if (!tracked.ok || !staged.ok || !untracked.ok) {
+    blockers.push({
+      code: "DESTINATION_UNAVAILABLE",
+      detail: "Destination dirty state could not be read before mutation.",
+    });
+    return blockers;
+  }
+
+  const candidateSet = new Set(candidateChangedPaths);
+  const dirtyPaths = [
+    ...new Set([
+      ...splitLines(tracked.stdout),
+      ...splitLines(staged.stdout),
+      ...splitLines(untracked.stdout),
+    ]),
+  ];
+  const overlapPaths = dirtyPaths.filter((path) => candidateSet.has(path));
+  if (overlapPaths.length > 0) {
+    blockers.push({
+      code: "DIRTY_OVERLAP",
+      detail: `Destination became dirty on Candidate paths after readiness: ${overlapPaths.join(", ")}`,
+    });
+    return blockers;
+  }
+  if (dirtyPolicy === "pristine" && dirtyPaths.length > 0) {
+    blockers.push({
+      code: "DIRTY_DESTINATION",
+      detail: `Dirty policy 'pristine' refuses the post-readiness dirty destination (${dirtyPaths.length} changed path(s)).`,
+    });
+  }
+  return blockers;
+}
+
+/**
  * Apply one exact immutable Candidate range onto the destination checkout.
  *
- * Every deterministic gate runs before the first destination mutation, and
- * `git apply` (without --reject) is atomic, so any failure — including one
- * between check and apply — leaves the destination unchanged. Nothing outside
- * the committed range (no untracked workspace files) is ever copied.
+ * Every deterministic gate runs before the first destination mutation:
+ * full readiness, then a same-call re-fence of destination HEAD and
+ * Candidate-overlap dirtiness immediately before the patch is produced and
+ * applied. `git apply` (without --reject) is atomic, so any failure — including
+ * one between check and apply — leaves the destination unchanged. Nothing
+ * outside the committed range (no untracked workspace files) is ever copied.
+ *
+ * Residual concurrency limitation: the re-fence deterministically closes the
+ * window between this call's own readiness and its own mutation. A concurrent
+ * external writer landing between the re-fence reads and `git apply` cannot be
+ * excluded without destination-level locking; in that case the atomicity of
+ * `git apply` still guarantees no partial mutation — the integration fails
+ * closed instead.
  */
 export async function integrateCandidate(
-  input: CandidateRangeIdentity & { confirmApply?: boolean },
+  input: CandidateApplyInput,
 ): Promise<IntegrationApplyResult> {
-  const readiness = await inspectIntegrationReadiness(input);
+  const { beforeMutationHook, ...identity } = input;
+  const readiness = await inspectIntegrationReadiness(identity);
   if (!readiness.technicallyReadyToApply) {
     return {
       applied: false,
-      appliedRange: { base: input.candidateBase, head: input.candidateHead },
+      appliedRange: { base: identity.candidateBase, head: identity.candidateHead },
       appliedTrackedFiles: 0,
       blockers: readiness.blockers,
     };
@@ -353,7 +536,7 @@ export async function integrateCandidate(
   if (input.confirmApply !== true) {
     return {
       applied: false,
-      appliedRange: { base: input.candidateBase, head: input.candidateHead },
+      appliedRange: { base: identity.candidateBase, head: identity.candidateHead },
       appliedTrackedFiles: 0,
       blockers: [
         {
@@ -364,17 +547,35 @@ export async function integrateCandidate(
     };
   }
 
-  const source = canonicalizePath(input.sourceWorkspaceRoot);
-  const destination = canonicalizePath(input.destinationWorkspaceRoot);
+  const source = canonicalizePath(identity.sourceWorkspaceRoot);
+  const destination = canonicalizePath(identity.destinationWorkspaceRoot);
+
+  // Controlled seam for deterministic race tests: runs after readiness, before
+  // the re-fence, so mutations performed here are caught by the fence below.
+  await beforeMutationHook?.();
+
+  const refenceBlockers = await refenceDestinationBeforeMutation(
+    destination,
+    identity,
+    readiness.candidateChangedPaths,
+  );
+  if (refenceBlockers.length > 0) {
+    return {
+      applied: false,
+      appliedRange: { base: identity.candidateBase, head: identity.candidateHead },
+      appliedTrackedFiles: 0,
+      blockers: refenceBlockers,
+    };
+  }
 
   const patch = await runGit(
-    ["diff", "--binary", input.candidateBase, input.candidateHead],
+    ["diff", "--binary", identity.candidateBase, identity.candidateHead],
     source,
   );
   if (!patch.ok || !patch.stdout.trim()) {
     return {
       applied: false,
-      appliedRange: { base: input.candidateBase, head: input.candidateHead },
+      appliedRange: { base: identity.candidateBase, head: identity.candidateHead },
       appliedTrackedFiles: 0,
       blockers: [
         {
@@ -393,7 +594,7 @@ export async function integrateCandidate(
   if (!applied) {
     return {
       applied: false,
-      appliedRange: { base: input.candidateBase, head: input.candidateHead },
+      appliedRange: { base: identity.candidateBase, head: identity.candidateHead },
       appliedTrackedFiles: 0,
       blockers: [
         {
@@ -407,7 +608,7 @@ export async function integrateCandidate(
   const changed = await runGit(["diff", "--name-only"], destination);
   return {
     applied: true,
-    appliedRange: { base: input.candidateBase, head: input.candidateHead },
+    appliedRange: { base: identity.candidateBase, head: identity.candidateHead },
     appliedTrackedFiles: changed.ok ? splitLines(changed.stdout).length : 0,
     blockers: [],
   };

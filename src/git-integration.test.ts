@@ -341,6 +341,189 @@ test("confirmApply gate: preparation never mutates the destination", async () =>
   }
 });
 
+test("mutable or ref-shaped Candidate identities fail closed before any mutation", async () => {
+  const source = makeRepo("refshape-src", { "f.ts": "v1\n" });
+  const destination = makeRepo("refshape-dst", { "f.ts": "v1\n" });
+  try {
+    const base = runGitRaw(["rev-parse", "HEAD"], source);
+    const head = commitAll(source, { "f.ts": "v2\n" }, "candidate");
+    const destHead = runGitRaw(["rev-parse", "HEAD"], destination);
+
+    const refCases: Array<{ field: "base" | "head"; value: string; label: string }> = [
+      { field: "head", value: "HEAD", label: "HEAD as candidateHead" },
+      { field: "head", value: "HEAD~1", label: "HEAD~1 as candidateHead" },
+      { field: "head", value: "main", label: "branch name as candidateHead" },
+      { field: "base", value: "main", label: "branch name as candidateBase" },
+      { field: "head", value: "refs/heads/main", label: "full ref as candidateHead" },
+      { field: "head", value: "g".repeat(40), label: "40-char non-hex value" },
+      { field: "head", value: head.slice(0, 39), label: "39-char truncated SHA" },
+      { field: "head", value: `${head}0`, label: "41-char overlong SHA" },
+    ];
+
+    for (const c of refCases) {
+      const input = {
+        sourceWorkspaceRoot: source,
+        candidateBase: c.field === "base" ? c.value : base,
+        candidateHead: c.field === "head" ? c.value : head,
+        destinationWorkspaceRoot: destination,
+        expectedDestinationHead: destHead,
+        confirmApply: true,
+      };
+      const result = await integrateCandidate(input);
+      assert.equal(result.applied, false, `expected rejection for ${c.label}`);
+      assert.ok(
+        result.blockers.some((b) => b.code === "CANDIDATE_IDENTITY_NOT_IMMUTABLE"),
+        `expected CANDIDATE_IDENTITY_NOT_IMMUTABLE for ${c.label}, got ${JSON.stringify(result.blockers)}`,
+      );
+      const readiness = await inspectIntegrationReadiness(input);
+      assert.equal(readiness.technicallyReadyToApply, false, c.label);
+    }
+
+    // Uppercase hex is safely normalized to lowercase and then resolves to the
+    // same immutable commit: normalization never converts a ref into a SHA.
+    {
+      const input = {
+        sourceWorkspaceRoot: source,
+        candidateBase: base.toUpperCase(),
+        candidateHead: head.toUpperCase(),
+        destinationWorkspaceRoot: destination,
+        expectedDestinationHead: destHead,
+        confirmApply: true,
+      };
+      const readiness = await inspectIntegrationReadiness(input);
+      assert.equal(readiness.technicallyReadyToApply, true);
+    }
+
+    // Destination bytes/state remain untouched by every rejected attempt.
+    assert.equal(await readFile(join(destination, "f.ts")), "v1\n");
+    assert.equal(runGitRaw(["status", "--porcelain"], destination), "");
+  } finally {
+    cleanupRepo(source);
+    cleanupRepo(destination);
+  }
+});
+
+test("exact immutable base/head SHAs still resolve to themselves and integrate", async () => {
+  const source = makeRepo("exact-src", { "x.ts": "v1\n" });
+  const destination = makeRepo("exact-dst", { "x.ts": "v1\n" });
+  try {
+    const base = runGitRaw(["rev-parse", "HEAD"], source);
+    const head = commitAll(source, { "x.ts": "v2\n" }, "candidate");
+
+    const readiness = await inspectIntegrationReadiness(identity(source, base, head, destination));
+    assert.equal(readiness.technicallyReadyToApply, true);
+    assert.equal(readiness.blockers.length, 0);
+
+    const result = await integrateCandidate({ ...identity(source, base, head, destination), confirmApply: true });
+    assert.equal(result.applied, true);
+    assert.deepEqual(result.appliedRange, { base, head });
+  } finally {
+    cleanupRepo(source);
+    cleanupRepo(destination);
+  }
+});
+
+test("internal race: destination HEAD advances inside integrateCandidate after readiness (test seam)", async () => {
+  const source = makeRepo("race-head-src", { "r.ts": "v1\n" });
+  const destination = makeRepo("race-head-dst", { "r.ts": "v1\n" });
+  try {
+    const base = runGitRaw(["rev-parse", "HEAD"], source);
+    const head = commitAll(source, { "r.ts": "v2\n" }, "candidate");
+    const destBase = runGitRaw(["rev-parse", "HEAD"], destination);
+
+    let hookRan = false;
+    const result = await integrateCandidate({
+      sourceWorkspaceRoot: source,
+      candidateBase: base,
+      candidateHead: head,
+      destinationWorkspaceRoot: destination,
+      expectedDestinationHead: destBase,
+      confirmApply: true,
+      // Mutates the destination INSIDE the same call, after internal readiness
+      // passed and before the pre-mutation re-fence runs.
+      beforeMutationHook: () => {
+        hookRan = true;
+        commitAll(destination, { "late.txt": "advanced\n" }, "advance inside call");
+      },
+    });
+
+    assert.equal(hookRan, true, "seam must have executed inside integrateCandidate");
+    assert.equal(result.applied, false);
+    assert.ok(result.blockers.some((b) => b.code === "DESTINATION_HEAD_MISMATCH"));
+    assert.equal(await readFile(join(destination, "r.ts")), "v1\n");
+    assert.equal(existsSync(join(destination, "late.txt")), true, "the racing commit itself stays");
+    assert.equal(runGitRaw(["diff", "--name-only"], destination), "");
+  } finally {
+    cleanupRepo(source);
+    cleanupRepo(destination);
+  }
+});
+
+test("internal race: overlap path becomes dirty inside integrateCandidate after readiness (test seam)", async () => {
+  const source = makeRepo("race-dirty-src", { "q.ts": "v1\n" });
+  const destination = makeRepo("race-dirty-dst", { "q.ts": "v1\n" });
+  try {
+    const base = runGitRaw(["rev-parse", "HEAD"], source);
+    const head = commitAll(source, { "q.ts": "v2\n" }, "candidate");
+    const destBase = runGitRaw(["rev-parse", "HEAD"], destination);
+
+    let hookRan = false;
+    const result = await integrateCandidate({
+      sourceWorkspaceRoot: source,
+      candidateBase: base,
+      candidateHead: head,
+      destinationWorkspaceRoot: destination,
+      expectedDestinationHead: destBase,
+      confirmApply: true,
+      beforeMutationHook: () => {
+        hookRan = true;
+        writeFileSync(join(destination, "q.ts"), "concurrent local edit\n");
+      },
+    });
+
+    assert.equal(hookRan, true, "seam must have executed inside integrateCandidate");
+    assert.equal(result.applied, false);
+    assert.ok(result.blockers.some((b) => b.code === "DIRTY_OVERLAP"));
+    assert.equal(
+      await readFile(join(destination, "q.ts")),
+      "concurrent local edit\n",
+      "existing destination bytes are preserved",
+    );
+  } finally {
+    cleanupRepo(source);
+    cleanupRepo(destination);
+  }
+});
+
+test("unrelated dirty state created inside the call stays allowed under allow_unrelated", async () => {
+  const source = makeRepo("race-unrelated-src", { "u.ts": "v1\n" });
+  const destination = makeRepo("race-unrelated-dst", { "u.ts": "v1\n" });
+  try {
+    const base = runGitRaw(["rev-parse", "HEAD"], source);
+    const head = commitAll(source, { "u.ts": "v2\n" }, "candidate");
+    const destBase = runGitRaw(["rev-parse", "HEAD"], destination);
+
+    const result = await integrateCandidate({
+      sourceWorkspaceRoot: source,
+      candidateBase: base,
+      candidateHead: head,
+      destinationWorkspaceRoot: destination,
+      expectedDestinationHead: destBase,
+      confirmApply: true,
+      beforeMutationHook: () => {
+        writeFileSync(join(destination, "someone-else.txt"), "unrelated dirt mid-call\n");
+      },
+    });
+
+    assert.equal(result.applied, true, "unrelated dirt must not block under allow_unrelated");
+    assert.equal(await readFile(join(destination, "u.ts")), "v2\n");
+    assert.equal(await readFile(join(destination, "someone-else.txt")), "unrelated dirt mid-call\n");
+  } finally {
+    cleanupRepo(source);
+    cleanupRepo(destination);
+  }
+});
+
 test("remote writability probe never fakes push permission", async () => {
   const repo = makeRepo("remote-probe", { "readme.txt": "x\n" });
   try {
