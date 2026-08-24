@@ -47,6 +47,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 4, name: "workspace-conversation-bindings" },
       { version: 5, name: "local-agent-worker-ownership" },
       { version: 6, name: "local-agent-execution-contract" },
+      { version: 7, name: "local-agent-lifecycle-state" },
     ]);
   } finally {
     database.close();
