@@ -6,11 +6,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after, type TestContext } from "node:test";
 import { promisify } from "node:util";
-import Database from "better-sqlite3";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { loadConfig, type ServerConfig } from "./config.js";
-import { databasePath } from "./db/client.js";
 import type { LocalAgentProviderAvailability } from "./local-agent-availability.js";
 import { buildLocalAgentProviderStatuses } from "./local-agent-catalog.js";
 import type { SubagentsConfig } from "./local-agent-config.js";
@@ -276,7 +274,6 @@ async function fixture(
     subagents?: boolean | SubagentsConfig;
     gitCandidates?: boolean;
     toolchains?: string;
-    toolMode?: "full" | "minimal" | "codex";
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -329,7 +326,6 @@ async function fixture(
   });
   let config: ServerConfig = {
     ...loadedConfig,
-    toolMode: options.toolMode ?? loadedConfig.toolMode,
     subagents: {
       ...loadedConfig.subagents,
       enabled: wantsSubagents,
@@ -360,7 +356,7 @@ async function fixture(
   const workspaces = new WorkspaceRegistry(config, store);
   const { LocalAgentSessionManager } = await import("./local-agent-sessions.js");
   const agentSessionManager = config.subagents.enabled
-    ? new LocalAgentSessionManager(config, async () => {}, async () => true)
+    ? new LocalAgentSessionManager(config, async () => {})
     : undefined;
   const server = createMcpServer(
     config,
@@ -574,21 +570,12 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   assert.equal(listStructured.agents[0].agentId, startStructured.agentId);
   assert.equal(listStructured.agents[0].latestResponse, undefined); // Excluded
 
-  // Test agent_continue after a generation-bound normal completion.
+  // Test agent_continue
+  // Update status to idle using a fresh store connection
   const { LocalAgentStore } = await import("./local-agent-store.js");
   const store = new LocalAgentStore(context.stateDir);
   try {
-    const current = store.getById(startStructured.agentId)!;
-    const generation = current.lifecycleState!.activeTurn!.generation!;
-    const workerToken = current.workerToken!;
-    assert.equal(store.claimWorkerCAS(startStructured.agentId, generation, workerToken, 39998).applied, true);
-    assert.equal(store.finishTurnCAS({
-      agentId: startStructured.agentId as string,
-      generation,
-      workerToken,
-      status: "idle",
-      terminalReason: "completed",
-    }).applied, true);
+    store.update(startStructured.agentId, { status: "idle" });
   } finally {
     store.close();
   }
@@ -630,120 +617,6 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   assert.equal(cancelStructured.agentId, startStructured.agentId);
   assert.equal(cancelStructured.status, "stopped");
   assert.equal(cancelStructured.terminal, true);
-});
-
-test("subagents: status and list expose durable termination pending without terminalizing", async (t) => {
-  const context = await fixture(t, { subagents: true });
-  const opened = await callOpen(context.client, context.project, "pending-status");
-  const workspaceId = structuredContent(opened).workspaceId as string;
-  const started = await context.client.callTool({
-    name: "agent_start",
-    arguments: { workspaceId, profile: "reviewer", prompt: "hold pending" },
-  });
-  const agentId = (started.structuredContent as Record<string, string>).agentId;
-  const { LocalAgentStore } = await import("./local-agent-store.js");
-  const store = new LocalAgentStore(context.stateDir);
-  try {
-    const fenced = store.beginTerminationCAS({
-      agentId,
-      terminalReason: "cancelled",
-      terminalStatus: "stopped",
-      error: "cancelled by operator",
-    });
-    assert.equal(fenced.applied, true);
-    const pending = fenced.current!.lifecycleState!.terminationPending!;
-
-    const status = await context.client.callTool({
-      name: "agent_status",
-      arguments: { workspaceId, agentId },
-    });
-    const statusOutput = status.structuredContent as Record<string, any>;
-    assert.equal(statusOutput.terminal, false);
-    assert.equal(statusOutput.termination.pending, true);
-    assert.equal(statusOutput.termination.generation, pending.generation);
-    assert.equal("terminationPending" in statusOutput, false);
-    assert.equal("terminationGeneration" in statusOutput, false);
-    assert.equal("workerPid" in statusOutput.termination, false);
-    assert.equal("workerToken" in statusOutput.termination, false);
-    assert.match(responseText(status), /termination pending/i);
-
-    const listed = await context.client.callTool({
-      name: "agent_list",
-      arguments: { workspaceId },
-    });
-    const agents = (listed.structuredContent as { agents: any[] }).agents;
-    assert.equal(agents[0].terminationPending, true);
-
-    assert.equal(store.completeTerminationCAS({
-      agentId,
-      generation: pending.generation,
-      workerPid: pending.workerPid,
-      workerToken: pending.workerToken,
-      turnEndBaseline: { changedPaths: [], head: null },
-    }).applied, true);
-  } finally {
-    store.close();
-  }
-});
-
-test("subagents: status and list distinguish blocked termination from actual pending", async (t) => {
-  const context = await fixture(t, { subagents: true });
-  const opened = await callOpen(context.client, context.project, "blocked-status");
-  const workspaceId = structuredContent(opened).workspaceId as string;
-  const { LocalAgentStore } = await import("./local-agent-store.js");
-  const store = new LocalAgentStore(context.stateDir);
-  try {
-    const partial = store.create({
-      workspaceId,
-      workspaceRoot: context.project,
-      profileName: "reviewer",
-      provider: "codex",
-    });
-    store.update(partial.id, { status: "starting", workerToken: "partial-server-token" });
-    assert.equal(store.reconcileLegacyDetachedActiveCAS(partial.id).applied, true);
-
-    const corrupt = store.create({
-      workspaceId,
-      workspaceRoot: context.project,
-      profileName: "reviewer",
-      provider: "codex",
-      lifecycleKind: "detached_worker_v2",
-    });
-    const database = new Database(databasePath(context.stateDir));
-    database.prepare("update local_agent_sessions set status = 'error', lifecycle_state = ? where id = ?")
-      .run(JSON.stringify({
-        lifecycleKind: "detached_worker_v2",
-        terminationPending: { generation: 42 },
-      }), corrupt.id);
-    database.close();
-
-    for (const agentId of [partial.id, corrupt.id]) {
-      const status = await context.client.callTool({
-        name: "agent_status",
-        arguments: { workspaceId, agentId },
-      });
-      const output = status.structuredContent as Record<string, any>;
-      assert.equal(output.terminal, false);
-      assert.equal(output.termination.pending, false);
-      assert.equal("workerPid" in output.termination, false);
-      assert.equal("workerToken" in output.termination, false);
-      assert.match(responseText(status), /termination blocked/i);
-    }
-
-    const listed = await context.client.callTool({
-      name: "agent_list",
-      arguments: { workspaceId },
-    });
-    const agents = (listed.structuredContent as { agents: any[] }).agents;
-    for (const agentId of [partial.id, corrupt.id]) {
-      const summary = agents.find((agent) => agent.agentId === agentId);
-      assert.equal(summary.terminationPending, undefined);
-      assert.equal(summary.terminationBlocked, true);
-    }
-    assert.match(responseText(listed), /2 termination blocked/i);
-  } finally {
-    store.close();
-  }
 });
 
 test("subagents: unknown/invalid workspaceId fails closed before durable-agent access", async (t) => {
@@ -1121,23 +994,12 @@ test("bash and command_status: attemptKey reconciliation and idempotent executio
   const openResult = await callOpen(context.client, context.project, "chat-cmd-reconcile");
   const workspaceId = structuredContent(openResult).workspaceId as string;
 
-  // 0. Missing attemptKey on native bash must fail closed / reject schema
-  const missingKeyRes = await context.client.callTool({
-    name: "bash",
-    arguments: {
-      workspaceId,
-      command: "echo fail_no_attempt_key",
-    },
-  });
-  assert.equal(missingKeyRes.isError, true, "Native bash requires attemptKey");
-
-  // 1. Short command compatibility with required attemptKey
+  // 1. Short command compatibility
   const shortRes = await context.client.callTool({
     name: "bash",
     arguments: {
       workspaceId,
       command: "echo short_cmd_hello",
-      attemptKey: "bash:g2:short01",
     },
   });
   assert.equal(shortRes.isError, undefined);
@@ -1204,29 +1066,4 @@ test("bash and command_status: attemptKey reconciliation and idempotent executio
   });
   assert.equal(conflictRes.isError, true);
   assert.match(responseText(conflictRes), /ATTEMPT_REPLAY_CONFLICT/);
-});
-
-test("command_status metadata annotations and minimal mode visibility", async (t) => {
-  // Test minimal mode tools
-  const context = await fixture(t, { toolMode: "minimal" });
-  const toolsList = await context.client.listTools();
-  const toolNames = toolsList.tools.map((t) => t.name);
-
-  // command_status is visible in minimal mode for read-only reconciliation
-  assert.ok(toolNames.includes("command_status"), "command_status should be visible in minimal mode");
-
-  // exec_command and write_stdin remain hidden in minimal mode
-  assert.ok(!toolNames.includes("exec_command"), "exec_command must stay hidden in minimal mode");
-  assert.ok(!toolNames.includes("write_stdin"), "write_stdin must stay hidden in minimal mode");
-
-  // Verify command_status annotations
-  const commandStatusTool = toolsList.tools.find((t) => t.name === "command_status");
-  assert.ok(commandStatusTool);
-  const annotations = (commandStatusTool as unknown as { annotations?: Record<string, unknown> }).annotations;
-  assert.deepEqual(annotations, {
-    readOnlyHint: true,
-    destructiveHint: false,
-    idempotentHint: true,
-    openWorldHint: false,
-  });
 });

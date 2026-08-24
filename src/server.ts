@@ -113,12 +113,6 @@ const SHELL_TOOL_ANNOTATIONS = {
   idempotentHint: false,
   openWorldHint: true,
 };
-const COMMAND_STATUS_TOOL_ANNOTATIONS = {
-  readOnlyHint: true,
-  destructiveHint: false,
-  idempotentHint: true,
-  openWorldHint: false,
-};
 
 interface RunningServer {
   app: ReturnType<typeof createMcpExpressApp>;
@@ -1939,9 +1933,8 @@ export function createMcpServer(
         attemptKey: z
           .string()
           .regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
-          .describe(
-            "Required physical-workspace-scoped command execution identity. Establish before spawn so transport failures (e.g. 502/timeouts) can be safely reconciled. Exact request replays reuse the existing running or completed command session; conflicting reuse fails closed. After transport uncertainty, use command_status with this attemptKey; do not issue a new attemptKey to retry an uncertain execution.",
-          ),
+          .optional()
+          .describe("Optional physical-workspace-scoped replay identity. Exact request replays reuse one running or completed command session; conflicting reuse fails closed."),
         yieldTimeMs: z
           .number()
           .int()
@@ -2040,7 +2033,7 @@ export function createMcpServer(
       },
       outputSchema: processOutputSchema(),
       ...toolWidgetDescriptorMeta(config, "shell"),
-      annotations: COMMAND_STATUS_TOOL_ANNOTATIONS,
+      annotations: SHELL_TOOL_ANNOTATIONS,
     },
     async ({ workspaceId, attemptKey, sessionId, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
@@ -2138,16 +2131,6 @@ export function createMcpServer(
                 .int()
                 .min(1)
                 .describe("Optional wall-clock bound for the whole agent turn."),
-              maxStartupMs: z
-                .number()
-                .int()
-                .min(1)
-                .describe("Optional wall-clock bound for the startup/readiness phase (turn start -> execution started)."),
-              maxExecutionMs: z
-                .number()
-                .int()
-                .min(1)
-                .describe("Optional wall-clock bound for semantic provider execution (execution started -> terminal)."),
               idleTimeoutMs: z
                 .number()
                 .int()
@@ -2297,15 +2280,6 @@ export function createMcpServer(
           changedPaths: z.array(z.string()).optional(),
           terminalReason: z.string().optional(),
           scopeState: z.string().optional(),
-          termination: z.object({
-            pending: z.boolean(),
-            generation: z.string().optional(),
-            requestedAt: z.string().optional(),
-            failure: z.string().optional(),
-            corrupt: z.boolean().optional(),
-            blocked: z.boolean().optional(),
-            reason: z.string().optional(),
-          }).optional(),
         },
         _meta: {},
         annotations: { readOnlyHint: true },
@@ -2318,13 +2292,9 @@ export function createMcpServer(
           agentId,
           waitMs,
         });
-        const statusLine = output.termination?.pending
-          ? `Agent ${agentId} is ${output.status} with termination pending.`
-          : output.termination
-            ? `Agent ${agentId} is ${output.status} with termination blocked.`
-          : output.terminal
-            ? `Agent ${agentId} is ${output.status}.`
-            : `Agent ${agentId} is ${output.status} (still running).`;
+        const statusLine = output.terminal
+          ? `Agent ${agentId} is ${output.status}.`
+          : `Agent ${agentId} is ${output.status} (still running).`;
         const responseLine = output.latestResponse ? `\nResponse: ${output.latestResponse}` : "";
         const errorLine = output.error ? `\nError: ${output.error}` : "";
         return {
@@ -2360,15 +2330,6 @@ export function createMcpServer(
           error: z.string().optional(),
           createdAt: z.string(),
           updatedAt: z.string(),
-          termination: z.object({
-            pending: z.boolean(),
-            generation: z.string().optional(),
-            requestedAt: z.string().optional(),
-            failure: z.string().optional(),
-            corrupt: z.boolean().optional(),
-            blocked: z.boolean().optional(),
-            reason: z.string().optional(),
-          }).optional(),
         },
         _meta: {},
         annotations: {
@@ -2392,13 +2353,7 @@ export function createMcpServer(
           durationMs: 0,
         });
         return {
-          content: [textBlock(
-            output.termination?.pending
-              ? `Agent ${agentId} is ${output.status} with termination pending.`
-              : output.termination
-                ? `Agent ${agentId} is ${output.status} with termination blocked.`
-              : `Agent ${agentId} is ${output.status}.`,
-          )],
+          content: [textBlock(`Agent ${agentId} is ${output.status}.`)],
           structuredContent: output as unknown as Record<string, unknown>,
         };
       },
@@ -2430,8 +2385,6 @@ export function createMcpServer(
               model: z.string().optional(),
               thinking: z.string().optional(),
               status: z.string(),
-              terminationPending: z.boolean().optional(),
-              terminationBlocked: z.boolean().optional(),
               updatedAt: z.string(),
             }),
           ),
@@ -2442,15 +2395,9 @@ export function createMcpServer(
       async ({ workspaceId, limit }) => {
         const workspace = workspaces.getWorkspace(workspaceId); // boundary check
         const agents = agentSessionManager.listAgents({ workspaceId, workspaceRoot: workspace.root, limit });
-        const pendingCount = agents.filter((agent) => agent.terminationPending).length;
-        const blockedCount = agents.filter((agent) => agent.terminationBlocked).length;
         const summary = agents.length === 0
           ? "No agent sessions found for this workspace."
-          : `${agents.length} agent session(s) in this workspace.${
-              pendingCount > 0 ? ` ${pendingCount} termination pending.` : ""
-            }${
-              blockedCount > 0 ? ` ${blockedCount} termination blocked.` : ""
-            }`;
+          : `${agents.length} agent session(s) in this workspace.`;
         return {
           content: [textBlock(summary)],
           structuredContent: { agents },
