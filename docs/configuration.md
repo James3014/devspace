@@ -109,6 +109,46 @@ Codex-mode commands run without a PTY by default. Set `tty: true` on
 `node-pty` dependency; `write_stdin` can send input, poll output, and resize PTY
 sessions.
 
+## Codex Goal Tools
+
+`DEVSPACE_CODEX_GOALS=1` exposes four narrow MCP tools — `codex_goal_start`,
+`codex_goal_status`, `codex_goal_continue`, and `codex_goal_cancel` — that drive
+the **real interactive Codex CLI** inside an open workspace:
+
+```bash
+DEVSPACE_CODEX_GOALS=1 DEVSPACE_TOOL_MODE=minimal npx @waishnav/devspace serve
+```
+
+Key properties:
+
+- **This does NOT require `DEVSPACE_TOOL_MODE=codex`.** The server can stay in
+  the default `minimal` tool mode. Minimal mode stays minimal: generic
+  `exec_command` and `write_stdin` remain hidden. The goal tools are a narrow,
+  special-purpose execution surface, not a general shell/PTY capability.
+- `codex_goal_start` launches the actual `codex` binary (never the Codex SDK)
+  inside a PTY in the exact opened workspace, waits for the TUI to become
+  ready, then types `/goal <goal>` in bounded chunks so large goals are not
+  swallowed by the TUI's paste handling. Start only succeeds once physical
+  evidence of Goal Mode activation (`Pursuing goal`) is observed; otherwise the
+  process is terminated and a start failure is returned.
+- The workspace must be clean before start, and `expectedHead` must match the
+  current Git HEAD when supplied. Only one active Codex goal is allowed per
+  workspace; different workspaces run independently.
+- The Codex child process runs with a sanitized environment. DevSpace secrets
+  such as `DEVSPACE_OAUTH_OWNER_TOKEN` are never inherited; Codex uses the
+  user's existing local authentication store.
+- `codex_goal_cancel` terminates exactly the process owned by that goal session
+  and keeps the final terminal state inspectable.
+- MCP transport reconnect can reuse a goal that is still running inside the
+  live server process. **DevSpace process restart durability is NOT claimed**:
+  goal sessions are in-memory and do not survive a server restart.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `DEVSPACE_CODEX_GOALS` | `0` | Expose the `codex_goal_*` tools in every tool mode. |
+| `DEVSPACE_CODEX_BIN` | unset | Explicit path to the Codex CLI executable. When unset, DevSpace resolves `codex` from `PATH`, then falls back to `/Applications/ChatGPT.app/Contents/Resources/codex` on macOS. An explicitly configured but invalid path fails closed. |
+
+
 ## Widgets
 
 `DEVSPACE_WIDGETS` controls ChatGPT Apps iframe usage.
