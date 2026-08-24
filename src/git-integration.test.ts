@@ -524,6 +524,133 @@ test("unrelated dirty state created inside the call stays allowed under allow_un
   }
 });
 
+test("whitespace-padded identities are rejected, never trimmed into validity", async () => {
+  const source = makeRepo("ws-src", { "w.ts": "v1\n" });
+  const destination = makeRepo("ws-dst", { "w.ts": "v1\n" });
+  try {
+    const base = runGitRaw(["rev-parse", "HEAD"], source);
+    const head = commitAll(source, { "w.ts": "v2\n" }, "candidate");
+    const destHead = runGitRaw(["rev-parse", "HEAD"], destination);
+
+    const cases = [
+      { label: "leading space", headValue: ` ${head}` },
+      { label: "trailing space", headValue: `${head} ` },
+      { label: "tab-prefixed", headValue: `\t${head}` },
+      { label: "newline-suffixed", headValue: `${head}\n` },
+    ];
+    for (const c of cases) {
+      const input = {
+        sourceWorkspaceRoot: source,
+        candidateBase: base,
+        candidateHead: c.headValue,
+        destinationWorkspaceRoot: destination,
+        expectedDestinationHead: destHead,
+        confirmApply: true,
+      };
+      const result = await integrateCandidate(input);
+      assert.equal(result.applied, false, c.label);
+      assert.ok(
+        result.blockers.some((b) => b.code === "CANDIDATE_IDENTITY_NOT_IMMUTABLE"),
+        `${c.label}: expected CANDIDATE_IDENTITY_NOT_IMMUTABLE`,
+      );
+      const readiness = await inspectIntegrationReadiness(input);
+      assert.equal(readiness.technicallyReadyToApply, false, c.label);
+      assert.equal(readiness.canonicalHead, undefined, `${c.label}: no canonical SHA may be exposed`);
+    }
+    // Destination untouched throughout.
+    assert.equal(await readFile(join(destination, "w.ts")), "v1\n");
+    assert.equal(runGitRaw(["status", "--porcelain"], destination), "");
+  } finally {
+    cleanupRepo(source);
+    cleanupRepo(destination);
+  }
+});
+
+test("uppercase hex normalizes; receipts carry the lowercase canonical frozen SHAs", async () => {
+  const source = makeRepo("upper-src", { "p.ts": "v1\n" });
+  const destination = makeRepo("upper-dst", { "p.ts": "v1\n" });
+  try {
+    const base = runGitRaw(["rev-parse", "HEAD"], source);
+    const head = commitAll(source, { "p.ts": "v2\n" }, "candidate");
+
+    const readiness = await inspectIntegrationReadiness({
+      sourceWorkspaceRoot: source,
+      candidateBase: base.toUpperCase(),
+      candidateHead: head.toUpperCase(),
+      destinationWorkspaceRoot: destination,
+      expectedDestinationHead: runGitRaw(["rev-parse", "HEAD"], destination),
+    });
+    assert.equal(readiness.technicallyReadyToApply, true);
+    // Canonical frozen identities are exposed in normalized lowercase form.
+    assert.equal(readiness.canonicalBase, base);
+    assert.equal(readiness.canonicalHead, head);
+
+    const result = await integrateCandidate({
+      sourceWorkspaceRoot: source,
+      candidateBase: base.toUpperCase(),
+      candidateHead: head.toUpperCase(),
+      destinationWorkspaceRoot: destination,
+      expectedDestinationHead: runGitRaw(["rev-parse", "HEAD"], destination),
+      confirmApply: true,
+    });
+    assert.equal(result.applied, true);
+    // Patch was produced from the canonical frozen identities and the receipt
+    // carries them in canonical lowercase form, never the raw caller strings.
+    assert.deepEqual(result.appliedRange, { base: base.toLowerCase(), head: head.toLowerCase() });
+    assert.equal(await readFile(join(destination, "p.ts")), "v2\n");
+  } finally {
+    cleanupRepo(source);
+    cleanupRepo(destination);
+  }
+});
+
+test("RESIDUAL LIMITATION: compatible concurrent edit after the final re-fence coexists with a successful apply", async () => {
+  // Multi-line base so the Candidate hunk keeps its context even after an
+  // unrelated trailing line is appended by the simulated external writer.
+  const source = makeRepo("residual-src", { "q.ts": "line1\nline2\nline3\n" });
+  const destination = makeRepo("residual-dst", { "q.ts": "line1\nline2\nline3\n" });
+  try {
+    const base = runGitRaw(["rev-parse", "HEAD"], source);
+    const head = commitAll(source, { "q.ts": "line1\nLINE2-CANDIDATE\nline3\n" }, "candidate");
+    const destBase = runGitRaw(["rev-parse", "HEAD"], destination);
+
+    let seamRan = false;
+    const result = await integrateCandidate({
+      sourceWorkspaceRoot: source,
+      candidateBase: base,
+      candidateHead: head,
+      destinationWorkspaceRoot: destination,
+      expectedDestinationHead: destBase,
+      confirmApply: true,
+      // Test-only observation seam AFTER the final re-fence: simulates an
+      // external writer landing inside the unexcludable window. This is NOT a
+      // fail-closed case — it documents the residual concurrency limitation.
+      beforeApplyHook: () => {
+        seamRan = true;
+        writeFileSync(
+          join(destination, "q.ts"),
+          "line1\nline2\nline3\nconcurrent-compatible-edit\n",
+        );
+      },
+    });
+
+    assert.equal(seamRan, true, "seam must run after the re-fence");
+    // The apply SUCCEEDS despite the concurrent edit: patch-atomicity is not
+    // mutual exclusion.
+    assert.equal(result.applied, true);
+    // Final file is MIXED: the candidate change (line2 -> LINE2-CANDIDATE)
+    // landed alongside the external appended line instead of being blocked or
+    // rolled back.
+    assert.equal(
+      await readFile(join(destination, "q.ts")),
+      "line1\nLINE2-CANDIDATE\nline3\nconcurrent-compatible-edit\n",
+    );
+  } finally {
+    cleanupRepo(source);
+    cleanupRepo(destination);
+  }
+});
+
 test("remote writability probe never fakes push permission", async () => {
   const repo = makeRepo("remote-probe", { "readme.txt": "x\n" });
   try {
