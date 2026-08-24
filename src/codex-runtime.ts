@@ -6,6 +6,13 @@ import { dirname, join, parse } from "node:path";
 
 export const MINIMUM_CODEX_RUNTIME_VERSION = "0.149.0";
 
+/**
+ * Bounded deadline for the real `codex --version` probe. Cold first runs of
+ * the CLI have been observed at ~17s; the deadline must tolerate that
+ * legitimate latency while still failing closed on a genuinely hung binary.
+ */
+export const CODEX_VERSION_PROBE_TIMEOUT_MS = 30_000;
+
 export interface CodexRuntimeIdentity {
   ready: boolean;
   sdkName?: string;
@@ -26,6 +33,11 @@ export interface InspectCodexRuntimeOptions {
    * real location so a normal DevSpace install finds its OWN dependency.
    */
   moduleUrl?: string;
+  /**
+   * Test-only override of the version-probe deadline. Production callers use
+   * the bounded CODEX_VERSION_PROBE_TIMEOUT_MS default; never unbounded.
+   */
+  versionProbeTimeoutMs?: number;
 }
 
 type PackageIdentity = {
@@ -194,11 +206,12 @@ export function inspectCodexRuntime(
   }
 
   let output: string;
+  const versionProbeTimeoutMs = options.versionProbeTimeoutMs ?? CODEX_VERSION_PROBE_TIMEOUT_MS;
   try {
     output = execFileSync(executable, ["--version"], {
       encoding: "utf8",
       env,
-      timeout: 10_000,
+      timeout: versionProbeTimeoutMs,
       stdio: ["ignore", "pipe", "pipe"],
     }).trim();
   } catch (error) {

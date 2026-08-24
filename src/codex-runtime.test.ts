@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import {
+  CODEX_VERSION_PROBE_TIMEOUT_MS,
   MINIMUM_CODEX_RUNTIME_VERSION,
   inspectCodexRuntime,
   resolveSelfInstalledSdkPackagePath,
@@ -253,5 +254,38 @@ test("self-discovery fails closed for an old package-owned SDK", () => {
     assert.match(identity.reason ?? "", /requires @openai\/codex-sdk >= 0\.149\.0/);
   } finally {
     f.clean();
+  }
+});
+
+// ─── Bounded version-probe deadline ─────────────────────────────────────────
+
+test("production version-probe default is the explicit 30s cold-start bound", () => {
+  assert.equal(CODEX_VERSION_PROBE_TIMEOUT_MS, 30_000);
+});
+
+test("an over-deadline probe fails closed while a sufficient deadline succeeds", () => {
+  const f = fixture(MINIMUM_CODEX_RUNTIME_VERSION);
+  try {
+    // Executable sleeps 500ms before answering: legitimate cold-start proxy.
+    writeFileSync(f.executable, "#!/bin/sh\nsleep 0.5\necho \"codex-cli 0.149.0\"\n", { mode: 0o755 });
+
+    const tooTight = inspectCodexRuntime({
+      sdkPackagePath: f.sdkPackagePath,
+      executable: f.executable,
+      versionProbeTimeoutMs: 50,
+    });
+    assert.equal(tooTight.ready, false);
+    assert.match(tooTight.reason ?? "", /version probe failed/);
+    assert.ok(/ETIMEDOUT|timed out/i.test(tooTight.reason ?? ""));
+
+    const sufficient = inspectCodexRuntime({
+      sdkPackagePath: f.sdkPackagePath,
+      executable: f.executable,
+      versionProbeTimeoutMs: 10_000,
+    });
+    assert.equal(sufficient.ready, true, sufficient.reason);
+    assert.equal(sufficient.binaryVersion, "0.149.0");
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
   }
 });
