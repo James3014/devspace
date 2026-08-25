@@ -174,10 +174,7 @@ class OmpLocalAgentAdapter implements LocalAgentAdapter {
   }
 
   async run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks): Promise<LocalAgentRunResult> {
-    if (callbacks?.onExecutionStarted) {
-      await callbacks.onExecutionStarted();
-    }
-    return runOmpAcpLocalAgent(input);
+    return runOmpAcpLocalAgent(input, callbacks);
   }
 }
 

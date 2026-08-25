@@ -3,7 +3,12 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable, Writable } from "node:stream";
-import { LocalAgentProviderError, type LocalAgentRunInput, type LocalAgentRunResult } from "./local-agent-runtime.js";
+import {
+  LocalAgentProviderError,
+  type LocalAgentRunCallbacks,
+  type LocalAgentRunInput,
+  type LocalAgentRunResult,
+} from "./local-agent-runtime.js";
 
 const DEFAULT_OMP_TIMEOUT_MS = 600_000;
 const OMP_WRITE_TOOLS = "read,edit,write,grep,glob,todo";
@@ -79,7 +84,10 @@ export function buildOmpAcpArgs(input: LocalAgentRunInput, configPath: string): 
   return args;
 }
 
-export async function runOmpAcpLocalAgent(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
+export async function runOmpAcpLocalAgent(
+  input: LocalAgentRunInput,
+  callbacks?: LocalAgentRunCallbacks,
+): Promise<LocalAgentRunResult> {
   const { client, methods, ndJsonStream, PROTOCOL_VERSION } = await import("@agentclientprotocol/sdk");
   const tempRoot = await mkdtemp(join(tmpdir(), "devspace-omp-acp-"));
   const configPath = join(tempRoot, "omp-devspace.yml");
@@ -153,6 +161,10 @@ export async function runOmpAcpLocalAgent(input: LocalAgentRunInput): Promise<Lo
           });
           activeSessionId = session.sessionId;
           items.push(session);
+        }
+
+        if (callbacks?.onExecutionStarted) {
+          await callbacks.onExecutionStarted();
         }
 
         const response = await agent.request(methods.agent.session.prompt, {
