@@ -2385,6 +2385,366 @@ test("G3 TEST T — OMP callback failure prevents prompt dispatch", async () => 
   assert.equal(promptSent, false, "When onExecutionStarted throws, session.prompt must NOT be sent");
 });
 
+// TEST U: Continuation blocked while terminator pending
+test("G3 TEST U — continuation blocked while terminator pending", async () => {
+  const f = setupGitFixture();
+  let terminatorEntered = false;
+  let releaseTerminator!: () => void;
+  const terminatorHoldPromise = new Promise<void>((resolve) => {
+    releaseTerminator = resolve;
+  });
+
+  const customTerminator = async (record: any) => {
+    terminatorEntered = true;
+    await terminatorHoldPromise;
+    return true;
+  };
+
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-race-u-"));
+  const config = {
+    stateDir,
+    subagents: true,
+    oauth: { scopes: ["devspace"] },
+    agentMaxConcurrent: 8,
+    toolchains: [],
+  } as any;
+
+  const manager = new LocalAgentSessionManager(
+    config,
+    async () => undefined,
+    customTerminator,
+  );
+
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "do work",
+      profiles: mockProfiles,
+      executionContract: {
+        maxStartupMs: 40,
+      },
+    });
+
+    const store = (manager as any).store;
+    const workerToken = "token-race-u";
+    store.prepareWorker(started.agentId, workerToken);
+    store.claimWorker(started.agentId, workerToken, 12345);
+
+    // Wait for startup timeout to exceed
+    await new Promise((r) => setTimeout(r, 60));
+
+    // Launch supervisor in background
+    const supervisePromise = manager.superviseActiveAgents();
+
+    // Poll until terminator is entered
+    while (!terminatorEntered) {
+      await new Promise((r) => setTimeout(r, 5));
+    }
+
+    // Record is error and termination is pending
+    const recordWhileTerminating = store.getById(started.agentId);
+    assert.equal(recordWhileTerminating?.status, "error");
+    assert.equal(recordWhileTerminating?.lifecycleState?.termination?.pending, true);
+
+    // Continuation attempt MUST fail with AGENT_TERMINATION_PENDING
+    await assert.rejects(
+      manager.continueAgent({
+        workspaceId: "ws_1",
+        workspaceRoot: f.repo,
+        agentId: started.agentId,
+        prompt: "continue prompt",
+      }),
+      (err: any) => {
+        assert.equal(err.code, "AGENT_TERMINATION_PENDING");
+        return true;
+      },
+      "Continuation must be rejected when physical worker termination is pending",
+    );
+
+    // Release terminator and wait for supervision to finish
+    releaseTerminator();
+    await supervisePromise;
+
+    // After successful termination, termination pending is cleared
+    const recordAfter = store.getById(started.agentId);
+    assert.equal(recordAfter?.lifecycleState?.termination, undefined);
+  } finally {
+    f.clean();
+    try {
+      rmSync(stateDir, { recursive: true, force: true });
+    } catch {}
+  }
+});
+
+// TEST V: Termination failure keeps continuation blocked
+test("G3 TEST V — termination failure keeps continuation blocked", async () => {
+  const f = setupGitFixture();
+  const customTerminator = async (record: any) => {
+    return false; // Termination could not be verified
+  };
+
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-race-v-"));
+  const config = {
+    stateDir,
+    subagents: true,
+    oauth: { scopes: ["devspace"] },
+    agentMaxConcurrent: 8,
+    toolchains: [],
+  } as any;
+
+  const manager = new LocalAgentSessionManager(
+    config,
+    async () => undefined,
+    customTerminator,
+  );
+
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "do work",
+      profiles: mockProfiles,
+      executionContract: {
+        maxStartupMs: 40,
+      },
+    });
+
+    const store = (manager as any).store;
+    const workerToken = "token-race-v";
+    store.prepareWorker(started.agentId, workerToken);
+    store.claimWorker(started.agentId, workerToken, 12345);
+
+    // Wait for startup timeout to exceed and supervise
+    await new Promise((r) => setTimeout(r, 60));
+    await manager.superviseActiveAgents();
+
+    const record = store.getById(started.agentId);
+    assert.equal(record?.status, "error");
+    assert.equal(record?.lifecycleState?.termination?.pending, true);
+    assert.match(record?.error ?? "", /Worker termination could not be verified/);
+
+    // Continuation must still be blocked
+    await assert.rejects(
+      manager.continueAgent({
+        workspaceId: "ws_1",
+        workspaceRoot: f.repo,
+        agentId: started.agentId,
+        prompt: "continue prompt",
+      }),
+      (err: any) => {
+        assert.equal(err.code, "AGENT_TERMINATION_PENDING");
+        return true;
+      },
+    );
+  } finally {
+    f.clean();
+    try {
+      rmSync(stateDir, { recursive: true, force: true });
+    } catch {}
+  }
+});
+
+// TEST W: Successful termination unlocks continuation
+test("G3 TEST W — successful termination unlocks continuation", async () => {
+  const f = setupGitFixture();
+  const { manager, clean } = setupManager();
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "do work",
+      profiles: mockProfiles,
+      executionContract: {
+        maxStartupMs: 40,
+      },
+    });
+
+    const store = (manager as any).store;
+    const workerToken = "token-race-w";
+    store.prepareWorker(started.agentId, workerToken);
+    store.claimWorker(started.agentId, workerToken, 12345);
+
+    // Timeout occurs and supervisor successfully terminates worker
+    await new Promise((r) => setTimeout(r, 60));
+    await manager.superviseActiveAgents();
+
+    const recordBefore = store.getById(started.agentId);
+    assert.equal(recordBefore?.status, "error");
+    assert.equal(recordBefore?.lifecycleState?.termination, undefined);
+
+    // Continuation is now permitted
+    await manager.continueAgent({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      agentId: started.agentId,
+      prompt: "continue prompt",
+    });
+
+    const recordAfter = store.getById(started.agentId);
+    assert.equal(recordAfter?.status, "starting");
+    assert.ok(recordAfter?.lifecycleState?.activeTurn?.turnStartedAt);
+  } finally {
+    f.clean();
+    clean();
+  }
+});
+
+// TEST X: Stale cleanup callback cannot touch newer generation
+test("G3 TEST X — stale cleanup callback cannot touch newer generation", async () => {
+  const f = setupGitFixture();
+  const { manager, clean } = setupManager();
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "do work",
+      profiles: mockProfiles,
+      executionContract: { maxStartupMs: 40 },
+    });
+
+    const store = (manager as any).store;
+    const workerTokenA = "token-gen-a";
+    store.prepareWorker(started.agentId, workerTokenA);
+    store.claimWorker(started.agentId, workerTokenA, 12345);
+
+    // Timeout generation A
+    const fenceResultA = store.fenceActiveTurn({
+      agentId: started.agentId,
+      terminalReason: "timeout",
+      error: "timeout A",
+    });
+    const terminationIdA = fenceResultA.terminationId!;
+    assert.ok(terminationIdA);
+
+    // Complete generation A
+    store.completeTermination(started.agentId, terminationIdA, true);
+
+    // Start generation B via continuation
+    await manager.continueAgent({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      agentId: started.agentId,
+      prompt: "turn B",
+    });
+
+    const workerTokenB = "token-gen-b";
+    store.prepareWorker(started.agentId, workerTokenB);
+    store.claimWorker(started.agentId, workerTokenB, 67890);
+
+    const recordBBefore = store.getById(started.agentId);
+    assert.equal(recordBBefore?.status, "running");
+    assert.equal(recordBBefore?.workerToken, workerTokenB);
+
+    // Stale generation A completion attempts to touch record B
+    store.completeTermination(started.agentId, terminationIdA, true);
+    store.completeTermination(started.agentId, terminationIdA, false);
+
+    const recordBAfter = store.getById(started.agentId);
+    assert.equal(recordBAfter?.status, "running", "Stale cleanup callback must not mutate newer generation status");
+    assert.equal(recordBAfter?.workerToken, workerTokenB, "Stale cleanup callback must not touch workerToken");
+  } finally {
+    f.clean();
+    clean();
+  }
+});
+
+// TEST Y: Termination-pending counts against capacity
+test("G3 TEST Y — termination-pending counts against capacity", async () => {
+  const f = setupGitFixture();
+  let releaseTerminatorA!: () => void;
+  const holdTerminatorA = new Promise<void>((resolve) => {
+    releaseTerminatorA = resolve;
+  });
+
+  const customTerminator = async (record: any) => {
+    if (record.id === "agent_a") {
+      await holdTerminatorA;
+    }
+    return true;
+  };
+
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-cap-y-"));
+  const config = {
+    stateDir,
+    subagents: true,
+    oauth: { scopes: ["devspace"] },
+    agentMaxConcurrent: 1, // Max concurrent is 1
+    toolchains: [],
+  } as any;
+
+  const manager = new LocalAgentSessionManager(
+    config,
+    async () => undefined,
+    customTerminator,
+  );
+
+  try {
+    const store = (manager as any).store;
+    // Manually create Agent A
+    store.create({
+      id: "agent_a",
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      provider: "claude",
+    });
+    const tokenA = "token-a";
+    store.prepareWorker("agent_a", tokenA);
+    store.claimWorker("agent_a", tokenA, 101);
+
+    // Fence Agent A to error with pending termination
+    store.fenceActiveTurn({
+      agentId: "agent_a",
+      terminalReason: "timeout",
+      error: "timed out",
+    });
+
+    assert.equal(manager.runningCount(), 1, "Termination pending must count towards runningCount");
+
+    // Attempting to start Agent B must fail capacity check
+    await assert.rejects(
+      manager.startAgent({
+        workspaceId: "ws_1",
+        workspaceRoot: f.repo,
+        profileName: "reviewer",
+        prompt: "start agent b",
+        profiles: mockProfiles,
+      }),
+      (err: any) => {
+        assert.equal(err.code, "NO_EXECUTION_CAPACITY");
+        return true;
+      },
+      "Must reject when capacity is exhausted by termination-pending worker",
+    );
+
+    // Clear Agent A termination
+    const agentARecord = store.getById("agent_a");
+    store.completeTermination("agent_a", agentARecord.lifecycleState.termination.terminationId, true);
+
+    assert.equal(manager.runningCount(), 0, "runningCount must be 0 after termination cleared");
+
+    // Now Agent B can start
+    const startedB = await manager.startAgent({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "start agent b",
+      profiles: mockProfiles,
+    });
+    assert.ok(startedB.agentId);
+  } finally {
+    f.clean();
+    try {
+      rmSync(stateDir, { recursive: true, force: true });
+    } catch {}
+  }
+});
+
 test("AC-5 dependency bridge rejects stale workspace evidence before worker launch", async () => {
   const f = setupGitFixture();
   const dependencyRoot = mkdtempSync(join(tmpdir(), "devspace-contract-dependencies-"));
