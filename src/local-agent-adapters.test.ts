@@ -397,7 +397,7 @@ assert.equal(
 // ==========================================
 import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 
 const mockAgySource = `#!/usr/bin/env node
@@ -442,6 +442,10 @@ if (args.includes("--print")) {
   if (process.env.EXPECTED_AGY_GIT_DIR && !addDirs.map(canonical).includes(canonical(process.env.EXPECTED_AGY_GIT_DIR))) {
     console.error("MISSING_GIT_METADATA_ADD_DIR");
     process.exit(96);
+  }
+  if (process.env.UNEXPECTED_AGY_GIT_DIR && addDirs.map(canonical).includes(canonical(process.env.UNEXPECTED_AGY_GIT_DIR))) {
+    console.error("LEAKED_REPO_COMMON_GIT_DIR");
+    process.exit(94);
   }
   const model = args.includes("--model") ? args[args.indexOf("--model") + 1] : "";
   const effort = args.includes("--effort") ? args[args.indexOf("--effort") + 1] : "";
@@ -693,7 +697,8 @@ try {
     }
   }
 
-  // K. Managed linked worktrees expose only their verified external Git common directory.
+  // K. Managed linked worktrees expose only their verified worktree-scoped
+  // Git metadata directory, never the repo-common .git.
   {
     const root = mkdtempSync(join(tmpdir(), "devspace-agy-worktree-"));
     const sourceRepo = join(root, "source");
@@ -715,7 +720,8 @@ try {
 
       process.env = {
         ...testEnv,
-        EXPECTED_AGY_GIT_DIR: join(sourceRepo, ".git"),
+        EXPECTED_AGY_GIT_DIR: join(sourceRepo, ".git", "worktrees", basename(linkedWorktree)),
+        UNEXPECTED_AGY_GIT_DIR: join(sourceRepo, ".git"),
       };
       const result = await adapter.run({
         prompt: "linked-worktree",
