@@ -386,6 +386,182 @@ try {
   assert.equal(shortCommand.running, false);
   assert.equal(shortCommand.exitCode, 0);
   assert.match(shortCommand.output, /short_ok/);
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Comprehensive Replay Identity Matrix (Required Tests 1 - 7)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // 1. same attemptKey + same command + same timeout -> reuse existing execution
+  const key1 = "matrix:test1";
+  const r1_first = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: `${node} -e "console.log('mat1'); process.exit(0);"`,
+    timeoutSeconds: 10,
+    yieldTimeMs: 1_000,
+    attemptKey: key1,
+  });
+  assert.equal(r1_first.running, false);
+  assert.equal(r1_first.exitCode, 0);
+
+  const r1_second = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: `${node} -e "console.log('mat1'); process.exit(0);"`,
+    timeoutSeconds: 10,
+    yieldTimeMs: 1_000,
+    attemptKey: key1,
+  });
+  assert.equal(r1_second.running, false);
+  assert.equal(r1_second.exitCode, 0);
+  assert.match(r1_second.output, /mat1/);
+
+  // 2. same attemptKey + same command + DIFFERENT timeoutSeconds -> ATTEMPT_REPLAY_CONFLICT
+  const key2 = "matrix:test2";
+  await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: "echo mat2",
+    timeoutSeconds: 30,
+    yieldTimeMs: 1_000,
+    attemptKey: key2,
+  });
+
+  await assert.rejects(
+    g2Manager.start({
+      workspaceId: "ws_g2",
+      cwd: process.cwd(),
+      command: "echo mat2",
+      timeoutSeconds: 300, // Different timeout!
+      yieldTimeMs: 1_000,
+      attemptKey: key2,
+    }),
+    /ATTEMPT_REPLAY_CONFLICT/,
+    "Changing timeoutSeconds on same attemptKey must fail closed",
+  );
+
+  // 3. same attemptKey + same command + DIFFERENT environmentPolicy -> ATTEMPT_REPLAY_CONFLICT
+  const key3 = "matrix:test3";
+  await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: "echo mat3",
+    environmentPolicy: "inherit",
+    yieldTimeMs: 1_000,
+    attemptKey: key3,
+  });
+
+  await assert.rejects(
+    g2Manager.start({
+      workspaceId: "ws_g2",
+      cwd: process.cwd(),
+      command: "echo mat3",
+      environmentPolicy: "sanitized", // Different environment policy!
+      yieldTimeMs: 1_000,
+      attemptKey: key3,
+    }),
+    /ATTEMPT_REPLAY_CONFLICT/,
+    "Changing environmentPolicy on same attemptKey must fail closed",
+  );
+
+  // 4. same attemptKey + same command + DIFFERENT tty -> ATTEMPT_REPLAY_CONFLICT
+  const key4 = "matrix:test4";
+  await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: "echo mat4",
+    tty: false,
+    yieldTimeMs: 1_000,
+    attemptKey: key4,
+  });
+
+  await assert.rejects(
+    g2Manager.start({
+      workspaceId: "ws_g2",
+      cwd: process.cwd(),
+      command: "echo mat4",
+      tty: true, // Different tty mode!
+      yieldTimeMs: 1_000,
+      attemptKey: key4,
+    }),
+    /ATTEMPT_REPLAY_CONFLICT/,
+    "Changing tty mode on same attemptKey must fail closed",
+  );
+
+  // 5. PTY execution: same key + changed columns/rows -> ATTEMPT_REPLAY_CONFLICT
+  if (process.platform !== "win32") {
+    const key5 = "matrix:test5";
+    await g2Manager.start({
+      workspaceId: "ws_g2",
+      cwd: process.cwd(),
+      command: "echo mat5",
+      tty: true,
+      columns: 80,
+      rows: 24,
+      yieldTimeMs: 1_000,
+      attemptKey: key5,
+    });
+
+    await assert.rejects(
+      g2Manager.start({
+        workspaceId: "ws_g2",
+        cwd: process.cwd(),
+        command: "echo mat5",
+        tty: true,
+        columns: 120, // Different initial columns!
+        rows: 30,
+        yieldTimeMs: 1_000,
+        attemptKey: key5,
+      }),
+      /ATTEMPT_REPLAY_CONFLICT/,
+      "Changing initial PTY dimensions on same attemptKey must fail closed",
+    );
+  }
+
+  // 6. same attemptKey + same execution but DIFFERENT yieldTimeMs -> SHOULD NOT conflict
+  const key6 = "matrix:test6";
+  const r6_first = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: `${node} -e "setTimeout(() => { console.log('mat6'); process.exit(0); }, 100)"`,
+    yieldTimeMs: 10, // Short yield
+    attemptKey: key6,
+  });
+  assert.equal(r6_first.running, true);
+
+  const r6_second = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: `${node} -e "setTimeout(() => { console.log('mat6'); process.exit(0); }, 100)"`,
+    yieldTimeMs: 1_000, // Longer yield to wait for finish
+    attemptKey: key6,
+  });
+  assert.equal(r6_second.running, false);
+  assert.equal(r6_second.exitCode, 0);
+  assert.match(r6_second.output, /mat6/);
+
+  // 7. same attemptKey + same execution but DIFFERENT maxOutputTokens -> SHOULD NOT conflict
+  const key7 = "matrix:test7";
+  const r7_first = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: "echo mat7_large_output_budget",
+    maxOutputTokens: 100,
+    yieldTimeMs: 1_000,
+    attemptKey: key7,
+  });
+  assert.equal(r7_first.running, false);
+
+  const r7_second = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: "echo mat7_large_output_budget",
+    maxOutputTokens: 500, // Different output token budget
+    yieldTimeMs: 1_000,
+    attemptKey: key7,
+  });
+  assert.equal(r7_second.running, false);
+  assert.match(r7_second.output, /mat7_large_output_budget/);
 } finally {
   g2Manager.shutdown();
 }

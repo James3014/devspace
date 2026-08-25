@@ -274,6 +274,7 @@ async function fixture(
     subagents?: boolean | SubagentsConfig;
     gitCandidates?: boolean;
     toolchains?: string;
+    toolMode?: "full" | "minimal" | "codex";
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -326,6 +327,7 @@ async function fixture(
   });
   let config: ServerConfig = {
     ...loadedConfig,
+    toolMode: options.toolMode ?? loadedConfig.toolMode,
     subagents: {
       ...loadedConfig.subagents,
       enabled: wantsSubagents,
@@ -994,12 +996,23 @@ test("bash and command_status: attemptKey reconciliation and idempotent executio
   const openResult = await callOpen(context.client, context.project, "chat-cmd-reconcile");
   const workspaceId = structuredContent(openResult).workspaceId as string;
 
-  // 1. Short command compatibility
+  // 0. Missing attemptKey on native bash must fail closed / reject schema
+  const missingKeyRes = await context.client.callTool({
+    name: "bash",
+    arguments: {
+      workspaceId,
+      command: "echo fail_no_attempt_key",
+    },
+  });
+  assert.equal(missingKeyRes.isError, true, "Native bash requires attemptKey");
+
+  // 1. Short command compatibility with required attemptKey
   const shortRes = await context.client.callTool({
     name: "bash",
     arguments: {
       workspaceId,
       command: "echo short_cmd_hello",
+      attemptKey: "bash:g2:short01",
     },
   });
   assert.equal(shortRes.isError, undefined);
@@ -1066,4 +1079,29 @@ test("bash and command_status: attemptKey reconciliation and idempotent executio
   });
   assert.equal(conflictRes.isError, true);
   assert.match(responseText(conflictRes), /ATTEMPT_REPLAY_CONFLICT/);
+});
+
+test("command_status metadata annotations and minimal mode visibility", async (t) => {
+  // Test minimal mode tools
+  const context = await fixture(t, { toolMode: "minimal" });
+  const toolsList = await context.client.listTools();
+  const toolNames = toolsList.tools.map((t) => t.name);
+
+  // command_status is visible in minimal mode for read-only reconciliation
+  assert.ok(toolNames.includes("command_status"), "command_status should be visible in minimal mode");
+
+  // exec_command and write_stdin remain hidden in minimal mode
+  assert.ok(!toolNames.includes("exec_command"), "exec_command must stay hidden in minimal mode");
+  assert.ok(!toolNames.includes("write_stdin"), "write_stdin must stay hidden in minimal mode");
+
+  // Verify command_status annotations
+  const commandStatusTool = toolsList.tools.find((t) => t.name === "command_status");
+  assert.ok(commandStatusTool);
+  const annotations = (commandStatusTool as unknown as { annotations?: Record<string, unknown> }).annotations;
+  assert.deepEqual(annotations, {
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  });
 });

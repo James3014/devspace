@@ -90,11 +90,14 @@ interface ProcessSession {
   id: number;
   attemptKey?: string;
   workspaceId: string;
+  workspaceRoot?: string;
   command: string;
   cwd: string;
   executable?: string;
   args?: string[];
   environmentPolicy?: ProcessEnvironmentPolicy;
+  tty?: boolean;
+  timeoutSeconds?: number;
   process?: ManagedProcess;
   startedAt: number;
   columns: number;
@@ -410,15 +413,36 @@ export class ProcessSessionManager {
 
   private isMateriallyIdentical(existing: ProcessSession, input: StartCommandInput): boolean {
     if (existing.workspaceId !== input.workspaceId) return false;
+    if (existing.workspaceRoot !== input.workspaceRoot) return false;
     if (existing.command !== input.command) return false;
     if (existing.cwd !== input.cwd) return false;
     if (existing.executable !== input.executable) return false;
+
     const existingArgs = existing.args ?? [];
     const inputArgs = input.args ?? [];
     if (existingArgs.length !== inputArgs.length) return false;
     for (let i = 0; i < existingArgs.length; i++) {
       if (existingArgs[i] !== inputArgs[i]) return false;
     }
+
+    if (existing.timeoutSeconds !== input.timeoutSeconds) return false;
+
+    const existingEnv = existing.environmentPolicy ?? "inherit";
+    const inputEnv = input.environmentPolicy ?? "inherit";
+    if (existingEnv !== inputEnv) return false;
+
+    const existingTty = Boolean(existing.tty);
+    const inputTty = Boolean(input.tty);
+    if (existingTty !== inputTty) return false;
+
+    if (existingTty) {
+      const inputColumns = terminalSize(input.columns, DEFAULT_COLUMNS);
+      const inputRows = terminalSize(input.rows, DEFAULT_ROWS);
+      if (existing.columns !== inputColumns || existing.rows !== inputRows) {
+        return false;
+      }
+    }
+
     return true;
   }
 
@@ -460,11 +484,14 @@ export class ProcessSessionManager {
       id: this.nextSessionId++,
       attemptKey: input.attemptKey,
       workspaceId: input.workspaceId,
+      workspaceRoot: input.workspaceRoot,
       command: input.command,
       cwd: input.cwd,
       executable: input.executable,
-      args: input.args,
-      environmentPolicy: input.environmentPolicy,
+      args: input.args ? [...input.args] : undefined,
+      environmentPolicy: input.environmentPolicy ?? "inherit",
+      tty: Boolean(input.tty),
+      timeoutSeconds: input.timeoutSeconds,
       startedAt: Date.now(),
       columns: terminalSize(input.columns, DEFAULT_COLUMNS),
       rows: terminalSize(input.rows, DEFAULT_ROWS),
