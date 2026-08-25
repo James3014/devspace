@@ -23,11 +23,17 @@ import { WorkspaceRegistry } from "./workspaces.js";
 const execFileAsync = promisify(execFile);
 const OWNER_TOKEN = "test-owner-token-that-is-long-enough";
 
-function makeFakeCodexTui(options: { logPath: string; emitGoalMarker?: boolean }): string {
+function makeFakeCodexTui(options: {
+  logPath: string;
+  emitGoalMarker?: boolean;
+  tuiReadyDelayMs?: number;
+}): string {
   return `#!/usr/bin/env node
 const fs = require("node:fs");
 fs.appendFileSync(${JSON.stringify(options.logPath)}, "SPAWN:" + process.pid + "\\n");
-process.stdout.write("Codex CLI fake ready\\n");
+process.stdout.write("Codex CLI fake booting\\n");
+process.stdout.write("model: loading\\n");
+process.stdout.write("directory: loading\\n");
 if (process.env.DEVSPACE_OAUTH_OWNER_TOKEN !== undefined) {
   process.stdout.write("SENTINEL_LEAK:" + process.env.DEVSPACE_OAUTH_OWNER_TOKEN + "\\n");
 }
@@ -36,10 +42,21 @@ process.stdout.write("TTY:" + (process.stdout.isTTY ? "1" : "0") + "\\n");
 process.stdout.write("PWD:" + process.cwd() + "\\n");
 if (process.stdin.isTTY && process.stdin.setRawMode) process.stdin.setRawMode(true);
 const emitGoal = ${options.emitGoalMarker === false ? "false" : "true"};
+let tuiReady = false;
+setTimeout(() => {
+  tuiReady = true;
+  process.stdout.write("model: gpt-5.6-sol medium\\n");
+  process.stdout.write("directory: " + process.cwd() + "\\n");
+  process.stdout.write("Ask Codex to do anything\\n");
+}, ${options.tuiReadyDelayMs ?? 0});
 let buffer = "";
 function handleLine(line) {
   if (!line) return;
   if (line.startsWith("/goal ")) {
+    if (!tuiReady) {
+      process.stdout.write("The session must start before you can set a goal.\\n");
+      return;
+    }
     const goalText = line.slice(6);
     if (emitGoal) {
       process.stdout.write("Pursuing goal\\n");
@@ -84,6 +101,7 @@ interface GoalFixtureOptions {
   goalsEnabled?: boolean;
   codexBinOverride?: string;
   emitGoalMarker?: boolean;
+  tuiReadyDelayMs?: number;
   startupTimeoutMs?: number;
 }
 
@@ -111,6 +129,7 @@ async function goalFixture(t: TestContext, options: GoalFixtureOptions = {}): Pr
   writeFileSync(fakeBin, makeFakeCodexTui({
     logPath: spawnLogPath,
     emitGoalMarker: options.emitGoalMarker,
+    tuiReadyDelayMs: options.tuiReadyDelayMs,
   }), { mode: 0o755 });
   chmodSync(fakeBin, 0o755);
 
@@ -451,6 +470,25 @@ test("large goal input is typed in chunks instead of one swallowed paste", async
   assert.doesNotMatch(collectOutput([structured(started), structured(status)]), /PASTE_SWALLOWED/);
   assert.ok(normalized.includes(`GOAL_RECEIVED:${goal.slice(0, 40)}`));
   assert.ok(normalized.includes(goal.slice(-30)));
+  await callTool(context.client, "codex_goal_cancel", {
+    workspaceId,
+    goalId: structured(started).goalId as string,
+  });
+});
+
+test("start waits for resolved model and directory before typing /goal", async (t) => {
+  const context = await goalFixture(t, { tuiReadyDelayMs: 500, startupTimeoutMs: 4_000 });
+  const workspaceId = await openWorkspace(context.client, context.projectA);
+
+  const started = await callTool(context.client, "codex_goal_start", {
+    workspaceId,
+    goal: "wait for the real session",
+    expectedHead: await headSha(context.projectA),
+  });
+  assert.equal(started.isError, undefined, textOf(started));
+  const output = collectOutput([structured(started)]);
+  assert.doesNotMatch(output, /The session must start before you can set a goal/);
+  assert.match(normalizeTerminalText(output), /Pursuing goal/);
   await callTool(context.client, "codex_goal_cancel", {
     workspaceId,
     goalId: structured(started).goalId as string,
