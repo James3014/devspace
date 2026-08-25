@@ -84,6 +84,70 @@ export function buildOmpAcpArgs(input: LocalAgentRunInput, configPath: string): 
   return args;
 }
 
+export interface OmpAcpSessionAgentLike {
+  request(method: any, params: any): Promise<any>;
+}
+
+export interface OmpAcpSessionOutput {
+  activeSessionId: string;
+  response: any;
+  items: unknown[];
+}
+
+export async function runOmpAcpSession(
+  agent: OmpAcpSessionAgentLike,
+  methods: any,
+  protocolVersion: number | string,
+  input: LocalAgentRunInput,
+  callbacks?: LocalAgentRunCallbacks,
+  items: unknown[] = [],
+): Promise<OmpAcpSessionOutput> {
+  const initialized = await agent.request(methods.agent.initialize, {
+    protocolVersion,
+    clientCapabilities: {},
+  });
+  items.push(initialized);
+
+  let activeSessionId: string;
+  if (input.providerSessionId) {
+    if (!initialized.agentCapabilities?.sessionCapabilities?.resume) {
+      throw new Error(
+        "OMP ACP does not advertise session/resume; refusing to replay a continued prompt as a new session.",
+      );
+    }
+    await agent.request(methods.agent.session.resume, {
+      sessionId: input.providerSessionId,
+      cwd: input.workspaceRoot,
+      additionalDirectories: [],
+    });
+    activeSessionId = input.providerSessionId;
+  } else {
+    const session = await agent.request(methods.agent.session.new, {
+      cwd: input.workspaceRoot,
+      mcpServers: [],
+    });
+    activeSessionId = session.sessionId;
+    items.push(session);
+  }
+
+  // Exact boundary: ACP session ready -> persist executionStartedAt -> prompt
+  if (callbacks?.onExecutionStarted) {
+    await callbacks.onExecutionStarted();
+  }
+
+  const response = await agent.request(methods.agent.session.prompt, {
+    sessionId: activeSessionId,
+    prompt: [{ type: "text", text: input.prompt }],
+  });
+  items.push(response);
+
+  return {
+    activeSessionId,
+    response,
+    items,
+  };
+}
+
 export async function runOmpAcpLocalAgent(
   input: LocalAgentRunInput,
   callbacks?: LocalAgentRunCallbacks,
@@ -138,41 +202,16 @@ export async function runOmpAcpLocalAgent(
         if (content.type === "text") textParts.push(content.text);
       })
       .connectWith(stream, async (agent) => {
-        const initialized = await agent.request(methods.agent.initialize, {
-          protocolVersion: PROTOCOL_VERSION,
-          clientCapabilities: {},
-        });
-        items.push(initialized);
-
-        if (input.providerSessionId) {
-          if (!initialized.agentCapabilities?.sessionCapabilities?.resume) {
-            throw new Error("OMP ACP does not advertise session/resume; refusing to replay a continued prompt as a new session.");
-          }
-          await agent.request(methods.agent.session.resume, {
-            sessionId: input.providerSessionId,
-            cwd: input.workspaceRoot,
-            additionalDirectories: [],
-          });
-          activeSessionId = input.providerSessionId;
-        } else {
-          const session = await agent.request(methods.agent.session.new, {
-            cwd: input.workspaceRoot,
-            mcpServers: [],
-          });
-          activeSessionId = session.sessionId;
-          items.push(session);
-        }
-
-        if (callbacks?.onExecutionStarted) {
-          await callbacks.onExecutionStarted();
-        }
-
-        const response = await agent.request(methods.agent.session.prompt, {
-          sessionId: activeSessionId!,
-          prompt: [{ type: "text", text: input.prompt }],
-        });
-        items.push(response);
-        return response;
+        const sessionResult = await runOmpAcpSession(
+          agent,
+          methods,
+          PROTOCOL_VERSION,
+          input,
+          callbacks,
+          items,
+        );
+        activeSessionId = sessionResult.activeSessionId;
+        return sessionResult.response;
       });
 
     const timeoutPromise = new Promise<never>((_, reject) => {
