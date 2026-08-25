@@ -2402,6 +2402,8 @@ export function createMcpServer(
               model: z.string().optional(),
               thinking: z.string().optional(),
               status: z.string(),
+              terminationPending: z.boolean().optional(),
+              terminationBlocked: z.boolean().optional(),
               updatedAt: z.string(),
             }),
           ),

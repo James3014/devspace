@@ -35,6 +35,8 @@ export interface AgentLifecycleState {
   cumulativeChangedPaths?: string[];
   turnEndBaseline?: ScopeBaseline;
   activeTurn?: ActiveTurnState;
+  /** Compatibility projection for the original termination callback API. */
+  termination?: PhysicalTerminationState;
   terminationPending?: TerminationPendingState;
   /** Parser evidence that a persisted pending-looking lifecycle is malformed. */
   lifecycleCorrupt?: true;
@@ -45,6 +47,15 @@ export interface AgentLifecycleState {
     detectedAt: string;
     reason: string;
   };
+}
+
+export interface PhysicalTerminationState {
+  pending: boolean;
+  fencedAt: string;
+  reason: AgentTerminalReason;
+  terminationId: string;
+  previousWorkerPid?: number;
+  previousWorkerToken?: string;
 }
 
 export interface LocalAgentRecord {
@@ -877,6 +888,7 @@ export class LocalAgentStore {
       }
 
       const now = new Date().toISOString();
+      const terminationId = randomUUID();
       const pending: TerminationPendingState = {
         generation: activeTurn.generation,
         requestedAt: now,
@@ -890,6 +902,14 @@ export class LocalAgentStore {
       const lifecycleState: AgentLifecycleState = {
         ...lifecycle,
         activeTurn: undefined,
+        termination: {
+          pending: true,
+          fencedAt: now,
+          reason: input.terminalReason,
+          terminationId,
+          previousWorkerPid: current.workerPid,
+          previousWorkerToken: current.workerToken,
+        },
         terminationPending: pending,
       };
       const scopeState = input.terminalReason === "scope_violation"
@@ -912,7 +932,7 @@ export class LocalAgentStore {
         current.updatedAt,
       );
       const refreshed = this.getById(input.agentId) ?? current;
-      return { applied: result.changes === 1, previous: current, current: refreshed };
+      return { applied: result.changes === 1, terminationId, previous: current, current: refreshed };
     });
     return begin.immediate();
   }
@@ -975,6 +995,7 @@ export class LocalAgentStore {
       const lifecycleState: AgentLifecycleState = {
         ...current.lifecycleState,
         terminationPending: undefined,
+        termination: undefined,
         lifecycleCorrupt: undefined,
         lastSettledGeneration: input.generation,
         cumulativeChangedPaths: input.cumulativeChangedPaths ?? current.lifecycleState?.cumulativeChangedPaths,
@@ -1000,6 +1021,26 @@ export class LocalAgentStore {
 
   fenceActiveTurn(input: FenceActiveTurnInput): FenceActiveTurnResult {
     return this.beginTerminationCAS({ ...input, terminalStatus: "error" });
+  }
+
+  /** Compatibility completion hook for older termination callbacks. */
+  completeTermination(agentId: string, terminationId: string, verified: boolean): LocalAgentRecord {
+    const current = this.getById(agentId);
+    if (!current) throw new Error(`Unknown subagent id: ${agentId}`);
+    if (current.lifecycleState?.termination?.terminationId !== terminationId) return current;
+    if (verified && current.lifecycleState?.terminationPending) {
+      const pending = current.lifecycleState.terminationPending;
+      return this.completeTerminationCAS({
+        agentId,
+        generation: pending.generation,
+        workerPid: pending.workerPid,
+        workerToken: pending.workerToken,
+        turnEndBaseline: current.lifecycleState.turnEndBaseline ?? { changedPaths: [], head: null },
+      }).current ?? current;
+    }
+    return this.update(agentId, {
+      error: `${current.error ?? "Termination requested."} Worker termination could not be verified.`,
+    });
   }
 
   reconcileLegacyDetachedActiveCAS(
@@ -1350,6 +1391,8 @@ function readLifecycleState(value: string | null | undefined): AgentLifecycleSta
     if (detached && typeof parsed.lastSettledGeneration === "string" && parsed.lastSettledGeneration) {
       state.lastSettledGeneration = parsed.lastSettledGeneration;
     }
+    const termination = readPhysicalTerminationState(parsed.termination);
+    if (termination) state.termination = termination;
     if (!detached) {
       const legacyActiveTurn = readLegacyActiveTurnState(parsed.activeTurn);
       if (legacyActiveTurn) state.activeTurn = legacyActiveTurn;
@@ -1382,6 +1425,20 @@ function readLifecycleState(value: string | null | undefined): AgentLifecycleSta
       ? { lifecycleKind: "detached_worker_v2", lifecycleCorrupt: true }
       : undefined;
   }
+}
+
+function readPhysicalTerminationState(value: unknown): PhysicalTerminationState | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record.terminationId !== "string" || typeof record.fencedAt !== "string") return undefined;
+  return {
+    pending: record.pending === true,
+    fencedAt: record.fencedAt,
+    reason: typeof record.reason === "string" ? record.reason as AgentTerminalReason : "unknown",
+    terminationId: record.terminationId,
+    previousWorkerPid: typeof record.previousWorkerPid === "number" ? record.previousWorkerPid : undefined,
+    previousWorkerToken: typeof record.previousWorkerToken === "string" ? record.previousWorkerToken : undefined,
+  };
 }
 
 function readLegacyActiveTurnState(value: unknown): ActiveTurnState | undefined {

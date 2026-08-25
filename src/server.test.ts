@@ -358,7 +358,7 @@ async function fixture(
   const workspaces = new WorkspaceRegistry(config, store);
   const { LocalAgentSessionManager } = await import("./local-agent-sessions.js");
   const agentSessionManager = config.subagents.enabled
-    ? new LocalAgentSessionManager(config, async () => {})
+    ? new LocalAgentSessionManager(config, async () => {}, async () => true)
     : undefined;
   const server = createMcpServer(
     config,
@@ -577,7 +577,17 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   const { LocalAgentStore } = await import("./local-agent-store.js");
   const store = new LocalAgentStore(context.stateDir);
   try {
-    store.update(startStructured.agentId, { status: "idle" });
+    const record = store.getById(startStructured.agentId)!;
+    const generation = record.lifecycleState!.activeTurn!.generation!;
+    const workerToken = record.workerToken!;
+    store.claimWorkerCAS(startStructured.agentId, generation, workerToken, process.pid);
+    store.finishTurnCAS({
+      agentId: startStructured.agentId,
+      generation,
+      workerToken,
+      status: "idle",
+      terminalReason: "completed",
+    });
   } finally {
     store.close();
   }
