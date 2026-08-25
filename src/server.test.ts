@@ -6,9 +6,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after, type TestContext } from "node:test";
 import { promisify } from "node:util";
+import Database from "better-sqlite3";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { loadConfig, type ServerConfig } from "./config.js";
+import { databasePath } from "./db/client.js";
 import type { LocalAgentProviderAvailability } from "./local-agent-availability.js";
 import { buildLocalAgentProviderStatuses } from "./local-agent-catalog.js";
 import type { SubagentsConfig } from "./local-agent-config.js";
@@ -679,6 +681,66 @@ test("subagents: status and list expose durable termination pending without term
       workerToken: pending.workerToken,
       turnEndBaseline: { changedPaths: [], head: null },
     }).applied, true);
+  } finally {
+    store.close();
+  }
+});
+
+test("subagents: status and list distinguish blocked termination from actual pending", async (t) => {
+  const context = await fixture(t, { subagents: true });
+  const opened = await callOpen(context.client, context.project, "blocked-status");
+  const workspaceId = structuredContent(opened).workspaceId as string;
+  const { LocalAgentStore } = await import("./local-agent-store.js");
+  const store = new LocalAgentStore(context.stateDir);
+  try {
+    const partial = store.create({
+      workspaceId,
+      workspaceRoot: context.project,
+      profileName: "reviewer",
+      provider: "codex",
+    });
+    store.update(partial.id, { status: "starting", workerToken: "partial-server-token" });
+    assert.equal(store.reconcileLegacyDetachedActiveCAS(partial.id).applied, true);
+
+    const corrupt = store.create({
+      workspaceId,
+      workspaceRoot: context.project,
+      profileName: "reviewer",
+      provider: "codex",
+      lifecycleKind: "detached_worker_v2",
+    });
+    const database = new Database(databasePath(context.stateDir));
+    database.prepare("update local_agent_sessions set status = 'error', lifecycle_state = ? where id = ?")
+      .run(JSON.stringify({
+        lifecycleKind: "detached_worker_v2",
+        terminationPending: { generation: 42 },
+      }), corrupt.id);
+    database.close();
+
+    for (const agentId of [partial.id, corrupt.id]) {
+      const status = await context.client.callTool({
+        name: "agent_status",
+        arguments: { workspaceId, agentId },
+      });
+      const output = status.structuredContent as Record<string, any>;
+      assert.equal(output.terminal, false);
+      assert.equal(output.termination.pending, false);
+      assert.equal("workerPid" in output.termination, false);
+      assert.equal("workerToken" in output.termination, false);
+      assert.match(responseText(status), /termination blocked/i);
+    }
+
+    const listed = await context.client.callTool({
+      name: "agent_list",
+      arguments: { workspaceId },
+    });
+    const agents = (listed.structuredContent as { agents: any[] }).agents;
+    for (const agentId of [partial.id, corrupt.id]) {
+      const summary = agents.find((agent) => agent.agentId === agentId);
+      assert.equal(summary.terminationPending, undefined);
+      assert.equal(summary.terminationBlocked, true);
+    }
+    assert.match(responseText(listed), /2 termination blocked/i);
   } finally {
     store.close();
   }

@@ -862,9 +862,16 @@ test("G3 TEST G — updatedAt noise does not reset authoritative clocks", async 
       },
     });
 
-    // Wait 40ms, touch updatedAt via non-phase metadata update
+    // Wait 40ms, touch updatedAt via an exact idempotent launch-state CAS.
     await new Promise((r) => setTimeout(r, 40));
-    manager.updateRecord(started.agentId, { effort: "noise-update" });
+    const store = (manager as any).store as LocalAgentStore;
+    const active = store.getById(started.agentId)!;
+    assert.equal(store.markWorkerSpawnedCAS(
+      started.agentId,
+      active.lifecycleState!.activeTurn!.generation!,
+      active.workerToken!,
+      active.workerPid,
+    ).applied, true);
 
     // Wait another 30ms (total wall time = 70ms > 60ms)
     await new Promise((r) => setTimeout(r, 30));

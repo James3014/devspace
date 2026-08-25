@@ -21,21 +21,6 @@ import {
 
 export type LocalAgentStatus = "starting" | "running" | "idle" | "error" | "stopped";
 
-const DETACHED_AUTHORITY_FIELDS: Array<keyof LocalAgentRecord> = [
-  "providerSessionId",
-  "workerPid",
-  "workerToken",
-  "terminalReason",
-  "scopeState",
-  "scopeBaseline",
-  "lifecycleState",
-  "status",
-  "latestResponse",
-  "error",
-  "errorCode",
-  "errorRetryable",
-];
-
 /**
  * Durable cross-turn scope lifecycle evidence persisted beside the baseline.
  *
@@ -396,12 +381,9 @@ export class LocalAgentStore {
   update(id: string, patch: Partial<Omit<LocalAgentRecord, "id" | "createdAt">>): LocalAgentRecord {
     const current = this.getById(id);
     if (!current) throw new Error(`Unknown subagent id: ${id}`);
-    if (
-      isDetachedLifecycle(current.lifecycleState) &&
-      DETACHED_AUTHORITY_FIELDS.some((field) => Object.prototype.hasOwnProperty.call(patch, field))
-    ) {
+    if (isDetachedLifecycle(current.lifecycleState)) {
       throw new Error(
-        `Generic update cannot mutate generation-owned detached lifecycle fields for agent ${id}.`,
+        `Generic update cannot mutate a generation-owned detached lifecycle record for agent ${id}.`,
       );
     }
 

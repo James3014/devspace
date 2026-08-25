@@ -2431,6 +2431,7 @@ export function createMcpServer(
               thinking: z.string().optional(),
               status: z.string(),
               terminationPending: z.boolean().optional(),
+              terminationBlocked: z.boolean().optional(),
               updatedAt: z.string(),
             }),
           ),
@@ -2442,10 +2443,13 @@ export function createMcpServer(
         const workspace = workspaces.getWorkspace(workspaceId); // boundary check
         const agents = agentSessionManager.listAgents({ workspaceId, workspaceRoot: workspace.root, limit });
         const pendingCount = agents.filter((agent) => agent.terminationPending).length;
+        const blockedCount = agents.filter((agent) => agent.terminationBlocked).length;
         const summary = agents.length === 0
           ? "No agent sessions found for this workspace."
           : `${agents.length} agent session(s) in this workspace.${
               pendingCount > 0 ? ` ${pendingCount} termination pending.` : ""
+            }${
+              blockedCount > 0 ? ` ${blockedCount} termination blocked.` : ""
             }`;
         return {
           content: [textBlock(summary)],

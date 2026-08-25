@@ -443,14 +443,19 @@ test("LocalAgentSessionManager - prompt cleanup paths", async () => {
     assert.equal(existsSync(tempFile), false);
     assert.equal(existsSync(tempDir), false);
 
-    const record2 = await manager.startAgent({ workspaceId: "ws_test", workspaceRoot, profileName: "reviewer", prompt: "error prompt turn", profiles: mockProfiles });
+    const record2 = manager.createRecord({
+      workspaceId: "ws_test",
+      workspaceRoot,
+      profileName: "nonexistent-profile",
+      provider: "agy",
+    });
+    (manager as any).store.prepareWorker(record2.id, "error-cleanup-token");
     const tempDir2 = mkdtempSync(join(tmpdir(), "devspace-agent-prompt-"));
     const tempFile2 = join(tempDir2, "prompt.txt");
     writeFileSync(tempFile2, "fail this prompt", { mode: 0o600 });
-    manager.updateRecord(record2.agentId, { profileName: "nonexistent-profile" });
-    const activeRecord2 = manager.getRecordByPrefixOrId(record2.agentId);
+    const activeRecord2 = manager.getRecordByPrefixOrId(record2.id);
     assert.ok(activeRecord2?.workerToken);
-    await manager.runWorkerTurnFromFile(record2.agentId, tempFile2, activeRecord2.workerToken);
+    await manager.runWorkerTurnFromFile(record2.id, tempFile2, activeRecord2.workerToken);
     assert.equal(existsSync(tempFile2), false);
     assert.equal(existsSync(tempDir2), false);
 

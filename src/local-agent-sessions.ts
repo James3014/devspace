@@ -276,6 +276,7 @@ export interface AgentSummary {
   effort?: string;
   status: LocalAgentStatus;
   terminationPending?: boolean;
+  terminationBlocked?: boolean;
   updatedAt: string;
 }
 
@@ -1966,7 +1967,8 @@ function recordToSummary(record: LocalAgentRecord): AgentSummary {
     profileName: record.profileName,
     provider: record.provider,
     status: record.status,
-    terminationPending: hasTerminationBlock(record) || undefined,
+    terminationPending: Boolean(record.lifecycleState?.terminationPending) || undefined,
+    terminationBlocked: hasDetachedTerminationBlocked(record) || undefined,
     updatedAt: record.updatedAt,
   };
   if (record.model !== undefined) output.model = record.model;
@@ -1978,6 +1980,15 @@ function hasTerminationBlock(record: LocalAgentRecord): boolean {
   if (!isDetachedLifecycle(record.lifecycleState)) return false;
   return Boolean(
     record.lifecycleState?.terminationPending ||
+    record.lifecycleState?.lifecycleCorrupt ||
+    record.lifecycleState?.terminationBlocked ||
+    (isTerminalStatus(record.status) && record.lifecycleState?.activeTurn),
+  );
+}
+
+function hasDetachedTerminationBlocked(record: LocalAgentRecord): boolean {
+  if (!isDetachedLifecycle(record.lifecycleState)) return false;
+  return Boolean(
     record.lifecycleState?.lifecycleCorrupt ||
     record.lifecycleState?.terminationBlocked ||
     (isTerminalStatus(record.status) && record.lifecycleState?.activeTurn),

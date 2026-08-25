@@ -422,6 +422,16 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
     provider: "codex",
   });
   assert.equal((legacyManagerRecord.lifecycleState as any)?.lifecycleKind, undefined);
+  const legacyMetadata = compatibilityStore.update(legacyManagerRecord.id, {
+    model: "legacy-model",
+    effort: "legacy-effort",
+    executionContract: { maxWallMs: 1234 },
+    startReplay: { key: "legacy-replay", requestHash: "legacy-request-hash" },
+  });
+  assert.equal(legacyMetadata.model, "legacy-model");
+  assert.equal(legacyMetadata.effort, "legacy-effort");
+  assert.equal(legacyMetadata.executionContract?.maxWallMs, 1234);
+  assert.equal(legacyMetadata.startReplay?.key, "legacy-replay");
   compatibilityStore.update(legacyManagerRecord.id, { status: "running" });
   assert.equal(compatibilityStore.reconcileActiveRuns(), 1);
   const reconciledLegacy = compatibilityStore.getById(legacyManagerRecord.id)!;
@@ -472,12 +482,33 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
     lifecycleKind: "detached_worker_v2",
   } as any);
   assert.equal((detachedRecord.lifecycleState as any)?.lifecycleKind, "detached_worker_v2");
-  assert.throws(
-    () => compatibilityStore.update(detachedRecord.id, { status: "idle" }),
-    /generation-owned detached lifecycle/i,
-  );
+  const detachedIdentity = compatibilityStore.getById(detachedRecord.id)!;
+  const forbiddenDetachedPatches = [
+    { workspaceId: "ws_redirected" },
+    { workspaceRoot: join(root, "redirected") },
+    { profileName: "redirected-profile" },
+    { provider: "redirected-provider" },
+    { model: "redirected-model" },
+    { effort: "redirected-effort" },
+    { executionContract: { maxWallMs: 999999 } },
+    { startReplay: { key: "redirected-replay", requestHash: "redirected-request" } },
+    { status: "idle" as const },
+  ];
+  for (const patch of forbiddenDetachedPatches) {
+    assert.throws(
+      () => compatibilityStore.update(detachedRecord.id, patch),
+      /generation-owned detached lifecycle/i,
+    );
+  }
+  assert.deepEqual(compatibilityStore.getById(detachedRecord.id), detachedIdentity);
   compatibilityStore.prepareWorker(detachedRecord.id, "detached-guard-token");
   compatibilityStore.claimWorker(detachedRecord.id, "detached-guard-token", 4102);
+  const claimedDetached = compatibilityStore.getById(detachedRecord.id)!;
+  assert.throws(
+    () => compatibilityStore.update(detachedRecord.id, { effort: "stale-claim-writer" }),
+    /generation-owned detached lifecycle/i,
+  );
+  assert.deepEqual(compatibilityStore.getById(detachedRecord.id), claimedDetached);
   const guardedFence = compatibilityStore.fenceActiveTurn({
     agentId: detachedRecord.id,
     terminalReason: "timeout",
@@ -485,16 +516,50 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
   });
   const guardedGeneration = guardedFence.current!.lifecycleState!.terminationPending!.generation;
   assert.throws(
-    () => compatibilityStore.update(detachedRecord.id, { latestResponse: "stale daemon callback" }),
+    () => compatibilityStore.update(detachedRecord.id, { workspaceRoot: join(root, "stale-fence-writer") }),
     /generation-owned detached lifecycle/i,
   );
-  assert.equal(
-    compatibilityStore.getById(detachedRecord.id)!.lifecycleState!.terminationPending!.generation,
-    guardedGeneration,
-  );
+  const pendingAfterStaleWriter = compatibilityStore.getById(detachedRecord.id)!;
+  assert.equal(pendingAfterStaleWriter.lifecycleState!.terminationPending!.generation, guardedGeneration);
+  assert.equal(pendingAfterStaleWriter.status, "error");
+  assert.equal(pendingAfterStaleWriter.workerPid, 4102);
+  assert.equal(pendingAfterStaleWriter.workerToken, "detached-guard-token");
+  assert.equal(pendingAfterStaleWriter.workspaceRoot, detachedIdentity.workspaceRoot);
   const joinedCancel = compatibilityStore.cancelActive(detachedRecord.id);
   assert.equal(joinedCancel.current.lifecycleState!.terminationPending!.generation, guardedGeneration);
   assert.equal(joinedCancel.current.lifecycleState!.terminationPending!.reason, "timeout");
+
+  const finishedDetached = compatibilityStore.create({
+    workspaceId: "ws_detached_finished",
+    workspaceRoot: join(root, "detached-finished"),
+    profileName: "reviewer",
+    provider: "codex",
+    executionContract: { maxExecutionMs: 4321 },
+    startReplay: { key: "detached-finished", requestHash: "detached-finished-request" },
+    lifecycleKind: "detached_worker_v2",
+  });
+  compatibilityStore.prepareWorker(finishedDetached.id, "detached-finished-token");
+  const finishedClaim = compatibilityStore.claimWorker(
+    finishedDetached.id,
+    "detached-finished-token",
+    4103,
+  )!;
+  assert.equal(compatibilityStore.finishTurnCAS({
+    agentId: finishedDetached.id,
+    generation: finishedClaim.lifecycleState!.activeTurn!.generation!,
+    workerToken: "detached-finished-token",
+    status: "idle",
+    terminalReason: "completed",
+    latestResponse: "finished",
+  }).applied, true);
+  const finishedSnapshot = compatibilityStore.getById(finishedDetached.id)!;
+  assert.throws(
+    () => compatibilityStore.update(finishedDetached.id, { model: "stale-finish-writer" }),
+    /generation-owned detached lifecycle/i,
+  );
+  assert.deepEqual(compatibilityStore.getById(finishedDetached.id), finishedSnapshot);
+  assert.equal(finishedSnapshot.executionContract?.maxExecutionMs, 4321);
+  assert.equal(finishedSnapshot.startReplay?.key, "detached-finished");
 
   const corruptStateDir = join(root, "corrupt-detached-lifecycle");
   const corruptStore = new LocalAgentStore(corruptStateDir);
