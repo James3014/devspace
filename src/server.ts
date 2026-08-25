@@ -2138,6 +2138,16 @@ export function createMcpServer(
                 .int()
                 .min(1)
                 .describe("Optional wall-clock bound for the whole agent turn."),
+              maxStartupMs: z
+                .number()
+                .int()
+                .min(1)
+                .describe("Optional wall-clock bound for the startup/readiness phase (turn start -> execution started)."),
+              maxExecutionMs: z
+                .number()
+                .int()
+                .min(1)
+                .describe("Optional wall-clock bound for semantic provider execution (execution started -> terminal)."),
               idleTimeoutMs: z
                 .number()
                 .int()

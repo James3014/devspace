@@ -7,6 +7,7 @@ import {
   createCodexSdkLocalAgentRuntime,
   LocalAgentProviderError,
   type LocalAgentDriver,
+  type LocalAgentRunCallbacks,
   type LocalAgentRunInput,
   type LocalAgentRunResult,
 } from "./local-agent-runtime.js";
@@ -40,7 +41,7 @@ import {
 export interface LocalAgentAdapter {
   readonly provider: LocalAgentProvider;
   runtimeKey(): string;
-  run(input: LocalAgentRunInput): Promise<LocalAgentRunResult>;
+  run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks): Promise<LocalAgentRunResult>;
 }
 
 export interface LocalAgentDriverOptions {
@@ -67,8 +68,9 @@ function definedEnvironment(env: NodeJS.ProcessEnv): Record<string, string> {
 export async function runLocalAgentProvider(
   provider: LocalAgentProvider,
   input: LocalAgentRunInput,
+  callbacks?: LocalAgentRunCallbacks,
 ): Promise<LocalAgentRunResult> {
-  return createLocalAgentAdapter(provider).run(input);
+  return createLocalAgentAdapter(provider).run(input, callbacks);
 }
 
 export function createLocalAgentAdapter(
@@ -112,7 +114,7 @@ class DriverBackedLocalAgentAdapter implements LocalAgentAdapter {
     });
   }
 
-  async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
+  async run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks): Promise<LocalAgentRunResult> {
     const context = {
       agentId: "adapter",
       provider: this.driver.provider,
@@ -127,8 +129,11 @@ class DriverBackedLocalAgentAdapter implements LocalAgentAdapter {
       throw new LocalAgentProviderError(created.error.message);
     }
     const runtime = created.value;
+    if (callbacks?.onExecutionStarted) {
+      await callbacks.onExecutionStarted();
+    }
     try {
-      const turn = await runtime.run(input);
+      const turn = await runtime.run(input, callbacks);
       if (turn.isOk()) return turn.value;
       throw new LocalAgentProviderError(turn.error.message);
     } finally {
@@ -144,7 +149,7 @@ class CodexLocalAgentAdapter implements LocalAgentAdapter {
     return this.provider;
   }
 
-  async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
+  async run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks): Promise<LocalAgentRunResult> {
     const environment = definedEnvironment(inputEnvironment(input));
     const identity = inspectCodexRuntime({ env: environment });
     if (!identity.ready || !identity.executable) {
@@ -154,6 +159,9 @@ class CodexLocalAgentAdapter implements LocalAgentAdapter {
       codexPathOverride: identity.executable,
       env: environment,
     });
+    if (callbacks?.onExecutionStarted) {
+      await callbacks.onExecutionStarted();
+    }
     return runtime.run(input);
   }
 }
@@ -165,7 +173,10 @@ class OmpLocalAgentAdapter implements LocalAgentAdapter {
     return this.provider;
   }
 
-  run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
+  async run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks): Promise<LocalAgentRunResult> {
+    if (callbacks?.onExecutionStarted) {
+      await callbacks.onExecutionStarted();
+    }
     return runOmpAcpLocalAgent(input);
   }
 }
@@ -353,7 +364,7 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
     return this.provider;
   }
 
-  async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
+  async run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks): Promise<LocalAgentRunResult> {
     const environment = inputEnvironment(input);
     const agyExecutable = resolveAgyExecutable(environment);
     if (!agyExecutable) {
@@ -391,6 +402,10 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
     args.push("--output-format", "json");
     args.push("--print-timeout", `${AGY_PRINT_TIMEOUT_SECONDS}s`);
     args.push("--print", input.prompt);
+
+    if (callbacks?.onExecutionStarted) {
+      await callbacks.onExecutionStarted();
+    }
 
     const child = spawn(agyExecutable, args, {
       cwd: input.workspaceRoot,

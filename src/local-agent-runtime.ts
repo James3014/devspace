@@ -39,6 +39,11 @@ export interface LocalAgentRunCallbacks {
    * could otherwise lose that identity.
    */
   onSessionId?: (providerSessionId: string) => void | Promise<void>;
+  /**
+   * Called as soon as the provider runtime is ready and before semantic
+   * execution starts.
+   */
+  onExecutionStarted?: () => void | Promise<void>;
 }
 
 export interface LocalAgentRuntimeContext {
