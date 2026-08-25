@@ -127,6 +127,10 @@ export interface LifecycleCasResult {
   current?: LocalAgentRecord;
 }
 
+export interface LocalAgentStoreTestHooks {
+  beforeGenericUpdateLock?: (snapshot: LocalAgentRecord) => void;
+}
+
 export interface BeginContinuationCasInput {
   agentId: string;
   expectedPreviousGeneration?: string;
@@ -192,7 +196,10 @@ interface LocalAgentRow {
 export class LocalAgentStore {
   private readonly database: DatabaseHandle;
 
-  constructor(stateDir: string) {
+  constructor(
+    stateDir: string,
+    private readonly testHooks: LocalAgentStoreTestHooks = {},
+  ) {
     this.database = openDatabase(stateDir);
   }
 
@@ -379,22 +386,35 @@ export class LocalAgentStore {
   }
 
   update(id: string, patch: Partial<Omit<LocalAgentRecord, "id" | "createdAt">>): LocalAgentRecord {
-    const current = this.getById(id);
-    if (!current) throw new Error(`Unknown subagent id: ${id}`);
-    if (isDetachedLifecycle(current.lifecycleState)) {
-      throw new Error(
-        `Generic update cannot mutate a generation-owned detached lifecycle record for agent ${id}.`,
-      );
-    }
+    const observedBeforeLock = this.testHooks.beforeGenericUpdateLock
+      ? this.getById(id)
+      : undefined;
+    if (observedBeforeLock) this.testHooks.beforeGenericUpdateLock?.(observedBeforeLock);
 
-    const updated: LocalAgentRecord = {
-      ...current,
-      ...patch,
-      updatedAt: new Date().toISOString(),
-    };
+    const updateLegacy = this.database.sqlite.transaction(() => {
+      const row = this.database.sqlite.prepare(
+        "select * from local_agent_sessions where id = ? limit 1",
+      ).get(id) as LocalAgentRow | undefined;
+      if (!row) throw new Error(`Unknown subagent id: ${id}`);
+      const current = rowToLocalAgentRecord(row);
+      if (isDetachedLifecycle(current.lifecycleState)) {
+        if (observedBeforeLock && !isDetachedLifecycle(observedBeforeLock.lifecycleState)) {
+          throw new Error(
+            `Stale generic update conflict for agent ${id}: legacy snapshot became detached-worker v2 before lock acquisition.`,
+          );
+        }
+        throw new Error(
+          `Generic update cannot mutate a generation-owned detached lifecycle record for agent ${id}.`,
+        );
+      }
 
-    this.database.sqlite
-      .prepare(
+      const updated: LocalAgentRecord = {
+        ...current,
+        ...patch,
+        updatedAt: new Date().toISOString(),
+      };
+
+      const result = this.database.sqlite.prepare(
         `update local_agent_sessions set
           workspace_id = ?,
           workspace_root = ?,
@@ -416,7 +436,7 @@ export class LocalAgentStore {
           error_code = ?,
           error_retryable = ?,
           updated_at = ?
-         where id = ?`,
+         where id = ? and updated_at = ? and lifecycle_state is ?`,
       )
       .run(
         updated.workspaceId ?? null,
@@ -440,9 +460,17 @@ export class LocalAgentStore {
         updated.errorRetryable === undefined ? null : String(updated.errorRetryable),
         updated.updatedAt,
         updated.id,
+        row.updated_at,
+        row.lifecycle_state,
       );
-
-    return updated;
+      if (result.changes !== 1) {
+        throw new Error(
+          `Stale generic update conflict for agent ${id}: exact locked row snapshot no longer matches.`,
+        );
+      }
+      return this.getById(id) ?? updated;
+    });
+    return updateLegacy.immediate();
   }
 
   updateResult(

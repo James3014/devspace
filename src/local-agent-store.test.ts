@@ -561,6 +561,68 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
   assert.equal(finishedSnapshot.executionContract?.maxExecutionMs, 4321);
   assert.equal(finishedSnapshot.startReplay?.key, "detached-finished");
 
+  const raceStateDir = join(root, "legacy-to-detached-race");
+  const raceStoreB = new LocalAgentStore(raceStateDir);
+  stores.push(raceStoreB);
+  const racedLegacy = raceStoreB.create({
+    workspaceId: "ws_raced_legacy",
+    workspaceRoot: join(root, "raced-legacy"),
+    profileName: "reviewer",
+    provider: "codex",
+    executionContract: { maxWallMs: 2222 },
+    startReplay: { key: "raced-legacy", requestHash: "raced-legacy-request" },
+  });
+  raceStoreB.update(racedLegacy.id, {
+    status: "running",
+    workerPid: 4201,
+    workerToken: "raced-legacy-token",
+    error: "legacy error bytes",
+  });
+  let observedLegacySnapshot: ReturnType<LocalAgentStore["getById"]>;
+  let fencedRaceSnapshot: ReturnType<LocalAgentStore["getById"]>;
+  let rawFencedSnapshot: unknown;
+  const raceStoreA = new LocalAgentStore(raceStateDir, {
+    beforeGenericUpdateLock(snapshot) {
+      observedLegacySnapshot = snapshot;
+      assert.equal(raceStoreB.reconcileLegacyDetachedActiveCAS(racedLegacy.id).applied, true);
+      fencedRaceSnapshot = raceStoreB.getById(racedLegacy.id);
+      const database = new Database(databasePath(raceStateDir), { readonly: true });
+      rawFencedSnapshot = database.prepare(
+        `select workspace_id, workspace_root, profile_name, provider, model, effort,
+          worker_pid, worker_token, execution_contract, terminal_reason,
+          lifecycle_state, status, latest_response, error, error_code,
+          error_retryable, updated_at
+         from local_agent_sessions where id = ?`,
+      ).get(racedLegacy.id);
+      database.close();
+    },
+  });
+  stores.push(raceStoreA);
+  assert.throws(
+    () => raceStoreA.update(racedLegacy.id, {
+      workspaceRoot: join(root, "stale-race-redirect"),
+      provider: "stale-provider",
+      executionContract: { maxWallMs: 999999 },
+      startReplay: { key: "stale-replay", requestHash: "stale-request" },
+    }),
+    /stale generic update conflict/i,
+  );
+  assert.equal((observedLegacySnapshot?.lifecycleState as any)?.lifecycleKind, undefined);
+  assert.equal((fencedRaceSnapshot?.lifecycleState as any)?.lifecycleKind, "detached_worker_v2");
+  assert.equal((fencedRaceSnapshot?.lifecycleState as any)?.terminationPending?.workerPid, 4201);
+  assert.equal((fencedRaceSnapshot?.lifecycleState as any)?.terminationPending?.workerToken, "raced-legacy-token");
+  assert.deepEqual(raceStoreB.getById(racedLegacy.id), fencedRaceSnapshot);
+  const verifyDatabase = new Database(databasePath(raceStateDir), { readonly: true });
+  const rawAfterStaleWriter = verifyDatabase.prepare(
+    `select workspace_id, workspace_root, profile_name, provider, model, effort,
+      worker_pid, worker_token, execution_contract, terminal_reason,
+      lifecycle_state, status, latest_response, error, error_code,
+      error_retryable, updated_at
+     from local_agent_sessions where id = ?`,
+  ).get(racedLegacy.id);
+  verifyDatabase.close();
+  assert.deepEqual(rawAfterStaleWriter, rawFencedSnapshot);
+
   const corruptStateDir = join(root, "corrupt-detached-lifecycle");
   const corruptStore = new LocalAgentStore(corruptStateDir);
   const corruptRecord = corruptStore.create({
