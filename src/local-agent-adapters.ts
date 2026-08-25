@@ -1,7 +1,7 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { createServer } from "node:net";
-import { basename, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Readable, Writable } from "node:stream";
 import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
@@ -170,7 +170,34 @@ export function agyCommandEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv
 }
 
 export function resolveAgyGitMetadataDirs(workspace: string): string[] {
-  const revParse = spawnSync(
+  const workspaceRoot = canonicalizeExistingPath(workspace);
+
+  // Resolve the worktree-scoped git metadata directory. For the main worktree
+  // this is <root>/.git (inside the workspace); for a linked worktree it is
+  // <common>/.git/worktrees/<name>, outside the workspace. Expose only the
+  // scoped directory: handing agy the repo-common .git makes its --new-project
+  // resolution pick the repository's main worktree instead of this workspace,
+  // escaping the bounded workspace boundary.
+  const gitDir = spawnSync(
+    "git",
+    ["rev-parse", "--path-format=absolute", "--git-dir"],
+    {
+      cwd: workspace,
+      encoding: "utf8",
+      env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+      windowsHide: true,
+    },
+  );
+  if (gitDir.status !== 0) return [];
+  const rawGitDir = gitDir.stdout.trim().split(/\r?\n/, 1)[0]?.trim();
+  if (!rawGitDir) return [];
+
+  const gitMetadataDir = canonicalizeExistingPath(resolve(workspaceRoot, rawGitDir));
+  if (isPathWithin(gitMetadataDir, workspaceRoot)) return [];
+
+  // The scoped dir must sit under <common>/.git/worktrees/ of a repository
+  // this workspace is a verified member of.
+  const commonRevParse = spawnSync(
     "git",
     ["rev-parse", "--path-format=absolute", "--git-common-dir"],
     {
@@ -180,15 +207,13 @@ export function resolveAgyGitMetadataDirs(workspace: string): string[] {
       windowsHide: true,
     },
   );
-  if (revParse.status !== 0) return [];
-
-  const rawCommonDir = revParse.stdout.trim().split(/\r?\n/, 1)[0]?.trim();
+  if (commonRevParse.status !== 0) return [];
+  const rawCommonDir = commonRevParse.stdout.trim().split(/\r?\n/, 1)[0]?.trim();
   if (!rawCommonDir) return [];
 
-  const workspaceRoot = canonicalizeExistingPath(workspace);
   const commonDir = canonicalizeExistingPath(resolve(workspaceRoot, rawCommonDir));
-  if (isPathWithin(commonDir, workspaceRoot)) return [];
   if (basename(commonDir) !== ".git") return [];
+  if (!isPathWithin(gitMetadataDir, join(commonDir, "worktrees"))) return [];
 
   const membership = spawnSync(
     "git",
@@ -208,7 +233,7 @@ export function resolveAgyGitMetadataDirs(workspace: string): string[] {
     .map((line) => canonicalizeExistingPath(line.slice("worktree ".length).trim()))
     .includes(workspaceRoot);
 
-  return ownsWorkspace ? [commonDir] : [];
+  return ownsWorkspace ? [gitMetadataDir] : [];
 }
 
 function canonicalizeExistingPath(path: string): string {
