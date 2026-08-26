@@ -52,6 +52,11 @@ const migrations: Migration[] = [
     name: "local-agent-lifecycle-state",
     up: migrateLocalAgentLifecycleState,
   },
+  {
+    version: 10,
+    name: "local-agent-schema-reconciliation",
+    up: migrateLocalAgentSchemaReconciliation,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -218,6 +223,14 @@ function migrateLocalAgentExecutionContract(sqlite: Database.Database): void {
 
 function migrateLocalAgentLifecycleState(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "local_agent_sessions", "lifecycle_state", "text");
+}
+
+function migrateLocalAgentSchemaReconciliation(sqlite: Database.Database): void {
+  migrateLocalAgentStructuredErrors(sqlite);
+  migrateLocalAgentEffortRename(sqlite);
+  migrateLocalAgentWorkerOwnership(sqlite);
+  migrateLocalAgentExecutionContract(sqlite);
+  migrateLocalAgentLifecycleState(sqlite);
 }
 
 function migrateWorkspaceConversationBindings(sqlite: Database.Database): void {

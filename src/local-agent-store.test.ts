@@ -184,6 +184,87 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
   assert.equal(reloadedRecord?.errorCode, "DAEMON_TIMEOUT");
   assert.equal(reloadedRecord?.errorRetryable, true);
 
+  const collisionStateDir = join(root, "collision-state");
+  mkdirSync(collisionStateDir, { recursive: true });
+  const collision = new Database(databasePath(collisionStateDir));
+  collision.exec(`
+    create table devspace_schema_migrations (
+      version integer primary key,
+      name text not null,
+      applied_at text not null
+    );
+    create table local_agent_sessions (
+      id text primary key,
+      workspace_id text,
+      workspace_root text not null,
+      profile_name text not null,
+      provider text not null,
+      model text,
+      thinking text,
+      provider_session_id text,
+      status text not null,
+      latest_response text,
+      error text,
+      created_at text not null,
+      updated_at text not null,
+      worker_pid integer,
+      worker_token text,
+      execution_contract text,
+      terminal_reason text,
+      scope_state text,
+      scope_baseline text,
+      lifecycle_state text
+    );
+  `);
+  const collisionMigration = collision.prepare(
+    "insert into devspace_schema_migrations (version, name, applied_at) values (?, ?, ?)",
+  );
+  for (const [version, name] of [
+    [1, "workspace-state"],
+    [2, "oauth-state"],
+    [3, "local-agent-sessions"],
+    [4, "workspace-conversation-bindings"],
+    [5, "local-agent-worker-ownership"],
+    [6, "local-agent-execution-contract"],
+    [7, "local-agent-lifecycle-state"],
+  ] as const) {
+    collisionMigration.run(version, name, "2026-08-26T00:00:00.000Z");
+  }
+  collision.prepare(`
+    insert into local_agent_sessions (
+      id, workspace_root, profile_name, provider, thinking, status, error,
+      execution_contract, lifecycle_state, created_at, updated_at
+    ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    "agt_collision",
+    join(root, "collision-project"),
+    "reviewer",
+    "agy",
+    "medium",
+    "idle",
+    "legacy collision",
+    JSON.stringify({ writePaths: ["src"] }),
+    "terminal",
+    "2026-08-26T00:00:00.000Z",
+    "2026-08-26T00:00:00.000Z",
+  );
+  collision.close();
+
+  const collisionStore = new LocalAgentStore(collisionStateDir);
+  stores.push(collisionStore);
+  const collisionRecord = collisionStore.getById("agt_collision");
+  assert.equal(collisionRecord?.effort, "medium");
+  assert.equal(collisionRecord?.errorCode, undefined);
+  assert.equal(collisionRecord?.errorRetryable, undefined);
+  assert.deepEqual(collisionRecord?.executionContract?.writePaths, ["src"]);
+  assert.equal(collisionRecord?.lifecycleState, "terminal");
+  const collisionUpdated = collisionStore.update("agt_collision", {
+    errorCode: "SCHEMA_RECONCILED",
+    errorRetryable: false,
+  });
+  assert.equal(collisionUpdated.errorCode, "SCHEMA_RECONCILED");
+  assert.equal(collisionUpdated.errorRetryable, false);
+
   const contracted = store.create({
     workspaceId: "ws_1",
     workspaceRoot: join(root, "project"),
