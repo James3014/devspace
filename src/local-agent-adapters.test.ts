@@ -360,16 +360,64 @@ assert.equal(
 // Agy Local Agent Adapter Tests
 // ==========================================
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
+import { cleanupProviderScratch, createProviderScratch } from "./provider-scratch.js";
 
 const mockAgySource = `#!/usr/bin/env node
-const { realpathSync } = require("node:fs");
+const { existsSync, realpathSync } = require("node:fs");
+const { isAbsolute, join, relative, sep } = require("node:path");
 const args = process.argv.slice(2);
 const canonical = (path) => {
   try { return realpathSync(path); } catch { return path; }
 };
+
+const expectedScratch = process.env.EXPECTED_AGY_PROVIDER_SCRATCH;
+const isolatedHome = process.env.HOME;
+if (!expectedScratch || !isolatedHome) {
+  console.error("MISSING_AGY_ISOLATION_ENV");
+  process.exit(93);
+}
+const homeRelativeToScratch = relative(canonical(expectedScratch), canonical(isolatedHome));
+if (!homeRelativeToScratch || isAbsolute(homeRelativeToScratch) || homeRelativeToScratch === ".." || homeRelativeToScratch.startsWith(\`..\${sep}\`)) {
+  console.error("AGY_HOME_OUTSIDE_PROVIDER_SCRATCH");
+  process.exit(92);
+}
+if (process.env.AMBIENT_AGY_HOME && canonical(isolatedHome) === canonical(process.env.AMBIENT_AGY_HOME)) {
+  console.error("INHERITED_AMBIENT_AGY_HOME");
+  process.exit(91);
+}
+if (existsSync(join(isolatedHome, ".gemini", "config", "mcp_config.json"))) {
+  console.error("INHERITED_AMBIENT_MCP_CONFIG");
+  process.exit(90);
+}
+const expectedAppData = process.env.EXPECTED_AGY_APPDATA;
+const isolatedAppData = join(isolatedHome, ".gemini", "antigravity-cli");
+if (!expectedAppData) {
+  console.error("MISSING_EXPECTED_AGY_APPDATA");
+  process.exit(88);
+}
+for (const name of ["antigravity-oauth-token", "conversations"]) {
+  if (canonical(join(isolatedAppData, name)) !== canonical(join(expectedAppData, name))) {
+    console.error(\`AGY_PROVIDER_STATE_LINK_MISMATCH_\${name}\`);
+    process.exit(87);
+  }
+}
+for (const forbidden of ["mcp", "scratch"]) {
+  if (existsSync(join(isolatedAppData, forbidden))) {
+    console.error(\`AGY_FORBIDDEN_PROVIDER_STATE_EXPOSED_\${forbidden}\`);
+    process.exit(86);
+  }
+}
+for (const key of ["XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME"]) {
+  const value = process.env[key];
+  const rel = value ? relative(canonical(isolatedHome), canonical(value)) : "";
+  if (!value || isAbsolute(rel) || rel === ".." || rel.startsWith(\`..\${sep}\`)) {
+    console.error(\`AGY_\${key}_OUTSIDE_ISOLATED_HOME\`);
+    process.exit(89);
+  }
+}
 
 // Secret leak check (Sentinel)
 if (process.env.DEVSPACE_OAUTH_OWNER_TOKEN) {
@@ -406,6 +454,10 @@ if (args.includes("--print")) {
   if (process.env.EXPECTED_AGY_GIT_DIR && !addDirs.map(canonical).includes(canonical(process.env.EXPECTED_AGY_GIT_DIR))) {
     console.error("MISSING_GIT_METADATA_ADD_DIR");
     process.exit(96);
+  }
+  if (process.env.UNEXPECTED_AGY_GIT_DIR && addDirs.map(canonical).includes(canonical(process.env.UNEXPECTED_AGY_GIT_DIR))) {
+    console.error("LEAKED_REPO_COMMON_GIT_DIR");
+    process.exit(94);
   }
   const model = args.includes("--model") ? args[args.indexOf("--model") + 1] : "";
   const effort = args.includes("--effort") ? args[args.indexOf("--effort") + 1] : "";
@@ -454,12 +506,30 @@ if (args.includes("--print")) {
 const tempMockDir = mkdtempSync(join(tmpdir(), "devspace-mock-agy-"));
 const tempMockPath = join(tempMockDir, "mock-agy.js");
 writeFileSync(tempMockPath, mockAgySource, { mode: 0o755 });
+const ambientAgyHome = join(tempMockDir, "ambient-home");
+const ambientMcpConfig = join(ambientAgyHome, ".gemini", "config", "mcp_config.json");
+const ambientAgyAppData = join(ambientAgyHome, ".gemini", "antigravity-cli");
+mkdirSync(join(ambientAgyHome, ".gemini", "config"), { recursive: true });
+mkdirSync(join(ambientAgyAppData, "conversations"), { recursive: true });
+writeFileSync(ambientMcpConfig, '{"serena":{"command":"UNRELATED_GLOBAL_MCP_SENTINEL"}}\n');
+writeFileSync(join(ambientAgyAppData, "antigravity-oauth-token"), "TEST_AUTH_TOKEN\n", { mode: 0o600 });
+const agyScratch = createProviderScratch(`adapter_test_${process.pid}_${Date.now()}`);
 const originalEnv = process.env;
 
 try {
   const testEnv = {
     ...process.env,
     AGY_COMMAND: tempMockPath,
+    HOME: ambientAgyHome,
+    USERPROFILE: ambientAgyHome,
+    XDG_CONFIG_HOME: join(ambientAgyHome, "xdg-config"),
+    XDG_DATA_HOME: join(ambientAgyHome, "xdg-data"),
+    XDG_CACHE_HOME: join(ambientAgyHome, "xdg-cache"),
+    XDG_STATE_HOME: join(ambientAgyHome, "xdg-state"),
+    DEVSPACE_PROVIDER_SCRATCH: agyScratch.root,
+    EXPECTED_AGY_PROVIDER_SCRATCH: agyScratch.root,
+    EXPECTED_AGY_APPDATA: ambientAgyAppData,
+    AMBIENT_AGY_HOME: ambientAgyHome,
     DEVSPACE_OAUTH_OWNER_TOKEN: "DO_NOT_LEAK",
     DEVSPACE_OAUTH_SCOPES: "devspace",
     DEVSPACE_SENSITIVE_SECRET: "DO_NOT_LEAK",
@@ -484,9 +554,39 @@ try {
     assert.match(result.finalResponse, /model=gemini-3.6/);
     assert.match(result.finalResponse, /effort=high/);
     assert.match(result.finalResponse, /newProject=true/);
+    assert.equal(
+      readFileSync(ambientMcpConfig, "utf8"),
+      '{"serena":{"command":"UNRELATED_GLOBAL_MCP_SENTINEL"}}\n',
+      "bounded Agy adapter must not mutate the ambient global MCP config",
+    );
   }
 
-  // B. Agy 1.1.18 preset model must not receive a redundant --effort flag.
+  // B. Missing or forged scratch must fail closed before Agy can inherit HOME.
+  {
+    process.env = { ...testEnv };
+    delete process.env.DEVSPACE_PROVIDER_SCRATCH;
+    await assert.rejects(
+      () => adapter.run({
+        prompt: "missing-scratch",
+        workspaceRoot: process.cwd(),
+        writeMode: "read_only",
+      }),
+      /requires DevSpace-owned provider scratch/,
+    );
+
+    process.env = { ...testEnv, DEVSPACE_PROVIDER_SCRATCH: ambientAgyHome };
+    await assert.rejects(
+      () => adapter.run({
+        prompt: "unowned-scratch",
+        workspaceRoot: process.cwd(),
+        writeMode: "read_only",
+      }),
+      /refused unowned provider scratch/,
+    );
+    process.env = testEnv;
+  }
+
+  // C. Agy 1.1.18 preset model must not receive a redundant --effort flag.
   {
     const result = await adapter.run({
       prompt: "preset-model-task",
@@ -499,7 +599,7 @@ try {
     assert.match(result.finalResponse, /effort=,/);
   }
 
-  // C. 唯讀新會話測試
+  // D. 唯讀新會話測試
   {
     const result = await adapter.run({
       prompt: "hello-task",
@@ -510,7 +610,7 @@ try {
     assert.match(result.finalResponse, /mode=plan/);
   }
 
-  // D. 恢復會話測試 (Resume)
+  // E. 恢復會話測試 (Resume)
   {
     const result = await adapter.run({
       prompt: "resume-task",
@@ -522,7 +622,7 @@ try {
     assert.match(result.finalResponse, /newProject=false/);
   }
 
-  // D. 錯誤處理測試 - exit code != 0
+  // F. 錯誤處理測試 - exit code != 0
   await assert.rejects(
     () => adapter.run({
       prompt: "FORCE_ERROR",
@@ -531,7 +631,7 @@ try {
     /Agy exited with non-zero code 1/,
   );
 
-  // E. 錯誤處理測試 - Malformed JSON
+  // G. 錯誤處理測試 - Malformed JSON
   await assert.rejects(
     () => adapter.run({
       prompt: "MALFORMED_JSON",
@@ -540,7 +640,7 @@ try {
     /Failed to parse Agy JSON output/,
   );
 
-  // F. 錯誤處理測試 - status != SUCCESS
+  // H. 錯誤處理測試 - status != SUCCESS
   await assert.rejects(
     () => adapter.run({
       prompt: "STATUS_FAILED",
@@ -555,7 +655,7 @@ try {
     },
   );
 
-  // G. 錯誤處理測試 - missing conversation_id
+  // I. 錯誤處理測試 - missing conversation_id
   await assert.rejects(
     () => adapter.run({
       prompt: "MISSING_CONV",
@@ -564,7 +664,7 @@ try {
     /missing conversation_id/,
   );
 
-  // H. 錯誤處理測試 - missing response
+  // J. 錯誤處理測試 - missing response
   await assert.rejects(
     () => adapter.run({
       prompt: "MISSING_RESP",
@@ -573,7 +673,7 @@ try {
     /missing response content/,
   );
 
-  // I. Focused Test - Timeout clearance and resource disposal on exit
+  // K. Focused Test - Timeout clearance and resource disposal on exit
   {
     const createdTimers = new Set<NodeJS.Timeout>();
     const clearedTimers = new Set<NodeJS.Timeout>();
@@ -609,7 +709,7 @@ try {
     }
   }
 
-  // J. Hostile timeout test (SIGTERM ignored, SIGKILL fallback)
+  // L. Hostile timeout test (SIGTERM ignored, SIGKILL fallback)
   {
     const createdTimers = new Set<NodeJS.Timeout>();
     const clearedTimers = new Set<NodeJS.Timeout>();
@@ -657,7 +757,8 @@ try {
     }
   }
 
-  // K. Managed linked worktrees expose only their verified external Git common directory.
+  // M. Managed linked worktrees expose only their verified worktree-scoped
+  // Git metadata directory, never the repo-common .git.
   {
     const root = mkdtempSync(join(tmpdir(), "devspace-agy-worktree-"));
     const sourceRepo = join(root, "source");
@@ -679,7 +780,8 @@ try {
 
       process.env = {
         ...testEnv,
-        EXPECTED_AGY_GIT_DIR: join(sourceRepo, ".git"),
+        EXPECTED_AGY_GIT_DIR: join(sourceRepo, ".git", "worktrees", basename(linkedWorktree)),
+        UNEXPECTED_AGY_GIT_DIR: join(sourceRepo, ".git"),
       };
       const result = await adapter.run({
         prompt: "linked-worktree",
@@ -695,5 +797,6 @@ try {
 
 } finally {
   process.env = originalEnv;
+  cleanupProviderScratch(agyScratch.root);
   rmSync(tempMockDir, { recursive: true, force: true });
 }

@@ -15,6 +15,8 @@ import {
 
 const GOAL_MARKER_PATTERN = /pursuing\s+goal/i;
 const TRUST_DIALOG_PATTERN = /trust\s+the\s+contents/i;
+const TUI_MODEL_READY_PATTERN = /model:\s+(?!loading\b)\S+/i;
+const TUI_DIRECTORY_READY_PATTERN = /directory:\s+(?!loading\b)\S+/i;
 const EXPECTED_HEAD_PATTERN = /^[0-9a-fA-F]{40}$/;
 const MACOS_CODEX_FALLBACK = "/Applications/ChatGPT.app/Contents/Resources/codex";
 const MAX_GOAL_CHARACTERS = 20_000;
@@ -75,6 +77,8 @@ interface GoalSession {
   startedAt: number;
   goalActiveObserved: boolean;
   trustDialogObserved: boolean;
+  modelReadyObserved: boolean;
+  directoryReadyObserved: boolean;
   terminal: boolean;
   exitCode?: number;
   signal?: string;
@@ -310,6 +314,8 @@ export class CodexGoalSessionManager {
       startedAt: Date.now(),
       goalActiveObserved: false,
       trustDialogObserved: false,
+      modelReadyObserved: false,
+      directoryReadyObserved: false,
       terminal: false,
       recentOutput: new HeadTailBuffer(RECENT_OUTPUT_LIMIT),
     };
@@ -446,13 +452,15 @@ export class CodexGoalSessionManager {
     }
   }
 
-  /** Wait until the Codex TUI has produced its first output so input is only
-   * typed once the interactive process is actually up and reading. */
+  /** Wait until Codex has resolved both model and workspace identity. Startup
+   * terminal output arrives before the persisted interactive thread is ready,
+   * and sending `/goal` during that loading window is rejected by current CLI
+   * versions as "The session must start before you can set a goal." */
   private async waitForTuiReady(session: GoalSession): Promise<void> {
     const deadline = Date.now() + this.startupTimeoutMs;
     while (Date.now() < deadline) {
       await this.pollSession(session, this.activationPollMs);
-      if (session.recentOutput.hasOutput()) {
+      if (session.modelReadyObserved && session.directoryReadyObserved) {
         this.assertNoTrustDialog(session);
         return;
       }
@@ -463,7 +471,9 @@ export class CodexGoalSessionManager {
       }
       await this.pause();
     }
-    throw new Error(`Codex CLI TUI produced no output within ${this.startupTimeoutMs}ms.`);
+    throw new Error(
+      `Codex CLI TUI did not resolve model and directory within ${this.startupTimeoutMs}ms.`,
+    );
   }
 
   private async waitForGoalActivation(session: GoalSession): Promise<void> {
@@ -535,11 +545,18 @@ export class CodexGoalSessionManager {
   private recordOutput(session: GoalSession, output: string): void {
     if (!output) return;
     session.recentOutput.append(output);
-    if (!session.goalActiveObserved && GOAL_MARKER_PATTERN.test(normalizeTerminalText(output))) {
+    const normalized = normalizeTerminalText(output);
+    if (!session.goalActiveObserved && GOAL_MARKER_PATTERN.test(normalized)) {
       session.goalActiveObserved = true;
     }
-    if (!session.trustDialogObserved && TRUST_DIALOG_PATTERN.test(normalizeTerminalText(output))) {
+    if (!session.trustDialogObserved && TRUST_DIALOG_PATTERN.test(normalized)) {
       session.trustDialogObserved = true;
+    }
+    if (!session.modelReadyObserved && TUI_MODEL_READY_PATTERN.test(normalized)) {
+      session.modelReadyObserved = true;
+    }
+    if (!session.directoryReadyObserved && TUI_DIRECTORY_READY_PATTERN.test(normalized)) {
+      session.directoryReadyObserved = true;
     }
   }
 

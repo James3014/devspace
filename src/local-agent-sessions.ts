@@ -887,9 +887,7 @@ export class LocalAgentSessionManager {
       delta.attribution,
     );
 
-    const startedAtMs = Date.parse(record.createdAt);
-    const updatedAtMs = Date.parse(record.updatedAt);
-    const now = Date.now();
+    const { wallMs, idleMs } = computeSessionTiming(record);
 
     return {
       agentId: record.id,
@@ -912,8 +910,8 @@ export class LocalAgentSessionManager {
         startedAt: record.createdAt,
         lastActivityAt: record.updatedAt,
         lastFileMutationAt: physical.lastFileMutationAt,
-        wallMs: Math.max(0, now - startedAtMs),
-        idleMs: Math.max(0, now - updatedAtMs),
+        wallMs,
+        idleMs,
       },
     };
   }
@@ -987,9 +985,7 @@ export class LocalAgentSessionManager {
     record: LocalAgentRecord,
   ): Promise<LifecycleEvidence | undefined> {
     const physical = await inspectWorkspacePhysicalState(record.workspaceRoot);
-    const now = Date.now();
-    const startedAtMs = Date.parse(record.createdAt);
-    const updatedAtMs = Date.parse(record.updatedAt);
+    const { wallMs, idleMs } = computeSessionTiming(record);
 
     const changedPaths = record.scopeBaseline
       ? computeWorkerDelta(physical, record.scopeBaseline).changedPaths
@@ -999,8 +995,8 @@ export class LocalAgentSessionManager {
       startedAt: record.createdAt,
       lastActivityAt: record.updatedAt,
       lastFileMutationAt: physical.lastFileMutationAt,
-      wallMs: Math.max(0, now - startedAtMs),
-      idleMs: Math.max(0, now - updatedAtMs),
+      wallMs,
+      idleMs,
       changedPaths: physical.gitAvailable ? changedPaths : undefined,
       terminalReason: record.terminalReason,
       scopeState: record.scopeState,
@@ -1306,6 +1302,22 @@ export class LocalAgentSessionManager {
 
 export function isTerminalStatus(status: LocalAgentStatus): boolean {
   return status === "idle" || status === "error" || status === "stopped";
+}
+
+export function computeSessionTiming(record: LocalAgentRecord): { wallMs: number; idleMs: number } {
+  const startedAtMs = Date.parse(record.createdAt);
+  const updatedAtMs = Date.parse(record.updatedAt);
+  const isTerminal = isTerminalStatus(record.status);
+  const referenceMs = isTerminal ? updatedAtMs : Date.now();
+  const wallMs = Number.isFinite(startedAtMs) && Number.isFinite(referenceMs)
+    ? Math.max(0, referenceMs - startedAtMs)
+    : 0;
+  const idleMs = isTerminal
+    ? 0
+    : Number.isFinite(updatedAtMs) && Number.isFinite(referenceMs)
+      ? Math.max(0, referenceMs - updatedAtMs)
+      : 0;
+  return { wallMs, idleMs };
 }
 
 export function isReadinessPositive(value: ReadinessValue): boolean {
