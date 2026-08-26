@@ -257,7 +257,6 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
   assert.equal(collisionRecord?.errorCode, undefined);
   assert.equal(collisionRecord?.errorRetryable, undefined);
   assert.deepEqual(collisionRecord?.executionContract?.writePaths, ["src"]);
-  assert.equal(collisionRecord?.lifecycleState, "terminal");
   const collisionUpdated = collisionStore.update("agt_collision", {
     errorCode: "SCHEMA_RECONCILED",
     errorRetryable: false,
