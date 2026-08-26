@@ -1391,3 +1391,109 @@ test("pathspec-magic-looking filename is fingerprinted literally", async () => {
     f.clean();
   }
 });
+
+test("issue #5: terminal agents return stable wallMs and idleMs across delayed reads and durable restart", async () => {
+  const f = setupGitFixture();
+  const { manager, config, clean } = setupManager();
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "do work",
+      profiles: mockProfiles,
+    });
+
+    // 1. Running/starting agent accumulates live timing
+    const liveStatus1 = await manager.getAgentStatus({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      agentId: started.agentId,
+    });
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const liveStatus2 = await manager.getAgentStatus({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      agentId: started.agentId,
+    });
+    assert.ok(liveStatus2.wallMs! > liveStatus1.wallMs!, "Live agent wallMs must advance with time");
+    assert.ok(liveStatus2.idleMs! > liveStatus1.idleMs!, "Live agent idleMs must advance with time");
+
+    // 2. Transition agent to terminal state
+    manager.updateRecord(started.agentId, {
+      status: "idle",
+      terminalReason: "completed",
+    });
+
+    const termStatus1 = await manager.getAgentStatus({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      agentId: started.agentId,
+    });
+    const termReconcile1 = await manager.reconcileAgent({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      isolated: true,
+      agentId: started.agentId,
+    });
+
+    assert.equal(termStatus1.terminal, true);
+    assert.equal(termStatus1.idleMs, 0);
+    assert.equal(termReconcile1.activity.idleMs, 0);
+    assert.equal(termStatus1.wallMs, termReconcile1.activity.wallMs);
+    assert.ok(typeof termStatus1.wallMs === "number" && termStatus1.wallMs >= 0);
+
+    // 3. Repeated / delayed reads must return stable metrics without growth
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const termStatus2 = await manager.getAgentStatus({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      agentId: started.agentId,
+    });
+    const termReconcile2 = await manager.reconcileAgent({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      isolated: true,
+      agentId: started.agentId,
+    });
+
+    assert.equal(termStatus2.wallMs, termStatus1.wallMs, "Terminal wallMs must remain stable across delayed reads");
+    assert.equal(termStatus2.idleMs, 0, "Terminal idleMs must remain 0 across delayed reads");
+    assert.equal(
+      termReconcile2.activity.wallMs,
+      termReconcile1.activity.wallMs,
+      "Terminal reconcile wallMs must remain stable across delayed reads",
+    );
+    assert.equal(termReconcile2.activity.idleMs, 0, "Terminal reconcile idleMs must remain 0 across delayed reads");
+
+    // 4. Durable restart must not resume timing growth
+    const restartedManager = new LocalAgentSessionManager(
+      config,
+      async () => undefined,
+      async () => true,
+    );
+    const restartedStatus = await restartedManager.getAgentStatus({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      agentId: started.agentId,
+    });
+    const restartedReconcile = await restartedManager.reconcileAgent({
+      workspaceId: "ws_1",
+      workspaceRoot: f.repo,
+      isolated: true,
+      agentId: started.agentId,
+    });
+
+    assert.equal(restartedStatus.wallMs, termStatus1.wallMs, "Restarted terminal wallMs must match original");
+    assert.equal(restartedStatus.idleMs, 0, "Restarted terminal idleMs must remain 0");
+    assert.equal(
+      restartedReconcile.activity.wallMs,
+      termReconcile1.activity.wallMs,
+      "Restarted terminal reconcile wallMs must match original",
+    );
+    assert.equal(restartedReconcile.activity.idleMs, 0, "Restarted terminal reconcile idleMs must remain 0");
+  } finally {
+    f.clean();
+    clean();
+  }
+});
