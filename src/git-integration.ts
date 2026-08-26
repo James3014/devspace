@@ -103,6 +103,62 @@ export interface IntegrationApplyResult {
   blockers: IntegrationBlocker[];
 }
 
+export interface CandidatePromotionInput {
+  /** Workspace containing the exact accepted Candidate objects. */
+  sourceWorkspaceRoot: string;
+  candidateBase: string;
+  candidateHead: string;
+  /** Exact tree SHA expected for candidateHead. */
+  candidateTree: string;
+  /** Attached local checkout whose maintained branch should advance. */
+  destinationWorkspaceRoot: string;
+  /** Short local branch name, for example `main` or `james/feature`. */
+  expectedDestinationBranch: string;
+  /** Exact pre-promotion branch HEAD. Must equal candidateBase. */
+  expectedDestinationHead: string;
+  /** Must be true before any ref or worktree mutation occurs. */
+  confirmPromote: boolean;
+  /** Deterministic race-test seam: runs after final validation, before CAS ref update. */
+  beforeRefUpdateHook?: () => Promise<void> | void;
+  /** Deterministic failure-test seam: runs after CAS ref update, before worktree/index sync. */
+  beforeWorktreeSyncHook?: () => Promise<void> | void;
+}
+
+export interface PromotionBlocker {
+  code:
+    | "SOURCE_DESTINATION_ALIAS"
+    | "CANDIDATE_IDENTITY_NOT_IMMUTABLE"
+    | "CANDIDATE_COMMIT_MISSING"
+    | "CANDIDATE_BASE_INVALID"
+    | "CANDIDATE_BASE_NOT_ANCESTOR"
+    | "CANDIDATE_TREE_MISMATCH"
+    | "REPOSITORY_IDENTITY_MISMATCH"
+    | "DESTINATION_UNAVAILABLE"
+    | "DESTINATION_BRANCH_INVALID"
+    | "DESTINATION_BRANCH_MISMATCH"
+    | "DESTINATION_HEAD_MISMATCH"
+    | "DIRTY_DESTINATION"
+    | "PROMOTION_NOT_CONFIRMED"
+    | "PROMOTION_CAS_FAILED"
+    | "PROMOTION_WORKTREE_SYNC_FAILED"
+    | "PROMOTION_POST_STATE_MISMATCH";
+  detail: string;
+}
+
+export interface CandidatePromotionResult {
+  success: boolean;
+  promoted: boolean;
+  alreadyPromoted: boolean;
+  branch: string;
+  previousHead: string;
+  currentHead: string;
+  candidateHead: string;
+  candidateTree: string;
+  /** Acceptance remains external authority; this primitive only moves local Git state. */
+  acceptanceStatus: "external_not_granted_here";
+  blockers: PromotionBlocker[];
+}
+
 const GIT_TIMEOUT_MS = 15_000;
 
 interface GitResult {
@@ -651,6 +707,377 @@ export async function integrateCandidate(
     applied: true,
     appliedRange: { base: canonicalBase, head: canonicalHead },
     appliedTrackedFiles: changed.ok ? splitLines(changed.stdout).length : 0,
+    blockers: [],
+  };
+}
+
+// ─── Durable local Candidate branch promotion ───────────────────────────────
+
+async function gitCommonDirectory(workspaceRoot: string): Promise<string | undefined> {
+  const result = await runGit(
+    ["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    workspaceRoot,
+  );
+  if (!result.ok || !result.stdout.trim()) return undefined;
+  try {
+    return canonicalizePath(result.stdout.trim());
+  } catch {
+    return undefined;
+  }
+}
+
+async function destinationPromotionState(
+  destination: string,
+  branch: string,
+): Promise<{
+  symbolicRef?: string;
+  branchHead?: string;
+  head?: string;
+  tree?: string;
+  status?: string;
+}> {
+  const fullRef = `refs/heads/${branch}`;
+  const [symbolic, branchHead, head, tree, status] = await Promise.all([
+    runGit(["symbolic-ref", "-q", "HEAD"], destination),
+    runGit(["show-ref", "--verify", "--hash", fullRef], destination),
+    runGit(["rev-parse", "--verify", "HEAD"], destination),
+    runGit(["rev-parse", "--verify", "HEAD^{tree}"], destination),
+    runGit(["status", "--porcelain=v1", "--untracked-files=all"], destination),
+  ]);
+  return {
+    symbolicRef: symbolic.ok ? symbolic.stdout.trim() : undefined,
+    branchHead: branchHead.ok ? branchHead.stdout.trim().toLowerCase() : undefined,
+    head: head.ok ? head.stdout.trim().toLowerCase() : undefined,
+    tree: tree.ok ? tree.stdout.trim().toLowerCase() : undefined,
+    status: status.ok ? status.stdout : undefined,
+  };
+}
+
+/**
+ * Advance one exact attached local branch from candidateBase to candidateHead.
+ *
+ * This is intentionally NOT a generic reset/rebase/reconciliation primitive.
+ * It only supports a same-repository, pristine, pure fast-forward promotion of
+ * an externally accepted Candidate. The stable replay request remains
+ * candidateBase -> candidateHead: when the exact branch is already cleanly at
+ * candidateHead with the expected tree, the operation returns idempotent
+ * success without mutating Git state.
+ *
+ * The ref move uses `git update-ref <ref> <new> <old>` so an unexpected branch
+ * move cannot be overwritten. After the CAS succeeds, `git read-tree -u -m`
+ * synchronizes the index/worktree from the exact old tree to the exact new tree
+ * without moving the ref again. If that synchronization fails, the primitive
+ * attempts a CAS rollback from candidateHead to candidateBase and reports the
+ * failure; it never force-resets a branch or overwrites a later ref move.
+ */
+export async function promoteCandidate(
+  input: CandidatePromotionInput,
+): Promise<CandidatePromotionResult> {
+  const blockers: PromotionBlocker[] = [];
+  const branch = input.expectedDestinationBranch;
+  let previousHead = input.expectedDestinationHead.toLowerCase();
+  let currentHead = "";
+
+  const fail = (): CandidatePromotionResult => ({
+    success: false,
+    promoted: false,
+    alreadyPromoted: false,
+    branch,
+    previousHead,
+    currentHead,
+    candidateHead: input.candidateHead.toLowerCase(),
+    candidateTree: input.candidateTree.toLowerCase(),
+    acceptanceStatus: "external_not_granted_here",
+    blockers,
+  });
+
+  const source = canonicalizePath(input.sourceWorkspaceRoot);
+  const destination = canonicalizePath(input.destinationWorkspaceRoot);
+  if (source === destination) {
+    blockers.push({
+      code: "SOURCE_DESTINATION_ALIAS",
+      detail: `Source and destination resolve to the same physical checkout: ${source}`,
+    });
+    return fail();
+  }
+
+  const baseIdentity = normalizeExactCommitSha(input.candidateBase, "candidateBase");
+  const headIdentity = normalizeExactCommitSha(input.candidateHead, "candidateHead");
+  if (!("sha" in baseIdentity) || !("sha" in headIdentity)) {
+    blockers.push({
+      code: "CANDIDATE_IDENTITY_NOT_IMMUTABLE",
+      detail: "Candidate base/head must both be exact immutable 40-character commit SHAs.",
+    });
+    return fail();
+  }
+  const candidateBase = baseIdentity.sha;
+  const candidateHead = headIdentity.sha;
+
+  const candidateTree = input.candidateTree.toLowerCase();
+  if (/\s/.test(input.candidateTree) || !EXACT_COMMIT_SHA_PATTERN.test(candidateTree)) {
+    blockers.push({
+      code: "CANDIDATE_TREE_MISMATCH",
+      detail: `Candidate tree ${JSON.stringify(input.candidateTree)} is not an exact whitespace-free 40-character hex tree SHA.`,
+    });
+    return fail();
+  }
+
+  const expectedDestinationHead = input.expectedDestinationHead.toLowerCase();
+  previousHead = expectedDestinationHead;
+  if (/\s/.test(input.expectedDestinationHead) || !EXACT_COMMIT_SHA_PATTERN.test(expectedDestinationHead)) {
+    blockers.push({
+      code: "DESTINATION_HEAD_MISMATCH",
+      detail: `Expected destination HEAD ${JSON.stringify(input.expectedDestinationHead)} is not an exact 40-character commit SHA.`,
+    });
+    return fail();
+  }
+  if (expectedDestinationHead !== candidateBase) {
+    blockers.push({
+      code: "DESTINATION_HEAD_MISMATCH",
+      detail: `Promotion expectedDestinationHead must equal candidateBase (${candidateBase}); received ${expectedDestinationHead}.`,
+    });
+    return fail();
+  }
+
+  const branchFormat = await runGit(["check-ref-format", "--branch", branch], destination);
+  if (!branchFormat.ok || !branch || branch.startsWith("refs/")) {
+    blockers.push({
+      code: "DESTINATION_BRANCH_INVALID",
+      detail: `Expected destination branch ${JSON.stringify(branch)} is not a valid short local branch name.`,
+    });
+    return fail();
+  }
+
+  const [sourceCommonDir, destinationCommonDir] = await Promise.all([
+    gitCommonDirectory(source),
+    gitCommonDirectory(destination),
+  ]);
+  if (!sourceCommonDir || !destinationCommonDir) {
+    blockers.push({
+      code: "DESTINATION_UNAVAILABLE",
+      detail: "Could not resolve source/destination Git common-directory identity.",
+    });
+    return fail();
+  }
+  if (sourceCommonDir !== destinationCommonDir) {
+    blockers.push({
+      code: "REPOSITORY_IDENTITY_MISMATCH",
+      detail: "Source Candidate and destination branch are not worktrees of the same Git common directory.",
+    });
+    return fail();
+  }
+
+  const baseVerified = await resolveSelfVerifyingSha(candidateBase, "candidateBase", source);
+  if (!baseVerified.verified) {
+    blockers.push({
+      code: "CANDIDATE_BASE_INVALID",
+      detail: `Candidate base ${candidateBase} is not an exact commit object in the source repository.`,
+    });
+    return fail();
+  }
+  const headVerified = await resolveSelfVerifyingSha(candidateHead, "candidateHead", source);
+  if (!headVerified.verified) {
+    blockers.push({
+      code: "CANDIDATE_COMMIT_MISSING",
+      detail: `Candidate head ${candidateHead} is not an exact commit object in the source repository.`,
+    });
+    return fail();
+  }
+
+  const ancestry = await runGit(["merge-base", "--is-ancestor", candidateBase, candidateHead], source);
+  if (!ancestry.ok) {
+    blockers.push({
+      code: "CANDIDATE_BASE_NOT_ANCESTOR",
+      detail: `Candidate base ${candidateBase} is not an ancestor of candidate head ${candidateHead}.`,
+    });
+    return fail();
+  }
+
+  const treeResult = await runGit(
+    ["rev-parse", "--verify", "--end-of-options", `${candidateHead}^{tree}`],
+    source,
+  );
+  const actualCandidateTree = treeResult.ok ? treeResult.stdout.trim().toLowerCase() : "";
+  if (!actualCandidateTree || actualCandidateTree !== candidateTree) {
+    blockers.push({
+      code: "CANDIDATE_TREE_MISMATCH",
+      detail: `Candidate head tree is ${actualCandidateTree || "unavailable"}, expected ${candidateTree}.`,
+    });
+    return fail();
+  }
+
+  const expectedFullRef = `refs/heads/${branch}`;
+  let state = await destinationPromotionState(destination, branch);
+  currentHead = state.head ?? "";
+  if (!state.symbolicRef || !state.branchHead || !state.head || state.status === undefined) {
+    blockers.push({
+      code: "DESTINATION_UNAVAILABLE",
+      detail: "Destination branch/HEAD/status could not be read completely.",
+    });
+    return fail();
+  }
+  if (state.symbolicRef !== expectedFullRef) {
+    blockers.push({
+      code: "DESTINATION_BRANCH_MISMATCH",
+      detail: `Destination HEAD is attached to ${state.symbolicRef}, expected ${expectedFullRef}.`,
+    });
+    return fail();
+  }
+  if (state.branchHead !== state.head) {
+    blockers.push({
+      code: "DESTINATION_HEAD_MISMATCH",
+      detail: `Destination branch ref is ${state.branchHead}, while HEAD resolves to ${state.head}.`,
+    });
+    return fail();
+  }
+
+  // Stable replay: same exact request after a successful promotion is a no-op.
+  if (state.head === candidateHead) {
+    if (state.status.trim() !== "") {
+      blockers.push({
+        code: "DIRTY_DESTINATION",
+        detail: "Destination is already at the Candidate head but is not pristine; replay is refused.",
+      });
+      return fail();
+    }
+    if (state.tree !== candidateTree) {
+      blockers.push({
+        code: "CANDIDATE_TREE_MISMATCH",
+        detail: `Destination already points at Candidate head but tree ${state.tree ?? "unavailable"} does not match ${candidateTree}.`,
+      });
+      return fail();
+    }
+    return {
+      success: true,
+      promoted: false,
+      alreadyPromoted: true,
+      branch,
+      previousHead: candidateBase,
+      currentHead: candidateHead,
+      candidateHead,
+      candidateTree,
+      acceptanceStatus: "external_not_granted_here",
+      blockers: [],
+    };
+  }
+
+  if (state.head !== expectedDestinationHead) {
+    blockers.push({
+      code: "DESTINATION_HEAD_MISMATCH",
+      detail: `Destination HEAD is ${state.head}, expected exact promotion base ${expectedDestinationHead}.`,
+    });
+    return fail();
+  }
+  if (state.status.trim() !== "") {
+    blockers.push({
+      code: "DIRTY_DESTINATION",
+      detail: "Destination index/worktree must be pristine before local Candidate promotion.",
+    });
+    return fail();
+  }
+  if (input.confirmPromote !== true) {
+    blockers.push({
+      code: "PROMOTION_NOT_CONFIRMED",
+      detail: "confirmPromote was not set: no local branch mutation performed.",
+    });
+    return fail();
+  }
+
+  // Final same-call re-fence before the first mutation.
+  state = await destinationPromotionState(destination, branch);
+  currentHead = state.head ?? "";
+  if (state.symbolicRef !== expectedFullRef) {
+    blockers.push({
+      code: "DESTINATION_BRANCH_MISMATCH",
+      detail: `Destination branch changed before promotion; expected ${expectedFullRef}, observed ${state.symbolicRef ?? "detached/unavailable"}.`,
+    });
+    return fail();
+  }
+  if (state.head !== expectedDestinationHead || state.branchHead !== expectedDestinationHead) {
+    blockers.push({
+      code: "DESTINATION_HEAD_MISMATCH",
+      detail: `Destination moved before promotion; expected ${expectedDestinationHead}, observed HEAD=${state.head ?? "unavailable"} ref=${state.branchHead ?? "unavailable"}.`,
+    });
+    return fail();
+  }
+  if (state.status === undefined || state.status.trim() !== "") {
+    blockers.push({
+      code: "DIRTY_DESTINATION",
+      detail: "Destination became dirty before promotion; no ref mutation performed.",
+    });
+    return fail();
+  }
+
+  // Deterministic race seam used by tests to move the ref after the final
+  // re-fence but before update-ref's old-OID CAS.
+  await input.beforeRefUpdateHook?.();
+
+  // CAS ref advancement: a concurrent ref move is never overwritten.
+  const refUpdate = await runGit(
+    ["update-ref", expectedFullRef, candidateHead, expectedDestinationHead],
+    destination,
+  );
+  if (!refUpdate.ok) {
+    const raced = await destinationPromotionState(destination, branch);
+    currentHead = raced.head ?? "";
+    blockers.push({
+      code: "PROMOTION_CAS_FAILED",
+      detail: `Conditional ref update failed; destination branch was not overwritten. Current HEAD=${currentHead || "unavailable"}.`,
+    });
+    return fail();
+  }
+
+  await input.beforeWorktreeSyncHook?.();
+
+  // Synchronize the pristine base index/worktree to the exact Candidate tree
+  // without moving the branch ref again.
+  const sync = await runGit(
+    ["read-tree", "-u", "-m", candidateBase, candidateHead],
+    destination,
+  );
+  if (!sync.ok) {
+    const rollback = await runGit(
+      ["update-ref", expectedFullRef, candidateBase, candidateHead],
+      destination,
+    );
+    const afterFailure = await destinationPromotionState(destination, branch);
+    currentHead = afterFailure.head ?? "";
+    blockers.push({
+      code: "PROMOTION_WORKTREE_SYNC_FAILED",
+      detail: rollback.ok
+        ? "Candidate ref advance was rolled back by CAS after index/worktree synchronization failed."
+        : "Index/worktree synchronization failed and CAS rollback could not restore the original ref because branch state changed again; no later ref move was overwritten.",
+    });
+    return fail();
+  }
+
+  const finalState = await destinationPromotionState(destination, branch);
+  currentHead = finalState.head ?? "";
+  const coherent =
+    finalState.symbolicRef === expectedFullRef &&
+    finalState.branchHead === candidateHead &&
+    finalState.head === candidateHead &&
+    finalState.tree === candidateTree &&
+    finalState.status !== undefined &&
+    finalState.status.trim() === "";
+  if (!coherent) {
+    blockers.push({
+      code: "PROMOTION_POST_STATE_MISMATCH",
+      detail: `Promotion post-state is not coherent: branch=${finalState.symbolicRef ?? "unavailable"}, ref=${finalState.branchHead ?? "unavailable"}, HEAD=${finalState.head ?? "unavailable"}, tree=${finalState.tree ?? "unavailable"}, dirty=${finalState.status === undefined ? "unknown" : String(finalState.status.trim() !== "")}.`,
+    });
+    return fail();
+  }
+
+  return {
+    success: true,
+    promoted: true,
+    alreadyPromoted: false,
+    branch,
+    previousHead: candidateBase,
+    currentHead: candidateHead,
+    candidateHead,
+    candidateTree,
+    acceptanceStatus: "external_not_granted_here",
     blockers: [],
   };
 }

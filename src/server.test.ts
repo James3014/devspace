@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after, type TestContext } from "node:test";
@@ -849,11 +849,12 @@ test("subagents: workspace_verify executes a configured verifier normally", asyn
   }
 });
 
-test("gitCandidates disabled: git tools are absent", async (t) => {
+test("gitCandidates disabled: git tools and candidate promotion are absent", async (t) => {
   const context = await fixture(t, { gitCandidates: false });
   const tools = await context.client.listTools();
   const gitTools = tools.tools.filter((tool) => tool.name.startsWith("git_"));
   assert.equal(gitTools.length, 0);
+  assert.equal(tools.tools.some((tool) => tool.name === "candidate_promote"), false);
 });
 
 test("gitCandidates enabled: git tools are present with schema validation", async (t) => {
@@ -864,9 +865,11 @@ test("gitCandidates enabled: git tools are present with schema validation", asyn
 
   const commitTool = gitTools.find((tool) => tool.name === "git_commit");
   const pushTool = gitTools.find((tool) => tool.name === "git_push");
+  const promoteTool = tools.tools.find((tool) => tool.name === "candidate_promote");
 
   assert.ok(commitTool);
   assert.ok(pushTool);
+  assert.ok(promoteTool);
 
   // Security schemas verification: NO workspaceRoot, cwd, remoteUrl, refspec, rawArgs, force, noVerify, delete, all
   const commitProps = commitTool.inputSchema.properties as Record<string, any>;
@@ -895,6 +898,23 @@ test("gitCandidates enabled: git tools are present with schema validation", asyn
   assert.equal(pushTool.annotations?.idempotentHint, false);
   assert.equal(pushTool.annotations?.openWorldHint, true);
 
+  const promoteProps = promoteTool.inputSchema.properties as Record<string, any>;
+  assert.equal(promoteProps.workspaceRoot, undefined);
+  assert.equal(promoteProps.ref, undefined);
+  assert.equal(promoteProps.force, undefined);
+  assert.equal(promoteProps.remote, undefined);
+  assert.equal(promoteProps.branch, undefined);
+  assert.ok(promoteProps.sourceWorkspaceId);
+  assert.ok(promoteProps.destinationWorkspaceId);
+  assert.ok(promoteProps.candidateTree);
+  assert.ok(promoteProps.expectedDestinationBranch);
+  assert.ok(promoteProps.expectedDestinationHead);
+  assert.ok(promoteProps.confirmPromote);
+  assert.equal(promoteTool.annotations?.readOnlyHint, false);
+  assert.equal(promoteTool.annotations?.destructiveHint, true);
+  assert.equal(promoteTool.annotations?.idempotentHint, true);
+  assert.equal(promoteTool.annotations?.openWorldHint, false);
+
   // Open workspace in default checkout mode
   const openResult = await callOpen(context.client, context.project, "chat-1", "checkout");
   const workspaceId = structuredContent(openResult).workspaceId as string;
@@ -911,6 +931,77 @@ test("gitCandidates enabled: git tools are present with schema validation", asyn
   });
   assert.equal(res.isError, true);
   assert.match(responseText(res), /GIT_MANAGED_WORKTREE_REQUIRED/);
+});
+
+test("candidate_promote - MCP promotes exact accepted Candidate onto attached local branch and replays idempotently", async (t) => {
+  const context = await fixture(t, { git: true, gitCandidates: true });
+
+  const destinationOpen = await callOpen(context.client, context.project, "chat-promote-destination", "checkout");
+  const destinationWorkspaceId = structuredContent(destinationOpen).workspaceId as string;
+  const destinationHead = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: context.project })).stdout.trim();
+  const destinationBranch = (await execFileAsync("git", ["branch", "--show-current"], { cwd: context.project })).stdout.trim();
+  assert.equal(destinationBranch, "main");
+
+  const sourceOpen = await context.client.callTool({
+    name: "open_workspace",
+    arguments: { path: context.project, mode: "worktree", baseRef: destinationHead },
+  });
+  assert.equal(sourceOpen.isError, undefined);
+  const sourceBody = structuredContent(sourceOpen);
+  const sourceWorkspaceId = sourceBody.workspaceId as string;
+  const sourceRoot = sourceBody.root as string;
+  assert.equal(sourceBody.mode, "worktree");
+  assert.equal((sourceBody.worktree as any)?.managed, true);
+
+  await execFileAsync("git", ["config", "user.email", "mcp-test@example.com"], { cwd: sourceRoot });
+  await execFileAsync("git", ["config", "user.name", "MCP Test User"], { cwd: sourceRoot });
+  await writeFile(join(sourceRoot, "promoted-canary.txt"), "candidate promotion content\n");
+
+  const commitRes = await context.client.callTool({
+    name: "git_commit",
+    arguments: {
+      workspaceId: sourceWorkspaceId,
+      expectedHead: destinationHead,
+      message: "feat: add promotion canary",
+      paths: ["promoted-canary.txt"],
+    },
+  });
+  assert.equal(commitRes.isError, undefined);
+  const candidate = structuredContent(commitRes);
+  const candidateHead = candidate.commitSha as string;
+  const candidateTree = candidate.treeSha as string;
+
+  const promoteArgs = {
+    sourceWorkspaceId,
+    candidateBase: destinationHead,
+    candidateHead,
+    candidateTree,
+    destinationWorkspaceId,
+    expectedDestinationBranch: destinationBranch,
+    expectedDestinationHead: destinationHead,
+    confirmPromote: true,
+  };
+  const promoteRes = await context.client.callTool({ name: "candidate_promote", arguments: promoteArgs });
+  assert.equal(promoteRes.isError, undefined);
+  const promoted = structuredContent(promoteRes);
+  assert.equal(promoted.success, true);
+  assert.equal(promoted.promoted, true);
+  assert.equal(promoted.alreadyPromoted, false);
+  assert.equal(promoted.currentHead, candidateHead);
+  assert.equal(promoted.candidateTree, candidateTree);
+  assert.equal(promoted.acceptanceStatus, "external_not_granted_here");
+  assert.equal((await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: context.project })).stdout.trim(), candidateHead);
+  assert.equal((await execFileAsync("git", ["rev-parse", "HEAD^{tree}"], { cwd: context.project })).stdout.trim(), candidateTree);
+  assert.equal((await execFileAsync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: context.project })).stdout.trim(), "");
+  assert.equal(await readFile(join(context.project, "promoted-canary.txt"), "utf8"), "candidate promotion content\n");
+
+  const replayRes = await context.client.callTool({ name: "candidate_promote", arguments: promoteArgs });
+  assert.equal(replayRes.isError, undefined);
+  const replay = structuredContent(replayRes);
+  assert.equal(replay.success, true);
+  assert.equal(replay.promoted, false);
+  assert.equal(replay.alreadyPromoted, true);
+  assert.equal(replay.currentHead, candidateHead);
 });
 
 test("git candidates tools - MCP managed worktree end-to-end integration test", async (t) => {

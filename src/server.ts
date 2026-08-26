@@ -23,6 +23,7 @@ import {
   integrateCandidate,
   inspectIntegrationReadiness,
   probeRemoteWritability,
+  promoteCandidate,
 } from "./git-integration.js";
 import {
   isArtifactDownloadSupportedPlatform,
@@ -230,7 +231,7 @@ function serverInstructions(config: ServerConfig): string {
     : "";
 
   const gitCandidatesInstruction = config.gitCandidatesEnabled
-    ? " Use git_commit to form a scoped Candidate from exact paths. Use git_push to publish Candidate HEAD to a non-default branch. Do not use bash for git mutation."
+    ? " Use git_commit to form a scoped Candidate from exact paths. After external Candidate acceptance, use candidate_promote only for an exact same-repository pristine fast-forward of the intended attached local branch; divergence must go through reconciliation instead. Use git_push to publish Candidate HEAD to a non-default branch. candidate_promote never pushes or grants acceptance. Do not use bash for git mutation."
     : "";
 
   const codexGoalsInstruction = config.codexGoalsEnabled
@@ -2669,6 +2670,94 @@ export function createMcpServer(
 
   // ── Native Git Candidate MCP Tools (only when gitCandidatesEnabled is true) ──
   if (config.gitCandidatesEnabled) {
+    registerAppTool(
+      server,
+      "candidate_promote",
+      {
+        title: "Promote accepted Candidate locally",
+        description:
+          "Durably fast-forward one exact attached local branch from candidateBase to an externally accepted candidateHead in the same Git repository. Requires exact Candidate tree identity, exact expected branch/base, a pristine destination, and old-OID CAS ref advancement. Stable replay is idempotent. Refuses divergence; never pushes, merges remotes, or grants acceptance.",
+        inputSchema: {
+          sourceWorkspaceId: z.string().describe("Workspace containing the exact accepted Candidate commit objects."),
+          candidateBase: z
+            .string()
+            .regex(/^[0-9a-fA-F]{40}$/)
+            .describe("Exact immutable Candidate base SHA."),
+          candidateHead: z
+            .string()
+            .regex(/^[0-9a-fA-F]{40}$/)
+            .describe("Exact immutable accepted Candidate head SHA."),
+          candidateTree: z
+            .string()
+            .regex(/^[0-9a-fA-F]{40}$/)
+            .describe("Exact tree SHA required for candidateHead."),
+          destinationWorkspaceId: z.string().describe("Attached local workspace whose maintained branch should advance."),
+          expectedDestinationBranch: z
+            .string()
+            .min(1)
+            .describe("Exact short local branch name currently attached in the destination workspace."),
+          expectedDestinationHead: z
+            .string()
+            .regex(/^[0-9a-fA-F]{40}$/)
+            .describe("Exact pre-promotion destination HEAD; must equal candidateBase."),
+          confirmPromote: z
+            .boolean()
+            .describe("Must be true to perform the local CAS promotion. False performs no mutation."),
+        },
+        outputSchema: {
+          success: z.boolean(),
+          promoted: z.boolean(),
+          alreadyPromoted: z.boolean(),
+          branch: z.string(),
+          previousHead: z.string(),
+          currentHead: z.string(),
+          candidateHead: z.string(),
+          candidateTree: z.string(),
+          acceptanceStatus: z.literal("external_not_granted_here"),
+          blockers: z.array(z.object({ code: z.string(), detail: z.string() })),
+        },
+        _meta: {},
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({
+        sourceWorkspaceId,
+        candidateBase,
+        candidateHead,
+        candidateTree,
+        destinationWorkspaceId,
+        expectedDestinationBranch,
+        expectedDestinationHead,
+        confirmPromote,
+      }) => {
+        const source = workspaces.getWorkspace(sourceWorkspaceId);
+        const destination = workspaces.getWorkspace(destinationWorkspaceId);
+        const output = await promoteCandidate({
+          sourceWorkspaceRoot: source.root,
+          candidateBase,
+          candidateHead,
+          candidateTree,
+          destinationWorkspaceRoot: destination.root,
+          expectedDestinationBranch,
+          expectedDestinationHead,
+          confirmPromote,
+        });
+        const summary = output.success
+          ? output.alreadyPromoted
+            ? `Candidate ${output.candidateHead} is already promoted on local branch ${output.branch}; replay made no mutation.`
+            : `Candidate ${output.candidateHead} promoted locally on branch ${output.branch}.`
+          : `Candidate not promoted${output.blockers.length > 0 ? `: ${output.blockers.map((blocker) => blocker.code).join(", ")}` : "."}`;
+        return {
+          content: [textBlock(summary)],
+          structuredContent: output as unknown as Record<string, unknown>,
+        };
+      },
+    );
+
     registerAppTool(
       server,
       "git_commit",

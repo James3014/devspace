@@ -8,6 +8,7 @@ import {
   integrateCandidate,
   inspectIntegrationReadiness,
   probeRemoteWritability,
+  promoteCandidate,
   type CandidateRangeIdentity,
 } from "./git-integration.js";
 
@@ -62,6 +63,14 @@ async function readFile(path: string): Promise<string> {
 
 function cleanupRepo(repo: string): void {
   rmSync(join(repo, ".."), { recursive: true, force: true });
+}
+
+function makePromotionFixture(name: string, files: Record<string, string> = { "app.ts": "v1\n" }) {
+  const destination = makeRepo(`promotion-${name}`, files);
+  const base = runGitRaw(["rev-parse", "HEAD"], destination);
+  const source = join(destination, "..", "candidate-worktree");
+  runGitRaw(["worktree", "add", "--detach", source, base], destination);
+  return { source, destination, base };
 }
 
 test("committed Candidate range integrates exactly; unrelated dirt survives; untracked metadata never leaks", async () => {
@@ -647,6 +656,292 @@ test("RESIDUAL LIMITATION: compatible concurrent edit after the final re-fence c
     );
   } finally {
     cleanupRepo(source);
+    cleanupRepo(destination);
+  }
+});
+
+test("candidate promotion fast-forwards the exact attached branch and replays idempotently", async () => {
+  const { source, destination, base } = makePromotionFixture("success");
+  try {
+    const head = commitAll(source, { "app.ts": "v2\n", "src/new.ts": "export const promoted = true;\n" }, "candidate");
+    const tree = runGitRaw(["rev-parse", `${head}^{tree}`], source);
+    const input = {
+      sourceWorkspaceRoot: source,
+      candidateBase: base,
+      candidateHead: head,
+      candidateTree: tree,
+      destinationWorkspaceRoot: destination,
+      expectedDestinationBranch: "main",
+      expectedDestinationHead: base,
+      confirmPromote: true,
+    };
+
+    const result = await promoteCandidate(input);
+    assert.equal(result.success, true);
+    assert.equal(result.promoted, true);
+    assert.equal(result.alreadyPromoted, false);
+    assert.equal(result.previousHead, base);
+    assert.equal(result.currentHead, head);
+    assert.equal(result.candidateTree, tree);
+    assert.equal(result.acceptanceStatus, "external_not_granted_here");
+    assert.equal(runGitRaw(["symbolic-ref", "HEAD"], destination), "refs/heads/main");
+    assert.equal(runGitRaw(["rev-parse", "HEAD"], destination), head);
+    assert.equal(runGitRaw(["rev-parse", "HEAD^{tree}"], destination), tree);
+    assert.equal(runGitRaw(["status", "--porcelain", "--untracked-files=all"], destination), "");
+    assert.equal(await readFile(join(destination, "app.ts")), "v2\n");
+    assert.equal(await readFile(join(destination, "src", "new.ts")), "export const promoted = true;\n");
+
+    const reflogBeforeReplay = runGitRaw(["reflog", "show", "--format=%H", "refs/heads/main"], destination);
+    const replay = await promoteCandidate(input);
+    const reflogAfterReplay = runGitRaw(["reflog", "show", "--format=%H", "refs/heads/main"], destination);
+    assert.equal(replay.success, true);
+    assert.equal(replay.promoted, false);
+    assert.equal(replay.alreadyPromoted, true);
+    assert.equal(replay.currentHead, head);
+    assert.equal(reflogAfterReplay, reflogBeforeReplay, "idempotent replay must not write the ref again");
+  } finally {
+    cleanupRepo(destination);
+  }
+});
+
+test("candidate promotion refuses unconfirmed, wrong-tree, wrong-branch, stale, and dirty destinations without mutation", async () => {
+  {
+    const { source, destination, base } = makePromotionFixture("unconfirmed");
+    try {
+      const head = commitAll(source, { "app.ts": "v2\n" }, "candidate");
+      const tree = runGitRaw(["rev-parse", `${head}^{tree}`], source);
+      const result = await promoteCandidate({
+        sourceWorkspaceRoot: source,
+        candidateBase: base,
+        candidateHead: head,
+        candidateTree: tree,
+        destinationWorkspaceRoot: destination,
+        expectedDestinationBranch: "main",
+        expectedDestinationHead: base,
+        confirmPromote: false,
+      });
+      assert.equal(result.success, false);
+      assert.ok(result.blockers.some((b) => b.code === "PROMOTION_NOT_CONFIRMED"));
+      assert.equal(runGitRaw(["rev-parse", "HEAD"], destination), base);
+      assert.equal(runGitRaw(["status", "--porcelain"], destination), "");
+    } finally {
+      cleanupRepo(destination);
+    }
+  }
+
+  {
+    const { source, destination, base } = makePromotionFixture("wrong-tree");
+    try {
+      const head = commitAll(source, { "app.ts": "v2\n" }, "candidate");
+      const result = await promoteCandidate({
+        sourceWorkspaceRoot: source,
+        candidateBase: base,
+        candidateHead: head,
+        candidateTree: "a".repeat(40),
+        destinationWorkspaceRoot: destination,
+        expectedDestinationBranch: "main",
+        expectedDestinationHead: base,
+        confirmPromote: true,
+      });
+      assert.equal(result.success, false);
+      assert.ok(result.blockers.some((b) => b.code === "CANDIDATE_TREE_MISMATCH"));
+      assert.equal(runGitRaw(["rev-parse", "HEAD"], destination), base);
+    } finally {
+      cleanupRepo(destination);
+    }
+  }
+
+  {
+    const { source, destination, base } = makePromotionFixture("wrong-branch");
+    try {
+      const head = commitAll(source, { "app.ts": "v2\n" }, "candidate");
+      const tree = runGitRaw(["rev-parse", `${head}^{tree}`], source);
+      runGitRaw(["branch", "other", base], destination);
+      const result = await promoteCandidate({
+        sourceWorkspaceRoot: source,
+        candidateBase: base,
+        candidateHead: head,
+        candidateTree: tree,
+        destinationWorkspaceRoot: destination,
+        expectedDestinationBranch: "other",
+        expectedDestinationHead: base,
+        confirmPromote: true,
+      });
+      assert.equal(result.success, false);
+      assert.ok(result.blockers.some((b) => b.code === "DESTINATION_BRANCH_MISMATCH"));
+      assert.equal(runGitRaw(["rev-parse", "refs/heads/main"], destination), base);
+      assert.equal(runGitRaw(["rev-parse", "refs/heads/other"], destination), base);
+    } finally {
+      cleanupRepo(destination);
+    }
+  }
+
+  {
+    const { source, destination, base } = makePromotionFixture("stale");
+    try {
+      const head = commitAll(source, { "app.ts": "candidate\n" }, "candidate");
+      const tree = runGitRaw(["rev-parse", `${head}^{tree}`], source);
+      commitAll(destination, { "local.txt": "new main work\n" }, "destination advanced");
+      const advanced = runGitRaw(["rev-parse", "HEAD"], destination);
+      const result = await promoteCandidate({
+        sourceWorkspaceRoot: source,
+        candidateBase: base,
+        candidateHead: head,
+        candidateTree: tree,
+        destinationWorkspaceRoot: destination,
+        expectedDestinationBranch: "main",
+        expectedDestinationHead: base,
+        confirmPromote: true,
+      });
+      assert.equal(result.success, false);
+      assert.ok(result.blockers.some((b) => b.code === "DESTINATION_HEAD_MISMATCH"));
+      assert.equal(runGitRaw(["rev-parse", "HEAD"], destination), advanced);
+    } finally {
+      cleanupRepo(destination);
+    }
+  }
+
+  {
+    const { source, destination, base } = makePromotionFixture("dirty");
+    try {
+      const head = commitAll(source, { "app.ts": "v2\n" }, "candidate");
+      const tree = runGitRaw(["rev-parse", `${head}^{tree}`], source);
+      writeFileSync(join(destination, "app.ts"), "local dirty work\n");
+      const result = await promoteCandidate({
+        sourceWorkspaceRoot: source,
+        candidateBase: base,
+        candidateHead: head,
+        candidateTree: tree,
+        destinationWorkspaceRoot: destination,
+        expectedDestinationBranch: "main",
+        expectedDestinationHead: base,
+        confirmPromote: true,
+      });
+      assert.equal(result.success, false);
+      assert.ok(result.blockers.some((b) => b.code === "DIRTY_DESTINATION"));
+      assert.equal(runGitRaw(["rev-parse", "HEAD"], destination), base);
+      assert.equal(await readFile(join(destination, "app.ts")), "local dirty work\n");
+    } finally {
+      cleanupRepo(destination);
+    }
+  }
+});
+
+test("candidate promotion refuses cross-repository and non-fast-forward Candidate identities", async () => {
+  {
+    const destination = makeRepo("promotion-cross-repo", { "app.ts": "v1\n" });
+    const base = runGitRaw(["rev-parse", "HEAD"], destination);
+    const source = join(destination, "..", "independent-clone");
+    runGitRaw(["clone", destination, source], join(destination, ".."));
+    try {
+      const head = commitAll(source, { "app.ts": "v2\n" }, "candidate");
+      const tree = runGitRaw(["rev-parse", `${head}^{tree}`], source);
+      const result = await promoteCandidate({
+        sourceWorkspaceRoot: source,
+        candidateBase: base,
+        candidateHead: head,
+        candidateTree: tree,
+        destinationWorkspaceRoot: destination,
+        expectedDestinationBranch: "main",
+        expectedDestinationHead: base,
+        confirmPromote: true,
+      });
+      assert.equal(result.success, false);
+      assert.ok(result.blockers.some((b) => b.code === "REPOSITORY_IDENTITY_MISMATCH"));
+      assert.equal(runGitRaw(["rev-parse", "HEAD"], destination), base);
+    } finally {
+      cleanupRepo(destination);
+    }
+  }
+
+  {
+    const { source, destination, base } = makePromotionFixture("non-ff");
+    try {
+      const baseTree = runGitRaw(["rev-parse", `${base}^{tree}`], source);
+      const orphanHead = runGitRaw(["commit-tree", baseTree, "-m", "unrelated candidate"], source);
+      const result = await promoteCandidate({
+        sourceWorkspaceRoot: source,
+        candidateBase: base,
+        candidateHead: orphanHead,
+        candidateTree: baseTree,
+        destinationWorkspaceRoot: destination,
+        expectedDestinationBranch: "main",
+        expectedDestinationHead: base,
+        confirmPromote: true,
+      });
+      assert.equal(result.success, false);
+      assert.ok(result.blockers.some((b) => b.code === "CANDIDATE_BASE_NOT_ANCESTOR"));
+      assert.equal(runGitRaw(["rev-parse", "HEAD"], destination), base);
+    } finally {
+      cleanupRepo(destination);
+    }
+  }
+});
+
+test("candidate promotion CAS does not overwrite a branch that moves after the final re-fence", async () => {
+  const { source, destination, base } = makePromotionFixture("cas-race");
+  try {
+    const head = commitAll(source, { "app.ts": "candidate\n" }, "candidate");
+    const tree = runGitRaw(["rev-parse", `${head}^{tree}`], source);
+    const newer = commitAll(source, { "race.txt": "newer branch state\n" }, "newer competing state");
+
+    let seamRan = false;
+    const result = await promoteCandidate({
+      sourceWorkspaceRoot: source,
+      candidateBase: base,
+      candidateHead: head,
+      candidateTree: tree,
+      destinationWorkspaceRoot: destination,
+      expectedDestinationBranch: "main",
+      expectedDestinationHead: base,
+      confirmPromote: true,
+      beforeRefUpdateHook: () => {
+        seamRan = true;
+        runGitRaw(["merge", "--ff-only", newer], destination);
+      },
+    });
+
+    assert.equal(seamRan, true);
+    assert.equal(result.success, false);
+    assert.ok(result.blockers.some((b) => b.code === "PROMOTION_CAS_FAILED"));
+    assert.equal(runGitRaw(["rev-parse", "HEAD"], destination), newer);
+    assert.equal(runGitRaw(["rev-parse", "refs/heads/main"], destination), newer);
+    assert.equal(runGitRaw(["status", "--porcelain"], destination), "");
+    assert.equal(await readFile(join(destination, "race.txt")), "newer branch state\n");
+  } finally {
+    cleanupRepo(destination);
+  }
+});
+
+test("candidate promotion rolls the ref back when worktree synchronization fails", async () => {
+  const { source, destination, base } = makePromotionFixture("sync-failure");
+  try {
+    const head = commitAll(source, { "app.ts": "candidate\n" }, "candidate");
+    const tree = runGitRaw(["rev-parse", `${head}^{tree}`], source);
+    let seamRan = false;
+
+    const result = await promoteCandidate({
+      sourceWorkspaceRoot: source,
+      candidateBase: base,
+      candidateHead: head,
+      candidateTree: tree,
+      destinationWorkspaceRoot: destination,
+      expectedDestinationBranch: "main",
+      expectedDestinationHead: base,
+      confirmPromote: true,
+      beforeWorktreeSyncHook: () => {
+        seamRan = true;
+        writeFileSync(join(destination, "app.ts"), "concurrent local edit\n");
+      },
+    });
+
+    assert.equal(seamRan, true);
+    assert.equal(result.success, false);
+    assert.ok(result.blockers.some((b) => b.code === "PROMOTION_WORKTREE_SYNC_FAILED"));
+    assert.equal(runGitRaw(["rev-parse", "refs/heads/main"], destination), base);
+    assert.equal(runGitRaw(["rev-parse", "HEAD"], destination), base);
+    assert.equal(await readFile(join(destination, "app.ts")), "concurrent local edit\n");
+  } finally {
     cleanupRepo(destination);
   }
 });
