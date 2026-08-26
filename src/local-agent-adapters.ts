@@ -1,5 +1,5 @@
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { realpathSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, symlinkSync } from "node:fs";
 import { createServer } from "node:net";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { Readable, Writable } from "node:stream";
@@ -15,6 +15,7 @@ import {
 } from "./local-agent-runtime.js";
 import { runOmpAcpLocalAgent } from "./local-agent-omp.js";
 import { inspectCodexRuntime } from "./codex-runtime.js";
+import { inspectScratchOwnership } from "./provider-scratch.js";
 
 export interface LocalAgentAdapter {
   readonly provider: LocalAgentProvider;
@@ -166,6 +167,77 @@ export function agyCommandEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv
       delete next[key];
     }
   }
+
+  // Agy loads global MCP configuration from ~/.gemini/config/mcp_config.json.
+  // A bounded DevSpace worker must not inherit that ambient tool surface. Bind
+  // Agy's user/config roots to the already-owned per-turn provider scratch so
+  // global MCP servers stay invisible without mutating the user's real config.
+  const scratch = next.DEVSPACE_PROVIDER_SCRATCH?.trim();
+  if (!scratch) {
+    throw new Error("Agy dispatch requires DevSpace-owned provider scratch for per-dispatch config isolation.");
+  }
+  const ownership = inspectScratchOwnership(scratch);
+  if (!ownership.owned) {
+    throw new Error(`Agy dispatch refused unowned provider scratch: ${ownership.reason}`);
+  }
+  const scratchRoot = canonicalizeExistingPath(scratch);
+  const isolatedHome = join(scratchRoot, "agy-home");
+  mkdirSync(isolatedHome, { recursive: true, mode: 0o700 });
+  const canonicalHome = canonicalizeExistingPath(isolatedHome);
+  if (!isPathWithin(canonicalHome, scratchRoot)) {
+    throw new Error(`Agy isolated home escaped provider scratch: ${canonicalHome}`);
+  }
+
+  // Agy stores its authenticated Antigravity token and durable conversation DBs
+  // under ~/.gemini/antigravity-cli, separately from global MCP configuration in
+  // ~/.gemini/config. Expose only those two provider-state paths into the
+  // isolated home. Do not link the application-data directory wholesale: it may
+  // contain cached MCP schemas, provider scratch, or other unrelated state.
+  const originalHome = next.HOME?.trim() || next.USERPROFILE?.trim();
+  if (!originalHome) {
+    throw new Error("Agy dispatch cannot isolate global config without the original user home.");
+  }
+  const canonicalOriginalHome = canonicalizeExistingPath(originalHome);
+  const sourceAppData = canonicalizeExistingPath(
+    join(canonicalOriginalHome, ".gemini", "antigravity-cli"),
+  );
+  if (!isPathWithin(sourceAppData, canonicalOriginalHome)) {
+    throw new Error(`Agy provider state escaped the original user home: ${sourceAppData}`);
+  }
+  const isolatedAppData = join(canonicalHome, ".gemini", "antigravity-cli");
+  mkdirSync(isolatedAppData, { recursive: true, mode: 0o700 });
+  const providerStateLinks: Array<{ name: string; type: "file" | "dir" }> = [
+    { name: "antigravity-oauth-token", type: "file" },
+    { name: "conversations", type: "dir" },
+  ];
+  for (const { name, type } of providerStateLinks) {
+    const source = canonicalizeExistingPath(join(sourceAppData, name));
+    if (!isPathWithin(source, sourceAppData)) {
+      throw new Error(`Agy provider state path escaped its application-data root: ${source}`);
+    }
+    const target = join(isolatedAppData, name);
+    if (existsSync(target)) {
+      const existing = canonicalizeExistingPath(target);
+      if (existing !== source) {
+        throw new Error(`Agy isolated provider state has unexpected target for ${name}: ${existing}`);
+      }
+    } else {
+      symlinkSync(source, target, process.platform === "win32" && type === "dir" ? "junction" : type);
+      const linked = canonicalizeExistingPath(target);
+      if (linked !== source) {
+        throw new Error(`Agy provider state link verification failed for ${name}: ${linked}`);
+      }
+    }
+  }
+
+  next.HOME = canonicalHome;
+  // Go's user-home resolution uses USERPROFILE on Windows. Setting both keeps
+  // the provider-specific boundary deterministic across supported platforms.
+  next.USERPROFILE = canonicalHome;
+  next.XDG_CONFIG_HOME = join(canonicalHome, ".config");
+  next.XDG_DATA_HOME = join(canonicalHome, ".local", "share");
+  next.XDG_CACHE_HOME = join(canonicalHome, ".cache");
+  next.XDG_STATE_HOME = join(canonicalHome, ".local", "state");
   return next;
 }
 
