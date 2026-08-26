@@ -1,4 +1,5 @@
 import { accessSync, constants } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { delimiter, resolve } from "node:path";
 import {
   LOCAL_AGENT_PROVIDERS,
@@ -29,6 +30,8 @@ export function checkLocalAgentProviderAvailability(
       return packageAvailability(provider, "@anthropic-ai/claude-agent-sdk");
     case "opencode":
       return packageAvailability(provider, "@opencode-ai/sdk/v2");
+    case "omp":
+      return commandAvailability(provider, env.OMP_COMMAND ?? "omp", env);
     case "pi":
       return packageAvailability(provider, "@earendil-works/pi-coding-agent");
     case "cursor":
@@ -37,6 +40,8 @@ export function checkLocalAgentProviderAvailability(
       return commandAvailability(provider, env.COPILOT_COMMAND ?? "copilot", env);
     case "grok":
       return commandAvailability(provider, env.GROK_COMMAND ?? "grok", env);
+    case "agy":
+      return checkAgyAvailability(env);
   }
 }
 
@@ -135,5 +140,83 @@ function executableExists(command: string): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+export function resolveAgyExecutable(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (env.AGY_COMMAND) {
+    const resolved = resolveCommand(env.AGY_COMMAND, env);
+    if (resolved) return resolved;
+  }
+  const resolvedPath = resolveCommand("agy", env);
+  if (resolvedPath) return resolvedPath;
+
+  const fallback = "/Users/jameschen/.local/bin/agy";
+  if (executableExists(fallback)) {
+    return fallback;
+  }
+  return undefined;
+}
+
+function checkAgyAvailability(env: NodeJS.ProcessEnv): LocalAgentProviderAvailability {
+  const executable = resolveAgyExecutable(env);
+  if (!executable) {
+    return {
+      name: "agy",
+      available: false,
+      reason: "agy executable not found",
+    };
+  }
+  return { name: "agy", available: true };
+}
+
+/**
+ * Resolve the concrete executable for a provider, when the provider runs an
+ * external command. Package-providers (codex/claude/opencode) return undefined.
+ */
+export function resolveLocalAgentProviderExecutable(
+  provider: LocalAgentProvider,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  switch (provider) {
+    case "omp":
+      return resolveCommand(env.OMP_COMMAND ?? "omp", env);
+    case "pi":
+      return resolveCommand(env.PI_COMMAND ?? "pi", env);
+    case "cursor":
+      return resolveCommand("cursor-agent", env);
+    case "copilot":
+      return resolveCommand("copilot", env);
+    case "grok":
+      return resolveCommand(env.GROK_COMMAND ?? "grok", env);
+    case "agy":
+      return resolveAgyExecutable(env);
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Best-effort runtime version for a provider, from `--version` on the resolved
+ * executable. Package-providers report undefined. Never throws.
+ */
+export function getLocalAgentProviderRuntimeVersion(
+  provider: LocalAgentProvider,
+  env: NodeJS.ProcessEnv = process.env,
+): string | undefined {
+  const executable = resolveLocalAgentProviderExecutable(provider, env);
+  if (!executable) return undefined;
+  try {
+    const result = spawnSync(executable, ["--version"], {
+      encoding: "utf8",
+      env,
+      windowsHide: true,
+      timeout: 5_000,
+    });
+    if (result.error) return undefined;
+    const version = (result.stdout ?? "").trim() || (result.stderr ?? "").trim();
+    return version.slice(0, 120) || undefined;
+  } catch {
+    return undefined;
   }
 }

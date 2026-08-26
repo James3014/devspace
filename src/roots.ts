@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { isAbsolute, relative, resolve, sep, dirname, basename } from "node:path";
+import { realpathSync } from "node:fs";
 
 export class AccessDeniedError extends Error {
   constructor(message: string) {
@@ -43,4 +44,25 @@ export function assertAllowedPath(path: string, allowedRoots: string[]): string 
 export function resolveAllowedPath(inputPath: string, cwd: string, allowedRoots: string[]): string {
   const absolutePath = resolve(cwd, inputPath);
   return assertAllowedPath(absolutePath, allowedRoots);
+}
+
+export function canonicalizePath(path: string): string {
+  const missingSegments: string[] = [];
+  let candidate = resolve(expandHomePath(path));
+
+  while (true) {
+    try {
+      return resolve(realpathSync(candidate), ...missingSegments.slice().reverse());
+    } catch (error) {
+      const err = error as NodeJS.ErrnoException;
+      if (!err || (err.code !== "ENOENT" && err.code !== "ENOTDIR")) {
+        throw error;
+      }
+
+      const parent = dirname(candidate);
+      if (parent === candidate) return resolve(expandHomePath(path));
+      missingSegments.push(basename(candidate));
+      candidate = parent;
+    }
+  }
 }

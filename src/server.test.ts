@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import test, { type TestContext } from "node:test";
+import test, { after, type TestContext } from "node:test";
 import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -11,6 +12,7 @@ import { loadConfig, type ServerConfig } from "./config.js";
 import type { LocalAgentProviderAvailability } from "./local-agent-availability.js";
 import { buildLocalAgentProviderStatuses } from "./local-agent-catalog.js";
 import type { SubagentsConfig } from "./local-agent-config.js";
+import { MINIMUM_CODEX_RUNTIME_VERSION } from "./codex-runtime.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { createMcpServer } from "./server.js";
@@ -18,6 +20,29 @@ import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 
 const execFileAsync = promisify(execFile);
+
+// Hermetic Codex runtime so dispatch gates see a valid, inspectable runtime
+// and spawned workers fail fast locally instead of invoking a real provider.
+const originalDependencyRoot = process.env.DEVSPACE_DEPENDENCY_ROOT;
+const codexRuntimeRoot = mkdtempSync(join(tmpdir(), "devspace-server-codex-runtime-"));
+mkdirSync(join(codexRuntimeRoot, "node_modules", "@openai", "codex-sdk"), { recursive: true });
+mkdirSync(join(codexRuntimeRoot, "node_modules", "@openai", "codex", "bin"), { recursive: true });
+writeFileSync(
+  join(codexRuntimeRoot, "node_modules", "@openai", "codex-sdk", "package.json"),
+  JSON.stringify({ name: "@openai/codex-sdk", version: MINIMUM_CODEX_RUNTIME_VERSION }),
+);
+writeFileSync(
+  join(codexRuntimeRoot, "node_modules", "@openai", "codex", "bin", "codex.js"),
+  `#!/bin/sh\necho 'codex-cli ${MINIMUM_CODEX_RUNTIME_VERSION}'\n`,
+  { mode: 0o755 },
+);
+process.env.DEVSPACE_DEPENDENCY_ROOT = codexRuntimeRoot;
+
+after(async () => {
+  if (originalDependencyRoot === undefined) delete process.env.DEVSPACE_DEPENDENCY_ROOT;
+  else process.env.DEVSPACE_DEPENDENCY_ROOT = originalDependencyRoot;
+  await rm(codexRuntimeRoot, { recursive: true, force: true });
+});
 
 test("open_workspace keeps lifecycle flags out of model output and preserves complete card metadata", async (t) => {
   const providerNote = "available";
@@ -246,7 +271,9 @@ async function fixture(
   options: {
     git?: boolean;
     localAgentProviders?: LocalAgentProviderAvailability[] | (() => LocalAgentProviderAvailability[]);
-    subagents?: SubagentsConfig;
+    subagents?: boolean | SubagentsConfig;
+    gitCandidates?: boolean;
+    toolchains?: string;
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -279,6 +306,11 @@ async function fixture(
   const initialProviderAvailability = typeof options.localAgentProviders === "function"
     ? options.localAgentProviders()
     : options.localAgentProviders ?? [];
+  const subagentsObject = typeof options.subagents === "object" ? options.subagents : undefined;
+  const wantsSubagents =
+    options.subagents === true ||
+    (subagentsObject !== undefined && subagentsObject.enabled !== false) ||
+    (options.subagents === undefined && options.localAgentProviders !== undefined);
   const loadedConfig = loadConfig({
     DEVSPACE_CONFIG_DIR: join(root, ".config"),
     DEVSPACE_ALLOWED_ROOTS: root,
@@ -286,22 +318,32 @@ async function fixture(
     DEVSPACE_AGENT_DIR: agentDir,
     DEVSPACE_WIDGETS: "full",
     DEVSPACE_TOOL_MODE: "full",
-    DEVSPACE_SUBAGENTS: options.localAgentProviders ? "1" : "0",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_GIT_CANDIDATES: options.gitCandidates ? "true" : "false",
+    DEVSPACE_TOOLCHAINS: options.toolchains,
   });
-  const config: ServerConfig = options.localAgentProviders
-    ? {
-        ...loadedConfig,
-        subagents: options.subagents ?? {
+  let config: ServerConfig = {
+    ...loadedConfig,
+    subagents: {
+      ...loadedConfig.subagents,
+      enabled: wantsSubagents,
+      ...(subagentsObject ?? {}),
+    },
+  };
+  if (options.localAgentProviders) {
+    config = {
+      ...config,
+      subagents: subagentsObject ?? {
+        enabled: true,
+        providers: initialProviderAvailability.map((provider) => ({
+          id: provider.name,
           enabled: true,
-          providers: initialProviderAvailability.map((provider) => ({
-            id: provider.name,
-            enabled: true,
-          })),
-        },
-      }
-    : loadedConfig;
+        })),
+      },
+    };
+  }
   const resolveProviderAvailability: () => LocalAgentProviderAvailability[] =
     typeof options.localAgentProviders === "function"
       ? options.localAgentProviders
@@ -312,6 +354,10 @@ async function fixture(
   );
   const store = new SqliteWorkspaceStore(stateDir);
   const workspaces = new WorkspaceRegistry(config, store);
+  const { LocalAgentSessionManager } = await import("./local-agent-sessions.js");
+  const agentSessionManager = config.subagents.enabled
+    ? new LocalAgentSessionManager(config, async () => {})
+    : undefined;
   const server = createMcpServer(
     config,
     workspaces,
@@ -319,6 +365,7 @@ async function fixture(
     new ProcessSessionManager(),
     resolveLocalAgentProviders,
     [],
+    agentSessionManager,
   );
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "devspace-test-client", version: "1.0.0" });
@@ -388,3 +435,556 @@ function responseCard(result: Awaited<ReturnType<Client["callTool"]>>): Record<s
   assert.ok(card && typeof card === "object");
   return card as Record<string, unknown>;
 }
+
+test("subagents disabled: agent tools are absent", async (t) => {
+  const context = await fixture(t, { subagents: false });
+  const tools = await context.client.listTools();
+  const agentTools = tools.tools.filter((tool) => tool.name.startsWith("agent_"));
+  assert.equal(agentTools.length, 0);
+});
+
+test("subagents enabled: agent tools are present and functional", async (t) => {
+  const context = await fixture(t, { subagents: true });
+  const tools = await context.client.listTools();
+  const agentTools = tools.tools.filter((tool) => tool.name.startsWith("agent_"));
+  assert.equal(agentTools.length, 7);
+
+  const startTool = agentTools.find((tool) => tool.name === "agent_start");
+  const continueTool = agentTools.find((tool) => tool.name === "agent_continue");
+  const statusTool = agentTools.find((tool) => tool.name === "agent_status");
+  const cancelTool = agentTools.find((tool) => tool.name === "agent_cancel");
+  const listTool = agentTools.find((tool) => tool.name === "agent_list");
+  const preflightTool = agentTools.find((tool) => tool.name === "agent_preflight");
+  const reconcileTool = agentTools.find((tool) => tool.name === "agent_reconcile");
+
+  assert.ok(startTool);
+  assert.ok(continueTool);
+  assert.ok(statusTool);
+  assert.ok(cancelTool);
+  assert.ok(listTool);
+  assert.ok(preflightTool);
+  assert.ok(reconcileTool);
+
+  // Verify start annotations
+  assert.equal(startTool.annotations?.readOnlyHint, false);
+  assert.equal(startTool.annotations?.destructiveHint, true);
+  assert.equal(startTool.annotations?.idempotentHint, false);
+  assert.equal(startTool.annotations?.openWorldHint, true);
+
+  // Open workspace to get workspaceId
+  const openResult = await callOpen(context.client, context.project, "chat-1");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+  assert.ok(workspaceId);
+
+  // Schema Security Checks: verify no workspaceRoot or provider/profile leakage
+  const startProps = startTool.inputSchema.properties as Record<string, any>;
+  assert.equal(startProps.workspaceRoot, undefined);
+  assert.equal(startProps.provider, undefined);
+  assert.ok(startProps.attemptKey);
+
+  const continueProps = continueTool.inputSchema.properties as Record<string, any>;
+  assert.equal(continueProps.workspaceRoot, undefined);
+  assert.equal(continueProps.provider, undefined);
+  assert.equal(continueProps.profile, undefined);
+
+  const statusProps = statusTool.inputSchema.properties as Record<string, any>;
+  assert.equal(statusProps.workspaceRoot, undefined);
+
+  const cancelProps = cancelTool.inputSchema.properties as Record<string, any>;
+  assert.equal(cancelProps.workspaceRoot, undefined);
+  assert.equal(cancelProps.workerPid, undefined);
+  assert.equal(cancelProps.workerToken, undefined);
+  assert.equal(cancelProps.signal, undefined);
+
+  const listProps = listTool.inputSchema.properties as Record<string, any>;
+  assert.equal(listProps.workspaceRoot, undefined);
+
+  // Call agent_start
+  const startResult = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "hello review tests",
+      attemptKey: "server-functional-attempt",
+    },
+  });
+
+  const startStructured = startResult.structuredContent as Record<string, any>;
+  assert.ok(startStructured.agentId);
+  assert.equal(startStructured.status, "starting");
+  assert.equal(startStructured.profileName, "reviewer");
+
+  const replayResult = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "hello review tests",
+      attemptKey: "server-functional-attempt",
+    },
+  });
+  assert.equal(replayResult.isError, undefined);
+  assert.equal(
+    (replayResult.structuredContent as Record<string, unknown>).agentId,
+    startStructured.agentId,
+  );
+
+  const replayConflict = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "materially different prompt",
+      attemptKey: "server-functional-attempt",
+    },
+  });
+  assert.equal(replayConflict.isError, true);
+  assert.match(responseText(replayConflict), /materially different request/);
+
+  // Call agent_status
+  const statusResult = await context.client.callTool({
+    name: "agent_status",
+    arguments: {
+      workspaceId,
+      agentId: startStructured.agentId,
+      waitMs: 0,
+    },
+  });
+
+  const statusStructured = statusResult.structuredContent as Record<string, any>;
+  assert.equal(statusStructured.agentId, startStructured.agentId);
+  assert.equal(statusStructured.status, "starting");
+
+  // Call agent_list
+  const listResult = await context.client.callTool({
+    name: "agent_list",
+    arguments: {
+      workspaceId,
+      limit: 10,
+    },
+  });
+
+  const listStructured = listResult.structuredContent as { agents: any[] };
+  assert.equal(listStructured.agents.length, 1);
+  assert.equal(listStructured.agents[0].agentId, startStructured.agentId);
+  assert.equal(listStructured.agents[0].latestResponse, undefined); // Excluded
+
+  // Test agent_continue
+  // Update status to idle using a fresh store connection
+  const { LocalAgentStore } = await import("./local-agent-store.js");
+  const store = new LocalAgentStore(context.stateDir);
+  try {
+    store.update(startStructured.agentId, { status: "idle" });
+  } finally {
+    store.close();
+  }
+
+  const continueResult = await context.client.callTool({
+    name: "agent_continue",
+    arguments: {
+      workspaceId,
+      agentId: startStructured.agentId,
+      prompt: "hello follow up prompt",
+    },
+  });
+
+  const continueStructured = continueResult.structuredContent as Record<string, any>;
+  assert.equal(continueStructured.agentId, startStructured.agentId);
+  assert.equal(continueStructured.status, "starting");
+  assert.equal(continueStructured.continued, true);
+
+  // Verify list count is still 1 (no duplicate record created)
+  const listResultAfter = await context.client.callTool({
+    name: "agent_list",
+    arguments: {
+      workspaceId,
+      limit: 10,
+    },
+  });
+  const listStructuredAfter = listResultAfter.structuredContent as { agents: any[] };
+  assert.equal(listStructuredAfter.agents.length, 1);
+  assert.equal(listStructuredAfter.agents[0].agentId, startStructured.agentId);
+
+  const cancelResult = await context.client.callTool({
+    name: "agent_cancel",
+    arguments: {
+      workspaceId,
+      agentId: startStructured.agentId,
+    },
+  });
+  const cancelStructured = cancelResult.structuredContent as Record<string, any>;
+  assert.equal(cancelStructured.agentId, startStructured.agentId);
+  assert.equal(cancelStructured.status, "stopped");
+  assert.equal(cancelStructured.terminal, true);
+});
+
+test("subagents: unknown/invalid workspaceId fails closed before durable-agent access", async (t) => {
+  const context = await fixture(t, { subagents: true });
+  const invalidWorkspaceId = "ws_invalid_nonexistent";
+
+  // 1. agent_start with invalid workspaceId fails closed
+  const startRes = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId: invalidWorkspaceId,
+      profile: "reviewer",
+      prompt: "fail prompt",
+    },
+  });
+  assert.equal(startRes.isError, true);
+  assert.match(responseText(startRes), /Unknown workspace/);
+
+  // 2. agent_status with invalid workspaceId fails closed
+  const statusRes = await context.client.callTool({
+    name: "agent_status",
+    arguments: {
+      workspaceId: invalidWorkspaceId,
+      agentId: "agt_12345678",
+    },
+  });
+  assert.equal(statusRes.isError, true);
+  assert.match(responseText(statusRes), /Unknown workspace/);
+
+  // 3. agent_continue with invalid workspaceId fails closed
+  const continueRes = await context.client.callTool({
+    name: "agent_continue",
+    arguments: {
+      workspaceId: invalidWorkspaceId,
+      agentId: "agt_12345678",
+      prompt: "continue prompt",
+    },
+  });
+  assert.equal(continueRes.isError, true);
+  assert.match(responseText(continueRes), /Unknown workspace/);
+
+  // 4. agent_cancel with invalid workspaceId fails closed
+  const cancelRes = await context.client.callTool({
+    name: "agent_cancel",
+    arguments: {
+      workspaceId: invalidWorkspaceId,
+      agentId: "agt_12345678",
+    },
+  });
+  assert.equal(cancelRes.isError, true);
+  assert.match(responseText(cancelRes), /Unknown workspace/);
+
+  // 5. agent_list with invalid workspaceId fails closed
+  const listRes = await context.client.callTool({
+    name: "agent_list",
+    arguments: {
+      workspaceId: invalidWorkspaceId,
+    },
+  });
+  assert.equal(listRes.isError, true);
+  assert.match(responseText(listRes), /Unknown workspace/);
+});
+
+test("subagents: agent_preflight returns structured readiness without secrets", async (t) => {
+  const context = await fixture(t, { git: true, subagents: true });
+  const openResult = await callOpen(context.client, context.project, "chat-preflight");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+
+  const preflightResult = await context.client.callTool({
+    name: "agent_preflight",
+    arguments: { workspaceId, profile: "reviewer" },
+  });
+  assert.equal(preflightResult.isError, undefined);
+  const preflight = structuredContent(preflightResult);
+  assert.equal((preflight.workspace as Record<string, unknown>).isolated, false);
+  assert.equal((preflight.workspace as Record<string, unknown>).dirty, false);
+  assert.equal((preflight.worker as Record<string, unknown>).profile, "reviewer");
+  const readiness = preflight.readiness as Record<string, unknown>;
+  assert.equal(readiness.profileResolved, true);
+  assert.equal(readiness.authReady, "unknown");
+  assert.equal(readiness.providerReachable, "unknown");
+  assert.equal(readiness.dispatchState, "UNKNOWN");
+  const serialized = JSON.stringify(preflight);
+  assert.ok(!serialized.includes("test-owner-token"));
+  assert.ok(!serialized.includes("DEVSPACE_OAUTH"));
+});
+
+test("subagents: agent_start executionContract expectedHead mismatch fails closed", async (t) => {
+  const context = await fixture(t, { git: true, subagents: true });
+  const openResult = await callOpen(context.client, context.project, "chat-contract");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+
+  const staleResult = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "work",
+      executionContract: { expectedHead: "a".repeat(40), writePaths: ["src"] },
+    },
+  });
+  assert.equal(staleResult.isError, true);
+  assert.match(responseText(staleResult), /expected HEAD|stale workspace/i);
+
+  const head = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: context.project });
+  const startResult = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "work",
+      executionContract: { expectedHead: head.stdout.trim(), writePaths: ["src"] },
+    },
+  });
+  assert.equal(startResult.isError, undefined);
+  assert.equal((structuredContent(startResult) as Record<string, unknown>).status, "starting");
+});
+
+test("subagents: agent_reconcile reports physical diff as candidate evidence", async (t) => {
+  const context = await fixture(t, { git: true, subagents: true });
+  const openResult = await callOpen(context.client, context.project, "chat-reconcile");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+
+  const startResult = await context.client.callTool({
+    name: "agent_start",
+    arguments: { workspaceId, profile: "reviewer", prompt: "do work" },
+  });
+  const agentId = (structuredContent(startResult) as Record<string, unknown>).agentId as string;
+
+  await writeFile(join(context.project, "candidate.ts"), "export const x = 1;\n");
+
+  const reconcileResult = await context.client.callTool({
+    name: "agent_reconcile",
+    arguments: { workspaceId, agentId },
+  });
+  assert.equal(reconcileResult.isError, undefined);
+  const reconciled = structuredContent(reconcileResult);
+  assert.equal((reconciled.agentId as string), agentId);
+  const candidate = reconciled.candidate as Record<string, unknown>;
+  assert.equal(candidate.present, true);
+  assert.ok((candidate.changedPaths as string[]).includes("candidate.ts"));
+  assert.equal(candidate.scopeState, "UNKNOWN");
+
+  const statusResult = await context.client.callTool({
+    name: "agent_status",
+    arguments: { workspaceId, agentId },
+  });
+  const status = structuredContent(statusResult) as Record<string, unknown>;
+  assert.ok(typeof status.startedAt === "string");
+  assert.ok(typeof status.wallMs === "number");
+});
+
+test("subagents: workspace_verify always present, returns structured TOOLCHAIN_UNAVAILABLE without config", async (t) => {
+  const context = await fixture(t, { subagents: true });
+  const tools = await context.client.listTools();
+  assert.equal(tools.tools.some((tool) => tool.name === "workspace_verify"), true);
+  const verifyTool = tools.tools.find((tool) => tool.name === "workspace_verify");
+  assert.equal(verifyTool?.annotations?.readOnlyHint, false);
+  assert.equal(verifyTool?.annotations?.destructiveHint, true);
+
+  const openResult = await callOpen(context.client, context.project, "chat-verify-unconfigured");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+
+  const unconfigured = await context.client.callTool({
+    name: "workspace_verify",
+    arguments: { workspaceId, toolchainId: "nexus-python", verifier: "pytest", args: [] },
+  });
+  assert.equal(unconfigured.isError, undefined);
+  const body = structuredContent(unconfigured);
+  assert.equal(body.ok, false);
+  const error = body.error as Record<string, unknown>;
+  assert.equal(error.code, "TOOLCHAIN_UNAVAILABLE");
+  assert.match(responseText(unconfigured), /TOOLCHAIN_UNAVAILABLE/);
+});
+
+test("subagents: workspace_verify structured TOOLCHAIN_UNAVAILABLE when a toolchain exists but the verifier does not", async (t) => {
+  const toolchainRoot = await mkdtemp(join(tmpdir(), "devspace-server-toolchain-"));
+  const toolchains = JSON.stringify([
+    { id: "nexus-python", root: toolchainRoot, verifiers: { pytest: ".venv/bin/pytest" } },
+  ]);
+  const context = await fixture(t, { subagents: true, toolchains });
+  try {
+    const tools = await context.client.listTools();
+    assert.equal(tools.tools.some((tool) => tool.name === "workspace_verify"), true);
+
+    const openResult = await callOpen(context.client, context.project, "chat-verify-unresolved");
+    const workspaceId = structuredContent(openResult).workspaceId as string;
+
+    const unconfigured = await context.client.callTool({
+      name: "workspace_verify",
+      arguments: { workspaceId, toolchainId: "nexus-python", verifier: "ruff", args: [] },
+    });
+    assert.equal(unconfigured.isError, undefined);
+    const body = structuredContent(unconfigured);
+    assert.equal(body.ok, false);
+    assert.equal((body.error as Record<string, unknown>).code, "TOOLCHAIN_UNAVAILABLE");
+  } finally {
+    await rm(toolchainRoot, { recursive: true, force: true });
+  }
+});
+
+test("subagents: workspace_verify executes a configured verifier normally", async (t) => {
+  const toolchainRoot = await mkdtemp(join(tmpdir(), "devspace-server-toolchain-"));
+  const bin = join(toolchainRoot, ".venv", "bin");
+  await mkdir(bin, { recursive: true });
+  const verifierPath = join(bin, "pytest");
+  await writeFile(verifierPath, "#!/bin/sh\necho \"verifier-ran\"\nexit 0\n", { mode: 0o755 });
+  chmodSync(verifierPath, 0o755);
+  const toolchains = JSON.stringify([
+    { id: "nexus-python", root: toolchainRoot, verifiers: { pytest: ".venv/bin/pytest" } },
+  ]);
+  const context = await fixture(t, { git: true, subagents: true, toolchains });
+  try {
+    const openResult = await callOpen(context.client, context.project, "chat-verify-ok");
+    const workspaceId = structuredContent(openResult).workspaceId as string;
+
+    const result = await context.client.callTool({
+      name: "workspace_verify",
+      arguments: { workspaceId, toolchainId: "nexus-python", verifier: "pytest", args: ["-q"] },
+    });
+    assert.equal(result.isError, undefined);
+    const body = structuredContent(result);
+    assert.equal(body.ok, true);
+    assert.equal(body.exitCode, 0);
+    assert.equal(body.toolchainId, "nexus-python");
+    assert.match(body.stdout as string, /verifier-ran/);
+    assert.match(responseText(result), /exited with code 0/);
+  } finally {
+    await rm(toolchainRoot, { recursive: true, force: true });
+  }
+});
+
+test("gitCandidates disabled: git tools are absent", async (t) => {
+  const context = await fixture(t, { gitCandidates: false });
+  const tools = await context.client.listTools();
+  const gitTools = tools.tools.filter((tool) => tool.name.startsWith("git_"));
+  assert.equal(gitTools.length, 0);
+});
+
+test("gitCandidates enabled: git tools are present with schema validation", async (t) => {
+  const context = await fixture(t, { git: true, gitCandidates: true });
+  const tools = await context.client.listTools();
+  const gitTools = tools.tools.filter((tool) => tool.name.startsWith("git_"));
+  assert.equal(gitTools.length, 2);
+
+  const commitTool = gitTools.find((tool) => tool.name === "git_commit");
+  const pushTool = gitTools.find((tool) => tool.name === "git_push");
+
+  assert.ok(commitTool);
+  assert.ok(pushTool);
+
+  // Security schemas verification: NO workspaceRoot, cwd, remoteUrl, refspec, rawArgs, force, noVerify, delete, all
+  const commitProps = commitTool.inputSchema.properties as Record<string, any>;
+  assert.equal(commitProps.workspaceRoot, undefined);
+  assert.equal(commitProps.cwd, undefined);
+  assert.equal(commitProps.rawArgs, undefined);
+  assert.equal(commitProps.force, undefined);
+  assert.equal(commitProps.noVerify, undefined);
+
+  const pushProps = pushTool.inputSchema.properties as Record<string, any>;
+  assert.equal(pushProps.workspaceRoot, undefined);
+  assert.equal(pushProps.remoteUrl, undefined);
+  assert.equal(pushProps.refspec, undefined);
+  assert.equal(pushProps.force, undefined);
+  assert.equal(pushProps.delete, undefined);
+  assert.equal(pushProps.all, undefined);
+
+  // Annotations check
+  assert.equal(commitTool.annotations?.readOnlyHint, false);
+  assert.equal(commitTool.annotations?.destructiveHint, true);
+  assert.equal(commitTool.annotations?.idempotentHint, false);
+  assert.equal(commitTool.annotations?.openWorldHint, false);
+
+  assert.equal(pushTool.annotations?.readOnlyHint, false);
+  assert.equal(pushTool.annotations?.destructiveHint, true);
+  assert.equal(pushTool.annotations?.idempotentHint, false);
+  assert.equal(pushTool.annotations?.openWorldHint, true);
+
+  // Open workspace in default checkout mode
+  const openResult = await callOpen(context.client, context.project, "chat-1", "checkout");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+  assert.ok(workspaceId);
+
+  const res = await context.client.callTool({
+    name: "git_commit",
+    arguments: {
+      workspaceId,
+      expectedHead: "a".repeat(40),
+      message: "test",
+      paths: ["README.md"],
+    },
+  });
+  assert.equal(res.isError, true);
+  assert.match(responseText(res), /GIT_MANAGED_WORKTREE_REQUIRED/);
+});
+
+test("git candidates tools - MCP managed worktree end-to-end integration test", async (t) => {
+  const context = await fixture(t, { git: true, gitCandidates: true });
+
+  // 1. Create a remote bare repository in the temp root
+  const bareDir = join(context.project, "../bare.git");
+  await mkdir(bareDir, { recursive: true });
+  await execFileAsync("git", ["init", "--bare", "--initial-branch=main"], { cwd: bareDir });
+
+  // 2. Point our local project's origin to this bare repo and push main
+  await execFileAsync("git", ["remote", "add", "origin", bareDir], { cwd: context.project });
+  await execFileAsync("git", ["push", "origin", "main"], { cwd: context.project });
+
+  // 3. Open via MCP in worktree mode - DevSpace will create a managed worktree internally
+  const openRes = await context.client.callTool({
+    name: "open_workspace",
+    arguments: { path: context.project, mode: "worktree" },
+  });
+  assert.equal(openRes.isError, undefined);
+  const ws = structuredContent(openRes);
+  const workspaceId = ws.workspaceId as string;
+  assert.ok(workspaceId);
+  assert.equal(ws.mode, "worktree");
+  assert.equal((ws.worktree as any)?.managed, true);
+
+  // 4. The actual managed worktree path is in ws.root
+  const worktreeRoot = ws.root as string;
+  assert.ok(worktreeRoot);
+
+  // Configure git identity in the managed worktree
+  await execFileAsync("git", ["config", "user.email", "mcp-test@example.com"], { cwd: worktreeRoot });
+  await execFileAsync("git", ["config", "user.name", "MCP Test User"], { cwd: worktreeRoot });
+  await execFileAsync("git", ["config", "remote.origin.url", bareDir], { cwd: worktreeRoot });
+
+  const initialHead = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: worktreeRoot })).stdout.trim();
+
+  // 5. Write a file in the managed worktree
+  await writeFile(join(worktreeRoot, "mcp-canary.txt"), "mcp content\n");
+
+  // 6. Execute git_commit via MCP
+  const commitRes = await context.client.callTool({
+    name: "git_commit",
+    arguments: {
+      workspaceId,
+      expectedHead: initialHead,
+      message: "feat: add mcp-canary.txt",
+      paths: ["mcp-canary.txt"],
+    },
+  });
+  assert.equal(commitRes.isError, undefined);
+  const commitResult = structuredContent(commitRes);
+  const commitSha = commitResult.commitSha as string;
+  assert.ok(commitSha);
+  assert.notEqual(commitSha, initialHead);
+  assert.equal(commitResult.previousHead, initialHead);
+
+  // 7. Execute git_push via MCP
+  const pushRes = await context.client.callTool({
+    name: "git_push",
+    arguments: {
+      workspaceId,
+      expectedHead: commitSha,
+      remote: "origin",
+      branch: "candidate/mcp-test-1",
+    },
+  });
+  assert.equal(pushRes.isError, undefined);
+  const pushResult = structuredContent(pushRes);
+  assert.equal(pushResult.remote, "origin");
+  assert.equal(pushResult.branch, "candidate/mcp-test-1");
+  assert.equal(pushResult.pushedSha, commitSha);
+
+  // 8. Verify the bare repo SHA equals the committed & pushed SHA
+  const { stdout: bareSha } = await execFileAsync("git", ["rev-parse", "refs/heads/candidate/mcp-test-1"], { cwd: bareDir });
+  assert.equal(bareSha.trim(), commitSha);
+});

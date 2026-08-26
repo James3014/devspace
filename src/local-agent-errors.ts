@@ -447,10 +447,12 @@ function displayProvider(provider: LocalAgentProvider): string {
     case "codex": return "Codex";
     case "claude": return "Claude";
     case "opencode": return "OpenCode";
+    case "omp": return "OMP";
     case "pi": return "Pi";
     case "cursor": return "Cursor";
     case "copilot": return "Copilot";
     case "grok": return "Grok";
+    case "agy": return "Agy";
   }
 }
 

@@ -18,6 +18,12 @@ import express from "express";
 import type { Request, Response } from "express";
 import * as z from "zod/v4";
 import { applyPatch } from "./apply-patch.js";
+import { commitCandidate, pushCandidate, GitCandidateError } from "./git-candidate.js";
+import {
+  integrateCandidate,
+  inspectIntegrationReadiness,
+  probeRemoteWritability,
+} from "./git-integration.js";
 import {
   isArtifactDownloadSupportedPlatform,
   registerArtifactTools,
@@ -49,13 +55,19 @@ import {
   type McpSessionCloseResult,
 } from "./mcp-sessions.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
+import {
+  CodexGoalSessionManager,
+  type CodexGoalState,
+} from "./codex-goal-sessions.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { openAiConversationScopeId } from "./request-meta.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
+import { summarizeLocalAgentProfile, loadLocalAgentProfiles } from "./local-agent-profiles.js";
 import {
+  formatLocalAgentProviderAvailabilitySummary,
   getLocalAgentProviderAvailabilitySnapshot,
 } from "./local-agent-availability.js";
 import {
@@ -64,12 +76,23 @@ import {
   formatLocalAgentProviderStatusSummary,
   type LocalAgentProviderStatus,
 } from "./local-agent-catalog.js";
+import {
+  LocalAgentSessionManager,
+  AgentSessionError,
+  isTerminalStatus,
+  AGENT_STATUS_MAX_WAIT_MS,
+  AGENT_LIST_MAX_LIMIT,
+  AGENT_LIST_DEFAULT_LIMIT,
+} from "./local-agent-sessions.js";
+import { parseExecutionContract } from "./local-agent-contract.js";
+import { runToolchainVerifier, resolveToolchainExecutable } from "./local-agent-toolchains.js";
 
 type Transport = StreamableHTTPServerTransport;
 // MCP clients can reconnect without closing the previous transport. Bound stale
 // session retention so abandoned MCP servers do not accumulate for the life of the process.
 const MCP_SESSION_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
+const AGENT_SUPERVISION_INTERVAL_MS = 2_000;
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
 const WRITE_TOOL_ANNOTATIONS = {
@@ -202,8 +225,20 @@ function serverInstructions(config: ServerConfig): string {
       ? " If the turn successfully modifies files by creating, editing, overwriting, deleting, moving, or applying patches, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. Do not call it after every individual file change; do not skip it because individual file-change tools already returned diffs."
       : "";
 
+  const agentToolsInstruction = config.subagents
+    ? " Use agent_start to launch an advertised agent profile as a background subagent. Use agent_status to retrieve result or progress. Use agent_continue for evidence-guided repair in the same session. Use agent_cancel to stop the exact owned worker. Use agent_list to inspect current workspace agent sessions. Do NOT use bash to call `devspace agents` when native agent tools are available."
+    : "";
+
+  const gitCandidatesInstruction = config.gitCandidatesEnabled
+    ? " Use git_commit to form a scoped Candidate from exact paths. Use git_push to publish Candidate HEAD to a non-default branch. Do not use bash for git mutation."
+    : "";
+
+  const codexGoalsInstruction = config.codexGoalsEnabled
+    ? " When a task should be delegated to the real interactive Codex CLI, use codex_goal_start to launch a /goal session in an open workspace, then poll codex_goal_status, send follow-ups with codex_goal_continue, and stop it with codex_goal_cancel."
+    : "";
+
   if (config.toolMode === "codex") {
-    return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}`;
+    return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}${agentToolsInstruction}${gitCandidatesInstruction}${codexGoalsInstruction}`;
   }
 
   const inspection = config.toolMode !== "full"
@@ -216,7 +251,7 @@ function serverInstructions(config: ServerConfig): string {
 
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
 
-  return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}`;
+  return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}${agentToolsInstruction}${gitCandidatesInstruction}${codexGoalsInstruction}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -272,6 +307,9 @@ const workspaceLocalAgentOutputSchema = z.object({
   provider: z.string(),
   model: z.string().optional(),
   effort: z.string().optional(),
+  write_mode: z.enum(["read_only", "allowed"]).optional(),
+  providerAvailable: z.boolean().optional(),
+  providerUnavailableReason: z.string().optional(),
 });
 
 const workspaceLocalAgentProviderOutputSchema = z.object({
@@ -704,6 +742,273 @@ function registerCodexProcessTools(
   );
 }
 
+function codexGoalStateStructured(state: CodexGoalState): Record<string, unknown> {
+  return {
+    goalId: state.goalId,
+    workspaceId: state.workspaceId,
+    running: state.running,
+    terminal: state.terminal,
+    exitCode: state.exitCode,
+    signal: state.signal,
+    goalActiveObserved: state.goalActiveObserved,
+    wallTimeMs: state.wallTimeMs,
+    outputChunk: state.outputChunk,
+    outputTruncated: state.outputTruncated,
+    model: state.model,
+    reasoningEffort: state.reasoningEffort,
+    baseHead: state.baseHead,
+    terminalReason: state.terminalReason,
+  };
+}
+
+function codexGoalResultText(action: string, state: CodexGoalState): string {
+  const status = state.terminal
+    ? `terminal (${state.terminalReason ?? "exited"}, exitCode=${state.exitCode ?? "unknown"})`
+    : state.goalActiveObserved
+      ? "running with Goal Mode active"
+      : "running";
+  const output = state.outputChunk.trim();
+  return [
+    `Codex goal ${state.goalId} ${action}: ${status}.`,
+    output ? `Output:\n${output}` : undefined,
+  ].filter(Boolean).join("\n");
+}
+
+function registerCodexGoalTools(
+  server: McpServer,
+  config: ServerConfig,
+  workspaces: WorkspaceRegistry,
+  goals: CodexGoalSessionManager,
+): void {
+  const GOAL_START_ANNOTATIONS = {
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: false,
+    openWorldHint: true,
+  };
+
+  registerAppTool(
+    server,
+    "codex_goal_start",
+    {
+      title: "Start Codex goal",
+      description:
+        "Launch a real interactive Codex CLI session in an open workspace and activate its /goal mode with the given goal text. Runs the actual Codex CLI binary in a PTY inside the exact opened workspace; never uses bash or the Codex SDK. Git workspaces must be clean and must provide expectedHead matching the current Git HEAD. Only one active Codex goal is allowed per workspace.",
+      inputSchema: {
+        workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+        goal: z
+          .string()
+          .min(1)
+          .max(20_000)
+          .describe("Goal text passed to the interactive /goal command."),
+        model: z.string().optional().describe("Codex model to select (for example gpt-5.6-sol). Omit for the CLI default."),
+        reasoningEffort: z
+          .enum(["minimal", "low", "medium", "high", "xhigh"])
+          .optional()
+          .describe("Reasoning effort for the selected model."),
+        expectedHead: z
+          .string()
+          .regex(/^[0-9a-fA-F]{40}$/, "expectedHead must be a valid 40-character commit SHA.")
+          .optional()
+          .describe("Exact 40-character Git HEAD the workspace must be at before launch. Required for Git workspaces; start fails closed when missing or mismatched."),
+      },
+      outputSchema: {
+        goalId: z.string(),
+        workspaceId: z.string(),
+        running: z.boolean(),
+        terminal: z.boolean(),
+        exitCode: z.number().int().optional(),
+        signal: z.string().optional(),
+        goalActiveObserved: z.boolean(),
+        wallTimeMs: z.number().nonnegative(),
+        outputChunk: z.string(),
+        outputTruncated: z.boolean(),
+        model: z.string().optional(),
+        reasoningEffort: z.string().optional(),
+        baseHead: z.string().optional(),
+        terminalReason: z.string().optional(),
+      },
+      _meta: {},
+      annotations: GOAL_START_ANNOTATIONS,
+    },
+    async ({ workspaceId, goal, model, reasoningEffort, expectedHead }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      let state: CodexGoalState;
+      try {
+        state = await goals.start({
+          workspaceId,
+          workspaceRoot: workspace.root,
+          goal,
+          ...(model ? { model } : {}),
+          ...(reasoningEffort ? { reasoningEffort } : {}),
+          ...(expectedHead ? { expectedHead } : {}),
+        });
+      } catch (error) {
+        logFailedToolResponse(config, {
+          tool: "codex_goal_start",
+          workspaceId,
+        }, [textBlock(error instanceof Error ? error.message : String(error))], startedAt);
+        throw error;
+      }
+      logToolCall(config, {
+        tool: "codex_goal_start",
+        workspaceId,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        content: [textBlock(codexGoalResultText("started", state))],
+        structuredContent: codexGoalStateStructured(state),
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "codex_goal_status",
+    {
+      title: "Codex goal status",
+      description:
+        "Poll one exact Codex CLI goal session owned by this workspace. Returns running/terminal state, whether Goal Mode was observed active, wall time, and new output since the last poll. Never creates a replacement Codex process.",
+      inputSchema: {
+        workspaceId: z.string().describe("Workspace identifier used to start the goal."),
+        goalId: z.string().describe("Exact goal ID returned by codex_goal_start."),
+        waitMs: z.number().int().min(0).max(30_000).optional().describe("Milliseconds to poll for new output. Default 0."),
+      },
+      outputSchema: {
+        goalId: z.string(),
+        workspaceId: z.string(),
+        running: z.boolean(),
+        terminal: z.boolean(),
+        exitCode: z.number().int().optional(),
+        signal: z.string().optional(),
+        goalActiveObserved: z.boolean(),
+        wallTimeMs: z.number().nonnegative(),
+        outputChunk: z.string(),
+        outputTruncated: z.boolean(),
+        model: z.string().optional(),
+        reasoningEffort: z.string().optional(),
+        baseHead: z.string().optional(),
+        terminalReason: z.string().optional(),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: true },
+    },
+    async ({ workspaceId, goalId, waitMs }) => {
+      workspaces.getWorkspace(workspaceId);
+      const state = await goals.status(workspaceId, goalId, { waitMs });
+      return {
+        content: [textBlock(codexGoalResultText("status", state))],
+        structuredContent: codexGoalStateStructured(state),
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "codex_goal_continue",
+    {
+      title: "Continue Codex goal",
+      description:
+        "Send a follow-up message into the same live Codex CLI goal session. Rejects unknown, cross-workspace, or already-terminal goals and never spawns a second Codex process.",
+      inputSchema: {
+        workspaceId: z.string().describe("Workspace identifier used to start the goal."),
+        goalId: z.string().describe("Exact goal ID returned by codex_goal_start."),
+        message: z.string().min(1).max(20_000).describe("Follow-up message for the active goal."),
+      },
+      outputSchema: {
+        goalId: z.string(),
+        workspaceId: z.string(),
+        running: z.boolean(),
+        terminal: z.boolean(),
+        exitCode: z.number().int().optional(),
+        signal: z.string().optional(),
+        goalActiveObserved: z.boolean(),
+        wallTimeMs: z.number().nonnegative(),
+        outputChunk: z.string(),
+        outputTruncated: z.boolean(),
+        model: z.string().optional(),
+        reasoningEffort: z.string().optional(),
+        baseHead: z.string().optional(),
+        terminalReason: z.string().optional(),
+      },
+      _meta: {},
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: true,
+      },
+    },
+    async ({ workspaceId, goalId, message }) => {
+      workspaces.getWorkspace(workspaceId);
+      const state = await goals.continue(workspaceId, goalId, message);
+      logToolCall(config, {
+        tool: "codex_goal_continue",
+        workspaceId,
+        success: true,
+        durationMs: 0,
+      });
+      return {
+        content: [textBlock(codexGoalResultText("continued", state))],
+        structuredContent: codexGoalStateStructured(state),
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "codex_goal_cancel",
+    {
+      title: "Cancel Codex goal",
+      description:
+        "Terminate exactly the Codex CLI process owned by this goal session. Cancelling an already-terminal goal returns its preserved final state. Repeated calls are safe.",
+      inputSchema: {
+        workspaceId: z.string().describe("Workspace identifier used to start the goal."),
+        goalId: z.string().describe("Exact goal ID returned by codex_goal_start."),
+      },
+      outputSchema: {
+        goalId: z.string(),
+        workspaceId: z.string(),
+        running: z.boolean(),
+        terminal: z.boolean(),
+        exitCode: z.number().int().optional(),
+        signal: z.string().optional(),
+        goalActiveObserved: z.boolean(),
+        wallTimeMs: z.number().nonnegative(),
+        outputChunk: z.string(),
+        outputTruncated: z.boolean(),
+        model: z.string().optional(),
+        reasoningEffort: z.string().optional(),
+        baseHead: z.string().optional(),
+        terminalReason: z.string().optional(),
+      },
+      _meta: {},
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async ({ workspaceId, goalId }) => {
+      workspaces.getWorkspace(workspaceId);
+      const state = await goals.cancel(workspaceId, goalId);
+      logToolCall(config, {
+        tool: "codex_goal_cancel",
+        workspaceId,
+        success: true,
+        durationMs: 0,
+      });
+      return {
+        content: [textBlock(codexGoalResultText("cancelled", state))],
+        structuredContent: codexGoalStateStructured(state),
+      };
+    },
+  );
+}
+
 export function createMcpServer(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
@@ -711,6 +1016,8 @@ export function createMcpServer(
   processSessions: ProcessSessionManager,
   resolveLocalAgentProviders: () => LocalAgentProviderStatus[],
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
+  agentSessionManager?: LocalAgentSessionManager,
+  codexGoals?: CodexGoalSessionManager,
 ): McpServer {
   const server = new McpServer(
     {
@@ -1568,9 +1875,14 @@ export function createMcpServer(
     toolNames.shell,
     {
       title: "Bash",
-      description: config.toolMode !== "full"
-        ? `Run a shell command in a workspace. Use only for tests, builds, git inspection, package scripts, search, file discovery, and directory inspection. In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use command-line tools such as grep, rg, find, ls, and tree for those read-only inspection actions. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read} for direct file reads. This is powerful execution and should only be exposed behind strong authentication.`
-        : `Run a shell command in a workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. This is powerful execution and should only be exposed behind strong authentication.`,
+      description: config.subagents.enabled
+        ? (config.toolMode !== "full"
+          ? `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, search, file discovery, and directory inspection. In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use command-line tools such as grep, rg, find, ls, and tree for those read-only inspection actions. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read} for direct file reads. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication. Do not use bash to call \`devspace agents\` when native agent tools are available.`
+          : `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication. Do not use bash to call \`devspace agents\` when native agent tools are available.`)
+        : (config.toolMode !== "full"
+          ? `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, search, file discovery, and directory inspection. In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use command-line tools such as grep, rg, find, ls, and tree for those read-only inspection actions. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read} for direct file reads. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`
+          : `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`),
+
       inputSchema: {
         workspaceId: z
           .string()
@@ -1658,12 +1970,837 @@ export function createMcpServer(
     registerCodexProcessTools(server, config, workspaces, processSessions);
   }
 
+  // Narrow opt-in Codex Goal capability. Available in every tool mode, but it
+  // exposes only special-purpose goal actions; generic exec_command/write_stdin
+  // stay hidden outside codex mode.
+  if (config.codexGoalsEnabled && codexGoals) {
+    registerCodexGoalTools(server, config, workspaces, codexGoals);
+  }
+
   if (config.artifactsEnabled && isArtifactDownloadSupportedPlatform()) {
     registerArtifactTools(server, {
       config,
       workspaces,
       incomingArtifactAdapters,
     });
+  }
+
+  // ── Native Agent MCP Tools (only when subagents enabled) ──────────────────
+  if (config.subagents && agentSessionManager) {
+    const AGENT_TOOL_ANNOTATIONS_WRITE = {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: false,
+      openWorldHint: true,
+    };
+
+    registerAppTool(
+      server,
+      "agent_start",
+      {
+        title: "Start agent",
+        description:
+          "Start a bounded background subagent using an advertised agent profile in an already-open workspace. Returns immediately with a durable agent ID. Use agent_status to retrieve progress/result.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          profile: z.string().describe("Name of an advertised agent profile to run."),
+          prompt: z.string().describe("Task prompt for the agent."),
+          attemptKey: z
+            .string()
+            .regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
+            .optional()
+            .describe("Optional physical-workspace-scoped replay identity. Exact request replays reuse one durable agent; conflicting reuse fails closed."),
+          executionContract: z
+            .object({
+              expectedHead: z
+                .string()
+                .describe("40-character commit SHA. If supplied, agent_start fails closed when workspace HEAD no longer matches."),
+              writePaths: z
+                .array(z.string())
+                .describe("Exact intended writable paths relative to the workspace root. Observed and aborted on violation; not a hard sandbox."),
+              maxFiles: z
+                .number()
+                .int()
+                .min(1)
+                .describe("Maximum number of files the worker may change."),
+              toolchainId: z
+                .string()
+                .describe("Toolchain id used to resolve verifier executables. Must already be configured; Dev MCP does not install toolchains."),
+              maxWallMs: z
+                .number()
+                .int()
+                .min(1)
+                .describe("Optional wall-clock bound for the whole agent turn."),
+              idleTimeoutMs: z
+                .number()
+                .int()
+                .min(1)
+                .describe("Recorded and surfaced; not auto-enforced (no mid-run activity signal)."),
+            })
+            .partial()
+            .optional()
+            .describe("Optional structured execution contract. Records and enforces where/how the worker may run."),
+        },
+        outputSchema: {
+          agentId: z.string(),
+          status: z.string(),
+          profileName: z.string(),
+          provider: z.string(),
+          model: z.string().optional(),
+          thinking: z.string().optional(),
+          workspaceId: z.string().optional(),
+          workspaceRoot: z.string(),
+          createdAt: z.string(),
+          updatedAt: z.string(),
+        },
+        _meta: {},
+        annotations: AGENT_TOOL_ANNOTATIONS_WRITE,
+      },
+      async ({ workspaceId, profile, prompt, attemptKey, executionContract }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const profiles = await loadLocalAgentProfiles(config, workspace.root);
+        let contract;
+        try {
+          contract = parseExecutionContract(executionContract);
+        } catch (error) {
+          throw new AgentSessionError(
+            "INVALID_EXECUTION_CONTRACT",
+            error instanceof Error ? error.message : String(error),
+          );
+        }
+        const output = await agentSessionManager.startAgent({
+          workspaceId,
+          workspaceRoot: workspace.root,
+          profileName: profile,
+          prompt,
+          profiles,
+          attemptKey,
+          executionContract: contract,
+        });
+        logToolCall(config, {
+          tool: "agent_start",
+          workspaceId,
+          success: true,
+          durationMs: 0,
+        });
+        return {
+          content: [textBlock(`Started agent ${output.agentId} (${output.profileName}). Use agent_status to check progress.`)],
+          structuredContent: output as unknown as Record<string, unknown>,
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
+      "agent_continue",
+      {
+        title: "Continue agent",
+        description:
+          "Continue one exact durable subagent session in the same physical workspace. Reuses the provider session/conversation and returns immediately.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          agentId: z.string().describe("Exact agent ID returned by agent_start."),
+          prompt: z.string().describe("Follow-up prompt for the agent."),
+        },
+        outputSchema: {
+          agentId: z.string(),
+          status: z.string(),
+          profileName: z.string(),
+          provider: z.string(),
+          model: z.string().optional(),
+          thinking: z.string().optional(),
+          workspaceId: z.string().optional(),
+          workspaceRoot: z.string(),
+          createdAt: z.string(),
+          updatedAt: z.string(),
+          continued: z.boolean(),
+        },
+        _meta: {},
+        annotations: AGENT_TOOL_ANNOTATIONS_WRITE,
+      },
+      async ({ workspaceId, agentId, prompt }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const output = await agentSessionManager.continueAgent({
+          workspaceId,
+          workspaceRoot: workspace.root,
+          agentId,
+          prompt,
+        });
+        logToolCall(config, {
+          tool: "agent_continue",
+          workspaceId,
+          success: true,
+          durationMs: 0,
+        });
+        return {
+          content: [textBlock(`Continuing agent ${output.agentId} (${output.profileName}). Use agent_status to check progress.`)],
+          structuredContent: output as unknown as Record<string, unknown>,
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
+      "agent_status",
+      {
+        title: "Agent status",
+        description:
+          "Retrieve the status and result of a durable subagent session. Optionally poll for up to waitMs milliseconds.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          agentId: z.string().describe("Exact agent ID returned by agent_start."),
+          waitMs: z
+            .number()
+            .int()
+            .min(0)
+            .max(AGENT_STATUS_MAX_WAIT_MS)
+            .optional()
+            .describe(`Milliseconds to poll for completion. Default 0, max ${AGENT_STATUS_MAX_WAIT_MS}.`),
+        },
+        outputSchema: {
+          agentId: z.string(),
+          workspaceId: z.string().optional(),
+          workspaceRoot: z.string(),
+          profileName: z.string(),
+          provider: z.string(),
+          model: z.string().optional(),
+          thinking: z.string().optional(),
+          providerSessionId: z.string().optional(),
+          status: z.string(),
+          terminal: z.boolean(),
+          latestResponse: z.string().optional(),
+          error: z.string().optional(),
+          createdAt: z.string(),
+          updatedAt: z.string(),
+          startedAt: z.string().optional(),
+          lastActivityAt: z.string().optional(),
+          lastFileMutationAt: z.number().optional(),
+          wallMs: z.number().optional(),
+          idleMs: z.number().optional(),
+          changedPaths: z.array(z.string()).optional(),
+          terminalReason: z.string().optional(),
+          scopeState: z.string().optional(),
+        },
+        _meta: {},
+        annotations: { readOnlyHint: true },
+      },
+      async ({ workspaceId, agentId, waitMs }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const output = await agentSessionManager.getAgentStatus({
+          workspaceId,
+          workspaceRoot: workspace.root,
+          agentId,
+          waitMs,
+        });
+        const statusLine = output.terminal
+          ? `Agent ${agentId} is ${output.status}.`
+          : `Agent ${agentId} is ${output.status} (still running).`;
+        const responseLine = output.latestResponse ? `\nResponse: ${output.latestResponse}` : "";
+        const errorLine = output.error ? `\nError: ${output.error}` : "";
+        return {
+          content: [textBlock(`${statusLine}${responseLine}${errorLine}`)],
+          structuredContent: output as unknown as Record<string, unknown>,
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
+      "agent_cancel",
+      {
+        title: "Cancel agent",
+        description:
+          "Cancel one exact durable subagent session. Persists stopped state first, then terminates only the worker process owned by that agent's PID/token fence.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          agentId: z.string().describe("Exact agent ID returned by agent_start."),
+        },
+        outputSchema: {
+          agentId: z.string(),
+          workspaceId: z.string().optional(),
+          workspaceRoot: z.string(),
+          profileName: z.string(),
+          provider: z.string(),
+          model: z.string().optional(),
+          thinking: z.string().optional(),
+          providerSessionId: z.string().optional(),
+          status: z.string(),
+          terminal: z.boolean(),
+          latestResponse: z.string().optional(),
+          error: z.string().optional(),
+          createdAt: z.string(),
+          updatedAt: z.string(),
+        },
+        _meta: {},
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ workspaceId, agentId }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const output = await agentSessionManager.cancelAgent({
+          workspaceId,
+          workspaceRoot: workspace.root,
+          agentId,
+        });
+        logToolCall(config, {
+          tool: "agent_cancel",
+          workspaceId,
+          success: true,
+          durationMs: 0,
+        });
+        return {
+          content: [textBlock(`Agent ${agentId} is ${output.status}.`)],
+          structuredContent: output as unknown as Record<string, unknown>,
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
+      "agent_list",
+      {
+        title: "List agents",
+        description:
+          "List recent durable subagent sessions in the current workspace. Use agent_status for full response/error retrieval.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          limit: z
+            .number()
+            .int()
+            .min(1)
+            .max(AGENT_LIST_MAX_LIMIT)
+            .optional()
+            .describe(`Maximum number of agents to return. Default ${AGENT_LIST_DEFAULT_LIMIT}, max ${AGENT_LIST_MAX_LIMIT}.`),
+        },
+        outputSchema: {
+          agents: z.array(
+            z.object({
+              agentId: z.string(),
+              profileName: z.string(),
+              provider: z.string(),
+              model: z.string().optional(),
+              thinking: z.string().optional(),
+              status: z.string(),
+              updatedAt: z.string(),
+            }),
+          ),
+        },
+        _meta: {},
+        annotations: { readOnlyHint: true },
+      },
+      async ({ workspaceId, limit }) => {
+        const workspace = workspaces.getWorkspace(workspaceId); // boundary check
+        const agents = agentSessionManager.listAgents({ workspaceId, workspaceRoot: workspace.root, limit });
+        const summary = agents.length === 0
+          ? "No agent sessions found for this workspace."
+          : `${agents.length} agent session(s) in this workspace.`;
+        return {
+          content: [textBlock(summary)],
+          structuredContent: { agents },
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
+      "agent_preflight",
+      {
+        title: "Agent preflight",
+        description:
+          "Read-only readiness evidence for an exact workspace + agent profile before dispatch. Provider 'configured' is not the same as dispatch-ready; unknown evidence stays unknown. Never exposes credentials and grants no routing/admission authority.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          profile: z.string().describe("Name of an advertised agent profile to check."),
+          toolchainId: z.string().optional().describe("Optional toolchain id to check availability for."),
+        },
+        outputSchema: {
+          workspace: z.object({
+            workspaceId: z.string(),
+            root: z.string(),
+            head: z.string().optional(),
+            dirty: z.boolean(),
+            isolated: z.boolean(),
+          }),
+          worker: z.object({
+            profile: z.string(),
+            provider: z.string(),
+            model: z.string().optional(),
+            thinking: z.string().optional(),
+            executionIdentity: z.string(),
+            runtimeVersion: z.string().optional(),
+          }),
+          readiness: z.object({
+            profileResolved: z.boolean(),
+            providerConfigured: z.boolean(),
+            authReady: z.union([z.boolean(), z.string()]),
+            providerReachable: z.union([z.boolean(), z.string()]),
+            runtimeReady: z.boolean(),
+            capacityAvailable: z.boolean(),
+            dispatchState: z.enum(["READY", "BLOCKED", "UNKNOWN"]),
+          }),
+          toolchain: z.object({
+            id: z.string(),
+            available: z.boolean(),
+            executables: z.record(z.string(), z.string()).optional(),
+          }),
+          blockers: z.array(z.object({ code: z.string(), detail: z.string() })),
+          unknowns: z.array(z.string()),
+        },
+        _meta: {},
+        annotations: { readOnlyHint: true },
+      },
+      async ({ workspaceId, profile, toolchainId }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const profiles = await loadLocalAgentProfiles(config, workspace.root);
+        const output = await agentSessionManager.preflightAgent({
+          workspaceId,
+          workspaceRoot: workspace.root,
+          isolated: workspace.mode === "worktree",
+          profileName: profile,
+          profiles,
+          toolchainId,
+        });
+        const blockerSummary =
+          output.blockers.length > 0
+            ? ` Blockers: ${output.blockers.map((blocker) => blocker.code).join(", ")}`
+            : "";
+        return {
+          content: [
+            textBlock(
+              `Preflight for ${profile}: dispatchState=${output.readiness.dispatchState}.${blockerSummary}`,
+            ),
+          ],
+          structuredContent: output as unknown as Record<string, unknown>,
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
+      "agent_reconcile",
+      {
+        title: "Reconcile agent",
+        description:
+          "Read-only physical reconciliation for an exact durable agent. Reports what actually happened in the workspace regardless of provider/session status. A provider timeout/error does NOT imply no candidate exists. Never retries mutation.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          agentId: z.string().describe("Exact agent ID returned by agent_start."),
+        },
+        outputSchema: {
+          agentId: z.string(),
+          agentState: z.string(),
+          providerState: z.string().optional(),
+          providerSessionId: z.string().optional(),
+          terminalReason: z.string().optional(),
+          workspace: z.object({ head: z.string().optional(), dirty: z.boolean() }),
+          candidate: z.object({
+            present: z.boolean(),
+            changedPaths: z.array(z.string()),
+            unexpectedPaths: z.array(z.string()),
+            diffHash: z.string().optional(),
+            scopeState: z.string(),
+          }),
+          activity: z.object({
+            startedAt: z.string(),
+            lastActivityAt: z.string(),
+            lastFileMutationAt: z.number().optional(),
+            wallMs: z.number(),
+            idleMs: z.number(),
+          }),
+        },
+        _meta: {},
+        annotations: { readOnlyHint: true },
+      },
+      async ({ workspaceId, agentId }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const output = await agentSessionManager.reconcileAgent({
+          workspaceId,
+          workspaceRoot: workspace.root,
+          isolated: workspace.mode === "worktree",
+          agentId,
+        });
+        const candidateLine = output.candidate.present
+          ? `Candidate present (${output.candidate.changedPaths.length} changed path(s), scope=${output.candidate.scopeState}).`
+          : "No physical candidate changes detected.";
+        return {
+          content: [
+            textBlock(
+              `Agent ${output.agentId} state=${output.agentState}. ${candidateLine}`,
+            ),
+          ],
+          structuredContent: output as unknown as Record<string, unknown>,
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
+      "workspace_verify",
+      {
+        title: "Verify workspace",
+        description:
+          "Run an allowlisted verifier executable from a configured toolchain inside the workspace. Bounded cwd, bounded timeout, structured exit code. Always available; when no compatible toolchain is configured it returns a structured TOOLCHAIN_UNAVAILABLE result instead of installing or repairing toolchains.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          toolchainId: z.string().describe("Configured toolchain id."),
+          verifier: z.string().describe("Verifier name defined by the toolchain, e.g. pytest or ruff."),
+          args: z.array(z.string()).default([]).describe("Arguments passed to the verifier executable."),
+          timeoutMs: z.number().int().min(1).optional().describe("Timeout in milliseconds."),
+        },
+        outputSchema: {
+          ok: z.boolean(),
+          error: z
+            .object({ code: z.string(), message: z.string() })
+            .optional(),
+          toolchainId: z.string().optional(),
+          verifier: z.string().optional(),
+          executable: z.string().optional(),
+          exitCode: z.number().nullable().optional(),
+          timedOut: z.boolean().optional(),
+          durationMs: z.number().optional(),
+          stdout: z.string().optional(),
+          stderr: z.string().optional(),
+        },
+        _meta: {},
+        annotations: SHELL_TOOL_ANNOTATIONS,
+      },
+      async ({ workspaceId, toolchainId, verifier, args, timeoutMs }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const resolved = resolveToolchainExecutable(config.toolchains, toolchainId, verifier);
+        if (!resolved) {
+          return {
+            content: [
+              textBlock(
+                `TOOLCHAIN_UNAVAILABLE: toolchain '${toolchainId}' verifier '${verifier}' is not configured or not resolvable.`,
+              ),
+            ],
+            structuredContent: {
+              ok: false,
+              error: {
+                code: "TOOLCHAIN_UNAVAILABLE",
+                message: `Toolchain '${toolchainId}' verifier '${verifier}' is not configured or not resolvable.`,
+              },
+            },
+          };
+        }
+        const result = await runToolchainVerifier({
+          toolchains: config.toolchains,
+          toolchainId,
+          verifier,
+          args,
+          cwd: workspace.root,
+          timeoutMs,
+        });
+        return {
+          content: [
+            textBlock(
+              `${verifier} exited with code ${result.exitCode ?? "null"} in ${result.durationMs}ms.`,
+            ),
+          ],
+          structuredContent: { ok: true, ...result } as unknown as Record<string, unknown>,
+        };
+      },
+    );
+  }
+
+  // ── Candidate integration readiness / typed integration (workspace level) ──
+  const candidateRangeInputSchema = {
+    sourceWorkspaceId: z.string().describe("Workspace that produced the accepted Candidate commits."),
+    candidateBase: z
+      .string()
+      .regex(/^[0-9a-fA-F]{40}$/)
+      .describe("Exact base SHA of the accepted Candidate range (ancestor of candidateHead)."),
+    candidateHead: z
+      .string()
+      .regex(/^[0-9a-fA-F]{40}$/)
+      .describe("Exact head SHA of the accepted Candidate range."),
+    destinationWorkspaceId: z.string().describe("Destination checkout workspace that should receive the Candidate range."),
+    expectedDestinationHead: z
+      .string()
+      .regex(/^[0-9a-fA-F]{40}$/)
+      .describe("Exact HEAD the destination must currently be at."),
+    dirtyPolicy: z.enum(["allow_unrelated", "pristine"]).optional(),
+  };
+
+  registerAppTool(
+    server,
+    "candidate_integration_readiness",
+    {
+      title: "Candidate integration readiness",
+      description:
+        "Read-only readiness evidence for integrating one exact immutable committed Candidate range (candidateBase..candidateHead) into a destination checkout. Verifies commit/tree/base identities, ancestor relation, destination base, and dirty overlap. Acceptance authority is external and never granted here; technical readiness and Owner acceptance are reported separately. No mutation happens.",
+      inputSchema: candidateRangeInputSchema,
+      outputSchema: {
+        candidateCommitVerified: z.boolean(),
+        candidateTreeId: z.string().optional(),
+        candidateBaseVerified: z.boolean(),
+        candidateBaseIsAncestor: z.boolean(),
+        candidateChangedPaths: z.array(z.string()),
+        destinationBaseMatches: z.boolean(),
+        destinationOverlap: z.string(),
+        overlappingPaths: z.array(z.string()),
+        unrelatedDestinationDirtyPaths: z.array(z.string()),
+        gitStateAvailable: z.boolean(),
+        operationExpressible: z.boolean(),
+        technicallyReadyToApply: z.boolean(),
+        acceptanceStatus: z.string(),
+        blockers: z.array(z.object({ code: z.string(), detail: z.string() })),
+        unknowns: z.array(z.string()),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: true },
+    },
+    async ({ sourceWorkspaceId, candidateBase, candidateHead, destinationWorkspaceId, expectedDestinationHead, dirtyPolicy }) => {
+      const source = workspaces.getWorkspace(sourceWorkspaceId);
+      const destination = workspaces.getWorkspace(destinationWorkspaceId);
+      const output = await inspectIntegrationReadiness({
+        sourceWorkspaceRoot: source.root,
+        candidateBase,
+        candidateHead,
+        destinationWorkspaceRoot: destination.root,
+        expectedDestinationHead,
+        dirtyPolicy,
+      });
+      const blockerSummary = output.blockers.length > 0
+        ? ` Blockers: ${output.blockers.map((blocker) => blocker.code).join(", ")}`
+        : "";
+      return {
+        content: [
+          textBlock(
+            `Integration readiness: technicallyReadyToApply=${output.technicallyReadyToApply}, ownerAcceptance=${output.acceptanceStatus}.${blockerSummary}`,
+          ),
+        ],
+        structuredContent: output as unknown as Record<string, unknown>,
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "candidate_integrate",
+    {
+      title: "Integrate candidate",
+      description:
+        "Apply one exact immutable committed Candidate range (candidateBase..candidateHead) onto a destination checkout after every identity gate passes (commit/tree existence, base ancestry, destination base, dirty-overlap policy). The payload comes only from the committed range; untracked workspace files are never included. Fails closed with the destination unchanged on any mismatch.",
+      inputSchema: {
+        ...candidateRangeInputSchema,
+        confirmApply: z
+          .boolean()
+          .describe("Must be true to apply. Without it the operation stays read-only preparation."),
+      },
+      outputSchema: {
+        applied: z.boolean(),
+        appliedRange: z.object({ base: z.string(), head: z.string() }),
+        appliedTrackedFiles: z.number(),
+        blockers: z.array(z.object({ code: z.string(), detail: z.string() })),
+      },
+      _meta: {},
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ sourceWorkspaceId, candidateBase, candidateHead, destinationWorkspaceId, expectedDestinationHead, dirtyPolicy, confirmApply }) => {
+      const source = workspaces.getWorkspace(sourceWorkspaceId);
+      const destination = workspaces.getWorkspace(destinationWorkspaceId);
+      const output = await integrateCandidate({
+        sourceWorkspaceRoot: source.root,
+        candidateBase,
+        candidateHead,
+        destinationWorkspaceRoot: destination.root,
+        expectedDestinationHead,
+        dirtyPolicy,
+        confirmApply,
+      });
+      const summary = output.applied
+        ? `Candidate range integrated (${output.appliedTrackedFiles} changed file(s)).`
+        : `Not applied${output.blockers.length > 0 ? `: ${output.blockers.map((blocker) => blocker.code).join(", ")}` : "."}`;
+      return {
+        content: [textBlock(summary)],
+        structuredContent: output as unknown as Record<string, unknown>,
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "remote_writability_probe",
+    {
+      title: "Remote writability probe",
+      description:
+        "Read-only Git remote readiness for a workspace. Reports whether a remote is configured, reachability/auth evidence when safely observable, upstream binding, and never claims push permission: proving it would require a mutating push.",
+      inputSchema: {
+        workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+        remoteName: z.string().optional().describe("Remote name. Defaults to origin."),
+      },
+      outputSchema: {
+        remoteName: z.string().optional(),
+        remoteUrl: z.string().optional(),
+        remoteConfigured: z.boolean(),
+        reachable: z.union([z.boolean(), z.string()]),
+        credentialsEvidence: z.string(),
+        upstreamBranch: z.string().optional(),
+        upstreamConfigured: z.boolean(),
+        pushPermissionProven: z.string(),
+        notes: z.array(z.string()),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: true },
+    },
+    async ({ workspaceId, remoteName }) => {
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const output = await probeRemoteWritability(workspace.root, remoteName ?? "origin");
+      return {
+        content: [
+          textBlock(
+            `Remote '${remoteName ?? "origin"}': configured=${output.remoteConfigured}, reachable=${String(output.reachable)}, push permission proven=${output.pushPermissionProven}.`,
+          ),
+        ],
+        structuredContent: output as unknown as Record<string, unknown>,
+      };
+    },
+  );
+
+  // ── Native Git Candidate MCP Tools (only when gitCandidatesEnabled is true) ──
+  if (config.gitCandidatesEnabled) {
+    registerAppTool(
+      server,
+      "git_commit",
+      {
+        title: "Git Commit Candidate",
+        description:
+          "Create a scoped Candidate commit from exactly specified paths inside a managed DevSpace worktree.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          expectedHead: z
+            .string()
+            .regex(/^[0-9a-fA-F]{40}$/)
+            .describe("Exact 40-character Git commit hash expected at current HEAD."),
+          message: z.string().min(1).describe("Bounded commit message describing the changes."),
+          paths: z
+            .array(z.string().min(1))
+            .min(1)
+            .max(100)
+            .describe("Workspace-relative file paths to stage and commit."),
+        },
+        outputSchema: {
+          workspaceId: z.string(),
+          previousHead: z.string(),
+          commitSha: z.string(),
+          treeSha: z.string(),
+          message: z.string(),
+          paths: z.array(z.string()),
+          detached: z.boolean(),
+          created: z.literal(true),
+        },
+        _meta: {},
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: false,
+          openWorldHint: false,
+        },
+      },
+      async ({ workspaceId, expectedHead, message, paths }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        if (workspace.mode !== "worktree" || !workspace.worktree?.managed) {
+          throw new Error(
+            "[GIT_MANAGED_WORKTREE_REQUIRED] Git candidate mutations are only allowed on DevSpace-managed worktrees.",
+          );
+        }
+        try {
+          const result = await commitCandidate({
+            workspaceId,
+            workspaceRoot: workspace.root,
+            expectedHead,
+            message,
+            paths,
+          });
+          return {
+            content: [textBlock(`Successfully created Candidate commit ${result.commitSha}`)],
+            structuredContent: {
+              workspaceId: result.workspaceId,
+              previousHead: result.previousHead,
+              commitSha: result.commitSha,
+              treeSha: result.treeSha,
+              message: result.message,
+              paths: result.paths,
+              detached: result.detached,
+              created: true as const,
+            },
+          };
+        } catch (err: any) {
+          const code = err instanceof GitCandidateError ? err.code : "GIT_EXECUTION_ERROR";
+          throw new Error(`[${code}] ${err.message}`);
+        }
+      },
+    );
+
+    registerAppTool(
+      server,
+      "git_push",
+      {
+        title: "Git Push Candidate",
+        description:
+          "Publish current Candidate HEAD from a managed DevSpace worktree to a non-default remote branch.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          expectedHead: z
+            .string()
+            .regex(/^[0-9a-fA-F]{40}$/)
+            .describe("Exact 40-character Git commit hash expected at current HEAD."),
+          remote: z.string().describe("Configured Git remote name (e.g. 'origin')."),
+          branch: z.string().describe("Name of the target non-default remote branch to push to."),
+        },
+        outputSchema: {
+          remote: z.string(),
+          branch: z.string(),
+          pushedSha: z.string(),
+        },
+        _meta: {},
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: false,
+          openWorldHint: true,
+        },
+      },
+      async ({ workspaceId, expectedHead, remote, branch }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        if (workspace.mode !== "worktree" || !workspace.worktree?.managed) {
+          throw new Error(
+            "[GIT_MANAGED_WORKTREE_REQUIRED] Git candidate mutations are only allowed on DevSpace-managed worktrees.",
+          );
+        }
+        try {
+          const result = await pushCandidate({
+            workspaceRoot: workspace.root,
+            expectedHead,
+            remote,
+            branch,
+          });
+          return {
+            content: [
+              textBlock(`Successfully pushed ${result.pushedSha} to ${result.remote}/${result.branch}`),
+            ],
+            structuredContent: {
+              remote: result.remote,
+              branch: result.branch,
+              pushedSha: result.pushedSha,
+            },
+          };
+        } catch (err: any) {
+          const code = err instanceof GitCandidateError ? err.code : "GIT_EXECUTION_ERROR";
+          throw new Error(`[${code}] ${err.message}`);
+        }
+      },
+    );
   }
 
   return server;
@@ -1707,6 +2844,23 @@ export function createServer(
     config.subagents,
     getLocalAgentProviderAvailabilitySnapshot(),
   );
+  const agentSessionManager = config.subagents.enabled
+    ? new LocalAgentSessionManager(config)
+    : undefined;
+  const codexGoals = config.codexGoalsEnabled
+    ? new CodexGoalSessionManager(processSessions, { codexBin: config.codexBin })
+    : undefined;
+
+  const agentSupervisionTimer = agentSessionManager
+    ? setInterval(() => {
+        void agentSessionManager.superviseActiveAgents().catch((error) => {
+          logEvent(config.logging, "error", "agent_supervision_error", {
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      }, AGENT_SUPERVISION_INTERVAL_MS)
+    : undefined;
+  agentSupervisionTimer?.unref();
 
   const logSessionCloseResults = (
     reason: "idle_timeout" | "server_shutdown",
@@ -1868,6 +3022,8 @@ export function createServer(
           processSessions,
           resolveLocalAgentProviders,
           incomingArtifactAdapters,
+          agentSessionManager,
+          codexGoals,
         );
         await server.connect(transport);
       } else {
@@ -1895,8 +3051,10 @@ export function createServer(
     close: () => {
       closePromise ??= (async () => {
         clearInterval(sessionCleanupTimer);
+        if (agentSupervisionTimer) clearInterval(agentSupervisionTimer);
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
+        codexGoals?.shutdown();
         processSessions.shutdown();
         oauthProvider.close();
         workspaceStore.close?.();
@@ -1933,6 +3091,16 @@ if (await isMainModule()) {
         : `unsupported on ${process.platform}`;
     console.log(`native artifact download: ${artifactDownloadStatus}`);
     console.log(`subagent providers: ${formatLocalAgentProviderStatusSummary(localAgentProviders)}`);
+    if (config.subagents.enabled) {
+      console.log(`subagent availability: ${formatLocalAgentProviderAvailabilitySummary(localAgentProviders.map((provider) => ({
+        name: provider.id,
+        available: provider.available,
+        reason: provider.reason ?? provider.note,
+      })))}`);
+    }
+    if (config.codexGoalsEnabled) {
+      console.log(`codex goal tools: enabled${config.codexBin ? ` (${config.codexBin})` : ""}`);
+    }
   });
 
   let shuttingDown = false;

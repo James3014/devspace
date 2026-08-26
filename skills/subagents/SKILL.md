@@ -43,6 +43,8 @@ devspace agents ls --json
 - `continue` gives the same subagent another turn with its existing provider
   session and context.
 - `ls` returns sessions belonging to the current project.
+- `cancel <id>` stops an active session; cancellation is recorded on the
+  session and the worker is not reused.
 
 Run `devspace agents show <id> --json` again later while the status is `running`.
 `completed` includes the response. `failed` includes a structured error, and

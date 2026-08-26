@@ -135,6 +135,43 @@ Legacy project paths such as `.pi/skills` can be added through `DEVSPACE_SKILL_P
 When `open_workspace` returns matching skills, the model should read the
 advertised `SKILL.md` before following that skill.
 
+## Controller-to-Worker Goal Mode
+
+For bounded engineering work, the MCP host should remain the controller and use
+DevSpace subagents as workers rather than handing the whole workflow to an
+opaque agent loop. A reliable default is:
+
+1. open the target checkout or an isolated worktree and bind its exact HEAD;
+2. run `agent_preflight` for the selected profile and treat `UNKNOWN` readiness
+   as unknown rather than silently promoting it to ready;
+3. call `agent_start` with an explicit execution contract when mutation is
+   allowed, including the expected HEAD and the narrowest practical write scope;
+4. inspect terminal state with `agent_status` and always use `agent_reconcile`
+   when provider status, timeout, or transport state could differ from the
+   physical workspace result;
+5. independently inspect the resulting diff and run affected verification
+   before calling the Candidate correct or ready to integrate;
+6. after integration or runtime reload, verify the exact integrated/runtime
+   revision again instead of reusing Candidate-level evidence.
+
+Provider failure and physical Candidate state are separate facts. A timeout or
+provider error must never be treated as proof that no files changed, and an
+implementer-reported PASS is not independent acceptance evidence.
+
+For Codex-backed profiles, DevSpace verifies the package-owned Codex SDK and the
+actual CLI version before launch. The SDK and CLI must satisfy the configured
+minimum version; runtime discovery must not borrow an arbitrary ancestor
+`node_modules`. The CLI version probe is bounded but allows normal cold-start
+latency before failing closed.
+
+For direct interactive Codex Goal Mode, keep `DEVSPACE_TOOL_MODE=minimal` and
+opt in to the narrow `codex_goal_*` surface with `DEVSPACE_CODEX_GOALS=1`.
+`codex_goal_start` launches the real Codex CLI in a PTY, binds Git workspaces to
+an exact `expectedHead`, requires a clean workspace, and only reports success
+after the TUI physically shows `Pursuing goal`. Use `codex_goal_status`,
+`codex_goal_continue`, and `codex_goal_cancel` to operate the same exact goal
+session. Generic `exec_command`/`write_stdin` remain hidden in minimal mode.
+
 Skill paths may be outside the workspace. DevSpace only permits reading:
 
 - advertised `SKILL.md` files
@@ -146,7 +183,7 @@ configuration. The bundled `subagents` skill teaches the minimal
 `devspace agents targets`, `devspace agents ls`, `devspace agents run`,
 `devspace agents continue`, and `devspace agents show` workflow. The catalog
 comes from `open_workspace`; `devspace agents ls` lists existing subagent
-sessions for that workspace.
+sessions for that workspace. `devspace agents cancel <id>` stops an active session.
 
 ## Tool Names
 

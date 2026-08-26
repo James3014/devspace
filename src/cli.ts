@@ -3,6 +3,7 @@ import { createRequire } from "node:module";
 import { stdin as input, stdout as output } from "node:process";
 import { resolve } from "node:path";
 import type { Result as BetterResult } from "better-result";
+
 import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { satisfies } from "semver";
@@ -43,6 +44,9 @@ import {
   usesChatGpt,
   usesCodingAgents,
 } from "./onboarding.js";
+import { LocalAgentSessionManager } from "./local-agent-sessions.js";
+import type { LocalAgentRecord } from "./local-agent-store.js";
+
 import {
   generateOwnerToken,
   loadDevspaceFiles,
@@ -392,6 +396,7 @@ function printHelp(): void {
       "  devspace agents run <profile-or-provider> [--model <model>] [--effort <level>] <prompt>",
       "  devspace agents continue <id> [--model <model>] [--effort <level>] <prompt>",
       "  devspace agents show <id>",
+      "  devspace agents cancel <id> [--json]",
       "  devspace agents daemon <status|stop|logs>",
       "  devspace -v, --version   Print the installed version",
       "",
@@ -464,6 +469,7 @@ async function runAgentsList(args: string[], json: boolean): Promise<void> {
     return;
   }
 
+
   if (agents.length === 0) {
     console.log("No subagent sessions found for this workspace.");
     return;
@@ -495,6 +501,7 @@ async function runAgentsRun(args: string[], json: boolean): Promise<void> {
     return;
   }
   console.log(formatAgentReceipt(receipt));
+
 }
 
 async function runAgentsContinue(args: string[], json: boolean): Promise<void> {
@@ -527,12 +534,14 @@ async function runAgentsShow(args: string[], json: boolean): Promise<void> {
   let record = presentAgentResult(initial, json);
   if (!record) return;
 
+
   const deadline = Date.now() + 15_000;
   while ((record.status === "starting" || record.status === "running") && Date.now() < deadline) {
     await sleep(500);
     const refreshed = presentAgentResult(await client.get(id, scope), json);
     if (!refreshed) return;
     record = refreshed;
+
   }
 
   const observation = presentAgentObservation(record);
@@ -607,6 +616,60 @@ function printJson(value: unknown): void {
   console.log(JSON.stringify(value));
 }
 
+async function runAgentsCancel(args: string[]): Promise<void> {
+  const [id] = args;
+  if (!id) throw new Error("Usage: devspace agents cancel <id>");
+
+  const config = loadConfig();
+  const manager = new LocalAgentSessionManager(config);
+  const record = manager.getRecordByPrefixOrId(id);
+  if (!record) throw new Error(`Unknown subagent id: ${id}`);
+  const output = await manager.cancelAgent({
+    workspaceId: record.workspaceId ?? "cli",
+    workspaceRoot: record.workspaceRoot,
+    agentId: record.id,
+  });
+  console.log(`${output.agentId} ${output.status} ${output.profileName} ${output.provider}`);
+}
+
+async function runAgentsWorker(args: string[]): Promise<void> {
+  const [id, promptFileFlag, promptFile, workerTokenFlag, workerToken] = args;
+  if (
+    !id ||
+    promptFileFlag !== "--prompt-file" ||
+    !promptFile ||
+    workerTokenFlag !== "--worker-token" ||
+    !workerToken
+  ) {
+    throw new Error("Usage: devspace agents __worker <id> --prompt-file <path> --worker-token <token>");
+  }
+
+  const config = loadConfig();
+  const manager = new LocalAgentSessionManager(config);
+  await manager.runWorkerTurnFromFile(id, promptFile, workerToken);
+}
+
+function resolveCurrentWorkspaceRoot(): string {
+  return resolve(process.env.DEVSPACE_WORKSPACE_ROOT || process.cwd());
+}
+
+function resolveCurrentWorkspaceScope(): { workspaceId?: string; workspaceRoot: string } {
+  return {
+    workspaceId: process.env.DEVSPACE_WORKSPACE_ID,
+    workspaceRoot: resolveCurrentWorkspaceRoot(),
+  };
+}
+
+function formatAgentLine(agent: Pick<
+  LocalAgentRecord,
+  "id" | "status" | "profileName" | "provider" | "model" | "effort"
+>): string {
+  const model = agent.model ? ` ${agent.model}` : "";
+  const effort = agent.effort ? ` effort=${agent.effort}` : "";
+  return `${agent.id} ${agent.status} ${agent.profileName} ${agent.provider}${model}${effort}`;
+
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolveSleep) => setTimeout(resolveSleep, ms));
 }
@@ -621,6 +684,7 @@ function printAgentsHelp(): void {
       "  devspace agents run <profile-or-provider> [--model <model>] [--effort <level>] [--json] <prompt>",
       "  devspace agents continue <id> [--model <model>] [--effort <level>] [--json] <prompt>",
       "  devspace agents show <id> [--json]",
+      "  devspace agents cancel <id> [--json]",
       "  devspace agents targets [--json]",
       "  devspace agents daemon <status|stop|logs> [--json]",
     ].join("\n"),
