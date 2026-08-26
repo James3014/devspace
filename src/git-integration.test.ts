@@ -946,6 +946,50 @@ test("candidate promotion rolls the ref back when worktree synchronization fails
   }
 });
 
+test("candidate promotion never overwrites a newer ref when synchronization and rollback both lose a race", async () => {
+  const { source, destination, base } = makePromotionFixture("sync-rollback-race");
+  try {
+    const head = commitAll(source, { "app.ts": "candidate\n" }, "candidate");
+    const tree = runGitRaw(["rev-parse", `${head}^{tree}`], source);
+    const newer = commitAll(source, { "newer.txt": "concurrent ref owner\n" }, "newer competing ref");
+    let seamRan = false;
+
+    const result = await promoteCandidate({
+      sourceWorkspaceRoot: source,
+      candidateBase: base,
+      candidateHead: head,
+      candidateTree: tree,
+      destinationWorkspaceRoot: destination,
+      expectedDestinationBranch: "main",
+      expectedDestinationHead: base,
+      confirmPromote: true,
+      beforeWorktreeSyncHook: () => {
+        seamRan = true;
+        // The promotion CAS has already placed main at `head`. Simulate an
+        // external actor taking the branch before worktree synchronization,
+        // then make read-tree fail on a conflicting local edit. The rollback's
+        // old-OID CAS must refuse to overwrite this newer ref.
+        runGitRaw(["update-ref", "refs/heads/main", newer, head], destination);
+        writeFileSync(join(destination, "app.ts"), "concurrent local edit\n");
+      },
+    });
+
+    assert.equal(seamRan, true);
+    assert.equal(result.success, false);
+    assert.ok(result.blockers.some((b) => b.code === "PROMOTION_WORKTREE_SYNC_FAILED"));
+    assert.equal(runGitRaw(["rev-parse", "refs/heads/main"], destination), newer);
+    assert.equal(runGitRaw(["rev-parse", "HEAD"], destination), newer);
+    assert.equal(await readFile(join(destination, "app.ts")), "concurrent local edit\n");
+    assert.equal(
+      runGitRaw(["show", `${newer}:newer.txt`], destination),
+      "concurrent ref owner",
+      "the concurrent actor's commit must remain the branch authority",
+    );
+  } finally {
+    cleanupRepo(destination);
+  }
+});
+
 test("remote writability probe never fakes push permission", async () => {
   const repo = makeRepo("remote-probe", { "readme.txt": "x\n" });
   try {
