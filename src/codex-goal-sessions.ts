@@ -1,5 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants, access } from "node:fs/promises";
+import { realpathSync } from "node:fs";
+import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import {
   HeadTailBuffer,
@@ -15,8 +17,6 @@ import {
 
 const GOAL_MARKER_PATTERN = /pursuing\s+goal/i;
 const TRUST_DIALOG_PATTERN = /trust\s+the\s+contents/i;
-const TUI_MODEL_READY_PATTERN = /model:\s+(?!loading\b)\S+/i;
-const TUI_DIRECTORY_READY_PATTERN = /directory:\s+(?!loading\b)\S+/i;
 const EXPECTED_HEAD_PATTERN = /^[0-9a-fA-F]{40}$/;
 const MACOS_CODEX_FALLBACK = "/Applications/ChatGPT.app/Contents/Resources/codex";
 const MAX_GOAL_CHARACTERS = 20_000;
@@ -28,6 +28,7 @@ const DEFAULT_ACTIVATION_POLL_MS = 250;
 const DEFAULT_TYPE_CHUNK_CHARACTERS = 24;
 const DEFAULT_TYPE_CHUNK_DELAY_MS = 25;
 const DEFAULT_CANCEL_TIMEOUT_MS = 5_000;
+const MAX_RAW_ESCAPE_CARRY_CHARACTERS = 8_192;
 
 /**
  * Narrow process backend used by the goal session manager. Structurally
@@ -77,13 +78,14 @@ interface GoalSession {
   startedAt: number;
   goalActiveObserved: boolean;
   trustDialogObserved: boolean;
-  modelReadyObserved: boolean;
-  directoryReadyObserved: boolean;
   terminal: boolean;
   exitCode?: number;
   signal?: string;
   terminalReason?: string;
   recentOutput: HeadTailBuffer;
+  readiness?: DestructiveDeltaReadiness;
+  readinessBlocked?: string;
+  terminalQueryCarry: string;
 }
 
 export interface CodexGoalSessionManagerOptions {
@@ -102,6 +104,460 @@ const TERMINAL_ESCAPE_PATTERN =
 /** Normalize ANSI terminal escapes so markers can be matched reliably. */
 export function normalizeTerminalText(value: string): string {
   return value.replace(TERMINAL_ESCAPE_PATTERN, "").replace(/\s+/g, " ");
+}
+
+// ─── Destructive delta readiness model ──────────────────────────────────────
+
+type ReadinessBlock = "trust" | "error" | "truncation";
+
+interface ReadinessSnapshot {
+  screen: string;
+  modelLine?: string;
+  model?: string;
+  directory?: string;
+  loading?: boolean;
+  block?: ReadinessBlock;
+}
+
+const LOADING_PATTERN = /\bloading\b/i;
+const ERROR_PATTERN = /\b(?:error|failed|fatal)\b/i;
+const PROMPT_FRAME_PATTERN = /^\s*(?:[>›]\s*)?Ask Codex to do anything\s*$/i;
+const READINESS_SEMANTIC_DELTA_PATTERN = /(?:model|direc|ask\s+codex|loading|error|failed|fatal|trust\s+the\s+contents)/i;
+const CLEAR_SCREEN_PATTERN = /\x1b(?:\[2J|\[3J|c)/;
+
+const TERMINAL_QUERY_RESPONSES = [
+  ["\x1b[6n", "\x1b[1;1R"],
+  ["\x1b]10;?\x1b\\", "\x1b]10;rgb:ffff/ffff/ffff\x1b\\"],
+  ["\x1b]11;?\x1b\\", "\x1b]11;rgb:0000/0000/0000\x1b\\"],
+  ["\x1b[?u", "\x1b[?0u"],
+  ["\x1b[c", "\x1b[?1;2c"],
+] as const;
+const MAX_TERMINAL_QUERY_LENGTH = Math.max(
+  ...TERMINAL_QUERY_RESPONSES.map(([query]) => query.length),
+);
+
+function terminalQueryReply(
+  output: string,
+  carry: string,
+): { chars: string; carry: string } {
+  const input = `${carry}${output}`;
+  const matches: Array<{ index: number; chars: string }> = [];
+  for (const [query, response] of TERMINAL_QUERY_RESPONSES) {
+    let from = 0;
+    while (from < input.length) {
+      const index = input.indexOf(query, from);
+      if (index < 0) break;
+      matches.push({ index, chars: response });
+      from = index + query.length;
+    }
+  }
+  matches.sort((left, right) => left.index - right.index);
+
+  let nextCarry = "";
+  const maxSuffix = Math.min(input.length, MAX_TERMINAL_QUERY_LENGTH - 1);
+  for (let length = maxSuffix; length > 0; length -= 1) {
+    const suffix = input.slice(-length);
+    if (
+      TERMINAL_QUERY_RESPONSES.some(
+        ([query]) => query.length > suffix.length && query.startsWith(suffix),
+      )
+    ) {
+      nextCarry = suffix;
+      break;
+    }
+  }
+
+  return {
+    chars: matches.map((match) => match.chars).join(""),
+    carry: nextCarry,
+  };
+}
+
+function stripAnsi(value: string): string {
+  return value
+    .replace(/\x1b\[\d+;1H/g, "\n")
+    .replace(TERMINAL_ESCAPE_PATTERN, "");
+}
+
+function currentEpochAfterLastClear(value: string): { cleared: boolean; output: string } {
+  const clearPattern = new RegExp(CLEAR_SCREEN_PATTERN.source, "g");
+  let cleared = false;
+  let suffixStart = 0;
+  let match: RegExpExecArray | null;
+  while ((match = clearPattern.exec(value)) !== null) {
+    cleared = true;
+    suffixStart = match.index + match[0].length;
+  }
+  return { cleared, output: cleared ? value.slice(suffixStart) : value };
+}
+
+function splitIncompleteTerminalEscape(value: string): { output: string; carry: string } {
+  const escapeIndex = value.lastIndexOf("\x1b");
+  if (escapeIndex < 0) return { output: value, carry: "" };
+
+  const suffix = value.slice(escapeIndex);
+  const completeClear = new RegExp(`^(?:${CLEAR_SCREEN_PATTERN.source})`).test(suffix);
+  const completeEscape = new RegExp(`^(?:${TERMINAL_ESCAPE_PATTERN.source})`).test(suffix);
+  if (completeClear || completeEscape) return { output: value, carry: "" };
+  return { output: value.slice(0, escapeIndex), carry: suffix };
+}
+
+function sampleReadyScreen(value: string): string {
+  return value.slice(-8_000);
+}
+
+function normalizeTuiRow(line: string): string {
+  let normalized = line.trim();
+  if (normalized.startsWith("│")) normalized = normalized.slice(1).trim();
+  if (normalized.endsWith("│")) normalized = normalized.slice(0, -1).trim();
+  return normalized;
+}
+
+function parseModelLine(line: string): string | undefined {
+  const match = normalizeTuiRow(line).match(/^model:\s*(.+)$/);
+  if (!match) return undefined;
+  const name = match[1]!.replace(/\s+\/model\s+to\s+change\s*$/i, "").trim();
+  return name || undefined;
+}
+
+function parseDirectoryLine(line: string): string | undefined {
+  const match = normalizeTuiRow(line).match(/^directory:\s*(.+)$/);
+  if (!match) return undefined;
+  const directory = match[1]!.trim();
+  return directory || undefined;
+}
+
+function scanScreen(screen: string): ReadinessSnapshot {
+  const snapshot: ReadinessSnapshot = { screen };
+  if (TRUST_DIALOG_PATTERN.test(screen)) {
+    snapshot.block = "trust";
+  } else if (ERROR_PATTERN.test(screen)) {
+    snapshot.block = "error";
+  } else if (LOADING_PATTERN.test(screen)) {
+    snapshot.loading = true;
+  }
+  for (const line of screen.split(/\r?\n/)) {
+    const model = parseModelLine(line);
+    if (model !== undefined) {
+      snapshot.modelLine = model;
+      snapshot.model = model;
+    }
+    const directory = parseDirectoryLine(line);
+    if (directory !== undefined) snapshot.directory = directory;
+  }
+  return snapshot;
+}
+
+function completeLines(value: string, carry: string): { lines: string[]; carry: string } {
+  const combined = `${carry}${value}`;
+  const parts = combined.split(/\r?\n/);
+  const incomplete = parts.pop() ?? "";
+  return { lines: parts, carry: incomplete };
+}
+
+function realpathEqual(left: string, right: string): boolean {
+  const expandHome = (value: string): string =>
+    value === "~"
+      ? homedir()
+      : value.startsWith("~/")
+        ? join(homedir(), value.slice(2))
+        : value;
+  try {
+    return realpathSync(expandHome(left)) === realpathSync(expandHome(right));
+  } catch {
+    return false;
+  }
+}
+
+function modelMatches(observed: string, requested: string): boolean {
+  return observed === requested || observed.startsWith(`${requested} `);
+}
+
+function readinessResolved(
+  snapshot: ReadinessSnapshot,
+  workspaceRoot: string,
+  explicitModel?: string,
+): boolean {
+  if (snapshot.block) return false;
+  if (snapshot.model === undefined || snapshot.directory === undefined) return false;
+  if (explicitModel !== undefined && !modelMatches(snapshot.model, explicitModel)) return false;
+  return realpathEqual(snapshot.directory, workspaceRoot);
+}
+
+const READINESS_REQUIRED_STABLE_POLLS = 3;
+
+/**
+ * ANSI-stripped, complete-line parser for a PTY's destructive screen deltas.
+ * It keeps a bounded recent screen model plus resolved model/directory lines
+ * and only reports coherency after the same full-ready frame has been observed
+ * across three stable polls. Loading is a transient startup/repaint state that
+ * invalidates the current readiness streak but keeps polling. Trust, error, or
+ * truncation remain fatal blocks; model/directory mismatches also fail closed
+ * with no /goal bytes.
+ */
+class DestructiveDeltaReadiness {
+  private rawEscapeCarry = "";
+  private carry = "";
+  private lineBuffer: string[] = [];
+  private screen = "";
+  private observedModel?: string;
+  private observedModelSequence?: number;
+  private observedDirectory?: string;
+  private observedDirectorySequence?: number;
+  private explicitModel?: string;
+  private workspaceRoot?: string;
+  private block?: ReadinessBlock;
+  private nonEmptySnapshots = 0;
+  private readyStablePolls = 0;
+  private lastReadySignature = "";
+  private inputReadyObserved = false;
+  private inputReadySequence?: number;
+  private lineSequence = 0;
+  private readonly explicitModelLocked?: string;
+  private sawAnyDelta = false;
+
+  absorb(snapshot: ProcessSnapshot, workspaceRoot: string, explicitModel?: string): void {
+    this.workspaceRoot = workspaceRoot;
+    if (explicitModel !== undefined) {
+      this.explicitModel = explicitModel;
+    }
+    if (snapshot.outputTruncated) {
+      this.block = "truncation";
+      this.rawEscapeCarry = "";
+      this.carry = "";
+      this.screen = "";
+      this.lineBuffer = [];
+      this.readyStablePolls = 0;
+      this.lastReadySignature = "";
+      this.inputReadyObserved = false;
+      return;
+    }
+    const hasNewRawOutput = snapshot.output.length > 0;
+    if (hasNewRawOutput) {
+      this.nonEmptySnapshots += 1;
+      this.sawAnyDelta = true;
+    }
+    const raw = splitIncompleteTerminalEscape(`${this.rawEscapeCarry}${snapshot.output}`);
+    this.rawEscapeCarry = raw.carry;
+    if (this.rawEscapeCarry.length > MAX_RAW_ESCAPE_CARRY_CHARACTERS) {
+      this.block = "truncation";
+      this.rawEscapeCarry = "";
+      this.carry = "";
+      this.inputReadyObserved = false;
+      this.inputReadySequence = undefined;
+      this.readyStablePolls = 0;
+      this.lastReadySignature = "";
+      return;
+    }
+    const currentEpoch = currentEpochAfterLastClear(raw.output);
+    if (currentEpoch.cleared) {
+      this.carry = "";
+      this.lineBuffer = [];
+      this.screen = "";
+      this.observedModel = undefined;
+      this.observedModelSequence = undefined;
+      this.observedDirectory = undefined;
+      this.observedDirectorySequence = undefined;
+      this.inputReadyObserved = false;
+      this.inputReadySequence = undefined;
+      this.lineSequence = 0;
+      this.readyStablePolls = 0;
+      this.lastReadySignature = "";
+    }
+    const output = stripAnsi(currentEpoch.output);
+    if (!output) {
+      if (hasNewRawOutput || this.rawEscapeCarry) {
+        return;
+      }
+      // Neutral empty poll: keep the current coherent screen; it neither adds
+      // history nor invalidates the current frame. A real ready frame that is
+      // still the current screen stays eligible for a stable re-observation;
+      // any different/invalidating frame resets the streak to zero.
+      const resolved = this.validate();
+      if (resolved && this.inputReadyObserved) {
+        this.readyStablePolls += 1;
+        this.lastReadySignature = resolved.signature;
+      } else {
+        this.readyStablePolls = 0;
+      }
+      return;
+    }
+
+    // Only readiness-semantic visible deltas revoke a previously coherent
+    // prompt frame. Codex 0.149+ continuously repaints decorative title/MCP
+    // startup spinners; treating every such byte as semantic drift creates a
+    // timing-dependent false negative even when model/directory/prompt remain
+    // unchanged. Identity/prompt/loading/error/trust deltas still revoke and
+    // must establish a fresh coherent frame before /goal is typed.
+    const semanticDelta = READINESS_SEMANTIC_DELTA_PATTERN.test(output);
+    if (semanticDelta) {
+      this.inputReadyObserved = false;
+      this.inputReadySequence = undefined;
+      this.readyStablePolls = 0;
+      this.lastReadySignature = "";
+    }
+    const { lines, carry } = completeLines(output, this.carry);
+    this.carry = carry;
+    let framePromptSequence: number | undefined;
+    for (const line of lines) {
+      this.lineSequence += 1;
+      const sequence = this.lineSequence;
+      this.lineBuffer.push(line);
+      const model = parseModelLine(line);
+      if (model !== undefined) {
+        this.observedModel = model;
+        this.observedModelSequence = sequence;
+      }
+      const directory = parseDirectoryLine(line);
+      if (directory !== undefined) {
+        this.observedDirectory = directory;
+        this.observedDirectorySequence = sequence;
+      }
+      if (PROMPT_FRAME_PATTERN.test(line)) {
+        framePromptSequence = sequence;
+      }
+    }
+    if (this.lineBuffer.length > 500) {
+      this.lineBuffer = this.lineBuffer.slice(-500);
+    }
+    const coherent = this.lineBuffer.join("\n") + (this.carry ? `\n${this.carry}` : "");
+    this.screen = sampleReadyScreen(coherent);
+
+    const scanned = scanScreen(this.screen);
+    if (scanned.block) {
+      this.block = scanned.block;
+      this.readyStablePolls = 0;
+      this.lastReadySignature = "";
+      this.inputReadyObserved = false;
+      this.inputReadySequence = undefined;
+      return;
+    }
+    if (LOADING_PATTERN.test(output)) {
+      this.readyStablePolls = 0;
+      this.lastReadySignature = "";
+      this.inputReadyObserved = false;
+      this.inputReadySequence = undefined;
+      return;
+    }
+    if (this.resolveMismatch()) {
+      this.block = "error";
+      this.readyStablePolls = 0;
+      this.lastReadySignature = "";
+      this.inputReadyObserved = false;
+      this.inputReadySequence = undefined;
+      return;
+    }
+
+    const resolved = this.validate();
+    if (
+      resolved &&
+      framePromptSequence !== undefined &&
+      this.observedModelSequence !== undefined &&
+      this.observedDirectorySequence !== undefined &&
+      framePromptSequence > this.observedModelSequence &&
+      framePromptSequence > this.observedDirectorySequence
+    ) {
+      this.inputReadyObserved = true;
+      this.inputReadySequence = framePromptSequence;
+      this.readyStablePolls = this.readyStablePolls + 1;
+      this.lastReadySignature = resolved.signature;
+    } else if (resolved && this.inputReadyObserved && !semanticDelta) {
+      this.readyStablePolls += 1;
+      this.lastReadySignature = resolved.signature;
+    } else {
+      this.readyStablePolls = 0;
+      this.lastReadySignature = "";
+    }
+  }
+
+  private resolveMismatch(): boolean {
+    if (this.observedModel === undefined || this.explicitModel === undefined) return false;
+    if (
+      LOADING_PATTERN.test(this.observedModel) ||
+      (this.observedDirectory !== undefined && LOADING_PATTERN.test(this.observedDirectory))
+    ) {
+      return false;
+    }
+    return !modelMatches(this.observedModel, this.explicitModel);
+  }
+
+  snapshot(): ReadinessSnapshot {
+    const snapshot: ReadinessSnapshot = { screen: this.screen };
+    if (this.observedModel) snapshot.model = this.observedModel;
+    if (this.observedDirectory) snapshot.directory = this.observedDirectory;
+    if (this.block) snapshot.block = this.block;
+    return snapshot;
+  }
+
+  validate(): { model: string; directory: string; signature: string } | undefined {
+    const snapshot = this.snapshot();
+    if (snapshot.block) return undefined;
+    if (!snapshot.model || !snapshot.directory) return undefined;
+    if (
+      this.explicitModel !== undefined &&
+      !modelMatches(snapshot.model, this.explicitModel)
+    ) {
+      return undefined;
+    }
+    if (!this.workspaceRoot || !realpathEqual(snapshot.directory, this.workspaceRoot)) return undefined;
+    return {
+      model: snapshot.model,
+      directory: snapshot.directory,
+      signature: `${snapshot.model}\n${snapshot.directory}`,
+    };
+  }
+
+  stableResolved(): boolean {
+    return (
+      this.inputReadyObserved &&
+      this.inputReadySequence !== undefined &&
+      this.observedModelSequence !== undefined &&
+      this.observedDirectorySequence !== undefined &&
+      this.inputReadySequence > this.observedModelSequence &&
+      this.inputReadySequence > this.observedDirectorySequence &&
+      this.validate() !== undefined &&
+      this.readyStablePolls >= READINESS_REQUIRED_STABLE_POLLS
+    );
+  }
+
+  debugStablePolls(): number {
+    return this.readyStablePolls;
+  }
+
+  get blockReason(): ReadinessBlock | undefined {
+    return this.block;
+  }
+
+  get snapshotCount(): number {
+    return this.nonEmptySnapshots;
+  }
+
+  hasModelDirectoryEvidence(): boolean {
+    return this.observedModel !== undefined || this.observedDirectory !== undefined;
+  }
+
+  sawCoherentDelta(): boolean {
+    return (
+      this.sawAnyDelta &&
+      !this.block &&
+      (this.observedModel !== undefined || this.observedDirectory !== undefined)
+    );
+  }
+
+  mismatchReason(explicitModel?: string, workspaceRoot?: string): string | undefined {
+    if (this.block === "truncation") return "terminal output was truncated by the runtime";
+    if (this.block === "trust") return "Codex is showing its directory-trust dialog for this workspace. Trust the directory once with the Codex CLI, then retry codex_goal_start.";
+    if (this.block === "error") return "the terminal resolved an error/failed state or a mismatched model/directory";
+    const snapshot = this.snapshot();
+    if (!snapshot.model || !snapshot.directory) return "Codex did not resolve model and directory before /goal";
+    if (explicitModel !== undefined && !modelMatches(snapshot.model, explicitModel)) {
+      return `Codex resolved model '${snapshot.model}' but ${explicitModel} was required`;
+    }
+    if (workspaceRoot !== undefined && !realpathEqual(snapshot.directory, workspaceRoot)) {
+      return `Codex resolved directory '${snapshot.directory}' which is not the workspace root`;
+    }
+    return "Codex did not reach a stable coherent readiness state";
+  }
 }
 
 function assertNonEmpty(value: string | undefined, name: string): string | undefined {
@@ -131,12 +587,14 @@ async function assertExecutableFile(path: string): Promise<void> {
  * Deterministic Codex CLI resolution:
  * 1. DEVSPACE_CODEX_BIN when explicitly configured (fail closed when invalid);
  * 2. an executable `codex` found on PATH;
- * 3. the macOS ChatGPT.app bundled CLI.
+ * 3. the current user's Codex plugin CLI on macOS;
+ * 4. the macOS ChatGPT.app bundled CLI.
  */
 export async function resolveCodexBinary(options: {
   configuredBin?: string;
   platform?: NodeJS.Platform;
   pathEnv?: string;
+  homeDir?: string;
 } = {}): Promise<string> {
   const platform = options.platform ?? process.platform;
   const configured = assertNonEmpty(options.configuredBin, "DEVSPACE_CODEX_BIN");
@@ -158,6 +616,20 @@ export async function resolveCodexBinary(options: {
   }
 
   if (platform === "darwin") {
+    const userPluginFallback = join(
+      options.homeDir ?? homedir(),
+      ".codex",
+      "plugins",
+      ".plugin-appserver",
+      "codex",
+    );
+    try {
+      await access(userPluginFallback, fsConstants.X_OK);
+      return userPluginFallback;
+    } catch {
+      // continue to the app-bundled fallback
+    }
+
     try {
       await access(MACOS_CODEX_FALLBACK, fsConstants.X_OK);
       return MACOS_CODEX_FALLBACK;
@@ -176,7 +648,7 @@ function buildCodexArgs(input: {
   model?: string;
   reasoningEffort?: string;
 }): string[] {
-  const args: string[] = [];
+  const args: string[] = ["-c", "check_for_update_on_startup=false"];
   if (input.model) args.push("--model", input.model);
   if (input.reasoningEffort) {
     args.push("-c", `model_reasoning_effort="${input.reasoningEffort}"`);
@@ -314,17 +786,18 @@ export class CodexGoalSessionManager {
       startedAt: Date.now(),
       goalActiveObserved: false,
       trustDialogObserved: false,
-      modelReadyObserved: false,
-      directoryReadyObserved: false,
       terminal: false,
       recentOutput: new HeadTailBuffer(RECENT_OUTPUT_LIMIT),
+      readiness: new DestructiveDeltaReadiness(),
+      terminalQueryCarry: "",
     };
     this.sessions.set(goalId, session);
-    this.recordOutput(session, snapshot.output);
+    this.absorbSnapshot(session, snapshot, input.workspaceRoot);
+    await this.respondToTerminalQueries(session, snapshot.output, input.workspaceRoot);
 
     try {
       await this.waitForTuiReady(session);
-      await this.typeIntoSession(session, `/goal ${goal}`);
+      await this.typeIntoSession(session, `/goal ${goal}`, input.workspaceRoot);
       await this.waitForGoalActivation(session);
     } catch (error) {
       await this.terminateSession(session, "activation_failed");
@@ -421,8 +894,31 @@ export class CodexGoalSessionManager {
   /** Type text through the PTY in bounded chunks so the Codex TUI does not
    * interpret the whole payload as a single bracketed paste event. Ends with
    * an explicit carriage return to execute the line. */
-  private async typeIntoSession(session: GoalSession, text: string): Promise<void> {
+  private async typeIntoSession(session: GoalSession, text: string, workspaceRoot?: string): Promise<void> {
     const characters = Array.from(text);
+    if (workspaceRoot !== undefined && text.startsWith("/goal ")) {
+      if (!session.readiness?.stableResolved()) {
+        const blockReason = session.readiness?.blockReason;
+        const reason =
+          blockReason === "truncation"
+            ? "terminal output was truncated by the runtime; readiness cannot be proven"
+            : blockReason === "trust"
+              ? "Codex is showing its directory-trust dialog for this workspace. Trust the directory once with the Codex CLI, then retry codex_goal_start."
+              : blockReason === "error"
+                ? "the terminal resolved an error/failed or mismatched state"
+                : session.readiness?.mismatchReason(session.model, workspaceRoot) ??
+                  "Codex did not resolve model and directory before /goal";
+        if (process.env.NEXUS_GOAL_DEBUG === "1") {
+          process.stderr.write(
+            `NEXUS_GOAL_DEBUG gate screen=${JSON.stringify(session.readiness?.snapshot().screen)}\n` +
+              `model=${JSON.stringify(session.readiness?.snapshot().model)} directory=${JSON.stringify(session.readiness?.snapshot().directory)} polls=${session.readiness?.debugStablePolls()}\n`,
+          );
+        }
+        throw new Error(
+          `Codex Goal activation failed: ${reason}. The terminal did not reach three stable coherent readiness polls.`,
+        );
+      }
+    }
     for (let index = 0; index < characters.length; index += this.typeChunkCharacters) {
       const chunk = characters.slice(index, index + this.typeChunkCharacters).join("");
       const snapshot = await this.processes.write({
@@ -431,7 +927,7 @@ export class CodexGoalSessionManager {
         chars: chunk,
         yieldTimeMs: this.typeChunkDelayMs,
       });
-      this.absorbSnapshot(session, snapshot);
+      this.absorbSnapshot(session, snapshot, workspaceRoot);
       if (!snapshot.running) {
         throw new Error(
           `Codex CLI exited while receiving input (exitCode=${snapshot.exitCode ?? "unknown"}).`,
@@ -444,7 +940,7 @@ export class CodexGoalSessionManager {
       chars: "\r",
       yieldTimeMs: this.typeChunkDelayMs,
     });
-    this.absorbSnapshot(session, submit);
+    this.absorbSnapshot(session, submit, workspaceRoot);
     if (!submit.running) {
       throw new Error(
         `Codex CLI exited while submitting input (exitCode=${submit.exitCode ?? "unknown"}).`,
@@ -452,16 +948,18 @@ export class CodexGoalSessionManager {
     }
   }
 
-  /** Wait until Codex has resolved both model and workspace identity. Startup
-   * terminal output arrives before the persisted interactive thread is ready,
-   * and sending `/goal` during that loading window is rejected by current CLI
-   * versions as "The session must start before you can set a goal." */
+  /** Wait until the Codex TUI has produced its first output so input is only
+   * typed once the interactive process is actually up and reading. */
   private async waitForTuiReady(session: GoalSession): Promise<void> {
     const deadline = Date.now() + this.startupTimeoutMs;
     while (Date.now() < deadline) {
       await this.pollSession(session, this.activationPollMs);
-      if (session.modelReadyObserved && session.directoryReadyObserved) {
-        this.assertNoTrustDialog(session);
+      this.assertNoTrustDialog(session);
+      if (
+        !session.terminal &&
+        !session.readiness?.blockReason &&
+        session.readiness?.stableResolved()
+      ) {
         return;
       }
       if (session.terminal) {
@@ -469,11 +967,14 @@ export class CodexGoalSessionManager {
           `Codex CLI exited before the TUI became ready (exitCode=${session.exitCode ?? "unknown"}).`,
         );
       }
+      if (session.readiness?.blockReason) {
+        throw new Error(
+          `Codex CLI readiness blocked (${session.readiness.blockReason}). ${session.readiness.blockReason === "truncation" ? "The runtime truncated the terminal buffer so a coherent readiness frame cannot be proven." : "The terminal resolved a non-coherent state before /goal."}`,
+        );
+      }
       await this.pause();
     }
-    throw new Error(
-      `Codex CLI TUI did not resolve model and directory within ${this.startupTimeoutMs}ms.`,
-    );
+    throw new Error(`Codex CLI TUI produced no output within ${this.startupTimeoutMs}ms.`);
   }
 
   private async waitForGoalActivation(session: GoalSession): Promise<void> {
@@ -528,11 +1029,51 @@ export class CodexGoalSessionManager {
       }
       throw error;
     }
-    return this.absorbSnapshot(session, snapshot);
+    const output = this.absorbSnapshot(session, snapshot, session.workspaceRoot);
+    const responseOutput = await this.respondToTerminalQueries(
+      session,
+      snapshot.output,
+      session.workspaceRoot,
+    );
+    return `${output}${responseOutput}`;
   }
 
-  private absorbSnapshot(session: GoalSession, snapshot: ProcessSnapshot): string {
+  private async respondToTerminalQueries(
+    session: GoalSession,
+    output: string,
+    workspaceRoot: string,
+  ): Promise<string> {
+    let pendingOutput = output;
+    let combinedOutput = "";
+    for (let round = 0; round < 4; round += 1) {
+      const reply = terminalQueryReply(pendingOutput, session.terminalQueryCarry);
+      session.terminalQueryCarry = reply.carry;
+      if (!reply.chars || session.terminal) break;
+      const snapshot = await this.processes.write({
+        workspaceId: session.workspaceId,
+        sessionId: session.processSessionId,
+        chars: reply.chars,
+        yieldTimeMs: this.activationPollMs,
+      });
+      combinedOutput += this.absorbSnapshot(session, snapshot, workspaceRoot);
+      if (!snapshot.running) break;
+      pendingOutput = snapshot.output;
+    }
+    return combinedOutput;
+  }
+
+  private absorbSnapshot(
+    session: GoalSession,
+    snapshot: ProcessSnapshot,
+    workspaceRoot?: string,
+  ): string {
     this.recordOutput(session, snapshot.output);
+    if (workspaceRoot !== undefined && session.readiness) {
+      session.readiness.absorb(snapshot, workspaceRoot, session.model);
+      if (session.readiness.blockReason === "truncation") {
+        session.readinessBlocked = "truncation";
+      }
+    }
     if (!snapshot.running && !session.terminal) {
       session.terminal = true;
       session.exitCode = snapshot.exitCode;
@@ -545,18 +1086,11 @@ export class CodexGoalSessionManager {
   private recordOutput(session: GoalSession, output: string): void {
     if (!output) return;
     session.recentOutput.append(output);
-    const normalized = normalizeTerminalText(output);
-    if (!session.goalActiveObserved && GOAL_MARKER_PATTERN.test(normalized)) {
+    if (!session.goalActiveObserved && GOAL_MARKER_PATTERN.test(normalizeTerminalText(output))) {
       session.goalActiveObserved = true;
     }
-    if (!session.trustDialogObserved && TRUST_DIALOG_PATTERN.test(normalized)) {
+    if (!session.trustDialogObserved && TRUST_DIALOG_PATTERN.test(normalizeTerminalText(output))) {
       session.trustDialogObserved = true;
-    }
-    if (!session.modelReadyObserved && TUI_MODEL_READY_PATTERN.test(normalized)) {
-      session.modelReadyObserved = true;
-    }
-    if (!session.directoryReadyObserved && TUI_DIRECTORY_READY_PATTERN.test(normalized)) {
-      session.directoryReadyObserved = true;
     }
   }
 
