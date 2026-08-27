@@ -3049,6 +3049,15 @@ export function createServer(
   config = loadConfig(),
   options: CreateServerOptions = {},
 ): RunningServer {
+  if (!config.oauth.scopes.includes(NEXUS_GATEWAY_REBIND_SCOPE)) {
+    config = {
+      ...config,
+      oauth: {
+        ...config.oauth,
+        scopes: [...config.oauth.scopes, NEXUS_GATEWAY_REBIND_SCOPE],
+      },
+    };
+  }
   const incomingArtifactAdapters = options.incomingArtifactAdapters
     ?? [createOpenAIIncomingArtifactAdapter()];
   const allowedHosts = config.allowedHosts.includes("*")
