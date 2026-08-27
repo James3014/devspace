@@ -52,10 +52,10 @@ assert.equal(
 );
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "0" }).skillsEnabled, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_SKILLS: "1" }).skillsEnabled, true);
-assert.deepEqual(loadConfig({ ...baseEnv, DEVSPACE_SUBAGENTS: "1" }).subagents, {
-  enabled: true,
-  providers: [],
-});
+const legacyEnvSubagents = loadConfig({ ...baseEnv, DEVSPACE_SUBAGENTS: "1" }).subagents;
+assert.equal(legacyEnvSubagents.enabled, true);
+assert.equal(legacyEnvSubagents.providers.length, 9);
+assert.equal(legacyEnvSubagents.providers.every((provider) => provider.enabled), true);
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_WIDGETS: "invalid" }),
   /Invalid DEVSPACE_WIDGETS: invalid/,

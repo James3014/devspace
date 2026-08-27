@@ -262,6 +262,44 @@ try {
         return true;
       },
     );
+
+    await assert.rejects(
+      execFileAsync(
+        "node",
+        [
+          "--import",
+          "tsx",
+          "src/cli.ts",
+          "agents",
+          "__worker",
+          "agt_missing",
+          "--prompt-file",
+          "/dev/null",
+          "--worker-token",
+          "diagnostic-token",
+        ],
+        {
+          cwd: process.cwd(),
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            DEVSPACE_CONFIG_DIR: configDir,
+            DEVSPACE_ALLOWED_ROOTS: projectRoot,
+            DEVSPACE_STATE_DIR: stateDir,
+            DEVSPACE_WORKSPACE_ID: "ws_current",
+            DEVSPACE_WORKSPACE_ROOT: projectRoot,
+            DEVSPACE_SUBAGENTS: "1",
+            DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+          },
+        },
+      ),
+      (error: unknown) => {
+        const stderr = (error as { stderr?: string }).stderr ?? "";
+        assert.match(stderr, /Unknown subagent id: agt_missing/);
+        assert.doesNotMatch(stderr, /Unknown agents command: __worker/);
+        return true;
+      },
+    );
   } finally {
     await new Promise<void>((resolveClose, rejectClose) => {
       daemon.close((error) => error ? rejectClose(error) : resolveClose());

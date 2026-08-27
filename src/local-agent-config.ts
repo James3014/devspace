@@ -36,6 +36,11 @@ export function resolveSubagentsConfig(
   value: unknown,
   env: NodeJS.ProcessEnv = process.env,
 ): SubagentsConfig {
+  const envOverride = env.DEVSPACE_SUBAGENTS;
+  if (value === undefined && envOverride !== undefined && parseBoolean(envOverride)) {
+    return legacySubagentsConfig(true);
+  }
+
   const stored = value === undefined
     ? { enabled: false, providers: [] }
     : typeof value === "boolean"
@@ -43,9 +48,9 @@ export function resolveSubagentsConfig(
       : subagentsSchema.parse(value);
   return {
     ...stored,
-    enabled: env.DEVSPACE_SUBAGENTS === undefined
+    enabled: envOverride === undefined
       ? stored.enabled
-      : parseBoolean(env.DEVSPACE_SUBAGENTS),
+      : parseBoolean(envOverride),
   };
 }
 
