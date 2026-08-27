@@ -2,11 +2,17 @@ import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
+import { createRequire } from "node:module";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after, type TestContext } from "node:test";
 import { promisify } from "node:util";
+
+const nodeRequire = createRequire(import.meta.url);
+const fs = nodeRequire("node:fs") as typeof import("node:fs");
+const childProcess = nodeRequire("node:child_process") as typeof import("node:child_process");
+const crypto = nodeRequire("node:crypto") as typeof import("node:crypto");
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
@@ -32,8 +38,8 @@ import {
   EXPECTED_NEXUS_GATEWAY_MANAGER_SHA256,
   DEDICATED_GATEWAY_REBIND_SCOPE,
   DEDICATED_GATEWAY_REBIND_SCOPES,
+  NEXUS_GATEWAY_REQUEST_SCHEMA,
   type CreateServerOptions,
-  type GatewayRecoveryOptions,
 } from "./server.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
@@ -295,7 +301,6 @@ async function fixture(
     toolchains?: string;
     oauthScopes?: string[];
     authInfo?: AuthInfo;
-    gatewayRecovery?: GatewayRecoveryOptions;
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -394,7 +399,6 @@ async function fixture(
     [],
     agentSessionManager,
     undefined,
-    options.gatewayRecovery,
   );
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "devspace-test-client", version: "1.0.0" });
@@ -1125,7 +1129,7 @@ const GATEWAY_REBIND_ARGS = {
   requestHash: GATEWAY_REBIND_REQUEST_HASH,
 };
 const GATEWAY_REBIND_STORE = {
-  schema: "nexus.gateway.deployment.v1",
+  schema: "nexus.gateway.durable_recovery_request.v1",
   operation: "gateway-recover",
   request_id: GATEWAY_REBIND_REQUEST_ID,
   request_hash: GATEWAY_REBIND_REQUEST_HASH,
@@ -1153,25 +1157,113 @@ type ForbiddenCreateServerSeams = Extract<
 >;
 const productionCreateServerHasNoGatewaySeams: ForbiddenCreateServerSeams extends never ? true : never = true;
 
-function trackingExec(
-  state: { count: number; file?: string; args?: readonly string[]; opts?: any },
-  callbackImpl?: (
-    callback: (error: Error | null, stdout: string, stderr: string) => void,
-  ) => void,
-): GatewayRecoveryOptions["execFileFn"] {
-  return (file, args, opts, callback) => {
-    state.count += 1;
-    state.file = file;
-    state.args = args;
-    state.opts = opts;
-    if (callbackImpl) {
-      callbackImpl(callback);
-      return;
-    }
-    callback(null, JSON.stringify({ ok: true }), "");
+type CreateMcpServerParams = Parameters<typeof createMcpServer>;
+type CreateMcpServerHasNinthArgument = CreateMcpServerParams extends { 8: unknown } ? true : false;
+const productionCreateMcpServerHasNoGatewaySeams: CreateMcpServerHasNinthArgument extends false
+  ? true
+  : never = true;
+
+function mockGatewayHostIo(
+  t: TestContext,
+  spec: {
+    manager?: Buffer | Error;
+    request?: string | Error;
+    acceptManagerHash?: boolean;
+    exec?: (
+      file: string,
+      args: readonly string[],
+      opts: any,
+      callback: (error: Error | null, stdout: string, stderr: string) => void,
+    ) => void;
+  } = {},
+): {
+  count: number;
+  managerReads: number;
+  requestReads: number;
+  file?: string;
+  args?: readonly string[];
+  opts?: any;
+} {
+  const originalReadFileSync = fs.readFileSync;
+  const originalExecFile = childProcess.execFile;
+  const originalCreateHash = crypto.createHash;
+  const execState: {
+    count: number;
+    managerReads: number;
+    requestReads: number;
+    file?: string;
+    args?: readonly string[];
+    opts?: any;
+  } = {
+    count: 0,
+    managerReads: 0,
+    requestReads: 0,
   };
+
+  (fs as { readFileSync: typeof fs.readFileSync }).readFileSync = ((path: import("node:fs").PathOrFileDescriptor, options?: any) => {
+    const resolved = String(path);
+    if (resolved === NEXUS_GATEWAY_MANAGER_EXECUTABLE) {
+      execState.managerReads += 1;
+      if (spec.manager instanceof Error) throw spec.manager;
+      if (spec.manager !== undefined) return spec.manager;
+    }
+    if (resolved === NEXUS_GATEWAY_REQUEST_STORE) {
+      execState.requestReads += 1;
+      if (spec.request instanceof Error) throw spec.request;
+      if (spec.request !== undefined) return spec.request;
+    }
+    return originalReadFileSync(path as Parameters<typeof originalReadFileSync>[0], options);
+  }) as typeof fs.readFileSync;
+
+  (childProcess as { execFile: typeof childProcess.execFile }).execFile = ((
+    file: any,
+    args?: any,
+    options?: any,
+    callback?: any,
+  ) => {
+    if (file === NEXUS_PYTHON_EXECUTABLE) {
+      execState.count += 1;
+      execState.file = file;
+      execState.args = args;
+      execState.opts = options;
+      const cb = typeof options === "function" ? options : callback;
+      if (spec.exec) {
+        spec.exec(file, args, typeof options === "function" ? undefined : options, cb);
+        return undefined;
+      }
+      cb?.(null, JSON.stringify({ ok: true }), "");
+      return undefined;
+    }
+    return originalExecFile(file, args, options, callback);
+  }) as typeof childProcess.execFile;
+
+  if (spec.acceptManagerHash) {
+    (crypto as { createHash: typeof crypto.createHash }).createHash = ((algorithm: string, options?: any) => {
+      const hasher = originalCreateHash(algorithm, options);
+      if (algorithm !== "sha256") return hasher;
+      return {
+        update(data: string | Buffer) {
+          hasher.update(data);
+          return this;
+        },
+        digest(_encoding?: import("node:crypto").BinaryToTextEncoding) {
+          hasher.digest("hex");
+          return EXPECTED_NEXUS_GATEWAY_MANAGER_SHA256;
+        },
+      };
+    }) as typeof crypto.createHash;
+  }
+
+  t.after(() => {
+    (fs as { readFileSync: typeof fs.readFileSync }).readFileSync = originalReadFileSync;
+    (childProcess as { execFile: typeof childProcess.execFile }).execFile = originalExecFile;
+    (crypto as { createHash: typeof crypto.createHash }).createHash = originalCreateHash;
+  });
+
+  return execState;
 }
 
+test.describe("nexus.gateway_rebind.reload.v1", { concurrency: false }, () => {
 test("nexus.gateway_rebind.reload.v1: tool is registered with exact fixed name, schema, and non-read-only destructive non-idempotent annotations", async (t) => {
   const context = await fixture(t);
   const tools = await context.client.listTools();
@@ -1222,6 +1314,10 @@ test("nexus.gateway_rebind.reload.v1: tool is registered with exact fixed name, 
   assert.deepEqual([...DEDICATED_GATEWAY_REBIND_SCOPES], [DEDICATED_GATEWAY_REBIND_SCOPE]);
   assert.equal(DEDICATED_GATEWAY_REBIND_SCOPE, "nexus.gateway_rebind.reload.v1");
   assert.equal(NEXUS_GATEWAY_RECOVERY_ACTION, "gateway-recover");
+  assert.equal(
+    NEXUS_GATEWAY_REQUEST_SCHEMA,
+    "nexus.gateway.durable_recovery_request.v1",
+  );
   assert.deepEqual([...NEXUS_GATEWAY_RECOVERY_ARGV], [
     NEXUS_GATEWAY_MANAGER_EXECUTABLE,
     "gateway-recover",
@@ -1276,21 +1372,34 @@ test("nexus.gateway_rebind.reload.v1: public createServer construction cannot ov
   );
 });
 
+test("nexus.gateway_rebind.reload.v1: exported createMcpServer cannot inject recovery dependencies", () => {
+  assert.equal(productionCreateMcpServerHasNoGatewaySeams, true);
+  assert.doesNotMatch(
+    Function.prototype.toString.call(createMcpServer),
+    /\bgatewayRecovery\b/,
+  );
+  assert.doesNotMatch(
+    Function.prototype.toString.call(createMcpServer),
+    /\bverifyManagerHashFn\b/,
+  );
+  assert.doesNotMatch(
+    Function.prototype.toString.call(createMcpServer),
+    /\breadManagerBytesFn\b/,
+  );
+  assert.doesNotMatch(
+    Function.prototype.toString.call(createMcpServer),
+    /\breadRequestStoreFn\b/,
+  );
+  assert.doesNotMatch(
+    Function.prototype.toString.call(createMcpServer),
+    /\bexecFileFn\b/,
+  );
+  assert.equal(createMcpServer.length, 8);
+});
+
 test("nexus.gateway_rebind.reload.v1: missing dedicated OAuth scope fails closed before any filesystem read or exec", async (t) => {
-  let readCalled = false;
-  let execCalled = false;
-  const context = await fixture(t, {
-    gatewayRecovery: {
-      readManagerBytesFn: () => {
-        readCalled = true;
-        return Buffer.from("must-not-read");
-      },
-      execFileFn: (_file, _args, _opts, callback) => {
-        execCalled = true;
-        callback(null, JSON.stringify({ success: true }), "");
-      },
-    },
-  });
+  const io = mockGatewayHostIo(t, { manager: Buffer.from("must-not-read") });
+  const context = await fixture(t);
 
   const res = await context.client.callTool({
     name: "nexus.gateway_rebind.reload.v1",
@@ -1298,8 +1407,8 @@ test("nexus.gateway_rebind.reload.v1: missing dedicated OAuth scope fails closed
   });
 
   assert.equal(res.isError, true);
-  assert.equal(readCalled, false, "must not read manager without dedicated scope");
-  assert.equal(execCalled, false, "execFile must never be called without dedicated scope");
+  assert.equal(io.managerReads, 0, "must not read manager without dedicated scope");
+  assert.equal(io.count, 0, "execFile must never be called without dedicated scope");
   const structured = structuredContent(res);
   assert.equal(structured.ok, false);
   assert.equal((structured.error as Record<string, unknown>).code, "GATEWAY_REBIND_SCOPE_NOT_CONFIGURED");
@@ -1307,8 +1416,7 @@ test("nexus.gateway_rebind.reload.v1: missing dedicated OAuth scope fails closed
 });
 
 test("nexus.gateway_rebind.reload.v1: ordinary devspace OAuth scope alone is insufficient", async (t) => {
-  let readCalled = false;
-  let execCalled = false;
+  const io = mockGatewayHostIo(t, { manager: Buffer.from("must-not-read") });
   const context = await fixture(t, {
     oauthScopes: ["devspace"],
     authInfo: {
@@ -1316,16 +1424,6 @@ test("nexus.gateway_rebind.reload.v1: ordinary devspace OAuth scope alone is ins
       clientId: "chatgpt",
       scopes: ["devspace"],
     },
-    gatewayRecovery: {
-      readManagerBytesFn: () => {
-        readCalled = true;
-        return Buffer.from("must-not-read");
-      },
-      execFileFn: (_file, _args, _opts, callback) => {
-        execCalled = true;
-        callback(null, JSON.stringify({ success: true }), "");
-      },
-    },
   });
 
   const res = await context.client.callTool({
@@ -1334,16 +1432,15 @@ test("nexus.gateway_rebind.reload.v1: ordinary devspace OAuth scope alone is ins
   });
 
   assert.equal(res.isError, true);
-  assert.equal(readCalled, false);
-  assert.equal(execCalled, false, "execFile must not be called with only ordinary devspace scope");
+  assert.equal(io.managerReads, 0);
+  assert.equal(io.count, 0, "execFile must not be called with only ordinary devspace scope");
   const structured = structuredContent(res);
   assert.equal(structured.ok, false);
   assert.equal((structured.error as Record<string, unknown>).code, "GATEWAY_REBIND_SCOPE_NOT_CONFIGURED");
 });
 
 test("nexus.gateway_rebind.reload.v1: configured dedicated scope still requires the token scope", async (t) => {
-  let readCalled = false;
-  let execCalled = false;
+  const io = mockGatewayHostIo(t, { manager: Buffer.from("must-not-read") });
   const context = await fixture(t, {
     oauthScopes: [DEDICATED_GATEWAY_REBIND_SCOPE, "devspace"],
     authInfo: {
@@ -1351,16 +1448,6 @@ test("nexus.gateway_rebind.reload.v1: configured dedicated scope still requires 
       clientId: "chatgpt",
       scopes: ["devspace"],
     },
-    gatewayRecovery: {
-      readManagerBytesFn: () => {
-        readCalled = true;
-        return Buffer.from("must-not-read");
-      },
-      execFileFn: (_file, _args, _opts, callback) => {
-        execCalled = true;
-        callback(null, "{}", "");
-      },
-    },
   });
 
   const res = await context.client.callTool({
@@ -1369,27 +1456,14 @@ test("nexus.gateway_rebind.reload.v1: configured dedicated scope still requires 
   });
 
   assert.equal(res.isError, true);
-  assert.equal(readCalled, false);
-  assert.equal(execCalled, false);
+  assert.equal(io.managerReads, 0);
+  assert.equal(io.count, 0);
   assert.equal((structuredContent(res).error as Record<string, unknown>).code, "GATEWAY_REBIND_SCOPE_NOT_CONFIGURED");
 });
 
 test("nexus.gateway_rebind.reload.v1: empty arguments fail closed before read or exec", async (t) => {
-  let readCalled = false;
-  let execCalled = false;
-  const context = await fixture(t, {
-    ...dedicatedRebindAuth(),
-    gatewayRecovery: {
-      readManagerBytesFn: () => {
-        readCalled = true;
-        return Buffer.from("must-not-read");
-      },
-      execFileFn: (_file, _args, _opts, callback) => {
-        execCalled = true;
-        callback(null, "{}", "");
-      },
-    },
-  });
+  const io = mockGatewayHostIo(t, { manager: Buffer.from("must-not-read") });
+  const context = await fixture(t, dedicatedRebindAuth());
 
   const res = await context.client.callTool({
     name: "nexus.gateway_rebind.reload.v1",
@@ -1397,28 +1471,18 @@ test("nexus.gateway_rebind.reload.v1: empty arguments fail closed before read or
   });
 
   assert.equal(res.isError, true);
-  assert.equal(readCalled, false, "omitted fence must not read the host manager");
-  assert.equal(execCalled, false, "omitted fence must not execute the host manager");
+  assert.equal(io.managerReads, 0, "omitted fence must not read the host manager");
+  assert.equal(io.count, 0, "omitted fence must not execute the host manager");
 });
 
 test("nexus.gateway_rebind.reload.v1: wrong manager bytes fails closed with MANAGER_HASH_MISMATCH before exec (F1)", async (t) => {
-  let execCalled = false;
   const alteredManagerContent = Buffer.from("#!/usr/bin/env python3\n# altered manager content\n");
   assert.notEqual(
     createHash("sha256").update(alteredManagerContent).digest("hex"),
     EXPECTED_NEXUS_GATEWAY_MANAGER_SHA256,
   );
-
-  const context = await fixture(t, {
-    ...dedicatedRebindAuth(),
-    gatewayRecovery: {
-      readManagerBytesFn: () => alteredManagerContent,
-      execFileFn: (_file, _args, _opts, callback) => {
-        execCalled = true;
-        callback(null, "{}", "");
-      },
-    },
-  });
+  const io = mockGatewayHostIo(t, { manager: alteredManagerContent });
+  const context = await fixture(t, dedicatedRebindAuth());
 
   const res = await context.client.callTool({
     name: "nexus.gateway_rebind.reload.v1",
@@ -1426,7 +1490,7 @@ test("nexus.gateway_rebind.reload.v1: wrong manager bytes fails closed with MANA
   });
 
   assert.equal(res.isError, true);
-  assert.equal(execCalled, false, "execFile must never be called on manager hash mismatch");
+  assert.equal(io.count, 0, "execFile must never be called on manager hash mismatch");
   const structured = structuredContent(res);
   assert.equal(structured.ok, false);
   assert.equal((structured.error as Record<string, unknown>).code, "MANAGER_HASH_MISMATCH");
@@ -1434,21 +1498,10 @@ test("nexus.gateway_rebind.reload.v1: wrong manager bytes fails closed with MANA
 });
 
 test("nexus.gateway_rebind.reload.v1: missing manager fails closed with MANAGER_NOT_INSTALLED before exec", async (t) => {
-  let execCalled = false;
-  const context = await fixture(t, {
-    ...dedicatedRebindAuth(),
-    gatewayRecovery: {
-      readManagerBytesFn: () => {
-        const error = new Error("ENOENT: no such file or directory");
-        (error as any).code = "ENOENT";
-        throw error;
-      },
-      execFileFn: (_file, _args, _opts, callback) => {
-        execCalled = true;
-        callback(null, "{}", "");
-      },
-    },
-  });
+  const missing = new Error("ENOENT: no such file or directory");
+  (missing as Error & { code: string }).code = "ENOENT";
+  const io = mockGatewayHostIo(t, { manager: missing });
+  const context = await fixture(t, dedicatedRebindAuth());
 
   const res = await context.client.callTool({
     name: "nexus.gateway_rebind.reload.v1",
@@ -1456,7 +1509,7 @@ test("nexus.gateway_rebind.reload.v1: missing manager fails closed with MANAGER_
   });
 
   assert.equal(res.isError, true);
-  assert.equal(execCalled, false, "execFile must never be called when manager is not installed");
+  assert.equal(io.count, 0, "execFile must never be called when manager is not installed");
   const structured = structuredContent(res);
   assert.equal(structured.ok, false);
   assert.equal((structured.error as Record<string, unknown>).code, "MANAGER_NOT_INSTALLED");
@@ -1464,23 +1517,14 @@ test("nexus.gateway_rebind.reload.v1: missing manager fails closed with MANAGER_
 });
 
 test("nexus.gateway_rebind.reload.v1: missing request store fails closed with REQUEST_STORE_MISSING before exec", async (t) => {
-  let execCalled = false;
-  const context = await fixture(t, {
-    ...dedicatedRebindAuth(),
-    gatewayRecovery: {
-      readManagerBytesFn: () => Buffer.from("mock-manager-bytes"),
-      verifyManagerHashFn: () => true,
-      readRequestStoreFn: () => {
-        const error = new Error("ENOENT: no such file or directory");
-        (error as any).code = "ENOENT";
-        throw error;
-      },
-      execFileFn: (_file, _args, _opts, callback) => {
-        execCalled = true;
-        callback(null, "{}", "");
-      },
-    },
+  const missing = new Error("ENOENT: no such file or directory");
+  (missing as Error & { code: string }).code = "ENOENT";
+  const io = mockGatewayHostIo(t, {
+    manager: Buffer.from("mock-manager-bytes"),
+    acceptManagerHash: true,
+    request: missing,
   });
+  const context = await fixture(t, dedicatedRebindAuth());
 
   const res = await context.client.callTool({
     name: "nexus.gateway_rebind.reload.v1",
@@ -1488,7 +1532,7 @@ test("nexus.gateway_rebind.reload.v1: missing request store fails closed with RE
   });
 
   assert.equal(res.isError, true);
-  assert.equal(execCalled, false, "execFile must never be called when request store is missing");
+  assert.equal(io.count, 0, "execFile must never be called when request store is missing");
   const structured = structuredContent(res);
   assert.equal(structured.ok, false);
   assert.equal((structured.error as Record<string, unknown>).code, "REQUEST_STORE_MISSING");
@@ -1496,19 +1540,12 @@ test("nexus.gateway_rebind.reload.v1: missing request store fails closed with RE
 });
 
 test("nexus.gateway_rebind.reload.v1: malformed or missing request fence in store fails closed before exec (F3)", async (t) => {
-  let execCalled = false;
-  const context = await fixture(t, {
-    ...dedicatedRebindAuth(),
-    gatewayRecovery: {
-      readManagerBytesFn: () => Buffer.from("mock-manager-bytes"),
-      verifyManagerHashFn: () => true,
-      readRequestStoreFn: () => JSON.stringify({ invalid: "schema" }),
-      execFileFn: (_file, _args, _opts, callback) => {
-        execCalled = true;
-        callback(null, "{}", "");
-      },
-    },
+  const io = mockGatewayHostIo(t, {
+    manager: Buffer.from("mock-manager-bytes"),
+    acceptManagerHash: true,
+    request: JSON.stringify({ invalid: "schema" }),
   });
+  const context = await fixture(t, dedicatedRebindAuth());
 
   const res = await context.client.callTool({
     name: "nexus.gateway_rebind.reload.v1",
@@ -1516,7 +1553,7 @@ test("nexus.gateway_rebind.reload.v1: malformed or missing request fence in stor
   });
 
   assert.equal(res.isError, true);
-  assert.equal(execCalled, false, "execFile must never be called on invalid request fence");
+  assert.equal(io.count, 0, "execFile must never be called on invalid request fence");
   const structured = structuredContent(res);
   assert.equal(structured.ok, false);
   assert.equal((structured.error as Record<string, unknown>).code, "REQUEST_FENCE_REJECTED");
@@ -1524,23 +1561,16 @@ test("nexus.gateway_rebind.reload.v1: malformed or missing request fence in stor
 });
 
 test("nexus.gateway_rebind.reload.v1: missing stored request_id fails closed before exec", async (t) => {
-  let execCalled = false;
-  const context = await fixture(t, {
-    ...dedicatedRebindAuth(),
-    gatewayRecovery: {
-      readManagerBytesFn: () => Buffer.from("mock-manager-bytes"),
-      verifyManagerHashFn: () => true,
-      readRequestStoreFn: () => JSON.stringify({
-        schema: "nexus.gateway.deployment.v1",
-        operation: "gateway-recover",
-        request_hash: GATEWAY_REBIND_REQUEST_HASH,
-      }),
-      execFileFn: (_file, _args, _opts, callback) => {
-        execCalled = true;
-        callback(null, "{}", "");
-      },
-    },
+  const io = mockGatewayHostIo(t, {
+    manager: Buffer.from("mock-manager-bytes"),
+    acceptManagerHash: true,
+    request: JSON.stringify({
+      schema: NEXUS_GATEWAY_REQUEST_SCHEMA,
+      operation: "gateway-recover",
+      request_hash: GATEWAY_REBIND_REQUEST_HASH,
+    }),
   });
+  const context = await fixture(t, dedicatedRebindAuth());
 
   const res = await context.client.callTool({
     name: "nexus.gateway_rebind.reload.v1",
@@ -1548,28 +1578,21 @@ test("nexus.gateway_rebind.reload.v1: missing stored request_id fails closed bef
   });
 
   assert.equal(res.isError, true);
-  assert.equal(execCalled, false);
+  assert.equal(io.count, 0);
   assert.equal((structuredContent(res).error as Record<string, unknown>).code, "REQUEST_FENCE_REJECTED");
 });
 
 test("nexus.gateway_rebind.reload.v1: missing stored request_hash fails closed before exec", async (t) => {
-  let execCalled = false;
-  const context = await fixture(t, {
-    ...dedicatedRebindAuth(),
-    gatewayRecovery: {
-      readManagerBytesFn: () => Buffer.from("mock-manager-bytes"),
-      verifyManagerHashFn: () => true,
-      readRequestStoreFn: () => JSON.stringify({
-        schema: "nexus.gateway.deployment.v1",
-        operation: "gateway-recover",
-        request_id: GATEWAY_REBIND_REQUEST_ID,
-      }),
-      execFileFn: (_file, _args, _opts, callback) => {
-        execCalled = true;
-        callback(null, "{}", "");
-      },
-    },
+  const io = mockGatewayHostIo(t, {
+    manager: Buffer.from("mock-manager-bytes"),
+    acceptManagerHash: true,
+    request: JSON.stringify({
+      schema: NEXUS_GATEWAY_REQUEST_SCHEMA,
+      operation: "gateway-recover",
+      request_id: GATEWAY_REBIND_REQUEST_ID,
+    }),
   });
+  const context = await fixture(t, dedicatedRebindAuth());
 
   const res = await context.client.callTool({
     name: "nexus.gateway_rebind.reload.v1",
@@ -1577,29 +1600,20 @@ test("nexus.gateway_rebind.reload.v1: missing stored request_hash fails closed b
   });
 
   assert.equal(res.isError, true);
-  assert.equal(execCalled, false);
+  assert.equal(io.count, 0);
   assert.equal((structuredContent(res).error as Record<string, unknown>).code, "REQUEST_FENCE_REJECTED");
 });
 
-test("nexus.gateway_rebind.reload.v1: stale host request schema fails closed before exec", async (t) => {
-  let execCalled = false;
-  const context = await fixture(t, {
-    ...dedicatedRebindAuth(),
-    gatewayRecovery: {
-      readManagerBytesFn: () => Buffer.from("mock-manager-bytes"),
-      verifyManagerHashFn: () => true,
-      readRequestStoreFn: () => JSON.stringify({
-        schema: "nexus.gateway.durable_recovery_request.v1",
-        operation: "gateway-recover",
-        request_id: GATEWAY_REBIND_REQUEST_ID,
-        request_hash: GATEWAY_REBIND_REQUEST_HASH,
-      }),
-      execFileFn: (_file, _args, _opts, callback) => {
-        execCalled = true;
-        callback(null, "{}", "");
-      },
-    },
+test("nexus.gateway_rebind.reload.v1: deployment.v1 request schema fails closed before exec", async (t) => {
+  const io = mockGatewayHostIo(t, {
+    manager: Buffer.from("mock-manager-bytes"),
+    acceptManagerHash: true,
+    request: JSON.stringify({
+      ...GATEWAY_REBIND_STORE,
+      schema: "nexus.gateway.deployment.v1",
+    }),
   });
+  const context = await fixture(t, dedicatedRebindAuth());
 
   const res = await context.client.callTool({
     name: "nexus.gateway_rebind.reload.v1",
@@ -1607,24 +1621,17 @@ test("nexus.gateway_rebind.reload.v1: stale host request schema fails closed bef
   });
 
   assert.equal(res.isError, true);
-  assert.equal(execCalled, false);
+  assert.equal(io.count, 0);
   assert.equal((structuredContent(res).error as Record<string, unknown>).code, "REQUEST_FENCE_REJECTED");
 });
 
 test("nexus.gateway_rebind.reload.v1: caller requestId mismatch against stored request fails closed before exec (F3)", async (t) => {
-  let execCalled = false;
-  const context = await fixture(t, {
-    ...dedicatedRebindAuth(),
-    gatewayRecovery: {
-      readManagerBytesFn: () => Buffer.from("mock-manager-bytes"),
-      verifyManagerHashFn: () => true,
-      readRequestStoreFn: () => JSON.stringify(GATEWAY_REBIND_STORE),
-      execFileFn: (_file, _args, _opts, callback) => {
-        execCalled = true;
-        callback(null, "{}", "");
-      },
-    },
+  const io = mockGatewayHostIo(t, {
+    manager: Buffer.from("mock-manager-bytes"),
+    acceptManagerHash: true,
+    request: JSON.stringify(GATEWAY_REBIND_STORE),
   });
+  const context = await fixture(t, dedicatedRebindAuth());
 
   const res = await context.client.callTool({
     name: "nexus.gateway_rebind.reload.v1",
@@ -1635,26 +1642,19 @@ test("nexus.gateway_rebind.reload.v1: caller requestId mismatch against stored r
   });
 
   assert.equal(res.isError, true);
-  assert.equal(execCalled, false, "execFile must never be called when caller requestId does not match stored request");
+  assert.equal(io.count, 0, "execFile must never be called when caller requestId does not match stored request");
   const structured = structuredContent(res);
   assert.equal(structured.ok, false);
   assert.equal((structured.error as Record<string, unknown>).code, "REQUEST_FENCE_REJECTED");
 });
 
 test("nexus.gateway_rebind.reload.v1: caller requestHash mismatch against stored request fails closed before exec (F3)", async (t) => {
-  let execCalled = false;
-  const context = await fixture(t, {
-    ...dedicatedRebindAuth(),
-    gatewayRecovery: {
-      readManagerBytesFn: () => Buffer.from("mock-manager-bytes"),
-      verifyManagerHashFn: () => true,
-      readRequestStoreFn: () => JSON.stringify(GATEWAY_REBIND_STORE),
-      execFileFn: (_file, _args, _opts, callback) => {
-        execCalled = true;
-        callback(null, "{}", "");
-      },
-    },
+  const io = mockGatewayHostIo(t, {
+    manager: Buffer.from("mock-manager-bytes"),
+    acceptManagerHash: true,
+    request: JSON.stringify(GATEWAY_REBIND_STORE),
   });
+  const context = await fixture(t, dedicatedRebindAuth());
 
   const res = await context.client.callTool({
     name: "nexus.gateway_rebind.reload.v1",
@@ -1665,30 +1665,22 @@ test("nexus.gateway_rebind.reload.v1: caller requestHash mismatch against stored
   });
 
   assert.equal(res.isError, true);
-  assert.equal(execCalled, false, "execFile must never be called when caller requestHash does not match stored request");
+  assert.equal(io.count, 0, "execFile must never be called when caller requestHash does not match stored request");
   const structured = structuredContent(res);
   assert.equal(structured.ok, false);
   assert.equal((structured.error as Record<string, unknown>).code, "REQUEST_FENCE_REJECTED");
 });
 
 test("nexus.gateway_rebind.reload.v1: file SHA is not an accepted requestHash meaning", async (t) => {
-  let execCalled = false;
   const content = JSON.stringify(GATEWAY_REBIND_STORE);
   const fileSha = createHash("sha256").update(content).digest("hex");
   assert.notEqual(fileSha, GATEWAY_REBIND_REQUEST_HASH);
-
-  const context = await fixture(t, {
-    ...dedicatedRebindAuth(),
-    gatewayRecovery: {
-      readManagerBytesFn: () => Buffer.from("mock-manager-bytes"),
-      verifyManagerHashFn: () => true,
-      readRequestStoreFn: () => content,
-      execFileFn: (_file, _args, _opts, callback) => {
-        execCalled = true;
-        callback(null, "{}", "");
-      },
-    },
+  const io = mockGatewayHostIo(t, {
+    manager: Buffer.from("mock-manager-bytes"),
+    acceptManagerHash: true,
+    request: content,
   });
+  const context = await fixture(t, dedicatedRebindAuth());
 
   const res = await context.client.callTool({
     name: "nexus.gateway_rebind.reload.v1",
@@ -1699,12 +1691,11 @@ test("nexus.gateway_rebind.reload.v1: file SHA is not an accepted requestHash me
   });
 
   assert.equal(res.isError, true);
-  assert.equal(execCalled, false, "file SHA must not satisfy the request_hash fence");
+  assert.equal(io.count, 0, "file SHA must not satisfy the request_hash fence");
   assert.equal((structuredContent(res).error as Record<string, unknown>).code, "REQUEST_FENCE_REJECTED");
 });
 
 test("nexus.gateway_rebind.reload.v1: successful manager invocation parses receipt and verifies immutable paths and minimal safe environment (F2, F6, F9)", async (t) => {
-  const execState: { count: number; file?: string; args?: readonly string[]; opts?: any } = { count: 0 };
   const receipt = {
     profile: "com.nexus.mcp.gateway.direct",
     operation: "gateway-recover",
@@ -1712,25 +1703,15 @@ test("nexus.gateway_rebind.reload.v1: successful manager invocation parses recei
     reloaded: true,
     observed: { head: "99ebab77a1324543523da116e27334f2e565277d" },
   };
-
-  const context = await fixture(t, {
-    ...dedicatedRebindAuth(),
-    gatewayRecovery: {
-      readManagerBytesFn: () => Buffer.from("mock-manager-bytes"),
-      verifyManagerHashFn: () => true,
-      readRequestStoreFn: () => JSON.stringify(GATEWAY_REBIND_STORE),
-      execFileFn: trackingExec(execState, (callback) => {
-        callback(null, JSON.stringify(receipt), "");
-      }),
-      ...({
-        managerExecutable: "/tmp/evil-manager.py",
-        pythonExecutable: "/tmp/evil-python",
-        requestStorePath: "/tmp/evil-request.json",
-        evidenceStorePath: "/tmp/evil-evidence.json",
-        action: "launchctl",
-      } as any),
+  const io = mockGatewayHostIo(t, {
+    manager: Buffer.from("mock-manager-bytes"),
+    acceptManagerHash: true,
+    request: JSON.stringify(GATEWAY_REBIND_STORE),
+    exec: (_file, _args, _opts, callback) => {
+      callback(null, JSON.stringify(receipt), "");
     },
   });
+  const context = await fixture(t, dedicatedRebindAuth());
 
   const originalPath = process.env.PATH;
   process.env.PATH = "/tmp/evil-bin:/usr/bin";
@@ -1755,12 +1736,12 @@ test("nexus.gateway_rebind.reload.v1: successful manager invocation parses recei
   assert.equal(structured.ok, true);
   assert.deepEqual(structured.receipt, receipt);
   assert.match(responseText(res), /completed successfully/);
-  assert.equal(execState.count, 1);
-  assert.equal(execState.file, NEXUS_PYTHON_EXECUTABLE);
-  assert.deepEqual(execState.args, [...NEXUS_GATEWAY_RECOVERY_ARGV]);
-  assert.equal(execState.opts.cwd, NEXUS_GATEWAY_DIRECT_ROOT);
-  assert.equal(execState.opts.shell, false);
-  const capturedEnv = execState.opts.env as Record<string, string>;
+  assert.equal(io.count, 1);
+  assert.equal(io.file, NEXUS_PYTHON_EXECUTABLE);
+  assert.deepEqual(io.args, [...NEXUS_GATEWAY_RECOVERY_ARGV]);
+  assert.equal(io.opts.cwd, NEXUS_GATEWAY_DIRECT_ROOT);
+  assert.equal(io.opts.shell, false);
+  const capturedEnv = io.opts.env as Record<string, string>;
   assert.deepEqual(Object.keys(capturedEnv).sort(), [
     "HOME",
     "PATH",
@@ -1779,20 +1760,17 @@ test("nexus.gateway_rebind.reload.v1: successful manager invocation parses recei
 });
 
 test("nexus.gateway_rebind.reload.v1: non-zero manager exit preserves error without retry (F7)", async (t) => {
-  const execState: { count: number; file?: string; args?: readonly string[]; opts?: any } = { count: 0 };
-  const context = await fixture(t, {
-    ...dedicatedRebindAuth(),
-    gatewayRecovery: {
-      readManagerBytesFn: () => Buffer.from("mock-manager-bytes"),
-      verifyManagerHashFn: () => true,
-      readRequestStoreFn: () => JSON.stringify(GATEWAY_REBIND_STORE),
-      execFileFn: trackingExec(execState, (callback) => {
-        const error = new Error("Command failed: python manager.py") as Error & { code: number };
-        error.code = 2;
-        callback(error, "request hash mismatch in manager stderr", "GateError: launchctl command failed");
-      }),
+  const io = mockGatewayHostIo(t, {
+    manager: Buffer.from("mock-manager-bytes"),
+    acceptManagerHash: true,
+    request: JSON.stringify(GATEWAY_REBIND_STORE),
+    exec: (_file, _args, _opts, callback) => {
+      const error = new Error("Command failed: python manager.py") as Error & { code: number };
+      error.code = 2;
+      callback(error, "request hash mismatch in manager stderr", "GateError: launchctl command failed");
     },
   });
+  const context = await fixture(t, dedicatedRebindAuth());
 
   const res = await context.client.callTool({
     name: "nexus.gateway_rebind.reload.v1",
@@ -1800,7 +1778,7 @@ test("nexus.gateway_rebind.reload.v1: non-zero manager exit preserves error with
   });
 
   assert.equal(res.isError, true);
-  assert.equal(execState.count, 1, "Must not retry on non-zero exit");
+  assert.equal(io.count, 1, "Must not retry on non-zero exit");
   const structured = structuredContent(res);
   assert.equal(structured.ok, false);
   assert.equal((structured.error as Record<string, unknown>).code, "MANAGER_EXIT_NON_ZERO");
@@ -1808,18 +1786,15 @@ test("nexus.gateway_rebind.reload.v1: non-zero manager exit preserves error with
 });
 
 test("nexus.gateway_rebind.reload.v1: malformed manager JSON fails closed", async (t) => {
-  const execState: { count: number; file?: string; args?: readonly string[]; opts?: any } = { count: 0 };
-  const context = await fixture(t, {
-    ...dedicatedRebindAuth(),
-    gatewayRecovery: {
-      readManagerBytesFn: () => Buffer.from("mock-manager-bytes"),
-      verifyManagerHashFn: () => true,
-      readRequestStoreFn: () => JSON.stringify(GATEWAY_REBIND_STORE),
-      execFileFn: trackingExec(execState, (callback) => {
-        callback(null, "NON_JSON_PLAIN_TEXT_OUTPUT\n", "");
-      }),
+  const io = mockGatewayHostIo(t, {
+    manager: Buffer.from("mock-manager-bytes"),
+    acceptManagerHash: true,
+    request: JSON.stringify(GATEWAY_REBIND_STORE),
+    exec: (_file, _args, _opts, callback) => {
+      callback(null, "NON_JSON_PLAIN_TEXT_OUTPUT\n", "");
     },
   });
+  const context = await fixture(t, dedicatedRebindAuth());
 
   const res = await context.client.callTool({
     name: "nexus.gateway_rebind.reload.v1",
@@ -1827,33 +1802,30 @@ test("nexus.gateway_rebind.reload.v1: malformed manager JSON fails closed", asyn
   });
 
   assert.equal(res.isError, true);
-  assert.equal(execState.count, 1);
+  assert.equal(io.count, 1);
   const structured = structuredContent(res);
   assert.equal(structured.ok, false);
   assert.equal((structured.error as Record<string, unknown>).code, "MALFORMED_MANAGER_JSON");
 });
 
 test("nexus.gateway_rebind.reload.v1: timeout produces UNCERTAIN_EFFECT and does not retry (F8)", async (t) => {
-  const execState: { count: number; file?: string; args?: readonly string[]; opts?: any } = { count: 0 };
-  const context = await fixture(t, {
-    ...dedicatedRebindAuth(),
-    gatewayRecovery: {
-      readManagerBytesFn: () => Buffer.from("mock-manager-bytes"),
-      verifyManagerHashFn: () => true,
-      readRequestStoreFn: () => JSON.stringify(GATEWAY_REBIND_STORE),
-      execFileFn: trackingExec(execState, (callback) => {
-        const error = new Error("Command timed out") as Error & {
-          killed: boolean;
-          signal: string;
-          code: string;
-        };
-        error.killed = true;
-        error.signal = "SIGTERM";
-        error.code = "ETIMEDOUT";
-        callback(error, "", "timed out after 30000ms");
-      }),
+  const io = mockGatewayHostIo(t, {
+    manager: Buffer.from("mock-manager-bytes"),
+    acceptManagerHash: true,
+    request: JSON.stringify(GATEWAY_REBIND_STORE),
+    exec: (_file, _args, _opts, callback) => {
+      const error = new Error("Command timed out") as Error & {
+        killed: boolean;
+        signal: string;
+        code: string;
+      };
+      error.killed = true;
+      error.signal = "SIGTERM";
+      error.code = "ETIMEDOUT";
+      callback(error, "", "timed out after 30000ms");
     },
   });
+  const context = await fixture(t, dedicatedRebindAuth());
 
   const res = await context.client.callTool({
     name: "nexus.gateway_rebind.reload.v1",
@@ -1861,7 +1833,7 @@ test("nexus.gateway_rebind.reload.v1: timeout produces UNCERTAIN_EFFECT and does
   });
 
   assert.equal(res.isError, true);
-  assert.equal(execState.count, 1, "Must not invoke manager a second time on timeout");
+  assert.equal(io.count, 1, "Must not invoke manager a second time on timeout");
   const structured = structuredContent(res);
   assert.equal(structured.ok, false);
   assert.equal(structured.uncertainEffect, true);
@@ -1880,25 +1852,11 @@ test("nexus.gateway_rebind.reload.v1: idempotentHint remains false because timeo
 });
 
 test("nexus.gateway_rebind.reload.v1: caller input regex rejects shell metacharacters and invalid formats without host reads", async (t) => {
-  let readCalled = false;
-  let execCalled = false;
-  const context = await fixture(t, {
-    ...dedicatedRebindAuth(),
-    gatewayRecovery: {
-      readManagerBytesFn: () => {
-        readCalled = true;
-        return Buffer.from("must-not-read");
-      },
-      readRequestStoreFn: () => {
-        readCalled = true;
-        return "{}";
-      },
-      execFileFn: (_file, _args, _opts, callback) => {
-        execCalled = true;
-        callback(null, "{}", "");
-      },
-    },
+  const io = mockGatewayHostIo(t, {
+    manager: Buffer.from("must-not-read"),
+    request: "{}",
   });
+  const context = await fixture(t, dedicatedRebindAuth());
 
   const resMeta = await context.client.callTool({
     name: "nexus.gateway_rebind.reload.v1",
@@ -1917,26 +1875,21 @@ test("nexus.gateway_rebind.reload.v1: caller input regex rejects shell metachara
     },
   });
   assert.equal(resHash.isError, true);
-  assert.equal(readCalled, false, "invalid input must not read host manager or request store");
-  assert.equal(execCalled, false, "invalid input must not execute host manager");
+  assert.equal(io.managerReads, 0, "invalid input must not read host manager or request store");
+  assert.equal(io.requestReads, 0, "invalid input must not read host manager or request store");
+  assert.equal(io.count, 0, "invalid input must not execute host manager");
 });
 
 test("nexus.gateway_rebind.reload.v1: no DevSpace restart or launchctl logic is executed", async (t) => {
-  const invokedExecutables: string[] = [];
-  const invokedArgs: string[][] = [];
-  const context = await fixture(t, {
-    ...dedicatedRebindAuth(),
-    gatewayRecovery: {
-      readManagerBytesFn: () => Buffer.from("mock-manager-bytes"),
-      verifyManagerHashFn: () => true,
-      readRequestStoreFn: () => JSON.stringify(GATEWAY_REBIND_STORE),
-      execFileFn: (file, args, _opts, callback) => {
-        invokedExecutables.push(file);
-        invokedArgs.push([...args]);
-        callback(null, JSON.stringify({ success: true, profile: "com.nexus.mcp.gateway.direct" }), "");
-      },
+  const io = mockGatewayHostIo(t, {
+    manager: Buffer.from("mock-manager-bytes"),
+    acceptManagerHash: true,
+    request: JSON.stringify(GATEWAY_REBIND_STORE),
+    exec: (_file, _args, _opts, callback) => {
+      callback(null, JSON.stringify({ success: true, profile: "com.nexus.mcp.gateway.direct" }), "");
     },
   });
+  const context = await fixture(t, dedicatedRebindAuth());
 
   const res = await context.client.callTool({
     name: "nexus.gateway_rebind.reload.v1",
@@ -1944,11 +1897,12 @@ test("nexus.gateway_rebind.reload.v1: no DevSpace restart or launchctl logic is 
   });
 
   assert.equal(res.isError, undefined);
-  assert.equal(invokedExecutables.length, 1);
-  assert.equal(invokedExecutables[0], NEXUS_PYTHON_EXECUTABLE);
-  assert.ok(!invokedExecutables.includes("launchctl"));
-  assert.ok(!invokedExecutables.includes("sh"));
-  assert.ok(!invokedExecutables.includes("bash"));
-  assert.ok(!invokedArgs.flat().includes("launchctl"));
-  assert.ok(!invokedArgs.flat().includes("kickstart"));
+  assert.equal(io.count, 1);
+  assert.equal(io.file, NEXUS_PYTHON_EXECUTABLE);
+  const invoked = [io.file, ...(io.args ?? [])].map(String);
+  assert.equal(invoked.includes("launchctl"), false);
+  assert.equal(invoked.includes("kickstart"), false);
+  assert.equal(invoked.includes("sh"), false);
+  assert.equal(invoked.includes("bash"), false);
+});
 });

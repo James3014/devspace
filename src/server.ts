@@ -1,6 +1,10 @@
-import { execFile } from "node:child_process";
-import { createHash, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { createRequire } from "node:module";
+import { randomUUID } from "node:crypto";
+
+const nodeRequire = createRequire(import.meta.url);
+const nodeChildProcess = nodeRequire("node:child_process") as typeof import("node:child_process");
+const nodeCrypto = nodeRequire("node:crypto") as typeof import("node:crypto");
+const nodeFs = nodeRequire("node:fs") as typeof import("node:fs");
 import { access, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname } from "node:path";
@@ -133,7 +137,8 @@ export const DEDICATED_GATEWAY_REBIND_SCOPE =
   "nexus.gateway_rebind.reload.v1";
 export const DEFAULT_GATEWAY_RECOVERY_TIMEOUT_MS = 30_000;
 export const NEXUS_GATEWAY_RECOVERY_ACTION = "gateway-recover";
-export const NEXUS_GATEWAY_REQUEST_SCHEMA = "nexus.gateway.deployment.v1";
+export const NEXUS_GATEWAY_REQUEST_SCHEMA =
+  "nexus.gateway.durable_recovery_request.v1";
 export const NEXUS_GATEWAY_RECOVERY_PATH =
   "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin";
 export const NEXUS_GATEWAY_RECOVERY_TMPDIR = "/tmp";
@@ -166,32 +171,11 @@ export function nexusGatewayRecoveryEnv(): Record<string, string> {
 }
 
 function sha256Hex(data: Buffer | string): string {
-  return createHash("sha256").update(data).digest("hex");
+  return nodeCrypto.createHash("sha256").update(data).digest("hex");
 }
 
-export function bytesMatchAcceptedGatewayManager(bytes: Buffer | string): boolean {
+function bytesMatchAcceptedGatewayManager(bytes: Buffer | string): boolean {
   return sha256Hex(bytes) === EXPECTED_NEXUS_GATEWAY_MANAGER_SHA256;
-}
-
-type GatewayRecoveryExecOptions = {
-  env?: Record<string, string>;
-  timeout?: number;
-  maxBuffer?: number;
-  cwd?: string;
-  shell?: boolean;
-};
-
-export interface GatewayRecoveryOptions {
-  timeoutMs?: number;
-  readManagerBytesFn?: (path: string) => Buffer | string | Promise<Buffer | string>;
-  readRequestStoreFn?: (path: string) => string | Promise<string>;
-  verifyManagerHashFn?: (bytes: Buffer | string, expectedHash: string) => boolean;
-  execFileFn?: (
-    file: string,
-    args: readonly string[],
-    options: GatewayRecoveryExecOptions,
-    callback: (error: Error | null, stdout: string, stderr: string) => void,
-  ) => void;
 }
 
 interface RunningServer {
@@ -549,7 +533,7 @@ function uiManifestUrl(): URL {
 }
 
 function readWorkspaceAppManifest(): WorkspaceAppManifest {
-  return JSON.parse(readFileSync(uiManifestUrl(), "utf8")) as WorkspaceAppManifest;
+  return JSON.parse(nodeFs.readFileSync(uiManifestUrl(), "utf8")) as WorkspaceAppManifest;
 }
 
 function getWorkspaceAppManifestEntry(): WorkspaceAppManifestEntry {
@@ -1098,7 +1082,6 @@ export function createMcpServer(
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
   agentSessionManager?: LocalAgentSessionManager,
   codexGoals?: CodexGoalSessionManager,
-  gatewayRecovery?: GatewayRecoveryOptions,
 ): McpServer {
   const server = new McpServer(
     {
@@ -3045,20 +3028,12 @@ export function createMcpServer(
       const managerExecutable = NEXUS_GATEWAY_MANAGER_EXECUTABLE;
       const pythonExecutable = NEXUS_PYTHON_EXECUTABLE;
       const requestStorePath = NEXUS_GATEWAY_REQUEST_STORE;
-      const timeoutMs =
-        gatewayRecovery?.timeoutMs ?? DEFAULT_GATEWAY_RECOVERY_TIMEOUT_MS;
-      const execFileRunner = gatewayRecovery?.execFileFn ?? execFile;
+      const timeoutMs = DEFAULT_GATEWAY_RECOVERY_TIMEOUT_MS;
 
       // 3. Pre-exec manager integrity verification (F1)
       let managerBytes: Buffer | string;
       try {
-        if (gatewayRecovery?.readManagerBytesFn) {
-          managerBytes = await gatewayRecovery.readManagerBytesFn(
-            managerExecutable,
-          );
-        } else {
-          managerBytes = readFileSync(managerExecutable);
-        }
+        managerBytes = nodeFs.readFileSync(managerExecutable);
       } catch (err: any) {
         const code = "MANAGER_NOT_INSTALLED";
         const message = `Fixed Nexus manager executable not found at ${managerExecutable}: ${err.message}`;
@@ -3076,13 +3051,7 @@ export function createMcpServer(
       }
 
       const managerSha256 = sha256Hex(managerBytes);
-      const hashMatches = gatewayRecovery?.verifyManagerHashFn
-        ? gatewayRecovery.verifyManagerHashFn(
-            managerBytes,
-            EXPECTED_NEXUS_GATEWAY_MANAGER_SHA256,
-          )
-        : bytesMatchAcceptedGatewayManager(managerBytes);
-      if (!hashMatches) {
+      if (!bytesMatchAcceptedGatewayManager(managerBytes)) {
         const code = "MANAGER_HASH_MISMATCH";
         const message = `Manager hash verification failed before execution. Expected ${EXPECTED_NEXUS_GATEWAY_MANAGER_SHA256}, got ${managerSha256}`;
         return {
@@ -3101,13 +3070,7 @@ export function createMcpServer(
       // 4. Request store integrity and mandatory fence verification (F3)
       let requestContent: string;
       try {
-        if (gatewayRecovery?.readRequestStoreFn) {
-          requestContent = await gatewayRecovery.readRequestStoreFn(
-            requestStorePath,
-          );
-        } else {
-          requestContent = readFileSync(requestStorePath, "utf8");
-        }
+        requestContent = nodeFs.readFileSync(requestStorePath, "utf8");
       } catch (err: any) {
         const code = "REQUEST_STORE_MISSING";
         const message = `Fixed Gateway request store not found at ${requestStorePath}: ${err.message}`;
@@ -3225,7 +3188,7 @@ export function createMcpServer(
         exitCode?: number;
         timedOut?: boolean;
       }>((resolve) => {
-        execFileRunner(
+        nodeChildProcess.execFile(
           pythonExecutable,
           args,
           {
