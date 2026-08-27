@@ -262,11 +262,36 @@ function realpathEqual(left: string, right: string): boolean {
       : value.startsWith("~/")
         ? join(homedir(), value.slice(2))
         : value;
+  const leftExpanded = expandHome(left);
+  const rightExpanded = expandHome(right);
   try {
-    return realpathSync(expandHome(left)) === realpathSync(expandHome(right));
+    if (realpathSync(leftExpanded) === realpathSync(rightExpanded)) {
+      return true;
+    }
   } catch {
-    return false;
+    // fallback to string compare or prefix/suffix ellipsis check below
   }
+  if (leftExpanded === rightExpanded) return true;
+  if (left.includes("…") || left.includes("...")) {
+    const delimiter = left.includes("…") ? "…" : "...";
+    const parts = leftExpanded.split(delimiter);
+    if (parts.length === 2) {
+      const [head, tail] = parts;
+      const target = rightExpanded;
+      const headMatch = !head || target.startsWith(head);
+      const tailMatch = !tail || target.endsWith(tail);
+      if (headMatch && tailMatch) return true;
+      try {
+        const targetReal = realpathSync(target);
+        const realHeadMatch = !head || targetReal.startsWith(realpathSync(head));
+        const realTailMatch = !tail || targetReal.endsWith(tail);
+        if (realHeadMatch && realTailMatch) return true;
+      } catch {
+        // best effort
+      }
+    }
+  }
+  return false;
 }
 
 function modelMatches(observed: string, requested: string): boolean {

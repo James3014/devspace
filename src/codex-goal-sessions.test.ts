@@ -1911,3 +1911,22 @@ test("RED: empty polls do not replay history and one real duplicate is consumed 
     manager.shutdown();
   }
 });
+
+test("Codex Goal accepts ellipsis-truncated directory paths from narrow TUI boxes", async () => {
+  const workspace = realpathSync(tmpdir());
+  const truncatedDir = `${workspace.slice(0, Math.max(5, workspace.length - 8))}…`;
+  const ready = `model: gpt-5.6-sol medium\ndirectory: ${truncatedDir}\nAsk Codex to do anything\n`;
+  const backend = new ScriptedDeltaBackend([{ output: ready }, { output: "" }, { output: "" }, { output: "" }]);
+  const manager = scriptedGoalManager(backend);
+  try {
+    const started = await manager.start({
+      workspaceId: "ws_ellipsis_dir",
+      workspaceRoot: workspace,
+      goal: "verify ellipsis directory",
+    });
+    assert.equal(backend.writes.join(""), "/goal verify ellipsis directory\r");
+    assert.equal(started.goalActiveObserved, true);
+  } finally {
+    manager.shutdown();
+  }
+});
