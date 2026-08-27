@@ -1,6 +1,9 @@
-import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { access, realpath } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
@@ -114,6 +117,82 @@ const SHELL_TOOL_ANNOTATIONS = {
   idempotentHint: false,
   openWorldHint: true,
 };
+
+export const NEXUS_PYTHON_EXECUTABLE =
+  "/Users/jameschen/Workspace/Nexus-new/.venv/bin/python";
+export const NEXUS_GATEWAY_MANAGER_EXECUTABLE =
+  "/Users/jameschen/Library/Application Support/Nexus/gateway-direct/manager.py";
+export const NEXUS_GATEWAY_REQUEST_STORE =
+  "/Users/jameschen/Library/Application Support/Nexus/gateway-direct/request.json";
+export const NEXUS_GATEWAY_EVIDENCE_STORE =
+  "/Users/jameschen/Library/Application Support/Nexus/gateway-direct/evidence.json";
+export const NEXUS_GATEWAY_DIRECT_ROOT = dirname(NEXUS_GATEWAY_MANAGER_EXECUTABLE);
+export const EXPECTED_NEXUS_GATEWAY_MANAGER_SHA256 =
+  "6625224ab881cdbd68f66607d190b1b0b7608c9175a1e69f0222653af467c125";
+export const DEDICATED_GATEWAY_REBIND_SCOPE =
+  "nexus.gateway_rebind.reload.v1";
+export const DEFAULT_GATEWAY_RECOVERY_TIMEOUT_MS = 30_000;
+export const NEXUS_GATEWAY_RECOVERY_ACTION = "gateway-recover";
+export const NEXUS_GATEWAY_REQUEST_SCHEMA = "nexus.gateway.deployment.v1";
+export const NEXUS_GATEWAY_RECOVERY_PATH =
+  "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin";
+export const NEXUS_GATEWAY_RECOVERY_TMPDIR = "/tmp";
+
+export const DEFAULT_NEXUS_PYTHON_EXECUTABLE = NEXUS_PYTHON_EXECUTABLE;
+export const DEFAULT_NEXUS_GATEWAY_MANAGER_EXECUTABLE = NEXUS_GATEWAY_MANAGER_EXECUTABLE;
+export const DEFAULT_NEXUS_GATEWAY_REQUEST_STORE = NEXUS_GATEWAY_REQUEST_STORE;
+export const DEFAULT_NEXUS_GATEWAY_EVIDENCE_STORE = NEXUS_GATEWAY_EVIDENCE_STORE;
+export const DEDICATED_GATEWAY_REBIND_SCOPES = [
+  DEDICATED_GATEWAY_REBIND_SCOPE,
+] as const;
+
+export const NEXUS_GATEWAY_RECOVERY_ARGV = [
+  NEXUS_GATEWAY_MANAGER_EXECUTABLE,
+  NEXUS_GATEWAY_RECOVERY_ACTION,
+  "--gateway-request",
+  NEXUS_GATEWAY_REQUEST_STORE,
+  "--gateway-evidence",
+  NEXUS_GATEWAY_EVIDENCE_STORE,
+] as const;
+
+export function nexusGatewayRecoveryEnv(): Record<string, string> {
+  return {
+    PATH: NEXUS_GATEWAY_RECOVERY_PATH,
+    HOME: homedir(),
+    TMPDIR: NEXUS_GATEWAY_RECOVERY_TMPDIR,
+    PYTHONDONTWRITEBYTECODE: "1",
+    PYTHONUNBUFFERED: "1",
+  };
+}
+
+function sha256Hex(data: Buffer | string): string {
+  return createHash("sha256").update(data).digest("hex");
+}
+
+export function bytesMatchAcceptedGatewayManager(bytes: Buffer | string): boolean {
+  return sha256Hex(bytes) === EXPECTED_NEXUS_GATEWAY_MANAGER_SHA256;
+}
+
+type GatewayRecoveryExecOptions = {
+  env?: Record<string, string>;
+  timeout?: number;
+  maxBuffer?: number;
+  cwd?: string;
+  shell?: boolean;
+};
+
+export interface GatewayRecoveryOptions {
+  timeoutMs?: number;
+  readManagerBytesFn?: (path: string) => Buffer | string | Promise<Buffer | string>;
+  readRequestStoreFn?: (path: string) => string | Promise<string>;
+  verifyManagerHashFn?: (bytes: Buffer | string, expectedHash: string) => boolean;
+  execFileFn?: (
+    file: string,
+    args: readonly string[],
+    options: GatewayRecoveryExecOptions,
+    callback: (error: Error | null, stdout: string, stderr: string) => void,
+  ) => void;
+}
 
 interface RunningServer {
   app: ReturnType<typeof createMcpExpressApp>;
@@ -1019,6 +1098,7 @@ export function createMcpServer(
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
   agentSessionManager?: LocalAgentSessionManager,
   codexGoals?: CodexGoalSessionManager,
+  gatewayRecovery?: GatewayRecoveryOptions,
 ): McpServer {
   const server = new McpServer(
     {
@@ -2891,6 +2971,370 @@ export function createMcpServer(
       },
     );
   }
+
+  // ── Nexus Gateway Recovery / Rebind Transport ──
+  registerAppTool(
+    server,
+    "nexus.gateway_rebind.reload.v1",
+    {
+      title: "Nexus Gateway Rebind & Recovery",
+      description:
+        "Invoke the fixed governed Nexus Gateway R1 recovery manager to rebind/reload the host Gateway. Dedicated OAuth scope required. DevSpace acts only as transport seam.",
+      inputSchema: {
+        requestHash: z
+          .string()
+          .regex(/^[0-9a-fA-F]{64}$/)
+          .describe("Required 64-character hex SHA-256 of the stored GatewayRecoveryRequest.request_hash fence."),
+        requestId: z
+          .string()
+          .regex(/^[A-Za-z0-9._:-]{1,128}$/)
+          .describe("Required immutable request_id fence to match against the fixed GatewayRecoveryRequest store."),
+      },
+      outputSchema: {
+        ok: z.boolean(),
+        uncertainEffect: z.boolean().optional(),
+        reconciliationRequired: z.boolean().optional(),
+        exitCode: z.number().nullable().optional(),
+        receipt: z.record(z.string(), z.unknown()).optional(),
+        error: z
+          .object({
+            code: z.string(),
+            message: z.string(),
+            timedOut: z.boolean().optional(),
+          })
+          .optional(),
+        stdout: z.string().optional(),
+        stderr: z.string().optional(),
+      },
+      _meta: {},
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async ({ requestHash, requestId }, extra) => {
+      // 1. Dedicated OAuth scope authorization check
+      const configuredScopes = config.oauth.scopes ?? [];
+      const hasConfiguredDedicatedScope = configuredScopes.includes(
+        DEDICATED_GATEWAY_REBIND_SCOPE,
+      );
+      const tokenScopes = extra?.authInfo?.scopes ?? [];
+      const hasAuthorizedDedicatedScope = tokenScopes.includes(
+        DEDICATED_GATEWAY_REBIND_SCOPE,
+      );
+
+      if (!hasConfiguredDedicatedScope || !hasAuthorizedDedicatedScope) {
+        const code = "GATEWAY_REBIND_SCOPE_NOT_CONFIGURED";
+        const message = `Dedicated Gateway rebind OAuth scope (${DEDICATED_GATEWAY_REBIND_SCOPE}) is required and not configured or authorized.`;
+        return {
+          isError: true,
+          content: [textBlock(`[${code}] ${message}`)],
+          structuredContent: {
+            ok: false,
+            error: {
+              code,
+              message,
+            },
+          },
+        };
+      }
+
+      // 2. Fixed paths (immutable constants)
+      const managerExecutable = NEXUS_GATEWAY_MANAGER_EXECUTABLE;
+      const pythonExecutable = NEXUS_PYTHON_EXECUTABLE;
+      const requestStorePath = NEXUS_GATEWAY_REQUEST_STORE;
+      const timeoutMs =
+        gatewayRecovery?.timeoutMs ?? DEFAULT_GATEWAY_RECOVERY_TIMEOUT_MS;
+      const execFileRunner = gatewayRecovery?.execFileFn ?? execFile;
+
+      // 3. Pre-exec manager integrity verification (F1)
+      let managerBytes: Buffer | string;
+      try {
+        if (gatewayRecovery?.readManagerBytesFn) {
+          managerBytes = await gatewayRecovery.readManagerBytesFn(
+            managerExecutable,
+          );
+        } else {
+          managerBytes = readFileSync(managerExecutable);
+        }
+      } catch (err: any) {
+        const code = "MANAGER_NOT_INSTALLED";
+        const message = `Fixed Nexus manager executable not found at ${managerExecutable}: ${err.message}`;
+        return {
+          isError: true,
+          content: [textBlock(`[${code}] ${message}`)],
+          structuredContent: {
+            ok: false,
+            error: {
+              code,
+              message,
+            },
+          },
+        };
+      }
+
+      const managerSha256 = sha256Hex(managerBytes);
+      const hashMatches = gatewayRecovery?.verifyManagerHashFn
+        ? gatewayRecovery.verifyManagerHashFn(
+            managerBytes,
+            EXPECTED_NEXUS_GATEWAY_MANAGER_SHA256,
+          )
+        : bytesMatchAcceptedGatewayManager(managerBytes);
+      if (!hashMatches) {
+        const code = "MANAGER_HASH_MISMATCH";
+        const message = `Manager hash verification failed before execution. Expected ${EXPECTED_NEXUS_GATEWAY_MANAGER_SHA256}, got ${managerSha256}`;
+        return {
+          isError: true,
+          content: [textBlock(`[${code}] ${message}`)],
+          structuredContent: {
+            ok: false,
+            error: {
+              code,
+              message,
+            },
+          },
+        };
+      }
+
+      // 4. Request store integrity and mandatory fence verification (F3)
+      let requestContent: string;
+      try {
+        if (gatewayRecovery?.readRequestStoreFn) {
+          requestContent = await gatewayRecovery.readRequestStoreFn(
+            requestStorePath,
+          );
+        } else {
+          requestContent = readFileSync(requestStorePath, "utf8");
+        }
+      } catch (err: any) {
+        const code = "REQUEST_STORE_MISSING";
+        const message = `Fixed Gateway request store not found at ${requestStorePath}: ${err.message}`;
+        return {
+          isError: true,
+          content: [textBlock(`[${code}] ${message}`)],
+          structuredContent: {
+            ok: false,
+            error: {
+              code,
+              message,
+            },
+          },
+        };
+      }
+
+      let parsedRequest: any;
+      try {
+        parsedRequest = JSON.parse(requestContent);
+      } catch (err: any) {
+        const code = "MALFORMED_MANAGER_JSON";
+        const message = `Failed to parse fixed request store at ${requestStorePath}: ${err.message}`;
+        return {
+          isError: true,
+          content: [textBlock(`[${code}] ${message}`)],
+          structuredContent: {
+            ok: false,
+            error: {
+              code,
+              message,
+            },
+          },
+        };
+      }
+
+      const storedRequestId =
+        parsedRequest && typeof parsedRequest === "object"
+          ? parsedRequest.request_id
+          : undefined;
+      const storedRequestHash =
+        parsedRequest && typeof parsedRequest === "object"
+          ? parsedRequest.request_hash
+          : undefined;
+      const storedHashIsFence =
+        typeof storedRequestHash === "string" &&
+        /^[0-9a-fA-F]{64}$/.test(storedRequestHash);
+
+      if (
+        !parsedRequest ||
+        typeof parsedRequest !== "object" ||
+        parsedRequest.schema !== NEXUS_GATEWAY_REQUEST_SCHEMA ||
+        parsedRequest.operation !== NEXUS_GATEWAY_RECOVERY_ACTION ||
+        typeof storedRequestId !== "string" ||
+        !storedRequestId ||
+        !storedHashIsFence
+      ) {
+        const code = "REQUEST_FENCE_REJECTED";
+        const message =
+          "Fixed request store missing valid schema, operation, request_id, or request_hash fence";
+        return {
+          isError: true,
+          content: [textBlock(`[${code}] ${message}`)],
+          structuredContent: {
+            ok: false,
+            error: {
+              code,
+              message,
+            },
+          },
+        };
+      }
+
+      if (storedRequestId !== requestId) {
+        const code = "REQUEST_FENCE_REJECTED";
+        const message = `Request ID mismatch: stored ${storedRequestId}, caller ${requestId}`;
+        return {
+          isError: true,
+          content: [textBlock(`[${code}] ${message}`)],
+          structuredContent: {
+            ok: false,
+            error: {
+              code,
+              message,
+            },
+          },
+        };
+      }
+
+      const fenceHash = storedRequestHash as string;
+      if (fenceHash.toLowerCase() !== requestHash.toLowerCase()) {
+        const code = "REQUEST_FENCE_REJECTED";
+        const message =
+          "Request hash mismatch: caller requestHash must equal stored request_hash";
+        return {
+          isError: true,
+          content: [textBlock(`[${code}] ${message}`)],
+          structuredContent: {
+            ok: false,
+            error: {
+              code,
+              message,
+            },
+          },
+        };
+      }
+
+      // 5. Fixed invocation & minimal safe environment (F6, F9)
+      const args = [...NEXUS_GATEWAY_RECOVERY_ARGV];
+      const safeEnv = nexusGatewayRecoveryEnv();
+
+      const execution = await new Promise<{
+        stdout: string;
+        stderr: string;
+        error: Error | null;
+        exitCode?: number;
+        timedOut?: boolean;
+      }>((resolve) => {
+        execFileRunner(
+          pythonExecutable,
+          args,
+          {
+            env: safeEnv,
+            timeout: timeoutMs,
+            maxBuffer: 10 * 1024 * 1024,
+            cwd: NEXUS_GATEWAY_DIRECT_ROOT,
+            shell: false,
+          },
+          (error, stdout, stderr) => {
+            const timedOut = Boolean(
+              error &&
+                ((error as any).killed ||
+                  (error as any).signal === "SIGTERM" ||
+                  (error as any).code === "ETIMEDOUT"),
+            );
+            resolve({
+              stdout: stdout?.toString() ?? "",
+              stderr: stderr?.toString() ?? "",
+              error,
+              exitCode:
+                (error as any)?.code && typeof (error as any).code === "number"
+                  ? (error as any).code
+                  : (error ? 1 : 0),
+              timedOut,
+            });
+          },
+        );
+      });
+
+      if (execution.timedOut) {
+        const code = "UNCERTAIN_EFFECT";
+        const message =
+          "Gateway recovery execution timed out. Status of host effect is uncertain; must reconcile through the same request/fence before retry.";
+        return {
+          isError: true,
+          content: [textBlock(`[${code}] ${message}`)],
+          structuredContent: {
+            ok: false,
+            uncertainEffect: true,
+            reconciliationRequired: true,
+            error: {
+              code,
+              message,
+              timedOut: true,
+            },
+            stdout: execution.stdout,
+            stderr: execution.stderr,
+          },
+        };
+      }
+
+      if (execution.error) {
+        const code = "MANAGER_EXIT_NON_ZERO";
+        const message =
+          execution.error.message ||
+          `Manager process exited with code ${execution.exitCode}`;
+        return {
+          isError: true,
+          content: [textBlock(`[${code}] ${message}\n${execution.stderr}`)],
+          structuredContent: {
+            ok: false,
+            exitCode: execution.exitCode,
+            error: {
+              code,
+              message,
+            },
+            stdout: execution.stdout,
+            stderr: execution.stderr,
+          },
+        };
+      }
+
+      let receipt: Record<string, unknown>;
+      try {
+        receipt = JSON.parse(execution.stdout.trim());
+      } catch (parseErr: any) {
+        const code = "MALFORMED_MANAGER_JSON";
+        const message = `Failed to parse manager stdout as JSON: ${parseErr.message}`;
+        return {
+          isError: true,
+          content: [textBlock(`[${code}] ${message}`)],
+          structuredContent: {
+            ok: false,
+            error: {
+              code,
+              message,
+            },
+            stdout: execution.stdout,
+            stderr: execution.stderr,
+          },
+        };
+      }
+
+      return {
+        content: [
+          textBlock(
+            `Nexus Gateway recovery completed successfully: ${JSON.stringify(receipt)}`,
+          ),
+        ],
+        structuredContent: {
+          ok: true,
+          receipt,
+          stdout: execution.stdout,
+          stderr: execution.stderr,
+        },
+      };
+    },
+  );
 
   return server;
 }
