@@ -25,10 +25,19 @@ assert.equal(isSubagentProviderEnabled(config, "pi"), false);
 assert.equal(subagentProviderConfig(config, "codex")?.model, "gpt-5.4");
 
 assert.equal(resolveSubagentsConfig(config, { DEVSPACE_SUBAGENTS: "0" }).enabled, false);
-assert.equal(resolveSubagentsConfig({ ...config, enabled: false }, {
+const explicitProvidersWithMasterOverride = resolveSubagentsConfig({ ...config, enabled: false }, {
   DEVSPACE_SUBAGENTS: "1",
-}).enabled, true);
+});
+assert.equal(explicitProvidersWithMasterOverride.enabled, true);
+assert.equal(explicitProvidersWithMasterOverride.providers.length, 2);
+assert.equal(isSubagentProviderEnabled(explicitProvidersWithMasterOverride, "codex"), true);
+assert.equal(isSubagentProviderEnabled(explicitProvidersWithMasterOverride, "pi"), false);
 assert.equal(resolveSubagentsConfig(undefined, {}).providers.length, 0);
+const legacyEnvEnabled = resolveSubagentsConfig(undefined, { DEVSPACE_SUBAGENTS: "1" });
+assert.equal(legacyEnvEnabled.enabled, true);
+assert.equal(legacyEnvEnabled.providers.length, 9);
+assert.equal(legacyEnvEnabled.providers.every((provider) => provider.enabled), true);
+assert.equal(resolveSubagentsConfig(undefined, { DEVSPACE_SUBAGENTS: "0" }).providers.length, 0);
 assert.equal(resolveSubagentsConfig(true, {}).providers.length, 9);
 
 assert.throws(

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants, access } from "node:fs/promises";
+import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
 import {
   HeadTailBuffer,
@@ -131,12 +132,14 @@ async function assertExecutableFile(path: string): Promise<void> {
  * Deterministic Codex CLI resolution:
  * 1. DEVSPACE_CODEX_BIN when explicitly configured (fail closed when invalid);
  * 2. an executable `codex` found on PATH;
- * 3. the macOS ChatGPT.app bundled CLI.
+ * 3. the current user's Codex plugin CLI on macOS;
+ * 4. the macOS ChatGPT.app bundled CLI.
  */
 export async function resolveCodexBinary(options: {
   configuredBin?: string;
   platform?: NodeJS.Platform;
   pathEnv?: string;
+  homeDir?: string;
 } = {}): Promise<string> {
   const platform = options.platform ?? process.platform;
   const configured = assertNonEmpty(options.configuredBin, "DEVSPACE_CODEX_BIN");
@@ -158,6 +161,20 @@ export async function resolveCodexBinary(options: {
   }
 
   if (platform === "darwin") {
+    const userPluginFallback = join(
+      options.homeDir ?? homedir(),
+      ".codex",
+      "plugins",
+      ".plugin-appserver",
+      "codex",
+    );
+    try {
+      await access(userPluginFallback, fsConstants.X_OK);
+      return userPluginFallback;
+    } catch {
+      // continue to the app-bundled fallback
+    }
+
     try {
       await access(MACOS_CODEX_FALLBACK, fsConstants.X_OK);
       return MACOS_CODEX_FALLBACK;

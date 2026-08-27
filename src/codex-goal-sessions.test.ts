@@ -274,6 +274,15 @@ test("resolveCodexBinary prefers explicit override then PATH then fails clearly"
       onPath,
     );
 
+    const pluginHome = join(rootDir, "plugin-home");
+    const pluginBin = join(pluginHome, ".codex", "plugins", ".plugin-appserver", "codex");
+    await mkdir(join(pluginHome, ".codex", "plugins", ".plugin-appserver"), { recursive: true });
+    writeFileSync(pluginBin, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    assert.equal(
+      await resolveCodexBinary({ platform: "darwin", pathEnv: "", homeDir: pluginHome }),
+      pluginBin,
+    );
+
     await assert.rejects(
       () => resolveCodexBinary({ platform: "linux", pathEnv: "" }),
       /Codex CLI executable not found/,
