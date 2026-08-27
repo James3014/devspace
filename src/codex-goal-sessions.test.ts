@@ -155,7 +155,7 @@ async function goalFixture(t: TestContext, options: GoalFixtureOptions = {}): Pr
     workspaces,
     createReviewCheckpointManager(),
     processes,
-    () => [],
+    [],
     [],
     undefined,
     goals,
