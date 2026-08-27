@@ -83,7 +83,7 @@ const manifestBody = {
     ? "nexus-canonical-gateway-proxy"
     : NEXUS_MCP_TOOL_SURFACE,
   effective_tool_count: surfaceIdentity.surface_profile === "canonical_gateway_proxy"
-    ? gatewayToolCount
+    ? surfaceIdentity.effective_tool_count
     : NEXUS_MCP_TOOL_COUNT,
   surface_profile: surfaceIdentity.surface_profile,
   protocol_mode: surfaceIdentity.protocol_mode,
@@ -92,6 +92,8 @@ const manifestBody = {
   observed_manifest_count: surfaceIdentity.observed_manifest_count,
   observed_manifest_revision: surfaceIdentity.observed_manifest_revision,
   observed_manifest_sha256: surfaceIdentity.observed_manifest_sha256,
+  local_protected_tool_count: surfaceIdentity.local_protected_tool_count,
+  local_protected_tools: surfaceIdentity.local_protected_tools,
   gateway_name: gatewayName,
   gateway_version: gatewayVersion,
   gateway_commit: gatewayCommit,

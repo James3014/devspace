@@ -40,7 +40,7 @@ import {
   writeFileTool,
 } from "./pi-tools.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
-import { NEXUS_MCP_TOOL_COUNT, NEXUS_MCP_TOOL_NAMES } from "./nexus-tools.js";
+import { NEXUS_MCP_TOOL_COUNT, NEXUS_MCP_TOOL_NAMES, readPackageBuildIdentity } from "./nexus-tools.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
@@ -65,6 +65,7 @@ import {
   type IntegrationTargetResolver,
 } from "./git-pr-merge.js";
 import {
+  assertCanonicalGatewayProxyManifestCompatible,
   createNexusGatewayProxyServer,
   fetchNexusGatewayToolManifest,
   nexusGatewayManifestIdentity,
@@ -514,7 +515,9 @@ export async function createMcpServer(
     if (!gatewayManifest) {
       throw new Error("canonical gateway manifest is unavailable; public MCP remains fail-closed");
     }
-    return await createNexusGatewayProxyServer(config, gatewayManifest);
+    return await createNexusGatewayProxyServer(config, gatewayManifest, {
+      gitMergeTransportFactory: overrides?.gitMergeTransportFactory,
+    });
   }
   const toolNames = toolNamesFor(config);
   const server = new McpServer(
@@ -1879,6 +1882,11 @@ export function createServer(
     config.surfaceProfile === "canonical_gateway_proxy"
       ? fetchNexusGatewayToolManifest(config)
           .then((manifest) => {
+            // Shared compatibility gate: a Gateway manifest that collides with
+            // the server-local protected extension must fail readiness (and
+            // therefore /healthz) here, before the surface is declared
+            // healthy and before any MCP server construction is attempted.
+            assertCanonicalGatewayProxyManifestCompatible(manifest);
             observedManifest = nexusGatewayManifestIdentity(manifest, manifest.revision);
             return manifest;
           })
@@ -1965,6 +1973,7 @@ export function createServer(
       name: identity.proxy_mode ? "nexus-mcp-gateway" : "devspace",
       ...identity,
       manifest_status: ready ? (identity.proxy_mode ? "verified" : "not_applicable") : "unavailable",
+      build: readPackageBuildIdentity(),
       ...(ready ? {} : { disposition: "PUBLIC_SURFACE_FAIL_CLOSED" }),
     });
   });

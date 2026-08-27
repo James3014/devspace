@@ -14,6 +14,7 @@ import {
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 import { createServer } from "./server.js";
+import { readPackageBuildIdentity } from "./nexus-tools.js";
 
 function createTestServer(): McpServer {
   const server = new McpServer(
@@ -231,9 +232,13 @@ try {
       observed_manifest_count: null,
       observed_manifest_revision: null,
       observed_manifest_sha256: null,
+      effective_tool_count: null,
+      local_protected_tool_count: null,
+      local_protected_tools: null,
       proxy_mode: false,
       gateway_url: null,
       manifest_status: "not_applicable",
+      build: readPackageBuildIdentity(),
     });
 
     const unauthenticated = await fetch(`${baseUrl}/mcp`, {
@@ -251,4 +256,128 @@ try {
   }
 } finally {
   await rm(serverRoot, { recursive: true, force: true });
+}
+
+// B-light v2 readiness gate: a Gateway tools/list manifest that collides with
+// the server-local protected extension must fail closed at /healthz (503,
+// ok=false, manifest_status=unavailable, disposition=PUBLIC_SURFACE_FAIL_CLOSED),
+// NOT report a false-green healthy surface. A non-colliding manifest stays
+// healthy with the hybrid identity.
+{
+  async function listenOnPort(running: ReturnType<typeof createServer>): Promise<{ baseUrl: string; close: () => Promise<void> }> {
+    const listener = await new Promise<ReturnType<typeof running.app.listen>>((resolve) => {
+      const instance = running.app.listen(0, "127.0.0.1", () => resolve(instance));
+    });
+    const address = listener.address();
+    if (!address || typeof address === "string") throw new Error("test server did not bind a TCP port");
+    return {
+      baseUrl: `http://127.0.0.1:${address.port}`,
+      close: async () => {
+        if (listener.listening) {
+          await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
+        }
+        await running.close();
+      },
+    };
+  }
+
+  async function proxyServer(base: string): Promise<ReturnType<typeof createServer>> {
+    const stateDir = join(base, ".state");
+    return createServer(loadConfig({
+      DEVSPACE_CONFIG_DIR: join(base, ".empty-config"),
+      DEVSPACE_ALLOWED_ROOTS: base,
+      DEVSPACE_STATE_DIR: stateDir,
+      DEVSPACE_AGENT_DIR: join(base, ".agent"),
+      DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+      DEVSPACE_LOG_LEVEL: "silent",
+      NEXUS_MCP_SURFACE_PROFILE: "canonical_gateway_proxy",
+      NEXUS_GATEWAY_PROXY_URL: "http://127.0.0.1:8766",
+      NEXUS_GATEWAY_PROXY_TOKEN: "gateway-token-that-is-long-enough",
+      MCP_PROTOCOL_MODE: "dual",
+    }));
+  }
+
+  function stubGatewayManifest(tools: Array<Record<string, unknown>>): typeof fetch {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input, init) => {
+      const url = String(input);
+      if (!url.startsWith("http://127.0.0.1:8766")) {
+        return originalFetch(input, init);
+      }
+      const bodyText = init ? String(init.body ?? "") : "";
+      let body: { method?: string; id?: unknown } | undefined;
+      try {
+        body = bodyText ? JSON.parse(bodyText) : undefined;
+      } catch {
+        body = undefined;
+      }
+      if (body?.method === "tools/list") {
+        return new Response(JSON.stringify({
+          jsonrpc: "2.0",
+          id: body.id,
+          result: { manifest_revision: "gateway-revision-7", tools },
+        }), { status: 200, headers: { "content-type": "application/json" } });
+      }
+      return new Response(JSON.stringify({ jsonrpc: "2.0", id: "x", result: {} }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }) as typeof fetch;
+    return originalFetch;
+  }
+
+  const readinessRoot = await mkdtemp(join(tmpdir(), "devspace-mcp-readiness-test-"));
+  const originalFetch = globalThis.fetch;
+  try {
+    // Colliding manifest -> fail-closed readiness.
+    {
+      stubGatewayManifest([
+        { name: "nexus_gateway_status", description: "status", inputSchema: { type: "object", properties: {} } },
+        { name: "git_merge_pull_request", description: "gateway-owned", inputSchema: { type: "object", properties: {} } },
+      ]);
+      const running = await proxyServer(join(readinessRoot, "collision"));
+      const bound = await listenOnPort(running);
+      try {
+        const health = await fetch(`${bound.baseUrl}/healthz`);
+        assert.equal(health.status, 503, "colliding manifest must not be healthy");
+        const body = await health.json();
+        assert.equal(body.ok, false);
+        assert.equal(body.manifest_status, "unavailable");
+        assert.equal(body.disposition, "PUBLIC_SURFACE_FAIL_CLOSED");
+        assert.equal(body.observed_manifest_count, null, "readiness must not claim an observed manifest on collision");
+      } finally {
+        await bound.close();
+      }
+    }
+
+    // Non-colliding manifest -> healthy with hybrid identity.
+    {
+      stubGatewayManifest([
+        { name: "nexus_gateway_status", description: "status", inputSchema: { type: "object", properties: {} } },
+        { name: "nexus_candidate_approve", description: "approve", inputSchema: { type: "object", properties: {} } },
+      ]);
+      const running = await proxyServer(join(readinessRoot, "healthy"));
+      const bound = await listenOnPort(running);
+      try {
+        const health = await fetch(`${bound.baseUrl}/healthz`);
+        assert.equal(health.status, 200, "non-colliding manifest must stay healthy");
+        const body = await health.json();
+        assert.equal(body.ok, true);
+        assert.equal(body.manifest_status, "verified");
+        assert.equal(body.tool_source, "canonical_gateway_manifest_plus_local_protected");
+        assert.equal(body.observed_manifest_count, 2);
+        assert.equal(body.effective_tool_count, 4);
+        assert.equal(body.local_protected_tool_count, 2);
+        assert.deepEqual(body.local_protected_tools, [
+          "git_merge_pull_request",
+          "github_complete_pull_request",
+        ]);
+      } finally {
+        await bound.close();
+      }
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+    await rm(readinessRoot, { recursive: true, force: true });
+  }
 }

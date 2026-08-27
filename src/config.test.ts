@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import express from "express";
@@ -39,6 +39,9 @@ assert.deepEqual(getSurfaceIdentity(loadConfig(baseEnv)), {
   observed_manifest_count: null,
   observed_manifest_revision: null,
   observed_manifest_sha256: null,
+  effective_tool_count: null,
+  local_protected_tool_count: null,
+  local_protected_tools: null,
   proxy_mode: false,
   gateway_url: null,
 });
@@ -259,6 +262,58 @@ assert.throws(
 
 assert.equal(loadConfig(baseEnv).publicBaseUrl, "http://127.0.0.1:7676");
 assert.deepEqual(loadConfig(baseEnv).allowedHosts, ["localhost", "127.0.0.1", "::1"]);
+
+// Server-bound canonical source root: parsed + resolved from env, never set by default
+assert.equal(loadConfig(baseEnv).nexusCanonicalSourceRoot, undefined);
+assert.equal(loadConfig(baseEnv).nexusPythonBin, undefined);
+assert.equal(
+  loadConfig({ ...baseEnv, NEXUS_CANONICAL_SOURCE_ROOT: "/tmp/nexus/../nexus-new" }).nexusCanonicalSourceRoot,
+  "/tmp/nexus-new",
+);
+assert.equal(
+  loadConfig({ ...baseEnv, NEXUS_PYTHON_BIN: "/tmp/nexus/../venv/bin/python" }).nexusPythonBin,
+  "/tmp/venv/bin/python",
+);
+{
+  const root = join(tmpdir(), `nexus-python-default-${process.pid}`);
+  const pythonPath = join(root, ".venv", "bin", "python");
+  mkdirSync(join(root, ".venv", "bin"), { recursive: true });
+  writeFileSync(pythonPath, "");
+  try {
+    assert.equal(
+      loadConfig({ ...baseEnv, NEXUS_CANONICAL_SOURCE_ROOT: root }).nexusPythonBin,
+      pythonPath,
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+// Hybrid public surface identity: canonical gateway manifest + local protected extension
+{
+  const proxyConfig = loadConfig({
+    ...baseEnv,
+    NEXUS_MCP_SURFACE_PROFILE: "canonical_gateway_proxy",
+    NEXUS_GATEWAY_PROXY_URL: "http://127.0.0.1:8766",
+    NEXUS_GATEWAY_PROXY_TOKEN: "gateway-token-that-is-long-enough",
+  });
+  const proxyIdentity = getSurfaceIdentity(proxyConfig, {
+    count: 28,
+    revision: "gateway-revision-7",
+    sha256: "d".repeat(64),
+  });
+  assert.equal(proxyIdentity.surface_profile, "canonical_gateway_proxy");
+  assert.equal(proxyIdentity.tool_source, "canonical_gateway_manifest_plus_local_protected");
+  assert.equal(proxyIdentity.observed_manifest_count, 28);
+  assert.equal(proxyIdentity.effective_tool_count, 30);
+  assert.equal(proxyIdentity.local_protected_tool_count, 2);
+  assert.deepEqual(proxyIdentity.local_protected_tools, [
+    "git_merge_pull_request",
+    "github_complete_pull_request",
+  ]);
+  assert.equal(proxyIdentity.proxy_mode, true);
+  assert.equal(proxyIdentity.gateway_url, "http://127.0.0.1:8766");
+}
 
 assert.equal(
   loadConfig({

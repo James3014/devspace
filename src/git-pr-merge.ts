@@ -336,6 +336,7 @@ export interface PullRequestView {
   baseRefOid: string;
   headRefName: string;
   headRefOid: string;
+  isCrossRepository?: boolean;
   mergeable: string;
   mergeStateStatus: string;
   merged: boolean;
@@ -389,6 +390,26 @@ export interface MergeResultView {
   message: string | null;
 }
 
+export interface CommitObjectView {
+  sha: string;
+  treeSha: string;
+  parentShas: string[];
+}
+
+export interface PullRequestReviewState {
+  reviews: Array<{ reviewer: string; state: string }>;
+  unresolvedThreads: number;
+}
+
+/** Extra read-only observations required by the #599 completion host binding. */
+export interface GitHubCompletionTransport extends GitHubPullRequestTransport {
+  getCommitObject(repo: string, commitSha: string): Promise<CommitObjectView>;
+  getBlobShaAtRef(repo: string, refSha: string, path: string): Promise<string>;
+  compareChangedFiles(repo: string, oldSha: string, newSha: string): Promise<string[]>;
+  getPullRequestReviewState(repo: string, prNumber: number): Promise<PullRequestReviewState>;
+  isPlatformApprovalRequired(repo: string, branch: string): Promise<boolean>;
+}
+
 /**
  * Narrow GitHub transport abstraction used by the core action. Core logic never
  * touches `gh`/`git` directly; it only talks to this interface so TOCTOU and
@@ -436,7 +457,7 @@ function defaultGhExec(
   );
 }
 
-export class GhCliGitHubTransport implements GitHubPullRequestTransport {
+export class GhCliGitHubTransport implements GitHubCompletionTransport {
   constructor(private readonly run: GhExecFn = defaultGhExec) {}
 
   private gh(args: string[]): Promise<string> {
@@ -505,6 +526,7 @@ export class GhCliGitHubTransport implements GitHubPullRequestTransport {
       "baseRefOid",
       "headRefName",
       "headRefOid",
+      "isCrossRepository",
       "mergeable",
       "mergeStateStatus",
       "mergedAt",
@@ -549,6 +571,7 @@ export class GhCliGitHubTransport implements GitHubPullRequestTransport {
       baseRefOid: String(p.baseRefOid ?? ""),
       headRefName: String(p.headRefName ?? ""),
       headRefOid: String(p.headRefOid ?? ""),
+      isCrossRepository: p.isCrossRepository === true,
       mergeable: String(p.mergeable ?? "UNKNOWN"),
       mergeStateStatus: String(p.mergeStateStatus ?? "UNKNOWN"),
       merged: p.state === "MERGED" || mergedAt !== null,
@@ -704,6 +727,134 @@ export class GhCliGitHubTransport implements GitHubPullRequestTransport {
         return { context: entry.context, state: entry.state };
       })
       .filter((s): s is CommitStatusEvidence => s !== null);
+  }
+
+  async getCommitObject(repo: string, commitSha: string): Promise<CommitObjectView> {
+    const body = await this.apiJson(["api", `repos/${repo}/git/commits/${commitSha}`]);
+    const record = body && !Array.isArray(body) ? body : {};
+    const tree = record.tree && typeof record.tree === "object"
+      ? (record.tree as { sha?: unknown })
+      : null;
+    const parents = Array.isArray(record.parents) ? record.parents : [];
+    return {
+      sha: typeof record.sha === "string" ? record.sha : "",
+      treeSha: tree && typeof tree.sha === "string" ? tree.sha : "",
+      parentShas: parents
+        .map((parent) => parent && typeof parent === "object" ? (parent as { sha?: unknown }).sha : undefined)
+        .filter((sha): sha is string => typeof sha === "string"),
+    };
+  }
+
+  async getBlobShaAtRef(repo: string, refSha: string, path: string): Promise<string> {
+    const encodedPath = path.split("/").map((part) => encodeURIComponent(part)).join("/");
+    const body = await this.apiJson([
+      "api",
+      "--method",
+      "GET",
+      `repos/${repo}/contents/${encodedPath}`,
+      "-f",
+      `ref=${refSha}`,
+    ]);
+    const record = body && !Array.isArray(body) ? body : {};
+    return typeof record.sha === "string" ? record.sha : "";
+  }
+
+  async compareChangedFiles(repo: string, oldSha: string, newSha: string): Promise<string[]> {
+    const body = await this.apiJson(["api", `repos/${repo}/compare/${oldSha}...${newSha}`]);
+    const record = body && !Array.isArray(body) ? body : {};
+    const files = Array.isArray(record.files) ? record.files : [];
+    return files
+      .map((file) => file && typeof file === "object" ? (file as { filename?: unknown }).filename : undefined)
+      .filter((name): name is string => typeof name === "string" && name.length > 0);
+  }
+
+  async getPullRequestReviewState(repo: string, prNumber: number): Promise<PullRequestReviewState> {
+    const [owner, name] = repo.split("/", 2);
+    const query = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){reviewThreads(first:100){nodes{isResolved}} reviews(first:100){nodes{author{login} state submittedAt}}}}}`;
+    const body = await this.apiJson([
+      "api",
+      "graphql",
+      "-f",
+      `query=${query}`,
+      "-F",
+      `owner=${owner}`,
+      "-F",
+      `name=${name}`,
+      "-F",
+      `number=${prNumber}`,
+    ]);
+    const repository = body && !Array.isArray(body) && body.data && typeof body.data === "object"
+      ? (body.data as { repository?: unknown }).repository
+      : undefined;
+    const pullRequest = repository && typeof repository === "object"
+      ? (repository as { pullRequest?: unknown }).pullRequest
+      : undefined;
+    const pr = pullRequest && typeof pullRequest === "object" ? pullRequest as Record<string, unknown> : {};
+    const reviewThreads = pr.reviewThreads && typeof pr.reviewThreads === "object"
+      ? (pr.reviewThreads as { nodes?: unknown }).nodes
+      : [];
+    const reviewNodes = pr.reviews && typeof pr.reviews === "object"
+      ? (pr.reviews as { nodes?: unknown }).nodes
+      : [];
+    const latest = new Map<string, { reviewer: string; state: string; submittedAt: string }>();
+    if (Array.isArray(reviewNodes)) {
+      for (const node of reviewNodes) {
+        if (!node || typeof node !== "object") continue;
+        const review = node as { author?: unknown; state?: unknown; submittedAt?: unknown };
+        const author = review.author && typeof review.author === "object"
+          ? (review.author as { login?: unknown }).login
+          : undefined;
+        if (typeof author !== "string" || typeof review.state !== "string") continue;
+        const submittedAt = typeof review.submittedAt === "string" ? review.submittedAt : "";
+        const existing = latest.get(author);
+        if (!existing || submittedAt >= existing.submittedAt) {
+          latest.set(author, { reviewer: author, state: review.state, submittedAt });
+        }
+      }
+    }
+    const unresolvedThreads = Array.isArray(reviewThreads)
+      ? reviewThreads.filter((node) => node && typeof node === "object" && (node as { isResolved?: unknown }).isResolved !== true).length
+      : 0;
+    return {
+      reviews: [...latest.values()].map(({ reviewer, state }) => ({ reviewer, state })),
+      unresolvedThreads,
+    };
+  }
+
+  async isPlatformApprovalRequired(repo: string, branch: string): Promise<boolean> {
+    let classicRequiresApproval = false;
+    try {
+      const body = await this.apiJson(["api", `repos/${repo}/branches/${encodeURIComponent(branch)}/protection`]);
+      const record = body && !Array.isArray(body) ? body : {};
+      const reviews = record.required_pull_request_reviews;
+      if (reviews && typeof reviews === "object") {
+        const count = (reviews as { required_approving_review_count?: unknown }).required_approving_review_count;
+        classicRequiresApproval = typeof count === "number" && count > 0;
+      }
+    } catch (error) {
+      if (!(error instanceof TransportError && error.kind === "http" && error.status === 404)) {
+        return true;
+      }
+    }
+    if (classicRequiresApproval) return true;
+    try {
+      const body = await this.apiJson(["api", `repos/${repo}/rules/branches/${encodeURIComponent(branch)}`]);
+      if (!Array.isArray(body)) return true;
+      for (const item of body) {
+        if (!item || typeof item !== "object") continue;
+        const rule = item as { type?: unknown; parameters?: unknown };
+        if (rule.type !== "pull_request") continue;
+        const parameters = rule.parameters && typeof rule.parameters === "object"
+          ? rule.parameters as { required_approving_review_count?: unknown }
+          : {};
+        if (typeof parameters.required_approving_review_count === "number" && parameters.required_approving_review_count > 0) {
+          return true;
+        }
+      }
+      return false;
+    } catch {
+      return true;
+    }
   }
 
   async mergePullRequest(

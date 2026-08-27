@@ -15,7 +15,7 @@ import {
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
 
-type Command = "serve" | "init" | "doctor" | "config" | "help";
+type Command = "serve" | "init" | "doctor" | "config" | "help" | "host-generation";
 const require = createRequire(import.meta.url);
 const SUPPORTED_NODE_RANGE = ">=20.12 <27";
 
@@ -42,12 +42,15 @@ async function main(argv: string[]): Promise<void> {
     case "help":
       printHelp();
       return;
+    case "host-generation":
+      await runHostGenerationCommand(args);
+      return;
   }
 }
 
 function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
-  if (command === "init" || command === "doctor" || command === "config") return command;
+  if (command === "init" || command === "doctor" || command === "config" || command === "host-generation") return command;
   if (command === "help" || command === "--help" || command === "-h") return "help";
   throw new Error(`Unknown command: ${command}`);
 }
@@ -261,11 +264,52 @@ function printHelp(): void {
       "  devspace doctor          Show config, runtime, and native dependency status",
       "  devspace config get      Print persisted config",
       "  devspace config set publicBaseUrl <url|null>",
+      "  devspace host-generation status     Read-only bound host generation status",
+      "  devspace host-generation activate   Activate one verified generation (JSON request on stdin)",
       "",
       "For temporary tunnels:",
       "  DEVSPACE_PUBLIC_BASE_URL=https://example.trycloudflare.com devspace serve",
     ].join("\n"),
   );
+}
+
+async function runHostGenerationCommand(args: string[]): Promise<void> {
+  const { parseActivationRequest, runLiveHostGeneration } = await import("./host-generation-activation.js");
+  const subcommand = args[0];
+  if (subcommand === "status") {
+    if (args.length !== 1) {
+      throw new Error("host-generation status accepts no additional arguments");
+    }
+    const result = await runLiveHostGeneration({
+      schema: "nexus.devspace.host_generation_activation.v1",
+      operation: "status",
+    });
+    console.log(JSON.stringify(result, null, 2));
+    return;
+  }
+  if (subcommand !== "activate") {
+    throw new Error("Unknown host-generation command. Use status or activate.");
+  }
+  if (args.length !== 1) {
+    throw new Error("host-generation activate reads JSON from stdin and accepts no path, label, env, or command arguments");
+  }
+  const chunks: Buffer[] = [];
+  for await (const chunk of input) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+  const rawText = Buffer.concat(chunks).toString("utf8").trim();
+  if (!rawText) {
+    throw new Error("host-generation activate requires a JSON request on stdin");
+  }
+  const request = parseActivationRequest(JSON.parse(rawText));
+  if (request.operation !== "activate") {
+    throw new Error("stdin request operation must be activate");
+  }
+  const result = await runLiveHostGeneration(request);
+  console.log(JSON.stringify(result, null, 2));
+  if (result.outcome === "BLOCK" || result.outcome === "NOT_READY") {
+    process.exitCode = 1;
+  }
 }
 
 function normalizeOptionalPublicBaseUrl(value: string): string | null {

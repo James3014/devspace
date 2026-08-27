@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
+import { execSync } from "node:child_process";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   NexusGatewayProxyError,
   createNexusGatewayProxyServer,
+  createPublicNexusIntegrationTargetResolver,
   fetchNexusGatewayToolManifest,
   forwardNexusGatewayTool,
   nexusGatewayManifestIdentity,
@@ -9,6 +14,24 @@ import {
 } from "./nexus-gateway-proxy.js";
 import type { ServerConfig } from "./config.js";
 import { createMcpTransportBoundary, MODERN_MCP_PROTOCOL_VERSION } from "./mcp-transport.js";
+import {
+  PR_MERGE_ERROR_CODES,
+  type GitHubPullRequestTransport,
+  type RepositoryView,
+  type PullRequestView,
+  type BranchRefView,
+  type BranchProtectionView,
+  type EffectiveRulesView,
+  type RequiredCheckRequirement,
+  type CommitStatusEvidence,
+  type CheckRunView,
+  type MergeResultView,
+  type MergeMethod,
+} from "./git-pr-merge.js";
+
+const BASE = "1".repeat(40);
+const HEAD = "2".repeat(40);
+const NEW_MAIN = "5".repeat(40);
 
 const config = {
   gatewayProxyUrl: "http://127.0.0.1:8766",
@@ -80,7 +103,10 @@ try {
   const proxyServer = await createNexusGatewayProxyServer(config, manifest);
   assert.equal(manifestFetches, 1, "prepared startup manifest must be reused by every request factory");
   const registeredTools = (proxyServer as unknown as { _registeredTools?: Record<string, unknown> })._registeredTools;
-  assert.deepEqual(Object.keys(registeredTools ?? {}).sort(), ["nexus_candidate_approve", "nexus_gateway_status"]);
+  assert.deepEqual(
+    Object.keys(registeredTools ?? {}).sort(),
+    ["git_merge_pull_request", "github_complete_pull_request", "nexus_candidate_approve", "nexus_gateway_status"],
+  );
 
   const publicBoundary = createMcpTransportBoundary(
     () => createNexusGatewayProxyServer(config, manifest),
@@ -111,9 +137,13 @@ try {
   assert.equal(toolsResponse.headers.has("mcp-session-id"), false);
   const publicPayload = JSON.parse(await toolsResponse.text());
   assert.deepEqual(
-    publicPayload.result.tools.map((tool: { name: string }) => tool.name),
-    ["nexus_candidate_approve", "nexus_gateway_status"],
+    publicPayload.result.tools.map((tool: { name: string }) => tool.name).sort(),
+    ["git_merge_pull_request", "github_complete_pull_request", "nexus_candidate_approve", "nexus_gateway_status"],
   );
+  const publicNames = new Set(publicPayload.result.tools.map((tool: { name: string }) => tool.name));
+  for (const rawName of ["open_workspace", "bash", "write", "edit"]) {
+    assert.equal(publicNames.has(rawName), false, `hybrid public surface must not expose raw ${rawName}`);
+  }
   assert.equal(publicPayload.result.resultType, "complete");
   await publicBoundary.close();
 
@@ -199,6 +229,324 @@ try {
     () => forwardNexusGatewayTool(config, "nexus_gateway_status", {}),
     (error: unknown) => error instanceof NexusGatewayProxyError && /non-JSON HTTP 502/.test(error.message),
   );
+
+  // ============================================================
+  // B-light hybrid public surface regression coverage
+  // ============================================================
+  class FakeGitHubTransport implements GitHubPullRequestTransport {
+    repository: RepositoryView = { default_branch: "main", full_name: "James3014/Nexus-new" };
+    pr: PullRequestView = {
+      number: 42,
+      state: "OPEN",
+      isDraft: false,
+      baseRefName: "main",
+      baseRefOid: BASE,
+      headRefName: "feature/x",
+      headRefOid: HEAD,
+      mergeable: "MERGEABLE",
+      mergeStateStatus: "CLEAN",
+      merged: false,
+      mergedAt: null,
+      mergeCommitOid: null,
+      title: "Fix widget",
+      url: "https://github.com/James3014/Nexus-new/pull/42",
+    };
+    branchProtection: BranchProtectionView = { determined: true, requirements: [] };
+    effectiveRules: EffectiveRulesView = { determined: true, requirements: [] };
+    checkRuns: CheckRunView[] = [];
+    commitStatuses: CommitStatusEvidence[] = [];
+    mergeCalls: Array<{ repo: string; prNumber: number; method: MergeMethod; expectedHeadSha: string }> = [];
+    mergedPr: PullRequestView = {
+      ...this.pr,
+      state: "MERGED",
+      merged: true,
+      mergedAt: "2026-08-16T12:00:00Z",
+      mergeCommitOid: NEW_MAIN,
+    };
+
+    async getRepository(repo: string): Promise<RepositoryView> {
+      return this.repository;
+    }
+    async getPullRequest(repo: string, prNumber: number): Promise<PullRequestView> {
+      return this.mergeCalls.length > 0 ? this.mergedPr : this.pr;
+    }
+    async getBranchRef(repo: string, branch: string): Promise<BranchRefView> {
+      return { sha: this.mergeCalls.length > 0 ? NEW_MAIN : BASE };
+    }
+    async getBranchProtection(repo: string, branch: string): Promise<BranchProtectionView> {
+      return this.branchProtection;
+    }
+    async getEffectiveRules(repo: string, branch: string): Promise<EffectiveRulesView> {
+      return this.effectiveRules;
+    }
+    async getCheckRuns(repo: string, headSha: string): Promise<CheckRunView[]> {
+      return this.checkRuns;
+    }
+    async getCommitStatus(repo: string, headSha: string): Promise<CommitStatusEvidence[]> {
+      return this.commitStatuses;
+    }
+    async mergePullRequest(
+      repo: string,
+      prNumber: number,
+      method: MergeMethod,
+      expectedHeadSha: string,
+    ): Promise<MergeResultView> {
+      this.mergeCalls.push({ repo, prNumber, method, expectedHeadSha });
+      return { merged: true, sha: NEW_MAIN, message: null };
+    }
+  }
+
+  function makeCanonicalFixture(): { base: string; dir: string; cleanup: () => void } {
+    const base = mkdtempSync(join(tmpdir(), "nexus-proxy-canonical-"));
+    const bare = join(base, "canonical.git");
+    const work = join(base, "work");
+    execSync(`git init --bare -b main ${JSON.stringify(bare)}`, { stdio: "pipe" });
+    execSync(`git clone -q ${JSON.stringify(bare)} ${JSON.stringify(work)}`, { stdio: "pipe" });
+    execSync(`git -C ${JSON.stringify(work)} config user.name test`, { stdio: "pipe" });
+    execSync(`git -C ${JSON.stringify(work)} config user.email test@test.com`, { stdio: "pipe" });
+    writeFileSync(join(work, "README.md"), "# nexus-new\n");
+    execSync(`git -C ${JSON.stringify(work)} add -A`, { stdio: "pipe" });
+    execSync(`git -C ${JSON.stringify(work)} commit -m init`, { stdio: "pipe" });
+    execSync(`git -C ${JSON.stringify(work)} push -q origin main`, { stdio: "pipe" });
+    execSync(
+      `git -C ${JSON.stringify(work)} remote set-url origin https://github.com/James3014/Nexus-new.git`,
+      { stdio: "pipe" },
+    );
+    return {
+      base,
+      dir: work,
+      cleanup: () => rmSync(base, { recursive: true, force: true }),
+    };
+  }
+
+  type RegisteredMergeTool = {
+    executor?: (args: Record<string, unknown>) => Promise<{ content?: Array<{ type: string; text: string }>; isError?: boolean }>;
+    inputSchema?: { def?: { shape?: Record<string, unknown> } };
+  };
+
+  async function buildPublicProxy(
+    manifestToRegister: typeof manifest,
+    root: string | undefined,
+    transport: FakeGitHubTransport,
+  ): Promise<{ executor: NonNullable<RegisteredMergeTool["executor"]>; registered: Record<string, RegisteredMergeTool> }> {
+    const proxyConfig = {
+      ...config,
+      ...(root ? { nexusCanonicalSourceRoot: root } : {}),
+    } as ServerConfig;
+    const proxy = await createNexusGatewayProxyServer(proxyConfig, manifestToRegister, {
+      gitMergeTransportFactory: () => transport,
+    });
+    const registered = (proxy as unknown as { _registeredTools?: Record<string, RegisteredMergeTool> })._registeredTools ?? {};
+    assert.ok(registered["git_merge_pull_request"]?.executor, "git_merge_pull_request must be registered on the proxy");
+    return { executor: registered["git_merge_pull_request"].executor!, registered };
+  }
+
+  const proxyMergeArgs: (overrides?: Record<string, unknown>) => Record<string, unknown> = (overrides = {}) => ({
+    prNumber: 42,
+    expectedBaseSha: BASE,
+    expectedHeadSha: HEAD,
+    mergeMethod: "merge",
+    ownerConfirmation: true,
+    ...overrides,
+  });
+
+  // B. Public merge schema: task-oriented only, no workspace/path/repo/remote controls.
+  {
+    const schemaBoundary = createMcpTransportBoundary(
+      () => createNexusGatewayProxyServer(config, manifest),
+      "dual",
+    );
+    const schemaResponse = await schemaBoundary.fetch(new Request("http://test.local/mcp", {
+      method: "POST",
+      headers: {
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+        "mcp-method": "tools/list",
+        "mcp-protocol-version": MODERN_MCP_PROTOCOL_VERSION,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "tools/list",
+        params: {
+          _meta: {
+            "io.modelcontextprotocol/protocolVersion": MODERN_MCP_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientInfo": { name: "schema-test", version: "1.0.0" },
+            "io.modelcontextprotocol/clientCapabilities": {},
+          },
+        },
+      }),
+    }));
+    const schemaPayload = JSON.parse(await schemaResponse.text());
+    const mergeTool = schemaPayload.result.tools.find((tool: { name: string }) => tool.name === "git_merge_pull_request");
+    assert.ok(mergeTool, "git_merge_pull_request must be advertised");
+    const properties = Object.keys(mergeTool.inputSchema.properties ?? {});
+    for (const requiredKey of ["prNumber", "expectedBaseSha", "expectedHeadSha", "mergeMethod", "ownerConfirmation"]) {
+      assert.ok(properties.includes(requiredKey), `public schema must contain ${requiredKey}`);
+    }
+    for (const forbiddenKey of ["workspaceId", "cwd", "repo", "repository", "remote", "branch"]) {
+      assert.ok(!properties.includes(forbiddenKey), `public schema must NOT contain ${forbiddenKey}`);
+    }
+    await schemaBoundary.close();
+  }
+
+  // G. Collision gate: either local protected action becoming Gateway-owned fails closed.
+  for (const protectedName of ["git_merge_pull_request", "github_complete_pull_request"]) {
+    const collisionManifest = [
+      ...manifest,
+      { name: protectedName, inputSchema: { type: "object", properties: {} } },
+    ] as typeof manifest;
+    await assert.rejects(
+      () => createNexusGatewayProxyServer(config, collisionManifest),
+      (error: unknown) =>
+        error instanceof NexusGatewayProxyError
+        && error.message.includes(`collision: canonical gateway manifest now exposes ${protectedName}`)
+        && /migration decision is required/.test(error.message),
+    );
+  }
+
+  // Completion action is present but fails closed until both host runtime bindings are configured.
+  {
+    const proxy = await createNexusGatewayProxyServer(config, manifest);
+    const registered = (proxy as unknown as { _registeredTools?: Record<string, RegisteredMergeTool> })._registeredTools ?? {};
+    const completion = registered["github_complete_pull_request"];
+    assert.ok(completion?.executor, "github_complete_pull_request must be registered on the proxy");
+    const result = await completion.executor!({
+      initialEvidence: {},
+      standingGrantRequest: {},
+      mergeMethod: "merge",
+      ownerConfirmation: true,
+    });
+    assert.equal(result.isError, true);
+    const data = JSON.parse(result.content?.[0]?.text ?? "{}");
+    assert.equal(data.code, "PUBLIC_COMPLETION_RUNTIME_UNCONFIGURED");
+  }
+
+  // C + F. Server-bound root + exact-head wiring through the existing merge core.
+  {
+    const fixture = makeCanonicalFixture();
+    try {
+      const transport = new FakeGitHubTransport();
+      const { executor } = await buildPublicProxy(manifest, fixture.dir, transport);
+      const result = await executor({
+        ...proxyMergeArgs({ mergeMethod: "squash" }),
+        // Caller-supplied workspace/path/remote controls must be structurally
+        // ignored; the handler binds cwd to the configured canonical root.
+        workspaceId: "ws_ignored",
+        cwd: "/does/not/exist",
+        repository: "evil/repo",
+        remote: "evil",
+        branch: "release",
+      });
+      assert.ok(!result.isError, `expected success receipt, got ${JSON.stringify(result)}`);
+      const receipt = JSON.parse(result.content?.[0]?.text ?? "{}");
+      assert.equal(receipt.merged, true);
+      assert.equal(receipt.repository, "James3014/Nexus-new");
+      assert.equal(receipt.remote_name, "origin");
+      assert.equal(receipt.pr_number, 42);
+      assert.equal(receipt.merge_method, "squash");
+      assert.equal(receipt.observed_head_sha_before_merge, HEAD);
+      assert.equal(receipt.merge_commit_sha, NEW_MAIN);
+      assert.equal(transport.mergeCalls.length, 1, "merge API must be called exactly once");
+      assert.deepEqual(transport.mergeCalls[0], {
+        repo: "James3014/Nexus-new",
+        prNumber: 42,
+        method: "squash",
+        expectedHeadSha: HEAD,
+      });
+    } finally {
+      fixture.cleanup();
+    }
+  }
+
+  // D. Public trusted target: origin -> James3014/Nexus-new succeeds; wrong or missing remote fails closed.
+  {
+    const fixture = makeCanonicalFixture();
+    try {
+      const transport = new FakeGitHubTransport();
+      const { executor } = await buildPublicProxy(manifest, fixture.dir, transport);
+      const result = await executor(proxyMergeArgs());
+      assert.ok(!result.isError, `expected success via server-side origin target, got ${JSON.stringify(result)}`);
+      assert.equal(transport.mergeCalls.length, 1);
+      assert.equal(transport.mergeCalls[0].repo, "James3014/Nexus-new");
+    } finally {
+      fixture.cleanup();
+    }
+  }
+  {
+    const fixture = makeCanonicalFixture();
+    try {
+      execSync(
+        `git -C ${JSON.stringify(fixture.dir)} remote set-url origin git@github.com:evil/widget.git`,
+        { stdio: "pipe" },
+      );
+      const transport = new FakeGitHubTransport();
+      const { executor } = await buildPublicProxy(manifest, fixture.dir, transport);
+      const result = await executor(proxyMergeArgs());
+      assert.ok(result.isError, "wrong origin remote must fail closed");
+      const data = JSON.parse(result.content?.[0]?.text ?? "{}");
+      assert.equal(data.code, PR_MERGE_ERROR_CODES.INTEGRATION_TARGET_UNRESOLVED);
+      assert.equal(transport.mergeCalls.length, 0);
+    } finally {
+      fixture.cleanup();
+    }
+  }
+  {
+    const fixture = makeCanonicalFixture();
+    try {
+      execSync(`git -C ${JSON.stringify(fixture.dir)} remote remove origin`, { stdio: "pipe" });
+      const transport = new FakeGitHubTransport();
+      const { executor } = await buildPublicProxy(manifest, fixture.dir, transport);
+      const result = await executor(proxyMergeArgs());
+      assert.ok(result.isError, "missing origin remote must fail closed");
+      const data = JSON.parse(result.content?.[0]?.text ?? "{}");
+      assert.equal(data.code, PR_MERGE_ERROR_CODES.INTEGRATION_TARGET_UNRESOLVED);
+      assert.equal(transport.mergeCalls.length, 0);
+    } finally {
+      fixture.cleanup();
+    }
+  }
+
+  // E. ownerConfirmation=false is rejected before any GitHub mutation.
+  {
+    const fixture = makeCanonicalFixture();
+    try {
+      const transport = new FakeGitHubTransport();
+      const { executor } = await buildPublicProxy(manifest, fixture.dir, transport);
+      const result = await executor(proxyMergeArgs({ ownerConfirmation: false }));
+      assert.ok(result.isError, "ownerConfirmation false must error");
+      const data = JSON.parse(result.content?.[0]?.text ?? "{}");
+      assert.equal(data.code, PR_MERGE_ERROR_CODES.OWNER_CONFIRMATION_REQUIRED);
+      assert.equal(transport.mergeCalls.length, 0, "no merge call without owner confirmation");
+    } finally {
+      fixture.cleanup();
+    }
+  }
+
+  // Server-bound root missing: the public action fails closed, not silently no-op.
+  {
+    const transport = new FakeGitHubTransport();
+    const { executor } = await buildPublicProxy(manifest, undefined, transport);
+    const result = await executor(proxyMergeArgs());
+    assert.ok(result.isError, "missing canonical source root must fail closed");
+    const data = JSON.parse(result.content?.[0]?.text ?? "{}");
+    assert.equal(data.code, "PUBLIC_MERGE_ROOT_UNCONFIGURED");
+    assert.equal(transport.mergeCalls.length, 0);
+  }
+
+  // Proxy trusted resolver binds origin -> James3014/Nexus-new (server-side).
+  {
+    const resolver = createPublicNexusIntegrationTargetResolver();
+    const fixture = makeCanonicalFixture();
+    try {
+      const target = await resolver.resolve(fixture.dir);
+      assert.equal(target.remoteName, "origin");
+      assert.equal(target.repository, "James3014/Nexus-new");
+      assert.equal(target.defaultBranch, "main");
+    } finally {
+      fixture.cleanup();
+    }
+  }
 } finally {
   globalThis.fetch = originalFetch;
 }

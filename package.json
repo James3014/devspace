@@ -1,6 +1,6 @@
 {
   "name": "@nexus-local/devspace",
-  "version": "1.0.1-nexus.4",
+  "version": "1.0.1-nexus.7",
   "description": "DevSpace MCP fork with Nexus read-only git and lifecycle tools. Based on @waishnav/devspace v1.0.1.",
   "type": "module",
   "main": "dist/server.js",
@@ -26,7 +26,7 @@
     "build:app": "vite build",
     "dev": "node scripts/dev-server.mjs",
     "start": "node dist/cli.js serve",
-    "test": "export DEVSPACE_CONFIG_DIR=\"${TMPDIR:-/tmp}/nexus-devspace-test-empty-config\"; tsx src/config.test.ts && tsx src/oauth-provider.test.ts && tsx src/mcp-transport.test.ts && tsx src/nexus-gateway-proxy.test.ts && tsx src/roots.test.ts && tsx src/skills.test.ts && tsx src/workspaces.test.ts && tsx src/review-checkpoints.test.ts && tsx src/nexus-git-tools.test.ts && tsx src/git-pr-merge.test.ts && tsx src/git-pr-merge-wiring.test.ts",
+    "test": "export DEVSPACE_CONFIG_DIR=\"${TMPDIR:-/tmp}/nexus-devspace-test-empty-config\"; tsx src/config.test.ts && tsx src/oauth-provider.test.ts && tsx src/mcp-transport.test.ts && tsx src/nexus-gateway-proxy.test.ts && tsx src/roots.test.ts && tsx src/skills.test.ts && tsx src/workspaces.test.ts && tsx src/review-checkpoints.test.ts && tsx src/nexus-git-tools.test.ts && tsx src/git-pr-merge.test.ts && tsx src/git-pr-merge-wiring.test.ts && tsx src/github-completion-host.test.ts && tsx src/host-generation-activation.test.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "postpack": "node scripts/compute-artifact-sha256.js"
   },

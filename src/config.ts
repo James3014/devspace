@@ -1,3 +1,4 @@
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { expandHomePath } from "./roots.js";
@@ -9,7 +10,27 @@ export type ToolNamingMode = "legacy" | "short";
 export type WidgetMode = "off" | "changes" | "full";
 export type SurfaceProfile = "raw_devspace" | "canonical_gateway_proxy";
 export type ProtocolMode = "legacy" | "dual" | "modern";
-export type ToolSource = "devspace_builtin" | "canonical_gateway_manifest";
+export type ToolSource =
+  | "devspace_builtin"
+  | "canonical_gateway_manifest"
+  | "canonical_gateway_manifest_plus_local_protected";
+
+/**
+ * The single server-local protected action that the canonical gateway proxy
+ * surface exposes in addition to the dynamic Gateway manifest. The name is the
+ * same action already registered on the loopback-only raw surface; only its
+ * schema/context differ (server-bound canonical root, no workspaceId).
+ */
+export const CANONICAL_PROXY_LOCAL_PROTECTED_TOOLS = [
+  "git_merge_pull_request",
+  "github_complete_pull_request",
+] as const;
+
+export interface LocalProtectedExtensionIdentity {
+  count: number;
+  tools: string[];
+}
+
 const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 
@@ -32,6 +53,11 @@ export interface ServerConfig {
   protocolMode: ProtocolMode;
   gatewayProxyUrl?: string;
   gatewayProxyToken?: string;
+  /** Server-bound canonical collaboration checkout used by the public proxy's
+   * local protected merge action. Never caller-selectable. */
+  nexusCanonicalSourceRoot?: string;
+  /** Python interpreter used only for the server-local #599 completion bridge. */
+  nexusPythonBin?: string;
   logging: LoggingConfig;
 }
 
@@ -48,6 +74,9 @@ export interface SurfaceIdentity {
   observed_manifest_count: number | null;
   observed_manifest_revision: string | null;
   observed_manifest_sha256: string | null;
+  effective_tool_count: number | null;
+  local_protected_tool_count: number | null;
+  local_protected_tools: string[] | null;
   proxy_mode: boolean;
   gateway_url: string | null;
 }
@@ -240,6 +269,13 @@ function parseRequiredSecret(value: string | undefined, name: string): string {
   return secret;
 }
 
+function parseNexusPythonBin(value: string | undefined, canonicalRoot: string | undefined): string | undefined {
+  if (value?.trim()) return resolve(expandHomePath(value));
+  if (!canonicalRoot) return undefined;
+  const bound = join(canonicalRoot, ".venv", "bin", "python");
+  return existsSync(bound) ? bound : undefined;
+}
+
 function parseGatewayProxyUrl(value: string | undefined): string | undefined {
   const raw = value?.trim();
   if (!raw) return undefined;
@@ -304,13 +340,26 @@ export function getSurfaceIdentity(
   observedManifest?: ObservedManifestIdentity,
 ): SurfaceIdentity {
   const proxyMode = config.surfaceProfile === "canonical_gateway_proxy";
+  const localProtected = proxyMode
+    ? {
+        count: CANONICAL_PROXY_LOCAL_PROTECTED_TOOLS.length,
+        tools: [...CANONICAL_PROXY_LOCAL_PROTECTED_TOOLS],
+      }
+    : undefined;
   return {
     surface_profile: config.surfaceProfile,
     protocol_mode: config.protocolMode,
-    tool_source: proxyMode ? "canonical_gateway_manifest" : "devspace_builtin",
+    tool_source: proxyMode
+      ? "canonical_gateway_manifest_plus_local_protected"
+      : "devspace_builtin",
     observed_manifest_count: observedManifest?.count ?? null,
     observed_manifest_revision: observedManifest?.revision ?? null,
     observed_manifest_sha256: observedManifest?.sha256 ?? null,
+    effective_tool_count: proxyMode && observedManifest
+      ? observedManifest.count + (localProtected?.count ?? 0)
+      : null,
+    local_protected_tool_count: localProtected?.count ?? null,
+    local_protected_tools: localProtected ? [...localProtected.tools] : null,
     proxy_mode: proxyMode,
     gateway_url: config.gatewayProxyUrl ?? null,
   };
@@ -423,6 +472,15 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     protocolMode: parseProtocolMode(env.MCP_PROTOCOL_MODE ?? env.NEXUS_MCP_PROTOCOL_MODE),
     gatewayProxyUrl,
     gatewayProxyToken,
+    nexusCanonicalSourceRoot: env.NEXUS_CANONICAL_SOURCE_ROOT
+      ? resolve(expandHomePath(env.NEXUS_CANONICAL_SOURCE_ROOT))
+      : undefined,
+    nexusPythonBin: parseNexusPythonBin(
+      env.NEXUS_PYTHON_BIN,
+      env.NEXUS_CANONICAL_SOURCE_ROOT
+        ? resolve(expandHomePath(env.NEXUS_CANONICAL_SOURCE_ROOT))
+        : undefined,
+    ),
     logging: parseLoggingConfig(env),
   };
 }

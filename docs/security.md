@@ -112,6 +112,49 @@ primary GitHub connector is unavailable.
 This action never bypasses branch protection, required checks, or admin merge
 guards.
 
+### Public canonical proxy surface
+
+The public `canonical_gateway_proxy` surface (e.g. `mcp.snowskill.app`)
+exposes the canonical Nexus Gateway manifest plus exactly two server-local
+protected actions: `git_merge_pull_request` and `github_complete_pull_request`.
+It never exposes raw DevSpace workspace, edit, write, or shell tools, and
+`raw_devspace` remains loopback-only.
+
+- The public merge action does not accept `workspaceId`, `cwd`, repository,
+  remote, branch, refspec, or any shell input. Its filesystem root is the
+  server-configured `NEXUS_CANONICAL_SOURCE_ROOT`; a missing root fails closed
+  (`PUBLIC_MERGE_ROOT_UNCONFIGURED`) rather than guessing a workspace.
+- Its trusted target is server-controlled and distinct from the raw surface:
+  `origin -> James3014/Nexus-new -> main`. The raw surface keeps its own
+  `nexus-new -> James3014/Nexus-new -> main` default; neither is
+  caller-selectable.
+- If the canonical Gateway manifest ever exposes either protected host action,
+  the public surface fails closed at startup until an explicit migration
+  decision is made; it never silently shadows, duplicates, or selects one
+  implementation.
+- `github_complete_pull_request` runs the Nexus
+  `run_github_completion_loop()` caller through a JSON-lines host bridge. The
+  Python caller cannot merge `main` directly: its CAS merge port is routed back
+  into the existing `git_merge_pull_request` core. Integration generations are
+  same-repository, non-force PR-branch updates and are capped at 3 generations
+  and 2700 seconds. Any affected semantic/authority/test/transport dimension
+  fails closed for fresh Candidate acceptance.
+
+The protected merge behavior itself remains the same `git_merge_pull_request`
+core used by the raw surface; the completion action reuses that core rather than
+adding another protected merge implementation.
+
+### Bound host generation activation
+
+`nexus-devspace host-generation` is a CLI-only control for this host package. It
+is not a public MCP action. Callers cannot select a service label, executable,
+path, refspec, environment map, or shell command. `status` is read-only.
+`activate` requires an exact `expected_old` generation and an exact desired
+Candidate/build identity, packs from the CLI package's own git checkout, installs
+that one artifact into the bound global package path, and kickstarts only
+`com.nexus.mcp.devspace.direct`. A second successful invocation reconciles
+without repeating mutation.
+
 ## Worktrees
 
 Managed worktrees reduce accidental edits to your active checkout, but they are

@@ -1,4 +1,7 @@
 import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 /**
  * Single canonical registry of the Nexus MCP tool surface.
@@ -76,4 +79,40 @@ export function canonicalBuildManifest(body: BuildManifestBody): string {
  */
 export function buildManifestSha256(body: BuildManifestBody): string {
   return createHash("sha256").update(canonicalBuildManifest(body)).digest("hex");
+}
+
+export interface PackageBuildIdentity {
+  package_name: string;
+  package_version: string;
+  source_commit: string;
+  source_dirty: boolean;
+  build_id: string;
+  build_manifest_sha256: string;
+}
+
+export function readPackageBuildIdentity(): PackageBuildIdentity | null {
+  try {
+    const identityPath = join(dirname(fileURLToPath(import.meta.url)), "..", "generated", "build-identity.json");
+    const parsed = JSON.parse(readFileSync(identityPath, "utf8")) as Record<string, unknown>;
+    if (
+      typeof parsed.package_name !== "string"
+      || typeof parsed.package_version !== "string"
+      || typeof parsed.source_commit !== "string"
+      || typeof parsed.source_dirty !== "boolean"
+      || typeof parsed.build_id !== "string"
+      || typeof parsed.build_manifest_sha256 !== "string"
+    ) {
+      return null;
+    }
+    return {
+      package_name: parsed.package_name,
+      package_version: parsed.package_version,
+      source_commit: parsed.source_commit,
+      source_dirty: parsed.source_dirty,
+      build_id: parsed.build_id,
+      build_manifest_sha256: parsed.build_manifest_sha256,
+    };
+  } catch {
+    return null;
+  }
 }

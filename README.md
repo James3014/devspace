@@ -52,14 +52,26 @@ https://your-tunnel-host.example.com/mcp
 
 For the Nexus installation, keep DevSpace as the single authenticated MCP
 connector and enable proxy mode so every public tool call reaches the canonical
-Nexus gateway. The proxy does not expose DevSpace workspace, edit, or shell
-tools and never creates a second workspace:
+Nexus gateway. The public surface exposes the canonical Gateway manifest plus two server-local
+protected host actions: `git_merge_pull_request` and
+`github_complete_pull_request`. It never exposes DevSpace workspace, edit,
+write, or shell tools and never creates a second workspace:
 
 ```bash
 export NEXUS_GATEWAY_PROXY_URL=http://127.0.0.1:8766
 export NEXUS_GATEWAY_PROXY_TOKEN='<the canonical Nexus gateway token>'
+export NEXUS_CANONICAL_SOURCE_ROOT=/path/to/the/canonical/nexus/checkout
+export NEXUS_PYTHON_BIN=/path/to/nexus/.venv/bin/python
 nexus-devspace serve
 ```
+
+`NEXUS_CANONICAL_SOURCE_ROOT` is the server-bound canonical collaboration
+checkout that the public merge fallback operates on. It is resolved from the
+server environment and is never caller-selectable; if it is missing, the
+public `git_merge_pull_request` action fails closed instead of guessing a
+workspace. The merge target itself is also server-controlled: the public
+surface trusts `origin -> James3014/Nexus-new -> main`, distinct from the raw
+surface's `nexus-new` default target.
 
 The public `/mcp` endpoint remains protected by DevSpace OAuth. The backend
 gateway token is only used on the local loopback hop. Health checks identify
@@ -84,13 +96,22 @@ At startup proxy mode fetches the canonical `tools/list` response, rejects raw
 DevSpace names such as `write`, `edit`, and `shell`, preserves only the
 canonical dynamic manifest, orders it deterministically, and records its
 observed count, revision, and SHA-256. The expected current count is not
-hard-coded in DevSpace.
+hard-coded in DevSpace. The proxy then registers exactly two local protected
+actions (`git_merge_pull_request` and `github_complete_pull_request`) in addition
+to the manifest. If the canonical manifest ever itself exposes either name, the
+proxy fails closed at startup instead of shadowing, duplicating, or picking an
+implementation.
 
 Build identity keeps `tool_surface` and `tool_count` bound to the embedded raw
 DevSpace registry for workspace snapshot compatibility. The configured runtime
 boundary is reported separately as `effective_tool_surface`,
 `effective_tool_count`, `surface_profile`, and the observed manifest identity;
-public proxy claims must use those effective and observed fields.
+public proxy claims must use those effective and observed fields. For proxy
+mode `tool_source` is `canonical_gateway_manifest_plus_local_protected`
+(never the pure `canonical_gateway_manifest`), `observed_manifest_count` is
+the actual Gateway manifest count, and `effective_tool_count` is that count
+plus the two local protected extensions, with
+`local_protected_tool_count`/`local_protected_tools` reported alongside.
 
 Rollback for local maintenance is explicit and loopback-only:
 
