@@ -274,6 +274,8 @@ async function fixture(
     subagents?: boolean | SubagentsConfig;
     gitCandidates?: boolean;
     toolchains?: string;
+    authScopes?: string[];
+    nexusGatewayRebindRunner?: () => Promise<Record<string, unknown>>;
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -366,8 +368,21 @@ async function fixture(
     resolveLocalAgentProviders,
     [],
     agentSessionManager,
+    undefined,
+    options.nexusGatewayRebindRunner,
   );
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  if (options.authScopes) {
+    const send = clientTransport.send.bind(clientTransport);
+    clientTransport.send = async (message, sendOptions) => send(message, {
+      ...sendOptions,
+      authInfo: {
+        token: "test-access-token",
+        clientId: "devspace-test-client",
+        scopes: options.authScopes ?? [],
+      },
+    });
+  }
   const client = new Client({ name: "devspace-test-client", version: "1.0.0" });
   await Promise.all([
     client.connect(clientTransport),
@@ -435,6 +450,88 @@ function responseCard(result: Awaited<ReturnType<Client["callTool"]>>): Record<s
   assert.ok(card && typeof card === "object");
   return card as Record<string, unknown>;
 }
+
+test("nexus gateway rebind tool is fixed and exposes no host-control inputs", async (t) => {
+  const context = await fixture(t);
+  const tools = await context.client.listTools();
+  const tool = tools.tools.find((entry) => entry.name === "nexus.gateway_rebind.reload.v1");
+  assert.ok(tool);
+  const schema = tool.inputSchema as { properties?: Record<string, unknown> };
+  assert.deepEqual(Object.keys(schema.properties ?? {}), []);
+  const encoded = JSON.stringify(tool.inputSchema);
+  for (const forbidden of ["command", "executable", "path", "root", "service", "pid", "label", "head", "tree"]) {
+    assert.equal(encoded.toLowerCase().includes(forbidden), false, `schema leaked host-control field ${forbidden}`);
+  }
+  assert.equal(tool.annotations?.readOnlyHint, false);
+  assert.equal(tool.annotations?.destructiveHint, true);
+  assert.equal(tool.annotations?.openWorldHint, false);
+});
+
+test("nexus gateway rebind tool denies missing and ordinary devspace scopes before runner", async (t) => {
+  let calls = 0;
+  const runner = async () => {
+    calls += 1;
+    return { state: "SHOULD_NOT_RUN" };
+  };
+
+  const missing = await fixture(t, { nexusGatewayRebindRunner: runner });
+  const missingResult = await missing.client.callTool({
+    name: "nexus.gateway_rebind.reload.v1",
+    arguments: {},
+  });
+  assert.equal(missingResult.isError, true);
+  assert.match(responseText(missingResult), /INSUFFICIENT_SCOPE|nexus\.gateway_rebind\.reload/);
+  assert.equal(calls, 0);
+
+  const ordinary = await fixture(t, {
+    authScopes: ["devspace"],
+    nexusGatewayRebindRunner: runner,
+  });
+  const ordinaryResult = await ordinary.client.callTool({
+    name: "nexus.gateway_rebind.reload.v1",
+    arguments: {},
+  });
+  assert.equal(ordinaryResult.isError, true);
+  assert.match(responseText(ordinaryResult), /INSUFFICIENT_SCOPE|nexus\.gateway_rebind\.reload/);
+  assert.equal(calls, 0);
+});
+
+test("nexus gateway rebind tool permits dedicated scope and calls fixed runner once", async (t) => {
+  let calls = 0;
+  const context = await fixture(t, {
+    authScopes: ["devspace", "nexus.gateway_rebind.reload"],
+    nexusGatewayRebindRunner: async () => {
+      calls += 1;
+      return { state: "VERIFIED", server_instance_id: "new-instance" };
+    },
+  });
+  const result = await context.client.callTool({
+    name: "nexus.gateway_rebind.reload.v1",
+    arguments: {},
+  });
+  assert.equal(calls, 1);
+  assert.deepEqual(structuredContent(result), {
+    result: { state: "VERIFIED", server_instance_id: "new-instance" },
+  });
+});
+
+test("nexus gateway rebind tool surfaces runner failure fail-closed", async (t) => {
+  let calls = 0;
+  const context = await fixture(t, {
+    authScopes: ["nexus.gateway_rebind.reload"],
+    nexusGatewayRebindRunner: async () => {
+      calls += 1;
+      throw new Error("fixed runner rejected recovery authority");
+    },
+  });
+  const result = await context.client.callTool({
+    name: "nexus.gateway_rebind.reload.v1",
+    arguments: {},
+  });
+  assert.equal(result.isError, true);
+  assert.match(responseText(result), /fixed runner rejected recovery authority/);
+  assert.equal(calls, 1);
+});
 
 test("subagents disabled: agent tools are absent", async (t) => {
   const context = await fixture(t, { subagents: false });

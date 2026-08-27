@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { execFile } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { access, realpath } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
@@ -94,6 +95,88 @@ type Transport = StreamableHTTPServerTransport;
 const MCP_SESSION_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
 const AGENT_SUPERVISION_INTERVAL_MS = 2_000;
+const NEXUS_GATEWAY_REBIND_TOOL = "nexus.gateway_rebind.reload.v1";
+const NEXUS_GATEWAY_REBIND_SCOPE = "nexus.gateway_rebind.reload";
+const NEXUS_GATEWAY_REBIND_PYTHON = "/Users/jameschen/Workspace/Nexus-new/.venv/bin/python";
+const NEXUS_GATEWAY_REBIND_BRIDGE = String.raw`
+import hashlib, importlib.util, json, os, pathlib, subprocess, sys, tempfile
+
+mirror = pathlib.Path("/Users/jameschen/Workspace/Nexus-new-authority-main")
+manager_rel = pathlib.Path("scripts/ops/mcp_gateway_durable.py")
+receipt_rel = pathlib.Path("tasks/github-issue-526-host-authority-and-canary-20260823/10-durable-recovery-authority-receipt.json")
+state = pathlib.Path("/Users/jameschen/Library/Application Support/Nexus/gateway-direct")
+manager_dst = state / "manager.py"
+receipt_dst = state / "recovery-authority.json"
+request_dst = state / "request.json"
+
+def run_git(*args):
+    return subprocess.run(["git", "-C", str(mirror), *args], check=True, capture_output=True, text=True).stdout.strip()
+
+def atomic_write(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    os.chmod(path.parent, 0o700)
+    fd, temp_name = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_name, 0o600)
+        os.replace(temp_name, path)
+    finally:
+        if os.path.exists(temp_name):
+            os.unlink(temp_name)
+
+if mirror.is_symlink() or not mirror.is_dir():
+    raise RuntimeError("fixed Nexus authority mirror unavailable")
+mirror_stat = mirror.stat()
+if mirror_stat.st_uid != os.getuid() or (mirror_stat.st_mode & 0o777) not in (0o700, 0o755):
+    raise RuntimeError("fixed Nexus authority mirror ownership/mode invalid")
+if run_git("remote", "get-url", "origin") != "https://github.com/James3014/Nexus-new.git":
+    raise RuntimeError("fixed Nexus authority mirror origin mismatch")
+if run_git("status", "--porcelain"):
+    raise RuntimeError("fixed Nexus authority mirror is dirty")
+subprocess.run(["git", "-C", str(mirror), "fetch", "origin", "main"], check=True, capture_output=True, text=True)
+fresh = run_git("rev-parse", "origin/main")
+subprocess.run(["git", "-C", str(mirror), "checkout", "--detach", fresh], check=True, capture_output=True, text=True)
+if run_git("status", "--porcelain"):
+    raise RuntimeError("fixed Nexus authority mirror became dirty")
+
+manager_bytes = (mirror / manager_rel).read_bytes()
+receipt_bytes = (mirror / receipt_rel).read_bytes()
+receipt = json.loads(receipt_bytes)
+if hashlib.sha256(manager_bytes).hexdigest() != receipt["final_manager_sha256"]:
+    raise RuntimeError("Nexus manager hash does not match recovery authority")
+atomic_write(manager_dst, manager_bytes)
+atomic_write(receipt_dst, receipt_bytes)
+
+request = {
+    "request_id": receipt["request_id"],
+    "idempotency_fence": receipt["idempotency_fence"],
+    "operation": "gateway-recover",
+    "effect_class": "GATEWAY_DURABLE_RECOVERY",
+    "recovery_authority_id": receipt["receipt_id"],
+    "recovery_authority_hash": receipt["receipt_hash"],
+    "desired_manifest_id": receipt["desired_manifest_id"],
+    "desired_manifest_hash": receipt["desired_manifest_sha256"],
+    "predecessor_manifest_id": receipt["predecessor_manifest_id"],
+    "predecessor_manifest_hash": receipt["predecessor_manifest_sha256"],
+}
+request["request_hash"] = hashlib.sha256(json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+request["schema"] = "nexus.gateway.durable_recovery_request.v1"
+atomic_write(request_dst, json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode())
+
+sys.path.insert(0, str(mirror))
+spec = importlib.util.spec_from_file_location("nexus_fixed_gateway_manager", manager_dst)
+if spec is None or spec.loader is None:
+    raise RuntimeError("fixed Nexus manager import failed")
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+result = module._gateway_recover_live(request)
+payload = result.model_dump() if hasattr(result, "model_dump") else result
+print(json.dumps(payload, sort_keys=True, default=str))
+`;
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
 const WRITE_TOOL_ANNOTATIONS = {
@@ -1010,6 +1093,36 @@ function registerCodexGoalTools(
   );
 }
 
+export type NexusGatewayRebindRunner = () => Promise<Record<string, unknown>>;
+
+function runFixedNexusGatewayRebind(): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    execFile(
+      NEXUS_GATEWAY_REBIND_PYTHON,
+      ["-c", NEXUS_GATEWAY_REBIND_BRIDGE],
+      { timeout: 300_000, maxBuffer: 1024 * 1024 },
+      (error, stdout, stderr) => {
+        if (error) {
+          const detail = stderr.trim() || error.message;
+          reject(new Error(`[NEXUS_GATEWAY_REBIND_FAILED] ${detail}`));
+          return;
+        }
+        try {
+          const parsed = JSON.parse(stdout.trim()) as unknown;
+          if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+            throw new Error("manager result is not an object");
+          }
+          resolve(parsed as Record<string, unknown>);
+        } catch (parseError) {
+          reject(new Error(
+            `[NEXUS_GATEWAY_REBIND_INVALID_RESULT] ${parseError instanceof Error ? parseError.message : String(parseError)}`,
+          ));
+        }
+      },
+    );
+  });
+}
+
 export function createMcpServer(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
@@ -1019,6 +1132,7 @@ export function createMcpServer(
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
   agentSessionManager?: LocalAgentSessionManager,
   codexGoals?: CodexGoalSessionManager,
+  nexusGatewayRebindRunner: NexusGatewayRebindRunner = runFixedNexusGatewayRebind,
 ): McpServer {
   const server = new McpServer(
     {
@@ -1986,6 +2100,37 @@ export function createMcpServer(
     });
   }
 
+  registerAppTool(
+    server,
+    NEXUS_GATEWAY_REBIND_TOOL,
+    {
+      title: "Reload Nexus Gateway to authorized source",
+      description:
+        "Run the fixed, OAuth-protected Nexus Gateway recovery/rebind operation. The caller cannot select commands, paths, roots, services, PIDs, labels, or deployment identities; those are bound by the issued Nexus recovery authority.",
+      inputSchema: {},
+      outputSchema: {
+        result: z.record(z.string(), z.unknown()),
+      },
+      _meta: {},
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async (_args, extra) => {
+      if (!extra.authInfo?.scopes.includes(NEXUS_GATEWAY_REBIND_SCOPE)) {
+        throw new Error(`[INSUFFICIENT_SCOPE] ${NEXUS_GATEWAY_REBIND_SCOPE} is required`);
+      }
+      const result = await nexusGatewayRebindRunner();
+      return {
+        content: [textBlock(JSON.stringify(result))],
+        structuredContent: { result },
+      };
+    },
+  );
+
   // ── Native Agent MCP Tools (only when subagents enabled) ──────────────────
   if (config.subagents && agentSessionManager) {
     const AGENT_TOOL_ANNOTATIONS_WRITE = {
@@ -2897,6 +3042,7 @@ export function createMcpServer(
 
 export interface CreateServerOptions {
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
+  nexusGatewayRebindRunner?: NexusGatewayRebindRunner;
 }
 
 export function createServer(
@@ -3113,6 +3259,7 @@ export function createServer(
           incomingArtifactAdapters,
           agentSessionManager,
           codexGoals,
+          options.nexusGatewayRebindRunner,
         );
         await server.connect(transport);
       } else {
