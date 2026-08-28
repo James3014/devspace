@@ -48,6 +48,16 @@ Do not call `open_workspace` again for the same checkout folder unless:
 - work switches between checkout and worktree mode
 - the user asks for a new isolated worktree
 
+## External Directories
+
+An agent's provider-level `external_directory` permission is not a DevSpace
+workspace grant. DevSpace does not support path-based implicit access or a
+fallback when a workspace path cannot be resolved. To work on a directory that
+is not the current workspace, open that exact directory (or explicitly rebind
+the session) and use the returned `workspaceId` for every tool call. The path
+must still be under the configured filesystem allowlist; otherwise the request
+is denied.
+
 ## Checkout Mode
 
 Checkout mode is the default. DevSpace opens the actual directory:
