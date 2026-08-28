@@ -382,7 +382,11 @@ export class ProcessSessionManager {
     const writableChars = chars.replaceAll("\u0003", "");
     if (writableChars && session.running) session.process?.write(writableChars);
 
-    if ((interactionRequested || !session.buffer.hasOutput()) && session.running) {
+    // An explicit yield is also a polling request. This matters for internal
+    // PTY callers (Codex Goal): retained output is intentionally non-destructive
+    // now, so checking only `hasOutput()` would otherwise suppress every later
+    // poll after the initial snapshot.
+    if ((interactionRequested || input.yieldTimeMs !== undefined || !session.buffer.hasOutput()) && session.running) {
       const fallback = interactionRequested ? DEFAULT_INTERACTIVE_YIELD_MS : DEFAULT_POLL_YIELD_MS;
       const maximum = interactionRequested ? MAX_COMMAND_YIELD_MS : MAX_POLL_YIELD_MS;
       const yieldTimeMs = boundedInteger(input.yieldTimeMs, fallback, maximum);
@@ -610,7 +614,11 @@ export class ProcessSessionManager {
   private getSnapshot(session: ProcessSession, maxOutputTokens?: number): ProcessSnapshot {
     const limit = boundedInteger(maxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 100_000);
     const maxCharacters = Math.max(256, limit * 4);
-    const buffered = session.buffer.peek(maxCharacters);
+    // PTY consumers (notably Codex Goal) process each snapshot as a delta;
+    // retain cumulative output for pipe/attempt-key reconciliation callers.
+    const buffered = session.tty
+      ? session.buffer.drain(maxCharacters)
+      : session.buffer.peek(maxCharacters);
 
     return {
       sessionId: session.running ? session.id : undefined,

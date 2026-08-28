@@ -562,6 +562,26 @@ try {
   });
   assert.equal(r7_second.running, false);
   assert.match(r7_second.output, /mat7_large_output_budget/);
+
+  // Internal PTY polling must continue waiting after a non-destructive
+  // snapshot has already retained initial output.
+  const retainedOutput = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: `${node} -e "console.log('initial'); setTimeout(() => console.log('later'), 150); setTimeout(() => process.exit(0), 250);"`,
+    tty: true,
+    yieldTimeMs: 250,
+  });
+  assert.equal(retainedOutput.running, true);
+  assert.match(retainedOutput.output, /initial/);
+  const polledOutput = await g2Manager.write({
+    workspaceId: "ws_g2",
+    sessionId: retainedOutput.sessionId!,
+    chars: "",
+    yieldTimeMs: 500,
+  });
+  assert.equal(polledOutput.running, false);
+  assert.match(polledOutput.output, /later/);
 } finally {
   g2Manager.shutdown();
 }

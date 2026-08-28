@@ -859,6 +859,7 @@ function registerCodexGoalTools(
         reasoningEffort: z.string().optional(),
         baseHead: z.string().optional(),
         terminalReason: z.string().optional(),
+        error: z.string().optional(),
       },
       _meta: {},
       annotations: GOAL_START_ANNOTATIONS,
@@ -868,7 +869,7 @@ function registerCodexGoalTools(
       const workspace = workspaces.getWorkspace(workspaceId);
       let state: CodexGoalState;
       try {
-        state = await goals.start({
+        state = await goals.startPrompt({
           workspaceId,
           workspaceRoot: workspace.root,
           goal,
@@ -923,6 +924,7 @@ function registerCodexGoalTools(
         reasoningEffort: z.string().optional(),
         baseHead: z.string().optional(),
         terminalReason: z.string().optional(),
+        error: z.string().optional(),
       },
       _meta: {},
       annotations: { readOnlyHint: true },
@@ -964,6 +966,7 @@ function registerCodexGoalTools(
         reasoningEffort: z.string().optional(),
         baseHead: z.string().optional(),
         terminalReason: z.string().optional(),
+        error: z.string().optional(),
       },
       _meta: {},
       annotations: {
@@ -1015,6 +1018,7 @@ function registerCodexGoalTools(
         reasoningEffort: z.string().optional(),
         baseHead: z.string().optional(),
         terminalReason: z.string().optional(),
+        error: z.string().optional(),
       },
       _meta: {},
       annotations: {
