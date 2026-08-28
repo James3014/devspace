@@ -1148,6 +1148,24 @@ export class LocalAgentStore {
     const current = this.getById(id);
     if (!current) throw new Error(`Unknown subagent id: ${id}`);
     const generation = current.lifecycleState?.activeTurn?.generation;
+    // Legacy/runtime-pool rows can be adopted when a detached worker is
+    // launched. Install one generation before the guarded preparation CAS so
+    // the worker path retains its historical behavior without weakening the
+    // detached ownership fence.
+    if (current.status === "starting" && !isDetachedLifecycle(current.lifecycleState) && !generation) {
+      const now = new Date().toISOString();
+      const adopted = this.update(id, {
+        lifecycleState: {
+          lifecycleKind: "detached_worker_v2",
+          activeTurn: {
+            generation: randomUUID(),
+            turnStartedAt: now,
+            launchState: "not_started",
+          },
+        },
+      });
+      return this.prepareWorker(adopted.id, workerToken);
+    }
     if (current.status !== "starting" || !generation) {
       throw new Error(`Agent ${id} is ${current.status}, not starting.`);
     }
