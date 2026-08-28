@@ -429,6 +429,9 @@ async function runAgentsCommand(args: string[]): Promise<void> {
     case "daemon":
       await runAgentsDaemon(commandArgs, json);
       return;
+    case "__worker":
+      await runAgentsWorker(commandArgs);
+      return;
     case undefined:
     case "help":
     case "--help":
