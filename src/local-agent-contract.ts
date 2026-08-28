@@ -35,8 +35,12 @@ export interface ExecutionContract {
   maxFiles?: number;
   /** Toolchain id used to resolve verifier executables outside the model prompt. */
   toolchainId?: string;
-  /** Optional wall-clock bound for the whole agent turn. */
+  /** Optional wall-clock bound for the whole agent turn (turn start -> terminal). */
   maxWallMs?: number;
+  /** Optional wall-clock bound for the startup/readiness phase (turn start -> execution started). */
+  maxStartupMs?: number;
+  /** Optional wall-clock bound for semantic provider execution (execution started -> terminal). */
+  maxExecutionMs?: number;
   /** Recorded and surfaced; not auto-enforced without a mid-run activity signal. */
   idleTimeoutMs?: number;
 }
@@ -68,6 +72,31 @@ export interface ScopeBaseline {
    * scope must degrade to UNKNOWN instead of falsely claiming WITHIN_SCOPE.
    */
   fingerprints?: Record<string, PathStateFingerprint>;
+}
+
+export type AgentLifecycleKind = "detached_worker_v2";
+
+export type AgentTurnLaunchState = "not_started" | "launching" | "spawned" | "claimed";
+
+export interface ActiveTurnState {
+  /** Opaque per-turn ABA fence. Never derived from provider, PID, or token identity. */
+  generation?: string;
+  turnStartedAt: string;
+  executionStartedAt?: string;
+  launchState?: AgentTurnLaunchState;
+}
+
+export interface TerminationPendingState {
+  generation: string;
+  requestedAt: string;
+  reason: AgentTerminalReason;
+  terminalStatus: "error" | "stopped";
+  previousStatus: "starting" | "running";
+  workerToken?: string;
+  workerPid?: number;
+  launchState: AgentTurnLaunchState;
+  lastAttemptAt?: string;
+  lastFailure?: string;
 }
 
 export function parseExecutionContract(value: unknown): ExecutionContract | undefined {
@@ -117,6 +146,20 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
       throw new Error("executionContract.maxWallMs must be a positive integer.");
     }
     contract.maxWallMs = record.maxWallMs;
+  }
+
+  if (record.maxStartupMs !== undefined) {
+    if (typeof record.maxStartupMs !== "number" || !Number.isInteger(record.maxStartupMs) || record.maxStartupMs < 1) {
+      throw new Error("executionContract.maxStartupMs must be a positive integer.");
+    }
+    contract.maxStartupMs = record.maxStartupMs;
+  }
+
+  if (record.maxExecutionMs !== undefined) {
+    if (typeof record.maxExecutionMs !== "number" || !Number.isInteger(record.maxExecutionMs) || record.maxExecutionMs < 1) {
+      throw new Error("executionContract.maxExecutionMs must be a positive integer.");
+    }
+    contract.maxExecutionMs = record.maxExecutionMs;
   }
 
   if (record.idleTimeoutMs !== undefined) {

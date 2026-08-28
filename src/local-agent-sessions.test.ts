@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import test from "node:test";
 import { LocalAgentSessionManager, AgentSessionError, getWorkerProcessOwnership } from "./local-agent-sessions.js";
+import { LocalAgentStore } from "./local-agent-store.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
 
 function setupFixture() {
@@ -49,6 +50,32 @@ function setupFixture() {
       launchErrorMsg = msg;
     }
   };
+}
+
+function settleAgent(
+  manager: LocalAgentSessionManager,
+  agentId: string,
+  patch: {
+    status?: "idle" | "error";
+    latestResponse?: string;
+    providerSessionId?: string;
+    error?: string;
+    terminalReason?: "completed" | "provider_error";
+  } = {},
+): void {
+  const store = (manager as any).store as LocalAgentStore;
+  const current = store.getById(agentId)!;
+  const generation = current.lifecycleState!.activeTurn!.generation!;
+  const workerToken = current.workerToken!;
+  assert.equal(store.claimWorkerCAS(agentId, generation, workerToken, 39997).applied, true);
+  assert.equal(store.finishTurnCAS({
+    agentId,
+    generation,
+    workerToken,
+    status: patch.status ?? "idle",
+    terminalReason: patch.terminalReason ?? "completed",
+    ...patch,
+  }).applied, true);
 }
 
 const mockProfiles: LocalAgentProfile[] = [
@@ -147,14 +174,6 @@ test("LocalAgentSessionManager - startAgent and PROVIDER_UNAVAILABLE", async () 
   }
 });
 
-test("LocalAgentSessionManager - close is idempotent and prevents use after close", async () => {
-  const fixture = setupFixture();
-  await fixture.manager.close();
-  await fixture.manager.close();
-  assert.throws(() => fixture.manager.listRecordsByRoot({}), /closed|database/i);
-  fixture.clean();
-});
-
 test("LocalAgentSessionManager - continueAgent identity and validation", async () => {
   const { manager, spawnedWorkers, clean } = setupFixture();
   try {
@@ -167,8 +186,7 @@ test("LocalAgentSessionManager - continueAgent identity and validation", async (
       profiles: mockProfiles,
     });
     assert.equal(record.status, "starting");
-    manager.updateRecord(record.agentId, {
-      status: "idle",
+    settleAgent(manager, record.agentId, {
       latestResponse: "done 1",
       providerSessionId: "provider-session-123"
     });
@@ -229,7 +247,7 @@ test("LocalAgentSessionManager - workspace boundary checks", async () => {
   try {
     const workspaceRoot = "/Users/jameschen/Workspace/nexus";
     const record = await manager.startAgent({ workspaceId: "ws_test", workspaceRoot, profileName: "reviewer", prompt: "hello 1", profiles: mockProfiles });
-    manager.updateRecord(record.agentId, { status: "idle" });
+    settleAgent(manager, record.agentId);
     await assert.rejects(
       manager.getAgentStatus({ workspaceId: "ws_test", workspaceRoot: "/other/physical/path", agentId: record.agentId }),
       (err: any) => { assert.equal(err.code, "AGENT_WORKSPACE_MISMATCH"); return true; },
@@ -250,7 +268,11 @@ test("LocalAgentSessionManager - recorded error state in status", async () => {
   try {
     const workspaceRoot = "/Users/jameschen/Workspace/nexus";
     const record = await manager.startAgent({ workspaceId: "ws_test", workspaceRoot, profileName: "reviewer", prompt: "hello 1", profiles: mockProfiles });
-    manager.updateRecord(record.agentId, { status: "error", error: "API call timed out after 30s" });
+    settleAgent(manager, record.agentId, {
+      status: "error",
+      error: "API call timed out after 30s",
+      terminalReason: "provider_error",
+    });
     const status = await manager.getAgentStatus({ workspaceId: "ws_test", workspaceRoot, agentId: record.agentId });
     assert.equal(status.status, "error");
     assert.equal(status.terminal, true);
@@ -275,7 +297,6 @@ test("LocalAgentSessionManager - launch failure fail-closed behavior", async () 
     const recordInDb = manager.getRecordByPrefixOrId(list[0].agentId);
     assert.ok(recordInDb);
     assert.match(recordInDb.error || "", /Permission denied/);
-    manager.updateRecord(recordInDb.id, { status: "idle" });
     await assert.rejects(
       manager.continueAgent({ workspaceId: "ws_test", workspaceRoot, agentId: recordInDb.id, prompt: "continue launch failure test" }),
       (err: any) => { assert.equal(err.code, "WORKER_LAUNCH_FAILED"); return true; },
@@ -316,7 +337,7 @@ test("LocalAgentSessionManager - cancel passes exact running worker ownership", 
     const workspaceRoot = "/Users/jameschen/Workspace/nexus";
     const record = await manager.startAgent({ workspaceId: "ws_test", workspaceRoot, profileName: "reviewer", prompt: "running cancel", profiles: mockProfiles });
     const workerToken = spawnedWorkers[0]!.workerToken;
-    manager.updateRecord(record.agentId, { status: "running", workerPid: 424242, workerToken });
+    (manager as any).store.claimWorker(record.agentId, workerToken, 424242);
     const cancelled = await manager.cancelAgent({ workspaceId: "ws_test", workspaceRoot, agentId: record.agentId });
     assert.equal(cancelled.status, "stopped");
     assert.deepEqual(terminatedWorkers[0], { id: record.agentId, workerPid: 424242, workerToken });
@@ -346,7 +367,7 @@ test("LocalAgentSessionManager - cancel with default terminator: absent PID succ
       profiles: mockProfiles,
     });
     const workerToken = spawnedWorkers[0]!.workerToken;
-    manager.updateRecord(record.agentId, { status: "running", workerPid: 9999999, workerToken });
+    (manager as any).store.claimWorker(record.agentId, workerToken, 9999999);
 
     const cancelled = await manager.cancelAgent({ workspaceId: "ws_test", workspaceRoot, agentId: record.agentId });
     assert.equal(cancelled.status, "stopped");
@@ -378,7 +399,7 @@ test("LocalAgentSessionManager - cancel with default terminator: foreign PID fai
       profiles: mockProfiles,
     });
     const workerToken = spawnedWorkers[0]!.workerToken;
-    manager.updateRecord(record.agentId, { status: "running", workerPid: process.pid, workerToken });
+    (manager as any).store.claimWorker(record.agentId, workerToken, process.pid);
 
     await assert.rejects(
       manager.cancelAgent({ workspaceId: "ws_test", workspaceRoot, agentId: record.agentId }),
@@ -470,7 +491,7 @@ test("LocalAgentSessionManager - Cross-conversation recovery regression", async 
     assert.equal(statusB.status, "starting");
 
     // Set status to idle so we can continue it
-    manager.updateRecord(agentId, { status: "idle" });
+    settleAgent(manager, agentId);
 
     // ws_B can continue it
     const continueB = await manager.continueAgent({

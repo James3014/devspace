@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after, type TestContext } from "node:test";
@@ -274,6 +274,7 @@ async function fixture(
     subagents?: boolean | SubagentsConfig;
     gitCandidates?: boolean;
     toolchains?: string;
+    toolMode?: "full" | "minimal" | "codex";
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -326,6 +327,7 @@ async function fixture(
   });
   let config: ServerConfig = {
     ...loadedConfig,
+    toolMode: options.toolMode ?? loadedConfig.toolMode,
     subagents: {
       ...loadedConfig.subagents,
       enabled: wantsSubagents,
@@ -356,7 +358,7 @@ async function fixture(
   const workspaces = new WorkspaceRegistry(config, store);
   const { LocalAgentSessionManager } = await import("./local-agent-sessions.js");
   const agentSessionManager = config.subagents.enabled
-    ? new LocalAgentSessionManager(config, async () => {})
+    ? new LocalAgentSessionManager(config, async () => {}, async () => true)
     : undefined;
   const server = createMcpServer(
     config,
@@ -570,12 +572,21 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   assert.equal(listStructured.agents[0].agentId, startStructured.agentId);
   assert.equal(listStructured.agents[0].latestResponse, undefined); // Excluded
 
-  // Test agent_continue
-  // Update status to idle using a fresh store connection
+  // Test agent_continue after a generation-bound normal completion.
   const { LocalAgentStore } = await import("./local-agent-store.js");
   const store = new LocalAgentStore(context.stateDir);
   try {
-    store.update(startStructured.agentId, { status: "idle" });
+    const current = store.getById(startStructured.agentId)!;
+    const generation = current.lifecycleState!.activeTurn!.generation!;
+    const workerToken = current.workerToken!;
+    assert.equal(store.claimWorkerCAS(startStructured.agentId, generation, workerToken, 39998).applied, true);
+    assert.equal(store.finishTurnCAS({
+      agentId: startStructured.agentId as string,
+      generation,
+      workerToken,
+      status: "idle",
+      terminalReason: "completed",
+    }).applied, true);
   } finally {
     store.close();
   }
@@ -617,6 +628,60 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   assert.equal(cancelStructured.agentId, startStructured.agentId);
   assert.equal(cancelStructured.status, "stopped");
   assert.equal(cancelStructured.terminal, true);
+});
+
+test("subagents: status and list expose durable termination pending without terminalizing", async (t) => {
+  const context = await fixture(t, { subagents: true });
+  const opened = await callOpen(context.client, context.project, "pending-status");
+  const workspaceId = structuredContent(opened).workspaceId as string;
+  const started = await context.client.callTool({
+    name: "agent_start",
+    arguments: { workspaceId, profile: "reviewer", prompt: "hold pending" },
+  });
+  const agentId = (started.structuredContent as Record<string, string>).agentId;
+  const { LocalAgentStore } = await import("./local-agent-store.js");
+  const store = new LocalAgentStore(context.stateDir);
+  try {
+    const fenced = store.beginTerminationCAS({
+      agentId,
+      terminalReason: "cancelled",
+      terminalStatus: "stopped",
+      error: "cancelled by operator",
+    });
+    assert.equal(fenced.applied, true);
+    const pending = fenced.current!.lifecycleState!.terminationPending!;
+
+    const status = await context.client.callTool({
+      name: "agent_status",
+      arguments: { workspaceId, agentId },
+    });
+    const statusOutput = status.structuredContent as Record<string, any>;
+    assert.equal(statusOutput.terminal, false);
+    assert.equal(statusOutput.termination.pending, true);
+    assert.equal(statusOutput.termination.generation, pending.generation);
+    assert.equal("terminationPending" in statusOutput, false);
+    assert.equal("terminationGeneration" in statusOutput, false);
+    assert.equal("workerPid" in statusOutput.termination, false);
+    assert.equal("workerToken" in statusOutput.termination, false);
+    assert.match(responseText(status), /termination pending/i);
+
+    const listed = await context.client.callTool({
+      name: "agent_list",
+      arguments: { workspaceId },
+    });
+    const agents = (listed.structuredContent as { agents: any[] }).agents;
+    assert.equal(agents[0].terminationPending, true);
+
+    assert.equal(store.completeTerminationCAS({
+      agentId,
+      generation: pending.generation,
+      workerPid: pending.workerPid,
+      workerToken: pending.workerToken,
+      turnEndBaseline: { changedPaths: [], head: null },
+    }).applied, true);
+  } finally {
+    store.close();
+  }
 });
 
 test("subagents: unknown/invalid workspaceId fails closed before durable-agent access", async (t) => {
@@ -849,12 +914,11 @@ test("subagents: workspace_verify executes a configured verifier normally", asyn
   }
 });
 
-test("gitCandidates disabled: git tools and candidate promotion are absent", async (t) => {
+test("gitCandidates disabled: git tools are absent", async (t) => {
   const context = await fixture(t, { gitCandidates: false });
   const tools = await context.client.listTools();
   const gitTools = tools.tools.filter((tool) => tool.name.startsWith("git_"));
   assert.equal(gitTools.length, 0);
-  assert.equal(tools.tools.some((tool) => tool.name === "candidate_promote"), false);
 });
 
 test("gitCandidates enabled: git tools are present with schema validation", async (t) => {
@@ -865,11 +929,9 @@ test("gitCandidates enabled: git tools are present with schema validation", asyn
 
   const commitTool = gitTools.find((tool) => tool.name === "git_commit");
   const pushTool = gitTools.find((tool) => tool.name === "git_push");
-  const promoteTool = tools.tools.find((tool) => tool.name === "candidate_promote");
 
   assert.ok(commitTool);
   assert.ok(pushTool);
-  assert.ok(promoteTool);
 
   // Security schemas verification: NO workspaceRoot, cwd, remoteUrl, refspec, rawArgs, force, noVerify, delete, all
   const commitProps = commitTool.inputSchema.properties as Record<string, any>;
@@ -898,23 +960,6 @@ test("gitCandidates enabled: git tools are present with schema validation", asyn
   assert.equal(pushTool.annotations?.idempotentHint, false);
   assert.equal(pushTool.annotations?.openWorldHint, true);
 
-  const promoteProps = promoteTool.inputSchema.properties as Record<string, any>;
-  assert.equal(promoteProps.workspaceRoot, undefined);
-  assert.equal(promoteProps.ref, undefined);
-  assert.equal(promoteProps.force, undefined);
-  assert.equal(promoteProps.remote, undefined);
-  assert.equal(promoteProps.branch, undefined);
-  assert.ok(promoteProps.sourceWorkspaceId);
-  assert.ok(promoteProps.destinationWorkspaceId);
-  assert.ok(promoteProps.candidateTree);
-  assert.ok(promoteProps.expectedDestinationBranch);
-  assert.ok(promoteProps.expectedDestinationHead);
-  assert.ok(promoteProps.confirmPromote);
-  assert.equal(promoteTool.annotations?.readOnlyHint, false);
-  assert.equal(promoteTool.annotations?.destructiveHint, true);
-  assert.equal(promoteTool.annotations?.idempotentHint, true);
-  assert.equal(promoteTool.annotations?.openWorldHint, false);
-
   // Open workspace in default checkout mode
   const openResult = await callOpen(context.client, context.project, "chat-1", "checkout");
   const workspaceId = structuredContent(openResult).workspaceId as string;
@@ -931,77 +976,6 @@ test("gitCandidates enabled: git tools are present with schema validation", asyn
   });
   assert.equal(res.isError, true);
   assert.match(responseText(res), /GIT_MANAGED_WORKTREE_REQUIRED/);
-});
-
-test("candidate_promote - MCP promotes exact accepted Candidate onto attached local branch and replays idempotently", async (t) => {
-  const context = await fixture(t, { git: true, gitCandidates: true });
-
-  const destinationOpen = await callOpen(context.client, context.project, "chat-promote-destination", "checkout");
-  const destinationWorkspaceId = structuredContent(destinationOpen).workspaceId as string;
-  const destinationHead = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: context.project })).stdout.trim();
-  const destinationBranch = (await execFileAsync("git", ["branch", "--show-current"], { cwd: context.project })).stdout.trim();
-  assert.equal(destinationBranch, "main");
-
-  const sourceOpen = await context.client.callTool({
-    name: "open_workspace",
-    arguments: { path: context.project, mode: "worktree", baseRef: destinationHead },
-  });
-  assert.equal(sourceOpen.isError, undefined);
-  const sourceBody = structuredContent(sourceOpen);
-  const sourceWorkspaceId = sourceBody.workspaceId as string;
-  const sourceRoot = sourceBody.root as string;
-  assert.equal(sourceBody.mode, "worktree");
-  assert.equal((sourceBody.worktree as any)?.managed, true);
-
-  await execFileAsync("git", ["config", "user.email", "mcp-test@example.com"], { cwd: sourceRoot });
-  await execFileAsync("git", ["config", "user.name", "MCP Test User"], { cwd: sourceRoot });
-  await writeFile(join(sourceRoot, "promoted-canary.txt"), "candidate promotion content\n");
-
-  const commitRes = await context.client.callTool({
-    name: "git_commit",
-    arguments: {
-      workspaceId: sourceWorkspaceId,
-      expectedHead: destinationHead,
-      message: "feat: add promotion canary",
-      paths: ["promoted-canary.txt"],
-    },
-  });
-  assert.equal(commitRes.isError, undefined);
-  const candidate = structuredContent(commitRes);
-  const candidateHead = candidate.commitSha as string;
-  const candidateTree = candidate.treeSha as string;
-
-  const promoteArgs = {
-    sourceWorkspaceId,
-    candidateBase: destinationHead,
-    candidateHead,
-    candidateTree,
-    destinationWorkspaceId,
-    expectedDestinationBranch: destinationBranch,
-    expectedDestinationHead: destinationHead,
-    confirmPromote: true,
-  };
-  const promoteRes = await context.client.callTool({ name: "candidate_promote", arguments: promoteArgs });
-  assert.equal(promoteRes.isError, undefined);
-  const promoted = structuredContent(promoteRes);
-  assert.equal(promoted.success, true);
-  assert.equal(promoted.promoted, true);
-  assert.equal(promoted.alreadyPromoted, false);
-  assert.equal(promoted.currentHead, candidateHead);
-  assert.equal(promoted.candidateTree, candidateTree);
-  assert.equal(promoted.acceptanceStatus, "external_not_granted_here");
-  assert.equal((await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: context.project })).stdout.trim(), candidateHead);
-  assert.equal((await execFileAsync("git", ["rev-parse", "HEAD^{tree}"], { cwd: context.project })).stdout.trim(), candidateTree);
-  assert.equal((await execFileAsync("git", ["status", "--porcelain", "--untracked-files=all"], { cwd: context.project })).stdout.trim(), "");
-  assert.equal(await readFile(join(context.project, "promoted-canary.txt"), "utf8"), "candidate promotion content\n");
-
-  const replayRes = await context.client.callTool({ name: "candidate_promote", arguments: promoteArgs });
-  assert.equal(replayRes.isError, undefined);
-  const replay = structuredContent(replayRes);
-  assert.equal(replay.success, true);
-  assert.equal(replay.promoted, false);
-  assert.equal(replay.alreadyPromoted, true);
-  assert.equal(replay.currentHead, candidateHead);
 });
 
 test("git candidates tools - MCP managed worktree end-to-end integration test", async (t) => {
@@ -1078,4 +1052,119 @@ test("git candidates tools - MCP managed worktree end-to-end integration test", 
   // 8. Verify the bare repo SHA equals the committed & pushed SHA
   const { stdout: bareSha } = await execFileAsync("git", ["rev-parse", "refs/heads/candidate/mcp-test-1"], { cwd: bareDir });
   assert.equal(bareSha.trim(), commitSha);
+});
+
+test("bash and command_status: attemptKey reconciliation and idempotent execution", async (t) => {
+  const context = await fixture(t);
+  const openResult = await callOpen(context.client, context.project, "chat-cmd-reconcile");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+
+  // 0. Missing attemptKey on native bash must fail closed / reject schema
+  const missingKeyRes = await context.client.callTool({
+    name: "bash",
+    arguments: {
+      workspaceId,
+      command: "echo fail_no_attempt_key",
+    },
+  });
+  assert.equal(missingKeyRes.isError, true, "Native bash requires attemptKey");
+
+  // 1. Short command compatibility with required attemptKey
+  const shortRes = await context.client.callTool({
+    name: "bash",
+    arguments: {
+      workspaceId,
+      command: "echo short_cmd_hello",
+      attemptKey: "bash:g2:short01",
+    },
+  });
+  assert.equal(shortRes.isError, undefined);
+  assert.match(responseText(shortRes), /short_cmd_hello/);
+  const shortStructured = structuredContent(shortRes) as Record<string, unknown>;
+  assert.equal(shortStructured.running, false);
+  assert.equal(shortStructured.exitCode, 0);
+
+  // 2. Long command yields running: true with attemptKey
+  const node = process.platform === "win32" ? `"${process.execPath}"` : JSON.stringify(process.execPath);
+  const attemptKey = "bash:g2:test01";
+  const longRes = await context.client.callTool({
+    name: "bash",
+    arguments: {
+      workspaceId,
+      command: `${node} -e "setTimeout(() => { console.log('async_done'); process.exit(0); }, 300)"`,
+      yieldTimeMs: 50,
+      attemptKey,
+    },
+  });
+  assert.equal(longRes.isError, undefined);
+  const longStructured = structuredContent(longRes) as Record<string, unknown>;
+  assert.equal(longStructured.running, true);
+  assert.equal(longStructured.attemptKey, attemptKey);
+
+  // 3. Reconcile via command_status
+  const statusRes = await context.client.callTool({
+    name: "command_status",
+    arguments: {
+      workspaceId,
+      attemptKey,
+      yieldTimeMs: 3_000,
+    },
+  });
+  assert.equal(statusRes.isError, undefined);
+  const statusStructured = structuredContent(statusRes) as Record<string, unknown>;
+  assert.equal(statusStructured.running, false);
+  assert.equal(statusStructured.exitCode, 0);
+  assert.match(responseText(statusRes), /async_done/);
+
+  // 4. Replay exact same bash start reuses completed session
+  const replayRes = await context.client.callTool({
+    name: "bash",
+    arguments: {
+      workspaceId,
+      command: `${node} -e "setTimeout(() => { console.log('async_done'); process.exit(0); }, 300)"`,
+      yieldTimeMs: 50,
+      attemptKey,
+    },
+  });
+  assert.equal(replayRes.isError, undefined);
+  const replayStructured = structuredContent(replayRes) as Record<string, unknown>;
+  assert.equal(replayStructured.running, false);
+  assert.equal(replayStructured.exitCode, 0);
+
+  // 5. Conflicting attemptKey fails closed
+  const conflictRes = await context.client.callTool({
+    name: "bash",
+    arguments: {
+      workspaceId,
+      command: "echo different_command",
+      attemptKey,
+    },
+  });
+  assert.equal(conflictRes.isError, true);
+  assert.match(responseText(conflictRes), /ATTEMPT_REPLAY_CONFLICT/);
+});
+
+test("command_status metadata annotations and minimal mode visibility", async (t) => {
+  // Test minimal mode tools
+  const context = await fixture(t, { toolMode: "minimal" });
+  const toolsList = await context.client.listTools();
+  const toolNames = toolsList.tools.map((t) => t.name);
+
+  // command_status is visible in minimal mode for read-only reconciliation
+  assert.ok(toolNames.includes("command_status"), "command_status should be visible in minimal mode");
+
+  // exec_command and write_stdin remain hidden in minimal mode
+  assert.ok(!toolNames.includes("exec_command"), "exec_command must stay hidden in minimal mode");
+  assert.ok(!toolNames.includes("write_stdin"), "write_stdin must stay hidden in minimal mode");
+
+  // Verify command_status annotations
+  const commandStatusTool = toolsList.tools.find((t) => t.name === "command_status");
+  assert.ok(commandStatusTool);
+  const annotations = (commandStatusTool as unknown as { annotations?: Record<string, unknown> }).annotations;
+  assert.deepEqual(annotations, {
+    readOnlyHint: true,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: false,
+  });
 });
