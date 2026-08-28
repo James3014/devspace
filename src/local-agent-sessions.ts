@@ -365,6 +365,7 @@ export class LocalAgentSessionManager {
   private readonly launcher: WorkerLauncher;
   private readonly terminator: WorkerTerminator;
   private readonly turnRunner?: AgentTurnRunner;
+  private closed = false;
   private readonly terminationAttempts = new Map<string, Promise<boolean>>();
 
   constructor(
@@ -377,6 +378,13 @@ export class LocalAgentSessionManager {
     this.launcher = testLauncher ?? defaultWorkerLauncher;
     this.terminator = testTerminator ?? terminateOwnedWorker;
     this.turnRunner = testTurnRunner;
+  }
+
+  /** Close the manager's durable store. Safe to call from multiple cleanup paths. */
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.store.close();
   }
 
   /**
