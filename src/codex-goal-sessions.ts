@@ -255,15 +255,19 @@ function completeLines(value: string, carry: string): { lines: string[]; carry: 
   return { lines: parts, carry: incomplete };
 }
 
+function normalizeHomeComponent(value: string): string {
+  const home = homedir().replace(/\/+$/, "");
+  if (value === "~") return home;
+  if (value === "~/") return `${home}/`;
+  if (value.startsWith("~/")) {
+    return `${home}/${value.slice(2).replace(/^\/+/, "")}`;
+  }
+  return value;
+}
+
 function realpathEqual(left: string, right: string): boolean {
-  const expandHome = (value: string): string =>
-    value === "~"
-      ? homedir()
-      : value.startsWith("~/")
-        ? join(homedir(), value.slice(2))
-        : value;
-  const leftExpanded = expandHome(left);
-  const rightExpanded = expandHome(right);
+  const leftExpanded = normalizeHomeComponent(left);
+  const rightExpanded = normalizeHomeComponent(right);
 
   // 1. Exact match via realpathSync / normalized string comparison
   try {
@@ -288,25 +292,30 @@ function realpathEqual(left: string, right: string): boolean {
   if (!rawHead || !rawTail) return false;
   if (!rawHead.endsWith("/") || !rawTail.startsWith("/")) return false;
 
-  const headExpanded = expandHome(rawHead);
+  const headExpanded = normalizeHomeComponent(rawHead);
+  const normalizedHead = headExpanded.endsWith("/") ? headExpanded : `${headExpanded}/`;
   const target = rightExpanded;
 
-  // Verify target starts with head component and ends with tail component
-  if (!target.startsWith(headExpanded)) return false;
+  // Verify target starts with normalizedHead at component boundary and ends with rawTail
+  if (!target.startsWith(normalizedHead)) return false;
   if (!target.endsWith(rawTail)) return false;
 
   // Verify no overlap: target length must strictly exceed head + tail length
-  if (target.length <= headExpanded.length + rawTail.length - 1) return false;
+  if (target.length <= normalizedHead.length + rawTail.length - 1) return false;
 
-  // Realpath component check if resolvable
+  // Realpath component check: physical verification is required; unresolvable targets fail closed
   try {
     const targetReal = realpathSync(target);
-    const headReal = realpathSync(headExpanded.slice(0, -1));
-    if (!targetReal.startsWith(headReal + "/") && targetReal !== headReal) {
+    const headDir = normalizedHead.replace(/\/+$/, "");
+    const headReal = realpathSync(headDir);
+    if (!targetReal.startsWith(`${headReal}/`) && targetReal !== headReal) {
+      return false;
+    }
+    if (!targetReal.endsWith(rawTail)) {
       return false;
     }
   } catch {
-    // if unresolved, target.startsWith(headExpanded) already passed
+    return false;
   }
 
   return true;

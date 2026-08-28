@@ -2057,3 +2057,47 @@ test("RED/NEGATIVE: multiple ellipses must fail closed", async () => {
   assert.equal(backend.terminated, true);
   manager.shutdown();
 });
+
+test("RED/NEGATIVE: home-prefix collision ~/…/target-project vs $HOME-evil/deep/target-project must fail closed", async () => {
+  const evilHomeWorkspace = `${homedir()}-evil/deep/target-project`;
+  const observed = "~/…/target-project";
+  const ready = `model: gpt-5.6-sol medium\ndirectory: ${observed}\nAsk Codex to do anything\n`;
+  const backend = new ScriptedDeltaBackend([{ output: ready }, { output: "" }, { output: "" }, { output: "" }]);
+  const manager = scriptedGoalManager(backend, { timeoutMs: 80 });
+  await assert.rejects(
+    manager.start({
+      workspaceId: "ws_home_evil_collision",
+      workspaceRoot: evilHomeWorkspace,
+      goal: "must stay blocked",
+    }),
+    /Codex Goal activation failed|did not resolve model and directory|produced no output/,
+  );
+  assert.equal(backend.writes.join(""), "", "home prefix collision must never emit /goal bytes");
+  assert.equal(backend.terminated, true);
+  manager.shutdown();
+});
+
+test("RED/NEGATIVE: textual prefix match across non-component boundary must fail closed", async () => {
+  const tmpRoot = realpathSync(tmpdir());
+  const foobarDir = join(tmpRoot, "foobar", "deep", "target");
+  mkdirSync(foobarDir, { recursive: true });
+  try {
+    const observed = `${tmpRoot}/foo/…/target`;
+    const ready = `model: gpt-5.6-sol medium\ndirectory: ${observed}\nAsk Codex to do anything\n`;
+    const backend = new ScriptedDeltaBackend([{ output: ready }, { output: "" }, { output: "" }, { output: "" }]);
+    const manager = scriptedGoalManager(backend, { timeoutMs: 80 });
+    await assert.rejects(
+      manager.start({
+        workspaceId: "ws_non_component_boundary",
+        workspaceRoot: foobarDir,
+        goal: "must stay blocked",
+      }),
+      /Codex Goal activation failed|did not resolve model and directory|produced no output/,
+    );
+    assert.equal(backend.writes.join(""), "", "non-component boundary must never emit /goal bytes");
+    assert.equal(backend.terminated, true);
+    manager.shutdown();
+  } finally {
+    try { rmSync(join(tmpRoot, "foobar"), { recursive: true, force: true }); } catch {}
+  }
+});
