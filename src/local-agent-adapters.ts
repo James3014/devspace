@@ -162,7 +162,7 @@ class CodexLocalAgentAdapter implements LocalAgentAdapter {
     if (callbacks?.onExecutionStarted) {
       await callbacks.onExecutionStarted();
     }
-    return runtime.run(input);
+    return runtime.run(input, callbacks);
   }
 }
 

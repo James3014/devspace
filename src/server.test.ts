@@ -491,12 +491,16 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
 
   const statusProps = statusTool.inputSchema.properties as Record<string, any>;
   assert.equal(statusProps.workspaceRoot, undefined);
+  const statusOutputProps = statusTool.outputSchema?.properties as Record<string, any>;
+  assert.ok(statusOutputProps.termination, "agent_status must expose physical termination evidence");
 
   const cancelProps = cancelTool.inputSchema.properties as Record<string, any>;
   assert.equal(cancelProps.workspaceRoot, undefined);
   assert.equal(cancelProps.workerPid, undefined);
   assert.equal(cancelProps.workerToken, undefined);
   assert.equal(cancelProps.signal, undefined);
+  const cancelOutputProps = cancelTool.outputSchema?.properties as Record<string, any>;
+  assert.ok(cancelOutputProps.termination, "agent_cancel must expose physical termination evidence");
 
   const listProps = listTool.inputSchema.properties as Record<string, any>;
   assert.equal(listProps.workspaceRoot, undefined);

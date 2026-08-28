@@ -93,6 +93,15 @@ type Transport = StreamableHTTPServerTransport;
 const MCP_SESSION_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
 const AGENT_SUPERVISION_INTERVAL_MS = 2_000;
+const AGENT_TERMINATION_OUTPUT_SCHEMA = z.object({
+  pending: z.boolean(),
+  generation: z.string().optional(),
+  requestedAt: z.string().optional(),
+  failure: z.string().optional(),
+  corrupt: z.boolean().optional(),
+  blocked: z.boolean().optional(),
+  reason: z.string().optional(),
+});
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
 const WRITE_TOOL_ANNOTATIONS = {
@@ -2301,6 +2310,7 @@ export function createMcpServer(
           changedPaths: z.array(z.string()).optional(),
           terminalReason: z.string().optional(),
           scopeState: z.string().optional(),
+          termination: AGENT_TERMINATION_OUTPUT_SCHEMA.optional(),
         },
         _meta: {},
         annotations: { readOnlyHint: true },
@@ -2349,6 +2359,7 @@ export function createMcpServer(
           terminal: z.boolean(),
           latestResponse: z.string().optional(),
           error: z.string().optional(),
+          termination: AGENT_TERMINATION_OUTPUT_SCHEMA.optional(),
           createdAt: z.string(),
           updatedAt: z.string(),
         },

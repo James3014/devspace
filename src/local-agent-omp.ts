@@ -128,6 +128,9 @@ export async function runOmpAcpSession(
     });
     activeSessionId = session.sessionId;
     items.push(session);
+    if (callbacks?.onSessionId) {
+      await callbacks.onSessionId(activeSessionId);
+    }
   }
 
   // Exact boundary: ACP session ready -> persist executionStartedAt -> prompt

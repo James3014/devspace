@@ -1117,7 +1117,8 @@ test("G3 TEST M — DriverBacked production boundary order", async () => {
         isOk: () => true,
         value: {
           provider: "claude" as const,
-          async run() {
+          async run(_input: any, callbacks?: any) {
+            assert.ok(callbacks, "driver must forward run callbacks to the runtime");
             events.push("runtime.run:start");
             return {
               isOk: () => true,
@@ -1192,6 +1193,9 @@ test("G3 TEST N — OMP production boundary order", async () => {
   };
 
   const callbacks = {
+    onSessionId: async (id: string) => {
+      events.push(`onSessionId:${id}`);
+    },
     onExecutionStarted: async () => {
       events.push("onExecutionStarted");
     },
@@ -1208,9 +1212,53 @@ test("G3 TEST N — OMP production boundary order", async () => {
   assert.deepEqual(events, [
     "initialize",
     "session.new",
+    "onSessionId:sess-omp-n",
     "onExecutionStarted",
     "session.prompt",
   ], "OMP session prompt must occur strictly after onExecutionStarted");
+});
+
+test("G3 TEST N1 — Codex session identity is persisted before execution", async () => {
+  const { CodexSdkLocalAgentRuntime } = await import("./local-agent-runtime.js");
+  const events: string[] = [];
+  const runtime = new CodexSdkLocalAgentRuntime({
+    startThread: () => ({
+      id: "thread-codex-n1",
+      run: async () => {
+        events.push("run");
+        throw new Error("provider timed out after session creation");
+      },
+    }),
+    resumeThread: () => { throw new Error("resume not expected"); },
+  } as any);
+
+  await assert.rejects(
+    runtime.run({ prompt: "prompt", workspaceRoot: "." }, {
+      onSessionId: async (id) => { events.push(`onSessionId:${id}`); },
+    }),
+    /provider timed out after session creation/,
+  );
+  assert.deepEqual(events, ["onSessionId:thread-codex-n1", "run"]);
+});
+
+test("G3 TEST N2 — Codex session callback failure blocks prompt dispatch", async () => {
+  const { CodexSdkLocalAgentRuntime } = await import("./local-agent-runtime.js");
+  let runCalled = false;
+  const runtime = new CodexSdkLocalAgentRuntime({
+    startThread: () => ({
+      id: "thread-codex-n2",
+      run: async () => { runCalled = true; return { finalResponse: "bad", items: [] }; },
+    }),
+    resumeThread: () => { throw new Error("resume not expected"); },
+  } as any);
+
+  await assert.rejects(
+    runtime.run({ prompt: "prompt", workspaceRoot: "." }, {
+      onSessionId: async () => { throw new Error("durable store unavailable"); },
+    }),
+    /durable store unavailable/,
+  );
+  assert.equal(runCalled, false);
 });
 
 // TEST O: OMP slow readiness does not consume execution budget
