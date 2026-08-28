@@ -52,6 +52,7 @@ export interface LocalAgentDriverOptions {
 
 const AGY_PRINT_TIMEOUT_SECONDS = 600;
 const AGY_AGENT_TIMEOUT_MS = 610_000;
+const AGY_OUTPUT_DRAIN_TIMEOUT_MS = 1_000;
 
 function inputEnvironment(input: LocalAgentRunInput): NodeJS.ProcessEnv {
   return input.environment ?? process.env;
@@ -450,13 +451,20 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
       }, timeoutMs);
     });
 
-    let exitInfo: { code: number | null; signal: NodeJS.Signals | null };
+    let exitInfo: { code: number | null; signal: NodeJS.Signals | null } | undefined;
     try {
       exitInfo = await Promise.race([exitPromise, timeoutPromise]);
     } finally {
       if (timeoutId) clearTimeout(timeoutId);
       if (graceTermId) clearTimeout(graceTermId);
       if (graceKillId) clearTimeout(graceKillId);
+      // A provider may fork a descendant that inherits these descriptors.
+      // Once the exact child has exited, close only our owned handles so that
+      // the caller is never held open by an inherited pipe.
+      if (exitInfo) {
+        await drainOwnedChildOutput(child, () => stdout, () => stderr);
+      }
+      await closeOwnedChildPipes(child);
     }
 
     if (isTimedOut) {
@@ -507,6 +515,56 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
       items: [parsed],
     };
   }
+}
+
+async function closeOwnedChildPipes(
+  child: import("node:child_process").ChildProcessWithoutNullStreams,
+): Promise<void> {
+  child.stdin.end();
+  child.stdin.destroy();
+  child.stdout.destroy();
+  child.stderr.destroy();
+}
+
+async function drainOwnedChildOutput(
+  child: import("node:child_process").ChildProcessWithoutNullStreams,
+  readStdout: () => string,
+  readStderr: () => string,
+): Promise<void> {
+  await new Promise<void>((resolve) => {
+    let stdoutEnded = child.stdout.readableEnded;
+    let stderrEnded = child.stderr.readableEnded;
+    let timer: NodeJS.Timeout | undefined;
+    const cleanup = () => {
+      if (timer) clearTimeout(timer);
+      child.stdout.off("data", onData);
+      child.stderr.off("data", onData);
+      child.stdout.off("end", onStdoutEnd);
+      child.stderr.off("end", onStderrEnd);
+      child.stdout.off("close", onStdoutEnd);
+      child.stderr.off("close", onStderrEnd);
+    };
+    const finish = () => { cleanup(); resolve(); };
+    const onData = () => {
+      try {
+        const parsed = JSON.parse(readStdout().trim());
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) finish();
+      } catch {
+        // Continue draining until the output is complete or bounded timeout.
+      }
+    };
+    const onStdoutEnd = () => { stdoutEnded = true; if (stdoutEnded && stderrEnded) finish(); };
+    const onStderrEnd = () => { stderrEnded = true; if (stdoutEnded && stderrEnded) finish(); };
+    child.stdout.on("data", onData);
+    child.stderr.on("data", onData);
+    child.stdout.once("end", onStdoutEnd);
+    child.stderr.once("end", onStderrEnd);
+    child.stdout.once("close", onStdoutEnd);
+    child.stderr.once("close", onStderrEnd);
+    timer = setTimeout(finish, AGY_OUTPUT_DRAIN_TIMEOUT_MS);
+    onData();
+    if (stdoutEnded && stderrEnded) finish();
+  });
 }
 
 function assertPipedChild(child: ReturnType<typeof spawn>): asserts child is import("node:child_process").ChildProcessWithoutNullStreams {

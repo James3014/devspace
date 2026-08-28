@@ -147,6 +147,14 @@ test("LocalAgentSessionManager - startAgent and PROVIDER_UNAVAILABLE", async () 
   }
 });
 
+test("LocalAgentSessionManager - close is idempotent and prevents use after close", async () => {
+  const fixture = setupFixture();
+  await fixture.manager.close();
+  await fixture.manager.close();
+  assert.throws(() => fixture.manager.listRecordsByRoot({}), /closed|database/i);
+  fixture.clean();
+});
+
 test("LocalAgentSessionManager - continueAgent identity and validation", async () => {
   const { manager, spawnedWorkers, clean } = setupFixture();
   try {

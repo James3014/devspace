@@ -25,7 +25,7 @@ import {
   parseLocalAgentRunArgs,
 } from "./local-agent-targets.js";
 import { createLocalAgentClient } from "./local-agent-client.js";
-import { toAgentErrorPayload, type LocalAgentError } from "./local-agent-errors.js";
+import { AgentTargetError, toAgentErrorPayload, type LocalAgentError } from "./local-agent-errors.js";
 import {
   formatAgentObservation,
   formatAgentReceipt,
@@ -44,7 +44,7 @@ import {
   usesChatGpt,
   usesCodingAgents,
 } from "./onboarding.js";
-import { LocalAgentSessionManager } from "./local-agent-sessions.js";
+import { AgentSessionError, LocalAgentSessionManager } from "./local-agent-sessions.js";
 import type { LocalAgentRecord } from "./local-agent-store.js";
 
 import {
@@ -423,6 +423,9 @@ async function runAgentsCommand(args: string[]): Promise<void> {
     case "show":
       await runAgentsShow(commandArgs, json);
       return;
+    case "cancel":
+      await runAgentsCancel(commandArgs, json);
+      return;
     case "targets":
       await runAgentsTargets(commandArgs, json);
       return;
@@ -619,20 +622,49 @@ function printJson(value: unknown): void {
   console.log(JSON.stringify(value));
 }
 
-async function runAgentsCancel(args: string[]): Promise<void> {
+async function runAgentsCancel(args: string[], json: boolean): Promise<void> {
   const [id] = args;
   if (!id) throw new Error("Usage: devspace agents cancel <id>");
 
   const config = loadConfig();
   const manager = new LocalAgentSessionManager(config);
-  const record = manager.getRecordByPrefixOrId(id);
-  if (!record) throw new Error(`Unknown subagent id: ${id}`);
-  const output = await manager.cancelAgent({
-    workspaceId: record.workspaceId ?? "cli",
-    workspaceRoot: record.workspaceRoot,
-    agentId: record.id,
-  });
-  console.log(`${output.agentId} ${output.status} ${output.profileName} ${output.provider}`);
+  let record: LocalAgentRecord | undefined;
+  try {
+    record = manager.getRecordByPrefixOrId(id);
+    if (!record) throw new AgentTargetError({
+      code: "AGENT_NOT_FOUND",
+      target: id,
+      operation: "cancel",
+      retryable: false,
+      message: `Unknown subagent id: ${id}`,
+    });
+    const output = await manager.cancelAgent({
+      workspaceId: record.workspaceId ?? "cli",
+      workspaceRoot: record.workspaceRoot,
+      agentId: record.id,
+    });
+    if (json) printJson(output);
+    else console.log(`${output.agentId} ${output.status} ${output.profileName} ${output.provider}`);
+  } catch (error) {
+    if (!json) throw error;
+    if (error instanceof AgentSessionError) {
+      printJson({ error: {
+        code: error.code,
+        message: error.message,
+        retryable: error.code === "WORKER_TERMINATION_FAILED",
+        operation: "cancel",
+        target: id,
+        ...(record ? { agentId: record.id, provider: record.provider, workspaceId: record.workspaceId } : {}),
+      } });
+    } else if (error instanceof AgentTargetError) {
+      printJson({ error: toAgentErrorPayload(error) });
+    } else {
+      printJson({ error: { code: "TARGET_RESOLUTION_FAILED", message: error instanceof Error ? error.message : String(error), retryable: false, target: id } });
+    }
+    process.exitCode = 1;
+  } finally {
+    manager.close();
+  }
 }
 
 async function runAgentsWorker(args: string[]): Promise<void> {
@@ -649,7 +681,11 @@ async function runAgentsWorker(args: string[]): Promise<void> {
 
   const config = loadConfig();
   const manager = new LocalAgentSessionManager(config);
-  await manager.runWorkerTurnFromFile(id, promptFile, workerToken);
+  try {
+    await manager.runWorkerTurnFromFile(id, promptFile, workerToken);
+  } finally {
+    manager.close();
+  }
 }
 
 function resolveCurrentWorkspaceRoot(): string {
