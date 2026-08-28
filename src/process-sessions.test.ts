@@ -1,4 +1,6 @@
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { HeadTailBuffer, ProcessSessionManager } from "./process-sessions.js";
 
 const smallBuffer = new HeadTailBuffer(100);
@@ -36,6 +38,86 @@ const manager = new ProcessSessionManager({
 const node = process.platform === "win32"
   ? `"${process.execPath}"`
   : JSON.stringify(process.execPath);
+
+// G5: command replay identity survives a fresh MCP workspace session for the
+// same physical checkout, but never crosses into another physical root.
+const reconnectManager = new ProcessSessionManager({ completedSessionTtlMs: 5_000 });
+const reconnectRoot = process.cwd();
+const reconnectCommand = `${node} -e "console.log('g5_reconnect_ok')"`;
+const reconnectFirst = await reconnectManager.start({
+  workspaceId: "ws_ephemeral_a",
+  workspaceRoot: reconnectRoot,
+  cwd: reconnectRoot,
+  command: reconnectCommand,
+  attemptKey: "g5:reconnect:001",
+  yieldTimeMs: 2_000,
+});
+assert.equal(reconnectFirst.exitCode, 0);
+const reconnectStatus = await reconnectManager.getStatus({
+  workspaceId: "ws_ephemeral_b",
+  workspaceRoot: reconnectRoot,
+  attemptKey: "g5:reconnect:001",
+});
+assert.equal(reconnectStatus.exitCode, 0);
+assert.match(reconnectStatus.output, /g5_reconnect_ok/);
+const reconnectReplay = await reconnectManager.start({
+  workspaceId: "ws_ephemeral_b",
+  workspaceRoot: reconnectRoot,
+  cwd: reconnectRoot,
+  command: reconnectCommand,
+  attemptKey: "g5:reconnect:001",
+  yieldTimeMs: 2_000,
+});
+assert.equal(reconnectReplay.exitCode, 0);
+await assert.rejects(
+  reconnectManager.start({
+    workspaceId: "ws_ephemeral_b",
+    workspaceRoot: reconnectRoot,
+    cwd: reconnectRoot,
+    command: "echo materially_different",
+    attemptKey: "g5:reconnect:001",
+  }),
+  /ATTEMPT_REPLAY_CONFLICT/,
+);
+await assert.rejects(
+  reconnectManager.getStatus({
+    workspaceId: "ws_other_root",
+    workspaceRoot: "/tmp",
+    attemptKey: "g5:reconnect:001",
+  }),
+  /Unknown process attemptKey/,
+);
+reconnectManager.shutdown();
+
+// Root and attempt-key delimiters must not create ambiguous replay identities.
+const collisionBase = mkdtempSync("/tmp/devspace-g5-collision-");
+const collisionRootA = join(collisionBase, "a");
+const collisionRootB = join(collisionBase, "a:b");
+mkdirSync(collisionRootA);
+mkdirSync(collisionRootB);
+const collisionManager = new ProcessSessionManager();
+try {
+  const firstCollision = await collisionManager.start({
+    workspaceId: "ws_collision_a",
+    workspaceRoot: collisionRootA,
+    cwd: reconnectRoot,
+    command: "echo collision_a",
+    attemptKey: "b:c",
+  });
+  const secondCollision = await collisionManager.start({
+    workspaceId: "ws_collision_b",
+    workspaceRoot: collisionRootB,
+    cwd: reconnectRoot,
+    command: "echo collision_b",
+    attemptKey: "c",
+  });
+  assert.equal(firstCollision.exitCode, 0);
+  assert.equal(secondCollision.exitCode, 0);
+  assert.match(secondCollision.output, /collision_b/);
+} finally {
+  collisionManager.shutdown();
+  rmSync(collisionBase, { recursive: true, force: true });
+}
 
 const foreground = await manager.start({
   workspaceId: "workspace-a",

@@ -2058,9 +2058,10 @@ export function createMcpServer(
     },
     async ({ workspaceId, attemptKey, sessionId, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
-      workspaces.getWorkspace(workspaceId);
+      const workspace = workspaces.getWorkspace(workspaceId);
       const snapshot = await processSessions.getStatus({
         workspaceId,
+        workspaceRoot: workspace.root,
         attemptKey,
         sessionId,
         yieldTimeMs: yieldTimeMs ?? 5_000,
