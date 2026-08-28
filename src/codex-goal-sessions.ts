@@ -16,7 +16,7 @@ import {
 } from "./workspace-reconciliation.js";
 
 const GOAL_MARKER_PATTERN = /pursuing\s+goal/i;
-const TRUST_DIALOG_PATTERN = /trust\s+the\s+contents/i;
+const TRUST_DIALOG_PATTERN = /\bdo\s*you\s*trust\s*the\s*contents\s*of\s*this\s*directory\b/i;
 const EXPECTED_HEAD_PATTERN = /^[0-9a-fA-F]{40}$/;
 const MACOS_CODEX_FALLBACK = "/Applications/ChatGPT.app/Contents/Resources/codex";
 const MAX_GOAL_CHARACTERS = 20_000;
@@ -65,6 +65,7 @@ export interface CodexGoalState {
   reasoningEffort?: string;
   baseHead?: string;
   terminalReason?: string;
+  error?: string;
 }
 
 interface GoalSession {
@@ -82,10 +83,15 @@ interface GoalSession {
   exitCode?: number;
   signal?: string;
   terminalReason?: string;
+  error?: string;
   recentOutput: HeadTailBuffer;
   readiness?: DestructiveDeltaReadiness;
   readinessBlocked?: string;
   terminalQueryCarry: string;
+  cancelRequested: boolean;
+  activationPromise?: Promise<void>;
+  ioTail: Promise<void>;
+  activationPending: boolean;
 }
 
 export interface CodexGoalSessionManagerOptions {
@@ -106,6 +112,10 @@ export function normalizeTerminalText(value: string): string {
   return value.replace(TERMINAL_ESCAPE_PATTERN, "").replace(/\s+/g, " ");
 }
 
+export function isTrustDialogText(value: string): boolean {
+  return TRUST_DIALOG_PATTERN.test(value);
+}
+
 // ─── Destructive delta readiness model ──────────────────────────────────────
 
 type ReadinessBlock = "trust" | "error" | "truncation";
@@ -122,7 +132,7 @@ interface ReadinessSnapshot {
 const LOADING_PATTERN = /\bloading\b/i;
 const ERROR_PATTERN = /\b(?:error|failed|fatal)\b/i;
 const PROMPT_FRAME_PATTERN = /^\s*(?:[>›]\s*)?Ask Codex to do anything\s*$/i;
-const READINESS_SEMANTIC_DELTA_PATTERN = /(?:model|direc|ask\s+codex|loading|error|failed|fatal|trust\s+the\s+contents)/i;
+const READINESS_SEMANTIC_DELTA_PATTERN = /(?:model|direc|ask\s+codex|loading|error|failed|fatal|do\s*you\s*trust\s*the\s*contents)/i;
 const CLEAR_SCREEN_PATTERN = /\x1b(?:\[2J|\[3J|c)/;
 
 const TERMINAL_QUERY_RESPONSES = [
@@ -710,6 +720,9 @@ export class CodexGoalSessionManager {
   private readonly cancelTimeoutMs: number;
   private readonly codexBin?: string;
   private readonly resolveBinaryImpl: (configuredBin?: string) => Promise<string>;
+  private readonly workspaceClaims = new Set<string>();
+  private closed = false;
+  private lifecycleGeneration = 0;
 
   constructor(
     private readonly processes: GoalProcessBackend,
@@ -738,6 +751,31 @@ export class CodexGoalSessionManager {
   }
 
   async start(input: CodexGoalStartInput): Promise<CodexGoalState> {
+    const { session, goal } = await this.createSession(input);
+    session.activationPending = true;
+    session.activationPromise = this.enqueueIo(session, () => this.activateSession(session, goal))
+      .finally(() => { session.activationPending = false; });
+    await session.activationPromise;
+    return this.stateFor(session, "");
+  }
+
+  /** Spawn and durably register one process, then activate it asynchronously. */
+  async startPrompt(input: CodexGoalStartInput): Promise<CodexGoalState> {
+    const { session, goal } = await this.createSession(input);
+    session.activationPending = true;
+    session.activationPromise = this.enqueueIo(session, () => this.activateInBackground(session, goal))
+      .finally(() => { session.activationPending = false; });
+    return this.stateFor(session, "");
+  }
+
+  private async createSession(input: CodexGoalStartInput): Promise<{ session: GoalSession; goal: string }> {
+    const generation = this.lifecycleGeneration;
+    if (this.closed) throw new Error("Codex Goal session manager is closed.");
+    if (this.workspaceClaims.has(input.workspaceId)) {
+      throw new Error(`Workspace already has an active Codex goal.`);
+    }
+    this.workspaceClaims.add(input.workspaceId);
+    try {
     const goal = collapseTypedWhitespace(input.goal);
     if (!goal) throw new Error("Goal text must not be empty.");
     if (codePointLength(goal) > MAX_GOAL_CHARACTERS) {
@@ -783,6 +821,9 @@ export class CodexGoalSessionManager {
     }
 
     const binary = await this.resolveBinaryImpl(this.codexBin);
+    if (this.closed || generation !== this.lifecycleGeneration) {
+      throw new Error("Codex Goal session manager lifecycle changed while starting.");
+    }
 
     const goalId = `goal_${randomUUID().replaceAll("-", "").slice(0, 16)}`;
     const args = buildCodexArgs({
@@ -802,6 +843,13 @@ export class CodexGoalSessionManager {
       environmentPolicy: "sanitized",
       yieldTimeMs: this.activationPollMs,
     });
+
+    if (this.closed || generation !== this.lifecycleGeneration) {
+      if (snapshot.sessionId !== undefined) {
+        try { this.processes.terminate(input.workspaceId, snapshot.sessionId); } catch { /* best effort */ }
+      }
+      throw new Error("Codex Goal session manager lifecycle changed while starting.");
+    }
 
     if (!snapshot.running || snapshot.sessionId === undefined) {
       throw new Error(
@@ -826,22 +874,47 @@ export class CodexGoalSessionManager {
       recentOutput: new HeadTailBuffer(RECENT_OUTPUT_LIMIT),
       readiness: new DestructiveDeltaReadiness(),
       terminalQueryCarry: "",
+      cancelRequested: false,
+      ioTail: Promise.resolve(),
+      activationPending: false,
     };
     this.sessions.set(goalId, session);
     this.absorbSnapshot(session, snapshot, input.workspaceRoot);
-    await this.respondToTerminalQueries(session, snapshot.output, input.workspaceRoot);
-
-    try {
-      await this.waitForTuiReady(session);
-      await this.typeIntoSession(session, `/goal ${goal}`, input.workspaceRoot);
-      await this.waitForGoalActivation(session);
-    } catch (error) {
-      await this.terminateSession(session, "activation_failed");
-      const message = error instanceof Error ? error.message : String(error);
-      throw new Error(`Codex Goal activation failed: ${message}`);
+    await this.enqueueIo(session, () => this.respondToTerminalQueries(session, snapshot.output, input.workspaceRoot));
+    if (this.closed || generation !== this.lifecycleGeneration) {
+      if (this.sessions.get(goalId) === session) this.sessions.delete(goalId);
+      try { this.processes.terminate(input.workspaceId, session.processSessionId); } catch { /* best effort */ }
+      throw new Error("Codex Goal session manager lifecycle changed while starting.");
     }
 
-    return this.stateFor(session, "");
+    return { session, goal };
+    } finally {
+      this.workspaceClaims.delete(input.workspaceId);
+    }
+  }
+
+  private async activateSession(session: GoalSession, goal: string): Promise<void> {
+    try {
+      await this.waitForTuiReady(session);
+      if (session.terminal || session.cancelRequested) return;
+      await this.typeIntoSession(session, `/goal ${goal}`, session.workspaceRoot);
+      await this.waitForGoalActivation(session);
+    } catch (error) {
+      if (session.cancelRequested || session.terminalReason === "server_shutdown") return;
+      await this.terminateSession(session, "activation_failed");
+      session.terminalReason = "activation_failed";
+      const message = error instanceof Error ? error.message : String(error);
+      session.error = truncateForError(message);
+      throw new Error(`Codex Goal activation failed: ${message}`);
+    }
+  }
+
+  private async activateInBackground(session: GoalSession, goal: string): Promise<void> {
+    try {
+      await this.activateSession(session, goal);
+    } catch {
+      // The terminal state and sanitized error are retained for status polling.
+    }
   }
 
   async status(
@@ -850,12 +923,23 @@ export class CodexGoalSessionManager {
     options: { waitMs?: number } = {},
   ): Promise<CodexGoalState> {
     const session = this.getOwnedSession(workspaceId, goalId);
-    let outputChunk = "";
-    if (!session.terminal) {
-      const polled = await this.pollSession(session, options.waitMs ?? 0);
-      outputChunk = polled;
+    if (session.activationPromise && !session.goalActiveObserved && !session.terminal) {
+      const waitMs = options.waitMs ?? 0;
+      if (waitMs > 0) {
+        await Promise.race([session.activationPromise.catch(() => undefined), this.pauseFor(waitMs)]);
+      }
     }
-    return this.stateFor(session, outputChunk);
+    if (session.activationPending && !session.goalActiveObserved && !session.terminal) {
+      return this.stateFor(session, "");
+    }
+    return this.enqueueIo(session, async () => {
+      if (session.activationPending && !session.goalActiveObserved && !session.terminal) {
+        return this.stateFor(session, "");
+      }
+      let outputChunk = "";
+      if (!session.terminal) outputChunk = await this.pollSession(session, options.waitMs ?? 0);
+      return this.stateFor(session, outputChunk);
+    });
   }
 
   async continue(
@@ -864,21 +948,31 @@ export class CodexGoalSessionManager {
     message: string,
   ): Promise<CodexGoalState> {
     const session = this.getOwnedSession(workspaceId, goalId);
-    if (session.terminal) {
-      throw new Error(`Codex goal ${goalId} is terminal and cannot accept continuation input.`);
-    }
-    if (!session.goalActiveObserved) {
-      throw new Error(`Codex goal ${goalId} has not activated Goal Mode yet.`);
-    }
     const collapsed = collapseTypedWhitespace(message);
     if (!collapsed) throw new Error("Continuation message must not be empty.");
     if (codePointLength(collapsed) > MAX_MESSAGE_CHARACTERS) {
       throw new Error(`Continuation message exceeds the ${MAX_MESSAGE_CHARACTERS} character limit.`);
     }
 
-    await this.typeIntoSession(session, collapsed);
-    const outputChunk = await this.pollSession(session, this.activationPollMs * 4);
-    return this.stateFor(session, outputChunk);
+    return this.enqueueIo(session, async () => {
+      if (session.terminal) {
+        throw new Error(`Codex goal ${goalId} is terminal and cannot accept continuation input.`);
+      }
+      if (!session.goalActiveObserved || session.cancelRequested) {
+        throw new Error(`Codex goal ${goalId} has not activated Goal Mode yet.`);
+      }
+      await this.typeIntoSession(session, collapsed);
+      const outputChunk = await this.pollSession(session, this.activationPollMs * 4);
+      return this.stateFor(session, outputChunk);
+    });
+  }
+
+  private async enqueueIo<T>(session: GoalSession, operation: () => Promise<T>): Promise<T> {
+    const prior = session.ioTail;
+    let release!: () => void;
+    session.ioTail = new Promise<void>((resolve) => { release = resolve; });
+    await prior;
+    try { return await operation(); } finally { release(); }
   }
 
   async cancel(workspaceId: string, goalId: string): Promise<CodexGoalState> {
@@ -888,31 +982,43 @@ export class CodexGoalSessionManager {
       return { ...state, terminalReason: session.terminalReason ?? "already_terminal" };
     }
 
-    this.processes.terminate(session.workspaceId, session.processSessionId);
-    const deadline = Date.now() + this.cancelTimeoutMs;
-    while (Date.now() < deadline && !session.terminal) {
-      await this.pollSession(session, Math.min(this.activationPollMs, deadline - Date.now()));
-      if (!session.terminal) await this.pause();
-    }
-    if (session.terminal) {
-      session.terminalReason = "cancelled";
-    } else {
+    session.cancelRequested = true;
+    session.terminal = true;
+    session.terminalReason = "cancelled";
+    const actorTail = session.ioTail;
+    try {
+      this.processes.terminate(session.workspaceId, session.processSessionId);
+    } catch (error) {
+      if (!(error instanceof Error && /unknown process session|already reaped|not found/i.test(error.message))) throw error;
       session.terminal = true;
+      session.terminalReason = "cancelled";
+      return this.stateFor(session, "");
+    }
+    let converged = false;
+    await Promise.race([
+      actorTail.then(() => { converged = true; }),
+      this.pauseFor(this.cancelTimeoutMs),
+    ]);
+    if (!converged) {
       session.terminalReason = "cancel_timeout";
+      session.error = `Cancellation did not converge within ${this.cancelTimeoutMs}ms.`;
     }
     return this.stateFor(session, "");
   }
 
   shutdown(): void {
+    this.closed = true;
+    this.lifecycleGeneration += 1;
     for (const session of this.sessions.values()) {
       if (!session.terminal) {
+        session.cancelRequested = true;
+        session.terminal = true;
+        session.terminalReason = "server_shutdown";
         try {
           this.processes.terminate(session.workspaceId, session.processSessionId);
         } catch {
           // best-effort shutdown
         }
-        session.terminal = true;
-        session.terminalReason = "server_shutdown";
       }
     }
     this.sessions.clear();
@@ -931,6 +1037,7 @@ export class CodexGoalSessionManager {
    * interpret the whole payload as a single bracketed paste event. Ends with
    * an explicit carriage return to execute the line. */
   private async typeIntoSession(session: GoalSession, text: string, workspaceRoot?: string): Promise<void> {
+    if (session.terminal || session.cancelRequested) return;
     const characters = Array.from(text);
     if (workspaceRoot !== undefined && text.startsWith("/goal ")) {
       if (!session.readiness?.stableResolved()) {
@@ -956,6 +1063,7 @@ export class CodexGoalSessionManager {
       }
     }
     for (let index = 0; index < characters.length; index += this.typeChunkCharacters) {
+      if (session.terminal || session.cancelRequested) return;
       const chunk = characters.slice(index, index + this.typeChunkCharacters).join("");
       const snapshot = await this.processes.write({
         workspaceId: session.workspaceId,
@@ -963,6 +1071,7 @@ export class CodexGoalSessionManager {
         chars: chunk,
         yieldTimeMs: this.typeChunkDelayMs,
       });
+      if (session.terminal || session.cancelRequested) return;
       this.absorbSnapshot(session, snapshot, workspaceRoot);
       if (!snapshot.running) {
         throw new Error(
@@ -970,12 +1079,14 @@ export class CodexGoalSessionManager {
         );
       }
     }
+    if (session.terminal || session.cancelRequested) return;
     const submit = await this.processes.write({
       workspaceId: session.workspaceId,
       sessionId: session.processSessionId,
       chars: "\r",
       yieldTimeMs: this.typeChunkDelayMs,
     });
+    if (session.terminal || session.cancelRequested) return;
     this.absorbSnapshot(session, submit, workspaceRoot);
     if (!submit.running) {
       throw new Error(
@@ -988,6 +1099,7 @@ export class CodexGoalSessionManager {
   private async waitForTuiReady(session: GoalSession): Promise<void> {
     const deadline = Date.now() + this.startupTimeoutMs;
     while (Date.now() < deadline) {
+      if (session.terminal || session.cancelRequested) return;
       await this.pollSession(session, this.activationPollMs);
       this.assertNoTrustDialog(session);
       if (
@@ -1015,6 +1127,7 @@ export class CodexGoalSessionManager {
   private async waitForGoalActivation(session: GoalSession): Promise<void> {
     const deadline = Date.now() + this.startupTimeoutMs;
     while (Date.now() < deadline) {
+      if (session.terminal || session.cancelRequested) return;
       await this.pollSession(session, this.activationPollMs);
       if (session.goalActiveObserved) return;
       this.assertNoTrustDialog(session);
@@ -1043,6 +1156,10 @@ export class CodexGoalSessionManager {
     return new Promise((resolve) => setTimeout(resolve, this.activationPollMs));
   }
 
+  private pauseFor(milliseconds: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, milliseconds));
+  }
+
   /** Poll the existing process session without ever creating a replacement. */
   private async pollSession(session: GoalSession, waitMs: number): Promise<string> {
     let snapshot: ProcessSnapshot;
@@ -1054,6 +1171,7 @@ export class CodexGoalSessionManager {
         yieldTimeMs: Math.max(waitMs, 50),
       });
     } catch (error) {
+      if (session.cancelRequested || session.terminal) return "";
       const message = error instanceof Error ? error.message : String(error);
       if (/Unknown process session/.test(message)) {
         if (!session.terminal) {
@@ -1084,12 +1202,14 @@ export class CodexGoalSessionManager {
       const reply = terminalQueryReply(pendingOutput, session.terminalQueryCarry);
       session.terminalQueryCarry = reply.carry;
       if (!reply.chars || session.terminal) break;
+      if (session.cancelRequested) break;
       const snapshot = await this.processes.write({
         workspaceId: session.workspaceId,
         sessionId: session.processSessionId,
         chars: reply.chars,
         yieldTimeMs: this.activationPollMs,
       });
+      if (session.cancelRequested || session.terminal) break;
       combinedOutput += this.absorbSnapshot(session, snapshot, workspaceRoot);
       if (!snapshot.running) break;
       pendingOutput = snapshot.output;
@@ -1124,7 +1244,7 @@ export class CodexGoalSessionManager {
     if (!session.goalActiveObserved && GOAL_MARKER_PATTERN.test(normalizeTerminalText(output))) {
       session.goalActiveObserved = true;
     }
-    if (!session.trustDialogObserved && TRUST_DIALOG_PATTERN.test(normalizeTerminalText(output))) {
+    if (!session.trustDialogObserved && isTrustDialogText(normalizeTerminalText(output))) {
       session.trustDialogObserved = true;
     }
   }
@@ -1164,6 +1284,7 @@ export class CodexGoalSessionManager {
       ...(session.reasoningEffort ? { reasoningEffort: session.reasoningEffort } : {}),
       ...(session.baseHead ? { baseHead: session.baseHead } : {}),
       ...(session.terminalReason ? { terminalReason: session.terminalReason } : {}),
+      ...(session.error ? { error: session.error } : {}),
     };
   }
 }

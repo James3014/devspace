@@ -12,6 +12,7 @@ import { loadConfig, type ServerConfig } from "./config.js";
 import {
   CodexGoalSessionManager,
   normalizeTerminalText,
+  isTrustDialogText,
   resolveCodexBinary,
   type GoalProcessBackend,
 } from "./codex-goal-sessions.js";
@@ -28,6 +29,15 @@ import { WorkspaceRegistry } from "./workspaces.js";
 
 const execFileAsync = promisify(execFile);
 const OWNER_TOKEN = "test-owner-token-that-is-long-enough";
+
+test("compact normalized trust dialog is detected without accepting it", () => {
+  assert.equal(isTrustDialogText("Doyoutrustthecontentsofthisdirectory?"), true);
+  assert.equal(isTrustDialogText("Do you trust the contents of this directory?"), true);
+  assert.equal(isTrustDialogText("distrustthecontentsofthisdirectory"), false);
+  assert.equal(isTrustDialogText("Do not trust the contents of this directory"), false);
+  assert.equal(isTrustDialogText("Ask Codex to do anything"), false);
+});
+
 
 function makeFakeCodexTui(options: { logPath: string; emitGoalMarker?: boolean }): string {
   return `#!/usr/bin/env node
@@ -186,6 +196,17 @@ async function callTool(
   args: Record<string, unknown>,
 ): Promise<CallToolResult> {
   return client.callTool({ name, arguments: args }) as Promise<CallToolResult>;
+}
+
+async function waitForGoalActive(client: Client, workspaceId: string, goalId: string): Promise<Record<string, unknown>> {
+  let output = "";
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const result = await callTool(client, "codex_goal_status", { workspaceId, goalId, waitMs: 50 });
+    const state = structured(result);
+    output += String(state.outputChunk ?? "");
+    if (state.goalActiveObserved || state.terminal) return { ...state, outputChunk: output };
+  }
+  throw new Error(`Goal ${goalId} did not reach active or terminal state within bounded polling window`);
 }
 
 type CallToolResult = Awaited<ReturnType<Client["callTool"]>> & {
@@ -422,12 +443,13 @@ test("start launches the real CLI in a PTY, types /goal, and observes activation
   assert.ok(String(state.goalId).startsWith("goal_"));
   assert.equal(state.running, true);
   assert.equal(state.terminal, false);
-  assert.equal(state.goalActiveObserved, true);
+  const activeState = await waitForGoalActive(context.client, workspaceId, state.goalId as string);
+  assert.equal(activeState.goalActiveObserved, true);
   assert.equal(state.model, "gpt-5.6-sol");
   assert.equal(state.reasoningEffort, "medium");
   assert.equal(state.baseHead, await headSha(context.projectA));
 
-  const output = collectOutput([state]);
+  const output = collectOutput([state, activeState]);
   assert.match(output, /TTY:1/, "the Codex process must run inside a real PTY");
   assert.match(normalizeTerminalText(output), /Pursuing goal/);
   assert.ok(output.includes(`GOAL_RECEIVED:${goal}`));
@@ -454,12 +476,10 @@ test("large goal input is typed in chunks instead of one swallowed paste", async
     expectedHead: await headSha(context.projectA),
   });
   assert.equal(started.isError, undefined, textOf(started));
-  const status = await callTool(context.client, "codex_goal_status", {
-    workspaceId,
-    goalId: structured(started).goalId as string,
-  });
-  const normalized = normalizeTerminalText(collectOutput([structured(started), structured(status)]));
-  assert.doesNotMatch(collectOutput([structured(started), structured(status)]), /PASTE_SWALLOWED/);
+  const goalId = structured(started).goalId as string;
+  const statusState = await waitForGoalActive(context.client, workspaceId, goalId);
+  const normalized = normalizeTerminalText(collectOutput([structured(started), statusState]));
+  assert.doesNotMatch(collectOutput([structured(started), statusState]), /PASTE_SWALLOWED/);
   assert.ok(normalized.includes(`GOAL_RECEIVED:${goal.slice(0, 40)}`));
   assert.ok(normalized.includes(goal.slice(-30)));
   await callTool(context.client, "codex_goal_cancel", {
@@ -479,8 +499,18 @@ test("start fails closed when Goal activation is never observed", async (t) => {
     goal: "should never activate",
     expectedHead: await headSha(context.projectA),
   });
-  assert.equal(started.isError, true);
-  assert.match(textOf(started), /Goal activation failed|not observed within/);
+  assert.equal(started.isError, undefined, textOf(started));
+  let failedState = await waitForGoalActive(context.client, workspaceId, structured(started).goalId as string);
+  for (let attempt = 0; attempt < 20 && failedState.terminalReason !== "activation_failed"; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    failedState = structured(await callTool(context.client, "codex_goal_status", {
+      workspaceId,
+      goalId: structured(started).goalId as string,
+    }));
+  }
+  assert.equal(failedState.terminal, true);
+  assert.equal(failedState.terminalReason, "activation_failed");
+  assert.match(String(failedState.error ?? ""), /activation|Goal|observed/i);
 
   // The half-started session must be terminated, not leaked as a success.
   const list = context.goals.listActiveGoalIds();
@@ -535,9 +565,9 @@ test("status and continue reuse the same goalId and never spawn a second process
   });
   const goalId = structured(started).goalId as string;
 
-  const status = await callTool(context.client, "codex_goal_status", { workspaceId, goalId });
-  assert.equal(structured(status).goalId, goalId);
-  assert.equal(structured(status).running, true);
+  const status = await waitForGoalActive(context.client, workspaceId, goalId);
+  assert.equal(status.goalId, goalId);
+  assert.equal(status.running, true);
 
   const continued = await callTool(context.client, "codex_goal_continue", {
     workspaceId,
@@ -673,6 +703,8 @@ test("cancel terminates only the target session and preserves terminal state", a
   });
   const targetGoalId = structured(target).goalId as string;
   const survivorGoalId = structured(survivor).goalId as string;
+  const targetActive = await waitForGoalActive(context.client, workspaceA, targetGoalId);
+  assert.equal(targetActive.goalActiveObserved, true);
 
   const cancelled = await callTool(context.client, "codex_goal_cancel", {
     workspaceId: workspaceA,
@@ -724,7 +756,8 @@ test("sanitized child environment hides DevSpace secrets from the Codex process"
     expectedHead: await headSha(context.projectA),
   });
   assert.equal(started.isError, undefined, textOf(started));
-  const output = collectOutput([structured(started)]);
+  const activeState = await waitForGoalActive(context.client, workspaceId, structured(started).goalId as string);
+  const output = collectOutput([structured(started), activeState]);
   assert.match(output, /HASPATH:1/, "PATH must survive sanitization for normal CLI operation");
   assert.doesNotMatch(output, /SENTINEL_LEAK/);
   assert.doesNotMatch(output, new RegExp(OWNER_TOKEN));
@@ -794,6 +827,7 @@ test("argv spawning with sanitized environment strips non-allowlisted variables"
 // ── RED oracles: destructive-delta Goal readiness (tests-only, current13a) ──
 
 interface ScriptedSnapshotInput {
+  sessionId?: number;
   output?: string;
   outputTruncated?: boolean;
   running?: boolean;
@@ -801,7 +835,7 @@ interface ScriptedSnapshotInput {
 
 function snapshotFor(input: ScriptedSnapshotInput): ProcessSnapshot {
   return {
-    sessionId: 1,
+    sessionId: input.sessionId ?? 1,
     output: input.output ?? "",
     outputTruncated: input.outputTruncated ?? false,
     running: input.running ?? true,
@@ -816,6 +850,7 @@ function snapshotFor(input: ScriptedSnapshotInput): ProcessSnapshot {
  * the real CLI's "start the session first" rejection.
  */
 class ScriptedDeltaBackend implements GoalProcessBackend {
+  startCount = 0;
   readonly writes: string[] = [];
   nonEmptySnapshotsConsumed = 0;
   terminated = false;
@@ -836,6 +871,7 @@ class ScriptedDeltaBackend implements GoalProcessBackend {
   }
 
   async start(input: { cwd: string }): Promise<ProcessSnapshot> {
+    this.startCount += 1;
     this.expectedReadyText = normalizeTerminalText(
       this.expectedReadyTextTemplate.replaceAll("<CWD>", input.cwd),
     );
@@ -882,6 +918,186 @@ class ScriptedDeltaBackend implements GoalProcessBackend {
   }
 }
 
+test("concurrent starts claim a workspace before spawning", async () => {
+  const workspace = realpathSync(tmpdir());
+  const backend = new ScriptedDeltaBackend([{ output: "" }]);
+  const manager = scriptedGoalManager(backend);
+  const input = { workspaceId: "ws_atomic", workspaceRoot: workspace, goal: "one" };
+  const results = await Promise.allSettled([manager.startPrompt(input), manager.startPrompt({ ...input, goal: "two" })]);
+  assert.equal(backend.startCount, 1);
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+  manager.shutdown();
+});
+
+test("cancel during background readiness preempts /goal input", async () => {
+  const workspace = realpathSync(tmpdir());
+  const backend = new ScriptedDeltaBackend([{ output: "model: loading\ndirectory: loading\n" }]);
+  const manager = scriptedGoalManager(backend, { timeoutMs: 200 });
+  const initial = await manager.startPrompt({ workspaceId: "ws_cancel_race", workspaceRoot: workspace, goal: "never type" });
+  const cancelled = await manager.cancel("ws_cancel_race", initial.goalId);
+  assert.equal(cancelled.terminal, true);
+  assert.equal(cancelled.terminalReason, "cancelled");
+  assert.equal(backend.writes.join(""), "");
+  manager.shutdown();
+});
+
+test("terminal cancellation releases the workspace start claim for a later goal", async () => {
+  const workspace = realpathSync(tmpdir());
+  const backend = new ScriptedDeltaBackend([{ output: "model: loading\ndirectory: loading\n" }]);
+  const manager = scriptedGoalManager(backend, { timeoutMs: 200 });
+  const first = await manager.startPrompt({ workspaceId: "ws_claim_release", workspaceRoot: workspace, goal: "first" });
+  const cancelled = await manager.cancel("ws_claim_release", first.goalId);
+  assert.equal(cancelled.terminalReason, "cancelled");
+  const second = await manager.startPrompt({ workspaceId: "ws_claim_release", workspaceRoot: workspace, goal: "second" });
+  assert.notEqual(second.goalId, first.goalId);
+  assert.equal(backend.startCount, 2);
+  manager.shutdown();
+});
+
+test("pending status observes without exposing actor fields or issuing a competing write", async () => {
+  const workspace = realpathSync(tmpdir());
+  const backend = new ScriptedDeltaBackend([{ output: "model: loading\ndirectory: loading\n" }]);
+  const manager = scriptedGoalManager(backend, { timeoutMs: 400 });
+  const initial = await manager.startPrompt({ workspaceId: "ws_status_observer", workspaceRoot: workspace, goal: "wait" });
+  const writesBefore = backend.writes.length;
+  const startedAt = Date.now();
+  const state = await manager.status("ws_status_observer", initial.goalId, { waitMs: 20 });
+  assert.ok(Date.now() - startedAt < 200);
+  assert.equal(state.goalId, initial.goalId);
+  assert.equal(backend.writes.length, writesBefore);
+  assert.equal("activationPromise" in state, false);
+  assert.equal("activationPending" in state, false);
+  assert.equal("cancelRequested" in state, false);
+  manager.shutdown();
+});
+
+test("shutdown during gated process start terminates the late process and rejects without registration", async () => {
+  const workspace = realpathSync(tmpdir());
+  let release!: () => void;
+  let entered!: () => void;
+  const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  let terminated = 0;
+  const backend: GoalProcessBackend = {
+    async start() { entered(); await gate; return snapshotFor({ running: true, sessionId: 77 }); },
+    async write() { return snapshotFor({}); },
+    terminate() { terminated += 1; },
+  };
+  const manager = new CodexGoalSessionManager(backend, { resolveBinary: async () => "/bin/echo" });
+  const starting = manager.startPrompt({ workspaceId: "ws_late_start", workspaceRoot: workspace, goal: "late" });
+  await enteredPromise;
+  manager.shutdown();
+  release();
+  await assert.rejects(starting, /shutdown|closed|lifecycle/i);
+  assert.equal(terminated, 1);
+  assert.deepEqual(manager.listActiveGoalIds(), []);
+});
+
+test("shutdown during registered terminal handshake rejects and removes the late handle", async () => {
+  const workspace = realpathSync(tmpdir());
+  let release!: () => void;
+  let entered!: () => void;
+  const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const writes: string[] = [];
+  let terminated = 0;
+  const backend: GoalProcessBackend = {
+    async start() { return snapshotFor({ sessionId: 78, output: "\u001b[6n" }); },
+    async write(input) {
+      if (input.chars) {
+        writes.push(input.chars);
+        entered();
+        await gate;
+      }
+      return snapshotFor({});
+    },
+    terminate() { terminated += 1; },
+  };
+  const manager = new CodexGoalSessionManager(backend, { resolveBinary: async () => "/bin/echo" });
+  const starting = manager.startPrompt({ workspaceId: "ws_late_handshake", workspaceRoot: workspace, goal: "late" });
+  await enteredPromise;
+  manager.shutdown();
+  release();
+  await assert.rejects(starting, /shutdown|closed|lifecycle/i);
+  assert.ok(terminated >= 1);
+  assert.deepEqual(manager.listActiveGoalIds(), []);
+  assert.deepEqual(writes, ["\u001b[1;1R"]);
+});
+
+test("shutdown during gated multi-chunk typing prevents later chunks and carriage return", async () => {
+  const workspace = realpathSync(tmpdir());
+  const writes: string[] = [];
+  let release!: () => void;
+  let entered!: () => void;
+  const enteredPromise = new Promise<void>((resolve) => { entered = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  const ready = `model: gpt-5.6-sol minimal\ndirectory: ${workspace}\nAsk Codex to do anything\n`;
+  const backend: GoalProcessBackend = {
+    async start() { return snapshotFor({ output: ready }); },
+    async write(input) {
+      if (input.chars) {
+        writes.push(input.chars);
+        if (writes.length === 1) { entered(); await gate; }
+      }
+      return snapshotFor({ output: input.chars ? "Pursuing goal\n" : "" });
+    },
+    terminate() {},
+  };
+  const manager = new CodexGoalSessionManager(backend, {
+    resolveBinary: async () => "/bin/echo", startupTimeoutMs: 500,
+    typeChunkCharacters: 4, typeChunkDelayMs: 0, cancelTimeoutMs: 50,
+  });
+  const starting = manager.start({ workspaceId: "ws_shutdown_chunks", workspaceRoot: workspace, goal: "abcdefghijk" });
+  await enteredPromise;
+  manager.shutdown();
+  release();
+  await starting;
+  assert.deepEqual(writes, ["/goa"]);
+});
+
+test("already reaped process can be cancelled repeatedly with cancelled disposition", async () => {
+  const workspace = realpathSync(tmpdir());
+  const backend: GoalProcessBackend = {
+    async start() { return snapshotFor({ sessionId: 9 }); },
+    async write() { throw new Error("Unknown process session 9"); },
+    terminate() {},
+  };
+  const manager = new CodexGoalSessionManager(backend, { resolveBinary: async () => "/bin/echo", startupTimeoutMs: 50 });
+  const initial = await manager.startPrompt({ workspaceId: "ws_reaped", workspaceRoot: workspace, goal: "reaped" });
+  const first = await manager.cancel("ws_reaped", initial.goalId);
+  const second = await manager.cancel("ws_reaped", initial.goalId);
+  assert.equal(first.terminalReason, "cancelled");
+  assert.equal(second.terminalReason, "cancelled");
+  manager.shutdown();
+});
+
+test("valid continuation is serialized as exact message followed by carriage return", async () => {
+  const workspace = realpathSync(tmpdir());
+  const ready = `model: gpt-5.6-sol minimal\ndirectory: ${workspace}\nAsk Codex to do anything\n`;
+  const backend = new ScriptedDeltaBackend([{ output: ready }, { output: "Pursuing goal\n" }], { readyText: ready });
+  const manager = scriptedGoalManager(backend);
+  const initial = await manager.start({ workspaceId: "ws_exact_continue", workspaceRoot: workspace, goal: "start" });
+  await manager.continue("ws_exact_continue", initial.goalId, "exact follow up");
+  assert.equal(backend.writes.at(-2), "exact follow up");
+  assert.equal(backend.writes.at(-1), "\r");
+  manager.shutdown();
+});
+
+test("concurrent status and continuation preserve actor write order without activation polling", async () => {
+  const workspace = realpathSync(tmpdir());
+  const ready = `model: gpt-5.6-sol minimal\ndirectory: ${workspace}\nAsk Codex to do anything\n`;
+  const backend = new ScriptedDeltaBackend([{ output: ready }, { output: "Pursuing goal\n" }], { readyText: ready });
+  const manager = scriptedGoalManager(backend);
+  const initial = await manager.start({ workspaceId: "ws_ordered_continue", workspaceRoot: workspace, goal: "start" });
+  const before = backend.writes.length;
+  await Promise.all([
+    manager.status("ws_ordered_continue", initial.goalId, { waitMs: 0 }),
+    manager.continue("ws_ordered_continue", initial.goalId, "ordered"),
+  ]);
+  assert.deepEqual(backend.writes.slice(before), ["ordered", "\r"]);
+  manager.shutdown();
+});
+
 function scriptedGoalManager(
   backend: GoalProcessBackend,
   options: { model?: string; timeoutMs?: number } = {},
@@ -896,6 +1112,62 @@ function scriptedGoalManager(
     resolveBinary: async () => "/bin/echo",
   });
 }
+
+test("prompt start returns a durable handle before background activation and preserves the same id", async () => {
+  const workspace = realpathSync(tmpdir());
+  const ready = `model: gpt-5.6-sol medium\ndirectory: ${workspace}\nAsk Codex to do anything\n`;
+  const backend = new ScriptedDeltaBackend([{ output: "model: loading\ndirectory: loading\n" }, { output: ready }, { output: ready }, { output: ready }]);
+  const manager = scriptedGoalManager(backend, { timeoutMs: 400 });
+  const initial = await manager.startPrompt({ workspaceId: "ws_prompt", workspaceRoot: workspace, goal: "background activation" });
+  assert.match(initial.goalId, /^goal_/);
+  assert.equal(initial.goalActiveObserved, false);
+  let state = await manager.status("ws_prompt", initial.goalId);
+  for (let i = 0; i < 20 && !state.goalActiveObserved; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    state = await manager.status("ws_prompt", initial.goalId);
+  }
+  assert.equal(state.goalId, initial.goalId);
+  assert.equal(state.goalActiveObserved, true);
+  assert.equal(backend.writes.filter((value) => value.includes("/goal ")).length > 0, true);
+  manager.shutdown();
+});
+
+test("prompt activation failure is terminal with sanitized error and never types /goal on trust dialog", async () => {
+  const workspace = realpathSync(tmpdir());
+  const backend = new ScriptedDeltaBackend([{ output: "Doyoutrustthecontentsofthisdirectory?\n" }]);
+  const manager = scriptedGoalManager(backend, { timeoutMs: 200 });
+  const initial = await manager.startPrompt({ workspaceId: "ws_trust_prompt", workspaceRoot: workspace, goal: "must not type" });
+  await new Promise((resolve) => setTimeout(resolve, 180));
+  const state = await manager.status("ws_trust_prompt", initial.goalId);
+  assert.equal(state.goalId, initial.goalId);
+  assert.equal(state.terminal, true);
+  assert.equal(state.terminalReason, "activation_failed");
+  assert.match(state.error ?? "", /directory-trust dialog|trust/i);
+  assert.equal(backend.writes.join(""), "");
+  assert.equal(backend.terminated, true);
+  manager.shutdown();
+});
+
+test("cancel preserves activation failure evidence for already-terminal goals", async () => {
+  const workspace = realpathSync(tmpdir());
+  const backend = new ScriptedDeltaBackend([{ output: "Do you trust the contents of this directory?\n" }]);
+  const manager = scriptedGoalManager(backend, { timeoutMs: 100 });
+  const initial = await manager.startPrompt({ workspaceId: "ws_cancel_failed", workspaceRoot: workspace, goal: "blocked" });
+  let failed = await manager.status("ws_cancel_failed", initial.goalId, { waitMs: 200 });
+  for (let i = 0; i < 10 && !failed.terminal; i += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    failed = await manager.status("ws_cancel_failed", initial.goalId);
+  }
+  assert.equal(failed.terminalReason, "activation_failed");
+  assert.ok(failed.error);
+  const cancelled = await manager.cancel("ws_cancel_failed", initial.goalId);
+  const repeated = await manager.cancel("ws_cancel_failed", initial.goalId);
+  assert.equal(cancelled.terminalReason, "activation_failed");
+  assert.equal(cancelled.error, failed.error);
+  assert.equal(repeated.terminalReason, "activation_failed");
+  assert.equal(repeated.error, failed.error);
+  manager.shutdown();
+});
 
 test("start waits for resolved model and directory before typing /goal", async () => {
   const workspace = realpathSync(tmpdir());
