@@ -10,7 +10,7 @@ export interface LoggingConfig {
   assets: boolean;
   toolCalls: boolean;
   shellCommands: boolean;
-  trustProxy: boolean;
+  trustProxy: boolean | number;
 }
 
 type LogFields = Record<string, unknown>;
@@ -52,8 +52,8 @@ export function logEvent(
   }
 }
 
-export function requestIp(req: Request, trustProxy: boolean): string | undefined {
-  if (trustProxy) {
+export function requestIp(req: Request, trustProxy: boolean | number): string | undefined {
+  if (trustProxy === true) {
     const cfConnectingIp = firstHeaderValue(req.header("cf-connecting-ip"));
     if (cfConnectingIp) return cfConnectingIp;
 

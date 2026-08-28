@@ -92,6 +92,25 @@ function parseBoolean(value: string | undefined): boolean {
   return ["1", "true", "yes", "on"].includes(value?.toLowerCase() ?? "");
 }
 
+function parseTrustProxy(env: NodeJS.ProcessEnv): boolean | number {
+  if (env.DEVSPACE_TRUST_PROXY_HOPS !== undefined) {
+    if (env.DEVSPACE_TRUST_PROXY_HOPS.trim() === "") {
+      throw new Error("Invalid DEVSPACE_TRUST_PROXY_HOPS: empty value");
+    }
+    return parsePositiveInteger(env.DEVSPACE_TRUST_PROXY_HOPS, 1, "DEVSPACE_TRUST_PROXY_HOPS", 32);
+  }
+
+  const value = env.DEVSPACE_TRUST_PROXY?.trim().toLowerCase();
+  if (!value || ["0", "false", "no", "off"].includes(value)) return false;
+  if (value === "1") {
+    throw new Error(
+      "DEVSPACE_TRUST_PROXY=1 is not supported; use DEVSPACE_TRUST_PROXY_HOPS=1 for a bounded trusted hop count.",
+    );
+  }
+  if (["true", "yes", "on"].includes(value)) return true;
+  throw new Error(`Invalid DEVSPACE_TRUST_PROXY: ${env.DEVSPACE_TRUST_PROXY}`);
+}
+
 function parseToolMode(env: NodeJS.ProcessEnv): ToolMode {
   const mode = env.DEVSPACE_TOOL_MODE;
   if (mode === "minimal" || mode === "full" || mode === "codex") return mode;
@@ -159,7 +178,7 @@ function parseLoggingConfig(env: NodeJS.ProcessEnv): LoggingConfig {
     assets: parseBoolean(env.DEVSPACE_LOG_ASSETS),
     toolCalls: env.DEVSPACE_LOG_TOOL_CALLS === undefined ? true : parseBoolean(env.DEVSPACE_LOG_TOOL_CALLS),
     shellCommands: parseBoolean(env.DEVSPACE_LOG_SHELL_COMMANDS),
-    trustProxy: parseBoolean(env.DEVSPACE_TRUST_PROXY),
+    trustProxy: parseTrustProxy(env),
   };
 }
 

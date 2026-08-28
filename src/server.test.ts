@@ -15,7 +15,7 @@ import type { SubagentsConfig } from "./local-agent-config.js";
 import { MINIMUM_CODEX_RUNTIME_VERSION } from "./codex-runtime.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
-import { createMcpServer } from "./server.js";
+import { createMcpServer, createServer } from "./server.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 
@@ -42,6 +42,25 @@ after(async () => {
   if (originalDependencyRoot === undefined) delete process.env.DEVSPACE_DEPENDENCY_ROOT;
   else process.env.DEVSPACE_DEPENDENCY_ROOT = originalDependencyRoot;
   await rm(codexRuntimeRoot, { recursive: true, force: true });
+});
+
+test("configures Express with an exact trusted proxy hop count", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-trust-proxy-test-"));
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_STATE_DIR: join(root, ".state"),
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    DEVSPACE_TRUST_PROXY_HOPS: "1",
+    PORT: "1",
+  });
+
+  const running = createServer(config);
+  try {
+    assert.equal(running.app.get("trust proxy"), 1);
+  } finally {
+    await running.close();
+  }
 });
 
 test("open_workspace keeps lifecycle flags out of model output and preserves complete card metadata", async (t) => {

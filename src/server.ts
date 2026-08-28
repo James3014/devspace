@@ -3029,8 +3029,8 @@ export function createServer(
   }, MCP_SESSION_CLEANUP_INTERVAL_MS);
   sessionCleanupTimer.unref();
 
-  if (config.logging.trustProxy) {
-    app.set("trust proxy", true);
+  if (config.logging.trustProxy !== false) {
+    app.set("trust proxy", config.logging.trustProxy);
   }
 
   app.use((req, res, next) => {
