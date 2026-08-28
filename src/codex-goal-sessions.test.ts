@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
@@ -1912,21 +1912,148 @@ test("RED: empty polls do not replay history and one real duplicate is consumed 
   }
 });
 
-test("Codex Goal accepts ellipsis-truncated directory paths from narrow TUI boxes", async () => {
-  const workspace = realpathSync(tmpdir());
-  const truncatedDir = `${workspace.slice(0, Math.max(5, workspace.length - 8))}…`;
-  const ready = `model: gpt-5.6-sol medium\ndirectory: ${truncatedDir}\nAsk Codex to do anything\n`;
-  const backend = new ScriptedDeltaBackend([{ output: ready }, { output: "" }, { output: "" }, { output: "" }]);
-  const manager = scriptedGoalManager(backend);
+test("Codex Goal accepts exact captured middle-ellipsis directory paths from narrow TUI boxes", async () => {
+  const tmpRoot = realpathSync(tmpdir());
+  const deepDir = join(tmpRoot, "devspace-nested-worktrees", "canary-goal-12345");
+  mkdirSync(deepDir, { recursive: true });
   try {
+    const truncatedDir = `${tmpRoot}/…/canary-goal-12345`;
+    const ready = `model: gpt-5.6-sol medium\ndirectory: ${truncatedDir}\nAsk Codex to do anything\n`;
+    const backend = new ScriptedDeltaBackend(
+      [{ output: ready }, { output: "" }, { output: "" }, { output: "" }],
+      { readyText: ready },
+    );
+    const manager = scriptedGoalManager(backend);
     const started = await manager.start({
-      workspaceId: "ws_ellipsis_dir",
-      workspaceRoot: workspace,
-      goal: "verify ellipsis directory",
+      workspaceId: "ws_ellipsis_valid",
+      workspaceRoot: deepDir,
+      goal: "verify valid middle ellipsis",
     });
-    assert.equal(backend.writes.join(""), "/goal verify ellipsis directory\r");
+    assert.equal(backend.writes.join(""), "/goal verify valid middle ellipsis\r");
     assert.equal(started.goalActiveObserved, true);
-  } finally {
     manager.shutdown();
+  } finally {
+    try { rmSync(join(tmpRoot, "devspace-nested-worktrees"), { recursive: true, force: true }); } catch {}
   }
+});
+
+test("RED/NEGATIVE: ChatGPT counterexample trailing ellipsis /Workspace/… must fail closed", async () => {
+  const tmpRoot = realpathSync(tmpdir());
+  const workspace = join(tmpRoot, "devspace-candidate-codex-goal-20260828");
+  mkdirSync(workspace, { recursive: true });
+  try {
+    const ambiguousDir = `${tmpRoot}/…`;
+    const ready = `model: gpt-5.6-sol medium\ndirectory: ${ambiguousDir}\nAsk Codex to do anything\n`;
+    const backend = new ScriptedDeltaBackend([{ output: ready }, { output: "" }, { output: "" }, { output: "" }]);
+    const manager = scriptedGoalManager(backend, { timeoutMs: 80 });
+    await assert.rejects(
+      manager.start({
+        workspaceId: "ws_trailing_ellipsis_counterexample",
+        workspaceRoot: workspace,
+        goal: "must stay blocked",
+      }),
+      /Codex Goal activation failed|did not resolve model and directory|produced no output/,
+    );
+    assert.equal(backend.writes.join(""), "", "trailing ellipsis must never emit /goal bytes");
+    assert.equal(backend.terminated, true);
+    manager.shutdown();
+  } finally {
+    try { rmSync(workspace, { recursive: true, force: true }); } catch {}
+  }
+});
+
+test("RED/NEGATIVE: bare ellipsis … must fail closed", async () => {
+  const workspace = realpathSync(tmpdir());
+  const ready = "model: gpt-5.6-sol medium\ndirectory: …\nAsk Codex to do anything\n";
+  const backend = new ScriptedDeltaBackend([{ output: ready }, { output: "" }, { output: "" }, { output: "" }]);
+  const manager = scriptedGoalManager(backend, { timeoutMs: 80 });
+  await assert.rejects(
+    manager.start({
+      workspaceId: "ws_bare_ellipsis",
+      workspaceRoot: workspace,
+      goal: "must stay blocked",
+    }),
+    /Codex Goal activation failed|did not resolve model and directory|produced no output/,
+  );
+  assert.equal(backend.writes.join(""), "", "bare ellipsis must never emit /goal bytes");
+  assert.equal(backend.terminated, true);
+  manager.shutdown();
+});
+
+test("RED/NEGATIVE: leading ellipsis …/suffix must fail closed", async () => {
+  const workspace = realpathSync(tmpdir());
+  const ready = "model: gpt-5.6-sol medium\ndirectory: …/my-workspace\nAsk Codex to do anything\n";
+  const backend = new ScriptedDeltaBackend([{ output: ready }, { output: "" }, { output: "" }, { output: "" }]);
+  const manager = scriptedGoalManager(backend, { timeoutMs: 80 });
+  await assert.rejects(
+    manager.start({
+      workspaceId: "ws_leading_ellipsis",
+      workspaceRoot: workspace,
+      goal: "must stay blocked",
+    }),
+    /Codex Goal activation failed|did not resolve model and directory|produced no output/,
+  );
+  assert.equal(backend.writes.join(""), "", "leading ellipsis must never emit /goal bytes");
+  assert.equal(backend.terminated, true);
+  manager.shutdown();
+});
+
+test("RED/NEGATIVE: wrong prefix with correct suffix must fail closed", async () => {
+  const tmpRoot = realpathSync(tmpdir());
+  const workspace = join(tmpRoot, "real-parent", "target-project");
+  const wrongObserved = "/var/wrong-prefix/…/target-project";
+  const ready = `model: gpt-5.6-sol medium\ndirectory: ${wrongObserved}\nAsk Codex to do anything\n`;
+  const backend = new ScriptedDeltaBackend([{ output: ready }, { output: "" }, { output: "" }, { output: "" }]);
+  const manager = scriptedGoalManager(backend, { timeoutMs: 80 });
+  await assert.rejects(
+    manager.start({
+      workspaceId: "ws_wrong_prefix_ellipsis",
+      workspaceRoot: workspace,
+      goal: "must stay blocked",
+    }),
+    /Codex Goal activation failed|did not resolve model and directory|produced no output/,
+  );
+  assert.equal(backend.writes.join(""), "", "wrong prefix must never emit /goal bytes");
+  assert.equal(backend.terminated, true);
+  manager.shutdown();
+});
+
+test("RED/NEGATIVE: correct prefix with wrong suffix must fail closed", async () => {
+  const tmpRoot = realpathSync(tmpdir());
+  const workspace = join(tmpRoot, "my-org", "project-alpha");
+  const wrongObserved = `${tmpRoot}/…/project-beta`;
+  const ready = `model: gpt-5.6-sol medium\ndirectory: ${wrongObserved}\nAsk Codex to do anything\n`;
+  const backend = new ScriptedDeltaBackend([{ output: ready }, { output: "" }, { output: "" }, { output: "" }]);
+  const manager = scriptedGoalManager(backend, { timeoutMs: 80 });
+  await assert.rejects(
+    manager.start({
+      workspaceId: "ws_wrong_suffix_ellipsis",
+      workspaceRoot: workspace,
+      goal: "must stay blocked",
+    }),
+    /Codex Goal activation failed|did not resolve model and directory|produced no output/,
+  );
+  assert.equal(backend.writes.join(""), "", "wrong suffix must never emit /goal bytes");
+  assert.equal(backend.terminated, true);
+  manager.shutdown();
+});
+
+test("RED/NEGATIVE: multiple ellipses must fail closed", async () => {
+  const tmpRoot = realpathSync(tmpdir());
+  const workspace = join(tmpRoot, "a", "b", "c", "d");
+  const multipleEllipses = `${tmpRoot}/…/b/…/d`;
+  const ready = `model: gpt-5.6-sol medium\ndirectory: ${multipleEllipses}\nAsk Codex to do anything\n`;
+  const backend = new ScriptedDeltaBackend([{ output: ready }, { output: "" }, { output: "" }, { output: "" }]);
+  const manager = scriptedGoalManager(backend, { timeoutMs: 80 });
+  await assert.rejects(
+    manager.start({
+      workspaceId: "ws_multiple_ellipses",
+      workspaceRoot: workspace,
+      goal: "must stay blocked",
+    }),
+    /Codex Goal activation failed|did not resolve model and directory|produced no output/,
+  );
+  assert.equal(backend.writes.join(""), "", "multiple ellipses must never emit /goal bytes");
+  assert.equal(backend.terminated, true);
+  manager.shutdown();
 });

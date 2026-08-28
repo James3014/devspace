@@ -264,34 +264,52 @@ function realpathEqual(left: string, right: string): boolean {
         : value;
   const leftExpanded = expandHome(left);
   const rightExpanded = expandHome(right);
+
+  // 1. Exact match via realpathSync / normalized string comparison
   try {
     if (realpathSync(leftExpanded) === realpathSync(rightExpanded)) {
       return true;
     }
   } catch {
-    // fallback to string compare or prefix/suffix ellipsis check below
+    // Left or right might not be a direct realpath if left is truncated
   }
   if (leftExpanded === rightExpanded) return true;
-  if (left.includes("…") || left.includes("...")) {
-    const delimiter = left.includes("…") ? "…" : "...";
-    const parts = leftExpanded.split(delimiter);
-    if (parts.length === 2) {
-      const [head, tail] = parts;
-      const target = rightExpanded;
-      const headMatch = !head || target.startsWith(head);
-      const tailMatch = !tail || target.endsWith(tail);
-      if (headMatch && tailMatch) return true;
-      try {
-        const targetReal = realpathSync(target);
-        const realHeadMatch = !head || targetReal.startsWith(realpathSync(head));
-        const realTailMatch = !tail || targetReal.endsWith(tail);
-        if (realHeadMatch && realTailMatch) return true;
-      } catch {
-        // best effort
-      }
+
+  // 2. Strict middle-ellipsis validation (fail closed)
+  // Real Codex TUI uses Unicode ellipsis "…" for long directory paths in boxes (e.g. ~/…/.worktrees/foo)
+  // It MUST be exactly one "…", situated between path component separators (HEAD/…/TAIL)
+  if (!left.includes("…")) return false;
+
+  const parts = left.split("…");
+  if (parts.length !== 2) return false; // exactly one ellipsis
+
+  const [rawHead, rawTail] = parts;
+  // Both head and tail must be non-empty and bounded by path separators
+  if (!rawHead || !rawTail) return false;
+  if (!rawHead.endsWith("/") || !rawTail.startsWith("/")) return false;
+
+  const headExpanded = expandHome(rawHead);
+  const target = rightExpanded;
+
+  // Verify target starts with head component and ends with tail component
+  if (!target.startsWith(headExpanded)) return false;
+  if (!target.endsWith(rawTail)) return false;
+
+  // Verify no overlap: target length must strictly exceed head + tail length
+  if (target.length <= headExpanded.length + rawTail.length - 1) return false;
+
+  // Realpath component check if resolvable
+  try {
+    const targetReal = realpathSync(target);
+    const headReal = realpathSync(headExpanded.slice(0, -1));
+    if (!targetReal.startsWith(headReal + "/") && targetReal !== headReal) {
+      return false;
     }
+  } catch {
+    // if unresolved, target.startsWith(headExpanded) already passed
   }
-  return false;
+
+  return true;
 }
 
 function modelMatches(observed: string, requested: string): boolean {
