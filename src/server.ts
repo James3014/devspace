@@ -759,6 +759,7 @@ function codexGoalStateStructured(state: CodexGoalState): Record<string, unknown
     reasoningEffort: state.reasoningEffort,
     baseHead: state.baseHead,
     terminalReason: state.terminalReason,
+    error: state.error,
   };
 }
 
@@ -771,6 +772,7 @@ function codexGoalResultText(action: string, state: CodexGoalState): string {
   const output = state.outputChunk.trim();
   return [
     `Codex goal ${state.goalId} ${action}: ${status}.`,
+    state.error ? `Error: ${state.error}` : undefined,
     output ? `Output:\n${output}` : undefined,
   ].filter(Boolean).join("\n");
 }
@@ -794,7 +796,7 @@ function registerCodexGoalTools(
     {
       title: "Start Codex goal",
       description:
-        "Launch a real interactive Codex CLI session in an open workspace and activate its /goal mode with the given goal text. Runs the actual Codex CLI binary in a PTY inside the exact opened workspace; never uses bash or the Codex SDK. Git workspaces must be clean and must provide expectedHead matching the current Git HEAD. Only one active Codex goal is allowed per workspace.",
+        "Launch a real interactive Codex CLI session in an open workspace and activate its /goal mode with the given goal text. Returns a durable goalId promptly; poll codex_goal_status until goalActiveObserved is true or terminal is true. Runs the actual Codex CLI binary in a PTY inside the exact opened workspace; never uses bash or the Codex SDK. Git workspaces must be clean and must provide expectedHead matching the current Git HEAD. Only one active Codex goal is allowed per workspace.",
       inputSchema: {
         workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
         goal: z
@@ -828,6 +830,7 @@ function registerCodexGoalTools(
         reasoningEffort: z.string().optional(),
         baseHead: z.string().optional(),
         terminalReason: z.string().optional(),
+        error: z.string().optional(),
       },
       _meta: {},
       annotations: GOAL_START_ANNOTATIONS,
@@ -837,7 +840,7 @@ function registerCodexGoalTools(
       const workspace = workspaces.getWorkspace(workspaceId);
       let state: CodexGoalState;
       try {
-        state = await goals.start({
+        state = await goals.startPrompt({
           workspaceId,
           workspaceRoot: workspace.root,
           goal,
@@ -892,6 +895,7 @@ function registerCodexGoalTools(
         reasoningEffort: z.string().optional(),
         baseHead: z.string().optional(),
         terminalReason: z.string().optional(),
+        error: z.string().optional(),
       },
       _meta: {},
       annotations: { readOnlyHint: true },
@@ -933,6 +937,7 @@ function registerCodexGoalTools(
         reasoningEffort: z.string().optional(),
         baseHead: z.string().optional(),
         terminalReason: z.string().optional(),
+        error: z.string().optional(),
       },
       _meta: {},
       annotations: {
@@ -984,6 +989,7 @@ function registerCodexGoalTools(
         reasoningEffort: z.string().optional(),
         baseHead: z.string().optional(),
         terminalReason: z.string().optional(),
+        error: z.string().optional(),
       },
       _meta: {},
       annotations: {

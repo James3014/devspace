@@ -344,6 +344,7 @@ export class LocalAgentSessionManager {
   private readonly launcher: WorkerLauncher;
   private readonly terminator: WorkerTerminator;
   private readonly turnRunner?: AgentTurnRunner;
+  private closed = false;
 
   constructor(
     private readonly config: ServerConfig,
@@ -355,6 +356,13 @@ export class LocalAgentSessionManager {
     this.launcher = testLauncher ?? defaultWorkerLauncher;
     this.terminator = testTerminator ?? terminateOwnedWorker;
     this.turnRunner = testTurnRunner;
+  }
+
+  /** Close the manager's durable store. Safe to call from multiple cleanup paths. */
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.store.close();
   }
 
   /**
@@ -1096,9 +1104,9 @@ export class LocalAgentSessionManager {
       return;
     }
 
-    const prompt = await readFile(promptFile, "utf8");
     let scratch: ScratchHandle | undefined;
     try {
+      const prompt = await readFile(promptFile, "utf8");
       // Containment gate (fail closed): the workspace root must resolve to its
       // canonical physical path and stay inside a configured allowed root.
       // Git linked worktrees remain legitimate: canonicalization resolves their
