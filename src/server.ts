@@ -799,6 +799,7 @@ function codexGoalStateStructured(state: CodexGoalState): Record<string, unknown
     reasoningEffort: state.reasoningEffort,
     baseHead: state.baseHead,
     terminalReason: state.terminalReason,
+    error: state.error,
   };
 }
 
