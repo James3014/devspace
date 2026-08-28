@@ -96,7 +96,6 @@ assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_REQUESTS: "0" }).logging.requ
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_ASSETS: "1" }).logging.assets, true);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_TOOL_CALLS: "0" }).logging.toolCalls, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_LOG_SHELL_COMMANDS: "1" }).logging.shellCommands, true);
-assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY: "true" }).logging.trustProxy, true);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY: "0" }).logging.trustProxy, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY_HOPS: "1" }).logging.trustProxy, 1);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY_HOPS: "2" }).logging.trustProxy, 2);
@@ -104,6 +103,12 @@ assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY: "1" }),
   /DEVSPACE_TRUST_PROXY_HOPS/,
 );
+for (const value of ["true", "yes", "on"]) {
+  assert.throws(
+    () => loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY: value }),
+    /DEVSPACE_TRUST_PROXY_HOPS/,
+  );
+}
 assert.throws(
   () => loadConfig({ ...baseEnv, DEVSPACE_TRUST_PROXY_HOPS: "0" }),
   /Invalid DEVSPACE_TRUST_PROXY_HOPS/,

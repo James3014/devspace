@@ -107,7 +107,11 @@ function parseTrustProxy(env: NodeJS.ProcessEnv): boolean | number {
       "DEVSPACE_TRUST_PROXY=1 is not supported; use DEVSPACE_TRUST_PROXY_HOPS=1 for a bounded trusted hop count.",
     );
   }
-  if (["true", "yes", "on"].includes(value)) return true;
+  if (["true", "yes", "on"].includes(value)) {
+    throw new Error(
+      `DEVSPACE_TRUST_PROXY=${value} is not supported; use DEVSPACE_TRUST_PROXY_HOPS for a bounded trusted hop count.`,
+    );
+  }
   throw new Error(`Invalid DEVSPACE_TRUST_PROXY: ${env.DEVSPACE_TRUST_PROXY}`);
 }
 
