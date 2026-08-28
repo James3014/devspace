@@ -1,9 +1,13 @@
 import assert from "node:assert/strict";
 import {
+  DEFAULT_OPENCODE_STARTUP_TIMEOUT_MS,
+  MAX_OPENCODE_STARTUP_TIMEOUT_MS,
+  defaultOpencodeFactory,
   opencodeAgentConfig,
   OpencodeLocalAgentDriver,
   opencodeAgentFor,
   opencodePermissionFor,
+  resolveOpencodeStartupTimeoutMs,
   type OpencodeClientLike,
   type OpencodeFactory,
 } from "./local-agent-opencode.js";
@@ -359,3 +363,34 @@ await recoveringPool.close();
 await pool.close();
 await pool.close();
 assert.equal(closeCalls, 1, "shared OpenCode server closes once");
+
+// OpenCode SDK startup readiness timeout must be explicit and bounded.
+assert.equal(DEFAULT_OPENCODE_STARTUP_TIMEOUT_MS, 30_000);
+assert.equal(MAX_OPENCODE_STARTUP_TIMEOUT_MS, 120_000);
+assert.equal(resolveOpencodeStartupTimeoutMs({}), 30_000);
+for (const raw of ["", "   ", "invalid", "NaN", "Infinity", "0", "-1", "15.5"]) {
+  assert.equal(resolveOpencodeStartupTimeoutMs({ DEVSPACE_OPENCODE_STARTUP_TIMEOUT_MS: raw }), 30_000, raw);
+}
+assert.equal(resolveOpencodeStartupTimeoutMs({ DEVSPACE_OPENCODE_STARTUP_TIMEOUT_MS: "45000" }), 45_000);
+assert.equal(resolveOpencodeStartupTimeoutMs({ DEVSPACE_OPENCODE_STARTUP_TIMEOUT_MS: "120000" }), 120_000);
+assert.equal(resolveOpencodeStartupTimeoutMs({ DEVSPACE_OPENCODE_STARTUP_TIMEOUT_MS: "120001" }), 120_000);
+assert.equal(resolveOpencodeStartupTimeoutMs({ DEVSPACE_OPENCODE_TIMEOUT_MS: "10000" }), 30_000);
+
+let capturedTimeout: number | undefined;
+const mockSdkLoader = async () => ({
+  createOpencode: async (options?: { timeout?: number; config?: unknown }) => {
+    capturedTimeout = options?.timeout;
+    assert.deepEqual(options?.config, {
+      agent: {
+        devspace_read_only: opencodeAgentConfig("read_only"),
+        devspace_allowed: opencodeAgentConfig("allowed"),
+        devspace_full_access: opencodeAgentConfig("full_access"),
+      },
+    });
+    return { client, server: { close: () => undefined } };
+  },
+});
+await defaultOpencodeFactory({}, undefined, mockSdkLoader as any);
+assert.equal(capturedTimeout, 30_000);
+await defaultOpencodeFactory({ DEVSPACE_OPENCODE_STARTUP_TIMEOUT_MS: "55000" }, undefined, mockSdkLoader as any);
+assert.equal(capturedTimeout, 55_000);

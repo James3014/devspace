@@ -3,6 +3,7 @@ import type {
   OpencodeClient,
   PromptInput,
   PermissionConfig,
+  ServerOptions,
   SessionMessagesResponse,
   SessionV2Info,
 } from "@opencode-ai/sdk/v2";
@@ -124,7 +125,14 @@ export class OpencodeLocalAgentDriver implements LocalAgentDriver {
   readonly provider = "opencode" as const;
   readonly idleTimeoutMs = 5 * 60_000;
 
-  constructor(private readonly factory: OpencodeFactory = defaultOpencodeFactory) {}
+  constructor(
+    factory?: OpencodeFactory,
+    private readonly env: NodeJS.ProcessEnv = process.env,
+  ) {
+    this.factory = factory ?? ((context) => defaultOpencodeFactory(this.env, context));
+  }
+
+  private readonly factory: OpencodeFactory;
 
   runtimeKey(_context: LocalAgentRuntimeContext): string {
     return "opencode:default";
@@ -143,15 +151,42 @@ export class OpencodeLocalAgentDriver implements LocalAgentDriver {
   }
 }
 
-async function defaultOpencodeFactory(): Promise<{ client: OpencodeClientLike; server: OpencodeServerLike }> {
-  const { createOpencode } = await import("@opencode-ai/sdk/v2");
-  return createOpencode({ config: {
-    agent: {
-      devspace_read_only: opencodeAgentConfig("read_only"),
-      devspace_allowed: opencodeAgentConfig("allowed"),
-      devspace_full_access: opencodeAgentConfig("full_access"),
+export const DEFAULT_OPENCODE_STARTUP_TIMEOUT_MS = 30_000;
+export const MAX_OPENCODE_STARTUP_TIMEOUT_MS = 120_000;
+
+export function resolveOpencodeStartupTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = env.DEVSPACE_OPENCODE_STARTUP_TIMEOUT_MS;
+  if (raw === undefined || raw.trim() === "") return DEFAULT_OPENCODE_STARTUP_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || !Number.isInteger(parsed) || parsed <= 0) {
+    return DEFAULT_OPENCODE_STARTUP_TIMEOUT_MS;
+  }
+  return Math.min(parsed, MAX_OPENCODE_STARTUP_TIMEOUT_MS);
+}
+
+export type OpencodeSdkModuleLike = {
+  createOpencode: (options?: ServerOptions) => Promise<{
+    client: OpencodeClientLike;
+    server: OpencodeServerLike;
+  }>;
+};
+
+export async function defaultOpencodeFactory(
+  env: NodeJS.ProcessEnv = process.env,
+  _context?: LocalAgentRuntimeContext,
+  loadSdk: () => Promise<OpencodeSdkModuleLike> = () => import("@opencode-ai/sdk/v2"),
+): Promise<{ client: OpencodeClientLike; server: OpencodeServerLike }> {
+  const { createOpencode } = await loadSdk();
+  return createOpencode({
+    timeout: resolveOpencodeStartupTimeoutMs(env),
+    config: {
+      agent: {
+        devspace_read_only: opencodeAgentConfig("read_only"),
+        devspace_allowed: opencodeAgentConfig("allowed"),
+        devspace_full_access: opencodeAgentConfig("full_access"),
+      },
     },
-  } });
+  });
 }
 
 export function opencodeAgentConfig(writeMode: LocalAgentRunInput["writeMode"]): {

@@ -83,7 +83,7 @@ export function createLocalAgentAdapter(
         new ClaudeLocalAgentDriver(options.claudeQueryFactory, options.env),
       );
     case "opencode":
-      return new DriverBackedLocalAgentAdapter(new OpencodeLocalAgentDriver(options.opencodeFactory));
+      return new DriverBackedLocalAgentAdapter(new OpencodeLocalAgentDriver(options.opencodeFactory, options.env));
     case "pi":
       return new DriverBackedLocalAgentAdapter(new PiLocalAgentDriver(options.piSessionFactory));
     case "cursor":
@@ -585,7 +585,7 @@ export function createLocalAgentDrivers(
   return [
     new CodexDriverForDaemonStack(options.env),
     new ClaudeLocalAgentDriver(options.claudeQueryFactory, options.env),
-    new OpencodeLocalAgentDriver(options.opencodeFactory),
+    new OpencodeLocalAgentDriver(options.opencodeFactory, options.env),
     new PiLocalAgentDriver(options.piSessionFactory),
     new AcpLocalAgentDriver("cursor", options.env),
     new AcpLocalAgentDriver("copilot", options.env),
