@@ -39,6 +39,11 @@ export interface LocalAgentRunCallbacks {
    * could otherwise lose that identity.
    */
   onSessionId?: (providerSessionId: string) => void | Promise<void>;
+  /**
+   * Called as soon as the provider runtime is ready and before semantic
+   * execution starts.
+   */
+  onExecutionStarted?: () => void | Promise<void>;
 }
 
 export interface LocalAgentRuntimeContext {
@@ -132,11 +137,21 @@ export class CodexSdkLocalAgentRuntime {
     this.codex = codex;
   }
 
-  async run(input: LocalAgentRunInput): Promise<LocalAgentRunResult> {
+  async run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks): Promise<LocalAgentRunResult> {
     const options = threadOptionsFor(input);
     const thread = input.providerSessionId
       ? this.codex.resumeThread(input.providerSessionId, options)
       : this.codex.startThread(options);
+    if (!input.providerSessionId && thread.id && callbacks?.onSessionId) {
+      try {
+        await callbacks.onSessionId(thread.id);
+      } catch (error) {
+        throw new LocalAgentProviderError(
+          error instanceof Error ? error.message : String(error),
+          { providerSessionId: thread.id },
+        );
+      }
+    }
     let turn: RunResult;
     try {
       turn = await thread.run(input.prompt);

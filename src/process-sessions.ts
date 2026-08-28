@@ -37,6 +37,25 @@ export interface StartCommandInput {
    * inherited by model-controlled subprocesses.
    */
   environmentPolicy?: ProcessEnvironmentPolicy;
+  /**
+   * Optional physical-workspace-scoped replay identity.
+   * Exact replays reuse the existing running or completed command session.
+   * Conflicting replays fail closed.
+   */
+  attemptKey?: string;
+  /**
+   * Optional execution timeout in seconds. The owned process tree is
+   * terminated when this duration is exceeded.
+   */
+  timeoutSeconds?: number;
+}
+
+export interface GetCommandStatusInput {
+  workspaceId: string;
+  sessionId?: number;
+  attemptKey?: string;
+  yieldTimeMs?: number;
+  maxOutputTokens?: number;
 }
 
 export interface WriteStdinInput {
@@ -51,11 +70,13 @@ export interface WriteStdinInput {
 
 export interface ProcessSnapshot {
   sessionId?: number;
+  attemptKey?: string;
   output: string;
   outputTruncated: boolean;
   running: boolean;
   exitCode?: number;
   signal?: string;
+  timedOut?: boolean;
   wallTimeMs: number;
 }
 
@@ -67,7 +88,16 @@ interface ManagedProcess {
 
 interface ProcessSession {
   id: number;
+  attemptKey?: string;
   workspaceId: string;
+  workspaceRoot?: string;
+  command: string;
+  cwd: string;
+  executable?: string;
+  args?: string[];
+  environmentPolicy?: ProcessEnvironmentPolicy;
+  tty?: boolean;
+  timeoutSeconds?: number;
   process?: ManagedProcess;
   startedAt: number;
   columns: number;
@@ -76,8 +106,10 @@ interface ProcessSession {
   running: boolean;
   exitCode?: number;
   signal?: string;
+  timedOut?: boolean;
   exitPromise: Promise<void>;
   resolveExit: () => void;
+  executionTimer?: NodeJS.Timeout;
   cleanupTimer?: NodeJS.Timeout;
 }
 
@@ -215,7 +247,7 @@ export class HeadTailBuffer {
     return this.totalCharacters > 0;
   }
 
-  drain(maxCharacters: number): { output: string; truncated: boolean } {
+  peek(maxCharacters: number): { output: string; truncated: boolean } {
     if (!Number.isInteger(maxCharacters) || maxCharacters < 1) {
       throw new Error("Output limit must be a positive integer.");
     }
@@ -228,11 +260,15 @@ export class HeadTailBuffer {
     const output = truncateOutput(retained, maxCharacters);
     const truncated = omittedByBuffer > 0 || output.truncated;
 
+    return { output: output.output, truncated };
+  }
+
+  drain(maxCharacters: number): { output: string; truncated: boolean } {
+    const result = this.peek(maxCharacters);
     this.head = "";
     this.tail = "";
     this.totalCharacters = 0;
-
-    return { output: output.output, truncated };
+    return result;
   }
 }
 
@@ -252,6 +288,7 @@ function truncateOutput(output: string, maxCharacters: number): { output: string
 
 export class ProcessSessionManager {
   private readonly sessions = new Map<number, ProcessSession>();
+  private readonly attemptKeyToSessionId = new Map<string, number>();
   private readonly maxBufferCharacters: number;
   private readonly completedSessionTtlMs: number;
   private nextSessionId = 1;
@@ -262,23 +299,65 @@ export class ProcessSessionManager {
   }
 
   async start(input: StartCommandInput): Promise<ProcessSnapshot> {
+    if (input.attemptKey) {
+      const attemptIndexKey = this.attemptIndexKey(input.workspaceId, input.attemptKey);
+      const existingSessionId = this.attemptKeyToSessionId.get(attemptIndexKey);
+      if (existingSessionId !== undefined) {
+        const existing = this.sessions.get(existingSessionId);
+        if (existing) {
+          if (!this.isMateriallyIdentical(existing, input)) {
+            throw new Error(
+              `ATTEMPT_REPLAY_CONFLICT: attemptKey '${input.attemptKey}' was already used for a different command in workspace ${input.workspaceId}.`,
+            );
+          }
+          // Materially identical replay: reuse existing session without spawning new process.
+          const yieldTimeMs = boundedInteger(input.yieldTimeMs, DEFAULT_EXEC_YIELD_MS, MAX_COMMAND_YIELD_MS);
+          if (existing.running && yieldTimeMs > 0) {
+            await this.waitForExit(existing, yieldTimeMs);
+          }
+          return this.getSnapshot(existing, input.maxOutputTokens);
+        }
+      }
+    }
+
     const session = this.createSession(input);
     this.sessions.set(session.id, session);
+    if (session.attemptKey) {
+      this.attemptKeyToSessionId.set(this.attemptIndexKey(session.workspaceId, session.attemptKey), session.id);
+    }
+
+    if (input.timeoutSeconds !== undefined && input.timeoutSeconds > 0) {
+      const timeoutMs = input.timeoutSeconds * 1000;
+      session.executionTimer = setTimeout(() => {
+        if (session.running) {
+          session.timedOut = true;
+          session.process?.kill("SIGTERM");
+        }
+      }, timeoutMs);
+      session.executionTimer.unref();
+    }
 
     try {
       if (input.tty && process.platform !== "win32") await this.startPty(session, input);
       else this.startPipe(session, input);
     } catch (error) {
-      this.sessions.delete(session.id);
+      this.removeSession(session.id);
       throw error;
     }
 
     const yieldTimeMs = boundedInteger(input.yieldTimeMs, DEFAULT_EXEC_YIELD_MS, MAX_COMMAND_YIELD_MS);
     await this.waitForExit(session, yieldTimeMs);
 
-    const snapshot = this.consume(session, input.maxOutputTokens);
-    if (!session.running) this.removeSession(session.id);
-    return snapshot;
+    return this.getSnapshot(session, input.maxOutputTokens);
+  }
+
+  async getStatus(input: GetCommandStatusInput): Promise<ProcessSnapshot> {
+    const session = this.resolveSession(input.workspaceId, input.sessionId, input.attemptKey);
+    const yieldTimeMs = boundedInteger(input.yieldTimeMs, 0, MAX_COMMAND_YIELD_MS);
+    if (session.running && yieldTimeMs > 0) {
+      await this.waitForExit(session, yieldTimeMs);
+    }
+    return this.getSnapshot(session, input.maxOutputTokens);
   }
 
   async write(input: WriteStdinInput): Promise<ProcessSnapshot> {
@@ -303,16 +382,18 @@ export class ProcessSessionManager {
     const writableChars = chars.replaceAll("\u0003", "");
     if (writableChars && session.running) session.process?.write(writableChars);
 
-    if ((interactionRequested || !session.buffer.hasOutput()) && session.running) {
+    // An explicit yield is also a polling request. This matters for internal
+    // PTY callers (Codex Goal): retained output is intentionally non-destructive
+    // now, so checking only `hasOutput()` would otherwise suppress every later
+    // poll after the initial snapshot.
+    if ((interactionRequested || input.yieldTimeMs !== undefined || !session.buffer.hasOutput()) && session.running) {
       const fallback = interactionRequested ? DEFAULT_INTERACTIVE_YIELD_MS : DEFAULT_POLL_YIELD_MS;
       const maximum = interactionRequested ? MAX_COMMAND_YIELD_MS : MAX_POLL_YIELD_MS;
       const yieldTimeMs = boundedInteger(input.yieldTimeMs, fallback, maximum);
       await this.waitForExit(session, yieldTimeMs);
     }
 
-    const snapshot = this.consume(session, input.maxOutputTokens);
-    if (!session.running) this.removeSession(session.id);
-    return snapshot;
+    return this.getSnapshot(session, input.maxOutputTokens);
   }
 
   terminate(workspaceId: string, sessionId: number): void {
@@ -322,10 +403,65 @@ export class ProcessSessionManager {
 
   shutdown(): void {
     for (const session of this.sessions.values()) {
+      if (session.executionTimer) clearTimeout(session.executionTimer);
       if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
       if (session.running) session.process?.kill("SIGTERM");
     }
     this.sessions.clear();
+    this.attemptKeyToSessionId.clear();
+  }
+
+  private attemptIndexKey(workspaceId: string, attemptKey: string): string {
+    return `${workspaceId}:${attemptKey}`;
+  }
+
+  private isMateriallyIdentical(existing: ProcessSession, input: StartCommandInput): boolean {
+    if (existing.workspaceId !== input.workspaceId) return false;
+    if (existing.workspaceRoot !== input.workspaceRoot) return false;
+    if (existing.command !== input.command) return false;
+    if (existing.cwd !== input.cwd) return false;
+    if (existing.executable !== input.executable) return false;
+
+    const existingArgs = existing.args ?? [];
+    const inputArgs = input.args ?? [];
+    if (existingArgs.length !== inputArgs.length) return false;
+    for (let i = 0; i < existingArgs.length; i++) {
+      if (existingArgs[i] !== inputArgs[i]) return false;
+    }
+
+    if (existing.timeoutSeconds !== input.timeoutSeconds) return false;
+
+    const existingEnv = existing.environmentPolicy ?? "inherit";
+    const inputEnv = input.environmentPolicy ?? "inherit";
+    if (existingEnv !== inputEnv) return false;
+
+    const existingTty = Boolean(existing.tty);
+    const inputTty = Boolean(input.tty);
+    if (existingTty !== inputTty) return false;
+
+    if (existingTty) {
+      const inputColumns = terminalSize(input.columns, DEFAULT_COLUMNS);
+      const inputRows = terminalSize(input.rows, DEFAULT_ROWS);
+      if (existing.columns !== inputColumns || existing.rows !== inputRows) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  private resolveSession(workspaceId: string, sessionId?: number, attemptKey?: string): ProcessSession {
+    if (sessionId !== undefined) {
+      return this.getOwnedSession(workspaceId, sessionId);
+    }
+    if (attemptKey !== undefined) {
+      const id = this.attemptKeyToSessionId.get(this.attemptIndexKey(workspaceId, attemptKey));
+      if (id !== undefined) {
+        return this.getOwnedSession(workspaceId, id);
+      }
+      throw new Error(`Unknown process attemptKey '${attemptKey}' in workspace ${workspaceId}.`);
+    }
+    throw new Error("Must provide either sessionId or attemptKey to look up process status.");
   }
 
   private async waitForExit(session: ProcessSession, yieldTimeMs: number): Promise<void> {
@@ -350,7 +486,16 @@ export class ProcessSessionManager {
 
     return {
       id: this.nextSessionId++,
+      attemptKey: input.attemptKey,
       workspaceId: input.workspaceId,
+      workspaceRoot: input.workspaceRoot,
+      command: input.command,
+      cwd: input.cwd,
+      executable: input.executable,
+      args: input.args ? [...input.args] : undefined,
+      environmentPolicy: input.environmentPolicy ?? "inherit",
+      tty: Boolean(input.tty),
+      timeoutSeconds: input.timeoutSeconds,
       startedAt: Date.now(),
       columns: terminalSize(input.columns, DEFAULT_COLUMNS),
       rows: terminalSize(input.rows, DEFAULT_ROWS),
@@ -447,12 +592,16 @@ export class ProcessSessionManager {
 
   private finish(session: ProcessSession, exitCode?: number, signal?: string): void {
     if (!session.running) return;
+    if (session.executionTimer) {
+      clearTimeout(session.executionTimer);
+      session.executionTimer = undefined;
+    }
     session.running = false;
     session.exitCode = exitCode;
     session.signal = signal;
     session.resolveExit();
     session.cleanupTimer = setTimeout(
-      () => this.sessions.delete(session.id),
+      () => this.removeSession(session.id),
       this.completedSessionTtlMs,
     );
     session.cleanupTimer.unref();
@@ -462,18 +611,24 @@ export class ProcessSessionManager {
     session.buffer.append(output);
   }
 
-  private consume(session: ProcessSession, maxOutputTokens?: number): ProcessSnapshot {
+  private getSnapshot(session: ProcessSession, maxOutputTokens?: number): ProcessSnapshot {
     const limit = boundedInteger(maxOutputTokens, DEFAULT_MAX_OUTPUT_TOKENS, 100_000);
     const maxCharacters = Math.max(256, limit * 4);
-    const buffered = session.buffer.drain(maxCharacters);
+    // PTY consumers (notably Codex Goal) process each snapshot as a delta;
+    // retain cumulative output for pipe/attempt-key reconciliation callers.
+    const buffered = session.tty
+      ? session.buffer.drain(maxCharacters)
+      : session.buffer.peek(maxCharacters);
 
     return {
       sessionId: session.running ? session.id : undefined,
+      attemptKey: session.attemptKey,
       output: buffered.output,
       outputTruncated: buffered.truncated,
       running: session.running,
       exitCode: session.exitCode,
       signal: session.signal,
+      timedOut: session.timedOut,
       wallTimeMs: Date.now() - session.startedAt,
     };
   }
@@ -489,7 +644,12 @@ export class ProcessSessionManager {
 
   private removeSession(sessionId: number): void {
     const session = this.sessions.get(sessionId);
-    if (session?.cleanupTimer) clearTimeout(session.cleanupTimer);
+    if (!session) return;
+    if (session.executionTimer) clearTimeout(session.executionTimer);
+    if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
+    if (session.attemptKey) {
+      this.attemptKeyToSessionId.delete(this.attemptIndexKey(session.workspaceId, session.attemptKey));
+    }
     this.sessions.delete(sessionId);
   }
 }

@@ -6,11 +6,15 @@ import { AgentStoreError, isProgrammerDefect } from "./local-agent-errors.js";
 import type { ServerConfig } from "./config.js";
 import { canonicalizePath } from "./roots.js";
 import {
+  type ActiveTurnState,
+  type AgentLifecycleKind,
   type AgentTerminalReason,
+  type AgentTurnLaunchState,
   type ExecutionContract,
   type PathStateFingerprint,
   type ScopeBaseline,
   type ScopeState,
+  type TerminationPendingState,
   deserializeExecutionContract,
   serializeExecutionContract,
 } from "./local-agent-contract.js";
@@ -27,8 +31,31 @@ export type LocalAgentStatus = "starting" | "running" | "idle" | "error" | "stop
  *   attributed to the worker) at continuation admission.
  */
 export interface AgentLifecycleState {
+  lifecycleKind?: AgentLifecycleKind;
   cumulativeChangedPaths?: string[];
   turnEndBaseline?: ScopeBaseline;
+  activeTurn?: ActiveTurnState;
+  /** Compatibility projection for the original termination callback API. */
+  termination?: PhysicalTerminationState;
+  terminationPending?: TerminationPendingState;
+  /** Parser evidence that a persisted pending-looking lifecycle is malformed. */
+  lifecycleCorrupt?: true;
+  /** Last generation settled by normal completion or verified termination. */
+  lastSettledGeneration?: string;
+  /** Legacy detached row whose exact physical target cannot be reconstructed. */
+  terminationBlocked?: {
+    detectedAt: string;
+    reason: string;
+  };
+}
+
+export interface PhysicalTerminationState {
+  pending: boolean;
+  fencedAt: string;
+  reason: AgentTerminalReason;
+  terminationId: string;
+  previousWorkerPid?: number;
+  previousWorkerToken?: string;
 }
 
 export interface LocalAgentRecord {
@@ -66,6 +93,7 @@ export interface CreateLocalAgentRecordInput {
   effort?: string;
   executionContract?: ExecutionContract;
   startReplay?: StartReplayBinding;
+  lifecycleKind?: AgentLifecycleKind;
 }
 
 export interface LocalAgentWorkspaceScope {
@@ -88,6 +116,67 @@ export class LocalAgentReplayConflictError extends Error {
 export interface LocalAgentListScope {
   workspaceId?: string;
   workspaceRoot?: string;
+}
+
+export interface FenceActiveTurnInput {
+  agentId: string;
+  expectedPhase?: "startup" | "execution" | "any";
+  budgetMs?: number;
+  terminalReason: AgentTerminalReason;
+  error: string;
+}
+
+export interface FenceActiveTurnResult {
+  applied: boolean;
+  previous?: LocalAgentRecord;
+  current?: LocalAgentRecord;
+}
+
+export interface LifecycleCasResult {
+  applied: boolean;
+  previous?: LocalAgentRecord;
+  current?: LocalAgentRecord;
+}
+
+export interface LocalAgentStoreTestHooks {
+  beforeGenericUpdateLock?: (snapshot: LocalAgentRecord) => void;
+}
+
+export interface BeginContinuationCasInput {
+  agentId: string;
+  expectedPreviousGeneration?: string;
+  expectedUpdatedAt?: string;
+  turnStartedAt?: string;
+}
+
+export interface BeginTerminationCasInput extends FenceActiveTurnInput {
+  terminalStatus?: "error" | "stopped";
+  errorCode?: string;
+  errorRetryable?: boolean;
+}
+
+export interface FinishTurnCasInput {
+  agentId: string;
+  generation: string;
+  workerToken: string;
+  status: "idle" | "error";
+  providerSessionId?: string;
+  latestResponse?: string;
+  error?: string;
+  terminalReason?: AgentTerminalReason;
+  scopeState?: ScopeState;
+  cumulativeChangedPaths?: string[];
+  turnEndBaseline?: ScopeBaseline;
+}
+
+export interface CompleteTerminationCasInput {
+  agentId: string;
+  generation: string;
+  workerPid?: number;
+  workerToken?: string;
+  turnEndBaseline: ScopeBaseline;
+  cumulativeChangedPaths?: string[];
+  scopeState?: ScopeState;
 }
 
 interface LocalAgentRow {
@@ -118,7 +207,10 @@ interface LocalAgentRow {
 export class LocalAgentStore {
   private readonly database: DatabaseHandle;
 
-  constructor(stateDir: string) {
+  constructor(
+    stateDir: string,
+    private readonly testHooks: LocalAgentStoreTestHooks = {},
+  ) {
     this.database = openDatabase(stateDir);
   }
 
@@ -173,6 +265,18 @@ export class LocalAgentStore {
       effort: input.effort,
       executionContract: input.executionContract,
       startReplay: input.startReplay,
+      lifecycleState: input.lifecycleKind === "detached_worker_v2"
+        ? {
+            lifecycleKind: "detached_worker_v2",
+            activeTurn: {
+              generation: randomUUID(),
+              turnStartedAt: now,
+              launchState: "not_started",
+            },
+          }
+        : {
+            activeTurn: { turnStartedAt: now },
+          },
       status: "starting",
       createdAt: now,
       updatedAt: now,
@@ -189,10 +293,11 @@ export class LocalAgentStore {
           model,
           effort,
           execution_contract,
+          lifecycle_state,
           status,
           created_at,
           updated_at
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         record.id,
@@ -203,6 +308,7 @@ export class LocalAgentStore {
         record.model ?? null,
         record.effort ?? null,
         serializeStoredExecutionState(record.executionContract, record.startReplay),
+        record.lifecycleState ? JSON.stringify(record.lifecycleState) : null,
         record.status,
         record.createdAt,
         record.updatedAt,
@@ -291,17 +397,35 @@ export class LocalAgentStore {
   }
 
   update(id: string, patch: Partial<Omit<LocalAgentRecord, "id" | "createdAt">>): LocalAgentRecord {
-    const current = this.getById(id);
-    if (!current) throw new Error(`Unknown subagent id: ${id}`);
+    const observedBeforeLock = this.testHooks.beforeGenericUpdateLock
+      ? this.getById(id)
+      : undefined;
+    if (observedBeforeLock) this.testHooks.beforeGenericUpdateLock?.(observedBeforeLock);
 
-    const updated: LocalAgentRecord = {
-      ...current,
-      ...patch,
-      updatedAt: new Date().toISOString(),
-    };
+    const updateLegacy = this.database.sqlite.transaction(() => {
+      const row = this.database.sqlite.prepare(
+        "select * from local_agent_sessions where id = ? limit 1",
+      ).get(id) as LocalAgentRow | undefined;
+      if (!row) throw new Error(`Unknown subagent id: ${id}`);
+      const current = rowToLocalAgentRecord(row);
+      if (isDetachedLifecycle(current.lifecycleState)) {
+        if (observedBeforeLock && !isDetachedLifecycle(observedBeforeLock.lifecycleState)) {
+          throw new Error(
+            `Stale generic update conflict for agent ${id}: legacy snapshot became detached-worker v2 before lock acquisition.`,
+          );
+        }
+        throw new Error(
+          `Generic update cannot mutate a generation-owned detached lifecycle record for agent ${id}.`,
+        );
+      }
 
-    this.database.sqlite
-      .prepare(
+      const updated: LocalAgentRecord = {
+        ...current,
+        ...patch,
+        updatedAt: new Date().toISOString(),
+      };
+
+      const result = this.database.sqlite.prepare(
         `update local_agent_sessions set
           workspace_id = ?,
           workspace_root = ?,
@@ -323,7 +447,7 @@ export class LocalAgentStore {
           error_code = ?,
           error_retryable = ?,
           updated_at = ?
-         where id = ?`,
+         where id = ? and updated_at = ? and lifecycle_state is ?`,
       )
       .run(
         updated.workspaceId ?? null,
@@ -347,9 +471,17 @@ export class LocalAgentStore {
         updated.errorRetryable === undefined ? null : String(updated.errorRetryable),
         updated.updatedAt,
         updated.id,
+        row.updated_at,
+        row.lifecycle_state,
       );
-
-    return updated;
+      if (result.changes !== 1) {
+        throw new Error(
+          `Stale generic update conflict for agent ${id}: exact locked row snapshot no longer matches.`,
+        );
+      }
+      return this.getById(id) ?? updated;
+    });
+    return updateLegacy.immediate();
   }
 
   updateResult(
@@ -359,16 +491,651 @@ export class LocalAgentStore {
     return storeResult("update", () => this.update(id, patch));
   }
 
+  beginContinuationCAS(input: BeginContinuationCasInput): LifecycleCasResult {
+    const begin = this.database.sqlite.transaction(() => {
+      const current = this.getById(input.agentId);
+      if (!current) return { applied: false };
+      const lifecycle = current.lifecycleState;
+      if (
+        !isDetachedLifecycle(lifecycle) ||
+        current.status === "starting" ||
+        current.status === "running" ||
+        lifecycle?.activeTurn ||
+        lifecycle?.terminationPending ||
+        lifecycle?.lifecycleCorrupt ||
+        (input.expectedUpdatedAt !== undefined && current.updatedAt !== input.expectedUpdatedAt) ||
+        (input.expectedPreviousGeneration !== undefined &&
+          lifecycle?.lastSettledGeneration !== input.expectedPreviousGeneration)
+      ) {
+        return { applied: false, previous: current, current };
+      }
+
+      const now = input.turnStartedAt ?? new Date().toISOString();
+      const updatedLifecycle: AgentLifecycleState = {
+        ...lifecycle,
+        activeTurn: {
+          generation: randomUUID(),
+          turnStartedAt: now,
+          launchState: "not_started",
+        },
+        terminationPending: undefined,
+        lifecycleCorrupt: undefined,
+      };
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set
+          status = 'starting', latest_response = null, error = null,
+          error_code = null, error_retryable = null, terminal_reason = null,
+          worker_pid = null, worker_token = null, lifecycle_state = ?, updated_at = ?
+         where id = ? and updated_at = ?`,
+      ).run(JSON.stringify(updatedLifecycle), now, input.agentId, current.updatedAt);
+      const refreshed = this.getById(input.agentId) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return begin.immediate();
+  }
+
+  prepareWorkerCAS(id: string, generation: string, workerToken: string): LifecycleCasResult {
+    const prepare = this.database.sqlite.transaction(() => {
+      const current = this.getById(id);
+      if (!current) return { applied: false };
+      const activeTurn = current.lifecycleState?.activeTurn;
+      if (
+        !isDetachedLifecycle(current.lifecycleState) ||
+        current.status !== "starting" ||
+        !activeTurn ||
+        activeTurn.generation !== generation ||
+        current.lifecycleState?.terminationPending ||
+        current.lifecycleState?.lifecycleCorrupt
+      ) {
+        return { applied: false, previous: current, current };
+      }
+      const lifecycleState: AgentLifecycleState = {
+        ...current.lifecycleState,
+        activeTurn: { ...activeTurn, launchState: "launching" },
+      };
+      const now = new Date().toISOString();
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set worker_pid = null, worker_token = ?, lifecycle_state = ?, updated_at = ?
+         where id = ? and status = 'starting' and updated_at = ?`,
+      ).run(workerToken, JSON.stringify(lifecycleState), now, id, current.updatedAt);
+      const refreshed = this.getById(id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return prepare.immediate();
+  }
+
+  markWorkerSpawnedCAS(
+    id: string,
+    generation: string,
+    workerToken: string,
+    workerPid?: number,
+  ): LifecycleCasResult {
+    return this.bindWorkerProcessCAS(id, generation, workerToken, workerPid, "spawned", false);
+  }
+
+  claimWorkerCAS(id: string, generation: string, workerToken: string, workerPid: number): LifecycleCasResult {
+    return this.bindWorkerProcessCAS(id, generation, workerToken, workerPid, "claimed", true);
+  }
+
+  private bindWorkerProcessCAS(
+    id: string,
+    generation: string,
+    workerToken: string,
+    workerPid: number | undefined,
+    launchState: "spawned" | "claimed",
+    claim: boolean,
+  ): LifecycleCasResult {
+    const bind = this.database.sqlite.transaction(() => {
+      const current = this.getById(id);
+      if (!current) return { applied: false };
+      const lifecycle = current.lifecycleState;
+      const activeTurn = lifecycle?.activeTurn;
+      const pending = lifecycle?.terminationPending;
+      if (!isDetachedLifecycle(lifecycle) || lifecycle.lifecycleCorrupt || current.workerToken !== workerToken) {
+        return { applied: false, previous: current, current };
+      }
+
+      let lifecycleState: AgentLifecycleState;
+      let status = current.status;
+      if (
+        activeTurn?.generation === generation &&
+        !pending &&
+        current.status === "starting"
+      ) {
+        lifecycleState = {
+          ...lifecycle,
+          activeTurn: { ...activeTurn, launchState },
+        };
+        if (claim) status = "running";
+      } else if (pending?.generation === generation && pending.workerToken === workerToken) {
+        lifecycleState = {
+          ...lifecycle,
+          terminationPending: {
+            ...pending,
+            workerPid: workerPid ?? pending.workerPid,
+            launchState: laterLaunchState(pending.launchState, launchState),
+          },
+        };
+      } else {
+        return { applied: false, previous: current, current };
+      }
+
+      const now = new Date().toISOString();
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set status = ?, worker_pid = ?, lifecycle_state = ?, updated_at = ?
+         where id = ? and worker_token = ? and updated_at = ?`,
+      ).run(
+        status,
+        workerPid ?? current.workerPid ?? null,
+        JSON.stringify(lifecycleState),
+        now,
+        id,
+        workerToken,
+        current.updatedAt,
+      );
+      const refreshed = this.getById(id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return bind.immediate();
+  }
+
+  markExecutionStarted(
+    id: string,
+    workerToken: string,
+    executionStartedAt = new Date().toISOString(),
+    expectedGeneration?: string,
+  ): LocalAgentRecord {
+    const mark = this.database.sqlite.transaction(() => {
+      const current = this.getById(id);
+      if (!current) throw new Error(`Unknown subagent id: ${id}`);
+      const activeTurn = current.lifecycleState?.activeTurn;
+      if (
+        current.status !== "running" ||
+        !isDetachedLifecycle(current.lifecycleState) ||
+        current.workerToken !== workerToken ||
+        !activeTurn ||
+        (expectedGeneration !== undefined && activeTurn.generation !== expectedGeneration) ||
+        current.lifecycleState?.terminationPending ||
+        current.lifecycleState?.lifecycleCorrupt
+      ) {
+        throw new Error(
+          `Agent ${id} is no longer active under worker token ${workerToken} (status: ${current.status}).`,
+        );
+      }
+      if (activeTurn.executionStartedAt) return current;
+      const lifecycleState: AgentLifecycleState = {
+        ...current.lifecycleState,
+        activeTurn: { ...activeTurn, executionStartedAt },
+      };
+      const now = new Date().toISOString();
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set lifecycle_state = ?, updated_at = ?
+         where id = ? and status = 'running' and worker_token = ? and updated_at = ?`,
+      ).run(JSON.stringify(lifecycleState), now, id, workerToken, current.updatedAt);
+      if (result.changes !== 1) {
+        throw new Error(`Agent ${id} execution transition failed ownership guard.`);
+      }
+      return this.getById(id) ?? current;
+    });
+    return mark.immediate();
+  }
+
+  updateTurnEvidenceCAS(
+    id: string,
+    generation: string,
+    workerToken: string,
+    patch: { scopeBaseline?: ScopeBaseline; cumulativeChangedPaths?: string[] },
+  ): LifecycleCasResult {
+    const updateEvidence = this.database.sqlite.transaction(() => {
+      const current = this.getById(id);
+      if (!current) return { applied: false };
+      const lifecycle = current.lifecycleState;
+      if (
+        !isDetachedLifecycle(lifecycle) ||
+        !lifecycle?.activeTurn ||
+        lifecycle.activeTurn.generation !== generation ||
+        lifecycle.terminationPending ||
+        lifecycle.lifecycleCorrupt ||
+        current.workerToken !== workerToken ||
+        (current.status !== "starting" && current.status !== "running")
+      ) {
+        return { applied: false, previous: current, current };
+      }
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        cumulativeChangedPaths: patch.cumulativeChangedPaths ?? lifecycle.cumulativeChangedPaths,
+      };
+      const now = new Date().toISOString();
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set scope_baseline = ?, lifecycle_state = ?, updated_at = ?
+         where id = ? and worker_token = ? and updated_at = ?`,
+      ).run(
+        patch.scopeBaseline === undefined
+          ? (current.scopeBaseline ? JSON.stringify(current.scopeBaseline) : null)
+          : JSON.stringify(patch.scopeBaseline),
+        JSON.stringify(lifecycleState),
+        now,
+        id,
+        workerToken,
+        current.updatedAt,
+      );
+      const refreshed = this.getById(id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return updateEvidence.immediate();
+  }
+
+  bindProviderSessionCAS(
+    id: string,
+    generation: string,
+    workerToken: string,
+    providerSessionId: string,
+  ): LifecycleCasResult {
+    const bind = this.database.sqlite.transaction(() => {
+      const current = this.getById(id);
+      if (!current) return { applied: false };
+      const lifecycle = current.lifecycleState;
+      if (
+        !isDetachedLifecycle(lifecycle) ||
+        !lifecycle?.activeTurn ||
+        lifecycle.activeTurn.generation !== generation ||
+        lifecycle.terminationPending ||
+        lifecycle.lifecycleCorrupt ||
+        current.workerToken !== workerToken ||
+        (current.status !== "starting" && current.status !== "running")
+      ) {
+        return { applied: false, previous: current, current };
+      }
+      const now = new Date().toISOString();
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set provider_session_id = ?, updated_at = ?
+         where id = ? and worker_token = ? and updated_at = ?`,
+      ).run(providerSessionId, now, id, workerToken, current.updatedAt);
+      const refreshed = this.getById(id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return bind.immediate();
+  }
+
+  finishTurnCAS(input: FinishTurnCasInput): LifecycleCasResult {
+    const finish = this.database.sqlite.transaction(() => {
+      const current = this.getById(input.agentId);
+      if (!current) return { applied: false };
+      const lifecycle = current.lifecycleState;
+      if (
+        !isDetachedLifecycle(lifecycle) ||
+        current.status !== "running" ||
+        current.workerToken !== input.workerToken ||
+        lifecycle?.activeTurn?.generation !== input.generation ||
+        lifecycle.terminationPending ||
+        lifecycle.lifecycleCorrupt
+      ) {
+        return { applied: false, previous: current, current };
+      }
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        activeTurn: undefined,
+        terminationPending: undefined,
+        lastSettledGeneration: input.generation,
+        cumulativeChangedPaths: input.cumulativeChangedPaths ?? lifecycle.cumulativeChangedPaths,
+        turnEndBaseline: input.turnEndBaseline ?? lifecycle.turnEndBaseline,
+      };
+      const now = new Date().toISOString();
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set provider_session_id = coalesce(?, provider_session_id),
+          status = ?, latest_response = ?, error = ?, terminal_reason = ?, scope_state = ?,
+          worker_pid = null, worker_token = null, lifecycle_state = ?, updated_at = ?
+         where id = ? and status = 'running' and worker_token = ? and updated_at = ?`,
+      ).run(
+        input.providerSessionId ?? null,
+        input.status,
+        input.latestResponse ?? null,
+        input.error ?? null,
+        input.terminalReason ?? null,
+        input.scopeState ?? null,
+        JSON.stringify(lifecycleState),
+        now,
+        input.agentId,
+        input.workerToken,
+        current.updatedAt,
+      );
+      const refreshed = this.getById(input.agentId) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return finish.immediate();
+  }
+
+  failTurnCAS(input: Omit<FinishTurnCasInput, "status">): LifecycleCasResult {
+    return this.finishTurnCAS({ ...input, status: "error" });
+  }
+
+  failLaunchCAS(
+    id: string,
+    generation: string,
+    workerToken: string,
+    error: string,
+  ): LifecycleCasResult {
+    const fail = this.database.sqlite.transaction(() => {
+      const current = this.getById(id);
+      if (!current) return { applied: false };
+      const lifecycle = current.lifecycleState;
+      if (
+        !isDetachedLifecycle(lifecycle) ||
+        current.status !== "starting" ||
+        current.workerToken !== workerToken ||
+        lifecycle?.activeTurn?.generation !== generation ||
+        lifecycle.terminationPending ||
+        lifecycle.lifecycleCorrupt
+      ) {
+        return { applied: false, previous: current, current };
+      }
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        activeTurn: undefined,
+        lastSettledGeneration: generation,
+      };
+      const now = new Date().toISOString();
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set status = 'error', worker_pid = null, worker_token = null,
+          error = ?, terminal_reason = 'launch_failed', lifecycle_state = ?, updated_at = ?
+         where id = ? and status = 'starting' and worker_token = ? and updated_at = ?`,
+      ).run(error, JSON.stringify(lifecycleState), now, id, workerToken, current.updatedAt);
+      const refreshed = this.getById(id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return fail.immediate();
+  }
+
+  beginTerminationCAS(input: BeginTerminationCasInput): LifecycleCasResult {
+    const begin = this.database.sqlite.transaction(() => {
+      const current = this.getById(input.agentId);
+      if (!current) return { applied: false };
+      const lifecycle = current.lifecycleState;
+      if (
+        !isDetachedLifecycle(lifecycle) ||
+        lifecycle.terminationPending ||
+        lifecycle.lifecycleCorrupt ||
+        lifecycle.terminationBlocked
+      ) {
+        return { applied: false, previous: current, current };
+      }
+      const activeTurn = lifecycle?.activeTurn;
+      if (
+        !activeTurn?.generation ||
+        !activeTurn.launchState ||
+        (current.status !== "starting" && current.status !== "running")
+      ) {
+        return { applied: false, previous: current, current };
+      }
+
+      const nowMs = Date.now();
+      const turnStartedAtMs = Date.parse(activeTurn.turnStartedAt);
+      const executionStartedAtMs = activeTurn.executionStartedAt
+        ? Date.parse(activeTurn.executionStartedAt)
+        : undefined;
+      if (input.expectedPhase === "startup") {
+        if (executionStartedAtMs !== undefined) return { applied: false, previous: current, current };
+        if (input.budgetMs !== undefined && nowMs - turnStartedAtMs <= input.budgetMs) {
+          return { applied: false, previous: current, current };
+        }
+      } else if (input.expectedPhase === "execution") {
+        if (executionStartedAtMs === undefined) return { applied: false, previous: current, current };
+        if (input.budgetMs !== undefined && nowMs - executionStartedAtMs <= input.budgetMs) {
+          return { applied: false, previous: current, current };
+        }
+      } else if (input.budgetMs !== undefined && nowMs - turnStartedAtMs <= input.budgetMs) {
+        return { applied: false, previous: current, current };
+      }
+
+      const now = new Date().toISOString();
+      const terminationId = randomUUID();
+      const pending: TerminationPendingState = {
+        generation: activeTurn.generation,
+        requestedAt: now,
+        reason: input.terminalReason,
+        terminalStatus: input.terminalStatus ?? "error",
+        previousStatus: current.status,
+        workerToken: current.workerToken,
+        workerPid: current.workerPid,
+        launchState: activeTurn.launchState,
+      };
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        activeTurn: undefined,
+        termination: {
+          pending: true,
+          fencedAt: now,
+          reason: input.terminalReason,
+          terminationId,
+          previousWorkerPid: current.workerPid,
+          previousWorkerToken: current.workerToken,
+        },
+        terminationPending: pending,
+      };
+      const scopeState = input.terminalReason === "scope_violation"
+        ? "SCOPE_VIOLATION"
+        : current.scopeState;
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set status = ?, terminal_reason = ?, error = ?,
+          error_code = ?, error_retryable = ?, scope_state = ?, lifecycle_state = ?, updated_at = ?
+         where id = ? and status in ('starting', 'running') and updated_at = ?`,
+      ).run(
+        pending.terminalStatus,
+        input.terminalReason,
+        input.error,
+        input.errorCode ?? null,
+        input.errorRetryable === undefined ? null : String(input.errorRetryable),
+        scopeState ?? null,
+        JSON.stringify(lifecycleState),
+        now,
+        input.agentId,
+        current.updatedAt,
+      );
+      const refreshed = this.getById(input.agentId) ?? current;
+      return { applied: result.changes === 1, terminationId, previous: current, current: refreshed };
+    });
+    return begin.immediate();
+  }
+
+  recordTerminationFailureCAS(input: {
+    agentId: string;
+    generation: string;
+    workerPid?: number;
+    workerToken?: string;
+    failure: string;
+  }): LifecycleCasResult {
+    const fail = this.database.sqlite.transaction(() => {
+      const current = this.getById(input.agentId);
+      if (!current) return { applied: false };
+      const pending = current.lifecycleState?.terminationPending;
+      if (
+        !isDetachedLifecycle(current.lifecycleState) ||
+        !pending ||
+        current.lifecycleState?.lifecycleCorrupt ||
+        pending.generation !== input.generation ||
+        pending.workerPid !== input.workerPid ||
+        pending.workerToken !== input.workerToken ||
+        current.workerPid !== input.workerPid ||
+        current.workerToken !== input.workerToken
+      ) {
+        return { applied: false, previous: current, current };
+      }
+      const now = new Date().toISOString();
+      const lifecycleState: AgentLifecycleState = {
+        ...current.lifecycleState,
+        terminationPending: { ...pending, lastAttemptAt: now, lastFailure: input.failure },
+      };
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set error = ?, lifecycle_state = ?, updated_at = ?
+         where id = ? and updated_at = ?`,
+      ).run(input.failure, JSON.stringify(lifecycleState), now, input.agentId, current.updatedAt);
+      const refreshed = this.getById(input.agentId) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return fail.immediate();
+  }
+
+  completeTerminationCAS(input: CompleteTerminationCasInput): LifecycleCasResult {
+    const complete = this.database.sqlite.transaction(() => {
+      const current = this.getById(input.agentId);
+      if (!current) return { applied: false };
+      const pending = current.lifecycleState?.terminationPending;
+      if (
+        !isDetachedLifecycle(current.lifecycleState) ||
+        !pending ||
+        current.lifecycleState?.lifecycleCorrupt ||
+        pending.generation !== input.generation ||
+        pending.workerPid !== input.workerPid ||
+        pending.workerToken !== input.workerToken ||
+        current.workerPid !== input.workerPid ||
+        current.workerToken !== input.workerToken
+      ) {
+        return { applied: false, previous: current, current };
+      }
+      const lifecycleState: AgentLifecycleState = {
+        ...current.lifecycleState,
+        terminationPending: undefined,
+        termination: undefined,
+        lifecycleCorrupt: undefined,
+        lastSettledGeneration: input.generation,
+        cumulativeChangedPaths: input.cumulativeChangedPaths ?? current.lifecycleState?.cumulativeChangedPaths,
+        turnEndBaseline: input.turnEndBaseline,
+      };
+      const now = new Date().toISOString();
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set worker_pid = null, worker_token = null,
+          scope_state = ?, lifecycle_state = ?, updated_at = ?
+         where id = ? and updated_at = ?`,
+      ).run(
+        input.scopeState ?? current.scopeState ?? null,
+        JSON.stringify(lifecycleState),
+        now,
+        input.agentId,
+        current.updatedAt,
+      );
+      const refreshed = this.getById(input.agentId) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return complete.immediate();
+  }
+
+  fenceActiveTurn(input: FenceActiveTurnInput): FenceActiveTurnResult {
+    return this.beginTerminationCAS({ ...input, terminalStatus: "error" });
+  }
+
+  /** Compatibility completion hook for older termination callbacks. */
+  completeTermination(agentId: string, terminationId: string, verified: boolean): LocalAgentRecord {
+    const current = this.getById(agentId);
+    if (!current) throw new Error(`Unknown subagent id: ${agentId}`);
+    if (current.lifecycleState?.termination?.terminationId !== terminationId) return current;
+    if (verified && current.lifecycleState?.terminationPending) {
+      const pending = current.lifecycleState.terminationPending;
+      return this.completeTerminationCAS({
+        agentId,
+        generation: pending.generation,
+        workerPid: pending.workerPid,
+        workerToken: pending.workerToken,
+        turnEndBaseline: current.lifecycleState.turnEndBaseline ?? { changedPaths: [], head: null },
+      }).current ?? current;
+    }
+    return this.update(agentId, {
+      error: `${current.error ?? "Termination requested."} Worker termination could not be verified.`,
+    });
+  }
+
+  reconcileLegacyDetachedActiveCAS(
+    id: string,
+    message = "DevSpace restarted while this agent turn was running.",
+  ): LifecycleCasResult {
+    const reconcile = this.database.sqlite.transaction(() => {
+      const current = this.getById(id);
+      if (!current) return { applied: false };
+      if (
+        isDetachedLifecycle(current.lifecycleState) ||
+        (current.status !== "starting" && current.status !== "running") ||
+        !current.lifecycleState?.activeTurn
+      ) {
+        return { applied: false, previous: current, current };
+      }
+
+      const hasPid = current.workerPid !== undefined;
+      const hasToken = current.workerToken !== undefined;
+      if (!hasPid && !hasToken) {
+        return { applied: false, previous: current, current };
+      }
+
+      const now = new Date().toISOString();
+      const generation = randomUUID();
+      const lifecycleState: AgentLifecycleState = hasPid && hasToken
+        ? {
+            ...current.lifecycleState,
+            lifecycleKind: "detached_worker_v2",
+            activeTurn: undefined,
+            terminationPending: {
+              generation,
+              requestedAt: now,
+              reason: "unknown",
+              terminalStatus: "error",
+              previousStatus: current.status,
+              workerPid: current.workerPid,
+              workerToken: current.workerToken,
+              launchState: "claimed",
+            },
+          }
+        : {
+            ...current.lifecycleState,
+            lifecycleKind: "detached_worker_v2",
+            activeTurn: undefined,
+            terminationBlocked: {
+              detectedAt: now,
+              reason: "Legacy detached worker ownership is incomplete; exact PID and token are both required.",
+            },
+          };
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set status = 'error', terminal_reason = 'unknown',
+          error = ?, error_code = 'DAEMON_UNAVAILABLE', error_retryable = 'true',
+          lifecycle_state = ?, updated_at = ?
+         where id = ? and status in ('starting', 'running') and updated_at = ?`,
+      ).run(message, JSON.stringify(lifecycleState), now, id, current.updatedAt);
+      const refreshed = this.getById(id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return reconcile.immediate();
+  }
+
   reconcileActiveRuns(message = "DevSpace restarted while this agent turn was running."): number {
-    const now = new Date().toISOString();
-    const result = this.database.sqlite
-      .prepare(
-        `update local_agent_sessions
-         set status = 'error', error = ?, error_code = 'DAEMON_UNAVAILABLE', error_retryable = 'true', updated_at = ?
-         where status in ('starting', 'running')`,
-      )
-      .run(message, now);
-    return Number(result.changes);
+    let reconciled = 0;
+    for (const record of this.list()) {
+      if (record.status !== "starting" && record.status !== "running") continue;
+      if (isDetachedLifecycle(record.lifecycleState)) {
+        const result = this.beginTerminationCAS({
+          agentId: record.id,
+          terminalReason: "unknown",
+          terminalStatus: "error",
+          error: message,
+          errorCode: "DAEMON_UNAVAILABLE",
+          errorRetryable: true,
+        });
+        if (result.applied) reconciled += 1;
+        continue;
+      }
+      const adopted = this.reconcileLegacyDetachedActiveCAS(record.id, message);
+      if (adopted.applied) {
+        reconciled += 1;
+        continue;
+      }
+      const current = adopted.current ?? record;
+      if (!isDetachedLifecycle(current.lifecycleState)) {
+        this.update(current.id, {
+          status: "error",
+          error: message,
+          errorCode: "DAEMON_UNAVAILABLE",
+          errorRetryable: true,
+        });
+        reconciled += 1;
+      }
+    }
+    return reconciled;
   }
 
   reconcileActiveRunsResult(
@@ -380,27 +1147,40 @@ export class LocalAgentStore {
   prepareWorker(id: string, workerToken: string): LocalAgentRecord {
     const current = this.getById(id);
     if (!current) throw new Error(`Unknown subagent id: ${id}`);
-    if (current.status !== "starting") {
+    const generation = current.lifecycleState?.activeTurn?.generation;
+    // Legacy/runtime-pool rows can be adopted when a detached worker is
+    // launched. Install one generation before the guarded preparation CAS so
+    // the worker path retains its historical behavior without weakening the
+    // detached ownership fence.
+    if (current.status === "starting" && !isDetachedLifecycle(current.lifecycleState) && !generation) {
+      const now = new Date().toISOString();
+      const adopted = this.update(id, {
+        lifecycleState: {
+          lifecycleKind: "detached_worker_v2",
+          activeTurn: {
+            generation: randomUUID(),
+            turnStartedAt: now,
+            launchState: "not_started",
+          },
+        },
+      });
+      return this.prepareWorker(adopted.id, workerToken);
+    }
+    if (current.status !== "starting" || !generation) {
       throw new Error(`Agent ${id} is ${current.status}, not starting.`);
     }
-    return this.update(id, {
-      workerPid: undefined,
-      workerToken,
-    });
+    const result = this.prepareWorkerCAS(id, generation, workerToken);
+    if (!result.applied || !result.current) throw new Error(`Agent ${id} worker preparation lost its generation guard.`);
+    return result.current;
   }
 
   claimWorker(id: string, workerToken: string, workerPid: number): LocalAgentRecord | undefined {
-    const now = new Date().toISOString();
-    const result = this.database.sqlite
-      .prepare(
-        `update local_agent_sessions set
-          status = 'running',
-          worker_pid = ?,
-          updated_at = ?
-         where id = ? and status = 'starting' and worker_token = ?`,
-      )
-      .run(workerPid, now, id, workerToken);
-    return result.changes === 1 ? this.getById(id) : undefined;
+    const current = this.getById(id);
+    const generation = current?.lifecycleState?.activeTurn?.generation
+      ?? current?.lifecycleState?.terminationPending?.generation;
+    if (!generation) return undefined;
+    const result = this.claimWorkerCAS(id, generation, workerToken, workerPid);
+    return result.applied ? result.current : undefined;
   }
 
   finishWorker(
@@ -415,54 +1195,23 @@ export class LocalAgentStore {
       scopeState?: ScopeState;
     },
   ): LocalAgentRecord {
-    const now = new Date().toISOString();
-    this.database.sqlite
-      .prepare(
-        `update local_agent_sessions set
-          provider_session_id = coalesce(?, provider_session_id),
-          status = ?,
-          latest_response = ?,
-          error = ?,
-          terminal_reason = ?,
-          scope_state = ?,
-          worker_pid = null,
-          worker_token = null,
-          updated_at = ?
-         where id = ? and status = 'running' and worker_token = ?`,
-      )
-      .run(
-        patch.providerSessionId ?? null,
-        patch.status,
-        patch.latestResponse ?? null,
-        patch.error ?? null,
-        patch.terminalReason ?? null,
-        patch.scopeState ?? null,
-        now,
-        id,
-        workerToken,
-      );
     const current = this.getById(id);
     if (!current) throw new Error(`Unknown subagent id: ${id}`);
-    return current;
+    const generation = current.lifecycleState?.activeTurn?.generation;
+    if (!generation) return current;
+    return this.finishTurnCAS({ ...patch, agentId: id, generation, workerToken }).current ?? current;
   }
 
   cancelActive(id: string): { previous: LocalAgentRecord; current: LocalAgentRecord } {
-    const cancel = this.database.sqlite.transaction(() => {
-      const previous = this.getById(id);
-      if (!previous) throw new Error(`Unknown subagent id: ${id}`);
-      if (previous.status !== "starting" && previous.status !== "running") {
-        return { previous, current: previous };
-      }
-      const current = this.update(id, {
-        status: "stopped",
-        workerPid: undefined,
-        workerToken: undefined,
-        error: "cancelled by operator",
-        terminalReason: "cancelled",
-      });
-      return { previous, current };
+    const previous = this.getById(id);
+    if (!previous) throw new Error(`Unknown subagent id: ${id}`);
+    const result = this.beginTerminationCAS({
+      agentId: id,
+      terminalReason: "cancelled",
+      terminalStatus: "stopped",
+      error: "cancelled by operator",
     });
-    return cancel.immediate();
+    return { previous: result.previous ?? previous, current: result.current ?? previous };
   }
 
   close(): void {
@@ -645,6 +1394,8 @@ function readLifecycleState(value: string | null | undefined): AgentLifecycleSta
   try {
     const parsed = JSON.parse(value) as Record<string, unknown>;
     const state: AgentLifecycleState = {};
+    const detached = parsed.lifecycleKind === "detached_worker_v2";
+    if (detached) state.lifecycleKind = "detached_worker_v2";
     if (Array.isArray(parsed.cumulativeChangedPaths)) {
       const paths = parsed.cumulativeChangedPaths.filter((entry): entry is string => typeof entry === "string");
       if (paths.length > 0) state.cumulativeChangedPaths = paths;
@@ -655,8 +1406,173 @@ function readLifecycleState(value: string | null | undefined): AgentLifecycleSta
       const baseline = readScopeBaseline(JSON.stringify(parsed.turnEndBaseline));
       if (baseline) state.turnEndBaseline = baseline;
     }
+    if (detached && typeof parsed.lastSettledGeneration === "string" && parsed.lastSettledGeneration) {
+      state.lastSettledGeneration = parsed.lastSettledGeneration;
+    }
+    const termination = readPhysicalTerminationState(parsed.termination);
+    if (termination) state.termination = termination;
+    if (!detached) {
+      const legacyActiveTurn = readLegacyActiveTurnState(parsed.activeTurn);
+      if (legacyActiveTurn) state.activeTurn = legacyActiveTurn;
+      return Object.keys(state).length > 0 ? state : undefined;
+    }
+
+    const activeTurn = readActiveTurnState(parsed.activeTurn);
+    const terminationPending = readTerminationPendingState(parsed.terminationPending);
+    const terminationBlocked = readTerminationBlockedState(parsed.terminationBlocked);
+    const activeLooking = parsed.activeTurn !== undefined && parsed.activeTurn !== null;
+    const pendingLooking = parsed.terminationPending !== undefined && parsed.terminationPending !== null;
+    const blockedLooking = parsed.terminationBlocked !== undefined && parsed.terminationBlocked !== null;
+    const authorityStateCount = Number(Boolean(activeTurn)) + Number(Boolean(terminationPending)) + Number(Boolean(terminationBlocked));
+    if (
+      parsed.lifecycleCorrupt === true ||
+      (activeLooking && !activeTurn) ||
+      (pendingLooking && !terminationPending) ||
+      (blockedLooking && !terminationBlocked) ||
+      authorityStateCount > 1
+    ) {
+      state.lifecycleCorrupt = true;
+    } else {
+      if (activeTurn) state.activeTurn = activeTurn;
+      if (terminationPending) state.terminationPending = terminationPending;
+      if (terminationBlocked) state.terminationBlocked = terminationBlocked;
+    }
     return Object.keys(state).length > 0 ? state : undefined;
   } catch {
+    return value.includes("detached_worker_v2")
+      ? { lifecycleKind: "detached_worker_v2", lifecycleCorrupt: true }
+      : undefined;
+  }
+}
+
+function readPhysicalTerminationState(value: unknown): PhysicalTerminationState | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record.terminationId !== "string" || typeof record.fencedAt !== "string") return undefined;
+  return {
+    pending: record.pending === true,
+    fencedAt: record.fencedAt,
+    reason: typeof record.reason === "string" ? record.reason as AgentTerminalReason : "unknown",
+    terminationId: record.terminationId,
+    previousWorkerPid: typeof record.previousWorkerPid === "number" ? record.previousWorkerPid : undefined,
+    previousWorkerToken: typeof record.previousWorkerToken === "string" ? record.previousWorkerToken : undefined,
+  };
+}
+
+function readLegacyActiveTurnState(value: unknown): ActiveTurnState | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (typeof record.turnStartedAt !== "string") return undefined;
+  return {
+    turnStartedAt: record.turnStartedAt,
+    executionStartedAt: typeof record.executionStartedAt === "string"
+      ? record.executionStartedAt
+      : undefined,
+  };
+}
+
+function readActiveTurnState(value: unknown): ActiveTurnState | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const launchState = readLaunchState(record.launchState);
+  if (
+    typeof record.generation !== "string" ||
+    !record.generation ||
+    typeof record.turnStartedAt !== "string" ||
+    !Number.isFinite(Date.parse(record.turnStartedAt)) ||
+    !launchState ||
+    (record.executionStartedAt !== undefined &&
+      (typeof record.executionStartedAt !== "string" || !Number.isFinite(Date.parse(record.executionStartedAt))))
+  ) {
     return undefined;
   }
+  return {
+    generation: record.generation,
+    turnStartedAt: record.turnStartedAt,
+    executionStartedAt: record.executionStartedAt as string | undefined,
+    launchState,
+  };
+}
+
+function readTerminationBlockedState(value: unknown): AgentLifecycleState["terminationBlocked"] {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.detectedAt !== "string" ||
+    !Number.isFinite(Date.parse(record.detectedAt)) ||
+    typeof record.reason !== "string" ||
+    !record.reason
+  ) {
+    return undefined;
+  }
+  return { detectedAt: record.detectedAt, reason: record.reason };
+}
+
+function readTerminationPendingState(value: unknown): TerminationPendingState | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const launchState = readLaunchState(record.launchState);
+  const reasons: AgentTerminalReason[] = [
+    "completed",
+    "cancelled",
+    "timeout",
+    "idle_timeout",
+    "scope_violation",
+    "provider_error",
+    "launch_failed",
+    "unknown",
+  ];
+  const reason = typeof record.reason === "string" && reasons.includes(record.reason as AgentTerminalReason)
+    ? record.reason as AgentTerminalReason
+    : undefined;
+  if (
+    typeof record.generation !== "string" ||
+    !record.generation ||
+    typeof record.requestedAt !== "string" ||
+    !Number.isFinite(Date.parse(record.requestedAt)) ||
+    !reason ||
+    (record.terminalStatus !== "error" && record.terminalStatus !== "stopped") ||
+    (record.previousStatus !== "starting" && record.previousStatus !== "running") ||
+    !launchState ||
+    (record.workerToken !== undefined && (typeof record.workerToken !== "string" || !record.workerToken)) ||
+    (record.workerPid !== undefined &&
+      (typeof record.workerPid !== "number" || !Number.isInteger(record.workerPid) || record.workerPid < 1)) ||
+    (record.lastAttemptAt !== undefined &&
+      (typeof record.lastAttemptAt !== "string" || !Number.isFinite(Date.parse(record.lastAttemptAt)))) ||
+    (record.lastFailure !== undefined && typeof record.lastFailure !== "string")
+  ) {
+    return undefined;
+  }
+  return {
+    generation: record.generation,
+    requestedAt: record.requestedAt,
+    reason,
+    terminalStatus: record.terminalStatus,
+    previousStatus: record.previousStatus,
+    workerToken: record.workerToken as string | undefined,
+    workerPid: record.workerPid as number | undefined,
+    launchState,
+    lastAttemptAt: record.lastAttemptAt as string | undefined,
+    lastFailure: record.lastFailure as string | undefined,
+  };
+}
+
+function readLaunchState(value: unknown): AgentTurnLaunchState | undefined {
+  return value === "not_started" || value === "launching" || value === "spawned" || value === "claimed"
+    ? value
+    : undefined;
+}
+
+function laterLaunchState(
+  current: AgentTurnLaunchState,
+  candidate: AgentTurnLaunchState,
+): AgentTurnLaunchState {
+  const order: AgentTurnLaunchState[] = ["not_started", "launching", "spawned", "claimed"];
+  return order.indexOf(candidate) > order.indexOf(current) ? candidate : current;
+}
+
+export function isDetachedLifecycle(
+  state: AgentLifecycleState | undefined,
+): state is AgentLifecycleState & { lifecycleKind: "detached_worker_v2" } {
+  return state?.lifecycleKind === "detached_worker_v2";
 }

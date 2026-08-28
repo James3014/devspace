@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import type { ServerConfig } from "./config.js";
 import {
   createLocalAgentStore,
+  isDetachedLifecycle,
   LocalAgentReplayConflictError,
   LocalAgentStore,
   type LocalAgentRecord,
@@ -20,7 +21,7 @@ import {
   resolveLocalAgentProviderExecutable,
 } from "./local-agent-availability.js";
 import { runLocalAgentProvider } from "./local-agent-adapters.js";
-import { LocalAgentProviderError, type LocalAgentRunResult } from "./local-agent-runtime.js";
+import { LocalAgentProviderError, type LocalAgentRunCallbacks, type LocalAgentRunResult } from "./local-agent-runtime.js";
 import { terminateProcessTree, type KillableProcess } from "./process-platform.js";
 import {
   type AgentTerminalReason,
@@ -54,6 +55,9 @@ export type AgentErrorCode =
   | "UNKNOWN_AGENT"
   | "AGENT_WORKSPACE_MISMATCH"
   | "AGENT_ALREADY_RUNNING"
+  | "AGENT_TERMINATION_PENDING"
+  | "AGENT_LIFECYCLE_CORRUPT"
+  | "AGENT_LIFECYCLE_UNSUPPORTED"
   | "INVALID_WAIT_MS"
   | "WORKER_LAUNCH_FAILED"
   | "WORKER_TERMINATION_FAILED"
@@ -148,6 +152,7 @@ export interface ListAgentsInput {
 export const AGENT_STATUS_MAX_WAIT_MS = 15_000;
 export const AGENT_LIST_DEFAULT_LIMIT = 20;
 export const AGENT_LIST_MAX_LIMIT = 100;
+const TERMINATION_RETRY_BACKOFF_MS = 30_000;
 
 export interface AgentStatusOutput {
   agentId: string;
@@ -172,6 +177,15 @@ export interface AgentStatusOutput {
   changedPaths?: string[];
   terminalReason?: AgentTerminalReason;
   scopeState?: ScopeState;
+  termination?: {
+    pending: boolean;
+    generation?: string;
+    requestedAt?: string;
+    failure?: string;
+    corrupt?: boolean;
+    blocked?: boolean;
+    reason?: string;
+  };
 }
 
 export interface ReconcileAgentInput {
@@ -261,6 +275,8 @@ export interface AgentSummary {
   model?: string;
   effort?: string;
   status: LocalAgentStatus;
+  terminationPending?: boolean;
+  terminationBlocked?: boolean;
   updatedAt: string;
 }
 
@@ -273,6 +289,20 @@ interface LifecycleEvidence {
   changedPaths?: string[];
   terminalReason?: AgentTerminalReason;
   scopeState?: ScopeState;
+}
+
+function computeSessionTiming(record: LocalAgentRecord, now = Date.now()): { wallMs: number; idleMs: number } {
+  const createdAtMs = Date.parse(record.createdAt);
+  const updatedAtMs = Date.parse(record.updatedAt);
+  const terminalStable = isTerminalStatus(record.status) &&
+    !record.lifecycleState?.terminationPending &&
+    !record.lifecycleState?.lifecycleCorrupt &&
+    !record.lifecycleState?.terminationBlocked;
+  const referenceMs = terminalStable ? updatedAtMs : now;
+  return {
+    wallMs: Math.max(0, referenceMs - createdAtMs),
+    idleMs: terminalStable ? 0 : Math.max(0, now - updatedAtMs),
+  };
 }
 
 export interface StartAgentOutput {
@@ -298,12 +328,17 @@ export interface ContinueAgentOutput extends StartAgentOutput {
  * Async contract: resolves when the worker process has successfully spawned,
  * rejects if the OS-level spawn fails. Does NOT wait for the worker to finish.
  */
-export type WorkerLauncher = (agentId: string, promptFile: string, workerToken: string) => Promise<void>;
+export type WorkerLauncher = (
+  agentId: string,
+  promptFile: string,
+  workerToken: string,
+) => Promise<number | void>;
 export type WorkerTerminator = (record: LocalAgentRecord) => Promise<boolean>;
 export type AgentTurnRunner = (
   profile: LocalAgentProfile | undefined,
   record: LocalAgentRecord,
   prompt: string,
+  callbacks?: LocalAgentRunCallbacks,
 ) => Promise<LocalAgentRunResult>;
 
 // ─── Owned temp cleanup ──────────────────────────────────────────────────────
@@ -345,6 +380,7 @@ export class LocalAgentSessionManager {
   private readonly terminator: WorkerTerminator;
   private readonly turnRunner?: AgentTurnRunner;
   private closed = false;
+  private readonly terminationAttempts = new Map<string, Promise<boolean>>();
 
   constructor(
     private readonly config: ServerConfig,
@@ -481,6 +517,7 @@ export class LocalAgentSessionManager {
           effort: profile.effort,
           executionContract,
           startReplay: replayBinding,
+          lifecycleKind: "detached_worker_v2",
         });
         record = result.record;
         created = result.created;
@@ -493,6 +530,7 @@ export class LocalAgentSessionManager {
           model: profile.model,
           effort: profile.effort,
           executionContract,
+          lifecycleKind: "detached_worker_v2",
         });
       }
     } catch (error) {
@@ -523,7 +561,7 @@ export class LocalAgentSessionManager {
     const { workspaceId: _workspaceId, workspaceRoot, agentId, prompt } = input;
 
     // Exact id lookup only (no prefix matching through MCP)
-    const record = this.store.getById(agentId);
+    let record = this.store.getById(agentId);
     if (!record) {
       throw new AgentSessionError("UNKNOWN_AGENT", `Unknown agent id: ${agentId}`);
     }
@@ -535,10 +573,34 @@ export class LocalAgentSessionManager {
       );
     }
 
+    if (!isDetachedLifecycle(record.lifecycleState)) {
+      throw new AgentSessionError(
+        "AGENT_LIFECYCLE_UNSUPPORTED",
+        `Agent ${agentId} is owned by the legacy/runtime-pool lifecycle and cannot be continued by detached-worker v2.`,
+      );
+    }
+    if (record.lifecycleState?.terminationPending) {
+      throw new AgentSessionError(
+        "AGENT_TERMINATION_PENDING",
+        `Agent ${agentId} has physical termination pending for generation ${record.lifecycleState.terminationPending.generation}.`,
+      );
+    }
+    if (record.lifecycleState?.lifecycleCorrupt || record.lifecycleState?.terminationBlocked) {
+      throw new AgentSessionError(
+        "AGENT_LIFECYCLE_CORRUPT",
+        `Agent ${agentId} has malformed durable lifecycle evidence; continuation is blocked.`,
+      );
+    }
     if (record.status === "starting" || record.status === "running") {
       throw new AgentSessionError(
         "AGENT_ALREADY_RUNNING",
         `Agent ${agentId} is currently ${record.status}. Wait for it to complete before continuing.`,
+      );
+    }
+    if (record.lifecycleState?.activeTurn) {
+      throw new AgentSessionError(
+        "AGENT_LIFECYCLE_CORRUPT",
+        `Agent ${agentId} has a terminal status with an unsettled active turn; continuation is blocked.`,
       );
     }
 
@@ -613,13 +675,34 @@ export class LocalAgentSessionManager {
       );
     }
 
-    // Preserve provider/profile/session identity; reset response/error; restart
-    // Note: workspaceId is NOT updated to preserve original workspaceId provenance.
-    this.store.update(record.id, {
-      status: "starting",
-      latestResponse: undefined,
-      error: undefined,
+    // Revalidate the same durable row after the read-only admission work. One
+    // exact CAS installs one new opaque turn generation; concurrent continues
+    // cannot both acquire execution authority.
+    const begun = this.store.beginContinuationCAS({
+      agentId: record.id,
+      expectedPreviousGeneration: record.lifecycleState?.lastSettledGeneration,
+      expectedUpdatedAt: record.updatedAt,
+      turnStartedAt: new Date().toISOString(),
     });
+    if (!begun.applied) {
+      const current = begun.current;
+      if (current?.lifecycleState?.terminationPending) {
+        throw new AgentSessionError(
+          "AGENT_TERMINATION_PENDING",
+          `Agent ${agentId} entered physical termination while continuation admission was being checked.`,
+        );
+      }
+      if (current?.lifecycleState?.lifecycleCorrupt) {
+        throw new AgentSessionError(
+          "AGENT_LIFECYCLE_CORRUPT",
+          `Agent ${agentId} has malformed durable lifecycle evidence; continuation is blocked.`,
+        );
+      }
+      throw new AgentSessionError(
+        "CONTINUATION_ADMISSION_FAILED",
+        `Continuation of agent ${agentId} lost its durable admission CAS before mutation.`,
+      );
+    }
 
     await this.launchPrompt(record.id, prompt);
     const updated = this.store.getById(record.id) ?? record;
@@ -651,9 +734,9 @@ export class LocalAgentSessionManager {
       );
     }
 
-    if (waitMs > 0 && isActiveStatus(record.status)) {
+    if (waitMs > 0 && occupiesDetachedExecutionSlot(record)) {
       const deadline = Date.now() + waitMs;
-      while (isActiveStatus(record.status) && Date.now() < deadline) {
+      while (occupiesDetachedExecutionSlot(record) && Date.now() < deadline) {
         await sleep(Math.min(300, deadline - Date.now()));
         record = this.store.getById(agentId) ?? record;
       }
@@ -664,7 +747,7 @@ export class LocalAgentSessionManager {
 
   async cancelAgent(input: CancelAgentInput): Promise<AgentStatusOutput> {
     const { workspaceRoot, agentId } = input;
-    const record = this.store.getById(agentId);
+    let record = this.store.getById(agentId);
     if (!record) {
       throw new AgentSessionError("UNKNOWN_AGENT", `Unknown agent id: ${agentId}`);
     }
@@ -675,19 +758,39 @@ export class LocalAgentSessionManager {
       );
     }
 
-    const { previous, current } = this.store.cancelActive(agentId);
-    if (previous.status === "starting" || previous.status === "running") {
-      const terminated = await this.terminator(previous);
-      if (!terminated) {
-        this.store.update(agentId, {
-          error: "cancellation persisted but owned worker termination could not be verified",
-        });
-        throw new AgentSessionError(
-          "WORKER_TERMINATION_FAILED",
-          `Agent ${agentId} is stopped, but its owned worker process could not be verified as terminated.`,
-        );
-      }
+    if (!isDetachedLifecycle(record.lifecycleState) && isActiveStatus(record.status)) {
+      record = this.store.reconcileLegacyDetachedActiveCAS(agentId).current ?? record;
     }
+    if (!isDetachedLifecycle(record.lifecycleState)) {
+      throw new AgentSessionError(
+        "AGENT_LIFECYCLE_UNSUPPORTED",
+        `Agent ${agentId} is owned by the legacy/runtime-pool lifecycle and cannot be cancelled by detached-worker v2.`,
+      );
+    }
+    if (record.lifecycleState?.lifecycleCorrupt || record.lifecycleState?.terminationBlocked) {
+      throw new AgentSessionError(
+        "AGENT_LIFECYCLE_CORRUPT",
+        `Agent ${agentId} has malformed durable lifecycle evidence; exact cancellation target is unknown.`,
+      );
+    }
+    if (!isActiveStatus(record.status) && !record.lifecycleState?.terminationPending) {
+      return recordToStatusOutput(record);
+    }
+    const terminated = await this.terminateActiveAgent(
+      agentId,
+      "cancelled",
+      "cancelled by operator",
+      undefined,
+      undefined,
+      "stopped",
+    );
+    if (!terminated) {
+      throw new AgentSessionError(
+        "WORKER_TERMINATION_FAILED",
+        `Agent ${agentId} is stopped, but its owned worker process could not be verified as terminated.`,
+      );
+    }
+    const current = this.store.getById(agentId) ?? record;
     return recordToStatusOutput(current);
   }
 
@@ -895,7 +998,9 @@ export class LocalAgentSessionManager {
       delta.attribution,
     );
 
-    const { wallMs, idleMs } = computeSessionTiming(record);
+    const startedAtMs = Date.parse(record.createdAt);
+    const updatedAtMs = Date.parse(record.updatedAt);
+    const now = Date.now();
 
     return {
       agentId: record.id,
@@ -918,8 +1023,8 @@ export class LocalAgentSessionManager {
         startedAt: record.createdAt,
         lastActivityAt: record.updatedAt,
         lastFileMutationAt: physical.lastFileMutationAt,
-        wallMs,
-        idleMs,
+        wallMs: Math.max(0, now - startedAtMs),
+        idleMs: Math.max(0, now - updatedAtMs),
       },
     };
   }
@@ -933,22 +1038,78 @@ export class LocalAgentSessionManager {
   async superviseActiveAgents(): Promise<void> {
     const now = Date.now();
     for (const record of this.store.list()) {
+      if (!isDetachedLifecycle(record.lifecycleState)) {
+        if (isActiveStatus(record.status)) {
+          const reconciled = this.store.reconcileLegacyDetachedActiveCAS(record.id);
+          const adopted = reconciled.current;
+          if (reconciled.applied && adopted?.lifecycleState?.terminationPending) {
+            await this.drivePendingTermination(adopted);
+          }
+        }
+        continue;
+      }
+      if (record.lifecycleState?.lifecycleCorrupt || record.lifecycleState?.terminationBlocked) {
+        continue;
+      }
+      if (record.lifecycleState?.terminationPending) {
+        if (shouldRetryPendingTermination(record, now)) {
+          await this.drivePendingTermination(record);
+        }
+        continue;
+      }
       if (record.status !== "running" && record.status !== "starting") continue;
       const contract = record.executionContract;
       if (!contract) continue;
 
-      // `updatedAt` is refreshed when each worker turn is prepared/claimed.
-      // A durable provider conversation may be continued long after the agent
-      // record was first created, so maxWallMs must fence the active turn rather
-      // than the lifetime of the durable session.
-      const activeTurnStartedAtMs = Date.parse(record.updatedAt);
-      if (contract.maxWallMs && now - activeTurnStartedAtMs > contract.maxWallMs) {
+      // Active turn phase timestamps are persisted in `lifecycleState.activeTurn`.
+      // `updatedAt` is not an authoritative phase clock.
+      const activeTurn = record.lifecycleState?.activeTurn;
+      const turnStartedAtMs = activeTurn?.turnStartedAt
+        ? Date.parse(activeTurn.turnStartedAt)
+        : Date.parse(record.updatedAt);
+      const executionStartedAtMs = activeTurn?.executionStartedAt
+        ? Date.parse(activeTurn.executionStartedAt)
+        : undefined;
+
+      // 1. maxWallMs: Whole-turn hard ceiling (turnStartedAt -> terminal)
+      if (contract.maxWallMs && now - turnStartedAtMs > contract.maxWallMs) {
         await this.terminateActiveAgent(
           record.id,
           "timeout",
           `Agent exceeded execution contract maxWallMs of ${contract.maxWallMs}ms.`,
+          "any",
+          contract.maxWallMs,
         );
         continue;
+      }
+
+      // 2. maxStartupMs: Startup/readiness bound (turnStartedAt -> executionStartedAt)
+      if (contract.maxStartupMs && executionStartedAtMs === undefined) {
+        if (now - turnStartedAtMs > contract.maxStartupMs) {
+          await this.terminateActiveAgent(
+            record.id,
+            "timeout",
+            `Agent exceeded execution contract maxStartupMs of ${contract.maxStartupMs}ms during startup/readiness.`,
+            "startup",
+            contract.maxStartupMs,
+          );
+          continue;
+        }
+      }
+
+      // 3. maxExecutionMs: Semantic execution bound (executionStartedAt -> terminal)
+      // Must not fire if executionStartedAt is not yet established.
+      if (contract.maxExecutionMs && executionStartedAtMs !== undefined) {
+        if (now - executionStartedAtMs > contract.maxExecutionMs) {
+          await this.terminateActiveAgent(
+            record.id,
+            "timeout",
+            `Agent exceeded execution contract maxExecutionMs of ${contract.maxExecutionMs}ms during execution.`,
+            "execution",
+            contract.maxExecutionMs,
+          );
+          continue;
+        }
       }
 
       if ((contract.writePaths?.length || contract.maxFiles !== undefined) && record.status === "running") {
@@ -976,11 +1137,11 @@ export class LocalAgentSessionManager {
     }
   }
 
-  /** Number of agents currently starting or running. */
+  /** Number of agents holding an execution slot, including physical cleanup. */
   runningCount(): number {
     return this.store
       .list()
-      .filter((record) => record.status === "starting" || record.status === "running").length;
+      .filter(occupiesDetachedExecutionSlot).length;
   }
 
   private hasExecutionCapacity(): boolean {
@@ -993,7 +1154,7 @@ export class LocalAgentSessionManager {
     record: LocalAgentRecord,
   ): Promise<LifecycleEvidence | undefined> {
     const physical = await inspectWorkspacePhysicalState(record.workspaceRoot);
-    const { wallMs, idleMs } = computeSessionTiming(record);
+    const timing = computeSessionTiming(record);
 
     const changedPaths = record.scopeBaseline
       ? computeWorkerDelta(physical, record.scopeBaseline).changedPaths
@@ -1003,8 +1164,8 @@ export class LocalAgentSessionManager {
       startedAt: record.createdAt,
       lastActivityAt: record.updatedAt,
       lastFileMutationAt: physical.lastFileMutationAt,
-      wallMs,
-      idleMs,
+      wallMs: timing.wallMs,
+      idleMs: timing.idleMs,
       changedPaths: physical.gitAvailable ? changedPaths : undefined,
       terminalReason: record.terminalReason,
       scopeState: record.scopeState,
@@ -1067,25 +1228,105 @@ export class LocalAgentSessionManager {
     agentId: string,
     reason: AgentTerminalReason,
     message: string,
-  ): Promise<void> {
-    const record = this.store.getById(agentId);
-    if (!record) return;
-    const wasActive = record.status === "starting" || record.status === "running";
-    const terminated = wasActive ? await this.terminator(record) : true;
-    const scopeState: ScopeState | undefined =
-      reason === "scope_violation" ? "SCOPE_VIOLATION" : record.scopeState;
-    this.store.update(agentId, {
-      status: "error",
-      workerPid: undefined,
-      workerToken: undefined,
-      error: message,
+    expectedPhase?: "startup" | "execution" | "any",
+    budgetMs?: number,
+    terminalStatus: "error" | "stopped" = "error",
+  ): Promise<boolean> {
+    const fenceResult = this.store.beginTerminationCAS({
+      agentId,
       terminalReason: reason,
-      scopeState,
+      error: message,
+      expectedPhase,
+      budgetMs,
+      terminalStatus,
     });
-    if (!terminated) {
-      this.store.update(agentId, {
-        error: `${message} Worker termination could not be verified.`,
-      });
+    const fenced = fenceResult.current;
+    if (!fenced?.lifecycleState?.terminationPending) {
+      // A normal completion or a phase transition may have won the fence CAS.
+      return true;
+    }
+    return this.drivePendingTermination(fenced);
+  }
+
+  private async drivePendingTermination(record: LocalAgentRecord): Promise<boolean> {
+    if (
+      !isDetachedLifecycle(record.lifecycleState) ||
+      record.lifecycleState?.lifecycleCorrupt ||
+      record.lifecycleState?.terminationBlocked
+    ) {
+      return false;
+    }
+    const pending = record.lifecycleState?.terminationPending;
+    if (!pending) return true;
+    const attemptKey = `${record.id}:${pending.generation}`;
+    const existing = this.terminationAttempts.get(attemptKey);
+    if (existing) return existing;
+
+    const attempt = (async () => {
+      let terminated = false;
+      let failureDetail: string | undefined;
+      try {
+        terminated = await this.terminator(record);
+      } catch (error) {
+        failureDetail = error instanceof Error ? error.message : String(error);
+      }
+      if (!terminated) {
+        const failure = `${record.error ?? "Termination requested."} Worker termination could not be verified.${
+          failureDetail ? ` ${failureDetail}` : ""
+        }`;
+        this.store.recordTerminationFailureCAS({
+          agentId: record.id,
+          generation: pending.generation,
+          workerPid: pending.workerPid,
+          workerToken: pending.workerToken,
+          failure,
+        });
+        return false;
+      }
+
+      try {
+        // Physical absence is necessary but not sufficient. The post-kill
+        // workspace snapshot and cumulative scope evidence are committed in
+        // the same CAS that releases the slot and worker identity.
+        const endState = await inspectWorkspacePhysicalState(record.workspaceRoot);
+        const scope = await this.computeCumulativeScopeEvidence(record.id);
+        const completed = this.store.completeTerminationCAS({
+          agentId: record.id,
+          generation: pending.generation,
+          workerPid: pending.workerPid,
+          workerToken: pending.workerToken,
+          turnEndBaseline: {
+            changedPaths: endState.changedPaths,
+            head: endState.head ?? null,
+            fingerprints: endState.fingerprints,
+          },
+          cumulativeChangedPaths: scope.workerChangedPaths,
+          scopeState: scope.scopeState,
+        });
+        if (completed.applied) return true;
+        const current = this.store.getById(record.id);
+        return current?.lifecycleState?.terminationPending?.generation !== pending.generation;
+      } catch (error) {
+        const failure = `Physical termination was verified, but post-termination evidence could not be finalized: ${
+          error instanceof Error ? error.message : String(error)
+        }`;
+        this.store.recordTerminationFailureCAS({
+          agentId: record.id,
+          generation: pending.generation,
+          workerPid: pending.workerPid,
+          workerToken: pending.workerToken,
+          failure,
+        });
+        return false;
+      }
+    })();
+    this.terminationAttempts.set(attemptKey, attempt);
+    try {
+      return await attempt;
+    } finally {
+      if (this.terminationAttempts.get(attemptKey) === attempt) {
+        this.terminationAttempts.delete(attemptKey);
+      }
     }
   }
 
@@ -1097,16 +1338,27 @@ export class LocalAgentSessionManager {
   async runWorkerTurnFromFile(agentId: string, promptFile: string, workerToken: string): Promise<void> {
     const initial = this.store.getById(agentId);
     if (!initial) throw new Error(`Unknown subagent id: ${agentId}`);
-
-    const claimed = this.store.claimWorker(agentId, workerToken, process.pid);
-    if (!claimed) {
+    const generation = initial.lifecycleState?.activeTurn?.generation
+      ?? initial.lifecycleState?.terminationPending?.generation;
+    if (!generation) {
+      cleanupOwnedPromptFile(promptFile);
+      return;
+    }
+    const claim = this.store.claimWorkerCAS(agentId, generation, workerToken, process.pid);
+    const claimed = claim.current;
+    if (
+      !claim.applied ||
+      !claimed ||
+      claimed.status !== "running" ||
+      claimed.lifecycleState?.activeTurn?.generation !== generation
+    ) {
       cleanupOwnedPromptFile(promptFile);
       return;
     }
 
+    const prompt = await readFile(promptFile, "utf8");
     let scratch: ScratchHandle | undefined;
     try {
-      const prompt = await readFile(promptFile, "utf8");
       // Containment gate (fail closed): the workspace root must resolve to its
       // canonical physical path and stay inside a configured allowed root.
       // Git linked worktrees remain legitimate: canonicalization resolves their
@@ -1127,23 +1379,42 @@ export class LocalAgentSessionManager {
       // physical diff as candidate evidence even when no execution contract
       // bounds writes (e.g. a manually started agent with no writePaths/maxFiles).
       const state = await inspectWorkspacePhysicalState(claimed.workspaceRoot);
-      this.store.update(claimed.id, {
+      const baseline = this.store.updateTurnEvidenceCAS(claimed.id, generation, workerToken, {
         scopeBaseline: {
           changedPaths: state.changedPaths,
           head: state.head ?? null,
           fingerprints: state.fingerprints,
         },
       });
+      if (!baseline.applied) {
+        throw new Error(`Agent ${claimed.id} lost turn generation before baseline capture.`);
+      }
 
       const profiles = await loadLocalAgentProfiles(this.config, claimed.workspaceRoot);
       const profile = profiles.find((p) => p.name === claimed.profileName);
+      const callbacks: LocalAgentRunCallbacks = {
+        onExecutionStarted: () => {
+          this.store.markExecutionStarted(claimed.id, workerToken, undefined, generation);
+        },
+        onSessionId: (providerSessionId) => {
+          const bound = this.store.bindProviderSessionCAS(
+            claimed.id,
+            generation,
+            workerToken,
+            providerSessionId,
+          );
+          if (!bound.applied) {
+            throw new Error(`Agent ${claimed.id} is no longer active under its turn generation.`);
+          }
+        },
+      };
       let result: LocalAgentRunResult;
       if (this.turnRunner) {
-        result = await this.turnRunner(profile, claimed, prompt);
+        result = await this.turnRunner(profile, claimed, prompt, callbacks);
       } else if (profile) {
-        result = await runLocalAgentProfile(this.config, profile, claimed, prompt, scratch);
+        result = await runLocalAgentProfile(this.config, profile, claimed, prompt, scratch, callbacks);
       } else {
-        result = await runRawLocalAgentProvider(this.config, claimed, prompt, scratch);
+        result = await runRawLocalAgentProvider(this.config, claimed, prompt, scratch, callbacks);
       }
 
       // End-of-turn snapshot: everything that changed after this point is no
@@ -1159,7 +1430,10 @@ export class LocalAgentSessionManager {
       const scopeViolated = scope.scopeState === "SCOPE_VIOLATION";
       const cumulative = new Set(this.store.getById(claimed.id)?.lifecycleState?.cumulativeChangedPaths ?? []);
       for (const path of scope.workerChangedPaths ?? []) cumulative.add(path);
-      this.store.finishWorker(agentId, workerToken, {
+      this.store.finishTurnCAS({
+        agentId,
+        generation,
+        workerToken,
         providerSessionId: result.providerSessionId ?? undefined,
         status: "idle",
         latestResponse: result.finalResponse,
@@ -1168,20 +1442,20 @@ export class LocalAgentSessionManager {
           : undefined,
         terminalReason: scopeViolated ? "scope_violation" : "completed",
         scopeState: scope.scopeState,
-      });
-      this.store.update(agentId, {
-        lifecycleState: {
-          ...this.store.getById(agentId)?.lifecycleState,
-          cumulativeChangedPaths: [...cumulative].sort(),
-          turnEndBaseline,
-        },
+        cumulativeChangedPaths: [...cumulative].sort(),
+        turnEndBaseline,
       });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       const scope = await this.computeCumulativeScopeEvidence(agentId);
-      this.store.finishWorker(agentId, workerToken, {
+      const endState = await inspectWorkspacePhysicalState(
+        this.store.getById(agentId)?.workspaceRoot ?? claimed.workspaceRoot,
+      ).catch(() => undefined);
+      this.store.failTurnCAS({
+        agentId,
+        generation,
+        workerToken,
         providerSessionId: error instanceof LocalAgentProviderError ? error.providerSessionId : undefined,
-        status: "error",
         latestResponse: error instanceof LocalAgentProviderError ? error.finalResponse : undefined,
         error: message,
         terminalReason:
@@ -1191,22 +1465,15 @@ export class LocalAgentSessionManager {
               ? "provider_error"
               : classifyProviderError(message),
         scopeState: scope.scopeState,
-      });
-      const endState = await inspectWorkspacePhysicalState(
-        this.store.getById(agentId)?.workspaceRoot ?? claimed.workspaceRoot,
-      ).catch(() => undefined);
-      if (endState) {
-        this.store.update(agentId, {
-          lifecycleState: {
-            ...this.store.getById(agentId)?.lifecycleState,
-            turnEndBaseline: {
+        cumulativeChangedPaths: scope.workerChangedPaths,
+        turnEndBaseline: endState
+          ? {
               changedPaths: endState.changedPaths,
               head: endState.head ?? null,
               fingerprints: endState.fingerprints,
-            },
-          },
-        });
-      }
+            }
+          : undefined,
+      });
     } finally {
       cleanupOwnedPromptFile(promptFile);
       if (scratch) {
@@ -1239,7 +1506,22 @@ export class LocalAgentSessionManager {
     if (!record) {
       throw new AgentSessionError("UNKNOWN_AGENT", `Unknown agent id: ${agentId}`);
     }
-    if (isActiveStatus(record.status)) {
+    if (isDetachedLifecycle(record.lifecycleState) && record.lifecycleState?.terminationPending) {
+      throw new AgentSessionError(
+        "AGENT_TERMINATION_PENDING",
+        `Agent ${agentId} has physical termination pending; scratch cleanup is blocked.`,
+      );
+    }
+    if (
+      isDetachedLifecycle(record.lifecycleState) &&
+      (record.lifecycleState?.lifecycleCorrupt || record.lifecycleState?.terminationBlocked)
+    ) {
+      throw new AgentSessionError(
+        "AGENT_LIFECYCLE_CORRUPT",
+        `Agent ${agentId} has blocked or corrupt detached lifecycle evidence; scratch cleanup is blocked.`,
+      );
+    }
+    if (isDetachedLifecycle(record.lifecycleState) ? occupiesDetachedExecutionSlot(record) : isActiveStatus(record.status)) {
       throw new AgentSessionError(
         "AGENT_ALREADY_RUNNING",
         `Agent ${agentId} is ${record.status}: refusing destructive cleanup while its owned worker is active.`,
@@ -1276,16 +1558,40 @@ export class LocalAgentSessionManager {
    */
   async spawnWorker(agentId: string, promptFile: string): Promise<void> {
     const workerToken = randomUUID();
-    this.store.prepareWorker(agentId, workerToken);
+    const current = this.store.getById(agentId);
+    const generation = current?.lifecycleState?.activeTurn?.generation;
+    if (!generation) throw new Error(`Agent ${agentId} has no active turn to launch.`);
+    const prepared = this.store.prepareWorkerCAS(agentId, generation, workerToken);
+    if (!prepared.applied) throw new Error(`Agent ${agentId} lost its turn generation before launch.`);
     try {
-      await this.launcher(agentId, promptFile, workerToken);
+      const workerPid = await this.launcher(agentId, promptFile, workerToken);
+      const spawned = this.store.markWorkerSpawnedCAS(
+        agentId,
+        generation,
+        workerToken,
+        typeof workerPid === "number" ? workerPid : undefined,
+      );
+      if (spawned.current?.lifecycleState?.terminationPending?.generation === generation) {
+        await this.drivePendingTermination(spawned.current);
+      }
     } catch (error) {
-      this.store.update(agentId, {
-        status: "error",
-        workerPid: undefined,
-        workerToken: undefined,
-        error: `Worker launch failed: ${error instanceof Error ? error.message : String(error)}`,
-      });
+      const message = `Worker launch failed: ${error instanceof Error ? error.message : String(error)}`;
+      const failed = this.store.failLaunchCAS(agentId, generation, workerToken, message);
+      const pending = failed.current?.lifecycleState?.terminationPending;
+      if (pending?.generation === generation && pending.launchState === "launching" && !pending.workerPid) {
+        const endState = await inspectWorkspacePhysicalState(failed.current!.workspaceRoot);
+        this.store.completeTerminationCAS({
+          agentId,
+          generation,
+          workerPid: pending.workerPid,
+          workerToken: pending.workerToken,
+          turnEndBaseline: {
+            changedPaths: endState.changedPaths,
+            head: endState.head ?? null,
+            fingerprints: endState.fingerprints,
+          },
+        });
+      }
       throw error;
     }
   }
@@ -1302,7 +1608,7 @@ export class LocalAgentSessionManager {
    * Create a new raw store record (for CLI use without profile).
    */
   createRecord(input: Parameters<LocalAgentStore["create"]>[0]): LocalAgentRecord {
-    return this.store.create(input);
+    return this.store.create({ ...input, lifecycleKind: "detached_worker_v2" });
   }
 }
 
@@ -1310,22 +1616,6 @@ export class LocalAgentSessionManager {
 
 export function isTerminalStatus(status: LocalAgentStatus): boolean {
   return status === "idle" || status === "error" || status === "stopped";
-}
-
-export function computeSessionTiming(record: LocalAgentRecord): { wallMs: number; idleMs: number } {
-  const startedAtMs = Date.parse(record.createdAt);
-  const updatedAtMs = Date.parse(record.updatedAt);
-  const isTerminal = isTerminalStatus(record.status);
-  const referenceMs = isTerminal ? updatedAtMs : Date.now();
-  const wallMs = Number.isFinite(startedAtMs) && Number.isFinite(referenceMs)
-    ? Math.max(0, referenceMs - startedAtMs)
-    : 0;
-  const idleMs = isTerminal
-    ? 0
-    : Number.isFinite(updatedAtMs) && Number.isFinite(referenceMs)
-      ? Math.max(0, referenceMs - updatedAtMs)
-      : 0;
-  return { wallMs, idleMs };
 }
 
 export function isReadinessPositive(value: ReadinessValue): boolean {
@@ -1385,7 +1675,7 @@ function writeAgentPromptFile(prompt: string): string {
   return filePath;
 }
 
-function defaultWorkerLauncher(agentId: string, promptFile: string, workerToken: string): Promise<void> {
+function defaultWorkerLauncher(agentId: string, promptFile: string, workerToken: string): Promise<number> {
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
@@ -1407,8 +1697,12 @@ function defaultWorkerLauncher(agentId: string, promptFile: string, workerToken:
       },
     );
     child.on("spawn", () => {
+      if (!child.pid) {
+        reject(new Error(`Worker process for ${agentId} spawned without an observable PID.`));
+        return;
+      }
       child.unref();
-      resolve();
+      resolve(child.pid);
     });
     child.on("error", (err) => {
       reject(err);
@@ -1484,7 +1778,9 @@ export function getWorkerProcessOwnership(
 async function terminateOwnedWorker(record: LocalAgentRecord): Promise<boolean> {
   const pid = record.workerPid;
   const workerToken = record.workerToken;
-  if (!pid || !workerToken) return true;
+  if (!pid || !workerToken) {
+    return record.lifecycleState?.terminationPending?.launchState === "not_started";
+  }
 
   const initialOwnership = getWorkerProcessOwnership(pid, record.id, workerToken);
   if (initialOwnership === "absent") {
@@ -1543,20 +1839,25 @@ async function runLocalAgentProfile(
   record: LocalAgentRecord,
   prompt?: string,
   scratch?: ScratchHandle,
+  callbacks?: LocalAgentRunCallbacks,
 ): Promise<LocalAgentRunResult> {
   const effectivePrompt = prompt ?? "";
   const body = profile.body.trim();
   const fullPrompt = body ? `${body}\n\nTask:\n${effectivePrompt}` : effectivePrompt;
   const environment = providerEnvironment(config, record, scratch);
-  return runLocalAgentProvider(profile.provider, {
-    prompt: fullPrompt,
-    workspaceRoot: record.workspaceRoot,
-    providerSessionId: record.providerSessionId,
-    writeMode: profile.write_mode === "allowed" ? "allowed" : "read_only",
-    model: record.model ?? profile.model,
-    effort: record.effort ?? profile.effort,
-    environment,
-  });
+  return runLocalAgentProvider(
+    profile.provider,
+    {
+      prompt: fullPrompt,
+      workspaceRoot: record.workspaceRoot,
+      providerSessionId: record.providerSessionId,
+      writeMode: profile.write_mode === "allowed" ? "allowed" : "read_only",
+      model: record.model ?? profile.model,
+      effort: record.effort ?? profile.effort,
+      environment,
+    },
+    callbacks,
+  );
 }
 
 async function runRawLocalAgentProvider(
@@ -1564,21 +1865,26 @@ async function runRawLocalAgentProvider(
   record: LocalAgentRecord,
   prompt?: string,
   scratch?: ScratchHandle,
+  callbacks?: LocalAgentRunCallbacks,
 ): Promise<LocalAgentRunResult> {
   const { isLocalAgentProvider } = await import("./local-agent-profiles.js");
   if (record.profileName !== record.provider || !isLocalAgentProvider(record.provider)) {
     throw new Error(`Subagent profile not found: ${record.profileName}`);
   }
   const environment = providerEnvironment(config, record, scratch);
-  return runLocalAgentProvider(record.provider, {
-    prompt: prompt ?? "",
-    workspaceRoot: record.workspaceRoot,
-    providerSessionId: record.providerSessionId,
-    writeMode: "read_only",
-    model: record.model,
-    effort: record.effort,
-    environment,
-  });
+  return runLocalAgentProvider(
+    record.provider,
+    {
+      prompt: prompt ?? "",
+      workspaceRoot: record.workspaceRoot,
+      providerSessionId: record.providerSessionId,
+      writeMode: "read_only",
+      model: record.model,
+      effort: record.effort,
+      environment,
+    },
+    callbacks,
+  );
 }
 
 /**
@@ -1637,7 +1943,7 @@ function recordToStatusOutput(
     profileName: record.profileName,
     provider: record.provider,
     status: record.status,
-    terminal: isTerminalStatus(record.status),
+    terminal: isTerminalStatus(record.status) && !hasTerminationBlock(record),
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
   };
@@ -1647,6 +1953,21 @@ function recordToStatusOutput(
   if (record.providerSessionId !== undefined) output.providerSessionId = record.providerSessionId;
   if (record.latestResponse !== undefined) output.latestResponse = record.latestResponse;
   if (record.error !== undefined) output.error = record.error;
+  const pending = record.lifecycleState?.terminationPending;
+  const corrupt = isDetachedLifecycle(record.lifecycleState) && record.lifecycleState?.lifecycleCorrupt;
+  const blocked = isDetachedLifecycle(record.lifecycleState) ? record.lifecycleState?.terminationBlocked : undefined;
+  if (pending || corrupt || blocked) {
+    output.termination = pending
+      ? {
+          pending: true,
+          generation: pending.generation,
+          requestedAt: pending.requestedAt,
+          failure: pending.lastFailure,
+        }
+      : corrupt
+        ? { pending: false, corrupt: true }
+        : { pending: false, blocked: true, reason: blocked?.reason };
+  }
   if (lifecycle) {
     output.startedAt = lifecycle.startedAt;
     output.lastActivityAt = lifecycle.lastActivityAt;
@@ -1666,9 +1987,42 @@ function recordToSummary(record: LocalAgentRecord): AgentSummary {
     profileName: record.profileName,
     provider: record.provider,
     status: record.status,
+    terminationPending: Boolean(record.lifecycleState?.terminationPending) || undefined,
+    terminationBlocked: hasDetachedTerminationBlocked(record) || undefined,
     updatedAt: record.updatedAt,
   };
   if (record.model !== undefined) output.model = record.model;
   if (record.effort !== undefined) output.effort = record.effort;
   return output;
+}
+
+function hasTerminationBlock(record: LocalAgentRecord): boolean {
+  if (!isDetachedLifecycle(record.lifecycleState)) return false;
+  return Boolean(
+    record.lifecycleState?.terminationPending ||
+    record.lifecycleState?.lifecycleCorrupt ||
+    record.lifecycleState?.terminationBlocked ||
+    (isTerminalStatus(record.status) && record.lifecycleState?.activeTurn),
+  );
+}
+
+function hasDetachedTerminationBlocked(record: LocalAgentRecord): boolean {
+  if (!isDetachedLifecycle(record.lifecycleState)) return false;
+  return Boolean(
+    record.lifecycleState?.lifecycleCorrupt ||
+    record.lifecycleState?.terminationBlocked ||
+    (isTerminalStatus(record.status) && record.lifecycleState?.activeTurn),
+  );
+}
+
+function occupiesDetachedExecutionSlot(record: LocalAgentRecord): boolean {
+  if (!isDetachedLifecycle(record.lifecycleState) || record.lifecycleState?.terminationBlocked) return false;
+  return isActiveStatus(record.status) || Boolean(record.lifecycleState?.activeTurn) || hasTerminationBlock(record);
+}
+
+function shouldRetryPendingTermination(record: LocalAgentRecord, now: number): boolean {
+  const lastAttemptAt = record.lifecycleState?.terminationPending?.lastAttemptAt;
+  if (!lastAttemptAt) return true;
+  const attemptedAt = Date.parse(lastAttemptAt);
+  return Number.isFinite(attemptedAt) && now - attemptedAt >= TERMINATION_RETRY_BACKOFF_MS;
 }

@@ -23,7 +23,6 @@ import {
   integrateCandidate,
   inspectIntegrationReadiness,
   probeRemoteWritability,
-  promoteCandidate,
 } from "./git-integration.js";
 import {
   isArtifactDownloadSupportedPlatform,
@@ -94,6 +93,15 @@ type Transport = StreamableHTTPServerTransport;
 const MCP_SESSION_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
 const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
 const AGENT_SUPERVISION_INTERVAL_MS = 2_000;
+const AGENT_TERMINATION_OUTPUT_SCHEMA = z.object({
+  pending: z.boolean(),
+  generation: z.string().optional(),
+  requestedAt: z.string().optional(),
+  failure: z.string().optional(),
+  corrupt: z.boolean().optional(),
+  blocked: z.boolean().optional(),
+  reason: z.string().optional(),
+});
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
 const WRITE_TOOL_ANNOTATIONS = {
@@ -113,6 +121,12 @@ const SHELL_TOOL_ANNOTATIONS = {
   destructiveHint: true,
   idempotentHint: false,
   openWorldHint: true,
+};
+const COMMAND_STATUS_TOOL_ANNOTATIONS = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
 };
 
 interface RunningServer {
@@ -212,6 +226,9 @@ interface ToolLogFields {
   workingDirectory?: string;
   command?: string;
   commandLength?: number;
+  attemptKey?: string;
+  sessionId?: number;
+  running?: boolean;
   success: boolean;
   durationMs: number;
   error?: string;
@@ -231,7 +248,7 @@ function serverInstructions(config: ServerConfig): string {
     : "";
 
   const gitCandidatesInstruction = config.gitCandidatesEnabled
-    ? " Use git_commit to form a scoped Candidate from exact paths. After external Candidate acceptance, use candidate_promote only for an exact same-repository pristine fast-forward of the intended attached local branch; divergence must go through reconciliation instead. Use git_push to publish Candidate HEAD to a non-default branch. candidate_promote never pushes or grants acceptance. Do not use bash for git mutation."
+    ? " Use git_commit to form a scoped Candidate from exact paths. Use git_push to publish Candidate HEAD to a non-default branch. Do not use bash for git mutation."
     : "";
 
   const codexGoalsInstruction = config.codexGoalsEnabled
@@ -550,26 +567,32 @@ async function assertWorkspaceAppAssets(): Promise<void> {
 
 function processResult(snapshot: ProcessSnapshot): string {
   const status = snapshot.running
-    ? `Process running with session ID ${snapshot.sessionId}.`
-    : snapshot.signal
-      ? `Process exited after signal ${snapshot.signal}.`
-      : `Process exited with code ${snapshot.exitCode ?? "unknown"}.`;
+    ? (snapshot.attemptKey
+        ? `Process running with session ID ${snapshot.sessionId} (attemptKey: ${snapshot.attemptKey}).`
+        : `Process running with session ID ${snapshot.sessionId}.`)
+    : snapshot.timedOut
+      ? `Process timed out and was terminated.`
+      : snapshot.signal
+        ? `Process exited after signal ${snapshot.signal}.`
+        : `Process exited with code ${snapshot.exitCode ?? "unknown"}.`;
   return snapshot.output ? `${snapshot.output.replace(/\n$/, "")}\n${status}` : status;
 }
 
 function processOutputSchema(): z.ZodRawShape {
   return resultOutputSchema({
     sessionId: z.number().optional(),
+    attemptKey: z.string().optional(),
     running: z.boolean(),
     exitCode: z.number().int().optional(),
     signal: z.string().optional(),
+    timedOut: z.boolean().optional(),
     wallTimeMs: z.number().nonnegative(),
     outputTruncated: z.boolean(),
   });
 }
 
 function processToolResponse(
-  tool: "exec_command" | "write_stdin",
+  tool: string,
   workspaceId: string,
   snapshot: ProcessSnapshot,
   summary: Record<string, unknown>,
@@ -577,8 +600,10 @@ function processToolResponse(
   const result = processResult(snapshot);
   const content = [textBlock(result)];
   const outputSummary = textSummary(snapshot.output ? [textBlock(snapshot.output)] : []);
+  const isError = !snapshot.running && (snapshot.exitCode !== 0 || snapshot.timedOut === true);
   return {
     content,
+    ...(isError ? { isError: true } : {}),
     _meta: {
       tool,
       card: {
@@ -590,9 +615,11 @@ function processToolResponse(
     structuredContent: {
       result,
       sessionId: snapshot.sessionId,
+      attemptKey: snapshot.attemptKey,
       running: snapshot.running,
       exitCode: snapshot.exitCode,
       signal: snapshot.signal,
+      timedOut: snapshot.timedOut,
       wallTimeMs: snapshot.wallTimeMs,
       outputTruncated: snapshot.outputTruncated,
     },
@@ -639,12 +666,23 @@ function registerCodexProcessTools(
           .max(100_000)
           .optional()
           .describe("Approximate output token budget. Defaults to 10000."),
+        attemptKey: z
+          .string()
+          .regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
+          .optional()
+          .describe("Optional workspace-scoped replay identity for idempotent command execution."),
+        timeout: z
+          .number()
+          .positive()
+          .max(300)
+          .optional()
+          .describe("Command execution deadline in seconds. Defaults to unbounded if omitted."),
       },
       outputSchema: processOutputSchema(),
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens }) => {
+    async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens, attemptKey, timeout }) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
@@ -658,6 +696,8 @@ function registerCodexProcessTools(
         rows,
         yieldTimeMs,
         maxOutputTokens,
+        attemptKey,
+        timeoutSeconds: timeout,
       });
 
       logToolCall(config, {
@@ -772,7 +812,6 @@ function codexGoalResultText(action: string, state: CodexGoalState): string {
   const output = state.outputChunk.trim();
   return [
     `Codex goal ${state.goalId} ${action}: ${status}.`,
-    state.error ? `Error: ${state.error}` : undefined,
     output ? `Output:\n${output}` : undefined,
   ].filter(Boolean).join("\n");
 }
@@ -796,7 +835,7 @@ function registerCodexGoalTools(
     {
       title: "Start Codex goal",
       description:
-        "Launch a real interactive Codex CLI session in an open workspace and activate its /goal mode with the given goal text. Returns a durable goalId promptly; poll codex_goal_status until goalActiveObserved is true or terminal is true. Runs the actual Codex CLI binary in a PTY inside the exact opened workspace; never uses bash or the Codex SDK. Git workspaces must be clean and must provide expectedHead matching the current Git HEAD. Only one active Codex goal is allowed per workspace.",
+        "Launch a real interactive Codex CLI session in an open workspace and activate its /goal mode with the given goal text. Runs the actual Codex CLI binary in a PTY inside the exact opened workspace; never uses bash or the Codex SDK. Git workspaces must be clean and must provide expectedHead matching the current Git HEAD. Only one active Codex goal is allowed per workspace.",
       inputSchema: {
         workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
         goal: z
@@ -1911,67 +1950,142 @@ export function createMcpServer(
           .max(300)
           .optional()
           .describe("Timeout in seconds. Defaults to 30, max 300."),
+        attemptKey: z
+          .string()
+          .regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
+          .describe(
+            "Required physical-workspace-scoped command execution identity. Establish before spawn so transport failures (e.g. 502/timeouts) can be safely reconciled. Exact request replays reuse the existing running or completed command session; conflicting reuse fails closed. After transport uncertainty, use command_status with this attemptKey; do not issue a new attemptKey to retry an uncertain execution.",
+          ),
+        yieldTimeMs: z
+          .number()
+          .int()
+          .min(0)
+          .max(30_000)
+          .optional()
+          .describe("Milliseconds to wait before returning a running session. Defaults to 10000."),
+        maxOutputTokens: z
+          .number()
+          .int()
+          .positive()
+          .max(100_000)
+          .optional()
+          .describe("Approximate output token budget. Defaults to 10000."),
       },
-      outputSchema: resultOutputSchema(),
+      outputSchema: processOutputSchema(),
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, workingDirectory, ...input }) => {
+    async ({ workspaceId, workingDirectory, command, timeout, attemptKey, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       const cwd = workspaces.resolveWorkingDirectory(
         workspace,
         workingDirectory,
       );
-      const response = await runShellTool(input, {
+      const snapshot = await processSessions.start({
+        workspaceId,
+        command,
         cwd,
-        root: workspace.root,
+        workspaceRoot: workspace.root,
+        yieldTimeMs,
+        timeoutSeconds: timeout ?? 30,
+        attemptKey,
+        maxOutputTokens,
       });
 
-      if (response.isError) {
-        logFailedToolResponse(config, {
-          tool: toolNames.shell,
-          workspaceId,
-          workingDirectory: workingDirectory ?? ".",
-          command: input.command,
-          commandLength: input.command.length,
-        }, response.content, startedAt);
-        return response;
-      }
-
       const summary = {
-        command: input.command,
+        command,
         workingDirectory: workingDirectory ?? ".",
-        ...textSummary(response.content),
+        running: snapshot.running,
+        exitCode: snapshot.exitCode,
+        wallTimeMs: snapshot.wallTimeMs,
+        attemptKey: snapshot.attemptKey,
       };
+
       logToolCall(config, {
         tool: toolNames.shell,
         workspaceId,
         workingDirectory: workingDirectory ?? ".",
-        command: input.command,
-        commandLength: input.command.length,
+        command,
+        commandLength: command.length,
+        success: snapshot.exitCode === 0 || snapshot.running,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+
+      return processToolResponse(toolNames.shell, workspaceId, snapshot, summary);
+    },
+  );
+  }
+
+  registerAppTool(
+    server,
+    "command_status",
+    {
+      title: "Command status",
+      description:
+        "Read-only inspection and reconciliation of an existing command session by attemptKey or sessionId. Observe running progress or retrieve terminal result without spawning new processes.",
+      inputSchema: {
+        workspaceId: z.string().describe(workspaceIdDescription),
+        attemptKey: z
+          .string()
+          .regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
+          .optional()
+          .describe("Attempt key of the command session to inspect."),
+        sessionId: z
+          .number()
+          .int()
+          .positive()
+          .optional()
+          .describe("Process session identifier to inspect."),
+        yieldTimeMs: z
+          .number()
+          .int()
+          .min(0)
+          .max(30_000)
+          .optional()
+          .describe("Milliseconds to wait for command output or completion if still running. Defaults to 5000."),
+        maxOutputTokens: z
+          .number()
+          .int()
+          .positive()
+          .max(100_000)
+          .optional()
+          .describe("Approximate output token budget. Defaults to 10000."),
+      },
+      outputSchema: processOutputSchema(),
+      ...toolWidgetDescriptorMeta(config, "shell"),
+      annotations: COMMAND_STATUS_TOOL_ANNOTATIONS,
+    },
+    async ({ workspaceId, attemptKey, sessionId, yieldTimeMs, maxOutputTokens }) => {
+      const startedAt = performance.now();
+      workspaces.getWorkspace(workspaceId);
+      const snapshot = await processSessions.getStatus({
+        workspaceId,
+        attemptKey,
+        sessionId,
+        yieldTimeMs: yieldTimeMs ?? 5_000,
+        maxOutputTokens,
+      });
+
+      logToolCall(config, {
+        tool: "command_status",
+        workspaceId,
+        attemptKey,
+        sessionId: snapshot.sessionId,
+        running: snapshot.running,
         success: true,
         durationMs: Math.round(performance.now() - startedAt),
       });
 
-      return {
-        ...response,
-        _meta: {
-          tool: toolNames.shell,
-          card: {
-            workspaceId,
-            path: workingDirectory,
-            summary,
-            payload: { content: response.content },
-          },
-        },
-        structuredContent: {
-          result: contentText(response.content),
-        },
-      };
+      return processToolResponse("command_status", workspaceId, snapshot, {
+        attemptKey,
+        sessionId: snapshot.sessionId,
+        running: snapshot.running,
+        exitCode: snapshot.exitCode,
+        wallTimeMs: snapshot.wallTimeMs,
+      });
     },
   );
-  }
 
   if (config.toolMode === "codex") {
     registerCodexProcessTools(server, config, workspaces, processSessions);
@@ -2038,6 +2152,16 @@ export function createMcpServer(
                 .int()
                 .min(1)
                 .describe("Optional wall-clock bound for the whole agent turn."),
+              maxStartupMs: z
+                .number()
+                .int()
+                .min(1)
+                .describe("Optional wall-clock bound for the startup/readiness phase (turn start -> execution started)."),
+              maxExecutionMs: z
+                .number()
+                .int()
+                .min(1)
+                .describe("Optional wall-clock bound for semantic provider execution (execution started -> terminal)."),
               idleTimeoutMs: z
                 .number()
                 .int()
@@ -2187,6 +2311,7 @@ export function createMcpServer(
           changedPaths: z.array(z.string()).optional(),
           terminalReason: z.string().optional(),
           scopeState: z.string().optional(),
+          termination: AGENT_TERMINATION_OUTPUT_SCHEMA.optional(),
         },
         _meta: {},
         annotations: { readOnlyHint: true },
@@ -2235,6 +2360,7 @@ export function createMcpServer(
           terminal: z.boolean(),
           latestResponse: z.string().optional(),
           error: z.string().optional(),
+          termination: AGENT_TERMINATION_OUTPUT_SCHEMA.optional(),
           createdAt: z.string(),
           updatedAt: z.string(),
         },
@@ -2292,6 +2418,8 @@ export function createMcpServer(
               model: z.string().optional(),
               thinking: z.string().optional(),
               status: z.string(),
+              terminationPending: z.boolean().optional(),
+              terminationBlocked: z.boolean().optional(),
               updatedAt: z.string(),
             }),
           ),
@@ -2676,94 +2804,6 @@ export function createMcpServer(
 
   // ── Native Git Candidate MCP Tools (only when gitCandidatesEnabled is true) ──
   if (config.gitCandidatesEnabled) {
-    registerAppTool(
-      server,
-      "candidate_promote",
-      {
-        title: "Promote accepted Candidate locally",
-        description:
-          "Durably fast-forward one exact attached local branch from candidateBase to an externally accepted candidateHead in the same Git repository. Requires exact Candidate tree identity, exact expected branch/base, a pristine destination, and old-OID CAS ref advancement. Stable replay is idempotent. Refuses divergence; never pushes, merges remotes, or grants acceptance.",
-        inputSchema: {
-          sourceWorkspaceId: z.string().describe("Workspace containing the exact accepted Candidate commit objects."),
-          candidateBase: z
-            .string()
-            .regex(/^[0-9a-fA-F]{40}$/)
-            .describe("Exact immutable Candidate base SHA."),
-          candidateHead: z
-            .string()
-            .regex(/^[0-9a-fA-F]{40}$/)
-            .describe("Exact immutable accepted Candidate head SHA."),
-          candidateTree: z
-            .string()
-            .regex(/^[0-9a-fA-F]{40}$/)
-            .describe("Exact tree SHA required for candidateHead."),
-          destinationWorkspaceId: z.string().describe("Attached local workspace whose maintained branch should advance."),
-          expectedDestinationBranch: z
-            .string()
-            .min(1)
-            .describe("Exact short local branch name currently attached in the destination workspace."),
-          expectedDestinationHead: z
-            .string()
-            .regex(/^[0-9a-fA-F]{40}$/)
-            .describe("Exact pre-promotion destination HEAD; must equal candidateBase."),
-          confirmPromote: z
-            .boolean()
-            .describe("Must be true to perform the local CAS promotion. False performs no mutation."),
-        },
-        outputSchema: {
-          success: z.boolean(),
-          promoted: z.boolean(),
-          alreadyPromoted: z.boolean(),
-          branch: z.string(),
-          previousHead: z.string(),
-          currentHead: z.string(),
-          candidateHead: z.string(),
-          candidateTree: z.string(),
-          acceptanceStatus: z.literal("external_not_granted_here"),
-          blockers: z.array(z.object({ code: z.string(), detail: z.string() })),
-        },
-        _meta: {},
-        annotations: {
-          readOnlyHint: false,
-          destructiveHint: true,
-          idempotentHint: true,
-          openWorldHint: false,
-        },
-      },
-      async ({
-        sourceWorkspaceId,
-        candidateBase,
-        candidateHead,
-        candidateTree,
-        destinationWorkspaceId,
-        expectedDestinationBranch,
-        expectedDestinationHead,
-        confirmPromote,
-      }) => {
-        const source = workspaces.getWorkspace(sourceWorkspaceId);
-        const destination = workspaces.getWorkspace(destinationWorkspaceId);
-        const output = await promoteCandidate({
-          sourceWorkspaceRoot: source.root,
-          candidateBase,
-          candidateHead,
-          candidateTree,
-          destinationWorkspaceRoot: destination.root,
-          expectedDestinationBranch,
-          expectedDestinationHead,
-          confirmPromote,
-        });
-        const summary = output.success
-          ? output.alreadyPromoted
-            ? `Candidate ${output.candidateHead} is already promoted on local branch ${output.branch}; replay made no mutation.`
-            : `Candidate ${output.candidateHead} promoted locally on branch ${output.branch}.`
-          : `Candidate not promoted${output.blockers.length > 0 ? `: ${output.blockers.map((blocker) => blocker.code).join(", ")}` : "."}`;
-        return {
-          content: [textBlock(summary)],
-          structuredContent: output as unknown as Record<string, unknown>,
-        };
-      },
-    );
-
     registerAppTool(
       server,
       "git_commit",

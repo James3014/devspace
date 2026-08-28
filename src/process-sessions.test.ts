@@ -215,3 +215,373 @@ try {
 } finally {
   manager.shutdown();
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// G2 Command Reconciliation & Reliability Tests (Test A - Test H)
+// ─────────────────────────────────────────────────────────────────────────────
+
+const g2Manager = new ProcessSessionManager({
+  maxBufferCharacters: 10_000,
+  completedSessionTtlMs: 5_000,
+});
+
+try {
+  // Test A: Long command yields instead of holding request
+  const testA = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: `${node} -e "setTimeout(() => { console.log('testA_done'); process.exit(0); }, 300)"`,
+    yieldTimeMs: 50,
+  });
+  assert.equal(testA.running, true, "Test A: command longer than yield window must return running: true");
+  assert.ok(testA.sessionId, "Test A: must return sessionId");
+
+  // Test B: Lost initial response -> reconcile using attemptKey
+  const attemptKeyB = "attempt:b:001";
+  const startB = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: `${node} -e "setTimeout(() => { console.log('testB_done'); process.exit(0); }, 200)"`,
+    yieldTimeMs: 50,
+    attemptKey: attemptKeyB,
+  });
+  assert.equal(startB.running, true);
+  assert.equal(startB.attemptKey, attemptKeyB);
+
+  // Pretend response was lost; query status by attemptKey
+  const reconcileB = await g2Manager.getStatus({
+    workspaceId: "ws_g2",
+    attemptKey: attemptKeyB,
+    yieldTimeMs: 500,
+  });
+  assert.equal(reconcileB.running, false, "Test B: reconcile should observe finished process");
+  assert.equal(reconcileB.exitCode, 0);
+  assert.match(reconcileB.output, /testB_done/);
+
+  // Test C: No duplicate process on replay of same attemptKey
+  const attemptKeyC = "attempt:c:001";
+  const firstStartC = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: `${node} -e "setTimeout(() => { console.log('testC_output'); process.exit(0); }, 200)"`,
+    yieldTimeMs: 50,
+    attemptKey: attemptKeyC,
+  });
+  assert.equal(firstStartC.running, true);
+  const firstSessionIdC = firstStartC.sessionId;
+
+  // Replay start with same attemptKey
+  const secondStartC = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: `${node} -e "setTimeout(() => { console.log('testC_output'); process.exit(0); }, 200)"`,
+    yieldTimeMs: 500,
+    attemptKey: attemptKeyC,
+  });
+  // Must reuse same session
+  assert.equal(secondStartC.running, false);
+  assert.equal(secondStartC.exitCode, 0);
+  assert.match(secondStartC.output, /testC_output/);
+
+  // Test D: Terminal result survives lost response (non-destructive inspection)
+  const attemptKeyD = "attempt:d:001";
+  const startD = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: `${node} -e "console.log('testD_result'); process.exit(0);"`,
+    yieldTimeMs: 1_000,
+    attemptKey: attemptKeyD,
+  });
+  assert.equal(startD.running, false);
+  assert.equal(startD.exitCode, 0);
+  assert.match(startD.output, /testD_result/);
+
+  // Subsequent status lookup retrieves exact same terminal evidence
+  const statusD1 = await g2Manager.getStatus({
+    workspaceId: "ws_g2",
+    attemptKey: attemptKeyD,
+  });
+  assert.equal(statusD1.running, false);
+  assert.equal(statusD1.exitCode, 0);
+  assert.match(statusD1.output, /testD_result/);
+
+  // Another subsequent status lookup still retrieves output
+  const statusD2 = await g2Manager.getStatus({
+    workspaceId: "ws_g2",
+    attemptKey: attemptKeyD,
+  });
+  assert.equal(statusD2.running, false);
+  assert.match(statusD2.output, /testD_result/);
+
+  // Test E: Replay conflict fails closed
+  const attemptKeyE = "attempt:e:001";
+  await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: "echo testE_cmd1",
+    yieldTimeMs: 500,
+    attemptKey: attemptKeyE,
+  });
+
+  await assert.rejects(
+    g2Manager.start({
+      workspaceId: "ws_g2",
+      cwd: process.cwd(),
+      command: "echo testE_different_cmd",
+      yieldTimeMs: 500,
+      attemptKey: attemptKeyE,
+    }),
+    /ATTEMPT_REPLAY_CONFLICT/,
+    "Test E: conflicting attemptKey must reject",
+  );
+
+  // Test F: Execution timeout terminates owned process
+  const attemptKeyF = "attempt:f:001";
+  const startF = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: `${node} -e "setInterval(() => {}, 1000)"`,
+    timeoutSeconds: 1, // 1 second execution deadline
+    yieldTimeMs: 2_000, // wait up to 2 seconds for execution timeout to kick in
+    attemptKey: attemptKeyF,
+  });
+  assert.equal(startF.running, false, "Test F: process must be terminated after execution timeout");
+  assert.equal(startF.timedOut, true, "Test F: timedOut flag must be true");
+
+  const statusF = await g2Manager.getStatus({
+    workspaceId: "ws_g2",
+    attemptKey: attemptKeyF,
+  });
+  assert.equal(statusF.timedOut, true);
+  assert.equal(statusF.running, false);
+
+  // Test G: Repeated status is side-effect free
+  const attemptKeyG = "attempt:g:001";
+  const startG = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: "echo testG_idempotent",
+    yieldTimeMs: 500,
+    attemptKey: attemptKeyG,
+  });
+  assert.equal(startG.running, false);
+
+  for (let i = 0; i < 5; i++) {
+    const status = await g2Manager.getStatus({
+      workspaceId: "ws_g2",
+      attemptKey: attemptKeyG,
+    });
+    assert.equal(status.running, false);
+    assert.equal(status.exitCode, 0);
+    assert.match(status.output, /testG_idempotent/);
+  }
+
+  // Test H: Short command compatibility
+  const shortCommand = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: "echo short_ok",
+    yieldTimeMs: 2_000,
+  });
+  assert.equal(shortCommand.running, false);
+  assert.equal(shortCommand.exitCode, 0);
+  assert.match(shortCommand.output, /short_ok/);
+
+  // ─────────────────────────────────────────────────────────────────────────
+  // Comprehensive Replay Identity Matrix (Required Tests 1 - 7)
+  // ─────────────────────────────────────────────────────────────────────────
+
+  // 1. same attemptKey + same command + same timeout -> reuse existing execution
+  const key1 = "matrix:test1";
+  const r1_first = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: `${node} -e "console.log('mat1'); process.exit(0);"`,
+    timeoutSeconds: 10,
+    yieldTimeMs: 1_000,
+    attemptKey: key1,
+  });
+  assert.equal(r1_first.running, false);
+  assert.equal(r1_first.exitCode, 0);
+
+  const r1_second = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: `${node} -e "console.log('mat1'); process.exit(0);"`,
+    timeoutSeconds: 10,
+    yieldTimeMs: 1_000,
+    attemptKey: key1,
+  });
+  assert.equal(r1_second.running, false);
+  assert.equal(r1_second.exitCode, 0);
+  assert.match(r1_second.output, /mat1/);
+
+  // 2. same attemptKey + same command + DIFFERENT timeoutSeconds -> ATTEMPT_REPLAY_CONFLICT
+  const key2 = "matrix:test2";
+  await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: "echo mat2",
+    timeoutSeconds: 30,
+    yieldTimeMs: 1_000,
+    attemptKey: key2,
+  });
+
+  await assert.rejects(
+    g2Manager.start({
+      workspaceId: "ws_g2",
+      cwd: process.cwd(),
+      command: "echo mat2",
+      timeoutSeconds: 300, // Different timeout!
+      yieldTimeMs: 1_000,
+      attemptKey: key2,
+    }),
+    /ATTEMPT_REPLAY_CONFLICT/,
+    "Changing timeoutSeconds on same attemptKey must fail closed",
+  );
+
+  // 3. same attemptKey + same command + DIFFERENT environmentPolicy -> ATTEMPT_REPLAY_CONFLICT
+  const key3 = "matrix:test3";
+  await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: "echo mat3",
+    environmentPolicy: "inherit",
+    yieldTimeMs: 1_000,
+    attemptKey: key3,
+  });
+
+  await assert.rejects(
+    g2Manager.start({
+      workspaceId: "ws_g2",
+      cwd: process.cwd(),
+      command: "echo mat3",
+      environmentPolicy: "sanitized", // Different environment policy!
+      yieldTimeMs: 1_000,
+      attemptKey: key3,
+    }),
+    /ATTEMPT_REPLAY_CONFLICT/,
+    "Changing environmentPolicy on same attemptKey must fail closed",
+  );
+
+  // 4. same attemptKey + same command + DIFFERENT tty -> ATTEMPT_REPLAY_CONFLICT
+  const key4 = "matrix:test4";
+  await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: "echo mat4",
+    tty: false,
+    yieldTimeMs: 1_000,
+    attemptKey: key4,
+  });
+
+  await assert.rejects(
+    g2Manager.start({
+      workspaceId: "ws_g2",
+      cwd: process.cwd(),
+      command: "echo mat4",
+      tty: true, // Different tty mode!
+      yieldTimeMs: 1_000,
+      attemptKey: key4,
+    }),
+    /ATTEMPT_REPLAY_CONFLICT/,
+    "Changing tty mode on same attemptKey must fail closed",
+  );
+
+  // 5. PTY execution: same key + changed columns/rows -> ATTEMPT_REPLAY_CONFLICT
+  if (process.platform !== "win32") {
+    const key5 = "matrix:test5";
+    await g2Manager.start({
+      workspaceId: "ws_g2",
+      cwd: process.cwd(),
+      command: "echo mat5",
+      tty: true,
+      columns: 80,
+      rows: 24,
+      yieldTimeMs: 1_000,
+      attemptKey: key5,
+    });
+
+    await assert.rejects(
+      g2Manager.start({
+        workspaceId: "ws_g2",
+        cwd: process.cwd(),
+        command: "echo mat5",
+        tty: true,
+        columns: 120, // Different initial columns!
+        rows: 30,
+        yieldTimeMs: 1_000,
+        attemptKey: key5,
+      }),
+      /ATTEMPT_REPLAY_CONFLICT/,
+      "Changing initial PTY dimensions on same attemptKey must fail closed",
+    );
+  }
+
+  // 6. same attemptKey + same execution but DIFFERENT yieldTimeMs -> SHOULD NOT conflict
+  const key6 = "matrix:test6";
+  const r6_first = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: `${node} -e "setTimeout(() => { console.log('mat6'); process.exit(0); }, 100)"`,
+    yieldTimeMs: 10, // Short yield
+    attemptKey: key6,
+  });
+  assert.equal(r6_first.running, true);
+
+  const r6_second = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: `${node} -e "setTimeout(() => { console.log('mat6'); process.exit(0); }, 100)"`,
+    yieldTimeMs: 1_000, // Longer yield to wait for finish
+    attemptKey: key6,
+  });
+  assert.equal(r6_second.running, false);
+  assert.equal(r6_second.exitCode, 0);
+  assert.match(r6_second.output, /mat6/);
+
+  // 7. same attemptKey + same execution but DIFFERENT maxOutputTokens -> SHOULD NOT conflict
+  const key7 = "matrix:test7";
+  const r7_first = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: "echo mat7_large_output_budget",
+    maxOutputTokens: 100,
+    yieldTimeMs: 1_000,
+    attemptKey: key7,
+  });
+  assert.equal(r7_first.running, false);
+
+  const r7_second = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: "echo mat7_large_output_budget",
+    maxOutputTokens: 500, // Different output token budget
+    yieldTimeMs: 1_000,
+    attemptKey: key7,
+  });
+  assert.equal(r7_second.running, false);
+  assert.match(r7_second.output, /mat7_large_output_budget/);
+
+  // Internal PTY polling must continue waiting after a non-destructive
+  // snapshot has already retained initial output.
+  const retainedOutput = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: `${node} -e "console.log('initial'); setTimeout(() => console.log('later'), 150); setTimeout(() => process.exit(0), 250);"`,
+    tty: true,
+    yieldTimeMs: 250,
+  });
+  assert.equal(retainedOutput.running, true);
+  assert.match(retainedOutput.output, /initial/);
+  const polledOutput = await g2Manager.write({
+    workspaceId: "ws_g2",
+    sessionId: retainedOutput.sessionId!,
+    chars: "",
+    yieldTimeMs: 500,
+  });
+  assert.equal(polledOutput.running, false);
+  assert.match(polledOutput.output, /later/);
+} finally {
+  g2Manager.shutdown();
+}
