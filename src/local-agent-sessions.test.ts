@@ -174,6 +174,75 @@ test("LocalAgentSessionManager - startAgent and PROVIDER_UNAVAILABLE", async () 
   }
 });
 
+test("LocalAgentSessionManager - idle timeout fences silent worker with idle_timeout", async () => {
+  const { manager, spawnedWorkers, terminatedWorkers, clean } = setupFixture();
+  try {
+    const workspaceRoot = "/Users/jameschen/Workspace/nexus";
+    const started = await manager.startAgent({
+      workspaceId: "ws_idle",
+      workspaceRoot,
+      profileName: "reviewer",
+      prompt: "silent worker",
+      profiles: mockProfiles,
+      executionContract: { idleTimeoutMs: 1 },
+    });
+    const store = (manager as any).store as LocalAgentStore;
+    const generation = store.getById(started.agentId)!.lifecycleState!.activeTurn!.generation!;
+    const token = spawnedWorkers[0]!.workerToken;
+    store.claimWorkerCAS(started.agentId, generation, token, 4242);
+    store.markExecutionStarted(started.agentId, token, new Date().toISOString(), generation);
+    store.touchActivityCAS(started.agentId, generation, token, new Date(Date.now() - 100).toISOString());
+    await manager.superviseActiveAgents();
+    const result = manager.getRecordByPrefixOrId(started.agentId)!;
+    assert.equal(result.status, "error");
+    assert.equal(result.terminalReason, "idle_timeout");
+    assert.equal(terminatedWorkers.length, 1);
+
+    const active = await manager.startAgent({
+      workspaceId: "ws_idle",
+      workspaceRoot,
+      profileName: "reviewer",
+      prompt: "active worker",
+      profiles: mockProfiles,
+      executionContract: { idleTimeoutMs: 60_000 },
+    });
+    const activeRecord = store.getById(active.agentId)!;
+    const activeGeneration = activeRecord.lifecycleState!.activeTurn!.generation!;
+    const activeToken = spawnedWorkers[1]!.workerToken;
+    store.claimWorkerCAS(active.agentId, activeGeneration, activeToken, 4243);
+    store.touchActivityCAS(active.agentId, activeGeneration, activeToken);
+    await manager.superviseActiveAgents();
+    assert.equal(manager.getRecordByPrefixOrId(active.agentId)!.status, "running");
+  } finally {
+    clean();
+  }
+});
+
+test("LocalAgentSessionManager - idle timeout does not apply during startup", async () => {
+  const { manager, spawnedWorkers, terminatedWorkers, clean } = setupFixture();
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_startup_idle",
+      workspaceRoot: "/Users/jameschen/Workspace/nexus",
+      profileName: "reviewer",
+      prompt: "startup still pending",
+      profiles: mockProfiles,
+      executionContract: { idleTimeoutMs: 1, maxStartupMs: 60_000 },
+    });
+    const store = (manager as any).store as LocalAgentStore;
+    const current = store.getById(started.agentId)!;
+    const generation = current.lifecycleState!.activeTurn!.generation!;
+    const token = spawnedWorkers[0]!.workerToken;
+    store.claimWorkerCAS(started.agentId, generation, token, 4244);
+    store.touchActivityCAS(started.agentId, generation, token, new Date(Date.now() - 100).toISOString());
+    await manager.superviseActiveAgents();
+    assert.equal(manager.getRecordByPrefixOrId(started.agentId)!.status, "running");
+    assert.equal(terminatedWorkers.length, 0);
+  } finally {
+    clean();
+  }
+});
+
 test("LocalAgentSessionManager - continueAgent identity and validation", async () => {
   const { manager, spawnedWorkers, clean } = setupFixture();
   try {

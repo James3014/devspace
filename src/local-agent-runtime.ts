@@ -44,6 +44,8 @@ export interface LocalAgentRunCallbacks {
    * execution starts.
    */
   onExecutionStarted?: () => void | Promise<void>;
+  /** Called for each trustworthy provider/runtime event during execution. */
+  onActivity?: () => void | Promise<void>;
 }
 
 export interface LocalAgentRuntimeContext {

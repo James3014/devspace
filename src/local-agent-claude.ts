@@ -146,6 +146,7 @@ export class ClaudeQueryRuntime implements LocalAgentRuntime {
             });
           }
           const message = next.value;
+          await callbacks?.onActivity?.();
           items.push(message);
           const record = asRecord(message);
           if (typeof record?.session_id === "string") {

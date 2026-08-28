@@ -999,7 +999,7 @@ export class LocalAgentSessionManager {
     );
 
     const startedAtMs = Date.parse(record.createdAt);
-    const updatedAtMs = Date.parse(record.updatedAt);
+    const updatedAtMs = Date.parse(record.lifecycleState?.activeTurn?.lastActivityAt ?? record.updatedAt);
     const now = Date.now();
 
     return {
@@ -1021,7 +1021,7 @@ export class LocalAgentSessionManager {
       },
       activity: {
         startedAt: record.createdAt,
-        lastActivityAt: record.updatedAt,
+        lastActivityAt: record.lifecycleState?.activeTurn?.lastActivityAt ?? record.updatedAt,
         lastFileMutationAt: physical.lastFileMutationAt,
         wallMs: Math.max(0, now - startedAtMs),
         idleMs: Math.max(0, now - updatedAtMs),
@@ -1070,6 +1070,9 @@ export class LocalAgentSessionManager {
       const executionStartedAtMs = activeTurn?.executionStartedAt
         ? Date.parse(activeTurn.executionStartedAt)
         : undefined;
+      const lastActivityAtMs = activeTurn?.lastActivityAt
+        ? Date.parse(activeTurn.lastActivityAt)
+        : turnStartedAtMs;
 
       // 1. maxWallMs: Whole-turn hard ceiling (turnStartedAt -> terminal)
       if (contract.maxWallMs && now - turnStartedAtMs > contract.maxWallMs) {
@@ -1110,6 +1113,20 @@ export class LocalAgentSessionManager {
           );
           continue;
         }
+      }
+
+      // 4. idleTimeoutMs: terminate only after a provider/runtime activity
+      // signal has gone silent. The active-turn generation and worker token
+      // are revalidated by beginTerminationCAS before any process is killed.
+      if (contract.idleTimeoutMs && executionStartedAtMs !== undefined && now - lastActivityAtMs > contract.idleTimeoutMs) {
+        await this.terminateActiveAgent(
+          record.id,
+          "idle_timeout",
+          `Agent exceeded execution contract idleTimeoutMs of ${contract.idleTimeoutMs}ms without provider activity.`,
+          "idle",
+          contract.idleTimeoutMs,
+        );
+        continue;
       }
 
       if ((contract.writePaths?.length || contract.maxFiles !== undefined) && record.status === "running") {
@@ -1162,7 +1179,7 @@ export class LocalAgentSessionManager {
 
     return {
       startedAt: record.createdAt,
-      lastActivityAt: record.updatedAt,
+      lastActivityAt: record.lifecycleState?.activeTurn?.lastActivityAt ?? record.updatedAt,
       lastFileMutationAt: physical.lastFileMutationAt,
       wallMs: timing.wallMs,
       idleMs: timing.idleMs,
@@ -1228,7 +1245,7 @@ export class LocalAgentSessionManager {
     agentId: string,
     reason: AgentTerminalReason,
     message: string,
-    expectedPhase?: "startup" | "execution" | "any",
+    expectedPhase?: "startup" | "execution" | "idle" | "any",
     budgetMs?: number,
     terminalStatus: "error" | "stopped" = "error",
   ): Promise<boolean> {
@@ -1393,6 +1410,9 @@ export class LocalAgentSessionManager {
       const profiles = await loadLocalAgentProfiles(this.config, claimed.workspaceRoot);
       const profile = profiles.find((p) => p.name === claimed.profileName);
       const callbacks: LocalAgentRunCallbacks = {
+        onActivity: () => {
+          this.store.touchActivityCAS(claimed.id, generation, workerToken);
+        },
         onExecutionStarted: () => {
           this.store.markExecutionStarted(claimed.id, workerToken, undefined, generation);
         },

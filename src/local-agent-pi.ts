@@ -51,6 +51,7 @@ export class PiSessionRuntime implements LocalAgentRuntime {
   private alive = true;
   private closed = false;
   private collectingEvents = false;
+  private activityCallback?: () => void | Promise<void>;
   private events: unknown[] = [];
 
   constructor(
@@ -58,6 +59,7 @@ export class PiSessionRuntime implements LocalAgentRuntime {
   ) {
     this.unsubscribe = session.subscribe((event) => {
       if (!this.collectingEvents) return;
+      void this.activityCallback?.();
       if (this.events.length >= MAX_PI_EVENTS) this.events.shift();
       this.events.push(event);
     });
@@ -78,6 +80,7 @@ export class PiSessionRuntime implements LocalAgentRuntime {
           });
         }
         await callbacks?.onSessionId?.(this.session.sessionId);
+        this.activityCallback = callbacks?.onActivity;
         await this.applyOverrides(input);
         this.events = [];
         const messageStart = this.session.messages.length;

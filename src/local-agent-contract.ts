@@ -41,7 +41,7 @@ export interface ExecutionContract {
   maxStartupMs?: number;
   /** Optional wall-clock bound for semantic provider execution (execution started -> terminal). */
   maxExecutionMs?: number;
-  /** Recorded and surfaced; not auto-enforced without a mid-run activity signal. */
+  /** Maximum interval without a provider/runtime activity event. */
   idleTimeoutMs?: number;
 }
 
@@ -83,6 +83,8 @@ export interface ActiveTurnState {
   generation?: string;
   turnStartedAt: string;
   executionStartedAt?: string;
+  /** Last provider/runtime activity observed for idle-timeout supervision. */
+  lastActivityAt?: string;
   launchState?: AgentTurnLaunchState;
 }
 

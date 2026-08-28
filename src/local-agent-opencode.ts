@@ -61,10 +61,12 @@ export class OpencodeRuntime implements LocalAgentRuntime {
         }
         try {
           await assertOpencodeHealthy(this.client);
+          await callbacks?.onActivity?.();
           const resumed = Boolean(input.providerSessionId);
           const initialModel = input.model ? parseOpencodeModel(input.model, input.effort) : undefined;
           const sessionId = input.providerSessionId ?? await createOpencodeSession(this.client, input, initialModel);
           await callbacks?.onSessionId?.(sessionId);
+          await callbacks?.onActivity?.();
           await this.client.v2.session.switchAgent({
             sessionID: sessionId,
             agent: opencodeAgentFor(input.writeMode),
@@ -75,7 +77,8 @@ export class OpencodeRuntime implements LocalAgentRuntime {
             await this.client.v2.session.switchModel({ sessionID: sessionId, model }, { throwOnError: true });
           }
           const promptResult = await promptOpencodeSession(this.client, sessionId, input);
-          await waitForOpencodeSession(this.client, sessionId, promptResult);
+          await callbacks?.onActivity?.();
+          await waitForOpencodeSession(this.client, sessionId, promptResult, callbacks?.onActivity);
           const promptId = extractOpenCodePromptId(promptResult);
           const messages = await readOpencodeMessages(this.client, sessionId, promptId);
           const finalResponse = requireFinalResponse(
@@ -309,6 +312,7 @@ async function waitForOpencodeSession(
   client: OpencodeClientLike,
   sessionId: string,
   promptResult: unknown,
+  onActivity?: () => void | Promise<void>,
 ): Promise<void> {
   // OpenCode 1.18 accepts the prompt before its foreground drain is ready.
   // Its wait endpoint rejects that state and can keep rejecting after the
@@ -324,11 +328,22 @@ async function waitForOpencodeSession(
   const promptId = extractOpenCodePromptId(promptResult);
   const deadline = Date.now() + OPENCODE_SESSION_POLL_TIMEOUT_MS;
   let observedActive = false;
+  let previousActivityFingerprint: string | undefined;
   while (true) {
     const messages = await readOpencodeMessages(client, sessionId, promptId);
     const activity = await active({ throwOnError: true });
     const running = isOpenCodeSessionActive(activity, sessionId);
     if (running) observedActive = true;
+    const latestMessage = messages.data?.at(-1);
+    const activityFingerprint = JSON.stringify({
+      running,
+      messageCount: messages.data?.length ?? 0,
+      latestMessage,
+    });
+    if (activityFingerprint !== previousActivityFingerprint) {
+      previousActivityFingerprint = activityFingerprint;
+      await onActivity?.();
+    }
 
     const completed = hasCompletedOpenCodeTurn(messages, promptId);
     if (completed && (promptId !== undefined || (observedActive && !running))) return;
