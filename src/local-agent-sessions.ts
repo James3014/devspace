@@ -291,6 +291,20 @@ interface LifecycleEvidence {
   scopeState?: ScopeState;
 }
 
+function computeSessionTiming(record: LocalAgentRecord, now = Date.now()): { wallMs: number; idleMs: number } {
+  const createdAtMs = Date.parse(record.createdAt);
+  const updatedAtMs = Date.parse(record.updatedAt);
+  const terminalStable = isTerminalStatus(record.status) &&
+    !record.lifecycleState?.terminationPending &&
+    !record.lifecycleState?.lifecycleCorrupt &&
+    !record.lifecycleState?.terminationBlocked;
+  const referenceMs = terminalStable ? updatedAtMs : now;
+  return {
+    wallMs: Math.max(0, referenceMs - createdAtMs),
+    idleMs: terminalStable ? 0 : Math.max(0, now - updatedAtMs),
+  };
+}
+
 export interface StartAgentOutput {
   agentId: string;
   status: LocalAgentStatus;
@@ -1140,9 +1154,7 @@ export class LocalAgentSessionManager {
     record: LocalAgentRecord,
   ): Promise<LifecycleEvidence | undefined> {
     const physical = await inspectWorkspacePhysicalState(record.workspaceRoot);
-    const now = Date.now();
-    const startedAtMs = Date.parse(record.createdAt);
-    const updatedAtMs = Date.parse(record.updatedAt);
+    const timing = computeSessionTiming(record);
 
     const changedPaths = record.scopeBaseline
       ? computeWorkerDelta(physical, record.scopeBaseline).changedPaths
@@ -1152,8 +1164,8 @@ export class LocalAgentSessionManager {
       startedAt: record.createdAt,
       lastActivityAt: record.updatedAt,
       lastFileMutationAt: physical.lastFileMutationAt,
-      wallMs: Math.max(0, now - startedAtMs),
-      idleMs: Math.max(0, now - updatedAtMs),
+      wallMs: timing.wallMs,
+      idleMs: timing.idleMs,
       changedPaths: physical.gitAvailable ? changedPaths : undefined,
       terminalReason: record.terminalReason,
       scopeState: record.scopeState,
