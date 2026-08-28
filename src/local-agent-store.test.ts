@@ -651,6 +651,24 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
   assert.equal((reopenedCorrupt.lifecycleState as any)?.lifecycleKind, "detached_worker_v2");
   assert.equal((reopenedCorrupt.lifecycleState as any)?.lifecycleCorrupt, true);
 
+  const activityRecord = store.create({
+    workspaceId: "ws_activity",
+    workspaceRoot: join(root, "activity"),
+    profileName: "reviewer",
+    provider: "codex",
+    lifecycleKind: "detached_worker_v2",
+  });
+  const activityGeneration = activityRecord.lifecycleState!.activeTurn!.generation!;
+  store.prepareWorker(activityRecord.id, "activity-token");
+  store.claimWorker(activityRecord.id, "activity-token", 4111);
+  const activityAt = new Date(Date.now() + 1000).toISOString();
+  assert.equal(store.touchActivityCAS(activityRecord.id, activityGeneration, "activity-token", activityAt).applied, true);
+  assert.equal(
+    store.getById(activityRecord.id)?.lifecycleState?.activeTurn?.lastActivityAt,
+    activityAt,
+  );
+  assert.equal(store.touchActivityCAS(activityRecord.id, "stale-generation", "activity-token").applied, false);
+
 } finally {
   for (const store of stores) {
     store.close();

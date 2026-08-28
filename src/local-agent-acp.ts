@@ -77,6 +77,7 @@ export interface AcpRuntimeOptions {
   sessionMetadata?: Map<string, unknown>;
   grokCompletionRegistry?: GrokPromptCompletionRegistry;
   promptCompletionTimeoutMs?: number;
+  activityCallbacks?: Map<string, () => void | Promise<void>>;
 }
 
 export class AcpRuntime implements LocalAgentRuntime {
@@ -94,6 +95,7 @@ export class AcpRuntime implements LocalAgentRuntime {
   private promptSequence = 0;
   private alive = true;
   private closed = false;
+  private readonly activityCallbacks: Map<string, () => void | Promise<void>>;
 
   constructor(options: AcpRuntimeOptions, connection: AcpConnectionLike) {
     this.provider = options.provider;
@@ -106,6 +108,7 @@ export class AcpRuntime implements LocalAgentRuntime {
     this.sessionMetadata = options.sessionMetadata ?? new Map();
     this.grokCompletionRegistry = options.grokCompletionRegistry;
     this.promptCompletionTimeoutMs = options.promptCompletionTimeoutMs ?? ACP_GROK_PROMPT_COMPLETION_TIMEOUT_MS;
+    this.activityCallbacks = options.activityCallbacks ?? new Map();
     void this.connection.closed.then(() => {
       if (!this.closed) this.alive = false;
       this.grokCompletionRegistry?.rejectAll(new Error(`${this.provider} ACP connection closed.`));
@@ -160,6 +163,8 @@ export class AcpRuntime implements LocalAgentRuntime {
             )
           : undefined;
         try {
+          if (callbacks?.onActivity) this.activityCallbacks.set(sessionId, callbacks.onActivity);
+          await callbacks?.onActivity?.();
           queue.values.length = 0;
           const standardResponse = this.connection.agent.request("session/prompt", {
             sessionId,
@@ -193,6 +198,7 @@ export class AcpRuntime implements LocalAgentRuntime {
             items: updates,
           };
         } finally {
+          this.activityCallbacks.delete(sessionId);
           if (promptId) this.grokCompletionRegistry?.remove(sessionId, promptId);
           this.activeSessions.delete(sessionId);
         }
@@ -222,6 +228,7 @@ export class AcpRuntime implements LocalAgentRuntime {
     this.sessionWriteModes.clear();
     this.sessionMetadata.clear();
     this.activeSessions.clear();
+    this.activityCallbacks.clear();
     this.grokCompletionRegistry?.rejectAll(new Error(`${this.provider} ACP runtime closed.`));
     this.connection.close(new Error(`${this.provider} ACP runtime closed.`));
     if (this.child && this.child.exitCode === null) {
@@ -489,6 +496,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
           const { client, methods, ndJsonStream } = await import("@agentclientprotocol/sdk");
           const queues = new Map<string, AcpSessionQueue>();
           const sessionWriteModes = new Map<string, LocalAgentWriteMode>();
+          const activityCallbacks = new Map<string, () => void | Promise<void>>();
           const grokCompletionRegistry = this.provider === "grok"
             ? new GrokPromptCompletionRegistry()
             : undefined;
@@ -501,6 +509,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
                 : { outcome: { outcome: "cancelled" } };
             })
             .onNotification(methods.client.session.update, (context) => {
+              void activityCallbacks.get(context.params.sessionId)?.();
               const sessionId = context.params.sessionId;
               const queue = queues.get(sessionId);
               if (queue) appendAcpQueueValue(queue, context.params);
@@ -544,6 +553,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
             queues,
             sessionWriteModes,
             grokCompletionRegistry,
+            activityCallbacks,
           }, connection);
           // AcpRuntime installs the long-lived child error listener before this
           // startup-only listener is removed, so there is no unobserved gap.

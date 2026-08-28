@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { realpathSync } from "node:fs";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 
 const DEFAULT_EXEC_YIELD_MS = 10_000;
@@ -52,6 +53,7 @@ export interface StartCommandInput {
 
 export interface GetCommandStatusInput {
   workspaceId: string;
+  workspaceRoot?: string;
   sessionId?: number;
   attemptKey?: string;
   yieldTimeMs?: number;
@@ -299,31 +301,37 @@ export class ProcessSessionManager {
   }
 
   async start(input: StartCommandInput): Promise<ProcessSnapshot> {
+    const workspaceRoot = input.attemptKey
+      ? this.canonicalWorkspaceRoot(input.workspaceRoot)
+      : input.workspaceRoot;
+    const normalizedInput = workspaceRoot === input.workspaceRoot
+      ? input
+      : { ...input, workspaceRoot };
     if (input.attemptKey) {
-      const attemptIndexKey = this.attemptIndexKey(input.workspaceId, input.attemptKey);
+      const attemptIndexKey = this.attemptIndexKey(input.workspaceId, workspaceRoot, input.attemptKey);
       const existingSessionId = this.attemptKeyToSessionId.get(attemptIndexKey);
       if (existingSessionId !== undefined) {
         const existing = this.sessions.get(existingSessionId);
         if (existing) {
-          if (!this.isMateriallyIdentical(existing, input)) {
+          if (!this.isMateriallyIdentical(existing, normalizedInput)) {
             throw new Error(
               `ATTEMPT_REPLAY_CONFLICT: attemptKey '${input.attemptKey}' was already used for a different command in workspace ${input.workspaceId}.`,
             );
           }
           // Materially identical replay: reuse existing session without spawning new process.
-          const yieldTimeMs = boundedInteger(input.yieldTimeMs, DEFAULT_EXEC_YIELD_MS, MAX_COMMAND_YIELD_MS);
+          const yieldTimeMs = boundedInteger(normalizedInput.yieldTimeMs, DEFAULT_EXEC_YIELD_MS, MAX_COMMAND_YIELD_MS);
           if (existing.running && yieldTimeMs > 0) {
             await this.waitForExit(existing, yieldTimeMs);
           }
-          return this.getSnapshot(existing, input.maxOutputTokens);
+          return this.getSnapshot(existing, normalizedInput.maxOutputTokens);
         }
       }
     }
 
-    const session = this.createSession(input);
+    const session = this.createSession(normalizedInput);
     this.sessions.set(session.id, session);
     if (session.attemptKey) {
-      this.attemptKeyToSessionId.set(this.attemptIndexKey(session.workspaceId, session.attemptKey), session.id);
+      this.attemptKeyToSessionId.set(this.attemptIndexKey(session.workspaceId, session.workspaceRoot, session.attemptKey), session.id);
     }
 
     if (input.timeoutSeconds !== undefined && input.timeoutSeconds > 0) {
@@ -338,21 +346,21 @@ export class ProcessSessionManager {
     }
 
     try {
-      if (input.tty && process.platform !== "win32") await this.startPty(session, input);
-      else this.startPipe(session, input);
+      if (normalizedInput.tty && process.platform !== "win32") await this.startPty(session, normalizedInput);
+      else this.startPipe(session, normalizedInput);
     } catch (error) {
       this.removeSession(session.id);
       throw error;
     }
 
-    const yieldTimeMs = boundedInteger(input.yieldTimeMs, DEFAULT_EXEC_YIELD_MS, MAX_COMMAND_YIELD_MS);
+    const yieldTimeMs = boundedInteger(normalizedInput.yieldTimeMs, DEFAULT_EXEC_YIELD_MS, MAX_COMMAND_YIELD_MS);
     await this.waitForExit(session, yieldTimeMs);
 
-    return this.getSnapshot(session, input.maxOutputTokens);
+    return this.getSnapshot(session, normalizedInput.maxOutputTokens);
   }
 
   async getStatus(input: GetCommandStatusInput): Promise<ProcessSnapshot> {
-    const session = this.resolveSession(input.workspaceId, input.sessionId, input.attemptKey);
+    const session = this.resolveSession(input.workspaceId, input.workspaceRoot, input.sessionId, input.attemptKey);
     const yieldTimeMs = boundedInteger(input.yieldTimeMs, 0, MAX_COMMAND_YIELD_MS);
     if (session.running && yieldTimeMs > 0) {
       await this.waitForExit(session, yieldTimeMs);
@@ -411,12 +419,20 @@ export class ProcessSessionManager {
     this.attemptKeyToSessionId.clear();
   }
 
-  private attemptIndexKey(workspaceId: string, attemptKey: string): string {
-    return `${workspaceId}:${attemptKey}`;
+  private canonicalWorkspaceRoot(workspaceRoot: string | undefined): string | undefined {
+    if (!workspaceRoot) return undefined;
+    try {
+      return realpathSync.native(workspaceRoot);
+    } catch {
+      throw new Error(`WORKSPACE_ROOT_UNRESOLVABLE: cannot resolve physical workspace root '${workspaceRoot}'.`);
+    }
+  }
+
+  private attemptIndexKey(workspaceId: string, workspaceRoot: string | undefined, attemptKey: string): string {
+    return JSON.stringify([workspaceRoot ? "root" : "session", workspaceRoot ?? workspaceId, attemptKey]);
   }
 
   private isMateriallyIdentical(existing: ProcessSession, input: StartCommandInput): boolean {
-    if (existing.workspaceId !== input.workspaceId) return false;
     if (existing.workspaceRoot !== input.workspaceRoot) return false;
     if (existing.command !== input.command) return false;
     if (existing.cwd !== input.cwd) return false;
@@ -450,14 +466,15 @@ export class ProcessSessionManager {
     return true;
   }
 
-  private resolveSession(workspaceId: string, sessionId?: number, attemptKey?: string): ProcessSession {
+  private resolveSession(workspaceId: string, workspaceRoot: string | undefined, sessionId?: number, attemptKey?: string): ProcessSession {
     if (sessionId !== undefined) {
-      return this.getOwnedSession(workspaceId, sessionId);
+      return this.getOwnedSession(workspaceId, sessionId, workspaceRoot);
     }
     if (attemptKey !== undefined) {
-      const id = this.attemptKeyToSessionId.get(this.attemptIndexKey(workspaceId, attemptKey));
+      const canonicalRoot = this.canonicalWorkspaceRoot(workspaceRoot);
+      const id = this.attemptKeyToSessionId.get(this.attemptIndexKey(workspaceId, canonicalRoot, attemptKey));
       if (id !== undefined) {
-        return this.getOwnedSession(workspaceId, id);
+        return this.getOwnedSession(workspaceId, id, canonicalRoot);
       }
       throw new Error(`Unknown process attemptKey '${attemptKey}' in workspace ${workspaceId}.`);
     }
@@ -633,10 +650,14 @@ export class ProcessSessionManager {
     };
   }
 
-  private getOwnedSession(workspaceId: string, sessionId: number): ProcessSession {
+  private getOwnedSession(workspaceId: string, sessionId: number, workspaceRoot?: string): ProcessSession {
     const session = this.sessions.get(sessionId);
     if (!session) throw new Error(`Unknown process session: ${sessionId}`);
-    if (session.workspaceId !== workspaceId) {
+    const canonicalRoot = this.canonicalWorkspaceRoot(workspaceRoot);
+    const samePhysicalRoot = canonicalRoot && session.workspaceRoot
+      ? canonicalRoot === session.workspaceRoot
+      : session.workspaceId === workspaceId;
+    if (!samePhysicalRoot) {
       throw new Error(`Process session ${sessionId} does not belong to workspace ${workspaceId}.`);
     }
     return session;
@@ -648,7 +669,7 @@ export class ProcessSessionManager {
     if (session.executionTimer) clearTimeout(session.executionTimer);
     if (session.cleanupTimer) clearTimeout(session.cleanupTimer);
     if (session.attemptKey) {
-      this.attemptKeyToSessionId.delete(this.attemptIndexKey(session.workspaceId, session.attemptKey));
+      this.attemptKeyToSessionId.delete(this.attemptIndexKey(session.workspaceId, session.workspaceRoot, session.attemptKey));
     }
     this.sessions.delete(sessionId);
   }

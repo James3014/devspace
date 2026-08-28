@@ -146,7 +146,7 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
         }
 
         await callbacks?.onSessionId?.(threadId);
-        const completed = await this.rpc.runTurn(threadId, turnParams(input, threadId));
+        const completed = await this.rpc.runTurn(threadId, turnParams(input, threadId), callbacks?.onActivity);
         const parsed = parseCompletedTurn(completed.event.params, completed.items);
         if (parsed.failure) {
           throw new AgentProviderExecutionError({
@@ -322,6 +322,7 @@ interface CodexTurnAccumulator {
   completed?: CodexEvent;
   resolve: (result: CodexTurnResult) => void;
   reject: (error: Error) => void;
+  onActivity?: () => void | Promise<void>;
 }
 
 class CodexAppServerRpc {
@@ -359,7 +360,7 @@ class CodexAppServerRpc {
     this.write({ method, ...(params === undefined ? {} : { params }) });
   }
 
-  async runTurn(threadId: string, params: unknown): Promise<CodexTurnResult> {
+  async runTurn(threadId: string, params: unknown, onActivity?: () => void | Promise<void>): Promise<CodexTurnResult> {
     if (this.fatalError) throw this.fatalError;
     if (this.turns.has(threadId)) throw new Error(`Codex thread ${threadId} already has an active turn.`);
     let resolveTurn!: (result: CodexTurnResult) => void;
@@ -373,6 +374,7 @@ class CodexAppServerRpc {
       items: [],
       resolve: resolveTurn,
       reject: rejectTurn,
+      onActivity,
     };
     this.turns.set(threadId, turn);
     try {
@@ -429,6 +431,7 @@ class CodexAppServerRpc {
     const event = { method, params: message.params };
     const turn = this.findTurn(event);
     if (!turn) return;
+    void turn.onActivity?.();
     const params = asRecord(event.params);
     if (params?.item !== undefined) {
       turn.items.push(params.item);

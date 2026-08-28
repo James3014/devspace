@@ -2058,9 +2058,10 @@ export function createMcpServer(
     },
     async ({ workspaceId, attemptKey, sessionId, yieldTimeMs, maxOutputTokens }) => {
       const startedAt = performance.now();
-      workspaces.getWorkspace(workspaceId);
+      const workspace = workspaces.getWorkspace(workspaceId);
       const snapshot = await processSessions.getStatus({
         workspaceId,
+        workspaceRoot: workspace.root,
         attemptKey,
         sessionId,
         yieldTimeMs: yieldTimeMs ?? 5_000,
@@ -3028,8 +3029,8 @@ export function createServer(
   }, MCP_SESSION_CLEANUP_INTERVAL_MS);
   sessionCleanupTimer.unref();
 
-  if (config.logging.trustProxy) {
-    app.set("trust proxy", true);
+  if (config.logging.trustProxy !== false) {
+    app.set("trust proxy", config.logging.trustProxy);
   }
 
   app.use((req, res, next) => {

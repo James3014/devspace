@@ -32,6 +32,21 @@ C:\
 The narrower the root, the easier it is to reason about what the MCP client can
 reach.
 
+### External-directory access is not an implicit grant
+
+DevSpace does not support executing against an external directory merely because
+an agent provider can request or allow an `external_directory` permission. A
+target directory must first be opened as a DevSpace workspace (or the current
+workspace must be explicitly rebound to that target), and every subsequent tool
+call must use the returned `workspaceId`.
+
+There is no path-based implicit grant and no fallback from a rejected or
+unresolvable workspace to a string-prefix match. If the target is outside the
+configured roots, or the workspace session is unknown, the operation is denied;
+open or rebind the exact target under an allowed root instead. This keeps the
+MCP workspace/session authority separate from provider permission settings and
+prevents a look-alike path from widening the filesystem boundary.
+
 ## Owner Password
 
 `devspace init` generates an Owner password and stores it in:

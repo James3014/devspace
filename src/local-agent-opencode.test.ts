@@ -126,6 +126,7 @@ assert.deepEqual(agentInputs[0], { sessionID: "session_1", agent: "devspace_allo
 
 let readinessActiveCalls = 0;
 let readinessWaitCalls = 0;
+let readinessActivityCalls = 0;
 const readinessRaceClient = {
   v2: {
     session: {
@@ -178,12 +179,13 @@ const readinessResult = await readinessPool.run(readinessDriver, {
   agentId: "agt_readiness",
   provider: "opencode",
   workspaceRoot: "/tmp/project",
-}, { prompt: "readiness", workspaceRoot: "/tmp/project" });
+}, { prompt: "readiness", workspaceRoot: "/tmp/project" }, { onActivity: () => { readinessActivityCalls += 1; } });
 assert.equal(readinessResult.isOk(), true, "OpenCode should wait for the active session to finish");
 if (readinessResult.isOk()) {
   assert.equal(readinessResult.value.finalResponse, "ready response");
 }
 assert.equal(readinessWaitCalls, 0, "OpenCode should not rely on the unavailable wait endpoint");
+assert.equal(readinessActivityCalls, 6, "OpenCode should touch setup plus changed provider evidence, not every unchanged poll");
 await readinessPool.close();
 
 const longSessionRequests: Array<{ cursor?: string; order?: string }> = [];

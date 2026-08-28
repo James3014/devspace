@@ -278,8 +278,16 @@ npx @waishnav/devspace serve
 | `DEVSPACE_LOG_TOOL_CALLS` | `1` |
 | `DEVSPACE_LOG_SHELL_COMMANDS` | `0` |
 | `DEVSPACE_TRUST_PROXY` | `0` |
+| `DEVSPACE_TRUST_PROXY_HOPS` | unset |
 
 Set `DEVSPACE_LOG_FORMAT=pretty` for local debugging.
+
+Proxy trust is disabled by default. For a tunnel or reverse proxy, set
+`DEVSPACE_TRUST_PROXY_HOPS` to the exact number of trusted proxy hops (for
+example, `1`). This configures Express and rate limiting with a bounded hop
+count. All truthy values of the legacy `DEVSPACE_TRUST_PROXY` setting
+(`1`/`true`/`yes`/`on`) are rejected because they would enable universal proxy
+trust; migrate to the positive hop-count setting instead.
 
 Set `DEVSPACE_LOG_SHELL_COMMANDS=1` only when you intentionally want command
 previews in logs.

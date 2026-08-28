@@ -198,6 +198,7 @@ export async function runOmpAcpLocalAgent(
       .onNotification(methods.client.session.update, (context) => {
         const notification = context.params;
         if (activeSessionId && notification.sessionId !== activeSessionId) return;
+        void callbacks?.onActivity?.();
         items.push(notification);
         const update = notification.update;
         if (update.sessionUpdate !== "agent_message_chunk") return;

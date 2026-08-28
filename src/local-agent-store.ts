@@ -120,7 +120,7 @@ export interface LocalAgentListScope {
 
 export interface FenceActiveTurnInput {
   agentId: string;
-  expectedPhase?: "startup" | "execution" | "any";
+  expectedPhase?: "startup" | "execution" | "idle" | "any";
   budgetMs?: number;
   terminalReason: AgentTerminalReason;
   error: string;
@@ -271,6 +271,7 @@ export class LocalAgentStore {
             activeTurn: {
               generation: randomUUID(),
               turnStartedAt: now,
+              lastActivityAt: now,
               launchState: "not_started",
             },
           }
@@ -516,6 +517,7 @@ export class LocalAgentStore {
         activeTurn: {
           generation: randomUUID(),
           turnStartedAt: now,
+          lastActivityAt: now,
           launchState: "not_started",
         },
         terminationPending: undefined,
@@ -665,7 +667,7 @@ export class LocalAgentStore {
       if (activeTurn.executionStartedAt) return current;
       const lifecycleState: AgentLifecycleState = {
         ...current.lifecycleState,
-        activeTurn: { ...activeTurn, executionStartedAt },
+        activeTurn: { ...activeTurn, executionStartedAt, lastActivityAt: executionStartedAt },
       };
       const now = new Date().toISOString();
       const result = this.database.sqlite.prepare(
@@ -678,6 +680,43 @@ export class LocalAgentStore {
       return this.getById(id) ?? current;
     });
     return mark.immediate();
+  }
+
+  /** Persist a provider/runtime event as the authoritative idle clock. */
+  touchActivityCAS(
+    id: string,
+    generation: string,
+    workerToken: string,
+    activityAt = new Date().toISOString(),
+  ): LifecycleCasResult {
+    const touch = this.database.sqlite.transaction(() => {
+      const current = this.getById(id);
+      const lifecycle = current?.lifecycleState;
+      const activeTurn = lifecycle?.activeTurn;
+      if (
+        !current ||
+        !isDetachedLifecycle(lifecycle) ||
+        !activeTurn ||
+        activeTurn.generation !== generation ||
+        lifecycle.terminationPending ||
+        lifecycle.lifecycleCorrupt ||
+        current.workerToken !== workerToken ||
+        (current.status !== "starting" && current.status !== "running")
+      ) {
+        return { applied: false, previous: current, current };
+      }
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        activeTurn: { ...activeTurn, lastActivityAt: activityAt },
+      };
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set lifecycle_state = ?, updated_at = ?
+         where id = ? and worker_token = ? and updated_at = ?`,
+      ).run(JSON.stringify(lifecycleState), activityAt, id, workerToken, current.updatedAt);
+      const refreshed = this.getById(id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return touch.immediate();
   }
 
   updateTurnEvidenceCAS(
@@ -881,6 +920,12 @@ export class LocalAgentStore {
       } else if (input.expectedPhase === "execution") {
         if (executionStartedAtMs === undefined) return { applied: false, previous: current, current };
         if (input.budgetMs !== undefined && nowMs - executionStartedAtMs <= input.budgetMs) {
+          return { applied: false, previous: current, current };
+        }
+      } else if (input.expectedPhase === "idle") {
+        if (executionStartedAtMs === undefined) return { applied: false, previous: current, current };
+        const activityAtMs = Date.parse(activeTurn.lastActivityAt ?? activeTurn.executionStartedAt!);
+        if (input.budgetMs !== undefined && nowMs - activityAtMs <= input.budgetMs) {
           return { applied: false, previous: current, current };
         }
       } else if (input.budgetMs !== undefined && nowMs - turnStartedAtMs <= input.budgetMs) {
@@ -1490,6 +1535,9 @@ function readActiveTurnState(value: unknown): ActiveTurnState | undefined {
     generation: record.generation,
     turnStartedAt: record.turnStartedAt,
     executionStartedAt: record.executionStartedAt as string | undefined,
+    lastActivityAt: typeof record.lastActivityAt === "string" && Number.isFinite(Date.parse(record.lastActivityAt))
+      ? record.lastActivityAt
+      : undefined,
     launchState,
   };
 }

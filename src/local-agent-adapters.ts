@@ -489,6 +489,10 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
       );
     }
 
+    // Agy's JSON protocol has no trustworthy incremental event boundary;
+    // record activity only once the complete provider response is available.
+    await callbacks?.onActivity?.();
+
     let parsed: any;
     try {
       parsed = JSON.parse(stdout.trim());
@@ -553,8 +557,6 @@ async function drainOwnedChildOutput(
       child.stderr.off("data", onData);
       child.stdout.off("end", onStdoutEnd);
       child.stderr.off("end", onStderrEnd);
-      child.stdout.off("close", onStdoutEnd);
-      child.stderr.off("close", onStderrEnd);
     };
     const finish = () => { cleanup(); resolve(); };
     const onData = () => {
@@ -571,8 +573,6 @@ async function drainOwnedChildOutput(
     child.stderr.on("data", onData);
     child.stdout.once("end", onStdoutEnd);
     child.stderr.once("end", onStderrEnd);
-    child.stdout.once("close", onStdoutEnd);
-    child.stderr.once("close", onStderrEnd);
     timer = setTimeout(finish, AGY_OUTPUT_DRAIN_TIMEOUT_MS);
     onData();
     if (stdoutEnded && stderrEnded) finish();
