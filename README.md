@@ -154,7 +154,8 @@ DevSpace provides tools for:
 A loopback/raw DevSpace instance can expose the canonical Repository Intelligence V1 CLI as four narrow read-only MCP tools without giving the model a generic shell for RI computation:
 
 ```bash
-export DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT=/path/to/nexus-opencli-reviewer
+export DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT=/path/to/repository-intelligence-engine
+export DEVSPACE_REPOSITORY_INTELLIGENCE_EXPECTED_HEAD=<exact 40-character Git HEAD SHA>
 # Optional; defaults to python3
 export DEVSPACE_REPOSITORY_INTELLIGENCE_PYTHON_BIN=/path/to/python3
 ```
@@ -162,11 +163,11 @@ export DEVSPACE_REPOSITORY_INTELLIGENCE_PYTHON_BIN=/path/to/python3
 When configured, the raw surface registers `repository_intelligence_revision`,
 `repository_intelligence_readiness`, `repository_intelligence_overlap`, and
 `repository_intelligence_ci`. The tools accept normalized structured evidence,
-invoke `python -m reviewer.intelligence_cli` with a server-controlled operation
-and `shell=false`, and preserve the Core claim ceilings (`PR_INTELLIGENCE_ONLY`
-or `CI_EVIDENCE_ONLY`). They do not fetch GitHub, write state, invoke an LLM,
-approve, or merge. They are intentionally absent from the public
-`canonical_gateway_proxy` surface.
+invoke `python -m repository_intelligence.cli` with a server-controlled operation
+and `shell=false`, verify the exact engine Git HEAD before execution, and preserve
+the Core claim ceilings (`PR_INTELLIGENCE_ONLY` or `CI_EVIDENCE_ONLY`). They do
+not fetch GitHub, write state, invoke an LLM, approve, or merge. They are
+intentionally absent from the public `canonical_gateway_proxy` surface.
 
 ### Protected PR integration fallback (`git_merge_pull_request`)
 

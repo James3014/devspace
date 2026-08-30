@@ -291,25 +291,54 @@ assert.equal(
 
 // Optional Repository Intelligence raw-surface adapter config.
 assert.equal(loadConfig(baseEnv).repositoryIntelligenceRoot, undefined);
+assert.equal(loadConfig(baseEnv).repositoryIntelligenceExpectedHead, undefined);
 assert.equal(loadConfig(baseEnv).repositoryIntelligencePythonBin, undefined);
 {
   const allowedRoot = mkdtempSync(join(tmpdir(), "devspace-ri-config-"));
-  const riRoot = join(allowedRoot, "nexus-opencli-reviewer");
+  const riRoot = join(allowedRoot, "repository-intelligence-engine");
+  const testHead = "693ae7cf59e3b090ee873b7196ee330b30e26221";
   mkdirSync(riRoot, { recursive: true });
   try {
     const configured = loadConfig({
       ...baseEnv,
       DEVSPACE_ALLOWED_ROOTS: allowedRoot,
       DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT: riRoot,
+      DEVSPACE_REPOSITORY_INTELLIGENCE_EXPECTED_HEAD: testHead.toUpperCase(),
       DEVSPACE_REPOSITORY_INTELLIGENCE_PYTHON_BIN: "/opt/homebrew/bin/python3",
     });
     assert.equal(configured.repositoryIntelligenceRoot, riRoot);
+    assert.equal(configured.repositoryIntelligenceExpectedHead, testHead);
     assert.equal(configured.repositoryIntelligencePythonBin, "/opt/homebrew/bin/python3");
+
+    // Missing expected head when root is configured
+    assert.throws(
+      () => loadConfig({
+        ...baseEnv,
+        DEVSPACE_ALLOWED_ROOTS: allowedRoot,
+        DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT: riRoot,
+      }),
+      /DEVSPACE_REPOSITORY_INTELLIGENCE_EXPECTED_HEAD is required when DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT is configured/,
+    );
+
+    // Invalid expected head formats
+    for (const invalidHead of ["", "   ", "not-a-sha", "693ae7", testHead + "a", testHead.slice(0, 39), "z".repeat(40)]) {
+      assert.throws(
+        () => loadConfig({
+          ...baseEnv,
+          DEVSPACE_ALLOWED_ROOTS: allowedRoot,
+          DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT: riRoot,
+          DEVSPACE_REPOSITORY_INTELLIGENCE_EXPECTED_HEAD: invalidHead,
+        }),
+        /DEVSPACE_REPOSITORY_INTELLIGENCE_EXPECTED_HEAD/,
+      );
+    }
+
     assert.throws(
       () => loadConfig({
         ...baseEnv,
         DEVSPACE_ALLOWED_ROOTS: allowedRoot,
         DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT: join(tmpdir(), "outside-ri-root"),
+        DEVSPACE_REPOSITORY_INTELLIGENCE_EXPECTED_HEAD: testHead,
       }),
       /DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT must be inside DEVSPACE_ALLOWED_ROOTS/,
     );

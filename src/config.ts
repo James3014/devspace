@@ -60,6 +60,8 @@ export interface ServerConfig {
   nexusPythonBin?: string;
   /** Optional Repository Intelligence V1 project root used by raw DevSpace typed adapters. */
   repositoryIntelligenceRoot?: string;
+  /** Optional expected exact 40-hex Git HEAD of the Repository Intelligence engine root. Required when root is set. */
+  repositoryIntelligenceExpectedHead?: string;
   /** Optional Python executable for Repository Intelligence V1. Defaults to python3. */
   repositoryIntelligencePythonBin?: string;
   logging: LoggingConfig;
@@ -298,6 +300,35 @@ function parseRepositoryIntelligencePythonBin(value: string | undefined): string
   return raw || undefined;
 }
 
+function parseRepositoryIntelligenceExpectedHead(
+  value: string | undefined,
+  rootConfigured: boolean,
+): string | undefined {
+  const raw = value?.trim();
+  if (rootConfigured) {
+    if (!raw) {
+      throw new Error(
+        "DEVSPACE_REPOSITORY_INTELLIGENCE_EXPECTED_HEAD is required when DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT is configured",
+      );
+    }
+    if (!/^[0-9a-fA-F]{40}$/.test(raw)) {
+      throw new Error(
+        `Invalid DEVSPACE_REPOSITORY_INTELLIGENCE_EXPECTED_HEAD: ${raw}`,
+      );
+    }
+    return raw.toLowerCase();
+  }
+  if (raw) {
+    if (!/^[0-9a-fA-F]{40}$/.test(raw)) {
+      throw new Error(
+        `Invalid DEVSPACE_REPOSITORY_INTELLIGENCE_EXPECTED_HEAD: ${raw}`,
+      );
+    }
+    return raw.toLowerCase();
+  }
+  return undefined;
+}
+
 function parseGatewayProxyUrl(value: string | undefined): string | undefined {
   const raw = value?.trim();
   if (!raw) return undefined;
@@ -504,10 +535,20 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
         ? resolve(expandHomePath(env.NEXUS_CANONICAL_SOURCE_ROOT))
         : undefined,
     ),
-    repositoryIntelligenceRoot: parseRepositoryIntelligenceRoot(
-      env.DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT,
-      allowedRoots,
-    ),
+    ...(() => {
+      const repositoryIntelligenceRoot = parseRepositoryIntelligenceRoot(
+        env.DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT,
+        allowedRoots,
+      );
+      const repositoryIntelligenceExpectedHead = parseRepositoryIntelligenceExpectedHead(
+        env.DEVSPACE_REPOSITORY_INTELLIGENCE_EXPECTED_HEAD,
+        Boolean(repositoryIntelligenceRoot),
+      );
+      return {
+        repositoryIntelligenceRoot,
+        repositoryIntelligenceExpectedHead,
+      };
+    })(),
     repositoryIntelligencePythonBin: parseRepositoryIntelligencePythonBin(
       env.DEVSPACE_REPOSITORY_INTELLIGENCE_PYTHON_BIN,
     ),
