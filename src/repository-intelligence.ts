@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
+import { promisify } from "node:util";
 
 export const REPOSITORY_INTELLIGENCE_TOOL_NAMES = [
   "repository_intelligence_revision",
@@ -12,9 +13,15 @@ export const REPOSITORY_INTELLIGENCE_TOOL_NAMES = [
 
 export type RepositoryIntelligenceOperation = "revision" | "readiness" | "overlap" | "ci" | "impact" | "cfi" | "eia";
 
+export interface RepositoryIntelligenceEngineIdentity {
+  head: string;
+}
+
 export interface RepositoryIntelligenceRunnerConfig {
   root: string;
+  expectedHead: string;
   pythonBin?: string;
+  gitBin?: string;
   timeoutMs?: number;
   maxStdoutBytes?: number;
   maxStderrBytes?: number;
@@ -24,11 +31,14 @@ export interface RepositoryIntelligenceResult {
   operation: RepositoryIntelligenceOperation;
   claim_ceiling: "PR_INTELLIGENCE_ONLY" | "CI_EVIDENCE_ONLY" | "AUTOMATION_ADVISORY_ONLY";
   result: Record<string, unknown>;
+  engine: RepositoryIntelligenceEngineIdentity;
 }
 
 const DEFAULT_TIMEOUT_MS = 15_000;
+const DEFAULT_GIT_TIMEOUT_MS = 5_000;
 const DEFAULT_MAX_STDOUT_BYTES = 1024 * 1024;
 const DEFAULT_MAX_STDERR_BYTES = 64 * 1024;
+const execFileAsync = promisify(execFile);
 
 export function expectedRepositoryIntelligenceClaimCeiling(
   operation: RepositoryIntelligenceOperation,
@@ -41,6 +51,7 @@ export function expectedRepositoryIntelligenceClaimCeiling(
 function validateCanonicalPayload(
   operation: RepositoryIntelligenceOperation,
   value: unknown,
+  engine: RepositoryIntelligenceEngineIdentity,
 ): RepositoryIntelligenceResult {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("Repository Intelligence returned a non-object JSON payload");
@@ -60,7 +71,45 @@ function validateCanonicalPayload(
   if (result.claim_ceiling !== undefined && result.claim_ceiling !== expected) {
     throw new Error(`Repository Intelligence nested claim ceiling mismatch: expected ${expected}`);
   }
-  return { operation, claim_ceiling: expected, result };
+  return { operation, claim_ceiling: expected, result, engine };
+}
+
+export async function verifyRepositoryIntelligenceEngineHead(
+  root: string,
+  expectedHead: string,
+  options: { gitBin?: string; timeoutMs?: number } = {},
+): Promise<string> {
+  const normalizedExpected = expectedHead.trim().toLowerCase();
+  if (!/^[0-9a-f]{40}$/.test(normalizedExpected)) {
+    throw new Error(`Invalid expected Repository Intelligence engine HEAD: ${expectedHead}`);
+  }
+  try {
+    const { stdout } = await execFileAsync(
+      options.gitBin?.trim() || "git",
+      ["-C", root, "rev-parse", "HEAD"],
+      {
+        encoding: "utf8",
+        env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+        maxBuffer: 4096,
+        timeout: options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS,
+      },
+    );
+    const actualHead = stdout.trim().toLowerCase();
+    if (!/^[0-9a-f]{40}$/.test(actualHead)) {
+      throw new Error(`Invalid Git HEAD returned by engine root: ${stdout.trim()}`);
+    }
+    if (actualHead !== normalizedExpected) {
+      throw new Error(`Repository Intelligence engine HEAD mismatch: expected ${normalizedExpected}, got ${actualHead}`);
+    }
+    return actualHead;
+  } catch (error) {
+    if (error instanceof Error && (
+      error.message.startsWith("Repository Intelligence engine HEAD mismatch") ||
+      error.message.startsWith("Invalid Git HEAD returned")
+    )) throw error;
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Failed to resolve Repository Intelligence engine Git HEAD: ${detail}`);
+  }
 }
 
 export async function runRepositoryIntelligenceOperation(
@@ -68,6 +117,16 @@ export async function runRepositoryIntelligenceOperation(
   operation: RepositoryIntelligenceOperation,
   input: unknown,
 ): Promise<RepositoryIntelligenceResult> {
+  const verifiedHead = await verifyRepositoryIntelligenceEngineHead(
+    config.root,
+    config.expectedHead,
+    {
+      gitBin: config.gitBin,
+      timeoutMs: config.timeoutMs
+        ? Math.min(config.timeoutMs, DEFAULT_GIT_TIMEOUT_MS)
+        : DEFAULT_GIT_TIMEOUT_MS,
+    },
+  );
   const timeoutMs = config.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const maxStdoutBytes = config.maxStdoutBytes ?? DEFAULT_MAX_STDOUT_BYTES;
   const maxStderrBytes = config.maxStderrBytes ?? DEFAULT_MAX_STDERR_BYTES;
@@ -77,7 +136,7 @@ export async function runRepositoryIntelligenceOperation(
   return await new Promise<RepositoryIntelligenceResult>((resolve, reject) => {
     const child = spawn(
       pythonBin,
-      ["-m", "reviewer.intelligence_cli", "--operation", operation, "--input", "-"],
+      ["-m", "repository_intelligence.cli", "--operation", operation, "--input", "-"],
       {
         cwd: config.root,
         shell: false,
@@ -138,7 +197,7 @@ export async function runRepositoryIntelligenceOperation(
         return;
       }
       try {
-        resolve(validateCanonicalPayload(operation, JSON.parse(out)));
+        resolve(validateCanonicalPayload(operation, JSON.parse(out), { head: verifiedHead }));
       } catch (error) {
         reject(error instanceof SyntaxError
           ? new Error("Repository Intelligence returned invalid JSON")

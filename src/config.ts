@@ -40,6 +40,7 @@ export interface ServerConfig {
   codexGoalsEnabled: boolean;
   codexBin?: string;
   repositoryIntelligenceRoot?: string;
+  repositoryIntelligenceExpectedHead?: string;
   repositoryIntelligencePythonBin?: string;
 }
 
@@ -258,6 +259,23 @@ function parseRepositoryIntelligencePythonBin(value: string | undefined): string
   return raw || undefined;
 }
 
+function parseRepositoryIntelligenceExpectedHead(
+  value: string | undefined,
+  rootConfigured: boolean,
+): string | undefined {
+  const raw = value?.trim();
+  if (rootConfigured && !raw) {
+    throw new Error(
+      "DEVSPACE_REPOSITORY_INTELLIGENCE_EXPECTED_HEAD is required when DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT is configured",
+    );
+  }
+  if (!raw) return undefined;
+  if (!/^[0-9a-fA-F]{40}$/.test(raw)) {
+    throw new Error(`Invalid DEVSPACE_REPOSITORY_INTELLIGENCE_EXPECTED_HEAD: ${raw}`);
+  }
+  return raw.toLowerCase();
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const files = loadDevspaceFiles(env);
   const host = env.HOST ?? files.config.host ?? "127.0.0.1";
@@ -314,10 +332,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     ),
     codexGoalsEnabled: parseBoolean(env.DEVSPACE_CODEX_GOALS),
     codexBin: env.DEVSPACE_CODEX_BIN?.trim() || undefined,
-    repositoryIntelligenceRoot: parseRepositoryIntelligenceRoot(
-      env.DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT,
-      allowedRoots,
-    ),
+    ...(() => {
+      const repositoryIntelligenceRoot = parseRepositoryIntelligenceRoot(
+        env.DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT,
+        allowedRoots,
+      );
+      return {
+        repositoryIntelligenceRoot,
+        repositoryIntelligenceExpectedHead: parseRepositoryIntelligenceExpectedHead(
+          env.DEVSPACE_REPOSITORY_INTELLIGENCE_EXPECTED_HEAD,
+          Boolean(repositoryIntelligenceRoot),
+        ),
+      };
+    })(),
     repositoryIntelligencePythonBin: parseRepositoryIntelligencePythonBin(
       env.DEVSPACE_REPOSITORY_INTELLIGENCE_PYTHON_BIN,
     ),
