@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { expandHomePath } from "./roots.js";
+import { expandHomePath, isPathInsideRoot } from "./roots.js";
 import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
 import { loadDevspaceFiles, type DevspaceFiles } from "./user-config.js";
@@ -58,6 +58,10 @@ export interface ServerConfig {
   nexusCanonicalSourceRoot?: string;
   /** Python interpreter used only for the server-local #599 completion bridge. */
   nexusPythonBin?: string;
+  /** Optional Repository Intelligence V1 project root used by raw DevSpace typed adapters. */
+  repositoryIntelligenceRoot?: string;
+  /** Optional Python executable for Repository Intelligence V1. Defaults to python3. */
+  repositoryIntelligencePythonBin?: string;
   logging: LoggingConfig;
 }
 
@@ -276,6 +280,24 @@ function parseNexusPythonBin(value: string | undefined, canonicalRoot: string | 
   return existsSync(bound) ? bound : undefined;
 }
 
+function parseRepositoryIntelligenceRoot(
+  value: string | undefined,
+  allowedRoots: string[],
+): string | undefined {
+  const raw = value?.trim();
+  if (!raw) return undefined;
+  const root = resolve(expandHomePath(raw));
+  if (!allowedRoots.some((allowedRoot) => isPathInsideRoot(root, allowedRoot))) {
+    throw new Error("DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT must be inside DEVSPACE_ALLOWED_ROOTS");
+  }
+  return root;
+}
+
+function parseRepositoryIntelligencePythonBin(value: string | undefined): string | undefined {
+  const raw = value?.trim();
+  return raw || undefined;
+}
+
 function parseGatewayProxyUrl(value: string | undefined): string | undefined {
   const raw = value?.trim();
   if (!raw) return undefined;
@@ -432,6 +454,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     env.DEVSPACE_PUBLIC_BASE_URL ?? files.config.publicBaseUrl ?? localPublicBaseUrl(host, port),
   );
   const gatewayProxyUrlCandidate = parseGatewayProxyUrl(env.NEXUS_GATEWAY_PROXY_URL);
+  const allowedRoots = parseAllowedRoots(env.DEVSPACE_ALLOWED_ROOTS ?? files.config.allowedRoots);
   const derivedAllowedHosts = [
     "localhost",
     "127.0.0.1",
@@ -457,7 +480,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     host,
     port,
     oauth: parseOAuthConfig(env, files.auth.ownerToken),
-    allowedRoots: parseAllowedRoots(env.DEVSPACE_ALLOWED_ROOTS ?? files.config.allowedRoots),
+    allowedRoots,
     allowedHosts: parseAllowedHosts(env.DEVSPACE_ALLOWED_HOSTS, derivedAllowedHosts),
     publicBaseUrl,
     minimalTools: parseMinimalTools(env),
@@ -480,6 +503,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       env.NEXUS_CANONICAL_SOURCE_ROOT
         ? resolve(expandHomePath(env.NEXUS_CANONICAL_SOURCE_ROOT))
         : undefined,
+    ),
+    repositoryIntelligenceRoot: parseRepositoryIntelligenceRoot(
+      env.DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT,
+      allowedRoots,
+    ),
+    repositoryIntelligencePythonBin: parseRepositoryIntelligencePythonBin(
+      env.DEVSPACE_REPOSITORY_INTELLIGENCE_PYTHON_BIN,
     ),
     logging: parseLoggingConfig(env),
   };

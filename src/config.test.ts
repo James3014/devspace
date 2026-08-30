@@ -289,6 +289,35 @@ assert.equal(
   }
 }
 
+// Optional Repository Intelligence raw-surface adapter config.
+assert.equal(loadConfig(baseEnv).repositoryIntelligenceRoot, undefined);
+assert.equal(loadConfig(baseEnv).repositoryIntelligencePythonBin, undefined);
+{
+  const allowedRoot = mkdtempSync(join(tmpdir(), "devspace-ri-config-"));
+  const riRoot = join(allowedRoot, "nexus-opencli-reviewer");
+  mkdirSync(riRoot, { recursive: true });
+  try {
+    const configured = loadConfig({
+      ...baseEnv,
+      DEVSPACE_ALLOWED_ROOTS: allowedRoot,
+      DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT: riRoot,
+      DEVSPACE_REPOSITORY_INTELLIGENCE_PYTHON_BIN: "/opt/homebrew/bin/python3",
+    });
+    assert.equal(configured.repositoryIntelligenceRoot, riRoot);
+    assert.equal(configured.repositoryIntelligencePythonBin, "/opt/homebrew/bin/python3");
+    assert.throws(
+      () => loadConfig({
+        ...baseEnv,
+        DEVSPACE_ALLOWED_ROOTS: allowedRoot,
+        DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT: join(tmpdir(), "outside-ri-root"),
+      }),
+      /DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT must be inside DEVSPACE_ALLOWED_ROOTS/,
+    );
+  } finally {
+    rmSync(allowedRoot, { recursive: true, force: true });
+  }
+}
+
 // Hybrid public surface identity: canonical gateway manifest + local protected extension
 {
   const proxyConfig = loadConfig({

@@ -149,6 +149,25 @@ DevSpace provides tools for:
 - exposing local agent skills from your skill folders
 - showing ChatGPT Apps tool cards, with an opt-in aggregate `show_changes` card
 
+### Repository Intelligence V1 native tools (opt-in raw surface)
+
+A loopback/raw DevSpace instance can expose the canonical Repository Intelligence V1 CLI as four narrow read-only MCP tools without giving the model a generic shell for RI computation:
+
+```bash
+export DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT=/path/to/nexus-opencli-reviewer
+# Optional; defaults to python3
+export DEVSPACE_REPOSITORY_INTELLIGENCE_PYTHON_BIN=/path/to/python3
+```
+
+When configured, the raw surface registers `repository_intelligence_revision`,
+`repository_intelligence_readiness`, `repository_intelligence_overlap`, and
+`repository_intelligence_ci`. The tools accept normalized structured evidence,
+invoke `python -m reviewer.intelligence_cli` with a server-controlled operation
+and `shell=false`, and preserve the Core claim ceilings (`PR_INTELLIGENCE_ONLY`
+or `CI_EVIDENCE_ONLY`). They do not fetch GitHub, write state, invoke an LLM,
+approve, or merge. They are intentionally absent from the public
+`canonical_gateway_proxy` surface.
+
 ### Protected PR integration fallback (`git_merge_pull_request`)
 
 `git_merge_pull_request` is a narrow, protected fallback for when the primary

@@ -75,6 +75,10 @@ import {
   createMcpTransportBoundary,
   extractMcpRequestTraceContext,
 } from "./mcp-transport.js";
+import {
+  runRepositoryIntelligenceOperation,
+  type RepositoryIntelligenceOperation,
+} from "./repository-intelligence.js";
 
 const WORKSPACE_APP_URI = "ui://devspace/workspace-app.html";
 const WORKSPACE_APP_MANIFEST_ENTRY = "workspace-app.html";
@@ -101,6 +105,12 @@ const PR_MERGE_TOOL_ANNOTATIONS = {
   destructiveHint: true,
   idempotentHint: false,
   openWorldHint: true,
+};
+const REPOSITORY_INTELLIGENCE_TOOL_ANNOTATIONS = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
 };
 
 interface RunningServer {
@@ -240,8 +250,11 @@ function serverInstructions(config: ServerConfig, toolNames: ToolNames): string 
     config.widgets === "changes"
       ? " After creating, editing, or overwriting files, call show_changes once after the related file changes are complete so the user can see the aggregate diff."
       : "";
+  const repositoryIntelligence = config.repositoryIntelligenceRoot
+    ? " When normalized repository evidence is already available, prefer the typed repository_intelligence_* tools over shell commands for canonical Repository Intelligence V1 computation. These tools are read-only and do not fetch GitHub or grant merge/approval authority."
+    : "";
 
-  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${showChanges}`;
+  return `Use DevSpace as a local coding workspace. Call ${toolNames.openWorkspace} once per project folder or worktree to obtain a workspaceId. Reuse that same workspaceId for all later file, search, edit, write, show-changes, and shell tools in that folder; do not call ${toolNames.openWorkspace} again unless switching folders/worktrees, changing checkout/worktree mode, the workspaceId is rejected as unknown, or the user explicitly asks to reopen. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${repositoryIntelligence}${showChanges}`;
 }
 function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
   return {
@@ -504,6 +517,117 @@ export interface DevSpaceMcpServerOverrides {
   gitMergeTargetResolver?: () => IntegrationTargetResolver;
 }
 
+function registerRepositoryIntelligenceTools(
+  server: McpServer,
+  config: ServerConfig,
+  workspaces: WorkspaceRegistry,
+): void {
+  const root = config.repositoryIntelligenceRoot;
+  if (!root) return;
+
+  const snapshotSchema = z.record(z.string(), z.unknown());
+  const specs: Array<{
+    name: string;
+    title: string;
+    description: string;
+    operation: RepositoryIntelligenceOperation;
+    inputSchema: Record<string, z.ZodType>;
+    extractInput: (input: Record<string, unknown>) => unknown;
+  }> = [
+    {
+      name: "repository_intelligence_revision",
+      title: "Repository Intelligence revision",
+      description:
+        "Compute canonical Repository Intelligence V1 revision/staleness identity from normalized evidence already supplied by the caller. Read-only: does not fetch GitHub, write state, invoke an LLM, approve, or merge.",
+      operation: "revision",
+      inputSchema: { workspaceId: z.string(), snapshot: snapshotSchema },
+      extractInput: (input) => input.snapshot,
+    },
+    {
+      name: "repository_intelligence_readiness",
+      title: "Repository Intelligence readiness",
+      description:
+        "Compute canonical Repository Intelligence V1 advisory PR readiness from normalized evidence already supplied by the caller. Read-only: does not fetch GitHub, write state, invoke an LLM, approve, or merge.",
+      operation: "readiness",
+      inputSchema: { workspaceId: z.string(), snapshot: snapshotSchema },
+      extractInput: (input) => input.snapshot,
+    },
+    {
+      name: "repository_intelligence_overlap",
+      title: "Repository Intelligence overlap",
+      description:
+        "Compute canonical Repository Intelligence V1 cross-PR overlap from normalized snapshot evidence already supplied by the caller. Read-only: does not fetch GitHub, write state, invoke an LLM, approve, or merge.",
+      operation: "overlap",
+      inputSchema: { workspaceId: z.string(), snapshots: z.array(snapshotSchema) },
+      extractInput: (input) => ({ snapshots: input.snapshots }),
+    },
+    {
+      name: "repository_intelligence_ci",
+      title: "Repository Intelligence CI evidence",
+      description:
+        "Compute canonical Repository Intelligence V1 CI failure evidence from normalized evidence already supplied by the caller. Read-only: does not fetch GitHub, write state, invoke an LLM, approve, or merge.",
+      operation: "ci",
+      inputSchema: { workspaceId: z.string(), snapshot: snapshotSchema },
+      extractInput: (input) => input.snapshot,
+    },
+  ];
+
+  for (const spec of specs) {
+    registerAppTool(
+      server as never,
+      spec.name,
+      {
+        title: spec.title,
+        description: spec.description,
+        _meta: {},
+        inputSchema: spec.inputSchema,
+        annotations: REPOSITORY_INTELLIGENCE_TOOL_ANNOTATIONS,
+      },
+      async (rawInput) => {
+        const startedAt = performance.now();
+        const input = rawInput as Record<string, unknown>;
+        const workspaceId = String(input.workspaceId ?? "");
+        workspaces.getWorkspace(workspaceId);
+        try {
+          const result = await runRepositoryIntelligenceOperation(
+            {
+              root,
+              pythonBin: config.repositoryIntelligencePythonBin,
+            },
+            spec.operation,
+            spec.extractInput(input),
+          );
+          const text = JSON.stringify(result, null, 2);
+          logToolCall(config, {
+            tool: spec.name,
+            workspaceId,
+            success: true,
+            durationMs: Math.round(performance.now() - startedAt),
+          });
+          return {
+            content: [textBlock(text)],
+            structuredContent: result as unknown as Record<string, unknown>,
+          };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          logToolCall(config, {
+            tool: spec.name,
+            workspaceId,
+            success: false,
+            durationMs: Math.round(performance.now() - startedAt),
+            error: message.slice(0, 240),
+          });
+          return {
+            content: [textBlock(message)],
+            isError: true,
+            structuredContent: { error: message },
+          };
+        }
+      },
+    );
+  }
+}
+
 export async function createMcpServer(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
@@ -563,6 +687,8 @@ export async function createMcpServer(
       };
     },
   );
+
+  registerRepositoryIntelligenceTools(server, config, workspaces);
 
   registerAppTool(
     server as never,
