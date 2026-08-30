@@ -146,7 +146,7 @@ DevSpace gives ChatGPT tools to:
 - discover local agent skills from your skill folders
 - show tool cards and optional change summaries in ChatGPT Apps-compatible hosts
 
-For installations that also use Repository Intelligence V1, DevSpace can expose its canonical local CLI through four opt-in, read-only MCP tools. Configure a Repository Intelligence project root inside `DEVSPACE_ALLOWED_ROOTS`:
+For installations that also use Repository Intelligence V1/V1.1, DevSpace can expose its canonical local CLI through five opt-in, read-only MCP tools. Configure a Repository Intelligence project root inside `DEVSPACE_ALLOWED_ROOTS`:
 
 ```bash
 export DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT=/path/to/nexus-opencli-reviewer
@@ -154,7 +154,7 @@ export DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT=/path/to/nexus-opencli-reviewer
 export DEVSPACE_REPOSITORY_INTELLIGENCE_PYTHON_BIN=/path/to/python3
 ```
 
-This registers `repository_intelligence_revision`, `repository_intelligence_readiness`, `repository_intelligence_overlap`, and `repository_intelligence_ci`. They accept normalized structured evidence, invoke the canonical `reviewer.intelligence_cli` without a shell, preserve `PR_INTELLIGENCE_ONLY` / `CI_EVIDENCE_ONLY`, and do not fetch GitHub, write state, invoke an LLM, approve, or merge.
+This registers `repository_intelligence_revision`, `repository_intelligence_readiness`, `repository_intelligence_overlap`, `repository_intelligence_ci`, and `repository_intelligence_impact`. They accept normalized structured evidence, invoke the canonical `reviewer.intelligence_cli` without a shell, preserve `PR_INTELLIGENCE_ONLY` / `CI_EVIDENCE_ONLY`, and do not fetch GitHub, write state, invoke an LLM, approve, or merge. The V1.1 impact tool consumes normalized repository graph evidence; DevSpace does not parse source or become the graph authority.
 
 ## Mental Model
 

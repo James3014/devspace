@@ -5,9 +5,10 @@ export const REPOSITORY_INTELLIGENCE_TOOL_NAMES = [
   "repository_intelligence_readiness",
   "repository_intelligence_overlap",
   "repository_intelligence_ci",
+  "repository_intelligence_impact",
 ] as const;
 
-export type RepositoryIntelligenceOperation = "revision" | "readiness" | "overlap" | "ci";
+export type RepositoryIntelligenceOperation = "revision" | "readiness" | "overlap" | "ci" | "impact";
 
 export interface RepositoryIntelligenceRunnerConfig {
   root: string;

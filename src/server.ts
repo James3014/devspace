@@ -1117,6 +1117,29 @@ function registerRepositoryIntelligenceTools(
       inputSchema: { workspaceId: z.string().describe(workspaceIdDescription), snapshot: snapshotSchema },
       extractInput: (input) => input.snapshot,
     },
+    {
+      name: "repository_intelligence_impact",
+      title: "Repository Intelligence change impact",
+      description: "Compute canonical Repository Intelligence V1.1 downstream Change Impact from normalized repository graph evidence already supplied by the caller. Read-only: does not fetch GitHub, parse source, write state, invoke an LLM, approve, or merge.",
+      operation: "impact",
+      inputSchema: {
+        workspaceId: z.string().describe(workspaceIdDescription),
+        snapshot: snapshotSchema,
+        covered_files: z.array(z.string()),
+        dependency_edges: z.array(z.object({ consumer: z.string(), dependency: z.string() })),
+        observed_symbols: z.record(z.string(), z.array(z.string())).optional(),
+        graph_complete: z.boolean(),
+        graph_errors: z.array(z.string()).optional(),
+      },
+      extractInput: (input) => ({
+        snapshot: input.snapshot,
+        covered_files: input.covered_files,
+        dependency_edges: input.dependency_edges,
+        observed_symbols: input.observed_symbols ?? {},
+        graph_complete: input.graph_complete,
+        graph_errors: input.graph_errors ?? [],
+      }),
+    },
   ];
 
   for (const spec of specs) {

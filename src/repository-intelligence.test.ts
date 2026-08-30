@@ -60,6 +60,13 @@ test("runner preserves operation and exact claim ceilings", async () => {
     assert.deepEqual((readiness.result.echo as Record<string, unknown>).custom, { preserved: true });
     const ci = await runRepositoryIntelligenceOperation({ root, pythonBin }, "ci", snapshot);
     assert.equal(ci.claim_ceiling, "CI_EVIDENCE_ONLY");
+    const impact = await runRepositoryIntelligenceOperation({ root, pythonBin }, "impact", {
+      snapshot,
+      covered_files: ["src/a.ts"],
+      dependency_edges: [],
+      graph_complete: true,
+    });
+    assert.equal(impact.claim_ceiling, "PR_INTELLIGENCE_ONLY");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -147,6 +154,15 @@ test("native tools are opt-in and exactly read-only when enabled", async () => {
         ["repository_intelligence_readiness", "readiness", "PR_INTELLIGENCE_ONLY", { workspaceId: opened.workspace.id, snapshot }],
         ["repository_intelligence_overlap", "overlap", "PR_INTELLIGENCE_ONLY", { workspaceId: opened.workspace.id, snapshots: [snapshot] }],
         ["repository_intelligence_ci", "ci", "CI_EVIDENCE_ONLY", { workspaceId: opened.workspace.id, snapshot }],
+        ["repository_intelligence_impact", "impact", "PR_INTELLIGENCE_ONLY", {
+          workspaceId: opened.workspace.id,
+          snapshot,
+          covered_files: ["src/a.ts"],
+          dependency_edges: [],
+          observed_symbols: { "src/a.ts": ["A"] },
+          graph_complete: true,
+          graph_errors: [],
+        }],
       ] as const;
       for (const [name, operation, ceiling, args] of cases) {
         const response = await connected.client.callTool({ name, arguments: args as unknown as Record<string, unknown> });
