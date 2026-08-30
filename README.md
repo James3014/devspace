@@ -146,15 +146,16 @@ DevSpace gives ChatGPT tools to:
 - discover local agent skills from your skill folders
 - show tool cards and optional change summaries in ChatGPT Apps-compatible hosts
 
-For installations that also use Repository Intelligence V1/V1.1, DevSpace can expose its canonical local CLI through five opt-in, read-only MCP tools. Configure a Repository Intelligence project root inside `DEVSPACE_ALLOWED_ROOTS`:
+For installations that also use Repository Intelligence V1/V1.1, DevSpace can expose its canonical local CLI through seven opt-in, read-only MCP tools. Configure the exact engine root and Git HEAD inside `DEVSPACE_ALLOWED_ROOTS`:
 
 ```bash
-export DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT=/path/to/nexus-opencli-reviewer
+export DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT=/path/to/repository-intelligence-engine
+export DEVSPACE_REPOSITORY_INTELLIGENCE_EXPECTED_HEAD=<exact-40-character-git-head>
 # Optional; defaults to python3
 export DEVSPACE_REPOSITORY_INTELLIGENCE_PYTHON_BIN=/path/to/python3
 ```
 
-This registers `repository_intelligence_revision`, `repository_intelligence_readiness`, `repository_intelligence_overlap`, `repository_intelligence_ci`, and `repository_intelligence_impact`. They accept normalized structured evidence, invoke the canonical `reviewer.intelligence_cli` without a shell, preserve `PR_INTELLIGENCE_ONLY` / `CI_EVIDENCE_ONLY`, and do not fetch GitHub, write state, invoke an LLM, approve, or merge. The V1.1 impact tool consumes normalized repository graph evidence; DevSpace does not parse source or become the graph authority.
+This registers `repository_intelligence_revision`, `repository_intelligence_readiness`, `repository_intelligence_overlap`, `repository_intelligence_ci`, `repository_intelligence_impact`, `repository_intelligence_cfi`, and `repository_intelligence_eia`. They accept normalized structured evidence, verify the exact engine Git HEAD before every invocation, call `repository_intelligence.cli` without a shell, and return the verified identity as `engine.head`. PR, CI, and automation outputs remain bounded by `PR_INTELLIGENCE_ONLY`, `CI_EVIDENCE_ONLY`, and `AUTOMATION_ADVISORY_ONLY`. DevSpace does not fetch GitHub, parse source, write state, invoke an LLM, dispatch a worker, approve, or merge.
 
 ## Mental Model
 

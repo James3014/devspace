@@ -1074,7 +1074,8 @@ function registerRepositoryIntelligenceTools(
   workspaces: WorkspaceRegistry,
 ): void {
   const root = config.repositoryIntelligenceRoot;
-  if (!root) return;
+  const expectedHead = config.repositoryIntelligenceExpectedHead;
+  if (!root || !expectedHead) return;
 
   const snapshotSchema = z.record(z.string(), z.unknown());
   const specs: Array<{
@@ -1187,7 +1188,11 @@ function registerRepositoryIntelligenceTools(
         workspaces.getWorkspace(workspaceId);
         try {
           const result = await runRepositoryIntelligenceOperation(
-            { root, pythonBin: config.repositoryIntelligencePythonBin },
+            {
+              root,
+              expectedHead,
+              pythonBin: config.repositoryIntelligencePythonBin,
+            },
             spec.operation,
             spec.extractInput(input),
           );
