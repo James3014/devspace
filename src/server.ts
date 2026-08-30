@@ -1127,6 +1127,7 @@ function registerRepositoryIntelligenceTools(
         title: spec.title,
         description: spec.description,
         inputSchema: spec.inputSchema,
+        ...toolWidgetDescriptorMeta(config, "read"),
         annotations: REPOSITORY_INTELLIGENCE_TOOL_ANNOTATIONS,
       },
       async (rawInput) => {

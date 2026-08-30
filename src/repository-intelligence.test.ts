@@ -3,6 +3,8 @@ import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:f
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { loadConfig } from "./config.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
@@ -75,8 +77,8 @@ test("runner fails closed on malformed execution and claim evidence", async () =
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
-function makeServer(config: ReturnType<typeof loadConfig>, workspaces: WorkspaceRegistry) {
-  return createMcpServer(
+async function makeConnectedServer(config: ReturnType<typeof loadConfig>, workspaces: WorkspaceRegistry) {
+  const server = createMcpServer(
     config,
     workspaces,
     createReviewCheckpointManager(),
@@ -84,6 +86,13 @@ function makeServer(config: ReturnType<typeof loadConfig>, workspaces: Workspace
     () => [],
     [],
   );
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "ri-test-client", version: "1.0.0" });
+  await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+  return {
+    client,
+    close: async () => { await client.close(); await server.close(); },
+  };
 }
 
 test("native tools are opt-in and exactly read-only when enabled", async () => {
@@ -103,9 +112,15 @@ test("native tools are opt-in and exactly read-only when enabled", async () => {
     } as NodeJS.ProcessEnv;
 
     const disabled = loadConfig(baseEnv);
-    const disabledServer = makeServer(disabled, new WorkspaceRegistry(disabled));
-    const disabledTools = (disabledServer as unknown as { _registeredTools?: Record<string, unknown> })._registeredTools ?? {};
-    for (const name of REPOSITORY_INTELLIGENCE_TOOL_NAMES) assert.equal(disabledTools[name], undefined);
+    const disabledConnected = await makeConnectedServer(disabled, new WorkspaceRegistry(disabled));
+    try {
+      const disabledTools = (await disabledConnected.client.listTools()).tools;
+      for (const name of REPOSITORY_INTELLIGENCE_TOOL_NAMES) {
+        assert.equal(disabledTools.some((tool) => tool.name === name), false);
+      }
+    } finally {
+      await disabledConnected.close();
+    }
 
     const enabled = loadConfig({
       ...baseEnv,
@@ -114,36 +129,34 @@ test("native tools are opt-in and exactly read-only when enabled", async () => {
     });
     const workspaces = new WorkspaceRegistry(enabled);
     const opened = await workspaces.openWorkspace(project);
-    const server = makeServer(enabled, workspaces);
-    const tools = (server as unknown as {
-      _registeredTools?: Record<string, {
-        executor?: (args: Record<string, unknown>) => Promise<{ isError?: boolean; structuredContent?: Record<string, unknown> }>;
-        annotations?: Record<string, unknown>;
-      }>;
-    })._registeredTools ?? {};
+    const connected = await makeConnectedServer(enabled, workspaces);
+    try {
+      const tools = (await connected.client.listTools()).tools;
+      for (const name of REPOSITORY_INTELLIGENCE_TOOL_NAMES) {
+        const tool = tools.find((candidate) => candidate.name === name);
+        assert.ok(tool, `${name} must be registered`);
+        assert.equal(tool.annotations?.readOnlyHint, true);
+        assert.equal(tool.annotations?.destructiveHint, false);
+        assert.equal(tool.annotations?.idempotentHint, true);
+        assert.equal(tool.annotations?.openWorldHint, false);
+      }
 
-    for (const name of REPOSITORY_INTELLIGENCE_TOOL_NAMES) {
-      assert.ok(tools[name]?.executor, `${name} must be registered`);
-      assert.deepEqual(tools[name]?.annotations, {
-        readOnlyHint: true,
-        destructiveHint: false,
-        idempotentHint: true,
-        openWorldHint: false,
-      });
-    }
-
-    const snapshot = { repository: "owner/repo", pr_number: 7, custom: "preserved" };
-    const cases = [
-      ["repository_intelligence_revision", "revision", "PR_INTELLIGENCE_ONLY", { workspaceId: opened.workspace.id, snapshot }],
-      ["repository_intelligence_readiness", "readiness", "PR_INTELLIGENCE_ONLY", { workspaceId: opened.workspace.id, snapshot }],
-      ["repository_intelligence_overlap", "overlap", "PR_INTELLIGENCE_ONLY", { workspaceId: opened.workspace.id, snapshots: [snapshot] }],
-      ["repository_intelligence_ci", "ci", "CI_EVIDENCE_ONLY", { workspaceId: opened.workspace.id, snapshot }],
-    ] as const;
-    for (const [name, operation, ceiling, args] of cases) {
-      const response = await tools[name]!.executor!(args as unknown as Record<string, unknown>);
-      assert.equal(response.isError, undefined);
-      assert.equal(response.structuredContent?.operation, operation);
-      assert.equal(response.structuredContent?.claim_ceiling, ceiling);
+      const snapshot = { repository: "owner/repo", pr_number: 7, custom: "preserved" };
+      const cases = [
+        ["repository_intelligence_revision", "revision", "PR_INTELLIGENCE_ONLY", { workspaceId: opened.workspace.id, snapshot }],
+        ["repository_intelligence_readiness", "readiness", "PR_INTELLIGENCE_ONLY", { workspaceId: opened.workspace.id, snapshot }],
+        ["repository_intelligence_overlap", "overlap", "PR_INTELLIGENCE_ONLY", { workspaceId: opened.workspace.id, snapshots: [snapshot] }],
+        ["repository_intelligence_ci", "ci", "CI_EVIDENCE_ONLY", { workspaceId: opened.workspace.id, snapshot }],
+      ] as const;
+      for (const [name, operation, ceiling, args] of cases) {
+        const response = await connected.client.callTool({ name, arguments: args as unknown as Record<string, unknown> });
+        assert.equal(response.isError, undefined);
+        const structured = response.structuredContent as Record<string, unknown>;
+        assert.equal(structured.operation, operation);
+        assert.equal(structured.claim_ceiling, ceiling);
+      }
+    } finally {
+      await connected.close();
     }
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
