@@ -29,7 +29,9 @@ process.stdin.on('end', () => {
   if (mode === 'timeout') { setTimeout(() => {}, 60000); return; }
   const args = process.argv.slice(2);
   const operation = args[args.indexOf('--operation') + 1];
-  const ceiling = operation === 'ci' ? 'CI_EVIDENCE_ONLY' : 'PR_INTELLIGENCE_ONLY';
+  const ceiling = operation === 'ci' || operation === 'cfi'
+    ? 'CI_EVIDENCE_ONLY'
+    : operation === 'eia' ? 'AUTOMATION_ADVISORY_ONLY' : 'PR_INTELLIGENCE_ONLY';
   const top = mode === 'wrong-ceiling' ? 'PRE_REVIEW_ONLY' : ceiling;
   const nested = mode === 'wrong-nested-ceiling' ? 'PRE_REVIEW_ONLY' : ceiling;
   const input = JSON.parse(body || '{}');
@@ -67,6 +69,10 @@ test("runner preserves operation and exact claim ceilings", async () => {
       graph_complete: true,
     });
     assert.equal(impact.claim_ceiling, "PR_INTELLIGENCE_ONLY");
+    const cfi = await runRepositoryIntelligenceOperation({ root, pythonBin }, "cfi", snapshot);
+    assert.equal(cfi.claim_ceiling, "CI_EVIDENCE_ONLY");
+    const eia = await runRepositoryIntelligenceOperation({ root, pythonBin }, "eia", { snapshot });
+    assert.equal(eia.claim_ceiling, "AUTOMATION_ADVISORY_ONLY");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
 
@@ -163,6 +169,8 @@ test("native tools are opt-in and exactly read-only when enabled", async () => {
           graph_complete: true,
           graph_errors: [],
         }],
+        ["repository_intelligence_cfi", "cfi", "CI_EVIDENCE_ONLY", { workspaceId: opened.workspace.id, snapshot }],
+        ["repository_intelligence_eia", "eia", "AUTOMATION_ADVISORY_ONLY", { workspaceId: opened.workspace.id, snapshot }],
       ] as const;
       for (const [name, operation, ceiling, args] of cases) {
         const response = await connected.client.callTool({ name, arguments: args as unknown as Record<string, unknown> });
@@ -171,6 +179,20 @@ test("native tools are opt-in and exactly read-only when enabled", async () => {
         assert.equal(structured.operation, operation);
         assert.equal(structured.claim_ceiling, ceiling);
       }
+
+      const eiaMissing = await connected.client.callTool({
+        name: "repository_intelligence_eia",
+        arguments: { workspaceId: opened.workspace.id },
+      });
+      assert.equal(eiaMissing.isError, true);
+      assert.match(JSON.stringify(eiaMissing.structuredContent), /exactly one of snapshot or cfi_report/);
+
+      const eiaAmbiguous = await connected.client.callTool({
+        name: "repository_intelligence_eia",
+        arguments: { workspaceId: opened.workspace.id, snapshot, cfi_report: snapshot },
+      });
+      assert.equal(eiaAmbiguous.isError, true);
+      assert.match(JSON.stringify(eiaAmbiguous.structuredContent), /exactly one of snapshot or cfi_report/);
     } finally {
       await connected.close();
     }
