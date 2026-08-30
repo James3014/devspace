@@ -86,6 +86,10 @@ import {
 } from "./local-agent-sessions.js";
 import { parseExecutionContract } from "./local-agent-contract.js";
 import { runToolchainVerifier, resolveToolchainExecutable } from "./local-agent-toolchains.js";
+import {
+  runRepositoryIntelligenceOperation,
+  type RepositoryIntelligenceOperation,
+} from "./repository-intelligence.js";
 
 type Transport = StreamableHTTPServerTransport;
 // MCP clients can reconnect without closing the previous transport. Bound stale
@@ -123,6 +127,12 @@ const SHELL_TOOL_ANNOTATIONS = {
   openWorldHint: true,
 };
 const COMMAND_STATUS_TOOL_ANNOTATIONS = {
+  readOnlyHint: true,
+  destructiveHint: false,
+  idempotentHint: true,
+  openWorldHint: false,
+};
+const REPOSITORY_INTELLIGENCE_TOOL_ANNOTATIONS = {
   readOnlyHint: true,
   destructiveHint: false,
   idempotentHint: true,
@@ -254,9 +264,12 @@ function serverInstructions(config: ServerConfig): string {
   const codexGoalsInstruction = config.codexGoalsEnabled
     ? " When a task should be delegated to the real interactive Codex CLI, use codex_goal_start to launch a /goal session in an open workspace, then poll codex_goal_status, send follow-ups with codex_goal_continue, and stop it with codex_goal_cancel."
     : "";
+  const repositoryIntelligenceInstruction = config.repositoryIntelligenceRoot
+    ? " When normalized repository evidence is already available, prefer the typed repository_intelligence_* tools over bash for canonical Repository Intelligence V1 computation. These tools are read-only and do not fetch GitHub or grant approve/merge authority."
+    : "";
 
   if (config.toolMode === "codex") {
-    return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}${agentToolsInstruction}${gitCandidatesInstruction}${codexGoalsInstruction}`;
+    return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}${agentToolsInstruction}${gitCandidatesInstruction}${codexGoalsInstruction}${repositoryIntelligenceInstruction}`;
   }
 
   const inspection = config.toolMode !== "full"
@@ -269,7 +282,7 @@ function serverInstructions(config: ServerConfig): string {
 
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
 
-  return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}${agentToolsInstruction}${gitCandidatesInstruction}${codexGoalsInstruction}`;
+  return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}${agentToolsInstruction}${gitCandidatesInstruction}${codexGoalsInstruction}${repositoryIntelligenceInstruction}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -1055,6 +1068,108 @@ function registerCodexGoalTools(
   );
 }
 
+function registerRepositoryIntelligenceTools(
+  server: McpServer,
+  config: ServerConfig,
+  workspaces: WorkspaceRegistry,
+): void {
+  const root = config.repositoryIntelligenceRoot;
+  if (!root) return;
+
+  const snapshotSchema = z.record(z.string(), z.unknown());
+  const specs: Array<{
+    name: string;
+    title: string;
+    description: string;
+    operation: RepositoryIntelligenceOperation;
+    inputSchema: Record<string, z.ZodType>;
+    extractInput: (input: Record<string, unknown>) => unknown;
+  }> = [
+    {
+      name: "repository_intelligence_revision",
+      title: "Repository Intelligence revision",
+      description: "Compute canonical Repository Intelligence V1 revision/staleness identity from normalized evidence already supplied by the caller. Read-only: does not fetch GitHub, write state, invoke an LLM, approve, or merge.",
+      operation: "revision",
+      inputSchema: { workspaceId: z.string().describe(workspaceIdDescription), snapshot: snapshotSchema },
+      extractInput: (input) => input.snapshot,
+    },
+    {
+      name: "repository_intelligence_readiness",
+      title: "Repository Intelligence readiness",
+      description: "Compute canonical Repository Intelligence V1 advisory PR readiness from normalized evidence already supplied by the caller. Read-only: does not fetch GitHub, write state, invoke an LLM, approve, or merge.",
+      operation: "readiness",
+      inputSchema: { workspaceId: z.string().describe(workspaceIdDescription), snapshot: snapshotSchema },
+      extractInput: (input) => input.snapshot,
+    },
+    {
+      name: "repository_intelligence_overlap",
+      title: "Repository Intelligence overlap",
+      description: "Compute canonical Repository Intelligence V1 cross-PR overlap from normalized snapshot evidence already supplied by the caller. Read-only: does not fetch GitHub, write state, invoke an LLM, approve, or merge.",
+      operation: "overlap",
+      inputSchema: { workspaceId: z.string().describe(workspaceIdDescription), snapshots: z.array(snapshotSchema) },
+      extractInput: (input) => ({ snapshots: input.snapshots }),
+    },
+    {
+      name: "repository_intelligence_ci",
+      title: "Repository Intelligence CI evidence",
+      description: "Compute canonical Repository Intelligence V1 CI failure evidence from normalized evidence already supplied by the caller. Read-only: does not fetch GitHub, write state, invoke an LLM, approve, or merge.",
+      operation: "ci",
+      inputSchema: { workspaceId: z.string().describe(workspaceIdDescription), snapshot: snapshotSchema },
+      extractInput: (input) => input.snapshot,
+    },
+  ];
+
+  for (const spec of specs) {
+    registerAppTool(
+      server,
+      spec.name,
+      {
+        title: spec.title,
+        description: spec.description,
+        inputSchema: spec.inputSchema,
+        annotations: REPOSITORY_INTELLIGENCE_TOOL_ANNOTATIONS,
+      },
+      async (rawInput) => {
+        const startedAt = performance.now();
+        const input = rawInput as Record<string, unknown>;
+        const workspaceId = String(input.workspaceId ?? "");
+        workspaces.getWorkspace(workspaceId);
+        try {
+          const result = await runRepositoryIntelligenceOperation(
+            { root, pythonBin: config.repositoryIntelligencePythonBin },
+            spec.operation,
+            spec.extractInput(input),
+          );
+          logToolCall(config, {
+            tool: spec.name,
+            workspaceId,
+            success: true,
+            durationMs: Math.round(performance.now() - startedAt),
+          });
+          return {
+            content: [textBlock(JSON.stringify(result, null, 2))],
+            structuredContent: result as unknown as Record<string, unknown>,
+          };
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          logToolCall(config, {
+            tool: spec.name,
+            workspaceId,
+            success: false,
+            durationMs: Math.round(performance.now() - startedAt),
+            error: message.slice(0, 240),
+          });
+          return {
+            content: [textBlock(message)],
+            isError: true,
+            structuredContent: { error: message },
+          };
+        }
+      },
+    );
+  }
+}
+
 export function createMcpServer(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
@@ -1077,6 +1192,8 @@ export function createMcpServer(
       instructions: serverInstructions(config),
     },
   );
+
+  registerRepositoryIntelligenceTools(server, config, workspaces);
 
   registerAppResource(
     server,
