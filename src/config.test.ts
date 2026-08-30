@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
@@ -33,6 +33,33 @@ assert.equal(loadConfig({ ...baseEnv, DEVSPACE_CODEX_GOALS: "1" }).codexGoalsEna
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_CODEX_GOALS: "0" }).codexGoalsEnabled, false);
 assert.equal(loadConfig(baseEnv).codexBin, undefined);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_CODEX_BIN: "/custom/codex" }).codexBin, "/custom/codex");
+assert.equal(loadConfig(baseEnv).repositoryIntelligenceRoot, undefined);
+assert.equal(loadConfig(baseEnv).repositoryIntelligencePythonBin, undefined);
+{
+  const allowedRoot = mkdtempSync(join(tmpdir(), "devspace-ri-config-"));
+  const riRoot = join(allowedRoot, "nexus-opencli-reviewer");
+  mkdirSync(riRoot, { recursive: true });
+  try {
+    const configured = loadConfig({
+      ...baseEnv,
+      DEVSPACE_ALLOWED_ROOTS: allowedRoot,
+      DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT: riRoot,
+      DEVSPACE_REPOSITORY_INTELLIGENCE_PYTHON_BIN: "/opt/homebrew/bin/python3",
+    });
+    assert.equal(configured.repositoryIntelligenceRoot, riRoot);
+    assert.equal(configured.repositoryIntelligencePythonBin, "/opt/homebrew/bin/python3");
+    assert.throws(
+      () => loadConfig({
+        ...baseEnv,
+        DEVSPACE_ALLOWED_ROOTS: allowedRoot,
+        DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT: join(tmpdir(), "outside-ri-root"),
+      }),
+      /DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT must be inside DEVSPACE_ALLOWED_ROOTS/,
+    );
+  } finally {
+    rmSync(allowedRoot, { recursive: true, force: true });
+  }
+}
 assert.deepEqual(loadConfig(baseEnv).toolchains, []);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_MAX_CONCURRENT_AGENTS: "2" }).agentMaxConcurrent, 2);
 assert.equal(

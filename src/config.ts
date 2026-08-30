@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { expandHomePath } from "./roots.js";
+import { expandHomePath, isPathInsideRoot } from "./roots.js";
 import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
 import type { ToolchainSpec } from "./local-agent-toolchains.js";
@@ -39,6 +39,8 @@ export interface ServerConfig {
   agentMaxConcurrent: number;
   codexGoalsEnabled: boolean;
   codexBin?: string;
+  repositoryIntelligenceRoot?: string;
+  repositoryIntelligencePythonBin?: string;
 }
 
 function parsePort(value: string | number | undefined): number {
@@ -238,6 +240,24 @@ function defaultAgentDir(): string {
   return join(homedir(), ".codex");
 }
 
+function parseRepositoryIntelligenceRoot(
+  value: string | undefined,
+  allowedRoots: string[],
+): string | undefined {
+  const raw = value?.trim();
+  if (!raw) return undefined;
+  const root = resolve(expandHomePath(raw));
+  if (!allowedRoots.some((allowedRoot) => isPathInsideRoot(root, allowedRoot))) {
+    throw new Error("DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT must be inside DEVSPACE_ALLOWED_ROOTS");
+  }
+  return root;
+}
+
+function parseRepositoryIntelligencePythonBin(value: string | undefined): string | undefined {
+  const raw = value?.trim();
+  return raw || undefined;
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const files = loadDevspaceFiles(env);
   const host = env.HOST ?? files.config.host ?? "127.0.0.1";
@@ -245,6 +265,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const publicBaseUrl = parsePublicBaseUrl(
     env.DEVSPACE_PUBLIC_BASE_URL ?? files.config.publicBaseUrl ?? localPublicBaseUrl(host, port),
   );
+  const allowedRoots = parseAllowedRoots(env.DEVSPACE_ALLOWED_ROOTS ?? files.config.allowedRoots);
   const derivedAllowedHosts = [
     "localhost",
     "127.0.0.1",
@@ -258,7 +279,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     host,
     port,
     oauth: parseOAuthConfig(env, files.auth.ownerToken),
-    allowedRoots: parseAllowedRoots(env.DEVSPACE_ALLOWED_ROOTS ?? files.config.allowedRoots),
+    allowedRoots,
     allowedHosts: parseAllowedHosts(env.DEVSPACE_ALLOWED_HOSTS, derivedAllowedHosts),
     publicBaseUrl,
     toolMode: parseToolMode(env),
@@ -293,6 +314,13 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     ),
     codexGoalsEnabled: parseBoolean(env.DEVSPACE_CODEX_GOALS),
     codexBin: env.DEVSPACE_CODEX_BIN?.trim() || undefined,
+    repositoryIntelligenceRoot: parseRepositoryIntelligenceRoot(
+      env.DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT,
+      allowedRoots,
+    ),
+    repositoryIntelligencePythonBin: parseRepositoryIntelligencePythonBin(
+      env.DEVSPACE_REPOSITORY_INTELLIGENCE_PYTHON_BIN,
+    ),
   };
 }
 
