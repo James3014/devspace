@@ -1140,6 +1140,33 @@ function registerRepositoryIntelligenceTools(
         graph_errors: input.graph_errors ?? [],
       }),
     },
+    {
+      name: "repository_intelligence_cfi",
+      title: "Repository Intelligence CI failure intelligence",
+      description: "Compute canonical Repository Intelligence V1.1 CFI triage from normalized CI evidence already supplied by the caller. Read-only and CI_EVIDENCE_ONLY: does not infer root cause, fetch GitHub, write state, invoke an LLM, dispatch a worker, approve, or merge.",
+      operation: "cfi",
+      inputSchema: { workspaceId: z.string().describe(workspaceIdDescription), snapshot: snapshotSchema },
+      extractInput: (input) => input.snapshot,
+    },
+    {
+      name: "repository_intelligence_eia",
+      title: "Repository Intelligence external automation advisory",
+      description: "Compute canonical Repository Intelligence V1.1 EIA advisory from caller-supplied snapshot or verified CFI report. Read-only and AUTOMATION_ADVISORY_ONLY: READY grants no worker dispatch, GitHub write, approval, merge, or other execution authority.",
+      operation: "eia",
+      inputSchema: {
+        workspaceId: z.string().describe(workspaceIdDescription),
+        snapshot: snapshotSchema.optional(),
+        cfi_report: snapshotSchema.optional(),
+      },
+      extractInput: (input) => {
+        const hasSnapshot = input.snapshot !== undefined;
+        const hasCfiReport = input.cfi_report !== undefined;
+        if (hasSnapshot === hasCfiReport) {
+          throw new Error("Repository Intelligence EIA requires exactly one of snapshot or cfi_report");
+        }
+        return hasSnapshot ? { snapshot: input.snapshot } : { cfi_report: input.cfi_report };
+      },
+    },
   ];
 
   for (const spec of specs) {

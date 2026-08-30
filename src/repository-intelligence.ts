@@ -6,9 +6,11 @@ export const REPOSITORY_INTELLIGENCE_TOOL_NAMES = [
   "repository_intelligence_overlap",
   "repository_intelligence_ci",
   "repository_intelligence_impact",
+  "repository_intelligence_cfi",
+  "repository_intelligence_eia",
 ] as const;
 
-export type RepositoryIntelligenceOperation = "revision" | "readiness" | "overlap" | "ci" | "impact";
+export type RepositoryIntelligenceOperation = "revision" | "readiness" | "overlap" | "ci" | "impact" | "cfi" | "eia";
 
 export interface RepositoryIntelligenceRunnerConfig {
   root: string;
@@ -20,7 +22,7 @@ export interface RepositoryIntelligenceRunnerConfig {
 
 export interface RepositoryIntelligenceResult {
   operation: RepositoryIntelligenceOperation;
-  claim_ceiling: "PR_INTELLIGENCE_ONLY" | "CI_EVIDENCE_ONLY";
+  claim_ceiling: "PR_INTELLIGENCE_ONLY" | "CI_EVIDENCE_ONLY" | "AUTOMATION_ADVISORY_ONLY";
   result: Record<string, unknown>;
 }
 
@@ -31,7 +33,9 @@ const DEFAULT_MAX_STDERR_BYTES = 64 * 1024;
 export function expectedRepositoryIntelligenceClaimCeiling(
   operation: RepositoryIntelligenceOperation,
 ): RepositoryIntelligenceResult["claim_ceiling"] {
-  return operation === "ci" ? "CI_EVIDENCE_ONLY" : "PR_INTELLIGENCE_ONLY";
+  if (operation === "ci" || operation === "cfi") return "CI_EVIDENCE_ONLY";
+  if (operation === "eia") return "AUTOMATION_ADVISORY_ONLY";
+  return "PR_INTELLIGENCE_ONLY";
 }
 
 function validateCanonicalPayload(
