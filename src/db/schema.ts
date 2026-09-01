@@ -104,6 +104,7 @@ export const localAgentSessions = sqliteTable(
     workerPid: integer("worker_pid"),
     workerToken: text("worker_token"),
     executionContract: text("execution_contract"),
+    executionGeneration: text("execution_generation"),
     terminalReason: text("terminal_reason"),
     scopeState: text("scope_state"),
     scopeBaseline: text("scope_baseline"),
@@ -129,5 +130,31 @@ export type LoadedAgentFileRow = typeof loadedAgentFiles.$inferSelect;
 export type NewLoadedAgentFileRow = typeof loadedAgentFiles.$inferInsert;
 export type WorkspaceConversationBindingRow = typeof workspaceConversationBindings.$inferSelect;
 export type NewWorkspaceConversationBindingRow = typeof workspaceConversationBindings.$inferInsert;
+export const durableOperations = sqliteTable(
+  "durable_operations",
+  {
+    operationId: text("operation_id").primaryKey(),
+    attemptKey: text("attempt_key").notNull(),
+    requestHash: text("request_hash").notNull(),
+    kind: text("kind").notNull(),
+    authorityMode: text("authority_mode").notNull(),
+    scopeRoot: text("scope_root").notNull(),
+    workspaceId: text("workspace_id"),
+    status: text("status").notNull(),
+    retrySafe: text("retry_safe").notNull(),
+    requestJson: text("request_json").notNull(),
+    receiptJson: text("receipt_json"),
+    errorCode: text("error_code"),
+    errorMessage: text("error_message"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    index("durable_operations_status_idx").on(table.status, table.updatedAt),
+  ],
+);
+
 export type LocalAgentSessionRow = typeof localAgentSessions.$inferSelect;
 export type NewLocalAgentSessionRow = typeof localAgentSessions.$inferInsert;
+export type DurableOperationRow = typeof durableOperations.$inferSelect;
+export type NewDurableOperationRow = typeof durableOperations.$inferInsert;

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after, type TestContext } from "node:test";
@@ -15,6 +15,7 @@ import type { SubagentsConfig } from "./local-agent-config.js";
 import { MINIMUM_CODEX_RUNTIME_VERSION } from "./codex-runtime.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
+import { DurableOperationManager } from "./durable-operations.js";
 import { createMcpServer, createServer } from "./server.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
@@ -379,6 +380,7 @@ async function fixture(
   const agentSessionManager = config.subagents.enabled
     ? new LocalAgentSessionManager(config, async () => {}, async () => true)
     : undefined;
+  const durableOperations = new DurableOperationManager(config);
   const server = createMcpServer(
     config,
     workspaces,
@@ -387,6 +389,9 @@ async function fixture(
     resolveLocalAgentProviders,
     [],
     agentSessionManager,
+    undefined,
+    undefined,
+    durableOperations,
   );
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "devspace-test-client", version: "1.0.0" });
@@ -401,6 +406,8 @@ async function fixture(
     closed = true;
     await client.close();
     await server.close();
+    durableOperations.close();
+    agentSessionManager?.close();
     store.close();
   };
 
@@ -652,6 +659,96 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   assert.equal(cancelStructured.agentId, startStructured.agentId);
   assert.equal(cancelStructured.status, "stopped");
   assert.equal(cancelStructured.terminal, true);
+});
+
+test("subagents: continuation fails closed when execution generation changes", async (t) => {
+  const context = await fixture(t, { subagents: true });
+  const opened = await callOpen(context.client, context.project, "chat-generation-change");
+  const workspaceId = structuredContent(opened).workspaceId as string;
+  const start = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "generation-bound work",
+      attemptKey: "generation-bound-start",
+    },
+  });
+  assert.equal(start.isError, undefined);
+  const agentId = structuredContent(start).agentId as string;
+
+  const { LocalAgentStore } = await import("./local-agent-store.js");
+  const store = new LocalAgentStore(context.stateDir);
+  try {
+    const record = store.getById(agentId)!;
+    assert.ok(record.executionGeneration?.executionBindingHash, "new durable sessions must persist execution generation");
+    const generation = record.lifecycleState!.activeTurn!.generation!;
+    const workerToken = record.workerToken!;
+    store.claimWorkerCAS(agentId, generation, workerToken, process.pid);
+    store.finishTurnCAS({ agentId, generation, workerToken, status: "idle", terminalReason: "completed" });
+  } finally {
+    store.close();
+  }
+
+  await writeFile(join(context.project, ".devspace", "agents", "reviewer.md"), [
+    "---",
+    "name: reviewer",
+    "description: Generation changed after start.",
+    "provider: codex",
+    "effort: high",
+    "---",
+    "Review changes with a changed profile generation.",
+  ].join("\n"));
+
+  const continued = await context.client.callTool({
+    name: "agent_continue",
+    arguments: { workspaceId, agentId, prompt: "continue after profile mutation" },
+  });
+  assert.equal(continued.isError, true);
+  assert.match(responseText(continued), /REBIND_REQUIRED|requires explicit rebind/i);
+});
+
+test("subagents: legacy durable session without execution generation does not silently upgrade", async (t) => {
+  const context = await fixture(t, { subagents: true });
+  const opened = await callOpen(context.client, context.project, "chat-legacy-generation");
+  const workspaceId = structuredContent(opened).workspaceId as string;
+  const start = await context.client.callTool({
+    name: "agent_start",
+    arguments: { workspaceId, profile: "reviewer", prompt: "legacy simulation" },
+  });
+  const agentId = structuredContent(start).agentId as string;
+
+  const { LocalAgentStore } = await import("./local-agent-store.js");
+  const store = new LocalAgentStore(context.stateDir);
+  try {
+    const record = store.getById(agentId)!;
+    const generation = record.lifecycleState!.activeTurn!.generation!;
+    const workerToken = record.workerToken!;
+    store.claimWorkerCAS(agentId, generation, workerToken, process.pid);
+    store.finishTurnCAS({ agentId, generation, workerToken, status: "idle", terminalReason: "completed" });
+  } finally {
+    store.close();
+  }
+  const { openDatabase } = await import("./db/client.js");
+  const database = openDatabase(context.stateDir);
+  try {
+    database.sqlite.prepare("update local_agent_sessions set execution_generation = null where id = ?").run(agentId);
+  } finally {
+    database.close();
+  }
+  const legacyStore = new LocalAgentStore(context.stateDir);
+  try {
+    assert.equal(legacyStore.getById(agentId)?.executionGeneration, undefined);
+  } finally {
+    legacyStore.close();
+  }
+
+  const continued = await context.client.callTool({
+    name: "agent_continue",
+    arguments: { workspaceId, agentId, prompt: "must not silently bind" },
+  });
+  assert.equal(continued.isError, true);
+  assert.match(responseText(continued), /REBIND_REQUIRED|predates execution-generation binding/i);
 });
 
 test("subagents: unknown/invalid workspaceId fails closed before durable-agent access", async (t) => {
@@ -1112,6 +1209,98 @@ test("bash and command_status: attemptKey reconciliation and idempotent executio
   });
   assert.equal(conflictRes.isError, true);
   assert.match(responseText(conflictRes), /ATTEMPT_REPLAY_CONFLICT/);
+});
+
+test("OWNER_DIRECT workspace_clone and dependency_sync run through typed MCP tools", async (t) => {
+  const context = await fixture(t, { git: true });
+  const tools = await context.client.listTools();
+  for (const name of ["workspace_clone", "dependency_sync", "operation_status", "operation_reconcile"]) {
+    assert.ok(tools.tools.some((tool) => tool.name === name), `${name} must be exposed`);
+  }
+  const bash = tools.tools.find((tool) => tool.name === "bash");
+  assert.match(String(bash?.description), /Do not use bash to create or modify files/);
+
+  const destination = join(context.project, "..", "typed-clone");
+  const clone = await context.client.callTool({
+    name: "workspace_clone",
+    arguments: {
+      attemptKey: "server-clone-1",
+      remote: context.project,
+      destination,
+      authorityMode: "OWNER_DIRECT",
+    },
+  });
+  assert.equal(clone.isError, undefined);
+  const cloneRecord = structuredContent(clone);
+  assert.equal(cloneRecord.status, "succeeded");
+  assert.equal((cloneRecord.receipt as Record<string, unknown>).openable, true);
+
+  const replay = await context.client.callTool({
+    name: "workspace_clone",
+    arguments: {
+      attemptKey: "server-clone-1",
+      remote: context.project,
+      destination,
+      authorityMode: "OWNER_DIRECT",
+    },
+  });
+  assert.equal(structuredContent(replay).operationId, cloneRecord.operationId);
+
+  const outside = await mkdtemp(join(tmpdir(), "devspace-server-outside-clone-"));
+  t.after(() => rm(outside, { recursive: true, force: true }));
+  const denied = await context.client.callTool({
+    name: "workspace_clone",
+    arguments: {
+      attemptKey: "server-clone-outside",
+      remote: context.project,
+      destination: join(outside, "clone"),
+      authorityMode: "OWNER_DIRECT",
+    },
+  });
+  assert.equal(denied.isError, true);
+
+  await writeFile(join(destination, "package.json"), JSON.stringify({ name: "typed-fixture", version: "1.0.0" }) + "\n");
+  await writeFile(join(destination, "package-lock.json"), JSON.stringify({
+    name: "typed-fixture",
+    version: "1.0.0",
+    lockfileVersion: 3,
+    requires: true,
+    packages: { "": { name: "typed-fixture", version: "1.0.0" } },
+  }) + "\n");
+  const manifestBefore = await readFile(join(destination, "package.json"), "utf8");
+  const lockBefore = await readFile(join(destination, "package-lock.json"), "utf8");
+  const opened = await callOpen(context.client, destination, "chat-dependency-sync");
+  const workspaceId = structuredContent(opened).workspaceId as string;
+  const sync = await context.client.callTool({
+    name: "dependency_sync",
+    arguments: {
+      workspaceId,
+      attemptKey: "server-deps-1",
+      recipe: "npm_ci",
+      authorityMode: "OWNER_DIRECT",
+    },
+  });
+  assert.equal(sync.isError, undefined);
+  assert.equal(structuredContent(sync).status, "succeeded");
+  assert.equal(await readFile(join(destination, "package.json"), "utf8"), manifestBefore);
+  assert.equal(await readFile(join(destination, "package-lock.json"), "utf8"), lockBefore);
+
+  const status = await context.client.callTool({
+    name: "operation_status",
+    arguments: { operationId: structuredContent(sync).operationId },
+  });
+  assert.equal(structuredContent(status).status, "succeeded");
+
+  const nexusBlocked = await context.client.callTool({
+    name: "workspace_clone",
+    arguments: {
+      attemptKey: "server-nexus-unvalidated",
+      remote: context.project,
+      destination: join(context.project, "..", "nexus-unvalidated"),
+      authorityMode: "NEXUS_GOVERNED",
+    },
+  });
+  assert.equal(nexusBlocked.isError, true);
 });
 
 test("command_status metadata annotations and minimal mode visibility", async (t) => {

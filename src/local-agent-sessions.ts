@@ -47,6 +47,14 @@ import {
 import { validateOpencodeModelAndVariant } from "./local-agent-opencode-catalog.js";
 import { canonicalizePath, isPathInsideRoot } from "./roots.js";
 import {
+  assertSameExecutionGeneration,
+  buildExecutionGenerationBinding,
+  type ExecutionGenerationBinding,
+  ExecutionProtocolError,
+} from "./execution-protocol.js";
+import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build-identity.js";
+import { devspaceConfigDir } from "./user-config.js";
+import {
   classifyScopeState,
   computeWorkerDelta,
   inspectWorkspacePhysicalState,
@@ -82,7 +90,8 @@ export type AgentErrorCode =
   | "INVALID_EXECUTION_CONTRACT"
   | "INVALID_ATTEMPT_KEY"
   | "ATTEMPT_REPLAY_CONFLICT"
-  | "CONTINUATION_ADMISSION_FAILED";
+  | "CONTINUATION_ADMISSION_FAILED"
+  | "REBIND_REQUIRED";
 
 export class AgentSessionError extends Error {
   constructor(
@@ -144,6 +153,8 @@ export interface ContinueAgentInput {
   workspaceRoot: string;
   agentId: string;
   prompt: string;
+  profiles?: LocalAgentProfile[];
+  profileCatalog?: ProfileCatalog;
 }
 
 export interface GetAgentStatusInput {
@@ -399,6 +410,7 @@ export class LocalAgentSessionManager {
   private readonly launcher: WorkerLauncher;
   private readonly terminator: WorkerTerminator;
   private readonly turnRunner?: AgentTurnRunner;
+  private readonly runtimeBuildIdentity: RuntimeBuildIdentity;
   private closed = false;
   private readonly terminationAttempts = new Map<string, Promise<boolean>>();
 
@@ -407,11 +419,19 @@ export class LocalAgentSessionManager {
     testLauncher?: WorkerLauncher,
     testTerminator?: WorkerTerminator,
     testTurnRunner?: AgentTurnRunner,
+    runtimeBuildIdentity?: RuntimeBuildIdentity,
   ) {
     this.store = createLocalAgentStore(config.stateDir);
     this.launcher = testLauncher ?? defaultWorkerLauncher;
     this.terminator = testTerminator ?? terminateOwnedWorker;
     this.turnRunner = testTurnRunner;
+    this.runtimeBuildIdentity = runtimeBuildIdentity ?? describeRuntimeBuildIdentity({
+      env: process.env,
+      listenPort: config.port,
+      configRoot: devspaceConfigDir(process.env),
+      stateRoot: config.stateDir,
+      profileCatalogGeneration: "unresolved",
+    });
   }
 
   /** Close the manager's durable store. Safe to call from multiple cleanup paths. */
@@ -538,6 +558,12 @@ export class LocalAgentSessionManager {
       }
     }
 
+    const executionGeneration = this.resolveExecutionGeneration(
+      profile,
+      input.profileCatalog?.generation ?? "unresolved",
+      providerEnvironment,
+    );
+
     let record: LocalAgentRecord;
     let created = true;
     try {
@@ -550,6 +576,7 @@ export class LocalAgentSessionManager {
           model: profile.model,
           effort: profile.effort,
           executionContract,
+          executionGeneration,
           startReplay: replayBinding,
           lifecycleKind: "detached_worker_v2",
         });
@@ -564,6 +591,7 @@ export class LocalAgentSessionManager {
           model: profile.model,
           effort: profile.effort,
           executionContract,
+          executionGeneration,
           lifecycleKind: "detached_worker_v2",
         });
       }
@@ -640,6 +668,33 @@ export class LocalAgentSessionManager {
 
     // ── Continuation admission gates (all read-only; run before mutation) ──
     const admissionFailures: string[] = [];
+
+    const currentProfile = input.profiles?.find((candidate) => candidate.name === record.profileName) ?? {
+      name: record.profileName,
+      description: "Persisted durable-agent profile binding",
+      provider: record.provider as LocalAgentProfile["provider"],
+      model: record.model,
+      effort: record.effort,
+      filePath: "<persisted>",
+      body: "",
+      disabled: false,
+    };
+    try {
+      const currentGeneration = this.resolveExecutionGeneration(
+        currentProfile,
+        input.profileCatalog?.generation ?? "unresolved",
+        process.env,
+      );
+      assertSameExecutionGeneration(record.executionGeneration, currentGeneration);
+    } catch (error) {
+      if (error instanceof ExecutionProtocolError || error instanceof AgentSessionError) {
+        throw new AgentSessionError(
+          "REBIND_REQUIRED",
+          `Continuation of agent ${agentId} requires explicit rebind before mutation: ${error.message}`,
+        );
+      }
+      throw error;
+    }
 
     if (!this.hasExecutionCapacity()) {
       admissionFailures.push(
@@ -1214,6 +1269,43 @@ export class LocalAgentSessionManager {
     const max = this.config.agentMaxConcurrent;
     if (max === undefined || max === null || max <= 0) return true;
     return this.runningCount() < max;
+  }
+
+  private resolveExecutionGeneration(
+    profile: LocalAgentProfile,
+    profileCatalogGeneration: string,
+    environment: NodeJS.ProcessEnv,
+  ): ExecutionGenerationBinding {
+    const availability = checkLocalAgentProviderAvailability(profile.provider, environment);
+    if (!availability.available) {
+      throw new AgentSessionError(
+        "REBIND_REQUIRED",
+        `Provider '${profile.provider}' is unavailable while rebinding execution generation: ${availability.reason ?? "unknown reason"}`,
+      );
+    }
+    const codexRuntime = profile.provider === "codex"
+      ? inspectCodexRuntime({ env: environment })
+      : undefined;
+    if (codexRuntime && !codexRuntime.ready) {
+      throw new AgentSessionError(
+        "REBIND_REQUIRED",
+        `Codex runtime is unavailable while rebinding execution generation: ${codexRuntime.reason ?? "unknown reason"}`,
+      );
+    }
+    const executable = codexRuntime?.executable
+      ?? resolveLocalAgentProviderExecutable(profile.provider, environment)
+      ?? profile.provider;
+    const runtimeVersion = codexRuntime?.binaryVersion
+      ?? getLocalAgentProviderRuntimeVersion(profile.provider, environment);
+    return buildExecutionGenerationBinding({
+      profileCatalogGeneration,
+      provider: profile.provider,
+      model: profile.model,
+      executionIdentity: executable,
+      runtimeVersion,
+      devspaceBuildId: this.runtimeBuildIdentity.buildId,
+      devspaceSourceCommit: this.runtimeBuildIdentity.sourceCommit,
+    });
   }
 
   private async buildLifecycleEvidence(

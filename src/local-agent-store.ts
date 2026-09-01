@@ -22,6 +22,11 @@ import {
   deserializeExecutionContract,
   serializeExecutionContract,
 } from "./local-agent-contract.js";
+import {
+  deserializeExecutionGenerationBinding,
+  serializeExecutionGenerationBinding,
+  type ExecutionGenerationBinding,
+} from "./execution-protocol.js";
 
 export type LocalAgentStatus = "starting" | "running" | "idle" | "error" | "stopped";
 
@@ -74,6 +79,7 @@ export interface LocalAgentRecord {
   workerPid?: number;
   workerToken?: string;
   executionContract?: ExecutionContract;
+  executionGeneration?: ExecutionGenerationBinding;
   startReplay?: StartReplayBinding;
   terminalReason?: AgentTerminalReason;
   scopeState?: ScopeState;
@@ -97,6 +103,7 @@ export interface CreateLocalAgentRecordInput {
   model?: string;
   effort?: string;
   executionContract?: ExecutionContract;
+  executionGeneration?: ExecutionGenerationBinding;
   startReplay?: StartReplayBinding;
   lifecycleKind?: AgentLifecycleKind;
 }
@@ -199,6 +206,7 @@ interface LocalAgentRow {
   worker_pid: number | null;
   worker_token: string | null;
   execution_contract: string | null;
+  execution_generation: string | null;
   terminal_reason: string | null;
   scope_state: string | null;
   scope_baseline: string | null;
@@ -273,6 +281,7 @@ export class LocalAgentStore {
       model: input.model,
       effort: input.effort,
       executionContract: input.executionContract,
+      executionGeneration: input.executionGeneration,
       startReplay: input.startReplay,
       lifecycleState: input.lifecycleKind === "detached_worker_v2"
         ? {
@@ -303,11 +312,12 @@ export class LocalAgentStore {
           model,
           effort,
           execution_contract,
+          execution_generation,
           lifecycle_state,
           status,
           created_at,
           updated_at
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         record.id,
@@ -318,6 +328,7 @@ export class LocalAgentStore {
         record.model ?? null,
         record.effort ?? null,
         serializeStoredExecutionState(record.executionContract, record.startReplay),
+        serializeExecutionGenerationBinding(record.executionGeneration),
         record.lifecycleState ? JSON.stringify(record.lifecycleState) : null,
         record.status,
         record.createdAt,
@@ -447,6 +458,7 @@ export class LocalAgentStore {
           worker_pid = ?,
           worker_token = ?,
           execution_contract = ?,
+          execution_generation = ?,
           terminal_reason = ?,
           scope_state = ?,
           scope_baseline = ?,
@@ -471,6 +483,7 @@ export class LocalAgentStore {
         updated.workerPid ?? null,
         updated.workerToken ?? null,
         serializeStoredExecutionState(updated.executionContract, updated.startReplay),
+        serializeExecutionGenerationBinding(updated.executionGeneration),
         updated.terminalReason ?? null,
         updated.scopeState ?? null,
         updated.scopeBaseline ? JSON.stringify(updated.scopeBaseline) : null,
@@ -1305,6 +1318,7 @@ function rowToLocalAgentRecord(row: LocalAgentRow): LocalAgentRecord {
     workerPid: row.worker_pid ?? undefined,
     workerToken: row.worker_token ?? undefined,
     executionContract: storedExecution.executionContract,
+    executionGeneration: deserializeExecutionGenerationBinding(row.execution_generation),
     startReplay: storedExecution.startReplay,
     terminalReason: readTerminalReason(row.terminal_reason),
     scopeState: readScopeState(row.scope_state),

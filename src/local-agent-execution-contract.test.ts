@@ -118,6 +118,25 @@ function setupManager(
   return { manager, config, terminated, clean, stateDir };
 }
 
+function syntheticExecutionGeneration(
+  manager: LocalAgentSessionManager,
+  provider: LocalAgentProfile["provider"],
+  profileName = "reviewer",
+) {
+  return (manager as any).resolveExecutionGeneration(
+    {
+      name: profileName,
+      description: "Synthetic lifecycle fixture with an explicit current execution generation.",
+      provider,
+      filePath: "<test-fixture>",
+      body: "",
+      disabled: false,
+    },
+    "unresolved",
+    process.env,
+  );
+}
+
 function settleForContinuation(
   manager: LocalAgentSessionManager,
   agentId: string,
@@ -1436,6 +1455,7 @@ test("G3 TEST U/W — verified termination unlocks continuation with a new turn"
       workspaceRoot: f.repo,
       profileName: "reviewer",
       provider: "codex",
+      executionGeneration: syntheticExecutionGeneration(manager, "codex"),
       executionContract: { maxStartupMs: 20 },
     });
     const promptFile = LocalAgentSessionManager.writePromptFile("turn A");
@@ -2606,6 +2626,7 @@ test("G3 TEST W — successful termination unlocks continuation", async () => {
       workspaceRoot: f.repo,
       profileName: "reviewer",
       provider: "claude",
+      executionGeneration: syntheticExecutionGeneration(manager, "claude"),
       lifecycleKind: "detached_worker_v2",
       executionContract: {
         maxStartupMs: 40,
@@ -2652,6 +2673,7 @@ test("G3 TEST X — stale cleanup callback cannot touch newer generation", async
       workspaceRoot: f.repo,
       profileName: "reviewer",
       provider: "claude",
+      executionGeneration: syntheticExecutionGeneration(manager, "claude"),
       lifecycleKind: "detached_worker_v2",
       executionContract: { maxStartupMs: 40 },
     });

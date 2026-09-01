@@ -56,6 +56,11 @@ import {
 } from "./mcp-sessions.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
 import {
+  DurableOperationManager,
+  DurableOperationError,
+  type DurableOperationRecord,
+} from "./durable-operations.js";
+import {
   CodexGoalSessionManager,
   type CodexGoalState,
 } from "./codex-goal-sessions.js";
@@ -1266,6 +1271,7 @@ export function createMcpServer(
   agentSessionManager?: LocalAgentSessionManager,
   codexGoals?: CodexGoalSessionManager,
   runtimeBuildIdentityContext?: RuntimeBuildIdentityContext,
+  durableOperations?: DurableOperationManager,
 ): McpServer {
   const runtimeBuildIdentity = runtimeBuildIdentityContext?.identity
     ?? describeRuntimeBuildIdentity({
@@ -1550,6 +1556,162 @@ export function createMcpServer(
       };
     },
   );
+
+  if (durableOperations) {
+    const durableOperationOutputSchema = {
+      operationId: z.string(),
+      attemptKey: z.string(),
+      requestHash: z.string(),
+      kind: z.enum(["workspace_clone", "dependency_sync"]),
+      authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]),
+      scopeRoot: z.string(),
+      workspaceId: z.string().optional(),
+      status: z.enum(["started", "succeeded", "failed", "outcome_unknown"]),
+      retrySafe: z.boolean(),
+      request: z.record(z.string(), z.unknown()),
+      receipt: z.record(z.string(), z.unknown()).optional(),
+      errorCode: z.string().optional(),
+      errorMessage: z.string().optional(),
+      createdAt: z.string(),
+      updatedAt: z.string(),
+    };
+    const operationResponse = (operation: DurableOperationRecord) => ({
+      content: [textBlock(
+        `${operation.kind} ${operation.operationId}: status=${operation.status}, retrySafe=${operation.retrySafe}.`,
+      )],
+      structuredContent: operation as unknown as Record<string, unknown>,
+    });
+
+    registerAppTool(
+      server,
+      "workspace_clone",
+      {
+        title: "Clone workspace",
+        description:
+          "Clone one Git repository into a new or empty destination under a configured allowed root. This is a typed OWNER_DIRECT bootstrap mutation with durable attempt fencing; it never overwrites an existing non-empty destination and never falls back to broad shell mutation.",
+        inputSchema: {
+          attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
+            .describe("Stable operation identity. Exact replay returns the existing operation; conflicting reuse fails closed."),
+          remote: z.string().min(1).describe("Credential-free Git remote URL or local repository path."),
+          destination: z.string().min(1).describe("Absolute destination path under a configured allowed root."),
+          ref: z.string().min(1).optional().describe("Optional branch or tag to clone as a single branch."),
+          authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).default("OWNER_DIRECT")
+            .describe("NEXUS_GOVERNED remains fail-closed until an external Nexus grant validator is wired."),
+        },
+        outputSchema: durableOperationOutputSchema,
+        _meta: {},
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: true,
+        },
+      },
+      async ({ attemptKey, remote, destination, ref, authorityMode }) => {
+        try {
+          const operation = await durableOperations.workspaceClone({
+            attemptKey,
+            remote,
+            destination,
+            ref,
+            authorityMode,
+          });
+          return operationResponse(operation);
+        } catch (error) {
+          if (error instanceof DurableOperationError && error.operation) {
+            return {
+              content: [textBlock(`${error.code}: ${error.message}`)],
+              isError: true,
+              structuredContent: error.operation as unknown as Record<string, unknown>,
+            };
+          }
+          throw error;
+        }
+      },
+    );
+
+    registerAppTool(
+      server,
+      "dependency_sync",
+      {
+        title: "Synchronize dependencies",
+        description:
+          "Synchronize an existing workspace using a conservative frozen dependency recipe. The operation is durably fenced and verifies dependency specification/lock inputs remain unchanged. It does not add packages, update manifests, or perform global installs.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
+            .describe("Stable operation identity. Exact replay returns the existing operation; conflicting reuse fails closed."),
+          recipe: z.enum(["npm_ci", "pnpm_frozen", "uv_frozen"]),
+          authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).default("OWNER_DIRECT")
+            .describe("NEXUS_GOVERNED remains fail-closed until an external Nexus grant validator is wired."),
+        },
+        outputSchema: durableOperationOutputSchema,
+        _meta: {},
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: true,
+        },
+      },
+      async ({ workspaceId, attemptKey, recipe, authorityMode }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        try {
+          const operation = await durableOperations.dependencySync({
+            workspaceId,
+            workspaceRoot: workspace.root,
+            attemptKey,
+            recipe,
+            authorityMode,
+          });
+          return operationResponse(operation);
+        } catch (error) {
+          if (error instanceof DurableOperationError && error.operation) {
+            return {
+              content: [textBlock(`${error.code}: ${error.message}`)],
+              isError: true,
+              structuredContent: error.operation as unknown as Record<string, unknown>,
+            };
+          }
+          throw error;
+        }
+      },
+    );
+
+    registerAppTool(
+      server,
+      "operation_status",
+      {
+        title: "Durable operation status",
+        description:
+          "Read one exact durable workspace/dependency operation without starting, retrying, or replacing it.",
+        inputSchema: { operationId: z.string().min(1) },
+        outputSchema: durableOperationOutputSchema,
+        _meta: {},
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      },
+      async ({ operationId }) => {
+        const operation = durableOperations.store.getByOperationId(operationId);
+        if (!operation) throw new DurableOperationError("RECONCILIATION_REQUIRED", `Unknown durable operation: ${operationId}`);
+        return operationResponse(operation);
+      },
+    );
+
+    registerAppTool(
+      server,
+      "operation_reconcile",
+      {
+        title: "Reconcile durable operation",
+        description:
+          "Reconcile physical state for one exact durable mutating operation after timeout/restart uncertainty. This never re-executes the mutation; unresolved physical truth remains outcome_unknown.",
+        inputSchema: { operationId: z.string().min(1) },
+        outputSchema: durableOperationOutputSchema,
+        _meta: {},
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      },
+      async ({ operationId }) => operationResponse(await durableOperations.reconcile(operationId)),
+    );
+  }
 
   registerAppTool(
     server,
@@ -2494,11 +2656,14 @@ export function createMcpServer(
       },
       async ({ workspaceId, agentId, prompt }) => {
         const workspace = workspaces.getWorkspace(workspaceId);
+        const profileCatalog = await loadProfileCatalog(config, workspace.root);
         const output = await agentSessionManager.continueAgent({
           workspaceId,
           workspaceRoot: workspace.root,
           agentId,
           prompt,
+          profiles: profileCatalog.profiles,
+          profileCatalog,
         });
         logToolCall(config, {
           tool: "agent_continue",
@@ -3219,6 +3384,7 @@ export function createServer(
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
+  const durableOperations = new DurableOperationManager(config);
   const localAgentProviders = buildLocalAgentProviderStatuses(
     config.subagents,
     getLocalAgentProviderAvailabilitySnapshot(),
@@ -3236,7 +3402,7 @@ export function createServer(
   });
   const latestProfileCatalogGeneration = { value: runtimeBuildIdentity.profileCatalogGeneration };
   const agentSessionManager = config.subagents.enabled
-    ? new LocalAgentSessionManager(config)
+    ? new LocalAgentSessionManager(config, undefined, undefined, undefined, runtimeBuildIdentity)
     : undefined;
   const codexGoals = config.codexGoalsEnabled
     ? new CodexGoalSessionManager(processSessions, { codexBin: config.codexBin })
@@ -3437,6 +3603,7 @@ export function createServer(
           agentSessionManager,
           codexGoals,
           { identity: runtimeBuildIdentity, latestProfileCatalogGeneration },
+          durableOperations,
         );
         await server.connect(transport);
       } else {
@@ -3469,6 +3636,8 @@ export function createServer(
         logSessionCloseResults("server_shutdown", results);
         codexGoals?.shutdown();
         processSessions.shutdown();
+        durableOperations.close();
+        agentSessionManager?.close();
         oauthProvider.close();
         workspaceStore.close?.();
       })();
