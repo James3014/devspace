@@ -135,6 +135,59 @@ try {
     "disabled",
   );
   assert.equal(disabledCatalog.blockerFor("agy-gemini-review")?.code, "PROFILE_DISABLED");
+
+  // Contract Case 1: OpenCode profile exists + provider exists + exact model missing
+  await writeProfile(join(configDir, "agents"), "opencode-stale-model", [
+    "name: opencode-stale-model",
+    "description: Profile with stale/removed model.",
+    "provider: opencode",
+    "model: opencode/definitely-not-in-catalog-12345",
+    "write_mode: read_only",
+  ]);
+  const staleModelCatalog = await loadProfileCatalog(config, workspaceRoot, {
+    availability: [{ name: "opencode", available: true }],
+  });
+  const staleEntry = staleModelCatalog.entries.find((e) => e.name === "opencode-stale-model");
+  assert.equal(staleEntry?.state, "exact_model_unavailable");
+  assert.equal(staleModelCatalog.advertised("opencode-stale-model"), undefined);
+  assert.equal(staleModelCatalog.blockerFor("opencode-stale-model")?.code, "EXACT_MODEL_UNAVAILABLE");
+  assert.ok(!staleModelCatalog.profiles.some((p) => p.name === "opencode-stale-model"));
+
+  // Contract Case 2: OpenCode profile + model exists + invalid variant
+  await writeProfile(join(configDir, "agents"), "opencode-invalid-variant", [
+    "name: opencode-invalid-variant",
+    "description: Profile with invalid variant.",
+    "provider: opencode",
+    "model: opencode/big-pickle",
+    "effort: non-existent-variant-xyz",
+    "write_mode: read_only",
+  ]);
+  const invalidVariantCatalog = await loadProfileCatalog(config, workspaceRoot, {
+    availability: [{ name: "opencode", available: true }],
+  });
+  const variantEntry = invalidVariantCatalog.entries.find((e) => e.name === "opencode-invalid-variant");
+  assert.equal(variantEntry?.state, "variant_unavailable");
+  assert.equal(invalidVariantCatalog.advertised("opencode-invalid-variant"), undefined);
+  assert.equal(invalidVariantCatalog.blockerFor("opencode-invalid-variant")?.code, "VARIANT_UNAVAILABLE");
+  assert.ok(!invalidVariantCatalog.profiles.some((p) => p.name === "opencode-invalid-variant"));
+
+  // Contract Case 3: OpenCode profile + current valid model/variant
+  await writeProfile(join(configDir, "agents"), "opencode-valid", [
+    "name: opencode-valid",
+    "description: Profile with valid model and variant.",
+    "provider: opencode",
+    "model: opencode/big-pickle",
+    "effort: high",
+    "write_mode: read_only",
+  ]);
+  const validCatalog = await loadProfileCatalog(config, workspaceRoot, {
+    availability: [{ name: "opencode", available: true }],
+  });
+  const validEntry = validCatalog.entries.find((e) => e.name === "opencode-valid");
+  assert.equal(validEntry?.state, "advertised");
+  assert.notEqual(validCatalog.advertised("opencode-valid"), undefined);
+  assert.equal(validCatalog.blockerFor("opencode-valid"), undefined);
+  assert.ok(validCatalog.profiles.some((p) => p.name === "opencode-valid"));
 } finally {
   await rm(root, { recursive: true, force: true });
 }

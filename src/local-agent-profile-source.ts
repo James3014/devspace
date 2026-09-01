@@ -10,6 +10,11 @@ import {
 } from "./local-agent-availability.js";
 import { resolveSubagentsConfig, type SubagentsConfig } from "./local-agent-config.js";
 import { LOCAL_AGENT_PROVIDERS } from "./local-agent-profiles.js";
+import {
+  getActiveOpencodeCatalogSnapshot,
+  validateOpencodeModelAndVariant,
+  type OpencodeCatalogSnapshot,
+} from "./local-agent-opencode-catalog.js";
 import type { ServerConfig } from "./config.js";
 
 /**
@@ -26,7 +31,9 @@ export type ProfileBlockerCode =
   | "UNTRACKED_REPOSITORY_PROFILE"
   | "PROFILE_AUTHORITY_CONFLICT"
   | "PROVIDER_DISABLED"
-  | "PROVIDER_UNAVAILABLE";
+  | "PROVIDER_UNAVAILABLE"
+  | "EXACT_MODEL_UNAVAILABLE"
+  | "VARIANT_UNAVAILABLE";
 
 export interface ProfileCatalogEntry {
   name: string;
@@ -35,7 +42,15 @@ export interface ProfileCatalogEntry {
   model?: string;
   effort?: string;
   write_mode?: string;
-  state: "advertised" | "disabled" | "untracked_repository_profile" | "profile_authority_conflict" | "provider_unavailable" | "provider_disabled";
+  state:
+    | "advertised"
+    | "disabled"
+    | "untracked_repository_profile"
+    | "profile_authority_conflict"
+    | "provider_unavailable"
+    | "provider_disabled"
+    | "exact_model_unavailable"
+    | "variant_unavailable";
   sources: string[];
   tracked?: boolean;
   diagnostic?: string;
@@ -60,6 +75,7 @@ export async function loadProfileCatalog(
   options: {
     subagents?: SubagentsConfig;
     availability?: readonly LocalAgentProviderAvailability[];
+    opencodeCatalog?: OpencodeCatalogSnapshot;
   } = {},
 ): Promise<ProfileCatalog> {
   const entries: LocalAgentProfileEntry[] = await loadLocalAgentProfileEntries(config, workspaceRoot);
@@ -99,6 +115,20 @@ export async function loadProfileCatalog(
       if (!live?.available) {
         state = "provider_unavailable";
         diagnostic = diagnostic ?? `provider '${profile.provider}' is unavailable: ${live?.reason ?? "provider preflight failed"}`;
+      } else if (profile.provider === "opencode") {
+        const opencodeCatalog = options.opencodeCatalog ?? getActiveOpencodeCatalogSnapshot();
+        const modelValidation = validateOpencodeModelAndVariant(profile.model, profile.effort, opencodeCatalog);
+        if (!modelValidation.valid) {
+          if (modelValidation.blockerCode === "EXACT_MODEL_UNAVAILABLE") {
+            state = "exact_model_unavailable";
+            diagnostic = modelValidation.reason ?? `OpenCode model '${profile.model}' is not available in current catalog`;
+          } else {
+            state = "variant_unavailable";
+            diagnostic = modelValidation.reason ?? `OpenCode variant '${profile.effort}' is not available for model '${profile.model}'`;
+          }
+        } else {
+          state = "advertised";
+        }
       } else {
         state = "advertised";
       }
@@ -146,6 +176,10 @@ export async function loadProfileCatalog(
           return { code: "PROVIDER_DISABLED", detail: catalogEntry.diagnostic ?? "provider is not enabled" };
         case "provider_unavailable":
           return { code: "PROVIDER_UNAVAILABLE", detail: catalogEntry.diagnostic ?? "provider is unavailable" };
+        case "exact_model_unavailable":
+          return { code: "EXACT_MODEL_UNAVAILABLE", detail: catalogEntry.diagnostic ?? "requested model is unavailable" };
+        case "variant_unavailable":
+          return { code: "VARIANT_UNAVAILABLE", detail: catalogEntry.diagnostic ?? "requested variant is unavailable" };
       }
     },
   };
