@@ -1,6 +1,7 @@
 import { accessSync, constants } from "node:fs";
+import { homedir } from "node:os";
 import { spawnSync } from "node:child_process";
-import { delimiter, resolve } from "node:path";
+import { delimiter, join, resolve } from "node:path";
 import {
   LOCAL_AGENT_PROVIDERS,
   type LocalAgentProvider,
@@ -39,9 +40,11 @@ export function checkLocalAgentProviderAvailability(
     case "copilot":
       return commandAvailability(provider, env.COPILOT_COMMAND ?? "copilot", env);
     case "grok":
-      return commandAvailability(provider, env.GROK_COMMAND ?? "grok", env);
+      return grokAvailability(env);
     case "agy":
       return checkAgyAvailability(env);
+    case "cline":
+      return clineAvailability(env);
   }
 }
 
@@ -158,6 +161,62 @@ export function resolveAgyExecutable(env: NodeJS.ProcessEnv = process.env): stri
   return undefined;
 }
 
+function grokAvailability(env: NodeJS.ProcessEnv): LocalAgentProviderAvailability {
+  const executable = resolveGrokExecutable(env);
+  if (!executable) {
+    return {
+      name: "grok",
+      available: false,
+      reason: "grok executable not found (set GROK_COMMAND)",
+    };
+  }
+  return { name: "grok", available: true, note: executable };
+}
+
+export function resolveGrokExecutable(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (env.GROK_COMMAND) {
+    const resolved = resolveCommand(env.GROK_COMMAND, env);
+    if (resolved) return resolved;
+  }
+  const resolvedPath = resolveCommand("grok", env);
+  if (resolvedPath) return resolvedPath;
+  for (const fallback of [
+    join(homedir(), ".grok", "bin", "grok"),
+    join(homedir(), ".local", "bin", "grok"),
+  ]) {
+    if (executableExists(fallback)) return fallback;
+  }
+  return undefined;
+}
+
+function clineAvailability(env: NodeJS.ProcessEnv): LocalAgentProviderAvailability {
+  const executable = resolveClineExecutable(env);
+  if (!executable) {
+    return {
+      name: "cline",
+      available: false,
+      reason: "cline executable not found (set CLINE_COMMAND)",
+    };
+  }
+  return { name: "cline", available: true, note: executable };
+}
+
+export function resolveClineExecutable(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (env.CLINE_COMMAND) {
+    const resolved = resolveCommand(env.CLINE_COMMAND, env);
+    if (resolved) return resolved;
+  }
+  const resolvedPath = resolveCommand("cline", env);
+  if (resolvedPath) return resolvedPath;
+  for (const fallback of [
+    join(homedir(), ".npm-global", "lib", "node_modules", "cline", "bin", ".cline"),
+    join(homedir(), ".cline", "bin", "cline"),
+  ]) {
+    if (executableExists(fallback)) return fallback;
+  }
+  return undefined;
+}
+
 function checkAgyAvailability(env: NodeJS.ProcessEnv): LocalAgentProviderAvailability {
   const executable = resolveAgyExecutable(env);
   if (!executable) {
@@ -188,9 +247,11 @@ export function resolveLocalAgentProviderExecutable(
     case "copilot":
       return resolveCommand("copilot", env);
     case "grok":
-      return resolveCommand(env.GROK_COMMAND ?? "grok", env);
+      return resolveGrokExecutable(env);
     case "agy":
       return resolveAgyExecutable(env);
+    case "cline":
+      return resolveClineExecutable(env);
     default:
       return undefined;
   }

@@ -4,10 +4,12 @@ import { createRequire } from "node:module";
 import { delimiter, resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
+  AgentProviderFailureError,
   AgentProviderProtocolError,
   AgentProviderUnavailableError,
   captureAgentProviderResult,
   isProgrammerDefect,
+  type AgentProviderError,
 } from "./local-agent-errors.js";
 import { terminateProcessTree } from "./process-platform.js";
 import {
@@ -28,7 +30,7 @@ import type {
   LocalAgentWriteMode,
 } from "./local-agent-runtime.js";
 
-export type AcpProvider = "cursor" | "copilot" | "grok";
+export type AcpProvider = "cursor" | "copilot" | "grok" | "cline";
 
 const MAX_ACP_QUEUE_ITEMS = 10_000;
 const MAX_ACP_STDERR_BYTES = 32 * 1024;
@@ -44,6 +46,7 @@ const ACP_COMMANDS: Record<AcpProvider, [string, ...string[]]> = {
   cursor: ["cursor-agent", "acp"],
   copilot: ["copilot", "--acp"],
   grok: ["grok", "agent", "stdio"],
+  cline: ["cline", "acp"],
 };
 
 interface AcpConnectionLike {
@@ -171,9 +174,16 @@ export class AcpRuntime implements LocalAgentRuntime {
             prompt: [{ type: "text", text: input.prompt }],
             ...(promptId ? { _meta: { promptId, requestId: promptId } } : {}),
           });
-          const response = completion
-            ? await Promise.race([standardResponse, completion])
-            : await standardResponse;
+          let response: unknown;
+          try {
+            response = completion
+              ? await Promise.race([standardResponse, completion])
+              : await standardResponse;
+          } catch (cause) {
+            const classified = classifyAcpError(cause, this.provider, sessionId, { model: input.model, variant: input.effort });
+            if (classified) throw classified;
+            throw cause;
+          }
           if (completion && isGrokPromptCompletion(response)) {
             await yieldToAcpQueue();
           } else if (promptId) {
@@ -182,6 +192,8 @@ export class AcpRuntime implements LocalAgentRuntime {
           const updates = queue.values.splice(0);
           const finalResponse = extractAcpText(updates);
           if (!finalResponse) {
+            const classified = classifyAcpError(response, this.provider, sessionId, { model: input.model, variant: input.effort });
+            if (classified) throw classified;
             throw new AgentProviderProtocolError({
               code: "PROVIDER_PROTOCOL_ERROR",
               provider: this.provider,
@@ -625,7 +637,9 @@ export function resolveAcpCommand(
     ? env.CURSOR_COMMAND
     : provider === "copilot"
       ? env.COPILOT_COMMAND
-      : env.GROK_COMMAND;
+      : provider === "cline"
+        ? env.CLINE_COMMAND
+        : env.GROK_COMMAND;
   const command = configured ?? ACP_COMMANDS[provider][0];
   if (command.includes("/") || command.includes("\\")) return executableExists(command) ? command : undefined;
   const path = env.PATH;
@@ -639,6 +653,14 @@ export function resolveAcpCommand(
       const candidate = resolve(directory, `${command}${extension}`);
       if (executableExists(candidate)) return candidate;
     }
+  }
+  // Cline known fallback executable path (npm global install location).
+  if (provider === "cline") {
+    const clineKnownPath = resolve(
+      env.HOME ?? process.env.HOME ?? "~",
+      ".npm-global/lib/node_modules/cline/bin/.cline",
+    );
+    if (executableExists(clineKnownPath)) return clineKnownPath;
   }
   return undefined;
 }
@@ -658,6 +680,15 @@ export function acpCommandArgs(
       "--workspace", resolve(context.workspaceRoot),
       ...(writeMode === "read_only" ? ["--mode", "plan"] : []),
       ...(writeMode === "full_access" ? ["--force"] : []),
+    ];
+  }
+  if (provider === "cline") {
+    return [
+      "--acp",
+      ...(context.model ? ["--model", context.model] : []),
+      ...(context.effort ? ["--thinking", context.effort] : []),
+      ...(writeMode === "read_only" ? ["--plan"] : []),
+      "--auto-approve",
     ];
   }
   if (provider === "grok") {
@@ -798,6 +829,73 @@ function readAcpCapabilities(value: unknown): AcpCapabilities {
     close: Boolean(sessions?.close),
     additionalDirectories: Boolean(sessions?.additionalDirectories),
   };
+}
+
+export function classifyAcpError(
+  error: unknown,
+  provider: AcpProvider,
+  sessionId?: string,
+  modelInfo?: { model?: string; variant?: string },
+  stderrTail?: string,
+): AgentProviderError | undefined {
+  const text = `${error instanceof Error ? error.message : String(error)} ${stderrTail ?? ""}`.trim();
+  if (/no access to clinepass subscription models/i.test(text)) {
+    return new AgentProviderFailureError({
+      code: "CLINEPASS_ENTITLEMENT_REQUIRED",
+      errorClass: "ENTITLEMENT_REQUIRED",
+      provider,
+      operation: "run",
+      retryable: false,
+      model: modelInfo?.model,
+      variant: modelInfo?.variant,
+      providerSessionId: sessionId,
+      providerMessage: text.slice(0, 400),
+      message: `ClinePass subscription entitlement required: ${text.slice(0, 400)}`,
+    });
+  }
+  if (/model.*(?:not found|unavailable|unknown)/i.test(text)) {
+    return new AgentProviderFailureError({
+      code: "PROVIDER_MODEL_UNAVAILABLE",
+      errorClass: "MODEL_UNAVAILABLE",
+      provider,
+      operation: "run",
+      retryable: false,
+      model: modelInfo?.model,
+      variant: modelInfo?.variant,
+      providerSessionId: sessionId,
+      providerMessage: text.slice(0, 400),
+      message: `Requested model is unavailable: ${text.slice(0, 400)}`,
+    });
+  }
+  if (/(unauthorized|unauthenticated|authentication|invalid token|invalid api key|401|403)/i.test(text)) {
+    return new AgentProviderFailureError({
+      code: "PROVIDER_AUTH_ERROR",
+      errorClass: "AUTH_FAILURE",
+      provider,
+      operation: "run",
+      retryable: false,
+      model: modelInfo?.model,
+      variant: modelInfo?.variant,
+      providerSessionId: sessionId,
+      providerMessage: text.slice(0, 400),
+      message: `Provider authentication failed: ${text.slice(0, 400)}`,
+    });
+  }
+  if (/(quota|capacity|rate limit|resource_exhausted|overloaded|429|503)/i.test(text)) {
+    return new AgentProviderFailureError({
+      code: "PROVIDER_CAPACITY_ERROR",
+      errorClass: "QUOTA_CAPACITY",
+      provider,
+      operation: "run",
+      retryable: true,
+      model: modelInfo?.model,
+      variant: modelInfo?.variant,
+      providerSessionId: sessionId,
+      providerMessage: text.slice(0, 400),
+      message: `Provider quota or capacity failure: ${text.slice(0, 400)}`,
+    });
+  }
+  return undefined;
 }
 
 function extractAcpText(updates: unknown[]): string {

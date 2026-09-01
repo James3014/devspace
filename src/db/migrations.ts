@@ -52,6 +52,11 @@ const migrations: Migration[] = [
     name: "local-agent-lifecycle-state",
     up: migrateLocalAgentLifecycleState,
   },
+  {
+    version: 10,
+    name: "local-agent-error-details",
+    up: migrateLocalAgentErrorDetails,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -242,6 +247,10 @@ function migrateWorkspaceConversationBindings(sqlite: Database.Database): void {
 function migrateLocalAgentStructuredErrors(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "local_agent_sessions", "error_code", "text");
   addColumnIfMissing(sqlite, "local_agent_sessions", "error_retryable", "text");
+}
+
+function migrateLocalAgentErrorDetails(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "local_agent_sessions", "error_details", "text");
 }
 
 function migrateLocalAgentEffortRename(sqlite: Database.Database): void {

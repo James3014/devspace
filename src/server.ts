@@ -67,6 +67,12 @@ import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 import { summarizeLocalAgentProfile, loadLocalAgentProfiles } from "./local-agent-profiles.js";
 import {
+  loadProfileCatalog,
+  type ProfileCatalogEntry,
+} from "./local-agent-profile-source.js";
+import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build-identity.js";
+import { devspaceConfigDir } from "./user-config.js";
+import {
   formatLocalAgentProviderAvailabilitySummary,
   getLocalAgentProviderAvailabilitySnapshot,
 } from "./local-agent-availability.js";
@@ -341,6 +347,25 @@ const workspaceLocalAgentOutputSchema = z.object({
   write_mode: z.enum(["read_only", "allowed"]).optional(),
   providerAvailable: z.boolean().optional(),
   providerUnavailableReason: z.string().optional(),
+});
+
+const workspaceProfileStatusOutputSchema = z.object({
+  name: z.string(),
+  provider: z.string(),
+  state: z.string(),
+  sources: z.array(z.string()),
+  model: z.string().optional(),
+  effort: z.string().optional(),
+  write_mode: z.string().optional(),
+  tracked: z.boolean().optional(),
+  diagnostic: z.string().optional(),
+});
+
+const devspaceBuildOutputSchema = z.object({
+  serverInstanceId: z.string(),
+  buildId: z.string(),
+  sourceCommit: z.string(),
+  profileCatalogGeneration: z.string(),
 });
 
 const workspaceLocalAgentProviderOutputSchema = z.object({
@@ -1226,6 +1251,11 @@ function registerRepositoryIntelligenceTools(
   }
 }
 
+export interface RuntimeBuildIdentityContext {
+  identity: RuntimeBuildIdentity;
+  latestProfileCatalogGeneration: { value: string };
+}
+
 export function createMcpServer(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
@@ -1235,7 +1265,18 @@ export function createMcpServer(
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
   agentSessionManager?: LocalAgentSessionManager,
   codexGoals?: CodexGoalSessionManager,
+  runtimeBuildIdentityContext?: RuntimeBuildIdentityContext,
 ): McpServer {
+  const runtimeBuildIdentity = runtimeBuildIdentityContext?.identity
+    ?? describeRuntimeBuildIdentity({
+      env: process.env,
+      listenPort: config.port,
+      configRoot: devspaceConfigDir(process.env),
+      stateRoot: config.stateDir,
+      profileCatalogGeneration: "unresolved",
+    });
+  const latestProfileCatalogGeneration = runtimeBuildIdentityContext?.latestProfileCatalogGeneration
+    ?? { value: runtimeBuildIdentity.profileCatalogGeneration };
   const server = new McpServer(
     {
       name: "devspace",
@@ -1326,6 +1367,8 @@ export function createMcpServer(
         skills: z.array(workspaceSkillOutputSchema).optional(),
         agentProviders: z.array(workspaceLocalAgentProviderOutputSchema).optional(),
         agents: z.array(workspaceLocalAgentOutputSchema).optional(),
+        agentProfileStatuses: z.array(workspaceProfileStatusOutputSchema).optional(),
+        devspaceBuild: devspaceBuildOutputSchema,
         skillDiagnostics: z.array(z.unknown()).optional(),
         instruction: z.string(),
       },
@@ -1371,6 +1414,26 @@ export function createMcpServer(
           note: provider.note,
         }));
       const cardAgents = agentCatalog.profiles;
+      const cardProfileStatuses = (workspace.profileCatalogEntries ?? []).map(
+        (entry: ProfileCatalogEntry) => ({
+          name: entry.name,
+          provider: entry.provider,
+          state: entry.state,
+          sources: entry.sources,
+          ...(entry.model ? { model: entry.model } : {}),
+          ...(entry.effort ? { effort: entry.effort } : {}),
+          ...(entry.write_mode ? { write_mode: entry.write_mode } : {}),
+          ...(entry.tracked !== undefined ? { tracked: entry.tracked } : {}),
+          ...(entry.diagnostic ? { diagnostic: entry.diagnostic } : {}),
+        }),
+      );
+      const devspaceBuildReceipt = {
+        serverInstanceId: runtimeBuildIdentity.serverInstanceId,
+        buildId: runtimeBuildIdentity.buildId,
+        sourceCommit: runtimeBuildIdentity.sourceCommit,
+        profileCatalogGeneration: workspace.profileCatalogGeneration ?? "unresolved",
+      };
+      latestProfileCatalogGeneration.value = devspaceBuildReceipt.profileCatalogGeneration;
       const cardAgentsFiles = agentsFiles.map((file) => ({
         path: formatAgentsPath(file.path, workspace.root),
         content: file.content,
@@ -1451,6 +1514,8 @@ export function createMcpServer(
             skills: cardSkills,
             agentProviders: cardAgentProviders,
             agents: cardAgents,
+            agentProfileStatuses: cardProfileStatuses,
+            devspaceBuild: devspaceBuildReceipt,
             instruction: cardInstruction,
             summary: {
               mode: workspace.mode,
@@ -1468,6 +1533,8 @@ export function createMcpServer(
           mode: workspace.mode,
           sourceRoot: workspace.sourceRoot,
           worktree: workspace.worktree,
+          agentProfileStatuses: cardProfileStatuses,
+          devspaceBuild: devspaceBuildReceipt,
           ...(includeBootstrapContext
             ? {
                 agentsFiles: loadedAgentsFiles,
@@ -2363,7 +2430,8 @@ export function createMcpServer(
       },
       async ({ workspaceId, profile, prompt, attemptKey, executionContract }) => {
         const workspace = workspaces.getWorkspace(workspaceId);
-        const profiles = await loadLocalAgentProfiles(config, workspace.root);
+        const profileCatalog = await loadProfileCatalog(config, workspace.root);
+        const profiles = profileCatalog.profiles;
         let contract;
         try {
           contract = parseExecutionContract(executionContract);
@@ -2379,6 +2447,7 @@ export function createMcpServer(
           profileName: profile,
           prompt,
           profiles,
+          profileCatalog,
           attemptKey,
           executionContract: contract,
         });
@@ -2664,13 +2733,15 @@ export function createMcpServer(
       },
       async ({ workspaceId, profile, toolchainId }) => {
         const workspace = workspaces.getWorkspace(workspaceId);
-        const profiles = await loadLocalAgentProfiles(config, workspace.root);
+        const profileCatalog = await loadProfileCatalog(config, workspace.root);
+        const profiles = profileCatalog.profiles;
         const output = await agentSessionManager.preflightAgent({
           workspaceId,
           workspaceRoot: workspace.root,
           isolated: workspace.mode === "worktree",
           profileName: profile,
           profiles,
+          profileCatalog,
           toolchainId,
         });
         const blockerSummary =
@@ -3153,6 +3224,14 @@ export function createServer(
     config.subagents,
     getLocalAgentProviderAvailabilitySnapshot(),
   );
+  const runtimeBuildIdentity = describeRuntimeBuildIdentity({
+    env: process.env,
+    listenPort: config.port,
+    configRoot: devspaceConfigDir(process.env),
+    stateRoot: config.stateDir,
+    profileCatalogGeneration: "unresolved",
+  });
+  const latestProfileCatalogGeneration = { value: runtimeBuildIdentity.profileCatalogGeneration };
   const agentSessionManager = config.subagents.enabled
     ? new LocalAgentSessionManager(config)
     : undefined;
@@ -3256,7 +3335,28 @@ export function createServer(
   );
 
   app.get("/healthz", (_req, res) => {
-    res.json({ ok: true, name: "devspace" });
+    res.json({
+      ok: true,
+      name: "devspace",
+      build: {
+        package_name: runtimeBuildIdentity.package,
+        package_version: runtimeBuildIdentity.version,
+        source_commit: runtimeBuildIdentity.sourceCommit,
+        source_dirty: runtimeBuildIdentity.sourceDirty,
+        build_id: runtimeBuildIdentity.buildId,
+        pid: runtimeBuildIdentity.pid,
+        listen_port: runtimeBuildIdentity.listenPort,
+      },
+    });
+  });
+
+  // Unauthenticated runtime identity endpoint (same trust level as /healthz).
+  // Exposes build/runtime identity only; no secrets, no workspace data.
+  app.get("/identity", (_req, res) => {
+    res.json({
+      ...runtimeBuildIdentity,
+      profileCatalogGeneration: latestProfileCatalogGeneration.value,
+    });
   });
 
   app.all("/mcp", async (req, res) => {
@@ -3333,6 +3433,7 @@ export function createServer(
           incomingArtifactAdapters,
           agentSessionManager,
           codexGoals,
+          { identity: runtimeBuildIdentity, latestProfileCatalogGeneration },
         );
         await server.connect(transport);
       } else {

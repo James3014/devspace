@@ -36,7 +36,7 @@ assert.equal(checkLocalAgentProviderAvailability("omp").available, true);
   });
   assert.deepEqual(
     snapshot.map((provider) => provider.name),
-    ["codex", "claude", "opencode", "omp", "pi", "cursor", "copilot", "grok", "agy"],
+    ["codex", "claude", "opencode", "omp", "pi", "cursor", "copilot", "grok", "agy", "cline"],
   );
   assert.equal(snapshot.find((provider) => provider.name === "pi")?.available, true);
 }

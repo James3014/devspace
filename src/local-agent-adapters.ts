@@ -96,6 +96,8 @@ export function createLocalAgentAdapter(
       return new AgyLocalAgentAdapter();
     case "omp":
       return new OmpLocalAgentAdapter();
+    case "cline":
+      return new DriverBackedLocalAgentAdapter(new AcpLocalAgentDriver("cline", options.env));
   }
 }
 

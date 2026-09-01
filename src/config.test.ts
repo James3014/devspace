@@ -266,7 +266,7 @@ assert.equal(fileConfig.port, 8787);
 assert.equal(fileConfig.oauth.ownerToken, "persisted-owner-token-long-enough");
 assert.equal(fileConfig.publicBaseUrl, "https://devspace.example.com");
 assert.equal(fileConfig.subagents.enabled, true);
-assert.equal(fileConfig.subagents.providers.length, 9);
+assert.equal(fileConfig.subagents.providers.length, 10);
 assert.equal(fileConfig.artifactsEnabled, true);
 assert.equal(fileConfig.artifactMaxFileBytes, 321);
 assert.deepEqual(fileConfig.allowedHosts, [

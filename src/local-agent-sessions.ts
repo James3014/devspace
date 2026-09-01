@@ -37,6 +37,9 @@ import {
   type CleanupResult,
   type ScratchHandle,
 } from "./provider-scratch.js";
+import type { ProfileCatalog } from "./local-agent-profile-source.js";
+import type { AgentProviderFailureDetails } from "./local-agent-errors.js";
+import { validateOpencodeModelAndVariant } from "./local-agent-opencode-catalog.js";
 import { canonicalizePath, isPathInsideRoot } from "./roots.js";
 import {
   classifyScopeState,
@@ -51,6 +54,13 @@ import {
 export type AgentErrorCode =
   | "UNKNOWN_WORKSPACE"
   | "UNKNOWN_PROFILE"
+  | "PROFILE_DISABLED"
+  | "UNTRACKED_REPOSITORY_PROFILE"
+  | "PROFILE_AUTHORITY_CONFLICT"
+  | "PROVIDER_DISABLED"
+  | "PROVIDER_UNAVAILABLE"
+  | "EXACT_MODEL_UNAVAILABLE"
+  | "VARIANT_UNAVAILABLE"
   | "PROVIDER_UNAVAILABLE"
   | "UNKNOWN_AGENT"
   | "AGENT_WORKSPACE_MISMATCH"
@@ -119,6 +129,7 @@ export interface StartAgentInput {
   profileName: string;
   prompt: string;
   profiles: LocalAgentProfile[];
+  profileCatalog?: ProfileCatalog;
   executionContract?: ExecutionContract;
   attemptKey?: string;
 }
@@ -167,6 +178,7 @@ export interface AgentStatusOutput {
   terminal: boolean;
   latestResponse?: string;
   error?: string;
+  errorDetails?: AgentProviderFailureDetails;
   createdAt: string;
   updatedAt: string;
   startedAt?: string;
@@ -231,6 +243,7 @@ export interface AgentPreflightInput {
   isolated: boolean;
   profileName: string;
   profiles: LocalAgentProfile[];
+  profileCatalog?: ProfileCatalog;
   toolchainId?: string;
 }
 
@@ -411,6 +424,10 @@ export class LocalAgentSessionManager {
 
     const profile = profiles.find((p) => p.name === profileName);
     if (!profile) {
+      const blocker = input.profileCatalog?.blockerFor(profileName);
+      if (blocker) {
+        throw new AgentSessionError(blocker.code, `Agent profile '${profileName}' is not dispatchable: ${blocker.detail}`);
+      }
       const available = profiles.map((p) => p.name).join(", ");
       throw new AgentSessionError(
         "UNKNOWN_PROFILE",
@@ -473,19 +490,6 @@ export class LocalAgentSessionManager {
       }
     }
 
-    const availability = checkLocalAgentProviderAvailability(profile.provider, providerEnvironment);
-    const codexRuntime = profile.provider === "codex" && availability.available
-      ? inspectCodexRuntime({ env: providerEnvironment })
-      : undefined;
-    if (!availability.available || (codexRuntime && !codexRuntime.ready)) {
-      throw new AgentSessionError(
-        "PROVIDER_UNAVAILABLE",
-        `Agent provider '${profile.provider}' is unavailable: ${
-          availability.reason ?? codexRuntime?.reason ?? "unknown reason"
-        }`,
-      );
-    }
-
     if (executionContract?.expectedHead) {
       const currentHead = await readWorkspaceHead(workspaceRoot);
       if (!currentHead) {
@@ -500,6 +504,29 @@ export class LocalAgentSessionManager {
           "STALE_WORKSPACE",
           `Execution contract expected HEAD ${executionContract.expectedHead}, current workspace HEAD is ${currentHead}. ` +
             `Refusing to start the worker against a stale workspace.`,
+        );
+      }
+    }
+
+    const availability = checkLocalAgentProviderAvailability(profile.provider, providerEnvironment);
+    const codexRuntime = profile.provider === "codex" && availability.available
+      ? inspectCodexRuntime({ env: providerEnvironment })
+      : undefined;
+    if (!availability.available || (codexRuntime && !codexRuntime.ready)) {
+      throw new AgentSessionError(
+        "PROVIDER_UNAVAILABLE",
+        `Agent provider '${profile.provider}' is unavailable: ${
+          availability.reason ?? codexRuntime?.reason ?? "unknown reason"
+        }`,
+      );
+    }
+
+    if (profile.provider === "opencode") {
+      const modelValidation = validateOpencodeModelAndVariant(profile.model, profile.effort);
+      if (!modelValidation.valid) {
+        throw new AgentSessionError(
+          modelValidation.blockerCode!,
+          modelValidation.reason!,
         );
       }
     }
@@ -821,7 +848,7 @@ export class LocalAgentSessionManager {
    * authority. Never exposes credentials. Unknown evidence stays unknown.
    */
   async preflightAgent(input: AgentPreflightInput): Promise<AgentPreflightOutput> {
-    const { workspaceId, workspaceRoot, isolated, profileName, profiles, toolchainId } = input;
+    const { workspaceId, workspaceRoot, isolated, profileName, profiles, profileCatalog, toolchainId } = input;
     const blockers: Array<{ code: string; detail: string }> = [];
     const unknowns: string[] = [];
 
@@ -837,10 +864,15 @@ export class LocalAgentSessionManager {
     const profile = profiles.find((candidate) => candidate.name === profileName);
     const profileResolved = Boolean(profile);
     if (!profile) {
-      blockers.push({
-        code: "UNKNOWN_PROFILE",
-        detail: `Profile '${profileName}' is not advertised for this workspace.`,
-      });
+      const blocker = profileCatalog?.blockerFor(profileName);
+      blockers.push(
+        blocker
+          ? { code: blocker.code, detail: `Profile '${profileName}' is not dispatchable: ${blocker.detail}` }
+          : {
+              code: "UNKNOWN_PROFILE",
+              detail: `Profile '${profileName}' is not advertised for this workspace.`,
+            },
+      );
     }
 
     // Authentication and provider reachability cannot be verified without an
@@ -916,6 +948,16 @@ export class LocalAgentSessionManager {
       } else if (!codexRuntime) {
         const executable = resolveLocalAgentProviderExecutable(profile.provider, providerEnvironment);
         if (executable) executionIdentity = executable;
+      }
+
+      if (runtimeReady && profile.provider === "opencode") {
+        const modelValidation = validateOpencodeModelAndVariant(profile.model, profile.effort);
+        if (!modelValidation.valid) {
+          blockers.push({
+            code: modelValidation.blockerCode!,
+            detail: modelValidation.reason!,
+          });
+        }
       }
     }
 
@@ -1973,6 +2015,7 @@ function recordToStatusOutput(
   if (record.providerSessionId !== undefined) output.providerSessionId = record.providerSessionId;
   if (record.latestResponse !== undefined) output.latestResponse = record.latestResponse;
   if (record.error !== undefined) output.error = record.error;
+  if (record.errorDetails !== undefined) output.errorDetails = record.errorDetails;
   const pending = record.lifecycleState?.terminationPending;
   const corrupt = isDetachedLifecycle(record.lifecycleState) && record.lifecycleState?.lifecycleCorrupt;
   const blocked = isDetachedLifecycle(record.lifecycleState) ? record.lifecycleState?.terminationBlocked : undefined;

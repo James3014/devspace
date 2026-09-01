@@ -2,7 +2,11 @@ import { randomUUID } from "node:crypto";
 import { resolve } from "node:path";
 import { Result, type Result as BetterResult } from "better-result";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
-import { AgentStoreError, isProgrammerDefect } from "./local-agent-errors.js";
+import {
+  AgentStoreError,
+  isProgrammerDefect,
+  type AgentProviderFailureDetails,
+} from "./local-agent-errors.js";
 import type { ServerConfig } from "./config.js";
 import { canonicalizePath } from "./roots.js";
 import {
@@ -80,6 +84,7 @@ export interface LocalAgentRecord {
   error?: string;
   errorCode?: string;
   errorRetryable?: boolean;
+  errorDetails?: AgentProviderFailureDetails;
   createdAt: string;
   updatedAt: string;
 }
@@ -200,6 +205,7 @@ interface LocalAgentRow {
   error: string | null;
   error_code: string | null;
   error_retryable: string | null;
+  error_details: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -447,6 +453,7 @@ export class LocalAgentStore {
           error = ?,
           error_code = ?,
           error_retryable = ?,
+          error_details = ?,
           updated_at = ?
          where id = ? and updated_at = ? and lifecycle_state is ?`,
       )
@@ -470,6 +477,7 @@ export class LocalAgentStore {
         updated.error ?? null,
         updated.errorCode ?? null,
         updated.errorRetryable === undefined ? null : String(updated.errorRetryable),
+        updated.errorDetails ? JSON.stringify(updated.errorDetails) : null,
         updated.updatedAt,
         updated.id,
         row.updated_at,
@@ -1292,9 +1300,31 @@ function rowToLocalAgentRecord(row: LocalAgentRow): LocalAgentRecord {
     error: row.error ?? undefined,
     errorCode: row.error_code ?? undefined,
     errorRetryable: readOptionalBoolean(row.error_retryable),
+    errorDetails: readErrorDetails(row.error_details),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function readErrorDetails(value: string | null): AgentProviderFailureDetails | undefined {
+  if (!value) return undefined;
+  try {
+    const parsed = JSON.parse(value) as Partial<AgentProviderFailureDetails>;
+    if (parsed.code && parsed.errorClass) {
+      return {
+        code: parsed.code,
+        errorClass: parsed.errorClass,
+        retryable: parsed.retryable === true,
+        model: parsed.model,
+        variant: parsed.variant,
+        providerSessionId: parsed.providerSessionId,
+        providerMessage: parsed.providerMessage,
+      };
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
 }
 
 function readOptionalBoolean(value: string | null): boolean | undefined {

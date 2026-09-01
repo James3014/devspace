@@ -2,6 +2,7 @@ import { resolve } from "node:path";
 import { Result, type Result as BetterResult } from "better-result";
 import {
   AgentConflictError,
+  AgentProviderFailureError,
   AgentScopeError,
   AgentStoreError,
   AgentTargetError,
@@ -382,11 +383,23 @@ export class LocalAgentManager {
     error: LocalAgentError,
     startedAt: number,
   ): void {
+    const failureDetails = error instanceof AgentProviderFailureError
+      ? {
+          code: error.code,
+          errorClass: error.errorClass,
+          retryable: error.retryable,
+          ...(error.model ? { model: error.model } : {}),
+          ...(error.variant ? { variant: error.variant } : {}),
+          ...(error.providerSessionId ? { providerSessionId: error.providerSessionId } : {}),
+          ...(error.providerMessage ? { providerMessage: error.providerMessage } : {}),
+        }
+      : undefined;
     const persisted = this.store.updateResult(record.id, {
       status: "error",
       error: error.message,
       errorCode: error.code,
       errorRetryable: error.retryable,
+      ...(failureDetails ? { errorDetails: failureDetails } : {}),
     });
     this.log("error", "agent_run_failed", {
       provider: record.provider,

@@ -35,16 +35,24 @@ export function localAgentDaemonPaths(
 ): LocalAgentDaemonPaths {
   const resolvedStateDir = resolve(stateDir);
   const socketPath = join(resolvedStateDir, LOCAL_AGENT_DAEMON_SOCKET_NAME);
+  // macOS enforces a 104-character maximum for Unix domain socket paths
+  // (EINVAL if exceeded). When the canonical path is too long, derive a
+  // collision-resistant short path under /tmp so tests and deeply-nested
+  // state directories remain functional.
+  const UNIX_SOCKET_PATH_LIMIT = 103;
+  const resolvedSocketPath = platform !== "win32" && socketPath.length > UNIX_SOCKET_PATH_LIMIT
+    ? `/tmp/ds-agentd-${hashStateDir(resolvedStateDir)}.sock`
+    : socketPath;
   return {
     stateDir: resolvedStateDir,
-    socketPath,
+    socketPath: resolvedSocketPath,
     pidPath: join(resolvedStateDir, LOCAL_AGENT_DAEMON_PID_NAME),
     lockPath: join(resolvedStateDir, LOCAL_AGENT_DAEMON_LOCK_NAME),
     secretPath: join(resolvedStateDir, LOCAL_AGENT_DAEMON_SECRET_NAME),
     logPath: join(resolvedStateDir, LOCAL_AGENT_DAEMON_LOG_NAME),
     endpoint: platform === "win32"
       ? `\\\\.\\pipe\\devspace-agentd-${hashStateDir(resolvedStateDir)}`
-      : socketPath,
+      : resolvedSocketPath,
   };
 }
 

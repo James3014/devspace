@@ -74,11 +74,54 @@ export class AgentProviderExecutionError extends TaggedError(
   "AgentProviderExecutionError",
 )<AgentProviderErrorFields & { code: "PROVIDER_EXECUTION_ERROR" }>() {}
 
+/**
+ * Root provider failure classes. These preserve the original provider error
+ * semantics (exact model, requested variant, retryability) instead of letting
+ * an idle timeout shadow the real cause.
+ */
+export type AgentProviderFailureCode =
+  | "PROVIDER_MODEL_UNAVAILABLE"
+  | "PROVIDER_VARIANT_UNAVAILABLE"
+  | "PROVIDER_AUTH_ERROR"
+  | "PROVIDER_CAPACITY_ERROR"
+  | "PROVIDER_TIMEOUT"
+  | "CLINEPASS_ENTITLEMENT_REQUIRED";
+
+export interface AgentProviderFailureDetails {
+  code: string;
+  errorClass: string;
+  retryable: boolean;
+  model?: string;
+  variant?: string;
+  providerSessionId?: string;
+  providerMessage?: string;
+}
+
+export type AgentProviderFailureClass =
+  | "MODEL_UNAVAILABLE"
+  | "VARIANT_UNAVAILABLE"
+  | "AUTH_FAILURE"
+  | "QUOTA_CAPACITY"
+  | "UPSTREAM_TIMEOUT"
+  | "ENTITLEMENT_REQUIRED";
+
+export class AgentProviderFailureError extends TaggedError(
+  "AgentProviderFailureError",
+)<AgentProviderErrorFields & {
+  code: AgentProviderFailureCode;
+  errorClass: AgentProviderFailureClass;
+  model?: string;
+  variant?: string;
+  providerSessionId?: string;
+  providerMessage?: string;
+}>() {}
+
 export type AgentProviderError =
   | AgentProviderUnavailableError
   | AgentProviderCancelledError
   | AgentProviderProtocolError
-  | AgentProviderExecutionError;
+  | AgentProviderExecutionError
+  | AgentProviderFailureError;
 
 interface AgentDaemonErrorFields extends Record<string, unknown> {
   operation: string;
@@ -171,7 +214,8 @@ export function isAgentProviderError(error: unknown): error is AgentProviderErro
   return AgentProviderUnavailableError.is(error)
     || AgentProviderCancelledError.is(error)
     || AgentProviderProtocolError.is(error)
-    || AgentProviderExecutionError.is(error);
+    || AgentProviderExecutionError.is(error)
+    || AgentProviderFailureError.is(error);
 }
 
 export function isAgentDaemonError(error: unknown): error is AgentDaemonError {
@@ -203,6 +247,7 @@ export function toAgentErrorPayload(error: LocalAgentError): AgentErrorPayload {
     AgentProviderCancelledError: providerErrorPayload,
     AgentProviderProtocolError: providerErrorPayload,
     AgentProviderExecutionError: providerErrorPayload,
+    AgentProviderFailureError: providerErrorPayload,
     AgentDaemonUnavailableError: daemonErrorPayload,
     AgentDaemonStartupError: daemonErrorPayload,
     AgentDaemonTimeoutError: daemonErrorPayload,
@@ -453,6 +498,7 @@ function displayProvider(provider: LocalAgentProvider): string {
     case "copilot": return "Copilot";
     case "grok": return "Grok";
     case "agy": return "Agy";
+    case "cline": return "Cline";
   }
 }
 
@@ -496,6 +542,14 @@ function providerErrorPayload(error: AgentProviderError): AgentErrorPayload {
     provider: error.provider,
     operation: error.operation,
     ...(error.agentId ? { agentId: error.agentId } : {}),
+    ...("errorClass" in error && error.errorClass
+      ? {
+          errorClass: error.errorClass,
+          model: (error as AgentProviderFailureError).model,
+          variant: (error as AgentProviderFailureError).variant,
+          providerSessionId: (error as AgentProviderFailureError).providerSessionId,
+        }
+      : {}),
   };
 }
 

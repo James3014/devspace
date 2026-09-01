@@ -27,6 +27,11 @@ import {
   loadLocalAgentProfiles,
   type LocalAgentProfile,
 } from "./local-agent-profiles.js";
+import {
+  loadProfileCatalog,
+  type ProfileCatalog,
+  type ProfileCatalogEntry,
+} from "./local-agent-profile-source.js";
 
 export interface LoadedAgentsFile {
   path: string;
@@ -55,6 +60,8 @@ export interface Workspace {
   skills: LoadedSkills["skills"];
   skillDiagnostics: LoadedSkills["diagnostics"];
   agentProfiles: LocalAgentProfile[];
+  profileCatalogGeneration?: string;
+  profileCatalogEntries?: ProfileCatalogEntry[];
   activatedSkillDirs: Set<string>;
 }
 
@@ -229,7 +236,10 @@ export class WorkspaceRegistry {
   }
 
   private async reusedWorkspaceContext(workspace: Workspace): Promise<WorkspaceContext> {
-    workspace.agentProfiles = await loadLocalAgentProfiles(this.config, workspace.root);
+    const catalog = await loadProfileCatalog(this.config, workspace.root);
+    workspace.agentProfiles = catalog.profiles;
+    workspace.profileCatalogGeneration = catalog.generation;
+    workspace.profileCatalogEntries = catalogEntriesOf(catalog);
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
     const availableAgentsFiles = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
 
@@ -363,9 +373,15 @@ export class WorkspaceRegistry {
       sourceRoot: input.sourceRoot,
       worktree: input.worktree,
       ...this.loadSkillsForWorkspace(input.root),
-      agentProfiles: await loadLocalAgentProfiles(this.config, input.root),
+      agentProfiles: [],
       activatedSkillDirs: new Set(),
     };
+    {
+      const catalog = await loadProfileCatalog(this.config, input.root);
+      workspace.agentProfiles = catalog.profiles;
+      workspace.profileCatalogGeneration = catalog.generation;
+      workspace.profileCatalogEntries = catalogEntriesOf(catalog);
+    }
 
     this.store?.createSession({
       id: workspace.id,
@@ -581,4 +597,8 @@ async function walkWorkspace(
 
 function isErrnoException(error: unknown): error is NodeJS.ErrnoException {
   return error instanceof Error && "code" in error;
+}
+
+function catalogEntriesOf(catalog: ProfileCatalog): ProfileCatalogEntry[] {
+  return catalog.entries;
 }
