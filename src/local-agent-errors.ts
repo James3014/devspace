@@ -218,6 +218,57 @@ export function isAgentProviderError(error: unknown): error is AgentProviderErro
     || AgentProviderFailureError.is(error);
 }
 
+export function describeAgentProviderError(error: AgentProviderError): AgentProviderFailureDetails {
+  if (AgentProviderFailureError.is(error)) {
+    return {
+      code: error.code,
+      errorClass: error.errorClass,
+      retryable: error.retryable,
+      ...(error.model ? { model: error.model } : {}),
+      ...(error.variant ? { variant: error.variant } : {}),
+      ...(error.providerSessionId ? { providerSessionId: error.providerSessionId } : {}),
+      ...(error.providerMessage ? { providerMessage: error.providerMessage } : {}),
+    };
+  }
+  return {
+    code: error.code,
+    errorClass: error.code,
+    retryable: error.retryable,
+    providerMessage: safeProviderDiagnostic(error.cause) ?? error.message,
+  };
+}
+
+function safeProviderDiagnostic(cause: unknown): string | undefined {
+  const parts: string[] = [];
+  const seen = new Set<object>();
+  let current = cause;
+  for (let depth = 0; depth < 4 && current !== undefined && current !== null; depth += 1) {
+    if (typeof current === "string") {
+      parts.push(current);
+      break;
+    }
+    if (typeof current !== "object" || seen.has(current)) break;
+    seen.add(current);
+    const record = current as { name?: unknown; message?: unknown; code?: unknown; cause?: unknown };
+    const summary = [
+      typeof record.name === "string" ? record.name : undefined,
+      typeof record.code === "string" ? record.code : undefined,
+      typeof record.message === "string" ? record.message : undefined,
+    ].filter(Boolean).join(": ");
+    if (summary) parts.push(summary);
+    current = record.cause;
+  }
+  const text = parts.join(" <- ").trim();
+  if (!text) return undefined;
+  return redactProviderDiagnostic(text).slice(0, 400);
+}
+
+function redactProviderDiagnostic(text: string): string {
+  return text
+    .replace(/\bBearer\s+[A-Za-z0-9._~+\/-]+=*/gi, "Bearer [REDACTED]")
+    .replace(/\b(api[_ -]?key|token|authorization|secret)\s*[:=]\s*[^\s,;]+/gi, "$1=[REDACTED]");
+}
+
 export function isAgentDaemonError(error: unknown): error is AgentDaemonError {
   return AgentDaemonUnavailableError.is(error)
     || AgentDaemonStartupError.is(error)

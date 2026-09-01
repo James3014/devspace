@@ -40,6 +40,7 @@ import {
 import type { ProfileCatalog } from "./local-agent-profile-source.js";
 import {
   AgentProviderFailureError,
+  describeAgentProviderError,
   isAgentProviderError,
   type AgentProviderFailureDetails,
 } from "./local-agent-errors.js";
@@ -1543,6 +1544,7 @@ export class LocalAgentSessionManager {
       } else if (isAgentProviderError(error)) {
         errorCode = error.code;
         errorRetryable = error.retryable;
+        errorDetails = describeAgentProviderError(error);
       } else if (error instanceof LocalAgentProviderError) {
         providerSessionId = error.providerSessionId;
         latestResponse = error.finalResponse;

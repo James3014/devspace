@@ -85,6 +85,7 @@ export interface AcpRuntimeOptions {
   grokCompletionRegistry?: GrokPromptCompletionRegistry;
   promptCompletionTimeoutMs?: number;
   activityCallbacks?: Map<string, () => void | Promise<void>>;
+  stderrTail?: () => string;
 }
 
 export class AcpRuntime implements LocalAgentRuntime {
@@ -103,6 +104,7 @@ export class AcpRuntime implements LocalAgentRuntime {
   private alive = true;
   private closed = false;
   private readonly activityCallbacks: Map<string, () => void | Promise<void>>;
+  private readonly stderrTail?: () => string;
 
   constructor(options: AcpRuntimeOptions, connection: AcpConnectionLike) {
     this.provider = options.provider;
@@ -116,6 +118,7 @@ export class AcpRuntime implements LocalAgentRuntime {
     this.grokCompletionRegistry = options.grokCompletionRegistry;
     this.promptCompletionTimeoutMs = options.promptCompletionTimeoutMs ?? ACP_GROK_PROMPT_COMPLETION_TIMEOUT_MS;
     this.activityCallbacks = options.activityCallbacks ?? new Map();
+    this.stderrTail = options.stderrTail;
     void this.connection.closed.then(() => {
       if (!this.closed) this.alive = false;
       this.grokCompletionRegistry?.rejectAll(new Error(`${this.provider} ACP connection closed.`));
@@ -184,7 +187,13 @@ export class AcpRuntime implements LocalAgentRuntime {
               ? await Promise.race([standardResponse, completion])
               : await standardResponse;
           } catch (cause) {
-            const classified = classifyAcpError(cause, this.provider, sessionId, { model: input.model, variant: input.effort });
+            const classified = classifyAcpError(
+              cause,
+              this.provider,
+              sessionId,
+              { model: input.model, variant: input.effort },
+              this.stderrTail?.(),
+            );
             if (classified) throw classified;
             throw cause;
           }
@@ -196,7 +205,13 @@ export class AcpRuntime implements LocalAgentRuntime {
           const updates = queue.values.splice(0);
           const finalResponse = extractAcpText(updates);
           if (!finalResponse) {
-            const classified = classifyAcpError(response, this.provider, sessionId, { model: input.model, variant: input.effort });
+            const classified = classifyAcpError(
+              response,
+              this.provider,
+              sessionId,
+              { model: input.model, variant: input.effort },
+              this.stderrTail?.(),
+            );
             if (classified) throw classified;
             throw new AgentProviderProtocolError({
               code: "PROVIDER_PROTOCOL_ERROR",
@@ -570,6 +585,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
             sessionWriteModes,
             grokCompletionRegistry,
             activityCallbacks,
+            stderrTail: () => stderrTail,
           }, connection);
           // AcpRuntime installs the long-lived child error listener before this
           // startup-only listener is removed, so there is no unobserved gap.

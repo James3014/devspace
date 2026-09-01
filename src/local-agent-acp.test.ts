@@ -480,6 +480,69 @@ await resumedRuntime.close();
 await resumedRuntime.close();
 assert.equal(resumedRuntime.isAlive(), false);
 
+// Cline entitlement emitted on stderr must survive the ACP runtime boundary.
+{
+  const clineQueues = new Map<string, { values: unknown[] }>();
+  const clineConnection = {
+    agent: {
+      async request(method: string, params?: unknown): Promise<unknown> {
+        const input = params as { sessionId?: string } | undefined;
+        if (method === "session/new") {
+          const sessionId = "cline_entitlement_session";
+          clineQueues.set(sessionId, { values: [] });
+          return {
+            sessionId,
+            configOptions: [
+              {
+                type: "select",
+                category: "model",
+                id: "model",
+                options: [{ value: "cline-pass/glm-5.3-flash" }],
+              },
+              {
+                type: "select",
+                category: "thought_level",
+                id: "effort",
+                options: [{ value: "high" }],
+              },
+            ],
+          };
+        }
+        if (method === "session/set_config_option") return {};
+        if (method === "session/prompt") return { stopReason: "error" };
+        const sessionId = input?.sessionId;
+        if (sessionId && !clineQueues.has(sessionId)) clineQueues.set(sessionId, { values: [] });
+        return {};
+      },
+    },
+    close() {},
+    closed: new Promise<void>(() => undefined),
+  };
+  const clineRuntime = new AcpRuntime({
+    provider: "cline",
+    command: "cline",
+    args: ["--acp"],
+    env: {},
+    queues: clineQueues,
+    stderrTail: () => "No access to ClinePass subscription models yet. Please upgrade your subscription.",
+  }, clineConnection);
+  const clineEntitlement = await clineRuntime.run({
+    prompt: "read only",
+    workspaceRoot: "/tmp/project",
+    model: "cline-pass/glm-5.3-flash",
+    effort: "high",
+    writeMode: "read_only",
+  });
+  assert.equal(clineEntitlement.isErr(), true);
+  if (clineEntitlement.isErr()) {
+    assert.equal(clineEntitlement.error.code, "CLINEPASS_ENTITLEMENT_REQUIRED");
+    assert.equal(clineEntitlement.error.retryable, false);
+    assert.equal(clineEntitlement.error.errorClass, "ENTITLEMENT_REQUIRED");
+    assert.equal(clineEntitlement.error.providerSessionId, "cline_entitlement_session");
+  }
+  await clineRuntime.close();
+}
+
 // Regression tests for Grok & Cline canonical resolver parity
 {
   const tempHome = await mkdtemp(join(tmpdir(), "devspace-acp-resolver-test-"));

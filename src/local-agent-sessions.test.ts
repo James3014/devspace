@@ -647,6 +647,71 @@ test("LocalAgentSessionManager - Cross-conversation recovery regression", async 
   }
 });
 
+test("runWorkerTurnFromFile persists generic AgentProviderError diagnostics", async () => {
+  const { stateDir, clean } = setupFixture();
+  try {
+    const { AgentProviderExecutionError } = await import("./local-agent-errors.js");
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    const { join } = await import("node:path");
+
+    const config = {
+      stateDir,
+      subagents: true,
+      oauth: { scopes: ["devspace"] },
+    } as any;
+    const projectRoot = join(stateDir, "project-generic-error");
+    mkdirSync(projectRoot, { recursive: true });
+
+    const manager = new LocalAgentSessionManager(
+      config,
+      undefined,
+      undefined,
+      async () => {
+        throw new AgentProviderExecutionError({
+          code: "PROVIDER_EXECUTION_ERROR",
+          provider: "opencode",
+          operation: "run",
+          message: "OpenCode agent execution failed.",
+          retryable: false,
+          cause: new Error("provider runtime rejected request"),
+        });
+      },
+    );
+
+    const store = (manager as any).store;
+    const record = store.create({
+      workspaceId: "ws_generic_err",
+      workspaceRoot: projectRoot,
+      profileName: "opencode-test",
+      provider: "opencode",
+      lifecycleKind: "detached_worker_v2",
+    });
+    const token = "worker-token-generic-error";
+    store.prepareWorker(record.id, token);
+    const promptFile = join(config.stateDir, `prompt-${record.id}.json`);
+    writeFileSync(promptFile, "test prompt");
+
+    await manager.runWorkerTurnFromFile(record.id, promptFile, token);
+
+    const updated = store.getById(record.id)!;
+    assert.equal(updated.status, "error");
+    assert.equal(updated.errorCode, "PROVIDER_EXECUTION_ERROR");
+    assert.equal(updated.errorRetryable, false);
+    assert.equal(updated.terminalReason, "provider_error");
+    assert.deepEqual(updated.errorDetails, {
+      code: "PROVIDER_EXECUTION_ERROR",
+      errorClass: "PROVIDER_EXECUTION_ERROR",
+      retryable: false,
+      model: undefined,
+      variant: undefined,
+      providerSessionId: undefined,
+      providerMessage: "Error: provider runtime rejected request",
+    });
+  } finally {
+    clean();
+  }
+});
+
 test("runWorkerTurnFromFile persists typed AgentProviderFailureError details", async () => {
   const { stateDir, clean } = setupFixture();
   try {

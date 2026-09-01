@@ -80,14 +80,14 @@ export class LocalAgentRuntimePool {
     if (this.closing) return Result.err(poolClosedError(driver, context));
 
     let acquired = await this.acquire(driver, context);
-    if (acquired.isErr()) return acquired;
+    if (acquired.isErr()) return Result.err(acquired.error);
     let entry = acquired.value;
     let runtime = entry.runtime;
     if (!runtime) throw new Error("Local agent runtime was created without a runtime.");
     if (!runtime.isAlive()) {
       await this.discardRuntime(entry, driver.provider, "runtime_not_alive");
       acquired = await this.acquire(driver, context);
-      if (acquired.isErr()) return acquired;
+      if (acquired.isErr()) return Result.err(acquired.error);
       entry = acquired.value;
       runtime = entry.runtime;
       if (!runtime || !runtime.isAlive()) {
@@ -270,7 +270,7 @@ export class LocalAgentRuntimePool {
             });
           }
           const created = await existing.createPromise;
-          if (created.isErr()) return created;
+          if (created.isErr()) return Result.err(created.error);
           if (
             !this.closing &&
             !existing.closing &&
@@ -323,7 +323,7 @@ export class LocalAgentRuntimePool {
       };
       this.entries.set(key, entry);
       const created = await createPromise;
-      if (created.isErr()) return created;
+      if (created.isErr()) return Result.err(created.error);
       if (this.closing || entry.closing || this.entries.get(key) !== entry) {
         await this.closeEntry(entry, "pool_shutdown_during_creation");
         return Result.err(poolClosedError(driver, context));

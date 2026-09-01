@@ -13,6 +13,7 @@
   },
   "files": [
     "dist",
+    "generated",
     "docs",
     "examples",
     "scripts",

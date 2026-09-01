@@ -2,10 +2,11 @@ import { resolve } from "node:path";
 import { Result, type Result as BetterResult } from "better-result";
 import {
   AgentConflictError,
-  AgentProviderFailureError,
+  describeAgentProviderError,
   AgentScopeError,
   AgentStoreError,
   AgentTargetError,
+  isAgentProviderError,
   isLocalAgentError,
   isProgrammerDefect,
   type LocalAgentError,
@@ -183,11 +184,11 @@ export class LocalAgentManager {
     scope: LocalAgentWorkspaceScope,
   ): BetterResult<LocalAgentRecord, AgentLookupError> {
     const lookup = this.store.getByIdResult(agentId);
-    if (lookup.isErr()) return lookup;
+    if (lookup.isErr()) return Result.err(lookup.error);
     const record = lookup.value;
     if (!record) return Result.err(agentNotFound(agentId));
     const scoped = this.agentWorkspaceResult(record, scope, "get");
-    if (scoped.isErr()) return scoped;
+    if (scoped.isErr()) return Result.err(scoped.error);
     return Result.ok(record);
   }
 
@@ -383,16 +384,8 @@ export class LocalAgentManager {
     error: LocalAgentError,
     startedAt: number,
   ): void {
-    const failureDetails = error instanceof AgentProviderFailureError
-      ? {
-          code: error.code,
-          errorClass: error.errorClass,
-          retryable: error.retryable,
-          ...(error.model ? { model: error.model } : {}),
-          ...(error.variant ? { variant: error.variant } : {}),
-          ...(error.providerSessionId ? { providerSessionId: error.providerSessionId } : {}),
-          ...(error.providerMessage ? { providerMessage: error.providerMessage } : {}),
-        }
+    const failureDetails = isAgentProviderError(error)
+      ? describeAgentProviderError(error)
       : undefined;
     const persisted = this.store.updateResult(record.id, {
       status: "error",
@@ -555,7 +548,7 @@ export class LocalAgentManager {
     operation: string,
   ): BetterResult<void, AgentScopeError> {
     const workspaceRoot = this.authorizeWorkspace(scope.workspaceRoot, scope.workspaceId, operation);
-    if (workspaceRoot.isErr()) return workspaceRoot;
+    if (workspaceRoot.isErr()) return Result.err(workspaceRoot.error);
     const idMismatch = scope.workspaceId !== undefined && record.workspaceId !== scope.workspaceId;
     if (workspaceRoot.value !== record.workspaceRoot || idMismatch) {
       return Result.err(new AgentScopeError({
