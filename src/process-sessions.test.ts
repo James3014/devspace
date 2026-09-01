@@ -650,9 +650,9 @@ try {
   const retainedOutput = await g2Manager.start({
     workspaceId: "ws_g2",
     cwd: process.cwd(),
-    command: 'printf "initial\\n"; sleep 0.3; printf "later\\n"; sleep 0.3',
+    command: `${node} -e "console.log('initial'); setTimeout(() => console.log('later'), 150); setTimeout(() => process.exit(0), 250);"`,
     tty: true,
-    yieldTimeMs: 150,
+    yieldTimeMs: 250,
   });
   assert.equal(retainedOutput.running, true);
   assert.match(retainedOutput.output, /initial/);
@@ -660,7 +660,7 @@ try {
     workspaceId: "ws_g2",
     sessionId: retainedOutput.sessionId!,
     chars: "",
-    yieldTimeMs: 800,
+    yieldTimeMs: 500,
   });
   assert.equal(polledOutput.running, false);
   assert.match(polledOutput.output, /later/);

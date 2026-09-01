@@ -479,3 +479,44 @@ await grokConfigurationRuntime.close();
 await resumedRuntime.close();
 await resumedRuntime.close();
 assert.equal(resumedRuntime.isAlive(), false);
+
+// Regression tests for Grok & Cline canonical resolver parity
+{
+  const tempHome = await mkdtemp(join(tmpdir(), "devspace-acp-resolver-test-"));
+  try {
+    const grokBinDir = join(tempHome, ".grok", "bin");
+    await mkdir(grokBinDir, { recursive: true });
+    const grokBin = join(grokBinDir, "grok");
+    await writeFile(grokBin, "#!/bin/sh\nexit 0\n");
+    await chmod(grokBin, 0o755);
+
+    const clineBinDir = join(tempHome, ".npm-global", "lib", "node_modules", "cline", "bin");
+    await mkdir(clineBinDir, { recursive: true });
+    const clineBin = join(clineBinDir, ".cline");
+    await writeFile(clineBin, "#!/bin/sh\nexit 0\n");
+    await chmod(clineBin, 0o755);
+
+    const testEnv: NodeJS.ProcessEnv = {
+      HOME: tempHome,
+      PATH: "/usr/bin:/bin", // explicitly does NOT contain grok or cline in PATH
+    };
+
+    // Grok resolution parity: ~/.grok/bin/grok is resolved through resolveAcpCommand
+    assert.equal(resolveAcpCommand("grok", testEnv), grokBin);
+    // Explicit GROK_COMMAND has highest priority
+    const explicitGrok = join(tempHome, "custom-grok");
+    await writeFile(explicitGrok, "#!/bin/sh\nexit 0\n");
+    await chmod(explicitGrok, 0o755);
+    assert.equal(resolveAcpCommand("grok", { ...testEnv, GROK_COMMAND: explicitGrok }), explicitGrok);
+
+    // Cline resolution parity: ~/.npm-global/.../.cline is resolved through resolveAcpCommand
+    assert.equal(resolveAcpCommand("cline", testEnv), clineBin);
+    // Explicit CLINE_COMMAND has highest priority
+    const explicitCline = join(tempHome, "custom-cline");
+    await writeFile(explicitCline, "#!/bin/sh\nexit 0\n");
+    await chmod(explicitCline, 0o755);
+    assert.equal(resolveAcpCommand("cline", { ...testEnv, CLINE_COMMAND: explicitCline }), explicitCline);
+  } finally {
+    await rm(tempHome, { recursive: true, force: true });
+  }
+}

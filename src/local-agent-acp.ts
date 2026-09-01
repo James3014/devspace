@@ -20,6 +20,10 @@ import {
   resolveGrokEffort,
   resolveGrokModelId,
 } from "./local-agent-grok.js";
+import {
+  resolveGrokExecutable,
+  resolveClineExecutable,
+} from "./local-agent-availability.js";
 import type {
   LocalAgentDriver,
   LocalAgentRunCallbacks,
@@ -633,13 +637,15 @@ export function resolveAcpCommand(
   provider: AcpProvider,
   env: NodeJS.ProcessEnv = process.env,
 ): string | undefined {
+  if (provider === "grok") {
+    return resolveGrokExecutable(env);
+  }
+  if (provider === "cline") {
+    return resolveClineExecutable(env);
+  }
   const configured = provider === "cursor"
     ? env.CURSOR_COMMAND
-    : provider === "copilot"
-      ? env.COPILOT_COMMAND
-      : provider === "cline"
-        ? env.CLINE_COMMAND
-        : env.GROK_COMMAND;
+    : env.COPILOT_COMMAND;
   const command = configured ?? ACP_COMMANDS[provider][0];
   if (command.includes("/") || command.includes("\\")) return executableExists(command) ? command : undefined;
   const path = env.PATH;
@@ -653,14 +659,6 @@ export function resolveAcpCommand(
       const candidate = resolve(directory, `${command}${extension}`);
       if (executableExists(candidate)) return candidate;
     }
-  }
-  // Cline known fallback executable path (npm global install location).
-  if (provider === "cline") {
-    const clineKnownPath = resolve(
-      env.HOME ?? process.env.HOME ?? "~",
-      ".npm-global/lib/node_modules/cline/bin/.cline",
-    );
-    if (executableExists(clineKnownPath)) return clineKnownPath;
   }
   return undefined;
 }

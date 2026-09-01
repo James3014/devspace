@@ -168,6 +168,9 @@ export interface FinishTurnCasInput {
   providerSessionId?: string;
   latestResponse?: string;
   error?: string;
+  errorCode?: string;
+  errorRetryable?: boolean;
+  errorDetails?: AgentProviderFailureDetails | string;
   terminalReason?: AgentTerminalReason;
   scopeState?: ScopeState;
   cumulativeChangedPaths?: string[];
@@ -827,10 +830,19 @@ export class LocalAgentStore {
         cumulativeChangedPaths: input.cumulativeChangedPaths ?? lifecycle.cumulativeChangedPaths,
         turnEndBaseline: input.turnEndBaseline ?? lifecycle.turnEndBaseline,
       };
+      const errorCode = input.status === "idle" ? null : input.errorCode ?? null;
+      const errorRetryable = input.status === "idle" ? null : input.errorRetryable === undefined ? null : String(input.errorRetryable);
+      const errorDetails = input.status === "idle"
+        ? null
+        : typeof input.errorDetails === "string"
+          ? input.errorDetails
+          : input.errorDetails ? JSON.stringify(input.errorDetails) : null;
+
       const now = new Date().toISOString();
       const result = this.database.sqlite.prepare(
         `update local_agent_sessions set provider_session_id = coalesce(?, provider_session_id),
-          status = ?, latest_response = ?, error = ?, terminal_reason = ?, scope_state = ?,
+          status = ?, latest_response = ?, error = ?, error_code = ?, error_retryable = ?, error_details = ?,
+          terminal_reason = ?, scope_state = ?,
           worker_pid = null, worker_token = null, lifecycle_state = ?, updated_at = ?
          where id = ? and status = 'running' and worker_token = ? and updated_at = ?`,
       ).run(
@@ -838,6 +850,9 @@ export class LocalAgentStore {
         input.status,
         input.latestResponse ?? null,
         input.error ?? null,
+        errorCode,
+        errorRetryable,
+        errorDetails,
         input.terminalReason ?? null,
         input.scopeState ?? null,
         JSON.stringify(lifecycleState),

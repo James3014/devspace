@@ -38,7 +38,11 @@ import {
   type ScratchHandle,
 } from "./provider-scratch.js";
 import type { ProfileCatalog } from "./local-agent-profile-source.js";
-import type { AgentProviderFailureDetails } from "./local-agent-errors.js";
+import {
+  AgentProviderFailureError,
+  isAgentProviderError,
+  type AgentProviderFailureDetails,
+} from "./local-agent-errors.js";
 import { validateOpencodeModelAndVariant } from "./local-agent-opencode-catalog.js";
 import { canonicalizePath, isPathInsideRoot } from "./roots.js";
 import {
@@ -1513,17 +1517,49 @@ export class LocalAgentSessionManager {
       const endState = await inspectWorkspacePhysicalState(
         this.store.getById(agentId)?.workspaceRoot ?? claimed.workspaceRoot,
       ).catch(() => undefined);
+
+      let providerSessionId: string | undefined;
+      let latestResponse: string | undefined;
+      let errorCode: string | undefined;
+      let errorRetryable: boolean | undefined;
+      let errorDetails: AgentProviderFailureDetails | string | undefined;
+
+      if (AgentProviderFailureError.is(error)) {
+        errorCode = error.code;
+        errorRetryable = error.retryable;
+        errorDetails = {
+          code: error.code,
+          errorClass: error.errorClass,
+          retryable: error.retryable,
+          model: error.model,
+          variant: error.variant,
+          providerSessionId: error.providerSessionId,
+          providerMessage: error.providerMessage ?? error.message,
+        };
+        providerSessionId = error.providerSessionId;
+        latestResponse = error.providerMessage;
+      } else if (isAgentProviderError(error)) {
+        errorCode = error.code;
+        errorRetryable = error.retryable;
+      } else if (error instanceof LocalAgentProviderError) {
+        providerSessionId = error.providerSessionId;
+        latestResponse = error.finalResponse;
+      }
+
       this.store.failTurnCAS({
         agentId,
         generation,
         workerToken,
-        providerSessionId: error instanceof LocalAgentProviderError ? error.providerSessionId : undefined,
-        latestResponse: error instanceof LocalAgentProviderError ? error.finalResponse : undefined,
+        providerSessionId,
+        latestResponse,
         error: message,
+        errorCode,
+        errorRetryable,
+        errorDetails,
         terminalReason:
           error instanceof WorkspaceContainmentError
             ? "launch_failed"
-            : error instanceof LocalAgentProviderError
+            : isAgentProviderError(error) || error instanceof LocalAgentProviderError
               ? "provider_error"
               : classifyProviderError(message),
         scopeState: scope.scopeState,

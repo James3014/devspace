@@ -180,9 +180,10 @@ export function resolveGrokExecutable(env: NodeJS.ProcessEnv = process.env): str
   }
   const resolvedPath = resolveCommand("grok", env);
   if (resolvedPath) return resolvedPath;
+  const home = env.HOME ?? homedir();
   for (const fallback of [
-    join(homedir(), ".grok", "bin", "grok"),
-    join(homedir(), ".local", "bin", "grok"),
+    join(home, ".grok", "bin", "grok"),
+    join(home, ".local", "bin", "grok"),
   ]) {
     if (executableExists(fallback)) return fallback;
   }
@@ -208,9 +209,10 @@ export function resolveClineExecutable(env: NodeJS.ProcessEnv = process.env): st
   }
   const resolvedPath = resolveCommand("cline", env);
   if (resolvedPath) return resolvedPath;
+  const home = env.HOME ?? homedir();
   for (const fallback of [
-    join(homedir(), ".npm-global", "lib", "node_modules", "cline", "bin", ".cline"),
-    join(homedir(), ".cline", "bin", "cline"),
+    join(home, ".npm-global", "lib", "node_modules", "cline", "bin", ".cline"),
+    join(home, ".cline", "bin", "cline"),
   ]) {
     if (executableExists(fallback)) return fallback;
   }

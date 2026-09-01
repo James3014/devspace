@@ -646,3 +646,75 @@ test("LocalAgentSessionManager - Cross-conversation recovery regression", async 
     clean();
   }
 });
+
+test("runWorkerTurnFromFile persists typed AgentProviderFailureError details", async () => {
+  const { stateDir, clean } = setupFixture();
+  try {
+    const { AgentProviderFailureError } = await import("./local-agent-errors.js");
+    const { writeFileSync } = await import("node:fs");
+    const { join } = await import("node:path");
+
+    const config = {
+      stateDir,
+      subagents: true,
+      oauth: { scopes: ["devspace"] },
+    } as any;
+
+    const projectRoot = join(stateDir, "project");
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(projectRoot, { recursive: true });
+
+    const manager = new LocalAgentSessionManager(
+      config,
+      undefined,
+      undefined,
+      async () => {
+        throw new AgentProviderFailureError({
+          code: "CLINEPASS_ENTITLEMENT_REQUIRED",
+          provider: "cline",
+          errorClass: "ENTITLEMENT_REQUIRED",
+          operation: "run",
+          message: "No access to ClinePass subscription models",
+          retryable: false,
+          model: "cline-pass/glm-5.3-flash",
+          variant: "high",
+          providerSessionId: "sess-cline-live-1",
+          providerMessage: "ClinePass entitlement required",
+        });
+      },
+    );
+
+    const store = (manager as any).store;
+    const record = store.create({
+      workspaceId: "ws_typed_err",
+      workspaceRoot: projectRoot,
+      profileName: "cline-test",
+      provider: "cline",
+      lifecycleKind: "detached_worker_v2",
+    });
+    const token = "worker-token-test";
+    store.prepareWorker(record.id, token);
+
+    const promptFile = join(config.stateDir, `prompt-${record.id}.json`);
+    writeFileSync(promptFile, JSON.stringify({ prompt: "test prompt" }));
+
+    await manager.runWorkerTurnFromFile(record.id, promptFile, token);
+
+    const updated = store.getById(record.id)!;
+    assert.equal(updated.status, "error");
+    assert.equal(updated.errorCode, "CLINEPASS_ENTITLEMENT_REQUIRED");
+    assert.equal(updated.errorRetryable, false);
+    assert.equal(updated.terminalReason, "provider_error");
+    assert.deepEqual(updated.errorDetails, {
+      code: "CLINEPASS_ENTITLEMENT_REQUIRED",
+      errorClass: "ENTITLEMENT_REQUIRED",
+      retryable: false,
+      model: "cline-pass/glm-5.3-flash",
+      variant: "high",
+      providerSessionId: "sess-cline-live-1",
+      providerMessage: "ClinePass entitlement required",
+    });
+  } finally {
+    clean();
+  }
+});
