@@ -182,6 +182,8 @@ export interface AgentStatusOutput {
   terminal: boolean;
   latestResponse?: string;
   error?: string;
+  errorCode?: string;
+  errorRetryable?: boolean;
   errorDetails?: AgentProviderFailureDetails;
   createdAt: string;
   updatedAt: string;
@@ -2051,6 +2053,8 @@ function recordToStatusOutput(
   if (record.providerSessionId !== undefined) output.providerSessionId = record.providerSessionId;
   if (record.latestResponse !== undefined) output.latestResponse = record.latestResponse;
   if (record.error !== undefined) output.error = record.error;
+  if (record.errorCode !== undefined) output.errorCode = record.errorCode;
+  if (record.errorRetryable !== undefined) output.errorRetryable = record.errorRetryable;
   if (record.errorDetails !== undefined) output.errorDetails = record.errorDetails;
   const pending = record.lifecycleState?.terminationPending;
   const corrupt = isDetachedLifecycle(record.lifecycleState) && record.lifecycleState?.lifecycleCorrupt;
