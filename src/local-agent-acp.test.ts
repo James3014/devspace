@@ -483,6 +483,7 @@ assert.equal(resumedRuntime.isAlive(), false);
 // Cline entitlement emitted on stderr must survive the ACP runtime boundary.
 {
   const clineQueues = new Map<string, { values: unknown[] }>();
+  let clineSetConfigCalls = 0;
   const clineConnection = {
     agent: {
       async request(method: string, params?: unknown): Promise<unknown> {
@@ -508,7 +509,10 @@ assert.equal(resumedRuntime.isAlive(), false);
             ],
           };
         }
-        if (method === "session/set_config_option") return {};
+        if (method === "session/set_config_option") {
+          clineSetConfigCalls += 1;
+          return {};
+        }
         if (method === "session/prompt") return { stopReason: "error" };
         const sessionId = input?.sessionId;
         if (sessionId && !clineQueues.has(sessionId)) clineQueues.set(sessionId, { values: [] });
@@ -540,7 +544,27 @@ assert.equal(resumedRuntime.isAlive(), false);
     assert.equal(clineEntitlement.error.errorClass, "ENTITLEMENT_REQUIRED");
     assert.equal(clineEntitlement.error.providerSessionId, "cline_entitlement_session");
   }
+  assert.equal(clineSetConfigCalls, 0, "Cline exact CLI model/effort must not be re-applied through ACP config options");
   await clineRuntime.close();
+
+  const clineDriver = new AcpLocalAgentDriver("cline", {}, () => "cline");
+  const clineKeyHigh = clineDriver.runtimeKey({
+    agentId: "cline-high",
+    provider: "cline",
+    workspaceRoot: "/tmp/project",
+    model: "cline-pass/glm-5.3-flash",
+    effort: "high",
+    writeMode: "read_only",
+  });
+  const clineKeyMedium = clineDriver.runtimeKey({
+    agentId: "cline-medium",
+    provider: "cline",
+    workspaceRoot: "/tmp/project",
+    model: "cline-pass/glm-5.3-flash",
+    effort: "medium",
+    writeMode: "read_only",
+  });
+  assert.notEqual(clineKeyHigh, clineKeyMedium, "Cline process runtime keys must bind process-level model/effort");
 }
 
 // Regression tests for Grok & Cline canonical resolver parity

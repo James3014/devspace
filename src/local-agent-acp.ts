@@ -350,6 +350,14 @@ export class AcpRuntime implements LocalAgentRuntime {
       await this.configureGrokSession(sessionId, input, metadata, isNewSession);
       return;
     }
+    // Cline's exact model and thinking level are process-level CLI settings
+    // (--model/--thinking). Its ACP `model` config is a provider-family selector
+    // (e.g. cline-pass), not the exact model id. Re-applying the exact CLI model
+    // through session/set_config_option rejects valid values such as
+    // cline-pass/glm-5.3-flash. Runtime identity is model/effort-bound below, so
+    // Cline sessions must keep the process-level selection instead.
+    if (this.provider === "cline") return;
+
     const canConfigure = isNewSession || hasAcpConfigOptions(metadata);
     if (!canConfigure) {
       const requested = [
@@ -465,7 +473,10 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
   runtimeKey(context: LocalAgentRuntimeContext): string {
     const command = this.resolveCommand() ?? ACP_COMMANDS[this.provider][0];
     const writeMode = context.writeMode ?? "allowed";
-    return `acp:${this.provider}:${command}:${writeMode}:${resolve(context.workspaceRoot)}`;
+    const processConfig = this.provider === "cline"
+      ? `:${context.model ?? "default"}:${context.effort ?? "default"}`
+      : "";
+    return `acp:${this.provider}:${command}:${writeMode}${processConfig}:${resolve(context.workspaceRoot)}`;
   }
 
   async createRuntime(context: LocalAgentRuntimeContext) {
