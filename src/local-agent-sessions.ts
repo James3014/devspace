@@ -49,6 +49,10 @@ import { canonicalizePath, isPathInsideRoot } from "./roots.js";
 import {
   assertSameExecutionGeneration,
   buildExecutionGenerationBinding,
+  hashDispatchIntent,
+  renderDispatchIntentForWorker,
+  validateDispatchIntent,
+  type DispatchIntent,
   type ExecutionGenerationBinding,
   ExecutionProtocolError,
 } from "./execution-protocol.js";
@@ -88,6 +92,7 @@ export type AgentErrorCode =
   | "NO_EXECUTION_CAPACITY"
   | "TOOLCHAIN_UNAVAILABLE"
   | "INVALID_EXECUTION_CONTRACT"
+  | "OVERLAPPING_MUTATION_OWNERSHIP"
   | "INVALID_ATTEMPT_KEY"
   | "ATTEMPT_REPLAY_CONFLICT"
   | "CONTINUATION_ADMISSION_FAILED"
@@ -181,6 +186,16 @@ export const AGENT_LIST_DEFAULT_LIMIT = 20;
 export const AGENT_LIST_MAX_LIMIT = 100;
 const TERMINATION_RETRY_BACKOFF_MS = 30_000;
 
+export interface DispatchContractOutput {
+  taskId: string;
+  attemptId: string;
+  roleIntent: string;
+  claimCeiling: string;
+  verificationRequired: boolean;
+  exclusiveOwnership: boolean;
+  intentHash: string;
+}
+
 export interface AgentStatusOutput {
   agentId: string;
   workspaceId?: string;
@@ -207,6 +222,7 @@ export interface AgentStatusOutput {
   changedPaths?: string[];
   terminalReason?: AgentTerminalReason;
   scopeState?: ScopeState;
+  dispatch?: DispatchContractOutput;
   termination?: {
     pending: boolean;
     generation?: string;
@@ -227,6 +243,7 @@ export interface ReconcileAgentInput {
 
 export interface ReconcileAgentOutput {
   agentId: string;
+  dispatch?: DispatchContractOutput;
   agentState: LocalAgentStatus;
   providerState?: string;
   providerSessionId?: string;
@@ -338,6 +355,7 @@ function computeSessionTiming(record: LocalAgentRecord, now = Date.now()): { wal
 
 export interface StartAgentOutput {
   agentId: string;
+  dispatch?: DispatchContractOutput;
   status: LocalAgentStatus;
   profileName: string;
   provider: string;
@@ -449,6 +467,8 @@ export class LocalAgentSessionManager {
   async startAgent(input: StartAgentInput): Promise<StartAgentOutput> {
     const { workspaceId, workspaceRoot, profileName, prompt, profiles, executionContract, attemptKey } = input;
 
+    assertDispatchContractCoherence(executionContract);
+
     const profile = profiles.find((p) => p.name === profileName);
     if (!profile) {
       const blocker = input.profileCatalog?.blockerFor(profileName);
@@ -470,6 +490,19 @@ export class LocalAgentSessionManager {
           prompt,
           executionContract,
         });
+    if (executionContract?.dispatchIntent && !attemptKey) {
+      throw new AgentSessionError(
+        "INVALID_ATTEMPT_KEY",
+        "Controller-authored dispatchIntent requires attemptKey so duplicate/uncertain dispatch can be reconciled to one durable attempt.",
+      );
+    }
+    if (executionContract?.dispatchIntent && attemptKey !== executionContract.dispatchIntent.attemptId) {
+      throw new AgentSessionError(
+        "INVALID_ATTEMPT_KEY",
+        `dispatchIntent.attemptId '${executionContract.dispatchIntent.attemptId}' must exactly match durable attemptKey '${attemptKey}'.`,
+      );
+    }
+
     if (replayBinding) {
       try {
         const replay = this.store.resolveStartReplay(workspaceRoot, replayBinding);
@@ -484,6 +517,8 @@ export class LocalAgentSessionManager {
         throw error;
       }
     }
+
+    this.assertDispatchOwnershipAvailable(workspaceRoot, executionContract);
 
     if (!this.hasExecutionCapacity()) {
       throw new AgentSessionError(
@@ -605,7 +640,7 @@ export class LocalAgentSessionManager {
       throw error;
     }
 
-    if (created) await this.launchPrompt(record.id, prompt);
+    if (created) await this.launchPrompt(record.id, bindDispatchIntentToPrompt(record.executionContract?.dispatchIntent, prompt));
     return recordToStartOutput(this.store.getById(record.id) ?? record);
   }
 
@@ -793,7 +828,7 @@ export class LocalAgentSessionManager {
       );
     }
 
-    await this.launchPrompt(record.id, prompt);
+    await this.launchPrompt(record.id, bindDispatchIntentToPrompt(record.executionContract?.dispatchIntent, prompt));
     const updated = this.store.getById(record.id) ?? record;
     return { ...recordToStartOutput(updated), continued: true as const };
   }
@@ -1108,6 +1143,7 @@ export class LocalAgentSessionManager {
 
     return {
       agentId: record.id,
+      dispatch: dispatchContractOutput(record.executionContract?.dispatchIntent),
       agentState: record.status,
       providerState: record.status,
       providerSessionId: record.providerSessionId,
@@ -1269,6 +1305,34 @@ export class LocalAgentSessionManager {
     const max = this.config.agentMaxConcurrent;
     if (max === undefined || max === null || max <= 0) return true;
     return this.runningCount() < max;
+  }
+
+  private assertDispatchOwnershipAvailable(workspaceRoot: string, contract: ExecutionContract | undefined): void {
+    const intent = contract?.dispatchIntent;
+    const writeScope = contract?.writePaths ?? [];
+    if (!intent?.exclusiveOwnership || writeScope.length === 0) return;
+
+    const canonicalRoot = canonicalizePath(workspaceRoot);
+    for (const record of this.store.list()) {
+      if (!occupiesDetachedExecutionSlot(record)) continue;
+      if (canonicalizePath(record.workspaceRoot) !== canonicalRoot) continue;
+
+      const activeWriteScope = record.executionContract?.writePaths;
+      const activeIntent = record.executionContract?.dispatchIntent;
+      if (!activeWriteScope?.length) {
+        if (activeIntent && (activeIntent.writeScope?.length ?? 0) === 0) continue;
+        throw new AgentSessionError(
+          "OVERLAPPING_MUTATION_OWNERSHIP",
+          `Active agent ${record.id} in the same workspace has no provable write ownership; serialize or use an isolated workspace before dispatching ${intent.taskId}/${intent.attemptId}.`,
+        );
+      }
+      if (writeScopesOverlap(writeScope, activeWriteScope)) {
+        throw new AgentSessionError(
+          "OVERLAPPING_MUTATION_OWNERSHIP",
+          `Dispatch ${intent.taskId}/${intent.attemptId} overlaps active agent ${record.id} write ownership; serialize or use isolated worktrees/workspaces.`,
+        );
+      }
+    }
   }
 
   private resolveExecutionGeneration(
@@ -2111,6 +2175,55 @@ function providerEnvironment(
     : environment;
 }
 
+function assertDispatchContractCoherence(contract: ExecutionContract | undefined): void {
+  const intent = contract?.dispatchIntent;
+  if (!intent) return;
+  try {
+    validateDispatchIntent(intent);
+  } catch (error) {
+    throw new AgentSessionError(
+      "INVALID_EXECUTION_CONTRACT",
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+  const intentWriteScope = [...(intent.writeScope ?? [])].sort();
+  const executionWriteScope = [...(contract?.writePaths ?? [])].sort();
+  if (intentWriteScope.join("\n") !== executionWriteScope.join("\n")) {
+    throw new AgentSessionError(
+      "INVALID_EXECUTION_CONTRACT",
+      "executionContract.dispatchIntent.writeScope must exactly match executionContract.writePaths; DevSpace does not maintain two write-scope authorities.",
+    );
+  }
+}
+
+function bindDispatchIntentToPrompt(intent: DispatchIntent | undefined, prompt: string): string {
+  if (!intent) return prompt;
+  return `${renderDispatchIntentForWorker(intent)}\n\nCONTROLLER TASK\n${prompt}`;
+}
+
+function dispatchContractOutput(intent: DispatchIntent | undefined): DispatchContractOutput | undefined {
+  if (!intent) return undefined;
+  return {
+    taskId: intent.taskId,
+    attemptId: intent.attemptId,
+    roleIntent: intent.roleIntent,
+    claimCeiling: intent.claimCeiling,
+    verificationRequired: intent.verificationRequired,
+    exclusiveOwnership: intent.exclusiveOwnership,
+    intentHash: hashDispatchIntent(intent),
+  };
+}
+
+function writeScopesOverlap(left: string[], right: string[]): boolean {
+  return left.some((leftPath) => right.some((rightPath) => workspacePathsOverlap(leftPath, rightPath)));
+}
+
+function workspacePathsOverlap(left: string, right: string): boolean {
+  const a = left.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "");
+  const b = right.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "");
+  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+}
+
 function recordToStartOutput(record: LocalAgentRecord): StartAgentOutput {
   const output: StartAgentOutput = {
     agentId: record.id,
@@ -2124,6 +2237,8 @@ function recordToStartOutput(record: LocalAgentRecord): StartAgentOutput {
   if (record.model !== undefined) output.model = record.model;
   if (record.effort !== undefined) output.effort = record.effort;
   if (record.workspaceId !== undefined) output.workspaceId = record.workspaceId;
+  const dispatch = dispatchContractOutput(record.executionContract?.dispatchIntent);
+  if (dispatch) output.dispatch = dispatch;
   return output;
 }
 
@@ -2144,6 +2259,8 @@ function recordToStatusOutput(
   if (record.model !== undefined) output.model = record.model;
   if (record.effort !== undefined) output.effort = record.effort;
   if (record.workspaceId !== undefined) output.workspaceId = record.workspaceId;
+  const dispatch = dispatchContractOutput(record.executionContract?.dispatchIntent);
+  if (dispatch) output.dispatch = dispatch;
   if (record.providerSessionId !== undefined) output.providerSessionId = record.providerSessionId;
   if (record.latestResponse !== undefined) output.latestResponse = record.latestResponse;
   if (record.error !== undefined) output.error = record.error;

@@ -13,6 +13,43 @@ export type ExecutionAuthorityMode = "OWNER_DIRECT" | "NEXUS_GOVERNED";
 export type CapabilityAccessMode = "native" | "mcp" | "none";
 export type ExecutionEffectCeiling = "READ_ONLY" | "WORKSPACE_MUTATION" | "CANDIDATE";
 
+export type DispatchRoleIntent =
+  | "EVIDENCE_COLLECTOR"
+  | "MECHANICAL_EXECUTOR"
+  | "DEEP_ENGINEERING"
+  | "TEST_VERIFIER"
+  | "INDEPENDENT_REVIEWER"
+  | "RECOVERY_RECONCILER";
+
+/**
+ * Maximum claim a delegated worker/result is allowed to make. Verification,
+ * acceptance, merge, deployment, and release remain controller/governance
+ * decisions and are intentionally not representable here.
+ */
+export type DispatchClaimCeiling = "RESULT_RETURNED" | "IMPLEMENTED" | "CANDIDATE_READY";
+
+/**
+ * Controller-authored semantic contract for one bounded delegated attempt.
+ * This is transported/persisted by DevSpace but does not grant routing,
+ * admission, verification, acceptance, merge, release, or controller authority.
+ */
+export interface DispatchIntent {
+  taskId: string;
+  attemptId: string;
+  objective: string;
+  roleIntent: DispatchRoleIntent;
+  context?: string[];
+  readScope?: string[];
+  writeScope?: string[];
+  exclusiveOwnership: boolean;
+  forbiddenChanges?: string[];
+  acceptanceCriteria: string[];
+  verificationRequired: boolean;
+  expectedArtifacts?: string[];
+  expectedEvidence?: string[];
+  claimCeiling: DispatchClaimCeiling;
+}
+
 export interface ExecutionAuthorityRef {
   mode: ExecutionAuthorityMode;
   /** Logical issuer only. This is not proof that the issuer authorized the request. */
@@ -121,6 +158,7 @@ export class ExecutionProtocolError extends Error {
   constructor(
     readonly code:
       | "INVALID_EXECUTION_BINDING"
+      | "INVALID_DISPATCH_INTENT"
       | "NEXUS_AUTHORITY_NOT_VALIDATED"
       | "AUTHORITY_EVIDENCE_MISMATCH"
       | "EXECUTION_GENERATION_MISMATCH"
@@ -130,6 +168,99 @@ export class ExecutionProtocolError extends Error {
     super(message);
     this.name = "ExecutionProtocolError";
   }
+}
+
+export function parseDispatchIntent(value: unknown): DispatchIntent {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ExecutionProtocolError("INVALID_DISPATCH_INTENT", "dispatchIntent must be an object.");
+  }
+  const record = value as Record<string, unknown>;
+  const intent: DispatchIntent = {
+    taskId: record.taskId as string,
+    attemptId: record.attemptId as string,
+    objective: record.objective as string,
+    roleIntent: record.roleIntent as DispatchRoleIntent,
+    exclusiveOwnership: record.exclusiveOwnership as boolean,
+    acceptanceCriteria: stringArrayOrUndefined(record.acceptanceCriteria) ?? [],
+    verificationRequired: record.verificationRequired as boolean,
+    claimCeiling: record.claimCeiling as DispatchClaimCeiling,
+  };
+  const optionalArrays: Array<[keyof DispatchIntent, unknown]> = [
+    ["context", record.context],
+    ["readScope", record.readScope],
+    ["writeScope", record.writeScope],
+    ["forbiddenChanges", record.forbiddenChanges],
+    ["expectedArtifacts", record.expectedArtifacts],
+    ["expectedEvidence", record.expectedEvidence],
+  ];
+  for (const [key, raw] of optionalArrays) {
+    const parsed = stringArrayOrUndefined(raw);
+    if (parsed !== undefined) (intent as unknown as Record<string, unknown>)[key] = parsed;
+  }
+  validateDispatchIntent(intent);
+  return intent;
+}
+
+export function hashDispatchIntent(intent: DispatchIntent): string {
+  validateDispatchIntent(intent);
+  return sha256(canonicalJson(intent));
+}
+
+export function validateDispatchIntent(intent: DispatchIntent): void {
+  requireDispatchText(intent.taskId, "taskId");
+  requireDispatchText(intent.attemptId, "attemptId");
+  requireDispatchText(intent.objective, "objective");
+  if (![
+    "EVIDENCE_COLLECTOR",
+    "MECHANICAL_EXECUTOR",
+    "DEEP_ENGINEERING",
+    "TEST_VERIFIER",
+    "INDEPENDENT_REVIEWER",
+    "RECOVERY_RECONCILER",
+  ].includes(intent.roleIntent)) {
+    throw new ExecutionProtocolError("INVALID_DISPATCH_INTENT", `Unsupported roleIntent: ${intent.roleIntent}`);
+  }
+  if (!["RESULT_RETURNED", "IMPLEMENTED", "CANDIDATE_READY"].includes(intent.claimCeiling)) {
+    throw new ExecutionProtocolError("INVALID_DISPATCH_INTENT", `Unsupported claimCeiling: ${intent.claimCeiling}`);
+  }
+  if (!Array.isArray(intent.acceptanceCriteria) || intent.acceptanceCriteria.length === 0) {
+    throw new ExecutionProtocolError("INVALID_DISPATCH_INTENT", "acceptanceCriteria must contain at least one independently checkable criterion.");
+  }
+  for (const [index, criterion] of intent.acceptanceCriteria.entries()) {
+    requireDispatchText(criterion, `acceptanceCriteria[${index}]`);
+  }
+  if (typeof intent.verificationRequired !== "boolean" || typeof intent.exclusiveOwnership !== "boolean") {
+    throw new ExecutionProtocolError("INVALID_DISPATCH_INTENT", "verificationRequired and exclusiveOwnership must be boolean values.");
+  }
+  validateDispatchStringArray(intent.context, "context");
+  validateDispatchScope(intent.readScope, "readScope", true);
+  validateDispatchScope(intent.writeScope, "writeScope", false);
+  validateDispatchStringArray(intent.forbiddenChanges, "forbiddenChanges");
+  validateDispatchStringArray(intent.expectedArtifacts, "expectedArtifacts");
+  validateDispatchStringArray(intent.expectedEvidence, "expectedEvidence");
+
+  const mutating = Boolean(intent.writeScope?.length);
+  if (mutating && !intent.exclusiveOwnership) {
+    throw new ExecutionProtocolError(
+      "INVALID_DISPATCH_INTENT",
+      "Mutating dispatch intent requires exclusiveOwnership=true; controllers must serialize or isolate overlapping mutation.",
+    );
+  }
+  if (!mutating && intent.exclusiveOwnership) {
+    throw new ExecutionProtocolError(
+      "INVALID_DISPATCH_INTENT",
+      "Read-only dispatch intent must not claim exclusive mutation ownership.",
+    );
+  }
+}
+
+export function renderDispatchIntentForWorker(intent: DispatchIntent): string {
+  validateDispatchIntent(intent);
+  return [
+    "DEVSPACE DISPATCH CONTRACT — controller-authored, bounded execution only.",
+    "Do not broaden scope or claim VERIFIED, ACCEPTED, MERGED, DEPLOYED, or RELEASED authority.",
+    canonicalJson(intent),
+  ].join("\n");
 }
 
 export function hashExecutionBinding(binding: ExecutionBinding): string {
@@ -264,6 +395,38 @@ export function deserializeExecutionGenerationBinding(value: string | null | und
 function requireText(value: unknown, field: string): asserts value is string {
   if (typeof value !== "string" || !value.trim()) {
     throw new ExecutionProtocolError("INVALID_EXECUTION_BINDING", `${field} must be a non-empty string.`);
+  }
+}
+
+function stringArrayOrUndefined(value: unknown): string[] | undefined {
+  if (value === undefined) return undefined;
+  if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
+    throw new ExecutionProtocolError("INVALID_DISPATCH_INTENT", "Expected an array of strings.");
+  }
+  return value.map((entry) => entry.trim());
+}
+
+function requireDispatchText(value: unknown, field: string): asserts value is string {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new ExecutionProtocolError("INVALID_DISPATCH_INTENT", `${field} must be a non-empty string.`);
+  }
+}
+
+function validateDispatchStringArray(value: string[] | undefined, field: string): void {
+  if (value === undefined) return;
+  if (!Array.isArray(value)) {
+    throw new ExecutionProtocolError("INVALID_DISPATCH_INTENT", `${field} must be an array of strings.`);
+  }
+  value.forEach((entry, index) => requireDispatchText(entry, `${field}[${index}]`));
+}
+
+function validateDispatchScope(value: string[] | undefined, field: string, allowRoot: boolean): void {
+  validateDispatchStringArray(value, field);
+  for (const entry of value ?? []) {
+    const path = entry.trim().replaceAll("\\", "/");
+    if ((!allowRoot && path === ".") || path.startsWith("/") || path.split("/").includes("..")) {
+      throw new ExecutionProtocolError("INVALID_DISPATCH_INTENT", `${field} contains an invalid workspace-relative path: ${entry}`);
+    }
   }
 }
 

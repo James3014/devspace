@@ -6,9 +6,32 @@ import {
   assertExecutionAuthority,
   assertSameExecutionGeneration,
   buildExecutionGenerationBinding,
+  hashDispatchIntent,
   hashExecutionBinding,
+  parseDispatchIntent,
+  renderDispatchIntentForWorker,
+  type DispatchIntent,
   type ExecutionBinding,
 } from "./execution-protocol.js";
+
+function controllerIntent(): DispatchIntent {
+  return {
+    taskId: "task-controller-1",
+    attemptId: "attempt-controller-1",
+    objective: "Implement one bounded controller-contract seam.",
+    roleIntent: "DEEP_ENGINEERING",
+    context: ["Preserve existing execution mechanics."],
+    readScope: ["src"],
+    writeScope: ["src/execution-protocol.ts", "src/execution-protocol.test.ts"],
+    exclusiveOwnership: true,
+    forbiddenChanges: ["Do not add route or acceptance authority to Dev MCP."],
+    acceptanceCriteria: ["Typed controller intent is durable and independently inspectable."],
+    verificationRequired: true,
+    expectedArtifacts: ["source diff"],
+    expectedEvidence: ["focused tests"],
+    claimCeiling: "CANDIDATE_READY",
+  };
+}
 
 function ownerBinding(): ExecutionBinding {
   return {
@@ -34,6 +57,27 @@ function ownerBinding(): ExecutionBinding {
     },
   };
 }
+
+test("controller DispatchIntent is deterministic, model-neutral, and cannot express verification/acceptance authority", () => {
+  const intent = controllerIntent();
+  assert.match(hashDispatchIntent(intent), /^[a-f0-9]{64}$/);
+  assert.equal(hashDispatchIntent(intent), hashDispatchIntent({ ...intent, writeScope: [...(intent.writeScope ?? [])] }));
+  assert.deepEqual(parseDispatchIntent(intent), intent);
+  assert.match(renderDispatchIntentForWorker(intent), /Do not broaden scope or claim VERIFIED, ACCEPTED, MERGED, DEPLOYED, or RELEASED/);
+
+  assert.throws(
+    () => parseDispatchIntent({ ...intent, claimCeiling: "VERIFIED" }),
+    (error: unknown) => error instanceof ExecutionProtocolError && error.code === "INVALID_DISPATCH_INTENT",
+  );
+  assert.throws(
+    () => parseDispatchIntent({ ...intent, exclusiveOwnership: false }),
+    (error: unknown) => error instanceof ExecutionProtocolError && error.code === "INVALID_DISPATCH_INTENT",
+  );
+  assert.throws(
+    () => parseDispatchIntent({ ...intent, writeScope: ["../outside"] }),
+    (error: unknown) => error instanceof ExecutionProtocolError && error.code === "INVALID_DISPATCH_INTENT",
+  );
+});
 
 test("OWNER_DIRECT binding hashes deterministically and requires trusted owner evidence", () => {
   const binding = ownerBinding();

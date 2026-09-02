@@ -836,6 +836,59 @@ test("subagents: agent_preflight returns structured readiness without secrets", 
   assert.ok(!serialized.includes("DEVSPACE_OAUTH"));
 });
 
+test("subagents: controller dispatchIntent crosses the MCP schema without gaining verification authority", async (t) => {
+  const context = await fixture(t, { git: true, subagents: true });
+  const openResult = await callOpen(context.client, context.project, "chat-dispatch-intent");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+  const intent = {
+    taskId: "task-server-r3",
+    attemptId: "attempt-server-r3",
+    objective: "Perform one bounded change.",
+    roleIntent: "DEEP_ENGINEERING",
+    readScope: ["src"],
+    writeScope: ["src"],
+    exclusiveOwnership: true,
+    forbiddenChanges: ["Do not claim acceptance authority."],
+    acceptanceCriteria: ["Return inspectable evidence."],
+    verificationRequired: true,
+    expectedEvidence: ["focused test"],
+    claimCeiling: "CANDIDATE_READY",
+  };
+
+  const startResult = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "bounded work",
+      attemptKey: "attempt-server-r3",
+      executionContract: { dispatchIntent: intent, writePaths: ["src"] },
+    },
+  });
+  assert.equal(startResult.isError, undefined);
+  const start = structuredContent(startResult) as Record<string, unknown>;
+  const dispatch = start.dispatch as Record<string, unknown>;
+  assert.equal(dispatch.taskId, "task-server-r3");
+  assert.equal(dispatch.claimCeiling, "CANDIDATE_READY");
+  assert.equal((start as any).verified, undefined);
+  assert.equal((start as any).accepted, undefined);
+
+  const invalidClaim = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "invalid authority",
+      attemptKey: "attempt-server-r3-invalid",
+      executionContract: {
+        dispatchIntent: { ...intent, attemptId: "attempt-server-r3-invalid", claimCeiling: "VERIFIED" },
+        writePaths: ["src"],
+      },
+    },
+  });
+  assert.equal(invalidClaim.isError, true);
+});
+
 test("subagents: agent_start executionContract expectedHead mismatch fails closed", async (t) => {
   const context = await fixture(t, { git: true, subagents: true });
   const openResult = await callOpen(context.client, context.project, "chat-contract");

@@ -2573,6 +2573,38 @@ export function createMcpServer(
       idempotentHint: false,
       openWorldHint: true,
     };
+    const AGENT_DISPATCH_INTENT_INPUT_SCHEMA = z.object({
+      taskId: z.string().min(1),
+      attemptId: z.string().min(1),
+      objective: z.string().min(1),
+      roleIntent: z.enum([
+        "EVIDENCE_COLLECTOR",
+        "MECHANICAL_EXECUTOR",
+        "DEEP_ENGINEERING",
+        "TEST_VERIFIER",
+        "INDEPENDENT_REVIEWER",
+        "RECOVERY_RECONCILER",
+      ]),
+      context: z.array(z.string()).optional(),
+      readScope: z.array(z.string()).optional(),
+      writeScope: z.array(z.string()).optional(),
+      exclusiveOwnership: z.boolean(),
+      forbiddenChanges: z.array(z.string()).optional(),
+      acceptanceCriteria: z.array(z.string()).min(1),
+      verificationRequired: z.boolean(),
+      expectedArtifacts: z.array(z.string()).optional(),
+      expectedEvidence: z.array(z.string()).optional(),
+      claimCeiling: z.enum(["RESULT_RETURNED", "IMPLEMENTED", "CANDIDATE_READY"]),
+    }).strict();
+    const AGENT_DISPATCH_OUTPUT_SCHEMA = z.object({
+      taskId: z.string(),
+      attemptId: z.string(),
+      roleIntent: z.string(),
+      claimCeiling: z.string(),
+      verificationRequired: z.boolean(),
+      exclusiveOwnership: z.boolean(),
+      intentHash: z.string(),
+    });
 
     registerAppTool(
       server,
@@ -2592,6 +2624,9 @@ export function createMcpServer(
             .describe("Optional physical-workspace-scoped replay identity. Exact request replays reuse one durable agent; conflicting reuse fails closed."),
           executionContract: z
             .object({
+              dispatchIntent: AGENT_DISPATCH_INTENT_INPUT_SCHEMA.describe(
+                "Controller-authored bounded task semantics. Dev MCP transports and mechanically enforces applicable scope/ownership constraints but does not gain planner, verifier, acceptance, merge, or release authority.",
+              ),
               expectedHead: z
                 .string()
                 .describe("40-character commit SHA. If supplied, agent_start fails closed when workspace HEAD no longer matches."),
@@ -2633,6 +2668,7 @@ export function createMcpServer(
         },
         outputSchema: {
           agentId: z.string(),
+          dispatch: AGENT_DISPATCH_OUTPUT_SCHEMA.optional(),
           status: z.string(),
           profileName: z.string(),
           provider: z.string(),
@@ -2696,6 +2732,7 @@ export function createMcpServer(
         },
         outputSchema: {
           agentId: z.string(),
+          dispatch: AGENT_DISPATCH_OUTPUT_SCHEMA.optional(),
           status: z.string(),
           profileName: z.string(),
           provider: z.string(),
@@ -2754,6 +2791,7 @@ export function createMcpServer(
         },
         outputSchema: {
           agentId: z.string(),
+          dispatch: AGENT_DISPATCH_OUTPUT_SCHEMA.optional(),
           workspaceId: z.string().optional(),
           workspaceRoot: z.string(),
           profileName: z.string(),
@@ -2816,6 +2854,7 @@ export function createMcpServer(
         },
         outputSchema: {
           agentId: z.string(),
+          dispatch: AGENT_DISPATCH_OUTPUT_SCHEMA.optional(),
           workspaceId: z.string().optional(),
           workspaceRoot: z.string(),
           profileName: z.string(),
@@ -2996,6 +3035,7 @@ export function createMcpServer(
         },
         outputSchema: {
           agentId: z.string(),
+          dispatch: AGENT_DISPATCH_OUTPUT_SCHEMA.optional(),
           agentState: z.string(),
           providerState: z.string().optional(),
           providerSessionId: z.string().optional(),
