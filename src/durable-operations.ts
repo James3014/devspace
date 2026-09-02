@@ -19,7 +19,7 @@ const NEXUS_DEPLOYMENT_ID = /^r1-[0-9a-f]{40}$/;
 export const NEXUS_GATEWAY_RECOVERY_SCHEMA = "nexus.gateway.durable_recovery_request.v1" as const;
 export const NEXUS_GATEWAY_INTERPRETER = "/Users/jameschen/Workspace/Nexus-new/.venv/bin/python";
 export const NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256 = "6625224ab881cdbd68f66607d190b1b0b7608c9175a1e69f0222653af467c125";
-export const NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256 = "9b830307d3f90842180ede6fa70185577706100dded60e9d425537aa2e7f0b93";
+export const NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256 = "5ba22736c0506c14e03ecf735bbb0a315c76733cdc0ee9d9a78e016f76f52e94";
 export const NEXUS_GATEWAY_STATE_ROOT = join(homedir(), "Library", "Application Support", "Nexus", "gateway-direct");
 
 export interface NexusGatewayRecoveryRequest {
