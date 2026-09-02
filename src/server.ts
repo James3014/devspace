@@ -58,6 +58,7 @@ import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.
 import {
   DurableOperationManager,
   DurableOperationError,
+  NEXUS_GATEWAY_RECOVERY_SCHEMA,
   type DurableOperationRecord,
 } from "./durable-operations.js";
 import {
@@ -1562,7 +1563,7 @@ export function createMcpServer(
       operationId: z.string(),
       attemptKey: z.string(),
       requestHash: z.string(),
-      kind: z.enum(["workspace_clone", "dependency_sync"]),
+      kind: z.enum(["workspace_clone", "dependency_sync", "nexus_gateway_recover"]),
       authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]),
       scopeRoot: z.string(),
       workspaceId: z.string().optional(),
@@ -1581,6 +1582,61 @@ export function createMcpServer(
       )],
       structuredContent: operation as unknown as Record<string, unknown>,
     });
+
+    const nexusSafeId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
+    const nexusHash = z.string().regex(/^[0-9a-f]{64}$/);
+    const nexusDeploymentId = z.string().regex(/^r1-[0-9a-f]{40}$/);
+    const nexusGatewayRecoveryRequestSchema = z.object({
+      request_id: nexusSafeId,
+      idempotency_fence: nexusSafeId,
+      operation: z.literal("gateway-recover"),
+      effect_class: z.literal("GATEWAY_DURABLE_RECOVERY"),
+      recovery_authority_id: nexusSafeId,
+      recovery_authority_hash: nexusHash,
+      desired_manifest_id: nexusDeploymentId,
+      desired_manifest_hash: nexusHash,
+      predecessor_manifest_id: nexusDeploymentId,
+      predecessor_manifest_hash: nexusHash,
+      request_hash: nexusHash,
+      schema: z.literal(NEXUS_GATEWAY_RECOVERY_SCHEMA),
+    }).strict();
+
+    registerAppTool(
+      server,
+      "nexus_gateway_recover",
+      {
+        title: "Recover Nexus Gateway",
+        description:
+          "Run one fixed Nexus #526 Gateway recovery request through the repository-owned stable manager. The caller supplies only the exact durable attempt identity and schema-bound Nexus recovery request; executable, service, PID, launchd label, plist, source root, manager path, environment, command, and timeout are fixed server-side. The Nexus recovery authority receipt remains the semantic authority. Timeout or uncertain effect must be reconciled through operation_reconcile with the same stored request.",
+        inputSchema: {
+          attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
+            .describe("Stable DevSpace transport attempt identity. Conflicting reuse fails closed."),
+          request: nexusGatewayRecoveryRequestSchema,
+        },
+        outputSchema: durableOperationOutputSchema,
+        _meta: {},
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ attemptKey, request }) => {
+        try {
+          return operationResponse(await durableOperations.nexusGatewayRecover({ attemptKey, request }));
+        } catch (error) {
+          if (error instanceof DurableOperationError && error.operation) {
+            return {
+              content: [textBlock(`${error.code}: ${error.message}`)],
+              isError: true,
+              structuredContent: error.operation as unknown as Record<string, unknown>,
+            };
+          }
+          throw error;
+        }
+      },
+    );
 
     registerAppTool(
       server,
@@ -1684,7 +1740,7 @@ export function createMcpServer(
       {
         title: "Durable operation status",
         description:
-          "Read one exact durable workspace/dependency operation without starting, retrying, or replacing it.",
+          "Read one exact durable workspace, dependency, or fixed Nexus Gateway recovery operation without starting, retrying, or replacing it.",
         inputSchema: { operationId: z.string().min(1) },
         outputSchema: durableOperationOutputSchema,
         _meta: {},
@@ -1703,7 +1759,7 @@ export function createMcpServer(
       {
         title: "Reconcile durable operation",
         description:
-          "Reconcile physical state for one exact durable mutating operation after timeout/restart uncertainty. This never re-executes the mutation; unresolved physical truth remains outcome_unknown.",
+          "Reconcile physical state for one exact durable mutating operation after timeout/restart uncertainty. Workspace/dependency operations inspect without replay. A Nexus Gateway recovery re-enters only the same fixed manager seam with the same persisted request and idempotency fence so the Nexus #526 ledger can reconcile physical truth; callers cannot replace the request or select another process target.",
         inputSchema: { operationId: z.string().min(1) },
         outputSchema: durableOperationOutputSchema,
         _meta: {},

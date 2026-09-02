@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
+import { access, chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -10,10 +11,86 @@ import {
   DurableOperationError,
   DurableOperationManager,
   DurableOperationStore,
+  NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE,
+  NEXUS_GATEWAY_RECOVERY_SCHEMA,
   type CommandRunner,
+  type NexusGatewayRecoveryRequest,
 } from "./durable-operations.js";
 
 const execFileAsync = promisify(execFile);
+
+function canonicalHash(value: unknown): string {
+  const sort = (child: unknown): unknown => {
+    if (Array.isArray(child)) return child.map(sort);
+    if (child && typeof child === "object") {
+      return Object.fromEntries(
+        Object.entries(child as Record<string, unknown>)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([key, item]) => [key, sort(item)]),
+      );
+    }
+    return child;
+  };
+  return createHash("sha256").update(JSON.stringify(sort(value))).digest("hex");
+}
+
+function recoveryRequest(overrides: Partial<NexusGatewayRecoveryRequest> = {}): NexusGatewayRecoveryRequest {
+  const request = {
+    request_id: "request-1",
+    idempotency_fence: "fence-1",
+    operation: "gateway-recover" as const,
+    effect_class: "GATEWAY_DURABLE_RECOVERY" as const,
+    recovery_authority_id: "authority-1",
+    recovery_authority_hash: "a".repeat(64),
+    desired_manifest_id: `r1-${"b".repeat(40)}`,
+    desired_manifest_hash: "c".repeat(64),
+    predecessor_manifest_id: `r1-${"d".repeat(40)}`,
+    predecessor_manifest_hash: "e".repeat(64),
+    request_hash: "",
+    schema: NEXUS_GATEWAY_RECOVERY_SCHEMA,
+    ...overrides,
+  };
+  request.request_hash = canonicalHash({
+    request_id: request.request_id,
+    idempotency_fence: request.idempotency_fence,
+    operation: request.operation,
+    effect_class: request.effect_class,
+    recovery_authority_id: request.recovery_authority_id,
+    recovery_authority_hash: request.recovery_authority_hash,
+    desired_manifest_id: request.desired_manifest_id,
+    desired_manifest_hash: request.desired_manifest_hash,
+    predecessor_manifest_id: request.predecessor_manifest_id,
+    predecessor_manifest_hash: request.predecessor_manifest_hash,
+  });
+  return request;
+}
+
+async function runRecoveryBridge(home: string, request: NexusGatewayRecoveryRequest) {
+  return await new Promise<{ exitCode: number | null; stdout: string; stderr: string }>((resolvePromise, rejectPromise) => {
+    const child = spawn("/usr/bin/python3", ["-I", "-B", "-c", NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { HOME: home, PATH: "/usr/bin:/bin:/usr/sbin:/sbin", PYTHONNOUSERSITE: "1", PYTHONDONTWRITEBYTECODE: "1" },
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+    child.on("error", rejectPromise);
+    child.on("close", (exitCode) => resolvePromise({ exitCode, stdout, stderr }));
+    child.stdin.end(JSON.stringify(request));
+  });
+}
+
+async function pathExists(path: string): Promise<boolean> {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 async function fixture() {
   const root = await mkdtemp(join(tmpdir(), "devspace-durable-ops-"));
@@ -226,5 +303,223 @@ test("NEXUS_GOVERNED mutating operations fail closed before G9 validation wiring
     }
   } finally {
     await f.cleanup();
+  }
+});
+
+test("nexus_gateway_recover exact replay is durable and never invokes the bridge twice", async () => {
+  const f = await fixture();
+  try {
+    const calls: NexusGatewayRecoveryRequest[] = [];
+    const manager = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      async (request) => {
+        calls.push(request);
+        return { exitCode: 0, stdout: JSON.stringify({ result: "VERIFIED", evidence_hash: "f".repeat(64) }), stderr: "" };
+      },
+    );
+    try {
+      const request = recoveryRequest();
+      const first = await manager.nexusGatewayRecover({ attemptKey: "gateway-recover-1", request });
+      assert.equal(first.kind, "nexus_gateway_recover");
+      assert.equal(first.authorityMode, "NEXUS_GOVERNED");
+      assert.equal(first.status, "succeeded");
+      assert.equal(calls.length, 1);
+
+      const replay = await manager.nexusGatewayRecover({ attemptKey: "gateway-recover-1", request });
+      assert.equal(replay.operationId, first.operationId);
+      assert.equal(replay.updatedAt, first.updatedAt);
+      assert.equal(calls.length, 1, "exact terminal replay must not invoke the fixed bridge twice");
+
+      const conflicting = recoveryRequest({ desired_manifest_hash: "1".repeat(64) });
+      await assert.rejects(
+        manager.nexusGatewayRecover({ attemptKey: "gateway-recover-1", request: conflicting }),
+        (error: unknown) => error instanceof DurableOperationError && error.code === "OPERATION_REPLAY_CONFLICT",
+      );
+      assert.equal(calls.length, 1);
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("nexus_gateway_recover rejects malformed request before bridge execution", async () => {
+  const f = await fixture();
+  try {
+    let calls = 0;
+    const manager = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      async () => {
+        calls += 1;
+        return { exitCode: 0, stdout: JSON.stringify({ result: "VERIFIED" }), stderr: "" };
+      },
+    );
+    try {
+      const malformed = { ...recoveryRequest(), operation: "launchctl" } as unknown as NexusGatewayRecoveryRequest;
+      await assert.rejects(
+        manager.nexusGatewayRecover({ attemptKey: "gateway-invalid-1", request: malformed }),
+        (error: unknown) => error instanceof DurableOperationError && error.code === "NEXUS_GATEWAY_REQUEST_INVALID",
+      );
+      assert.equal(calls, 0);
+
+      const badHash = { ...recoveryRequest(), request_hash: "0".repeat(64) };
+      await assert.rejects(
+        manager.nexusGatewayRecover({ attemptKey: "gateway-invalid-2", request: badHash }),
+        (error: unknown) => error instanceof DurableOperationError && error.code === "NEXUS_GATEWAY_REQUEST_INVALID",
+      );
+      assert.equal(calls, 0);
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("nexus_gateway_recover bridge failure is persisted as uncertain instead of remaining started", async () => {
+  const f = await fixture();
+  try {
+    const manager = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      async () => { throw new Error("fixed interpreter unavailable"); },
+    );
+    try {
+      const result = await manager.nexusGatewayRecover({
+        attemptKey: "gateway-bridge-error-1",
+        request: recoveryRequest(),
+      });
+      assert.equal(result.status, "outcome_unknown");
+      assert.equal(result.errorCode, "NEXUS_GATEWAY_RECOVERY_UNCERTAIN");
+      assert.notEqual(manager.store.getByOperationId(result.operationId)?.status, "started");
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("nexus_gateway_recover reconciliation re-enters only the same stored request", async () => {
+  const f = await fixture();
+  try {
+    const calls: NexusGatewayRecoveryRequest[] = [];
+    const manager = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      async (request) => {
+        calls.push(structuredClone(request));
+        return calls.length === 1
+          ? { exitCode: 0, stdout: JSON.stringify({ result: "UNCERTAIN_EFFECT", evidence_hash: "1".repeat(64) }), stderr: "" }
+          : { exitCode: 0, stdout: JSON.stringify({ result: "VERIFIED", evidence_hash: "2".repeat(64) }), stderr: "" };
+      },
+    );
+    try {
+      const request = recoveryRequest();
+      const uncertain = await manager.nexusGatewayRecover({ attemptKey: "gateway-reconcile-1", request });
+      assert.equal(uncertain.status, "outcome_unknown");
+      const reconciled = await manager.reconcile(uncertain.operationId);
+      assert.equal(reconciled.status, "succeeded");
+      assert.equal(calls.length, 2);
+      assert.deepEqual(calls[1], calls[0], "reconcile must use the original persisted Nexus request and fence");
+      assert.equal((reconciled.receipt as Record<string, unknown>).reconciled, true);
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("nexus_gateway_recover malformed manager output fails closed as uncertain", async () => {
+  const f = await fixture();
+  try {
+    const manager = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      async () => ({ exitCode: 0, stdout: "not-json", stderr: "" }),
+    );
+    try {
+      const result = await manager.nexusGatewayRecover({ attemptKey: "gateway-json-1", request: recoveryRequest() });
+      assert.equal(result.status, "outcome_unknown");
+      assert.equal(result.errorCode, "NEXUS_GATEWAY_RECOVERY_UNCERTAIN");
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("fixed Nexus bridge rejects manager hash mismatch before importing manager code", { skip: process.platform !== "darwin" }, async () => {
+  const home = await mkdtemp(join(tmpdir(), "devspace-nexus-bridge-hash-"));
+  try {
+    const state = join(home, "Library", "Application Support", "Nexus", "gateway-direct");
+    await mkdir(state, { recursive: true });
+    const marker = join(home, "manager-imported");
+    const managerPath = join(state, "manager.py");
+    await writeFile(managerPath, `from pathlib import Path\nPath(${JSON.stringify(marker)}).write_text("IMPORTED")\n`);
+    await chmod(managerPath, 0o600);
+    const request = recoveryRequest();
+    const authorityPath = join(state, "recovery-authority.json");
+    await writeFile(authorityPath, JSON.stringify({
+      schema: "nexus.gateway.durable_recovery_authority.v1",
+      revocation_state: "NOT_REVOKED",
+      final_manager_sha256: "0".repeat(64),
+    }));
+    await chmod(authorityPath, 0o600);
+    const result = await runRecoveryBridge(home, request);
+    assert.notEqual(result.exitCode, 0);
+    assert.match(result.stderr, /manager artifact hash mismatch/);
+    assert.equal(await pathExists(marker), false, "tampered manager must be rejected before Python import executes it");
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("fixed Nexus bridge rejects a symlinked desired deployment root before importing manager code", { skip: process.platform !== "darwin" }, async () => {
+  const home = await mkdtemp(join(tmpdir(), "devspace-nexus-bridge-root-"));
+  const outside = await mkdtemp(join(tmpdir(), "devspace-nexus-bridge-outside-"));
+  try {
+    const state = join(home, "Library", "Application Support", "Nexus", "gateway-direct");
+    const deployments = join(state, "deployments");
+    await mkdir(deployments, { recursive: true });
+    const marker = join(home, "manager-imported");
+    const managerPath = join(state, "manager.py");
+    await writeFile(managerPath, `from pathlib import Path\nPath(${JSON.stringify(marker)}).write_text("IMPORTED")\n`);
+    await chmod(managerPath, 0o600);
+    const managerHash = createHash("sha256").update(await readFile(managerPath)).digest("hex");
+    const request = recoveryRequest();
+    await symlink(outside, join(deployments, request.desired_manifest_id));
+    const authorityPath = join(state, "recovery-authority.json");
+    await writeFile(authorityPath, JSON.stringify({
+      schema: "nexus.gateway.durable_recovery_authority.v1",
+      revocation_state: "NOT_REVOKED",
+      final_manager_sha256: managerHash,
+      request_id: request.request_id,
+      idempotency_fence: request.idempotency_fence,
+      receipt_id: request.recovery_authority_id,
+      receipt_hash: request.recovery_authority_hash,
+      desired_manifest_id: request.desired_manifest_id,
+      desired_manifest_sha256: request.desired_manifest_hash,
+      predecessor_manifest_id: request.predecessor_manifest_id,
+      predecessor_manifest_sha256: request.predecessor_manifest_hash,
+      desired_manifest: {
+        deployment_id: request.desired_manifest_id,
+        commit: "1".repeat(40),
+        tree: "2".repeat(40),
+      },
+    }));
+    await chmod(authorityPath, 0o600);
+    const result = await runRecoveryBridge(home, request);
+    assert.notEqual(result.exitCode, 0);
+    assert.match(result.stderr, /must not be a symlink/);
+    assert.equal(await pathExists(marker), false, "escaped deployment root must be rejected before manager import");
+  } finally {
+    await rm(home, { recursive: true, force: true });
+    await rm(outside, { recursive: true, force: true });
   }
 });

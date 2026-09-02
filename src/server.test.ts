@@ -1211,6 +1211,68 @@ test("bash and command_status: attemptKey reconciliation and idempotent executio
   assert.match(responseText(conflictRes), /ATTEMPT_REPLAY_CONFLICT/);
 });
 
+test("nexus_gateway_recover exposes only the fixed typed recovery contract", async (t) => {
+  const context = await fixture(t, { git: true });
+  const tools = await context.client.listTools();
+  const gatewayTool = tools.tools.find((tool) => tool.name === "nexus_gateway_recover");
+  assert.ok(gatewayTool, "fixed Nexus Gateway recovery tool must be exposed");
+  const annotations = (gatewayTool as unknown as { annotations?: Record<string, unknown> }).annotations;
+  assert.deepEqual(annotations, {
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: true,
+    openWorldHint: false,
+  });
+  assert.match(String(gatewayTool.description), /executable, service, PID, launchd label, plist, source root/);
+
+  const schema = gatewayTool.inputSchema as Record<string, unknown>;
+  const properties = schema.properties as Record<string, unknown>;
+  assert.deepEqual(Object.keys(properties).sort(), ["attemptKey", "request"]);
+  const requestSchema = properties.request as Record<string, unknown>;
+  const requestProperties = requestSchema.properties as Record<string, unknown>;
+  assert.deepEqual(Object.keys(requestProperties).sort(), [
+    "desired_manifest_hash",
+    "desired_manifest_id",
+    "effect_class",
+    "idempotency_fence",
+    "operation",
+    "predecessor_manifest_hash",
+    "predecessor_manifest_id",
+    "recovery_authority_hash",
+    "recovery_authority_id",
+    "request_hash",
+    "request_id",
+    "schema",
+  ]);
+  for (const forbidden of ["command", "executable", "pid", "service", "launchdLabel", "plist", "root", "managerPath", "environment", "timeout"]) {
+    assert.equal(forbidden in requestProperties, false, `${forbidden} must not be caller-selectable`);
+  }
+  assert.equal(requestSchema.additionalProperties, false, "recovery request must reject extra process-control fields");
+
+  const invalid = await context.client.callTool({
+    name: "nexus_gateway_recover",
+    arguments: {
+      attemptKey: "server-gateway-invalid",
+      request: {
+        request_id: "request-1",
+        idempotency_fence: "fence-1",
+        operation: "gateway-recover",
+        effect_class: "GATEWAY_DURABLE_RECOVERY",
+        recovery_authority_id: "authority-1",
+        recovery_authority_hash: "a".repeat(64),
+        desired_manifest_id: `r1-${"b".repeat(40)}`,
+        desired_manifest_hash: "c".repeat(64),
+        predecessor_manifest_id: `r1-${"d".repeat(40)}`,
+        predecessor_manifest_hash: "e".repeat(64),
+        request_hash: "f".repeat(64),
+        schema: "nexus.gateway.durable_recovery_request.v1",
+        command: "launchctl",
+      },
+    },
+  });
+  assert.equal(invalid.isError, true, "extra caller-selected process controls must fail schema validation before handler execution");
+});
+
 test("OWNER_DIRECT workspace_clone and dependency_sync run through typed MCP tools", async (t) => {
   const context = await fixture(t, { git: true });
   const tools = await context.client.listTools();
