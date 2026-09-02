@@ -56,6 +56,12 @@ import {
 } from "./mcp-sessions.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
 import {
+  DurableOperationManager,
+  DurableOperationError,
+  NEXUS_GATEWAY_RECOVERY_SCHEMA,
+  type DurableOperationRecord,
+} from "./durable-operations.js";
+import {
   CodexGoalSessionManager,
   type CodexGoalState,
 } from "./codex-goal-sessions.js";
@@ -66,6 +72,12 @@ import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 import { summarizeLocalAgentProfile, loadLocalAgentProfiles } from "./local-agent-profiles.js";
+import {
+  loadProfileCatalog,
+  type ProfileCatalogEntry,
+} from "./local-agent-profile-source.js";
+import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build-identity.js";
+import { devspaceConfigDir } from "./user-config.js";
 import {
   formatLocalAgentProviderAvailabilitySummary,
   getLocalAgentProviderAvailabilitySnapshot,
@@ -341,6 +353,25 @@ const workspaceLocalAgentOutputSchema = z.object({
   write_mode: z.enum(["read_only", "allowed"]).optional(),
   providerAvailable: z.boolean().optional(),
   providerUnavailableReason: z.string().optional(),
+});
+
+const workspaceProfileStatusOutputSchema = z.object({
+  name: z.string(),
+  provider: z.string(),
+  state: z.string(),
+  sources: z.array(z.string()),
+  model: z.string().optional(),
+  effort: z.string().optional(),
+  write_mode: z.string().optional(),
+  tracked: z.boolean().optional(),
+  diagnostic: z.string().optional(),
+});
+
+const devspaceBuildOutputSchema = z.object({
+  serverInstanceId: z.string(),
+  buildId: z.string(),
+  sourceCommit: z.string(),
+  profileCatalogGeneration: z.string(),
 });
 
 const workspaceLocalAgentProviderOutputSchema = z.object({
@@ -1226,6 +1257,11 @@ function registerRepositoryIntelligenceTools(
   }
 }
 
+export interface RuntimeBuildIdentityContext {
+  identity: RuntimeBuildIdentity;
+  latestProfileCatalogGeneration: { value: string };
+}
+
 export function createMcpServer(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
@@ -1235,7 +1271,19 @@ export function createMcpServer(
   incomingArtifactAdapters: readonly IncomingArtifactAdapter[],
   agentSessionManager?: LocalAgentSessionManager,
   codexGoals?: CodexGoalSessionManager,
+  runtimeBuildIdentityContext?: RuntimeBuildIdentityContext,
+  durableOperations?: DurableOperationManager,
 ): McpServer {
+  const runtimeBuildIdentity = runtimeBuildIdentityContext?.identity
+    ?? describeRuntimeBuildIdentity({
+      env: process.env,
+      listenPort: config.port,
+      configRoot: devspaceConfigDir(process.env),
+      stateRoot: config.stateDir,
+      profileCatalogGeneration: "unresolved",
+    });
+  const latestProfileCatalogGeneration = runtimeBuildIdentityContext?.latestProfileCatalogGeneration
+    ?? { value: runtimeBuildIdentity.profileCatalogGeneration };
   const server = new McpServer(
     {
       name: "devspace",
@@ -1326,6 +1374,8 @@ export function createMcpServer(
         skills: z.array(workspaceSkillOutputSchema).optional(),
         agentProviders: z.array(workspaceLocalAgentProviderOutputSchema).optional(),
         agents: z.array(workspaceLocalAgentOutputSchema).optional(),
+        agentProfileStatuses: z.array(workspaceProfileStatusOutputSchema).optional(),
+        devspaceBuild: devspaceBuildOutputSchema,
         skillDiagnostics: z.array(z.unknown()).optional(),
         instruction: z.string(),
       },
@@ -1371,6 +1421,26 @@ export function createMcpServer(
           note: provider.note,
         }));
       const cardAgents = agentCatalog.profiles;
+      const cardProfileStatuses = (workspace.profileCatalogEntries ?? []).map(
+        (entry: ProfileCatalogEntry) => ({
+          name: entry.name,
+          provider: entry.provider,
+          state: entry.state,
+          sources: entry.sources,
+          ...(entry.model ? { model: entry.model } : {}),
+          ...(entry.effort ? { effort: entry.effort } : {}),
+          ...(entry.write_mode ? { write_mode: entry.write_mode } : {}),
+          ...(entry.tracked !== undefined ? { tracked: entry.tracked } : {}),
+          ...(entry.diagnostic ? { diagnostic: entry.diagnostic } : {}),
+        }),
+      );
+      const devspaceBuildReceipt = {
+        serverInstanceId: runtimeBuildIdentity.serverInstanceId,
+        buildId: runtimeBuildIdentity.buildId,
+        sourceCommit: runtimeBuildIdentity.sourceCommit,
+        profileCatalogGeneration: workspace.profileCatalogGeneration ?? "unresolved",
+      };
+      latestProfileCatalogGeneration.value = devspaceBuildReceipt.profileCatalogGeneration;
       const cardAgentsFiles = agentsFiles.map((file) => ({
         path: formatAgentsPath(file.path, workspace.root),
         content: file.content,
@@ -1451,6 +1521,8 @@ export function createMcpServer(
             skills: cardSkills,
             agentProviders: cardAgentProviders,
             agents: cardAgents,
+            agentProfileStatuses: cardProfileStatuses,
+            devspaceBuild: devspaceBuildReceipt,
             instruction: cardInstruction,
             summary: {
               mode: workspace.mode,
@@ -1468,6 +1540,8 @@ export function createMcpServer(
           mode: workspace.mode,
           sourceRoot: workspace.sourceRoot,
           worktree: workspace.worktree,
+          agentProfileStatuses: cardProfileStatuses,
+          devspaceBuild: devspaceBuildReceipt,
           ...(includeBootstrapContext
             ? {
                 agentsFiles: loadedAgentsFiles,
@@ -1483,6 +1557,217 @@ export function createMcpServer(
       };
     },
   );
+
+  if (durableOperations) {
+    const durableOperationOutputSchema = {
+      operationId: z.string(),
+      attemptKey: z.string(),
+      requestHash: z.string(),
+      kind: z.enum(["workspace_clone", "dependency_sync", "nexus_gateway_recover"]),
+      authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]),
+      scopeRoot: z.string(),
+      workspaceId: z.string().optional(),
+      status: z.enum(["started", "succeeded", "failed", "outcome_unknown"]),
+      retrySafe: z.boolean(),
+      request: z.record(z.string(), z.unknown()),
+      receipt: z.record(z.string(), z.unknown()).optional(),
+      errorCode: z.string().optional(),
+      errorMessage: z.string().optional(),
+      createdAt: z.string(),
+      updatedAt: z.string(),
+    };
+    const operationResponse = (operation: DurableOperationRecord) => ({
+      content: [textBlock(
+        `${operation.kind} ${operation.operationId}: status=${operation.status}, retrySafe=${operation.retrySafe}.`,
+      )],
+      structuredContent: operation as unknown as Record<string, unknown>,
+    });
+
+    const nexusSafeId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
+    const nexusHash = z.string().regex(/^[0-9a-f]{64}$/);
+    const nexusDeploymentId = z.string().regex(/^r1-[0-9a-f]{40}$/);
+    const nexusGatewayRecoveryRequestSchema = z.object({
+      request_id: nexusSafeId,
+      idempotency_fence: nexusSafeId,
+      operation: z.literal("gateway-recover"),
+      effect_class: z.literal("GATEWAY_DURABLE_RECOVERY"),
+      recovery_authority_id: nexusSafeId,
+      recovery_authority_hash: nexusHash,
+      desired_manifest_id: nexusDeploymentId,
+      desired_manifest_hash: nexusHash,
+      predecessor_manifest_id: nexusDeploymentId,
+      predecessor_manifest_hash: nexusHash,
+      request_hash: nexusHash,
+      schema: z.literal(NEXUS_GATEWAY_RECOVERY_SCHEMA),
+    }).strict();
+
+    registerAppTool(
+      server,
+      "nexus_gateway_recover",
+      {
+        title: "Recover Nexus Gateway",
+        description:
+          "Run one fixed Nexus #526 Gateway recovery request through the repository-owned stable manager. The caller supplies only the exact durable attempt identity and schema-bound Nexus recovery request; executable, service, PID, launchd label, plist, source root, manager path, environment, command, and timeout are fixed server-side. The Nexus recovery authority receipt remains the semantic authority. Timeout or uncertain effect must be reconciled through operation_reconcile with the same stored request.",
+        inputSchema: {
+          attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
+            .describe("Stable DevSpace transport attempt identity. Conflicting reuse fails closed."),
+          request: nexusGatewayRecoveryRequestSchema,
+        },
+        outputSchema: durableOperationOutputSchema,
+        _meta: {},
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ attemptKey, request }) => {
+        try {
+          return operationResponse(await durableOperations.nexusGatewayRecover({ attemptKey, request }));
+        } catch (error) {
+          if (error instanceof DurableOperationError && error.operation) {
+            return {
+              content: [textBlock(`${error.code}: ${error.message}`)],
+              isError: true,
+              structuredContent: error.operation as unknown as Record<string, unknown>,
+            };
+          }
+          throw error;
+        }
+      },
+    );
+
+    registerAppTool(
+      server,
+      "workspace_clone",
+      {
+        title: "Clone workspace",
+        description:
+          "Clone one Git repository into a new or empty destination under a configured allowed root. This is a typed OWNER_DIRECT bootstrap mutation with durable attempt fencing; it never overwrites an existing non-empty destination and never falls back to broad shell mutation.",
+        inputSchema: {
+          attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
+            .describe("Stable operation identity. Exact replay returns the existing operation; conflicting reuse fails closed."),
+          remote: z.string().min(1).describe("Credential-free Git remote URL or local repository path."),
+          destination: z.string().min(1).describe("Absolute destination path under a configured allowed root."),
+          ref: z.string().min(1).optional().describe("Optional branch or tag to clone as a single branch."),
+          authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).default("OWNER_DIRECT")
+            .describe("NEXUS_GOVERNED remains fail-closed until an external Nexus grant validator is wired."),
+        },
+        outputSchema: durableOperationOutputSchema,
+        _meta: {},
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: true,
+        },
+      },
+      async ({ attemptKey, remote, destination, ref, authorityMode }) => {
+        try {
+          const operation = await durableOperations.workspaceClone({
+            attemptKey,
+            remote,
+            destination,
+            ref,
+            authorityMode,
+          });
+          return operationResponse(operation);
+        } catch (error) {
+          if (error instanceof DurableOperationError && error.operation) {
+            return {
+              content: [textBlock(`${error.code}: ${error.message}`)],
+              isError: true,
+              structuredContent: error.operation as unknown as Record<string, unknown>,
+            };
+          }
+          throw error;
+        }
+      },
+    );
+
+    registerAppTool(
+      server,
+      "dependency_sync",
+      {
+        title: "Synchronize dependencies",
+        description:
+          "Synchronize an existing workspace using a conservative frozen dependency recipe. The operation is durably fenced and verifies dependency specification/lock inputs remain unchanged. It does not add packages, update manifests, or perform global installs.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
+            .describe("Stable operation identity. Exact replay returns the existing operation; conflicting reuse fails closed."),
+          recipe: z.enum(["npm_ci", "pnpm_frozen", "uv_frozen"]),
+          authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).default("OWNER_DIRECT")
+            .describe("NEXUS_GOVERNED remains fail-closed until an external Nexus grant validator is wired."),
+        },
+        outputSchema: durableOperationOutputSchema,
+        _meta: {},
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: true,
+        },
+      },
+      async ({ workspaceId, attemptKey, recipe, authorityMode }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        try {
+          const operation = await durableOperations.dependencySync({
+            workspaceId,
+            workspaceRoot: workspace.root,
+            attemptKey,
+            recipe,
+            authorityMode,
+          });
+          return operationResponse(operation);
+        } catch (error) {
+          if (error instanceof DurableOperationError && error.operation) {
+            return {
+              content: [textBlock(`${error.code}: ${error.message}`)],
+              isError: true,
+              structuredContent: error.operation as unknown as Record<string, unknown>,
+            };
+          }
+          throw error;
+        }
+      },
+    );
+
+    registerAppTool(
+      server,
+      "operation_status",
+      {
+        title: "Durable operation status",
+        description:
+          "Read one exact durable workspace, dependency, or fixed Nexus Gateway recovery operation without starting, retrying, or replacing it.",
+        inputSchema: { operationId: z.string().min(1) },
+        outputSchema: durableOperationOutputSchema,
+        _meta: {},
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      },
+      async ({ operationId }) => {
+        const operation = durableOperations.store.getByOperationId(operationId);
+        if (!operation) throw new DurableOperationError("RECONCILIATION_REQUIRED", `Unknown durable operation: ${operationId}`);
+        return operationResponse(operation);
+      },
+    );
+
+    registerAppTool(
+      server,
+      "operation_reconcile",
+      {
+        title: "Reconcile durable operation",
+        description:
+          "Reconcile physical state for one exact durable mutating operation after timeout/restart uncertainty. Workspace/dependency operations inspect without replay. A Nexus Gateway recovery re-enters only the same fixed manager seam with the same persisted request and idempotency fence so the Nexus #526 ledger can reconcile physical truth; callers cannot replace the request or select another process target.",
+        inputSchema: { operationId: z.string().min(1) },
+        outputSchema: durableOperationOutputSchema,
+        _meta: {},
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      },
+      async ({ operationId }) => operationResponse(await durableOperations.reconcile(operationId)),
+    );
+  }
 
   registerAppTool(
     server,
@@ -2288,6 +2573,46 @@ export function createMcpServer(
       idempotentHint: false,
       openWorldHint: true,
     };
+    const AGENT_DISPATCH_INTENT_INPUT_SCHEMA = z.object({
+      taskId: z.string().min(1),
+      attemptId: z.string().min(1),
+      objective: z.string().min(1),
+      roleIntent: z.enum([
+        "EVIDENCE_COLLECTOR",
+        "MECHANICAL_EXECUTOR",
+        "DEEP_ENGINEERING",
+        "TEST_VERIFIER",
+        "INDEPENDENT_REVIEWER",
+        "RECOVERY_RECONCILER",
+      ]),
+      context: z.array(z.string()).optional(),
+      readScope: z.array(z.string()).optional(),
+      writeScope: z.array(z.string()).optional(),
+      exclusiveOwnership: z.boolean(),
+      forbiddenChanges: z.array(z.string()).optional(),
+      acceptanceCriteria: z.array(z.string()).min(1),
+      verificationRequired: z.boolean(),
+      expectedArtifacts: z.array(z.string()).optional(),
+      expectedEvidence: z.array(z.string()).optional(),
+      claimCeiling: z.enum(["RESULT_RETURNED", "IMPLEMENTED", "CANDIDATE_READY"]),
+    }).strict();
+    const AGENT_DISPATCH_OUTPUT_SCHEMA = z.object({
+      taskId: z.string(),
+      attemptId: z.string(),
+      roleIntent: z.string(),
+      claimCeiling: z.string(),
+      verificationRequired: z.boolean(),
+      exclusiveOwnership: z.boolean(),
+      intentHash: z.string(),
+    });
+    const NEXUS_GRANT_REF_INPUT_SCHEMA = z.object({
+      repository: z.literal("James3014/Nexus-new"),
+      revision: z.string().regex(/^[0-9a-f]{40}$/),
+      grantPath: z.string().startsWith("tasks/"),
+      grantSha256: z.string().regex(/^[0-9a-f]{64}$/),
+      authorityPath: z.string().startsWith("tasks/"),
+      authoritySha256: z.string().regex(/^[0-9a-f]{64}$/),
+    }).strict();
 
     registerAppTool(
       server,
@@ -2307,6 +2632,15 @@ export function createMcpServer(
             .describe("Optional physical-workspace-scoped replay identity. Exact request replays reuse one durable agent; conflicting reuse fails closed."),
           executionContract: z
             .object({
+              authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).optional().describe(
+                "Execution authority lane. OWNER_DIRECT is the backwards-compatible default. NEXUS_GOVERNED requires canonical Nexus authority evidence and never falls back to direct authority.",
+              ),
+              nexusGrant: NEXUS_GRANT_REF_INPUT_SCHEMA.optional().describe(
+                "Immutable pointer to a canonical Nexus execution grant and its governing Task Card. Dev MCP independently verifies current Nexus main and tracked bytes before worker launch.",
+              ),
+              dispatchIntent: AGENT_DISPATCH_INTENT_INPUT_SCHEMA.describe(
+                "Controller-authored bounded task semantics. Dev MCP transports and mechanically enforces applicable scope/ownership constraints but does not gain planner, verifier, acceptance, merge, or release authority.",
+              ),
               expectedHead: z
                 .string()
                 .describe("40-character commit SHA. If supplied, agent_start fails closed when workspace HEAD no longer matches."),
@@ -2348,6 +2682,7 @@ export function createMcpServer(
         },
         outputSchema: {
           agentId: z.string(),
+          dispatch: AGENT_DISPATCH_OUTPUT_SCHEMA.optional(),
           status: z.string(),
           profileName: z.string(),
           provider: z.string(),
@@ -2363,7 +2698,8 @@ export function createMcpServer(
       },
       async ({ workspaceId, profile, prompt, attemptKey, executionContract }) => {
         const workspace = workspaces.getWorkspace(workspaceId);
-        const profiles = await loadLocalAgentProfiles(config, workspace.root);
+        const profileCatalog = await loadProfileCatalog(config, workspace.root);
+        const profiles = profileCatalog.profiles;
         let contract;
         try {
           contract = parseExecutionContract(executionContract);
@@ -2379,6 +2715,7 @@ export function createMcpServer(
           profileName: profile,
           prompt,
           profiles,
+          profileCatalog,
           attemptKey,
           executionContract: contract,
         });
@@ -2409,6 +2746,7 @@ export function createMcpServer(
         },
         outputSchema: {
           agentId: z.string(),
+          dispatch: AGENT_DISPATCH_OUTPUT_SCHEMA.optional(),
           status: z.string(),
           profileName: z.string(),
           provider: z.string(),
@@ -2425,11 +2763,14 @@ export function createMcpServer(
       },
       async ({ workspaceId, agentId, prompt }) => {
         const workspace = workspaces.getWorkspace(workspaceId);
+        const profileCatalog = await loadProfileCatalog(config, workspace.root);
         const output = await agentSessionManager.continueAgent({
           workspaceId,
           workspaceRoot: workspace.root,
           agentId,
           prompt,
+          profiles: profileCatalog.profiles,
+          profileCatalog,
         });
         logToolCall(config, {
           tool: "agent_continue",
@@ -2464,6 +2805,7 @@ export function createMcpServer(
         },
         outputSchema: {
           agentId: z.string(),
+          dispatch: AGENT_DISPATCH_OUTPUT_SCHEMA.optional(),
           workspaceId: z.string().optional(),
           workspaceRoot: z.string(),
           profileName: z.string(),
@@ -2475,6 +2817,9 @@ export function createMcpServer(
           terminal: z.boolean(),
           latestResponse: z.string().optional(),
           error: z.string().optional(),
+          errorCode: z.string().optional(),
+          errorRetryable: z.boolean().optional(),
+          errorDetails: z.record(z.string(), z.unknown()).optional(),
           createdAt: z.string(),
           updatedAt: z.string(),
           startedAt: z.string().optional(),
@@ -2523,6 +2868,7 @@ export function createMcpServer(
         },
         outputSchema: {
           agentId: z.string(),
+          dispatch: AGENT_DISPATCH_OUTPUT_SCHEMA.optional(),
           workspaceId: z.string().optional(),
           workspaceRoot: z.string(),
           profileName: z.string(),
@@ -2664,13 +3010,15 @@ export function createMcpServer(
       },
       async ({ workspaceId, profile, toolchainId }) => {
         const workspace = workspaces.getWorkspace(workspaceId);
-        const profiles = await loadLocalAgentProfiles(config, workspace.root);
+        const profileCatalog = await loadProfileCatalog(config, workspace.root);
+        const profiles = profileCatalog.profiles;
         const output = await agentSessionManager.preflightAgent({
           workspaceId,
           workspaceRoot: workspace.root,
           isolated: workspace.mode === "worktree",
           profileName: profile,
           profiles,
+          profileCatalog,
           toolchainId,
         });
         const blockerSummary =
@@ -2701,6 +3049,7 @@ export function createMcpServer(
         },
         outputSchema: {
           agentId: z.string(),
+          dispatch: AGENT_DISPATCH_OUTPUT_SCHEMA.optional(),
           agentState: z.string(),
           providerState: z.string().optional(),
           providerSessionId: z.string().optional(),
@@ -3145,6 +3494,7 @@ export function createServer(
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
+  const durableOperations = new DurableOperationManager(config);
   const localAgentProviders = buildLocalAgentProviderStatuses(
     config.subagents,
     getLocalAgentProviderAvailabilitySnapshot(),
@@ -3153,8 +3503,16 @@ export function createServer(
     config.subagents,
     getLocalAgentProviderAvailabilitySnapshot(),
   );
+  const runtimeBuildIdentity = describeRuntimeBuildIdentity({
+    env: process.env,
+    listenPort: config.port,
+    configRoot: devspaceConfigDir(process.env),
+    stateRoot: config.stateDir,
+    profileCatalogGeneration: "unresolved",
+  });
+  const latestProfileCatalogGeneration = { value: runtimeBuildIdentity.profileCatalogGeneration };
   const agentSessionManager = config.subagents.enabled
-    ? new LocalAgentSessionManager(config)
+    ? new LocalAgentSessionManager(config, undefined, undefined, undefined, runtimeBuildIdentity)
     : undefined;
   const codexGoals = config.codexGoalsEnabled
     ? new CodexGoalSessionManager(processSessions, { codexBin: config.codexBin })
@@ -3256,7 +3614,28 @@ export function createServer(
   );
 
   app.get("/healthz", (_req, res) => {
-    res.json({ ok: true, name: "devspace" });
+    res.json({
+      ok: true,
+      name: "devspace",
+      build: {
+        package_name: runtimeBuildIdentity.package,
+        package_version: runtimeBuildIdentity.version,
+        source_commit: runtimeBuildIdentity.sourceCommit,
+        source_dirty: runtimeBuildIdentity.sourceDirty,
+        build_id: runtimeBuildIdentity.buildId,
+        pid: runtimeBuildIdentity.pid,
+        listen_port: runtimeBuildIdentity.listenPort,
+      },
+    });
+  });
+
+  // Unauthenticated runtime identity endpoint (same trust level as /healthz).
+  // Exposes build/runtime identity only; no secrets, no workspace data.
+  app.get("/identity", (_req, res) => {
+    res.json({
+      ...runtimeBuildIdentity,
+      profileCatalogGeneration: latestProfileCatalogGeneration.value,
+    });
   });
 
   app.all("/mcp", async (req, res) => {
@@ -3333,6 +3712,8 @@ export function createServer(
           incomingArtifactAdapters,
           agentSessionManager,
           codexGoals,
+          { identity: runtimeBuildIdentity, latestProfileCatalogGeneration },
+          durableOperations,
         );
         await server.connect(transport);
       } else {
@@ -3365,6 +3746,8 @@ export function createServer(
         logSessionCloseResults("server_shutdown", results);
         codexGoals?.shutdown();
         processSessions.shutdown();
+        durableOperations.close();
+        agentSessionManager?.close();
         oauthProvider.close();
         workspaceStore.close?.();
       })();

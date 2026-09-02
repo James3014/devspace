@@ -56,8 +56,12 @@ import {
 } from "./user-config.js";
 import { expandHomePath } from "./roots.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
+import {
+  getActiveOpencodeCatalogSnapshot,
+  refreshOpencodeCatalog,
+} from "./local-agent-opencode-catalog.js";
 
-type Command = "serve" | "init" | "doctor" | "config" | "agents" | "help" | "version";
+type Command = "serve" | "init" | "doctor" | "config" | "agents" | "models" | "help" | "version";
 const require = createRequire(import.meta.url);
 const SUPPORTED_NODE_RANGE = ">=20.12 <27";
 
@@ -84,6 +88,9 @@ async function main(argv: string[]): Promise<void> {
     case "agents":
       await runAgentsCommand(args);
       return;
+    case "models":
+      await runModelsCommand(args);
+      return;
     case "help":
       printHelp();
       return;
@@ -95,7 +102,7 @@ async function main(argv: string[]): Promise<void> {
 
 function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
-  if (command === "init" || command === "doctor" || command === "config" || command === "agents") return command;
+  if (command === "init" || command === "doctor" || command === "config" || command === "agents" || command === "models") return command;
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
   throw new Error(`Unknown command: ${command}`);
@@ -392,6 +399,8 @@ function printHelp(): void {
       "  devspace doctor          Show config, runtime, and native dependency status",
       "  devspace config get      Print persisted config",
       "  devspace config set publicBaseUrl <url|null>",
+      "  devspace models          List available models in catalog",
+      "  devspace models refresh  Refresh current provider model catalog and bump generation",
       "  devspace agents ls       List subagent sessions",
       "  devspace agents run <profile-or-provider> [--model <model>] [--effort <level>] <prompt>",
       "  devspace agents continue <id> [--model <model>] [--effort <level>] <prompt>",
@@ -404,6 +413,20 @@ function printHelp(): void {
       "  DEVSPACE_PUBLIC_BASE_URL=https://example.trycloudflare.com devspace serve",
     ].join("\n"),
   );
+}
+
+async function runModelsCommand(args: string[]): Promise<void> {
+  const [subcommand] = args;
+  if (subcommand === "refresh") {
+    const refreshed = await refreshOpencodeCatalog();
+    console.log(`Refreshed OpenCode catalog: ${refreshed.entries.length} models (generation: ${refreshed.generation}, source: ${refreshed.source})`);
+    return;
+  }
+  const current = getActiveOpencodeCatalogSnapshot();
+  console.log(`OpenCode Catalog (generation: ${current.generation}, source: ${current.source}, fetchedAt: ${current.fetchedAt}):`);
+  for (const entry of current.entries) {
+    console.log(`  ${entry.fullName} (variants: ${entry.variants.join(", ")}) [${entry.status}]`);
+  }
 }
 
 async function runAgentsCommand(args: string[]): Promise<void> {

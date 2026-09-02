@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test, { after } from "node:test";
@@ -21,6 +21,13 @@ import {
   workerChangedPathsSinceBaseline,
 } from "./workspace-reconciliation.js";
 import type { WorkspacePhysicalState } from "./workspace-reconciliation.js";
+import {
+  hashDispatchIntent,
+  hashNexusExecutionGrant,
+  type DispatchIntent,
+  type NexusExecutionGrant,
+  type NexusExecutionGrantRef,
+} from "./execution-protocol.js";
 
 const originalDependencyRoot = process.env.DEVSPACE_DEPENDENCY_ROOT;
 const codexRuntimeRoot = mkdtempSync(join(tmpdir(), "devspace-contract-codex-runtime-"));
@@ -86,6 +93,7 @@ function setupManager(
   overrides: Record<string, unknown> = {},
   turnRunner?: any,
   launcher?: any,
+  nexusGrantResolver?: (ref: NexusExecutionGrantRef) => Promise<NexusExecutionGrant>,
 ) {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-contract-state-"));
   const terminated: Array<{ id: string }> = [];
@@ -108,6 +116,8 @@ function setupManager(
     launcher ?? (async () => undefined),
     mockTerminator,
     turnRunner,
+    undefined,
+    nexusGrantResolver,
   );
 
   const clean = () => {
@@ -116,6 +126,25 @@ function setupManager(
     } catch {}
   };
   return { manager, config, terminated, clean, stateDir };
+}
+
+function syntheticExecutionGeneration(
+  manager: LocalAgentSessionManager,
+  provider: LocalAgentProfile["provider"],
+  profileName = "reviewer",
+) {
+  return (manager as any).resolveExecutionGeneration(
+    {
+      name: profileName,
+      description: "Synthetic lifecycle fixture with an explicit current execution generation.",
+      provider,
+      filePath: "<test-fixture>",
+      body: "",
+      disabled: false,
+    },
+    "unresolved",
+    process.env,
+  );
 }
 
 function settleForContinuation(
@@ -176,6 +205,65 @@ function failDetachedTurn(
     error: input.error,
     terminalReason: input.terminalReason,
   }).applied, true);
+}
+
+function controllerDispatchIntent(
+  attemptId: string,
+  writeScope: string[] = ["src"],
+  overrides: Partial<DispatchIntent> = {},
+): DispatchIntent {
+  return {
+    taskId: "task-r3-controller-contract",
+    attemptId,
+    objective: "Perform one bounded engineering change and return inspectable evidence.",
+    roleIntent: "DEEP_ENGINEERING",
+    readScope: ["src", "tests"],
+    writeScope,
+    exclusiveOwnership: writeScope.length > 0,
+    forbiddenChanges: ["Do not widen governance or acceptance authority."],
+    acceptanceCriteria: ["Only the declared scope changes and required evidence is returned."],
+    verificationRequired: true,
+    expectedArtifacts: ["source diff"],
+    expectedEvidence: ["focused tests"],
+    claimCeiling: "CANDIDATE_READY",
+    ...overrides,
+  };
+}
+
+function governedGrant(intent: DispatchIntent, head: string, overrides: Partial<NexusExecutionGrant> = {}): NexusExecutionGrant {
+  const payload = {
+    schema: "nexus.devspace.execution_grant.v1" as const,
+    grantId: `grant-${intent.attemptId}`,
+    issuer: "nexus" as const,
+    taskId: intent.taskId,
+    attemptId: intent.attemptId,
+    devspaceBaseRevision: head,
+    dispatchIntentHash: hashDispatchIntent(intent),
+    profile: "reviewer",
+    writeScope: [...(intent.writeScope ?? [])],
+    effectCeiling: "CANDIDATE" as const,
+    claimCeiling: "CANDIDATE_READY" as const,
+    authorityPath: "tasks/g10/00-pilot.md",
+    authoritySha256: "b".repeat(64),
+    issuedAt: "2026-09-02T05:00:00.000Z",
+    expiresAt: "2099-09-02T07:00:00.000Z",
+    revocationState: "NOT_REVOKED" as const,
+    revokedAt: null,
+    revocationReason: null,
+    ...overrides,
+  };
+  return { ...payload, grantHash: hashNexusExecutionGrant(payload as any) };
+}
+
+function governedRef(): NexusExecutionGrantRef {
+  return {
+    repository: "James3014/Nexus-new",
+    revision: "c".repeat(40),
+    grantPath: "tasks/g10/grant.json",
+    grantSha256: "d".repeat(64),
+    authorityPath: "tasks/g10/00-pilot.md",
+    authoritySha256: "b".repeat(64),
+  };
 }
 
 const mockProfiles: LocalAgentProfile[] = [
@@ -246,6 +334,384 @@ test("AC-3 executionContract writePaths are durable", async () => {
     assert.deepEqual(record.executionContract?.writePaths, ["src", "tests"]);
     assert.equal(record.executionContract?.maxFiles, 2);
     assert.equal(record.executionContract?.maxWallMs, 5000);
+  } finally {
+    f.clean();
+    clean();
+  }
+});
+
+test("R2 dispatchIntent is durable, injected into the worker prompt, and never upgrades DONE to VERIFIED", async () => {
+  const f = setupGitFixture();
+  let observedPrompt = "";
+  const { manager, clean, stateDir } = setupManager({}, undefined, async (_agentId: string, promptFile: string) => {
+    observedPrompt = readFileSync(promptFile, "utf8");
+    return undefined;
+  });
+  try {
+    const intent = controllerDispatchIntent("attempt-r2-durable", ["src"]);
+    const started = await manager.startAgent({
+      workspaceId: "ws_r2",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "Implement the bounded change.",
+      profiles: mockProfiles,
+      attemptKey: "attempt-r2-durable",
+      executionContract: { dispatchIntent: intent, writePaths: ["src"] },
+    });
+    assert.equal(started.dispatch?.taskId, intent.taskId);
+    assert.equal(started.dispatch?.claimCeiling, "CANDIDATE_READY");
+    assert.match(observedPrompt, /DEVSPACE DISPATCH CONTRACT/);
+    assert.match(observedPrompt, /Do not broaden scope or claim VERIFIED, ACCEPTED, MERGED, DEPLOYED, or RELEASED/);
+    assert.match(observedPrompt, /Implement the bounded change/);
+
+    const reopened = new LocalAgentStore(stateDir);
+    try {
+      const persisted = reopened.getById(started.agentId)!;
+      assert.deepEqual(persisted.executionContract?.dispatchIntent, intent);
+    } finally {
+      reopened.close();
+    }
+
+    settleForContinuation(manager, started.agentId, { latestResponse: "DONE", terminalReason: "completed" });
+    const status = await manager.getAgentStatus({
+      workspaceId: "ws_r2",
+      workspaceRoot: f.repo,
+      agentId: started.agentId,
+    });
+    assert.equal(status.latestResponse, "DONE");
+    assert.equal(status.dispatch?.claimCeiling, "CANDIDATE_READY");
+    assert.equal((status as any).verified, undefined);
+    assert.equal((status as any).accepted, undefined);
+    assert.equal((status as any).merged, undefined);
+  } finally {
+    f.clean();
+    clean();
+  }
+});
+
+test("G9 NEXUS_GOVERNED rejects mismatched canonical grant before durable record or worker launch", async () => {
+  const f = setupGitFixture();
+  let launches = 0;
+  const intent = controllerDispatchIntent("attempt-g9-reject", ["src"]);
+  const badGrant = governedGrant(intent, f.head, { profile: "different-profile" });
+  const { manager, clean } = setupManager(
+    {},
+    undefined,
+    async () => { launches += 1; },
+    async () => badGrant,
+  );
+  try {
+    await assert.rejects(
+      manager.startAgent({
+        workspaceId: "ws_g9_reject",
+        workspaceRoot: f.repo,
+        profileName: "reviewer",
+        prompt: "must never launch",
+        profiles: mockProfiles,
+        attemptKey: intent.attemptId,
+        executionContract: {
+          authorityMode: "NEXUS_GOVERNED",
+          nexusGrant: governedRef(),
+          dispatchIntent: intent,
+          expectedHead: f.head,
+          writePaths: ["src"],
+        },
+      }),
+      (error: any) => error instanceof AgentSessionError && error.code === "NEXUS_AUTHORITY_REJECTED" && /profile mismatch/.test(error.message),
+    );
+    assert.equal(launches, 0);
+    assert.equal(manager.listAgents({ workspaceId: "ws_g9_reject" }).length, 0);
+  } finally {
+    f.clean();
+    clean();
+  }
+});
+
+test("G9 NEXUS_GOVERNED starts only after canonical grant validation and revalidates before continuation", async () => {
+  const f = setupGitFixture();
+  let launches = 0;
+  let validations = 0;
+  const intent = controllerDispatchIntent("attempt-g9-valid", ["src"]);
+  const validGrant = governedGrant(intent, f.head);
+  const revokedGrant = governedGrant(intent, f.head, {
+    revocationState: "REVOKED",
+    revokedAt: "2026-09-02T06:00:00.000Z",
+    revocationReason: "owner revoked",
+  });
+  const { manager, clean } = setupManager(
+    {},
+    undefined,
+    async () => { launches += 1; },
+    async () => (++validations === 1 ? validGrant : revokedGrant),
+  );
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_g9_valid",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "bounded governed work",
+      profiles: mockProfiles,
+      attemptKey: intent.attemptId,
+      executionContract: {
+        authorityMode: "NEXUS_GOVERNED",
+        nexusGrant: governedRef(),
+        dispatchIntent: intent,
+        expectedHead: f.head,
+        writePaths: ["src"],
+      },
+    });
+    assert.equal(launches, 1);
+    assert.equal(validations, 1);
+    settleForContinuation(manager, started.agentId, { latestResponse: "DONE", terminalReason: "completed" });
+
+    await assert.rejects(
+      manager.continueAgent({
+        workspaceId: "ws_g9_valid",
+        workspaceRoot: f.repo,
+        agentId: started.agentId,
+        prompt: "must not relaunch after revocation",
+        profiles: mockProfiles,
+      }),
+      (error: any) => error instanceof AgentSessionError && error.code === "NEXUS_AUTHORITY_REJECTED" && /revoked/.test(error.message),
+    );
+    assert.equal(validations, 2);
+    assert.equal(launches, 1);
+  } finally {
+    f.clean();
+    clean();
+  }
+});
+
+test("R2 controller dispatch requires a durable attemptKey before worker launch", async () => {
+  const f = setupGitFixture();
+  const { manager, clean } = setupManager();
+  try {
+    await assert.rejects(
+      manager.startAgent({
+        workspaceId: "ws_r2_attempt",
+        workspaceRoot: f.repo,
+        profileName: "reviewer",
+        prompt: "do work",
+        profiles: mockProfiles,
+        executionContract: {
+          dispatchIntent: controllerDispatchIntent("attempt-r2-required", ["src"]),
+          writePaths: ["src"],
+        },
+      }),
+      (error: any) => error instanceof AgentSessionError && error.code === "INVALID_ATTEMPT_KEY",
+    );
+    assert.equal(manager.listAgents({ workspaceId: "ws_r2_attempt" }).length, 0);
+  } finally {
+    f.clean();
+    clean();
+  }
+});
+
+test("R2 semantic attemptId must exactly match durable attemptKey", async () => {
+  const f = setupGitFixture();
+  const { manager, clean } = setupManager();
+  try {
+    await assert.rejects(
+      manager.startAgent({
+        workspaceId: "ws_r2_attempt_match",
+        workspaceRoot: f.repo,
+        profileName: "reviewer",
+        prompt: "do work",
+        profiles: mockProfiles,
+        attemptKey: "attempt-physical",
+        executionContract: {
+          dispatchIntent: controllerDispatchIntent("attempt-semantic", ["src"]),
+          writePaths: ["src"],
+        },
+      }),
+      (error: any) => error instanceof AgentSessionError &&
+        error.code === "INVALID_ATTEMPT_KEY" &&
+        /must exactly match durable attemptKey/.test(error.message),
+    );
+    assert.equal(manager.listAgents({ workspaceId: "ws_r2_attempt_match" }).length, 0);
+  } finally {
+    f.clean();
+    clean();
+  }
+});
+
+test("R2 dispatchIntent and executionContract cannot define different write-scope authorities", async () => {
+  const f = setupGitFixture();
+  const { manager, clean } = setupManager();
+  try {
+    await assert.rejects(
+      manager.startAgent({
+        workspaceId: "ws_r2_scope",
+        workspaceRoot: f.repo,
+        profileName: "reviewer",
+        prompt: "do work",
+        profiles: mockProfiles,
+        attemptKey: "attempt-r2-scope",
+        executionContract: {
+          dispatchIntent: controllerDispatchIntent("attempt-r2-scope", ["src"]),
+          writePaths: ["tests"],
+        },
+      }),
+      /writeScope must exactly match executionContract\.writePaths/,
+    );
+  } finally {
+    f.clean();
+    clean();
+  }
+});
+
+test("R3 duplicate controller attempt replays exactly and rejects materially changed intent", async () => {
+  const f = setupGitFixture();
+  const { manager, clean } = setupManager();
+  try {
+    const intent = controllerDispatchIntent("attempt-r3-replay", ["src"]);
+    const input = {
+      workspaceId: "ws_r3_replay",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "bounded replay work",
+      profiles: mockProfiles,
+      attemptKey: "attempt-r3-replay",
+      executionContract: { dispatchIntent: intent, writePaths: ["src"] },
+    };
+    const first = await manager.startAgent(input);
+    const replay = await manager.startAgent(input);
+    assert.equal(replay.agentId, first.agentId);
+
+    await assert.rejects(
+      manager.startAgent({
+        ...input,
+        executionContract: {
+          dispatchIntent: { ...intent, objective: "Materially different objective." },
+          writePaths: ["src"],
+        },
+      }),
+      (error: any) => error instanceof AgentSessionError && error.code === "ATTEMPT_REPLAY_CONFLICT",
+    );
+  } finally {
+    f.clean();
+    clean();
+  }
+});
+
+test("R3 same-workspace overlapping mutation ownership is rejected while disjoint ownership remains dispatchable", async () => {
+  const f = setupGitFixture();
+  const { manager, clean } = setupManager();
+  try {
+    const first = await manager.startAgent({
+      workspaceId: "ws_r3",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "first",
+      profiles: mockProfiles,
+      attemptKey: "attempt-r3-a",
+      executionContract: {
+        dispatchIntent: controllerDispatchIntent("attempt-r3-a", ["src/a"]),
+        writePaths: ["src/a"],
+      },
+    });
+    assert.equal(first.status, "starting");
+
+    await assert.rejects(
+      manager.startAgent({
+        workspaceId: "ws_r3",
+        workspaceRoot: f.repo,
+        profileName: "reviewer",
+        prompt: "overlap",
+        profiles: mockProfiles,
+        attemptKey: "attempt-r3-overlap",
+        executionContract: {
+          dispatchIntent: controllerDispatchIntent("attempt-r3-overlap", ["src"]),
+          writePaths: ["src"],
+        },
+      }),
+      (error: any) => error instanceof AgentSessionError && error.code === "OVERLAPPING_MUTATION_OWNERSHIP",
+    );
+
+    const disjoint = await manager.startAgent({
+      workspaceId: "ws_r3",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "disjoint",
+      profiles: mockProfiles,
+      attemptKey: "attempt-r3-b",
+      executionContract: {
+        dispatchIntent: controllerDispatchIntent("attempt-r3-b", ["tests"]),
+        writePaths: ["tests"],
+      },
+    });
+    assert.equal(disjoint.status, "starting");
+  } finally {
+    f.clean();
+    clean();
+  }
+});
+
+test("R3 identical write paths remain parallelizable when physical workspace roots are isolated", async () => {
+  const firstRepo = setupGitFixture();
+  const secondRepo = setupGitFixture();
+  const { manager, clean } = setupManager();
+  try {
+    const first = await manager.startAgent({
+      workspaceId: "ws_r3_isolated_a",
+      workspaceRoot: firstRepo.repo,
+      profileName: "reviewer",
+      prompt: "first isolated mutation",
+      profiles: mockProfiles,
+      attemptKey: "attempt-r3-isolated-a",
+      executionContract: {
+        dispatchIntent: controllerDispatchIntent("attempt-r3-isolated-a", ["src"]),
+        writePaths: ["src"],
+      },
+    });
+    const second = await manager.startAgent({
+      workspaceId: "ws_r3_isolated_b",
+      workspaceRoot: secondRepo.repo,
+      profileName: "reviewer",
+      prompt: "second isolated mutation",
+      profiles: mockProfiles,
+      attemptKey: "attempt-r3-isolated-b",
+      executionContract: {
+        dispatchIntent: controllerDispatchIntent("attempt-r3-isolated-b", ["src"]),
+        writePaths: ["src"],
+      },
+    });
+    assert.equal(first.status, "starting");
+    assert.equal(second.status, "starting");
+  } finally {
+    firstRepo.clean();
+    secondRepo.clean();
+    clean();
+  }
+});
+
+test("R3 mutation dispatch fails closed when an active same-workspace worker has unprovable ownership", async () => {
+  const f = setupGitFixture();
+  const { manager, clean } = setupManager();
+  try {
+    await manager.startAgent({
+      workspaceId: "ws_r3_unknown",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "legacy active worker with unknown write ownership",
+      profiles: mockProfiles,
+    });
+
+    await assert.rejects(
+      manager.startAgent({
+        workspaceId: "ws_r3_unknown",
+        workspaceRoot: f.repo,
+        profileName: "reviewer",
+        prompt: "new bounded mutation",
+        profiles: mockProfiles,
+        attemptKey: "attempt-r3-unknown",
+        executionContract: {
+          dispatchIntent: controllerDispatchIntent("attempt-r3-unknown", ["src"]),
+          writePaths: ["src"],
+        },
+      }),
+      (error: any) => error instanceof AgentSessionError && error.code === "OVERLAPPING_MUTATION_OWNERSHIP",
+    );
   } finally {
     f.clean();
     clean();
@@ -1436,6 +1902,7 @@ test("G3 TEST U/W — verified termination unlocks continuation with a new turn"
       workspaceRoot: f.repo,
       profileName: "reviewer",
       provider: "codex",
+      executionGeneration: syntheticExecutionGeneration(manager, "codex"),
       executionContract: { maxStartupMs: 20 },
     });
     const promptFile = LocalAgentSessionManager.writePromptFile("turn A");
@@ -2606,6 +3073,7 @@ test("G3 TEST W — successful termination unlocks continuation", async () => {
       workspaceRoot: f.repo,
       profileName: "reviewer",
       provider: "claude",
+      executionGeneration: syntheticExecutionGeneration(manager, "claude"),
       lifecycleKind: "detached_worker_v2",
       executionContract: {
         maxStartupMs: 40,
@@ -2652,6 +3120,7 @@ test("G3 TEST X — stale cleanup callback cannot touch newer generation", async
       workspaceRoot: f.repo,
       profileName: "reviewer",
       provider: "claude",
+      executionGeneration: syntheticExecutionGeneration(manager, "claude"),
       lifecycleKind: "detached_worker_v2",
       executionContract: { maxStartupMs: 40 },
     });

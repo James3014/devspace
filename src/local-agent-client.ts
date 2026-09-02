@@ -155,7 +155,7 @@ export class LocalAgentClient {
 
   private async ensureReadyInternal(): Promise<BetterResult<LocalAgentDaemonStatus, AgentDaemonError>> {
     const existing = await this.tryHello();
-    if (existing.isErr()) return existing;
+    if (existing.isErr()) return Result.err(existing.error);
     if (existing.value) return Result.ok(existing.value);
 
     try {
@@ -179,7 +179,7 @@ export class LocalAgentClient {
         if (
           ready.error.code === "DAEMON_PROTOCOL_MISMATCH"
           || ready.error.code === "DAEMON_INVALID_RESPONSE"
-        ) return ready;
+        ) return Result.err(ready.error);
         continue;
       }
       if (ready.value) return Result.ok(ready.value);
@@ -195,7 +195,7 @@ export class LocalAgentClient {
 
   private async tryHello(): Promise<BetterResult<LocalAgentDaemonStatus | undefined, AgentDaemonError>> {
     const authToken = this.authTokenResult("hello");
-    if (authToken.isErr()) return authToken;
+    if (authToken.isErr()) return Result.err(authToken.error);
     const response = await sendRequest(this.endpoint, {
       requestId: randomUUID(),
       protocolVersion: LOCAL_AGENT_DAEMON_PROTOCOL_VERSION,
@@ -208,7 +208,7 @@ export class LocalAgentClient {
         response.error.code === "DAEMON_UNAVAILABLE"
         || response.error.code === "DAEMON_TIMEOUT"
       ) return Result.ok(undefined);
-      return response;
+      return Result.err(response.error);
     }
     if (!response.value.ok) {
       const error = decodeRemoteError(response.value.error, "hello");
@@ -564,6 +564,7 @@ function isRequestError(
     AgentProviderCancelledError: () => "provider" as const,
     AgentProviderProtocolError: () => "provider" as const,
     AgentProviderExecutionError: () => "provider" as const,
+    AgentProviderFailureError: () => "provider" as const,
     AgentDaemonUnavailableError: () => "daemon" as const,
     AgentDaemonStartupError: () => "daemon" as const,
     AgentDaemonTimeoutError: () => "daemon" as const,

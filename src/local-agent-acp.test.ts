@@ -479,3 +479,131 @@ await grokConfigurationRuntime.close();
 await resumedRuntime.close();
 await resumedRuntime.close();
 assert.equal(resumedRuntime.isAlive(), false);
+
+// Cline entitlement emitted on stderr must survive the ACP runtime boundary.
+{
+  const clineQueues = new Map<string, { values: unknown[] }>();
+  let clineSetConfigCalls = 0;
+  const clineConnection = {
+    agent: {
+      async request(method: string, params?: unknown): Promise<unknown> {
+        const input = params as { sessionId?: string } | undefined;
+        if (method === "session/new") {
+          const sessionId = "cline_entitlement_session";
+          clineQueues.set(sessionId, { values: [] });
+          return {
+            sessionId,
+            configOptions: [
+              {
+                type: "select",
+                category: "model",
+                id: "model",
+                options: [{ value: "cline-pass/glm-5.3-flash" }],
+              },
+              {
+                type: "select",
+                category: "thought_level",
+                id: "effort",
+                options: [{ value: "high" }],
+              },
+            ],
+          };
+        }
+        if (method === "session/set_config_option") {
+          clineSetConfigCalls += 1;
+          return {};
+        }
+        if (method === "session/prompt") return { stopReason: "error" };
+        const sessionId = input?.sessionId;
+        if (sessionId && !clineQueues.has(sessionId)) clineQueues.set(sessionId, { values: [] });
+        return {};
+      },
+    },
+    close() {},
+    closed: new Promise<void>(() => undefined),
+  };
+  const clineRuntime = new AcpRuntime({
+    provider: "cline",
+    command: "cline",
+    args: ["--acp"],
+    env: {},
+    queues: clineQueues,
+    stderrTail: () => "No access to ClinePass subscription models yet. Please upgrade your subscription.",
+  }, clineConnection);
+  const clineEntitlement = await clineRuntime.run({
+    prompt: "read only",
+    workspaceRoot: "/tmp/project",
+    model: "cline-pass/glm-5.3-flash",
+    effort: "high",
+    writeMode: "read_only",
+  });
+  assert.equal(clineEntitlement.isErr(), true);
+  if (clineEntitlement.isErr()) {
+    assert.equal(clineEntitlement.error.code, "CLINEPASS_ENTITLEMENT_REQUIRED");
+    assert.equal(clineEntitlement.error.retryable, false);
+    assert.equal(clineEntitlement.error.errorClass, "ENTITLEMENT_REQUIRED");
+    assert.equal(clineEntitlement.error.providerSessionId, "cline_entitlement_session");
+  }
+  assert.equal(clineSetConfigCalls, 0, "Cline exact CLI model/effort must not be re-applied through ACP config options");
+  await clineRuntime.close();
+
+  const clineDriver = new AcpLocalAgentDriver("cline", {}, () => "cline");
+  const clineKeyHigh = clineDriver.runtimeKey({
+    agentId: "cline-high",
+    provider: "cline",
+    workspaceRoot: "/tmp/project",
+    model: "cline-pass/glm-5.3-flash",
+    effort: "high",
+    writeMode: "read_only",
+  });
+  const clineKeyMedium = clineDriver.runtimeKey({
+    agentId: "cline-medium",
+    provider: "cline",
+    workspaceRoot: "/tmp/project",
+    model: "cline-pass/glm-5.3-flash",
+    effort: "medium",
+    writeMode: "read_only",
+  });
+  assert.notEqual(clineKeyHigh, clineKeyMedium, "Cline process runtime keys must bind process-level model/effort");
+}
+
+// Regression tests for Grok & Cline canonical resolver parity
+{
+  const tempHome = await mkdtemp(join(tmpdir(), "devspace-acp-resolver-test-"));
+  try {
+    const grokBinDir = join(tempHome, ".grok", "bin");
+    await mkdir(grokBinDir, { recursive: true });
+    const grokBin = join(grokBinDir, "grok");
+    await writeFile(grokBin, "#!/bin/sh\nexit 0\n");
+    await chmod(grokBin, 0o755);
+
+    const clineBinDir = join(tempHome, ".npm-global", "lib", "node_modules", "cline", "bin");
+    await mkdir(clineBinDir, { recursive: true });
+    const clineBin = join(clineBinDir, ".cline");
+    await writeFile(clineBin, "#!/bin/sh\nexit 0\n");
+    await chmod(clineBin, 0o755);
+
+    const testEnv: NodeJS.ProcessEnv = {
+      HOME: tempHome,
+      PATH: "/usr/bin:/bin", // explicitly does NOT contain grok or cline in PATH
+    };
+
+    // Grok resolution parity: ~/.grok/bin/grok is resolved through resolveAcpCommand
+    assert.equal(resolveAcpCommand("grok", testEnv), grokBin);
+    // Explicit GROK_COMMAND has highest priority
+    const explicitGrok = join(tempHome, "custom-grok");
+    await writeFile(explicitGrok, "#!/bin/sh\nexit 0\n");
+    await chmod(explicitGrok, 0o755);
+    assert.equal(resolveAcpCommand("grok", { ...testEnv, GROK_COMMAND: explicitGrok }), explicitGrok);
+
+    // Cline resolution parity: ~/.npm-global/.../.cline is resolved through resolveAcpCommand
+    assert.equal(resolveAcpCommand("cline", testEnv), clineBin);
+    // Explicit CLINE_COMMAND has highest priority
+    const explicitCline = join(tempHome, "custom-cline");
+    await writeFile(explicitCline, "#!/bin/sh\nexit 0\n");
+    await chmod(explicitCline, 0o755);
+    assert.equal(resolveAcpCommand("cline", { ...testEnv, CLINE_COMMAND: explicitCline }), explicitCline);
+  } finally {
+    await rm(tempHome, { recursive: true, force: true });
+  }
+}

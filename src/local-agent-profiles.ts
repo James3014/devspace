@@ -1,6 +1,7 @@
 import { existsSync } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
-import { basename, join, resolve } from "node:path";
+import { basename, join, relative, resolve } from "node:path";
+import { spawnSync } from "node:child_process";
 import { parse as parseYaml } from "yaml";
 import type { ServerConfig } from "./config.js";
 
@@ -13,7 +14,8 @@ export type LocalAgentProvider =
   | "cursor"
   | "copilot"
   | "grok"
-  | "agy";
+  | "agy"
+  | "cline";
 
 export const LOCAL_AGENT_PROVIDERS: readonly LocalAgentProvider[] = [
   "codex",
@@ -25,6 +27,7 @@ export const LOCAL_AGENT_PROVIDERS: readonly LocalAgentProvider[] = [
   "copilot",
   "grok",
   "agy",
+  "cline",
 ];
 
 export type WriteMode = "read_only" | "allowed";
@@ -36,6 +39,14 @@ export interface LocalAgentProfile {
   model?: string;
   effort?: string;
   write_mode?: WriteMode;
+  /**
+   * Repository-local profiles may explicitly extend a global profile and
+   * override it. Silent same-name overrides are prohibited: a conflicting
+   * repository definition must either declare an explicit tracked override
+   * relationship or fail closed as PROFILE_AUTHORITY_CONFLICT.
+   */
+  extends?: string;
+  override?: boolean;
   filePath: string;
   body: string;
   disabled: boolean;
@@ -48,6 +59,32 @@ export interface LocalAgentProfileSummary {
   model?: string;
   effort?: string;
   write_mode?: WriteMode;
+}
+
+/**
+ * Profile authority states. Every loaded profile is always visible with an
+ * explicit state; profiles never silently disappear from diagnostics, and
+ * non-ready states are never dispatchable.
+ */
+export type LocalAgentProfileState =
+  | "ready"
+  | "disabled"
+  | "untracked_repository_profile"
+  | "profile_authority_conflict";
+
+export type LocalAgentProfileSource = "global" | "repository";
+
+export interface LocalAgentProfileStatusInfo {
+  state: LocalAgentProfileState;
+  sources: LocalAgentProfileSource[];
+  /** Git-tracked status of a repository-local profile file. */
+  tracked?: boolean;
+  diagnostic?: string;
+}
+
+export interface LocalAgentProfileEntry {
+  profile: LocalAgentProfile;
+  status: LocalAgentProfileStatusInfo;
 }
 
 interface ParsedFrontmatter {
@@ -63,23 +100,204 @@ export async function loadLocalAgentProfiles(
   workspaceRoot: string,
   options: { includeDisabled?: boolean } = {},
 ): Promise<LocalAgentProfile[]> {
+  const entries = await loadLocalAgentProfileEntries(config, workspaceRoot);
+  return entries
+    .filter((entry) =>
+      entry.status.state === "ready"
+      || (options.includeDisabled && entry.status.state === "disabled")
+    )
+    .map((entry) => entry.profile)
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+/**
+ * Single authoritative profile loader. Loads global machine profiles and
+ * repository profiles, applies the owner-approved authority rules, and returns
+ * every profile with an explicit state:
+ *
+ * - Global profiles (~/.devspace/agents) are the machine/provider capability
+ *   authority.
+ * - Repository profiles (<workspace>/.devspace/agents) are project execution
+ *   policy and must be Git-tracked to be dispatchable.
+ * - Untracked repository profiles are diagnostic-only and never dispatchable.
+ * - Same name with different definitions fails closed as
+ *   PROFILE_AUTHORITY_CONFLICT unless the repository profile is tracked and
+ *   explicitly declares `extends` + `override: true`.
+ */
+export async function loadLocalAgentProfileEntries(
+  config: ServerConfig,
+  workspaceRoot: string,
+): Promise<LocalAgentProfileEntry[]> {
   if (!config.subagents.enabled) return [];
 
-  const profileDirs = [
-    config.devspaceAgentsDir,
-    join(workspaceRoot, ".devspace", "agents"),
-  ];
-  const profilesByName = new Map<string, LocalAgentProfile>();
+  const globalDir = resolve(config.devspaceAgentsDir);
+  const repoDir = resolve(join(workspaceRoot, ".devspace", "agents"));
 
-  for (const directory of profileDirs) {
-    for (const profile of await loadProfilesFromDirectory(directory)) {
-      profilesByName.set(profile.name, profile);
-    }
+  const globalProfiles = await loadProfilesFromDirectory(globalDir);
+  const repoProfiles = await loadProfilesFromDirectory(repoDir);
+  const repoTracking = new Map<string, { tracked: boolean; nonGit: boolean }>();
+  for (const profile of repoProfiles) {
+    const probe = isPathGitTracked(workspaceRoot, profile.filePath);
+    repoTracking.set(profile.filePath, { tracked: probe === true, nonGit: probe === "non_git" });
   }
 
-  return Array.from(profilesByName.values())
-    .filter((profile) => options.includeDisabled || !profile.disabled)
-    .sort((a, b) => a.name.localeCompare(b.name));
+  const byName = new Map<string, LocalAgentProfileEntry>();
+
+  for (const profile of globalProfiles) {
+    byName.set(profile.name, {
+      profile,
+      status: {
+        state: profile.disabled ? "disabled" : "ready",
+        sources: ["global"],
+      },
+    });
+  }
+
+  for (const profile of repoProfiles) {
+    const tracking = repoTracking.get(profile.filePath) ?? { tracked: false, nonGit: false };
+    const tracked = tracking.tracked;
+    const existing = byName.get(profile.name);
+    if (!existing) {
+      byName.set(profile.name, repositoryOnlyEntry(profile, tracked, tracking.nonGit));
+      continue;
+    }
+
+    const mergedSources: LocalAgentProfileSource[] =
+      existing.status.sources.includes("global")
+        ? [...existing.status.sources, "repository"]
+        : ["repository"];
+
+    if (profilesEquivalent(existing.profile, profile)) {
+      byName.set(profile.name, {
+        profile,
+        status: {
+          state: existing.profile.disabled || profile.disabled ? "disabled" : "ready",
+          sources: mergedSources,
+          tracked,
+        },
+      });
+      continue;
+    }
+
+    if (
+      tracked === true
+      && profile.override === true
+      && profile.extends !== undefined
+      && normalizeExtendsTarget(profile.extends) === profile.name
+      && !profile.disabled
+    ) {
+      byName.set(profile.name, {
+        profile,
+        status: {
+          state: "ready",
+          sources: mergedSources,
+          tracked,
+          diagnostic: `repository profile explicitly overrides global profile '${profile.name}' (tracked, extends+override)`,
+        },
+      });
+      continue;
+    }
+
+    byName.set(profile.name, {
+      profile: existing.profile,
+      status: {
+        state: "profile_authority_conflict",
+        sources: mergedSources,
+        tracked,
+        diagnostic:
+          `PROFILE_AUTHORITY_CONFLICT: global profile '${existing.profile.filePath}' and repository profile '${profile.filePath}' `
+          + `define different definitions for '${profile.name}'. A repository profile may only override a global profile `
+          + `when it is Git-tracked and declares 'extends: global:${profile.name}' with 'override: true'.`,
+      },
+    });
+  }
+
+  return Array.from(byName.values()).sort((a, b) =>
+    a.profile.name.localeCompare(b.profile.name),
+  );
+}
+
+function repositoryOnlyEntry(
+  profile: LocalAgentProfile,
+  tracked: boolean,
+  nonGit: boolean,
+): LocalAgentProfileEntry {
+  if (profile.disabled) {
+    return {
+      profile,
+      status: { state: "disabled", sources: ["repository"], tracked },
+    };
+  }
+  if (nonGit) {
+    return {
+      profile,
+      status: {
+        state: "ready",
+        sources: ["repository"],
+        diagnostic:
+          "workspace is not a Git worktree; repository-local profile tracking cannot be verified",
+      },
+    };
+  }
+  if (!tracked) {
+    return {
+      profile,
+      status: {
+        state: "untracked_repository_profile",
+        sources: ["repository"],
+        tracked: false,
+        diagnostic:
+          `UNTRACKED_REPOSITORY_PROFILE: '${profile.filePath}' is not Git-tracked. It is visible here for `
+          + `diagnostics but is NOT advertised and NOT dispatchable. Commit the profile or move it to the `
+          + `global agents directory (~/.devspace/agents).`,
+      },
+    };
+  }
+  return { profile, status: { state: "ready", sources: ["repository"], tracked: true } };
+}
+
+function profilesEquivalent(a: LocalAgentProfile, b: LocalAgentProfile): boolean {
+  return a.description === b.description
+    && a.provider === b.provider
+    && (a.model ?? undefined) === (b.model ?? undefined)
+    && (a.effort ?? undefined) === (b.effort ?? undefined)
+    && (a.write_mode ?? undefined) === (b.write_mode ?? undefined)
+    && a.body === b.body
+    && a.disabled === b.disabled;
+}
+
+function normalizeExtendsTarget(value: string): string {
+  return value.trim().replace(/^global:/, "");
+}
+
+/**
+ * Returns true when the file is tracked by Git in the repository containing
+ * workspaceRoot, false when it is untracked, and "non_git" when workspaceRoot
+ * is not inside a Git worktree.
+ */
+export function isPathGitTracked(
+  workspaceRoot: string,
+  filePath: string,
+  run: typeof spawnSync = spawnSync,
+): boolean | "non_git" {
+  try {
+    const inside = run("git", ["-C", workspaceRoot, "rev-parse", "--is-inside-work-tree"], {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 5_000,
+    });
+    if (inside.status !== 0 || inside.stdout?.trim() !== "true") return "non_git";
+    const rel = relative(resolve(workspaceRoot), resolve(filePath));
+    if (rel.startsWith("..")) return false;
+    const listed = run("git", ["-C", workspaceRoot, "ls-files", "--", rel], {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 5_000,
+    });
+    return listed.status === 0 && Boolean(listed.stdout?.trim().length);
+  } catch {
+    return false;
+  }
 }
 
 export function summarizeLocalAgentProfile(
@@ -170,6 +388,7 @@ function profileFromFrontmatter(
     throw new Error(`Subagent profile is missing description: ${filePath}`);
   }
 
+  const override = frontmatter.override === true ? true : undefined;
   return {
     name,
     description,
@@ -177,6 +396,8 @@ function profileFromFrontmatter(
     model: readString(frontmatter, "model"),
     effort: readString(frontmatter, "effort") ?? readString(frontmatter, "thinking"),
     write_mode: readWriteMode(frontmatter, filePath),
+    extends: readString(frontmatter, "extends"),
+    override,
     filePath,
     body,
     disabled: frontmatter.disabled === true,
@@ -190,7 +411,7 @@ function readProvider(frontmatter: Record<string, unknown>, filePath: string): L
   }
   if (!PROVIDERS.has(provider as LocalAgentProvider)) {
     throw new Error(
-      `Subagent profile provider must be codex, claude, opencode, omp, pi, cursor, copilot, grok, or agy: ${filePath}`,
+      `Subagent profile provider must be codex, claude, opencode, omp, pi, cursor, copilot, grok, agy, or cline: ${filePath}`,
     );
   }
   return provider as LocalAgentProvider;

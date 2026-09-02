@@ -8,10 +8,14 @@ import type {
   SessionV2Info,
 } from "@opencode-ai/sdk/v2";
 import {
+  AgentProviderFailureError,
   AgentProviderProtocolError,
   AgentProviderUnavailableError,
   captureAgentProviderResult,
+  type AgentProviderFailureClass,
+  type AgentProviderFailureCode,
 } from "./local-agent-errors.js";
+import { getOpencodeCatalogGeneration } from "./local-agent-opencode-catalog.js";
 import type {
   LocalAgentDriver,
   LocalAgentRunCallbacks,
@@ -78,7 +82,13 @@ export class OpencodeRuntime implements LocalAgentRuntime {
           }
           const promptResult = await promptOpencodeSession(this.client, sessionId, input);
           await callbacks?.onActivity?.();
-          await waitForOpencodeSession(this.client, sessionId, promptResult, callbacks?.onActivity);
+          const modelInfo = {
+            model: input.model,
+            variant: initialModel?.variant ?? input.effort,
+          };
+          const promptFailure = extractOpencodeFailureFromPayload(promptResult, sessionId, modelInfo);
+          if (promptFailure) throw promptFailure;
+          await waitForOpencodeSession(this.client, sessionId, promptResult, callbacks?.onActivity, modelInfo);
           const promptId = extractOpenCodePromptId(promptResult);
           const messages = await readOpencodeMessages(this.client, sessionId, promptId);
           const finalResponse = requireFinalResponse(
@@ -138,7 +148,7 @@ export class OpencodeLocalAgentDriver implements LocalAgentDriver {
   private readonly factory: OpencodeFactory;
 
   runtimeKey(_context: LocalAgentRuntimeContext): string {
-    return "opencode:default";
+    return `opencode:default:${getOpencodeCatalogGeneration()}`;
   }
 
   async createRuntime(context: LocalAgentRuntimeContext) {
@@ -313,6 +323,7 @@ async function waitForOpencodeSession(
   sessionId: string,
   promptResult: unknown,
   onActivity?: () => void | Promise<void>,
+  modelInfo: { model?: string; variant?: string } = {},
 ): Promise<void> {
   // OpenCode 1.18 accepts the prompt before its foreground drain is ready.
   // Its wait endpoint rejects that state and can keep rejecting after the
@@ -331,6 +342,11 @@ async function waitForOpencodeSession(
   let previousActivityFingerprint: string | undefined;
   while (true) {
     const messages = await readOpencodeMessages(client, sessionId, promptId);
+    // Root-cause fail-fast: any provider-reported failure terminal-immediately
+    // with the original failure class. Never wait for an idle timeout shadow.
+    const failure = extractOpencodeFailureFromMessages(messages, sessionId, modelInfo)
+      ?? extractOpencodeFailureFromPayload(promptResult, sessionId, modelInfo);
+    if (failure) throw failure;
     const activity = await active({ throwOnError: true });
     const running = isOpenCodeSessionActive(activity, sessionId);
     if (running) observedActive = true;
@@ -533,6 +549,145 @@ function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined;
+}
+
+export interface OpencodeFailureInfo {
+  code: AgentProviderFailureCode;
+  errorClass: AgentProviderFailureClass;
+  retryable: boolean;
+  message: string;
+}
+
+/**
+ * Classifies a provider-reported failure string into the typed root-cause
+ * taxonomy. Provider class names (SessionRunnerModel.*Error) take precedence,
+ * then generic provider error text. Unknown failures return undefined so the
+ * caller keeps existing semantics instead of inventing a wrong class.
+ */
+export function classifyOpencodeProviderError(raw: string): OpencodeFailureInfo | undefined {
+  const text = raw.trim();
+  if (!text) return undefined;
+  if (/VariantUnavailable/i.test(text)
+    || /variant.{0,24}(unavailable|not (found|supported)|unknown variant)/i.test(text)) {
+    return {
+      code: "PROVIDER_VARIANT_UNAVAILABLE",
+      errorClass: "VARIANT_UNAVAILABLE",
+      retryable: false,
+      message: `Requested reasoning variant is unavailable on this model: ${truncateErrorText(text)}`,
+    };
+  }
+  if (/ModelUnavailable/i.test(text)
+    || /model.{0,24}(unavailable|not (found|supported)|unknown model|does not exist)/i.test(text)) {
+    return {
+      code: "PROVIDER_MODEL_UNAVAILABLE",
+      errorClass: "MODEL_UNAVAILABLE",
+      retryable: false,
+      message: `Requested model is unavailable on this provider: ${truncateErrorText(text)}`,
+    };
+  }
+  if (/(unauthorized|unauthenticated|authentication|invalid api key|invalid token|permission denied|401|403)/i.test(text)) {
+    return {
+      code: "PROVIDER_AUTH_ERROR",
+      errorClass: "AUTH_FAILURE",
+      retryable: false,
+      message: `Provider authentication failed: ${truncateErrorText(text)}`,
+    };
+  }
+  if (/(quota|capacity|rate limit|resource_exhausted|overloaded|insufficient credits|429|503)/i.test(text)) {
+    return {
+      code: "PROVIDER_CAPACITY_ERROR",
+      errorClass: "QUOTA_CAPACITY",
+      retryable: true,
+      message: `Provider quota or capacity failure: ${truncateErrorText(text)}`,
+    };
+  }
+  if (/(timeout|timed out|deadline exceeded|etimedout)/i.test(text)) {
+    return {
+      code: "PROVIDER_TIMEOUT",
+      errorClass: "UPSTREAM_TIMEOUT",
+      retryable: true,
+      message: `Provider upstream timeout: ${truncateErrorText(text)}`,
+    };
+  }
+  return undefined;
+}
+
+function truncateErrorText(text: string): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  return normalized.length > 400 ? `${normalized.slice(0, 400)}...` : normalized;
+}
+
+function extractOpencodeFailureFromMessages(
+  response: SessionMessagesResponse,
+  sessionId: string,
+  modelInfo: { model?: string; variant?: string },
+): AgentProviderFailureError | undefined {
+  const root = unwrapProviderPayload(response);
+  const messages = Array.isArray(root) ? root : readArray(root, "messages");
+  if (!messages) return undefined;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const record = asRecord(messages[index]);
+    if (!record) continue;
+    const info = asRecord(record.info) ?? record;
+    const role = typeof info.role === "string" ? info.role : record.type;
+    const errorPayload = info.error ?? record.error;
+    if (errorPayload === undefined || errorPayload === null) continue;
+    if (role !== undefined && role !== "assistant" && role !== "user") continue;
+    return buildOpencodeFailure(errorPayload, sessionId, modelInfo);
+  }
+  return undefined;
+}
+
+function extractOpencodeFailureFromPayload(
+  payload: unknown,
+  sessionId: string,
+  modelInfo: { model?: string; variant?: string },
+): AgentProviderFailureError | undefined {
+  const record = asRecord(unwrapProviderPayload(payload));
+  if (!record) return undefined;
+  const info = asRecord(record.info) ?? record;
+  const errorPayload = info.error ?? record.error;
+  if (errorPayload === undefined || errorPayload === null) return undefined;
+  return buildOpencodeFailure(errorPayload, sessionId, modelInfo);
+}
+
+function buildOpencodeFailure(
+  errorPayload: unknown,
+  sessionId: string,
+  modelInfo: { model?: string; variant?: string },
+): AgentProviderFailureError {
+  const text = stringifyOpencodeErrorPayload(errorPayload);
+  const classification = classifyOpencodeProviderError(text);
+  const resolved = classification ?? {
+    code: "PROVIDER_EXECUTION_ERROR" as const,
+    errorClass: "PROVIDER_EXECUTION_ERROR" as string,
+    retryable: false,
+    message: `OpenCode provider reported a session failure: ${truncateErrorText(text)}`,
+  };
+  return new AgentProviderFailureError({
+    code: resolved.code as AgentProviderFailureCode,
+    provider: "opencode",
+    operation: "run",
+    retryable: resolved.retryable,
+    errorClass: resolved.errorClass as AgentProviderFailureClass,
+    ...(modelInfo.model ? { model: modelInfo.model } : {}),
+    ...(modelInfo.variant ? { variant: modelInfo.variant } : {}),
+    providerSessionId: sessionId,
+    providerMessage: truncateErrorText(text),
+    message: resolved.message,
+  });
+}
+
+function stringifyOpencodeErrorPayload(value: unknown): string {
+  if (typeof value === "string") return value;
+  const record = asRecord(value);
+  if (record) {
+    const name = typeof record.name === "string" ? record.name : undefined;
+    const message = typeof record.message === "string" ? record.message : undefined;
+    const dataText = record.data !== undefined ? stringifyOpencodeErrorPayload(record.data) : undefined;
+    return [name, message, dataText].filter(Boolean).join(" ");
+  }
+  return JSON.stringify(value);
 }
 
 function requireFinalResponse(response: string): string {

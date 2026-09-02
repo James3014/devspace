@@ -37,7 +37,32 @@ import {
   type CleanupResult,
   type ScratchHandle,
 } from "./provider-scratch.js";
+import type { ProfileCatalog } from "./local-agent-profile-source.js";
+import {
+  AgentProviderFailureError,
+  describeAgentProviderError,
+  isAgentProviderError,
+  type AgentProviderFailureDetails,
+} from "./local-agent-errors.js";
+import { validateOpencodeModelAndVariant } from "./local-agent-opencode-catalog.js";
 import { canonicalizePath, isPathInsideRoot } from "./roots.js";
+import {
+  assertNexusGrantAuthorizesExecution,
+  assertSameExecutionGeneration,
+  buildExecutionGenerationBinding,
+  hashDispatchIntent,
+  renderDispatchIntentForWorker,
+  validateDispatchIntent,
+  validateResolvedNexusExecutionGrant,
+  type AuthorityValidationEvidence,
+  type DispatchIntent,
+  type ExecutionGenerationBinding,
+  type NexusExecutionGrant,
+  type NexusExecutionGrantRef,
+  ExecutionProtocolError,
+} from "./execution-protocol.js";
+import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build-identity.js";
+import { devspaceConfigDir } from "./user-config.js";
 import {
   classifyScopeState,
   computeWorkerDelta,
@@ -51,6 +76,13 @@ import {
 export type AgentErrorCode =
   | "UNKNOWN_WORKSPACE"
   | "UNKNOWN_PROFILE"
+  | "PROFILE_DISABLED"
+  | "UNTRACKED_REPOSITORY_PROFILE"
+  | "PROFILE_AUTHORITY_CONFLICT"
+  | "PROVIDER_DISABLED"
+  | "PROVIDER_UNAVAILABLE"
+  | "EXACT_MODEL_UNAVAILABLE"
+  | "VARIANT_UNAVAILABLE"
   | "PROVIDER_UNAVAILABLE"
   | "UNKNOWN_AGENT"
   | "AGENT_WORKSPACE_MISMATCH"
@@ -65,9 +97,12 @@ export type AgentErrorCode =
   | "NO_EXECUTION_CAPACITY"
   | "TOOLCHAIN_UNAVAILABLE"
   | "INVALID_EXECUTION_CONTRACT"
+  | "OVERLAPPING_MUTATION_OWNERSHIP"
   | "INVALID_ATTEMPT_KEY"
   | "ATTEMPT_REPLAY_CONFLICT"
-  | "CONTINUATION_ADMISSION_FAILED";
+  | "CONTINUATION_ADMISSION_FAILED"
+  | "NEXUS_AUTHORITY_REJECTED"
+  | "REBIND_REQUIRED";
 
 export class AgentSessionError extends Error {
   constructor(
@@ -119,6 +154,7 @@ export interface StartAgentInput {
   profileName: string;
   prompt: string;
   profiles: LocalAgentProfile[];
+  profileCatalog?: ProfileCatalog;
   executionContract?: ExecutionContract;
   attemptKey?: string;
 }
@@ -128,6 +164,8 @@ export interface ContinueAgentInput {
   workspaceRoot: string;
   agentId: string;
   prompt: string;
+  profiles?: LocalAgentProfile[];
+  profileCatalog?: ProfileCatalog;
 }
 
 export interface GetAgentStatusInput {
@@ -154,6 +192,16 @@ export const AGENT_LIST_DEFAULT_LIMIT = 20;
 export const AGENT_LIST_MAX_LIMIT = 100;
 const TERMINATION_RETRY_BACKOFF_MS = 30_000;
 
+export interface DispatchContractOutput {
+  taskId: string;
+  attemptId: string;
+  roleIntent: string;
+  claimCeiling: string;
+  verificationRequired: boolean;
+  exclusiveOwnership: boolean;
+  intentHash: string;
+}
+
 export interface AgentStatusOutput {
   agentId: string;
   workspaceId?: string;
@@ -167,6 +215,9 @@ export interface AgentStatusOutput {
   terminal: boolean;
   latestResponse?: string;
   error?: string;
+  errorCode?: string;
+  errorRetryable?: boolean;
+  errorDetails?: AgentProviderFailureDetails;
   createdAt: string;
   updatedAt: string;
   startedAt?: string;
@@ -177,6 +228,7 @@ export interface AgentStatusOutput {
   changedPaths?: string[];
   terminalReason?: AgentTerminalReason;
   scopeState?: ScopeState;
+  dispatch?: DispatchContractOutput;
   termination?: {
     pending: boolean;
     generation?: string;
@@ -197,6 +249,7 @@ export interface ReconcileAgentInput {
 
 export interface ReconcileAgentOutput {
   agentId: string;
+  dispatch?: DispatchContractOutput;
   agentState: LocalAgentStatus;
   providerState?: string;
   providerSessionId?: string;
@@ -231,6 +284,7 @@ export interface AgentPreflightInput {
   isolated: boolean;
   profileName: string;
   profiles: LocalAgentProfile[];
+  profileCatalog?: ProfileCatalog;
   toolchainId?: string;
 }
 
@@ -307,6 +361,7 @@ function computeSessionTiming(record: LocalAgentRecord, now = Date.now()): { wal
 
 export interface StartAgentOutput {
   agentId: string;
+  dispatch?: DispatchContractOutput;
   status: LocalAgentStatus;
   profileName: string;
   provider: string;
@@ -340,6 +395,8 @@ export type AgentTurnRunner = (
   prompt: string,
   callbacks?: LocalAgentRunCallbacks,
 ) => Promise<LocalAgentRunResult>;
+
+export type NexusGrantResolver = (ref: NexusExecutionGrantRef) => Promise<NexusExecutionGrant>;
 
 // ─── Owned temp cleanup ──────────────────────────────────────────────────────
 
@@ -379,6 +436,8 @@ export class LocalAgentSessionManager {
   private readonly launcher: WorkerLauncher;
   private readonly terminator: WorkerTerminator;
   private readonly turnRunner?: AgentTurnRunner;
+  private readonly runtimeBuildIdentity: RuntimeBuildIdentity;
+  private readonly nexusGrantResolver: NexusGrantResolver;
   private closed = false;
   private readonly terminationAttempts = new Map<string, Promise<boolean>>();
 
@@ -387,11 +446,21 @@ export class LocalAgentSessionManager {
     testLauncher?: WorkerLauncher,
     testTerminator?: WorkerTerminator,
     testTurnRunner?: AgentTurnRunner,
+    runtimeBuildIdentity?: RuntimeBuildIdentity,
+    nexusGrantResolver?: NexusGrantResolver,
   ) {
     this.store = createLocalAgentStore(config.stateDir);
     this.launcher = testLauncher ?? defaultWorkerLauncher;
     this.terminator = testTerminator ?? terminateOwnedWorker;
     this.turnRunner = testTurnRunner;
+    this.nexusGrantResolver = nexusGrantResolver ?? resolveCanonicalNexusExecutionGrant;
+    this.runtimeBuildIdentity = runtimeBuildIdentity ?? describeRuntimeBuildIdentity({
+      env: process.env,
+      listenPort: config.port,
+      configRoot: devspaceConfigDir(process.env),
+      stateRoot: config.stateDir,
+      profileCatalogGeneration: "unresolved",
+    });
   }
 
   /** Close the manager's durable store. Safe to call from multiple cleanup paths. */
@@ -409,8 +478,14 @@ export class LocalAgentSessionManager {
   async startAgent(input: StartAgentInput): Promise<StartAgentOutput> {
     const { workspaceId, workspaceRoot, profileName, prompt, profiles, executionContract, attemptKey } = input;
 
+    assertDispatchContractCoherence(executionContract);
+
     const profile = profiles.find((p) => p.name === profileName);
     if (!profile) {
+      const blocker = input.profileCatalog?.blockerFor(profileName);
+      if (blocker) {
+        throw new AgentSessionError(blocker.code, `Agent profile '${profileName}' is not dispatchable: ${blocker.detail}`);
+      }
       const available = profiles.map((p) => p.name).join(", ");
       throw new AgentSessionError(
         "UNKNOWN_PROFILE",
@@ -426,6 +501,19 @@ export class LocalAgentSessionManager {
           prompt,
           executionContract,
         });
+    if (executionContract?.dispatchIntent && !attemptKey) {
+      throw new AgentSessionError(
+        "INVALID_ATTEMPT_KEY",
+        "Controller-authored dispatchIntent requires attemptKey so duplicate/uncertain dispatch can be reconciled to one durable attempt.",
+      );
+    }
+    if (executionContract?.dispatchIntent && attemptKey !== executionContract.dispatchIntent.attemptId) {
+      throw new AgentSessionError(
+        "INVALID_ATTEMPT_KEY",
+        `dispatchIntent.attemptId '${executionContract.dispatchIntent.attemptId}' must exactly match durable attemptKey '${attemptKey}'.`,
+      );
+    }
+
     if (replayBinding) {
       try {
         const replay = this.store.resolveStartReplay(workspaceRoot, replayBinding);
@@ -440,6 +528,9 @@ export class LocalAgentSessionManager {
         throw error;
       }
     }
+
+    await this.assertExecutionAuthority(profileName, executionContract);
+    this.assertDispatchOwnershipAvailable(workspaceRoot, executionContract);
 
     if (!this.hasExecutionCapacity()) {
       throw new AgentSessionError(
@@ -473,19 +564,6 @@ export class LocalAgentSessionManager {
       }
     }
 
-    const availability = checkLocalAgentProviderAvailability(profile.provider, providerEnvironment);
-    const codexRuntime = profile.provider === "codex" && availability.available
-      ? inspectCodexRuntime({ env: providerEnvironment })
-      : undefined;
-    if (!availability.available || (codexRuntime && !codexRuntime.ready)) {
-      throw new AgentSessionError(
-        "PROVIDER_UNAVAILABLE",
-        `Agent provider '${profile.provider}' is unavailable: ${
-          availability.reason ?? codexRuntime?.reason ?? "unknown reason"
-        }`,
-      );
-    }
-
     if (executionContract?.expectedHead) {
       const currentHead = await readWorkspaceHead(workspaceRoot);
       if (!currentHead) {
@@ -504,6 +582,35 @@ export class LocalAgentSessionManager {
       }
     }
 
+    const availability = checkLocalAgentProviderAvailability(profile.provider, providerEnvironment);
+    const codexRuntime = profile.provider === "codex" && availability.available
+      ? inspectCodexRuntime({ env: providerEnvironment })
+      : undefined;
+    if (!availability.available || (codexRuntime && !codexRuntime.ready)) {
+      throw new AgentSessionError(
+        "PROVIDER_UNAVAILABLE",
+        `Agent provider '${profile.provider}' is unavailable: ${
+          availability.reason ?? codexRuntime?.reason ?? "unknown reason"
+        }`,
+      );
+    }
+
+    if (profile.provider === "opencode") {
+      const modelValidation = validateOpencodeModelAndVariant(profile.model, profile.effort);
+      if (!modelValidation.valid) {
+        throw new AgentSessionError(
+          modelValidation.blockerCode!,
+          modelValidation.reason!,
+        );
+      }
+    }
+
+    const executionGeneration = this.resolveExecutionGeneration(
+      profile,
+      input.profileCatalog?.generation ?? "unresolved",
+      providerEnvironment,
+    );
+
     let record: LocalAgentRecord;
     let created = true;
     try {
@@ -516,6 +623,7 @@ export class LocalAgentSessionManager {
           model: profile.model,
           effort: profile.effort,
           executionContract,
+          executionGeneration,
           startReplay: replayBinding,
           lifecycleKind: "detached_worker_v2",
         });
@@ -530,6 +638,7 @@ export class LocalAgentSessionManager {
           model: profile.model,
           effort: profile.effort,
           executionContract,
+          executionGeneration,
           lifecycleKind: "detached_worker_v2",
         });
       }
@@ -543,8 +652,37 @@ export class LocalAgentSessionManager {
       throw error;
     }
 
-    if (created) await this.launchPrompt(record.id, prompt);
+    if (created) await this.launchPrompt(record.id, bindDispatchIntentToPrompt(record.executionContract?.dispatchIntent, prompt));
     return recordToStartOutput(this.store.getById(record.id) ?? record);
+  }
+
+  private async assertExecutionAuthority(profileName: string, contract: ExecutionContract | undefined): Promise<AuthorityValidationEvidence> {
+    const mode = contract?.authorityMode ?? "OWNER_DIRECT";
+    if (mode === "OWNER_DIRECT") {
+      if (contract?.nexusGrant) {
+        throw new AgentSessionError("NEXUS_AUTHORITY_REJECTED", "OWNER_DIRECT execution must not carry Nexus grant authority.");
+      }
+      return { kind: "OWNER_DIRECT" };
+    }
+    if (!contract?.nexusGrant || !contract.dispatchIntent || !contract.expectedHead) {
+      throw new AgentSessionError(
+        "NEXUS_AUTHORITY_REJECTED",
+        "NEXUS_GOVERNED execution requires canonical Nexus grant, dispatchIntent, and expectedHead before worker launch.",
+      );
+    }
+    try {
+      const grant = await this.nexusGrantResolver(contract.nexusGrant);
+      return assertNexusGrantAuthorizesExecution({
+        grant,
+        dispatchIntent: contract.dispatchIntent,
+        expectedHead: contract.expectedHead,
+        profile: profileName,
+        writePaths: contract.writePaths ?? [],
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new AgentSessionError("NEXUS_AUTHORITY_REJECTED", `NEXUS_GOVERNED authority rejected before worker launch: ${detail}`);
+    }
   }
 
   /**
@@ -607,6 +745,33 @@ export class LocalAgentSessionManager {
     // ── Continuation admission gates (all read-only; run before mutation) ──
     const admissionFailures: string[] = [];
 
+    const currentProfile = input.profiles?.find((candidate) => candidate.name === record.profileName) ?? {
+      name: record.profileName,
+      description: "Persisted durable-agent profile binding",
+      provider: record.provider as LocalAgentProfile["provider"],
+      model: record.model,
+      effort: record.effort,
+      filePath: "<persisted>",
+      body: "",
+      disabled: false,
+    };
+    try {
+      const currentGeneration = this.resolveExecutionGeneration(
+        currentProfile,
+        input.profileCatalog?.generation ?? "unresolved",
+        process.env,
+      );
+      assertSameExecutionGeneration(record.executionGeneration, currentGeneration);
+    } catch (error) {
+      if (error instanceof ExecutionProtocolError || error instanceof AgentSessionError) {
+        throw new AgentSessionError(
+          "REBIND_REQUIRED",
+          `Continuation of agent ${agentId} requires explicit rebind before mutation: ${error.message}`,
+        );
+      }
+      throw error;
+    }
+
     if (!this.hasExecutionCapacity()) {
       admissionFailures.push(
         `Execution capacity exhausted: ${this.runningCount()} of ${this.config.agentMaxConcurrent} configured agent(s) active.`,
@@ -614,6 +779,7 @@ export class LocalAgentSessionManager {
     }
 
     const contract = record.executionContract;
+    await this.assertExecutionAuthority(record.profileName, contract);
     const lineageBaseline = record.lifecycleState?.turnEndBaseline ?? record.scopeBaseline;
 
     const physical = await inspectWorkspacePhysicalState(record.workspaceRoot);
@@ -704,7 +870,7 @@ export class LocalAgentSessionManager {
       );
     }
 
-    await this.launchPrompt(record.id, prompt);
+    await this.launchPrompt(record.id, bindDispatchIntentToPrompt(record.executionContract?.dispatchIntent, prompt));
     const updated = this.store.getById(record.id) ?? record;
     return { ...recordToStartOutput(updated), continued: true as const };
   }
@@ -821,7 +987,7 @@ export class LocalAgentSessionManager {
    * authority. Never exposes credentials. Unknown evidence stays unknown.
    */
   async preflightAgent(input: AgentPreflightInput): Promise<AgentPreflightOutput> {
-    const { workspaceId, workspaceRoot, isolated, profileName, profiles, toolchainId } = input;
+    const { workspaceId, workspaceRoot, isolated, profileName, profiles, profileCatalog, toolchainId } = input;
     const blockers: Array<{ code: string; detail: string }> = [];
     const unknowns: string[] = [];
 
@@ -837,10 +1003,15 @@ export class LocalAgentSessionManager {
     const profile = profiles.find((candidate) => candidate.name === profileName);
     const profileResolved = Boolean(profile);
     if (!profile) {
-      blockers.push({
-        code: "UNKNOWN_PROFILE",
-        detail: `Profile '${profileName}' is not advertised for this workspace.`,
-      });
+      const blocker = profileCatalog?.blockerFor(profileName);
+      blockers.push(
+        blocker
+          ? { code: blocker.code, detail: `Profile '${profileName}' is not dispatchable: ${blocker.detail}` }
+          : {
+              code: "UNKNOWN_PROFILE",
+              detail: `Profile '${profileName}' is not advertised for this workspace.`,
+            },
+      );
     }
 
     // Authentication and provider reachability cannot be verified without an
@@ -916,6 +1087,16 @@ export class LocalAgentSessionManager {
       } else if (!codexRuntime) {
         const executable = resolveLocalAgentProviderExecutable(profile.provider, providerEnvironment);
         if (executable) executionIdentity = executable;
+      }
+
+      if (runtimeReady && profile.provider === "opencode") {
+        const modelValidation = validateOpencodeModelAndVariant(profile.model, profile.effort);
+        if (!modelValidation.valid) {
+          blockers.push({
+            code: modelValidation.blockerCode!,
+            detail: modelValidation.reason!,
+          });
+        }
       }
     }
 
@@ -1004,6 +1185,7 @@ export class LocalAgentSessionManager {
 
     return {
       agentId: record.id,
+      dispatch: dispatchContractOutput(record.executionContract?.dispatchIntent),
       agentState: record.status,
       providerState: record.status,
       providerSessionId: record.providerSessionId,
@@ -1165,6 +1347,71 @@ export class LocalAgentSessionManager {
     const max = this.config.agentMaxConcurrent;
     if (max === undefined || max === null || max <= 0) return true;
     return this.runningCount() < max;
+  }
+
+  private assertDispatchOwnershipAvailable(workspaceRoot: string, contract: ExecutionContract | undefined): void {
+    const intent = contract?.dispatchIntent;
+    const writeScope = contract?.writePaths ?? [];
+    if (!intent?.exclusiveOwnership || writeScope.length === 0) return;
+
+    const canonicalRoot = canonicalizePath(workspaceRoot);
+    for (const record of this.store.list()) {
+      if (!occupiesDetachedExecutionSlot(record)) continue;
+      if (canonicalizePath(record.workspaceRoot) !== canonicalRoot) continue;
+
+      const activeWriteScope = record.executionContract?.writePaths;
+      const activeIntent = record.executionContract?.dispatchIntent;
+      if (!activeWriteScope?.length) {
+        if (activeIntent && (activeIntent.writeScope?.length ?? 0) === 0) continue;
+        throw new AgentSessionError(
+          "OVERLAPPING_MUTATION_OWNERSHIP",
+          `Active agent ${record.id} in the same workspace has no provable write ownership; serialize or use an isolated workspace before dispatching ${intent.taskId}/${intent.attemptId}.`,
+        );
+      }
+      if (writeScopesOverlap(writeScope, activeWriteScope)) {
+        throw new AgentSessionError(
+          "OVERLAPPING_MUTATION_OWNERSHIP",
+          `Dispatch ${intent.taskId}/${intent.attemptId} overlaps active agent ${record.id} write ownership; serialize or use isolated worktrees/workspaces.`,
+        );
+      }
+    }
+  }
+
+  private resolveExecutionGeneration(
+    profile: LocalAgentProfile,
+    profileCatalogGeneration: string,
+    environment: NodeJS.ProcessEnv,
+  ): ExecutionGenerationBinding {
+    const availability = checkLocalAgentProviderAvailability(profile.provider, environment);
+    if (!availability.available) {
+      throw new AgentSessionError(
+        "REBIND_REQUIRED",
+        `Provider '${profile.provider}' is unavailable while rebinding execution generation: ${availability.reason ?? "unknown reason"}`,
+      );
+    }
+    const codexRuntime = profile.provider === "codex"
+      ? inspectCodexRuntime({ env: environment })
+      : undefined;
+    if (codexRuntime && !codexRuntime.ready) {
+      throw new AgentSessionError(
+        "REBIND_REQUIRED",
+        `Codex runtime is unavailable while rebinding execution generation: ${codexRuntime.reason ?? "unknown reason"}`,
+      );
+    }
+    const executable = codexRuntime?.executable
+      ?? resolveLocalAgentProviderExecutable(profile.provider, environment)
+      ?? profile.provider;
+    const runtimeVersion = codexRuntime?.binaryVersion
+      ?? getLocalAgentProviderRuntimeVersion(profile.provider, environment);
+    return buildExecutionGenerationBinding({
+      profileCatalogGeneration,
+      provider: profile.provider,
+      model: profile.model,
+      executionIdentity: executable,
+      runtimeVersion,
+      devspaceBuildId: this.runtimeBuildIdentity.buildId,
+      devspaceSourceCommit: this.runtimeBuildIdentity.sourceCommit,
+    });
   }
 
   private async buildLifecycleEvidence(
@@ -1471,17 +1718,50 @@ export class LocalAgentSessionManager {
       const endState = await inspectWorkspacePhysicalState(
         this.store.getById(agentId)?.workspaceRoot ?? claimed.workspaceRoot,
       ).catch(() => undefined);
+
+      let providerSessionId: string | undefined;
+      let latestResponse: string | undefined;
+      let errorCode: string | undefined;
+      let errorRetryable: boolean | undefined;
+      let errorDetails: AgentProviderFailureDetails | string | undefined;
+
+      if (AgentProviderFailureError.is(error)) {
+        errorCode = error.code;
+        errorRetryable = error.retryable;
+        errorDetails = {
+          code: error.code,
+          errorClass: error.errorClass,
+          retryable: error.retryable,
+          model: error.model,
+          variant: error.variant,
+          providerSessionId: error.providerSessionId,
+          providerMessage: error.providerMessage ?? error.message,
+        };
+        providerSessionId = error.providerSessionId;
+        latestResponse = error.providerMessage;
+      } else if (isAgentProviderError(error)) {
+        errorCode = error.code;
+        errorRetryable = error.retryable;
+        errorDetails = describeAgentProviderError(error);
+      } else if (error instanceof LocalAgentProviderError) {
+        providerSessionId = error.providerSessionId;
+        latestResponse = error.finalResponse;
+      }
+
       this.store.failTurnCAS({
         agentId,
         generation,
         workerToken,
-        providerSessionId: error instanceof LocalAgentProviderError ? error.providerSessionId : undefined,
-        latestResponse: error instanceof LocalAgentProviderError ? error.finalResponse : undefined,
+        providerSessionId,
+        latestResponse,
         error: message,
+        errorCode,
+        errorRetryable,
+        errorDetails,
         terminalReason:
           error instanceof WorkspaceContainmentError
             ? "launch_failed"
-            : error instanceof LocalAgentProviderError
+            : isAgentProviderError(error) || error instanceof LocalAgentProviderError
               ? "provider_error"
               : classifyProviderError(message),
         scopeState: scope.scopeState,
@@ -1937,6 +2217,110 @@ function providerEnvironment(
     : environment;
 }
 
+function assertDispatchContractCoherence(contract: ExecutionContract | undefined): void {
+  const intent = contract?.dispatchIntent;
+  if (!intent) return;
+  try {
+    validateDispatchIntent(intent);
+  } catch (error) {
+    throw new AgentSessionError(
+      "INVALID_EXECUTION_CONTRACT",
+      error instanceof Error ? error.message : String(error),
+    );
+  }
+  const intentWriteScope = [...(intent.writeScope ?? [])].sort();
+  const executionWriteScope = [...(contract?.writePaths ?? [])].sort();
+  if (intentWriteScope.join("\n") !== executionWriteScope.join("\n")) {
+    throw new AgentSessionError(
+      "INVALID_EXECUTION_CONTRACT",
+      "executionContract.dispatchIntent.writeScope must exactly match executionContract.writePaths; DevSpace does not maintain two write-scope authorities.",
+    );
+  }
+}
+
+function bindDispatchIntentToPrompt(intent: DispatchIntent | undefined, prompt: string): string {
+  if (!intent) return prompt;
+  return `${renderDispatchIntentForWorker(intent)}\n\nCONTROLLER TASK\n${prompt}`;
+}
+
+function dispatchContractOutput(intent: DispatchIntent | undefined): DispatchContractOutput | undefined {
+  if (!intent) return undefined;
+  return {
+    taskId: intent.taskId,
+    attemptId: intent.attemptId,
+    roleIntent: intent.roleIntent,
+    claimCeiling: intent.claimCeiling,
+    verificationRequired: intent.verificationRequired,
+    exclusiveOwnership: intent.exclusiveOwnership,
+    intentHash: hashDispatchIntent(intent),
+  };
+}
+
+const NEXUS_CANONICAL_REMOTE = "https://github.com/James3014/Nexus-new.git";
+const NEXUS_RAW_HOST = "raw.githubusercontent.com";
+const NEXUS_AUTHORITY_FETCH_TIMEOUT_MS = 10_000;
+const NEXUS_AUTHORITY_MAX_BYTES = 256 * 1024;
+
+async function resolveCanonicalNexusExecutionGrant(ref: NexusExecutionGrantRef): Promise<NexusExecutionGrant> {
+  const observedMain = observeCanonicalNexusMain();
+  const [grantRaw, authorityRaw] = await Promise.all([
+    fetchCanonicalNexusText(ref.revision, ref.grantPath),
+    fetchCanonicalNexusText(ref.revision, ref.authorityPath),
+  ]);
+  return validateResolvedNexusExecutionGrant(ref, grantRaw, authorityRaw, observedMain);
+}
+
+function observeCanonicalNexusMain(): string {
+  const probe = spawnSync("git", ["ls-remote", NEXUS_CANONICAL_REMOTE, "refs/heads/main"], {
+    encoding: "utf8",
+    timeout: NEXUS_AUTHORITY_FETCH_TIMEOUT_MS,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    maxBuffer: 64 * 1024,
+  });
+  if (probe.error || probe.status !== 0) {
+    throw new ExecutionProtocolError(
+      "NEXUS_AUTHORITY_NOT_VALIDATED",
+      `Unable to resolve canonical Nexus main: ${probe.error?.message ?? String(probe.stderr || `git exited ${probe.status}`)}`,
+    );
+  }
+  const match = /^([0-9a-f]{40})\s+refs\/heads\/main\s*$/m.exec(String(probe.stdout || ""));
+  if (!match) {
+    throw new ExecutionProtocolError("NEXUS_AUTHORITY_NOT_VALIDATED", "Canonical Nexus main probe returned malformed identity.");
+  }
+  return match[1];
+}
+
+async function fetchCanonicalNexusText(revision: string, path: string): Promise<string> {
+  const encodedPath = path.split("/").map((segment) => encodeURIComponent(segment)).join("/");
+  const url = new URL(`https://${NEXUS_RAW_HOST}/James3014/Nexus-new/${revision}/${encodedPath}`);
+  const response = await fetch(url, {
+    redirect: "error",
+    signal: AbortSignal.timeout(NEXUS_AUTHORITY_FETCH_TIMEOUT_MS),
+    headers: { Accept: "text/plain" },
+  });
+  if (!response.ok || new URL(response.url).hostname !== NEXUS_RAW_HOST) {
+    throw new ExecutionProtocolError(
+      "NEXUS_AUTHORITY_NOT_VALIDATED",
+      `Canonical Nexus authority fetch failed closed for ${path} (HTTP ${response.status}).`,
+    );
+  }
+  const raw = await response.text();
+  if (Buffer.byteLength(raw, "utf8") > NEXUS_AUTHORITY_MAX_BYTES) {
+    throw new ExecutionProtocolError("NEXUS_AUTHORITY_NOT_VALIDATED", `Canonical Nexus authority artifact ${path} exceeds the bounded size limit.`);
+  }
+  return raw;
+}
+
+function writeScopesOverlap(left: string[], right: string[]): boolean {
+  return left.some((leftPath) => right.some((rightPath) => workspacePathsOverlap(leftPath, rightPath)));
+}
+
+function workspacePathsOverlap(left: string, right: string): boolean {
+  const a = left.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "");
+  const b = right.replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "");
+  return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
+}
+
 function recordToStartOutput(record: LocalAgentRecord): StartAgentOutput {
   const output: StartAgentOutput = {
     agentId: record.id,
@@ -1950,6 +2334,8 @@ function recordToStartOutput(record: LocalAgentRecord): StartAgentOutput {
   if (record.model !== undefined) output.model = record.model;
   if (record.effort !== undefined) output.effort = record.effort;
   if (record.workspaceId !== undefined) output.workspaceId = record.workspaceId;
+  const dispatch = dispatchContractOutput(record.executionContract?.dispatchIntent);
+  if (dispatch) output.dispatch = dispatch;
   return output;
 }
 
@@ -1970,9 +2356,14 @@ function recordToStatusOutput(
   if (record.model !== undefined) output.model = record.model;
   if (record.effort !== undefined) output.effort = record.effort;
   if (record.workspaceId !== undefined) output.workspaceId = record.workspaceId;
+  const dispatch = dispatchContractOutput(record.executionContract?.dispatchIntent);
+  if (dispatch) output.dispatch = dispatch;
   if (record.providerSessionId !== undefined) output.providerSessionId = record.providerSessionId;
   if (record.latestResponse !== undefined) output.latestResponse = record.latestResponse;
   if (record.error !== undefined) output.error = record.error;
+  if (record.errorCode !== undefined) output.errorCode = record.errorCode;
+  if (record.errorRetryable !== undefined) output.errorRetryable = record.errorRetryable;
+  if (record.errorDetails !== undefined) output.errorDetails = record.errorDetails;
   const pending = record.lifecycleState?.terminationPending;
   const corrupt = isDetachedLifecycle(record.lifecycleState) && record.lifecycleState?.lifecycleCorrupt;
   const blocked = isDetachedLifecycle(record.lifecycleState) ? record.lifecycleState?.terminationBlocked : undefined;

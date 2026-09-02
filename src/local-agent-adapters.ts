@@ -96,6 +96,8 @@ export function createLocalAgentAdapter(
       return new AgyLocalAgentAdapter();
     case "omp":
       return new OmpLocalAgentAdapter();
+    case "cline":
+      return new DriverBackedLocalAgentAdapter(new AcpLocalAgentDriver("cline", options.env));
   }
 }
 
@@ -126,7 +128,7 @@ class DriverBackedLocalAgentAdapter implements LocalAgentAdapter {
     };
     const created = await this.driver.createRuntime(context);
     if (!created.isOk()) {
-      throw new LocalAgentProviderError(created.error.message);
+      throw created.error;
     }
     const runtime = created.value;
     if (callbacks?.onExecutionStarted) {
@@ -135,9 +137,9 @@ class DriverBackedLocalAgentAdapter implements LocalAgentAdapter {
     try {
       const turn = await runtime.run(input, callbacks);
       if (turn.isOk()) return turn.value;
-      throw new LocalAgentProviderError(turn.error.message);
+      throw turn.error;
     } finally {
-      await runtime.close().catch(() => {});
+      await runtime.close?.().catch(() => {});
     }
   }
 }

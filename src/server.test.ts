@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after, type TestContext } from "node:test";
@@ -15,6 +15,7 @@ import type { SubagentsConfig } from "./local-agent-config.js";
 import { MINIMUM_CODEX_RUNTIME_VERSION } from "./codex-runtime.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
+import { DurableOperationManager } from "./durable-operations.js";
 import { createMcpServer, createServer } from "./server.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
@@ -379,6 +380,7 @@ async function fixture(
   const agentSessionManager = config.subagents.enabled
     ? new LocalAgentSessionManager(config, async () => {}, async () => true)
     : undefined;
+  const durableOperations = new DurableOperationManager(config);
   const server = createMcpServer(
     config,
     workspaces,
@@ -387,6 +389,9 @@ async function fixture(
     resolveLocalAgentProviders,
     [],
     agentSessionManager,
+    undefined,
+    undefined,
+    durableOperations,
   );
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "devspace-test-client", version: "1.0.0" });
@@ -401,6 +406,8 @@ async function fixture(
     closed = true;
     await client.close();
     await server.close();
+    durableOperations.close();
+    agentSessionManager?.close();
     store.close();
   };
 
@@ -654,6 +661,96 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   assert.equal(cancelStructured.terminal, true);
 });
 
+test("subagents: continuation fails closed when execution generation changes", async (t) => {
+  const context = await fixture(t, { subagents: true });
+  const opened = await callOpen(context.client, context.project, "chat-generation-change");
+  const workspaceId = structuredContent(opened).workspaceId as string;
+  const start = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "generation-bound work",
+      attemptKey: "generation-bound-start",
+    },
+  });
+  assert.equal(start.isError, undefined);
+  const agentId = structuredContent(start).agentId as string;
+
+  const { LocalAgentStore } = await import("./local-agent-store.js");
+  const store = new LocalAgentStore(context.stateDir);
+  try {
+    const record = store.getById(agentId)!;
+    assert.ok(record.executionGeneration?.executionBindingHash, "new durable sessions must persist execution generation");
+    const generation = record.lifecycleState!.activeTurn!.generation!;
+    const workerToken = record.workerToken!;
+    store.claimWorkerCAS(agentId, generation, workerToken, process.pid);
+    store.finishTurnCAS({ agentId, generation, workerToken, status: "idle", terminalReason: "completed" });
+  } finally {
+    store.close();
+  }
+
+  await writeFile(join(context.project, ".devspace", "agents", "reviewer.md"), [
+    "---",
+    "name: reviewer",
+    "description: Generation changed after start.",
+    "provider: codex",
+    "effort: high",
+    "---",
+    "Review changes with a changed profile generation.",
+  ].join("\n"));
+
+  const continued = await context.client.callTool({
+    name: "agent_continue",
+    arguments: { workspaceId, agentId, prompt: "continue after profile mutation" },
+  });
+  assert.equal(continued.isError, true);
+  assert.match(responseText(continued), /REBIND_REQUIRED|requires explicit rebind/i);
+});
+
+test("subagents: legacy durable session without execution generation does not silently upgrade", async (t) => {
+  const context = await fixture(t, { subagents: true });
+  const opened = await callOpen(context.client, context.project, "chat-legacy-generation");
+  const workspaceId = structuredContent(opened).workspaceId as string;
+  const start = await context.client.callTool({
+    name: "agent_start",
+    arguments: { workspaceId, profile: "reviewer", prompt: "legacy simulation" },
+  });
+  const agentId = structuredContent(start).agentId as string;
+
+  const { LocalAgentStore } = await import("./local-agent-store.js");
+  const store = new LocalAgentStore(context.stateDir);
+  try {
+    const record = store.getById(agentId)!;
+    const generation = record.lifecycleState!.activeTurn!.generation!;
+    const workerToken = record.workerToken!;
+    store.claimWorkerCAS(agentId, generation, workerToken, process.pid);
+    store.finishTurnCAS({ agentId, generation, workerToken, status: "idle", terminalReason: "completed" });
+  } finally {
+    store.close();
+  }
+  const { openDatabase } = await import("./db/client.js");
+  const database = openDatabase(context.stateDir);
+  try {
+    database.sqlite.prepare("update local_agent_sessions set execution_generation = null where id = ?").run(agentId);
+  } finally {
+    database.close();
+  }
+  const legacyStore = new LocalAgentStore(context.stateDir);
+  try {
+    assert.equal(legacyStore.getById(agentId)?.executionGeneration, undefined);
+  } finally {
+    legacyStore.close();
+  }
+
+  const continued = await context.client.callTool({
+    name: "agent_continue",
+    arguments: { workspaceId, agentId, prompt: "must not silently bind" },
+  });
+  assert.equal(continued.isError, true);
+  assert.match(responseText(continued), /REBIND_REQUIRED|predates execution-generation binding/i);
+});
+
 test("subagents: unknown/invalid workspaceId fails closed before durable-agent access", async (t) => {
   const context = await fixture(t, { subagents: true });
   const invalidWorkspaceId = "ws_invalid_nonexistent";
@@ -737,6 +834,124 @@ test("subagents: agent_preflight returns structured readiness without secrets", 
   const serialized = JSON.stringify(preflight);
   assert.ok(!serialized.includes("test-owner-token"));
   assert.ok(!serialized.includes("DEVSPACE_OAUTH"));
+});
+
+test("subagents: controller dispatchIntent crosses the MCP schema without gaining verification authority", async (t) => {
+  const context = await fixture(t, { git: true, subagents: true });
+  const openResult = await callOpen(context.client, context.project, "chat-dispatch-intent");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+  const intent = {
+    taskId: "task-server-r3",
+    attemptId: "attempt-server-r3",
+    objective: "Perform one bounded change.",
+    roleIntent: "DEEP_ENGINEERING",
+    readScope: ["src"],
+    writeScope: ["src"],
+    exclusiveOwnership: true,
+    forbiddenChanges: ["Do not claim acceptance authority."],
+    acceptanceCriteria: ["Return inspectable evidence."],
+    verificationRequired: true,
+    expectedEvidence: ["focused test"],
+    claimCeiling: "CANDIDATE_READY",
+  };
+
+  const startResult = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "bounded work",
+      attemptKey: "attempt-server-r3",
+      executionContract: { dispatchIntent: intent, writePaths: ["src"] },
+    },
+  });
+  assert.equal(startResult.isError, undefined);
+  const start = structuredContent(startResult) as Record<string, unknown>;
+  const dispatch = start.dispatch as Record<string, unknown>;
+  assert.equal(dispatch.taskId, "task-server-r3");
+  assert.equal(dispatch.claimCeiling, "CANDIDATE_READY");
+  assert.equal((start as any).verified, undefined);
+  assert.equal((start as any).accepted, undefined);
+
+  const invalidClaim = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "invalid authority",
+      attemptKey: "attempt-server-r3-invalid",
+      executionContract: {
+        dispatchIntent: { ...intent, attemptId: "attempt-server-r3-invalid", claimCeiling: "VERIFIED" },
+        writePaths: ["src"],
+      },
+    },
+  });
+  assert.equal(invalidClaim.isError, true);
+});
+
+test("subagents: NEXUS_GOVERNED fails closed at the MCP boundary without complete canonical grant evidence", async (t) => {
+  const context = await fixture(t, { git: true, subagents: true });
+  const openResult = await callOpen(context.client, context.project, "chat-nexus-governed-missing-grant");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+  const head = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: context.project });
+  const intent = {
+    taskId: "task-server-g9",
+    attemptId: "attempt-server-g9",
+    objective: "Perform one bounded governed change.",
+    roleIntent: "DEEP_ENGINEERING",
+    readScope: ["src"],
+    writeScope: ["src"],
+    exclusiveOwnership: true,
+    forbiddenChanges: ["Do not fall back to OWNER_DIRECT."],
+    acceptanceCriteria: ["Reject missing Nexus authority before launch."],
+    verificationRequired: true,
+    expectedEvidence: ["typed rejection"],
+    claimCeiling: "CANDIDATE_READY",
+  };
+
+  const missingGrant = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "must not launch",
+      attemptKey: intent.attemptId,
+      executionContract: {
+        authorityMode: "NEXUS_GOVERNED",
+        dispatchIntent: intent,
+        expectedHead: head.stdout.trim(),
+        writePaths: ["src"],
+      },
+    },
+  });
+  assert.equal(missingGrant.isError, true);
+  assert.match(responseText(missingGrant), /NEXUS_GOVERNED.*requires nexusGrant/i);
+
+  const directWithSyntheticGrant = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "must not launch",
+      attemptKey: "attempt-server-g9-direct",
+      executionContract: {
+        authorityMode: "OWNER_DIRECT",
+        nexusGrant: {
+          repository: "James3014/Nexus-new",
+          revision: "a".repeat(40),
+          grantPath: "tasks/g9/grant.json",
+          grantSha256: "b".repeat(64),
+          authorityPath: "tasks/g9/00-task.md",
+          authoritySha256: "c".repeat(64),
+        },
+        dispatchIntent: { ...intent, attemptId: "attempt-server-g9-direct" },
+        expectedHead: head.stdout.trim(),
+        writePaths: ["src"],
+      },
+    },
+  });
+  assert.equal(directWithSyntheticGrant.isError, true);
+  assert.match(responseText(directWithSyntheticGrant), /OWNER_DIRECT.*must not carry Nexus grant/i);
 });
 
 test("subagents: agent_start executionContract expectedHead mismatch fails closed", async (t) => {
@@ -1112,6 +1327,160 @@ test("bash and command_status: attemptKey reconciliation and idempotent executio
   });
   assert.equal(conflictRes.isError, true);
   assert.match(responseText(conflictRes), /ATTEMPT_REPLAY_CONFLICT/);
+});
+
+test("nexus_gateway_recover exposes only the fixed typed recovery contract", async (t) => {
+  const context = await fixture(t, { git: true });
+  const tools = await context.client.listTools();
+  const gatewayTool = tools.tools.find((tool) => tool.name === "nexus_gateway_recover");
+  assert.ok(gatewayTool, "fixed Nexus Gateway recovery tool must be exposed");
+  const annotations = (gatewayTool as unknown as { annotations?: Record<string, unknown> }).annotations;
+  assert.deepEqual(annotations, {
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: true,
+    openWorldHint: false,
+  });
+  assert.match(String(gatewayTool.description), /executable, service, PID, launchd label, plist, source root/);
+
+  const schema = gatewayTool.inputSchema as Record<string, unknown>;
+  const properties = schema.properties as Record<string, unknown>;
+  assert.deepEqual(Object.keys(properties).sort(), ["attemptKey", "request"]);
+  const requestSchema = properties.request as Record<string, unknown>;
+  const requestProperties = requestSchema.properties as Record<string, unknown>;
+  assert.deepEqual(Object.keys(requestProperties).sort(), [
+    "desired_manifest_hash",
+    "desired_manifest_id",
+    "effect_class",
+    "idempotency_fence",
+    "operation",
+    "predecessor_manifest_hash",
+    "predecessor_manifest_id",
+    "recovery_authority_hash",
+    "recovery_authority_id",
+    "request_hash",
+    "request_id",
+    "schema",
+  ]);
+  for (const forbidden of ["command", "executable", "pid", "service", "launchdLabel", "plist", "root", "managerPath", "environment", "timeout"]) {
+    assert.equal(forbidden in requestProperties, false, `${forbidden} must not be caller-selectable`);
+  }
+  assert.equal(requestSchema.additionalProperties, false, "recovery request must reject extra process-control fields");
+
+  const invalid = await context.client.callTool({
+    name: "nexus_gateway_recover",
+    arguments: {
+      attemptKey: "server-gateway-invalid",
+      request: {
+        request_id: "request-1",
+        idempotency_fence: "fence-1",
+        operation: "gateway-recover",
+        effect_class: "GATEWAY_DURABLE_RECOVERY",
+        recovery_authority_id: "authority-1",
+        recovery_authority_hash: "a".repeat(64),
+        desired_manifest_id: `r1-${"b".repeat(40)}`,
+        desired_manifest_hash: "c".repeat(64),
+        predecessor_manifest_id: `r1-${"d".repeat(40)}`,
+        predecessor_manifest_hash: "e".repeat(64),
+        request_hash: "f".repeat(64),
+        schema: "nexus.gateway.durable_recovery_request.v1",
+        command: "launchctl",
+      },
+    },
+  });
+  assert.equal(invalid.isError, true, "extra caller-selected process controls must fail schema validation before handler execution");
+});
+
+test("OWNER_DIRECT workspace_clone and dependency_sync run through typed MCP tools", async (t) => {
+  const context = await fixture(t, { git: true });
+  const tools = await context.client.listTools();
+  for (const name of ["workspace_clone", "dependency_sync", "operation_status", "operation_reconcile"]) {
+    assert.ok(tools.tools.some((tool) => tool.name === name), `${name} must be exposed`);
+  }
+  const bash = tools.tools.find((tool) => tool.name === "bash");
+  assert.match(String(bash?.description), /Do not use bash to create or modify files/);
+
+  const destination = join(context.project, "..", "typed-clone");
+  const clone = await context.client.callTool({
+    name: "workspace_clone",
+    arguments: {
+      attemptKey: "server-clone-1",
+      remote: context.project,
+      destination,
+      authorityMode: "OWNER_DIRECT",
+    },
+  });
+  assert.equal(clone.isError, undefined);
+  const cloneRecord = structuredContent(clone);
+  assert.equal(cloneRecord.status, "succeeded");
+  assert.equal((cloneRecord.receipt as Record<string, unknown>).openable, true);
+
+  const replay = await context.client.callTool({
+    name: "workspace_clone",
+    arguments: {
+      attemptKey: "server-clone-1",
+      remote: context.project,
+      destination,
+      authorityMode: "OWNER_DIRECT",
+    },
+  });
+  assert.equal(structuredContent(replay).operationId, cloneRecord.operationId);
+
+  const outside = await mkdtemp(join(tmpdir(), "devspace-server-outside-clone-"));
+  t.after(() => rm(outside, { recursive: true, force: true }));
+  const denied = await context.client.callTool({
+    name: "workspace_clone",
+    arguments: {
+      attemptKey: "server-clone-outside",
+      remote: context.project,
+      destination: join(outside, "clone"),
+      authorityMode: "OWNER_DIRECT",
+    },
+  });
+  assert.equal(denied.isError, true);
+
+  await writeFile(join(destination, "package.json"), JSON.stringify({ name: "typed-fixture", version: "1.0.0" }) + "\n");
+  await writeFile(join(destination, "package-lock.json"), JSON.stringify({
+    name: "typed-fixture",
+    version: "1.0.0",
+    lockfileVersion: 3,
+    requires: true,
+    packages: { "": { name: "typed-fixture", version: "1.0.0" } },
+  }) + "\n");
+  const manifestBefore = await readFile(join(destination, "package.json"), "utf8");
+  const lockBefore = await readFile(join(destination, "package-lock.json"), "utf8");
+  const opened = await callOpen(context.client, destination, "chat-dependency-sync");
+  const workspaceId = structuredContent(opened).workspaceId as string;
+  const sync = await context.client.callTool({
+    name: "dependency_sync",
+    arguments: {
+      workspaceId,
+      attemptKey: "server-deps-1",
+      recipe: "npm_ci",
+      authorityMode: "OWNER_DIRECT",
+    },
+  });
+  assert.equal(sync.isError, undefined);
+  assert.equal(structuredContent(sync).status, "succeeded");
+  assert.equal(await readFile(join(destination, "package.json"), "utf8"), manifestBefore);
+  assert.equal(await readFile(join(destination, "package-lock.json"), "utf8"), lockBefore);
+
+  const status = await context.client.callTool({
+    name: "operation_status",
+    arguments: { operationId: structuredContent(sync).operationId },
+  });
+  assert.equal(structuredContent(status).status, "succeeded");
+
+  const nexusBlocked = await context.client.callTool({
+    name: "workspace_clone",
+    arguments: {
+      attemptKey: "server-nexus-unvalidated",
+      remote: context.project,
+      destination: join(context.project, "..", "nexus-unvalidated"),
+      authorityMode: "NEXUS_GOVERNED",
+    },
+  });
+  assert.equal(nexusBlocked.isError, true);
 });
 
 test("command_status metadata annotations and minimal mode visibility", async (t) => {

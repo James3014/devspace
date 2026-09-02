@@ -669,6 +669,80 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
   );
   assert.equal(store.touchActivityCAS(activityRecord.id, "stale-generation", "activity-token").applied, false);
 
+  // Case A & C: failTurnCAS persists errorCode, errorRetryable, errorDetails
+  const failureAgent = store.create({
+    workspaceId: "ws_failure",
+    workspaceRoot: join(root, "failure"),
+    profileName: "cline-reviewer",
+    provider: "cline",
+    lifecycleKind: "detached_worker_v2",
+  });
+  const failGeneration = failureAgent.lifecycleState!.activeTurn!.generation!;
+  store.prepareWorker(failureAgent.id, "fail-token");
+  store.claimWorker(failureAgent.id, "fail-token", 5222);
+
+  const failResult = store.failTurnCAS({
+    agentId: failureAgent.id,
+    generation: failGeneration,
+    workerToken: "fail-token",
+    error: "Subscription required for ClinePass",
+    errorCode: "CLINEPASS_ENTITLEMENT_REQUIRED",
+    errorRetryable: false,
+    errorDetails: {
+      code: "CLINEPASS_ENTITLEMENT_REQUIRED",
+      errorClass: "ENTITLEMENT_REQUIRED",
+      retryable: false,
+      model: "cline-pass/glm-5.3-flash",
+      variant: "high",
+      providerSessionId: "sess-cline-999",
+      providerMessage: "Account lacks entitlement",
+    },
+    terminalReason: "provider_error",
+  });
+  assert.equal(failResult.applied, true);
+
+  const readFailed = store.getById(failureAgent.id)!;
+  assert.equal(readFailed.status, "error");
+  assert.equal(readFailed.errorCode, "CLINEPASS_ENTITLEMENT_REQUIRED");
+  assert.equal(readFailed.errorRetryable, false);
+  assert.deepEqual(readFailed.errorDetails, {
+    code: "CLINEPASS_ENTITLEMENT_REQUIRED",
+    errorClass: "ENTITLEMENT_REQUIRED",
+    retryable: false,
+    model: "cline-pass/glm-5.3-flash",
+    variant: "high",
+    providerSessionId: "sess-cline-999",
+    providerMessage: "Account lacks entitlement",
+  });
+
+  // Case D: successful finishTurnCAS clears prior error fields
+  const successAgent = store.create({
+    workspaceId: "ws_success",
+    workspaceRoot: join(root, "success"),
+    profileName: "agy-reviewer",
+    provider: "agy",
+    lifecycleKind: "detached_worker_v2",
+  });
+  const succGeneration = successAgent.lifecycleState!.activeTurn!.generation!;
+  store.prepareWorker(successAgent.id, "succ-token");
+  store.claimWorker(successAgent.id, "succ-token", 5333);
+
+  const succResult = store.finishTurnCAS({
+    agentId: successAgent.id,
+    generation: succGeneration,
+    workerToken: "succ-token",
+    status: "idle",
+    latestResponse: "All good",
+    terminalReason: "completed",
+  });
+  assert.equal(succResult.applied, true);
+
+  const readSuccess = store.getById(successAgent.id)!;
+  assert.equal(readSuccess.status, "idle");
+  assert.equal(readSuccess.errorCode, undefined);
+  assert.equal(readSuccess.errorRetryable, undefined);
+  assert.equal(readSuccess.errorDetails, undefined);
+
 } finally {
   for (const store of stores) {
     store.close();

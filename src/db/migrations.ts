@@ -52,6 +52,21 @@ const migrations: Migration[] = [
     name: "local-agent-lifecycle-state",
     up: migrateLocalAgentLifecycleState,
   },
+  {
+    version: 10,
+    name: "local-agent-error-details",
+    up: migrateLocalAgentErrorDetails,
+  },
+  {
+    version: 11,
+    name: "local-agent-execution-generation",
+    up: migrateLocalAgentExecutionGeneration,
+  },
+  {
+    version: 12,
+    name: "durable-operations",
+    up: migrateDurableOperations,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -242,6 +257,42 @@ function migrateWorkspaceConversationBindings(sqlite: Database.Database): void {
 function migrateLocalAgentStructuredErrors(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "local_agent_sessions", "error_code", "text");
   addColumnIfMissing(sqlite, "local_agent_sessions", "error_retryable", "text");
+}
+
+function migrateLocalAgentErrorDetails(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "local_agent_sessions", "error_details", "text");
+}
+
+function migrateLocalAgentExecutionGeneration(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "local_agent_sessions", "execution_generation", "text");
+}
+
+function migrateDurableOperations(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists durable_operations (
+      operation_id text primary key,
+      attempt_key text not null,
+      request_hash text not null,
+      kind text not null,
+      authority_mode text not null,
+      scope_root text not null,
+      workspace_id text,
+      status text not null,
+      retry_safe text not null,
+      request_json text not null,
+      receipt_json text,
+      error_code text,
+      error_message text,
+      created_at text not null,
+      updated_at text not null
+    );
+
+    create unique index if not exists durable_operations_attempt_idx
+      on durable_operations(scope_root, attempt_key);
+
+    create index if not exists durable_operations_status_idx
+      on durable_operations(status, updated_at desc);
+  `);
 }
 
 function migrateLocalAgentEffortRename(sqlite: Database.Database): void {

@@ -795,6 +795,77 @@ try {
     }
   }
 
+  // N. DriverBackedLocalAgentAdapter preserves original typed AgentProviderError subtypes
+  {
+    const { AgentProviderFailureError, AgentProviderUnavailableError } = await import("./local-agent-errors.js");
+    const { Result } = await import("better-result");
+
+    // 1. AgentProviderFailureError preservation
+    const failureError = new AgentProviderFailureError({
+      code: "CLINEPASS_ENTITLEMENT_REQUIRED",
+      provider: "cline",
+      errorClass: "ENTITLEMENT_REQUIRED",
+      operation: "run",
+      message: "No access to ClinePass subscription models",
+      retryable: false,
+      model: "cline-pass/glm-5.3-flash",
+      variant: "high",
+      providerSessionId: "sess-123",
+      providerMessage: "Subscription required",
+    });
+
+    const mockDriverFailure = {
+      provider: "cline" as const,
+      runtimeKey: () => "mock-key",
+      createRuntime: async () => Result.ok({
+        provider: "cline" as const,
+        run: async () => Result.err(failureError),
+      }),
+    };
+
+    const clineAdapter = createLocalAgentAdapter("cline", {
+      env: {},
+    });
+
+    // Test run throwing failureError directly
+    const testDriverAdapter = new (clineAdapter.constructor as any)(mockDriverFailure);
+    await assert.rejects(
+      testDriverAdapter.run({ prompt: "test", workspaceRoot: "/tmp" }),
+      (thrown: any) => {
+        assert.ok(thrown instanceof AgentProviderFailureError);
+        assert.equal(thrown.code, "CLINEPASS_ENTITLEMENT_REQUIRED");
+        assert.equal(thrown.retryable, false);
+        assert.equal(thrown.errorClass, "ENTITLEMENT_REQUIRED");
+        assert.equal(thrown.model, "cline-pass/glm-5.3-flash");
+        return true;
+      }
+    );
+
+    // 2. AgentProviderUnavailableError on createRuntime failure
+    const unavailableError = new AgentProviderUnavailableError({
+      code: "PROVIDER_UNAVAILABLE",
+      provider: "grok",
+      operation: "createRuntime",
+      retryable: false,
+      message: "grok executable was not found",
+    });
+    const mockDriverUnavailable = {
+      provider: "grok" as const,
+      runtimeKey: () => "mock-key",
+      createRuntime: async () => Result.err(unavailableError),
+    };
+    const grokDriverAdapter = new (clineAdapter.constructor as any)(mockDriverUnavailable);
+    await assert.rejects(
+      grokDriverAdapter.run({ prompt: "test", workspaceRoot: "/tmp" }),
+      (thrown: any) => {
+        assert.ok(thrown instanceof AgentProviderUnavailableError);
+        assert.equal(thrown.code, "PROVIDER_UNAVAILABLE");
+        assert.equal(thrown.message, "grok executable was not found");
+        return true;
+      }
+    );
+  }
+
 } finally {
   process.env = originalEnv;
   cleanupProviderScratch(agyScratch.root);

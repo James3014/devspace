@@ -4,10 +4,12 @@ import { createRequire } from "node:module";
 import { delimiter, resolve } from "node:path";
 import { Readable, Writable } from "node:stream";
 import {
+  AgentProviderFailureError,
   AgentProviderProtocolError,
   AgentProviderUnavailableError,
   captureAgentProviderResult,
   isProgrammerDefect,
+  type AgentProviderError,
 } from "./local-agent-errors.js";
 import { terminateProcessTree } from "./process-platform.js";
 import {
@@ -18,6 +20,10 @@ import {
   resolveGrokEffort,
   resolveGrokModelId,
 } from "./local-agent-grok.js";
+import {
+  resolveGrokExecutable,
+  resolveClineExecutable,
+} from "./local-agent-availability.js";
 import type {
   LocalAgentDriver,
   LocalAgentRunCallbacks,
@@ -28,7 +34,7 @@ import type {
   LocalAgentWriteMode,
 } from "./local-agent-runtime.js";
 
-export type AcpProvider = "cursor" | "copilot" | "grok";
+export type AcpProvider = "cursor" | "copilot" | "grok" | "cline";
 
 const MAX_ACP_QUEUE_ITEMS = 10_000;
 const MAX_ACP_STDERR_BYTES = 32 * 1024;
@@ -44,6 +50,7 @@ const ACP_COMMANDS: Record<AcpProvider, [string, ...string[]]> = {
   cursor: ["cursor-agent", "acp"],
   copilot: ["copilot", "--acp"],
   grok: ["grok", "agent", "stdio"],
+  cline: ["cline", "acp"],
 };
 
 interface AcpConnectionLike {
@@ -78,6 +85,7 @@ export interface AcpRuntimeOptions {
   grokCompletionRegistry?: GrokPromptCompletionRegistry;
   promptCompletionTimeoutMs?: number;
   activityCallbacks?: Map<string, () => void | Promise<void>>;
+  stderrTail?: () => string;
 }
 
 export class AcpRuntime implements LocalAgentRuntime {
@@ -96,6 +104,7 @@ export class AcpRuntime implements LocalAgentRuntime {
   private alive = true;
   private closed = false;
   private readonly activityCallbacks: Map<string, () => void | Promise<void>>;
+  private readonly stderrTail?: () => string;
 
   constructor(options: AcpRuntimeOptions, connection: AcpConnectionLike) {
     this.provider = options.provider;
@@ -109,6 +118,7 @@ export class AcpRuntime implements LocalAgentRuntime {
     this.grokCompletionRegistry = options.grokCompletionRegistry;
     this.promptCompletionTimeoutMs = options.promptCompletionTimeoutMs ?? ACP_GROK_PROMPT_COMPLETION_TIMEOUT_MS;
     this.activityCallbacks = options.activityCallbacks ?? new Map();
+    this.stderrTail = options.stderrTail;
     void this.connection.closed.then(() => {
       if (!this.closed) this.alive = false;
       this.grokCompletionRegistry?.rejectAll(new Error(`${this.provider} ACP connection closed.`));
@@ -171,9 +181,22 @@ export class AcpRuntime implements LocalAgentRuntime {
             prompt: [{ type: "text", text: input.prompt }],
             ...(promptId ? { _meta: { promptId, requestId: promptId } } : {}),
           });
-          const response = completion
-            ? await Promise.race([standardResponse, completion])
-            : await standardResponse;
+          let response: unknown;
+          try {
+            response = completion
+              ? await Promise.race([standardResponse, completion])
+              : await standardResponse;
+          } catch (cause) {
+            const classified = classifyAcpError(
+              cause,
+              this.provider,
+              sessionId,
+              { model: input.model, variant: input.effort },
+              this.stderrTail?.(),
+            );
+            if (classified) throw classified;
+            throw cause;
+          }
           if (completion && isGrokPromptCompletion(response)) {
             await yieldToAcpQueue();
           } else if (promptId) {
@@ -182,6 +205,14 @@ export class AcpRuntime implements LocalAgentRuntime {
           const updates = queue.values.splice(0);
           const finalResponse = extractAcpText(updates);
           if (!finalResponse) {
+            const classified = classifyAcpError(
+              response,
+              this.provider,
+              sessionId,
+              { model: input.model, variant: input.effort },
+              this.stderrTail?.(),
+            );
+            if (classified) throw classified;
             throw new AgentProviderProtocolError({
               code: "PROVIDER_PROTOCOL_ERROR",
               provider: this.provider,
@@ -319,6 +350,14 @@ export class AcpRuntime implements LocalAgentRuntime {
       await this.configureGrokSession(sessionId, input, metadata, isNewSession);
       return;
     }
+    // Cline's exact model and thinking level are process-level CLI settings
+    // (--model/--thinking). Its ACP `model` config is a provider-family selector
+    // (e.g. cline-pass), not the exact model id. Re-applying the exact CLI model
+    // through session/set_config_option rejects valid values such as
+    // cline-pass/glm-5.3-flash. Runtime identity is model/effort-bound below, so
+    // Cline sessions must keep the process-level selection instead.
+    if (this.provider === "cline") return;
+
     const canConfigure = isNewSession || hasAcpConfigOptions(metadata);
     if (!canConfigure) {
       const requested = [
@@ -434,7 +473,10 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
   runtimeKey(context: LocalAgentRuntimeContext): string {
     const command = this.resolveCommand() ?? ACP_COMMANDS[this.provider][0];
     const writeMode = context.writeMode ?? "allowed";
-    return `acp:${this.provider}:${command}:${writeMode}:${resolve(context.workspaceRoot)}`;
+    const processConfig = this.provider === "cline"
+      ? `:${context.model ?? "default"}:${context.effort ?? "default"}`
+      : "";
+    return `acp:${this.provider}:${command}:${writeMode}${processConfig}:${resolve(context.workspaceRoot)}`;
   }
 
   async createRuntime(context: LocalAgentRuntimeContext) {
@@ -554,6 +596,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
             sessionWriteModes,
             grokCompletionRegistry,
             activityCallbacks,
+            stderrTail: () => stderrTail,
           }, connection);
           // AcpRuntime installs the long-lived child error listener before this
           // startup-only listener is removed, so there is no unobserved gap.
@@ -621,11 +664,15 @@ export function resolveAcpCommand(
   provider: AcpProvider,
   env: NodeJS.ProcessEnv = process.env,
 ): string | undefined {
+  if (provider === "grok") {
+    return resolveGrokExecutable(env);
+  }
+  if (provider === "cline") {
+    return resolveClineExecutable(env);
+  }
   const configured = provider === "cursor"
     ? env.CURSOR_COMMAND
-    : provider === "copilot"
-      ? env.COPILOT_COMMAND
-      : env.GROK_COMMAND;
+    : env.COPILOT_COMMAND;
   const command = configured ?? ACP_COMMANDS[provider][0];
   if (command.includes("/") || command.includes("\\")) return executableExists(command) ? command : undefined;
   const path = env.PATH;
@@ -658,6 +705,15 @@ export function acpCommandArgs(
       "--workspace", resolve(context.workspaceRoot),
       ...(writeMode === "read_only" ? ["--mode", "plan"] : []),
       ...(writeMode === "full_access" ? ["--force"] : []),
+    ];
+  }
+  if (provider === "cline") {
+    return [
+      "--acp",
+      ...(context.model ? ["--model", context.model] : []),
+      ...(context.effort ? ["--thinking", context.effort] : []),
+      ...(writeMode === "read_only" ? ["--plan"] : []),
+      "--auto-approve",
     ];
   }
   if (provider === "grok") {
@@ -798,6 +854,73 @@ function readAcpCapabilities(value: unknown): AcpCapabilities {
     close: Boolean(sessions?.close),
     additionalDirectories: Boolean(sessions?.additionalDirectories),
   };
+}
+
+export function classifyAcpError(
+  error: unknown,
+  provider: AcpProvider,
+  sessionId?: string,
+  modelInfo?: { model?: string; variant?: string },
+  stderrTail?: string,
+): AgentProviderError | undefined {
+  const text = `${error instanceof Error ? error.message : String(error)} ${stderrTail ?? ""}`.trim();
+  if (/no access to clinepass subscription models/i.test(text)) {
+    return new AgentProviderFailureError({
+      code: "CLINEPASS_ENTITLEMENT_REQUIRED",
+      errorClass: "ENTITLEMENT_REQUIRED",
+      provider,
+      operation: "run",
+      retryable: false,
+      model: modelInfo?.model,
+      variant: modelInfo?.variant,
+      providerSessionId: sessionId,
+      providerMessage: text.slice(0, 400),
+      message: `ClinePass subscription entitlement required: ${text.slice(0, 400)}`,
+    });
+  }
+  if (/model.*(?:not found|unavailable|unknown)/i.test(text)) {
+    return new AgentProviderFailureError({
+      code: "PROVIDER_MODEL_UNAVAILABLE",
+      errorClass: "MODEL_UNAVAILABLE",
+      provider,
+      operation: "run",
+      retryable: false,
+      model: modelInfo?.model,
+      variant: modelInfo?.variant,
+      providerSessionId: sessionId,
+      providerMessage: text.slice(0, 400),
+      message: `Requested model is unavailable: ${text.slice(0, 400)}`,
+    });
+  }
+  if (/(unauthorized|unauthenticated|authentication|invalid token|invalid api key|401|403)/i.test(text)) {
+    return new AgentProviderFailureError({
+      code: "PROVIDER_AUTH_ERROR",
+      errorClass: "AUTH_FAILURE",
+      provider,
+      operation: "run",
+      retryable: false,
+      model: modelInfo?.model,
+      variant: modelInfo?.variant,
+      providerSessionId: sessionId,
+      providerMessage: text.slice(0, 400),
+      message: `Provider authentication failed: ${text.slice(0, 400)}`,
+    });
+  }
+  if (/(quota|capacity|rate limit|resource_exhausted|overloaded|429|503)/i.test(text)) {
+    return new AgentProviderFailureError({
+      code: "PROVIDER_CAPACITY_ERROR",
+      errorClass: "QUOTA_CAPACITY",
+      provider,
+      operation: "run",
+      retryable: true,
+      model: modelInfo?.model,
+      variant: modelInfo?.variant,
+      providerSessionId: sessionId,
+      providerMessage: text.slice(0, 400),
+      message: `Provider quota or capacity failure: ${text.slice(0, 400)}`,
+    });
+  }
+  return undefined;
 }
 
 function extractAcpText(updates: unknown[]): string {
