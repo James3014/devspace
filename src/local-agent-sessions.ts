@@ -47,13 +47,18 @@ import {
 import { validateOpencodeModelAndVariant } from "./local-agent-opencode-catalog.js";
 import { canonicalizePath, isPathInsideRoot } from "./roots.js";
 import {
+  assertNexusGrantAuthorizesExecution,
   assertSameExecutionGeneration,
   buildExecutionGenerationBinding,
   hashDispatchIntent,
   renderDispatchIntentForWorker,
   validateDispatchIntent,
+  validateResolvedNexusExecutionGrant,
+  type AuthorityValidationEvidence,
   type DispatchIntent,
   type ExecutionGenerationBinding,
+  type NexusExecutionGrant,
+  type NexusExecutionGrantRef,
   ExecutionProtocolError,
 } from "./execution-protocol.js";
 import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build-identity.js";
@@ -96,6 +101,7 @@ export type AgentErrorCode =
   | "INVALID_ATTEMPT_KEY"
   | "ATTEMPT_REPLAY_CONFLICT"
   | "CONTINUATION_ADMISSION_FAILED"
+  | "NEXUS_AUTHORITY_REJECTED"
   | "REBIND_REQUIRED";
 
 export class AgentSessionError extends Error {
@@ -390,6 +396,8 @@ export type AgentTurnRunner = (
   callbacks?: LocalAgentRunCallbacks,
 ) => Promise<LocalAgentRunResult>;
 
+export type NexusGrantResolver = (ref: NexusExecutionGrantRef) => Promise<NexusExecutionGrant>;
+
 // ─── Owned temp cleanup ──────────────────────────────────────────────────────
 
 /**
@@ -429,6 +437,7 @@ export class LocalAgentSessionManager {
   private readonly terminator: WorkerTerminator;
   private readonly turnRunner?: AgentTurnRunner;
   private readonly runtimeBuildIdentity: RuntimeBuildIdentity;
+  private readonly nexusGrantResolver: NexusGrantResolver;
   private closed = false;
   private readonly terminationAttempts = new Map<string, Promise<boolean>>();
 
@@ -438,11 +447,13 @@ export class LocalAgentSessionManager {
     testTerminator?: WorkerTerminator,
     testTurnRunner?: AgentTurnRunner,
     runtimeBuildIdentity?: RuntimeBuildIdentity,
+    nexusGrantResolver?: NexusGrantResolver,
   ) {
     this.store = createLocalAgentStore(config.stateDir);
     this.launcher = testLauncher ?? defaultWorkerLauncher;
     this.terminator = testTerminator ?? terminateOwnedWorker;
     this.turnRunner = testTurnRunner;
+    this.nexusGrantResolver = nexusGrantResolver ?? resolveCanonicalNexusExecutionGrant;
     this.runtimeBuildIdentity = runtimeBuildIdentity ?? describeRuntimeBuildIdentity({
       env: process.env,
       listenPort: config.port,
@@ -518,6 +529,7 @@ export class LocalAgentSessionManager {
       }
     }
 
+    await this.assertExecutionAuthority(profileName, executionContract);
     this.assertDispatchOwnershipAvailable(workspaceRoot, executionContract);
 
     if (!this.hasExecutionCapacity()) {
@@ -644,6 +656,35 @@ export class LocalAgentSessionManager {
     return recordToStartOutput(this.store.getById(record.id) ?? record);
   }
 
+  private async assertExecutionAuthority(profileName: string, contract: ExecutionContract | undefined): Promise<AuthorityValidationEvidence> {
+    const mode = contract?.authorityMode ?? "OWNER_DIRECT";
+    if (mode === "OWNER_DIRECT") {
+      if (contract?.nexusGrant) {
+        throw new AgentSessionError("NEXUS_AUTHORITY_REJECTED", "OWNER_DIRECT execution must not carry Nexus grant authority.");
+      }
+      return { kind: "OWNER_DIRECT" };
+    }
+    if (!contract?.nexusGrant || !contract.dispatchIntent || !contract.expectedHead) {
+      throw new AgentSessionError(
+        "NEXUS_AUTHORITY_REJECTED",
+        "NEXUS_GOVERNED execution requires canonical Nexus grant, dispatchIntent, and expectedHead before worker launch.",
+      );
+    }
+    try {
+      const grant = await this.nexusGrantResolver(contract.nexusGrant);
+      return assertNexusGrantAuthorizesExecution({
+        grant,
+        dispatchIntent: contract.dispatchIntent,
+        expectedHead: contract.expectedHead,
+        profile: profileName,
+        writePaths: contract.writePaths ?? [],
+      });
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      throw new AgentSessionError("NEXUS_AUTHORITY_REJECTED", `NEXUS_GOVERNED authority rejected before worker launch: ${detail}`);
+    }
+  }
+
   /**
    * Continue an existing agent session with a new prompt.
    * Provider session ID is preserved.
@@ -738,6 +779,7 @@ export class LocalAgentSessionManager {
     }
 
     const contract = record.executionContract;
+    await this.assertExecutionAuthority(record.profileName, contract);
     const lineageBaseline = record.lifecycleState?.turnEndBaseline ?? record.scopeBaseline;
 
     const physical = await inspectWorkspacePhysicalState(record.workspaceRoot);
@@ -2212,6 +2254,61 @@ function dispatchContractOutput(intent: DispatchIntent | undefined): DispatchCon
     exclusiveOwnership: intent.exclusiveOwnership,
     intentHash: hashDispatchIntent(intent),
   };
+}
+
+const NEXUS_CANONICAL_REMOTE = "https://github.com/James3014/Nexus-new.git";
+const NEXUS_RAW_HOST = "raw.githubusercontent.com";
+const NEXUS_AUTHORITY_FETCH_TIMEOUT_MS = 10_000;
+const NEXUS_AUTHORITY_MAX_BYTES = 256 * 1024;
+
+async function resolveCanonicalNexusExecutionGrant(ref: NexusExecutionGrantRef): Promise<NexusExecutionGrant> {
+  const observedMain = observeCanonicalNexusMain();
+  const [grantRaw, authorityRaw] = await Promise.all([
+    fetchCanonicalNexusText(ref.revision, ref.grantPath),
+    fetchCanonicalNexusText(ref.revision, ref.authorityPath),
+  ]);
+  return validateResolvedNexusExecutionGrant(ref, grantRaw, authorityRaw, observedMain);
+}
+
+function observeCanonicalNexusMain(): string {
+  const probe = spawnSync("git", ["ls-remote", NEXUS_CANONICAL_REMOTE, "refs/heads/main"], {
+    encoding: "utf8",
+    timeout: NEXUS_AUTHORITY_FETCH_TIMEOUT_MS,
+    env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+    maxBuffer: 64 * 1024,
+  });
+  if (probe.error || probe.status !== 0) {
+    throw new ExecutionProtocolError(
+      "NEXUS_AUTHORITY_NOT_VALIDATED",
+      `Unable to resolve canonical Nexus main: ${probe.error?.message ?? String(probe.stderr || `git exited ${probe.status}`)}`,
+    );
+  }
+  const match = /^([0-9a-f]{40})\s+refs\/heads\/main\s*$/m.exec(String(probe.stdout || ""));
+  if (!match) {
+    throw new ExecutionProtocolError("NEXUS_AUTHORITY_NOT_VALIDATED", "Canonical Nexus main probe returned malformed identity.");
+  }
+  return match[1];
+}
+
+async function fetchCanonicalNexusText(revision: string, path: string): Promise<string> {
+  const encodedPath = path.split("/").map((segment) => encodeURIComponent(segment)).join("/");
+  const url = new URL(`https://${NEXUS_RAW_HOST}/James3014/Nexus-new/${revision}/${encodedPath}`);
+  const response = await fetch(url, {
+    redirect: "error",
+    signal: AbortSignal.timeout(NEXUS_AUTHORITY_FETCH_TIMEOUT_MS),
+    headers: { Accept: "text/plain" },
+  });
+  if (!response.ok || new URL(response.url).hostname !== NEXUS_RAW_HOST) {
+    throw new ExecutionProtocolError(
+      "NEXUS_AUTHORITY_NOT_VALIDATED",
+      `Canonical Nexus authority fetch failed closed for ${path} (HTTP ${response.status}).`,
+    );
+  }
+  const raw = await response.text();
+  if (Buffer.byteLength(raw, "utf8") > NEXUS_AUTHORITY_MAX_BYTES) {
+    throw new ExecutionProtocolError("NEXUS_AUTHORITY_NOT_VALIDATED", `Canonical Nexus authority artifact ${path} exceeds the bounded size limit.`);
+  }
+  return raw;
 }
 
 function writeScopesOverlap(left: string[], right: string[]): boolean {

@@ -21,7 +21,13 @@ import {
   workerChangedPathsSinceBaseline,
 } from "./workspace-reconciliation.js";
 import type { WorkspacePhysicalState } from "./workspace-reconciliation.js";
-import type { DispatchIntent } from "./execution-protocol.js";
+import {
+  hashDispatchIntent,
+  hashNexusExecutionGrant,
+  type DispatchIntent,
+  type NexusExecutionGrant,
+  type NexusExecutionGrantRef,
+} from "./execution-protocol.js";
 
 const originalDependencyRoot = process.env.DEVSPACE_DEPENDENCY_ROOT;
 const codexRuntimeRoot = mkdtempSync(join(tmpdir(), "devspace-contract-codex-runtime-"));
@@ -87,6 +93,7 @@ function setupManager(
   overrides: Record<string, unknown> = {},
   turnRunner?: any,
   launcher?: any,
+  nexusGrantResolver?: (ref: NexusExecutionGrantRef) => Promise<NexusExecutionGrant>,
 ) {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-contract-state-"));
   const terminated: Array<{ id: string }> = [];
@@ -109,6 +116,8 @@ function setupManager(
     launcher ?? (async () => undefined),
     mockTerminator,
     turnRunner,
+    undefined,
+    nexusGrantResolver,
   );
 
   const clean = () => {
@@ -218,6 +227,42 @@ function controllerDispatchIntent(
     expectedEvidence: ["focused tests"],
     claimCeiling: "CANDIDATE_READY",
     ...overrides,
+  };
+}
+
+function governedGrant(intent: DispatchIntent, head: string, overrides: Partial<NexusExecutionGrant> = {}): NexusExecutionGrant {
+  const payload = {
+    schema: "nexus.devspace.execution_grant.v1" as const,
+    grantId: `grant-${intent.attemptId}`,
+    issuer: "nexus" as const,
+    taskId: intent.taskId,
+    attemptId: intent.attemptId,
+    devspaceBaseRevision: head,
+    dispatchIntentHash: hashDispatchIntent(intent),
+    profile: "reviewer",
+    writeScope: [...(intent.writeScope ?? [])],
+    effectCeiling: "CANDIDATE" as const,
+    claimCeiling: "CANDIDATE_READY" as const,
+    authorityPath: "tasks/g10/00-pilot.md",
+    authoritySha256: "b".repeat(64),
+    issuedAt: "2026-09-02T05:00:00.000Z",
+    expiresAt: "2099-09-02T07:00:00.000Z",
+    revocationState: "NOT_REVOKED" as const,
+    revokedAt: null,
+    revocationReason: null,
+    ...overrides,
+  };
+  return { ...payload, grantHash: hashNexusExecutionGrant(payload as any) };
+}
+
+function governedRef(): NexusExecutionGrantRef {
+  return {
+    repository: "James3014/Nexus-new",
+    revision: "c".repeat(40),
+    grantPath: "tasks/g10/grant.json",
+    grantSha256: "d".repeat(64),
+    authorityPath: "tasks/g10/00-pilot.md",
+    authoritySha256: "b".repeat(64),
   };
 }
 
@@ -338,6 +383,99 @@ test("R2 dispatchIntent is durable, injected into the worker prompt, and never u
     assert.equal((status as any).verified, undefined);
     assert.equal((status as any).accepted, undefined);
     assert.equal((status as any).merged, undefined);
+  } finally {
+    f.clean();
+    clean();
+  }
+});
+
+test("G9 NEXUS_GOVERNED rejects mismatched canonical grant before durable record or worker launch", async () => {
+  const f = setupGitFixture();
+  let launches = 0;
+  const intent = controllerDispatchIntent("attempt-g9-reject", ["src"]);
+  const badGrant = governedGrant(intent, f.head, { profile: "different-profile" });
+  const { manager, clean } = setupManager(
+    {},
+    undefined,
+    async () => { launches += 1; },
+    async () => badGrant,
+  );
+  try {
+    await assert.rejects(
+      manager.startAgent({
+        workspaceId: "ws_g9_reject",
+        workspaceRoot: f.repo,
+        profileName: "reviewer",
+        prompt: "must never launch",
+        profiles: mockProfiles,
+        attemptKey: intent.attemptId,
+        executionContract: {
+          authorityMode: "NEXUS_GOVERNED",
+          nexusGrant: governedRef(),
+          dispatchIntent: intent,
+          expectedHead: f.head,
+          writePaths: ["src"],
+        },
+      }),
+      (error: any) => error instanceof AgentSessionError && error.code === "NEXUS_AUTHORITY_REJECTED" && /profile mismatch/.test(error.message),
+    );
+    assert.equal(launches, 0);
+    assert.equal(manager.listAgents({ workspaceId: "ws_g9_reject" }).length, 0);
+  } finally {
+    f.clean();
+    clean();
+  }
+});
+
+test("G9 NEXUS_GOVERNED starts only after canonical grant validation and revalidates before continuation", async () => {
+  const f = setupGitFixture();
+  let launches = 0;
+  let validations = 0;
+  const intent = controllerDispatchIntent("attempt-g9-valid", ["src"]);
+  const validGrant = governedGrant(intent, f.head);
+  const revokedGrant = governedGrant(intent, f.head, {
+    revocationState: "REVOKED",
+    revokedAt: "2026-09-02T06:00:00.000Z",
+    revocationReason: "owner revoked",
+  });
+  const { manager, clean } = setupManager(
+    {},
+    undefined,
+    async () => { launches += 1; },
+    async () => (++validations === 1 ? validGrant : revokedGrant),
+  );
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_g9_valid",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "bounded governed work",
+      profiles: mockProfiles,
+      attemptKey: intent.attemptId,
+      executionContract: {
+        authorityMode: "NEXUS_GOVERNED",
+        nexusGrant: governedRef(),
+        dispatchIntent: intent,
+        expectedHead: f.head,
+        writePaths: ["src"],
+      },
+    });
+    assert.equal(launches, 1);
+    assert.equal(validations, 1);
+    settleForContinuation(manager, started.agentId, { latestResponse: "DONE", terminalReason: "completed" });
+
+    await assert.rejects(
+      manager.continueAgent({
+        workspaceId: "ws_g9_valid",
+        workspaceRoot: f.repo,
+        agentId: started.agentId,
+        prompt: "must not relaunch after revocation",
+        profiles: mockProfiles,
+      }),
+      (error: any) => error instanceof AgentSessionError && error.code === "NEXUS_AUTHORITY_REJECTED" && /revoked/.test(error.message),
+    );
+    assert.equal(validations, 2);
+    assert.equal(launches, 1);
   } finally {
     f.clean();
     clean();

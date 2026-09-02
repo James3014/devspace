@@ -1,6 +1,9 @@
 import {
   parseDispatchIntent,
+  parseNexusExecutionGrantRef,
   type DispatchIntent,
+  type ExecutionAuthorityMode,
+  type NexusExecutionGrantRef,
 } from "./execution-protocol.js";
 
 /**
@@ -25,6 +28,10 @@ export type AgentTerminalReason =
   | "unknown";
 
 export interface ExecutionContract {
+  /** Defaults to OWNER_DIRECT for backwards compatibility. */
+  authorityMode?: ExecutionAuthorityMode;
+  /** Immutable canonical Nexus authority pointer, required only for NEXUS_GOVERNED. */
+  nexusGrant?: NexusExecutionGrantRef;
   /** Controller-authored bounded work semantics, transported durably by DevSpace. */
   dispatchIntent?: DispatchIntent;
   /**
@@ -116,6 +123,17 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
   const record = value as Record<string, unknown>;
   const contract: ExecutionContract = {};
 
+  if (record.authorityMode !== undefined) {
+    if (record.authorityMode !== "OWNER_DIRECT" && record.authorityMode !== "NEXUS_GOVERNED") {
+      throw new Error("executionContract.authorityMode must be OWNER_DIRECT or NEXUS_GOVERNED.");
+    }
+    contract.authorityMode = record.authorityMode;
+  }
+
+  if (record.nexusGrant !== undefined) {
+    contract.nexusGrant = parseNexusExecutionGrantRef(record.nexusGrant);
+  }
+
   if (record.dispatchIntent !== undefined) {
     contract.dispatchIntent = parseDispatchIntent(record.dispatchIntent);
   }
@@ -180,6 +198,16 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
       throw new Error("executionContract.idleTimeoutMs must be a positive integer.");
     }
     contract.idleTimeoutMs = record.idleTimeoutMs;
+  }
+
+  const authorityMode = contract.authorityMode ?? "OWNER_DIRECT";
+  if (authorityMode === "OWNER_DIRECT" && contract.nexusGrant) {
+    throw new Error("OWNER_DIRECT execution must not carry Nexus grant authority.");
+  }
+  if (authorityMode === "NEXUS_GOVERNED") {
+    if (!contract.nexusGrant || !contract.dispatchIntent || !contract.expectedHead) {
+      throw new Error("NEXUS_GOVERNED execution requires nexusGrant, dispatchIntent, and expectedHead.");
+    }
   }
 
   if (contract.dispatchIntent) {

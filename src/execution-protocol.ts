@@ -28,6 +28,50 @@ export type DispatchRoleIntent =
  */
 export type DispatchClaimCeiling = "RESULT_RETURNED" | "IMPLEMENTED" | "CANDIDATE_READY";
 
+export const NEXUS_EXECUTION_GRANT_SCHEMA = "nexus.devspace.execution_grant.v1" as const;
+export const NEXUS_CANONICAL_REPOSITORY = "James3014/Nexus-new" as const;
+
+/**
+ * Caller-supplied pointer to immutable Nexus authority. The pointer is not
+ * authority by itself: the runtime must prove that revision is the current
+ * canonical Nexus main revision and load the exact tracked bytes before use.
+ */
+export interface NexusExecutionGrantRef {
+  repository: typeof NEXUS_CANONICAL_REPOSITORY;
+  revision: string;
+  grantPath: string;
+  grantSha256: string;
+  authorityPath: string;
+  authoritySha256: string;
+}
+
+/**
+ * Canonical Nexus-owned authorization for one DevSpace attempt. This contract
+ * can only narrow execution. Verification/acceptance/merge/release authority
+ * is deliberately not representable.
+ */
+export interface NexusExecutionGrant {
+  schema: typeof NEXUS_EXECUTION_GRANT_SCHEMA;
+  grantId: string;
+  issuer: "nexus";
+  taskId: string;
+  attemptId: string;
+  devspaceBaseRevision: string;
+  dispatchIntentHash: string;
+  profile: string;
+  writeScope: string[];
+  effectCeiling: ExecutionEffectCeiling;
+  claimCeiling: DispatchClaimCeiling;
+  authorityPath: string;
+  authoritySha256: string;
+  issuedAt: string;
+  expiresAt: string;
+  revocationState: "NOT_REVOKED" | "REVOKED";
+  revokedAt: string | null;
+  revocationReason: string | null;
+  grantHash: string;
+}
+
 /**
  * Controller-authored semantic contract for one bounded delegated attempt.
  * This is transported/persisted by DevSpace but does not grant routing,
@@ -160,6 +204,7 @@ export class ExecutionProtocolError extends Error {
       | "INVALID_EXECUTION_BINDING"
       | "INVALID_DISPATCH_INTENT"
       | "NEXUS_AUTHORITY_NOT_VALIDATED"
+      | "INVALID_NEXUS_EXECUTION_GRANT"
       | "AUTHORITY_EVIDENCE_MISMATCH"
       | "EXECUTION_GENERATION_MISMATCH"
       | "LEGACY_EXECUTION_BINDING_MISSING",
@@ -204,6 +249,186 @@ export function parseDispatchIntent(value: unknown): DispatchIntent {
 export function hashDispatchIntent(intent: DispatchIntent): string {
   validateDispatchIntent(intent);
   return sha256(canonicalJson(intent));
+}
+
+export function parseNexusExecutionGrantRef(value: unknown): NexusExecutionGrantRef {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", "nexusGrant must be an object.");
+  }
+  const record = value as Record<string, unknown>;
+  const ref: NexusExecutionGrantRef = {
+    repository: record.repository as typeof NEXUS_CANONICAL_REPOSITORY,
+    revision: record.revision as string,
+    grantPath: record.grantPath as string,
+    grantSha256: record.grantSha256 as string,
+    authorityPath: record.authorityPath as string,
+    authoritySha256: record.authoritySha256 as string,
+  };
+  validateNexusExecutionGrantRef(ref);
+  return ref;
+}
+
+export function validateNexusExecutionGrantRef(ref: NexusExecutionGrantRef): void {
+  if (ref.repository !== NEXUS_CANONICAL_REPOSITORY) {
+    throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", "Nexus execution grant repository is not canonical.");
+  }
+  requireHex(ref.revision, 40, "nexusGrant.revision");
+  requireHex(ref.grantSha256, 64, "nexusGrant.grantSha256");
+  requireHex(ref.authoritySha256, 64, "nexusGrant.authoritySha256");
+  validateNexusAuthorityPath(ref.grantPath, "nexusGrant.grantPath", ".json");
+  validateNexusAuthorityPath(ref.authorityPath, "nexusGrant.authorityPath");
+}
+
+export function parseNexusExecutionGrant(value: unknown): NexusExecutionGrant {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", "Tracked Nexus execution grant must be an object.");
+  }
+  const record = value as Record<string, unknown>;
+  const grant: NexusExecutionGrant = {
+    schema: record.schema as typeof NEXUS_EXECUTION_GRANT_SCHEMA,
+    grantId: record.grantId as string,
+    issuer: record.issuer as "nexus",
+    taskId: record.taskId as string,
+    attemptId: record.attemptId as string,
+    devspaceBaseRevision: record.devspaceBaseRevision as string,
+    dispatchIntentHash: record.dispatchIntentHash as string,
+    profile: record.profile as string,
+    writeScope: stringArrayForGrant(record.writeScope, "writeScope"),
+    effectCeiling: record.effectCeiling as ExecutionEffectCeiling,
+    claimCeiling: record.claimCeiling as DispatchClaimCeiling,
+    authorityPath: record.authorityPath as string,
+    authoritySha256: record.authoritySha256 as string,
+    issuedAt: record.issuedAt as string,
+    expiresAt: record.expiresAt as string,
+    revocationState: record.revocationState as "NOT_REVOKED" | "REVOKED",
+    revokedAt: record.revokedAt as string | null,
+    revocationReason: record.revocationReason as string | null,
+    grantHash: record.grantHash as string,
+  };
+  validateNexusExecutionGrant(grant);
+  return grant;
+}
+
+export function hashNexusExecutionGrant(grant: Omit<NexusExecutionGrant, "grantHash"> | NexusExecutionGrant): string {
+  const { grantHash: _grantHash, ...payload } = grant as NexusExecutionGrant;
+  return sha256(canonicalJson(payload));
+}
+
+export function validateResolvedNexusExecutionGrant(
+  ref: NexusExecutionGrantRef,
+  grantRaw: string,
+  authorityRaw: string,
+  observedCanonicalMain: string,
+): NexusExecutionGrant {
+  validateNexusExecutionGrantRef(ref);
+  requireHex(observedCanonicalMain, 40, "observedCanonicalMain");
+  if (observedCanonicalMain !== ref.revision) {
+    throw new ExecutionProtocolError(
+      "NEXUS_AUTHORITY_NOT_VALIDATED",
+      `Nexus grant revision ${ref.revision} is not current canonical main ${observedCanonicalMain}; rebind required.`,
+    );
+  }
+  if (sha256(grantRaw) !== ref.grantSha256) {
+    throw new ExecutionProtocolError("NEXUS_AUTHORITY_NOT_VALIDATED", "Tracked Nexus execution grant bytes do not match grantSha256.");
+  }
+  if (sha256(authorityRaw) !== ref.authoritySha256) {
+    throw new ExecutionProtocolError("NEXUS_AUTHORITY_NOT_VALIDATED", "Tracked Nexus authority bytes do not match authoritySha256.");
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(grantRaw);
+  } catch {
+    throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", "Tracked Nexus execution grant is not valid JSON.");
+  }
+  const grant = parseNexusExecutionGrant(parsed);
+  if (grant.authorityPath !== ref.authorityPath || grant.authoritySha256 !== ref.authoritySha256) {
+    throw new ExecutionProtocolError("AUTHORITY_EVIDENCE_MISMATCH", "Nexus execution grant authority binding does not match the tracked authority artifact.");
+  }
+  return grant;
+}
+
+export function assertNexusGrantAuthorizesExecution(input: {
+  grant: NexusExecutionGrant;
+  dispatchIntent: DispatchIntent;
+  expectedHead: string;
+  profile: string;
+  writePaths: string[];
+  now?: Date;
+}): AuthorityValidationEvidence {
+  const { grant, dispatchIntent, expectedHead, profile, writePaths } = input;
+  validateNexusExecutionGrant(grant);
+  validateDispatchIntent(dispatchIntent);
+  const now = input.now ?? new Date();
+  if (!Number.isFinite(now.getTime())) {
+    throw new ExecutionProtocolError("NEXUS_AUTHORITY_NOT_VALIDATED", "Current time is invalid for Nexus grant validation.");
+  }
+  if (grant.revocationState !== "NOT_REVOKED" || grant.revokedAt !== null || grant.revocationReason !== null) {
+    throw new ExecutionProtocolError("NEXUS_AUTHORITY_NOT_VALIDATED", "Nexus execution grant is revoked.");
+  }
+  if (now.getTime() < Date.parse(grant.issuedAt) || now.getTime() >= Date.parse(grant.expiresAt)) {
+    throw new ExecutionProtocolError("NEXUS_AUTHORITY_NOT_VALIDATED", "Nexus execution grant is not currently valid.");
+  }
+  if (grant.taskId !== dispatchIntent.taskId || grant.attemptId !== dispatchIntent.attemptId) {
+    throw new ExecutionProtocolError("AUTHORITY_EVIDENCE_MISMATCH", "Nexus grant task/attempt does not match dispatch intent.");
+  }
+  if (grant.devspaceBaseRevision !== expectedHead.toLowerCase()) {
+    throw new ExecutionProtocolError("AUTHORITY_EVIDENCE_MISMATCH", "Nexus grant target base does not match execution expectedHead.");
+  }
+  if (grant.dispatchIntentHash !== hashDispatchIntent(dispatchIntent)) {
+    throw new ExecutionProtocolError("AUTHORITY_EVIDENCE_MISMATCH", "Nexus grant dispatch-intent hash mismatch.");
+  }
+  if (grant.profile !== profile) {
+    throw new ExecutionProtocolError("AUTHORITY_EVIDENCE_MISMATCH", "Nexus grant worker profile mismatch.");
+  }
+  if (!scopeIsNarrowerOrEqual(writePaths, grant.writeScope)) {
+    throw new ExecutionProtocolError("AUTHORITY_EVIDENCE_MISMATCH", "Execution write scope exceeds Nexus grant authority.");
+  }
+  if (writePaths.length > 0 && grant.effectCeiling === "READ_ONLY") {
+    throw new ExecutionProtocolError("AUTHORITY_EVIDENCE_MISMATCH", "Mutating execution exceeds Nexus grant effect ceiling.");
+  }
+  if (claimCeilingRank(dispatchIntent.claimCeiling) > claimCeilingRank(grant.claimCeiling)) {
+    throw new ExecutionProtocolError("AUTHORITY_EVIDENCE_MISMATCH", "Dispatch claim ceiling exceeds Nexus grant authority.");
+  }
+  return { kind: "NEXUS_VALIDATED", grantId: grant.grantId, grantHash: grant.grantHash };
+}
+
+export function validateNexusExecutionGrant(grant: NexusExecutionGrant): void {
+  if (grant.schema !== NEXUS_EXECUTION_GRANT_SCHEMA || grant.issuer !== "nexus") {
+    throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", "Nexus execution grant schema/issuer mismatch.");
+  }
+  requireGrantText(grant.grantId, "grantId");
+  requireGrantText(grant.taskId, "taskId");
+  requireGrantText(grant.attemptId, "attemptId");
+  requireHex(grant.devspaceBaseRevision, 40, "devspaceBaseRevision");
+  requireHex(grant.dispatchIntentHash, 64, "dispatchIntentHash");
+  requireGrantText(grant.profile, "profile");
+  validateGrantScope(grant.writeScope);
+  if (!["READ_ONLY", "WORKSPACE_MUTATION", "CANDIDATE"].includes(grant.effectCeiling)) {
+    throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", `Unsupported effectCeiling: ${grant.effectCeiling}`);
+  }
+  if (!["RESULT_RETURNED", "IMPLEMENTED", "CANDIDATE_READY"].includes(grant.claimCeiling)) {
+    throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", `Unsupported claimCeiling: ${grant.claimCeiling}`);
+  }
+  validateNexusAuthorityPath(grant.authorityPath, "authorityPath");
+  requireHex(grant.authoritySha256, 64, "authoritySha256");
+  requireIsoDate(grant.issuedAt, "issuedAt");
+  requireIsoDate(grant.expiresAt, "expiresAt");
+  if (Date.parse(grant.issuedAt) >= Date.parse(grant.expiresAt)) {
+    throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", "Nexus execution grant expiry must be after issuance.");
+  }
+  if (!["NOT_REVOKED", "REVOKED"].includes(grant.revocationState)) {
+    throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", "Nexus execution grant revocationState is invalid.");
+  }
+  if (grant.revocationState === "NOT_REVOKED" && (grant.revokedAt !== null || grant.revocationReason !== null)) {
+    throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", "Active Nexus execution grant must not carry revocation metadata.");
+  }
+  if (grant.revocationState === "REVOKED" && (!grant.revokedAt || !grant.revocationReason)) {
+    throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", "Revoked Nexus execution grant requires revocation metadata.");
+  }
+  requireHex(grant.grantHash, 64, "grantHash");
+  if (grant.grantHash !== hashNexusExecutionGrant(grant)) {
+    throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", "Nexus execution grant hash mismatch.");
+  }
 }
 
 export function validateDispatchIntent(intent: DispatchIntent): void {
@@ -389,6 +614,64 @@ export function deserializeExecutionGenerationBinding(value: string | null | und
     return parsed as ExecutionGenerationBinding;
   } catch {
     return undefined;
+  }
+}
+
+function stringArrayForGrant(value: unknown, field: string): string[] {
+  if (!Array.isArray(value) || !value.every((entry) => typeof entry === "string")) {
+    throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", `${field} must be an array of strings.`);
+  }
+  return value.map((entry) => entry.trim());
+}
+
+function requireGrantText(value: unknown, field: string): asserts value is string {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", `${field} must be a non-empty string.`);
+  }
+}
+
+function requireHex(value: unknown, length: 40 | 64, field: string): asserts value is string {
+  if (typeof value !== "string" || !new RegExp(`^[0-9a-f]{${length}}$`).test(value)) {
+    throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", `${field} must be lowercase ${length}-hex.`);
+  }
+}
+
+function requireIsoDate(value: unknown, field: string): asserts value is string {
+  if (typeof value !== "string" || !value || !Number.isFinite(Date.parse(value))) {
+    throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", `${field} must be an ISO timestamp.`);
+  }
+}
+
+function validateNexusAuthorityPath(value: unknown, field: string, suffix?: string): asserts value is string {
+  requireGrantText(value, field);
+  const path = value.replaceAll("\\", "/");
+  if (!path.startsWith("tasks/") || path.startsWith("/") || path.split("/").includes("..") || (suffix && !path.endsWith(suffix))) {
+    throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", `${field} must be a canonical tasks/ repository path${suffix ? ` ending in ${suffix}` : ""}.`);
+  }
+}
+
+function claimCeilingRank(value: DispatchClaimCeiling): number {
+  return value === "RESULT_RETURNED" ? 0 : value === "IMPLEMENTED" ? 1 : 2;
+}
+
+function normalizeWorkspacePath(value: string): string {
+  return value.trim().replaceAll("\\", "/").replace(/^\.\//, "").replace(/\/$/, "");
+}
+
+function scopeIsNarrowerOrEqual(requested: string[], authorized: string[]): boolean {
+  const ceilings = authorized.map(normalizeWorkspacePath);
+  return requested.map(normalizeWorkspacePath).every((path) =>
+    ceilings.some((ceiling) => path === ceiling || path.startsWith(`${ceiling}/`)),
+  );
+}
+
+function validateGrantScope(value: string[]): void {
+  for (const entry of value) {
+    requireGrantText(entry, "writeScope entry");
+    const path = entry.replaceAll("\\", "/");
+    if (path === "." || path.startsWith("/") || path.split("/").includes("..")) {
+      throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", `writeScope contains an invalid workspace-relative path: ${entry}`);
+    }
   }
 }
 

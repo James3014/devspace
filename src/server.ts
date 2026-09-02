@@ -2605,6 +2605,14 @@ export function createMcpServer(
       exclusiveOwnership: z.boolean(),
       intentHash: z.string(),
     });
+    const NEXUS_GRANT_REF_INPUT_SCHEMA = z.object({
+      repository: z.literal("James3014/Nexus-new"),
+      revision: z.string().regex(/^[0-9a-f]{40}$/),
+      grantPath: z.string().startsWith("tasks/"),
+      grantSha256: z.string().regex(/^[0-9a-f]{64}$/),
+      authorityPath: z.string().startsWith("tasks/"),
+      authoritySha256: z.string().regex(/^[0-9a-f]{64}$/),
+    }).strict();
 
     registerAppTool(
       server,
@@ -2624,6 +2632,12 @@ export function createMcpServer(
             .describe("Optional physical-workspace-scoped replay identity. Exact request replays reuse one durable agent; conflicting reuse fails closed."),
           executionContract: z
             .object({
+              authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).optional().describe(
+                "Execution authority lane. OWNER_DIRECT is the backwards-compatible default. NEXUS_GOVERNED requires canonical Nexus authority evidence and never falls back to direct authority.",
+              ),
+              nexusGrant: NEXUS_GRANT_REF_INPUT_SCHEMA.optional().describe(
+                "Immutable pointer to a canonical Nexus execution grant and its governing Task Card. Dev MCP independently verifies current Nexus main and tracked bytes before worker launch.",
+              ),
               dispatchIntent: AGENT_DISPATCH_INTENT_INPUT_SCHEMA.describe(
                 "Controller-authored bounded task semantics. Dev MCP transports and mechanically enforces applicable scope/ownership constraints but does not gain planner, verifier, acceptance, merge, or release authority.",
               ),

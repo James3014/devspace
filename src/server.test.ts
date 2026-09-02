@@ -889,6 +889,71 @@ test("subagents: controller dispatchIntent crosses the MCP schema without gainin
   assert.equal(invalidClaim.isError, true);
 });
 
+test("subagents: NEXUS_GOVERNED fails closed at the MCP boundary without complete canonical grant evidence", async (t) => {
+  const context = await fixture(t, { git: true, subagents: true });
+  const openResult = await callOpen(context.client, context.project, "chat-nexus-governed-missing-grant");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+  const head = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: context.project });
+  const intent = {
+    taskId: "task-server-g9",
+    attemptId: "attempt-server-g9",
+    objective: "Perform one bounded governed change.",
+    roleIntent: "DEEP_ENGINEERING",
+    readScope: ["src"],
+    writeScope: ["src"],
+    exclusiveOwnership: true,
+    forbiddenChanges: ["Do not fall back to OWNER_DIRECT."],
+    acceptanceCriteria: ["Reject missing Nexus authority before launch."],
+    verificationRequired: true,
+    expectedEvidence: ["typed rejection"],
+    claimCeiling: "CANDIDATE_READY",
+  };
+
+  const missingGrant = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "must not launch",
+      attemptKey: intent.attemptId,
+      executionContract: {
+        authorityMode: "NEXUS_GOVERNED",
+        dispatchIntent: intent,
+        expectedHead: head.stdout.trim(),
+        writePaths: ["src"],
+      },
+    },
+  });
+  assert.equal(missingGrant.isError, true);
+  assert.match(responseText(missingGrant), /NEXUS_GOVERNED.*requires nexusGrant/i);
+
+  const directWithSyntheticGrant = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "must not launch",
+      attemptKey: "attempt-server-g9-direct",
+      executionContract: {
+        authorityMode: "OWNER_DIRECT",
+        nexusGrant: {
+          repository: "James3014/Nexus-new",
+          revision: "a".repeat(40),
+          grantPath: "tasks/g9/grant.json",
+          grantSha256: "b".repeat(64),
+          authorityPath: "tasks/g9/00-task.md",
+          authoritySha256: "c".repeat(64),
+        },
+        dispatchIntent: { ...intent, attemptId: "attempt-server-g9-direct" },
+        expectedHead: head.stdout.trim(),
+        writePaths: ["src"],
+      },
+    },
+  });
+  assert.equal(directWithSyntheticGrant.isError, true);
+  assert.match(responseText(directWithSyntheticGrant), /OWNER_DIRECT.*must not carry Nexus grant/i);
+});
+
 test("subagents: agent_start executionContract expectedHead mismatch fails closed", async (t) => {
   const context = await fixture(t, { git: true, subagents: true });
   const openResult = await callOpen(context.client, context.project, "chat-contract");
