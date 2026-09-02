@@ -804,7 +804,14 @@ async function readGitRemote(root: string): Promise<string | undefined> {
   }
 }
 
-export const NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE = String.raw`
+export function buildNexusGatewayRecoveryBridgeCode(
+  acceptedManagerSha256: string,
+  acceptedContractSha256: string,
+): string {
+  if (!HEX64.test(acceptedManagerSha256) || !HEX64.test(acceptedContractSha256)) {
+    throw new Error("Nexus Gateway bridge trust-root hashes must be lowercase SHA-256 values.");
+  }
+  return String.raw`
 import hashlib
 import importlib.util
 import json
@@ -823,8 +830,8 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 DEPLOYMENT_ID = re.compile(r"^r1-[0-9a-f]{40}$")
 REMOTE = "https://github.com/James3014/Nexus-new.git"
-ACCEPTED_MANAGER_SHA256 = "6625224ab881cdbd68f66607d190b1b0b7608c9175a1e69f0222653af467c125"
-ACCEPTED_CONTRACT_SHA256 = "9b830307d3f90842180ede6fa70185577706100dded60e9d425537aa2e7f0b93"
+ACCEPTED_MANAGER_SHA256 = "${acceptedManagerSha256}"
+ACCEPTED_CONTRACT_SHA256 = "${acceptedContractSha256}"
 
 
 def fail(message):
@@ -942,6 +949,12 @@ except Exception as exc:
     print("NEXUS_GATEWAY_BRIDGE_ERROR:" + type(exc).__name__ + ":" + str(exc), file=sys.stderr)
     raise SystemExit(1)
 `;
+}
+
+export const NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE = buildNexusGatewayRecoveryBridgeCode(
+  NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256,
+  NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256,
+);
 
 async function spawnNexusGatewayRecovery(
   request: NexusGatewayRecoveryRequest,
