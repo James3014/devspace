@@ -18,6 +18,8 @@ const HEX64 = /^[0-9a-f]{64}$/;
 const NEXUS_DEPLOYMENT_ID = /^r1-[0-9a-f]{40}$/;
 export const NEXUS_GATEWAY_RECOVERY_SCHEMA = "nexus.gateway.durable_recovery_request.v1" as const;
 export const NEXUS_GATEWAY_INTERPRETER = "/Users/jameschen/Workspace/Nexus-new/.venv/bin/python";
+export const NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256 = "6625224ab881cdbd68f66607d190b1b0b7608c9175a1e69f0222653af467c125";
+export const NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256 = "9b830307d3f90842180ede6fa70185577706100dded60e9d425537aa2e7f0b93";
 export const NEXUS_GATEWAY_STATE_ROOT = join(homedir(), "Library", "Application Support", "Nexus", "gateway-direct");
 
 export interface NexusGatewayRecoveryRequest {
@@ -821,6 +823,8 @@ HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 DEPLOYMENT_ID = re.compile(r"^r1-[0-9a-f]{40}$")
 REMOTE = "https://github.com/James3014/Nexus-new.git"
+ACCEPTED_MANAGER_SHA256 = "6625224ab881cdbd68f66607d190b1b0b7608c9175a1e69f0222653af467c125"
+ACCEPTED_CONTRACT_SHA256 = "9b830307d3f90842180ede6fa70185577706100dded60e9d425537aa2e7f0b93"
 
 
 def fail(message):
@@ -864,9 +868,9 @@ try:
     if authority.get("revocation_state") != "NOT_REVOKED":
         fail("recovery authority is not active")
     manager_hash = authority.get("final_manager_sha256")
-    if not isinstance(manager_hash, str) or HEX64.fullmatch(manager_hash) is None:
-        fail("recovery authority manager hash invalid")
-    if hashlib.sha256(MANAGER.read_bytes()).hexdigest() != manager_hash:
+    if manager_hash != ACCEPTED_MANAGER_SHA256:
+        fail("recovery authority accepted manager hash mismatch")
+    if hashlib.sha256(MANAGER.read_bytes()).hexdigest() != ACCEPTED_MANAGER_SHA256:
         fail("manager artifact hash mismatch")
 
     binding_pairs = (
@@ -920,6 +924,10 @@ try:
         fail("desired deployment commit mismatch")
     if git(desired_root, "rev-parse", "HEAD^{tree}") != desired_tree:
         fail("desired deployment tree mismatch")
+    contract_path = desired_root / "nexus" / "contracts" / "gateway_deployment.py"
+    secure_file(contract_path, "gateway deployment authority contract")
+    if hashlib.sha256(contract_path.read_bytes()).hexdigest() != ACCEPTED_CONTRACT_SHA256:
+        fail("gateway deployment authority contract hash mismatch")
 
     sys.path.insert(0, str(desired_root))
     spec = importlib.util.spec_from_file_location("nexus_gateway_stable_manager", MANAGER)
