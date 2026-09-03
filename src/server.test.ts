@@ -1110,13 +1110,25 @@ test("gitCandidates enabled: git tools are present with schema validation", asyn
   const context = await fixture(t, { git: true, gitCandidates: true });
   const tools = await context.client.listTools();
   const gitTools = tools.tools.filter((tool) => tool.name.startsWith("git_"));
-  assert.equal(gitTools.length, 2);
+  assert.equal(gitTools.length, 3);
 
   const commitTool = gitTools.find((tool) => tool.name === "git_commit");
   const pushTool = gitTools.find((tool) => tool.name === "git_push");
+  const promoteTool = gitTools.find((tool) => tool.name === "git_promote_candidate");
 
   assert.ok(commitTool);
   assert.ok(pushTool);
+  assert.ok(promoteTool);
+
+  const promoteProps = promoteTool.inputSchema.properties as Record<string, any>;
+  assert.equal(promoteProps.canonicalRemote, undefined);
+  assert.equal(promoteProps.canonicalHead, undefined);
+  assert.equal(promoteProps.requiredCapabilityIds, undefined);
+  assert.equal(promoteProps.candidateCapabilityIds, undefined);
+  assert.ok(promoteProps.expectedServerInstanceId);
+  assert.ok(promoteProps.expectedSourceCommit);
+  assert.ok(promoteProps.expectedBuildId);
+  assert.ok(promoteProps.expectedCapabilityManifestSha256);
 
   // Security schemas verification: NO workspaceRoot, cwd, remoteUrl, refspec, rawArgs, force, noVerify, delete, all
   const commitProps = commitTool.inputSchema.properties as Record<string, any>;
@@ -1161,6 +1173,21 @@ test("gitCandidates enabled: git tools are present with schema validation", asyn
   });
   assert.equal(res.isError, true);
   assert.match(responseText(res), /GIT_MANAGED_WORKTREE_REQUIRED/);
+});
+
+test("agent_start schema preserves #28 heartbeat and G9/G10 authority capabilities", async (t) => {
+  const context = await fixture(t, { subagents: true });
+  const tools = await context.client.listTools();
+  const start = tools.tools.find((tool) => tool.name === "agent_start");
+  assert.ok(start);
+  const props = start.inputSchema.properties as Record<string, any>;
+  const contract = props.executionContract;
+  const contractProps = contract.anyOf?.find((entry: any) => entry.type === "object")?.properties
+    ?? contract.properties;
+  assert.ok(contractProps.authorityMode);
+  assert.ok(contractProps.nexusGrant);
+  assert.ok(contractProps.idleTimeoutMs);
+  assert.match(contractProps.idleTimeoutMs.description, /terminated.*no provider activity/i);
 });
 
 test("git candidates tools - MCP managed worktree end-to-end integration test", async (t) => {

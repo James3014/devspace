@@ -22,6 +22,7 @@ import { commitCandidate, pushCandidate, GitCandidateError } from "./git-candida
 import {
   integrateCandidate,
   inspectIntegrationReadiness,
+  promoteCandidate,
   probeRemoteWritability,
 } from "./git-integration.js";
 import {
@@ -77,6 +78,10 @@ import {
   type ProfileCatalogEntry,
 } from "./local-agent-profile-source.js";
 import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build-identity.js";
+import {
+  deriveLoadedCapabilityManifest,
+  type CapabilityManifest,
+} from "./capability-manifest.js";
 import { devspaceConfigDir } from "./user-config.js";
 import {
   formatLocalAgentProviderAvailabilitySummary,
@@ -1260,6 +1265,83 @@ function registerRepositoryIntelligenceTools(
 export interface RuntimeBuildIdentityContext {
   identity: RuntimeBuildIdentity;
   latestProfileCatalogGeneration: { value: string };
+  capabilityManifest?: CapabilityManifest;
+}
+
+function createAgentStartInputSchema() {
+  const dispatchIntent = z.object({
+    taskId: z.string().min(1),
+    attemptId: z.string().min(1),
+    objective: z.string().min(1),
+    roleIntent: z.enum([
+      "EVIDENCE_COLLECTOR",
+      "MECHANICAL_EXECUTOR",
+      "DEEP_ENGINEERING",
+      "TEST_VERIFIER",
+      "INDEPENDENT_REVIEWER",
+      "RECOVERY_RECONCILER",
+    ]),
+    context: z.array(z.string()).optional(),
+    readScope: z.array(z.string()).optional(),
+    writeScope: z.array(z.string()).optional(),
+    exclusiveOwnership: z.boolean(),
+    forbiddenChanges: z.array(z.string()).optional(),
+    acceptanceCriteria: z.array(z.string()).min(1),
+    verificationRequired: z.boolean(),
+    expectedArtifacts: z.array(z.string()).optional(),
+    expectedEvidence: z.array(z.string()).optional(),
+    claimCeiling: z.enum(["RESULT_RETURNED", "IMPLEMENTED", "CANDIDATE_READY"]),
+  }).strict();
+  const nexusGrant = z.object({
+    repository: z.literal("James3014/Nexus-new"),
+    revision: z.string().regex(/^[0-9a-f]{40}$/),
+    grantPath: z.string().startsWith("tasks/"),
+    grantSha256: z.string().regex(/^[0-9a-f]{64}$/),
+    authorityPath: z.string().startsWith("tasks/"),
+    authoritySha256: z.string().regex(/^[0-9a-f]{64}$/),
+  }).strict();
+  const executionContract = z.object({
+    authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).optional().describe(
+      "Execution authority lane. OWNER_DIRECT is the backwards-compatible default. NEXUS_GOVERNED requires canonical Nexus authority evidence and never falls back to direct authority.",
+    ),
+    nexusGrant: nexusGrant.optional().describe(
+      "Immutable pointer to a canonical Nexus execution grant and its governing Task Card. Dev MCP independently verifies current Nexus main and tracked bytes before worker launch.",
+    ),
+    dispatchIntent: dispatchIntent.describe(
+      "Controller-authored bounded task semantics. Dev MCP transports and mechanically enforces applicable scope/ownership constraints but does not gain planner, verifier, acceptance, merge, or release authority.",
+    ),
+    expectedHead: z.string().describe(
+      "40-character commit SHA. If supplied, agent_start fails closed when workspace HEAD no longer matches.",
+    ),
+    writePaths: z.array(z.string()).describe(
+      "Exact intended writable paths relative to the workspace root. Observed and aborted on violation; not a hard sandbox.",
+    ),
+    maxFiles: z.number().int().min(1).describe("Maximum number of files the worker may change."),
+    toolchainId: z.string().describe(
+      "Toolchain id used to resolve verifier executables. Must already be configured; Dev MCP does not install toolchains.",
+    ),
+    maxWallMs: z.number().int().min(1).describe("Optional wall-clock bound for the whole agent turn."),
+    maxStartupMs: z.number().int().min(1).describe(
+      "Optional wall-clock bound for the startup/readiness phase (turn start -> execution started).",
+    ),
+    maxExecutionMs: z.number().int().min(1).describe(
+      "Optional wall-clock bound for semantic provider execution (execution started -> terminal).",
+    ),
+    idleTimeoutMs: z.number().int().min(1).describe(
+      "Optional idle bound enforced by the Dev supervisor once execution has started: the agent is terminated after this long with no provider activity. Adapters report activity on provider protocol events and raw output bytes; providers that emit nothing mid-run must not be paired with tight idle bounds (use maxExecutionMs for those).",
+    ),
+  }).partial().optional().describe(
+    "Optional structured execution contract. Records and enforces where/how the worker may run.",
+  );
+  return {
+    workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+    profile: z.string().describe("Name of an advertised agent profile to run."),
+    prompt: z.string().describe("Task prompt for the agent."),
+    attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/).optional().describe(
+      "Optional physical-workspace-scoped replay identity. Exact request replays reuse one durable agent; conflicting reuse fails closed.",
+    ),
+    executionContract,
+  };
 }
 
 export function createMcpServer(
@@ -1284,6 +1366,11 @@ export function createMcpServer(
     });
   const latestProfileCatalogGeneration = runtimeBuildIdentityContext?.latestProfileCatalogGeneration
     ?? { value: runtimeBuildIdentity.profileCatalogGeneration };
+  const agentStartInputSchema = createAgentStartInputSchema();
+  const capabilityManifest = runtimeBuildIdentityContext?.capabilityManifest
+    ?? deriveLoadedCapabilityManifest(
+      config.subagents && agentSessionManager ? { agent_start: agentStartInputSchema } : {},
+    );
   const server = new McpServer(
     {
       name: "devspace",
@@ -2573,29 +2660,6 @@ export function createMcpServer(
       idempotentHint: false,
       openWorldHint: true,
     };
-    const AGENT_DISPATCH_INTENT_INPUT_SCHEMA = z.object({
-      taskId: z.string().min(1),
-      attemptId: z.string().min(1),
-      objective: z.string().min(1),
-      roleIntent: z.enum([
-        "EVIDENCE_COLLECTOR",
-        "MECHANICAL_EXECUTOR",
-        "DEEP_ENGINEERING",
-        "TEST_VERIFIER",
-        "INDEPENDENT_REVIEWER",
-        "RECOVERY_RECONCILER",
-      ]),
-      context: z.array(z.string()).optional(),
-      readScope: z.array(z.string()).optional(),
-      writeScope: z.array(z.string()).optional(),
-      exclusiveOwnership: z.boolean(),
-      forbiddenChanges: z.array(z.string()).optional(),
-      acceptanceCriteria: z.array(z.string()).min(1),
-      verificationRequired: z.boolean(),
-      expectedArtifacts: z.array(z.string()).optional(),
-      expectedEvidence: z.array(z.string()).optional(),
-      claimCeiling: z.enum(["RESULT_RETURNED", "IMPLEMENTED", "CANDIDATE_READY"]),
-    }).strict();
     const AGENT_DISPATCH_OUTPUT_SCHEMA = z.object({
       taskId: z.string(),
       attemptId: z.string(),
@@ -2605,15 +2669,6 @@ export function createMcpServer(
       exclusiveOwnership: z.boolean(),
       intentHash: z.string(),
     });
-    const NEXUS_GRANT_REF_INPUT_SCHEMA = z.object({
-      repository: z.literal("James3014/Nexus-new"),
-      revision: z.string().regex(/^[0-9a-f]{40}$/),
-      grantPath: z.string().startsWith("tasks/"),
-      grantSha256: z.string().regex(/^[0-9a-f]{64}$/),
-      authorityPath: z.string().startsWith("tasks/"),
-      authoritySha256: z.string().regex(/^[0-9a-f]{64}$/),
-    }).strict();
-
     registerAppTool(
       server,
       "agent_start",
@@ -2621,65 +2676,7 @@ export function createMcpServer(
         title: "Start agent",
         description:
           "Start a bounded background subagent using an advertised agent profile in an already-open workspace. Returns immediately with a durable agent ID. Use agent_status to retrieve progress/result.",
-        inputSchema: {
-          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
-          profile: z.string().describe("Name of an advertised agent profile to run."),
-          prompt: z.string().describe("Task prompt for the agent."),
-          attemptKey: z
-            .string()
-            .regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
-            .optional()
-            .describe("Optional physical-workspace-scoped replay identity. Exact request replays reuse one durable agent; conflicting reuse fails closed."),
-          executionContract: z
-            .object({
-              authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).optional().describe(
-                "Execution authority lane. OWNER_DIRECT is the backwards-compatible default. NEXUS_GOVERNED requires canonical Nexus authority evidence and never falls back to direct authority.",
-              ),
-              nexusGrant: NEXUS_GRANT_REF_INPUT_SCHEMA.optional().describe(
-                "Immutable pointer to a canonical Nexus execution grant and its governing Task Card. Dev MCP independently verifies current Nexus main and tracked bytes before worker launch.",
-              ),
-              dispatchIntent: AGENT_DISPATCH_INTENT_INPUT_SCHEMA.describe(
-                "Controller-authored bounded task semantics. Dev MCP transports and mechanically enforces applicable scope/ownership constraints but does not gain planner, verifier, acceptance, merge, or release authority.",
-              ),
-              expectedHead: z
-                .string()
-                .describe("40-character commit SHA. If supplied, agent_start fails closed when workspace HEAD no longer matches."),
-              writePaths: z
-                .array(z.string())
-                .describe("Exact intended writable paths relative to the workspace root. Observed and aborted on violation; not a hard sandbox."),
-              maxFiles: z
-                .number()
-                .int()
-                .min(1)
-                .describe("Maximum number of files the worker may change."),
-              toolchainId: z
-                .string()
-                .describe("Toolchain id used to resolve verifier executables. Must already be configured; Dev MCP does not install toolchains."),
-              maxWallMs: z
-                .number()
-                .int()
-                .min(1)
-                .describe("Optional wall-clock bound for the whole agent turn."),
-              maxStartupMs: z
-                .number()
-                .int()
-                .min(1)
-                .describe("Optional wall-clock bound for the startup/readiness phase (turn start -> execution started)."),
-              maxExecutionMs: z
-                .number()
-                .int()
-                .min(1)
-                .describe("Optional wall-clock bound for semantic provider execution (execution started -> terminal)."),
-              idleTimeoutMs: z
-                .number()
-                .int()
-                .min(1)
-                .describe("Optional idle bound enforced by the Dev supervisor once execution has started: the agent is terminated after this long with no provider activity. Adapters report activity on provider protocol events and raw output bytes; providers that emit nothing mid-run must not be paired with tight idle bounds (use maxExecutionMs for those)."),
-            })
-            .partial()
-            .optional()
-            .describe("Optional structured execution contract. Records and enforces where/how the worker may run."),
-        },
+        inputSchema: agentStartInputSchema,
         outputSchema: {
           agentId: z.string(),
           dispatch: AGENT_DISPATCH_OUTPUT_SCHEMA.optional(),
@@ -3329,6 +3326,97 @@ export function createMcpServer(
   if (config.gitCandidatesEnabled) {
     registerAppTool(
       server,
+      "git_promote_candidate",
+      {
+        title: "Promote Candidate",
+        description:
+          "Advance one pristine attached destination branch by exact fast-forward CAS. Canonical upstream/head are derived from destination Git configuration and observed live. The request is fenced to this loaded server/build/source/capability identity; arbitrary candidate capability attestations are not accepted.",
+        inputSchema: {
+          sourceWorkspaceId: z.string().describe("Workspace containing the exact Candidate commit objects."),
+          candidateBase: z.string().regex(/^[0-9a-f]{40}$/),
+          candidateHead: z.string().regex(/^[0-9a-f]{40}$/),
+          candidateTree: z.string().regex(/^[0-9a-f]{40}$/),
+          destinationWorkspaceId: z.string().describe("Attached destination checkout whose configured upstream is canonical."),
+          expectedDestinationBranch: z.string().min(1),
+          expectedDestinationHead: z.string().regex(/^[0-9a-f]{40}$/),
+          expectedServerInstanceId: z.string().min(1),
+          expectedSourceCommit: z.string().min(1),
+          expectedBuildId: z.string().min(1),
+          expectedCapabilityManifestSha256: z.string().regex(/^[0-9a-f]{64}$/),
+          confirmPromote: z.boolean(),
+        },
+        outputSchema: {
+          success: z.boolean(),
+          promoted: z.boolean(),
+          alreadyPromoted: z.boolean(),
+          branch: z.string(),
+          previousHead: z.string(),
+          currentHead: z.string(),
+          candidateHead: z.string(),
+          candidateTree: z.string(),
+          canonicalRemote: z.string().optional(),
+          canonicalRef: z.string().optional(),
+          canonicalHead: z.string().optional(),
+          acceptanceStatus: z.literal("external_not_granted_here"),
+          blockers: z.array(z.object({ code: z.string(), detail: z.string() })),
+        },
+        _meta: {},
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: true,
+        },
+      },
+      async ({
+        sourceWorkspaceId,
+        candidateBase,
+        candidateHead,
+        candidateTree,
+        destinationWorkspaceId,
+        expectedDestinationBranch,
+        expectedDestinationHead,
+        expectedServerInstanceId,
+        expectedSourceCommit,
+        expectedBuildId,
+        expectedCapabilityManifestSha256,
+        confirmPromote,
+      }) => {
+        const source = workspaces.getWorkspace(sourceWorkspaceId);
+        const destination = workspaces.getWorkspace(destinationWorkspaceId);
+        const output = await promoteCandidate({
+          sourceWorkspaceRoot: source.root,
+          candidateBase,
+          candidateHead,
+          candidateTree,
+          destinationWorkspaceRoot: destination.root,
+          expectedDestinationBranch,
+          expectedDestinationHead,
+          runtimeBinding: {
+            expectedServerInstanceId,
+            expectedSourceCommit,
+            expectedBuildId,
+            expectedCapabilityManifestSha256,
+          },
+          confirmPromote,
+        }, {
+          identity: runtimeBuildIdentity,
+          capabilityManifest,
+        });
+        const summary = output.success
+          ? output.alreadyPromoted
+            ? "Candidate promotion replay already applied."
+            : "Candidate promoted by exact local ref CAS."
+          : `Candidate not promoted: ${output.blockers.map((blocker) => blocker.code).join(", ")}.`;
+        return {
+          content: [textBlock(summary)],
+          structuredContent: output as unknown as Record<string, unknown>,
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
       "git_commit",
       {
         title: "Git Commit Candidate",
@@ -3514,6 +3602,9 @@ export function createServer(
   const agentSessionManager = config.subagents.enabled
     ? new LocalAgentSessionManager(config, undefined, undefined, undefined, runtimeBuildIdentity)
     : undefined;
+  const capabilityManifest = deriveLoadedCapabilityManifest(
+    agentSessionManager ? { agent_start: createAgentStartInputSchema() } : {},
+  );
   const codexGoals = config.codexGoalsEnabled
     ? new CodexGoalSessionManager(processSessions, { codexBin: config.codexBin })
     : undefined;
@@ -3626,6 +3717,7 @@ export function createServer(
         pid: runtimeBuildIdentity.pid,
         listen_port: runtimeBuildIdentity.listenPort,
       },
+      capabilityManifest,
     });
   });
 
@@ -3635,6 +3727,7 @@ export function createServer(
     res.json({
       ...runtimeBuildIdentity,
       profileCatalogGeneration: latestProfileCatalogGeneration.value,
+      capabilityManifest,
     });
   });
 
@@ -3712,7 +3805,7 @@ export function createServer(
           incomingArtifactAdapters,
           agentSessionManager,
           codexGoals,
-          { identity: runtimeBuildIdentity, latestProfileCatalogGeneration },
+          { identity: runtimeBuildIdentity, latestProfileCatalogGeneration, capabilityManifest },
           durableOperations,
         );
         await server.connect(transport);

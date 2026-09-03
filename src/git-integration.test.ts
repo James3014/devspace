@@ -10,7 +10,9 @@ import {
   probeRemoteWritability,
   promoteCandidate,
   type CandidateRangeIdentity,
+  type PromotionRuntimeContext,
 } from "./git-integration.js";
+import type { CapabilityManifest } from "./capability-manifest.js";
 
 function runGitRaw(args: string[], cwd: string): string {
   return execFileSync("git", args, {
@@ -68,9 +70,45 @@ function cleanupRepo(repo: string): void {
 function makePromotionFixture(name: string, files: Record<string, string> = { "app.ts": "v1\n" }) {
   const destination = makeRepo(`promotion-${name}`, files);
   const base = runGitRaw(["rev-parse", "HEAD"], destination);
+  const canonical = join(destination, "..", "canonical.git");
+  runGitRaw(["init", "--bare", "--initial-branch=main", canonical], destination);
+  runGitRaw(["remote", "add", "origin", canonical], destination);
+  runGitRaw(["push", "-u", "origin", "main"], destination);
   const source = join(destination, "..", "candidate-worktree");
   runGitRaw(["worktree", "add", "--detach", source, base], destination);
-  return { source, destination, base };
+  return { source, destination, base, canonical };
+}
+
+const LOADED_MANIFEST: CapabilityManifest = {
+  schema: "devspace.capability_manifest.v1",
+  capabilities: [
+    "agent_start.executionContract.authorityMode",
+    "agent_start.executionContract.idleTimeoutMs",
+    "agent_start.executionContract.nexusGrant",
+    "agent_start.tool",
+  ],
+  missing: [],
+  manifestSha256: "c".repeat(64),
+};
+
+function runtimeContext(candidateHead: string): PromotionRuntimeContext {
+  return {
+    identity: {
+      serverInstanceId: "server-current",
+      sourceCommit: candidateHead,
+      buildId: "build-current",
+    },
+    capabilityManifest: LOADED_MANIFEST,
+  };
+}
+
+function runtimeBinding(candidateHead: string) {
+  return {
+    expectedServerInstanceId: "server-current",
+    expectedSourceCommit: candidateHead,
+    expectedBuildId: "build-current",
+    expectedCapabilityManifestSha256: LOADED_MANIFEST.manifestSha256,
+  };
 }
 
 test("committed Candidate range integrates exactly; unrelated dirt survives; untracked metadata never leaks", async () => {
@@ -1007,5 +1045,165 @@ test("remote writability probe never fakes push permission", async () => {
     assert.ok(configured.notes.some((note) => /never proven/.test(note)));
   } finally {
     cleanupRepo(repo);
+  }
+});
+
+test("promotion derives current canonical upstream and accepts an exact loaded-runtime candidate", async () => {
+  const { source, destination, base } = makePromotionFixture("runtime-bound-positive");
+  try {
+    const head = commitAll(source, { "app.ts": "v2\n" }, "candidate");
+    const tree = runGitRaw(["rev-parse", `${head}^{tree}`], source);
+    const input = {
+      sourceWorkspaceRoot: source,
+      candidateBase: base,
+      candidateHead: head,
+      candidateTree: tree,
+      destinationWorkspaceRoot: destination,
+      expectedDestinationBranch: "main",
+      expectedDestinationHead: base,
+      runtimeBinding: runtimeBinding(head),
+      confirmPromote: true,
+    };
+
+    const promoted = await promoteCandidate(input, runtimeContext(head));
+    assert.equal(promoted.success, true);
+    assert.equal(promoted.promoted, true);
+    assert.equal(promoted.canonicalRemote, "origin");
+    assert.equal(promoted.canonicalRef, "refs/heads/main");
+    assert.equal(promoted.canonicalHead, base);
+
+    const replay = await promoteCandidate(input, runtimeContext(head));
+    assert.equal(replay.success, true);
+    assert.equal(replay.alreadyPromoted, true);
+  } finally {
+    cleanupRepo(destination);
+  }
+});
+
+test("promotion rejects a configured upstream that is not the remote default branch", async () => {
+  const { source, destination, base } = makePromotionFixture("non-default-upstream");
+  try {
+    runGitRaw(["switch", "-c", "release", base], destination);
+    runGitRaw(["push", "-u", "origin", "release"], destination);
+    const head = commitAll(source, { "app.ts": "v2\n" }, "candidate");
+    const tree = runGitRaw(["rev-parse", `${head}^{tree}`], source);
+
+    const result = await promoteCandidate({
+      sourceWorkspaceRoot: source,
+      candidateBase: base,
+      candidateHead: head,
+      candidateTree: tree,
+      destinationWorkspaceRoot: destination,
+      expectedDestinationBranch: "release",
+      expectedDestinationHead: base,
+      runtimeBinding: runtimeBinding(head),
+      confirmPromote: true,
+    }, runtimeContext(head));
+
+    assert.equal(result.success, false);
+    assert.ok(result.blockers.some((blocker) => blocker.code === "PROMOTION_CANONICAL_UPSTREAM_UNKNOWN"));
+    assert.equal(runGitRaw(["symbolic-ref", "HEAD"], destination), "refs/heads/release");
+    assert.equal(runGitRaw(["rev-parse", "HEAD"], destination), base);
+    assert.equal(runGitRaw(["rev-parse", "refs/heads/release"], destination), base);
+    assert.equal(runGitRaw(["status", "--porcelain", "--untracked-files=all"], destination), "");
+    assert.equal(await readFile(join(destination, "app.ts")), "v1\n");
+  } finally {
+    cleanupRepo(destination);
+  }
+});
+
+test("promotion rejects stale live identity and never trusts caller capability or canonical facts", async () => {
+  const { source, destination, base } = makePromotionFixture("runtime-bound-negative");
+  try {
+    const head = commitAll(source, { "app.ts": "v2\n" }, "candidate");
+    const tree = runGitRaw(["rev-parse", `${head}^{tree}`], source);
+    const result = await promoteCandidate({
+      sourceWorkspaceRoot: source,
+      candidateBase: base,
+      candidateHead: head,
+      candidateTree: tree,
+      destinationWorkspaceRoot: destination,
+      expectedDestinationBranch: "main",
+      expectedDestinationHead: base,
+      runtimeBinding: {
+        ...runtimeBinding(head),
+        expectedServerInstanceId: "stale-server",
+        canonicalHead: head,
+        requiredCapabilityIds: [],
+      } as ReturnType<typeof runtimeBinding>,
+      confirmPromote: true,
+    }, runtimeContext(head));
+
+    assert.equal(result.success, false);
+    assert.ok(result.blockers.some((blocker) => blocker.code === "PROMOTION_RUNTIME_IDENTITY_MISMATCH"));
+    assert.equal(runGitRaw(["rev-parse", "HEAD"], destination), base);
+  } finally {
+    cleanupRepo(destination);
+  }
+});
+
+test("promotion fails closed when candidate capability evidence is not bound to the exact loaded source commit", async () => {
+  const { source, destination, base } = makePromotionFixture("candidate-capability-unavailable");
+  try {
+    const head = commitAll(source, { "app.ts": "v2\n" }, "candidate");
+    const tree = runGitRaw(["rev-parse", `${head}^{tree}`], source);
+    const context = runtimeContext("d".repeat(40));
+    const result = await promoteCandidate({
+      sourceWorkspaceRoot: source,
+      candidateBase: base,
+      candidateHead: head,
+      candidateTree: tree,
+      destinationWorkspaceRoot: destination,
+      expectedDestinationBranch: "main",
+      expectedDestinationHead: base,
+      runtimeBinding: {
+        expectedServerInstanceId: context.identity.serverInstanceId,
+        expectedSourceCommit: context.identity.sourceCommit,
+        expectedBuildId: context.identity.buildId,
+        expectedCapabilityManifestSha256: context.capabilityManifest.manifestSha256,
+      },
+      confirmPromote: true,
+    }, context);
+
+    assert.equal(result.success, false);
+    assert.ok(result.blockers.some((blocker) => blocker.code === "PROMOTION_CANDIDATE_CAPABILITY_BINDING_UNAVAILABLE"));
+    assert.equal(runGitRaw(["rev-parse", "HEAD"], destination), base);
+  } finally {
+    cleanupRepo(destination);
+  }
+});
+
+test("promotion rejects canonical remote drift derived from destination upstream", async () => {
+  const { source, destination, base, canonical } = makePromotionFixture("canonical-drift-derived");
+  try {
+    const head = commitAll(source, { "app.ts": "v2\n" }, "candidate");
+    const tree = runGitRaw(["rev-parse", `${head}^{tree}`], source);
+    const advance = makeRepo("canonical-drift-writer", { "app.ts": "v1\n" });
+    try {
+      runGitRaw(["remote", "add", "canonical", canonical], advance);
+      runGitRaw(["fetch", "canonical", "main"], advance);
+      runGitRaw(["reset", "--hard", "FETCH_HEAD"], advance);
+      const drift = commitAll(advance, { "remote.txt": "advanced\n" }, "remote drift");
+      runGitRaw(["push", "canonical", `${drift}:refs/heads/main`], advance);
+    } finally {
+      cleanupRepo(advance);
+    }
+
+    const result = await promoteCandidate({
+      sourceWorkspaceRoot: source,
+      candidateBase: base,
+      candidateHead: head,
+      candidateTree: tree,
+      destinationWorkspaceRoot: destination,
+      expectedDestinationBranch: "main",
+      expectedDestinationHead: base,
+      runtimeBinding: runtimeBinding(head),
+      confirmPromote: true,
+    }, runtimeContext(head));
+    assert.equal(result.success, false);
+    assert.ok(result.blockers.some((blocker) => blocker.code === "PROMOTION_STALE_CANONICAL_BASE"));
+    assert.equal(runGitRaw(["rev-parse", "HEAD"], destination), base);
+  } finally {
+    cleanupRepo(destination);
   }
 });
