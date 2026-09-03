@@ -879,7 +879,7 @@ function registerCodexGoalTools(
     {
       title: "Start Codex goal",
       description:
-        "Launch a real interactive Codex CLI session in an open workspace and activate its /goal mode with the given goal text. Runs the actual Codex CLI binary in a PTY inside the exact opened workspace; never uses bash or the Codex SDK. Git workspaces must be clean and must provide expectedHead matching the current Git HEAD. Only one active Codex goal is allowed per workspace.",
+        "Launch a real interactive Codex CLI session in an open workspace and activate its /goal mode with the given goal text. Runs the actual Codex CLI binary in a PTY inside the exact opened workspace; never uses bash or the Codex SDK. Bootstraps Codex directory trust for the workspace root in CODEX_HOME/config.toml so first-use workspaces do not block on the interactive trust dialog (opt out with DEVSPACE_CODEX_TRUST_BOOTSTRAP=off). Git workspaces must be clean and must provide expectedHead matching the current Git HEAD. Only one active Codex goal is allowed per workspace.",
       inputSchema: {
         workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
         goal: z
