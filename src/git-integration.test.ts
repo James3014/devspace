@@ -68,9 +68,32 @@ function cleanupRepo(repo: string): void {
 function makePromotionFixture(name: string, files: Record<string, string> = { "app.ts": "v1\n" }) {
   const destination = makeRepo(`promotion-${name}`, files);
   const base = runGitRaw(["rev-parse", "HEAD"], destination);
+  const originPath = join(destination, "..", "origin.git");
+  runGitRaw(["init", "--bare", "--initial-branch=main", originPath], destination);
+  runGitRaw(["remote", "add", "origin", originPath], destination);
+  runGitRaw(["push", "origin", "main:refs/heads/main"], destination);
   const source = join(destination, "..", "candidate-worktree");
   runGitRaw(["worktree", "add", "--detach", source, base], destination);
-  return { source, destination, base };
+  return { source, destination, base, originPath };
+}
+
+// Issue #30: every promotion is bound to the current canonical lineage and
+// carries loaded-capability preservation evidence.
+const REQUIRED_CAPABILITY_IDS = [
+  "agent_start.tool",
+  "agent_start.executionContract.authorityMode",
+  "agent_start.executionContract.nexusGrant",
+];
+
+function canonicalLineage(expectedHead: string) {
+  return { remoteName: "origin", branch: "main", expectedHead };
+}
+
+function preservedCapabilities(candidateCapabilityIds: readonly string[] = REQUIRED_CAPABILITY_IDS) {
+  return {
+    requiredCapabilityIds: REQUIRED_CAPABILITY_IDS,
+    candidateCapabilityIds: [...candidateCapabilityIds],
+  };
 }
 
 test("committed Candidate range integrates exactly; unrelated dirt survives; untracked metadata never leaks", async () => {
@@ -673,6 +696,8 @@ test("candidate promotion fast-forwards the exact attached branch and replays id
       destinationWorkspaceRoot: destination,
       expectedDestinationBranch: "main",
       expectedDestinationHead: base,
+      canonicalLineage: canonicalLineage(base),
+      capabilityPreservation: preservedCapabilities(),
       confirmPromote: true,
     };
 
@@ -718,6 +743,8 @@ test("candidate promotion refuses unconfirmed, wrong-tree, wrong-branch, stale, 
         destinationWorkspaceRoot: destination,
         expectedDestinationBranch: "main",
         expectedDestinationHead: base,
+        canonicalLineage: canonicalLineage(base),
+        capabilityPreservation: preservedCapabilities(),
         confirmPromote: false,
       });
       assert.equal(result.success, false);
@@ -741,6 +768,8 @@ test("candidate promotion refuses unconfirmed, wrong-tree, wrong-branch, stale, 
         destinationWorkspaceRoot: destination,
         expectedDestinationBranch: "main",
         expectedDestinationHead: base,
+        canonicalLineage: canonicalLineage(base),
+        capabilityPreservation: preservedCapabilities(),
         confirmPromote: true,
       });
       assert.equal(result.success, false);
@@ -765,6 +794,8 @@ test("candidate promotion refuses unconfirmed, wrong-tree, wrong-branch, stale, 
         destinationWorkspaceRoot: destination,
         expectedDestinationBranch: "other",
         expectedDestinationHead: base,
+        canonicalLineage: canonicalLineage(base),
+        capabilityPreservation: preservedCapabilities(),
         confirmPromote: true,
       });
       assert.equal(result.success, false);
@@ -791,6 +822,8 @@ test("candidate promotion refuses unconfirmed, wrong-tree, wrong-branch, stale, 
         destinationWorkspaceRoot: destination,
         expectedDestinationBranch: "main",
         expectedDestinationHead: base,
+        canonicalLineage: canonicalLineage(base),
+        capabilityPreservation: preservedCapabilities(),
         confirmPromote: true,
       });
       assert.equal(result.success, false);
@@ -815,6 +848,8 @@ test("candidate promotion refuses unconfirmed, wrong-tree, wrong-branch, stale, 
         destinationWorkspaceRoot: destination,
         expectedDestinationBranch: "main",
         expectedDestinationHead: base,
+        canonicalLineage: canonicalLineage(base),
+        capabilityPreservation: preservedCapabilities(),
         confirmPromote: true,
       });
       assert.equal(result.success, false);
@@ -844,6 +879,8 @@ test("candidate promotion refuses cross-repository and non-fast-forward Candidat
         destinationWorkspaceRoot: destination,
         expectedDestinationBranch: "main",
         expectedDestinationHead: base,
+        canonicalLineage: canonicalLineage(base),
+        capabilityPreservation: preservedCapabilities(),
         confirmPromote: true,
       });
       assert.equal(result.success, false);
@@ -867,6 +904,8 @@ test("candidate promotion refuses cross-repository and non-fast-forward Candidat
         destinationWorkspaceRoot: destination,
         expectedDestinationBranch: "main",
         expectedDestinationHead: base,
+        canonicalLineage: canonicalLineage(base),
+        capabilityPreservation: preservedCapabilities(),
         confirmPromote: true,
       });
       assert.equal(result.success, false);
@@ -894,6 +933,8 @@ test("candidate promotion CAS does not overwrite a branch that moves after the f
       destinationWorkspaceRoot: destination,
       expectedDestinationBranch: "main",
       expectedDestinationHead: base,
+      canonicalLineage: canonicalLineage(base),
+      capabilityPreservation: preservedCapabilities(),
       confirmPromote: true,
       beforeRefUpdateHook: () => {
         seamRan = true;
@@ -928,6 +969,8 @@ test("candidate promotion rolls the ref back when worktree synchronization fails
       destinationWorkspaceRoot: destination,
       expectedDestinationBranch: "main",
       expectedDestinationHead: base,
+      canonicalLineage: canonicalLineage(base),
+      capabilityPreservation: preservedCapabilities(),
       confirmPromote: true,
       beforeWorktreeSyncHook: () => {
         seamRan = true;
@@ -962,6 +1005,8 @@ test("candidate promotion never overwrites a newer ref when synchronization and 
       destinationWorkspaceRoot: destination,
       expectedDestinationBranch: "main",
       expectedDestinationHead: base,
+      canonicalLineage: canonicalLineage(base),
+      capabilityPreservation: preservedCapabilities(),
       confirmPromote: true,
       beforeWorktreeSyncHook: () => {
         seamRan = true;
@@ -1007,5 +1052,218 @@ test("remote writability probe never fakes push permission", async () => {
     assert.ok(configured.notes.some((note) => /never proven/.test(note)));
   } finally {
     cleanupRepo(repo);
+  }
+});
+
+test("candidate promotion fails closed without loaded-capability preservation evidence (pre-#30 caller shape)", async () => {
+  const { source, destination, base } = makePromotionFixture("no-capability-evidence");
+  try {
+    const head = commitAll(source, { "app.ts": "v2\n" }, "candidate");
+    const tree = runGitRaw(["rev-parse", `${head}^{tree}`], source);
+    // A pre-#30 caller carries no capability evidence at all.
+    const legacyInput = {
+      sourceWorkspaceRoot: source,
+      candidateBase: base,
+      candidateHead: head,
+      candidateTree: tree,
+      destinationWorkspaceRoot: destination,
+      expectedDestinationBranch: "main",
+      expectedDestinationHead: base,
+      confirmPromote: true,
+      canonicalLineage: canonicalLineage(base),
+    };
+    const result = await promoteCandidate(legacyInput as Parameters<typeof promoteCandidate>[0]);
+    assert.equal(result.success, false);
+    assert.ok(
+      result.blockers.some((b) => b.code === "PROMOTION_CAPABILITY_EVIDENCE_REQUIRED"),
+      `expected PROMOTION_CAPABILITY_EVIDENCE_REQUIRED, got ${JSON.stringify(result.blockers)}`,
+    );
+    assert.equal(runGitRaw(["rev-parse", "HEAD"], destination), base);
+  } finally {
+    cleanupRepo(destination);
+  }
+});
+
+test("candidate promotion from a stale canonical base fails closed (1f626813 vs 458bb443 divergence class)", async () => {
+  const { source, destination, base } = makePromotionFixture("stale-canonical-base");
+  try {
+    // Canonical main advanced on its own lineage (like the G9 grant bridge)
+    // while the recovery candidate is still built on the old shared base.
+    const advance = join(destination, "..", "canonical-advance");
+    runGitRaw(["worktree", "add", "--detach", advance, base], destination);
+    const advancedTip = commitAll(advance, { "g9-bridge.ts": "export const g9 = true;\n" }, "canonical lineage advance");
+    runGitRaw(["push", "origin", `${advancedTip}:refs/heads/main`], advance);
+
+    const head = commitAll(source, { "app.ts": "recovery candidate\n" }, "recovery candidate");
+    const tree = runGitRaw(["rev-parse", `${head}^{tree}`], source);
+    const result = await promoteCandidate({
+      sourceWorkspaceRoot: source,
+      candidateBase: base,
+      candidateHead: head,
+      candidateTree: tree,
+      destinationWorkspaceRoot: destination,
+      expectedDestinationBranch: "main",
+      expectedDestinationHead: base,
+      confirmPromote: true,
+      canonicalLineage: canonicalLineage(advancedTip),
+      capabilityPreservation: preservedCapabilities(),
+    });
+    assert.equal(result.success, false);
+    assert.ok(
+      result.blockers.some((b) => b.code === "PROMOTION_STALE_CANONICAL_BASE"),
+      `expected PROMOTION_STALE_CANONICAL_BASE, got ${JSON.stringify(result.blockers)}`,
+    );
+    assert.equal(runGitRaw(["rev-parse", "HEAD"], destination), base, "no ref mutation may occur");
+  } finally {
+    cleanupRepo(destination);
+  }
+});
+
+test("candidate promotion fails closed when the canonical remote drifted from the bound lineage head", async () => {
+  const { source, destination, base } = makePromotionFixture("canonical-drift");
+  try {
+    // Canonical remote moved after the promotion was bound to `base`.
+    const advance = join(destination, "..", "canonical-drift-advance");
+    runGitRaw(["worktree", "add", "--detach", advance, base], destination);
+    const advancedTip = commitAll(advance, { "drift.ts": "moved\n" }, "canonical remote drift");
+    runGitRaw(["push", "origin", `${advancedTip}:refs/heads/main`], advance);
+
+    const head = commitAll(source, { "app.ts": "candidate\n" }, "candidate");
+    const tree = runGitRaw(["rev-parse", `${head}^{tree}`], source);
+    const result = await promoteCandidate({
+      sourceWorkspaceRoot: source,
+      candidateBase: base,
+      candidateHead: head,
+      candidateTree: tree,
+      destinationWorkspaceRoot: destination,
+      expectedDestinationBranch: "main",
+      expectedDestinationHead: base,
+      confirmPromote: true,
+      canonicalLineage: canonicalLineage(base),
+      capabilityPreservation: preservedCapabilities(),
+    });
+    assert.equal(result.success, false);
+    assert.ok(
+      result.blockers.some((b) => b.code === "PROMOTION_CANONICAL_HEAD_DRIFT"),
+      `expected PROMOTION_CANONICAL_HEAD_DRIFT, got ${JSON.stringify(result.blockers)}`,
+    );
+    assert.equal(runGitRaw(["rev-parse", "HEAD"], destination), base, "no ref mutation may occur");
+  } finally {
+    cleanupRepo(destination);
+  }
+});
+
+test("candidate promotion fails closed when the canonical head cannot be verified", async () => {
+  const { source, destination, base } = makePromotionFixture("canonical-unverifiable");
+  try {
+    const head = commitAll(source, { "app.ts": "candidate\n" }, "candidate");
+    const tree = runGitRaw(["rev-parse", `${head}^{tree}`], source);
+    runGitRaw(["remote", "remove", "origin"], source);
+    const result = await promoteCandidate({
+      sourceWorkspaceRoot: source,
+      candidateBase: base,
+      candidateHead: head,
+      candidateTree: tree,
+      destinationWorkspaceRoot: destination,
+      expectedDestinationBranch: "main",
+      expectedDestinationHead: base,
+      confirmPromote: true,
+      canonicalLineage: canonicalLineage(base),
+      capabilityPreservation: preservedCapabilities(),
+    });
+    assert.equal(result.success, false);
+    assert.ok(
+      result.blockers.some((b) => b.code === "PROMOTION_CANONICAL_HEAD_UNKNOWN"),
+      `expected PROMOTION_CANONICAL_HEAD_UNKNOWN, got ${JSON.stringify(result.blockers)}`,
+    );
+    assert.equal(runGitRaw(["rev-parse", "HEAD"], destination), base, "no ref mutation may occur");
+  } finally {
+    cleanupRepo(destination);
+  }
+});
+
+test("candidate promotion refuses capability regression without an explicit contract delta and allows it with one", async () => {
+  const { source, destination, base } = makePromotionFixture("capability-regression");
+  try {
+    const head = commitAll(source, { "app.ts": "candidate\n" }, "candidate");
+    const tree = runGitRaw(["rev-parse", `${head}^{tree}`], source);
+    // Candidate dropped the G9 authority seam capabilities.
+    const regressed = preservedCapabilities(["agent_start.tool"]);
+
+    const refused = await promoteCandidate({
+      sourceWorkspaceRoot: source,
+      candidateBase: base,
+      candidateHead: head,
+      candidateTree: tree,
+      destinationWorkspaceRoot: destination,
+      expectedDestinationBranch: "main",
+      expectedDestinationHead: base,
+      confirmPromote: true,
+      canonicalLineage: canonicalLineage(base),
+      capabilityPreservation: regressed,
+    });
+    assert.equal(refused.success, false);
+    assert.ok(
+      refused.blockers.some((b) => b.code === "PROMOTION_CAPABILITY_REGRESSION"),
+      `expected PROMOTION_CAPABILITY_REGRESSION, got ${JSON.stringify(refused.blockers)}`,
+    );
+    assert.ok(
+      refused.blockers.some((b) => b.detail.includes("agent_start.executionContract.nexusGrant")),
+      "blocker detail must name the dropped capability",
+    );
+    assert.equal(runGitRaw(["rev-parse", "HEAD"], destination), base, "no ref mutation may occur");
+
+    const acknowledged = await promoteCandidate({
+      sourceWorkspaceRoot: source,
+      candidateBase: base,
+      candidateHead: head,
+      candidateTree: tree,
+      destinationWorkspaceRoot: destination,
+      expectedDestinationBranch: "main",
+      expectedDestinationHead: base,
+      confirmPromote: true,
+      canonicalLineage: canonicalLineage(base),
+      capabilityPreservation: {
+        ...regressed,
+        contractDeltaAcknowledgement:
+          "CONTRACT_DELTA_REQUIRED accepted: G9 authority seam intentionally retired by explicit owner decision.",
+      },
+    });
+    assert.equal(acknowledged.success, true);
+    assert.equal(acknowledged.promoted, true);
+  } finally {
+    cleanupRepo(destination);
+  }
+});
+
+test("recovery candidate bound to current canonical main with preserved capabilities promotes and replays idempotently", async () => {
+  const { source, destination, base } = makePromotionFixture("canonical-recovery");
+  try {
+    const head = commitAll(source, { "app.ts": "repaired\n", "src/g9.ts": "export const seam = true;\n" }, "recovery candidate");
+    const tree = runGitRaw(["rev-parse", `${head}^{tree}`], source);
+    const input = {
+      sourceWorkspaceRoot: source,
+      candidateBase: base,
+      candidateHead: head,
+      candidateTree: tree,
+      destinationWorkspaceRoot: destination,
+      expectedDestinationBranch: "main",
+      expectedDestinationHead: base,
+      confirmPromote: true,
+      canonicalLineage: canonicalLineage(base),
+      capabilityPreservation: preservedCapabilities(),
+    };
+
+    const result = await promoteCandidate(input);
+    assert.equal(result.success, true);
+    assert.equal(result.promoted, true);
+    assert.equal(runGitRaw(["rev-parse", "HEAD"], destination), head);
+
+    const replay = await promoteCandidate(input);
+    assert.equal(replay.success, true);
+    assert.equal(replay.alreadyPromoted, true);
+    assert.equal(replay.promoted, false);
+  } finally {
+    cleanupRepo(destination);
   }
 });

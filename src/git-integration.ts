@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { isAbsolute, relative, sep } from "node:path";
 import { canonicalizePath } from "./roots.js";
+import { diffCapabilityManifests } from "./capability-manifest.js";
 
 /**
  * Typed integration primitive for one accepted, IMMUTABLE Candidate range.
@@ -118,6 +119,30 @@ export interface CandidatePromotionInput {
   expectedDestinationHead: string;
   /** Must be true before any ref or worktree mutation occurs. */
   confirmPromote: boolean;
+  /**
+   * Issue #30 lineage binding. The promotion is only valid while the
+   * candidate descends from the current canonical remote lineage head.
+   */
+  canonicalLineage: {
+    /** Configured remote carrying the canonical branch, for example `james`. */
+    remoteName: string;
+    /** Canonical branch name, for example `main`. */
+    branch: string;
+    /** Exact canonical lineage head this promotion request is bound to. */
+    expectedHead: string;
+  };
+  /**
+   * Issue #30 loaded-capability preservation evidence. The required ids come
+   * from the currently live/canonical capability manifest; the candidate ids
+   * are computed from the candidate source. Dropping a required capability
+   * without an explicit contract delta acknowledgement fails closed.
+   */
+  capabilityPreservation: {
+    requiredCapabilityIds: readonly string[];
+    candidateCapabilityIds: readonly string[];
+    /** Present only when a capability removal is an explicit contract delta. */
+    contractDeltaAcknowledgement?: string;
+  };
   /** Deterministic race-test seam: runs after final validation, before CAS ref update. */
   beforeRefUpdateHook?: () => Promise<void> | void;
   /** Deterministic failure-test seam: runs after CAS ref update, before worktree/index sync. */
@@ -141,7 +166,13 @@ export interface PromotionBlocker {
     | "PROMOTION_NOT_CONFIRMED"
     | "PROMOTION_CAS_FAILED"
     | "PROMOTION_WORKTREE_SYNC_FAILED"
-    | "PROMOTION_POST_STATE_MISMATCH";
+    | "PROMOTION_POST_STATE_MISMATCH"
+    | "PROMOTION_CANONICAL_LINEAGE_INVALID"
+    | "PROMOTION_STALE_CANONICAL_BASE"
+    | "PROMOTION_CANONICAL_HEAD_DRIFT"
+    | "PROMOTION_CANONICAL_HEAD_UNKNOWN"
+    | "PROMOTION_CAPABILITY_EVIDENCE_REQUIRED"
+    | "PROMOTION_CAPABILITY_REGRESSION";
   detail: string;
 }
 
@@ -902,6 +933,95 @@ export async function promoteCandidate(
     blockers.push({
       code: "CANDIDATE_TREE_MISMATCH",
       detail: `Candidate head tree is ${actualCandidateTree || "unavailable"}, expected ${candidateTree}.`,
+    });
+    return fail();
+  }
+
+  // ─── Issue #30: canonical lineage binding + capability preservation ───────
+  const lineage = input.canonicalLineage;
+  const lineageHead = typeof lineage?.expectedHead === "string" ? lineage.expectedHead.toLowerCase() : "";
+  if (
+    !lineage ||
+    typeof lineage.remoteName !== "string" ||
+    !lineage.remoteName ||
+    lineage.remoteName.startsWith("-") ||
+    typeof lineage.branch !== "string" ||
+    !lineage.branch ||
+    lineage.branch.startsWith("refs/") ||
+    /\s/.test(lineage.expectedHead ?? "") ||
+    !EXACT_COMMIT_SHA_PATTERN.test(lineageHead)
+  ) {
+    blockers.push({
+      code: "PROMOTION_CANONICAL_LINEAGE_INVALID",
+      detail: "Promotion requires an exact canonical lineage binding (remoteName, branch, expectedHead as a 40-character commit SHA).",
+    });
+    return fail();
+  }
+
+  const preservation = input.capabilityPreservation;
+  if (
+    !preservation ||
+    !Array.isArray(preservation.requiredCapabilityIds) ||
+    preservation.requiredCapabilityIds.length === 0 ||
+    !Array.isArray(preservation.candidateCapabilityIds) ||
+    preservation.requiredCapabilityIds.some((id) => typeof id !== "string" || !id) ||
+    preservation.candidateCapabilityIds.some((id) => typeof id !== "string" || !id)
+  ) {
+    blockers.push({
+      code: "PROMOTION_CAPABILITY_EVIDENCE_REQUIRED",
+      detail: "Promotion requires loaded-capability evidence: requiredCapabilityIds from the current live/canonical capability manifest and candidateCapabilityIds computed from the candidate source.",
+    });
+    return fail();
+  }
+
+  // The candidate must descend from the canonical lineage head. A recovery
+  // candidate built on a stale/diverged base is refused even when the local
+  // destination branch would still fast-forward (Issue #30: the historical
+  // failure let a pre-G9 recovery lineage silently replace the live runtime).
+  const canonicalAncestry = await runGit(
+    ["merge-base", "--is-ancestor", lineageHead, candidateBase],
+    source,
+  );
+  if (!canonicalAncestry.ok) {
+    blockers.push({
+      code: "PROMOTION_STALE_CANONICAL_BASE",
+      detail: `Candidate base ${candidateBase} does not descend from canonical ${lineage.remoteName}/${lineage.branch} head ${lineageHead}; promotion or recovery from a stale or diverged base is refused.`,
+    });
+    return fail();
+  }
+
+  // The canonical lineage binding must still be current at promotion time.
+  const canonicalRemote = await runGit(
+    ["ls-remote", "--heads", lineage.remoteName, `refs/heads/${lineage.branch}`],
+    source,
+  );
+  if (!canonicalRemote.ok) {
+    blockers.push({
+      code: "PROMOTION_CANONICAL_HEAD_UNKNOWN",
+      detail: `Canonical ${lineage.remoteName}/${lineage.branch} head could not be verified; failing closed instead of promoting against an unknown lineage.`,
+    });
+    return fail();
+  }
+  const canonicalRemoteHead = canonicalRemote.stdout.split(/\s+/)[0]?.trim().toLowerCase() ?? "";
+  if (canonicalRemoteHead !== lineageHead) {
+    blockers.push({
+      code: "PROMOTION_CANONICAL_HEAD_DRIFT",
+      detail: `Canonical ${lineage.remoteName}/${lineage.branch} is ${canonicalRemoteHead || "unavailable"}, expected exact lineage head ${lineageHead}; re-bind the promotion to the current canonical lineage.`,
+    });
+    return fail();
+  }
+
+  // Loaded-capability preservation: dropping a required host-visible
+  // capability is an explicit contract delta, never an incidental promotion
+  // effect.
+  const capabilityDiff = diffCapabilityManifests({
+    requiredCapabilityIds: preservation.requiredCapabilityIds,
+    candidateCapabilityIds: preservation.candidateCapabilityIds,
+  });
+  if (!capabilityDiff.preserved && !preservation.contractDeltaAcknowledgement?.trim()) {
+    blockers.push({
+      code: "PROMOTION_CAPABILITY_REGRESSION",
+      detail: `Candidate drops currently loaded capabilities: ${capabilityDiff.missing.join(", ")}. Preserve the capabilities or supply an explicit contractDeltaAcknowledgement.`,
     });
     return fail();
   }

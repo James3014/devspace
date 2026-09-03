@@ -77,6 +77,7 @@ import {
   type ProfileCatalogEntry,
 } from "./local-agent-profile-source.js";
 import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build-identity.js";
+import { computeCapabilityManifest, recordToolSchemaEvidence } from "./capability-manifest.js";
 import { devspaceConfigDir } from "./user-config.js";
 import {
   formatLocalAgentProviderAvailabilitySummary,
@@ -2614,6 +2615,55 @@ export function createMcpServer(
       authoritySha256: z.string().regex(/^[0-9a-f]{64}$/),
     }).strict();
 
+    // Issue #30: the agent_start execution contract schema is a named const so
+    // the loaded-capability manifest can be computed from the actual registered
+    // zod shape instead of a prose copy of it.
+    const AGENT_START_EXECUTION_CONTRACT_SCHEMA = z.object({
+      authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).optional().describe(
+        "Execution authority lane. OWNER_DIRECT is the backwards-compatible default. NEXUS_GOVERNED requires canonical Nexus authority evidence and never falls back to direct authority.",
+      ),
+      nexusGrant: NEXUS_GRANT_REF_INPUT_SCHEMA.optional().describe(
+        "Immutable pointer to a canonical Nexus execution grant and its governing Task Card. Dev MCP independently verifies current Nexus main and tracked bytes before worker launch.",
+      ),
+      dispatchIntent: AGENT_DISPATCH_INTENT_INPUT_SCHEMA.describe(
+        "Controller-authored bounded task semantics. Dev MCP transports and mechanically enforces applicable scope/ownership constraints but does not gain planner, verifier, acceptance, merge, or release authority.",
+      ),
+      expectedHead: z
+        .string()
+        .describe("40-character commit SHA. If supplied, agent_start fails closed when workspace HEAD no longer matches."),
+      writePaths: z
+        .array(z.string())
+        .describe("Exact intended writable paths relative to the workspace root. Observed and aborted on violation; not a hard sandbox."),
+      maxFiles: z
+        .number()
+        .int()
+        .min(1)
+        .describe("Maximum number of files the worker may change."),
+      toolchainId: z
+        .string()
+        .describe("Toolchain id used to resolve verifier executables. Must already be configured; Dev MCP does not install toolchains."),
+      maxWallMs: z
+        .number()
+        .int()
+        .min(1)
+        .describe("Optional wall-clock bound for the whole agent turn."),
+      maxStartupMs: z
+        .number()
+        .int()
+        .min(1)
+        .describe("Optional wall-clock bound for the startup/readiness phase (turn start -> execution started)."),
+      maxExecutionMs: z
+        .number()
+        .int()
+        .min(1)
+        .describe("Optional wall-clock bound for semantic provider execution (execution started -> terminal)."),
+      idleTimeoutMs: z
+        .number()
+        .int()
+        .min(1)
+        .describe("Recorded and surfaced; not auto-enforced (no mid-run activity signal)."),
+    });
+
     registerAppTool(
       server,
       "agent_start",
@@ -2630,52 +2680,7 @@ export function createMcpServer(
             .regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
             .optional()
             .describe("Optional physical-workspace-scoped replay identity. Exact request replays reuse one durable agent; conflicting reuse fails closed."),
-          executionContract: z
-            .object({
-              authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).optional().describe(
-                "Execution authority lane. OWNER_DIRECT is the backwards-compatible default. NEXUS_GOVERNED requires canonical Nexus authority evidence and never falls back to direct authority.",
-              ),
-              nexusGrant: NEXUS_GRANT_REF_INPUT_SCHEMA.optional().describe(
-                "Immutable pointer to a canonical Nexus execution grant and its governing Task Card. Dev MCP independently verifies current Nexus main and tracked bytes before worker launch.",
-              ),
-              dispatchIntent: AGENT_DISPATCH_INTENT_INPUT_SCHEMA.describe(
-                "Controller-authored bounded task semantics. Dev MCP transports and mechanically enforces applicable scope/ownership constraints but does not gain planner, verifier, acceptance, merge, or release authority.",
-              ),
-              expectedHead: z
-                .string()
-                .describe("40-character commit SHA. If supplied, agent_start fails closed when workspace HEAD no longer matches."),
-              writePaths: z
-                .array(z.string())
-                .describe("Exact intended writable paths relative to the workspace root. Observed and aborted on violation; not a hard sandbox."),
-              maxFiles: z
-                .number()
-                .int()
-                .min(1)
-                .describe("Maximum number of files the worker may change."),
-              toolchainId: z
-                .string()
-                .describe("Toolchain id used to resolve verifier executables. Must already be configured; Dev MCP does not install toolchains."),
-              maxWallMs: z
-                .number()
-                .int()
-                .min(1)
-                .describe("Optional wall-clock bound for the whole agent turn."),
-              maxStartupMs: z
-                .number()
-                .int()
-                .min(1)
-                .describe("Optional wall-clock bound for the startup/readiness phase (turn start -> execution started)."),
-              maxExecutionMs: z
-                .number()
-                .int()
-                .min(1)
-                .describe("Optional wall-clock bound for semantic provider execution (execution started -> terminal)."),
-              idleTimeoutMs: z
-                .number()
-                .int()
-                .min(1)
-                .describe("Recorded and surfaced; not auto-enforced (no mid-run activity signal)."),
-            })
+          executionContract: AGENT_START_EXECUTION_CONTRACT_SCHEMA
             .partial()
             .optional()
             .describe("Optional structured execution contract. Records and enforces where/how the worker may run."),
@@ -2731,6 +2736,20 @@ export function createMcpServer(
         };
       },
     );
+
+    // Issue #30: record the loaded tool-schema evidence from the actual
+    // registered zod shape so the runtime capability manifest reflects what
+    // this process really advertises, not what the source claims.
+    recordToolSchemaEvidence("agent_start", [
+      "workspaceId",
+      "profile",
+      "prompt",
+      "attemptKey",
+      "executionContract",
+      ...Object.keys(AGENT_START_EXECUTION_CONTRACT_SCHEMA.shape).map(
+        (key) => `executionContract.${key}`,
+      ),
+    ]);
 
     registerAppTool(
       server,
@@ -3626,6 +3645,9 @@ export function createServer(
         pid: runtimeBuildIdentity.pid,
         listen_port: runtimeBuildIdentity.listenPort,
       },
+      // Issue #30: post-cutover verification compares this loaded-capability
+      // manifest against the expected manifest bound to the promotion.
+      capabilityManifest: computeCapabilityManifest(),
     });
   });
 
@@ -3635,6 +3657,9 @@ export function createServer(
     res.json({
       ...runtimeBuildIdentity,
       profileCatalogGeneration: latestProfileCatalogGeneration.value,
+      // Issue #30: source/build/server identity plus the host-visible tool
+      // schema fingerprint must be provable together after a cutover.
+      capabilityManifest: computeCapabilityManifest(),
     });
   });
 
