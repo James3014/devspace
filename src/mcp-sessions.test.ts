@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import test from "node:test";
 import { McpSessionRegistry } from "./mcp-sessions.js";
 
 interface FakeTransport {
@@ -84,3 +85,37 @@ finishDelayedClose?.();
 await delayedClose;
 assert.equal(delayedCloseResolved, true);
 assert.equal(registry.size, 0);
+test("observe exposes transport count, age buckets, and generation without session ids", () => {
+  const nowref = { value: 0 };
+  const gen = new McpSessionRegistry<FakeTransport>({
+    now: () => nowref.value,
+    generation: "gen-1",
+  });
+  gen.register("secret-session-id", createTransport());
+  nowref.value =10 * 60 * 1_000 + 1;
+  gen.register("another-secret", createTransport());
+  const obs = gen.observe();
+  assert.equal(obs.count, 2);
+  assert.equal(obs.serverGeneration, "gen-1");
+  assert.equal(obs.oldestAgeMs, 0);
+  const byAge = Object.fromEntries(obs.byAgeBucket.map((b) => [b.bucket,b.count]));
+  assert.equal(byAge["1m-15m"], 1);
+  assert.equal(byAge["<1m"], 1);
+  const serialized = JSON.stringify(obs);
+
+  assert.ok(!serialized.includes("secret-session-id"));
+  assert.ok(!serialized.includes("another-secret"));
+});
+
+test("closeAll leaves durable session state in separate registries intact", async () => {
+  const nowref = { value: 0 };
+  const transports = new McpSessionRegistry<FakeTransport>({ now: () => nowref.value });
+  const durable = new Map<string, string>();
+  durable.set("durable-agent-1", "still-running");
+  transports.register("transport-1", createTransport());
+  const results = await transports.closeAll();
+
+  assert.equal(transports.size, 0);
+  assert.equal(results.length, 1);
+  assert.equal(durable.size, 1);
+});

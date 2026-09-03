@@ -102,7 +102,8 @@ export type AgentErrorCode =
   | "ATTEMPT_REPLAY_CONFLICT"
   | "CONTINUATION_ADMISSION_FAILED"
   | "NEXUS_AUTHORITY_REJECTED"
-  | "REBIND_REQUIRED";
+  | "REBIND_REQUIRED"
+  | "SERVER_DRAINING";
 
 export class AgentSessionError extends Error {
   constructor(

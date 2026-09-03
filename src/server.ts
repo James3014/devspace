@@ -102,12 +102,36 @@ import {
   runRepositoryIntelligenceOperation,
   type RepositoryIntelligenceOperation,
 } from "./repository-intelligence.js";
+import {
+  acquireCutoverLease,
+  releaseCutoverLease,
+  readCutoverLease,
+  type CutoverLease,
+} from "./cutover-lease.js";
+import {
+  createMcpCutoverCoordinator,
+  compareServerIdentity,
+  type ServerIdentityEvidence,
+} from "./mcp-cutover.js";
 
 type Transport = StreamableHTTPServerTransport;
 // MCP clients can reconnect without closing the previous transport. Bound stale
-// session retention so abandoned MCP servers do not accumulate for the life of the process.
-const MCP_SESSION_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
+// session retention so abandoned MCP servers do not accumulate for the life of the
+// process. Issue #31: the previous effectively day-long default is replaced with a
+// host-appropriate bounded lifecycle (overridable via env for different deployments).
+const MCP_SESSION_IDLE_TIMEOUT_MS = parseEnvIdleTimeout(process.env.DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS);
 const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
+
+function parseEnvIdleTimeout(value: string | undefined): number {
+  if (value === undefined || value.trim() === "") {
+    return 6 * 60 * 60 * 1_000;
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 6 * 60 * 60 * 1_000;
+  }
+  return parsed;
+}
 const AGENT_SUPERVISION_INTERVAL_MS = 2_000;
 const AGENT_TERMINATION_OUTPUT_SCHEMA = z.object({
   pending: z.boolean(),
@@ -1273,6 +1297,9 @@ export function createMcpServer(
   codexGoals?: CodexGoalSessionManager,
   runtimeBuildIdentityContext?: RuntimeBuildIdentityContext,
   durableOperations?: DurableOperationManager,
+  // Issue #31: accessor that reports whether the server is draining for
+  // cutover; new consequential starts are refused while draining.
+  isCutoverDraining?: () => boolean,
 ): McpServer {
   const runtimeBuildIdentity = runtimeBuildIdentityContext?.identity
     ?? describeRuntimeBuildIdentity({
@@ -2709,6 +2736,14 @@ export function createMcpServer(
             error instanceof Error ? error.message : String(error),
           );
         }
+        // Issue #31: refuse consequential new agent starts while the server is
+        // draining for cutover; existing durable work is unaffected.
+        if (isCutoverDraining?.()) {
+          throw new AgentSessionError(
+            "SERVER_DRAINING",
+            "Server is draining for cutover; new agent starts are refused.",
+          );
+        }
         const output = await agentSessionManager.startAgent({
           workspaceId,
           workspaceRoot: workspace.root,
@@ -3481,7 +3516,6 @@ export function createServer(
     host: config.host,
     ...(allowedHosts ? { allowedHosts } : {}),
   });
-  const transports = new McpSessionRegistry<Transport>();
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
   const oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
@@ -3511,6 +3545,12 @@ export function createServer(
     profileCatalogGeneration: "unresolved",
   });
   const latestProfileCatalogGeneration = { value: runtimeBuildIdentity.profileCatalogGeneration };
+  // Issue #31: bind the current server generation to the registry so
+  // observability/receipts can reference the exact instance that owned a
+  // transport set, and so drain can prove old/new instance identity.
+  const transports = new McpSessionRegistry<Transport>({
+    generation: runtimeBuildIdentity.serverInstanceId,
+  });
   const agentSessionManager = config.subagents.enabled
     ? new LocalAgentSessionManager(config, undefined, undefined, undefined, runtimeBuildIdentity)
     : undefined;
@@ -3557,6 +3597,16 @@ export function createServer(
     void transports
       .closeIdle(MCP_SESSION_IDLE_TIMEOUT_MS)
       .then((results) => logSessionCloseResults("idle_timeout", results));
+    // Issue #1: periodic, non-secret transport/drain/generation metrics.
+    const observation = transports.observe();
+    logEvent(config.logging, "info", "mcp_metrics", {
+      transportCount: observation.count,
+      draining: cutoverCoordinator.isDraining(),
+      serverGeneration: observation.serverGeneration,
+      oldestAgeMs: observation.oldestAgeMs,
+      idleTimeoutMs: MCP_SESSION_IDLE_TIMEOUT_MS,
+      byAgeBucket: observation.byAgeBucket,
+    });
   }, MCP_SESSION_CLEANUP_INTERVAL_MS);
   sessionCleanupTimer.unref();
 
@@ -3614,6 +3664,7 @@ export function createServer(
   );
 
   app.get("/healthz", (_req, res) => {
+    const observation = transports.observe();
     res.json({
       ok: true,
       name: "devspace",
@@ -3626,6 +3677,12 @@ export function createServer(
         pid: runtimeBuildIdentity.pid,
         listen_port: runtimeBuildIdentity.listenPort,
       },
+      // Issue #31: transport count + drain state (no session secrets).
+      mcp: {
+        transportCount: observation.count,
+        draining: cutoverCoordinator.isDraining(),
+        serverGeneration: observation.serverGeneration,
+      },
     });
   });
 
@@ -3635,6 +3692,89 @@ export function createServer(
     res.json({
       ...runtimeBuildIdentity,
       profileCatalogGeneration: latestProfileCatalogGeneration.value,
+      // Issue #31: expose transport count, drain state, and server generation
+      // (no session ids/tokens) so operators can observe cutover state.
+      mcp: {
+        transportCount: transports.size,
+        draining: cutoverCoordinator.isDraining(),
+        serverGeneration: transports.serverGeneration,
+      },
+    });
+  });
+
+  // Issue #31: deployment/cutover control plane. Owner-token authenticated.
+  // Only one controller may hold the cutover lease at a time; drain rejects
+  // new consequential starts while allowing bounded status/reconcile calls.
+  const cutoverIdentity: ServerIdentityEvidence = {
+    serverInstanceId: runtimeBuildIdentity.serverInstanceId,
+    sourceCommit: runtimeBuildIdentity.sourceCommit,
+    buildId: runtimeBuildIdentity.buildId,
+  };
+  const cutoverCoordinator = createMcpCutoverCoordinator({
+    transports,
+    server: cutoverIdentity,
+  });
+
+  function cutoverAuth(req: Request): boolean {
+    const expected = config.oauth.ownerToken;
+    const header = req.header("authorization") ?? "";
+    const prefix = "Bearer ";
+    if (!header.startsWith(prefix)) return false;
+    return header.slice(prefix.length) === expected;
+  }
+
+  app.post("/api/cutover/drain", async (_req, res) => {
+    if (!cutoverAuth(_req)) {
+      res.status(401).json({ error: "cutover_owner_token_required" });
+      return;
+    }
+    const lease = await acquireCutoverLease({
+      stateRoot: config.stateDir,
+      serverInstanceId: cutoverIdentity.serverInstanceId,
+    });
+    if (!lease.acquired) {
+      res.status(409).json({
+        error: "cutover_lease_held",
+        heldBy: lease.existing?.holder,
+        expiresAt: lease.existing?.expiresAt,
+      });
+      return;
+    }
+    const drain = await cutoverCoordinator.beginDrain();
+    res.json({
+      status: drain.status,
+      leaseId: lease.lease?.leaseId,
+      transportsDrained: drain.transportsDrained,
+      closeFailures: drain.closeFailures,
+      oldServer: drain.oldServer,
+      reconnectRequired: true,
+    });
+  });
+
+  app.post("/api/cutover/finish", async (_req, res) => {
+    if (!cutoverAuth(_req)) {
+      res.status(401).json({ error: "cutover_owner_token_required" });
+      return;
+    }
+    const released = await releaseCutoverLease(
+      config.stateDir,
+      cutoverIdentity.serverInstanceId,
+    );
+    const finish = cutoverCoordinator.finishDrain();
+    res.json({
+      released: released.released,
+      observation: finish.observation,
+      server: finish.servers,
+    });
+  });
+
+  app.get("/api/cutover/status", async (_req, res) => {
+    const lease = await readCutoverLease(config.stateDir);
+    res.json({
+      draining: cutoverCoordinator.isDraining(),
+      lease: lease,
+      server: cutoverIdentity,
+      transportCount: transports.size,
     });
   });
 
@@ -3660,6 +3800,19 @@ export function createServer(
         ...requestLogFields(req, config),
       });
       sendJsonRpcError(res, 401, -32001, "Unauthorized");
+      return;
+    }
+
+    // Issue #31: while draining, reject new MCP session initialization so a
+    // cutover does not pick up consequential new starts; existing-session
+    // status/reconcile calls (sessionId present) are still allowed.
+    if (initializeRequest && cutoverCoordinator.isDraining()) {
+      logEvent(config.logging, "warn", "mcp_session_rejected", {
+        requestId,
+        reason: "server_draining",
+        sessionIdPrefix: sessionIdPrefix(sessionId),
+      });
+      sendJsonRpcError(res, 503, -32003, "Server is draining for cutover");
       return;
     }
 
@@ -3714,6 +3867,7 @@ export function createServer(
           codexGoals,
           { identity: runtimeBuildIdentity, latestProfileCatalogGeneration },
           durableOperations,
+          () => cutoverCoordinator.isDraining(),
         );
         await server.connect(transport);
       } else {
@@ -3744,6 +3898,9 @@ export function createServer(
         if (agentSupervisionTimer) clearInterval(agentSupervisionTimer);
         const results = await transports.closeAll();
         logSessionCloseResults("server_shutdown", results);
+        // Issue #31: release the cutover lease on shutdown so a crashed holder
+        // does not block the next cutover indefinitely (best-effort).
+        await releaseCutoverLease(config.stateDir, cutoverIdentity.serverInstanceId);
         codexGoals?.shutdown();
         processSessions.shutdown();
         durableOperations.close();
