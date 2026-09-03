@@ -2674,7 +2674,7 @@ export function createMcpServer(
                 .number()
                 .int()
                 .min(1)
-                .describe("Recorded and surfaced; not auto-enforced (no mid-run activity signal)."),
+                .describe("Optional idle bound enforced by the Dev supervisor once execution has started: the agent is terminated after this long with no provider activity. Adapters report activity on provider protocol events and raw output bytes; providers that emit nothing mid-run must not be paired with tight idle bounds (use maxExecutionMs for those)."),
             })
             .partial()
             .optional()

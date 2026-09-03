@@ -12,6 +12,7 @@ import {
   type AgentProviderError,
 } from "./local-agent-errors.js";
 import { terminateProcessTree } from "./process-platform.js";
+import { createThrottledActivityTouch } from "./local-agent-activity.js";
 import {
   GrokPromptCompletionRegistry,
   GROK_DEFAULT_MODEL,
@@ -155,6 +156,15 @@ export class AcpRuntime implements LocalAgentRuntime {
           throw new TypeError(`${this.provider} ACP session ${sessionId} already has an active turn.`);
         }
         this.activeSessions.add(sessionId);
+        // Raw-byte heartbeat: any output from the provider process is proof of
+        // life even when the protocol emits no session/update (e.g. silent
+        // model reasoning). Throttled; detached when the turn ends.
+        const activityTouch = createThrottledActivityTouch(() => {
+          void callbacks?.onActivity?.();
+        });
+        const onProviderBytes = () => activityTouch.touch();
+        this.child?.stdout?.on("data", onProviderBytes);
+        this.child?.stderr?.on("data", onProviderBytes);
         const queue = this.queues.get(sessionId) ?? { values: [] };
         this.queues.set(sessionId, queue);
         const promptId = this.provider === "grok" ? this.nextPromptId() : undefined;
@@ -229,6 +239,8 @@ export class AcpRuntime implements LocalAgentRuntime {
             items: updates,
           };
         } finally {
+          this.child?.stdout?.off("data", onProviderBytes);
+          this.child?.stderr?.off("data", onProviderBytes);
           this.activityCallbacks.delete(sessionId);
           if (promptId) this.grokCompletionRegistry?.remove(sessionId, promptId);
           this.activeSessions.delete(sessionId);

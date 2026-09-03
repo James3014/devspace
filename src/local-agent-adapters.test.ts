@@ -364,6 +364,24 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { cleanupProviderScratch, createProviderScratch } from "./provider-scratch.js";
+import { createThrottledActivityTouch } from "./local-agent-activity.js";
+
+// Throttle semantics: with minIntervalMs=0 every touch fires; with a positive
+// interval only the first touch inside the window fires (Nexus issue 731).
+{
+  let zeroIntervalTouches = 0;
+  const zeroThrottle = createThrottledActivityTouch(() => { zeroIntervalTouches += 1; }, 0);
+  zeroThrottle.touch();
+  zeroThrottle.touch();
+  zeroThrottle.touch();
+  assert.equal(zeroIntervalTouches, 3);
+
+  let throttledTouches = 0;
+  const throttled = createThrottledActivityTouch(() => { throttledTouches += 1; }, 60_000);
+  throttled.touch();
+  throttled.touch();
+  assert.equal(throttledTouches, 1);
+}
 
 const mockAgySource = `#!/usr/bin/env node
 const { existsSync, realpathSync } = require("node:fs");
@@ -471,6 +489,16 @@ if (args.includes("--print")) {
       console.error("MOCK_AGY: IGNORED_SIGTERM");
     });
     setInterval(() => {}, 10000);
+    return;
+  }
+  if (prompt === "STREAM_HEARTBEAT") {
+    // Progress-style bytes go to stderr; stdout must stay clean JSON for the
+    // non-incremental --print protocol.
+    process.stderr.write("heartbeat-chunk-1\\n");
+    setTimeout(() => {
+      process.stderr.write("heartbeat-chunk-2\\n");
+      console.log(JSON.stringify({ status: "SUCCESS", conversation_id: "stream-conv-id", response: "streamed ok" }));
+    }, 2100);
     return;
   }
   if (prompt === "FORCE_ERROR") {
@@ -597,6 +625,26 @@ try {
     });
     assert.match(result.finalResponse, /model=gemini-3.7-flash-medium/);
     assert.match(result.finalResponse, /effort=,/);
+  }
+
+  // C2. Byte-level heartbeat: streamed provider output must touch activity so
+  // the idle supervisor cannot mistake a working provider for a hung one
+  // (Nexus issue 731).
+  {
+    const activityTouchTimes: number[] = [];
+    const result = await adapter.run({
+      prompt: "STREAM_HEARTBEAT",
+      workspaceRoot: process.cwd(),
+      writeMode: "allowed",
+    }, {
+      onActivity: () => { activityTouchTimes.push(Date.now()); },
+    });
+    assert.equal(result.provider, "agy");
+    assert.match(result.finalResponse, /streamed ok/);
+    assert.ok(
+      activityTouchTimes.length >= 2,
+      `expected at least two mid-run activity touches from streamed output, got ${activityTouchTimes.length}`,
+    );
   }
 
   // D. 唯讀新會話測試

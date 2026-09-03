@@ -1297,9 +1297,12 @@ export class LocalAgentSessionManager {
         }
       }
 
-      // 4. idleTimeoutMs: terminate only after a provider/runtime activity
-      // signal has gone silent. The active-turn generation and worker token
-      // are revalidated by beginTerminationCAS before any process is killed.
+      // 4. idleTimeoutMs: enforced once execution has started. The idle clock
+      // is seeded at execution start and advanced by provider activity
+      // (protocol events and raw output bytes, throttled per adapter). A
+      // provider that emits nothing for this long is treated as hung. The
+      // active-turn generation and worker token are revalidated by
+      // beginTerminationCAS before any process is killed.
       if (contract.idleTimeoutMs && executionStartedAtMs !== undefined && now - lastActivityAtMs > contract.idleTimeoutMs) {
         await this.terminateActiveAgent(
           record.id,
