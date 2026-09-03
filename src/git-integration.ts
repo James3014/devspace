@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { isAbsolute, relative, sep } from "node:path";
 import { canonicalizePath } from "./roots.js";
+import type { CapabilityManifest } from "./capability-manifest.js";
 
 /**
  * Typed integration primitive for one accepted, IMMUTABLE Candidate range.
@@ -118,6 +119,13 @@ export interface CandidatePromotionInput {
   expectedDestinationHead: string;
   /** Must be true before any ref or worktree mutation occurs. */
   confirmPromote: boolean;
+  /** Expected values used only as a CAS fence against trusted live runtime facts. */
+  runtimeBinding?: {
+    expectedServerInstanceId: string;
+    expectedSourceCommit: string;
+    expectedBuildId: string;
+    expectedCapabilityManifestSha256: string;
+  };
   /** Deterministic race-test seam: runs after final validation, before CAS ref update. */
   beforeRefUpdateHook?: () => Promise<void> | void;
   /** Deterministic failure-test seam: runs after CAS ref update, before worktree/index sync. */
@@ -141,7 +149,13 @@ export interface PromotionBlocker {
     | "PROMOTION_NOT_CONFIRMED"
     | "PROMOTION_CAS_FAILED"
     | "PROMOTION_WORKTREE_SYNC_FAILED"
-    | "PROMOTION_POST_STATE_MISMATCH";
+    | "PROMOTION_POST_STATE_MISMATCH"
+    | "PROMOTION_RUNTIME_IDENTITY_MISMATCH"
+    | "PROMOTION_CAPABILITY_MANIFEST_INCOMPLETE"
+    | "PROMOTION_CANDIDATE_CAPABILITY_BINDING_UNAVAILABLE"
+    | "PROMOTION_CANONICAL_UPSTREAM_UNKNOWN"
+    | "PROMOTION_STALE_CANONICAL_BASE"
+    | "PROMOTION_CANONICAL_HEAD_DRIFT";
   detail: string;
 }
 
@@ -154,9 +168,21 @@ export interface CandidatePromotionResult {
   currentHead: string;
   candidateHead: string;
   candidateTree: string;
+  canonicalRemote?: string;
+  canonicalRef?: string;
+  canonicalHead?: string;
   /** Acceptance remains external authority; this primitive only moves local Git state. */
   acceptanceStatus: "external_not_granted_here";
   blockers: PromotionBlocker[];
+}
+
+export interface PromotionRuntimeContext {
+  identity: {
+    serverInstanceId: string;
+    sourceCommit: string;
+    buildId: string;
+  };
+  capabilityManifest: CapabilityManifest;
 }
 
 const GIT_TIMEOUT_MS = 15_000;
@@ -753,6 +779,35 @@ async function destinationPromotionState(
   };
 }
 
+interface CanonicalUpstreamObservation {
+  remote: string;
+  ref: string;
+  head: string;
+}
+
+async function observeCanonicalUpstream(
+  destination: string,
+  branch: string,
+): Promise<CanonicalUpstreamObservation | undefined> {
+  const [remoteResult, mergeResult] = await Promise.all([
+    runGit(["config", "--get", `branch.${branch}.remote`], destination),
+    runGit(["config", "--get", `branch.${branch}.merge`], destination),
+  ]);
+  const remote = remoteResult.ok ? remoteResult.stdout.trim() : "";
+  const ref = mergeResult.ok ? mergeResult.stdout.trim() : "";
+  if (!remote || remote === "." || remote.startsWith("-") || !ref.startsWith("refs/heads/")) {
+    return undefined;
+  }
+
+  const observed = await runGit(["ls-remote", "--exit-code", "--heads", remote, ref], destination);
+  if (!observed.ok) return undefined;
+  const matches = splitLines(observed.stdout)
+    .map((line) => line.split(/\s+/))
+    .filter((parts) => parts[1] === ref && EXACT_COMMIT_SHA_PATTERN.test(parts[0]?.toLowerCase() ?? ""));
+  if (matches.length !== 1) return undefined;
+  return { remote, ref, head: matches[0]![0]!.toLowerCase() };
+}
+
 /**
  * Advance one exact attached local branch from candidateBase to candidateHead.
  *
@@ -772,11 +827,13 @@ async function destinationPromotionState(
  */
 export async function promoteCandidate(
   input: CandidatePromotionInput,
+  runtimeContext?: PromotionRuntimeContext,
 ): Promise<CandidatePromotionResult> {
   const blockers: PromotionBlocker[] = [];
   const branch = input.expectedDestinationBranch;
   let previousHead = input.expectedDestinationHead.toLowerCase();
   let currentHead = "";
+  let canonicalUpstream: CanonicalUpstreamObservation | undefined;
 
   const fail = (): CandidatePromotionResult => ({
     success: false,
@@ -787,6 +844,9 @@ export async function promoteCandidate(
     currentHead,
     candidateHead: input.candidateHead.toLowerCase(),
     candidateTree: input.candidateTree.toLowerCase(),
+    canonicalRemote: canonicalUpstream?.remote,
+    canonicalRef: canonicalUpstream?.ref,
+    canonicalHead: canonicalUpstream?.head,
     acceptanceStatus: "external_not_granted_here",
     blockers,
   });
@@ -906,6 +966,55 @@ export async function promoteCandidate(
     return fail();
   }
 
+  if (runtimeContext) {
+    const binding = input.runtimeBinding;
+    const actual = runtimeContext.identity;
+    const manifest = runtimeContext.capabilityManifest;
+    if (
+      !binding
+      || binding.expectedServerInstanceId !== actual.serverInstanceId
+      || binding.expectedSourceCommit !== actual.sourceCommit
+      || binding.expectedBuildId !== actual.buildId
+      || binding.expectedCapabilityManifestSha256 !== manifest.manifestSha256
+    ) {
+      blockers.push({
+        code: "PROMOTION_RUNTIME_IDENTITY_MISMATCH",
+        detail: "Promotion runtime binding does not match the currently loaded serverInstanceId/sourceCommit/buildId/capability manifest.",
+      });
+      return fail();
+    }
+    if (manifest.missing.length > 0) {
+      blockers.push({
+        code: "PROMOTION_CAPABILITY_MANIFEST_INCOMPLETE",
+        detail: `Currently loaded runtime is missing required capabilities: ${manifest.missing.join(", ")}.`,
+      });
+      return fail();
+    }
+    if (actual.sourceCommit !== candidateHead) {
+      blockers.push({
+        code: "PROMOTION_CANDIDATE_CAPABILITY_BINDING_UNAVAILABLE",
+        detail: `Candidate ${candidateHead} is not the exact sourceCommit loaded by this runtime (${actual.sourceCommit}); DevSpace has no narrow trusted primitive to execute and attest an arbitrary candidate, so promotion fails closed.`,
+      });
+      return fail();
+    }
+
+    canonicalUpstream = await observeCanonicalUpstream(destination, branch);
+    if (!canonicalUpstream) {
+      blockers.push({
+        code: "PROMOTION_CANONICAL_UPSTREAM_UNKNOWN",
+        detail: `Could not derive and live-observe the configured upstream for destination branch ${branch}.`,
+      });
+      return fail();
+    }
+    if (canonicalUpstream.head !== candidateBase) {
+      blockers.push({
+        code: "PROMOTION_STALE_CANONICAL_BASE",
+        detail: `Candidate base ${candidateBase} does not equal the live canonical upstream head ${canonicalUpstream.head} derived from ${canonicalUpstream.remote}/${canonicalUpstream.ref}.`,
+      });
+      return fail();
+    }
+  }
+
   const expectedFullRef = `refs/heads/${branch}`;
   let state = await destinationPromotionState(destination, branch);
   currentHead = state.head ?? "";
@@ -956,6 +1065,9 @@ export async function promoteCandidate(
       currentHead: candidateHead,
       candidateHead,
       candidateTree,
+      canonicalRemote: canonicalUpstream?.remote,
+      canonicalRef: canonicalUpstream?.ref,
+      canonicalHead: canonicalUpstream?.head,
       acceptanceStatus: "external_not_granted_here",
       blockers: [],
     };
@@ -1011,6 +1123,22 @@ export async function promoteCandidate(
   // Deterministic race seam used by tests to move the ref after the final
   // re-fence but before update-ref's old-OID CAS.
   await input.beforeRefUpdateHook?.();
+
+  if (runtimeContext && canonicalUpstream) {
+    const finalCanonical = await observeCanonicalUpstream(destination, branch);
+    if (
+      !finalCanonical
+      || finalCanonical.remote !== canonicalUpstream.remote
+      || finalCanonical.ref !== canonicalUpstream.ref
+      || finalCanonical.head !== canonicalUpstream.head
+    ) {
+      blockers.push({
+        code: "PROMOTION_CANONICAL_HEAD_DRIFT",
+        detail: "Destination canonical upstream binding or live remote head changed before the promotion CAS; no local ref mutation occurred.",
+      });
+      return fail();
+    }
+  }
 
   // CAS ref advancement: a concurrent ref move is never overwritten.
   const refUpdate = await runGit(
@@ -1077,6 +1205,9 @@ export async function promoteCandidate(
     currentHead: candidateHead,
     candidateHead,
     candidateTree,
+    canonicalRemote: canonicalUpstream?.remote,
+    canonicalRef: canonicalUpstream?.ref,
+    canonicalHead: canonicalUpstream?.head,
     acceptanceStatus: "external_not_granted_here",
     blockers: [],
   };
