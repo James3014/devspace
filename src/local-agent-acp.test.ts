@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import {
   AcpLocalAgentDriver,
   AcpRuntime,
@@ -606,4 +607,40 @@ assert.equal(resumedRuntime.isAlive(), false);
   } finally {
     await rm(tempHome, { recursive: true, force: true });
   }
+}
+
+// Raw-byte heartbeat: provider stdout bytes must touch activity even when the
+// protocol emits no session/update mid-run (Nexus issue 731).
+{
+  const { EventEmitter } = await import("node:events");
+  const fakeChild = Object.assign(new EventEmitter(), {
+    stdout: new EventEmitter(),
+    stderr: new EventEmitter(),
+    exitCode: null,
+    killed: false,
+  }) as unknown as ChildProcessWithoutNullStreams;
+  const heartbeatRuntime = new AcpRuntime({
+    provider: "cursor",
+    command: "cursor-agent",
+    args: ["acp"],
+    env: {},
+    capabilities: { resume: false, close: false },
+    queues,
+    child: fakeChild,
+  }, connection);
+  let heartbeatTouches = 0;
+  const heartbeatRun = heartbeatRuntime.run({
+    prompt: "heartbeat",
+    workspaceRoot: "/tmp/project",
+    writeMode: "read_only",
+  }, {
+    onActivity: () => { heartbeatTouches += 1; },
+  });
+  await new Promise((resolveSleep) => setTimeout(resolveSleep, 50));
+  fakeChild.stdout.emit("data", Buffer.from("reasoning-bytes"));
+  fakeChild.stdout.emit("data", Buffer.from("more-bytes"));
+  const heartbeatResult = await heartbeatRun;
+  assert.equal(heartbeatResult.isOk(), true);
+  if (heartbeatResult.isErr()) throw heartbeatResult.error;
+  assert.ok(heartbeatTouches >= 1, `expected byte heartbeat activity touches, got ${heartbeatTouches}`);
 }

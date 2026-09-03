@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, realpathSync, symlinkSync } from "node:fs";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
 import { resolveAgyExecutable } from "./local-agent-availability.js";
+import { createThrottledActivityTouch } from "./local-agent-activity.js";
 import {
   createCodexSdkLocalAgentRuntime,
   LocalAgentProviderError,
@@ -418,11 +419,21 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
     let stdout = "";
     let stderr = "";
 
+    // Any provider output byte is proof of life. Agy --print emits nothing
+    // until the full JSON response, but if it does stream anything (progress
+    // on stderr etc.) the idle supervisor must not mistake it for a hung
+    // worker. Throttled because every touch persists to the session store.
+    const activityTouch = createThrottledActivityTouch(() => {
+      void callbacks?.onActivity?.();
+    });
+
     child.stdout.on("data", (chunk: Buffer) => {
       stdout += chunk.toString("utf8");
+      activityTouch.touch();
     });
     child.stderr.on("data", (chunk: Buffer) => {
       stderr += chunk.toString("utf8");
+      activityTouch.touch();
     });
 
     const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
