@@ -1,4 +1,10 @@
 import { createHash, randomUUID } from "node:crypto";
+// Issue #33: conversation-scoped checkout collision detection + cross-session capacity diagnostics
+import {
+  checkCrossSessionCapacity,
+  type CrossSessionCapacityInput,
+  type CrossSessionCapacityResult,
+} from "./conversation-isolation.js";
 import { mkdtempSync, unlinkSync, rmdirSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -312,8 +318,14 @@ export interface AgentPreflightOutput {
     available: boolean;
     executables?: Record<string, string>;
   };
-  blockers: Array<{ code: string; detail: string }>;
+    blockers: Array<{ code: string; detail: string }>;
   unknowns: string[];
+  // Issue #33: read-only diagnostics distinguishing local slot exhaustion from provider rate-limit
+  capacityDiagnostics?: {
+    isLocalExhaustion: boolean;
+    isRateLimited: boolean;
+    reason: string;
+  };
 }
 
 export interface AgentSummary {
@@ -990,6 +1002,25 @@ export class LocalAgentSessionManager {
       });
     }
 
+    // Issue #33: Distinguish local agent slot exhaustion from provider rate-limiting.
+    // This is read-only diagnostics, NOT a global lock.
+    const capacityInput: CrossSessionCapacityInput = {
+      activeLocalAgents: this.runningCount(),
+      maxAgentSlots: this.config.agentMaxConcurrent,
+      // provider quota is unknown at preflight time without an expensive provider call
+      providerQuotaRemaining: -1, // treated as unknown → no rate-limit blocker, reported as diagnostic
+    };
+    const capacityDiagnostic = checkCrossSessionCapacity(capacityInput);
+    const capacityDiagnostics: {
+      isLocalExhaustion: boolean;
+      isRateLimited: boolean;
+      reason: string;
+    } = {
+      isLocalExhaustion: capacityDiagnostic.isLocalExhaustion,
+      isRateLimited: capacityDiagnostic.isRateLimited,
+      reason: capacityDiagnostic.reason,
+    };
+
     let toolchainAvailable = false;
     let executables: Record<string, string> | undefined;
     let providerEnvironment = process.env;
@@ -1099,6 +1130,7 @@ export class LocalAgentSessionManager {
         : { id: "none", available: false },
       blockers,
       unknowns,
+      capacityDiagnostics,
     };
   }
 
@@ -1299,6 +1331,11 @@ export class LocalAgentSessionManager {
     return this.store
       .list()
       .filter(occupiesDetachedExecutionSlot).length;
+  }
+
+  // Issue #33: read-only capacity accessor for /healthz diagnostics
+  maxConcurrent(): number {
+    return this.config.agentMaxConcurrent ?? 0;
   }
 
   private hasExecutionCapacity(): boolean {

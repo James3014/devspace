@@ -2990,6 +2990,12 @@ export function createMcpServer(
           }),
           blockers: z.array(z.object({ code: z.string(), detail: z.string() })),
           unknowns: z.array(z.string()),
+          // Issue #33: read-only capacity diagnostics, no session secrets
+          capacityDiagnostics: z.object({
+            isLocalExhaustion: z.boolean(),
+            isRateLimited: z.boolean(),
+            reason: z.string(),
+          }).optional(),
         },
         _meta: {},
         annotations: { readOnlyHint: true },
@@ -3600,6 +3606,9 @@ export function createServer(
   );
 
   app.get("/healthz", (_req, res) => {
+    // Issue #33: read-only capacity diagnostics (used/max), no session secrets
+    const runningCount = agentSessionManager?.runningCount?.() ?? 0;
+    const maxConcurrent = agentSessionManager?.maxConcurrent?.() ?? 0;
     res.json({
       ok: true,
       name: "devspace",
@@ -3611,6 +3620,10 @@ export function createServer(
         build_id: runtimeBuildIdentity.buildId,
         pid: runtimeBuildIdentity.pid,
         listen_port: runtimeBuildIdentity.listenPort,
+      },
+      capacity: {
+        used: runningCount,
+        max: maxConcurrent,
       },
     });
   });
