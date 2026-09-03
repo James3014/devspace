@@ -825,7 +825,9 @@ import sys
 STATE = pathlib.Path.home() / "Library" / "Application Support" / "Nexus" / "gateway-direct"
 AUTHORITY = STATE / "recovery-authority.json"
 MANAGER = STATE / "manager.py"
-DEPLOYMENTS = STATE / "deployments"
+AUTHORITY_MIRROR = pathlib.Path.home() / "Workspace" / "Nexus-new-authority-main"
+MANAGER_REL = pathlib.Path("scripts") / "ops" / "mcp_gateway_durable.py"
+CONTRACT_REL = pathlib.Path("nexus") / "contracts" / "gateway_deployment.py"
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 DEPLOYMENT_ID = re.compile(r"^r1-[0-9a-f]{40}$")
@@ -844,6 +846,16 @@ def secure_file(path, label):
     info = os.lstat(path)
     if not stat.S_ISREG(info.st_mode):
         fail(label + " must be a regular file")
+    if info.st_uid != os.getuid() or (stat.S_IMODE(info.st_mode) & 0o022):
+        fail(label + " ownership/mode invalid")
+
+
+def secure_directory(path, label):
+    if path.is_symlink():
+        fail(label + " must not be a symlink")
+    info = os.lstat(path)
+    if not stat.S_ISDIR(info.st_mode):
+        fail(label + " must be a directory")
     if info.st_uid != os.getuid() or (stat.S_IMODE(info.st_mode) & 0o022):
         fail(label + " ownership/mode invalid")
 
@@ -911,32 +923,30 @@ try:
     if not isinstance(desired_tree, str) or HEX40.fullmatch(desired_tree) is None:
         fail("desired deployment tree invalid")
 
-    deployments_root = DEPLOYMENTS.resolve(strict=True)
-    desired_root_path = DEPLOYMENTS / desired_id
-    if desired_root_path.is_symlink():
-        fail("desired deployment root must not be a symlink")
-    desired_root = desired_root_path.resolve(strict=True)
-    if desired_root.parent != deployments_root or not desired_root.is_dir():
-        fail("desired deployment root escaped fixed deployments directory")
-    root_info = os.lstat(desired_root)
-    if root_info.st_uid != os.getuid() or (stat.S_IMODE(root_info.st_mode) & 0o022):
-        fail("desired deployment root ownership/mode invalid")
-    if git(desired_root, "rev-parse", "--show-toplevel") != str(desired_root):
-        fail("desired deployment toplevel mismatch")
-    if git(desired_root, "remote", "get-url", "origin") != REMOTE:
-        fail("desired deployment remote mismatch")
-    if git(desired_root, "status", "--porcelain"):
-        fail("desired deployment is dirty")
-    if git(desired_root, "rev-parse", "HEAD") != desired_commit:
-        fail("desired deployment commit mismatch")
-    if git(desired_root, "rev-parse", "HEAD^{tree}") != desired_tree:
-        fail("desired deployment tree mismatch")
-    contract_path = desired_root / "nexus" / "contracts" / "gateway_deployment.py"
-    secure_file(contract_path, "gateway deployment authority contract")
-    if hashlib.sha256(contract_path.read_bytes()).hexdigest() != ACCEPTED_CONTRACT_SHA256:
+    # The desired deployment is manager-owned recovery state.  It may not exist
+    # yet on the first call, so the transport must not require it before the
+    # pinned manager can run its effect-free staging transition.  Bootstrap the
+    # manager import only from the fixed clean authority mirror and exact pinned
+    # manager/contract bytes; the manager then revalidates fresh remote-main
+    # provenance and owns all deployment creation/verification.
+    secure_directory(AUTHORITY_MIRROR, "authority mirror")
+    authority_mirror = AUTHORITY_MIRROR.resolve(strict=True)
+    if git(authority_mirror, "rev-parse", "--show-toplevel") != str(authority_mirror):
+        fail("authority mirror toplevel mismatch")
+    if git(authority_mirror, "remote", "get-url", "origin") != REMOTE:
+        fail("authority mirror remote mismatch")
+    if git(authority_mirror, "status", "--porcelain"):
+        fail("authority mirror is dirty")
+    mirror_manager = authority_mirror / MANAGER_REL
+    mirror_contract = authority_mirror / CONTRACT_REL
+    secure_file(mirror_manager, "authority mirror manager")
+    secure_file(mirror_contract, "gateway deployment authority contract")
+    if hashlib.sha256(mirror_manager.read_bytes()).hexdigest() != ACCEPTED_MANAGER_SHA256:
+        fail("authority mirror manager hash mismatch")
+    if hashlib.sha256(mirror_contract.read_bytes()).hexdigest() != ACCEPTED_CONTRACT_SHA256:
         fail("gateway deployment authority contract hash mismatch")
 
-    sys.path.insert(0, str(desired_root))
+    sys.path.insert(0, str(authority_mirror))
     spec = importlib.util.spec_from_file_location("nexus_gateway_stable_manager", MANAGER)
     if spec is None or spec.loader is None:
         fail("manager import spec unavailable")

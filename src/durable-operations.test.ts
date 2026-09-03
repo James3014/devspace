@@ -116,6 +116,29 @@ async function git(cwd: string, ...args: string[]): Promise<string> {
   return result.stdout.trim();
 }
 
+async function prepareRecoveryAuthorityMirror(
+  home: string,
+  managerSource: string,
+  contractSource: string,
+): Promise<{ mirror: string; managerHash: string; contractHash: string }> {
+  const mirror = join(home, "Workspace", "Nexus-new-authority-main");
+  await mkdir(join(mirror, "scripts", "ops"), { recursive: true });
+  await mkdir(join(mirror, "nexus", "contracts"), { recursive: true });
+  await writeFile(join(mirror, "scripts", "ops", "mcp_gateway_durable.py"), managerSource);
+  await writeFile(join(mirror, "nexus", "contracts", "gateway_deployment.py"), contractSource);
+  await git(mirror, "init");
+  await git(mirror, "config", "user.email", "devspace@example.com");
+  await git(mirror, "config", "user.name", "DevSpace Test");
+  await git(mirror, "remote", "add", "origin", "https://github.com/James3014/Nexus-new.git");
+  await git(mirror, "add", ".");
+  await git(mirror, "commit", "-m", "fixture");
+  return {
+    mirror,
+    managerHash: createHash("sha256").update(managerSource).digest("hex"),
+    contractHash: createHash("sha256").update(contractSource).digest("hex"),
+  };
+}
+
 test("workspace_clone clones a local repository inside allowed roots and exact replay does not duplicate", async () => {
   const f = await fixture();
   try {
@@ -460,6 +483,63 @@ test("nexus_gateway_recover malformed manager output fails closed as uncertain",
   }
 });
 
+test("fixed Nexus bridge lets the pinned manager stage a missing desired deployment", { skip: process.platform !== "darwin" }, async () => {
+  const home = await mkdtemp(join(tmpdir(), "devspace-nexus-bridge-staging-"));
+  try {
+    const state = join(home, "Library", "Application Support", "Nexus", "gateway-direct");
+    await mkdir(state, { recursive: true });
+    const marker = join(home, "manager-imported");
+    const managerSource = [
+      "from pathlib import Path",
+      `Path(${JSON.stringify(marker)}).write_text(\"IMPORTED\")`,
+      "class Outcome:",
+      "    def model_dump(self, mode=None):",
+      "        return {'result': 'VERIFIED', 'effect_started': False}",
+      "def _gateway_recover_live(request):",
+      "    return Outcome()",
+      "",
+    ].join("\n");
+    const contractSource = "# accepted gateway deployment contract\n";
+    const { managerHash, contractHash } = await prepareRecoveryAuthorityMirror(home, managerSource, contractSource);
+    const managerPath = join(state, "manager.py");
+    await writeFile(managerPath, managerSource);
+    await chmod(managerPath, 0o600);
+    const request = recoveryRequest();
+    const authorityPath = join(state, "recovery-authority.json");
+    await writeFile(authorityPath, JSON.stringify({
+      schema: "nexus.gateway.durable_recovery_authority.v1",
+      revocation_state: "NOT_REVOKED",
+      final_manager_sha256: managerHash,
+      request_id: request.request_id,
+      idempotency_fence: request.idempotency_fence,
+      receipt_id: request.recovery_authority_id,
+      receipt_hash: request.recovery_authority_hash,
+      desired_manifest_id: request.desired_manifest_id,
+      desired_manifest_sha256: request.desired_manifest_hash,
+      predecessor_manifest_id: request.predecessor_manifest_id,
+      predecessor_manifest_sha256: request.predecessor_manifest_hash,
+      desired_manifest: {
+        deployment_id: request.desired_manifest_id,
+        commit: "1".repeat(40),
+        tree: "2".repeat(40),
+      },
+    }));
+    await chmod(authorityPath, 0o600);
+    const bridgeCode = buildNexusGatewayRecoveryBridgeCode(managerHash, contractHash);
+    const result = await runRecoveryBridge(home, request, bridgeCode);
+    assert.equal(result.exitCode, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), { effect_started: false, result: "VERIFIED" });
+    assert.equal(await pathExists(marker), true, "accepted manager must own the staging transition");
+    assert.equal(
+      await pathExists(join(state, "deployments")),
+      false,
+      "transport must not require or create deployment state before the manager runs",
+    );
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
 test("fixed Nexus bridge rejects manager hash mismatch before importing manager code", { skip: process.platform !== "darwin" }, async () => {
   const home = await mkdtemp(join(tmpdir(), "devspace-nexus-bridge-hash-"));
   try {
@@ -486,29 +566,19 @@ test("fixed Nexus bridge rejects manager hash mismatch before importing manager 
   }
 });
 
-test("fixed Nexus bridge rejects a deployment with a substituted authority contract before manager import", { skip: process.platform !== "darwin" }, async () => {
+test("fixed Nexus bridge rejects a substituted authority-mirror contract before manager import", { skip: process.platform !== "darwin" }, async () => {
   const home = await mkdtemp(join(tmpdir(), "devspace-nexus-bridge-contract-"));
   try {
     const state = join(home, "Library", "Application Support", "Nexus", "gateway-direct");
-    const deployments = join(state, "deployments");
-    await mkdir(deployments, { recursive: true });
+    await mkdir(state, { recursive: true });
     const marker = join(home, "manager-imported");
+    const managerSource = `from pathlib import Path\nPath(${JSON.stringify(marker)}).write_text("IMPORTED")\n`;
     const managerPath = join(state, "manager.py");
-    await writeFile(managerPath, `from pathlib import Path\nPath(${JSON.stringify(marker)}).write_text("IMPORTED")\n`);
+    await writeFile(managerPath, managerSource);
     await chmod(managerPath, 0o600);
     const managerHash = createHash("sha256").update(await readFile(managerPath)).digest("hex");
+    await prepareRecoveryAuthorityMirror(home, managerSource, "# substituted authority contract\n");
     const request = recoveryRequest();
-    const desiredRoot = join(deployments, request.desired_manifest_id);
-    await mkdir(join(desiredRoot, "nexus", "contracts"), { recursive: true });
-    await git(desiredRoot, "init");
-    await git(desiredRoot, "config", "user.email", "devspace@example.com");
-    await git(desiredRoot, "config", "user.name", "DevSpace Test");
-    await git(desiredRoot, "remote", "add", "origin", "https://github.com/James3014/Nexus-new.git");
-    await writeFile(join(desiredRoot, "nexus", "contracts", "gateway_deployment.py"), "# substituted authority contract\n");
-    await git(desiredRoot, "add", ".");
-    await git(desiredRoot, "commit", "-m", "fixture");
-    const desiredCommit = await git(desiredRoot, "rev-parse", "HEAD");
-    const desiredTree = await git(desiredRoot, "rev-parse", "HEAD^{tree}");
     const authorityPath = join(state, "recovery-authority.json");
     await writeFile(authorityPath, JSON.stringify({
       schema: "nexus.gateway.durable_recovery_authority.v1",
@@ -524,8 +594,8 @@ test("fixed Nexus bridge rejects a deployment with a substituted authority contr
       predecessor_manifest_sha256: request.predecessor_manifest_hash,
       desired_manifest: {
         deployment_id: request.desired_manifest_id,
-        commit: desiredCommit,
-        tree: desiredTree,
+        commit: "1".repeat(40),
+        tree: "2".repeat(40),
       },
     }));
     await chmod(authorityPath, 0o600);
@@ -539,20 +609,20 @@ test("fixed Nexus bridge rejects a deployment with a substituted authority contr
   }
 });
 
-test("fixed Nexus bridge rejects a symlinked desired deployment root before importing manager code", { skip: process.platform !== "darwin" }, async () => {
+test("fixed Nexus bridge rejects a symlinked authority mirror before importing manager code", { skip: process.platform !== "darwin" }, async () => {
   const home = await mkdtemp(join(tmpdir(), "devspace-nexus-bridge-root-"));
   const outside = await mkdtemp(join(tmpdir(), "devspace-nexus-bridge-outside-"));
   try {
     const state = join(home, "Library", "Application Support", "Nexus", "gateway-direct");
-    const deployments = join(state, "deployments");
-    await mkdir(deployments, { recursive: true });
+    await mkdir(state, { recursive: true });
+    await mkdir(join(home, "Workspace"), { recursive: true });
+    await symlink(outside, join(home, "Workspace", "Nexus-new-authority-main"));
     const marker = join(home, "manager-imported");
     const managerPath = join(state, "manager.py");
     await writeFile(managerPath, `from pathlib import Path\nPath(${JSON.stringify(marker)}).write_text("IMPORTED")\n`);
     await chmod(managerPath, 0o600);
     const managerHash = createHash("sha256").update(await readFile(managerPath)).digest("hex");
     const request = recoveryRequest();
-    await symlink(outside, join(deployments, request.desired_manifest_id));
     const authorityPath = join(state, "recovery-authority.json");
     await writeFile(authorityPath, JSON.stringify({
       schema: "nexus.gateway.durable_recovery_authority.v1",
@@ -576,8 +646,8 @@ test("fixed Nexus bridge rejects a symlinked desired deployment root before impo
     const bridgeCode = buildNexusGatewayRecoveryBridgeCode(managerHash, "8".repeat(64));
     const result = await runRecoveryBridge(home, request, bridgeCode);
     assert.notEqual(result.exitCode, 0);
-    assert.match(result.stderr, /must not be a symlink/);
-    assert.equal(await pathExists(marker), false, "escaped deployment root must be rejected before manager import");
+    assert.match(result.stderr, /authority mirror must not be a symlink/);
+    assert.equal(await pathExists(marker), false, "escaped authority mirror must be rejected before manager import");
   } finally {
     await rm(home, { recursive: true, force: true });
     await rm(outside, { recursive: true, force: true });
