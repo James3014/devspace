@@ -799,6 +799,21 @@ async function observeCanonicalUpstream(
     return undefined;
   }
 
+  const advertisedHead = await runGit(["ls-remote", "--symref", remote, "HEAD"], destination);
+  if (!advertisedHead.ok) return undefined;
+  const symbolicHeadLines = splitLines(advertisedHead.stdout)
+    .map((line) => line.split(/\s+/))
+    .filter((parts) => parts[0] === "ref:");
+  if (symbolicHeadLines.length !== 1) return undefined;
+  const [marker, defaultRef, target, ...extra] = symbolicHeadLines[0]!;
+  if (
+    marker !== "ref:"
+    || !defaultRef?.startsWith("refs/heads/")
+    || target !== "HEAD"
+    || extra.length > 0
+    || defaultRef !== ref
+  ) return undefined;
+
   const observed = await runGit(["ls-remote", "--exit-code", "--heads", remote, ref], destination);
   if (!observed.ok) return undefined;
   const matches = splitLines(observed.stdout)

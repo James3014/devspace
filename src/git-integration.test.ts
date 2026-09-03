@@ -1080,6 +1080,38 @@ test("promotion derives current canonical upstream and accepts an exact loaded-r
   }
 });
 
+test("promotion rejects a configured upstream that is not the remote default branch", async () => {
+  const { source, destination, base } = makePromotionFixture("non-default-upstream");
+  try {
+    runGitRaw(["switch", "-c", "release", base], destination);
+    runGitRaw(["push", "-u", "origin", "release"], destination);
+    const head = commitAll(source, { "app.ts": "v2\n" }, "candidate");
+    const tree = runGitRaw(["rev-parse", `${head}^{tree}`], source);
+
+    const result = await promoteCandidate({
+      sourceWorkspaceRoot: source,
+      candidateBase: base,
+      candidateHead: head,
+      candidateTree: tree,
+      destinationWorkspaceRoot: destination,
+      expectedDestinationBranch: "release",
+      expectedDestinationHead: base,
+      runtimeBinding: runtimeBinding(head),
+      confirmPromote: true,
+    }, runtimeContext(head));
+
+    assert.equal(result.success, false);
+    assert.ok(result.blockers.some((blocker) => blocker.code === "PROMOTION_CANONICAL_UPSTREAM_UNKNOWN"));
+    assert.equal(runGitRaw(["symbolic-ref", "HEAD"], destination), "refs/heads/release");
+    assert.equal(runGitRaw(["rev-parse", "HEAD"], destination), base);
+    assert.equal(runGitRaw(["rev-parse", "refs/heads/release"], destination), base);
+    assert.equal(runGitRaw(["status", "--porcelain", "--untracked-files=all"], destination), "");
+    assert.equal(await readFile(join(destination, "app.ts")), "v1\n");
+  } finally {
+    cleanupRepo(destination);
+  }
+});
+
 test("promotion rejects stale live identity and never trusts caller capability or canonical facts", async () => {
   const { source, destination, base } = makePromotionFixture("runtime-bound-negative");
   try {
