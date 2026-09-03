@@ -11,9 +11,12 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { loadConfig, type ServerConfig } from "./config.js";
 import {
   CodexGoalSessionManager,
+  ensureCodexDirectoryTrust,
+  isCodexDirectoryTrusted,
   normalizeTerminalText,
   isTrustDialogText,
   resolveCodexBinary,
+  upsertCodexDirectoryTrust,
   type GoalProcessBackend,
 } from "./codex-goal-sessions.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
@@ -2373,3 +2376,51 @@ test("RED/NEGATIVE: textual prefix match across non-component boundary must fail
     try { rmSync(join(tmpRoot, "foobar"), { recursive: true, force: true }); } catch {}
   }
 });
+
+// ─── Directory trust bootstrap (Nexus issue 732) ────────────────────────────
+{
+  const trustDir = mkdtempSync(join(tmpdir(), "devspace-codex-trust-test-"));
+  const configPath = join(trustDir, "config.toml");
+  const workspace = join(trustDir, "some workspace");
+  try {
+    // A. Missing config file: upsert creates it with a trusted entry.
+    assert.equal(isCodexDirectoryTrusted(configPath, workspace), false);
+    const created = upsertCodexDirectoryTrust(configPath, workspace);
+    assert.equal(created.changed, true);
+    assert.equal(isCodexDirectoryTrusted(configPath, workspace), true);
+    const createdContent = readFileSync(configPath, "utf8");
+    assert.match(createdContent, /\[projects\.[^\n]*some workspace/);
+    assert.match(createdContent, /trust_level = "trusted"/);
+
+    // B. Idempotent: second upsert does not change the file.
+    const again = upsertCodexDirectoryTrust(configPath, workspace);
+    assert.equal(again.changed, false);
+    assert.equal(readFileSync(configPath, "utf8"), createdContent);
+
+    // C. Existing section without trust_level: entry is inserted in place.
+    writeFileSync(configPath, '[projects."/elsewhere"]\ntrust_level = "trusted"\n\n[projects."/target space"]\nmodel = "gpt-5.6"\n', { mode: 0o600 });
+    upsertCodexDirectoryTrust(configPath, "/target space");
+    const inserted = readFileSync(configPath, "utf8");
+    assert.match(inserted, /\[projects\."\/target space"\]\ntrust_level = "trusted"\nmodel = "gpt-5\.6"/);
+    assert.equal(isCodexDirectoryTrusted(configPath, "/target space"), true);
+    assert.equal(isCodexDirectoryTrusted(configPath, "/elsewhere"), true);
+
+    // D. Existing non-trusted value: replaced with trusted.
+    writeFileSync(configPath, '[projects."/target space"]\ntrust_level = "untrusted"\n', { mode: 0o600 });
+    const replaced = upsertCodexDirectoryTrust(configPath, "/target space");
+    assert.equal(replaced.changed, true);
+    assert.equal(isCodexDirectoryTrusted(configPath, "/target space"), true);
+
+    // E. ensureCodexDirectoryTrust: no-op when already trusted; disabled
+    // opt-out never writes.
+    const ensured = ensureCodexDirectoryTrust({ workspaceRoot: "/target space", configPath });
+    assert.equal(ensured.bootstrapped, false);
+    const beforeDisabled = readFileSync(configPath, "utf8");
+    const disabled = ensureCodexDirectoryTrust({ workspaceRoot: "/other", configPath, disabled: true });
+    assert.equal(disabled.bootstrapped, false);
+    assert.equal(readFileSync(configPath, "utf8"), beforeDisabled);
+    assert.equal(isCodexDirectoryTrusted(configPath, "/other"), false);
+  } finally {
+    rmSync(trustDir, { recursive: true, force: true });
+  }
+}

@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
 import { constants as fsConstants, access } from "node:fs/promises";
-import { realpathSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import {
   HeadTailBuffer,
   type ProcessSnapshot,
@@ -102,6 +102,8 @@ export interface CodexGoalSessionManagerOptions {
   typeChunkDelayMs?: number;
   cancelTimeoutMs?: number;
   resolveBinary?: (configuredBin?: string) => Promise<string>;
+  /** "off" disables the pre-launch directory-trust bootstrap (fail closed). */
+  directoryTrustBootstrap?: "auto" | "off";
 }
 
 const TERMINAL_ESCAPE_PATTERN =
@@ -114,6 +116,112 @@ export function normalizeTerminalText(value: string): string {
 
 export function isTrustDialogText(value: string): boolean {
   return TRUST_DIALOG_PATTERN.test(value);
+}
+
+// ─── Directory trust bootstrap ──────────────────────────────────────────────
+
+const TRUST_BOOTSTRAP_DISABLED_VALUES = new Set(["off", "0", "false", "no"]);
+
+/**
+ * First-use Codex CLI runs block on an interactive "Do you trust the contents
+ * of this directory?" dialog before any sandbox/approval flag applies. PTY
+ * automation must not answer that dialog on the Owner's behalf, so DevSpace
+ * bootstraps the per-root trust entry in CODEX_HOME/config.toml before
+ * spawning instead (Nexus issue 732).
+ */
+
+export function codexDirectoryTrustConfigPath(env: NodeJS.ProcessEnv = process.env): string {
+  return join(env.CODEX_HOME ?? join(homedir(), ".codex"), "config.toml");
+}
+
+function tomlProjectsHeader(workspaceRoot: string): string {
+  const key = workspaceRoot.replace(/\\/g, "\\\\").replace(/"/g, "\\\"");
+  return `[projects."${key}"]`;
+}
+
+export function isCodexDirectoryTrusted(configPath: string, workspaceRoot: string): boolean {
+  let content: string;
+  try {
+    content = readFileSync(configPath, "utf8");
+  } catch {
+    return false;
+  }
+  const header = tomlProjectsHeader(workspaceRoot);
+  const lines = content.split("\n");
+  const headerIndex = lines.findIndex((line) => line.trim() === header);
+  if (headerIndex === -1) return false;
+  for (let i = headerIndex + 1; i < lines.length; i += 1) {
+    const trimmed = lines[i].trim();
+    if (trimmed.startsWith("[")) break;
+    const match = /^trust_level\s*=\s*"([^"]*)"/.exec(trimmed);
+    if (match) return match[1] === "trusted";
+  }
+  return false;
+}
+
+/** Idempotently mark `workspaceRoot` trusted. Atomic tmp-file + rename write. */
+export function upsertCodexDirectoryTrust(configPath: string, workspaceRoot: string): { changed: boolean } {
+  const header = tomlProjectsHeader(workspaceRoot);
+  const trustLine = 'trust_level = "trusted"';
+  let existed = true;
+  let content = "";
+  try {
+    content = readFileSync(configPath, "utf8");
+  } catch {
+    existed = false;
+  }
+  const lines = content.split("\n");
+  let changed: boolean;
+  const headerIndex = lines.findIndex((line) => line.trim() === header);
+  if (headerIndex === -1) {
+    while (lines.length > 0 && lines[lines.length - 1].trim() === "") lines.pop();
+    lines.push("", header, trustLine, "");
+    changed = true;
+  } else {
+    let trustIndex = -1;
+    for (let i = headerIndex + 1; i < lines.length; i += 1) {
+      const trimmed = lines[i].trim();
+      if (trimmed.startsWith("[")) break;
+      if (/^trust_level\s*=/.test(trimmed)) trustIndex = i;
+    }
+    if (trustIndex === -1) {
+      lines.splice(headerIndex + 1, 0, trustLine);
+      changed = true;
+    } else {
+      const value = /^trust_level\s*=\s*"([^"]*)"/.exec(lines[trustIndex].trim())?.[1];
+      if (value === "trusted") {
+        changed = false;
+      } else {
+        lines[trustIndex] = trustLine;
+        changed = true;
+      }
+    }
+  }
+  if (!changed) return { changed: false };
+  mkdirSync(dirname(configPath), { recursive: true });
+  const mode = existed ? (statSync(configPath).mode & 0o777) : 0o600;
+  const tmpPath = `${configPath}.tmp-${randomUUID()}`;
+  writeFileSync(tmpPath, lines.join("\n"), { mode });
+  renameSync(tmpPath, configPath);
+  return { changed: true };
+}
+
+export function isCodexTrustBootstrapDisabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const flag = env.DEVSPACE_CODEX_TRUST_BOOTSTRAP;
+  return flag !== undefined && TRUST_BOOTSTRAP_DISABLED_VALUES.has(flag.trim().toLowerCase());
+}
+
+export function ensureCodexDirectoryTrust(input: {
+  workspaceRoot: string;
+  configPath?: string;
+  disabled?: boolean;
+}): { bootstrapped: boolean; changed: boolean; configPath: string } {
+  const configPath = input.configPath ?? codexDirectoryTrustConfigPath();
+  if (input.disabled || isCodexDirectoryTrusted(configPath, input.workspaceRoot)) {
+    return { bootstrapped: false, changed: false, configPath };
+  }
+  upsertCodexDirectoryTrust(configPath, input.workspaceRoot);
+  return { bootstrapped: true, changed: true, configPath };
 }
 
 // ─── Destructive delta readiness model ──────────────────────────────────────
@@ -720,6 +828,7 @@ export class CodexGoalSessionManager {
   private readonly cancelTimeoutMs: number;
   private readonly codexBin?: string;
   private readonly resolveBinaryImpl: (configuredBin?: string) => Promise<string>;
+  private readonly directoryTrustBootstrap: "auto" | "off";
   private readonly workspaceClaims = new Set<string>();
   private closed = false;
   private lifecycleGeneration = 0;
@@ -742,6 +851,13 @@ export class CodexGoalSessionManager {
     this.codexBin = options.codexBin;
     this.resolveBinaryImpl =
       options.resolveBinary ?? ((configuredBin?: string) => resolveCodexBinary({ configuredBin }));
+    this.directoryTrustBootstrap = options.directoryTrustBootstrap ?? "auto";
+  }
+
+  /** Trust bootstrap is skipped when disabled by option or environment. */
+  private shouldBootstrapDirectoryTrust(): boolean {
+    if (this.directoryTrustBootstrap === "off") return false;
+    return !isCodexTrustBootstrapDisabled();
   }
 
   listActiveGoalIds(): string[] {
@@ -826,6 +942,19 @@ export class CodexGoalSessionManager {
     }
 
     const goalId = `goal_${randomUUID().replaceAll("-", "").slice(0, 16)}`;
+
+    if (this.shouldBootstrapDirectoryTrust()) {
+      try {
+        ensureCodexDirectoryTrust({ workspaceRoot: input.workspaceRoot });
+      } catch (error) {
+        throw new Error(
+          `Codex directory trust bootstrap failed for ${input.workspaceRoot}: ${
+            error instanceof Error ? error.message : String(error)
+          }. Trust the directory once with the Codex CLI, then retry codex_goal_start.`,
+        );
+      }
+    }
+
     const args = buildCodexArgs({
       workspaceRoot: input.workspaceRoot,
       model: input.model,
