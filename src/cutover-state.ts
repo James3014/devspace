@@ -13,6 +13,7 @@ import {
 import { join } from "node:path";
 
 export const CUTOVER_STATE_SCHEMA = "devspace.cutover.v1" as const;
+const CUTOVER_RESTART_SCHEMA = "devspace.cutover_restart.v1" as const;
 
 export interface CutoverServerIdentity {
   serverInstanceId: string;
@@ -40,6 +41,18 @@ export interface CutoverReconciliationReceipt {
   reconciledAt: string;
 }
 
+export interface CutoverRestartRequest {
+  actuator: "launchd-self";
+  requestedByServerInstanceId: string;
+  requestedAt: string;
+}
+
+interface CutoverRestartMarker {
+  schema: typeof CUTOVER_RESTART_SCHEMA;
+  cutoverId: string;
+  request: CutoverRestartRequest;
+}
+
 export interface DurableCutoverRecord {
   schema: typeof CUTOVER_STATE_SCHEMA;
   cutoverId: string;
@@ -51,6 +64,7 @@ export interface DurableCutoverRecord {
   expiresAt?: string;
   expired?: boolean;
   drainEvidence?: CutoverDrainEvidence;
+  restartRequest?: CutoverRestartRequest;
   reconciliationReceipt?: CutoverReconciliationReceipt;
 }
 
@@ -75,6 +89,7 @@ export class CutoverStateStore {
   private readonly cutoverRoot: string;
   private readonly activeDir: string;
   private readonly createdPath: string;
+  private readonly restartRequestedPath: string;
   private readonly now: () => number;
   private readonly newId: () => string;
 
@@ -82,6 +97,7 @@ export class CutoverStateStore {
     this.cutoverRoot = join(stateDir, "cutover");
     this.activeDir = join(this.cutoverRoot, "active");
     this.createdPath = join(this.activeDir, "created.json");
+    this.restartRequestedPath = join(this.activeDir, "restart-requested.json");
     this.now = options.now ?? Date.now;
     this.newId = options.newId ?? randomUUID;
   }
@@ -105,8 +121,16 @@ export class CutoverStateStore {
     const drained = events.filter((name) => name.startsWith("drained-")).sort().at(-1);
     if (closed) record = parseRecord(readFileSync(join(this.activeDir, closed), "utf8"));
     else if (drained) record = parseRecord(readFileSync(join(this.activeDir, drained), "utf8"));
+    const restartRequest = readRestartMarker(this.restartRequestedPath, record.cutoverId)
+      ?? record.restartRequest;
     return {
       ...record,
+      ...(restartRequest ? {
+        restartRequest,
+        updatedAt: restartRequest.requestedAt > record.updatedAt
+          ? restartRequest.requestedAt
+          : record.updatedAt,
+      } : {}),
       expired: record.expiresAt === undefined
         ? false
         : this.now() >= Date.parse(record.expiresAt),
@@ -172,6 +196,41 @@ export class CutoverStateStore {
     });
   }
 
+  recordRestartRequest(
+    cutoverId: string,
+    request: Omit<CutoverRestartRequest, "requestedAt">,
+  ): { record: DurableCutoverRecord; newlyRequested: boolean } {
+    const record = this.requireExact(cutoverId);
+    if (record.phase !== "drained") {
+      throw new CutoverStateError(
+        `Cutover ${cutoverId} must be drained before restart can be requested.`,
+      );
+    }
+    if (record.restartRequest) {
+      return { record, newlyRequested: false };
+    }
+    const requestedAt = new Date(this.now()).toISOString();
+    const marker: CutoverRestartMarker = {
+      schema: CUTOVER_RESTART_SCHEMA,
+      cutoverId,
+      request: { ...request, requestedAt },
+    };
+    try {
+      writeExclusiveDurable(this.restartRequestedPath, `${JSON.stringify(marker, null, 2)}\n`);
+      syncDirectory(this.activeDir);
+    } catch (error) {
+      if (!isErrno(error, "EEXIST")) throw error;
+      const current = this.requireExact(cutoverId);
+      if (!current.restartRequest) {
+        throw new CutoverStateError(
+          "Durable restart fence exists without a readable restart request; reconciliation is required.",
+        );
+      }
+      return { record: current, newlyRequested: false };
+    }
+    return { record: this.requireExact(cutoverId), newlyRequested: true };
+  }
+
   close(cutoverId: string, receipt: CutoverReconciliationReceipt): DurableCutoverRecord {
     const record = this.requireExact(cutoverId);
     if (record.phase === "closed") return record;
@@ -224,7 +283,8 @@ function parseRecord(raw: string): DurableCutoverRecord {
     !isIdentity(value.oldServerIdentity) ||
     !isExpectedIdentity(value.expectedNewIdentity) ||
     typeof value.createdAt !== "string" ||
-    typeof value.updatedAt !== "string"
+    typeof value.updatedAt !== "string" ||
+    (value.restartRequest !== undefined && !isRestartRequest(value.restartRequest))
   ) {
     throw new CutoverStateError("Durable cutover record is malformed; reconciliation is required.");
   }
@@ -248,6 +308,49 @@ function isExpectedIdentity(value: unknown): value is ExpectedCutoverIdentity {
     typeof identity.sourceCommit === "string" &&
     typeof identity.buildId === "string",
   );
+}
+
+function isRestartRequest(value: unknown): value is CutoverRestartRequest {
+  const request = value as Partial<CutoverRestartRequest> | undefined;
+  return Boolean(
+    request &&
+    request.actuator === "launchd-self" &&
+    typeof request.requestedByServerInstanceId === "string" &&
+    request.requestedByServerInstanceId.length > 0 &&
+    typeof request.requestedAt === "string" &&
+    Number.isFinite(Date.parse(request.requestedAt)),
+  );
+}
+
+function readRestartMarker(
+  path: string,
+  expectedCutoverId: string,
+): CutoverRestartRequest | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) return undefined;
+    throw error;
+  }
+  let value: Partial<CutoverRestartMarker>;
+  try {
+    value = JSON.parse(raw) as Partial<CutoverRestartMarker>;
+  } catch {
+    throw new CutoverStateError(
+      "Durable restart fence is malformed; reconciliation is required.",
+    );
+  }
+  if (
+    value.schema !== CUTOVER_RESTART_SCHEMA ||
+    value.cutoverId !== expectedCutoverId ||
+    !isRestartRequest(value.request)
+  ) {
+    throw new CutoverStateError(
+      "Durable restart fence does not match the active cutover; reconciliation is required.",
+    );
+  }
+  return value.request;
 }
 
 function isErrno(error: unknown, code: string): boolean {

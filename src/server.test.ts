@@ -282,6 +282,172 @@ test("checkout reuse and context suppression survive a registry restart", async 
   }
 });
 
+test("cutover MCP control exposes bounded lease lifecycle and schedules self restart once", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-cutover-mcp-control-"));
+  const stateDir = join(root, ".state");
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  const workspaceStore = new SqliteWorkspaceStore(stateDir);
+  const workspaces = new WorkspaceRegistry(config, workspaceStore);
+  const cutoverController = new McpCutoverController(
+    new CutoverStateStore(stateDir, { newId: () => "cutover-mcp-control" }),
+    {
+      serverInstanceId: "server-old",
+      sourceCommit: "old-source",
+      buildId: "old-build",
+      capabilityManifestSha256: "a".repeat(64),
+    },
+  );
+  let restartSchedules = 0;
+  const server = createMcpServer(
+    config,
+    workspaces,
+    createReviewCheckpointManager(),
+    new ProcessSessionManager(),
+    () => [],
+    [],
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    {
+      controller: cutoverController,
+      transportEvidence: () => ({ activeSessions: 3, oldestAgeMs: 12_000 }),
+      reconcileDurableState: async () => ({
+        workspaceQueryable: true,
+        agentQueryable: true,
+        agentReconciled: true,
+      }),
+      restartSelf: {
+        actuator: "launchd-self",
+        serviceLabel: "com.example.devspace",
+        launchdTarget: "gui/501/com.example.devspace",
+        schedule: () => {
+          restartSchedules += 1;
+          return {
+            scheduled: true,
+            actuator: "launchd-self",
+            serviceLabel: "com.example.devspace",
+            launchdTarget: "gui/501/com.example.devspace",
+          };
+        },
+      },
+    },
+  );
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "devspace-cutover-control-test", version: "1.0.0" });
+  try {
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+    const tools = await client.listTools();
+    for (const name of [
+      "cutover_status",
+      "cutover_start",
+      "cutover_drain",
+      "cutover_restart_self",
+      "cutover_finish",
+    ]) {
+      assert.ok(tools.tools.some((tool) => tool.name === name), `missing ${name}`);
+    }
+
+    const started = structuredContent(await client.callTool({
+      name: "cutover_start",
+      arguments: {
+        expectedSourceCommit: "b".repeat(40),
+        expectedBuildId: "new-build",
+        expectedCapabilityManifestSha256: "a".repeat(64),
+      },
+    }));
+    assert.equal((started.cutover as Record<string, unknown>).phase, "prepared");
+
+    const drained = structuredContent(await client.callTool({
+      name: "cutover_drain",
+      arguments: { cutoverId: "cutover-mcp-control" },
+    }));
+    assert.equal((drained.cutover as Record<string, unknown>).phase, "drained");
+    assert.deepEqual(
+      (drained.cutover as { drainEvidence?: unknown }).drainEvidence,
+      { activeSessions: 3, oldestAgeMs: 12_000 },
+    );
+
+    const firstRestart = structuredContent(await client.callTool({
+      name: "cutover_restart_self",
+      arguments: { cutoverId: "cutover-mcp-control" },
+    }));
+    assert.equal((firstRestart.restart as Record<string, unknown>).scheduled, true);
+    assert.equal((firstRestart.restart as Record<string, unknown>).alreadyRequested, false);
+    assert.equal(restartSchedules, 1);
+
+    const duplicateRestart = structuredContent(await client.callTool({
+      name: "cutover_restart_self",
+      arguments: { cutoverId: "cutover-mcp-control" },
+    }));
+    assert.equal((duplicateRestart.restart as Record<string, unknown>).scheduled, false);
+    assert.equal((duplicateRestart.restart as Record<string, unknown>).alreadyRequested, true);
+    assert.equal(restartSchedules, 1);
+  } finally {
+    await client.close();
+    await server.close();
+    workspaceStore.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("cutover restart tool is absent when no bounded self actuator is available", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-cutover-no-actuator-"));
+  const stateDir = join(root, ".state");
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  const workspaceStore = new SqliteWorkspaceStore(stateDir);
+  const cutoverController = new McpCutoverController(
+    new CutoverStateStore(stateDir),
+    { serverInstanceId: "old", sourceCommit: "old", buildId: "old" },
+  );
+  const server = createMcpServer(
+    config,
+    new WorkspaceRegistry(config, workspaceStore),
+    createReviewCheckpointManager(),
+    new ProcessSessionManager(),
+    () => [],
+    [],
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    {
+      controller: cutoverController,
+      transportEvidence: () => ({ activeSessions: 0, oldestAgeMs: 0 }),
+      reconcileDurableState: async () => ({
+        workspaceQueryable: true,
+        agentQueryable: true,
+        agentReconciled: true,
+      }),
+    },
+  );
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "devspace-cutover-no-actuator", version: "1.0.0" });
+  try {
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+    const tools = await client.listTools();
+    assert.ok(tools.tools.some((tool) => tool.name === "cutover_start"));
+    assert.equal(tools.tools.some((tool) => tool.name === "cutover_restart_self"), false);
+  } finally {
+    await client.close();
+    await server.close();
+    workspaceStore.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("cutover finish proves real durable agent and workspace reconciliation after replacement", async () => {
   const root = await mkdtemp(join(tmpdir(), "devspace-cutover-durable-witness-"));
   const project = join(root, "project");
@@ -316,6 +482,7 @@ test("cutover finish proves real durable agent and workspace reconciliation afte
     { serverInstanceId: "server-old", sourceCommit: "old", buildId: "old-build" },
   );
   old.begin({ sourceCommit: "new", buildId: "new-build" });
+  old.recordDrain("cutover-durable", { activeSessions: 1, oldestAgeMs: 100 });
 
   const replacementWorkspaceStore = new SqliteWorkspaceStore(stateDir);
   const replacementWorkspaces = new WorkspaceRegistry(config, replacementWorkspaceStore);

@@ -67,6 +67,77 @@ test("concurrent controllers create exactly one active cutover", async () => {
   }
 });
 
+test("restart request requires drain, survives replacement, and is idempotent", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-restart-request-"));
+  try {
+    let now = 1_000;
+    const store = new CutoverStateStore(stateDir, {
+      now: () => now,
+      newId: () => `event-${now}`,
+    });
+    const created = store.begin({
+      oldServerIdentity: oldIdentity,
+      expectedNewIdentity: { sourceCommit: "source-new", buildId: "build-new" },
+    });
+    assert.throws(
+      () => store.recordRestartRequest(created.cutoverId, {
+        actuator: "launchd-self",
+        requestedByServerInstanceId: oldIdentity.serverInstanceId,
+      }),
+      /must be drained/i,
+    );
+
+    now = 2_000;
+    store.recordDrain(created.cutoverId, { activeSessions: 2, oldestAgeMs: 9_000 });
+    const first = store.recordRestartRequest(created.cutoverId, {
+      actuator: "launchd-self",
+      requestedByServerInstanceId: oldIdentity.serverInstanceId,
+    });
+    assert.equal(first.newlyRequested, true);
+    assert.equal(first.record.restartRequest?.actuator, "launchd-self");
+    assert.equal(first.record.restartRequest?.requestedByServerInstanceId, oldIdentity.serverInstanceId);
+    assert.equal(first.record.restartRequest?.requestedAt, new Date(2_000).toISOString());
+
+    now = 4_000;
+    const duplicate = new CutoverStateStore(stateDir, { now: () => now }).recordRestartRequest(
+      created.cutoverId,
+      {
+        actuator: "launchd-self",
+        requestedByServerInstanceId: oldIdentity.serverInstanceId,
+      },
+    );
+    assert.equal(duplicate.newlyRequested, false);
+    assert.equal(duplicate.record.restartRequest?.requestedAt, new Date(2_000).toISOString());
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("concurrent restart requesters produce exactly one restart authority winner", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-restart-race-"));
+  try {
+    const initial = new CutoverStateStore(stateDir, { newId: () => "cutover-restart-race" });
+    initial.begin({
+      oldServerIdentity: oldIdentity,
+      expectedNewIdentity: { sourceCommit: "source-new", buildId: "build-new" },
+    });
+    initial.recordDrain("cutover-restart-race", { activeSessions: 4, oldestAgeMs: 5_000 });
+
+    const stores = Array.from({ length: 12 }, () => new CutoverStateStore(stateDir));
+    const results = await Promise.all(stores.map(async (store) => store.recordRestartRequest(
+      "cutover-restart-race",
+      {
+        actuator: "launchd-self",
+        requestedByServerInstanceId: oldIdentity.serverInstanceId,
+      },
+    )));
+    assert.equal(results.filter((result) => result.newlyRequested).length, 1);
+    assert.ok(results.every((result) => result.record.restartRequest?.actuator === "launchd-self"));
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("drain evidence and terminal reconciliation receipt survive store replacement", () => {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-receipt-"));
   try {

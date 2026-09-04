@@ -33,6 +33,7 @@ export const CONSEQUENTIAL_MCP_TOOLS = new Set([
   "exec_command",
   "workspace_clone",
   "dependency_sync",
+  "workspace_verify",
   "nexus_gateway_recover",
   "codex_goal_start",
   "codex_goal_continue",
@@ -74,7 +75,37 @@ export class McpCutoverController {
   }
 
   recordDrain(cutoverId: string, evidence: CutoverDrainEvidence): DurableCutoverRecord {
+    const record = this.store.get();
+    if (!record) throw new CutoverStateError("No durable cutover record exists.");
+    if (record.cutoverId !== cutoverId) {
+      throw new CutoverStateError(`Cutover id mismatch: active cutover is ${record.cutoverId}.`);
+    }
+    if (record.oldServerIdentity.serverInstanceId !== this.currentIdentity.serverInstanceId) {
+      throw new CutoverStateError(
+        "Only the old server instance that owns the cutover lease may record drain evidence.",
+      );
+    }
     return this.store.recordDrain(cutoverId, evidence);
+  }
+
+  requestRestart(cutoverId: string): {
+    record: DurableCutoverRecord;
+    newlyRequested: boolean;
+  } {
+    const record = this.store.get();
+    if (!record) throw new CutoverStateError("No durable cutover record exists.");
+    if (record.cutoverId !== cutoverId) {
+      throw new CutoverStateError(`Cutover id mismatch: active cutover is ${record.cutoverId}.`);
+    }
+    if (record.oldServerIdentity.serverInstanceId !== this.currentIdentity.serverInstanceId) {
+      throw new CutoverStateError(
+        "Only the old server instance that owns the drain lease may request its restart.",
+      );
+    }
+    return this.store.recordRestartRequest(cutoverId, {
+      actuator: "launchd-self",
+      requestedByServerInstanceId: this.currentIdentity.serverInstanceId,
+    });
   }
 
   record(): DurableCutoverRecord | undefined {
@@ -121,6 +152,11 @@ export class McpCutoverController {
       throw new CutoverStateError(`Cutover id mismatch: active cutover is ${record.cutoverId}.`);
     }
     if (record.phase === "closed") return record;
+    if (record.phase !== "drained") {
+      throw new CutoverStateError(
+        `Cutover ${cutoverId} must have durable drain evidence before it can be finished.`,
+      );
+    }
 
     const comparison = compareServerIdentity(record, this.currentIdentity);
     if (!comparison.serverInstanceChanged) {
