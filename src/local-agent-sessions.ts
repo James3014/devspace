@@ -319,6 +319,14 @@ export interface AgentPreflightOutput {
     capacityAvailable: boolean;
     dispatchState: DispatchReadinessState;
   };
+  capacity: {
+    used: number;
+    max?: number;
+    activeInWorkspace: number;
+    activeOtherWorkspaces: number;
+    localState: "AVAILABLE" | "EXHAUSTED";
+    providerState: "UNKNOWN";
+  };
   toolchain: {
     id: string;
     available: boolean;
@@ -326,6 +334,24 @@ export interface AgentPreflightOutput {
   };
   blockers: Array<{ code: string; detail: string }>;
   unknowns: string[];
+}
+
+export function summarizeExecutionCapacity(
+  used: number,
+  configuredMax: number | undefined | null,
+  activeInWorkspace: number,
+): AgentPreflightOutput["capacity"] {
+  const boundedMax = configuredMax !== undefined && configuredMax !== null && configuredMax > 0
+    ? configuredMax
+    : undefined;
+  return {
+    used,
+    ...(boundedMax === undefined ? {} : { max: boundedMax }),
+    activeInWorkspace,
+    activeOtherWorkspaces: Math.max(0, used - activeInWorkspace),
+    localState: boundedMax !== undefined && used >= boundedMax ? "EXHAUSTED" : "AVAILABLE",
+    providerState: "UNKNOWN",
+  };
 }
 
 export interface AgentSummary {
@@ -549,10 +575,11 @@ export class LocalAgentSessionManager {
     await this.assertExecutionAuthority(profileName, executionContract);
     this.assertDispatchOwnershipAvailable(workspaceRoot, executionContract);
 
-    if (!this.hasExecutionCapacity()) {
+    const startCapacity = this.executionCapacitySnapshot(workspaceRoot);
+    if (startCapacity.localState === "EXHAUSTED") {
       throw new AgentSessionError(
         "NO_EXECUTION_CAPACITY",
-        `Execution capacity exhausted: ${this.runningCount()} of ${this.config.agentMaxConcurrent} configured agent(s) active.`,
+        `Local DevSpace execution capacity exhausted: ${startCapacity.used} of ${startCapacity.max} slot(s) active (${startCapacity.activeInWorkspace} in this workspace, ${startCapacity.activeOtherWorkspaces} in other workspaces/conversations). This is not provider rate-limit evidence.`,
       );
     }
 
@@ -806,9 +833,10 @@ export class LocalAgentSessionManager {
       throw error;
     }
 
-    if (!this.hasExecutionCapacity()) {
+    const continuationCapacity = this.executionCapacitySnapshot(workspaceRoot);
+    if (continuationCapacity.localState === "EXHAUSTED") {
       admissionFailures.push(
-        `Execution capacity exhausted: ${this.runningCount()} of ${this.config.agentMaxConcurrent} configured agent(s) active.`,
+        `Local DevSpace execution capacity exhausted: ${continuationCapacity.used} of ${continuationCapacity.max} slot(s) active (${continuationCapacity.activeInWorkspace} in this workspace, ${continuationCapacity.activeOtherWorkspaces} in other workspaces/conversations). This is not provider rate-limit evidence.`,
       );
     }
 
@@ -1059,13 +1087,17 @@ export class LocalAgentSessionManager {
       "providerReachable is unknown: no safe readiness probe exists that does not spawn a provider runtime.",
     );
 
-    const capacityAvailable = this.hasExecutionCapacity();
+    const capacity = this.executionCapacitySnapshot(workspaceRoot);
+    const capacityAvailable = capacity.localState === "AVAILABLE";
     if (!capacityAvailable) {
       blockers.push({
         code: "NO_EXECUTION_CAPACITY",
-        detail: `${this.runningCount()} of ${this.config.agentMaxConcurrent} configured agent(s) are active.`,
+        detail: `${capacity.used} of ${capacity.max} configured local agent slot(s) are active (${capacity.activeInWorkspace} in this workspace, ${capacity.activeOtherWorkspaces} in other workspaces/conversations). This is local DevSpace capacity, not evidence of provider rate limiting.`,
       });
     }
+    unknowns.push(
+      "providerCapacity is unknown: local slot availability is reported separately and must not be interpreted as provider quota/rate-limit evidence.",
+    );
 
     let toolchainAvailable = false;
     let executables: Record<string, string> | undefined;
@@ -1171,6 +1203,7 @@ export class LocalAgentSessionManager {
         capacityAvailable,
         dispatchState,
       },
+      capacity,
       toolchain: toolchainId
         ? { id: toolchainId, available: toolchainAvailable, executables }
         : { id: "none", available: false },
@@ -1378,10 +1411,13 @@ export class LocalAgentSessionManager {
       .filter(occupiesDetachedExecutionSlot).length;
   }
 
-  private hasExecutionCapacity(): boolean {
-    const max = this.config.agentMaxConcurrent;
-    if (max === undefined || max === null || max <= 0) return true;
-    return this.runningCount() < max;
+  private executionCapacitySnapshot(workspaceRoot?: string): AgentPreflightOutput["capacity"] {
+    const active = this.store.list().filter(occupiesDetachedExecutionSlot);
+    const canonicalRoot = workspaceRoot ? canonicalizePath(workspaceRoot) : undefined;
+    const activeInWorkspace = canonicalRoot
+      ? active.filter((record) => canonicalizePath(record.workspaceRoot) === canonicalRoot).length
+      : 0;
+    return summarizeExecutionCapacity(active.length, this.config.agentMaxConcurrent, activeInWorkspace);
   }
 
   private assertDispatchOwnershipAvailable(workspaceRoot: string, contract: ExecutionContract | undefined): void {

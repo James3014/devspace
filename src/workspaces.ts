@@ -32,6 +32,11 @@ import {
   type ProfileCatalog,
   type ProfileCatalogEntry,
 } from "./local-agent-profile-source.js";
+import {
+  CONVERSATION_CHECKOUT_SHARED,
+  CONVERSATION_WORKSPACE_REBIND_REQUIRED,
+  type ConversationMutationSafety,
+} from "./conversation-isolation.js";
 
 export interface LoadedAgentsFile {
   path: string;
@@ -87,6 +92,19 @@ export interface OpenWorkspaceInput {
 
 export interface OpenWorkspaceOptions {
   conversationScopeId?: string;
+}
+
+const CONVERSATION_COLLISION_ACTIVE_WINDOW_MS = 6 * 60 * 60 * 1_000;
+
+export class ConversationMutationError extends Error {
+  constructor(
+    readonly code: typeof CONVERSATION_CHECKOUT_SHARED | typeof CONVERSATION_WORKSPACE_REBIND_REQUIRED,
+    message: string,
+    readonly safety: ConversationMutationSafety,
+  ) {
+    super(`[${code}] ${message}`);
+    this.name = "ConversationMutationError";
+  }
 }
 
 type PathStats = Stats;
@@ -291,6 +309,106 @@ export class WorkspaceRegistry {
     this.workspaces.set(restoredWorkspace.id, restoredWorkspace);
 
     return restoredWorkspace;
+  }
+
+  async conversationMutationSafety(
+    workspaceId: string,
+    conversationScopeId: string | undefined,
+    nowMs = Date.now(),
+  ): Promise<ConversationMutationSafety> {
+    const workspace = this.getWorkspace(workspaceId);
+    if (workspace.mode === "worktree") {
+      return {
+        state: "ISOLATED_WORKTREE",
+        sharedCheckout: false,
+        competingConversationCount: 0,
+        mutationAllowed: true,
+      };
+    }
+    if (!conversationScopeId || !this.store) {
+      return {
+        state: "UNSCOPED",
+        sharedCheckout: false,
+        competingConversationCount: 0,
+        mutationAllowed: true,
+      };
+    }
+
+    const projectKey = await canonicalPath(workspace.root);
+    const targetKey = this.conversationCheckoutTargetKey(projectKey);
+    const currentBinding = this.store.getConversationBinding(conversationScopeId, targetKey);
+    if (!currentBinding || currentBinding.workspaceSessionId !== workspace.id) {
+      return {
+        state: "SHARED_CHECKOUT",
+        sharedCheckout: true,
+        competingConversationCount: this.activeCompetingConversationBindings(
+          targetKey,
+          conversationScopeId,
+          nowMs,
+        ).length,
+        mutationAllowed: false,
+        reason: CONVERSATION_WORKSPACE_REBIND_REQUIRED,
+        recommendation: "Re-open this checkout in the current conversation, or open a managed worktree for mutation. DevSpace will not silently reuse another conversation's checkout workspace.",
+      };
+    }
+
+    this.store.touchConversationBinding(conversationScopeId, targetKey);
+    const competitors = this.activeCompetingConversationBindings(targetKey, conversationScopeId, nowMs);
+    if (competitors.length > 0) {
+      return {
+        state: "SHARED_CHECKOUT",
+        sharedCheckout: true,
+        competingConversationCount: competitors.length,
+        mutationAllowed: false,
+        reason: CONVERSATION_CHECKOUT_SHARED,
+        recommendation: "Open a DevSpace-managed worktree for mutation. Direct mutation of a physical checkout shared by active conversations is blocked; no checkout is cleaned or reset automatically.",
+      };
+    }
+
+    return {
+      state: "SINGLE_CONVERSATION_CHECKOUT",
+      sharedCheckout: false,
+      competingConversationCount: 0,
+      mutationAllowed: true,
+    };
+  }
+
+  async assertConversationMutationAllowed(
+    workspaceId: string,
+    conversationScopeId: string | undefined,
+  ): Promise<ConversationMutationSafety> {
+    const safety = await this.conversationMutationSafety(workspaceId, conversationScopeId);
+    if (!safety.mutationAllowed && safety.reason) {
+      throw new ConversationMutationError(
+        safety.reason,
+        `${safety.recommendation ?? "Use an isolated worktree before mutation."} Competing active conversation bindings: ${safety.competingConversationCount}.`,
+        safety,
+      );
+    }
+    return safety;
+  }
+
+  private activeCompetingConversationBindings(
+    targetKey: string,
+    conversationScopeId: string,
+    nowMs: number,
+  ): WorkspaceConversationBinding[] {
+    if (!this.store) return [];
+    const activeSince = nowMs - CONVERSATION_COLLISION_ACTIVE_WINDOW_MS;
+    return this.store
+      .listConversationBindingsForTarget(targetKey)
+      .filter((binding) => binding.conversationScopeId !== conversationScopeId)
+      .filter((binding) => {
+        const session = this.store?.getSession(binding.workspaceSessionId);
+        if (session?.status !== "active" || session.mode !== "checkout") return false;
+        const bindingLastUsedAtMs = Date.parse(binding.lastUsedAt);
+        const sessionLastUsedAtMs = Date.parse(session.lastUsedAt);
+        const lastUsedAtMs = Math.max(
+          Number.isFinite(bindingLastUsedAtMs) ? bindingLastUsedAtMs : 0,
+          Number.isFinite(sessionLastUsedAtMs) ? sessionLastUsedAtMs : 0,
+        );
+        return lastUsedAtMs >= activeSince;
+      });
   }
 
   resolvePath(workspace: Workspace, inputPath: string): string {
