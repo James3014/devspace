@@ -35,6 +35,16 @@ test("self restart actuator is unavailable outside macOS launchd", () => {
     }),
     undefined,
   );
+  assert.equal(
+    createLaunchdSelfRestartActuator({
+      platform: "darwin",
+      env: { XPC_SERVICE_NAME: "com.example.devspace" },
+      uid: 501,
+      pid: 4321,
+      inspectLaunchdTarget: () => ({ status: 0, stdout: "pid = 9999\n" }),
+    }),
+    undefined,
+  );
 });
 
 test("self restart actuator schedules only the launchd-injected service label", () => {
@@ -46,7 +56,13 @@ test("self restart actuator schedules only the launchd-injected service label", 
     platform: "darwin",
     env: { XPC_SERVICE_NAME: "com.example.devspace" },
     uid: 501,
+    pid: 4321,
     delayMs: 321,
+    inspectLaunchdTarget: (command, args) => {
+      assert.equal(command, "/bin/launchctl");
+      assert.deepEqual(args, ["print", "gui/501/com.example.devspace"]);
+      return { status: 0, stdout: "\tpid = 4321\n" };
+    },
     schedule: (scheduled, delayMs) => {
       callback = scheduled;
       delay = delayMs;

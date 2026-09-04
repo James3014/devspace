@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 
 export interface SelfRestartReceipt {
   scheduled: true;
@@ -22,8 +22,10 @@ interface LaunchdSelfRestartOptions {
   platform?: NodeJS.Platform;
   env?: NodeJS.ProcessEnv;
   uid?: number;
+  pid?: number;
   delayMs?: number;
   schedule?: (callback: () => void, delayMs: number) => TimerHandle;
+  inspectLaunchdTarget?: (command: string, args: string[]) => { status: number | null; stdout: string };
   spawnDetached?: (command: string, args: string[]) => void;
 }
 
@@ -54,6 +56,19 @@ export function createLaunchdSelfRestartActuator(
   if (!Number.isInteger(uid) || (uid ?? -1) < 0) return undefined;
 
   const launchdTarget = `gui/${uid}/${serviceLabel}`;
+  const pid = options.pid ?? process.pid;
+  if (!Number.isInteger(pid) || pid <= 0) return undefined;
+  const inspectLaunchdTarget = options.inspectLaunchdTarget ?? ((command, args) => {
+    const result = spawnSync(command, args, {
+      encoding: "utf8",
+      shell: false,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return { status: result.status, stdout: result.stdout ?? "" };
+  });
+  const inspection = inspectLaunchdTarget("/bin/launchctl", ["print", launchdTarget]);
+  if (inspection.status !== 0 || !launchdOutputOwnsPid(inspection.stdout, pid)) return undefined;
+
   const delayMs = options.delayMs ?? 750;
   const schedule = options.schedule ?? ((callback, delay) => setTimeout(callback, delay));
   const spawnDetached = options.spawnDetached ?? ((command, args) => {
@@ -85,4 +100,10 @@ export function createLaunchdSelfRestartActuator(
       };
     },
   };
+}
+
+function launchdOutputOwnsPid(output: string, pid: number): boolean {
+  return output
+    .split(/\r?\n/)
+    .some((line) => new RegExp(`^\\s*pid\\s*=\\s*${pid}\\s*$`).test(line));
 }

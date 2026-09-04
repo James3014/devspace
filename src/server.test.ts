@@ -482,6 +482,7 @@ test("cutover finish proves real durable agent and workspace reconciliation afte
     { serverInstanceId: "server-old", sourceCommit: "old", buildId: "old-build" },
   );
   old.begin({ sourceCommit: "new", buildId: "new-build" });
+  old.recordDrain("cutover-durable", { activeSessions: 1, oldestAgeMs: 100 });
 
   const replacementWorkspaceStore = new SqliteWorkspaceStore(stateDir);
   const replacementWorkspaces = new WorkspaceRegistry(config, replacementWorkspaceStore);
