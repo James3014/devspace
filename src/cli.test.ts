@@ -64,14 +64,20 @@ const { spawn } = require("node:child_process");
 const prompt = process.argv[process.argv.indexOf("--print") + 1];
 if (process.env.FORCE_MALFORMED) { console.log("{malformed"); process.exit(0); }
 if (process.env.DESCENDANT_PID_FILE) {
-  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 3000)"], { stdio: "inherit", detached: true });
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 3000)"], { stdio: "ignore", detached: true });
   require("node:fs").writeFileSync(process.env.DESCENDANT_PID_FILE, String(child.pid));
   child.unref();
 }
 const response = "mock response-" + "x".repeat(100000);
 const payload = JSON.stringify({ status: "SUCCESS", conversation_id: "mock-session", response });
-for (let index = 0; index < payload.length; index += 4096) process.stdout.write(payload.slice(index, index + 4096));
-process.exit(0);
+let index = 0;
+function writeNextChunk() {
+  if (index >= payload.length) { process.exit(0); }
+  const chunk = payload.slice(index, index + 4096);
+  index += 4096;
+  process.stdout.write(chunk, writeNextChunk);
+}
+writeNextChunk();
 `, { mode: 0o755 });
   const store = new LocalAgentStore(stateDir);
   const current = store.update(
