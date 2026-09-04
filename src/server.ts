@@ -55,6 +55,12 @@ import {
   McpSessionRegistry,
   type McpSessionCloseResult,
 } from "./mcp-sessions.js";
+import { CutoverStateError, CutoverStateStore } from "./cutover-state.js";
+import {
+  CutoverBlockedError,
+  McpCutoverController,
+  registerCutoverHttpRoutes,
+} from "./mcp-cutover.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
 import {
   DurableOperationManager,
@@ -111,7 +117,7 @@ import {
 type Transport = StreamableHTTPServerTransport;
 // MCP clients can reconnect without closing the previous transport. Bound stale
 // session retention so abandoned MCP servers do not accumulate for the life of the process.
-const MCP_SESSION_IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1_000;
+const MCP_SESSION_IDLE_TIMEOUT_MS = 6 * 60 * 60 * 1_000;
 const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
 const AGENT_SUPERVISION_INTERVAL_MS = 2_000;
 const AGENT_TERMINATION_OUTPUT_SCHEMA = z.object({
@@ -3605,6 +3611,15 @@ export function createServer(
   const capabilityManifest = deriveLoadedCapabilityManifest(
     agentSessionManager ? { agent_start: createAgentStartInputSchema() } : {},
   );
+  const cutoverController = new McpCutoverController(
+    new CutoverStateStore(config.stateDir),
+    {
+      serverInstanceId: runtimeBuildIdentity.serverInstanceId,
+      sourceCommit: runtimeBuildIdentity.sourceCommit,
+      buildId: runtimeBuildIdentity.buildId,
+      capabilityManifestSha256: capabilityManifest.manifestSha256,
+    },
+  );
   const codexGoals = config.codexGoalsEnabled
     ? new CodexGoalSessionManager(processSessions, { codexBin: config.codexBin })
     : undefined;
@@ -3647,7 +3662,17 @@ export function createServer(
   const sessionCleanupTimer = setInterval(() => {
     void transports
       .closeIdle(MCP_SESSION_IDLE_TIMEOUT_MS)
-      .then((results) => logSessionCloseResults("idle_timeout", results));
+      .then((results) => {
+        logSessionCloseResults("idle_timeout", results);
+        const metrics = transports.metrics();
+        logEvent(config.logging, "info", "mcp_metrics", {
+          activeSessions: metrics.activeSessions,
+          oldestAgeMs: metrics.oldestAgeMs,
+          cutoverMode: cutoverController.mode(),
+          reconciliationRequired: cutoverController.mode() !== "normal",
+          serverInstanceId: runtimeBuildIdentity.serverInstanceId,
+        });
+      });
   }, MCP_SESSION_CLEANUP_INTERVAL_MS);
   sessionCleanupTimer.unref();
 
@@ -3718,6 +3743,12 @@ export function createServer(
         listen_port: runtimeBuildIdentity.listenPort,
       },
       capabilityManifest,
+      mcp: {
+        ...transports.metrics(),
+        cutoverMode: cutoverController.mode(),
+        reconciliationRequired: cutoverController.mode() !== "normal",
+        serverInstanceId: runtimeBuildIdentity.serverInstanceId,
+      },
     });
   });
 
@@ -3728,7 +3759,43 @@ export function createServer(
       ...runtimeBuildIdentity,
       profileCatalogGeneration: latestProfileCatalogGeneration.value,
       capabilityManifest,
+      mcp: {
+        ...transports.metrics(),
+        cutoverMode: cutoverController.mode(),
+        reconciliationRequired: cutoverController.mode() !== "normal",
+      },
     });
+  });
+
+  registerCutoverHttpRoutes(app, {
+    controller: cutoverController,
+    authenticate: bearerAuth,
+    transportEvidence: () => transports.metrics(),
+    reconcileDurableState: async ({ workspaceId, agentId }) => {
+      if (!agentSessionManager) {
+        throw new CutoverStateError(
+          "Durable agent reconciliation is unavailable because subagents are disabled.",
+        );
+      }
+      const workspace = workspaces.getWorkspace(workspaceId);
+      await agentSessionManager.getAgentStatus({
+        workspaceId,
+        workspaceRoot: workspace.root,
+        agentId,
+        waitMs: 0,
+      });
+      await agentSessionManager.reconcileAgent({
+        workspaceId,
+        workspaceRoot: workspace.root,
+        isolated: workspace.mode === "worktree",
+        agentId,
+      });
+      return {
+        workspaceQueryable: true,
+        agentQueryable: true,
+        agentReconciled: true,
+      };
+    },
   });
 
   app.all("/mcp", async (req, res) => {
@@ -3754,6 +3821,33 @@ export function createServer(
       });
       sendJsonRpcError(res, 401, -32001, "Unauthorized");
       return;
+    }
+
+    if (initializeRequest && !cutoverController.canInitializeTransport()) {
+      const record = cutoverController.record();
+      sendJsonRpcError(
+        res,
+        409,
+        -32002,
+        `[CUTOVER_RECONCILIATION_REQUIRED] Cutover ${record?.cutoverId ?? "unknown"} is draining; new MCP initialization is blocked.`,
+      );
+      return;
+    }
+
+    if (
+      req.method === "POST" &&
+      req.body?.method === "tools/call" &&
+      typeof req.body?.params?.name === "string"
+    ) {
+      try {
+        cutoverController.assertToolAllowed(req.body.params.name);
+      } catch (error) {
+        if (error instanceof CutoverBlockedError) {
+          sendJsonRpcError(res, 409, -32002, error.message);
+          return;
+        }
+        throw error;
+      }
     }
 
     logEvent(config.logging, "debug", "mcp_request", {
@@ -3805,7 +3899,11 @@ export function createServer(
           incomingArtifactAdapters,
           agentSessionManager,
           codexGoals,
-          { identity: runtimeBuildIdentity, latestProfileCatalogGeneration, capabilityManifest },
+          {
+            identity: runtimeBuildIdentity,
+            latestProfileCatalogGeneration,
+            capabilityManifest,
+          },
           durableOperations,
         );
         await server.connect(transport);

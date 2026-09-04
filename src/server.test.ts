@@ -17,6 +17,10 @@ import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { DurableOperationManager } from "./durable-operations.js";
 import { createMcpServer, createServer } from "./server.js";
+import { CutoverStateStore } from "./cutover-state.js";
+import { McpCutoverController } from "./mcp-cutover.js";
+import { LocalAgentStore } from "./local-agent-store.js";
+import { LocalAgentSessionManager } from "./local-agent-sessions.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 
@@ -275,6 +279,76 @@ test("checkout reuse and context suppression survive a registry restart", async 
     assert.equal(structuredContent(restored).agentsFiles, undefined);
   } finally {
     await closeRestored();
+  }
+});
+
+test("cutover finish proves real durable agent and workspace reconciliation after replacement", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-cutover-durable-witness-"));
+  const project = join(root, "project");
+  const stateDir = join(root, ".state");
+  await mkdir(project, { recursive: true });
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  const workspaceId = "ws_cutover_durable";
+  let agentId: string;
+  const initialWorkspaceStore = new SqliteWorkspaceStore(stateDir);
+  const initialAgentStore = new LocalAgentStore(stateDir);
+  try {
+    initialWorkspaceStore.createSession({ id: workspaceId, root: project });
+    agentId = initialAgentStore.create({
+      workspaceId,
+      workspaceRoot: project,
+      profileName: "durable-reviewer",
+      provider: "codex",
+    }).id;
+  } finally {
+    initialAgentStore.close();
+    initialWorkspaceStore.close();
+  }
+
+  const old = new McpCutoverController(
+    new CutoverStateStore(stateDir, { newId: () => "cutover-durable" }),
+    { serverInstanceId: "server-old", sourceCommit: "old", buildId: "old-build" },
+  );
+  old.begin({ sourceCommit: "new", buildId: "new-build" });
+
+  const replacementWorkspaceStore = new SqliteWorkspaceStore(stateDir);
+  const replacementWorkspaces = new WorkspaceRegistry(config, replacementWorkspaceStore);
+  const replacementAgents = new LocalAgentSessionManager(config, async () => {}, async () => true);
+  try {
+    const replacement = new McpCutoverController(
+      new CutoverStateStore(stateDir),
+      { serverInstanceId: "server-new", sourceCommit: "new", buildId: "new-build" },
+    );
+    const closed = await replacement.finish("cutover-durable", async () => {
+      const workspace = replacementWorkspaces.getWorkspace(workspaceId);
+      const status = await replacementAgents.getAgentStatus({
+        workspaceId,
+        workspaceRoot: workspace.root,
+        agentId,
+      });
+      const reconciliation = await replacementAgents.reconcileAgent({
+        workspaceId,
+        workspaceRoot: workspace.root,
+        isolated: false,
+        agentId,
+      });
+      return {
+        workspaceQueryable: workspace.id === workspaceId,
+        agentQueryable: status.agentId === agentId,
+        agentReconciled: reconciliation.agentId === agentId,
+      };
+    });
+    assert.equal(closed.reconciliationReceipt?.agentReconciled, true);
+  } finally {
+    replacementAgents.close();
+    replacementWorkspaceStore.close();
+    await rm(root, { recursive: true, force: true });
   }
 });
 

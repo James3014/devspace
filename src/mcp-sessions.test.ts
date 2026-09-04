@@ -28,6 +28,12 @@ now = 1_500;
 assert.equal(registry.get("active"), activeTransport);
 now = 2_000;
 
+assert.deepEqual(registry.metrics(), {
+  activeSessions: 2,
+  oldestAgeMs: 2_000,
+});
+assert.equal(JSON.stringify(registry.metrics()).includes("stale"), false);
+
 const idleResults = await registry.closeIdle(1_500);
 assert.deepEqual(idleResults, [{ sessionId: "stale" }]);
 assert.equal(staleTransport.closeCalls, 1);
