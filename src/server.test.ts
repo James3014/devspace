@@ -1416,7 +1416,7 @@ test("gitCandidates enabled: git tools are present with schema validation", asyn
   assert.match(responseText(res), /GIT_MANAGED_WORKTREE_REQUIRED/);
 });
 
-test("agent_start schema preserves #28 heartbeat and G9/G10 authority capabilities", async (t) => {
+test("agent_start schema preserves heartbeat, GPT-first selection, and optional Nexus authority capabilities", async (t) => {
   const context = await fixture(t, { subagents: true });
   const tools = await context.client.listTools();
   const start = tools.tools.find((tool) => tool.name === "agent_start");
@@ -1426,9 +1426,17 @@ test("agent_start schema preserves #28 heartbeat and G9/G10 authority capabiliti
   const contractProps = contract.anyOf?.find((entry: any) => entry.type === "object")?.properties
     ?? contract.properties;
   assert.ok(contractProps.authorityMode);
+  assert.ok(contractProps.selection);
   assert.ok(contractProps.nexusGrant);
   assert.ok(contractProps.idleTimeoutMs);
   assert.match(contractProps.idleTimeoutMs.description, /terminated.*no provider activity/i);
+
+  const status = tools.tools.find((tool) => tool.name === "agent_status");
+  const reconcile = tools.tools.find((tool) => tool.name === "agent_reconcile");
+  assert.ok(status?.outputSchema?.properties?.selection);
+  assert.ok(status?.outputSchema?.properties?.dispatchControl);
+  assert.ok(reconcile?.outputSchema?.properties?.selection);
+  assert.ok(reconcile?.outputSchema?.properties?.dispatchControl);
 });
 
 test("git candidates tools - MCP managed worktree end-to-end integration test", async (t) => {

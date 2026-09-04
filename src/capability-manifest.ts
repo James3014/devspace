@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 
 export const CAPABILITY_MANIFEST_SCHEMA = "devspace.capability_manifest.v1" as const;
+export const NEXUS_INTEGRATION_MANIFEST_SCHEMA = "devspace.nexus_integration_manifest.v1" as const;
 
 export interface CapabilityManifest {
   schema: typeof CAPABILITY_MANIFEST_SCHEMA;
@@ -16,6 +17,13 @@ interface SchemaLike {
   constructor?: { name?: string };
 }
 
+export interface NexusIntegrationManifest {
+  schema: typeof NEXUS_INTEGRATION_MANIFEST_SCHEMA;
+  capabilities: string[];
+  missing: string[];
+  manifestSha256: string;
+}
+
 type ToolInputSchemas = Record<string, Record<string, SchemaLike>>;
 
 const REQUIRED_CAPABILITIES = [
@@ -29,6 +37,19 @@ const REQUIRED_CAPABILITIES = [
     id: "agent_start.executionContract.idleTimeoutMs",
     tool: "agent_start",
     fieldPath: "executionContract.idleTimeoutMs",
+  },
+  {
+    id: "agent_start.executionContract.selection",
+    tool: "agent_start",
+    fieldPath: "executionContract.selection",
+  },
+] as const;
+
+const NEXUS_INTEGRATION_CAPABILITIES = [
+  {
+    id: "agent_start.executionContract.authorityMode",
+    tool: "agent_start",
+    fieldPath: "executionContract.authorityMode",
   },
   {
     id: "agent_start.executionContract.nexusGrant",
@@ -65,16 +86,18 @@ function resolveField(
  * registration. No source declaration or caller-supplied capability list is
  * treated as evidence.
  */
-export function deriveLoadedCapabilityManifest(
+function deriveManifest(
+  schema: string,
+  requirements: readonly { id: string; tool: string; fieldPath?: string }[],
   tools: ToolInputSchemas,
-): CapabilityManifest {
+): { capabilities: string[]; missing: string[]; manifestSha256: string } {
   const capabilities: string[] = [];
   const missing: string[] = [];
   const observed: Array<{ id: string; description?: string; schemaKind?: string }> = [];
 
-  for (const requirement of REQUIRED_CAPABILITIES) {
+  for (const requirement of requirements) {
     const toolSchema = tools[requirement.tool];
-    const field = "fieldPath" in requirement
+    const field = requirement.fieldPath !== undefined
       ? resolveField(toolSchema, requirement.fieldPath)
       : toolSchema
         ? ({ constructor: { name: "McpTool" } } satisfies SchemaLike)
@@ -95,7 +118,21 @@ export function deriveLoadedCapabilityManifest(
   missing.sort();
   observed.sort((left, right) => left.id.localeCompare(right.id));
   const manifestSha256 = createHash("sha256")
-    .update(JSON.stringify({ schema: CAPABILITY_MANIFEST_SCHEMA, observed }))
+    .update(JSON.stringify({ schema, observed }))
     .digest("hex");
-  return { schema: CAPABILITY_MANIFEST_SCHEMA, capabilities, missing, manifestSha256 };
+  return { capabilities, missing, manifestSha256 };
+}
+
+export function deriveLoadedCapabilityManifest(
+  tools: ToolInputSchemas,
+): CapabilityManifest {
+  const derived = deriveManifest(CAPABILITY_MANIFEST_SCHEMA, REQUIRED_CAPABILITIES, tools);
+  return { schema: CAPABILITY_MANIFEST_SCHEMA, ...derived };
+}
+
+export function deriveNexusIntegrationManifest(
+  tools: ToolInputSchemas,
+): NexusIntegrationManifest {
+  const derived = deriveManifest(NEXUS_INTEGRATION_MANIFEST_SCHEMA, NEXUS_INTEGRATION_CAPABILITIES, tools);
+  return { schema: NEXUS_INTEGRATION_MANIFEST_SCHEMA, ...derived };
 }

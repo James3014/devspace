@@ -96,6 +96,7 @@ import {
 import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build-identity.js";
 import {
   deriveLoadedCapabilityManifest,
+  deriveNexusIntegrationManifest,
   type CapabilityManifest,
 } from "./capability-manifest.js";
 import { devspaceConfigDir } from "./user-config.js";
@@ -1504,6 +1505,14 @@ function createAgentStartInputSchema() {
     expectedEvidence: z.array(z.string()).optional(),
     claimCeiling: z.enum(["RESULT_RETURNED", "IMPLEMENTED", "CANDIDATE_READY"]),
   }).strict();
+  const selection = z.object({
+    selectedBy: z.enum(["GPT", "NEXUS", "OWNER_EXPLICIT"]),
+    profile: z.string().min(1),
+    provider: z.string().min(1),
+    model: z.string().min(1).optional(),
+    effort: z.string().min(1).optional(),
+    decisionRef: z.string().min(1).optional(),
+  }).strict();
   const nexusGrant = z.object({
     repository: z.literal("James3014/Nexus-new"),
     revision: z.string().regex(/^[0-9a-f]{40}$/),
@@ -1515,6 +1524,9 @@ function createAgentStartInputSchema() {
   const executionContract = z.object({
     authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).optional().describe(
       "Execution authority lane. OWNER_DIRECT is the backwards-compatible default. NEXUS_GOVERNED requires canonical Nexus authority evidence and never falls back to direct authority.",
+    ),
+    selection: selection.optional().describe(
+      "Explicit host-selected worker binding, independent from execution authority. GPT/Owner selections are valid in direct mode; selectedBy=NEXUS is valid only for an explicitly Nexus-governed attempt. Dev MCP validates this exact profile/provider/model/effort and never silently substitutes another worker.",
     ),
     nexusGrant: nexusGrant.optional().describe(
       "Immutable pointer to a canonical Nexus execution grant and its governing Task Card. Dev MCP independently verifies current Nexus main and tracked bytes before worker launch.",
@@ -2946,6 +2958,29 @@ export function createMcpServer(
       activityCapability: z.enum(["TRUSTWORTHY", "UNAVAILABLE"]),
       timeoutMs: z.number().int().positive().optional(),
     });
+    const AGENT_SELECTION_OUTPUT_SCHEMA = z.object({
+      selectedBy: z.enum(["GPT", "NEXUS", "OWNER_EXPLICIT"]),
+      profile: z.string(),
+      provider: z.string(),
+      model: z.string().optional(),
+      effort: z.string().optional(),
+      decisionRef: z.string().optional(),
+    });
+    const AGENT_DISPATCH_CONTROL_OUTPUT_SCHEMA = z.object({
+      decisionOwner: z.literal("HOST_GPT"),
+      silentFallbackAllowed: z.literal(false),
+      freshNexusAuthorityRequired: z.boolean(),
+      effectState: z.enum([
+        "NONE_OBSERVED",
+        "POSSIBLE",
+        "OBSERVED",
+        "RECONCILED_NO_EFFECT",
+        "RECONCILED_EFFECT",
+      ]),
+      retrySafe: z.boolean(),
+      reconciliationRequired: z.boolean(),
+      reasonCode: z.string(),
+    });
     const AGENT_DISPATCH_OUTPUT_SCHEMA = z.object({
       taskId: z.string(),
       attemptId: z.string(),
@@ -2965,6 +3000,7 @@ export function createMcpServer(
         inputSchema: agentStartInputSchema,
         outputSchema: {
           agentId: z.string(),
+          selection: AGENT_SELECTION_OUTPUT_SCHEMA.optional(),
           dispatch: AGENT_DISPATCH_OUTPUT_SCHEMA.optional(),
           status: z.string(),
           profileName: z.string(),
@@ -3040,6 +3076,7 @@ export function createMcpServer(
         },
         outputSchema: {
           agentId: z.string(),
+          selection: AGENT_SELECTION_OUTPUT_SCHEMA.optional(),
           dispatch: AGENT_DISPATCH_OUTPUT_SCHEMA.optional(),
           status: z.string(),
           profileName: z.string(),
@@ -3109,7 +3146,9 @@ export function createMcpServer(
         },
         outputSchema: {
           agentId: z.string(),
+          selection: AGENT_SELECTION_OUTPUT_SCHEMA.optional(),
           dispatch: AGENT_DISPATCH_OUTPUT_SCHEMA.optional(),
+          dispatchControl: AGENT_DISPATCH_CONTROL_OUTPUT_SCHEMA,
           workspaceId: z.string().optional(),
           workspaceRoot: z.string(),
           profileName: z.string(),
@@ -3173,7 +3212,9 @@ export function createMcpServer(
         },
         outputSchema: {
           agentId: z.string(),
+          selection: AGENT_SELECTION_OUTPUT_SCHEMA.optional(),
           dispatch: AGENT_DISPATCH_OUTPUT_SCHEMA.optional(),
+          dispatchControl: AGENT_DISPATCH_CONTROL_OUTPUT_SCHEMA,
           workspaceId: z.string().optional(),
           workspaceRoot: z.string(),
           profileName: z.string(),
@@ -3378,7 +3419,9 @@ export function createMcpServer(
         },
         outputSchema: {
           agentId: z.string(),
+          selection: AGENT_SELECTION_OUTPUT_SCHEMA.optional(),
           dispatch: AGENT_DISPATCH_OUTPUT_SCHEMA.optional(),
+          dispatchControl: AGENT_DISPATCH_CONTROL_OUTPUT_SCHEMA,
           agentState: z.string(),
           providerState: z.string().optional(),
           providerSessionId: z.string().optional(),
@@ -3941,6 +3984,9 @@ export function createServer(
   const capabilityManifest = deriveLoadedCapabilityManifest(
     agentSessionManager ? { agent_start: createAgentStartInputSchema() } : {},
   );
+  const nexusIntegrationManifest = deriveNexusIntegrationManifest(
+    agentSessionManager ? { agent_start: createAgentStartInputSchema() } : {},
+  );
   const cutoverController = new McpCutoverController(
     new CutoverStateStore(config.stateDir),
     {
@@ -4105,6 +4151,7 @@ export function createServer(
         listen_port: runtimeBuildIdentity.listenPort,
       },
       capabilityManifest,
+      nexusIntegrationManifest,
       mcp: {
         ...transports.metrics(),
         cutoverMode: cutoverController.mode(),
@@ -4121,6 +4168,7 @@ export function createServer(
       ...runtimeBuildIdentity,
       profileCatalogGeneration: latestProfileCatalogGeneration.value,
       capabilityManifest,
+      nexusIntegrationManifest,
       mcp: {
         ...transports.metrics(),
         cutoverMode: cutoverController.mode(),

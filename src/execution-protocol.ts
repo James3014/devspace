@@ -10,8 +10,40 @@ import { createHash } from "node:crypto";
 export const EXECUTION_PROTOCOL_VERSION = "devspace.execution.v1" as const;
 
 export type ExecutionAuthorityMode = "OWNER_DIRECT" | "NEXUS_GOVERNED";
+export type ExecutionSelectionSource = "GPT" | "NEXUS" | "OWNER_EXPLICIT";
 export type CapabilityAccessMode = "native" | "mcp" | "none";
 export type ExecutionEffectCeiling = "READ_ONLY" | "WORKSPACE_MUTATION" | "CANDIDATE";
+export type ExecutionEffectState =
+  | "NONE_OBSERVED"
+  | "POSSIBLE"
+  | "OBSERVED"
+  | "RECONCILED_NO_EFFECT"
+  | "RECONCILED_EFFECT";
+
+/**
+ * Explicit worker selection made by the host/Owner or by Nexus only when the
+ * host has deliberately entered the Nexus-governed lane. DevSpace validates
+ * this binding against the resolved profile; it never chooses or substitutes a
+ * worker on the caller's behalf.
+ */
+export interface ExecutionSelection {
+  selectedBy: ExecutionSelectionSource;
+  profile: string;
+  provider: string;
+  model?: string;
+  effort?: string;
+  decisionRef?: string;
+}
+
+export interface ExecutionDispatchControl {
+  decisionOwner: "HOST_GPT";
+  silentFallbackAllowed: false;
+  freshNexusAuthorityRequired: boolean;
+  effectState: ExecutionEffectState;
+  retrySafe: boolean;
+  reconciliationRequired: boolean;
+  reasonCode: string;
+}
 
 export type DispatchRoleIntent =
   | "EVIDENCE_COLLECTOR"
@@ -202,6 +234,7 @@ export class ExecutionProtocolError extends Error {
   constructor(
     readonly code:
       | "INVALID_EXECUTION_BINDING"
+      | "INVALID_EXECUTION_SELECTION"
       | "INVALID_DISPATCH_INTENT"
       | "NEXUS_AUTHORITY_NOT_VALIDATED"
       | "INVALID_NEXUS_EXECUTION_GRANT"
@@ -212,6 +245,43 @@ export class ExecutionProtocolError extends Error {
   ) {
     super(message);
     this.name = "ExecutionProtocolError";
+  }
+}
+
+export function parseExecutionSelection(value: unknown): ExecutionSelection {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ExecutionProtocolError("INVALID_EXECUTION_SELECTION", "selection must be an object.");
+  }
+  const record = value as Record<string, unknown>;
+  const selection: ExecutionSelection = {
+    selectedBy: record.selectedBy as ExecutionSelectionSource,
+    profile: record.profile as string,
+    provider: record.provider as string,
+  };
+  if (record.model !== undefined) selection.model = record.model as string;
+  if (record.effort !== undefined) selection.effort = record.effort as string;
+  if (record.decisionRef !== undefined) selection.decisionRef = record.decisionRef as string;
+  validateExecutionSelection(selection);
+  return selection;
+}
+
+export function validateExecutionSelection(selection: ExecutionSelection): void {
+  if (!["GPT", "NEXUS", "OWNER_EXPLICIT"].includes(selection.selectedBy)) {
+    throw new ExecutionProtocolError(
+      "INVALID_EXECUTION_SELECTION",
+      `Unsupported selection.selectedBy: ${selection.selectedBy}`,
+    );
+  }
+  requireSelectionText(selection.profile, "selection.profile");
+  requireSelectionText(selection.provider, "selection.provider");
+  if (selection.model !== undefined) requireSelectionText(selection.model, "selection.model");
+  if (selection.effort !== undefined) requireSelectionText(selection.effort, "selection.effort");
+  if (selection.decisionRef !== undefined) requireSelectionText(selection.decisionRef, "selection.decisionRef");
+  if (selection.selectedBy === "NEXUS" && !selection.decisionRef) {
+    throw new ExecutionProtocolError(
+      "INVALID_EXECUTION_SELECTION",
+      "NEXUS selection requires selection.decisionRef so the host-visible routing decision is explicit.",
+    );
   }
 }
 
@@ -672,6 +742,12 @@ function validateGrantScope(value: string[]): void {
     if (path === "." || path.startsWith("/") || path.split("/").includes("..")) {
       throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", `writeScope contains an invalid workspace-relative path: ${entry}`);
     }
+  }
+}
+
+function requireSelectionText(value: unknown, field: string): asserts value is string {
+  if (typeof value !== "string" || !value.trim()) {
+    throw new ExecutionProtocolError("INVALID_EXECUTION_SELECTION", `${field} must be a non-empty string.`);
   }
 }
 

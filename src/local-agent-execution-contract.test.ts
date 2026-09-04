@@ -356,8 +356,13 @@ test("R2 dispatchIntent is durable, injected into the worker prompt, and never u
       prompt: "Implement the bounded change.",
       profiles: mockProfiles,
       attemptKey: "attempt-r2-durable",
-      executionContract: { dispatchIntent: intent, writePaths: ["src"] },
+      executionContract: {
+        selection: { selectedBy: "GPT", profile: "reviewer", provider: "codex" },
+        dispatchIntent: intent,
+        writePaths: ["src"],
+      },
     });
+    assert.deepEqual(started.selection, { selectedBy: "GPT", profile: "reviewer", provider: "codex" });
     assert.equal(started.dispatch?.taskId, intent.taskId);
     assert.equal(started.dispatch?.claimCeiling, "CANDIDATE_READY");
     assert.match(observedPrompt, /DEVSPACE DISPATCH CONTRACT/);
@@ -380,9 +385,87 @@ test("R2 dispatchIntent is durable, injected into the worker prompt, and never u
     });
     assert.equal(status.latestResponse, "DONE");
     assert.equal(status.dispatch?.claimCeiling, "CANDIDATE_READY");
+    assert.deepEqual(status.selection, { selectedBy: "GPT", profile: "reviewer", provider: "codex" });
+    assert.equal(status.dispatchControl?.decisionOwner, "HOST_GPT");
+    assert.equal(status.dispatchControl?.silentFallbackAllowed, false);
+    assert.equal(status.dispatchControl?.effectState, "RECONCILED_NO_EFFECT");
+    assert.equal(status.dispatchControl?.retrySafe, true);
+    assert.equal(status.dispatchControl?.reconciliationRequired, false);
     assert.equal((status as any).verified, undefined);
     assert.equal((status as any).accepted, undefined);
     assert.equal((status as any).merged, undefined);
+  } finally {
+    f.clean();
+    clean();
+  }
+});
+
+test("G4 host-controlled reassignment stays blocked when a terminal mutating attempt has an observed candidate", async () => {
+  const f = setupGitFixture();
+  const { manager, clean } = setupManager();
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_g4_effect",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "bounded mutation",
+      profiles: mockProfiles,
+      executionContract: {
+        selection: { selectedBy: "GPT", profile: "reviewer", provider: "codex" },
+        writePaths: ["readme.md"],
+      },
+    });
+    writeFileSync(join(f.repo, "readme.md"), "# Changed by worker fixture\n");
+    settleForContinuation(manager, started.agentId, { latestResponse: "DONE", terminalReason: "completed" });
+
+    const status = await manager.getAgentStatus({
+      workspaceId: "ws_g4_effect",
+      workspaceRoot: f.repo,
+      agentId: started.agentId,
+    });
+    assert.equal(status.dispatchControl?.decisionOwner, "HOST_GPT");
+    assert.equal(status.dispatchControl?.silentFallbackAllowed, false);
+    assert.equal(status.dispatchControl?.effectState, "OBSERVED");
+    assert.equal(status.dispatchControl?.retrySafe, false);
+
+    const reconciled = await manager.reconcileAgent({
+      workspaceId: "ws_g4_effect",
+      workspaceRoot: f.repo,
+      isolated: true,
+      agentId: started.agentId,
+    });
+    assert.equal(reconciled.candidate.present, true);
+    assert.equal(reconciled.dispatchControl.effectState, "RECONCILED_EFFECT");
+    assert.equal(reconciled.dispatchControl.retrySafe, false);
+    assert.equal(reconciled.dispatchControl.reconciliationRequired, false);
+  } finally {
+    f.clean();
+    clean();
+  }
+});
+
+test("G2 explicit GPT selection fails before durable record when Dev MCP would need to substitute the worker", async () => {
+  const f = setupGitFixture();
+  let launches = 0;
+  const { manager, clean } = setupManager({}, undefined, async () => { launches += 1; });
+  try {
+    await assert.rejects(
+      manager.startAgent({
+        workspaceId: "ws_g2_selection",
+        workspaceRoot: f.repo,
+        profileName: "reviewer",
+        prompt: "must never launch",
+        profiles: mockProfiles,
+        executionContract: {
+          selection: { selectedBy: "GPT", profile: "different-profile", provider: "codex" },
+        },
+      }),
+      (error: any) => error instanceof AgentSessionError &&
+        error.code === "INVALID_EXECUTION_CONTRACT" &&
+        /will not substitute/.test(error.message),
+    );
+    assert.equal(launches, 0);
+    assert.equal(manager.listAgents({ workspaceId: "ws_g2_selection" }).length, 0);
   } finally {
     f.clean();
     clean();

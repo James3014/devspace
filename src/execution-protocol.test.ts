@@ -12,6 +12,7 @@ import {
   hashExecutionBinding,
   hashNexusExecutionGrant,
   parseDispatchIntent,
+  parseExecutionSelection,
   parseNexusExecutionGrantRef,
   renderDispatchIntentForWorker,
   validateResolvedNexusExecutionGrant,
@@ -111,6 +112,31 @@ test("controller DispatchIntent is deterministic, model-neutral, and cannot expr
     () => parseDispatchIntent({ ...intent, writeScope: ["../outside"] }),
     (error: unknown) => error instanceof ExecutionProtocolError && error.code === "INVALID_DISPATCH_INTENT",
   );
+});
+
+test("worker selection is explicit, host-first, and Nexus selection requires a decision reference", () => {
+  assert.deepEqual(parseExecutionSelection({
+    selectedBy: "GPT",
+    profile: "codex-implement",
+    provider: "codex",
+    model: "gpt-5.6-sol",
+  }), {
+    selectedBy: "GPT",
+    profile: "codex-implement",
+    provider: "codex",
+    model: "gpt-5.6-sol",
+  });
+
+  assert.throws(
+    () => parseExecutionSelection({ selectedBy: "NEXUS", profile: "reviewer", provider: "agy" }),
+    (error: unknown) => error instanceof ExecutionProtocolError && error.code === "INVALID_EXECUTION_SELECTION",
+  );
+  assert.doesNotThrow(() => parseExecutionSelection({
+    selectedBy: "NEXUS",
+    profile: "reviewer",
+    provider: "agy",
+    decisionRef: "nexus-route-123",
+  }));
 });
 
 test("OWNER_DIRECT binding hashes deterministically and requires trusted owner evidence", () => {

@@ -58,7 +58,9 @@ import {
   validateResolvedNexusExecutionGrant,
   type AuthorityValidationEvidence,
   type DispatchIntent,
+  type ExecutionDispatchControl,
   type ExecutionGenerationBinding,
+  type ExecutionSelection,
   type NexusExecutionGrant,
   type NexusExecutionGrantRef,
   ExecutionProtocolError,
@@ -197,6 +199,8 @@ export const AGENT_LIST_DEFAULT_LIMIT = 20;
 export const AGENT_LIST_MAX_LIMIT = 100;
 const TERMINATION_RETRY_BACKOFF_MS = 30_000;
 
+export type SelectionContractOutput = ExecutionSelection;
+
 export interface DispatchContractOutput {
   taskId: string;
   attemptId: string;
@@ -233,7 +237,9 @@ export interface AgentStatusOutput {
   changedPaths?: string[];
   terminalReason?: AgentTerminalReason;
   scopeState?: ScopeState;
+  selection?: SelectionContractOutput;
   dispatch?: DispatchContractOutput;
+  dispatchControl?: ExecutionDispatchControl;
   executionIdlePolicy?: EffectiveExecutionIdlePolicy;
   termination?: {
     pending: boolean;
@@ -255,7 +261,9 @@ export interface ReconcileAgentInput {
 
 export interface ReconcileAgentOutput {
   agentId: string;
+  selection?: SelectionContractOutput;
   dispatch?: DispatchContractOutput;
+  dispatchControl: ExecutionDispatchControl;
   agentState: LocalAgentStatus;
   providerState?: string;
   providerSessionId?: string;
@@ -393,6 +401,7 @@ function computeSessionTiming(record: LocalAgentRecord, now = Date.now()): { wal
 
 export interface StartAgentOutput {
   agentId: string;
+  selection?: SelectionContractOutput;
   dispatch?: DispatchContractOutput;
   status: LocalAgentStatus;
   profileName: string;
@@ -525,6 +534,8 @@ export class LocalAgentSessionManager {
         `Unknown agent profile: ${profileName}. Available: ${available || "none"}`,
       );
     }
+
+    assertSelectionMatchesResolvedProfile(executionContract?.selection, profile);
 
     const replayBinding = attemptKey === undefined
       ? undefined
@@ -801,6 +812,8 @@ export class LocalAgentSessionManager {
       body: "",
       disabled: false,
     };
+    assertSelectionMatchesResolvedProfile(record.executionContract?.selection, currentProfile);
+
     let executionIdlePolicy: EffectiveExecutionIdlePolicy;
     try {
       executionIdlePolicy = resolveEffectiveExecutionIdlePolicy(
@@ -1250,10 +1263,13 @@ export class LocalAgentSessionManager {
     const startedAtMs = Date.parse(record.createdAt);
     const updatedAtMs = Date.parse(record.lifecycleState?.activeTurn?.lastActivityAt ?? record.updatedAt);
     const now = Date.now();
+    const candidatePresent = workerChanged.length > 0 || headAdvanced;
 
     return {
       agentId: record.id,
+      selection: selectionContractOutput(record.executionContract?.selection),
       dispatch: dispatchContractOutput(record.executionContract?.dispatchIntent),
+      dispatchControl: dispatchControlForReconcile(record, candidatePresent),
       agentState: record.status,
       providerState: record.status,
       providerSessionId: record.providerSessionId,
@@ -1263,7 +1279,7 @@ export class LocalAgentSessionManager {
         dirty: physical.dirty,
       },
       candidate: {
-        present: workerChanged.length > 0 || headAdvanced,
+        present: candidatePresent,
         changedPaths: workerChanged,
         unexpectedPaths,
         diffHash: physical.diffHash,
@@ -2293,6 +2309,24 @@ function providerEnvironment(
     : environment;
 }
 
+function assertSelectionMatchesResolvedProfile(
+  selection: ExecutionSelection | undefined,
+  profile: LocalAgentProfile,
+): void {
+  if (!selection) return;
+  const mismatches: string[] = [];
+  if (selection.profile !== profile.name) mismatches.push(`profile=${selection.profile} (resolved ${profile.name})`);
+  if (selection.provider !== profile.provider) mismatches.push(`provider=${selection.provider} (resolved ${profile.provider})`);
+  if (selection.model !== profile.model) mismatches.push(`model=${selection.model ?? "<none>"} (resolved ${profile.model ?? "<none>"})`);
+  if (selection.effort !== profile.effort) mismatches.push(`effort=${selection.effort ?? "<none>"} (resolved ${profile.effort ?? "<none>"})`);
+  if (mismatches.length > 0) {
+    throw new AgentSessionError(
+      "INVALID_EXECUTION_CONTRACT",
+      `Explicit worker selection does not match the resolved advertised profile; Dev MCP will not substitute it: ${mismatches.join(", ")}.`,
+    );
+  }
+}
+
 function assertDispatchContractCoherence(contract: ExecutionContract | undefined): void {
   const intent = contract?.dispatchIntent;
   if (!intent) return;
@@ -2317,6 +2351,10 @@ function assertDispatchContractCoherence(contract: ExecutionContract | undefined
 function bindDispatchIntentToPrompt(intent: DispatchIntent | undefined, prompt: string): string {
   if (!intent) return prompt;
   return `${renderDispatchIntentForWorker(intent)}\n\nCONTROLLER TASK\n${prompt}`;
+}
+
+function selectionContractOutput(selection: ExecutionSelection | undefined): SelectionContractOutput | undefined {
+  return selection ? { ...selection } : undefined;
 }
 
 function dispatchContractOutput(intent: DispatchIntent | undefined): DispatchContractOutput | undefined {
@@ -2397,6 +2435,101 @@ function workspacePathsOverlap(left: string, right: string): boolean {
   return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 }
 
+function dispatchControlBase(record: LocalAgentRecord) {
+  return {
+    decisionOwner: "HOST_GPT" as const,
+    silentFallbackAllowed: false as const,
+    freshNexusAuthorityRequired: (record.executionContract?.authorityMode ?? "OWNER_DIRECT") === "NEXUS_GOVERNED",
+  };
+}
+
+function dispatchControlForStatus(
+  record: LocalAgentRecord,
+  lifecycle: LifecycleEvidence | undefined,
+): ExecutionDispatchControl {
+  const base = dispatchControlBase(record);
+  const stableTerminal = isTerminalStatus(record.status) && !hasTerminationBlock(record);
+  const mutating = Boolean(record.executionContract?.writePaths?.length);
+  const changedPaths = lifecycle?.changedPaths;
+  const changed = Boolean(changedPaths?.length);
+
+  if (!stableTerminal) {
+    return {
+      ...base,
+      effectState: mutating ? (changed ? "OBSERVED" : "POSSIBLE") : "NONE_OBSERVED",
+      retrySafe: false,
+      reconciliationRequired: mutating || hasTerminationBlock(record),
+      reasonCode: hasTerminationBlock(record) ? "TERMINATION_OR_EFFECT_UNCERTAIN" : "ATTEMPT_ACTIVE",
+    };
+  }
+  if (!mutating) {
+    return {
+      ...base,
+      effectState: "NONE_OBSERVED",
+      retrySafe: true,
+      reconciliationRequired: false,
+      reasonCode: "TERMINAL_READ_ONLY",
+    };
+  }
+  if (changedPaths === undefined) {
+    return {
+      ...base,
+      effectState: "POSSIBLE",
+      retrySafe: false,
+      reconciliationRequired: true,
+      reasonCode: "PHYSICAL_EFFECT_UNKNOWN",
+    };
+  }
+  if (changed) {
+    return {
+      ...base,
+      effectState: "OBSERVED",
+      retrySafe: false,
+      reconciliationRequired: false,
+      reasonCode: "TERMINAL_EFFECT_OBSERVED",
+    };
+  }
+  return {
+    ...base,
+    effectState: "RECONCILED_NO_EFFECT",
+    retrySafe: true,
+    reconciliationRequired: false,
+    reasonCode: "TERMINAL_NO_WORKSPACE_EFFECT",
+  };
+}
+
+function dispatchControlForReconcile(
+  record: LocalAgentRecord,
+  candidatePresent: boolean,
+): ExecutionDispatchControl {
+  const base = dispatchControlBase(record);
+  const stableTerminal = isTerminalStatus(record.status) && !hasTerminationBlock(record);
+  if (!stableTerminal) {
+    return {
+      ...base,
+      effectState: candidatePresent ? "RECONCILED_EFFECT" : "POSSIBLE",
+      retrySafe: false,
+      reconciliationRequired: true,
+      reasonCode: candidatePresent ? "ACTIVE_EFFECT_RECONCILED" : "ATTEMPT_STILL_ACTIVE",
+    };
+  }
+  return candidatePresent
+    ? {
+        ...base,
+        effectState: "RECONCILED_EFFECT",
+        retrySafe: false,
+        reconciliationRequired: false,
+        reasonCode: "TERMINAL_EFFECT_RECONCILED",
+      }
+    : {
+        ...base,
+        effectState: "RECONCILED_NO_EFFECT",
+        retrySafe: true,
+        reconciliationRequired: false,
+        reasonCode: "TERMINAL_NO_EFFECT_RECONCILED",
+      };
+}
+
 function recordToStartOutput(record: LocalAgentRecord): StartAgentOutput {
   const output: StartAgentOutput = {
     agentId: record.id,
@@ -2413,6 +2546,8 @@ function recordToStartOutput(record: LocalAgentRecord): StartAgentOutput {
   const executionIdlePolicy = record.lifecycleState?.activeTurn?.executionIdlePolicy
     ?? record.lifecycleState?.lastExecutionIdlePolicy;
   if (executionIdlePolicy) output.executionIdlePolicy = executionIdlePolicy;
+  const selection = selectionContractOutput(record.executionContract?.selection);
+  if (selection) output.selection = selection;
   const dispatch = dispatchContractOutput(record.executionContract?.dispatchIntent);
   if (dispatch) output.dispatch = dispatch;
   return output;
@@ -2438,8 +2573,11 @@ function recordToStatusOutput(
   const executionIdlePolicy = record.lifecycleState?.activeTurn?.executionIdlePolicy
     ?? record.lifecycleState?.lastExecutionIdlePolicy;
   if (executionIdlePolicy) output.executionIdlePolicy = executionIdlePolicy;
+  const selection = selectionContractOutput(record.executionContract?.selection);
+  if (selection) output.selection = selection;
   const dispatch = dispatchContractOutput(record.executionContract?.dispatchIntent);
   if (dispatch) output.dispatch = dispatch;
+  output.dispatchControl = dispatchControlForStatus(record, lifecycle);
   if (record.providerSessionId !== undefined) output.providerSessionId = record.providerSessionId;
   if (record.latestResponse !== undefined) output.latestResponse = record.latestResponse;
   if (record.error !== undefined) output.error = record.error;

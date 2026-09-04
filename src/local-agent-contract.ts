@@ -1,8 +1,10 @@
 import {
   parseDispatchIntent,
+  parseExecutionSelection,
   parseNexusExecutionGrantRef,
   type DispatchIntent,
   type ExecutionAuthorityMode,
+  type ExecutionSelection,
   type NexusExecutionGrantRef,
 } from "./execution-protocol.js";
 
@@ -39,6 +41,12 @@ export type AgentTerminalReason =
 export interface ExecutionContract {
   /** Defaults to OWNER_DIRECT for backwards compatibility. */
   authorityMode?: ExecutionAuthorityMode;
+  /**
+   * Explicit worker/model selection made by the host. This is independent from
+   * execution authority: GPT_DIRECT uses selectedBy=GPT, while selectedBy=NEXUS
+   * is valid only for an explicitly Nexus-governed attempt.
+   */
+  selection?: ExecutionSelection;
   /** Immutable canonical Nexus authority pointer, required only for NEXUS_GOVERNED. */
   nexusGrant?: NexusExecutionGrantRef;
   /** Controller-authored bounded work semantics, transported durably by DevSpace. */
@@ -145,6 +153,10 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
     contract.authorityMode = record.authorityMode;
   }
 
+  if (record.selection !== undefined) {
+    contract.selection = parseExecutionSelection(record.selection);
+  }
+
   if (record.nexusGrant !== undefined) {
     contract.nexusGrant = parseNexusExecutionGrantRef(record.nexusGrant);
   }
@@ -228,12 +240,20 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
   }
 
   const authorityMode = contract.authorityMode ?? "OWNER_DIRECT";
-  if (authorityMode === "OWNER_DIRECT" && contract.nexusGrant) {
-    throw new Error("OWNER_DIRECT execution must not carry Nexus grant authority.");
+  if (authorityMode === "OWNER_DIRECT") {
+    if (contract.nexusGrant) {
+      throw new Error("OWNER_DIRECT execution must not carry Nexus grant authority.");
+    }
+    if (contract.selection?.selectedBy === "NEXUS") {
+      throw new Error("OWNER_DIRECT execution cannot claim that Nexus selected the worker; Nexus advisory input must remain advisory and the host must record its own final selection.");
+    }
   }
   if (authorityMode === "NEXUS_GOVERNED") {
     if (!contract.nexusGrant || !contract.dispatchIntent || !contract.expectedHead) {
       throw new Error("NEXUS_GOVERNED execution requires nexusGrant, dispatchIntent, and expectedHead.");
+    }
+    if (contract.selection && contract.selection.selectedBy !== "NEXUS") {
+      throw new Error("NEXUS_GOVERNED execution with an explicit selection requires selection.selectedBy=NEXUS.");
     }
   }
 
