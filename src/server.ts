@@ -3662,7 +3662,17 @@ export function createServer(
   const sessionCleanupTimer = setInterval(() => {
     void transports
       .closeIdle(MCP_SESSION_IDLE_TIMEOUT_MS)
-      .then((results) => logSessionCloseResults("idle_timeout", results));
+      .then((results) => {
+        logSessionCloseResults("idle_timeout", results);
+        const metrics = transports.metrics();
+        logEvent(config.logging, "info", "mcp_metrics", {
+          activeSessions: metrics.activeSessions,
+          oldestAgeMs: metrics.oldestAgeMs,
+          cutoverMode: cutoverController.mode(),
+          reconciliationRequired: cutoverController.mode() !== "normal",
+          serverInstanceId: runtimeBuildIdentity.serverInstanceId,
+        });
+      });
   }, MCP_SESSION_CLEANUP_INTERVAL_MS);
   sessionCleanupTimer.unref();
 
@@ -3733,6 +3743,12 @@ export function createServer(
         listen_port: runtimeBuildIdentity.listenPort,
       },
       capabilityManifest,
+      mcp: {
+        ...transports.metrics(),
+        cutoverMode: cutoverController.mode(),
+        reconciliationRequired: cutoverController.mode() !== "normal",
+        serverInstanceId: runtimeBuildIdentity.serverInstanceId,
+      },
     });
   });
 
@@ -3743,6 +3759,11 @@ export function createServer(
       ...runtimeBuildIdentity,
       profileCatalogGeneration: latestProfileCatalogGeneration.value,
       capabilityManifest,
+      mcp: {
+        ...transports.metrics(),
+        cutoverMode: cutoverController.mode(),
+        reconciliationRequired: cutoverController.mode() !== "normal",
+      },
     });
   });
 

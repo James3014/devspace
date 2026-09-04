@@ -24,6 +24,7 @@ test("old instance drains and replacement instance is reconcile-only across rest
     assert.doesNotThrow(() => old.assertToolAllowed("read"));
     assert.doesNotThrow(() => old.assertToolAllowed("agent_status"));
     assert.doesNotThrow(() => old.assertToolAllowed("agent_reconcile"));
+    assert.doesNotThrow(() => old.assertToolAllowed("remote_writability_probe"));
 
     const replacement = new McpCutoverController(
       new CutoverStateStore(stateDir),

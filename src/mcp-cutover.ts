@@ -41,7 +41,6 @@ export const CONSEQUENTIAL_MCP_TOOLS = new Set([
   "agent_continue",
   "agent_cancel",
   "candidate_integrate",
-  "remote_writability_probe",
   "git_promote_candidate",
   "git_commit",
   "git_push",
