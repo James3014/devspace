@@ -39,6 +39,10 @@ export interface LocalAgentProfile {
   model?: string;
   effort?: string;
   write_mode?: WriteMode;
+  /** Default hard execution-idle timeout for trustworthy-activity providers. */
+  execution_idle_timeout_ms?: number;
+  /** Minimum allowed explicit per-task idle override for this profile. */
+  execution_idle_min_override_ms?: number;
   /**
    * Repository-local profiles may explicitly extend a global profile and
    * override it. Silent same-name overrides are prohibited: a conflicting
@@ -59,6 +63,8 @@ export interface LocalAgentProfileSummary {
   model?: string;
   effort?: string;
   write_mode?: WriteMode;
+  execution_idle_timeout_ms?: number;
+  execution_idle_min_override_ms?: number;
 }
 
 /**
@@ -262,6 +268,8 @@ function profilesEquivalent(a: LocalAgentProfile, b: LocalAgentProfile): boolean
     && (a.model ?? undefined) === (b.model ?? undefined)
     && (a.effort ?? undefined) === (b.effort ?? undefined)
     && (a.write_mode ?? undefined) === (b.write_mode ?? undefined)
+    && (a.execution_idle_timeout_ms ?? undefined) === (b.execution_idle_timeout_ms ?? undefined)
+    && (a.execution_idle_min_override_ms ?? undefined) === (b.execution_idle_min_override_ms ?? undefined)
     && a.body === b.body
     && a.disabled === b.disabled;
 }
@@ -310,6 +318,8 @@ export function summarizeLocalAgentProfile(
     model: profile.model,
     effort: profile.effort,
     write_mode: profile.write_mode,
+    execution_idle_timeout_ms: profile.execution_idle_timeout_ms,
+    execution_idle_min_override_ms: profile.execution_idle_min_override_ms,
   };
 }
 
@@ -396,6 +406,8 @@ function profileFromFrontmatter(
     model: readString(frontmatter, "model"),
     effort: readString(frontmatter, "effort") ?? readString(frontmatter, "thinking"),
     write_mode: readWriteMode(frontmatter, filePath),
+    execution_idle_timeout_ms: readPositiveInteger(frontmatter, "execution_idle_timeout_ms", filePath),
+    execution_idle_min_override_ms: readPositiveInteger(frontmatter, "execution_idle_min_override_ms", filePath),
     extends: readString(frontmatter, "extends"),
     override,
     filePath,
@@ -428,6 +440,19 @@ function readWriteMode(frontmatter: Record<string, unknown>, filePath: string): 
     throw new Error(`Subagent profile write_mode must be read_only or allowed: ${filePath}`);
   }
   return value as WriteMode;
+}
+
+function readPositiveInteger(
+  frontmatter: Record<string, unknown>,
+  key: string,
+  filePath: string,
+): number | undefined {
+  const value = frontmatter[key];
+  if (value === undefined || value === null) return undefined;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 1) {
+    throw new Error(`Subagent profile ${key} must be a positive integer: ${filePath}`);
+  }
+  return value;
 }
 
 function readString(frontmatter: Record<string, unknown>, key: string): string | undefined {

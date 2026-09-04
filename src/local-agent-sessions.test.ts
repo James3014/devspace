@@ -174,69 +174,74 @@ test("LocalAgentSessionManager - startAgent and PROVIDER_UNAVAILABLE", async () 
   }
 });
 
-test("LocalAgentSessionManager - idle timeout fences silent worker with idle_timeout", async () => {
-  const { manager, spawnedWorkers, terminatedWorkers, clean } = setupFixture();
+test("LocalAgentSessionManager - effective idle policy fences silent worker and activity resets clock", async () => {
+  const { manager, terminatedWorkers, clean } = setupFixture();
   try {
-    const workspaceRoot = "/Users/jameschen/Workspace/nexus";
-    const started = await manager.startAgent({
-      workspaceId: "ws_idle",
-      workspaceRoot,
-      profileName: "reviewer",
-      prompt: "silent worker",
-      profiles: mockProfiles,
-      executionContract: { idleTimeoutMs: 1 },
-    });
     const store = (manager as any).store as LocalAgentStore;
-    const generation = store.getById(started.agentId)!.lifecycleState!.activeTurn!.generation!;
-    const token = spawnedWorkers[0]!.workerToken;
-    store.claimWorkerCAS(started.agentId, generation, token, 4242);
-    store.markExecutionStarted(started.agentId, token, new Date().toISOString(), generation);
-    store.touchActivityCAS(started.agentId, generation, token, new Date(Date.now() - 100).toISOString());
+    const workspaceRoot = "/Users/jameschen/Workspace/nexus";
+    const createRunning = (timeoutMs: number, pid: number) => {
+      const record = store.create({
+        workspaceId: "ws_idle",
+        workspaceRoot,
+        profileName: "synthetic-trustworthy",
+        provider: "codex",
+        executionContract: {},
+        executionIdlePolicy: {
+          source: "EXPLICIT_OVERRIDE",
+          activityCapability: "TRUSTWORTHY",
+          timeoutMs,
+        },
+        lifecycleKind: "detached_worker_v2",
+      });
+      const generation = record.lifecycleState!.activeTurn!.generation!;
+      const token = `token-${pid}`;
+      assert.equal(store.prepareWorkerCAS(record.id, generation, token).applied, true);
+      assert.equal(store.claimWorkerCAS(record.id, generation, token, pid).applied, true);
+      store.markExecutionStarted(record.id, token, new Date().toISOString(), generation);
+      return { record, generation, token };
+    };
+
+    const silent = createRunning(1, 4242);
+    store.touchActivityCAS(silent.record.id, silent.generation, silent.token, new Date(Date.now() - 100).toISOString());
     await manager.superviseActiveAgents();
-    const result = manager.getRecordByPrefixOrId(started.agentId)!;
+    const result = manager.getRecordByPrefixOrId(silent.record.id)!;
     assert.equal(result.status, "error");
     assert.equal(result.terminalReason, "idle_timeout");
     assert.equal(terminatedWorkers.length, 1);
 
-    const active = await manager.startAgent({
-      workspaceId: "ws_idle",
-      workspaceRoot,
-      profileName: "reviewer",
-      prompt: "active worker",
-      profiles: mockProfiles,
-      executionContract: { idleTimeoutMs: 60_000 },
-    });
-    const activeRecord = store.getById(active.agentId)!;
-    const activeGeneration = activeRecord.lifecycleState!.activeTurn!.generation!;
-    const activeToken = spawnedWorkers[1]!.workerToken;
-    store.claimWorkerCAS(active.agentId, activeGeneration, activeToken, 4243);
-    store.touchActivityCAS(active.agentId, activeGeneration, activeToken);
+    const active = createRunning(60_000, 4243);
+    store.touchActivityCAS(active.record.id, active.generation, active.token);
     await manager.superviseActiveAgents();
-    assert.equal(manager.getRecordByPrefixOrId(active.agentId)!.status, "running");
+    assert.equal(manager.getRecordByPrefixOrId(active.record.id)!.status, "running");
   } finally {
     clean();
   }
 });
 
-test("LocalAgentSessionManager - idle timeout does not apply during startup", async () => {
-  const { manager, spawnedWorkers, terminatedWorkers, clean } = setupFixture();
+test("LocalAgentSessionManager - effective idle timeout does not apply during startup", async () => {
+  const { manager, terminatedWorkers, clean } = setupFixture();
   try {
-    const started = await manager.startAgent({
+    const store = (manager as any).store as LocalAgentStore;
+    const record = store.create({
       workspaceId: "ws_startup_idle",
       workspaceRoot: "/Users/jameschen/Workspace/nexus",
-      profileName: "reviewer",
-      prompt: "startup still pending",
-      profiles: mockProfiles,
-      executionContract: { idleTimeoutMs: 1, maxStartupMs: 60_000 },
+      profileName: "synthetic-trustworthy",
+      provider: "codex",
+      executionContract: { maxStartupMs: 60_000 },
+      executionIdlePolicy: {
+        source: "EXPLICIT_OVERRIDE",
+        activityCapability: "TRUSTWORTHY",
+        timeoutMs: 1,
+      },
+      lifecycleKind: "detached_worker_v2",
     });
-    const store = (manager as any).store as LocalAgentStore;
-    const current = store.getById(started.agentId)!;
-    const generation = current.lifecycleState!.activeTurn!.generation!;
-    const token = spawnedWorkers[0]!.workerToken;
-    store.claimWorkerCAS(started.agentId, generation, token, 4244);
-    store.touchActivityCAS(started.agentId, generation, token, new Date(Date.now() - 100).toISOString());
+    const generation = record.lifecycleState!.activeTurn!.generation!;
+    const token = "token-startup";
+    assert.equal(store.prepareWorkerCAS(record.id, generation, token).applied, true);
+    assert.equal(store.claimWorkerCAS(record.id, generation, token, 4244).applied, true);
+    store.touchActivityCAS(record.id, generation, token, new Date(Date.now() - 100).toISOString());
     await manager.superviseActiveAgents();
-    assert.equal(manager.getRecordByPrefixOrId(started.agentId)!.status, "running");
+    assert.equal(manager.getRecordByPrefixOrId(record.id)!.status, "running");
     assert.equal(terminatedWorkers.length, 0);
   } finally {
     clean();

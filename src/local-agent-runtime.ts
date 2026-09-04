@@ -8,6 +8,7 @@ import type {
   ThreadOptions,
 } from "@openai/codex-sdk";
 import type { AgentProviderError } from "./local-agent-errors.js";
+import type { ExecutionActivityCapability } from "./local-agent-contract.js";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
 
 export type LocalAgentWriteMode = "read_only" | "allowed" | "full_access";
@@ -77,6 +78,8 @@ export interface LocalAgentRuntime {
 
 export interface LocalAgentDriver {
   readonly provider: LocalAgentProvider;
+  /** Whether provider/runtime events are trustworthy enough for a terminating execution-idle fence. */
+  readonly executionActivityCapability?: ExecutionActivityCapability;
   runtimeKey(context: LocalAgentRuntimeContext): string;
   createRuntime(context: LocalAgentRuntimeContext): Promise<Result<LocalAgentRuntime, AgentProviderError>>;
   readonly idleTimeoutMs?: number;

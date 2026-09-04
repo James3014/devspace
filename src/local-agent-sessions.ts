@@ -21,10 +21,12 @@ import {
   resolveLocalAgentProviderExecutable,
 } from "./local-agent-availability.js";
 import { runLocalAgentProvider } from "./local-agent-adapters.js";
+import { resolveEffectiveExecutionIdlePolicy } from "./local-agent-idle-policy.js";
 import { LocalAgentProviderError, type LocalAgentRunCallbacks, type LocalAgentRunResult } from "./local-agent-runtime.js";
 import { terminateProcessTree, type KillableProcess } from "./process-platform.js";
 import {
   type AgentTerminalReason,
+  type EffectiveExecutionIdlePolicy,
   type ExecutionContract,
   type ScopeState,
 } from "./local-agent-contract.js";
@@ -164,6 +166,9 @@ export interface ContinueAgentInput {
   workspaceRoot: string;
   agentId: string;
   prompt: string;
+  /** Omitted means resolve the new turn from current profile/provider policy. */
+  idleTimeoutMode?: "EXPLICIT_OVERRIDE";
+  idleTimeoutMs?: number;
   profiles?: LocalAgentProfile[];
   profileCatalog?: ProfileCatalog;
 }
@@ -229,6 +234,7 @@ export interface AgentStatusOutput {
   terminalReason?: AgentTerminalReason;
   scopeState?: ScopeState;
   dispatch?: DispatchContractOutput;
+  executionIdlePolicy?: EffectiveExecutionIdlePolicy;
   termination?: {
     pending: boolean;
     generation?: string;
@@ -371,6 +377,7 @@ export interface StartAgentOutput {
   workspaceRoot: string;
   createdAt: string;
   updatedAt: string;
+  executionIdlePolicy?: EffectiveExecutionIdlePolicy;
 }
 
 export interface ContinueAgentOutput extends StartAgentOutput {
@@ -529,6 +536,16 @@ export class LocalAgentSessionManager {
       }
     }
 
+    let executionIdlePolicy: EffectiveExecutionIdlePolicy;
+    try {
+      executionIdlePolicy = resolveEffectiveExecutionIdlePolicy(profile, executionContract);
+    } catch (error) {
+      throw new AgentSessionError(
+        "INVALID_EXECUTION_CONTRACT",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+
     await this.assertExecutionAuthority(profileName, executionContract);
     this.assertDispatchOwnershipAvailable(workspaceRoot, executionContract);
 
@@ -623,6 +640,7 @@ export class LocalAgentSessionManager {
           model: profile.model,
           effort: profile.effort,
           executionContract,
+          executionIdlePolicy,
           executionGeneration,
           startReplay: replayBinding,
           lifecycleKind: "detached_worker_v2",
@@ -638,6 +656,7 @@ export class LocalAgentSessionManager {
           model: profile.model,
           effort: profile.effort,
           executionContract,
+          executionIdlePolicy,
           executionGeneration,
           lifecycleKind: "detached_worker_v2",
         });
@@ -755,6 +774,21 @@ export class LocalAgentSessionManager {
       body: "",
       disabled: false,
     };
+    let executionIdlePolicy: EffectiveExecutionIdlePolicy;
+    try {
+      executionIdlePolicy = resolveEffectiveExecutionIdlePolicy(
+        currentProfile,
+        input.idleTimeoutMode !== undefined || input.idleTimeoutMs !== undefined
+          ? { idleTimeoutMode: input.idleTimeoutMode, idleTimeoutMs: input.idleTimeoutMs }
+          : undefined,
+      );
+    } catch (error) {
+      throw new AgentSessionError(
+        "INVALID_EXECUTION_CONTRACT",
+        error instanceof Error ? error.message : String(error),
+      );
+    }
+
     try {
       const currentGeneration = this.resolveExecutionGeneration(
         currentProfile,
@@ -849,6 +883,7 @@ export class LocalAgentSessionManager {
       expectedPreviousGeneration: record.lifecycleState?.lastSettledGeneration,
       expectedUpdatedAt: record.updatedAt,
       turnStartedAt: new Date().toISOString(),
+      executionIdlePolicy,
     });
     if (!begun.applied) {
       const current = begun.current;
@@ -1240,8 +1275,7 @@ export class LocalAgentSessionManager {
         continue;
       }
       if (record.status !== "running" && record.status !== "starting") continue;
-      const contract = record.executionContract;
-      if (!contract) continue;
+      const contract: ExecutionContract = record.executionContract ?? {};
 
       // Active turn phase timestamps are persisted in `lifecycleState.activeTurn`.
       // `updatedAt` is not an authoritative phase clock.
@@ -1297,19 +1331,17 @@ export class LocalAgentSessionManager {
         }
       }
 
-      // 4. idleTimeoutMs: enforced once execution has started. The idle clock
-      // is seeded at execution start and advanced by provider activity
-      // (protocol events and raw output bytes, throttled per adapter). A
-      // provider that emits nothing for this long is treated as hung. The
-      // active-turn generation and worker token are revalidated by
-      // beginTerminationCAS before any process is killed.
-      if (contract.idleTimeoutMs && executionStartedAtMs !== undefined && now - lastActivityAtMs > contract.idleTimeoutMs) {
+      // 4. Effective execution-idle policy is resolved before provider launch
+      // and persisted per turn. Continuation therefore defaults back to the
+      // current profile/provider policy instead of inheriting a prior explicit override.
+      const effectiveIdleTimeoutMs = activeTurn?.executionIdlePolicy?.timeoutMs;
+      if (effectiveIdleTimeoutMs && executionStartedAtMs !== undefined && now - lastActivityAtMs > effectiveIdleTimeoutMs) {
         await this.terminateActiveAgent(
           record.id,
           "idle_timeout",
-          `Agent exceeded execution contract idleTimeoutMs of ${contract.idleTimeoutMs}ms without provider activity.`,
+          `Agent exceeded effective execution idle timeout of ${effectiveIdleTimeoutMs}ms without provider activity.`,
           "idle",
-          contract.idleTimeoutMs,
+          effectiveIdleTimeoutMs,
         );
         continue;
       }
@@ -2337,6 +2369,9 @@ function recordToStartOutput(record: LocalAgentRecord): StartAgentOutput {
   if (record.model !== undefined) output.model = record.model;
   if (record.effort !== undefined) output.effort = record.effort;
   if (record.workspaceId !== undefined) output.workspaceId = record.workspaceId;
+  const executionIdlePolicy = record.lifecycleState?.activeTurn?.executionIdlePolicy
+    ?? record.lifecycleState?.lastExecutionIdlePolicy;
+  if (executionIdlePolicy) output.executionIdlePolicy = executionIdlePolicy;
   const dispatch = dispatchContractOutput(record.executionContract?.dispatchIntent);
   if (dispatch) output.dispatch = dispatch;
   return output;
@@ -2359,6 +2394,9 @@ function recordToStatusOutput(
   if (record.model !== undefined) output.model = record.model;
   if (record.effort !== undefined) output.effort = record.effort;
   if (record.workspaceId !== undefined) output.workspaceId = record.workspaceId;
+  const executionIdlePolicy = record.lifecycleState?.activeTurn?.executionIdlePolicy
+    ?? record.lifecycleState?.lastExecutionIdlePolicy;
+  if (executionIdlePolicy) output.executionIdlePolicy = executionIdlePolicy;
   const dispatch = dispatchContractOutput(record.executionContract?.dispatchIntent);
   if (dispatch) output.dispatch = dispatch;
   if (record.providerSessionId !== undefined) output.providerSessionId = record.providerSessionId;

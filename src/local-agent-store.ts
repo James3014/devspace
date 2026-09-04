@@ -14,6 +14,7 @@ import {
   type AgentLifecycleKind,
   type AgentTerminalReason,
   type AgentTurnLaunchState,
+  type EffectiveExecutionIdlePolicy,
   type ExecutionContract,
   type PathStateFingerprint,
   type ScopeBaseline,
@@ -44,6 +45,8 @@ export interface AgentLifecycleState {
   cumulativeChangedPaths?: string[];
   turnEndBaseline?: ScopeBaseline;
   activeTurn?: ActiveTurnState;
+  /** Effective idle policy of the most recently settled turn, retained as terminal evidence. */
+  lastExecutionIdlePolicy?: EffectiveExecutionIdlePolicy;
   /** Compatibility projection for the original termination callback API. */
   termination?: PhysicalTerminationState;
   terminationPending?: TerminationPendingState;
@@ -103,6 +106,7 @@ export interface CreateLocalAgentRecordInput {
   model?: string;
   effort?: string;
   executionContract?: ExecutionContract;
+  executionIdlePolicy?: EffectiveExecutionIdlePolicy;
   executionGeneration?: ExecutionGenerationBinding;
   startReplay?: StartReplayBinding;
   lifecycleKind?: AgentLifecycleKind;
@@ -159,6 +163,7 @@ export interface BeginContinuationCasInput {
   expectedPreviousGeneration?: string;
   expectedUpdatedAt?: string;
   turnStartedAt?: string;
+  executionIdlePolicy?: EffectiveExecutionIdlePolicy;
 }
 
 export interface BeginTerminationCasInput extends FenceActiveTurnInput {
@@ -290,6 +295,7 @@ export class LocalAgentStore {
               generation: randomUUID(),
               turnStartedAt: now,
               lastActivityAt: now,
+              executionIdlePolicy: input.executionIdlePolicy,
               launchState: "not_started",
             },
           }
@@ -542,6 +548,7 @@ export class LocalAgentStore {
           generation: randomUUID(),
           turnStartedAt: now,
           lastActivityAt: now,
+          executionIdlePolicy: input.executionIdlePolicy,
           launchState: "not_started",
         },
         terminationPending: undefined,
@@ -837,6 +844,7 @@ export class LocalAgentStore {
       }
       const lifecycleState: AgentLifecycleState = {
         ...lifecycle,
+        lastExecutionIdlePolicy: lifecycle.activeTurn?.executionIdlePolicy,
         activeTurn: undefined,
         terminationPending: undefined,
         lastSettledGeneration: input.generation,
@@ -906,6 +914,7 @@ export class LocalAgentStore {
       }
       const lifecycleState: AgentLifecycleState = {
         ...lifecycle,
+        lastExecutionIdlePolicy: lifecycle.activeTurn?.executionIdlePolicy,
         activeTurn: undefined,
         lastSettledGeneration: generation,
       };
@@ -982,6 +991,7 @@ export class LocalAgentStore {
       };
       const lifecycleState: AgentLifecycleState = {
         ...lifecycle,
+        lastExecutionIdlePolicy: activeTurn.executionIdlePolicy,
         activeTurn: undefined,
         termination: {
           pending: true,
@@ -1515,6 +1525,8 @@ function readLifecycleState(value: string | null | undefined): AgentLifecycleSta
     }
     const termination = readPhysicalTerminationState(parsed.termination);
     if (termination) state.termination = termination;
+    const lastExecutionIdlePolicy = readEffectiveExecutionIdlePolicy(parsed.lastExecutionIdlePolicy);
+    if (lastExecutionIdlePolicy) state.lastExecutionIdlePolicy = lastExecutionIdlePolicy;
     if (!detached) {
       const legacyActiveTurn = readLegacyActiveTurnState(parsed.activeTurn);
       if (legacyActiveTurn) state.activeTurn = legacyActiveTurn;
@@ -1590,6 +1602,10 @@ function readActiveTurnState(value: unknown): ActiveTurnState | undefined {
   ) {
     return undefined;
   }
+  const executionIdlePolicy = readEffectiveExecutionIdlePolicy(record.executionIdlePolicy);
+  if (record.executionIdlePolicy !== undefined && record.executionIdlePolicy !== null && !executionIdlePolicy) {
+    return undefined;
+  }
   return {
     generation: record.generation,
     turnStartedAt: record.turnStartedAt,
@@ -1597,7 +1613,25 @@ function readActiveTurnState(value: unknown): ActiveTurnState | undefined {
     lastActivityAt: typeof record.lastActivityAt === "string" && Number.isFinite(Date.parse(record.lastActivityAt))
       ? record.lastActivityAt
       : undefined,
+    executionIdlePolicy,
     launchState,
+  };
+}
+
+function readEffectiveExecutionIdlePolicy(value: unknown): EffectiveExecutionIdlePolicy | undefined {
+  if (value === undefined || value === null) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (record.source !== "PROFILE_DEFAULT" && record.source !== "EXPLICIT_OVERRIDE") return undefined;
+  if (record.activityCapability !== "TRUSTWORTHY" && record.activityCapability !== "UNAVAILABLE") return undefined;
+  if (record.timeoutMs !== undefined &&
+      (typeof record.timeoutMs !== "number" || !Number.isInteger(record.timeoutMs) || record.timeoutMs < 1)) {
+    return undefined;
+  }
+  return {
+    source: record.source,
+    activityCapability: record.activityCapability,
+    ...(record.timeoutMs === undefined ? {} : { timeoutMs: record.timeoutMs }),
   };
 }
 
