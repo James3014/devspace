@@ -354,6 +354,22 @@ test("continuation is rejected while execution capacity is exhausted", async () 
     const finished = await startAndRun("ws_cap_b", "finish");
     // ...and a second active worker exhausts configured capacity.
     void startAndRun("ws_cap_c", "block");
+    // The continuation admission below snapshots execution capacity. Both
+    // blocked workers must have claimed their detached execution slots first,
+    // otherwise the snapshot can race the second worker's claim and the
+    // rejection becomes timing-dependent. Poll for deterministic occupancy.
+    const slotDeadline = Date.now() + 5_000;
+    while (
+      (manager as any).store
+        .list()
+        .filter((record: any) => record.status === "running" && record.lifecycleState?.activeTurn)
+        .length < 2
+    ) {
+      if (Date.now() > slotDeadline) {
+        throw new Error("blocked workers never occupied their execution slots");
+      }
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
     await assert.rejects(
       manager.continueAgent({
         workspaceId: "ws_cap_b",
