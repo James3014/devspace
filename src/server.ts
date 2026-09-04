@@ -74,6 +74,7 @@ import {
 } from "./codex-goal-sessions.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { openAiConversationScopeId } from "./request-meta.js";
+import { isReadOnlyInspectionCommand } from "./conversation-isolation.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
@@ -737,8 +738,11 @@ function registerCodexProcessTools(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens, attemptKey, timeout }) => {
+    async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens, attemptKey, timeout }, { _meta }) => {
       const startedAt = performance.now();
+      if (!isReadOnlyInspectionCommand(cmd)) {
+        await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
+      }
       const workspace = workspaces.getWorkspace(workspaceId);
       const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
       const snapshot = await processSessions.start({
@@ -929,8 +933,9 @@ function registerCodexGoalTools(
       _meta: {},
       annotations: GOAL_START_ANNOTATIONS,
     },
-    async ({ workspaceId, goal, model, reasoningEffort, expectedHead }) => {
+    async ({ workspaceId, goal, model, reasoningEffort, expectedHead }, { _meta }) => {
       const startedAt = performance.now();
+      await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
       const workspace = workspaces.getWorkspace(workspaceId);
       let state: CodexGoalState;
       try {
@@ -1041,7 +1046,8 @@ function registerCodexGoalTools(
         openWorldHint: true,
       },
     },
-    async ({ workspaceId, goalId, message }) => {
+    async ({ workspaceId, goalId, message }, { _meta }) => {
+      await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
       workspaces.getWorkspace(workspaceId);
       const state = await goals.continue(workspaceId, goalId, message);
       logToolCall(config, {
@@ -1337,7 +1343,7 @@ function createAgentStartInputSchema() {
       "Marks idleTimeoutMs as an explicit task-contract override. Omit both fields to use the current profile/provider execution-idle policy.",
     ),
     idleTimeoutMs: z.number().int().min(1).describe(
-      "Explicit hard no-provider-activity timeout for this turn. Requires idleTimeoutMode=EXPLICIT_OVERRIDE and must satisfy the profile/provider policy; generic callers should normally omit it and use the profile default.",
+      "Explicit hard no-provider-activity timeout for this turn. Requires idleTimeoutMode=EXPLICIT_OVERRIDE and must satisfy the profile/provider policy; when valid, the agent is terminated after this interval with no provider activity. Generic callers should normally omit it and use the profile default.",
     ),
   }).partial().optional().describe(
     "Optional structured execution contract. Records and enforces where/how the worker may run.",
@@ -1432,7 +1438,7 @@ export function createMcpServer(
     {
       title: "Open workspace",
       description:
-        "Start work in a project directory or isolated worktree when no usable workspaceId exists for it. During continued work, reuse the existing workspaceId instead of calling this tool again. By default this uses the actual checkout; set mode=\"worktree\" for isolated or parallel work.",
+        "Start work in a project directory or isolated worktree when no usable workspaceId exists for it. During continued work, reuse the existing workspaceId instead of calling this tool again. Checkout mode is suitable for read/control-plane work; use mode=\"worktree\" for mutating or parallel engineering when another conversation may share the project checkout.",
       inputSchema: {
         path: z
           .string()
@@ -1443,7 +1449,7 @@ export function createMcpServer(
           .enum(["checkout", "worktree"])
           .optional()
           .describe(
-            "Defaults to checkout, which works in the actual directory. Use worktree for isolated or parallel Git work.",
+            "Defaults to checkout, which works in the actual directory. Use worktree for mutating or parallel Git work when cross-conversation checkout ownership may overlap.",
           ),
         baseRef: z
           .string()
@@ -1473,6 +1479,14 @@ export function createMcpServer(
         agentProfileStatuses: z.array(workspaceProfileStatusOutputSchema).optional(),
         devspaceBuild: devspaceBuildOutputSchema,
         skillDiagnostics: z.array(z.unknown()).optional(),
+        conversationSafety: z.object({
+          state: z.enum(["ISOLATED_WORKTREE", "SINGLE_CONVERSATION_CHECKOUT", "SHARED_CHECKOUT", "UNSCOPED"]),
+          sharedCheckout: z.boolean(),
+          competingConversationCount: z.number().int().nonnegative(),
+          mutationAllowed: z.boolean(),
+          reason: z.string().optional(),
+          recommendation: z.string().optional(),
+        }),
         instruction: z.string(),
       },
       ...toolWidgetDescriptorMeta(config, "workspace"),
@@ -1480,6 +1494,7 @@ export function createMcpServer(
     },
     async ({ path, mode, baseRef }, { _meta }) => {
       const startedAt = performance.now();
+      const conversationScopeId = openAiConversationScopeId(_meta);
       const {
         workspace,
         agentsFiles,
@@ -1488,7 +1503,11 @@ export function createMcpServer(
         includeBootstrapContext,
       } = await workspaces.openWorkspace(
         { path, mode, baseRef },
-        { conversationScopeId: openAiConversationScopeId(_meta) },
+        { conversationScopeId },
+      );
+      const conversationSafety = await workspaces.conversationMutationSafety(
+        workspace.id,
+        conversationScopeId,
       );
       if (config.widgets === "changes") {
         await reviewCheckpoints.initializeWorkspace({
@@ -1552,7 +1571,7 @@ export function createMcpServer(
       const cardInstruction = config.skillsEnabled
         ? "Use this workspaceId for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file. When a task matches an available skill in skills, read its path before proceeding."
         : "Use this workspaceId for subsequent work in this project. Keep reusing it while working in this project. Follow loaded agentsFiles instructions. Before working under a path listed in availableAgentsFiles, read that instruction file.";
-      const instruction = workspaceReused
+      const baseInstruction = workspaceReused
         ? [
             `Workspace already open as ${workspace.id}.`,
             "Continue with this workspaceId.",
@@ -1561,6 +1580,9 @@ export function createMcpServer(
         : workspace.mode === "worktree"
           ? "Use this workspaceId for subsequent work in this isolated worktree. Keep reusing it while working in this worktree. Follow the project instructions, nested instruction files, skills, agent profiles, and diagnostics returned for it."
           : cardInstruction;
+      const instruction = conversationSafety.mutationAllowed
+        ? baseInstruction
+        : `${baseInstruction}\n\n${conversationSafety.recommendation ?? "This physical checkout is shared by another active conversation; use a managed worktree before mutation."}`;
       const resultContent: ToolContent[] = [
         {
           type: "text" as const,
@@ -1619,6 +1641,7 @@ export function createMcpServer(
             agents: cardAgents,
             agentProfileStatuses: cardProfileStatuses,
             devspaceBuild: devspaceBuildReceipt,
+            conversationSafety,
             instruction: cardInstruction,
             summary: {
               mode: workspace.mode,
@@ -1638,6 +1661,7 @@ export function createMcpServer(
           worktree: workspace.worktree,
           agentProfileStatuses: cardProfileStatuses,
           devspaceBuild: devspaceBuildReceipt,
+          conversationSafety,
           ...(includeBootstrapContext
             ? {
                 agentsFiles: loadedAgentsFiles,
@@ -1806,7 +1830,8 @@ export function createMcpServer(
           openWorldHint: true,
         },
       },
-      async ({ workspaceId, attemptKey, recipe, authorityMode }) => {
+      async ({ workspaceId, attemptKey, recipe, authorityMode }, { _meta }) => {
+        await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
         const workspace = workspaces.getWorkspace(workspaceId);
         try {
           const operation = await durableOperations.dependencySync({
@@ -1983,8 +2008,9 @@ export function createMcpServer(
       ...toolWidgetDescriptorMeta(config, "write"),
       annotations: WRITE_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, ...input }) => {
+    async ({ workspaceId, ...input }, { _meta }) => {
       const startedAt = performance.now();
+      await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
       const workspace = workspaces.getWorkspace(workspaceId);
       workspaces.resolvePath(workspace, input.path);
       const response = await writeFileTool(input, {
@@ -2070,8 +2096,9 @@ export function createMcpServer(
       ...toolWidgetDescriptorMeta(config, "edit"),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, ...input }) => {
+    async ({ workspaceId, ...input }, { _meta }) => {
       const startedAt = performance.now();
+      await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
       const workspace = workspaces.getWorkspace(workspaceId);
       workspaces.resolvePath(workspace, input.path);
       const response = await editFileTool(input, {
@@ -2158,8 +2185,9 @@ export function createMcpServer(
         ...toolWidgetDescriptorMeta(config, "edit"),
         annotations: EDIT_TOOL_ANNOTATIONS,
       },
-      async ({ workspaceId, patch }) => {
+      async ({ workspaceId, patch }, { _meta }) => {
         const startedAt = performance.now();
+        await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
         const workspace = workspaces.getWorkspace(workspaceId);
         const applied = await applyPatch(workspace.root, patch);
         const paths = applied.files.map((file) => file.path).join(", ");
@@ -2529,8 +2557,11 @@ export function createMcpServer(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, workingDirectory, command, timeout, attemptKey, yieldTimeMs, maxOutputTokens }) => {
+    async ({ workspaceId, workingDirectory, command, timeout, attemptKey, yieldTimeMs, maxOutputTokens }, { _meta }) => {
       const startedAt = performance.now();
+      if (!isReadOnlyInspectionCommand(command)) {
+        await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
+      }
       const workspace = workspaces.getWorkspace(workspaceId);
       const cwd = workspaces.resolveWorkingDirectory(
         workspace,
@@ -2708,10 +2739,14 @@ export function createMcpServer(
         _meta: {},
         annotations: AGENT_TOOL_ANNOTATIONS_WRITE,
       },
-      async ({ workspaceId, profile, prompt, attemptKey, executionContract }) => {
+      async ({ workspaceId, profile, prompt, attemptKey, executionContract }, { _meta }) => {
         const workspace = workspaces.getWorkspace(workspaceId);
         const profileCatalog = await loadProfileCatalog(config, workspace.root);
         const profiles = profileCatalog.profiles;
+        const selectedProfile = profiles.find((candidate) => candidate.name === profile);
+        if (selectedProfile?.write_mode !== "read_only") {
+          await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
+        }
         let contract;
         try {
           contract = parseExecutionContract(executionContract);
@@ -2780,9 +2815,16 @@ export function createMcpServer(
         _meta: {},
         annotations: AGENT_TOOL_ANNOTATIONS_WRITE,
       },
-      async ({ workspaceId, agentId, prompt, idleTimeoutMode, idleTimeoutMs }) => {
+      async ({ workspaceId, agentId, prompt, idleTimeoutMode, idleTimeoutMs }, { _meta }) => {
         const workspace = workspaces.getWorkspace(workspaceId);
         const profileCatalog = await loadProfileCatalog(config, workspace.root);
+        const currentAgent = agentSessionManager.getRecordByPrefixOrId(agentId);
+        const currentProfile = currentAgent
+          ? profileCatalog.profiles.find((candidate) => candidate.name === currentAgent.profileName)
+          : undefined;
+        if (currentProfile?.write_mode !== "read_only") {
+          await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
+        }
         const output = await agentSessionManager.continueAgent({
           workspaceId,
           workspaceRoot: workspace.root,
@@ -2900,6 +2942,7 @@ export function createMcpServer(
           providerSessionId: z.string().optional(),
           status: z.string(),
           terminal: z.boolean(),
+          executionIdlePolicy: AGENT_IDLE_POLICY_OUTPUT_SCHEMA.optional(),
           latestResponse: z.string().optional(),
           error: z.string().optional(),
           termination: AGENT_TERMINATION_OUTPUT_SCHEMA.optional(),
@@ -3019,6 +3062,22 @@ export function createMcpServer(
             capacityAvailable: z.boolean(),
             dispatchState: z.enum(["READY", "BLOCKED", "UNKNOWN"]),
           }),
+          capacity: z.object({
+            used: z.number().int().nonnegative(),
+            max: z.number().int().positive().optional(),
+            activeInWorkspace: z.number().int().nonnegative(),
+            activeOtherWorkspaces: z.number().int().nonnegative(),
+            localState: z.enum(["AVAILABLE", "EXHAUSTED"]),
+            providerState: z.literal("UNKNOWN"),
+          }),
+          conversationSafety: z.object({
+            state: z.enum(["ISOLATED_WORKTREE", "SINGLE_CONVERSATION_CHECKOUT", "SHARED_CHECKOUT", "UNSCOPED"]),
+            sharedCheckout: z.boolean(),
+            competingConversationCount: z.number().int().nonnegative(),
+            mutationAllowed: z.boolean(),
+            reason: z.string().optional(),
+            recommendation: z.string().optional(),
+          }),
           toolchain: z.object({
             id: z.string(),
             available: z.boolean(),
@@ -3030,7 +3089,7 @@ export function createMcpServer(
         _meta: {},
         annotations: { readOnlyHint: true },
       },
-      async ({ workspaceId, profile, toolchainId }) => {
+      async ({ workspaceId, profile, toolchainId }, { _meta }) => {
         const workspace = workspaces.getWorkspace(workspaceId);
         const profileCatalog = await loadProfileCatalog(config, workspace.root);
         const profiles = profileCatalog.profiles;
@@ -3043,17 +3102,24 @@ export function createMcpServer(
           profileCatalog,
           toolchainId,
         });
+        const conversationSafety = await workspaces.conversationMutationSafety(
+          workspaceId,
+          openAiConversationScopeId(_meta),
+        );
         const blockerSummary =
           output.blockers.length > 0
             ? ` Blockers: ${output.blockers.map((blocker) => blocker.code).join(", ")}`
             : "";
+        const conversationSummary = conversationSafety.mutationAllowed
+          ? ""
+          : ` Checkout mutation blocked: ${conversationSafety.reason}.`;
         return {
           content: [
             textBlock(
-              `Preflight for ${profile}: dispatchState=${output.readiness.dispatchState}.${blockerSummary}`,
+              `Preflight for ${profile}: dispatchState=${output.readiness.dispatchState}; localCapacity=${output.capacity.used}/${output.capacity.max ?? "unbounded"}; providerCapacity=${output.capacity.providerState}.${blockerSummary}${conversationSummary}`,
             ),
           ],
-          structuredContent: output as unknown as Record<string, unknown>,
+          structuredContent: { ...output, conversationSafety } as unknown as Record<string, unknown>,
         };
       },
     );
@@ -3148,7 +3214,8 @@ export function createMcpServer(
         _meta: {},
         annotations: SHELL_TOOL_ANNOTATIONS,
       },
-      async ({ workspaceId, toolchainId, verifier, args, timeoutMs }) => {
+      async ({ workspaceId, toolchainId, verifier, args, timeoutMs }, { _meta }) => {
+        await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
         const workspace = workspaces.getWorkspace(workspaceId);
         const resolved = resolveToolchainExecutable(config.toolchains, toolchainId, verifier);
         if (!resolved) {
@@ -3286,7 +3353,10 @@ export function createMcpServer(
         openWorldHint: false,
       },
     },
-    async ({ sourceWorkspaceId, candidateBase, candidateHead, destinationWorkspaceId, expectedDestinationHead, dirtyPolicy, confirmApply }) => {
+    async ({ sourceWorkspaceId, candidateBase, candidateHead, destinationWorkspaceId, expectedDestinationHead, dirtyPolicy, confirmApply }, { _meta }) => {
+      if (confirmApply) {
+        await workspaces.assertConversationMutationAllowed(destinationWorkspaceId, openAiConversationScopeId(_meta));
+      }
       const source = workspaces.getWorkspace(sourceWorkspaceId);
       const destination = workspaces.getWorkspace(destinationWorkspaceId);
       const output = await integrateCandidate({
