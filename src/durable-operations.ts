@@ -16,10 +16,10 @@ export type DependencySyncRecipe = "npm_ci" | "pnpm_frozen" | "uv_frozen";
 const SAFE_NEXUS_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const HEX64 = /^[0-9a-f]{64}$/;
 const NEXUS_DEPLOYMENT_ID = /^r1-[0-9a-f]{40}$/;
-export const NEXUS_GATEWAY_RECOVERY_SCHEMA = "nexus.gateway.durable_recovery_request.v1" as const;
+export const NEXUS_GATEWAY_RECOVERY_SCHEMA = "nexus.gateway.durable_recovery_request.v2" as const;
 export const NEXUS_GATEWAY_INTERPRETER = "/Users/jameschen/Workspace/Nexus-new/.venv/bin/python";
-export const NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256 = "6625224ab881cdbd68f66607d190b1b0b7608c9175a1e69f0222653af467c125";
-export const NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256 = "5ba22736c0506c14e03ecf735bbb0a315c76733cdc0ee9d9a78e016f76f52e94";
+export const NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256 = "7af3760bd2b6729654a89d7b07fa4c43bb9b323e8e0006a08aa5e485d78562ac";
+export const NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256 = "be6918bc5b328dfbf8c50387e88f983ce33f0096542cc22109f75fbe6250ab5e";
 export const NEXUS_GATEWAY_STATE_ROOT = join(homedir(), "Library", "Application Support", "Nexus", "gateway-direct");
 
 export interface NexusGatewayRecoveryRequest {
@@ -870,7 +870,7 @@ try:
     secure_file(AUTHORITY, "recovery authority")
     secure_file(MANAGER, "manager artifact")
     authority = json.loads(AUTHORITY.read_text(encoding="utf-8"))
-    if not isinstance(authority, dict) or authority.get("schema") != "nexus.gateway.durable_recovery_authority.v1":
+    if not isinstance(authority, dict) or authority.get("schema") != "nexus.gateway.durable_recovery_authority.v2":
         fail("recovery authority schema mismatch")
     if authority.get("revocation_state") != "NOT_REVOKED":
         fail("recovery authority is not active")
@@ -895,7 +895,7 @@ try:
             fail("request/authority binding mismatch")
     if request.get("operation") != "gateway-recover" or request.get("effect_class") != "GATEWAY_DURABLE_RECOVERY":
         fail("recovery operation/effect mismatch")
-    if request.get("schema") != "nexus.gateway.durable_recovery_request.v1":
+    if request.get("schema") != "nexus.gateway.durable_recovery_request.v2":
         fail("recovery request schema mismatch")
 
     desired_id = authority.get("desired_manifest_id")
