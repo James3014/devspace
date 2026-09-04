@@ -16,6 +16,11 @@ export interface McpSessionRegistryOptions {
   now?: () => number;
 }
 
+export interface McpSessionMetrics {
+  activeSessions: number;
+  oldestAgeMs: number;
+}
+
 export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   private readonly sessions = new Map<string, McpSessionEntry<TTransport>>();
   private readonly now: () => number;
@@ -45,6 +50,16 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
 
   remove(sessionId: string): boolean {
     return this.sessions.delete(sessionId);
+  }
+
+  /** Aggregate-only transport evidence. Never returns session identifiers. */
+  metrics(): McpSessionMetrics {
+    const now = this.now();
+    let oldestAgeMs = 0;
+    for (const entry of this.sessions.values()) {
+      oldestAgeMs = Math.max(oldestAgeMs, Math.max(0, now - entry.lastActivityAt));
+    }
+    return { activeSessions: this.sessions.size, oldestAgeMs };
   }
 
   async closeIdle(idleTimeoutMs: number): Promise<McpSessionCloseResult[]> {
