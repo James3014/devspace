@@ -1962,6 +1962,45 @@ export function createMcpServer(
 
     registerAppTool(
       server,
+      "nexus_gateway_recovery_preflight",
+      {
+        title: "Nexus Gateway Recovery Preflight",
+        description:
+          "Effect-free preflight checkpoint for a Nexus Gateway recovery request. Validates authority, request binding, manifest integrity, and source bundle through the manager-owned gateway_recover() function without starting any launchd, plist, or process host effects. Returns readiness=[TARGET_READY,ROLLBACK_READY] and effect_started=false when the preflight passes. A BLOCKED result is the expected positive outcome — it means the effect-free checkpoint was reached without authorizing host recovery.",
+        inputSchema: {
+          attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
+            .describe("Stable DevSpace transport attempt identity for preflight. Conflicting reuse fails closed."),
+          request: nexusGatewayRecoveryRequestSchema,
+        },
+        outputSchema: {
+          status: z.enum(["passed", "error"]),
+          effectStarted: z.boolean(),
+          readiness: z.array(z.string()),
+          outcome: z.record(z.string(), z.unknown()).optional(),
+          errorMessage: z.string().optional(),
+        },
+        _meta: {},
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ attemptKey, request }) => {
+        const result = await durableOperations.nexusGatewayRecoveryPreflight({ attemptKey, request });
+        return {
+          content: [textBlock(
+            `Preflight ${result.status}: effect_started=${String(result.effectStarted)}, readiness=[${result.readiness.join(",")}].`,
+          )],
+          isError: result.status === "error",
+          structuredContent: result as unknown as Record<string, unknown>,
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
       "workspace_clone",
       {
         title: "Clone workspace",
