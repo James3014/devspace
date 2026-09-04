@@ -13,6 +13,7 @@ import {
   DurableOperationStore,
   NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256,
   NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE,
+  NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE,
   buildNexusGatewayRecoveryBridgeCode,
   NEXUS_GATEWAY_RECOVERY_SCHEMA,
   type CommandRunner,
@@ -581,5 +582,161 @@ test("fixed Nexus bridge rejects a symlinked desired deployment root before impo
   } finally {
     await rm(home, { recursive: true, force: true });
     await rm(outside, { recursive: true, force: true });
+  }
+});
+
+test("nexus_gateway_recovery_preflight passes with effect_started=false and readiness=[TARGET_READY,ROLLBACK_READY]", async () => {
+  const f = await fixture();
+  try {
+    const manager = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      async () => { throw new Error("recovery bridge must not be called during preflight"); },
+      async (request) => ({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          result: "BLOCKED",
+          effect_started: false,
+          evidence_hash: "1".repeat(64),
+          physical_observation: { readiness: ["TARGET_READY", "ROLLBACK_READY"] },
+        }),
+        stderr: "",
+      }),
+    );
+    try {
+      const result = await manager.nexusGatewayRecoveryPreflight({
+        attemptKey: "preflight-pass-1",
+        request: recoveryRequest(),
+      });
+      assert.equal(result.status, "passed");
+      assert.equal(result.effectStarted, false);
+      assert.deepEqual(result.readiness, ["TARGET_READY", "ROLLBACK_READY"]);
+      assert.ok(result.outcome, "outcome must be present on pass");
+      assert.equal(result.outcome!.result, "BLOCKED");
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("nexus_gateway_recovery_preflight rejects authority schema mismatch", async () => {
+  const f = await fixture();
+  try {
+    const manager = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      async () => { throw new Error("recovery bridge must not be called"); },
+      async () => ({
+        exitCode: 1,
+        stdout: "",
+        stderr: "recovery authority schema mismatch",
+      }),
+    );
+    try {
+      const result = await manager.nexusGatewayRecoveryPreflight({
+        attemptKey: "preflight-tamper-1",
+        request: recoveryRequest(),
+      });
+      assert.equal(result.status, "error");
+      assert.equal(result.effectStarted, false);
+      assert.match(result.errorMessage ?? "", /schema mismatch|exit/i);
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("nexus_gateway_recovery_preflight rejects wrong request hash", async () => {
+  const f = await fixture();
+  try {
+    const manager = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      async () => { throw new Error("recovery bridge must not be called"); },
+      async () => ({
+        exitCode: 1,
+        stdout: "",
+        stderr: "request/authority binding mismatch",
+      }),
+    );
+    try {
+      const badRequest = recoveryRequest({ request_hash: "0".repeat(64) });
+      const result = await manager.nexusGatewayRecoveryPreflight({
+        attemptKey: "preflight-tamper-2",
+        request: badRequest,
+      });
+      assert.equal(result.status, "error");
+      assert.equal(result.effectStarted, false);
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("nexus_gateway_recovery_preflight rejects wrong manager hash", async () => {
+  const f = await fixture();
+  try {
+    const manager = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      async () => { throw new Error("recovery bridge must not be called"); },
+      async () => ({
+        exitCode: 1,
+        stdout: "",
+        stderr: "manager artifact hash mismatch",
+      }),
+    );
+    try {
+      const result = await manager.nexusGatewayRecoveryPreflight({
+        attemptKey: "preflight-tamper-3",
+        request: recoveryRequest(),
+      });
+      assert.equal(result.status, "error");
+      assert.equal(result.effectStarted, false);
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("nexus_gateway_recovery_preflight rejects effect_started=true as error", async () => {
+  const f = await fixture();
+  try {
+    const manager = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      async () => { throw new Error("recovery bridge must not be called"); },
+      async () => ({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          result: "BLOCKED",
+          effect_started: true,
+          evidence_hash: "1".repeat(64),
+          physical_observation: { readiness: ["TARGET_READY", "ROLLBACK_READY"] },
+        }),
+        stderr: "",
+      }),
+    );
+    try {
+      const result = await manager.nexusGatewayRecoveryPreflight({
+        attemptKey: "preflight-effect-leak-1",
+        request: recoveryRequest(),
+      });
+      assert.equal(result.status, "error");
+      assert.equal(result.effectStarted, true);
+      assert.match(result.errorMessage ?? "", /effect/i);
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
   }
 });

@@ -48,6 +48,14 @@ export interface NexusGatewayRecoveryBridgeResult {
   stderr: string;
 }
 
+export interface NexusGatewayRecoveryPreflightResult {
+  status: "passed" | "error";
+  effectStarted: boolean;
+  readiness: string[];
+  outcome?: Record<string, unknown>;
+  errorMessage?: string;
+}
+
 export type NexusGatewayRecoveryRunner = (
   request: NexusGatewayRecoveryRequest,
 ) => Promise<NexusGatewayRecoveryBridgeResult>;
@@ -251,6 +259,7 @@ export class DurableOperationManager {
     private readonly config: ServerConfig,
     private readonly runCommand: CommandRunner = spawnCommand,
     private readonly runNexusGatewayRecovery: NexusGatewayRecoveryRunner = spawnNexusGatewayRecovery,
+    private readonly runNexusGatewayRecoveryPreflight: NexusGatewayRecoveryRunner = spawnNexusGatewayRecoveryPreflight,
   ) {
     this.store = new DurableOperationStore(config.stateDir);
     this.store.markInterruptedUnknown();
@@ -430,6 +439,73 @@ export class DurableOperationManager {
     });
     if (!created) return replayResult(record);
     return await this.executeNexusGatewayRecovery(operationId, input.request, false);
+  }
+
+  async nexusGatewayRecoveryPreflight(input: NexusGatewayRecoveryInput): Promise<NexusGatewayRecoveryPreflightResult> {
+    assertAttemptKey(input.attemptKey);
+    assertNexusGatewayRecoveryRequest(input.request);
+    let bridge: NexusGatewayRecoveryBridgeResult;
+    try {
+      bridge = await this.runNexusGatewayRecoveryPreflight(input.request);
+    } catch (error) {
+      return {
+        status: "error",
+        effectStarted: false,
+        readiness: [],
+        errorMessage: redactSecrets(error instanceof Error ? error.message : String(error)),
+      };
+    }
+    if (bridge.exitCode !== 0) {
+      return {
+        status: "error",
+        effectStarted: false,
+        readiness: [],
+        errorMessage: redactSecrets(
+          bridge.stderr.trim() || `Preflight bridge exited ${String(bridge.exitCode)}.`,
+        ),
+      };
+    }
+    let outcome: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(bridge.stdout);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("outcome must be an object");
+      outcome = parsed as Record<string, unknown>;
+    } catch (error) {
+      return {
+        status: "error",
+        effectStarted: false,
+        readiness: [],
+        errorMessage: `Preflight bridge returned malformed outcome JSON: ${redactSecrets(error instanceof Error ? error.message : String(error))}`,
+      };
+    }
+    const effectStarted = Boolean(outcome.effect_started);
+    const result = String(outcome.result ?? "");
+    const physicalObservation = (outcome.physical_observation ?? {}) as Record<string, unknown>;
+    const readiness = Array.isArray(physicalObservation.readiness)
+      ? (physicalObservation.readiness as unknown[]).map(String)
+      : [];
+    if (effectStarted) {
+      return {
+        status: "error",
+        effectStarted: true,
+        readiness,
+        errorMessage: "Preflight must not start effects; gateway_recover() started an effect.",
+      };
+    }
+    if (result !== "BLOCKED") {
+      return {
+        status: "error",
+        effectStarted,
+        readiness,
+        errorMessage: `Preflight expected result=BLOCKED, got '${redactSecrets(result)}'.`,
+      };
+    }
+    return {
+      status: "passed",
+      effectStarted: false,
+      readiness,
+      outcome,
+    };
   }
 
   private async executeNexusGatewayRecovery(
@@ -956,6 +1032,156 @@ export const NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE = buildNexusGatewayRecoveryBridg
   NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256,
 );
 
+function buildNexusGatewayRecoveryPreflightBridgeCode(
+  acceptedManagerSha256: string,
+  acceptedContractSha256: string,
+): string {
+  return String.raw `
+import hashlib
+import importlib.util
+import json
+import os
+import pathlib
+import re
+import stat
+import subprocess
+import sys
+
+
+STATE = pathlib.Path.home() / "Library" / "Application Support" / "Nexus" / "gateway-direct"
+AUTHORITY = STATE / "recovery-authority.json"
+MANAGER = STATE / "manager.py"
+DEPLOYMENTS = STATE / "deployments"
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
+DEPLOYMENT_ID = re.compile(r"^r1-[0-9a-f]{40}$")
+REMOTE = "https://github.com/James3014/Nexus-new.git"
+ACCEPTED_MANAGER_SHA256 = "${acceptedManagerSha256}"
+ACCEPTED_CONTRACT_SHA256 = "${acceptedContractSha256}"
+
+
+def fail(message):
+    raise RuntimeError(message)
+
+
+def secure_file(path, label):
+    if path.is_symlink():
+        fail(label + " must not be a symlink")
+    info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode):
+        fail(label + " must be a regular file")
+    if info.st_uid != os.getuid() or (stat.S_IMODE(info.st_mode) & 0o022):
+        fail(label + " ownership/mode invalid")
+
+
+def git(root, *args):
+    result = subprocess.run(
+        ["/usr/bin/git", "-C", str(root), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=10,
+        check=False,
+        env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+    )
+    if result.returncode != 0:
+        fail("deployment git verification failed")
+    return result.stdout.strip()
+
+
+try:
+    request = json.load(sys.stdin)
+    if not isinstance(request, dict):
+        fail("recovery request must be an object")
+    secure_file(AUTHORITY, "recovery authority")
+    secure_file(MANAGER, "manager artifact")
+    authority = json.loads(AUTHORITY.read_text(encoding="utf-8"))
+    if not isinstance(authority, dict) or authority.get("schema") != "nexus.gateway.durable_recovery_authority.v2":
+        fail("recovery authority schema mismatch")
+    if authority.get("revocation_state") != "NOT_REVOKED":
+        fail("recovery authority is not active")
+    manager_hash = authority.get("final_manager_sha256")
+    if manager_hash != ACCEPTED_MANAGER_SHA256:
+        fail("recovery authority accepted manager hash mismatch")
+    if hashlib.sha256(MANAGER.read_bytes()).hexdigest() != ACCEPTED_MANAGER_SHA256:
+        fail("manager artifact hash mismatch")
+
+    binding_pairs = (
+        ("request_id", "request_id"),
+        ("idempotency_fence", "idempotency_fence"),
+        ("recovery_authority_id", "receipt_id"),
+        ("recovery_authority_hash", "receipt_hash"),
+        ("desired_manifest_id", "desired_manifest_id"),
+        ("desired_manifest_hash", "desired_manifest_sha256"),
+        ("predecessor_manifest_id", "predecessor_manifest_id"),
+        ("predecessor_manifest_hash", "predecessor_manifest_sha256"),
+    )
+    for request_key, authority_key in binding_pairs:
+        if request.get(request_key) != authority.get(authority_key):
+            fail("request/authority binding mismatch")
+    if request.get("operation") != "gateway-recover" or request.get("effect_class") != "GATEWAY_DURABLE_RECOVERY":
+        fail("recovery operation/effect mismatch")
+    if request.get("schema") != "nexus.gateway.durable_recovery_request.v2":
+        fail("recovery request schema mismatch")
+
+    desired_id = authority.get("desired_manifest_id")
+    desired_manifest = authority.get("desired_manifest")
+    if not isinstance(desired_id, str) or DEPLOYMENT_ID.fullmatch(desired_id) is None:
+        fail("desired deployment id invalid")
+    if not isinstance(desired_manifest, dict) or desired_manifest.get("deployment_id") != desired_id:
+        fail("desired deployment manifest binding mismatch")
+    desired_commit = desired_manifest.get("commit")
+    desired_tree = desired_manifest.get("tree")
+    if not isinstance(desired_commit, str) or HEX40.fullmatch(desired_commit) is None:
+        fail("desired deployment commit invalid")
+    if not isinstance(desired_tree, str) or HEX40.fullmatch(desired_tree) is None:
+        fail("desired deployment tree invalid")
+
+    deployments_root = DEPLOYMENTS.resolve(strict=True)
+    desired_root_path = DEPLOYMENTS / desired_id
+    if desired_root_path.is_symlink():
+        fail("desired deployment root must not be a symlink")
+    desired_root = desired_root_path.resolve(strict=True)
+    if desired_root.parent != deployments_root or not desired_root.is_dir():
+        fail("desired deployment root escaped fixed deployments directory")
+    root_info = os.lstat(desired_root)
+    if root_info.st_uid != os.getuid() or (stat.S_IMODE(root_info.st_mode) & 0o022):
+        fail("desired deployment root ownership/mode invalid")
+    if git(desired_root, "rev-parse", "--show-toplevel") != str(desired_root):
+        fail("desired deployment toplevel mismatch")
+    if git(desired_root, "remote", "get-url", "origin") != REMOTE:
+        fail("desired deployment remote mismatch")
+    if git(desired_root, "status", "--porcelain"):
+        fail("desired deployment is dirty")
+    if git(desired_root, "rev-parse", "HEAD") != desired_commit:
+        fail("desired deployment commit mismatch")
+    if git(desired_root, "rev-parse", "HEAD^{tree}") != desired_tree:
+        fail("desired deployment tree mismatch")
+    contract_path = desired_root / "nexus" / "contracts" / "gateway_deployment.py"
+    secure_file(contract_path, "gateway deployment authority contract")
+    if hashlib.sha256(contract_path.read_bytes()).hexdigest() != ACCEPTED_CONTRACT_SHA256:
+        fail("gateway deployment authority contract hash mismatch")
+
+    sys.path.insert(0, str(desired_root))
+    spec = importlib.util.spec_from_file_location("nexus_gateway_stable_manager", MANAGER)
+    if spec is None or spec.loader is None:
+        fail("manager import spec unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    outcome = module.gateway_recover(request)
+    print(json.dumps(outcome.model_dump(mode="json"), sort_keys=True, separators=(",", ":")))
+except Exception as exc:
+    print("NEXUS_GATEWAY_BRIDGE_ERROR:" + type(exc).__name__ + ":" + str(exc), file=sys.stderr)
+    raise SystemExit(1)
+`;
+}
+
+export const NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE = buildNexusGatewayRecoveryPreflightBridgeCode(
+  NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256,
+  NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256,
+);
+
 async function spawnNexusGatewayRecovery(
   request: NexusGatewayRecoveryRequest,
 ): Promise<NexusGatewayRecoveryBridgeResult> {
@@ -984,6 +1210,54 @@ async function spawnNexusGatewayRecovery(
       const next = String(chunk);
       if (Buffer.byteLength((target === "stdout" ? stdout : stderr) + next, "utf8") > maxOutputBytes) {
         rejectOnce(new Error("Fixed Nexus Gateway recovery bridge exceeded bounded output."));
+        return;
+      }
+      if (target === "stdout") stdout += next;
+      else stderr += next;
+    };
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => appendBounded("stdout", chunk));
+    child.stderr.on("data", (chunk) => appendBounded("stderr", chunk));
+    child.on("error", (error) => rejectOnce(error));
+    child.stdin.on("error", (error) => rejectOnce(error));
+    child.on("close", (exitCode) => {
+      if (settled) return;
+      settled = true;
+      resolvePromise({ exitCode, stdout, stderr });
+    });
+    child.stdin.end(JSON.stringify(request));
+  });
+}
+
+async function spawnNexusGatewayRecoveryPreflight(
+  request: NexusGatewayRecoveryRequest,
+): Promise<NexusGatewayRecoveryBridgeResult> {
+  const maxOutputBytes = 1024 * 1024;
+  return await new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(NEXUS_GATEWAY_INTERPRETER, ["-I", "-B", "-c", NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE], {
+      cwd: homedir(),
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        HOME: homedir(),
+        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+        PYTHONNOUSERSITE: "1",
+        PYTHONDONTWRITEBYTECODE: "1",
+      },
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const rejectOnce = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      rejectPromise(error);
+    };
+    const appendBounded = (target: "stdout" | "stderr", chunk: unknown) => {
+      const next = String(chunk);
+      if (Buffer.byteLength((target === "stdout" ? stdout : stderr) + next, "utf8") > maxOutputBytes) {
+        rejectOnce(new Error("Fixed Nexus Gateway recovery preflight bridge exceeded bounded output."));
         return;
       }
       if (target === "stdout") stdout += next;
