@@ -1343,7 +1343,7 @@ function createAgentStartInputSchema() {
       "Marks idleTimeoutMs as an explicit task-contract override. Omit both fields to use the current profile/provider execution-idle policy.",
     ),
     idleTimeoutMs: z.number().int().min(1).describe(
-      "Explicit hard no-provider-activity timeout for this turn. Requires idleTimeoutMode=EXPLICIT_OVERRIDE and must satisfy the profile/provider policy; generic callers should normally omit it and use the profile default.",
+      "Explicit hard no-provider-activity timeout for this turn. Requires idleTimeoutMode=EXPLICIT_OVERRIDE and must satisfy the profile/provider policy; when valid, the agent is terminated after this interval with no provider activity. Generic callers should normally omit it and use the profile default.",
     ),
   }).partial().optional().describe(
     "Optional structured execution contract. Records and enforces where/how the worker may run.",
@@ -2942,6 +2942,7 @@ export function createMcpServer(
           providerSessionId: z.string().optional(),
           status: z.string(),
           terminal: z.boolean(),
+          executionIdlePolicy: AGENT_IDLE_POLICY_OUTPUT_SCHEMA.optional(),
           latestResponse: z.string().optional(),
           error: z.string().optional(),
           termination: AGENT_TERMINATION_OUTPUT_SCHEMA.optional(),

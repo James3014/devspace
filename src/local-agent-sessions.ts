@@ -1420,6 +1420,11 @@ export class LocalAgentSessionManager {
     return summarizeExecutionCapacity(active.length, this.config.agentMaxConcurrent, activeInWorkspace);
   }
 
+  /** Compatibility predicate backed by the canonical capacity snapshot. */
+  private hasExecutionCapacity(): boolean {
+    return this.executionCapacitySnapshot().localState === "AVAILABLE";
+  }
+
   private assertDispatchOwnershipAvailable(workspaceRoot: string, contract: ExecutionContract | undefined): void {
     const intent = contract?.dispatchIntent;
     const writeScope = contract?.writePaths ?? [];
