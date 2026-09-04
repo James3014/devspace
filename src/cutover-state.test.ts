@@ -67,6 +67,53 @@ test("concurrent controllers create exactly one active cutover", async () => {
   }
 });
 
+test("restart request requires drain, survives replacement, and is idempotent", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-restart-request-"));
+  try {
+    let now = 1_000;
+    const store = new CutoverStateStore(stateDir, {
+      now: () => now,
+      newId: () => `event-${now}`,
+    });
+    const created = store.begin({
+      oldServerIdentity: oldIdentity,
+      expectedNewIdentity: { sourceCommit: "source-new", buildId: "build-new" },
+    });
+    assert.throws(
+      () => store.recordRestartRequest(created.cutoverId, {
+        actuator: "launchd-self",
+        requestedByServerInstanceId: oldIdentity.serverInstanceId,
+      }),
+      /must be drained/i,
+    );
+
+    now = 2_000;
+    store.recordDrain(created.cutoverId, { activeSessions: 2, oldestAgeMs: 9_000 });
+    now = 3_000;
+    const first = store.recordRestartRequest(created.cutoverId, {
+      actuator: "launchd-self",
+      requestedByServerInstanceId: oldIdentity.serverInstanceId,
+    });
+    assert.equal(first.newlyRequested, true);
+    assert.equal(first.record.restartRequest?.actuator, "launchd-self");
+    assert.equal(first.record.restartRequest?.requestedByServerInstanceId, oldIdentity.serverInstanceId);
+    assert.equal(first.record.restartRequest?.requestedAt, new Date(3_000).toISOString());
+
+    now = 4_000;
+    const duplicate = new CutoverStateStore(stateDir, { now: () => now }).recordRestartRequest(
+      created.cutoverId,
+      {
+        actuator: "launchd-self",
+        requestedByServerInstanceId: oldIdentity.serverInstanceId,
+      },
+    );
+    assert.equal(duplicate.newlyRequested, false);
+    assert.equal(duplicate.record.restartRequest?.requestedAt, new Date(3_000).toISOString());
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("drain evidence and terminal reconciliation receipt survive store replacement", () => {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-receipt-"));
   try {

@@ -55,12 +55,21 @@ import {
   McpSessionRegistry,
   type McpSessionCloseResult,
 } from "./mcp-sessions.js";
-import { CutoverStateError, CutoverStateStore } from "./cutover-state.js";
+import {
+  CutoverStateError,
+  CutoverStateStore,
+  type CutoverDrainEvidence,
+} from "./cutover-state.js";
 import {
   CutoverBlockedError,
   McpCutoverController,
   registerCutoverHttpRoutes,
+  type DurableReconciliationWitness,
 } from "./mcp-cutover.js";
+import {
+  createLaunchdSelfRestartActuator,
+  type SelfRestartActuator,
+} from "./cutover-restart.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
 import {
   DurableOperationManager,
@@ -1280,6 +1289,197 @@ export interface RuntimeBuildIdentityContext {
   capabilityManifest?: CapabilityManifest;
 }
 
+export interface CutoverMcpControlContext {
+  controller: McpCutoverController;
+  transportEvidence: () => CutoverDrainEvidence;
+  reconcileDurableState: (input: {
+    workspaceId: string;
+    agentId: string;
+  }) => Promise<DurableReconciliationWitness>;
+  restartSelf?: SelfRestartActuator;
+}
+
+function registerCutoverMcpTools(
+  server: McpServer,
+  control: CutoverMcpControlContext,
+): void {
+  const cutoverRecordSchema = z.record(z.string(), z.unknown());
+  const modeSchema = z.enum(["normal", "drain", "reconcile-only"]);
+
+  registerAppTool(
+    server,
+    "cutover_status",
+    {
+      title: "Cutover status",
+      description:
+        "Read the durable Dev MCP cutover lease, aggregate transport drain evidence, current server identity comparison, and whether reconciliation is required. Never starts, retries, or closes a cutover.",
+      inputSchema: {},
+      outputSchema: {
+        status: z.record(z.string(), z.unknown()),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async () => {
+      const status = control.controller.status(control.transportEvidence());
+      return {
+        content: [textBlock(
+          `Cutover mode=${String(status.mode)}, reconciliationRequired=${String(status.reconciliationRequired)}.`,
+        )],
+        structuredContent: { status },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "cutover_start",
+    {
+      title: "Start cutover",
+      description:
+        "Acquire the single durable Dev MCP cutover lease for one exact expected source/build identity. Fails closed when another unresolved cutover owns the lease. Does not install or restart anything.",
+      inputSchema: {
+        expectedSourceCommit: z.string().regex(/^[0-9a-f]{40}$/),
+        expectedBuildId: z.string().min(1),
+        expectedCapabilityManifestSha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+        expiresAt: z.string().optional(),
+      },
+      outputSchema: {
+        cutover: cutoverRecordSchema,
+        mode: modeSchema,
+      },
+      _meta: {},
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    },
+    async ({ expectedSourceCommit, expectedBuildId, expectedCapabilityManifestSha256, expiresAt }) => {
+      const capabilityManifestSha256 = expectedCapabilityManifestSha256
+        ?? control.controller.currentIdentity.capabilityManifestSha256;
+      const record = control.controller.begin(
+        {
+          sourceCommit: expectedSourceCommit,
+          buildId: expectedBuildId,
+          ...(capabilityManifestSha256 ? { capabilityManifestSha256 } : {}),
+        },
+        expiresAt,
+      );
+      const mode = control.controller.mode();
+      return {
+        content: [textBlock(`Started cutover ${record.cutoverId}; mode=${mode}.`) ],
+        structuredContent: { cutover: record as unknown as Record<string, unknown>, mode },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "cutover_drain",
+    {
+      title: "Drain cutover",
+      description:
+        "Record aggregate transport drain evidence for one exact cutover lease. Consequential MCP starts remain blocked while the lease is active.",
+      inputSchema: { cutoverId: z.string().min(1) },
+      outputSchema: {
+        cutover: cutoverRecordSchema,
+        mode: modeSchema,
+      },
+      _meta: {},
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    },
+    async ({ cutoverId }) => {
+      const record = control.controller.recordDrain(cutoverId, control.transportEvidence());
+      const mode = control.controller.mode();
+      return {
+        content: [textBlock(
+          `Drained cutover ${record.cutoverId}: activeSessions=${record.drainEvidence?.activeSessions ?? "unknown"}, oldestAgeMs=${record.drainEvidence?.oldestAgeMs ?? "unknown"}.`,
+        )],
+        structuredContent: { cutover: record as unknown as Record<string, unknown>, mode },
+      };
+    },
+  );
+
+  if (control.restartSelf) {
+    registerAppTool(
+      server,
+      "cutover_restart_self",
+      {
+        title: "Restart cutover server",
+        description:
+          "Schedule exactly one restart of this macOS launchd-managed Dev MCP service after a drained cutover lease is durably bound. The service label comes only from launchd XPC_SERVICE_NAME; callers cannot supply a command, label, path, PID, or launchd domain. Duplicate calls never schedule a second restart and must be reconciled by server identity.",
+        inputSchema: { cutoverId: z.string().min(1) },
+        outputSchema: {
+          cutover: cutoverRecordSchema,
+          mode: modeSchema,
+          restart: z.object({
+            scheduled: z.boolean(),
+            alreadyRequested: z.boolean(),
+            actuator: z.literal("launchd-self"),
+            serviceLabel: z.string(),
+            launchdTarget: z.string(),
+          }),
+        },
+        _meta: {},
+        annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+      },
+      async ({ cutoverId }) => {
+        const request = control.controller.requestRestart(cutoverId);
+        const actuator = control.restartSelf!;
+        const scheduled = request.newlyRequested ? actuator.schedule() : undefined;
+        const mode = control.controller.mode();
+        const restart = {
+          scheduled: Boolean(scheduled),
+          alreadyRequested: !request.newlyRequested,
+          actuator: "launchd-self" as const,
+          serviceLabel: actuator.serviceLabel,
+          launchdTarget: actuator.launchdTarget,
+        };
+        const message = request.newlyRequested
+          ? `Restart scheduled for cutover ${cutoverId}; reconcile the replacement server identity before any retry.`
+          : `Restart was already requested for cutover ${cutoverId}; no second restart was scheduled.`;
+        return {
+          content: [textBlock(message)],
+          structuredContent: {
+            cutover: request.record as unknown as Record<string, unknown>,
+            mode,
+            restart,
+          },
+        };
+      },
+    );
+  }
+
+  registerAppTool(
+    server,
+    "cutover_finish",
+    {
+      title: "Finish cutover",
+      description:
+        "Close one exact cutover only on the replacement server after source/build/capability identity matches and one durable workspace/agent pair is positively queried and physically reconciled. Worker state is evidence only; this grants no acceptance or merge authority.",
+      inputSchema: {
+        cutoverId: z.string().min(1),
+        workspaceId: z.string().min(1),
+        agentId: z.string().min(1),
+      },
+      outputSchema: {
+        cutover: cutoverRecordSchema,
+        mode: modeSchema,
+      },
+      _meta: {},
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ cutoverId, workspaceId, agentId }) => {
+      const record = await control.controller.finish(
+        cutoverId,
+        () => control.reconcileDurableState({ workspaceId, agentId }),
+      );
+      const mode = control.controller.mode();
+      return {
+        content: [textBlock(`Finished cutover ${cutoverId}; mode=${mode}.`) ],
+        structuredContent: { cutover: record as unknown as Record<string, unknown>, mode },
+      };
+    },
+  );
+}
+
 function createAgentStartInputSchema() {
   const dispatchIntent = z.object({
     taskId: z.string().min(1),
@@ -1370,6 +1570,7 @@ export function createMcpServer(
   codexGoals?: CodexGoalSessionManager,
   runtimeBuildIdentityContext?: RuntimeBuildIdentityContext,
   durableOperations?: DurableOperationManager,
+  cutoverControl?: CutoverMcpControlContext,
 ): McpServer {
   const runtimeBuildIdentity = runtimeBuildIdentityContext?.identity
     ?? describeRuntimeBuildIdentity({
@@ -1400,6 +1601,7 @@ export function createMcpServer(
   );
 
   registerRepositoryIntelligenceTools(server, config, workspaces);
+  if (cutoverControl) registerCutoverMcpTools(server, cutoverControl);
 
   registerAppResource(
     server,
@@ -3709,6 +3911,38 @@ export function createServer(
       capabilityManifestSha256: capabilityManifest.manifestSha256,
     },
   );
+  const restartSelfActuator = createLaunchdSelfRestartActuator();
+  const reconcileCutoverDurableState = async ({
+    workspaceId,
+    agentId,
+  }: {
+    workspaceId: string;
+    agentId: string;
+  }): Promise<DurableReconciliationWitness> => {
+    if (!agentSessionManager) {
+      throw new CutoverStateError(
+        "Durable agent reconciliation is unavailable because subagents are disabled.",
+      );
+    }
+    const workspace = workspaces.getWorkspace(workspaceId);
+    await agentSessionManager.getAgentStatus({
+      workspaceId,
+      workspaceRoot: workspace.root,
+      agentId,
+      waitMs: 0,
+    });
+    await agentSessionManager.reconcileAgent({
+      workspaceId,
+      workspaceRoot: workspace.root,
+      isolated: workspace.mode === "worktree",
+      agentId,
+    });
+    return {
+      workspaceQueryable: true,
+      agentQueryable: true,
+      agentReconciled: true,
+    };
+  };
   const codexGoals = config.codexGoalsEnabled
     ? new CodexGoalSessionManager(processSessions, { codexBin: config.codexBin })
     : undefined;
@@ -3860,31 +4094,7 @@ export function createServer(
     controller: cutoverController,
     authenticate: bearerAuth,
     transportEvidence: () => transports.metrics(),
-    reconcileDurableState: async ({ workspaceId, agentId }) => {
-      if (!agentSessionManager) {
-        throw new CutoverStateError(
-          "Durable agent reconciliation is unavailable because subagents are disabled.",
-        );
-      }
-      const workspace = workspaces.getWorkspace(workspaceId);
-      await agentSessionManager.getAgentStatus({
-        workspaceId,
-        workspaceRoot: workspace.root,
-        agentId,
-        waitMs: 0,
-      });
-      await agentSessionManager.reconcileAgent({
-        workspaceId,
-        workspaceRoot: workspace.root,
-        isolated: workspace.mode === "worktree",
-        agentId,
-      });
-      return {
-        workspaceQueryable: true,
-        agentQueryable: true,
-        agentReconciled: true,
-      };
-    },
+    reconcileDurableState: reconcileCutoverDurableState,
   });
 
   app.all("/mcp", async (req, res) => {
@@ -3994,6 +4204,12 @@ export function createServer(
             capabilityManifest,
           },
           durableOperations,
+          {
+            controller: cutoverController,
+            transportEvidence: () => transports.metrics(),
+            reconcileDurableState: reconcileCutoverDurableState,
+            ...(restartSelfActuator ? { restartSelf: restartSelfActuator } : {}),
+          },
         );
         await server.connect(transport);
       } else {

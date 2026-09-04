@@ -79,6 +79,31 @@ test("finish fails closed for old/wrong identities and closes exact cutover idem
   }
 });
 
+test("restart authority is drain-bound, idempotent, and cannot transfer to replacement instance", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-mcp-restart-authority-"));
+  try {
+    const store = new CutoverStateStore(stateDir, { newId: () => "cutover-restart" });
+    const old = new McpCutoverController(store, identity("old", "old-source", "old-build"));
+    old.begin({ sourceCommit: "new-source", buildId: "new-build" });
+    assert.throws(() => old.requestRestart("cutover-restart"), /must be drained/i);
+
+    old.recordDrain("cutover-restart", { activeSessions: 1, oldestAgeMs: 100 });
+    assert.equal(old.requestRestart("cutover-restart").newlyRequested, true);
+    assert.equal(old.requestRestart("cutover-restart").newlyRequested, false);
+
+    const replacement = new McpCutoverController(
+      new CutoverStateStore(stateDir),
+      identity("new", "new-source", "new-build"),
+    );
+    assert.throws(
+      () => replacement.requestRestart("cutover-restart"),
+      /only the old server instance/i,
+    );
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("finish requires a real positive durable reconciliation witness", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-mcp-witness-"));
   try {

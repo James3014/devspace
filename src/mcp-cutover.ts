@@ -77,6 +77,26 @@ export class McpCutoverController {
     return this.store.recordDrain(cutoverId, evidence);
   }
 
+  requestRestart(cutoverId: string): {
+    record: DurableCutoverRecord;
+    newlyRequested: boolean;
+  } {
+    const record = this.store.get();
+    if (!record) throw new CutoverStateError("No durable cutover record exists.");
+    if (record.cutoverId !== cutoverId) {
+      throw new CutoverStateError(`Cutover id mismatch: active cutover is ${record.cutoverId}.`);
+    }
+    if (record.oldServerIdentity.serverInstanceId !== this.currentIdentity.serverInstanceId) {
+      throw new CutoverStateError(
+        "Only the old server instance that owns the drain lease may request its restart.",
+      );
+    }
+    return this.store.recordRestartRequest(cutoverId, {
+      actuator: "launchd-self",
+      requestedByServerInstanceId: this.currentIdentity.serverInstanceId,
+    });
+  }
+
   record(): DurableCutoverRecord | undefined {
     return this.store.get();
   }

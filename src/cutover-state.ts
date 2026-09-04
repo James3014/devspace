@@ -40,6 +40,12 @@ export interface CutoverReconciliationReceipt {
   reconciledAt: string;
 }
 
+export interface CutoverRestartRequest {
+  actuator: "launchd-self";
+  requestedByServerInstanceId: string;
+  requestedAt: string;
+}
+
 export interface DurableCutoverRecord {
   schema: typeof CUTOVER_STATE_SCHEMA;
   cutoverId: string;
@@ -51,6 +57,7 @@ export interface DurableCutoverRecord {
   expiresAt?: string;
   expired?: boolean;
   drainEvidence?: CutoverDrainEvidence;
+  restartRequest?: CutoverRestartRequest;
   reconciliationReceipt?: CutoverReconciliationReceipt;
 }
 
@@ -172,6 +179,30 @@ export class CutoverStateStore {
     });
   }
 
+  recordRestartRequest(
+    cutoverId: string,
+    request: Omit<CutoverRestartRequest, "requestedAt">,
+  ): { record: DurableCutoverRecord; newlyRequested: boolean } {
+    const record = this.requireExact(cutoverId);
+    if (record.phase !== "drained") {
+      throw new CutoverStateError(
+        `Cutover ${cutoverId} must be drained before restart can be requested.`,
+      );
+    }
+    if (record.restartRequest) {
+      return { record, newlyRequested: false };
+    }
+    const requestedAt = new Date(this.now()).toISOString();
+    return {
+      record: this.replace({
+        ...withoutDiagnostic(record),
+        restartRequest: { ...request, requestedAt },
+        updatedAt: requestedAt,
+      }),
+      newlyRequested: true,
+    };
+  }
+
   close(cutoverId: string, receipt: CutoverReconciliationReceipt): DurableCutoverRecord {
     const record = this.requireExact(cutoverId);
     if (record.phase === "closed") return record;
@@ -224,7 +255,8 @@ function parseRecord(raw: string): DurableCutoverRecord {
     !isIdentity(value.oldServerIdentity) ||
     !isExpectedIdentity(value.expectedNewIdentity) ||
     typeof value.createdAt !== "string" ||
-    typeof value.updatedAt !== "string"
+    typeof value.updatedAt !== "string" ||
+    (value.restartRequest !== undefined && !isRestartRequest(value.restartRequest))
   ) {
     throw new CutoverStateError("Durable cutover record is malformed; reconciliation is required.");
   }
@@ -247,6 +279,18 @@ function isExpectedIdentity(value: unknown): value is ExpectedCutoverIdentity {
     identity &&
     typeof identity.sourceCommit === "string" &&
     typeof identity.buildId === "string",
+  );
+}
+
+function isRestartRequest(value: unknown): value is CutoverRestartRequest {
+  const request = value as Partial<CutoverRestartRequest> | undefined;
+  return Boolean(
+    request &&
+    request.actuator === "launchd-self" &&
+    typeof request.requestedByServerInstanceId === "string" &&
+    request.requestedByServerInstanceId.length > 0 &&
+    typeof request.requestedAt === "string" &&
+    Number.isFinite(Date.parse(request.requestedAt)),
   );
 }
 
