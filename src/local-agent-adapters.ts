@@ -4,6 +4,7 @@ import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
 import { resolveAgyExecutable } from "./local-agent-availability.js";
 import { createThrottledActivityTouch } from "./local-agent-activity.js";
+import type { ExecutionActivityCapability } from "./local-agent-contract.js";
 import {
   createCodexSdkLocalAgentRuntime,
   LocalAgentProviderError,
@@ -41,6 +42,7 @@ import {
 
 export interface LocalAgentAdapter {
   readonly provider: LocalAgentProvider;
+  readonly executionActivityCapability: ExecutionActivityCapability;
   runtimeKey(): string;
   run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks): Promise<LocalAgentRunResult>;
 }
@@ -74,6 +76,12 @@ export async function runLocalAgentProvider(
   return createLocalAgentAdapter(provider).run(input, callbacks);
 }
 
+export function getLocalAgentExecutionActivityCapability(
+  provider: LocalAgentProvider,
+): ExecutionActivityCapability {
+  return createLocalAgentAdapter(provider).executionActivityCapability;
+}
+
 export function createLocalAgentAdapter(
   provider: LocalAgentProvider,
   options: LocalAgentDriverOptions = {},
@@ -104,9 +112,11 @@ export function createLocalAgentAdapter(
 
 class DriverBackedLocalAgentAdapter implements LocalAgentAdapter {
   readonly provider: LocalAgentProvider;
+  readonly executionActivityCapability: ExecutionActivityCapability;
 
   constructor(private readonly driver: LocalAgentDriver) {
     this.provider = driver.provider;
+    this.executionActivityCapability = driver.executionActivityCapability ?? "UNAVAILABLE";
   }
 
   runtimeKey(): string {
@@ -147,6 +157,7 @@ class DriverBackedLocalAgentAdapter implements LocalAgentAdapter {
 
 class CodexLocalAgentAdapter implements LocalAgentAdapter {
   readonly provider = "codex" as const;
+  readonly executionActivityCapability = "TRUSTWORTHY" as const;
 
   runtimeKey(): string {
     return this.provider;
@@ -171,6 +182,7 @@ class CodexLocalAgentAdapter implements LocalAgentAdapter {
 
 class OmpLocalAgentAdapter implements LocalAgentAdapter {
   readonly provider = "omp" as const;
+  readonly executionActivityCapability = "TRUSTWORTHY" as const;
 
   runtimeKey(): string {
     return this.provider;
@@ -359,6 +371,9 @@ function isPathWithin(candidate: string, root: string): boolean {
 
 class AgyLocalAgentAdapter implements LocalAgentAdapter {
   readonly provider = "agy" as const;
+  // Agy --print can remain silent until the final response. Raw-byte touches are useful
+  // when present, but silence is not a trustworthy liveness signal for hard idle fencing.
+  readonly executionActivityCapability = "UNAVAILABLE" as const;
 
   runtimeKey(): string {
     return this.provider;

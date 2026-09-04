@@ -209,6 +209,7 @@ export class ClaudeQueryRuntime implements LocalAgentRuntime {
 
 export class ClaudeLocalAgentDriver implements LocalAgentDriver {
   readonly provider = "claude" as const;
+  readonly executionActivityCapability = "TRUSTWORTHY" as const;
   readonly idleTimeoutMs = 3 * 60_000;
 
   constructor(

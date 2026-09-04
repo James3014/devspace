@@ -1333,8 +1333,11 @@ function createAgentStartInputSchema() {
     maxExecutionMs: z.number().int().min(1).describe(
       "Optional wall-clock bound for semantic provider execution (execution started -> terminal).",
     ),
+    idleTimeoutMode: z.literal("EXPLICIT_OVERRIDE").describe(
+      "Marks idleTimeoutMs as an explicit task-contract override. Omit both fields to use the current profile/provider execution-idle policy.",
+    ),
     idleTimeoutMs: z.number().int().min(1).describe(
-      "Optional idle bound enforced by the Dev supervisor once execution has started: the agent is terminated after this long with no provider activity. Adapters report activity on provider protocol events and raw output bytes; providers that emit nothing mid-run must not be paired with tight idle bounds (use maxExecutionMs for those).",
+      "Explicit hard no-provider-activity timeout for this turn. Requires idleTimeoutMode=EXPLICIT_OVERRIDE and must satisfy the profile/provider policy; generic callers should normally omit it and use the profile default.",
     ),
   }).partial().optional().describe(
     "Optional structured execution contract. Records and enforces where/how the worker may run.",
@@ -2666,6 +2669,11 @@ export function createMcpServer(
       idempotentHint: false,
       openWorldHint: true,
     };
+    const AGENT_IDLE_POLICY_OUTPUT_SCHEMA = z.object({
+      source: z.enum(["PROFILE_DEFAULT", "EXPLICIT_OVERRIDE"]),
+      activityCapability: z.enum(["TRUSTWORTHY", "UNAVAILABLE"]),
+      timeoutMs: z.number().int().positive().optional(),
+    });
     const AGENT_DISPATCH_OUTPUT_SCHEMA = z.object({
       taskId: z.string(),
       attemptId: z.string(),
@@ -2695,6 +2703,7 @@ export function createMcpServer(
           workspaceRoot: z.string(),
           createdAt: z.string(),
           updatedAt: z.string(),
+          executionIdlePolicy: AGENT_IDLE_POLICY_OUTPUT_SCHEMA.optional(),
         },
         _meta: {},
         annotations: AGENT_TOOL_ANNOTATIONS_WRITE,
@@ -2746,6 +2755,12 @@ export function createMcpServer(
           workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
           agentId: z.string().describe("Exact agent ID returned by agent_start."),
           prompt: z.string().describe("Follow-up prompt for the agent."),
+          idleTimeoutMode: z.literal("EXPLICIT_OVERRIDE").optional().describe(
+            "Optional explicit idle override for this continuation turn. Omit to recompute the current profile/provider default.",
+          ),
+          idleTimeoutMs: z.number().int().positive().optional().describe(
+            "Explicit continuation-turn idle timeout; requires idleTimeoutMode=EXPLICIT_OVERRIDE and must satisfy current policy.",
+          ),
         },
         outputSchema: {
           agentId: z.string(),
@@ -2759,12 +2774,13 @@ export function createMcpServer(
           workspaceRoot: z.string(),
           createdAt: z.string(),
           updatedAt: z.string(),
+          executionIdlePolicy: AGENT_IDLE_POLICY_OUTPUT_SCHEMA.optional(),
           continued: z.boolean(),
         },
         _meta: {},
         annotations: AGENT_TOOL_ANNOTATIONS_WRITE,
       },
-      async ({ workspaceId, agentId, prompt }) => {
+      async ({ workspaceId, agentId, prompt, idleTimeoutMode, idleTimeoutMs }) => {
         const workspace = workspaces.getWorkspace(workspaceId);
         const profileCatalog = await loadProfileCatalog(config, workspace.root);
         const output = await agentSessionManager.continueAgent({
@@ -2772,6 +2788,8 @@ export function createMcpServer(
           workspaceRoot: workspace.root,
           agentId,
           prompt,
+          idleTimeoutMode,
+          idleTimeoutMs,
           profiles: profileCatalog.profiles,
           profileCatalog,
         });
@@ -2825,6 +2843,7 @@ export function createMcpServer(
           errorDetails: z.record(z.string(), z.unknown()).optional(),
           createdAt: z.string(),
           updatedAt: z.string(),
+          executionIdlePolicy: AGENT_IDLE_POLICY_OUTPUT_SCHEMA.optional(),
           startedAt: z.string().optional(),
           lastActivityAt: z.string().optional(),
           lastFileMutationAt: z.number().optional(),

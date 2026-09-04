@@ -17,6 +17,15 @@ import {
 
 export type ScopeState = "WITHIN_SCOPE" | "SCOPE_VIOLATION" | "UNKNOWN";
 
+export type ExecutionActivityCapability = "TRUSTWORTHY" | "UNAVAILABLE";
+export type ExecutionIdlePolicySource = "PROFILE_DEFAULT" | "EXPLICIT_OVERRIDE";
+
+export interface EffectiveExecutionIdlePolicy {
+  source: ExecutionIdlePolicySource;
+  activityCapability: ExecutionActivityCapability;
+  timeoutMs?: number;
+}
+
 export type AgentTerminalReason =
   | "completed"
   | "cancelled"
@@ -55,8 +64,12 @@ export interface ExecutionContract {
   maxStartupMs?: number;
   /** Optional wall-clock bound for semantic provider execution (execution started -> terminal). */
   maxExecutionMs?: number;
-  /** Maximum interval without a provider/runtime activity event. */
+  /**
+   * Explicit task-contract idle override. Supplying idleTimeoutMs requires
+   * idleTimeoutMode=EXPLICIT_OVERRIDE; omission resolves from profile/provider policy.
+   */
   idleTimeoutMs?: number;
+  idleTimeoutMode?: "EXPLICIT_OVERRIDE";
 }
 
 /**
@@ -99,6 +112,8 @@ export interface ActiveTurnState {
   executionStartedAt?: string;
   /** Last provider/runtime activity observed for idle-timeout supervision. */
   lastActivityAt?: string;
+  /** Durable effective execution-idle policy for this exact turn. */
+  executionIdlePolicy?: EffectiveExecutionIdlePolicy;
   launchState?: AgentTurnLaunchState;
 }
 
@@ -193,11 +208,23 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
     contract.maxExecutionMs = record.maxExecutionMs;
   }
 
+  if (record.idleTimeoutMode !== undefined) {
+    if (record.idleTimeoutMode !== "EXPLICIT_OVERRIDE") {
+      throw new Error("executionContract.idleTimeoutMode must be EXPLICIT_OVERRIDE when supplied.");
+    }
+    contract.idleTimeoutMode = record.idleTimeoutMode;
+  }
+
   if (record.idleTimeoutMs !== undefined) {
     if (typeof record.idleTimeoutMs !== "number" || !Number.isInteger(record.idleTimeoutMs) || record.idleTimeoutMs < 1) {
       throw new Error("executionContract.idleTimeoutMs must be a positive integer.");
     }
+    if (contract.idleTimeoutMode !== "EXPLICIT_OVERRIDE") {
+      throw new Error("executionContract.idleTimeoutMs is an explicit task-contract override and requires idleTimeoutMode=EXPLICIT_OVERRIDE.");
+    }
     contract.idleTimeoutMs = record.idleTimeoutMs;
+  } else if (contract.idleTimeoutMode === "EXPLICIT_OVERRIDE") {
+    throw new Error("executionContract.idleTimeoutMode=EXPLICIT_OVERRIDE requires idleTimeoutMs.");
   }
 
   const authorityMode = contract.authorityMode ?? "OWNER_DIRECT";
