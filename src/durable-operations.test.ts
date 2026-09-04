@@ -472,7 +472,7 @@ test("fixed Nexus bridge rejects manager hash mismatch before importing manager 
     const request = recoveryRequest();
     const authorityPath = join(state, "recovery-authority.json");
     await writeFile(authorityPath, JSON.stringify({
-      schema: "nexus.gateway.durable_recovery_authority.v1",
+      schema: "nexus.gateway.durable_recovery_authority.v2",
       revocation_state: "NOT_REVOKED",
       final_manager_sha256: NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256,
     }));
@@ -511,7 +511,7 @@ test("fixed Nexus bridge rejects a deployment with a substituted authority contr
     const desiredTree = await git(desiredRoot, "rev-parse", "HEAD^{tree}");
     const authorityPath = join(state, "recovery-authority.json");
     await writeFile(authorityPath, JSON.stringify({
-      schema: "nexus.gateway.durable_recovery_authority.v1",
+      schema: "nexus.gateway.durable_recovery_authority.v2",
       revocation_state: "NOT_REVOKED",
       final_manager_sha256: managerHash,
       request_id: request.request_id,
@@ -555,7 +555,7 @@ test("fixed Nexus bridge rejects a symlinked desired deployment root before impo
     await symlink(outside, join(deployments, request.desired_manifest_id));
     const authorityPath = join(state, "recovery-authority.json");
     await writeFile(authorityPath, JSON.stringify({
-      schema: "nexus.gateway.durable_recovery_authority.v1",
+      schema: "nexus.gateway.durable_recovery_authority.v2",
       revocation_state: "NOT_REVOKED",
       final_manager_sha256: managerHash,
       request_id: request.request_id,
