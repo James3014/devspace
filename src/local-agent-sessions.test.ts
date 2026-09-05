@@ -783,3 +783,193 @@ test("runWorkerTurnFromFile persists typed AgentProviderFailureError details", a
     clean();
   }
 });
+
+test("startAgent direct dispatch persists dispatch_mode/write_mode and binds direct generation", async () => {
+  const { manager, spawnedWorkers, clean } = setupFixture();
+  try {
+    const workspaceRoot = "/Users/jameschen/Workspace/nexus";
+    const directProfile: LocalAgentProfile = {
+      name: "agy",
+      description: "Direct-model dispatch (no profile file)",
+      provider: "agy",
+      model: "gemini-2.6-pro",
+      write_mode: "allowed",
+      filePath: "<direct-dispatch>",
+      body: "",
+      disabled: false,
+    };
+    const startResult = await manager.startAgent({
+      workspaceId: "ws_direct",
+      workspaceRoot,
+      profileName: "agy",
+      prompt: "direct dispatch prompt",
+      profiles: [directProfile],
+      dispatchMode: "direct_model",
+      writeMode: "allowed",
+    });
+    assert.equal(startResult.status, "starting");
+    assert.equal(startResult.profileName, "agy");
+    assert.equal(spawnedWorkers.length, 1);
+
+    const store = (manager as any).store;
+    const record = store.getById(startResult.agentId)!;
+    assert.equal(record.dispatchMode, "direct_model");
+    assert.equal(record.writeMode, "allowed");
+    assert.equal(record.model, "gemini-2.6-pro");
+    assert.equal(record.executionGeneration!.profileCatalogGeneration, "direct:agy");
+    assert.equal(record.executionGeneration!.provider, "agy");
+  } finally {
+    clean();
+  }
+});
+
+test("direct dispatch start is replayable with an identical attemptKey without spawning a second worker", async () => {
+  const { manager, spawnedWorkers, clean } = setupFixture();
+  try {
+    const workspaceRoot = "/Users/jameschen/Workspace/nexus";
+    const attemptKey = "direct-dispatch-replay-1";
+    const directProfile: LocalAgentProfile = {
+      name: "agy",
+      description: "Direct-model dispatch (no profile file)",
+      provider: "agy",
+      model: "gemini-2.6-pro",
+      write_mode: "allowed",
+      filePath: "<direct-dispatch>",
+      body: "",
+      disabled: false,
+    };
+    const first = await manager.startAgent({
+      workspaceId: "ws_direct_replay",
+      workspaceRoot,
+      profileName: "agy",
+      prompt: "dispatch once",
+      profiles: [directProfile],
+      attemptKey,
+      dispatchMode: "direct_model",
+      writeMode: "allowed",
+    });
+    const replay = await manager.startAgent({
+      workspaceId: "ws_direct_replay",
+      workspaceRoot,
+      profileName: "agy",
+      prompt: "dispatch once",
+      profiles: [directProfile],
+      attemptKey,
+      dispatchMode: "direct_model",
+      writeMode: "allowed",
+    });
+    assert.equal(replay.agentId, first.agentId);
+    assert.equal(spawnedWorkers.length, 1);
+  } finally {
+    clean();
+  }
+});
+
+test("runWorkerTurnFromFile routes direct_model records through the provider runner with persisted dispatch state", async () => {
+  const { stateDir, clean } = setupFixture();
+  try {
+    const config = {
+      stateDir,
+      subagents: true,
+      oauth: { scopes: ["devspace"] },
+    } as any;
+    const projectRoot = join(stateDir, "project-direct-worker");
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(projectRoot, { recursive: true });
+
+    const calls: Array<{ provider: string; input: any }> = [];
+    const manager = new LocalAgentSessionManager(
+      config,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      async (provider, input) => {
+        calls.push({ provider, input });
+        return { provider, providerSessionId: "direct-session-1", finalResponse: "direct ok", items: [] };
+      },
+    );
+
+    const store = (manager as any).store;
+    const record = store.create({
+      workspaceId: "ws_direct_worker",
+      workspaceRoot: projectRoot,
+      profileName: "agy",
+      provider: "agy",
+      model: "gemini-2.6-pro",
+      effort: "high",
+      dispatchMode: "direct_model",
+      writeMode: "read_only",
+      lifecycleKind: "detached_worker_v2",
+    });
+    const token = "worker-token-direct";
+    store.prepareWorker(record.id, token);
+    const promptFile = join(stateDir, `prompt-${record.id}.json`);
+    writeFileSync(promptFile, JSON.stringify({ prompt: "direct worker prompt" }));
+
+    await manager.runWorkerTurnFromFile(record.id, promptFile, token);
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].provider, "agy");
+    assert.equal(calls[0].input.model, "gemini-2.6-pro");
+    assert.equal(calls[0].input.effort, "high");
+    assert.equal(calls[0].input.writeMode, "read_only");
+    assert.equal(calls[0].input.workspaceRoot, projectRoot);
+    const updated = store.getById(record.id)!;
+    assert.equal(updated.status, "idle");
+    assert.equal(updated.latestResponse, "direct ok");
+  } finally {
+    clean();
+  }
+});
+
+test("runWorkerTurnFromFile fails closed when a direct_model record has no persisted write mode", async () => {
+  const { stateDir, clean } = setupFixture();
+  try {
+    const config = {
+      stateDir,
+      subagents: true,
+      oauth: { scopes: ["devspace"] },
+    } as any;
+    const projectRoot = join(stateDir, "project-direct-defect");
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(projectRoot, { recursive: true });
+
+    let called = false;
+    const manager = new LocalAgentSessionManager(
+      config,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      async () => {
+        called = true;
+        return { provider: "agy", providerSessionId: null, finalResponse: "", items: [] };
+      },
+    );
+
+    const store = (manager as any).store;
+    const record = store.create({
+      workspaceId: "ws_direct_defect",
+      workspaceRoot: projectRoot,
+      profileName: "agy",
+      provider: "agy",
+      model: "gemini-2.6-pro",
+      dispatchMode: "direct_model",
+      lifecycleKind: "detached_worker_v2",
+    });
+    const token = "worker-token-direct-defect";
+    store.prepareWorker(record.id, token);
+    const promptFile = join(stateDir, `prompt-${record.id}.json`);
+    writeFileSync(promptFile, JSON.stringify({ prompt: "defect prompt" }));
+
+    await manager.runWorkerTurnFromFile(record.id, promptFile, token);
+
+    assert.equal(called, false);
+    const updated = store.getById(record.id)!;
+    assert.equal(updated.status, "error");
+    assert.match(updated.error ?? "", /no persisted write mode/i);
+  } finally {
+    clean();
+  }
+});

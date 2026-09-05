@@ -22,6 +22,7 @@ import {
   deserializeExecutionContract,
   serializeExecutionContract,
 } from "./local-agent-contract.js";
+import type { WriteMode } from "./local-agent-profiles.js";
 import {
   deserializeExecutionGenerationBinding,
   serializeExecutionGenerationBinding,
@@ -29,6 +30,18 @@ import {
 } from "./execution-protocol.js";
 
 export type LocalAgentStatus = "starting" | "running" | "idle" | "error" | "stopped";
+
+/**
+ * How this durable agent session was dispatched:
+ * - "profile": an advertised on-disk agent profile (legacy behavior).
+ * - "direct_model": a provider + model pair supplied at start time without a
+ *   profile file (dynamic direct dispatch). Persisted so continuation and the
+ *   worker can rebind the exact provider/model without replaying profile
+ *   catalog state.
+ */
+export type LocalAgentDispatchMode = "profile" | "direct_model";
+
+export type { WriteMode } from "./local-agent-profiles.js";
 
 /**
  * Durable cross-turn scope lifecycle evidence persisted beside the baseline.
@@ -75,6 +88,8 @@ export interface LocalAgentRecord {
   provider: string;
   model?: string;
   effort?: string;
+  dispatchMode?: LocalAgentDispatchMode;
+  writeMode?: WriteMode;
   providerSessionId?: string;
   workerPid?: number;
   workerToken?: string;
@@ -102,6 +117,8 @@ export interface CreateLocalAgentRecordInput {
   provider: string;
   model?: string;
   effort?: string;
+  dispatchMode?: LocalAgentDispatchMode;
+  writeMode?: WriteMode;
   executionContract?: ExecutionContract;
   executionGeneration?: ExecutionGenerationBinding;
   startReplay?: StartReplayBinding;
@@ -202,6 +219,8 @@ interface LocalAgentRow {
   provider: string;
   model: string | null;
   effort: string | null;
+  dispatch_mode: string | null;
+  write_mode: string | null;
   provider_session_id: string | null;
   worker_pid: number | null;
   worker_token: string | null;
@@ -280,6 +299,8 @@ export class LocalAgentStore {
       provider: input.provider,
       model: input.model,
       effort: input.effort,
+      dispatchMode: input.dispatchMode,
+      writeMode: input.writeMode,
       executionContract: input.executionContract,
       executionGeneration: input.executionGeneration,
       startReplay: input.startReplay,
@@ -311,13 +332,15 @@ export class LocalAgentStore {
           provider,
           model,
           effort,
+          dispatch_mode,
+          write_mode,
           execution_contract,
           execution_generation,
           lifecycle_state,
           status,
           created_at,
           updated_at
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         record.id,
@@ -327,6 +350,8 @@ export class LocalAgentStore {
         record.provider,
         record.model ?? null,
         record.effort ?? null,
+        record.dispatchMode ?? null,
+        record.writeMode ?? null,
         serializeStoredExecutionState(record.executionContract, record.startReplay),
         serializeExecutionGenerationBinding(record.executionGeneration),
         record.lifecycleState ? JSON.stringify(record.lifecycleState) : null,
@@ -454,6 +479,8 @@ export class LocalAgentStore {
           provider = ?,
           model = ?,
           effort = ?,
+          dispatch_mode = ?,
+          write_mode = ?,
           provider_session_id = ?,
           worker_pid = ?,
           worker_token = ?,
@@ -479,6 +506,8 @@ export class LocalAgentStore {
         updated.provider,
         updated.model ?? null,
         updated.effort ?? null,
+        updated.dispatchMode ?? null,
+        updated.writeMode ?? null,
         updated.providerSessionId ?? null,
         updated.workerPid ?? null,
         updated.workerToken ?? null,
@@ -1314,6 +1343,8 @@ function rowToLocalAgentRecord(row: LocalAgentRow): LocalAgentRecord {
     provider: row.provider,
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
+    dispatchMode: readDispatchMode(row.dispatch_mode),
+    writeMode: readWriteMode(row.write_mode),
     providerSessionId: row.provider_session_id ?? undefined,
     workerPid: row.worker_pid ?? undefined,
     workerToken: row.worker_token ?? undefined,
@@ -1333,6 +1364,14 @@ function rowToLocalAgentRecord(row: LocalAgentRow): LocalAgentRecord {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function readDispatchMode(value: string | null): LocalAgentDispatchMode | undefined {
+  return value === "direct_model" || value === "profile" ? value : undefined;
+}
+
+function readWriteMode(value: string | null): WriteMode | undefined {
+  return value === "allowed" || value === "read_only" ? value : undefined;
 }
 
 function readErrorDetails(value: string | null): AgentProviderFailureDetails | undefined {

@@ -71,11 +71,25 @@ import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
-import { summarizeLocalAgentProfile, loadLocalAgentProfiles } from "./local-agent-profiles.js";
+import {
+  isLocalAgentProvider,
+  LOCAL_AGENT_PROVIDERS,
+  loadLocalAgentProfiles,
+  summarizeLocalAgentProfile,
+  type LocalAgentProfile,
+  type LocalAgentProvider,
+} from "./local-agent-profiles.js";
 import {
   loadProfileCatalog,
+  type ProfileCatalog,
   type ProfileCatalogEntry,
 } from "./local-agent-profile-source.js";
+import { isSubagentProviderEnabled } from "./local-agent-config.js";
+import {
+  getActiveOpencodeCatalogSnapshot,
+  getOpencodeCatalogGeneration,
+  validateOpencodeModelAndVariant,
+} from "./local-agent-opencode-catalog.js";
 import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build-identity.js";
 import { devspaceConfigDir } from "./user-config.js";
 import {
@@ -86,6 +100,7 @@ import {
   buildLocalAgentCatalog,
   buildLocalAgentProviderStatuses,
   formatLocalAgentProviderStatusSummary,
+  type LocalAgentCatalog,
   type LocalAgentProviderStatus,
 } from "./local-agent-catalog.js";
 import {
@@ -320,6 +335,138 @@ function formatAvailableAgentProvider(provider: {
     provider.note,
   ].filter(Boolean).join(", ");
   return `${provider.id}${details ? ` (${details})` : ""}`;
+}
+
+// ─── Dynamic direct-model dispatch helpers ───────────────────────────────────
+//
+// Direct dispatch lets a caller start an agent by provider + model (or provider
+// + configured model) without creating a profile file. The provider must be an
+// advertised, enabled, available local agent provider; the model is fail-closed
+// validated against the live OpenCode catalog for opencode. Persisted sessions
+// carry their own dispatch_mode/write_mode so continuation and the worker
+// rebind purely from durable dispatch state.
+const DIRECT_DISPATCH_FILE_PATH = "<direct-dispatch>";
+
+interface DirectDispatchRequest {
+  provider?: LocalAgentProvider;
+  model?: string;
+  effort?: string;
+  writeMode?: "read_only" | "allowed";
+}
+
+function isDirectDispatch(input: DirectDispatchRequest): boolean {
+  return input.provider !== undefined;
+}
+
+function directDispatchProfile(request: DirectDispatchRequest): LocalAgentProfile {
+  return {
+    name: request.provider!,
+    description: "Dynamic direct-model dispatch (no profile file)",
+    provider: request.provider!,
+    model: request.model,
+    effort: request.effort,
+    write_mode: request.writeMode,
+    filePath: DIRECT_DISPATCH_FILE_PATH,
+    body: "",
+    disabled: false,
+  };
+}
+
+function directCatalogGeneration(provider: string): string {
+  return provider === "opencode" ? getOpencodeCatalogGeneration() : `direct:${provider}`;
+}
+
+/**
+ * Fail-closed admission for direct dispatch. Returns the synthetic profile and
+ * the generation-overridden catalog clone, or throws a typed AgentSessionError.
+ * The live (or validated) profile catalog must not already advertise a profile
+ * with the provider's name, otherwise direct dispatch could silently shadow an
+ * owner-advertised profile.
+ */
+function resolveDirectDispatch(
+  config: ServerConfig,
+  profileCatalog: ProfileCatalog,
+  request: DirectDispatchRequest,
+): { profile: LocalAgentProfile; profileCatalog: ProfileCatalog; dispatch: "direct_model" } {
+  const provider = request.provider;
+  if (!provider) {
+    throw new AgentSessionError(
+      "UNKNOWN_PROFILE",
+      "Direct dispatch requires an explicit provider.",
+    );
+  }
+  if (!isLocalAgentProvider(provider)) {
+    throw new AgentSessionError(
+      "UNKNOWN_PROFILE",
+      `Unknown agent provider: ${provider}. Direct dispatch targets a configured local agent provider.`,
+    );
+  }
+  if (!config.subagents.enabled || subagentProviderEnabled(config, provider) !== true) {
+    throw new AgentSessionError(
+      "PROVIDER_DISABLED",
+      `Agent provider '${provider}' is disabled in subagent configuration; direct dispatch cannot bypass it.`,
+    );
+  }
+  if (!request.model) {
+    throw new AgentSessionError(
+      "EXACT_MODEL_UNAVAILABLE",
+      `Direct dispatch for provider '${provider}' requires an explicit model; refusing to infer one.`,
+    );
+  }
+  if (profileCatalog.profiles.some((candidate) => candidate.name === provider)) {
+    throw new AgentSessionError(
+      "PROFILE_AUTHORITY_CONFLICT",
+      `Agent profile '${provider}' is already advertised by the profile catalog; use that profile instead of direct provider dispatch.`,
+    );
+  }
+  const modelValidation = validateOpencodeModelAndVariant(request.model, request.effort);
+  if (provider === "opencode" && !modelValidation.valid) {
+    throw new AgentSessionError(
+      modelValidation.blockerCode ?? "EXACT_MODEL_UNAVAILABLE",
+      modelValidation.reason ?? "OpenCode model rejected by live catalog.",
+    );
+  }
+  return {
+    profile: directDispatchProfile(request),
+    profileCatalog: { ...profileCatalog, generation: directCatalogGeneration(provider) },
+    dispatch: "direct_model",
+  };
+}
+
+function subagentProviderEnabled(config: ServerConfig, provider: LocalAgentProvider): boolean {
+  return isSubagentProviderEnabled(config.subagents, provider);
+}
+
+/** Compact modelDispatch surface for open_workspace. */
+function buildModelDispatchOutput(
+  config: ServerConfig,
+  agentCatalog: LocalAgentCatalog,
+): {
+  enabled: boolean;
+  providers: string[];
+  opencode?: {
+    catalogSource: string;
+    catalogGeneration: string;
+    catalogVersion: string;
+    models: string[];
+  };
+} {
+  const opencodeSnapshot = getActiveOpencodeCatalogSnapshot();
+  return {
+    enabled: config.subagents.enabled,
+    providers: agentCatalog.providers
+      .filter((provider) => provider.usable && subagentProviderEnabled(config, provider.id))
+      .map((provider) => provider.id),
+    opencode: {
+      catalogSource: opencodeSnapshot.source,
+      catalogGeneration: opencodeSnapshot.generation,
+      catalogVersion: opencodeSnapshot.version,
+      models: opencodeSnapshot.entries
+        .filter((entry) => entry.providerId === "opencode" && entry.status === "active")
+        .map((entry) => entry.fullName)
+        .sort(),
+    },
+  };
 }
 
 function resultOutputSchema(extra: z.ZodRawShape = {}): z.ZodRawShape {
@@ -1375,6 +1522,20 @@ export function createMcpServer(
         agentProviders: z.array(workspaceLocalAgentProviderOutputSchema).optional(),
         agents: z.array(workspaceLocalAgentOutputSchema).optional(),
         agentProfileStatuses: z.array(workspaceProfileStatusOutputSchema).optional(),
+        modelDispatch: z
+          .object({
+            enabled: z.boolean(),
+            providers: z.array(z.string()),
+            opencode: z
+              .object({
+                catalogSource: z.string(),
+                catalogGeneration: z.string(),
+                catalogVersion: z.string().optional(),
+                models: z.array(z.string()),
+              })
+              .optional(),
+          })
+          .optional(),
         devspaceBuild: devspaceBuildOutputSchema,
         skillDiagnostics: z.array(z.unknown()).optional(),
         instruction: z.string(),
@@ -1440,6 +1601,7 @@ export function createMcpServer(
         sourceCommit: runtimeBuildIdentity.sourceCommit,
         profileCatalogGeneration: workspace.profileCatalogGeneration ?? "unresolved",
       };
+      const cardModelDispatch = buildModelDispatchOutput(config, agentCatalog);
       latestProfileCatalogGeneration.value = devspaceBuildReceipt.profileCatalogGeneration;
       const cardAgentsFiles = agentsFiles.map((file) => ({
         path: formatAgentsPath(file.path, workspace.root),
@@ -1541,6 +1703,7 @@ export function createMcpServer(
           sourceRoot: workspace.sourceRoot,
           worktree: workspace.worktree,
           agentProfileStatuses: cardProfileStatuses,
+          modelDispatch: cardModelDispatch,
           devspaceBuild: devspaceBuildReceipt,
           ...(includeBootstrapContext
             ? {
@@ -2612,60 +2775,105 @@ export function createMcpServer(
       {
         title: "Start agent",
         description:
-          "Start a bounded background subagent using an advertised agent profile in an already-open workspace. Returns immediately with a durable agent ID. Use agent_status to retrieve progress/result.",
-        inputSchema: {
-          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
-          profile: z.string().describe("Name of an advertised agent profile to run."),
-          prompt: z.string().describe("Task prompt for the agent."),
-          attemptKey: z
-            .string()
-            .regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
-            .optional()
-            .describe("Optional physical-workspace-scoped replay identity. Exact request replays reuse one durable agent; conflicting reuse fails closed."),
-          executionContract: z
-            .object({
-              dispatchIntent: AGENT_DISPATCH_INTENT_INPUT_SCHEMA.describe(
-                "Controller-authored bounded task semantics. Dev MCP transports and mechanically enforces applicable scope/ownership constraints but does not gain planner, verifier, acceptance, merge, or release authority.",
+          "Start a bounded background subagent using an advertised agent profile, OR direct provider/model dispatch, in an already-open workspace. Returns immediately with a durable agent ID. Use agent_status to retrieve progress/result.",
+        inputSchema: z
+          .object({
+            workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+            profile: z.string().optional().describe(
+              "Name of an advertised agent profile to run. Mutually exclusive with direct provider/model dispatch.",
+            ),
+            provider: z
+              .enum(LOCAL_AGENT_PROVIDERS as unknown as [LocalAgentProvider, ...LocalAgentProvider[]])
+              .optional()
+              .describe(
+                "Direct dispatch: explicit local agent provider to run (e.g. opencode), bypassing profile files. Mutually exclusive with profile.",
               ),
-              expectedHead: z
-                .string()
-                .describe("40-character commit SHA. If supplied, agent_start fails closed when workspace HEAD no longer matches."),
-              writePaths: z
-                .array(z.string())
-                .describe("Exact intended writable paths relative to the workspace root. Observed and aborted on violation; not a hard sandbox."),
-              maxFiles: z
-                .number()
-                .int()
-                .min(1)
-                .describe("Maximum number of files the worker may change."),
-              toolchainId: z
-                .string()
-                .describe("Toolchain id used to resolve verifier executables. Must already be configured; Dev MCP does not install toolchains."),
-              maxWallMs: z
-                .number()
-                .int()
-                .min(1)
-                .describe("Optional wall-clock bound for the whole agent turn."),
-              maxStartupMs: z
-                .number()
-                .int()
-                .min(1)
-                .describe("Optional wall-clock bound for the startup/readiness phase (turn start -> execution started)."),
-              maxExecutionMs: z
-                .number()
-                .int()
-                .min(1)
-                .describe("Optional wall-clock bound for semantic provider execution (execution started -> terminal)."),
-              idleTimeoutMs: z
-                .number()
-                .int()
-                .min(1)
-                .describe("Recorded and surfaced; not auto-enforced (no mid-run activity signal)."),
-            })
-            .partial()
-            .optional()
-            .describe("Optional structured execution contract. Records and enforces where/how the worker may run."),
-        },
+            model: z.string().min(1).optional().describe(
+              "Direct dispatch: exact model id (e.g. opencode/muse-spark-1.3-contributor-free). Required for direct dispatch.",
+            ),
+            effort: z.string().min(1).optional().describe(
+              "Direct dispatch: optional effort/variant used for catalog validation (e.g. high).",
+            ),
+            writeMode: z.enum(["read_only", "allowed"]).optional().describe(
+              "Direct dispatch: worker write scope. Persisted with the session; worker honors it without catalog revalidation.",
+            ),
+            prompt: z.string().describe("Task prompt for the agent."),
+            attemptKey: z
+              .string()
+              .regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
+              .optional()
+              .describe("Optional physical-workspace-scoped replay identity. Exact request replays reuse one durable agent; conflicting reuse fails closed."),
+            executionContract: z
+              .object({
+                dispatchIntent: AGENT_DISPATCH_INTENT_INPUT_SCHEMA.describe(
+                  "Controller-authored bounded task semantics. Dev MCP transports and mechanically enforces applicable scope/ownership constraints but does not gain planner, verifier, acceptance, merge, or release authority.",
+                ),
+                expectedHead: z
+                  .string()
+                  .describe("40-character commit SHA. If supplied, agent_start fails closed when workspace HEAD no longer matches."),
+                writePaths: z
+                  .array(z.string())
+                  .describe("Exact intended writable paths relative to the workspace root. Observed and aborted on violation; not a hard sandbox."),
+                maxFiles: z
+                  .number()
+                  .int()
+                  .min(1)
+                  .describe("Maximum number of files the worker may change."),
+                toolchainId: z
+                  .string()
+                  .describe("Toolchain id used to resolve verifier executables. Must already be configured; Dev MCP does not install toolchains."),
+                maxWallMs: z
+                  .number()
+                  .int()
+                  .min(1)
+                  .describe("Optional wall-clock bound for the whole agent turn."),
+                maxStartupMs: z
+                  .number()
+                  .int()
+                  .min(1)
+                  .describe("Optional wall-clock bound for the startup/readiness phase (turn start -> execution started)."),
+                maxExecutionMs: z
+                  .number()
+                  .int()
+                  .min(1)
+                  .describe("Optional wall-clock bound for semantic provider execution (execution started -> terminal)."),
+                idleTimeoutMs: z
+                  .number()
+                  .int()
+                  .min(1)
+                  .describe("Recorded and surfaced; not auto-enforced (no mid-run activity signal)."),
+              })
+              .partial()
+              .optional()
+              .describe("Optional structured execution contract. Records and enforces where/how the worker may run."),
+          })
+          .superRefine((value, context) => {
+            const hasProfile = value.profile !== undefined;
+            const hasDirect = value.provider !== undefined;
+            const hasDirectFields =
+              hasDirect || value.model !== undefined || value.effort !== undefined || value.writeMode !== undefined;
+            if (hasProfile && hasDirectFields) {
+              context.addIssue({
+                code: "custom",
+                path: ["profile"],
+                message: "Provide either an advertised profile or direct provider/model dispatch, not both.",
+              });
+            }
+            if (!hasProfile && !hasDirect) {
+              context.addIssue({
+                code: "custom",
+                path: ["provider"],
+                message: "Either 'profile' or direct dispatch via 'provider' + 'model' is required.",
+              });
+            }
+            if (hasDirect && (value.model === undefined || value.model === "")) {
+              context.addIssue({
+                code: "custom",
+                path: ["model"],
+                message: "Direct dispatch requires an explicit, non-empty 'model'.",
+              });
+            }
+          }),
         outputSchema: {
           agentId: z.string(),
           dispatch: AGENT_DISPATCH_OUTPUT_SCHEMA.optional(),
@@ -2673,6 +2881,8 @@ export function createMcpServer(
           profileName: z.string(),
           provider: z.string(),
           model: z.string().optional(),
+          dispatchMode: z.enum(["profile", "direct_model"]).optional(),
+          writeMode: z.enum(["read_only", "allowed"]).optional(),
           thinking: z.string().optional(),
           workspaceId: z.string().optional(),
           workspaceRoot: z.string(),
@@ -2682,10 +2892,9 @@ export function createMcpServer(
         _meta: {},
         annotations: AGENT_TOOL_ANNOTATIONS_WRITE,
       },
-      async ({ workspaceId, profile, prompt, attemptKey, executionContract }) => {
+      async ({ workspaceId, profile, provider, model, effort, writeMode, prompt, attemptKey, executionContract }) => {
         const workspace = workspaces.getWorkspace(workspaceId);
         const profileCatalog = await loadProfileCatalog(config, workspace.root);
-        const profiles = profileCatalog.profiles;
         let contract;
         try {
           contract = parseExecutionContract(executionContract);
@@ -2695,15 +2904,38 @@ export function createMcpServer(
             error instanceof Error ? error.message : String(error),
           );
         }
+
+        // Direct dispatch: validate fail-closed at admission and bind a
+        // generation-overridden catalog clone so the worker's binding does not
+        // silently reference the profile catalog (which has no entry for it).
+        let dispatchMode: "profile" | "direct_model" | undefined;
+        let directWriteMode: "read_only" | "allowed" | undefined;
+        let effectiveCatalog = profileCatalog;
+        let dispatchProfiles = profileCatalog.profiles;
+        if (isDirectDispatch({ provider, model, effort, writeMode })) {
+          const resolved = resolveDirectDispatch(config, profileCatalog, {
+            provider,
+            model,
+            effort,
+            writeMode,
+          });
+          effectiveCatalog = resolved.profileCatalog;
+          dispatchProfiles = [...profileCatalog.profiles, resolved.profile];
+          dispatchMode = resolved.dispatch;
+          directWriteMode = writeMode;
+        }
+
         const output = await agentSessionManager.startAgent({
           workspaceId,
           workspaceRoot: workspace.root,
-          profileName: profile,
+          profileName: profile ?? provider!,
           prompt,
-          profiles,
-          profileCatalog,
+          profiles: dispatchProfiles,
+          profileCatalog: effectiveCatalog,
           attemptKey,
           executionContract: contract,
+          dispatchMode,
+          writeMode: directWriteMode,
         });
         logToolCall(config, {
           tool: "agent_start",
@@ -2713,7 +2945,11 @@ export function createMcpServer(
         });
         return {
           content: [textBlock(`Started agent ${output.agentId} (${output.profileName}). Use agent_status to check progress.`)],
-          structuredContent: output as unknown as Record<string, unknown>,
+          structuredContent: {
+            ...output,
+            ...(dispatchMode ? { dispatchMode } : {}),
+            ...(directWriteMode ? { writeMode: directWriteMode } : {}),
+          } as unknown as Record<string, unknown>,
         };
       },
     );
@@ -2952,12 +3188,53 @@ export function createMcpServer(
       {
         title: "Agent preflight",
         description:
-          "Read-only readiness evidence for an exact workspace + agent profile before dispatch. Provider 'configured' is not the same as dispatch-ready; unknown evidence stays unknown. Never exposes credentials and grants no routing/admission authority.",
-        inputSchema: {
-          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
-          profile: z.string().describe("Name of an advertised agent profile to check."),
-          toolchainId: z.string().optional().describe("Optional toolchain id to check availability for."),
-        },
+          "Read-only readiness evidence for an exact workspace + agent profile, or direct provider/model dispatch, before dispatch. Provider 'configured' is not the same as dispatch-ready; unknown evidence stays unknown. Never exposes credentials and grants no routing/admission authority.",
+        inputSchema: z
+          .object({
+            workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+            profile: z.string().optional().describe(
+              "Name of an advertised agent profile to check. Mutually exclusive with direct provider/model dispatch.",
+            ),
+            provider: z
+              .enum(LOCAL_AGENT_PROVIDERS as unknown as [LocalAgentProvider, ...LocalAgentProvider[]])
+              .optional()
+              .describe(
+                "Direct dispatch: explicit local agent provider to check (e.g. opencode). Mutually exclusive with profile.",
+              ),
+            model: z.string().min(1).optional().describe(
+              "Direct dispatch: exact model id to validate against the live catalog for opencode.",
+            ),
+            effort: z.string().min(1).optional().describe(
+              "Direct dispatch: optional effort/variant used for catalog validation.",
+            ),
+            toolchainId: z.string().optional().describe("Optional toolchain id to check availability for."),
+          })
+          .superRefine((value, context) => {
+            const hasProfile = value.profile !== undefined;
+            const hasDirect = value.provider !== undefined;
+            const hasDirectFields = hasDirect || value.model !== undefined || value.effort !== undefined;
+            if (hasProfile && hasDirectFields) {
+              context.addIssue({
+                code: "custom",
+                path: ["profile"],
+                message: "Provide either an advertised profile or direct provider/model dispatch, not both.",
+              });
+            }
+            if (!hasProfile && !hasDirect) {
+              context.addIssue({
+                code: "custom",
+                path: ["provider"],
+                message: "Either 'profile' or direct dispatch via 'provider' + 'model' is required.",
+              });
+            }
+            if (hasDirect && (value.model === undefined || value.model === "")) {
+              context.addIssue({
+                code: "custom",
+                path: ["model"],
+                message: "Direct dispatch requires an explicit, non-empty 'model'.",
+              });
+            }
+          }),
         outputSchema: {
           workspace: z.object({
             workspaceId: z.string(),
@@ -2994,30 +3271,55 @@ export function createMcpServer(
         _meta: {},
         annotations: { readOnlyHint: true },
       },
-      async ({ workspaceId, profile, toolchainId }) => {
+      async ({ workspaceId, profile, provider, model, effort, toolchainId }) => {
         const workspace = workspaces.getWorkspace(workspaceId);
         const profileCatalog = await loadProfileCatalog(config, workspace.root);
-        const profiles = profileCatalog.profiles;
+        let dispatchMode: "profile" | "direct_model" | undefined;
+        let effectiveCatalog = profileCatalog;
+        let dispatchProfiles = profileCatalog.profiles;
+        let directBlockers: Array<{ code: string; detail: string }> = [];
+        if (isDirectDispatch({ provider, model, effort })) {
+          try {
+            const resolved = resolveDirectDispatch(config, profileCatalog, { provider, model, effort });
+            effectiveCatalog = resolved.profileCatalog;
+            dispatchProfiles = [...profileCatalog.profiles, resolved.profile];
+            dispatchMode = resolved.dispatch;
+          } catch (error) {
+            directBlockers = [
+              {
+                code: error instanceof AgentSessionError ? error.code : "UNKNOWN_PROFILE",
+                detail: error instanceof Error ? error.message : String(error),
+              },
+            ];
+          }
+        }
         const output = await agentSessionManager.preflightAgent({
           workspaceId,
           workspaceRoot: workspace.root,
           isolated: workspace.mode === "worktree",
-          profileName: profile,
-          profiles,
-          profileCatalog,
+          profileName: profile ?? provider ?? "",
+          profiles: dispatchProfiles,
+          profileCatalog: effectiveCatalog,
           toolchainId,
+          dispatchMode,
         });
         const blockerSummary =
-          output.blockers.length > 0
-            ? ` Blockers: ${output.blockers.map((blocker) => blocker.code).join(", ")}`
-            : "";
+          directBlockers.length > 0
+            ? ` Blockers: ${directBlockers.map((blocker) => blocker.code).join(", ")}`
+            : output.blockers.length > 0
+              ? ` Blockers: ${output.blockers.map((blocker) => blocker.code).join(", ")}`
+              : "";
+        const merged = {
+          ...output,
+          blockers: [...directBlockers, ...output.blockers],
+        };
         return {
           content: [
             textBlock(
-              `Preflight for ${profile}: dispatchState=${output.readiness.dispatchState}.${blockerSummary}`,
+              `Preflight for ${profile ?? provider}: dispatchState=${merged.readiness.dispatchState}.${blockerSummary}`,
             ),
           ],
-          structuredContent: output as unknown as Record<string, unknown>,
+          structuredContent: merged as unknown as Record<string, unknown>,
         };
       },
     );

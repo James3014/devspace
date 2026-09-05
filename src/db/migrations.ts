@@ -67,6 +67,11 @@ const migrations: Migration[] = [
     name: "durable-operations",
     up: migrateDurableOperations,
   },
+  {
+    version: 13,
+    name: "local-agent-direct-dispatch",
+    up: migrateLocalAgentDirectDispatch,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -315,6 +320,11 @@ function migrateLocalAgentEffortRename(sqlite: Database.Database): void {
     return;
   }
   sqlite.exec("alter table local_agent_sessions rename column thinking to effort");
+}
+
+function migrateLocalAgentDirectDispatch(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "local_agent_sessions", "dispatch_mode", "text");
+  addColumnIfMissing(sqlite, "local_agent_sessions", "write_mode", "text");
 }
 
 function addColumnIfMissing(

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   computeOpencodeCatalogGeneration,
+  fallbackOpencodeCatalogSnapshot,
   getActiveOpencodeCatalogSnapshot,
   parseOpencodeCliModels,
   refreshOpencodeCatalog,
@@ -85,5 +86,24 @@ assert.equal(parsed[2].modelId, "deepseek-v4-flash");
 const gen1 = computeOpencodeCatalogGeneration(mockEntries, 1);
 const gen2 = computeOpencodeCatalogGeneration(mockEntries, 2);
 assert.notEqual(gen1, gen2);
+
+// Test 4: Shared fallback snapshot includes the contributor-free baseline and
+// accepts it for direct dispatch validation (muse-spark-1.3 was missing from
+// the previous fallback; the shared builder mirrors the sync AND async paths).
+const fallback = fallbackOpencodeCatalogSnapshot();
+assert.equal(fallback.source, "fallback");
+assert.equal(fallback.version, "unknown");
+assert.ok(
+  fallback.entries.some((entry) => entry.fullName === "opencode/muse-spark-1.3-contributor-free"),
+  "fallback must include opencode/muse-spark-1.3-contributor-free",
+);
+assert.ok(
+  fallback.entries.some((entry) => entry.fullName === "opencode/big-pickle"),
+  "fallback must include opencode/big-pickle",
+);
+assert.deepEqual(
+  validateOpencodeModelAndVariant("opencode/muse-spark-1.3-contributor-free", "high", fallback),
+  { valid: true },
+);
 
 console.log("local-agent-opencode-catalog tests passed!");
