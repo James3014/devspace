@@ -28,6 +28,27 @@ try {
   assert.equal(store.getById(created.id)?.profileName, "reviewer");
   assert.equal(store.getById(created.id.slice(0, 7)), undefined);
 
+  const direct = store.create({
+    workspaceId: "ws_direct",
+    workspaceRoot: join(root, "project-direct"),
+    profileName: "opencode",
+    provider: "opencode",
+    model: "opencode/muse-spark-1.3-contributor-free",
+    effort: "high",
+    dispatchMode: "direct_model",
+    writeMode: "read_only",
+  });
+  assert.equal(direct.dispatchMode, "direct_model");
+  assert.equal(direct.writeMode, "read_only");
+  const directRow = store.getById(direct.id);
+  assert.equal(directRow?.dispatchMode, "direct_model");
+  assert.equal(directRow?.writeMode, "read_only");
+  const directLegacyWrite = store.update(direct.id, { writeMode: "allowed" });
+  assert.equal(directLegacyWrite.writeMode, "allowed");
+  const directReload = store.getById(direct.id);
+  assert.equal(directReload?.writeMode, "allowed");
+  assert.equal(directReload?.dispatchMode, "direct_model");
+
   const updated = store.update(created.id, {
     status: "error",
     latestResponse: "done",

@@ -11,10 +11,12 @@ import {
   isDetachedLifecycle,
   LocalAgentReplayConflictError,
   LocalAgentStore,
+  type LocalAgentDispatchMode,
   type LocalAgentRecord,
   type LocalAgentStatus,
+  type WriteMode,
 } from "./local-agent-store.js";
-import { loadLocalAgentProfiles, type LocalAgentProfile } from "./local-agent-profiles.js";
+import { loadLocalAgentProfiles, type LocalAgentProfile, type LocalAgentProvider } from "./local-agent-profiles.js";
 import {
   checkLocalAgentProviderAvailability,
   getLocalAgentProviderRuntimeVersion,
@@ -22,7 +24,7 @@ import {
 } from "./local-agent-availability.js";
 import { runLocalAgentProvider } from "./local-agent-adapters.js";
 import { resolveEffectiveExecutionIdlePolicy } from "./local-agent-idle-policy.js";
-import { LocalAgentProviderError, type LocalAgentRunCallbacks, type LocalAgentRunResult } from "./local-agent-runtime.js";
+import { LocalAgentProviderError, type LocalAgentRunCallbacks, type LocalAgentRunInput, type LocalAgentRunResult } from "./local-agent-runtime.js";
 import { terminateProcessTree, type KillableProcess } from "./process-platform.js";
 import {
   type AgentTerminalReason,
@@ -46,10 +48,10 @@ import {
   isAgentProviderError,
   type AgentProviderFailureDetails,
 } from "./local-agent-errors.js";
-import { validateOpencodeModelAndVariant } from "./local-agent-opencode-catalog.js";
+import { getOpencodeCatalogGeneration, validateOpencodeModelAndVariant } from "./local-agent-opencode-catalog.js";
 import { canonicalizePath, isPathInsideRoot } from "./roots.js";
 import {
-  assertNexusGrantAuthorizesExecution,
+assertNexusGrantAuthorizesExecution,
   assertSameExecutionGeneration,
   buildExecutionGenerationBinding,
   hashDispatchIntent,
@@ -161,6 +163,8 @@ export interface StartAgentInput {
   profileCatalog?: ProfileCatalog;
   executionContract?: ExecutionContract;
   attemptKey?: string;
+  dispatchMode?: LocalAgentDispatchMode;
+  writeMode?: WriteMode;
 }
 
 export interface ContinueAgentInput {
@@ -300,6 +304,8 @@ export interface AgentPreflightInput {
   profiles: LocalAgentProfile[];
   profileCatalog?: ProfileCatalog;
   toolchainId?: string;
+  dispatchMode?: LocalAgentDispatchMode;
+  writeMode?: WriteMode;
 }
 
 export interface AgentPreflightOutput {
@@ -440,6 +446,17 @@ export type AgentTurnRunner = (
 
 export type NexusGrantResolver = (ref: NexusExecutionGrantRef) => Promise<NexusExecutionGrant>;
 
+/**
+ * Direct-dispatch provider runner. Mirrors the exported `runLocalAgentProvider`
+ * adapter signature so worker direct-dispatch turns stay unit-testable without
+ * spawning a real provider runtime.
+ */
+export type LocalAgentProviderRunner = (
+  provider: LocalAgentProvider,
+  input: LocalAgentRunInput,
+  callbacks?: LocalAgentRunCallbacks,
+) => Promise<LocalAgentRunResult>;
+
 // ─── Owned temp cleanup ──────────────────────────────────────────────────────
 
 /**
@@ -478,6 +495,7 @@ export class LocalAgentSessionManager {
   private readonly launcher: WorkerLauncher;
   private readonly terminator: WorkerTerminator;
   private readonly turnRunner?: AgentTurnRunner;
+  private readonly providerRunner?: LocalAgentProviderRunner;
   private readonly runtimeBuildIdentity: RuntimeBuildIdentity;
   private readonly nexusGrantResolver: NexusGrantResolver;
   private closed = false;
@@ -489,13 +507,15 @@ export class LocalAgentSessionManager {
     testTerminator?: WorkerTerminator,
     testTurnRunner?: AgentTurnRunner,
     runtimeBuildIdentity?: RuntimeBuildIdentity,
-    nexusGrantResolver?: NexusGrantResolver,
+nexusGrantResolver?: NexusGrantResolver,
+    testProviderRunner?: LocalAgentProviderRunner,
   ) {
     this.store = createLocalAgentStore(config.stateDir);
     this.launcher = testLauncher ?? defaultWorkerLauncher;
     this.terminator = testTerminator ?? terminateOwnedWorker;
     this.turnRunner = testTurnRunner;
     this.nexusGrantResolver = nexusGrantResolver ?? resolveCanonicalNexusExecutionGrant;
+    this.providerRunner = testProviderRunner;
     this.runtimeBuildIdentity = runtimeBuildIdentity ?? describeRuntimeBuildIdentity({
       env: process.env,
       listenPort: config.port,
@@ -519,6 +539,8 @@ export class LocalAgentSessionManager {
    */
   async startAgent(input: StartAgentInput): Promise<StartAgentOutput> {
     const { workspaceId, workspaceRoot, profileName, prompt, profiles, executionContract, attemptKey } = input;
+    const dispatchMode = input.dispatchMode ?? "profile";
+    const writeMode = input.writeMode;
 
     assertDispatchContractCoherence(executionContract);
 
@@ -544,6 +566,7 @@ export class LocalAgentSessionManager {
           profile,
           prompt,
           executionContract,
+          dispatchMode,
         });
     if (executionContract?.dispatchIntent && !attemptKey) {
       throw new AgentSessionError(
@@ -664,6 +687,7 @@ export class LocalAgentSessionManager {
       profile,
       input.profileCatalog?.generation ?? "unresolved",
       providerEnvironment,
+      dispatchMode,
     );
 
     let record: LocalAgentRecord;
@@ -677,6 +701,8 @@ export class LocalAgentSessionManager {
           provider: profile.provider,
           model: profile.model,
           effort: profile.effort,
+          dispatchMode,
+          writeMode,
           executionContract,
           executionIdlePolicy,
           executionGeneration,
@@ -693,6 +719,8 @@ export class LocalAgentSessionManager {
           provider: profile.provider,
           model: profile.model,
           effort: profile.effort,
+          dispatchMode,
+          writeMode,
           executionContract,
           executionIdlePolicy,
           executionGeneration,
@@ -802,16 +830,30 @@ export class LocalAgentSessionManager {
     // ── Continuation admission gates (all read-only; run before mutation) ──
     const admissionFailures: string[] = [];
 
-    const currentProfile = input.profiles?.find((candidate) => candidate.name === record.profileName) ?? {
-      name: record.profileName,
-      description: "Persisted durable-agent profile binding",
-      provider: record.provider as LocalAgentProfile["provider"],
-      model: record.model,
-      effort: record.effort,
-      filePath: "<persisted>",
-      body: "",
-      disabled: false,
-    };
+// Direct-model sessions never rebind against the profile catalog: their
+    // provider/model are durable-dispatch state, so an on-disk profile that
+    // happens to share the provider name must not influence continuation.
+    const currentProfile: LocalAgentProfile = record.dispatchMode === "direct_model"
+      ? {
+          name: record.profileName,
+          description: "Persisted direct-model dispatch binding",
+          provider: record.provider as LocalAgentProfile["provider"],
+          model: record.model,
+          effort: record.effort,
+          filePath: "<direct-dispatch>",
+          body: "",
+          disabled: false,
+        }
+      : (input.profiles?.find((candidate) => candidate.name === record.profileName) ?? {
+          name: record.profileName,
+          description: "Persisted durable-agent profile binding",
+          provider: record.provider as LocalAgentProfile["provider"],
+          model: record.model,
+          effort: record.effort,
+          filePath: "<persisted>",
+          body: "",
+          disabled: false,
+        });
     assertSelectionMatchesResolvedProfile(record.executionContract?.selection, currentProfile);
 
     let executionIdlePolicy: EffectiveExecutionIdlePolicy;
@@ -828,12 +870,12 @@ export class LocalAgentSessionManager {
         error instanceof Error ? error.message : String(error),
       );
     }
-
     try {
       const currentGeneration = this.resolveExecutionGeneration(
         currentProfile,
         input.profileCatalog?.generation ?? "unresolved",
         process.env,
+        record.dispatchMode,
       );
       assertSameExecutionGeneration(record.executionGeneration, currentGeneration);
     } catch (error) {
@@ -1473,6 +1515,7 @@ export class LocalAgentSessionManager {
     profile: LocalAgentProfile,
     profileCatalogGeneration: string,
     environment: NodeJS.ProcessEnv,
+    dispatchMode?: LocalAgentDispatchMode,
   ): ExecutionGenerationBinding {
     const availability = checkLocalAgentProviderAvailability(profile.provider, environment);
     if (!availability.available) {
@@ -1495,8 +1538,19 @@ export class LocalAgentSessionManager {
       ?? profile.provider;
     const runtimeVersion = codexRuntime?.binaryVersion
       ?? getLocalAgentProviderRuntimeVersion(profile.provider, environment);
+
+    // Direct-model dispatch has no profile catalog entry, so a grounded
+    // "catalog generation" is synthesized instead: the live OpenCode catalog
+    // generation (model validity is bound to it) or a stable per-provider
+    // direct binding id. Continuation rebinds reproduce the exact same value.
+    const effectiveCatalogGeneration = dispatchMode === "direct_model"
+      ? profile.provider === "opencode"
+        ? getOpencodeCatalogGeneration()
+        : `direct:${profile.provider}`
+      : profileCatalogGeneration;
+
     return buildExecutionGenerationBinding({
-      profileCatalogGeneration,
+      profileCatalogGeneration: effectiveCatalogGeneration,
       provider: profile.provider,
       model: profile.model,
       executionIdentity: executable,
@@ -1747,7 +1801,12 @@ export class LocalAgentSessionManager {
       }
 
       const profiles = await loadLocalAgentProfiles(this.config, claimed.workspaceRoot);
-      const profile = profiles.find((p) => p.name === claimed.profileName);
+      // Direct-model sessions rebind purely from persisted dispatch state; the
+      // on-disk profile with the provider's name (if any) is never shadowed or
+      // consulted at the worker turn.
+      const profile = claimed.dispatchMode === "direct_model"
+        ? undefined
+        : profiles.find((p) => p.name === claimed.profileName);
       const callbacks: LocalAgentRunCallbacks = {
         onActivity: () => {
           this.store.touchActivityCAS(claimed.id, generation, workerToken);
@@ -1770,6 +1829,15 @@ export class LocalAgentSessionManager {
       let result: LocalAgentRunResult;
       if (this.turnRunner) {
         result = await this.turnRunner(profile, claimed, prompt, callbacks);
+      } else if (claimed.dispatchMode === "direct_model") {
+        result = await runDirectModelDispatch(
+          this.config,
+          claimed,
+          prompt,
+          scratch,
+          callbacks,
+          this.providerRunner,
+        );
       } else if (profile) {
         result = await runLocalAgentProfile(this.config, profile, claimed, prompt, scratch, callbacks);
       } else {
@@ -2027,6 +2095,7 @@ function buildStartReplayBinding(
     profile: LocalAgentProfile;
     prompt: string;
     executionContract?: ExecutionContract;
+    dispatchMode?: LocalAgentDispatchMode;
   },
 ): { key: string; requestHash: string } {
   if (!/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(attemptKey)) {
@@ -2045,6 +2114,7 @@ function buildStartReplayBinding(
     profileBody: input.profile.body,
     prompt: input.prompt,
     executionContract: input.executionContract ?? null,
+    dispatchMode: input.dispatchMode ?? "profile",
   });
   return {
     key: attemptKey,
@@ -2277,6 +2347,49 @@ async function runRawLocalAgentProvider(
     },
     callbacks,
   );
+}
+
+/**
+ * Worker-side direct-model dispatch. Rebuilds the provider run input from the
+ * persisted durable dispatch state (never from profile files): provider must be
+ * a known local agent provider, and the persisted model binding must exist.
+ * The write mode is persisted dispatch state, so an absent value is a
+ * serialization defect and fails closed instead of defaulting to a scope.
+ */
+async function runDirectModelDispatch(
+  config: ServerConfig,
+  record: LocalAgentRecord,
+  prompt?: string,
+  scratch?: ScratchHandle,
+  callbacks?: LocalAgentRunCallbacks,
+  providerRunner?: LocalAgentProviderRunner,
+): Promise<LocalAgentRunResult> {
+  const { isLocalAgentProvider } = await import("./local-agent-profiles.js");
+  if (!isLocalAgentProvider(record.provider)) {
+    throw new Error(`Unknown direct-dispatch provider: ${record.provider}`);
+  }
+  if (!record.model) {
+    throw new Error(
+      `Direct-dispatch session ${record.id} has no persisted model binding; refusing to run an unbounded provider turn.`,
+    );
+  }
+  if (!record.writeMode) {
+    throw new Error(
+      `Direct-dispatch session ${record.id} has no persisted write mode; serialization defect, failing closed.`,
+    );
+  }
+  const environment = providerEnvironment(config, record, scratch);
+  const input: LocalAgentRunInput = {
+    prompt: prompt ?? "",
+    workspaceRoot: record.workspaceRoot,
+    providerSessionId: record.providerSessionId,
+    writeMode: record.writeMode,
+    model: record.model,
+    effort: record.effort,
+    environment,
+  };
+  const run = providerRunner ?? runLocalAgentProvider;
+  return run(record.provider, input, callbacks);
 }
 
 /**

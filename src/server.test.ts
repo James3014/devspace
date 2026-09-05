@@ -746,10 +746,14 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   const workspaceId = structuredContent(openResult).workspaceId as string;
   assert.ok(workspaceId);
 
-  // Schema Security Checks: verify no workspaceRoot or provider/profile leakage
+  // Schema Security Checks: verify no workspaceRoot leakage.
+  // 'provider'/'model' are deliberately exposed for direct provider/model
+  // dispatch; replay and write scope stay explicit and never workspace-derived.
   const startProps = startTool.inputSchema.properties as Record<string, any>;
   assert.equal(startProps.workspaceRoot, undefined);
-  assert.equal(startProps.provider, undefined);
+  assert.ok(startProps.provider, "agent_start must expose provider for direct dispatch");
+  assert.ok(startProps.model, "agent_start must expose model for direct dispatch");
+  assert.equal(startProps.writeMode?.enum?.sort?.().join(","), "allowed,read_only");
   assert.ok(startProps.attemptKey);
 
   const continueProps = continueTool.inputSchema.properties as Record<string, any>;
@@ -1851,4 +1855,122 @@ test("nexus_task_card_authority_switch and restore expose fixed typed contracts 
     },
   });
   assert.equal(invalidSwitch.isError, true, "ownerConfirmation=false must fail schema validation");
+});
+
+test("subagents: open_workspace exposes modelDispatch without provider session or secret leakage", async (t) => {
+  const context = await fixture(t, { git: true, subagents: true });
+  const openResult = await callOpen(context.client, context.project, "chat-model-dispatch");
+  const open = structuredContent(openResult);
+  const modelDispatch = open.modelDispatch as Record<string, unknown>;
+  assert.ok(modelDispatch, "open_workspace must expose modelDispatch");
+  assert.equal(modelDispatch.enabled, true);
+  assert.ok(Array.isArray(modelDispatch.providers));
+  const opencode = modelDispatch.opencode as Record<string, unknown> | undefined;
+  assert.ok(opencode, "modelDispatch must include an opencode catalog surface");
+  assert.equal(opencode.catalogSource, "fallback");
+  const models = (opencode.models as string[]) ?? [];
+  assert.ok(
+    models.includes("opencode/muse-spark-1.3-contributor-free"),
+    "fallback catalog models must include opencode/muse-spark-1.3-contributor-free",
+  );
+  assert.ok(
+    models.includes("opencode/big-pickle"),
+    "fallback catalog models must include opencode/big-pickle",
+  );
+  assert.ok(
+    !models.some((model) => model.startsWith("opencode-go/")),
+    "modelDispatch must exclude paid opencode-go lane",
+  );
+  const serialized = JSON.stringify(open);
+  assert.ok(!serialized.includes("test-owner-token"));
+});
+
+test("subagents: agent_start XOR validation rejects profile+provider and neither", async (t) => {
+  const context = await fixture(t, { git: true, subagents: true });
+  const openResult = await callOpen(context.client, context.project, "chat-xor");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+
+  const both = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      provider: "codex",
+      model: "opencode/big-pickle",
+      prompt: "ambiguous dispatch",
+    },
+  });
+  assert.ok(both.isError, "profile + provider must fail closed");
+  const bothText = responseText(both);
+  assert.ok(bothText.length > 0);
+
+  const neither = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      prompt: "no dispatch target",
+    },
+  });
+  assert.ok(neither.isError, "missing profile and provider must fail closed");
+
+  const providerOnly = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      provider: "codex",
+      prompt: "provider without model",
+    },
+  });
+  assert.ok(providerOnly.isError, "provider without model must fail closed");
+});
+
+test("subagents: direct provider/model dispatch starts a durable direct_model agent", async (t) => {
+  const context = await fixture(t, {
+    git: true,
+    subagents: { enabled: true, providers: [{ id: "codex", enabled: true }] },
+  });
+  const openResult = await callOpen(context.client, context.project, "chat-direct-codex");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+
+  const startResult = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      provider: "codex",
+      model: "codex/gpt-5.4",
+      writeMode: "read_only",
+      prompt: "direct dispatch bounded review",
+    },
+  });
+  assert.equal(startResult.isError, undefined, `agent_start direct failed: ${JSON.stringify(startResult)}`);
+  const start = structuredContent(startResult) as Record<string, unknown>;
+  assert.equal(start.provider, "codex");
+  assert.equal(start.model, "codex/gpt-5.4");
+  assert.equal(start.dispatchMode, "direct_model");
+  assert.equal(start.writeMode, "read_only");
+  assert.ok(start.agentId);
+});
+
+test("subagents: agent_preflight accepts direct provider/model dispatch", async (t) => {
+  const context = await fixture(t, {
+    git: true,
+    subagents: { enabled: true, providers: [{ id: "codex", enabled: true }] },
+  });
+  const openResult = await callOpen(context.client, context.project, "chat-preflight-direct");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+
+  const preflightResult = await context.client.callTool({
+    name: "agent_preflight",
+    arguments: {
+      workspaceId,
+      provider: "codex",
+      model: "codex/gpt-5.4",
+    },
+  });
+  assert.equal(preflightResult.isError, undefined, `agent_preflight direct failed: ${JSON.stringify(preflightResult)}`);
+  const preflight = structuredContent(preflightResult);
+  const readiness = preflight.readiness as Record<string, unknown>;
+  assert.equal(readiness.profileResolved, true);
+  const worker = preflight.worker as Record<string, unknown>;
+  assert.equal(worker.profile, "codex");
 });

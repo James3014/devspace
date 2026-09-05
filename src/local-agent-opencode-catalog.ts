@@ -27,6 +27,28 @@ export interface ModelValidationResult {
 let activeCatalogSnapshot: OpencodeCatalogSnapshot | undefined;
 let catalogGenerationCounter = 1;
 
+/**
+ * Baseline fallback catalog. Single source of truth used both by the async
+ * fetch path (when SDK/CLI probing is unavailable) and the synchronous
+ * initial snapshot, so they can never diverge. Kept in sync with the
+ * live OpenCode CLI baseline; models missing from this list fail closed
+ * (EXACT_MODEL_UNAVAILABLE) instead of being accepted.
+ */
+const fallbackOpencodeCatalogEntries: readonly OpencodeCatalogEntry[] = [
+  { providerId: "opencode", modelId: "big-pickle", fullName: "opencode/big-pickle", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
+  { providerId: "opencode", modelId: "ling-3.0-flash-fin-free", fullName: "opencode/ling-3.0-flash-fin-free", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
+  { providerId: "opencode", modelId: "mimo-v2.5-free", fullName: "opencode/mimo-v2.5-free", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
+  { providerId: "opencode", modelId: "muse-spark-1.2-contributor-free", fullName: "opencode/muse-spark-1.2-contributor-free", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
+  { providerId: "opencode", modelId: "muse-spark-1.3-contributor-free", fullName: "opencode/muse-spark-1.3-contributor-free", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
+  { providerId: "opencode", modelId: "nemotron-3-ultra-free", fullName: "opencode/nemotron-3-ultra-free", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
+  { providerId: "opencode", modelId: "nemotron-3.5-lightning-free", fullName: "opencode/nemotron-3.5-lightning-free", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
+  { providerId: "opencode-go", modelId: "deepseek-v4-flash", fullName: "opencode-go/deepseek-v4-flash", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
+  { providerId: "opencode-go", modelId: "glm-5.3-flash", fullName: "opencode-go/glm-5.3-flash", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
+  { providerId: "opencode-go", modelId: "grok-4.6", fullName: "opencode-go/grok-4.6", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
+  { providerId: "opencode-go", modelId: "hy3", fullName: "opencode-go/hy3", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
+  { providerId: "opencode-go", modelId: "mimo-v2.5", fullName: "opencode-go/mimo-v2.5", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
+];
+
 export function computeOpencodeCatalogGeneration(entries: readonly OpencodeCatalogEntry[], counter = catalogGenerationCounter): string {
   const hash = createHash("sha256");
   hash.update(`gen-${counter}:`);
@@ -34,6 +56,24 @@ export function computeOpencodeCatalogGeneration(entries: readonly OpencodeCatal
     hash.update(`${entry.fullName}:${entry.variants.join(",")}:${entry.status}\n`);
   }
   return hash.digest("hex").slice(0, 16);
+}
+
+/**
+ * Shared fallback snapshot builder. Both async fetch fallback and the
+ * synchronous initial snapshot derive from the same baseline const, so they
+ * can never diverge.
+ */
+export function fallbackOpencodeCatalogSnapshot(
+  fetchedAt = new Date().toISOString(),
+): OpencodeCatalogSnapshot {
+  const fallbackEntries = [...fallbackOpencodeCatalogEntries];
+  return {
+    entries: fallbackEntries,
+    fetchedAt,
+    source: "fallback",
+    generation: computeOpencodeCatalogGeneration(fallbackEntries),
+    version: "unknown",
+  };
 }
 
 export function parseOpencodeCliModels(stdout: string): OpencodeCatalogEntry[] {
@@ -124,19 +164,7 @@ export async function fetchOpencodeCatalog(
   }
 
   // 3. Fallback catalog matching current baseline snapshot
-  const fallbackEntries: OpencodeCatalogEntry[] = [
-    { providerId: "opencode", modelId: "big-pickle", fullName: "opencode/big-pickle", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-    { providerId: "opencode", modelId: "ling-3.0-flash-fin-free", fullName: "opencode/ling-3.0-flash-fin-free", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-    { providerId: "opencode", modelId: "mimo-v2.5-free", fullName: "opencode/mimo-v2.5-free", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-    { providerId: "opencode", modelId: "muse-spark-1.2-contributor-free", fullName: "opencode/muse-spark-1.2-contributor-free", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-    { providerId: "opencode", modelId: "nemotron-3-ultra-free", fullName: "opencode/nemotron-3-ultra-free", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-    { providerId: "opencode", modelId: "nemotron-3.5-lightning-free", fullName: "opencode/nemotron-3.5-lightning-free", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-    { providerId: "opencode-go", modelId: "deepseek-v4-flash", fullName: "opencode-go/deepseek-v4-flash", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-    { providerId: "opencode-go", modelId: "glm-5.3-flash", fullName: "opencode-go/glm-5.3-flash", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-    { providerId: "opencode-go", modelId: "grok-4.6", fullName: "opencode-go/grok-4.6", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-    { providerId: "opencode-go", modelId: "hy3", fullName: "opencode-go/hy3", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-    { providerId: "opencode-go", modelId: "mimo-v2.5", fullName: "opencode-go/mimo-v2.5", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-  ];
+  const fallbackEntries = [...fallbackOpencodeCatalogEntries];
 
   const generation = computeOpencodeCatalogGeneration(fallbackEntries);
   return {
@@ -150,27 +178,9 @@ export async function fetchOpencodeCatalog(
 
 export function getActiveOpencodeCatalogSnapshot(): OpencodeCatalogSnapshot {
   if (!activeCatalogSnapshot) {
-    // Sync initial fallback snapshot until async fetch completes
-    const fallbackEntries: OpencodeCatalogEntry[] = [
-      { providerId: "opencode", modelId: "big-pickle", fullName: "opencode/big-pickle", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-      { providerId: "opencode", modelId: "ling-3.0-flash-fin-free", fullName: "opencode/ling-3.0-flash-fin-free", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-      { providerId: "opencode", modelId: "mimo-v2.5-free", fullName: "opencode/mimo-v2.5-free", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-      { providerId: "opencode", modelId: "muse-spark-1.2-contributor-free", fullName: "opencode/muse-spark-1.2-contributor-free", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-      { providerId: "opencode", modelId: "nemotron-3-ultra-free", fullName: "opencode/nemotron-3-ultra-free", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-      { providerId: "opencode", modelId: "nemotron-3.5-lightning-free", fullName: "opencode/nemotron-3.5-lightning-free", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-      { providerId: "opencode-go", modelId: "deepseek-v4-flash", fullName: "opencode-go/deepseek-v4-flash", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-      { providerId: "opencode-go", modelId: "glm-5.3-flash", fullName: "opencode-go/glm-5.3-flash", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-      { providerId: "opencode-go", modelId: "grok-4.6", fullName: "opencode-go/grok-4.6", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-      { providerId: "opencode-go", modelId: "hy3", fullName: "opencode-go/hy3", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-      { providerId: "opencode-go", modelId: "mimo-v2.5", fullName: "opencode-go/mimo-v2.5", variants: ["none", "minimal", "low", "medium", "high"], status: "active" },
-    ];
-    activeCatalogSnapshot = {
-      entries: fallbackEntries,
-      fetchedAt: new Date().toISOString(),
-      source: "fallback",
-      generation: computeOpencodeCatalogGeneration(fallbackEntries),
-      version: "unknown",
-    };
+    // Sync initial fallback snapshot until async fetch completes. Always built
+    // from the shared baseline const used by the fetch fallback path.
+    activeCatalogSnapshot = fallbackOpencodeCatalogSnapshot();
   }
   return activeCatalogSnapshot;
 }
