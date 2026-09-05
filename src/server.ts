@@ -1924,7 +1924,13 @@ export function createMcpServer(
       operationId: z.string(),
       attemptKey: z.string(),
       requestHash: z.string(),
-      kind: z.enum(["workspace_clone", "dependency_sync", "nexus_gateway_recover"]),
+      kind: z.enum([
+        "workspace_clone",
+        "dependency_sync",
+        "nexus_gateway_recover",
+        "nexus_task_card_authority_switch",
+        "nexus_task_card_authority_restore",
+      ]),
       authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]),
       scopeRoot: z.string(),
       workspaceId: z.string().optional(),
@@ -2035,6 +2041,109 @@ export function createMcpServer(
           isError: result.status === "error",
           structuredContent: result as unknown as Record<string, unknown>,
         };
+      },
+    );
+
+    registerAppTool(
+      server,
+      "nexus_task_card_authority_switch",
+      {
+        title: "Switch Nexus Task Card Authority",
+        description:
+          "Switch active Nexus GITHUB_MERGE standing grant authority to temporary Task Card actions (TASK_CARD_COMMIT + TASK_CARD_CREATE) with CAS verification, TTL <= 30m, mode 0600, and durable backup.",
+        inputSchema: {
+          attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
+            .describe("Stable DevSpace transport attempt identity. Conflicting reuse fails closed."),
+          expectedCurrentReceiptHash: z.string().regex(/^[0-9a-f]{64}$/)
+            .describe("Expected receipt hash of the active GITHUB_MERGE predecessor standing grant for CAS."),
+          expectedCurrentGoalId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/)
+            .describe("Goal identifier that must exactly match the predecessor standing grant."),
+          successorGoalId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/)
+            .describe("Owner-authorized bounded Goal for the temporary Task Card bootstrap authority."),
+          successorThreadId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/)
+            .describe("Owner-authorized durable coordination scope for the temporary Task Card bootstrap authority."),
+          ttlMinutes: z.number().int().min(1).max(30).default(20)
+            .describe("Temporary authority TTL in minutes (maximum 30, bounded by predecessor expiry)."),
+          ownerConfirmation: z.literal(true)
+            .describe("Explicit owner confirmation required to switch standing grant authority."),
+        },
+        outputSchema: durableOperationOutputSchema,
+        _meta: {},
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ attemptKey, expectedCurrentReceiptHash, expectedCurrentGoalId, successorGoalId, successorThreadId, ttlMinutes, ownerConfirmation }) => {
+        try {
+          return operationResponse(await durableOperations.nexusTaskCardAuthoritySwitch({
+            attemptKey,
+            expectedCurrentReceiptHash,
+            expectedCurrentGoalId,
+            successorGoalId,
+            successorThreadId,
+            ttlMinutes,
+            ownerConfirmation,
+          }));
+        } catch (error) {
+          if (error instanceof DurableOperationError && error.operation) {
+            return {
+              content: [textBlock(`${error.code}: ${error.message}`)],
+              isError: true,
+              structuredContent: error.operation as unknown as Record<string, unknown>,
+            };
+          }
+          throw error;
+        }
+      },
+    );
+
+    registerAppTool(
+      server,
+      "nexus_task_card_authority_restore",
+      {
+        title: "Restore Nexus Task Card Authority",
+        description:
+          "Restore active Nexus standing grant authority from temporary Task Card actions back to a successor preserving the predecessor authority context through CAS verification.",
+        inputSchema: {
+          attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
+            .describe("Stable DevSpace transport attempt identity. Conflicting reuse fails closed."),
+          switchOperationId: z.string().min(1)
+            .describe("Operation ID of the preceding successful authority switch operation."),
+          expectedTemporaryReceiptHash: z.string().regex(/^[0-9a-f]{64}$/)
+            .describe("Expected receipt hash of the temporary Task Card standing grant for CAS."),
+          ownerConfirmation: z.literal(true)
+            .describe("Explicit owner confirmation required to restore the predecessor authority context."),
+        },
+        outputSchema: durableOperationOutputSchema,
+        _meta: {},
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ attemptKey, switchOperationId, expectedTemporaryReceiptHash, ownerConfirmation }) => {
+        try {
+          return operationResponse(await durableOperations.nexusTaskCardAuthorityRestore({
+            attemptKey,
+            switchOperationId,
+            expectedTemporaryReceiptHash,
+            ownerConfirmation,
+          }));
+        } catch (error) {
+          if (error instanceof DurableOperationError && error.operation) {
+            return {
+              content: [textBlock(`${error.code}: ${error.message}`)],
+              isError: true,
+              structuredContent: error.operation as unknown as Record<string, unknown>,
+            };
+          }
+          throw error;
+        }
       },
     );
 

@@ -1,15 +1,20 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { chmod, lstat, readFile, rename, stat, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import type { ServerConfig } from "./config.js";
 import { assertAllowedPath, canonicalizePath, isPathInsideRoot } from "./roots.js";
 import { EXECUTION_PROTOCOL_VERSION, type ExecutionAuthorityMode } from "./execution-protocol.js";
 
-export type DurableOperationKind = "workspace_clone" | "dependency_sync" | "nexus_gateway_recover";
+export type DurableOperationKind =
+  | "workspace_clone"
+  | "dependency_sync"
+  | "nexus_gateway_recover"
+  | "nexus_task_card_authority_switch"
+  | "nexus_task_card_authority_restore";
 export type DurableOperationStatus = "started" | "succeeded" | "failed" | "outcome_unknown";
 export type DependencySyncRecipe = "npm_ci" | "pnpm_frozen" | "uv_frozen";
 
@@ -21,6 +26,54 @@ export const NEXUS_GATEWAY_INTERPRETER = "/Users/jameschen/Workspace/Nexus-new/.
 export const NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256 = "7af3760bd2b6729654a89d7b07fa4c43bb9b323e8e0006a08aa5e485d78562ac";
 export const NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256 = "be6918bc5b328dfbf8c50387e88f983ce33f0096542cc22109f75fbe6250ab5e";
 export const NEXUS_GATEWAY_STATE_ROOT = join(homedir(), "Library", "Application Support", "Nexus", "gateway-direct");
+export const NEXUS_STANDING_GRANT_AUTHORITY_ROOT = join(homedir(), ".local", "state", "nexus", "authority");
+export const NEXUS_STANDING_GRANT_PATH = join(NEXUS_STANDING_GRANT_AUTHORITY_ROOT, "standing-grant.json");
+export const NEXUS_STANDING_GRANT_BACKUP_PATH = join(NEXUS_STANDING_GRANT_AUTHORITY_ROOT, ".devspace-task-card-authority-backup.json");
+
+export interface StandingGrantRepositoryIdentity {
+  repository_id: string;
+  canonical_remote: string;
+}
+
+export interface StandingGrantContext {
+  schema: "nexus.standing_grant_context.v1";
+  owner_id: string;
+  coordinator_id: string;
+  repository: StandingGrantRepositoryIdentity;
+  thread_id: string;
+  goal_id: string;
+  allowed_actions: string[];
+  issued_at: string;
+  expires_at: string;
+  revoked_at: string | null;
+  revocation_reason: string | null;
+  context_hash: string;
+}
+
+export interface StandingGrantReceipt {
+  schema: "nexus.standing_grant_receipt.v1";
+  grant_id: string;
+  context: StandingGrantContext;
+  receipt_hash: string;
+  supersedes_grant_hash: string | null;
+}
+
+export interface NexusTaskCardAuthoritySwitchInput {
+  attemptKey: string;
+  expectedCurrentReceiptHash: string;
+  expectedCurrentGoalId: string;
+  successorGoalId: string;
+  successorThreadId: string;
+  ttlMinutes?: number;
+  ownerConfirmation: boolean;
+}
+
+export interface NexusTaskCardAuthorityRestoreInput {
+  attemptKey: string;
+  switchOperationId: string;
+  expectedTemporaryReceiptHash: string;
+  ownerConfirmation: boolean;
+}
 
 export interface NexusGatewayRecoveryRequest {
   request_id: string;
@@ -113,6 +166,10 @@ export class DurableOperationError extends Error {
       | "NEXUS_GATEWAY_REQUEST_INVALID"
       | "NEXUS_GATEWAY_RECOVERY_FAILED"
       | "NEXUS_GATEWAY_RECOVERY_UNCERTAIN"
+      | "NEXUS_AUTHORITY_SWITCH_INVALID"
+      | "NEXUS_AUTHORITY_SWITCH_FAILED"
+      | "NEXUS_AUTHORITY_RESTORE_INVALID"
+      | "NEXUS_AUTHORITY_RESTORE_FAILED"
       | "RECONCILIATION_REQUIRED",
     message: string,
     readonly operation?: DurableOperationRecord,
@@ -260,6 +317,9 @@ export class DurableOperationManager {
     private readonly runCommand: CommandRunner = spawnCommand,
     private readonly runNexusGatewayRecovery: NexusGatewayRecoveryRunner = spawnNexusGatewayRecovery,
     private readonly runNexusGatewayRecoveryPreflight: NexusGatewayRecoveryRunner = spawnNexusGatewayRecoveryPreflight,
+    private readonly standingGrantPath: string = NEXUS_STANDING_GRANT_PATH,
+    private readonly standingGrantBackupPath: string = NEXUS_STANDING_GRANT_BACKUP_PATH,
+    private readonly now: () => number = Date.now,
   ) {
     this.store = new DurableOperationStore(config.stateDir);
     this.store.markInterruptedUnknown();
@@ -508,6 +568,266 @@ export class DurableOperationManager {
     };
   }
 
+  async nexusTaskCardAuthoritySwitch(input: NexusTaskCardAuthoritySwitchInput): Promise<DurableOperationRecord> {
+    assertAttemptKey(input.attemptKey);
+    if (input.ownerConfirmation !== true) {
+      throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", "ownerConfirmation must be explicitly true.");
+    }
+    for (const [field, value] of [
+      ["expectedCurrentReceiptHash", input.expectedCurrentReceiptHash],
+      ["expectedCurrentGoalId", input.expectedCurrentGoalId],
+      ["successorGoalId", input.successorGoalId],
+      ["successorThreadId", input.successorThreadId],
+    ] as const) {
+      if (field.endsWith("Hash")) {
+        if (!HEX64.test(value)) throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", `${field} must be 64 lowercase hex characters.`);
+      } else if (!SAFE_NEXUS_ID.test(value)) {
+        throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", `${field} must be a bounded safe identifier.`);
+      }
+    }
+    const ttlMinutes = input.ttlMinutes ?? 20;
+    if (!Number.isInteger(ttlMinutes) || ttlMinutes < 1 || ttlMinutes > 30) {
+      throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", "ttlMinutes must be an integer between 1 and 30.");
+    }
+
+    const scopeRoot = dirname(resolve(this.standingGrantPath));
+    const inputBinding = {
+      expectedCurrentReceiptHash: input.expectedCurrentReceiptHash,
+      expectedCurrentGoalId: input.expectedCurrentGoalId,
+      successorGoalId: input.successorGoalId,
+      successorThreadId: input.successorThreadId,
+      ttlMinutes,
+      ownerConfirmation: true,
+    };
+    const inputHash = hashJson(inputBinding);
+    const existing = this.store.getByAttempt(scopeRoot, input.attemptKey);
+    if (existing) {
+      if (existing.kind !== "nexus_task_card_authority_switch" || existing.request.inputHash !== inputHash) {
+        throw new DurableOperationError(
+          "OPERATION_REPLAY_CONFLICT",
+          `attemptKey '${input.attemptKey}' is already bound to a materially different ${existing.kind} request.`,
+          existing,
+        );
+      }
+      return replayResult(existing);
+    }
+
+    const predecessor = await readSecureStandingGrantReceipt(this.standingGrantPath, "NEXUS_AUTHORITY_SWITCH_INVALID");
+    if (predecessor.receipt_hash !== input.expectedCurrentReceiptHash) {
+      throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", "Current standing-grant receipt hash does not match expectedCurrentReceiptHash.");
+    }
+    if (predecessor.context.goal_id !== input.expectedCurrentGoalId) {
+      throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", "Current standing-grant Goal does not match expectedCurrentGoalId.");
+    }
+    if (
+      predecessor.context.repository.repository_id !== "James3014/Nexus-new" ||
+      predecessor.context.repository.canonical_remote !== "https://github.com/James3014/Nexus-new.git"
+    ) {
+      throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", "Standing grant is not bound to the fixed Nexus repository identity.");
+    }
+    if (predecessor.context.revoked_at !== null || predecessor.context.revocation_reason !== null) {
+      throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", "Current standing grant is revoked.");
+    }
+    if (
+      predecessor.context.allowed_actions.length !== 1 ||
+      predecessor.context.allowed_actions[0] !== "GITHUB_MERGE"
+    ) {
+      throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", "Task Card bootstrap requires predecessor actions to be exactly [GITHUB_MERGE].");
+    }
+
+    const now = this.now();
+    const predecessorExpiry = Date.parse(predecessor.context.expires_at);
+    if (!Number.isFinite(predecessorExpiry) || predecessorExpiry <= now) {
+      throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", "Current standing grant is expired.");
+    }
+    const issuedAt = new Date(now).toISOString();
+    const expiresAt = new Date(Math.min(now + ttlMinutes * 60_000, predecessorExpiry)).toISOString();
+    const temporaryContext = issueStandingGrantContext({
+      owner_id: predecessor.context.owner_id,
+      coordinator_id: predecessor.context.coordinator_id,
+      repository: predecessor.context.repository,
+      thread_id: input.successorThreadId,
+      goal_id: input.successorGoalId,
+      allowed_actions: ["TASK_CARD_COMMIT", "TASK_CARD_CREATE"],
+      issued_at: issuedAt,
+      expires_at: expiresAt,
+      revoked_at: null,
+      revocation_reason: null,
+    });
+    const temporaryReceipt = issueStandingGrantReceipt({
+      grant_id: `devspace-task-card-${hashJson({ attemptKey: input.attemptKey, inputHash }).slice(0, 24)}`,
+      context: temporaryContext,
+      supersedes_grant_hash: predecessor.receipt_hash,
+    });
+    const request = {
+      version: EXECUTION_PROTOCOL_VERSION,
+      inputHash,
+      ...inputBinding,
+      issuedAt,
+      expiresAt,
+      predecessorReceiptHash: predecessor.receipt_hash,
+      temporaryReceiptHash: temporaryReceipt.receipt_hash,
+      targetActions: ["TASK_CARD_COMMIT", "TASK_CARD_CREATE"],
+    };
+    const requestHash = hashJson(request);
+    const operationId = stableOperationId("nexus_task_card_authority_switch", scopeRoot, input.attemptKey);
+    const { record, created } = this.store.createOrReplay({
+      operationId,
+      attemptKey: input.attemptKey,
+      requestHash,
+      kind: "nexus_task_card_authority_switch",
+      authorityMode: "OWNER_DIRECT",
+      scopeRoot,
+      request,
+    });
+    if (!created) return replayResult(record);
+
+    try {
+      await writeStandingGrantBackup(this.standingGrantBackupPath, predecessor);
+      await writeStandingGrantReceiptCas(this.standingGrantPath, temporaryReceipt, predecessor.receipt_hash);
+      return this.store.finish(operationId, {
+        status: "succeeded",
+        retrySafe: false,
+        receipt: {
+          switched: true,
+          predecessorReceiptHash: predecessor.receipt_hash,
+          temporaryReceiptHash: temporaryReceipt.receipt_hash,
+          predecessorGoalId: predecessor.context.goal_id,
+          successorGoalId: temporaryReceipt.context.goal_id,
+          successorThreadId: temporaryReceipt.context.thread_id,
+          actions: [...temporaryReceipt.context.allowed_actions],
+          expiresAt: temporaryReceipt.context.expires_at,
+        },
+      });
+    } catch (error) {
+      return this.store.finish(operationId, {
+        status: "outcome_unknown",
+        retrySafe: false,
+        errorCode: "NEXUS_AUTHORITY_SWITCH_FAILED",
+        errorMessage: redactSecrets(error instanceof Error ? error.message : String(error)),
+        receipt: {
+          predecessorReceiptHash: predecessor.receipt_hash,
+          temporaryReceiptHash: temporaryReceipt.receipt_hash,
+        },
+      });
+    }
+  }
+
+  async nexusTaskCardAuthorityRestore(input: NexusTaskCardAuthorityRestoreInput): Promise<DurableOperationRecord> {
+    assertAttemptKey(input.attemptKey);
+    if (input.ownerConfirmation !== true) {
+      throw new DurableOperationError("NEXUS_AUTHORITY_RESTORE_INVALID", "ownerConfirmation must be explicitly true.");
+    }
+    if (!HEX64.test(input.expectedTemporaryReceiptHash)) {
+      throw new DurableOperationError("NEXUS_AUTHORITY_RESTORE_INVALID", "expectedTemporaryReceiptHash must be 64 lowercase hex characters.");
+    }
+    if (!input.switchOperationId) {
+      throw new DurableOperationError("NEXUS_AUTHORITY_RESTORE_INVALID", "switchOperationId is required.");
+    }
+
+    const scopeRoot = dirname(resolve(this.standingGrantPath));
+    const inputBinding = {
+      switchOperationId: input.switchOperationId,
+      expectedTemporaryReceiptHash: input.expectedTemporaryReceiptHash,
+      ownerConfirmation: true,
+    };
+    const inputHash = hashJson(inputBinding);
+    const existing = this.store.getByAttempt(scopeRoot, input.attemptKey);
+    if (existing) {
+      if (existing.kind !== "nexus_task_card_authority_restore" || existing.request.inputHash !== inputHash) {
+        throw new DurableOperationError(
+          "OPERATION_REPLAY_CONFLICT",
+          `attemptKey '${input.attemptKey}' is already bound to a materially different ${existing.kind} request.`,
+          existing,
+        );
+      }
+      return replayResult(existing);
+    }
+
+    const switchRecord = this.store.getByOperationId(input.switchOperationId);
+    if (!switchRecord || switchRecord.kind !== "nexus_task_card_authority_switch" || switchRecord.status !== "succeeded") {
+      throw new DurableOperationError("NEXUS_AUTHORITY_RESTORE_INVALID", "switchOperationId must identify one successful Task Card authority switch.");
+    }
+    const predecessorReceiptHash = String(switchRecord.request.predecessorReceiptHash ?? "");
+    const recordedTemporaryReceiptHash = String(switchRecord.request.temporaryReceiptHash ?? "");
+    if (!HEX64.test(predecessorReceiptHash) || recordedTemporaryReceiptHash !== input.expectedTemporaryReceiptHash) {
+      throw new DurableOperationError("NEXUS_AUTHORITY_RESTORE_INVALID", "Restore request does not match the durable switch binding.");
+    }
+
+    const backup = await readSecureStandingGrantReceipt(this.standingGrantBackupPath, "NEXUS_AUTHORITY_RESTORE_INVALID");
+    if (backup.receipt_hash !== predecessorReceiptHash) {
+      throw new DurableOperationError("NEXUS_AUTHORITY_RESTORE_INVALID", "Fixed standing-grant backup does not match the switch predecessor receipt.");
+    }
+    const current = await readSecureStandingGrantReceipt(this.standingGrantPath, "NEXUS_AUTHORITY_RESTORE_INVALID");
+    if (current.receipt_hash !== input.expectedTemporaryReceiptHash) {
+      throw new DurableOperationError("NEXUS_AUTHORITY_RESTORE_INVALID", "Current standing-grant receipt does not match expectedTemporaryReceiptHash.");
+    }
+    if (
+      current.context.allowed_actions.length !== 2 ||
+      current.context.allowed_actions[0] !== "TASK_CARD_COMMIT" ||
+      current.context.allowed_actions[1] !== "TASK_CARD_CREATE" ||
+      current.context.goal_id !== String(switchRecord.request.successorGoalId ?? "") ||
+      current.context.thread_id !== String(switchRecord.request.successorThreadId ?? "")
+    ) {
+      throw new DurableOperationError("NEXUS_AUTHORITY_RESTORE_INVALID", "Current standing grant does not match the exact temporary Task Card authority binding.");
+    }
+
+    const restoredReceipt = issueStandingGrantReceipt({
+      grant_id: `devspace-task-card-restore-${hashJson({ switchOperationId: input.switchOperationId, predecessorReceiptHash }).slice(0, 24)}`,
+      context: backup.context,
+      supersedes_grant_hash: current.receipt_hash,
+    });
+    const request = {
+      version: EXECUTION_PROTOCOL_VERSION,
+      inputHash,
+      ...inputBinding,
+      predecessorReceiptHash,
+      restoredReceiptHash: restoredReceipt.receipt_hash,
+    };
+    const requestHash = hashJson(request);
+    const operationId = stableOperationId("nexus_task_card_authority_restore", scopeRoot, input.attemptKey);
+    const { record, created } = this.store.createOrReplay({
+      operationId,
+      attemptKey: input.attemptKey,
+      requestHash,
+      kind: "nexus_task_card_authority_restore",
+      authorityMode: "OWNER_DIRECT",
+      scopeRoot,
+      request,
+    });
+    if (!created) return replayResult(record);
+
+    try {
+      await writeStandingGrantReceiptCas(this.standingGrantPath, restoredReceipt, current.receipt_hash);
+      return this.store.finish(operationId, {
+        status: "succeeded",
+        retrySafe: false,
+        receipt: {
+          restored: true,
+          switchOperationId: input.switchOperationId,
+          temporaryReceiptHash: current.receipt_hash,
+          predecessorReceiptHash,
+          restoredReceiptHash: restoredReceipt.receipt_hash,
+          restoredGoalId: restoredReceipt.context.goal_id,
+          actions: [...restoredReceipt.context.allowed_actions],
+          expiresAt: restoredReceipt.context.expires_at,
+        },
+      });
+    } catch (error) {
+      return this.store.finish(operationId, {
+        status: "outcome_unknown",
+        retrySafe: false,
+        errorCode: "NEXUS_AUTHORITY_RESTORE_FAILED",
+        errorMessage: redactSecrets(error instanceof Error ? error.message : String(error)),
+        receipt: {
+          temporaryReceiptHash: current.receipt_hash,
+          predecessorReceiptHash,
+          restoredReceiptHash: restoredReceipt.receipt_hash,
+        },
+      });
+    }
+  }
+
   private async executeNexusGatewayRecovery(
     operationId: string,
     request: NexusGatewayRecoveryRequest,
@@ -588,6 +908,86 @@ export class DurableOperationManager {
       assertNexusGatewayRecoveryRequest(recoveryRequest);
       return await this.executeNexusGatewayRecovery(operationId, recoveryRequest, true);
     }
+    if (record.kind === "nexus_task_card_authority_switch") {
+      try {
+        const current = await readSecureStandingGrantReceipt(this.standingGrantPath, "NEXUS_AUTHORITY_SWITCH_INVALID");
+        const temporaryReceiptHash = String(record.request.temporaryReceiptHash ?? "");
+        const predecessorReceiptHash = String(record.request.predecessorReceiptHash ?? "");
+        const priorReceipt = record.receipt as Record<string, unknown> | undefined;
+        if (HEX64.test(temporaryReceiptHash) && current.receipt_hash === temporaryReceiptHash) {
+          return this.store.finish(operationId, {
+            status: "succeeded",
+            retrySafe: false,
+            receipt: { ...priorReceipt, reconciled: true, currentReceiptHash: current.receipt_hash },
+          });
+        }
+        if (HEX64.test(predecessorReceiptHash) && current.receipt_hash === predecessorReceiptHash) {
+          return this.store.finish(operationId, {
+            status: "failed",
+            retrySafe: true,
+            errorCode: "NEXUS_AUTHORITY_SWITCH_FAILED",
+            errorMessage: "Standing grant remains at the exact predecessor; switch produced no effect.",
+            receipt: { ...priorReceipt, reconciled: true, currentReceiptHash: current.receipt_hash },
+          });
+        }
+        return this.store.finish(operationId, {
+          status: "outcome_unknown",
+          retrySafe: false,
+          errorCode: "RECONCILIATION_REQUIRED",
+          errorMessage: "Standing grant is neither the bound predecessor nor the bound temporary successor.",
+          receipt: { ...priorReceipt, reconciled: true, currentReceiptHash: current.receipt_hash },
+        });
+      } catch (error) {
+        return this.store.finish(operationId, {
+          status: "outcome_unknown",
+          retrySafe: false,
+          errorCode: "RECONCILIATION_REQUIRED",
+          errorMessage: `Failed to inspect standing grant during reconciliation: ${redactSecrets(error instanceof Error ? error.message : String(error))}`,
+          receipt: { reconciled: true },
+        });
+      }
+    }
+
+    if (record.kind === "nexus_task_card_authority_restore") {
+      try {
+        const current = await readSecureStandingGrantReceipt(this.standingGrantPath, "NEXUS_AUTHORITY_RESTORE_INVALID");
+        const restoredReceiptHash = String(record.request.restoredReceiptHash ?? "");
+        const expectedTemporaryReceiptHash = String(record.request.expectedTemporaryReceiptHash ?? "");
+        const priorReceipt = record.receipt as Record<string, unknown> | undefined;
+        if (HEX64.test(restoredReceiptHash) && current.receipt_hash === restoredReceiptHash) {
+          return this.store.finish(operationId, {
+            status: "succeeded",
+            retrySafe: false,
+            receipt: { ...priorReceipt, reconciled: true, currentReceiptHash: current.receipt_hash },
+          });
+        }
+        if (HEX64.test(expectedTemporaryReceiptHash) && current.receipt_hash === expectedTemporaryReceiptHash) {
+          return this.store.finish(operationId, {
+            status: "failed",
+            retrySafe: true,
+            errorCode: "NEXUS_AUTHORITY_RESTORE_FAILED",
+            errorMessage: "Standing grant remains at the exact temporary authority; restore produced no effect.",
+            receipt: { ...priorReceipt, reconciled: true, currentReceiptHash: current.receipt_hash },
+          });
+        }
+        return this.store.finish(operationId, {
+          status: "outcome_unknown",
+          retrySafe: false,
+          errorCode: "RECONCILIATION_REQUIRED",
+          errorMessage: "Standing grant is neither the bound temporary authority nor the bound restored successor.",
+          receipt: { ...priorReceipt, reconciled: true, currentReceiptHash: current.receipt_hash },
+        });
+      } catch (error) {
+        return this.store.finish(operationId, {
+          status: "outcome_unknown",
+          retrySafe: false,
+          errorCode: "RECONCILIATION_REQUIRED",
+          errorMessage: `Failed to inspect standing grant during reconciliation: ${redactSecrets(error instanceof Error ? error.message : String(error))}`,
+          receipt: { reconciled: true },
+        });
+      }
+    }
+
 
     if (record.kind === "workspace_clone") {
       const destination = String(record.request.destination ?? "");
@@ -737,6 +1137,322 @@ export function assertNexusGatewayRecoveryRequest(value: unknown): asserts value
   });
   if (request.request_hash !== expectedRequestHash) {
     throw new DurableOperationError("NEXUS_GATEWAY_REQUEST_INVALID", "Nexus Gateway recovery request hash mismatch.");
+  }
+}
+
+export function canonicalAutonomyHash(value: Record<string, unknown>): string {
+  const payload = { ...value };
+  delete payload.context_hash;
+  return hashJson(payload);
+}
+
+function canonicalStandingGrantReceiptHash(value: Record<string, unknown>): string {
+  const payload = { ...value };
+  delete payload.receipt_hash;
+  return hashJson(payload);
+}
+
+export function assertStandingGrantContext(value: unknown): asserts value is StandingGrantContext {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", "Standing grant context must be an object.");
+  }
+  const raw = value as Record<string, unknown>;
+  if (raw.schema !== "nexus.standing_grant_context.v1") {
+    throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", `Invalid standing grant schema: ${String(raw.schema)}`);
+  }
+  for (const field of ["owner_id", "coordinator_id", "thread_id", "goal_id"] as const) {
+    if (typeof raw[field] !== "string" || !SAFE_NEXUS_ID.test(raw[field] as string)) {
+      throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", `Invalid or missing ${field} in standing grant.`);
+    }
+  }
+  if (!raw.repository || typeof raw.repository !== "object" || Array.isArray(raw.repository)) {
+    throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", "Invalid or missing repository in standing grant.");
+  }
+  const repo = raw.repository as Record<string, unknown>;
+  if (typeof repo.repository_id !== "string" || typeof repo.canonical_remote !== "string") {
+    throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", "Invalid repository structure in standing grant.");
+  }
+  if (!Array.isArray(raw.allowed_actions) || raw.allowed_actions.length === 0 || raw.allowed_actions.some((action) => typeof action !== "string" || !action)) {
+    throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", "allowed_actions must be a non-empty string array.");
+  }
+  if (typeof raw.issued_at !== "string" || Number.isNaN(Date.parse(raw.issued_at))) {
+    throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", "Invalid issued_at timestamp in standing grant.");
+  }
+  if (typeof raw.expires_at !== "string" || Number.isNaN(Date.parse(raw.expires_at))) {
+    throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", "Invalid expires_at timestamp in standing grant.");
+  }
+  if (!(raw.revoked_at === null || typeof raw.revoked_at === "string") || !(raw.revocation_reason === null || typeof raw.revocation_reason === "string")) {
+    throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", "Invalid revocation binding in standing grant.");
+  }
+  if (typeof raw.context_hash !== "string" || !HEX64.test(raw.context_hash)) {
+    throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", "Invalid context_hash format in standing grant.");
+  }
+  if (raw.context_hash !== canonicalAutonomyHash(raw)) {
+    throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", "Standing grant context_hash tampering or mismatch.");
+  }
+}
+
+function assertStandingGrantReceipt(value: unknown, code: "NEXUS_AUTHORITY_SWITCH_INVALID" | "NEXUS_AUTHORITY_RESTORE_INVALID"): asserts value is StandingGrantReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new DurableOperationError(code, "Standing grant receipt must be an object.");
+  }
+  const raw = value as Record<string, unknown>;
+  if (raw.schema !== "nexus.standing_grant_receipt.v1" || typeof raw.grant_id !== "string" || !SAFE_NEXUS_ID.test(raw.grant_id)) {
+    throw new DurableOperationError(code, "Standing grant receipt identity is invalid.");
+  }
+  assertStandingGrantContext(raw.context);
+  if (typeof raw.receipt_hash !== "string" || !HEX64.test(raw.receipt_hash)) {
+    throw new DurableOperationError(code, "Standing grant receipt_hash is invalid.");
+  }
+  if (!(raw.supersedes_grant_hash === null || (typeof raw.supersedes_grant_hash === "string" && HEX64.test(raw.supersedes_grant_hash)))) {
+    throw new DurableOperationError(code, "Standing grant supersedes hash is invalid.");
+  }
+  if (raw.receipt_hash !== canonicalStandingGrantReceiptHash(raw)) {
+    throw new DurableOperationError(code, "Standing grant receipt hash mismatch.");
+  }
+}
+
+function issueStandingGrantContext(values: Omit<StandingGrantContext, "schema" | "context_hash">): StandingGrantContext {
+  const payload = {
+    schema: "nexus.standing_grant_context.v1" as const,
+    ...values,
+    allowed_actions: [...new Set(values.allowed_actions)].sort(),
+  };
+  return { ...payload, context_hash: canonicalAutonomyHash(payload as unknown as Record<string, unknown>) };
+}
+
+function issueStandingGrantReceipt(values: Omit<StandingGrantReceipt, "schema" | "receipt_hash">): StandingGrantReceipt {
+  const payload = { schema: "nexus.standing_grant_receipt.v1" as const, ...values };
+  return { ...payload, receipt_hash: canonicalStandingGrantReceiptHash(payload as unknown as Record<string, unknown>) };
+}
+
+async function assertSecureAuthorityDirectory(directory: string, code: "NEXUS_AUTHORITY_SWITCH_INVALID" | "NEXUS_AUTHORITY_RESTORE_INVALID"): Promise<void> {
+  const info = await lstat(directory);
+  if (!info.isDirectory() || info.isSymbolicLink() || (typeof process.getuid === "function" && info.uid !== process.getuid()) || (info.mode & 0o777) !== 0o700) {
+    throw new DurableOperationError(code, "Nexus authority directory ownership/mode is unsafe.");
+  }
+}
+
+async function readSecureStandingGrantReceipt(filePath: string, code: "NEXUS_AUTHORITY_SWITCH_INVALID" | "NEXUS_AUTHORITY_RESTORE_INVALID"): Promise<StandingGrantReceipt> {
+  const resolved = resolve(filePath);
+  await assertSecureAuthorityDirectory(dirname(resolved), code);
+  const info = await lstat(resolved);
+  if (!info.isFile() || info.isSymbolicLink() || (typeof process.getuid === "function" && info.uid !== process.getuid()) || (info.mode & 0o777) !== 0o600 || info.size > 16 * 1024) {
+    throw new DurableOperationError(code, "Standing grant file ownership/mode/size is unsafe.");
+  }
+  const parsed = JSON.parse(await readFile(resolved, "utf8")) as unknown;
+  assertStandingGrantReceipt(parsed, code);
+  return parsed;
+}
+
+async function writeStandingGrantFile(filePath: string, content: StandingGrantReceipt): Promise<void> {
+  const dir = dirname(resolve(filePath));
+  await assertSecureAuthorityDirectory(dir, "NEXUS_AUTHORITY_SWITCH_INVALID");
+  const tempPath = join(dir, `.standing-grant-${randomUUID()}.tmp`);
+  const payload = JSON.stringify(sortJson(content)) + "\n";
+  await writeFile(tempPath, payload, { mode: 0o600, encoding: "utf8" });
+  await chmod(tempPath, 0o600);
+  await rename(tempPath, filePath);
+  await chmod(filePath, 0o600);
+}
+
+async function writeStandingGrantBackup(filePath: string, predecessor: StandingGrantReceipt): Promise<void> {
+  if (existsSync(filePath)) {
+    const existing = await readSecureStandingGrantReceipt(filePath, "NEXUS_AUTHORITY_SWITCH_INVALID");
+    if (existing.receipt_hash !== predecessor.receipt_hash) {
+      throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", "Existing Task Card authority backup is bound to a different predecessor.");
+    }
+    return;
+  }
+  await writeStandingGrantFile(filePath, predecessor);
+}
+
+const NEXUS_GATEWAY_DIRECT_PLIST = join(homedir(), "Library", "LaunchAgents", "com.nexus.mcp.gateway.direct.plist");
+const NEXUS_GATEWAY_DEPLOYMENTS_ROOT = join(homedir(), "Library", "Application Support", "Nexus", "gateway-direct", "deployments");
+
+export const NEXUS_STANDING_GRANT_CAS_BRIDGE_CODE = String.raw`
+import json
+import os
+import pathlib
+import plistlib
+import re
+import stat
+import subprocess
+import sys
+
+PLIST = pathlib.Path.home() / "Library" / "LaunchAgents" / "com.nexus.mcp.gateway.direct.plist"
+DEPLOYMENTS = pathlib.Path.home() / "Library" / "Application Support" / "Nexus" / "gateway-direct" / "deployments"
+REMOTE = "https://github.com/James3014/Nexus-new.git"
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def fail(message):
+    raise RuntimeError(message)
+
+
+def secure_file(path, label):
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        fail(label + " must be a regular non-symlink file")
+    if info.st_uid != os.getuid() or (stat.S_IMODE(info.st_mode) & 0o022):
+        fail(label + " ownership/mode invalid")
+
+
+def secure_dir(path, label):
+    info = os.lstat(path)
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        fail(label + " must be a real directory")
+    if info.st_uid != os.getuid() or (stat.S_IMODE(info.st_mode) & 0o022):
+        fail(label + " ownership/mode invalid")
+
+
+def git(root, *args):
+    result = subprocess.run(
+        ["/usr/bin/git", "-C", str(root), *args],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=10,
+        check=False,
+        env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"},
+    )
+    if result.returncode != 0:
+        fail("active Nexus deployment git verification failed")
+    return result.stdout.strip()
+
+
+try:
+    request = json.load(sys.stdin)
+    if not isinstance(request, dict) or set(request) != {"expected_receipt_hash", "receipt"}:
+        fail("standing-grant CAS request schema mismatch")
+    expected = request.get("expected_receipt_hash")
+    if not isinstance(expected, str) or HEX64.fullmatch(expected) is None:
+        fail("expected receipt hash invalid")
+
+    secure_file(PLIST, "Nexus Gateway plist")
+    secure_dir(DEPLOYMENTS, "Nexus Gateway deployments root")
+    plist = plistlib.loads(PLIST.read_bytes())
+    root_text = plist.get("WorkingDirectory") if isinstance(plist, dict) else None
+    if not isinstance(root_text, str) or not root_text:
+        fail("Nexus Gateway WorkingDirectory missing")
+    root_path = pathlib.Path(root_text)
+    if root_path.is_symlink():
+        fail("active Nexus deployment root is symlinked")
+    root = root_path.resolve(strict=True)
+    deployments = DEPLOYMENTS.resolve(strict=True)
+    if root.parent != deployments:
+        fail("active Nexus deployment escaped fixed deployments root")
+    secure_dir(root, "active Nexus deployment")
+    if git(root, "rev-parse", "--show-toplevel") != str(root):
+        fail("active Nexus deployment top-level mismatch")
+    if git(root, "remote", "get-url", "origin") != REMOTE:
+        fail("active Nexus deployment remote mismatch")
+    if git(root, "status", "--porcelain"):
+        fail("active Nexus deployment is dirty")
+
+    sys.path.insert(0, str(root))
+    from nexus.orchestrator.standing_grant_store import (
+        StandingGrantReceipt,
+        load_standing_grant_receipt,
+        write_standing_grant_receipt,
+    )
+
+    candidate = StandingGrantReceipt.model_validate(request.get("receipt"))
+    if candidate.supersedes_grant_hash != expected:
+        fail("candidate predecessor binding mismatch")
+
+    current = load_standing_grant_receipt()
+    if current is not None and current.receipt_hash == candidate.receipt_hash:
+        print(json.dumps({"result": "VERIFIED", "already_applied": True, "receipt_hash": current.receipt_hash}, sort_keys=True))
+        raise SystemExit(0)
+    if current is None or current.receipt_hash != expected:
+        fail("canonical standing-grant CAS predecessor mismatch")
+
+    write_standing_grant_receipt(candidate, expected_receipt_hash=expected)
+    readback = load_standing_grant_receipt()
+    if readback is None or readback.receipt_hash != candidate.receipt_hash:
+        fail("canonical standing-grant readback mismatch")
+    print(json.dumps({"result": "VERIFIED", "already_applied": False, "receipt_hash": readback.receipt_hash}, sort_keys=True))
+except SystemExit:
+    raise
+except Exception as exc:
+    print("NEXUS_STANDING_GRANT_CAS_ERROR:" + type(exc).__name__ + ":" + str(exc), file=sys.stderr)
+    raise SystemExit(1)
+`;
+
+async function writeCanonicalStandingGrantViaNexusStore(receipt: StandingGrantReceipt, expectedReceiptHash: string): Promise<void> {
+  const maxOutputBytes = 64 * 1024;
+  const result = await new Promise<{ exitCode: number | null; stdout: string; stderr: string }>((resolvePromise, rejectPromise) => {
+    const child = spawn(NEXUS_GATEWAY_INTERPRETER, ["-I", "-B", "-c", NEXUS_STANDING_GRANT_CAS_BRIDGE_CODE], {
+      cwd: homedir(),
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        HOME: homedir(),
+        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+        PYTHONNOUSERSITE: "1",
+        PYTHONDONTWRITEBYTECODE: "1",
+      },
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      rejectPromise(new Error("Fixed Nexus standing-grant CAS bridge timed out."));
+    }, 15_000);
+    const finish = (callback: () => void) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      callback();
+    };
+    const append = (target: "stdout" | "stderr", chunk: unknown) => {
+      const next = String(chunk);
+      const combined = (target === "stdout" ? stdout : stderr) + next;
+      if (Buffer.byteLength(combined, "utf8") > maxOutputBytes) {
+        finish(() => {
+          child.kill("SIGKILL");
+          rejectPromise(new Error("Fixed Nexus standing-grant CAS bridge exceeded bounded output."));
+        });
+        return;
+      }
+      if (target === "stdout") stdout = combined;
+      else stderr = combined;
+    };
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => append("stdout", chunk));
+    child.stderr.on("data", (chunk) => append("stderr", chunk));
+    child.on("error", (error) => finish(() => rejectPromise(error)));
+    child.stdin.on("error", (error) => finish(() => rejectPromise(error)));
+    child.on("close", (exitCode) => finish(() => resolvePromise({ exitCode, stdout, stderr })));
+    child.stdin.end(JSON.stringify({ expected_receipt_hash: expectedReceiptHash, receipt }));
+  });
+  if (result.exitCode !== 0) {
+    throw new Error(redactSecrets(result.stderr.trim() || `Fixed Nexus standing-grant CAS bridge exited ${String(result.exitCode)}.`));
+  }
+  const parsed = JSON.parse(result.stdout) as Record<string, unknown>;
+  if (parsed.result !== "VERIFIED" || parsed.receipt_hash !== receipt.receipt_hash) {
+    throw new Error("Fixed Nexus standing-grant CAS bridge returned an invalid verification receipt.");
+  }
+}
+
+async function writeStandingGrantReceiptCas(filePath: string, receipt: StandingGrantReceipt, expectedReceiptHash: string): Promise<void> {
+  if (resolve(filePath) === resolve(NEXUS_STANDING_GRANT_PATH)) {
+    await writeCanonicalStandingGrantViaNexusStore(receipt, expectedReceiptHash);
+    return;
+  }
+  // Test-only injected paths never target the canonical machine-local authority store.
+  const current = await readSecureStandingGrantReceipt(filePath, "NEXUS_AUTHORITY_SWITCH_INVALID");
+  if (current.receipt_hash !== expectedReceiptHash || receipt.supersedes_grant_hash !== expectedReceiptHash) {
+    throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", "Standing grant CAS predecessor mismatch.");
+  }
+  await writeStandingGrantFile(filePath, receipt);
+  const readback = await readSecureStandingGrantReceipt(filePath, "NEXUS_AUTHORITY_SWITCH_INVALID");
+  if (readback.receipt_hash !== receipt.receipt_hash) {
+    throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", "Standing grant readback mismatch after CAS write.");
   }
 }
 

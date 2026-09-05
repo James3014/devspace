@@ -1784,3 +1784,71 @@ test("command_status metadata annotations and minimal mode visibility", async (t
     openWorldHint: false,
   });
 });
+
+test("nexus_task_card_authority_switch and restore expose fixed typed contracts with no arbitrary controls", async (t) => {
+  const context = await fixture(t, { git: true });
+  const tools = await context.client.listTools();
+
+  // 1. Verify switch tool
+  const switchTool = tools.tools.find((tool) => tool.name === "nexus_task_card_authority_switch");
+  assert.ok(switchTool, "nexus_task_card_authority_switch must be exposed as a public tool");
+  const switchAnnotations = (switchTool as unknown as { annotations?: Record<string, unknown> }).annotations;
+  assert.deepEqual(switchAnnotations, {
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: true,
+    openWorldHint: false,
+  });
+
+  const switchSchema = switchTool.inputSchema as Record<string, unknown>;
+  const switchProperties = switchSchema.properties as Record<string, unknown>;
+  assert.deepEqual(Object.keys(switchProperties).sort(), [
+    "attemptKey",
+    "expectedCurrentGoalId",
+    "expectedCurrentReceiptHash",
+    "ownerConfirmation",
+    "successorGoalId",
+    "successorThreadId",
+    "ttlMinutes",
+  ]);
+  for (const forbidden of ["path", "command", "actions", "allowedActions", "script", "executable"]) {
+    assert.equal(forbidden in switchProperties, false, `${forbidden} must not be caller-selectable in switch tool`);
+  }
+
+  // 2. Verify restore tool
+  const restoreTool = tools.tools.find((tool) => tool.name === "nexus_task_card_authority_restore");
+  assert.ok(restoreTool, "nexus_task_card_authority_restore must be exposed as a public tool");
+  const restoreAnnotations = (restoreTool as unknown as { annotations?: Record<string, unknown> }).annotations;
+  assert.deepEqual(restoreAnnotations, {
+    readOnlyHint: false,
+    destructiveHint: true,
+    idempotentHint: true,
+    openWorldHint: false,
+  });
+
+  const restoreSchema = restoreTool.inputSchema as Record<string, unknown>;
+  const restoreProperties = restoreSchema.properties as Record<string, unknown>;
+  assert.deepEqual(Object.keys(restoreProperties).sort(), [
+    "attemptKey",
+    "expectedTemporaryReceiptHash",
+    "ownerConfirmation",
+    "switchOperationId",
+  ]);
+  for (const forbidden of ["path", "command", "actions", "allowedActions", "script", "executable"]) {
+    assert.equal(forbidden in restoreProperties, false, `${forbidden} must not be caller-selectable in restore tool`);
+  }
+
+  // 3. Schema validation rejects invalid ownerConfirmation
+  const invalidSwitch = await context.client.callTool({
+    name: "nexus_task_card_authority_switch",
+    arguments: {
+      attemptKey: "server-switch-invalid",
+      expectedCurrentReceiptHash: "a".repeat(64),
+      expectedCurrentGoalId: "goal-1",
+      successorGoalId: "goal-task-card-bootstrap",
+      successorThreadId: "thread-task-card-bootstrap",
+      ownerConfirmation: false,
+    },
+  });
+  assert.equal(invalidSwitch.isError, true, "ownerConfirmation=false must fail schema validation");
+});

@@ -14,12 +14,15 @@ import {
   NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256,
   NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE,
   NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE,
+  NEXUS_STANDING_GRANT_CAS_BRIDGE_CODE,
   buildNexusGatewayRecoveryBridgeCode,
   NEXUS_GATEWAY_RECOVERY_SCHEMA,
+  canonicalAutonomyHash,
   type CommandRunner,
   type NexusGatewayRecoveryRequest,
+  type StandingGrantContext,
+  type StandingGrantReceipt,
 } from "./durable-operations.js";
-
 const execFileAsync = promisify(execFile);
 
 function canonicalHash(value: unknown): string {
@@ -35,6 +38,40 @@ function canonicalHash(value: unknown): string {
     return child;
   };
   return createHash("sha256").update(JSON.stringify(sort(value))).digest("hex");
+}
+
+function makeStandingGrant(overrides: Partial<StandingGrantContext> = {}): StandingGrantReceipt {
+  const contextBase = {
+    schema: "nexus.standing_grant_context.v1" as const,
+    owner_id: "owner-james",
+    coordinator_id: "coordinator-codex",
+    repository: {
+      repository_id: "James3014/Nexus-new",
+      canonical_remote: "https://github.com/James3014/Nexus-new.git",
+    },
+    thread_id: "thread-test-1",
+    goal_id: "goal-test-1",
+    allowed_actions: ["GITHUB_MERGE"],
+    issued_at: new Date(Date.now() - 3600_000).toISOString(),
+    expires_at: new Date(Date.now() + 86400_000).toISOString(),
+    revoked_at: null,
+    revocation_reason: null,
+    ...overrides,
+  };
+  const context: StandingGrantContext = {
+    ...contextBase,
+    context_hash: overrides.context_hash ?? canonicalAutonomyHash(contextBase as unknown as Record<string, unknown>),
+  };
+  const receiptBase = {
+    schema: "nexus.standing_grant_receipt.v1" as const,
+    grant_id: "grant-test-1",
+    context,
+    supersedes_grant_hash: null,
+  };
+  return {
+    ...receiptBase,
+    receipt_hash: canonicalHash(receiptBase),
+  };
 }
 
 function recoveryRequest(overrides: Partial<NexusGatewayRecoveryRequest> = {}): NexusGatewayRecoveryRequest {
@@ -87,6 +124,24 @@ async function runRecoveryBridge(
     child.on("error", rejectPromise);
     child.on("close", (exitCode) => resolvePromise({ exitCode, stdout, stderr }));
     child.stdin.end(JSON.stringify(request));
+  });
+}
+
+async function runPythonBridge(home: string, bridgeCode: string, payload: unknown) {
+  return await new Promise<{ exitCode: number | null; stdout: string; stderr: string }>((resolvePromise, rejectPromise) => {
+    const child = spawn("/usr/bin/python3", ["-I", "-B", "-c", bridgeCode], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: { HOME: home, PATH: "/usr/bin:/bin:/usr/sbin:/sbin", PYTHONNOUSERSITE: "1", PYTHONDONTWRITEBYTECODE: "1" },
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+    child.on("error", rejectPromise);
+    child.on("close", (exitCode) => resolvePromise({ exitCode, stdout, stderr }));
+    child.stdin.end(JSON.stringify(payload));
   });
 }
 
@@ -733,6 +788,229 @@ test("nexus_gateway_recovery_preflight rejects effect_started=true as error", as
       assert.equal(result.status, "error");
       assert.equal(result.effectStarted, true);
       assert.match(result.errorMessage ?? "", /effect/i);
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("fixed Nexus standing-grant CAS bridge rejects malformed input before any host effect", async () => {
+  const home = await mkdtemp(join(tmpdir(), "devspace-standing-grant-bridge-"));
+  try {
+    const result = await runPythonBridge(home, NEXUS_STANDING_GRANT_CAS_BRIDGE_CODE, {});
+    assert.notEqual(result.exitCode, 0);
+    assert.match(result.stderr, /standing-grant CAS request schema mismatch/);
+    assert.equal(result.stdout, "");
+  } finally {
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("nexus_task_card_authority_switch switches exact GITHUB_MERGE receipt to fixed Task Card actions", async () => {
+  const f = await fixture();
+  try {
+    const grantPath = join(f.root, "standing_grant.json");
+    const backupPath = join(f.root, "standing_grant.backup.json");
+    const initialGrant = makeStandingGrant();
+    await writeFile(grantPath, JSON.stringify(initialGrant), { mode: 0o600 });
+
+    const manager = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      async () => { throw new Error("gateway recovery runner unused"); },
+      async () => { throw new Error("preflight runner unused"); },
+      grantPath,
+      backupPath,
+    );
+    try {
+      const input = {
+        attemptKey: "switch-1",
+        expectedCurrentReceiptHash: initialGrant.receipt_hash,
+        expectedCurrentGoalId: initialGrant.context.goal_id,
+        successorGoalId: "goal-task-card-bootstrap",
+        successorThreadId: "thread-task-card-bootstrap",
+        ttlMinutes: 20,
+        ownerConfirmation: true,
+      } as const;
+      const result = await manager.nexusTaskCardAuthoritySwitch(input);
+      assert.equal(result.kind, "nexus_task_card_authority_switch");
+      assert.equal(result.status, "succeeded");
+      assert.equal(result.authorityMode, "OWNER_DIRECT");
+
+      const updatedGrant = JSON.parse(await readFile(grantPath, "utf8")) as StandingGrantReceipt;
+      assert.deepEqual(updatedGrant.context.allowed_actions, ["TASK_CARD_COMMIT", "TASK_CARD_CREATE"]);
+      assert.equal(updatedGrant.context.owner_id, initialGrant.context.owner_id);
+      assert.equal(updatedGrant.context.goal_id, input.successorGoalId);
+      assert.equal(updatedGrant.context.thread_id, input.successorThreadId);
+      assert.equal(updatedGrant.supersedes_grant_hash, initialGrant.receipt_hash);
+      const { receipt_hash: updatedHash, ...updatedPayload } = updatedGrant;
+      assert.equal(updatedHash, canonicalHash(updatedPayload));
+
+      const backupGrant = JSON.parse(await readFile(backupPath, "utf8")) as StandingGrantReceipt;
+      assert.deepEqual(backupGrant, initialGrant);
+
+      const replayed = await manager.nexusTaskCardAuthoritySwitch(input);
+      assert.equal(replayed.operationId, result.operationId);
+      assert.equal(replayed.status, "succeeded");
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("nexus_task_card_authority_switch rejects missing Owner authority, CAS/Goal drift, wide TTL, and wrong predecessor action", async () => {
+  const f = await fixture();
+  try {
+    const grantPath = join(f.root, "standing_grant.json");
+    const backupPath = join(f.root, "standing_grant.backup.json");
+    const initialGrant = makeStandingGrant();
+    await writeFile(grantPath, JSON.stringify(initialGrant), { mode: 0o600 });
+    const manager = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      async () => { throw new Error("unused"); },
+      async () => { throw new Error("unused"); },
+      grantPath,
+      backupPath,
+    );
+    const base = {
+      expectedCurrentReceiptHash: initialGrant.receipt_hash,
+      expectedCurrentGoalId: initialGrant.context.goal_id,
+      successorGoalId: "goal-task-card-bootstrap",
+      successorThreadId: "thread-task-card-bootstrap",
+      ttlMinutes: 20,
+      ownerConfirmation: true,
+    } as const;
+    try {
+      await assert.rejects(
+        manager.nexusTaskCardAuthoritySwitch({ ...base, attemptKey: "switch-err-1", ownerConfirmation: false }),
+        (err: DurableOperationError) => err.code === "NEXUS_AUTHORITY_SWITCH_INVALID",
+      );
+      await assert.rejects(
+        manager.nexusTaskCardAuthoritySwitch({ ...base, attemptKey: "switch-err-2", expectedCurrentReceiptHash: "0".repeat(64) }),
+        (err: DurableOperationError) => err.code === "NEXUS_AUTHORITY_SWITCH_INVALID",
+      );
+      await assert.rejects(
+        manager.nexusTaskCardAuthoritySwitch({ ...base, attemptKey: "switch-err-3", expectedCurrentGoalId: "wrong-goal-id" }),
+        (err: DurableOperationError) => err.code === "NEXUS_AUTHORITY_SWITCH_INVALID",
+      );
+      await assert.rejects(
+        manager.nexusTaskCardAuthoritySwitch({ ...base, attemptKey: "switch-err-4", ttlMinutes: 45 }),
+        (err: DurableOperationError) => err.code === "NEXUS_AUTHORITY_SWITCH_INVALID",
+      );
+
+      const nonMergeGrant = makeStandingGrant({ allowed_actions: ["TASK_CARD_CREATE"] });
+      await writeFile(grantPath, JSON.stringify(nonMergeGrant), { mode: 0o600 });
+      await assert.rejects(
+        manager.nexusTaskCardAuthoritySwitch({
+          ...base,
+          attemptKey: "switch-err-5",
+          expectedCurrentReceiptHash: nonMergeGrant.receipt_hash,
+          expectedCurrentGoalId: nonMergeGrant.context.goal_id,
+        }),
+        (err: DurableOperationError) => err.code === "NEXUS_AUTHORITY_SWITCH_INVALID",
+      );
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("nexus_task_card_authority_restore restores the exact predecessor context as a new CAS successor", async () => {
+  const f = await fixture();
+  try {
+    const grantPath = join(f.root, "standing_grant.json");
+    const backupPath = join(f.root, "standing_grant.backup.json");
+    const initialGrant = makeStandingGrant();
+    await writeFile(grantPath, JSON.stringify(initialGrant), { mode: 0o600 });
+    const manager = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      async () => { throw new Error("unused"); },
+      async () => { throw new Error("unused"); },
+      grantPath,
+      backupPath,
+    );
+    try {
+      const switchResult = await manager.nexusTaskCardAuthoritySwitch({
+        attemptKey: "switch-to-restore-1",
+        expectedCurrentReceiptHash: initialGrant.receipt_hash,
+        expectedCurrentGoalId: initialGrant.context.goal_id,
+        successorGoalId: "goal-task-card-bootstrap",
+        successorThreadId: "thread-task-card-bootstrap",
+        ttlMinutes: 15,
+        ownerConfirmation: true,
+      });
+      assert.equal(switchResult.status, "succeeded");
+      const temporaryReceiptHash = String((switchResult.receipt as Record<string, unknown>).temporaryReceiptHash);
+
+      const restoreInput = {
+        attemptKey: "restore-1",
+        switchOperationId: switchResult.operationId,
+        expectedTemporaryReceiptHash: temporaryReceiptHash,
+        ownerConfirmation: true,
+      } as const;
+      const restoreResult = await manager.nexusTaskCardAuthorityRestore(restoreInput);
+      assert.equal(restoreResult.kind, "nexus_task_card_authority_restore");
+      assert.equal(restoreResult.status, "succeeded");
+      assert.equal(restoreResult.authorityMode, "OWNER_DIRECT");
+
+      const restoredGrant = JSON.parse(await readFile(grantPath, "utf8")) as StandingGrantReceipt;
+      assert.deepEqual(restoredGrant.context, initialGrant.context);
+      assert.equal(restoredGrant.supersedes_grant_hash, temporaryReceiptHash);
+      assert.notEqual(restoredGrant.receipt_hash, initialGrant.receipt_hash);
+      const { receipt_hash: restoredHash, ...restoredPayload } = restoredGrant;
+      assert.equal(restoredHash, canonicalHash(restoredPayload));
+
+      const replayed = await manager.nexusTaskCardAuthorityRestore(restoreInput);
+      assert.equal(replayed.operationId, restoreResult.operationId);
+      assert.equal(replayed.status, "succeeded");
+
+      await assert.rejects(
+        manager.nexusTaskCardAuthorityRestore({ ...restoreInput, expectedTemporaryReceiptHash: "1".repeat(64) }),
+        (err: DurableOperationError) => err.code === "OPERATION_REPLAY_CONFLICT",
+      );
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("nexus_task_card_authority reconcile leaves successful switch stable", async () => {
+  const f = await fixture();
+  try {
+    const grantPath = join(f.root, "standing_grant.json");
+    const backupPath = join(f.root, "standing_grant.backup.json");
+    const initialGrant = makeStandingGrant();
+    await writeFile(grantPath, JSON.stringify(initialGrant), { mode: 0o600 });
+    const manager = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      async () => { throw new Error("unused"); },
+      async () => { throw new Error("unused"); },
+      grantPath,
+      backupPath,
+    );
+    try {
+      const switchResult = await manager.nexusTaskCardAuthoritySwitch({
+        attemptKey: "reconcile-switch-1",
+        expectedCurrentReceiptHash: initialGrant.receipt_hash,
+        expectedCurrentGoalId: initialGrant.context.goal_id,
+        successorGoalId: "goal-task-card-bootstrap",
+        successorThreadId: "thread-task-card-bootstrap",
+        ttlMinutes: 20,
+        ownerConfirmation: true,
+      });
+      const reconciled = await manager.reconcile(switchResult.operationId);
+      assert.equal(reconciled.status, "succeeded");
     } finally {
       manager.close();
     }
