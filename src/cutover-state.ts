@@ -33,6 +33,13 @@ export interface CutoverDrainEvidence {
   oldestAgeMs: number;
 }
 
+export interface CutoverRecoveryEvidence {
+  kind: "REPLACEMENT_RECOVER_DRAIN";
+  recoveredByServerInstanceId: string;
+  transportEvidence: CutoverDrainEvidence;
+  recoveredAt: string;
+}
+
 export interface CutoverReconciliationReceipt {
   closedByServerInstanceId: string;
   workspaceQueryable: boolean;
@@ -56,7 +63,7 @@ interface CutoverRestartMarker {
 export interface DurableCutoverRecord {
   schema: typeof CUTOVER_STATE_SCHEMA;
   cutoverId: string;
-  phase: "prepared" | "drained" | "closed";
+  phase: "prepared" | "drained" | "recovered" | "closed";
   oldServerIdentity: CutoverServerIdentity;
   expectedNewIdentity: ExpectedCutoverIdentity;
   createdAt: string;
@@ -64,6 +71,7 @@ export interface DurableCutoverRecord {
   expiresAt?: string;
   expired?: boolean;
   drainEvidence?: CutoverDrainEvidence;
+  recoveryEvidence?: CutoverRecoveryEvidence;
   restartRequest?: CutoverRestartRequest;
   reconciliationReceipt?: CutoverReconciliationReceipt;
 }
@@ -118,8 +126,10 @@ export class CutoverStateStore {
     let record = parseRecord(raw);
     const events = readdirSync(this.activeDir).filter((name) => name.endsWith(".json"));
     const closed = events.filter((name) => name.startsWith("closed-")).sort().at(-1);
+    const recovered = events.filter((name) => name.startsWith("recovered-")).sort().at(-1);
     const drained = events.filter((name) => name.startsWith("drained-")).sort().at(-1);
     if (closed) record = parseRecord(readFileSync(join(this.activeDir, closed), "utf8"));
+    else if (recovered) record = parseRecord(readFileSync(join(this.activeDir, recovered), "utf8"));
     else if (drained) record = parseRecord(readFileSync(join(this.activeDir, drained), "utf8"));
     const restartRequest = readRestartMarker(this.restartRequestedPath, record.cutoverId)
       ?? record.restartRequest;
@@ -193,6 +203,34 @@ export class CutoverStateStore {
       phase: "drained",
       drainEvidence: evidence,
       updatedAt: new Date(this.now()).toISOString(),
+    });
+  }
+
+  recordRecoveredDrain(
+    cutoverId: string,
+    input: {
+      recoveredByServerInstanceId: string;
+      transportEvidence: CutoverDrainEvidence;
+    },
+  ): DurableCutoverRecord {
+    const record = this.requireExact(cutoverId);
+    if (record.phase === "closed" || record.phase === "recovered") return record;
+    if (record.phase !== "prepared") {
+      throw new CutoverStateError(
+        `Cutover ${cutoverId} can recover a missing drain receipt only from prepared phase.`,
+      );
+    }
+    const recoveredAt = new Date(this.now()).toISOString();
+    return this.replace({
+      ...withoutDiagnostic(record),
+      phase: "recovered",
+      recoveryEvidence: {
+        kind: "REPLACEMENT_RECOVER_DRAIN",
+        recoveredByServerInstanceId: input.recoveredByServerInstanceId,
+        transportEvidence: input.transportEvidence,
+        recoveredAt,
+      },
+      updatedAt: recoveredAt,
     });
   }
 
@@ -279,11 +317,12 @@ function parseRecord(raw: string): DurableCutoverRecord {
   if (
     value.schema !== CUTOVER_STATE_SCHEMA ||
     typeof value.cutoverId !== "string" ||
-    !["prepared", "drained", "closed"].includes(value.phase ?? "") ||
+    !["prepared", "drained", "recovered", "closed"].includes(value.phase ?? "") ||
     !isIdentity(value.oldServerIdentity) ||
     !isExpectedIdentity(value.expectedNewIdentity) ||
     typeof value.createdAt !== "string" ||
     typeof value.updatedAt !== "string" ||
+    (value.recoveryEvidence !== undefined && !isRecoveryEvidence(value.recoveryEvidence)) ||
     (value.restartRequest !== undefined && !isRestartRequest(value.restartRequest))
   ) {
     throw new CutoverStateError("Durable cutover record is malformed; reconciliation is required.");
@@ -307,6 +346,26 @@ function isExpectedIdentity(value: unknown): value is ExpectedCutoverIdentity {
     identity &&
     typeof identity.sourceCommit === "string" &&
     typeof identity.buildId === "string",
+  );
+}
+
+function isRecoveryEvidence(value: unknown): value is CutoverRecoveryEvidence {
+  const recovery = value as Partial<CutoverRecoveryEvidence> | undefined;
+  const transport = recovery?.transportEvidence as Partial<CutoverDrainEvidence> | undefined;
+  return Boolean(
+    recovery &&
+    recovery.kind === "REPLACEMENT_RECOVER_DRAIN" &&
+    typeof recovery.recoveredByServerInstanceId === "string" &&
+    recovery.recoveredByServerInstanceId.length > 0 &&
+    typeof recovery.recoveredAt === "string" &&
+    Number.isFinite(Date.parse(recovery.recoveredAt)) &&
+    transport &&
+    typeof transport.activeSessions === "number" &&
+    Number.isInteger(transport.activeSessions) &&
+    transport.activeSessions >= 0 &&
+    typeof transport.oldestAgeMs === "number" &&
+    Number.isFinite(transport.oldestAgeMs) &&
+    transport.oldestAgeMs >= 0,
   );
 }
 

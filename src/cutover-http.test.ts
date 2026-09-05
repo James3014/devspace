@@ -57,6 +57,56 @@ test("cutover HTTP lifecycle is durable, exact-bound, and secret-free", async ()
   }
 });
 
+test("cutover HTTP replacement recovery is identity-bound and caller supplies no drain evidence", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-http-recovery-"));
+  const store = new CutoverStateStore(stateDir, { newId: () => "cutover-http-recovery" });
+  new McpCutoverController(store, {
+    serverInstanceId: "old-server",
+    sourceCommit: "old-source",
+    buildId: "old-build",
+    capabilityManifestSha256: "cap",
+  }).begin({ sourceCommit: "new-source", buildId: "new-build", capabilityManifestSha256: "cap" });
+
+  const routes = new Map<string, Function>();
+  const app = {
+    get(path: string, ...handlers: Function[]) { routes.set(`GET ${path}`, handlers.at(-1)!); },
+    post(path: string, ...handlers: Function[]) { routes.set(`POST ${path}`, handlers.at(-1)!); },
+  };
+  const replacement = new McpCutoverController(
+    new CutoverStateStore(stateDir),
+    {
+      serverInstanceId: "new-server",
+      sourceCommit: "new-source",
+      buildId: "new-build",
+      capabilityManifestSha256: "cap",
+    },
+  );
+  registerCutoverHttpRoutes(app, {
+    controller: replacement,
+    authenticate: (_req, _res, next) => next(),
+    transportEvidence: () => ({ activeSessions: 2, oldestAgeMs: 500 }),
+    reconcileDurableState: async () => ({
+      workspaceQueryable: true,
+      agentQueryable: true,
+      agentReconciled: true,
+    }),
+  });
+  try {
+    const recovered = await invoke(
+      routes.get("POST /api/cutover/recover-drain")!,
+      { cutoverId: "cutover-http-recovery", activeSessions: 999, oldestAgeMs: 999 },
+    );
+    assert.equal(recovered.statusCode, 200);
+    assert.equal(recovered.body.cutover.phase, "recovered");
+    assert.deepEqual(recovered.body.cutover.recoveryEvidence.transportEvidence, {
+      activeSessions: 2,
+      oldestAgeMs: 500,
+    });
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 async function invoke(handler: Function, body?: unknown): Promise<{ statusCode: number; body: any }> {
   const response = {
     statusCode: 200,

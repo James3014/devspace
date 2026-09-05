@@ -1398,6 +1398,33 @@ function registerCutoverMcpTools(
     },
   );
 
+  registerAppTool(
+    server,
+    "cutover_recover_drain",
+    {
+      title: "Recover cutover drain",
+      description:
+        "Recover exactly one prepared cutover after the old server disappeared before persisting drain evidence. Available only on a replacement server whose source/build/capability identity exactly matches the cutover target. The caller supplies only cutoverId; transport evidence and replacement identity come from the server. This never rewrites arbitrary cutover state or grants execution authority.",
+      inputSchema: { cutoverId: z.string().min(1) },
+      outputSchema: {
+        cutover: cutoverRecordSchema,
+        mode: modeSchema,
+      },
+      _meta: {},
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ cutoverId }) => {
+      const record = control.controller.recoverDrain(cutoverId, control.transportEvidence());
+      const mode = control.controller.mode();
+      return {
+        content: [textBlock(
+          `Recovered missing drain receipt for cutover ${cutoverId} on the exact replacement runtime; mode=${mode}.`,
+        )],
+        structuredContent: { cutover: record as unknown as Record<string, unknown>, mode },
+      };
+    },
+  );
+
   if (control.restartSelf) {
     registerAppTool(
       server,

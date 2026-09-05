@@ -348,6 +348,7 @@ test("cutover MCP control exposes bounded lease lifecycle and schedules self res
       "cutover_status",
       "cutover_start",
       "cutover_drain",
+      "cutover_recover_drain",
       "cutover_restart_self",
       "cutover_finish",
     ]) {

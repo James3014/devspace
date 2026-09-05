@@ -1,6 +1,6 @@
 # GPT-First Dispatch Architecture
 
-Status: G0 architecture baseline for the Dev MCP source candidate.
+Status: G0-G5 accepted; H1/H2 cutover hardening implemented and verified in source on 2026-09-05.
 
 ## Decision
 
@@ -79,7 +79,7 @@ Dev MCP does not own semantic routing, Workforce Admission, independent acceptan
 - **G3** — core capability readiness is independent from Nexus integration readiness.
 - **G4** — physical effect/retry/reconciliation evidence is exposed for GPT-controlled reassignment; Dev MCP never auto-fallbacks.
 
-Live cutover and real host dispatch are deliberately outside G0-G4 and belong to the later G5 acceptance gate.
+G5 subsequently accepted the live GPT_DIRECT path on `78157addb7a2041057542b2cdcce94600bf6e983`. H1/H2 were then added to harden cutover control after G5 exposed two real recovery defects.
 
 ## G0-G4 source candidate evidence (2026-09-05)
 
@@ -97,4 +97,32 @@ Live cutover and real host dispatch are deliberately outside G0-G4 and belong to
 - Full `npm run build`: passed; the existing Vite chunk-size warning remains non-blocking.
 - `git diff --check`: passed.
 - Verification reused the exact lockfile-compatible dependency tree from the source checkout through a temporary `node_modules` symlink; the symlink was removed afterward and no generated/tracked build residue remained.
-- G5 live cutover / ChatGPT host rebind / real GPT_DIRECT acceptance remains deliberately out of scope.
+- G5 live cutover / ChatGPT host rebind / real GPT_DIRECT acceptance: passed on live runtime `78157addb7a2041057542b2cdcce94600bf6e983` (`GPT_DIRECT_LIVE_DISPATCH_VERIFIED`).
+
+## H1/H2 cutover hardening
+
+### H1 — bootstrap-safe reconnect during drain
+
+A cutover may no longer reject a fresh MCP `initialize` merely because the old server is in `drain`. New transports may initialize so the controlling GPT can continue to reach `cutover_status`, `cutover_drain`, restart, finish, and other non-consequential reconciliation tools. Consequential tools remain blocked by the durable `assertToolAllowed()` fence, so reconnectability does not grant mutation authority.
+
+### H2 — typed replacement recovery for a missing drain receipt
+
+If the old server disappears while the durable cutover is still `prepared`, an exact replacement server may use `cutover_recover_drain(cutoverId)`. The transition is accepted only when:
+
+- the replacement `serverInstanceId` differs from the old server;
+- source commit exactly matches the expected target;
+- build ID exactly matches the expected target;
+- capability manifest exactly matches the expected target;
+- the caller supplies no session counts, paths, commands, or arbitrary state.
+
+The server itself captures current bounded transport evidence and persists a typed `REPLACEMENT_RECOVER_DRAIN` event. `cutover_finish` accepts either normal `drained` evidence or this typed `recovered` evidence, and still requires the ordinary durable workspace/agent reconciliation witness.
+
+Focused verification:
+
+- `cutover-state.test.ts`: 6/6 passed.
+- `mcp-cutover.test.ts`: 5/5 passed.
+- `cutover-http.test.ts`: 2/2 passed.
+- Full TypeScript typecheck: passed.
+- Full build: passed.
+- `git diff --check`: passed.
+- `server.test.ts` could not execute assertions in this worktree because the local `better-sqlite3` native binding was absent; all 33 failures shared that environment error rather than a product assertion failure.

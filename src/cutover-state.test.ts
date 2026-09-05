@@ -138,6 +138,48 @@ test("concurrent restart requesters produce exactly one restart authority winner
   }
 });
 
+test("replacement drain recovery is durable, typed, and survives store replacement", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-recovery-"));
+  try {
+    let now = 1_000;
+    const first = new CutoverStateStore(stateDir, {
+      now: () => now,
+      newId: () => `recovery-${now}`,
+    });
+    first.begin({
+      oldServerIdentity: oldIdentity,
+      expectedNewIdentity: { sourceCommit: "source-new", buildId: "build-new" },
+    });
+
+    now = 2_000;
+    const recovered = first.recordRecoveredDrain("recovery-1000", {
+      recoveredByServerInstanceId: "server-new",
+      transportEvidence: { activeSessions: 3, oldestAgeMs: 12_000 },
+    });
+    assert.equal(recovered.phase, "recovered");
+    assert.deepEqual(recovered.recoveryEvidence, {
+      kind: "REPLACEMENT_RECOVER_DRAIN",
+      recoveredByServerInstanceId: "server-new",
+      transportEvidence: { activeSessions: 3, oldestAgeMs: 12_000 },
+      recoveredAt: new Date(2_000).toISOString(),
+    });
+
+    now = 3_000;
+    const reopened = new CutoverStateStore(stateDir, { now: () => now });
+    assert.equal(reopened.get()?.phase, "recovered");
+    assert.equal(reopened.get()?.recoveryEvidence?.recoveredByServerInstanceId, "server-new");
+    assert.equal(
+      reopened.recordRecoveredDrain("recovery-1000", {
+        recoveredByServerInstanceId: "server-other",
+        transportEvidence: { activeSessions: 999, oldestAgeMs: 999 },
+      }).recoveryEvidence?.recoveredByServerInstanceId,
+      "server-new",
+    );
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("drain evidence and terminal reconciliation receipt survive store replacement", () => {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-receipt-"));
   try {

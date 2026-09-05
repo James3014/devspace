@@ -88,6 +88,35 @@ export class McpCutoverController {
     return this.store.recordDrain(cutoverId, evidence);
   }
 
+  recoverDrain(cutoverId: string, evidence: CutoverDrainEvidence): DurableCutoverRecord {
+    const record = this.store.get();
+    if (!record) throw new CutoverStateError("No durable cutover record exists.");
+    if (record.cutoverId !== cutoverId) {
+      throw new CutoverStateError(`Cutover id mismatch: active cutover is ${record.cutoverId}.`);
+    }
+    if (record.phase === "closed" || record.phase === "recovered") return record;
+    if (record.phase !== "prepared") {
+      throw new CutoverStateError(
+        `Cutover ${cutoverId} can recover a missing drain receipt only from prepared phase.`,
+      );
+    }
+    const comparison = compareServerIdentity(record, this.currentIdentity);
+    if (!comparison.serverInstanceChanged) {
+      throw new CutoverStateError(
+        "Replacement drain recovery requires a different serverInstanceId from the old cutover owner.",
+      );
+    }
+    if (!comparison.sourceMatches || !comparison.buildMatches || !comparison.capabilityManifestMatches) {
+      throw new CutoverStateError(
+        "Replacement drain recovery requires the exact expected source/build/capability identity.",
+      );
+    }
+    return this.store.recordRecoveredDrain(cutoverId, {
+      recoveredByServerInstanceId: this.currentIdentity.serverInstanceId,
+      transportEvidence: evidence,
+    });
+  }
+
   requestRestart(cutoverId: string): {
     record: DurableCutoverRecord;
     newlyRequested: boolean;
@@ -121,7 +150,10 @@ export class McpCutoverController {
   }
 
   canInitializeTransport(): boolean {
-    return this.mode() !== "drain";
+    // Fresh transports remain bootstrap-safe during cutover. Consequential
+    // tools are still blocked by assertToolAllowed(), so reconnecting the host
+    // cannot bypass the durable drain/reconciliation fence.
+    return true;
   }
 
   assertToolAllowed(toolName: string): void {
@@ -152,9 +184,9 @@ export class McpCutoverController {
       throw new CutoverStateError(`Cutover id mismatch: active cutover is ${record.cutoverId}.`);
     }
     if (record.phase === "closed") return record;
-    if (record.phase !== "drained") {
+    if (record.phase !== "drained" && record.phase !== "recovered") {
       throw new CutoverStateError(
-        `Cutover ${cutoverId} must have durable drain evidence before it can be finished.`,
+        `Cutover ${cutoverId} must have durable drain or typed replacement-recovery evidence before it can be finished.`,
       );
     }
 
@@ -249,6 +281,16 @@ export function registerCutoverHttpRoutes(
     try {
       const cutoverId = requiredString(objectBody(req.body).cutoverId, "cutoverId");
       const record = controller.recordDrain(cutoverId, transportEvidence());
+      res.json({ cutover: record, mode: controller.mode() });
+    } catch (error) {
+      sendCutoverError(res, error);
+    }
+  });
+
+  app.post("/api/cutover/recover-drain", authenticate, (req, res) => {
+    try {
+      const cutoverId = requiredString(objectBody(req.body).cutoverId, "cutoverId");
+      const record = controller.recoverDrain(cutoverId, transportEvidence());
       res.json({ cutover: record, mode: controller.mode() });
     } catch (error) {
       sendCutoverError(res, error);

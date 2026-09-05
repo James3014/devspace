@@ -20,6 +20,7 @@ test("old instance drains and replacement instance is reconcile-only across rest
     const old = new McpCutoverController(store, identity("old", "old-source", "old-build"));
     old.begin({ sourceCommit: "new-source", buildId: "new-build", capabilityManifestSha256: "cap" });
     assert.equal(old.mode(), "drain");
+    assert.equal(old.canInitializeTransport(), true);
     assert.throws(() => old.assertToolAllowed("write"), /CUTOVER_RECONCILIATION_REQUIRED/);
     assert.throws(() => old.assertToolAllowed("workspace_verify"), /CUTOVER_RECONCILIATION_REQUIRED/);
     assert.doesNotThrow(() => old.assertToolAllowed("read"));
@@ -38,8 +39,49 @@ test("old instance drains and replacement instance is reconcile-only across rest
       () => replacement.recordDrain("cutover-one", { activeSessions: 0, oldestAgeMs: 0 }),
       /only the old server instance/i,
     );
+    const recovered = replacement.recoverDrain("cutover-one", { activeSessions: 1, oldestAgeMs: 25 });
+    assert.equal(recovered.phase, "recovered");
+    assert.equal(recovered.recoveryEvidence?.kind, "REPLACEMENT_RECOVER_DRAIN");
+    assert.equal(recovered.recoveryEvidence?.recoveredByServerInstanceId, "new");
+    assert.deepEqual(recovered.recoveryEvidence?.transportEvidence, { activeSessions: 1, oldestAgeMs: 25 });
+    assert.equal(replacement.recoverDrain("cutover-one", { activeSessions: 999, oldestAgeMs: 999 }).phase, "recovered");
     assert.throws(() => replacement.assertToolAllowed("agent_start"), /CUTOVER_RECONCILIATION_REQUIRED/);
     assert.throws(() => replacement.assertToolAllowed("bash"), /CUTOVER_RECONCILIATION_REQUIRED/);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("replacement drain recovery is exact-identity bound and can close through the normal reconciliation witness", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-mcp-recover-drain-"));
+  try {
+    const store = new CutoverStateStore(stateDir, { newId: () => "cutover-recover" });
+    const old = new McpCutoverController(store, identity("old", "old-source", "old-build"));
+    old.begin({ sourceCommit: "new-source", buildId: "new-build", capabilityManifestSha256: "cap" });
+
+    assert.throws(
+      () => new McpCutoverController(store, identity("new", "wrong-source", "new-build")).recoverDrain(
+        "cutover-recover",
+        { activeSessions: 1, oldestAgeMs: 10 },
+      ),
+      /exact expected source\/build\/capability identity/i,
+    );
+    assert.throws(
+      () => old.recoverDrain("cutover-recover", { activeSessions: 1, oldestAgeMs: 10 }),
+      /different serverInstanceId/i,
+    );
+
+    const replacement = new McpCutoverController(store, identity("new", "new-source", "new-build"));
+    const recovered = replacement.recoverDrain("cutover-recover", { activeSessions: 2, oldestAgeMs: 20 });
+    assert.equal(recovered.phase, "recovered");
+    const closed = await replacement.finish("cutover-recover", async () => ({
+      workspaceQueryable: true,
+      agentQueryable: true,
+      agentReconciled: true,
+    }));
+    assert.equal(closed.phase, "closed");
+    assert.equal(closed.recoveryEvidence?.kind, "REPLACEMENT_RECOVER_DRAIN");
+    assert.equal(replacement.mode(), "normal");
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -59,7 +101,7 @@ test("finish fails closed for old/wrong identities and closes exact cutover idem
 
     await assert.rejects(
       new McpCutoverController(store, identity("new", "new-source", "new-build")).finish("cutover-exact", witness),
-      /durable drain evidence/i,
+      /durable drain or typed replacement-recovery evidence/i,
     );
     old.recordDrain("cutover-exact", { activeSessions: 1, oldestAgeMs: 10 });
     await assert.rejects(
