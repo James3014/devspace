@@ -862,6 +862,53 @@ test("nexus_task_card_authority_switch switches exact GITHUB_MERGE receipt to fi
   }
 });
 
+test("nexus_task_card_authority_switch emits Nexus-canonical six-digit UTC timestamps", async () => {
+  const f = await fixture();
+  try {
+    const grantPath = join(f.root, "standing_grant.json");
+    const backupPath = join(f.root, "standing_grant.backup.json");
+    const fixedNow = Date.parse("2026-09-05T08:40:07.910Z");
+    const initialGrant = makeStandingGrant({
+      owner_id: "James3014",
+      coordinator_id: "primary-codex-coordinator",
+      issued_at: "2026-09-05T07:40:07.910000Z",
+      expires_at: "2026-09-05T09:40:07.910000Z",
+    });
+    await writeFile(grantPath, JSON.stringify(initialGrant), { mode: 0o600 });
+
+    const manager = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      async () => { throw new Error("gateway recovery runner unused"); },
+      async () => { throw new Error("preflight runner unused"); },
+      grantPath,
+      backupPath,
+      () => fixedNow,
+    );
+    try {
+      const result = await manager.nexusTaskCardAuthoritySwitch({
+        attemptKey: "switch-python-canonical-timestamp-1",
+        expectedCurrentReceiptHash: initialGrant.receipt_hash,
+        expectedCurrentGoalId: initialGrant.context.goal_id,
+        successorGoalId: "H4-LIVE-TASK-CARD-AUTHORITY-ACCEPTANCE-20260905",
+        successorThreadId: "H4-LIVE-TASK-CARD-AUTHORITY-ACCEPTANCE-20260905",
+        ttlMinutes: 1,
+        ownerConfirmation: true,
+      });
+      assert.equal(result.status, "succeeded");
+
+      const updatedGrant = JSON.parse(await readFile(grantPath, "utf8")) as StandingGrantReceipt;
+      assert.equal(updatedGrant.context.issued_at, "2026-09-05T08:40:07.910000Z");
+      assert.equal(updatedGrant.context.expires_at, "2026-09-05T08:41:07.910000Z");
+      assert.equal(updatedGrant.context.context_hash, "d83148444f0d30c3bf1706e36ca6de34b46fe586ffd237a2cd08ec5b78f6c9fe");
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("nexus_task_card_authority_switch rejects missing Owner authority, CAS/Goal drift, wide TTL, and wrong predecessor action", async () => {
   const f = await fixture();
   try {

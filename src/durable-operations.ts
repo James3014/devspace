@@ -640,8 +640,8 @@ export class DurableOperationManager {
     if (!Number.isFinite(predecessorExpiry) || predecessorExpiry <= now) {
       throw new DurableOperationError("NEXUS_AUTHORITY_SWITCH_INVALID", "Current standing grant is expired.");
     }
-    const issuedAt = new Date(now).toISOString();
-    const expiresAt = new Date(Math.min(now + ttlMinutes * 60_000, predecessorExpiry)).toISOString();
+    const issuedAt = nexusCanonicalUtcTimestamp(now);
+    const expiresAt = nexusCanonicalUtcTimestamp(Math.min(now + ttlMinutes * 60_000, predecessorExpiry));
     const temporaryContext = issueStandingGrantContext({
       owner_id: predecessor.context.owner_id,
       coordinator_id: predecessor.context.coordinator_id,
@@ -1138,6 +1138,11 @@ export function assertNexusGatewayRecoveryRequest(value: unknown): asserts value
   if (request.request_hash !== expectedRequestHash) {
     throw new DurableOperationError("NEXUS_GATEWAY_REQUEST_INVALID", "Nexus Gateway recovery request hash mismatch.");
   }
+}
+
+function nexusCanonicalUtcTimestamp(epochMs: number): string {
+  const iso = new Date(epochMs).toISOString();
+  return `${iso.slice(0, -1)}000Z`;
 }
 
 export function canonicalAutonomyHash(value: Record<string, unknown>): string {
