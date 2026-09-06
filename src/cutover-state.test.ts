@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -133,6 +133,183 @@ test("concurrent restart requesters produce exactly one restart authority winner
     )));
     assert.equal(results.filter((result) => result.newlyRequested).length, 1);
     assert.ok(results.every((result) => result.record.restartRequest?.actuator === "launchd-self"));
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("restart scheduling requires build-ready attestation and marker is durable and idempotent", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-restart-scheduled-"));
+  try {
+    let now = 1_000;
+    const store = new CutoverStateStore(stateDir, {
+      now: () => now,
+      newId: () => `event-${now}`,
+    });
+    const created = store.begin({
+      oldServerIdentity: oldIdentity,
+      expectedNewIdentity: { sourceCommit: "source-new", buildId: "build-new" },
+    });
+    assert.throws(
+      () => store.recordRestartScheduled(created.cutoverId, oldIdentity.serverInstanceId),
+      /requires a drained cutover/i,
+    );
+
+    now = 2_000;
+    store.recordDrain(created.cutoverId, { activeSessions: 2, oldestAgeMs: 9_000 });
+    const requested = store.recordRestartRequest(created.cutoverId, {
+      actuator: "launchd-self",
+      requestedByServerInstanceId: oldIdentity.serverInstanceId,
+      buildReady: {
+        verifiedBy: "deploy-operator",
+        verifiedAt: new Date(2_000).toISOString(),
+        evidence: "staged artifact matches expected build",
+      },
+    });
+    assert.equal(requested.record.restartRequest?.buildReady?.verifiedBy, "deploy-operator");
+
+    now = 3_000;
+    const scheduled = store.recordRestartScheduled(created.cutoverId, oldIdentity.serverInstanceId);
+    assert.equal(scheduled.newlyScheduled, true);
+    assert.equal(scheduled.record.restartRequest?.restartScheduledAt, new Date(3_000).toISOString());
+    assert.equal(
+      scheduled.record.restartRequest?.restartScheduledForServerInstanceId,
+      oldIdentity.serverInstanceId,
+    );
+
+    const duplicate = new CutoverStateStore(stateDir, { now: () => now })
+      .recordRestartScheduled(created.cutoverId, oldIdentity.serverInstanceId);
+    assert.equal(duplicate.newlyScheduled, false);
+    assert.equal(duplicate.record.restartRequest?.restartScheduledAt, new Date(3_000).toISOString());
+
+    const afterReplacement = new CutoverStateStore(stateDir).get();
+    assert.equal(afterReplacement?.restartRequest?.restartScheduledAt, new Date(3_000).toISOString());
+    assert.equal(afterReplacement?.restartRequest?.buildReady?.verifiedBy, "deploy-operator");
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("restart scheduling fails closed without a build-ready attestation", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-restart-ungated-"));
+  try {
+    const store = new CutoverStateStore(stateDir, { newId: () => "cutover-ungated" });
+    store.begin({
+      oldServerIdentity: oldIdentity,
+      expectedNewIdentity: { sourceCommit: "source-new", buildId: "build-new" },
+    });
+    store.recordDrain("cutover-ungated", { activeSessions: 2, oldestAgeMs: 9_000 });
+    store.recordRestartRequest("cutover-ungated", {
+      actuator: "launchd-self",
+      requestedByServerInstanceId: oldIdentity.serverInstanceId,
+    });
+    assert.throws(
+      () => store.recordRestartScheduled("cutover-ungated", oldIdentity.serverInstanceId),
+      /build-ready attestation/i,
+    );
+    assert.throws(
+      () => store.recordRestartScheduled("cutover-ungated", oldIdentity.serverInstanceId),
+      /CUTOVER_BUILD_NOT_READY/i,
+    );
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("concurrent schedulers produce exactly one restart schedule winner", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-schedule-race-"));
+  try {
+    const initial = new CutoverStateStore(stateDir, { newId: () => "cutover-schedule-race" });
+    initial.begin({
+      oldServerIdentity: oldIdentity,
+      expectedNewIdentity: { sourceCommit: "source-new", buildId: "build-new" },
+    });
+    initial.recordDrain("cutover-schedule-race", { activeSessions: 4, oldestAgeMs: 5_000 });
+    initial.recordRestartRequest("cutover-schedule-race", {
+      actuator: "launchd-self",
+      requestedByServerInstanceId: oldIdentity.serverInstanceId,
+      buildReady: { verifiedBy: "deploy-operator", verifiedAt: new Date().toISOString() },
+    });
+
+    const stores = Array.from({ length: 12 }, () => new CutoverStateStore(stateDir));
+    const results = await Promise.all(stores.map(async (store) => store.recordRestartScheduled(
+      "cutover-schedule-race",
+      oldIdentity.serverInstanceId,
+    )));
+    assert.equal(results.filter((result) => result.newlyScheduled).length, 1);
+    assert.ok(results.every((result) => result.record.restartRequest?.restartScheduledAt !== undefined));
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("invalid build-ready receipt and malformed schedule fence fail closed", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-invalid-"));
+  try {
+    const store = new CutoverStateStore(stateDir, { newId: () => "cutover-invalid" });
+    store.begin({
+      oldServerIdentity: oldIdentity,
+      expectedNewIdentity: { sourceCommit: "source-new", buildId: "build-new" },
+    });
+    store.recordDrain("cutover-invalid", { activeSessions: 0, oldestAgeMs: 0 });
+    assert.throws(
+      () => store.recordRestartRequest("cutover-invalid", {
+        actuator: "launchd-self",
+        requestedByServerInstanceId: oldIdentity.serverInstanceId,
+        buildReady: { verifiedBy: "op", verifiedAt: "not-a-date" },
+      }),
+      /build-ready attestation is invalid/i,
+    );
+
+    store.recordRestartRequest("cutover-invalid", {
+      actuator: "launchd-self",
+      requestedByServerInstanceId: oldIdentity.serverInstanceId,
+      buildReady: { verifiedBy: "op", verifiedAt: new Date().toISOString() },
+    });
+    store.recordRestartScheduled("cutover-invalid", oldIdentity.serverInstanceId);
+
+    const activeDir = join(stateDir, "cutover", "active");
+    writeFileSync(join(activeDir, "restart-scheduled.json"), "garbage", "utf8");
+    assert.throws(
+      () => new CutoverStateStore(stateDir).get(),
+      /restart-scheduled fence is malformed/i,
+    );
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("schedule fence from another cutover or a missing marker reads safely", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-fence-wrong-"));
+  try {
+    const store = new CutoverStateStore(stateDir, { newId: () => "cutover-fence-wrong" });
+    store.begin({
+      oldServerIdentity: oldIdentity,
+      expectedNewIdentity: { sourceCommit: "source-new", buildId: "build-new" },
+    });
+    store.recordDrain("cutover-fence-wrong", { activeSessions: 0, oldestAgeMs: 0 });
+    store.recordRestartRequest("cutover-fence-wrong", {
+      actuator: "launchd-self",
+      requestedByServerInstanceId: oldIdentity.serverInstanceId,
+      buildReady: { verifiedBy: "op", verifiedAt: new Date().toISOString() },
+    });
+    assert.equal(store.get()?.restartRequest?.restartScheduledAt, undefined);
+
+    const activeDir = join(stateDir, "cutover", "active");
+    writeFileSync(
+      join(activeDir, "restart-scheduled.json"),
+      JSON.stringify({
+        schema: "devspace.cutover_restart_scheduled.v1",
+        cutoverId: "some-other-cutover",
+        scheduledForServerInstanceId: "server-other",
+        scheduledAt: new Date().toISOString(),
+      }),
+      "utf8",
+    );
+    assert.throws(
+      () => new CutoverStateStore(stateDir).get(),
+      /does not match the active cutover/i,
+    );
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }

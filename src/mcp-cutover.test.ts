@@ -115,6 +115,62 @@ test("restart authority is drain-bound, idempotent, and cannot transfer to repla
   }
 });
 
+test("markRestartScheduled is owner-bound, attestation-gated, idempotent, and fail-closed", () => {
+  const ungatedDir = mkdtempSync(join(tmpdir(), "devspace-mcp-mark-ungated-"));
+  try {
+    const store = new CutoverStateStore(ungatedDir, { newId: () => "cutover-ungated" });
+    const old = new McpCutoverController(store, identity("old", "old-source", "old-build"));
+    old.begin({ sourceCommit: "new-source", buildId: "new-build" });
+    assert.throws(
+      () => old.markRestartScheduled("cutover-ungated"),
+      /requires a drained cutover/i,
+    );
+
+    old.recordDrain("cutover-ungated", { activeSessions: 1, oldestAgeMs: 100 });
+    old.requestRestart("cutover-ungated");
+    assert.throws(
+      () => old.markRestartScheduled("cutover-ungated"),
+      /build-ready attestation/i,
+    );
+    assert.throws(
+      () => old.markRestartScheduled("cutover-ungated"),
+      /CUTOVER_BUILD_NOT_READY/i,
+    );
+    assert.equal(old.record()?.restartRequest?.restartScheduledAt, undefined);
+
+    const aGatedDir = mkdtempSync(join(tmpdir(), "devspace-mcp-mark-gated-"));
+    try {
+      const gatedStore = new CutoverStateStore(aGatedDir, { newId: () => "cutover-gated" });
+      const gated = new McpCutoverController(gatedStore, identity("old", "old-source", "old-build"));
+      gated.begin({ sourceCommit: "new-source", buildId: "new-build" });
+      gated.recordDrain("cutover-gated", { activeSessions: 1, oldestAgeMs: 100 });
+      gated.requestRestart("cutover-gated", {
+        verifiedBy: "op",
+        verifiedAt: new Date().toISOString(),
+      });
+      assert.equal(gated.markRestartScheduled("cutover-gated").newlyScheduled, true);
+      assert.equal(gated.markRestartScheduled("cutover-gated").newlyScheduled, false);
+      assert.equal(
+        gated.record()?.restartRequest?.restartScheduledForServerInstanceId,
+        "old",
+      );
+
+      const replacement = new McpCutoverController(
+        new CutoverStateStore(aGatedDir),
+        identity("new", "new-source", "new-build"),
+      );
+      assert.throws(
+        () => replacement.markRestartScheduled("cutover-gated"),
+        /only the old server instance/i,
+      );
+    } finally {
+      rmSync(aGatedDir, { recursive: true, force: true });
+    }
+  } finally {
+    rmSync(ungatedDir, { recursive: true, force: true });
+  }
+});
+
 test("finish requires a real positive durable reconciliation witness", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-mcp-witness-"));
   try {

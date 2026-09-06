@@ -1,4 +1,10 @@
 import type {
+  BuildReadyProbeResult,
+} from "./cutover-build-ready.js";
+import { CutoverBuildNotReadyError } from "./cutover-build-ready.js";
+import type { SelfRestartActuator } from "./cutover-restart.js";
+import type {
+  BuildReadyReceipt,
   CutoverDrainEvidence,
   CutoverReconciliationReceipt,
   CutoverServerIdentity,
@@ -7,6 +13,7 @@ import type {
 } from "./cutover-state.js";
 import { CutoverStateError, CutoverStateStore } from "./cutover-state.js";
 import type { NextFunction, Request, Response } from "express";
+import type { OrchestrationOutcome } from "./cutover-orchestration.js";
 
 export type CutoverMode = "normal" | "drain" | "reconcile-only";
 
@@ -88,7 +95,7 @@ export class McpCutoverController {
     return this.store.recordDrain(cutoverId, evidence);
   }
 
-  requestRestart(cutoverId: string): {
+  requestRestart(cutoverId: string, buildReady?: BuildReadyReceipt): {
     record: DurableCutoverRecord;
     newlyRequested: boolean;
   } {
@@ -105,7 +112,25 @@ export class McpCutoverController {
     return this.store.recordRestartRequest(cutoverId, {
       actuator: "launchd-self",
       requestedByServerInstanceId: this.currentIdentity.serverInstanceId,
+      ...(buildReady ? { buildReady } : {}),
     });
+  }
+
+  markRestartScheduled(cutoverId: string): {
+    record: DurableCutoverRecord;
+    newlyScheduled: boolean;
+  } {
+    const record = this.store.get();
+    if (!record) throw new CutoverStateError("No durable cutover record exists.");
+    if (record.cutoverId !== cutoverId) {
+      throw new CutoverStateError(`Cutover id mismatch: active cutover is ${record.cutoverId}.`);
+    }
+    if (record.oldServerIdentity.serverInstanceId !== this.currentIdentity.serverInstanceId) {
+      throw new CutoverStateError(
+        "Only the old server instance that owns the drain lease may schedule its restart.",
+      );
+    }
+    return this.store.recordRestartScheduled(cutoverId, this.currentIdentity.serverInstanceId);
   }
 
   record(): DurableCutoverRecord | undefined {
@@ -210,6 +235,11 @@ export interface CutoverHttpDependencies {
     workspaceId: string;
     agentId: string;
   }) => Promise<DurableReconciliationWitness>;
+  restartSelf?: SelfRestartActuator;
+  probeBuildReady?: (
+    expected: ExpectedCutoverIdentity,
+  ) => Promise<BuildReadyProbeResult> | BuildReadyProbeResult;
+  advance?: () => Promise<OrchestrationOutcome>;
 }
 
 interface RouteRegistrar {
@@ -222,7 +252,15 @@ export function registerCutoverHttpRoutes(
   app: RouteRegistrar,
   dependencies: CutoverHttpDependencies,
 ): void {
-  const { controller, authenticate, transportEvidence, reconcileDurableState } = dependencies;
+  const {
+    controller,
+    authenticate,
+    transportEvidence,
+    reconcileDurableState,
+    restartSelf,
+    probeBuildReady,
+    advance,
+  } = dependencies;
 
   app.get("/api/cutover/status", authenticate, (_req, res) => {
     res.json(controller.status(transportEvidence()));
@@ -250,6 +288,87 @@ export function registerCutoverHttpRoutes(
       const cutoverId = requiredString(objectBody(req.body).cutoverId, "cutoverId");
       const record = controller.recordDrain(cutoverId, transportEvidence());
       res.json({ cutover: record, mode: controller.mode() });
+    } catch (error) {
+      sendCutoverError(res, error);
+    }
+  });
+
+  app.post("/api/cutover/restart", authenticate, async (req, res) => {
+    try {
+      const body = objectBody(req.body);
+      const cutoverId = requiredString(body.cutoverId, "cutoverId");
+      if (body.buildReady === undefined) {
+        throw new CutoverBuildNotReadyError(`Restart request ${cutoverId} lacks a build-ready attestation.`);
+      }
+      const buildReady = buildReadyReceipt(body.buildReady);
+      const request = controller.requestRestart(cutoverId, buildReady);
+      const restart = request.record.restartRequest;
+      if (!restart?.buildReady) {
+        throw new CutoverBuildNotReadyError(
+          `Restart request ${cutoverId} lacks a build-ready attestation.`,
+        );
+      }
+      if (restart.restartScheduledAt) {
+        res.status(200).json({
+          cutover: request.record,
+          mode: controller.mode(),
+          restart: { scheduled: false, alreadyRequested: true, scheduleBlocked: false },
+        });
+        return;
+      }
+      if (probeBuildReady) {
+        const probe = await probeBuildReady(request.record.expectedNewIdentity);
+        if (!probe.buildReady) {
+          throw new CutoverBuildNotReadyError(probe.detail);
+        }
+      }
+      if (!restartSelf) {
+        throw new CutoverStateError("Restart scheduling is unavailable in this environment.");
+      }
+      const mark = controller.markRestartScheduled(cutoverId);
+      const scheduled = mark.newlyScheduled ? restartSelf.schedule() : undefined;
+      if (!scheduled) {
+        res.status(200).json({
+          cutover: mark.record,
+          mode: controller.mode(),
+          restart: { scheduled: false, alreadyRequested: true, scheduleBlocked: false },
+        });
+        return;
+      }
+      res.status(200).json({
+        cutover: mark.record,
+        mode: controller.mode(),
+        restart: {
+          scheduled: true,
+          alreadyRequested: false,
+          actuator: "launchd-self",
+          serviceLabel: restartSelf.serviceLabel,
+          launchdTarget: restartSelf.launchdTarget,
+        },
+      });
+    } catch (error) {
+      sendCutoverError(res, error);
+    }
+  });
+
+  app.post("/api/cutover/advance", authenticate, async (_req, res) => {
+    if (!advance) {
+      sendCutoverError(
+        res,
+        new CutoverStateError("Cutover orchestration is unavailable in this environment."),
+      );
+      return;
+    }
+    try {
+      const outcome = await advance();
+      if (outcome.outcome === "blocked") {
+        res.status(409).json({
+          error: { code: outcome.code, message: outcome.reason },
+          outcome,
+        });
+        return;
+      }
+      res.status(200).json({ outcome });
     } catch (error) {
       sendCutoverError(res, error);
     }
@@ -290,8 +409,35 @@ function optionalString(value: unknown): string | undefined {
   return typeof value === "string" && value.trim() !== "" ? value : undefined;
 }
 
+function buildReadyReceipt(value: unknown): BuildReadyReceipt {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new CutoverStateError("buildReady must be a build-ready attestation object.");
+  }
+  const receipt = value as Partial<BuildReadyReceipt>;
+  if (
+    typeof receipt.verifiedBy !== "string" ||
+    receipt.verifiedBy.trim() === "" ||
+    typeof receipt.verifiedAt !== "string" ||
+    !Number.isFinite(Date.parse(receipt.verifiedAt)) ||
+    (receipt.evidence !== undefined && typeof receipt.evidence !== "string")
+  ) {
+    throw new CutoverStateError("buildReady must contain a non-empty verifiedBy and an ISO verifiedAt.");
+  }
+  return {
+    verifiedBy: receipt.verifiedBy,
+    verifiedAt: receipt.verifiedAt,
+    ...(receipt.evidence !== undefined ? { evidence: receipt.evidence } : {}),
+  };
+}
+
 function sendCutoverError(res: Response, error: unknown): void {
   const message = error instanceof Error ? error.message : String(error);
+  if (error instanceof CutoverBuildNotReadyError) {
+    res.status(409).json({
+      error: { code: "CUTOVER_BUILD_NOT_READY", message },
+    });
+    return;
+  }
   res.status(error instanceof CutoverStateError ? 409 : 500).json({
     error: {
       code: error instanceof CutoverStateError ? "CUTOVER_RECONCILIATION_REQUIRED" : "CUTOVER_INTERNAL_ERROR",

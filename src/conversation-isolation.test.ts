@@ -59,6 +59,10 @@ class MemoryWorkspaceStore implements WorkspaceStore {
     return this.sessions.get(id);
   }
 
+  listSessions(): WorkspaceSession[] {
+    return [...this.sessions.values()];
+  }
+
   touchSession(id: string): void {
     const session = this.sessions.get(id);
     if (session) session.lastUsedAt = new Date().toISOString();
