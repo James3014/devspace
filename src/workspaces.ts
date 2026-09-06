@@ -3,6 +3,7 @@ import type { Stats } from "node:fs";
 import type {
   WorkspaceConversationBinding,
   WorkspaceMode,
+  WorkspaceSession,
   WorkspaceStore,
 } from "./workspace-store.js";
 import { mkdir, opendir, readFile, realpath, stat } from "node:fs/promises";
@@ -309,6 +310,19 @@ export class WorkspaceRegistry {
     this.workspaces.set(restoredWorkspace.id, restoredWorkspace);
 
     return restoredWorkspace;
+  }
+
+  listSessions(): WorkspaceSession[] {
+    return this.store?.listSessions() ?? [];
+  }
+
+  inspectWorkspace(
+    workspaceId: string,
+  ): { session?: WorkspaceSession; loaded: boolean } {
+    return {
+      session: this.store?.getSession(workspaceId),
+      loaded: this.workspaces.has(workspaceId),
+    };
   }
 
   async conversationMutationSafety(

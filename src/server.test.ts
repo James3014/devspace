@@ -323,6 +323,13 @@ test("cutover MCP control exposes bounded lease lifecycle and schedules self res
         agentQueryable: true,
         agentReconciled: true,
       }),
+      inspectWorkspace: (workspaceId) => workspaces.inspectWorkspace(workspaceId),
+      listWorkspaceSessions: () => workspaces.listSessions(),
+      advance: async () => ({
+        outcome: "restart_already_scheduled",
+        reason: "restart already durably scheduled",
+        scheduledFor: "com.example.devspace",
+      }),
       restartSelf: {
         actuator: "launchd-self",
         serviceLabel: "com.example.devspace",
@@ -350,6 +357,8 @@ test("cutover MCP control exposes bounded lease lifecycle and schedules self res
       "cutover_drain",
       "cutover_restart_self",
       "cutover_finish",
+      "workspace_inspect",
+      "cutover_reconcile",
     ]) {
       assert.ok(tools.tools.some((tool) => tool.name === name), `missing ${name}`);
     }
@@ -376,19 +385,52 @@ test("cutover MCP control exposes bounded lease lifecycle and schedules self res
 
     const firstRestart = structuredContent(await client.callTool({
       name: "cutover_restart_self",
-      arguments: { cutoverId: "cutover-mcp-control" },
+      arguments: {
+        cutoverId: "cutover-mcp-control",
+        buildReady: { verifiedBy: "test-operator", verifiedAt: "2025-01-01T00:00:00.000Z" },
+      },
     }));
     assert.equal((firstRestart.restart as Record<string, unknown>).scheduled, true);
     assert.equal((firstRestart.restart as Record<string, unknown>).alreadyRequested, false);
+    assert.equal((firstRestart.restart as Record<string, unknown>).scheduleBlocked, false);
     assert.equal(restartSchedules, 1);
 
     const duplicateRestart = structuredContent(await client.callTool({
       name: "cutover_restart_self",
-      arguments: { cutoverId: "cutover-mcp-control" },
+      arguments: {
+        cutoverId: "cutover-mcp-control",
+        buildReady: { verifiedBy: "test-operator", verifiedAt: "2025-01-01T00:00:00.000Z" },
+      },
     }));
     assert.equal((duplicateRestart.restart as Record<string, unknown>).scheduled, false);
     assert.equal((duplicateRestart.restart as Record<string, unknown>).alreadyRequested, true);
+    assert.equal((duplicateRestart.restart as Record<string, unknown>).scheduleBlocked, false);
     assert.equal(restartSchedules, 1);
+
+    const inspectAll = structuredContent(await client.callTool({
+      name: "workspace_inspect",
+      arguments: {},
+    }));
+    assert.equal(inspectAll.workspaceSessions, 0);
+
+    const inspectMissing = structuredContent(await client.callTool({
+      name: "workspace_inspect",
+      arguments: { workspaceId: "ws-does-not-exist" },
+    }));
+    assert.equal(inspectMissing.workspaceSessions, 0);
+    assert.equal(
+      (inspectMissing.detail as Array<Record<string, unknown>>)[0].loaded,
+      false,
+    );
+
+    const reconciled = structuredContent(await client.callTool({
+      name: "cutover_reconcile",
+      arguments: {},
+    }));
+    assert.equal(
+      (reconciled.outcome as Record<string, unknown>).outcome,
+      "restart_already_scheduled",
+    );
   } finally {
     await client.close();
     await server.close();

@@ -1044,6 +1044,10 @@ export class LocalAgentSessionManager {
     return matched.slice(0, effectiveLimit).map(recordToSummary);
   }
 
+  listAllAgentRecords(): LocalAgentRecord[] {
+    return this.store.list();
+  }
+
   /**
    * Read-only preflight for an exact workspace + agent profile.
    * Reports readiness evidence without routing, admission, or mutation

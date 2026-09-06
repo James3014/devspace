@@ -22,6 +22,9 @@ export interface DevspaceUserConfig {
   artifactMaxFileBytes?: number;
   agentDir?: string;
   subagents?: StoredSubagentsConfig;
+  mcpSessionIdleTimeoutMs?: number;
+  mcpSessionMaxSessions?: number;
+  mcpCutoverBuildReadyRoot?: string;
 }
 
 export interface DevspaceAuthConfig {

@@ -226,6 +226,34 @@ assert.throws(
   /Invalid DEVSPACE_ARTIFACT_MAX_FILE_BYTES: 0/,
 );
 
+assert.equal(loadConfig(baseEnv).mcpSessionIdleTimeoutMs, 6 * 60 * 60 * 1000);
+assert.equal(loadConfig(baseEnv).mcpSessionMaxSessions, 2048);
+assert.equal(loadConfig(baseEnv).mcpCutoverBuildReadyRoot, undefined);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS: "30000" }).mcpSessionIdleTimeoutMs,
+  30000,
+);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_MCP_SESSION_MAX_SESSIONS: "64" }).mcpSessionMaxSessions,
+  64,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS: "0" }),
+  /Invalid DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS: 0/,
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_MCP_SESSION_MAX_SESSIONS: "0" }),
+  /Invalid DEVSPACE_MCP_SESSION_MAX_SESSIONS: 0/,
+);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_BUILD_READY_ROOT: process.cwd() }).mcpCutoverBuildReadyRoot,
+  process.cwd(),
+);
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_BUILD_READY_ROOT: join(tmpdir(), "outside-build-ready") }),
+  /DEVSPACE_BUILD_READY_ROOT must be inside DEVSPACE_ALLOWED_ROOTS/,
+);
+
 assert.equal(loadConfig(baseEnv).publicBaseUrl, "http://127.0.0.1:7676");
 assert.deepEqual(loadConfig(baseEnv).allowedHosts, ["localhost", "127.0.0.1", "::1"]);
 

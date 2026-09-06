@@ -90,3 +90,73 @@ finishDelayedClose?.();
 await delayedClose;
 assert.equal(delayedCloseResolved, true);
 assert.equal(registry.size, 0);
+
+const inFlightRegistry = new McpSessionRegistry<FakeTransport>({ now: () => inFlightNow });
+const inFlightTransport = createTransport();
+const idleTransport = createTransport();
+let inFlightNow = 0;
+inFlightRegistry.register("idle", idleTransport);
+inFlightNow = 1_000;
+inFlightRegistry.register("in-flight", inFlightTransport);
+inFlightNow = 2_000;
+assert.equal(inFlightRegistry.beginRequest("in-flight"), true);
+assert.equal(inFlightRegistry.beginRequest("missing"), false);
+assert.deepEqual(inFlightRegistry.inFlightStats(), {
+  inFlightRequestCount: 1,
+  sessionsWithInFlight: 1,
+});
+
+const skipIdleResults = await inFlightRegistry.closeIdle(1_500);
+assert.deepEqual(skipIdleResults, [{ sessionId: "idle" }]);
+assert.equal(inFlightTransport.closeCalls, 0);
+assert.equal(inFlightRegistry.size, 1);
+assert.equal(inFlightRegistry.get("in-flight"), inFlightTransport);
+
+const closeAllWithInflight = inFlightRegistry.closeAll();
+const pendingResults = await closeAllWithInflight;
+assert.deepEqual(pendingResults, []);
+assert.equal(inFlightTransport.closeCalls, 0);
+assert.equal(inFlightRegistry.size, 1);
+
+const endCloseResult = await inFlightRegistry.endRequest("in-flight");
+assert.equal(endCloseResult?.sessionId, "in-flight");
+assert.equal(inFlightTransport.closeCalls, 1);
+assert.equal(inFlightRegistry.size, 0);
+assert.deepEqual(inFlightRegistry.inFlightStats(), {
+  inFlightRequestCount: 0,
+  sessionsWithInFlight: 0,
+});
+
+const unboundedEnd = await inFlightRegistry.endRequest("missing");
+assert.equal(unboundedEnd, undefined);
+
+let boundedNow = 0;
+const boundedRegistry = new McpSessionRegistry<FakeTransport>({
+  now: () => boundedNow,
+  maxSessions: 3,
+});
+const oldest = createTransport();
+const middle = createTransport();
+const newest = createTransport();
+boundedRegistry.register("oldest", oldest);
+boundedNow = 10;
+boundedRegistry.register("middle", middle);
+boundedNow = 20;
+boundedRegistry.register("newest", newest);
+boundedNow = 30;
+boundedRegistry.register("overflow", createTransport());
+assert.equal(boundedRegistry.size, 3);
+assert.equal(boundedRegistry.get("oldest"), undefined);
+assert.equal(oldest.closeCalls, 1);
+assert.equal(boundedRegistry.get("middle"), middle);
+
+boundedNow = 40;
+boundedRegistry.beginRequest("middle");
+boundedNow = 50;
+boundedRegistry.register("overflow-two", createTransport());
+assert.equal(boundedRegistry.get("newest"), undefined);
+assert.equal(boundedRegistry.get("middle"), middle);
+
+await boundedRegistry.endRequest("middle");
+assert.equal(boundedRegistry.size, 3);
+assert.equal(boundedRegistry.get("middle"), middle);

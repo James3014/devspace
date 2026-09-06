@@ -59,6 +59,7 @@ import {
   CutoverStateError,
   CutoverStateStore,
   type CutoverDrainEvidence,
+  type ExpectedCutoverIdentity,
 } from "./cutover-state.js";
 import {
   CutoverBlockedError,
@@ -66,10 +67,13 @@ import {
   registerCutoverHttpRoutes,
   type DurableReconciliationWitness,
 } from "./mcp-cutover.js";
+import { CutoverBuildNotReadyError, probeBuildReady, type BuildReadyProbeResult } from "./cutover-build-ready.js";
+import { CutoverOrchestrator, type OrchestrationOutcome } from "./cutover-orchestration.js";
 import {
   createLaunchdSelfRestartActuator,
   type SelfRestartActuator,
 } from "./cutover-restart.js";
+import type { WorkspaceSession } from "./workspace-store.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
 import {
   DurableOperationManager,
@@ -125,9 +129,6 @@ import {
 } from "./repository-intelligence.js";
 
 type Transport = StreamableHTTPServerTransport;
-// MCP clients can reconnect without closing the previous transport. Bound stale
-// session retention so abandoned MCP servers do not accumulate for the life of the process.
-const MCP_SESSION_IDLE_TIMEOUT_MS = 6 * 60 * 60 * 1_000;
 const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
 const AGENT_SUPERVISION_INTERVAL_MS = 2_000;
 const AGENT_TERMINATION_OUTPUT_SCHEMA = z.object({
@@ -1297,6 +1298,12 @@ export interface CutoverMcpControlContext {
     agentId: string;
   }) => Promise<DurableReconciliationWitness>;
   restartSelf?: SelfRestartActuator;
+  probeBuildReady?: (
+    expected: ExpectedCutoverIdentity,
+  ) => Promise<BuildReadyProbeResult> | BuildReadyProbeResult;
+  inspectWorkspace?: (workspaceId: string) => { session?: WorkspaceSession; loaded: boolean };
+  listWorkspaceSessions?: () => WorkspaceSession[];
+  advance?: () => Promise<OrchestrationOutcome>;
 }
 
 function registerCutoverMcpTools(
@@ -1404,14 +1411,22 @@ function registerCutoverMcpTools(
       {
         title: "Restart cutover server",
         description:
-          "Schedule exactly one restart of this macOS launchd-managed Dev MCP service after a drained cutover lease is durably bound. The service label comes only from launchd XPC_SERVICE_NAME; callers cannot supply a command, label, path, PID, or launchd domain. Duplicate calls never schedule a second restart and must be reconciled by server identity.",
-        inputSchema: { cutoverId: z.string().min(1) },
+          "Schedule exactly one restart of this macOS launchd-managed Dev MCP service after a drained cutover lease is durably bound. Requires a build-ready attestation (verifiedBy/verifiedAt) and additionally verifies the target build on disk when a build-ready root is configured. The service label comes only from launchd XPC_SERVICE_NAME; callers cannot supply a command, label, path, PID, or launchd domain. Duplicate calls never schedule a second restart and must be reconciled by server identity.",
+        inputSchema: {
+          cutoverId: z.string().min(1),
+          buildReady: z.object({
+            verifiedBy: z.string().min(1),
+            verifiedAt: z.string().refine((value) => Number.isFinite(Date.parse(value))),
+            evidence: z.string().optional(),
+          }),
+        },
         outputSchema: {
           cutover: cutoverRecordSchema,
           mode: modeSchema,
           restart: z.object({
             scheduled: z.boolean(),
             alreadyRequested: z.boolean(),
+            scheduleBlocked: z.boolean(),
             actuator: z.literal("launchd-self"),
             serviceLabel: z.string(),
             launchdTarget: z.string(),
@@ -1420,25 +1435,57 @@ function registerCutoverMcpTools(
         _meta: {},
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
       },
-      async ({ cutoverId }) => {
-        const request = control.controller.requestRestart(cutoverId);
+      async ({ cutoverId, buildReady }) => {
+        const request = control.controller.requestRestart(cutoverId, buildReady);
         const actuator = control.restartSelf!;
-        const scheduled = request.newlyRequested ? actuator.schedule() : undefined;
         const mode = control.controller.mode();
+        if (!request.newlyRequested) {
+          const scheduleBlocked = !request.record.restartRequest?.buildReady;
+          const restart = {
+            scheduled: false,
+            alreadyRequested: true,
+            scheduleBlocked,
+            actuator: "launchd-self" as const,
+            serviceLabel: actuator.serviceLabel,
+            launchdTarget: actuator.launchdTarget,
+          };
+          const message = scheduleBlocked
+            ? `Restart was already durably requested for cutover ${cutoverId} without build-ready attestation; scheduling stays blocked until verified.`
+            : `Restart was already durably requested for cutover ${cutoverId}; no second restart was scheduled.`;
+          return {
+            content: [textBlock(message)],
+            structuredContent: {
+              cutover: request.record as unknown as Record<string, unknown>,
+              mode,
+              restart,
+            },
+          };
+        }
+        if (control.probeBuildReady) {
+          const probe = await control.probeBuildReady(request.record.expectedNewIdentity);
+          if (!probe.buildReady) {
+            throw new CutoverBuildNotReadyError(probe.detail);
+          }
+        }
+        const mark = control.controller.markRestartScheduled(cutoverId);
+        if (mark.newlyScheduled) {
+          actuator.schedule();
+        }
         const restart = {
-          scheduled: Boolean(scheduled),
-          alreadyRequested: !request.newlyRequested,
+          scheduled: mark.newlyScheduled,
+          alreadyRequested: false,
+          scheduleBlocked: false,
           actuator: "launchd-self" as const,
           serviceLabel: actuator.serviceLabel,
           launchdTarget: actuator.launchdTarget,
         };
-        const message = request.newlyRequested
+        const message = mark.newlyScheduled
           ? `Restart scheduled for cutover ${cutoverId}; reconcile the replacement server identity before any retry.`
-          : `Restart was already requested for cutover ${cutoverId}; no second restart was scheduled.`;
+          : `Restart was already durably scheduled for cutover ${cutoverId}; no second restart was scheduled.`;
         return {
           content: [textBlock(message)],
           structuredContent: {
-            cutover: request.record as unknown as Record<string, unknown>,
+            cutover: mark.record as unknown as Record<string, unknown>,
             mode,
             restart,
           },
@@ -1478,6 +1525,92 @@ function registerCutoverMcpTools(
       };
     },
   );
+
+  if (control.listWorkspaceSessions && control.inspectWorkspace) {
+    registerAppTool(
+      server,
+      "workspace_inspect",
+      {
+        title: "Inspect workspace",
+        description:
+          "Read-only durable workspace introspection: list persisted workspace sessions and report whether each is currently loaded in the running server registry. Never mutates session state.",
+        inputSchema: { workspaceId: z.string().min(1).optional() },
+        outputSchema: {
+          workspaceSessions: z.number(),
+          detail: z.array(z.record(z.string(), z.unknown())),
+        },
+        _meta: {},
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      },
+      async ({ workspaceId }) => {
+        if (typeof workspaceId === "string" && workspaceId.length > 0) {
+          const inspected = control.inspectWorkspace!(workspaceId);
+          return {
+            content: [
+              textBlock(
+                `Workspace ${workspaceId}: durable=${inspected.session ? "present" : "absent"}, loaded=${String(inspected.loaded)}.`,
+              ),
+            ],
+            structuredContent: {
+              workspaceSessions: control.listWorkspaceSessions!().filter(
+                (session) => session.id === workspaceId,
+              ).length,
+              detail: [{ unit: `workspace:${workspaceId}`, loaded: inspected.loaded, session: inspected.session }],
+            },
+          };
+        }
+        const sessions = control.listWorkspaceSessions!();
+        const detail = sessions.map((session) => {
+          const inspected = control.inspectWorkspace!(session.id);
+          return { unit: `workspace:${session.id}`, loaded: inspected.loaded };
+        });
+        return {
+          content: [textBlock(`Durable workspace sessions: ${sessions.length}.`)],
+          structuredContent: { workspaceSessions: sessions.length, detail },
+        };
+      },
+    );
+  }
+
+  if (control.advance) {
+    registerAppTool(
+      server,
+      "cutover_reconcile",
+      {
+        title: "Reconcile cutover",
+        description:
+          "Drive exactly one fail-closed cutover step: schedule a verified restart on the old instance exactly once, or close the cutover on the replacement instance only after a fully positive durable reconciliation witness. Never drains automatically and never re-schedules an already-scheduled restart.",
+        inputSchema: {},
+        outputSchema: {
+          outcome: z.record(z.string(), z.unknown()),
+        },
+        _meta: {},
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      },
+      async () => {
+        const outcome = await control.advance!();
+        return {
+          content: [textBlock(describeOutcome(outcome))],
+          structuredContent: { outcome: outcome as unknown as Record<string, unknown> },
+        };
+      },
+    );
+  }
+}
+
+function describeOutcome(outcome: OrchestrationOutcome): string {
+  switch (outcome.outcome) {
+    case "restart_scheduled":
+      return `Cutover advanced: restart scheduled for ${outcome.scheduledFor}. ${outcome.reason}`;
+    case "restart_already_scheduled":
+      return `Cutover advanced: restart already scheduled for ${outcome.scheduledFor}; never re-scheduled. ${outcome.reason}`;
+    case "reconciled_and_finished":
+      return `Cutover advanced: ${outcome.reason}`;
+    case "blocked":
+      return `Cutover blocked [${outcome.code}]: ${outcome.reason}`;
+    default:
+      return `Cutover advanced (${outcome.outcome}): ${outcome.reason}`;
+  }
 }
 
 function createAgentStartInputSchema() {
@@ -3905,7 +4038,9 @@ export function createServer(
     host: config.host,
     ...(allowedHosts ? { allowedHosts } : {}),
   });
-  const transports = new McpSessionRegistry<Transport>();
+  const transports = new McpSessionRegistry<Transport>({
+    maxSessions: config.mcpSessionMaxSessions,
+  });
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
   const oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
@@ -3982,9 +4117,146 @@ export function createServer(
       agentReconciled: true,
     };
   };
+  const enumerateDurableReconciliationState = async (): Promise<{
+    workspaceQueryable: boolean;
+    agentQueryable: boolean;
+    agentReconciled: boolean;
+    workspaceSessions: number;
+    agentSessions: number;
+    detail: Array<{ unit: string; ok: boolean; detail?: string }>;
+  }> => {
+    const errorText = (error: unknown): string =>
+      error instanceof Error ? error.message : String(error);
+    const detail: Array<{ unit: string; ok: boolean; detail?: string }> = [];
+    let workspaceQueryable = true;
+    let workspaceSessions = 0;
+    try {
+      const sessions = workspaceStore.listSessions();
+      workspaceSessions = sessions.length;
+      for (const session of sessions) {
+        const unit = `workspace:${session.id}`;
+        try {
+          const inspected = workspaces.inspectWorkspace(session.id);
+          detail.push({
+            unit,
+            ok: true,
+            ...(inspected.loaded
+              ? {}
+              : { detail: "durable session present; registry not currently loaded (no write performed)" }),
+          });
+        } catch (error) {
+          workspaceQueryable = false;
+          detail.push({ unit, ok: false, detail: errorText(error) });
+        }
+      }
+    } catch (error) {
+      workspaceQueryable = false;
+      detail.push({ unit: "workspace-store", ok: false, detail: errorText(error) });
+    }
+    if (!agentSessionManager) {
+      return {
+        workspaceQueryable,
+        agentQueryable: false,
+        agentReconciled: false,
+        workspaceSessions,
+        agentSessions: 0,
+        detail: [
+          ...detail,
+          { unit: "agent-store", ok: false, detail: "subagents disabled; durable agent reconciliation unavailable" },
+        ],
+      };
+    }
+    let agentQueryable = true;
+    let agentReconciled = true;
+    let agentSessions = 0;
+    try {
+      const records = agentSessionManager.listAllAgentRecords();
+      agentSessions = records.length;
+      for (const agent of records) {
+        const unit = `agent:${agent.id}${agent.workspaceId ? `@${agent.workspaceId}` : ""}`;
+        if (!agent.workspaceId) {
+          agentQueryable = false;
+          agentReconciled = false;
+          detail.push({
+            unit,
+            ok: false,
+            detail: "durable agent record has no workspace binding; reconciliation impossible",
+          });
+          continue;
+        }
+        try {
+          await agentSessionManager.getAgentStatus({
+            workspaceId: agent.workspaceId,
+            workspaceRoot: agent.workspaceRoot,
+            agentId: agent.id,
+            waitMs: 0,
+          });
+        } catch (error) {
+          agentQueryable = false;
+          detail.push({ unit, ok: false, detail: `status unreadable: ${errorText(error)}` });
+          continue;
+        }
+        try {
+          await agentSessionManager.reconcileAgent({
+            workspaceId: agent.workspaceId,
+            workspaceRoot: agent.workspaceRoot,
+            isolated: false,
+            agentId: agent.id,
+          });
+          detail.push({ unit, ok: true });
+        } catch (error) {
+          agentReconciled = false;
+          detail.push({ unit, ok: false, detail: `reconcile failed: ${errorText(error)}` });
+        }
+      }
+    } catch (error) {
+      agentQueryable = false;
+      agentReconciled = false;
+      detail.push({ unit: "agent-store", ok: false, detail: errorText(error) });
+    }
+    return {
+      workspaceQueryable,
+      agentQueryable,
+      agentReconciled,
+      workspaceSessions,
+      agentSessions,
+      detail,
+    };
+  };
   const codexGoals = config.codexGoalsEnabled
     ? new CodexGoalSessionManager(processSessions, { codexBin: config.codexBin })
     : undefined;
+
+  const buildReadyProbe = config.mcpCutoverBuildReadyRoot
+    ? (expected: ExpectedCutoverIdentity) =>
+        probeBuildReady({ packageRoot: config.mcpCutoverBuildReadyRoot!, expected })
+    : undefined;
+  const orchestrator = restartSelfActuator
+    ? new CutoverOrchestrator({
+        controller: cutoverController,
+        actuator: restartSelfActuator,
+        enumerateAll: enumerateDurableReconciliationState,
+        ...(buildReadyProbe ? { probeBuildReady: buildReadyProbe } : {}),
+      })
+    : undefined;
+  const advanceCutover = orchestrator ? () => orchestrator.advance() : undefined;
+
+  if (orchestrator) {
+    void orchestrator.advance({ dryRun: true })
+      .then((outcome) => {
+        logEvent(
+          config.logging,
+          outcome.outcome === "blocked" ? "warn" : "info",
+          "cutover_startup_drive",
+          { outcome: outcome as unknown as Record<string, unknown> },
+        );
+      })
+      .catch((error) => {
+        logEvent(config.logging, "error", "cutover_startup_drive_error", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+  }
 
   const agentSupervisionTimer = agentSessionManager
     ? setInterval(() => {
@@ -4023,13 +4295,28 @@ export function createServer(
 
   const sessionCleanupTimer = setInterval(() => {
     void transports
-      .closeIdle(MCP_SESSION_IDLE_TIMEOUT_MS)
-      .then((results) => {
-        logSessionCloseResults("idle_timeout", results);
+      .closeIdle(config.mcpSessionIdleTimeoutMs)
+      .then((results) => logSessionCloseResults("idle_timeout", results))
+      .then(() => enumerateDurableReconciliationState())
+      .then((durableBundle) => {
         const metrics = transports.metrics();
+        const inFlight = transports.inFlightStats();
+        const cutoverRecord = cutoverController.record();
         logEvent(config.logging, "info", "mcp_metrics", {
           activeSessions: metrics.activeSessions,
           oldestAgeMs: metrics.oldestAgeMs,
+          inflightRequestCount: inFlight.inFlightRequestCount,
+          durable: {
+            workspaceSessions: durableBundle.workspaceSessions,
+            agentSessions: durableBundle.agentSessions,
+          },
+          cutoverBacklog: {
+            active: cutoverController.mode() !== "normal",
+            phase: cutoverRecord?.phase ?? null,
+            restartRequested: Boolean(cutoverRecord?.restartRequest),
+            restartScheduled: Boolean(cutoverRecord?.restartRequest?.restartScheduledAt),
+            buildReadyVerified: Boolean(cutoverRecord?.restartRequest?.buildReady),
+          },
           cutoverMode: cutoverController.mode(),
           reconciliationRequired: cutoverController.mode() !== "normal",
           serverInstanceId: runtimeBuildIdentity.serverInstanceId,
@@ -4134,6 +4421,9 @@ export function createServer(
     authenticate: bearerAuth,
     transportEvidence: () => transports.metrics(),
     reconcileDurableState: reconcileCutoverDurableState,
+    ...(restartSelfActuator ? { restartSelf: restartSelfActuator } : {}),
+    ...(buildReadyProbe ? { probeBuildReady: buildReadyProbe } : {}),
+    ...(advanceCutover ? { advance: advanceCutover } : {}),
   });
 
   app.all("/mcp", async (req, res) => {
@@ -4248,6 +4538,10 @@ export function createServer(
             transportEvidence: () => transports.metrics(),
             reconcileDurableState: reconcileCutoverDurableState,
             ...(restartSelfActuator ? { restartSelf: restartSelfActuator } : {}),
+            ...(buildReadyProbe ? { probeBuildReady: buildReadyProbe } : {}),
+            inspectWorkspace: (workspaceId) => workspaces.inspectWorkspace(workspaceId),
+            listWorkspaceSessions: () => workspaceStore.listSessions(),
+            ...(advanceCutover ? { advance: advanceCutover } : {}),
           },
         );
         await server.connect(transport);
@@ -4256,7 +4550,12 @@ export function createServer(
         return;
       }
 
-      await transport.handleRequest(req, res, req.body);
+      if (sessionId) transports.beginRequest(sessionId);
+      try {
+        await transport.handleRequest(req, res, req.body);
+      } finally {
+        if (sessionId) await transports.endRequest(sessionId);
+      }
     } catch (error) {
       logEvent(config.logging, "error", "mcp_request_error", {
         requestId,

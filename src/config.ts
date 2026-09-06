@@ -13,6 +13,8 @@ export type WidgetMode = "off" | "changes" | "full";
 const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_ARTIFACT_MAX_FILE_BYTES = 100 * 1024 * 1024;
+const DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS = 6 * 60 * 60 * 1000;
+const DEFAULT_MCP_SESSION_MAX_SESSIONS = 2048;
 
 export interface ServerConfig {
   host: string;
@@ -39,6 +41,9 @@ export interface ServerConfig {
   agentMaxConcurrent: number;
   codexGoalsEnabled: boolean;
   codexBin?: string;
+  mcpSessionIdleTimeoutMs: number;
+  mcpSessionMaxSessions: number;
+  mcpCutoverBuildReadyRoot?: string;
   repositoryIntelligenceRoot?: string;
   repositoryIntelligenceExpectedHead?: string;
   repositoryIntelligencePythonBin?: string;
@@ -254,6 +259,19 @@ function parseRepositoryIntelligenceRoot(
   return root;
 }
 
+function parseBuildReadyRoot(
+  value: string | undefined,
+  allowedRoots: string[],
+): string | undefined {
+  const raw = value?.trim();
+  if (!raw) return undefined;
+  const root = resolve(expandHomePath(raw));
+  if (!allowedRoots.some((allowedRoot) => isPathInsideRoot(root, allowedRoot))) {
+    throw new Error("DEVSPACE_BUILD_READY_ROOT must be inside DEVSPACE_ALLOWED_ROOTS");
+  }
+  return root;
+}
+
 function parseRepositoryIntelligencePythonBin(value: string | undefined): string | undefined {
   const raw = value?.trim();
   return raw || undefined;
@@ -332,6 +350,21 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     ),
     codexGoalsEnabled: parseBoolean(env.DEVSPACE_CODEX_GOALS),
     codexBin: env.DEVSPACE_CODEX_BIN?.trim() || undefined,
+    mcpSessionIdleTimeoutMs: parsePositiveInteger(
+      env.DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS ?? numberConfigValue(files.config.mcpSessionIdleTimeoutMs),
+      DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS,
+      "DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS",
+    ),
+    mcpSessionMaxSessions: parsePositiveInteger(
+      env.DEVSPACE_MCP_SESSION_MAX_SESSIONS ?? numberConfigValue(files.config.mcpSessionMaxSessions),
+      DEFAULT_MCP_SESSION_MAX_SESSIONS,
+      "DEVSPACE_MCP_SESSION_MAX_SESSIONS",
+      100_000,
+    ),
+    mcpCutoverBuildReadyRoot: parseBuildReadyRoot(
+      env.DEVSPACE_BUILD_READY_ROOT ?? files.config.mcpCutoverBuildReadyRoot,
+      allowedRoots,
+    ),
     ...(() => {
       const repositoryIntelligenceRoot = parseRepositoryIntelligenceRoot(
         env.DEVSPACE_REPOSITORY_INTELLIGENCE_ROOT,

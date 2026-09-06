@@ -14,6 +14,7 @@ import { join } from "node:path";
 
 export const CUTOVER_STATE_SCHEMA = "devspace.cutover.v1" as const;
 const CUTOVER_RESTART_SCHEMA = "devspace.cutover_restart.v1" as const;
+const CUTOVER_RESTART_SCHEDULED_SCHEMA = "devspace.cutover_restart_scheduled.v1" as const;
 
 export interface CutoverServerIdentity {
   serverInstanceId: string;
@@ -41,16 +42,32 @@ export interface CutoverReconciliationReceipt {
   reconciledAt: string;
 }
 
+export interface BuildReadyReceipt {
+  verifiedBy: string;
+  verifiedAt: string;
+  evidence?: string;
+}
+
 export interface CutoverRestartRequest {
   actuator: "launchd-self";
   requestedByServerInstanceId: string;
   requestedAt: string;
+  buildReady?: BuildReadyReceipt;
+  restartScheduledAt?: string;
+  restartScheduledForServerInstanceId?: string;
 }
 
 interface CutoverRestartMarker {
   schema: typeof CUTOVER_RESTART_SCHEMA;
   cutoverId: string;
   request: CutoverRestartRequest;
+}
+
+interface CutoverRestartScheduledMarker {
+  schema: typeof CUTOVER_RESTART_SCHEDULED_SCHEMA;
+  cutoverId: string;
+  scheduledForServerInstanceId: string;
+  scheduledAt: string;
 }
 
 export interface DurableCutoverRecord {
@@ -90,6 +107,7 @@ export class CutoverStateStore {
   private readonly activeDir: string;
   private readonly createdPath: string;
   private readonly restartRequestedPath: string;
+  private readonly restartScheduledPath: string;
   private readonly now: () => number;
   private readonly newId: () => string;
 
@@ -98,6 +116,7 @@ export class CutoverStateStore {
     this.activeDir = join(this.cutoverRoot, "active");
     this.createdPath = join(this.activeDir, "created.json");
     this.restartRequestedPath = join(this.activeDir, "restart-requested.json");
+    this.restartScheduledPath = join(this.activeDir, "restart-scheduled.json");
     this.now = options.now ?? Date.now;
     this.newId = options.newId ?? randomUUID;
   }
@@ -123,12 +142,22 @@ export class CutoverStateStore {
     else if (drained) record = parseRecord(readFileSync(join(this.activeDir, drained), "utf8"));
     const restartRequest = readRestartMarker(this.restartRequestedPath, record.cutoverId)
       ?? record.restartRequest;
+    const restartScheduled = restartRequest
+      ? readRestartScheduledMarker(this.restartScheduledPath, record.cutoverId)
+      : undefined;
+    const mergedRestartRequest = restartRequest && restartScheduled
+      ? {
+          ...restartRequest,
+          restartScheduledAt: restartScheduled.scheduledAt,
+          restartScheduledForServerInstanceId: restartScheduled.scheduledForServerInstanceId,
+        }
+      : restartRequest;
     return {
       ...record,
-      ...(restartRequest ? {
-        restartRequest,
-        updatedAt: restartRequest.requestedAt > record.updatedAt
-          ? restartRequest.requestedAt
+      ...(mergedRestartRequest ? {
+        restartRequest: mergedRestartRequest,
+        updatedAt: mergedRestartRequest.requestedAt > record.updatedAt
+          ? mergedRestartRequest.requestedAt
           : record.updatedAt,
       } : {}),
       expired: record.expiresAt === undefined
@@ -209,6 +238,11 @@ export class CutoverStateStore {
     if (record.restartRequest) {
       return { record, newlyRequested: false };
     }
+    if (request.buildReady !== undefined && !isBuildReadyReceipt(request.buildReady)) {
+      throw new CutoverStateError(
+        "Restart build-ready attestation is invalid; reconciliation is required.",
+      );
+    }
     const requestedAt = new Date(this.now()).toISOString();
     const marker: CutoverRestartMarker = {
       schema: CUTOVER_RESTART_SCHEMA,
@@ -229,6 +263,41 @@ export class CutoverStateStore {
       return { record: current, newlyRequested: false };
     }
     return { record: this.requireExact(cutoverId), newlyRequested: true };
+  }
+
+  recordRestartScheduled(
+    cutoverId: string,
+    scheduledForServerInstanceId: string,
+  ): { record: DurableCutoverRecord; newlyScheduled: boolean } {
+    const record = this.requireExact(cutoverId);
+    if (record.phase !== "drained") {
+      throw new CutoverStateError(
+        `Cutover ${cutoverId} restart scheduling requires a drained cutover.`,
+      );
+    }
+    if (!record.restartRequest?.buildReady) {
+      throw new CutoverStateError(
+        `Restart scheduling requires a build-ready attestation; refusing to schedule cutover ${cutoverId}. [CUTOVER_BUILD_NOT_READY]`,
+      );
+    }
+    if (record.restartRequest?.restartScheduledAt) {
+      return { record, newlyScheduled: false };
+    }
+    const marker: CutoverRestartScheduledMarker = {
+      schema: CUTOVER_RESTART_SCHEDULED_SCHEMA,
+      cutoverId,
+      scheduledForServerInstanceId,
+      scheduledAt: new Date(this.now()).toISOString(),
+    };
+    try {
+      writeExclusiveDurable(this.restartScheduledPath, `${JSON.stringify(marker, null, 2)}\n`);
+      syncDirectory(this.activeDir);
+    } catch (error) {
+      if (!isErrno(error, "EEXIST")) throw error;
+      readRestartScheduledMarker(this.restartScheduledPath, cutoverId);
+      return { record: this.requireExact(cutoverId), newlyScheduled: false };
+    }
+    return { record: this.requireExact(cutoverId), newlyScheduled: true };
   }
 
   close(cutoverId: string, receipt: CutoverReconciliationReceipt): DurableCutoverRecord {
@@ -318,8 +387,61 @@ function isRestartRequest(value: unknown): value is CutoverRestartRequest {
     typeof request.requestedByServerInstanceId === "string" &&
     request.requestedByServerInstanceId.length > 0 &&
     typeof request.requestedAt === "string" &&
-    Number.isFinite(Date.parse(request.requestedAt)),
+    Number.isFinite(Date.parse(request.requestedAt)) &&
+    (request.buildReady === undefined || isBuildReadyReceipt(request.buildReady)) &&
+    (request.restartScheduledAt === undefined ||
+      (typeof request.restartScheduledAt === "string" &&
+        Number.isFinite(Date.parse(request.restartScheduledAt)))) &&
+    (request.restartScheduledForServerInstanceId === undefined ||
+      (typeof request.restartScheduledForServerInstanceId === "string" &&
+        request.restartScheduledForServerInstanceId.length > 0)),
   );
+}
+
+function isBuildReadyReceipt(value: unknown): value is BuildReadyReceipt {
+  const receipt = value as Partial<BuildReadyReceipt> | undefined;
+  return Boolean(
+    receipt &&
+    typeof receipt.verifiedBy === "string" &&
+    receipt.verifiedBy.length > 0 &&
+    typeof receipt.verifiedAt === "string" &&
+    Number.isFinite(Date.parse(receipt.verifiedAt)) &&
+    (receipt.evidence === undefined || typeof receipt.evidence === "string"),
+  );
+}
+
+function readRestartScheduledMarker(
+  path: string,
+  expectedCutoverId: string,
+): CutoverRestartScheduledMarker | undefined {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) return undefined;
+    throw error;
+  }
+  let value: Partial<CutoverRestartScheduledMarker>;
+  try {
+    value = JSON.parse(raw) as Partial<CutoverRestartScheduledMarker>;
+  } catch {
+    throw new CutoverStateError(
+      "Durable restart-scheduled fence is malformed; reconciliation is required.",
+    );
+  }
+  if (
+    value.schema !== CUTOVER_RESTART_SCHEDULED_SCHEMA ||
+    value.cutoverId !== expectedCutoverId ||
+    typeof value.scheduledForServerInstanceId !== "string" ||
+    value.scheduledForServerInstanceId.length === 0 ||
+    typeof value.scheduledAt !== "string" ||
+    !Number.isFinite(Date.parse(value.scheduledAt))
+  ) {
+    throw new CutoverStateError(
+      "Durable restart-scheduled fence does not match the active cutover; reconciliation is required.",
+    );
+  }
+  return value as CutoverRestartScheduledMarker;
 }
 
 function readRestartMarker(

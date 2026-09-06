@@ -41,6 +41,7 @@ export interface WorkspaceStore {
     managed?: boolean;
   }): WorkspaceSession;
   getSession(id: string): WorkspaceSession | undefined;
+  listSessions(): WorkspaceSession[];
   touchSession(id: string): void;
   getConversationBinding(
     conversationScopeId: string,
@@ -114,6 +115,14 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       .get();
 
     return row ? rowToWorkspaceSession(row) : undefined;
+  }
+
+  listSessions(): WorkspaceSession[] {
+    return this.database.db
+      .select()
+      .from(workspaceSessions)
+      .all()
+      .map(rowToWorkspaceSession);
   }
 
   touchSession(id: string): void {
