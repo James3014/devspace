@@ -48,7 +48,9 @@ test("old instance drains and replacement instance is reconcile-only across rest
 test("finish fails closed for old/wrong identities and closes exact cutover idempotently", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-mcp-finish-"));
   try {
-    const store = new CutoverStateStore(stateDir, { newId: () => "cutover-exact" });
+    const store = new CutoverStateStore(stateDir, {
+      newId: (() => { let n = 0; return () => `cutover-${n += 1}`; })(),
+    });
     const old = new McpCutoverController(store, identity("old", "old-source", "old-build"));
     old.begin({ sourceCommit: "new-source", buildId: "new-build", capabilityManifestSha256: "cap" });
     const witness = async () => ({
@@ -58,32 +60,32 @@ test("finish fails closed for old/wrong identities and closes exact cutover idem
     });
 
     await assert.rejects(
-      new McpCutoverController(store, identity("new", "new-source", "new-build")).finish("cutover-exact", witness),
+      new McpCutoverController(store, identity("new", "new-source", "new-build")).finish("cutover-1", witness),
       /durable drain evidence/i,
     );
-    old.recordDrain("cutover-exact", { activeSessions: 1, oldestAgeMs: 10 });
+    old.recordDrain("cutover-1", { activeSessions: 1, oldestAgeMs: 10 });
     await assert.rejects(
-      new McpCutoverController(store, identity("old", "new-source", "new-build")).finish("cutover-exact", witness),
+      new McpCutoverController(store, identity("old", "new-source", "new-build")).finish("cutover-1", witness),
       /serverInstanceId did not change/,
     );
     await assert.rejects(
-      new McpCutoverController(store, identity("new", "wrong-source", "new-build")).finish("cutover-exact", witness),
+      new McpCutoverController(store, identity("new", "wrong-source", "new-build")).finish("cutover-1", witness),
       /sourceCommit/,
     );
     await assert.rejects(
-      new McpCutoverController(store, identity("new", "new-source", "wrong-build")).finish("cutover-exact", witness),
+      new McpCutoverController(store, identity("new", "new-source", "wrong-build")).finish("cutover-1", witness),
       /buildId/,
     );
     await assert.rejects(
-      new McpCutoverController(store, identity("new", "new-source", "new-build", "wrong-cap")).finish("cutover-exact", witness),
+      new McpCutoverController(store, identity("new", "new-source", "new-build", "wrong-cap")).finish("cutover-1", witness),
       /capability manifest/,
     );
     assert.equal(store.get()?.phase, "drained");
 
     const expected = new McpCutoverController(store, identity("new", "new-source", "new-build"));
-    const closed = await expected.finish("cutover-exact", witness);
+    const closed = await expected.finish("cutover-1", witness);
     assert.equal(closed.phase, "closed");
-    assert.equal((await expected.finish("cutover-exact", witness)).phase, "closed");
+    assert.equal((await expected.finish("cutover-1", witness)).phase, "closed");
     assert.equal(expected.mode(), "normal");
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
@@ -188,6 +190,139 @@ test("finish requires a real positive durable reconciliation witness", async () 
       /durable agent.*reconciliation/i,
     );
     assert.equal(current.mode(), "reconcile-only");
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("recoverCutover supersedes only when the old owner and target are both gone", () => {
+  const eligibleDir = mkdtempSync(join(tmpdir(), "devspace-mcp-recover-eligible-"));
+  try {
+    const store = new CutoverStateStore(eligibleDir, {
+      newId: (() => { let n = 0; return () => `cutover-${n += 1}`; })(),
+    });
+    const old = new McpCutoverController(store, identity("old", "old-source", "old-build"));
+    old.begin({ sourceCommit: "new-source", buildId: "new-build", capabilityManifestSha256: "cap" });
+
+    // The original drain-lease owner is still running: not recoverable.
+    assert.throws(
+      () => old.recoverCutover({
+        cutoverId: "cutover-1",
+        expectedNewIdentity: { sourceCommit: "target-source", buildId: "target-build" },
+      }),
+      /original drain-lease owner is still running/i,
+    );
+
+    // A replacement runtime that already matches the bound target: normal finish applies.
+    const atTarget = new McpCutoverController(store, identity("new", "new-source", "new-build", "cap"));
+    assert.throws(
+      () => atTarget.recoverCutover({
+        cutoverId: "cutover-1",
+        expectedNewIdentity: { sourceCommit: "target-source", buildId: "target-build" },
+      }),
+      /already matches the bound expected target/i,
+    );
+
+    // A distinct control-plane runtime with neither the old identity nor the target.
+    const recovering = new McpCutoverController(store, identity("reconciler", "old-source", "old-build"));
+    const recovered = recovering.recoverCutover({
+      cutoverId: "cutover-1",
+      expectedNewIdentity: { sourceCommit: "target-source", buildId: "target-build", capabilityManifestSha256: "cap2" },
+    });
+    assert.equal(recovered.newlyRecovered, true);
+    assert.equal(recovered.terminal.phase, "superseded");
+    assert.equal(recovered.terminal.supersession?.recoveredBy, "reconciler");
+    assert.equal(recovered.successor.supersedesCutoverId, "cutover-1");
+    assert.equal(recovered.successor.expectedNewIdentity.sourceCommit, "target-source");
+    assert.equal(recovering.mode(), "reconcile-only");
+  } finally {
+    rmSync(eligibleDir, { recursive: true, force: true });
+  }
+});
+
+test("recoverCutover is idempotent, rejects wrong ids, and never touches a closed cutover", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-mcp-recover-idempotent-"));
+  try {
+    const store = new CutoverStateStore(stateDir, {
+      newId: (() => { let n = 0; return () => `cutover-${n += 1}`; })(),
+    });
+    const old = new McpCutoverController(store, identity("old", "old-source", "old-build"));
+    old.begin({ sourceCommit: "new-source", buildId: "new-build" });
+    const recovering = new McpCutoverController(store, identity("reconciler", "old-source", "old-build"));
+
+    assert.throws(
+      () => recovering.recoverCutover({
+        cutoverId: "some-other-id",
+        expectedNewIdentity: { sourceCommit: "target-source", buildId: "target-build" },
+      }),
+      /mismatch/i,
+    );
+
+    const first = recovering.recoverCutover({
+      cutoverId: "cutover-1",
+      expectedNewIdentity: { sourceCommit: "target-source", buildId: "target-build" },
+    });
+    assert.equal(first.newlyRecovered, true);
+    const second = recovering.recoverCutover({
+      cutoverId: "cutover-1",
+      expectedNewIdentity: { sourceCommit: "target-source", buildId: "target-build" },
+    });
+    assert.equal(second.newlyRecovered, false);
+    assert.equal(second.successor.cutoverId, first.successor.cutoverId);
+
+    // After the successor fully closes, recovery of the stale predecessor still
+    // rendezvouses idempotently to the same closed successor (no re-supersession).
+    store.recordDrain(first.successor.cutoverId, { activeSessions: 0, oldestAgeMs: 0 });
+    store.recordRestartRequest(first.successor.cutoverId, {
+      actuator: "launchd-self",
+      requestedByServerInstanceId: "target-reconciler",
+      buildReady: { verifiedBy: "seam", verifiedAt: new Date().toISOString() },
+    });
+    store.recordRestartScheduled(first.successor.cutoverId, "target-reconciler");
+    store.close(first.successor.cutoverId, {
+      closedByServerInstanceId: "target-reconciler",
+      workspaceQueryable: true,
+      agentQueryable: true,
+      agentReconciled: true,
+      reconciledAt: new Date().toISOString(),
+    });
+    const afterClose = recovering.recoverCutover({
+      cutoverId: "cutover-1",
+      expectedNewIdentity: { sourceCommit: "target-source", buildId: "target-build" },
+    });
+    assert.equal(afterClose.newlyRecovered, false);
+    assert.equal(afterClose.successor.cutoverId, first.successor.cutoverId);
+    assert.equal(afterClose.successor.phase, "closed");
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("recoverCutover rejects a closed cutover with no supersession lineage", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-mcp-recover-closed-"));
+  try {
+    const store = new CutoverStateStore(stateDir, { newId: () => "cutover-closed" });
+    const old = new McpCutoverController(store, identity("old", "old-source", "old-build"));
+    old.begin({ sourceCommit: "new-source", buildId: "new-build" });
+    old.recordDrain("cutover-closed", { activeSessions: 0, oldestAgeMs: 0 });
+    old.requestRestart("cutover-closed", { verifiedBy: "op", verifiedAt: new Date().toISOString() });
+    old.markRestartScheduled("cutover-closed");
+    const newOwner = new McpCutoverController(store, identity("new", "new-source", "new-build"));
+    const closed = await newOwner.finish("cutover-closed", async () => ({
+      workspaceQueryable: true,
+      agentQueryable: true,
+      agentReconciled: true,
+    }));
+    assert.equal(closed.phase, "closed");
+
+    const recovering = new McpCutoverController(store, identity("reconciler", "old-source", "old-build"));
+    assert.throws(
+      () => recovering.recoverCutover({
+        cutoverId: "cutover-closed",
+        expectedNewIdentity: { sourceCommit: "target-source", buildId: "target-build" },
+      }),
+      /already closed/i,
+    );
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }

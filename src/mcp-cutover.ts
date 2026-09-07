@@ -157,14 +157,36 @@ export class McpCutoverController {
 
   status(transportEvidence: CutoverDrainEvidence): Record<string, unknown> {
     const record = this.store.get();
+    const superseded = this.store.supersededRecord();
     return {
       cutover: record,
+      supersededCutover:
+        superseded && (!record || record.supersedesCutoverId === undefined)
+          ? superseded
+          : undefined,
       currentServerIdentity: this.currentIdentity,
       comparison: record ? compareServerIdentity(record, this.currentIdentity) : undefined,
       transportEvidence,
       mode: this.mode(),
       reconciliationRequired: Boolean(record && record.phase !== "closed"),
     };
+  }
+
+  /**
+   * Terminally supersede one stale unresolved cutover whose expected target
+   * became obsolete and whose original drain-lease owner is gone. Bounded and
+   * idempotent; a different expected target on retry fails closed.
+   */
+  recoverCutover(input: {
+    cutoverId: string;
+    expectedNewIdentity: ExpectedCutoverIdentity;
+    expiresAt?: string;
+  }): {
+    terminal: DurableCutoverRecord;
+    successor: DurableCutoverRecord;
+    newlyRecovered: boolean;
+  } {
+    return recoverCutoverWithStore(this.store, this.currentIdentity, input);
   }
 
   async finish(
@@ -225,6 +247,113 @@ export function compareServerIdentity(
       record.expectedNewIdentity.capabilityManifestSha256 === undefined ||
       current.capabilityManifestSha256 === record.expectedNewIdentity.capabilityManifestSha256,
   };
+}
+
+export type CutoverRecoveryEligibility =
+  | { eligible: true }
+  | { eligible: false; reason: string };
+
+/**
+ * Shared terminal-recovery entry used by both the in-process controller and
+ * the out-of-process recovery seam so eligibility and idempotent rendezvous
+ * never diverge between the two control surfaces.
+ */
+export function recoverCutoverWithStore(
+  store: CutoverStateStore,
+  currentIdentity: CutoverServerIdentity,
+  input: {
+    cutoverId: string;
+    expectedNewIdentity: ExpectedCutoverIdentity;
+    expiresAt?: string;
+  },
+): {
+  terminal: DurableCutoverRecord;
+  successor: DurableCutoverRecord;
+  newlyRecovered: boolean;
+} {
+  const record = store.get();
+  if (!record) throw new CutoverStateError("No durable cutover record exists.");
+  if (
+    record.cutoverId !== input.cutoverId &&
+    record.supersedesCutoverId !== input.cutoverId
+  ) {
+    throw new CutoverStateError(`Cutover id mismatch: active cutover is ${record.cutoverId}.`);
+  }
+  if (record.supersedesCutoverId === input.cutoverId && record.cutoverId !== input.cutoverId) {
+    return store.recoverSupersede({
+      cutoverId: input.cutoverId,
+      expectedNewIdentity: input.expectedNewIdentity,
+      observedIdentity: currentIdentity,
+      recoveredBy: currentIdentity.serverInstanceId,
+      expiresAt: input.expiresAt,
+    });
+  }
+  if (record.phase === "superseded" && record.cutoverId === input.cutoverId) {
+    return store.recoverSupersede({
+      cutoverId: input.cutoverId,
+      expectedNewIdentity: input.expectedNewIdentity,
+      observedIdentity: currentIdentity,
+      recoveredBy: currentIdentity.serverInstanceId,
+      expiresAt: input.expiresAt,
+    });
+  }
+  const eligibility = assessRecoveryEligibility(record, currentIdentity);
+  if (!eligibility.eligible) {
+    throw new CutoverStateError(`Cutover ${input.cutoverId} is not recoverable: ${eligibility.reason}`);
+  }
+  return store.recoverSupersede({
+    cutoverId: input.cutoverId,
+    expectedNewIdentity: input.expectedNewIdentity,
+    observedIdentity: currentIdentity,
+    recoveredBy: currentIdentity.serverInstanceId,
+    expiresAt: input.expiresAt,
+  });
+}
+
+/**
+ * A stale cutover is recoverable only when it is unresolved at a terminal-
+ * recovery phase, the original drain-lease owner is gone, the current runtime
+ * is not already the abandoned expected target, and recovery has not already
+ * produced a successor. Never grants retry, deletion, or takeover.
+ */
+export function assessRecoveryEligibility(
+  record: DurableCutoverRecord,
+  current: CutoverServerIdentity,
+): CutoverRecoveryEligibility {
+  if (record.phase === "closed") {
+    return { eligible: false, reason: "the cutover is already closed; normal archive applies." };
+  }
+  if (record.phase === "superseded") {
+    return { eligible: false, reason: "the cutover was already terminally superseded." };
+  }
+  if (record.phase === "prepared" || record.phase === "drained") {
+    // intentionally the only recoverable phases
+  } else {
+    return { eligible: false, reason: `unknown phase ${record.phase}.` };
+  }
+  if (record.oldServerIdentity.serverInstanceId === current.serverInstanceId) {
+    return {
+      eligible: false,
+      reason: "the original drain-lease owner is still running; use the normal drain/restart/finish path instead.",
+    };
+  }
+  const comparison = compareServerIdentity(record, current);
+  if (
+    comparison.serverInstanceChanged &&
+    comparison.sourceMatches &&
+    comparison.buildMatches &&
+    (record.expectedNewIdentity.capabilityManifestSha256 === undefined ||
+      comparison.capabilityManifestMatches)
+  ) {
+    return {
+      eligible: false,
+      reason: "the current runtime already matches the bound expected target; finish the cutover normally.",
+    };
+  }
+  if (record.supersedesCutoverId !== undefined) {
+    return { eligible: false, reason: "the active cutover is its own successor, not a stale predecessor." };
+  }
+  return { eligible: true };
 }
 
 export interface CutoverHttpDependencies {
@@ -369,6 +498,33 @@ export function registerCutoverHttpRoutes(
         return;
       }
       res.status(200).json({ outcome });
+    } catch (error) {
+      sendCutoverError(res, error);
+    }
+  });
+
+  app.post("/api/cutover/recover", authenticate, (req, res) => {
+    try {
+      const body = objectBody(req.body);
+      const cutoverId = requiredString(body.cutoverId, "cutoverId");
+      const sourceCommit = requiredString(body.expectedSourceCommit, "expectedSourceCommit");
+      const buildId = requiredString(body.expectedBuildId, "expectedBuildId");
+      const capabilityManifestSha256 = optionalString(body.expectedCapabilityManifestSha256);
+      const recovered = controller.recoverCutover({
+        cutoverId,
+        expectedNewIdentity: {
+          sourceCommit,
+          buildId,
+          ...(capabilityManifestSha256 ? { capabilityManifestSha256 } : {}),
+        },
+        ...(optionalString(body.expiresAt) ? { expiresAt: body.expiresAt as string } : {}),
+      });
+      res.json({
+        terminal: recovered.terminal,
+        successor: recovered.successor,
+        newlyRecovered: recovered.newlyRecovered,
+        mode: controller.mode(),
+      });
     } catch (error) {
       sendCutoverError(res, error);
     }

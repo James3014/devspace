@@ -153,6 +153,15 @@ export class CutoverOrchestrator {
     record: NonNullable<ReturnType<McpCutoverController["record"]>>,
     dryRun: boolean,
   ): Promise<OrchestrationOutcome> {
+    if (record.phase === "superseded") {
+      return {
+        outcome: "blocked",
+        code: "CUTOVER_RECONCILIATION_REQUIRED",
+        reason:
+          `Cutover ${record.cutoverId} was terminally superseded while its recovery successor is pending establishment; ` +
+          "the durable recovery seam must be resumed to establish the successor. This orchestrator never auto-establishes or retries a supersession.",
+      };
+    }
     if (record.phase !== "drained") {
       return {
         outcome: "blocked",
