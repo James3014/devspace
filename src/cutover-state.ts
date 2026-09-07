@@ -15,6 +15,46 @@ import { join } from "node:path";
 export const CUTOVER_STATE_SCHEMA = "devspace.cutover.v1" as const;
 const CUTOVER_RESTART_SCHEMA = "devspace.cutover_restart.v1" as const;
 const CUTOVER_RESTART_SCHEDULED_SCHEMA = "devspace.cutover_restart_scheduled.v1" as const;
+export const CUTOVER_RECOVERY_INTENT_SCHEMA = "devspace.cutover_recovery_intent.v1" as const;
+export const CUTOVER_SUPERSEDED_SCHEMA = "devspace.cutover_superseded.v1" as const;
+
+export const CUTOVER_SUPERSEDED_REASON = "STALE_TARGET_SUPERSEDED" as const;
+
+/**
+ * A stale unresolved cutover cannot be retried, replaced, or deleted. It can
+ * only be closed as a terminal supersession that establishes one successor
+ * record owning a fresh cutover id. The receipt binds the abandoned expected
+ * identity, the observed recovering identity, and the historical restart
+ * ambiguity so the successor can never be mistaken for a retry of the old
+ * target.
+ */
+export interface CutoverSupersessionReceipt {
+  schema: typeof CUTOVER_SUPERSEDED_SCHEMA;
+  supersededCutoverId: string;
+  oldServerIdentity: CutoverServerIdentity;
+  oldExpectedIdentity: ExpectedCutoverIdentity;
+  observedIdentity: CutoverServerIdentity;
+  terminalReason: typeof CUTOVER_SUPERSEDED_REASON;
+  supersededAt: string;
+  recoveredBy: string;
+  successorCutoverId: string;
+  successorExpectedIdentity: ExpectedCutoverIdentity;
+  restartAmbiguity: {
+    restartRequested: boolean;
+    restartScheduled: boolean;
+    oldRestartEffect: "ambiguous_historical";
+  };
+}
+
+/** Durable intent bound before any supersession side effect; exclusive per cutover. */
+export interface CutoverRecoveryIntent {
+  schema: typeof CUTOVER_RECOVERY_INTENT_SCHEMA;
+  version: 1;
+  supersedesCutoverId: string;
+  expectedNewIdentity: ExpectedCutoverIdentity;
+  requestedByServerInstanceId: string;
+  requestedAt: string;
+}
 
 export interface CutoverServerIdentity {
   serverInstanceId: string;
@@ -73,7 +113,7 @@ interface CutoverRestartScheduledMarker {
 export interface DurableCutoverRecord {
   schema: typeof CUTOVER_STATE_SCHEMA;
   cutoverId: string;
-  phase: "prepared" | "drained" | "closed";
+  phase: "prepared" | "drained" | "closed" | "superseded";
   oldServerIdentity: CutoverServerIdentity;
   expectedNewIdentity: ExpectedCutoverIdentity;
   createdAt: string;
@@ -83,6 +123,10 @@ export interface DurableCutoverRecord {
   drainEvidence?: CutoverDrainEvidence;
   restartRequest?: CutoverRestartRequest;
   reconciliationReceipt?: CutoverReconciliationReceipt;
+  /** Present only on a successor record established by terminal supersession. */
+  supersedesCutoverId?: string;
+  /** Present only on a terminal superseded record. */
+  supersession?: CutoverSupersessionReceipt;
 }
 
 export interface CutoverStateStoreOptions {
@@ -108,6 +152,7 @@ export class CutoverStateStore {
   private readonly createdPath: string;
   private readonly restartRequestedPath: string;
   private readonly restartScheduledPath: string;
+  private readonly recoveryIntentPath: string;
   private readonly now: () => number;
   private readonly newId: () => string;
 
@@ -117,6 +162,7 @@ export class CutoverStateStore {
     this.createdPath = join(this.activeDir, "created.json");
     this.restartRequestedPath = join(this.activeDir, "restart-requested.json");
     this.restartScheduledPath = join(this.activeDir, "restart-scheduled.json");
+    this.recoveryIntentPath = join(this.cutoverRoot, "recovery-intent.json");
     this.now = options.now ?? Date.now;
     this.newId = options.newId ?? randomUUID;
   }
@@ -135,15 +181,34 @@ export class CutoverStateStore {
       throw error;
     }
     let record = parseRecord(raw);
-    const events = readdirSync(this.activeDir).filter((name) => name.endsWith(".json"));
-    const closed = events.filter((name) => name.startsWith("closed-")).sort().at(-1);
-    const drained = events.filter((name) => name.startsWith("drained-")).sort().at(-1);
-    if (closed) record = parseRecord(readFileSync(join(this.activeDir, closed), "utf8"));
-    else if (drained) record = parseRecord(readFileSync(join(this.activeDir, drained), "utf8"));
-    const restartRequest = readRestartMarker(this.restartRequestedPath, record.cutoverId)
+    const events = readdirSync(this.activeDir).filter((name) => name.endsWith(".json"))
+      .sort();
+
+    const successorCreatedPath = join(this.activeDir, SUCCESSOR_CREATED_FILE);
+    const successorCreatedRaw = readOptionalFile(successorCreatedPath);
+    if (successorCreatedRaw !== undefined) {
+      const successorCreated = parseRecord(successorCreatedRaw);
+      const successorClosed = latestEvent(events, "successor-closed-");
+      const successorDrained = latestEvent(events, "successor-drained-");
+      if (successorClosed) record = parseRecord(readFileSync(join(this.activeDir, successorClosed), "utf8"));
+      else if (successorDrained) record = parseRecord(readFileSync(join(this.activeDir, successorDrained), "utf8"));
+      else record = successorCreated;
+    } else {
+      const superseded = latestEvent(events, "superseded-");
+      if (superseded) {
+        record = parseRecord(readFileSync(join(this.activeDir, superseded), "utf8"));
+      } else {
+        const closed = latestEvent(events, "closed-");
+        const drained = latestEvent(events, "drained-");
+        if (closed) record = parseRecord(readFileSync(join(this.activeDir, closed), "utf8"));
+        else if (drained) record = parseRecord(readFileSync(join(this.activeDir, drained), "utf8"));
+      }
+    }
+    const markers = this.markerPaths(record);
+    const restartRequest = readRestartMarker(markers.restartRequested, record.cutoverId)
       ?? record.restartRequest;
     const restartScheduled = restartRequest
-      ? readRestartScheduledMarker(this.restartScheduledPath, record.cutoverId)
+      ? readRestartScheduledMarker(markers.restartScheduled, record.cutoverId)
       : undefined;
     const mergedRestartRequest = restartRequest && restartScheduled
       ? {
@@ -249,8 +314,9 @@ export class CutoverStateStore {
       cutoverId,
       request: { ...request, requestedAt },
     };
+    const markers = this.markerPaths(record);
     try {
-      writeExclusiveDurable(this.restartRequestedPath, `${JSON.stringify(marker, null, 2)}\n`);
+      writeExclusiveDurable(markers.restartRequested, `${JSON.stringify(marker, null, 2)}\n`);
       syncDirectory(this.activeDir);
     } catch (error) {
       if (!isErrno(error, "EEXIST")) throw error;
@@ -289,12 +355,13 @@ export class CutoverStateStore {
       scheduledForServerInstanceId,
       scheduledAt: new Date(this.now()).toISOString(),
     };
+    const markers = this.markerPaths(record);
     try {
-      writeExclusiveDurable(this.restartScheduledPath, `${JSON.stringify(marker, null, 2)}\n`);
+      writeExclusiveDurable(markers.restartScheduled, `${JSON.stringify(marker, null, 2)}\n`);
       syncDirectory(this.activeDir);
     } catch (error) {
       if (!isErrno(error, "EEXIST")) throw error;
-      readRestartScheduledMarker(this.restartScheduledPath, cutoverId);
+      readRestartScheduledMarker(markers.restartScheduled, cutoverId);
       return { record: this.requireExact(cutoverId), newlyScheduled: false };
     }
     return { record: this.requireExact(cutoverId), newlyScheduled: true };
@@ -326,11 +393,247 @@ export class CutoverStateStore {
     const sequence = String(this.now()).padStart(16, "0");
     const eventPath = join(
       this.activeDir,
-      `${record.phase}-${sequence}-${this.newId()}.json`,
+      this.eventFileName(record, record.phase, sequence),
     );
     writeExclusiveDurable(eventPath, serializeRecord(record));
     syncDirectory(this.activeDir);
     return record;
+  }
+
+  private eventFileName(record: DurableCutoverRecord, phase: string, sequence: string): string {
+    const prefix = record.supersedesCutoverId !== undefined ? `successor-${phase}` : phase;
+    return `${prefix}-${sequence}-${this.newId()}.json`;
+  }
+
+  /**
+   * Restart markers are per-generation so the successor can never bind the old
+   * cutover's restart fence and the old record can never bind the successor's.
+   */
+  private markerPaths(record: DurableCutoverRecord): {
+    restartRequested: string;
+    restartScheduled: string;
+  } {
+    if (record.supersedesCutoverId === undefined) {
+      return {
+        restartRequested: this.restartRequestedPath,
+        restartScheduled: this.restartScheduledPath,
+      };
+    }
+    return {
+      restartRequested: join(this.activeDir, `restart-requested-${record.cutoverId}.json`),
+      restartScheduled: join(this.activeDir, `restart-scheduled-${record.cutoverId}.json`),
+    };
+  }
+
+  /** Terminal supersession record for a stale resolved cutover, if any. */
+  supersededRecord(): DurableCutoverRecord | undefined {
+    let events: string[];
+    try {
+      events = readdirSync(this.activeDir).filter((name) => name.endsWith(".json")).sort();
+    } catch (error) {
+      if (isErrno(error, "ENOENT")) return undefined;
+      throw error;
+    }
+    const superseded = latestEvent(events, "superseded-");
+    if (!superseded) return undefined;
+    return parseRecord(readFileSync(join(this.activeDir, superseded), "utf8"));
+  }
+
+  /**
+   * Terminally supersede a stale unresolved cutover and establish exactly one
+   * successor record with a fresh cutover id. Crash-consistent and idempotent:
+   * the recovery intent and the superseded event are written before the
+   * successor is established, so being window between A-superseded and
+   * B-created still owns the durable fence. A different target on retry fails
+   * with [RECOVERY_BINDING_MISMATCH].
+   */
+  recoverSupersede(input: {
+    cutoverId: string;
+    expectedNewIdentity: ExpectedCutoverIdentity;
+    observedIdentity: CutoverServerIdentity;
+    recoveredBy: string;
+    expiresAt?: string;
+  }): { terminal: DurableCutoverRecord; successor: DurableCutoverRecord; newlyRecovered: boolean } {
+    mkdirSync(this.cutoverRoot, { recursive: true, mode: 0o700 });
+    const active = this.get();
+
+    if (
+      active &&
+      active.supersedesCutoverId === input.cutoverId &&
+      active.cutoverId !== input.cutoverId
+    ) {
+      const terminal = this.requireSuperseded(input.cutoverId);
+      this.assertRecoveryBinding(input);
+      return { terminal, successor: active, newlyRecovered: false };
+    }
+
+    if (active?.phase === "superseded") {
+      const terminal = this.requireSuperseded(input.cutoverId);
+      this.assertRecoveryBinding(input);
+      const successor = this.establishSuccessor(terminal, input);
+      return { terminal, successor, newlyRecovered: true };
+    }
+
+    if (!active) throw new CutoverStateError("No durable cutover record exists.");
+    if (active.cutoverId !== input.cutoverId) {
+      throw new CutoverStateError(
+        `Cutover id mismatch: active cutover is ${active.cutoverId}.`,
+      );
+    }
+    if (active.phase === "closed") {
+      throw new CutoverStateError(
+        `Cutover ${input.cutoverId} is already closed; normal begin() or archive applies, not supersession.`,
+      );
+    }
+    if (active.supersession) {
+      const terminal = this.requireSuperseded(input.cutoverId);
+      this.assertRecoveryBinding(input);
+      return { terminal, successor: active, newlyRecovered: false };
+    }
+
+    this.writeRecoveryIntent(input);
+
+    const supersededAt = new Date(this.now()).toISOString();
+    const successorCutoverId = this.newId();
+    const terminal: DurableCutoverRecord = {
+      ...withoutDiagnostic(active),
+      phase: "superseded",
+      expectedNewIdentity: input.expectedNewIdentity,
+      supersedesCutoverId: undefined,
+      supersession: {
+        schema: CUTOVER_SUPERSEDED_SCHEMA,
+        supersededCutoverId: input.cutoverId,
+        oldServerIdentity: active.oldServerIdentity,
+        oldExpectedIdentity: active.expectedNewIdentity,
+        observedIdentity: input.observedIdentity,
+        terminalReason: CUTOVER_SUPERSEDED_REASON,
+        supersededAt,
+        recoveredBy: input.recoveredBy,
+        successorCutoverId,
+        successorExpectedIdentity: input.expectedNewIdentity,
+        restartAmbiguity: {
+          restartRequested: Boolean(active.restartRequest),
+          restartScheduled: Boolean(active.restartRequest?.restartScheduledAt),
+          oldRestartEffect: "ambiguous_historical",
+        },
+      },
+      updatedAt: supersededAt,
+    };
+    this.replace(terminal);
+    const successor: DurableCutoverRecord = {
+      schema: CUTOVER_STATE_SCHEMA,
+      cutoverId: successorCutoverId,
+      phase: "prepared",
+      oldServerIdentity: active.oldServerIdentity,
+      expectedNewIdentity: input.expectedNewIdentity,
+      supersedesCutoverId: input.cutoverId,
+      createdAt: supersededAt,
+      updatedAt: supersededAt,
+      ...(input.expiresAt ? { expiresAt: input.expiresAt } : {}),
+    };
+    this.writeSuccessorCreated(successor);
+    return { terminal, successor, newlyRecovered: true };
+  }
+
+  private writeRecoveryIntent(input: {
+    cutoverId: string;
+    expectedNewIdentity: ExpectedCutoverIdentity;
+    recoveredBy: string;
+  }): void {
+    const intent: CutoverRecoveryIntent = {
+      schema: CUTOVER_RECOVERY_INTENT_SCHEMA,
+      version: 1,
+      supersedesCutoverId: input.cutoverId,
+      expectedNewIdentity: input.expectedNewIdentity,
+      requestedByServerInstanceId: input.recoveredBy,
+      requestedAt: new Date(this.now()).toISOString(),
+    };
+    try {
+      writeExclusiveDurable(this.recoveryIntentPath, `${JSON.stringify(intent, null, 2)}\n`);
+      syncDirectory(this.cutoverRoot);
+    } catch (error) {
+      if (isErrno(error, "EEXIST")) {
+        this.assertRecoveryBinding(input);
+        return;
+      }
+      throw error;
+    }
+  }
+
+  private assertRecoveryBinding(input: {
+    cutoverId: string;
+    expectedNewIdentity: ExpectedCutoverIdentity;
+  }): void {
+    const intent = readRecoveryIntent(this.recoveryIntentPath);
+    if (
+      intent.supersedesCutoverId !== input.cutoverId ||
+      intent.expectedNewIdentity.sourceCommit !== input.expectedNewIdentity.sourceCommit ||
+      intent.expectedNewIdentity.buildId !== input.expectedNewIdentity.buildId ||
+      (intent.expectedNewIdentity.capabilityManifestSha256 ?? undefined) !==
+        (input.expectedNewIdentity.capabilityManifestSha256 ?? undefined)
+    ) {
+      throw new CutoverStateError(
+        `Recovery intent binds cutover ${intent.supersedesCutoverId} to a different target; ` +
+        "refusing to supersede. [RECOVERY_BINDING_MISMATCH]",
+      );
+    }
+  }
+
+  private requireSuperseded(cutoverId: string): DurableCutoverRecord {
+    const terminal = this.supersededRecord();
+    if (!terminal || terminal.cutoverId !== cutoverId) {
+      throw new CutoverStateError(`Cutover ${cutoverId} has no terminal supersession record.`);
+    }
+    return terminal;
+  }
+
+  private establishSuccessor(
+    terminal: DurableCutoverRecord,
+    input: {
+      expectedNewIdentity: ExpectedCutoverIdentity;
+      expiresAt?: string;
+    },
+  ): DurableCutoverRecord {
+    const successor: DurableCutoverRecord = {
+      schema: CUTOVER_STATE_SCHEMA,
+      cutoverId: this.newId(),
+      phase: "prepared",
+      oldServerIdentity: terminal.oldServerIdentity,
+      expectedNewIdentity: input.expectedNewIdentity,
+      supersedesCutoverId: terminal.cutoverId,
+      createdAt: terminal.updatedAt,
+      updatedAt: terminal.updatedAt,
+      ...(input.expiresAt ? { expiresAt: input.expiresAt } : {}),
+    };
+    this.writeSuccessorCreated(successor);
+    return successor;
+  }
+
+  private writeSuccessorCreated(record: DurableCutoverRecord): void {
+    mkdirSync(this.activeDir, { mode: 0o700, recursive: true });
+    const path = join(this.activeDir, SUCCESSOR_CREATED_FILE);
+    try {
+      writeExclusiveDurable(path, serializeRecord(record));
+      syncDirectory(this.activeDir);
+      syncDirectory(this.cutoverRoot);
+    } catch (error) {
+      if (isErrno(error, "EEXIST")) {
+        const existing = readOptionalFile(path);
+        if (existing === undefined) {
+          throw new CutoverStateError(
+            "Durable successor fence exists but is unreadable; reconciliation is required.",
+          );
+        }
+        const parsed = parseRecord(existing);
+        if (parsed.cutoverId !== record.cutoverId) {
+          throw new CutoverStateError(
+            "Successor fence is bound to a different successor; refusing to double-establish. [RECOVERY_BINDING_MISMATCH]",
+          );
+        }
+        return;
+      }
+      throw error;
+    }
   }
 }
 
@@ -348,16 +651,46 @@ function parseRecord(raw: string): DurableCutoverRecord {
   if (
     value.schema !== CUTOVER_STATE_SCHEMA ||
     typeof value.cutoverId !== "string" ||
-    !["prepared", "drained", "closed"].includes(value.phase ?? "") ||
+    !["prepared", "drained", "closed", "superseded"].includes(value.phase ?? "") ||
     !isIdentity(value.oldServerIdentity) ||
     !isExpectedIdentity(value.expectedNewIdentity) ||
     typeof value.createdAt !== "string" ||
     typeof value.updatedAt !== "string" ||
-    (value.restartRequest !== undefined && !isRestartRequest(value.restartRequest))
+    (value.restartRequest !== undefined && !isRestartRequest(value.restartRequest)) ||
+    (value.supersedesCutoverId !== undefined &&
+      (typeof value.supersedesCutoverId !== "string" ||
+        value.supersedesCutoverId.trim() === "" ||
+        value.supersedesCutoverId === value.cutoverId)) ||
+    (value.supersession !== undefined && !isSupersessionReceipt(value.supersession))
   ) {
     throw new CutoverStateError("Durable cutover record is malformed; reconciliation is required.");
   }
   return value as DurableCutoverRecord;
+}
+
+function isSupersessionReceipt(value: unknown): value is CutoverSupersessionReceipt {
+  const receipt = value as Partial<CutoverSupersessionReceipt> | undefined;
+  return Boolean(
+    receipt &&
+    receipt.schema === CUTOVER_SUPERSEDED_SCHEMA &&
+    typeof receipt.supersededCutoverId === "string" &&
+    receipt.supersededCutoverId.length > 0 &&
+    isIdentity(receipt.oldServerIdentity) &&
+    isExpectedIdentity(receipt.oldExpectedIdentity) &&
+    isIdentity(receipt.observedIdentity) &&
+    receipt.terminalReason === CUTOVER_SUPERSEDED_REASON &&
+    typeof receipt.supersededAt === "string" &&
+    Number.isFinite(Date.parse(receipt.supersededAt)) &&
+    typeof receipt.recoveredBy === "string" &&
+    receipt.recoveredBy.length > 0 &&
+    typeof receipt.successorCutoverId === "string" &&
+    receipt.successorCutoverId.trim() !== "" &&
+    isExpectedIdentity(receipt.successorExpectedIdentity) &&
+    receipt.restartAmbiguity !== undefined &&
+    typeof receipt.restartAmbiguity.restartRequested === "boolean" &&
+    typeof receipt.restartAmbiguity.restartScheduled === "boolean" &&
+    receipt.restartAmbiguity.oldRestartEffect === "ambiguous_historical",
+  );
 }
 
 function isIdentity(value: unknown): value is CutoverServerIdentity {
@@ -477,6 +810,54 @@ function readRestartMarker(
 
 function isErrno(error: unknown, code: string): boolean {
   return (error as NodeJS.ErrnoException | undefined)?.code === code;
+}
+
+const SUCCESSOR_CREATED_FILE = "successor-created.json";
+
+function latestEvent(events: string[], prefix: string): string | undefined {
+  return events.filter((name) => name.startsWith(prefix)).at(-1);
+}
+
+function readOptionalFile(path: string): string | undefined {
+  try {
+    return readFileSync(path, "utf8");
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) return undefined;
+    throw error;
+  }
+}
+
+function readRecoveryIntent(path: string): CutoverRecoveryIntent {
+  const raw = readOptionalFile(path);
+  if (raw === undefined) {
+    throw new CutoverStateError(
+      "Durable recovery intent is missing; reconciliation is required.",
+    );
+  }
+  let value: Partial<CutoverRecoveryIntent>;
+  try {
+    value = JSON.parse(raw) as Partial<CutoverRecoveryIntent>;
+  } catch {
+    throw new CutoverStateError(
+      "Durable recovery intent is malformed; reconciliation is required.",
+    );
+  }
+  if (
+    value.schema !== CUTOVER_RECOVERY_INTENT_SCHEMA ||
+    value.version !== 1 ||
+    typeof value.supersedesCutoverId !== "string" ||
+    value.supersedesCutoverId.trim() === "" ||
+    !isExpectedIdentity(value.expectedNewIdentity) ||
+    typeof value.requestedByServerInstanceId !== "string" ||
+    value.requestedByServerInstanceId.trim() === "" ||
+    typeof value.requestedAt !== "string" ||
+    !Number.isFinite(Date.parse(value.requestedAt))
+  ) {
+    throw new CutoverStateError(
+      "Durable recovery intent is malformed; reconciliation is required.",
+    );
+  }
+  return value as CutoverRecoveryIntent;
 }
 
 function closeQuietly(fd: number): void {

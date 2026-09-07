@@ -1496,6 +1496,54 @@ function registerCutoverMcpTools(
 
   registerAppTool(
     server,
+    "cutover_recover",
+    {
+      title: "Recover stale cutover",
+      description:
+        "Terminally supersede one stale unresolved cutover lease whose expected target became obsolete and whose original drain-lease owner is gone, establishing one successor cutover bound to a fresh expected target. Idempotent: retries with the same binding rendezvous to the same successor; a different expected target fails closed. Never uninstalls, deletes, or retries the old target and never schedules a restart.",
+      inputSchema: {
+        cutoverId: z.string().min(1),
+        expectedSourceCommit: z.string().regex(/^[0-9a-f]{40}$/),
+        expectedBuildId: z.string().min(1),
+        expectedCapabilityManifestSha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+        expiresAt: z.string().optional(),
+      },
+      outputSchema: {
+        terminal: cutoverRecordSchema,
+        successor: cutoverRecordSchema,
+        newlyRecovered: z.boolean(),
+        mode: modeSchema,
+      },
+      _meta: {},
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ cutoverId, expectedSourceCommit, expectedBuildId, expectedCapabilityManifestSha256, expiresAt }) => {
+      const recovered = control.controller.recoverCutover({
+        cutoverId,
+        expectedNewIdentity: {
+          sourceCommit: expectedSourceCommit,
+          buildId: expectedBuildId,
+          ...(expectedCapabilityManifestSha256 ? { capabilityManifestSha256: expectedCapabilityManifestSha256 } : {}),
+        },
+        ...(expiresAt ? { expiresAt } : {}),
+      });
+      const mode = control.controller.mode();
+      return {
+        content: [textBlock(
+          `Superseded stale cutover ${recovered.terminal.cutoverId} -> successor ${recovered.successor.cutoverId}; mode=${mode}.`,
+        )],
+        structuredContent: {
+          terminal: recovered.terminal as unknown as Record<string, unknown>,
+          successor: recovered.successor as unknown as Record<string, unknown>,
+          newlyRecovered: recovered.newlyRecovered,
+          mode,
+        },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
     "cutover_finish",
     {
       title: "Finish cutover",

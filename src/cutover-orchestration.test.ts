@@ -307,3 +307,37 @@ test("reconcile-only advance fails closed on ambiguous restart and missing drain
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
+
+test("advance never establishes a recovery successor for a superseded terminal", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-orch-superseded-"));
+  try {
+    const store = new CutoverStateStore(stateDir, { newId: () => "cutover-superseded" });
+    new McpCutoverController(store, oldIdentity).begin(expectedId);
+    store.recoverSupersede({
+      cutoverId: "cutover-superseded",
+      expectedNewIdentity: { sourceCommit: "source-target", buildId: "build-target" },
+      observedIdentity: oldIdentity,
+      recoveredBy: "seam",
+    });
+    // Simulate the crash window where the superseded terminal survives but the
+    // successor write was lost: only the recovery seam may establish it.
+    rmSync(join(stateDir, "cutover", "active", "successor-created.json"), { force: true });
+    assert.equal(store.get()?.phase, "superseded");
+
+    const actuator = makeActuator();
+    const replacement = new McpCutoverController(store, newIdentity);
+    const outcome = await new CutoverOrchestrator({
+      controller: replacement,
+      actuator,
+      enumerateAll: async () => goodWitness,
+    }).advance();
+    assert.equal(outcome.outcome, "blocked");
+    assert.equal("code" in outcome && outcome.code, "CUTOVER_RECONCILIATION_REQUIRED");
+    assert.equal(actuator.calls, 0);
+    assert.equal(store.get()?.phase, "superseded");
+    assert.equal(store.get()?.supersedesCutoverId, undefined);
+    assert.equal(store.supersededRecord()?.cutoverId, "cutover-superseded");
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});

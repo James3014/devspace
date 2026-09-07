@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -339,6 +339,404 @@ test("drain evidence and terminal reconciliation receipt survive store replaceme
     const terminal = new CutoverStateStore(stateDir).get();
     assert.equal(terminal?.phase, "closed");
     assert.equal(terminal?.reconciliationReceipt?.agentReconciled, true);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("recoverSupersede terminally supersedes a stale cutover and establishes a fresh successor", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-supersede-"));
+  try {
+    let now = 1_000;
+    const store = new CutoverStateStore(stateDir, {
+      now: () => now,
+      newId: () => {
+        now += 1;
+        return `id-${now}`;
+      },
+    });
+    store.begin({
+      oldServerIdentity: oldIdentity,
+      expectedNewIdentity: { sourceCommit: "source-stale", buildId: "build-stale" },
+    });
+
+    now = 10_000;
+    const recovered = store.recoverSupersede({
+      cutoverId: "id-1001",
+      expectedNewIdentity: { sourceCommit: "source-target", buildId: "build-target" },
+      observedIdentity: {
+        serverInstanceId: "server-recovery",
+        sourceCommit: "source-target",
+        buildId: "build-target",
+      },
+      recoveredBy: "server-recovery",
+    });
+
+    assert.equal(recovered.newlyRecovered, true);
+    assert.equal(recovered.terminal.phase, "superseded");
+    assert.equal(recovered.terminal.cutoverId, "id-1001");
+    assert.equal(recovered.terminal.supersedesCutoverId, undefined);
+    assert.equal(recovered.terminal.supersession?.schema, "devspace.cutover_superseded.v1");
+    assert.equal(recovered.terminal.supersession?.supersededCutoverId, "id-1001");
+    assert.equal(recovered.terminal.supersession?.oldServerIdentity.serverInstanceId, "server-old");
+    assert.deepEqual(recovered.terminal.supersession?.oldExpectedIdentity, {
+      sourceCommit: "source-stale",
+      buildId: "build-stale",
+    });
+    assert.equal(recovered.terminal.supersession?.observedIdentity.serverInstanceId, "server-recovery");
+    assert.equal(recovered.terminal.supersession?.terminalReason, "STALE_TARGET_SUPERSEDED");
+    assert.equal(recovered.terminal.supersession?.successorCutoverId, recovered.successor.cutoverId);
+    assert.deepEqual(recovered.terminal.supersession?.restartAmbiguity, {
+      restartRequested: false,
+      restartScheduled: false,
+      oldRestartEffect: "ambiguous_historical",
+    });
+
+    assert.equal(recovered.successor.phase, "prepared");
+    assert.equal(recovered.successor.supersedesCutoverId, "id-1001");
+    assert.deepEqual(recovered.successor.expectedNewIdentity, {
+      sourceCommit: "source-target",
+      buildId: "build-target",
+    });
+    assert.equal(recovered.successor.oldServerIdentity.serverInstanceId, "server-old");
+    assert.notEqual(recovered.successor.cutoverId, "id-1001");
+
+    assert.equal(store.get()?.cutoverId, recovered.successor.cutoverId);
+    assert.equal(store.get()?.phase, "prepared");
+    assert.equal(store.supersededRecord()?.cutoverId, "id-1001");
+    assert.equal(existsSync(join(stateDir, "cutover", "recovery-intent.json")), true);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("recoverSupersede rendezvouses to the same successor and refuses a changed target", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-rendezvous-"));
+  try {
+    const store = new CutoverStateStore(stateDir, {
+      newId: (() => { let n = 0; return () => `cutover-${n += 1}`; })(),
+    });
+    store.begin({
+      oldServerIdentity: oldIdentity,
+      expectedNewIdentity: { sourceCommit: "source-stale", buildId: "build-stale" },
+    });
+    const first = store.recoverSupersede({
+      cutoverId: "cutover-1",
+      expectedNewIdentity: { sourceCommit: "source-target", buildId: "build-target" },
+      observedIdentity: oldIdentity,
+      recoveredBy: "server-recovery",
+    });
+    assert.equal(first.newlyRecovered, true);
+
+    // Rendezvous after successor creation + ack loss: same successor, no mutation.
+    const retry = store.recoverSupersede({
+      cutoverId: "cutover-1",
+      expectedNewIdentity: { sourceCommit: "source-target", buildId: "build-target" },
+      observedIdentity: oldIdentity,
+      recoveredBy: "server-recovery",
+    });
+    assert.equal(retry.newlyRecovered, false);
+    assert.equal(retry.successor.cutoverId, first.successor.cutoverId);
+    assert.equal(retry.terminal.cutoverId, first.terminal.cutoverId);
+
+    // A different target on retry fails closed at the recovery intent.
+    assert.throws(
+      () => store.recoverSupersede({
+        cutoverId: "cutover-1",
+        expectedNewIdentity: { sourceCommit: "source-different", buildId: "build-target" },
+        observedIdentity: oldIdentity,
+        recoveredBy: "server-recovery",
+      }),
+      /RECOVERY_BINDING_MISMATCH/i,
+    );
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("recoverSupersede resumes a superseded terminal when the successor was lost (C2)", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-c2-"));
+  try {
+    const store = new CutoverStateStore(stateDir, {
+      newId: (() => { let n = 0; return () => `cutover-${n += 1}`; })(),
+    });
+    store.begin({
+      oldServerIdentity: oldIdentity,
+      expectedNewIdentity: { sourceCommit: "source-stale", buildId: "build-stale" },
+    });
+    store.recoverSupersede({
+      cutoverId: "cutover-1",
+      expectedNewIdentity: { sourceCommit: "source-target", buildId: "build-target" },
+      observedIdentity: oldIdentity,
+      recoveredBy: "server-recovery",
+    });
+    rmSync(join(stateDir, "cutover", "active", "successor-created.json"), { force: true });
+
+    // The superseded terminal still owns the durable fence and is visible.
+    assert.equal(store.get()?.cutoverId, "cutover-1");
+    assert.equal(store.get()?.phase, "superseded");
+
+    // Retry re-establishes exactly one successor bound to the same target.
+    const resumed = store.recoverSupersede({
+      cutoverId: "cutover-1",
+      expectedNewIdentity: { sourceCommit: "source-target", buildId: "build-target" },
+      observedIdentity: oldIdentity,
+      recoveredBy: "server-recovery",
+    });
+    assert.equal(resumed.newlyRecovered, true);
+    assert.equal(resumed.successor.supersedesCutoverId, "cutover-1");
+
+    // The fence remains exclusive: a fresh recover cannot create a second successor.
+    const again = store.recoverSupersede({
+      cutoverId: "cutover-1",
+      expectedNewIdentity: { sourceCommit: "source-target", buildId: "build-target" },
+      observedIdentity: oldIdentity,
+      recoveredBy: "server-recovery",
+    });
+    assert.equal(again.newlyRecovered, false);
+    assert.equal(again.successor.cutoverId, resumed.successor.cutoverId);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("recoverSupersede resumes an intent-only crash window and fences a changed target (C1)", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-c1-"));
+  try {
+    const store = new CutoverStateStore(stateDir, {
+      newId: (() => { let n = 0; return () => `cutover-${n += 1}`; })(),
+    });
+    store.begin({
+      oldServerIdentity: oldIdentity,
+      expectedNewIdentity: { sourceCommit: "source-stale", buildId: "build-stale" },
+    });
+    const cutoverRoot = join(stateDir, "cutover");
+    writeFileSync(
+      join(cutoverRoot, "recovery-intent.json"),
+      JSON.stringify({
+        schema: "devspace.cutover_recovery_intent.v1",
+        version: 1,
+        supersedesCutoverId: "cutover-1",
+        expectedNewIdentity: { sourceCommit: "source-target", buildId: "build-target" },
+        requestedByServerInstanceId: "server-recovery",
+        requestedAt: new Date().toISOString(),
+      }),
+      "utf8",
+    );
+
+    const resumed = store.recoverSupersede({
+      cutoverId: "cutover-1",
+      expectedNewIdentity: { sourceCommit: "source-target", buildId: "build-target" },
+      observedIdentity: oldIdentity,
+      recoveredBy: "server-recovery",
+    });
+    assert.equal(resumed.newlyRecovered, true);
+    assert.equal(resumed.terminal.phase, "superseded");
+
+    // A different target after the intent window is refused even though it is the
+    // only other possible writer.
+    const bound = store.recoverSupersede({
+      cutoverId: "cutover-1",
+      expectedNewIdentity: { sourceCommit: "source-target", buildId: "build-target" },
+      observedIdentity: oldIdentity,
+      recoveredBy: "server-recovery",
+    });
+    assert.equal(bound.newlyRecovered, false);
+    assert.throws(
+      () => store.recoverSupersede({
+        cutoverId: "cutover-1",
+        expectedNewIdentity: { sourceCommit: "source-different", buildId: "build-target" },
+        observedIdentity: oldIdentity,
+        recoveredBy: "server-recovery",
+      }),
+      /RECOVERY_BINDING_MISMATCH/i,
+    );
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("concurrent recoverers produce exactly one successor cutover", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-supersede-race-"));
+  try {
+    const initialState = new CutoverStateStore(stateDir, { newId: () => "cutover-race" });
+    initialState.begin({
+      oldServerIdentity: oldIdentity,
+      expectedNewIdentity: { sourceCommit: "source-stale", buildId: "build-stale" },
+    });
+
+    const stores = Array.from({ length: 8 }, (_, index) => new CutoverStateStore(stateDir, {
+      newId: () => `successor-${index}`,
+    }));
+    const results = await Promise.allSettled(stores.map(async (store) => store.recoverSupersede({
+      cutoverId: "cutover-race",
+      expectedNewIdentity: { sourceCommit: "source-target", buildId: "build-target" },
+      observedIdentity: oldIdentity,
+      recoveredBy: `recovery-${Math.random()}`,
+    })));
+    const fulfilled = results.filter((result) => result.status === "fulfilled");
+    assert.ok(fulfilled.length >= 1);
+    const successorIds = new Set(
+      fulfilled.map((result) => (result as PromiseFulfilledResult<{
+        successor: { cutoverId: string };
+      }>).value.successor.cutoverId),
+    );
+    assert.equal(successorIds.size, 1);
+    assert.equal(fulfilled.filter((result) => (result as PromiseFulfilledResult<{
+      newlyRecovered: boolean;
+    }>).value.newlyRecovered).length, 1);
+    assert.equal(new CutoverStateStore(stateDir).supersededRecord()?.cutoverId, "cutover-race");
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("recoverSupersede rejects a closed cutover and a mismatched active id", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-reject-"));
+  try {
+    const store = new CutoverStateStore(stateDir, { newId: () => "cutover-closed" });
+    store.begin({
+      oldServerIdentity: oldIdentity,
+      expectedNewIdentity: { sourceCommit: "source-new", buildId: "build-new" },
+    });
+    store.recordDrain("cutover-closed", { activeSessions: 1, oldestAgeMs: 10 });
+    store.close("cutover-closed", {
+      closedByServerInstanceId: "server-new",
+      workspaceQueryable: true,
+      agentQueryable: true,
+      agentReconciled: true,
+      reconciledAt: new Date().toISOString(),
+    });
+    assert.throws(
+      () => store.recoverSupersede({
+        cutoverId: "cutover-closed",
+        expectedNewIdentity: { sourceCommit: "source-target", buildId: "build-target" },
+        observedIdentity: oldIdentity,
+        recoveredBy: "server-recovery",
+      }),
+      /already closed/i,
+    );
+
+    const other = new CutoverStateStore(stateDir, { newId: () => "cutover-other" });
+    assert.throws(
+      () => other.recoverSupersede({
+        cutoverId: "not-the-active-cutover",
+        expectedNewIdentity: { sourceCommit: "source-target", buildId: "build-target" },
+        observedIdentity: oldIdentity,
+        recoveredBy: "server-recovery",
+      }),
+      /already closed|mismatch|no durable/i,
+    );
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("successor lifecycle drains, restarts, schedules, and closes with scoped markers", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-successor-lifecycle-"));
+  try {
+    let now = 1_000;
+    const store = new CutoverStateStore(stateDir, {
+      now: () => now,
+      newId: () => {
+        now += 1;
+        return `id-${now}`;
+      },
+    });
+    store.begin({
+      oldServerIdentity: oldIdentity,
+      expectedNewIdentity: { sourceCommit: "source-stale", buildId: "build-stale" },
+    });
+    const recovered = store.recoverSupersede({
+      cutoverId: "id-1001",
+      expectedNewIdentity: { sourceCommit: "source-target", buildId: "build-target" },
+      observedIdentity: oldIdentity,
+      recoveredBy: "server-recovery",
+    });
+    const successorId = recovered.successor.cutoverId;
+
+    assert.throws(
+      () => store.recordRestartRequest(successorId, {
+        actuator: "launchd-self",
+        requestedByServerInstanceId: "server-target",
+      }),
+      /must be drained/i,
+    );
+
+    store.recordDrain(successorId, { activeSessions: 3, oldestAgeMs: 40_000 });
+    assert.equal(store.get()?.phase, "drained");
+    assert.equal(store.get()?.cutoverId, successorId);
+
+    const requested = store.recordRestartRequest(successorId, {
+      actuator: "launchd-self",
+      requestedByServerInstanceId: "server-target",
+      buildReady: { verifiedBy: "seam", verifiedAt: new Date(now).toISOString() },
+    });
+    assert.equal(requested.newlyRequested, true);
+
+    const scheduled = store.recordRestartScheduled(successorId, "server-target");
+    assert.equal(scheduled.newlyScheduled, true);
+
+    const activeDir = join(stateDir, "cutover", "active");
+    assert.equal(existsSync(join(activeDir, `restart-requested-${successorId}.json`)), true);
+    assert.equal(existsSync(join(activeDir, `restart-scheduled-${successorId}.json`)), true);
+
+    store.close(successorId, {
+      closedByServerInstanceId: "server-target",
+      workspaceQueryable: true,
+      agentQueryable: true,
+      agentReconciled: true,
+      reconciledAt: new Date(now).toISOString(),
+    });
+    assert.equal(store.get()?.phase, "closed");
+    assert.equal(store.get()?.supersedesCutoverId, "id-1001");
+
+    const next = store.begin({
+      oldServerIdentity: {
+        serverInstanceId: "server-target",
+        sourceCommit: "source-target",
+        buildId: "build-target",
+      },
+      expectedNewIdentity: { sourceCommit: "source-future", buildId: "build-future" },
+    });
+    assert.equal(store.get()?.cutoverId, next.cutoverId);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("malformed supersession records fail closed on parse", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-supersession-parse-"));
+  try {
+    const store = new CutoverStateStore(stateDir, {
+      newId: (() => { let n = 0; return () => `cutover-${n += 1}`; })(),
+    });
+    store.begin({
+      oldServerIdentity: oldIdentity,
+      expectedNewIdentity: { sourceCommit: "source-stale", buildId: "build-stale" },
+    });
+    store.recoverSupersede({
+      cutoverId: "cutover-1",
+      expectedNewIdentity: { sourceCommit: "source-target", buildId: "build-target" },
+      observedIdentity: oldIdentity,
+      recoveredBy: "server-recovery",
+    });
+
+    const superseded = store.supersededRecord();
+    assert.ok(superseded);
+    const activeDir = join(stateDir, "cutover", "active");
+    const supersededPath = join(
+      activeDir,
+      readdirSync(activeDir).find((name) => name.startsWith("superseded-")) ?? "missing.json",
+    );
+    writeFileSync(supersededPath, JSON.stringify({
+      ...superseded,
+      supersession: { ...superseded.supersession, successorExpectedIdentity: undefined },
+    }), "utf8");
+    assert.throws(
+      () => new CutoverStateStore(stateDir).supersededRecord(),
+      /malformed/i,
+    );
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }

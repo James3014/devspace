@@ -60,8 +60,18 @@ import {
   getActiveOpencodeCatalogSnapshot,
   refreshOpencodeCatalog,
 } from "./local-agent-opencode-catalog.js";
+import {
+  cutoverSeamStatus,
+  performCutoverRecovery,
+  readRunningBuildIdentity,
+  resolveSeamStateDir,
+  runningPackageRoot,
+} from "./cutover-recovery.js";
+import { CutoverStateStore } from "./cutover-state.js";
+import { probeBuildReady } from "./cutover-build-ready.js";
+import type { ExpectedCutoverIdentity } from "./cutover-state.js";
 
-type Command = "serve" | "init" | "doctor" | "config" | "agents" | "models" | "help" | "version";
+type Command = "serve" | "init" | "doctor" | "config" | "agents" | "models" | "cutover" | "help" | "version";
 const require = createRequire(import.meta.url);
 const SUPPORTED_NODE_RANGE = ">=20.12 <27";
 
@@ -91,6 +101,9 @@ async function main(argv: string[]): Promise<void> {
     case "models":
       await runModelsCommand(args);
       return;
+    case "cutover":
+      await runCutoverCommand(args);
+      return;
     case "help":
       printHelp();
       return;
@@ -102,7 +115,7 @@ async function main(argv: string[]): Promise<void> {
 
 function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
-  if (command === "init" || command === "doctor" || command === "config" || command === "agents" || command === "models") return command;
+  if (command === "init" || command === "doctor" || command === "config" || command === "agents" || command === "models" || command === "cutover") return command;
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
   throw new Error(`Unknown command: ${command}`);
@@ -749,6 +762,202 @@ function printAgentsHelp(): void {
       "  devspace agents cancel <id> [--json]",
       "  devspace agents targets [--json]",
       "  devspace agents daemon <status|stop|logs> [--json]",
+    ].join("\n"),
+  );
+}
+
+interface CutoverRecoverCliOptions {
+  cutoverId: string;
+  sourceCommit: string;
+  buildId: string;
+  capabilityManifestSha256?: string;
+  activeSessions: number;
+  oldestAgeMs: number;
+  expiresAt?: string;
+  buildReadyVerifiedBy?: string;
+  buildReadyEvidence?: string;
+  json: boolean;
+}
+
+async function runCutoverCommand(args: string[]): Promise<void> {
+  const [subcommand] = args;
+  if (subcommand === "status" || subcommand === "ls") {
+    const json = args.includes("--json");
+    const status = cutoverSeamStatus(resolveSeamStateDir());
+    if (json) printJson(status);
+    else {
+      const active = status.active as { cutoverId?: string; phase?: string } | undefined;
+      const superseded = status.superseded as { cutoverId?: string; phase?: string } | undefined;
+      console.log(
+        [
+          `Active cutover: ${active ? `${active.cutoverId} (${active.phase})` : "none"}`,
+          `Terminally superseded: ${superseded ? superseded.cutoverId : "none"}`,
+        ].join("\n"),
+      );
+    }
+    return;
+  }
+  if (subcommand === "recover") {
+    await runCutoverRecover(args.slice(1));
+    return;
+  }
+  if (subcommand === "help" || subcommand === "--help" || subcommand === "-h" || subcommand === undefined) {
+    printCutoverHelp();
+    return;
+  }
+  throw new Error("Usage: devspace cutover <status|recover>");
+}
+
+function printCutoverHelp(): void {
+  console.log(
+    [
+      "DevSpace cutover recovery (out-of-process control seam)",
+      "",
+      "Usage:",
+      "  devspace cutover status [--json]",
+      "  devspace cutover recover --cutover-id <id> --expected-source-commit <40hex> --expected-build-id <id>",
+      "      [--expected-capability-manifest-sha256 <64hex>] [--active-sessions <n>] [--oldest-age-ms <n>]",
+      "      [--build-ready-verified-by <identity>] [--build-ready-evidence <detail>] [--expires-at <ISO>] [--json]",
+      "",
+      "The recover subcommand supersedes one stale unresolved cutover lease and",
+      "establishes its successor bound to the expected target, then durably drains,",
+      "requests, and schedules the successor restart. It never restarts the service;",
+      "the operator performs the single launchctl kickstart after the durable",
+      "restart-scheduled marker exists. Requires the configured state directory and",
+      "either a configured DEVSPACE_BUILD_READY_ROOT probe or --build-ready-verified-by.",
+    ].join("\n"),
+  );
+}
+
+function parseCutoverRecoverArgs(args: string[]): CutoverRecoverCliOptions {
+  const options: Partial<CutoverRecoverCliOptions> = { json: false };
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    const value = (): string => {
+      const next = args[index + 1];
+      if (next === undefined) throw new Error(`Flag ${argument} requires a value.`);
+      index += 1;
+      return next;
+    };
+    switch (argument) {
+      case "--json":
+        options.json = true;
+        break;
+      case "--cutover-id":
+        options.cutoverId = value();
+        break;
+      case "--expected-source-commit":
+        options.sourceCommit = value();
+        break;
+      case "--expected-build-id":
+        options.buildId = value();
+        break;
+      case "--expected-capability-manifest-sha256":
+        options.capabilityManifestSha256 = value();
+        break;
+      case "--active-sessions":
+        options.activeSessions = parseNonNegativeIntOrThrow(value(), "--active-sessions");
+        break;
+      case "--oldest-age-ms":
+        options.oldestAgeMs = parseNonNegativeIntOrThrow(value(), "--oldest-age-ms");
+        break;
+      case "--expires-at":
+        options.expiresAt = value();
+        break;
+      case "--build-ready-verified-by":
+        options.buildReadyVerifiedBy = value();
+        break;
+      case "--build-ready-evidence":
+        options.buildReadyEvidence = value();
+        break;
+      default:
+        throw new Error(`Unknown cutover recover flag: ${argument}`);
+    }
+  }
+  if (!options.cutoverId || !options.sourceCommit || !options.buildId) {
+    throw new Error(
+      "Usage: devspace cutover recover --cutover-id <id> --expected-source-commit <40hex> --expected-build-id <id> ...",
+    );
+  }
+  if (options.activeSessions === undefined || options.oldestAgeMs === undefined) {
+    throw new Error(
+      "devspace cutover recover requires --active-sessions <n> and --oldest-age-ms <n> so drain evidence is never fabricated.",
+    );
+  }
+  if (options.buildReadyVerifiedBy?.trim() === "") {
+    throw new Error("--build-ready-verified-by must be a non-empty identity string.");
+  }
+  return options as CutoverRecoverCliOptions;
+}
+
+function parseNonNegativeIntOrThrow(value: string, flag: string): number {
+  const parsed = Number(value);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${flag} must be a non-negative integer; got ${JSON.stringify(value)}.`);
+  }
+  return parsed;
+}
+
+async function runCutoverRecover(args: string[]): Promise<void> {
+  const options = parseCutoverRecoverArgs(args);
+  if (!/^[0-9a-f]{40}$/.test(options.sourceCommit)) {
+    throw new Error("--expected-source-commit must be a 40-character hex commit.");
+  }
+  if (
+    options.capabilityManifestSha256 !== undefined &&
+    !/^[0-9a-f]{64}$/.test(options.capabilityManifestSha256)
+  ) {
+    throw new Error("--expected-capability-manifest-sha256 must be a 64-character hex hash.");
+  }
+  if (options.expiresAt !== undefined && !Number.isFinite(Date.parse(options.expiresAt))) {
+    throw new Error("--expires-at must be an ISO-8601 timestamp.");
+  }
+  const config = loadConfig();
+  const requesterIdentity = readRunningBuildIdentity(runningPackageRoot());
+  if (!requesterIdentity) {
+    throw new Error(
+      "Unable to read the running build identity; run the recovery seam from an accepted DevSpace build.",
+    );
+  }
+  const buildReadyProbe = config.mcpCutoverBuildReadyRoot
+    ? (expected: ExpectedCutoverIdentity) =>
+        probeBuildReady({ packageRoot: runningPackageRoot(), expected })
+    : undefined;
+  const buildReadyAttestation = options.buildReadyVerifiedBy
+    ? { verifiedBy: options.buildReadyVerifiedBy, ...(options.buildReadyEvidence ? { evidence: options.buildReadyEvidence } : {}) }
+    : undefined;
+  if (!buildReadyProbe && !buildReadyAttestation) {
+    throw new Error(
+      "Cutover recovery requires a configured DEVSPACE_BUILD_READY_ROOT or --build-ready-verified-by.",
+    );
+  }
+  const result = performCutoverRecovery({
+    store: new CutoverStateStore(config.stateDir),
+    requesterIdentity,
+    cutoverId: options.cutoverId,
+    expectedNewIdentity: {
+      sourceCommit: options.sourceCommit,
+      buildId: options.buildId,
+      ...(options.capabilityManifestSha256 ? { capabilityManifestSha256: options.capabilityManifestSha256 } : {}),
+    },
+    drainEvidence: { activeSessions: options.activeSessions, oldestAgeMs: options.oldestAgeMs },
+    ...(buildReadyProbe ? { buildReadyProbe } : {}),
+    ...(buildReadyAttestation ? { buildReadyAttestation } : {}),
+    ...(options.expiresAt ? { expiresAt: options.expiresAt } : {}),
+  });
+  if (options.json) {
+    printJson(result);
+    return;
+  }
+  console.log(
+    [
+      `Superseded stale cutover ${result.terminal.cutoverId} (phase ${result.terminal.phase})`,
+      `  old expected target: ${result.terminal.supersession?.oldExpectedIdentity.sourceCommit} / ${result.terminal.supersession?.oldExpectedIdentity.buildId}`,
+      `Established successor ${result.successor.cutoverId} (supersedes ${result.successor.supersedesCutoverId})`,
+      `  new expected target: ${result.successor.expectedNewIdentity.sourceCommit} / ${result.successor.expectedNewIdentity.buildId}`,
+      `Successor drain recorded: activeSessions=${result.drainRecord.drainEvidence?.activeSessions ?? "unknown"}`,
+      `Restart requested: ${String(result.restartRequested)}; restart scheduled (durable marker): ${String(result.restartScheduled)}`,
+      `The service is NOT restarted; after verifying the restart-scheduled marker, run the single launchctl kickstart.`,
     ].join("\n"),
   );
 }
