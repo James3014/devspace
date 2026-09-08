@@ -1818,7 +1818,7 @@ export class LocalAgentSessionManager {
       }
       if (catalogReceipt?.provider === "opencode") {
         const liveCatalog = await this.opencodeCatalogSource.acquire();
-        const runtimeIdentity = `${liveCatalog.runtime?.source ?? "unknown"}:${liveCatalog.runtime?.version ?? "unknown"}`;
+        const runtimeIdentity = `${liveCatalog.runtime?.source ?? "unknown"}:${liveCatalog.runtime?.version ?? "unknown"}:${liveCatalog.runtime?.executable ?? "unknown"}`;
         if (liveCatalog.generation !== catalogReceipt.generation
           || (liveCatalog.freshness ?? "unknown") !== catalogReceipt.freshness
           || runtimeIdentity !== catalogReceipt.runtimeIdentity) {
@@ -1830,7 +1830,7 @@ export class LocalAgentSessionManager {
       if (catalogReceipt?.provider === "cline") {
         const liveCatalog = await this.clineCatalogService?.refresh();
         const exact = liveCatalog?.entries.filter((entry) => entry.cliProviderId === (catalogReceipt.cliProviderId ?? "cline") && entry.fullName === catalogReceipt.model) ?? [];
-        const runtimeIdentity = liveCatalog ? `${liveCatalog.runtime.cliProviderId}:${liveCatalog.runtime.version}` : "unknown:unknown";
+        const runtimeIdentity = liveCatalog ? `${liveCatalog.runtime.cliProviderId}:${liveCatalog.runtime.version}:${liveCatalog.runtime.command}` : "unknown:unknown:unknown";
         if (!liveCatalog || liveCatalog.state !== "READY" || liveCatalog.generation !== catalogReceipt.generation
           || catalogReceipt.freshness !== "fresh" || runtimeIdentity !== catalogReceipt.runtimeIdentity || exact.length !== 1
           || (catalogReceipt.effort && (!exact[0].thinkingKnown || !exact[0].thinking.includes(catalogReceipt.effort as never)))) {

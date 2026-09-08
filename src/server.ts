@@ -1875,7 +1875,7 @@ function catalogReceiptForProfile(
       generation: opencodeCatalog.generation,
       fetchedAt: opencodeCatalog.fetchedAt,
       freshness: opencodeCatalog.freshness ?? "unknown",
-      runtimeIdentity: `${opencodeCatalog.runtime?.source ?? "unknown"}:${opencodeCatalog.runtime?.version ?? "unknown"}`,
+      runtimeIdentity: `${opencodeCatalog.runtime?.source ?? "unknown"}:${opencodeCatalog.runtime?.version ?? "unknown"}:${opencodeCatalog.runtime?.executable ?? "unknown"}`,
     };
   }
   if (profile.provider === "cline") {
@@ -1888,7 +1888,7 @@ function catalogReceiptForProfile(
       generation: clineCatalog.generation,
       fetchedAt: clineCatalog.fetchedAt ?? new Date(0).toISOString(),
       freshness: clineCatalog.state === "READY" ? "fresh" : "unknown",
-      runtimeIdentity: `${clineCatalog.runtime.cliProviderId}:${clineCatalog.runtime.version}`,
+      runtimeIdentity: `${clineCatalog.runtime.cliProviderId}:${clineCatalog.runtime.version}:${clineCatalog.runtime.command}`,
     };
   }
   return undefined;
@@ -3350,6 +3350,8 @@ export function createMcpServer(
             variantsKnown: z.boolean().optional(),
             status: z.string(),
             enabled: z.boolean().optional(),
+            cliProviderId: z.string().optional(),
+            routeKey: z.string().optional(),
             membership: z.literal("catalog-listed"),
           })),
           entitlement: z.object({ state: z.literal("UNKNOWN"), source: z.literal("not-probed") }),
@@ -3372,7 +3374,7 @@ export function createMcpServer(
         const filteredEntries = provider === "cline"
           ? clineCatalog.entries
             .filter((entry) => !model || entry.fullName === model || entry.routeKey === model)
-            .map((entry) => ({ providerId: "cline", modelId: entry.modelId, fullName: entry.fullName, variants: [...entry.thinking], variantsKnown: entry.thinkingKnown, status: clineCatalog.state.toLowerCase(), enabled: true }))
+            .map((entry) => ({ providerId: "cline", modelId: entry.modelId, fullName: entry.fullName, variants: [...entry.thinking], variantsKnown: entry.thinkingKnown, status: clineCatalog.state.toLowerCase(), cliProviderId: entry.cliProviderId, routeKey: entry.routeKey }))
           : opencodeCatalog.entries
             .filter((entry) => !provider || entry.providerId === provider)
             .filter((entry) => !model || entry.fullName === model || entry.modelId === model);
@@ -3389,7 +3391,7 @@ export function createMcpServer(
           source: selectedSnapshot.source,
           fetchedAt: selectedSnapshot.fetchedAt ?? new Date(0).toISOString(),
           generation: selectedSnapshot.generation,
-          freshness: "fresh",
+          freshness: provider === "cline" ? (clineCatalog.state === "READY" ? "fresh" : "unknown") : (opencodeCatalog.freshness ?? "unknown"),
           version: provider === "cline" ? clineCatalog.runtime.version : (opencodeCatalog.runtime?.version ?? "unknown"),
           runtime: { version: provider === "cline" ? clineCatalog.runtime.version : (opencodeCatalog.runtime?.version ?? "unknown"), source: selectedSnapshot.source },
           ...(snapshotFailure ? { failure: snapshotFailure } : {}),
