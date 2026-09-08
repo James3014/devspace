@@ -313,6 +313,38 @@ await closeOnlyRuntime.close();
   assert.equal(promptCalls, 0, "conflicting model identities must prevent prompt dispatch");
 }
 
+{
+  const requestedModel = "deepseek/deepseek-v4-flash";
+  const queues = new Map<string, { values: unknown[] }>();
+  let promptCalls = 0;
+  const connection = {
+    agent: {
+      async request(method: string): Promise<unknown> {
+        if (method === "session/new") {
+          queues.set("cline_effort_unsupported", { values: [] });
+          return {
+            sessionId: "cline_effort_unsupported",
+            models: { currentModelId: requestedModel, availableModels: [{ modelId: requestedModel }] },
+            configOptions: [
+              { type: "select", id: "provider", currentValue: "cline", options: [{ value: "cline" }] },
+              { type: "select", id: "model", currentValue: requestedModel, options: [{ value: requestedModel }] },
+            ],
+          };
+        }
+        if (method === "session/prompt") promptCalls += 1;
+        return { stopReason: "end_turn" };
+      },
+    },
+    close() {},
+    closed: new Promise<void>(() => undefined),
+  };
+  const runtime = new AcpRuntime({ provider: "cline", command: "cline", args: ["--acp"], env: {}, queues, capabilities: { resume: false, close: false } }, connection);
+  const result = await runtime.run({ prompt: "route", workspaceRoot: "/tmp/project", model: requestedModel, effort: "high" });
+  assert.equal(result.isErr(), true);
+  if (result.isErr()) assert.match(result.error.message, /thinking\/effort/);
+  assert.equal(promptCalls, 0, "unsupported Cline effort must fail before prompt dispatch");
+}
+
 assert.deepEqual(
   selectAcpPermissionOption([
     { optionId: "allow", kind: "allow_once" },
@@ -720,7 +752,6 @@ assert.equal(resumedRuntime.isAlive(), false);
     prompt: "read only",
     workspaceRoot: "/tmp/project",
     model: "cline-pass/glm-5.3-flash",
-    effort: "high",
     writeMode: "read_only",
   });
   assert.equal(clineEntitlement.isErr(), true);

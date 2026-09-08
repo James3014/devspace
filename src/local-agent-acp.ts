@@ -451,6 +451,9 @@ export class AcpRuntime implements LocalAgentRuntime {
     input: LocalAgentRunInput,
     metadata: unknown,
   ): Promise<void> {
+    if (input.effort !== undefined) {
+      throw clineSelectionError("Cline ACP does not advertise a session thinking/effort config or readback.");
+    }
     const requestedProvider = input.cliProviderId ?? "cline";
     let current = readClineSessionIdentity(metadata);
     if (current.provider !== requestedProvider) {
