@@ -802,6 +802,9 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   const opencodeSnapshot = catalogPayload.snapshot as Record<string, any>;
   assert.equal(opencodeSnapshot.runtime.source, opencodeSnapshot.source);
   assert.ok(opencodeSnapshot.freshness === "fresh" || opencodeSnapshot.freshness === "stale" || opencodeSnapshot.freshness === "unknown");
+  const opencodeEntries = catalogPayload.entries as Array<Record<string, unknown>>;
+  assert.ok(opencodeEntries.length > 0, "OpenCode regression requires a non-empty catalog result");
+  assert.ok(opencodeEntries.every((entry) => entry.thinkingVerified === undefined), "Cline-only thinking evidence must not be added to OpenCode entries");
   const clineCatalogResult = await context.client.callTool({
     name: "agent_catalog",
     arguments: { workspaceId, provider: "cline", model: "cline-pass:openai/gpt-6-astra" },
