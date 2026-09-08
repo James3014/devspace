@@ -409,13 +409,10 @@ export class AcpRuntime implements LocalAgentRuntime {
       await this.configureGrokSession(sessionId, input, metadata, isNewSession);
       return;
     }
-    // Cline's exact model and thinking level are process-level CLI settings
-    // (--model/--thinking). Its ACP `model` config is a provider-family selector
-    // (e.g. cline-pass), not the exact model id. Re-applying the exact CLI model
-    // through session/set_config_option rejects valid values such as
-    // cline-pass/glm-5.3-flash. Runtime identity is model/effort-bound below, so
-    // Cline sessions must keep the process-level selection instead.
-    if (this.provider === "cline") return;
+    if (this.provider === "cline") {
+      await this.configureClineSession(sessionId, input, metadata);
+      return;
+    }
 
     const canConfigure = isNewSession || hasAcpConfigOptions(metadata);
     if (!canConfigure) {
@@ -446,6 +443,53 @@ export class AcpRuntime implements LocalAgentRuntime {
     if (input.effort) {
       const config = resolveAcpEffortConfigUpdate(metadata, input.effort, this.provider, sessionId);
       await this.connection.agent.request("session/set_config_option", config);
+    }
+  }
+
+  private async configureClineSession(
+    sessionId: string,
+    input: LocalAgentRunInput,
+    metadata: unknown,
+  ): Promise<void> {
+    const requestedProvider = input.cliProviderId ?? "cline";
+    let current = readClineSessionIdentity(metadata);
+    if (current.provider !== requestedProvider) {
+      const providerConfig = current.providerConfig;
+      if (!providerConfig || !flattenAcpSelectValues(providerConfig).includes(requestedProvider)) {
+        throw clineSelectionError(`provider '${requestedProvider}' is not advertised by the ACP session.`);
+      }
+      const providerConfigId = directString(providerConfig.id);
+      if (!providerConfigId) throw clineSelectionError("Cline ACP provider config option is missing an id.");
+      const providerResponse = await this.connection.agent.request("session/set_config_option", {
+        sessionId,
+        configId: providerConfigId,
+        value: requestedProvider,
+      });
+      current = readClineSessionIdentity(providerResponse);
+      if (current.provider !== requestedProvider) {
+        throw clineSelectionError(`provider readback '${current.provider ?? "unknown"}' did not match requested '${requestedProvider}'.`);
+      }
+    }
+    if (!input.model) return;
+    if (!current.models.includes(input.model)) {
+      throw clineSelectionError(`model '${input.model}' is not advertised by the ACP session.`);
+    }
+    if (current.model === input.model) return;
+    const modelConfig = current.modelConfig;
+    if (!modelConfig) throw clineSelectionError("Cline ACP did not advertise a model config option.");
+    const modelConfigId = directString(modelConfig.id);
+    if (!modelConfigId) throw clineSelectionError("Cline ACP model config option is missing an id.");
+    const modelResponse = await this.connection.agent.request("session/set_config_option", {
+      sessionId,
+      configId: modelConfigId,
+      value: input.model,
+    });
+    const readback = readClineSessionIdentity(modelResponse);
+    if (readback.provider !== requestedProvider) {
+      throw clineSelectionError(`provider readback '${readback.provider ?? "unknown"}' did not match requested '${requestedProvider}'.`);
+    }
+    if (readback.model !== input.model) {
+      throw clineSelectionError(`model readback '${readback.model ?? "unknown"}' did not match requested '${input.model}'.`);
     }
   }
 
@@ -997,6 +1041,57 @@ function extractAcpText(updates: unknown[]): string {
     })
     .join("")
     .trim();
+}
+
+type ClineSessionIdentity = {
+  provider?: string;
+  model?: string;
+  models: string[];
+  providerConfig?: Record<string, unknown>;
+  modelConfig?: Record<string, unknown>;
+};
+
+function clineSelectionError(message: string): AgentProviderProtocolError {
+  return new AgentProviderProtocolError({
+    code: "PROVIDER_PROTOCOL_ERROR",
+    provider: "cline",
+    operation: "configure_session",
+    retryable: false,
+    message: `Cline ACP route selection failed closed: ${message}`,
+  });
+}
+
+function readClineSessionIdentity(value: unknown): ClineSessionIdentity {
+  const record = asRecord(value);
+  const response = asRecord(record?.newSessionResponse) ?? record;
+  const configOptions = readArray(response, "configOptions") ?? [];
+  const configs = configOptions.map(asRecord).filter((config): config is Record<string, unknown> => Boolean(config));
+  const providerConfigs = configs.filter((config) => config.type === "select" && config.id === "provider");
+  const modelConfigs = configs.filter((config) => config.type === "select" && config.id === "model");
+  if (providerConfigs.length > 1) throw clineSelectionError("Cline ACP advertised duplicate provider config options.");
+  if (modelConfigs.length > 1) throw clineSelectionError("Cline ACP advertised duplicate model config options.");
+  const providerConfig = providerConfigs[0];
+  const modelConfig = modelConfigs[0];
+  const models = new Set(flattenAcpSelectValues(modelConfig ?? {}));
+  const modelSet = asRecord(response?.models);
+  for (const item of readArray(modelSet, "availableModels") ?? []) {
+    const modelId = directString(asRecord(item)?.modelId);
+    if (modelId) models.add(modelId);
+  }
+  const modelFromModels = directString(modelSet?.currentModelId);
+  const modelFromConfig = directString(modelConfig?.currentValue);
+  if (modelFromModels && modelFromConfig && modelFromModels !== modelFromConfig) {
+    throw clineSelectionError(`Cline ACP reported conflicting model identities '${modelFromModels}' and '${modelFromConfig}'.`);
+  }
+  const model = modelFromModels ?? modelFromConfig;
+  const provider = directString(providerConfig?.currentValue);
+  return {
+    provider,
+    model,
+    models: [...models],
+    ...(providerConfig ? { providerConfig } : {}),
+    ...(modelConfig ? { modelConfig } : {}),
+  };
 }
 
 const DIAGNOSTIC_RESPONSE_KEYS = new Set(["stopReason", "sessionId", "usage", "_meta", "result", "error"]);
