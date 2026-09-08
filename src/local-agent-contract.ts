@@ -42,7 +42,19 @@ export interface ExecutionContract {
     provider: string;
     model: string;
     effort?: string;
+    cliProviderId?: "cline" | "cline-pass";
     writeMode: "read_only" | "allowed";
+  };
+  /** Exact provider catalog evidence admitted with this execution. */
+  catalogReceipt?: {
+    provider: string;
+    model?: string;
+    effort?: string;
+    cliProviderId?: "cline" | "cline-pass";
+    source: string;
+    generation: string;
+    fetchedAt: string;
+    runtimeIdentity: string;
   };
   /** Defaults to OWNER_DIRECT for backwards compatibility. */
   authorityMode?: ExecutionAuthorityMode;
@@ -153,6 +165,7 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
     if (typeof selection.provider !== "string" || !selection.provider.trim()
       || typeof selection.model !== "string" || !selection.model.trim()
       || (selection.effort !== undefined && (typeof selection.effort !== "string" || !selection.effort.trim()))
+      || (selection.cliProviderId !== undefined && selection.cliProviderId !== "cline" && selection.cliProviderId !== "cline-pass")
       || (selection.writeMode !== "read_only" && selection.writeMode !== "allowed")) {
       throw new Error("executionContract.directSelection has invalid provider, model, effort, or writeMode.");
     }
@@ -160,7 +173,35 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
       provider: selection.provider.trim(),
       model: selection.model.trim(),
       effort: selection.effort === undefined ? undefined : selection.effort.trim(),
+      ...(selection.cliProviderId === undefined ? {} : { cliProviderId: selection.cliProviderId }),
       writeMode: selection.writeMode,
+    };
+  }
+
+  if (record.catalogReceipt !== undefined) {
+    if (typeof record.catalogReceipt !== "object" || record.catalogReceipt === null || Array.isArray(record.catalogReceipt)) {
+      throw new Error("executionContract.catalogReceipt must be an object.");
+    }
+    const receipt = record.catalogReceipt as Record<string, unknown>;
+    if (typeof receipt.provider !== "string" || !receipt.provider.trim()
+      || (receipt.model !== undefined && (typeof receipt.model !== "string" || !receipt.model.trim()))
+      || (receipt.effort !== undefined && (typeof receipt.effort !== "string" || !receipt.effort.trim()))
+      || (receipt.cliProviderId !== undefined && receipt.cliProviderId !== "cline" && receipt.cliProviderId !== "cline-pass")
+      || typeof receipt.source !== "string" || !receipt.source.trim()
+      || typeof receipt.generation !== "string" || !receipt.generation.trim()
+      || typeof receipt.fetchedAt !== "string" || !receipt.fetchedAt.trim()
+      || typeof receipt.runtimeIdentity !== "string" || !receipt.runtimeIdentity.trim()) {
+      throw new Error("executionContract.catalogReceipt has invalid provider, identity, source, generation, or runtime evidence.");
+    }
+    contract.catalogReceipt = {
+      provider: receipt.provider.trim(),
+      ...(receipt.model === undefined ? {} : { model: receipt.model.trim() }),
+      ...(receipt.effort === undefined ? {} : { effort: receipt.effort.trim() }),
+      ...(receipt.cliProviderId === undefined ? {} : { cliProviderId: receipt.cliProviderId }),
+      source: receipt.source.trim(),
+      generation: receipt.generation.trim(),
+      fetchedAt: receipt.fetchedAt.trim(),
+      runtimeIdentity: receipt.runtimeIdentity.trim(),
     };
   }
 

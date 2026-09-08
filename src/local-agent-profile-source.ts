@@ -16,6 +16,7 @@ import {
   type OpencodeCatalogSnapshot,
 } from "./local-agent-opencode-catalog.js";
 import type { ServerConfig } from "./config.js";
+import type { ClineCatalogSnapshot } from "./local-agent-cline-catalog.js";
 
 /**
  * Owner-approved profile authority contract:
@@ -66,6 +67,7 @@ export interface ProfileCatalog {
   generation: string;
   /** Exact OpenCode snapshot used to validate provider/model/variant entries. */
   opencodeCatalog?: OpencodeCatalogSnapshot;
+  clineCatalog?: ClineCatalogSnapshot;
   /** Resolve a profile by name; returns the advertised profile or undefined. */
   advertised(profileName: string): LocalAgentProfile | undefined;
   /** Typed blocker for a known-but-not-advertised profile; undefined if unknown. */
@@ -78,7 +80,8 @@ export async function loadProfileCatalog(
   options: {
     subagents?: SubagentsConfig;
     availability?: readonly LocalAgentProviderAvailability[];
-    opencodeCatalog?: OpencodeCatalogSnapshot;
+  opencodeCatalog?: OpencodeCatalogSnapshot;
+  clineCatalog?: ClineCatalogSnapshot;
   } = {},
 ): Promise<ProfileCatalog> {
   const entries: LocalAgentProfileEntry[] = await loadLocalAgentProfileEntries(config, workspaceRoot);
@@ -132,6 +135,20 @@ export async function loadProfileCatalog(
         } else {
           state = "advertised";
         }
+      } else if (profile.provider === "cline") {
+        const clineCatalog = options.clineCatalog;
+        const exact = clineCatalog?.state === "READY"
+          ? clineCatalog.entries.filter((entry) => entry.cliProviderId === (profile.cliProviderId ?? "cline") && entry.fullName === profile.model)
+          : [];
+        if (exact.length !== 1) {
+          state = "exact_model_unavailable";
+          diagnostic = clineCatalog?.diagnostic ?? `Cline model '${profile.model}' is not established by the current catalog.`;
+        } else if (profile.effort && (!exact[0].thinkingKnown || !exact[0].thinking.includes(profile.effort as never))) {
+          state = "variant_unavailable";
+          diagnostic = `Cline thinking level '${profile.effort}' is not established for '${profile.model}'.`;
+        } else {
+          state = "advertised";
+        }
       } else {
         state = "advertised";
       }
@@ -160,8 +177,12 @@ export async function loadProfileCatalog(
     // snapshot used for validation. A refreshed snapshot must therefore be
     // treated as execution material drift even when its profile projection is
     // textually unchanged.
-    generation: computeProfileCatalogGeneration(catalogEntries, options.opencodeCatalog?.generation),
+    generation: computeProfileCatalogGeneration(
+      catalogEntries,
+      [options.opencodeCatalog?.generation, options.clineCatalog?.generation].filter(Boolean).join("|") || undefined,
+    ),
     opencodeCatalog: options.opencodeCatalog,
+    clineCatalog: options.clineCatalog,
     advertised: (profileName) => advertised.get(profileName),
     blockerFor: (profileName) => {
       const catalogEntry = catalogEntries.find((candidate) => candidate.name === profileName);
