@@ -12,6 +12,7 @@ export interface GrantEvidenceReference {
   coordinatorThread: string;
   evidenceHash: string;
 }
+export interface GrantEvidenceIndexRow extends GrantEvidenceReference { version: number; updatedAt: string; }
 
 export interface TrustedOwnerContext {
   ownerThread: string;
@@ -115,6 +116,11 @@ export function initializeControlPlaneOwnershipDatabase(sqlite: Database.Databas
       updated_at text not null,
       primary key(goal, layer)
     );
+    create table if not exists control_plane_grant_evidence (
+      repository text not null, goal text not null, coordinator_thread text not null,
+      evidence_hash text not null, version integer not null, updated_at text not null,
+      primary key(repository, goal, coordinator_thread)
+    );
   `);
 }
 
@@ -169,6 +175,12 @@ export class ControlPlaneOwnershipStore {
   constructor(private readonly sqlite: Database.Database, private readonly options: ControlPlaneOwnershipOptions) {
     initializeControlPlaneOwnershipDatabase(sqlite);
   }
+  putGrantEvidence(reference: GrantEvidenceReference, expectedVersion: number): GrantEvidenceIndexRow {
+    const owner = ownerFor(this.options, { ownerThread: reference.coordinatorThread }); verifyGrant(this.options, reference, owner);
+    const repository = normalizeRepositoryKey(reference.repository); bounded(reference.goal, "grant.goal"); bounded(reference.coordinatorThread, "grant.coordinatorThread"); bounded(reference.evidenceHash, "grant.evidenceHash");
+    const now = new Date(this.now()).toISOString(); const tx = this.sqlite.transaction(() => { const current = this.sqlite.prepare("select * from control_plane_grant_evidence where repository=? and goal=? and coordinator_thread=?").get(repository, reference.goal, reference.coordinatorThread) as { version: number } | undefined; if (!current && expectedVersion !== 0) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "grant evidence row does not exist"); if (current && current.version !== expectedVersion) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "grant evidence version changed"); const version = expectedVersion + 1; this.sqlite.prepare("insert into control_plane_grant_evidence(repository,goal,coordinator_thread,evidence_hash,version,updated_at) values(?,?,?,?,?,?) on conflict(repository,goal,coordinator_thread) do update set evidence_hash=excluded.evidence_hash, version=excluded.version, updated_at=excluded.updated_at").run(repository, reference.goal, reference.coordinatorThread, reference.evidenceHash, version, now); return this.getGrantEvidence(reference.repository, reference.goal, reference.coordinatorThread)!; }); return tx.immediate();
+  }
+  getGrantEvidence(repository: string, goal: string, coordinatorThread: string): GrantEvidenceIndexRow | undefined { const row = this.sqlite.prepare("select * from control_plane_grant_evidence where repository=? and goal=? and coordinator_thread=?").get(normalizeRepositoryKey(repository), goal, coordinatorThread) as { repository: string; goal: string; coordinator_thread: string; evidence_hash: string; version: number; updated_at: string } | undefined; return row && { repository: row.repository, goal: row.goal, coordinatorThread: row.coordinator_thread, evidenceHash: row.evidence_hash, version: row.version, updatedAt: row.updated_at }; }
   acquire(consumerContext: unknown, input: ResourceLeaseInput): ResourceLease {
     const owner = ownerFor(this.options, consumerContext); verifyGrant(this.options, input.grant, owner);
     const repositoryKey = normalizeRepositoryKey(input.repositoryKey); if (normalizeRepositoryKey(input.grant.repository) !== repositoryKey) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "grant repository does not match the leased repository"); bounded(input.resourceKind, "resourceKind"); bounded(input.resourceId, "resourceId"); const scope = normalizeScope(input.scope); bounded(input.resource, "resource"); bounded(input.operation, "operation"); bounded(input.baseRevision, "baseRevision"); bounded(input.idempotencyKey, "idempotencyKey"); validExpiry(input.expiresAt, this.now());
