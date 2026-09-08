@@ -31,6 +31,10 @@ export interface CutoverIdentityComparison {
 }
 
 export const CONSEQUENTIAL_MCP_TOOLS = new Set([
+  "chat_swarm_create",
+  "chat_swarm_join",
+  "chat_swarm_dispatch",
+  "chat_swarm_close",
   "open_workspace",
   "write",
   "edit",

@@ -88,6 +88,9 @@ import {
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { openAiConversationScopeId } from "./request-meta.js";
 import { isReadOnlyInspectionCommand } from "./conversation-isolation.js";
+import { ChatSwarmLifecycle } from "./chat-swarm-lifecycle.js";
+import { registerChatSwarmTools, chatSwarmToolInputShapes } from "./chat-swarm-tools.js";
+import { ChatSwarmRuntimeOwner } from "./chat-swarm-runtime-owner.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
@@ -1924,6 +1927,7 @@ export function createMcpServer(
   cutoverControl?: CutoverMcpControlContext,
   opencodeCatalogSource?: ReturnType<typeof createMcpOpencodeCatalogSource>,
   clineCatalogService?: ClineCatalogService,
+  chatSwarmLifecycle?: ChatSwarmLifecycle,
 ): McpServer {
   const runtimeBuildIdentity = runtimeBuildIdentityContext?.identity
     ?? describeRuntimeBuildIdentity({
@@ -1944,8 +1948,13 @@ export function createMcpServer(
           agent_start: agentStartInputSchema,
           agent_preflight: agentPreflightInputSchema,
           agent_catalog: createAgentCatalogInputSchema(),
+          ...(config.chatSwarmEnabled && chatSwarmLifecycle?.enabled && chatSwarmLifecycle.coordinator
+            ? chatSwarmToolInputShapes(config)
+            : {}),
         }
-        : {},
+        : config.chatSwarmEnabled && chatSwarmLifecycle?.enabled && chatSwarmLifecycle.coordinator
+          ? chatSwarmToolInputShapes(config)
+          : {},
     );
   const server = new McpServer(
     {
@@ -4389,11 +4398,20 @@ export function createMcpServer(
     );
   }
 
+  if (chatSwarmLifecycle?.enabled && chatSwarmLifecycle.coordinator) {
+    registerChatSwarmTools(server, {
+      coordinator: chatSwarmLifecycle.coordinator,
+      config,
+      admit: (action, context) => chatSwarmLifecycle.admit(action === "worker_next" ? "next" : action, context),
+    });
+  }
+
   return server;
 }
 
 export interface CreateServerOptions {
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
+  chatSwarmInitializationHook?: () => void;
 }
 
 export function createServer(
@@ -4451,6 +4469,7 @@ export function createServer(
       ...(agentSessionManager
         ? { agent_start: createAgentStartInputSchema(), agent_preflight: createAgentPreflightInputSchema(), agent_catalog: createAgentCatalogInputSchema() }
         : {}),
+      ...(config.chatSwarmEnabled ? chatSwarmToolInputShapes(config) : {}),
     },
   );
   const cutoverController = new McpCutoverController(
@@ -4462,6 +4481,31 @@ export function createServer(
       capabilityManifestSha256: capabilityManifest.manifestSha256,
     },
   );
+  let chatSwarmRuntimeOwner: ChatSwarmRuntimeOwner | undefined;
+  let chatSwarmLifecycle: ChatSwarmLifecycle | undefined;
+  try {
+    chatSwarmRuntimeOwner = config.chatSwarmEnabled
+      ? new ChatSwarmRuntimeOwner(config.stateDir)
+      : undefined;
+  try {
+    chatSwarmRuntimeOwner?.acquire();
+  } catch (error) {
+    chatSwarmRuntimeOwner?.close();
+    throw error;
+  }
+  try {
+    chatSwarmLifecycle = new ChatSwarmLifecycle({ stateDir: config.stateDir, enabled: config.chatSwarmEnabled, mode: () => cutoverController.mode() });
+    if (chatSwarmLifecycle.enabled) chatSwarmLifecycle.recoverAfterStartup();
+  } catch (error) {
+    try {
+      chatSwarmLifecycle?.close();
+    } finally {
+      chatSwarmRuntimeOwner?.close();
+    }
+    throw error;
+  }
+  if (!chatSwarmLifecycle) throw new Error("Chat Swarm lifecycle failed to initialize.");
+  options.chatSwarmInitializationHook?.();
   const restartSelfActuator = createLaunchdSelfRestartActuator();
   const reconcileCutoverDurableState = async ({
     workspaceId,
@@ -4922,6 +4966,7 @@ export function createServer(
           },
           opencodeCatalogSource,
           clineCatalogService,
+          chatSwarmLifecycle,
         );
         await server.connect(transport);
       } else {
@@ -4960,6 +5005,8 @@ export function createServer(
         codexGoals?.shutdown();
         processSessions.shutdown();
         durableOperations.close();
+        chatSwarmLifecycle?.close();
+        chatSwarmRuntimeOwner?.close();
         agentSessionManager?.close();
         await opencodeCatalogSource.close();
         oauthProvider.close();
@@ -4968,6 +5015,14 @@ export function createServer(
       return closePromise;
     },
   };
+  } catch (error) {
+    try {
+      chatSwarmLifecycle?.close();
+    } finally {
+      chatSwarmRuntimeOwner?.close();
+    }
+    throw error;
+  }
 }
 
 async function isMainModule(): Promise<boolean> {

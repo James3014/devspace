@@ -28,6 +28,24 @@ assert.deepEqual(loadConfig(baseEnv).subagents, { enabled: false, providers: [] 
 assert.equal(loadConfig(baseEnv).artifactsEnabled, false);
 assert.equal(loadConfig(baseEnv).artifactMaxFileBytes, 100 * 1024 * 1024);
 assert.equal(loadConfig(baseEnv).agentMaxConcurrent, 4);
+assert.equal(loadConfig(baseEnv).chatSwarmEnabled, false);
+assert.equal(loadConfig(baseEnv).chatSwarmMaxWorkers, 16);
+assert.equal(loadConfig(baseEnv).chatSwarmQueueLimit, 1000);
+assert.equal(loadConfig(baseEnv).chatSwarmResultMaxChars, 256 * 1024);
+assert.equal(loadConfig(baseEnv).chatSwarmInviteTtlSeconds, 15 * 60);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_CHAT_SWARM: "1" }).chatSwarmEnabled, true);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_CHAT_SWARM_MAX_WORKERS: "3" }).chatSwarmMaxWorkers, 3);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_CHAT_SWARM_QUEUE_LIMIT: "17" }).chatSwarmQueueLimit, 17);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_CHAT_SWARM_RESULT_MAX_CHARS: "4096" }).chatSwarmResultMaxChars, 4096);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_CHAT_SWARM_INVITE_TTL_SECONDS: "60" }).chatSwarmInviteTtlSeconds, 60);
+for (const [name, value] of [
+  ["DEVSPACE_CHAT_SWARM_MAX_WORKERS", "0"],
+  ["DEVSPACE_CHAT_SWARM_QUEUE_LIMIT", "0"],
+  ["DEVSPACE_CHAT_SWARM_RESULT_MAX_CHARS", "0"],
+  ["DEVSPACE_CHAT_SWARM_INVITE_TTL_SECONDS", "0"],
+] as const) {
+  assert.throws(() => loadConfig({ ...baseEnv, [name]: value }), new RegExp(`Invalid ${name}`));
+}
 assert.equal(loadConfig(baseEnv).codexGoalsEnabled, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_CODEX_GOALS: "1" }).codexGoalsEnabled, true);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_CODEX_GOALS: "0" }).codexGoalsEnabled, false);

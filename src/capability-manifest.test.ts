@@ -5,6 +5,7 @@ import {
   CAPABILITY_MANIFEST_SCHEMA,
   deriveLoadedCapabilityManifest,
 } from "./capability-manifest.js";
+import { chatSwarmToolInputShapes } from "./chat-swarm-tools.js";
 
 function agentStartInput(idleDescription = "heartbeat-backed idle supervision"): Record<string, z.ZodType> {
   return {
@@ -60,4 +61,16 @@ test("loaded capability manifest detects removal from the actual registered sche
     "agent_start.executionContract.authorityMode",
     "agent_start.executionContract.nexusGrant",
   ]);
+});
+
+test("schema fingerprint includes the exact Chat Swarm registered input shapes", () => {
+  const withoutSwarm = deriveLoadedCapabilityManifest({ agent_start: agentStartInput() });
+  const withSwarm = deriveLoadedCapabilityManifest({
+    agent_start: agentStartInput(),
+    ...chatSwarmToolInputShapes({ chatSwarmMaxWorkers: 4, chatSwarmResultMaxChars: 4096 }),
+  });
+  assert.notEqual(withSwarm.inputSchemaFingerprint, withoutSwarm.inputSchemaFingerprint);
+  const changed = chatSwarmToolInputShapes({ chatSwarmMaxWorkers: 5, chatSwarmResultMaxChars: 4096 });
+  const changedManifest = deriveLoadedCapabilityManifest({ agent_start: agentStartInput(), ...changed });
+  assert.notEqual(changedManifest.inputSchemaFingerprint, withSwarm.inputSchemaFingerprint);
 });

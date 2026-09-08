@@ -1,4 +1,5 @@
-import { index, integer, primaryKey, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { foreignKey, index, integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import { sql } from "drizzle-orm";
 
 export const workspaceSessions = sqliteTable(
   "workspace_sessions",
@@ -154,7 +155,107 @@ export const durableOperations = sqliteTable(
   ],
 );
 
+export const chatSwarms = sqliteTable(
+  "chat_swarms",
+  {
+    id: text("id").primaryKey(),
+    status: text("status").notNull(),
+    ownerIdentityFingerprint: text("owner_identity_fingerprint").notNull(),
+    workerLimit: integer("worker_limit").notNull(),
+    inviteCredentialHash: text("invite_credential_hash"),
+    metadataJson: text("metadata_json").notNull(),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [index("chat_swarms_status_idx").on(table.status, table.updatedAt)],
+);
+
+export const chatSwarmWorkers = sqliteTable(
+  "chat_swarm_workers",
+  {
+    id: text("id").primaryKey(),
+    swarmId: text("swarm_id").notNull().references(() => chatSwarms.id, { onDelete: "cascade" }),
+    label: text("label").notNull(),
+    runtimeKind: text("runtime_kind").notNull(),
+    sessionIdentityFingerprint: text("session_identity_fingerprint"),
+    carrierConversationFingerprint: text("carrier_conversation_fingerprint"),
+    lifecycleState: text("lifecycle_state").notNull(),
+    currentTaskId: text("current_task_id"),
+    leaseJson: text("lease_json"),
+    checkpointJson: text("checkpoint_json"),
+    continuationEpoch: integer("continuation_epoch").notNull(),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    index("chat_swarm_workers_swarm_idx").on(table.swarmId, table.updatedAt),
+    index("chat_swarm_workers_task_idx").on(table.currentTaskId),
+    foreignKey((): any => ({ columns: [table.currentTaskId], foreignColumns: [chatSwarmTasks.id], name: "chat_swarm_workers_current_task_fk" })),
+  ],
+);
+
+export const chatSwarmTasks = sqliteTable(
+  "chat_swarm_tasks",
+  {
+    id: text("id").primaryKey(),
+    swarmId: text("swarm_id").notNull().references(() => chatSwarms.id, { onDelete: "cascade" }),
+    taskKey: text("task_key").notNull(),
+    requestHash: text("request_hash").notNull(),
+    prompt: text("prompt").notNull(),
+    payloadJson: text("payload_json").notNull(),
+    preferredWorkerId: text("preferred_worker_id"),
+    assignedWorkerId: text("assigned_worker_id"),
+    lifecycleState: text("lifecycle_state").notNull(),
+    result: text("result"),
+    errorCode: text("error_code"),
+    errorMessage: text("error_message"),
+    retrySafe: text("retry_safe").notNull(),
+    reconciliationJson: text("reconciliation_json"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+    completedAt: text("completed_at"),
+    collectedAt: text("collected_at"),
+  },
+  (table) => [
+    index("chat_swarm_tasks_swarm_state_idx").on(table.swarmId, table.lifecycleState, table.updatedAt),
+    index("chat_swarm_tasks_worker_state_idx").on(table.assignedWorkerId, table.lifecycleState),
+    uniqueIndex("chat_swarm_tasks_replay_idx").on(table.swarmId, table.taskKey),
+    uniqueIndex("chat_swarm_tasks_one_active_worker_idx").on(table.assignedWorkerId).where(sql`${table.assignedWorkerId} is not null and ${table.lifecycleState} in ('CLAIMED', 'RUNNING', 'CANCEL_REQUESTED', 'RECONCILE_REQUIRED')`),
+    foreignKey({ columns: [table.preferredWorkerId] as [typeof table.preferredWorkerId], foreignColumns: [chatSwarmWorkers.id] as [typeof chatSwarmWorkers.id], name: "chat_swarm_tasks_preferred_worker_fk" }),
+    foreignKey({ columns: [table.assignedWorkerId] as [typeof table.assignedWorkerId], foreignColumns: [chatSwarmWorkers.id] as [typeof chatSwarmWorkers.id], name: "chat_swarm_tasks_assigned_worker_fk" }),
+  ],
+);
+
+export const chatSwarmAttempts = sqliteTable(
+  "chat_swarm_attempts",
+  {
+    id: text("id").primaryKey(),
+    taskId: text("task_id").notNull().references(() => chatSwarmTasks.id, { onDelete: "cascade" }),
+    attemptNumber: integer("attempt_number").notNull(),
+    runtimeKind: text("runtime_kind").notNull(),
+    effectState: text("effect_state").notNull(),
+    runtimeReceiptJson: text("runtime_receipt_json"),
+    startedAt: text("started_at"),
+    acknowledgedAt: text("acknowledged_at"),
+    finishedAt: text("finished_at"),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => [
+    index("chat_swarm_attempts_task_idx").on(table.taskId, table.attemptNumber),
+    index("chat_swarm_attempts_effect_idx").on(table.effectState),
+    uniqueIndex("chat_swarm_attempts_ordinal_idx").on(table.taskId, table.attemptNumber),
+  ],
+);
+
 export type LocalAgentSessionRow = typeof localAgentSessions.$inferSelect;
 export type NewLocalAgentSessionRow = typeof localAgentSessions.$inferInsert;
 export type DurableOperationRow = typeof durableOperations.$inferSelect;
 export type NewDurableOperationRow = typeof durableOperations.$inferInsert;
+export type ChatSwarmRow = typeof chatSwarms.$inferSelect;
+export type NewChatSwarmRow = typeof chatSwarms.$inferInsert;
+export type ChatSwarmWorkerRow = typeof chatSwarmWorkers.$inferSelect;
+export type NewChatSwarmWorkerRow = typeof chatSwarmWorkers.$inferInsert;
+export type ChatSwarmTaskRow = typeof chatSwarmTasks.$inferSelect;
+export type NewChatSwarmTaskRow = typeof chatSwarmTasks.$inferInsert;
+export type ChatSwarmAttemptRow = typeof chatSwarmAttempts.$inferSelect;
+export type NewChatSwarmAttemptRow = typeof chatSwarmAttempts.$inferInsert;

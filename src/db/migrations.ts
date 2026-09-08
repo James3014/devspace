@@ -67,6 +67,16 @@ const migrations: Migration[] = [
     name: "durable-operations",
     up: migrateDurableOperations,
   },
+  {
+    version: 13,
+    name: "chat-swarm-core",
+    up: migrateChatSwarmCore,
+  },
+  {
+    version: 14,
+    name: "chat-swarm-runtime-owner",
+    up: migrateChatSwarmRuntimeOwner,
+  },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -292,6 +302,100 @@ function migrateDurableOperations(sqlite: Database.Database): void {
 
     create index if not exists durable_operations_status_idx
       on durable_operations(status, updated_at desc);
+  `);
+}
+
+function migrateChatSwarmCore(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists chat_swarms (
+      id text primary key,
+      status text not null,
+      owner_identity_fingerprint text not null,
+      worker_limit integer not null,
+      invite_credential_hash text,
+      metadata_json text not null,
+      created_at text not null,
+      updated_at text not null
+    );
+    create index if not exists chat_swarms_status_idx on chat_swarms(status, updated_at desc);
+
+    create table if not exists chat_swarm_workers (
+      id text primary key,
+      swarm_id text not null references chat_swarms(id) on delete cascade,
+      label text not null,
+      runtime_kind text not null,
+      session_identity_fingerprint text,
+      carrier_conversation_fingerprint text,
+      lifecycle_state text not null,
+      current_task_id text,
+      lease_json text,
+      checkpoint_json text,
+      continuation_epoch integer not null,
+      created_at text not null,
+      updated_at text not null
+      ,foreign key (current_task_id) references chat_swarm_tasks(id)
+    );
+    create index if not exists chat_swarm_workers_swarm_idx on chat_swarm_workers(swarm_id, updated_at desc);
+    create index if not exists chat_swarm_workers_task_idx on chat_swarm_workers(current_task_id);
+
+    create table if not exists chat_swarm_tasks (
+      id text primary key,
+      swarm_id text not null references chat_swarms(id) on delete cascade,
+      task_key text not null,
+      request_hash text not null,
+      prompt text not null,
+      payload_json text not null,
+      preferred_worker_id text,
+      assigned_worker_id text,
+      lifecycle_state text not null,
+      result text,
+      error_code text,
+      error_message text,
+      retry_safe text not null,
+      reconciliation_json text,
+      created_at text not null,
+      updated_at text not null,
+      completed_at text,
+      collected_at text,
+      unique (swarm_id, task_key),
+      foreign key (preferred_worker_id) references chat_swarm_workers(id),
+      foreign key (assigned_worker_id) references chat_swarm_workers(id)
+    );
+    create index if not exists chat_swarm_tasks_swarm_state_idx on chat_swarm_tasks(swarm_id, lifecycle_state, updated_at desc);
+    create index if not exists chat_swarm_tasks_worker_state_idx on chat_swarm_tasks(assigned_worker_id, lifecycle_state);
+    create unique index if not exists chat_swarm_tasks_replay_idx on chat_swarm_tasks(swarm_id, task_key);
+    create unique index if not exists chat_swarm_tasks_one_active_worker_idx
+      on chat_swarm_tasks(assigned_worker_id)
+      where assigned_worker_id is not null and lifecycle_state in ('CLAIMED', 'RUNNING', 'CANCEL_REQUESTED', 'RECONCILE_REQUIRED');
+
+    create table if not exists chat_swarm_attempts (
+      id text primary key,
+      task_id text not null references chat_swarm_tasks(id) on delete cascade,
+      attempt_number integer not null,
+      runtime_kind text not null,
+      effect_state text not null,
+      runtime_receipt_json text,
+      started_at text,
+      acknowledged_at text,
+      finished_at text,
+      created_at text not null,
+      unique (task_id, attempt_number)
+    );
+    create index if not exists chat_swarm_attempts_task_idx on chat_swarm_attempts(task_id, attempt_number);
+    create index if not exists chat_swarm_attempts_effect_idx on chat_swarm_attempts(effect_state);
+    create unique index if not exists chat_swarm_attempts_ordinal_idx on chat_swarm_attempts(task_id, attempt_number);
+  `);
+}
+
+function migrateChatSwarmRuntimeOwner(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists chat_swarm_runtime_owner (
+      singleton_id integer primary key check (singleton_id = 1),
+      owner_token text not null,
+      pid integer not null,
+      state_dir text not null,
+      acquired_at text not null
+    );
   `);
 }
 
