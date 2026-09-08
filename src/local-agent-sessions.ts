@@ -830,12 +830,12 @@ export class LocalAgentSessionManager {
       if (receipt.provider === "opencode") {
         const validation = validateOpencodeModelAndVariant(receipt.model, receipt.effort, snapshot as OpencodeCatalogSnapshot);
         const opencode = snapshot as OpencodeCatalogSnapshot;
-        const runtimeIdentity = `${opencode.runtime?.source ?? "unknown"}:${opencode.runtime?.version ?? "unknown"}`;
+        const runtimeIdentity = `${opencode.runtime?.source ?? "unknown"}:${opencode.runtime?.version ?? "unknown"}:${opencode.runtime?.executable ?? "unknown"}`;
         if (!validation.valid || (opencode.freshness ?? "unknown") !== receipt.freshness || runtimeIdentity !== receipt.runtimeIdentity) throw new AgentSessionError("REBIND_REQUIRED", validation.reason ?? "Persisted OpenCode catalog receipt is no longer valid.");
       } else if (receipt.provider === "cline") {
         const cline = snapshot as ClineCatalogSnapshot;
         const exact = cline.entries.filter((entry) => entry.cliProviderId === (receipt.cliProviderId ?? "cline") && entry.fullName === receipt.model);
-        const runtimeIdentity = `${cline.runtime.cliProviderId}:${cline.runtime.version}`;
+        const runtimeIdentity = `${cline.runtime.cliProviderId}:${cline.runtime.version}:${cline.runtime.command}`;
         if (cline.state !== "READY" || receipt.freshness !== "fresh" || runtimeIdentity !== receipt.runtimeIdentity || exact.length !== 1 || (receipt.effort && (!exact[0].thinkingKnown || !exact[0].thinking.includes(receipt.effort as never)))) {
           throw new AgentSessionError("REBIND_REQUIRED", "Persisted Cline catalog receipt is no longer valid.");
         }
