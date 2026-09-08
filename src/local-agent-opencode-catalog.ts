@@ -9,7 +9,17 @@ const FAILURE_RETRY_MS = 5_000;
 const SDK_TIMEOUT_MS = 5_000;
 const CLI_TIMEOUT_MS = 10_000;
 
-export interface OpencodeCatalogEntry { providerId: string; modelId: string; fullName: string; variants: string[]; status: string; enabled?: boolean; variantsKnown?: boolean; }
+export interface OpencodeCatalogEntry { providerId: string; modelId: string; fullName: string; variants: string[]; status: string; enabled?: boolean; variantsKnown?: boolean; metadata?: OpencodeModelMetadata; }
+export interface OpencodeModelMetadata {
+  cost?: {
+    evidence: "sdk" | "unknown";
+    currency: string;
+    unit: string;
+    tiers: Array<{ input: number; output: number; cacheRead: number; cacheWrite: number; contextSize?: number }>;
+  };
+  limits?: { context: number; input?: number; output: number };
+  capabilities?: { tools: boolean; input: string[]; output: string[] };
+}
 export type OpencodeCatalogFreshness = "fresh" | "stale" | "unknown";
 export type OpencodeCatalogSource = "sdk" | "cli" | "fallback";
 export interface OpencodeCatalogFailure { code: "SDK_UNAVAILABLE" | "SDK_ERROR" | "CLI_UNAVAILABLE" | "CLI_MALFORMED" | "FALLBACK_ONLY"; message: string; }
@@ -76,7 +86,7 @@ function fallbackEntries(): OpencodeCatalogEntry[] {
 export function computeOpencodeCatalogGeneration(entries: readonly OpencodeCatalogEntry[], counter = catalogGenerationCounter): string {
   const hash = createHash("sha256");
   hash.update(`gen-${counter}:`);
-  for (const entry of [...entries].sort((a, b) => a.fullName.localeCompare(b.fullName))) hash.update(`${entry.providerId}:${entry.modelId}:${entry.fullName}:${[...entry.variants].sort().join(",")}:${entry.variantsKnown === true ? "known" : entry.variantsKnown === false ? "unknown" : "unspecified"}:${entry.enabled === false ? "disabled" : entry.enabled === true ? "enabled" : "unspecified"}:${entry.status}\n`);
+  for (const entry of [...entries].sort((a, b) => a.fullName.localeCompare(b.fullName))) hash.update(`${entry.providerId}:${entry.modelId}:${entry.fullName}:${[...entry.variants].sort().join(",")}:${entry.variantsKnown === true ? "known" : entry.variantsKnown === false ? "unknown" : "unspecified"}:${entry.enabled === false ? "disabled" : entry.enabled === true ? "enabled" : "unspecified"}:${entry.status}:${JSON.stringify(entry.metadata ?? null)}\n`);
   return hash.digest("hex").slice(0, 16);
 }
 
@@ -117,6 +127,41 @@ function makeSnapshot(entries: OpencodeCatalogEntry[], source: OpencodeCatalogSo
   return { entries, source, version, fetchedAt, freshness, runtime, generation: computeOpencodeCatalogGeneration(entries), ...(freshness === "fresh" ? { expiresAt: new Date(Date.parse(fetchedAt) + DEFAULT_TTL_MS).toISOString() } : {}), ...(failure ? { failure } : {}), ...(lastSuccessAt ? { lastSuccessAt } : {}) };
 }
 
+function projectSdkMetadata(item: { cost?: unknown; limit?: unknown; capabilities?: unknown }): OpencodeModelMetadata | undefined {
+  const metadata: OpencodeModelMetadata = {};
+  if (Array.isArray(item.cost)) {
+    const validNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0;
+    const plainRecord = (value: unknown): value is Record<string, unknown> => Boolean(value) && typeof value === "object" && !Array.isArray(value);
+    const validTiers = item.cost.every((tier) => {
+      if (!plainRecord(tier)) return false;
+      const cache = tier.cache;
+      const context = tier.tier;
+      return validNumber(tier.input) && validNumber(tier.output) && plainRecord(cache) && validNumber(cache.read) && validNumber(cache.write) && (context === undefined || (plainRecord(context) && validNumber(context.size)));
+    });
+    const tiers = validTiers ? item.cost.map((tier) => {
+      const value = tier as Record<string, unknown>;
+      const cache = value.cache as Record<string, number>;
+      const context = value.tier as Record<string, number> | undefined;
+      return { input: value.input as number, output: value.output as number, cacheRead: cache.read, cacheWrite: cache.write, ...(context?.size !== undefined ? { contextSize: context.size } : {}) };
+    }).sort((a, b) => (a.contextSize ?? -1) - (b.contextSize ?? -1) || a.input - b.input || a.output - b.output || a.cacheRead - b.cacheRead || a.cacheWrite - b.cacheWrite) : [];
+    metadata.cost = { evidence: validTiers ? "sdk" : "unknown", currency: "unknown", unit: "unknown", tiers };
+  } else {
+    metadata.cost = { evidence: "unknown", currency: "unknown", unit: "unknown", tiers: [] };
+  }
+  if (item.limit && typeof item.limit === "object") {
+    const limit = item.limit as Record<string, unknown>;
+    const validNumber = (value: unknown): value is number => typeof value === "number" && Number.isFinite(value) && value >= 0;
+    if (validNumber(limit.context) && validNumber(limit.output) && (limit.input === undefined || validNumber(limit.input))) metadata.limits = { context: limit.context, output: limit.output, ...(limit.input !== undefined ? { input: limit.input } : {}) };
+  }
+  if (item.capabilities && typeof item.capabilities === "object") {
+    const capabilities = item.capabilities as Record<string, unknown>;
+    const modalities = new Set(["text", "image", "audio", "video", "file"]);
+    const validModalities = (value: unknown): value is string[] => Array.isArray(value) && value.length <= 16 && value.every((item) => typeof item === "string" && item.length <= 32 && modalities.has(item));
+    if (typeof capabilities.tools === "boolean" && validModalities(capabilities.input) && validModalities(capabilities.output)) metadata.capabilities = { tools: capabilities.tools, input: [...new Set(capabilities.input)].sort(), output: [...new Set(capabilities.output)].sort() };
+  }
+  return metadata;
+}
+
 export async function fetchOpencodeCatalog(client?: OpencodeClientLike, env: NodeJS.ProcessEnv = process.env, probe?: OpencodeCatalogAcquireOptions["runCommand"], now = () => Date.now()): Promise<OpencodeCatalogSnapshot> {
   const runCommand = probe ?? ((file, args, options) => defaultRunCommand(file, args, options));
   const fetchedAt = new Date(now()).toISOString();
@@ -140,7 +185,7 @@ export async function fetchOpencodeCatalog(client?: OpencodeClientLike, env: Nod
         if (item.variants !== undefined && !Array.isArray(item.variants)) throw new Error("SDK model catalog contained malformed variants");
         if (item.variants?.some((variant) => !variant || typeof variant.id !== "string" || !variant.id)) throw new Error("SDK model catalog contained malformed variant entries");
         if (item.enabled !== undefined && typeof item.enabled !== "boolean") throw new Error("SDK model catalog contained malformed enabled metadata");
-        return { providerId: item.providerID, modelId: item.id, fullName: `${item.providerID}/${item.id}`, variants: item.variants?.map((variant) => variant.id) ?? [], variantsKnown: item.variants !== undefined, enabled: item.enabled, status: item.status ?? "unknown" };
+        return { providerId: item.providerID, modelId: item.id, fullName: `${item.providerID}/${item.id}`, variants: item.variants?.map((variant) => variant.id) ?? [], variantsKnown: item.variants !== undefined, enabled: item.enabled, status: item.status ?? "unknown", metadata: projectSdkMetadata(item) };
       });
       return makeSnapshot(entries, "sdk", version, fetchedAt, "fresh", { version, executable, source: "sdk" }, undefined, fetchedAt);
     } catch (error) { sdkFailure = { code: "SDK_ERROR", message: error instanceof Error ? error.message : String(error) }; }

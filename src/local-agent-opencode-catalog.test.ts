@@ -137,6 +137,32 @@ assert.equal(concurrentRefresh[0]?.source, "sdk");
 assert.deepEqual(concurrentRefresh[0]?.entries[0]?.variants, ["high"]);
 assert.equal(validateOpencodeModelAndVariant("opencode/muse-spark-1.3-contributor-free", "low", concurrentRefresh[0]).variantStatus, "unsupported");
 assert.equal(validateOpencodeModelAndVariant("opencode/big-pickle", undefined, concurrentRefresh[0]).blockerCode, "EXACT_MODEL_UNAVAILABLE", "removed live model must be rejected");
+const metadataCatalog = await fetchOpencodeCatalog({
+  v2: { model: { list: async () => ({ data: { data: [{
+    id: "metadata-model", providerID: "opencode", variants: [], status: "active", enabled: true,
+    cost: [{ input: 0, output: 2, cache: { read: 0, write: 3 }, tier: { type: "context", size: 4096 } }],
+    limit: { context: 8192, input: 4096, output: 2048 }, capabilities: { tools: true, input: ["text"], output: ["text", "image"] },
+    request: { headers: { secret: "must-not-project" }, body: { token: "must-not-project" } },
+  }] } }) } },
+} as never, {}, async () => ({ stdout: "", executable: "/metadata/opencode" }));
+const metadata = metadataCatalog.entries[0]?.metadata;
+assert.deepEqual(metadata?.cost, { evidence: "sdk", currency: "unknown", unit: "unknown", tiers: [{ input: 0, output: 2, cacheRead: 0, cacheWrite: 3, contextSize: 4096 }] });
+assert.deepEqual(metadata?.limits, { context: 8192, input: 4096, output: 2048 });
+assert.deepEqual(metadata?.capabilities, { tools: true, input: ["text"], output: ["image", "text"] });
+assert.equal("headers" in (metadata ?? {}), false);
+assert.equal("body" in (metadata ?? {}), false);
+const malformedMetadataCatalog = await fetchOpencodeCatalog({
+  v2: { model: { list: async () => ({ data: { data: [{
+    id: "malformed-metadata", providerID: "opencode", variants: [], status: "active", enabled: true,
+    cost: [{ input: Number.NaN, output: 0, cache: { read: 0, write: 0 } }, { input: 1, output: 1, cache: [], tier: null }, null],
+    limit: { context: 0, input: 0, output: 0 }, capabilities: { tools: true, input: ["unknown-modality"], output: ["text"] },
+  }] } }) } },
+} as never, {}, async () => ({ stdout: "", executable: "/malformed/opencode" }));
+const malformedMetadata = malformedMetadataCatalog.entries[0]?.metadata;
+assert.equal(malformedMetadataCatalog.source, "sdk", "malformed economics must not downgrade SDK membership");
+assert.deepEqual(malformedMetadata?.cost, { evidence: "unknown", currency: "unknown", unit: "unknown", tiers: [] });
+assert.deepEqual(malformedMetadata?.limits, { context: 0, input: 0, output: 0 }, "zero limits remain bounded values, never unlimited sentinels");
+assert.equal(malformedMetadata?.capabilities, undefined);
 
 // A live model entry without variants is UNKNOWN, not proof of unsupported.
 const cliSnapshot: OpencodeCatalogSnapshot = {
