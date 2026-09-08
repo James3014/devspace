@@ -46,9 +46,11 @@ import {
   isAgentProviderError,
   type AgentProviderFailureDetails,
 } from "./local-agent-errors.js";
-import { acquireOpencodeCatalog, validateOpencodeModelAndVariant, type OpencodeCatalogSnapshot } from "./local-agent-opencode-catalog.js";
+import { validateOpencodeModelAndVariant, type OpencodeCatalogSnapshot } from "./local-agent-opencode-catalog.js";
 import type { ClineCatalogSnapshot } from "./local-agent-cline-catalog.js";
 import type { ClineCatalogService } from "./local-agent-cline-catalog.js";
+import { ClineCatalogService as ClineCatalogServiceImpl } from "./local-agent-cline-catalog.js";
+import { createMcpOpencodeCatalogSource } from "./local-agent-opencode-mcp-catalog.js";
 import { canonicalizePath, isPathInsideRoot } from "./roots.js";
 import {
   assertNexusGrantAuthorizesExecution,
@@ -476,6 +478,8 @@ export class LocalAgentSessionManager {
   private readonly runtimeBuildIdentity: RuntimeBuildIdentity;
   private readonly nexusGrantResolver: NexusGrantResolver;
   private readonly clineCatalogService?: ClineCatalogService;
+  private readonly opencodeCatalogSource: ReturnType<typeof createMcpOpencodeCatalogSource>;
+  private readonly ownsOpencodeCatalogSource: boolean;
   private closed = false;
   private readonly terminationAttempts = new Map<string, Promise<boolean>>();
 
@@ -487,13 +491,16 @@ export class LocalAgentSessionManager {
     runtimeBuildIdentity?: RuntimeBuildIdentity,
     nexusGrantResolver?: NexusGrantResolver,
     clineCatalogService?: ClineCatalogService,
+    opencodeCatalogSource?: ReturnType<typeof createMcpOpencodeCatalogSource>,
   ) {
     this.store = createLocalAgentStore(config.stateDir);
     this.launcher = testLauncher ?? defaultWorkerLauncher;
     this.terminator = testTerminator ?? terminateOwnedWorker;
     this.turnRunner = testTurnRunner;
     this.nexusGrantResolver = nexusGrantResolver ?? resolveCanonicalNexusExecutionGrant;
-    this.clineCatalogService = clineCatalogService;
+    this.clineCatalogService = clineCatalogService ?? new ClineCatalogServiceImpl();
+    this.opencodeCatalogSource = opencodeCatalogSource ?? createMcpOpencodeCatalogSource();
+    this.ownsOpencodeCatalogSource = opencodeCatalogSource === undefined;
     this.runtimeBuildIdentity = runtimeBuildIdentity ?? describeRuntimeBuildIdentity({
       env: process.env,
       listenPort: config.port,
@@ -508,6 +515,7 @@ export class LocalAgentSessionManager {
     if (this.closed) return;
     this.closed = true;
     this.store.close();
+    if (this.ownsOpencodeCatalogSource) this.opencodeCatalogSource.close();
   }
 
   /**
@@ -1795,8 +1803,18 @@ export class LocalAgentSessionManager {
       // runner and security gates.
       const directSelection = claimed.executionContract?.directSelection;
       const catalogReceipt = claimed.executionContract?.catalogReceipt;
+      if (catalogReceipt && (claimed.provider !== catalogReceipt.provider
+        || (claimed.model ?? undefined) !== (catalogReceipt.model ?? undefined)
+        || (claimed.effort ?? undefined) !== (catalogReceipt.effort ?? undefined))) {
+        throw new Error("Durable record identity does not match its catalog receipt; refusing execution.");
+      }
+      if (directSelection && (directSelection.provider !== claimed.provider
+        || directSelection.model !== claimed.model
+        || directSelection.effort !== claimed.effort)) {
+        throw new Error("Durable record identity does not match its direct selection; refusing execution.");
+      }
       if (catalogReceipt?.provider === "opencode") {
-        const liveCatalog = await acquireOpencodeCatalog();
+        const liveCatalog = await this.opencodeCatalogSource.acquire();
         if (liveCatalog.generation !== catalogReceipt.generation) {
           throw new Error("Persisted OpenCode catalog receipt drifted before provider invocation; refusing execution.");
         }
