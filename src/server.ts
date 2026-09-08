@@ -3351,7 +3351,7 @@ export function createMcpServer(
             fullName: z.string(),
             variants: z.array(z.string()),
             variantsKnown: z.boolean().optional(),
-            thinkingVerified: z.boolean(),
+            thinkingVerified: z.boolean().optional(),
             status: z.string(),
             enabled: z.boolean().optional(),
             cliProviderId: z.string().optional(),
