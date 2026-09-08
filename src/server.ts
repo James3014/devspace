@@ -1874,6 +1874,7 @@ function catalogReceiptForProfile(
       source: opencodeCatalog.source,
       generation: opencodeCatalog.generation,
       fetchedAt: opencodeCatalog.fetchedAt,
+      freshness: opencodeCatalog.freshness ?? "unknown",
       runtimeIdentity: `${opencodeCatalog.runtime?.source ?? "unknown"}:${opencodeCatalog.runtime?.version ?? "unknown"}`,
     };
   }
@@ -1886,6 +1887,7 @@ function catalogReceiptForProfile(
       source: clineCatalog.source,
       generation: clineCatalog.generation,
       fetchedAt: clineCatalog.fetchedAt ?? new Date(0).toISOString(),
+      freshness: clineCatalog.state === "READY" ? "fresh" : "unknown",
       runtimeIdentity: `${clineCatalog.runtime.cliProviderId}:${clineCatalog.runtime.version}`,
     };
   }

@@ -829,11 +829,14 @@ export class LocalAgentSessionManager {
       }
       if (receipt.provider === "opencode") {
         const validation = validateOpencodeModelAndVariant(receipt.model, receipt.effort, snapshot as OpencodeCatalogSnapshot);
-        if (!validation.valid) throw new AgentSessionError("REBIND_REQUIRED", validation.reason ?? "Persisted OpenCode catalog receipt is no longer valid.");
+        const opencode = snapshot as OpencodeCatalogSnapshot;
+        const runtimeIdentity = `${opencode.runtime?.source ?? "unknown"}:${opencode.runtime?.version ?? "unknown"}`;
+        if (!validation.valid || (opencode.freshness ?? "unknown") !== receipt.freshness || runtimeIdentity !== receipt.runtimeIdentity) throw new AgentSessionError("REBIND_REQUIRED", validation.reason ?? "Persisted OpenCode catalog receipt is no longer valid.");
       } else if (receipt.provider === "cline") {
         const cline = snapshot as ClineCatalogSnapshot;
         const exact = cline.entries.filter((entry) => entry.cliProviderId === (receipt.cliProviderId ?? "cline") && entry.fullName === receipt.model);
-        if (cline.state !== "READY" || exact.length !== 1 || (receipt.effort && (!exact[0].thinkingKnown || !exact[0].thinking.includes(receipt.effort as never)))) {
+        const runtimeIdentity = `${cline.runtime.cliProviderId}:${cline.runtime.version}`;
+        if (cline.state !== "READY" || receipt.freshness !== "fresh" || runtimeIdentity !== receipt.runtimeIdentity || exact.length !== 1 || (receipt.effort && (!exact[0].thinkingKnown || !exact[0].thinking.includes(receipt.effort as never)))) {
           throw new AgentSessionError("REBIND_REQUIRED", "Persisted Cline catalog receipt is no longer valid.");
         }
       }
@@ -1815,7 +1818,10 @@ export class LocalAgentSessionManager {
       }
       if (catalogReceipt?.provider === "opencode") {
         const liveCatalog = await this.opencodeCatalogSource.acquire();
-        if (liveCatalog.generation !== catalogReceipt.generation) {
+        const runtimeIdentity = `${liveCatalog.runtime?.source ?? "unknown"}:${liveCatalog.runtime?.version ?? "unknown"}`;
+        if (liveCatalog.generation !== catalogReceipt.generation
+          || (liveCatalog.freshness ?? "unknown") !== catalogReceipt.freshness
+          || runtimeIdentity !== catalogReceipt.runtimeIdentity) {
           throw new Error("Persisted OpenCode catalog receipt drifted before provider invocation; refusing execution.");
         }
         const validation = validateOpencodeModelAndVariant(catalogReceipt.model, catalogReceipt.effort, liveCatalog);
@@ -1824,7 +1830,9 @@ export class LocalAgentSessionManager {
       if (catalogReceipt?.provider === "cline") {
         const liveCatalog = await this.clineCatalogService?.refresh();
         const exact = liveCatalog?.entries.filter((entry) => entry.cliProviderId === (catalogReceipt.cliProviderId ?? "cline") && entry.fullName === catalogReceipt.model) ?? [];
-        if (!liveCatalog || liveCatalog.state !== "READY" || liveCatalog.generation !== catalogReceipt.generation || exact.length !== 1
+        const runtimeIdentity = liveCatalog ? `${liveCatalog.runtime.cliProviderId}:${liveCatalog.runtime.version}` : "unknown:unknown";
+        if (!liveCatalog || liveCatalog.state !== "READY" || liveCatalog.generation !== catalogReceipt.generation
+          || catalogReceipt.freshness !== "fresh" || runtimeIdentity !== catalogReceipt.runtimeIdentity || exact.length !== 1
           || (catalogReceipt.effort && (!exact[0].thinkingKnown || !exact[0].thinking.includes(catalogReceipt.effort as never)))) {
           throw new Error("Persisted Cline catalog receipt drifted before provider invocation; refusing execution.");
         }

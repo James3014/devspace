@@ -54,6 +54,7 @@ export interface ExecutionContract {
     source: string;
     generation: string;
     fetchedAt: string;
+    freshness: "fresh" | "stale" | "unknown";
     runtimeIdentity: string;
   };
   /** Defaults to OWNER_DIRECT for backwards compatibility. */
@@ -191,6 +192,7 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
       || typeof receipt.source !== "string" || !receipt.source.trim()
       || typeof receipt.generation !== "string" || !receipt.generation.trim()
       || typeof receipt.fetchedAt !== "string" || !receipt.fetchedAt.trim()
+      || (receipt.freshness !== "fresh" && receipt.freshness !== "stale" && receipt.freshness !== "unknown")
       || typeof receipt.runtimeIdentity !== "string" || !receipt.runtimeIdentity.trim()) {
       throw new Error("executionContract.catalogReceipt has invalid provider, identity, source, generation, or runtime evidence.");
     }
@@ -202,6 +204,7 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
       source: receipt.source.trim(),
       generation: receipt.generation.trim(),
       fetchedAt: receipt.fetchedAt.trim(),
+      freshness: receipt.freshness,
       runtimeIdentity: receipt.runtimeIdentity.trim(),
     };
   }
