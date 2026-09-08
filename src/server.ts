@@ -106,7 +106,7 @@ import {
 } from "./local-agent-profile-source.js";
 import { acquireOpencodeCatalog, type OpencodeCatalogSnapshot } from "./local-agent-opencode-catalog.js";
 import { createMcpOpencodeCatalogSource } from "./local-agent-opencode-mcp-catalog.js";
-import { ClineCatalogService, isClineCatalogFresh, type ClineCatalogSnapshot } from "./local-agent-cline-catalog.js";
+import { ClineCatalogService, isClineCatalogFresh, validateClineModelAndThinking, type ClineCatalogSnapshot } from "./local-agent-cline-catalog.js";
 import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build-identity.js";
 import {
   deriveLoadedCapabilityManifest,
@@ -1795,6 +1795,16 @@ function createAgentPreflightInputSchema() {
   };
 }
 
+function createAgentCatalogInputSchema() {
+  return {
+    workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+    provider: z.string().optional().describe("Optional exact provider family filter."),
+    model: z.string().optional().describe("Optional exact provider/model identity filter."),
+    limit: z.number().int().positive().max(50).optional().describe("Maximum entries to return; defaults to 25."),
+    cursor: z.string().regex(/^[A-Za-z0-9._:-]{1,160}$/).optional().describe("Opaque page cursor returned by the previous query."),
+  };
+}
+
 async function loadMcpProfileCatalog(
   config: ServerConfig,
   workspaceRoot: string,
@@ -1896,17 +1906,8 @@ function catalogReceiptForProfile(
 
 function assertDirectClineCatalogSelection(selector: AgentSelector, catalog: Awaited<ReturnType<typeof loadProfileCatalog>>): void {
   if (selector.provider !== "cline") return;
-  const snapshot = catalog.clineCatalog;
-  const family = selector.cliProviderId ?? "cline";
-  const exact = snapshot?.state === "READY"
-    ? snapshot.entries.filter((entry) => entry.cliProviderId === family && entry.fullName === selector.model)
-    : [];
-  if (!snapshot || !isClineCatalogFresh(snapshot) || exact.length !== 1) {
-    throw new AgentSessionError("EXACT_MODEL_UNAVAILABLE", `Cline model '${selector.model}' is not established for cliProviderId '${family}'.`);
-  }
-  if (selector.effort && (!exact[0].thinkingKnown || !exact[0].thinking.includes(selector.effort as never))) {
-    throw new AgentSessionError("VARIANT_UNAVAILABLE", `Cline thinking level '${selector.effort}' is not established for '${selector.model}'.`);
-  }
+  const validation = validateClineModelAndThinking(selector.model, selector.cliProviderId as "cline" | "cline-pass" | undefined, selector.effort, catalog.clineCatalog);
+  if (!validation.valid) throw new AgentSessionError(validation.blockerCode ?? "EXACT_MODEL_UNAVAILABLE", validation.reason ?? "Cline selection is unavailable.");
 }
 
 export function createMcpServer(
@@ -1939,7 +1940,11 @@ export function createMcpServer(
   const capabilityManifest = runtimeBuildIdentityContext?.capabilityManifest
     ?? deriveLoadedCapabilityManifest(
       config.subagents && agentSessionManager
-        ? { agent_start: agentStartInputSchema, agent_preflight: agentPreflightInputSchema }
+        ? {
+          agent_start: agentStartInputSchema,
+          agent_preflight: agentPreflightInputSchema,
+          agent_catalog: createAgentCatalogInputSchema(),
+        }
         : {},
     );
   const server = new McpServer(
@@ -3321,13 +3326,7 @@ export function createMcpServer(
         title: "Agent model catalog",
         description:
           "Read-only bounded catalog evidence for exact provider/model membership. Membership, runtime, and account entitlement remain separate facts; this query never starts a provider task.",
-        inputSchema: {
-          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
-          provider: z.string().optional().describe("Optional exact provider family filter."),
-          model: z.string().optional().describe("Optional exact provider/model identity filter."),
-          limit: z.number().int().positive().max(50).optional().describe("Maximum entries to return; defaults to 25."),
-          cursor: z.string().regex(/^[A-Za-z0-9._:-]{1,160}$/).optional().describe("Opaque page cursor returned by the previous query."),
-        },
+        inputSchema: createAgentCatalogInputSchema(),
         outputSchema: {
           snapshot: z.object({
             source: z.string(),
@@ -4448,9 +4447,11 @@ export function createServer(
     ? new LocalAgentSessionManager(config, undefined, undefined, undefined, runtimeBuildIdentity, undefined, clineCatalogService, opencodeCatalogSource)
     : undefined;
   const capabilityManifest = deriveLoadedCapabilityManifest(
-    agentSessionManager
-      ? { agent_start: createAgentStartInputSchema(), agent_preflight: createAgentPreflightInputSchema() }
-      : {},
+    {
+      ...(agentSessionManager
+        ? { agent_start: createAgentStartInputSchema(), agent_preflight: createAgentPreflightInputSchema(), agent_catalog: createAgentCatalogInputSchema() }
+        : {}),
+    },
   );
   const cutoverController = new McpCutoverController(
     new CutoverStateStore(config.stateDir),
@@ -4920,6 +4921,7 @@ export function createServer(
             ...(advanceCutover ? { advance: advanceCutover } : {}),
           },
           opencodeCatalogSource,
+          clineCatalogService,
         );
         await server.connect(transport);
       } else {
