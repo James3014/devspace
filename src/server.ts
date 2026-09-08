@@ -3351,6 +3351,7 @@ export function createMcpServer(
             fullName: z.string(),
             variants: z.array(z.string()),
             variantsKnown: z.boolean().optional(),
+            thinkingVerified: z.boolean(),
             status: z.string(),
             enabled: z.boolean().optional(),
             cliProviderId: z.string().optional(),
@@ -3381,7 +3382,7 @@ export function createMcpServer(
         const filteredEntries = provider === "cline"
           ? clineCatalog.entries
             .filter((entry) => !model || entry.fullName === model || entry.routeKey === model)
-            .map((entry) => ({ providerId: "cline", modelId: entry.modelId, fullName: entry.fullName, variants: [...entry.thinking], variantsKnown: entry.thinkingKnown, status: clineCatalog.state.toLowerCase(), cliProviderId: entry.cliProviderId, routeKey: entry.routeKey, catalogTier: entry.catalogTier, free: entry.free, accountEntitlement: entry.accountEntitlement, supportsReasoning: entry.supportsReasoning }))
+            .map((entry) => ({ providerId: "cline", modelId: entry.modelId, fullName: entry.fullName, variants: [...entry.thinking], variantsKnown: entry.thinkingKnown, thinkingVerified: clineCatalog.runtime.thinkingVerified === true, status: clineCatalog.state.toLowerCase(), cliProviderId: entry.cliProviderId, routeKey: entry.routeKey, catalogTier: entry.catalogTier, free: entry.free, accountEntitlement: entry.accountEntitlement, supportsReasoning: entry.supportsReasoning }))
           : opencodeCatalog.entries
             .filter((entry) => !provider || entry.providerId === provider)
             .filter((entry) => !model || entry.fullName === model || entry.modelId === model);
