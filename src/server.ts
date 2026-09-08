@@ -1894,6 +1894,21 @@ function catalogReceiptForProfile(
   return undefined;
 }
 
+function assertDirectClineCatalogSelection(selector: AgentSelector, catalog: Awaited<ReturnType<typeof loadProfileCatalog>>): void {
+  if (selector.provider !== "cline") return;
+  const snapshot = catalog.clineCatalog;
+  const family = selector.cliProviderId ?? "cline";
+  const exact = snapshot?.state === "READY"
+    ? snapshot.entries.filter((entry) => entry.cliProviderId === family && entry.fullName === selector.model)
+    : [];
+  if (!snapshot || snapshot.state !== "READY" || exact.length !== 1) {
+    throw new AgentSessionError("EXACT_MODEL_UNAVAILABLE", `Cline model '${selector.model}' is not established for cliProviderId '${family}'.`);
+  }
+  if (selector.effort && (!exact[0].thinkingKnown || !exact[0].thinking.includes(selector.effort as never))) {
+    throw new AgentSessionError("VARIANT_UNAVAILABLE", `Cline thinking level '${selector.effort}' is not established for '${selector.model}'.`);
+  }
+}
+
 export function createMcpServer(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
@@ -3435,6 +3450,7 @@ export function createMcpServer(
           config,
           contract,
         );
+        assertDirectClineCatalogSelection({ profile, provider, model, effort, cliProviderId }, profileCatalog);
         const profiles = selection.profiles;
         const selectedProfile = profiles.find((candidate) => candidate.name === selection.profileName);
         if (selectedProfile?.write_mode !== "read_only") {
@@ -3798,6 +3814,7 @@ export function createMcpServer(
           profileCatalog.profiles,
           config,
         );
+        assertDirectClineCatalogSelection({ profile, provider, model, effort, cliProviderId }, profileCatalog);
         const profiles = selection.profiles;
         const output = await agentSessionManager.preflightAgent({
           workspaceId,

@@ -4076,6 +4076,7 @@ test("catalog receipt gates real worker turn before provider runner and rejects 
   const makeSnapshot = (generation: string) => ({ entries: [entry], fetchedAt: new Date().toISOString(), source: "sdk" as const, generation, version: "test", freshness: "fresh" as const, runtime: { version: "test", source: "sdk" as const }, lastSuccessAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString() });
   let current = makeSnapshot("receipt-g1");
   const catalogSource = { acquire: async () => current, close: () => {} } as any;
+  let reopened: LocalAgentSessionManager | undefined;
   const manager = new LocalAgentSessionManager(config, async (_id: string, promptFile: string, workerToken: string) => { launched = { promptFile, workerToken }; }, async () => true, async (_profile: any, record: any, _prompt: string) => { providerCalls += 1; return { provider: record.provider, providerSessionId: null, finalResponse: "ok", items: [] }; }, undefined, undefined, undefined, catalogSource);
   const profile: LocalAgentProfile = { name: "receipt-profile", description: "receipt", provider: "opencode", model: "opencode/test", effort: "high", write_mode: "read_only", disabled: false, filePath: "<test>", body: "" };
   const profileCatalog: any = { generation: "profile-g1", opencodeCatalog: current, advertised: () => profile, blockerFor: () => undefined };
@@ -4086,14 +4087,27 @@ test("catalog receipt gates real worker turn before provider runner and rejects 
     await manager.runWorkerTurnFromFile(started.agentId, launched!.promptFile, launched!.workerToken);
     assert.equal(providerCalls, 1);
 
-    const second = await manager.startAgent({ workspaceId: "ws_1", workspaceRoot: f.repo, profileName: profile.name, prompt: "read", profiles: [profile], profileCatalog, executionContract: contract });
+    // Reopen the same durable store and continue through the real manager
+    // boundary; the receipt must still bind the same catalog scope.
+    manager.close();
+    launched = undefined;
+    reopened = new LocalAgentSessionManager(config, async (_id: string, promptFile: string, workerToken: string) => { launched = { promptFile, workerToken }; }, async () => true, async (_profile: any, record: any) => { providerCalls += 1; return { provider: record.provider, providerSessionId: null, finalResponse: "continued", items: [] }; }, undefined, undefined, undefined, catalogSource);
+    const continued = await reopened.continueAgent({ workspaceId: "ws_1", workspaceRoot: f.repo, agentId: started.agentId, prompt: "continue", profiles: [profile], profileCatalog, opencodeCatalog: current });
+    const continuedLaunch = launched as { promptFile: string; workerToken: string } | undefined;
+    assert.ok(continuedLaunch);
+    await reopened.runWorkerTurnFromFile(continued.agentId, continuedLaunch.promptFile, continuedLaunch.workerToken);
+    assert.equal(providerCalls, 2);
+
+    const second = await reopened.startAgent({ workspaceId: "ws_1", workspaceRoot: f.repo, profileName: profile.name, prompt: "read", profiles: [profile], profileCatalog, executionContract: contract });
     current = makeSnapshot("receipt-g2");
-    assert.ok(launched);
+    const driftLaunch = launched as { promptFile: string; workerToken: string } | undefined;
+    assert.ok(driftLaunch);
     const before = providerCalls;
-    await manager.runWorkerTurnFromFile(second.agentId, launched!.promptFile, launched!.workerToken);
+    await reopened.runWorkerTurnFromFile(second.agentId, driftLaunch.promptFile, driftLaunch.workerToken);
     assert.equal(providerCalls, before, "catalog drift must reject before provider invocation");
   } finally {
     manager.close();
+    try { reopened?.close(); } catch { /* already closed */ }
     f.clean();
     rmSync(stateDir, { recursive: true, force: true });
   }
