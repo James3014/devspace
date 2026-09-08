@@ -80,6 +80,17 @@ interface AcpSessionQueue {
   values: unknown[];
 }
 
+export interface AcpDiagnosticObservation {
+  provider: AcpProvider;
+  sessionId: string;
+  responseKeys: string[];
+  stopReason?: string;
+  updateTypes: string[];
+  updateContentTypes: string[];
+  updateContentBytes: number;
+  classifiedErrorCode?: string;
+}
+
 export interface AcpRuntimeOptions {
   provider: AcpProvider;
   command: string;
@@ -95,6 +106,7 @@ export interface AcpRuntimeOptions {
   promptCompletionTimeoutMs?: number;
   activityCallbacks?: Map<string, () => void | Promise<void>>;
   stderrTail?: () => string;
+  diagnosticObserver?: (observation: AcpDiagnosticObservation) => void;
 }
 
 export class AcpRuntime implements LocalAgentRuntime {
@@ -114,6 +126,7 @@ export class AcpRuntime implements LocalAgentRuntime {
   private closed = false;
   private readonly activityCallbacks: Map<string, () => void | Promise<void>>;
   private readonly stderrTail?: () => string;
+  private readonly diagnosticObserver?: (observation: AcpDiagnosticObservation) => void;
 
   constructor(options: AcpRuntimeOptions, connection: AcpConnectionLike) {
     this.provider = options.provider;
@@ -128,6 +141,7 @@ export class AcpRuntime implements LocalAgentRuntime {
     this.promptCompletionTimeoutMs = options.promptCompletionTimeoutMs ?? ACP_GROK_PROMPT_COMPLETION_TIMEOUT_MS;
     this.activityCallbacks = options.activityCallbacks ?? new Map();
     this.stderrTail = options.stderrTail;
+    this.diagnosticObserver = options.diagnosticObserver;
     void this.connection.closed.then(() => {
       if (!this.closed) this.alive = false;
       this.grokCompletionRegistry?.rejectAll(new Error(`${this.provider} ACP connection closed.`));
@@ -212,6 +226,7 @@ export class AcpRuntime implements LocalAgentRuntime {
               { model: input.model, variant: input.effort },
               this.stderrTail?.(),
             );
+            this.emitDiagnostic(sessionId, undefined, queue.values, classified?.code);
             if (classified) throw classified;
             throw cause;
           }
@@ -230,6 +245,7 @@ export class AcpRuntime implements LocalAgentRuntime {
               { model: input.model, variant: input.effort },
               this.stderrTail?.(),
             );
+            this.emitDiagnostic(sessionId, response, updates, classified?.code ?? "PROVIDER_PROTOCOL_ERROR");
             if (classified) throw classified;
             throw new AgentProviderProtocolError({
               code: "PROVIDER_PROTOCOL_ERROR",
@@ -255,6 +271,28 @@ export class AcpRuntime implements LocalAgentRuntime {
         }
       },
     });
+  }
+
+  private emitDiagnostic(
+    sessionId: string,
+    response: unknown,
+    updates: unknown[],
+    classifiedErrorCode?: string,
+  ): void {
+    if (!this.diagnosticObserver) return;
+    const observation: AcpDiagnosticObservation = {
+      provider: this.provider,
+      sessionId,
+      responseKeys: diagnosticResponseKeys(response),
+      ...(diagnosticStopReason(response) ? { stopReason: diagnosticStopReason(response) } : {}),
+      ...diagnosticUpdateSummary(updates),
+      ...(classifiedErrorCode ? { classifiedErrorCode } : {}),
+    };
+    try {
+      this.diagnosticObserver(observation);
+    } catch {
+      // Diagnostics are strictly observational and must never alter execution.
+    }
   }
 
   async releaseSession(providerSessionId: string): Promise<void> {
@@ -956,6 +994,59 @@ function extractAcpText(updates: unknown[]): string {
     })
     .join("")
     .trim();
+}
+
+const DIAGNOSTIC_RESPONSE_KEYS = new Set(["stopReason", "sessionId", "usage", "_meta", "result", "error"]);
+const DIAGNOSTIC_UPDATE_TYPES = new Set([
+  "user_message_chunk",
+  "agent_message_chunk",
+  "agent_thought_chunk",
+  "tool_call",
+  "tool_call_update",
+  "plan",
+  "available_commands_update",
+  "current_mode_update",
+  "config_option_update",
+  "session_info_update",
+  "usage_update",
+]);
+const DIAGNOSTIC_CONTENT_TYPES = new Set(["text", "image", "audio", "resource"]);
+const MAX_DIAGNOSTIC_TEXT_BYTES = 64 * 1024;
+
+function diagnosticResponseKeys(value: unknown): string[] {
+  const record = asRecord(value);
+  if (!record) return [];
+  return Object.keys(record).filter((key) => DIAGNOSTIC_RESPONSE_KEYS.has(key)).sort();
+}
+
+function diagnosticStopReason(value: unknown): string | undefined {
+  const stopReason = asRecord(value)?.stopReason;
+  return typeof stopReason === "string" && stopReason.length <= 64 ? stopReason : undefined;
+}
+
+function diagnosticToken(value: unknown, allowed: Set<string>): string {
+  return typeof value === "string" && allowed.has(value) ? value : "unknown";
+}
+
+function diagnosticUpdateSummary(updates: unknown[]): Pick<AcpDiagnosticObservation, "updateTypes" | "updateContentTypes" | "updateContentBytes"> {
+  const updateTypes = new Set<string>();
+  const updateContentTypes = new Set<string>();
+  let updateContentBytes = 0;
+  for (const value of updates) {
+    const update = asRecord(asRecord(value)?.update);
+    updateTypes.add(diagnosticToken(update?.sessionUpdate, DIAGNOSTIC_UPDATE_TYPES));
+    const content = asRecord(update?.content);
+    if (!content) continue;
+    updateContentTypes.add(diagnosticToken(content.type, DIAGNOSTIC_CONTENT_TYPES));
+    if (typeof content.text === "string" && updateContentBytes < MAX_DIAGNOSTIC_TEXT_BYTES) {
+      updateContentBytes = Math.min(MAX_DIAGNOSTIC_TEXT_BYTES, updateContentBytes + Buffer.byteLength(content.text, "utf8"));
+    }
+  }
+  return {
+    updateTypes: [...updateTypes].sort(),
+    updateContentTypes: [...updateContentTypes].sort(),
+    updateContentBytes,
+  };
 }
 
 function isGrokPromptCompletion(value: unknown): boolean {

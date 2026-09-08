@@ -688,3 +688,91 @@ assert.equal(resumedRuntime.isAlive(), false);
   if (heartbeatResult.isErr()) throw heartbeatResult.error;
   assert.ok(heartbeatTouches >= 1, `expected byte heartbeat activity touches, got ${heartbeatTouches}`);
 }
+
+// Opt-in ACP diagnostics stay schema-only and are emitted only for a failed
+// or no-final-response turn. Provider text, prompts, and arbitrary keys never
+// cross the observation boundary.
+{
+  const diagnosticQueues = new Map<string, { values: unknown[] }>();
+  const diagnosticConnection = {
+    agent: {
+      async request(method: string, params?: unknown): Promise<unknown> {
+        const sessionId = (params as { sessionId?: string } | undefined)?.sessionId ?? "diagnostic-session";
+        if (method === "session/new") {
+          diagnosticQueues.set(sessionId, { values: [] });
+          return { sessionId };
+        }
+        if (method === "session/prompt") {
+          diagnosticQueues.get(sessionId)?.values.push(
+            { update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `${"x".repeat(100_000)} secret prompt response` } } },
+            { update: { sessionUpdate: "secret-token", content: { type: "secret", text: "api-key-value" } } },
+          );
+          return { stopReason: "end_turn", apiKey: "must-not-be-observed" };
+        }
+        return {};
+      },
+    },
+    close() {},
+    closed: new Promise<void>(() => undefined),
+  };
+  const observations: Array<Record<string, unknown>> = [];
+  const diagnosticRuntime = new AcpRuntime({
+    provider: "cline",
+    command: "cline",
+    args: ["acp"],
+    env: {},
+    capabilities: { resume: false, close: false },
+    queues: diagnosticQueues,
+    diagnosticObserver: (observation) => { observations.push(observation as unknown as Record<string, unknown>); },
+  }, diagnosticConnection);
+  const diagnosticResult = await diagnosticRuntime.run({ prompt: "secret prompt", workspaceRoot: "/tmp/project" });
+  assert.equal(diagnosticResult.isErr(), true);
+  assert.equal(observations.length, 1);
+  const observation = observations[0];
+  assert.deepEqual(observation.responseKeys, ["stopReason"]);
+  assert.equal(observation.stopReason, "end_turn");
+  assert.deepEqual(observation.updateTypes, ["agent_thought_chunk", "unknown"]);
+  assert.deepEqual(observation.updateContentTypes, ["text", "unknown"]);
+  assert.equal(observation.updateContentBytes, 64 * 1024);
+  assert.equal(Object.hasOwn(observation, "apiKey"), false);
+  assert.equal(JSON.stringify(observation).includes("secret"), false);
+}
+
+// Enabling the observer does not change a successful ACP response and does
+// not emit a failure observation for a normal assistant text update.
+{
+  const successQueues = new Map<string, { values: unknown[] }>();
+  const successConnection = {
+    agent: {
+      async request(method: string, params?: unknown): Promise<unknown> {
+        const sessionId = (params as { sessionId?: string } | undefined)?.sessionId ?? "success-diagnostic-session";
+        if (method === "session/new") {
+          successQueues.set(sessionId, { values: [] });
+          return { sessionId };
+        }
+        if (method === "session/prompt") {
+          successQueues.get(sessionId)?.values.push({ update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ACP response" } } });
+          return { stopReason: "end_turn" };
+        }
+        return {};
+      },
+    },
+    close() {},
+    closed: new Promise<void>(() => undefined),
+  };
+  const observations: unknown[] = [];
+  const successRuntime = new AcpRuntime({
+    provider: "cline",
+    command: "cline",
+    args: ["acp"],
+    env: {},
+    capabilities: { resume: false, close: false },
+    queues: successQueues,
+    diagnosticObserver: (observation) => { observations.push(observation); },
+  }, successConnection);
+  const successResult = await successRuntime.run({ prompt: "safe", workspaceRoot: "/tmp/project" });
+  assert.equal(successResult.isOk(), true);
+  if (successResult.isErr()) throw successResult.error;
+  assert.equal(successResult.value.finalResponse, "ACP response");
+  assert.equal(observations.length, 0);
+}
