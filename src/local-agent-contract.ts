@@ -166,6 +166,7 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
       || typeof selection.model !== "string" || !selection.model.trim()
       || (selection.effort !== undefined && (typeof selection.effort !== "string" || !selection.effort.trim()))
       || (selection.cliProviderId !== undefined && selection.cliProviderId !== "cline" && selection.cliProviderId !== "cline-pass")
+      || (selection.cliProviderId !== undefined && selection.provider !== "cline")
       || (selection.writeMode !== "read_only" && selection.writeMode !== "allowed")) {
       throw new Error("executionContract.directSelection has invalid provider, model, effort, or writeMode.");
     }

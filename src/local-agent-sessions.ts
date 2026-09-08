@@ -46,7 +46,9 @@ import {
   isAgentProviderError,
   type AgentProviderFailureDetails,
 } from "./local-agent-errors.js";
-import { validateOpencodeModelAndVariant } from "./local-agent-opencode-catalog.js";
+import { acquireOpencodeCatalog, validateOpencodeModelAndVariant, type OpencodeCatalogSnapshot } from "./local-agent-opencode-catalog.js";
+import type { ClineCatalogSnapshot } from "./local-agent-cline-catalog.js";
+import type { ClineCatalogService } from "./local-agent-cline-catalog.js";
 import { canonicalizePath, isPathInsideRoot } from "./roots.js";
 import {
   assertNexusGrantAuthorizesExecution,
@@ -171,6 +173,8 @@ export interface ContinueAgentInput {
   idleTimeoutMs?: number;
   profiles?: LocalAgentProfile[];
   profileCatalog?: ProfileCatalog;
+  opencodeCatalog?: OpencodeCatalogSnapshot;
+  clineCatalog?: ClineCatalogSnapshot;
 }
 
 export interface GetAgentStatusInput {
@@ -471,6 +475,7 @@ export class LocalAgentSessionManager {
   private readonly turnRunner?: AgentTurnRunner;
   private readonly runtimeBuildIdentity: RuntimeBuildIdentity;
   private readonly nexusGrantResolver: NexusGrantResolver;
+  private readonly clineCatalogService?: ClineCatalogService;
   private closed = false;
   private readonly terminationAttempts = new Map<string, Promise<boolean>>();
 
@@ -481,12 +486,14 @@ export class LocalAgentSessionManager {
     testTurnRunner?: AgentTurnRunner,
     runtimeBuildIdentity?: RuntimeBuildIdentity,
     nexusGrantResolver?: NexusGrantResolver,
+    clineCatalogService?: ClineCatalogService,
   ) {
     this.store = createLocalAgentStore(config.stateDir);
     this.launcher = testLauncher ?? defaultWorkerLauncher;
     this.terminator = testTerminator ?? terminateOwnedWorker;
     this.turnRunner = testTurnRunner;
     this.nexusGrantResolver = nexusGrantResolver ?? resolveCanonicalNexusExecutionGrant;
+    this.clineCatalogService = clineCatalogService;
     this.runtimeBuildIdentity = runtimeBuildIdentity ?? describeRuntimeBuildIdentity({
       env: process.env,
       listenPort: config.port,
@@ -806,6 +813,23 @@ export class LocalAgentSessionManager {
         throw new AgentSessionError("REBIND_REQUIRED", `Agent ${agentId} has inconsistent persisted direct selection evidence.`);
       }
     }
+    const receipt = record.executionContract?.catalogReceipt;
+    if (receipt) {
+      const snapshot = receipt.provider === "opencode" ? input.opencodeCatalog : receipt.provider === "cline" ? input.clineCatalog : undefined;
+      if (!snapshot || snapshot.generation !== receipt.generation) {
+        throw new AgentSessionError("REBIND_REQUIRED", `Agent ${agentId} catalog receipt is stale or unavailable; explicit rebind is required.`);
+      }
+      if (receipt.provider === "opencode") {
+        const validation = validateOpencodeModelAndVariant(receipt.model, receipt.effort, snapshot as OpencodeCatalogSnapshot);
+        if (!validation.valid) throw new AgentSessionError("REBIND_REQUIRED", validation.reason ?? "Persisted OpenCode catalog receipt is no longer valid.");
+      } else if (receipt.provider === "cline") {
+        const cline = snapshot as ClineCatalogSnapshot;
+        const exact = cline.entries.filter((entry) => entry.cliProviderId === (receipt.cliProviderId ?? "cline") && entry.fullName === receipt.model);
+        if (cline.state !== "READY" || exact.length !== 1 || (receipt.effort && (!exact[0].thinkingKnown || !exact[0].thinking.includes(receipt.effort as never)))) {
+          throw new AgentSessionError("REBIND_REQUIRED", "Persisted Cline catalog receipt is no longer valid.");
+        }
+      }
+    }
     const currentProfile = directSelection
       ? {
           name: record.profileName,
@@ -813,6 +837,7 @@ export class LocalAgentSessionManager {
           provider: directSelection.provider as LocalAgentProfile["provider"],
           model: directSelection.model,
           effort: directSelection.effort,
+          cliProviderId: directSelection.cliProviderId,
           write_mode: directSelection.writeMode,
           filePath: "<direct-dispatch>",
           body: "",
@@ -1769,6 +1794,23 @@ export class LocalAgentSessionManager {
       // worker reloads and continuation turns use the same normal profile
       // runner and security gates.
       const directSelection = claimed.executionContract?.directSelection;
+      const catalogReceipt = claimed.executionContract?.catalogReceipt;
+      if (catalogReceipt?.provider === "opencode") {
+        const liveCatalog = await acquireOpencodeCatalog();
+        if (liveCatalog.generation !== catalogReceipt.generation) {
+          throw new Error("Persisted OpenCode catalog receipt drifted before provider invocation; refusing execution.");
+        }
+        const validation = validateOpencodeModelAndVariant(catalogReceipt.model, catalogReceipt.effort, liveCatalog);
+        if (!validation.valid) throw new Error(validation.reason ?? "Persisted OpenCode catalog receipt is no longer valid.");
+      }
+      if (catalogReceipt?.provider === "cline") {
+        const liveCatalog = await this.clineCatalogService?.refresh();
+        const exact = liveCatalog?.entries.filter((entry) => entry.cliProviderId === (catalogReceipt.cliProviderId ?? "cline") && entry.fullName === catalogReceipt.model) ?? [];
+        if (!liveCatalog || liveCatalog.state !== "READY" || liveCatalog.generation !== catalogReceipt.generation || exact.length !== 1
+          || (catalogReceipt.effort && (!exact[0].thinkingKnown || !exact[0].thinking.includes(catalogReceipt.effort as never)))) {
+          throw new Error("Persisted Cline catalog receipt drifted before provider invocation; refusing execution.");
+        }
+      }
       if (directSelection) {
         if (!isLocalAgentProvider(directSelection.provider)) {
           throw new Error(`Persisted direct selection has unknown provider '${directSelection.provider}'.`);
@@ -1786,6 +1828,7 @@ export class LocalAgentSessionManager {
             provider: directSelection.provider as LocalAgentProfile["provider"],
             model: directSelection.model,
             effort: directSelection.effort,
+            cliProviderId: directSelection.cliProviderId,
             write_mode: directSelection.writeMode,
             filePath: "<direct-dispatch>",
             body: "",

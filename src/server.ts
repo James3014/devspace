@@ -1860,6 +1860,38 @@ function resolveAgentSelector(
   };
 }
 
+function catalogReceiptForProfile(
+  profile: LocalAgentProfile | undefined,
+  opencodeCatalog: OpencodeCatalogSnapshot,
+  clineCatalog: ClineCatalogSnapshot,
+): NonNullable<ExecutionContract["catalogReceipt"]> | undefined {
+  if (!profile?.model) return undefined;
+  if (profile.provider === "opencode") {
+    return {
+      provider: profile.provider,
+      model: profile.model,
+      effort: profile.effort,
+      source: opencodeCatalog.source,
+      generation: opencodeCatalog.generation,
+      fetchedAt: opencodeCatalog.fetchedAt,
+      runtimeIdentity: `${opencodeCatalog.runtime?.source ?? "unknown"}:${opencodeCatalog.runtime?.version ?? "unknown"}`,
+    };
+  }
+  if (profile.provider === "cline") {
+    return {
+      provider: profile.provider,
+      model: profile.model,
+      effort: profile.effort,
+      cliProviderId: profile.cliProviderId,
+      source: clineCatalog.source,
+      generation: clineCatalog.generation,
+      fetchedAt: clineCatalog.fetchedAt ?? new Date(0).toISOString(),
+      runtimeIdentity: `${clineCatalog.runtime.cliProviderId}:${clineCatalog.runtime.version}`,
+    };
+  }
+  return undefined;
+}
+
 export function createMcpServer(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
@@ -1872,8 +1904,8 @@ export function createMcpServer(
   runtimeBuildIdentityContext?: RuntimeBuildIdentityContext,
   durableOperations?: DurableOperationManager,
   cutoverControl?: CutoverMcpControlContext,
-  opencodeCatalogSource = createMcpOpencodeCatalogSource(),
-  clineCatalogService = new ClineCatalogService(),
+  opencodeCatalogSource?: ReturnType<typeof createMcpOpencodeCatalogSource>,
+  clineCatalogService?: ClineCatalogService,
 ): McpServer {
   const runtimeBuildIdentity = runtimeBuildIdentityContext?.identity
     ?? describeRuntimeBuildIdentity({
@@ -3394,7 +3426,7 @@ export function createMcpServer(
             error instanceof Error ? error.message : String(error),
           );
         }
-        const { catalog: profileCatalog } = await loadMcpProfileCatalog(config, workspace.root, opencodeCatalogSource, clineCatalogService);
+        const { catalog: profileCatalog, opencodeCatalog, clineCatalog } = await loadMcpProfileCatalog(config, workspace.root, opencodeCatalogSource, clineCatalogService);
         const selection = resolveAgentSelector(
           { profile, provider, model, effort, cliProviderId },
           profileCatalog.profiles,
@@ -3406,9 +3438,15 @@ export function createMcpServer(
         if (selectedProfile?.write_mode !== "read_only") {
           await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
         }
-        const boundContract = selection.directSelection
+        const boundContractBase = selection.directSelection
           ? { ...(contract ?? {}), directSelection: selection.directSelection }
-          : contract;
+          : (contract ?? {});
+        const boundContract = {
+          ...boundContractBase,
+          ...(catalogReceiptForProfile(selectedProfile, opencodeCatalog, clineCatalog)
+            ? { catalogReceipt: catalogReceiptForProfile(selectedProfile, opencodeCatalog, clineCatalog) }
+            : {}),
+        };
         const output = await agentSessionManager.startAgent({
           workspaceId,
           workspaceRoot: workspace.root,
@@ -3470,7 +3508,7 @@ export function createMcpServer(
       },
       async ({ workspaceId, agentId, prompt, idleTimeoutMode, idleTimeoutMs }, { _meta }) => {
         const workspace = workspaces.getWorkspace(workspaceId);
-        const { catalog: profileCatalog } = await loadMcpProfileCatalog(config, workspace.root, opencodeCatalogSource, clineCatalogService);
+        const { catalog: profileCatalog, opencodeCatalog, clineCatalog } = await loadMcpProfileCatalog(config, workspace.root, opencodeCatalogSource, clineCatalogService);
         const currentAgent = agentSessionManager.getRecordByPrefixOrId(agentId);
         const currentProfile = currentAgent
           ? profileCatalog.profiles.find((candidate) => candidate.name === currentAgent.profileName)
@@ -3487,6 +3525,8 @@ export function createMcpServer(
           idleTimeoutMs,
           profiles: profileCatalog.profiles,
           profileCatalog,
+          opencodeCatalog,
+          clineCatalog,
         });
         logToolCall(config, {
           tool: "agent_continue",
@@ -4355,6 +4395,7 @@ export function createServer(
   const processSessions = new ProcessSessionManager();
   const durableOperations = new DurableOperationManager(config);
   const opencodeCatalogSource = createMcpOpencodeCatalogSource();
+  const clineCatalogService = new ClineCatalogService();
   const localAgentProviders = buildLocalAgentProviderStatuses(
     config.subagents,
     getLocalAgentProviderAvailabilitySnapshot(),
@@ -4372,7 +4413,7 @@ export function createServer(
   });
   const latestProfileCatalogGeneration = { value: runtimeBuildIdentity.profileCatalogGeneration };
   const agentSessionManager = config.subagents.enabled
-    ? new LocalAgentSessionManager(config, undefined, undefined, undefined, runtimeBuildIdentity)
+    ? new LocalAgentSessionManager(config, undefined, undefined, undefined, runtimeBuildIdentity, undefined, clineCatalogService)
     : undefined;
   const capabilityManifest = deriveLoadedCapabilityManifest(
     agentSessionManager
