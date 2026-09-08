@@ -755,7 +755,9 @@ test("subagents disabled: agent tools are absent", async (t) => {
 });
 
 test("subagents enabled: agent tools are present and functional", async (t) => {
-  const context = await fixture(t, { subagents: true });
+  const context = await fixture(t, {
+    subagents: { enabled: true, providers: [{ id: "codex", enabled: true }] },
+  });
   const tools = await context.client.listTools();
   const agentTools = tools.tools.filter((tool) => tool.name.startsWith("agent_"));
   assert.equal(agentTools.length, 7);
@@ -790,7 +792,10 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   // Schema Security Checks: verify no workspaceRoot or provider/profile leakage
   const startProps = startTool.inputSchema.properties as Record<string, any>;
   assert.equal(startProps.workspaceRoot, undefined);
-  assert.equal(startProps.provider, undefined);
+  assert.ok(startProps.provider, "agent_start must advertise direct provider selection");
+  assert.ok(startProps.model, "agent_start must advertise direct model selection");
+  assert.ok(startProps.effort, "agent_start must advertise direct effort selection");
+  assert.ok(!(startTool.inputSchema.required as string[] | undefined)?.includes("profile"), "profile must be optional for direct dispatch");
   assert.ok(startProps.attemptKey);
 
   const continueProps = continueTool.inputSchema.properties as Record<string, any>;
@@ -828,6 +833,42 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   const startStructured = startResult.structuredContent as Record<string, any>;
   assert.ok(startStructured.agentId);
   assert.equal(startStructured.status, "starting");
+
+  const invalidSelector = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      provider: "codex",
+      model: "gpt-test",
+      prompt: "invalid selector",
+    },
+  });
+  assert.equal(invalidSelector.isError, true);
+  assert.match(responseText(invalidSelector), /either profile|both provider and model/i);
+
+  for (const arguments_ of [
+    { workspaceId, prompt: "missing selector" },
+    { workspaceId, provider: "codex", prompt: "missing model" },
+    { workspaceId, profile: "reviewer", effort: "high", prompt: "profile effort mismatch" },
+    { workspaceId, provider: "codex", model: "", prompt: "empty model" },
+  ]) {
+    const rejected = await context.client.callTool({ name: "agent_start", arguments: arguments_ });
+    assert.equal(rejected.isError, true);
+  }
+
+  const directPreflight = await context.client.callTool({
+    name: "agent_preflight",
+    arguments: {
+      workspaceId,
+      provider: "codex",
+      model: "gpt-test",
+      effort: "high",
+    },
+  });
+  assert.equal(directPreflight.isError, undefined, responseText(directPreflight));
+  assert.equal((structuredContent(directPreflight).worker as Record<string, unknown>).provider, "codex");
+  assert.equal((structuredContent(directPreflight).worker as Record<string, unknown>).model, "gpt-test");
   assert.equal(startStructured.profileName, "reviewer");
 
   const replayResult = await context.client.callTool({
@@ -1471,6 +1512,25 @@ test("agent_start schema preserves #28 heartbeat and G9/G10 authority capabiliti
   assert.ok(contractProps.nexusGrant);
   assert.ok(contractProps.idleTimeoutMs);
   assert.match(contractProps.idleTimeoutMs.description, /terminated.*no provider activity/i);
+});
+
+test("direct agent selectors reject disabled providers before preflight", async (t) => {
+  const context = await fixture(t, {
+    subagents: { enabled: true, providers: [{ id: "codex", enabled: true }] },
+  });
+  const workspaceId = structuredContent(await callOpen(context.client, context.project, "direct-disabled")).workspaceId as string;
+  const result = await context.client.callTool({
+    name: "agent_preflight",
+    arguments: { workspaceId, provider: "claude", model: "claude-test" },
+  });
+  assert.equal(result.isError, true);
+  assert.match(responseText(result), /provider 'claude' is disabled/i);
+  const start = await context.client.callTool({
+    name: "agent_start",
+    arguments: { workspaceId, provider: "claude", model: "claude-test", prompt: "must be rejected" },
+  });
+  assert.equal(start.isError, true);
+  assert.match(responseText(start), /provider 'claude' is disabled/i);
 });
 
 test("git candidates tools - MCP managed worktree end-to-end integration test", async (t) => {

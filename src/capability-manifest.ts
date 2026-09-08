@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import * as z from "zod/v4";
 
 export const CAPABILITY_MANIFEST_SCHEMA = "devspace.capability_manifest.v1" as const;
 
@@ -7,6 +8,8 @@ export interface CapabilityManifest {
   capabilities: string[];
   missing: string[];
   manifestSha256: string;
+  /** Stable fingerprint of the complete registered MCP input schemas. */
+  inputSchemaFingerprint?: string;
 }
 
 interface SchemaLike {
@@ -60,6 +63,26 @@ function resolveField(
   return current;
 }
 
+function canonicalValue(value: unknown, key?: string): unknown {
+  if (Array.isArray(value)) {
+    const items = value.map((item) => canonicalValue(item));
+    return key === "required" || key === "enum"
+      ? items.sort((left, right) => JSON.stringify(left).localeCompare(JSON.stringify(right)))
+      : items;
+  }
+  if (!value || typeof value !== "object") return value;
+  return Object.fromEntries(
+    Object.keys(value as Record<string, unknown>).sort().map((childKey) => [childKey, canonicalValue((value as Record<string, unknown>)[childKey], childKey)]),
+  );
+}
+
+function registeredSchemaFingerprint(tools: ToolInputSchemas): string | undefined {
+  const schemas = Object.fromEntries(
+    Object.keys(tools).sort().map((tool) => [tool, z.toJSONSchema(z.object(tools[tool] as Record<string, z.ZodType>))]),
+  );
+  return createHash("sha256").update(JSON.stringify(canonicalValue(schemas))).digest("hex");
+}
+
 /**
  * Derive the runtime manifest from the same schema objects passed to MCP tool
  * registration. No source declaration or caller-supplied capability list is
@@ -94,8 +117,9 @@ export function deriveLoadedCapabilityManifest(
   capabilities.sort();
   missing.sort();
   observed.sort((left, right) => left.id.localeCompare(right.id));
+  const inputSchemaFingerprint = registeredSchemaFingerprint(tools);
   const manifestSha256 = createHash("sha256")
-    .update(JSON.stringify({ schema: CAPABILITY_MANIFEST_SCHEMA, observed }))
+    .update(JSON.stringify({ schema: CAPABILITY_MANIFEST_SCHEMA, observed, inputSchemaFingerprint }))
     .digest("hex");
-  return { schema: CAPABILITY_MANIFEST_SCHEMA, capabilities, missing, manifestSha256 };
+  return { schema: CAPABILITY_MANIFEST_SCHEMA, capabilities, missing, manifestSha256, inputSchemaFingerprint };
 }

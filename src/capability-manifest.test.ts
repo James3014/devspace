@@ -30,7 +30,25 @@ test("loaded capability manifest is deterministic and derived from the registere
     "agent_start.tool",
   ]);
   assert.match(first.manifestSha256, /^[0-9a-f]{64}$/);
+  assert.match(first.inputSchemaFingerprint ?? "", /^[0-9a-f]{64}$/);
   assert.equal(first.manifestSha256, second.manifestSha256);
+});
+
+test("registered input schema fingerprint tracks selector shape while ignoring key order", () => {
+  const original = deriveLoadedCapabilityManifest({ agent_start: agentStartInput() });
+  const reordered = deriveLoadedCapabilityManifest({
+    agent_start: {
+      executionContract: agentStartInput().executionContract,
+      workspaceId: agentStartInput().workspaceId,
+    },
+  });
+  assert.equal(original.inputSchemaFingerprint, reordered.inputSchemaFingerprint);
+
+  const changed = agentStartInput();
+  changed.provider = z.string().optional();
+  const changedManifest = deriveLoadedCapabilityManifest({ agent_start: changed });
+  assert.notEqual(original.inputSchemaFingerprint, changedManifest.inputSchemaFingerprint);
+  assert.notEqual(original.manifestSha256, changedManifest.manifestSha256);
 });
 
 test("loaded capability manifest detects removal from the actual registered schema", () => {

@@ -37,6 +37,13 @@ export type AgentTerminalReason =
   | "unknown";
 
 export interface ExecutionContract {
+  /** Immutable direct provider/model identity captured at MCP admission. */
+  directSelection?: {
+    provider: string;
+    model: string;
+    effort?: string;
+    writeMode: "read_only" | "allowed";
+  };
   /** Defaults to OWNER_DIRECT for backwards compatibility. */
   authorityMode?: ExecutionAuthorityMode;
   /** Immutable canonical Nexus authority pointer, required only for NEXUS_GOVERNED. */
@@ -137,6 +144,25 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
   }
   const record = value as Record<string, unknown>;
   const contract: ExecutionContract = {};
+
+  if (record.directSelection !== undefined) {
+    if (typeof record.directSelection !== "object" || record.directSelection === null || Array.isArray(record.directSelection)) {
+      throw new Error("executionContract.directSelection must be an object.");
+    }
+    const selection = record.directSelection as Record<string, unknown>;
+    if (typeof selection.provider !== "string" || !selection.provider.trim()
+      || typeof selection.model !== "string" || !selection.model.trim()
+      || (selection.effort !== undefined && (typeof selection.effort !== "string" || !selection.effort.trim()))
+      || (selection.writeMode !== "read_only" && selection.writeMode !== "allowed")) {
+      throw new Error("executionContract.directSelection has invalid provider, model, effort, or writeMode.");
+    }
+    contract.directSelection = {
+      provider: selection.provider.trim(),
+      model: selection.model.trim(),
+      effort: selection.effort === undefined ? undefined : selection.effort.trim(),
+      writeMode: selection.writeMode,
+    };
+  }
 
   if (record.authorityMode !== undefined) {
     if (record.authorityMode !== "OWNER_DIRECT" && record.authorityMode !== "NEXUS_GOVERNED") {

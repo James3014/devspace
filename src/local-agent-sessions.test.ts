@@ -174,6 +174,114 @@ test("LocalAgentSessionManager - startAgent and PROVIDER_UNAVAILABLE", async () 
   }
 });
 
+test("direct provider/model identity survives durable worker reload without a disk profile", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-direct-state-"));
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "devspace-direct-workspace-"));
+  const devspaceAgentsDir = mkdtempSync(join(tmpdir(), "devspace-direct-agents-"));
+  const spawnedWorkers: Array<{ agentId: string; promptFile: string; workerToken: string }> = [];
+  let observedProfile: LocalAgentProfile | undefined;
+  const config = { stateDir, devspaceAgentsDir, subagents: true, oauth: { scopes: ["devspace"] } } as any;
+  let manager = new LocalAgentSessionManager(
+    config,
+    async (agentId: string, promptFile: string, workerToken: string) => {
+      spawnedWorkers.push({ agentId, promptFile, workerToken });
+    },
+    async () => true,
+    async (profile: LocalAgentProfile | undefined) => {
+      assert.ok(profile);
+      observedProfile = profile;
+      return { provider: profile.provider, providerSessionId: null, finalResponse: "direct-ok", items: [] };
+    },
+  );
+  try {
+    const profileName = "__direct__agy__direct-model__high";
+    const started = await manager.startAgent({
+      workspaceId: "ws_direct",
+      workspaceRoot,
+      profileName,
+      prompt: "read package metadata",
+      executionContract: {
+        directSelection: {
+          provider: "agy",
+          model: "direct-model",
+          effort: "high",
+          writeMode: "read_only",
+        },
+      },
+      attemptKey: "direct-replay",
+      profiles: [{
+        name: profileName,
+        description: "direct",
+        provider: "agy",
+        model: "direct-model",
+        effort: "high",
+        write_mode: "read_only",
+        filePath: "<direct-dispatch>",
+        body: "",
+        disabled: false,
+      }],
+    });
+    const launched = spawnedWorkers[0]!;
+    manager.close();
+    writeFileSync(join(devspaceAgentsDir, "collision.md"), [
+      "---",
+      `name: ${profileName}`,
+      "description: collision",
+      "provider: claude",
+      "write_mode: allowed",
+      "---",
+      "must never shadow direct evidence",
+    ].join("\n"));
+    manager = new LocalAgentSessionManager(
+      config,
+      async (agentId: string, promptFile: string, workerToken: string) => {
+        spawnedWorkers.push({ agentId, promptFile, workerToken });
+      },
+      async () => true,
+      async (profile: LocalAgentProfile | undefined) => {
+        assert.ok(profile);
+        observedProfile = profile;
+        return { provider: profile.provider, providerSessionId: null, finalResponse: "direct-ok", items: [] };
+      },
+    );
+    const replayed = await manager.startAgent({
+      workspaceId: "ws_direct",
+      workspaceRoot,
+      profileName,
+      prompt: "read package metadata",
+      attemptKey: "direct-replay",
+      executionContract: {
+        directSelection: { provider: "agy", model: "direct-model", effort: "high", writeMode: "read_only" },
+      },
+      profiles: [{
+        name: profileName, description: "direct", provider: "agy", model: "direct-model", effort: "high",
+        write_mode: "read_only", filePath: "<direct-dispatch>", body: "", disabled: false,
+      }],
+    });
+    assert.equal(replayed.agentId, started.agentId);
+    await manager.runWorkerTurnFromFile(started.agentId, launched.promptFile, launched.workerToken);
+    assert.equal(observedProfile?.provider, "agy");
+    assert.equal(observedProfile?.model, "direct-model");
+    assert.equal(observedProfile?.effort, "high");
+    assert.equal(observedProfile?.write_mode, "read_only");
+    assert.equal(manager.getRecordByPrefixOrId(started.agentId)?.status, "idle");
+    const continued = await manager.continueAgent({
+      workspaceId: "ws_direct",
+      workspaceRoot,
+      agentId: started.agentId,
+      prompt: "continue direct evidence",
+    });
+    const continuedLaunch = spawnedWorkers.at(-1)!;
+    await manager.runWorkerTurnFromFile(continued.agentId, continuedLaunch.promptFile, continuedLaunch.workerToken);
+    assert.equal(manager.getRecordByPrefixOrId(started.agentId)?.status, "idle");
+  } finally {
+    manager.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(devspaceAgentsDir, { recursive: true, force: true });
+  }
+});
+
 test("LocalAgentSessionManager - effective idle policy fences silent worker and activity resets clock", async () => {
   const { manager, terminatedWorkers, clean } = setupFixture();
   try {

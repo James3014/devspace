@@ -92,7 +92,14 @@ import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
-import { summarizeLocalAgentProfile, loadLocalAgentProfiles } from "./local-agent-profiles.js";
+import {
+  summarizeLocalAgentProfile,
+  loadLocalAgentProfiles,
+  LOCAL_AGENT_PROVIDERS,
+  type LocalAgentProfile,
+  type LocalAgentProvider,
+} from "./local-agent-profiles.js";
+import { isSubagentProviderEnabled } from "./local-agent-config.js";
 import {
   loadProfileCatalog,
   type ProfileCatalogEntry,
@@ -121,7 +128,7 @@ import {
   AGENT_LIST_MAX_LIMIT,
   AGENT_LIST_DEFAULT_LIMIT,
 } from "./local-agent-sessions.js";
-import { parseExecutionContract } from "./local-agent-contract.js";
+import { parseExecutionContract, type ExecutionContract } from "./local-agent-contract.js";
 import { runToolchainVerifier, resolveToolchainExecutable } from "./local-agent-toolchains.js";
 import {
   runRepositoryIntelligenceOperation,
@@ -172,6 +179,38 @@ const REPOSITORY_INTELLIGENCE_TOOL_ANNOTATIONS = {
   idempotentHint: true,
   openWorldHint: false,
 };
+
+type AgentSelector = {
+  profile?: string;
+  provider?: LocalAgentProvider;
+  model?: string;
+  effort?: string;
+};
+
+function agentSelectorShape() {
+  return z.object({
+    profile: z.string().min(1).optional().describe("Name of an advertised agent profile to run."),
+    provider: z.enum(LOCAL_AGENT_PROVIDERS as [LocalAgentProvider, ...LocalAgentProvider[]]).optional()
+      .describe("Provider for direct dispatch. Requires model and cannot be combined with profile."),
+    model: z.string().trim().min(1).optional()
+      .describe("Exact provider model for direct dispatch. Requires provider and cannot be combined with profile."),
+    effort: z.string().trim().min(1).optional()
+      .describe("Optional provider reasoning effort for direct dispatch."),
+  });
+}
+
+function validateAgentSelector(value: AgentSelector): string | undefined {
+  const hasProfile = value.profile !== undefined;
+  const hasDirect = value.provider !== undefined || value.model !== undefined;
+  if (hasProfile && value.effort !== undefined) return "effort is only valid with direct provider and model selection.";
+  if (hasProfile === hasDirect) {
+    return "Provide either profile, or provider and model together.";
+  }
+  if (hasDirect && (value.provider === undefined || value.model === undefined)) {
+    return "Direct dispatch requires both provider and model.";
+  }
+  return undefined;
+}
 
 interface RunningServer {
   app: ReturnType<typeof createMcpExpressApp>;
@@ -1729,14 +1768,72 @@ function createAgentStartInputSchema() {
   }).partial().optional().describe(
     "Optional structured execution contract. Records and enforces where/how the worker may run.",
   );
+  const selectorShape = agentSelectorShape();
   return {
     workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
-    profile: z.string().describe("Name of an advertised agent profile to run."),
+    ...selectorShape.shape,
     prompt: z.string().describe("Task prompt for the agent."),
     attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/).optional().describe(
       "Optional physical-workspace-scoped replay identity. Exact request replays reuse one durable agent; conflicting reuse fails closed.",
     ),
     executionContract,
+  };
+}
+
+function createAgentPreflightInputSchema() {
+  return {
+    workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+    ...agentSelectorShape().shape,
+    toolchainId: z.string().optional().describe("Optional toolchain id to check availability for."),
+  };
+}
+
+function resolveAgentSelector(
+  selector: AgentSelector,
+  profiles: LocalAgentProfile[],
+  config: ServerConfig,
+  contract?: ExecutionContract,
+): { profileName: string; profiles: LocalAgentProfile[]; directSelection?: NonNullable<ExecutionContract["directSelection"]> } {
+  if (selector.profile !== undefined) return { profileName: selector.profile, profiles };
+  if (!selector.provider || !selector.model) {
+    throw new AgentSessionError("UNKNOWN_PROFILE", "Provide either profile, or provider and model together.");
+  }
+  if (!isSubagentProviderEnabled(config.subagents, selector.provider)) {
+    throw new AgentSessionError(
+      "PROVIDER_DISABLED",
+      `Agent provider '${selector.provider}' is disabled; direct dispatch is refused.`,
+    );
+  }
+  const baseName = `__direct__${selector.provider}__${selector.model}__${selector.effort ?? "default"}`;
+  const profileName = baseName;
+  const writeMode = contract?.dispatchIntent
+    && (contract.dispatchIntent.roleIntent === "MECHANICAL_EXECUTOR" || contract.dispatchIntent.roleIntent === "DEEP_ENGINEERING")
+    && (contract.writePaths?.length ?? 0) > 0
+    ? "allowed" as const
+    : "read_only" as const;
+  return {
+    profileName,
+    directSelection: {
+      provider: selector.provider,
+      model: selector.model,
+      effort: selector.effort,
+      writeMode,
+    },
+    // Put the immutable direct binding first so an unrelated disk profile
+    // with the same display name cannot shadow the admitted selection.
+    profiles: [{
+      name: profileName,
+      description: "Validated direct provider/model selection",
+      provider: selector.provider,
+      model: selector.model,
+      effort: selector.effort,
+      // Direct selection must pass the same conversation mutation gate as a
+      // normal writable profile; it must never gain an implicit bypass.
+      write_mode: writeMode,
+      filePath: "<direct-dispatch>",
+      body: "",
+      disabled: false,
+    }, ...profiles],
   };
 }
 
@@ -1764,9 +1861,12 @@ export function createMcpServer(
   const latestProfileCatalogGeneration = runtimeBuildIdentityContext?.latestProfileCatalogGeneration
     ?? { value: runtimeBuildIdentity.profileCatalogGeneration };
   const agentStartInputSchema = createAgentStartInputSchema();
+  const agentPreflightInputSchema = createAgentPreflightInputSchema();
   const capabilityManifest = runtimeBuildIdentityContext?.capabilityManifest
     ?? deriveLoadedCapabilityManifest(
-      config.subagents && agentSessionManager ? { agent_start: agentStartInputSchema } : {},
+      config.subagents && agentSessionManager
+        ? { agent_start: agentStartInputSchema, agent_preflight: agentPreflightInputSchema }
+        : {},
     );
   const server = new McpServer(
     {
@@ -3161,15 +3261,11 @@ export function createMcpServer(
         _meta: {},
         annotations: AGENT_TOOL_ANNOTATIONS_WRITE,
       },
-      async ({ workspaceId, profile, prompt, attemptKey, executionContract }, { _meta }) => {
+      async ({ workspaceId, profile, provider, model, effort, prompt, attemptKey, executionContract }, { _meta }) => {
+        const selectorError = validateAgentSelector({ profile, provider, model, effort });
+        if (selectorError) throw new AgentSessionError("UNKNOWN_PROFILE", selectorError);
         const workspace = workspaces.getWorkspace(workspaceId);
-        const profileCatalog = await loadProfileCatalog(config, workspace.root);
-        const profiles = profileCatalog.profiles;
-        const selectedProfile = profiles.find((candidate) => candidate.name === profile);
-        if (selectedProfile?.write_mode !== "read_only") {
-          await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
-        }
-        let contract;
+        let contract: ExecutionContract | undefined;
         try {
           contract = parseExecutionContract(executionContract);
         } catch (error) {
@@ -3178,15 +3274,30 @@ export function createMcpServer(
             error instanceof Error ? error.message : String(error),
           );
         }
+        const profileCatalog = await loadProfileCatalog(config, workspace.root);
+        const selection = resolveAgentSelector(
+          { profile, provider, model, effort },
+          profileCatalog.profiles,
+          config,
+          contract,
+        );
+        const profiles = selection.profiles;
+        const selectedProfile = profiles.find((candidate) => candidate.name === selection.profileName);
+        if (selectedProfile?.write_mode !== "read_only") {
+          await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
+        }
+        const boundContract = selection.directSelection
+          ? { ...(contract ?? {}), directSelection: selection.directSelection }
+          : contract;
         const output = await agentSessionManager.startAgent({
           workspaceId,
           workspaceRoot: workspace.root,
-          profileName: profile,
+          profileName: selection.profileName,
           prompt,
           profiles,
           profileCatalog,
           attemptKey,
-          executionContract: contract,
+          executionContract: boundContract,
         });
         logToolCall(config, {
           tool: "agent_start",
@@ -3454,11 +3565,7 @@ export function createMcpServer(
         title: "Agent preflight",
         description:
           "Read-only readiness evidence for an exact workspace + agent profile before dispatch. Provider 'configured' is not the same as dispatch-ready; unknown evidence stays unknown. Never exposes credentials and grants no routing/admission authority.",
-        inputSchema: {
-          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
-          profile: z.string().describe("Name of an advertised agent profile to check."),
-          toolchainId: z.string().optional().describe("Optional toolchain id to check availability for."),
-        },
+        inputSchema: agentPreflightInputSchema,
         outputSchema: {
           workspace: z.object({
             workspaceId: z.string(),
@@ -3471,6 +3578,7 @@ export function createMcpServer(
             profile: z.string(),
             provider: z.string(),
             model: z.string().optional(),
+            effort: z.string().optional(),
             thinking: z.string().optional(),
             executionIdentity: z.string(),
             runtimeVersion: z.string().optional(),
@@ -3511,15 +3619,22 @@ export function createMcpServer(
         _meta: {},
         annotations: { readOnlyHint: true },
       },
-      async ({ workspaceId, profile, toolchainId }, { _meta }) => {
+      async ({ workspaceId, profile, provider, model, effort, toolchainId }, { _meta }) => {
+        const selectorError = validateAgentSelector({ profile, provider, model, effort });
+        if (selectorError) throw new AgentSessionError("UNKNOWN_PROFILE", selectorError);
         const workspace = workspaces.getWorkspace(workspaceId);
         const profileCatalog = await loadProfileCatalog(config, workspace.root);
-        const profiles = profileCatalog.profiles;
+        const selection = resolveAgentSelector(
+          { profile, provider, model, effort },
+          profileCatalog.profiles,
+          config,
+        );
+        const profiles = selection.profiles;
         const output = await agentSessionManager.preflightAgent({
           workspaceId,
           workspaceRoot: workspace.root,
           isolated: workspace.mode === "worktree",
-          profileName: profile,
+          profileName: selection.profileName,
           profiles,
           profileCatalog,
           toolchainId,
@@ -4122,7 +4237,9 @@ export function createServer(
     ? new LocalAgentSessionManager(config, undefined, undefined, undefined, runtimeBuildIdentity)
     : undefined;
   const capabilityManifest = deriveLoadedCapabilityManifest(
-    agentSessionManager ? { agent_start: createAgentStartInputSchema() } : {},
+    agentSessionManager
+      ? { agent_start: createAgentStartInputSchema(), agent_preflight: createAgentPreflightInputSchema() }
+      : {},
   );
   const cutoverController = new McpCutoverController(
     new CutoverStateStore(config.stateDir),

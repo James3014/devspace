@@ -14,7 +14,7 @@ import {
   type LocalAgentRecord,
   type LocalAgentStatus,
 } from "./local-agent-store.js";
-import { loadLocalAgentProfiles, type LocalAgentProfile } from "./local-agent-profiles.js";
+import { isLocalAgentProvider, loadLocalAgentProfiles, type LocalAgentProfile } from "./local-agent-profiles.js";
 import {
   checkLocalAgentProviderAvailability,
   getLocalAgentProviderRuntimeVersion,
@@ -791,16 +791,39 @@ export class LocalAgentSessionManager {
     // ── Continuation admission gates (all read-only; run before mutation) ──
     const admissionFailures: string[] = [];
 
-    const currentProfile = input.profiles?.find((candidate) => candidate.name === record.profileName) ?? {
-      name: record.profileName,
-      description: "Persisted durable-agent profile binding",
-      provider: record.provider as LocalAgentProfile["provider"],
-      model: record.model,
-      effort: record.effort,
-      filePath: "<persisted>",
-      body: "",
-      disabled: false,
-    };
+    const directSelection = record.executionContract?.directSelection;
+    if (directSelection) {
+      if (!isLocalAgentProvider(directSelection.provider)) {
+        throw new AgentSessionError("REBIND_REQUIRED", `Agent ${agentId} has an unknown persisted direct provider.`);
+      }
+      if (record.provider !== directSelection.provider
+        || record.model !== directSelection.model
+        || record.effort !== directSelection.effort) {
+        throw new AgentSessionError("REBIND_REQUIRED", `Agent ${agentId} has inconsistent persisted direct selection evidence.`);
+      }
+    }
+    const currentProfile = directSelection
+      ? {
+          name: record.profileName,
+          description: "Durable direct provider/model selection",
+          provider: directSelection.provider as LocalAgentProfile["provider"],
+          model: directSelection.model,
+          effort: directSelection.effort,
+          write_mode: directSelection.writeMode,
+          filePath: "<direct-dispatch>",
+          body: "",
+          disabled: false,
+        }
+      : input.profiles?.find((candidate) => candidate.name === record.profileName) ?? {
+          name: record.profileName,
+          description: "Persisted durable-agent profile binding",
+          provider: record.provider as LocalAgentProfile["provider"],
+          model: record.model,
+          effort: record.effort,
+          filePath: "<persisted>",
+          body: "",
+          disabled: false,
+        };
     let executionIdlePolicy: EffectiveExecutionIdlePolicy;
     try {
       executionIdlePolicy = resolveEffectiveExecutionIdlePolicy(
@@ -1733,7 +1756,34 @@ export class LocalAgentSessionManager {
       }
 
       const profiles = await loadLocalAgentProfiles(this.config, claimed.workspaceRoot);
-      const profile = profiles.find((p) => p.name === claimed.profileName);
+      // Direct provider/model selections are durable records without a disk
+      // profile. Reconstruct the exact execution identity from the record so
+      // worker reloads and continuation turns use the same normal profile
+      // runner and security gates.
+      const directSelection = claimed.executionContract?.directSelection;
+      if (directSelection) {
+        if (!isLocalAgentProvider(directSelection.provider)) {
+          throw new Error(`Persisted direct selection has unknown provider '${directSelection.provider}'.`);
+        }
+        if (claimed.provider !== directSelection.provider
+          || claimed.model !== directSelection.model
+          || claimed.effort !== directSelection.effort) {
+          throw new Error("Persisted direct selection does not match the durable provider/model/effort identity.");
+        }
+      }
+      const profile = directSelection
+        ? {
+            name: claimed.profileName,
+            description: "Durable direct provider/model selection",
+            provider: directSelection.provider as LocalAgentProfile["provider"],
+            model: directSelection.model,
+            effort: directSelection.effort,
+            write_mode: directSelection.writeMode,
+            filePath: "<direct-dispatch>",
+            body: "",
+            disabled: false,
+          }
+        : profiles.find((p) => p.name === claimed.profileName);
       const callbacks: LocalAgentRunCallbacks = {
         onActivity: () => {
           this.store.touchActivityCAS(claimed.id, generation, workerToken);
