@@ -1251,9 +1251,7 @@ export class LocalAgentSessionManager {
       delta.attribution,
     );
 
-    const startedAtMs = Date.parse(record.createdAt);
-    const updatedAtMs = Date.parse(record.lifecycleState?.activeTurn?.lastActivityAt ?? record.updatedAt);
-    const now = Date.now();
+    const timing = computeSessionTiming(record);
 
     return {
       agentId: record.id,
@@ -1277,8 +1275,8 @@ export class LocalAgentSessionManager {
         startedAt: record.createdAt,
         lastActivityAt: record.lifecycleState?.activeTurn?.lastActivityAt ?? record.updatedAt,
         lastFileMutationAt: physical.lastFileMutationAt,
-        wallMs: Math.max(0, now - startedAtMs),
-        idleMs: Math.max(0, now - updatedAtMs),
+        wallMs: timing.wallMs,
+        idleMs: timing.idleMs,
       },
     };
   }
