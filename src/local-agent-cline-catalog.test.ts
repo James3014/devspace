@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { ClineCatalogService, CLINE_RECOMMENDED_MODELS_ENDPOINT, parseClineCatalogFeed, type ClineRuntimeIdentity } from "./local-agent-cline-catalog.js";
+import { ClineCatalogService, CLINE_RECOMMENDED_MODELS_ENDPOINT, parseClineCatalogFeed, validateClineModelAndThinking, type ClineRuntimeIdentity } from "./local-agent-cline-catalog.js";
 
 const runtime: ClineRuntimeIdentity = {
   command: "cline", cliProviderId: "cline", version: "3.0.61", supportsProviderFlag: true, supportsModelFlag: true,
@@ -20,6 +20,16 @@ assert.equal(entries[1]?.free, "known-free");
 assert.equal(entries[1]?.thinking.length, 0, "thinking variants must not be invented");
 assert.equal(entries[0]?.modelProviderId, "anthropic");
 assert.equal(entries[0]?.thinkingKnown, true);
+const feedSnapshot = {
+  state: "READY" as const, entries, fetchedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString(), generation: "fixture", runtime, source: "fixture" as const,
+};
+assert.equal(validateClineModelAndThinking("anthropic/claude-sonnet-4-6", "cline-pass", "high", feedSnapshot).valid, false, "feed thinking metadata is not executable readiness");
+assert.equal(validateClineModelAndThinking("anthropic/claude-sonnet-4-6", "cline-pass", undefined, feedSnapshot).valid, true);
+assert.equal(validateClineModelAndThinking("anthropic/claude-sonnet-4-6", "cline-pass", "high", { ...feedSnapshot, runtime: { ...runtime, thinkingVerified: true } }).valid, true);
+const verifiedSnapshot = { ...feedSnapshot, runtime: { ...runtime, thinkingVerified: true } };
+assert.equal(validateClineModelAndThinking("anthropic/claude-sonnet-4-6", "cline-pass", "high", { ...verifiedSnapshot, expiresAt: new Date(Date.now() - 1).toISOString() }).valid, false, "stale snapshot must not admit effort");
+assert.equal(validateClineModelAndThinking("anthropic/claude-sonnet-4-6", "cline-pass", "high", { ...verifiedSnapshot, expiresAt: undefined }).valid, false, "missing expiry must fail closed");
+assert.equal(validateClineModelAndThinking("anthropic/claude-sonnet-4-6", "cline-pass", "high", { ...verifiedSnapshot, fetchedAt: new Date(Date.now() + 60_000).toISOString() }).valid, false, "future snapshot must fail closed");
 assert.throws(() => parseClineCatalogFeed({ data: [{ id: "claude-sonnet-4-6" }] }));
 assert.throws(() => parseClineCatalogFeed({ clinePass: [{ id: "x/a\nb" }], free: [] }), /invalid/);
 const overlap = parseClineCatalogFeed({ clinePass: [{ id: "x/a" }], free: [{ id: "x/a" }] });

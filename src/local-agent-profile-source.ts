@@ -16,7 +16,7 @@ import {
   type OpencodeCatalogSnapshot,
 } from "./local-agent-opencode-catalog.js";
 import type { ServerConfig } from "./config.js";
-import { isClineCatalogFresh, type ClineCatalogSnapshot } from "./local-agent-cline-catalog.js";
+import { isClineCatalogFresh, validateClineModelAndThinking, type ClineCatalogSnapshot } from "./local-agent-cline-catalog.js";
 
 /**
  * Owner-approved profile authority contract:
@@ -137,15 +137,12 @@ export async function loadProfileCatalog(
         }
       } else if (profile.provider === "cline") {
         const clineCatalog = options.clineCatalog;
-        const exact = clineCatalog && isClineCatalogFresh(clineCatalog)
-          ? clineCatalog.entries.filter((entry) => entry.cliProviderId === (profile.cliProviderId ?? "cline") && entry.fullName === profile.model)
-          : [];
-        if (exact.length !== 1) {
-          state = "exact_model_unavailable";
-          diagnostic = clineCatalog?.diagnostic ?? `Cline model '${profile.model}' is not established by the current catalog.`;
-        } else if (profile.effort && (!exact[0].thinkingKnown || !exact[0].thinking.includes(profile.effort as never))) {
-          state = "variant_unavailable";
-          diagnostic = `Cline thinking level '${profile.effort}' is not established for '${profile.model}'.`;
+        const validation = clineCatalog && isClineCatalogFresh(clineCatalog)
+          ? validateClineModelAndThinking(profile.model, profile.cliProviderId, profile.effort, clineCatalog)
+          : { valid: false, blockerCode: "EXACT_MODEL_UNAVAILABLE" as const, reason: clineCatalog?.diagnostic ?? `Cline model '${profile.model}' is not established by the current catalog.` };
+        if (!validation.valid) {
+          state = validation.blockerCode === "VARIANT_UNAVAILABLE" ? "variant_unavailable" : "exact_model_unavailable";
+          diagnostic = validation.reason;
         } else {
           state = "advertised";
         }

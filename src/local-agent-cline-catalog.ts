@@ -35,6 +35,8 @@ export interface ClineRuntimeIdentity {
   supportsProviderFlag: boolean;
   supportsModelFlag: boolean;
   supportedThinking: readonly ClineThinkingLevel[];
+  /** True only after an executable session API proves the requested level. */
+  thinkingVerified?: boolean;
 }
 
 export interface ClineCatalogSnapshot {
@@ -64,6 +66,34 @@ export function isClineCatalogFresh(snapshot: Pick<ClineCatalogSnapshot, "state"
 export interface ClineCatalogResponse {
   status: number;
   json(): Promise<unknown>;
+}
+
+export interface ClineModelValidationResult {
+  valid: boolean;
+  blockerCode?: "EXACT_MODEL_UNAVAILABLE" | "VARIANT_UNAVAILABLE";
+  reason?: string;
+}
+
+/**
+ * Validate the exact Cline route and optional thinking level. Feed metadata
+ * remains observable, but it cannot authorize an executable effort until a
+ * session-level readback has established thinkingVerified=true.
+ */
+export function validateClineModelAndThinking(
+  model: string | undefined,
+  cliProviderId: "cline" | "cline-pass" | undefined,
+  effort: string | undefined,
+  snapshot: ClineCatalogSnapshot | undefined,
+): ClineModelValidationResult {
+  const family = cliProviderId ?? "cline";
+  const exact = snapshot?.entries.filter((entry) => entry.cliProviderId === family && entry.fullName === model) ?? [];
+  if (!snapshot || !isClineCatalogFresh(snapshot) || exact.length !== 1) {
+    return { valid: false, blockerCode: "EXACT_MODEL_UNAVAILABLE", reason: `Cline model '${model ?? ""}' is not established for cliProviderId '${family}'.` };
+  }
+  if (effort && (snapshot.runtime.thinkingVerified !== true || !exact[0].thinkingKnown || !exact[0].thinking.includes(effort as ClineThinkingLevel))) {
+    return { valid: false, blockerCode: "VARIANT_UNAVAILABLE", reason: `Cline thinking level '${effort}' is not verified for '${model}'.` };
+  }
+  return { valid: true };
 }
 
 export interface ClineCatalogOptions {

@@ -254,6 +254,31 @@ try {
     computeProfileCatalogGeneration(liveCatalog.entries, "stable-snapshot"),
     computeProfileCatalogGeneration([...liveCatalog.entries].reverse(), "stable-snapshot"),
   );
+
+  await writeProfile(join(configDir, "agents"), "cline-feed-effort", [
+    "name: cline-feed-effort",
+    "description: Cline feed metadata must not authorize executable effort.",
+    "provider: cline",
+    "cliProviderId: cline-pass",
+    "model: anthropic/claude-sonnet-4-6",
+    "effort: high",
+    "write_mode: read_only",
+  ]);
+  const clineSnapshot = {
+    state: "READY" as const,
+    entries: [{ cliProviderId: "cline-pass" as const, catalogTier: "pass" as const, modelProviderId: "anthropic", modelId: "claude-sonnet-4-6", fullName: "anthropic/claude-sonnet-4-6", routeKey: "cline-pass:anthropic/claude-sonnet-4-6", thinking: ["high" as const], thinkingKnown: true, supportsReasoning: true as const, free: "unknown" as const, accountEntitlement: "unknown" as const, source: "fixture" as const }],
+    fetchedAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    generation: "cline-feed-effort",
+    runtime: { command: "cline", cliProviderId: "cline" as const, version: "fixture", supportsProviderFlag: true, supportsModelFlag: true, supportedThinking: ["high" as const] },
+    source: "fixture" as const,
+  };
+  const clineFeedCatalog = await loadProfileCatalog(config, workspaceRoot, {
+    availability: [{ name: "cline", available: true }],
+    clineCatalog: clineSnapshot,
+  });
+  assert.equal(clineFeedCatalog.entries.find((entry) => entry.name === "cline-feed-effort")?.state, "variant_unavailable");
+  assert.equal(clineFeedCatalog.blockerFor("cline-feed-effort")?.code, "VARIANT_UNAVAILABLE");
 } finally {
   await rm(root, { recursive: true, force: true });
 }
