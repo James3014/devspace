@@ -201,17 +201,41 @@ export function validateOpencodeModelAndVariant(
   if (!model) return { valid: true };
 
   const trimmedModel = model.trim();
-  const entry = catalog.entries.find((e) =>
-    e.fullName === trimmedModel ||
-    e.modelId === trimmedModel ||
-    (trimmedModel.includes("/") && e.modelId === trimmedModel.split("/")[1] && e.providerId === trimmedModel.split("/")[0]),
+  // Provider-qualified IDs must match in full, including nested model paths.
+  // Retain legacy bare aliases only when they identify exactly one route.
+  const matches = catalog.entries.filter((entry) =>
+    entry.fullName === trimmedModel ||
+    (!trimmedModel.includes("/") && entry.modelId === trimmedModel),
   );
+  const entry = matches.length === 1 ? matches[0] : undefined;
 
   if (!entry) {
     return {
       valid: false,
       blockerCode: "EXACT_MODEL_UNAVAILABLE",
-      reason: `OpenCode model '${model}' is not available in the current catalog.`,
+      reason: matches.length > 1
+        ? `OpenCode model '${model}' is ambiguous in the current catalog; an exact, unique provider/model identity is required.`
+        : `OpenCode model '${model}' is not available in the current catalog.`,
+    };
+  }
+
+  // The runtime parses bare IDs with providerID='opencode'. Never validate a
+  // non-default provider alias that would execute against a different route.
+  if (!trimmedModel.includes("/") && entry.providerId !== "opencode") {
+    return {
+      valid: false,
+      blockerCode: "EXACT_MODEL_UNAVAILABLE",
+      reason: `OpenCode model '${model}' requires its exact provider-qualified identity '${entry.fullName}'.`,
+    };
+  }
+
+  // Preserve the catalog states declared by the installed OpenCode SDK.
+  // Deprecated is lifecycle metadata, not proof that the route is unavailable.
+  if (!["active", "alpha", "beta", "deprecated"].includes(entry.status)) {
+    return {
+      valid: false,
+      blockerCode: "EXACT_MODEL_UNAVAILABLE",
+      reason: `OpenCode model '${model}' has unavailable or unrecognized catalog status '${entry.status}'.`,
     };
   }
 

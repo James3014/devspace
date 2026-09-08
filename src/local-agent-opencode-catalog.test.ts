@@ -86,4 +86,52 @@ const gen1 = computeOpencodeCatalogGeneration(mockEntries, 1);
 const gen2 = computeOpencodeCatalogGeneration(mockEntries, 2);
 assert.notEqual(gen1, gen2);
 
+// Issue #58: exact identity must not accept a suffixed model path.
+for (const model of ["opencode/big-pickle/extra", "opencode/big-pickle/"]) {
+  const result = validateOpencodeModelAndVariant(model, undefined, testSnapshot);
+  assert.equal(result.valid, false, `Non-exact model '${model}' must be rejected`);
+  assert.equal(result.blockerCode, "EXACT_MODEL_UNAVAILABLE");
+}
+
+// Preserve unique legacy aliases, but never choose the first ambiguous route.
+const sharedEntries: OpencodeCatalogEntry[] = [
+  { providerId: "first", modelId: "shared", fullName: "first/shared", variants: [], status: "active" },
+  { providerId: "second", modelId: "shared", fullName: "second/shared", variants: [], status: "active" },
+];
+const sharedSnapshot = { ...testSnapshot, entries: sharedEntries };
+assert.equal(validateOpencodeModelAndVariant("shared", undefined, sharedSnapshot).valid, false);
+for (const entry of sharedEntries) {
+  assert.deepEqual(validateOpencodeModelAndVariant(entry.fullName, undefined, sharedSnapshot), { valid: true });
+}
+assert.deepEqual(validateOpencodeModelAndVariant("big-pickle", undefined, testSnapshot), { valid: true });
+// Runtime bare IDs default to provider 'opencode', so a unique non-default
+// alias must still require qualification rather than select the wrong route.
+assert.equal(validateOpencodeModelAndVariant("shared", undefined, { ...testSnapshot, entries: [sharedEntries[0]] }).valid, false);
+
+// Nested model IDs remain usable only with their exact provider-qualified ID.
+const nestedEntry: OpencodeCatalogEntry = {
+  providerId: "first", modelId: "family/model", fullName: "first/family/model", variants: [], status: "active",
+};
+const nestedSnapshot = { ...testSnapshot, entries: [nestedEntry] };
+assert.deepEqual(validateOpencodeModelAndVariant(nestedEntry.fullName, undefined, nestedSnapshot), { valid: true });
+assert.equal(validateOpencodeModelAndVariant("family/model", undefined, nestedSnapshot).valid, false);
+assert.equal(validateOpencodeModelAndVariant(`${nestedEntry.fullName}/extra`, undefined, nestedSnapshot).valid, false);
+
+// Preserve SDK lifecycle metadata: deprecated alone does not prove unavailable.
+// Unknown or explicitly inactive states must not be admitted.
+for (const status of ["active", "alpha", "beta", "deprecated"]) {
+  const snapshot = { ...testSnapshot, entries: [{ ...mockEntries[0], status }] };
+  assert.deepEqual(validateOpencodeModelAndVariant("opencode/big-pickle", undefined, snapshot), { valid: true });
+}
+for (const status of ["inactive", "disabled", "retired", "unknown", ""]) {
+  const snapshot = { ...testSnapshot, entries: [{ ...mockEntries[0], status }] };
+  const result = validateOpencodeModelAndVariant("opencode/big-pickle", undefined, snapshot);
+  assert.equal(result.valid, false, `Status '${status}' must not be admitted`);
+  assert.equal(result.blockerCode, "EXACT_MODEL_UNAVAILABLE");
+}
+
+// Duplicate exact identities are corrupt/ambiguous catalog evidence.
+const duplicateSnapshot = { ...testSnapshot, entries: [mockEntries[0], { ...mockEntries[0] }] };
+assert.equal(validateOpencodeModelAndVariant("opencode/big-pickle", undefined, duplicateSnapshot).valid, false);
+
 console.log("local-agent-opencode-catalog tests passed!");
