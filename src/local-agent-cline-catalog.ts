@@ -41,6 +41,7 @@ export interface ClineCatalogSnapshot {
   state: ClineCatalogState;
   entries: readonly ClineCatalogEntry[];
   fetchedAt?: string;
+  expiresAt?: string;
   generation: string;
   runtime: ClineRuntimeIdentity;
   endpoint?: string;
@@ -48,6 +49,16 @@ export interface ClineCatalogSnapshot {
   diagnostic?: string;
   lastSuccessfulAt?: string;
   retryAfter?: string;
+}
+
+export function isClineCatalogFresh(snapshot: Pick<ClineCatalogSnapshot, "state" | "fetchedAt" | "expiresAt">, now = Date.now()): boolean {
+  const fetched = snapshot.fetchedAt ? Date.parse(snapshot.fetchedAt) : NaN;
+  const expires = snapshot.expiresAt ? Date.parse(snapshot.expiresAt) : NaN;
+  return snapshot.state === "READY"
+    && Number.isFinite(fetched)
+    && fetched <= now
+    && Number.isFinite(expires)
+    && now < expires;
 }
 
 export interface ClineCatalogResponse {
@@ -245,7 +256,7 @@ export class ClineCatalogService {
       if (response.status < 200 || response.status >= 300) throw new Error(`Cline catalog endpoint returned HTTP ${response.status}.`);
       const entries = parseClineCatalogFeed(await response.json(), "cline-api");
       const fetchedAt = this.options.now().toISOString();
-      this.snapshot = { state: "READY", entries, fetchedAt, lastSuccessfulAt: fetchedAt, generation: generation(entries, runtime), runtime, endpoint, source: "cline-api" };
+      this.snapshot = { state: "READY", entries, fetchedAt, expiresAt: new Date(this.options.now!().getTime() + this.options.maxAgeMs!).toISOString(), lastSuccessfulAt: fetchedAt, generation: generation(entries, runtime), runtime, endpoint, source: "cline-api" };
     } catch (error) {
       this.snapshot = { ...this.failedSnapshot(runtime, error instanceof Error ? error.message : "Cline catalog feed failed."), state: "BLOCKED", source: "cline-api", endpoint };
     }

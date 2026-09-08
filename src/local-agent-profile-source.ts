@@ -16,7 +16,7 @@ import {
   type OpencodeCatalogSnapshot,
 } from "./local-agent-opencode-catalog.js";
 import type { ServerConfig } from "./config.js";
-import type { ClineCatalogSnapshot } from "./local-agent-cline-catalog.js";
+import { isClineCatalogFresh, type ClineCatalogSnapshot } from "./local-agent-cline-catalog.js";
 
 /**
  * Owner-approved profile authority contract:
@@ -137,7 +137,7 @@ export async function loadProfileCatalog(
         }
       } else if (profile.provider === "cline") {
         const clineCatalog = options.clineCatalog;
-        const exact = clineCatalog?.state === "READY"
+        const exact = clineCatalog && isClineCatalogFresh(clineCatalog)
           ? clineCatalog.entries.filter((entry) => entry.cliProviderId === (profile.cliProviderId ?? "cline") && entry.fullName === profile.model)
           : [];
         if (exact.length !== 1) {

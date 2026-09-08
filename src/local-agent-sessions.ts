@@ -47,7 +47,7 @@ import {
   type AgentProviderFailureDetails,
 } from "./local-agent-errors.js";
 import { validateOpencodeModelAndVariant, type OpencodeCatalogSnapshot } from "./local-agent-opencode-catalog.js";
-import type { ClineCatalogSnapshot } from "./local-agent-cline-catalog.js";
+import { isClineCatalogFresh, type ClineCatalogSnapshot } from "./local-agent-cline-catalog.js";
 import type { ClineCatalogService } from "./local-agent-cline-catalog.js";
 import { ClineCatalogService as ClineCatalogServiceImpl } from "./local-agent-cline-catalog.js";
 import { createMcpOpencodeCatalogSource } from "./local-agent-opencode-mcp-catalog.js";
@@ -76,6 +76,12 @@ import {
   readWorkspaceHead,
   type WorkerAttribution,
 } from "./workspace-reconciliation.js";
+
+function catalogSnapshotIsFresh(fetchedAt: string | undefined, expiresAt: string | undefined): boolean {
+  const fetched = Date.parse(fetchedAt ?? "");
+  const expires = expiresAt ? Date.parse(expiresAt) : NaN;
+  return Number.isFinite(fetched) && fetched <= Date.now() && (!expiresAt || (Number.isFinite(expires) && Date.now() < expires));
+}
 
 // ─── Error codes ────────────────────────────────────────────────────────────
 
@@ -831,12 +837,12 @@ export class LocalAgentSessionManager {
         const validation = validateOpencodeModelAndVariant(receipt.model, receipt.effort, snapshot as OpencodeCatalogSnapshot);
         const opencode = snapshot as OpencodeCatalogSnapshot;
         const runtimeIdentity = `${opencode.runtime?.source ?? "unknown"}:${opencode.runtime?.version ?? "unknown"}:${opencode.runtime?.executable ?? "unknown"}`;
-        if (!validation.valid || (opencode.freshness ?? "unknown") !== receipt.freshness || runtimeIdentity !== receipt.runtimeIdentity) throw new AgentSessionError("REBIND_REQUIRED", validation.reason ?? "Persisted OpenCode catalog receipt is no longer valid.");
+        if (!validation.valid || opencode.source !== receipt.source || !catalogSnapshotIsFresh(opencode.fetchedAt, opencode.expiresAt) || (opencode.freshness ?? "unknown") !== receipt.freshness || runtimeIdentity !== receipt.runtimeIdentity) throw new AgentSessionError("REBIND_REQUIRED", validation.reason ?? "Persisted OpenCode catalog receipt is no longer valid.");
       } else if (receipt.provider === "cline") {
         const cline = snapshot as ClineCatalogSnapshot;
         const exact = cline.entries.filter((entry) => entry.cliProviderId === (receipt.cliProviderId ?? "cline") && entry.fullName === receipt.model);
         const runtimeIdentity = `${cline.runtime.cliProviderId}:${cline.runtime.version}:${cline.runtime.command}`;
-        if (cline.state !== "READY" || receipt.freshness !== "fresh" || runtimeIdentity !== receipt.runtimeIdentity || exact.length !== 1 || (receipt.effort && (!exact[0].thinkingKnown || !exact[0].thinking.includes(receipt.effort as never)))) {
+        if (!isClineCatalogFresh(cline) || cline.source !== receipt.source || receipt.freshness !== "fresh" || runtimeIdentity !== receipt.runtimeIdentity || exact.length !== 1 || (receipt.effort && (!exact[0].thinkingKnown || !exact[0].thinking.includes(receipt.effort as never)))) {
           throw new AgentSessionError("REBIND_REQUIRED", "Persisted Cline catalog receipt is no longer valid.");
         }
       }
@@ -1820,6 +1826,8 @@ export class LocalAgentSessionManager {
         const liveCatalog = await this.opencodeCatalogSource.acquire();
         const runtimeIdentity = `${liveCatalog.runtime?.source ?? "unknown"}:${liveCatalog.runtime?.version ?? "unknown"}:${liveCatalog.runtime?.executable ?? "unknown"}`;
         if (liveCatalog.generation !== catalogReceipt.generation
+          || liveCatalog.source !== catalogReceipt.source
+          || !catalogSnapshotIsFresh(liveCatalog.fetchedAt, liveCatalog.expiresAt)
           || (liveCatalog.freshness ?? "unknown") !== catalogReceipt.freshness
           || runtimeIdentity !== catalogReceipt.runtimeIdentity) {
           throw new Error("Persisted OpenCode catalog receipt drifted before provider invocation; refusing execution.");
@@ -1832,7 +1840,7 @@ export class LocalAgentSessionManager {
         const exact = liveCatalog?.entries.filter((entry) => entry.cliProviderId === (catalogReceipt.cliProviderId ?? "cline") && entry.fullName === catalogReceipt.model) ?? [];
         const runtimeIdentity = liveCatalog ? `${liveCatalog.runtime.cliProviderId}:${liveCatalog.runtime.version}:${liveCatalog.runtime.command}` : "unknown:unknown:unknown";
         if (!liveCatalog || liveCatalog.state !== "READY" || liveCatalog.generation !== catalogReceipt.generation
-          || catalogReceipt.freshness !== "fresh" || runtimeIdentity !== catalogReceipt.runtimeIdentity || exact.length !== 1
+          || liveCatalog.source !== catalogReceipt.source || !isClineCatalogFresh(liveCatalog) || catalogReceipt.freshness !== "fresh" || runtimeIdentity !== catalogReceipt.runtimeIdentity || exact.length !== 1
           || (catalogReceipt.effort && (!exact[0].thinkingKnown || !exact[0].thinking.includes(catalogReceipt.effort as never)))) {
           throw new Error("Persisted Cline catalog receipt drifted before provider invocation; refusing execution.");
         }

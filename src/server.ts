@@ -106,7 +106,7 @@ import {
 } from "./local-agent-profile-source.js";
 import { acquireOpencodeCatalog, type OpencodeCatalogSnapshot } from "./local-agent-opencode-catalog.js";
 import { createMcpOpencodeCatalogSource } from "./local-agent-opencode-mcp-catalog.js";
-import { ClineCatalogService, type ClineCatalogSnapshot } from "./local-agent-cline-catalog.js";
+import { ClineCatalogService, isClineCatalogFresh, type ClineCatalogSnapshot } from "./local-agent-cline-catalog.js";
 import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build-identity.js";
 import {
   deriveLoadedCapabilityManifest,
@@ -1901,7 +1901,7 @@ function assertDirectClineCatalogSelection(selector: AgentSelector, catalog: Awa
   const exact = snapshot?.state === "READY"
     ? snapshot.entries.filter((entry) => entry.cliProviderId === family && entry.fullName === selector.model)
     : [];
-  if (!snapshot || snapshot.state !== "READY" || exact.length !== 1) {
+  if (!snapshot || !isClineCatalogFresh(snapshot) || exact.length !== 1) {
     throw new AgentSessionError("EXACT_MODEL_UNAVAILABLE", `Cline model '${selector.model}' is not established for cliProviderId '${family}'.`);
   }
   if (selector.effort && (!exact[0].thinkingKnown || !exact[0].thinking.includes(selector.effort as never))) {
