@@ -1853,6 +1853,13 @@ export class LocalAgentSessionManager {
             disabled: false,
           }
         : profiles.find((p) => p.name === claimed.profileName);
+      if (catalogReceipt && (!profile
+        || profile.provider !== catalogReceipt.provider
+        || (profile.model ?? undefined) !== (catalogReceipt.model ?? undefined)
+        || (profile.effort ?? undefined) !== (catalogReceipt.effort ?? undefined)
+        || (profile.cliProviderId ?? undefined) !== (catalogReceipt.cliProviderId ?? undefined))) {
+        throw new Error("Reloaded profile identity does not match the durable catalog receipt; refusing execution.");
+      }
       const callbacks: LocalAgentRunCallbacks = {
         onActivity: () => {
           this.store.touchActivityCAS(claimed.id, generation, workerToken);

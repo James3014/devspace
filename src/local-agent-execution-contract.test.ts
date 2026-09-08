@@ -4080,12 +4080,13 @@ test("catalog receipt gates real worker turn before provider runner and rejects 
   const profile: LocalAgentProfile = { name: "receipt-profile", description: "receipt", provider: "opencode", model: "opencode/test", effort: "high", write_mode: "read_only", disabled: false, filePath: "<test>", body: "" };
   const profileCatalog: any = { generation: "profile-g1", opencodeCatalog: current, advertised: () => profile, blockerFor: () => undefined };
   try {
-    const started = await manager.startAgent({ workspaceId: "ws_1", workspaceRoot: f.repo, profileName: profile.name, prompt: "read", profiles: [profile], profileCatalog, executionContract: { catalogReceipt: { provider: "opencode", model: "opencode/test", effort: "high", source: "sdk", generation: current.generation, fetchedAt: current.fetchedAt, runtimeIdentity: "sdk:test" } } });
+    const contract = { directSelection: { provider: "opencode", model: "opencode/test", effort: "high", writeMode: "read_only" as const }, catalogReceipt: { provider: "opencode", model: "opencode/test", effort: "high", source: "sdk", generation: current.generation, fetchedAt: current.fetchedAt, runtimeIdentity: "sdk:test" } };
+    const started = await manager.startAgent({ workspaceId: "ws_1", workspaceRoot: f.repo, profileName: profile.name, prompt: "read", profiles: [profile], profileCatalog, executionContract: contract });
     assert.ok(launched);
     await manager.runWorkerTurnFromFile(started.agentId, launched!.promptFile, launched!.workerToken);
     assert.equal(providerCalls, 1);
 
-    const second = await manager.startAgent({ workspaceId: "ws_1", workspaceRoot: f.repo, profileName: profile.name, prompt: "read", profiles: [profile], profileCatalog, executionContract: { catalogReceipt: { provider: "opencode", model: "opencode/test", effort: "high", source: "sdk", generation: current.generation, fetchedAt: current.fetchedAt, runtimeIdentity: "sdk:test" } } });
+    const second = await manager.startAgent({ workspaceId: "ws_1", workspaceRoot: f.repo, profileName: profile.name, prompt: "read", profiles: [profile], profileCatalog, executionContract: contract });
     current = makeSnapshot("receipt-g2");
     assert.ok(launched);
     const before = providerCalls;
