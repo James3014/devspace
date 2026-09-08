@@ -126,7 +126,7 @@ export function initializeControlPlaneOwnershipDatabase(sqlite: Database.Databas
   `);
   const columns = sqlite.prepare("pragma table_info(control_plane_resource_leases)").all() as Array<{ name: string }>;
   if (!columns.some((column) => column.name === "grant_version")) {
-    sqlite.exec("alter table control_plane_resource_leases add column grant_version integer not null default 1");
+    sqlite.exec("alter table control_plane_resource_leases add column grant_version integer not null default 0");
   }
 }
 
