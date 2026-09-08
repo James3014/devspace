@@ -799,6 +799,19 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   const catalogPayload = structuredContent(catalogResult);
   assert.ok((catalogPayload.snapshot as Record<string, unknown>).generation);
   assert.equal((catalogPayload.entitlement as Record<string, unknown>).state, "UNKNOWN");
+  const opencodeSnapshot = catalogPayload.snapshot as Record<string, any>;
+  assert.equal(opencodeSnapshot.runtime.source, opencodeSnapshot.source);
+  assert.ok(opencodeSnapshot.freshness === "fresh" || opencodeSnapshot.freshness === "stale" || opencodeSnapshot.freshness === "unknown");
+  const clineCatalogResult = await context.client.callTool({
+    name: "agent_catalog",
+    arguments: { workspaceId, provider: "cline", model: "cline-pass:openai/gpt-6-astra" },
+  });
+  assert.equal(clineCatalogResult.isError, undefined);
+  const clineCatalogPayload = structuredContent(clineCatalogResult);
+  const clineSnapshot = clineCatalogPayload.snapshot as Record<string, any>;
+  assert.equal((clineCatalogPayload.entitlement as Record<string, unknown>).state, "UNKNOWN");
+  assert.equal(clineSnapshot.runtime.cliProviderId, "cline");
+  assert.equal(clineSnapshot.freshness, "unknown");
 
   // Schema Security Checks: verify no workspaceRoot or provider/profile leakage
   const startProps = startTool.inputSchema.properties as Record<string, any>;
