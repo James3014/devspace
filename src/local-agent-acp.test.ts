@@ -699,15 +699,16 @@ assert.equal(resumedRuntime.isAlive(), false);
       async request(method: string, params?: unknown): Promise<unknown> {
         const sessionId = (params as { sessionId?: string } | undefined)?.sessionId ?? "diagnostic-session";
         if (method === "session/new") {
-          diagnosticQueues.set(sessionId, { values: [] });
-          return { sessionId };
+          const createdSessionId = "s".repeat(300);
+          diagnosticQueues.set(createdSessionId, { values: [] });
+          return { sessionId: createdSessionId };
         }
         if (method === "session/prompt") {
           diagnosticQueues.get(sessionId)?.values.push(
             { update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `${"x".repeat(100_000)} secret prompt response` } } },
             { update: { sessionUpdate: "secret-token", content: { type: "secret", text: "api-key-value" } } },
           );
-          return { stopReason: "end_turn", apiKey: "must-not-be-observed" };
+          return { stopReason: "secret-stop", apiKey: "must-not-be-observed" };
         }
         return {};
       },
@@ -723,14 +724,15 @@ assert.equal(resumedRuntime.isAlive(), false);
     env: {},
     capabilities: { resume: false, close: false },
     queues: diagnosticQueues,
-    diagnosticObserver: (observation) => { observations.push(observation as unknown as Record<string, unknown>); },
+      diagnosticObserver: (observation) => { observations.push(observation as unknown as Record<string, unknown>); throw new Error("observer must not affect run"); },
   }, diagnosticConnection);
   const diagnosticResult = await diagnosticRuntime.run({ prompt: "secret prompt", workspaceRoot: "/tmp/project" });
   assert.equal(diagnosticResult.isErr(), true);
   assert.equal(observations.length, 1);
   const observation = observations[0];
+  assert.match(observation.sessionId as string, /^sha256:[0-9a-f]{64}$/);
   assert.deepEqual(observation.responseKeys, ["stopReason"]);
-  assert.equal(observation.stopReason, "end_turn");
+  assert.equal(observation.stopReason, "unknown");
   assert.deepEqual(observation.updateTypes, ["agent_thought_chunk", "unknown"]);
   assert.deepEqual(observation.updateContentTypes, ["text", "unknown"]);
   assert.equal(observation.updateContentBytes, 64 * 1024);

@@ -1,4 +1,5 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { createHash } from "node:crypto";
 import { accessSync, constants } from "node:fs";
 import { createRequire } from "node:module";
 import { delimiter, resolve } from "node:path";
@@ -282,7 +283,7 @@ export class AcpRuntime implements LocalAgentRuntime {
     if (!this.diagnosticObserver) return;
     const observation: AcpDiagnosticObservation = {
       provider: this.provider,
-      sessionId,
+      sessionId: diagnosticSessionId(sessionId),
       responseKeys: diagnosticResponseKeys(response),
       ...(diagnosticStopReason(response) ? { stopReason: diagnosticStopReason(response) } : {}),
       ...diagnosticUpdateSummary(updates),
@@ -525,6 +526,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
     provider: AcpProvider,
     private readonly env: NodeJS.ProcessEnv = process.env,
     private readonly commandResolver: AcpCommandResolver = resolveAcpCommand,
+    private readonly diagnosticObserver?: (observation: AcpDiagnosticObservation) => void,
   ) {
     this.provider = provider;
   }
@@ -656,6 +658,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
             grokCompletionRegistry,
             activityCallbacks,
             stderrTail: () => stderrTail,
+            diagnosticObserver: this.diagnosticObserver,
           }, connection);
           // AcpRuntime installs the long-lived child error listener before this
           // startup-only listener is removed, so there is no unobserved gap.
@@ -1021,7 +1024,14 @@ function diagnosticResponseKeys(value: unknown): string[] {
 
 function diagnosticStopReason(value: unknown): string | undefined {
   const stopReason = asRecord(value)?.stopReason;
-  return typeof stopReason === "string" && stopReason.length <= 64 ? stopReason : undefined;
+  return typeof stopReason === "string" && DIAGNOSTIC_STOP_REASONS.has(stopReason) ? stopReason : stopReason === undefined ? undefined : "unknown";
+}
+
+const DIAGNOSTIC_STOP_REASONS = new Set(["end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"]);
+
+function diagnosticSessionId(sessionId: string): string {
+  if (sessionId.length <= 256) return sessionId;
+  return `sha256:${createHash("sha256").update(sessionId).digest("hex")}`;
 }
 
 function diagnosticToken(value: unknown, allowed: Set<string>): string {
