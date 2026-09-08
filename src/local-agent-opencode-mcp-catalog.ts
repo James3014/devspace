@@ -1,52 +1,62 @@
-import {
-  defaultOpencodeFactory,
-  type OpencodeClientLike,
-  type OpencodeServerLike,
-} from "./local-agent-opencode.js";
-import {
-  acquireOpencodeCatalog,
-  type OpencodeCatalogSnapshot,
-} from "./local-agent-opencode-catalog.js";
+import { createOpencode } from "@opencode-ai/sdk/v2";
+import type { OpencodeClientLike, OpencodeServerLike } from "./local-agent-opencode.js";
+import { acquireOpencodeCatalog, type OpencodeCatalogSnapshot } from "./local-agent-opencode-catalog.js";
+
+export type McpCatalogLifecycle = { client: OpencodeClientLike; server: OpencodeServerLike };
+export type McpCatalogFactory = () => Promise<McpCatalogLifecycle>;
 
 /**
- * One lifecycle-scoped, read-only OpenCode SDK catalog client for MCP.
- * The SDK server is started lazily on the first catalog request and is never
- * used for prompts or agent execution. All concurrent callers share it.
+ * The MCP catalog gets an isolated SDK server. Port 0 lets the OS choose an
+ * available localhost endpoint, so discovery cannot occupy the dispatch port.
  */
-export function createMcpOpencodeCatalogSource() {
-  let lifecycle: Promise<{ client: OpencodeClientLike; server: OpencodeServerLike }> | undefined;
-  let closed = false;
+export async function defaultMcpOpencodeCatalogFactory(): Promise<McpCatalogLifecycle> {
+  return createOpencode({ hostname: "127.0.0.1", port: 0, timeout: 30_000 });
+}
 
-  const getLifecycle = (): Promise<{ client: OpencodeClientLike; server: OpencodeServerLike }> => {
+export function createMcpOpencodeCatalogSource(factory: McpCatalogFactory = defaultMcpOpencodeCatalogFactory, options: { retryMs?: number } = {}) {
+  let lifecycle: Promise<McpCatalogLifecycle> | undefined;
+  let closed = false;
+  let retryAt = 0;
+  const retryMs = options.retryMs ?? 1_000;
+
+  const getLifecycle = (): Promise<McpCatalogLifecycle> => {
     if (closed) return Promise.reject(new Error("OpenCode MCP catalog source is closed."));
-    lifecycle ??= defaultOpencodeFactory(undefined, { agentId: "mcp-catalog", provider: "opencode", workspaceRoot: "." });
-    return lifecycle;
+    if (Date.now() < retryAt) return Promise.reject(new Error("OpenCode MCP catalog startup is in backoff."));
+    if (lifecycle) return lifecycle;
+    const pending = factory().then((created) => {
+      if (closed) {
+        created.server.close();
+        throw new Error("OpenCode MCP catalog source closed during startup.");
+      }
+      retryAt = 0;
+      return created;
+    }).catch((error) => {
+      if (lifecycle === pending) lifecycle = undefined;
+      retryAt = Date.now() + retryMs;
+      throw error;
+    });
+    lifecycle = pending;
+    return pending;
   };
 
   return {
     async acquire(): Promise<OpencodeCatalogSnapshot> {
+      if (closed) throw new Error("OpenCode MCP catalog source is closed.");
       try {
         const { client } = await getLifecycle();
+        if (closed) throw new Error("OpenCode MCP catalog source is closed.");
         return acquireOpencodeCatalog({ client });
-      } catch {
-        // SDK startup is optional discovery evidence. Preserve the existing
-        // bounded CLI/fallback path rather than blocking workspace opening.
+      } catch (error) {
+        if (closed) throw error;
         return acquireOpencodeCatalog();
       }
     },
-    async close(): Promise<void> {
+    close(): void {
       if (closed) return;
       closed = true;
       const active = lifecycle;
       lifecycle = undefined;
-      if (active) {
-        try {
-          const { server } = await active;
-          server.close();
-        } catch {
-          // Discovery must not prevent the MCP server from shutting down.
-        }
-      }
+      if (active) void active.then(({ server }) => server.close(), () => undefined);
     },
   };
 }
