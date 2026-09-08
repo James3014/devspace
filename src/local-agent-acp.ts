@@ -36,6 +36,14 @@ import type {
 } from "./local-agent-runtime.js";
 
 export type AcpProvider = "cursor" | "copilot" | "grok" | "cline";
+type ClineCliProviderId = "cline" | "cline-pass";
+
+function clineCliProviderId(context: LocalAgentRuntimeContext): ClineCliProviderId {
+  const value = (context as LocalAgentRuntimeContext & { cliProviderId?: ClineCliProviderId }).cliProviderId;
+  if (value === undefined || value === "cline") return "cline";
+  if (value === "cline-pass") return value;
+  throw new Error(`Unsupported Cline CLI provider '${String(value)}'.`);
+}
 
 const MAX_ACP_QUEUE_ITEMS = 10_000;
 const MAX_ACP_STDERR_BYTES = 32 * 1024;
@@ -487,7 +495,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
     const command = this.resolveCommand() ?? ACP_COMMANDS[this.provider][0];
     const writeMode = context.writeMode ?? "allowed";
     const processConfig = this.provider === "cline"
-      ? `:${context.model ?? "default"}:${context.effort ?? "default"}`
+      ? `:${clineCliProviderId(context)}:${context.model ?? "default"}:${context.effort ?? "default"}`
       : "";
     return `acp:${this.provider}:${command}:${writeMode}${processConfig}:${resolve(context.workspaceRoot)}`;
   }
@@ -723,6 +731,7 @@ export function acpCommandArgs(
   if (provider === "cline") {
     return [
       "--acp",
+      "--provider", clineCliProviderId(context),
       ...(context.model ? ["--model", context.model] : []),
       ...(context.effort ? ["--thinking", context.effort] : []),
       ...(writeMode === "read_only" ? ["--plan"] : []),

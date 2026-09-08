@@ -301,6 +301,25 @@ assert.deepEqual(acpCommandArgs("copilot", { ...cachedContext, writeMode: "read_
 assert.deepEqual(acpCommandArgs("copilot", { ...cachedContext, writeMode: "full_access" }), [
   "--acp", "--no-sandbox", "--allow-all", "-C", resolvedProject,
 ]);
+assert.deepEqual(acpCommandArgs("cline", {
+  ...cachedContext,
+  provider: "cline",
+  model: "cline-pass/glm-5.3-flash",
+  effort: "high",
+  writeMode: "read_only",
+}), ["--acp", "--provider", "cline", "--model", "cline-pass/glm-5.3-flash", "--thinking", "high", "--plan", "--auto-approve"]);
+assert.deepEqual(acpCommandArgs("cline", {
+  ...cachedContext,
+  provider: "cline",
+  cliProviderId: "cline-pass",
+  model: "same-model",
+  effort: "medium",
+} as unknown as typeof cachedContext & { cliProviderId: "cline-pass" }), ["--acp", "--provider", "cline-pass", "--model", "same-model", "--thinking", "medium", "--auto-approve"]);
+assert.throws(() => acpCommandArgs("cline", {
+  ...cachedContext,
+  provider: "cline",
+  cliProviderId: "unexpected-provider",
+} as unknown as typeof cachedContext & { cliProviderId: string }), /Unsupported Cline CLI provider/);
 
 const missingCommandDriver = new AcpLocalAgentDriver(
   "cursor",
@@ -566,6 +585,31 @@ assert.equal(resumedRuntime.isAlive(), false);
     writeMode: "read_only",
   });
   assert.notEqual(clineKeyHigh, clineKeyMedium, "Cline process runtime keys must bind process-level model/effort");
+  const clineFreeKey = clineDriver.runtimeKey({
+    agentId: "cline-free",
+    provider: "cline",
+    cliProviderId: "cline",
+    workspaceRoot: "/tmp/project",
+    model: "same-model",
+    effort: "high",
+    writeMode: "read_only",
+  } as any);
+  const clinePassKey = clineDriver.runtimeKey({
+    agentId: "cline-pass",
+    provider: "cline",
+    cliProviderId: "cline-pass",
+    workspaceRoot: "/tmp/project",
+    model: "same-model",
+    effort: "high",
+    writeMode: "read_only",
+  } as any);
+  assert.notEqual(clineFreeKey, clinePassKey, "Cline runtime keys must bind CLI provider family");
+  assert.throws(() => clineDriver.runtimeKey({
+    agentId: "cline-invalid",
+    provider: "cline",
+    cliProviderId: "unexpected-provider",
+    workspaceRoot: "/tmp/project",
+  } as any), /Unsupported Cline CLI provider/);
 }
 
 // Regression tests for Grok & Cline canonical resolver parity
