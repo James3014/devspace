@@ -104,6 +104,8 @@ import {
   loadProfileCatalog,
   type ProfileCatalogEntry,
 } from "./local-agent-profile-source.js";
+import { acquireOpencodeCatalog, type OpencodeCatalogSnapshot } from "./local-agent-opencode-catalog.js";
+import { createMcpOpencodeCatalogSource } from "./local-agent-opencode-mcp-catalog.js";
 import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build-identity.js";
 import {
   deriveLoadedCapabilityManifest,
@@ -1788,6 +1790,18 @@ function createAgentPreflightInputSchema() {
   };
 }
 
+async function loadMcpProfileCatalog(
+  config: ServerConfig,
+  workspaceRoot: string,
+  opencodeCatalogSource?: ReturnType<typeof createMcpOpencodeCatalogSource>,
+): Promise<{ catalog: Awaited<ReturnType<typeof loadProfileCatalog>>; opencodeCatalog: OpencodeCatalogSnapshot }> {
+  // Profile discovery, preflight, start, and continuation all acquire through
+  // the same bounded single-flight snapshot. No provider execution occurs here.
+  const opencodeCatalog = await (opencodeCatalogSource?.acquire() ?? acquireOpencodeCatalog());
+  const catalog = await loadProfileCatalog(config, workspaceRoot, { opencodeCatalog });
+  return { catalog, opencodeCatalog };
+}
+
 function resolveAgentSelector(
   selector: AgentSelector,
   profiles: LocalAgentProfile[],
@@ -1849,6 +1863,7 @@ export function createMcpServer(
   runtimeBuildIdentityContext?: RuntimeBuildIdentityContext,
   durableOperations?: DurableOperationManager,
   cutoverControl?: CutoverMcpControlContext,
+  opencodeCatalogSource = createMcpOpencodeCatalogSource(),
 ): McpServer {
   const runtimeBuildIdentity = runtimeBuildIdentityContext?.identity
     ?? describeRuntimeBuildIdentity({
@@ -1988,6 +2003,10 @@ export function createMcpServer(
         { path, mode, baseRef },
         { conversationScopeId },
       );
+      const discoveredCatalog = await loadMcpProfileCatalog(config, workspace.root, opencodeCatalogSource);
+      workspace.agentProfiles = discoveredCatalog.catalog.profiles;
+      workspace.profileCatalogGeneration = discoveredCatalog.catalog.generation;
+      workspace.profileCatalogEntries = discoveredCatalog.catalog.entries;
       const conversationSafety = await workspaces.conversationMutationSafety(
         workspace.id,
         conversationScopeId,
@@ -3238,6 +3257,83 @@ export function createMcpServer(
     });
     registerAppTool(
       server,
+      "agent_catalog",
+      {
+        title: "Agent model catalog",
+        description:
+          "Read-only bounded catalog evidence for exact provider/model membership. Membership, runtime, and account entitlement remain separate facts; this query never starts a provider task.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          provider: z.string().optional().describe("Optional exact provider family filter."),
+          model: z.string().optional().describe("Optional exact provider/model identity filter."),
+          limit: z.number().int().positive().max(50).optional().describe("Maximum entries to return; defaults to 25."),
+          cursor: z.string().regex(/^\d{1,9}$/).optional().describe("Opaque page cursor returned by the previous query."),
+        },
+        outputSchema: {
+          snapshot: z.object({
+            source: z.string(),
+            fetchedAt: z.string(),
+            generation: z.string(),
+            freshness: z.string(),
+            version: z.string(),
+            runtime: z.object({
+              executable: z.string().optional(),
+              version: z.string(),
+              source: z.string(),
+            }),
+            failure: z.object({ code: z.string(), message: z.string() }).optional(),
+          }),
+          entries: z.array(z.object({
+            providerId: z.string(),
+            modelId: z.string(),
+            fullName: z.string(),
+            variants: z.array(z.string()),
+            variantsKnown: z.boolean().optional(),
+            status: z.string(),
+            enabled: z.boolean().optional(),
+            membership: z.literal("catalog-listed"),
+          })),
+          entitlement: z.object({ state: z.literal("UNKNOWN"), source: z.literal("not-probed") }),
+          nextCursor: z.string().optional(),
+        },
+        _meta: {},
+        annotations: { readOnlyHint: true },
+      },
+      async ({ workspaceId, provider, model, limit = 25, cursor }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const { opencodeCatalog } = await loadMcpProfileCatalog(config, workspace.root, opencodeCatalogSource);
+        const offset = cursor === undefined ? 0 : Number(cursor);
+        const filteredEntries = opencodeCatalog.entries
+          .filter((entry) => !provider || entry.providerId === provider)
+          .filter((entry) => !model || entry.fullName === model || entry.modelId === model);
+        const entries = filteredEntries
+          .slice(offset, offset + limit)
+          .map((entry) => ({ ...entry, membership: "catalog-listed" as const }));
+        const nextCursor = offset + entries.length < filteredEntries.length
+          ? String(offset + entries.length)
+          : undefined;
+        const snapshot = {
+          source: opencodeCatalog.source,
+          fetchedAt: opencodeCatalog.fetchedAt,
+          generation: opencodeCatalog.generation,
+          freshness: opencodeCatalog.freshness ?? "unknown",
+          version: opencodeCatalog.version,
+          runtime: opencodeCatalog.runtime ?? { version: "unknown", source: "unknown" },
+          ...(opencodeCatalog.failure ? { failure: opencodeCatalog.failure } : {}),
+        };
+        return {
+          content: [textBlock(`Catalog ${snapshot.generation}: ${entries.length} matching exact membership record(s).`)],
+          structuredContent: {
+            snapshot,
+            entries,
+            entitlement: { state: "UNKNOWN" as const, source: "not-probed" as const },
+            ...(nextCursor ? { nextCursor } : {}),
+          },
+        };
+      },
+    );
+    registerAppTool(
+      server,
       "agent_start",
       {
         title: "Start agent",
@@ -3274,7 +3370,7 @@ export function createMcpServer(
             error instanceof Error ? error.message : String(error),
           );
         }
-        const profileCatalog = await loadProfileCatalog(config, workspace.root);
+        const { catalog: profileCatalog } = await loadMcpProfileCatalog(config, workspace.root, opencodeCatalogSource);
         const selection = resolveAgentSelector(
           { profile, provider, model, effort },
           profileCatalog.profiles,
@@ -3350,7 +3446,7 @@ export function createMcpServer(
       },
       async ({ workspaceId, agentId, prompt, idleTimeoutMode, idleTimeoutMs }, { _meta }) => {
         const workspace = workspaces.getWorkspace(workspaceId);
-        const profileCatalog = await loadProfileCatalog(config, workspace.root);
+        const { catalog: profileCatalog } = await loadMcpProfileCatalog(config, workspace.root, opencodeCatalogSource);
         const currentAgent = agentSessionManager.getRecordByPrefixOrId(agentId);
         const currentProfile = currentAgent
           ? profileCatalog.profiles.find((candidate) => candidate.name === currentAgent.profileName)
@@ -3615,6 +3711,13 @@ export function createMcpServer(
           }),
           blockers: z.array(z.object({ code: z.string(), detail: z.string() })),
           unknowns: z.array(z.string()),
+          catalog: z.object({
+            source: z.string(),
+            fetchedAt: z.string(),
+            generation: z.string(),
+            freshness: z.string(),
+            version: z.string(),
+          }),
         },
         _meta: {},
         annotations: { readOnlyHint: true },
@@ -3623,7 +3726,7 @@ export function createMcpServer(
         const selectorError = validateAgentSelector({ profile, provider, model, effort });
         if (selectorError) throw new AgentSessionError("UNKNOWN_PROFILE", selectorError);
         const workspace = workspaces.getWorkspace(workspaceId);
-        const profileCatalog = await loadProfileCatalog(config, workspace.root);
+        const { catalog: profileCatalog, opencodeCatalog } = await loadMcpProfileCatalog(config, workspace.root, opencodeCatalogSource);
         const selection = resolveAgentSelector(
           { profile, provider, model, effort },
           profileCatalog.profiles,
@@ -3656,7 +3759,17 @@ export function createMcpServer(
               `Preflight for ${profile}: dispatchState=${output.readiness.dispatchState}; localCapacity=${output.capacity.used}/${output.capacity.max ?? "unbounded"}; providerCapacity=${output.capacity.providerState}.${blockerSummary}${conversationSummary}`,
             ),
           ],
-          structuredContent: { ...output, conversationSafety } as unknown as Record<string, unknown>,
+          structuredContent: {
+            ...output,
+            conversationSafety,
+            catalog: {
+              source: opencodeCatalog.source,
+              fetchedAt: opencodeCatalog.fetchedAt,
+              generation: opencodeCatalog.generation,
+              freshness: opencodeCatalog.freshness ?? "unknown",
+              version: opencodeCatalog.version,
+            },
+          } as unknown as Record<string, unknown>,
         };
       },
     );
@@ -4217,6 +4330,7 @@ export function createServer(
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
   const durableOperations = new DurableOperationManager(config);
+  const opencodeCatalogSource = createMcpOpencodeCatalogSource();
   const localAgentProviders = buildLocalAgentProviderStatuses(
     config.subagents,
     getLocalAgentProviderAvailabilitySnapshot(),
@@ -4708,6 +4822,7 @@ export function createServer(
             listWorkspaceSessions: () => workspaceStore.listSessions(),
             ...(advanceCutover ? { advance: advanceCutover } : {}),
           },
+          opencodeCatalogSource,
         );
         await server.connect(transport);
       } else {
@@ -4747,6 +4862,7 @@ export function createServer(
         processSessions.shutdown();
         durableOperations.close();
         agentSessionManager?.close();
+        await opencodeCatalogSource.close();
         oauthProvider.close();
         workspaceStore.close?.();
       })();

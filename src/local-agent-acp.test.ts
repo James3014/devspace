@@ -319,7 +319,7 @@ assert.throws(() => acpCommandArgs("cline", {
   ...cachedContext,
   provider: "cline",
   cliProviderId: "unexpected-provider",
-} as unknown as typeof cachedContext & { cliProviderId: string }), /Unsupported Cline CLI provider/);
+} as unknown as typeof cachedContext & { cliProviderId?: "cline" | "cline-pass" }), /Unsupported Cline CLI provider/);
 
 const missingCommandDriver = new AcpLocalAgentDriver(
   "cursor",

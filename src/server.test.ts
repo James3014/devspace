@@ -760,7 +760,7 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   });
   const tools = await context.client.listTools();
   const agentTools = tools.tools.filter((tool) => tool.name.startsWith("agent_"));
-  assert.equal(agentTools.length, 7);
+  assert.equal(agentTools.length, 8);
 
   const startTool = agentTools.find((tool) => tool.name === "agent_start");
   const continueTool = agentTools.find((tool) => tool.name === "agent_continue");
@@ -769,6 +769,7 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   const listTool = agentTools.find((tool) => tool.name === "agent_list");
   const preflightTool = agentTools.find((tool) => tool.name === "agent_preflight");
   const reconcileTool = agentTools.find((tool) => tool.name === "agent_reconcile");
+  const catalogTool = agentTools.find((tool) => tool.name === "agent_catalog");
 
   assert.ok(startTool);
   assert.ok(continueTool);
@@ -777,6 +778,7 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   assert.ok(listTool);
   assert.ok(preflightTool);
   assert.ok(reconcileTool);
+  assert.ok(catalogTool);
 
   // Verify start annotations
   assert.equal(startTool.annotations?.readOnlyHint, false);
@@ -788,6 +790,15 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   const openResult = await callOpen(context.client, context.project, "chat-1");
   const workspaceId = structuredContent(openResult).workspaceId as string;
   assert.ok(workspaceId);
+
+  const catalogResult = await context.client.callTool({
+    name: "agent_catalog",
+    arguments: { workspaceId, provider: "opencode", limit: 2 },
+  });
+  assert.equal(catalogResult.isError, undefined);
+  const catalogPayload = structuredContent(catalogResult);
+  assert.ok((catalogPayload.snapshot as Record<string, unknown>).generation);
+  assert.equal((catalogPayload.entitlement as Record<string, unknown>).state, "UNKNOWN");
 
   // Schema Security Checks: verify no workspaceRoot or provider/profile leakage
   const startProps = startTool.inputSchema.properties as Record<string, any>;

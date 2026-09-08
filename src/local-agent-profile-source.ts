@@ -41,6 +41,7 @@ export interface ProfileCatalogEntry {
   provider: string;
   model?: string;
   effort?: string;
+  cliProviderId?: "cline" | "cline-pass";
   write_mode?: string;
   state:
     | "advertised"
@@ -63,6 +64,8 @@ export interface ProfileCatalog {
   entries: ProfileCatalogEntry[];
   /** Stable fingerprint over the full profile + state surface. */
   generation: string;
+  /** Exact OpenCode snapshot used to validate provider/model/variant entries. */
+  opencodeCatalog?: OpencodeCatalogSnapshot;
   /** Resolve a profile by name; returns the advertised profile or undefined. */
   advertised(profileName: string): LocalAgentProfile | undefined;
   /** Typed blocker for a known-but-not-advertised profile; undefined if unknown. */
@@ -141,6 +144,7 @@ export async function loadProfileCatalog(
       provider: profile.provider,
       model: profile.model,
       effort: profile.effort,
+      cliProviderId: profile.cliProviderId,
       write_mode: profile.write_mode,
       state,
       sources: status.sources,
@@ -152,7 +156,12 @@ export async function loadProfileCatalog(
   return {
     profiles: Array.from(advertised.values()).sort((a, b) => a.name.localeCompare(b.name)),
     entries: catalogEntries.sort((a, b) => a.name.localeCompare(b.name)),
-    generation: computeProfileCatalogGeneration(catalogEntries),
+    // Bind the advertised profile generation to the exact live catalog
+    // snapshot used for validation. A refreshed snapshot must therefore be
+    // treated as execution material drift even when its profile projection is
+    // textually unchanged.
+    generation: computeProfileCatalogGeneration(catalogEntries, options.opencodeCatalog?.generation),
+    opencodeCatalog: options.opencodeCatalog,
     advertised: (profileName) => advertised.get(profileName),
     blockerFor: (profileName) => {
       const catalogEntry = catalogEntries.find((candidate) => candidate.name === profileName);
@@ -187,14 +196,19 @@ export async function loadProfileCatalog(
 
 export function computeProfileCatalogGeneration(
   entries: readonly ProfileCatalogEntry[],
+  catalogGeneration?: string,
 ): string {
   const hash = createHash("sha256");
+  if (catalogGeneration !== undefined) {
+    hash.update(`catalog-generation:${catalogGeneration}\n`);
+  }
   for (const entry of [...entries].sort((a, b) => a.name.localeCompare(b.name))) {
     hash.update(JSON.stringify({
       name: entry.name,
       provider: entry.provider,
       model: entry.model ?? null,
       effort: entry.effort ?? null,
+      cliProviderId: entry.cliProviderId ?? null,
       write_mode: entry.write_mode ?? null,
       state: entry.state,
       sources: entry.sources,

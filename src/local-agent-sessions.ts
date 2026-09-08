@@ -640,7 +640,11 @@ export class LocalAgentSessionManager {
     }
 
     if (profile.provider === "opencode") {
-      const modelValidation = validateOpencodeModelAndVariant(profile.model, profile.effort);
+      const modelValidation = validateOpencodeModelAndVariant(
+        profile.model,
+        profile.effort,
+        input.profileCatalog?.opencodeCatalog,
+      );
       if (!modelValidation.valid) {
         throw new AgentSessionError(
           modelValidation.blockerCode!,
@@ -1184,7 +1188,11 @@ export class LocalAgentSessionManager {
       }
 
       if (runtimeReady && profile.provider === "opencode") {
-        const modelValidation = validateOpencodeModelAndVariant(profile.model, profile.effort);
+        const modelValidation = validateOpencodeModelAndVariant(
+          profile.model,
+          profile.effort,
+          input.profileCatalog?.opencodeCatalog,
+        );
         if (!modelValidation.valid) {
           blockers.push({
             code: modelValidation.blockerCode!,
@@ -2077,6 +2085,7 @@ function buildStartReplayBinding(
     provider: input.profile.provider,
     model: input.profile.model ?? null,
     effort: input.profile.effort ?? null,
+    cliProviderId: input.profile.cliProviderId ?? null,
     writeMode: input.profile.write_mode ?? "read_only",
     profileBody: input.profile.body,
     prompt: input.prompt,
@@ -2282,6 +2291,7 @@ async function runLocalAgentProfile(
       writeMode: profile.write_mode === "allowed" ? "allowed" : "read_only",
       model: record.model ?? profile.model,
       effort: record.effort ?? profile.effort,
+      cliProviderId: profile.cliProviderId,
       environment,
     },
     callbacks,

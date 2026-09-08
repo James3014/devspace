@@ -38,6 +38,8 @@ export interface LocalAgentProfile {
   provider: LocalAgentProvider;
   model?: string;
   effort?: string;
+  /** Exact ACP CLI provider id for Cline; absent means Cline's default route. */
+  cliProviderId?: "cline" | "cline-pass";
   write_mode?: WriteMode;
   /** Default hard execution-idle timeout for trustworthy-activity providers. */
   execution_idle_timeout_ms?: number;
@@ -62,6 +64,7 @@ export interface LocalAgentProfileSummary {
   provider: LocalAgentProvider;
   model?: string;
   effort?: string;
+  cliProviderId?: "cline" | "cline-pass";
   write_mode?: WriteMode;
   execution_idle_timeout_ms?: number;
   execution_idle_min_override_ms?: number;
@@ -267,6 +270,7 @@ function profilesEquivalent(a: LocalAgentProfile, b: LocalAgentProfile): boolean
     && a.provider === b.provider
     && (a.model ?? undefined) === (b.model ?? undefined)
     && (a.effort ?? undefined) === (b.effort ?? undefined)
+    && (a.cliProviderId ?? undefined) === (b.cliProviderId ?? undefined)
     && (a.write_mode ?? undefined) === (b.write_mode ?? undefined)
     && (a.execution_idle_timeout_ms ?? undefined) === (b.execution_idle_timeout_ms ?? undefined)
     && (a.execution_idle_min_override_ms ?? undefined) === (b.execution_idle_min_override_ms ?? undefined)
@@ -317,6 +321,7 @@ export function summarizeLocalAgentProfile(
     provider: profile.provider,
     model: profile.model,
     effort: profile.effort,
+    cliProviderId: profile.cliProviderId,
     write_mode: profile.write_mode,
     execution_idle_timeout_ms: profile.execution_idle_timeout_ms,
     execution_idle_min_override_ms: profile.execution_idle_min_override_ms,
@@ -398,6 +403,14 @@ function profileFromFrontmatter(
     throw new Error(`Subagent profile is missing description: ${filePath}`);
   }
 
+  const cliProviderId = readString(frontmatter, "cliProviderId");
+  if (cliProviderId !== undefined && provider !== "cline") {
+    throw new Error(`Subagent profile cliProviderId is only valid for provider cline: ${filePath}`);
+  }
+  if (cliProviderId !== undefined && cliProviderId !== "cline" && cliProviderId !== "cline-pass") {
+    throw new Error(`Subagent profile cliProviderId must be cline or cline-pass: ${filePath}`);
+  }
+
   const override = frontmatter.override === true ? true : undefined;
   return {
     name,
@@ -405,6 +418,7 @@ function profileFromFrontmatter(
     provider,
     model: readString(frontmatter, "model"),
     effort: readString(frontmatter, "effort") ?? readString(frontmatter, "thinking"),
+    cliProviderId: cliProviderId as "cline" | "cline-pass" | undefined,
     write_mode: readWriteMode(frontmatter, filePath),
     execution_idle_timeout_ms: readPositiveInteger(frontmatter, "execution_idle_timeout_ms", filePath),
     execution_idle_min_override_ms: readPositiveInteger(frontmatter, "execution_idle_min_override_ms", filePath),

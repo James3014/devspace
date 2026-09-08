@@ -4,7 +4,7 @@ import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { loadConfig } from "./config.js";
-import { loadProfileCatalog } from "./local-agent-profile-source.js";
+import { computeProfileCatalogGeneration, loadProfileCatalog } from "./local-agent-profile-source.js";
 
 const root = await mkdtemp(join(tmpdir(), "devspace-profile-source-test-"));
 
@@ -153,6 +153,25 @@ try {
   assert.equal(staleModelCatalog.blockerFor("opencode-stale-model")?.code, "EXACT_MODEL_UNAVAILABLE");
   assert.ok(!staleModelCatalog.profiles.some((p) => p.name === "opencode-stale-model"));
 
+  const knownVariantCatalog = {
+    entries: [{
+      providerId: "opencode",
+      modelId: "big-pickle",
+      fullName: "opencode/big-pickle",
+      variants: ["high"],
+      variantsKnown: true,
+      status: "active",
+    }],
+    fetchedAt: new Date().toISOString(),
+    source: "sdk" as const,
+    generation: "known-big-pickle",
+    version: "test",
+    freshness: "fresh" as const,
+    runtime: { version: "test", source: "sdk" as const },
+    lastSuccessAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  };
+
   // Contract Case 2: OpenCode profile + model exists + invalid variant
   await writeProfile(join(configDir, "agents"), "opencode-invalid-variant", [
     "name: opencode-invalid-variant",
@@ -164,6 +183,7 @@ try {
   ]);
   const invalidVariantCatalog = await loadProfileCatalog(config, workspaceRoot, {
     availability: [{ name: "opencode", available: true }],
+    opencodeCatalog: knownVariantCatalog,
   });
   const variantEntry = invalidVariantCatalog.entries.find((e) => e.name === "opencode-invalid-variant");
   assert.equal(variantEntry?.state, "variant_unavailable");
@@ -182,12 +202,58 @@ try {
   ]);
   const validCatalog = await loadProfileCatalog(config, workspaceRoot, {
     availability: [{ name: "opencode", available: true }],
+    opencodeCatalog: knownVariantCatalog,
   });
   const validEntry = validCatalog.entries.find((e) => e.name === "opencode-valid");
   assert.equal(validEntry?.state, "advertised");
   assert.notEqual(validCatalog.advertised("opencode-valid"), undefined);
   assert.equal(validCatalog.blockerFor("opencode-valid"), undefined);
   assert.ok(validCatalog.profiles.some((p) => p.name === "opencode-valid"));
+
+  // A fresh injected snapshot may establish an exact model absent from the
+  // static fallback, while a removed identity remains blocked.
+  await writeProfile(join(configDir, "agents"), "opencode-live-only", [
+    "name: opencode-live-only",
+    "description: Live-only model.",
+    "provider: opencode",
+    "model: opencode/muse-spark-1.3-contributor-free",
+    "write_mode: read_only",
+  ]);
+  const liveSnapshot = {
+    entries: [{
+      providerId: "opencode",
+      modelId: "muse-spark-1.3-contributor-free",
+      fullName: "opencode/muse-spark-1.3-contributor-free",
+      variants: [],
+      variantsKnown: true,
+      status: "active",
+    }],
+    fetchedAt: new Date().toISOString(),
+    source: "sdk" as const,
+    generation: "live-muse-13",
+    version: "1.18.25",
+    freshness: "fresh" as const,
+    runtime: { version: "1.18.25", source: "sdk" as const },
+    lastSuccessAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+  };
+  const liveCatalog = await loadProfileCatalog(config, workspaceRoot, {
+    availability: [{ name: "opencode", available: true }],
+    opencodeCatalog: liveSnapshot,
+  });
+  assert.equal(liveCatalog.entries.find((e) => e.name === "opencode-live-only")?.state, "advertised");
+
+  // The same profile projection under a different live snapshot is a
+  // material execution change and must receive a different generation.
+  const liveCatalogWithNewGeneration = await loadProfileCatalog(config, workspaceRoot, {
+    availability: [{ name: "opencode", available: true }],
+    opencodeCatalog: { ...liveSnapshot, generation: "live-muse-13-refresh" },
+  });
+  assert.notEqual(liveCatalogWithNewGeneration.generation, liveCatalog.generation);
+  assert.equal(
+    computeProfileCatalogGeneration(liveCatalog.entries, "stable-snapshot"),
+    computeProfileCatalogGeneration([...liveCatalog.entries].reverse(), "stable-snapshot"),
+  );
 } finally {
   await rm(root, { recursive: true, force: true });
 }

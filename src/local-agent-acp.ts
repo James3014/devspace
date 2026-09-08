@@ -40,7 +40,7 @@ export type AcpProvider = "cursor" | "copilot" | "grok" | "cline";
 type ClineCliProviderId = "cline" | "cline-pass";
 
 function clineCliProviderId(context: LocalAgentRuntimeContext): ClineCliProviderId {
-  const value = (context as LocalAgentRuntimeContext & { cliProviderId?: ClineCliProviderId }).cliProviderId;
+  const value = context.cliProviderId;
   if (value === undefined || value === "cline") return "cline";
   if (value === "cline-pass") return value;
   throw new Error(`Unsupported Cline CLI provider '${String(value)}'.`);
