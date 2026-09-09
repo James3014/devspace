@@ -2237,18 +2237,43 @@ test("RED: POSIX backslash filename remains a valid exact directory identity", a
   }
 });
 
+test("RED: POSIX directory whose physical final component ends in a backslash remains valid", async () => {
+  if (process.platform === "win32") return;
+  const tmpRoot = realpathSync(tmpdir());
+  const workspace = join(tmpRoot, "physical-tail\\");
+  mkdirSync(workspace, { recursive: true });
+  try {
+    const ready = `model: gpt-5.6-sol medium\ndirectory: ${workspace}\nAsk Codex to do anything\n`;
+    const backend = new ScriptedDeltaBackend(
+      [{ output: ready }, { output: "" }, { output: "" }, { output: "" }],
+      { readyText: ready },
+    );
+    const manager = scriptedGoalManager(backend);
+    const started = await manager.start({
+      workspaceId: "ws_posix_trailing_backslash_component",
+      workspaceRoot: workspace,
+      goal: "accept POSIX trailing backslash component",
+    });
+    assert.equal(backend.writes.join(""), "/goal accept POSIX trailing backslash component\r");
+    assert.equal(started.goalActiveObserved, true);
+    manager.shutdown();
+  } finally {
+    try { rmSync(workspace, { recursive: true, force: true }); } catch {}
+  }
+});
+
 if (process.platform === "win32") {
   test("Windows accepts native, forward-slash, and mixed physical directory spellings", async () => {
     const tmpRoot = realpathSync(tmpdir());
     const head = join(tmpRoot, "windows-separator-head");
-    const workspace = join(head, "target");
+    const workspace = join(head, "omitted", "middle", "target");
     mkdirSync(workspace, { recursive: true });
     const nativeHead = head;
     const forwardHead = head.replaceAll("\\", "/");
     const observedPaths = [
-      `${nativeHead}\\…\\target`,
-      `${forwardHead}/…/target`,
-      `${forwardHead}/…\\target`,
+      `${nativeHead}\\…\\middle\\target`,
+      `${forwardHead}/…/middle/target`,
+      `${forwardHead}/…\\middle\\target`,
     ];
     try {
       for (const [index, observed] of observedPaths.entries()) {
@@ -2398,12 +2423,12 @@ test("RED/NEGATIVE: ellipsis path whose physical target escapes through a symlin
   const tmpRoot = realpathSync(tmpdir());
   const head = join(tmpRoot, "ellipsis-symlink-head");
   const outside = join(tmpRoot, "ellipsis-symlink-outside", "target");
-  const workspace = join(head, "target");
+  const workspace = join(head, "omitted", "middle", "target");
   mkdirSync(outside, { recursive: true });
-  mkdirSync(head, { recursive: true });
+  mkdirSync(join(head, "omitted", "middle"), { recursive: true });
   symlinkSync(outside, workspace, process.platform === "win32" ? "junction" : "dir");
   try {
-    const observed = `${head}/…/target`;
+    const observed = `${head}/…/middle/target`;
     const ready = `model: gpt-5.6-sol medium\ndirectory: ${observed}\nAsk Codex to do anything\n`;
     const backend = new ScriptedDeltaBackend([{ output: ready }, { output: "" }, { output: "" }, { output: "" }]);
     const manager = scriptedGoalManager(backend, { timeoutMs: 80 });

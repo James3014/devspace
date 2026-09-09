@@ -374,15 +374,20 @@ function completeLines(value: string, carry: string): { lines: string[]; carry: 
 }
 
 function normalizeHomeComponent(value: string): string {
+  if (process.platform === "win32") {
+    const home = homedir().replace(/[\\/]+$/, "");
+    if (value === "~") return home;
+    if (value.startsWith("~/") || value.startsWith("~\\")) {
+      return `${home}\\${value.slice(2).replace(/^[/\\]+/, "")}`;
+    }
+    return value;
+  }
+
   const home = homedir().replace(/\/+$/, "");
   if (value === "~") return home;
   if (value === "~/") return `${home}/`;
   if (value.startsWith("~/")) {
     return `${home}/${value.slice(2).replace(/^\/+/, "")}`;
-  }
-  if (value === "~\\") return `${home}\\`;
-  if (value.startsWith("~\\")) {
-    return `${home}\\${value.slice(2).replace(/^\\+/, "")}`;
   }
   return value;
 }
@@ -435,7 +440,7 @@ function realpathEqual(left: string, right: string): boolean {
   // Realpath component check: physical verification is required; unresolvable targets fail closed
   try {
     const targetReal = realpathSync(target);
-    const headDir = normalizedHead.replace(/[\\/]+$/, "");
+    const headDir = normalizedHead.replace(windowsPath ? /\\+$/ : /\/+$/, "");
     const headReal = realpathSync(headDir);
     if (!targetReal.startsWith(`${headReal}${separator}`) && targetReal !== headReal) {
       return false;
