@@ -44,6 +44,26 @@ export interface ResourceLease extends ResourceLeaseInput {
   operationState?: "active" | "finished";
 }
 
+export interface ReconciliationEvidence {
+  leaseId: string;
+  operationHandle: string;
+  operation: string;
+  baseRevision: string;
+  leaseVersion: number;
+  state: "finished" | "failed" | "not_running" | "unknown" | "running";
+  detail?: string;
+}
+
+export interface ReconciliationReceipt {
+  schema: typeof CONTROL_PLANE_SCHEMA;
+  receiptId: string;
+  leaseId: string;
+  previousVersion: number;
+  newVersion: number;
+  evidence: ReconciliationEvidence;
+  createdAt: string;
+}
+
 export function normalizeRepositoryKey(value: string): string {
   bounded(value, "repositoryKey");
   const normalized = value.trim().toLowerCase();
@@ -57,6 +77,7 @@ export type GrantEvidenceVerifier = (reference: GrantEvidenceReference, owner: T
 export interface ControlPlaneOwnershipOptions {
   resolveOwnerContext?: OwnerContextResolver;
   verifyGrantEvidence?: GrantEvidenceVerifier;
+  verifyReconciliationEvidence?: (evidence: ReconciliationEvidence, lease: ResourceLease, authority: TrustedOwnerContext) => boolean;
   now?: () => number;
   newId?: () => string;
 }
@@ -122,6 +143,15 @@ export function initializeControlPlaneOwnershipDatabase(sqlite: Database.Databas
       repository text not null, goal text not null, coordinator_thread text not null,
       evidence_hash text not null, version integer not null, updated_at text not null,
       primary key(repository, goal, coordinator_thread)
+    );
+    create table if not exists control_plane_reconciliation_receipts (
+      receipt_id text primary key,
+      lease_id text not null,
+      previous_version integer not null,
+      new_version integer not null,
+      evidence_json text not null,
+      created_at text not null,
+      foreign key (lease_id) references control_plane_resource_leases(lease_id)
     );
   `);
   const columns = sqlite.prepare("pragma table_info(control_plane_resource_leases)").all() as Array<{ name: string }>;
