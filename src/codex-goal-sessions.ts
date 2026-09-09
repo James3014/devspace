@@ -390,8 +390,11 @@ function normalizeHomeComponent(value: string): string {
 function realpathEqual(left: string, right: string): boolean {
   const leftExpanded = normalizeHomeComponent(left);
   const rightExpanded = normalizeHomeComponent(right);
-  const hasMixedSeparators = (value: string): boolean => value.includes("/") && value.includes("\\");
-  if (hasMixedSeparators(leftExpanded) || hasMixedSeparators(rightExpanded)) return false;
+  const windowsPath = process.platform === "win32";
+  const normalizeForHost = (value: string): string =>
+    windowsPath ? value.replaceAll("/", "\\") : value;
+  const observedPath = normalizeForHost(leftExpanded);
+  const target = normalizeForHost(rightExpanded);
 
   // 1. Exact match via realpathSync / normalized string comparison
   try {
@@ -401,28 +404,26 @@ function realpathEqual(left: string, right: string): boolean {
   } catch {
     // Left or right might not be a direct realpath if left is truncated
   }
-  if (leftExpanded === rightExpanded) return true;
+  if (observedPath === target) return true;
 
   // 2. Strict middle-ellipsis validation (fail closed)
   // Real Codex TUI uses Unicode ellipsis "…" for long directory paths in boxes (e.g. ~/…/.worktrees/foo)
   // It MUST be exactly one "…", situated between path component separators (HEAD/…/TAIL)
-  if (!left.includes("…")) return false;
+  if (!observedPath.includes("…")) return false;
 
-  const parts = left.split("…");
+  const parts = observedPath.split("…");
   if (parts.length !== 2) return false; // exactly one ellipsis
 
   const [rawHead, rawTail] = parts;
-  // Both head and tail must be non-empty and bounded by the same path
-  // separator. Mixed separators are ambiguous across Windows/POSIX and fail
-  // closed instead of being normalized into a different physical path.
-  const hasBackslash = leftExpanded.includes("\\");
-  const separator = hasBackslash ? "\\" : "/";
+  // Windows TUI output may use either slash spelling; normalize it above.
+  // POSIX keeps backslashes as ordinary filename characters, so it continues
+  // to require the native slash separator for an ellipsis path.
+  const separator = windowsPath ? "\\" : "/";
   if (!rawHead || !rawTail) return false;
   if (!rawHead.endsWith(separator) || !rawTail.startsWith(separator)) return false;
 
-  const headExpanded = normalizeHomeComponent(rawHead);
+  const headExpanded = normalizeForHost(normalizeHomeComponent(rawHead));
   const normalizedHead = headExpanded.endsWith(separator) ? headExpanded : `${headExpanded}${separator}`;
-  const target = rightExpanded;
 
   // Verify target starts with normalizedHead at component boundary and ends with rawTail
   if (!target.startsWith(normalizedHead)) return false;

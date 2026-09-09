@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join, sep } from "node:path";
+import { join } from "node:path";
 import test, { type TestContext } from "node:test";
 import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -2192,7 +2192,7 @@ test("Codex Goal accepts exact captured middle-ellipsis directory paths from nar
   const deepDir = join(tmpRoot, "devspace-nested-worktrees", "canary-goal-12345");
   mkdirSync(deepDir, { recursive: true });
   try {
-    const truncatedDir = `${tmpRoot}${sep}…${sep}canary-goal-12345`;
+    const truncatedDir = `${tmpRoot}/…/canary-goal-12345`;
     const ready = `model: gpt-5.6-sol medium\ndirectory: ${truncatedDir}\nAsk Codex to do anything\n`;
     const backend = new ScriptedDeltaBackend(
       [{ output: ready }, { output: "" }, { output: "" }, { output: "" }],
@@ -2211,6 +2211,67 @@ test("Codex Goal accepts exact captured middle-ellipsis directory paths from nar
     try { rmSync(join(tmpRoot, "devspace-nested-worktrees"), { recursive: true, force: true }); } catch {}
   }
 });
+
+test("RED: POSIX backslash filename remains a valid exact directory identity", async () => {
+  if (process.platform === "win32") return;
+  const tmpRoot = realpathSync(tmpdir());
+  const workspace = join(tmpRoot, "backslash\\workspace");
+  mkdirSync(workspace, { recursive: true });
+  try {
+    const ready = `model: gpt-5.6-sol medium\ndirectory: ${workspace}\nAsk Codex to do anything\n`;
+    const backend = new ScriptedDeltaBackend(
+      [{ output: ready }, { output: "" }, { output: "" }, { output: "" }],
+      { readyText: ready },
+    );
+    const manager = scriptedGoalManager(backend);
+    const started = await manager.start({
+      workspaceId: "ws_posix_backslash_filename",
+      workspaceRoot: workspace,
+      goal: "accept POSIX backslash filename",
+    });
+    assert.equal(backend.writes.join(""), "/goal accept POSIX backslash filename\r");
+    assert.equal(started.goalActiveObserved, true);
+    manager.shutdown();
+  } finally {
+    try { rmSync(workspace, { recursive: true, force: true }); } catch {}
+  }
+});
+
+if (process.platform === "win32") {
+  test("Windows accepts native, forward-slash, and mixed physical directory spellings", async () => {
+    const tmpRoot = realpathSync(tmpdir());
+    const head = join(tmpRoot, "windows-separator-head");
+    const workspace = join(head, "target");
+    mkdirSync(workspace, { recursive: true });
+    const nativeHead = head;
+    const forwardHead = head.replaceAll("\\", "/");
+    const observedPaths = [
+      `${nativeHead}\\…\\target`,
+      `${forwardHead}/…/target`,
+      `${forwardHead}/…\\target`,
+    ];
+    try {
+      for (const [index, observed] of observedPaths.entries()) {
+        const ready = `model: gpt-5.6-sol medium\ndirectory: ${observed}\nAsk Codex to do anything\n`;
+        const backend = new ScriptedDeltaBackend(
+          [{ output: ready }, { output: "" }, { output: "" }, { output: "" }],
+          { readyText: ready },
+        );
+        const manager = scriptedGoalManager(backend);
+        const started = await manager.start({
+          workspaceId: `ws_windows_separator_${index}`,
+          workspaceRoot: workspace,
+          goal: `accept Windows separator spelling ${index}`,
+        });
+        assert.equal(backend.writes.join(""), `/goal accept Windows separator spelling ${index}\r`);
+        assert.equal(started.goalActiveObserved, true);
+        manager.shutdown();
+      }
+    } finally {
+      try { rmSync(head, { recursive: true, force: true }); } catch {}
+    }
+  });
+}
 
 test("RED/NEGATIVE: ChatGPT counterexample trailing ellipsis /Workspace/… must fail closed", async () => {
   const tmpRoot = realpathSync(tmpdir());
@@ -2333,29 +2394,33 @@ test("RED/NEGATIVE: multiple ellipses must fail closed", async () => {
   manager.shutdown();
 });
 
-test("RED/NEGATIVE: mixed Windows/POSIX directory separators fail closed", async () => {
+test("RED/NEGATIVE: ellipsis path whose physical target escapes through a symlink fails closed", async () => {
   const tmpRoot = realpathSync(tmpdir());
-  const workspace = join(tmpRoot, "mixed-separator-workspace", "target");
-  mkdirSync(workspace, { recursive: true });
+  const head = join(tmpRoot, "ellipsis-symlink-head");
+  const outside = join(tmpRoot, "ellipsis-symlink-outside", "target");
+  const workspace = join(head, "target");
+  mkdirSync(outside, { recursive: true });
+  mkdirSync(head, { recursive: true });
+  symlinkSync(outside, workspace, process.platform === "win32" ? "junction" : "dir");
   try {
-    const mixedSeparator = sep === "\\" ? "/" : "\\";
-    const observed = `${tmpRoot}${mixedSeparator}…${sep}target`;
+    const observed = `${head}/…/target`;
     const ready = `model: gpt-5.6-sol medium\ndirectory: ${observed}\nAsk Codex to do anything\n`;
     const backend = new ScriptedDeltaBackend([{ output: ready }, { output: "" }, { output: "" }, { output: "" }]);
     const manager = scriptedGoalManager(backend, { timeoutMs: 80 });
     await assert.rejects(
       manager.start({
-        workspaceId: "ws_mixed_directory_separators",
+        workspaceId: "ws_ellipsis_symlink_escape",
         workspaceRoot: workspace,
         goal: "must stay blocked",
       }),
       /Codex Goal activation failed|did not resolve model and directory|produced no output/,
     );
-    assert.equal(backend.writes.join(""), "", "mixed separators must never emit /goal bytes");
+    assert.equal(backend.writes.join(""), "", "symlink escape must never emit /goal bytes");
     assert.equal(backend.terminated, true);
     manager.shutdown();
   } finally {
-    try { rmSync(join(tmpRoot, "mixed-separator-workspace"), { recursive: true, force: true }); } catch {}
+    try { rmSync(join(tmpRoot, "ellipsis-symlink-head"), { recursive: true, force: true }); } catch {}
+    try { rmSync(join(tmpRoot, "ellipsis-symlink-outside"), { recursive: true, force: true }); } catch {}
   }
 });
 
