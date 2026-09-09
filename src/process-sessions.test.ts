@@ -37,6 +37,15 @@ import {
     { PATH: "canonical", SystemRoot: "C:\\Windows" },
   );
 
+  assert.deepEqual(
+    selectSanitizedEnvironment(
+      { lc_all: "lower-locale", LC_ALL: "canonical-locale", Lc_Ctype: "canonical-ctype", LC_CTYPE: "canonical-ctype" },
+      "win32",
+    ),
+    { LC_ALL: "canonical-locale", LC_CTYPE: "canonical-ctype" },
+  );
+  assert.equal(isSanitizedEnvironmentKey("lc_all", "win32"), true);
+
   const previousSecret = process.env.OPENAI_API_KEY;
   process.env.OPENAI_API_KEY = "must-not-cross-sanitized-boundary";
   try {
@@ -139,6 +148,27 @@ const manager = new ProcessSessionManager({
 const node = process.platform === "win32"
   ? `"${process.execPath}"`
   : JSON.stringify(process.execPath);
+
+if (process.platform === "win32") {
+  const previousSecret = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = "must-not-reach-sanitized-child";
+  try {
+    const sanitizedChild = await manager.start({
+      workspaceId: "workspace-windows-native",
+      cwd: process.cwd(),
+      command: `${node} -e "const { randomBytes } = require('node:crypto'); console.log('native_child:' + randomBytes(16).toString('hex') + ':secret=' + (process.env.OPENAI_API_KEY ?? 'absent'))"`,
+      tty: true,
+      environmentPolicy: "sanitized",
+      yieldTimeMs: 10_000,
+    });
+    assert.equal(sanitizedChild.running, false);
+    assert.equal(sanitizedChild.exitCode, 0);
+    assert.match(sanitizedChild.output, /native_child:[0-9a-f]{32}:secret=absent/);
+  } finally {
+    if (previousSecret === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousSecret;
+  }
+}
 
 // G5: command replay identity survives a fresh MCP workspace session for the
 // same physical checkout, but never crosses into another physical root.
