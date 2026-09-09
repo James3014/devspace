@@ -1,7 +1,12 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { HeadTailBuffer, killPtyProcess, ProcessSessionManager } from "./process-sessions.js";
+import {
+  HeadTailBuffer,
+  killPtyProcess,
+  ProcessSessionManager,
+  resolvePtyShellInvocation,
+} from "./process-sessions.js";
 
 // Windows node-pty exposes termination as kill() without a POSIX signal;
 // signal-specific PTY termination remains required on POSIX.
@@ -12,6 +17,16 @@ import { HeadTailBuffer, killPtyProcess, ProcessSessionManager } from "./process
   assert.deepEqual(calls, [undefined]);
   killPtyProcess(pty, "SIGINT", "linux");
   assert.deepEqual(calls, [undefined, "SIGINT"]);
+}
+
+{
+  const command = `"C:\\Program Files\\Node\\node.exe" -e "console.log('windows spaces')"`;
+  const invocation = resolvePtyShellInvocation(command, "win32", { ComSpec: "C:\\Windows\\System32\\cmd.exe" });
+  assert.deepEqual(invocation.args, ["/d"]);
+  assert.equal(invocation.initialInput, `${command}\r\nexit\r\n`);
+
+  const posix = resolvePtyShellInvocation("printf 'posix'", "linux", { SHELL: "/bin/bash" });
+  assert.deepEqual(posix, { executable: "/bin/bash", args: ["-lc", "printf 'posix'"] });
 }
 
 const smallBuffer = new HeadTailBuffer(100);

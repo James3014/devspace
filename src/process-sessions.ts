@@ -88,6 +88,32 @@ interface ManagedProcess {
   resize?(columns: number, rows: number): void;
 }
 
+export interface PtyShellInvocation {
+  executable: string;
+  args: string[];
+  initialInput?: string;
+}
+
+export function resolvePtyShellInvocation(
+  command: string,
+  platform: NodeJS.Platform = process.platform,
+  environment: NodeJS.ProcessEnv = process.env,
+): PtyShellInvocation {
+  const shell = resolveShellCommand(command, platform, environment);
+  if (platform === "win32") {
+    // node-pty applies CRT quoting to every argv entry on Windows. Passing a
+    // command containing a quoted executable as the /c argument therefore
+    // escapes the quotes twice. Feed cmd interactively so the command reaches
+    // cmd.exe with its original quoting intact.
+    return {
+      executable: shell.executable,
+      args: ["/d"],
+      initialInput: `${command}\r\nexit\r\n`,
+    };
+  }
+  return shell;
+}
+
 export function killPtyProcess(
   pty: { kill(signal?: string): void },
   signal?: NodeJS.Signals,
@@ -588,6 +614,7 @@ export class ProcessSessionManager {
       workspaceRoot: input.workspaceRoot,
     });
     let pty: import("node-pty").IPty;
+    const shell = input.executable ? undefined : resolvePtyShellInvocation(input.command);
     try {
       if (input.executable) {
         pty = nodePty.spawn(input.executable, input.args ?? [], {
@@ -598,7 +625,7 @@ export class ProcessSessionManager {
           rows: session.rows,
         });
       } else {
-        const shell = resolveShellCommand(input.command);
+        if (!shell) throw new Error("Missing PTY shell invocation.");
         pty = nodePty.spawn(shell.executable, shell.args, {
           cwd: input.cwd,
           env,
@@ -620,6 +647,7 @@ export class ProcessSessionManager {
     pty.onExit(({ exitCode, signal }) => {
       this.finish(session, exitCode, signal === 0 ? undefined : String(signal));
     });
+    if (shell?.initialInput) pty.write(shell.initialInput);
   }
 
   private finish(session: ProcessSession, exitCode?: number, signal?: string): void {
