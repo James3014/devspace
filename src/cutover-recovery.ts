@@ -238,6 +238,8 @@ export async function performNativeObservedReplacementRecovery(
   options: NativeObservedReplacementOptions,
 ): Promise<NativeObservedReplacementResult> {
   if (options.ownerToken.length === 0) throw new CutoverStateError("OAuth owner token is not configured.");
+  const loopback = ["127.0.0.1", "localhost", "::1"].includes(options.serverUrl.hostname);
+  if (options.serverUrl.origin !== options.publicBaseUrl.origin && !loopback) throw new CutoverStateError("Native MCP endpoint must be the configured public origin or a loopback endpoint.");
   const fetchFn = options.fetch ?? globalThis.fetch;
   const oauth = await authorizeNativeClient(options.serverUrl, options.publicBaseUrl, options.ownerToken, fetchFn);
   const transport = new StreamableHTTPClientTransport(options.serverUrl, {
@@ -268,9 +270,13 @@ export async function performNativeObservedReplacementRecovery(
     if (before.phase === "closed") {
       const observed = before.observedReplacement?.observedIdentity;
       if (!observed || observed.serverInstanceId !== serverInstanceId || observed.sourceCommit !== sourceCommit || observed.buildId !== buildId || observed.capabilityManifestSha256 !== capabilityManifestSha256) throw new CutoverStateError("Closed replay identity does not match the authenticated replacement.");
+      const receipt = before.reconciliationReceipt;
+      if (!receipt) throw new CutoverStateError("Closed replay is missing its durable reconciliation receipt.");
       committedRecord = before;
-      return { cutover: before, newlyRecovered: false, serverInstanceId, expectedNewIdentity: { sourceCommit, buildId, capabilityManifestSha256 }, witness: { ...before.reconciliationReceipt, witnessCutoverId: options.cutoverId, witnessServerInstanceId: serverInstanceId, witnessExpectedIdentity: { sourceCommit, buildId, capabilityManifestSha256 }, witnessWorkspaceId: before.reconciliationReceipt.witnessWorkspaceId, witnessAgentId: before.reconciliationReceipt.witnessAgentId, witnessWorkspaceSessions: before.reconciliationReceipt.witnessWorkspaceSessions, witnessAgentSessions: before.reconciliationReceipt.witnessAgentSessions, witnessKind: before.reconciliationReceipt.witnessKind } };
+      return { cutover: before, newlyRecovered: false, serverInstanceId, expectedNewIdentity: { sourceCommit, buildId, capabilityManifestSha256 }, witness: { workspaceQueryable: receipt.workspaceQueryable, agentQueryable: receipt.agentQueryable, agentReconciled: receipt.agentReconciled, witnessCutoverId: options.cutoverId, witnessServerInstanceId: serverInstanceId, witnessExpectedIdentity: { sourceCommit, buildId, capabilityManifestSha256 }, witnessWorkspaceId: receipt.witnessWorkspaceId, witnessAgentId: receipt.witnessAgentId, witnessWorkspaceSessions: receipt.witnessWorkspaceSessions, witnessAgentSessions: receipt.witnessAgentSessions, witnessKind: receipt.witnessKind } };
     }
+    if (before.phase !== "prepared" || before.drainEvidence || before.restartRequest || existsSync(join(options.stateDir, "cutover", "active", "restart-requested.json")) || existsSync(join(options.stateDir, "cutover", "active", "restart-scheduled.json"))) throw new CutoverStateError("Observed recovery requires a prepared local cutover with no drain or restart evidence.");
+    if (cutover.phase !== "prepared" || cutover.drainEvidence !== undefined || cutover.restartRequest !== undefined) throw new CutoverStateError("Observed recovery requires a prepared live cutover with no drain or restart evidence.");
     const workspace = structuredResult(await client.callTool({ name: "workspace_inspect", arguments: { workspaceId: options.workspaceId } }), "workspace_inspect");
     const agentStatus = structuredResult(await client.callTool({ name: "agent_status", arguments: { workspaceId: options.workspaceId, agentId: options.agentId } }), "agent_status");
     const agent = structuredResult(await client.callTool({ name: "agent_reconcile", arguments: { workspaceId: options.workspaceId, agentId: options.agentId } }), "agent_reconcile");
@@ -310,15 +316,22 @@ export async function performNativeObservedReplacementRecovery(
       recoveredBy: options.requesterIdentity.serverInstanceId,
       witness,
     });
-    const after = store.get();
-    committedRecord = after;
-    if (!after || after.phase !== "closed" || after.observedReplacement?.observedIdentity.serverInstanceId !== serverInstanceId || after.restartRequest || after.drainEvidence) throw new NativeObservedReplacementCommittedError(after ?? before, "Native observed recovery committed but durable readback did not match; reconcile before retry.");
+    committedRecord = recovered.record;
+    let after: DurableCutoverRecord;
+    try {
+      const readback = store.get();
+      if (!readback || readback.phase !== "closed" || readback.observedReplacement?.observedIdentity.serverInstanceId !== serverInstanceId || readback.restartRequest || readback.drainEvidence) throw new Error("durable readback did not match the authenticated witness");
+      after = readback;
+    } catch (error) {
+      throw new NativeObservedReplacementCommittedError(committedRecord, `Native observed recovery committed but durable readback failed; reconcile before retry: ${error instanceof Error ? error.message : String(error)}`);
+    }
     try {
       const postStatusResult = structuredResult(await client.callTool({ name: "cutover_status", arguments: {} }), "cutover_status after commit");
       const postStatus = requiredRecordField(postStatusResult, "status", "cutover_status after commit");
       const postIdentity = requiredRecordField(postStatus, "currentServerIdentity", "cutover_status after commit");
       const postCutover = requiredRecordField(postStatus, "cutover", "cutover_status after commit");
-      if (requiredStringField(postCutover, "cutoverId", "cutover_status after commit") !== options.cutoverId || postCutover.phase !== "closed" || postIdentity.serverInstanceId !== serverInstanceId || postIdentity.sourceCommit !== sourceCommit || postIdentity.buildId !== buildId || postIdentity.capabilityManifestSha256 !== capabilityManifestSha256) throw new Error("post-commit live status does not match committed observed generation");
+      const postExpected = requiredRecordField(postCutover, "expectedNewIdentity", "cutover_status after commit");
+      if (requiredStringField(postCutover, "cutoverId", "cutover_status after commit") !== options.cutoverId || postCutover.phase !== "closed" || postIdentity.serverInstanceId !== serverInstanceId || postIdentity.sourceCommit !== sourceCommit || postIdentity.buildId !== buildId || postIdentity.capabilityManifestSha256 !== capabilityManifestSha256 || postExpected.sourceCommit !== sourceCommit || postExpected.buildId !== buildId || postExpected.capabilityManifestSha256 !== capabilityManifestSha256) throw new Error("post-commit live status does not match committed observed generation");
     } catch (error) {
       throw new NativeObservedReplacementCommittedError(after, `Native observed recovery committed locally but post-commit status failed; reconcile before retry: ${error instanceof Error ? error.message : String(error)}`);
     }
