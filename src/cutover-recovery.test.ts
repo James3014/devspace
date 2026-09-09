@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { createServer as createHttpServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { performCutoverRecovery, validateNativeOAuthMetadata } from "./cutover-recovery.js";
+import { NativeObservedReplacementCommittedError, performCutoverRecovery, performNativeObservedReplacementRecovery, validateNativeOAuthMetadata } from "./cutover-recovery.js";
 import { CutoverStateStore, type CutoverServerIdentity, type ExpectedCutoverIdentity, type DurableReconciliationWitness } from "./cutover-state.js";
 import type { BuildReadyProbeResult } from "./cutover-build-ready.js";
 
@@ -34,6 +35,60 @@ const goodProbe = (): BuildReadyProbeResult => ({
   actualBuildId: expectedTarget.buildId,
   detail: "installed build identity matches the bound recovery target",
 });
+
+type NativeFixtureOptions = {
+  status?: () => Record<string, unknown>;
+  tokenMode?: "access-only" | "both";
+  pair?: { workspaceId: string; agentId: string; root: string };
+};
+
+async function nativeHttpFixture(options: NativeFixtureOptions = {}) {
+  const pair = options.pair ?? { workspaceId: "ws-native", agentId: "agt-native", root: "/tmp/native-project" };
+  const oldIdentity: CutoverServerIdentity = { serverInstanceId: "old-native", sourceCommit: "old-source", buildId: "old-build", capabilityManifestSha256: "m".repeat(64) };
+  const expected: ExpectedCutoverIdentity = { sourceCommit: "target-source", buildId: "target-build", capabilityManifestSha256: "n".repeat(64) };
+  const current: CutoverServerIdentity = { serverInstanceId: "new-native", ...expected };
+  const statusDefault = () => ({
+    cutover: { cutoverId: "cutover-native", phase: "prepared", oldServerIdentity: oldIdentity, expectedNewIdentity: expected },
+    currentServerIdentity: current,
+    mode: "reconcile-only",
+    reconciliationRequired: true,
+  });
+  let statusReads = 0;
+  const revoked: string[] = [];
+  const server = createHttpServer(async (req, res) => {
+    const body = await new Promise<string>((resolve) => { let text = ""; req.on("data", (chunk) => { text += String(chunk); }); req.on("end", () => resolve(text)); });
+    const url = new URL(req.url ?? "/", `http://${req.headers.host}`);
+    const json = (value: unknown, status = 200, headers: Record<string, string> = {}) => { res.writeHead(status, { "content-type": "application/json", "mcp-session-id": "native-test-session", ...headers }); res.end(JSON.stringify(value)); };
+    if (req.method === "GET" && url.pathname === "/.well-known/oauth-protected-resource/mcp") return json({ resource: `http://${req.headers.host}/mcp`, authorization_servers: [`http://${req.headers.host}/`], scopes_supported: ["devspace"] });
+    if (req.method === "GET" && url.pathname === "/.well-known/oauth-authorization-server") return json({ issuer: `http://${req.headers.host}/`, authorization_endpoint: `http://${req.headers.host}/authorize`, registration_endpoint: `http://${req.headers.host}/register`, token_endpoint: `http://${req.headers.host}/token`, revocation_endpoint: `http://${req.headers.host}/revoke` });
+    if (req.method === "POST" && url.pathname === "/register") return json({ client_id: "native-test-client" }, 201);
+    if (req.method === "GET" && url.pathname === "/authorize") return json({ ok: true });
+    if (req.method === "POST" && url.pathname === "/authorize") { const form = new URLSearchParams(body); res.writeHead(302, { location: `${form.get("redirect_uri")}?code=native-code&state=${form.get("state")}` }); return res.end(); }
+    if (req.method === "POST" && url.pathname === "/token") return json(options.tokenMode === "access-only" ? { access_token: "native-access", token_type: "Bearer", scope: "devspace" } : { access_token: "native-access", refresh_token: "native-refresh", token_type: "Bearer", scope: "devspace" });
+    if (req.method === "POST" && url.pathname === "/revoke") { revoked.push(new URLSearchParams(body).get("token") ?? ""); res.writeHead(200); return res.end(); }
+    if (req.method === "POST" && url.pathname === "/mcp") {
+      const request = JSON.parse(body) as { id?: number; method?: string; params?: { name?: string } };
+      if (request.method === "initialize") return json({ jsonrpc: "2.0", id: request.id, result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "native-test", version: "1" } } });
+      if (request.method?.startsWith("notifications/")) { res.writeHead(202, { "mcp-session-id": "native-test-session" }); return res.end(); }
+      if (request.method === "tools/call") {
+        const name = request.params?.name;
+        if (name === "cutover_status") { statusReads += 1; const status = options.status?.() ?? statusDefault(); if (!options.status && statusReads >= 3) status.cutover = { ...(status.cutover as Record<string, unknown>), phase: "closed" }; return json({ jsonrpc: "2.0", id: request.id, result: { structuredContent: { status }, content: [] } }); }
+        if (name === "workspace_inspect") return json({ jsonrpc: "2.0", id: request.id, result: { structuredContent: { workspaceSessions: 1, detail: [{ unit: `workspace:${pair.workspaceId}`, session: { id: pair.workspaceId, root: pair.root } }] }, content: [] } });
+        if (name === "agent_status") return json({ jsonrpc: "2.0", id: request.id, result: { structuredContent: { agentId: pair.agentId, workspaceId: pair.workspaceId, workspaceRoot: pair.root, status: "running" }, content: [] } });
+        if (name === "agent_reconcile") return json({ jsonrpc: "2.0", id: request.id, result: { structuredContent: { agentId: pair.agentId, workspaceId: pair.workspaceId }, content: [] } });
+      }
+    }
+    json({ error: "not found" }, 404);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("fixture did not bind");
+  const base = new URL(`http://127.0.0.1:${address.port}/`);
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-native-http-state-"));
+  const store = new CutoverStateStore(stateDir, { newId: () => "cutover-native" });
+  store.begin({ oldServerIdentity: oldIdentity, expectedNewIdentity: expected });
+  return { server, base, stateDir, store, current, expected, pair, revoked, getStatusReads: () => statusReads, async close() { await new Promise<void>((resolve) => server.close(() => resolve())); rmSync(stateDir, { recursive: true, force: true }); } };
+}
 
 function makeStateDir(manifest?: string): { stateDir: string; store: CutoverStateStore } {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-seam-"));
@@ -173,6 +228,7 @@ test("native OAuth metadata rejects foreign resource, issuer, endpoint, and redi
   const publicBase = new URL("https://devspace.example.test");
   const metadata = { resource: "https://devspace.example.test/mcp", authorization_servers: ["https://devspace.example.test/"] };
   const auth = {
+    issuer: "https://devspace.example.test/",
     authorization_endpoint: "https://devspace.example.test/authorize",
     registration_endpoint: "https://devspace.example.test/register",
     token_endpoint: "https://devspace.example.test/token",
@@ -183,6 +239,62 @@ test("native OAuth metadata rejects foreign resource, issuer, endpoint, and redi
   assert.throws(() => validateNativeOAuthMetadata(metadata, { ...auth, token_endpoint: "https://foreign.example/token" }, publicBase, new URL("http://127.0.0.1:9/devspace-native-cutover")), /token_endpoint origin/i);
   assert.throws(() => validateNativeOAuthMetadata(metadata, auth, publicBase, new URL("https://foreign.example/callback")), /redirect URI/i);
   assert.throws(() => validateNativeOAuthMetadata(metadata, { ...auth, authorization_endpoint: "https://foreign.example/authorize" }, publicBase, new URL("http://127.0.0.1:9/devspace-native-cutover")), /authorization_endpoint origin/i);
+});
+
+function nativeOptions(fixture: Awaited<ReturnType<typeof nativeHttpFixture>>) {
+  return { serverUrl: new URL("/mcp", fixture.base), publicBaseUrl: fixture.base, stateDir: fixture.stateDir, cutoverId: "cutover-native", workspaceId: fixture.pair.workspaceId, agentId: fixture.pair.agentId, ownerToken: "fixture-owner", requesterIdentity: { serverInstanceId: "accepted-native", sourceCommit: "accepted-source", buildId: "accepted-build" } };
+}
+
+test("native adapter closes one exact pair through real OAuth and MCP HTTP, preserving restart markers", async () => {
+  const fixture = await nativeHttpFixture();
+  try {
+    const result = await performNativeObservedReplacementRecovery(nativeOptions(fixture));
+    assert.equal(result.cutover.phase, "closed");
+    assert.equal(result.newlyRecovered, true);
+    assert.equal(fixture.getStatusReads(), 3);
+    assert.deepEqual(fixture.revoked.sort(), ["native-access", "native-refresh"]);
+    assert.equal(existsSync(join(fixture.stateDir, "cutover", "active", "restart-requested.json")), false);
+    assert.equal(existsSync(join(fixture.stateDir, "cutover", "active", "restart-scheduled.json")), false);
+  } finally { await fixture.close(); }
+});
+
+test("native adapter supports access-only cleanup and exact closed replay, then rejects changed replay", async () => {
+  const fixture = await nativeHttpFixture({ tokenMode: "access-only" });
+  try {
+    const first = await performNativeObservedReplacementRecovery(nativeOptions(fixture));
+    assert.equal(first.newlyRecovered, true);
+    assert.deepEqual(fixture.revoked, ["native-access"]);
+    const replay = await performNativeObservedReplacementRecovery(nativeOptions(fixture));
+    assert.equal(replay.newlyRecovered, false);
+    assert.equal(replay.cutover.observedReplacement?.observedIdentity.serverInstanceId, fixture.current.serverInstanceId);
+    const changed = await nativeHttpFixture({ status: () => ({ cutover: { cutoverId: "cutover-native", phase: "closed", oldServerIdentity: { serverInstanceId: "old-native" }, expectedNewIdentity: fixture.expected }, currentServerIdentity: { ...fixture.current, serverInstanceId: "changed-native" }, mode: "normal", reconciliationRequired: false }) });
+    try { await assert.rejects(() => performNativeObservedReplacementRecovery({ ...nativeOptions(changed), stateDir: fixture.stateDir }), /Closed replay identity|generation/); } finally { await changed.close(); }
+  } finally { await fixture.close(); }
+});
+
+test("native adapter rejects pair mismatch, missing manifest, stale generation, and local store mismatch before write", async () => {
+  for (const [name, status, localMismatch] of [
+    ["pair mismatch", undefined, false],
+    ["missing manifest", () => ({ cutover: { cutoverId: "cutover-native", phase: "prepared", oldServerIdentity: { serverInstanceId: "old-native" }, expectedNewIdentity: { sourceCommit: "target-source", buildId: "target-build" } }, currentServerIdentity: { ...({ serverInstanceId: "new-native", sourceCommit: "target-source", buildId: "target-build" }) }, mode: "reconcile-only", reconciliationRequired: true }), false],
+    ["local store mismatch", undefined, true],
+  ] as const) {
+    const fixture = await nativeHttpFixture({ ...(name === "pair mismatch" ? { pair: { workspaceId: "ws-native", agentId: "agt-native", root: "/tmp/native-project" } } : {}), ...(status ? { status } : {}) });
+    try {
+      const options = nativeOptions(fixture);
+      if (name === "pair mismatch") options.agentId = "wrong-agent";
+      if (localMismatch) options.cutoverId = "wrong-cutover";
+      await assert.rejects(() => performNativeObservedReplacementRecovery(options));
+      assert.equal(fixture.store.get()?.phase, "prepared", name);
+    } finally { await fixture.close(); }
+  }
+});
+
+test("native adapter reports committed outcome when post-commit live readback fails", async () => {
+  let reads = 0;
+  const fixture = await nativeHttpFixture({ status: () => { reads += 1; if (reads >= 3) return { cutover: { cutoverId: "cutover-native", phase: "prepared", oldServerIdentity: { serverInstanceId: "old-native" }, expectedNewIdentity: fixtureExpected }, currentServerIdentity: fixtureCurrent, mode: "reconcile-only", reconciliationRequired: true }; return { cutover: { cutoverId: "cutover-native", phase: "prepared", oldServerIdentity: { serverInstanceId: "old-native" }, expectedNewIdentity: fixtureExpected }, currentServerIdentity: fixtureCurrent, mode: "reconcile-only", reconciliationRequired: true }; } });
+  const fixtureExpected = { sourceCommit: "target-source", buildId: "target-build", capabilityManifestSha256: "n".repeat(64) };
+  const fixtureCurrent = { serverInstanceId: "new-native", ...fixtureExpected };
+  try { await assert.rejects(() => performNativeObservedReplacementRecovery(nativeOptions(fixture)), NativeObservedReplacementCommittedError); assert.equal(fixture.store.get()?.phase, "closed"); } finally { await fixture.close(); }
 });
 
 test("seam accepts an operator build-ready attestation when no probe root is configured", () => {

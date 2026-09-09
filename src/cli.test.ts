@@ -30,6 +30,19 @@ for (const flag of ["-v", "--version"]) {
   assert.equal(output, packageJson.version);
 }
 
+for (const args of [
+  ["cutover", "observe", "--cutover-id", "c", "--workspace-id", "w"],
+  ["cutover", "observe", "--cutover-id", "c", "--workspace-id", "w", "--agent-id", "a", "--server-url", "https://foreign.invalid/mcp"],
+]) {
+  assert.throws(
+    () => execFileSync("node", ["--import", "tsx", "src/cli.ts", ...args], { encoding: "utf8", env: { ...process.env, DEVSPACE_CONFIG_DIR: "/tmp/devspace-cli-invalid-binding-test" } }),
+    (error: unknown) => {
+      const detail = error as { stderr?: string; status?: number };
+      return detail.status !== 0 && /Usage:|Unknown cutover observe flag/.test(detail.stderr ?? "");
+    },
+  );
+}
+
 const root = mkdtempSync(join(tmpdir(), "devspace-cli-agents-test-"));
 try {
   const configDir = join(root, ".devspace");

@@ -1,5 +1,5 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { loadConfig } from "./config.js";
@@ -131,6 +131,7 @@ export function validateNativeOAuthMetadata(
   if (!Array.isArray(servers) || typeof servers[0] !== "string") throw new CutoverStateError("OAuth resource metadata has no authorization server.");
   const issuer = new URL(servers[0]);
   if (issuer.origin !== publicBaseUrl.origin) throw new CutoverStateError("OAuth issuer origin is not the configured public origin.");
+  if (authorizationMetadata.issuer !== issuer.href) throw new CutoverStateError("OAuth authorization metadata issuer does not match the protected-resource issuer.");
   for (const field of ["authorization_endpoint", "registration_endpoint", "token_endpoint", "revocation_endpoint"]) {
     const endpoint = new URL(requiredStringField(authorizationMetadata, field, "OAuth authorization metadata"));
     if (endpoint.origin !== publicBaseUrl.origin) throw new CutoverStateError(`OAuth ${field} origin is not the configured public origin.`);
@@ -182,6 +183,7 @@ async function authorizeNativeClient(
   };
   const registration = await fetchFn(endpoint("registration_endpoint"), {
     method: "POST",
+    redirect: "manual",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(clientMetadata),
   });
@@ -214,7 +216,7 @@ async function authorizeNativeClient(
   const code = callback.searchParams.get("code");
   if (!code || callback.searchParams.get("state") !== state) throw new CutoverStateError("OAuth authorization response has no valid code/state.");
   const token = await fetchFn(endpoint("token_endpoint"), {
-    method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
+    method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ grant_type: "authorization_code", client_id: clientId, redirect_uri: redirectUri, code, code_verifier: verifier, resource: metadataBinding.resource.href }),
   });
   if (!token.ok) throw new CutoverStateError(`OAuth token exchange failed: HTTP ${token.status}.`);
@@ -243,6 +245,7 @@ export async function performNativeObservedReplacementRecovery(
   });
   const client = new Client({ name: "devspace-native-cutover", version: "1.0.0" });
   let operationError: unknown;
+  let committedRecord: DurableCutoverRecord | undefined;
   try {
     await client.connect(transport);
     const statusResult = structuredResult(await client.callTool({ name: "cutover_status", arguments: {} }), "cutover_status");
@@ -250,7 +253,7 @@ export async function performNativeObservedReplacementRecovery(
     const current = requiredRecordField(status, "currentServerIdentity", "cutover_status");
     const cutover = requiredRecordField(status, "cutover", "cutover_status");
     if (requiredStringField(cutover, "cutoverId", "cutover_status") !== options.cutoverId) throw new CutoverStateError("Live cutover id does not match the requested cutover.");
-    if (cutover.phase !== "prepared" || cutover.drainEvidence !== undefined) throw new CutoverStateError("Observed recovery requires a prepared cutover without drain evidence.");
+    if (cutover.phase !== "closed" && (cutover.phase !== "prepared" || cutover.drainEvidence !== undefined)) throw new CutoverStateError("Observed recovery requires a prepared cutover without drain evidence.");
     const serverInstanceId = requiredStringField(current, "serverInstanceId", "cutover_status");
     const sourceCommit = requiredStringField(current, "sourceCommit", "cutover_status");
     const buildId = requiredStringField(current, "buildId", "cutover_status");
@@ -266,8 +269,10 @@ export async function performNativeObservedReplacementRecovery(
       const session = item.session;
       return item.unit === `workspace:${options.workspaceId}` && !!session && typeof session === "object" && (session as JsonRecord).id === options.workspaceId && typeof (session as JsonRecord).root === "string";
     });
-    if (workspaceSessions < 1 || !matchingWorkspace) throw new CutoverStateError("workspace_inspect did not prove the requested durable workspace identity and root.");
-    if (requiredStringField(agent, "agentId", "agent_reconcile") !== options.agentId || requiredStringField(agentStatus, "agentId", "agent_status") !== options.agentId || requiredStringField(agentStatus, "workspaceId", "agent_status") !== options.workspaceId) throw new CutoverStateError("Live agent identity or workspace binding drifted during reconciliation.");
+    const selectedSession = details.find((entry) => entry && typeof entry === "object" && (entry as JsonRecord).unit === `workspace:${options.workspaceId}`) as JsonRecord | undefined;
+    const selectedRoot = selectedSession && (selectedSession.session as JsonRecord | undefined)?.root;
+    if (workspaceSessions < 1 || !matchingWorkspace || typeof selectedRoot !== "string") throw new CutoverStateError("workspace_inspect did not prove the requested durable workspace identity and root.");
+    if (requiredStringField(agent, "agentId", "agent_reconcile") !== options.agentId || requiredStringField(agent, "workspaceId", "agent_reconcile") !== options.workspaceId || requiredStringField(agentStatus, "agentId", "agent_status") !== options.agentId || requiredStringField(agentStatus, "workspaceId", "agent_status") !== options.workspaceId || requiredStringField(agentStatus, "workspaceRoot", "agent_status") !== selectedRoot) throw new CutoverStateError("Live agent identity or workspace binding drifted during reconciliation.");
     const witness: DurableReconciliationWitness = {
       witnessCutoverId: options.cutoverId, witnessServerInstanceId: serverInstanceId,
       witnessExpectedIdentity: { sourceCommit, buildId, capabilityManifestSha256 },
@@ -281,6 +286,8 @@ export async function performNativeObservedReplacementRecovery(
     if (!active || active.cutoverId !== options.cutoverId) throw new CutoverStateError("Local durable cutover record does not match live cutover.");
     const before = store.get();
     if (!before || before.cutoverId !== options.cutoverId) throw new CutoverStateError("Local cutover state changed before observed recovery.");
+    const activeDir = join(options.stateDir, "cutover", "active");
+    if (existsSync(join(activeDir, "restart-requested.json")) || existsSync(join(activeDir, "restart-scheduled.json"))) throw new CutoverStateError("Observed recovery refuses existing restart markers.");
     const liveExpected = requiredRecordField(cutover, "expectedNewIdentity", "cutover_status");
     const liveOld = requiredRecordField(cutover, "oldServerIdentity", "cutover_status");
     if (before.expectedNewIdentity.sourceCommit !== sourceCommit || before.expectedNewIdentity.buildId !== buildId || before.expectedNewIdentity.capabilityManifestSha256 !== capabilityManifestSha256 || liveExpected.sourceCommit !== sourceCommit || liveExpected.buildId !== buildId || liveExpected.capabilityManifestSha256 !== capabilityManifestSha256 || liveOld.serverInstanceId !== before.oldServerIdentity.serverInstanceId) throw new CutoverStateError("Local and live cutover generation bindings do not agree.");
@@ -294,7 +301,7 @@ export async function performNativeObservedReplacementRecovery(
     const commitStatus = requiredRecordField(commitStatusResult, "status", "cutover_status before commit");
     const commitIdentity = requiredRecordField(commitStatus, "currentServerIdentity", "cutover_status before commit");
     const commitCutover = requiredRecordField(commitStatus, "cutover", "cutover_status before commit");
-    if (commitIdentity.serverInstanceId !== serverInstanceId || commitIdentity.sourceCommit !== sourceCommit || commitIdentity.buildId !== buildId || commitIdentity.capabilityManifestSha256 !== capabilityManifestSha256 || commitCutover.phase !== "prepared") throw new CutoverStateError("Live generation drifted before durable observed recovery.");
+    if (requiredStringField(commitCutover, "cutoverId", "cutover_status before commit") !== options.cutoverId || commitIdentity.serverInstanceId !== serverInstanceId || commitIdentity.sourceCommit !== sourceCommit || commitIdentity.buildId !== buildId || commitIdentity.capabilityManifestSha256 !== capabilityManifestSha256 || commitCutover.phase !== "prepared") throw new CutoverStateError("Live generation drifted before durable observed recovery.");
     const recovered = store.recoverObservedReplacement({
       cutoverId: options.cutoverId,
       expectedNewIdentity: { sourceCommit, buildId, capabilityManifestSha256 },
@@ -303,10 +310,17 @@ export async function performNativeObservedReplacementRecovery(
       witness,
     });
     const after = store.get();
-    if (!after || after.phase !== "closed" || after.observedReplacement?.observedIdentity.serverInstanceId !== serverInstanceId || after.restartRequest || after.drainEvidence) throw new CutoverStateError("Local observed recovery readback did not match the authenticated witness.");
-    const postStatusResult = structuredResult(await client.callTool({ name: "cutover_status", arguments: {} }), "cutover_status after commit");
-    const postStatus = requiredRecordField(postStatusResult, "status", "cutover_status after commit");
-    if (requiredRecordField(postStatus, "cutover", "cutover_status after commit").phase !== "closed") throw new NativeObservedReplacementCommittedError(after, "Native observed recovery committed locally but post-commit status is not closed; reconcile before retry.");
+    committedRecord = after;
+    if (!after || after.phase !== "closed" || after.observedReplacement?.observedIdentity.serverInstanceId !== serverInstanceId || after.restartRequest || after.drainEvidence) throw new NativeObservedReplacementCommittedError(after ?? before, "Native observed recovery committed but durable readback did not match; reconcile before retry.");
+    try {
+      const postStatusResult = structuredResult(await client.callTool({ name: "cutover_status", arguments: {} }), "cutover_status after commit");
+      const postStatus = requiredRecordField(postStatusResult, "status", "cutover_status after commit");
+      const postIdentity = requiredRecordField(postStatus, "currentServerIdentity", "cutover_status after commit");
+      const postCutover = requiredRecordField(postStatus, "cutover", "cutover_status after commit");
+      if (requiredStringField(postCutover, "cutoverId", "cutover_status after commit") !== options.cutoverId || postCutover.phase !== "closed" || postIdentity.serverInstanceId !== serverInstanceId || postIdentity.sourceCommit !== sourceCommit || postIdentity.buildId !== buildId || postIdentity.capabilityManifestSha256 !== capabilityManifestSha256) throw new Error("post-commit live status does not match committed observed generation");
+    } catch (error) {
+      throw new NativeObservedReplacementCommittedError(after, `Native observed recovery committed locally but post-commit status failed; reconcile before retry: ${error instanceof Error ? error.message : String(error)}`);
+    }
     return { cutover: after, newlyRecovered: recovered.newlyRecovered, serverInstanceId, expectedNewIdentity: { sourceCommit, buildId, capabilityManifestSha256 }, witness };
   } catch (error) {
     operationError = error;
@@ -321,7 +335,10 @@ export async function performNativeObservedReplacementRecovery(
         if (!response.ok || response.status >= 300) revocationErrors.push(`${kind}:HTTP ${response.status}`);
       } catch (error) { revocationErrors.push(`${kind}:${error instanceof Error ? error.message : String(error)}`); }
     }
-    if (revocationErrors.length > 0 && !operationError) throw new CutoverStateError(`OAuth token revocation failed: ${revocationErrors.join(",")}.`);
+    if (revocationErrors.length > 0 && !operationError) {
+      if (committedRecord) throw new NativeObservedReplacementCommittedError(committedRecord, `OAuth token revocation failed after commit; reconcile before retry: ${revocationErrors.join(",")}.`);
+      throw new CutoverStateError(`OAuth token revocation failed: ${revocationErrors.join(",")}.`);
+    }
   }
 }
 
