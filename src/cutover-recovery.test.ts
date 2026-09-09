@@ -265,6 +265,7 @@ test("native adapter supports access-only cleanup and exact closed replay, then 
     const first = await performNativeObservedReplacementRecovery(nativeOptions(fixture));
     assert.equal(first.newlyRecovered, true);
     assert.deepEqual(fixture.revoked, ["native-access"]);
+    assert.equal(new CutoverStateStore(fixture.stateDir).get()?.phase, "closed", "durable reopen must preserve the committed receipt");
     const replay = await performNativeObservedReplacementRecovery(nativeOptions(fixture));
     assert.equal(replay.newlyRecovered, false);
     assert.equal(replay.cutover.observedReplacement?.observedIdentity.serverInstanceId, fixture.current.serverInstanceId);
