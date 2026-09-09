@@ -698,12 +698,13 @@ try {
     workspaceId: "ws_g2",
     sessionId: retainedOutput.sessionId!,
     chars: "",
-    // Windows node-pty waits up to FLUSH_DATA_INTERVAL (1s) after the
-    // process exit before reporting the PTY as closed; allow one bounded
-    // poll to observe the actual terminal state.
-    yieldTimeMs: 1_500,
+    // Windows node-pty waits up to FLUSH_DATA_INTERVAL (1s) after process
+    // exit before reporting the PTY as closed; allow one bounded 1.5s poll
+    // there while preserving the original 500ms POSIX timing.
+    yieldTimeMs: process.platform === "win32" ? 1_500 : 500,
   });
   assert.equal(polledOutput.running, false);
+  assert.equal(polledOutput.exitCode, 0);
   assert.match(`${retainedOutput.output}${polledOutput.output}`, /later/);
 } finally {
   g2Manager.shutdown();
