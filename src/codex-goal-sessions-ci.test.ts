@@ -13,6 +13,22 @@ if (process.platform !== "win32") {
   const originalWriteFileSync = fsModule.writeFileSync;
   const originalJoin = pathModule.join;
   const originalStart = ProcessSessionManager.prototype.start;
+  const originalProcessKill = process.kill;
+  const uncaughtExceptionMonitor = (error: Error, origin: string) => {
+    console.error("[codex-goal-ci-diagnostic] uncaughtExceptionMonitor", { pid: process.pid, origin, error: error.stack ?? error.message });
+  };
+  const exitObserver = (code: number) => {
+    console.error("[codex-goal-ci-diagnostic] exit", { pid: process.pid, code });
+  };
+  console.error("[codex-goal-ci-diagnostic] parent", { pid: process.pid, parentPid: process.ppid });
+  process.on("uncaughtExceptionMonitor", uncaughtExceptionMonitor);
+  process.on("exit", exitObserver);
+  (process as any).kill = ((targetPid: number, signal?: NodeJS.Signals | number) => {
+    console.error("[codex-goal-ci-diagnostic] process.kill", { selfPid: process.pid, targetPid, signal });
+    return signal === undefined
+      ? originalProcessKill.call(process, targetPid)
+      : originalProcessKill.call(process, targetPid, signal);
+  }) as typeof process.kill;
 
   // The upstream fixture is an extensionless shebang script. Windows ConPTY
   // requires a native executable, so retain the same JS fake TUI as a sidecar
@@ -68,6 +84,9 @@ if (process.platform !== "win32") {
     ProcessSessionManager.prototype.start = originalStart;
     fsModule.writeFileSync = originalWriteFileSync;
     pathModule.join = originalJoin;
+    (process as any).kill = originalProcessKill;
+    process.removeListener("uncaughtExceptionMonitor", uncaughtExceptionMonitor);
+    process.removeListener("exit", exitObserver);
     syncBuiltinESMExports();
     if (createdEchoFixture) rmSync(echoFixture, { force: true });
     if (createdEchoDir) rmSync(echoFixtureDir, { recursive: true, force: true });
