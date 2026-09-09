@@ -1,7 +1,8 @@
 import { after } from "node:test";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { createRequire, syncBuiltinESMExports } from "node:module";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { closeSync, existsSync, fsyncSync, mkdirSync, mkdtempSync, openSync, rmSync, writeSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { ProcessSessionManager } from "./process-sessions.js";
 
 if (process.platform !== "win32") {
@@ -18,6 +19,75 @@ if (process.platform !== "win32") {
   const originalTerminate = ProcessSessionManager.prototype.terminate;
   const originalShutdown = ProcessSessionManager.prototype.shutdown;
   const originalProcessKill = process.kill;
+  const fsyncProbeDir = mkdtempSync(join(tmpdir(), "devspace-windows-dir-fsync-"));
+  const fsyncProbeFile = join(fsyncProbeDir, "probe-file");
+  const probeDirectory = () => {
+    for (const flags of ["r", "r+"] as const) {
+      let descriptor: number | undefined;
+      let result = "ok";
+      let errorCode: string | undefined;
+      try {
+        descriptor = openSync(fsyncProbeDir, flags);
+      } catch (error) {
+        result = "open-error";
+        errorCode = (error as NodeJS.ErrnoException).code;
+      }
+      if (descriptor !== undefined) {
+        try {
+          fsyncSync(descriptor);
+        } catch (error) {
+          result = "fsync-error";
+          errorCode = (error as NodeJS.ErrnoException).code;
+        } finally {
+          try {
+            closeSync(descriptor);
+          } catch (error) {
+            if (result === "ok") {
+              result = "close-error";
+              errorCode = (error as NodeJS.ErrnoException).code;
+            }
+          }
+        }
+      }
+      console.error(
+        `[windows-directory-fsync] flags=${flags} result=${result}${errorCode ? ` errorCode=${errorCode}` : ""}`,
+      );
+    }
+  };
+  try {
+    console.error(`[windows-directory-fsync] runtime=node${process.version} uv=${process.versions.uv}`);
+    probeDirectory();
+    let descriptor: number | undefined;
+    let result = "ok";
+    let errorCode: string | undefined;
+    try {
+      descriptor = openSync(fsyncProbeFile, "wx");
+      writeSync(descriptor, "probe\n");
+      fsyncSync(descriptor);
+    } catch (error) {
+      result = "file-error";
+      errorCode = (error as NodeJS.ErrnoException).code;
+    } finally {
+      if (descriptor !== undefined) {
+        try {
+          closeSync(descriptor);
+        } catch (error) {
+          if (result === "ok") {
+            result = "file-close-error";
+            errorCode = (error as NodeJS.ErrnoException).code;
+          }
+        }
+      }
+    }
+    console.error(
+      `[windows-directory-fsync] flags=wx result=${result}${errorCode ? ` errorCode=${errorCode}` : ""}`,
+    );
+    rmSync(fsyncProbeFile, { force: true });
+    probeDirectory();
+  } finally {
+    rmSync(fsyncProbeFile, { force: true });
+    rmSync(fsyncProbeDir, { force: true });
+  }
   const uncaughtExceptionMonitor = (error: Error, origin: string) => {
     console.error("[codex-goal-ci-diagnostic] uncaughtExceptionMonitor", { pid: process.pid, origin, error: error.stack ?? error.message });
   };
