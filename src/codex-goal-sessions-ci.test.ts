@@ -119,8 +119,6 @@ if (process.platform !== "win32") {
     pathModule.join = originalJoin;
     childProcessModule.fork = originalFork;
     (process as any).kill = originalProcessKill;
-    process.removeListener("uncaughtExceptionMonitor", uncaughtExceptionMonitor);
-    process.removeListener("exit", exitObserver);
     syncBuiltinESMExports();
     if (createdEchoFixture) rmSync(echoFixture, { force: true });
     if (createdEchoDir) rmSync(echoFixtureDir, { recursive: true, force: true });
