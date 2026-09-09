@@ -22,7 +22,6 @@ export const CUTOVER_OBSERVED_REPLACEMENT_SCHEMA = "devspace.cutover_observed_re
 export const CUTOVER_SUPERSEDED_REASON = "STALE_TARGET_SUPERSEDED" as const;
 export const CUTOVER_OBSERVED_REPLACEMENT_REASON = "OBSERVED_REPLACEMENT_WITHOUT_DRAIN" as const;
 
-
 /**
  * A stale unresolved cutover cannot be retried, replaced, or deleted. It can
  * only be closed as a terminal supersession that establishes one successor
@@ -691,9 +690,10 @@ export class CutoverStateStore {
    * - Never alters phase to "drained".
    * - Never creates a successor cutover.
    * - Never schedules or requests a restart.
+   * - Does not read or write the stale-target supersession recovery intent.
    * - Requires fully positive reconciliation witness (workspaceQueryable, agentQueryable, agentReconciled).
    * - Idempotent rendezvous if already closed via this exact recovery.
-   * - Fail closed on wrong cutoverId, wrong identity, or changed recovery binding.
+   * - Fail closed on wrong cutoverId or wrong active/observed identity.
    */
   recoverObservedReplacement(input: {
     cutoverId: string;
@@ -721,12 +721,6 @@ export class CutoverStateStore {
         throw new CutoverStateError(
           "[RECOVERY_BINDING_MISMATCH] Recovery expected identity does not match active cutover expected identity.",
         );
-      }
-      if (existsSync(this.recoveryIntentPath)) {
-        this.assertRecoveryBinding({
-          cutoverId: input.cutoverId,
-          expectedNewIdentity: input.expectedNewIdentity,
-        });
       }
     }
 
@@ -790,14 +784,6 @@ export class CutoverStateStore {
       );
     }
 
-    if (input.expectedNewIdentity) {
-      this.writeRecoveryIntent({
-        cutoverId: input.cutoverId,
-        expectedNewIdentity: input.expectedNewIdentity,
-        recoveredBy: input.recoveredBy,
-      });
-    }
-
     const nowIso = new Date(this.now()).toISOString();
     const reconciliationReceipt: CutoverReconciliationReceipt = {
       closedByServerInstanceId: input.observedIdentity.serverInstanceId,
@@ -835,7 +821,7 @@ export class CutoverStateStore {
     const closedRecord: DurableCutoverRecord = {
       ...withoutDiagnostic(active),
       phase: "closed",
-      drainEvidence: undefined, // Explicitly keep absent! No fabricated drain!
+      drainEvidence: undefined,
       reconciliationReceipt,
       observedReplacement,
       updatedAt: nowIso,
@@ -924,7 +910,6 @@ function isObservedReplacementReceipt(value: unknown): value is CutoverObservedR
     isReconciliationReceipt(receipt.reconciliationReceipt),
   );
 }
-
 
 function isSupersessionReceipt(value: unknown): value is CutoverSupersessionReceipt {
   const receipt = value as Partial<CutoverSupersessionReceipt> | undefined;
