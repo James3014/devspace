@@ -476,6 +476,39 @@ test("native adapter rejects precommit drain and restart state drift", async () 
   }
 });
 
+test("native adapter rejects native precommit drain or restart fields added by live status", async () => {
+  for (const field of ["drainEvidence", "restartRequest"] as const) {
+    let statusReads = 0;
+    const fixture = await nativeHttpFixture({
+      status: () => {
+        statusReads += 1;
+        const durable = fixture.store.get();
+        if (!durable) throw new Error("fixture durable state missing");
+        return {
+          cutover: {
+            ...durable,
+            ...(statusReads === 2
+              ? field === "drainEvidence"
+                ? { drainEvidence: { activeSessions: 1, oldestAgeMs: 1 } }
+                : { restartRequest: { actuator: "launchd-self", requestedByServerInstanceId: "live-drift", requestedAt: new Date().toISOString() } }
+              : {}),
+          },
+          currentServerIdentity: fixture.current,
+          mode: "reconcile-only",
+          reconciliationRequired: true,
+        };
+      },
+    });
+    const createdPath = join(fixture.stateDir, "cutover", "active", "created.json");
+    const beforeBytes = readFileSync(createdPath);
+    try {
+      await assert.rejects(() => performNativeObservedReplacementRecovery(nativeOptions(fixture)), /drain|restart|generation|state/i);
+      assert.deepEqual(readFileSync(createdPath), beforeBytes, field + " live drift must not mutate local durable state");
+      assert.equal(fixture.store.get()?.phase, "prepared");
+    } finally { await fixture.close(); }
+  }
+});
+
 test("native adapter reports committed outcome when post-commit live readback fails", async () => {
   let reads = 0;
   const fixtureExpected = { sourceCommit: "target-source", buildId: "target-build", capabilityManifestSha256: "n".repeat(64) };
