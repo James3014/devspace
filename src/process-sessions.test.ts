@@ -51,8 +51,8 @@ import {
   const previousCanonicalLocale = process.env.LC_ALL;
   try {
     Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
-    process.env.lC_aLl = "mixedcase-locale";
     delete process.env.LC_ALL;
+    process.env.lC_aLl = "mixedcase-locale";
     const mixedLocaleEnvironment = processEnvironment("sanitized");
     assert.equal(mixedLocaleEnvironment.LC_ALL, "mixedcase-locale");
     assert.equal(mixedLocaleEnvironment.lC_aLl, undefined);
