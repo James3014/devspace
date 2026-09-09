@@ -119,10 +119,43 @@ function defaultSdkPackagePath(env: NodeJS.ProcessEnv, moduleUrl: string): strin
   return resolveSelfInstalledSdkPackagePath(moduleUrl);
 }
 
+function windowsNativeExecutableCandidates(sdkPackagePath: string): string[] {
+  const dependencyRoot = dirname(dirname(dirname(dirname(sdkPackagePath))));
+  const architecture = process.arch === "x64"
+    ? { packageName: "codex-win32-x64", target: "x86_64-pc-windows-msvc" }
+    : process.arch === "arm64"
+      ? { packageName: "codex-win32-arm64", target: "aarch64-pc-windows-msvc" }
+      : undefined;
+  if (!architecture) return [];
+  const platformPackage = join(dependencyRoot, "node_modules", "@openai", architecture.packageName);
+  return [
+    join(platformPackage, "codex.exe"),
+    join(platformPackage, "bin", "codex.exe"),
+    join(dependencyRoot, "vendor", architecture.target, "bin", "codex.exe"),
+  ];
+}
+
 function defaultExecutable(sdkPackagePath: string | undefined, env: NodeJS.ProcessEnv): string | undefined {
   const override = env.DEVSPACE_CODEX_EXECUTABLE?.trim();
   if (override) return override;
   if (!sdkPackagePath) return undefined;
+  if (process.platform === "win32") {
+    const dependencyRoot = dirname(dirname(dirname(dirname(sdkPackagePath))));
+    const architecture = process.arch === "x64"
+      ? { packageName: "codex-win32-x64", target: "x86_64-pc-windows-msvc" }
+      : process.arch === "arm64"
+        ? { packageName: "codex-win32-arm64", target: "aarch64-pc-windows-msvc" }
+        : undefined;
+    if (!architecture) return undefined;
+    const platformPackage = join(dependencyRoot, "node_modules", "@openai", architecture.packageName);
+    if (existsSync(platformPackage)) {
+      return windowsNativeExecutableCandidates(sdkPackagePath).slice(0, 2).find(existsSync);
+    }
+    const vendorRoot = join(dependencyRoot, "vendor", architecture.target);
+    if (existsSync(vendorRoot)) {
+      return join(vendorRoot, "bin", "codex.exe");
+    }
+  }
   return join(dirname(sdkPackagePath), "..", "codex", "bin", "codex.js");
 }
 
