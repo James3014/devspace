@@ -83,6 +83,12 @@ export interface NativeObservedReplacementResult {
   witness: DurableReconciliationWitness;
 }
 
+export class NativeObservedReplacementCommittedError extends CutoverStateError {
+  constructor(readonly committedRecord: DurableCutoverRecord, message: string) {
+    super(message);
+  }
+}
+
 type JsonRecord = Record<string, unknown>;
 
 function asRecord(value: unknown, label: string): JsonRecord {
@@ -144,6 +150,7 @@ interface MemoryOAuthProvider {
     token_endpoint_auth_method: "none";
   };
   readonly clientId: string;
+  readonly revocationEndpoint: URL;
   readonly tokens: { access_token: string; token_type: string; refresh_token?: string; scope?: string };
 }
 
@@ -186,7 +193,7 @@ async function authorizeNativeClient(
   const state = randomUUID();
   const params = new URLSearchParams({
     response_type: "code", client_id: clientId, redirect_uri: redirectUri,
-    code_challenge: challenge, code_challenge_method: "S256", scope: "devspace offline_access",
+    code_challenge: challenge, code_challenge_method: "S256", scope: "devspace",
     resource: metadataBinding.resource.href, state,
   });
   const authorizationUrl = new URL(endpoint("authorization_endpoint"));
@@ -214,7 +221,7 @@ async function authorizeNativeClient(
   const tokenBody = asRecord(await token.json(), "OAuth token response");
   const accessToken = requiredStringField(tokenBody, "access_token", "OAuth token response");
   return {
-    clientMetadata, clientId,
+    clientMetadata, clientId, revocationEndpoint: new URL(endpoint("revocation_endpoint")),
     tokens: { access_token: accessToken, token_type: typeof tokenBody.token_type === "string" ? tokenBody.token_type : "Bearer", ...(typeof tokenBody.refresh_token === "string" ? { refresh_token: tokenBody.refresh_token } : {}), ...(typeof tokenBody.scope === "string" ? { scope: tokenBody.scope } : {}) },
   };
 }
@@ -273,7 +280,21 @@ export async function performNativeObservedReplacementRecovery(
     const active = store.get();
     if (!active || active.cutoverId !== options.cutoverId) throw new CutoverStateError("Local durable cutover record does not match live cutover.");
     const before = store.get();
-    if (!before || before.cutoverId !== options.cutoverId || before.phase !== "prepared" || before.restartRequest || before.drainEvidence) throw new CutoverStateError("Local cutover state changed before observed recovery.");
+    if (!before || before.cutoverId !== options.cutoverId) throw new CutoverStateError("Local cutover state changed before observed recovery.");
+    const liveExpected = requiredRecordField(cutover, "expectedNewIdentity", "cutover_status");
+    const liveOld = requiredRecordField(cutover, "oldServerIdentity", "cutover_status");
+    if (before.expectedNewIdentity.sourceCommit !== sourceCommit || before.expectedNewIdentity.buildId !== buildId || before.expectedNewIdentity.capabilityManifestSha256 !== capabilityManifestSha256 || liveExpected.sourceCommit !== sourceCommit || liveExpected.buildId !== buildId || liveExpected.capabilityManifestSha256 !== capabilityManifestSha256 || liveOld.serverInstanceId !== before.oldServerIdentity.serverInstanceId) throw new CutoverStateError("Local and live cutover generation bindings do not agree.");
+    if (before.phase === "closed") {
+      const observed = before.observedReplacement?.observedIdentity;
+      if (!observed || observed.serverInstanceId !== serverInstanceId || observed.sourceCommit !== sourceCommit || observed.buildId !== buildId || observed.capabilityManifestSha256 !== capabilityManifestSha256) throw new CutoverStateError("Closed replay identity does not match the authenticated replacement.");
+      return { cutover: before, newlyRecovered: false, serverInstanceId, expectedNewIdentity: { sourceCommit, buildId, capabilityManifestSha256 }, witness };
+    }
+    if (before.phase !== "prepared" || before.restartRequest || before.drainEvidence) throw new CutoverStateError("Local cutover state changed before observed recovery.");
+    const commitStatusResult = structuredResult(await client.callTool({ name: "cutover_status", arguments: {} }), "cutover_status before commit");
+    const commitStatus = requiredRecordField(commitStatusResult, "status", "cutover_status before commit");
+    const commitIdentity = requiredRecordField(commitStatus, "currentServerIdentity", "cutover_status before commit");
+    const commitCutover = requiredRecordField(commitStatus, "cutover", "cutover_status before commit");
+    if (commitIdentity.serverInstanceId !== serverInstanceId || commitIdentity.sourceCommit !== sourceCommit || commitIdentity.buildId !== buildId || commitIdentity.capabilityManifestSha256 !== capabilityManifestSha256 || commitCutover.phase !== "prepared") throw new CutoverStateError("Live generation drifted before durable observed recovery.");
     const recovered = store.recoverObservedReplacement({
       cutoverId: options.cutoverId,
       expectedNewIdentity: { sourceCommit, buildId, capabilityManifestSha256 },
@@ -283,32 +304,24 @@ export async function performNativeObservedReplacementRecovery(
     });
     const after = store.get();
     if (!after || after.phase !== "closed" || after.observedReplacement?.observedIdentity.serverInstanceId !== serverInstanceId || after.restartRequest || after.drainEvidence) throw new CutoverStateError("Local observed recovery readback did not match the authenticated witness.");
+    const postStatusResult = structuredResult(await client.callTool({ name: "cutover_status", arguments: {} }), "cutover_status after commit");
+    const postStatus = requiredRecordField(postStatusResult, "status", "cutover_status after commit");
+    if (requiredRecordField(postStatus, "cutover", "cutover_status after commit").phase !== "closed") throw new NativeObservedReplacementCommittedError(after, "Native observed recovery committed locally but post-commit status is not closed; reconcile before retry.");
     return { cutover: after, newlyRecovered: recovered.newlyRecovered, serverInstanceId, expectedNewIdentity: { sourceCommit, buildId, capabilityManifestSha256 }, witness };
   } catch (error) {
     operationError = error;
     throw error;
   } finally {
     await client.close().catch(() => undefined);
-    if (oauth.tokens.refresh_token) {
-      const metadataUrl = new URL("/.well-known/oauth-protected-resource/mcp", options.serverUrl.origin);
+    const revocationErrors: string[] = [];
+    for (const [kind, token] of [["access", oauth.tokens.access_token], ["refresh", oauth.tokens.refresh_token]] as const) {
+      if (!token) continue;
       try {
-        const metadata = asRecord(await fetchFn(metadataUrl).then((response) => response.json()), "OAuth resource metadata");
-        const servers = metadata.authorization_servers;
-        const issuer = Array.isArray(servers) && typeof servers[0] === "string" ? new URL(servers[0]) : undefined;
-        if (issuer) {
-          const authMetadata = asRecord(await fetchFn(new URL(".well-known/oauth-authorization-server", issuer)).then((response) => response.json()), "OAuth authorization metadata");
-          const endpoint = authMetadata.revocation_endpoint;
-          if (typeof endpoint === "string") {
-            for (const token of [oauth.tokens.access_token, oauth.tokens.refresh_token].filter((value): value is string => Boolean(value))) {
-              const response = await fetchFn(endpoint, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ token, client_id: oauth.clientId }) });
-              if (!response.ok) throw new CutoverStateError(`OAuth token revocation failed: HTTP ${response.status}.`);
-            }
-          }
-        }
-      } catch (error) {
-        if (!operationError) throw error;
-      }
+        const response = await fetchFn(oauth.revocationEndpoint, { method: "POST", redirect: "manual", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ token, token_type_hint: `${kind}_token`, client_id: oauth.clientId }) });
+        if (!response.ok || response.status >= 300) revocationErrors.push(`${kind}:HTTP ${response.status}`);
+      } catch (error) { revocationErrors.push(`${kind}:${error instanceof Error ? error.message : String(error)}`); }
     }
+    if (revocationErrors.length > 0 && !operationError) throw new CutoverStateError(`OAuth token revocation failed: ${revocationErrors.join(",")}.`);
   }
 }
 
