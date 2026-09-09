@@ -681,12 +681,12 @@ export class CutoverStateStore {
   }
 
   /**
-
    * Terminally close one cutover where the replacement server is already running with
    * exact expected source/build/capability identity, but pre-restart drain evidence
    * was absent (e.g. transport initialization rejection before cutover_drain reached handler).
    *
    * Invariants:
+   * - Requires phase "prepared" with drainEvidence absent.
    * - Never fabricates drainEvidence (remains undefined).
    * - Never alters phase to "drained".
    * - Never creates a successor cutover.
@@ -739,9 +739,9 @@ export class CutoverStateStore {
       );
     }
 
-    if (active.phase !== "prepared" && active.phase !== "drained") {
+    if (active.phase !== "prepared" || active.drainEvidence !== undefined) {
       throw new CutoverStateError(
-        `Cutover ${input.cutoverId} in phase ${active.phase} is not eligible for observed replacement recovery.`,
+        `Cutover ${input.cutoverId} requires prepared state without durable drain evidence for observed replacement recovery.`,
       );
     }
 
