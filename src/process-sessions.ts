@@ -223,6 +223,18 @@ const SANITIZED_ENVIRONMENT_ALLOWLIST = new Set([
   "TMPDIR",
   "CODEX_HOME",
 ]);
+const WINDOWS_SANITIZED_ENVIRONMENT_ALLOWLIST = new Set(["SYSTEMROOT"]);
+
+export function isSanitizedEnvironmentKey(
+  key: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  const normalizedKey = platform === "win32" ? key.toUpperCase() : key;
+  return SANITIZED_ENVIRONMENT_ALLOWLIST.has(normalizedKey) ||
+    (platform === "win32" && WINDOWS_SANITIZED_ENVIRONMENT_ALLOWLIST.has(normalizedKey)) ||
+    normalizedKey.startsWith("LC_") ||
+    normalizedKey.startsWith("XDG_");
+}
 
 export function processEnvironment(
   policy: ProcessEnvironmentPolicy = "inherit",
@@ -237,10 +249,7 @@ export function processEnvironment(
   const base = policy === "sanitized"
     ? Object.fromEntries(
         Object.entries(source).filter(
-          ([key]) =>
-            SANITIZED_ENVIRONMENT_ALLOWLIST.has(key) ||
-            key.startsWith("LC_") ||
-            key.startsWith("XDG_"),
+          ([key]) => isSanitizedEnvironmentKey(key),
         ),
       )
     : source;

@@ -5,7 +5,9 @@ import { join } from "node:path";
 import {
   HeadTailBuffer,
   disposeWindowsPtyResources,
+  isSanitizedEnvironmentKey,
   killPtyProcess,
+  processEnvironment,
   ProcessSessionManager,
   resolvePtyShellInvocation,
 } from "./process-sessions.js";
@@ -19,6 +21,22 @@ import {
   assert.deepEqual(calls, [undefined]);
   killPtyProcess(pty, "SIGINT", "linux");
   assert.deepEqual(calls, [undefined, "SIGINT"]);
+}
+
+{
+  assert.equal(isSanitizedEnvironmentKey("SystemRoot", "win32"), true);
+  assert.equal(isSanitizedEnvironmentKey("pAtH", "win32"), true);
+  assert.equal(isSanitizedEnvironmentKey("systemroot", "linux"), false);
+  assert.equal(isSanitizedEnvironmentKey("OPENAI_API_KEY", "win32"), false);
+
+  const previousSecret = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = "must-not-cross-sanitized-boundary";
+  try {
+    assert.equal(processEnvironment("sanitized").OPENAI_API_KEY, undefined);
+  } finally {
+    if (previousSecret === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousSecret;
+  }
 }
 
 {
