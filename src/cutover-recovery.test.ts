@@ -181,7 +181,8 @@ test("native OAuth metadata rejects foreign resource, issuer, endpoint, and redi
   assert.deepEqual(validateNativeOAuthMetadata(metadata, auth, publicBase, new URL("http://127.0.0.1:9/devspace-native-cutover")).resource.href, "https://devspace.example.test/mcp");
   assert.throws(() => validateNativeOAuthMetadata({ ...metadata, resource: "https://foreign.example/mcp" }, auth, publicBase, new URL("http://127.0.0.1:9/devspace-native-cutover")), /resource does not match/i);
   assert.throws(() => validateNativeOAuthMetadata(metadata, { ...auth, token_endpoint: "https://foreign.example/token" }, publicBase, new URL("http://127.0.0.1:9/devspace-native-cutover")), /token_endpoint origin/i);
-  assert.throws(() => validateNativeOAuthMetadata(metadata, { ...auth, authorization_endpoint: "https://foreign.example/authorize" }, publicBase, new URL("https://foreign.example/callback")), /authorization_endpoint origin/i);
+  assert.throws(() => validateNativeOAuthMetadata(metadata, auth, publicBase, new URL("https://foreign.example/callback")), /redirect URI/i);
+  assert.throws(() => validateNativeOAuthMetadata(metadata, { ...auth, authorization_endpoint: "https://foreign.example/authorize" }, publicBase, new URL("http://127.0.0.1:9/devspace-native-cutover")), /authorization_endpoint origin/i);
 });
 
 test("seam accepts an operator build-ready attestation when no probe root is configured", () => {
