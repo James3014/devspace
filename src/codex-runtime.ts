@@ -130,17 +130,15 @@ function defaultExecutable(sdkPackagePath: string | undefined, env: NodeJS.Proce
   if (override) return override;
   if (!sdkPackagePath) return undefined;
   if (process.platform === "win32") {
-    const dependencyRoot = dirname(dirname(dirname(dirname(sdkPackagePath))));
+    const openaiPackageRoot = dirname(dirname(sdkPackagePath));
     const architecture = windowsArchitecture();
     if (!architecture) return undefined;
-    const platformPackage = join(dependencyRoot, "node_modules", "@openai", architecture.packageName);
+    const platformPackage = join(openaiPackageRoot, architecture.packageName);
     if (existsSync(platformPackage)) {
       return join(platformPackage, "vendor", architecture.target, "bin", "codex.exe");
     }
     const vendorRoot = join(
-      dependencyRoot,
-      "node_modules",
-      "@openai",
+      openaiPackageRoot,
       "codex",
       "vendor",
       architecture.target,
