@@ -463,7 +463,7 @@ test("native adapter rejects precommit drain and restart state drift", async () 
         if (statusReads === 2 && driftStateDir) {
           const path = join(driftStateDir, "cutover", "active", "created.json");
           const record = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-          writeFileSync(path, JSON.stringify({ ...record, ...(drift === "drainEvidence" ? { drainEvidence: { activeSessions: 1, oldestAgeMs: 1 } } : { restartRequest: { actuator: "launchd-self", requestedByServerInstanceId: "drift" } }) }));
+          writeFileSync(path, JSON.stringify({ ...record, ...(drift === "drainEvidence" ? { drainEvidence: { activeSessions: 1, oldestAgeMs: 1 } } : { restartRequest: { actuator: "launchd-self", requestedByServerInstanceId: "drift", requestedAt: new Date().toISOString() } }) }));
         }
         return { cutover: { cutoverId: "cutover-native", phase: "prepared", oldServerIdentity: { serverInstanceId: "old-native", sourceCommit: "old-source", buildId: "old-build", capabilityManifestSha256: "m".repeat(64) }, expectedNewIdentity: { sourceCommit: "target-source", buildId: "target-build", capabilityManifestSha256: "n".repeat(64) } }, currentServerIdentity: { serverInstanceId: "new-native", sourceCommit: "target-source", buildId: "target-build", capabilityManifestSha256: "n".repeat(64) }, mode: "reconcile-only", reconciliationRequired: true };
       },
