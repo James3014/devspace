@@ -1,3 +1,4 @@
+import { after } from "node:test";
 import { dirname, resolve } from "node:path";
 import { createRequire, syncBuiltinESMExports } from "node:module";
 import { existsSync, mkdirSync, rmSync } from "node:fs";
@@ -61,14 +62,15 @@ if (process.platform !== "win32") {
   if (createdEchoDir) mkdirSync(echoFixtureDir, { recursive: true });
   if (createdEchoFixture) originalWriteFileSync(echoFixture, "windows-test-executable-placeholder\n");
 
-  try {
-    await import("./codex-goal-sessions.test.js");
-  } finally {
+  // Import registers node:test cases but does not await their execution. Keep
+  // the Windows adapters alive until every registered test has completed.
+  after(() => {
     ProcessSessionManager.prototype.start = originalStart;
     fsModule.writeFileSync = originalWriteFileSync;
     pathModule.join = originalJoin;
     syncBuiltinESMExports();
     if (createdEchoFixture) rmSync(echoFixture, { force: true });
     if (createdEchoDir) rmSync(echoFixtureDir, { recursive: true, force: true });
-  }
+  });
+  await import("./codex-goal-sessions.test.js");
 }
