@@ -1206,7 +1206,9 @@ function writeExclusiveDurable(path: string, content: string): void {
 function syncDirectory(path: string): void {
   let fd: number | undefined;
   try {
-    fd = openSync(path, "r");
+    // Windows requires write access for directory fsync; POSIX keeps the
+    // read-only directory handle and preserves its existing error behavior.
+    fd = openSync(path, process.platform === "win32" ? "r+" : "r");
     fsyncSync(fd);
   } finally {
     if (fd !== undefined) closeQuietly(fd);
