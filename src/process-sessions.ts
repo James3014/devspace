@@ -346,7 +346,10 @@ export class ProcessSessionManager {
     }
 
     try {
-      if (normalizedInput.tty && process.platform !== "win32") await this.startPty(session, normalizedInput);
+      // A requested TTY is a contract: Windows uses node-pty/ConPTY just as
+      // POSIX uses node-pty. Falling back to pipes changes terminal rendering
+      // and interactive semantics, so an unavailable PTY must fail closed.
+      if (normalizedInput.tty) await this.startPty(session, normalizedInput);
       else this.startPipe(session, normalizedInput);
     } catch (error) {
       this.removeSession(session.id);

@@ -3,7 +3,7 @@ import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSy
 import { execFile } from "node:child_process";
 import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import test, { type TestContext } from "node:test";
 import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -2192,7 +2192,7 @@ test("Codex Goal accepts exact captured middle-ellipsis directory paths from nar
   const deepDir = join(tmpRoot, "devspace-nested-worktrees", "canary-goal-12345");
   mkdirSync(deepDir, { recursive: true });
   try {
-    const truncatedDir = `${tmpRoot}/…/canary-goal-12345`;
+    const truncatedDir = `${tmpRoot}${sep}…${sep}canary-goal-12345`;
     const ready = `model: gpt-5.6-sol medium\ndirectory: ${truncatedDir}\nAsk Codex to do anything\n`;
     const backend = new ScriptedDeltaBackend(
       [{ output: ready }, { output: "" }, { output: "" }, { output: "" }],
@@ -2331,6 +2331,32 @@ test("RED/NEGATIVE: multiple ellipses must fail closed", async () => {
   assert.equal(backend.writes.join(""), "", "multiple ellipses must never emit /goal bytes");
   assert.equal(backend.terminated, true);
   manager.shutdown();
+});
+
+test("RED/NEGATIVE: mixed Windows/POSIX directory separators fail closed", async () => {
+  const tmpRoot = realpathSync(tmpdir());
+  const workspace = join(tmpRoot, "mixed-separator-workspace", "target");
+  mkdirSync(workspace, { recursive: true });
+  try {
+    const mixedSeparator = sep === "\\" ? "/" : "\\";
+    const observed = `${tmpRoot}${mixedSeparator}…${sep}target`;
+    const ready = `model: gpt-5.6-sol medium\ndirectory: ${observed}\nAsk Codex to do anything\n`;
+    const backend = new ScriptedDeltaBackend([{ output: ready }, { output: "" }, { output: "" }, { output: "" }]);
+    const manager = scriptedGoalManager(backend, { timeoutMs: 80 });
+    await assert.rejects(
+      manager.start({
+        workspaceId: "ws_mixed_directory_separators",
+        workspaceRoot: workspace,
+        goal: "must stay blocked",
+      }),
+      /Codex Goal activation failed|did not resolve model and directory|produced no output/,
+    );
+    assert.equal(backend.writes.join(""), "", "mixed separators must never emit /goal bytes");
+    assert.equal(backend.terminated, true);
+    manager.shutdown();
+  } finally {
+    try { rmSync(join(tmpRoot, "mixed-separator-workspace"), { recursive: true, force: true }); } catch {}
+  }
 });
 
 test("RED/NEGATIVE: home-prefix collision ~/…/target-project vs $HOME-evil/deep/target-project must fail closed", async () => {

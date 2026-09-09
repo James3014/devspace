@@ -380,12 +380,18 @@ function normalizeHomeComponent(value: string): string {
   if (value.startsWith("~/")) {
     return `${home}/${value.slice(2).replace(/^\/+/, "")}`;
   }
+  if (value === "~\\") return `${home}\\`;
+  if (value.startsWith("~\\")) {
+    return `${home}\\${value.slice(2).replace(/^\\+/, "")}`;
+  }
   return value;
 }
 
 function realpathEqual(left: string, right: string): boolean {
   const leftExpanded = normalizeHomeComponent(left);
   const rightExpanded = normalizeHomeComponent(right);
+  const hasMixedSeparators = (value: string): boolean => value.includes("/") && value.includes("\\");
+  if (hasMixedSeparators(leftExpanded) || hasMixedSeparators(rightExpanded)) return false;
 
   // 1. Exact match via realpathSync / normalized string comparison
   try {
@@ -406,12 +412,16 @@ function realpathEqual(left: string, right: string): boolean {
   if (parts.length !== 2) return false; // exactly one ellipsis
 
   const [rawHead, rawTail] = parts;
-  // Both head and tail must be non-empty and bounded by path separators
+  // Both head and tail must be non-empty and bounded by the same path
+  // separator. Mixed separators are ambiguous across Windows/POSIX and fail
+  // closed instead of being normalized into a different physical path.
+  const hasBackslash = leftExpanded.includes("\\");
+  const separator = hasBackslash ? "\\" : "/";
   if (!rawHead || !rawTail) return false;
-  if (!rawHead.endsWith("/") || !rawTail.startsWith("/")) return false;
+  if (!rawHead.endsWith(separator) || !rawTail.startsWith(separator)) return false;
 
   const headExpanded = normalizeHomeComponent(rawHead);
-  const normalizedHead = headExpanded.endsWith("/") ? headExpanded : `${headExpanded}/`;
+  const normalizedHead = headExpanded.endsWith(separator) ? headExpanded : `${headExpanded}${separator}`;
   const target = rightExpanded;
 
   // Verify target starts with normalizedHead at component boundary and ends with rawTail
@@ -424,9 +434,9 @@ function realpathEqual(left: string, right: string): boolean {
   // Realpath component check: physical verification is required; unresolvable targets fail closed
   try {
     const targetReal = realpathSync(target);
-    const headDir = normalizedHead.replace(/\/+$/, "");
+    const headDir = normalizedHead.replace(/[\\/]+$/, "");
     const headReal = realpathSync(headDir);
-    if (!targetReal.startsWith(`${headReal}/`) && targetReal !== headReal) {
+    if (!targetReal.startsWith(`${headReal}${separator}`) && targetReal !== headReal) {
       return false;
     }
     if (!targetReal.endsWith(rawTail)) {
