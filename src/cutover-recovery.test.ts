@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -402,6 +402,32 @@ test("native adapter rejects stale live generation and divergent stores for the 
     await assert.rejects(() => performNativeObservedReplacementRecovery(nativeOptions(fixture)), /generation|expected|binding/i);
     assert.equal(fixture.store.get()?.phase, "prepared");
     assert.deepEqual(fixture.toolCalls.filter((name) => name !== "cutover_status"), []);
+  } finally { await fixture.close(); }
+});
+
+test("native adapter rejects local cutover drift between final status and commit", async () => {
+  let statusReads = 0;
+  let driftStateDir: string | undefined;
+  const fixture = await nativeHttpFixture({
+    status: () => {
+      statusReads += 1;
+      if (statusReads === 2 && driftStateDir) {
+        const path = join(driftStateDir, "cutover", "active", "created.json");
+        const record = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+        writeFileSync(path, JSON.stringify({ ...record, expectedNewIdentity: { sourceCommit: "drifted-source", buildId: "target-build", capabilityManifestSha256: "n".repeat(64) } }));
+      }
+      return {
+        cutover: { cutoverId: "cutover-native", phase: "prepared", oldServerIdentity: { serverInstanceId: "old-native", sourceCommit: "old-source", buildId: "old-build", capabilityManifestSha256: "m".repeat(64) }, expectedNewIdentity: { sourceCommit: "target-source", buildId: "target-build", capabilityManifestSha256: "n".repeat(64) } },
+        currentServerIdentity: { serverInstanceId: "new-native", sourceCommit: "target-source", buildId: "target-build", capabilityManifestSha256: "n".repeat(64) },
+        mode: "reconcile-only",
+        reconciliationRequired: true,
+      };
+    },
+  });
+  driftStateDir = fixture.stateDir;
+  try {
+    await assert.rejects(() => performNativeObservedReplacementRecovery(nativeOptions(fixture)), /generation|binding|changed|drift/i);
+    assert.equal(fixture.store.get()?.phase, "prepared");
   } finally { await fixture.close(); }
 });
 
