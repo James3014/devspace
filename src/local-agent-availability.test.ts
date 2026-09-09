@@ -14,14 +14,7 @@ import {
     assert.equal(availability.note, "available");
   }
 }
-
-{
-  const availability = checkLocalAgentProviderAvailability("omp", {
-    ...process.env,
-    OMP_COMMAND: process.execPath,
-  });
-  assert.equal(availability.available, true);
-}
+assert.equal(checkLocalAgentProviderAvailability("omp").available, true);
 
 {
   const availability = checkLocalAgentProviderAvailability("codex", {
@@ -59,7 +52,7 @@ assert.equal(
 {
   const agyPath = resolveAgyExecutable({
     ...process.env,
-    AGY_COMMAND: process.execPath,
+    AGY_COMMAND: "/bin/sh",
   });
-  assert.equal(agyPath, process.execPath);
+  assert.equal(agyPath, "/bin/sh");
 }
