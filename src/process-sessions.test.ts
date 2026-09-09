@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import {
   HeadTailBuffer,
+  disposeWindowsPtyResources,
   killPtyProcess,
   ProcessSessionManager,
   resolvePtyShellInvocation,
@@ -18,6 +19,23 @@ import {
   assert.deepEqual(calls, [undefined]);
   killPtyProcess(pty, "SIGINT", "linux");
   assert.deepEqual(calls, [undefined, "SIGINT"]);
+}
+
+{
+  const calls: string[] = [];
+  const pty = {
+    _agent: {
+      _conoutSocketWorker: { dispose: () => calls.push("worker") },
+      _inSocket: { destroy: () => calls.push("input") },
+    },
+  };
+  disposeWindowsPtyResources(pty, "win32");
+  disposeWindowsPtyResources(pty, "win32");
+  assert.deepEqual(calls, ["worker", "input"]);
+  assert.throws(
+    () => disposeWindowsPtyResources({ _agent: {} }, "win32"),
+    /Unsupported node-pty Windows resource layout/,
+  );
 }
 
 {

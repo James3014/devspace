@@ -93,6 +93,37 @@ export interface PtyShellInvocation {
   args: string[] | string;
 }
 
+interface WindowsPtyCleanupAgent {
+  _conoutSocketWorker?: { dispose(): void };
+  _inSocket?: { destroy(): void };
+}
+
+interface WindowsPtyCleanupTarget {
+  _agent?: WindowsPtyCleanupAgent;
+}
+
+const cleanedWindowsPtys = new WeakSet<object>();
+
+export function disposeWindowsPtyResources(
+  pty: unknown,
+  platform: NodeJS.Platform = process.platform,
+): void {
+  if (platform !== "win32") return;
+  if (typeof pty !== "object" || pty === null) {
+    throw new Error("Unsupported node-pty Windows resource layout.");
+  }
+  if (cleanedWindowsPtys.has(pty)) return;
+  const agent = (pty as WindowsPtyCleanupTarget)._agent;
+  const worker = agent?._conoutSocketWorker;
+  const input = agent?._inSocket;
+  if (!agent || typeof worker?.dispose !== "function" || typeof input?.destroy !== "function") {
+    throw new Error("Unsupported node-pty Windows resource layout.");
+  }
+  cleanedWindowsPtys.add(pty);
+  worker.dispose();
+  input.destroy();
+}
+
 export function resolvePtyShellInvocation(
   command: string,
   platform: NodeJS.Platform = process.platform,
@@ -642,7 +673,7 @@ export class ProcessSessionManager {
     pty.onData((data) => this.append(session, data));
     pty.onExit(({ exitCode, signal }) => {
       this.finish(session, exitCode, signal === 0 ? undefined : String(signal));
-      if (process.platform === "win32") pty.kill();
+      disposeWindowsPtyResources(pty);
     });
   }
 
