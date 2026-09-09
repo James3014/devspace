@@ -46,7 +46,7 @@ import {
   );
   assert.equal(isSanitizedEnvironmentKey("lc_all", "win32"), true);
 
-  const reversedWindowsPath = selectSanitizedEnvironment({ Path: "lower-priority", PATH: "canonical" }, "win32");
+  const reversedWindowsPath = selectSanitizedEnvironment({ PATH: "canonical", Path: "lower-priority" }, "win32");
   assert.equal(reversedWindowsPath.PATH, "canonical");
   assert.equal(reversedWindowsPath.Path, undefined);
   const mixedCaseSecret = selectSanitizedEnvironment({ oPeNaI_aPi_KeY: "secret" }, "win32");
