@@ -88,6 +88,18 @@ interface ManagedProcess {
   resize?(columns: number, rows: number): void;
 }
 
+export function killPtyProcess(
+  pty: { kill(signal?: string): void },
+  signal?: NodeJS.Signals,
+  platform: NodeJS.Platform = process.platform,
+): void {
+  if (platform === "win32") {
+    pty.kill();
+    return;
+  }
+  pty.kill(signal);
+}
+
 interface ProcessSession {
   id: number;
   attemptKey?: string;
@@ -601,7 +613,7 @@ export class ProcessSessionManager {
 
     session.process = {
       write: (data) => pty.write(data),
-      kill: (signal) => pty.kill(signal),
+      kill: (signal) => killPtyProcess(pty, signal),
       resize: (columns, rows) => pty.resize(columns, rows),
     };
     pty.onData((data) => this.append(session, data));

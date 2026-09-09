@@ -1,7 +1,18 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { HeadTailBuffer, ProcessSessionManager } from "./process-sessions.js";
+import { HeadTailBuffer, killPtyProcess, ProcessSessionManager } from "./process-sessions.js";
+
+// Windows node-pty exposes termination as kill() without a POSIX signal;
+// signal-specific PTY termination remains required on POSIX.
+{
+  const calls: Array<string | undefined> = [];
+  const pty = { kill: (signal?: string) => calls.push(signal) };
+  killPtyProcess(pty, "SIGTERM", "win32");
+  assert.deepEqual(calls, [undefined]);
+  killPtyProcess(pty, "SIGINT", "linux");
+  assert.deepEqual(calls, [undefined, "SIGINT"]);
+}
 
 const smallBuffer = new HeadTailBuffer(100);
 smallBuffer.append("hello\n");
