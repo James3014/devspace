@@ -1564,16 +1564,9 @@ function registerCutoverMcpTools(
           },
         };
       }
-      let witness: DurableReconciliationWitness | undefined;
-      if (
-        activeRecord &&
-        activeRecord.cutoverId === cutoverId &&
-        activeRecord.phase === "prepared" &&
-        !activeRecord.drainEvidence &&
-        control.enumerateReconciliation
-      ) {
-        witness = await control.enumerateReconciliation();
-      }
+      // Without the bound inventory executor, observed recovery is denied by
+      // the controller's missing-witness guard. Stale-target supersession still
+      // follows its existing eligibility checks.
       const recovered = control.controller.recoverCutover({
         cutoverId,
         expectedNewIdentity: {
@@ -1582,7 +1575,6 @@ function registerCutoverMcpTools(
           ...(expectedCapabilityManifestSha256 ? { capabilityManifestSha256: expectedCapabilityManifestSha256 } : {}),
         },
         ...(expiresAt ? { expiresAt } : {}),
-        ...(witness ? { witness } : {}),
       });
       const mode = control.controller.mode();
       const summaryText = recovered.successor
@@ -1632,6 +1624,9 @@ function registerCutoverMcpTools(
             structuredContent: { cutover: replay.terminal as unknown as Record<string, unknown>, mode: replay.mode },
           };
         }
+        if (activeRecord.observedReplacement) {
+          throw new CutoverStateError("[RECOVERY_BINDING_MISMATCH] Observed recovery replay requires replacement identity verification.");
+        }
         const mode = control.controller.mode();
         return {
           content: [textBlock(`Finished cutover ${cutoverId}; mode=${mode}.`)],
@@ -1655,7 +1650,6 @@ function registerCutoverMcpTools(
           structuredContent: { cutover: recovered.terminal as unknown as Record<string, unknown>, mode },
         };
       }
-      const witness = await control.reconcileDurableState({ workspaceId, agentId });
       let record: DurableCutoverRecord;
       if (
         activeRecord &&
@@ -1663,13 +1657,9 @@ function registerCutoverMcpTools(
         activeRecord.phase === "prepared" &&
         !activeRecord.drainEvidence
       ) {
-        const recovered = control.controller.recoverCutover({
-          cutoverId,
-          expectedNewIdentity: activeRecord.expectedNewIdentity,
-          witness,
-        });
-        record = recovered.terminal;
+        throw new CutoverStateError("[RECOVERY_BINDING_MISMATCH] Observed recovery requires fresh generation-bound inventory collection.");
       } else {
+        const witness = await control.reconcileDurableState({ workspaceId, agentId });
         record = await control.controller.finish(
           cutoverId,
           async () => witness,

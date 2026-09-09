@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
@@ -746,7 +747,7 @@ export class CutoverStateStore {
       );
     }
     if (
-      active.expectedNewIdentity.capabilityManifestSha256 !== undefined &&
+      !active.expectedNewIdentity.capabilityManifestSha256?.trim() ||
       input.observedIdentity.capabilityManifestSha256 !== active.expectedNewIdentity.capabilityManifestSha256
     ) {
       throw new CutoverStateError(
@@ -787,20 +788,19 @@ export class CutoverStateStore {
     const witnessKind = input.witness.witnessKind ?? "exact-pair";
 
     if (
-      input.witness.witnessCutoverId !== undefined &&
       input.witness.witnessCutoverId !== input.cutoverId
     ) {
       throw new CutoverStateError("[RECOVERY_BINDING_MISMATCH] Witness belongs to a different cutover generation.");
     }
     if (
-      input.witness.witnessServerInstanceId !== undefined &&
       input.witness.witnessServerInstanceId !== input.observedIdentity.serverInstanceId
     ) {
       throw new CutoverStateError("[RECOVERY_BINDING_MISMATCH] Witness belongs to a different replacement instance.");
     }
     const witnessExpected = input.witness.witnessExpectedIdentity;
     if (
-      witnessExpected &&
+      !witnessExpected ||
+      !witnessExpected.capabilityManifestSha256?.trim() ||
       (witnessExpected.sourceCommit !== active.expectedNewIdentity.sourceCommit ||
         witnessExpected.buildId !== active.expectedNewIdentity.buildId ||
         witnessExpected.capabilityManifestSha256 !== active.expectedNewIdentity.capabilityManifestSha256)
@@ -907,6 +907,9 @@ function parseRecord(raw: string): DurableCutoverRecord {
     const receipt = record.observedReplacement;
     if (
       receipt.cutoverId !== record.cutoverId ||
+      receipt.observedIdentity.serverInstanceId === receipt.oldServerIdentity.serverInstanceId ||
+      !receipt.expectedIdentity.capabilityManifestSha256?.trim() ||
+      !isDeepStrictEqual(record.reconciliationReceipt, receipt.reconciliationReceipt) ||
       !identitiesEqual(receipt.oldServerIdentity, record.oldServerIdentity) ||
       !expectedIdentitiesEqual(receipt.expectedIdentity, record.expectedNewIdentity) ||
       receipt.observedIdentity.sourceCommit !== receipt.expectedIdentity.sourceCommit ||

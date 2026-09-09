@@ -384,6 +384,7 @@ test("Test 2 & 3 (controller) — recoverCutover on replacement with missing dra
 
     const replacement = new McpCutoverController(store, identity("new-inst", "new-source", "new-build", "cap"));
     const witness: DurableReconciliationWitness = {
+      witnessCutoverId: "cutover-ctrl-dl", witnessServerInstanceId: "new-inst", witnessExpectedIdentity: { sourceCommit: "new-source", buildId: "new-build", capabilityManifestSha256: "cap" },
       workspaceQueryable: true,
       agentQueryable: true,
       agentReconciled: true,
@@ -427,6 +428,7 @@ test("closed observed recovery validates identity even when replay has no witnes
     old.begin({ sourceCommit: "new-source", buildId: "new-build", capabilityManifestSha256: "cap" });
     const replacement = new McpCutoverController(store, identity("new", "new-source", "new-build"));
     const witness: DurableReconciliationWitness = {
+      witnessCutoverId: "cutover-closed-binding", witnessServerInstanceId: "new", witnessExpectedIdentity: { sourceCommit: "new-source", buildId: "new-build", capabilityManifestSha256: "cap" },
       workspaceQueryable: true,
       agentQueryable: true,
       agentReconciled: true,

@@ -1844,8 +1844,8 @@ test("P0-2: durable reconciliation witness fails closed on empty inventory, mism
   try {
     const store = new CutoverStateStore(stateDir, { newId: () => "cutover-p02" });
     const oldIdentity = { serverInstanceId: "old", sourceCommit: "old", buildId: "old" };
-    const expectedIdentity = { sourceCommit: "new", buildId: "new" };
-    const replacementIdentity = { serverInstanceId: "new", sourceCommit: "new", buildId: "new" };
+    const expectedIdentity = { sourceCommit: "new", buildId: "new", capabilityManifestSha256: "cap" };
+    const replacementIdentity = { serverInstanceId: "new", sourceCommit: "new", buildId: "new", capabilityManifestSha256: "cap" };
     store.begin({ oldServerIdentity: oldIdentity, expectedNewIdentity: expectedIdentity });
 
     const emptyNormalWitness = await resolveDurableReconciliationWitnessFromInventory({
@@ -1863,6 +1863,7 @@ test("P0-2: durable reconciliation witness fails closed on empty inventory, mism
         cutoverId: "cutover-p02",
         observedIdentity: replacementIdentity,
         witness: {
+          witnessCutoverId: "cutover-p02", witnessServerInstanceId: "new", witnessExpectedIdentity: expectedIdentity,
           workspaceQueryable: true,
           agentQueryable: true,
           agentReconciled: true,
@@ -1882,6 +1883,7 @@ test("P0-2: durable reconciliation witness fails closed on empty inventory, mism
         cutoverId: "cutover-p02",
         observedIdentity: replacementIdentity,
         witness: {
+          witnessCutoverId: "cutover-p02", witnessServerInstanceId: "new", witnessExpectedIdentity: expectedIdentity,
           workspaceQueryable: true,
           agentQueryable: true,
           agentReconciled: true,
@@ -1925,6 +1927,7 @@ test("P0-2: durable reconciliation witness fails closed on empty inventory, mism
         cutoverId: "cutover-p02",
         observedIdentity: replacementIdentity,
         witness: {
+          witnessCutoverId: "cutover-p02", witnessServerInstanceId: "new", witnessExpectedIdentity: expectedIdentity,
           workspaceQueryable: true,
           agentQueryable: false,
           agentReconciled: false,
@@ -1945,6 +1948,7 @@ test("P0-2: durable reconciliation witness fails closed on empty inventory, mism
         cutoverId: "cutover-p02",
         observedIdentity: replacementIdentity,
         witness: {
+          witnessCutoverId: "cutover-p02", witnessServerInstanceId: "new", witnessExpectedIdentity: expectedIdentity,
           workspaceQueryable: true,
           agentQueryable: false,
           agentReconciled: false,
@@ -1965,6 +1969,7 @@ test("P0-2: durable reconciliation witness fails closed on empty inventory, mism
       expectedNewIdentity: expectedIdentity,
       observedIdentity: replacementIdentity,
       witness: {
+          witnessCutoverId: "cutover-p02", witnessServerInstanceId: "new", witnessExpectedIdentity: expectedIdentity,
         workspaceQueryable: true,
         agentQueryable: true,
         agentReconciled: true,
@@ -2022,9 +2027,9 @@ test("P0-3: recovery and finish share identical semantics and idempotently rende
 
     const store1 = new CutoverStateStore(stateDir1, { newId: () => "cutover-r-then-f" });
     const old = new McpCutoverController(store1, { serverInstanceId: "old-server", sourceCommit: "old", buildId: "old" });
-    old.begin({ sourceCommit: targetCommit, buildId: "target-build" });
+    old.begin({ sourceCommit: targetCommit, buildId: "target-build", capabilityManifestSha256: "a".repeat(64) });
 
-    const replacement = new McpCutoverController(store1, { serverInstanceId: "new-server", sourceCommit: targetCommit, buildId: "target-build" });
+    const replacement = new McpCutoverController(store1, { serverInstanceId: "new-server", sourceCommit: targetCommit, buildId: "target-build", capabilityManifestSha256: "a".repeat(64) });
     const wsStore = new SqliteWorkspaceStore(stateDir1);
     const agentStore = new LocalAgentStore(stateDir1);
     const workspaces = new WorkspaceRegistry(config1, wsStore);
@@ -2063,6 +2068,7 @@ test("P0-3: recovery and finish share identical semantics and idempotently rende
             cutoverId: input.cutoverId,
             expectedNewIdentity: input.expectedNewIdentity ?? active.expectedNewIdentity,
             witness: {
+              witnessCutoverId: active.cutoverId, witnessServerInstanceId: replacement.currentIdentity.serverInstanceId, witnessExpectedIdentity: active.expectedNewIdentity,
               workspaceQueryable: true,
               agentQueryable: true,
               agentReconciled: true,
@@ -2090,6 +2096,7 @@ test("P0-3: recovery and finish share identical semantics and idempotently rende
           cutoverId: "cutover-r-then-f",
           expectedSourceCommit: targetCommit,
           expectedBuildId: "target-build",
+          expectedCapabilityManifestSha256: "a".repeat(64),
         },
       }));
       assert.equal(recoverResult.newlyRecovered, true);
@@ -2148,9 +2155,9 @@ test("P0-3: recovery and finish share identical semantics and idempotently rende
 
     const store2 = new CutoverStateStore(stateDir2, { newId: () => "cutover-f-then-r" });
     const old = new McpCutoverController(store2, { serverInstanceId: "old-server-2", sourceCommit: "old", buildId: "old" });
-    old.begin({ sourceCommit: targetCommit, buildId: "target-build" });
+    old.begin({ sourceCommit: targetCommit, buildId: "target-build", capabilityManifestSha256: "a".repeat(64) });
 
-    const replacement = new McpCutoverController(store2, { serverInstanceId: "new-server-2", sourceCommit: targetCommit, buildId: "target-build" });
+    const replacement = new McpCutoverController(store2, { serverInstanceId: "new-server-2", sourceCommit: targetCommit, buildId: "target-build", capabilityManifestSha256: "a".repeat(64) });
     const wsStore = new SqliteWorkspaceStore(stateDir2);
     const agentStore = new LocalAgentStore(stateDir2);
     const workspaces = new WorkspaceRegistry(config2, wsStore);
@@ -2189,6 +2196,7 @@ test("P0-3: recovery and finish share identical semantics and idempotently rende
             cutoverId: input.cutoverId,
             expectedNewIdentity: input.expectedNewIdentity ?? active.expectedNewIdentity,
             witness: {
+              witnessCutoverId: active.cutoverId, witnessServerInstanceId: replacement.currentIdentity.serverInstanceId, witnessExpectedIdentity: active.expectedNewIdentity,
               workspaceQueryable: true,
               agentQueryable: true,
               agentReconciled: true,
@@ -2228,6 +2236,7 @@ test("P0-3: recovery and finish share identical semantics and idempotently rende
           cutoverId: "cutover-f-then-r",
           expectedSourceCommit: targetCommit,
           expectedBuildId: "target-build",
+          expectedCapabilityManifestSha256: "a".repeat(64),
         },
       }));
       assert.equal(recoverReplay.newlyRecovered, false);

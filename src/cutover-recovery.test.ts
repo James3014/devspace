@@ -35,14 +35,14 @@ const goodProbe = (): BuildReadyProbeResult => ({
   detail: "installed build identity matches the bound recovery target",
 });
 
-function makeStateDir(): { stateDir: string; store: CutoverStateStore } {
+function makeStateDir(manifest?: string): { stateDir: string; store: CutoverStateStore } {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-seam-"));
   const store = new CutoverStateStore(stateDir, {
     newId: (() => { let n = 0; return () => `cutover-${n += 1}`; })(),
   });
   store.begin({
     oldServerIdentity: staleIdentity,
-    expectedNewIdentity: { sourceCommit: "stale-target", buildId: "stale-target-build" },
+    expectedNewIdentity: { sourceCommit: "stale-target", buildId: "stale-target-build", ...(manifest ? { capabilityManifestSha256: manifest } : {}) },
   });
   return { stateDir, store };
 }
@@ -194,7 +194,7 @@ test("seam accepts an operator build-ready attestation when no probe root is con
 });
 
 test("Test 10 — restart replay prevention: replacement exists, recovery creates no restart markers", () => {
-  const { stateDir, store } = makeStateDir();
+  const { stateDir, store } = makeStateDir("cap-shared");
   try {
     const target = {
       serverInstanceId: "new-instance-b",
@@ -219,6 +219,7 @@ test("Test 10 — restart replay prevention: replacement exists, recovery create
     });
 
     const witness: DurableReconciliationWitness = {
+      witnessCutoverId: "cutover-1", witnessServerInstanceId: target.serverInstanceId, witnessExpectedIdentity: expected,
       workspaceQueryable: true,
       agentQueryable: true,
       agentReconciled: true,
