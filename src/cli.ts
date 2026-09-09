@@ -63,6 +63,7 @@ import {
 import {
   cutoverSeamStatus,
   performCutoverRecovery,
+  performNativeObservedReplacementRecovery,
   readRunningBuildIdentity,
   resolveSeamStateDir,
   runningPackageRoot,
@@ -801,11 +802,15 @@ async function runCutoverCommand(args: string[]): Promise<void> {
     await runCutoverRecover(args.slice(1));
     return;
   }
+  if (subcommand === "observe") {
+    await runCutoverObserve(args.slice(1));
+    return;
+  }
   if (subcommand === "help" || subcommand === "--help" || subcommand === "-h" || subcommand === undefined) {
     printCutoverHelp();
     return;
   }
-  throw new Error("Usage: devspace cutover <status|recover>");
+  throw new Error("Usage: devspace cutover <status|recover|observe>");
 }
 
 function printCutoverHelp(): void {
@@ -816,6 +821,7 @@ function printCutoverHelp(): void {
       "Usage:",
       "  devspace cutover status [--json]",
       "  devspace cutover recover --cutover-id <id> --expected-source-commit <40hex> --expected-build-id <id>",
+      "  devspace cutover observe --cutover-id <id> --workspace-id <id> --agent-id <id> [--json]",
       "      [--expected-capability-manifest-sha256 <64hex>] [--active-sessions <n>] [--oldest-age-ms <n>]",
       "      [--build-ready-verified-by <identity>] [--build-ready-evidence <detail>] [--expires-at <ISO>] [--json]",
       "",
@@ -827,6 +833,50 @@ function printCutoverHelp(): void {
       "either a configured DEVSPACE_BUILD_READY_ROOT probe or --build-ready-verified-by.",
     ].join("\n"),
   );
+}
+
+async function runCutoverObserve(args: string[]): Promise<void> {
+  let cutoverId: string | undefined;
+  let workspaceId: string | undefined;
+  let agentId: string | undefined;
+  let json = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    const value = (): string => {
+      const next = args[++index];
+      if (!next) throw new Error(`${argument} requires a value.`);
+      return next;
+    };
+    if (argument === "--json") json = true;
+    else if (argument === "--cutover-id") cutoverId = value();
+    else if (argument === "--workspace-id") workspaceId = value();
+    else if (argument === "--agent-id") agentId = value();
+    else throw new Error(`Unknown cutover observe flag: ${argument}`);
+  }
+  if (!cutoverId || !workspaceId || !agentId) {
+    throw new Error("Usage: devspace cutover observe --cutover-id <id> --workspace-id <id> --agent-id <id> [--json]");
+  }
+  const config = loadConfig();
+  const requesterIdentity = readRunningBuildIdentity(runningPackageRoot());
+  if (!requesterIdentity) {
+    throw new Error("Unable to read the executing accepted build identity; refusing native observed recovery.");
+  }
+  const endpoint = new URL(`http://${config.host}:${config.port}/mcp`);
+  const result = await performNativeObservedReplacementRecovery({
+    serverUrl: endpoint,
+    publicBaseUrl: new URL(config.publicBaseUrl),
+    stateDir: config.stateDir,
+    cutoverId,
+    workspaceId,
+    agentId,
+    ownerToken: config.oauth.ownerToken,
+    requesterIdentity,
+  });
+  if (json) {
+    printJson(result);
+    return;
+  }
+  console.log(`Observed replacement ${result.cutover.cutoverId}: phase=${result.cutover.phase}; server=${result.serverInstanceId}; newlyRecovered=${String(result.newlyRecovered)}`);
 }
 
 function parseCutoverRecoverArgs(args: string[]): CutoverRecoverCliOptions {
