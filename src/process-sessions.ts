@@ -104,7 +104,7 @@ export function resolvePtyShellInvocation(
     // command-line form preserves cmd's original quoting for the /c payload.
     return {
       executable: shell.executable,
-      args: `/d /s /c ${command}`,
+      args: `/d /s /c "${command}"`,
     };
   }
   return shell;

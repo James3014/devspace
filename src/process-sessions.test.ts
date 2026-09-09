@@ -23,14 +23,18 @@ import {
 {
   const command = `"C:\\Program Files\\Node\\node.exe" -e "console.log('windows spaces')"`;
   const invocation = resolvePtyShellInvocation(command, "win32", { ComSpec: "C:\\Windows\\System32\\cmd.exe" });
-  assert.equal(invocation.args, `/d /s /c ${command}`);
+  assert.equal(invocation.args, `/d /s /c "${command}"`);
   const require = createRequire(import.meta.url);
   const { argsToCommandLine } = require("node-pty/lib/windowsPtyAgent.js") as {
     argsToCommandLine(file: string, args: string[] | string): string;
   };
   assert.equal(
     argsToCommandLine(invocation.executable, invocation.args),
-    `C:\\Windows\\System32\\cmd.exe /d /s /c ${command}`,
+    `C:\\Windows\\System32\\cmd.exe /d /s /c "${command}"`,
+  );
+  assert.notEqual(
+    argsToCommandLine(invocation.executable, ["/d", "/s", "/c", command]),
+    argsToCommandLine(invocation.executable, invocation.args),
   );
 
   const posix = resolvePtyShellInvocation("printf 'posix'", "linux", { SHELL: "/bin/bash" });
