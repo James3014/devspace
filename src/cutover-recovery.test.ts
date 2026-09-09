@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { performCutoverRecovery } from "./cutover-recovery.js";
+import { performCutoverRecovery, validateNativeOAuthMetadata } from "./cutover-recovery.js";
 import { CutoverStateStore, type CutoverServerIdentity, type ExpectedCutoverIdentity, type DurableReconciliationWitness } from "./cutover-state.js";
 import type { BuildReadyProbeResult } from "./cutover-build-ready.js";
 
@@ -167,6 +167,21 @@ test("seam fails closed on a negative build-ready probe with no mutation", () =>
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
+});
+
+test("native OAuth metadata rejects foreign resource, issuer, endpoint, and redirect origins", () => {
+  const publicBase = new URL("https://devspace.example.test");
+  const metadata = { resource: "https://devspace.example.test/mcp", authorization_servers: ["https://devspace.example.test/"] };
+  const auth = {
+    authorization_endpoint: "https://devspace.example.test/authorize",
+    registration_endpoint: "https://devspace.example.test/register",
+    token_endpoint: "https://devspace.example.test/token",
+    revocation_endpoint: "https://devspace.example.test/revoke",
+  };
+  assert.deepEqual(validateNativeOAuthMetadata(metadata, auth, publicBase, new URL("http://127.0.0.1:9/devspace-native-cutover")).resource.href, "https://devspace.example.test/mcp");
+  assert.throws(() => validateNativeOAuthMetadata({ ...metadata, resource: "https://foreign.example/mcp" }, auth, publicBase, new URL("http://127.0.0.1:9/devspace-native-cutover")), /resource does not match/i);
+  assert.throws(() => validateNativeOAuthMetadata(metadata, { ...auth, token_endpoint: "https://foreign.example/token" }, publicBase, new URL("http://127.0.0.1:9/devspace-native-cutover")), /token_endpoint origin/i);
+  assert.throws(() => validateNativeOAuthMetadata(metadata, { ...auth, authorization_endpoint: "https://foreign.example/authorize" }, publicBase, new URL("https://foreign.example/callback")), /authorization_endpoint origin/i);
 });
 
 test("seam accepts an operator build-ready attestation when no probe root is configured", () => {

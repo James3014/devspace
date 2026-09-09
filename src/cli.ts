@@ -821,7 +821,7 @@ function printCutoverHelp(): void {
       "Usage:",
       "  devspace cutover status [--json]",
       "  devspace cutover recover --cutover-id <id> --expected-source-commit <40hex> --expected-build-id <id>",
-      "  devspace cutover observe --cutover-id <id> --workspace-id <id> --agent-id <id> [--server-url <url>] [--json]",
+      "  devspace cutover observe --cutover-id <id> --workspace-id <id> --agent-id <id> [--json]",
       "      [--expected-capability-manifest-sha256 <64hex>] [--active-sessions <n>] [--oldest-age-ms <n>]",
       "      [--build-ready-verified-by <identity>] [--build-ready-evidence <detail>] [--expires-at <ISO>] [--json]",
       "",
@@ -839,7 +839,6 @@ async function runCutoverObserve(args: string[]): Promise<void> {
   let cutoverId: string | undefined;
   let workspaceId: string | undefined;
   let agentId: string | undefined;
-  let serverUrl: string | undefined;
   let json = false;
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
@@ -852,20 +851,20 @@ async function runCutoverObserve(args: string[]): Promise<void> {
     else if (argument === "--cutover-id") cutoverId = value();
     else if (argument === "--workspace-id") workspaceId = value();
     else if (argument === "--agent-id") agentId = value();
-    else if (argument === "--server-url") serverUrl = value();
     else throw new Error(`Unknown cutover observe flag: ${argument}`);
   }
   if (!cutoverId || !workspaceId || !agentId) {
-    throw new Error("Usage: devspace cutover observe --cutover-id <id> --workspace-id <id> --agent-id <id> [--server-url <url>] [--json]");
+    throw new Error("Usage: devspace cutover observe --cutover-id <id> --workspace-id <id> --agent-id <id> [--json]");
   }
   const config = loadConfig();
   const requesterIdentity = readRunningBuildIdentity(runningPackageRoot());
   if (!requesterIdentity) {
     throw new Error("Unable to read the executing accepted build identity; refusing native observed recovery.");
   }
-  const endpoint = new URL(serverUrl ?? `http://${config.host}:${config.port}/mcp`);
+  const endpoint = new URL(`http://${config.host}:${config.port}/mcp`);
   const result = await performNativeObservedReplacementRecovery({
     serverUrl: endpoint,
+    publicBaseUrl: new URL(config.publicBaseUrl),
     stateDir: config.stateDir,
     cutoverId,
     workspaceId,

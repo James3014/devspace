@@ -63,6 +63,8 @@ export interface CutoverRecoveryDependencies {
 export interface NativeObservedReplacementOptions {
   /** The local MCP endpoint; never taken from a caller-provided executable or path. */
   serverUrl: URL;
+  /** Configured public origin used for OAuth resource and issuer pinning. */
+  publicBaseUrl: URL;
   stateDir: string;
   cutoverId: string;
   workspaceId: string;
@@ -110,6 +112,29 @@ function requiredRecordField(record: JsonRecord, field: string, label: string): 
   return asRecord(record[field], `${label}.${field}`);
 }
 
+export function validateNativeOAuthMetadata(
+  metadata: JsonRecord,
+  authorizationMetadata: JsonRecord,
+  publicBaseUrl: URL,
+  redirectUri: URL,
+): { resource: URL; issuer: URL } {
+  const expectedResource = new URL("/mcp", publicBaseUrl);
+  const resource = new URL(requiredStringField(metadata, "resource", "OAuth resource metadata"));
+  if (resource.href !== expectedResource.href) throw new CutoverStateError("OAuth resource does not match the configured public endpoint.");
+  const servers = metadata.authorization_servers;
+  if (!Array.isArray(servers) || typeof servers[0] !== "string") throw new CutoverStateError("OAuth resource metadata has no authorization server.");
+  const issuer = new URL(servers[0]);
+  if (issuer.origin !== publicBaseUrl.origin) throw new CutoverStateError("OAuth issuer origin is not the configured public origin.");
+  for (const field of ["authorization_endpoint", "registration_endpoint", "token_endpoint", "revocation_endpoint"]) {
+    const endpoint = new URL(requiredStringField(authorizationMetadata, field, "OAuth authorization metadata"));
+    if (endpoint.origin !== publicBaseUrl.origin) throw new CutoverStateError(`OAuth ${field} origin is not the configured public origin.`);
+  }
+  if (redirectUri.protocol !== "http:" || !["127.0.0.1", "localhost"].includes(redirectUri.hostname)) {
+    throw new CutoverStateError("OAuth redirect URI must be a fixed loopback callback.");
+  }
+  return { resource, issuer };
+}
+
 interface MemoryOAuthProvider {
   readonly clientMetadata: {
     client_name: string;
@@ -124,6 +149,7 @@ interface MemoryOAuthProvider {
 
 async function authorizeNativeClient(
   serverUrl: URL,
+  publicBaseUrl: URL,
   ownerToken: string,
   fetchFn: typeof globalThis.fetch,
 ): Promise<MemoryOAuthProvider> {
@@ -131,17 +157,15 @@ async function authorizeNativeClient(
   const resourceResponse = await fetchFn(resourceMetadataUrl);
   if (!resourceResponse.ok) throw new CutoverStateError(`OAuth resource metadata failed: HTTP ${resourceResponse.status}.`);
   const resourceMetadata = asRecord(await resourceResponse.json(), "OAuth resource metadata");
-  const resource = requiredStringField(resourceMetadata, "resource", "OAuth resource metadata");
   const servers = resourceMetadata.authorization_servers;
-  if (!Array.isArray(servers) || typeof servers[0] !== "string") {
-    throw new CutoverStateError("OAuth resource metadata has no authorization server.");
-  }
+  if (!Array.isArray(servers) || typeof servers[0] !== "string") throw new CutoverStateError("OAuth resource metadata has no authorization server.");
   const issuer = new URL(servers[0]);
   const authMetadataResponse = await fetchFn(new URL(".well-known/oauth-authorization-server", issuer));
   if (!authMetadataResponse.ok) throw new CutoverStateError(`OAuth authorization metadata failed: HTTP ${authMetadataResponse.status}.`);
   const authMetadata = asRecord(await authMetadataResponse.json(), "OAuth authorization metadata");
   const endpoint = (name: string): string => requiredStringField(authMetadata, name, "OAuth authorization metadata");
   const redirectUri = "http://127.0.0.1:9/devspace-native-cutover";
+  const metadataBinding = validateNativeOAuthMetadata(resourceMetadata, authMetadata, publicBaseUrl, new URL(redirectUri));
   const clientMetadata: MemoryOAuthProvider["clientMetadata"] = {
     client_name: "devspace-native-cutover",
     redirect_uris: [redirectUri],
@@ -163,7 +187,7 @@ async function authorizeNativeClient(
   const params = new URLSearchParams({
     response_type: "code", client_id: clientId, redirect_uri: redirectUri,
     code_challenge: challenge, code_challenge_method: "S256", scope: "devspace offline_access",
-    resource, state,
+    resource: metadataBinding.resource.href, state,
   });
   const authorizationUrl = new URL(endpoint("authorization_endpoint"));
   authorizationUrl.search = params.toString();
@@ -184,7 +208,7 @@ async function authorizeNativeClient(
   if (!code || callback.searchParams.get("state") !== state) throw new CutoverStateError("OAuth authorization response has no valid code/state.");
   const token = await fetchFn(endpoint("token_endpoint"), {
     method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" },
-    body: new URLSearchParams({ grant_type: "authorization_code", client_id: clientId, redirect_uri: redirectUri, code, code_verifier: verifier, resource }),
+    body: new URLSearchParams({ grant_type: "authorization_code", client_id: clientId, redirect_uri: redirectUri, code, code_verifier: verifier, resource: metadataBinding.resource.href }),
   });
   if (!token.ok) throw new CutoverStateError(`OAuth token exchange failed: HTTP ${token.status}.`);
   const tokenBody = asRecord(await token.json(), "OAuth token response");
@@ -205,12 +229,13 @@ export async function performNativeObservedReplacementRecovery(
 ): Promise<NativeObservedReplacementResult> {
   if (options.ownerToken.length === 0) throw new CutoverStateError("OAuth owner token is not configured.");
   const fetchFn = options.fetch ?? globalThis.fetch;
-  const oauth = await authorizeNativeClient(options.serverUrl, options.ownerToken, fetchFn);
+  const oauth = await authorizeNativeClient(options.serverUrl, options.publicBaseUrl, options.ownerToken, fetchFn);
   const transport = new StreamableHTTPClientTransport(options.serverUrl, {
     requestInit: { headers: { Authorization: `Bearer ${oauth.tokens.access_token}` } },
     fetch: fetchFn,
   });
   const client = new Client({ name: "devspace-native-cutover", version: "1.0.0" });
+  let operationError: unknown;
   try {
     await client.connect(transport);
     const statusResult = structuredResult(await client.callTool({ name: "cutover_status", arguments: {} }), "cutover_status");
@@ -227,8 +252,15 @@ export async function performNativeObservedReplacementRecovery(
     const agentStatus = structuredResult(await client.callTool({ name: "agent_status", arguments: { workspaceId: options.workspaceId, agentId: options.agentId } }), "agent_status");
     const agent = structuredResult(await client.callTool({ name: "agent_reconcile", arguments: { workspaceId: options.workspaceId, agentId: options.agentId } }), "agent_reconcile");
     const workspaceSessions = typeof workspace.workspaceSessions === "number" ? workspace.workspaceSessions : 0;
-    if (workspaceSessions < 1 || workspace.detail === undefined) throw new CutoverStateError("workspace_inspect did not prove a durable workspace.");
-    if (requiredStringField(agent, "agentId", "agent_reconcile") !== options.agentId || requiredStringField(agentStatus, "agentId", "agent_status") !== options.agentId) throw new CutoverStateError("Live agent identity drifted during reconciliation.");
+    const details = Array.isArray(workspace.detail) ? workspace.detail : [];
+    const matchingWorkspace = details.some((entry) => {
+      if (!entry || typeof entry !== "object") return false;
+      const item = entry as JsonRecord;
+      const session = item.session;
+      return item.unit === `workspace:${options.workspaceId}` && !!session && typeof session === "object" && (session as JsonRecord).id === options.workspaceId && typeof (session as JsonRecord).root === "string";
+    });
+    if (workspaceSessions < 1 || !matchingWorkspace) throw new CutoverStateError("workspace_inspect did not prove the requested durable workspace identity and root.");
+    if (requiredStringField(agent, "agentId", "agent_reconcile") !== options.agentId || requiredStringField(agentStatus, "agentId", "agent_status") !== options.agentId || requiredStringField(agentStatus, "workspaceId", "agent_status") !== options.workspaceId) throw new CutoverStateError("Live agent identity or workspace binding drifted during reconciliation.");
     const witness: DurableReconciliationWitness = {
       witnessCutoverId: options.cutoverId, witnessServerInstanceId: serverInstanceId,
       witnessExpectedIdentity: { sourceCommit, buildId, capabilityManifestSha256 },
@@ -240,6 +272,8 @@ export async function performNativeObservedReplacementRecovery(
     const store = new CutoverStateStore(options.stateDir);
     const active = store.get();
     if (!active || active.cutoverId !== options.cutoverId) throw new CutoverStateError("Local durable cutover record does not match live cutover.");
+    const before = store.get();
+    if (!before || before.cutoverId !== options.cutoverId || before.phase !== "prepared" || before.restartRequest || before.drainEvidence) throw new CutoverStateError("Local cutover state changed before observed recovery.");
     const recovered = store.recoverObservedReplacement({
       cutoverId: options.cutoverId,
       expectedNewIdentity: { sourceCommit, buildId, capabilityManifestSha256 },
@@ -247,7 +281,12 @@ export async function performNativeObservedReplacementRecovery(
       recoveredBy: options.requesterIdentity.serverInstanceId,
       witness,
     });
-    return { cutover: recovered.record, newlyRecovered: recovered.newlyRecovered, serverInstanceId, expectedNewIdentity: { sourceCommit, buildId, capabilityManifestSha256 }, witness };
+    const after = store.get();
+    if (!after || after.phase !== "closed" || after.observedReplacement?.observedIdentity.serverInstanceId !== serverInstanceId || after.restartRequest || after.drainEvidence) throw new CutoverStateError("Local observed recovery readback did not match the authenticated witness.");
+    return { cutover: after, newlyRecovered: recovered.newlyRecovered, serverInstanceId, expectedNewIdentity: { sourceCommit, buildId, capabilityManifestSha256 }, witness };
+  } catch (error) {
+    operationError = error;
+    throw error;
   } finally {
     await client.close().catch(() => undefined);
     if (oauth.tokens.refresh_token) {
@@ -259,9 +298,16 @@ export async function performNativeObservedReplacementRecovery(
         if (issuer) {
           const authMetadata = asRecord(await fetchFn(new URL(".well-known/oauth-authorization-server", issuer)).then((response) => response.json()), "OAuth authorization metadata");
           const endpoint = authMetadata.revocation_endpoint;
-          if (typeof endpoint === "string") await fetchFn(endpoint, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ token: oauth.tokens.refresh_token, token_type_hint: "refresh_token", client_id: oauth.clientId }) });
+          if (typeof endpoint === "string") {
+            for (const token of [oauth.tokens.access_token, oauth.tokens.refresh_token].filter((value): value is string => Boolean(value))) {
+              const response = await fetchFn(endpoint, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ token, client_id: oauth.clientId }) });
+              if (!response.ok) throw new CutoverStateError(`OAuth token revocation failed: HTTP ${response.status}.`);
+            }
+          }
         }
-      } catch { /* revocation is best effort; no token is persisted */ }
+      } catch (error) {
+        if (!operationError) throw error;
+      }
     }
   }
 }
