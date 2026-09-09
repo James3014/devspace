@@ -419,6 +419,41 @@ test("Test 2 & 3 (controller) — recoverCutover on replacement with missing dra
   }
 });
 
+test("closed observed recovery validates identity even when replay has no witness", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-mcp-closed-replay-binding-"));
+  try {
+    const store = new CutoverStateStore(stateDir, { newId: () => "cutover-closed-binding" });
+    const old = new McpCutoverController(store, identity("old", "old-source", "old-build"));
+    old.begin({ sourceCommit: "new-source", buildId: "new-build", capabilityManifestSha256: "cap" });
+    const replacement = new McpCutoverController(store, identity("new", "new-source", "new-build"));
+    const witness: DurableReconciliationWitness = {
+      workspaceQueryable: true,
+      agentQueryable: true,
+      agentReconciled: true,
+      witnessWorkspaceId: "ws-closed",
+      witnessAgentId: "agent-closed",
+      witnessWorkspaceSessions: 1,
+      witnessAgentSessions: 1,
+      witnessKind: "exact-pair",
+    };
+    replacement.recoverCutover({
+      cutoverId: "cutover-closed-binding",
+      expectedNewIdentity: { sourceCommit: "new-source", buildId: "new-build", capabilityManifestSha256: "cap" },
+      witness,
+    });
+    assert.throws(
+      () => new McpCutoverController(store, identity("other", "new-source", "new-build"))
+        .recoverCutover({
+          cutoverId: "cutover-closed-binding",
+          expectedNewIdentity: { sourceCommit: "new-source", buildId: "new-build", capabilityManifestSha256: "cap" },
+        }),
+      /identity|binding/i,
+    );
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("Test 7 (controller) — recoverCutover without witness fails closed", () => {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-mcp-ctrl-nowit-"));
   try {

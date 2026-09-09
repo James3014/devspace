@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -449,6 +449,7 @@ test("recoverSupersede rendezvouses to the same successor and refuses a changed 
       }),
       /RECOVERY_BINDING_MISMATCH/i,
     );
+
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -1099,6 +1100,19 @@ test("Test 8 & 9 — exact replay idempotent, changed binding fails closed", () 
         recoveredBy: "inst-B",
       }),
       /RECOVERY_BINDING_MISMATCH/i,
+    );
+
+    const closedEvent = readdirSync(join(stateDir, "cutover", "active"))
+      .find((name) => name.startsWith("closed-"));
+    assert.ok(closedEvent);
+    const tampered = JSON.parse(readFileSync(join(stateDir, "cutover", "active", closedEvent), "utf8")) as {
+      observedReplacement: { cutoverId: string };
+    };
+    tampered.observedReplacement.cutoverId = "cutover-other";
+    writeFileSync(join(stateDir, "cutover", "active", closedEvent), `${JSON.stringify(tampered)}\n`);
+    assert.throws(
+      () => new CutoverStateStore(stateDir).get(),
+      /malformed|reconciliation/i,
     );
   } finally {
     rmSync(stateDir, { recursive: true, force: true });

@@ -29,6 +29,10 @@ export interface DurableReconciliationWitness {
   witnessAgentSessions?: number;
   witnessKind?: string;
   detail?: Array<{ unit: string; ok: boolean; detail?: string }>;
+  /** Optional generation binding carried only by observed-replacement recovery. */
+  witnessCutoverId?: string;
+  witnessServerInstanceId?: string;
+  witnessExpectedIdentity?: ExpectedCutoverIdentity;
 }
 
 export interface CutoverIdentityComparison {
@@ -361,17 +365,22 @@ export function recoverCutoverWithStore(
   }
   if (record.phase === "closed" && record.cutoverId === input.cutoverId) {
     if (record.observedReplacement?.cutoverId === input.cutoverId) {
-      if (input.witness) {
-        const res = store.recoverObservedReplacement({
-          cutoverId: input.cutoverId,
-          expectedNewIdentity: input.expectedNewIdentity,
-          observedIdentity: currentIdentity,
-          witness: input.witness,
-          recoveredBy: currentIdentity.serverInstanceId,
-        });
-        return { terminal: res.record, newlyRecovered: res.newlyRecovered };
-      }
-      return { terminal: record, newlyRecovered: false };
+      const receipt = record.observedReplacement;
+      const res = store.recoverObservedReplacement({
+        cutoverId: input.cutoverId,
+        expectedNewIdentity: input.expectedNewIdentity,
+        observedIdentity: currentIdentity,
+        witness: input.witness ?? {
+          ...receipt.reconciliationReceipt,
+          witnessWorkspaceId: receipt.witnessWorkspaceId,
+          witnessAgentId: receipt.witnessAgentId,
+          witnessWorkspaceSessions: receipt.witnessWorkspaceSessions,
+          witnessAgentSessions: receipt.witnessAgentSessions,
+          witnessKind: receipt.witnessKind,
+        },
+        recoveredBy: currentIdentity.serverInstanceId,
+      });
+      return { terminal: res.record, newlyRecovered: res.newlyRecovered };
     }
   }
   const eligibility = assessRecoveryEligibility(record, currentIdentity, input.expectedNewIdentity);
@@ -379,6 +388,14 @@ export function recoverCutoverWithStore(
     throw new CutoverStateError(`Cutover ${input.cutoverId} is not recoverable: ${eligibility.reason}`);
   }
   if (eligibility.mode === "observed_replacement") {
+    if (
+      !input.expectedNewIdentity.capabilityManifestSha256 &&
+      currentIdentity.capabilityManifestSha256
+    ) {
+      throw new CutoverStateError(
+        "Cannot recover cutover: observed replacement requires an explicitly bound capability manifest.",
+      );
+    }
     if (!input.witness) {
       throw new CutoverStateError(
         "Cannot recover cutover: durable agent/workspace reconciliation witness is not fully positive.",

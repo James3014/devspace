@@ -88,6 +88,9 @@ export interface DurableReconciliationWitness {
   witnessAgentSessions?: number;
   witnessKind?: string;
   detail?: Array<{ unit: string; ok: boolean; detail?: string }>;
+  witnessCutoverId?: string;
+  witnessServerInstanceId?: string;
+  witnessExpectedIdentity?: ExpectedCutoverIdentity;
 }
 
 export interface CutoverReconciliationReceipt {
@@ -784,6 +787,28 @@ export class CutoverStateStore {
     const witnessKind = input.witness.witnessKind ?? "exact-pair";
 
     if (
+      input.witness.witnessCutoverId !== undefined &&
+      input.witness.witnessCutoverId !== input.cutoverId
+    ) {
+      throw new CutoverStateError("[RECOVERY_BINDING_MISMATCH] Witness belongs to a different cutover generation.");
+    }
+    if (
+      input.witness.witnessServerInstanceId !== undefined &&
+      input.witness.witnessServerInstanceId !== input.observedIdentity.serverInstanceId
+    ) {
+      throw new CutoverStateError("[RECOVERY_BINDING_MISMATCH] Witness belongs to a different replacement instance.");
+    }
+    const witnessExpected = input.witness.witnessExpectedIdentity;
+    if (
+      witnessExpected &&
+      (witnessExpected.sourceCommit !== active.expectedNewIdentity.sourceCommit ||
+        witnessExpected.buildId !== active.expectedNewIdentity.buildId ||
+        witnessExpected.capabilityManifestSha256 !== active.expectedNewIdentity.capabilityManifestSha256)
+    ) {
+      throw new CutoverStateError("[RECOVERY_BINDING_MISMATCH] Witness expected identity does not match the cutover generation.");
+    }
+
+    if (
       !input.witness.workspaceQueryable ||
       !input.witness.agentQueryable ||
       !input.witness.agentReconciled ||
@@ -877,7 +902,43 @@ function parseRecord(raw: string): DurableCutoverRecord {
   ) {
     throw new CutoverStateError("Durable cutover record is malformed; reconciliation is required.");
   }
-  return value as DurableCutoverRecord;
+  const record = value as DurableCutoverRecord;
+  if (record.observedReplacement) {
+    const receipt = record.observedReplacement;
+    if (
+      receipt.cutoverId !== record.cutoverId ||
+      !identitiesEqual(receipt.oldServerIdentity, record.oldServerIdentity) ||
+      !expectedIdentitiesEqual(receipt.expectedIdentity, record.expectedNewIdentity) ||
+      receipt.observedIdentity.sourceCommit !== receipt.expectedIdentity.sourceCommit ||
+      receipt.observedIdentity.buildId !== receipt.expectedIdentity.buildId ||
+      (receipt.expectedIdentity.capabilityManifestSha256 !== undefined &&
+        receipt.observedIdentity.capabilityManifestSha256 !== receipt.expectedIdentity.capabilityManifestSha256) ||
+      receipt.reconciliationReceipt.closedByServerInstanceId !== receipt.observedIdentity.serverInstanceId ||
+      receipt.reconciliationReceipt.preRestartDrainObserved !== false ||
+      receipt.reconciliationReceipt.witnessWorkspaceId !== receipt.witnessWorkspaceId ||
+      receipt.reconciliationReceipt.witnessAgentId !== receipt.witnessAgentId ||
+      receipt.reconciliationReceipt.witnessWorkspaceSessions !== receipt.witnessWorkspaceSessions ||
+      receipt.reconciliationReceipt.witnessAgentSessions !== receipt.witnessAgentSessions ||
+      record.phase !== "closed" ||
+      record.drainEvidence !== undefined
+    ) {
+      throw new CutoverStateError("Durable cutover record is malformed; observed replacement binding is inconsistent.");
+    }
+  }
+  return record;
+}
+
+function identitiesEqual(a: CutoverServerIdentity, b: CutoverServerIdentity): boolean {
+  return a.serverInstanceId === b.serverInstanceId &&
+    a.sourceCommit === b.sourceCommit &&
+    a.buildId === b.buildId &&
+    a.capabilityManifestSha256 === b.capabilityManifestSha256;
+}
+
+function expectedIdentitiesEqual(a: ExpectedCutoverIdentity, b: ExpectedCutoverIdentity): boolean {
+  return a.sourceCommit === b.sourceCommit &&
+    a.buildId === b.buildId &&
+    a.capabilityManifestSha256 === b.capabilityManifestSha256;
 }
 
 function isReconciliationReceipt(value: unknown): value is CutoverReconciliationReceipt {

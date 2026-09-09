@@ -1622,6 +1622,16 @@ function registerCutoverMcpTools(
     async ({ cutoverId, workspaceId, agentId }) => {
       const activeRecord = control.controller.record();
       if (activeRecord && activeRecord.phase === "closed" && activeRecord.cutoverId === cutoverId) {
+        if (activeRecord.observedReplacement && control.executeObservedReplacementRecovery) {
+          const replay = await control.executeObservedReplacementRecovery({
+            cutoverId,
+            preferredPair: { workspaceId, agentId },
+          });
+          return {
+            content: [textBlock(`Finished cutover ${cutoverId}; mode=${replay.mode}.`)],
+            structuredContent: { cutover: replay.terminal as unknown as Record<string, unknown>, mode: replay.mode },
+          };
+        }
         const mode = control.controller.mode();
         return {
           content: [textBlock(`Finished cutover ${cutoverId}; mode=${mode}.`)],
@@ -4463,7 +4473,15 @@ export function createServer(
       };
     }
 
-    const witness = await resolveDurableReconciliationWitness(input.preferredPair, true);
+    const witnessBinding = {
+      witnessCutoverId: active.cutoverId,
+      witnessServerInstanceId: cutoverController.currentIdentity.serverInstanceId,
+      witnessExpectedIdentity: { ...active.expectedNewIdentity },
+    };
+    const witness = {
+      ...await resolveDurableReconciliationWitness(input.preferredPair, true),
+      ...witnessBinding,
+    };
     const recovered = cutoverController.recoverCutover({
       cutoverId: input.cutoverId,
       expectedNewIdentity: input.expectedNewIdentity ?? active.expectedNewIdentity,
