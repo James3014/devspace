@@ -33,12 +33,15 @@ for (const flag of ["-v", "--version"]) {
 for (const args of [
   ["cutover", "observe", "--cutover-id", "c", "--workspace-id", "w"],
   ["cutover", "observe", "--cutover-id", "c", "--workspace-id", "w", "--agent-id", "a", "--server-url", "https://foreign.invalid/mcp"],
+  ["cutover", "observe", "--cutover-id", "", "--workspace-id", "w", "--agent-id", "a"],
+  ["cutover", "observe", "--cutover-id", "c", "--workspace-id", "", "--agent-id", "a"],
+  ["cutover", "observe", "--cutover-id", "c", "--workspace-id", "w", "--agent-id", ""],
 ]) {
   assert.throws(
     () => execFileSync("node", ["--import", "tsx", "src/cli.ts", ...args], { encoding: "utf8", env: { ...process.env, DEVSPACE_CONFIG_DIR: "/tmp/devspace-cli-invalid-binding-test" } }),
     (error: unknown) => {
       const detail = error as { stderr?: string; status?: number };
-      return detail.status !== 0 && /Usage:|Unknown cutover observe flag/.test(detail.stderr ?? "");
+      return detail.status !== 0 && /Usage:|Unknown cutover observe flag|requires a value/.test(detail.stderr ?? "");
     },
   );
 }
