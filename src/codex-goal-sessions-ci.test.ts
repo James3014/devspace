@@ -36,7 +36,8 @@ if (process.platform !== "win32") {
   childProcessModule.fork = function (this: unknown, modulePath: unknown, args?: unknown[], ...rest: unknown[]) {
     const helper = typeof modulePath === "string" && /[\\/]conpty_console_list_agent(?:\.js)?$/.test(modulePath);
     if (!helper) return originalFork.call(this, modulePath, args, ...rest);
-    console.error("[codex-goal-ci-diagnostic] conpty fork", { modulePath, pid: process.pid });
+    const targetPid = typeof args?.[0] === "string" && args[0].length > 0 && args[0].split("").every((character) => character >= "0" && character <= "9") ? Number(args[0]) : undefined;
+    console.error("[codex-goal-ci-diagnostic] conpty fork", { modulePath, targetPid, pid: process.pid });
     const child = originalFork.call(this, modulePath, args, ...rest);
     console.error("[codex-goal-ci-diagnostic] conpty forked", { modulePath, childPid: child.pid, parentPid: process.pid });
     child.on("message", (message: unknown) => {
