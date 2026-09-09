@@ -40,6 +40,7 @@ type NativeFixtureOptions = {
   status?: () => Record<string, unknown>;
   tokenMode?: "access-only" | "both";
   pair?: { workspaceId: string; agentId: string; root: string };
+  revokeFailure?: boolean;
 };
 
 async function nativeHttpFixture(options: NativeFixtureOptions = {}) {
@@ -65,7 +66,7 @@ async function nativeHttpFixture(options: NativeFixtureOptions = {}) {
     if (req.method === "GET" && url.pathname === "/authorize") return json({ ok: true });
     if (req.method === "POST" && url.pathname === "/authorize") { const form = new URLSearchParams(body); res.writeHead(302, { location: `${form.get("redirect_uri")}?code=native-code&state=${form.get("state")}` }); return res.end(); }
     if (req.method === "POST" && url.pathname === "/token") return json(options.tokenMode === "access-only" ? { access_token: "native-access", token_type: "Bearer", scope: "devspace" } : { access_token: "native-access", refresh_token: "native-refresh", token_type: "Bearer", scope: "devspace" });
-    if (req.method === "POST" && url.pathname === "/revoke") { revoked.push(new URLSearchParams(body).get("token") ?? ""); res.writeHead(200); return res.end(); }
+    if (req.method === "POST" && url.pathname === "/revoke") { revoked.push(new URLSearchParams(body).get("token") ?? ""); if (options.revokeFailure) { res.writeHead(503); return res.end(); } res.writeHead(200); return res.end(); }
     if (req.method === "POST" && url.pathname === "/mcp") {
       const request = JSON.parse(body) as { id?: number; method?: string; params?: { name?: string } };
       if (request.method === "initialize") return json({ jsonrpc: "2.0", id: request.id, result: { protocolVersion: "2025-06-18", capabilities: { tools: {} }, serverInfo: { name: "native-test", version: "1" } } });
@@ -295,6 +296,17 @@ test("native adapter reports committed outcome when post-commit live readback fa
   const fixtureExpected = { sourceCommit: "target-source", buildId: "target-build", capabilityManifestSha256: "n".repeat(64) };
   const fixtureCurrent = { serverInstanceId: "new-native", ...fixtureExpected };
   try { await assert.rejects(() => performNativeObservedReplacementRecovery(nativeOptions(fixture)), NativeObservedReplacementCommittedError); assert.equal(fixture.store.get()?.phase, "closed"); } finally { await fixture.close(); }
+});
+
+test("native adapter preserves primary failure together with independent revocation cleanup failures", async () => {
+  const fixture = await nativeHttpFixture({ revokeFailure: true });
+  try {
+    await assert.rejects(
+      () => performNativeObservedReplacementRecovery({ ...nativeOptions(fixture), agentId: "wrong-agent" }),
+      (error: unknown) => error instanceof Error && Array.isArray((error as Error & { cleanupErrors?: unknown }).cleanupErrors),
+    );
+    assert.equal(fixture.store.get()?.phase, "prepared");
+  } finally { await fixture.close(); }
 });
 
 test("seam accepts an operator build-ready attestation when no probe root is configured", () => {

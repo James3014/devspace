@@ -335,6 +335,9 @@ export async function performNativeObservedReplacementRecovery(
         if (!response.ok || response.status >= 300) revocationErrors.push(`${kind}:HTTP ${response.status}`);
       } catch (error) { revocationErrors.push(`${kind}:${error instanceof Error ? error.message : String(error)}`); }
     }
+    if (revocationErrors.length > 0 && operationError instanceof Error) {
+      Object.defineProperty(operationError, "cleanupErrors", { value: revocationErrors, enumerable: true, configurable: true });
+    }
     if (revocationErrors.length > 0 && !operationError) {
       if (committedRecord) throw new NativeObservedReplacementCommittedError(committedRecord, `OAuth token revocation failed after commit; reconcile before retry: ${revocationErrors.join(",")}.`);
       throw new CutoverStateError(`OAuth token revocation failed: ${revocationErrors.join(",")}.`);
