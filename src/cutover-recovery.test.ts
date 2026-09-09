@@ -334,7 +334,7 @@ test("native adapter supports access-only cleanup and exact closed replay, then 
     assert.deepEqual(fixture.toolCalls.filter((name) => name !== "cutover_status"), ["workspace_inspect", "agent_status", "agent_reconcile"], "closed replay must not query the selected pair");
     assert.equal(replay.newlyRecovered, false);
     assert.equal(replay.cutover.observedReplacement?.observedIdentity.serverInstanceId, fixture.current.serverInstanceId);
-    const changed = await nativeHttpFixture({ status: () => ({ cutover: { cutoverId: "cutover-native", phase: "closed", oldServerIdentity: { serverInstanceId: "old-native" }, expectedNewIdentity: fixture.expected }, currentServerIdentity: { ...fixture.current, serverInstanceId: "changed-native" }, mode: "normal", reconciliationRequired: false }) });
+    const changed = await nativeHttpFixture({ status: () => ({ cutover: { cutoverId: "cutover-native", phase: "closed", oldServerIdentity: { serverInstanceId: "old-native", sourceCommit: "old-source", buildId: "old-build", capabilityManifestSha256: "m".repeat(64) }, expectedNewIdentity: fixture.expected }, currentServerIdentity: { ...fixture.current, serverInstanceId: "changed-native" }, mode: "normal", reconciliationRequired: false }) });
     try { await assert.rejects(() => performNativeObservedReplacementRecovery({ ...nativeOptions(changed), stateDir: fixture.stateDir }), /Closed replay identity|generation/); } finally { await changed.close(); }
   } finally { await fixture.close(); }
 });
@@ -431,6 +431,51 @@ test("native adapter rejects local cutover drift between final status and commit
   } finally { await fixture.close(); }
 });
 
+test("native adapter rejects a locally closed record while live status remains prepared", async () => {
+  const fixture = await nativeHttpFixture({
+    status: () => ({
+      cutover: { cutoverId: "cutover-native", phase: "prepared", oldServerIdentity: { serverInstanceId: "old-native", sourceCommit: "old-source", buildId: "old-build", capabilityManifestSha256: "m".repeat(64) }, expectedNewIdentity: fixture.expected },
+      currentServerIdentity: fixture.current,
+      mode: "reconcile-only",
+      reconciliationRequired: true,
+    }),
+  });
+  fixture.store.recoverObservedReplacement({
+    cutoverId: "cutover-native",
+    expectedNewIdentity: fixture.expected,
+    observedIdentity: fixture.current,
+    recoveredBy: "fixture",
+    witness: { witnessCutoverId: "cutover-native", witnessServerInstanceId: fixture.current.serverInstanceId, witnessExpectedIdentity: fixture.expected, workspaceQueryable: true, agentQueryable: true, agentReconciled: true, witnessWorkspaceId: fixture.pair.workspaceId, witnessAgentId: fixture.pair.agentId, witnessWorkspaceSessions: 1, witnessAgentSessions: 1, witnessKind: "exact-pair" },
+  });
+  try {
+    await assert.rejects(() => performNativeObservedReplacementRecovery(nativeOptions(fixture)), /closed|prepared|generation|binding/i);
+    assert.deepEqual(fixture.toolCalls.filter((name) => name !== "cutover_status"), []);
+  } finally { await fixture.close(); }
+});
+
+test("native adapter rejects precommit drain and restart state drift", async () => {
+  for (const drift of ["drainEvidence", "restartRequest"] as const) {
+    let statusReads = 0;
+    let driftStateDir: string | undefined;
+    const fixture = await nativeHttpFixture({
+      status: () => {
+        statusReads += 1;
+        if (statusReads === 2 && driftStateDir) {
+          const path = join(driftStateDir, "cutover", "active", "created.json");
+          const record = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+          writeFileSync(path, JSON.stringify({ ...record, ...(drift === "drainEvidence" ? { drainEvidence: { activeSessions: 1, oldestAgeMs: 1 } } : { restartRequest: { actuator: "launchd-self", requestedByServerInstanceId: "drift" } }) }));
+        }
+        return { cutover: { cutoverId: "cutover-native", phase: "prepared", oldServerIdentity: { serverInstanceId: "old-native", sourceCommit: "old-source", buildId: "old-build", capabilityManifestSha256: "m".repeat(64) }, expectedNewIdentity: { sourceCommit: "target-source", buildId: "target-build", capabilityManifestSha256: "n".repeat(64) } }, currentServerIdentity: { serverInstanceId: "new-native", sourceCommit: "target-source", buildId: "target-build", capabilityManifestSha256: "n".repeat(64) }, mode: "reconcile-only", reconciliationRequired: true };
+      },
+    });
+    driftStateDir = fixture.stateDir;
+    try {
+      await assert.rejects(() => performNativeObservedReplacementRecovery(nativeOptions(fixture)), /drain|restart|changed|prepared|generation|state/i);
+      assert.equal(fixture.store.get()?.phase, "prepared");
+    } finally { await fixture.close(); }
+  }
+});
+
 test("native adapter reports committed outcome when post-commit live readback fails", async () => {
   let reads = 0;
   const fixtureExpected = { sourceCommit: "target-source", buildId: "target-build", capabilityManifestSha256: "n".repeat(64) };
@@ -471,14 +516,20 @@ test("native adapter reports committed outcome when post-commit MCP network fail
 
 test("native adapter carries the committed record when durable post-commit read fails", async () => {
   const fixture = await nativeHttpFixture();
-  const prototype = CutoverStateStore.prototype as unknown as { get: () => unknown };
+  const prototype = CutoverStateStore.prototype as unknown as {
+    get: () => unknown;
+    recoverObservedReplacement: (input: unknown) => unknown;
+  };
   const originalGet = prototype.get;
-  let localReads = 0;
-  prototype.get = function(this: { cutoverRoot?: string }) {
-    if (this.cutoverRoot?.startsWith(join(fixture.stateDir, "cutover"))) {
-      localReads += 1;
-      if (localReads === 5) throw new Error("simulated durable read failure");
-    }
+  const originalRecover = prototype.recoverObservedReplacement;
+  let committed = false;
+  prototype.recoverObservedReplacement = function(this: unknown, input: unknown) {
+    const result = originalRecover.call(this, input);
+    if (this !== fixture.store) committed = true;
+    return result;
+  };
+  prototype.get = function(this: unknown) {
+    if (committed && this !== fixture.store) throw new Error("simulated durable post-commit read failure");
     return originalGet.call(this);
   };
   try {
@@ -486,13 +537,13 @@ test("native adapter carries the committed record when durable post-commit read 
       () => performNativeObservedReplacementRecovery(nativeOptions(fixture)),
       NativeObservedReplacementCommittedError,
     );
-    assert.equal(fixture.store.get()?.phase, "closed");
   } finally {
     prototype.get = originalGet;
+    prototype.recoverObservedReplacement = originalRecover;
+    assert.equal(fixture.store.get()?.phase, "closed");
     await fixture.close();
   }
 });
-
 test("native adapter preserves primary failure together with independent revocation cleanup failures", async () => {
   const fixture = await nativeHttpFixture({ revokeFailure: true });
   try {
