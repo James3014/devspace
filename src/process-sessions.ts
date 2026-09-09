@@ -236,6 +236,22 @@ export function isSanitizedEnvironmentKey(
     normalizedKey.startsWith("XDG_");
 }
 
+export function selectSanitizedEnvironment(
+  source: Record<string, string>,
+  platform: NodeJS.Platform = process.platform,
+): Record<string, string> {
+  const selected = new Map<string, [string, string]>();
+  for (const [key, value] of Object.entries(source)) {
+    if (!isSanitizedEnvironmentKey(key, platform)) continue;
+    const identity = platform === "win32" ? key.toUpperCase() : key;
+    const existing = selected.get(identity);
+    if (!existing || (platform === "win32" && key === identity && existing[0] !== identity)) {
+      selected.set(identity, [key, value]);
+    }
+  }
+  return Object.fromEntries(selected.values());
+}
+
 export function processEnvironment(
   policy: ProcessEnvironmentPolicy = "inherit",
   input?: {
@@ -247,11 +263,7 @@ export function processEnvironment(
     Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
   );
   const base = policy === "sanitized"
-    ? Object.fromEntries(
-        Object.entries(source).filter(
-          ([key]) => isSanitizedEnvironmentKey(key),
-        ),
-      )
+    ? selectSanitizedEnvironment(source)
     : source;
 
   return {

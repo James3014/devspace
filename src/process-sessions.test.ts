@@ -10,6 +10,7 @@ import {
   processEnvironment,
   ProcessSessionManager,
   resolvePtyShellInvocation,
+  selectSanitizedEnvironment,
 } from "./process-sessions.js";
 
 // Windows node-pty exposes termination as kill() without a POSIX signal;
@@ -28,6 +29,13 @@ import {
   assert.equal(isSanitizedEnvironmentKey("pAtH", "win32"), true);
   assert.equal(isSanitizedEnvironmentKey("systemroot", "linux"), false);
   assert.equal(isSanitizedEnvironmentKey("OPENAI_API_KEY", "win32"), false);
+  assert.deepEqual(
+    selectSanitizedEnvironment(
+      { Path: "lower-priority", PATH: "canonical", SystemRoot: "C:\\Windows", OPENAI_API_KEY: "secret" },
+      "win32",
+    ),
+    { PATH: "canonical", SystemRoot: "C:\\Windows" },
+  );
 
   const previousSecret = process.env.OPENAI_API_KEY;
   process.env.OPENAI_API_KEY = "must-not-cross-sanitized-boundary";
