@@ -46,6 +46,15 @@ import {
   );
   assert.equal(isSanitizedEnvironmentKey("lc_all", "win32"), true);
 
+  const reversedWindowsPath = selectSanitizedEnvironment({ Path: "lower-priority", PATH: "canonical" }, "win32");
+  assert.equal(reversedWindowsPath.PATH, "canonical");
+  assert.equal(reversedWindowsPath.Path, undefined);
+  const mixedCaseSecret = selectSanitizedEnvironment({ oPeNaI_aPi_KeY: "secret" }, "win32");
+  assert.deepEqual(mixedCaseSecret, {});
+  assert.equal(isSanitizedEnvironmentKey("OpenAI_API_Key", "win32"), false);
+  const lowercasePosixPath = selectSanitizedEnvironment({ path: "/tmp/unsafe", HOME: "/home/test" }, "linux");
+  assert.deepEqual(lowercasePosixPath, { HOME: "/home/test" });
+
   const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
   const previousMixedLocale = process.env.lC_aLl;
   const previousCanonicalLocale = process.env.LC_ALL;
