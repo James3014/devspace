@@ -1907,7 +1907,7 @@ test("P0-2: durable reconciliation witness fails closed on empty inventory, mism
 
     // Failure-first regression: a valid first agent must not hide a second,
     // unbound durable record from the full reconciliation inventory.
-    agentStore.create({
+    const unrelatedAgent = agentStore.create({
       workspaceRoot: secondProject,
       profileName: "p02-unbound",
       provider: "codex",
@@ -1920,6 +1920,24 @@ test("P0-2: durable reconciliation witness fails closed on empty inventory, mism
     assert.equal(inventoryWitness.agentQueryable, false);
     assert.equal(inventoryWitness.agentReconciled, false);
     assert.ok(inventoryWitness.detail?.some((entry) => entry.detail?.includes("unbound")));
+
+    // Explicit manual pair selection must query only the supplied pair. The
+    // unrelated malformed record remains untouched and cannot poison this
+    // exact-pair witness, while automatic inventory remains fail-closed above.
+    const unrelatedBefore = agentStore.getById(unrelatedAgent.id);
+    const exactPairWitness = await resolveDurableReconciliationWitnessFromInventory(
+      { workspaceStore: wsStore, workspaces, agentSessionManager: agentManager },
+      { workspaceId: "ws_p02", agentId: agent.id },
+      true,
+    );
+    assert.equal(exactPairWitness.workspaceQueryable, true);
+    assert.equal(exactPairWitness.agentQueryable, true);
+    assert.equal(exactPairWitness.agentReconciled, true);
+    assert.equal(exactPairWitness.witnessWorkspaceSessions, 1);
+    assert.equal(exactPairWitness.witnessAgentSessions, 1);
+    assert.equal(exactPairWitness.witnessKind, "exact-pair");
+    assert.ok(!exactPairWitness.detail?.some((entry) => entry.unit.includes(unrelatedAgent.id)));
+    assert.deepEqual(agentStore.getById(unrelatedAgent.id), unrelatedBefore);
 
     // Mismatched pair -> fails closed
     assert.throws(
@@ -1969,15 +1987,8 @@ test("P0-2: durable reconciliation witness fails closed on empty inventory, mism
       expectedNewIdentity: expectedIdentity,
       observedIdentity: replacementIdentity,
       witness: {
+        ...exactPairWitness,
           witnessCutoverId: "cutover-p02", witnessServerInstanceId: "new", witnessExpectedIdentity: expectedIdentity,
-        workspaceQueryable: true,
-        agentQueryable: true,
-        agentReconciled: true,
-        witnessWorkspaceId: "ws_p02",
-        witnessAgentId: agent.id,
-        witnessWorkspaceSessions: 1,
-        witnessAgentSessions: 1,
-        witnessKind: "exact-pair",
       },
       recoveredBy: "new",
     });
