@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import {
@@ -75,16 +75,18 @@ function dependencyBridgeFixture(version = "1.0.0") {
       "} });",
     ].join("\n"),
   );
-  writeFileSync(
-    verifierExecutable,
-    [
-      "#!/usr/bin/env node",
-      'import { spawnSync } from "node:child_process";',
-      `const child = spawnSync(process.execPath, ["--import", ${JSON.stringify(pathToFileURL(verifierLoader).href)}, ...process.argv.slice(2)], { env: process.env, stdio: "inherit" });`,
-      "process.exit(child.status ?? 1);",
-    ].join("\n"),
-    { mode: 0o755 },
-  );
+  if (process.platform !== "win32") {
+    writeFileSync(
+      verifierExecutable,
+      [
+        "#!/usr/bin/env node",
+        'import { spawnSync } from "node:child_process";',
+        `const child = spawnSync(process.execPath, ["--import", ${JSON.stringify(pathToFileURL(verifierLoader).href)}, ...process.argv.slice(2)], { env: process.env, stdio: "inherit" });`,
+        "process.exit(child.status ?? 1);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+  }
   writeFileSync(join(workspace, "source-value.mjs"), "export default 'worktree-source';\n");
   writeFileSync(
     join(workspace, "probe.mjs"),
@@ -169,7 +171,7 @@ test("dependency bridge admits a differing source lock when selected Candidate p
     assert.equal(environment.EXISTING, "kept");
     assert.equal(environment.NODE_PATH, realpathSync(join(fixture.root, "node_modules")));
     assert.equal(
-      environment.PATH?.split(":")[0],
+      environment.PATH?.split(delimiter)[0],
       realpathSync(join(fixture.root, "node_modules", ".bin")),
     );
     assert.equal(environment.DEVSPACE_DEPENDENCY_ROOT, realpathSync(fixture.root));
