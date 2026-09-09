@@ -46,6 +46,24 @@ import {
   );
   assert.equal(isSanitizedEnvironmentKey("lc_all", "win32"), true);
 
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+  const previousMixedLocale = process.env.lC_aLl;
+  const previousCanonicalLocale = process.env.LC_ALL;
+  try {
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    process.env.lC_aLl = "mixedcase-locale";
+    delete process.env.LC_ALL;
+    const mixedLocaleEnvironment = processEnvironment("sanitized");
+    assert.equal(mixedLocaleEnvironment.LC_ALL, "mixedcase-locale");
+    assert.equal(mixedLocaleEnvironment.lC_aLl, undefined);
+  } finally {
+    if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
+    if (previousMixedLocale === undefined) delete process.env.lC_aLl;
+    else process.env.lC_aLl = previousMixedLocale;
+    if (previousCanonicalLocale === undefined) delete process.env.LC_ALL;
+    else process.env.LC_ALL = previousCanonicalLocale;
+  }
+
   const previousSecret = process.env.OPENAI_API_KEY;
   process.env.OPENAI_API_KEY = "must-not-cross-sanitized-boundary";
   try {
