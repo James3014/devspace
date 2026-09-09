@@ -206,10 +206,7 @@ export async function commitCandidate(options: {
     throw new GitCandidateError("GIT_MANAGED_WORKTREE_REQUIRED", "Workspace root is not a Git repository.");
   }
 
-  const samePhysicalRoot = process.platform === "win32"
-    ? resolvedWorkspaceRoot.toLowerCase() === toplevel.toLowerCase()
-    : resolvedWorkspaceRoot === toplevel;
-  if (!samePhysicalRoot) {
+  if (resolvedWorkspaceRoot !== toplevel) {
     throw new GitCandidateError(
       "GIT_MANAGED_WORKTREE_REQUIRED",
       `Workspace root '${resolvedWorkspaceRoot}' does not match physical Git toplevel '${toplevel}'`,
