@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -193,7 +193,7 @@ test("seam accepts an operator build-ready attestation when no probe root is con
   }
 });
 
-test("Test 10 — restart replay prevention: replacement exists, recovery never schedules restart", () => {
+test("Test 10 — restart replay prevention: replacement exists, recovery creates no restart markers", () => {
   const { stateDir, store } = makeStateDir();
   try {
     const target = {
@@ -229,9 +229,11 @@ test("Test 10 — restart replay prevention: replacement exists, recovery never 
       witnessKind: "exact-pair",
     };
 
-    let actuatorCalls = 0;
     const preRecoveryRecord = store.get();
     const preRestartRequest = preRecoveryRecord?.restartRequest;
+    const activeDir = join(stateDir, "cutover", "active");
+    assert.equal(existsSync(join(activeDir, "restart-requested.json")), false);
+    assert.equal(existsSync(join(activeDir, "restart-scheduled.json")), false);
 
     const result = performCutoverRecovery({
       store,
@@ -249,14 +251,14 @@ test("Test 10 — restart replay prevention: replacement exists, recovery never 
     assert.equal(result.terminal.drainEvidence, undefined);
     assert.equal(result.terminal.observedReplacement?.preRestartDrainObserved, false);
 
-    // P0-5: Restart replay spy/counter assertions
-    assert.equal(actuatorCalls, 0, "Restart actuator must NEVER be called for observed replacement");
     const active = store.get();
     assert.deepEqual(
       active?.restartRequest,
       preRestartRequest,
-      "restartRequest marker count/state must remain unchanged",
+      "restartRequest state must remain unchanged",
     );
+    assert.equal(existsSync(join(activeDir, "restart-requested.json")), false);
+    assert.equal(existsSync(join(activeDir, "restart-scheduled.json")), false);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
