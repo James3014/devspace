@@ -698,7 +698,10 @@ try {
     workspaceId: "ws_g2",
     sessionId: retainedOutput.sessionId!,
     chars: "",
-    yieldTimeMs: 500,
+    // Windows node-pty waits up to FLUSH_DATA_INTERVAL (1s) after the
+    // process exit before reporting the PTY as closed; allow one bounded
+    // poll to observe the actual terminal state.
+    yieldTimeMs: 1_500,
   });
   assert.equal(polledOutput.running, false);
   assert.match(`${retainedOutput.output}${polledOutput.output}`, /later/);
