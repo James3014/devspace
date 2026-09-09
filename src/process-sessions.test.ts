@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createRequire } from "node:module";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import {
@@ -22,8 +23,15 @@ import {
 {
   const command = `"C:\\Program Files\\Node\\node.exe" -e "console.log('windows spaces')"`;
   const invocation = resolvePtyShellInvocation(command, "win32", { ComSpec: "C:\\Windows\\System32\\cmd.exe" });
-  assert.deepEqual(invocation.args, ["/d"]);
-  assert.equal(invocation.initialInput, `${command}\r\nexit\r\n`);
+  assert.equal(invocation.args, `/d /s /c ${command}`);
+  const require = createRequire(import.meta.url);
+  const { argsToCommandLine } = require("node-pty/lib/windowsPtyAgent.js") as {
+    argsToCommandLine(file: string, args: string[] | string): string;
+  };
+  assert.equal(
+    argsToCommandLine(invocation.executable, invocation.args),
+    `C:\\Windows\\System32\\cmd.exe /d /s /c ${command}`,
+  );
 
   const posix = resolvePtyShellInvocation("printf 'posix'", "linux", { SHELL: "/bin/bash" });
   assert.deepEqual(posix, { executable: "/bin/bash", args: ["-lc", "printf 'posix'"] });

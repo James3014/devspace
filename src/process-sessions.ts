@@ -90,8 +90,7 @@ interface ManagedProcess {
 
 export interface PtyShellInvocation {
   executable: string;
-  args: string[];
-  initialInput?: string;
+  args: string[] | string;
 }
 
 export function resolvePtyShellInvocation(
@@ -101,14 +100,11 @@ export function resolvePtyShellInvocation(
 ): PtyShellInvocation {
   const shell = resolveShellCommand(command, platform, environment);
   if (platform === "win32") {
-    // node-pty applies CRT quoting to every argv entry on Windows. Passing a
-    // command containing a quoted executable as the /c argument therefore
-    // escapes the quotes twice. Feed cmd interactively so the command reaches
-    // cmd.exe with its original quoting intact.
+    // node-pty applies CRT quoting to every argv entry on Windows. Its raw
+    // command-line form preserves cmd's original quoting for the /c payload.
     return {
       executable: shell.executable,
-      args: ["/d"],
-      initialInput: `${command}\r\nexit\r\n`,
+      args: `/d /s /c ${command}`,
     };
   }
   return shell;
@@ -647,7 +643,6 @@ export class ProcessSessionManager {
     pty.onExit(({ exitCode, signal }) => {
       this.finish(session, exitCode, signal === 0 ? undefined : String(signal));
     });
-    if (shell?.initialInput) pty.write(shell.initialInput);
   }
 
   private finish(session: ProcessSession, exitCode?: number, signal?: string): void {
