@@ -41,6 +41,7 @@ type NativeFixtureOptions = {
   tokenMode?: "access-only" | "both";
   pair?: { workspaceId: string; agentId: string; root: string };
   revokeFailure?: boolean;
+  callbackOverride?: string;
 };
 
 async function nativeHttpFixture(options: NativeFixtureOptions = {}) {
@@ -64,7 +65,7 @@ async function nativeHttpFixture(options: NativeFixtureOptions = {}) {
     if (req.method === "GET" && url.pathname === "/.well-known/oauth-authorization-server") return json({ issuer: `http://${req.headers.host}/`, authorization_endpoint: `http://${req.headers.host}/authorize`, registration_endpoint: `http://${req.headers.host}/register`, token_endpoint: `http://${req.headers.host}/token`, revocation_endpoint: `http://${req.headers.host}/revoke` });
     if (req.method === "POST" && url.pathname === "/register") return json({ client_id: "native-test-client" }, 201);
     if (req.method === "GET" && url.pathname === "/authorize") return json({ ok: true });
-    if (req.method === "POST" && url.pathname === "/authorize") { const form = new URLSearchParams(body); res.writeHead(302, { location: `${form.get("redirect_uri")}?code=native-code&state=${form.get("state")}` }); return res.end(); }
+    if (req.method === "POST" && url.pathname === "/authorize") { const form = new URLSearchParams(body); res.writeHead(302, { location: `${options.callbackOverride ?? form.get("redirect_uri")}?code=native-code&state=${form.get("state")}` }); return res.end(); }
     if (req.method === "POST" && url.pathname === "/token") return json(options.tokenMode === "access-only" ? { access_token: "native-access", token_type: "Bearer", scope: "devspace" } : { access_token: "native-access", refresh_token: "native-refresh", token_type: "Bearer", scope: "devspace" });
     if (req.method === "POST" && url.pathname === "/revoke") { revoked.push(new URLSearchParams(body).get("token") ?? ""); if (options.revokeFailure) { res.writeHead(503); return res.end(); } res.writeHead(200); return res.end(); }
     if (req.method === "POST" && url.pathname === "/mcp") {
@@ -76,7 +77,7 @@ async function nativeHttpFixture(options: NativeFixtureOptions = {}) {
         if (name === "cutover_status") { statusReads += 1; const status = options.status?.() ?? statusDefault(); if (!options.status && statusReads >= 3) status.cutover = { ...(status.cutover as Record<string, unknown>), phase: "closed" }; return json({ jsonrpc: "2.0", id: request.id, result: { structuredContent: { status }, content: [] } }); }
         if (name === "workspace_inspect") return json({ jsonrpc: "2.0", id: request.id, result: { structuredContent: { workspaceSessions: 1, detail: [{ unit: `workspace:${pair.workspaceId}`, session: { id: pair.workspaceId, root: pair.root } }] }, content: [] } });
         if (name === "agent_status") return json({ jsonrpc: "2.0", id: request.id, result: { structuredContent: { agentId: pair.agentId, workspaceId: pair.workspaceId, workspaceRoot: pair.root, status: "running" }, content: [] } });
-        if (name === "agent_reconcile") return json({ jsonrpc: "2.0", id: request.id, result: { structuredContent: { agentId: pair.agentId, workspaceId: pair.workspaceId }, content: [] } });
+        if (name === "agent_reconcile") return json({ jsonrpc: "2.0", id: request.id, result: { structuredContent: { agentId: pair.agentId, workspace: { head: "test-head", dirty: false }, candidate: { present: false, changedPaths: [], unexpectedPaths: [], scopeState: "clean" } }, content: [] } });
       }
     }
     json({ error: "not found" }, 404);

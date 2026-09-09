@@ -213,6 +213,7 @@ async function authorizeNativeClient(
   const location = approval.headers.get("location");
   if (!location) throw new CutoverStateError(`OAuth owner authorization failed: HTTP ${approval.status}.`);
   const callback = new URL(location);
+  if (callback.origin !== new URL(redirectUri).origin || callback.pathname !== new URL(redirectUri).pathname || callback.hash !== "") throw new CutoverStateError("OAuth authorization callback origin/path binding failed.");
   const code = callback.searchParams.get("code");
   if (!code || callback.searchParams.get("state") !== state) throw new CutoverStateError("OAuth authorization response has no valid code/state.");
   const token = await fetchFn(endpoint("token_endpoint"), {
@@ -258,6 +259,18 @@ export async function performNativeObservedReplacementRecovery(
     const sourceCommit = requiredStringField(current, "sourceCommit", "cutover_status");
     const buildId = requiredStringField(current, "buildId", "cutover_status");
     const capabilityManifestSha256 = requiredStringField(current, "capabilityManifestSha256", "cutover_status");
+    const store = new CutoverStateStore(options.stateDir);
+    const before = store.get();
+    if (!before || before.cutoverId !== options.cutoverId) throw new CutoverStateError("Local durable cutover record does not match live cutover.");
+    const liveExpected = requiredRecordField(cutover, "expectedNewIdentity", "cutover_status");
+    const liveOld = requiredRecordField(cutover, "oldServerIdentity", "cutover_status");
+    if (before.expectedNewIdentity.sourceCommit !== sourceCommit || before.expectedNewIdentity.buildId !== buildId || before.expectedNewIdentity.capabilityManifestSha256 !== capabilityManifestSha256 || liveExpected.sourceCommit !== sourceCommit || liveExpected.buildId !== buildId || liveExpected.capabilityManifestSha256 !== capabilityManifestSha256 || liveOld.serverInstanceId !== before.oldServerIdentity.serverInstanceId || liveOld.sourceCommit !== before.oldServerIdentity.sourceCommit || liveOld.buildId !== before.oldServerIdentity.buildId || liveOld.capabilityManifestSha256 !== before.oldServerIdentity.capabilityManifestSha256) throw new CutoverStateError("Local and live cutover generation bindings do not agree.");
+    if (before.phase === "closed") {
+      const observed = before.observedReplacement?.observedIdentity;
+      if (!observed || observed.serverInstanceId !== serverInstanceId || observed.sourceCommit !== sourceCommit || observed.buildId !== buildId || observed.capabilityManifestSha256 !== capabilityManifestSha256) throw new CutoverStateError("Closed replay identity does not match the authenticated replacement.");
+      committedRecord = before;
+      return { cutover: before, newlyRecovered: false, serverInstanceId, expectedNewIdentity: { sourceCommit, buildId, capabilityManifestSha256 }, witness: { ...before.reconciliationReceipt, witnessCutoverId: options.cutoverId, witnessServerInstanceId: serverInstanceId, witnessExpectedIdentity: { sourceCommit, buildId, capabilityManifestSha256 }, witnessWorkspaceId: before.reconciliationReceipt.witnessWorkspaceId, witnessAgentId: before.reconciliationReceipt.witnessAgentId, witnessWorkspaceSessions: before.reconciliationReceipt.witnessWorkspaceSessions, witnessAgentSessions: before.reconciliationReceipt.witnessAgentSessions, witnessKind: before.reconciliationReceipt.witnessKind } };
+    }
     const workspace = structuredResult(await client.callTool({ name: "workspace_inspect", arguments: { workspaceId: options.workspaceId } }), "workspace_inspect");
     const agentStatus = structuredResult(await client.callTool({ name: "agent_status", arguments: { workspaceId: options.workspaceId, agentId: options.agentId } }), "agent_status");
     const agent = structuredResult(await client.callTool({ name: "agent_reconcile", arguments: { workspaceId: options.workspaceId, agentId: options.agentId } }), "agent_reconcile");
@@ -272,7 +285,7 @@ export async function performNativeObservedReplacementRecovery(
     const selectedSession = details.find((entry) => entry && typeof entry === "object" && (entry as JsonRecord).unit === `workspace:${options.workspaceId}`) as JsonRecord | undefined;
     const selectedRoot = selectedSession && (selectedSession.session as JsonRecord | undefined)?.root;
     if (workspaceSessions < 1 || !matchingWorkspace || typeof selectedRoot !== "string") throw new CutoverStateError("workspace_inspect did not prove the requested durable workspace identity and root.");
-    if (requiredStringField(agent, "agentId", "agent_reconcile") !== options.agentId || requiredStringField(agent, "workspaceId", "agent_reconcile") !== options.workspaceId || requiredStringField(agentStatus, "agentId", "agent_status") !== options.agentId || requiredStringField(agentStatus, "workspaceId", "agent_status") !== options.workspaceId || requiredStringField(agentStatus, "workspaceRoot", "agent_status") !== selectedRoot) throw new CutoverStateError("Live agent identity or workspace binding drifted during reconciliation.");
+    if (requiredStringField(agent, "agentId", "agent_reconcile") !== options.agentId || requiredStringField(agentStatus, "agentId", "agent_status") !== options.agentId || requiredStringField(agentStatus, "workspaceId", "agent_status") !== options.workspaceId || requiredStringField(agentStatus, "workspaceRoot", "agent_status") !== selectedRoot) throw new CutoverStateError("Live agent identity or workspace binding drifted during reconciliation.");
     const witness: DurableReconciliationWitness = {
       witnessCutoverId: options.cutoverId, witnessServerInstanceId: serverInstanceId,
       witnessExpectedIdentity: { sourceCommit, buildId, capabilityManifestSha256 },
@@ -281,21 +294,9 @@ export async function performNativeObservedReplacementRecovery(
       workspaceSessions, agentSessions: 1, witnessWorkspaceSessions: workspaceSessions, witnessAgentSessions: 1,
       witnessKind: "exact-pair", detail: [{ unit: "native-mcp", ok: true, detail: "authenticated status, workspace, agent status, and reconciliation agree" }],
     };
-    const store = new CutoverStateStore(options.stateDir);
-    const active = store.get();
-    if (!active || active.cutoverId !== options.cutoverId) throw new CutoverStateError("Local durable cutover record does not match live cutover.");
-    const before = store.get();
     if (!before || before.cutoverId !== options.cutoverId) throw new CutoverStateError("Local cutover state changed before observed recovery.");
     const activeDir = join(options.stateDir, "cutover", "active");
     if (existsSync(join(activeDir, "restart-requested.json")) || existsSync(join(activeDir, "restart-scheduled.json"))) throw new CutoverStateError("Observed recovery refuses existing restart markers.");
-    const liveExpected = requiredRecordField(cutover, "expectedNewIdentity", "cutover_status");
-    const liveOld = requiredRecordField(cutover, "oldServerIdentity", "cutover_status");
-    if (before.expectedNewIdentity.sourceCommit !== sourceCommit || before.expectedNewIdentity.buildId !== buildId || before.expectedNewIdentity.capabilityManifestSha256 !== capabilityManifestSha256 || liveExpected.sourceCommit !== sourceCommit || liveExpected.buildId !== buildId || liveExpected.capabilityManifestSha256 !== capabilityManifestSha256 || liveOld.serverInstanceId !== before.oldServerIdentity.serverInstanceId) throw new CutoverStateError("Local and live cutover generation bindings do not agree.");
-    if (before.phase === "closed") {
-      const observed = before.observedReplacement?.observedIdentity;
-      if (!observed || observed.serverInstanceId !== serverInstanceId || observed.sourceCommit !== sourceCommit || observed.buildId !== buildId || observed.capabilityManifestSha256 !== capabilityManifestSha256) throw new CutoverStateError("Closed replay identity does not match the authenticated replacement.");
-      return { cutover: before, newlyRecovered: false, serverInstanceId, expectedNewIdentity: { sourceCommit, buildId, capabilityManifestSha256 }, witness };
-    }
     if (before.phase !== "prepared" || before.restartRequest || before.drainEvidence) throw new CutoverStateError("Local cutover state changed before observed recovery.");
     const commitStatusResult = structuredResult(await client.callTool({ name: "cutover_status", arguments: {} }), "cutover_status before commit");
     const commitStatus = requiredRecordField(commitStatusResult, "status", "cutover_status before commit");
