@@ -14,6 +14,17 @@ const require = createRequire(import.meta.url);
 const pathModule = require("node:path") as { join: (...paths: string[]) => string };
 const originalJoin = pathModule.join;
 let patchedWindowsCollisionPath = false;
+let diagnosticPhase = "setup";
+const diagnosticWatchdog = setTimeout(() => {
+  const resources = typeof process.getActiveResourcesInfo === "function"
+    ? process.getActiveResourcesInfo()
+    : ["active-resource-inspection-unavailable"];
+  console.error(
+    `[process-sessions-ci] watchdog timeout phase=${diagnosticPhase} activeResources=${resources.join(",")}`,
+  );
+  throw new Error(`process-sessions-ci watchdog timeout during ${diagnosticPhase}`);
+}, 120_000);
+diagnosticWatchdog.unref();
 
 if (process.platform === "win32") {
   // NTFS rejects ':' in a path component, so exercise the same delimiter
@@ -58,8 +69,14 @@ if (process.platform === "win32") {
 }
 
 try {
+  diagnosticPhase = "process-sessions-import-start";
+  console.error(`[process-sessions-ci] phase=${diagnosticPhase}`);
   await import("./process-sessions.test.js");
+  diagnosticPhase = "process-sessions-import-complete";
+  console.error(`[process-sessions-ci] phase=${diagnosticPhase}`);
 } finally {
+  diagnosticPhase = "cleanup-start";
+  console.error(`[process-sessions-ci] phase=${diagnosticPhase}`);
   if (patchedWindowsCollisionPath) {
     pathModule.join = originalJoin;
     syncBuiltinESMExports();
@@ -67,4 +84,7 @@ try {
   if (createdLegacyTmpRoot) {
     rmSync(legacyTmpRoot, { recursive: true, force: true });
   }
+  clearTimeout(diagnosticWatchdog);
+  diagnosticPhase = "cleanup-complete";
+  console.error(`[process-sessions-ci] phase=${diagnosticPhase}`);
 }
