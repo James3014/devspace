@@ -314,17 +314,17 @@ test("Windows self-discovery resolves the native vendor executable", () => {
   }
 });
 
-test("Windows explicit SDK discovery does not borrow an ancestor native package", () => {
+test("Windows explicit SDK discovery does not borrow a reconstructed ancestor native package", () => {
   if (process.platform !== "win32") return;
   const root = mkdtempSync(join(tmpdir(), "devspace-explicit-codex-"));
-  const sdkPackagePath = join(root, "owned", "node_modules", "@openai", "codex-sdk", "package.json");
-  const ancestorExecutable = join(root, "node_modules", "@openai", "codex", "vendor", windowsTargetTriple(), "bin", "codex.exe");
+  const sdkPackagePath = join(root, "a", "b", "owned", "sdk", "package.json");
+  const ancestorExecutable = join(root, "a", "node_modules", "@openai", windowsPlatformPackageName(), "vendor", windowsTargetTriple(), "bin", "codex.exe");
   try {
     mkdirSync(dirname(sdkPackagePath), { recursive: true });
     writeFileSync(sdkPackagePath, JSON.stringify({ name: "@openai/codex-sdk", version: MINIMUM_CODEX_RUNTIME_VERSION }));
     mkdirSync(dirname(ancestorExecutable), { recursive: true });
     compileWindowsExecutable(ancestorExecutable, MINIMUM_CODEX_RUNTIME_VERSION);
-    const identity = inspectCodexRuntime({ sdkPackagePath });
+    const identity = inspectCodexRuntime({ sdkPackagePath, env: {} });
     assert.equal(identity.ready, false);
     assert.match(identity.reason ?? "", /could not be resolved|does not exist/);
   } finally {
