@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test, { after } from "node:test";
@@ -38,21 +38,31 @@ const codexSdkPackagePath = join(
   "codex-sdk",
   "package.json",
 );
-const codexExecutable = join(
-  codexRuntimeRoot,
-  "node_modules",
-  "@openai",
-  "codex",
-  "bin",
-  "codex.js",
-);
 mkdirSync(join(codexRuntimeRoot, "node_modules", "@openai", "codex-sdk"), { recursive: true });
-mkdirSync(join(codexRuntimeRoot, "node_modules", "@openai", "codex", "bin"), { recursive: true });
 writeFileSync(
   codexSdkPackagePath,
   JSON.stringify({ name: "@openai/codex-sdk", version: "0.149.0" }),
 );
-writeFileSync(codexExecutable, "#!/bin/sh\necho 'codex-cli 0.149.0'\n", { mode: 0o755 });
+const codexExecutable = process.platform === "win32"
+  ? join(codexRuntimeRoot, "node_modules", "@openai", process.arch === "arm64" ? "codex-win32-arm64" : "codex-win32-x64", "vendor", process.arch === "arm64" ? "aarch64-pc-windows-msvc" : "x86_64-pc-windows-msvc", "bin", "codex.exe")
+  : join(codexRuntimeRoot, "node_modules", "@openai", "codex", "bin", "codex.js");
+mkdirSync(dirname(codexExecutable), { recursive: true });
+if (process.platform === "win32") {
+  const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT;
+  const compiler = systemRoot
+    ? join(systemRoot, "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe")
+    : "";
+  if (!compiler) throw new Error("Windows PE fixture compiler is unavailable: SystemRoot");
+  const source = `${codexExecutable}.cs`;
+  writeFileSync(source, 'using System; class Program { static void Main() { Console.WriteLine("codex-cli 0.149.0"); } }');
+  try {
+    execFileSync(compiler, ["/nologo", "/target:exe", `/out:${codexExecutable}`, source], { stdio: "ignore" });
+  } finally {
+    rmSync(source, { force: true });
+  }
+} else {
+  writeFileSync(codexExecutable, "#!/bin/sh\necho 'codex-cli 0.149.0'\n", { mode: 0o755 });
+}
 process.env.DEVSPACE_DEPENDENCY_ROOT = codexRuntimeRoot;
 
 after(() => {
@@ -4040,21 +4050,35 @@ test("symlink fingerprint derives from link target text, not external target byt
 test("pathspec-magic-looking filename is fingerprinted literally", async () => {
   const f = setupGitFixture();
   try {
-    const magicName = ":(glob)*.txt";
+    const magicName = process.platform === "win32" ? "[ab].txt" : ":(glob)*.txt";
+    const unrelatedName = process.platform === "win32" ? "a.txt" : "unrelated.txt";
     writeFileSync(join(f.repo, magicName), "magic v1");
-    writeFileSync(join(f.repo, "unrelated.txt"), "A");
+    writeFileSync(join(f.repo, unrelatedName), "A");
     runGitRaw(["add", "."], f.repo);
     runGitRaw(["commit", "-m", "seed magic-name and unrelated paths"], f.repo);
 
     writeFileSync(join(f.repo, magicName), "magic v2");
     const first = await inspectWorkspacePhysicalState(f.repo);
     const firstFp = first.fingerprints?.[magicName];
+    if (!firstFp) {
+      const resolvePath = (resolver: (path: string) => string, path: string) => {
+        try { return resolver(path); } catch (error) { return `ERROR:${String(error)}`; }
+      };
+      console.error(JSON.stringify({
+        fixtureRepo: f.repo,
+        gitRoot: runGitRaw(["rev-parse", "--show-toplevel"], f.repo),
+        repoRealpath: resolvePath(realpathSync, f.repo),
+        repoNativeRealpath: resolvePath(realpathSync.native, f.repo),
+        changedPaths: first.changedPaths,
+        fingerprintKeys: Object.keys(first.fingerprints ?? {}),
+      }));
+    }
     assert.ok(firstFp);
     assert.equal(firstFp.kind, "modified");
     assert.ok(typeof firstFp.gitStateHash === "string" && firstFp.gitStateHash.length > 0);
 
-    writeFileSync(join(f.repo, "unrelated.txt"), "B");
-    runGitRaw(["add", "unrelated.txt"], f.repo);
+    writeFileSync(join(f.repo, unrelatedName), "B");
+    runGitRaw(["add", unrelatedName], f.repo);
 
     const second = await inspectWorkspacePhysicalState(f.repo);
     const secondFp = second.fingerprints?.[magicName];

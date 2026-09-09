@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { CutoverStateStore } from "./cutover-state.js";
+import { CutoverStateStore, type DurableReconciliationWitness, type DurableCutoverRecord } from "./cutover-state.js";
 
 const oldIdentity = {
   serverInstanceId: "server-old",
@@ -449,6 +449,7 @@ test("recoverSupersede rendezvouses to the same successor and refuses a changed 
       }),
       /RECOVERY_BINDING_MISMATCH/i,
     );
+
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -741,3 +742,433 @@ test("malformed supersession records fail closed on parse", () => {
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
+
+test("Test 2 & 3 — current production deadlock recovered without fabricated drain", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-deadlock-recovery-"));
+  try {
+    const store = new CutoverStateStore(stateDir, { newId: () => "cutover-deadlock" });
+    const instanceA = {
+      serverInstanceId: "instance-A",
+      sourceCommit: "old-source-S0",
+      buildId: "old-build-B0",
+      capabilityManifestSha256: "manifest-M",
+    };
+    const expectedTarget = {
+      sourceCommit: "target-source-S",
+      buildId: "target-build-B",
+      capabilityManifestSha256: "manifest-M",
+    };
+    store.begin({
+      oldServerIdentity: instanceA,
+      expectedNewIdentity: expectedTarget,
+    });
+    const initial = store.get()!;
+    assert.equal(initial.phase, "prepared");
+    assert.equal(initial.drainEvidence, undefined);
+
+    const instanceB = {
+      serverInstanceId: "instance-B",
+      sourceCommit: "target-source-S",
+      buildId: "target-build-B",
+      capabilityManifestSha256: "manifest-M",
+    };
+
+    const goodWitness: DurableReconciliationWitness = {
+      witnessCutoverId: "cutover-deadlock", witnessServerInstanceId: instanceB.serverInstanceId, witnessExpectedIdentity: expectedTarget,
+      workspaceQueryable: true,
+      agentQueryable: true,
+      agentReconciled: true,
+      witnessWorkspaceId: "ws-test",
+      witnessAgentId: "agent-test",
+      witnessWorkspaceSessions: 1,
+      witnessAgentSessions: 1,
+      witnessKind: "exact-pair",
+    };
+
+    const recovered = store.recoverObservedReplacement({
+      cutoverId: "cutover-deadlock",
+      expectedNewIdentity: expectedTarget,
+      observedIdentity: instanceB,
+      witness: goodWitness,
+      recoveredBy: instanceB.serverInstanceId,
+    });
+
+    // Test 2: Legal recovery + terminal close
+    assert.equal(recovered.newlyRecovered, true);
+    assert.equal(recovered.record.phase, "closed");
+    assert.equal(recovered.record.observedReplacement?.cutoverId, "cutover-deadlock");
+    assert.equal(recovered.record.observedReplacement?.terminalReason, "OBSERVED_REPLACEMENT_WITHOUT_DRAIN");
+
+    // Test 3: No fabricated drain
+    assert.equal(recovered.record.drainEvidence, undefined);
+    assert.equal(recovered.record.observedReplacement?.preRestartDrainObserved, false);
+    assert.equal(recovered.record.reconciliationReceipt?.preRestartDrainObserved, false);
+
+    const reloaded = new CutoverStateStore(stateDir).get()!;
+    assert.equal(reloaded.phase, "closed");
+    assert.equal(reloaded.drainEvidence, undefined);
+    assert.equal(reloaded.observedReplacement?.preRestartDrainObserved, false);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("Test 4, 5, 6 — wrong identity fails closed with state unchanged", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-identity-failclosed-"));
+  try {
+    const store = new CutoverStateStore(stateDir, { newId: () => "cutover-ident" });
+    const instanceA = { serverInstanceId: "inst-A", sourceCommit: "source-A", buildId: "build-A" };
+    const expected = { sourceCommit: "source-target", buildId: "build-target", capabilityManifestSha256: "cap-target" };
+    store.begin({ oldServerIdentity: instanceA, expectedNewIdentity: expected });
+
+    const goodWitness: DurableReconciliationWitness = {
+      witnessCutoverId: "cutover-ident", witnessServerInstanceId: "inst-B", witnessExpectedIdentity: expected,
+      workspaceQueryable: true,
+      agentQueryable: true,
+      agentReconciled: true,
+      witnessWorkspaceId: "ws-test",
+      witnessAgentId: "agent-test",
+      witnessWorkspaceSessions: 1,
+      witnessAgentSessions: 1,
+      witnessKind: "exact-pair",
+    };
+
+    // Test 4: wrong source
+    assert.throws(
+      () => store.recoverObservedReplacement({
+        cutoverId: "cutover-ident",
+        observedIdentity: { serverInstanceId: "inst-B", sourceCommit: "wrong-source", buildId: "build-target", capabilityManifestSha256: "cap-target" },
+        witness: goodWitness,
+        recoveredBy: "inst-B",
+      }),
+      /sourceCommit/i,
+    );
+    assert.equal(store.get()?.phase, "prepared");
+
+    // Test 5: wrong build
+    assert.throws(
+      () => store.recoverObservedReplacement({
+        cutoverId: "cutover-ident",
+        observedIdentity: { serverInstanceId: "inst-B", sourceCommit: "source-target", buildId: "wrong-build", capabilityManifestSha256: "cap-target" },
+        witness: goodWitness,
+        recoveredBy: "inst-B",
+      }),
+      /buildId/i,
+    );
+    assert.equal(store.get()?.phase, "prepared");
+
+    // Test 6: wrong capability manifest
+    assert.throws(
+      () => store.recoverObservedReplacement({
+        cutoverId: "cutover-ident",
+        observedIdentity: { serverInstanceId: "inst-B", sourceCommit: "source-target", buildId: "build-target", capabilityManifestSha256: "wrong-cap" },
+        witness: goodWitness,
+        recoveredBy: "inst-B",
+      }),
+      /capability manifest/i,
+    );
+    assert.equal(store.get()?.phase, "prepared");
+
+    // Same old server instance
+    assert.throws(
+      () => store.recoverObservedReplacement({
+        cutoverId: "cutover-ident",
+        observedIdentity: { serverInstanceId: "inst-A", sourceCommit: "source-target", buildId: "build-target", capabilityManifestSha256: "cap-target" },
+        witness: goodWitness,
+        recoveredBy: "inst-A",
+      }),
+      /serverInstanceId did not change/i,
+    );
+    assert.equal(store.get()?.phase, "prepared");
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("Test 7 — witness incomplete fails closed without terminal close", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-witness-failclosed-"));
+  try {
+    const store = new CutoverStateStore(stateDir, { newId: () => "cutover-wit" });
+    const instanceA = { serverInstanceId: "inst-A", sourceCommit: "source-A", buildId: "build-A" };
+    const expected = { sourceCommit: "source-target", buildId: "build-target", capabilityManifestSha256: "cap-target" };
+    store.begin({ oldServerIdentity: instanceA, expectedNewIdentity: expected });
+
+    const targetInstance = { serverInstanceId: "inst-B", sourceCommit: "source-target", buildId: "build-target", capabilityManifestSha256: "cap-target" };
+
+    // workspaceQueryable=false
+    assert.throws(
+      () => store.recoverObservedReplacement({
+        cutoverId: "cutover-wit",
+        observedIdentity: targetInstance,
+        witness: {
+          witnessCutoverId: "cutover-wit", witnessServerInstanceId: targetInstance.serverInstanceId, witnessExpectedIdentity: expected,
+          workspaceQueryable: false,
+          agentQueryable: true,
+          agentReconciled: true,
+          witnessWorkspaceId: "ws-1",
+          witnessAgentId: "agent-1",
+          witnessWorkspaceSessions: 1,
+          witnessAgentSessions: 1,
+        },
+        recoveredBy: "inst-B",
+      }),
+      /witness is not fully positive/i,
+    );
+    assert.equal(store.get()?.phase, "prepared");
+
+    // agentQueryable=false
+    assert.throws(
+      () => store.recoverObservedReplacement({
+        cutoverId: "cutover-wit",
+        observedIdentity: targetInstance,
+        witness: {
+          witnessCutoverId: "cutover-wit", witnessServerInstanceId: targetInstance.serverInstanceId, witnessExpectedIdentity: expected,
+          workspaceQueryable: true,
+          agentQueryable: false,
+          agentReconciled: true,
+          witnessWorkspaceId: "ws-1",
+          witnessAgentId: "agent-1",
+          witnessWorkspaceSessions: 1,
+          witnessAgentSessions: 1,
+        },
+        recoveredBy: "inst-B",
+      }),
+      /witness is not fully positive/i,
+    );
+    assert.equal(store.get()?.phase, "prepared");
+
+    // agentReconciled=false
+    assert.throws(
+      () => store.recoverObservedReplacement({
+        cutoverId: "cutover-wit",
+        observedIdentity: targetInstance,
+        witness: {
+          witnessCutoverId: "cutover-wit", witnessServerInstanceId: targetInstance.serverInstanceId, witnessExpectedIdentity: expected,
+          workspaceQueryable: true,
+          agentQueryable: true,
+          agentReconciled: false,
+          witnessWorkspaceId: "ws-1",
+          witnessAgentId: "agent-1",
+          witnessWorkspaceSessions: 1,
+          witnessAgentSessions: 1,
+        },
+        recoveredBy: "inst-B",
+      }),
+      /witness is not fully positive/i,
+    );
+    assert.equal(store.get()?.phase, "prepared");
+
+    // P0-2: zero agents
+    assert.throws(
+      () => store.recoverObservedReplacement({
+        cutoverId: "cutover-wit",
+        observedIdentity: targetInstance,
+        witness: {
+          witnessCutoverId: "cutover-wit", witnessServerInstanceId: targetInstance.serverInstanceId, witnessExpectedIdentity: expected,
+          workspaceQueryable: true,
+          agentQueryable: true,
+          agentReconciled: true,
+          witnessWorkspaceId: "ws-1",
+          witnessAgentId: "agent-1",
+          witnessWorkspaceSessions: 1,
+          witnessAgentSessions: 0,
+        },
+        recoveredBy: "inst-B",
+      }),
+      /witness is not fully positive/i,
+    );
+    assert.equal(store.get()?.phase, "prepared");
+
+    // P0-2: zero workspaces
+    assert.throws(
+      () => store.recoverObservedReplacement({
+        cutoverId: "cutover-wit",
+        observedIdentity: targetInstance,
+        witness: {
+          witnessCutoverId: "cutover-wit", witnessServerInstanceId: targetInstance.serverInstanceId, witnessExpectedIdentity: expected,
+          workspaceQueryable: true,
+          agentQueryable: true,
+          agentReconciled: true,
+          witnessWorkspaceId: "ws-1",
+          witnessAgentId: "agent-1",
+          witnessWorkspaceSessions: 0,
+          witnessAgentSessions: 1,
+        },
+        recoveredBy: "inst-B",
+      }),
+      /witness is not fully positive/i,
+    );
+    assert.equal(store.get()?.phase, "prepared");
+
+    // P0-2: missing witnessAgentId
+    assert.throws(
+      () => store.recoverObservedReplacement({
+        cutoverId: "cutover-wit",
+        observedIdentity: targetInstance,
+        witness: {
+          witnessCutoverId: "cutover-wit", witnessServerInstanceId: targetInstance.serverInstanceId, witnessExpectedIdentity: expected,
+          workspaceQueryable: true,
+          agentQueryable: true,
+          agentReconciled: true,
+          witnessWorkspaceId: "ws-1",
+          witnessWorkspaceSessions: 1,
+          witnessAgentSessions: 1,
+        },
+        recoveredBy: "inst-B",
+      }),
+      /witness is not fully positive/i,
+    );
+    assert.equal(store.get()?.phase, "prepared");
+
+    // P0-2: missing witnessWorkspaceId
+    assert.throws(
+      () => store.recoverObservedReplacement({
+        cutoverId: "cutover-wit",
+        observedIdentity: targetInstance,
+        witness: {
+          witnessCutoverId: "cutover-wit", witnessServerInstanceId: targetInstance.serverInstanceId, witnessExpectedIdentity: expected,
+          workspaceQueryable: true,
+          agentQueryable: true,
+          agentReconciled: true,
+          witnessAgentId: "agent-1",
+          witnessWorkspaceSessions: 1,
+          witnessAgentSessions: 1,
+        },
+        recoveredBy: "inst-B",
+      }),
+      /witness is not fully positive/i,
+    );
+    assert.equal(store.get()?.phase, "prepared");
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("Test 8 & 9 — exact replay idempotent, changed binding fails closed", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-replay-idempotent-"));
+  try {
+    const store = new CutoverStateStore(stateDir, { newId: () => "cutover-replay" });
+    const instanceA = { serverInstanceId: "inst-A", sourceCommit: "source-A", buildId: "build-A" };
+    const expected = { sourceCommit: "source-target", buildId: "build-target", capabilityManifestSha256: "cap-target" };
+    store.begin({ oldServerIdentity: instanceA, expectedNewIdentity: expected });
+
+    const targetInstance = { serverInstanceId: "inst-B", sourceCommit: "source-target", buildId: "build-target", capabilityManifestSha256: "cap-target" };
+    const goodWitness: DurableReconciliationWitness = {
+      witnessCutoverId: "cutover-replay", witnessServerInstanceId: targetInstance.serverInstanceId, witnessExpectedIdentity: expected,
+      workspaceQueryable: true,
+      agentQueryable: true,
+      agentReconciled: true,
+      witnessWorkspaceId: "ws-test",
+      witnessAgentId: "agent-test",
+      witnessWorkspaceSessions: 1,
+      witnessAgentSessions: 1,
+      witnessKind: "exact-pair",
+    };
+
+    const first = store.recoverObservedReplacement({
+      cutoverId: "cutover-replay",
+      expectedNewIdentity: expected,
+      observedIdentity: targetInstance,
+      witness: goodWitness,
+      recoveredBy: "inst-B",
+    });
+    assert.equal(first.newlyRecovered, true);
+    assert.equal(first.record.phase, "closed");
+
+    const activeDirectory = join(stateDir, "cutover", "active");
+    const beforeReplayFiles = readdirSync(activeDirectory).sort();
+    const restartedStore = new CutoverStateStore(stateDir);
+    assert.deepEqual(restartedStore.get()?.observedReplacement, first.record.observedReplacement);
+    const reopenedReplay = restartedStore.recoverObservedReplacement({
+      cutoverId: "cutover-replay", expectedNewIdentity: expected,
+      observedIdentity: targetInstance, witness: goodWitness, recoveredBy: "inst-B",
+    });
+    assert.equal(reopenedReplay.newlyRecovered, false);
+    assert.deepEqual(reopenedReplay.record.observedReplacement, first.record.observedReplacement);
+    assert.deepEqual(reopenedReplay.record.reconciliationReceipt, first.record.reconciliationReceipt);
+    assert.deepEqual(readdirSync(activeDirectory).sort(), beforeReplayFiles);
+    assert.equal(beforeReplayFiles.some((name) => name.startsWith("restart-")), false);
+
+    // Test 8: Exact replay idempotent
+    const second = store.recoverObservedReplacement({
+      cutoverId: "cutover-replay",
+      expectedNewIdentity: expected,
+      observedIdentity: targetInstance,
+      witness: goodWitness,
+      recoveredBy: "inst-B",
+    });
+    assert.equal(second.newlyRecovered, false);
+    assert.equal(second.record.phase, "closed");
+    assert.equal(second.record.cutoverId, first.record.cutoverId);
+
+    // A closed receipt is idempotent only for the same observed replacement;
+    // a changed generation identity must still fail closed.
+    assert.throws(
+      () => store.recoverObservedReplacement({
+        cutoverId: "cutover-replay",
+        expectedNewIdentity: expected,
+        observedIdentity: { ...targetInstance, serverInstanceId: "inst-C" },
+        witness: goodWitness,
+        recoveredBy: "inst-C",
+      }),
+      /observed sourceCommit|observed buildId|RECOVERY_BINDING_MISMATCH|already closed/i,
+    );
+
+    // Test 9: Changed recovery binding fails closed
+    assert.throws(
+      () => store.recoverObservedReplacement({
+        cutoverId: "cutover-replay",
+        expectedNewIdentity: { sourceCommit: "different-source", buildId: "build-target", capabilityManifestSha256: "cap-target" },
+        observedIdentity: targetInstance,
+        witness: goodWitness,
+        recoveredBy: "inst-B",
+      }),
+      /RECOVERY_BINDING_MISMATCH/i,
+    );
+
+    const closedEvent = readdirSync(join(stateDir, "cutover", "active"))
+      .find((name) => name.startsWith("closed-"));
+    assert.ok(closedEvent);
+    const eventPath = join(stateDir, "cutover", "active", closedEvent);
+    const originalEvent = readFileSync(eventPath, "utf8");
+    for (const change of ["top-level", "same-instance"] as const) {
+      const corrupt = JSON.parse(originalEvent) as DurableCutoverRecord;
+      if (change === "top-level") corrupt.reconciliationReceipt!.witnessAgentId = "other-agent";
+      else {
+        corrupt.oldServerIdentity.serverInstanceId = targetInstance.serverInstanceId;
+        corrupt.observedReplacement!.oldServerIdentity.serverInstanceId = targetInstance.serverInstanceId;
+      }
+      writeFileSync(eventPath, JSON.stringify(corrupt));
+      assert.throws(() => new CutoverStateStore(stateDir).get(), /malformed|reconciliation/i);
+      writeFileSync(eventPath, originalEvent);
+    }
+    const tampered = JSON.parse(readFileSync(join(stateDir, "cutover", "active", closedEvent), "utf8")) as {
+      observedReplacement: { cutoverId: string };
+    };
+    tampered.observedReplacement.cutoverId = "cutover-other";
+    writeFileSync(join(stateDir, "cutover", "active", closedEvent), `${JSON.stringify(tampered)}\n`);
+    assert.throws(
+      () => new CutoverStateStore(stateDir).get(),
+      /malformed|reconciliation/i,
+    );
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+for (const missing of ["witnessCutoverId", "witnessServerInstanceId", "witnessExpectedIdentity", "manifest", "stale"] as const) {
+  test(`observed recovery rejects ${missing} witness binding`, () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "strict-witness-"));
+    try {
+      const store = new CutoverStateStore(stateDir, { newId: () => "generation-B" });
+      const expected = { sourceCommit: "target", buildId: "build", capabilityManifestSha256: "manifest" };
+      store.begin({ oldServerIdentity: { serverInstanceId: "old", sourceCommit: "old", buildId: "old" }, expectedNewIdentity: expected });
+      const witness: DurableReconciliationWitness = { workspaceQueryable: true, agentQueryable: true, agentReconciled: true, witnessWorkspaceId: "ws", witnessAgentId: "agent", witnessWorkspaceSessions: 1, witnessAgentSessions: 1, witnessCutoverId: "generation-B", witnessServerInstanceId: "new", witnessExpectedIdentity: expected };
+      if (missing === "manifest") witness.witnessExpectedIdentity = { sourceCommit: "target", buildId: "build" };
+      else if (missing === "stale") witness.witnessCutoverId = "generation-A";
+      else delete witness[missing];
+      assert.throws(() => store.recoverObservedReplacement({ cutoverId: "generation-B", observedIdentity: { ...expected, serverInstanceId: "new" }, witness, recoveredBy: "new" }), /RECOVERY_BINDING_MISMATCH/);
+      assert.equal(store.get()?.phase, "prepared");
+    } finally { rmSync(stateDir, { recursive: true, force: true }); }
+  });
+}
