@@ -4177,9 +4177,9 @@ export interface CreateServerOptions {
 }
 
 export interface DurableReconciliationResolverDependencies {
-  workspaceStore: Pick<ReturnType<typeof createWorkspaceStore>, "listSessions">;
+  workspaceStore: Pick<ReturnType<typeof createWorkspaceStore>, "getSession" | "listSessions">;
   workspaces: Pick<WorkspaceRegistry, "inspectWorkspace" | "getWorkspace">;
-  agentSessionManager: Pick<LocalAgentSessionManager, "listAllAgentRecords" | "getAgentStatus" | "reconcileAgent">;
+  agentSessionManager: Pick<LocalAgentSessionManager, "getRecordByPrefixOrId" | "listAllAgentRecords" | "getAgentStatus" | "reconcileAgent">;
 }
 
 /**
@@ -4196,6 +4196,71 @@ export async function resolveDurableReconciliationWitnessFromInventory(
   const { workspaceStore, workspaces, agentSessionManager } = dependencies;
   const errorText = (error: unknown): string =>
     error instanceof Error ? error.message : String(error);
+  const witnessKind = preferredPair ? "exact-pair" : "inventory-selected-pair";
+  if (preferredPair) {
+    const workspaceId = preferredPair.workspaceId;
+    const agentId = preferredPair.agentId;
+    const exactDetail: Array<{ unit: string; ok: boolean; detail?: string }> = [];
+    if (!workspaceId || !agentId) {
+      return {
+        workspaceQueryable: false, agentQueryable: false, agentReconciled: false,
+        workspaceSessions: 0, agentSessions: 0, witnessWorkspaceSessions: 0,
+        witnessAgentSessions: 0, witnessKind,
+        detail: [{ unit: "requested-witness", ok: false, detail: "workspaceId and agentId are both required" }],
+      };
+    }
+    const session = workspaceStore.getSession(workspaceId);
+    if (!session) {
+      return {
+        workspaceQueryable: false, agentQueryable: false, agentReconciled: false,
+        workspaceSessions: 0, agentSessions: 0, witnessWorkspaceSessions: 0,
+        witnessAgentSessions: 0, witnessKind,
+        detail: [{ unit: `workspace:${workspaceId}`, ok: false, detail: "requested workspace is not durably present" }],
+      };
+    }
+    const record = agentSessionManager.getRecordByPrefixOrId(agentId);
+    if (!record || record.id !== agentId || record.workspaceId !== workspaceId) {
+      return {
+        workspaceQueryable: true, agentQueryable: false, agentReconciled: false,
+        workspaceSessions: 1, agentSessions: 0, witnessWorkspaceSessions: 1,
+        witnessAgentSessions: 0, witnessKind,
+        detail: [{ unit: `agent:${agentId}`, ok: false, detail: "requested agent is not durably bound to the requested workspace" }],
+      };
+    }
+    try {
+      const inspected = workspaces.inspectWorkspace(workspaceId);
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const status = await agentSessionManager.getAgentStatus({ workspaceId, workspaceRoot: workspace.root, agentId, waitMs: 0 });
+      if (status.agentId !== agentId || (status.workspaceId !== undefined && status.workspaceId !== workspaceId)) {
+        throw new Error("status returned a different workspace/agent identity");
+      }
+      const reconciled = await agentSessionManager.reconcileAgent({
+        workspaceId, workspaceRoot: workspace.root, isolated: workspace.mode === "worktree", agentId,
+      });
+      if (reconciled.agentId !== agentId) {
+        throw new Error(`reconciliation returned agent ${reconciled.agentId}, expected ${agentId}`);
+      }
+      exactDetail.push(
+        { unit: `workspace:${workspaceId}`, ok: true, ...(inspected.loaded ? {} : { detail: "durable session present; registry not currently loaded (no write performed)" }) },
+        { unit: `agent:${agentId}@${workspaceId}`, ok: true },
+      );
+      return {
+        workspaceQueryable: true, agentQueryable: true, agentReconciled: true,
+        witnessWorkspaceId: workspaceId, witnessAgentId: agentId,
+        workspaceSessions: 1, agentSessions: 1, witnessWorkspaceSessions: 1,
+        witnessAgentSessions: 1, witnessKind, detail: exactDetail,
+      };
+    } catch (error) {
+      return {
+        workspaceQueryable: true, agentQueryable: false, agentReconciled: false,
+        witnessWorkspaceId: workspaceId, witnessAgentId: agentId,
+        workspaceSessions: 1, agentSessions: 1, witnessWorkspaceSessions: 1,
+        witnessAgentSessions: 1, witnessKind,
+        detail: [{ unit: `agent:${agentId}@${workspaceId}`, ok: false, detail: errorText(error) }],
+      };
+    }
+  }
+
   const detail: Array<{ unit: string; ok: boolean; detail?: string }> = [];
   let workspaceQueryable = true;
   let agentQueryable = true;
@@ -4235,111 +4300,6 @@ export async function resolveDurableReconciliationWitnessFromInventory(
       witnessKind: preferredPair ? "exact-pair" : "inventory-selected-pair",
       detail: [...detail, { unit: "agent-store", ok: false, detail: errorText(error) }],
     };
-  }
-
-  const witnessKind = preferredPair ? "exact-pair" : "inventory-selected-pair";
-  if (preferredPair) {
-    const workspaceId = preferredPair.workspaceId;
-    const agentId = preferredPair.agentId;
-    if (!workspaceId || !agentId) {
-      return {
-        workspaceQueryable: false,
-        agentQueryable: false,
-        agentReconciled: false,
-        workspaceSessions: 0,
-        agentSessions: 0,
-        witnessWorkspaceSessions: 0,
-        witnessAgentSessions: 0,
-        witnessKind,
-        detail: [...detail, { unit: "requested-witness", ok: false, detail: "workspaceId and agentId are both required" }],
-      };
-    }
-
-    const session = workspaceById.get(workspaceId);
-    const record = agentRecords.find((candidate) => candidate.id === agentId);
-    if (!session) {
-      return {
-        workspaceQueryable: false,
-        agentQueryable: false,
-        agentReconciled: false,
-        workspaceSessions: 0,
-        agentSessions: record?.workspaceId === workspaceId ? 1 : 0,
-        witnessWorkspaceSessions: 0,
-        witnessAgentSessions: 0,
-        witnessKind,
-        detail: [...detail, { unit: `workspace:${workspaceId}`, ok: false, detail: "requested workspace is not durably present" }],
-      };
-    }
-    if (!record || record.workspaceId !== workspaceId) {
-      return {
-        workspaceQueryable: true,
-        agentQueryable: false,
-        agentReconciled: false,
-        workspaceSessions: 1,
-        agentSessions: 0,
-        witnessWorkspaceSessions: 1,
-        witnessAgentSessions: 0,
-        witnessKind,
-        detail: [...detail, { unit: `agent:${agentId}`, ok: false, detail: "requested agent is not durably bound to the requested workspace" }],
-      };
-    }
-
-    try {
-      const inspected = workspaces.inspectWorkspace(workspaceId);
-      const workspace = workspaces.getWorkspace(workspaceId);
-      const status = await agentSessionManager.getAgentStatus({
-        workspaceId,
-        workspaceRoot: workspace.root,
-        agentId,
-        waitMs: 0,
-      });
-      if (status.agentId !== agentId || (status.workspaceId !== undefined && status.workspaceId !== workspaceId)) {
-        throw new Error("status returned a different workspace/agent identity");
-      }
-      if (status.status === "error") {
-        throw new Error("requested agent has failed status");
-      }
-      const reconciled = await agentSessionManager.reconcileAgent({
-        workspaceId,
-        workspaceRoot: workspace.root,
-        isolated: workspace.mode === "worktree",
-        agentId,
-      });
-      if (reconciled.agentId !== agentId) {
-        throw new Error(`reconciliation returned agent ${reconciled.agentId}, expected ${agentId}`);
-      }
-      return {
-        workspaceQueryable: true,
-        agentQueryable: true,
-        agentReconciled: true,
-        witnessWorkspaceId: workspaceId,
-        witnessAgentId: agentId,
-        workspaceSessions: 1,
-        agentSessions: 1,
-        witnessWorkspaceSessions: 1,
-        witnessAgentSessions: 1,
-        witnessKind,
-        detail: [
-          ...detail,
-          { unit: `workspace:${workspaceId}`, ok: true, ...(inspected.loaded ? {} : { detail: "durable session present; registry not currently loaded (no write performed)" }) },
-          { unit: `agent:${agentId}@${workspaceId}`, ok: true },
-        ],
-      };
-    } catch (error) {
-      return {
-        workspaceQueryable: true,
-        agentQueryable: false,
-        agentReconciled: false,
-        witnessWorkspaceId: workspaceId,
-        witnessAgentId: agentId,
-        workspaceSessions: 1,
-        agentSessions: 1,
-        witnessWorkspaceSessions: 1,
-        witnessAgentSessions: 1,
-        witnessKind,
-        detail: [...detail, { unit: `agent:${agentId}@${workspaceId}`, ok: false, detail: errorText(error) }],
-      };
-    }
   }
 
   let witnessWorkspaceId: string | undefined;

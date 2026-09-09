@@ -2006,6 +2006,66 @@ test("P0-2: durable reconciliation witness fails closed on empty inventory, mism
   }
 });
 
+test("manual exact-pair witness bypasses aggregate enumeration and accepts reconciled error state", async () => {
+  let aggregateWorkspaceCalled = false;
+  let aggregateAgentCalled = false;
+  let reconcileMode: "ok" | "fail" = "ok";
+  const dependencies = {
+    workspaceStore: {
+      getSession: (id: string) => id === "ws-exact" ? ({ id, root: "/tmp/exact", status: "active", mode: "checkout" } as any) : undefined,
+      listSessions: () => { aggregateWorkspaceCalled = true; throw new Error("aggregate workspace enumeration must not run"); },
+    },
+    workspaces: {
+      inspectWorkspace: () => ({ loaded: true }),
+      getWorkspace: () => ({ id: "ws-exact", root: "/tmp/exact", mode: "checkout" }),
+    },
+    agentSessionManager: {
+      getRecordByPrefixOrId: (id: string) => id === "agt-exact" ? ({ id, workspaceId: "ws-exact", workspaceRoot: "/tmp/exact", status: "error" } as any) : undefined,
+      listAllAgentRecords: () => { aggregateAgentCalled = true; throw new Error("aggregate agent enumeration must not run"); },
+      getAgentStatus: async () => ({ agentId: "agt-exact", workspaceId: "ws-exact", workspaceRoot: "/tmp/exact", status: "error" } as any),
+      reconcileAgent: async () => {
+        if (reconcileMode === "fail") throw new Error("reconcile failed");
+        return { agentId: "agt-exact" } as any;
+      },
+    },
+  };
+
+  const exact = await resolveDurableReconciliationWitnessFromInventory(
+    dependencies as any,
+    { workspaceId: "ws-exact", agentId: "agt-exact" },
+    true,
+  );
+  assert.equal(exact.workspaceQueryable, true);
+  assert.equal(exact.agentQueryable, true);
+  assert.equal(exact.agentReconciled, true);
+  assert.equal(exact.witnessWorkspaceSessions, 1);
+  assert.equal(exact.witnessAgentSessions, 1);
+  assert.equal(aggregateWorkspaceCalled, false);
+  assert.equal(aggregateAgentCalled, false);
+
+  const missingRoot = await resolveDurableReconciliationWitnessFromInventory(
+    dependencies as any,
+    { workspaceId: "ws-missing", agentId: "agt-exact" },
+    true,
+  );
+  assert.equal(missingRoot.workspaceQueryable, false);
+
+  const wrongAssociation = await resolveDurableReconciliationWitnessFromInventory(
+    dependencies as any,
+    { workspaceId: "ws-exact", agentId: "agt-missing" },
+    true,
+  );
+  assert.equal(wrongAssociation.agentQueryable, false);
+
+  reconcileMode = "fail";
+  const failedReconcile = await resolveDurableReconciliationWitnessFromInventory(
+    dependencies as any,
+    { workspaceId: "ws-exact", agentId: "agt-exact" },
+    true,
+  );
+  assert.equal(failedReconcile.agentReconciled, false);
+});
+
 test("P0-3: recovery and finish share identical semantics and idempotently rendezvous without second effect", async () => {
   const root = await mkdtemp(join(tmpdir(), "devspace-p0-3-shared-"));
   const targetCommit = "a".repeat(40);
