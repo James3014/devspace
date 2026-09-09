@@ -119,9 +119,19 @@ export function disposeWindowsPtyResources(
   if (!agent || typeof worker?.dispose !== "function" || typeof input?.destroy !== "function") {
     throw new Error("Unsupported node-pty Windows resource layout.");
   }
+  let cleanupError: unknown;
+  try {
+    worker.dispose();
+  } catch (error) {
+    cleanupError = error;
+  }
+  try {
+    input.destroy();
+  } catch (error) {
+    cleanupError ??= error;
+  }
+  if (cleanupError) throw cleanupError;
   cleanedWindowsPtys.add(pty);
-  worker.dispose();
-  input.destroy();
 }
 
 export function resolvePtyShellInvocation(

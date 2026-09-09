@@ -32,6 +32,25 @@ import {
   disposeWindowsPtyResources(pty, "win32");
   disposeWindowsPtyResources(pty, "win32");
   assert.deepEqual(calls, ["worker", "input"]);
+  const retryCalls: string[] = [];
+  let disposeAttempts = 0;
+  const retryPty = {
+    kill: () => { throw new Error("kill must not be called"); },
+    _agent: {
+      _conoutSocketWorker: {
+        dispose: () => {
+          disposeAttempts += 1;
+          retryCalls.push("worker");
+          if (disposeAttempts === 1) throw new Error("worker cleanup failed");
+        },
+      },
+      _inSocket: { destroy: () => retryCalls.push("input") },
+    },
+  };
+  assert.throws(() => disposeWindowsPtyResources(retryPty, "win32"), /worker cleanup failed/);
+  disposeWindowsPtyResources(retryPty, "win32");
+  assert.deepEqual(retryCalls, ["worker", "input", "worker", "input"]);
+  disposeWindowsPtyResources({}, "linux");
   assert.throws(
     () => disposeWindowsPtyResources({ _agent: {} }, "win32"),
     /Unsupported node-pty Windows resource layout/,
@@ -724,6 +743,36 @@ try {
   assert.equal(polledOutput.running, false);
   assert.equal(polledOutput.exitCode, 0);
   assert.match(`${retainedOutput.output}${polledOutput.output}`, /later/);
+
+  for (let index = 0; index < 2; index += 1) {
+    const naturalPty = await g2Manager.start({
+      workspaceId: "ws_g2",
+      cwd: process.cwd(),
+      command: `${node} -e "console.log('natural-${index}')"`,
+      tty: true,
+      yieldTimeMs: process.platform === "win32" ? 1_500 : 500,
+    });
+    assert.equal(naturalPty.running, false);
+    assert.equal(naturalPty.exitCode, 0);
+    assert.match(naturalPty.output, new RegExp(`natural-${index}`));
+  }
+
+  const terminatedPty = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: `${node} -e "console.log('before-terminate'); setInterval(() => {}, 1000)"`,
+    tty: true,
+    yieldTimeMs: 100,
+  });
+  assert.equal(terminatedPty.running, true);
+  g2Manager.terminate("ws_g2", terminatedPty.sessionId!);
+  const terminatedStatus = await g2Manager.getStatus({
+    workspaceId: "ws_g2",
+    sessionId: terminatedPty.sessionId!,
+    yieldTimeMs: process.platform === "win32" ? 1_500 : 500,
+  });
+  assert.equal(terminatedStatus.running, false);
+  assert.match(`${terminatedPty.output}${terminatedStatus.output}`, /before-terminate/);
 } finally {
   g2Manager.shutdown();
 }
