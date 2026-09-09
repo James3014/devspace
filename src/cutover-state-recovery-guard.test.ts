@@ -91,7 +91,7 @@ test("observed replacement recovery does not poison a later cutover generation",
         serverInstanceId: "server-one",
         ...firstExpected,
       },
-      witness: positiveWitness,
+      witness: { ...positiveWitness, witnessCutoverId: first.cutoverId, witnessServerInstanceId: "server-one", witnessExpectedIdentity: firstExpected },
       recoveredBy: "server-one",
     });
     assert.equal(firstRecovered.record.phase, "closed");
@@ -115,7 +115,7 @@ test("observed replacement recovery does not poison a later cutover generation",
         serverInstanceId: "server-two",
         ...secondExpected,
       },
-      witness: positiveWitness,
+      witness: { ...positiveWitness, witnessCutoverId: second.cutoverId, witnessServerInstanceId: "server-two", witnessExpectedIdentity: secondExpected },
       recoveredBy: "server-two",
     });
 

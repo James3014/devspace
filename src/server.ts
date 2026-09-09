@@ -1552,13 +1552,16 @@ function registerCutoverMcpTools(
           ...(expiresAt ? { expiresAt } : {}),
         });
         const mode = recovered.mode;
-        const summaryText = recovered.newlyRecovered
-          ? `Recovered observed replacement cutover ${recovered.terminal.cutoverId} without pre-restart drain; mode=${mode}.`
-          : `Cutover ${recovered.terminal.cutoverId} is already closed; mode=${mode}.`;
+        const summaryText = recovered.successor
+          ? `Superseded stale cutover ${recovered.terminal.cutoverId} -> successor ${recovered.successor.cutoverId}; mode=${mode}.`
+          : recovered.newlyRecovered
+            ? `Recovered observed replacement cutover ${recovered.terminal.cutoverId} without pre-restart drain; mode=${mode}.`
+            : `Cutover ${recovered.terminal.cutoverId} is already closed; mode=${mode}.`;
         return {
           content: [textBlock(summaryText)],
           structuredContent: {
             terminal: recovered.terminal as unknown as Record<string, unknown>,
+            ...(recovered.successor ? { successor: recovered.successor as unknown as Record<string, unknown> } : {}),
             newlyRecovered: recovered.newlyRecovered,
             mode,
           },

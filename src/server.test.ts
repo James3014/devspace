@@ -2474,3 +2474,43 @@ test("P0-4: real server /mcp HTTP boundary permits transport reconnect during dr
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("prepared stale-target MCP recovery preserves successor and supersession summary", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-stale-recovery-"));
+  const stateDir = join(root, ".state");
+  const config = loadConfig({ DEVSPACE_CONFIG_DIR: join(root, ".config"), DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_STATE_DIR: stateDir, DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough", PORT: "1" });
+  const wsStore = new SqliteWorkspaceStore(stateDir);
+  const workspaces = new WorkspaceRegistry(config, wsStore);
+  let sequence = 0;
+  const store = new CutoverStateStore(stateDir, { newId: () => `stale-${++sequence}` });
+  const initial = store.begin({ oldServerIdentity: { serverInstanceId: "gone", sourceCommit: "old", buildId: "old" },
+    expectedNewIdentity: { sourceCommit: "b".repeat(40), buildId: "stale-build" } });
+  const controller = new McpCutoverController(store, { serverInstanceId: "current", sourceCommit: "current", buildId: "current" });
+  const server = createMcpServer(config, workspaces, createReviewCheckpointManager(), new ProcessSessionManager(),
+    () => [], [], undefined, undefined, undefined, undefined, {
+      controller, transportEvidence: () => ({ activeSessions: 0, oldestAgeMs: 0 }),
+      reconcileDurableState: async () => ({ workspaceQueryable: true, agentQueryable: true, agentReconciled: true }),
+      executeObservedReplacementRecovery: async (input) => {
+        const result = controller.recoverCutover({ cutoverId: input.cutoverId, expectedNewIdentity: input.expectedNewIdentity! });
+        return { ...result, mode: controller.mode() };
+      },
+    });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "stale-recovery", version: "1.0.0" });
+  try {
+    await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+    const result = await client.callTool({ name: "cutover_recover", arguments: {
+      cutoverId: initial.cutoverId, expectedSourceCommit: "a".repeat(40), expectedBuildId: "fresh-build",
+    } });
+    const content = structuredContent(result);
+    assert.equal((content.terminal as Record<string, unknown>).phase, "superseded");
+    assert.equal((content.successor as Record<string, unknown>)?.cutoverId, store.get()?.cutoverId);
+    assert.notEqual(store.get()?.cutoverId, initial.cutoverId);
+    assert.match(JSON.stringify(result.content), /Superseded stale cutover/);
+    assert.doesNotMatch(JSON.stringify(result.content), /Recovered observed replacement/);
+  } finally {
+    await client.close(); await server.close(); wsStore.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
