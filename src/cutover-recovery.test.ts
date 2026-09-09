@@ -477,7 +477,7 @@ test("native adapter carries the committed record when durable post-commit read 
   prototype.get = function(this: { cutoverRoot?: string }) {
     if (this.cutoverRoot?.startsWith(join(fixture.stateDir, "cutover"))) {
       localReads += 1;
-      if (localReads === 2) throw new Error("simulated durable read failure");
+      if (localReads === 4) throw new Error("simulated durable read failure");
     }
     return originalGet.call(this);
   };
