@@ -389,29 +389,7 @@ const { existsSync, realpathSync } = require("node:fs");
 const { isAbsolute, join, relative, sep } = require("node:path");
 const args = process.argv.slice(2);
 const canonical = (path) => {
-  try { return realpathSync(path); } catch { return path; }
-};
-const pathDiagnostic = () => {
-  const resolvePath = (resolver, path) => {
-    try { return resolver(path); } catch (error) { return \`ERROR:\${error?.code || String(error)}\`; }
-  };
-  const expectedRealpath = resolvePath(realpathSync, expectedScratch);
-  const isolatedRealpath = resolvePath(realpathSync, isolatedHome);
-  const expectedNative = resolvePath(realpathSync.native, expectedScratch);
-  const isolatedNative = resolvePath(realpathSync.native, isolatedHome);
-  const resolveRelative = (from, to) => {
-    try { return relative(from, to); } catch (error) { return \`ERROR:\${error?.code || String(error)}\`; }
-  };
-  return {
-    expectedScratch,
-    isolatedHome,
-    expectedRealpath,
-    isolatedRealpath,
-    expectedNative,
-    isolatedNative,
-    relativeRealpath: resolveRelative(expectedRealpath, isolatedRealpath),
-    relativeNative: resolveRelative(expectedNative, isolatedNative),
-  };
+  try { return realpathSync.native(path); } catch { return path; }
 };
 
 const expectedScratch = process.env.EXPECTED_AGY_PROVIDER_SCRATCH;
@@ -423,7 +401,6 @@ if (!expectedScratch || !isolatedHome) {
 const homeRelativeToScratch = relative(canonical(expectedScratch), canonical(isolatedHome));
 if (!homeRelativeToScratch || isAbsolute(homeRelativeToScratch) || homeRelativeToScratch === ".." || homeRelativeToScratch.startsWith(\`..\${sep}\`)) {
   console.error("AGY_HOME_OUTSIDE_PROVIDER_SCRATCH");
-  console.error(JSON.stringify(pathDiagnostic()));
   process.exit(92);
 }
 if (process.env.AMBIENT_AGY_HOME && canonical(isolatedHome) === canonical(process.env.AMBIENT_AGY_HOME)) {
