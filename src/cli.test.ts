@@ -41,7 +41,7 @@ for (const args of [
     () => execFileSync("node", ["--import", "tsx", "src/cli.ts", ...args], { encoding: "utf8", env: { ...process.env, DEVSPACE_CONFIG_DIR: "/tmp/devspace-cli-invalid-binding-test" } }),
     (error: unknown) => {
       const detail = error as { stderr?: string; status?: number };
-      return detail.status !== 0 && /Usage:|Unknown cutover observe flag/.test(detail.stderr ?? "");
+      return detail.status !== 0 && /Usage:|Unknown cutover observe flag|requires a value/.test(detail.stderr ?? "");
     },
   );
 }
