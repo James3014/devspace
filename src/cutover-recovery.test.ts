@@ -453,10 +453,11 @@ test("native adapter reports committed outcome when post-commit live readback fa
 
 test("native adapter reports committed outcome when post-commit MCP network fails", async () => {
   const fixture = await nativeHttpFixture();
-  let mcpCalls = 0;
+  let statusCalls = 0;
   const throwingFetch: typeof globalThis.fetch = async (input, init) => {
     const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
-    if (new URL(requestUrl).pathname === "/mcp" && ++mcpCalls >= 8) throw new Error("simulated post-commit network loss");
+    const requestBody = typeof init?.body === "string" ? init.body : "";
+    if (new URL(requestUrl).pathname === "/mcp" && requestBody.includes("cutover_status") && ++statusCalls === 3) throw new Error("simulated post-commit network loss");
     return globalThis.fetch(input, init);
   };
   try {
