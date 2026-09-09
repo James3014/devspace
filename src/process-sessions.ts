@@ -103,6 +103,7 @@ interface WindowsPtyCleanupTarget {
 }
 
 const cleanedWindowsPtys = new WeakSet<object>();
+const windowsPtyTermination = new WeakMap<object, { error?: unknown }>();
 
 // node-pty 1.1.0's normal Windows exit path omits these two owned resources;
 // post-exit kill is unsafe because its PID lookup can race PID reuse. Keep
@@ -160,7 +161,19 @@ export function killPtyProcess(
   platform: NodeJS.Platform = process.platform,
 ): void {
   if (platform === "win32") {
-    pty.kill();
+    const target = pty as object;
+    const prior = windowsPtyTermination.get(target);
+    if (prior) {
+      if (prior.error !== undefined) throw prior.error;
+      return;
+    }
+    windowsPtyTermination.set(target, {});
+    try {
+      pty.kill();
+    } catch (error) {
+      windowsPtyTermination.set(target, { error });
+      throw error;
+    }
     return;
   }
   pty.kill(signal);

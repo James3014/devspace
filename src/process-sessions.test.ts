@@ -20,8 +20,24 @@ import {
   const pty = { kill: (signal?: string) => calls.push(signal) };
   killPtyProcess(pty, "SIGTERM", "win32");
   assert.deepEqual(calls, [undefined]);
+  killPtyProcess(pty, "SIGKILL", "win32");
+  assert.deepEqual(calls, [undefined]);
+  const secondCalls: Array<string | undefined> = [];
+  const secondPty = { kill: (signal?: string) => secondCalls.push(signal) };
+  killPtyProcess(secondPty, "SIGTERM", "win32");
+  assert.deepEqual(calls, [undefined]);
+  assert.deepEqual(secondCalls, [undefined]);
   killPtyProcess(pty, "SIGINT", "linux");
   assert.deepEqual(calls, [undefined, "SIGINT"]);
+  killPtyProcess(pty, "SIGTERM", "linux");
+  assert.deepEqual(calls, [undefined, "SIGINT", "SIGTERM"]);
+
+  const failure = new Error("native termination failed");
+  let failureCalls = 0;
+  const failingPty = { kill: () => { failureCalls += 1; throw failure; } };
+  assert.throws(() => killPtyProcess(failingPty, "SIGTERM", "win32"), failure);
+  assert.throws(() => killPtyProcess(failingPty, "SIGKILL", "win32"), failure);
+  assert.equal(failureCalls, 1);
 }
 
 {
