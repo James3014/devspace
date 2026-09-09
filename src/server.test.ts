@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { execFile } from "node:child_process";
+import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { createServer as createNetServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { after, type TestContext } from "node:test";
@@ -23,6 +25,7 @@ import { LocalAgentStore } from "./local-agent-store.js";
 import { LocalAgentSessionManager } from "./local-agent-sessions.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
+import { SqliteOAuthStore, SqliteOAuthClientsStore } from "./oauth-store.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -1816,4 +1819,595 @@ test("command_status metadata annotations and minimal mode visibility", async (t
     idempotentHint: true,
     openWorldHint: false,
   });
+});
+
+test("P0-2: durable reconciliation witness fails closed on empty inventory, mismatches, or missing records", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-p0-2-witness-"));
+  const project = join(root, "project");
+  const stateDir = join(root, ".state");
+  await mkdir(project, { recursive: true });
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+
+  const wsStore = new SqliteWorkspaceStore(stateDir);
+  const agentStore = new LocalAgentStore(stateDir);
+  const workspaces = new WorkspaceRegistry(config, wsStore);
+  const agentManager = new LocalAgentSessionManager(config, async () => {}, async () => true);
+
+  try {
+    const store = new CutoverStateStore(stateDir, { newId: () => "cutover-p02" });
+    const oldIdentity = { serverInstanceId: "old", sourceCommit: "old", buildId: "old" };
+    const expectedIdentity = { sourceCommit: "new", buildId: "new" };
+    const replacementIdentity = { serverInstanceId: "new", sourceCommit: "new", buildId: "new" };
+    store.begin({ oldServerIdentity: oldIdentity, expectedNewIdentity: expectedIdentity });
+
+    // 1. Zero workspaces, zero agents -> recovery MUST NOT close
+    assert.throws(
+      () => store.recoverObservedReplacement({
+        cutoverId: "cutover-p02",
+        observedIdentity: replacementIdentity,
+        witness: {
+          workspaceQueryable: true,
+          agentQueryable: true,
+          agentReconciled: true,
+          witnessWorkspaceSessions: 0,
+          witnessAgentSessions: 0,
+        },
+        recoveredBy: "new",
+      }),
+      /witness is not fully positive/i,
+    );
+    assert.equal(store.get()?.phase, "prepared");
+
+    // 2. Create workspace session; zero agents in agent store -> recovery MUST NOT close
+    wsStore.createSession({ id: "ws_p02", root: project });
+    assert.throws(
+      () => store.recoverObservedReplacement({
+        cutoverId: "cutover-p02",
+        observedIdentity: replacementIdentity,
+        witness: {
+          workspaceQueryable: true,
+          agentQueryable: true,
+          agentReconciled: true,
+          witnessWorkspaceId: "ws_p02",
+          witnessWorkspaceSessions: 1,
+          witnessAgentSessions: 0,
+        },
+        recoveredBy: "new",
+      }),
+      /witness is not fully positive/i,
+    );
+    assert.equal(store.get()?.phase, "prepared");
+
+    // 3. Create agent session belonging to ws_p02
+    const agent = agentStore.create({
+      workspaceId: "ws_p02",
+      workspaceRoot: project,
+      profileName: "p02-reviewer",
+      provider: "codex",
+    });
+
+    // Mismatched pair -> fails closed
+    assert.throws(
+      () => store.recoverObservedReplacement({
+        cutoverId: "cutover-p02",
+        observedIdentity: replacementIdentity,
+        witness: {
+          workspaceQueryable: true,
+          agentQueryable: false,
+          agentReconciled: false,
+          witnessWorkspaceId: "ws_other",
+          witnessAgentId: agent.id,
+          witnessWorkspaceSessions: 1,
+          witnessAgentSessions: 1,
+        },
+        recoveredBy: "new",
+      }),
+      /witness is not fully positive/i,
+    );
+    assert.equal(store.get()?.phase, "prepared");
+
+    // Stale/missing agent record -> fails closed
+    assert.throws(
+      () => store.recoverObservedReplacement({
+        cutoverId: "cutover-p02",
+        observedIdentity: replacementIdentity,
+        witness: {
+          workspaceQueryable: true,
+          agentQueryable: false,
+          agentReconciled: false,
+          witnessWorkspaceId: "ws_p02",
+          witnessAgentId: "agent-missing",
+          witnessWorkspaceSessions: 1,
+          witnessAgentSessions: 1,
+        },
+        recoveredBy: "new",
+      }),
+      /witness is not fully positive/i,
+    );
+    assert.equal(store.get()?.phase, "prepared");
+
+    // One valid exact pair -> eligible and succeeds
+    const recovered = store.recoverObservedReplacement({
+      cutoverId: "cutover-p02",
+      expectedNewIdentity: expectedIdentity,
+      observedIdentity: replacementIdentity,
+      witness: {
+        workspaceQueryable: true,
+        agentQueryable: true,
+        agentReconciled: true,
+        witnessWorkspaceId: "ws_p02",
+        witnessAgentId: agent.id,
+        witnessWorkspaceSessions: 1,
+        witnessAgentSessions: 1,
+        witnessKind: "exact-pair",
+      },
+      recoveredBy: "new",
+    });
+    assert.equal(recovered.newlyRecovered, true);
+    assert.equal(recovered.record.phase, "closed");
+    assert.equal(recovered.record.observedReplacement?.witnessWorkspaceId, "ws_p02");
+    assert.equal(recovered.record.observedReplacement?.witnessAgentId, agent.id);
+    assert.equal(recovered.record.observedReplacement?.witnessWorkspaceSessions, 1);
+    assert.equal(recovered.record.observedReplacement?.witnessAgentSessions, 1);
+  } finally {
+    agentManager.close();
+    agentStore.close();
+    wsStore.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("P0-3: recovery and finish share identical semantics and idempotently rendezvous without second effect", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-p0-3-shared-"));
+  const targetCommit = "a".repeat(40);
+
+  // Scenario 1: recover first -> finish replay
+  {
+    const root1 = join(root, "scenario-1");
+    const project1 = join(root1, "project");
+    const stateDir1 = join(root1, ".state");
+    await mkdir(project1, { recursive: true });
+    const config1 = loadConfig({
+      DEVSPACE_CONFIG_DIR: join(root1, ".config"),
+      DEVSPACE_ALLOWED_ROOTS: root1,
+      DEVSPACE_STATE_DIR: stateDir1,
+      DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+      PORT: "1",
+    });
+
+    const seedWs1 = new SqliteWorkspaceStore(stateDir1);
+    const seedAgent1 = new LocalAgentStore(stateDir1);
+    seedWs1.createSession({ id: "ws_shared", root: project1 });
+    const seededAgent1 = seedAgent1.create({
+      workspaceId: "ws_shared",
+      workspaceRoot: project1,
+      profileName: "shared-worker",
+      provider: "codex",
+    });
+    seedAgent1.close();
+    seedWs1.close();
+
+    const store1 = new CutoverStateStore(stateDir1, { newId: () => "cutover-r-then-f" });
+    const old = new McpCutoverController(store1, { serverInstanceId: "old-server", sourceCommit: "old", buildId: "old" });
+    old.begin({ sourceCommit: targetCommit, buildId: "target-build" });
+
+    const replacement = new McpCutoverController(store1, { serverInstanceId: "new-server", sourceCommit: targetCommit, buildId: "target-build" });
+    const wsStore = new SqliteWorkspaceStore(stateDir1);
+    const agentStore = new LocalAgentStore(stateDir1);
+    const workspaces = new WorkspaceRegistry(config1, wsStore);
+    const agentManager = new LocalAgentSessionManager(config1, async () => {}, async () => true);
+
+    const server = createMcpServer(
+      config1,
+      workspaces,
+      createReviewCheckpointManager(),
+      new ProcessSessionManager(),
+      () => [],
+      [],
+      agentManager,
+      undefined,
+      undefined,
+      undefined,
+      {
+        controller: replacement,
+        transportEvidence: () => ({ activeSessions: 0, oldestAgeMs: 0 }),
+        reconcileDurableState: async ({ workspaceId, agentId }) => ({
+          workspaceQueryable: true,
+          agentQueryable: true,
+          agentReconciled: true,
+          witnessWorkspaceId: workspaceId,
+          witnessAgentId: agentId,
+          witnessWorkspaceSessions: 1,
+          witnessAgentSessions: 1,
+          witnessKind: "exact-pair",
+        }),
+        executeObservedReplacementRecovery: async (input) => {
+          const active = replacement.record()!;
+          if (active.phase === "closed") {
+            return { terminal: active, newlyRecovered: false, mode: replacement.mode() };
+          }
+          const rec = replacement.recoverCutover({
+            cutoverId: input.cutoverId,
+            expectedNewIdentity: input.expectedNewIdentity ?? active.expectedNewIdentity,
+            witness: {
+              workspaceQueryable: true,
+              agentQueryable: true,
+              agentReconciled: true,
+              witnessWorkspaceId: "ws_shared",
+              witnessAgentId: seededAgent1.id,
+              witnessWorkspaceSessions: 1,
+              witnessAgentSessions: 1,
+              witnessKind: "exact-pair",
+            },
+          });
+          return { terminal: rec.terminal, newlyRecovered: rec.newlyRecovered, mode: replacement.mode() };
+        },
+      },
+    );
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "test-client-rf", version: "1.0.0" });
+    try {
+      await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+
+      // 1. First call: cutover_recover
+      const recoverResult = structuredContent(await client.callTool({
+        name: "cutover_recover",
+        arguments: {
+          cutoverId: "cutover-r-then-f",
+          expectedSourceCommit: targetCommit,
+          expectedBuildId: "target-build",
+        },
+      }));
+      assert.equal(recoverResult.newlyRecovered, true);
+      assert.equal((recoverResult.terminal as Record<string, unknown>).phase, "closed");
+      assert.equal(replacement.mode(), "normal");
+
+      // 2. Second call: cutover_finish replay on the already-closed cutover
+      const finishReplay = structuredContent(await client.callTool({
+        name: "cutover_finish",
+        arguments: {
+          cutoverId: "cutover-r-then-f",
+          workspaceId: "ws_shared",
+          agentId: seededAgent1.id,
+        },
+      }));
+      assert.equal((finishReplay.cutover as Record<string, unknown>).phase, "closed");
+      assert.equal(
+        (finishReplay.cutover as Record<string, unknown>).cutoverId,
+        (recoverResult.terminal as Record<string, unknown>).cutoverId,
+      );
+      assert.equal(replacement.mode(), "normal");
+    } finally {
+      await client.close();
+      await server.close();
+      agentManager.close();
+      agentStore.close();
+      wsStore.close();
+    }
+  }
+
+  // Scenario 2: finish first -> recover replay
+  {
+    const root2 = join(root, "scenario-2");
+    const project2 = join(root2, "project");
+    const stateDir2 = join(root2, ".state");
+    await mkdir(project2, { recursive: true });
+    const config2 = loadConfig({
+      DEVSPACE_CONFIG_DIR: join(root2, ".config"),
+      DEVSPACE_ALLOWED_ROOTS: root2,
+      DEVSPACE_STATE_DIR: stateDir2,
+      DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+      PORT: "1",
+    });
+
+    const seedWs2 = new SqliteWorkspaceStore(stateDir2);
+    const seedAgent2 = new LocalAgentStore(stateDir2);
+    seedWs2.createSession({ id: "ws_shared", root: project2 });
+    const seededAgent2 = seedAgent2.create({
+      workspaceId: "ws_shared",
+      workspaceRoot: project2,
+      profileName: "shared-worker",
+      provider: "codex",
+    });
+    seedAgent2.close();
+    seedWs2.close();
+
+    const store2 = new CutoverStateStore(stateDir2, { newId: () => "cutover-f-then-r" });
+    const old = new McpCutoverController(store2, { serverInstanceId: "old-server-2", sourceCommit: "old", buildId: "old" });
+    old.begin({ sourceCommit: targetCommit, buildId: "target-build" });
+
+    const replacement = new McpCutoverController(store2, { serverInstanceId: "new-server-2", sourceCommit: targetCommit, buildId: "target-build" });
+    const wsStore = new SqliteWorkspaceStore(stateDir2);
+    const agentStore = new LocalAgentStore(stateDir2);
+    const workspaces = new WorkspaceRegistry(config2, wsStore);
+    const agentManager = new LocalAgentSessionManager(config2, async () => {}, async () => true);
+
+    const server = createMcpServer(
+      config2,
+      workspaces,
+      createReviewCheckpointManager(),
+      new ProcessSessionManager(),
+      () => [],
+      [],
+      agentManager,
+      undefined,
+      undefined,
+      undefined,
+      {
+        controller: replacement,
+        transportEvidence: () => ({ activeSessions: 0, oldestAgeMs: 0 }),
+        reconcileDurableState: async ({ workspaceId, agentId }) => ({
+          workspaceQueryable: true,
+          agentQueryable: true,
+          agentReconciled: true,
+          witnessWorkspaceId: workspaceId,
+          witnessAgentId: agentId,
+          witnessWorkspaceSessions: 1,
+          witnessAgentSessions: 1,
+          witnessKind: "exact-pair",
+        }),
+        executeObservedReplacementRecovery: async (input) => {
+          const active = replacement.record()!;
+          if (active.phase === "closed") {
+            return { terminal: active, newlyRecovered: false, mode: replacement.mode() };
+          }
+          const rec = replacement.recoverCutover({
+            cutoverId: input.cutoverId,
+            expectedNewIdentity: input.expectedNewIdentity ?? active.expectedNewIdentity,
+            witness: {
+              workspaceQueryable: true,
+              agentQueryable: true,
+              agentReconciled: true,
+              witnessWorkspaceId: "ws_shared",
+              witnessAgentId: seededAgent2.id,
+              witnessWorkspaceSessions: 1,
+              witnessAgentSessions: 1,
+              witnessKind: "exact-pair",
+            },
+          });
+          return { terminal: rec.terminal, newlyRecovered: rec.newlyRecovered, mode: replacement.mode() };
+        },
+      },
+    );
+
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: "test-client-fr", version: "1.0.0" });
+    try {
+      await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+
+      // 1. First call: cutover_finish
+      const finishResult = structuredContent(await client.callTool({
+        name: "cutover_finish",
+        arguments: {
+          cutoverId: "cutover-f-then-r",
+          workspaceId: "ws_shared",
+          agentId: seededAgent2.id,
+        },
+      }));
+      assert.equal((finishResult.cutover as Record<string, unknown>).phase, "closed");
+      assert.equal(replacement.mode(), "normal");
+
+      // 2. Second call: cutover_recover replay
+      const recoverReplay = structuredContent(await client.callTool({
+        name: "cutover_recover",
+        arguments: {
+          cutoverId: "cutover-f-then-r",
+          expectedSourceCommit: targetCommit,
+          expectedBuildId: "target-build",
+        },
+      }));
+      assert.equal(recoverReplay.newlyRecovered, false);
+      assert.equal((recoverReplay.terminal as Record<string, unknown>).phase, "closed");
+      assert.equal(
+        (recoverReplay.terminal as Record<string, unknown>).cutoverId,
+        (finishResult.cutover as Record<string, unknown>).cutoverId,
+      );
+      assert.equal(replacement.mode(), "normal");
+    } finally {
+      await client.close();
+      await server.close();
+      agentManager.close();
+      agentStore.close();
+      wsStore.close();
+    }
+  }
+
+  await rm(root, { recursive: true, force: true });
+});
+
+test("P0-4: real server /mcp HTTP boundary permits transport reconnect during drain, allows safe tools, blocks consequential tools", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-p0-4-http-"));
+  const project = join(root, "project");
+  const stateDir = join(root, ".state");
+  await mkdir(project, { recursive: true });
+
+  // Get dynamic free port
+  const port = await new Promise<number>((resolve, reject) => {
+    const s = createNetServer();
+    s.listen(0, "127.0.0.1", () => {
+      const p = (s.address() as AddressInfo).port;
+      s.close((err) => (err ? reject(err) : resolve(p)));
+    });
+  });
+
+  const ownerToken = "test-owner-token-that-is-long-enough";
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_OAUTH_OWNER_TOKEN: ownerToken,
+    DEVSPACE_PUBLIC_BASE_URL: baseUrl,
+    PORT: String(port),
+  });
+
+  // Seed valid OAuth access token for HTTP bearerAuth
+  const testAccessToken = "valid-test-bearer-access-token";
+  const mcpUrl = `http://127.0.0.1:${port}/mcp`;
+  const oauthStore = new SqliteOAuthStore(stateDir);
+  const clientsStore = new SqliteOAuthClientsStore(oauthStore, ["127.0.0.1", "localhost"]);
+  const clientRecord = clientsStore.registerClient({
+    redirect_uris: [`http://127.0.0.1:${port}/callback`],
+    client_name: "chatgpt-client",
+  });
+  oauthStore.saveTokenPair({
+    accessTokenHash: createHash("sha256").update(testAccessToken).digest("base64url"),
+    accessToken: {
+      clientId: clientRecord.client_id,
+      scopes: ["devspace"],
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      resource: mcpUrl,
+    },
+    refreshTokenHash: createHash("sha256").update("dummy-refresh-hash").digest("base64url"),
+    refreshToken: {
+      clientId: clientRecord.client_id,
+      scopes: ["devspace"],
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      resource: mcpUrl,
+    },
+  });
+  oauthStore.close();
+
+  const running = createServer(config);
+  const httpServer = running.app.listen(port);
+
+  try {
+    // 1. Client 1 initializes MCP session
+    const init1Res = await fetch(mcpUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${testAccessToken}`,
+        "Accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "chatgpt-connector-1", version: "1.0.0" },
+        },
+      }),
+    });
+    assert.equal(init1Res.status, 200);
+    const session1Id = init1Res.headers.get("mcp-session-id");
+    assert.ok(session1Id, "Session 1 id header present");
+
+    // 2. Client 1 starts cutover -> enters drain
+    const startRes = await fetch(mcpUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${testAccessToken}`,
+        "mcp-session-id": session1Id,
+        "Accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 2,
+        method: "tools/call",
+        params: {
+          name: "cutover_start",
+          arguments: {
+            expectedSourceCommit: "a".repeat(40),
+            expectedBuildId: "build-p04",
+          },
+        },
+      }),
+    });
+    assert.equal(startRes.status, 200);
+
+    // 3. Client 2 (reconnecting ChatGPT connector after drop, starting new session during drain)
+    const init2Res = await fetch(mcpUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${testAccessToken}`,
+        "Accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 10,
+        method: "initialize",
+        params: {
+          protocolVersion: "2024-11-05",
+          capabilities: {},
+          clientInfo: { name: "chatgpt-connector-reconnected", version: "1.0.0" },
+        },
+      }),
+    });
+    // Transport initialization itself MUST SUCCEED (reversing 2026-09-09 deadlock!)
+    assert.equal(init2Res.status, 200, "Transport initialization during drain must succeed");
+    const session2Id = init2Res.headers.get("mcp-session-id");
+    assert.ok(session2Id, "Session 2 id header present");
+
+    const parseMcpResponse = async (res: globalThis.Response) => {
+      const text = await res.text();
+      const dataLine = text.split("\n").find((line) => line.startsWith("data: "));
+      if (dataLine) {
+        return JSON.parse(dataLine.slice(6));
+      }
+      return JSON.parse(text);
+    };
+
+    // 4. Client 2 calls safe control tool (cutover_status) -> SUCCEEDS
+    const statusRes = await fetch(mcpUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${testAccessToken}`,
+        "mcp-session-id": session2Id,
+        "Accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 11,
+        method: "tools/call",
+        params: {
+          name: "cutover_status",
+          arguments: {},
+        },
+      }),
+    });
+    assert.equal(statusRes.status, 200, "Safe control tool must succeed during drain");
+    const statusJson = (await parseMcpResponse(statusRes)) as { result?: { structuredContent?: { status?: { mode?: string } } } };
+    assert.equal(statusJson.result?.structuredContent?.status?.mode, "drain");
+
+    // 5. Client 2 calls consequential mutation tool (open_workspace) -> BLOCKED with 409
+    const openRes = await fetch(mcpUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${testAccessToken}`,
+        "mcp-session-id": session2Id,
+        "Accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 12,
+        method: "tools/call",
+        params: {
+          name: "open_workspace",
+          arguments: { path: project },
+        },
+      }),
+    });
+    assert.equal(openRes.status, 409, "Consequential tool must be blocked with 409 during drain");
+    const openJson = (await parseMcpResponse(openRes)) as { error?: { code?: number; message?: string } };
+    assert.equal(openJson.error?.code, -32002);
+    assert.ok(openJson.error?.message?.includes("CUTOVER_RECONCILIATION_REQUIRED"));
+  } finally {
+    await new Promise<void>((res) => httpServer.close(() => res()));
+    await running.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });

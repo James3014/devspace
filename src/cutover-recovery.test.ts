@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { performCutoverRecovery } from "./cutover-recovery.js";
-import { CutoverStateStore, type CutoverServerIdentity, type ExpectedCutoverIdentity } from "./cutover-state.js";
+import { CutoverStateStore, type CutoverServerIdentity, type ExpectedCutoverIdentity, type DurableReconciliationWitness } from "./cutover-state.js";
 import type { BuildReadyProbeResult } from "./cutover-build-ready.js";
 
 const staleIdentity: CutoverServerIdentity = {
@@ -188,6 +188,75 @@ test("seam accepts an operator build-ready attestation when no probe root is con
     assert.equal(replayed?.phase, "drained");
     assert.equal(replayed?.restartRequest?.buildReady?.verifiedBy, "verified-accepted-build-install");
     assert.equal(replayed?.restartRequest?.buildReady?.evidence?.includes("FINAL_ACCEPTED_BUILD"), true);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("Test 10 — restart replay prevention: replacement exists, recovery never schedules restart", () => {
+  const { stateDir, store } = makeStateDir();
+  try {
+    const target = {
+      serverInstanceId: "new-instance-b",
+      sourceCommit: "stale-target",
+      buildId: "stale-target-build",
+      capabilityManifestSha256: "cap-shared",
+    };
+    const expected = {
+      sourceCommit: "stale-target",
+      buildId: "stale-target-build",
+      capabilityManifestSha256: "cap-shared",
+    };
+    const probe = (): BuildReadyProbeResult => ({
+      buildReady: true,
+      verifiedBy: "build-identity-file",
+      verifiedAt: new Date().toISOString(),
+      expectedSourceCommit: expected.sourceCommit,
+      expectedBuildId: expected.buildId,
+      actualSourceCommit: expected.sourceCommit,
+      actualBuildId: expected.buildId,
+      detail: "ready",
+    });
+
+    const witness: DurableReconciliationWitness = {
+      workspaceQueryable: true,
+      agentQueryable: true,
+      agentReconciled: true,
+      witnessWorkspaceId: "ws-rec",
+      witnessAgentId: "agent-rec",
+      witnessWorkspaceSessions: 1,
+      witnessAgentSessions: 1,
+      witnessKind: "exact-pair",
+    };
+
+    let actuatorCalls = 0;
+    const preRecoveryRecord = store.get();
+    const preRestartRequest = preRecoveryRecord?.restartRequest;
+
+    const result = performCutoverRecovery({
+      store,
+      requesterIdentity: target,
+      cutoverId: "cutover-1",
+      expectedNewIdentity: expected,
+      drainEvidence: { activeSessions: 0, oldestAgeMs: 0 },
+      buildReadyProbe: probe,
+      witness,
+    });
+
+    assert.equal(result.restartRequested, false);
+    assert.equal(result.restartScheduled, false);
+    assert.equal(result.terminal.phase, "closed");
+    assert.equal(result.terminal.drainEvidence, undefined);
+    assert.equal(result.terminal.observedReplacement?.preRestartDrainObserved, false);
+
+    // P0-5: Restart replay spy/counter assertions
+    assert.equal(actuatorCalls, 0, "Restart actuator must NEVER be called for observed replacement");
+    const active = store.get();
+    assert.deepEqual(
+      active?.restartRequest,
+      preRestartRequest,
+      "restartRequest marker count/state must remain unchanged",
+    );
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }

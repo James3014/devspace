@@ -59,14 +59,18 @@ import {
   CutoverStateError,
   CutoverStateStore,
   type CutoverDrainEvidence,
+  type DurableCutoverRecord,
   type ExpectedCutoverIdentity,
 } from "./cutover-state.js";
+
 import {
   CutoverBlockedError,
   McpCutoverController,
   registerCutoverHttpRoutes,
+  type CutoverMode,
   type DurableReconciliationWitness,
 } from "./mcp-cutover.js";
+import type { LocalAgentRecord } from "./local-agent-store.js";
 import { CutoverBuildNotReadyError, probeBuildReady, type BuildReadyProbeResult } from "./cutover-build-ready.js";
 import { CutoverOrchestrator, type OrchestrationOutcome } from "./cutover-orchestration.js";
 import {
@@ -1304,7 +1308,20 @@ export interface CutoverMcpControlContext {
   inspectWorkspace?: (workspaceId: string) => { session?: WorkspaceSession; loaded: boolean };
   listWorkspaceSessions?: () => WorkspaceSession[];
   advance?: () => Promise<OrchestrationOutcome>;
+  enumerateReconciliation?: () => Promise<DurableReconciliationWitness>;
+  executeObservedReplacementRecovery?: (input: {
+    cutoverId: string;
+    expectedNewIdentity?: ExpectedCutoverIdentity;
+    preferredPair?: { workspaceId?: string; agentId?: string };
+    expiresAt?: string;
+  }) => Promise<{
+    terminal: DurableCutoverRecord;
+    successor?: DurableCutoverRecord;
+    newlyRecovered: boolean;
+    mode: CutoverMode;
+  }>;
 }
+
 
 function registerCutoverMcpTools(
   server: McpServer,
@@ -1510,7 +1527,7 @@ function registerCutoverMcpTools(
       },
       outputSchema: {
         terminal: cutoverRecordSchema,
-        successor: cutoverRecordSchema,
+        successor: cutoverRecordSchema.optional(),
         newlyRecovered: z.boolean(),
         mode: modeSchema,
       },
@@ -1518,6 +1535,45 @@ function registerCutoverMcpTools(
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ cutoverId, expectedSourceCommit, expectedBuildId, expectedCapabilityManifestSha256, expiresAt }) => {
+      const activeRecord = control.controller.record();
+      if (
+        activeRecord &&
+        activeRecord.cutoverId === cutoverId &&
+        (activeRecord.phase === "closed" || (activeRecord.phase === "prepared" && !activeRecord.drainEvidence)) &&
+        control.executeObservedReplacementRecovery
+      ) {
+        const recovered = await control.executeObservedReplacementRecovery({
+          cutoverId,
+          expectedNewIdentity: {
+            sourceCommit: expectedSourceCommit,
+            buildId: expectedBuildId,
+            ...(expectedCapabilityManifestSha256 ? { capabilityManifestSha256: expectedCapabilityManifestSha256 } : {}),
+          },
+          ...(expiresAt ? { expiresAt } : {}),
+        });
+        const mode = recovered.mode;
+        const summaryText = recovered.newlyRecovered
+          ? `Recovered observed replacement cutover ${recovered.terminal.cutoverId} without pre-restart drain; mode=${mode}.`
+          : `Cutover ${recovered.terminal.cutoverId} is already closed; mode=${mode}.`;
+        return {
+          content: [textBlock(summaryText)],
+          structuredContent: {
+            terminal: recovered.terminal as unknown as Record<string, unknown>,
+            newlyRecovered: recovered.newlyRecovered,
+            mode,
+          },
+        };
+      }
+      let witness: DurableReconciliationWitness | undefined;
+      if (
+        activeRecord &&
+        activeRecord.cutoverId === cutoverId &&
+        activeRecord.phase === "prepared" &&
+        !activeRecord.drainEvidence &&
+        control.enumerateReconciliation
+      ) {
+        witness = await control.enumerateReconciliation();
+      }
       const recovered = control.controller.recoverCutover({
         cutoverId,
         expectedNewIdentity: {
@@ -1526,15 +1582,17 @@ function registerCutoverMcpTools(
           ...(expectedCapabilityManifestSha256 ? { capabilityManifestSha256: expectedCapabilityManifestSha256 } : {}),
         },
         ...(expiresAt ? { expiresAt } : {}),
+        ...(witness ? { witness } : {}),
       });
       const mode = control.controller.mode();
+      const summaryText = recovered.successor
+        ? `Superseded stale cutover ${recovered.terminal.cutoverId} -> successor ${recovered.successor.cutoverId}; mode=${mode}.`
+        : `Recovered observed replacement cutover ${recovered.terminal.cutoverId} without pre-restart drain; mode=${mode}.`;
       return {
-        content: [textBlock(
-          `Superseded stale cutover ${recovered.terminal.cutoverId} -> successor ${recovered.successor.cutoverId}; mode=${mode}.`,
-        )],
+        content: [textBlock(summaryText)],
         structuredContent: {
           terminal: recovered.terminal as unknown as Record<string, unknown>,
-          successor: recovered.successor as unknown as Record<string, unknown>,
+          ...(recovered.successor ? { successor: recovered.successor as unknown as Record<string, unknown> } : {}),
           newlyRecovered: recovered.newlyRecovered,
           mode,
         },
@@ -1562,17 +1620,59 @@ function registerCutoverMcpTools(
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ cutoverId, workspaceId, agentId }) => {
-      const record = await control.controller.finish(
-        cutoverId,
-        () => control.reconcileDurableState({ workspaceId, agentId }),
-      );
+      const activeRecord = control.controller.record();
+      if (activeRecord && activeRecord.phase === "closed" && activeRecord.cutoverId === cutoverId) {
+        const mode = control.controller.mode();
+        return {
+          content: [textBlock(`Finished cutover ${cutoverId}; mode=${mode}.`)],
+          structuredContent: { cutover: activeRecord as unknown as Record<string, unknown>, mode },
+        };
+      }
+      if (
+        activeRecord &&
+        activeRecord.cutoverId === cutoverId &&
+        activeRecord.phase === "prepared" &&
+        !activeRecord.drainEvidence &&
+        control.executeObservedReplacementRecovery
+      ) {
+        const recovered = await control.executeObservedReplacementRecovery({
+          cutoverId,
+          preferredPair: { workspaceId, agentId },
+        });
+        const mode = recovered.mode;
+        return {
+          content: [textBlock(`Finished cutover ${cutoverId}; mode=${mode}.`)],
+          structuredContent: { cutover: recovered.terminal as unknown as Record<string, unknown>, mode },
+        };
+      }
+      const witness = await control.reconcileDurableState({ workspaceId, agentId });
+      let record: DurableCutoverRecord;
+      if (
+        activeRecord &&
+        activeRecord.cutoverId === cutoverId &&
+        activeRecord.phase === "prepared" &&
+        !activeRecord.drainEvidence
+      ) {
+        const recovered = control.controller.recoverCutover({
+          cutoverId,
+          expectedNewIdentity: activeRecord.expectedNewIdentity,
+          witness,
+        });
+        record = recovered.terminal;
+      } else {
+        record = await control.controller.finish(
+          cutoverId,
+          async () => witness,
+        );
+      }
       const mode = control.controller.mode();
       return {
-        content: [textBlock(`Finished cutover ${cutoverId}; mode=${mode}.`) ],
+        content: [textBlock(`Finished cutover ${cutoverId}; mode=${mode}.`)],
         structuredContent: { cutover: record as unknown as Record<string, unknown>, mode },
       };
     },
   );
+
 
   if (control.listWorkspaceSessions && control.inspectWorkspace) {
     registerAppTool(
@@ -4134,53 +4234,21 @@ export function createServer(
     },
   );
   const restartSelfActuator = createLaunchdSelfRestartActuator();
-  const reconcileCutoverDurableState = async ({
-    workspaceId,
-    agentId,
-  }: {
-    workspaceId: string;
-    agentId: string;
+  const resolveDurableReconciliationWitness = async (preferredPair?: {
+    workspaceId?: string;
+    agentId?: string;
   }): Promise<DurableReconciliationWitness> => {
-    if (!agentSessionManager) {
-      throw new CutoverStateError(
-        "Durable agent reconciliation is unavailable because subagents are disabled.",
-      );
-    }
-    const workspace = workspaces.getWorkspace(workspaceId);
-    await agentSessionManager.getAgentStatus({
-      workspaceId,
-      workspaceRoot: workspace.root,
-      agentId,
-      waitMs: 0,
-    });
-    await agentSessionManager.reconcileAgent({
-      workspaceId,
-      workspaceRoot: workspace.root,
-      isolated: workspace.mode === "worktree",
-      agentId,
-    });
-    return {
-      workspaceQueryable: true,
-      agentQueryable: true,
-      agentReconciled: true,
-    };
-  };
-  const enumerateDurableReconciliationState = async (): Promise<{
-    workspaceQueryable: boolean;
-    agentQueryable: boolean;
-    agentReconciled: boolean;
-    workspaceSessions: number;
-    agentSessions: number;
-    detail: Array<{ unit: string; ok: boolean; detail?: string }>;
-  }> => {
     const errorText = (error: unknown): string =>
       error instanceof Error ? error.message : String(error);
     const detail: Array<{ unit: string; ok: boolean; detail?: string }> = [];
+
     let workspaceQueryable = true;
     let workspaceSessions = 0;
+    const workspaceList: WorkspaceSession[] = [];
     try {
       const sessions = workspaceStore.listSessions();
       workspaceSessions = sessions.length;
+      workspaceList.push(...sessions);
       for (const session of sessions) {
         const unit = `workspace:${session.id}`;
         try {
@@ -4201,74 +4269,220 @@ export function createServer(
       workspaceQueryable = false;
       detail.push({ unit: "workspace-store", ok: false, detail: errorText(error) });
     }
+
     if (!agentSessionManager) {
       return {
-        workspaceQueryable,
+        workspaceQueryable: workspaceQueryable && workspaceSessions >= 1,
         agentQueryable: false,
         agentReconciled: false,
         workspaceSessions,
         agentSessions: 0,
+        witnessWorkspaceSessions: workspaceSessions,
+        witnessAgentSessions: 0,
         detail: [
           ...detail,
           { unit: "agent-store", ok: false, detail: "subagents disabled; durable agent reconciliation unavailable" },
         ],
       };
     }
+
+    let agentRecords: LocalAgentRecord[] = [];
     let agentQueryable = true;
     let agentReconciled = true;
     let agentSessions = 0;
     try {
-      const records = agentSessionManager.listAllAgentRecords();
-      agentSessions = records.length;
-      for (const agent of records) {
-        const unit = `agent:${agent.id}${agent.workspaceId ? `@${agent.workspaceId}` : ""}`;
-        if (!agent.workspaceId) {
-          agentQueryable = false;
-          agentReconciled = false;
-          detail.push({
-            unit,
-            ok: false,
-            detail: "durable agent record has no workspace binding; reconciliation impossible",
-          });
-          continue;
-        }
+      agentRecords = agentSessionManager.listAllAgentRecords();
+      agentSessions = agentRecords.length;
+    } catch (error) {
+      agentQueryable = false;
+      agentReconciled = false;
+      detail.push({ unit: "agent-store", ok: false, detail: errorText(error) });
+    }
+
+    let targetWorkspaceId = preferredPair?.workspaceId;
+    let targetAgentId = preferredPair?.agentId;
+    let witnessKind = "exact-pair";
+
+    if (targetWorkspaceId && targetAgentId) {
+      const matchedWorkspace = workspaceList.find((s) => s.id === targetWorkspaceId);
+      if (!matchedWorkspace) {
+        workspaceQueryable = false;
+        detail.push({
+          unit: `workspace:${targetWorkspaceId}`,
+          ok: false,
+          detail: "requested witness workspace not found in durable workspace store",
+        });
+      }
+      const matchedAgent = agentRecords.find((a) => a.id === targetAgentId);
+      if (!matchedAgent) {
+        agentQueryable = false;
+        detail.push({
+          unit: `agent:${targetAgentId}`,
+          ok: false,
+          detail: "requested witness agent not found in durable agent store",
+        });
+      } else if (matchedAgent.workspaceId !== targetWorkspaceId) {
+        agentQueryable = false;
+        agentReconciled = false;
+        detail.push({
+          unit: `agent:${targetAgentId}`,
+          ok: false,
+          detail: `agent belongs to workspace ${matchedAgent.workspaceId ?? "unbound"}, not requested ${targetWorkspaceId}`,
+        });
+      }
+    } else {
+      witnessKind = "inventory-selected-pair";
+      if (workspaceSessions === 0 || agentSessions === 0) {
+        return {
+          workspaceQueryable: workspaceQueryable && workspaceSessions >= 1,
+          agentQueryable: false,
+          agentReconciled: false,
+          workspaceSessions,
+          agentSessions,
+          witnessWorkspaceSessions: workspaceSessions,
+          witnessAgentSessions: agentSessions,
+          witnessKind,
+          detail: [
+            ...detail,
+            { unit: "reconciliation-inventory", ok: false, detail: "inventory empty: cannot close without durable workspace and agent" },
+          ],
+        };
+      }
+      const sortedAgents = [...agentRecords].sort((a, b) => a.id.localeCompare(b.id));
+      const candidate = sortedAgents.find(
+        (a) => Boolean(a.workspaceId) && workspaceList.some((s) => s.id === a.workspaceId),
+      );
+      if (!candidate || !candidate.workspaceId) {
+        return {
+          workspaceQueryable: workspaceQueryable && workspaceSessions >= 1,
+          agentQueryable: false,
+          agentReconciled: false,
+          workspaceSessions,
+          agentSessions,
+          witnessWorkspaceSessions: workspaceSessions,
+          witnessAgentSessions: agentSessions,
+          witnessKind,
+          detail: [
+            ...detail,
+            { unit: "reconciliation-inventory", ok: false, detail: "no durable agent record is bound to an active workspace session" },
+          ],
+        };
+      }
+      targetWorkspaceId = candidate.workspaceId;
+      targetAgentId = candidate.id;
+    }
+
+    if (targetWorkspaceId && targetAgentId && agentQueryable && workspaceQueryable) {
+      try {
+        const workspace = workspaces.getWorkspace(targetWorkspaceId);
+        const unit = `agent:${targetAgentId}@${targetWorkspaceId}`;
         try {
           await agentSessionManager.getAgentStatus({
-            workspaceId: agent.workspaceId,
-            workspaceRoot: agent.workspaceRoot,
-            agentId: agent.id,
+            workspaceId: targetWorkspaceId,
+            workspaceRoot: workspace.root,
+            agentId: targetAgentId,
             waitMs: 0,
           });
         } catch (error) {
           agentQueryable = false;
           detail.push({ unit, ok: false, detail: `status unreadable: ${errorText(error)}` });
-          continue;
         }
+
         try {
           await agentSessionManager.reconcileAgent({
-            workspaceId: agent.workspaceId,
-            workspaceRoot: agent.workspaceRoot,
-            isolated: false,
-            agentId: agent.id,
+            workspaceId: targetWorkspaceId,
+            workspaceRoot: workspace.root,
+            isolated: workspace.mode === "worktree",
+            agentId: targetAgentId,
           });
           detail.push({ unit, ok: true });
         } catch (error) {
           agentReconciled = false;
           detail.push({ unit, ok: false, detail: `reconcile failed: ${errorText(error)}` });
         }
+      } catch (error) {
+        workspaceQueryable = false;
+        detail.push({ unit: `workspace:${targetWorkspaceId}`, ok: false, detail: errorText(error) });
       }
-    } catch (error) {
-      agentQueryable = false;
-      agentReconciled = false;
-      detail.push({ unit: "agent-store", ok: false, detail: errorText(error) });
     }
+
+    const isFullyPositive = Boolean(
+      workspaceQueryable &&
+      agentQueryable &&
+      agentReconciled &&
+      workspaceSessions >= 1 &&
+      agentSessions >= 1 &&
+      targetWorkspaceId &&
+      targetAgentId,
+    );
+
     return {
-      workspaceQueryable,
-      agentQueryable,
-      agentReconciled,
+      workspaceQueryable: workspaceQueryable && workspaceSessions >= 1,
+      agentQueryable: agentQueryable && isFullyPositive,
+      agentReconciled: agentReconciled && isFullyPositive,
+      witnessWorkspaceId: targetWorkspaceId,
+      witnessAgentId: targetAgentId,
       workspaceSessions,
       agentSessions,
+      witnessWorkspaceSessions: workspaceSessions,
+      witnessAgentSessions: agentSessions,
+      witnessKind,
       detail,
+    };
+  };
+
+  const reconcileCutoverDurableState = async ({
+    workspaceId,
+    agentId,
+  }: {
+    workspaceId: string;
+    agentId: string;
+  }): Promise<DurableReconciliationWitness> => {
+    return resolveDurableReconciliationWitness({ workspaceId, agentId });
+  };
+
+  const enumerateDurableReconciliationState = async (): Promise<DurableReconciliationWitness> => {
+    return resolveDurableReconciliationWitness();
+  };
+
+  const executeObservedReplacementRecovery = async (input: {
+    cutoverId: string;
+    expectedNewIdentity?: ExpectedCutoverIdentity;
+    preferredPair?: { workspaceId?: string; agentId?: string };
+    expiresAt?: string;
+  }): Promise<{
+    terminal: DurableCutoverRecord;
+    successor?: DurableCutoverRecord;
+    newlyRecovered: boolean;
+    mode: CutoverMode;
+  }> => {
+    const active = cutoverController.record();
+    if (!active) {
+      throw new CutoverStateError("No durable cutover record exists.");
+    }
+    if (active.cutoverId !== input.cutoverId) {
+      throw new CutoverStateError(`Cutover id mismatch: active cutover is ${active.cutoverId}.`);
+    }
+    if (active.phase === "closed") {
+      return {
+        terminal: active,
+        newlyRecovered: false,
+        mode: cutoverController.mode(),
+      };
+    }
+
+    const witness = await resolveDurableReconciliationWitness(input.preferredPair);
+    const recovered = cutoverController.recoverCutover({
+      cutoverId: input.cutoverId,
+      expectedNewIdentity: input.expectedNewIdentity ?? active.expectedNewIdentity,
+      ...(input.expiresAt ? { expiresAt: input.expiresAt } : {}),
+      witness,
+    });
+    return {
+      terminal: recovered.terminal,
+      successor: recovered.successor,
+      newlyRecovered: recovered.newlyRecovered,
+      mode: cutoverController.mode(),
     };
   };
   const codexGoals = config.codexGoalsEnabled
@@ -4590,7 +4804,10 @@ export function createServer(
             inspectWorkspace: (workspaceId) => workspaces.inspectWorkspace(workspaceId),
             listWorkspaceSessions: () => workspaceStore.listSessions(),
             ...(advanceCutover ? { advance: advanceCutover } : {}),
+            enumerateReconciliation: enumerateDurableReconciliationState,
+            executeObservedReplacementRecovery,
           },
+
         );
         await server.connect(transport);
       } else {

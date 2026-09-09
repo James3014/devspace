@@ -17,8 +17,11 @@ const CUTOVER_RESTART_SCHEMA = "devspace.cutover_restart.v1" as const;
 const CUTOVER_RESTART_SCHEDULED_SCHEMA = "devspace.cutover_restart_scheduled.v1" as const;
 export const CUTOVER_RECOVERY_INTENT_SCHEMA = "devspace.cutover_recovery_intent.v1" as const;
 export const CUTOVER_SUPERSEDED_SCHEMA = "devspace.cutover_superseded.v1" as const;
+export const CUTOVER_OBSERVED_REPLACEMENT_SCHEMA = "devspace.cutover_observed_replacement.v1" as const;
 
 export const CUTOVER_SUPERSEDED_REASON = "STALE_TARGET_SUPERSEDED" as const;
+export const CUTOVER_OBSERVED_REPLACEMENT_REASON = "OBSERVED_REPLACEMENT_WITHOUT_DRAIN" as const;
+
 
 /**
  * A stale unresolved cutover cannot be retried, replaced, or deleted. It can
@@ -74,12 +77,51 @@ export interface CutoverDrainEvidence {
   oldestAgeMs: number;
 }
 
+export interface DurableReconciliationWitness {
+  workspaceQueryable: boolean;
+  agentQueryable: boolean;
+  agentReconciled: boolean;
+  witnessWorkspaceId?: string;
+  witnessAgentId?: string;
+  workspaceSessions?: number;
+  agentSessions?: number;
+  witnessWorkspaceSessions?: number;
+  witnessAgentSessions?: number;
+  witnessKind?: string;
+  detail?: Array<{ unit: string; ok: boolean; detail?: string }>;
+}
+
 export interface CutoverReconciliationReceipt {
   closedByServerInstanceId: string;
   workspaceQueryable: boolean;
   agentQueryable: boolean;
   agentReconciled: boolean;
   reconciledAt: string;
+  terminalReason?: typeof CUTOVER_OBSERVED_REPLACEMENT_REASON;
+  preRestartDrainObserved?: boolean;
+  witnessWorkspaceId?: string;
+  witnessAgentId?: string;
+  witnessWorkspaceSessions?: number;
+  witnessAgentSessions?: number;
+  witnessKind?: string;
+}
+
+export interface CutoverObservedReplacementReceipt {
+  schema: typeof CUTOVER_OBSERVED_REPLACEMENT_SCHEMA;
+  cutoverId: string;
+  terminalReason: typeof CUTOVER_OBSERVED_REPLACEMENT_REASON;
+  preRestartDrainObserved: false;
+  oldServerIdentity: CutoverServerIdentity;
+  expectedIdentity: ExpectedCutoverIdentity;
+  observedIdentity: CutoverServerIdentity;
+  recoveredBy: string;
+  recoveredAt: string;
+  witnessWorkspaceId: string;
+  witnessAgentId: string;
+  witnessWorkspaceSessions: number;
+  witnessAgentSessions: number;
+  witnessKind: string;
+  reconciliationReceipt: CutoverReconciliationReceipt;
 }
 
 export interface BuildReadyReceipt {
@@ -127,6 +169,8 @@ export interface DurableCutoverRecord {
   supersedesCutoverId?: string;
   /** Present only on a terminal superseded record. */
   supersession?: CutoverSupersessionReceipt;
+  /** Present only on a record closed via observed replacement recovery without drain. */
+  observedReplacement?: CutoverObservedReplacementReceipt;
 }
 
 export interface CutoverStateStoreOptions {
@@ -635,6 +679,171 @@ export class CutoverStateStore {
       throw error;
     }
   }
+
+  /**
+
+   * Terminally close one cutover where the replacement server is already running with
+   * exact expected source/build/capability identity, but pre-restart drain evidence
+   * was absent (e.g. transport initialization rejection before cutover_drain reached handler).
+   *
+   * Invariants:
+   * - Never fabricates drainEvidence (remains undefined).
+   * - Never alters phase to "drained".
+   * - Never creates a successor cutover.
+   * - Never schedules or requests a restart.
+   * - Requires fully positive reconciliation witness (workspaceQueryable, agentQueryable, agentReconciled).
+   * - Idempotent rendezvous if already closed via this exact recovery.
+   * - Fail closed on wrong cutoverId, wrong identity, or changed recovery binding.
+   */
+  recoverObservedReplacement(input: {
+    cutoverId: string;
+    expectedNewIdentity?: ExpectedCutoverIdentity;
+    observedIdentity: CutoverServerIdentity;
+    witness: DurableReconciliationWitness;
+    recoveredBy: string;
+  }): { record: DurableCutoverRecord; newlyRecovered: boolean } {
+    mkdirSync(this.cutoverRoot, { recursive: true, mode: 0o700 });
+    const active = this.get();
+    if (!active) throw new CutoverStateError("No durable cutover record exists.");
+    if (active.cutoverId !== input.cutoverId) {
+      throw new CutoverStateError(
+        `Cutover id mismatch: active cutover is ${active.cutoverId}.`,
+      );
+    }
+
+    if (input.expectedNewIdentity) {
+      if (
+        input.expectedNewIdentity.sourceCommit !== active.expectedNewIdentity.sourceCommit ||
+        input.expectedNewIdentity.buildId !== active.expectedNewIdentity.buildId ||
+        (active.expectedNewIdentity.capabilityManifestSha256 !== undefined &&
+          input.expectedNewIdentity.capabilityManifestSha256 !== active.expectedNewIdentity.capabilityManifestSha256)
+      ) {
+        throw new CutoverStateError(
+          "[RECOVERY_BINDING_MISMATCH] Recovery expected identity does not match active cutover expected identity.",
+        );
+      }
+      if (existsSync(this.recoveryIntentPath)) {
+        this.assertRecoveryBinding({
+          cutoverId: input.cutoverId,
+          expectedNewIdentity: input.expectedNewIdentity,
+        });
+      }
+    }
+
+    if (active.phase === "closed") {
+      if (active.observedReplacement?.cutoverId === input.cutoverId) {
+        return { record: active, newlyRecovered: false };
+      }
+      throw new CutoverStateError(
+        `Cutover ${input.cutoverId} is already closed; normal archive applies.`,
+      );
+    }
+
+    if (active.phase !== "prepared" && active.phase !== "drained") {
+      throw new CutoverStateError(
+        `Cutover ${input.cutoverId} in phase ${active.phase} is not eligible for observed replacement recovery.`,
+      );
+    }
+
+    if (active.oldServerIdentity.serverInstanceId === input.observedIdentity.serverInstanceId) {
+      throw new CutoverStateError(
+        "Cannot recover cutover: observed serverInstanceId did not change from the old server.",
+      );
+    }
+
+    if (input.observedIdentity.sourceCommit !== active.expectedNewIdentity.sourceCommit) {
+      throw new CutoverStateError(
+        `Cannot recover cutover: observed sourceCommit ${input.observedIdentity.sourceCommit} does not match expected ${active.expectedNewIdentity.sourceCommit}.`,
+      );
+    }
+    if (input.observedIdentity.buildId !== active.expectedNewIdentity.buildId) {
+      throw new CutoverStateError(
+        `Cannot recover cutover: observed buildId ${input.observedIdentity.buildId} does not match expected ${active.expectedNewIdentity.buildId}.`,
+      );
+    }
+    if (
+      active.expectedNewIdentity.capabilityManifestSha256 !== undefined &&
+      input.observedIdentity.capabilityManifestSha256 !== active.expectedNewIdentity.capabilityManifestSha256
+    ) {
+      throw new CutoverStateError(
+        "Cannot recover cutover: observed capability manifest does not match expected target.",
+      );
+    }
+
+    const wsSessions = input.witness.witnessWorkspaceSessions ?? input.witness.workspaceSessions ?? 0;
+    const agSessions = input.witness.witnessAgentSessions ?? input.witness.agentSessions ?? 0;
+    const witnessWsId = input.witness.witnessWorkspaceId;
+    const witnessAgId = input.witness.witnessAgentId;
+    const witnessKind = input.witness.witnessKind ?? "exact-pair";
+
+    if (
+      !input.witness.workspaceQueryable ||
+      !input.witness.agentQueryable ||
+      !input.witness.agentReconciled ||
+      wsSessions < 1 ||
+      agSessions < 1 ||
+      !witnessWsId ||
+      !witnessAgId
+    ) {
+      throw new CutoverStateError(
+        "Cannot recover cutover: durable agent/workspace reconciliation witness is not fully positive or missing exact non-empty binding.",
+      );
+    }
+
+    if (input.expectedNewIdentity) {
+      this.writeRecoveryIntent({
+        cutoverId: input.cutoverId,
+        expectedNewIdentity: input.expectedNewIdentity,
+        recoveredBy: input.recoveredBy,
+      });
+    }
+
+    const nowIso = new Date(this.now()).toISOString();
+    const reconciliationReceipt: CutoverReconciliationReceipt = {
+      closedByServerInstanceId: input.observedIdentity.serverInstanceId,
+      workspaceQueryable: input.witness.workspaceQueryable,
+      agentQueryable: input.witness.agentQueryable,
+      agentReconciled: input.witness.agentReconciled,
+      reconciledAt: nowIso,
+      terminalReason: CUTOVER_OBSERVED_REPLACEMENT_REASON,
+      preRestartDrainObserved: false,
+      witnessWorkspaceId: witnessWsId,
+      witnessAgentId: witnessAgId,
+      witnessWorkspaceSessions: wsSessions,
+      witnessAgentSessions: agSessions,
+      witnessKind,
+    };
+
+    const observedReplacement: CutoverObservedReplacementReceipt = {
+      schema: CUTOVER_OBSERVED_REPLACEMENT_SCHEMA,
+      cutoverId: input.cutoverId,
+      terminalReason: CUTOVER_OBSERVED_REPLACEMENT_REASON,
+      preRestartDrainObserved: false,
+      oldServerIdentity: active.oldServerIdentity,
+      expectedIdentity: active.expectedNewIdentity,
+      observedIdentity: input.observedIdentity,
+      recoveredBy: input.recoveredBy,
+      recoveredAt: nowIso,
+      witnessWorkspaceId: witnessWsId,
+      witnessAgentId: witnessAgId,
+      witnessWorkspaceSessions: wsSessions,
+      witnessAgentSessions: agSessions,
+      witnessKind,
+      reconciliationReceipt,
+    };
+
+    const closedRecord: DurableCutoverRecord = {
+      ...withoutDiagnostic(active),
+      phase: "closed",
+      drainEvidence: undefined, // Explicitly keep absent! No fabricated drain!
+      reconciliationReceipt,
+      observedReplacement,
+      updatedAt: nowIso,
+    };
+
+    const closed = this.replace(closedRecord);
+    return { record: closed, newlyRecovered: true };
+  }
 }
 
 function withoutDiagnostic(record: DurableCutoverRecord): DurableCutoverRecord {
@@ -661,12 +870,61 @@ function parseRecord(raw: string): DurableCutoverRecord {
       (typeof value.supersedesCutoverId !== "string" ||
         value.supersedesCutoverId.trim() === "" ||
         value.supersedesCutoverId === value.cutoverId)) ||
-    (value.supersession !== undefined && !isSupersessionReceipt(value.supersession))
+    (value.supersession !== undefined && !isSupersessionReceipt(value.supersession)) ||
+    (value.reconciliationReceipt !== undefined && !isReconciliationReceipt(value.reconciliationReceipt)) ||
+    (value.observedReplacement !== undefined && !isObservedReplacementReceipt(value.observedReplacement))
   ) {
     throw new CutoverStateError("Durable cutover record is malformed; reconciliation is required.");
   }
   return value as DurableCutoverRecord;
 }
+
+function isReconciliationReceipt(value: unknown): value is CutoverReconciliationReceipt {
+  const receipt = value as Partial<CutoverReconciliationReceipt> | undefined;
+  return Boolean(
+    receipt &&
+    typeof receipt.closedByServerInstanceId === "string" &&
+    receipt.closedByServerInstanceId.length > 0 &&
+    typeof receipt.workspaceQueryable === "boolean" &&
+    typeof receipt.agentQueryable === "boolean" &&
+    typeof receipt.agentReconciled === "boolean" &&
+    typeof receipt.reconciledAt === "string" &&
+    Number.isFinite(Date.parse(receipt.reconciledAt)) &&
+    (receipt.preRestartDrainObserved === undefined || typeof receipt.preRestartDrainObserved === "boolean") &&
+    (receipt.terminalReason === undefined || receipt.terminalReason === CUTOVER_OBSERVED_REPLACEMENT_REASON),
+  );
+}
+
+function isObservedReplacementReceipt(value: unknown): value is CutoverObservedReplacementReceipt {
+  const receipt = value as Partial<CutoverObservedReplacementReceipt> | undefined;
+  return Boolean(
+    receipt &&
+    receipt.schema === CUTOVER_OBSERVED_REPLACEMENT_SCHEMA &&
+    typeof receipt.cutoverId === "string" &&
+    receipt.cutoverId.length > 0 &&
+    receipt.terminalReason === CUTOVER_OBSERVED_REPLACEMENT_REASON &&
+    receipt.preRestartDrainObserved === false &&
+    isIdentity(receipt.oldServerIdentity) &&
+    isExpectedIdentity(receipt.expectedIdentity) &&
+    isIdentity(receipt.observedIdentity) &&
+    typeof receipt.recoveredBy === "string" &&
+    receipt.recoveredBy.length > 0 &&
+    typeof receipt.recoveredAt === "string" &&
+    Number.isFinite(Date.parse(receipt.recoveredAt)) &&
+    typeof receipt.witnessWorkspaceId === "string" &&
+    receipt.witnessWorkspaceId.length > 0 &&
+    typeof receipt.witnessAgentId === "string" &&
+    receipt.witnessAgentId.length > 0 &&
+    typeof receipt.witnessWorkspaceSessions === "number" &&
+    receipt.witnessWorkspaceSessions >= 1 &&
+    typeof receipt.witnessAgentSessions === "number" &&
+    receipt.witnessAgentSessions >= 1 &&
+    typeof receipt.witnessKind === "string" &&
+    receipt.reconciliationReceipt !== undefined &&
+    isReconciliationReceipt(receipt.reconciliationReceipt),
+  );
+}
+
 
 function isSupersessionReceipt(value: unknown): value is CutoverSupersessionReceipt {
   const receipt = value as Partial<CutoverSupersessionReceipt> | undefined;

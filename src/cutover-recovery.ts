@@ -15,8 +15,10 @@ import {
   type CutoverDrainEvidence,
   type CutoverServerIdentity,
   type DurableCutoverRecord,
+  type DurableReconciliationWitness,
   type ExpectedCutoverIdentity,
 } from "./cutover-state.js";
+
 import { recoverCutoverWithStore } from "./mcp-cutover.js";
 
 /**
@@ -52,6 +54,7 @@ export interface CutoverRecoveryDependencies {
   /** Operator attestation fallback when no probe root is configured. */
   buildReadyAttestation?: Omit<BuildReadyReceipt, "verifiedAt">;
   expiresAt?: string;
+  witness?: DurableReconciliationWitness;
   now?: () => number;
 }
 
@@ -94,7 +97,20 @@ export function performCutoverRecovery(
     cutoverId,
     expectedNewIdentity,
     ...(dependencies.expiresAt ? { expiresAt: dependencies.expiresAt } : {}),
+    ...(dependencies.witness ? { witness: dependencies.witness } : {}),
   });
+
+  if (!recovered.successor) {
+    return {
+      terminal: recovered.terminal,
+      successor: recovered.terminal,
+      newlyRecovered: recovered.newlyRecovered,
+      drainRecord: recovered.terminal,
+      restartRequested: false,
+      restartScheduled: false,
+      buildReadyVerifiedBy: buildReady.verifiedBy,
+    };
+  }
 
   const drainRecord = store.recordDrain(recovered.successor.cutoverId, drainEvidence);
   const requested = store.recordRestartRequest(recovered.successor.cutoverId, {
@@ -117,6 +133,7 @@ export function performCutoverRecovery(
     buildReadyVerifiedBy: buildReady.verifiedBy,
   };
 }
+
 
 /** Identity of the recovering runtime read from its own generated build identity. */
 export function readRunningBuildIdentity(packageRoot: string): CutoverServerIdentity | undefined {
