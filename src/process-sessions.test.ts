@@ -750,11 +750,18 @@ try {
       cwd: process.cwd(),
       command: `${node} -e "console.log('natural-${index}')"`,
       tty: true,
-      yieldTimeMs: process.platform === "win32" ? 1_500 : 500,
+      yieldTimeMs: 250,
     });
-    assert.equal(naturalPty.running, false);
-    assert.equal(naturalPty.exitCode, 0);
-    assert.match(naturalPty.output, new RegExp(`natural-${index}`));
+    const naturalCompleted = naturalPty.running
+      ? await g2Manager.getStatus({
+          workspaceId: "ws_g2",
+          sessionId: naturalPty.sessionId!,
+          yieldTimeMs: process.platform === "win32" ? 1_500 : 500,
+        })
+      : naturalPty;
+    assert.equal(naturalCompleted.running, false);
+    assert.equal(naturalCompleted.exitCode, 0);
+    assert.match(`${naturalPty.output}${naturalCompleted.output}`, new RegExp(`natural-${index}`));
   }
 
   const terminatedPty = await g2Manager.start({
@@ -765,6 +772,13 @@ try {
     yieldTimeMs: 100,
   });
   assert.equal(terminatedPty.running, true);
+  const terminatedReady = await g2Manager.getStatus({
+    workspaceId: "ws_g2",
+    sessionId: terminatedPty.sessionId!,
+    yieldTimeMs: process.platform === "win32" ? 1_000 : 250,
+  });
+  assert.equal(terminatedReady.running, true);
+  assert.match(`${terminatedPty.output}${terminatedReady.output}`, /before-terminate/);
   g2Manager.terminate("ws_g2", terminatedPty.sessionId!);
   const terminatedStatus = await g2Manager.getStatus({
     workspaceId: "ws_g2",
@@ -772,7 +786,7 @@ try {
     yieldTimeMs: process.platform === "win32" ? 1_500 : 500,
   });
   assert.equal(terminatedStatus.running, false);
-  assert.match(`${terminatedPty.output}${terminatedStatus.output}`, /before-terminate/);
+  assert.match(`${terminatedPty.output}${terminatedReady.output}${terminatedStatus.output}`, /before-terminate/);
 } finally {
   g2Manager.shutdown();
 }

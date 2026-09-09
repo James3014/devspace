@@ -104,6 +104,9 @@ interface WindowsPtyCleanupTarget {
 
 const cleanedWindowsPtys = new WeakSet<object>();
 
+// node-pty 1.1.0's normal Windows exit path omits these two owned resources;
+// post-exit kill is unsafe because its PID lookup can race PID reuse. Keep
+// this compatibility seam pinned and release only the exact PTY resources.
 export function disposeWindowsPtyResources(
   pty: unknown,
   platform: NodeJS.Platform = process.platform,
