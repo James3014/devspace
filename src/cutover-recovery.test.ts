@@ -451,6 +451,23 @@ test("native adapter reports committed outcome when post-commit live readback fa
   } finally { await fixture.close(); }
 });
 
+test("native adapter reports committed outcome when post-commit MCP network fails", async () => {
+  const fixture = await nativeHttpFixture();
+  let mcpCalls = 0;
+  const throwingFetch: typeof globalThis.fetch = async (input, init) => {
+    const requestUrl = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
+    if (new URL(requestUrl).pathname === "/mcp" && ++mcpCalls >= 8) throw new Error("simulated post-commit network loss");
+    return globalThis.fetch(input, init);
+  };
+  try {
+    await assert.rejects(
+      () => performNativeObservedReplacementRecovery({ ...nativeOptions(fixture), fetch: throwingFetch }),
+      NativeObservedReplacementCommittedError,
+    );
+    assert.equal(fixture.store.get()?.phase, "closed");
+  } finally { await fixture.close(); }
+});
+
 test("native adapter preserves primary failure together with independent revocation cleanup failures", async () => {
   const fixture = await nativeHttpFixture({ revokeFailure: true });
   try {
