@@ -38,6 +38,34 @@ import {
   assert.throws(() => killPtyProcess(failingPty, "SIGTERM", "win32"), failure);
   assert.throws(() => killPtyProcess(failingPty, "SIGKILL", "win32"), failure);
   assert.equal(failureCalls, 1);
+
+  let reentrantCalls = 0;
+  let reentrantPty: { kill(): void };
+  reentrantPty = { kill: () => {
+    reentrantCalls += 1;
+    killPtyProcess(reentrantPty, "SIGTERM", "win32");
+  } };
+  killPtyProcess(reentrantPty, "SIGTERM", "win32");
+  assert.equal(reentrantCalls, 1);
+
+  let undefinedFailureCalls = 0;
+  const undefinedFailurePty = { kill: () => {
+    undefinedFailureCalls += 1;
+    throw undefined;
+  } };
+  try {
+    killPtyProcess(undefinedFailurePty, "SIGTERM", "win32");
+    assert.fail("expected undefined native failure");
+  } catch (error) {
+    assert.equal(error, undefined);
+  }
+  try {
+    killPtyProcess(undefinedFailurePty, "SIGKILL", "win32");
+    assert.fail("expected sticky undefined native failure");
+  } catch (error) {
+    assert.equal(error, undefined);
+  }
+  assert.equal(undefinedFailureCalls, 1);
 }
 
 {

@@ -103,7 +103,7 @@ interface WindowsPtyCleanupTarget {
 }
 
 const cleanedWindowsPtys = new WeakSet<object>();
-const windowsPtyTermination = new WeakMap<object, { error?: unknown }>();
+const windowsPtyTermination = new WeakMap<object, { status: "inflight" | "succeeded" | "failed"; error?: unknown }>();
 
 // node-pty 1.1.0's normal Windows exit path omits these two owned resources;
 // post-exit kill is unsafe because its PID lookup can race PID reuse. Keep
@@ -164,14 +164,15 @@ export function killPtyProcess(
     const target = pty as object;
     const prior = windowsPtyTermination.get(target);
     if (prior) {
-      if (prior.error !== undefined) throw prior.error;
+      if (prior.status === "failed") throw prior.error;
       return;
     }
-    windowsPtyTermination.set(target, {});
+    windowsPtyTermination.set(target, { status: "inflight" });
     try {
       pty.kill();
+      windowsPtyTermination.set(target, { status: "succeeded" });
     } catch (error) {
-      windowsPtyTermination.set(target, { error });
+      windowsPtyTermination.set(target, { status: "failed", error });
       throw error;
     }
     return;
