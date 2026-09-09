@@ -642,6 +642,7 @@ export class ProcessSessionManager {
     pty.onData((data) => this.append(session, data));
     pty.onExit(({ exitCode, signal }) => {
       this.finish(session, exitCode, signal === 0 ? undefined : String(signal));
+      if (process.platform === "win32") pty.kill();
     });
   }
 
