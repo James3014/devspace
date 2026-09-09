@@ -193,7 +193,7 @@ export async function commitCandidate(options: {
   // 3. Verify physical git toplevel equals workspaceRoot (canonicalized paths)
   let resolvedWorkspaceRoot = "";
   try {
-    resolvedWorkspaceRoot = realpathSync(workspaceRoot);
+    resolvedWorkspaceRoot = realpathSync.native(workspaceRoot);
   } catch (err) {
     throw new GitCandidateError("GIT_MANAGED_WORKTREE_REQUIRED", `Workspace root path is invalid or non-existent: ${workspaceRoot}`);
   }
@@ -201,7 +201,7 @@ export async function commitCandidate(options: {
   let toplevel = "";
   try {
     const { stdout } = await runGit(["rev-parse", "--show-toplevel"], resolvedWorkspaceRoot, 10000);
-    toplevel = realpathSync(resolve(stdout));
+    toplevel = realpathSync.native(resolve(stdout));
   } catch (err) {
     throw new GitCandidateError("GIT_MANAGED_WORKTREE_REQUIRED", "Workspace root is not a Git repository.");
   }

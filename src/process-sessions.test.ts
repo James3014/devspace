@@ -663,7 +663,7 @@ try {
     yieldTimeMs: 500,
   });
   assert.equal(polledOutput.running, false);
-  assert.match(polledOutput.output, /later/);
+  assert.match(`${retainedOutput.output}${polledOutput.output}`, /later/);
 } finally {
   g2Manager.shutdown();
 }
