@@ -84,7 +84,6 @@ try {
   if (createdLegacyTmpRoot) {
     rmSync(legacyTmpRoot, { recursive: true, force: true });
   }
-  clearTimeout(diagnosticWatchdog);
   diagnosticPhase = "cleanup-complete";
   console.error(`[process-sessions-ci] phase=${diagnosticPhase}`);
 }
