@@ -1076,6 +1076,19 @@ test("Test 8 & 9 — exact replay idempotent, changed binding fails closed", () 
     assert.equal(second.record.phase, "closed");
     assert.equal(second.record.cutoverId, first.record.cutoverId);
 
+    // A closed receipt is idempotent only for the same observed replacement;
+    // a changed generation identity must still fail closed.
+    assert.throws(
+      () => store.recoverObservedReplacement({
+        cutoverId: "cutover-replay",
+        expectedNewIdentity: expected,
+        observedIdentity: { ...targetInstance, serverInstanceId: "inst-C" },
+        witness: goodWitness,
+        recoveredBy: "inst-C",
+      }),
+      /observed sourceCommit|observed buildId|RECOVERY_BINDING_MISMATCH|already closed/i,
+    );
+
     // Test 9: Changed recovery binding fails closed
     assert.throws(
       () => store.recoverObservedReplacement({

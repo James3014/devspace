@@ -724,27 +724,14 @@ export class CutoverStateStore {
       }
     }
 
-    if (active.phase === "closed") {
-      if (active.observedReplacement?.cutoverId === input.cutoverId) {
-        return { record: active, newlyRecovered: false };
-      }
-      throw new CutoverStateError(
-        `Cutover ${input.cutoverId} is already closed; normal archive applies.`,
-      );
-    }
-
-    if (active.phase !== "prepared" || active.drainEvidence !== undefined) {
-      throw new CutoverStateError(
-        `Cutover ${input.cutoverId} requires prepared state without durable drain evidence for observed replacement recovery.`,
-      );
-    }
-
+    // Validate the observed generation before idempotent closed replay. A
+    // closed receipt is only a rendezvous for the same replacement identity;
+    // it must not become an oracle for a stale or changed instance.
     if (active.oldServerIdentity.serverInstanceId === input.observedIdentity.serverInstanceId) {
       throw new CutoverStateError(
         "Cannot recover cutover: observed serverInstanceId did not change from the old server.",
       );
     }
-
     if (input.observedIdentity.sourceCommit !== active.expectedNewIdentity.sourceCommit) {
       throw new CutoverStateError(
         `Cannot recover cutover: observed sourceCommit ${input.observedIdentity.sourceCommit} does not match expected ${active.expectedNewIdentity.sourceCommit}.`,
@@ -764,6 +751,32 @@ export class CutoverStateStore {
       );
     }
 
+    if (active.phase === "closed") {
+      if (active.observedReplacement?.cutoverId === input.cutoverId) {
+        const observed = active.observedReplacement.observedIdentity;
+        if (
+          observed.serverInstanceId !== input.observedIdentity.serverInstanceId ||
+          observed.sourceCommit !== input.observedIdentity.sourceCommit ||
+          observed.buildId !== input.observedIdentity.buildId ||
+          observed.capabilityManifestSha256 !== input.observedIdentity.capabilityManifestSha256
+        ) {
+          throw new CutoverStateError(
+            "[RECOVERY_BINDING_MISMATCH] Observed replacement identity does not match the closed receipt.",
+          );
+        }
+        return { record: active, newlyRecovered: false };
+      }
+      throw new CutoverStateError(
+        `Cutover ${input.cutoverId} is already closed; normal archive applies.`,
+      );
+    }
+
+    if (active.phase !== "prepared" || active.drainEvidence !== undefined) {
+      throw new CutoverStateError(
+        `Cutover ${input.cutoverId} requires prepared state without durable drain evidence for observed replacement recovery.`,
+      );
+    }
+
     const wsSessions = input.witness.witnessWorkspaceSessions ?? input.witness.workspaceSessions ?? 0;
     const agSessions = input.witness.witnessAgentSessions ?? input.witness.agentSessions ?? 0;
     const witnessWsId = input.witness.witnessWorkspaceId;
@@ -774,7 +787,9 @@ export class CutoverStateStore {
       !input.witness.workspaceQueryable ||
       !input.witness.agentQueryable ||
       !input.witness.agentReconciled ||
+      !Number.isSafeInteger(wsSessions) ||
       wsSessions < 1 ||
+      !Number.isSafeInteger(agSessions) ||
       agSessions < 1 ||
       !witnessWsId ||
       !witnessAgId

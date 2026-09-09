@@ -18,7 +18,7 @@ import { MINIMUM_CODEX_RUNTIME_VERSION } from "./codex-runtime.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { DurableOperationManager } from "./durable-operations.js";
-import { createMcpServer, createServer } from "./server.js";
+import { createMcpServer, createServer, resolveDurableReconciliationWitnessFromInventory } from "./server.js";
 import { CutoverStateStore } from "./cutover-state.js";
 import { McpCutoverController } from "./mcp-cutover.js";
 import { LocalAgentStore } from "./local-agent-store.js";
@@ -1824,8 +1824,10 @@ test("command_status metadata annotations and minimal mode visibility", async (t
 test("P0-2: durable reconciliation witness fails closed on empty inventory, mismatches, or missing records", async () => {
   const root = await mkdtemp(join(tmpdir(), "devspace-p0-2-witness-"));
   const project = join(root, "project");
+  const secondProject = join(root, "second-project");
   const stateDir = join(root, ".state");
   await mkdir(project, { recursive: true });
+  await mkdir(secondProject, { recursive: true });
   const config = loadConfig({
     DEVSPACE_CONFIG_DIR: join(root, ".config"),
     DEVSPACE_ALLOWED_ROOTS: root,
@@ -1845,6 +1847,15 @@ test("P0-2: durable reconciliation witness fails closed on empty inventory, mism
     const expectedIdentity = { sourceCommit: "new", buildId: "new" };
     const replacementIdentity = { serverInstanceId: "new", sourceCommit: "new", buildId: "new" };
     store.begin({ oldServerIdentity: oldIdentity, expectedNewIdentity: expectedIdentity });
+
+    const emptyNormalWitness = await resolveDurableReconciliationWitnessFromInventory({
+      workspaceStore: wsStore,
+      workspaces,
+      agentSessionManager: agentManager,
+    });
+    assert.equal(emptyNormalWitness.workspaceQueryable, true);
+    assert.equal(emptyNormalWitness.agentQueryable, true);
+    assert.equal(emptyNormalWitness.agentReconciled, true);
 
     // 1. Zero workspaces, zero agents -> recovery MUST NOT close
     assert.throws(
@@ -1891,6 +1902,22 @@ test("P0-2: durable reconciliation witness fails closed on empty inventory, mism
       profileName: "p02-reviewer",
       provider: "codex",
     });
+
+    // Failure-first regression: a valid first agent must not hide a second,
+    // unbound durable record from the full reconciliation inventory.
+    agentStore.create({
+      workspaceRoot: secondProject,
+      profileName: "p02-unbound",
+      provider: "codex",
+    });
+    const inventoryWitness = await resolveDurableReconciliationWitnessFromInventory({
+      workspaceStore: wsStore,
+      workspaces,
+      agentSessionManager: agentManager,
+    });
+    assert.equal(inventoryWitness.agentQueryable, false);
+    assert.equal(inventoryWitness.agentReconciled, false);
+    assert.ok(inventoryWitness.detail?.some((entry) => entry.detail?.includes("unbound")));
 
     // Mismatched pair -> fails closed
     assert.throws(
@@ -2379,8 +2406,35 @@ test("P0-4: real server /mcp HTTP boundary permits transport reconnect during dr
       }),
     });
     assert.equal(statusRes.status, 200, "Safe control tool must succeed during drain");
-    const statusJson = (await parseMcpResponse(statusRes)) as { result?: { structuredContent?: { status?: { mode?: string } } } };
+    const statusJson = (await parseMcpResponse(statusRes)) as { result?: { structuredContent?: { status?: { mode?: string; cutover?: { cutoverId?: string } } } } };
     assert.equal(statusJson.result?.structuredContent?.status?.mode, "drain");
+    const activeCutoverId = statusJson.result?.structuredContent?.status?.cutover?.cutoverId;
+    assert.ok(activeCutoverId);
+
+    // A reconnecting client must reach the real drain handler, not merely read
+    // status; this is the durable transition that makes restart coordination
+    // possible while transport remains available.
+    const drainRes = await fetch(mcpUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${testAccessToken}`,
+        "mcp-session-id": session2Id,
+        "Accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 111,
+        method: "tools/call",
+        params: {
+          name: "cutover_drain",
+          arguments: { cutoverId: activeCutoverId },
+        },
+      }),
+    });
+    assert.equal(drainRes.status, 200, "Reconnected transport must reach cutover_drain");
+    const drainJson = (await parseMcpResponse(drainRes)) as { result?: { structuredContent?: { cutover?: { phase?: string } } } };
+    assert.equal(drainJson.result?.structuredContent?.cutover?.phase, "drained");
 
     // 5. Client 2 calls consequential mutation tool (open_workspace) -> BLOCKED with 409
     const openRes = await fetch(mcpUrl, {
