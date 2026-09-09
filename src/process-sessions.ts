@@ -252,6 +252,30 @@ export function selectSanitizedEnvironment(
   return Object.fromEntries(selected.values());
 }
 
+function environmentValue(
+  source: Record<string, string>,
+  key: string,
+  platform: NodeJS.Platform,
+): string | undefined {
+  if (platform !== "win32") return source[key];
+  const normalizedKey = key.toUpperCase();
+  return source[key] ?? Object.entries(source).find(([candidate]) => candidate.toUpperCase() === normalizedKey)?.[1];
+}
+
+function setEnvironmentValue(
+  target: Record<string, string>,
+  key: string,
+  value: string,
+  platform: NodeJS.Platform,
+): void {
+  if (platform === "win32") {
+    for (const candidate of Object.keys(target)) {
+      if (candidate.toUpperCase() === key) delete target[candidate];
+    }
+  }
+  target[key] = value;
+}
+
 export function processEnvironment(
   policy: ProcessEnvironmentPolicy = "inherit",
   input?: {
@@ -266,18 +290,34 @@ export function processEnvironment(
     ? selectSanitizedEnvironment(source)
     : source;
 
-  return {
-    ...base,
-    ...(policy === "sanitized" ? { TERM: base.TERM ?? source.TERM ?? "xterm-256color" } : { NO_COLOR: "1", TERM: "dumb" }),
-    PAGER: "cat",
-    GIT_PAGER: "cat",
-    GH_PAGER: "cat",
-    CODEX_CI: "1",
-    LANG: source.LANG ?? "C.UTF-8",
-    LC_ALL: source.LC_ALL ?? "C.UTF-8",
-    ...(input?.workspaceId ? { DEVSPACE_WORKSPACE_ID: input.workspaceId } : {}),
-    ...(input?.workspaceRoot ? { DEVSPACE_WORKSPACE_ROOT: input.workspaceRoot } : {}),
-  };
+  if (policy !== "sanitized") {
+    return {
+      ...base,
+      NO_COLOR: "1",
+      TERM: "dumb",
+      PAGER: "cat",
+      GIT_PAGER: "cat",
+      GH_PAGER: "cat",
+      CODEX_CI: "1",
+      LANG: source.LANG ?? "C.UTF-8",
+      LC_ALL: source.LC_ALL ?? "C.UTF-8",
+      ...(input?.workspaceId ? { DEVSPACE_WORKSPACE_ID: input.workspaceId } : {}),
+      ...(input?.workspaceRoot ? { DEVSPACE_WORKSPACE_ROOT: input.workspaceRoot } : {}),
+    };
+  }
+
+  const result = { ...base };
+  const platform = process.platform;
+  setEnvironmentValue(result, "TERM", environmentValue(base, "TERM", platform) ?? environmentValue(source, "TERM", platform) ?? "xterm-256color", platform);
+  setEnvironmentValue(result, "PAGER", "cat", platform);
+  setEnvironmentValue(result, "GIT_PAGER", "cat", platform);
+  setEnvironmentValue(result, "GH_PAGER", "cat", platform);
+  setEnvironmentValue(result, "CODEX_CI", "1", platform);
+  setEnvironmentValue(result, "LANG", environmentValue(source, "LANG", platform) ?? "C.UTF-8", platform);
+  setEnvironmentValue(result, "LC_ALL", environmentValue(source, "LC_ALL", platform) ?? "C.UTF-8", platform);
+  if (input?.workspaceId) result.DEVSPACE_WORKSPACE_ID = input.workspaceId;
+  if (input?.workspaceRoot) result.DEVSPACE_WORKSPACE_ROOT = input.workspaceRoot;
+  return result;
 }
 
 function codePointLength(value: string): number {
