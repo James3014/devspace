@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import {
@@ -32,6 +32,14 @@ function compileWindowsExecutable(executable: string, version: string, delayMs =
   }
 }
 
+function windowsTargetTriple(): string {
+  return process.arch === "arm64" ? "aarch64-pc-windows-msvc" : "x86_64-pc-windows-msvc";
+}
+
+function windowsPlatformPackageName(): string {
+  return process.arch === "arm64" ? "codex-win32-arm64" : "codex-win32-x64";
+}
+
 function fixture(version: string, delayMs = 0): { root: string; sdkPackagePath: string; executable: string } {
   const root = mkdtempSync(join(tmpdir(), "devspace-codex-runtime-"));
   const sdkPackagePath = join(root, "codex-sdk", "package.json");
@@ -57,6 +65,21 @@ test("inspectCodexRuntime reports the actual SDK and executable identity", () =>
     assert.equal(identity.sdkVersion, MINIMUM_CODEX_RUNTIME_VERSION);
     assert.equal(identity.binaryVersion, MINIMUM_CODEX_RUNTIME_VERSION);
     assert.equal(identity.executable, realpathSync(f.executable));
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("inspectCodexRuntime returns an executable that can be spawned directly", () => {
+  const f = fixture(MINIMUM_CODEX_RUNTIME_VERSION);
+  try {
+    const identity = inspectCodexRuntime({
+      sdkPackagePath: f.sdkPackagePath,
+      executable: f.executable,
+    });
+    assert.equal(identity.ready, true, identity.reason);
+    const output = execFileSync(identity.executable!, ["--version"], { encoding: "utf8" }).trim();
+    assert.match(output, new RegExp(`codex-cli ${MINIMUM_CODEX_RUNTIME_VERSION}`));
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }
@@ -143,10 +166,12 @@ test("inspectCodexRuntime fails closed for an incompatible SDK", () => {
 test("inspectCodexRuntime resolves an ESM-only SDK from the verified dependency root", () => {
   const root = mkdtempSync(join(tmpdir(), "devspace-codex-bridge-runtime-"));
   const sdkPackagePath = join(root, "node_modules", "@openai", "codex-sdk", "package.json");
-  const executable = join(root, "node_modules", "@openai", "codex", "bin", "codex.js");
+  const executable = process.platform === "win32"
+    ? join(root, "node_modules", "@openai", "codex", "vendor", windowsTargetTriple(), "bin", "codex.exe")
+    : join(root, "node_modules", "@openai", "codex", "bin", "codex.js");
   try {
     mkdirSync(join(root, "node_modules", "@openai", "codex-sdk"), { recursive: true });
-    mkdirSync(join(root, "node_modules", "@openai", "codex", "bin"), { recursive: true });
+    mkdirSync(dirname(executable), { recursive: true });
     writeFileSync(
       sdkPackagePath,
       JSON.stringify({
@@ -155,9 +180,8 @@ test("inspectCodexRuntime resolves an ESM-only SDK from the verified dependency 
         exports: { ".": { import: "./dist/index.js" } },
       }),
     );
-    writeFileSync(executable, `#!/bin/sh\necho "codex-cli ${MINIMUM_CODEX_RUNTIME_VERSION}"\n`, {
-      mode: 0o755,
-    });
+    if (process.platform === "win32") compileWindowsExecutable(executable, MINIMUM_CODEX_RUNTIME_VERSION);
+    else writeFileSync(executable, `#!/bin/sh\necho "codex-cli ${MINIMUM_CODEX_RUNTIME_VERSION}"\n`, { mode: 0o755 });
     const identity = inspectCodexRuntime({
       env: { DEVSPACE_DEPENDENCY_ROOT: root },
     });
@@ -201,17 +225,19 @@ function selfInstalledFixture(options: {
     }),
   );
   if (process.platform === "win32") {
-    const architecture = process.arch === "arm64"
-      ? { packageName: "codex-win32-arm64", target: "aarch64-pc-windows-msvc" }
-      : { packageName: "codex-win32-x64", target: "x86_64-pc-windows-msvc" };
+    const architecture = { packageName: windowsPlatformPackageName(), target: windowsTargetTriple() };
     if (options.nativeLayout === "vendor") {
-      const executable = join(root, "vendor", architecture.target, "bin", "codex.exe");
-      mkdirSync(join(root, "vendor", architecture.target, "bin"), { recursive: true });
+      const executable = join(root, "node_modules", "@openai", "codex", "vendor", architecture.target, "bin", "codex.exe");
+      mkdirSync(join(root, "node_modules", "@openai", "codex", "vendor", architecture.target, "bin"), { recursive: true });
       compileWindowsExecutable(executable, version);
     } else {
       const packageRoot = join(root, "node_modules", "@openai", architecture.packageName);
       mkdirSync(packageRoot, { recursive: true });
-      if (!options.brokenPlatformPackage) compileWindowsExecutable(join(packageRoot, "codex.exe"), version);
+      if (!options.brokenPlatformPackage) {
+        const executable = join(packageRoot, "vendor", architecture.target, "bin", "codex.exe");
+        mkdirSync(dirname(executable), { recursive: true });
+        compileWindowsExecutable(executable, version);
+      }
     }
   } else {
     mkdirSync(join(root, "node_modules", "@openai", "codex", "bin"), { recursive: true });
@@ -232,8 +258,8 @@ function expectedSelfExecutable(root: string, layout: "platform" | "vendor" = "p
   if (process.platform !== "win32") return join(root, "node_modules", "@openai", "codex", "bin", "codex.js");
   const target = process.arch === "arm64" ? "aarch64-pc-windows-msvc" : "x86_64-pc-windows-msvc";
   return layout === "vendor"
-    ? join(root, "vendor", target, "bin", "codex.exe")
-    : join(root, "node_modules", "@openai", process.arch === "arm64" ? "codex-win32-arm64" : "codex-win32-x64", "codex.exe");
+    ? join(root, "node_modules", "@openai", "codex", "vendor", target, "bin", "codex.exe")
+    : join(root, "node_modules", "@openai", windowsPlatformPackageName(), "vendor", target, "bin", "codex.exe");
 }
 
 test("self-installed ESM-only SDK is discovered from the owning package root", () => {
@@ -286,8 +312,9 @@ test("Windows discovery fails closed for a broken platform package", () => {
   if (process.platform !== "win32") return;
   const f = selfInstalledFixture({ brokenPlatformPackage: true });
   try {
-    mkdirSync(join(f.root, "node_modules", "@openai", "codex", "bin"), { recursive: true });
-    writeFileSync(join(f.root, "node_modules", "@openai", "codex", "bin", "codex.js"), "legacy");
+    const legacyExecutable = join(f.root, "node_modules", "@openai", "codex", "vendor", windowsTargetTriple(), "bin", "codex.exe");
+    mkdirSync(dirname(legacyExecutable), { recursive: true });
+    compileWindowsExecutable(legacyExecutable, MINIMUM_CODEX_RUNTIME_VERSION);
     const identity = inspectCodexRuntime({ moduleUrl: f.moduleUrl, env: {} });
     assert.equal(identity.ready, false);
     assert.match(identity.reason ?? "", /does not exist/);
@@ -301,9 +328,10 @@ test("Windows discovery ignores a native package for the wrong architecture", ()
   const f = selfInstalledFixture();
   try {
     const wrongPackage = process.arch === "arm64" ? "codex-win32-x64" : "codex-win32-arm64";
-    rmSync(join(f.root, "node_modules", "@openai", process.arch === "arm64" ? "codex-win32-arm64" : "codex-win32-x64"), { recursive: true, force: true });
-    const wrongExecutable = join(f.root, "node_modules", "@openai", wrongPackage, "codex.exe");
-    mkdirSync(join(f.root, "node_modules", "@openai", wrongPackage), { recursive: true });
+    rmSync(join(f.root, "node_modules", "@openai", windowsPlatformPackageName()), { recursive: true, force: true });
+    const wrongTarget = process.arch === "arm64" ? "x86_64-pc-windows-msvc" : "aarch64-pc-windows-msvc";
+    const wrongExecutable = join(f.root, "node_modules", "@openai", wrongPackage, "vendor", wrongTarget, "bin", "codex.exe");
+    mkdirSync(dirname(wrongExecutable), { recursive: true });
     compileWindowsExecutable(wrongExecutable, MINIMUM_CODEX_RUNTIME_VERSION);
     const identity = inspectCodexRuntime({ moduleUrl: f.moduleUrl, env: {} });
     assert.equal(identity.ready, false);

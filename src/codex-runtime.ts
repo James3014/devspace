@@ -119,20 +119,10 @@ function defaultSdkPackagePath(env: NodeJS.ProcessEnv, moduleUrl: string): strin
   return resolveSelfInstalledSdkPackagePath(moduleUrl);
 }
 
-function windowsNativeExecutableCandidates(sdkPackagePath: string): string[] {
-  const dependencyRoot = dirname(dirname(dirname(dirname(sdkPackagePath))));
-  const architecture = process.arch === "x64"
-    ? { packageName: "codex-win32-x64", target: "x86_64-pc-windows-msvc" }
-    : process.arch === "arm64"
-      ? { packageName: "codex-win32-arm64", target: "aarch64-pc-windows-msvc" }
-      : undefined;
-  if (!architecture) return [];
-  const platformPackage = join(dependencyRoot, "node_modules", "@openai", architecture.packageName);
-  return [
-    join(platformPackage, "codex.exe"),
-    join(platformPackage, "bin", "codex.exe"),
-    join(dependencyRoot, "vendor", architecture.target, "bin", "codex.exe"),
-  ];
+function windowsArchitecture(): { packageName: string; target: string } | undefined {
+  if (process.arch === "x64") return { packageName: "codex-win32-x64", target: "x86_64-pc-windows-msvc" };
+  if (process.arch === "arm64") return { packageName: "codex-win32-arm64", target: "aarch64-pc-windows-msvc" };
+  return undefined;
 }
 
 function defaultExecutable(sdkPackagePath: string | undefined, env: NodeJS.ProcessEnv): string | undefined {
@@ -141,20 +131,24 @@ function defaultExecutable(sdkPackagePath: string | undefined, env: NodeJS.Proce
   if (!sdkPackagePath) return undefined;
   if (process.platform === "win32") {
     const dependencyRoot = dirname(dirname(dirname(dirname(sdkPackagePath))));
-    const architecture = process.arch === "x64"
-      ? { packageName: "codex-win32-x64", target: "x86_64-pc-windows-msvc" }
-      : process.arch === "arm64"
-        ? { packageName: "codex-win32-arm64", target: "aarch64-pc-windows-msvc" }
-        : undefined;
+    const architecture = windowsArchitecture();
     if (!architecture) return undefined;
     const platformPackage = join(dependencyRoot, "node_modules", "@openai", architecture.packageName);
     if (existsSync(platformPackage)) {
-      return windowsNativeExecutableCandidates(sdkPackagePath).slice(0, 2).find(existsSync);
+      return join(platformPackage, "vendor", architecture.target, "bin", "codex.exe");
     }
-    const vendorRoot = join(dependencyRoot, "vendor", architecture.target);
+    const vendorRoot = join(
+      dependencyRoot,
+      "node_modules",
+      "@openai",
+      "codex",
+      "vendor",
+      architecture.target,
+    );
     if (existsSync(vendorRoot)) {
       return join(vendorRoot, "bin", "codex.exe");
     }
+    return undefined;
   }
   return join(dirname(sdkPackagePath), "..", "codex", "bin", "codex.js");
 }
