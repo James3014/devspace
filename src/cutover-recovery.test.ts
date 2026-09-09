@@ -469,6 +469,30 @@ test("native adapter reports committed outcome when post-commit MCP network fail
   } finally { await fixture.close(); }
 });
 
+test("native adapter carries the committed record when durable post-commit read fails", async () => {
+  const fixture = await nativeHttpFixture();
+  const prototype = CutoverStateStore.prototype as unknown as { get: () => unknown };
+  const originalGet = prototype.get;
+  let localReads = 0;
+  prototype.get = function(this: { cutoverRoot?: string }) {
+    if (this.cutoverRoot?.startsWith(join(fixture.stateDir, "cutover"))) {
+      localReads += 1;
+      if (localReads === 2) throw new Error("simulated durable read failure");
+    }
+    return originalGet.call(this);
+  };
+  try {
+    await assert.rejects(
+      () => performNativeObservedReplacementRecovery(nativeOptions(fixture)),
+      NativeObservedReplacementCommittedError,
+    );
+    assert.equal(fixture.store.get()?.phase, "closed");
+  } finally {
+    prototype.get = originalGet;
+    await fixture.close();
+  }
+});
+
 test("native adapter preserves primary failure together with independent revocation cleanup failures", async () => {
   const fixture = await nativeHttpFixture({ revokeFailure: true });
   try {
