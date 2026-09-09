@@ -70,6 +70,34 @@ try {
   const advertisedNames = checkout.profiles.map((profile) => profile.name).sort();
   assert.deepEqual(advertisedNames, ["agy-gemini-review"]);
 
+  // A tracked repository override can advance the owner-provided Agy capability
+  // to the exact Gemini 3.8 Flash preset without weakening provider admission.
+  await writeProfile(join(configDir, "agents"), "agy-medium-implement", [
+    "name: agy-medium-implement",
+    "description: Global Agy implementation capability.",
+    "provider: agy",
+    "model: gemini-3.7-flash-medium",
+    "write_mode: allowed",
+  ]);
+  await writeProfile(join(workspaceRoot, ".devspace", "agents"), "agy-medium-implement", [
+    "name: agy-medium-implement",
+    "description: Gemini 3.8 Flash implementation capability.",
+    "provider: agy",
+    "model: gemini-3.8-flash-medium",
+    "write_mode: allowed",
+    "extends: global:agy-medium-implement",
+    "override: true",
+  ]);
+  git("add", ".devspace/agents/agy-medium-implement.md");
+  git("commit", "-q", "-m", "track agy 3.8 override");
+  const agy38Catalog = await loadProfileCatalog(config, workspaceRoot, {
+    availability: [{ name: "agy", available: true }],
+  });
+  const agy38 = agy38Catalog.advertised("agy-medium-implement");
+  assert.equal(agy38?.model, "gemini-3.8-flash-medium");
+  assert.equal(agy38?.write_mode, "allowed");
+  assert.equal(agy38Catalog.blockerFor("agy-medium-implement"), undefined);
+
   // Same committed revision: worktree sees the identical authoritative set.
   git("add", ".devspace/agents/project-policy.md");
   git("commit", "-q", "-m", "track project policy");
@@ -79,7 +107,7 @@ try {
   const committedCheckout = await loadProfileCatalog(config, workspaceRoot);
   assert.deepEqual(
     worktree.profiles.map((profile) => profile.name).sort(),
-    [...advertisedNames, "project-policy"],
+    [...advertisedNames, "agy-medium-implement", "project-policy"].sort(),
   );
   assert.deepEqual(
     worktree.entries.map((entry) => [entry.name, entry.state]).sort(),
