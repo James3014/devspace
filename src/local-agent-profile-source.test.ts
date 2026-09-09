@@ -55,8 +55,11 @@ try {
     DEVSPACE_SUBAGENTS: "1",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
   });
+  const agyAvailable = [{ name: "agy" as const, available: true }];
 
-  const checkout = await loadProfileCatalog(config, workspaceRoot);
+  const checkout = await loadProfileCatalog(config, workspaceRoot, {
+    availability: agyAvailable,
+  });
 
   // Untracked repository profile: visible with explicit state, not advertised.
   assert.equal(
@@ -75,8 +78,12 @@ try {
   git("commit", "-q", "-m", "track project policy");
   const worktreePath = join(root, "wt");
   git("worktree", "add", "-q", worktreePath, "HEAD");
-  const worktree = await loadProfileCatalog(config, worktreePath);
-  const committedCheckout = await loadProfileCatalog(config, workspaceRoot);
+  const worktree = await loadProfileCatalog(config, worktreePath, {
+    availability: agyAvailable,
+  });
+  const committedCheckout = await loadProfileCatalog(config, workspaceRoot, {
+    availability: agyAvailable,
+  });
   assert.deepEqual(
     worktree.profiles.map((profile) => profile.name).sort(),
     [...advertisedNames, "project-policy"],
@@ -117,7 +124,9 @@ try {
   ]);
   git("add", ".devspace/agents/extra-policy.md");
   git("commit", "-q", "-m", "extra");
-  const afterExtra = await loadProfileCatalog(config, workspaceRoot);
+  const afterExtra = await loadProfileCatalog(config, workspaceRoot, {
+    availability: agyAvailable,
+  });
   assert.notEqual(afterExtra.generation, beforeGeneration);
 
   // Disabled global profile: explicit state, typed blocker.
@@ -129,7 +138,9 @@ try {
     "write_mode: read_only",
     "disabled: true",
   ]);
-  const disabledCatalog = await loadProfileCatalog(config, workspaceRoot);
+  const disabledCatalog = await loadProfileCatalog(config, workspaceRoot, {
+    availability: agyAvailable,
+  });
   assert.equal(
     disabledCatalog.entries.find((entry) => entry.name === "agy-gemini-review")?.state,
     "disabled",
