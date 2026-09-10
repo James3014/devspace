@@ -1686,6 +1686,12 @@ function registerCutoverMcpTools(
         !activeRecord.drainEvidence &&
         control.executeObservedReplacementRecovery
       ) {
+        const comparison = compareServerIdentity(activeRecord, control.controller.currentIdentity);
+        if (!comparison.sourceMatches || !comparison.buildMatches || !comparison.capabilityManifestMatches) {
+          throw new CutoverStateError(
+            "[RECOVERY_BINDING_MISMATCH] Prepared cutover finish requires the current replacement identity to match the bound target.",
+          );
+        }
         const recovered = await control.executeObservedReplacementRecovery({
           cutoverId,
           preferredPair: { workspaceId, agentId },

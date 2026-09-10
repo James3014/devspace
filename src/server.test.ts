@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { execFile, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -2572,6 +2572,88 @@ test("P0-4: real server /mcp HTTP boundary permits transport reconnect during dr
     await running.close();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("prepared finish rejects each wrong replacement identity without durable mutation", async () => {
+  const mismatches = [
+    { label: "source", sourceCommit: "e".repeat(40), buildId: "target-build", capabilityManifestSha256: "a".repeat(64) },
+    { label: "build", sourceCommit: "b".repeat(40), buildId: "wrong-build", capabilityManifestSha256: "a".repeat(64) },
+    { label: "capability", sourceCommit: "b".repeat(40), buildId: "target-build", capabilityManifestSha256: "c".repeat(64) },
+  ];
+  const failures: string[] = [];
+  const snapshotTree = (root: string): Record<string, string> => {
+    const snapshot: Record<string, string> = {};
+    const visit = (current: string, relative = "") => {
+      if (!existsSync(current)) return;
+      for (const entry of readdirSync(current, { withFileTypes: true })) {
+        const child = join(current, entry.name);
+        const childRelative = relative ? join(relative, entry.name) : entry.name;
+        if (entry.isDirectory()) visit(child, childRelative);
+        else snapshot[childRelative] = readFileSync(child).toString("base64");
+      }
+    };
+    visit(root);
+    return snapshot;
+  };
+
+  for (const mismatch of mismatches) {
+    const root = await mkdtemp(join(tmpdir(), `devspace-prepared-finish-${mismatch.label}-`));
+    const stateDir = join(root, ".state");
+    const config = loadConfig({ DEVSPACE_CONFIG_DIR: join(root, ".config"), DEVSPACE_ALLOWED_ROOTS: root,
+      DEVSPACE_STATE_DIR: stateDir, DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough", PORT: "1" });
+    const wsStore = new SqliteWorkspaceStore(stateDir);
+    const workspaces = new WorkspaceRegistry(config, wsStore);
+    let sequence = 0;
+    const store = new CutoverStateStore(stateDir, { newId: () => `prepared-finish-${mismatch.label}-${++sequence}` });
+    const old = new McpCutoverController(store, { serverInstanceId: "old-server", sourceCommit: "d".repeat(40), buildId: "old", capabilityManifestSha256: "d".repeat(64) });
+    const targetIdentity = { sourceCommit: "b".repeat(40), buildId: "target-build", capabilityManifestSha256: "a".repeat(64) };
+    const initial = old.begin(targetIdentity);
+    const replacement = new McpCutoverController(store, { serverInstanceId: "replacement-server", ...mismatch });
+    let executorInvoked = false;
+    const server = createMcpServer(config, workspaces, createReviewCheckpointManager(), new ProcessSessionManager(),
+      () => [], [], undefined, undefined, undefined, undefined, {
+        controller: replacement,
+        transportEvidence: () => ({ activeSessions: 0, oldestAgeMs: 0 }),
+        reconcileDurableState: async ({ workspaceId, agentId }) => ({
+          workspaceQueryable: true, agentQueryable: true, agentReconciled: true,
+          witnessWorkspaceId: workspaceId, witnessAgentId: agentId,
+          witnessWorkspaceSessions: 1, witnessAgentSessions: 1, witnessKind: "exact-pair",
+        }),
+        executeObservedReplacementRecovery: async (input) => {
+          executorInvoked = true;
+          const recovered = replacement.recoverCutover({
+            cutoverId: input.cutoverId,
+            expectedNewIdentity: input.expectedNewIdentity ?? targetIdentity,
+            witness: { witnessCutoverId: initial.cutoverId, witnessServerInstanceId: replacement.currentIdentity.serverInstanceId,
+              witnessExpectedIdentity: targetIdentity, workspaceQueryable: true, agentQueryable: true, agentReconciled: true,
+              witnessWorkspaceId: "ws_shared", witnessAgentId: "agent_shared", witnessWorkspaceSessions: 1,
+              witnessAgentSessions: 1, witnessKind: "exact-pair" },
+          });
+          return { ...recovered, mode: replacement.mode() };
+        },
+      });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const client = new Client({ name: `prepared-finish-${mismatch.label}`, version: "1.0.0" });
+    try {
+      await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+      const before = snapshotTree(join(stateDir, "cutover"));
+      const result = await client.callTool({ name: "cutover_finish", arguments: {
+        cutoverId: initial.cutoverId, workspaceId: "ws_shared", agentId: "agent_shared",
+      } });
+      assert.equal(result.isError, true, `${mismatch.label} mismatch must be denied`);
+      assert.match(JSON.stringify(result.content), /RECOVERY_BINDING_MISMATCH|replacement identity/i);
+      assert.equal(executorInvoked, false, `${mismatch.label} mismatch must not invoke recovery`);
+      assert.deepEqual(snapshotTree(join(stateDir, "cutover")), before);
+      assert.equal(store.get()?.phase, "prepared");
+      assert.equal(readdirSync(join(stateDir, "cutover", "active")).some((name) => name.includes("recovery-intent")), false);
+    } catch (error) {
+      failures.push(`${mismatch.label}: ${error instanceof Error ? error.message : String(error)}`);
+    } finally {
+      await client.close(); await server.close(); wsStore.close();
+      await rm(root, { recursive: true, force: true });
+    }
+  }
+  assert.deepEqual(failures, [], failures.join("\n"));
 });
 
 test("prepared stale-target MCP recovery preserves successor and supersession summary", async () => {
