@@ -2,7 +2,7 @@ import { isDeepStrictEqual } from "node:util";
 import { McpCutoverController } from "./mcp-cutover.js";
 import { CutoverStateStore, type CutoverServerIdentity, type ExpectedCutoverIdentity, type CutoverCoordinationBinding } from "./cutover-state.js";
 import { ControlPlaneConsumer, type ControlPlaneConsumerOptions, type DependencyReconciliationEvidence } from "./control-plane-consumer.js";
-import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore } from "./control-plane-ownership.js";
+import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type HandoffInput } from "./control-plane-ownership.js";
 import { createHash } from "node:crypto";
 import { spawn as nativeSpawn } from "node:child_process";
 import { createRequire } from "node:module";
@@ -430,6 +430,11 @@ export class DurableOperationManager {
       if (record.status === "succeeded") return record;
       return this.store.finish(operationId,{status:"succeeded",retrySafe:false,receipt:{cutoverId:observed.cutoverId,coordinationBinding:observed.coordinationBinding,startVerified:true,lifecycleTerminal:false}});
     });
+  }
+
+  handoff(leaseId: string, expectedVersion: number, recipientHandle: string, receipt: HandoffInput, context?: unknown) {
+    if (!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","handoff requires trusted host authority");
+    return this.consumer.handoff(context,leaseId,expectedVersion,recipientHandle,receipt);
   }
 
   readHandoff(leaseId: string, previousVersion: number, expectedCurrentVersion: number, consumerContext?: unknown) {

@@ -84,6 +84,7 @@ export const CUTOVER_SAFE_TOOLS: ReadonlySet<string> = new Set([
 
   // Operation & command inspection
   "coordination_handoff_readback",
+  "coordination_handoff", // Existing lease only; no new effect or grant.
   "operation_status",
   "operation_reconcile",
   "command_status",

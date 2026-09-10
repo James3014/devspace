@@ -2631,6 +2631,20 @@ export function createMcpServer(
       },
     );
 
+    const handoffGrantSchema=z.object({repository:z.string().min(1),goal:z.string().min(1),coordinatorThread:z.string().min(1),evidenceHash:z.string().min(1)}).strict();
+    registerAppTool(server,"coordination_handoff",{
+      title:"Transfer existing resource ownership",
+      description:"Atomically transfer one existing lease using exact CAS and a fixed handoff receipt. Recipient handle must resolve through the trusted host to a previously authenticated recipient. Does not create grants, widen scope, start work or clear an in-flight operation.",
+      inputSchema:{leaseId:z.string().min(1),expectedVersion:z.number().int().positive(),recipientHandle:z.string().min(1).max(160),receipt:z.object({
+        resource:z.string().min(1),baseRevision:z.string().min(1),scope:z.array(z.string().min(1)),candidateRevision:z.string().min(1),liveOperation:z.string().min(1),liveHandle:z.string(),checkpoint:z.string().min(1),
+        grantDependency:handoffGrantSchema,grantVersion:z.number().int().positive(),recipientGrant:handoffGrantSchema,recipientGrantVersion:z.number().int().positive(),forbiddenOverlap:z.array(z.string()),tests:z.array(z.string()),evidence:z.array(z.string()).min(1),remainingGap:z.string(),nextGate:z.string().min(1),expiresAt:z.string(),
+      }).strict()},
+      outputSchema:{receipt:z.record(z.string(),z.unknown())},_meta:{},annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:false,openWorldHint:false},
+    },async({leaseId,expectedVersion,recipientHandle,receipt},extra)=>{
+      const transferred=durableOperations.handoff(leaseId,expectedVersion,recipientHandle,receipt,dependencyConsumerContext(extra));
+      return {content:[textBlock(`Transferred existing lease ${leaseId}; version=${transferred.newVersion}.`)],structuredContent:{receipt:transferred as unknown as Record<string,unknown>}};
+    });
+
     registerAppTool(
       server,
       "coordination_handoff_readback",

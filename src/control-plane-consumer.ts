@@ -1,4 +1,4 @@
-import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type ControlPlaneOwnershipOptions, type ReconciliationEvidence } from "./control-plane-ownership.js";
+import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type ControlPlaneOwnershipOptions, type ReconciliationEvidence, type HandoffInput } from "./control-plane-ownership.js";
 
 export interface EffectSubject {
   operationId: string;
@@ -19,6 +19,8 @@ export interface DependencyReconciliationEvidence extends ReconciliationEvidence
   frozenInputsUnchanged: boolean;
 }
 export interface ControlPlaneConsumerOptions extends ControlPlaneOwnershipOptions {
+  /** Host lookup of a previously authenticated recipient; handle is not identity evidence. */
+  resolveHandoffRecipient?(senderContext: unknown, recipientHandle: string): unknown;
   readDependencyReconciliation?(context: unknown, subject: Readonly<EffectSubject>): DependencyReconciliationEvidence | undefined;
   /** Verifies an external terminal witness, including exit code and frozen-input result. */
   verifyDependencyReconciliation?(evidence: Readonly<DependencyReconciliationEvidence>, subject: Readonly<EffectSubject>): boolean;
@@ -43,6 +45,12 @@ export class ControlPlaneConsumer {
     if (subject.operation !== "cutover_start" || binding.role !== "controller") throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "cutover requires controller authority");
     this.assertPinned(context, subject, binding, pinnedVersion);
     return Object.freeze({leaseId:binding.leaseId,pinnedLeaseVersion:pinnedVersion,operationHandle:subject.operationId,requestHash:subject.requestHash,ownerThread:this.ownership.get(binding.leaseId)!.ownerThread});
+  }
+
+  handoff(context: unknown, leaseId: string, expectedVersion: number, recipientHandle: string, receipt: HandoffInput) {
+    const recipient = this.options.resolveHandoffRecipient?.(context,recipientHandle);
+    if (recipient === undefined || recipient === null) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","trusted authenticated handoff recipient is unavailable");
+    return this.ownership.handoff(context,leaseId,expectedVersion,recipient,receipt);
   }
 
   readHandoff(context: unknown, leaseId: string, previousVersion: number, expectedCurrentVersion: number) {

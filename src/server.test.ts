@@ -2121,11 +2121,12 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
   await provider.authorize(oauthClient,{redirectUri:"http://localhost/callback",codeChallenge:"fixture",scopes:config.oauth.scopes,resource:new URL("/mcp",config.publicBaseUrl)}, {req:{method:"POST",body:{owner_token:config.oauth.ownerToken}},redirect:(_status:number,url:string)=>{redirect=url;}} as never);
   const tokens=await provider.exchangeAuthorizationCode(oauthClient,new URL(redirect).searchParams.get("code")!);
   const grant={repository:"owner/repo",goal:"http-fixture",coordinatorThread:"controller",evidenceHash:"external-fixture-proof"};
-  let approvedHash=""; let leaseId=""; let readerClient:unknown; let successorClientId=""; let cutoverLeaseId=""; let cutoverHash="";
+  let approvedHash=""; let leaseId=""; let readerClient:unknown; let successorClientId=""; let cutoverLeaseId=""; let cutoverHash=""; let lastAuthenticatedContext:unknown; let originalAuthenticatedContext:unknown;
   let ownership: import("./control-plane-ownership.js").ControlPlaneOwnershipStore;
   const authenticated=(c:unknown)=>!!c && (c as {clientId?:string}).clientId===oauthClient.client_id && typeof (c as {sessionId?:string}).sessionId==="string";
   const coordination:import("./control-plane-consumer.js").ControlPlaneConsumerOptions={
-    readDependencyReconciliation:c=>{readerClient=(c as {clientId:string}).clientId;return undefined;},
+    readDependencyReconciliation:c=>{if(authenticated(c)) originalAuthenticatedContext=c;readerClient=(c as {clientId:string}).clientId;lastAuthenticatedContext=c;return undefined;},
+    resolveHandoffRecipient:(c,handle)=>authenticated(c)&&handle==="other-client"?lastAuthenticatedContext:(c as {clientId?:string})?.clientId===successorClientId && handle==="original-client"?originalAuthenticatedContext:undefined,
     resolveOwnerContext:c=>authenticated(c)?{ownerThread:"delegated-cli-worker"}:successorClientId && (c as {clientId?:string})?.clientId===successorClientId ? {ownerThread:"successor"}:undefined,
     verifyGrantEvidence:g=>JSON.stringify(g)===JSON.stringify(grant),
     resolveEffectBinding:(c,subject)=>subject.operation==="cutover_start" && (c as {clientId?:string})?.clientId===successorClientId && cutoverHash && subject.requestHash===cutoverHash ? {leaseId:cutoverLeaseId,leaseVersion:ownership.get(cutoverLeaseId)!.version,requestHash:cutoverHash,role:"controller"} : authenticated(c) && subject.workspaceRoot===project && subject.baseRevision===base && subject.requestHash===approvedHash ? {leaseId,leaseVersion:ownership.get(leaseId)!.version,requestHash:approvedHash,role:"worker"}:undefined,
@@ -2175,11 +2176,22 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
       assert.equal(readerClient,otherOAuth.client_id);
       successorClientId=otherOAuth.client_id;
       const current=ownership.get(leaseId)!;
-      const handoff=ownership.handoff(trustedContext,leaseId,current.version,{clientId:successorClientId,sessionId:"fixture-recipient"},{
+      const handoffInput={
         resource:current.resource,baseRevision:current.baseRevision,scope:current.scope,candidateRevision:base,liveOperation:current.operation,liveHandle:current.operationHandle??"",
         checkpoint:"installed-workspace-checkpoint",grantDependency:current.grant,grantVersion:current.grantVersion,recipientGrant:current.grant,recipientGrantVersion:current.grantVersion,
         forbiddenOverlap:[project],tests:["http-witness"],evidence:["terminal-operation"],remainingGap:"next revision",nextGate:"readback",expiresAt:current.expiresAt,
-      });
+      };
+      const handoffArgs={leaseId,expectedVersion:current.version,recipientHandle:"other-client",receipt:handoffInput};
+      const beforeHandoff=JSON.stringify(ownership.get(leaseId));
+      for(const invalid of [{...handoffArgs,recipientHandle:"unknown"},{...handoffArgs,expectedVersion:current.version-1},{...handoffArgs,receipt:{...handoffInput,baseRevision:"wrong"}}]) {
+        assert.equal((await client.callTool({name:"coordination_handoff",arguments:invalid})).isError,true);
+        assert.equal(JSON.stringify(ownership.get(leaseId)),beforeHandoff);
+      }
+      assert.equal((await otherClient.callTool({name:"coordination_handoff",arguments:handoffArgs,_meta:{clientId:oauthClient.client_id,ownerThread:"delegated-cli-worker"}})).isError,true);
+      assert.equal(JSON.stringify(ownership.get(leaseId)),beforeHandoff);
+      const transferred=await client.callTool({name:"coordination_handoff",arguments:handoffArgs});
+      assert.equal(transferred.isError,undefined,JSON.stringify(transferred));
+      const handoff=structuredContent(transferred).receipt as unknown as import("./control-plane-ownership.js").HandoffReceipt;
       const readArgs={leaseId,previousVersion:handoff.previousVersion,expectedCurrentVersion:handoff.newVersion};
       const startArgs={expectedSourceCommit:"a".repeat(40),expectedBuildId:"handoff-fixture",attemptKey:"http-cutover"};
       const missingGrant=await otherClient.callTool({name:"cutover_start",arguments:startArgs});
@@ -2231,6 +2243,17 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
       assert.equal(stale.isError,true);
       assert.equal(JSON.stringify(ownership.get(leaseId)),beforeRead);
       assert.equal(JSON.stringify(cutoverStore.get()),beforeCutover);
+      // Drain admission permits only an exact existing-lease transfer; the live pin survives.
+      const pinned=ownership.get(cutoverLeaseId)!;
+      const pinnedReceipt={...handoffInput,resource:pinned.resource,scope:pinned.scope,baseRevision:pinned.baseRevision,liveOperation:pinned.operation,liveHandle:operationId,grantDependency:pinned.grant,grantVersion:pinned.grantVersion,recipientGrant:pinned.grant,recipientGrantVersion:pinned.grantVersion,expiresAt:pinned.expiresAt};
+      const pinTransfer=await otherClient.callTool({name:"coordination_handoff",arguments:{leaseId:cutoverLeaseId,expectedVersion:pinned.version,recipientHandle:"original-client",receipt:pinnedReceipt}});
+      assert.equal(pinTransfer.isError,undefined,JSON.stringify(pinTransfer));
+      assert.equal(ownership.get(cutoverLeaseId)?.operationHandle,operationId);
+      assert.equal(ownership.get(cutoverLeaseId)?.ownerThread,"delegated-cli-worker");
+      assert.equal(JSON.stringify(cutoverStore.get()),beforeCutover);
+      assert.equal((await otherClient.callTool({name:"operation_reconcile",arguments:{operationId}})).isError,true);
+      // Receiving the lease does not promote a worker to controller.
+      assert.equal((await client.callTool({name:"operation_reconcile",arguments:{operationId}})).isError,true);
       await assert.rejects(otherClient.callTool({name:"dependency_sync",arguments:input}),/CUTOVER_RECONCILIATION_REQUIRED/);
 
     } finally {await otherClient.close();}

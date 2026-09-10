@@ -436,7 +436,15 @@ test("C3 cutover reconciliation follows legitimate same-lease handoff and fences
     const owner=f.options.resolveOwnerContext!;const resolve=f.options.resolveEffectBinding;
     f.options.resolveOwnerContext=c=>c===recipient?{ownerThread:"recipient"}:owner(c);
     f.options.resolveEffectBinding=(c,s)=>resolve(c===recipient?f.context:c,s);
-    f.ownership.handoff(f.context,f.leaseId,lease.version,recipient,{resource:lease.resource,scope:lease.scope,baseRevision:lease.baseRevision,candidateRevision:"candidate",liveOperation:lease.operation,liveHandle:result.operationId,checkpoint:"after-start",grantDependency:lease.grant,grantVersion:lease.grantVersion,recipientGrant:lease.grant,recipientGrantVersion:lease.grantVersion,forbiddenOverlap:[lease.resource],tests:["start"],evidence:["bound-file"],remainingGap:"lifecycle",nextGate:"reconcile",expiresAt:lease.expiresAt});
+    f.options.resolveHandoffRecipient=(c,h)=>c===f.context && h==="recipient"?recipient:undefined;
+    const handoffInput={resource:lease.resource,scope:lease.scope,baseRevision:lease.baseRevision,candidateRevision:"candidate",liveOperation:lease.operation,liveHandle:result.operationId,checkpoint:"after-start",grantDependency:lease.grant,grantVersion:lease.grantVersion,recipientGrant:lease.grant,recipientGrantVersion:lease.grantVersion,forbiddenOverlap:[lease.resource],tests:["start"],evidence:["bound-file"],remainingGap:"lifecycle",nextGate:"reconcile",expiresAt:lease.expiresAt};
+    const snapshot=JSON.stringify(f.ownership.get(f.leaseId));
+    const recipientReader=f.options.resolveHandoffRecipient;
+    f.options.resolveHandoffRecipient=undefined;
+    assert.throws(()=>f.manager.handoff(f.leaseId,lease.version,"recipient",handoffInput,f.context),/trusted authenticated handoff recipient/);
+    assert.equal(JSON.stringify(f.ownership.get(f.leaseId)),snapshot);
+    f.options.resolveHandoffRecipient=recipientReader;
+    f.manager.handoff(f.leaseId,lease.version,"recipient",handoffInput,f.context);
     assert.equal(f.manager.reconcileCutoverStart(result.operationId,recipient).operationId,result.operationId);
     assert.throws(()=>f.manager.reconcileCutoverStart(result.operationId,f.context),/owner|binding|CAS|lease evidence/);
     assert.equal(f.ownership.get(f.leaseId)?.operationHandle,result.operationId);
