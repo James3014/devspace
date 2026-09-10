@@ -1,7 +1,188 @@
 import assert from "node:assert/strict";
+import { createRequire } from "node:module";
 import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { HeadTailBuffer, ProcessSessionManager } from "./process-sessions.js";
+import {
+  HeadTailBuffer,
+  disposeWindowsPtyResources,
+  isSanitizedEnvironmentKey,
+  killPtyProcess,
+  processEnvironment,
+  ProcessSessionManager,
+  resolvePtyShellInvocation,
+  selectSanitizedEnvironment,
+} from "./process-sessions.js";
+
+// Windows node-pty exposes termination as kill() without a POSIX signal;
+// signal-specific PTY termination remains required on POSIX.
+{
+  const calls: Array<string | undefined> = [];
+  const pty = { kill: (signal?: string) => calls.push(signal) };
+  killPtyProcess(pty, "SIGTERM", "win32");
+  assert.deepEqual(calls, [undefined]);
+  killPtyProcess(pty, "SIGKILL", "win32");
+  assert.deepEqual(calls, [undefined]);
+  const secondCalls: Array<string | undefined> = [];
+  const secondPty = { kill: (signal?: string) => secondCalls.push(signal) };
+  killPtyProcess(secondPty, "SIGTERM", "win32");
+  assert.deepEqual(calls, [undefined]);
+  assert.deepEqual(secondCalls, [undefined]);
+  killPtyProcess(pty, "SIGINT", "linux");
+  assert.deepEqual(calls, [undefined, "SIGINT"]);
+  killPtyProcess(pty, "SIGTERM", "linux");
+  assert.deepEqual(calls, [undefined, "SIGINT", "SIGTERM"]);
+
+  const failure = new Error("native termination failed");
+  let failureCalls = 0;
+  const failingPty = { kill: () => { failureCalls += 1; throw failure; } };
+  assert.throws(() => killPtyProcess(failingPty, "SIGTERM", "win32"), failure);
+  assert.throws(() => killPtyProcess(failingPty, "SIGKILL", "win32"), failure);
+  assert.equal(failureCalls, 1);
+
+  let reentrantCalls = 0;
+  let reentrantPty: { kill(): void };
+  reentrantPty = { kill: () => {
+    reentrantCalls += 1;
+    killPtyProcess(reentrantPty, "SIGTERM", "win32");
+  } };
+  killPtyProcess(reentrantPty, "SIGTERM", "win32");
+  assert.equal(reentrantCalls, 1);
+
+  let undefinedFailureCalls = 0;
+  const undefinedFailurePty = { kill: () => {
+    undefinedFailureCalls += 1;
+    throw undefined;
+  } };
+  try {
+    killPtyProcess(undefinedFailurePty, "SIGTERM", "win32");
+    assert.fail("expected undefined native failure");
+  } catch (error) {
+    assert.equal(error, undefined);
+  }
+  try {
+    killPtyProcess(undefinedFailurePty, "SIGKILL", "win32");
+    assert.fail("expected sticky undefined native failure");
+  } catch (error) {
+    assert.equal(error, undefined);
+  }
+  assert.equal(undefinedFailureCalls, 1);
+}
+
+{
+  assert.equal(isSanitizedEnvironmentKey("SystemRoot", "win32"), true);
+  assert.equal(isSanitizedEnvironmentKey("pAtH", "win32"), true);
+  assert.equal(isSanitizedEnvironmentKey("systemroot", "linux"), false);
+  assert.equal(isSanitizedEnvironmentKey("OPENAI_API_KEY", "win32"), false);
+  assert.deepEqual(
+    selectSanitizedEnvironment(
+      { Path: "lower-priority", PATH: "canonical", SystemRoot: "C:\\Windows", OPENAI_API_KEY: "secret" },
+      "win32",
+    ),
+    { PATH: "canonical", SystemRoot: "C:\\Windows" },
+  );
+
+  assert.deepEqual(
+    selectSanitizedEnvironment(
+      { lc_all: "lower-locale", LC_ALL: "canonical-locale", Lc_Ctype: "canonical-ctype", LC_CTYPE: "canonical-ctype" },
+      "win32",
+    ),
+    { LC_ALL: "canonical-locale", LC_CTYPE: "canonical-ctype" },
+  );
+  assert.equal(isSanitizedEnvironmentKey("lc_all", "win32"), true);
+
+  const reversedWindowsPath = selectSanitizedEnvironment({ PATH: "canonical", Path: "lower-priority" }, "win32");
+  assert.equal(reversedWindowsPath.PATH, "canonical");
+  assert.equal(reversedWindowsPath.Path, undefined);
+  const mixedCaseSecret = selectSanitizedEnvironment({ oPeNaI_aPi_KeY: "secret" }, "win32");
+  assert.deepEqual(mixedCaseSecret, {});
+  assert.equal(isSanitizedEnvironmentKey("OpenAI_API_Key", "win32"), false);
+  const lowercasePosixPath = selectSanitizedEnvironment({ path: "/tmp/unsafe", HOME: "/home/test" }, "linux");
+  assert.deepEqual(lowercasePosixPath, { HOME: "/home/test" });
+
+  const platformDescriptor = Object.getOwnPropertyDescriptor(process, "platform");
+  const previousMixedLocale = process.env.lC_aLl;
+  const previousCanonicalLocale = process.env.LC_ALL;
+  try {
+    Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+    delete process.env.LC_ALL;
+    process.env.lC_aLl = "mixedcase-locale";
+    const mixedLocaleEnvironment = processEnvironment("sanitized");
+    assert.equal(mixedLocaleEnvironment.LC_ALL, "mixedcase-locale");
+    assert.equal(mixedLocaleEnvironment.lC_aLl, undefined);
+  } finally {
+    if (platformDescriptor) Object.defineProperty(process, "platform", platformDescriptor);
+    if (previousMixedLocale === undefined) delete process.env.lC_aLl;
+    else process.env.lC_aLl = previousMixedLocale;
+    if (previousCanonicalLocale === undefined) delete process.env.LC_ALL;
+    else process.env.LC_ALL = previousCanonicalLocale;
+  }
+
+  const previousSecret = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = "must-not-cross-sanitized-boundary";
+  try {
+    assert.equal(processEnvironment("sanitized").OPENAI_API_KEY, undefined);
+  } finally {
+    if (previousSecret === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousSecret;
+  }
+}
+
+{
+  const calls: string[] = [];
+  const pty = {
+    _agent: {
+      _conoutSocketWorker: { dispose: () => calls.push("worker") },
+      _inSocket: { destroy: () => calls.push("input") },
+    },
+  };
+  disposeWindowsPtyResources(pty, "win32");
+  disposeWindowsPtyResources(pty, "win32");
+  assert.deepEqual(calls, ["worker", "input"]);
+  const retryCalls: string[] = [];
+  let disposeAttempts = 0;
+  const retryPty = {
+    kill: () => { throw new Error("kill must not be called"); },
+    _agent: {
+      _conoutSocketWorker: {
+        dispose: () => {
+          disposeAttempts += 1;
+          retryCalls.push("worker");
+          if (disposeAttempts === 1) throw new Error("worker cleanup failed");
+        },
+      },
+      _inSocket: { destroy: () => retryCalls.push("input") },
+    },
+  };
+  assert.throws(() => disposeWindowsPtyResources(retryPty, "win32"), /worker cleanup failed/);
+  disposeWindowsPtyResources(retryPty, "win32");
+  assert.deepEqual(retryCalls, ["worker", "input", "worker", "input"]);
+  disposeWindowsPtyResources({}, "linux");
+  assert.throws(
+    () => disposeWindowsPtyResources({ _agent: {} }, "win32"),
+    /Unsupported node-pty Windows resource layout/,
+  );
+}
+
+{
+  const command = `"C:\\Program Files\\Node\\node.exe" -e "console.log('windows spaces')"`;
+  const invocation = resolvePtyShellInvocation(command, "win32", { ComSpec: "C:\\Windows\\System32\\cmd.exe" });
+  assert.equal(invocation.args, `/d /s /c "${command}"`);
+  const require = createRequire(import.meta.url);
+  const { argsToCommandLine } = require("node-pty/lib/windowsPtyAgent.js") as {
+    argsToCommandLine(file: string, args: string[] | string): string;
+  };
+  assert.equal(
+    argsToCommandLine(invocation.executable, invocation.args),
+    `C:\\Windows\\System32\\cmd.exe /d /s /c "${command}"`,
+  );
+  assert.notEqual(
+    argsToCommandLine(invocation.executable, ["/d", "/s", "/c", command]),
+    argsToCommandLine(invocation.executable, invocation.args),
+  );
+
+  const posix = resolvePtyShellInvocation("printf 'posix'", "linux", { SHELL: "/bin/bash" });
+  assert.deepEqual(posix, { executable: "/bin/bash", args: ["-lc", "printf 'posix'"] });
+}
 
 const smallBuffer = new HeadTailBuffer(100);
 smallBuffer.append("hello\n");
@@ -38,6 +219,27 @@ const manager = new ProcessSessionManager({
 const node = process.platform === "win32"
   ? `"${process.execPath}"`
   : JSON.stringify(process.execPath);
+
+if (process.platform === "win32") {
+  const previousSecret = process.env.OPENAI_API_KEY;
+  process.env.OPENAI_API_KEY = "must-not-reach-sanitized-child";
+  try {
+    const sanitizedChild = await manager.start({
+      workspaceId: "workspace-windows-native",
+      cwd: process.cwd(),
+      command: `${node} -e "const { randomBytes } = require('node:crypto'); console.log('native_child:' + randomBytes(16).toString('hex') + ':secret=' + (process.env.OPENAI_API_KEY ?? 'absent'))"`,
+      tty: true,
+      environmentPolicy: "sanitized",
+      yieldTimeMs: 10_000,
+    });
+    assert.equal(sanitizedChild.running, false);
+    assert.equal(sanitizedChild.exitCode, 0);
+    assert.match(sanitizedChild.output, /native_child:[0-9a-f]{32}:secret=absent/);
+  } finally {
+    if (previousSecret === undefined) delete process.env.OPENAI_API_KEY;
+    else process.env.OPENAI_API_KEY = previousSecret;
+  }
+}
 
 // G5: command replay identity survives a fresh MCP workspace session for the
 // same physical checkout, but never crosses into another physical root.
@@ -660,10 +862,58 @@ try {
     workspaceId: "ws_g2",
     sessionId: retainedOutput.sessionId!,
     chars: "",
-    yieldTimeMs: 500,
+    // Windows node-pty waits up to FLUSH_DATA_INTERVAL (1s) after process
+    // exit before reporting the PTY as closed; allow one bounded 1.5s poll
+    // there while preserving the original 500ms POSIX timing.
+    yieldTimeMs: process.platform === "win32" ? 1_500 : 500,
   });
   assert.equal(polledOutput.running, false);
-  assert.match(polledOutput.output, /later/);
+  assert.equal(polledOutput.exitCode, 0);
+  assert.match(`${retainedOutput.output}${polledOutput.output}`, /later/);
+
+  for (let index = 0; index < 2; index += 1) {
+    const naturalPty = await g2Manager.start({
+      workspaceId: "ws_g2",
+      cwd: process.cwd(),
+      command: `${node} -e "console.log('natural-${index}')"`,
+      tty: true,
+      yieldTimeMs: 250,
+    });
+    const naturalCompleted = naturalPty.running
+      ? await g2Manager.getStatus({
+          workspaceId: "ws_g2",
+          sessionId: naturalPty.sessionId!,
+          yieldTimeMs: process.platform === "win32" ? 1_500 : 500,
+        })
+      : naturalPty;
+    assert.equal(naturalCompleted.running, false);
+    assert.equal(naturalCompleted.exitCode, 0);
+    assert.match(`${naturalPty.output}${naturalCompleted.output}`, new RegExp(`natural-${index}`));
+  }
+
+  const terminatedPty = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: `${node} -e "console.log('before-terminate'); setInterval(() => {}, 1000)"`,
+    tty: true,
+    yieldTimeMs: 100,
+  });
+  assert.equal(terminatedPty.running, true);
+  const terminatedReady = await g2Manager.getStatus({
+    workspaceId: "ws_g2",
+    sessionId: terminatedPty.sessionId!,
+    yieldTimeMs: process.platform === "win32" ? 1_000 : 250,
+  });
+  assert.equal(terminatedReady.running, true);
+  assert.match(`${terminatedPty.output}${terminatedReady.output}`, /before-terminate/);
+  g2Manager.terminate("ws_g2", terminatedPty.sessionId!);
+  const terminatedStatus = await g2Manager.getStatus({
+    workspaceId: "ws_g2",
+    sessionId: terminatedPty.sessionId!,
+    yieldTimeMs: process.platform === "win32" ? 1_500 : 500,
+  });
+  assert.equal(terminatedStatus.running, false);
+  assert.match(`${terminatedPty.output}${terminatedReady.output}${terminatedStatus.output}`, /before-terminate/);
 } finally {
   g2Manager.shutdown();
 }

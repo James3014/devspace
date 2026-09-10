@@ -193,6 +193,33 @@ test("workspace_clone rejects destinations outside allowed roots and conflicting
   }
 });
 
+test("workspace_clone passes literal native Git paths containing spaces and shell metacharacters", async () => {
+  const f = await fixture();
+  try {
+    const source = join(f.root, "source dir;$(touch SHOULD_NOT_EXIST)");
+    const destination = join(f.root, "clone dir [literal]");
+    await mkdir(source);
+    await git(source, "init");
+    await git(source, "config", "user.email", "devspace@example.com");
+    await git(source, "config", "user.name", "DevSpace Test");
+    await writeFile(join(source, "README.md"), "native argv\n");
+    await git(source, "add", "README.md");
+    await git(source, "commit", "-m", "native argv");
+
+    const manager = new DurableOperationManager(f.config);
+    try {
+      const result = await manager.workspaceClone({ attemptKey: "clone-native-argv-1", remote: source, destination });
+      assert.equal(result.status, "succeeded");
+      assert.equal(await readFile(join(destination, "README.md"), "utf8"), "native argv\n");
+      assert.equal(await pathExists(join(f.root, "SHOULD_NOT_EXIST")), false);
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("dependency_sync frozen recipe succeeds without changing manifest or lock inputs", async () => {
   const f = await fixture();
   try {

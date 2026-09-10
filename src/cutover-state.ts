@@ -1,3 +1,4 @@
+import { isDeepStrictEqual } from "node:util";
 import { randomUUID } from "node:crypto";
 import {
   closeSync,
@@ -17,8 +18,12 @@ const CUTOVER_RESTART_SCHEMA = "devspace.cutover_restart.v1" as const;
 const CUTOVER_RESTART_SCHEDULED_SCHEMA = "devspace.cutover_restart_scheduled.v1" as const;
 export const CUTOVER_RECOVERY_INTENT_SCHEMA = "devspace.cutover_recovery_intent.v1" as const;
 export const CUTOVER_SUPERSEDED_SCHEMA = "devspace.cutover_superseded.v1" as const;
+export const CUTOVER_OBSERVED_REPLACEMENT_SCHEMA = "devspace.cutover_observed_replacement.v1" as const;
 
 export const CUTOVER_SUPERSEDED_REASON = "STALE_TARGET_SUPERSEDED" as const;
+export const CUTOVER_OBSERVED_REPLACEMENT_REASON = "OBSERVED_REPLACEMENT_WITHOUT_DRAIN" as const;
+export const CUTOVER_BINDING_REPAIR_SCHEMA = "devspace.cutover_binding_repair.v1" as const;
+export const CUTOVER_BINDING_REPAIR_REASON = "CROSS_DOMAIN_DIGEST_MISBINDING" as const;
 
 /**
  * A stale unresolved cutover cannot be retried, replaced, or deleted. It can
@@ -69,9 +74,44 @@ export interface ExpectedCutoverIdentity {
   capabilityManifestSha256?: string;
 }
 
+/**
+ * Returns the effective target identity for comparison and gating.
+ * When a verified CROSS_DOMAIN_DIGEST_MISBINDING receipt exists, the effective
+ * capability manifest expectation is corrected while preserving the original
+ * bound digest in the durable record as immutable historical evidence.
+ */
+export function effectiveExpectedIdentity(record: DurableCutoverRecord): ExpectedCutoverIdentity {
+  if (record.bindingRepair) {
+    assertValidBindingRepair(record.bindingRepair, record);
+    return {
+      sourceCommit: record.expectedNewIdentity.sourceCommit,
+      buildId: record.expectedNewIdentity.buildId,
+      capabilityManifestSha256: record.bindingRepair.correctCapabilityManifestSha256,
+    };
+  }
+  return record.expectedNewIdentity;
+}
+
 export interface CutoverDrainEvidence {
   activeSessions: number;
   oldestAgeMs: number;
+}
+
+export interface DurableReconciliationWitness {
+  workspaceQueryable: boolean;
+  agentQueryable: boolean;
+  agentReconciled: boolean;
+  witnessWorkspaceId?: string;
+  witnessAgentId?: string;
+  workspaceSessions?: number;
+  agentSessions?: number;
+  witnessWorkspaceSessions?: number;
+  witnessAgentSessions?: number;
+  witnessKind?: string;
+  detail?: Array<{ unit: string; ok: boolean; detail?: string }>;
+  witnessCutoverId?: string;
+  witnessServerInstanceId?: string;
+  witnessExpectedIdentity?: ExpectedCutoverIdentity;
 }
 
 export interface CutoverReconciliationReceipt {
@@ -80,6 +120,31 @@ export interface CutoverReconciliationReceipt {
   agentQueryable: boolean;
   agentReconciled: boolean;
   reconciledAt: string;
+  terminalReason?: typeof CUTOVER_OBSERVED_REPLACEMENT_REASON;
+  preRestartDrainObserved?: boolean;
+  witnessWorkspaceId?: string;
+  witnessAgentId?: string;
+  witnessWorkspaceSessions?: number;
+  witnessAgentSessions?: number;
+  witnessKind?: string;
+}
+
+export interface CutoverObservedReplacementReceipt {
+  schema: typeof CUTOVER_OBSERVED_REPLACEMENT_SCHEMA;
+  cutoverId: string;
+  terminalReason: typeof CUTOVER_OBSERVED_REPLACEMENT_REASON;
+  preRestartDrainObserved: false;
+  oldServerIdentity: CutoverServerIdentity;
+  expectedIdentity: ExpectedCutoverIdentity;
+  observedIdentity: CutoverServerIdentity;
+  recoveredBy: string;
+  recoveredAt: string;
+  witnessWorkspaceId: string;
+  witnessAgentId: string;
+  witnessWorkspaceSessions: number;
+  witnessAgentSessions: number;
+  witnessKind: string;
+  reconciliationReceipt: CutoverReconciliationReceipt;
 }
 
 export interface BuildReadyReceipt {
@@ -110,6 +175,30 @@ interface CutoverRestartScheduledMarker {
   scheduledAt: string;
 }
 
+export interface CutoverBindingRepairReceipt {
+  schema: typeof CUTOVER_BINDING_REPAIR_SCHEMA;
+  cutoverId: string;
+  reason: typeof CUTOVER_BINDING_REPAIR_REASON;
+  // 4 distinct identities required by G71-R1
+  repairControlSurfaceIdentity: CutoverServerIdentity;
+  observedTargetRuntimeIdentity: CutoverServerIdentity;
+  originalCutoverExpectedIdentity: ExpectedCutoverIdentity;
+  effectiveRepairedIdentity: ExpectedCutoverIdentity;
+
+  originalBoundDigest: string;
+  originalDigestField: "expectedNewIdentity.capabilityManifestSha256";
+  provenActualDigestDomain: "build_manifest_sha256";
+  correctCapabilityManifestSchema: "devspace.capability_manifest.v1";
+  correctCapabilityManifestSha256: string;
+  sourceCommit: string;
+  buildId: string;
+  observedServerInstanceId: string;
+  repairedBy: string;
+  repairedAt: string;
+  physicalProbeEvidence: string;
+  reconciliationWitness?: DurableReconciliationWitness;
+}
+
 export interface DurableCutoverRecord {
   schema: typeof CUTOVER_STATE_SCHEMA;
   cutoverId: string;
@@ -127,6 +216,10 @@ export interface DurableCutoverRecord {
   supersedesCutoverId?: string;
   /** Present only on a terminal superseded record. */
   supersession?: CutoverSupersessionReceipt;
+  /** Present only on a record closed via observed replacement recovery without drain. */
+  observedReplacement?: CutoverObservedReplacementReceipt;
+  /** Present only on a record with a verified cross-domain digest repair. */
+  bindingRepair?: CutoverBindingRepairReceipt;
 }
 
 export interface CutoverStateStoreOptions {
@@ -217,8 +310,11 @@ export class CutoverStateStore {
           restartScheduledForServerInstanceId: restartScheduled.scheduledForServerInstanceId,
         }
       : restartRequest;
+    const bindingRepair = readBindingRepairMarker(markers.bindingRepair, record.cutoverId)
+      ?? record.bindingRepair;
     return {
       ...record,
+      ...(bindingRepair ? { bindingRepair } : {}),
       ...(mergedRestartRequest ? {
         restartRequest: mergedRestartRequest,
         updatedAt: mergedRestartRequest.requestedAt > record.updatedAt
@@ -412,17 +508,58 @@ export class CutoverStateStore {
   private markerPaths(record: DurableCutoverRecord): {
     restartRequested: string;
     restartScheduled: string;
+    bindingRepair: string;
   } {
     if (record.supersedesCutoverId === undefined) {
       return {
         restartRequested: this.restartRequestedPath,
         restartScheduled: this.restartScheduledPath,
+        bindingRepair: join(this.activeDir, "binding-repair.json"),
       };
     }
     return {
       restartRequested: join(this.activeDir, `restart-requested-${record.cutoverId}.json`),
       restartScheduled: join(this.activeDir, `restart-scheduled-${record.cutoverId}.json`),
+      bindingRepair: join(this.activeDir, `binding-repair-${record.cutoverId}.json`),
     };
+  }
+
+  recordBindingRepair(
+    cutoverId: string,
+    repair: CutoverBindingRepairReceipt,
+  ): { record: DurableCutoverRecord; newlyRepaired: boolean } {
+    const record = this.requireExact(cutoverId);
+    if (!isBindingRepairReceipt(repair) || repair.cutoverId !== cutoverId) {
+      throw new CutoverStateError("Binding repair receipt is malformed; reconciliation is required.");
+    }
+    const markers = this.markerPaths(record);
+    if (record.bindingRepair) {
+      if (!isDeepStrictEqual(record.bindingRepair, repair)) {
+        throw new CutoverStateError(
+          "[REPAIR_BINDING_MISMATCH] Active cutover already has a different durable binding repair receipt.",
+        );
+      }
+      return { record, newlyRepaired: false };
+    }
+    try {
+      writeExclusiveDurable(markers.bindingRepair, `${JSON.stringify(repair, null, 2)}\n`);
+      syncDirectory(this.activeDir);
+    } catch (error) {
+      if (!isErrno(error, "EEXIST")) throw error;
+      const current = this.requireExact(cutoverId);
+      if (!current.bindingRepair) {
+        throw new CutoverStateError(
+          "Durable binding repair fence exists without a readable receipt; reconciliation is required.",
+        );
+      }
+      if (!isDeepStrictEqual(current.bindingRepair, repair)) {
+        throw new CutoverStateError(
+          "[REPAIR_BINDING_MISMATCH] Concurrent binding repair recorded a different receipt.",
+        );
+      }
+      return { record: current, newlyRepaired: false };
+    }
+    return { record: this.requireExact(cutoverId), newlyRepaired: true };
   }
 
   /** Terminal supersession record for a stale resolved cutover, if any. */
@@ -635,6 +772,194 @@ export class CutoverStateStore {
       throw error;
     }
   }
+
+  /**
+   * Terminally close one cutover where the replacement server is already running with
+   * exact expected source/build/capability identity, but pre-restart drain evidence
+   * was absent (e.g. transport initialization rejection before cutover_drain reached handler).
+   *
+   * Invariants:
+   * - Requires phase "prepared" with drainEvidence absent.
+   * - Never fabricates drainEvidence (remains undefined).
+   * - Never alters phase to "drained".
+   * - Never creates a successor cutover.
+   * - Never schedules or requests a restart.
+   * - Does not read or write the stale-target supersession recovery intent.
+   * - Requires fully positive reconciliation witness (workspaceQueryable, agentQueryable, agentReconciled).
+   * - Idempotent rendezvous if already closed via this exact recovery.
+   * - Fail closed on wrong cutoverId or wrong active/observed identity.
+   */
+  recoverObservedReplacement(input: {
+    cutoverId: string;
+    expectedNewIdentity?: ExpectedCutoverIdentity;
+    observedIdentity: CutoverServerIdentity;
+    witness: DurableReconciliationWitness;
+    recoveredBy: string;
+  }): { record: DurableCutoverRecord; newlyRecovered: boolean } {
+    mkdirSync(this.cutoverRoot, { recursive: true, mode: 0o700 });
+    const active = this.get();
+    if (!active) throw new CutoverStateError("No durable cutover record exists.");
+    if (active.cutoverId !== input.cutoverId) {
+      throw new CutoverStateError(
+        `Cutover id mismatch: active cutover is ${active.cutoverId}.`,
+      );
+    }
+
+    if (input.expectedNewIdentity) {
+      if (
+        input.expectedNewIdentity.sourceCommit !== active.expectedNewIdentity.sourceCommit ||
+        input.expectedNewIdentity.buildId !== active.expectedNewIdentity.buildId ||
+        (active.expectedNewIdentity.capabilityManifestSha256 !== undefined &&
+          input.expectedNewIdentity.capabilityManifestSha256 !== active.expectedNewIdentity.capabilityManifestSha256)
+      ) {
+        throw new CutoverStateError(
+          "[RECOVERY_BINDING_MISMATCH] Recovery expected identity does not match active cutover expected identity.",
+        );
+      }
+    }
+
+    // Validate the observed generation before idempotent closed replay. A
+    // closed receipt is only a rendezvous for the same replacement identity;
+    // it must not become an oracle for a stale or changed instance.
+    if (active.oldServerIdentity.serverInstanceId === input.observedIdentity.serverInstanceId) {
+      throw new CutoverStateError(
+        "Cannot recover cutover: observed serverInstanceId did not change from the old server.",
+      );
+    }
+    if (input.observedIdentity.sourceCommit !== active.expectedNewIdentity.sourceCommit) {
+      throw new CutoverStateError(
+        `Cannot recover cutover: observed sourceCommit ${input.observedIdentity.sourceCommit} does not match expected ${active.expectedNewIdentity.sourceCommit}.`,
+      );
+    }
+    if (input.observedIdentity.buildId !== active.expectedNewIdentity.buildId) {
+      throw new CutoverStateError(
+        `Cannot recover cutover: observed buildId ${input.observedIdentity.buildId} does not match expected ${active.expectedNewIdentity.buildId}.`,
+      );
+    }
+    if (
+      !active.expectedNewIdentity.capabilityManifestSha256?.trim() ||
+      input.observedIdentity.capabilityManifestSha256 !== active.expectedNewIdentity.capabilityManifestSha256
+    ) {
+      throw new CutoverStateError(
+        "Cannot recover cutover: observed capability manifest does not match expected target.",
+      );
+    }
+
+    if (active.phase === "closed") {
+      if (active.observedReplacement?.cutoverId === input.cutoverId) {
+        const observed = active.observedReplacement.observedIdentity;
+        if (
+          observed.serverInstanceId !== input.observedIdentity.serverInstanceId ||
+          observed.sourceCommit !== input.observedIdentity.sourceCommit ||
+          observed.buildId !== input.observedIdentity.buildId ||
+          observed.capabilityManifestSha256 !== input.observedIdentity.capabilityManifestSha256
+        ) {
+          throw new CutoverStateError(
+            "[RECOVERY_BINDING_MISMATCH] Observed replacement identity does not match the closed receipt.",
+          );
+        }
+        return { record: active, newlyRecovered: false };
+      }
+      throw new CutoverStateError(
+        `Cutover ${input.cutoverId} is already closed; normal archive applies.`,
+      );
+    }
+
+    if (active.phase !== "prepared" || active.drainEvidence !== undefined) {
+      throw new CutoverStateError(
+        `Cutover ${input.cutoverId} requires prepared state without durable drain evidence for observed replacement recovery.`,
+      );
+    }
+
+    const wsSessions = input.witness.witnessWorkspaceSessions ?? input.witness.workspaceSessions ?? 0;
+    const agSessions = input.witness.witnessAgentSessions ?? input.witness.agentSessions ?? 0;
+    const witnessWsId = input.witness.witnessWorkspaceId;
+    const witnessAgId = input.witness.witnessAgentId;
+    const witnessKind = input.witness.witnessKind ?? "exact-pair";
+
+    if (
+      input.witness.witnessCutoverId !== input.cutoverId
+    ) {
+      throw new CutoverStateError("[RECOVERY_BINDING_MISMATCH] Witness belongs to a different cutover generation.");
+    }
+    if (
+      input.witness.witnessServerInstanceId !== input.observedIdentity.serverInstanceId
+    ) {
+      throw new CutoverStateError("[RECOVERY_BINDING_MISMATCH] Witness belongs to a different replacement instance.");
+    }
+    const witnessExpected = input.witness.witnessExpectedIdentity;
+    if (
+      !witnessExpected ||
+      !witnessExpected.capabilityManifestSha256?.trim() ||
+      (witnessExpected.sourceCommit !== active.expectedNewIdentity.sourceCommit ||
+        witnessExpected.buildId !== active.expectedNewIdentity.buildId ||
+        witnessExpected.capabilityManifestSha256 !== active.expectedNewIdentity.capabilityManifestSha256)
+    ) {
+      throw new CutoverStateError("[RECOVERY_BINDING_MISMATCH] Witness expected identity does not match the cutover generation.");
+    }
+
+    if (
+      !input.witness.workspaceQueryable ||
+      !input.witness.agentQueryable ||
+      !input.witness.agentReconciled ||
+      !Number.isSafeInteger(wsSessions) ||
+      wsSessions < 1 ||
+      !Number.isSafeInteger(agSessions) ||
+      agSessions < 1 ||
+      !witnessWsId ||
+      !witnessAgId
+    ) {
+      throw new CutoverStateError(
+        "Cannot recover cutover: durable agent/workspace reconciliation witness is not fully positive or missing exact non-empty binding.",
+      );
+    }
+
+    const nowIso = new Date(this.now()).toISOString();
+    const reconciliationReceipt: CutoverReconciliationReceipt = {
+      closedByServerInstanceId: input.observedIdentity.serverInstanceId,
+      workspaceQueryable: input.witness.workspaceQueryable,
+      agentQueryable: input.witness.agentQueryable,
+      agentReconciled: input.witness.agentReconciled,
+      reconciledAt: nowIso,
+      terminalReason: CUTOVER_OBSERVED_REPLACEMENT_REASON,
+      preRestartDrainObserved: false,
+      witnessWorkspaceId: witnessWsId,
+      witnessAgentId: witnessAgId,
+      witnessWorkspaceSessions: wsSessions,
+      witnessAgentSessions: agSessions,
+      witnessKind,
+    };
+
+    const observedReplacement: CutoverObservedReplacementReceipt = {
+      schema: CUTOVER_OBSERVED_REPLACEMENT_SCHEMA,
+      cutoverId: input.cutoverId,
+      terminalReason: CUTOVER_OBSERVED_REPLACEMENT_REASON,
+      preRestartDrainObserved: false,
+      oldServerIdentity: active.oldServerIdentity,
+      expectedIdentity: active.expectedNewIdentity,
+      observedIdentity: input.observedIdentity,
+      recoveredBy: input.recoveredBy,
+      recoveredAt: nowIso,
+      witnessWorkspaceId: witnessWsId,
+      witnessAgentId: witnessAgId,
+      witnessWorkspaceSessions: wsSessions,
+      witnessAgentSessions: agSessions,
+      witnessKind,
+      reconciliationReceipt,
+    };
+
+    const closedRecord: DurableCutoverRecord = {
+      ...withoutDiagnostic(active),
+      phase: "closed",
+      drainEvidence: undefined,
+      reconciliationReceipt,
+      observedReplacement,
+      updatedAt: nowIso,
+    };
+
+    const closed = this.replace(closedRecord);
+    return { record: closed, newlyRecovered: true };
+  }
 }
 
 function withoutDiagnostic(record: DurableCutoverRecord): DurableCutoverRecord {
@@ -661,11 +986,165 @@ function parseRecord(raw: string): DurableCutoverRecord {
       (typeof value.supersedesCutoverId !== "string" ||
         value.supersedesCutoverId.trim() === "" ||
         value.supersedesCutoverId === value.cutoverId)) ||
-    (value.supersession !== undefined && !isSupersessionReceipt(value.supersession))
+    (value.supersession !== undefined && !isSupersessionReceipt(value.supersession)) ||
+    (value.reconciliationReceipt !== undefined && !isReconciliationReceipt(value.reconciliationReceipt)) ||
+    (value.observedReplacement !== undefined && !isObservedReplacementReceipt(value.observedReplacement)) ||
+    (value.bindingRepair !== undefined && !isBindingRepairReceipt(value.bindingRepair))
   ) {
     throw new CutoverStateError("Durable cutover record is malformed; reconciliation is required.");
   }
-  return value as DurableCutoverRecord;
+  const record = value as DurableCutoverRecord;
+  if (record.bindingRepair) {
+    assertValidBindingRepair(record.bindingRepair, record);
+  }
+  if (record.observedReplacement) {
+    const receipt = record.observedReplacement;
+    if (
+      receipt.cutoverId !== record.cutoverId ||
+      receipt.observedIdentity.serverInstanceId === receipt.oldServerIdentity.serverInstanceId ||
+      !receipt.expectedIdentity.capabilityManifestSha256?.trim() ||
+      !isDeepStrictEqual(record.reconciliationReceipt, receipt.reconciliationReceipt) ||
+      !identitiesEqual(receipt.oldServerIdentity, record.oldServerIdentity) ||
+      !expectedIdentitiesEqual(receipt.expectedIdentity, record.expectedNewIdentity) ||
+      receipt.observedIdentity.sourceCommit !== receipt.expectedIdentity.sourceCommit ||
+      receipt.observedIdentity.buildId !== receipt.expectedIdentity.buildId ||
+      (receipt.expectedIdentity.capabilityManifestSha256 !== undefined &&
+        receipt.observedIdentity.capabilityManifestSha256 !== receipt.expectedIdentity.capabilityManifestSha256) ||
+      receipt.reconciliationReceipt.closedByServerInstanceId !== receipt.observedIdentity.serverInstanceId ||
+      receipt.reconciliationReceipt.preRestartDrainObserved !== false ||
+      receipt.reconciliationReceipt.witnessWorkspaceId !== receipt.witnessWorkspaceId ||
+      receipt.reconciliationReceipt.witnessAgentId !== receipt.witnessAgentId ||
+      receipt.reconciliationReceipt.witnessWorkspaceSessions !== receipt.witnessWorkspaceSessions ||
+      receipt.reconciliationReceipt.witnessAgentSessions !== receipt.witnessAgentSessions ||
+      record.phase !== "closed" ||
+      record.drainEvidence !== undefined
+    ) {
+      throw new CutoverStateError("Durable cutover record is malformed; observed replacement binding is inconsistent.");
+    }
+  }
+  return record;
+}
+
+function identitiesEqual(a: CutoverServerIdentity, b: CutoverServerIdentity): boolean {
+  return a.serverInstanceId === b.serverInstanceId &&
+    a.sourceCommit === b.sourceCommit &&
+    a.buildId === b.buildId &&
+    a.capabilityManifestSha256 === b.capabilityManifestSha256;
+}
+
+function expectedIdentitiesEqual(a: ExpectedCutoverIdentity, b: ExpectedCutoverIdentity): boolean {
+  return a.sourceCommit === b.sourceCommit &&
+    a.buildId === b.buildId &&
+    a.capabilityManifestSha256 === b.capabilityManifestSha256;
+}
+
+function isReconciliationReceipt(value: unknown): value is CutoverReconciliationReceipt {
+  const receipt = value as Partial<CutoverReconciliationReceipt> | undefined;
+  return Boolean(
+    receipt &&
+    typeof receipt.closedByServerInstanceId === "string" &&
+    receipt.closedByServerInstanceId.length > 0 &&
+    typeof receipt.workspaceQueryable === "boolean" &&
+    typeof receipt.agentQueryable === "boolean" &&
+    typeof receipt.agentReconciled === "boolean" &&
+    typeof receipt.reconciledAt === "string" &&
+    Number.isFinite(Date.parse(receipt.reconciledAt)) &&
+    (receipt.preRestartDrainObserved === undefined || typeof receipt.preRestartDrainObserved === "boolean") &&
+    (receipt.terminalReason === undefined || receipt.terminalReason === CUTOVER_OBSERVED_REPLACEMENT_REASON),
+  );
+}
+
+function isObservedReplacementReceipt(value: unknown): value is CutoverObservedReplacementReceipt {
+  const receipt = value as Partial<CutoverObservedReplacementReceipt> | undefined;
+  return Boolean(
+    receipt &&
+    receipt.schema === CUTOVER_OBSERVED_REPLACEMENT_SCHEMA &&
+    typeof receipt.cutoverId === "string" &&
+    receipt.cutoverId.length > 0 &&
+    receipt.terminalReason === CUTOVER_OBSERVED_REPLACEMENT_REASON &&
+    receipt.preRestartDrainObserved === false &&
+    isIdentity(receipt.oldServerIdentity) &&
+    isExpectedIdentity(receipt.expectedIdentity) &&
+    isIdentity(receipt.observedIdentity) &&
+    typeof receipt.recoveredBy === "string" &&
+    receipt.recoveredBy.length > 0 &&
+    typeof receipt.recoveredAt === "string" &&
+    Number.isFinite(Date.parse(receipt.recoveredAt)) &&
+    typeof receipt.witnessWorkspaceId === "string" &&
+    receipt.witnessWorkspaceId.length > 0 &&
+    typeof receipt.witnessAgentId === "string" &&
+    receipt.witnessAgentId.length > 0 &&
+    typeof receipt.witnessWorkspaceSessions === "number" &&
+    receipt.witnessWorkspaceSessions >= 1 &&
+    typeof receipt.witnessAgentSessions === "number" &&
+    receipt.witnessAgentSessions >= 1 &&
+    typeof receipt.witnessKind === "string" &&
+    receipt.reconciliationReceipt !== undefined &&
+    isReconciliationReceipt(receipt.reconciliationReceipt),
+  );
+}
+
+function isBindingRepairReceipt(value: unknown): value is CutoverBindingRepairReceipt {
+  const receipt = value as Partial<CutoverBindingRepairReceipt> | undefined;
+  return Boolean(
+    receipt &&
+    receipt.schema === CUTOVER_BINDING_REPAIR_SCHEMA &&
+    typeof receipt.cutoverId === "string" &&
+    receipt.cutoverId.length > 0 &&
+    receipt.reason === CUTOVER_BINDING_REPAIR_REASON &&
+    typeof receipt.originalBoundDigest === "string" &&
+    /^[0-9a-f]{64}$/.test(receipt.originalBoundDigest) &&
+    receipt.originalDigestField === "expectedNewIdentity.capabilityManifestSha256" &&
+    receipt.provenActualDigestDomain === "build_manifest_sha256" &&
+    receipt.correctCapabilityManifestSchema === "devspace.capability_manifest.v1" &&
+    typeof receipt.correctCapabilityManifestSha256 === "string" &&
+    /^[0-9a-f]{64}$/.test(receipt.correctCapabilityManifestSha256) &&
+    typeof receipt.sourceCommit === "string" &&
+    /^[0-9a-f]{40}$/.test(receipt.sourceCommit) &&
+    typeof receipt.buildId === "string" &&
+    receipt.buildId.length > 0 &&
+    typeof receipt.observedServerInstanceId === "string" &&
+    receipt.observedServerInstanceId.length > 0 &&
+    typeof receipt.repairedBy === "string" &&
+    receipt.repairedBy.length > 0 &&
+    typeof receipt.repairedAt === "string" &&
+    Number.isFinite(Date.parse(receipt.repairedAt)) &&
+    typeof receipt.physicalProbeEvidence === "string" &&
+    receipt.physicalProbeEvidence.length > 0 &&
+    (!receipt.repairControlSurfaceIdentity || isIdentity(receipt.repairControlSurfaceIdentity)) &&
+    (!receipt.observedTargetRuntimeIdentity || isIdentity(receipt.observedTargetRuntimeIdentity)) &&
+    (!receipt.originalCutoverExpectedIdentity || isExpectedIdentity(receipt.originalCutoverExpectedIdentity)) &&
+    (!receipt.effectiveRepairedIdentity || isExpectedIdentity(receipt.effectiveRepairedIdentity)),
+  );
+}
+
+export function assertValidBindingRepair(
+  repair: CutoverBindingRepairReceipt,
+  record: DurableCutoverRecord,
+): void {
+  if (
+    repair.schema !== CUTOVER_BINDING_REPAIR_SCHEMA ||
+    repair.cutoverId !== record.cutoverId ||
+    repair.reason !== CUTOVER_BINDING_REPAIR_REASON ||
+    repair.originalBoundDigest !== record.expectedNewIdentity.capabilityManifestSha256 ||
+    repair.sourceCommit !== record.expectedNewIdentity.sourceCommit ||
+    repair.buildId !== record.expectedNewIdentity.buildId ||
+    (repair.effectiveRepairedIdentity &&
+      (repair.effectiveRepairedIdentity.sourceCommit !== record.expectedNewIdentity.sourceCommit ||
+        repair.effectiveRepairedIdentity.buildId !== record.expectedNewIdentity.buildId ||
+        repair.effectiveRepairedIdentity.capabilityManifestSha256 !== repair.correctCapabilityManifestSha256)) ||
+    (repair.observedTargetRuntimeIdentity &&
+      (repair.observedTargetRuntimeIdentity.serverInstanceId !== repair.observedServerInstanceId ||
+        repair.observedTargetRuntimeIdentity.sourceCommit !== record.expectedNewIdentity.sourceCommit ||
+        repair.observedTargetRuntimeIdentity.buildId !== record.expectedNewIdentity.buildId)) ||
+    (repair.originalCutoverExpectedIdentity &&
+      (repair.originalCutoverExpectedIdentity.sourceCommit !== record.expectedNewIdentity.sourceCommit ||
+        repair.originalCutoverExpectedIdentity.buildId !== record.expectedNewIdentity.buildId ||
+        repair.originalCutoverExpectedIdentity.capabilityManifestSha256 !== record.expectedNewIdentity.capabilityManifestSha256)) ||
+    repair.observedServerInstanceId === record.oldServerIdentity.serverInstanceId
+  ) {
+    throw new CutoverStateError("Durable cutover record is malformed; binding repair receipt is inconsistent.");
+  }
 }
 
 function isSupersessionReceipt(value: unknown): value is CutoverSupersessionReceipt {
@@ -808,6 +1287,25 @@ function readRestartMarker(
   return value.request;
 }
 
+function readBindingRepairMarker(
+  path: string,
+  expectedCutoverId: string,
+): CutoverBindingRepairReceipt | undefined {
+  const raw = readOptionalFile(path);
+  if (raw === undefined) return undefined;
+  try {
+    const parsed = JSON.parse(raw) as unknown;
+    if (isBindingRepairReceipt(parsed) && parsed.cutoverId === expectedCutoverId) {
+      return parsed;
+    }
+  } catch {
+    // Malformed marker will throw below.
+  }
+  throw new CutoverStateError(
+    "Durable binding repair fence is malformed; reconciliation is required.",
+  );
+}
+
 function isErrno(error: unknown, code: string): boolean {
   return (error as NodeJS.ErrnoException | undefined)?.code === code;
 }
@@ -884,7 +1382,9 @@ function writeExclusiveDurable(path: string, content: string): void {
 function syncDirectory(path: string): void {
   let fd: number | undefined;
   try {
-    fd = openSync(path, "r");
+    // Windows requires write access for directory fsync; POSIX keeps the
+    // read-only directory handle and preserves its existing error behavior.
+    fd = openSync(path, process.platform === "win32" ? "r+" : "r");
     fsyncSync(fd);
   } finally {
     if (fd !== undefined) closeQuietly(fd);

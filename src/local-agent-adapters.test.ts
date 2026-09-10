@@ -361,6 +361,7 @@ assert.equal(
 // ==========================================
 import { execFileSync } from "node:child_process";
 import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import { basename, join } from "node:path";
 import { tmpdir } from "node:os";
 import { cleanupProviderScratch, createProviderScratch } from "./provider-scratch.js";
@@ -388,7 +389,7 @@ const { existsSync, realpathSync } = require("node:fs");
 const { isAbsolute, join, relative, sep } = require("node:path");
 const args = process.argv.slice(2);
 const canonical = (path) => {
-  try { return realpathSync(path); } catch { return path; }
+  try { return realpathSync.native(path); } catch { return path; }
 };
 
 const expectedScratch = process.env.EXPECTED_AGY_PROVIDER_SCRATCH;
@@ -543,6 +544,24 @@ writeFileSync(ambientMcpConfig, '{"serena":{"command":"UNRELATED_GLOBAL_MCP_SENT
 writeFileSync(join(ambientAgyAppData, "antigravity-oauth-token"), "TEST_AUTH_TOKEN\n", { mode: 0o600 });
 const agyScratch = createProviderScratch(`adapter_test_${process.pid}_${Date.now()}`);
 const originalEnv = process.env;
+const childProcess = createRequire(import.meta.url)("node:child_process") as typeof import("node:child_process");
+const originalSpawn = childProcess.spawn;
+let interceptedWindowsAgySpawn = false;
+
+if (process.platform === "win32") {
+  childProcess.spawn = function patchedSpawn(this: typeof childProcess, command: any, args?: any, options?: any): any {
+    if (command === tempMockPath) {
+      interceptedWindowsAgySpawn = true;
+      const forwardedArgs = Array.isArray(args) ? args : [];
+      const forwardedOptions = Array.isArray(args) ? options : args;
+      return originalSpawn.call(this, process.execPath, [tempMockPath, ...forwardedArgs], forwardedOptions);
+    }
+    return originalSpawn.call(this, command, args, options);
+  } as typeof childProcess.spawn;
+  // local-agent-adapters imports spawn as an ESM builtin binding. Synchronize
+  // that binding after patching the CJS builtin object, before adapter calls.
+  syncBuiltinESMExports();
+}
 
 try {
   const testEnv = {
@@ -914,8 +933,16 @@ try {
     );
   }
 
+  if (process.platform === "win32") {
+    assert.equal(interceptedWindowsAgySpawn, true, "Windows Agy fixture spawn was not intercepted");
+  }
+
 } finally {
   process.env = originalEnv;
+  if (process.platform === "win32") {
+    childProcess.spawn = originalSpawn;
+    syncBuiltinESMExports();
+  }
   cleanupProviderScratch(agyScratch.root);
   rmSync(tempMockDir, { recursive: true, force: true });
 }
