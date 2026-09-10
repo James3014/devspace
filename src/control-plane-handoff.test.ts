@@ -6,7 +6,7 @@ import { ControlPlaneOwnershipStore } from "./control-plane-ownership.js";
 
 test("handoff facade delegates the atomic ownership transfer contract", () => {
   const db = new Database(":memory:");
-  const options = { resolveOwnerContext: (value: unknown) => ({ ownerThread: String(value) }), verifyGrantEvidence: () => true };
+  const options = { resolveResourceIdentity: (input: Parameters<ControlPlaneOwnershipStore["acquire"]>[1]) => input, resolveOwnerContext: (value: unknown) => ({ ownerThread: String(value) }), verifyGrantEvidence: () => true };
   const store = new ControlPlaneOwnershipStore(db, options);
   db.prepare("insert into control_plane_grant_evidence(repository,goal,coordinator_thread,evidence_hash,version,updated_at) values(?,?,?,?,?,?)").run("owner/repo", "goal", "coord", "evidence", 1, new Date().toISOString());
   const lease = store.acquire("from", { repositoryKey: "owner/repo", resourceKind: "checkout", resourceId: "main", resource: "checkout", operation: "write", scope: ["/repo"], baseRevision: "sha", expiresAt: new Date(Date.now() + 60_000).toISOString(), idempotencyKey: "handoff", grant: { repository: "owner/repo", goal: "goal", coordinatorThread: "coord", evidenceHash: "evidence" } });
@@ -18,7 +18,7 @@ test("handoff facade delegates the atomic ownership transfer contract", () => {
 
 test("handoff validates full binding and fences every former-owner mutation", () => {
   const db = new Database(":memory:"); let now=Date.now(); let allowRecipient=true;
-  const opts={resolveOwnerContext:(v:unknown)=>({ownerThread:String(v)}),verifyGrantEvidence:(_g:unknown,o:{ownerThread:string})=>o.ownerThread!=="to" || allowRecipient,now:()=>now,verifyReconciliationEvidence:()=>true};
+  const opts={resolveResourceIdentity: (input: Parameters<ControlPlaneOwnershipStore["acquire"]>[1]) => input,resolveOwnerContext:(v:unknown)=>({ownerThread:String(v)}),verifyGrantEvidence:(_g:unknown,o:{ownerThread:string})=>o.ownerThread!=="to" || allowRecipient,now:()=>now,verifyReconciliationEvidence:()=>true};
   const store=new ControlPlaneOwnershipStore(db,opts);
   const grant={repository:"owner/repo",goal:"goal",coordinatorThread:"from",evidenceHash:"old"};
   const recipientGrant={...grant,coordinatorThread:"to",evidenceHash:"new"};
