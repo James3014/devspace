@@ -1,7 +1,9 @@
+import { CutoverBuildNotReadyError } from "./cutover-build-ready.js";
+import type { SelfRestartActuator } from "./cutover-restart.js";
 import type { CompletionSelection } from "./current-completion-matrix.js";
 import { isDeepStrictEqual } from "node:util";
 import { McpCutoverController, compareServerIdentity, type DurableReconciliationWitness } from "./mcp-cutover.js";
-import { CutoverStateStore, type CutoverServerIdentity, type CutoverDrainEvidence, type ExpectedCutoverIdentity, type CutoverCoordinationBinding } from "./cutover-state.js";
+import { CutoverStateStore, type CutoverServerIdentity, type CutoverDrainEvidence, type BuildReadyReceipt, type ExpectedCutoverIdentity, type CutoverCoordinationBinding } from "./cutover-state.js";
 import { ControlPlaneConsumer, type ControlPlaneConsumerOptions, type DependencyReconciliationEvidence } from "./control-plane-consumer.js";
 import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type HandoffInput } from "./control-plane-ownership.js";
 import { createHash } from "node:crypto";
@@ -454,6 +456,51 @@ export class DurableOperationManager {
       if(!isDeepStrictEqual(current,binding)||!isDeepStrictEqual(cutoverStore.get(),observed)||!isDeepStrictEqual(this.store.getByOperationId(intent.operationId),intent)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","drain binding changed during evidence collection");
       // Same DB fence; file effects cannot be rolled back by a SQLite failure.
       return new McpCutoverController(cutoverStore,identity).recordDrain(cutoverId,evidence);
+    });
+  }
+
+  async restartCutover(cutoverId:string, currentIdentity:CutoverServerIdentity, buildReady:BuildReadyReceipt, probe:(expected:ExpectedCutoverIdentity)=>{buildReady:boolean;detail:string}|Promise<{buildReady:boolean;detail:string}>, actuator:SelfRestartActuator, context?:unknown) {
+    if(!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","restart requires trusted host authority");
+    const consumer=this.consumer,identity=Object.freeze({...currentIdentity});
+    const target=Object.freeze({actuator:actuator.actuator,serviceLabel:actuator.serviceLabel,launchdTarget:actuator.launchdTarget});
+    const schedule=actuator.schedule,ready=Object.freeze({...buildReady});
+    const action={action:"restart" as const,cutoverId,currentIdentity:identity,buildReady:ready,actuator:target};
+    const cutoverStore=new CutoverStateStore(canonicalizePath(this.config.stateDir));
+    const readBound=()=>{
+      const file=cutoverStore.get();
+      if(!file?.coordinationBinding||file.cutoverId!==cutoverId||file.phase!=="drained"||!isDeepStrictEqual(file.oldServerIdentity,identity)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart requires exact drained original runtime binding");
+      const intent=this.reconcileCutoverStart(file.coordinationBinding.operationHandle,context);
+      const subject={operationId:intent.operationId,requestHash:intent.requestHash,workspaceRoot:intent.scopeRoot,baseRevision:intent.request.baseRevision as string,operation:"cutover_start" as const};
+      const binding=consumer.authorizeCutoverLifecycle(context,subject,action);
+      if(schedule!==actuator.schedule||!isDeepStrictEqual(target,{actuator:actuator.actuator,serviceLabel:actuator.serviceLabel,launchdTarget:actuator.launchdTarget})) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart actuator binding changed");
+      if(file.restartRequest && (!isDeepStrictEqual(file.restartRequest.buildReady,ready)||file.restartRequest.requestedByServerInstanceId!==identity.serverInstanceId||file.restartRequest.actuator!==target.actuator)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart marker action binding mismatch");
+      if(intent.receipt?.restartAction && !isDeepStrictEqual(intent.receipt.restartAction,action)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart action changed");
+      if(!isDeepStrictEqual(cutoverStore.get(),file)||!isDeepStrictEqual(this.store.getByOperationId(intent.operationId),intent)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart binding changed during approval");
+      return {file,intent,subject,binding};
+    };
+    const initial=this.store.atomic(()=>{
+      const current=readBound();
+      if(current.file.restartRequest) {
+        if(!current.intent.receipt?.restartAction) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart marker lacks bound action; reconciliation required");
+        return {...current,replay:true};
+      }
+      this.store.finish(current.intent.operationId,{status:"succeeded",retrySafe:false,receipt:{...current.intent.receipt,restartAction:action,restartState:"requested"}});
+      new McpCutoverController(cutoverStore,identity).requestRestart(cutoverId,ready);
+      return {...readBound(),replay:false};
+    });
+    if(initial.replay) return {record:initial.file,scheduled:false,outcome:"outcome_unknown" as const};
+    const result=await probe(Object.freeze({...initial.file.expectedNewIdentity}));
+    if(result.buildReady!==true) throw new CutoverBuildNotReadyError(result.detail);
+    return this.store.atomic(()=>{
+      const current=readBound();
+      const {replay,...expected}=initial;
+      if(!isDeepStrictEqual(current,expected)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart binding changed during probe");
+      const marked=new McpCutoverController(cutoverStore,identity).markRestartScheduled(cutoverId);
+      // Durable file marker precedes the external actuator; errors keep the pin.
+      const scheduled=readBound();
+      if(!isDeepStrictEqual(scheduled.binding,current.binding)||!isDeepStrictEqual(scheduled.intent,current.intent)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart authority changed after scheduling marker");
+      if(marked.newlyScheduled) schedule.call(actuator);
+      return {record:marked.record,scheduled:marked.newlyScheduled,outcome:"outcome_unknown" as const};
     });
   }
 

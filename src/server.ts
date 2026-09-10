@@ -1546,7 +1546,13 @@ function registerCutoverMcpTools(
         _meta: {},
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
       },
-      async ({ cutoverId, buildReady }) => {
+      async ({ cutoverId, buildReady }, extra) => {
+        if(control.controller.record()?.coordinationBinding) {
+          if(!durableOperations) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","restart requires trusted coordination");
+          const actuator=control.restartSelf!;
+          const outcome=await durableOperations.restartCutover(cutoverId,control.controller.currentIdentity,buildReady,control.probeBuildReady??(async()=>({buildReady:true,detail:"trusted attestation only"})),actuator,dependencyConsumerContext(extra));
+          return {content:[textBlock("Restart scheduling intent is recorded; execution remains unconfirmed and must not be replayed.")],structuredContent:{cutover:outcome.record as unknown as Record<string,unknown>,mode:control.controller.mode(),restart:{scheduled:outcome.scheduled,alreadyRequested:!outcome.scheduled,scheduleBlocked:false,actuator:"launchd-self" as const,serviceLabel:actuator.serviceLabel,launchdTarget:actuator.launchdTarget}}};
+        }
         const request = control.controller.requestRestart(cutoverId, buildReady);
         const actuator = control.restartSelf!;
         const mode = control.controller.mode();
@@ -1907,6 +1913,7 @@ function registerCutoverMcpTools(
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       },
       async () => {
+        if(control.controller.record()?.coordinationBinding) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","coordination-bound automatic advance is unavailable; use explicitly authorized lifecycle actions");
         const outcome = await control.advance!();
         return {
           content: [textBlock(describeOutcome(outcome))],

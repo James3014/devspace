@@ -3158,3 +3158,20 @@ test("prepared stale-target MCP recovery preserves successor and supersession su
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("C3 bound cutover rejects unfenced automatic advance before its callback",async()=>{
+  const root=await mkdtemp(join(tmpdir(),"devspace-bound-advance-"));
+  const config=loadConfig({DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_ALLOWED_ROOTS:root,DEVSPACE_STATE_DIR:join(root,"state"),DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",PORT:"1"});
+  const store=new SqliteWorkspaceStore(config.stateDir);const workspaces=new WorkspaceRegistry(config,store);
+  const cutoverStore=new CutoverStateStore(config.stateDir);
+  const controller=new McpCutoverController(cutoverStore,{serverInstanceId:"old",sourceCommit:"old",buildId:"old"});
+  controller.begin({sourceCommit:"target",buildId:"target"},undefined,{leaseId:"lease",pinnedLeaseVersion:1,operationHandle:"operation",requestHash:"a".repeat(64),ownerThread:"owner"});
+  let advances=0;
+  const server=createMcpServer(config,workspaces,createReviewCheckpointManager(),new ProcessSessionManager(),()=>[],[],undefined,undefined,undefined,undefined,{controller,transportEvidence:()=>({activeSessions:0,oldestAgeMs:0}),reconcileDurableState:async()=>({workspaceQueryable:false,agentQueryable:false,agentReconciled:false}),advance:async()=>{advances++;return {outcome:"restart_already_scheduled",reason:"fixture",scheduledFor:"fixture"};}});
+  const [ct,st]=InMemoryTransport.createLinkedPair();const client=new Client({name:"bound-advance-test",version:"1"});
+  try {
+    await Promise.all([client.connect(ct),server.connect(st)]);const before=JSON.stringify(cutoverStore.get());
+    const result=await client.callTool({name:"cutover_reconcile",arguments:{}});
+    assert.equal(result.isError,true);assert.equal(advances,0);assert.equal(JSON.stringify(cutoverStore.get()),before);
+  } finally {await client.close();await server.close();store.close();}
+});

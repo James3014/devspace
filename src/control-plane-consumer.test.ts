@@ -581,3 +581,55 @@ test("C3 final finish authority callback cannot overwrite a changed durable inte
     assert.equal(new CutoverStateStore(f.config.stateDir).get()?.phase,"closed");
   } finally {f.manager.close();}
 });
+
+test("C3 guarded restart records intent before one actuator call and never replays scheduling",async()=>{
+  const {CutoverStateStore}=await import("./cutover-state.js");const f=cutoverFixture();let schedules=0;
+  try {
+    const start=f.manager.startCutover(f.input,f.context);const id=start.receipt!.cutoverId as string;
+    f.options.approveCutoverLifecycle=()=>true;
+    f.manager.drainCutover(id,f.input.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),f.context);
+    const actuator={actuator:"launchd-self" as const,serviceLabel:"fixture",launchdTarget:"gui/1/fixture",schedule:()=>{
+      schedules++;assert.ok(new CutoverStateStore(f.config.stateDir).get()?.restartRequest?.restartScheduledAt);
+      return {scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:"fixture",launchdTarget:"gui/1/fixture"};
+    }};
+    const ready={verifiedBy:"fixture",verifiedAt:new Date().toISOString()};
+    await f.manager.restartCutover(id,f.input.currentIdentity,ready,async()=>({buildReady:true,detail:"fixture"}),actuator,f.context);
+    const replay=await f.manager.restartCutover(id,f.input.currentIdentity,ready,async()=>{throw new Error("no repeated probe");},actuator,f.context);
+    assert.equal(replay.outcome,"outcome_unknown");assert.equal(schedules,1);assert.equal(f.ownership.get(f.leaseId)?.operationHandle,start.operationId);
+    await assert.rejects(f.manager.restartCutover(id,f.input.currentIdentity,ready,async()=>({buildReady:true,detail:"fixture"}),{...actuator,launchdTarget:"gui/1/other"},f.context),/binding|action/);
+  } finally {f.manager.close();}
+});
+
+test("C3 restart probe drift and uncertain actuator results never release or repeat",async()=>{
+  const {CutoverStateStore}=await import("./cutover-state.js");
+  for(const failure of ["missing-approval","revoke","handoff","target-change","marker-fail","actuator-throws","callback-intent"]){
+    const f=cutoverFixture();const originalMarker=CutoverStateStore.prototype.recordRestartScheduled;let calls=0;
+    try {
+      const start=f.manager.startCutover(f.input,f.context);const id=start.receipt!.cutoverId as string;
+      f.options.approveCutoverLifecycle=()=>true;f.manager.drainCutover(id,f.input.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),f.context);
+      const ready={verifiedBy:"fixture",verifiedAt:new Date().toISOString()};
+      const actuator={actuator:"launchd-self" as const,serviceLabel:"fixture",launchdTarget:"gui/1/fixture",schedule:()=>{calls++;if(failure==="actuator-throws")throw new Error("uncertain actuator response");return {scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:"fixture",launchdTarget:"gui/1/fixture"};}};
+      if(failure==="missing-approval") f.options.approveCutoverLifecycle=undefined;
+      if(failure==="marker-fail") CutoverStateStore.prototype.recordRestartScheduled=()=>{throw new Error("marker write failed");};
+      if(failure==="callback-intent") {
+        const verify=f.options.verifyGrantEvidence!;let attacked=false;
+        f.options.verifyGrantEvidence=(g,o)=>{if(!attacked&&new CutoverStateStore(f.config.stateDir).get()?.restartRequest?.restartScheduledAt){attacked=true;f.manager.store.finish(start.operationId,{status:"failed",retrySafe:false});}return verify(g,o);};
+      }
+      await assert.rejects(f.manager.restartCutover(id,f.input.currentIdentity,ready,async()=>{
+        if(failure==="handoff") {
+          const recipient={};const owner=f.options.resolveOwnerContext!;f.options.resolveOwnerContext=c=>c===recipient?{ownerThread:"successor"}:owner(c);
+          const pin=f.ownership.get(f.leaseId)!;
+          f.ownership.handoff(f.context,f.leaseId,pin.version,recipient,{resource:pin.resource,scope:pin.scope,baseRevision:pin.baseRevision,candidateRevision:"candidate",liveOperation:pin.operation,liveHandle:start.operationId,checkpoint:"pending-probe",grantDependency:pin.grant,grantVersion:pin.grantVersion,recipientGrant:pin.grant,recipientGrantVersion:pin.grantVersion,forbiddenOverlap:[pin.resource],tests:["drain"],evidence:["bound-file"],remainingGap:"restart",nextGate:"reconcile",expiresAt:pin.expiresAt});
+        }
+        if(failure==="revoke")f.revoke();if(failure==="target-change")actuator.launchdTarget="gui/1/changed";
+        return {buildReady:true,detail:"fixture"};
+      },actuator,f.context));
+      assert.equal(calls,failure==="actuator-throws"?1:0);assert.equal(f.ownership.get(f.leaseId)?.operationHandle,start.operationId);
+      if(failure==="missing-approval")assert.equal(new CutoverStateStore(f.config.stateDir).get()?.restartRequest,undefined);
+      if(["marker-fail","actuator-throws","callback-intent"].includes(failure)){
+        const replay=await f.manager.restartCutover(id,f.input.currentIdentity,ready,async()=>{throw new Error("must not reprobe");},actuator,f.context);
+        assert.equal(replay.outcome,"outcome_unknown");assert.equal(calls,failure==="actuator-throws"?1:0);
+      }
+    } finally {CutoverStateStore.prototype.recordRestartScheduled=originalMarker;f.manager.close();}
+  }
+});

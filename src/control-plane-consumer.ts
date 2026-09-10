@@ -1,4 +1,4 @@
-import type { CutoverServerIdentity } from "./cutover-state.js";
+import type { CutoverServerIdentity, BuildReadyReceipt } from "./cutover-state.js";
 import { projectCompletion, type CompletionSelection } from "./current-completion-matrix.js";
 import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type ControlPlaneOwnershipOptions, type ReconciliationEvidence, type HandoffInput } from "./control-plane-ownership.js";
 
@@ -20,7 +20,7 @@ export interface DependencyReconciliationEvidence extends ReconciliationEvidence
   exitCode: number;
   frozenInputsUnchanged: boolean;
 }
-export interface CutoverLifecycleAction { action: "drain" | "finish"; cutoverId: string; currentIdentity: Readonly<CutoverServerIdentity>; preferredPair?: Readonly<{workspaceId:string;agentId:string}>; }
+export interface CutoverLifecycleAction { action: "drain" | "finish" | "restart"; cutoverId: string; currentIdentity: Readonly<CutoverServerIdentity>; preferredPair?: Readonly<{workspaceId:string;agentId:string}>; buildReady?:Readonly<BuildReadyReceipt>; actuator?:Readonly<{actuator:"launchd-self";serviceLabel:string;launchdTarget:string}>; }
 export interface ControlPlaneConsumerOptions extends ControlPlaneOwnershipOptions {
   approveCutoverLifecycle?(context: unknown, subject: Readonly<EffectSubject>, action: Readonly<CutoverLifecycleAction>): boolean;
   readCompletionContract?(context: unknown, selection: Readonly<CompletionSelection>): unknown;
@@ -55,7 +55,10 @@ export class ControlPlaneConsumer {
 
   authorizeCutoverLifecycle(context: unknown, subject: EffectSubject, action: CutoverLifecycleAction, requirePin=true) {
     const binding=this.authorize(context,subject);
-    if(binding.role!=="controller" || this.options.approveCutoverLifecycle?.(context,Object.freeze({...subject}),Object.freeze({...action,currentIdentity:Object.freeze({...action.currentIdentity}),...(action.preferredPair?{preferredPair:Object.freeze({...action.preferredPair})}:{})}))!==true) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","explicit cutover lifecycle approval required");
+    const approvedAction=JSON.parse(JSON.stringify(action)) as CutoverLifecycleAction;
+    for(const value of Object.values(approvedAction)) if(value&&typeof value==="object") Object.freeze(value);
+    Object.freeze(approvedAction);
+    if(binding.role!=="controller" || this.options.approveCutoverLifecycle?.(context,Object.freeze({...subject}),approvedAction)!==true) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","explicit cutover lifecycle approval required");
     if(requirePin) this.assertPinned(context,subject,binding,binding.leaseVersion);
     else {
       if(this.ownership.get(binding.leaseId)?.operationHandle!==undefined) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal replay cannot touch a newer pin");
