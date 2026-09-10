@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, chmod, realpath, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -9,6 +9,7 @@ import { promisify } from "node:util";
 import type { ControlPlaneOwnershipStore } from "./control-plane-ownership.js";
 import type { ControlPlaneConsumerOptions } from "./control-plane-consumer.js";
 import { loadConfig } from "./config.js";
+import { canonicalizePath } from "./roots.js";
 import {
   DurableOperationError,
   DurableOperationManager,
@@ -196,7 +197,7 @@ test("workspace_clone rejects destinations outside allowed roots and conflicting
 });
 
 async function dependencyFixtureManager(config: ReturnType<typeof loadConfig>, runner: CommandRunner, path: string) {
-  const root=await realpath(path);
+  const root=canonicalizePath(path);
   await git(root,"init");
   await git(root,"-c","user.name=Fixture","-c","user.email=fixture@example.test","commit","--allow-empty","-m","fixture");
   const base=await git(root,"rev-parse","HEAD");
@@ -215,7 +216,7 @@ async function dependencyFixtureManager(config: ReturnType<typeof loadConfig>, r
   ownership=manager.store.createOwnershipStore(options);
   ownership.putGrantEvidence(context,grant,0);
   leaseId=ownership.acquire(context,{repositoryKey:grant.repository,resourceKind:"workspace",resourceId:root,resource:root,scope:[root],operation:"dependency_sync",baseRevision:base,expiresAt:new Date(Date.now()+60000).toISOString(),idempotencyKey:"fixture",grant}).leaseId;
-  return {manager,context};
+  return {manager,context,ownership,leaseId};
 }
 
 test("workspace_clone passes literal native Git paths containing spaces and shell metacharacters", async () => {
@@ -266,6 +267,40 @@ test("dependency_sync frozen recipe succeeds without changing manifest or lock i
       assert.equal(result.status, "succeeded");
       assert.equal(await readFile(join(project, "package.json"), "utf8"), beforeManifest);
       assert.equal(await readFile(join(project, "package-lock.json"), "utf8"), beforeLock);
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("dependency_sync rejects a changed request before creating an operation or pin", async () => {
+  const f = await fixture();
+  try {
+    const project = join(f.root, "project");
+    await mkdir(project);
+    await writeFile(join(project, "package.json"), '{"name":"fixture"}\n');
+    await writeFile(join(project, "package-lock.json"), '{"lockfileVersion":3}\n');
+    let calls = 0;
+    const runner: CommandRunner = async () => {
+      calls += 1;
+      return { exitCode: 0, stdout: "", stderr: "" };
+    };
+    const { manager, context, ownership, leaseId } = await dependencyFixtureManager(f.config, runner, project);
+    try {
+      const before = ownership.get(leaseId);
+      const attemptKey = "deps-wrong-request";
+      await assert.rejects(manager.dependencySync({
+        attemptKey,
+        workspaceId: "wrong-workspace",
+        workspaceRoot: project,
+        recipe: "npm_ci",
+      }, context), (error: unknown) =>
+        error instanceof Error && "code" in error && error.code === "AUTHORITY_REQUIRED");
+      assert.equal(calls, 0);
+      assert.equal(manager.store.getByAttempt(canonicalizePath(project), attemptKey), undefined);
+      assert.deepEqual(ownership.get(leaseId), before);
     } finally {
       manager.close();
     }
