@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import test from "node:test";
 import {
@@ -62,7 +62,10 @@ function dependencyBridgeFixture(version = "1.0.0") {
     "import source from './source-value.mjs'; import dependency from 'fixture-package'; console.log(`${source}:${dependency}`);\n",
   );
   const verifierLoader = join(root, "node_modules", ".bin", "verifier-loader.mjs");
-  const verifierExecutable = join(root, "node_modules", ".bin", "tsx-fixture.mjs");
+  const verifierExecutable = process.platform === "win32"
+    ? join(root, "node.exe")
+    : join(root, "node_modules", ".bin", "tsx-fixture.mjs");
+  if (process.platform === "win32") copyFileSync(process.execPath, verifierExecutable);
   writeFileSync(
     verifierLoader,
     [
@@ -72,16 +75,18 @@ function dependencyBridgeFixture(version = "1.0.0") {
       "} });",
     ].join("\n"),
   );
-  writeFileSync(
-    verifierExecutable,
-    [
-      "#!/usr/bin/env node",
-      'import { spawnSync } from "node:child_process";',
-      `const child = spawnSync(process.execPath, ["--import", ${JSON.stringify(pathToFileURL(verifierLoader).href)}, ...process.argv.slice(2)], { env: process.env, stdio: "inherit" });`,
-      "process.exit(child.status ?? 1);",
-    ].join("\n"),
-    { mode: 0o755 },
-  );
+  if (process.platform !== "win32") {
+    writeFileSync(
+      verifierExecutable,
+      [
+        "#!/usr/bin/env node",
+        'import { spawnSync } from "node:child_process";',
+        `const child = spawnSync(process.execPath, ["--import", ${JSON.stringify(pathToFileURL(verifierLoader).href)}, ...process.argv.slice(2)], { env: process.env, stdio: "inherit" });`,
+        "process.exit(child.status ?? 1);",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+  }
   writeFileSync(join(workspace, "source-value.mjs"), "export default 'worktree-source';\n");
   writeFileSync(
     join(workspace, "probe.mjs"),
@@ -103,6 +108,9 @@ function dependencyBridgeFixture(version = "1.0.0") {
       },
     } satisfies ToolchainSpec,
     verifierExecutable,
+    verifierArgs: process.platform === "win32"
+      ? ["--import", pathToFileURL(verifierLoader).href]
+      : [],
     clean() {
       rmSync(root, { recursive: true, force: true });
       rmSync(workspace, { recursive: true, force: true });
@@ -163,7 +171,7 @@ test("dependency bridge admits a differing source lock when selected Candidate p
     assert.equal(environment.EXISTING, "kept");
     assert.equal(environment.NODE_PATH, realpathSync(join(fixture.root, "node_modules")));
     assert.equal(
-      environment.PATH?.split(":")[0],
+      environment.PATH?.split(delimiter)[0],
       realpathSync(join(fixture.root, "node_modules", ".bin")),
     );
     assert.equal(environment.DEVSPACE_DEPENDENCY_ROOT, realpathSync(fixture.root));
@@ -279,7 +287,7 @@ test("workspace verifier runs worktree source with dependencies from the verifie
       toolchains: [spec],
       toolchainId: spec.id,
       verifier: "tsx",
-      args: [join(fixture.workspace, "probe.mjs")],
+      args: [...fixture.verifierArgs, join(fixture.workspace, "probe.mjs")],
       cwd: fixture.workspace,
     });
     assert.equal(result.exitCode, 0, result.stderr);
@@ -377,19 +385,28 @@ test("runToolchainVerifier runs allowlisted executable with bounded cwd and stru
   try {
     const bin = join(root, ".venv", "bin");
     mkdirSync(bin, { recursive: true });
-    const verifierPath = join(bin, "pytest");
-    writeFileSync(
-      verifierPath,
-      [
-        "#!/bin/sh",
-        'echo "cwd=$(pwd)"',
-        "echo \"args=$*\"",
-        `if [ "$1" = "fail" ]; then exit 3; fi`,
-        "exit 0",
-      ].join("\n"),
-      { mode: 0o755 },
-    );
-    chmodSync(verifierPath, 0o755);
+    const verifierPath = process.platform === "win32" ? join(root, "node.exe") : join(bin, "pytest");
+    const verifierArgs = process.platform === "win32" ? [join(root, "pytest-fixture.mjs")] : [];
+    if (process.platform === "win32") {
+      copyFileSync(process.execPath, verifierPath);
+      writeFileSync(
+        verifierArgs[0],
+        'import process from "node:process"; console.log(`cwd=${process.cwd()}`); console.log(`args=${process.argv.slice(2).join(" ")}`); if (process.argv[2] === "fail") process.exit(3);',
+      );
+    } else {
+      writeFileSync(
+        verifierPath,
+        [
+          "#!/bin/sh",
+          'echo "cwd=$(pwd)"',
+          "echo \"args=$*\"",
+          `if [ "$1" = "fail" ]; then exit 3; fi`,
+          "exit 0",
+        ].join("\n"),
+        { mode: 0o755 },
+      );
+      chmodSync(verifierPath, 0o755);
+    }
 
     const toolchains: ToolchainSpec[] = [
       { id: "nexus-python", root, verifiers: { pytest: verifierPath } },
@@ -399,7 +416,7 @@ test("runToolchainVerifier runs allowlisted executable with bounded cwd and stru
       toolchains,
       toolchainId: "nexus-python",
       verifier: "pytest",
-      args: ["--tb=short", "tests"],
+      args: [...verifierArgs, "--tb=short", "tests"],
       cwd: workRoot,
       timeoutMs: 5000,
     });
@@ -412,7 +429,7 @@ test("runToolchainVerifier runs allowlisted executable with bounded cwd and stru
       toolchains,
       toolchainId: "nexus-python",
       verifier: "pytest",
-      args: ["fail"],
+      args: [...verifierArgs, "fail"],
       cwd: workRoot,
       timeoutMs: 5000,
     });
@@ -423,14 +440,80 @@ test("runToolchainVerifier runs allowlisted executable with bounded cwd and stru
   }
 });
 
+test("runToolchainVerifier preserves literal argv and separates launch failure from verifier exit", async () => {
+  const root = mkdtempSync(join(tmpdir(), "devspace-toolchain-argv-"));
+  const cwd = mkdtempSync(join(tmpdir(), "devspace-toolchain-argv-cwd-"));
+  try {
+    const executable = join(root, process.platform === "win32" ? "node.exe" : "node");
+    const script = join(root, "argv-verifier.mjs");
+    const expectedArgs = ["value with spaces", "literal;$(touch SHOULD_NOT_EXIST)", "quote'\"value"];
+    copyFileSync(process.execPath, executable);
+    chmodSync(executable, 0o755);
+    writeFileSync(script, `
+      const [mode, ...args] = process.argv.slice(2);
+      const expected = ${JSON.stringify(expectedArgs)};
+      if (mode === "overflow") {
+        process.stdout.write("x".repeat(4 * 1024 * 1024));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        process.exit(0);
+      }
+      if (JSON.stringify(args) !== JSON.stringify(expected)) process.exit(17);
+      process.exit(mode === "fail" ? 7 : 0);
+    `);
+    const toolchains: ToolchainSpec[] = [{ id: "native", root, verifiers: { probe: executable } }];
+    const args = [script, "ok", ...expectedArgs];
+    const success = await runToolchainVerifier({ toolchains, toolchainId: "native", verifier: "probe", args, cwd });
+    assert.equal(success.exitCode, 0, `${success.stderr}\n${success.stdout}`);
+    assert.equal(success.launchError, undefined);
+    const failed = await runToolchainVerifier({
+      toolchains,
+      toolchainId: "native",
+      verifier: "probe",
+      args: [script, "fail", ...args.slice(2)],
+      cwd,
+    });
+    assert.equal(failed.exitCode, 7);
+    assert.equal(failed.launchError, undefined, "a real verifier exit must not be labeled launch failure");
+    const overflow = await runToolchainVerifier({
+      toolchains,
+      toolchainId: "native",
+      verifier: "probe",
+      args: [script, "overflow", ...expectedArgs],
+      cwd,
+    });
+    assert.equal(overflow.exitCode, null);
+    assert.equal(overflow.launchError, undefined, "post-launch maxBuffer failure must not be labeled launch failure");
+    const unavailable = join(root, "unavailable-verifier");
+    writeFileSync(unavailable, "#!/bin/sh\nexit 0\n", { mode: 0o644 });
+    const missing = await runToolchainVerifier({
+      toolchains: [{ id: "native", root, verifiers: { probe: unavailable } }],
+      toolchainId: "native",
+      verifier: "probe",
+      args: [],
+      cwd,
+    });
+    assert.equal(missing.exitCode, null);
+    assert.equal(missing.launchError?.code, "TOOLCHAIN_LAUNCH_FAILED");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("runToolchainVerifier enforces a bounded timeout", async () => {
   const root = mkdtempSync(join(tmpdir(), "devspace-toolchain-test-"));
   try {
     const bin = join(root, ".venv", "bin");
     mkdirSync(bin, { recursive: true });
-    const verifierPath = join(bin, "slow");
-    writeFileSync(verifierPath, "#!/bin/sh\nsleep 30\nexit 0\n", { mode: 0o755 });
-    chmodSync(verifierPath, 0o755);
+    const verifierPath = process.platform === "win32" ? join(root, "node.exe") : join(bin, "slow");
+    const verifierArgs = process.platform === "win32" ? [join(root, "slow-fixture.mjs")] : [];
+    if (process.platform === "win32") {
+      copyFileSync(process.execPath, verifierPath);
+      writeFileSync(verifierArgs[0], "setTimeout(() => process.exit(0), 30_000);\n");
+    } else {
+      writeFileSync(verifierPath, "#!/bin/sh\nsleep 30\nexit 0\n", { mode: 0o755 });
+      chmodSync(verifierPath, 0o755);
+    }
 
     const toolchains: ToolchainSpec[] = [{ id: "t", root, verifiers: { slow: verifierPath } }];
     const startedAt = Date.now();
@@ -438,7 +521,7 @@ test("runToolchainVerifier enforces a bounded timeout", async () => {
       toolchains,
       toolchainId: "t",
       verifier: "slow",
-      args: [],
+      args: verifierArgs,
       cwd: root,
       timeoutMs: 200,
     });

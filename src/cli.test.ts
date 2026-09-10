@@ -17,6 +17,53 @@ const require = createRequire(import.meta.url);
 const tsxLoader = pathToFileURL(require.resolve("tsx")).href;
 const cliPath = fileURLToPath(new URL("./cli.ts", import.meta.url));
 
+function compileWindowsAgyExecutable(executable: string): void {
+  const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT;
+  const compiler = systemRoot
+    ? join(systemRoot, "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe")
+    : "";
+  if (!compiler || !existsSync(compiler)) {
+    throw new Error(`Windows native Agy fixture compiler is unavailable: ${compiler || "SystemRoot"}`);
+  }
+  const source = `${executable}.cs`;
+  writeFileSync(source, String.raw`using System;
+using System.Diagnostics;
+using System.IO;
+
+class Program {
+  static void Main() {
+    if (Environment.GetEnvironmentVariable("FORCE_MALFORMED") == "1") {
+      Console.Write("{malformed");
+      return;
+    }
+    var descendantPath = Environment.GetEnvironmentVariable("DESCENDANT_PID_FILE");
+    if (!String.IsNullOrEmpty(descendantPath)) {
+      var node = Environment.GetEnvironmentVariable("NODE_EXEC_PATH");
+      var child = Process.Start(new ProcessStartInfo {
+        FileName = node,
+        Arguments = "-e \"setTimeout(() => {}, 3000)\"",
+        UseShellExecute = false,
+        RedirectStandardInput = true,
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
+        CreateNoWindow = true,
+      });
+      child.StandardInput.Close();
+      File.WriteAllText(descendantPath, child.Id.ToString());
+    }
+    var response = "{\"status\":\"SUCCESS\",\"conversation_id\":\"mock-session\",\"response\":\"mock response-"
+      + new String('x', 100000) + "\"}";
+    Console.Write(response);
+  }
+}
+`);
+  try {
+    execFileSync(compiler, ["/nologo", "/target:exe", `/out:${executable}`, source], { stdio: "ignore" });
+  } finally {
+    rmSync(source, { force: true });
+  }
+}
+
 const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
   version: string;
 };
@@ -28,6 +75,22 @@ for (const flag of ["-v", "--version"]) {
   }).trim();
 
   assert.equal(output, packageJson.version);
+}
+
+for (const args of [
+  ["cutover", "observe", "--cutover-id", "c", "--workspace-id", "w"],
+  ["cutover", "observe", "--cutover-id", "c", "--workspace-id", "w", "--agent-id", "a", "--server-url", "https://foreign.invalid/mcp"],
+  ["cutover", "observe", "--cutover-id", "", "--workspace-id", "w", "--agent-id", "a"],
+  ["cutover", "observe", "--cutover-id", "c", "--workspace-id", "", "--agent-id", "a"],
+  ["cutover", "observe", "--cutover-id", "c", "--workspace-id", "w", "--agent-id", ""],
+]) {
+  assert.throws(
+    () => execFileSync("node", ["--import", "tsx", "src/cli.ts", ...args], { encoding: "utf8", env: { ...process.env, DEVSPACE_CONFIG_DIR: "/tmp/devspace-cli-invalid-binding-test" } }),
+    (error: unknown) => {
+      const detail = error as { stderr?: string; status?: number };
+      return detail.status !== 0 && /Usage:|Unknown cutover observe flag|requires a value/.test(detail.stderr ?? "");
+    },
+  );
 }
 
 const root = mkdtempSync(join(tmpdir(), "devspace-cli-agents-test-"));
@@ -57,9 +120,12 @@ try {
     join(configDir, "agents", "agy-reviewer.md"),
     ["---", "name: agy-reviewer", "description: Test Agy worker.", "provider: agy", "model: mock", "---", "", "Review only.", ""].join("\n"),
   );
-  const mockAgyPath = join(root, "mock-agy.js");
+  const mockAgyPath = join(root, process.platform === "win32" ? "mock-agy.exe" : "mock-agy.js");
   const descendantPidPath = join(root, "agy-descendant.pid");
-  writeFileSync(mockAgyPath, `#!/usr/bin/env node
+  if (process.platform === "win32") {
+    compileWindowsAgyExecutable(mockAgyPath);
+  } else {
+    writeFileSync(mockAgyPath, `#!/usr/bin/env node
 const { spawn } = require("node:child_process");
 const prompt = process.argv[process.argv.indexOf("--print") + 1];
 if (process.env.FORCE_MALFORMED) { console.log("{malformed"); process.exit(0); }
@@ -79,8 +145,16 @@ function writeNextChunk() {
 }
 writeNextChunk();
 `, { mode: 0o755 });
+  }
   const store = new LocalAgentStore(stateDir);
-  const current = store.update(
+  let current: ReturnType<LocalAgentStore["update"]>;
+  let other: ReturnType<LocalAgentStore["update"]>;
+  let successWorker: ReturnType<LocalAgentStore["create"]>;
+  let failureWorker: ReturnType<LocalAgentStore["create"]>;
+  const successToken = "success-worker-token";
+  const failureToken = "failure-worker-token";
+  try {
+    current = store.update(
     store.create({
       workspaceId: "ws_current",
       workspaceRoot: projectRoot,
@@ -90,8 +164,8 @@ writeNextChunk();
       effort: "high",
     }).id,
     { status: "idle", latestResponse: "Review complete.", providerSessionId: "provider_secret" },
-  );
-  const other = store.update(
+    );
+    other = store.update(
     store.create({
       workspaceId: "ws_other",
       workspaceRoot: projectRoot,
@@ -99,14 +173,14 @@ writeNextChunk();
       provider: "codex",
     }).id,
     { status: "running", workerPid: process.pid, workerToken: "foreign-token" },
-  );
-  const successWorker = store.create({ workspaceId: "ws_current", workspaceRoot: projectRoot, profileName: "agy-reviewer", provider: "agy", model: "mock" });
-  const successToken = "success-worker-token";
-  store.prepareWorker(successWorker.id, successToken);
-  const failureWorker = store.create({ workspaceId: "ws_current", workspaceRoot: projectRoot, profileName: "agy-reviewer", provider: "agy", model: "mock" });
-  const failureToken = "failure-worker-token";
-  store.prepareWorker(failureWorker.id, failureToken);
-  store.close();
+    );
+    successWorker = store.create({ workspaceId: "ws_current", workspaceRoot: projectRoot, profileName: "agy-reviewer", provider: "agy", model: "mock" });
+    store.prepareWorker(successWorker.id, successToken);
+    failureWorker = store.create({ workspaceId: "ws_current", workspaceRoot: projectRoot, profileName: "agy-reviewer", provider: "agy", model: "mock" });
+    store.prepareWorker(failureWorker.id, failureToken);
+  } finally {
+    store.close();
+  }
 
   const daemonSocket = localAgentDaemonPaths(stateDir).endpoint;
   const daemonRequests: Array<{ method: string; params?: Record<string, unknown> }> = [];
@@ -175,6 +249,7 @@ writeNextChunk();
       DEVSPACE_SUBAGENTS: "1",
       DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
       AGY_COMMAND: mockAgyPath,
+      NODE_EXEC_PATH: process.execPath,
       DESCENDANT_PID_FILE: descendantPidPath,
     };
     const runWorker = async (worker: typeof successWorker, token: string, prompt: string) => {
@@ -200,24 +275,30 @@ writeNextChunk();
     };
     await runWorker(successWorker, successToken, "success");
     const successStore = new LocalAgentStore(stateDir);
-    const completed = successStore.getById(successWorker.id)!;
-    assert.equal(completed.status, "idle");
-    assert.equal(completed.terminalReason, "completed");
-    assert.equal(completed.providerSessionId, "mock-session");
-    assert.equal(completed.latestResponse, "mock response-" + "x".repeat(100000));
-    assert.equal(completed.workerPid, undefined);
-    assert.equal(completed.workerToken, undefined);
-    successStore.close();
+    try {
+      const completed = successStore.getById(successWorker.id)!;
+      assert.equal(completed.status, "idle");
+      assert.equal(completed.terminalReason, "completed");
+      assert.equal(completed.providerSessionId, "mock-session");
+      assert.equal(completed.latestResponse, "mock response-" + "x".repeat(100000));
+      assert.equal(completed.workerPid, undefined);
+      assert.equal(completed.workerToken, undefined);
+    } finally {
+      successStore.close();
+    }
 
     await runWorker(failureWorker, failureToken, "failure");
     const failureStore = new LocalAgentStore(stateDir);
-    const failed = failureStore.getById(failureWorker.id)!;
-    assert.equal(failed.status, "error");
-    assert.equal(failed.terminalReason, "provider_error");
-    assert.match(failed.error ?? "", /Failed to parse Agy JSON output/);
-    assert.equal(failed.workerPid, undefined);
-    assert.equal(failed.workerToken, undefined);
-    failureStore.close();
+    try {
+      const failed = failureStore.getById(failureWorker.id)!;
+      assert.equal(failed.status, "error");
+      assert.equal(failed.terminalReason, "provider_error");
+      assert.match(failed.error ?? "", /Failed to parse Agy JSON output/);
+      assert.equal(failed.workerPid, undefined);
+      assert.equal(failed.workerToken, undefined);
+    } finally {
+      failureStore.close();
+    }
     const descendantPid = Number(readFileSync(descendantPidPath, "utf8"));
     if (Number.isInteger(descendantPid) && descendantPid > 0) {
       try { process.kill(descendantPid, "SIGTERM"); } catch {}

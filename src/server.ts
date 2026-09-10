@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { access, realpath } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
@@ -58,16 +59,30 @@ import {
 import {
   CutoverStateError,
   CutoverStateStore,
+  CUTOVER_BINDING_REPAIR_SCHEMA,
+  CUTOVER_BINDING_REPAIR_REASON,
+  type CutoverBindingRepairReceipt,
   type CutoverDrainEvidence,
+  type DurableCutoverRecord,
   type ExpectedCutoverIdentity,
 } from "./cutover-state.js";
+
 import {
   CutoverBlockedError,
   McpCutoverController,
+  compareServerIdentity,
   registerCutoverHttpRoutes,
+  type CutoverMode,
   type DurableReconciliationWitness,
 } from "./mcp-cutover.js";
-import { CutoverBuildNotReadyError, probeBuildReady, type BuildReadyProbeResult } from "./cutover-build-ready.js";
+import type { LocalAgentRecord } from "./local-agent-store.js";
+import {
+  CutoverBuildNotReadyError,
+  CutoverCapabilityManifestDomainMismatchError,
+  probeBuildReady,
+  probeTargetPackage,
+  type BuildReadyProbeResult,
+} from "./cutover-build-ready.js";
 import { CutoverOrchestrator, type OrchestrationOutcome } from "./cutover-orchestration.js";
 import {
   createLaunchdSelfRestartActuator,
@@ -1353,7 +1368,26 @@ export interface CutoverMcpControlContext {
   inspectWorkspace?: (workspaceId: string) => { session?: WorkspaceSession; loaded: boolean };
   listWorkspaceSessions?: () => WorkspaceSession[];
   advance?: () => Promise<OrchestrationOutcome>;
+  enumerateReconciliation?: () => Promise<DurableReconciliationWitness>;
+  executeObservedReplacementRecovery?: (input: {
+    cutoverId: string;
+    expectedNewIdentity?: ExpectedCutoverIdentity;
+    preferredPair?: { workspaceId?: string; agentId?: string };
+    expiresAt?: string;
+  }) => Promise<{
+    terminal: DurableCutoverRecord;
+    successor?: DurableCutoverRecord;
+    newlyRecovered: boolean;
+    mode: CutoverMode;
+  }>;
+  canRepairBinding?: (cutoverId: string) => boolean;
+  executeBindingRepair?: (input: {
+    cutoverId: string;
+    workspaceId: string;
+    agentId: string;
+  }) => Promise<DurableCutoverRecord>;
 }
+
 
 function registerCutoverMcpTools(
   server: McpServer,
@@ -1408,6 +1442,19 @@ function registerCutoverMcpTools(
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
     async ({ expectedSourceCommit, expectedBuildId, expectedCapabilityManifestSha256, expiresAt }) => {
+      if (expectedCapabilityManifestSha256 && control.probeBuildReady) {
+        const probe = await control.probeBuildReady({
+          sourceCommit: expectedSourceCommit,
+          buildId: expectedBuildId,
+          capabilityManifestSha256: expectedCapabilityManifestSha256,
+        });
+        if (probe.domainMismatch) {
+          throw new CutoverCapabilityManifestDomainMismatchError(
+            probe.detail ??
+              `[CAPABILITY_MANIFEST_DIGEST_DOMAIN_MISMATCH] expected capabilityManifestSha256 ${expectedCapabilityManifestSha256} matches target package build_manifest_sha256; domain confusion detected.`,
+          );
+        }
+      }
       const capabilityManifestSha256 = expectedCapabilityManifestSha256
         ?? control.controller.currentIdentity.capabilityManifestSha256;
       const record = control.controller.begin(
@@ -1559,7 +1606,7 @@ function registerCutoverMcpTools(
       },
       outputSchema: {
         terminal: cutoverRecordSchema,
-        successor: cutoverRecordSchema,
+        successor: cutoverRecordSchema.optional(),
         newlyRecovered: z.boolean(),
         mode: modeSchema,
       },
@@ -1567,6 +1614,54 @@ function registerCutoverMcpTools(
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ cutoverId, expectedSourceCommit, expectedBuildId, expectedCapabilityManifestSha256, expiresAt }) => {
+      if (expectedCapabilityManifestSha256 && control.probeBuildReady) {
+        const probe = await control.probeBuildReady({
+          sourceCommit: expectedSourceCommit,
+          buildId: expectedBuildId,
+          capabilityManifestSha256: expectedCapabilityManifestSha256,
+        });
+        if (probe.domainMismatch) {
+          throw new CutoverCapabilityManifestDomainMismatchError(
+            probe.detail ??
+              `[CAPABILITY_MANIFEST_DIGEST_DOMAIN_MISMATCH] expected capabilityManifestSha256 ${expectedCapabilityManifestSha256} matches target package build_manifest_sha256; domain confusion detected.`,
+          );
+        }
+      }
+      const activeRecord = control.controller.record();
+      if (
+        activeRecord &&
+        activeRecord.cutoverId === cutoverId &&
+        (activeRecord.phase === "closed" || (activeRecord.phase === "prepared" && !activeRecord.drainEvidence)) &&
+        control.executeObservedReplacementRecovery
+      ) {
+        const recovered = await control.executeObservedReplacementRecovery({
+          cutoverId,
+          expectedNewIdentity: {
+            sourceCommit: expectedSourceCommit,
+            buildId: expectedBuildId,
+            ...(expectedCapabilityManifestSha256 ? { capabilityManifestSha256: expectedCapabilityManifestSha256 } : {}),
+          },
+          ...(expiresAt ? { expiresAt } : {}),
+        });
+        const mode = recovered.mode;
+        const summaryText = recovered.successor
+          ? `Superseded stale cutover ${recovered.terminal.cutoverId} -> successor ${recovered.successor.cutoverId}; mode=${mode}.`
+          : recovered.newlyRecovered
+            ? `Recovered observed replacement cutover ${recovered.terminal.cutoverId} without pre-restart drain; mode=${mode}.`
+            : `Cutover ${recovered.terminal.cutoverId} is already closed; mode=${mode}.`;
+        return {
+          content: [textBlock(summaryText)],
+          structuredContent: {
+            terminal: recovered.terminal as unknown as Record<string, unknown>,
+            ...(recovered.successor ? { successor: recovered.successor as unknown as Record<string, unknown> } : {}),
+            newlyRecovered: recovered.newlyRecovered,
+            mode,
+          },
+        };
+      }
+      // Without the bound inventory executor, observed recovery is denied by
+      // the controller's missing-witness guard. Stale-target supersession still
+      // follows its existing eligibility checks.
       const recovered = control.controller.recoverCutover({
         cutoverId,
         expectedNewIdentity: {
@@ -1577,13 +1672,14 @@ function registerCutoverMcpTools(
         ...(expiresAt ? { expiresAt } : {}),
       });
       const mode = control.controller.mode();
+      const summaryText = recovered.successor
+        ? `Superseded stale cutover ${recovered.terminal.cutoverId} -> successor ${recovered.successor.cutoverId}; mode=${mode}.`
+        : `Recovered observed replacement cutover ${recovered.terminal.cutoverId} without pre-restart drain; mode=${mode}.`;
       return {
-        content: [textBlock(
-          `Superseded stale cutover ${recovered.terminal.cutoverId} -> successor ${recovered.successor.cutoverId}; mode=${mode}.`,
-        )],
+        content: [textBlock(summaryText)],
         structuredContent: {
           terminal: recovered.terminal as unknown as Record<string, unknown>,
-          successor: recovered.successor as unknown as Record<string, unknown>,
+          ...(recovered.successor ? { successor: recovered.successor as unknown as Record<string, unknown> } : {}),
           newlyRecovered: recovered.newlyRecovered,
           mode,
         },
@@ -1611,17 +1707,122 @@ function registerCutoverMcpTools(
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ cutoverId, workspaceId, agentId }) => {
-      const record = await control.controller.finish(
-        cutoverId,
-        () => control.reconcileDurableState({ workspaceId, agentId }),
-      );
+      const activeRecord = control.controller.record();
+      if (activeRecord && activeRecord.phase === "closed" && activeRecord.cutoverId === cutoverId) {
+        if (activeRecord.observedReplacement && control.executeObservedReplacementRecovery) {
+          const replay = await control.executeObservedReplacementRecovery({
+            cutoverId,
+            preferredPair: { workspaceId, agentId },
+          });
+          return {
+            content: [textBlock(`Finished cutover ${cutoverId}; mode=${replay.mode}.`)],
+            structuredContent: { cutover: replay.terminal as unknown as Record<string, unknown>, mode: replay.mode },
+          };
+        }
+        if (activeRecord.observedReplacement) {
+          throw new CutoverStateError("[RECOVERY_BINDING_MISMATCH] Observed recovery replay requires replacement identity verification.");
+        }
+        const mode = control.controller.mode();
+        return {
+          content: [textBlock(`Finished cutover ${cutoverId}; mode=${mode}.`)],
+          structuredContent: { cutover: activeRecord as unknown as Record<string, unknown>, mode },
+        };
+      }
+      if (
+        activeRecord &&
+        activeRecord.cutoverId === cutoverId &&
+        activeRecord.phase === "prepared" &&
+        !activeRecord.drainEvidence &&
+        control.executeObservedReplacementRecovery
+      ) {
+        const comparison = compareServerIdentity(activeRecord, control.controller.currentIdentity);
+        if (!comparison.sourceMatches || !comparison.buildMatches || !comparison.capabilityManifestMatches) {
+          throw new CutoverStateError(
+            "[RECOVERY_BINDING_MISMATCH] Prepared cutover finish requires the current replacement identity to match the bound target.",
+          );
+        }
+        const recovered = await control.executeObservedReplacementRecovery({
+          cutoverId,
+          preferredPair: { workspaceId, agentId },
+        });
+        const mode = recovered.mode;
+        return {
+          content: [textBlock(`Finished cutover ${cutoverId}; mode=${mode}.`)],
+          structuredContent: { cutover: recovered.terminal as unknown as Record<string, unknown>, mode },
+        };
+      }
+      let record: DurableCutoverRecord;
+      if (
+        activeRecord &&
+        activeRecord.cutoverId === cutoverId &&
+        activeRecord.phase === "prepared" &&
+        !activeRecord.drainEvidence
+      ) {
+        throw new CutoverStateError("[RECOVERY_BINDING_MISMATCH] Observed recovery requires fresh generation-bound inventory collection.");
+      } else {
+        const comparison = activeRecord ? compareServerIdentity(activeRecord, control.controller.currentIdentity) : undefined;
+        if (
+          activeRecord &&
+          activeRecord.cutoverId === cutoverId &&
+          activeRecord.phase === "drained" &&
+          activeRecord.restartRequest?.restartScheduledAt &&
+          comparison &&
+          comparison.serverInstanceChanged &&
+          comparison.sourceMatches &&
+          comparison.buildMatches &&
+          !comparison.capabilityManifestMatches &&
+          control.canRepairBinding?.(cutoverId) &&
+          control.executeBindingRepair
+        ) {
+          record = await control.executeBindingRepair({ cutoverId, workspaceId, agentId });
+        } else {
+          const witness = await control.reconcileDurableState({ workspaceId, agentId });
+          record = await control.controller.finish(
+            cutoverId,
+            async () => witness,
+          );
+        }
+      }
       const mode = control.controller.mode();
       return {
-        content: [textBlock(`Finished cutover ${cutoverId}; mode=${mode}.`) ],
+        content: [textBlock(`Finished cutover ${cutoverId}; mode=${mode}.`)],
         structuredContent: { cutover: record as unknown as Record<string, unknown>, mode },
       };
     },
   );
+
+  registerAppTool(
+    server,
+    "cutover_repair_binding",
+    {
+      title: "Repair cross-domain capability manifest digest misbinding",
+      description:
+        "Repair a drained cutover record whose expected capabilityManifestSha256 was mistakenly bound to a build manifest digest (CROSS_DOMAIN_DIGEST_MISBINDING). Requires cryptographic attribution to target build_manifest_sha256, live capability manifest match, positive durable agent/workspace witness, zero restart replay, and idempotent completion.",
+      inputSchema: {
+        cutoverId: z.string().min(1),
+        workspaceId: z.string().min(1),
+        agentId: z.string().min(1),
+      },
+      outputSchema: {
+        cutover: cutoverRecordSchema,
+        mode: modeSchema,
+      },
+      _meta: {},
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ cutoverId, workspaceId, agentId }) => {
+      if (!control.executeBindingRepair) {
+        throw new CutoverStateError("Binding repair is not supported on this server configuration.");
+      }
+      const record = await control.executeBindingRepair({ cutoverId, workspaceId, agentId });
+      const mode = control.controller.mode();
+      return {
+        content: [textBlock(`Repaired cross-domain digest misbinding for cutover ${cutoverId}; mode=${mode}.`)],
+        structuredContent: { cutover: record as unknown as Record<string, unknown>, mode },
+      };
+    },
+  );
+
 
   if (control.listWorkspaceSessions && control.inspectWorkspace) {
     registerAppTool(
@@ -3964,6 +4165,7 @@ export function createMcpServer(
           durationMs: z.number().optional(),
           stdout: z.string().optional(),
           stderr: z.string().optional(),
+          launchError: z.object({ code: z.string(), message: z.string() }).optional(),
         },
         _meta: {},
         annotations: SHELL_TOOL_ANNOTATIONS,
@@ -4414,6 +4616,203 @@ export interface CreateServerOptions {
   chatSwarmInitializationHook?: () => void;
 }
 
+export interface DurableReconciliationResolverDependencies {
+  workspaceStore: Pick<ReturnType<typeof createWorkspaceStore>, "getSession" | "listSessions">;
+  workspaces: Pick<WorkspaceRegistry, "inspectWorkspace" | "getWorkspace">;
+  agentSessionManager: Pick<LocalAgentSessionManager, "getRecordByPrefixOrId" | "listAllAgentRecords" | "getAgentStatus" | "reconcileAgent">;
+}
+
+/**
+ * Build a durable witness from the complete persisted inventory. Every
+ * workspace and agent record is inspected and reconciled; selecting the first
+ * usable pair is insufficient because an unbound or unreadable sibling would
+ * otherwise be hidden from cutover acceptance.
+ */
+export async function resolveDurableReconciliationWitnessFromInventory(
+  dependencies: DurableReconciliationResolverDependencies,
+  preferredPair?: { workspaceId?: string; agentId?: string },
+  requirePositiveInventory = false,
+): Promise<DurableReconciliationWitness> {
+  const { workspaceStore, workspaces, agentSessionManager } = dependencies;
+  const errorText = (error: unknown): string =>
+    error instanceof Error ? error.message : String(error);
+  const witnessKind = preferredPair ? "exact-pair" : "inventory-selected-pair";
+  if (preferredPair) {
+    const workspaceId = preferredPair.workspaceId;
+    const agentId = preferredPair.agentId;
+    const exactDetail: Array<{ unit: string; ok: boolean; detail?: string }> = [];
+    if (!workspaceId || !agentId) {
+      return {
+        workspaceQueryable: false, agentQueryable: false, agentReconciled: false,
+        workspaceSessions: 0, agentSessions: 0, witnessWorkspaceSessions: 0,
+        witnessAgentSessions: 0, witnessKind,
+        detail: [{ unit: "requested-witness", ok: false, detail: "workspaceId and agentId are both required" }],
+      };
+    }
+    const session = workspaceStore.getSession(workspaceId);
+    if (!session) {
+      return {
+        workspaceQueryable: false, agentQueryable: false, agentReconciled: false,
+        workspaceSessions: 0, agentSessions: 0, witnessWorkspaceSessions: 0,
+        witnessAgentSessions: 0, witnessKind,
+        detail: [{ unit: `workspace:${workspaceId}`, ok: false, detail: "requested workspace is not durably present" }],
+      };
+    }
+    const record = agentSessionManager.getRecordByPrefixOrId(agentId);
+    if (!record || record.id !== agentId || record.workspaceId !== workspaceId) {
+      return {
+        workspaceQueryable: true, agentQueryable: false, agentReconciled: false,
+        workspaceSessions: 1, agentSessions: 0, witnessWorkspaceSessions: 1,
+        witnessAgentSessions: 0, witnessKind,
+        detail: [{ unit: `agent:${agentId}`, ok: false, detail: "requested agent is not durably bound to the requested workspace" }],
+      };
+    }
+    try {
+      const inspected = workspaces.inspectWorkspace(workspaceId);
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const status = await agentSessionManager.getAgentStatus({ workspaceId, workspaceRoot: workspace.root, agentId, waitMs: 0 });
+      if (status.agentId !== agentId || (status.workspaceId !== undefined && status.workspaceId !== workspaceId)) {
+        throw new Error("status returned a different workspace/agent identity");
+      }
+      const reconciled = await agentSessionManager.reconcileAgent({
+        workspaceId, workspaceRoot: workspace.root, isolated: workspace.mode === "worktree", agentId,
+      });
+      if (reconciled.agentId !== agentId) {
+        throw new Error(`reconciliation returned agent ${reconciled.agentId}, expected ${agentId}`);
+      }
+      exactDetail.push(
+        { unit: `workspace:${workspaceId}`, ok: true, ...(inspected.loaded ? {} : { detail: "durable session present; registry not currently loaded (no write performed)" }) },
+        { unit: `agent:${agentId}@${workspaceId}`, ok: true },
+      );
+      return {
+        workspaceQueryable: true, agentQueryable: true, agentReconciled: true,
+        witnessWorkspaceId: workspaceId, witnessAgentId: agentId,
+        workspaceSessions: 1, agentSessions: 1, witnessWorkspaceSessions: 1,
+        witnessAgentSessions: 1, witnessKind, detail: exactDetail,
+      };
+    } catch (error) {
+      return {
+        workspaceQueryable: true, agentQueryable: false, agentReconciled: false,
+        witnessWorkspaceId: workspaceId, witnessAgentId: agentId,
+        workspaceSessions: 1, agentSessions: 1, witnessWorkspaceSessions: 1,
+        witnessAgentSessions: 1, witnessKind,
+        detail: [{ unit: `agent:${agentId}@${workspaceId}`, ok: false, detail: errorText(error) }],
+      };
+    }
+  }
+
+  const detail: Array<{ unit: string; ok: boolean; detail?: string }> = [];
+  let workspaceQueryable = true;
+  let agentQueryable = true;
+  let agentReconciled = true;
+  const workspaceList = workspaceStore.listSessions();
+  const workspaceById = new Map(workspaceList.map((session) => [session.id, session]));
+
+  for (const session of workspaceList) {
+    const unit = `workspace:${session.id}`;
+    try {
+      const inspected = workspaces.inspectWorkspace(session.id);
+      detail.push({
+        unit,
+        ok: true,
+        ...(inspected.loaded
+          ? {}
+          : { detail: "durable session present; registry not currently loaded (no write performed)" }),
+      });
+    } catch (error) {
+      workspaceQueryable = false;
+      detail.push({ unit, ok: false, detail: errorText(error) });
+    }
+  }
+
+  let agentRecords: LocalAgentRecord[];
+  try {
+    agentRecords = agentSessionManager.listAllAgentRecords();
+  } catch (error) {
+    return {
+      workspaceQueryable: workspaceQueryable && (!requirePositiveInventory || workspaceList.length >= 1),
+      agentQueryable: false,
+      agentReconciled: false,
+      workspaceSessions: workspaceList.length,
+      agentSessions: 0,
+      witnessWorkspaceSessions: workspaceList.length,
+      witnessAgentSessions: 0,
+      witnessKind: preferredPair ? "exact-pair" : "inventory-selected-pair",
+      detail: [...detail, { unit: "agent-store", ok: false, detail: errorText(error) }],
+    };
+  }
+
+  let witnessWorkspaceId: string | undefined;
+  let witnessAgentId: string | undefined;
+  const sortedAgents = [...agentRecords].sort((a, b) => a.id.localeCompare(b.id));
+
+  for (const record of sortedAgents) {
+    const unit = `agent:${record.id}`;
+    if (!record.workspaceId) {
+      agentQueryable = false;
+      agentReconciled = false;
+      detail.push({ unit, ok: false, detail: "agent record is unbound to a durable workspace" });
+      continue;
+    }
+    const session = workspaceById.get(record.workspaceId);
+    if (!session) {
+      agentQueryable = false;
+      agentReconciled = false;
+      detail.push({ unit, ok: false, detail: `workspace ${record.workspaceId} not found in durable workspace store` });
+      continue;
+    }
+    try {
+      const workspace = workspaces.getWorkspace(record.workspaceId);
+      await agentSessionManager.getAgentStatus({
+        workspaceId: record.workspaceId,
+        workspaceRoot: workspace.root,
+        agentId: record.id,
+        waitMs: 0,
+      });
+      const reconciled = await agentSessionManager.reconcileAgent({
+        workspaceId: record.workspaceId,
+        workspaceRoot: workspace.root,
+        isolated: workspace.mode === "worktree",
+        agentId: record.id,
+      });
+      if (reconciled.agentId !== record.id) {
+        throw new Error(`reconciliation returned agent ${reconciled.agentId}, expected ${record.id}`);
+      }
+      detail.push({ unit: `${unit}@${record.workspaceId}`, ok: true });
+      if (!witnessAgentId) {
+        witnessAgentId = record.id;
+        witnessWorkspaceId = record.workspaceId;
+      }
+    } catch (error) {
+      agentQueryable = false;
+      agentReconciled = false;
+      detail.push({ unit: `${unit}@${record.workspaceId}`, ok: false, detail: errorText(error) });
+    }
+  }
+
+  const fullyPositive = Boolean(
+    workspaceQueryable &&
+    agentQueryable &&
+    agentReconciled &&
+    (!requirePositiveInventory || workspaceList.length >= 1) &&
+    (!requirePositiveInventory || agentRecords.length >= 1) &&
+    (!requirePositiveInventory || (witnessWorkspaceId && witnessAgentId)),
+  );
+  return {
+    workspaceQueryable: workspaceQueryable && (!requirePositiveInventory || workspaceList.length >= 1),
+    agentQueryable: agentQueryable && fullyPositive,
+    agentReconciled: agentReconciled && fullyPositive,
+    witnessWorkspaceId,
+    witnessAgentId,
+    workspaceSessions: workspaceList.length,
+    agentSessions: agentRecords.length,
+    witnessWorkspaceSessions: workspaceList.length,
+    witnessAgentSessions: agentRecords.length,
+    witnessKind,
+    detail,
+  };
+}
+
 export function createServer(
   config = loadConfig(),
   options: CreateServerOptions = {},
@@ -4507,6 +4906,30 @@ export function createServer(
   if (!chatSwarmLifecycle) throw new Error("Chat Swarm lifecycle failed to initialize.");
   options.chatSwarmInitializationHook?.();
   const restartSelfActuator = createLaunchdSelfRestartActuator();
+  const resolveDurableReconciliationWitness = async (
+    preferredPair?: { workspaceId?: string; agentId?: string },
+    requirePositiveInventory = Boolean(preferredPair),
+  ): Promise<DurableReconciliationWitness> => {
+    if (!agentSessionManager) {
+      return {
+        workspaceQueryable: !requirePositiveInventory,
+        agentQueryable: false,
+        agentReconciled: false,
+        workspaceSessions: 0,
+        agentSessions: 0,
+        witnessWorkspaceSessions: 0,
+        witnessAgentSessions: 0,
+        witnessKind: preferredPair ? "exact-pair" : "inventory-selected-pair",
+        detail: [{ unit: "agent-store", ok: false, detail: "subagents disabled; durable agent reconciliation unavailable" }],
+      };
+    }
+    return resolveDurableReconciliationWitnessFromInventory({
+      workspaceStore,
+      workspaces,
+      agentSessionManager,
+      }, preferredPair, requirePositiveInventory);
+  };
+
   const reconcileCutoverDurableState = async ({
     workspaceId,
     agentId,
@@ -4514,136 +4937,231 @@ export function createServer(
     workspaceId: string;
     agentId: string;
   }): Promise<DurableReconciliationWitness> => {
-    if (!agentSessionManager) {
-      throw new CutoverStateError(
-        "Durable agent reconciliation is unavailable because subagents are disabled.",
-      );
-    }
-    const workspace = workspaces.getWorkspace(workspaceId);
-    await agentSessionManager.getAgentStatus({
-      workspaceId,
-      workspaceRoot: workspace.root,
-      agentId,
-      waitMs: 0,
-    });
-    await agentSessionManager.reconcileAgent({
-      workspaceId,
-      workspaceRoot: workspace.root,
-      isolated: workspace.mode === "worktree",
-      agentId,
-    });
-    return {
-      workspaceQueryable: true,
-      agentQueryable: true,
-      agentReconciled: true,
-    };
+    return resolveDurableReconciliationWitness({ workspaceId, agentId });
   };
-  const enumerateDurableReconciliationState = async (): Promise<{
-    workspaceQueryable: boolean;
-    agentQueryable: boolean;
-    agentReconciled: boolean;
-    workspaceSessions: number;
-    agentSessions: number;
-    detail: Array<{ unit: string; ok: boolean; detail?: string }>;
+
+  const enumerateDurableReconciliationState = async (): Promise<DurableReconciliationWitness> => {
+    return resolveDurableReconciliationWitness();
+  };
+
+  const executeObservedReplacementRecovery = async (input: {
+    cutoverId: string;
+    expectedNewIdentity?: ExpectedCutoverIdentity;
+    preferredPair?: { workspaceId?: string; agentId?: string };
+    expiresAt?: string;
+  }): Promise<{
+    terminal: DurableCutoverRecord;
+    successor?: DurableCutoverRecord;
+    newlyRecovered: boolean;
+    mode: CutoverMode;
   }> => {
-    const errorText = (error: unknown): string =>
-      error instanceof Error ? error.message : String(error);
-    const detail: Array<{ unit: string; ok: boolean; detail?: string }> = [];
-    let workspaceQueryable = true;
-    let workspaceSessions = 0;
-    try {
-      const sessions = workspaceStore.listSessions();
-      workspaceSessions = sessions.length;
-      for (const session of sessions) {
-        const unit = `workspace:${session.id}`;
-        try {
-          const inspected = workspaces.inspectWorkspace(session.id);
-          detail.push({
-            unit,
-            ok: true,
-            ...(inspected.loaded
-              ? {}
-              : { detail: "durable session present; registry not currently loaded (no write performed)" }),
-          });
-        } catch (error) {
-          workspaceQueryable = false;
-          detail.push({ unit, ok: false, detail: errorText(error) });
-        }
-      }
-    } catch (error) {
-      workspaceQueryable = false;
-      detail.push({ unit: "workspace-store", ok: false, detail: errorText(error) });
+    const active = cutoverController.record();
+    if (!active) {
+      throw new CutoverStateError("No durable cutover record exists.");
     }
-    if (!agentSessionManager) {
+    if (active.cutoverId !== input.cutoverId) {
+      throw new CutoverStateError(`Cutover id mismatch: active cutover is ${active.cutoverId}.`);
+    }
+    if (active.phase === "closed") {
+      const observed = active.observedReplacement?.observedIdentity;
+      const current = cutoverController.currentIdentity;
+      if (
+        observed &&
+        (observed.serverInstanceId !== current.serverInstanceId ||
+          observed.sourceCommit !== current.sourceCommit ||
+          observed.buildId !== current.buildId ||
+          observed.capabilityManifestSha256 !== current.capabilityManifestSha256)
+      ) {
+        throw new CutoverStateError("[RECOVERY_BINDING_MISMATCH] Current replacement identity does not match the closed receipt.");
+      }
+      const expected = input.expectedNewIdentity;
+      if (
+        expected &&
+        (expected.sourceCommit !== active.expectedNewIdentity.sourceCommit ||
+          expected.buildId !== active.expectedNewIdentity.buildId ||
+          expected.capabilityManifestSha256 !== active.expectedNewIdentity.capabilityManifestSha256)
+      ) {
+        throw new CutoverStateError("[RECOVERY_BINDING_MISMATCH] Recovery expected identity does not match closed cutover.");
+      }
       return {
-        workspaceQueryable,
-        agentQueryable: false,
-        agentReconciled: false,
-        workspaceSessions,
-        agentSessions: 0,
-        detail: [
-          ...detail,
-          { unit: "agent-store", ok: false, detail: "subagents disabled; durable agent reconciliation unavailable" },
-        ],
+        terminal: active,
+        newlyRecovered: false,
+        mode: cutoverController.mode(),
       };
     }
-    let agentQueryable = true;
-    let agentReconciled = true;
-    let agentSessions = 0;
-    try {
-      const records = agentSessionManager.listAllAgentRecords();
-      agentSessions = records.length;
-      for (const agent of records) {
-        const unit = `agent:${agent.id}${agent.workspaceId ? `@${agent.workspaceId}` : ""}`;
-        if (!agent.workspaceId) {
-          agentQueryable = false;
-          agentReconciled = false;
-          detail.push({
-            unit,
-            ok: false,
-            detail: "durable agent record has no workspace binding; reconciliation impossible",
-          });
-          continue;
-        }
-        try {
-          await agentSessionManager.getAgentStatus({
-            workspaceId: agent.workspaceId,
-            workspaceRoot: agent.workspaceRoot,
-            agentId: agent.id,
-            waitMs: 0,
-          });
-        } catch (error) {
-          agentQueryable = false;
-          detail.push({ unit, ok: false, detail: `status unreadable: ${errorText(error)}` });
-          continue;
-        }
-        try {
-          await agentSessionManager.reconcileAgent({
-            workspaceId: agent.workspaceId,
-            workspaceRoot: agent.workspaceRoot,
-            isolated: false,
-            agentId: agent.id,
-          });
-          detail.push({ unit, ok: true });
-        } catch (error) {
-          agentReconciled = false;
-          detail.push({ unit, ok: false, detail: `reconcile failed: ${errorText(error)}` });
-        }
-      }
-    } catch (error) {
-      agentQueryable = false;
-      agentReconciled = false;
-      detail.push({ unit: "agent-store", ok: false, detail: errorText(error) });
-    }
+
+    const witnessBinding = {
+      witnessCutoverId: active.cutoverId,
+      witnessServerInstanceId: cutoverController.currentIdentity.serverInstanceId,
+      witnessExpectedIdentity: { ...active.expectedNewIdentity },
+    };
+    const witness = {
+      ...await resolveDurableReconciliationWitness(input.preferredPair, true),
+      ...witnessBinding,
+    };
+    const recovered = cutoverController.recoverCutover({
+      cutoverId: input.cutoverId,
+      expectedNewIdentity: input.expectedNewIdentity ?? active.expectedNewIdentity,
+      ...(input.expiresAt ? { expiresAt: input.expiresAt } : {}),
+      witness,
+    });
     return {
-      workspaceQueryable,
-      agentQueryable,
-      agentReconciled,
-      workspaceSessions,
-      agentSessions,
-      detail,
+      terminal: recovered.terminal,
+      successor: recovered.successor,
+      newlyRecovered: recovered.newlyRecovered,
+      mode: cutoverController.mode(),
     };
   };
+
+  const executeBindingRepair = async (input: {
+    cutoverId: string;
+    workspaceId: string;
+    agentId: string;
+  }): Promise<DurableCutoverRecord> => {
+    const active = cutoverController.record();
+    if (!active) {
+      throw new CutoverStateError("No durable cutover record exists.");
+    }
+    if (active.cutoverId !== input.cutoverId) {
+      throw new CutoverStateError(`Cutover id mismatch: active cutover is ${active.cutoverId}.`);
+    }
+    if (active.phase === "closed") {
+      return active;
+    }
+    if (active.phase !== "drained") {
+      throw new CutoverStateError(
+        `Cannot repair binding for cutover ${input.cutoverId}: phase must be "drained", but is "${active.phase}".`,
+      );
+    }
+    if (!active.restartRequest || !active.restartRequest.restartScheduledAt) {
+      throw new CutoverStateError(
+        `Cannot repair binding for cutover ${input.cutoverId}: restart was not scheduled prior to repair.`,
+      );
+    }
+    const current = cutoverController.currentIdentity;
+    if (current.serverInstanceId === active.oldServerIdentity.serverInstanceId) {
+      throw new CutoverStateError(
+        "Cannot repair binding on the old server instance; must be run on the replacement server.",
+      );
+    }
+    if (current.sourceCommit !== active.expectedNewIdentity.sourceCommit) {
+      throw new CutoverStateError(
+        `Current source commit (${current.sourceCommit}) does not match expected (${active.expectedNewIdentity.sourceCommit}).`,
+      );
+    }
+    if (current.buildId !== active.expectedNewIdentity.buildId) {
+      throw new CutoverStateError(
+        `Current build id (${current.buildId}) does not match expected (${active.expectedNewIdentity.buildId}).`,
+      );
+    }
+    if (!active.expectedNewIdentity.capabilityManifestSha256) {
+      throw new CutoverStateError(
+        "Cutover expectedNewIdentity does not have a capabilityManifestSha256; not a digest misbinding.",
+      );
+    }
+    if (!current.capabilityManifestSha256) {
+      throw new CutoverStateError(
+        "Current replacement server does not expose capabilityManifestSha256; cannot repair binding.",
+      );
+    }
+    if (active.expectedNewIdentity.capabilityManifestSha256 === current.capabilityManifestSha256) {
+      throw new CutoverStateError(
+        "Capability manifest already matches expected; binding repair is not needed.",
+      );
+    }
+
+    const targetRoot = config.mcpCutoverBuildReadyRoot ?? process.env.DEVSPACE_PACKAGE_ROOT ?? resolve(dirname(fileURLToPath(import.meta.url)), "..");
+    const probed = probeTargetPackage(targetRoot);
+    const targetBuildManifestSha = probed.buildManifestSha256 ?? runtimeBuildIdentity.buildManifestSha256;
+    if (!targetBuildManifestSha) {
+      throw new CutoverStateError(
+        "Cannot prove cryptographic attribution: target package build_manifest_sha256 is unavailable. [DOMAIN_MISMATCH_UNVERIFIED]",
+      );
+    }
+    if (targetBuildManifestSha !== active.expectedNewIdentity.capabilityManifestSha256) {
+      throw new CutoverStateError(
+        `Cryptographic attribution failed: expected capability manifest digest ${active.expectedNewIdentity.capabilityManifestSha256} does not equal target build_manifest_sha256 ${targetBuildManifestSha}. [NOT_A_CROSS_DOMAIN_MISBINDING]`,
+      );
+    }
+
+    const witness = await resolveDurableReconciliationWitness(
+      { workspaceId: input.workspaceId, agentId: input.agentId },
+      true,
+    );
+    if (!witness.workspaceQueryable || !witness.agentQueryable || !witness.agentReconciled) {
+      throw new CutoverStateError(
+        "Cannot repair binding: durable agent/workspace reconciliation witness is not fully positive.",
+      );
+    }
+    if ((witness.workspaceSessions ?? 0) < 1) {
+      throw new CutoverStateError("Zero durable workspace sessions found; live positive witness required.");
+    }
+    if ((witness.agentSessions ?? 0) < 1) {
+      throw new CutoverStateError("Zero durable agent sessions found; live positive witness required.");
+    }
+
+    const nowIso = new Date().toISOString();
+    const repairReceipt: CutoverBindingRepairReceipt = {
+      schema: CUTOVER_BINDING_REPAIR_SCHEMA,
+      cutoverId: input.cutoverId,
+      reason: CUTOVER_BINDING_REPAIR_REASON,
+      repairControlSurfaceIdentity: current,
+      observedTargetRuntimeIdentity: current,
+      originalCutoverExpectedIdentity: active.expectedNewIdentity,
+      effectiveRepairedIdentity: {
+        sourceCommit: current.sourceCommit,
+        buildId: current.buildId,
+        capabilityManifestSha256: current.capabilityManifestSha256,
+      },
+      originalBoundDigest: active.expectedNewIdentity.capabilityManifestSha256,
+      originalDigestField: "expectedNewIdentity.capabilityManifestSha256",
+      provenActualDigestDomain: "build_manifest_sha256",
+      correctCapabilityManifestSchema: "devspace.capability_manifest.v1",
+      correctCapabilityManifestSha256: current.capabilityManifestSha256,
+      sourceCommit: current.sourceCommit,
+      buildId: current.buildId,
+      observedServerInstanceId: current.serverInstanceId,
+      repairedBy: current.serverInstanceId,
+      repairedAt: nowIso,
+      physicalProbeEvidence: `Target package at ${targetRoot} verified: build_manifest_sha256=${targetBuildManifestSha} equals expectedNewIdentity.capabilityManifestSha256.`,
+    };
+
+    cutoverController.recordBindingRepair(input.cutoverId, repairReceipt);
+    return await cutoverController.finish(input.cutoverId, async () => ({
+      ...witness,
+      witnessCutoverId: input.cutoverId,
+      witnessServerInstanceId: current.serverInstanceId,
+      witnessExpectedIdentity: {
+        sourceCommit: current.sourceCommit,
+        buildId: current.buildId,
+        capabilityManifestSha256: current.capabilityManifestSha256,
+      },
+      witnessWorkspaceId: input.workspaceId,
+      witnessAgentId: input.agentId,
+      witnessKind: "exact-pair",
+      detail: [{ unit: "native-mcp", ok: true, detail: "cross-domain digest misbinding repaired and reconciled" }],
+    }));
+  };
+
+  const canRepairBinding = (cutoverId: string): boolean => {
+    const active = cutoverController.record();
+    if (!active || active.cutoverId !== cutoverId || active.phase !== "drained") return false;
+    if (!active.restartRequest?.restartScheduledAt) return false;
+    try {
+      const targetRoot =
+        config.mcpCutoverBuildReadyRoot ??
+        process.env.DEVSPACE_PACKAGE_ROOT ??
+        resolve(dirname(fileURLToPath(import.meta.url)), "..");
+      const probed = probeTargetPackage(targetRoot);
+      return Boolean(
+        probed.buildManifestSha256 &&
+        probed.buildManifestSha256 === active.expectedNewIdentity.capabilityManifestSha256,
+      );
+    } catch {
+      return false;
+    }
+  };
+
   const codexGoals = config.codexGoalsEnabled
     ? new CodexGoalSessionManager(processSessions, { codexBin: config.codexBin })
     : undefined;
@@ -4963,6 +5481,10 @@ export function createServer(
             inspectWorkspace: (workspaceId) => workspaces.inspectWorkspace(workspaceId),
             listWorkspaceSessions: () => workspaceStore.listSessions(),
             ...(advanceCutover ? { advance: advanceCutover } : {}),
+            enumerateReconciliation: enumerateDurableReconciliationState,
+            executeObservedReplacementRecovery,
+            canRepairBinding,
+            executeBindingRepair,
           },
           opencodeCatalogSource,
           clineCatalogService,

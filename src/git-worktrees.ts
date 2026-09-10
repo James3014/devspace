@@ -33,6 +33,31 @@ export interface ManagedWorktree {
   managed: boolean;
 }
 
+const repoWorktreeLocks = new Map<string, Promise<void>>();
+
+export async function withRepoWorktreeLock<T>(sourceRoot: string, fn: () => Promise<T>): Promise<T> {
+  const currentLock = repoWorktreeLocks.get(sourceRoot) ?? Promise.resolve();
+  let releaseLock: () => void;
+  const newLock = new Promise<void>((resolve) => {
+    releaseLock = resolve;
+  });
+  const tail = currentLock.then(() => newLock, () => newLock);
+  repoWorktreeLocks.set(sourceRoot, tail);
+  try {
+    await currentLock;
+    return await fn();
+  } finally {
+    releaseLock!();
+    if (repoWorktreeLocks.get(sourceRoot) === tail) {
+      repoWorktreeLocks.delete(sourceRoot);
+    }
+  }
+}
+
+export function repoWorktreeLockCount(): number {
+  return repoWorktreeLocks.size;
+}
+
 export async function createManagedWorktree(input: {
   sourcePath: string;
   baseRef?: string;
@@ -69,7 +94,9 @@ export async function createManagedWorktree(input: {
   assertAllowedPath(worktreePath, [input.config.worktreeRoot]);
 
   try {
-    await git(["worktree", "add", "--detach", worktreePath, baseSha], sourceRoot);
+    await withRepoWorktreeLock(sourceRoot, () =>
+      git(["worktree", "add", "--detach", worktreePath, baseSha], sourceRoot),
+    );
   } catch (error) {
     await rm(worktreePath, { recursive: true, force: true });
     const message = error instanceof Error ? error.message : String(error);
