@@ -1,3 +1,5 @@
+import type { ControlPlaneConsumerOptions } from "./control-plane-consumer.js";
+import { ControlPlaneOwnershipError } from "./control-plane-ownership.js";
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { access, realpath } from "node:fs/promises";
@@ -2444,7 +2446,9 @@ export function createMcpServer(
           openWorldHint: true,
         },
       },
-      async ({ workspaceId, attemptKey, recipe, authorityMode }, { _meta }) => {
+      async ({ workspaceId, attemptKey, recipe, authorityMode }, extra) => {
+        const { _meta } = extra;
+        const consumerContext = dependencyConsumerContext(extra);
         await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
         const workspace = workspaces.getWorkspace(workspaceId);
         try {
@@ -2454,7 +2458,7 @@ export function createMcpServer(
             attemptKey,
             recipe,
             authorityMode,
-          });
+          }, consumerContext);
           return operationResponse(operation);
         } catch (error) {
           if (error instanceof DurableOperationError && error.operation) {
@@ -2500,7 +2504,11 @@ export function createMcpServer(
         _meta: {},
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       },
-      async ({ operationId }) => operationResponse(await durableOperations.reconcile(operationId)),
+      async ({ operationId }, extra) => {
+        const context = durableOperations.store.getByOperationId(operationId)?.kind === "dependency_sync"
+          ? dependencyConsumerContext(extra) : undefined;
+        return operationResponse(await durableOperations.reconcile(operationId, context));
+      },
     );
   }
 
@@ -4409,7 +4417,18 @@ export function createMcpServer(
   return server;
 }
 
+function dependencyConsumerContext(extra: {authInfo?: {clientId: string; scopes: string[]}; sessionId?: string}) {
+  if (!extra.authInfo?.clientId) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "authenticated MCP client context is required");
+  return Object.freeze({
+    clientId:extra.authInfo.clientId,
+    scopes:Object.freeze([...extra.authInfo.scopes]),
+    sessionId:extra.sessionId,
+  });
+}
+
 export interface CreateServerOptions {
+  /** Trusted host reader only; OAuth identity alone does not grant resource ownership. */
+  coordination?: ControlPlaneConsumerOptions;
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
   chatSwarmInitializationHook?: () => void;
 }
@@ -4442,7 +4461,7 @@ export function createServer(
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
-  const durableOperations = new DurableOperationManager(config);
+  const durableOperations = new DurableOperationManager(config, undefined, undefined, undefined, options.coordination);
   const opencodeCatalogSource = createMcpOpencodeCatalogSource();
   const clineCatalogService = new ClineCatalogService();
   const localAgentProviders = buildLocalAgentProviderStatuses(

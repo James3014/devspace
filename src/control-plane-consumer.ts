@@ -19,6 +19,7 @@ export interface DependencyReconciliationEvidence extends ReconciliationEvidence
   frozenInputsUnchanged: boolean;
 }
 export interface ControlPlaneConsumerOptions extends ControlPlaneOwnershipOptions {
+  readDependencyReconciliation?(context: unknown, subject: Readonly<EffectSubject>): DependencyReconciliationEvidence | undefined;
   /** Verifies an external terminal witness, including exit code and frozen-input result. */
   verifyDependencyReconciliation?(evidence: Readonly<DependencyReconciliationEvidence>, subject: Readonly<EffectSubject>): boolean;
   /** Trusted host injection, never populated from caller claims alone. Workers remain scoped workers. */
@@ -36,6 +37,12 @@ export class ControlPlaneConsumer {
     const normalizedRoot = subject.workspaceRoot.replaceAll("\\", "/");
     if (lease.scope.length !== 1 || lease.scope[0] !== normalizedRoot || lease.resource !== normalizedRoot) throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "lease must bind the actual dependency workspace");
     return {...binding};
+  }
+
+  readReconciliation(context: unknown, subject: EffectSubject): DependencyReconciliationEvidence {
+    const evidence = this.options.readDependencyReconciliation?.(context, Object.freeze({...subject}));
+    if (!evidence) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "trusted same-operation terminal witness is unavailable");
+    return evidence;
   }
 
   reconcile(context: unknown, subject: EffectSubject, evidence: DependencyReconciliationEvidence): void {

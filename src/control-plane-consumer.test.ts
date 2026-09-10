@@ -149,6 +149,8 @@ test("C3 externally verified terminal proof reconciles durable record and pin to
     const proof={leaseId:lease.leaseId,ownerThread:lease.ownerThread,operationHandle:unknown.operationId,operation:lease.operation,baseRevision:lease.baseRevision,leaseVersion:lease.version,state:"finished" as const,requestHash:unknown.requestHash,exitCode:0,frozenInputsUnchanged:true};
     assert.throws(()=>f.manager.reconcileDependencySync(unknown.operationId,proof,f.context),/verified terminal/);
     assert.ok(f.lease().operationHandle);
+    await assert.rejects(f.manager.reconcile(unknown.operationId,f.context), /terminal witness is unavailable/);
+    f.options.readDependencyReconciliation=(c,subject)=>c===f.context && subject.operationId===unknown.operationId ? proof : undefined;
     f.options.verifyDependencyReconciliation=e=>JSON.stringify(e)===JSON.stringify(proof);
     f.options.verifyReconciliationEvidence=e=>e.operationHandle===proof.operationHandle && e.detail===JSON.stringify({requestHash:proof.requestHash,exitCode:proof.exitCode,frozenInputsUnchanged:proof.frozenInputsUnchanged});
     // The host policy is fixed at construction; reopen against the same durable database.
@@ -156,6 +158,7 @@ test("C3 externally verified terminal proof reconciles durable record and pin to
     try {
       const result=reopened.reconcileDependencySync(unknown.operationId,proof,f.context);
       assert.equal(result.status,"succeeded");
+      assert.deepEqual(await reopened.reconcile(unknown.operationId,f.context),result);
       assert.equal(f.lease().operationHandle,undefined);
       assert.deepEqual(reopened.reconcileDependencySync(unknown.operationId,proof,f.context),result);
       assert.throws(()=>reopened.reconcileDependencySync(unknown.operationId,{...proof,exitCode:1},f.context));

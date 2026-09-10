@@ -641,9 +641,14 @@ export class DurableOperationManager {
     });
   }
 
-  async reconcile(operationId: string): Promise<DurableOperationRecord> {
+  async reconcile(operationId: string, consumerContext?: unknown): Promise<DurableOperationRecord> {
     const record = this.store.getByOperationId(operationId);
     if (!record) throw new DurableOperationError("RECONCILIATION_REQUIRED", `Unknown durable operation: ${operationId}`);
+    if (record.kind === "dependency_sync") {
+      if (!this.consumer || typeof record.request.baseRevision !== "string") throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency reconciliation requires revision-bound host authority");
+      const subject = {operationId, requestHash:record.requestHash, workspaceRoot:record.scopeRoot, baseRevision:record.request.baseRevision, operation:"dependency_sync" as const};
+      return this.reconcileDependencySync(operationId, this.consumer.readReconciliation(consumerContext, subject), consumerContext);
+    }
     if (record.status !== "outcome_unknown" && record.status !== "started") return record;
 
     if (record.kind === "nexus_gateway_recover") {
@@ -673,27 +678,7 @@ export class DurableOperationManager {
       });
     }
 
-    const workspaceRoot = String(record.request.workspaceRoot ?? record.scopeRoot);
-    const recipe = String(record.request.recipe) as DependencySyncRecipe;
-    const frozenInputs = recipeFrozenInputs(recipe);
-    const current = await hashFiles(workspaceRoot, frozenInputs);
-    const original = record.request.frozenInputs as Record<string, string | null> | undefined;
-    if (original && hashJson(original) !== hashJson(current)) {
-      return this.store.finish(operationId, {
-        status: "failed",
-        retrySafe: false,
-        errorCode: "FROZEN_INPUT_CHANGED",
-        errorMessage: "Frozen dependency inputs differ from the operation's bound inputs; success cannot be claimed.",
-        receipt: { recipe, original, current, reconciled: true },
-      });
-    }
-    return this.store.finish(operationId, {
-      status: "outcome_unknown",
-      retrySafe: false,
-      errorCode: "RECONCILIATION_REQUIRED",
-      errorMessage: "Dependency inputs are intact, but installed-environment success cannot be proven after interruption without re-executing mutation.",
-      receipt: { recipe, frozenInputs: current, reconciled: true },
-    });
+    throw new DurableOperationError("RECONCILIATION_REQUIRED", "Unsupported durable operation kind");
   }
 }
 

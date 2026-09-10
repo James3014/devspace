@@ -1949,7 +1949,7 @@ test("nexus_gateway_recover exposes only the fixed typed recovery contract", asy
   assert.equal(invalid.isError, true, "extra caller-selected process controls must fail schema validation before handler execution");
 });
 
-test("OWNER_DIRECT workspace_clone and dependency_sync run through typed MCP tools", async (t) => {
+test("OWNER_DIRECT workspace_clone works and dependency_sync denies unauthenticated MCP context", async (t) => {
   const context = await fixture(t, { git: true });
   const tools = await context.client.listTools();
   for (const name of ["workspace_clone", "dependency_sync", "operation_status", "operation_reconcile"]) {
@@ -2018,14 +2018,14 @@ test("OWNER_DIRECT workspace_clone and dependency_sync run through typed MCP too
       authorityMode: "OWNER_DIRECT",
     },
   });
-  assert.equal(sync.isError, undefined);
-  assert.equal(structuredContent(sync).status, "succeeded");
+  assert.equal(sync.isError, true);
+  assert.match(JSON.stringify(sync), /authenticated MCP client context/);
   assert.equal(await readFile(join(destination, "package.json"), "utf8"), manifestBefore);
   assert.equal(await readFile(join(destination, "package-lock.json"), "utf8"), lockBefore);
 
   const status = await context.client.callTool({
     name: "operation_status",
-    arguments: { operationId: structuredContent(sync).operationId },
+    arguments: { operationId: cloneRecord.operationId },
   });
   assert.equal(structuredContent(status).status, "succeeded");
 
@@ -2064,4 +2064,85 @@ test("command_status metadata annotations and minimal mode visibility", async (t
     idempotentHint: true,
     openWorldHint: false,
   });
+});
+
+test("C3 authenticated HTTP MCP uses host-bound worker authority for real dependency execution", async () => {
+  const {realpath}=await import("node:fs/promises");
+  const {createHash}=await import("node:crypto");
+  const {SingleUserOAuthProvider}=await import("./oauth-provider.js");
+  const {StreamableHTTPClientTransport}=await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
+  const root=await realpath(await mkdtemp(join(tmpdir(),"devspace-c3-http-")));
+  const project=join(root,"project");
+  await mkdir(project);
+  await git(project,["init"]);
+  await git(project,["-c","user.name=Fixture","-c","user.email=fixture@example.test","commit","--allow-empty","-m","fixture"]);
+  await writeFile(join(project,"package.json"),'{"name":"fixture","version":"1.0.0"}');
+  await writeFile(join(project,"package-lock.json"),'{"lockfileVersion":3,"packages":{}}');
+  const base=(await execFileAsync("git",["rev-parse","HEAD"],{cwd:project})).stdout.trim();
+  const config=loadConfig({DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_ALLOWED_ROOTS:root,DEVSPACE_STATE_DIR:join(root,"state"),DEVSPACE_WORKTREE_ROOT:join(root,"worktrees"),DEVSPACE_PUBLIC_BASE_URL:"http://127.0.0.1:1",DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",PORT:"1"});
+  const provider=new SingleUserOAuthProvider(config.oauth,new URL("/mcp",config.publicBaseUrl),config.stateDir);
+  const oauthClient=await provider.clientsStore.registerClient!({redirect_uris:["http://localhost/callback"],client_name:"C3 fixture",token_endpoint_auth_method:"none"});
+  let redirect="";
+  await provider.authorize(oauthClient,{redirectUri:"http://localhost/callback",codeChallenge:"fixture",scopes:config.oauth.scopes,resource:new URL("/mcp",config.publicBaseUrl)}, {req:{method:"POST",body:{owner_token:config.oauth.ownerToken}},redirect:(_status:number,url:string)=>{redirect=url;}} as never);
+  const tokens=await provider.exchangeAuthorizationCode(oauthClient,new URL(redirect).searchParams.get("code")!);
+  const grant={repository:"owner/repo",goal:"http-fixture",coordinatorThread:"controller",evidenceHash:"external-fixture-proof"};
+  let approvedHash=""; let leaseId=""; let readerClient:unknown;
+  let ownership: import("./control-plane-ownership.js").ControlPlaneOwnershipStore;
+  const authenticated=(c:unknown)=>!!c && (c as {clientId?:string}).clientId===oauthClient.client_id && typeof (c as {sessionId?:string}).sessionId==="string";
+  const coordination:import("./control-plane-consumer.js").ControlPlaneConsumerOptions={
+    readDependencyReconciliation:c=>{readerClient=(c as {clientId:string}).clientId;return undefined;},
+    resolveOwnerContext:c=>authenticated(c)?{ownerThread:"delegated-cli-worker"}:undefined,
+    verifyGrantEvidence:g=>JSON.stringify(g)===JSON.stringify(grant),
+    resolveEffectBinding:(c,subject)=>authenticated(c) && subject.workspaceRoot===project && subject.baseRevision===base && subject.requestHash===approvedHash ? {leaseId,leaseVersion:ownership.get(leaseId)!.version,requestHash:approvedHash,role:"worker"}:undefined,
+  };
+  const running=createServer(config,{coordination});
+  const manager=new DurableOperationManager(config,undefined,undefined,undefined,coordination);
+  ownership=manager.store.createOwnershipStore(coordination);
+  const listener=running.app.listen(0,"127.0.0.1");
+  await new Promise<void>(resolve=>listener.once("listening",resolve));
+  const address=listener.address() as {port:number};
+  const transport=new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${address.port}/mcp`),{requestInit:{headers:{Authorization:`Bearer ${tokens.access_token}`}}});
+  const client=new Client({name:"fixture-cli-worker",version:"1"});
+  try {
+    await client.connect(transport);
+    const opened=await callOpen(client,project,"http-fixture-conversation");
+    const workspaceId=structuredContent(opened).workspaceId as string;
+    assert.equal(typeof workspaceId,"string",JSON.stringify(opened));
+    const input={workspaceId,attemptKey:"http-fixture",recipe:"npm_ci",authorityMode:"OWNER_DIRECT"};
+    const denied=await client.callTool({name:"dependency_sync",arguments:input,_meta:{ownerThread:"controller",role:"controller"}});
+    assert.equal(denied.isError,true);
+    const sha=(value:string|Buffer)=>createHash("sha256").update(value).digest("hex");
+    approvedHash=sha(JSON.stringify({baseRevision:base,frozenInputs:{"package-lock.json":sha(await readFile(join(project,"package-lock.json"))),"package.json":sha(await readFile(join(project,"package.json")))},recipe:"npm_ci",version:"devspace.execution.v1",workspaceId,workspaceRoot:project}));
+    const trustedContext={clientId:oauthClient.client_id,sessionId:transport.sessionId};
+    ownership.putGrantEvidence(trustedContext,grant,0);
+    leaseId=ownership.acquire(trustedContext,{repositoryKey:grant.repository,resourceKind:"workspace",resourceId:project,resource:project,scope:[project],operation:"dependency_sync",baseRevision:base,expiresAt:new Date(Date.now()+60000).toISOString(),idempotencyKey:"http-fixture",grant}).leaseId;
+    const result=await client.callTool({name:"dependency_sync",arguments:input});
+    assert.equal(result.isError,undefined,JSON.stringify(result));
+    assert.equal(structuredContent(result).status,"succeeded");
+    assert.equal(ownership.get(leaseId)?.ownerThread,"delegated-cli-worker");
+    const unprovedReconcile=await client.callTool({name:"operation_reconcile",arguments:{operationId:structuredContent(result).operationId},_meta:{ownerThread:"controller",role:"controller"}});
+    assert.equal(unprovedReconcile.isError,true);
+    assert.match(JSON.stringify(unprovedReconcile),/terminal witness is unavailable/);
+    assert.equal(readerClient,oauthClient.client_id);
+    const otherOAuth=await provider.clientsStore.registerClient!({redirect_uris:["http://localhost/callback"],client_name:"Other client",token_endpoint_auth_method:"none"});
+    await provider.authorize(otherOAuth,{redirectUri:"http://localhost/callback",codeChallenge:"fixture",scopes:config.oauth.scopes,resource:new URL("/mcp",config.publicBaseUrl)}, {req:{method:"POST",body:{owner_token:config.oauth.ownerToken}},redirect:(_status:number,url:string)=>{redirect=url;}} as never);
+    const otherTokens=await provider.exchangeAuthorizationCode(otherOAuth,new URL(redirect).searchParams.get("code")!);
+    const otherClient=new Client({name:"other-client",version:"1"});
+    try {
+      await otherClient.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${address.port}/mcp`),{requestInit:{headers:{Authorization:`Bearer ${otherTokens.access_token}`}}}));
+      const otherSync=await otherClient.callTool({name:"dependency_sync",arguments:input,_meta:{clientId:oauthClient.client_id,ownerThread:"controller"}});
+      assert.equal(otherSync.isError,true);
+      const otherReconcile=await otherClient.callTool({name:"operation_reconcile",arguments:{operationId:structuredContent(result).operationId},_meta:{clientId:oauthClient.client_id,ownerThread:"controller"}});
+      assert.equal(otherReconcile.isError,true);
+      assert.equal(readerClient,otherOAuth.client_id);
+    } finally {await otherClient.close();}
+
+    const replay=await client.callTool({name:"dependency_sync",arguments:input});
+    assert.equal(structuredContent(replay).operationId,structuredContent(result).operationId);
+    const changed=await client.callTool({name:"dependency_sync",arguments:{...input,recipe:"pnpm_frozen"}});
+    assert.equal(changed.isError,true);
+  } finally {
+    await client.close(); await running.close(); manager.close(); provider.close();
+    await new Promise<void>((resolve,reject)=>listener.close(e=>e?reject(e):resolve()));
+  }
 });
