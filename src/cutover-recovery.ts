@@ -559,8 +559,8 @@ export async function performNativeCrossDomainBindingRepair(
       if (!receipt || receipt.witnessWorkspaceId !== options.workspaceId || receipt.witnessAgentId !== options.agentId) {
         throw new CutoverStateError("[REPAIR_BINDING_MISMATCH] Closed replay pair does not match stored reconciliation receipt.");
       }
-      await validateClosedBindingRepair(store, client, options, before, serverInstanceId, sourceCommit, buildId, capabilityManifestSha256, before.bindingRepair);
       committedRecord = before;
+      await validateClosedBindingRepair(store, client, options, before, serverInstanceId, sourceCommit, buildId, capabilityManifestSha256, before.bindingRepair);
       return {
         cutover: before,
         newlyRecovered: false,

@@ -260,7 +260,9 @@ type MockHttpOptions = {
   statusPhases?: Array<"drained" | "closed">;
   statusServerInstanceIds?: string[];
   statusStateDir?: string;
+  statusExpectedDigest?: string;
   statusFailAfter?: number;
+  statusFailOnCall?: number;
   onCallTool?: (name: string, args: Record<string, unknown>) => void;
 };
 
@@ -376,6 +378,7 @@ async function createMockReplacementServer(options: MockHttpOptions = {}) {
         }
         if (name === "cutover_status") {
           if (options.statusFailAfter !== undefined && statusCalls >= options.statusFailAfter) return fail("post-close status unavailable", 503);
+          if (options.statusFailOnCall !== undefined && statusCalls === options.statusFailOnCall) return fail("replay post-close status unavailable", 503);
           const phase = options.statusPhases?.[statusCalls] ?? (options.statusStateDir ? new CutoverStateStore(options.statusStateDir).get()?.phase ?? "drained" : "drained");
           const ownedRecord = options.statusStateDir ? new CutoverStateStore(options.statusStateDir).get() : undefined;
           statusCalls += 1;
@@ -392,7 +395,7 @@ async function createMockReplacementServer(options: MockHttpOptions = {}) {
                     expectedNewIdentity: {
                       sourceCommit,
                       buildId,
-                      capabilityManifestSha256: ownedRecord?.expectedNewIdentity.capabilityManifestSha256 ?? options.statusDigest ?? capabilityManifestSha256,
+                      capabilityManifestSha256: ownedRecord?.expectedNewIdentity.capabilityManifestSha256 ?? options.statusExpectedDigest ?? options.statusDigest ?? capabilityManifestSha256,
                     },
                   },
                   currentServerIdentity: {
@@ -1232,6 +1235,87 @@ test("Positive: Exact production deadlock reproduced and terminally repaired wit
   }
 });
 
+test("Closed replay native status failure preserves committed record evidence", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-replay-status-state-"));
+  const pkgDir = mkdtempSync(join(tmpdir(), "devspace-replay-status-pkg-"));
+  const cutoverId = "cutover-replay-status-fail";
+  const mock = await createMockReplacementServer({
+    cutoverId,
+    statusStateDir: stateDir,
+    statusFailOnCall: 3,
+    workspaceId: "ws-replay-status",
+    agentId: "agt-replay-status",
+  });
+  setupDrainedRecord(stateDir, cutoverId);
+  try {
+    createPackageRoot(pkgDir, SHA_BUILD_MANIFEST);
+    const options = {
+      cutoverId,
+      stateDir,
+      packageRoot: pkgDir,
+      serverUrl: mock.serverUrl,
+      ownerToken: mock.ownerToken,
+      workspaceId: "ws-replay-status",
+      agentId: "agt-replay-status",
+      requesterIdentity: { serverInstanceId: "repair-cli", sourceCommit: SHA_COMMIT, buildId: BUILD_ID },
+    } satisfies NativeCrossDomainBindingRepairOptions;
+    await performNativeCrossDomainBindingRepair(options);
+    await assert.rejects(
+      performNativeCrossDomainBindingRepair(options),
+      (error: unknown) => error instanceof NativeObservedReplacementCommittedError && error.committedRecord.phase === "closed" && error.message.includes("replay post-close status unavailable"),
+    );
+  } finally {
+    await mock.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(pkgDir, { recursive: true, force: true });
+  }
+});
+
+test("Closed replay durable readback failure preserves committed record evidence", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-replay-readback-state-"));
+  const pkgDir = mkdtempSync(join(tmpdir(), "devspace-replay-readback-pkg-"));
+  const cutoverId = "cutover-replay-readback-fail";
+  const mock = await createMockReplacementServer({
+    cutoverId,
+    statusPhases: ["drained", "closed", "closed", "closed"],
+    statusExpectedDigest: SHA_BUILD_MANIFEST,
+    statusDigest: SHA_CAPABILITY_MANIFEST,
+    workspaceId: "ws-replay-readback",
+    agentId: "agt-replay-readback",
+  });
+  setupDrainedRecord(stateDir, cutoverId);
+  const originalGet = CutoverStateStore.prototype.get;
+  try {
+    createPackageRoot(pkgDir, SHA_BUILD_MANIFEST);
+    const options = {
+      cutoverId,
+      stateDir,
+      packageRoot: pkgDir,
+      serverUrl: mock.serverUrl,
+      ownerToken: mock.ownerToken,
+      workspaceId: "ws-replay-readback",
+      agentId: "agt-replay-readback",
+      requesterIdentity: { serverInstanceId: "repair-cli", sourceCommit: SHA_COMMIT, buildId: BUILD_ID },
+    } satisfies NativeCrossDomainBindingRepairOptions;
+    await performNativeCrossDomainBindingRepair(options);
+    let replayReads = 0;
+    CutoverStateStore.prototype.get = function (this: CutoverStateStore) {
+      replayReads += 1;
+      if (replayReads === 2) throw new Error("injected closed replay durable readback failure");
+      return originalGet.call(this);
+    };
+    await assert.rejects(
+      performNativeCrossDomainBindingRepair(options),
+      (error: unknown) => error instanceof NativeObservedReplacementCommittedError && error.committedRecord.phase === "closed" && error.message.includes("injected closed replay durable readback failure"),
+    );
+  } finally {
+    CutoverStateStore.prototype.get = originalGet;
+    await mock.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(pkgDir, { recursive: true, force: true });
+  }
+});
+
 test("Committed partial repair preserves the durable receipt when close fails, then exact retry closes it", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-close-fault-state-"));
   const pkgDir = mkdtempSync(join(tmpdir(), "devspace-close-fault-pkg-"));
@@ -1657,7 +1741,7 @@ test("G71-R6b: Fresh durable updatedAt validation fails closed before repair mar
 test("G71-R7: 150a36f old parser and mode() function accept repaired record and resolve mode=normal", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-150-compat-state-"));
   const pkgDir = mkdtempSync(join(tmpdir(), "devspace-150-compat-pkg-"));
-  const mock = await createMockReplacementServer();
+  const mock = await createMockReplacementServer({ statusStateDir: stateDir, workspaceId: "ws-test", agentId: "agt-test" });
   try {
     createPackageRoot(pkgDir, SHA_BUILD_MANIFEST);
     setupDrainedRecord(stateDir, "cutover-150compat", SHA_BUILD_MANIFEST);
