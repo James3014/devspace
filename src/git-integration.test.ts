@@ -157,7 +157,7 @@ test("committed Candidate range integrates exactly; unrelated dirt survives; unt
   }
 });
 
-test("failed integration never leaves partial changes (late apply failure)", async () => {
+test("write-denied destination rejects late apply failure without changing tracked bytes", async () => {
   const source = makeRepo("late-fail-src", { "a.ts": "v1\n" });
   const destination = makeRepo("late-fail-dst", { "a.ts": "v1\n" });
   try {
@@ -169,10 +169,23 @@ test("failed integration never leaves partial changes (late apply failure)", asy
     const readiness = await inspectIntegrationReadiness(input);
     assert.equal(readiness.technicallyReadyToApply, true);
 
-    // ...but make the real `git apply` fail AFTER the check phase: the
-    // destination directory becomes unwritable so no file can be created,
-    // replaced, or deleted during the mutation step.
-    chmodSync(destination, 0o555);
+    // ...but make the real `git apply` fail AFTER the check phase. POSIX uses
+    // the original mode-bit fixture. Windows needs an ACL deny because mode
+    // bits do not deny writes there.
+    let windowsAclSid: string | undefined;
+    let windowsAclApplied = false;
+    if (process.platform === "win32") {
+      const whoami = execFileSync("whoami", ["/user", "/fo", "csv", "/nh"], { encoding: "utf8" });
+      const sidMatches = whoami.match(/\bS-\d-(?:\d+-){1,14}\d+\b/g) ?? [];
+      assert.equal(sidMatches.length, 1, "whoami must return exactly one current-user SID");
+      windowsAclSid = sidMatches[0];
+      execFileSync("icacls", [destination, "/deny", `*${windowsAclSid}:(OI)(CI)(W,D,DC)`], {
+        encoding: "utf8",
+      });
+      windowsAclApplied = true;
+    } else {
+      chmodSync(destination, 0o555);
+    }
     try {
       const result = await integrateCandidate({ ...input, confirmApply: true });
       assert.equal(result.applied, false);
@@ -182,7 +195,13 @@ test("failed integration never leaves partial changes (late apply failure)", asy
       const status = runGitRaw(["status", "--porcelain"], destination);
       assert.equal(status, "");
     } finally {
-      chmodSync(destination, 0o755);
+      if (process.platform === "win32") {
+        if (windowsAclApplied && windowsAclSid !== undefined) {
+          execFileSync("icacls", [destination, "/remove:d", `*${windowsAclSid}`], { encoding: "utf8" });
+        }
+      } else {
+        chmodSync(destination, 0o755);
+      }
     }
   } finally {
     cleanupRepo(source);
