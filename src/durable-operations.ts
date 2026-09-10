@@ -361,6 +361,11 @@ export class DurableOperationManager {
     });
   }
 
+  readHandoff(leaseId: string, previousVersion: number, expectedCurrentVersion: number, consumerContext?: unknown) {
+    if (!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "handoff readback requires trusted host authority");
+    return this.consumer.readHandoff(consumerContext, leaseId, previousVersion, expectedCurrentVersion);
+  }
+
   async dependencySync(input: DependencySyncInput, consumerContext?: unknown): Promise<DurableOperationRecord> {
     if (!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency sync requires a trusted host authority reader");
     const consumer = this.consumer;

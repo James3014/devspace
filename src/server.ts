@@ -2424,6 +2424,22 @@ export function createMcpServer(
 
     registerAppTool(
       server,
+      "coordination_handoff_readback",
+      {
+        title: "Read handoff receipt",
+        description: "Recover one existing handoff receipt under current authenticated recipient and lease-version checks. Returns historical receipt and current lease separately. This read does not transfer ownership, renew a lease, or authorize execution.",
+        inputSchema: {leaseId:z.string().min(1),previousVersion:z.number().int().positive(),expectedCurrentVersion:z.number().int().positive()},
+        annotations: {readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+        _meta: {},
+      },
+      async ({leaseId,previousVersion,expectedCurrentVersion}, extra) => {
+        const result = durableOperations.readHandoff(leaseId, previousVersion, expectedCurrentVersion, dependencyConsumerContext(extra));
+        return {content:[textBlock(JSON.stringify(result))],structuredContent:result};
+      },
+    );
+
+    registerAppTool(
+      server,
       "dependency_sync",
       {
         title: "Synchronize dependencies",

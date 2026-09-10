@@ -30,6 +30,10 @@ export interface ControlPlaneConsumerOptions extends ControlPlaneOwnershipOption
 export class ControlPlaneConsumer {
   constructor(private readonly ownership: ControlPlaneOwnershipStore, private readonly options: ControlPlaneConsumerOptions) {}
 
+  readHandoff(context: unknown, leaseId: string, previousVersion: number, expectedCurrentVersion: number) {
+    return this.ownership.readHandoff(context, leaseId, previousVersion, expectedCurrentVersion);
+  }
+
   authorize(context: unknown, subject: EffectSubject): EffectBinding {
     const binding = this.options.resolveEffectBinding(context, Object.freeze({...subject}));
     if (!binding || !["controller", "worker"].includes(binding.role) || binding.requestHash !== subject.requestHash) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "trusted effect binding required");

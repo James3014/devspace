@@ -2086,12 +2086,12 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
   await provider.authorize(oauthClient,{redirectUri:"http://localhost/callback",codeChallenge:"fixture",scopes:config.oauth.scopes,resource:new URL("/mcp",config.publicBaseUrl)}, {req:{method:"POST",body:{owner_token:config.oauth.ownerToken}},redirect:(_status:number,url:string)=>{redirect=url;}} as never);
   const tokens=await provider.exchangeAuthorizationCode(oauthClient,new URL(redirect).searchParams.get("code")!);
   const grant={repository:"owner/repo",goal:"http-fixture",coordinatorThread:"controller",evidenceHash:"external-fixture-proof"};
-  let approvedHash=""; let leaseId=""; let readerClient:unknown;
+  let approvedHash=""; let leaseId=""; let readerClient:unknown; let successorClientId="";
   let ownership: import("./control-plane-ownership.js").ControlPlaneOwnershipStore;
   const authenticated=(c:unknown)=>!!c && (c as {clientId?:string}).clientId===oauthClient.client_id && typeof (c as {sessionId?:string}).sessionId==="string";
   const coordination:import("./control-plane-consumer.js").ControlPlaneConsumerOptions={
     readDependencyReconciliation:c=>{readerClient=(c as {clientId:string}).clientId;return undefined;},
-    resolveOwnerContext:c=>authenticated(c)?{ownerThread:"delegated-cli-worker"}:undefined,
+    resolveOwnerContext:c=>authenticated(c)?{ownerThread:"delegated-cli-worker"}:successorClientId && (c as {clientId?:string})?.clientId===successorClientId ? {ownerThread:"successor"}:undefined,
     verifyGrantEvidence:g=>JSON.stringify(g)===JSON.stringify(grant),
     resolveEffectBinding:(c,subject)=>authenticated(c) && subject.workspaceRoot===project && subject.baseRevision===base && subject.requestHash===approvedHash ? {leaseId,leaseVersion:ownership.get(leaseId)!.version,requestHash:approvedHash,role:"worker"}:undefined,
   };
@@ -2120,6 +2120,9 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
     assert.equal(result.isError,undefined,JSON.stringify(result));
     assert.equal(structuredContent(result).status,"succeeded");
     assert.equal(ownership.get(leaseId)?.ownerThread,"delegated-cli-worker");
+    const initialReplay=await client.callTool({name:"dependency_sync",arguments:input});
+    assert.equal(initialReplay.isError,undefined);
+    assert.equal(structuredContent(initialReplay).operationId,structuredContent(result).operationId);
     const unprovedReconcile=await client.callTool({name:"operation_reconcile",arguments:{operationId:structuredContent(result).operationId},_meta:{ownerThread:"controller",role:"controller"}});
     assert.equal(unprovedReconcile.isError,true);
     assert.match(JSON.stringify(unprovedReconcile),/terminal witness is unavailable/);
@@ -2135,10 +2138,31 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
       const otherReconcile=await otherClient.callTool({name:"operation_reconcile",arguments:{operationId:structuredContent(result).operationId},_meta:{clientId:oauthClient.client_id,ownerThread:"controller"}});
       assert.equal(otherReconcile.isError,true);
       assert.equal(readerClient,otherOAuth.client_id);
+      successorClientId=otherOAuth.client_id;
+      const current=ownership.get(leaseId)!;
+      const handoff=ownership.handoff(trustedContext,leaseId,current.version,{clientId:successorClientId,sessionId:"fixture-recipient"},{
+        resource:current.resource,baseRevision:current.baseRevision,scope:current.scope,candidateRevision:base,liveOperation:current.operation,liveHandle:current.operationHandle??"",
+        checkpoint:"installed-workspace-checkpoint",grantDependency:current.grant,grantVersion:current.grantVersion,recipientGrant:current.grant,recipientGrantVersion:current.grantVersion,
+        forbiddenOverlap:[project],tests:["http-witness"],evidence:["terminal-operation"],remainingGap:"next revision",nextGate:"readback",expiresAt:current.expiresAt,
+      });
+      const readArgs={leaseId,previousVersion:handoff.previousVersion,expectedCurrentVersion:handoff.newVersion};
+      const beforeRead=JSON.stringify(ownership.get(leaseId));
+      const recovered=await otherClient.callTool({name:"coordination_handoff_readback",arguments:readArgs});
+      assert.equal(recovered.isError,undefined,JSON.stringify(recovered));
+      assert.deepEqual(structuredContent(recovered).receipt,handoff);
+      assert.equal((structuredContent(recovered).currentLease as {ownerThread:string}).ownerThread,"successor");
+      const repeated=await otherClient.callTool({name:"coordination_handoff_readback",arguments:readArgs});
+      assert.deepEqual(structuredContent(repeated),structuredContent(recovered));
+      const former=await client.callTool({name:"coordination_handoff_readback",arguments:readArgs,_meta:{clientId:successorClientId,ownerThread:"successor"}});
+      assert.equal(former.isError,true);
+      const stale=await otherClient.callTool({name:"coordination_handoff_readback",arguments:{...readArgs,expectedCurrentVersion:handoff.previousVersion}});
+      assert.equal(stale.isError,true);
+      assert.equal(JSON.stringify(ownership.get(leaseId)),beforeRead);
+
     } finally {await otherClient.close();}
 
     const replay=await client.callTool({name:"dependency_sync",arguments:input});
-    assert.equal(structuredContent(replay).operationId,structuredContent(result).operationId);
+    assert.equal(replay.isError,true);
     const changed=await client.callTool({name:"dependency_sync",arguments:{...input,recipe:"pnpm_frozen"}});
     assert.equal(changed.isError,true);
   } finally {
