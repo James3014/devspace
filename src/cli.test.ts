@@ -95,7 +95,15 @@ for (const args of [
 }
 
 const root = mkdtempSync(join(tmpdir(), "devspace-cli-agents-test-"));
+// A fresh production-tsconfig compilation keeps tsx cold loading outside the
+// worker exit deadline. Both direct and CI-wrapper invocations use this fixture.
+const compiledWorkerDir = mkdtempSync(join(process.cwd(), ".cli-worker-build-"));
 try {
+  const compilationStarted = performance.now();
+  execFileSync(process.execPath, [require.resolve("typescript/bin/tsc"), "-p", "tsconfig.build.json", "--outDir", compiledWorkerDir], { cwd: process.cwd(), stdio: "pipe", timeout: 120000 });
+  const compiledWorkerEntry = join(compiledWorkerDir, "cli.js");
+  assert.equal(existsSync(compiledWorkerEntry), true);
+  console.error(`[cli-worker-build] elapsedMs=${Math.round(performance.now() - compilationStarted)}`);
   const configDir = join(root, ".devspace");
   const stateDir = join(root, ".state");
   const projectRoot = join(root, "project");
@@ -257,7 +265,7 @@ writeNextChunk();
       const promptDir = mkdtempSync(join(tmpdir(), "devspace-agent-prompt-"));
       const promptFile = join(promptDir, "prompt.txt");
       writeFileSync(promptFile, prompt);
-      const child = spawn(process.execPath, ["--import", "tsx", "src/cli.ts", "agents", "__worker", worker.id, "--prompt-file", promptFile, "--worker-token", token], {
+      const child = spawn(process.execPath, [compiledWorkerEntry, "agents", "__worker", worker.id, "--prompt-file", promptFile, "--worker-token", token], {
         cwd: process.cwd(), env: { ...workerEnv, DESCENDANT_PID_FILE: prompt === "success" ? descendantPidPath : "", FORCE_MALFORMED: prompt === "failure" ? "1" : "" },
         stdio: ["ignore", "pipe", "pipe"],
       });
@@ -569,6 +577,7 @@ writeNextChunk();
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
   }).subagents.enabled, true);
 } finally {
+  rmSync(compiledWorkerDir, { recursive: true, force: true });
   rmSync(root, { recursive: true, force: true });
 }
 
