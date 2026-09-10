@@ -20,7 +20,7 @@ export interface DependencyReconciliationEvidence extends ReconciliationEvidence
   exitCode: number;
   frozenInputsUnchanged: boolean;
 }
-export interface CutoverLifecycleAction { action: "drain"; cutoverId: string; currentIdentity: Readonly<CutoverServerIdentity>; }
+export interface CutoverLifecycleAction { action: "drain" | "finish"; cutoverId: string; currentIdentity: Readonly<CutoverServerIdentity>; preferredPair?: Readonly<{workspaceId:string;agentId:string}>; }
 export interface ControlPlaneConsumerOptions extends ControlPlaneOwnershipOptions {
   approveCutoverLifecycle?(context: unknown, subject: Readonly<EffectSubject>, action: Readonly<CutoverLifecycleAction>): boolean;
   readCompletionContract?(context: unknown, selection: Readonly<CompletionSelection>): unknown;
@@ -53,10 +53,14 @@ export class ControlPlaneConsumer {
     return Object.freeze({leaseId:binding.leaseId,pinnedLeaseVersion:pinnedVersion,operationHandle:subject.operationId,requestHash:subject.requestHash,ownerThread:this.ownership.get(binding.leaseId)!.ownerThread});
   }
 
-  authorizeCutoverLifecycle(context: unknown, subject: EffectSubject, action: CutoverLifecycleAction) {
+  authorizeCutoverLifecycle(context: unknown, subject: EffectSubject, action: CutoverLifecycleAction, requirePin=true) {
     const binding=this.authorize(context,subject);
-    if(binding.role!=="controller" || this.options.approveCutoverLifecycle?.(context,Object.freeze({...subject}),Object.freeze({...action,currentIdentity:Object.freeze({...action.currentIdentity})}))!==true) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","explicit cutover lifecycle approval required");
-    this.assertPinned(context,subject,binding,binding.leaseVersion);
+    if(binding.role!=="controller" || this.options.approveCutoverLifecycle?.(context,Object.freeze({...subject}),Object.freeze({...action,currentIdentity:Object.freeze({...action.currentIdentity}),...(action.preferredPair?{preferredPair:Object.freeze({...action.preferredPair})}:{})}))!==true) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","explicit cutover lifecycle approval required");
+    if(requirePin) this.assertPinned(context,subject,binding,binding.leaseVersion);
+    else {
+      if(this.ownership.get(binding.leaseId)?.operationHandle!==undefined) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal replay cannot touch a newer pin");
+      if(JSON.stringify(this.authorize(context,subject))!==JSON.stringify(binding)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal replay authority changed");
+    }
     return binding;
   }
 

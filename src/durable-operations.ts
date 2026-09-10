@@ -1,6 +1,6 @@
 import type { CompletionSelection } from "./current-completion-matrix.js";
 import { isDeepStrictEqual } from "node:util";
-import { McpCutoverController } from "./mcp-cutover.js";
+import { McpCutoverController, compareServerIdentity, type DurableReconciliationWitness } from "./mcp-cutover.js";
 import { CutoverStateStore, type CutoverServerIdentity, type CutoverDrainEvidence, type ExpectedCutoverIdentity, type CutoverCoordinationBinding } from "./cutover-state.js";
 import { ControlPlaneConsumer, type ControlPlaneConsumerOptions, type DependencyReconciliationEvidence } from "./control-plane-consumer.js";
 import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type HandoffInput } from "./control-plane-ownership.js";
@@ -454,6 +454,51 @@ export class DurableOperationManager {
       if(!isDeepStrictEqual(current,binding)||!isDeepStrictEqual(cutoverStore.get(),observed)||!isDeepStrictEqual(this.store.getByOperationId(intent.operationId),intent)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","drain binding changed during evidence collection");
       // Same DB fence; file effects cannot be rolled back by a SQLite failure.
       return new McpCutoverController(cutoverStore,identity).recordDrain(cutoverId,evidence);
+    });
+  }
+
+  async finishCutover(cutoverId: string, currentIdentity: CutoverServerIdentity, preferredPair: {workspaceId:string;agentId:string}, reconcile: () => Promise<DurableReconciliationWitness>, context?: unknown) {
+    if(!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","cutover finish requires trusted host authority");
+    const consumer=this.consumer;
+    const identity=Object.freeze({...currentIdentity}),pair=Object.freeze({...preferredPair});
+    const action={action:"finish" as const,cutoverId,currentIdentity:identity,preferredPair:pair};
+    const cutoverStore=new CutoverStateStore(canonicalizePath(this.config.stateDir));
+    const digest=(record: NonNullable<ReturnType<CutoverStateStore["get"]>>)=>{const {expired,...durable}=record;return hashJson(durable);};
+    const readBound=()=>{
+      const file=cutoverStore.get();
+      if(!file?.coordinationBinding||file.cutoverId!==cutoverId) throw new ControlPlaneOwnershipError("CAS_CONFLICT","finish requires exact bound cutover generation");
+      const intent=this.store.getByOperationId(file.coordinationBinding.operationHandle);
+      if(!intent||intent.kind!=="cutover_start"||intent.scopeRoot!==canonicalizePath(this.config.stateDir)||typeof intent.request.baseRevision!=="string") throw new ControlPlaneOwnershipError("CAS_CONFLICT","finish intent binding is missing");
+      const {coordinationBinding,...request}=intent.request;
+      if(hashJson(request)!==intent.requestHash||request.stateRoot!==intent.scopeRoot||!isDeepStrictEqual(coordinationBinding,file.coordinationBinding)||!isDeepStrictEqual(request.currentIdentity,file.oldServerIdentity)||!isDeepStrictEqual(request.expectedIdentity,file.expectedNewIdentity)||request.expiresAt!==file.expiresAt) throw new ControlPlaneOwnershipError("CAS_CONFLICT","finish intent or file correlation changed");
+      const subject={operationId:intent.operationId,requestHash:intent.requestHash,workspaceRoot:intent.scopeRoot,baseRevision:intent.request.baseRevision,operation:"cutover_start" as const};
+      const replay=intent.receipt?.lifecycleTerminal===true;
+      const binding=consumer.authorizeCutoverLifecycle(context,subject,action,!replay);
+      if(binding.leaseId!==file.coordinationBinding.leaseId) throw new ControlPlaneOwnershipError("CAS_CONFLICT","finish authorized lease differs from generation");
+      const comparison=compareServerIdentity(file,identity);
+      if(!Object.values(comparison).every(Boolean)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","finish replacement runtime identity mismatch");
+      if(file.phase!=="drained"&&file.phase!=="closed") throw new ControlPlaneOwnershipError("CAS_CONFLICT","bound finish requires drained generation; recovery is separate");
+      if(replay&&(file.phase!=="closed"||intent.receipt?.terminalRecordHash!==digest(file)||!isDeepStrictEqual(intent.receipt?.lifecycleAction,action))) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal replay receipt mismatch");
+      return {file,intent,subject,binding,replay};
+    };
+    const validWitness=(w:DurableReconciliationWitness|undefined)=>!!w&&w.workspaceQueryable===true&&w.agentQueryable===true&&w.agentReconciled===true&&w.witnessWorkspaceId===pair.workspaceId&&w.witnessAgentId===pair.agentId;
+    const initial=this.store.atomic(readBound);
+    let witness:DurableReconciliationWitness|undefined;
+    if(initial.file.phase!=="closed") witness=JSON.parse(JSON.stringify(await reconcile())) as DurableReconciliationWitness;
+    return this.store.atomic(()=>{
+      const current=readBound();
+      if(!isDeepStrictEqual(current,initial)||!isDeepStrictEqual(cutoverStore.get(),current.file)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","finish binding changed while reconciliation was pending");
+      if(current.file.phase!=="closed") {
+        if(!validWitness(witness)) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","finish requires positive exact workspace/agent witness");
+        new McpCutoverController(cutoverStore,identity).finishWithWitness(cutoverId,witness!);
+      }
+      const closed=cutoverStore.get();const receipt=closed?.reconciliationReceipt;
+      if(!closed||closed.phase!=="closed"||closed.cutoverId!==cutoverId||!isDeepStrictEqual(closed.coordinationBinding,current.file.coordinationBinding)||!validWitness(receipt)||receipt?.closedByServerInstanceId!==identity.serverInstanceId||!Number.isFinite(Date.parse(receipt.reconciledAt))||Date.parse(receipt.reconciledAt)>Date.now()) throw new ControlPlaneOwnershipError("CAS_CONFLICT","closed file lacks exact terminal witness");
+      if(current.replay) return closed;
+      consumer.finish(context,current.subject,current.binding,current.binding.leaseVersion);
+      if(!isDeepStrictEqual(cutoverStore.get(),closed)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal file changed during final authority check");
+      this.store.finish(current.intent.operationId,{status:"succeeded",retrySafe:false,receipt:{...current.intent.receipt,lifecycleTerminal:true,terminalRecordHash:digest(closed),lifecycleAction:action}});
+      return closed;
     });
   }
 

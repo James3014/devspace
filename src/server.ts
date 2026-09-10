@@ -1721,8 +1721,14 @@ function registerCutoverMcpTools(
       _meta: {},
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
-    async ({ cutoverId, workspaceId, agentId }) => {
+    async ({ cutoverId, workspaceId, agentId }, extra) => {
       const activeRecord = control.controller.record();
+      if(activeRecord?.coordinationBinding) {
+        if(!durableOperations) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","cutover finish requires trusted coordination");
+        const record=await durableOperations.finishCutover(cutoverId,control.controller.currentIdentity,{workspaceId,agentId},()=>control.reconcileDurableState({workspaceId,agentId}),dependencyConsumerContext(extra));
+        const mode=control.controller.mode();
+        return {content:[textBlock(`Finished cutover ${cutoverId}; mode=${mode}.`)],structuredContent:{cutover:record as unknown as Record<string,unknown>,mode}};
+      }
       if (activeRecord && activeRecord.phase === "closed" && activeRecord.cutoverId === cutoverId) {
         if (activeRecord.observedReplacement && control.executeObservedReplacementRecovery) {
           const replay = await control.executeObservedReplacementRecovery({

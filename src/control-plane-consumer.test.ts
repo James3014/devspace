@@ -500,3 +500,64 @@ test("C3 drain response loss preserves pin and reconciles existing file without 
     assert.equal(writes,1);assert.equal(JSON.stringify(f.ownership.get(f.leaseId)),pin);
   } finally {CutoverStateStore.prototype.recordDrain=original;f.manager.close();}
 });
+
+test("C3 guarded finish closes exact generation, releases its pin and rejects newer-pin replay",async()=>{
+  const f=cutoverFixture();
+  try {
+    const start=f.manager.startCutover(f.input,f.context);const id=start.receipt!.cutoverId as string;
+    f.options.approveCutoverLifecycle=(c,s,a)=>c===f.context&&s.operationId===start.operationId;
+    f.manager.drainCutover(id,f.input.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),f.context);
+    const replacement={serverInstanceId:"replacement",...f.input.expectedIdentity};
+    const pair={workspaceId:"workspace",agentId:"agent"};let calls=0;
+    const reconcile=async()=>{calls++;return {workspaceQueryable:true,agentQueryable:true,agentReconciled:true,witnessWorkspaceId:pair.workspaceId,witnessAgentId:pair.agentId};};
+    const result=await f.manager.finishCutover(id,replacement,pair,reconcile,f.context);
+    assert.equal(result.phase,"closed");assert.equal(f.ownership.get(f.leaseId)?.operationHandle,undefined);
+    assert.equal(f.manager.store.getByOperationId(start.operationId)?.receipt?.lifecycleTerminal,true);
+    assert.deepEqual(await f.manager.finishCutover(id,replacement,pair,reconcile,f.context),result);assert.equal(calls,1);
+    const lease=f.ownership.get(f.leaseId)!;f.ownership.beginOperation(f.context,f.leaseId,lease.version,"new-operation");
+    await assert.rejects(f.manager.finishCutover(id,replacement,pair,reconcile,f.context),/pin/);
+    assert.equal(f.ownership.get(f.leaseId)?.operationHandle,"new-operation");
+  } finally {f.manager.close();}
+});
+
+test("C3 finish denial and uncertain terminal writes retain the original pin",async()=>{
+  const {CutoverStateStore}=await import("./cutover-state.js");
+  for(const failure of ["wrong-pair","wrong-runtime","revoke","handoff","close-response","terminal-write"]){
+    const f=cutoverFixture();const recipient={};const originalClose=CutoverStateStore.prototype.close;const originalFinish=f.manager.store.finish.bind(f.manager.store);
+    try {
+      const start=f.manager.startCutover(f.input,f.context);const id=start.receipt!.cutoverId as string;
+      f.options.approveCutoverLifecycle=(c,s)=>[f.context,recipient].includes(c as object)&&s.operationId===start.operationId;
+      f.manager.drainCutover(id,f.input.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),f.context);
+      const replacement={serverInstanceId:"replacement",...f.input.expectedIdentity};const pair={workspaceId:"workspace",agentId:"agent"};
+      const pin=f.ownership.get(f.leaseId)!;
+      const witness={workspaceQueryable:true,agentQueryable:true,agentReconciled:true,witnessWorkspaceId:pair.workspaceId,witnessAgentId:pair.agentId};let calls=0;
+      if(failure==="close-response") CutoverStateStore.prototype.close=function(id,r){originalClose.call(this,id,r);throw new Error("lost close response");};
+      if(failure==="terminal-write") f.manager.store.finish=()=>{throw new Error("terminal receipt failure");};
+      await assert.rejects(f.manager.finishCutover(id,failure==="wrong-runtime"?f.input.currentIdentity:replacement,pair,async()=>{
+        calls++;
+        if(failure==="revoke") f.revoke();
+        if(failure==="handoff") {
+          const owner=f.options.resolveOwnerContext!,resolver=f.options.resolveEffectBinding;
+          f.options.resolveOwnerContext=c=>c===recipient?{ownerThread:"recipient"}:owner(c);
+          f.options.resolveEffectBinding=(c,s)=>resolver(c===recipient?f.context:c,s);
+          f.ownership.handoff(f.context,f.leaseId,pin.version,recipient,{resource:pin.resource,scope:pin.scope,baseRevision:pin.baseRevision,candidateRevision:"candidate",liveOperation:pin.operation,liveHandle:start.operationId,checkpoint:"pending-finish",grantDependency:pin.grant,grantVersion:pin.grantVersion,recipientGrant:pin.grant,recipientGrantVersion:pin.grantVersion,forbiddenOverlap:[pin.resource],tests:["drain"],evidence:["bound-file"],remainingGap:"finish",nextGate:"reconcile",expiresAt:pin.expiresAt});
+        }
+        return {...witness,...(failure==="wrong-pair"?{witnessAgentId:"wrong"}:{})};
+      },f.context));
+      assert.equal(f.ownership.get(f.leaseId)?.operationHandle,start.operationId);
+      assert.notEqual(f.manager.store.getByOperationId(start.operationId)?.receipt?.lifecycleTerminal,true);
+      const file=new CutoverStateStore(f.config.stateDir).get()!;
+      assert.equal(file.phase,["close-response","terminal-write"].includes(failure)?"closed":"drained");
+      if(failure==="wrong-runtime") assert.equal(calls,0);
+      if(failure==="handoff") {
+        await assert.rejects(f.manager.finishCutover(id,replacement,pair,async()=>witness,f.context));
+        assert.equal((await f.manager.finishCutover(id,replacement,pair,async()=>witness,recipient)).phase,"closed");
+      }
+      if(["close-response","terminal-write"].includes(failure)) {
+        CutoverStateStore.prototype.close=originalClose;f.manager.store.finish=originalFinish;
+        assert.equal((await f.manager.finishCutover(id,replacement,pair,async()=>{throw new Error("must not repeat reconciliation");},f.context)).phase,"closed");
+        assert.equal(f.ownership.get(f.leaseId)?.operationHandle,undefined);
+      }
+    } finally {CutoverStateStore.prototype.close=originalClose;f.manager.store.finish=originalFinish;f.manager.close();}
+  }
+});

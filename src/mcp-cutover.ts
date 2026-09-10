@@ -291,10 +291,7 @@ export class McpCutoverController {
     return recoverCutoverWithStore(this.store, this.currentIdentity, input);
   }
 
-  async finish(
-    cutoverId: string,
-    reconcile: () => Promise<DurableReconciliationWitness>,
-  ): Promise<DurableCutoverRecord> {
+  private finishableRecord(cutoverId: string): DurableCutoverRecord {
     const record = this.store.get();
     if (!record) throw new CutoverStateError("No durable cutover record exists.");
     if (record.cutoverId !== cutoverId) {
@@ -322,8 +319,18 @@ export class McpCutoverController {
       );
     }
 
+    return record;
+  }
 
-    const witness = await reconcile();
+  async finish(cutoverId: string, reconcile: () => Promise<DurableReconciliationWitness>): Promise<DurableCutoverRecord> {
+    const record=this.finishableRecord(cutoverId);
+    if(record.phase==="closed") return record;
+    return this.finishWithWitness(cutoverId,await reconcile());
+  }
+
+  finishWithWitness(cutoverId: string, witness: DurableReconciliationWitness): DurableCutoverRecord {
+    const record=this.finishableRecord(cutoverId);
+    if(record.phase==="closed") return record;
     if (!witness.workspaceQueryable || !witness.agentQueryable || !witness.agentReconciled) {
       throw new CutoverStateError(
         "Cannot finish cutover: durable agent/workspace reconciliation witness is not fully positive.",

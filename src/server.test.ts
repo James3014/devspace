@@ -2246,6 +2246,12 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
       assert.equal(drained.isError,undefined,JSON.stringify(drained));
       const cutoverStore=new CutoverStateStore(config.stateDir);
       const beforeCutover=JSON.stringify(cutoverStore.get());
+      const finishArgs={cutoverId,workspaceId:"unverified-workspace",agentId:"unverified-agent"};
+      assert.equal((await otherClient.callTool({name:"cutover_finish",arguments:finishArgs})).isError,true);
+      assert.equal((await client.callTool({name:"cutover_finish",arguments:finishArgs,_meta:{clientId:successorClientId}})).isError,true);
+      assert.equal(JSON.stringify(cutoverStore.get()),beforeCutover);
+      assert.equal(ownership.get(cutoverLeaseId)?.operationHandle,operationId);
+
       assert.equal((await otherClient.callTool({name:"cutover_drain",arguments:{cutoverId}})).isError,undefined);
       assert.equal(JSON.stringify(cutoverStore.get()),beforeCutover);
 
