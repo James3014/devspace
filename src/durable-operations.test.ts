@@ -1,11 +1,13 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { access, chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { access, chmod, realpath, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
+import type { ControlPlaneOwnershipStore } from "./control-plane-ownership.js";
+import type { ControlPlaneConsumerOptions } from "./control-plane-consumer.js";
 import { loadConfig } from "./config.js";
 import {
   DurableOperationError,
@@ -193,6 +195,29 @@ test("workspace_clone rejects destinations outside allowed roots and conflicting
   }
 });
 
+async function dependencyFixtureManager(config: ReturnType<typeof loadConfig>, runner: CommandRunner, path: string) {
+  const root=await realpath(path);
+  await git(root,"init");
+  await git(root,"-c","user.name=Fixture","-c","user.email=fixture@example.test","commit","--allow-empty","-m","fixture");
+  const base=await git(root,"rev-parse","HEAD");
+  const sha=(value: string|Buffer)=>createHash("sha256").update(value).digest("hex");
+  const requestHash=sha(JSON.stringify({baseRevision:base,frozenInputs:{"package-lock.json":sha(await readFile(join(root,"package-lock.json"))),"package.json":sha(await readFile(join(root,"package.json")))},recipe:"npm_ci",version:"devspace.execution.v1",workspaceId:"ws_fixture",workspaceRoot:root}));
+  const context=Object.freeze({});
+  const grant={repository:"owner/repo",goal:"fixture",coordinatorThread:"controller",evidenceHash:"fixture-proof"};
+  let ownership:ControlPlaneOwnershipStore;
+  let leaseId="";
+  const options:ControlPlaneConsumerOptions={
+    resolveOwnerContext:c=>c===context?{ownerThread:"fixture"}:undefined,
+    verifyGrantEvidence:g=>JSON.stringify(g)===JSON.stringify(grant),
+    resolveEffectBinding:(c,subject)=>c===context && subject.requestHash===requestHash ? {leaseId,leaseVersion:ownership.get(leaseId)!.version,requestHash,role:"worker"}:undefined,
+  };
+  const manager=new DurableOperationManager(config,runner,undefined,undefined,options);
+  ownership=manager.store.createOwnershipStore(options);
+  ownership.putGrantEvidence(context,grant,0);
+  leaseId=ownership.acquire(context,{repositoryKey:grant.repository,resourceKind:"workspace",resourceId:root,resource:root,scope:[root],operation:"dependency_sync",baseRevision:base,expiresAt:new Date(Date.now()+60000).toISOString(),idempotencyKey:"fixture",grant}).leaseId;
+  return {manager,context};
+}
+
 test("dependency_sync frozen recipe succeeds without changing manifest or lock inputs", async () => {
   const f = await fixture();
   try {
@@ -203,14 +228,14 @@ test("dependency_sync frozen recipe succeeds without changing manifest or lock i
     const beforeManifest = await readFile(join(project, "package.json"), "utf8");
     const beforeLock = await readFile(join(project, "package-lock.json"), "utf8");
     const runner: CommandRunner = async () => ({ exitCode: 0, stdout: "ok", stderr: "" });
-    const manager = new DurableOperationManager(f.config, runner);
+    const {manager,context} = await dependencyFixtureManager(f.config,runner,project);
     try {
       const result = await manager.dependencySync({
         attemptKey: "deps-frozen-1",
         workspaceId: "ws_fixture",
         workspaceRoot: project,
         recipe: "npm_ci",
-      });
+      },context);
       assert.equal(result.status, "succeeded");
       assert.equal(await readFile(join(project, "package.json"), "utf8"), beforeManifest);
       assert.equal(await readFile(join(project, "package-lock.json"), "utf8"), beforeLock);
@@ -233,14 +258,14 @@ test("dependency_sync detects frozen input mutation even when the command exits 
       await writeFile(join(cwd, "package-lock.json"), "{\"lockfileVersion\":3,\"mutated\":true}\n");
       return { exitCode: 0, stdout: "", stderr: "" };
     };
-    const manager = new DurableOperationManager(f.config, runner);
+    const {manager,context} = await dependencyFixtureManager(f.config,runner,project);
     try {
       const result = await manager.dependencySync({
         attemptKey: "deps-mutation-1",
         workspaceId: "ws_fixture",
         workspaceRoot: project,
         recipe: "npm_ci",
-      });
+      },context);
       assert.equal(result.status, "failed");
       assert.equal(result.errorCode, "FROZEN_INPUT_CHANGED");
       assert.equal(result.retrySafe, false);

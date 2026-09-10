@@ -1,3 +1,5 @@
+import { ControlPlaneConsumer, type ControlPlaneConsumerOptions, type DependencyReconciliationEvidence } from "./control-plane-consumer.js";
+import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore } from "./control-plane-ownership.js";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
@@ -133,6 +135,19 @@ export class DurableOperationStore {
     this.database.close();
   }
 
+  createOwnershipStore(options: ControlPlaneConsumerOptions): ControlPlaneOwnershipStore {
+    return new ControlPlaneOwnershipStore(this.database.sqlite, {
+      ...options,
+      resolveOwnerContext: context => {
+        const owner = options.resolveOwnerContext?.(context);
+        return owner && Object.freeze({...owner});
+      },
+      verifyGrantEvidence: (grant, owner) => options.verifyGrantEvidence?.(Object.freeze({...grant}), Object.freeze({...owner})) === true,
+    });
+  }
+
+  atomic<T>(work: () => T): T { return this.database.sqlite.transaction(work).immediate(); }
+
   markInterruptedUnknown(): number {
     const now = new Date().toISOString();
     const result = this.database.sqlite.prepare(`
@@ -141,7 +156,7 @@ export class DurableOperationStore {
           error_code = 'RECONCILIATION_REQUIRED',
           error_message = 'DevSpace restarted while the mutating operation was nonterminal; reconcile physical state before any replay.',
           updated_at = ?
-      where status = 'started'
+      where status = 'started' and kind != 'dependency_sync'
     `).run(now);
     return result.changes;
   }
@@ -254,15 +269,18 @@ export type CommandRunner = (
 
 export class DurableOperationManager {
   readonly store: DurableOperationStore;
+  private readonly consumer?: ControlPlaneConsumer;
 
   constructor(
     private readonly config: ServerConfig,
     private readonly runCommand: CommandRunner = spawnCommand,
     private readonly runNexusGatewayRecovery: NexusGatewayRecoveryRunner = spawnNexusGatewayRecovery,
     private readonly runNexusGatewayRecoveryPreflight: NexusGatewayRecoveryRunner = spawnNexusGatewayRecoveryPreflight,
+    coordination?: ControlPlaneConsumerOptions,
   ) {
     this.store = new DurableOperationStore(config.stateDir);
     this.store.markInterruptedUnknown();
+    if (coordination) this.consumer = new ControlPlaneConsumer(this.store.createOwnershipStore(coordination), coordination);
   }
 
   close(): void {
@@ -343,7 +361,9 @@ export class DurableOperationManager {
     });
   }
 
-  async dependencySync(input: DependencySyncInput): Promise<DurableOperationRecord> {
+  async dependencySync(input: DependencySyncInput, consumerContext?: unknown): Promise<DurableOperationRecord> {
+    if (!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency sync requires a trusted host authority reader");
+    const consumer = this.consumer;
     assertAttemptKey(input.attemptKey);
     const authorityMode = input.authorityMode ?? "OWNER_DIRECT";
     if (authorityMode !== "OWNER_DIRECT") {
@@ -360,8 +380,11 @@ export class DurableOperationManager {
 
     const frozenInputs = recipeFrozenInputs(input.recipe);
     const before = await hashFiles(workspaceRoot, frozenInputs);
+    const baseRevision = await readGitHead(workspaceRoot);
+    if (!baseRevision) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency workspace revision cannot be verified");
     const request = {
       version: EXECUTION_PROTOCOL_VERSION,
+      baseRevision,
       workspaceId: input.workspaceId,
       workspaceRoot,
       recipe: input.recipe,
@@ -369,7 +392,10 @@ export class DurableOperationManager {
     };
     const requestHash = hashJson(request);
     const operationId = stableOperationId("dependency_sync", workspaceRoot, input.attemptKey);
-    const { record, created } = this.store.createOrReplay({
+    const subject = {operationId, requestHash, workspaceRoot, baseRevision, operation: "dependency_sync" as const};
+    const { record, created, binding, pinnedVersion } = this.store.atomic(() => {
+      const binding = consumer.authorize(consumerContext, subject);
+      const value = this.store.createOrReplay({
       operationId,
       attemptKey: input.attemptKey,
       requestHash,
@@ -378,14 +404,27 @@ export class DurableOperationManager {
       scopeRoot: workspaceRoot,
       workspaceId: input.workspaceId,
       request,
+      });
+      const pinnedVersion = value.created ? consumer.pin(consumerContext, subject, binding) : binding.leaseVersion;
+      return {...value, binding, pinnedVersion};
     });
     if (!created) return replayResult(record);
 
+    const finish = (patch: Parameters<DurableOperationStore["finish"]>[1]) => this.store.atomic(() => {
+      consumer.finish(consumerContext, subject, binding, pinnedVersion);
+      return this.store.finish(operationId, patch);
+    });
+    try {
+    if (await readGitHead(workspaceRoot) !== baseRevision || hashJson(await hashFiles(workspaceRoot, frozenInputs)) !== hashJson(before)) {
+      throw new Error("Frozen dependency input or base revision changed before launch");
+    }
+    consumer.assertPinned(consumerContext, subject, binding, pinnedVersion);
     const command = dependencyCommand(input.recipe);
     const result = await this.runCommand(command.command, command.args, workspaceRoot);
+    if (result.exitCode === null) throw new Error("Command termination is unconfirmed");
     const after = await hashFiles(workspaceRoot, frozenInputs);
     if (hashJson(before) !== hashJson(after)) {
-      return this.store.finish(operationId, {
+      return finish({
         status: "failed",
         retrySafe: false,
         errorCode: "FROZEN_INPUT_CHANGED",
@@ -394,7 +433,7 @@ export class DurableOperationManager {
       });
     }
     if (result.exitCode !== 0) {
-      return this.store.finish(operationId, {
+      return finish({
         status: "failed",
         retrySafe: false,
         errorCode: "DEPENDENCY_SYNC_FAILED",
@@ -402,10 +441,34 @@ export class DurableOperationManager {
         receipt: { recipe: input.recipe, frozenInputs: after, exitCode: result.exitCode },
       });
     }
-    return this.store.finish(operationId, {
+    return finish({
       status: "succeeded",
       retrySafe: false,
       receipt: { recipe: input.recipe, frozenInputs: after, exitCode: result.exitCode },
+    });
+    } catch (error) {
+      return this.store.finish(operationId, {status: "outcome_unknown", retrySafe:false, errorCode:"RECONCILIATION_REQUIRED", errorMessage: redactSecrets(error instanceof Error ? error.message : String(error))});
+    }
+  }
+
+  reconcileDependencySync(operationId: string, evidence: DependencyReconciliationEvidence, consumerContext?: unknown): DurableOperationRecord {
+    if (!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency reconciliation requires trusted host authority");
+    const consumer = this.consumer;
+    const proof = Object.freeze(structuredClone(evidence));
+    return this.store.atomic(() => {
+      const record = this.store.getByOperationId(operationId);
+      if (!record || record.kind !== "dependency_sync" || typeof record.request.baseRevision !== "string") {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT", "no revision-bound dependency operation to reconcile");
+      }
+      const subject = {operationId, requestHash:record.requestHash, workspaceRoot:record.scopeRoot, baseRevision:record.request.baseRevision, operation:"dependency_sync" as const};
+      consumer.reconcile(consumerContext, subject, proof);
+      if (JSON.stringify(this.store.getByOperationId(operationId)) !== JSON.stringify(record)) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "durable operation changed during reconciliation");
+      if (record.status === "succeeded" || record.status === "failed") return record;
+      return this.store.finish(operationId, {
+        status: proof.exitCode === 0 && proof.frozenInputsUnchanged && proof.state === "finished" ? "succeeded" : "failed",
+        retrySafe:false,
+        receipt: {reconciliation:proof},
+      });
     });
   }
 
