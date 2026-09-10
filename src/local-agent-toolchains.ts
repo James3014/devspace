@@ -414,6 +414,7 @@ export function runToolchainVerifier(input: {
         timeout: timeoutMs,
         maxBuffer: DEFAULT_MAX_BUFFER_BYTES,
         env: environment,
+        shell: process.platform === "win32",
       },
       (error, stdout, stderr) => {
         if (completed) return;
@@ -428,11 +429,17 @@ export function runToolchainVerifier(input: {
             "signal" in error &&
             (error as { signal?: unknown }).signal === "SIGTERM",
         );
+        const exitCode =
+          error && typeof (error as { code?: unknown }).code === "number"
+            ? (error as { code: number }).code
+            : error
+              ? 1
+              : 0;
         resolvePromise({
           toolchainId: input.toolchainId,
           verifier: input.verifier,
           executable: resolved.executable,
-          exitCode: error ? (error as { code?: number | null }).code ?? null : 0,
+          exitCode,
           timedOut,
           durationMs: Date.now() - startedAt,
           stdout: (stdout ?? "").toString(),
