@@ -29,7 +29,7 @@ import {
 } from "./cutover-state.js";
 import { CAPABILITY_MANIFEST_SCHEMA } from "./capability-manifest.js";
 
-import { recoverCutoverWithStore } from "./mcp-cutover.js";
+import { recoverCutoverWithStore, assertLegacyCutoverUnbound } from "./mcp-cutover.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
@@ -253,6 +253,7 @@ async function authorizeNativeClient(
 export async function performNativeObservedReplacementRecovery(
   options: NativeObservedReplacementOptions,
 ): Promise<NativeObservedReplacementResult> {
+  assertLegacyCutoverUnbound(new CutoverStateStore(options.stateDir).get());
   if (options.ownerToken.length === 0) throw new CutoverStateError("OAuth owner token is not configured.");
   const loopback = ["127.0.0.1", "localhost", "::1"].includes(options.serverUrl.hostname);
   if (options.serverUrl.origin !== options.publicBaseUrl.origin && !loopback) throw new CutoverStateError("Native MCP endpoint must be the configured public origin or a loopback endpoint.");
@@ -278,6 +279,7 @@ export async function performNativeObservedReplacementRecovery(
     const buildId = requiredStringField(current, "buildId", "cutover_status");
     const capabilityManifestSha256 = requiredStringField(current, "capabilityManifestSha256", "cutover_status");
     const store = new CutoverStateStore(options.stateDir);
+    assertLegacyCutoverUnbound(store.get());
     const before = store.get();
     if (!before || before.cutoverId !== options.cutoverId) throw new CutoverStateError("Local durable cutover record does not match live cutover.");
     const liveExpected = requiredRecordField(cutover, "expectedNewIdentity", "cutover_status");
@@ -297,6 +299,7 @@ export async function performNativeObservedReplacementRecovery(
     if (cutover.phase !== "prepared" || cutover.drainEvidence !== undefined || cutover.restartRequest !== undefined) throw new CutoverStateError("Observed recovery requires a prepared live cutover with no drain or restart evidence.");
     const workspace = structuredResult(await client.callTool({ name: "workspace_inspect", arguments: { workspaceId: options.workspaceId } }), "workspace_inspect");
     const agentStatus = structuredResult(await client.callTool({ name: "agent_status", arguments: { workspaceId: options.workspaceId, agentId: options.agentId } }), "agent_status");
+    assertLegacyCutoverUnbound(store.get());
     const agent = structuredResult(await client.callTool({ name: "agent_reconcile", arguments: { workspaceId: options.workspaceId, agentId: options.agentId } }), "agent_reconcile");
     const workspaceSessions = typeof workspace.workspaceSessions === "number" ? workspace.workspaceSessions : 0;
     const details = Array.isArray(workspace.detail) ? workspace.detail : [];
@@ -327,6 +330,7 @@ export async function performNativeObservedReplacementRecovery(
     const commitIdentity = requiredRecordField(commitStatus, "currentServerIdentity", "cutover_status before commit");
     const commitCutover = requiredRecordField(commitStatus, "cutover", "cutover_status before commit");
     if (requiredStringField(commitCutover, "cutoverId", "cutover_status before commit") !== options.cutoverId || commitIdentity.serverInstanceId !== serverInstanceId || commitIdentity.sourceCommit !== sourceCommit || commitIdentity.buildId !== buildId || commitIdentity.capabilityManifestSha256 !== capabilityManifestSha256 || commitCutover.phase !== "prepared") throw new CutoverStateError("Live generation drifted before durable observed recovery.");
+    assertLegacyCutoverUnbound(store.get());
     const refreshed = store.get();
     const refreshedExpected = refreshed?.expectedNewIdentity;
     const refreshedOld = refreshed?.oldServerIdentity;
@@ -434,6 +438,7 @@ async function validateClosedBindingRepair(
 export async function performNativeCrossDomainBindingRepair(
   options: NativeCrossDomainBindingRepairOptions,
 ): Promise<NativeCrossDomainBindingRepairResult> {
+  assertLegacyCutoverUnbound(new CutoverStateStore(options.stateDir).get());
   if (options.ownerToken.length === 0) throw new CutoverStateError("OAuth owner token is not configured.");
   const serverUrl = typeof options.serverUrl === "string" ? new URL(options.serverUrl) : options.serverUrl;
   const publicBaseUrl = options.publicBaseUrl
@@ -492,6 +497,7 @@ export async function performNativeCrossDomainBindingRepair(
     }
 
     const store = new CutoverStateStore(options.stateDir);
+    assertLegacyCutoverUnbound(store.get());
     const before = store.get();
     if (!before || before.cutoverId !== options.cutoverId) {
       throw new CutoverStateError("Local durable cutover record does not match live cutover.");
@@ -585,6 +591,7 @@ export async function performNativeCrossDomainBindingRepair(
 
     const workspace = structuredResult(await client.callTool({ name: "workspace_inspect", arguments: { workspaceId: options.workspaceId } }), "workspace_inspect");
     const agentStatus = structuredResult(await client.callTool({ name: "agent_status", arguments: { workspaceId: options.workspaceId, agentId: options.agentId } }), "agent_status");
+    assertLegacyCutoverUnbound(store.get());
     const agent = structuredResult(await client.callTool({ name: "agent_reconcile", arguments: { workspaceId: options.workspaceId, agentId: options.agentId } }), "agent_reconcile");
     const workspaceSessions = typeof workspace.workspaceSessions === "number" ? workspace.workspaceSessions : 0;
     const details = Array.isArray(workspace.detail) ? workspace.detail : [];
@@ -664,6 +671,7 @@ export async function performNativeCrossDomainBindingRepair(
     }
 
     // Fresh binding validation before durable write (G71-R6)
+    assertLegacyCutoverUnbound(store.get());
     const latest = store.get();
     if (!latest || latest.cutoverId !== before.cutoverId) {
       throw new CutoverStateError("Concurrent modification detected: active cutover changed during repair evaluation.");
@@ -797,6 +805,7 @@ export function performCutoverRecovery(
     now = Date.now,
   } = dependencies;
 
+  assertLegacyCutoverUnbound(store.get());
   const current = store.get();
   if (!current) throw new CutoverStateError("No durable cutover record exists.");
 
@@ -829,6 +838,7 @@ export function performCutoverRecovery(
     verifiedAt: new Date(now()).toISOString(),
   };
 
+  assertLegacyCutoverUnbound(store.get());
   const recovered = recoverCutoverWithStore(store, requesterIdentity, {
     cutoverId,
     expectedNewIdentity,

@@ -71,6 +71,7 @@ import {
 
 import {
   CutoverBlockedError,
+  assertLegacyCutoverUnbound,
   McpCutoverController,
   compareServerIdentity,
   registerCutoverHttpRoutes,
@@ -1584,6 +1585,7 @@ function registerCutoverMcpTools(
             throw new CutoverBuildNotReadyError(probe.detail);
           }
         }
+        assertLegacyCutoverUnbound(control.controller.record());
         const mark = control.controller.markRestartScheduled(cutoverId);
         if (mark.newlyScheduled) {
           actuator.schedule();
@@ -1635,6 +1637,7 @@ function registerCutoverMcpTools(
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ cutoverId, expectedSourceCommit, expectedBuildId, expectedCapabilityManifestSha256, expiresAt }) => {
+      assertLegacyCutoverUnbound(control.controller.record());
       if (expectedCapabilityManifestSha256 && control.probeBuildReady) {
         const probe = await control.probeBuildReady({
           sourceCommit: expectedSourceCommit,
@@ -1838,6 +1841,7 @@ function registerCutoverMcpTools(
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ cutoverId, workspaceId, agentId }) => {
+      assertLegacyCutoverUnbound(control.controller.record());
       if (!control.executeBindingRepair) {
         throw new CutoverStateError("Binding repair is not supported on this server configuration.");
       }
@@ -5040,6 +5044,7 @@ export function createServer(
     newlyRecovered: boolean;
     mode: CutoverMode;
   }> => {
+    assertLegacyCutoverUnbound(cutoverController.record());
     const active = cutoverController.record();
     if (!active) {
       throw new CutoverStateError("No durable cutover record exists.");
@@ -5103,6 +5108,7 @@ export function createServer(
     workspaceId: string;
     agentId: string;
   }): Promise<DurableCutoverRecord> => {
+    assertLegacyCutoverUnbound(cutoverController.record());
     const active = cutoverController.record();
     if (!active) {
       throw new CutoverStateError("No durable cutover record exists.");
@@ -5211,6 +5217,7 @@ export function createServer(
       physicalProbeEvidence: `Target package at ${targetRoot} verified: build_manifest_sha256=${targetBuildManifestSha} equals expectedNewIdentity.capabilityManifestSha256.`,
     };
 
+    assertLegacyCutoverUnbound(cutoverController.record());
     cutoverController.recordBindingRepair(input.cutoverId, repairReceipt);
     return await cutoverController.finish(input.cutoverId, async () => ({
       ...witness,

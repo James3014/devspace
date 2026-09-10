@@ -17,6 +17,11 @@ import { CutoverStateError, CutoverStateStore, effectiveExpectedIdentity } from 
 import type { NextFunction, Request, Response } from "express";
 import type { OrchestrationOutcome } from "./cutover-orchestration.js";
 
+/** Legacy entrypoints cannot mutate a generation owned by the coordination consumer. */
+export function assertLegacyCutoverUnbound(record: DurableCutoverRecord | undefined): void {
+  if(record?.coordinationBinding) throw new CutoverStateError("[COORDINATION_REQUIRED] This cutover requires an explicitly authorized coordination lifecycle action; legacy mutation is unavailable.");
+}
+
 export type CutoverMode = "normal" | "drain" | "reconcile-only";
 
 export interface DurableReconciliationWitness {
@@ -323,9 +328,12 @@ export class McpCutoverController {
   }
 
   async finish(cutoverId: string, reconcile: () => Promise<DurableReconciliationWitness>): Promise<DurableCutoverRecord> {
+    assertLegacyCutoverUnbound(this.store.get());
     const record=this.finishableRecord(cutoverId);
     if(record.phase==="closed") return record;
-    return this.finishWithWitness(cutoverId,await reconcile());
+    const witness=await reconcile();
+    assertLegacyCutoverUnbound(this.store.get());
+    return this.finishWithWitness(cutoverId,witness);
   }
 
   finishWithWitness(cutoverId: string, witness: DurableReconciliationWitness): DurableCutoverRecord {
@@ -385,6 +393,7 @@ export function recoverCutoverWithStore(
   successor?: DurableCutoverRecord;
   newlyRecovered: boolean;
 } {
+  assertLegacyCutoverUnbound(store.get());
   const record = store.get();
   if (!record) throw new CutoverStateError("No durable cutover record exists.");
   if (
@@ -565,11 +574,15 @@ export function registerCutoverHttpRoutes(
     advance,
   } = dependencies;
 
+  const requireUnbound=(req:Request,res:Response,next:NextFunction)=>{
+    try {assertLegacyCutoverUnbound(controller.record());next();} catch(error){sendCutoverError(res,error);}
+  };
+
   app.get("/api/cutover/status", authenticate, (_req, res) => {
     res.json(controller.status(transportEvidence()));
   });
 
-  app.post("/api/cutover/start", authenticate, (req, res) => {
+  app.post("/api/cutover/start", authenticate, requireUnbound, (req, res) => {
     try {
       const body = objectBody(req.body);
       const sourceCommit = requiredString(body.expectedSourceCommit, "expectedSourceCommit");
@@ -586,17 +599,19 @@ export function registerCutoverHttpRoutes(
     }
   });
 
-  app.post("/api/cutover/drain", authenticate, (req, res) => {
+  app.post("/api/cutover/drain", authenticate, requireUnbound, (req, res) => {
     try {
       const cutoverId = requiredString(objectBody(req.body).cutoverId, "cutoverId");
-      const record = controller.recordDrain(cutoverId, transportEvidence());
+      const evidence=transportEvidence();
+      assertLegacyCutoverUnbound(controller.record());
+      const record = controller.recordDrain(cutoverId, evidence);
       res.json({ cutover: record, mode: controller.mode() });
     } catch (error) {
       sendCutoverError(res, error);
     }
   });
 
-  app.post("/api/cutover/restart", authenticate, async (req, res) => {
+  app.post("/api/cutover/restart", authenticate, requireUnbound, async (req, res) => {
     try {
       const body = objectBody(req.body);
       const cutoverId = requiredString(body.cutoverId, "cutoverId");
@@ -628,6 +643,7 @@ export function registerCutoverHttpRoutes(
       if (!restartSelf) {
         throw new CutoverStateError("Restart scheduling is unavailable in this environment.");
       }
+      assertLegacyCutoverUnbound(controller.record());
       const mark = controller.markRestartScheduled(cutoverId);
       const scheduled = mark.newlyScheduled ? restartSelf.schedule() : undefined;
       if (!scheduled) {
@@ -654,7 +670,7 @@ export function registerCutoverHttpRoutes(
     }
   });
 
-  app.post("/api/cutover/advance", authenticate, async (_req, res) => {
+  app.post("/api/cutover/advance", authenticate, requireUnbound, async (_req, res) => {
     if (!advance) {
       sendCutoverError(
         res,
@@ -677,7 +693,7 @@ export function registerCutoverHttpRoutes(
     }
   });
 
-  app.post("/api/cutover/recover", authenticate, (req, res) => {
+  app.post("/api/cutover/recover", authenticate, requireUnbound, (req, res) => {
     try {
       const body = objectBody(req.body);
       const cutoverId = requiredString(body.cutoverId, "cutoverId");
@@ -704,7 +720,7 @@ export function registerCutoverHttpRoutes(
     }
   });
 
-  app.post("/api/cutover/finish", authenticate, async (req, res) => {
+  app.post("/api/cutover/finish", authenticate, requireUnbound, async (req, res) => {
     try {
       const body = objectBody(req.body);
       const cutoverId = requiredString(body.cutoverId, "cutoverId");

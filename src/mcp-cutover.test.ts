@@ -546,3 +546,18 @@ test("P0-1: unknown/newly-registered mutation tool fails closed during cutover, 
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
+
+test("C3 legacy finish rechecks bound generation after awaited reconciliation",async()=>{
+  const stateDir=mkdtempSync(join(tmpdir(),"devspace-bound-finish-race-"));const store=new CutoverStateStore(stateDir);
+  const old=identity("old","old","old"),replacement=identity("new","target","target");
+  const initial=store.begin({oldServerIdentity:old,expectedNewIdentity:{sourceCommit:"target",buildId:"target",capabilityManifestSha256:"cap"}});
+  store.recordDrain(initial.cutoverId,{activeSessions:0,oldestAgeMs:0});
+  const controller=new McpCutoverController(store,replacement);
+  let nextId="";
+  await assert.rejects(controller.finish(initial.cutoverId,async()=>{
+    store.close(initial.cutoverId,{closedByServerInstanceId:"new",workspaceQueryable:true,agentQueryable:true,agentReconciled:true,reconciledAt:new Date().toISOString()});
+    nextId=store.begin({oldServerIdentity:replacement,expectedNewIdentity:{sourceCommit:"next",buildId:"next"},coordinationBinding:{leaseId:"lease",pinnedLeaseVersion:1,operationHandle:"operation",requestHash:"a".repeat(64),ownerThread:"owner"}}).cutoverId;
+    return {workspaceQueryable:true,agentQueryable:true,agentReconciled:true};
+  }),/COORDINATION_REQUIRED/);
+  assert.equal(store.get()?.cutoverId,nextId);assert.equal(store.get()?.phase,"prepared");
+});

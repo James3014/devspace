@@ -2246,6 +2246,15 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
       assert.equal(drained.isError,undefined,JSON.stringify(drained));
       const cutoverStore=new CutoverStateStore(config.stateDir);
       const beforeCutover=JSON.stringify(cutoverStore.get());
+      for(const endpoint of ["start","drain","restart","advance","recover","finish"]) {
+        const denied=await fetch(`http://127.0.0.1:${address.port}/api/cutover/${endpoint}`,{method:"POST",headers:{Authorization:`Bearer ${tokens.access_token}`,"Content-Type":"application/json"},body:JSON.stringify({cutoverId})});
+        assert.equal(denied.status,409,endpoint);assert.match(await denied.text(),/COORDINATION_REQUIRED/);
+      }
+      for(const request of [{name:"cutover_recover",arguments:{cutoverId,expectedSourceCommit:"a".repeat(40),expectedBuildId:"fixture"}},{name:"cutover_repair_binding",arguments:{cutoverId,workspaceId:"ws",agentId:"agent"}}]) {
+        const denied=await otherClient.callTool(request);assert.equal(denied.isError,true);assert.match(JSON.stringify(denied),/COORDINATION_REQUIRED/);
+      }
+      assert.equal(JSON.stringify(cutoverStore.get()),beforeCutover);
+
       const finishArgs={cutoverId,workspaceId:"unverified-workspace",agentId:"unverified-agent"};
       assert.equal((await otherClient.callTool({name:"cutover_finish",arguments:finishArgs})).isError,true);
       assert.equal((await client.callTool({name:"cutover_finish",arguments:finishArgs,_meta:{clientId:successorClientId}})).isError,true);
