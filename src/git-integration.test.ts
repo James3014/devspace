@@ -199,6 +199,17 @@ test("write-denied destination rejects late apply failure without changing track
         result.blockers.some((b) => b.code === "INTEGRATION_NOT_EXPRESSIBLE"),
         JSON.stringify(result),
       );
+
+      // Restore write permissions before reading back destination state.
+      if (process.platform === "win32") {
+        if (windowsAclApplied && windowsAclSid !== undefined) {
+          execFileSync("icacls", [destination, "/remove:d", `*${windowsAclSid}`], { encoding: "utf8" });
+          windowsAclApplied = false;
+        }
+      } else {
+        chmodSync(destination, 0o755);
+      }
+
       // Destination bytes/state remain unchanged.
       assert.equal(await readFile(join(destination, "a.ts")), "v1\n");
       const status = runGitRaw(["status", "--porcelain"], destination);
@@ -207,9 +218,12 @@ test("write-denied destination rejects late apply failure without changing track
       if (process.platform === "win32") {
         if (windowsAclApplied && windowsAclSid !== undefined) {
           execFileSync("icacls", [destination, "/remove:d", `*${windowsAclSid}`], { encoding: "utf8" });
+          windowsAclApplied = false;
         }
       } else {
-        chmodSync(destination, 0o755);
+        try {
+          chmodSync(destination, 0o755);
+        } catch {}
       }
     }
   } finally {
