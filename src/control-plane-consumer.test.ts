@@ -237,3 +237,49 @@ test("C3 reconciliation callbacks cannot change verified outcome, record, or bin
     } finally {f.manager.close();}
   }
 });
+
+test("C3 late predecessor success or rejection cannot overwrite successor reconciliation", async () => {
+  for (const lateResult of ["success", "rejection"] as const) {
+    let deliver!:()=>void;
+    let started!:()=>void;
+    const pendingResponse=new Promise<void>(resolve=>{deliver=resolve;});
+    const effectFinished=new Promise<void>(resolve=>{started=resolve;});
+    const f=fixture(async()=>{
+      // The effect has terminated; its response is delayed in the old carrier.
+      started(); await pendingResponse;
+      if(lateResult==="rejection") throw new Error("old carrier disconnected after effect");
+      return {exitCode:0,stdout:"completed",stderr:""};
+    });
+    const successorContext=Object.freeze({});
+    const oldResolver=f.options.resolveOwnerContext!;
+    f.options.resolveOwnerContext=c=>c===successorContext?{ownerThread:"successor"}:oldResolver(c);
+    const oldResponse=f.manager.dependencySync(f.input,f.context).then(result=>({result,error:undefined}),error=>({result:undefined,error}));
+    let successor:DurableOperationManager|undefined;
+    try {
+      await effectFinished;
+      const prior=f.lease();
+      f.ownership.handoff(f.context,prior.leaseId,prior.version,successorContext,{
+        resource:prior.resource,candidateRevision:f.base,baseRevision:prior.baseRevision,scope:prior.scope,
+        grantDependency:prior.grant,grantVersion:prior.grantVersion,recipientGrant:prior.grant,recipientGrantVersion:prior.grantVersion,
+        checkpoint:"verified-effect-completed-response-pending",liveOperation:prior.operation,liveHandle:prior.operationHandle!,
+        forbiddenOverlap:[f.root],tests:["late-result"],evidence:["independent-terminal-proof"],remainingGap:"reconcile",nextGate:"reconcile",expiresAt:prior.expiresAt,
+      });
+      const transferred=f.lease();
+      const proof={leaseId:transferred.leaseId,ownerThread:"successor",operationHandle:transferred.operationHandle!,operation:transferred.operation,baseRevision:transferred.baseRevision,leaseVersion:transferred.version,state:"finished" as const,requestHash:f.approvedHash,exitCode:0,frozenInputsUnchanged:true};
+      const successorOptions:ControlPlaneConsumerOptions={...f.options,
+        resolveEffectBinding:(c,s)=>c===successorContext && s.requestHash===f.approvedHash ? {leaseId:f.leaseId,leaseVersion:f.lease().version,requestHash:f.approvedHash,role:"worker"}:undefined,
+        verifyDependencyReconciliation:e=>JSON.stringify(e)===JSON.stringify(proof),
+        verifyReconciliationEvidence:e=>e.ownerThread==="successor" && e.operationHandle===proof.operationHandle && e.detail===JSON.stringify({requestHash:proof.requestHash,exitCode:0,frozenInputsUnchanged:true}),
+      };
+      successor=new DurableOperationManager(f.config,undefined,undefined,undefined,successorOptions);
+      const terminal=successor.reconcileDependencySync(proof.operationHandle,proof,successorContext);
+      assert.equal(terminal.status,"succeeded");
+      const successorLease=f.lease();
+      deliver();
+      const late=await oldResponse;
+      assert.deepEqual(f.manager.store.getByOperationId(terminal.operationId),terminal);
+      assert.deepEqual(f.lease(),successorLease);
+      assert.equal(late.error?.code,"CAS_CONFLICT");
+    } finally {deliver();await oldResponse;successor?.close();f.manager.close();}
+  }
+});

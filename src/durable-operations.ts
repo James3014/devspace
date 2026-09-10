@@ -447,7 +447,12 @@ export class DurableOperationManager {
       receipt: { recipe: input.recipe, frozenInputs: after, exitCode: result.exitCode },
     });
     } catch (error) {
-      return this.store.finish(operationId, {status: "outcome_unknown", retrySafe:false, errorCode:"RECONCILIATION_REQUIRED", errorMessage: redactSecrets(error instanceof Error ? error.message : String(error))});
+      return this.store.atomic(() => {
+        if (JSON.stringify(this.store.getByOperationId(operationId)) !== JSON.stringify(record)) {
+          throw new ControlPlaneOwnershipError("CAS_CONFLICT", "late dependency result cannot overwrite a newer durable outcome");
+        }
+        return this.store.finish(operationId, {status: "outcome_unknown", retrySafe:false, errorCode:"RECONCILIATION_REQUIRED", errorMessage: redactSecrets(error instanceof Error ? error.message : String(error))});
+      });
     }
   }
 
