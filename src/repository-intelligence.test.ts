@@ -59,11 +59,27 @@ process.stdin.on('end', () => {
 `;
 
   if (process.platform === "win32") {
-    const scriptPath = join(root, "fake-python.cjs");
-    writeFileSync(scriptPath, scriptContent);
-    const cmdPath = join(root, "fake-python.cmd");
-    writeFileSync(cmdPath, `@node "%~dp0fake-python.cjs" %*\r\n`);
-    return cmdPath;
+    execFileSync("python", ["--version"], { stdio: "pipe" });
+    const packageRoot = join(root, "repository_intelligence");
+    mkdirSync(packageRoot, { recursive: true });
+    writeFileSync(join(packageRoot, "__init__.py"), "");
+    writeFileSync(join(packageRoot, "cli.py"), [
+      "import json, os, sys, time",
+      "args = sys.argv[1:]",
+      "operation = args[args.index('--operation') + 1]",
+      "mode = os.environ.get('RI_FAKE_MODE', 'ok')",
+      "if mode == 'fail-if-called': print('python was unexpectedly called', file=sys.stderr); raise SystemExit(11)",
+      "if mode == 'nonzero': print('canonical failure', file=sys.stderr); raise SystemExit(7)",
+      "if mode == 'invalid-json': print('not-json', end=''); raise SystemExit(0)",
+      "if mode == 'overflow': print('x' * 4096, end=''); raise SystemExit(0)",
+      "if mode == 'timeout': time.sleep(60)",
+      "ceiling = 'CI_EVIDENCE_ONLY' if operation in ('ci', 'cfi') else ('AUTOMATION_ADVISORY_ONLY' if operation == 'eia' else 'PR_INTELLIGENCE_ONLY')",
+      "top = 'PRE_REVIEW_ONLY' if mode == 'wrong-ceiling' else ceiling",
+      "nested = 'PRE_REVIEW_ONLY' if mode == 'wrong-nested-ceiling' else ceiling",
+      "payload = json.loads(sys.stdin.read() or '{}')",
+      "print(json.dumps({'operation': operation, 'claim_ceiling': top, 'result': {'echo': payload, 'claim_ceiling': nested}}), end='')",
+    ].join("\n"));
+    return "python";
   }
 
   const path = join(root, "fake-python");

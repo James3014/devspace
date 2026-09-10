@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { spawn as nativeSpawn } from "node:child_process";
 import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
@@ -9,7 +10,8 @@ import type { ServerConfig } from "./config.js";
 import { assertAllowedPath, canonicalizePath, isPathInsideRoot } from "./roots.js";
 import { EXECUTION_PROTOCOL_VERSION, type ExecutionAuthorityMode } from "./execution-protocol.js";
 
-const spawn = createRequire(import.meta.url)("cross-spawn") as typeof import("node:child_process").spawn;
+const spawn = nativeSpawn;
+const crossSpawn = createRequire(import.meta.url)("cross-spawn") as typeof import("node:child_process").spawn;
 
 export type DurableOperationKind = "workspace_clone" | "dependency_sync" | "nexus_gateway_recover";
 export type DurableOperationStatus = "started" | "succeeded" | "failed" | "outcome_unknown";
@@ -1286,7 +1288,7 @@ async function spawnCommand(
   cwd: string,
 ): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
   return await new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(command, args, {
+    const child = crossSpawn(command, args, {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
       env: process.env,

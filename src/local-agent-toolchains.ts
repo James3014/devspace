@@ -44,6 +44,7 @@ export interface ToolchainVerificationResult {
   durationMs: number;
   stdout: string;
   stderr: string;
+  error?: string;
 }
 
 const DEFAULT_VERIFY_TIMEOUT_MS = 60_000;
@@ -442,6 +443,7 @@ export function runToolchainVerifier(input: {
           durationMs: Date.now() - startedAt,
           stdout: (stdout ?? "").toString(),
           stderr: (stderr ?? "").toString(),
+          ...(error ? { error: error instanceof Error ? error.message : String(error) } : {}),
         });
       },
     );
