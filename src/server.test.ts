@@ -1376,11 +1376,16 @@ test("subagents: workspace_verify executes a configured verifier normally", asyn
   const toolchainRoot = await mkdtemp(join(tmpdir(), "devspace-server-toolchain-"));
   const bin = join(toolchainRoot, ".venv", "bin");
   await mkdir(bin, { recursive: true });
-  const verifierPath = join(bin, "pytest");
-  await writeFile(verifierPath, "#!/bin/sh\necho \"verifier-ran\"\nexit 0\n", { mode: 0o755 });
-  chmodSync(verifierPath, 0o755);
+  const verifierRelative = process.platform === "win32" ? ".venv/bin/pytest.cmd" : ".venv/bin/pytest";
+  const verifierPath = join(toolchainRoot, verifierRelative);
+  if (process.platform === "win32") {
+    await writeFile(verifierPath, "@echo verifier-ran\r\n@exit /b 0\r\n");
+  } else {
+    await writeFile(verifierPath, "#!/bin/sh\necho \"verifier-ran\"\nexit 0\n", { mode: 0o755 });
+    chmodSync(verifierPath, 0o755);
+  }
   const toolchains = JSON.stringify([
-    { id: "nexus-python", root: toolchainRoot, verifiers: { pytest: ".venv/bin/pytest" } },
+    { id: "nexus-python", root: toolchainRoot, verifiers: { pytest: verifierRelative } },
   ]);
   const context = await fixture(t, { git: true, subagents: true, toolchains });
   try {

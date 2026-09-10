@@ -1288,6 +1288,7 @@ async function spawnCommand(
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
       env: process.env,
+      shell: process.platform === "win32",
     });
     let stdout = "";
     let stderr = "";
