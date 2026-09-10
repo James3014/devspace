@@ -246,3 +246,59 @@ test("C2 symlink replacement denies renew, reconcile, replay and handoff without
     } finally {sqlite.close();rmSync(root,{recursive:true,force:true});}
   }
 });
+
+test("physical leases conflict across repository grants while disjoint resources remain independent", () => {
+  const root=realpathSync(mkdtempSync(join(tmpdir(),"devspace-cross-repo-")));
+  const a=join(root,"a"),child=join(a,"child"),b=join(root,"b");mkdirSync(child,{recursive:true});mkdirSync(b);
+  const sqlite=new Database(":memory:");
+  const grants=[{...grant,repository:"owner/repo-a"},{...grant,repository:"owner/repo-b"}];
+  const store=new ControlPlaneOwnershipStore(sqlite,{resolveOwnerContext:options.resolveOwnerContext,verifyGrantEvidence:g=>grants.some(known=>JSON.stringify(known)===JSON.stringify(g))});
+  const request=(repository: number,path: string,key: string)=>({...input([path]),repositoryKey:grants[repository]!.repository,grant:grants[repository]!,resourceKind:"filesystem",resourceId:path,resource:path,idempotencyKey:key});
+  try {
+    for(const g of grants)store.putGrantEvidence(context("owner"),g,0);
+    const first=store.acquire(context("one"),request(0,a,"same-key"));
+    for(const path of [a,child,root])assert.throws(()=>store.acquire(context("two"),request(1,path,"same-key")),/overlapping resource/);
+    const distinct=store.acquire(context("two"),request(1,b,"same-key"));assert.equal(distinct.repositoryKey,"owner/repo-b");
+    assert.throws(()=>store.acquire(context("two"),{...request(1,b,"forged"),grant:grants[0]!}),/grant repository/);
+    store.release(context("one"),first.leaseId,first.version);
+    assert.equal(store.acquire(context("two"),request(1,a,"after-release")).resource,a);
+  }finally{sqlite.close();rmSync(root,{recursive:true,force:true});}
+});
+
+test("shared Git branch resource conflicts across repository labels and distinct worktree scopes", () => {
+  const root=realpathSync(mkdtempSync(join(tmpdir(),"devspace-cross-git-"))),repo=join(root,"repo"),linked=join(root,"linked");mkdirSync(repo);
+  const git=(...args:string[])=>execFileSync("git",["-C",repo,...args],{stdio:"pipe"});git("init");git("-c","user.name=Fixture","-c","user.email=fixture@example.test","commit","--allow-empty","-m","initial");git("worktree","add","--detach",linked);
+  const sqlite=new Database(":memory:"),grants=[{...grant,repository:"owner/repo-a"},{...grant,repository:"owner/repo-b"}];
+  const store=new ControlPlaneOwnershipStore(sqlite,{resolveOwnerContext:options.resolveOwnerContext,verifyGrantEvidence:g=>grants.some(v=>JSON.stringify(v)===JSON.stringify(g))});
+  try{for(const g of grants)store.putGrantEvidence(context("owner"),g,0);store.acquire(context("one"),{...input([repo]),repositoryKey:grants[0]!.repository,grant:grants[0]!,resourceKind:"branch",resourceId:"shared",resource:repo});assert.throws(()=>store.acquire(context("two"),{...input([linked]),repositoryKey:grants[1]!.repository,grant:grants[1]!,resourceKind:"branch",resourceId:"refs/heads/shared",resource:linked}),/overlapping resource/);}finally{sqlite.close();rmSync(root,{recursive:true,force:true});}
+});
+
+test("persisted cross-repository overlaps deny replay, authorization and new pins until lawful release", () => {
+  const root=realpathSync(mkdtempSync(join(tmpdir(),"devspace-cross-legacy-"))),a=join(root,"a"),b=join(root,"b");mkdirSync(a);mkdirSync(b);
+  const sqlite=new Database(":memory:"),grants=[{...grant,repository:"owner/repo-a"},{...grant,repository:"owner/repo-b"}];
+  let callbackConflictLease: string | undefined;
+  const store=new ControlPlaneOwnershipStore(sqlite,{resolveOwnerContext:options.resolveOwnerContext,verifyGrantEvidence:g=>{if(callbackConflictLease)sqlite.prepare("update control_plane_resource_leases set terminal_state=null where lease_id=?").run(callbackConflictLease);return grants.some(v=>JSON.stringify(v)===JSON.stringify(g));}});
+  try {
+    for(const g of grants)store.putGrantEvidence(context("owner"),g,0);
+    const request={...input([a]),repositoryKey:grants[0]!.repository,grant:grants[0]!,resourceKind:"filesystem",resourceId:a,resource:a};
+    const first=store.acquire(context("one"),request);const second=store.acquire(context("two"),{...input([b]),repositoryKey:grants[1]!.repository,grant:grants[1]!,resourceKind:"filesystem",resourceId:b,resource:b});
+    // Reproduce a row accepted by the previous repository-filtered implementation.
+    sqlite.prepare("update control_plane_resource_leases set resource_id=?,resource=?,scope_json=? where lease_id=?").run(a,a,JSON.stringify([a]),second.leaseId);
+    const before=sqlite.prepare("select * from control_plane_resource_leases order by lease_id").all();
+    assert.throws(()=>store.acquire(context("one"),request),/overlapping resource/);
+    for(const [lease,owner] of [[first,"one"],[second,"two"]] as const){assert.throws(()=>store.assertHeld(context(owner),lease.leaseId,1,lease.operation,lease.baseRevision),/overlapping resource/);assert.throws(()=>store.beginOperation(context(owner),lease.leaseId,1,"new-effect"),/overlapping resource/);}
+    assert.deepEqual(sqlite.prepare("select * from control_plane_resource_leases order by lease_id").all(),before);
+    sqlite.prepare("update control_plane_resource_leases set expires_at=? where lease_id=?").run(new Date(0).toISOString(),second.leaseId);
+    assert.throws(()=>store.assertHeld(context("one"),first.leaseId,1,first.operation,first.baseRevision),/overlapping resource/);
+    sqlite.prepare("update control_plane_resource_leases set scope_json='null' where lease_id=?").run(second.leaseId);
+    assert.throws(()=>store.assertHeld(context("one"),first.leaseId,1,first.operation,first.baseRevision),e=>e instanceof ControlPlaneOwnershipError&&e.code==="MALFORMED");
+    sqlite.prepare("update control_plane_resource_leases set scope_json=? where lease_id=?").run(JSON.stringify([a]),second.leaseId);
+    store.release(context("two"),second.leaseId,1);
+    assert.equal(store.assertHeld(context("one"),first.leaseId,1,first.operation,first.baseRevision).leaseId,first.leaseId);
+    callbackConflictLease=second.leaseId;
+    assert.throws(()=>store.assertHeld(context("one"),first.leaseId,1,first.operation,first.baseRevision),/overlapping resource/);
+    assert.equal(store.get(second.leaseId)?.terminalState,"released");
+    assert.throws(()=>store.beginOperation(context("one"),first.leaseId,1,"late-callback-effect"),/overlapping resource/);
+    assert.equal(store.get(second.leaseId)?.terminalState,"released");
+  }finally{sqlite.close();rmSync(root,{recursive:true,force:true});}
+});
