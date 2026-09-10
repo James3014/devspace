@@ -1,7 +1,7 @@
 import type { CompletionSelection } from "./current-completion-matrix.js";
 import { isDeepStrictEqual } from "node:util";
 import { McpCutoverController } from "./mcp-cutover.js";
-import { CutoverStateStore, type CutoverServerIdentity, type ExpectedCutoverIdentity, type CutoverCoordinationBinding } from "./cutover-state.js";
+import { CutoverStateStore, type CutoverServerIdentity, type CutoverDrainEvidence, type ExpectedCutoverIdentity, type CutoverCoordinationBinding } from "./cutover-state.js";
 import { ControlPlaneConsumer, type ControlPlaneConsumerOptions, type DependencyReconciliationEvidence } from "./control-plane-consumer.js";
 import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type HandoffInput } from "./control-plane-ownership.js";
 import { createHash } from "node:crypto";
@@ -430,6 +430,30 @@ export class DurableOperationManager {
       if (!isDeepStrictEqual(this.store.getByOperationId(operationId),record)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","cutover intent changed during readback");
       if (record.status === "succeeded") return record;
       return this.store.finish(operationId,{status:"succeeded",retrySafe:false,receipt:{cutoverId:observed.cutoverId,coordinationBinding:observed.coordinationBinding,startVerified:true,lifecycleTerminal:false}});
+    });
+  }
+
+  drainCutover(cutoverId: string, currentIdentity: CutoverServerIdentity, readTransportEvidence: () => CutoverDrainEvidence, context?: unknown) {
+    if(!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","cutover drain requires trusted host authority");
+    const consumer=this.consumer;
+    const identity=Object.freeze({...currentIdentity});
+    return this.store.atomic(()=>{
+      const cutoverStore=new CutoverStateStore(canonicalizePath(this.config.stateDir));
+      const observed=cutoverStore.get();
+      if(!observed?.coordinationBinding || observed.cutoverId!==cutoverId) throw new ControlPlaneOwnershipError("CAS_CONFLICT","drain requires exact bound cutover generation");
+      const intent=this.reconcileCutoverStart(observed.coordinationBinding.operationHandle,context);
+      const subject={operationId:intent.operationId,requestHash:intent.requestHash,workspaceRoot:intent.scopeRoot,baseRevision:intent.request.baseRevision as string,operation:"cutover_start" as const};
+      const action={action:"drain" as const,cutoverId,currentIdentity:identity};
+      const binding=consumer.authorizeCutoverLifecycle(context,subject,action);
+      if(!isDeepStrictEqual(observed.oldServerIdentity,identity)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","drain runtime identity does not match original generation");
+      if(!isDeepStrictEqual(cutoverStore.get(),observed)||!isDeepStrictEqual(this.store.getByOperationId(intent.operationId),intent)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","drain generation changed during approval");
+      if(observed.phase==="drained") return observed;
+      if(observed.phase!=="prepared") throw new ControlPlaneOwnershipError("CAS_CONFLICT","drain requires prepared or already drained generation");
+      const evidence=JSON.parse(JSON.stringify(readTransportEvidence())) as CutoverDrainEvidence;
+      const current=consumer.authorizeCutoverLifecycle(context,subject,action);
+      if(!isDeepStrictEqual(current,binding)||!isDeepStrictEqual(cutoverStore.get(),observed)||!isDeepStrictEqual(this.store.getByOperationId(intent.operationId),intent)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","drain binding changed during evidence collection");
+      // Same DB fence; file effects cannot be rolled back by a SQLite failure.
+      return new McpCutoverController(cutoverStore,identity).recordDrain(cutoverId,evidence);
     });
   }
 

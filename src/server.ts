@@ -1498,8 +1498,13 @@ function registerCutoverMcpTools(
       _meta: {},
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ cutoverId }) => {
-      const record = control.controller.recordDrain(cutoverId, control.transportEvidence());
+    async ({ cutoverId }, extra) => {
+      const existing=control.controller.record();
+      // Legacy unbound generations retain their existing runtime fence only.
+      // Malformed bindings throw from record(); they never enter this branch.
+      const record = existing?.coordinationBinding
+        ? (()=>{if(!durableOperations) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","cutover drain requires trusted coordination");return durableOperations.drainCutover(cutoverId,control.controller.currentIdentity,control.transportEvidence,dependencyConsumerContext(extra));})()
+        : control.controller.recordDrain(cutoverId, control.transportEvidence());
       const mode = control.controller.mode();
       return {
         content: [textBlock(

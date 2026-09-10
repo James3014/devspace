@@ -2122,10 +2122,11 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
   await provider.authorize(oauthClient,{redirectUri:"http://localhost/callback",codeChallenge:"fixture",scopes:config.oauth.scopes,resource:new URL("/mcp",config.publicBaseUrl)}, {req:{method:"POST",body:{owner_token:config.oauth.ownerToken}},redirect:(_status:number,url:string)=>{redirect=url;}} as never);
   const tokens=await provider.exchangeAuthorizationCode(oauthClient,new URL(redirect).searchParams.get("code")!);
   const grant={repository:"owner/repo",goal:"http-fixture",coordinatorThread:"controller",evidenceHash:"external-fixture-proof"};
-  let approvedHash=""; let leaseId=""; let readerClient:unknown; let successorClientId=""; let cutoverLeaseId=""; let cutoverHash=""; let lastAuthenticatedContext:unknown; let originalAuthenticatedContext:unknown;
+  let approvedHash=""; let leaseId=""; let readerClient:unknown; let successorClientId=""; let cutoverLeaseId=""; let cutoverHash=""; let lastAuthenticatedContext:unknown; let originalAuthenticatedContext:unknown; let approvedDrainId="";
   let ownership: import("./control-plane-ownership.js").ControlPlaneOwnershipStore;
   const authenticated=(c:unknown)=>!!c && (c as {clientId?:string}).clientId===oauthClient.client_id && typeof (c as {sessionId?:string}).sessionId==="string";
   const coordination:import("./control-plane-consumer.js").ControlPlaneConsumerOptions={
+    approveCutoverLifecycle:(c,subject,action)=>(c as {clientId?:string})?.clientId===successorClientId && subject.requestHash===cutoverHash && action.action==="drain" && action.cutoverId===approvedDrainId && action.currentIdentity.serverInstanceId.length>0,
     readCompletionContract:(c,selection)=>{
       if(!authenticated(c)) throw new Error("unauthorized reader");
       return {...selection,source:"issue62-fixture",requiredLayers:["SOURCE","NATIVE_SINGLE"],criteria:["SOURCE","NATIVE_SINGLE"].map(layer=>({id:`AC-${layer}`,layer,sourceRevision:base,environment:"darwin",surface:"installed-mcp",independent:true,maxAgeMs:60000}))};
@@ -2235,10 +2236,19 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
       assert.equal(structuredContent(reconciledStart).kind,"cutover_start");
       assert.equal((new CutoverStateStore(config.stateDir).get()?.coordinationBinding)?.operationHandle,operationId);
 
+      const beforeDrain=JSON.stringify(new CutoverStateStore(config.stateDir).get());
+      assert.equal((await client.callTool({name:"cutover_drain",arguments:{cutoverId},_meta:{clientId:successorClientId}})).isError,true);
+      assert.equal(JSON.stringify(new CutoverStateStore(config.stateDir).get()),beforeDrain);
+      assert.equal((await otherClient.callTool({name:"cutover_drain",arguments:{cutoverId}})).isError,true);
+      assert.equal(JSON.stringify(new CutoverStateStore(config.stateDir).get()),beforeDrain);
+      approvedDrainId=cutoverId;
       const drained=await otherClient.callTool({name:"cutover_drain",arguments:{cutoverId}});
       assert.equal(drained.isError,undefined,JSON.stringify(drained));
       const cutoverStore=new CutoverStateStore(config.stateDir);
       const beforeCutover=JSON.stringify(cutoverStore.get());
+      assert.equal((await otherClient.callTool({name:"cutover_drain",arguments:{cutoverId}})).isError,undefined);
+      assert.equal(JSON.stringify(cutoverStore.get()),beforeCutover);
+
       const beforeRead=JSON.stringify(ownership.get(leaseId));
       const completionArgs={goal:"http-fixture",candidate:base,subject:"full-delivery"};
       const completion=await client.callTool({name:"coordination_completion_read",arguments:completionArgs});
@@ -2272,6 +2282,7 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
       assert.equal(pinTransfer.isError,undefined,JSON.stringify(pinTransfer));
       assert.equal(ownership.get(cutoverLeaseId)?.operationHandle,operationId);
       assert.equal(ownership.get(cutoverLeaseId)?.ownerThread,"delegated-cli-worker");
+      assert.equal((await otherClient.callTool({name:"cutover_drain",arguments:{cutoverId}})).isError,true);
       assert.equal(JSON.stringify(cutoverStore.get()),beforeCutover);
       assert.equal((await otherClient.callTool({name:"operation_reconcile",arguments:{operationId}})).isError,true);
       // Receiving the lease does not promote a worker to controller.

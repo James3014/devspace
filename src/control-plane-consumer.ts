@@ -1,3 +1,4 @@
+import type { CutoverServerIdentity } from "./cutover-state.js";
 import { projectCompletion, type CompletionSelection } from "./current-completion-matrix.js";
 import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type ControlPlaneOwnershipOptions, type ReconciliationEvidence, type HandoffInput } from "./control-plane-ownership.js";
 
@@ -19,7 +20,9 @@ export interface DependencyReconciliationEvidence extends ReconciliationEvidence
   exitCode: number;
   frozenInputsUnchanged: boolean;
 }
+export interface CutoverLifecycleAction { action: "drain"; cutoverId: string; currentIdentity: Readonly<CutoverServerIdentity>; }
 export interface ControlPlaneConsumerOptions extends ControlPlaneOwnershipOptions {
+  approveCutoverLifecycle?(context: unknown, subject: Readonly<EffectSubject>, action: Readonly<CutoverLifecycleAction>): boolean;
   readCompletionContract?(context: unknown, selection: Readonly<CompletionSelection>): unknown;
   readCompletionEvidence?(context: unknown, selection: Readonly<CompletionSelection>): unknown;
   /** Host lookup of a previously authenticated recipient; handle is not identity evidence. */
@@ -48,6 +51,13 @@ export class ControlPlaneConsumer {
     if (subject.operation !== "cutover_start" || binding.role !== "controller") throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "cutover requires controller authority");
     this.assertPinned(context, subject, binding, pinnedVersion);
     return Object.freeze({leaseId:binding.leaseId,pinnedLeaseVersion:pinnedVersion,operationHandle:subject.operationId,requestHash:subject.requestHash,ownerThread:this.ownership.get(binding.leaseId)!.ownerThread});
+  }
+
+  authorizeCutoverLifecycle(context: unknown, subject: EffectSubject, action: CutoverLifecycleAction) {
+    const binding=this.authorize(context,subject);
+    if(binding.role!=="controller" || this.options.approveCutoverLifecycle?.(context,Object.freeze({...subject}),Object.freeze({...action,currentIdentity:Object.freeze({...action.currentIdentity})}))!==true) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","explicit cutover lifecycle approval required");
+    this.assertPinned(context,subject,binding,binding.leaseVersion);
+    return binding;
   }
 
   readCompletion(context: unknown, selection: CompletionSelection) {

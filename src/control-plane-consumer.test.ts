@@ -446,7 +446,57 @@ test("C3 cutover reconciliation follows legitimate same-lease handoff and fences
     f.options.resolveHandoffRecipient=recipientReader;
     f.manager.handoff(f.leaseId,lease.version,"recipient",handoffInput,f.context);
     assert.equal(f.manager.reconcileCutoverStart(result.operationId,recipient).operationId,result.operationId);
+    f.options.approveCutoverLifecycle=(c,subject,action)=>c===recipient&&subject.operationId===result.operationId&&action.action==="drain";
+    const cutoverId=result.receipt!.cutoverId as string;
+    assert.equal(f.manager.drainCutover(cutoverId,f.input.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),recipient).phase,"drained");
+    assert.throws(()=>f.manager.drainCutover(cutoverId,f.input.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),f.context));
+
     assert.throws(()=>f.manager.reconcileCutoverStart(result.operationId,f.context),/owner|binding|CAS|lease evidence/);
     assert.equal(f.ownership.get(f.leaseId)?.operationHandle,result.operationId);
   } finally {f.manager.close();}
+});
+
+test("C3 guarded drain binds action/runtime, rejects callback CAS drift and preserves replay", async()=>{
+  const {CutoverStateStore}=await import("./cutover-state.js");const f=cutoverFixture();
+  const evidence={activeSessions:0,oldestAgeMs:0};
+  try {
+    const start=f.manager.startCutover(f.input,f.context);const store=new CutoverStateStore(f.config.stateDir);const record=store.get()!;
+    const snapshot=()=>JSON.stringify([store.get(),f.ownership.get(f.leaseId),f.manager.store.getByOperationId(start.operationId)]);
+    const before=snapshot();
+    assert.throws(()=>f.manager.drainCutover(record.cutoverId,f.input.currentIdentity,()=>evidence,f.context),/approval/);
+    f.options.approveCutoverLifecycle=(c,s,a)=>c===f.context&&s.operationId===start.operationId&&a.action==="drain"&&a.cutoverId===record.cutoverId;
+    assert.throws(()=>f.manager.drainCutover("wrong-id",f.input.currentIdentity,()=>evidence,f.context),/generation/);
+    assert.throws(()=>f.manager.drainCutover(record.cutoverId,{...f.input.currentIdentity,buildId:"wrong"},()=>evidence,f.context),/runtime identity/);
+    const resolver=f.options.resolveEffectBinding;
+    f.options.resolveEffectBinding=(c,s)=>{const b=resolver(c,s);return b?{...b,leaseVersion:b.leaseVersion-1}:undefined;};
+    assert.throws(()=>f.manager.drainCutover(record.cutoverId,f.input.currentIdentity,()=>evidence,f.context),/CAS|lease/);
+    f.options.resolveEffectBinding=resolver;
+    assert.throws(()=>f.manager.drainCutover(record.cutoverId,f.input.currentIdentity,()=>{
+      const lease=f.ownership.get(f.leaseId)!;
+      f.ownership.renew(f.context,f.leaseId,lease.version,new Date(Date.parse(lease.expiresAt)+10000).toISOString());
+      return evidence;
+    },f.context),/binding changed/);
+    assert.equal(snapshot(),before);
+    const drained=f.manager.drainCutover(record.cutoverId,f.input.currentIdentity,()=>evidence,f.context);
+    assert.equal(drained.phase,"drained");assert.equal(f.ownership.get(f.leaseId)?.operationHandle,start.operationId);
+    const beforeReplay=snapshot();
+    assert.deepEqual(f.manager.drainCutover(record.cutoverId,f.input.currentIdentity,()=>{throw new Error("replay must not sample");},f.context),store.get());
+    assert.equal(snapshot(),beforeReplay);
+    f.revoke();const terminal=snapshot();assert.throws(()=>f.manager.drainCutover(record.cutoverId,f.input.currentIdentity,()=>evidence,f.context));assert.equal(snapshot(),terminal);
+  } finally {f.manager.close();}
+});
+
+test("C3 drain response loss preserves pin and reconciles existing file without replay", async()=>{
+  const {CutoverStateStore}=await import("./cutover-state.js");const f=cutoverFixture();
+  const original=CutoverStateStore.prototype.recordDrain;let writes=0;
+  try {
+    const start=f.manager.startCutover(f.input,f.context);const cutoverId=start.receipt!.cutoverId as string;
+    f.options.approveCutoverLifecycle=(c,s,a)=>c===f.context&&s.operationId===start.operationId&&a.cutoverId===cutoverId;
+    const pin=JSON.stringify(f.ownership.get(f.leaseId));
+    CutoverStateStore.prototype.recordDrain=function(id,evidence){writes++;original.call(this,id,evidence);throw new Error("drain response lost");};
+    assert.throws(()=>f.manager.drainCutover(cutoverId,f.input.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),f.context),/response lost/);
+    assert.equal(JSON.stringify(f.ownership.get(f.leaseId)),pin);
+    assert.equal(f.manager.drainCutover(cutoverId,f.input.currentIdentity,()=>{throw new Error("must not reexecute");},f.context).phase,"drained");
+    assert.equal(writes,1);assert.equal(JSON.stringify(f.ownership.get(f.leaseId)),pin);
+  } finally {CutoverStateStore.prototype.recordDrain=original;f.manager.close();}
 });
