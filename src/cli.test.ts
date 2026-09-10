@@ -17,6 +17,49 @@ const require = createRequire(import.meta.url);
 const tsxLoader = pathToFileURL(require.resolve("tsx")).href;
 const cliPath = fileURLToPath(new URL("./cli.ts", import.meta.url));
 
+function compileWindowsAgyExecutable(executable: string): void {
+  const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT;
+  const compiler = systemRoot
+    ? join(systemRoot, "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe")
+    : "";
+  if (!compiler || !existsSync(compiler)) {
+    throw new Error(`Windows native Agy fixture compiler is unavailable: ${compiler || "SystemRoot"}`);
+  }
+  const source = `${executable}.cs`;
+  writeFileSync(source, String.raw`using System;
+using System.Diagnostics;
+using System.IO;
+
+class Program {
+  static void Main() {
+    if (Environment.GetEnvironmentVariable("FORCE_MALFORMED") == "1") {
+      Console.Write("{malformed");
+      return;
+    }
+    var descendantPath = Environment.GetEnvironmentVariable("DESCENDANT_PID_FILE");
+    if (!String.IsNullOrEmpty(descendantPath)) {
+      var node = Environment.GetEnvironmentVariable("NODE_EXEC_PATH");
+      var child = Process.Start(new ProcessStartInfo {
+        FileName = node,
+        Arguments = "-e \"setTimeout(() => {}, 3000)\"",
+        UseShellExecute = false,
+        CreateNoWindow = true,
+      });
+      File.WriteAllText(descendantPath, child.Id.ToString());
+    }
+    var response = "{\"status\":\"SUCCESS\",\"conversation_id\":\"mock-session\",\"response\":\""
+      + new String('x', 100000) + "\"}";
+    Console.Write(response);
+  }
+}
+`);
+  try {
+    execFileSync(compiler, ["/nologo", "/target:exe", `/out:${executable}`, source], { stdio: "ignore" });
+  } finally {
+    rmSync(source, { force: true });
+  }
+}
+
 const packageJson = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as {
   version: string;
 };
@@ -73,9 +116,12 @@ try {
     join(configDir, "agents", "agy-reviewer.md"),
     ["---", "name: agy-reviewer", "description: Test Agy worker.", "provider: agy", "model: mock", "---", "", "Review only.", ""].join("\n"),
   );
-  const mockAgyPath = join(root, "mock-agy.js");
+  const mockAgyPath = join(root, process.platform === "win32" ? "mock-agy.exe" : "mock-agy.js");
   const descendantPidPath = join(root, "agy-descendant.pid");
-  writeFileSync(mockAgyPath, `#!/usr/bin/env node
+  if (process.platform === "win32") {
+    compileWindowsAgyExecutable(mockAgyPath);
+  } else {
+    writeFileSync(mockAgyPath, `#!/usr/bin/env node
 const { spawn } = require("node:child_process");
 const prompt = process.argv[process.argv.indexOf("--print") + 1];
 if (process.env.FORCE_MALFORMED) { console.log("{malformed"); process.exit(0); }
@@ -95,6 +141,7 @@ function writeNextChunk() {
 }
 writeNextChunk();
 `, { mode: 0o755 });
+  }
   const store = new LocalAgentStore(stateDir);
   let current: ReturnType<LocalAgentStore["update"]>;
   let other: ReturnType<LocalAgentStore["update"]>;
@@ -198,6 +245,7 @@ writeNextChunk();
       DEVSPACE_SUBAGENTS: "1",
       DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
       AGY_COMMAND: mockAgyPath,
+      NODE_EXEC_PATH: process.execPath,
       DESCENDANT_PID_FILE: descendantPidPath,
     };
     const runWorker = async (worker: typeof successWorker, token: string, prompt: string) => {
