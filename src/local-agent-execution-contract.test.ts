@@ -4060,19 +4060,6 @@ test("pathspec-magic-looking filename is fingerprinted literally", async () => {
     writeFileSync(join(f.repo, magicName), "magic v2");
     const first = await inspectWorkspacePhysicalState(f.repo);
     const firstFp = first.fingerprints?.[magicName];
-    if (!firstFp) {
-      const resolvePath = (resolver: (path: string) => string, path: string) => {
-        try { return resolver(path); } catch (error) { return `ERROR:${String(error)}`; }
-      };
-      console.error(JSON.stringify({
-        fixtureRepo: f.repo,
-        gitRoot: runGitRaw(["rev-parse", "--show-toplevel"], f.repo),
-        repoRealpath: resolvePath(realpathSync, f.repo),
-        repoNativeRealpath: resolvePath(realpathSync.native, f.repo),
-        changedPaths: first.changedPaths,
-        fingerprintKeys: Object.keys(first.fingerprints ?? {}),
-      }));
-    }
     assert.ok(firstFp);
     assert.equal(firstFp.kind, "modified");
     assert.ok(typeof firstFp.gitStateHash === "string" && firstFp.gitStateHash.length > 0);
