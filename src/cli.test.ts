@@ -96,7 +96,14 @@ function writeNextChunk() {
 writeNextChunk();
 `, { mode: 0o755 });
   const store = new LocalAgentStore(stateDir);
-  const current = store.update(
+  let current: ReturnType<LocalAgentStore["update"]>;
+  let other: ReturnType<LocalAgentStore["update"]>;
+  let successWorker: ReturnType<LocalAgentStore["create"]>;
+  let failureWorker: ReturnType<LocalAgentStore["create"]>;
+  const successToken = "success-worker-token";
+  const failureToken = "failure-worker-token";
+  try {
+    current = store.update(
     store.create({
       workspaceId: "ws_current",
       workspaceRoot: projectRoot,
@@ -106,8 +113,8 @@ writeNextChunk();
       effort: "high",
     }).id,
     { status: "idle", latestResponse: "Review complete.", providerSessionId: "provider_secret" },
-  );
-  const other = store.update(
+    );
+    other = store.update(
     store.create({
       workspaceId: "ws_other",
       workspaceRoot: projectRoot,
@@ -115,14 +122,14 @@ writeNextChunk();
       provider: "codex",
     }).id,
     { status: "running", workerPid: process.pid, workerToken: "foreign-token" },
-  );
-  const successWorker = store.create({ workspaceId: "ws_current", workspaceRoot: projectRoot, profileName: "agy-reviewer", provider: "agy", model: "mock" });
-  const successToken = "success-worker-token";
-  store.prepareWorker(successWorker.id, successToken);
-  const failureWorker = store.create({ workspaceId: "ws_current", workspaceRoot: projectRoot, profileName: "agy-reviewer", provider: "agy", model: "mock" });
-  const failureToken = "failure-worker-token";
-  store.prepareWorker(failureWorker.id, failureToken);
-  store.close();
+    );
+    successWorker = store.create({ workspaceId: "ws_current", workspaceRoot: projectRoot, profileName: "agy-reviewer", provider: "agy", model: "mock" });
+    store.prepareWorker(successWorker.id, successToken);
+    failureWorker = store.create({ workspaceId: "ws_current", workspaceRoot: projectRoot, profileName: "agy-reviewer", provider: "agy", model: "mock" });
+    store.prepareWorker(failureWorker.id, failureToken);
+  } finally {
+    store.close();
+  }
 
   const daemonSocket = localAgentDaemonPaths(stateDir).endpoint;
   const daemonRequests: Array<{ method: string; params?: Record<string, unknown> }> = [];
@@ -216,24 +223,30 @@ writeNextChunk();
     };
     await runWorker(successWorker, successToken, "success");
     const successStore = new LocalAgentStore(stateDir);
-    const completed = successStore.getById(successWorker.id)!;
-    assert.equal(completed.status, "idle");
-    assert.equal(completed.terminalReason, "completed");
-    assert.equal(completed.providerSessionId, "mock-session");
-    assert.equal(completed.latestResponse, "mock response-" + "x".repeat(100000));
-    assert.equal(completed.workerPid, undefined);
-    assert.equal(completed.workerToken, undefined);
-    successStore.close();
+    try {
+      const completed = successStore.getById(successWorker.id)!;
+      assert.equal(completed.status, "idle");
+      assert.equal(completed.terminalReason, "completed");
+      assert.equal(completed.providerSessionId, "mock-session");
+      assert.equal(completed.latestResponse, "mock response-" + "x".repeat(100000));
+      assert.equal(completed.workerPid, undefined);
+      assert.equal(completed.workerToken, undefined);
+    } finally {
+      successStore.close();
+    }
 
     await runWorker(failureWorker, failureToken, "failure");
     const failureStore = new LocalAgentStore(stateDir);
-    const failed = failureStore.getById(failureWorker.id)!;
-    assert.equal(failed.status, "error");
-    assert.equal(failed.terminalReason, "provider_error");
-    assert.match(failed.error ?? "", /Failed to parse Agy JSON output/);
-    assert.equal(failed.workerPid, undefined);
-    assert.equal(failed.workerToken, undefined);
-    failureStore.close();
+    try {
+      const failed = failureStore.getById(failureWorker.id)!;
+      assert.equal(failed.status, "error");
+      assert.equal(failed.terminalReason, "provider_error");
+      assert.match(failed.error ?? "", /Failed to parse Agy JSON output/);
+      assert.equal(failed.workerPid, undefined);
+      assert.equal(failed.workerToken, undefined);
+    } finally {
+      failureStore.close();
+    }
     const descendantPid = Number(readFileSync(descendantPidPath, "utf8"));
     if (Number.isInteger(descendantPid) && descendantPid > 0) {
       try { process.kill(descendantPid, "SIGTERM"); } catch {}
