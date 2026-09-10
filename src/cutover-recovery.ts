@@ -279,8 +279,8 @@ export async function performNativeObservedReplacementRecovery(
     const buildId = requiredStringField(current, "buildId", "cutover_status");
     const capabilityManifestSha256 = requiredStringField(current, "capabilityManifestSha256", "cutover_status");
     const store = new CutoverStateStore(options.stateDir);
-    assertLegacyCutoverUnbound(store.get());
     const before = store.get();
+    assertLegacyCutoverUnbound(before);
     if (!before || before.cutoverId !== options.cutoverId) throw new CutoverStateError("Local durable cutover record does not match live cutover.");
     const liveExpected = requiredRecordField(cutover, "expectedNewIdentity", "cutover_status");
     const liveOld = requiredRecordField(cutover, "oldServerIdentity", "cutover_status");
@@ -438,7 +438,8 @@ async function validateClosedBindingRepair(
 export async function performNativeCrossDomainBindingRepair(
   options: NativeCrossDomainBindingRepairOptions,
 ): Promise<NativeCrossDomainBindingRepairResult> {
-  assertLegacyCutoverUnbound(new CutoverStateStore(options.stateDir).get());
+  const initialRecord = new CutoverStateStore(options.stateDir).get();
+  assertLegacyCutoverUnbound(initialRecord);
   if (options.ownerToken.length === 0) throw new CutoverStateError("OAuth owner token is not configured.");
   const serverUrl = typeof options.serverUrl === "string" ? new URL(options.serverUrl) : options.serverUrl;
   const publicBaseUrl = options.publicBaseUrl
@@ -456,7 +457,10 @@ export async function performNativeCrossDomainBindingRepair(
   });
   const client = new Client({ name: "devspace-native-binding-repair", version: "1.0.0" });
   let operationError: unknown;
-  let committedRecord: DurableCutoverRecord | undefined;
+  // Preserve observed commit evidence even when the next fresh read fails.
+  // This snapshot never authorizes a mutation or replaces fresh validation.
+  let committedRecord: DurableCutoverRecord | undefined =
+    initialRecord?.cutoverId === options.cutoverId && initialRecord.phase === "closed" ? initialRecord : undefined;
   let repairReceiptForReconciliation: CutoverBindingRepairReceipt | undefined;
   let committedReadbackError: string | undefined;
   let writeAttempted = false;
@@ -497,8 +501,8 @@ export async function performNativeCrossDomainBindingRepair(
     }
 
     const store = new CutoverStateStore(options.stateDir);
-    assertLegacyCutoverUnbound(store.get());
     const before = store.get();
+    assertLegacyCutoverUnbound(before);
     if (!before || before.cutoverId !== options.cutoverId) {
       throw new CutoverStateError("Local durable cutover record does not match live cutover.");
     }

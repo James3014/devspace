@@ -1,7 +1,8 @@
+import { isDeepStrictEqual } from "node:util";
 import type { BuildReadyProbeResult } from "./cutover-build-ready.js";
 import type { SelfRestartActuator } from "./cutover-restart.js";
 import type { ExpectedCutoverIdentity } from "./cutover-state.js";
-import type { DurableReconciliationWitness, McpCutoverController } from "./mcp-cutover.js";
+import { assertLegacyCutoverUnbound, type DurableReconciliationWitness, type McpCutoverController } from "./mcp-cutover.js";
 
 export type OrchestrationOutcome =
   | { outcome: "noop"; reason: string }
@@ -60,6 +61,7 @@ export class CutoverOrchestrator {
     if (!record || record.phase === "closed") {
       return { outcome: "noop", reason: "No unresolved cutover requires advancement." };
     }
+    assertLegacyCutoverUnbound(record);
     const mode = this.controller.mode();
 
     if (mode === "reconcile-only") {
@@ -112,6 +114,12 @@ export class CutoverOrchestrator {
           probe,
         };
       }
+    }
+
+    const current = this.controller.record();
+    assertLegacyCutoverUnbound(current);
+    if (!isDeepStrictEqual(current, record)) {
+      return { outcome: "blocked", code: "CUTOVER_RECONCILIATION_REQUIRED", reason: "Cutover generation changed during the build probe; reconcile before advancement." };
     }
 
     if (dryRun) {
