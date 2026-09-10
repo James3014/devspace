@@ -140,8 +140,8 @@ test("C1 callback mutation, throw and missing verifier roll back; grant ABA and 
   }
 });
 
-test("C1 two processes race at renewal/reconciliation CAS after grant is seeded", async () => {
-  for (const action of ["renew", "reconcile"] as const) {
+test("C1/C2 two processes race at renewal/reconciliation/handoff CAS after grant is seeded", async () => {
+  for (const action of ["renew", "reconcile", "handoff"] as const) {
     const root = mkdtempSync(join(tmpdir(), "devspace-c1-race-")); const path=join(root,"state.sqlite");
     const sqlite = new Database(path); const store = new ControlPlaneOwnershipStore(sqlite, options);
     store.putGrantEvidence(context("owner"), grant, 0);
@@ -151,6 +151,7 @@ test("C1 two processes race at renewal/reconciliation CAS after grant is seeded"
       const s=new ControlPlaneOwnershipStore(db,{resolveOwnerContext:()=>({ownerThread:'owner'}),verifyGrantEvidence:()=>true,verifyReconciliationEvidence:()=>true});
       process.stdout.write('ready\\n'); process.stdin.once('data',()=>{try {
         if(process.argv[3]==='renew') s.renew({},process.argv[2],2,new Date(Date.now()+120000+Number(process.argv[4])*1000).toISOString());
+        else if(process.argv[3]==='handoff') { const lease=s.get(process.argv[2]); const target=process.argv[4]; const handoffStore=new ControlPlaneOwnershipStore(db,{resolveOwnerContext:(v)=>({ownerThread:String(v)}),verifyGrantEvidence:()=>true}); handoffStore.handoff('owner',lease.leaseId,2,target,{resource:lease.resource,baseRevision:lease.baseRevision,scope:lease.scope,candidateRevision:'candidate',liveOperation:lease.operation,liveHandle:'op',checkpoint:'checkpoint',grantDependency:lease.grant,grantVersion:lease.grantVersion,recipientGrant:lease.grant,recipientGrantVersion:lease.grantVersion,forbiddenOverlap:lease.scope,tests:[],evidence:['proof'],remainingGap:'unknown',nextGate:'reconcile',expiresAt:lease.expiresAt}); }
         else s.reconcile({},process.argv[2],2,{leaseId:process.argv[2],ownerThread:'owner',operationHandle:'op',operation:'write',baseRevision:'sha-a',leaseVersion:2,state:'finished',detail:process.argv[4]});
         console.log('won');
       }catch(e){console.log('lost:'+e.code)}finally{db.close()}});`;
@@ -168,6 +169,10 @@ test("C1 two processes race at renewal/reconciliation CAS after grant is seeded"
       const reopened=new Database(path);try {
         assert.equal((reopened.prepare('select version from control_plane_resource_leases').get() as {version:number}).version,3);
         assert.equal((reopened.prepare('select count(*) n from control_plane_reconciliation_receipts').get() as {n:number}).n,action==='reconcile'?1:0);
+        if(action==='handoff') {
+          assert.equal((reopened.prepare('select count(*) n from control_plane_handoff_receipts').get() as {n:number}).n,1);
+          const state=new ControlPlaneOwnershipStore(reopened,options).get(lease.leaseId)!;assert.ok(['1','2'].includes(state.ownerThread));assert.equal(state.operationHandle,'op');
+        }
       } finally {reopened.close();}
     } finally {children.forEach(c=>c.child.kill());rmSync(root,{recursive:true,force:true});}
   }
