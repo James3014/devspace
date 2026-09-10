@@ -122,3 +122,27 @@ test("production-shaped handlers enforce owner, worker, invite TTL, and drain ad
     assert.ok(denied.includes("create"));
   } finally { close(f); }
 });
+
+
+test("drain admission cannot turn a vanished current task into a queued claim", async () => {
+  const f=fixture(); const server=new McpServer({name:"drain-race",version:"1"});
+  const owner={"openai/session":"race-owner"}; const workerMeta={"openai/session":"race-worker"};
+  try {
+    const swarm=f.coordinator.createSwarm(owner,{workerLimit:1});
+    const worker=f.coordinator.joinWorker(workerMeta,swarm.id,{label:"worker",runtimeKind:"mcp_peer"});
+    const first=f.coordinator.dispatch(owner,{swarmId:swarm.id,taskKey:"first",prompt:"first"});
+    const second=f.coordinator.dispatch(owner,{swarmId:swarm.id,taskKey:"second",prompt:"second"});
+    assert.equal(second.lifecycleState,"QUEUED");
+    registerChatSwarmTools(server,{coordinator:f.coordinator,config,admit:(action,context)=>{
+      assert.equal(action,"worker_next"); assert.equal(context?.existingTask,true);
+      f.coordinator.submit(workerMeta,worker.id,first.id,"done");
+      f.coordinator.collect(owner,swarm.id,first.id);
+    }});
+    const result=await tools(server).chat_swarm_next.handler({workerId:worker.id},{_meta:workerMeta});
+    assert.equal(result.isError,undefined);
+    assert.equal(result.structuredContent.task,null);
+    assert.equal(f.store.getTask(second.id)?.lifecycleState,"QUEUED");
+    assert.equal(f.store.getTask(second.id)?.assignedWorkerId,undefined);
+    assert.equal(f.coordinator.nextTask(workerMeta,worker.id)?.id,second.id);
+  } finally {await server.close();close(f);}
+});

@@ -35,10 +35,12 @@ export class ChatSwarmCoordinator {
   reconcile(meta: unknown, swarmId: string, taskId: string, decision: "REQUEUE" | "FAILED" | "RESULT_READY", result?: string, evidence?: ReconciliationEvidence): ChatSwarmTask { this.requireOwnedTask(meta, swarmId, taskId); return this.store.resolveReconciliation(taskId, decision, result, evidence); }
   close(meta: unknown, swarmId: string): ChatSwarm { this.assertOwner(meta, swarmId); return this.store.closeSwarm(swarmId); }
 
-  nextTask(meta: unknown, workerId: string): ChatSwarmTask | undefined {
+  nextTask(meta: unknown, workerId: string, expectedCurrentTaskId?: string): ChatSwarmTask | undefined {
     const worker = this.requireWorkerIdentity(meta, workerId);
     if (worker.lifecycleState === "RECONCILE_REQUIRED" || worker.lifecycleState === "DISABLED") return undefined;
     const current = worker.currentTaskId ? this.store.getTask(worker.currentTaskId) : undefined;
+    // An admitted existing-task read must never become a new claim after a race.
+    if (expectedCurrentTaskId !== undefined) return worker.currentTaskId === expectedCurrentTaskId && current?.assignedWorkerId === worker.id ? current : undefined;
     if (current) return current;
     return this.store.claimNextQueuedTaskAtomic(worker.id);
   }

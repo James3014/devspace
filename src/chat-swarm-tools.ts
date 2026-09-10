@@ -130,7 +130,7 @@ export function registerChatSwarmTools(
     try { admit("join"); requireFreshInvite(coordinator, authorizeInvite, input.swarmId, input.inviteCredential, config.chatSwarmInviteTtlSeconds); return success(coordinator.joinWorker(meta(extra), input.swarmId, input)); } catch (error) { return failure(error); }
   });
   server.registerTool("chat_swarm_next", { title: "Get next swarm task", description: "Return the worker's current task or atomically claim the next queued task.", inputSchema: schemas.chat_swarm_next, outputSchema: nextResult }, async (input: any, extra) => {
-    try { const worker = coordinator.store.getWorker(input.workerId); admit("worker_next", { existingTask: Boolean(worker?.currentTaskId) }); return success({ task: coordinator.nextTask(meta(extra), input.workerId) ?? null }); } catch (error) { return failure(error); }
+    try { const worker = coordinator.store.getWorker(input.workerId); admit("worker_next", { existingTask: Boolean(worker?.currentTaskId) }); return success({ task: coordinator.nextTask(meta(extra), input.workerId, worker?.currentTaskId) ?? null }); } catch (error) { return failure(error); }
   });
   server.registerTool("chat_swarm_submit", { title: "Submit swarm result", description: "Submit an owned worker result; terminal replay is idempotent.", inputSchema: schemas.chat_swarm_submit, outputSchema: taskResult }, async (input: any, extra) => {
     try { admit("submit"); return success(coordinator.submit(meta(extra), input.workerId, input.taskId, input.result)); } catch (error) { return failure(error); }

@@ -2178,6 +2178,13 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
         forbiddenOverlap:[project],tests:["http-witness"],evidence:["terminal-operation"],remainingGap:"next revision",nextGate:"readback",expiresAt:current.expiresAt,
       });
       const readArgs={leaseId,previousVersion:handoff.previousVersion,expectedCurrentVersion:handoff.newVersion};
+      const started=await otherClient.callTool({name:"cutover_start",arguments:{expectedSourceCommit:"a".repeat(40),expectedBuildId:"handoff-fixture"}});
+      assert.equal(started.isError,undefined,JSON.stringify(started));
+      const cutoverId=(structuredContent(started).cutover as {cutoverId:string}).cutoverId;
+      const drained=await otherClient.callTool({name:"cutover_drain",arguments:{cutoverId}});
+      assert.equal(drained.isError,undefined,JSON.stringify(drained));
+      const cutoverStore=new CutoverStateStore(config.stateDir);
+      const beforeCutover=JSON.stringify(cutoverStore.get());
       const beforeRead=JSON.stringify(ownership.get(leaseId));
       const recovered=await otherClient.callTool({name:"coordination_handoff_readback",arguments:readArgs});
       assert.equal(recovered.isError,undefined,JSON.stringify(recovered));
@@ -2190,13 +2197,12 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
       const stale=await otherClient.callTool({name:"coordination_handoff_readback",arguments:{...readArgs,expectedCurrentVersion:handoff.previousVersion}});
       assert.equal(stale.isError,true);
       assert.equal(JSON.stringify(ownership.get(leaseId)),beforeRead);
+      assert.equal(JSON.stringify(cutoverStore.get()),beforeCutover);
+      await assert.rejects(otherClient.callTool({name:"dependency_sync",arguments:input}),/CUTOVER_RECONCILIATION_REQUIRED/);
 
     } finally {await otherClient.close();}
 
-    const replay=await client.callTool({name:"dependency_sync",arguments:input});
-    assert.equal(replay.isError,true);
-    const changed=await client.callTool({name:"dependency_sync",arguments:{...input,recipe:"pnpm_frozen"}});
-    assert.equal(changed.isError,true);
+    await assert.rejects(client.callTool({name:"dependency_sync",arguments:input}),/CUTOVER_RECONCILIATION_REQUIRED/);
   } finally {
     await client.close(); await running.close(); manager.close(); provider.close();
     await new Promise<void>((resolve,reject)=>listener.close(e=>e?reject(e):resolve()));
