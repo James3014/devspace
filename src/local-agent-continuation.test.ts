@@ -25,7 +25,7 @@ if (process.platform === "win32") {
   const compiler = systemRoot ? join(systemRoot, "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe") : "";
   if (!compiler || !existsSync(compiler)) throw new Error(`Windows PE fixture compiler is unavailable: ${compiler || "SystemRoot"}`);
   const source = `${codexExecutable}.cs`;
-  writeFileSync(source, 'using System; class Program { static void Main() { Console.WriteLine("codex-cli 0.149.0"); } }');
+  writeFileSync(source, `using System; class Program { static void Main() { Console.WriteLine("codex-cli ${MINIMUM_CODEX_RUNTIME_VERSION}"); } }`);
   try {
     execFileSync(compiler, ["/nologo", "/target:exe", `/out:${codexExecutable}`, source], { stdio: "ignore" });
   } finally {
@@ -395,10 +395,13 @@ test("continuation is rejected while execution capacity is exhausted", async () 
     );
   } finally {
     for (const resolvePending of release) resolvePending();
-    await Promise.allSettled([blockedA, blockedC].filter((promise): promise is Promise<unknown> => promise !== undefined));
-    manager.close();
-    rmSync(stateDir, { recursive: true, force: true });
-    f.clean();
+    try {
+      await Promise.all([blockedA, blockedC].filter((promise): promise is Promise<unknown> => promise !== undefined));
+    } finally {
+      manager.close();
+      rmSync(stateDir, { recursive: true, force: true });
+      f.clean();
+    }
   }
 });
 
