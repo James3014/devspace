@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, realpathSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, symlinkSync, unlinkSync, realpathSync, writeFileSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { loadConfig } from "./config.js";
 import { DurableOperationManager } from "./durable-operations.js";
-import type { ControlPlaneConsumerOptions } from "./control-plane-consumer.js";
+import { ControlPlaneConsumer, type ControlPlaneConsumerOptions } from "./control-plane-consumer.js";
 import type { ControlPlaneOwnershipStore } from "./control-plane-ownership.js";
 
 function fixture(run: ConstructorParameters<typeof DurableOperationManager>[1]) {
@@ -632,4 +632,23 @@ test("C3 restart probe drift and uncertain actuator results never release or rep
       }
     } finally {CutoverStateStore.prototype.recordRestartScheduled=originalMarker;f.manager.close();}
   }
+});
+
+
+test("consumer authorizes and reconciles physical aliases but denies changed or missing roots", () => {
+  const f=fixture(async()=>({exitCode:0,stdout:"",stderr:""}));
+  const alias=join(f.root,"alias"),other=join(f.root,"other");mkdirSync(other);symlinkSync(f.root,alias,"junction");
+  const opts:ControlPlaneConsumerOptions={...f.options,verifyDependencyReconciliation:()=>true,verifyReconciliationEvidence:()=>true,resolveEffectBinding:(_c,s)=>({leaseId:f.leaseId,leaseVersion:f.lease().version,requestHash:s.requestHash,role:"worker"})};
+  const ownership=f.manager.store.createOwnershipStore(opts),consumer=new ControlPlaneConsumer(ownership,opts);
+  const subject={operationId:"alias-effect",requestHash:f.approvedHash,workspaceRoot:alias,baseRevision:f.base,operation:"dependency_sync" as const};
+  try {
+    assert.equal(consumer.authorize(f.context,subject).leaseId,f.leaseId);
+    ownership.beginOperation(f.context,f.leaseId,1,subject.operationId);
+    const proof={leaseId:f.leaseId,leaseVersion:2,ownerThread:"worker",operationHandle:subject.operationId,operation:subject.operation,baseRevision:f.base,state:"finished" as const,requestHash:subject.requestHash,exitCode:0,frozenInputsUnchanged:true};
+    for(const path of [other,join(f.root,"missing")]) {
+      const before=f.lease();assert.throws(()=>consumer.authorize(f.context,{...subject,workspaceRoot:path}));assert.throws(()=>consumer.reconcile(f.context,{...subject,workspaceRoot:path},proof));assert.deepEqual(f.lease(),before);
+    }
+    unlinkSync(alias);symlinkSync(other,alias,"junction");const before=f.lease();assert.throws(()=>consumer.authorize(f.context,subject));assert.throws(()=>consumer.reconcile(f.context,subject,proof));assert.deepEqual(f.lease(),before);
+    unlinkSync(alias);symlinkSync(f.root,alias,"junction");consumer.reconcile(f.context,subject,proof);assert.equal(f.lease().operationHandle,undefined);
+  } finally {f.manager.close();unlinkSync(alias);}
 });

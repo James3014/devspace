@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import type { CutoverServerIdentity, BuildReadyReceipt } from "./cutover-state.js";
 import { projectCompletion, type CompletionSelection } from "./current-completion-matrix.js";
 import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type ControlPlaneOwnershipOptions, type ReconciliationEvidence, type HandoffInput } from "./control-plane-ownership.js";
@@ -90,7 +91,7 @@ export class ControlPlaneConsumer {
     const binding = this.options.resolveEffectBinding(context, Object.freeze({...subject}));
     if (!binding || !["controller", "worker"].includes(binding.role) || binding.requestHash !== subject.requestHash) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "trusted effect binding required");
     const lease = this.ownership.assertHeld(context, binding.leaseId, binding.leaseVersion, subject.operation, subject.baseRevision);
-    const normalizedRoot = subject.workspaceRoot.replaceAll("\\", "/");
+    const normalizedRoot = realpathSync.native(subject.workspaceRoot).replaceAll("\\", "/");
     if (lease.scope.length !== 1 || lease.scope[0] !== normalizedRoot || lease.resource !== normalizedRoot) throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "lease must bind the actual dependency workspace");
     return {...binding};
   }
@@ -116,7 +117,8 @@ export class ControlPlaneConsumer {
     const currentBinding = this.options.resolveEffectBinding(context, Object.freeze({...subject}));
     if (JSON.stringify(currentBinding) !== JSON.stringify(binding)) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "terminal witness authority changed");
     const lease = this.ownership.get(binding.leaseId);
-    if (!lease || lease.resource !== subject.workspaceRoot || lease.scope.length !== 1 || lease.scope[0] !== subject.workspaceRoot) {
+    const normalizedRoot = realpathSync.native(subject.workspaceRoot).replaceAll("\\", "/");
+    if (!lease || lease.resource !== normalizedRoot || lease.scope.length !== 1 || lease.scope[0] !== normalizedRoot) {
       throw new ControlPlaneOwnershipError("CAS_CONFLICT", "reconciliation workspace changed");
     }
     const {requestHash, exitCode, frozenInputsUnchanged, ...ownershipProof} = proof;
