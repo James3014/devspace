@@ -3827,6 +3827,7 @@ export function createMcpServer(
           durationMs: z.number().optional(),
           stdout: z.string().optional(),
           stderr: z.string().optional(),
+          launchError: z.object({ code: z.string(), message: z.string() }).optional(),
         },
         _meta: {},
         annotations: SHELL_TOOL_ANNOTATIONS,

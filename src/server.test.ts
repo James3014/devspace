@@ -1,11 +1,11 @@
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
-import { execFile } from "node:child_process";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFile, execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { createServer as createNetServer, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test, { after, type TestContext } from "node:test";
 import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -34,16 +34,34 @@ const execFileAsync = promisify(execFile);
 const originalDependencyRoot = process.env.DEVSPACE_DEPENDENCY_ROOT;
 const codexRuntimeRoot = mkdtempSync(join(tmpdir(), "devspace-server-codex-runtime-"));
 mkdirSync(join(codexRuntimeRoot, "node_modules", "@openai", "codex-sdk"), { recursive: true });
-mkdirSync(join(codexRuntimeRoot, "node_modules", "@openai", "codex", "bin"), { recursive: true });
 writeFileSync(
   join(codexRuntimeRoot, "node_modules", "@openai", "codex-sdk", "package.json"),
   JSON.stringify({ name: "@openai/codex-sdk", version: MINIMUM_CODEX_RUNTIME_VERSION }),
 );
-writeFileSync(
-  join(codexRuntimeRoot, "node_modules", "@openai", "codex", "bin", "codex.js"),
-  `#!/bin/sh\necho 'codex-cli ${MINIMUM_CODEX_RUNTIME_VERSION}'\n`,
-  { mode: 0o755 },
-);
+const codexExecutable = process.platform === "win32"
+  ? join(codexRuntimeRoot, "node_modules", "@openai", process.arch === "arm64" ? "codex-win32-arm64" : "codex-win32-x64", "vendor", process.arch === "arm64" ? "aarch64-pc-windows-msvc" : "x86_64-pc-windows-msvc", "bin", "codex.exe")
+  : join(codexRuntimeRoot, "node_modules", "@openai", "codex", "bin", "codex.js");
+mkdirSync(dirname(codexExecutable), { recursive: true });
+if (process.platform === "win32") {
+  const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT;
+  const compiler = systemRoot
+    ? join(systemRoot, "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe")
+    : "";
+  if (!compiler || !existsSync(compiler)) throw new Error(`Windows PE fixture compiler is unavailable: ${compiler || "SystemRoot"}`);
+  const source = `${codexExecutable}.cs`;
+  writeFileSync(source, `using System; class Program { static void Main() { Console.WriteLine("codex-cli ${MINIMUM_CODEX_RUNTIME_VERSION}"); } }`);
+  try {
+    execFileSync(compiler, ["/nologo", "/target:exe", `/out:${codexExecutable}`, source], { stdio: "ignore" });
+  } finally {
+    rmSync(source, { force: true });
+  }
+} else {
+  writeFileSync(
+    codexExecutable,
+    `#!/bin/sh\necho 'codex-cli ${MINIMUM_CODEX_RUNTIME_VERSION}'\n`,
+    { mode: 0o755 },
+  );
+}
 process.env.DEVSPACE_DEPENDENCY_ROOT = codexRuntimeRoot;
 
 after(async () => {
@@ -1358,11 +1376,16 @@ test("subagents: workspace_verify executes a configured verifier normally", asyn
   const toolchainRoot = await mkdtemp(join(tmpdir(), "devspace-server-toolchain-"));
   const bin = join(toolchainRoot, ".venv", "bin");
   await mkdir(bin, { recursive: true });
-  const verifierPath = join(bin, "pytest");
-  await writeFile(verifierPath, "#!/bin/sh\necho \"verifier-ran\"\nexit 0\n", { mode: 0o755 });
-  chmodSync(verifierPath, 0o755);
+  const verifierRelative = process.platform === "win32" ? ".venv/bin/pytest.exe" : ".venv/bin/pytest";
+  const verifierPath = join(toolchainRoot, verifierRelative);
+  if (process.platform === "win32") {
+    copyFileSync(process.execPath, verifierPath);
+  } else {
+    await writeFile(verifierPath, "#!/bin/sh\necho \"verifier-ran\"\nexit 0\n", { mode: 0o755 });
+    chmodSync(verifierPath, 0o755);
+  }
   const toolchains = JSON.stringify([
-    { id: "nexus-python", root: toolchainRoot, verifiers: { pytest: ".venv/bin/pytest" } },
+    { id: "nexus-python", root: toolchainRoot, verifiers: { pytest: verifierRelative } },
   ]);
   const context = await fixture(t, { git: true, subagents: true, toolchains });
   try {
@@ -1371,7 +1394,12 @@ test("subagents: workspace_verify executes a configured verifier normally", asyn
 
     const result = await context.client.callTool({
       name: "workspace_verify",
-      arguments: { workspaceId, toolchainId: "nexus-python", verifier: "pytest", args: ["-q"] },
+      arguments: {
+        workspaceId,
+        toolchainId: "nexus-python",
+        verifier: "pytest",
+        args: process.platform === "win32" ? ["-e", "console.log('verifier-ran')"] : ["-q"],
+      },
     });
     assert.equal(result.isError, undefined);
     const body = structuredContent(result);

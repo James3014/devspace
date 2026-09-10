@@ -1,8 +1,8 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test, { after } from "node:test";
 import { LocalAgentSessionManager } from "./local-agent-sessions.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
@@ -12,16 +12,28 @@ import { MINIMUM_CODEX_RUNTIME_VERSION } from "./codex-runtime.js";
 const originalDependencyRoot = process.env.DEVSPACE_DEPENDENCY_ROOT;
 const codexRuntimeRoot = mkdtempSync(join(tmpdir(), "devspace-continuation-codex-runtime-"));
 mkdirSync(join(codexRuntimeRoot, "node_modules", "@openai", "codex-sdk"), { recursive: true });
-mkdirSync(join(codexRuntimeRoot, "node_modules", "@openai", "codex", "bin"), { recursive: true });
 writeFileSync(
   join(codexRuntimeRoot, "node_modules", "@openai", "codex-sdk", "package.json"),
   JSON.stringify({ name: "@openai/codex-sdk", version: MINIMUM_CODEX_RUNTIME_VERSION }),
 );
-writeFileSync(
-  join(codexRuntimeRoot, "node_modules", "@openai", "codex", "bin", "codex.js"),
-  `#!/bin/sh\necho 'codex-cli ${MINIMUM_CODEX_RUNTIME_VERSION}'\n`,
-  { mode: 0o755 },
-);
+const codexExecutable = process.platform === "win32"
+  ? join(codexRuntimeRoot, "node_modules", "@openai", process.arch === "arm64" ? "codex-win32-arm64" : "codex-win32-x64", "vendor", process.arch === "arm64" ? "aarch64-pc-windows-msvc" : "x86_64-pc-windows-msvc", "bin", "codex.exe")
+  : join(codexRuntimeRoot, "node_modules", "@openai", "codex", "bin", "codex.js");
+mkdirSync(dirname(codexExecutable), { recursive: true });
+if (process.platform === "win32") {
+  const systemRoot = process.env.SystemRoot ?? process.env.SYSTEMROOT;
+  const compiler = systemRoot ? join(systemRoot, "Microsoft.NET", "Framework64", "v4.0.30319", "csc.exe") : "";
+  if (!compiler || !existsSync(compiler)) throw new Error(`Windows PE fixture compiler is unavailable: ${compiler || "SystemRoot"}`);
+  const source = `${codexExecutable}.cs`;
+  writeFileSync(source, `using System; class Program { static void Main() { Console.WriteLine("codex-cli ${MINIMUM_CODEX_RUNTIME_VERSION}"); } }`);
+  try {
+    execFileSync(compiler, ["/nologo", "/target:exe", `/out:${codexExecutable}`, source], { stdio: "ignore" });
+  } finally {
+    rmSync(source, { force: true });
+  }
+} else {
+  writeFileSync(codexExecutable, `#!/bin/sh\necho 'codex-cli ${MINIMUM_CODEX_RUNTIME_VERSION}'\n`, { mode: 0o755 });
+}
 process.env.DEVSPACE_DEPENDENCY_ROOT = codexRuntimeRoot;
 
 after(() => {
@@ -69,7 +81,7 @@ function setupManager(overrides: Record<string, unknown> = {}, turnRunner?: any)
     async () => true,
     turnRunner,
   );
-  return { manager, clean: () => rmSync(stateDir, { recursive: true, force: true }) };
+  return { manager, clean: () => { manager.close(); rmSync(stateDir, { recursive: true, force: true }); } };
 }
 
 const mockProfiles: LocalAgentProfile[] = [
@@ -313,7 +325,8 @@ test("continuation is rejected when HEAD advanced past recorded lineage", async 
 test("continuation is rejected while execution capacity is exhausted", async () => {
   const f = setupGitFixture();
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-capacity-state-"));
-  const release: Array<() => void> = [];
+  let releaseBlocked!: () => void;
+  const blocked = new Promise<void>((resolve) => { releaseBlocked = resolve; });
   const manager = new LocalAgentSessionManager(
     {
       stateDir,
@@ -327,11 +340,13 @@ test("continuation is rejected while execution capacity is exhausted", async () 
     async () => true,
     async (_profile, _record, prompt) => {
       if (prompt === "block") {
-        await new Promise<void>((resolve) => release.push(resolve));
+        await blocked;
       }
       return { provider: "codex", providerSessionId: "sess-test", items: [], finalResponse: "done" };
     },
   );
+  let blockedA: Promise<unknown> | undefined;
+  let blockedC: Promise<unknown> | undefined;
   try {
     const startAndRun = async (workspaceId: string, prompt: string) => {
       const started = await manager.startAgent({
@@ -349,11 +364,11 @@ test("continuation is rejected while execution capacity is exhausted", async () 
     };
 
     // One worker holds an execution slot...
-    void startAndRun("ws_cap_a", "block");
+    blockedA = startAndRun("ws_cap_a", "block");
     // ...while another agent finishes cleanly and stays terminal...
     const finished = await startAndRun("ws_cap_b", "finish");
     // ...and a second active worker exhausts configured capacity.
-    void startAndRun("ws_cap_c", "block");
+    blockedC = startAndRun("ws_cap_c", "block");
     // The continuation admission below snapshots execution capacity. Both
     // blocked workers must have claimed their detached execution slots first,
     // otherwise the snapshot can race the second worker's claim and the
@@ -380,9 +395,14 @@ test("continuation is rejected while execution capacity is exhausted", async () 
       (err: any) => err.code === "CONTINUATION_ADMISSION_FAILED" && /capacity/i.test(err.message),
     );
   } finally {
-    for (const resolvePending of release) resolvePending();
-    rmSync(stateDir, { recursive: true, force: true });
-    f.clean();
+    releaseBlocked();
+    try {
+      await Promise.all([blockedA, blockedC].filter((promise): promise is Promise<unknown> => promise !== undefined));
+    } finally {
+      manager.close();
+      rmSync(stateDir, { recursive: true, force: true });
+      f.clean();
+    }
   }
 });
 
