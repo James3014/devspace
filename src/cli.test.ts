@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import test from "node:test";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer as createNetServer } from "node:net";
@@ -94,7 +95,15 @@ for (const args of [
 }
 
 const root = mkdtempSync(join(tmpdir(), "devspace-cli-agents-test-"));
+// A fresh production-tsconfig compilation keeps tsx cold loading outside the
+// worker exit deadline. Both direct and CI-wrapper invocations use this fixture.
+const compiledWorkerDir = mkdtempSync(join(process.cwd(), ".cli-worker-build-"));
 try {
+  const compilationStarted = performance.now();
+  execFileSync(process.execPath, [require.resolve("typescript/bin/tsc"), "-p", "tsconfig.build.json", "--outDir", compiledWorkerDir], { cwd: process.cwd(), stdio: "pipe", timeout: 120000 });
+  const compiledWorkerEntry = join(compiledWorkerDir, "cli.js");
+  assert.equal(existsSync(compiledWorkerEntry), true);
+  console.error(`[cli-worker-build] elapsedMs=${Math.round(performance.now() - compilationStarted)}`);
   const configDir = join(root, ".devspace");
   const stateDir = join(root, ".state");
   const projectRoot = join(root, "project");
@@ -256,16 +265,51 @@ writeNextChunk();
       const promptDir = mkdtempSync(join(tmpdir(), "devspace-agent-prompt-"));
       const promptFile = join(promptDir, "prompt.txt");
       writeFileSync(promptFile, prompt);
-      const child = spawn("node", ["--import", "tsx", "src/cli.ts", "agents", "__worker", worker.id, "--prompt-file", promptFile, "--worker-token", token], {
+      const child = spawn(process.execPath, [compiledWorkerEntry, "agents", "__worker", worker.id, "--prompt-file", promptFile, "--worker-token", token], {
         cwd: process.cwd(), env: { ...workerEnv, DESCENDANT_PID_FILE: prompt === "success" ? descendantPidPath : "", FORCE_MALFORMED: prompt === "failure" ? "1" : "" },
         stdio: ["ignore", "pipe", "pipe"],
       });
       const workerPid = child.pid;
-      let stderr = "";
-      child.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+      const started = performance.now();
+      const elapsed = () => Math.round(performance.now() - started);
+      const milestones: Record<string, unknown> = { executable: process.execPath, pid: workerPid };
+      let stderr = "", stdout = "", stderrTruncated = false, stdoutTruncated = false;
+      const capture = (stream: "stdout" | "stderr", chunk: Buffer) => {
+        milestones.firstOutputMs ??= elapsed();
+        const text = chunk.toString();
+        if (stream === "stderr") { stderrTruncated ||= stderr.length + text.length > 8192; stderr = (stderr + text).slice(-8192); }
+        else { stdoutTruncated ||= stdout.length + text.length > 8192; stdout = (stdout + text).slice(-8192); }
+      };
+      child.stdout.on("data", chunk => capture("stdout", chunk));
+      child.stderr.on("data", chunk => capture("stderr", chunk));
       const result = await new Promise<{ code: number | null; stderr: string }>((resolveWorker, rejectWorker) => {
-        const timer = setTimeout(() => { child.kill("SIGKILL"); rejectWorker(new Error(`worker timeout: ${stderr}`)); }, 5_000);
-        child.once("close", (code) => { clearTimeout(timer); resolveWorker({ code, stderr }); });
+        let settled = false, timedOut = false;
+        let cleanupTimer: ReturnType<typeof setTimeout> | undefined;
+        const finish = (error?: Error, code: number | null = null) => {
+          if (settled) return;
+          settled = true; clearTimeout(timer); if (cleanupTimer) clearTimeout(cleanupTimer);
+          child.removeListener("close", onClose); child.removeListener("error", onError);
+          if (error) rejectWorker(error); else resolveWorker({ code, stderr });
+        };
+        const details = () => JSON.stringify({ ...milestones, stderr, stdout, stderrTruncated, stdoutTruncated });
+        const onClose = (code: number | null) => {
+          milestones.closeMs = elapsed();
+          if (timedOut) finish(new Error(`worker timeout: ${details()}`));
+          else { console.error(`[cli-worker-diagnostic] ${JSON.stringify(milestones)}`); finish(undefined, code); }
+        };
+        const onError = (error: Error) => finish(new Error(`worker spawn error: ${error.message}; ${details()}`));
+        child.once("spawn", () => { milestones.spawnMs = elapsed(); });
+        child.once("close", onClose); child.once("error", onError);
+        const timer = setTimeout(() => {
+          timedOut = true; milestones.timeoutMs = elapsed();
+          try {
+            const snapshot = new LocalAgentStore(stateDir);
+            try { const row = snapshot.getById(worker.id); milestones.worker = row ? { status: row.status, terminalReason: row.terminalReason, workerPid: row.workerPid } : "missing"; }
+            finally { snapshot.close(); }
+          } catch { milestones.worker = "diagnostic-read-failed"; }
+          child.kill("SIGKILL");
+          cleanupTimer = setTimeout(() => finish(new Error(`worker timeout; cleanup close not observed: ${details()}`)), 2000);
+        }, 5_000);
       });
       assert.equal(result.code, 0, result.stderr);
       if (workerPid) {
@@ -533,5 +577,15 @@ writeNextChunk();
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
   }).subagents.enabled, true);
 } finally {
+  rmSync(compiledWorkerDir, { recursive: true, force: true });
   rmSync(root, { recursive: true, force: true });
 }
+
+test("serve rejects incomplete coordination reader selection before listening", async () => {
+  await assert.rejects(execFileAsync(process.execPath, ["--import", tsxLoader, cliPath, "serve", "--coordination-reader-module", "relative.mjs"], { timeout: 15000 }), error => {
+    const result = error as Error & { stdout?: string; stderr?: string };
+    assert.match(result.stderr ?? "", /absolute .mjs path and its SHA-256 together/);
+    assert.doesNotMatch(result.stdout ?? "", /devspace listening/);
+    return true;
+  });
+});

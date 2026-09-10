@@ -341,3 +341,49 @@ test("advance never establishes a recovery successor for a superseded terminal",
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
+for (const changeDuringProbe of [false, true]) {
+  test(`orchestrator rejects bound generation ${changeDuringProbe ? "after probe" : "at entry"} without scheduling`, async () => {
+    const stateDir = mkdtempSync(join(tmpdir(), "devspace-orch-bound-"));
+    try {
+      const { old, orchestrator } = makeStore(stateDir);
+      const actuator = makeActuator();
+      const binding = { leaseId: "lease", pinnedLeaseVersion: 1, operationHandle: "operation", requestHash: "a".repeat(64), ownerThread: "owner" };
+      old.begin(expectedId, undefined, changeDuringProbe ? undefined : binding);
+      const id = old.record()!.cutoverId;
+      old.recordDrain(id, { activeSessions: 0, oldestAgeMs: 0 });
+      old.requestRestart(id, { verifiedBy: "op", verifiedAt: new Date().toISOString() });
+      let probes = 0;
+      const originalRecord = old.record.bind(old);
+      const run = orchestrator(old, { actuator, probe: () => {
+        probes++;
+        old.record = () => ({ ...originalRecord()!, coordinationBinding: binding });
+        return { buildReady: true, verifiedBy: "build-identity-file", verifiedAt: new Date().toISOString(), expectedSourceCommit: expectedId.sourceCommit, expectedBuildId: expectedId.buildId, detail: "fixture target verified" };
+      } });
+      await assert.rejects(run.advance(), /COORDINATION_REQUIRED/);
+      assert.equal(probes, changeDuringProbe ? 1 : 0);
+      assert.equal(actuator.calls, 0);
+      assert.equal(originalRecord()?.restartRequest?.restartScheduledAt, undefined);
+    } finally { rmSync(stateDir, { recursive: true, force: true }); }
+  });
+}
+
+test("orchestrator rejects an unbound generation changed during probe without scheduling", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-orch-generation-"));
+  try {
+    const { old, orchestrator } = makeStore(stateDir);
+    const actuator = makeActuator();
+    old.begin(expectedId);
+    const id = old.record()!.cutoverId;
+    old.recordDrain(id, { activeSessions: 0, oldestAgeMs: 0 });
+    old.requestRestart(id, { verifiedBy: "op", verifiedAt: new Date().toISOString() });
+    const originalRecord = old.record.bind(old);
+    const outcome = await orchestrator(old, { actuator, probe: () => {
+      old.record = () => ({ ...originalRecord()!, cutoverId: "different-generation" });
+      return { buildReady: true, verifiedBy: "build-identity-file", verifiedAt: new Date().toISOString(), expectedSourceCommit: expectedId.sourceCommit, expectedBuildId: expectedId.buildId, detail: "fixture target verified" };
+    } }).advance();
+    assert.equal(outcome.outcome, "blocked");
+    assert.equal("code" in outcome && outcome.code, "CUTOVER_RECONCILIATION_REQUIRED");
+    assert.equal(actuator.calls, 0);
+    assert.equal(originalRecord()?.restartRequest?.restartScheduledAt, undefined);
+  } finally { rmSync(stateDir, { recursive: true, force: true }); }
+});

@@ -18,8 +18,11 @@ test("old instance drains and replacement instance is reconcile-only across rest
   try {
     const store = new CutoverStateStore(stateDir, { newId: () => "cutover-one" });
     const old = new McpCutoverController(store, identity("old", "old-source", "old-build"));
-    old.begin({ sourceCommit: "new-source", buildId: "new-build", capabilityManifestSha256: "cap" });
+    const binding={leaseId:"lease",pinnedLeaseVersion:2,operationHandle:"operation",requestHash:"a".repeat(64),ownerThread:"controller"};
+    old.begin({ sourceCommit: "new-source", buildId: "new-build", capabilityManifestSha256: "cap" },undefined,binding);
+    assert.deepEqual(old.record()?.coordinationBinding,binding);
     assert.equal(old.mode(), "drain");
+    assert.doesNotThrow(() => old.assertToolAllowed("coordination_handoff_readback"));
     assert.throws(() => old.assertToolAllowed("write"), /CUTOVER_RECONCILIATION_REQUIRED/);
     assert.throws(() => old.assertToolAllowed("workspace_verify"), /CUTOVER_RECONCILIATION_REQUIRED/);
     assert.doesNotThrow(() => old.assertToolAllowed("read"));
@@ -42,6 +45,8 @@ test("old instance drains and replacement instance is reconcile-only across rest
       identity("new", "new-source", "new-build"),
     );
     assert.equal(replacement.mode(), "reconcile-only");
+    assert.deepEqual(replacement.record()?.coordinationBinding,binding);
+    assert.doesNotThrow(() => replacement.assertToolAllowed("coordination_handoff_readback"));
     assert.equal(replacement.canInitializeTransport(), true);
     assert.throws(
       () => replacement.recordDrain("cutover-one", { activeSessions: 0, oldestAgeMs: 0 }),
@@ -540,4 +545,19 @@ test("P0-1: unknown/newly-registered mutation tool fails closed during cutover, 
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
+});
+
+test("C3 legacy finish rechecks bound generation after awaited reconciliation",async()=>{
+  const stateDir=mkdtempSync(join(tmpdir(),"devspace-bound-finish-race-"));const store=new CutoverStateStore(stateDir);
+  const old=identity("old","old","old"),replacement=identity("new","target","target");
+  const initial=store.begin({oldServerIdentity:old,expectedNewIdentity:{sourceCommit:"target",buildId:"target",capabilityManifestSha256:"cap"}});
+  store.recordDrain(initial.cutoverId,{activeSessions:0,oldestAgeMs:0});
+  const controller=new McpCutoverController(store,replacement);
+  let nextId="";
+  await assert.rejects(controller.finish(initial.cutoverId,async()=>{
+    store.close(initial.cutoverId,{closedByServerInstanceId:"new",workspaceQueryable:true,agentQueryable:true,agentReconciled:true,reconciledAt:new Date().toISOString()});
+    nextId=store.begin({oldServerIdentity:replacement,expectedNewIdentity:{sourceCommit:"next",buildId:"next"},coordinationBinding:{leaseId:"lease",pinnedLeaseVersion:1,operationHandle:"operation",requestHash:"a".repeat(64),ownerThread:"owner"}}).cutoverId;
+    return {workspaceQueryable:true,agentQueryable:true,agentReconciled:true};
+  }),/COORDINATION_REQUIRED/);
+  assert.equal(store.get()?.cutoverId,nextId);assert.equal(store.get()?.phase,"prepared");
 });

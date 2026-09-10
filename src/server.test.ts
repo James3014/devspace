@@ -31,6 +31,7 @@ import { ChatSwarmLifecycle } from "./chat-swarm-lifecycle.js";
 import { ChatSwarmRuntimeAlreadyOwnedError } from "./chat-swarm-runtime-owner.js";
 import { ChatSwarmStore } from "./chat-swarm-store.js";
 import { chatSwarmToolInputShapes } from "./chat-swarm-tools.js";
+
 import { SqliteOAuthStore, SqliteOAuthClientsStore } from "./oauth-store.js";
 
 const execFileAsync = promisify(execFile);
@@ -412,15 +413,18 @@ test("cutover MCP control exposes bounded lease lifecycle and schedules self res
       assert.ok(tools.tools.some((tool) => tool.name === name), `missing ${name}`);
     }
 
-    const started = structuredContent(await client.callTool({
+    const deniedStart = await client.callTool({
       name: "cutover_start",
       arguments: {
         expectedSourceCommit: "b".repeat(40),
         expectedBuildId: "new-build",
         expectedCapabilityManifestSha256: "a".repeat(64),
       },
-    }));
-    assert.equal((started.cutover as Record<string, unknown>).phase, "prepared");
+    });
+    assert.equal(deniedStart.isError,true);
+    assert.equal(cutoverController.record(),undefined);
+    // Trusted fixture setup for the following lifecycle-handler checks.
+    cutoverController.begin({sourceCommit:"b".repeat(40),buildId:"new-build",capabilityManifestSha256:"a".repeat(64)});
 
     const drained = structuredContent(await client.callTool({
       name: "cutover_drain",
@@ -2007,12 +2011,13 @@ test("nexus_gateway_recover exposes only the fixed typed recovery contract", asy
   assert.equal(invalid.isError, true, "extra caller-selected process controls must fail schema validation before handler execution");
 });
 
-test("OWNER_DIRECT workspace_clone and dependency_sync run through typed MCP tools", async (t) => {
+test("OWNER_DIRECT workspace_clone works and dependency_sync denies unauthenticated MCP context", async (t) => {
   const context = await fixture(t, { git: true });
   const tools = await context.client.listTools();
   for (const name of ["workspace_clone", "dependency_sync", "operation_status", "operation_reconcile"]) {
     assert.ok(tools.tools.some((tool) => tool.name === name), `${name} must be exposed`);
   }
+  assert.equal((await context.client.callTool({name:"coordination_completion_read",arguments:{goal:"g",candidate:"c",subject:"s"},_meta:{clientId:"forged"}})).isError,true);
   const bash = tools.tools.find((tool) => tool.name === "bash");
   assert.match(String(bash?.description), /Do not use bash to create or modify files/);
 
@@ -2076,14 +2081,14 @@ test("OWNER_DIRECT workspace_clone and dependency_sync run through typed MCP too
       authorityMode: "OWNER_DIRECT",
     },
   });
-  assert.equal(sync.isError, undefined);
-  assert.equal(structuredContent(sync).status, "succeeded");
+  assert.equal(sync.isError, true);
+  assert.match(JSON.stringify(sync), /authenticated MCP client context/);
   assert.equal(await readFile(join(destination, "package.json"), "utf8"), manifestBefore);
   assert.equal(await readFile(join(destination, "package-lock.json"), "utf8"), lockBefore);
 
   const status = await context.client.callTool({
     name: "operation_status",
-    arguments: { operationId: structuredContent(sync).operationId },
+    arguments: { operationId: cloneRecord.operationId },
   });
   assert.equal(structuredContent(status).status, "succeeded");
 
@@ -2122,6 +2127,217 @@ test("command_status metadata annotations and minimal mode visibility", async (t
     idempotentHint: true,
     openWorldHint: false,
   });
+});
+
+test("C3 authenticated HTTP MCP uses host-bound worker authority for real dependency execution", async () => {
+  const {realpath}=await import("node:fs/promises");
+  const {createHash}=await import("node:crypto");
+  const {SingleUserOAuthProvider}=await import("./oauth-provider.js");
+  const {StreamableHTTPClientTransport}=await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
+  const root=await realpath(await mkdtemp(join(tmpdir(),"devspace-c3-http-")));
+  const project=join(root,"project");
+  await mkdir(project);
+  await git(project,["init"]);
+  await git(project,["-c","user.name=Fixture","-c","user.email=fixture@example.test","commit","--allow-empty","-m","fixture"]);
+  await writeFile(join(project,"package.json"),'{"name":"fixture","version":"1.0.0"}');
+  await writeFile(join(project,"package-lock.json"),'{"lockfileVersion":3,"packages":{}}');
+  const base=(await execFileAsync("git",["rev-parse","HEAD"],{cwd:project})).stdout.trim();
+  const config=loadConfig({DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_ALLOWED_ROOTS:root,DEVSPACE_STATE_DIR:join(root,"state"),DEVSPACE_WORKTREE_ROOT:join(root,"worktrees"),DEVSPACE_PUBLIC_BASE_URL:"http://127.0.0.1:1",DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",PORT:"1"});
+  const provider=new SingleUserOAuthProvider(config.oauth,new URL("/mcp",config.publicBaseUrl),config.stateDir);
+  const oauthClient=await provider.clientsStore.registerClient!({redirect_uris:["http://localhost/callback"],client_name:"C3 fixture",token_endpoint_auth_method:"none"});
+  let redirect="";
+  await provider.authorize(oauthClient,{redirectUri:"http://localhost/callback",codeChallenge:"fixture",scopes:config.oauth.scopes,resource:new URL("/mcp",config.publicBaseUrl)}, {req:{method:"POST",body:{owner_token:config.oauth.ownerToken}},redirect:(_status:number,url:string)=>{redirect=url;}} as never);
+  const tokens=await provider.exchangeAuthorizationCode(oauthClient,new URL(redirect).searchParams.get("code")!);
+  const grant={repository:"owner/repo",goal:"http-fixture",coordinatorThread:"controller",evidenceHash:"external-fixture-proof"};
+  let approvedHash=""; let leaseId=""; let readerClient:unknown; let successorClientId=""; let cutoverLeaseId=""; let cutoverHash=""; let lastAuthenticatedContext:unknown; let originalAuthenticatedContext:unknown; let approvedDrainId="";
+  let ownership: import("./control-plane-ownership.js").ControlPlaneOwnershipStore;
+  const authenticated=(c:unknown)=>!!c && (c as {clientId?:string}).clientId===oauthClient.client_id && typeof (c as {sessionId?:string}).sessionId==="string";
+  const coordination:import("./control-plane-consumer.js").ControlPlaneConsumerOptions={
+    approveCutoverLifecycle:(c,subject,action)=>(c as {clientId?:string})?.clientId===successorClientId && subject.requestHash===cutoverHash && action.action==="drain" && action.cutoverId===approvedDrainId && action.currentIdentity.serverInstanceId.length>0,
+    readCompletionContract:(c,selection)=>{
+      if(!authenticated(c)) throw new Error("unauthorized reader");
+      return {...selection,source:"issue62-fixture",requiredLayers:["SOURCE","NATIVE_SINGLE"],criteria:["SOURCE","NATIVE_SINGLE"].map(layer=>({id:`AC-${layer}`,layer,sourceRevision:base,environment:"darwin",surface:"installed-mcp",independent:true,maxAgeMs:60000}))};
+    },
+    readCompletionEvidence:(c,selection)=>{
+      if(!authenticated(c)) throw new Error("unauthorized reader");
+      return [{...selection,goal:undefined,criterionId:"AC-SOURCE",layer:"SOURCE",sourceRevision:base,source:"fixture-receipt",command:"real HTTP MCP",result:"PASS",artifactSha256:"a".repeat(64),environment:"darwin",surface:"installed-mcp",verifier:"reviewer",implementer:"worker",verificationState:"INDEPENDENTLY_VERIFIED",observedAt:new Date(Date.now()-1000).toISOString(),expiresAt:new Date(Date.now()+30000).toISOString(),limitations:[],nextGate:"native witness"}];
+    },
+    readDependencyReconciliation:c=>{if(authenticated(c)) originalAuthenticatedContext=c;readerClient=(c as {clientId:string}).clientId;lastAuthenticatedContext=c;return undefined;},
+    resolveHandoffRecipient:(c,handle)=>authenticated(c)&&handle==="other-client"?lastAuthenticatedContext:(c as {clientId?:string})?.clientId===successorClientId && handle==="original-client"?originalAuthenticatedContext:undefined,
+    resolveOwnerContext:c=>authenticated(c)?{ownerThread:"delegated-cli-worker"}:successorClientId && (c as {clientId?:string})?.clientId===successorClientId ? {ownerThread:"successor"}:undefined,
+    verifyGrantEvidence:g=>JSON.stringify(g)===JSON.stringify(grant),
+    resolveEffectBinding:(c,subject)=>subject.operation==="cutover_start" && (c as {clientId?:string})?.clientId===successorClientId && cutoverHash && subject.requestHash===cutoverHash ? {leaseId:cutoverLeaseId,leaseVersion:ownership.get(cutoverLeaseId)!.version,requestHash:cutoverHash,role:"controller"} : authenticated(c) && subject.workspaceRoot===project && subject.baseRevision===base && subject.requestHash===approvedHash ? {leaseId,leaseVersion:ownership.get(leaseId)!.version,requestHash:approvedHash,role:"worker"}:undefined,
+  };
+  const running=createServer(config,{coordination});
+  const manager=new DurableOperationManager(config,undefined,undefined,undefined,coordination);
+  ownership=manager.store.createOwnershipStore(coordination);
+  const listener=running.app.listen(0,"127.0.0.1");
+  await new Promise<void>(resolve=>listener.once("listening",resolve));
+  const address=listener.address() as {port:number};
+  const transport=new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${address.port}/mcp`),{requestInit:{headers:{Authorization:`Bearer ${tokens.access_token}`}}});
+  const client=new Client({name:"fixture-cli-worker",version:"1"});
+  try {
+    await client.connect(transport);
+    const opened=await callOpen(client,project,"http-fixture-conversation");
+    const workspaceId=structuredContent(opened).workspaceId as string;
+    assert.equal(typeof workspaceId,"string",JSON.stringify(opened));
+    const input={workspaceId,attemptKey:"http-fixture",recipe:"npm_ci",authorityMode:"OWNER_DIRECT"};
+    const denied=await client.callTool({name:"dependency_sync",arguments:input,_meta:{ownerThread:"controller",role:"controller"}});
+    assert.equal(denied.isError,true);
+    const sha=(value:string|Buffer)=>createHash("sha256").update(value).digest("hex");
+    approvedHash=sha(JSON.stringify({baseRevision:base,frozenInputs:{"package-lock.json":sha(await readFile(join(project,"package-lock.json"))),"package.json":sha(await readFile(join(project,"package.json")))},recipe:"npm_ci",version:"devspace.execution.v1",workspaceId,workspaceRoot:project}));
+    const trustedContext={clientId:oauthClient.client_id,sessionId:transport.sessionId};
+    ownership.putGrantEvidence(trustedContext,grant,0);
+    leaseId=ownership.acquire(trustedContext,{repositoryKey:grant.repository,resourceKind:"workspace",resourceId:project,resource:project,scope:[project],operation:"dependency_sync",baseRevision:base,expiresAt:new Date(Date.now()+60000).toISOString(),idempotencyKey:"http-fixture",grant}).leaseId;
+    const result=await client.callTool({name:"dependency_sync",arguments:input});
+    assert.equal(result.isError,undefined,JSON.stringify(result));
+    assert.equal(structuredContent(result).status,"succeeded");
+    assert.equal(ownership.get(leaseId)?.ownerThread,"delegated-cli-worker");
+    const initialReplay=await client.callTool({name:"dependency_sync",arguments:input});
+    assert.equal(initialReplay.isError,undefined);
+    assert.equal(structuredContent(initialReplay).operationId,structuredContent(result).operationId);
+    const unprovedReconcile=await client.callTool({name:"operation_reconcile",arguments:{operationId:structuredContent(result).operationId},_meta:{ownerThread:"controller",role:"controller"}});
+    assert.equal(unprovedReconcile.isError,true);
+    assert.match(JSON.stringify(unprovedReconcile),/terminal witness is unavailable/);
+    assert.equal(readerClient,oauthClient.client_id);
+    const otherOAuth=await provider.clientsStore.registerClient!({redirect_uris:["http://localhost/callback"],client_name:"Other client",token_endpoint_auth_method:"none"});
+    await provider.authorize(otherOAuth,{redirectUri:"http://localhost/callback",codeChallenge:"fixture",scopes:config.oauth.scopes,resource:new URL("/mcp",config.publicBaseUrl)}, {req:{method:"POST",body:{owner_token:config.oauth.ownerToken}},redirect:(_status:number,url:string)=>{redirect=url;}} as never);
+    const otherTokens=await provider.exchangeAuthorizationCode(otherOAuth,new URL(redirect).searchParams.get("code")!);
+    const otherClient=new Client({name:"other-client",version:"1"});
+    try {
+      await otherClient.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${address.port}/mcp`),{requestInit:{headers:{Authorization:`Bearer ${otherTokens.access_token}`}}}));
+      const otherSync=await otherClient.callTool({name:"dependency_sync",arguments:input,_meta:{clientId:oauthClient.client_id,ownerThread:"controller"}});
+      assert.equal(otherSync.isError,true);
+      const otherReconcile=await otherClient.callTool({name:"operation_reconcile",arguments:{operationId:structuredContent(result).operationId},_meta:{clientId:oauthClient.client_id,ownerThread:"controller"}});
+      assert.equal(otherReconcile.isError,true);
+      assert.equal(readerClient,otherOAuth.client_id);
+      successorClientId=otherOAuth.client_id;
+      const current=ownership.get(leaseId)!;
+      const handoffInput={
+        resource:current.resource,baseRevision:current.baseRevision,scope:current.scope,candidateRevision:base,liveOperation:current.operation,liveHandle:current.operationHandle??"",
+        checkpoint:"installed-workspace-checkpoint",grantDependency:current.grant,grantVersion:current.grantVersion,recipientGrant:current.grant,recipientGrantVersion:current.grantVersion,
+        forbiddenOverlap:[project],tests:["http-witness"],evidence:["terminal-operation"],remainingGap:"next revision",nextGate:"readback",expiresAt:current.expiresAt,
+      };
+      const handoffArgs={leaseId,expectedVersion:current.version,recipientHandle:"other-client",receipt:handoffInput};
+      const beforeHandoff=JSON.stringify(ownership.get(leaseId));
+      for(const invalid of [{...handoffArgs,recipientHandle:"unknown"},{...handoffArgs,expectedVersion:current.version-1},{...handoffArgs,receipt:{...handoffInput,baseRevision:"wrong"}}]) {
+        assert.equal((await client.callTool({name:"coordination_handoff",arguments:invalid})).isError,true);
+        assert.equal(JSON.stringify(ownership.get(leaseId)),beforeHandoff);
+      }
+      assert.equal((await otherClient.callTool({name:"coordination_handoff",arguments:handoffArgs,_meta:{clientId:oauthClient.client_id,ownerThread:"delegated-cli-worker"}})).isError,true);
+      assert.equal(JSON.stringify(ownership.get(leaseId)),beforeHandoff);
+      const transferred=await client.callTool({name:"coordination_handoff",arguments:handoffArgs});
+      assert.equal(transferred.isError,undefined,JSON.stringify(transferred));
+      const handoff=structuredContent(transferred).receipt as unknown as import("./control-plane-ownership.js").HandoffReceipt;
+      const readArgs={leaseId,previousVersion:handoff.previousVersion,expectedCurrentVersion:handoff.newVersion};
+      const startArgs={expectedSourceCommit:"a".repeat(40),expectedBuildId:"handoff-fixture",attemptKey:"http-cutover"};
+      const missingGrant=await otherClient.callTool({name:"cutover_start",arguments:startArgs});
+      assert.equal(missingGrant.isError,true);
+      assert.equal(new CutoverStateStore(config.stateDir).get(),undefined);
+      const status=structuredContent(await otherClient.callTool({name:"cutover_status",arguments:{}})).status as {currentServerIdentity:import("./cutover-state.js").CutoverServerIdentity};
+      const currentIdentity=status.currentServerIdentity;
+      const expectedIdentity={sourceCommit:startArgs.expectedSourceCommit,buildId:startArgs.expectedBuildId,capabilityManifestSha256:currentIdentity.capabilityManifestSha256};
+      const sorted=(v:any):any=>v&&typeof v==="object"?Object.fromEntries(Object.entries(v).filter(([,v])=>v!==undefined).sort(([a],[b])=>a.localeCompare(b)).map(([k,v])=>[k,sorted(v)])):v;
+      cutoverHash=sha(JSON.stringify(sorted({version:"devspace.execution.v1",baseRevision:currentIdentity.sourceCommit,stateRoot:config.stateDir,currentIdentity,expectedIdentity})));
+      const cutoverContext={clientId:successorClientId,sessionId:"fixture-recipient"};
+      cutoverLeaseId=ownership.acquire(cutoverContext,{repositoryKey:grant.repository,resourceKind:"filesystem",resourceId:config.stateDir,resource:config.stateDir,operation:"cutover_start",scope:[config.stateDir],baseRevision:currentIdentity.sourceCommit,expiresAt:new Date(Date.now()+60000).toISOString(),idempotencyKey:"cutover-http",grant}).leaseId;
+      const started=await otherClient.callTool({name:"cutover_start",arguments:startArgs});
+      assert.equal(started.isError,undefined,JSON.stringify(started));
+      const cutoverId=(structuredContent(started).cutover as {cutoverId:string}).cutoverId;
+      const operationId=structuredContent(started).operationId as string;
+      assert.equal(typeof operationId,"string");
+      assert.equal(ownership.get(cutoverLeaseId)?.operationHandle,operationId);
+      const replayStart=await otherClient.callTool({name:"cutover_start",arguments:startArgs});
+      assert.equal((structuredContent(replayStart).cutover as {cutoverId:string}).cutoverId,cutoverId);
+      const wrongStart=await client.callTool({name:"cutover_start",arguments:startArgs,_meta:{clientId:successorClientId,ownerThread:"successor"}});
+      assert.equal(wrongStart.isError,true);
+      const beforeDenied=JSON.stringify([ownership.get(cutoverLeaseId),new CutoverStateStore(config.stateDir).get()]);
+      assert.equal((await otherClient.callTool({name:"cutover_start",arguments:{...startArgs,attemptKey:"new-attempt"}})).isError,true);
+      assert.equal((await otherClient.callTool({name:"cutover_start",arguments:{...startArgs,expectedBuildId:"changed-target"}})).isError,true);
+      assert.equal(manager.store.getByAttempt(config.stateDir,"new-attempt"),undefined);
+      assert.equal(JSON.stringify([ownership.get(cutoverLeaseId),new CutoverStateStore(config.stateDir).get()]),beforeDenied);
+      assert.equal((await client.callTool({name:"operation_reconcile",arguments:{operationId},_meta:{clientId:successorClientId}})).isError,true);
+
+      const reconciledStart=await otherClient.callTool({name:"operation_reconcile",arguments:{operationId}});
+      assert.equal(reconciledStart.isError,undefined,JSON.stringify(reconciledStart));
+      assert.equal(structuredContent(reconciledStart).kind,"cutover_start");
+      assert.equal((new CutoverStateStore(config.stateDir).get()?.coordinationBinding)?.operationHandle,operationId);
+
+      const beforeDrain=JSON.stringify(new CutoverStateStore(config.stateDir).get());
+      assert.equal((await client.callTool({name:"cutover_drain",arguments:{cutoverId},_meta:{clientId:successorClientId}})).isError,true);
+      assert.equal(JSON.stringify(new CutoverStateStore(config.stateDir).get()),beforeDrain);
+      assert.equal((await otherClient.callTool({name:"cutover_drain",arguments:{cutoverId}})).isError,true);
+      assert.equal(JSON.stringify(new CutoverStateStore(config.stateDir).get()),beforeDrain);
+      approvedDrainId=cutoverId;
+      const drained=await otherClient.callTool({name:"cutover_drain",arguments:{cutoverId}});
+      assert.equal(drained.isError,undefined,JSON.stringify(drained));
+      const cutoverStore=new CutoverStateStore(config.stateDir);
+      const beforeCutover=JSON.stringify(cutoverStore.get());
+      for(const endpoint of ["start","drain","restart","advance","recover","finish"]) {
+        const denied=await fetch(`http://127.0.0.1:${address.port}/api/cutover/${endpoint}`,{method:"POST",headers:{Authorization:`Bearer ${tokens.access_token}`,"Content-Type":"application/json"},body:JSON.stringify({cutoverId})});
+        assert.equal(denied.status,409,endpoint);assert.match(await denied.text(),/COORDINATION_REQUIRED/);
+      }
+      for(const request of [{name:"cutover_recover",arguments:{cutoverId,expectedSourceCommit:"a".repeat(40),expectedBuildId:"fixture"}},{name:"cutover_repair_binding",arguments:{cutoverId,workspaceId:"ws",agentId:"agent"}}]) {
+        const denied=await otherClient.callTool(request);assert.equal(denied.isError,true);assert.match(JSON.stringify(denied),/COORDINATION_REQUIRED/);
+      }
+      assert.equal(JSON.stringify(cutoverStore.get()),beforeCutover);
+
+      const finishArgs={cutoverId,workspaceId:"unverified-workspace",agentId:"unverified-agent"};
+      assert.equal((await otherClient.callTool({name:"cutover_finish",arguments:finishArgs})).isError,true);
+      assert.equal((await client.callTool({name:"cutover_finish",arguments:finishArgs,_meta:{clientId:successorClientId}})).isError,true);
+      assert.equal(JSON.stringify(cutoverStore.get()),beforeCutover);
+      assert.equal(ownership.get(cutoverLeaseId)?.operationHandle,operationId);
+
+      assert.equal((await otherClient.callTool({name:"cutover_drain",arguments:{cutoverId}})).isError,undefined);
+      assert.equal(JSON.stringify(cutoverStore.get()),beforeCutover);
+
+      const beforeRead=JSON.stringify(ownership.get(leaseId));
+      const completionArgs={goal:"http-fixture",candidate:base,subject:"full-delivery"};
+      const completion=await client.callTool({name:"coordination_completion_read",arguments:completionArgs});
+      assert.equal(completion.isError,undefined,JSON.stringify(completion));
+      const projection=structuredContent(completion).projection as any;
+      assert.equal(projection.status,"INCOMPLETE");
+      assert.equal(projection.layers.SOURCE.status,"PASS");
+      assert.equal(projection.layers.NATIVE_SINGLE.status,"BLOCKED");
+      assert.equal(projection.contractSource,"issue62-fixture");
+      const spoofedCompletion=await otherClient.callTool({name:"coordination_completion_read",arguments:completionArgs,_meta:{clientId:oauthClient.client_id}});
+      assert.equal((structuredContent(spoofedCompletion).projection as any).status,"BLOCKED");
+      assert.equal(JSON.stringify(ownership.get(leaseId)),beforeRead);
+      assert.equal(JSON.stringify(cutoverStore.get()),beforeCutover);
+
+      const recovered=await otherClient.callTool({name:"coordination_handoff_readback",arguments:readArgs});
+      assert.equal(recovered.isError,undefined,JSON.stringify(recovered));
+      assert.deepEqual(structuredContent(recovered).receipt,handoff);
+      assert.equal((structuredContent(recovered).currentLease as {ownerThread:string}).ownerThread,"successor");
+      const repeated=await otherClient.callTool({name:"coordination_handoff_readback",arguments:readArgs});
+      assert.deepEqual(structuredContent(repeated),structuredContent(recovered));
+      const former=await client.callTool({name:"coordination_handoff_readback",arguments:readArgs,_meta:{clientId:successorClientId,ownerThread:"successor"}});
+      assert.equal(former.isError,true);
+      const stale=await otherClient.callTool({name:"coordination_handoff_readback",arguments:{...readArgs,expectedCurrentVersion:handoff.previousVersion}});
+      assert.equal(stale.isError,true);
+      assert.equal(JSON.stringify(ownership.get(leaseId)),beforeRead);
+      assert.equal(JSON.stringify(cutoverStore.get()),beforeCutover);
+      // Drain admission permits only an exact existing-lease transfer; the live pin survives.
+      const pinned=ownership.get(cutoverLeaseId)!;
+      const pinnedReceipt={...handoffInput,resource:pinned.resource,scope:pinned.scope,baseRevision:pinned.baseRevision,liveOperation:pinned.operation,liveHandle:operationId,grantDependency:pinned.grant,grantVersion:pinned.grantVersion,recipientGrant:pinned.grant,recipientGrantVersion:pinned.grantVersion,expiresAt:pinned.expiresAt};
+      const pinTransfer=await otherClient.callTool({name:"coordination_handoff",arguments:{leaseId:cutoverLeaseId,expectedVersion:pinned.version,recipientHandle:"original-client",receipt:pinnedReceipt}});
+      assert.equal(pinTransfer.isError,undefined,JSON.stringify(pinTransfer));
+      assert.equal(ownership.get(cutoverLeaseId)?.operationHandle,operationId);
+      assert.equal(ownership.get(cutoverLeaseId)?.ownerThread,"delegated-cli-worker");
+      assert.equal((await otherClient.callTool({name:"cutover_drain",arguments:{cutoverId}})).isError,true);
+      assert.equal(JSON.stringify(cutoverStore.get()),beforeCutover);
+      assert.equal((await otherClient.callTool({name:"operation_reconcile",arguments:{operationId}})).isError,true);
+      // Receiving the lease does not promote a worker to controller.
+      assert.equal((await client.callTool({name:"operation_reconcile",arguments:{operationId}})).isError,true);
+      await assert.rejects(otherClient.callTool({name:"dependency_sync",arguments:input}),/CUTOVER_RECONCILIATION_REQUIRED/);
+
+    } finally {await otherClient.close();}
+
+    await assert.rejects(client.callTool({name:"dependency_sync",arguments:input}),/CUTOVER_RECONCILIATION_REQUIRED/);
+  } finally {
+    await client.close(); await running.close(); manager.close(); provider.close();
+    await new Promise<void>((resolve,reject)=>listener.close(e=>e?reject(e):resolve()));
+  }
 });
 
 test("P0-2: durable reconciliation witness fails closed on empty inventory, mismatches, or missing records", async () => {
@@ -2735,6 +2951,14 @@ test("P0-4: real server /mcp HTTP boundary permits transport reconnect during dr
       }),
     });
     assert.equal(startRes.status, 200);
+    const startText=await startRes.text();
+    const startData=startText.split("\n").find(line=>line.startsWith("data: "));
+    assert.equal(JSON.parse(startData?startData.slice(6):startText).result.isError,true);
+    assert.equal(new CutoverStateStore(stateDir).get(),undefined);
+    // Arrange drain through the trusted fixture API; this test covers reconnect.
+    const runtime=await (await fetch(`http://127.0.0.1:${port}/identity`)).json() as any;
+    new CutoverStateStore(stateDir).begin({oldServerIdentity:{serverInstanceId:runtime.serverInstanceId,sourceCommit:runtime.sourceCommit,buildId:runtime.buildId,capabilityManifestSha256:runtime.capabilityManifest.manifestSha256},expectedNewIdentity:{sourceCommit:"a".repeat(40),buildId:"build-p04"}});
+
 
     // 3. Client 2 (reconnecting ChatGPT connector after drop, starting new session during drain)
     const init2Res = await fetch(mcpUrl, {
@@ -2969,4 +3193,21 @@ test("prepared stale-target MCP recovery preserves successor and supersession su
     await client.close(); await server.close(); wsStore.close();
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("C3 bound cutover rejects unfenced automatic advance before its callback",async()=>{
+  const root=await mkdtemp(join(tmpdir(),"devspace-bound-advance-"));
+  const config=loadConfig({DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_ALLOWED_ROOTS:root,DEVSPACE_STATE_DIR:join(root,"state"),DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",PORT:"1"});
+  const store=new SqliteWorkspaceStore(config.stateDir);const workspaces=new WorkspaceRegistry(config,store);
+  const cutoverStore=new CutoverStateStore(config.stateDir);
+  const controller=new McpCutoverController(cutoverStore,{serverInstanceId:"old",sourceCommit:"old",buildId:"old"});
+  controller.begin({sourceCommit:"target",buildId:"target"},undefined,{leaseId:"lease",pinnedLeaseVersion:1,operationHandle:"operation",requestHash:"a".repeat(64),ownerThread:"owner"});
+  let advances=0;
+  const server=createMcpServer(config,workspaces,createReviewCheckpointManager(),new ProcessSessionManager(),()=>[],[],undefined,undefined,undefined,undefined,{controller,transportEvidence:()=>({activeSessions:0,oldestAgeMs:0}),reconcileDurableState:async()=>({workspaceQueryable:false,agentQueryable:false,agentReconciled:false}),advance:async()=>{advances++;return {outcome:"restart_already_scheduled",reason:"fixture",scheduledFor:"fixture"};}});
+  const [ct,st]=InMemoryTransport.createLinkedPair();const client=new Client({name:"bound-advance-test",version:"1"});
+  try {
+    await Promise.all([client.connect(ct),server.connect(st)]);const before=JSON.stringify(cutoverStore.get());
+    const result=await client.callTool({name:"cutover_reconcile",arguments:{}});
+    assert.equal(result.isError,true);assert.equal(advances,0);assert.equal(JSON.stringify(cutoverStore.get()),before);
+  } finally {await client.close();await server.close();store.close();}
 });

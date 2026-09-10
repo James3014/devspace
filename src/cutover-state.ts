@@ -199,7 +199,17 @@ export interface CutoverBindingRepairReceipt {
   reconciliationWitness?: DurableReconciliationWitness;
 }
 
+export interface CutoverCoordinationBinding {
+  readonly leaseId: string;
+  readonly pinnedLeaseVersion: number;
+  readonly operationHandle: string;
+  readonly requestHash: string;
+  readonly ownerThread: string;
+}
+
 export interface DurableCutoverRecord {
+  /** Trusted consumer correlation only; never issues authority. */
+  coordinationBinding?: Readonly<CutoverCoordinationBinding>;
   schema: typeof CUTOVER_STATE_SCHEMA;
   cutoverId: string;
   phase: "prepared" | "drained" | "closed" | "superseded";
@@ -274,13 +284,23 @@ export class CutoverStateStore {
       throw error;
     }
     let record = parseRecord(raw);
+    let generation = record;
     const events = readdirSync(this.activeDir).filter((name) => name.endsWith(".json"))
       .sort();
 
     const successorCreatedPath = join(this.activeDir, SUCCESSOR_CREATED_FILE);
     const successorCreatedRaw = readOptionalFile(successorCreatedPath);
+    const successorGeneration = successorCreatedRaw === undefined ? undefined : parseRecord(successorCreatedRaw);
+    for (const event of events) {
+      const match = /^(successor-)?(?:prepared|drained|closed|superseded)-/.exec(event);
+      if (!match) continue; // Restart and repair markers have separate schemas.
+      const origin = match[1] ? successorGeneration : generation;
+      if (!origin) throw new CutoverStateError("Cutover coordination binding has no generation creation record.");
+      assertSameCoordinationBinding(origin, parseRecord(readFileSync(join(this.activeDir, event), "utf8")));
+    }
     if (successorCreatedRaw !== undefined) {
       const successorCreated = parseRecord(successorCreatedRaw);
+      generation = successorCreated;
       const successorClosed = latestEvent(events, "successor-closed-");
       const successorDrained = latestEvent(events, "successor-drained-");
       if (successorClosed) record = parseRecord(readFileSync(join(this.activeDir, successorClosed), "utf8"));
@@ -297,6 +317,7 @@ export class CutoverStateStore {
         else if (drained) record = parseRecord(readFileSync(join(this.activeDir, drained), "utf8"));
       }
     }
+    assertSameCoordinationBinding(generation, record);
     const markers = this.markerPaths(record);
     const restartRequest = readRestartMarker(markers.restartRequested, record.cutoverId)
       ?? record.restartRequest;
@@ -331,13 +352,16 @@ export class CutoverStateStore {
     oldServerIdentity: CutoverServerIdentity;
     expectedNewIdentity: ExpectedCutoverIdentity;
     expiresAt?: string;
+    coordinationBinding?: CutoverCoordinationBinding;
   }): DurableCutoverRecord {
+    const coordinationBinding = input.coordinationBinding === undefined ? undefined : validatedCoordinationBinding(input.coordinationBinding);
     mkdirSync(this.cutoverRoot, { recursive: true, mode: 0o700 });
     const now = new Date(this.now()).toISOString();
     const record: DurableCutoverRecord = {
       schema: CUTOVER_STATE_SCHEMA,
       cutoverId: this.newId(),
       phase: "prepared",
+      ...(coordinationBinding ? { coordinationBinding } : {}),
       oldServerIdentity: input.oldServerIdentity,
       expectedNewIdentity: input.expectedNewIdentity,
       createdAt: now,
@@ -573,7 +597,9 @@ export class CutoverStateStore {
     }
     const superseded = latestEvent(events, "superseded-");
     if (!superseded) return undefined;
-    return parseRecord(readFileSync(join(this.activeDir, superseded), "utf8"));
+    const record = parseRecord(readFileSync(join(this.activeDir, superseded), "utf8"));
+    assertSameCoordinationBinding(parseRecord(readFileSync(this.createdPath, "utf8")), record);
+    return record;
   }
 
   /**
@@ -971,6 +997,25 @@ function serializeRecord(record: DurableCutoverRecord): string {
   return `${JSON.stringify(withoutDiagnostic(record), null, 2)}\n`;
 }
 
+function validatedCoordinationBinding(value: unknown): Readonly<CutoverCoordinationBinding> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new CutoverStateError("Malformed coordination binding.");
+  const binding = value as Record<string, unknown>;
+  const keys = ["leaseId", "pinnedLeaseVersion", "operationHandle", "requestHash", "ownerThread"];
+  if (Object.keys(binding).length !== keys.length || keys.some(key => !Object.hasOwn(binding, key)) ||
+      ["leaseId", "operationHandle", "ownerThread"].some(key => typeof binding[key] !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,159}$/.test(binding[key] as string)) ||
+      !Number.isSafeInteger(binding.pinnedLeaseVersion) || Number(binding.pinnedLeaseVersion) < 1 ||
+      typeof binding.requestHash !== "string" || !/^[a-f0-9]{64}$/.test(binding.requestHash)) {
+    throw new CutoverStateError("Malformed coordination binding.");
+  }
+  return Object.freeze({...binding}) as unknown as Readonly<CutoverCoordinationBinding>;
+}
+
+function assertSameCoordinationBinding(created: DurableCutoverRecord, event: DurableCutoverRecord): void {
+  if (created.cutoverId !== event.cutoverId || !isDeepStrictEqual(created.coordinationBinding, event.coordinationBinding)) {
+    throw new CutoverStateError("Cutover coordination binding changed within its generation.");
+  }
+}
+
 function parseRecord(raw: string): DurableCutoverRecord {
   const value = JSON.parse(raw) as Partial<DurableCutoverRecord>;
   if (
@@ -994,6 +1039,7 @@ function parseRecord(raw: string): DurableCutoverRecord {
     throw new CutoverStateError("Durable cutover record is malformed; reconciliation is required.");
   }
   const record = value as DurableCutoverRecord;
+  if (record.coordinationBinding !== undefined) record.coordinationBinding = validatedCoordinationBinding(record.coordinationBinding);
   if (record.bindingRepair) {
     assertValidBindingRepair(record.bindingRepair, record);
   }

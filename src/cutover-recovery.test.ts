@@ -683,3 +683,15 @@ test("Test 10 — restart replay prevention: replacement exists, recovery create
     rmSync(stateDir, { recursive: true, force: true });
   }
 });
+
+test("C3 native legacy recovery refuses bound generations before any network or probe",async()=>{
+  const {performNativeCrossDomainBindingRepair}=await import("./cutover-recovery.js");
+  const root=mkdtempSync(join(tmpdir(),"devspace-bound-native-denial-"));const store=new CutoverStateStore(root);
+  const record=store.begin({oldServerIdentity:staleIdentity,expectedNewIdentity:expectedTarget,coordinationBinding:{leaseId:"lease",pinnedLeaseVersion:1,operationHandle:"operation",requestHash:"a".repeat(64),ownerThread:"owner"}});
+  const before=JSON.stringify(store.get());let calls=0;
+  const options={serverUrl:new URL("http://127.0.0.1:1/mcp"),publicBaseUrl:new URL("http://127.0.0.1:1"),stateDir:root,cutoverId:record.cutoverId,workspaceId:"ws",agentId:"agent",ownerToken:"fixture",requesterIdentity:targetIdentity,fetch:async()=>{calls++;throw new Error("network must not run");}};
+  await assert.rejects(performNativeObservedReplacementRecovery(options),/COORDINATION_REQUIRED/);
+  await assert.rejects(performNativeCrossDomainBindingRepair(options),/COORDINATION_REQUIRED/);
+  assert.throws(()=>performCutoverRecovery({store,cutoverId:record.cutoverId,requesterIdentity:targetIdentity,expectedNewIdentity:expectedTarget,drainEvidence:{activeSessions:0,oldestAgeMs:0},buildReadyProbe:()=>{calls++;return goodProbe();}}),/COORDINATION_REQUIRED/);
+  assert.equal(calls,0);assert.equal(JSON.stringify(store.get()),before);
+});

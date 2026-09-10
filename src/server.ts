@@ -1,4 +1,6 @@
-import { randomUUID } from "node:crypto";
+import type { ControlPlaneConsumerOptions } from "./control-plane-consumer.js";
+import { ControlPlaneOwnershipError } from "./control-plane-ownership.js";
+import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { access, realpath } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -69,6 +71,7 @@ import {
 
 import {
   CutoverBlockedError,
+  assertLegacyCutoverUnbound,
   McpCutoverController,
   compareServerIdentity,
   registerCutoverHttpRoutes,
@@ -1392,6 +1395,7 @@ export interface CutoverMcpControlContext {
 function registerCutoverMcpTools(
   server: McpServer,
   control: CutoverMcpControlContext,
+  durableOperations?: DurableOperationManager,
 ): void {
   const cutoverRecordSchema = z.record(z.string(), z.unknown());
   const modeSchema = z.enum(["normal", "drain", "reconcile-only"]);
@@ -1433,15 +1437,19 @@ function registerCutoverMcpTools(
         expectedBuildId: z.string().min(1),
         expectedCapabilityManifestSha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
         expiresAt: z.string().optional(),
+        attemptKey: z.string().min(1).optional().describe("Stable attempt identity; defaults to a digest of runtime, resolved target and expiry."),
       },
       outputSchema: {
         cutover: cutoverRecordSchema,
+        operationId: z.string(),
         mode: modeSchema,
       },
       _meta: {},
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ expectedSourceCommit, expectedBuildId, expectedCapabilityManifestSha256, expiresAt }) => {
+    async ({ expectedSourceCommit, expectedBuildId, expectedCapabilityManifestSha256, expiresAt, attemptKey }, extra) => {
+      const context = dependencyConsumerContext(extra);
+      if (!durableOperations) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "cutover start requires trusted host coordination");
       if (expectedCapabilityManifestSha256 && control.probeBuildReady) {
         const probe = await control.probeBuildReady({
           sourceCommit: expectedSourceCommit,
@@ -1457,18 +1465,21 @@ function registerCutoverMcpTools(
       }
       const capabilityManifestSha256 = expectedCapabilityManifestSha256
         ?? control.controller.currentIdentity.capabilityManifestSha256;
-      const record = control.controller.begin(
-        {
-          sourceCommit: expectedSourceCommit,
-          buildId: expectedBuildId,
-          ...(capabilityManifestSha256 ? { capabilityManifestSha256 } : {}),
-        },
-        expiresAt,
-      );
+      const expectedIdentity = {
+        sourceCommit: expectedSourceCommit,
+        buildId: expectedBuildId,
+        ...(capabilityManifestSha256 ? { capabilityManifestSha256 } : {}),
+      };
+      const currentIdentity = control.controller.currentIdentity;
+      const defaultAttempt = createHash("sha256").update(JSON.stringify({currentIdentity,expectedIdentity,expiresAt})).digest("hex");
+      const operation = durableOperations.startCutover({attemptKey:attemptKey ?? defaultAttempt,currentIdentity,expectedIdentity,expiresAt},context);
+      if (operation.status !== "succeeded") throw new CutoverStateError(`Cutover operation ${operation.operationId} requires exact operation_reconcile; no new start is authorized.`);
+      const record = control.controller.record();
+      if (!record || record.cutoverId !== operation.receipt?.cutoverId) throw new CutoverStateError(`Cutover operation ${operation.operationId} readback changed; reconciliation required.`);
       const mode = control.controller.mode();
       return {
         content: [textBlock(`Started cutover ${record.cutoverId}; mode=${mode}.`) ],
-        structuredContent: { cutover: record as unknown as Record<string, unknown>, mode },
+        structuredContent: { cutover: record as unknown as Record<string, unknown>, mode, operationId:operation.operationId },
       };
     },
   );
@@ -1488,8 +1499,13 @@ function registerCutoverMcpTools(
       _meta: {},
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ cutoverId }) => {
-      const record = control.controller.recordDrain(cutoverId, control.transportEvidence());
+    async ({ cutoverId }, extra) => {
+      const existing=control.controller.record();
+      // Legacy unbound generations retain their existing runtime fence only.
+      // Malformed bindings throw from record(); they never enter this branch.
+      const record = existing?.coordinationBinding
+        ? (()=>{if(!durableOperations) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","cutover drain requires trusted coordination");return durableOperations.drainCutover(cutoverId,control.controller.currentIdentity,control.transportEvidence,dependencyConsumerContext(extra));})()
+        : control.controller.recordDrain(cutoverId, control.transportEvidence());
       const mode = control.controller.mode();
       return {
         content: [textBlock(
@@ -1531,7 +1547,13 @@ function registerCutoverMcpTools(
         _meta: {},
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
       },
-      async ({ cutoverId, buildReady }) => {
+      async ({ cutoverId, buildReady }, extra) => {
+        if(control.controller.record()?.coordinationBinding) {
+          if(!durableOperations) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","restart requires trusted coordination");
+          const actuator=control.restartSelf!;
+          const outcome=await durableOperations.restartCutover(cutoverId,control.controller.currentIdentity,buildReady,control.probeBuildReady??(async()=>({buildReady:true,detail:"trusted attestation only"})),actuator,dependencyConsumerContext(extra));
+          return {content:[textBlock("Restart scheduling intent is recorded; execution remains unconfirmed and must not be replayed.")],structuredContent:{cutover:outcome.record as unknown as Record<string,unknown>,mode:control.controller.mode(),restart:{scheduled:outcome.scheduled,alreadyRequested:!outcome.scheduled,scheduleBlocked:false,actuator:"launchd-self" as const,serviceLabel:actuator.serviceLabel,launchdTarget:actuator.launchdTarget}}};
+        }
         const request = control.controller.requestRestart(cutoverId, buildReady);
         const actuator = control.restartSelf!;
         const mode = control.controller.mode();
@@ -1563,6 +1585,7 @@ function registerCutoverMcpTools(
             throw new CutoverBuildNotReadyError(probe.detail);
           }
         }
+        assertLegacyCutoverUnbound(control.controller.record());
         const mark = control.controller.markRestartScheduled(cutoverId);
         if (mark.newlyScheduled) {
           actuator.schedule();
@@ -1614,6 +1637,7 @@ function registerCutoverMcpTools(
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ cutoverId, expectedSourceCommit, expectedBuildId, expectedCapabilityManifestSha256, expiresAt }) => {
+      assertLegacyCutoverUnbound(control.controller.record());
       if (expectedCapabilityManifestSha256 && control.probeBuildReady) {
         const probe = await control.probeBuildReady({
           sourceCommit: expectedSourceCommit,
@@ -1706,8 +1730,14 @@ function registerCutoverMcpTools(
       _meta: {},
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
-    async ({ cutoverId, workspaceId, agentId }) => {
+    async ({ cutoverId, workspaceId, agentId }, extra) => {
       const activeRecord = control.controller.record();
+      if(activeRecord?.coordinationBinding) {
+        if(!durableOperations) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","cutover finish requires trusted coordination");
+        const record=await durableOperations.finishCutover(cutoverId,control.controller.currentIdentity,{workspaceId,agentId},()=>control.reconcileDurableState({workspaceId,agentId}),dependencyConsumerContext(extra));
+        const mode=control.controller.mode();
+        return {content:[textBlock(`Finished cutover ${cutoverId}; mode=${mode}.`)],structuredContent:{cutover:record as unknown as Record<string,unknown>,mode}};
+      }
       if (activeRecord && activeRecord.phase === "closed" && activeRecord.cutoverId === cutoverId) {
         if (activeRecord.observedReplacement && control.executeObservedReplacementRecovery) {
           const replay = await control.executeObservedReplacementRecovery({
@@ -1811,6 +1841,7 @@ function registerCutoverMcpTools(
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ cutoverId, workspaceId, agentId }) => {
+      assertLegacyCutoverUnbound(control.controller.record());
       if (!control.executeBindingRepair) {
         throw new CutoverStateError("Binding repair is not supported on this server configuration.");
       }
@@ -1886,6 +1917,7 @@ function registerCutoverMcpTools(
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       },
       async () => {
+        if(control.controller.record()?.coordinationBinding) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","coordination-bound automatic advance is unavailable; use explicitly authorized lifecycle actions");
         const outcome = await control.advance!();
         return {
           content: [textBlock(describeOutcome(outcome))],
@@ -2171,7 +2203,7 @@ export function createMcpServer(
   );
 
   registerRepositoryIntelligenceTools(server, config, workspaces);
-  if (cutoverControl) registerCutoverMcpTools(server, cutoverControl);
+  if (cutoverControl) registerCutoverMcpTools(server, cutoverControl, durableOperations);
 
   registerAppResource(
     server,
@@ -2459,7 +2491,7 @@ export function createMcpServer(
       operationId: z.string(),
       attemptKey: z.string(),
       requestHash: z.string(),
-      kind: z.enum(["workspace_clone", "dependency_sync", "nexus_gateway_recover"]),
+      kind: z.enum(["workspace_clone", "dependency_sync", "nexus_gateway_recover", "cutover_start"]),
       authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]),
       scopeRoot: z.string(),
       workspaceId: z.string().optional(),
@@ -2621,6 +2653,46 @@ export function createMcpServer(
       },
     );
 
+    registerAppTool(server,"coordination_completion_read",{
+      title:"Read current delivery evidence",
+      description:"Project the complete trusted contract and revision-bound evidence. Missing native, CI or other required evidence remains a gap. This read grants no authority and never unlocks or retries work.",
+      inputSchema:{goal:z.string().min(1),candidate:z.string().min(1),subject:z.string().min(1)},
+      annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},_meta:{},
+    },async(selection,extra)=>{
+      const projection=durableOperations.readCompletion(selection,dependencyConsumerContext(extra));
+      return {content:[textBlock(JSON.stringify(projection))],structuredContent:{projection}};
+    });
+
+    const handoffGrantSchema=z.object({repository:z.string().min(1),goal:z.string().min(1),coordinatorThread:z.string().min(1),evidenceHash:z.string().min(1)}).strict();
+    registerAppTool(server,"coordination_handoff",{
+      title:"Transfer existing resource ownership",
+      description:"Atomically transfer one existing lease using exact CAS and a fixed handoff receipt. Recipient handle must resolve through the trusted host to a previously authenticated recipient. Does not create grants, widen scope, start work or clear an in-flight operation.",
+      inputSchema:{leaseId:z.string().min(1),expectedVersion:z.number().int().positive(),recipientHandle:z.string().min(1).max(160),receipt:z.object({
+        resource:z.string().min(1),baseRevision:z.string().min(1),scope:z.array(z.string().min(1)),candidateRevision:z.string().min(1),liveOperation:z.string().min(1),liveHandle:z.string(),checkpoint:z.string().min(1),
+        grantDependency:handoffGrantSchema,grantVersion:z.number().int().positive(),recipientGrant:handoffGrantSchema,recipientGrantVersion:z.number().int().positive(),forbiddenOverlap:z.array(z.string()),tests:z.array(z.string()),evidence:z.array(z.string()).min(1),remainingGap:z.string(),nextGate:z.string().min(1),expiresAt:z.string(),
+      }).strict()},
+      outputSchema:{receipt:z.record(z.string(),z.unknown())},_meta:{},annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:false,openWorldHint:false},
+    },async({leaseId,expectedVersion,recipientHandle,receipt},extra)=>{
+      const transferred=durableOperations.handoff(leaseId,expectedVersion,recipientHandle,receipt,dependencyConsumerContext(extra));
+      return {content:[textBlock(`Transferred existing lease ${leaseId}; version=${transferred.newVersion}.`)],structuredContent:{receipt:transferred as unknown as Record<string,unknown>}};
+    });
+
+    registerAppTool(
+      server,
+      "coordination_handoff_readback",
+      {
+        title: "Read handoff receipt",
+        description: "Recover one existing handoff receipt under current authenticated recipient and lease-version checks. Returns historical receipt and current lease separately. This read does not transfer ownership, renew a lease, or authorize execution.",
+        inputSchema: {leaseId:z.string().min(1),previousVersion:z.number().int().positive(),expectedCurrentVersion:z.number().int().positive()},
+        annotations: {readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
+        _meta: {},
+      },
+      async ({leaseId,previousVersion,expectedCurrentVersion}, extra) => {
+        const result = durableOperations.readHandoff(leaseId, previousVersion, expectedCurrentVersion, dependencyConsumerContext(extra));
+        return {content:[textBlock(JSON.stringify(result))],structuredContent:result};
+      },
+    );
+
     registerAppTool(
       server,
       "dependency_sync",
@@ -2645,7 +2717,9 @@ export function createMcpServer(
           openWorldHint: true,
         },
       },
-      async ({ workspaceId, attemptKey, recipe, authorityMode }, { _meta }) => {
+      async ({ workspaceId, attemptKey, recipe, authorityMode }, extra) => {
+        const { _meta } = extra;
+        const consumerContext = dependencyConsumerContext(extra);
         await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
         const workspace = workspaces.getWorkspace(workspaceId);
         try {
@@ -2655,7 +2729,7 @@ export function createMcpServer(
             attemptKey,
             recipe,
             authorityMode,
-          });
+          }, consumerContext);
           return operationResponse(operation);
         } catch (error) {
           if (error instanceof DurableOperationError && error.operation) {
@@ -2701,7 +2775,11 @@ export function createMcpServer(
         _meta: {},
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       },
-      async ({ operationId }) => operationResponse(await durableOperations.reconcile(operationId)),
+      async ({ operationId }, extra) => {
+        const context = ["dependency_sync", "cutover_start"].includes(durableOperations.store.getByOperationId(operationId)?.kind ?? "")
+          ? dependencyConsumerContext(extra) : undefined;
+        return operationResponse(await durableOperations.reconcile(operationId, context));
+      },
     );
   }
 
@@ -4611,7 +4689,18 @@ export function createMcpServer(
   return server;
 }
 
+function dependencyConsumerContext(extra: {authInfo?: {clientId: string; scopes: string[]}; sessionId?: string}) {
+  if (!extra.authInfo?.clientId) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "authenticated MCP client context is required");
+  return Object.freeze({
+    clientId:extra.authInfo.clientId,
+    scopes:Object.freeze([...extra.authInfo.scopes]),
+    sessionId:extra.sessionId,
+  });
+}
+
 export interface CreateServerOptions {
+  /** Trusted host reader only; OAuth identity alone does not grant resource ownership. */
+  coordination?: ControlPlaneConsumerOptions;
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
   chatSwarmInitializationHook?: () => void;
 }
@@ -4847,7 +4936,7 @@ export function createServer(
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
   initializationCleanups.push(() => processSessions.shutdown());
-  const durableOperations = new DurableOperationManager(config);
+  const durableOperations = new DurableOperationManager(config, undefined, undefined, undefined, options.coordination);
   initializationCleanups.push(() => durableOperations.close());
   const opencodeCatalogSource = createMcpOpencodeCatalogSource();
   initializationCleanups.push(() => opencodeCatalogSource.close());
@@ -4947,6 +5036,7 @@ export function createServer(
     newlyRecovered: boolean;
     mode: CutoverMode;
   }> => {
+    assertLegacyCutoverUnbound(cutoverController.record());
     const active = cutoverController.record();
     if (!active) {
       throw new CutoverStateError("No durable cutover record exists.");
@@ -5010,6 +5100,7 @@ export function createServer(
     workspaceId: string;
     agentId: string;
   }): Promise<DurableCutoverRecord> => {
+    assertLegacyCutoverUnbound(cutoverController.record());
     const active = cutoverController.record();
     if (!active) {
       throw new CutoverStateError("No durable cutover record exists.");
@@ -5118,6 +5209,7 @@ export function createServer(
       physicalProbeEvidence: `Target package at ${targetRoot} verified: build_manifest_sha256=${targetBuildManifestSha} equals expectedNewIdentity.capabilityManifestSha256.`,
     };
 
+    assertLegacyCutoverUnbound(cutoverController.record());
     cutoverController.recordBindingRepair(input.cutoverId, repairReceipt);
     return await cutoverController.finish(input.cutoverId, async () => ({
       ...witness,

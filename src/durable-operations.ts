@@ -1,3 +1,11 @@
+import { CutoverBuildNotReadyError } from "./cutover-build-ready.js";
+import type { SelfRestartActuator } from "./cutover-restart.js";
+import type { CompletionSelection } from "./current-completion-matrix.js";
+import { isDeepStrictEqual } from "node:util";
+import { McpCutoverController, compareServerIdentity, type DurableReconciliationWitness } from "./mcp-cutover.js";
+import { CutoverStateStore, type CutoverServerIdentity, type CutoverDrainEvidence, type BuildReadyReceipt, type ExpectedCutoverIdentity, type CutoverCoordinationBinding } from "./cutover-state.js";
+import { ControlPlaneConsumer, type ControlPlaneConsumerOptions, type DependencyReconciliationEvidence } from "./control-plane-consumer.js";
+import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type HandoffInput } from "./control-plane-ownership.js";
 import { createHash } from "node:crypto";
 import { spawn as nativeSpawn } from "node:child_process";
 import { createRequire } from "node:module";
@@ -13,7 +21,7 @@ import { EXECUTION_PROTOCOL_VERSION, type ExecutionAuthorityMode } from "./execu
 const spawn = nativeSpawn;
 const crossSpawn = createRequire(import.meta.url)("cross-spawn") as typeof import("node:child_process").spawn;
 
-export type DurableOperationKind = "workspace_clone" | "dependency_sync" | "nexus_gateway_recover";
+export type DurableOperationKind = "workspace_clone" | "dependency_sync" | "nexus_gateway_recover" | "cutover_start";
 export type DurableOperationStatus = "started" | "succeeded" | "failed" | "outcome_unknown";
 export type DependencySyncRecipe = "npm_ci" | "pnpm_frozen" | "uv_frozen";
 
@@ -137,6 +145,19 @@ export class DurableOperationStore {
     this.database.close();
   }
 
+  createOwnershipStore(options: ControlPlaneConsumerOptions): ControlPlaneOwnershipStore {
+    return new ControlPlaneOwnershipStore(this.database.sqlite, {
+      ...options,
+      resolveOwnerContext: context => {
+        const owner = options.resolveOwnerContext?.(context);
+        return owner && Object.freeze({...owner});
+      },
+      verifyGrantEvidence: (grant, owner) => options.verifyGrantEvidence?.(Object.freeze({...grant}), Object.freeze({...owner})) === true,
+    });
+  }
+
+  atomic<T>(work: () => T): T { return this.database.sqlite.transaction(work).immediate(); }
+
   markInterruptedUnknown(): number {
     const now = new Date().toISOString();
     const result = this.database.sqlite.prepare(`
@@ -145,7 +166,7 @@ export class DurableOperationStore {
           error_code = 'RECONCILIATION_REQUIRED',
           error_message = 'DevSpace restarted while the mutating operation was nonterminal; reconcile physical state before any replay.',
           updated_at = ?
-      where status = 'started'
+      where status = 'started' and kind not in ('dependency_sync', 'cutover_start')
     `).run(now);
     return result.changes;
   }
@@ -258,15 +279,18 @@ export type CommandRunner = (
 
 export class DurableOperationManager {
   readonly store: DurableOperationStore;
+  private readonly consumer?: ControlPlaneConsumer;
 
   constructor(
     private readonly config: ServerConfig,
     private readonly runCommand: CommandRunner = spawnCommand,
     private readonly runNexusGatewayRecovery: NexusGatewayRecoveryRunner = spawnNexusGatewayRecovery,
     private readonly runNexusGatewayRecoveryPreflight: NexusGatewayRecoveryRunner = spawnNexusGatewayRecoveryPreflight,
+    coordination?: ControlPlaneConsumerOptions,
   ) {
     this.store = new DurableOperationStore(config.stateDir);
     this.store.markInterruptedUnknown();
+    if (coordination) this.consumer = new ControlPlaneConsumer(this.store.createOwnershipStore(coordination), coordination);
   }
 
   close(): void {
@@ -347,7 +371,203 @@ export class DurableOperationManager {
     });
   }
 
-  async dependencySync(input: DependencySyncInput): Promise<DurableOperationRecord> {
+  startCutover(input: {attemptKey: string; currentIdentity: CutoverServerIdentity; expectedIdentity: ExpectedCutoverIdentity; expiresAt?: string}, context?: unknown): DurableOperationRecord {
+    if (!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "cutover start requires trusted host authority");
+    assertAttemptKey(input.attemptKey);
+    const snapshot = JSON.parse(JSON.stringify(input)) as typeof input;
+    const stateRoot = canonicalizePath(this.config.stateDir);
+    const request = {version:EXECUTION_PROTOCOL_VERSION,baseRevision:snapshot.currentIdentity.sourceCommit,stateRoot,currentIdentity:snapshot.currentIdentity,expectedIdentity:snapshot.expectedIdentity,expiresAt:snapshot.expiresAt};
+    const requestHash = hashJson(request);
+    const operationId = stableOperationId("cutover_start",stateRoot,snapshot.attemptKey);
+    const subject = {operationId,requestHash,workspaceRoot:stateRoot,baseRevision:request.baseRevision,operation:"cutover_start" as const};
+    const consumer = this.consumer;
+    const intent = this.store.atomic(() => {
+      const binding = consumer.authorize(context,subject);
+      if (binding.role !== "controller") throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","cutover requires controller authority");
+      const existing = this.store.getByOperationId(operationId);
+      if (existing) {
+        if (existing.requestHash !== requestHash || existing.kind !== "cutover_start") throw new DurableOperationError("OPERATION_REPLAY_CONFLICT","cutover attempt changed",existing);
+        return {record:existing,created:false};
+      }
+      const coordinationBinding = consumer.pinCutover(context,subject,binding);
+      return this.store.createOrReplay({operationId,attemptKey:snapshot.attemptKey,requestHash,kind:"cutover_start",authorityMode:"OWNER_DIRECT",scopeRoot:stateRoot,request:{...request,coordinationBinding}});
+    });
+    if (!intent.created) return this.reconcileCutoverStart(operationId,context);
+    try {
+      // Keep the committed intent/pin across crashes; this second transaction
+      // serializes participating writers but cannot roll back the cutover file.
+      return this.store.atomic(() => {
+        const binding = consumer.authorize(context,subject);
+        const currentPin = consumer.cutoverBinding(context,subject,binding,binding.leaseVersion);
+        if (!isDeepStrictEqual(currentPin,intent.record.request.coordinationBinding) || !isDeepStrictEqual(this.store.getByOperationId(operationId),intent.record)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","cutover intent or pin changed before file write");
+        const controller = new McpCutoverController(new CutoverStateStore(stateRoot),snapshot.currentIdentity);
+        controller.begin(snapshot.expectedIdentity,snapshot.expiresAt,intent.record.request.coordinationBinding as unknown as CutoverCoordinationBinding);
+        return this.reconcileCutoverStart(operationId,context);
+      });
+    } catch (error) {
+      return this.store.atomic(() => {
+        if (!isDeepStrictEqual(this.store.getByOperationId(operationId),intent.record)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","late cutover result cannot overwrite newer durable state");
+        const binding = consumer.authorize(context,subject);
+        if (!isDeepStrictEqual(consumer.cutoverBinding(context,subject,binding,binding.leaseVersion),intent.record.request.coordinationBinding)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","late cutover result no longer owns the original pin");
+        if (!isDeepStrictEqual(this.store.getByOperationId(operationId),intent.record)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","cutover intent changed during unknown-result authority check");
+        return this.store.finish(operationId,{status:"outcome_unknown",retrySafe:false,errorCode:"RECONCILIATION_REQUIRED",errorMessage:error instanceof Error?error.message:String(error)});
+      });
+    }
+  }
+
+  reconcileCutoverStart(operationId: string, context?: unknown): DurableOperationRecord {
+    if (!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","cutover reconciliation requires trusted host authority");
+    const consumer = this.consumer;
+    return this.store.atomic(() => {
+      const record = this.store.getByOperationId(operationId);
+      if (!record || record.kind !== "cutover_start" || typeof record.request.baseRevision !== "string" || record.scopeRoot !== canonicalizePath(this.config.stateDir)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","cutover intent is not bound to this state resource");
+      const {coordinationBinding: persistedBinding, ...request} = record.request;
+      if (hashJson(request) !== record.requestHash || request.stateRoot !== record.scopeRoot || !persistedBinding) throw new ControlPlaneOwnershipError("CAS_CONFLICT","cutover intent digest or resource is malformed");
+      const subject = {operationId,requestHash:record.requestHash,workspaceRoot:record.scopeRoot,baseRevision:record.request.baseRevision,operation:"cutover_start" as const};
+      const binding = consumer.authorize(context,subject);
+      consumer.cutoverBinding(context,subject,binding,binding.leaseVersion);
+      const observed = new CutoverStateStore(record.scopeRoot).get();
+      if (!observed || !observed.coordinationBinding || observed.coordinationBinding.leaseId !== binding.leaseId || observed.coordinationBinding.operationHandle !== operationId || observed.coordinationBinding.requestHash !== record.requestHash || !record.request.coordinationBinding || !isDeepStrictEqual(observed.coordinationBinding,record.request.coordinationBinding) || !isDeepStrictEqual(observed.oldServerIdentity,record.request.currentIdentity) || !isDeepStrictEqual(observed.expectedNewIdentity,record.request.expectedIdentity) || observed.expiresAt !== record.request.expiresAt) throw new DurableOperationError("RECONCILIATION_REQUIRED","cutover outcome lacks exact persisted correlation; no retry or release is authorized",record);
+      // The cutover file and SQLite are separate stores. Keep the lifecycle pin.
+      if (!isDeepStrictEqual(this.store.getByOperationId(operationId),record)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","cutover intent changed during readback");
+      if (record.status === "succeeded") return record;
+      return this.store.finish(operationId,{status:"succeeded",retrySafe:false,receipt:{cutoverId:observed.cutoverId,coordinationBinding:observed.coordinationBinding,startVerified:true,lifecycleTerminal:false}});
+    });
+  }
+
+  drainCutover(cutoverId: string, currentIdentity: CutoverServerIdentity, readTransportEvidence: () => CutoverDrainEvidence, context?: unknown) {
+    if(!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","cutover drain requires trusted host authority");
+    const consumer=this.consumer;
+    const identity=Object.freeze({...currentIdentity});
+    return this.store.atomic(()=>{
+      const cutoverStore=new CutoverStateStore(canonicalizePath(this.config.stateDir));
+      const observed=cutoverStore.get();
+      if(!observed?.coordinationBinding || observed.cutoverId!==cutoverId) throw new ControlPlaneOwnershipError("CAS_CONFLICT","drain requires exact bound cutover generation");
+      const intent=this.reconcileCutoverStart(observed.coordinationBinding.operationHandle,context);
+      const subject={operationId:intent.operationId,requestHash:intent.requestHash,workspaceRoot:intent.scopeRoot,baseRevision:intent.request.baseRevision as string,operation:"cutover_start" as const};
+      const action={action:"drain" as const,cutoverId,currentIdentity:identity};
+      const binding=consumer.authorizeCutoverLifecycle(context,subject,action);
+      if(!isDeepStrictEqual(observed.oldServerIdentity,identity)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","drain runtime identity does not match original generation");
+      if(!isDeepStrictEqual(cutoverStore.get(),observed)||!isDeepStrictEqual(this.store.getByOperationId(intent.operationId),intent)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","drain generation changed during approval");
+      if(observed.phase==="drained") return observed;
+      if(observed.phase!=="prepared") throw new ControlPlaneOwnershipError("CAS_CONFLICT","drain requires prepared or already drained generation");
+      const evidence=JSON.parse(JSON.stringify(readTransportEvidence())) as CutoverDrainEvidence;
+      const current=consumer.authorizeCutoverLifecycle(context,subject,action);
+      if(!isDeepStrictEqual(current,binding)||!isDeepStrictEqual(cutoverStore.get(),observed)||!isDeepStrictEqual(this.store.getByOperationId(intent.operationId),intent)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","drain binding changed during evidence collection");
+      // Same DB fence; file effects cannot be rolled back by a SQLite failure.
+      return new McpCutoverController(cutoverStore,identity).recordDrain(cutoverId,evidence);
+    });
+  }
+
+  async restartCutover(cutoverId:string, currentIdentity:CutoverServerIdentity, buildReady:BuildReadyReceipt, probe:(expected:ExpectedCutoverIdentity)=>{buildReady:boolean;detail:string}|Promise<{buildReady:boolean;detail:string}>, actuator:SelfRestartActuator, context?:unknown) {
+    if(!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","restart requires trusted host authority");
+    const consumer=this.consumer,identity=Object.freeze({...currentIdentity});
+    const target=Object.freeze({actuator:actuator.actuator,serviceLabel:actuator.serviceLabel,launchdTarget:actuator.launchdTarget});
+    const schedule=actuator.schedule,ready=Object.freeze({...buildReady});
+    const action={action:"restart" as const,cutoverId,currentIdentity:identity,buildReady:ready,actuator:target};
+    const cutoverStore=new CutoverStateStore(canonicalizePath(this.config.stateDir));
+    const readBound=()=>{
+      const file=cutoverStore.get();
+      if(!file?.coordinationBinding||file.cutoverId!==cutoverId||file.phase!=="drained"||!isDeepStrictEqual(file.oldServerIdentity,identity)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart requires exact drained original runtime binding");
+      const intent=this.reconcileCutoverStart(file.coordinationBinding.operationHandle,context);
+      const subject={operationId:intent.operationId,requestHash:intent.requestHash,workspaceRoot:intent.scopeRoot,baseRevision:intent.request.baseRevision as string,operation:"cutover_start" as const};
+      const binding=consumer.authorizeCutoverLifecycle(context,subject,action);
+      if(schedule!==actuator.schedule||!isDeepStrictEqual(target,{actuator:actuator.actuator,serviceLabel:actuator.serviceLabel,launchdTarget:actuator.launchdTarget})) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart actuator binding changed");
+      if(file.restartRequest && (!isDeepStrictEqual(file.restartRequest.buildReady,ready)||file.restartRequest.requestedByServerInstanceId!==identity.serverInstanceId||file.restartRequest.actuator!==target.actuator)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart marker action binding mismatch");
+      if(intent.receipt?.restartAction && !isDeepStrictEqual(intent.receipt.restartAction,action)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart action changed");
+      if(!isDeepStrictEqual(cutoverStore.get(),file)||!isDeepStrictEqual(this.store.getByOperationId(intent.operationId),intent)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart binding changed during approval");
+      return {file,intent,subject,binding};
+    };
+    const initial=this.store.atomic(()=>{
+      const current=readBound();
+      if(current.file.restartRequest) {
+        if(!current.intent.receipt?.restartAction) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart marker lacks bound action; reconciliation required");
+        return {...current,replay:true};
+      }
+      this.store.finish(current.intent.operationId,{status:"succeeded",retrySafe:false,receipt:{...current.intent.receipt,restartAction:action,restartState:"requested"}});
+      new McpCutoverController(cutoverStore,identity).requestRestart(cutoverId,ready);
+      return {...readBound(),replay:false};
+    });
+    if(initial.replay) return {record:initial.file,scheduled:false,outcome:"outcome_unknown" as const};
+    const result=await probe(Object.freeze({...initial.file.expectedNewIdentity}));
+    if(result.buildReady!==true) throw new CutoverBuildNotReadyError(result.detail);
+    return this.store.atomic(()=>{
+      const current=readBound();
+      const {replay,...expected}=initial;
+      if(!isDeepStrictEqual(current,expected)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart binding changed during probe");
+      const marked=new McpCutoverController(cutoverStore,identity).markRestartScheduled(cutoverId);
+      // Durable file marker precedes the external actuator; errors keep the pin.
+      const scheduled=readBound();
+      if(!isDeepStrictEqual(scheduled.binding,current.binding)||!isDeepStrictEqual(scheduled.intent,current.intent)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart authority changed after scheduling marker");
+      if(marked.newlyScheduled) schedule.call(actuator);
+      return {record:marked.record,scheduled:marked.newlyScheduled,outcome:"outcome_unknown" as const};
+    });
+  }
+
+  async finishCutover(cutoverId: string, currentIdentity: CutoverServerIdentity, preferredPair: {workspaceId:string;agentId:string}, reconcile: () => Promise<DurableReconciliationWitness>, context?: unknown) {
+    if(!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","cutover finish requires trusted host authority");
+    const consumer=this.consumer;
+    const identity=Object.freeze({...currentIdentity}),pair=Object.freeze({...preferredPair});
+    const action={action:"finish" as const,cutoverId,currentIdentity:identity,preferredPair:pair};
+    const cutoverStore=new CutoverStateStore(canonicalizePath(this.config.stateDir));
+    const digest=(record: NonNullable<ReturnType<CutoverStateStore["get"]>>)=>{const {expired,...durable}=record;return hashJson(durable);};
+    const readBound=()=>{
+      const file=cutoverStore.get();
+      if(!file?.coordinationBinding||file.cutoverId!==cutoverId) throw new ControlPlaneOwnershipError("CAS_CONFLICT","finish requires exact bound cutover generation");
+      const intent=this.store.getByOperationId(file.coordinationBinding.operationHandle);
+      if(!intent||intent.kind!=="cutover_start"||intent.scopeRoot!==canonicalizePath(this.config.stateDir)||typeof intent.request.baseRevision!=="string") throw new ControlPlaneOwnershipError("CAS_CONFLICT","finish intent binding is missing");
+      const {coordinationBinding,...request}=intent.request;
+      if(hashJson(request)!==intent.requestHash||request.stateRoot!==intent.scopeRoot||!isDeepStrictEqual(coordinationBinding,file.coordinationBinding)||!isDeepStrictEqual(request.currentIdentity,file.oldServerIdentity)||!isDeepStrictEqual(request.expectedIdentity,file.expectedNewIdentity)||request.expiresAt!==file.expiresAt) throw new ControlPlaneOwnershipError("CAS_CONFLICT","finish intent or file correlation changed");
+      const subject={operationId:intent.operationId,requestHash:intent.requestHash,workspaceRoot:intent.scopeRoot,baseRevision:intent.request.baseRevision,operation:"cutover_start" as const};
+      const replay=intent.receipt?.lifecycleTerminal===true;
+      const binding=consumer.authorizeCutoverLifecycle(context,subject,action,!replay);
+      if(binding.leaseId!==file.coordinationBinding.leaseId) throw new ControlPlaneOwnershipError("CAS_CONFLICT","finish authorized lease differs from generation");
+      const comparison=compareServerIdentity(file,identity);
+      if(!Object.values(comparison).every(Boolean)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","finish replacement runtime identity mismatch");
+      if(file.phase!=="drained"&&file.phase!=="closed") throw new ControlPlaneOwnershipError("CAS_CONFLICT","bound finish requires drained generation; recovery is separate");
+      if(replay&&(file.phase!=="closed"||intent.receipt?.terminalRecordHash!==digest(file)||!isDeepStrictEqual(intent.receipt?.lifecycleAction,action))) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal replay receipt mismatch");
+      return {file,intent,subject,binding,replay};
+    };
+    const validWitness=(w:DurableReconciliationWitness|undefined)=>!!w&&w.workspaceQueryable===true&&w.agentQueryable===true&&w.agentReconciled===true&&w.witnessWorkspaceId===pair.workspaceId&&w.witnessAgentId===pair.agentId;
+    const initial=this.store.atomic(readBound);
+    let witness:DurableReconciliationWitness|undefined;
+    if(initial.file.phase!=="closed") witness=JSON.parse(JSON.stringify(await reconcile())) as DurableReconciliationWitness;
+    return this.store.atomic(()=>{
+      const current=readBound();
+      if(!isDeepStrictEqual(current,initial)||!isDeepStrictEqual(cutoverStore.get(),current.file)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","finish binding changed while reconciliation was pending");
+      if(current.file.phase!=="closed") {
+        if(!validWitness(witness)) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","finish requires positive exact workspace/agent witness");
+        new McpCutoverController(cutoverStore,identity).finishWithWitness(cutoverId,witness!);
+      }
+      const closed=cutoverStore.get();const receipt=closed?.reconciliationReceipt;
+      if(!closed||closed.phase!=="closed"||closed.cutoverId!==cutoverId||!isDeepStrictEqual(closed.coordinationBinding,current.file.coordinationBinding)||!validWitness(receipt)||receipt?.closedByServerInstanceId!==identity.serverInstanceId||!Number.isFinite(Date.parse(receipt.reconciledAt))||Date.parse(receipt.reconciledAt)>Date.now()) throw new ControlPlaneOwnershipError("CAS_CONFLICT","closed file lacks exact terminal witness");
+      if(current.replay) return closed;
+      consumer.finish(context,current.subject,current.binding,current.binding.leaseVersion);
+      if(!isDeepStrictEqual(cutoverStore.get(),closed)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal file changed during final authority check");
+      if(!isDeepStrictEqual(this.store.getByOperationId(current.intent.operationId),current.intent)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal intent changed during final authority check");
+      this.store.finish(current.intent.operationId,{status:"succeeded",retrySafe:false,receipt:{...current.intent.receipt,lifecycleTerminal:true,terminalRecordHash:digest(closed),lifecycleAction:action}});
+      return closed;
+    });
+  }
+
+  readCompletion(selection: CompletionSelection, context?: unknown) {
+    if(!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","completion read requires trusted host authority");
+    return this.consumer.readCompletion(context,selection);
+  }
+
+  handoff(leaseId: string, expectedVersion: number, recipientHandle: string, receipt: HandoffInput, context?: unknown) {
+    if (!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","handoff requires trusted host authority");
+    return this.consumer.handoff(context,leaseId,expectedVersion,recipientHandle,receipt);
+  }
+
+  readHandoff(leaseId: string, previousVersion: number, expectedCurrentVersion: number, consumerContext?: unknown) {
+    if (!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "handoff readback requires trusted host authority");
+    return this.consumer.readHandoff(consumerContext, leaseId, previousVersion, expectedCurrentVersion);
+  }
+
+  async dependencySync(input: DependencySyncInput, consumerContext?: unknown): Promise<DurableOperationRecord> {
+    if (!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency sync requires a trusted host authority reader");
+    const consumer = this.consumer;
     assertAttemptKey(input.attemptKey);
     const authorityMode = input.authorityMode ?? "OWNER_DIRECT";
     if (authorityMode !== "OWNER_DIRECT") {
@@ -364,8 +584,11 @@ export class DurableOperationManager {
 
     const frozenInputs = recipeFrozenInputs(input.recipe);
     const before = await hashFiles(workspaceRoot, frozenInputs);
+    const baseRevision = await readGitHead(workspaceRoot);
+    if (!baseRevision) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency workspace revision cannot be verified");
     const request = {
       version: EXECUTION_PROTOCOL_VERSION,
+      baseRevision,
       workspaceId: input.workspaceId,
       workspaceRoot,
       recipe: input.recipe,
@@ -373,7 +596,10 @@ export class DurableOperationManager {
     };
     const requestHash = hashJson(request);
     const operationId = stableOperationId("dependency_sync", workspaceRoot, input.attemptKey);
-    const { record, created } = this.store.createOrReplay({
+    const subject = {operationId, requestHash, workspaceRoot, baseRevision, operation: "dependency_sync" as const};
+    const { record, created, binding, pinnedVersion } = this.store.atomic(() => {
+      const binding = consumer.authorize(consumerContext, subject);
+      const value = this.store.createOrReplay({
       operationId,
       attemptKey: input.attemptKey,
       requestHash,
@@ -382,14 +608,27 @@ export class DurableOperationManager {
       scopeRoot: workspaceRoot,
       workspaceId: input.workspaceId,
       request,
+      });
+      const pinnedVersion = value.created ? consumer.pin(consumerContext, subject, binding) : binding.leaseVersion;
+      return {...value, binding, pinnedVersion};
     });
     if (!created) return replayResult(record);
 
+    const finish = (patch: Parameters<DurableOperationStore["finish"]>[1]) => this.store.atomic(() => {
+      consumer.finish(consumerContext, subject, binding, pinnedVersion);
+      return this.store.finish(operationId, patch);
+    });
+    try {
+    if (await readGitHead(workspaceRoot) !== baseRevision || hashJson(await hashFiles(workspaceRoot, frozenInputs)) !== hashJson(before)) {
+      throw new Error("Frozen dependency input or base revision changed before launch");
+    }
+    consumer.assertPinned(consumerContext, subject, binding, pinnedVersion);
     const command = dependencyCommand(input.recipe);
     const result = await this.runCommand(command.command, command.args, workspaceRoot);
+    if (result.exitCode === null) throw new Error("Command termination is unconfirmed");
     const after = await hashFiles(workspaceRoot, frozenInputs);
     if (hashJson(before) !== hashJson(after)) {
-      return this.store.finish(operationId, {
+      return finish({
         status: "failed",
         retrySafe: false,
         errorCode: "FROZEN_INPUT_CHANGED",
@@ -398,7 +637,7 @@ export class DurableOperationManager {
       });
     }
     if (result.exitCode !== 0) {
-      return this.store.finish(operationId, {
+      return finish({
         status: "failed",
         retrySafe: false,
         errorCode: "DEPENDENCY_SYNC_FAILED",
@@ -406,10 +645,39 @@ export class DurableOperationManager {
         receipt: { recipe: input.recipe, frozenInputs: after, exitCode: result.exitCode },
       });
     }
-    return this.store.finish(operationId, {
+    return finish({
       status: "succeeded",
       retrySafe: false,
       receipt: { recipe: input.recipe, frozenInputs: after, exitCode: result.exitCode },
+    });
+    } catch (error) {
+      return this.store.atomic(() => {
+        if (JSON.stringify(this.store.getByOperationId(operationId)) !== JSON.stringify(record)) {
+          throw new ControlPlaneOwnershipError("CAS_CONFLICT", "late dependency result cannot overwrite a newer durable outcome");
+        }
+        return this.store.finish(operationId, {status: "outcome_unknown", retrySafe:false, errorCode:"RECONCILIATION_REQUIRED", errorMessage: redactSecrets(error instanceof Error ? error.message : String(error))});
+      });
+    }
+  }
+
+  reconcileDependencySync(operationId: string, evidence: DependencyReconciliationEvidence, consumerContext?: unknown): DurableOperationRecord {
+    if (!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency reconciliation requires trusted host authority");
+    const consumer = this.consumer;
+    const proof = Object.freeze(structuredClone(evidence));
+    return this.store.atomic(() => {
+      const record = this.store.getByOperationId(operationId);
+      if (!record || record.kind !== "dependency_sync" || typeof record.request.baseRevision !== "string") {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT", "no revision-bound dependency operation to reconcile");
+      }
+      const subject = {operationId, requestHash:record.requestHash, workspaceRoot:record.scopeRoot, baseRevision:record.request.baseRevision, operation:"dependency_sync" as const};
+      consumer.reconcile(consumerContext, subject, proof);
+      if (JSON.stringify(this.store.getByOperationId(operationId)) !== JSON.stringify(record)) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "durable operation changed during reconciliation");
+      if (record.status === "succeeded" || record.status === "failed") return record;
+      return this.store.finish(operationId, {
+        status: proof.exitCode === 0 && proof.frozenInputsUnchanged && proof.state === "finished" ? "succeeded" : "failed",
+        retrySafe:false,
+        receipt: {reconciliation:proof},
+      });
     });
   }
 
@@ -582,9 +850,15 @@ export class DurableOperationManager {
     });
   }
 
-  async reconcile(operationId: string): Promise<DurableOperationRecord> {
+  async reconcile(operationId: string, consumerContext?: unknown): Promise<DurableOperationRecord> {
     const record = this.store.getByOperationId(operationId);
     if (!record) throw new DurableOperationError("RECONCILIATION_REQUIRED", `Unknown durable operation: ${operationId}`);
+    if (record.kind === "cutover_start") return this.reconcileCutoverStart(operationId,consumerContext);
+    if (record.kind === "dependency_sync") {
+      if (!this.consumer || typeof record.request.baseRevision !== "string") throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency reconciliation requires revision-bound host authority");
+      const subject = {operationId, requestHash:record.requestHash, workspaceRoot:record.scopeRoot, baseRevision:record.request.baseRevision, operation:"dependency_sync" as const};
+      return this.reconcileDependencySync(operationId, this.consumer.readReconciliation(consumerContext, subject), consumerContext);
+    }
     if (record.status !== "outcome_unknown" && record.status !== "started") return record;
 
     if (record.kind === "nexus_gateway_recover") {
@@ -614,27 +888,7 @@ export class DurableOperationManager {
       });
     }
 
-    const workspaceRoot = String(record.request.workspaceRoot ?? record.scopeRoot);
-    const recipe = String(record.request.recipe) as DependencySyncRecipe;
-    const frozenInputs = recipeFrozenInputs(recipe);
-    const current = await hashFiles(workspaceRoot, frozenInputs);
-    const original = record.request.frozenInputs as Record<string, string | null> | undefined;
-    if (original && hashJson(original) !== hashJson(current)) {
-      return this.store.finish(operationId, {
-        status: "failed",
-        retrySafe: false,
-        errorCode: "FROZEN_INPUT_CHANGED",
-        errorMessage: "Frozen dependency inputs differ from the operation's bound inputs; success cannot be claimed.",
-        receipt: { recipe, original, current, reconciled: true },
-      });
-    }
-    return this.store.finish(operationId, {
-      status: "outcome_unknown",
-      retrySafe: false,
-      errorCode: "RECONCILIATION_REQUIRED",
-      errorMessage: "Dependency inputs are intact, but installed-environment success cannot be proven after interruption without re-executing mutation.",
-      receipt: { recipe, frozenInputs: current, reconciled: true },
-    });
+    throw new DurableOperationError("RECONCILIATION_REQUIRED", "Unsupported durable operation kind");
   }
 }
 
