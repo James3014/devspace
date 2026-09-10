@@ -64,7 +64,7 @@ test("missing optional node-pty is a no-op and non-darwin is a no-op", async () 
   const f = await fixture("nested");
   try {
     await rm(join(f.app, "node_modules"), { recursive: true, force: true });
-    const mod = await import(`${f.hook}?linux=${Date.now()}`);
+    const mod = await import(`${pathToFileURL(f.hook).href}?linux=${Date.now()}`);
     await mod.fixNodePtyPermissions({ platform: "linux", hookUrl: pathToFileURL(f.hook).href });
     await mod.fixNodePtyPermissions({ platform: "darwin", hookUrl: pathToFileURL(f.hook).href });
   } finally { await rm(f.root, { recursive: true, force: true }); }
