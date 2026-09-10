@@ -291,10 +291,11 @@ export class ControlPlaneOwnershipStore {
   }
   private assertNoOverlap(resource: Pick<ResourceLease, "resourceKind" | "resourceId" | "resource" | "scope">, ownLeaseId?: string): void {
     // Repository grants remain separate; physical resources belong to the shared host.
-    const active = this.sqlite.prepare("select * from control_plane_resource_leases where terminal_state is null").all() as LeaseRow[];
+    const active = this.sqlite.prepare("select * from control_plane_resource_leases").all() as LeaseRow[];
     for (const row of active) {
       if (row.lease_id === ownLeaseId) continue;
       const other = rowLease(row);
+      if (other.terminalState !== undefined) continue;
       if (overlaps(resource.scope, other.scope) || (other.resourceKind !== "filesystem" && other.resourceKind !== "checkout" && other.resourceKind === resource.resourceKind && other.resourceId === resource.resourceId && other.resource === resource.resource)) {
         throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "overlapping resource scope is already leased");
       }

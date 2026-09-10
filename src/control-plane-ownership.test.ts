@@ -302,3 +302,22 @@ test("persisted cross-repository overlaps deny replay, authorization and new pin
     assert.equal(store.get(second.leaseId)?.terminalState,"released");
   }finally{sqlite.close();rmSync(root,{recursive:true,force:true});}
 });
+
+
+test("malformed terminal rows cannot hide from resource fencing", () => {
+  for (const corruption of [{terminal_state:"unknown"},{terminal_state:""},{terminal_state:"released",scope_json:"null"}]) {
+    const sqlite=db();const store=new ControlPlaneOwnershipStore(sqlite,options);
+    try {
+      const request=input(["/repo/a"]);const first=store.acquire(context("owner"),request);
+      const other=store.acquire(context("owner"),{...input(["/repo/b"]),idempotencyKey:"other",resourceId:"other"});
+      sqlite.prepare("update control_plane_resource_leases set terminal_state=?,scope_json=? where lease_id=?").run(corruption.terminal_state,corruption.scope_json??JSON.stringify(first.scope),other.leaseId);
+      const before=sqlite.prepare("select * from control_plane_resource_leases order by lease_id").all();
+      const malformed=(e:unknown)=>e instanceof ControlPlaneOwnershipError&&e.code==="MALFORMED";
+      assert.throws(()=>store.acquire(context("owner"),{...input(["/repo/c"]),resourceId:"new",idempotencyKey:"new"}),malformed);
+      assert.throws(()=>store.acquire(context("owner"),request),malformed);
+      assert.throws(()=>store.assertHeld(context("owner"),first.leaseId,1,first.operation,first.baseRevision),malformed);
+      assert.throws(()=>store.beginOperation(context("owner"),first.leaseId,1,"effect"),malformed);
+      assert.deepEqual(sqlite.prepare("select * from control_plane_resource_leases order by lease_id").all(),before);
+    } finally {sqlite.close();}
+  }
+});
