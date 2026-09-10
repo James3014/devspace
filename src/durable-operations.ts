@@ -1288,7 +1288,10 @@ async function spawnCommand(
   cwd: string,
 ): Promise<{ exitCode: number | null; stdout: string; stderr: string }> {
   return await new Promise((resolvePromise, rejectPromise) => {
-    const child = crossSpawn(command, args, {
+    const commandSpawn = process.platform === "win32" && /^(npm|pnpm)\.cmd$/i.test(command)
+      ? crossSpawn
+      : spawn;
+    const child = commandSpawn(command, args, {
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
       env: process.env,
