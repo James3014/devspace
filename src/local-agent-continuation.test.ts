@@ -325,7 +325,8 @@ test("continuation is rejected when HEAD advanced past recorded lineage", async 
 test("continuation is rejected while execution capacity is exhausted", async () => {
   const f = setupGitFixture();
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-capacity-state-"));
-  const release: Array<() => void> = [];
+  let releaseBlocked!: () => void;
+  const blocked = new Promise<void>((resolve) => { releaseBlocked = resolve; });
   const manager = new LocalAgentSessionManager(
     {
       stateDir,
@@ -339,7 +340,7 @@ test("continuation is rejected while execution capacity is exhausted", async () 
     async () => true,
     async (_profile, _record, prompt) => {
       if (prompt === "block") {
-        await new Promise<void>((resolve) => release.push(resolve));
+        await blocked;
       }
       return { provider: "codex", providerSessionId: "sess-test", items: [], finalResponse: "done" };
     },
@@ -394,7 +395,7 @@ test("continuation is rejected while execution capacity is exhausted", async () 
       (err: any) => err.code === "CONTINUATION_ADMISSION_FAILED" && /capacity/i.test(err.message),
     );
   } finally {
-    for (const resolvePending of release) resolvePending();
+    releaseBlocked();
     try {
       await Promise.all([blockedA, blockedC].filter((promise): promise is Promise<unknown> => promise !== undefined));
     } finally {
