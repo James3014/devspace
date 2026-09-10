@@ -176,21 +176,31 @@ test("write-denied destination rejects late apply failure without changing track
     let windowsAclApplied = false;
     try {
       if (process.platform === "win32") {
-        const whoami = execFileSync("whoami", ["/user", "/fo", "csv", "/nh"], { encoding: "utf8" });
-        const sidMatches = whoami.match(/\bS-\d-(?:\d+-){1,14}\d+\b/g) ?? [];
-        assert.equal(sidMatches.length, 1, "whoami must return exactly one current-user SID");
-        windowsAclSid = sidMatches[0];
-        windowsAclApplied = true;
-        const targetFile = join(destination, "a.ts");
-        execFileSync("icacls", [targetFile, "/deny", `*${windowsAclSid}:(W,D)`], {
-          encoding: "utf8",
-        });
+        // Installed immediately before git apply, after the final re-fence.
+        // This keeps readiness checks independent of the write denial.
       } else {
         chmodSync(destination, 0o555);
       }
-      const result = await integrateCandidate({ ...input, confirmApply: true });
+      const result = await integrateCandidate({
+        ...input,
+        confirmApply: true,
+        beforeApplyHook: process.platform === "win32"
+          ? () => {
+              const whoami = execFileSync("whoami", ["/user", "/fo", "csv", "/nh"], { encoding: "utf8" });
+              const sidMatches = whoami.match(/\bS-\d-(?:\d+-){1,14}\d+\b/g) ?? [];
+              assert.equal(sidMatches.length, 1, "whoami must return exactly one current-user SID");
+              windowsAclSid = sidMatches[0];
+              windowsAclApplied = true;
+              const targetFile = join(destination, "a.ts");
+              execFileSync("icacls", [targetFile, "/deny", `*${windowsAclSid}:(W,D)`], { encoding: "utf8" });
+            }
+          : undefined,
+      });
       assert.equal(result.applied, false);
-      assert.ok(result.blockers.some((b) => b.code === "INTEGRATION_NOT_EXPRESSIBLE"));
+      assert.ok(
+        result.blockers.some((b) => b.code === "INTEGRATION_NOT_EXPRESSIBLE"),
+        JSON.stringify(result),
+      );
       // Destination bytes/state remain unchanged.
       assert.equal(await readFile(join(destination, "a.ts")), "v1\n");
       const status = runGitRaw(["status", "--porcelain"], destination);
