@@ -139,7 +139,7 @@ export async function runRepositoryIntelligenceOperation(
       ["-m", "repository_intelligence.cli", "--operation", operation, "--input", "-"],
       {
         cwd: config.root,
-        shell: false,
+        shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(pythonBin),
         stdio: ["pipe", "pipe", "pipe"],
         env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" },
       },

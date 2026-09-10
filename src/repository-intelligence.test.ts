@@ -27,9 +27,7 @@ function initGitRepo(dir: string): string {
 }
 
 function makeFakePython(root: string): string {
-  const path = join(root, "fake-python");
-  writeFileSync(path, `#!/usr/bin/env node
-let body = '';
+  const scriptContent = `let body = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => { body += chunk; });
 process.stdin.on('end', () => {
@@ -54,7 +52,18 @@ process.stdin.on('end', () => {
   const input = JSON.parse(body || '{}');
   process.stdout.write(JSON.stringify({ operation, claim_ceiling: top, result: { echo: input, claim_ceiling: nested } }));
 });
-`);
+`;
+
+  if (process.platform === "win32") {
+    const scriptPath = join(root, "fake-python.cjs");
+    writeFileSync(scriptPath, scriptContent);
+    const cmdPath = join(root, "fake-python.cmd");
+    writeFileSync(cmdPath, `@node "%~dp0fake-python.cjs" %*\r\n`);
+    return cmdPath;
+  }
+
+  const path = join(root, "fake-python");
+  writeFileSync(path, `#!/usr/bin/env node\n${scriptContent}`);
   chmodSync(path, 0o755);
   return path;
 }
