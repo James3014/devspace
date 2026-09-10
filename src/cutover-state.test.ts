@@ -321,6 +321,7 @@ test("drain evidence and terminal reconciliation receipt survive store replaceme
     const first = new CutoverStateStore(stateDir, { newId: () => "cutover-one" });
     first.begin({
       oldServerIdentity: oldIdentity,
+      coordinationBinding,
       expectedNewIdentity: { sourceCommit: "source-new", buildId: "build-new" },
     });
     first.recordDrain("cutover-one", { activeSessions: 2, oldestAgeMs: 9_000 });
@@ -338,6 +339,7 @@ test("drain evidence and terminal reconciliation receipt survive store replaceme
 
     const terminal = new CutoverStateStore(stateDir).get();
     assert.equal(terminal?.phase, "closed");
+    assert.deepEqual(terminal?.coordinationBinding,coordinationBinding);
     assert.equal(terminal?.reconciliationReceipt?.agentReconciled, true);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
@@ -358,6 +360,7 @@ test("recoverSupersede terminally supersedes a stale cutover and establishes a f
     store.begin({
       oldServerIdentity: oldIdentity,
       expectedNewIdentity: { sourceCommit: "source-stale", buildId: "build-stale" },
+      coordinationBinding,
     });
 
     now = 10_000;
@@ -373,6 +376,9 @@ test("recoverSupersede terminally supersedes a stale cutover and establishes a f
     });
 
     assert.equal(recovered.newlyRecovered, true);
+    assert.deepEqual(recovered.terminal.coordinationBinding,coordinationBinding);
+    assert.equal(recovered.successor.coordinationBinding,undefined);
+    assert.deepEqual(store.supersededRecord()?.coordinationBinding,coordinationBinding);
     assert.equal(recovered.terminal.phase, "superseded");
     assert.equal(recovered.terminal.cutoverId, "id-1001");
     assert.equal(recovered.terminal.supersedesCutoverId, undefined);
@@ -1172,3 +1178,54 @@ for (const missing of ["witnessCutoverId", "witnessServerInstanceId", "witnessEx
     } finally { rmSync(stateDir, { recursive: true, force: true }); }
   });
 }
+
+
+const coordinationBinding = {leaseId:"lease-one",pinnedLeaseVersion:2,operationHandle:"operation-one",requestHash:"a".repeat(64),ownerThread:"controller-one"};
+
+test("coordination binding is validated before writes and survives restart and drain", () => {
+  const root=mkdtempSync(join(tmpdir(),"devspace-cutover-correlation-"));
+  try {
+    const store=new CutoverStateStore(root);
+    for (const invalid of [{...coordinationBinding,pinnedLeaseVersion:0},{...coordinationBinding,pinnedLeaseVersion:1.5},{...coordinationBinding,requestHash:"unknown"},{...coordinationBinding,ownerThread:""},{...coordinationBinding,extra:"field"}]) {
+      assert.throws(()=>store.begin({oldServerIdentity:oldIdentity,expectedNewIdentity:{sourceCommit:"next",buildId:"next"},coordinationBinding:invalid}),/coordination binding/i);
+      assert.deepEqual(readdirSync(root),[]);
+    }
+    const input={...coordinationBinding};
+    const created=store.begin({oldServerIdentity:oldIdentity,expectedNewIdentity:{sourceCommit:"next",buildId:"next"},coordinationBinding:input});
+    input.ownerThread="mutated";
+    assert.deepEqual(created.coordinationBinding,coordinationBinding);
+    assert.deepEqual(new CutoverStateStore(root).get()?.coordinationBinding,coordinationBinding);
+    store.recordDrain(created.cutoverId,{activeSessions:0,oldestAgeMs:0});
+    assert.deepEqual(new CutoverStateStore(root).get()?.coordinationBinding,coordinationBinding);
+  } finally {rmSync(root,{recursive:true,force:true});}
+});
+
+test("coordination event binding cannot be altered, removed, or retrofitted onto legacy records", () => {
+  for (const legacy of [false,true]) {
+    const root=mkdtempSync(join(tmpdir(),"devspace-cutover-binding-tamper-"));
+    try {
+      const store=new CutoverStateStore(root);
+      const created=store.begin({oldServerIdentity:oldIdentity,expectedNewIdentity:{sourceCommit:"next",buildId:"next"},...(legacy?{}:{coordinationBinding})});
+      store.recordDrain(created.cutoverId,{activeSessions:0,oldestAgeMs:0});
+      const active=join(root,"cutover","active");const event=join(active,readdirSync(active).find(n=>n.startsWith("drained-"))!);
+      const original=JSON.parse(readFileSync(event,"utf8"));
+      for (const changed of legacy?[coordinationBinding]:[undefined,{...coordinationBinding,ownerThread:"different"}]) {
+        const value={...original,coordinationBinding:changed};writeFileSync(event,JSON.stringify(value));
+        assert.throws(()=>new CutoverStateStore(root).get(),/coordination binding/i);
+      }
+    } finally {rmSync(root,{recursive:true,force:true});}
+  }
+});
+
+
+test("malformed persisted coordination binding fails closed without rewriting evidence", () => {
+  const root=mkdtempSync(join(tmpdir(),"devspace-cutover-malformed-binding-"));
+  try {
+    const store=new CutoverStateStore(root);
+    store.begin({oldServerIdentity:oldIdentity,expectedNewIdentity:{sourceCommit:"next",buildId:"next"},coordinationBinding});
+    const path=join(root,"cutover","active","created.json");const record=JSON.parse(readFileSync(path,"utf8"));
+    const raw=JSON.stringify({...record,coordinationBinding:{...coordinationBinding,pinnedLeaseVersion:"2"}});writeFileSync(path,raw);
+    assert.throws(()=>new CutoverStateStore(root).get(),/coordination binding/i);
+    assert.equal(readFileSync(path,"utf8"),raw);
+  } finally {rmSync(root,{recursive:true,force:true});}
+});

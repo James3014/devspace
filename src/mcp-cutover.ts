@@ -5,6 +5,7 @@ import { CutoverBuildNotReadyError } from "./cutover-build-ready.js";
 import type { SelfRestartActuator } from "./cutover-restart.js";
 import type {
   BuildReadyReceipt,
+  CutoverCoordinationBinding,
   CutoverBindingRepairReceipt,
   CutoverDrainEvidence,
   CutoverReconciliationReceipt,
@@ -148,11 +149,12 @@ export class McpCutoverController {
     private readonly now: () => number = Date.now,
   ) {}
 
-  begin(expectedNewIdentity: ExpectedCutoverIdentity, expiresAt?: string): DurableCutoverRecord {
+  begin(expectedNewIdentity: ExpectedCutoverIdentity, expiresAt?: string, coordinationBinding?: CutoverCoordinationBinding): DurableCutoverRecord {
     return this.store.begin({
       oldServerIdentity: this.currentIdentity,
       expectedNewIdentity,
       expiresAt,
+      coordinationBinding,
     });
   }
 

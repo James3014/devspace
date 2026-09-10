@@ -18,7 +18,9 @@ test("old instance drains and replacement instance is reconcile-only across rest
   try {
     const store = new CutoverStateStore(stateDir, { newId: () => "cutover-one" });
     const old = new McpCutoverController(store, identity("old", "old-source", "old-build"));
-    old.begin({ sourceCommit: "new-source", buildId: "new-build", capabilityManifestSha256: "cap" });
+    const binding={leaseId:"lease",pinnedLeaseVersion:2,operationHandle:"operation",requestHash:"a".repeat(64),ownerThread:"controller"};
+    old.begin({ sourceCommit: "new-source", buildId: "new-build", capabilityManifestSha256: "cap" },undefined,binding);
+    assert.deepEqual(old.record()?.coordinationBinding,binding);
     assert.equal(old.mode(), "drain");
     assert.doesNotThrow(() => old.assertToolAllowed("coordination_handoff_readback"));
     assert.throws(() => old.assertToolAllowed("write"), /CUTOVER_RECONCILIATION_REQUIRED/);
@@ -43,6 +45,7 @@ test("old instance drains and replacement instance is reconcile-only across rest
       identity("new", "new-source", "new-build"),
     );
     assert.equal(replacement.mode(), "reconcile-only");
+    assert.deepEqual(replacement.record()?.coordinationBinding,binding);
     assert.doesNotThrow(() => replacement.assertToolAllowed("coordination_handoff_readback"));
     assert.equal(replacement.canInitializeTransport(), true);
     assert.throws(
