@@ -561,3 +561,23 @@ test("C3 finish denial and uncertain terminal writes retain the original pin",as
     } finally {CutoverStateStore.prototype.close=originalClose;f.manager.store.finish=originalFinish;f.manager.close();}
   }
 });
+
+test("C3 final finish authority callback cannot overwrite a changed durable intent",async()=>{
+  const {CutoverStateStore}=await import("./cutover-state.js");const f=cutoverFixture();
+  try {
+    const start=f.manager.startCutover(f.input,f.context);const id=start.receipt!.cutoverId as string;
+    f.options.approveCutoverLifecycle=()=>true;
+    f.manager.drainCutover(id,f.input.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),f.context);
+    const pin=f.ownership.get(f.leaseId);const intent=f.manager.store.getByOperationId(start.operationId);
+    const verifier=f.options.verifyGrantEvidence!;let attacked=false;
+    f.options.verifyGrantEvidence=(grant,owner)=>{
+      if(!attacked&&new CutoverStateStore(f.config.stateDir).get()?.phase==="closed") {
+        attacked=true;f.manager.store.finish(start.operationId,{status:"failed",retrySafe:false,errorMessage:"newer callback intent"});
+      }
+      return verifier(grant,owner);
+    };
+    await assert.rejects(f.manager.finishCutover(id,{serverInstanceId:"replacement",...f.input.expectedIdentity},{workspaceId:"workspace",agentId:"agent"},async()=>({workspaceQueryable:true,agentQueryable:true,agentReconciled:true,witnessWorkspaceId:"workspace",witnessAgentId:"agent"}),f.context),/intent changed/);
+    assert.equal(attacked,true);assert.deepEqual(f.ownership.get(f.leaseId),pin);assert.deepEqual(f.manager.store.getByOperationId(start.operationId),intent);
+    assert.equal(new CutoverStateStore(f.config.stateDir).get()?.phase,"closed");
+  } finally {f.manager.close();}
+});
