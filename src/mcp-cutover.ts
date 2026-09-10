@@ -5,13 +5,14 @@ import { CutoverBuildNotReadyError } from "./cutover-build-ready.js";
 import type { SelfRestartActuator } from "./cutover-restart.js";
 import type {
   BuildReadyReceipt,
+  CutoverBindingRepairReceipt,
   CutoverDrainEvidence,
   CutoverReconciliationReceipt,
   CutoverServerIdentity,
   DurableCutoverRecord,
   ExpectedCutoverIdentity,
 } from "./cutover-state.js";
-import { CutoverStateError, CutoverStateStore } from "./cutover-state.js";
+import { CutoverStateError, CutoverStateStore, effectiveExpectedIdentity } from "./cutover-state.js";
 import type { NextFunction, Request, Response } from "express";
 import type { OrchestrationOutcome } from "./cutover-orchestration.js";
 
@@ -55,6 +56,7 @@ export const CUTOVER_SAFE_TOOLS: ReadonlySet<string> = new Set([
   "cutover_reconcile",
   "cutover_finish",
   "cutover_recover",
+  "cutover_repair_binding",
 
   // Agent inspection & reconciliation
   "agent_status",
@@ -193,6 +195,18 @@ export class McpCutoverController {
     return this.store.recordRestartScheduled(cutoverId, this.currentIdentity.serverInstanceId);
   }
 
+  recordBindingRepair(
+    cutoverId: string,
+    repair: CutoverBindingRepairReceipt,
+  ): DurableCutoverRecord {
+    const record = this.store.get();
+    if (!record) throw new CutoverStateError("No durable cutover record exists.");
+    if (record.cutoverId !== cutoverId) {
+      throw new CutoverStateError(`Cutover id mismatch: active cutover is ${record.cutoverId}.`);
+    }
+    return this.store.recordBindingRepair(cutoverId, repair).record;
+  }
+
   record(): DurableCutoverRecord | undefined {
     return this.store.get();
   }
@@ -219,6 +233,13 @@ export class McpCutoverController {
   status(transportEvidence: CutoverDrainEvidence): Record<string, unknown> {
     const record = this.store.get();
     const superseded = this.store.supersededRecord();
+    const repairObservability = record?.bindingRepair
+      ? {
+          originalExpectedIdentity: record.expectedNewIdentity,
+          effectiveExpectedIdentity: effectiveExpectedIdentity(record),
+          bindingRepair: record.bindingRepair,
+        }
+      : {};
     return {
       cutover: record,
       supersededCutover:
@@ -227,6 +248,7 @@ export class McpCutoverController {
           : undefined,
       currentServerIdentity: this.currentIdentity,
       comparison: record ? compareServerIdentity(record, this.currentIdentity) : undefined,
+      ...repairObservability,
       transportEvidence,
       mode: this.mode(),
       reconciliationRequired: Boolean(record && record.phase !== "closed"),
@@ -303,14 +325,15 @@ export function compareServerIdentity(
   record: DurableCutoverRecord,
   current: CutoverServerIdentity,
 ): CutoverIdentityComparison {
+  const expected = effectiveExpectedIdentity(record);
   return {
     serverInstanceChanged:
       current.serverInstanceId !== record.oldServerIdentity.serverInstanceId,
-    sourceMatches: current.sourceCommit === record.expectedNewIdentity.sourceCommit,
-    buildMatches: current.buildId === record.expectedNewIdentity.buildId,
+    sourceMatches: current.sourceCommit === expected.sourceCommit,
+    buildMatches: current.buildId === expected.buildId,
     capabilityManifestMatches:
-      record.expectedNewIdentity.capabilityManifestSha256 === undefined ||
-      current.capabilityManifestSha256 === record.expectedNewIdentity.capabilityManifestSha256,
+      expected.capabilityManifestSha256 === undefined ||
+      current.capabilityManifestSha256 === expected.capabilityManifestSha256,
   };
 }
 

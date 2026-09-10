@@ -2,22 +2,32 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import { loadConfig } from "./config.js";
 import {
   BUILD_IDENTITY_RELATIVE_PATH,
+  CutoverCapabilityManifestDomainMismatchError,
   probeBuildReady,
+  probeTargetPackage,
   type BuildReadyProbeResult,
+  type TargetPackageIdentity,
 } from "./cutover-build-ready.js";
 import {
+  CUTOVER_BINDING_REPAIR_REASON,
+  CUTOVER_BINDING_REPAIR_SCHEMA,
   CutoverStateError,
   CutoverStateStore,
+  effectiveExpectedIdentity,
   type BuildReadyReceipt,
+  type CutoverBindingRepairReceipt,
   type CutoverDrainEvidence,
+  type CutoverReconciliationReceipt,
   type CutoverServerIdentity,
   type DurableCutoverRecord,
   type DurableReconciliationWitness,
   type ExpectedCutoverIdentity,
 } from "./cutover-state.js";
+import { CAPABILITY_MANIFEST_SCHEMA } from "./capability-manifest.js";
 
 import { recoverCutoverWithStore } from "./mcp-cutover.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -85,6 +95,12 @@ export interface NativeObservedReplacementResult {
 
 export class NativeObservedReplacementCommittedError extends CutoverStateError {
   constructor(readonly committedRecord: DurableCutoverRecord, message: string) {
+    super(message);
+  }
+}
+
+export class NativeBindingRepairOutcomeUnknownError extends CutoverStateError {
+  constructor(readonly cutoverId: string, message: string) {
     super(message);
   }
 }
@@ -367,6 +383,407 @@ export async function performNativeObservedReplacementRecovery(
   }
 }
 
+export interface NativeCrossDomainBindingRepairOptions {
+  serverUrl: URL | string;
+  publicBaseUrl?: URL | string;
+  stateDir: string;
+  cutoverId: string;
+  workspaceId: string;
+  agentId: string;
+  ownerToken: string;
+  requesterIdentity: CutoverServerIdentity;
+  packageRoot?: string;
+  fetch?: typeof globalThis.fetch;
+}
+
+export interface NativeCrossDomainBindingRepairResult {
+  cutover: DurableCutoverRecord;
+  newlyRecovered: boolean;
+  serverInstanceId: string;
+  bindingRepair: CutoverBindingRepairReceipt;
+  witness: DurableReconciliationWitness;
+  mode: "normal";
+}
+
+async function validateClosedBindingRepair(
+  store: CutoverStateStore,
+  client: Client,
+  options: NativeCrossDomainBindingRepairOptions,
+  record: DurableCutoverRecord,
+  serverInstanceId: string,
+  sourceCommit: string,
+  buildId: string,
+  capabilityManifestSha256: string,
+  repairReceipt: CutoverBindingRepairReceipt,
+): Promise<DurableCutoverRecord> {
+  const durable = store.get();
+  if (!durable || durable.cutoverId !== options.cutoverId || durable.phase !== "closed" || !durable.bindingRepair || !isDeepStrictEqual(durable.bindingRepair, repairReceipt) || durable.reconciliationReceipt?.witnessWorkspaceId !== options.workspaceId || durable.reconciliationReceipt?.witnessAgentId !== options.agentId || durable.expectedNewIdentity.capabilityManifestSha256 !== record.expectedNewIdentity.capabilityManifestSha256) {
+    throw new NativeObservedReplacementCommittedError(record, "Binding repair committed but durable closed readback did not match the exact receipt and witness pair; reconcile before retry.");
+  }
+  const result = structuredResult(await client.callTool({ name: "cutover_status", arguments: {} }), "cutover_status post-close");
+  const status = requiredRecordField(result, "status", "cutover_status post-close");
+  const cutover = requiredRecordField(status, "cutover", "cutover_status post-close");
+  const current = requiredRecordField(status, "currentServerIdentity", "cutover_status post-close");
+  const expected = requiredRecordField(cutover, "expectedNewIdentity", "cutover_status post-close");
+  if (requiredStringField(cutover, "cutoverId", "cutover_status post-close") !== options.cutoverId || cutover.phase !== "closed" || requiredStringField(current, "serverInstanceId", "cutover_status post-close") !== serverInstanceId || requiredStringField(current, "sourceCommit", "cutover_status post-close") !== sourceCommit || requiredStringField(current, "buildId", "cutover_status post-close") !== buildId || requiredStringField(current, "capabilityManifestSha256", "cutover_status post-close") !== capabilityManifestSha256 || requiredStringField(expected, "sourceCommit", "cutover_status post-close") !== record.expectedNewIdentity.sourceCommit || requiredStringField(expected, "buildId", "cutover_status post-close") !== record.expectedNewIdentity.buildId || requiredStringField(expected, "capabilityManifestSha256", "cutover_status post-close") !== record.expectedNewIdentity.capabilityManifestSha256) {
+    throw new NativeObservedReplacementCommittedError(record, "Binding repair committed but fresh native closed status did not match the exact authenticated identity; reconcile before retry.");
+  }
+  return durable;
+}
+
+export async function performNativeCrossDomainBindingRepair(
+  options: NativeCrossDomainBindingRepairOptions,
+): Promise<NativeCrossDomainBindingRepairResult> {
+  if (options.ownerToken.length === 0) throw new CutoverStateError("OAuth owner token is not configured.");
+  const serverUrl = typeof options.serverUrl === "string" ? new URL(options.serverUrl) : options.serverUrl;
+  const publicBaseUrl = options.publicBaseUrl
+    ? (typeof options.publicBaseUrl === "string" ? new URL(options.publicBaseUrl) : options.publicBaseUrl)
+    : serverUrl;
+  const loopback = ["127.0.0.1", "localhost", "::1"].includes(serverUrl.hostname);
+  if (serverUrl.origin !== publicBaseUrl.origin && !loopback) {
+    throw new CutoverStateError("Native MCP endpoint must be the configured public origin or a loopback endpoint.");
+  }
+  const fetchFn = options.fetch ?? globalThis.fetch;
+  const oauth = await authorizeNativeClient(serverUrl, publicBaseUrl, options.ownerToken, fetchFn);
+  const transport = new StreamableHTTPClientTransport(serverUrl, {
+    requestInit: { headers: { Authorization: `Bearer ${oauth.tokens.access_token}` } },
+    fetch: fetchFn,
+  });
+  const client = new Client({ name: "devspace-native-binding-repair", version: "1.0.0" });
+  let operationError: unknown;
+  let committedRecord: DurableCutoverRecord | undefined;
+  let repairReceiptForReconciliation: CutoverBindingRepairReceipt | undefined;
+  let committedReadbackError: string | undefined;
+  let writeAttempted = false;
+  try {
+    await client.connect(transport);
+
+    const healthUrl = new URL("/healthz", serverUrl);
+    const healthRes = await fetchFn(healthUrl);
+    if (!healthRes.ok) {
+      throw new CutoverStateError(`Live server /healthz responded with ${healthRes.status}.`);
+    }
+    const health = (await healthRes.json()) as JsonRecord;
+    const capabilityManifest = health.capabilityManifest as JsonRecord | undefined;
+    if (
+      !capabilityManifest ||
+      capabilityManifest.schema !== CAPABILITY_MANIFEST_SCHEMA ||
+      !Array.isArray(capabilityManifest.capabilities) ||
+      !Array.isArray(capabilityManifest.missing) ||
+      capabilityManifest.missing.length > 0 ||
+      typeof capabilityManifest.manifestSha256 !== "string"
+    ) {
+      throw new CutoverStateError("Current server capability manifest is malformed or missing required capabilities.");
+    }
+
+    const statusResult = structuredResult(await client.callTool({ name: "cutover_status", arguments: {} }), "cutover_status");
+    const status = requiredRecordField(statusResult, "status", "cutover_status");
+    const current = requiredRecordField(status, "currentServerIdentity", "cutover_status");
+    const cutover = requiredRecordField(status, "cutover", "cutover_status");
+    if (requiredStringField(cutover, "cutoverId", "cutover_status") !== options.cutoverId) {
+      throw new CutoverStateError("Live cutover id does not match the requested cutover.");
+    }
+    const serverInstanceId = requiredStringField(current, "serverInstanceId", "cutover_status");
+    const sourceCommit = requiredStringField(current, "sourceCommit", "cutover_status");
+    const buildId = requiredStringField(current, "buildId", "cutover_status");
+    const capabilityManifestSha256 = requiredStringField(current, "capabilityManifestSha256", "cutover_status");
+    if (capabilityManifestSha256 !== capabilityManifest.manifestSha256) {
+      throw new CutoverStateError("Live server capability manifest digest does not match current identity.");
+    }
+
+    const store = new CutoverStateStore(options.stateDir);
+    const before = store.get();
+    if (!before || before.cutoverId !== options.cutoverId) {
+      throw new CutoverStateError("Local durable cutover record does not match live cutover.");
+    }
+    if (typeof before.supersedesCutoverId !== "string" || before.supersedesCutoverId.length === 0 || before.supersedesCutoverId === before.cutoverId) {
+      throw new CutoverStateError("Binding repair requires an established successor cutover record.");
+    }
+    if (before.phase !== "drained" && before.phase !== "closed") {
+      throw new CutoverStateError(`Binding repair requires phase == drained; got ${before.phase}.`);
+    }
+    if (!before.restartRequest || !before.restartRequest.restartScheduledAt) {
+      throw new CutoverStateError("Binding repair requires an existing durably scheduled restart.");
+    }
+    if (serverInstanceId === before.oldServerIdentity.serverInstanceId) {
+      throw new CutoverStateError("Same old server instance is still running; refusing binding repair.");
+    }
+    if (serverInstanceId === before.restartRequest.requestedByServerInstanceId) {
+      throw new CutoverStateError("Current server instance is the restart-scheduling server; restart not effected.");
+    }
+    if (sourceCommit !== before.expectedNewIdentity.sourceCommit) {
+      throw new CutoverStateError(`Live sourceCommit ${sourceCommit} does not match expected target ${before.expectedNewIdentity.sourceCommit}.`);
+    }
+    if (buildId !== before.expectedNewIdentity.buildId) {
+      throw new CutoverStateError(`Live buildId ${buildId} does not match expected target ${before.expectedNewIdentity.buildId}.`);
+    }
+    if (before.expectedNewIdentity.capabilityManifestSha256 === capabilityManifestSha256) {
+      throw new CutoverStateError("Cutover expected target already matches expected; binding repair is not needed.");
+    }
+
+    const targetRoot = options.packageRoot ?? resolve(dirname(fileURLToPath(import.meta.url)), "..");
+    let targetPackage: TargetPackageIdentity;
+    try {
+      targetPackage = probeTargetPackage(targetRoot);
+    } catch (error) {
+      throw new CutoverStateError(`Target package cannot be physically probed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+    if (!targetPackage.buildManifestSha256) {
+      throw new CutoverStateError("Target build manifest identity unavailable.");
+    }
+    if (
+      targetPackage.sourceCommit !== before.expectedNewIdentity.sourceCommit ||
+      targetPackage.buildId !== before.expectedNewIdentity.buildId
+    ) {
+      throw new CutoverStateError("Target package identity does not match expected cutover target.");
+    }
+    if (targetPackage.buildManifestSha256 !== before.expectedNewIdentity.capabilityManifestSha256) {
+      throw new CutoverStateError(
+        `Cryptographic attribution failed: expected capability manifest digest ${before.expectedNewIdentity.capabilityManifestSha256} does not equal target build_manifest_sha256 ${targetPackage.buildManifestSha256}. [NOT_A_CROSS_DOMAIN_MISBINDING]`,
+      );
+    }
+
+    if (before.phase === "closed") {
+      if (!before.bindingRepair) {
+        throw new CutoverStateError("Closed cutover is missing binding repair receipt.");
+      }
+      if (
+        before.bindingRepair.correctCapabilityManifestSha256 !== capabilityManifestSha256 ||
+        before.bindingRepair.observedServerInstanceId !== serverInstanceId ||
+        before.bindingRepair.sourceCommit !== sourceCommit ||
+        before.bindingRepair.buildId !== buildId
+      ) {
+        throw new CutoverStateError("[REPAIR_BINDING_MISMATCH] Closed replay identity does not match authenticated replacement.");
+      }
+      const receipt = before.reconciliationReceipt;
+      if (!receipt || receipt.witnessWorkspaceId !== options.workspaceId || receipt.witnessAgentId !== options.agentId) {
+        throw new CutoverStateError("[REPAIR_BINDING_MISMATCH] Closed replay pair does not match stored reconciliation receipt.");
+      }
+      committedRecord = before;
+      await validateClosedBindingRepair(store, client, options, before, serverInstanceId, sourceCommit, buildId, capabilityManifestSha256, before.bindingRepair);
+      return {
+        cutover: before,
+        newlyRecovered: false,
+        serverInstanceId,
+        bindingRepair: before.bindingRepair,
+        witness: {
+          workspaceQueryable: receipt.workspaceQueryable,
+          agentQueryable: receipt.agentQueryable,
+          agentReconciled: receipt.agentReconciled,
+          witnessCutoverId: options.cutoverId,
+          witnessServerInstanceId: serverInstanceId,
+          witnessExpectedIdentity: effectiveExpectedIdentity(before),
+          witnessWorkspaceId: receipt.witnessWorkspaceId,
+          witnessAgentId: receipt.witnessAgentId,
+          witnessWorkspaceSessions: receipt.witnessWorkspaceSessions,
+          witnessAgentSessions: receipt.witnessAgentSessions,
+          witnessKind: receipt.witnessKind,
+        },
+        mode: "normal",
+      };
+    }
+
+    const workspace = structuredResult(await client.callTool({ name: "workspace_inspect", arguments: { workspaceId: options.workspaceId } }), "workspace_inspect");
+    const agentStatus = structuredResult(await client.callTool({ name: "agent_status", arguments: { workspaceId: options.workspaceId, agentId: options.agentId } }), "agent_status");
+    const agent = structuredResult(await client.callTool({ name: "agent_reconcile", arguments: { workspaceId: options.workspaceId, agentId: options.agentId } }), "agent_reconcile");
+    const workspaceSessions = typeof workspace.workspaceSessions === "number" ? workspace.workspaceSessions : 0;
+    const details = Array.isArray(workspace.detail) ? workspace.detail : [];
+    const matchingWorkspace = details.some((entry) => {
+      if (!entry || typeof entry !== "object") return false;
+      const item = entry as JsonRecord;
+      const session = item.session;
+      return (
+        item.unit === `workspace:${options.workspaceId}` &&
+        !!session &&
+        typeof session === "object" &&
+        (session as JsonRecord).id === options.workspaceId &&
+        typeof (session as JsonRecord).root === "string"
+      );
+    });
+    const selectedSession = details.find(
+      (entry) => entry && typeof entry === "object" && (entry as JsonRecord).unit === `workspace:${options.workspaceId}`,
+    ) as JsonRecord | undefined;
+    const selectedRoot = selectedSession && (selectedSession.session as JsonRecord | undefined)?.root;
+    if (workspaceSessions < 1 || !matchingWorkspace || typeof selectedRoot !== "string") {
+      throw new CutoverStateError("workspace_inspect did not prove the requested durable workspace identity and root.");
+    }
+    if (
+      requiredStringField(agent, "agentId", "agent_reconcile") !== options.agentId ||
+      requiredStringField(agentStatus, "agentId", "agent_status") !== options.agentId ||
+      requiredStringField(agentStatus, "workspaceId", "agent_status") !== options.workspaceId ||
+      requiredStringField(agentStatus, "workspaceRoot", "agent_status") !== selectedRoot
+    ) {
+      throw new CutoverStateError("Live agent identity or workspace binding drifted during reconciliation.");
+    }
+    const agentReconciled = Boolean(agent.agentReconciled ?? true);
+    if (!agentReconciled) {
+      throw new CutoverStateError("Agent reconciliation failed.");
+    }
+
+    const nowIso = new Date().toISOString();
+    const proposedRepair: CutoverBindingRepairReceipt = {
+      schema: CUTOVER_BINDING_REPAIR_SCHEMA,
+      cutoverId: options.cutoverId,
+      reason: CUTOVER_BINDING_REPAIR_REASON,
+      repairControlSurfaceIdentity: options.requesterIdentity,
+      observedTargetRuntimeIdentity: {
+        serverInstanceId,
+        sourceCommit,
+        buildId,
+        capabilityManifestSha256,
+      },
+      originalCutoverExpectedIdentity: before.expectedNewIdentity,
+      effectiveRepairedIdentity: {
+        sourceCommit,
+        buildId,
+        capabilityManifestSha256,
+      },
+      originalBoundDigest: before.expectedNewIdentity.capabilityManifestSha256!,
+      originalDigestField: "expectedNewIdentity.capabilityManifestSha256",
+      provenActualDigestDomain: "build_manifest_sha256",
+      correctCapabilityManifestSchema: CAPABILITY_MANIFEST_SCHEMA,
+      correctCapabilityManifestSha256: capabilityManifestSha256,
+      sourceCommit,
+      buildId,
+      observedServerInstanceId: serverInstanceId,
+      repairedBy: options.requesterIdentity.serverInstanceId,
+      repairedAt: nowIso,
+      physicalProbeEvidence: `Target package at ${targetRoot} verified: build_manifest_sha256=${targetPackage.buildManifestSha256} equals expectedNewIdentity.capabilityManifestSha256.`,
+    };
+    const repairReceipt = before.bindingRepair ?? proposedRepair;
+    repairReceiptForReconciliation = repairReceipt;
+    if (before.bindingRepair && (
+      before.bindingRepair.cutoverId !== options.cutoverId ||
+      before.bindingRepair.correctCapabilityManifestSha256 !== capabilityManifestSha256 ||
+      before.bindingRepair.observedServerInstanceId !== serverInstanceId ||
+      before.bindingRepair.sourceCommit !== sourceCommit ||
+      before.bindingRepair.buildId !== buildId ||
+      before.bindingRepair.originalCutoverExpectedIdentity.capabilityManifestSha256 !== before.expectedNewIdentity.capabilityManifestSha256
+    )) {
+      throw new CutoverStateError("[REPAIR_BINDING_MISMATCH] Existing durable binding repair does not match authenticated replacement.");
+    }
+
+    // Fresh binding validation before durable write (G71-R6)
+    const latest = store.get();
+    if (!latest || latest.cutoverId !== before.cutoverId) {
+      throw new CutoverStateError("Concurrent modification detected: active cutover changed during repair evaluation.");
+    }
+    if (latest.supersedesCutoverId !== before.supersedesCutoverId) {
+      throw new CutoverStateError("Concurrent modification detected: successor predecessor binding changed during repair evaluation.");
+    }
+    if (latest.phase !== "drained") {
+      throw new CutoverStateError(`Concurrent modification detected: cutover phase transitioned to ${latest.phase}.`);
+    }
+    if (latest.updatedAt !== before.updatedAt) {
+      throw new CutoverStateError("Concurrent modification detected: cutover was updated during repair evaluation.");
+    }
+    if (latest.expectedNewIdentity.capabilityManifestSha256 !== before.expectedNewIdentity.capabilityManifestSha256) {
+      throw new CutoverStateError("Concurrent modification detected: expectedNewIdentity changed during repair evaluation.");
+    }
+    if (latest.bindingRepair && !isDeepStrictEqual(latest.bindingRepair, repairReceipt)) {
+      throw new CutoverStateError("Concurrent modification detected: conflicting bindingRepair already recorded.");
+    }
+
+    writeAttempted = true;
+    const repaired = store.recordBindingRepair(options.cutoverId, repairReceipt);
+    committedRecord = repaired.record;
+
+    const witness: DurableReconciliationWitness = {
+      witnessCutoverId: options.cutoverId,
+      witnessServerInstanceId: serverInstanceId,
+      witnessExpectedIdentity: { sourceCommit, buildId, capabilityManifestSha256 },
+      workspaceQueryable: true,
+      agentQueryable: true,
+      agentReconciled: true,
+      witnessWorkspaceId: options.workspaceId,
+      witnessAgentId: options.agentId,
+      workspaceSessions,
+      agentSessions: 1,
+      witnessWorkspaceSessions: workspaceSessions,
+      witnessAgentSessions: 1,
+      witnessKind: "exact-pair",
+      detail: [{ unit: "native-mcp", ok: true, detail: "cross-domain digest misbinding repaired and reconciled" }],
+    };
+    const reconciliationReceipt: CutoverReconciliationReceipt = {
+      closedByServerInstanceId: serverInstanceId,
+      ...witness,
+      reconciledAt: nowIso,
+      terminalReason: undefined,
+    };
+    const closed = store.close(options.cutoverId, reconciliationReceipt);
+    committedRecord = closed;
+    await validateClosedBindingRepair(store, client, options, closed, serverInstanceId, sourceCommit, buildId, capabilityManifestSha256, repairReceipt);
+    return {
+      cutover: closed,
+      newlyRecovered: true,
+      serverInstanceId,
+      bindingRepair: repairReceipt,
+      witness,
+      mode: "normal",
+    };
+  } catch (error) {
+    if (!committedRecord && writeAttempted && repairReceiptForReconciliation) {
+      try {
+        const reconciled = new CutoverStateStore(options.stateDir).get();
+        if (reconciled?.bindingRepair && isDeepStrictEqual(reconciled.bindingRepair, repairReceiptForReconciliation)) {
+          committedRecord = reconciled;
+        }
+      } catch (readbackError) {
+        operationError = new NativeBindingRepairOutcomeUnknownError(
+          options.cutoverId,
+          `Binding repair outcome unknown; reconcile before retry: durable readback failed: ${readbackError instanceof Error ? readbackError.message : String(readbackError)}`,
+        );
+        throw operationError;
+      }
+    } else if (committedRecord) {
+      try {
+        const reconciled = new CutoverStateStore(options.stateDir).get();
+        if (reconciled?.cutoverId === options.cutoverId && reconciled.phase === "closed") committedRecord = reconciled;
+      } catch (readbackError) {
+        committedReadbackError = `durable readback failed: ${readbackError instanceof Error ? readbackError.message : String(readbackError)}`;
+      }
+    }
+    if (committedRecord && !(error instanceof NativeObservedReplacementCommittedError)) {
+      operationError = new NativeObservedReplacementCommittedError(
+        committedRecord,
+        `Binding repair committed partially; reconcile before retry: ${error instanceof Error ? error.message : String(error)}${committedReadbackError ? `; ${committedReadbackError}` : ""}`,
+      );
+      throw operationError;
+    }
+    operationError = error;
+    throw error;
+  } finally {
+    await client.close().catch(() => undefined);
+    const revocationErrors: string[] = [];
+    for (const [kind, token] of [["access", oauth.tokens.access_token], ["refresh", oauth.tokens.refresh_token]] as const) {
+      if (!token) continue;
+      try {
+        const response = await fetchFn(oauth.revocationEndpoint, {
+          method: "POST",
+          redirect: "manual",
+          headers: { "content-type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ token, token_type_hint: `${kind}_token`, client_id: oauth.clientId }),
+        });
+        if (!response.ok || response.status >= 300) revocationErrors.push(`${kind}:HTTP ${response.status}`);
+      } catch (error) {
+        revocationErrors.push(`${kind}:${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    if (revocationErrors.length > 0 && operationError instanceof Error) {
+      Object.defineProperty(operationError, "cleanupErrors", { value: revocationErrors, enumerable: true, configurable: true });
+    }
+    if (revocationErrors.length > 0 && !operationError) {
+      if (committedRecord) {
+        throw new NativeObservedReplacementCommittedError(
+          committedRecord,
+          `Binding repair committed but OAuth token revocation failed; reconcile before retry: ${revocationErrors.join(",")}.`,
+        );
+      }
+      throw new CutoverStateError(`OAuth token revocation failed: ${revocationErrors.join(",")}.`);
+    }
+  }
+}
+
 /** Perform terminal supersession + successor drain/restart scheduling durably. */
 export function performCutoverRecovery(
   dependencies: CutoverRecoveryDependencies,
@@ -387,7 +804,17 @@ export function performCutoverRecovery(
   if (dependencies.buildReadyProbe) {
     const probe = dependencies.buildReadyProbe(expectedNewIdentity);
     if (!probe.buildReady) {
+      if (probe.domainMismatch) {
+        throw new CutoverCapabilityManifestDomainMismatchError(probe.detail);
+      }
       throw new CutoverStateError(`[CUTOVER_BUILD_NOT_READY] ${probe.detail}`);
+    }
+    if (
+      probe.actualBuildManifestSha256 !== undefined &&
+      expectedNewIdentity.capabilityManifestSha256 !== undefined &&
+      probe.actualBuildManifestSha256 === expectedNewIdentity.capabilityManifestSha256
+    ) {
+      throw new CutoverCapabilityManifestDomainMismatchError();
     }
     buildReadyReceipt = { verifiedBy: probe.verifiedBy, evidence: probe.detail };
   } else if (dependencies.buildReadyAttestation) {
