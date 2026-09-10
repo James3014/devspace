@@ -27,9 +27,7 @@ function initGitRepo(dir: string): string {
 }
 
 function cleanupDir(dir: string): void {
-  try {
-    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
-  } catch {}
+  rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 }
 
 function makeFakePython(root: string): string {

@@ -207,7 +207,7 @@ test("write-denied destination rejects late apply failure without changing track
           windowsAclApplied = false;
         }
       } else {
-        chmodSync(destination, 0o755);
+      chmodSync(destination, 0o755);
       }
 
       // Destination bytes/state remain unchanged.
@@ -221,9 +221,7 @@ test("write-denied destination rejects late apply failure without changing track
           windowsAclApplied = false;
         }
       } else {
-        try {
-          chmodSync(destination, 0o755);
-        } catch {}
+        chmodSync(destination, 0o755);
       }
     }
   } finally {

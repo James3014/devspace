@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { spawn } from "node:child_process";
+import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
 import { readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -8,6 +8,8 @@ import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import type { ServerConfig } from "./config.js";
 import { assertAllowedPath, canonicalizePath, isPathInsideRoot } from "./roots.js";
 import { EXECUTION_PROTOCOL_VERSION, type ExecutionAuthorityMode } from "./execution-protocol.js";
+
+const spawn = createRequire(import.meta.url)("cross-spawn") as typeof import("node:child_process").spawn;
 
 export type DurableOperationKind = "workspace_clone" | "dependency_sync" | "nexus_gateway_recover";
 export type DurableOperationStatus = "started" | "succeeded" | "failed" | "outcome_unknown";
@@ -833,10 +835,10 @@ function recipeFrozenInputs(recipe: DependencySyncRecipe): string[] {
 
 function dependencyCommand(recipe: DependencySyncRecipe): { command: string; args: string[] } {
   if (recipe === "npm_ci") {
-    return { command: "npm", args: ["ci", "--ignore-scripts", "--no-audit", "--no-fund"] };
+    return { command: process.platform === "win32" ? "npm.cmd" : "npm", args: ["ci", "--ignore-scripts", "--no-audit", "--no-fund"] };
   }
   if (recipe === "pnpm_frozen") {
-    return { command: "pnpm", args: ["install", "--frozen-lockfile", "--ignore-scripts"] };
+    return { command: process.platform === "win32" ? "pnpm.cmd" : "pnpm", args: ["install", "--frozen-lockfile", "--ignore-scripts"] };
   }
   if (recipe === "uv_frozen") {
     return { command: "uv", args: ["sync", "--frozen"] };
@@ -1288,7 +1290,7 @@ async function spawnCommand(
       cwd,
       stdio: ["ignore", "pipe", "pipe"],
       env: process.env,
-      shell: process.platform === "win32",
+      shell: false,
     });
     let stdout = "";
     let stderr = "";

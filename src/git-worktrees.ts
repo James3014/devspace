@@ -41,16 +41,14 @@ async function withRepoWorktreeLock<T>(sourceRoot: string, fn: () => Promise<T>)
   const newLock = new Promise<void>((resolve) => {
     releaseLock = resolve;
   });
-  repoWorktreeLocks.set(
-    sourceRoot,
-    currentLock.then(() => newLock).catch(() => newLock),
-  );
+  const tail = currentLock.then(() => newLock, () => newLock);
+  repoWorktreeLocks.set(sourceRoot, tail);
   try {
     await currentLock;
     return await fn();
   } finally {
     releaseLock!();
-    if (repoWorktreeLocks.get(sourceRoot) === newLock) {
+    if (repoWorktreeLocks.get(sourceRoot) === tail) {
       repoWorktreeLocks.delete(sourceRoot);
     }
   }

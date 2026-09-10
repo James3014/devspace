@@ -1,4 +1,4 @@
-import { execFile, execFileSync, spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { promisify } from "node:util";
 
 export const REPOSITORY_INTELLIGENCE_TOOL_NAMES = [
@@ -139,7 +139,7 @@ export async function runRepositoryIntelligenceOperation(
       ["-m", "repository_intelligence.cli", "--operation", operation, "--input", "-"],
       {
         cwd: config.root,
-        shell: process.platform === "win32" && /\.(cmd|bat)$/i.test(pythonBin),
+        shell: false,
         stdio: ["pipe", "pipe", "pipe"],
         env: { ...process.env, PYTHONDONTWRITEBYTECODE: "1" },
       },
@@ -155,13 +155,7 @@ export async function runRepositoryIntelligenceOperation(
       settled = true;
       clearTimeout(timer);
       if (!child.killed) {
-        if (process.platform === "win32" && child.pid) {
-          try {
-            execFileSync("taskkill", ["/F", "/T", "/PID", String(child.pid)], { stdio: "ignore" });
-          } catch {}
-        } else {
-          child.kill("SIGKILL");
-        }
+        child.kill("SIGKILL");
       }
       reject(error);
     };
