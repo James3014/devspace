@@ -1229,3 +1229,17 @@ test("malformed persisted coordination binding fails closed without rewriting ev
     assert.equal(readFileSync(path,"utf8"),raw);
   } finally {rmSync(root,{recursive:true,force:true});}
 });
+
+
+test("a later closed event cannot hide an earlier coordination binding change", () => {
+  const root=mkdtempSync(join(tmpdir(),"devspace-cutover-history-binding-"));
+  try {
+    let now=1000;const store=new CutoverStateStore(root,{now:()=>now++});
+    const record=store.begin({oldServerIdentity:oldIdentity,expectedNewIdentity:{sourceCommit:"next",buildId:"next"},coordinationBinding});
+    store.recordDrain(record.cutoverId,{activeSessions:0,oldestAgeMs:0});
+    store.close(record.cutoverId,{closedByServerInstanceId:"next",workspaceQueryable:true,agentQueryable:true,agentReconciled:true,reconciledAt:new Date().toISOString()});
+    const active=join(root,"cutover","active");const event=join(active,readdirSync(active).find(n=>n.startsWith("drained-"))!);
+    const value=JSON.parse(readFileSync(event,"utf8"));value.coordinationBinding.ownerThread="foreign";writeFileSync(event,JSON.stringify(value));
+    assert.throws(()=>new CutoverStateStore(root).get(),/coordination binding/i);
+  } finally {rmSync(root,{recursive:true,force:true});}
+});

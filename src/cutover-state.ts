@@ -290,6 +290,14 @@ export class CutoverStateStore {
 
     const successorCreatedPath = join(this.activeDir, SUCCESSOR_CREATED_FILE);
     const successorCreatedRaw = readOptionalFile(successorCreatedPath);
+    const successorGeneration = successorCreatedRaw === undefined ? undefined : parseRecord(successorCreatedRaw);
+    for (const event of events) {
+      const match = /^(successor-)?(?:prepared|drained|closed|superseded)-/.exec(event);
+      if (!match) continue; // Restart and repair markers have separate schemas.
+      const origin = match[1] ? successorGeneration : generation;
+      if (!origin) throw new CutoverStateError("Cutover coordination binding has no generation creation record.");
+      assertSameCoordinationBinding(origin, parseRecord(readFileSync(join(this.activeDir, event), "utf8")));
+    }
     if (successorCreatedRaw !== undefined) {
       const successorCreated = parseRecord(successorCreatedRaw);
       generation = successorCreated;
@@ -1003,7 +1011,7 @@ function validatedCoordinationBinding(value: unknown): Readonly<CutoverCoordinat
 }
 
 function assertSameCoordinationBinding(created: DurableCutoverRecord, event: DurableCutoverRecord): void {
-  if (!isDeepStrictEqual(created.coordinationBinding, event.coordinationBinding)) {
+  if (created.cutoverId !== event.cutoverId || !isDeepStrictEqual(created.coordinationBinding, event.coordinationBinding)) {
     throw new CutoverStateError("Cutover coordination binding changed within its generation.");
   }
 }
