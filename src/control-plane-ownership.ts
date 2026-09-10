@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { posix, resolve, isAbsolute } from "node:path";
+import { posix, win32, resolve, isAbsolute } from "node:path";
 import { realpathSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import type Database from "better-sqlite3";
@@ -195,7 +195,7 @@ function normalizeScope(scope: readonly string[]): string[] {
   if (!Array.isArray(scope) || scope.length === 0 || scope.length > 512) throw new ControlPlaneOwnershipError("INVALID_INPUT", "scope must be non-empty and bounded");
   const result = [...new Set(scope.map((raw) => {
     bounded(raw, "scope path");
-    if (!raw.startsWith("/") || raw.includes("\0") || raw.split("/").some((part: string) => part === "." || part === "..")) throw new ControlPlaneOwnershipError("INVALID_INPUT", "scope must contain verified absolute realpaths");
+    if ((!posix.isAbsolute(raw) && !win32.isAbsolute(raw)) || raw.includes("\0") || raw.split("/").some((part: string) => part === "." || part === "..")) throw new ControlPlaneOwnershipError("INVALID_INPUT", "scope must contain verified absolute realpaths");
     const normalized = posix.normalize(raw);
     if (normalized === "/.." || normalized.startsWith("/../")) throw new ControlPlaneOwnershipError("INVALID_INPUT", "scope path escapes its root");
     return normalized;
