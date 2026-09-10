@@ -88,6 +88,98 @@ interface ManagedProcess {
   resize?(columns: number, rows: number): void;
 }
 
+export interface PtyShellInvocation {
+  executable: string;
+  args: string[] | string;
+}
+
+interface WindowsPtyCleanupAgent {
+  _conoutSocketWorker?: { dispose(): void };
+  _inSocket?: { destroy(): void };
+}
+
+interface WindowsPtyCleanupTarget {
+  _agent?: WindowsPtyCleanupAgent;
+}
+
+const cleanedWindowsPtys = new WeakSet<object>();
+const windowsPtyTermination = new WeakMap<object, { status: "inflight" | "succeeded" | "failed"; error?: unknown }>();
+
+// node-pty 1.1.0's normal Windows exit path omits these two owned resources;
+// post-exit kill is unsafe because its PID lookup can race PID reuse. Keep
+// this compatibility seam pinned and release only the exact PTY resources.
+export function disposeWindowsPtyResources(
+  pty: unknown,
+  platform: NodeJS.Platform = process.platform,
+): void {
+  if (platform !== "win32") return;
+  if (typeof pty !== "object" || pty === null) {
+    throw new Error("Unsupported node-pty Windows resource layout.");
+  }
+  if (cleanedWindowsPtys.has(pty)) return;
+  const agent = (pty as WindowsPtyCleanupTarget)._agent;
+  const worker = agent?._conoutSocketWorker;
+  const input = agent?._inSocket;
+  if (!agent || typeof worker?.dispose !== "function" || typeof input?.destroy !== "function") {
+    throw new Error("Unsupported node-pty Windows resource layout.");
+  }
+  let cleanupError: unknown;
+  try {
+    worker.dispose();
+  } catch (error) {
+    cleanupError = error;
+  }
+  try {
+    input.destroy();
+  } catch (error) {
+    cleanupError ??= error;
+  }
+  if (cleanupError) throw cleanupError;
+  cleanedWindowsPtys.add(pty);
+}
+
+export function resolvePtyShellInvocation(
+  command: string,
+  platform: NodeJS.Platform = process.platform,
+  environment: NodeJS.ProcessEnv = process.env,
+): PtyShellInvocation {
+  const shell = resolveShellCommand(command, platform, environment);
+  if (platform === "win32") {
+    // node-pty applies CRT quoting to every argv entry on Windows. Its raw
+    // command-line form preserves cmd's original quoting for the /c payload.
+    return {
+      executable: shell.executable,
+      args: `/d /s /c "${command}"`,
+    };
+  }
+  return shell;
+}
+
+export function killPtyProcess(
+  pty: { kill(signal?: string): void },
+  signal?: NodeJS.Signals,
+  platform: NodeJS.Platform = process.platform,
+): void {
+  if (platform === "win32") {
+    const target = pty as object;
+    const prior = windowsPtyTermination.get(target);
+    if (prior) {
+      if (prior.status === "failed") throw prior.error;
+      return;
+    }
+    windowsPtyTermination.set(target, { status: "inflight" });
+    try {
+      pty.kill();
+      windowsPtyTermination.set(target, { status: "succeeded" });
+    } catch (error) {
+      windowsPtyTermination.set(target, { status: "failed", error });
+      throw error;
+    }
+    return;
+  }
+  pty.kill(signal);
+}
+
 interface ProcessSession {
   id: number;
   attemptKey?: string;
@@ -145,6 +237,58 @@ const SANITIZED_ENVIRONMENT_ALLOWLIST = new Set([
   "TMPDIR",
   "CODEX_HOME",
 ]);
+const WINDOWS_SANITIZED_ENVIRONMENT_ALLOWLIST = new Set(["SYSTEMROOT"]);
+
+export function isSanitizedEnvironmentKey(
+  key: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  const normalizedKey = platform === "win32" ? key.toUpperCase() : key;
+  return SANITIZED_ENVIRONMENT_ALLOWLIST.has(normalizedKey) ||
+    (platform === "win32" && WINDOWS_SANITIZED_ENVIRONMENT_ALLOWLIST.has(normalizedKey)) ||
+    normalizedKey.startsWith("LC_") ||
+    normalizedKey.startsWith("XDG_");
+}
+
+export function selectSanitizedEnvironment(
+  source: Record<string, string>,
+  platform: NodeJS.Platform = process.platform,
+): Record<string, string> {
+  const selected = new Map<string, [string, string]>();
+  for (const [key, value] of Object.entries(source)) {
+    if (!isSanitizedEnvironmentKey(key, platform)) continue;
+    const identity = platform === "win32" ? key.toUpperCase() : key;
+    const existing = selected.get(identity);
+    if (!existing || (platform === "win32" && key === identity && existing[0] !== identity)) {
+      selected.set(identity, [key, value]);
+    }
+  }
+  return Object.fromEntries(selected.values());
+}
+
+function environmentValue(
+  source: Record<string, string>,
+  key: string,
+  platform: NodeJS.Platform,
+): string | undefined {
+  if (platform !== "win32") return source[key];
+  const normalizedKey = key.toUpperCase();
+  return source[key] ?? Object.entries(source).find(([candidate]) => candidate.toUpperCase() === normalizedKey)?.[1];
+}
+
+function setEnvironmentValue(
+  target: Record<string, string>,
+  key: string,
+  value: string,
+  platform: NodeJS.Platform,
+): void {
+  if (platform === "win32") {
+    for (const candidate of Object.keys(target)) {
+      if (candidate.toUpperCase() === key) delete target[candidate];
+    }
+  }
+  target[key] = value;
+}
 
 export function processEnvironment(
   policy: ProcessEnvironmentPolicy = "inherit",
@@ -157,28 +301,37 @@ export function processEnvironment(
     Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
   );
   const base = policy === "sanitized"
-    ? Object.fromEntries(
-        Object.entries(source).filter(
-          ([key]) =>
-            SANITIZED_ENVIRONMENT_ALLOWLIST.has(key) ||
-            key.startsWith("LC_") ||
-            key.startsWith("XDG_"),
-        ),
-      )
+    ? selectSanitizedEnvironment(source)
     : source;
 
-  return {
-    ...base,
-    ...(policy === "sanitized" ? { TERM: base.TERM ?? source.TERM ?? "xterm-256color" } : { NO_COLOR: "1", TERM: "dumb" }),
-    PAGER: "cat",
-    GIT_PAGER: "cat",
-    GH_PAGER: "cat",
-    CODEX_CI: "1",
-    LANG: source.LANG ?? "C.UTF-8",
-    LC_ALL: source.LC_ALL ?? "C.UTF-8",
-    ...(input?.workspaceId ? { DEVSPACE_WORKSPACE_ID: input.workspaceId } : {}),
-    ...(input?.workspaceRoot ? { DEVSPACE_WORKSPACE_ROOT: input.workspaceRoot } : {}),
-  };
+  if (policy !== "sanitized") {
+    return {
+      ...base,
+      NO_COLOR: "1",
+      TERM: "dumb",
+      PAGER: "cat",
+      GIT_PAGER: "cat",
+      GH_PAGER: "cat",
+      CODEX_CI: "1",
+      LANG: source.LANG ?? "C.UTF-8",
+      LC_ALL: source.LC_ALL ?? "C.UTF-8",
+      ...(input?.workspaceId ? { DEVSPACE_WORKSPACE_ID: input.workspaceId } : {}),
+      ...(input?.workspaceRoot ? { DEVSPACE_WORKSPACE_ROOT: input.workspaceRoot } : {}),
+    };
+  }
+
+  const result = { ...base };
+  const platform = process.platform;
+  setEnvironmentValue(result, "TERM", environmentValue(base, "TERM", platform) ?? environmentValue(source, "TERM", platform) ?? "xterm-256color", platform);
+  setEnvironmentValue(result, "PAGER", "cat", platform);
+  setEnvironmentValue(result, "GIT_PAGER", "cat", platform);
+  setEnvironmentValue(result, "GH_PAGER", "cat", platform);
+  setEnvironmentValue(result, "CODEX_CI", "1", platform);
+  setEnvironmentValue(result, "LANG", environmentValue(source, "LANG", platform) ?? "C.UTF-8", platform);
+  setEnvironmentValue(result, "LC_ALL", environmentValue(source, "LC_ALL", platform) ?? "C.UTF-8", platform);
+  if (input?.workspaceId) result.DEVSPACE_WORKSPACE_ID = input.workspaceId;
+  if (input?.workspaceRoot) result.DEVSPACE_WORKSPACE_ROOT = input.workspaceRoot;
+  return result;
 }
 
 function codePointLength(value: string): number {
@@ -346,7 +499,10 @@ export class ProcessSessionManager {
     }
 
     try {
-      if (normalizedInput.tty && process.platform !== "win32") await this.startPty(session, normalizedInput);
+      // A requested TTY is a contract: Windows uses node-pty/ConPTY just as
+      // POSIX uses node-pty. Falling back to pipes changes terminal rendering
+      // and interactive semantics, so an unavailable PTY must fail closed.
+      if (normalizedInput.tty) await this.startPty(session, normalizedInput);
       else this.startPipe(session, normalizedInput);
     } catch (error) {
       this.removeSession(session.id);
@@ -573,6 +729,7 @@ export class ProcessSessionManager {
       workspaceRoot: input.workspaceRoot,
     });
     let pty: import("node-pty").IPty;
+    const shell = input.executable ? undefined : resolvePtyShellInvocation(input.command);
     try {
       if (input.executable) {
         pty = nodePty.spawn(input.executable, input.args ?? [], {
@@ -583,7 +740,7 @@ export class ProcessSessionManager {
           rows: session.rows,
         });
       } else {
-        const shell = resolveShellCommand(input.command);
+        if (!shell) throw new Error("Missing PTY shell invocation.");
         pty = nodePty.spawn(shell.executable, shell.args, {
           cwd: input.cwd,
           env,
@@ -598,12 +755,13 @@ export class ProcessSessionManager {
 
     session.process = {
       write: (data) => pty.write(data),
-      kill: (signal) => pty.kill(signal),
+      kill: (signal) => killPtyProcess(pty, signal),
       resize: (columns, rows) => pty.resize(columns, rows),
     };
     pty.onData((data) => this.append(session, data));
     pty.onExit(({ exitCode, signal }) => {
       this.finish(session, exitCode, signal === 0 ? undefined : String(signal));
+      disposeWindowsPtyResources(pty);
     });
   }
 

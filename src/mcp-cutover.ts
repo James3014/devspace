@@ -5,13 +5,14 @@ import { CutoverBuildNotReadyError } from "./cutover-build-ready.js";
 import type { SelfRestartActuator } from "./cutover-restart.js";
 import type {
   BuildReadyReceipt,
+  CutoverBindingRepairReceipt,
   CutoverDrainEvidence,
   CutoverReconciliationReceipt,
   CutoverServerIdentity,
   DurableCutoverRecord,
   ExpectedCutoverIdentity,
 } from "./cutover-state.js";
-import { CutoverStateError, CutoverStateStore } from "./cutover-state.js";
+import { CutoverStateError, CutoverStateStore, effectiveExpectedIdentity } from "./cutover-state.js";
 import type { NextFunction, Request, Response } from "express";
 import type { OrchestrationOutcome } from "./cutover-orchestration.js";
 
@@ -21,6 +22,18 @@ export interface DurableReconciliationWitness {
   workspaceQueryable: boolean;
   agentQueryable: boolean;
   agentReconciled: boolean;
+  witnessWorkspaceId?: string;
+  witnessAgentId?: string;
+  workspaceSessions?: number;
+  agentSessions?: number;
+  witnessWorkspaceSessions?: number;
+  witnessAgentSessions?: number;
+  witnessKind?: string;
+  detail?: Array<{ unit: string; ok: boolean; detail?: string }>;
+  /** Optional generation binding carried only by observed-replacement recovery. */
+  witnessCutoverId?: string;
+  witnessServerInstanceId?: string;
+  witnessExpectedIdentity?: ExpectedCutoverIdentity;
 }
 
 export interface CutoverIdentityComparison {
@@ -28,6 +41,51 @@ export interface CutoverIdentityComparison {
   sourceMatches: boolean;
   buildMatches: boolean;
   capabilityManifestMatches: boolean;
+}
+
+/**
+ * Authoritative fail-closed allowlist for tools allowed to execute during
+ * cutover drain or reconcile-only modes. Any tool not in this set is strictly
+ * blocked with CUTOVER_RECONCILIATION_REQUIRED.
+ */
+export const CUTOVER_SAFE_TOOLS: ReadonlySet<string> = new Set([
+  // Core cutover control & recovery
+  "cutover_status",
+  "cutover_drain",
+  "cutover_restart_self",
+  "cutover_reconcile",
+  "cutover_finish",
+  "cutover_recover",
+  "cutover_repair_binding",
+
+  // Agent inspection & reconciliation
+  "agent_status",
+  "agent_reconcile",
+  "agent_list",
+  "agent_preflight",
+
+  // Workspace & file inspection (read-only)
+  "workspace_inspect",
+  "read",
+  "grep",
+  "glob",
+  "ls",
+  "show_changes",
+
+  // Operation & command inspection
+  "operation_status",
+  "operation_reconcile",
+  "command_status",
+  "codex_goal_status",
+
+  // Safe read/preflight inspection
+  "nexus_gateway_recovery_preflight",
+  "candidate_integration_readiness",
+  "remote_writability_probe",
+]);
+
+export function isCutoverSafeTool(toolName: string): boolean {
+  return CUTOVER_SAFE_TOOLS.has(toolName);
 }
 
 export const CONSEQUENTIAL_MCP_TOOLS = new Set([
@@ -56,7 +114,11 @@ export const CONSEQUENTIAL_MCP_TOOLS = new Set([
   "git_promote_candidate",
   "git_commit",
   "git_push",
+  "chat_swarm_create",
+  "chat_swarm_join",
+  "chat_swarm_dispatch",
 ]);
+
 
 export class CutoverBlockedError extends Error {
   readonly code = "CUTOVER_RECONCILIATION_REQUIRED";
@@ -137,6 +199,18 @@ export class McpCutoverController {
     return this.store.recordRestartScheduled(cutoverId, this.currentIdentity.serverInstanceId);
   }
 
+  recordBindingRepair(
+    cutoverId: string,
+    repair: CutoverBindingRepairReceipt,
+  ): DurableCutoverRecord {
+    const record = this.store.get();
+    if (!record) throw new CutoverStateError("No durable cutover record exists.");
+    if (record.cutoverId !== cutoverId) {
+      throw new CutoverStateError(`Cutover id mismatch: active cutover is ${record.cutoverId}.`);
+    }
+    return this.store.recordBindingRepair(cutoverId, repair).record;
+  }
+
   record(): DurableCutoverRecord | undefined {
     return this.store.get();
   }
@@ -150,18 +224,26 @@ export class McpCutoverController {
   }
 
   canInitializeTransport(): boolean {
-    return this.mode() !== "drain";
+    return true;
   }
 
   assertToolAllowed(toolName: string): void {
     const mode = this.mode();
-    if (mode === "normal" || !CONSEQUENTIAL_MCP_TOOLS.has(toolName)) return;
+    if (mode === "normal") return;
+    if (CUTOVER_SAFE_TOOLS.has(toolName)) return;
     throw new CutoverBlockedError(this.store.get()!.cutoverId, mode);
   }
 
   status(transportEvidence: CutoverDrainEvidence): Record<string, unknown> {
     const record = this.store.get();
     const superseded = this.store.supersededRecord();
+    const repairObservability = record?.bindingRepair
+      ? {
+          originalExpectedIdentity: record.expectedNewIdentity,
+          effectiveExpectedIdentity: effectiveExpectedIdentity(record),
+          bindingRepair: record.bindingRepair,
+        }
+      : {};
     return {
       cutover: record,
       supersededCutover:
@@ -170,6 +252,7 @@ export class McpCutoverController {
           : undefined,
       currentServerIdentity: this.currentIdentity,
       comparison: record ? compareServerIdentity(record, this.currentIdentity) : undefined,
+      ...repairObservability,
       transportEvidence,
       mode: this.mode(),
       reconciliationRequired: Boolean(record && record.phase !== "closed"),
@@ -185,9 +268,10 @@ export class McpCutoverController {
     cutoverId: string;
     expectedNewIdentity: ExpectedCutoverIdentity;
     expiresAt?: string;
+    witness?: DurableReconciliationWitness;
   }): {
     terminal: DurableCutoverRecord;
-    successor: DurableCutoverRecord;
+    successor?: DurableCutoverRecord;
     newlyRecovered: boolean;
   } {
     return recoverCutoverWithStore(this.store, this.currentIdentity, input);
@@ -203,11 +287,6 @@ export class McpCutoverController {
       throw new CutoverStateError(`Cutover id mismatch: active cutover is ${record.cutoverId}.`);
     }
     if (record.phase === "closed") return record;
-    if (record.phase !== "drained") {
-      throw new CutoverStateError(
-        `Cutover ${cutoverId} must have durable drain evidence before it can be finished.`,
-      );
-    }
 
     const comparison = compareServerIdentity(record, this.currentIdentity);
     if (!comparison.serverInstanceChanged) {
@@ -222,6 +301,13 @@ export class McpCutoverController {
     if (!comparison.capabilityManifestMatches) {
       throw new CutoverStateError("Cannot finish cutover: capability manifest does not match the bound target.");
     }
+
+    if (record.phase !== "drained") {
+      throw new CutoverStateError(
+        `Cutover ${cutoverId} must have durable drain evidence before it can be finished.`,
+      );
+    }
+
 
     const witness = await reconcile();
     if (!witness.workspaceQueryable || !witness.agentQueryable || !witness.agentReconciled) {
@@ -238,23 +324,25 @@ export class McpCutoverController {
   }
 }
 
+
 export function compareServerIdentity(
   record: DurableCutoverRecord,
   current: CutoverServerIdentity,
 ): CutoverIdentityComparison {
+  const expected = effectiveExpectedIdentity(record);
   return {
     serverInstanceChanged:
       current.serverInstanceId !== record.oldServerIdentity.serverInstanceId,
-    sourceMatches: current.sourceCommit === record.expectedNewIdentity.sourceCommit,
-    buildMatches: current.buildId === record.expectedNewIdentity.buildId,
+    sourceMatches: current.sourceCommit === expected.sourceCommit,
+    buildMatches: current.buildId === expected.buildId,
     capabilityManifestMatches:
-      record.expectedNewIdentity.capabilityManifestSha256 === undefined ||
-      current.capabilityManifestSha256 === record.expectedNewIdentity.capabilityManifestSha256,
+      expected.capabilityManifestSha256 === undefined ||
+      current.capabilityManifestSha256 === expected.capabilityManifestSha256,
   };
 }
 
 export type CutoverRecoveryEligibility =
-  | { eligible: true }
+  | { eligible: true; mode: "stale_target" | "observed_replacement" }
   | { eligible: false; reason: string };
 
 /**
@@ -269,10 +357,11 @@ export function recoverCutoverWithStore(
     cutoverId: string;
     expectedNewIdentity: ExpectedCutoverIdentity;
     expiresAt?: string;
+    witness?: DurableReconciliationWitness;
   },
 ): {
   terminal: DurableCutoverRecord;
-  successor: DurableCutoverRecord;
+  successor?: DurableCutoverRecord;
   newlyRecovered: boolean;
 } {
   const record = store.get();
@@ -301,9 +390,56 @@ export function recoverCutoverWithStore(
       expiresAt: input.expiresAt,
     });
   }
-  const eligibility = assessRecoveryEligibility(record, currentIdentity);
+  if (record.phase === "closed" && record.cutoverId === input.cutoverId) {
+    if (record.observedReplacement?.cutoverId === input.cutoverId) {
+      const receipt = record.observedReplacement;
+      const res = store.recoverObservedReplacement({
+        cutoverId: input.cutoverId,
+        expectedNewIdentity: input.expectedNewIdentity,
+        observedIdentity: currentIdentity,
+        witness: input.witness ?? {
+          ...receipt.reconciliationReceipt,
+          witnessWorkspaceId: receipt.witnessWorkspaceId,
+          witnessAgentId: receipt.witnessAgentId,
+          witnessWorkspaceSessions: receipt.witnessWorkspaceSessions,
+          witnessAgentSessions: receipt.witnessAgentSessions,
+          witnessKind: receipt.witnessKind,
+        },
+        recoveredBy: currentIdentity.serverInstanceId,
+      });
+      return { terminal: res.record, newlyRecovered: res.newlyRecovered };
+    }
+  }
+  const eligibility = assessRecoveryEligibility(record, currentIdentity, input.expectedNewIdentity);
   if (!eligibility.eligible) {
     throw new CutoverStateError(`Cutover ${input.cutoverId} is not recoverable: ${eligibility.reason}`);
+  }
+  if (eligibility.mode === "observed_replacement") {
+    if (
+      !input.expectedNewIdentity.capabilityManifestSha256 &&
+      currentIdentity.capabilityManifestSha256
+    ) {
+      throw new CutoverStateError(
+        "Cannot recover cutover: observed replacement requires an explicitly bound capability manifest.",
+      );
+    }
+    if (!input.witness) {
+      throw new CutoverStateError(
+        "Cannot recover cutover: durable agent/workspace reconciliation witness is not fully positive.",
+      );
+    }
+    const result = store.recoverObservedReplacement({
+      cutoverId: input.cutoverId,
+      expectedNewIdentity: input.expectedNewIdentity,
+      observedIdentity: currentIdentity,
+      witness: input.witness,
+      recoveredBy: currentIdentity.serverInstanceId,
+    });
+    return {
+      terminal: result.record,
+      successor: undefined,
+      newlyRecovered: result.newlyRecovered,
+    };
   }
   return store.recoverSupersede({
     cutoverId: input.cutoverId,
@@ -323,6 +459,7 @@ export function recoverCutoverWithStore(
 export function assessRecoveryEligibility(
   record: DurableCutoverRecord,
   current: CutoverServerIdentity,
+  expectedNewIdentity?: ExpectedCutoverIdentity,
 ): CutoverRecoveryEligibility {
   if (record.phase === "closed") {
     return { eligible: false, reason: "the cutover is already closed; normal archive applies." };
@@ -349,6 +486,16 @@ export function assessRecoveryEligibility(
     (record.expectedNewIdentity.capabilityManifestSha256 === undefined ||
       comparison.capabilityManifestMatches)
   ) {
+    const isTargetingSameIdentity =
+      expectedNewIdentity === undefined ||
+      (expectedNewIdentity.sourceCommit === record.expectedNewIdentity.sourceCommit &&
+        expectedNewIdentity.buildId === record.expectedNewIdentity.buildId &&
+        (record.expectedNewIdentity.capabilityManifestSha256 === undefined ||
+          expectedNewIdentity.capabilityManifestSha256 === record.expectedNewIdentity.capabilityManifestSha256));
+
+    if (record.phase === "prepared" && !record.drainEvidence && isTargetingSameIdentity) {
+      return { eligible: true, mode: "observed_replacement" };
+    }
     return {
       eligible: false,
       reason: "the current runtime already matches the bound expected target; finish the cutover normally.",
@@ -357,8 +504,10 @@ export function assessRecoveryEligibility(
   if (record.supersedesCutoverId !== undefined) {
     return { eligible: false, reason: "the active cutover is its own successor, not a stale predecessor." };
   }
-  return { eligible: true };
+  return { eligible: true, mode: "stale_target" };
 }
+
+
 
 export interface CutoverHttpDependencies {
   controller: McpCutoverController;

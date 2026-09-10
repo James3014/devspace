@@ -119,10 +119,35 @@ function defaultSdkPackagePath(env: NodeJS.ProcessEnv, moduleUrl: string): strin
   return resolveSelfInstalledSdkPackagePath(moduleUrl);
 }
 
+function windowsArchitecture(): { packageName: string; target: string } | undefined {
+  if (process.arch === "x64") return { packageName: "codex-win32-x64", target: "x86_64-pc-windows-msvc" };
+  if (process.arch === "arm64") return { packageName: "codex-win32-arm64", target: "aarch64-pc-windows-msvc" };
+  return undefined;
+}
+
 function defaultExecutable(sdkPackagePath: string | undefined, env: NodeJS.ProcessEnv): string | undefined {
   const override = env.DEVSPACE_CODEX_EXECUTABLE?.trim();
   if (override) return override;
   if (!sdkPackagePath) return undefined;
+  if (process.platform === "win32") {
+    const openaiPackageRoot = dirname(dirname(sdkPackagePath));
+    const architecture = windowsArchitecture();
+    if (!architecture) return undefined;
+    const platformPackage = join(openaiPackageRoot, architecture.packageName);
+    if (existsSync(platformPackage)) {
+      return join(platformPackage, "vendor", architecture.target, "bin", "codex.exe");
+    }
+    const vendorRoot = join(
+      openaiPackageRoot,
+      "codex",
+      "vendor",
+      architecture.target,
+    );
+    if (existsSync(vendorRoot)) {
+      return join(vendorRoot, "bin", "codex.exe");
+    }
+    return undefined;
+  }
   return join(dirname(sdkPackagePath), "..", "codex", "bin", "codex.js");
 }
 
