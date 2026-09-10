@@ -19,6 +19,7 @@ import { MINIMUM_CODEX_RUNTIME_VERSION } from "./codex-runtime.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { DurableOperationManager } from "./durable-operations.js";
+import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import { createMcpServer, createServer, resolveDurableReconciliationWitnessFromInventory } from "./server.js";
 import { CutoverStateStore } from "./cutover-state.js";
 import { McpCutoverController } from "./mcp-cutover.js";
@@ -806,7 +807,20 @@ test("Chat Swarm production registration is opt-in and uses the shared lifecycle
   assert.equal((closed.structuredContent as Record<string, any>).status, "CLOSED");
 });
 
-test("enabled createServer instances share one runtime owner", async () => {
+function trackServerStoreCloses(t: TestContext) {
+  const counts = new Map<object, number>();
+  for (const prototype of [DurableOperationManager.prototype, SqliteWorkspaceStore.prototype, SingleUserOAuthProvider.prototype]) {
+    const original = prototype.close;
+    t.mock.method(prototype, "close", function (this: typeof prototype) {
+      counts.set(this, (counts.get(this) ?? 0) + 1);
+      return original.call(this);
+    });
+  }
+  return counts;
+}
+
+test("enabled createServer instances share one runtime owner", async (t) => {
+  const closes = trackServerStoreCloses(t);
   const root = await mkdtemp(join(tmpdir(), "devspace-server-swarm-owner-"));
   const stateDir = join(root, ".state");
   const config = loadConfig({
@@ -822,15 +836,24 @@ test("enabled createServer instances share one runtime owner", async () => {
   const first = createServer(config);
   try {
     assert.throws(() => createServer(config), ChatSwarmRuntimeAlreadyOwnedError);
+    assert.equal(closes.size, 3, "failed construction closes each newly owned store");
+    assert.deepEqual([...closes.values()], [1, 1, 1]);
+    assert.throws(() => createServer(config), ChatSwarmRuntimeAlreadyOwnedError,
+      "failed construction must not release the existing server owner");
+    assert.equal(closes.size, 6);
+    assert.ok([...closes.values()].every(count => count === 1));
   } finally {
     await first.close();
   }
   const afterRelease = createServer(config);
   await afterRelease.close();
+  assert.equal(closes.size, 12);
+  assert.ok([...closes.values()].every(count => count === 1));
   await rm(root, { recursive: true, force: true });
 });
 
-test("late server initialization failure releases the Chat Swarm owner", async () => {
+test("late server initialization failure releases the Chat Swarm owner", async (t) => {
+  const closes = trackServerStoreCloses(t);
   const root = await mkdtemp(join(tmpdir(), "devspace-server-swarm-owner-failure-"));
   const config = loadConfig({
     DEVSPACE_CONFIG_DIR: join(root, ".config"),
@@ -846,8 +869,12 @@ test("late server initialization failure releases the Chat Swarm owner", async (
     () => createServer(config, { chatSwarmInitializationHook: () => { throw new Error("late init fault"); } }),
     /late init fault/,
   );
+  assert.equal(closes.size, 3, "late initialization failure closes all owned stores");
+  assert.deepEqual([...closes.values()], [1, 1, 1]);
   const recovered = createServer(config);
   await recovered.close();
+  assert.equal(closes.size, 6);
+  assert.ok([...closes.values()].every(count => count === 1));
   await rm(root, { recursive: true, force: true });
 });
 
