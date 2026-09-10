@@ -4920,18 +4920,26 @@ export function createServer(
   });
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
+  const initializationCleanups: Array<() => void> = [];
+  let chatSwarmRuntimeOwner: ChatSwarmRuntimeOwner | undefined;
+  try {
   const oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
+  initializationCleanups.push(() => oauthProvider.close());
   const bearerAuth = requireBearerAuth({
     verifier: oauthProvider,
     requiredScopes: [config.oauth.scopes[0] ?? "devspace"],
     resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceServerUrl),
   });
   const workspaceStore = createWorkspaceStore(config.stateDir);
+  initializationCleanups.push(() => workspaceStore.close?.());
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
+  initializationCleanups.push(() => processSessions.shutdown());
   const durableOperations = new DurableOperationManager(config, undefined, undefined, undefined, options.coordination);
+  initializationCleanups.push(() => durableOperations.close());
   const opencodeCatalogSource = createMcpOpencodeCatalogSource();
+  initializationCleanups.push(() => opencodeCatalogSource.close());
   const clineCatalogService = new ClineCatalogService();
   const localAgentProviders = buildLocalAgentProviderStatuses(
     config.subagents,
@@ -4952,6 +4960,7 @@ export function createServer(
   const agentSessionManager = config.subagents.enabled
     ? new LocalAgentSessionManager(config, undefined, undefined, undefined, runtimeBuildIdentity, undefined, clineCatalogService, opencodeCatalogSource)
     : undefined;
+  initializationCleanups.push(() => agentSessionManager?.close());
   const capabilityManifest = deriveLoadedCapabilityManifest(
     {
       ...(agentSessionManager
@@ -4969,30 +4978,13 @@ export function createServer(
       capabilityManifestSha256: capabilityManifest.manifestSha256,
     },
   );
-  let chatSwarmRuntimeOwner: ChatSwarmRuntimeOwner | undefined;
-  let chatSwarmLifecycle: ChatSwarmLifecycle | undefined;
-  try {
-    chatSwarmRuntimeOwner = config.chatSwarmEnabled
-      ? new ChatSwarmRuntimeOwner(config.stateDir)
-      : undefined;
-  try {
-    chatSwarmRuntimeOwner?.acquire();
-  } catch (error) {
-    chatSwarmRuntimeOwner?.close();
-    throw error;
-  }
-  try {
-    chatSwarmLifecycle = new ChatSwarmLifecycle({ stateDir: config.stateDir, enabled: config.chatSwarmEnabled, mode: () => cutoverController.mode() });
-    if (chatSwarmLifecycle.enabled) chatSwarmLifecycle.recoverAfterStartup();
-  } catch (error) {
-    try {
-      chatSwarmLifecycle?.close();
-    } finally {
-      chatSwarmRuntimeOwner?.close();
-    }
-    throw error;
-  }
-  if (!chatSwarmLifecycle) throw new Error("Chat Swarm lifecycle failed to initialize.");
+  chatSwarmRuntimeOwner = config.chatSwarmEnabled
+    ? new ChatSwarmRuntimeOwner(config.stateDir)
+    : undefined;
+  chatSwarmRuntimeOwner?.acquire();
+  const chatSwarmLifecycle = new ChatSwarmLifecycle({ stateDir: config.stateDir, enabled: config.chatSwarmEnabled, mode: () => cutoverController.mode() });
+  initializationCleanups.push(() => chatSwarmLifecycle.close());
+  if (chatSwarmLifecycle.enabled) chatSwarmLifecycle.recoverAfterStartup();
   options.chatSwarmInitializationHook?.();
   const restartSelfActuator = createLaunchdSelfRestartActuator();
   const resolveDurableReconciliationWitness = async (
@@ -5258,6 +5250,7 @@ export function createServer(
     ? new CodexGoalSessionManager(processSessions, { codexBin: config.codexBin })
     : undefined;
 
+  initializationCleanups.push(() => codexGoals?.shutdown());
   const buildReadyProbe = config.mcpCutoverBuildReadyRoot
     ? (expected: ExpectedCutoverIdentity) =>
         probeBuildReady({ packageRoot: config.mcpCutoverBuildReadyRoot!, expected })
@@ -5298,6 +5291,7 @@ export function createServer(
         });
       }, AGENT_SUPERVISION_INTERVAL_MS)
     : undefined;
+  initializationCleanups.push(() => { if (agentSupervisionTimer) clearInterval(agentSupervisionTimer); });
   agentSupervisionTimer?.unref();
 
   const logSessionCloseResults = (
@@ -5354,6 +5348,7 @@ export function createServer(
         });
       });
   }, MCP_SESSION_CLEANUP_INTERVAL_MS);
+  initializationCleanups.push(() => clearInterval(sessionCleanupTimer));
   sessionCleanupTimer.unref();
 
   if (config.logging.trustProxy !== false) {
@@ -5630,11 +5625,11 @@ export function createServer(
     },
   };
   } catch (error) {
-    try {
-      chatSwarmLifecycle?.close();
-    } finally {
-      chatSwarmRuntimeOwner?.close();
+    // Construction stays synchronous: close every acquired handle before rethrowing.
+    for (const cleanup of initializationCleanups.reverse()) {
+      try { cleanup(); } catch { /* Preserve the initialization error and continue cleanup. */ }
     }
+    try { chatSwarmRuntimeOwner?.close(); } catch { /* Preserve the original error. */ }
     throw error;
   }
 }
