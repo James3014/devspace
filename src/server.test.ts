@@ -1990,6 +1990,7 @@ test("OWNER_DIRECT workspace_clone works and dependency_sync denies unauthentica
   for (const name of ["workspace_clone", "dependency_sync", "operation_status", "operation_reconcile"]) {
     assert.ok(tools.tools.some((tool) => tool.name === name), `${name} must be exposed`);
   }
+  assert.equal((await context.client.callTool({name:"coordination_completion_read",arguments:{goal:"g",candidate:"c",subject:"s"},_meta:{clientId:"forged"}})).isError,true);
   const bash = tools.tools.find((tool) => tool.name === "bash");
   assert.match(String(bash?.description), /Do not use bash to create or modify files/);
 
@@ -2125,6 +2126,14 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
   let ownership: import("./control-plane-ownership.js").ControlPlaneOwnershipStore;
   const authenticated=(c:unknown)=>!!c && (c as {clientId?:string}).clientId===oauthClient.client_id && typeof (c as {sessionId?:string}).sessionId==="string";
   const coordination:import("./control-plane-consumer.js").ControlPlaneConsumerOptions={
+    readCompletionContract:(c,selection)=>{
+      if(!authenticated(c)) throw new Error("unauthorized reader");
+      return {...selection,source:"issue62-fixture",requiredLayers:["SOURCE","NATIVE_SINGLE"],criteria:["SOURCE","NATIVE_SINGLE"].map(layer=>({id:`AC-${layer}`,layer,sourceRevision:base,environment:"darwin",surface:"installed-mcp",independent:true,maxAgeMs:60000}))};
+    },
+    readCompletionEvidence:(c,selection)=>{
+      if(!authenticated(c)) throw new Error("unauthorized reader");
+      return [{...selection,goal:undefined,criterionId:"AC-SOURCE",layer:"SOURCE",sourceRevision:base,source:"fixture-receipt",command:"real HTTP MCP",result:"PASS",artifactSha256:"a".repeat(64),environment:"darwin",surface:"installed-mcp",verifier:"reviewer",implementer:"worker",verificationState:"INDEPENDENTLY_VERIFIED",observedAt:new Date(Date.now()-1000).toISOString(),expiresAt:new Date(Date.now()+30000).toISOString(),limitations:[],nextGate:"native witness"}];
+    },
     readDependencyReconciliation:c=>{if(authenticated(c)) originalAuthenticatedContext=c;readerClient=(c as {clientId:string}).clientId;lastAuthenticatedContext=c;return undefined;},
     resolveHandoffRecipient:(c,handle)=>authenticated(c)&&handle==="other-client"?lastAuthenticatedContext:(c as {clientId?:string})?.clientId===successorClientId && handle==="original-client"?originalAuthenticatedContext:undefined,
     resolveOwnerContext:c=>authenticated(c)?{ownerThread:"delegated-cli-worker"}:successorClientId && (c as {clientId?:string})?.clientId===successorClientId ? {ownerThread:"successor"}:undefined,
@@ -2231,6 +2240,19 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
       const cutoverStore=new CutoverStateStore(config.stateDir);
       const beforeCutover=JSON.stringify(cutoverStore.get());
       const beforeRead=JSON.stringify(ownership.get(leaseId));
+      const completionArgs={goal:"http-fixture",candidate:base,subject:"full-delivery"};
+      const completion=await client.callTool({name:"coordination_completion_read",arguments:completionArgs});
+      assert.equal(completion.isError,undefined,JSON.stringify(completion));
+      const projection=structuredContent(completion).projection as any;
+      assert.equal(projection.status,"INCOMPLETE");
+      assert.equal(projection.layers.SOURCE.status,"PASS");
+      assert.equal(projection.layers.NATIVE_SINGLE.status,"BLOCKED");
+      assert.equal(projection.contractSource,"issue62-fixture");
+      const spoofedCompletion=await otherClient.callTool({name:"coordination_completion_read",arguments:completionArgs,_meta:{clientId:oauthClient.client_id}});
+      assert.equal((structuredContent(spoofedCompletion).projection as any).status,"BLOCKED");
+      assert.equal(JSON.stringify(ownership.get(leaseId)),beforeRead);
+      assert.equal(JSON.stringify(cutoverStore.get()),beforeCutover);
+
       const recovered=await otherClient.callTool({name:"coordination_handoff_readback",arguments:readArgs});
       assert.equal(recovered.isError,undefined,JSON.stringify(recovered));
       assert.deepEqual(structuredContent(recovered).receipt,handoff);

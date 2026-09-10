@@ -1,3 +1,4 @@
+import type { CompletionSelection } from "./current-completion-matrix.js";
 import { isDeepStrictEqual } from "node:util";
 import { McpCutoverController } from "./mcp-cutover.js";
 import { CutoverStateStore, type CutoverServerIdentity, type ExpectedCutoverIdentity, type CutoverCoordinationBinding } from "./cutover-state.js";
@@ -430,6 +431,11 @@ export class DurableOperationManager {
       if (record.status === "succeeded") return record;
       return this.store.finish(operationId,{status:"succeeded",retrySafe:false,receipt:{cutoverId:observed.cutoverId,coordinationBinding:observed.coordinationBinding,startVerified:true,lifecycleTerminal:false}});
     });
+  }
+
+  readCompletion(selection: CompletionSelection, context?: unknown) {
+    if(!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","completion read requires trusted host authority");
+    return this.consumer.readCompletion(context,selection);
   }
 
   handoff(leaseId: string, expectedVersion: number, recipientHandle: string, receipt: HandoffInput, context?: unknown) {

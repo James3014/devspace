@@ -2631,6 +2631,16 @@ export function createMcpServer(
       },
     );
 
+    registerAppTool(server,"coordination_completion_read",{
+      title:"Read current delivery evidence",
+      description:"Project the complete trusted contract and revision-bound evidence. Missing native, CI or other required evidence remains a gap. This read grants no authority and never unlocks or retries work.",
+      inputSchema:{goal:z.string().min(1),candidate:z.string().min(1),subject:z.string().min(1)},
+      annotations:{readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},_meta:{},
+    },async(selection,extra)=>{
+      const projection=durableOperations.readCompletion(selection,dependencyConsumerContext(extra));
+      return {content:[textBlock(JSON.stringify(projection))],structuredContent:{projection}};
+    });
+
     const handoffGrantSchema=z.object({repository:z.string().min(1),goal:z.string().min(1),coordinatorThread:z.string().min(1),evidenceHash:z.string().min(1)}).strict();
     registerAppTool(server,"coordination_handoff",{
       title:"Transfer existing resource ownership",

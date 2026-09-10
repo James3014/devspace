@@ -1,3 +1,4 @@
+import { projectCompletion, type CompletionSelection } from "./current-completion-matrix.js";
 import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type ControlPlaneOwnershipOptions, type ReconciliationEvidence, type HandoffInput } from "./control-plane-ownership.js";
 
 export interface EffectSubject {
@@ -19,6 +20,8 @@ export interface DependencyReconciliationEvidence extends ReconciliationEvidence
   frozenInputsUnchanged: boolean;
 }
 export interface ControlPlaneConsumerOptions extends ControlPlaneOwnershipOptions {
+  readCompletionContract?(context: unknown, selection: Readonly<CompletionSelection>): unknown;
+  readCompletionEvidence?(context: unknown, selection: Readonly<CompletionSelection>): unknown;
   /** Host lookup of a previously authenticated recipient; handle is not identity evidence. */
   resolveHandoffRecipient?(senderContext: unknown, recipientHandle: string): unknown;
   readDependencyReconciliation?(context: unknown, subject: Readonly<EffectSubject>): DependencyReconciliationEvidence | undefined;
@@ -45,6 +48,15 @@ export class ControlPlaneConsumer {
     if (subject.operation !== "cutover_start" || binding.role !== "controller") throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "cutover requires controller authority");
     this.assertPinned(context, subject, binding, pinnedVersion);
     return Object.freeze({leaseId:binding.leaseId,pinnedLeaseVersion:pinnedVersion,operationHandle:subject.operationId,requestHash:subject.requestHash,ownerThread:this.ownership.get(binding.leaseId)!.ownerThread});
+  }
+
+  readCompletion(context: unknown, selection: CompletionSelection) {
+    const {readCompletionContract,readCompletionEvidence}=this.options;
+    if(!readCompletionContract||!readCompletionEvidence) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","trusted completion readers are unavailable");
+    return projectCompletion(selection,{
+      readContract:s=>readCompletionContract(context,s),
+      readEvidence:s=>readCompletionEvidence(context,s),
+    });
   }
 
   handoff(context: unknown, leaseId: string, expectedVersion: number, recipientHandle: string, receipt: HandoffInput) {
