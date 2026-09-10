@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test, { after } from "node:test";
@@ -2268,7 +2268,7 @@ test("G3 TEST Z1b — malformed pending state fails closed after reopen", async 
         error.code === "AGENT_TERMINATION_PENDING" || error.code === "AGENT_LIFECYCLE_CORRUPT",
     );
   } finally {
-    try { reopenedManager?.close(); } catch {}
+    reopenedManager?.close();
     f.clean();
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -3557,7 +3557,7 @@ test("agent_start replay survives restart when reopen returns a new workspaceId 
       assert.notEqual(otherAttempt.agentId, first.agentId);
       assert.equal(reopenedLaunches, 1);
     } finally {
-      try { reopenedManager?.close(); } catch {}
+      reopenedManager?.close();
       reopenedWorkspaceStore.close();
     }
   } finally {
