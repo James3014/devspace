@@ -64,6 +64,8 @@ import {
   cutoverSeamStatus,
   performCutoverRecovery,
   performNativeCrossDomainBindingRepair,
+  NativeObservedReplacementCommittedError,
+  NativeBindingRepairOutcomeUnknownError,
   performNativeObservedReplacementRecovery,
   readRunningBuildIdentity,
   resolveSeamStateDir,
@@ -929,17 +931,44 @@ async function runCutoverRepair(args: string[]): Promise<void> {
   }
   const endpoint = serverUrl ? new URL(serverUrl) : new URL(`http://${config.host}:${config.port}/mcp`);
   const effectivePackageRoot = packageRoot ?? config.mcpCutoverBuildReadyRoot ?? process.env.DEVSPACE_PACKAGE_ROOT ?? runningPackageRoot();
-  const result = await performNativeCrossDomainBindingRepair({
-    serverUrl: endpoint,
-    publicBaseUrl: new URL(config.publicBaseUrl),
-    stateDir: stateDir ?? config.stateDir,
-    cutoverId,
-    workspaceId,
-    agentId,
-    ownerToken: config.oauth.ownerToken,
-    requesterIdentity,
-    packageRoot: effectivePackageRoot,
-  });
+  let result: Awaited<ReturnType<typeof performNativeCrossDomainBindingRepair>>;
+  try {
+    result = await performNativeCrossDomainBindingRepair({
+      serverUrl: endpoint,
+      publicBaseUrl: new URL(config.publicBaseUrl),
+      stateDir: stateDir ?? config.stateDir,
+      cutoverId,
+      workspaceId,
+      agentId,
+      ownerToken: config.oauth.ownerToken,
+      requesterIdentity,
+      packageRoot: effectivePackageRoot,
+    });
+  } catch (error) {
+    if (error instanceof NativeBindingRepairOutcomeUnknownError && json) {
+      printJson({
+        outcome: "OUTCOME_UNKNOWN",
+        committed: null,
+        cutoverId: error.cutoverId,
+        error: error.message,
+        retryAllowed: false,
+      });
+      process.exitCode = 1;
+      return;
+    }
+    if (error instanceof NativeObservedReplacementCommittedError && json) {
+      printJson({
+        outcome: "RECONCILE_REQUIRED",
+        committed: true,
+        committedRecord: error.committedRecord,
+        error: error.message,
+        retryAllowed: false,
+      });
+      process.exitCode = 1;
+      return;
+    }
+    throw error;
+  }
   if (json) {
     printJson(result);
     return;

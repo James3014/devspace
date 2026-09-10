@@ -99,6 +99,12 @@ export class NativeObservedReplacementCommittedError extends CutoverStateError {
   }
 }
 
+export class NativeBindingRepairOutcomeUnknownError extends CutoverStateError {
+  constructor(readonly cutoverId: string, message: string) {
+    super(message);
+  }
+}
+
 type JsonRecord = Record<string, unknown>;
 
 function asRecord(value: unknown, label: string): JsonRecord {
@@ -399,6 +405,32 @@ export interface NativeCrossDomainBindingRepairResult {
   mode: "normal";
 }
 
+async function validateClosedBindingRepair(
+  store: CutoverStateStore,
+  client: Client,
+  options: NativeCrossDomainBindingRepairOptions,
+  record: DurableCutoverRecord,
+  serverInstanceId: string,
+  sourceCommit: string,
+  buildId: string,
+  capabilityManifestSha256: string,
+  repairReceipt: CutoverBindingRepairReceipt,
+): Promise<DurableCutoverRecord> {
+  const durable = store.get();
+  if (!durable || durable.cutoverId !== options.cutoverId || durable.phase !== "closed" || !durable.bindingRepair || !isDeepStrictEqual(durable.bindingRepair, repairReceipt) || durable.reconciliationReceipt?.witnessWorkspaceId !== options.workspaceId || durable.reconciliationReceipt?.witnessAgentId !== options.agentId || durable.expectedNewIdentity.capabilityManifestSha256 !== record.expectedNewIdentity.capabilityManifestSha256) {
+    throw new NativeObservedReplacementCommittedError(record, "Binding repair committed but durable closed readback did not match the exact receipt and witness pair; reconcile before retry.");
+  }
+  const result = structuredResult(await client.callTool({ name: "cutover_status", arguments: {} }), "cutover_status post-close");
+  const status = requiredRecordField(result, "status", "cutover_status post-close");
+  const cutover = requiredRecordField(status, "cutover", "cutover_status post-close");
+  const current = requiredRecordField(status, "currentServerIdentity", "cutover_status post-close");
+  const expected = requiredRecordField(cutover, "expectedNewIdentity", "cutover_status post-close");
+  if (requiredStringField(cutover, "cutoverId", "cutover_status post-close") !== options.cutoverId || cutover.phase !== "closed" || requiredStringField(current, "serverInstanceId", "cutover_status post-close") !== serverInstanceId || requiredStringField(current, "sourceCommit", "cutover_status post-close") !== sourceCommit || requiredStringField(current, "buildId", "cutover_status post-close") !== buildId || requiredStringField(current, "capabilityManifestSha256", "cutover_status post-close") !== capabilityManifestSha256 || requiredStringField(expected, "sourceCommit", "cutover_status post-close") !== record.expectedNewIdentity.sourceCommit || requiredStringField(expected, "buildId", "cutover_status post-close") !== record.expectedNewIdentity.buildId || requiredStringField(expected, "capabilityManifestSha256", "cutover_status post-close") !== record.expectedNewIdentity.capabilityManifestSha256) {
+    throw new NativeObservedReplacementCommittedError(record, "Binding repair committed but fresh native closed status did not match the exact authenticated identity; reconcile before retry.");
+  }
+  return durable;
+}
+
 export async function performNativeCrossDomainBindingRepair(
   options: NativeCrossDomainBindingRepairOptions,
 ): Promise<NativeCrossDomainBindingRepairResult> {
@@ -420,6 +452,9 @@ export async function performNativeCrossDomainBindingRepair(
   const client = new Client({ name: "devspace-native-binding-repair", version: "1.0.0" });
   let operationError: unknown;
   let committedRecord: DurableCutoverRecord | undefined;
+  let repairReceiptForReconciliation: CutoverBindingRepairReceipt | undefined;
+  let committedReadbackError: string | undefined;
+  let writeAttempted = false;
   try {
     await client.connect(transport);
 
@@ -460,6 +495,9 @@ export async function performNativeCrossDomainBindingRepair(
     const before = store.get();
     if (!before || before.cutoverId !== options.cutoverId) {
       throw new CutoverStateError("Local durable cutover record does not match live cutover.");
+    }
+    if (typeof before.supersedesCutoverId !== "string" || before.supersedesCutoverId.length === 0 || before.supersedesCutoverId === before.cutoverId) {
+      throw new CutoverStateError("Binding repair requires an established successor cutover record.");
     }
     if (before.phase !== "drained" && before.phase !== "closed") {
       throw new CutoverStateError(`Binding repair requires phase == drained; got ${before.phase}.`);
@@ -521,6 +559,7 @@ export async function performNativeCrossDomainBindingRepair(
       if (!receipt || receipt.witnessWorkspaceId !== options.workspaceId || receipt.witnessAgentId !== options.agentId) {
         throw new CutoverStateError("[REPAIR_BINDING_MISMATCH] Closed replay pair does not match stored reconciliation receipt.");
       }
+      await validateClosedBindingRepair(store, client, options, before, serverInstanceId, sourceCommit, buildId, capabilityManifestSha256, before.bindingRepair);
       committedRecord = before;
       return {
         cutover: before,
@@ -582,7 +621,7 @@ export async function performNativeCrossDomainBindingRepair(
     }
 
     const nowIso = new Date().toISOString();
-    const repairReceipt: CutoverBindingRepairReceipt = {
+    const proposedRepair: CutoverBindingRepairReceipt = {
       schema: CUTOVER_BINDING_REPAIR_SCHEMA,
       cutoverId: options.cutoverId,
       reason: CUTOVER_BINDING_REPAIR_REASON,
@@ -611,11 +650,26 @@ export async function performNativeCrossDomainBindingRepair(
       repairedAt: nowIso,
       physicalProbeEvidence: `Target package at ${targetRoot} verified: build_manifest_sha256=${targetPackage.buildManifestSha256} equals expectedNewIdentity.capabilityManifestSha256.`,
     };
+    const repairReceipt = before.bindingRepair ?? proposedRepair;
+    repairReceiptForReconciliation = repairReceipt;
+    if (before.bindingRepair && (
+      before.bindingRepair.cutoverId !== options.cutoverId ||
+      before.bindingRepair.correctCapabilityManifestSha256 !== capabilityManifestSha256 ||
+      before.bindingRepair.observedServerInstanceId !== serverInstanceId ||
+      before.bindingRepair.sourceCommit !== sourceCommit ||
+      before.bindingRepair.buildId !== buildId ||
+      before.bindingRepair.originalCutoverExpectedIdentity.capabilityManifestSha256 !== before.expectedNewIdentity.capabilityManifestSha256
+    )) {
+      throw new CutoverStateError("[REPAIR_BINDING_MISMATCH] Existing durable binding repair does not match authenticated replacement.");
+    }
 
-    // Atomic CAS check before durable write (G71-R6)
+    // Fresh binding validation before durable write (G71-R6)
     const latest = store.get();
     if (!latest || latest.cutoverId !== before.cutoverId) {
       throw new CutoverStateError("Concurrent modification detected: active cutover changed during repair evaluation.");
+    }
+    if (latest.supersedesCutoverId !== before.supersedesCutoverId) {
+      throw new CutoverStateError("Concurrent modification detected: successor predecessor binding changed during repair evaluation.");
     }
     if (latest.phase !== "drained") {
       throw new CutoverStateError(`Concurrent modification detected: cutover phase transitioned to ${latest.phase}.`);
@@ -630,7 +684,9 @@ export async function performNativeCrossDomainBindingRepair(
       throw new CutoverStateError("Concurrent modification detected: conflicting bindingRepair already recorded.");
     }
 
-    store.recordBindingRepair(options.cutoverId, repairReceipt);
+    writeAttempted = true;
+    const repaired = store.recordBindingRepair(options.cutoverId, repairReceipt);
+    committedRecord = repaired.record;
 
     const witness: DurableReconciliationWitness = {
       witnessCutoverId: options.cutoverId,
@@ -656,6 +712,7 @@ export async function performNativeCrossDomainBindingRepair(
     };
     const closed = store.close(options.cutoverId, reconciliationReceipt);
     committedRecord = closed;
+    await validateClosedBindingRepair(store, client, options, closed, serverInstanceId, sourceCommit, buildId, capabilityManifestSha256, repairReceipt);
     return {
       cutover: closed,
       newlyRecovered: true,
@@ -665,6 +722,34 @@ export async function performNativeCrossDomainBindingRepair(
       mode: "normal",
     };
   } catch (error) {
+    if (!committedRecord && writeAttempted && repairReceiptForReconciliation) {
+      try {
+        const reconciled = new CutoverStateStore(options.stateDir).get();
+        if (reconciled?.bindingRepair && isDeepStrictEqual(reconciled.bindingRepair, repairReceiptForReconciliation)) {
+          committedRecord = reconciled;
+        }
+      } catch (readbackError) {
+        operationError = new NativeBindingRepairOutcomeUnknownError(
+          options.cutoverId,
+          `Binding repair outcome unknown; reconcile before retry: durable readback failed: ${readbackError instanceof Error ? readbackError.message : String(readbackError)}`,
+        );
+        throw operationError;
+      }
+    } else if (committedRecord) {
+      try {
+        const reconciled = new CutoverStateStore(options.stateDir).get();
+        if (reconciled?.cutoverId === options.cutoverId && reconciled.phase === "closed") committedRecord = reconciled;
+      } catch (readbackError) {
+        committedReadbackError = `durable readback failed: ${readbackError instanceof Error ? readbackError.message : String(readbackError)}`;
+      }
+    }
+    if (committedRecord && !(error instanceof NativeObservedReplacementCommittedError)) {
+      operationError = new NativeObservedReplacementCommittedError(
+        committedRecord,
+        `Binding repair committed partially; reconcile before retry: ${error instanceof Error ? error.message : String(error)}${committedReadbackError ? `; ${committedReadbackError}` : ""}`,
+      );
+      throw operationError;
+    }
     operationError = error;
     throw error;
   } finally {
@@ -688,6 +773,12 @@ export async function performNativeCrossDomainBindingRepair(
       Object.defineProperty(operationError, "cleanupErrors", { value: revocationErrors, enumerable: true, configurable: true });
     }
     if (revocationErrors.length > 0 && !operationError) {
+      if (committedRecord) {
+        throw new NativeObservedReplacementCommittedError(
+          committedRecord,
+          `Binding repair committed but OAuth token revocation failed; reconcile before retry: ${revocationErrors.join(",")}.`,
+        );
+      }
       throw new CutoverStateError(`OAuth token revocation failed: ${revocationErrors.join(",")}.`);
     }
   }

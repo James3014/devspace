@@ -12,6 +12,8 @@ import {
 } from "./cutover-build-ready.js";
 import {
   performNativeCrossDomainBindingRepair,
+  NativeObservedReplacementCommittedError,
+  NativeBindingRepairOutcomeUnknownError,
   type NativeCrossDomainBindingRepairOptions,
 } from "./cutover-recovery.js";
 import {
@@ -254,11 +256,17 @@ type MockHttpOptions = {
   workspaceId?: string;
   workspaceRoot?: string;
   agentReconciled?: boolean;
+  revokeStatus?: number;
+  statusPhases?: Array<"drained" | "closed">;
+  statusServerInstanceIds?: string[];
+  statusStateDir?: string;
+  statusFailAfter?: number;
   onCallTool?: (name: string, args: Record<string, unknown>) => void;
 };
 
 async function createMockReplacementServer(options: MockHttpOptions = {}) {
   let currentCutoverId = options.cutoverId ?? "cutover-repair-p0";
+  let statusCalls = 0;
   const serverInstanceId = options.serverInstanceId ?? "replacement-inst-1";
   const sourceCommit = options.sourceCommit ?? SHA_COMMIT;
   const buildId = options.buildId ?? BUILD_ID;
@@ -344,7 +352,7 @@ async function createMockReplacementServer(options: MockHttpOptions = {}) {
       return json({ access_token: accessToken, token_type: "Bearer", scope: "devspace" });
     }
     if (req.method === "POST" && url.pathname === "/revoke") {
-      res.writeHead(200);
+      res.writeHead(options.revokeStatus ?? 200);
       return res.end();
     }
 
@@ -367,6 +375,10 @@ async function createMockReplacementServer(options: MockHttpOptions = {}) {
           options.onCallTool(name, (request.params?.arguments ?? {}) as Record<string, unknown>);
         }
         if (name === "cutover_status") {
+          if (options.statusFailAfter !== undefined && statusCalls >= options.statusFailAfter) return fail("post-close status unavailable", 503);
+          const phase = options.statusPhases?.[statusCalls] ?? (options.statusStateDir ? new CutoverStateStore(options.statusStateDir).get()?.phase ?? "drained" : "drained");
+          const ownedRecord = options.statusStateDir ? new CutoverStateStore(options.statusStateDir).get() : undefined;
+          statusCalls += 1;
           return json({
             jsonrpc: "2.0",
             id: request.id,
@@ -376,15 +388,15 @@ async function createMockReplacementServer(options: MockHttpOptions = {}) {
                 status: {
                   cutover: {
                     cutoverId: currentCutoverId,
-                    phase: "drained",
+                    phase,
                     expectedNewIdentity: {
                       sourceCommit,
                       buildId,
-                      capabilityManifestSha256: options.statusDigest ?? capabilityManifestSha256,
+                      capabilityManifestSha256: ownedRecord?.expectedNewIdentity.capabilityManifestSha256 ?? options.statusDigest ?? capabilityManifestSha256,
                     },
                   },
                   currentServerIdentity: {
-                    serverInstanceId,
+                    serverInstanceId: options.statusServerInstanceIds?.[statusCalls - 1] ?? serverInstanceId,
                     sourceCommit,
                     buildId,
                     capabilityManifestSha256: options.statusDigest ?? capabilityManifestSha256,
@@ -470,7 +482,9 @@ function setupDrainedRecord(
   restartScheduled = true,
   phase: "prepared" | "drained" | "closed" = "drained",
 ): { store: CutoverStateStore } {
-  const store = new CutoverStateStore(stateDir, { newId: () => cutoverId });
+  const predecessorId = `predecessor-${cutoverId}`;
+  const ids = phase === "prepared" ? [predecessorId, cutoverId] : [predecessorId, `${cutoverId}-event-1`, cutoverId];
+  const store = new CutoverStateStore(stateDir, { newId: () => ids.shift() ?? `${cutoverId}-event` });
   const oldServer: CutoverServerIdentity = {
     serverInstanceId: "old-owner-inst",
     sourceCommit: SHA_COMMIT,
@@ -484,9 +498,9 @@ function setupDrainedRecord(
   };
   store.begin({ oldServerIdentity: oldServer, expectedNewIdentity: expected });
   if (phase === "drained" || phase === "closed") {
-    store.recordDrain(cutoverId, { activeSessions: 0, oldestAgeMs: 0 });
+    store.recordDrain(predecessorId, { activeSessions: 0, oldestAgeMs: 0 });
     if (restartScheduled) {
-      store.recordRestartRequest(cutoverId, {
+      store.recordRestartRequest(predecessorId, {
         actuator: "launchd-self",
         requestedByServerInstanceId: "old-owner-inst",
         buildReady: {
@@ -494,8 +508,32 @@ function setupDrainedRecord(
           verifiedAt: new Date().toISOString(),
         },
       });
-      store.recordRestartScheduled(cutoverId, "old-owner-inst");
+      store.recordRestartScheduled(predecessorId, "old-owner-inst");
     }
+    const successor = store.recoverSupersede({
+      cutoverId: predecessorId,
+      expectedNewIdentity: expected,
+      observedIdentity: { serverInstanceId: "replacement-inst-1", sourceCommit: SHA_COMMIT, buildId: BUILD_ID, capabilityManifestSha256: SHA_CAPABILITY_MANIFEST },
+      recoveredBy: "test-successor",
+    }).successor;
+    if (phase === "drained" || phase === "closed") {
+      store.recordDrain(successor.cutoverId, { activeSessions: 0, oldestAgeMs: 0 });
+      if (restartScheduled) {
+        store.recordRestartRequest(successor.cutoverId, {
+          actuator: "launchd-self",
+          requestedByServerInstanceId: "old-owner-inst",
+          buildReady: { verifiedBy: "test", verifiedAt: new Date().toISOString() },
+        });
+        store.recordRestartScheduled(successor.cutoverId, "old-owner-inst");
+      }
+    }
+  } else if (phase === "prepared") {
+    store.recoverSupersede({
+      cutoverId: predecessorId,
+      expectedNewIdentity: expected,
+      observedIdentity: { serverInstanceId: "replacement-inst-1", sourceCommit: SHA_COMMIT, buildId: BUILD_ID, capabilityManifestSha256: SHA_CAPABILITY_MANIFEST },
+      recoveredBy: "test-successor",
+    });
   }
   return { store };
 }
@@ -1034,6 +1072,27 @@ test("Negative 15: Cutover expected target already matches capability manifest (
   }
 });
 
+test("Negative: Initial drained cutover without a successor is rejected before repair marker write", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-initial-drained-state-"));
+  const mock = await createMockReplacementServer({ cutoverId: "cutover-initial-drained" });
+  try {
+    const store = new CutoverStateStore(stateDir, { newId: () => "cutover-initial-drained" });
+    const expected = { sourceCommit: SHA_COMMIT, buildId: BUILD_ID, capabilityManifestSha256: SHA_BUILD_MANIFEST };
+    store.begin({ oldServerIdentity: { serverInstanceId: "old", sourceCommit: SHA_COMMIT, buildId: BUILD_ID, capabilityManifestSha256: "0".repeat(64) }, expectedNewIdentity: expected });
+    store.recordDrain("cutover-initial-drained", { activeSessions: 0, oldestAgeMs: 0 });
+    store.recordRestartRequest("cutover-initial-drained", { actuator: "launchd-self", requestedByServerInstanceId: "old", buildReady: { verifiedBy: "test", verifiedAt: new Date().toISOString() } });
+    store.recordRestartScheduled("cutover-initial-drained", "old");
+    await assert.rejects(
+      performNativeCrossDomainBindingRepair({ cutoverId: "cutover-initial-drained", stateDir, serverUrl: mock.serverUrl, ownerToken: mock.ownerToken, workspaceId: "ws-test", agentId: "agt-test", requesterIdentity: { serverInstanceId: "cli", sourceCommit: SHA_COMMIT, buildId: BUILD_ID } }),
+      /established successor/,
+    );
+    assert.equal(store.get()?.bindingRepair, undefined);
+  } finally {
+    await mock.close();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 // ---------------------------------------------------------------------------
 // Part B: Positive Production Regression Test
 // ---------------------------------------------------------------------------
@@ -1046,6 +1105,7 @@ test("Positive: Exact production deadlock reproduced and terminally repaired wit
   const cutoverId = "52e4dbc1-c92d-4b20-b8ae-2079323329f1";
 
   const mock = await createMockReplacementServer({
+    statusStateDir: stateDir,
     serverInstanceId: liveServerInstanceId,
     sourceCommit: SHA_COMMIT,
     buildId: BUILD_ID,
@@ -1061,7 +1121,9 @@ test("Positive: Exact production deadlock reproduced and terminally repaired wit
   try {
     createPackageRoot(pkgDir, SHA_BUILD_MANIFEST);
 
-    const store = new CutoverStateStore(stateDir, { newId: () => cutoverId });
+    const predecessorId = `${cutoverId}-predecessor`;
+    const ids = [predecessorId, `${cutoverId}-event-1`, cutoverId];
+    const store = new CutoverStateStore(stateDir, { newId: () => ids.shift() ?? `${cutoverId}-event` });
     const oldServer: CutoverServerIdentity = {
       serverInstanceId: "old-server-deadlock",
       sourceCommit: SHA_COMMIT,
@@ -1074,14 +1136,27 @@ test("Positive: Exact production deadlock reproduced and terminally repaired wit
       capabilityManifestSha256: SHA_BUILD_MANIFEST,
     };
     store.begin({ oldServerIdentity: oldServer, expectedNewIdentity: expected });
-    store.recordDrain(cutoverId, { activeSessions: 0, oldestAgeMs: 0 });
-    store.recordRestartRequest(cutoverId, {
+    store.recordDrain(predecessorId, { activeSessions: 0, oldestAgeMs: 0 });
+    store.recordRestartRequest(predecessorId, {
       actuator: "launchd-self",
       requestedByServerInstanceId: "old-server-deadlock",
       buildReady: {
         verifiedBy: "pre-restart-probe",
         verifiedAt: new Date().toISOString(),
       },
+    });
+    store.recordRestartScheduled(predecessorId, "old-server-deadlock");
+    store.recoverSupersede({
+      cutoverId: predecessorId,
+      expectedNewIdentity: expected,
+      observedIdentity: { serverInstanceId: liveServerInstanceId, sourceCommit: SHA_COMMIT, buildId: BUILD_ID, capabilityManifestSha256: SHA_CAPABILITY_MANIFEST },
+      recoveredBy: "pre-recovery-test",
+    });
+    store.recordDrain(cutoverId, { activeSessions: 0, oldestAgeMs: 0 });
+    store.recordRestartRequest(cutoverId, {
+      actuator: "launchd-self",
+      requestedByServerInstanceId: "old-server-deadlock",
+      buildReady: { verifiedBy: "pre-restart-probe", verifiedAt: new Date().toISOString() },
     });
     store.recordRestartScheduled(cutoverId, "old-server-deadlock");
     mock.setCutoverId(cutoverId);
@@ -1151,6 +1226,221 @@ test("Positive: Exact production deadlock reproduced and terminally repaired wit
     assert.equal(replay.cutover.phase, "closed");
     assert.equal(replay.mode, "normal");
   } finally {
+    await mock.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(pkgDir, { recursive: true, force: true });
+  }
+});
+
+test("Committed partial repair preserves the durable receipt when close fails, then exact retry closes it", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-close-fault-state-"));
+  const pkgDir = mkdtempSync(join(tmpdir(), "devspace-close-fault-pkg-"));
+  const cutoverId = "cutover-close-fault";
+  const mock = await createMockReplacementServer({ cutoverId, statusStateDir: stateDir, workspaceId: "ws-close", agentId: "agt-close" });
+  const { store } = setupDrainedRecord(stateDir, cutoverId);
+  const options = {
+    cutoverId,
+    stateDir,
+    packageRoot: pkgDir,
+    serverUrl: mock.serverUrl,
+    ownerToken: mock.ownerToken,
+    workspaceId: "ws-close",
+    agentId: "agt-close",
+    requesterIdentity: { serverInstanceId: "repair-cli", sourceCommit: SHA_COMMIT, buildId: BUILD_ID },
+  } satisfies NativeCrossDomainBindingRepairOptions;
+  const originalClose = CutoverStateStore.prototype.close;
+  try {
+    createPackageRoot(pkgDir, SHA_BUILD_MANIFEST);
+    CutoverStateStore.prototype.close = function () { throw new Error("injected close failure"); };
+    await assert.rejects(
+      performNativeCrossDomainBindingRepair(options),
+      (error: unknown) => error instanceof NativeObservedReplacementCommittedError && error.committedRecord.bindingRepair !== undefined,
+    );
+    CutoverStateStore.prototype.close = originalClose;
+    const partial = new CutoverStateStore(stateDir).get()!;
+    assert.equal(partial.phase, "drained");
+    assert.ok(partial.bindingRepair);
+    const repairedAt = partial.bindingRepair.repairedAt;
+    const replay = await performNativeCrossDomainBindingRepair(options);
+    assert.equal(replay.cutover.phase, "closed");
+    assert.equal(replay.cutover.bindingRepair?.repairedAt, repairedAt);
+  } finally {
+    CutoverStateStore.prototype.close = originalClose;
+    await mock.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(pkgDir, { recursive: true, force: true });
+  }
+});
+
+test("Post-close revocation failure returns committed evidence for reconciliation", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-revoke-fault-state-"));
+  const pkgDir = mkdtempSync(join(tmpdir(), "devspace-revoke-fault-pkg-"));
+  const cutoverId = "cutover-revoke-fault";
+  const mock = await createMockReplacementServer({ cutoverId, statusStateDir: stateDir, revokeStatus: 503, workspaceId: "ws-revoke", agentId: "agt-revoke" });
+  const { store } = setupDrainedRecord(stateDir, cutoverId);
+  try {
+    createPackageRoot(pkgDir, SHA_BUILD_MANIFEST);
+    await assert.rejects(
+      performNativeCrossDomainBindingRepair({
+        cutoverId,
+        stateDir,
+        packageRoot: pkgDir,
+        serverUrl: mock.serverUrl,
+        ownerToken: mock.ownerToken,
+        workspaceId: "ws-revoke",
+        agentId: "agt-revoke",
+        requesterIdentity: { serverInstanceId: "repair-cli", sourceCommit: SHA_COMMIT, buildId: BUILD_ID },
+      }),
+      (error: unknown) => error instanceof NativeObservedReplacementCommittedError && error.committedRecord.phase === "closed",
+    );
+    assert.equal(new CutoverStateStore(stateDir).get()?.phase, "closed");
+  } finally {
+    await mock.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(pkgDir, { recursive: true, force: true });
+  }
+});
+
+test("Post-close native identity drift returns committed evidence", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-post-status-state-"));
+  const pkgDir = mkdtempSync(join(tmpdir(), "devspace-post-status-pkg-"));
+  const cutoverId = "cutover-post-status-drift";
+  const mock = await createMockReplacementServer({ cutoverId, statusStateDir: stateDir, statusServerInstanceIds: ["replacement-inst-1", "different-instance"], workspaceId: "ws-post", agentId: "agt-post" });
+  setupDrainedRecord(stateDir, cutoverId);
+  try {
+    createPackageRoot(pkgDir, SHA_BUILD_MANIFEST);
+    await assert.rejects(
+      performNativeCrossDomainBindingRepair({ cutoverId, stateDir, packageRoot: pkgDir, serverUrl: mock.serverUrl, ownerToken: mock.ownerToken, workspaceId: "ws-post", agentId: "agt-post", requesterIdentity: { serverInstanceId: "repair-cli", sourceCommit: SHA_COMMIT, buildId: BUILD_ID } }),
+      (error: unknown) => error instanceof NativeObservedReplacementCommittedError && error.committedRecord.phase === "closed",
+    );
+  } finally {
+    await mock.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(pkgDir, { recursive: true, force: true });
+  }
+});
+
+test("Post-close durable readback failure returns committed record with readback detail", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-post-readback-state-"));
+  const pkgDir = mkdtempSync(join(tmpdir(), "devspace-post-readback-pkg-"));
+  const cutoverId = "cutover-post-readback";
+  const mock = await createMockReplacementServer({ cutoverId, statusStateDir: stateDir, workspaceId: "ws-post-readback", agentId: "agt-post-readback" });
+  setupDrainedRecord(stateDir, cutoverId);
+  const originalClose = CutoverStateStore.prototype.close;
+  const originalGet = CutoverStateStore.prototype.get;
+  try {
+    createPackageRoot(pkgDir, SHA_BUILD_MANIFEST);
+    CutoverStateStore.prototype.close = function (this: CutoverStateStore, id: string, receipt: Parameters<CutoverStateStore["close"]>[1]) {
+      const result = originalClose.call(this, id, receipt);
+      CutoverStateStore.prototype.get = function () { throw new Error("injected post-close readback failure"); };
+      return result;
+    };
+    await assert.rejects(
+      performNativeCrossDomainBindingRepair({ cutoverId, stateDir, packageRoot: pkgDir, serverUrl: mock.serverUrl, ownerToken: mock.ownerToken, workspaceId: "ws-post-readback", agentId: "agt-post-readback", requesterIdentity: { serverInstanceId: "repair-cli", sourceCommit: SHA_COMMIT, buildId: BUILD_ID } }),
+      (error: unknown) => error instanceof NativeObservedReplacementCommittedError && error.committedRecord.phase === "closed" && error.message.includes("readback"),
+    );
+  } finally {
+    CutoverStateStore.prototype.close = originalClose;
+    CutoverStateStore.prototype.get = originalGet;
+    await mock.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(pkgDir, { recursive: true, force: true });
+  }
+});
+
+test("Post-close native status failure returns committed closed record", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-post-status-fail-state-"));
+  const pkgDir = mkdtempSync(join(tmpdir(), "devspace-post-status-fail-pkg-"));
+  const cutoverId = "cutover-post-status-fail";
+  const mock = await createMockReplacementServer({ cutoverId, statusStateDir: stateDir, statusFailAfter: 1, workspaceId: "ws-post-status-fail", agentId: "agt-post-status-fail" });
+  setupDrainedRecord(stateDir, cutoverId);
+  try {
+    createPackageRoot(pkgDir, SHA_BUILD_MANIFEST);
+    await assert.rejects(
+      performNativeCrossDomainBindingRepair({ cutoverId, stateDir, packageRoot: pkgDir, serverUrl: mock.serverUrl, ownerToken: mock.ownerToken, workspaceId: "ws-post-status-fail", agentId: "agt-post-status-fail", requesterIdentity: { serverInstanceId: "repair-cli", sourceCommit: SHA_COMMIT, buildId: BUILD_ID } }),
+      (error: unknown) => error instanceof NativeObservedReplacementCommittedError && error.committedRecord.phase === "closed",
+    );
+  } finally {
+    await mock.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(pkgDir, { recursive: true, force: true });
+  }
+});
+
+test("Marker write followed by an exception is reconciled as committed", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-marker-fault-state-"));
+  const pkgDir = mkdtempSync(join(tmpdir(), "devspace-marker-fault-pkg-"));
+  const cutoverId = "cutover-marker-fault";
+  const mock = await createMockReplacementServer({ cutoverId, statusStateDir: stateDir, workspaceId: "ws-marker", agentId: "agt-marker" });
+  setupDrainedRecord(stateDir, cutoverId);
+  const original = CutoverStateStore.prototype.recordBindingRepair;
+  try {
+    createPackageRoot(pkgDir, SHA_BUILD_MANIFEST);
+    CutoverStateStore.prototype.recordBindingRepair = function (this: CutoverStateStore, id: string, receipt: CutoverBindingRepairReceipt) {
+      const result = original.call(this, id, receipt);
+      throw new Error("injected post-write exception");
+    };
+    await assert.rejects(
+      performNativeCrossDomainBindingRepair({ cutoverId, stateDir, packageRoot: pkgDir, serverUrl: mock.serverUrl, ownerToken: mock.ownerToken, workspaceId: "ws-marker", agentId: "agt-marker", requesterIdentity: { serverInstanceId: "repair-cli", sourceCommit: SHA_COMMIT, buildId: BUILD_ID } }),
+      (error: unknown) => error instanceof NativeObservedReplacementCommittedError && error.committedRecord.bindingRepair !== undefined,
+    );
+    assert.ok(new CutoverStateStore(stateDir).get()?.bindingRepair);
+  } finally {
+    CutoverStateStore.prototype.recordBindingRepair = original;
+    await mock.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(pkgDir, { recursive: true, force: true });
+  }
+});
+
+test("Close write followed by an exception returns the physical closed record", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-close-write-fault-state-"));
+  const pkgDir = mkdtempSync(join(tmpdir(), "devspace-close-write-fault-pkg-"));
+  const cutoverId = "cutover-close-write-fault";
+  const mock = await createMockReplacementServer({ cutoverId, statusStateDir: stateDir, workspaceId: "ws-close-write", agentId: "agt-close-write" });
+  setupDrainedRecord(stateDir, cutoverId);
+  const originalClose = CutoverStateStore.prototype.close;
+  try {
+    createPackageRoot(pkgDir, SHA_BUILD_MANIFEST);
+    CutoverStateStore.prototype.close = function (this: CutoverStateStore, id: string, receipt: Parameters<CutoverStateStore["close"]>[1]) {
+      const result = originalClose.call(this, id, receipt);
+      throw new Error(`injected after close write ${result.phase}`);
+    };
+    await assert.rejects(
+      performNativeCrossDomainBindingRepair({ cutoverId, stateDir, packageRoot: pkgDir, serverUrl: mock.serverUrl, ownerToken: mock.ownerToken, workspaceId: "ws-close-write", agentId: "agt-close-write", requesterIdentity: { serverInstanceId: "repair-cli", sourceCommit: SHA_COMMIT, buildId: BUILD_ID } }),
+      (error: unknown) => error instanceof NativeObservedReplacementCommittedError && error.committedRecord.phase === "closed",
+    );
+    assert.equal(new CutoverStateStore(stateDir).get()?.phase, "closed");
+  } finally {
+    CutoverStateStore.prototype.close = originalClose;
+    await mock.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(pkgDir, { recursive: true, force: true });
+  }
+});
+
+test("Marker write followed by unavailable readback reports outcome unknown without a fabricated record", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-marker-readback-fault-state-"));
+  const pkgDir = mkdtempSync(join(tmpdir(), "devspace-marker-readback-fault-pkg-"));
+  const cutoverId = "cutover-marker-readback-fault";
+  const mock = await createMockReplacementServer({ cutoverId, statusStateDir: stateDir, workspaceId: "ws-marker-readback", agentId: "agt-marker-readback" });
+  setupDrainedRecord(stateDir, cutoverId);
+  const originalRecord = CutoverStateStore.prototype.recordBindingRepair;
+  const originalGet = CutoverStateStore.prototype.get;
+  try {
+    createPackageRoot(pkgDir, SHA_BUILD_MANIFEST);
+    CutoverStateStore.prototype.recordBindingRepair = function (this: CutoverStateStore, id: string, receipt: CutoverBindingRepairReceipt) {
+      const result = originalRecord.call(this, id, receipt);
+      CutoverStateStore.prototype.get = function () { throw new Error("injected readback unavailable"); };
+      throw new Error("injected after marker write");
+    };
+    await assert.rejects(
+      performNativeCrossDomainBindingRepair({ cutoverId, stateDir, packageRoot: pkgDir, serverUrl: mock.serverUrl, ownerToken: mock.ownerToken, workspaceId: "ws-marker-readback", agentId: "agt-marker-readback", requesterIdentity: { serverInstanceId: "repair-cli", sourceCommit: SHA_COMMIT, buildId: BUILD_ID } }),
+      (error: unknown) => error instanceof NativeBindingRepairOutcomeUnknownError && error.cutoverId === cutoverId && !("committedRecord" in (error as object)),
+    );
+  } finally {
+    CutoverStateStore.prototype.recordBindingRepair = originalRecord;
+    CutoverStateStore.prototype.get = originalGet;
     await mock.close();
     rmSync(stateDir, { recursive: true, force: true });
     rmSync(pkgDir, { recursive: true, force: true });
@@ -1265,10 +1555,10 @@ test("G71-R1 & G71-R9: assertValidBindingRepair rejects fabricated or inconsiste
 });
 
 // ---------------------------------------------------------------------------
-// G71-R6: Atomic CAS Concurrency Protection Test
+// G71-R6: Fresh successor binding validation
 // ---------------------------------------------------------------------------
 
-test("G71-R6: Atomic CAS fails closed if record is updated concurrently before repair", async () => {
+test("G71-R6: Fresh successor binding validation fails closed if predecessor binding drifts before repair", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-cas-state-"));
   const pkgDir = mkdtempSync(join(tmpdir(), "devspace-cas-pkg-"));
   let mutated = false;
@@ -1279,12 +1569,12 @@ test("G71-R6: Atomic CAS fails closed if record is updated concurrently before r
         mutated = true;
         // Concurrently mutate the latest durable drained event file's updatedAt
         const activeDir = join(stateDir, "cutover", "active");
-        const files = readdirSync(activeDir).filter((f) => f.startsWith("drained-")).sort();
+        const files = readdirSync(activeDir).filter((f) => f.includes("drained-")).sort();
         const drainedFile = files.at(-1)!;
         const targetPath = join(activeDir, drainedFile);
         const raw = readFileSync(targetPath, "utf8");
         const obj = JSON.parse(raw);
-        obj.updatedAt = new Date(Date.now() + 100000).toISOString();
+        obj.supersedesCutoverId = "different-predecessor";
         writeFileSync(targetPath, JSON.stringify(obj, null, 2) + "\n");
       }
     },
@@ -1317,6 +1607,42 @@ test("G71-R6: Atomic CAS fails closed if record is updated concurrently before r
         );
       },
     );
+  } finally {
+    await mock.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(pkgDir, { recursive: true, force: true });
+  }
+});
+
+test("G71-R6b: Fresh durable updatedAt validation fails closed before repair marker write", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-updatedat-state-"));
+  const pkgDir = mkdtempSync(join(tmpdir(), "devspace-updatedat-pkg-"));
+  let mutated = false;
+  const mock = await createMockReplacementServer({
+    cutoverId: "cutover-updatedat",
+    onCallTool: (name) => {
+      if (name !== "agent_reconcile" || mutated) return;
+      mutated = true;
+      const activeDir = join(stateDir, "cutover", "active");
+      const file = readdirSync(activeDir).filter((f) => f.includes("drained-")).sort().at(-1)!;
+      const path = join(activeDir, file);
+      const record = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+      record.updatedAt = new Date(Date.now() + 100000).toISOString();
+      writeFileSync(path, JSON.stringify(record, null, 2) + "\n");
+    },
+  });
+  try {
+    createPackageRoot(pkgDir, SHA_BUILD_MANIFEST);
+    setupDrainedRecord(stateDir, "cutover-updatedat", SHA_BUILD_MANIFEST);
+    await assert.rejects(
+      performNativeCrossDomainBindingRepair({
+        cutoverId: "cutover-updatedat", stateDir, packageRoot: pkgDir, serverUrl: mock.serverUrl,
+        ownerToken: mock.ownerToken, workspaceId: "ws-test", agentId: "agt-test",
+        requesterIdentity: { serverInstanceId: "cli-updatedat", sourceCommit: SHA_COMMIT, buildId: BUILD_ID },
+      }),
+      /Concurrent modification detected: cutover was updated during repair evaluation/,
+    );
+    assert.equal(new CutoverStateStore(stateDir).get()?.bindingRepair, undefined);
   } finally {
     await mock.close();
     rmSync(stateDir, { recursive: true, force: true });
@@ -1357,7 +1683,7 @@ test("G71-R7: 150a36f old parser and mode() function accept repaired record and 
     // Read the latest active event file written by out-of-process repair
     const activeDir = join(stateDir, "cutover", "active");
     const eventFiles = readdirSync(activeDir).filter((f) => f.endsWith(".json")).sort();
-    const closedEventFile = eventFiles.find((f) => f.startsWith("closed-"));
+    const closedEventFile = eventFiles.find((f) => f.includes("closed-"));
     assert.ok(closedEventFile, "closed event file must exist on disk");
     const rawOnDisk = readFileSync(join(activeDir, closedEventFile), "utf8");
 
