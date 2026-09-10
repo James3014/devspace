@@ -440,6 +440,52 @@ test("runToolchainVerifier runs allowlisted executable with bounded cwd and stru
   }
 });
 
+test("runToolchainVerifier preserves literal argv and separates launch failure from verifier exit", async () => {
+  const root = mkdtempSync(join(tmpdir(), "devspace-toolchain-argv-"));
+  const cwd = mkdtempSync(join(tmpdir(), "devspace-toolchain-argv-cwd-"));
+  try {
+    const executable = join(root, process.platform === "win32" ? "node.exe" : "node");
+    const script = join(root, "argv-verifier.mjs");
+    const expectedArgs = ["value with spaces", "literal;$(touch SHOULD_NOT_EXIST)", "quote'\"value"];
+    copyFileSync(process.execPath, executable);
+    chmodSync(executable, 0o755);
+    writeFileSync(script, `
+      const [mode, ...args] = process.argv.slice(2);
+      const expected = ${JSON.stringify(expectedArgs)};
+      if (JSON.stringify(args) !== JSON.stringify(expected)) process.exit(17);
+      process.exit(mode === "fail" ? 7 : 0);
+    `);
+    const toolchains: ToolchainSpec[] = [{ id: "native", root, verifiers: { probe: executable } }];
+    const args = [script, "ok", ...expectedArgs];
+    const success = await runToolchainVerifier({ toolchains, toolchainId: "native", verifier: "probe", args, cwd });
+    assert.equal(success.exitCode, 0, `${success.stderr}\n${success.stdout}`);
+    assert.equal(success.launchError, undefined);
+    const failed = await runToolchainVerifier({
+      toolchains,
+      toolchainId: "native",
+      verifier: "probe",
+      args: [script, "fail", ...args.slice(2)],
+      cwd,
+    });
+    assert.equal(failed.exitCode, 7);
+    assert.equal(failed.launchError, undefined, "a real verifier exit must not be labeled launch failure");
+    const unavailable = join(root, "unavailable-verifier");
+    writeFileSync(unavailable, "#!/bin/sh\nexit 0\n", { mode: 0o644 });
+    const missing = await runToolchainVerifier({
+      toolchains: [{ id: "native", root, verifiers: { probe: unavailable } }],
+      toolchainId: "native",
+      verifier: "probe",
+      args: [],
+      cwd,
+    });
+    assert.equal(missing.exitCode, null);
+    assert.equal(missing.launchError?.code, "TOOLCHAIN_LAUNCH_FAILED");
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
 test("runToolchainVerifier enforces a bounded timeout", async () => {
   const root = mkdtempSync(join(tmpdir(), "devspace-toolchain-test-"));
   try {

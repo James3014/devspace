@@ -434,6 +434,14 @@ export function runToolchainVerifier(input: {
           error && typeof (error as { code?: unknown }).code === "number"
             ? (error as { code: number }).code
             : error ? null : 0;
+        const errorCode = error && typeof (error as { code?: unknown }).code === "string"
+          ? (error as { code: string }).code
+          : undefined;
+        const launchFailed = Boolean(
+          errorCode &&
+            !((error as { killed?: unknown }).killed === true) &&
+            !((error as { signal?: unknown }).signal),
+        );
         resolvePromise({
           toolchainId: input.toolchainId,
           verifier: input.verifier,
@@ -443,7 +451,7 @@ export function runToolchainVerifier(input: {
           durationMs: Date.now() - startedAt,
           stdout: (stdout ?? "").toString(),
           stderr: (stderr ?? "").toString(),
-          ...(error
+          ...(launchFailed
             ? {
                 launchError: {
                   code: "TOOLCHAIN_LAUNCH_FAILED" as const,

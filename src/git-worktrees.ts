@@ -35,7 +35,7 @@ export interface ManagedWorktree {
 
 const repoWorktreeLocks = new Map<string, Promise<void>>();
 
-async function withRepoWorktreeLock<T>(sourceRoot: string, fn: () => Promise<T>): Promise<T> {
+export async function withRepoWorktreeLock<T>(sourceRoot: string, fn: () => Promise<T>): Promise<T> {
   const currentLock = repoWorktreeLocks.get(sourceRoot) ?? Promise.resolve();
   let releaseLock: () => void;
   const newLock = new Promise<void>((resolve) => {
@@ -52,6 +52,10 @@ async function withRepoWorktreeLock<T>(sourceRoot: string, fn: () => Promise<T>)
       repoWorktreeLocks.delete(sourceRoot);
     }
   }
+}
+
+export function repoWorktreeLockCount(): number {
+  return repoWorktreeLocks.size;
 }
 
 export async function createManagedWorktree(input: {
