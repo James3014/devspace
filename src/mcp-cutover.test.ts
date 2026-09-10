@@ -27,6 +27,15 @@ test("old instance drains and replacement instance is reconcile-only across rest
     assert.doesNotThrow(() => old.assertToolAllowed("agent_status"));
     assert.doesNotThrow(() => old.assertToolAllowed("agent_reconcile"));
     assert.doesNotThrow(() => old.assertToolAllowed("remote_writability_probe"));
+    for (const tool of ["chat_swarm_create", "chat_swarm_join", "chat_swarm_dispatch", "chat_swarm_close"]) {
+      assert.throws(() => old.assertToolAllowed(tool), /CUTOVER_RECONCILIATION_REQUIRED/);
+    }
+    // `next` is admitted to the handler because it must distinguish a
+    // worker's already-owned task from a new claim.
+    assert.doesNotThrow(() => old.assertToolAllowed("chat_swarm_next"));
+    for (const tool of ["chat_swarm_submit", "chat_swarm_status", "chat_swarm_collect", "chat_swarm_reconcile", "chat_swarm_cancel"]) {
+      assert.doesNotThrow(() => old.assertToolAllowed(tool));
+    }
 
     const replacement = new McpCutoverController(
       new CutoverStateStore(stateDir),
@@ -40,6 +49,8 @@ test("old instance drains and replacement instance is reconcile-only across rest
     );
     assert.throws(() => replacement.assertToolAllowed("agent_start"), /CUTOVER_RECONCILIATION_REQUIRED/);
     assert.throws(() => replacement.assertToolAllowed("bash"), /CUTOVER_RECONCILIATION_REQUIRED/);
+    assert.throws(() => replacement.assertToolAllowed("chat_swarm_create"), /CUTOVER_RECONCILIATION_REQUIRED/);
+    assert.doesNotThrow(() => replacement.assertToolAllowed("chat_swarm_next"));
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }

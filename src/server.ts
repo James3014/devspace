@@ -103,6 +103,9 @@ import {
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { openAiConversationScopeId } from "./request-meta.js";
 import { isReadOnlyInspectionCommand } from "./conversation-isolation.js";
+import { ChatSwarmLifecycle } from "./chat-swarm-lifecycle.js";
+import { registerChatSwarmTools, chatSwarmToolInputShapes } from "./chat-swarm-tools.js";
+import { ChatSwarmRuntimeOwner } from "./chat-swarm-runtime-owner.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
@@ -2125,6 +2128,7 @@ export function createMcpServer(
   cutoverControl?: CutoverMcpControlContext,
   opencodeCatalogSource?: ReturnType<typeof createMcpOpencodeCatalogSource>,
   clineCatalogService?: ClineCatalogService,
+  chatSwarmLifecycle?: ChatSwarmLifecycle,
 ): McpServer {
   const runtimeBuildIdentity = runtimeBuildIdentityContext?.identity
     ?? describeRuntimeBuildIdentity({
@@ -2145,8 +2149,13 @@ export function createMcpServer(
           agent_start: agentStartInputSchema,
           agent_preflight: agentPreflightInputSchema,
           agent_catalog: createAgentCatalogInputSchema(),
+          ...(config.chatSwarmEnabled && chatSwarmLifecycle?.enabled && chatSwarmLifecycle.coordinator
+            ? chatSwarmToolInputShapes(config)
+            : {}),
         }
-        : {},
+        : config.chatSwarmEnabled && chatSwarmLifecycle?.enabled && chatSwarmLifecycle.coordinator
+          ? chatSwarmToolInputShapes(config)
+          : {},
     );
   const server = new McpServer(
     {
@@ -4591,11 +4600,20 @@ export function createMcpServer(
     );
   }
 
+  if (chatSwarmLifecycle?.enabled && chatSwarmLifecycle.coordinator) {
+    registerChatSwarmTools(server, {
+      coordinator: chatSwarmLifecycle.coordinator,
+      config,
+      admit: (action, context) => chatSwarmLifecycle.admit(action === "worker_next" ? "next" : action, context),
+    });
+  }
+
   return server;
 }
 
 export interface CreateServerOptions {
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
+  chatSwarmInitializationHook?: () => void;
 }
 
 export interface DurableReconciliationResolverDependencies {
@@ -4813,18 +4831,26 @@ export function createServer(
   });
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
+  const initializationCleanups: Array<() => void> = [];
+  let chatSwarmRuntimeOwner: ChatSwarmRuntimeOwner | undefined;
+  try {
   const oauthProvider = new SingleUserOAuthProvider(config.oauth, mcpUrl, config.stateDir);
+  initializationCleanups.push(() => oauthProvider.close());
   const bearerAuth = requireBearerAuth({
     verifier: oauthProvider,
     requiredScopes: [config.oauth.scopes[0] ?? "devspace"],
     resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceServerUrl),
   });
   const workspaceStore = createWorkspaceStore(config.stateDir);
+  initializationCleanups.push(() => workspaceStore.close?.());
   const workspaces = new WorkspaceRegistry(config, workspaceStore);
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
+  initializationCleanups.push(() => processSessions.shutdown());
   const durableOperations = new DurableOperationManager(config);
+  initializationCleanups.push(() => durableOperations.close());
   const opencodeCatalogSource = createMcpOpencodeCatalogSource();
+  initializationCleanups.push(() => opencodeCatalogSource.close());
   const clineCatalogService = new ClineCatalogService();
   const localAgentProviders = buildLocalAgentProviderStatuses(
     config.subagents,
@@ -4845,11 +4871,13 @@ export function createServer(
   const agentSessionManager = config.subagents.enabled
     ? new LocalAgentSessionManager(config, undefined, undefined, undefined, runtimeBuildIdentity, undefined, clineCatalogService, opencodeCatalogSource)
     : undefined;
+  initializationCleanups.push(() => agentSessionManager?.close());
   const capabilityManifest = deriveLoadedCapabilityManifest(
     {
       ...(agentSessionManager
         ? { agent_start: createAgentStartInputSchema(), agent_preflight: createAgentPreflightInputSchema(), agent_catalog: createAgentCatalogInputSchema() }
         : {}),
+      ...(config.chatSwarmEnabled ? chatSwarmToolInputShapes(config) : {}),
     },
   );
   const cutoverController = new McpCutoverController(
@@ -4861,6 +4889,14 @@ export function createServer(
       capabilityManifestSha256: capabilityManifest.manifestSha256,
     },
   );
+  chatSwarmRuntimeOwner = config.chatSwarmEnabled
+    ? new ChatSwarmRuntimeOwner(config.stateDir)
+    : undefined;
+  chatSwarmRuntimeOwner?.acquire();
+  const chatSwarmLifecycle = new ChatSwarmLifecycle({ stateDir: config.stateDir, enabled: config.chatSwarmEnabled, mode: () => cutoverController.mode() });
+  initializationCleanups.push(() => chatSwarmLifecycle.close());
+  if (chatSwarmLifecycle.enabled) chatSwarmLifecycle.recoverAfterStartup();
+  options.chatSwarmInitializationHook?.();
   const restartSelfActuator = createLaunchdSelfRestartActuator();
   const resolveDurableReconciliationWitness = async (
     preferredPair?: { workspaceId?: string; agentId?: string },
@@ -5122,6 +5158,7 @@ export function createServer(
     ? new CodexGoalSessionManager(processSessions, { codexBin: config.codexBin })
     : undefined;
 
+  initializationCleanups.push(() => codexGoals?.shutdown());
   const buildReadyProbe = config.mcpCutoverBuildReadyRoot
     ? (expected: ExpectedCutoverIdentity) =>
         probeBuildReady({ packageRoot: config.mcpCutoverBuildReadyRoot!, expected })
@@ -5162,6 +5199,7 @@ export function createServer(
         });
       }, AGENT_SUPERVISION_INTERVAL_MS)
     : undefined;
+  initializationCleanups.push(() => { if (agentSupervisionTimer) clearInterval(agentSupervisionTimer); });
   agentSupervisionTimer?.unref();
 
   const logSessionCloseResults = (
@@ -5218,6 +5256,7 @@ export function createServer(
         });
       });
   }, MCP_SESSION_CLEANUP_INTERVAL_MS);
+  initializationCleanups.push(() => clearInterval(sessionCleanupTimer));
   sessionCleanupTimer.unref();
 
   if (config.logging.trustProxy !== false) {
@@ -5444,6 +5483,7 @@ export function createServer(
           },
           opencodeCatalogSource,
           clineCatalogService,
+          chatSwarmLifecycle,
         );
         await server.connect(transport);
       } else {
@@ -5482,6 +5522,8 @@ export function createServer(
         codexGoals?.shutdown();
         processSessions.shutdown();
         durableOperations.close();
+        chatSwarmLifecycle?.close();
+        chatSwarmRuntimeOwner?.close();
         agentSessionManager?.close();
         await opencodeCatalogSource.close();
         oauthProvider.close();
@@ -5490,6 +5532,14 @@ export function createServer(
       return closePromise;
     },
   };
+  } catch (error) {
+    // Construction stays synchronous: close every acquired handle before rethrowing.
+    for (const cleanup of initializationCleanups.reverse()) {
+      try { cleanup(); } catch { /* Preserve the initialization error and continue cleanup. */ }
+    }
+    try { chatSwarmRuntimeOwner?.close(); } catch { /* Preserve the original error. */ }
+    throw error;
+  }
 }
 
 async function isMainModule(): Promise<boolean> {

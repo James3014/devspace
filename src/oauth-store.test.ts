@@ -53,6 +53,8 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 10, name: "local-agent-error-details" },
       { version: 11, name: "local-agent-execution-generation" },
       { version: 12, name: "durable-operations" },
+      { version: 13, name: "chat-swarm-core" },
+      { version: 14, name: "chat-swarm-runtime-owner" },
     ]);
   } finally {
     database.close();

@@ -10,6 +10,7 @@ import test, { after, type TestContext } from "node:test";
 import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import * as z from "zod/v4";
 import { loadConfig, type ServerConfig } from "./config.js";
 import type { LocalAgentProviderAvailability } from "./local-agent-availability.js";
 import { buildLocalAgentProviderStatuses } from "./local-agent-catalog.js";
@@ -18,6 +19,7 @@ import { MINIMUM_CODEX_RUNTIME_VERSION } from "./codex-runtime.js";
 import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { DurableOperationManager } from "./durable-operations.js";
+import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import { createMcpServer, createServer, resolveDurableReconciliationWitnessFromInventory } from "./server.js";
 import { CutoverStateStore } from "./cutover-state.js";
 import { McpCutoverController } from "./mcp-cutover.js";
@@ -25,9 +27,35 @@ import { LocalAgentStore } from "./local-agent-store.js";
 import { LocalAgentSessionManager } from "./local-agent-sessions.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
+import { ChatSwarmLifecycle } from "./chat-swarm-lifecycle.js";
+import { ChatSwarmRuntimeAlreadyOwnedError } from "./chat-swarm-runtime-owner.js";
+import { ChatSwarmStore } from "./chat-swarm-store.js";
+import { chatSwarmToolInputShapes } from "./chat-swarm-tools.js";
 import { SqliteOAuthStore, SqliteOAuthClientsStore } from "./oauth-store.js";
 
 const execFileAsync = promisify(execFile);
+
+function normalizedSchema(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(normalizedSchema);
+  if (!value || typeof value !== "object") return value;
+  const object = value as Record<string, unknown>;
+  const normalized = Object.fromEntries(Object.entries(object)
+    .filter(([key]) => key !== "$schema")
+    .map(([key, child]) => [key, normalizedSchema(child)]));
+  return normalized;
+}
+
+function assertRegisteredChatSwarmSchemaParity(
+  actualTools: readonly { name: string; inputSchema?: unknown }[],
+  expectedShapes: Record<string, Record<string, z.ZodType>>,
+): void {
+  const actual = Object.fromEntries(actualTools.map((tool) => [tool.name, tool.inputSchema]));
+  assert.deepEqual(Object.keys(actual).sort(), Object.keys(expectedShapes).sort());
+  for (const [name, shape] of Object.entries(expectedShapes)) {
+    const expected = normalizedSchema(z.toJSONSchema(z.object(shape), { io: "input", target: "draft-7" }));
+    assert.deepEqual(normalizedSchema(actual[name]), expected);
+  }
+}
 
 // Hermetic Codex runtime so dispatch gates see a valid, inspectable runtime
 // and spawned workers fail fast locally instead of invoking a real provider.
@@ -599,6 +627,7 @@ async function fixture(
     gitCandidates?: boolean;
     toolchains?: string;
     toolMode?: "full" | "minimal" | "codex";
+    chatSwarm?: boolean;
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -648,6 +677,7 @@ async function fixture(
     DEVSPACE_STATE_DIR: stateDir,
     DEVSPACE_GIT_CANDIDATES: options.gitCandidates ? "true" : "false",
     DEVSPACE_TOOLCHAINS: options.toolchains,
+    DEVSPACE_CHAT_SWARM: options.chatSwarm ? "1" : "0",
   });
   let config: ServerConfig = {
     ...loadedConfig,
@@ -685,6 +715,8 @@ async function fixture(
     ? new LocalAgentSessionManager(config, async () => {}, async () => true)
     : undefined;
   const durableOperations = new DurableOperationManager(config);
+  const chatSwarmLifecycle = config.chatSwarmEnabled ? new ChatSwarmLifecycle({ stateDir }) : undefined;
+  chatSwarmLifecycle?.recoverAfterStartup();
   const server = createMcpServer(
     config,
     workspaces,
@@ -696,6 +728,10 @@ async function fixture(
     undefined,
     undefined,
     durableOperations,
+    undefined,
+    undefined,
+    undefined,
+    chatSwarmLifecycle,
   );
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "devspace-test-client", version: "1.0.0" });
@@ -711,6 +747,7 @@ async function fixture(
     await client.close();
     await server.close();
     durableOperations.close();
+    chatSwarmLifecycle?.close();
     agentSessionManager?.close();
     store.close();
   };
@@ -722,6 +759,157 @@ async function fixture(
 
   return { client, project, config, stateDir, close };
 }
+
+test("Chat Swarm production registration is opt-in and uses the shared lifecycle", async (t) => {
+  const disabled = await fixture(t);
+  assert.equal((await disabled.client.listTools()).tools.some((tool) => tool.name === "chat_swarm_create"), false);
+  await disabled.close();
+
+  const enabled = await fixture(t, { chatSwarm: true });
+  const tools = await enabled.client.listTools();
+  const swarmTools = tools.tools.filter((tool) => tool.name.startsWith("chat_swarm_"));
+  assert.equal(swarmTools.length, 10);
+  assert.ok(swarmTools.every((tool) => tool.inputSchema));
+  const expectedShapes = chatSwarmToolInputShapes(enabled.config);
+  assertRegisteredChatSwarmSchemaParity(swarmTools, expectedShapes);
+  assert.throws(() => assertRegisteredChatSwarmSchemaParity(swarmTools.slice(1), expectedShapes));
+  assert.throws(() => assertRegisteredChatSwarmSchemaParity(swarmTools, {
+    ...expectedShapes,
+    chat_swarm_next: { workerId: z.string().min(1) },
+  }));
+  assert.ok(swarmTools.find((tool) => tool.name === "chat_swarm_status")?.annotations?.readOnlyHint);
+  const owner = { "openai/session": "server-owner" };
+  const created = await enabled.client.callTool({ name: "chat_swarm_create", arguments: { workerLimit: 1 }, _meta: owner });
+  assert.equal(created.isError, undefined);
+  const createdValue = created.structuredContent as Record<string, any>;
+  assert.equal(createdValue.swarm.status, "ACTIVE");
+  const workerCall = await enabled.client.callTool({
+    name: "chat_swarm_join",
+    arguments: { swarmId: createdValue.swarm.id, inviteCredential: createdValue.inviteCredential, label: "server-peer", runtimeKind: "mcp_peer" },
+    _meta: { "openai/session": "server-peer" },
+  });
+  assert.equal(workerCall.isError, undefined);
+  const worker = workerCall.structuredContent as Record<string, any>;
+  const dispatched = await enabled.client.callTool({
+    name: "chat_swarm_dispatch",
+    arguments: { swarmId: createdValue.swarm.id, taskKey: "server-task", prompt: "server protocol" },
+    _meta: owner,
+  });
+  assert.equal(dispatched.isError, undefined);
+  const task = dispatched.structuredContent as Record<string, any>;
+  const next = await enabled.client.callTool({ name: "chat_swarm_next", arguments: { workerId: worker.id }, _meta: { "openai/session": "server-peer" } });
+  assert.equal((next.structuredContent as Record<string, any>).task.id, task.id);
+  const submitted = await enabled.client.callTool({ name: "chat_swarm_submit", arguments: { workerId: worker.id, taskId: task.id, result: "server-result" }, _meta: { "openai/session": "server-peer" } });
+  assert.equal((submitted.structuredContent as Record<string, any>).lifecycleState, "RESULT_READY");
+  const collected = await enabled.client.callTool({ name: "chat_swarm_collect", arguments: { swarmId: createdValue.swarm.id, taskId: task.id }, _meta: owner });
+  assert.equal((collected.structuredContent as Record<string, any>).lifecycleState, "COLLECTED");
+  const closed = await enabled.client.callTool({ name: "chat_swarm_close", arguments: { swarmId: createdValue.swarm.id }, _meta: owner });
+  assert.equal((closed.structuredContent as Record<string, any>).status, "CLOSED");
+});
+
+function trackServerStoreCloses(t: TestContext) {
+  const counts = new Map<object, number>();
+  for (const prototype of [DurableOperationManager.prototype, SqliteWorkspaceStore.prototype, SingleUserOAuthProvider.prototype]) {
+    const original = prototype.close;
+    t.mock.method(prototype, "close", function (this: typeof prototype) {
+      counts.set(this, (counts.get(this) ?? 0) + 1);
+      return original.call(this);
+    });
+  }
+  return counts;
+}
+
+test("enabled createServer instances share one runtime owner", async (t) => {
+  const closes = trackServerStoreCloses(t);
+  const root = await mkdtemp(join(tmpdir(), "devspace-server-swarm-owner-"));
+  const stateDir = join(root, ".state");
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_WORKTREE_ROOT: join(root, ".worktrees"),
+    DEVSPACE_AGENT_DIR: join(root, ".agents"),
+    DEVSPACE_CHAT_SWARM: "1",
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  const first = createServer(config);
+  try {
+    assert.throws(() => createServer(config), ChatSwarmRuntimeAlreadyOwnedError);
+    assert.equal(closes.size, 3, "failed construction closes each newly owned store");
+    assert.deepEqual([...closes.values()], [1, 1, 1]);
+    assert.throws(() => createServer(config), ChatSwarmRuntimeAlreadyOwnedError,
+      "failed construction must not release the existing server owner");
+    assert.equal(closes.size, 6);
+    assert.ok([...closes.values()].every(count => count === 1));
+  } finally {
+    await first.close();
+  }
+  const afterRelease = createServer(config);
+  await afterRelease.close();
+  assert.equal(closes.size, 12);
+  assert.ok([...closes.values()].every(count => count === 1));
+  await rm(root, { recursive: true, force: true });
+});
+
+test("late server initialization failure releases the Chat Swarm owner", async (t) => {
+  const closes = trackServerStoreCloses(t);
+  const root = await mkdtemp(join(tmpdir(), "devspace-server-swarm-owner-failure-"));
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_WORKTREE_ROOT: join(root, ".worktrees"),
+    DEVSPACE_AGENT_DIR: join(root, ".agents"),
+    DEVSPACE_CHAT_SWARM: "1",
+    DEVSPACE_STATE_DIR: join(root, ".state"),
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  assert.throws(
+    () => createServer(config, { chatSwarmInitializationHook: () => { throw new Error("late init fault"); } }),
+    /late init fault/,
+  );
+  assert.equal(closes.size, 3, "late initialization failure closes all owned stores");
+  assert.deepEqual([...closes.values()], [1, 1, 1]);
+  const recovered = createServer(config);
+  await recovered.close();
+  assert.equal(closes.size, 6);
+  assert.ok([...closes.values()].every(count => count === 1));
+  await rm(root, { recursive: true, force: true });
+});
+
+test("enabled server startup explicitly reconciles a previously claimed task", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-server-swarm-recovery-"));
+  const stateDir = join(root, ".state");
+  const store = new ChatSwarmStore(stateDir);
+  const swarm = store.createSwarm({ ownerIdentity: "owner", inviteCredential: "invite", workerLimit: 1 });
+  const worker = store.createWorker({ swarmId: swarm.id, label: "peer", runtimeKind: "mcp_peer" });
+  const task = store.createTask({ swarmId: swarm.id, taskKey: "restart", prompt: "restart" }).task;
+  store.claimTask(task.id, worker.id);
+  store.close();
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_WORKTREE_ROOT: join(root, ".worktrees"),
+    DEVSPACE_AGENT_DIR: join(root, ".agents"),
+    DEVSPACE_CHAT_SWARM: "1",
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  const running = createServer(config);
+  try {
+    const afterRestart = new ChatSwarmStore(stateDir);
+    try {
+      assert.equal(afterRestart.getTask(task.id)?.lifecycleState, "RECONCILE_REQUIRED");
+    } finally {
+      afterRestart.close();
+    }
+  } finally {
+    await running.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
 
 async function git(cwd: string, args: string[]): Promise<void> {
   await execFileAsync("git", args, { cwd });

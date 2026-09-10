@@ -15,6 +15,10 @@ const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_ARTIFACT_MAX_FILE_BYTES = 100 * 1024 * 1024;
 const DEFAULT_MCP_SESSION_IDLE_TIMEOUT_MS = 6 * 60 * 60 * 1000;
 const DEFAULT_MCP_SESSION_MAX_SESSIONS = 2048;
+const DEFAULT_CHAT_SWARM_MAX_WORKERS = 16;
+const DEFAULT_CHAT_SWARM_QUEUE_LIMIT = 1000;
+const DEFAULT_CHAT_SWARM_RESULT_MAX_CHARS = 256 * 1024;
+const DEFAULT_CHAT_SWARM_INVITE_TTL_SECONDS = 15 * 60;
 
 export interface ServerConfig {
   host: string;
@@ -43,6 +47,11 @@ export interface ServerConfig {
   codexBin?: string;
   mcpSessionIdleTimeoutMs: number;
   mcpSessionMaxSessions: number;
+  chatSwarmEnabled: boolean;
+  chatSwarmMaxWorkers: number;
+  chatSwarmQueueLimit: number;
+  chatSwarmResultMaxChars: number;
+  chatSwarmInviteTtlSeconds: number;
   mcpCutoverBuildReadyRoot?: string;
   repositoryIntelligenceRoot?: string;
   repositoryIntelligenceExpectedHead?: string;
@@ -360,6 +369,31 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       DEFAULT_MCP_SESSION_MAX_SESSIONS,
       "DEVSPACE_MCP_SESSION_MAX_SESSIONS",
       100_000,
+    ),
+    chatSwarmEnabled: parseBoolean(env.DEVSPACE_CHAT_SWARM),
+    chatSwarmMaxWorkers: parsePositiveInteger(
+      env.DEVSPACE_CHAT_SWARM_MAX_WORKERS,
+      DEFAULT_CHAT_SWARM_MAX_WORKERS,
+      "DEVSPACE_CHAT_SWARM_MAX_WORKERS",
+      1_000,
+    ),
+    chatSwarmQueueLimit: parsePositiveInteger(
+      env.DEVSPACE_CHAT_SWARM_QUEUE_LIMIT,
+      DEFAULT_CHAT_SWARM_QUEUE_LIMIT,
+      "DEVSPACE_CHAT_SWARM_QUEUE_LIMIT",
+      100_000,
+    ),
+    chatSwarmResultMaxChars: parsePositiveInteger(
+      env.DEVSPACE_CHAT_SWARM_RESULT_MAX_CHARS,
+      DEFAULT_CHAT_SWARM_RESULT_MAX_CHARS,
+      "DEVSPACE_CHAT_SWARM_RESULT_MAX_CHARS",
+      256 * 1024,
+    ),
+    chatSwarmInviteTtlSeconds: parsePositiveInteger(
+      env.DEVSPACE_CHAT_SWARM_INVITE_TTL_SECONDS,
+      DEFAULT_CHAT_SWARM_INVITE_TTL_SECONDS,
+      "DEVSPACE_CHAT_SWARM_INVITE_TTL_SECONDS",
+      7 * 24 * 60 * 60,
     ),
     mcpCutoverBuildReadyRoot: parseBuildReadyRoot(
       env.DEVSPACE_BUILD_READY_ROOT ?? files.config.mcpCutoverBuildReadyRoot,
