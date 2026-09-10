@@ -172,3 +172,18 @@ test("C1 two processes race at renewal/reconciliation CAS after grant is seeded"
     } finally {children.forEach(c=>c.child.kill());rmSync(root,{recursive:true,force:true});}
   }
 });
+
+test("C1 corrupted receipt after reopen denies replay and preserves durable evidence", () => {
+  for (const patch of ["new_version=-1", "receipt_id=''", "created_at='invalid'", "evidence_json='{}'"]) {
+    const root=mkdtempSync(join(tmpdir(),"devspace-corrupt-receipt-")); const path=join(root,"state.sqlite");
+    let sqlite=new Database(path); const opts={...options,verifyReconciliationEvidence:()=>true}; let store=new ControlPlaneOwnershipStore(sqlite,opts);
+    try {
+      store.putGrantEvidence(context("owner"),grant,0);const lease=store.acquire(context("owner"),input());store.beginOperation(context("owner"),lease.leaseId,1,"op");
+      const evidence={leaseId:lease.leaseId,ownerThread:"owner",operationHandle:"op",operation:"write",baseRevision:"sha-a",leaseVersion:2,state:"finished" as const};
+      store.reconcile(context("owner"),lease.leaseId,2,evidence);sqlite.exec(`update control_plane_reconciliation_receipts set ${patch}`);
+      const before=sqlite.prepare("select * from control_plane_reconciliation_receipts").all();sqlite.close();sqlite=new Database(path);store=new ControlPlaneOwnershipStore(sqlite,opts);
+      assert.throws(()=>store.reconcile(context("owner"),lease.leaseId,2,evidence),(error:unknown)=>error instanceof ControlPlaneOwnershipError && error.code==='MALFORMED');
+      assert.deepEqual(sqlite.prepare("select * from control_plane_reconciliation_receipts").all(),before);
+    } finally {sqlite.close();rmSync(root,{recursive:true,force:true});}
+  }
+});

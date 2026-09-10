@@ -296,6 +296,10 @@ export class ControlPlaneOwnershipStore {
       if (lease.ownerThread !== owner.ownerThread || JSON.stringify(this.get(leaseId)) !== JSON.stringify(lease)) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "reconciliation owner changed");
       const previous = this.sqlite.prepare("select * from control_plane_reconciliation_receipts where lease_id=? and previous_version=?").get(leaseId, expectedVersion) as {receipt_id:string;lease_id:string;previous_version:number;new_version:number;evidence_json:string;created_at:string} | undefined;
       if (previous) {
+        if (typeof previous.receipt_id !== "string" || !SAFE_ID.test(previous.receipt_id) || previous.lease_id !== leaseId || !Number.isSafeInteger(previous.previous_version) || previous.previous_version < 1 || previous.previous_version !== expectedVersion || !Number.isSafeInteger(previous.new_version) || previous.new_version !== previous.previous_version + 1 || typeof previous.created_at !== "string" || !Number.isFinite(Date.parse(previous.created_at))) throw new ControlPlaneOwnershipError("MALFORMED", "persisted reconciliation receipt is malformed");
+        let stored: ReconciliationEvidence;
+        try { stored = canonicalReconciliation(JSON.parse(previous.evidence_json)); } catch { throw new ControlPlaneOwnershipError("MALFORMED", "persisted reconciliation evidence is malformed"); }
+        if (stored.leaseId !== leaseId || stored.leaseVersion !== previous.previous_version || stored.ownerThread !== owner.ownerThread || stored.operation !== lease.operation || stored.baseRevision !== lease.baseRevision || JSON.stringify(stored) !== previous.evidence_json) throw new ControlPlaneOwnershipError("MALFORMED", "persisted reconciliation bindings are malformed");
         if (previous.evidence_json !== evidenceJson) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "reconciliation replay payload changed");
         return {schema: CONTROL_PLANE_SCHEMA, receiptId: previous.receipt_id, leaseId, previousVersion: previous.previous_version, newVersion: previous.new_version, evidence, createdAt: previous.created_at};
       }
