@@ -149,15 +149,34 @@ export async function runRepositoryIntelligenceOperation(
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let settled = false;
+    let failure: Error | undefined;
 
     const fail = (error: Error) => {
-      if (settled) return;
-      settled = true;
+      if (settled || failure) return;
+      failure = error;
       clearTimeout(timer);
       if (!child.killed) {
-        child.kill("SIGKILL");
+        try {
+          if (!child.kill("SIGKILL")) {
+            failure = new Error(`${error.message}; child termination was not confirmed`);
+            settled = true;
+            reject(failure);
+            return;
+          }
+        } catch (killError) {
+          failure = new Error(`${error.message}; failed to terminate child: ${killError instanceof Error ? killError.message : String(killError)}`);
+          settled = true;
+          reject(failure);
+          return;
+        }
       }
-      reject(error);
+      // A spawn error can happen before a child process exists and may not
+      // produce a close event. Settle that case immediately; owned children
+      // settle only from close so callers never clean up while handles live.
+      if (child.pid === undefined) {
+        settled = true;
+        reject(failure);
+      }
     };
     const timer = setTimeout(
       () => fail(new Error(`Repository Intelligence timed out after ${timeoutMs}ms`)),
@@ -191,6 +210,10 @@ export async function runRepositoryIntelligenceOperation(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (failure) {
+        reject(failure);
+        return;
+      }
       const out = Buffer.concat(stdout).toString("utf8");
       const err = Buffer.concat(stderr).toString("utf8").trim();
       if (code !== 0) {
