@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { access, realpath } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
@@ -58,6 +59,9 @@ import {
 import {
   CutoverStateError,
   CutoverStateStore,
+  CUTOVER_BINDING_REPAIR_SCHEMA,
+  CUTOVER_BINDING_REPAIR_REASON,
+  type CutoverBindingRepairReceipt,
   type CutoverDrainEvidence,
   type DurableCutoverRecord,
   type ExpectedCutoverIdentity,
@@ -66,12 +70,19 @@ import {
 import {
   CutoverBlockedError,
   McpCutoverController,
+  compareServerIdentity,
   registerCutoverHttpRoutes,
   type CutoverMode,
   type DurableReconciliationWitness,
 } from "./mcp-cutover.js";
 import type { LocalAgentRecord } from "./local-agent-store.js";
-import { CutoverBuildNotReadyError, probeBuildReady, type BuildReadyProbeResult } from "./cutover-build-ready.js";
+import {
+  CutoverBuildNotReadyError,
+  CutoverCapabilityManifestDomainMismatchError,
+  probeBuildReady,
+  probeTargetPackage,
+  type BuildReadyProbeResult,
+} from "./cutover-build-ready.js";
 import { CutoverOrchestrator, type OrchestrationOutcome } from "./cutover-orchestration.js";
 import {
   createLaunchdSelfRestartActuator,
@@ -1320,6 +1331,11 @@ export interface CutoverMcpControlContext {
     newlyRecovered: boolean;
     mode: CutoverMode;
   }>;
+  executeBindingRepair?: (input: {
+    cutoverId: string;
+    workspaceId: string;
+    agentId: string;
+  }) => Promise<DurableCutoverRecord>;
 }
 
 
@@ -1376,6 +1392,19 @@ function registerCutoverMcpTools(
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
     async ({ expectedSourceCommit, expectedBuildId, expectedCapabilityManifestSha256, expiresAt }) => {
+      if (expectedCapabilityManifestSha256 && control.probeBuildReady) {
+        const probe = await control.probeBuildReady({
+          sourceCommit: expectedSourceCommit,
+          buildId: expectedBuildId,
+          capabilityManifestSha256: expectedCapabilityManifestSha256,
+        });
+        if (probe.domainMismatch) {
+          throw new CutoverCapabilityManifestDomainMismatchError(
+            probe.detail ??
+              `[CAPABILITY_MANIFEST_DIGEST_DOMAIN_MISMATCH] expected capabilityManifestSha256 ${expectedCapabilityManifestSha256} matches target package build_manifest_sha256; domain confusion detected.`,
+          );
+        }
+      }
       const capabilityManifestSha256 = expectedCapabilityManifestSha256
         ?? control.controller.currentIdentity.capabilityManifestSha256;
       const record = control.controller.begin(
@@ -1535,6 +1564,19 @@ function registerCutoverMcpTools(
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
     },
     async ({ cutoverId, expectedSourceCommit, expectedBuildId, expectedCapabilityManifestSha256, expiresAt }) => {
+      if (expectedCapabilityManifestSha256 && control.probeBuildReady) {
+        const probe = await control.probeBuildReady({
+          sourceCommit: expectedSourceCommit,
+          buildId: expectedBuildId,
+          capabilityManifestSha256: expectedCapabilityManifestSha256,
+        });
+        if (probe.domainMismatch) {
+          throw new CutoverCapabilityManifestDomainMismatchError(
+            probe.detail ??
+              `[CAPABILITY_MANIFEST_DIGEST_DOMAIN_MISMATCH] expected capabilityManifestSha256 ${expectedCapabilityManifestSha256} matches target package build_manifest_sha256; domain confusion detected.`,
+          );
+        }
+      }
       const activeRecord = control.controller.record();
       if (
         activeRecord &&
@@ -1662,15 +1704,62 @@ function registerCutoverMcpTools(
       ) {
         throw new CutoverStateError("[RECOVERY_BINDING_MISMATCH] Observed recovery requires fresh generation-bound inventory collection.");
       } else {
-        const witness = await control.reconcileDurableState({ workspaceId, agentId });
-        record = await control.controller.finish(
-          cutoverId,
-          async () => witness,
-        );
+        const comparison = activeRecord ? compareServerIdentity(activeRecord, control.controller.currentIdentity) : undefined;
+        if (
+          activeRecord &&
+          activeRecord.cutoverId === cutoverId &&
+          activeRecord.phase === "drained" &&
+          comparison &&
+          comparison.serverInstanceChanged &&
+          comparison.sourceMatches &&
+          comparison.buildMatches &&
+          !comparison.capabilityManifestMatches &&
+          control.executeBindingRepair
+        ) {
+          record = await control.executeBindingRepair({ cutoverId, workspaceId, agentId });
+        } else {
+          const witness = await control.reconcileDurableState({ workspaceId, agentId });
+          record = await control.controller.finish(
+            cutoverId,
+            async () => witness,
+          );
+        }
       }
       const mode = control.controller.mode();
       return {
         content: [textBlock(`Finished cutover ${cutoverId}; mode=${mode}.`)],
+        structuredContent: { cutover: record as unknown as Record<string, unknown>, mode },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "cutover_repair_binding",
+    {
+      title: "Repair cross-domain capability manifest digest misbinding",
+      description:
+        "Repair a drained cutover record whose expected capabilityManifestSha256 was mistakenly bound to a build manifest digest (CROSS_DOMAIN_DIGEST_MISBINDING). Requires cryptographic attribution to target build_manifest_sha256, live capability manifest match, positive durable agent/workspace witness, zero restart replay, and idempotent completion.",
+      inputSchema: {
+        cutoverId: z.string().min(1),
+        workspaceId: z.string().min(1),
+        agentId: z.string().min(1),
+      },
+      outputSchema: {
+        cutover: cutoverRecordSchema,
+        mode: modeSchema,
+      },
+      _meta: {},
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ cutoverId, workspaceId, agentId }) => {
+      if (!control.executeBindingRepair) {
+        throw new CutoverStateError("Binding repair is not supported on this server configuration.");
+      }
+      const record = await control.executeBindingRepair({ cutoverId, workspaceId, agentId });
+      const mode = control.controller.mode();
+      return {
+        content: [textBlock(`Repaired cross-domain digest misbinding for cutover ${cutoverId}; mode=${mode}.`)],
         structuredContent: { cutover: record as unknown as Record<string, unknown>, mode },
       };
     },
@@ -4540,6 +4629,129 @@ export function createServer(
       mode: cutoverController.mode(),
     };
   };
+
+  const executeBindingRepair = async (input: {
+    cutoverId: string;
+    workspaceId: string;
+    agentId: string;
+  }): Promise<DurableCutoverRecord> => {
+    const active = cutoverController.record();
+    if (!active) {
+      throw new CutoverStateError("No durable cutover record exists.");
+    }
+    if (active.cutoverId !== input.cutoverId) {
+      throw new CutoverStateError(`Cutover id mismatch: active cutover is ${active.cutoverId}.`);
+    }
+    if (active.phase === "closed") {
+      return active;
+    }
+    if (active.phase !== "drained") {
+      throw new CutoverStateError(
+        `Cannot repair binding for cutover ${input.cutoverId}: phase must be "drained", but is "${active.phase}".`,
+      );
+    }
+    if (!active.restartRequest || !active.restartRequest.restartScheduledAt) {
+      throw new CutoverStateError(
+        `Cannot repair binding for cutover ${input.cutoverId}: restart was not scheduled prior to repair.`,
+      );
+    }
+    const current = cutoverController.currentIdentity;
+    if (current.serverInstanceId === active.oldServerIdentity.serverInstanceId) {
+      throw new CutoverStateError(
+        "Cannot repair binding on the old server instance; must be run on the replacement server.",
+      );
+    }
+    if (current.sourceCommit !== active.expectedNewIdentity.sourceCommit) {
+      throw new CutoverStateError(
+        `Current source commit (${current.sourceCommit}) does not match expected (${active.expectedNewIdentity.sourceCommit}).`,
+      );
+    }
+    if (current.buildId !== active.expectedNewIdentity.buildId) {
+      throw new CutoverStateError(
+        `Current build id (${current.buildId}) does not match expected (${active.expectedNewIdentity.buildId}).`,
+      );
+    }
+    if (!active.expectedNewIdentity.capabilityManifestSha256) {
+      throw new CutoverStateError(
+        "Cutover expectedNewIdentity does not have a capabilityManifestSha256; not a digest misbinding.",
+      );
+    }
+    if (!current.capabilityManifestSha256) {
+      throw new CutoverStateError(
+        "Current replacement server does not expose capabilityManifestSha256; cannot repair binding.",
+      );
+    }
+    if (active.expectedNewIdentity.capabilityManifestSha256 === current.capabilityManifestSha256) {
+      throw new CutoverStateError(
+        "Capability manifest already matches expected; binding repair is not needed.",
+      );
+    }
+
+    const targetRoot = config.mcpCutoverBuildReadyRoot ?? process.env.DEVSPACE_PACKAGE_ROOT ?? resolve(dirname(fileURLToPath(import.meta.url)), "..");
+    const probed = probeTargetPackage(targetRoot);
+    const targetBuildManifestSha = probed.buildManifestSha256 ?? runtimeBuildIdentity.buildManifestSha256;
+    if (!targetBuildManifestSha) {
+      throw new CutoverStateError(
+        "Cannot prove cryptographic attribution: target package build_manifest_sha256 is unavailable. [DOMAIN_MISMATCH_UNVERIFIED]",
+      );
+    }
+    if (targetBuildManifestSha !== active.expectedNewIdentity.capabilityManifestSha256) {
+      throw new CutoverStateError(
+        `Cryptographic attribution failed: expected capability manifest digest ${active.expectedNewIdentity.capabilityManifestSha256} does not equal target build_manifest_sha256 ${targetBuildManifestSha}. [NOT_A_CROSS_DOMAIN_MISBINDING]`,
+      );
+    }
+
+    const witness = await resolveDurableReconciliationWitness(
+      { workspaceId: input.workspaceId, agentId: input.agentId },
+      true,
+    );
+    if (!witness.workspaceQueryable || !witness.agentQueryable || !witness.agentReconciled) {
+      throw new CutoverStateError(
+        "Cannot repair binding: durable agent/workspace reconciliation witness is not fully positive.",
+      );
+    }
+    if ((witness.workspaceSessions ?? 0) < 1) {
+      throw new CutoverStateError("Zero durable workspace sessions found; live positive witness required.");
+    }
+    if ((witness.agentSessions ?? 0) < 1) {
+      throw new CutoverStateError("Zero durable agent sessions found; live positive witness required.");
+    }
+
+    const nowIso = new Date().toISOString();
+    const repairReceipt: CutoverBindingRepairReceipt = {
+      schema: CUTOVER_BINDING_REPAIR_SCHEMA,
+      cutoverId: input.cutoverId,
+      reason: CUTOVER_BINDING_REPAIR_REASON,
+      originalBoundDigest: active.expectedNewIdentity.capabilityManifestSha256,
+      originalDigestField: "expectedNewIdentity.capabilityManifestSha256",
+      provenActualDigestDomain: "build_manifest_sha256",
+      correctCapabilityManifestSchema: "devspace.capability_manifest.v1",
+      correctCapabilityManifestSha256: current.capabilityManifestSha256,
+      sourceCommit: current.sourceCommit,
+      buildId: current.buildId,
+      observedServerInstanceId: current.serverInstanceId,
+      repairedBy: current.serverInstanceId,
+      repairedAt: nowIso,
+      physicalProbeEvidence: `Target package at ${targetRoot} verified: build_manifest_sha256=${targetBuildManifestSha} equals expectedNewIdentity.capabilityManifestSha256.`,
+    };
+
+    cutoverController.recordBindingRepair(input.cutoverId, repairReceipt);
+    return await cutoverController.finish(input.cutoverId, async () => ({
+      ...witness,
+      witnessCutoverId: input.cutoverId,
+      witnessServerInstanceId: current.serverInstanceId,
+      witnessExpectedIdentity: {
+        sourceCommit: current.sourceCommit,
+        buildId: current.buildId,
+        capabilityManifestSha256: current.capabilityManifestSha256,
+      },
+      witnessWorkspaceId: input.workspaceId,
+      witnessAgentId: input.agentId,
+      witnessKind: "exact-pair",
+      detail: [{ unit: "native-mcp", ok: true, detail: "cross-domain digest misbinding repaired and reconciled" }],
+    }));
+  };
+
   const codexGoals = config.codexGoalsEnabled
     ? new CodexGoalSessionManager(processSessions, { codexBin: config.codexBin })
     : undefined;
@@ -4861,6 +5073,7 @@ export function createServer(
             ...(advanceCutover ? { advance: advanceCutover } : {}),
             enumerateReconciliation: enumerateDurableReconciliationState,
             executeObservedReplacementRecovery,
+            executeBindingRepair,
           },
 
         );

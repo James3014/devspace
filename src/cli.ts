@@ -63,13 +63,18 @@ import {
 import {
   cutoverSeamStatus,
   performCutoverRecovery,
+  performNativeCrossDomainBindingRepair,
   performNativeObservedReplacementRecovery,
   readRunningBuildIdentity,
   resolveSeamStateDir,
   runningPackageRoot,
 } from "./cutover-recovery.js";
 import { CutoverStateStore } from "./cutover-state.js";
-import { probeBuildReady } from "./cutover-build-ready.js";
+import {
+  CutoverCapabilityManifestDomainMismatchError,
+  probeBuildReady,
+  probeTargetPackage,
+} from "./cutover-build-ready.js";
 import type { ExpectedCutoverIdentity } from "./cutover-state.js";
 
 type Command = "serve" | "init" | "doctor" | "config" | "agents" | "models" | "cutover" | "help" | "version";
@@ -806,11 +811,15 @@ async function runCutoverCommand(args: string[]): Promise<void> {
     await runCutoverObserve(args.slice(1));
     return;
   }
+  if (subcommand === "repair" || subcommand === "repair-binding") {
+    await runCutoverRepair(args.slice(1));
+    return;
+  }
   if (subcommand === "help" || subcommand === "--help" || subcommand === "-h" || subcommand === undefined) {
     printCutoverHelp();
     return;
   }
-  throw new Error("Usage: devspace cutover <status|recover|observe>");
+  throw new Error("Usage: devspace cutover <status|recover|observe|repair>");
 }
 
 function printCutoverHelp(): void {
@@ -822,6 +831,7 @@ function printCutoverHelp(): void {
       "  devspace cutover status [--json]",
       "  devspace cutover recover --cutover-id <id> --expected-source-commit <40hex> --expected-build-id <id>",
       "  devspace cutover observe --cutover-id <id> --workspace-id <id> --agent-id <id> [--json]",
+      "  devspace cutover repair --cutover-id <id> --workspace-id <id> --agent-id <id> [--package-root <path>] [--json]",
       "      [--expected-capability-manifest-sha256 <64hex>] [--active-sessions <n>] [--oldest-age-ms <n>]",
       "      [--build-ready-verified-by <identity>] [--build-ready-evidence <detail>] [--expires-at <ISO>] [--json]",
       "",
@@ -831,6 +841,12 @@ function printCutoverHelp(): void {
       "the operator performs the single launchctl kickstart after the durable",
       "restart-scheduled marker exists. Requires the configured state directory and",
       "either a configured DEVSPACE_BUILD_READY_ROOT probe or --build-ready-verified-by.",
+      "",
+      "The repair subcommand repairs a successor cutover blocked by CROSS_DOMAIN_DIGEST_MISBINDING",
+      "where the target build-manifest digest was mistakenly bound as the capability manifest digest.",
+      "It verifies cryptographic attribution against the physical target package, records a durable",
+      "repair receipt, requires exact positive workspace/agent reconciliation, and terminally closes",
+      "the cutover without replaying the restart.",
     ].join("\n"),
   );
 }
@@ -877,6 +893,55 @@ async function runCutoverObserve(args: string[]): Promise<void> {
     return;
   }
   console.log(`Observed replacement ${result.cutover.cutoverId}: phase=${result.cutover.phase}; server=${result.serverInstanceId}; newlyRecovered=${String(result.newlyRecovered)}`);
+}
+
+async function runCutoverRepair(args: string[]): Promise<void> {
+  let cutoverId: string | undefined;
+  let workspaceId: string | undefined;
+  let agentId: string | undefined;
+  let packageRoot: string | undefined;
+  let json = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    const value = (): string => {
+      const next = args[++index];
+      if (!next) throw new Error(`${argument} requires a value.`);
+      return next;
+    };
+    if (argument === "--json") json = true;
+    else if (argument === "--cutover-id") cutoverId = value();
+    else if (argument === "--workspace-id") workspaceId = value();
+    else if (argument === "--agent-id") agentId = value();
+    else if (argument === "--package-root") packageRoot = value();
+    else throw new Error(`Unknown cutover repair flag: ${argument}`);
+  }
+  if (!cutoverId || !workspaceId || !agentId) {
+    throw new Error("Usage: devspace cutover repair --cutover-id <id> --workspace-id <id> --agent-id <id> [--package-root <path>] [--json]");
+  }
+  const config = loadConfig();
+  const requesterIdentity = readRunningBuildIdentity(runningPackageRoot());
+  if (!requesterIdentity) {
+    throw new Error("Unable to read the executing accepted build identity; refusing cross-domain binding repair.");
+  }
+  const endpoint = new URL(`http://${config.host}:${config.port}/mcp`);
+  const result = await performNativeCrossDomainBindingRepair({
+    serverUrl: endpoint,
+    publicBaseUrl: new URL(config.publicBaseUrl),
+    stateDir: config.stateDir,
+    cutoverId,
+    workspaceId,
+    agentId,
+    ownerToken: config.oauth.ownerToken,
+    requesterIdentity,
+    ...(packageRoot ? { packageRoot } : {}),
+  });
+  if (json) {
+    printJson(result);
+    return;
+  }
+  console.log(
+    `Repaired binding ${result.cutover.cutoverId}: phase=${result.cutover.phase}; server=${result.serverInstanceId}; newlyRecovered=${String(result.newlyRecovered)}`,
+  );
 }
 
 function parseCutoverRecoverArgs(args: string[]): CutoverRecoverCliOptions {
@@ -958,6 +1023,20 @@ async function runCutoverRecover(args: string[]): Promise<void> {
     !/^[0-9a-f]{64}$/.test(options.capabilityManifestSha256)
   ) {
     throw new Error("--expected-capability-manifest-sha256 must be a 64-character hex hash.");
+  }
+  if (options.capabilityManifestSha256 !== undefined) {
+    const targetRoot = runningPackageRoot();
+    try {
+      const targetPackage = probeTargetPackage(targetRoot);
+      if (
+        targetPackage.buildManifestSha256 !== undefined &&
+        options.capabilityManifestSha256 === targetPackage.buildManifestSha256
+      ) {
+        throw new CutoverCapabilityManifestDomainMismatchError();
+      }
+    } catch (err) {
+      if (err instanceof CutoverCapabilityManifestDomainMismatchError) throw err;
+    }
   }
   if (options.expiresAt !== undefined && !Number.isFinite(Date.parse(options.expiresAt))) {
     throw new Error("--expires-at must be an ISO-8601 timestamp.");
