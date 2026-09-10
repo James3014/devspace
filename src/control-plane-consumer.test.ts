@@ -413,3 +413,32 @@ test("C3 cutover callback drift cannot reach begin or overwrite durable evidence
     } finally {CutoverStateStore.prototype.begin=begin;f.manager.close();}
   }
 });
+
+test("C3 cutover reconciliation rejects another lease with the same operation handle", async()=>{
+  const {CutoverStateStore}=await import("./cutover-state.js");const f=cutoverFixture();
+  try {
+    const result=f.manager.startCutover(f.input,f.context);const old=f.ownership.get(f.leaseId)!;
+    const finished=f.ownership.finishOperation(f.context,f.leaseId,old.version,result.operationId);
+    f.ownership.release(f.context,f.leaseId,finished.version);
+    const alternate=f.ownership.acquire(f.context,{...old,idempotencyKey:"alternate"});
+    f.ownership.beginOperation(f.context,alternate.leaseId,alternate.version,result.operationId);
+    const resolve=f.options.resolveEffectBinding;
+    f.options.resolveEffectBinding=(c,s)=>{const binding=resolve(c,s);return binding?{...binding,leaseId:alternate.leaseId,leaseVersion:f.ownership.get(alternate.leaseId)!.version}:undefined;};
+    const snapshot=()=>JSON.stringify([f.manager.store.getByOperationId(result.operationId),f.ownership.get(f.leaseId),f.ownership.get(alternate.leaseId),new CutoverStateStore(f.config.stateDir).get()]);
+    const before=snapshot();assert.throws(()=>f.manager.reconcileCutoverStart(result.operationId,f.context),/correlation|binding/);assert.equal(snapshot(),before);
+  } finally {f.manager.close();}
+});
+
+test("C3 cutover reconciliation follows legitimate same-lease handoff and fences former owner", ()=>{
+  const f=cutoverFixture();const recipient={};
+  try {
+    const result=f.manager.startCutover(f.input,f.context);const lease=f.ownership.get(f.leaseId)!;
+    const owner=f.options.resolveOwnerContext!;const resolve=f.options.resolveEffectBinding;
+    f.options.resolveOwnerContext=c=>c===recipient?{ownerThread:"recipient"}:owner(c);
+    f.options.resolveEffectBinding=(c,s)=>resolve(c===recipient?f.context:c,s);
+    f.ownership.handoff(f.context,f.leaseId,lease.version,recipient,{resource:lease.resource,scope:lease.scope,baseRevision:lease.baseRevision,candidateRevision:"candidate",liveOperation:lease.operation,liveHandle:result.operationId,checkpoint:"after-start",grantDependency:lease.grant,grantVersion:lease.grantVersion,recipientGrant:lease.grant,recipientGrantVersion:lease.grantVersion,forbiddenOverlap:[lease.resource],tests:["start"],evidence:["bound-file"],remainingGap:"lifecycle",nextGate:"reconcile",expiresAt:lease.expiresAt});
+    assert.equal(f.manager.reconcileCutoverStart(result.operationId,recipient).operationId,result.operationId);
+    assert.throws(()=>f.manager.reconcileCutoverStart(result.operationId,f.context),/owner|binding|CAS|lease evidence/);
+    assert.equal(f.ownership.get(f.leaseId)?.operationHandle,result.operationId);
+  } finally {f.manager.close();}
+});
