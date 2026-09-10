@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test, { after } from "node:test";
@@ -131,6 +131,7 @@ function setupManager(
   );
 
   const clean = () => {
+    manager.close();
     try {
       rmSync(stateDir, { recursive: true, force: true });
     } catch {}
@@ -1886,6 +1887,7 @@ test("G3 TEST P — durable timeout fence precedes terminator completion", async
     await supervisePromise;
     assert.equal(store.getById(started.agentId)?.lifecycleState?.terminationPending, undefined);
   } finally {
+    manager.close();
     f.clean();
     try {
       rmSync(stateDir, { recursive: true, force: true });
@@ -1950,6 +1952,7 @@ test("G3 TEST U/W — verified termination unlocks continuation with a new turn"
     assert.notEqual(store.getById(started.agentId).lifecycleState.activeTurn.generation, oldGeneration);
     assert.equal(store.getById(started.agentId).lifecycleState.activeTurn.launchState, "spawned");
   } finally {
+    manager.close();
     f.clean();
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -1998,6 +2001,7 @@ for (const failureMode of ["false", "throw"] as const) {
         (error: any) => error.code === "AGENT_TERMINATION_PENDING",
       );
     } finally {
+      manager.close();
       f.clean();
       rmSync(stateDir, { recursive: true, force: true });
     }
@@ -2055,6 +2059,7 @@ test("G3 TEST Y — termination-pending worker consumes execution capacity", asy
     releaseResolve();
     await supervise;
   } finally {
+    manager.close();
     f.clean();
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -2106,6 +2111,7 @@ test("G3 adversarial — scope violation uses the same durable cleanup primitive
     releaseResolve();
     await supervise;
   } finally {
+    manager.close();
     f.clean();
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -2221,6 +2227,7 @@ test("G3 TEST Z1b — malformed pending state fails closed after reopen", async 
     async () => undefined,
     async () => true,
   );
+  let reopenedManager: LocalAgentSessionManager | undefined;
   try {
     const started = await first.startAgent({
       workspaceId: "ws_pending_malformed",
@@ -2237,21 +2244,21 @@ test("G3 TEST Z1b — malformed pending state fails closed after reopen", async 
         terminationPending: { generation: 42 },
       }), started.agentId);
     database.close();
-    const manager = new LocalAgentSessionManager(
+    reopenedManager = new LocalAgentSessionManager(
       { stateDir, subagents: true, oauth: { scopes: ["devspace"] }, agentMaxConcurrent: 1, toolchains: [] } as any,
       async () => undefined,
       async () => true,
     );
-    const parsedStatus = await manager.getAgentStatus({
+    const parsedStatus = await reopenedManager.getAgentStatus({
       workspaceId: "ws_pending_malformed",
       workspaceRoot: f.repo,
       agentId: started.agentId,
     });
     assert.equal(parsedStatus.terminal, false, "corrupt pending evidence must not become terminal");
     assert.equal((parsedStatus as any).termination?.corrupt, true);
-    assert.equal(manager.runningCount(), 1, "corrupt pending evidence must continue to occupy capacity");
+    assert.equal(reopenedManager.runningCount(), 1, "corrupt pending evidence must continue to occupy capacity");
     await assert.rejects(
-      manager.continueAgent({
+      reopenedManager.continueAgent({
         workspaceId: "ws_pending_malformed",
         workspaceRoot: f.repo,
         agentId: started.agentId,
@@ -2260,8 +2267,8 @@ test("G3 TEST Z1b — malformed pending state fails closed after reopen", async 
       (error: any) =>
         error.code === "AGENT_TERMINATION_PENDING" || error.code === "AGENT_LIFECYCLE_CORRUPT",
     );
-    (manager as any).store.close();
   } finally {
+    reopenedManager?.close();
     f.clean();
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -2325,6 +2332,7 @@ test("G3 TEST Z2 — launching generation without PID remains pending when termi
       workerPid: 3399,
     });
   } finally {
+    manager.close();
     f.clean();
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -2377,6 +2385,7 @@ test("G3 XA2 I11 — verified kill snapshots before unlock and later foreign edi
       (error: any) => error.code === "CONTINUATION_ADMISSION_FAILED",
     );
   } finally {
+    manager.close();
     f.clean();
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -2468,6 +2477,7 @@ test("G3 T18 — legacy manager rows remain outside detached capacity and reconc
     assert.equal((legacyAfter.lifecycleState as any)?.terminationPending, undefined);
     assert.equal(legacyAfter.latestResponse, "runtime-pool progress");
   } finally {
+    manager.close();
     f.clean();
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -2515,6 +2525,7 @@ test("G3 T18b — exact legacy detached PID and token adopt and settle one gener
     assert.equal(settled.workerToken, undefined);
     assert.equal(manager.runningCount(), 0);
   } finally {
+    manager.close();
     f.clean();
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -2557,6 +2568,7 @@ test("G3 T19 — failed termination is not retried by every supervisor tick", as
     );
     assert.equal(attempts, 2, "explicit cancel retries the same pending generation exactly once");
   } finally {
+    manager.close();
     f.clean();
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -2630,6 +2642,7 @@ test("G3 T12 — launcher PID is persisted under the active generation before cl
     });
     assert.deepEqual(terminatedPids, [3601]);
   } finally {
+    manager.close();
     f.clean();
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -2996,6 +3009,7 @@ test("G3 TEST U — continuation blocked while terminator pending", async () => 
     const recordAfter = store.getById(started.id);
     assert.equal(recordAfter?.lifecycleState?.termination, undefined);
   } finally {
+    manager.close();
     f.clean();
     try {
       rmSync(stateDir, { recursive: true, force: true });
@@ -3065,6 +3079,7 @@ test("G3 TEST V — termination failure keeps continuation blocked", async () =>
       },
     );
   } finally {
+    manager.close();
     f.clean();
     try {
       rmSync(stateDir, { recursive: true, force: true });
@@ -3246,6 +3261,7 @@ test("G3 TEST Y — termination-pending counts against capacity", async () => {
     assert.equal(manager.runningCount(), 0, "runningCount must be 0 after termination cleared");
     assert.equal((manager as any).hasExecutionCapacity(), true, "Capacity must reopen after termination cleared");
   } finally {
+    manager.close();
     f.clean();
     try {
       rmSync(stateDir, { recursive: true, force: true });
@@ -3411,6 +3427,7 @@ test("agent_start attemptKey concurrently reuses one durable launch", async () =
     assert.equal(launches, 1);
     assert.equal(manager.listAgents({ workspaceId: "ws_replay" }).length, 1);
   } finally {
+    manager.close();
     f.clean();
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -3462,6 +3479,8 @@ test("agent_start attemptKey binding survives store reopen and rejects material 
       );
     }
   } finally {
+    firstManager.close();
+    reopenedManager.close();
     f.clean();
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -3488,6 +3507,7 @@ test("agent_start replay survives restart when reopen returns a new workspaceId 
   const firstRegistry = new WorkspaceRegistry(config, firstWorkspaceStore);
   const firstWorkspace = await firstRegistry.openWorkspace(f.repo);
   const firstManager = new LocalAgentSessionManager(config, async () => { firstLaunches += 1; });
+  let reopenedManager: LocalAgentSessionManager | undefined;
   try {
     const input = {
       workspaceId: firstWorkspace.workspace.id,
@@ -3507,7 +3527,7 @@ test("agent_start replay survives restart when reopen returns a new workspaceId 
       const reopenedWorkspace = await reopenedRegistry.openWorkspace(f.repo);
       assert.notEqual(reopenedWorkspace.workspace.id, firstWorkspace.workspace.id);
 
-      const reopenedManager = new LocalAgentSessionManager(config, async () => { reopenedLaunches += 1; });
+      reopenedManager = new LocalAgentSessionManager(config, async () => { reopenedLaunches += 1; });
       const replay = await reopenedManager.startAgent({
         ...input,
         workspaceId: reopenedWorkspace.workspace.id,
@@ -3537,9 +3557,11 @@ test("agent_start replay survives restart when reopen returns a new workspaceId 
       assert.notEqual(otherAttempt.agentId, first.agentId);
       assert.equal(reopenedLaunches, 1);
     } finally {
+      reopenedManager?.close();
       reopenedWorkspaceStore.close();
     }
   } finally {
+    firstManager.close();
     f.clean();
     other.clean();
     rmSync(stateDir, { recursive: true, force: true });
@@ -3629,6 +3651,7 @@ test("provider failure preserves session, response evidence, and physical candid
     assert.deepEqual(reconciled.candidate.changedPaths, ["src/candidate.ts"]);
     assert.equal(reconciled.candidate.scopeState, "WITHIN_SCOPE");
   } finally {
+    manager.close();
     f.clean();
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -4060,19 +4083,6 @@ test("pathspec-magic-looking filename is fingerprinted literally", async () => {
     writeFileSync(join(f.repo, magicName), "magic v2");
     const first = await inspectWorkspacePhysicalState(f.repo);
     const firstFp = first.fingerprints?.[magicName];
-    if (!firstFp) {
-      const resolvePath = (resolver: (path: string) => string, path: string) => {
-        try { return resolver(path); } catch (error) { return `ERROR:${String(error)}`; }
-      };
-      console.error(JSON.stringify({
-        fixtureRepo: f.repo,
-        gitRoot: runGitRaw(["rev-parse", "--show-toplevel"], f.repo),
-        repoRealpath: resolvePath(realpathSync, f.repo),
-        repoNativeRealpath: resolvePath(realpathSync.native, f.repo),
-        changedPaths: first.changedPaths,
-        fingerprintKeys: Object.keys(first.fingerprints ?? {}),
-      }));
-    }
     assert.ok(firstFp);
     assert.equal(firstFp.kind, "modified");
     assert.ok(typeof firstFp.gitStateHash === "string" && firstFp.gitStateHash.length > 0);
