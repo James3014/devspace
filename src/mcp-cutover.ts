@@ -72,6 +72,14 @@ export const CUTOVER_SAFE_TOOLS: ReadonlySet<string> = new Set([
   "ls",
   "show_changes",
 
+  // Existing-task completion only; lifecycle admission still rejects new claims.
+  "chat_swarm_next",
+  "chat_swarm_submit",
+  "chat_swarm_status",
+  "chat_swarm_collect",
+  "chat_swarm_reconcile",
+  "chat_swarm_cancel",
+
   // Operation & command inspection
   "operation_status",
   "operation_reconcile",
