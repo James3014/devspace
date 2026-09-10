@@ -291,15 +291,21 @@ export class ControlPlaneOwnershipStore {
   }
   private assertNoOverlap(resource: Pick<ResourceLease, "resourceKind" | "resourceId" | "resource" | "scope">, ownLeaseId?: string): void {
     // Repository grants remain separate; physical resources belong to the shared host.
-    const active = this.sqlite.prepare("select * from control_plane_resource_leases").all() as LeaseRow[];
+    const leases = () => this.sqlite.prepare("select * from control_plane_resource_leases order by lease_id").all() as LeaseRow[];
+    const grants = () => this.sqlite.prepare("select * from control_plane_grant_evidence order by repository,goal,coordinator_thread").all();
+    const active = leases();
+    const grantSnapshot = JSON.stringify(grants());
     for (const row of active) {
       if (row.lease_id === ownLeaseId) continue;
       const other = rowLease(row);
       if (other.terminalState !== undefined) continue;
+      this.assertPhysicalBinding(other);
       if (overlaps(resource.scope, other.scope) || (other.resourceKind !== "filesystem" && other.resourceKind !== "checkout" && other.resourceKind === resource.resourceKind && other.resourceId === resource.resourceId && other.resource === resource.resource)) {
         throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "overlapping resource scope is already leased");
       }
     }
+    // Resolver callbacks may reenter this transaction; no callbacks follow this fence.
+    if (JSON.stringify(leases()) !== JSON.stringify(active) || JSON.stringify(grants()) !== grantSnapshot) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "ownership evidence changed during physical validation");
   }
   private assertPhysicalBinding(lease: ResourceLease): void {
     const identity = (this.options.resolveResourceIdentity ?? resolvePhysicalResource)(immutable(lease));

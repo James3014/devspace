@@ -321,3 +321,44 @@ test("malformed terminal rows cannot hide from resource fencing", () => {
     } finally {sqlite.close();}
   }
 });
+
+
+test("active physical identity corruption denies new acquisitions without repairing evidence", () => {
+  const root=realpathSync.native(mkdtempSync(join(tmpdir(),"devspace-corrupt-physical-")));const a=join(root,"a"),b=join(root,"b");mkdirSync(a);mkdirSync(b);
+  const sqlite=new Database(":memory:");const store=new ControlPlaneOwnershipStore(sqlite,{resolveOwnerContext:options.resolveOwnerContext,verifyGrantEvidence:options.verifyGrantEvidence});
+  try {
+    store.putGrantEvidence(context("owner"),grant,0);
+    const first=store.acquire(context("owner"),{...input([a]),resource:a});
+    sqlite.prepare("update control_plane_resource_leases set resource_id='corrupt-alias' where lease_id=?").run(first.leaseId);
+    const before=sqlite.prepare("select * from control_plane_resource_leases").all();
+    assert.throws(()=>store.acquire(context("owner"),{...input([b]),resource:b,idempotencyKey:"new"}),e=>e instanceof ControlPlaneOwnershipError&&e.code==="CAS_CONFLICT");
+    assert.deepEqual(sqlite.prepare("select * from control_plane_resource_leases").all(),before);
+  } finally {sqlite.close();rmSync(root,{recursive:true,force:true});}
+});
+
+test("physical resolver callback lease and grant drift rolls back before authorization", () => {
+  for(const mutation of ["lease","grant","identity","insert","delete"]) {
+    const sqlite=db();let armed=false;
+    const store=new ControlPlaneOwnershipStore(sqlite,{...options,resolveResourceIdentity:value=>{
+      if(armed&&value.resourceId==="other") {
+        if(mutation==="lease")sqlite.prepare("update control_plane_resource_leases set version=version+1").run();
+        if(mutation==="grant")sqlite.prepare("delete from control_plane_grant_evidence").run();
+        if(mutation==="insert") {
+          const row=sqlite.prepare("select * from control_plane_resource_leases where resource_id='other'").get() as Record<string,unknown>;
+          const added={...row,lease_id:"inserted-lease",idempotency_key:"inserted-key"};const columns=Object.keys(added);
+          sqlite.prepare(`insert into control_plane_resource_leases (${columns.join(",")}) values (${columns.map(()=>"?").join(",")})`).run(...Object.values(added));
+        }
+        if(mutation==="delete")sqlite.prepare("delete from control_plane_resource_leases where resource_id='other'").run();
+        if(mutation==="identity")sqlite.prepare("update control_plane_resource_leases set lease_id=lease_id||'-new'").run();
+      }
+      return options.resolveResourceIdentity!(value);
+    }});
+    try {
+      const first=store.acquire(context("owner"),input(["/repo/a"]));
+      store.acquire(context("owner"),{...input(["/repo/b"]),resourceId:"other",idempotencyKey:"other"});
+      const leases=sqlite.prepare("select * from control_plane_resource_leases order by lease_id").all(),grants=sqlite.prepare("select * from control_plane_grant_evidence").all();armed=true;
+      assert.throws(()=>store.assertHeld(context("owner"),first.leaseId,1,first.operation,first.baseRevision),e=>e instanceof ControlPlaneOwnershipError&&e.code==="CAS_CONFLICT");
+      assert.deepEqual(sqlite.prepare("select * from control_plane_resource_leases order by lease_id").all(),leases);assert.deepEqual(sqlite.prepare("select * from control_plane_grant_evidence").all(),grants);
+    } finally {sqlite.close();}
+  }
+});
