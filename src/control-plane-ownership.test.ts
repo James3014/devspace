@@ -362,3 +362,21 @@ test("physical resolver callback lease and grant drift rolls back before authori
     } finally {sqlite.close();}
   }
 });
+
+
+test("persisted alias and raw Windows scope cannot bypass physical fencing", () => {
+  const root=realpathSync.native(mkdtempSync(join(tmpdir(),"devspace-scope-alias-")));const a=join(root,"a"),b=join(root,"b"),alias=join(root,"alias");mkdirSync(a);mkdirSync(b);symlinkSync(a,alias,"junction");
+  const sqlite=new Database(":memory:");const store=new ControlPlaneOwnershipStore(sqlite,{resolveOwnerContext:options.resolveOwnerContext,verifyGrantEvidence:options.verifyGrantEvidence});
+  try {
+    store.putGrantEvidence(context("owner"),grant,0);const first=store.acquire(context("owner"),{...input([a]),resource:a});
+    const corruptScopes=[alias.replaceAll("\\","/")];
+    if(process.platform==="win32")corruptScopes.push(a,realpathSync(a));
+    for(const path of new Set(corruptScopes)) {
+      assert.notEqual(path,first.scope[0]);
+      sqlite.prepare("update control_plane_resource_leases set scope_json=? where lease_id=?").run(JSON.stringify([path]),first.leaseId);
+      const before=sqlite.prepare("select * from control_plane_resource_leases").all();
+      assert.throws(()=>store.acquire(context("owner"),{...input([b]),resource:b,idempotencyKey:"new"}),e=>e instanceof ControlPlaneOwnershipError&&["CAS_CONFLICT","MALFORMED"].includes(e.code));
+      assert.deepEqual(sqlite.prepare("select * from control_plane_resource_leases").all(),before);
+    }
+  } finally {sqlite.close();rmSync(root,{recursive:true,force:true});}
+});
