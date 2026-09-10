@@ -49,7 +49,6 @@ export interface ToolchainVerificationResult {
 
 const DEFAULT_VERIFY_TIMEOUT_MS = 60_000;
 const DEFAULT_MAX_BUFFER_BYTES = 1024 * 1024;
-
 export function parseToolchains(value: string | undefined): ToolchainSpec[] {
   if (!value || !value.trim()) return [];
   let parsed: unknown;
@@ -405,6 +404,7 @@ export function runToolchainVerifier(input: {
   return new Promise((resolvePromise) => {
     const startedAt = Date.now();
     let completed = false;
+    let spawned = false;
     let timer: NodeJS.Timeout | undefined;
 
     const child = execFile(
@@ -437,11 +437,7 @@ export function runToolchainVerifier(input: {
         const errorCode = error && typeof (error as { code?: unknown }).code === "string"
           ? (error as { code: string }).code
           : undefined;
-        const launchFailed = Boolean(
-          errorCode &&
-            !((error as { killed?: unknown }).killed === true) &&
-            !((error as { signal?: unknown }).signal),
-        );
+        const launchFailed = Boolean(errorCode && !spawned);
         resolvePromise({
           toolchainId: input.toolchainId,
           verifier: input.verifier,
@@ -462,6 +458,7 @@ export function runToolchainVerifier(input: {
         });
       },
     );
+    child.once("spawn", () => { spawned = true; });
 
     timer = setTimeout(() => {
       if (completed) return;

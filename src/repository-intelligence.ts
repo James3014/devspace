@@ -186,7 +186,7 @@ export async function runRepositoryIntelligenceOperation(
 
     child.on("error", (error) => fail(new Error(`Repository Intelligence process failed: ${error.message}`)));
     child.stdout.on("data", (chunk: Buffer | string) => {
-      if (settled) return;
+      if (settled || failure) return;
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       stdoutBytes += buffer.length;
       if (stdoutBytes > maxStdoutBytes) {
@@ -196,7 +196,7 @@ export async function runRepositoryIntelligenceOperation(
       stdout.push(buffer);
     });
     child.stderr.on("data", (chunk: Buffer | string) => {
-      if (settled) return;
+      if (settled || failure) return;
       const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
       stderrBytes += buffer.length;
       if (stderrBytes > maxStderrBytes) {

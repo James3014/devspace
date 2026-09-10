@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import test from "node:test";
@@ -46,7 +46,7 @@ process.stdin.on('end', () => {
   if (mode === 'nonzero') { console.error('canonical failure'); process.exit(7); }
   if (mode === 'invalid-json') { process.stdout.write('not-json'); return; }
   if (mode === 'overflow') { process.stdout.write('x'.repeat(4096)); return; }
-  if (mode === 'timeout') { setTimeout(() => {}, 60000); return; }
+  if (mode === 'timeout') { require('node:fs').writeFileSync('ri-child.pid', String(process.pid)); setTimeout(() => {}, 60000); return; }
   const operation = args[args.indexOf('--operation') + 1];
   const ceiling = operation === 'ci' || operation === 'cfi'
     ? 'CI_EVIDENCE_ONLY'
@@ -72,7 +72,7 @@ process.stdin.on('end', () => {
       "if mode == 'nonzero': print('canonical failure', file=sys.stderr); raise SystemExit(7)",
       "if mode == 'invalid-json': print('not-json', end=''); raise SystemExit(0)",
       "if mode == 'overflow': print('x' * 4096, end=''); raise SystemExit(0)",
-      "if mode == 'timeout': time.sleep(60)",
+      "if mode == 'timeout': open('ri-child.pid', 'w').write(str(__import__('os').getpid())); time.sleep(60)",
       "ceiling = 'CI_EVIDENCE_ONLY' if operation in ('ci', 'cfi') else ('AUTOMATION_ADVISORY_ONLY' if operation == 'eia' else 'PR_INTELLIGENCE_ONLY')",
       "top = 'PRE_REVIEW_ONLY' if mode == 'wrong-ceiling' else ceiling",
       "nested = 'PRE_REVIEW_ONLY' if mode == 'wrong-nested-ceiling' else ceiling",
@@ -154,7 +154,16 @@ test("runner fails closed on malformed execution and claim evidence", async () =
     await assert.rejects(() => withFakeMode("invalid-json", () => runRepositoryIntelligenceOperation(cfg, "revision", {})), /invalid JSON/);
     await assert.rejects(() => withFakeMode("nonzero", () => runRepositoryIntelligenceOperation(cfg, "revision", {})), /canonical failure/);
     await assert.rejects(() => withFakeMode("overflow", () => runRepositoryIntelligenceOperation({ ...cfg, maxStdoutBytes: 128 }, "revision", {})), /stdout exceeded 128 byte limit/);
-    await assert.rejects(() => withFakeMode("timeout", () => runRepositoryIntelligenceOperation({ ...cfg, timeoutMs: 50 }, "revision", {})), /timed out/);
+    await assert.rejects(() => withFakeMode("timeout", () => runRepositoryIntelligenceOperation({ ...cfg, timeoutMs: 2_000 }, "revision", {})), /timed out/);
+    assert.equal(existsSync(join(root, "ri-child.pid")), true);
+    const childPid = Number.parseInt(readFileSync(join(root, "ri-child.pid"), "utf8"), 10);
+    assert.ok(Number.isInteger(childPid) && childPid > 0);
+    assert.throws(
+      () => process.kill(childPid, 0),
+      (error: unknown) =>
+        error instanceof Error && "code" in error && (error as NodeJS.ErrnoException).code === "ESRCH",
+    );
+    rmSync(root, { recursive: true, force: false });
   } finally { cleanupDir(root); }
 });
 
@@ -184,7 +193,7 @@ test("native tools are opt-in and exactly read-only when enabled", async () => {
     mkdirSync(project, { recursive: true });
     mkdirSync(riRoot, { recursive: true });
     const riHead = initGitRepo(riRoot);
-    const pythonBin = makeFakePython(root);
+    const pythonBin = makeFakePython(riRoot);
     const baseEnv = {
       DEVSPACE_CONFIG_DIR: join(root, ".config"),
       DEVSPACE_ALLOWED_ROOTS: root,

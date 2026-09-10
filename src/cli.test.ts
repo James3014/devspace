@@ -43,11 +43,15 @@ class Program {
         FileName = node,
         Arguments = "-e \"setTimeout(() => {}, 3000)\"",
         UseShellExecute = false,
+        RedirectStandardInput = true,
+        RedirectStandardOutput = true,
+        RedirectStandardError = true,
         CreateNoWindow = true,
       });
+      child.StandardInput.Close();
       File.WriteAllText(descendantPath, child.Id.ToString());
     }
-    var response = "{\"status\":\"SUCCESS\",\"conversation_id\":\"mock-session\",\"response\":\""
+    var response = "{\"status\":\"SUCCESS\",\"conversation_id\":\"mock-session\",\"response\":\"mock response-"
       + new String('x', 100000) + "\"}";
     Console.Write(response);
   }

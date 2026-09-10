@@ -452,6 +452,11 @@ test("runToolchainVerifier preserves literal argv and separates launch failure f
     writeFileSync(script, `
       const [mode, ...args] = process.argv.slice(2);
       const expected = ${JSON.stringify(expectedArgs)};
+      if (mode === "overflow") {
+        process.stdout.write("x".repeat(4 * 1024 * 1024));
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        process.exit(0);
+      }
       if (JSON.stringify(args) !== JSON.stringify(expected)) process.exit(17);
       process.exit(mode === "fail" ? 7 : 0);
     `);
@@ -469,6 +474,15 @@ test("runToolchainVerifier preserves literal argv and separates launch failure f
     });
     assert.equal(failed.exitCode, 7);
     assert.equal(failed.launchError, undefined, "a real verifier exit must not be labeled launch failure");
+    const overflow = await runToolchainVerifier({
+      toolchains,
+      toolchainId: "native",
+      verifier: "probe",
+      args: [script, "overflow", ...expectedArgs],
+      cwd,
+    });
+    assert.equal(overflow.exitCode, null);
+    assert.equal(overflow.launchError, undefined, "post-launch maxBuffer failure must not be labeled launch failure");
     const unavailable = join(root, "unavailable-verifier");
     writeFileSync(unavailable, "#!/bin/sh\nexit 0\n", { mode: 0o644 });
     const missing = await runToolchainVerifier({
