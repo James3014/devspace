@@ -26,6 +26,12 @@ function initGitRepo(dir: string): string {
   return execFileSync("git", ["-C", dir, "rev-parse", "HEAD"], { encoding: "utf8" }).trim().toLowerCase();
 }
 
+function cleanupDir(dir: string): void {
+  try {
+    rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+  } catch {}
+}
+
 function makeFakePython(root: string): string {
   const scriptContent = `let body = '';
 process.stdin.setEncoding('utf8');
@@ -106,7 +112,7 @@ test("runner verifies exact engine HEAD and preserves all operation claim ceilin
     const eia = await runRepositoryIntelligenceOperation(cfg, "eia", { snapshot });
     assert.equal(eia.claim_ceiling, "AUTOMATION_ADVISORY_ONLY");
     assert.equal(eia.engine.head, head);
-  } finally { rmSync(root, { recursive: true, force: true }); }
+  } finally { cleanupDir(root); }
 });
 
 test("runner fails closed on engine HEAD mismatch before Python execution", async () => {
@@ -120,7 +126,7 @@ test("runner fails closed on engine HEAD mismatch before Python execution", asyn
         runRepositoryIntelligenceOperation({ root, expectedHead: wrongHead, pythonBin }, "revision", {})),
       new RegExp(`Repository Intelligence engine HEAD mismatch: expected ${wrongHead}, got ${head}`),
     );
-  } finally { rmSync(root, { recursive: true, force: true }); }
+  } finally { cleanupDir(root); }
 });
 
 test("runner fails closed on malformed execution and claim evidence", async () => {
@@ -135,7 +141,7 @@ test("runner fails closed on malformed execution and claim evidence", async () =
     await assert.rejects(() => withFakeMode("nonzero", () => runRepositoryIntelligenceOperation(cfg, "revision", {})), /canonical failure/);
     await assert.rejects(() => withFakeMode("overflow", () => runRepositoryIntelligenceOperation({ ...cfg, maxStdoutBytes: 128 }, "revision", {})), /stdout exceeded 128 byte limit/);
     await assert.rejects(() => withFakeMode("timeout", () => runRepositoryIntelligenceOperation({ ...cfg, timeoutMs: 50 }, "revision", {})), /timed out/);
-  } finally { rmSync(root, { recursive: true, force: true }); }
+  } finally { cleanupDir(root); }
 });
 
 async function makeConnectedServer(config: ReturnType<typeof loadConfig>, workspaces: WorkspaceRegistry) {
@@ -247,7 +253,7 @@ test("native tools are opt-in and exactly read-only when enabled", async () => {
     } finally {
       await connected.close();
     }
-  } finally { rmSync(root, { recursive: true, force: true }); }
+  } finally { cleanupDir(root); }
 });
 
 const EXTRACTED_ENGINE_ROOT = "/Users/jameschen/Workspace/repository-intelligence-engine";
