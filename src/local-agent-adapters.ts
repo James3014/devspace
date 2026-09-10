@@ -136,6 +136,7 @@ class DriverBackedLocalAgentAdapter implements LocalAgentAdapter {
       writeMode: input.writeMode,
       model: input.model,
       effort: input.effort,
+      cliProviderId: input.cliProviderId,
     };
     const created = await this.driver.createRuntime(context);
     if (!created.isOk()) {

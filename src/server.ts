@@ -107,11 +107,21 @@ import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
-import { summarizeLocalAgentProfile, loadLocalAgentProfiles } from "./local-agent-profiles.js";
+import {
+  summarizeLocalAgentProfile,
+  loadLocalAgentProfiles,
+  LOCAL_AGENT_PROVIDERS,
+  type LocalAgentProfile,
+  type LocalAgentProvider,
+} from "./local-agent-profiles.js";
+import { isSubagentProviderEnabled } from "./local-agent-config.js";
 import {
   loadProfileCatalog,
   type ProfileCatalogEntry,
 } from "./local-agent-profile-source.js";
+import { acquireOpencodeCatalog, type OpencodeCatalogSnapshot } from "./local-agent-opencode-catalog.js";
+import { createMcpOpencodeCatalogSource } from "./local-agent-opencode-mcp-catalog.js";
+import { ClineCatalogService, isClineCatalogFresh, validateClineModelAndThinking, type ClineCatalogSnapshot } from "./local-agent-cline-catalog.js";
 import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build-identity.js";
 import {
   deriveLoadedCapabilityManifest,
@@ -136,7 +146,7 @@ import {
   AGENT_LIST_MAX_LIMIT,
   AGENT_LIST_DEFAULT_LIMIT,
 } from "./local-agent-sessions.js";
-import { parseExecutionContract } from "./local-agent-contract.js";
+import { parseExecutionContract, type ExecutionContract } from "./local-agent-contract.js";
 import { runToolchainVerifier, resolveToolchainExecutable } from "./local-agent-toolchains.js";
 import {
   runRepositoryIntelligenceOperation,
@@ -187,6 +197,42 @@ const REPOSITORY_INTELLIGENCE_TOOL_ANNOTATIONS = {
   idempotentHint: true,
   openWorldHint: false,
 };
+
+type AgentSelector = {
+  profile?: string;
+  provider?: LocalAgentProvider;
+  model?: string;
+  effort?: string;
+  cliProviderId?: "cline" | "cline-pass";
+};
+
+function agentSelectorShape() {
+  return z.object({
+    profile: z.string().min(1).optional().describe("Name of an advertised agent profile to run."),
+    provider: z.enum(LOCAL_AGENT_PROVIDERS as [LocalAgentProvider, ...LocalAgentProvider[]]).optional()
+      .describe("Provider for direct dispatch. Requires model and cannot be combined with profile."),
+    model: z.string().trim().min(1).optional()
+      .describe("Exact provider model for direct dispatch. Requires provider and cannot be combined with profile."),
+    effort: z.string().trim().min(1).optional()
+      .describe("Optional provider reasoning effort for direct dispatch."),
+    cliProviderId: z.enum(["cline", "cline-pass"]).optional()
+      .describe("Exact Cline CLI provider family; valid only when provider=cline."),
+  });
+}
+
+function validateAgentSelector(value: AgentSelector): string | undefined {
+  const hasProfile = value.profile !== undefined;
+  const hasDirect = value.provider !== undefined || value.model !== undefined;
+  if (hasProfile && value.effort !== undefined) return "effort is only valid with direct provider and model selection.";
+  if (value.cliProviderId !== undefined && value.provider !== "cline") return "cliProviderId is only valid with provider=cline.";
+  if (hasProfile === hasDirect) {
+    return "Provide either profile, or provider and model together.";
+  }
+  if (hasDirect && (value.provider === undefined || value.model === undefined)) {
+    return "Direct dispatch requires both provider and model.";
+  }
+  return undefined;
+}
 
 interface RunningServer {
   app: ReturnType<typeof createMcpExpressApp>;
@@ -1930,15 +1976,139 @@ function createAgentStartInputSchema() {
   }).partial().optional().describe(
     "Optional structured execution contract. Records and enforces where/how the worker may run.",
   );
+  const selectorShape = agentSelectorShape();
   return {
     workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
-    profile: z.string().describe("Name of an advertised agent profile to run."),
+    ...selectorShape.shape,
     prompt: z.string().describe("Task prompt for the agent."),
     attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/).optional().describe(
       "Optional physical-workspace-scoped replay identity. Exact request replays reuse one durable agent; conflicting reuse fails closed.",
     ),
     executionContract,
   };
+}
+
+function createAgentPreflightInputSchema() {
+  return {
+    workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+    ...agentSelectorShape().shape,
+    toolchainId: z.string().optional().describe("Optional toolchain id to check availability for."),
+  };
+}
+
+function createAgentCatalogInputSchema() {
+  return {
+    workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+    provider: z.string().optional().describe("Optional exact provider family filter."),
+    model: z.string().optional().describe("Optional exact provider/model identity filter."),
+    limit: z.number().int().positive().max(50).optional().describe("Maximum entries to return; defaults to 25."),
+    cursor: z.string().regex(/^[A-Za-z0-9._:-]{1,160}$/).optional().describe("Opaque page cursor returned by the previous query."),
+  };
+}
+
+async function loadMcpProfileCatalog(
+  config: ServerConfig,
+  workspaceRoot: string,
+  opencodeCatalogSource?: ReturnType<typeof createMcpOpencodeCatalogSource>,
+  clineCatalogService?: ClineCatalogService,
+): Promise<{ catalog: Awaited<ReturnType<typeof loadProfileCatalog>>; opencodeCatalog: OpencodeCatalogSnapshot; clineCatalog: ClineCatalogSnapshot }> {
+  // Profile discovery, preflight, start, and continuation all acquire through
+  // the same bounded single-flight snapshot. No provider execution occurs here.
+  const opencodeCatalog = await (opencodeCatalogSource?.acquire() ?? acquireOpencodeCatalog());
+  const clineCatalog = clineCatalogService ? await clineCatalogService.refresh() : { state: "UNKNOWN" as const, entries: [], generation: "unknown", runtime: { command: "cline", cliProviderId: "cline" as const, version: "unknown", supportsProviderFlag: false, supportsModelFlag: false, supportedThinking: [] }, source: "none" as const };
+  const catalog = await loadProfileCatalog(config, workspaceRoot, { opencodeCatalog, clineCatalog });
+  return { catalog, opencodeCatalog, clineCatalog };
+}
+
+function resolveAgentSelector(
+  selector: AgentSelector,
+  profiles: LocalAgentProfile[],
+  config: ServerConfig,
+  contract?: ExecutionContract,
+): { profileName: string; profiles: LocalAgentProfile[]; directSelection?: NonNullable<ExecutionContract["directSelection"]> } {
+  if (selector.profile !== undefined) return { profileName: selector.profile, profiles };
+  if (!selector.provider || !selector.model) {
+    throw new AgentSessionError("UNKNOWN_PROFILE", "Provide either profile, or provider and model together.");
+  }
+  if (!isSubagentProviderEnabled(config.subagents, selector.provider)) {
+    throw new AgentSessionError(
+      "PROVIDER_DISABLED",
+      `Agent provider '${selector.provider}' is disabled; direct dispatch is refused.`,
+    );
+  }
+  const baseName = `__direct__${selector.provider}__${selector.cliProviderId ?? "default"}__${selector.model}__${selector.effort ?? "default"}`;
+  const profileName = baseName;
+  const writeMode = contract?.dispatchIntent
+    && (contract.dispatchIntent.roleIntent === "MECHANICAL_EXECUTOR" || contract.dispatchIntent.roleIntent === "DEEP_ENGINEERING")
+    && (contract.writePaths?.length ?? 0) > 0
+    ? "allowed" as const
+    : "read_only" as const;
+  return {
+    profileName,
+    directSelection: {
+      provider: selector.provider,
+      model: selector.model,
+      effort: selector.effort,
+      cliProviderId: selector.cliProviderId,
+      writeMode,
+    },
+    // Put the immutable direct binding first so an unrelated disk profile
+    // with the same display name cannot shadow the admitted selection.
+    profiles: [{
+      name: profileName,
+      description: "Validated direct provider/model selection",
+      provider: selector.provider,
+      model: selector.model,
+      effort: selector.effort,
+      cliProviderId: selector.cliProviderId,
+      // Direct selection must pass the same conversation mutation gate as a
+      // normal writable profile; it must never gain an implicit bypass.
+      write_mode: writeMode,
+      filePath: "<direct-dispatch>",
+      body: "",
+      disabled: false,
+    }, ...profiles],
+  };
+}
+
+function catalogReceiptForProfile(
+  profile: LocalAgentProfile | undefined,
+  opencodeCatalog: OpencodeCatalogSnapshot,
+  clineCatalog: ClineCatalogSnapshot,
+): NonNullable<ExecutionContract["catalogReceipt"]> | undefined {
+  if (!profile?.model) return undefined;
+  if (profile.provider === "opencode") {
+    return {
+      provider: profile.provider,
+      model: profile.model,
+      effort: profile.effort,
+      source: opencodeCatalog.source,
+      generation: opencodeCatalog.generation,
+      fetchedAt: opencodeCatalog.fetchedAt,
+      freshness: opencodeCatalog.freshness ?? "unknown",
+      runtimeIdentity: `${opencodeCatalog.runtime?.source ?? "unknown"}:${opencodeCatalog.runtime?.version ?? "unknown"}:${opencodeCatalog.runtime?.executable ?? "unknown"}`,
+    };
+  }
+  if (profile.provider === "cline") {
+    return {
+      provider: profile.provider,
+      model: profile.model,
+      effort: profile.effort,
+      cliProviderId: profile.cliProviderId,
+      source: clineCatalog.source,
+      generation: clineCatalog.generation,
+      fetchedAt: clineCatalog.fetchedAt ?? new Date(0).toISOString(),
+      freshness: clineCatalog.state === "READY" ? "fresh" : "unknown",
+      runtimeIdentity: `${clineCatalog.runtime.cliProviderId}:${clineCatalog.runtime.version}:${clineCatalog.runtime.command}`,
+    };
+  }
+  return undefined;
+}
+
+function assertDirectClineCatalogSelection(selector: AgentSelector, catalog: Awaited<ReturnType<typeof loadProfileCatalog>>): void {
+  if (selector.provider !== "cline") return;
+  const validation = validateClineModelAndThinking(selector.model, selector.cliProviderId as "cline" | "cline-pass" | undefined, selector.effort, catalog.clineCatalog);
+  if (!validation.valid) throw new AgentSessionError(validation.blockerCode ?? "EXACT_MODEL_UNAVAILABLE", validation.reason ?? "Cline selection is unavailable.");
 }
 
 export function createMcpServer(
@@ -1953,6 +2123,8 @@ export function createMcpServer(
   runtimeBuildIdentityContext?: RuntimeBuildIdentityContext,
   durableOperations?: DurableOperationManager,
   cutoverControl?: CutoverMcpControlContext,
+  opencodeCatalogSource?: ReturnType<typeof createMcpOpencodeCatalogSource>,
+  clineCatalogService?: ClineCatalogService,
 ): McpServer {
   const runtimeBuildIdentity = runtimeBuildIdentityContext?.identity
     ?? describeRuntimeBuildIdentity({
@@ -1965,9 +2137,16 @@ export function createMcpServer(
   const latestProfileCatalogGeneration = runtimeBuildIdentityContext?.latestProfileCatalogGeneration
     ?? { value: runtimeBuildIdentity.profileCatalogGeneration };
   const agentStartInputSchema = createAgentStartInputSchema();
+  const agentPreflightInputSchema = createAgentPreflightInputSchema();
   const capabilityManifest = runtimeBuildIdentityContext?.capabilityManifest
     ?? deriveLoadedCapabilityManifest(
-      config.subagents && agentSessionManager ? { agent_start: agentStartInputSchema } : {},
+      config.subagents && agentSessionManager
+        ? {
+          agent_start: agentStartInputSchema,
+          agent_preflight: agentPreflightInputSchema,
+          agent_catalog: createAgentCatalogInputSchema(),
+        }
+        : {},
     );
   const server = new McpServer(
     {
@@ -2089,6 +2268,10 @@ export function createMcpServer(
         { path, mode, baseRef },
         { conversationScopeId },
       );
+      const discoveredCatalog = await loadMcpProfileCatalog(config, workspace.root, opencodeCatalogSource, clineCatalogService);
+      workspace.agentProfiles = discoveredCatalog.catalog.profiles;
+      workspace.profileCatalogGeneration = discoveredCatalog.catalog.generation;
+      workspace.profileCatalogEntries = discoveredCatalog.catalog.entries;
       const conversationSafety = await workspaces.conversationMutationSafety(
         workspace.id,
         conversationScopeId,
@@ -3339,6 +3522,104 @@ export function createMcpServer(
     });
     registerAppTool(
       server,
+      "agent_catalog",
+      {
+        title: "Agent model catalog",
+        description:
+          "Read-only bounded catalog evidence for exact provider/model membership. Membership, runtime, and account entitlement remain separate facts; this query never starts a provider task.",
+        inputSchema: createAgentCatalogInputSchema(),
+        outputSchema: {
+          snapshot: z.object({
+            source: z.string(),
+            fetchedAt: z.string(),
+            generation: z.string(),
+            freshness: z.string(),
+            version: z.string(),
+            expiresAt: z.string().optional(),
+            runtime: z.object({
+              executable: z.string().optional(),
+              command: z.string().optional(),
+              cliProviderId: z.string().optional(),
+              version: z.string(),
+              source: z.string(),
+            }),
+            failure: z.object({ code: z.string(), message: z.string() }).optional(),
+          }),
+          entries: z.array(z.object({
+            providerId: z.string(),
+            modelId: z.string(),
+            fullName: z.string(),
+            variants: z.array(z.string()),
+            variantsKnown: z.boolean().optional(),
+            thinkingVerified: z.boolean().optional(),
+            status: z.string(),
+            enabled: z.boolean().optional(),
+            cliProviderId: z.string().optional(),
+            routeKey: z.string().optional(),
+            catalogTier: z.enum(["free", "pass"]).optional(),
+            free: z.enum(["known-free", "known-paid", "unknown"]).optional(),
+            accountEntitlement: z.literal("unknown").optional(),
+            supportsReasoning: z.union([z.boolean(), z.literal("unknown")]).optional(),
+            membership: z.literal("catalog-listed"),
+          })),
+          entitlement: z.object({ state: z.literal("UNKNOWN"), source: z.literal("not-probed") }),
+          nextCursor: z.string().optional(),
+        },
+        _meta: {},
+        annotations: { readOnlyHint: true },
+      },
+      async ({ workspaceId, provider, model, limit = 25, cursor }) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const { opencodeCatalog, clineCatalog } = await loadMcpProfileCatalog(config, workspace.root, opencodeCatalogSource, clineCatalogService);
+        const selectedSnapshot = provider === "cline" ? clineCatalog : opencodeCatalog;
+        const selectedGeneration = selectedSnapshot.generation;
+        const [cursorGeneration, cursorOffset] = cursor?.split(":", 2) ?? [selectedGeneration, "0"];
+        if (cursor !== undefined && cursorGeneration !== selectedGeneration) {
+          throw new AgentSessionError("REBIND_REQUIRED", "Catalog cursor belongs to a different snapshot generation; restart the query.");
+        }
+        const offset = Number(cursorOffset);
+        if (!Number.isSafeInteger(offset) || offset < 0) throw new AgentSessionError("UNKNOWN_PROFILE", "Invalid catalog cursor.");
+        const filteredEntries = provider === "cline"
+          ? clineCatalog.entries
+            .filter((entry) => !model || entry.fullName === model || entry.routeKey === model)
+            .map((entry) => ({ providerId: "cline", modelId: entry.modelId, fullName: entry.fullName, variants: [...entry.thinking], variantsKnown: entry.thinkingKnown, thinkingVerified: clineCatalog.runtime.thinkingVerified === true, status: clineCatalog.state.toLowerCase(), cliProviderId: entry.cliProviderId, routeKey: entry.routeKey, catalogTier: entry.catalogTier, free: entry.free, accountEntitlement: entry.accountEntitlement, supportsReasoning: entry.supportsReasoning }))
+          : opencodeCatalog.entries
+            .filter((entry) => !provider || entry.providerId === provider)
+            .filter((entry) => !model || entry.fullName === model || entry.modelId === model);
+        const entries = filteredEntries
+          .slice(offset, offset + limit)
+          .map((entry) => ({ ...entry, membership: "catalog-listed" as const }));
+        const nextCursor = offset + entries.length < filteredEntries.length
+          ? `${selectedGeneration}:${offset + entries.length}`
+          : undefined;
+        const snapshotFailure = provider === "cline" && clineCatalog.diagnostic
+          ? { code: clineCatalog.state, message: clineCatalog.diagnostic }
+          : opencodeCatalog.failure;
+        const snapshot = {
+          source: selectedSnapshot.source,
+          fetchedAt: selectedSnapshot.fetchedAt ?? new Date(0).toISOString(),
+          generation: selectedSnapshot.generation,
+          freshness: provider === "cline" ? (isClineCatalogFresh(clineCatalog) ? "fresh" : "unknown") : (opencodeCatalog.freshness ?? "unknown"),
+          version: provider === "cline" ? clineCatalog.runtime.version : (opencodeCatalog.runtime?.version ?? "unknown"),
+          ...(selectedSnapshot.expiresAt ? { expiresAt: selectedSnapshot.expiresAt } : {}),
+          runtime: provider === "cline"
+            ? { command: clineCatalog.runtime.command, cliProviderId: clineCatalog.runtime.cliProviderId, version: clineCatalog.runtime.version, source: selectedSnapshot.source }
+            : { executable: opencodeCatalog.runtime?.executable, version: opencodeCatalog.runtime?.version ?? "unknown", source: selectedSnapshot.source },
+          ...(snapshotFailure ? { failure: snapshotFailure } : {}),
+        };
+        return {
+          content: [textBlock(`Catalog ${snapshot.generation}: ${entries.length} matching exact membership record(s).`)],
+          structuredContent: {
+            snapshot,
+            entries,
+            entitlement: { state: "UNKNOWN" as const, source: "not-probed" as const },
+            ...(nextCursor ? { nextCursor } : {}),
+          },
+        };
+      },
+    );
+    registerAppTool(
+      server,
       "agent_start",
       {
         title: "Start agent",
@@ -3362,15 +3643,11 @@ export function createMcpServer(
         _meta: {},
         annotations: AGENT_TOOL_ANNOTATIONS_WRITE,
       },
-      async ({ workspaceId, profile, prompt, attemptKey, executionContract }, { _meta }) => {
+      async ({ workspaceId, profile, provider, model, effort, cliProviderId, prompt, attemptKey, executionContract }, { _meta }) => {
+        const selectorError = validateAgentSelector({ profile, provider, model, effort, cliProviderId });
+        if (selectorError) throw new AgentSessionError("UNKNOWN_PROFILE", selectorError);
         const workspace = workspaces.getWorkspace(workspaceId);
-        const profileCatalog = await loadProfileCatalog(config, workspace.root);
-        const profiles = profileCatalog.profiles;
-        const selectedProfile = profiles.find((candidate) => candidate.name === profile);
-        if (selectedProfile?.write_mode !== "read_only") {
-          await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
-        }
-        let contract;
+        let contract: ExecutionContract | undefined;
         try {
           contract = parseExecutionContract(executionContract);
         } catch (error) {
@@ -3379,15 +3656,37 @@ export function createMcpServer(
             error instanceof Error ? error.message : String(error),
           );
         }
+        const { catalog: profileCatalog, opencodeCatalog, clineCatalog } = await loadMcpProfileCatalog(config, workspace.root, opencodeCatalogSource, clineCatalogService);
+        const selection = resolveAgentSelector(
+          { profile, provider, model, effort, cliProviderId },
+          profileCatalog.profiles,
+          config,
+          contract,
+        );
+        assertDirectClineCatalogSelection({ profile, provider, model, effort, cliProviderId }, profileCatalog);
+        const profiles = selection.profiles;
+        const selectedProfile = profiles.find((candidate) => candidate.name === selection.profileName);
+        if (selectedProfile?.write_mode !== "read_only") {
+          await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
+        }
+        const boundContractBase = selection.directSelection
+          ? { ...(contract ?? {}), directSelection: selection.directSelection }
+          : (contract ?? {});
+        const boundContract = {
+          ...boundContractBase,
+          ...(catalogReceiptForProfile(selectedProfile, opencodeCatalog, clineCatalog)
+            ? { catalogReceipt: catalogReceiptForProfile(selectedProfile, opencodeCatalog, clineCatalog) }
+            : {}),
+        };
         const output = await agentSessionManager.startAgent({
           workspaceId,
           workspaceRoot: workspace.root,
-          profileName: profile,
+          profileName: selection.profileName,
           prompt,
           profiles,
           profileCatalog,
           attemptKey,
-          executionContract: contract,
+          executionContract: boundContract,
         });
         logToolCall(config, {
           tool: "agent_start",
@@ -3440,7 +3739,7 @@ export function createMcpServer(
       },
       async ({ workspaceId, agentId, prompt, idleTimeoutMode, idleTimeoutMs }, { _meta }) => {
         const workspace = workspaces.getWorkspace(workspaceId);
-        const profileCatalog = await loadProfileCatalog(config, workspace.root);
+        const { catalog: profileCatalog, opencodeCatalog, clineCatalog } = await loadMcpProfileCatalog(config, workspace.root, opencodeCatalogSource, clineCatalogService);
         const currentAgent = agentSessionManager.getRecordByPrefixOrId(agentId);
         const currentProfile = currentAgent
           ? profileCatalog.profiles.find((candidate) => candidate.name === currentAgent.profileName)
@@ -3457,6 +3756,8 @@ export function createMcpServer(
           idleTimeoutMs,
           profiles: profileCatalog.profiles,
           profileCatalog,
+          opencodeCatalog,
+          clineCatalog,
         });
         logToolCall(config, {
           tool: "agent_continue",
@@ -3655,11 +3956,7 @@ export function createMcpServer(
         title: "Agent preflight",
         description:
           "Read-only readiness evidence for an exact workspace + agent profile before dispatch. Provider 'configured' is not the same as dispatch-ready; unknown evidence stays unknown. Never exposes credentials and grants no routing/admission authority.",
-        inputSchema: {
-          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
-          profile: z.string().describe("Name of an advertised agent profile to check."),
-          toolchainId: z.string().optional().describe("Optional toolchain id to check availability for."),
-        },
+        inputSchema: agentPreflightInputSchema,
         outputSchema: {
           workspace: z.object({
             workspaceId: z.string(),
@@ -3672,6 +3969,7 @@ export function createMcpServer(
             profile: z.string(),
             provider: z.string(),
             model: z.string().optional(),
+            effort: z.string().optional(),
             thinking: z.string().optional(),
             executionIdentity: z.string(),
             runtimeVersion: z.string().optional(),
@@ -3708,19 +4006,34 @@ export function createMcpServer(
           }),
           blockers: z.array(z.object({ code: z.string(), detail: z.string() })),
           unknowns: z.array(z.string()),
+          catalog: z.object({
+            source: z.string(),
+            fetchedAt: z.string(),
+            generation: z.string(),
+            freshness: z.string(),
+            version: z.string(),
+          }),
         },
         _meta: {},
         annotations: { readOnlyHint: true },
       },
-      async ({ workspaceId, profile, toolchainId }, { _meta }) => {
+      async ({ workspaceId, profile, provider, model, effort, cliProviderId, toolchainId }, { _meta }) => {
+        const selectorError = validateAgentSelector({ profile, provider, model, effort, cliProviderId });
+        if (selectorError) throw new AgentSessionError("UNKNOWN_PROFILE", selectorError);
         const workspace = workspaces.getWorkspace(workspaceId);
-        const profileCatalog = await loadProfileCatalog(config, workspace.root);
-        const profiles = profileCatalog.profiles;
+        const { catalog: profileCatalog, opencodeCatalog } = await loadMcpProfileCatalog(config, workspace.root, opencodeCatalogSource, clineCatalogService);
+        const selection = resolveAgentSelector(
+          { profile, provider, model, effort, cliProviderId },
+          profileCatalog.profiles,
+          config,
+        );
+        assertDirectClineCatalogSelection({ profile, provider, model, effort, cliProviderId }, profileCatalog);
+        const profiles = selection.profiles;
         const output = await agentSessionManager.preflightAgent({
           workspaceId,
           workspaceRoot: workspace.root,
           isolated: workspace.mode === "worktree",
-          profileName: profile,
+          profileName: selection.profileName,
           profiles,
           profileCatalog,
           toolchainId,
@@ -3742,7 +4055,17 @@ export function createMcpServer(
               `Preflight for ${profile}: dispatchState=${output.readiness.dispatchState}; localCapacity=${output.capacity.used}/${output.capacity.max ?? "unbounded"}; providerCapacity=${output.capacity.providerState}.${blockerSummary}${conversationSummary}`,
             ),
           ],
-          structuredContent: { ...output, conversationSafety } as unknown as Record<string, unknown>,
+          structuredContent: {
+            ...output,
+            conversationSafety,
+            catalog: {
+              source: opencodeCatalog.source,
+              fetchedAt: opencodeCatalog.fetchedAt,
+              generation: opencodeCatalog.generation,
+              freshness: opencodeCatalog.freshness ?? "unknown",
+              version: opencodeCatalog.version,
+            },
+          } as unknown as Record<string, unknown>,
         };
       },
     );
@@ -4501,6 +4824,8 @@ export function createServer(
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
   const durableOperations = new DurableOperationManager(config);
+  const opencodeCatalogSource = createMcpOpencodeCatalogSource();
+  const clineCatalogService = new ClineCatalogService();
   const localAgentProviders = buildLocalAgentProviderStatuses(
     config.subagents,
     getLocalAgentProviderAvailabilitySnapshot(),
@@ -4518,10 +4843,14 @@ export function createServer(
   });
   const latestProfileCatalogGeneration = { value: runtimeBuildIdentity.profileCatalogGeneration };
   const agentSessionManager = config.subagents.enabled
-    ? new LocalAgentSessionManager(config, undefined, undefined, undefined, runtimeBuildIdentity)
+    ? new LocalAgentSessionManager(config, undefined, undefined, undefined, runtimeBuildIdentity, undefined, clineCatalogService, opencodeCatalogSource)
     : undefined;
   const capabilityManifest = deriveLoadedCapabilityManifest(
-    agentSessionManager ? { agent_start: createAgentStartInputSchema() } : {},
+    {
+      ...(agentSessionManager
+        ? { agent_start: createAgentStartInputSchema(), agent_preflight: createAgentPreflightInputSchema(), agent_catalog: createAgentCatalogInputSchema() }
+        : {}),
+    },
   );
   const cutoverController = new McpCutoverController(
     new CutoverStateStore(config.stateDir),
@@ -5113,7 +5442,8 @@ export function createServer(
             canRepairBinding,
             executeBindingRepair,
           },
-
+          opencodeCatalogSource,
+          clineCatalogService,
         );
         await server.connect(transport);
       } else {
@@ -5153,6 +5483,7 @@ export function createServer(
         processSessions.shutdown();
         durableOperations.close();
         agentSessionManager?.close();
+        await opencodeCatalogSource.close();
         oauthProvider.close();
         workspaceStore.close?.();
       })();

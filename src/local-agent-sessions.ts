@@ -14,7 +14,7 @@ import {
   type LocalAgentRecord,
   type LocalAgentStatus,
 } from "./local-agent-store.js";
-import { loadLocalAgentProfiles, type LocalAgentProfile } from "./local-agent-profiles.js";
+import { isLocalAgentProvider, loadLocalAgentProfiles, type LocalAgentProfile } from "./local-agent-profiles.js";
 import {
   checkLocalAgentProviderAvailability,
   getLocalAgentProviderRuntimeVersion,
@@ -46,7 +46,11 @@ import {
   isAgentProviderError,
   type AgentProviderFailureDetails,
 } from "./local-agent-errors.js";
-import { validateOpencodeModelAndVariant } from "./local-agent-opencode-catalog.js";
+import { validateOpencodeModelAndVariant, type OpencodeCatalogSnapshot } from "./local-agent-opencode-catalog.js";
+import { isClineCatalogFresh, type ClineCatalogSnapshot } from "./local-agent-cline-catalog.js";
+import type { ClineCatalogService } from "./local-agent-cline-catalog.js";
+import { ClineCatalogService as ClineCatalogServiceImpl } from "./local-agent-cline-catalog.js";
+import { createMcpOpencodeCatalogSource } from "./local-agent-opencode-mcp-catalog.js";
 import { canonicalizePath, isPathInsideRoot } from "./roots.js";
 import {
   assertNexusGrantAuthorizesExecution,
@@ -72,6 +76,12 @@ import {
   readWorkspaceHead,
   type WorkerAttribution,
 } from "./workspace-reconciliation.js";
+
+function catalogSnapshotIsFresh(fetchedAt: string | undefined, expiresAt: string | undefined): boolean {
+  const fetched = Date.parse(fetchedAt ?? "");
+  const expires = expiresAt ? Date.parse(expiresAt) : NaN;
+  return Number.isFinite(fetched) && fetched <= Date.now() && (!expiresAt || (Number.isFinite(expires) && Date.now() < expires));
+}
 
 // ─── Error codes ────────────────────────────────────────────────────────────
 
@@ -171,6 +181,8 @@ export interface ContinueAgentInput {
   idleTimeoutMs?: number;
   profiles?: LocalAgentProfile[];
   profileCatalog?: ProfileCatalog;
+  opencodeCatalog?: OpencodeCatalogSnapshot;
+  clineCatalog?: ClineCatalogSnapshot;
 }
 
 export interface GetAgentStatusInput {
@@ -471,6 +483,9 @@ export class LocalAgentSessionManager {
   private readonly turnRunner?: AgentTurnRunner;
   private readonly runtimeBuildIdentity: RuntimeBuildIdentity;
   private readonly nexusGrantResolver: NexusGrantResolver;
+  private readonly clineCatalogService?: ClineCatalogService;
+  private readonly opencodeCatalogSource: ReturnType<typeof createMcpOpencodeCatalogSource>;
+  private readonly ownsOpencodeCatalogSource: boolean;
   private closed = false;
   private readonly terminationAttempts = new Map<string, Promise<boolean>>();
 
@@ -481,12 +496,17 @@ export class LocalAgentSessionManager {
     testTurnRunner?: AgentTurnRunner,
     runtimeBuildIdentity?: RuntimeBuildIdentity,
     nexusGrantResolver?: NexusGrantResolver,
+    clineCatalogService?: ClineCatalogService,
+    opencodeCatalogSource?: ReturnType<typeof createMcpOpencodeCatalogSource>,
   ) {
     this.store = createLocalAgentStore(config.stateDir);
     this.launcher = testLauncher ?? defaultWorkerLauncher;
     this.terminator = testTerminator ?? terminateOwnedWorker;
     this.turnRunner = testTurnRunner;
     this.nexusGrantResolver = nexusGrantResolver ?? resolveCanonicalNexusExecutionGrant;
+    this.clineCatalogService = clineCatalogService ?? new ClineCatalogServiceImpl();
+    this.opencodeCatalogSource = opencodeCatalogSource ?? createMcpOpencodeCatalogSource();
+    this.ownsOpencodeCatalogSource = opencodeCatalogSource === undefined;
     this.runtimeBuildIdentity = runtimeBuildIdentity ?? describeRuntimeBuildIdentity({
       env: process.env,
       listenPort: config.port,
@@ -501,6 +521,7 @@ export class LocalAgentSessionManager {
     if (this.closed) return;
     this.closed = true;
     this.store.close();
+    if (this.ownsOpencodeCatalogSource) this.opencodeCatalogSource.close();
   }
 
   /**
@@ -640,7 +661,11 @@ export class LocalAgentSessionManager {
     }
 
     if (profile.provider === "opencode") {
-      const modelValidation = validateOpencodeModelAndVariant(profile.model, profile.effort);
+      const modelValidation = validateOpencodeModelAndVariant(
+        profile.model,
+        profile.effort,
+        input.profileCatalog?.opencodeCatalog,
+      );
       if (!modelValidation.valid) {
         throw new AgentSessionError(
           modelValidation.blockerCode!,
@@ -791,16 +816,60 @@ export class LocalAgentSessionManager {
     // ── Continuation admission gates (all read-only; run before mutation) ──
     const admissionFailures: string[] = [];
 
-    const currentProfile = input.profiles?.find((candidate) => candidate.name === record.profileName) ?? {
-      name: record.profileName,
-      description: "Persisted durable-agent profile binding",
-      provider: record.provider as LocalAgentProfile["provider"],
-      model: record.model,
-      effort: record.effort,
-      filePath: "<persisted>",
-      body: "",
-      disabled: false,
-    };
+    const directSelection = record.executionContract?.directSelection;
+    if (directSelection) {
+      if (!isLocalAgentProvider(directSelection.provider)) {
+        throw new AgentSessionError("REBIND_REQUIRED", `Agent ${agentId} has an unknown persisted direct provider.`);
+      }
+      if (record.provider !== directSelection.provider
+        || record.model !== directSelection.model
+        || record.effort !== directSelection.effort) {
+        throw new AgentSessionError("REBIND_REQUIRED", `Agent ${agentId} has inconsistent persisted direct selection evidence.`);
+      }
+    }
+    const receipt = record.executionContract?.catalogReceipt;
+    if (receipt) {
+      const snapshot = receipt.provider === "opencode" ? input.opencodeCatalog : receipt.provider === "cline" ? input.clineCatalog : undefined;
+      if (!snapshot || snapshot.generation !== receipt.generation) {
+        throw new AgentSessionError("REBIND_REQUIRED", `Agent ${agentId} catalog receipt is stale or unavailable; explicit rebind is required.`);
+      }
+      if (receipt.provider === "opencode") {
+        const validation = validateOpencodeModelAndVariant(receipt.model, receipt.effort, snapshot as OpencodeCatalogSnapshot);
+        const opencode = snapshot as OpencodeCatalogSnapshot;
+        const runtimeIdentity = `${opencode.runtime?.source ?? "unknown"}:${opencode.runtime?.version ?? "unknown"}:${opencode.runtime?.executable ?? "unknown"}`;
+        if (!validation.valid || opencode.source !== receipt.source || !catalogSnapshotIsFresh(opencode.fetchedAt, opencode.expiresAt) || (opencode.freshness ?? "unknown") !== receipt.freshness || runtimeIdentity !== receipt.runtimeIdentity) throw new AgentSessionError("REBIND_REQUIRED", validation.reason ?? "Persisted OpenCode catalog receipt is no longer valid.");
+      } else if (receipt.provider === "cline") {
+        const cline = snapshot as ClineCatalogSnapshot;
+        const exact = cline.entries.filter((entry) => entry.cliProviderId === (receipt.cliProviderId ?? "cline") && entry.fullName === receipt.model);
+        const runtimeIdentity = `${cline.runtime.cliProviderId}:${cline.runtime.version}:${cline.runtime.command}`;
+        if (!isClineCatalogFresh(cline) || cline.source !== receipt.source || receipt.freshness !== "fresh" || runtimeIdentity !== receipt.runtimeIdentity || exact.length !== 1 || (receipt.effort && (!exact[0].thinkingKnown || !exact[0].thinking.includes(receipt.effort as never)))) {
+          throw new AgentSessionError("REBIND_REQUIRED", "Persisted Cline catalog receipt is no longer valid.");
+        }
+      }
+    }
+    const currentProfile = directSelection
+      ? {
+          name: record.profileName,
+          description: "Durable direct provider/model selection",
+          provider: directSelection.provider as LocalAgentProfile["provider"],
+          model: directSelection.model,
+          effort: directSelection.effort,
+          cliProviderId: directSelection.cliProviderId,
+          write_mode: directSelection.writeMode,
+          filePath: "<direct-dispatch>",
+          body: "",
+          disabled: false,
+        }
+      : input.profiles?.find((candidate) => candidate.name === record.profileName) ?? {
+          name: record.profileName,
+          description: "Persisted durable-agent profile binding",
+          provider: record.provider as LocalAgentProfile["provider"],
+          model: record.model,
+          effort: record.effort,
+          filePath: "<persisted>",
+          body: "",
+          disabled: false,
+        };
     let executionIdlePolicy: EffectiveExecutionIdlePolicy;
     try {
       executionIdlePolicy = resolveEffectiveExecutionIdlePolicy(
@@ -1161,7 +1230,11 @@ export class LocalAgentSessionManager {
       }
 
       if (runtimeReady && profile.provider === "opencode") {
-        const modelValidation = validateOpencodeModelAndVariant(profile.model, profile.effort);
+        const modelValidation = validateOpencodeModelAndVariant(
+          profile.model,
+          profile.effort,
+          input.profileCatalog?.opencodeCatalog,
+        );
         if (!modelValidation.valid) {
           blockers.push({
             code: modelValidation.blockerCode!,
@@ -1251,9 +1324,7 @@ export class LocalAgentSessionManager {
       delta.attribution,
     );
 
-    const startedAtMs = Date.parse(record.createdAt);
-    const updatedAtMs = Date.parse(record.lifecycleState?.activeTurn?.lastActivityAt ?? record.updatedAt);
-    const now = Date.now();
+    const timing = computeSessionTiming(record);
 
     return {
       agentId: record.id,
@@ -1277,8 +1348,8 @@ export class LocalAgentSessionManager {
         startedAt: record.createdAt,
         lastActivityAt: record.lifecycleState?.activeTurn?.lastActivityAt ?? record.updatedAt,
         lastFileMutationAt: physical.lastFileMutationAt,
-        wallMs: Math.max(0, now - startedAtMs),
-        idleMs: Math.max(0, now - updatedAtMs),
+        wallMs: timing.wallMs,
+        idleMs: timing.idleMs,
       },
     };
   }
@@ -1735,7 +1806,76 @@ export class LocalAgentSessionManager {
       }
 
       const profiles = await loadLocalAgentProfiles(this.config, claimed.workspaceRoot);
-      const profile = profiles.find((p) => p.name === claimed.profileName);
+      // Direct provider/model selections are durable records without a disk
+      // profile. Reconstruct the exact execution identity from the record so
+      // worker reloads and continuation turns use the same normal profile
+      // runner and security gates.
+      const directSelection = claimed.executionContract?.directSelection;
+      const catalogReceipt = claimed.executionContract?.catalogReceipt;
+      if (catalogReceipt && (claimed.provider !== catalogReceipt.provider
+        || (claimed.model ?? undefined) !== (catalogReceipt.model ?? undefined)
+        || (claimed.effort ?? undefined) !== (catalogReceipt.effort ?? undefined))) {
+        throw new Error("Durable record identity does not match its catalog receipt; refusing execution.");
+      }
+      if (directSelection && (directSelection.provider !== claimed.provider
+        || directSelection.model !== claimed.model
+        || directSelection.effort !== claimed.effort)) {
+        throw new Error("Durable record identity does not match its direct selection; refusing execution.");
+      }
+      if (catalogReceipt?.provider === "opencode") {
+        const liveCatalog = await this.opencodeCatalogSource.acquire();
+        const runtimeIdentity = `${liveCatalog.runtime?.source ?? "unknown"}:${liveCatalog.runtime?.version ?? "unknown"}:${liveCatalog.runtime?.executable ?? "unknown"}`;
+        if (liveCatalog.generation !== catalogReceipt.generation
+          || liveCatalog.source !== catalogReceipt.source
+          || !catalogSnapshotIsFresh(liveCatalog.fetchedAt, liveCatalog.expiresAt)
+          || (liveCatalog.freshness ?? "unknown") !== catalogReceipt.freshness
+          || runtimeIdentity !== catalogReceipt.runtimeIdentity) {
+          throw new Error("Persisted OpenCode catalog receipt drifted before provider invocation; refusing execution.");
+        }
+        const validation = validateOpencodeModelAndVariant(catalogReceipt.model, catalogReceipt.effort, liveCatalog);
+        if (!validation.valid) throw new Error(validation.reason ?? "Persisted OpenCode catalog receipt is no longer valid.");
+      }
+      if (catalogReceipt?.provider === "cline") {
+        const liveCatalog = await this.clineCatalogService?.refresh();
+        const exact = liveCatalog?.entries.filter((entry) => entry.cliProviderId === (catalogReceipt.cliProviderId ?? "cline") && entry.fullName === catalogReceipt.model) ?? [];
+        const runtimeIdentity = liveCatalog ? `${liveCatalog.runtime.cliProviderId}:${liveCatalog.runtime.version}:${liveCatalog.runtime.command}` : "unknown:unknown:unknown";
+        if (!liveCatalog || liveCatalog.state !== "READY" || liveCatalog.generation !== catalogReceipt.generation
+          || liveCatalog.source !== catalogReceipt.source || !isClineCatalogFresh(liveCatalog) || catalogReceipt.freshness !== "fresh" || runtimeIdentity !== catalogReceipt.runtimeIdentity || exact.length !== 1
+          || (catalogReceipt.effort && (!exact[0].thinkingKnown || !exact[0].thinking.includes(catalogReceipt.effort as never)))) {
+          throw new Error("Persisted Cline catalog receipt drifted before provider invocation; refusing execution.");
+        }
+      }
+      if (directSelection) {
+        if (!isLocalAgentProvider(directSelection.provider)) {
+          throw new Error(`Persisted direct selection has unknown provider '${directSelection.provider}'.`);
+        }
+        if (claimed.provider !== directSelection.provider
+          || claimed.model !== directSelection.model
+          || claimed.effort !== directSelection.effort) {
+          throw new Error("Persisted direct selection does not match the durable provider/model/effort identity.");
+        }
+      }
+      const profile = directSelection
+        ? {
+            name: claimed.profileName,
+            description: "Durable direct provider/model selection",
+            provider: directSelection.provider as LocalAgentProfile["provider"],
+            model: directSelection.model,
+            effort: directSelection.effort,
+            cliProviderId: directSelection.cliProviderId,
+            write_mode: directSelection.writeMode,
+            filePath: "<direct-dispatch>",
+            body: "",
+            disabled: false,
+          }
+        : profiles.find((p) => p.name === claimed.profileName);
+      if (catalogReceipt && (!profile
+        || profile.provider !== catalogReceipt.provider
+        || (profile.model ?? undefined) !== (catalogReceipt.model ?? undefined)
+        || (profile.effort ?? undefined) !== (catalogReceipt.effort ?? undefined)
+        || (profile.cliProviderId ?? undefined) !== (catalogReceipt.cliProviderId ?? undefined))) {
+        throw new Error("Reloaded profile identity does not match the durable catalog receipt; refusing execution.");
+      }
       const callbacks: LocalAgentRunCallbacks = {
         onActivity: () => {
           this.store.touchActivityCAS(claimed.id, generation, workerToken);
@@ -2029,6 +2169,7 @@ function buildStartReplayBinding(
     provider: input.profile.provider,
     model: input.profile.model ?? null,
     effort: input.profile.effort ?? null,
+    cliProviderId: input.profile.cliProviderId ?? null,
     writeMode: input.profile.write_mode ?? "read_only",
     profileBody: input.profile.body,
     prompt: input.prompt,
@@ -2234,6 +2375,7 @@ async function runLocalAgentProfile(
       writeMode: profile.write_mode === "allowed" ? "allowed" : "read_only",
       model: record.model ?? profile.model,
       effort: record.effort ?? profile.effort,
+      cliProviderId: profile.cliProviderId,
       environment,
     },
     callbacks,

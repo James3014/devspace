@@ -81,7 +81,7 @@ function setupManager(overrides: Record<string, unknown> = {}, turnRunner?: any)
     async () => true,
     turnRunner,
   );
-  return { manager, clean: () => { manager.close(); rmSync(stateDir, { recursive: true, force: true }); } };
+  return { manager, config, clean: async () => { await manager.close(); rmSync(stateDir, { recursive: true, force: true }); } };
 }
 
 const mockProfiles: LocalAgentProfile[] = [
@@ -138,8 +138,8 @@ test("continuation is admitted after a clean within-scope turn", async () => {
     });
     assert.equal(continued.continued, true);
   } finally {
+    await clean();
     f.clean();
-    clean();
   }
 });
 
@@ -179,8 +179,8 @@ test("continuation is rejected BEFORE mutation when a foreign mutation happened 
     assert.equal(after.status, before.status);
     assert.deepEqual(after.updatedAt, before.updatedAt);
   } finally {
+    await clean();
     f.clean();
-    clean();
   }
 });
 
@@ -232,8 +232,8 @@ test("continuation rejects a foreign edit to a PREVIOUSLY WORKER-MODIFIED path",
     assert.deepEqual(after.updatedAt, before.updatedAt);
     assert.deepEqual(after.latestResponse, before.latestResponse);
   } finally {
+    await clean();
     f.clean();
-    clean();
   }
 });
 
@@ -281,8 +281,8 @@ test("continuation cannot widen scope: maxFiles stays enforced across turns", as
     assert.equal(record.scopeState, "SCOPE_VIOLATION");
     assert.match(record.error ?? "", /write scope/);
   } finally {
+    await clean();
     f.clean();
-    clean();
   }
 });
 
@@ -317,8 +317,8 @@ test("continuation is rejected when HEAD advanced past recorded lineage", async 
       (err: any) => err.code === "CONTINUATION_ADMISSION_FAILED" && /HEAD/.test(err.message),
     );
   } finally {
+    await clean();
     f.clean();
-    clean();
   }
 });
 
@@ -399,7 +399,7 @@ test("continuation is rejected while execution capacity is exhausted", async () 
     try {
       await Promise.all([blockedA, blockedC].filter((promise): promise is Promise<unknown> => promise !== undefined));
     } finally {
-      manager.close();
+      await manager.close();
       rmSync(stateDir, { recursive: true, force: true });
       f.clean();
     }
@@ -429,7 +429,7 @@ test("worker turn refuses a workspace outside configured allowed roots before mu
       assert.equal(after.terminalReason, "launch_failed");
       assert.match(after.error ?? "", /allowed root/i);
     } finally {
-      clean();
+      await clean();
       rmSync(outside, { recursive: true, force: true });
     }
   } catch {
@@ -464,6 +464,17 @@ test("provider error mid-turn still records turn-end baseline and preserves cand
     });
     assert.equal(reconciled.candidate.present, true);
     assert.deepEqual(reconciled.candidate.changedPaths, ["partial-work.txt"]);
+    const errorStatus = await manager.getAgentStatus({
+      workspaceId: "ws_err", workspaceRoot: f.repo, agentId: started.agentId,
+    });
+    assert.equal(errorStatus.status, "error");
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const errorReconcile = await manager.reconcileAgent({
+      workspaceId: "ws_err", workspaceRoot: f.repo, agentId: started.agentId, isolated: true,
+    });
+    assert.equal(errorReconcile.activity.wallMs, errorStatus.wallMs);
+    assert.equal(errorReconcile.activity.idleMs, 0);
+    assert.deepEqual(errorReconcile.candidate, reconciled.candidate);
 
     // No foreign edits since turn end: continuation is admissible.
     await manager.continueAgent({
@@ -473,15 +484,15 @@ test("provider error mid-turn still records turn-end baseline and preserves cand
       prompt: "retry",
     });
   } finally {
+    await clean();
     f.clean();
-    clean();
   }
 });
 
 test("issue #5: continuation restores live timing during active turns and stabilizes upon terminal completion", async () => {
   const f = setupGitFixture();
   let turnCount = 0;
-  const { manager, clean } = setupManager({}, async (_profile: unknown, record: any, _prompt: string) => {
+  const { manager, config, clean } = setupManager({}, async (_profile: unknown, record: any, _prompt: string) => {
     turnCount += 1;
     mkdirSync(join(f.repo, "src"), { recursive: true });
     writeFileSync(join(f.repo, "src", `turn-${turnCount}.txt`), `turn ${turnCount} for ${record.id}\n`);
@@ -526,6 +537,19 @@ test("issue #5: continuation restores live timing during active turns and stabil
     });
     assert.equal(term1Status2.wallMs, term1WallMs);
     assert.equal(term1Status2.idleMs, 0);
+    const reconcileInput = {
+      workspaceId: "ws_cont_timing",
+      workspaceRoot: f.repo,
+      agentId: started.agentId,
+      isolated: true,
+    };
+    const term1Reconcile1 = await manager.reconcileAgent(reconcileInput);
+    assert.equal(term1Reconcile1.activity.wallMs, term1WallMs, "Terminal reconciliation must match status timing");
+    assert.equal(term1Reconcile1.activity.idleMs, 0);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const term1Reconcile2 = await manager.reconcileAgent(reconcileInput);
+    assert.equal(term1Reconcile2.activity.wallMs, term1WallMs);
+    assert.equal(term1Reconcile2.activity.idleMs, 0);
 
     // 2. Continue agent: transitions to starting
     await manager.continueAgent({
@@ -548,6 +572,10 @@ test("issue #5: continuation restores live timing during active turns and stabil
       agentId: started.agentId,
     });
     assert.ok(activeStatus2.wallMs! > activeStatus1.wallMs!, "Continuation active turn wallMs must advance");
+    const activeReconcile1 = await manager.reconcileAgent(reconcileInput);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    const activeReconcile2 = await manager.reconcileAgent(reconcileInput);
+    assert.ok(activeReconcile2.activity.wallMs > activeReconcile1.activity.wallMs, "Active reconciliation timing must advance");
 
     // 3. Complete turn 2
     const launched2 = (manager as any).store.getById(started.agentId);
@@ -573,8 +601,21 @@ test("issue #5: continuation restores live timing during active turns and stabil
     });
     assert.equal(term2Status2.wallMs, term2WallMs);
     assert.equal(term2Status2.idleMs, 0);
+    const term2Reconcile = await manager.reconcileAgent(reconcileInput);
+    assert.equal(term2Reconcile.activity.wallMs, term2WallMs);
+    assert.equal(term2Reconcile.activity.idleMs, 0);
+
+    // Reconstruct the production manager against the same durable store.
+    const reloaded = new LocalAgentSessionManager(config, async () => undefined, async () => true);
+    try {
+      const reloadedReconcile = await reloaded.reconcileAgent(reconcileInput);
+      assert.equal(reloadedReconcile.activity.wallMs, term2WallMs);
+      assert.equal(reloadedReconcile.activity.idleMs, 0);
+    } finally {
+      await reloaded.close();
+    }
   } finally {
+    await clean();
     f.clean();
-    clean();
   }
 });

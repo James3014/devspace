@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test, { after } from "node:test";
@@ -12,6 +12,7 @@ import { LocalAgentStore } from "./local-agent-store.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
 import type { ScopeBaseline } from "./local-agent-contract.js";
 import { LocalAgentProviderError } from "./local-agent-runtime.js";
+import { ClineCatalogService } from "./local-agent-cline-catalog.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 import {
@@ -4098,4 +4099,101 @@ test("pathspec-magic-looking filename is fingerprinted literally", async () => {
   } finally {
     f.clean();
   }
+});
+
+test("catalog receipt gates real worker turn before provider runner and rejects drift", async () => {
+  const f = setupGitFixture();
+  let launched: { promptFile: string; workerToken: string } | undefined;
+  let providerCalls = 0;
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-catalog-receipt-state-"));
+  const config = { stateDir, subagents: true, oauth: { scopes: ["devspace"] }, agentMaxConcurrent: 8, toolchains: [] } as any;
+  const entry = { providerId: "opencode", modelId: "test", fullName: "opencode/test", variants: ["high"], variantsKnown: true, status: "active" };
+  const makeSnapshot = (generation: string) => ({ entries: [entry], fetchedAt: new Date().toISOString(), source: "sdk" as const, generation, version: "test", freshness: "fresh" as const, runtime: { version: "test", source: "sdk" as const }, lastSuccessAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString() });
+  let current = makeSnapshot("receipt-g1");
+  const catalogSource = { acquire: async () => current, close: () => {} } as any;
+  let reopened: LocalAgentSessionManager | undefined;
+  const manager = new LocalAgentSessionManager(config, async (_id: string, promptFile: string, workerToken: string) => { launched = { promptFile, workerToken }; }, async () => true, async (workerProfile: any, record: any, _prompt: string) => { assert.ok(workerProfile); assert.equal(workerProfile.model, "opencode/test"); assert.equal(workerProfile.effort, "high"); providerCalls += 1; return { provider: record.provider, providerSessionId: null, finalResponse: "ok", items: [] }; }, undefined, undefined, undefined, catalogSource);
+  const profile: LocalAgentProfile = { name: "receipt-profile", description: "receipt", provider: "opencode", model: "opencode/test", effort: "high", write_mode: "read_only", disabled: false, filePath: "<test>", body: "" };
+  const profileCatalog: any = { generation: "profile-g1", opencodeCatalog: current, advertised: () => profile, blockerFor: () => undefined };
+  try {
+    const contract = { directSelection: { provider: "opencode", model: "opencode/test", effort: "high", writeMode: "read_only" as const }, catalogReceipt: { provider: "opencode", model: "opencode/test", effort: "high", source: "sdk", generation: current.generation, fetchedAt: current.fetchedAt, freshness: "fresh" as const, runtimeIdentity: "sdk:test:unknown" } };
+    const started = await manager.startAgent({ workspaceId: "ws_1", workspaceRoot: f.repo, profileName: profile.name, prompt: "read", profiles: [profile], profileCatalog, executionContract: contract });
+    assert.ok(launched);
+    await manager.runWorkerTurnFromFile(started.agentId, launched!.promptFile, launched!.workerToken);
+    assert.equal(providerCalls, 1);
+
+    // Reopen the same durable store and continue through the real manager
+    // boundary; the receipt must still bind the same catalog scope.
+    manager.close();
+    launched = undefined;
+    reopened = new LocalAgentSessionManager(config, async (_id: string, promptFile: string, workerToken: string) => { launched = { promptFile, workerToken }; }, async () => true, async (_profile: any, record: any) => { providerCalls += 1; return { provider: record.provider, providerSessionId: null, finalResponse: "continued", items: [] }; }, undefined, undefined, undefined, catalogSource);
+    const continued = await reopened.continueAgent({ workspaceId: "ws_1", workspaceRoot: f.repo, agentId: started.agentId, prompt: "continue", profiles: [profile], profileCatalog, opencodeCatalog: current });
+    const continuedLaunch = launched as { promptFile: string; workerToken: string } | undefined;
+    assert.ok(continuedLaunch);
+    await reopened.runWorkerTurnFromFile(continued.agentId, continuedLaunch.promptFile, continuedLaunch.workerToken);
+    assert.equal(providerCalls, 2);
+
+    const second = await reopened.startAgent({ workspaceId: "ws_1", workspaceRoot: f.repo, profileName: profile.name, prompt: "read", profiles: [profile], profileCatalog, executionContract: contract });
+    current = makeSnapshot("receipt-g2");
+    const driftLaunch = launched as { promptFile: string; workerToken: string } | undefined;
+    assert.ok(driftLaunch);
+    const before = providerCalls;
+    await reopened.runWorkerTurnFromFile(second.agentId, driftLaunch.promptFile, driftLaunch.workerToken);
+    assert.equal(providerCalls, before, "catalog drift must reject before provider invocation");
+  } finally {
+    manager.close();
+    try { reopened?.close(); } catch { /* already closed */ }
+    f.clean();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("ClinePass receipt survives reopen and rejects family/runtime/source drift before runner", async () => {
+  const f = setupGitFixture();
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-cline-receipt-state-"));
+  const clineBin = join(stateDir, "cline"); writeFileSync(clineBin, "#!/bin/sh\nexit 0\n"); chmodSync(clineBin, 0o755);
+  const previousCommand = process.env.CLINE_COMMAND; process.env.CLINE_COMMAND = clineBin;
+  let calls = 0; let launched: any; let runtimeCommand = clineBin;
+  const feed = { clinePass: [{ id: "openai/gpt-6-astra", thinkingLevels: ["high"] }], free: [] };
+  const service = new ClineCatalogService({ probeRuntime: async () => ({ command: runtimeCommand, cliProviderId: "cline", version: "1", supportsProviderFlag: true, supportsModelFlag: true, supportedThinking: ["high"] }), fetchCatalog: async () => ({ status: 200, json: async () => feed }) });
+  const snapshot = await service.refresh(true);
+  const source = { acquire: async () => ({ entries: [], fetchedAt: new Date().toISOString(), source: "fallback" as const, generation: "unused", version: "x", freshness: "unknown" as const, runtime: { version: "x", source: "unknown" as const } }), close: () => {} } as any;
+  const config = { stateDir, subagents: true, oauth: { scopes: ["devspace"] }, agentMaxConcurrent: 8, toolchains: [] } as any;
+  const profile: LocalAgentProfile = { name: "cline-pass-profile", description: "cline", provider: "cline", cliProviderId: "cline-pass", model: "openai/gpt-6-astra", effort: "high", write_mode: "read_only", disabled: false, filePath: "<test>", body: "" };
+  const catalog: any = { generation: "cline-profile", clineCatalog: snapshot, advertised: () => profile, blockerFor: () => undefined };
+  const contract: any = { directSelection: { provider: "cline", cliProviderId: "cline-pass", model: profile.model, effort: profile.effort, writeMode: "read_only" }, catalogReceipt: { provider: "cline", cliProviderId: "cline-pass", model: profile.model, effort: profile.effort, source: snapshot.source, generation: snapshot.generation, fetchedAt: snapshot.fetchedAt, freshness: "fresh", runtimeIdentity: `cline:${snapshot.runtime.version}:${snapshot.runtime.command}` } };
+  const make = () => new LocalAgentSessionManager(config, async (_id: string, p: string, t: string) => { launched = { promptFile: p, workerToken: t }; }, async () => true, async (p: any) => { assert.equal(p.cliProviderId, "cline-pass"); assert.equal(p.model, profile.model); calls += 1; return { provider: "cline", providerSessionId: null, finalResponse: "ok", items: [] }; }, undefined, undefined, service, source);
+  const manager = make();
+  try {
+    const started = await manager.startAgent({ workspaceId: "ws_1", workspaceRoot: f.repo, profileName: profile.name, prompt: "read", profiles: [profile], profileCatalog: catalog, executionContract: contract });
+    await manager.runWorkerTurnFromFile(started.agentId, launched.promptFile, launched.workerToken); assert.equal(calls, 1);
+    manager.close(); const reopened = make();
+    const continued = await reopened.continueAgent({ workspaceId: "ws_1", workspaceRoot: f.repo, agentId: started.agentId, prompt: "again", profiles: [profile], profileCatalog: catalog, clineCatalog: snapshot });
+    await reopened.runWorkerTurnFromFile(continued.agentId, launched.promptFile, launched.workerToken); assert.equal(calls, 2);
+    const callsBeforeRejectedCases = calls;
+    const runRejected = async (caseContract: any, caseCatalog: any = catalog) => {
+      launched = undefined;
+      const rejected = await reopened.startAgent({ workspaceId: "ws_1", workspaceRoot: f.repo, profileName: profile.name, prompt: "reject", profiles: [profile], profileCatalog: caseCatalog, executionContract: caseContract });
+      assert.ok(launched);
+      await reopened.runWorkerTurnFromFile(rejected.agentId, launched.promptFile, launched.workerToken);
+      assert.equal(calls, callsBeforeRejectedCases);
+    };
+    // A current READY snapshot whose freshness window has expired must not be used.
+    const staleService = { refresh: async () => ({ ...snapshot, expiresAt: new Date(Date.now() - 1).toISOString() }) } as any;
+    const staleManager = new LocalAgentSessionManager(config, async (_id: string, p: string, t: string) => { launched = { promptFile: p, workerToken: t }; }, async () => true, async (p: any) => { assert.equal(p.cliProviderId, "cline-pass"); calls += 1; return { provider: "cline", providerSessionId: null, finalResponse: "unexpected", items: [] }; }, undefined, undefined, staleService, source);
+    launched = undefined;
+    const stale = await staleManager.startAgent({ workspaceId: "ws_1", workspaceRoot: f.repo, profileName: profile.name, prompt: "stale", profiles: [profile], profileCatalog: catalog, executionContract: contract });
+    assert.ok(launched); await staleManager.runWorkerTurnFromFile(stale.agentId, launched.promptFile, launched.workerToken); assert.equal(calls, callsBeforeRejectedCases); staleManager.close();
+    // The source is part of the receipt identity, even when generation/model match.
+    await runRejected({ ...contract, catalogReceipt: { ...contract.catalogReceipt, source: "fixture" } });
+    // A same-version executable change is a runtime-scope drift.
+    runtimeCommand = join(stateDir, "cline-v2"); writeFileSync(runtimeCommand, "#!/bin/sh\nexit 0\n"); chmodSync(runtimeCommand, 0o755);
+    const commandSnapshot = await service.refresh(true);
+    await runRejected({ ...contract, catalogReceipt: { ...contract.catalogReceipt, generation: commandSnapshot.generation, runtimeIdentity: `cline:${contract.catalogReceipt.runtimeIdentity.split(":")[1]}:${clineBin}` } }, { ...catalog, clineCatalog: commandSnapshot });
+    // Removing the pass family makes the exact family selector unavailable.
+    feed.clinePass.length = 0;
+    const familySnapshot = await service.refresh(true);
+    await runRejected({ ...contract, catalogReceipt: { ...contract.catalogReceipt, generation: familySnapshot.generation, fetchedAt: familySnapshot.fetchedAt, runtimeIdentity: `cline:${familySnapshot.runtime.version}:${familySnapshot.runtime.command}` } }, { ...catalog, clineCatalog: familySnapshot });
+    reopened.close();
+  } finally { manager.close(); f.clean(); rmSync(stateDir, { recursive: true, force: true }); if (previousCommand === undefined) delete process.env.CLINE_COMMAND; else process.env.CLINE_COMMAND = previousCommand; }
 });

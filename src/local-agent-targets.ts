@@ -27,6 +27,7 @@ export type LocalAgentTarget =
       provider: LocalAgentProvider;
       model?: string;
       effort?: string;
+      cliProviderId?: "cline" | "cline-pass";
       profile: LocalAgentProfile;
     }
   | {
@@ -35,6 +36,7 @@ export type LocalAgentTarget =
       provider: LocalAgentProvider;
       model?: string;
       effort?: string;
+      cliProviderId?: "cline" | "cline-pass";
     };
 
 export function parseLocalAgentRunArgs(args: string[]): ParsedLocalAgentRunArgs {
@@ -139,6 +141,7 @@ export function resolveLocalAgentTarget(
       provider: profile.provider,
       model: modelOverride ?? profile.model ?? providerConfig?.model,
       effort: effortOverride ?? profile.effort ?? providerConfig?.effort,
+      cliProviderId: profile.cliProviderId,
       profile,
     };
   }

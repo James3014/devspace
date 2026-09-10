@@ -88,11 +88,27 @@ export class OpencodeRuntime implements LocalAgentRuntime {
           };
           const promptFailure = extractOpencodeFailureFromPayload(promptResult, sessionId, modelInfo);
           if (promptFailure) throw promptFailure;
-          await waitForOpencodeSession(this.client, sessionId, promptResult, callbacks?.onActivity, modelInfo);
           const promptId = extractOpenCodePromptId(promptResult);
+          if (!promptId) {
+            throw new AgentProviderProtocolError({
+              code: "PROVIDER_PROTOCOL_ERROR",
+              provider: this.provider,
+              operation: "run",
+              retryable: false,
+              message: "OpenCode did not acknowledge the current prompt with a message id.",
+            });
+          }
+          await waitForOpencodeSession(this.client, sessionId, promptResult, callbacks?.onActivity, modelInfo);
           const messages = await readOpencodeMessages(this.client, sessionId, promptId);
           const finalResponse = requireFinalResponse(
-            extractOpenCodeFinalResponse(messages) || extractOpenCodeFinalResponse(promptResult),
+            extractOpenCodeFinalResponseForPrompt(messages, promptId),
+            {
+            sessionId,
+            promptId,
+            model: modelInfo.model,
+            finish: extractLatestOpenCodeAssistantFinish(messages, promptId),
+            messageCount: messages.data?.length ?? 0,
+            },
           );
           return {
             provider: this.provider,
@@ -345,7 +361,7 @@ async function waitForOpencodeSession(
     const messages = await readOpencodeMessages(client, sessionId, promptId);
     // Root-cause fail-fast: any provider-reported failure terminal-immediately
     // with the original failure class. Never wait for an idle timeout shadow.
-    const failure = extractOpencodeFailureFromMessages(messages, sessionId, modelInfo)
+    const failure = extractOpencodeFailureFromMessages(messages, sessionId, modelInfo, promptId)
       ?? extractOpencodeFailureFromPayload(promptResult, sessionId, modelInfo);
     if (failure) throw failure;
     const activity = await active({ throwOnError: true });
@@ -436,14 +452,21 @@ function hasCompletedOpenCodeTurn(value: unknown, promptId?: string): boolean {
       promptSeen = true;
       continue;
     }
+    if (promptId !== undefined && promptSeen && role === "user") return false;
     if (!promptSeen || role !== "assistant") continue;
 
     const time = asRecord(info.time) ?? asRecord(record.time);
-    if (typeof info.finish === "string" || typeof record.finish === "string") return true;
-    if (typeof time?.completed === "number") return true;
+    const finish = typeof info.finish === "string"
+      ? info.finish
+      : typeof record.finish === "string" ? record.finish : undefined;
+    if (isTerminalOpenCodeFinish(finish)) return true;
     if (info.error !== undefined || record.error !== undefined) return true;
   }
   return false;
+}
+
+function isTerminalOpenCodeFinish(value: unknown): boolean {
+  return typeof value === "string" && value !== "tool-calls";
 }
 
 function delay(milliseconds: number): Promise<void> {
@@ -478,7 +501,14 @@ export function extractOpenCodeFinalResponse(value: unknown): string {
   return extractOpenCodeAssistantMessageText(root);
 }
 
-function extractLastOpenCodeAssistantMessageText(messages: unknown[]): string {
+function extractOpenCodeFinalResponseForPrompt(value: unknown, promptId?: string): string {
+  const root = unwrapProviderPayload(value);
+  const messages = Array.isArray(root) ? root : readArray(root, "messages");
+  if (!messages || promptId === undefined) return extractOpenCodeFinalResponse(value);
+  return extractLastOpenCodeAssistantMessageText(messagesAfterPrompt(messages, promptId), true);
+}
+
+function extractLastOpenCodeAssistantMessageText(messages: unknown[], terminalOnly = false): string {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = asRecord(messages[index]);
     if (!message) continue;
@@ -486,6 +516,11 @@ function extractLastOpenCodeAssistantMessageText(messages: unknown[]): string {
     const role = typeof info?.role === "string" ? info.role : message.role;
     const type = typeof message.type === "string" ? message.type : undefined;
     if (role !== "assistant" && type !== "assistant") continue;
+    if (terminalOnly) {
+      const finish = typeof info?.finish === "string" ? info.finish : message.finish;
+      if (!isTerminalOpenCodeFinish(finish)) continue;
+      return extractOpenCodeAssistantMessageText(message);
+    }
     const text = extractOpenCodeAssistantMessageText(message);
     if (text) return text;
   }
@@ -509,6 +544,46 @@ function extractOpenCodeAssistantMessageText(value: unknown): string {
   }
   const info = asRecord(message.info) ?? message;
   return stringifyStructuredMessage(info.structured);
+}
+
+function extractLatestOpenCodeAssistantFinish(value: unknown, promptId?: string): string | undefined {
+  const root = unwrapProviderPayload(value);
+  const messages = Array.isArray(root) ? root : readArray(root, "messages");
+  if (!messages) return undefined;
+  const scopedMessages = promptId === undefined ? messages : messagesAfterPrompt(messages, promptId);
+  for (let index = scopedMessages.length - 1; index >= 0; index -= 1) {
+    const record = asRecord(scopedMessages[index]);
+    if (!record) continue;
+    const info = asRecord(record.info) ?? record;
+    const role = typeof info.role === "string" ? info.role : record.type;
+    if (role !== "assistant") continue;
+    const finish = typeof info.finish === "string"
+      ? info.finish
+      : typeof record.finish === "string" ? record.finish : undefined;
+    if (finish !== undefined) return finish;
+  }
+  return undefined;
+}
+
+function messagesAfterPrompt(messages: unknown[], promptId: string): unknown[] {
+  const promptIndex = messages.findIndex((message) => {
+    const record = asRecord(message);
+    if (!record) return false;
+    const info = asRecord(record.info) ?? record;
+    const role = typeof info.role === "string" ? info.role : record.type;
+    return role === "user" && info.id === promptId;
+  });
+  if (promptIndex < 0) return [];
+  const nextPromptOffset = messages.slice(promptIndex + 1).findIndex((message) => {
+    const record = asRecord(message);
+    if (!record) return false;
+    const info = asRecord(record.info) ?? record;
+    const role = typeof info.role === "string" ? info.role : record.type;
+    return role === "user";
+  });
+  return nextPromptOffset < 0
+    ? messages.slice(promptIndex + 1)
+    : messages.slice(promptIndex + 1, promptIndex + 1 + nextPromptOffset);
 }
 
 function stringifyStructuredMessage(value: unknown): string {
@@ -622,12 +697,14 @@ function extractOpencodeFailureFromMessages(
   response: SessionMessagesResponse,
   sessionId: string,
   modelInfo: { model?: string; variant?: string },
+  promptId?: string,
 ): AgentProviderFailureError | undefined {
   const root = unwrapProviderPayload(response);
   const messages = Array.isArray(root) ? root : readArray(root, "messages");
   if (!messages) return undefined;
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const record = asRecord(messages[index]);
+  const scopedMessages = promptId === undefined ? messages : messagesAfterPrompt(messages, promptId);
+  for (let index = scopedMessages.length - 1; index >= 0; index -= 1) {
+    const record = asRecord(scopedMessages[index]);
     if (!record) continue;
     const info = asRecord(record.info) ?? record;
     const role = typeof info.role === "string" ? info.role : record.type;
@@ -691,15 +768,41 @@ function stringifyOpencodeErrorPayload(value: unknown): string {
   return JSON.stringify(value);
 }
 
-function requireFinalResponse(response: string): string {
+function requireFinalResponse(
+  response: string,
+  evidence: { sessionId?: string; model?: string; promptId?: string; finish?: string; messageCount?: number } = {},
+): string {
   const trimmed = response.trim();
   if (!trimmed) {
+    const diagnostic = [
+      evidence.sessionId ? `session=${evidence.sessionId}` : undefined,
+      evidence.model ? `model=${evidence.model}` : undefined,
+      evidence.promptId ? `prompt=${evidence.promptId}` : undefined,
+      evidence.finish ? `finish=${evidence.finish}` : undefined,
+      typeof evidence.messageCount === "number" ? `messages=${evidence.messageCount}` : undefined,
+    ].filter(Boolean).join(", ");
     throw new AgentProviderProtocolError({
       code: "PROVIDER_PROTOCOL_ERROR",
       provider: "opencode",
       operation: "run",
       retryable: false,
-      message: "OpenCode did not return a final assistant response.",
+      cause: {
+        sessionId: evidence.sessionId,
+        model: evidence.model,
+        promptId: evidence.promptId,
+        finish: evidence.finish,
+        messageCount: evidence.messageCount,
+      },
+      message: `OpenCode did not return a final assistant response${diagnostic ? ` (${diagnostic})` : ""}.`,
+    });
+  }
+  if (evidence.finish && evidence.finish !== "stop" && evidence.finish !== "end_turn") {
+    throw new AgentProviderProtocolError({
+      code: "PROVIDER_PROTOCOL_ERROR",
+      provider: "opencode",
+      operation: "run",
+      retryable: false,
+      message: `OpenCode ended the current turn without a final assistant response (finish=${evidence.finish}).`,
     });
   }
   return trimmed;

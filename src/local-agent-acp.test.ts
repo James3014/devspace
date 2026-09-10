@@ -159,6 +159,192 @@ assert.equal(
 );
 await closeOnlyRuntime.close();
 
+// Cline ACP route selection is session-scoped and must read back both the
+// exact provider family and model before any prompt is dispatched.
+{
+  const requestedModel = "deepseek/deepseek-v4-flash";
+  const sessionId = "cline_route_selection";
+  const calls: Array<{ method: string; params?: unknown }> = [];
+  const queues = new Map<string, { values: unknown[] }>();
+  const response = (provider: string, model: string, models = [requestedModel, "anthropic/claude-sonnet-5"]) => ({
+    sessionId,
+    models: { currentModelId: model, availableModels: models.map((modelId) => ({ modelId })) },
+    configOptions: [
+      { type: "select", id: "provider", currentValue: provider, options: [{ value: "cline" }, { value: "cline-pass" }] },
+      { type: "select", id: "model", currentValue: model, options: models.map((value) => ({ value })) },
+    ],
+  });
+  const connection = {
+    agent: {
+      async request(method: string, params?: unknown): Promise<unknown> {
+        calls.push({ method, params });
+        const input = params as { sessionId?: string; configId?: string; value?: string } | undefined;
+        if (method === "session/new") {
+          queues.set(sessionId, { values: [] });
+          return response("cline", "anthropic/claude-sonnet-5");
+        }
+        if (method === "session/set_config_option") {
+          return response(input?.configId === "provider" ? input.value ?? "unknown" : input?.configId === "model" ? "cline-pass" : "cline", input?.configId === "model" ? input.value ?? "unknown" : "anthropic/claude-sonnet-5");
+        }
+        if (method === "session/prompt") {
+          queues.get(sessionId)?.values.push({ update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } } });
+          return { stopReason: "end_turn" };
+        }
+        return {};
+      },
+    },
+    close() {},
+    closed: new Promise<void>(() => undefined),
+  };
+  const routeRuntime = new AcpRuntime({ provider: "cline", command: "cline", args: ["--acp"], env: {}, queues, capabilities: { resume: false, close: false } }, connection);
+  const routeResult = await routeRuntime.run({ prompt: "route", workspaceRoot: "/tmp/project", model: requestedModel, cliProviderId: "cline-pass" });
+  assert.equal(routeResult.isOk(), true);
+  assert.deepEqual(calls.filter(({ method }) => method === "session/set_config_option").map(({ params }) => params), [
+    { sessionId, configId: "provider", value: "cline-pass" },
+    { sessionId, configId: "model", value: requestedModel },
+  ]);
+  assert.equal(calls.filter(({ method }) => method === "session/prompt").length, 1);
+}
+
+{
+  const requestedModel = "deepseek/deepseek-v4-flash";
+  const queues = new Map<string, { values: unknown[] }>();
+  let promptCalls = 0;
+  const connection = {
+    agent: {
+      async request(method: string, params?: unknown): Promise<unknown> {
+        const input = params as { sessionId?: string; configId?: string } | undefined;
+        if (method === "session/new") {
+          queues.set("cline_model_mismatch", { values: [] });
+          return { sessionId: "cline_model_mismatch", models: { currentModelId: "anthropic/claude-sonnet-5", availableModels: [{ modelId: requestedModel }] }, configOptions: [
+            { type: "select", id: "provider", currentValue: "cline", options: [{ value: "cline" }] },
+            { type: "select", id: "model", currentValue: "anthropic/claude-sonnet-5", options: [{ value: requestedModel }] },
+          ] };
+        }
+        if (method === "session/set_config_option") return { sessionId: input?.sessionId, configOptions: [
+          { type: "select", id: "provider", currentValue: "cline", options: [{ value: "cline" }] },
+          { type: "select", id: "model", currentValue: "anthropic/claude-sonnet-5", options: [{ value: requestedModel }] },
+        ] };
+        if (method === "session/prompt") promptCalls += 1;
+        return { stopReason: "end_turn" };
+      },
+    },
+    close() {},
+    closed: new Promise<void>(() => undefined),
+  };
+  const runtime = new AcpRuntime({ provider: "cline", command: "cline", args: ["--acp"], env: {}, queues, capabilities: { resume: false, close: false } }, connection);
+  const result = await runtime.run({ prompt: "route", workspaceRoot: "/tmp/project", model: requestedModel });
+  assert.equal(result.isErr(), true);
+  assert.equal(promptCalls, 0, "mismatched model readback must prevent prompt dispatch");
+}
+
+{
+  const queues = new Map<string, { values: unknown[] }>();
+  let promptCalls = 0;
+  const connection = {
+    agent: {
+      async request(method: string): Promise<unknown> {
+        if (method === "session/new") return { sessionId: "cline_unadvertised", models: { currentModelId: "anthropic/claude-sonnet-5", availableModels: [{ modelId: "anthropic/claude-sonnet-5" }] }, configOptions: [
+          { type: "select", id: "provider", currentValue: "cline", options: [{ value: "cline" }] },
+          { type: "select", id: "model", currentValue: "anthropic/claude-sonnet-5", options: [{ value: "anthropic/claude-sonnet-5" }] },
+        ] };
+        if (method === "session/prompt") promptCalls += 1;
+        return { stopReason: "end_turn" };
+      },
+    },
+    close() {},
+    closed: new Promise<void>(() => undefined),
+  };
+  const runtime = new AcpRuntime({ provider: "cline", command: "cline", args: ["--acp"], env: {}, queues, capabilities: { resume: false, close: false } }, connection);
+  const result = await runtime.run({ prompt: "route", workspaceRoot: "/tmp/project", model: "deepseek/deepseek-v4-flash" });
+  assert.equal(result.isErr(), true);
+  assert.equal(promptCalls, 0, "unadvertised model must prevent prompt dispatch");
+}
+
+{
+  const requestedModel = "deepseek/deepseek-v4-flash";
+  const queues = new Map<string, { values: unknown[] }>();
+  let promptCalls = 0;
+  const connection = {
+    agent: {
+      async request(method: string, params?: unknown): Promise<unknown> {
+        const input = params as { sessionId?: string } | undefined;
+        if (method === "session/resume") return { sessionId: input?.sessionId, models: { currentModelId: "anthropic/claude-sonnet-5", availableModels: [{ modelId: requestedModel }] }, configOptions: [
+          { type: "select", id: "provider", currentValue: "cline", options: [{ value: "cline" }] },
+          { type: "select", id: "model", currentValue: "anthropic/claude-sonnet-5", options: [{ value: requestedModel }] },
+        ] };
+        if (method === "session/set_config_option") return { sessionId: input?.sessionId, configOptions: [
+          { type: "select", id: "provider", currentValue: "cline", options: [{ value: "cline" }] },
+          { type: "select", id: "model", currentValue: "anthropic/claude-sonnet-5", options: [{ value: requestedModel }] },
+        ] };
+        if (method === "session/prompt") promptCalls += 1;
+        return { stopReason: "end_turn" };
+      },
+    },
+    close() {},
+    closed: new Promise<void>(() => undefined),
+  };
+  const runtime = new AcpRuntime({ provider: "cline", command: "cline", args: ["--acp"], env: {}, queues, capabilities: { resume: true, close: false } }, connection);
+  const result = await runtime.run({ prompt: "resume", workspaceRoot: "/tmp/project", providerSessionId: "persisted-cline", model: requestedModel });
+  assert.equal(result.isErr(), true);
+  assert.equal(promptCalls, 0, "resumed identity mismatch must prevent prompt dispatch");
+}
+
+{
+  const queues = new Map<string, { values: unknown[] }>();
+  let promptCalls = 0;
+  const connection = {
+    agent: {
+      async request(method: string): Promise<unknown> {
+        if (method === "session/new") return { sessionId: "cline_conflicting_identity", models: { currentModelId: "deepseek/deepseek-v4-flash", availableModels: [{ modelId: "deepseek/deepseek-v4-flash" }] }, configOptions: [
+          { type: "select", id: "provider", currentValue: "cline", options: [{ value: "cline" }] },
+          { type: "select", id: "model", currentValue: "anthropic/claude-sonnet-5", options: [{ value: "deepseek/deepseek-v4-flash" }] },
+        ] };
+        if (method === "session/prompt") promptCalls += 1;
+        return { stopReason: "end_turn" };
+      },
+    },
+    close() {},
+    closed: new Promise<void>(() => undefined),
+  };
+  const runtime = new AcpRuntime({ provider: "cline", command: "cline", args: ["--acp"], env: {}, queues, capabilities: { resume: false, close: false } }, connection);
+  const result = await runtime.run({ prompt: "route", workspaceRoot: "/tmp/project", model: "deepseek/deepseek-v4-flash" });
+  assert.equal(result.isErr(), true);
+  assert.equal(promptCalls, 0, "conflicting model identities must prevent prompt dispatch");
+}
+
+{
+  const requestedModel = "deepseek/deepseek-v4-flash";
+  const queues = new Map<string, { values: unknown[] }>();
+  let promptCalls = 0;
+  const connection = {
+    agent: {
+      async request(method: string): Promise<unknown> {
+        if (method === "session/new") {
+          queues.set("cline_effort_unsupported", { values: [] });
+          return {
+            sessionId: "cline_effort_unsupported",
+            models: { currentModelId: requestedModel, availableModels: [{ modelId: requestedModel }] },
+            configOptions: [
+              { type: "select", id: "provider", currentValue: "cline", options: [{ value: "cline" }] },
+              { type: "select", id: "model", currentValue: requestedModel, options: [{ value: requestedModel }] },
+            ],
+          };
+        }
+        if (method === "session/prompt") promptCalls += 1;
+        return { stopReason: "end_turn" };
+      },
+    },
+    close() {},
+    closed: new Promise<void>(() => undefined),
+  };
+  const runtime = new AcpRuntime({ provider: "cline", command: "cline", args: ["--acp"], env: {}, queues, capabilities: { resume: false, close: false } }, connection);
+  const result = await runtime.run({ prompt: "route", workspaceRoot: "/tmp/project", model: requestedModel, effort: "high" });
+  assert.equal(result.isErr(), true);
+  if (result.isErr()) assert.match(result.error.message, /thinking\/effort/);
+  assert.equal(promptCalls, 0, "unsupported Cline effort must fail before prompt dispatch");
+}
+
 assert.deepEqual(
   selectAcpPermissionOption([
     { optionId: "allow", kind: "allow_once" },
@@ -301,6 +487,25 @@ assert.deepEqual(acpCommandArgs("copilot", { ...cachedContext, writeMode: "read_
 assert.deepEqual(acpCommandArgs("copilot", { ...cachedContext, writeMode: "full_access" }), [
   "--acp", "--no-sandbox", "--allow-all", "-C", resolvedProject,
 ]);
+assert.deepEqual(acpCommandArgs("cline", {
+  ...cachedContext,
+  provider: "cline",
+  model: "cline-pass/glm-5.3-flash",
+  effort: "high",
+  writeMode: "read_only",
+}), ["--acp", "--provider", "cline", "--model", "cline-pass/glm-5.3-flash", "--thinking", "high", "--plan", "--auto-approve"]);
+assert.deepEqual(acpCommandArgs("cline", {
+  ...cachedContext,
+  provider: "cline",
+  cliProviderId: "cline-pass",
+  model: "same-model",
+  effort: "medium",
+} as unknown as typeof cachedContext & { cliProviderId: "cline-pass" }), ["--acp", "--provider", "cline-pass", "--model", "same-model", "--thinking", "medium", "--auto-approve"]);
+assert.throws(() => acpCommandArgs("cline", {
+  ...cachedContext,
+  provider: "cline",
+  cliProviderId: "unexpected-provider",
+} as unknown as typeof cachedContext & { cliProviderId?: "cline" | "cline-pass" }), /Unsupported Cline CLI provider/);
 
 const missingCommandDriver = new AcpLocalAgentDriver(
   "cursor",
@@ -494,11 +699,23 @@ assert.equal(resumedRuntime.isAlive(), false);
           clineQueues.set(sessionId, { values: [] });
           return {
             sessionId,
+            models: {
+              currentModelId: "cline-pass/glm-5.3-flash",
+              availableModels: [{ modelId: "cline-pass/glm-5.3-flash" }],
+            },
             configOptions: [
               {
                 type: "select",
                 category: "model",
+                id: "provider",
+                currentValue: "cline",
+                options: [{ value: "cline" }],
+              },
+              {
+                type: "select",
+                category: "model",
                 id: "model",
+                currentValue: "cline-pass/glm-5.3-flash",
                 options: [{ value: "cline-pass/glm-5.3-flash" }],
               },
               {
@@ -535,7 +752,6 @@ assert.equal(resumedRuntime.isAlive(), false);
     prompt: "read only",
     workspaceRoot: "/tmp/project",
     model: "cline-pass/glm-5.3-flash",
-    effort: "high",
     writeMode: "read_only",
   });
   assert.equal(clineEntitlement.isErr(), true);
@@ -566,6 +782,31 @@ assert.equal(resumedRuntime.isAlive(), false);
     writeMode: "read_only",
   });
   assert.notEqual(clineKeyHigh, clineKeyMedium, "Cline process runtime keys must bind process-level model/effort");
+  const clineFreeKey = clineDriver.runtimeKey({
+    agentId: "cline-free",
+    provider: "cline",
+    cliProviderId: "cline",
+    workspaceRoot: "/tmp/project",
+    model: "same-model",
+    effort: "high",
+    writeMode: "read_only",
+  } as any);
+  const clinePassKey = clineDriver.runtimeKey({
+    agentId: "cline-pass",
+    provider: "cline",
+    cliProviderId: "cline-pass",
+    workspaceRoot: "/tmp/project",
+    model: "same-model",
+    effort: "high",
+    writeMode: "read_only",
+  } as any);
+  assert.notEqual(clineFreeKey, clinePassKey, "Cline runtime keys must bind CLI provider family");
+  assert.throws(() => clineDriver.runtimeKey({
+    agentId: "cline-invalid",
+    provider: "cline",
+    cliProviderId: "unexpected-provider",
+    workspaceRoot: "/tmp/project",
+  } as any), /Unsupported Cline CLI provider/);
 }
 
 // Regression tests for Grok & Cline canonical resolver parity
@@ -643,4 +884,94 @@ assert.equal(resumedRuntime.isAlive(), false);
   assert.equal(heartbeatResult.isOk(), true);
   if (heartbeatResult.isErr()) throw heartbeatResult.error;
   assert.ok(heartbeatTouches >= 1, `expected byte heartbeat activity touches, got ${heartbeatTouches}`);
+}
+
+// Opt-in ACP diagnostics stay schema-only and are emitted only for a failed
+// or no-final-response turn. Provider text, prompts, and arbitrary keys never
+// cross the observation boundary.
+{
+  const diagnosticQueues = new Map<string, { values: unknown[] }>();
+  const diagnosticConnection = {
+    agent: {
+      async request(method: string, params?: unknown): Promise<unknown> {
+        const sessionId = (params as { sessionId?: string } | undefined)?.sessionId ?? "diagnostic-session";
+        if (method === "session/new") {
+          const createdSessionId = "s".repeat(300);
+          diagnosticQueues.set(createdSessionId, { values: [] });
+          return { sessionId: createdSessionId };
+        }
+        if (method === "session/prompt") {
+          diagnosticQueues.get(sessionId)?.values.push(
+            { update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: `${"x".repeat(100_000)} secret prompt response` } } },
+            { update: { sessionUpdate: "secret-token", content: { type: "secret", text: "api-key-value" } } },
+          );
+          return { stopReason: "secret-stop", apiKey: "must-not-be-observed" };
+        }
+        return {};
+      },
+    },
+    close() {},
+    closed: new Promise<void>(() => undefined),
+  };
+  const observations: Array<Record<string, unknown>> = [];
+  const diagnosticRuntime = new AcpRuntime({
+    provider: "cursor",
+    command: "cursor-agent",
+    args: ["acp"],
+    env: {},
+    capabilities: { resume: false, close: false },
+    queues: diagnosticQueues,
+      diagnosticObserver: (observation) => { observations.push(observation as unknown as Record<string, unknown>); throw new Error("observer must not affect run"); },
+  }, diagnosticConnection);
+  const diagnosticResult = await diagnosticRuntime.run({ prompt: "secret prompt", workspaceRoot: "/tmp/project" });
+  assert.equal(diagnosticResult.isErr(), true);
+  assert.equal(observations.length, 1);
+  const observation = observations[0];
+  assert.match(observation.sessionId as string, /^sha256:[0-9a-f]{64}$/);
+  assert.deepEqual(observation.responseKeys, ["stopReason"]);
+  assert.equal(observation.stopReason, "unknown");
+  assert.deepEqual(observation.updateTypes, ["agent_thought_chunk", "unknown"]);
+  assert.deepEqual(observation.updateContentTypes, ["text", "unknown"]);
+  assert.equal(observation.updateContentBytes, 64 * 1024);
+  assert.equal(Object.hasOwn(observation, "apiKey"), false);
+  assert.equal(JSON.stringify(observation).includes("secret"), false);
+}
+
+// Enabling the observer does not change a successful ACP response and does
+// not emit a failure observation for a normal assistant text update.
+{
+  const successQueues = new Map<string, { values: unknown[] }>();
+  const successConnection = {
+    agent: {
+      async request(method: string, params?: unknown): Promise<unknown> {
+        const sessionId = (params as { sessionId?: string } | undefined)?.sessionId ?? "success-diagnostic-session";
+        if (method === "session/new") {
+          successQueues.set(sessionId, { values: [] });
+          return { sessionId };
+        }
+        if (method === "session/prompt") {
+          successQueues.get(sessionId)?.values.push({ update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ACP response" } } });
+          return { stopReason: "end_turn" };
+        }
+        return {};
+      },
+    },
+    close() {},
+    closed: new Promise<void>(() => undefined),
+  };
+  const observations: unknown[] = [];
+  const successRuntime = new AcpRuntime({
+    provider: "cursor",
+    command: "cursor-agent",
+    args: ["acp"],
+    env: {},
+    capabilities: { resume: false, close: false },
+    queues: successQueues,
+    diagnosticObserver: (observation) => { observations.push(observation); },
+  }, successConnection);
+  const successResult = await successRuntime.run({ prompt: "safe", workspaceRoot: "/tmp/project" });
+  assert.equal(successResult.isOk(), true);
+  if (successResult.isErr()) throw successResult.error;
+  assert.equal(successResult.value.finalResponse, "ACP response");
+  assert.equal(observations.length, 0);
 }

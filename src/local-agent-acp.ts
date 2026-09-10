@@ -1,4 +1,5 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
+import { createHash } from "node:crypto";
 import { accessSync, constants } from "node:fs";
 import { createRequire } from "node:module";
 import { delimiter, resolve } from "node:path";
@@ -36,6 +37,14 @@ import type {
 } from "./local-agent-runtime.js";
 
 export type AcpProvider = "cursor" | "copilot" | "grok" | "cline";
+type ClineCliProviderId = "cline" | "cline-pass";
+
+function clineCliProviderId(context: LocalAgentRuntimeContext): ClineCliProviderId {
+  const value = context.cliProviderId;
+  if (value === undefined || value === "cline") return "cline";
+  if (value === "cline-pass") return value;
+  throw new Error(`Unsupported Cline CLI provider '${String(value)}'.`);
+}
 
 const MAX_ACP_QUEUE_ITEMS = 10_000;
 const MAX_ACP_STDERR_BYTES = 32 * 1024;
@@ -72,6 +81,17 @@ interface AcpSessionQueue {
   values: unknown[];
 }
 
+export interface AcpDiagnosticObservation {
+  provider: AcpProvider;
+  sessionId: string;
+  responseKeys: string[];
+  stopReason?: string;
+  updateTypes: string[];
+  updateContentTypes: string[];
+  updateContentBytes: number;
+  classifiedErrorCode?: string;
+}
+
 export interface AcpRuntimeOptions {
   provider: AcpProvider;
   command: string;
@@ -87,6 +107,7 @@ export interface AcpRuntimeOptions {
   promptCompletionTimeoutMs?: number;
   activityCallbacks?: Map<string, () => void | Promise<void>>;
   stderrTail?: () => string;
+  diagnosticObserver?: (observation: AcpDiagnosticObservation) => void;
 }
 
 export class AcpRuntime implements LocalAgentRuntime {
@@ -106,6 +127,7 @@ export class AcpRuntime implements LocalAgentRuntime {
   private closed = false;
   private readonly activityCallbacks: Map<string, () => void | Promise<void>>;
   private readonly stderrTail?: () => string;
+  private readonly diagnosticObserver?: (observation: AcpDiagnosticObservation) => void;
 
   constructor(options: AcpRuntimeOptions, connection: AcpConnectionLike) {
     this.provider = options.provider;
@@ -120,6 +142,7 @@ export class AcpRuntime implements LocalAgentRuntime {
     this.promptCompletionTimeoutMs = options.promptCompletionTimeoutMs ?? ACP_GROK_PROMPT_COMPLETION_TIMEOUT_MS;
     this.activityCallbacks = options.activityCallbacks ?? new Map();
     this.stderrTail = options.stderrTail;
+    this.diagnosticObserver = options.diagnosticObserver;
     void this.connection.closed.then(() => {
       if (!this.closed) this.alive = false;
       this.grokCompletionRegistry?.rejectAll(new Error(`${this.provider} ACP connection closed.`));
@@ -204,6 +227,7 @@ export class AcpRuntime implements LocalAgentRuntime {
               { model: input.model, variant: input.effort },
               this.stderrTail?.(),
             );
+            this.emitDiagnostic(sessionId, undefined, queue.values, classified?.code);
             if (classified) throw classified;
             throw cause;
           }
@@ -222,6 +246,7 @@ export class AcpRuntime implements LocalAgentRuntime {
               { model: input.model, variant: input.effort },
               this.stderrTail?.(),
             );
+            this.emitDiagnostic(sessionId, response, updates, classified?.code ?? "PROVIDER_PROTOCOL_ERROR");
             if (classified) throw classified;
             throw new AgentProviderProtocolError({
               code: "PROVIDER_PROTOCOL_ERROR",
@@ -247,6 +272,28 @@ export class AcpRuntime implements LocalAgentRuntime {
         }
       },
     });
+  }
+
+  private emitDiagnostic(
+    sessionId: string,
+    response: unknown,
+    updates: unknown[],
+    classifiedErrorCode?: string,
+  ): void {
+    if (!this.diagnosticObserver) return;
+    const observation: AcpDiagnosticObservation = {
+      provider: this.provider,
+      sessionId: diagnosticSessionId(sessionId),
+      responseKeys: diagnosticResponseKeys(response),
+      ...(diagnosticStopReason(response) ? { stopReason: diagnosticStopReason(response) } : {}),
+      ...diagnosticUpdateSummary(updates),
+      ...(classifiedErrorCode ? { classifiedErrorCode } : {}),
+    };
+    try {
+      this.diagnosticObserver(observation);
+    } catch {
+      // Diagnostics are strictly observational and must never alter execution.
+    }
   }
 
   async releaseSession(providerSessionId: string): Promise<void> {
@@ -362,13 +409,10 @@ export class AcpRuntime implements LocalAgentRuntime {
       await this.configureGrokSession(sessionId, input, metadata, isNewSession);
       return;
     }
-    // Cline's exact model and thinking level are process-level CLI settings
-    // (--model/--thinking). Its ACP `model` config is a provider-family selector
-    // (e.g. cline-pass), not the exact model id. Re-applying the exact CLI model
-    // through session/set_config_option rejects valid values such as
-    // cline-pass/glm-5.3-flash. Runtime identity is model/effort-bound below, so
-    // Cline sessions must keep the process-level selection instead.
-    if (this.provider === "cline") return;
+    if (this.provider === "cline") {
+      await this.configureClineSession(sessionId, input, metadata);
+      return;
+    }
 
     const canConfigure = isNewSession || hasAcpConfigOptions(metadata);
     if (!canConfigure) {
@@ -399,6 +443,56 @@ export class AcpRuntime implements LocalAgentRuntime {
     if (input.effort) {
       const config = resolveAcpEffortConfigUpdate(metadata, input.effort, this.provider, sessionId);
       await this.connection.agent.request("session/set_config_option", config);
+    }
+  }
+
+  private async configureClineSession(
+    sessionId: string,
+    input: LocalAgentRunInput,
+    metadata: unknown,
+  ): Promise<void> {
+    if (input.effort !== undefined) {
+      throw clineSelectionError("Cline ACP does not advertise a session thinking/effort config or readback.");
+    }
+    const requestedProvider = input.cliProviderId ?? "cline";
+    let current = readClineSessionIdentity(metadata);
+    if (current.provider !== requestedProvider) {
+      const providerConfig = current.providerConfig;
+      if (!providerConfig || !flattenAcpSelectValues(providerConfig).includes(requestedProvider)) {
+        throw clineSelectionError(`provider '${requestedProvider}' is not advertised by the ACP session.`);
+      }
+      const providerConfigId = directString(providerConfig.id);
+      if (!providerConfigId) throw clineSelectionError("Cline ACP provider config option is missing an id.");
+      const providerResponse = await this.connection.agent.request("session/set_config_option", {
+        sessionId,
+        configId: providerConfigId,
+        value: requestedProvider,
+      });
+      current = readClineSessionIdentity(providerResponse);
+      if (current.provider !== requestedProvider) {
+        throw clineSelectionError(`provider readback '${current.provider ?? "unknown"}' did not match requested '${requestedProvider}'.`);
+      }
+    }
+    if (!input.model) return;
+    if (!current.models.includes(input.model)) {
+      throw clineSelectionError(`model '${input.model}' is not advertised by the ACP session.`);
+    }
+    if (current.model === input.model) return;
+    const modelConfig = current.modelConfig;
+    if (!modelConfig) throw clineSelectionError("Cline ACP did not advertise a model config option.");
+    const modelConfigId = directString(modelConfig.id);
+    if (!modelConfigId) throw clineSelectionError("Cline ACP model config option is missing an id.");
+    const modelResponse = await this.connection.agent.request("session/set_config_option", {
+      sessionId,
+      configId: modelConfigId,
+      value: input.model,
+    });
+    const readback = readClineSessionIdentity(modelResponse);
+    if (readback.provider !== requestedProvider) {
+      throw clineSelectionError(`provider readback '${readback.provider ?? "unknown"}' did not match requested '${requestedProvider}'.`);
+    }
+    if (readback.model !== input.model) {
+      throw clineSelectionError(`model readback '${readback.model ?? "unknown"}' did not match requested '${input.model}'.`);
     }
   }
 
@@ -479,6 +573,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
     provider: AcpProvider,
     private readonly env: NodeJS.ProcessEnv = process.env,
     private readonly commandResolver: AcpCommandResolver = resolveAcpCommand,
+    private readonly diagnosticObserver?: (observation: AcpDiagnosticObservation) => void,
   ) {
     this.provider = provider;
   }
@@ -487,7 +582,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
     const command = this.resolveCommand() ?? ACP_COMMANDS[this.provider][0];
     const writeMode = context.writeMode ?? "allowed";
     const processConfig = this.provider === "cline"
-      ? `:${context.model ?? "default"}:${context.effort ?? "default"}`
+      ? `:${clineCliProviderId(context)}:${context.model ?? "default"}:${context.effort ?? "default"}`
       : "";
     return `acp:${this.provider}:${command}:${writeMode}${processConfig}:${resolve(context.workspaceRoot)}`;
   }
@@ -610,6 +705,7 @@ export class AcpLocalAgentDriver implements LocalAgentDriver {
             grokCompletionRegistry,
             activityCallbacks,
             stderrTail: () => stderrTail,
+            diagnosticObserver: this.diagnosticObserver,
           }, connection);
           // AcpRuntime installs the long-lived child error listener before this
           // startup-only listener is removed, so there is no unobserved gap.
@@ -723,6 +819,7 @@ export function acpCommandArgs(
   if (provider === "cline") {
     return [
       "--acp",
+      "--provider", clineCliProviderId(context),
       ...(context.model ? ["--model", context.model] : []),
       ...(context.effort ? ["--thinking", context.effort] : []),
       ...(writeMode === "read_only" ? ["--plan"] : []),
@@ -947,6 +1044,117 @@ function extractAcpText(updates: unknown[]): string {
     })
     .join("")
     .trim();
+}
+
+type ClineSessionIdentity = {
+  provider?: string;
+  model?: string;
+  models: string[];
+  providerConfig?: Record<string, unknown>;
+  modelConfig?: Record<string, unknown>;
+};
+
+function clineSelectionError(message: string): AgentProviderProtocolError {
+  return new AgentProviderProtocolError({
+    code: "PROVIDER_PROTOCOL_ERROR",
+    provider: "cline",
+    operation: "configure_session",
+    retryable: false,
+    message: `Cline ACP route selection failed closed: ${message}`,
+  });
+}
+
+function readClineSessionIdentity(value: unknown): ClineSessionIdentity {
+  const record = asRecord(value);
+  const response = asRecord(record?.newSessionResponse) ?? record;
+  const configOptions = readArray(response, "configOptions") ?? [];
+  const configs = configOptions.map(asRecord).filter((config): config is Record<string, unknown> => Boolean(config));
+  const providerConfigs = configs.filter((config) => config.type === "select" && config.id === "provider");
+  const modelConfigs = configs.filter((config) => config.type === "select" && config.id === "model");
+  if (providerConfigs.length > 1) throw clineSelectionError("Cline ACP advertised duplicate provider config options.");
+  if (modelConfigs.length > 1) throw clineSelectionError("Cline ACP advertised duplicate model config options.");
+  const providerConfig = providerConfigs[0];
+  const modelConfig = modelConfigs[0];
+  const models = new Set(flattenAcpSelectValues(modelConfig ?? {}));
+  const modelSet = asRecord(response?.models);
+  for (const item of readArray(modelSet, "availableModels") ?? []) {
+    const modelId = directString(asRecord(item)?.modelId);
+    if (modelId) models.add(modelId);
+  }
+  const modelFromModels = directString(modelSet?.currentModelId);
+  const modelFromConfig = directString(modelConfig?.currentValue);
+  if (modelFromModels && modelFromConfig && modelFromModels !== modelFromConfig) {
+    throw clineSelectionError(`Cline ACP reported conflicting model identities '${modelFromModels}' and '${modelFromConfig}'.`);
+  }
+  const model = modelFromModels ?? modelFromConfig;
+  const provider = directString(providerConfig?.currentValue);
+  return {
+    provider,
+    model,
+    models: [...models],
+    ...(providerConfig ? { providerConfig } : {}),
+    ...(modelConfig ? { modelConfig } : {}),
+  };
+}
+
+const DIAGNOSTIC_RESPONSE_KEYS = new Set(["stopReason", "sessionId", "usage", "_meta", "result", "error"]);
+const DIAGNOSTIC_UPDATE_TYPES = new Set([
+  "user_message_chunk",
+  "agent_message_chunk",
+  "agent_thought_chunk",
+  "tool_call",
+  "tool_call_update",
+  "plan",
+  "available_commands_update",
+  "current_mode_update",
+  "config_option_update",
+  "session_info_update",
+  "usage_update",
+]);
+const DIAGNOSTIC_CONTENT_TYPES = new Set(["text", "image", "audio", "resource"]);
+const MAX_DIAGNOSTIC_TEXT_BYTES = 64 * 1024;
+
+function diagnosticResponseKeys(value: unknown): string[] {
+  const record = asRecord(value);
+  if (!record) return [];
+  return Object.keys(record).filter((key) => DIAGNOSTIC_RESPONSE_KEYS.has(key)).sort();
+}
+
+function diagnosticStopReason(value: unknown): string | undefined {
+  const stopReason = asRecord(value)?.stopReason;
+  return typeof stopReason === "string" && DIAGNOSTIC_STOP_REASONS.has(stopReason) ? stopReason : stopReason === undefined ? undefined : "unknown";
+}
+
+const DIAGNOSTIC_STOP_REASONS = new Set(["end_turn", "max_tokens", "max_turn_requests", "refusal", "cancelled"]);
+
+function diagnosticSessionId(sessionId: string): string {
+  if (sessionId.length <= 256) return sessionId;
+  return `sha256:${createHash("sha256").update(sessionId).digest("hex")}`;
+}
+
+function diagnosticToken(value: unknown, allowed: Set<string>): string {
+  return typeof value === "string" && allowed.has(value) ? value : "unknown";
+}
+
+function diagnosticUpdateSummary(updates: unknown[]): Pick<AcpDiagnosticObservation, "updateTypes" | "updateContentTypes" | "updateContentBytes"> {
+  const updateTypes = new Set<string>();
+  const updateContentTypes = new Set<string>();
+  let updateContentBytes = 0;
+  for (const value of updates) {
+    const update = asRecord(asRecord(value)?.update);
+    updateTypes.add(diagnosticToken(update?.sessionUpdate, DIAGNOSTIC_UPDATE_TYPES));
+    const content = asRecord(update?.content);
+    if (!content) continue;
+    updateContentTypes.add(diagnosticToken(content.type, DIAGNOSTIC_CONTENT_TYPES));
+    if (typeof content.text === "string" && updateContentBytes < MAX_DIAGNOSTIC_TEXT_BYTES) {
+      updateContentBytes = Math.min(MAX_DIAGNOSTIC_TEXT_BYTES, updateContentBytes + Buffer.byteLength(content.text, "utf8"));
+    }
+  }
+  return {
+    updateTypes: [...updateTypes].sort(),
+    updateContentTypes: [...updateContentTypes].sort(),
+    updateContentBytes,
+  };
 }
 
 function isGrokPromptCompletion(value: unknown): boolean {

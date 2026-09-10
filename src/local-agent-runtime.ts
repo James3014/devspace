@@ -20,6 +20,7 @@ export interface LocalAgentRunInput {
   writeMode?: LocalAgentWriteMode;
   model?: string;
   effort?: string;
+  cliProviderId?: "cline" | "cline-pass";
   modelOverrideRequested?: boolean;
   effortOverrideRequested?: boolean;
   /** Per-turn environment after any configured read-only toolchain bridge. */
@@ -57,6 +58,7 @@ export interface LocalAgentRuntimeContext {
   writeMode?: LocalAgentWriteMode;
   model?: string;
   effort?: string;
+  cliProviderId?: "cline" | "cline-pass";
   agentDir?: string;
 }
 

@@ -51,6 +51,7 @@ export interface StartLocalAgentInput {
 export interface RunOverrides {
   model?: string;
   effort?: string;
+  cliProviderId?: "cline" | "cline-pass";
   writeMode?: LocalAgentWriteMode;
 }
 
@@ -318,6 +319,7 @@ export class LocalAgentManager {
         writeMode: input.value.writeMode,
         model: input.value.model,
         effort: input.value.effort,
+        cliProviderId: input.value.cliProviderId,
         agentDir: this.agentDir,
       };
       const callbacks: LocalAgentRunCallbacks = {
@@ -431,6 +433,7 @@ export class LocalAgentManager {
       writeMode: overrides.writeMode ?? "allowed",
       model: record.model ?? profile?.model,
       effort: record.effort ?? profile?.effort,
+      cliProviderId: profile?.cliProviderId,
       modelOverrideRequested: overrides.model !== undefined,
       effortOverrideRequested: overrides.effort !== undefined,
     });
