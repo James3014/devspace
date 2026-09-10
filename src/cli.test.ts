@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import test from "node:test";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer as createNetServer } from "node:net";
@@ -535,3 +536,12 @@ writeNextChunk();
 } finally {
   rmSync(root, { recursive: true, force: true });
 }
+
+test("serve rejects incomplete coordination reader selection before listening", async () => {
+  await assert.rejects(execFileAsync(process.execPath, ["--import", tsxLoader, cliPath, "serve", "--coordination-reader-module", "relative.mjs"], { timeout: 15000 }), error => {
+    const result = error as Error & { stdout?: string; stderr?: string };
+    assert.match(result.stderr ?? "", /absolute .mjs path and its SHA-256 together/);
+    assert.doesNotMatch(result.stdout ?? "", /devspace listening/);
+    return true;
+  });
+});

@@ -8,6 +8,7 @@ import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { satisfies } from "semver";
 import { loadConfig } from "./config.js";
+import { loadCoordinationReaders, parseCoordinationReaderArgs, type CoordinationReaderSelection } from "./coordination-reader-loader.js";
 import { resolveCliWorkspaceContext } from "./cli-workspace.js";
 import { resolveSubagentsConfig } from "./local-agent-config.js";
 import {
@@ -90,10 +91,12 @@ async function main(argv: string[]): Promise<void> {
   const command = normalizeCommand(rawCommand);
 
   switch (command) {
-    case "serve":
+    case "serve": {
+      const selection = parseCoordinationReaderArgs(args);
       await ensureConfigured();
-      await serve();
+      await serve(selection);
       return;
+    }
     case "init":
       await runInit({ force: args.includes("--force") });
       return;
@@ -304,7 +307,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
   }
 }
 
-async function serve(): Promise<void> {
+async function serve(selection?: CoordinationReaderSelection): Promise<void> {
   const sqliteStatus = checkSqliteNative();
   if (sqliteStatus !== "ok") {
     throw new Error(
@@ -320,7 +323,8 @@ async function serve(): Promise<void> {
 
   const { createServer } = await import("./server.js");
   const config = loadConfig();
-  const { app, close, localAgentProviders } = createServer(config);
+  const coordination = await loadCoordinationReaders(selection, config.stateDir);
+  const { app, close, localAgentProviders } = createServer(config, coordination ? { coordination } : {});
   const httpServer = app.listen(config.port, config.host, () => {
     console.log(`devspace listening on http://${config.host}:${config.port}/mcp`);
     console.log(`public base url: ${config.publicBaseUrl}`);
