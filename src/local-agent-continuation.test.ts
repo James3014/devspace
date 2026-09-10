@@ -81,7 +81,7 @@ function setupManager(overrides: Record<string, unknown> = {}, turnRunner?: any)
     async () => true,
     turnRunner,
   );
-  return { manager, config, clean: () => { manager.close(); rmSync(stateDir, { recursive: true, force: true }); } };
+  return { manager, config, clean: async () => { await manager.close(); rmSync(stateDir, { recursive: true, force: true }); } };
 }
 
 const mockProfiles: LocalAgentProfile[] = [
@@ -138,8 +138,8 @@ test("continuation is admitted after a clean within-scope turn", async () => {
     });
     assert.equal(continued.continued, true);
   } finally {
+    await clean();
     f.clean();
-    clean();
   }
 });
 
@@ -179,8 +179,8 @@ test("continuation is rejected BEFORE mutation when a foreign mutation happened 
     assert.equal(after.status, before.status);
     assert.deepEqual(after.updatedAt, before.updatedAt);
   } finally {
+    await clean();
     f.clean();
-    clean();
   }
 });
 
@@ -232,8 +232,8 @@ test("continuation rejects a foreign edit to a PREVIOUSLY WORKER-MODIFIED path",
     assert.deepEqual(after.updatedAt, before.updatedAt);
     assert.deepEqual(after.latestResponse, before.latestResponse);
   } finally {
+    await clean();
     f.clean();
-    clean();
   }
 });
 
@@ -281,8 +281,8 @@ test("continuation cannot widen scope: maxFiles stays enforced across turns", as
     assert.equal(record.scopeState, "SCOPE_VIOLATION");
     assert.match(record.error ?? "", /write scope/);
   } finally {
+    await clean();
     f.clean();
-    clean();
   }
 });
 
@@ -317,8 +317,8 @@ test("continuation is rejected when HEAD advanced past recorded lineage", async 
       (err: any) => err.code === "CONTINUATION_ADMISSION_FAILED" && /HEAD/.test(err.message),
     );
   } finally {
+    await clean();
     f.clean();
-    clean();
   }
 });
 
@@ -399,7 +399,7 @@ test("continuation is rejected while execution capacity is exhausted", async () 
     try {
       await Promise.all([blockedA, blockedC].filter((promise): promise is Promise<unknown> => promise !== undefined));
     } finally {
-      manager.close();
+      await manager.close();
       rmSync(stateDir, { recursive: true, force: true });
       f.clean();
     }
@@ -429,7 +429,7 @@ test("worker turn refuses a workspace outside configured allowed roots before mu
       assert.equal(after.terminalReason, "launch_failed");
       assert.match(after.error ?? "", /allowed root/i);
     } finally {
-      clean();
+      await clean();
       rmSync(outside, { recursive: true, force: true });
     }
   } catch {
@@ -484,8 +484,8 @@ test("provider error mid-turn still records turn-end baseline and preserves cand
       prompt: "retry",
     });
   } finally {
+    await clean();
     f.clean();
-    clean();
   }
 });
 
@@ -607,11 +607,15 @@ test("issue #5: continuation restores live timing during active turns and stabil
 
     // Reconstruct the production manager against the same durable store.
     const reloaded = new LocalAgentSessionManager(config, async () => undefined, async () => true);
-    const reloadedReconcile = await reloaded.reconcileAgent(reconcileInput);
-    assert.equal(reloadedReconcile.activity.wallMs, term2WallMs);
-    assert.equal(reloadedReconcile.activity.idleMs, 0);
+    try {
+      const reloadedReconcile = await reloaded.reconcileAgent(reconcileInput);
+      assert.equal(reloadedReconcile.activity.wallMs, term2WallMs);
+      assert.equal(reloadedReconcile.activity.idleMs, 0);
+    } finally {
+      await reloaded.close();
+    }
   } finally {
+    await clean();
     f.clean();
-    clean();
   }
 });
