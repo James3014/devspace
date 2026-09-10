@@ -299,6 +299,132 @@ test("resolveCodexBinary prefers explicit override then PATH then fails clearly"
   }
 });
 
+test("resolveCodexBinary hostile controls for win32 and platform contracts", async () => {
+  const rootDir = await mkdtemp(join(tmpdir(), "devspace-codex-hostile-"));
+  try {
+    // 1. win32 PATH + codex.exe -> exact executable
+    const winBinDir = join(rootDir, "win-bin");
+    await mkdir(winBinDir, { recursive: true });
+    const winCodexExe = join(winBinDir, "codex.exe");
+    writeFileSync(winCodexExe, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
+    const resolvedWin = await resolveCodexBinary({
+      platform: "win32",
+      pathEnv: winBinDir,
+    });
+    assert.equal(resolvedWin, winCodexExe);
+
+    // 2. win32 PATH only unrelated executable -> reject/not found
+    const unrelatedDir = join(rootDir, "unrelated-bin");
+    await mkdir(unrelatedDir, { recursive: true });
+    writeFileSync(join(unrelatedDir, "other.exe"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    writeFileSync(join(unrelatedDir, "codex"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    await assert.rejects(
+      () => resolveCodexBinary({ platform: "win32", pathEnv: unrelatedDir }),
+      /Codex CLI executable not found/,
+    );
+
+    // 3. explicit valid DEVSPACE_CODEX_BIN -> exact override
+    const explicitBin = join(rootDir, "custom-codex.exe");
+    writeFileSync(explicitBin, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const resolvedExplicit = await resolveCodexBinary({
+      configuredBin: explicitBin,
+      platform: "win32",
+      pathEnv: winBinDir,
+    });
+    assert.equal(resolvedExplicit, explicitBin);
+
+    // 4. explicit malformed/missing target -> fail closed, no silent fallback to PATH
+    const missingBin = join(rootDir, "nonexistent-override.exe");
+    await assert.rejects(
+      () =>
+        resolveCodexBinary({
+          configuredBin: missingBin,
+          platform: "win32",
+          pathEnv: winBinDir,
+        }),
+      /not an executable file.*DEVSPACE_CODEX_BIN/,
+    );
+
+    // 5. POSIX PATH codex -> unchanged (extensionless matched, codex.exe ignored)
+    const posixBinDir = join(rootDir, "posix-bin");
+    await mkdir(posixBinDir, { recursive: true });
+    const posixCodex = join(posixBinDir, "codex");
+    writeFileSync(posixCodex, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const resolvedPosix = await resolveCodexBinary({
+      platform: "linux",
+      pathEnv: posixBinDir,
+    });
+    assert.equal(resolvedPosix, posixCodex);
+
+    const posixOnlyExeDir = join(rootDir, "posix-exe-only");
+    await mkdir(posixOnlyExeDir, { recursive: true });
+    writeFileSync(join(posixOnlyExeDir, "codex.exe"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    await assert.rejects(
+      () => resolveCodexBinary({ platform: "linux", pathEnv: posixOnlyExeDir }),
+      /Codex CLI executable not found/,
+    );
+
+    // 6. macOS fallback -> unchanged (on non-darwin platforms, fallback is not consulted)
+    await assert.rejects(
+      () => resolveCodexBinary({ platform: "linux", pathEnv: "" }),
+      /Codex CLI executable not found/,
+    );
+    await assert.rejects(
+      () => resolveCodexBinary({ platform: "win32", pathEnv: "" }),
+      /Codex CLI executable not found/,
+    );
+
+    // 7. directory/path with spaces
+    const spaceDir = join(rootDir, "Program Files (x86)", "Codex Tools");
+    await mkdir(spaceDir, { recursive: true });
+    const spaceCodexExe = join(spaceDir, "codex.exe");
+    writeFileSync(spaceCodexExe, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const resolvedSpace = await resolveCodexBinary({
+      platform: "win32",
+      pathEnv: spaceDir,
+    });
+    assert.equal(resolvedSpace, spaceCodexExe);
+
+    // 8. multiple PATH entries -> deterministic first valid match
+    const emptyDir = join(rootDir, "empty-dir");
+    await mkdir(emptyDir, { recursive: true });
+    const secondMatchDir = join(rootDir, "second-match");
+    await mkdir(secondMatchDir, { recursive: true });
+    writeFileSync(join(secondMatchDir, "codex.exe"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+
+    const resolvedFirstMatch = await resolveCodexBinary({
+      platform: "win32",
+      pathEnv: `${emptyDir};${winBinDir};${secondMatchDir}`,
+    });
+    assert.equal(resolvedFirstMatch, winCodexExe);
+
+    // 9. no shell-string execution introduced (directory names with shell metacharacters resolved via filesystem APIs)
+    const metaDir = join(rootDir, "bin&echo injected$(id)");
+    await mkdir(metaDir, { recursive: true });
+    const metaCodexExe = join(metaDir, "codex.exe");
+    writeFileSync(metaCodexExe, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const resolvedMeta = await resolveCodexBinary({
+      platform: "win32",
+      pathEnv: metaDir,
+    });
+    assert.equal(resolvedMeta, metaCodexExe);
+
+    // 10. POSIX PATH resolution does not split on colons inside Windows drive letters
+    const winDriveSimDir = join(rootDir, "win-drive-sim");
+    await mkdir(winDriveSimDir, { recursive: true });
+    const winDriveCodex = join(winDriveSimDir, "codex");
+    writeFileSync(winDriveCodex, "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    const resolvedDriveSim = await resolveCodexBinary({
+      platform: "linux",
+      pathEnv: `C:\\nonexistent\\dir:${winDriveSimDir}:D:\\another\\fake`,
+    });
+    assert.equal(resolvedDriveSim, winDriveCodex);
+  } finally {
+    await rm(rootDir, { recursive: true, force: true });
+  }
+});
+
 // ── Tool surface registration ────────────────────────────────────────────────
 
 const GOAL_TOOLS = [

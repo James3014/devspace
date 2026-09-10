@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { constants as fsConstants, access } from "node:fs/promises";
 import { mkdirSync, readFileSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { delimiter, dirname, join } from "node:path";
+import { dirname, join, posix, win32 } from "node:path";
 import {
   HeadTailBuffer,
   type ProcessSnapshot,
@@ -769,10 +769,28 @@ async function assertExecutableFile(path: string): Promise<void> {
   }
 }
 
+function splitPathEnv(pathEnv: string, delimiter: string): string[] {
+  if (delimiter === ";") {
+    return pathEnv.split(";");
+  }
+  const rawParts = pathEnv.split(":");
+  const resolved: string[] = [];
+  for (let i = 0; i < rawParts.length; i++) {
+    const part = rawParts[i];
+    if (/^[a-zA-Z]$/.test(part) && i + 1 < rawParts.length && /^[/\\]/.test(rawParts[i + 1])) {
+      resolved.push(`${part}:${rawParts[i + 1]}`);
+      i++;
+    } else {
+      resolved.push(part);
+    }
+  }
+  return resolved;
+}
+
 /**
  * Deterministic Codex CLI resolution:
  * 1. DEVSPACE_CODEX_BIN when explicitly configured (fail closed when invalid);
- * 2. an executable `codex` found on PATH;
+ * 2. an executable `codex` (or `codex.exe` on Windows) found on PATH;
  * 3. the macOS ChatGPT.app bundled CLI.
  */
 export async function resolveCodexBinary(options: {
@@ -788,14 +806,18 @@ export async function resolveCodexBinary(options: {
   }
 
   const pathEnv = options.pathEnv ?? process.env.PATH ?? "";
-  for (const directory of pathEnv.split(delimiter)) {
+  const pathDelimiter = platform === "win32" ? win32.delimiter : posix.delimiter;
+  const candidateNames = platform === "win32" ? ["codex.exe"] : ["codex"];
+  for (const directory of splitPathEnv(pathEnv, pathDelimiter)) {
     if (!directory) continue;
-    const candidate = join(directory, "codex");
-    try {
-      await access(candidate, fsConstants.X_OK);
-      return candidate;
-    } catch {
-      continue;
+    for (const name of candidateNames) {
+      const candidate = join(directory, name);
+      try {
+        await access(candidate, fsConstants.X_OK);
+        return candidate;
+      } catch {
+        continue;
+      }
     }
   }
 
