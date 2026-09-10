@@ -29,6 +29,7 @@ function makeRepo(name: string, files: Record<string, string> = {}): string {
   runGitRaw(["init", "--initial-branch=main"], repo);
   runGitRaw(["config", "user.email", "test@example.com"], repo);
   runGitRaw(["config", "user.name", "Test User"], repo);
+  runGitRaw(["config", "core.autocrlf", "false"], repo);
   commitAll(repo, files);
   return repo;
 }
