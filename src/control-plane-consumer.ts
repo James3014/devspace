@@ -5,7 +5,7 @@ export interface EffectSubject {
   requestHash: string;
   workspaceRoot: string;
   baseRevision: string;
-  operation: "dependency_sync";
+  operation: "dependency_sync" | "cutover_start";
 }
 export interface EffectBinding {
   leaseId: string;
@@ -29,6 +29,12 @@ export interface ControlPlaneConsumerOptions extends ControlPlaneOwnershipOption
 /** Runs inside the durable store transaction. It creates no grants or independent database. */
 export class ControlPlaneConsumer {
   constructor(private readonly ownership: ControlPlaneOwnershipStore, private readonly options: ControlPlaneConsumerOptions) {}
+
+  cutoverBinding(context: unknown, subject: EffectSubject, binding: EffectBinding, pinnedVersion: number) {
+    if (subject.operation !== "cutover_start" || binding.role !== "controller") throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "cutover requires controller authority");
+    this.assertPinned(context, subject, binding, pinnedVersion);
+    return Object.freeze({leaseId:binding.leaseId,pinnedLeaseVersion:pinnedVersion,operationHandle:subject.operationId,requestHash:subject.requestHash,ownerThread:this.ownership.get(binding.leaseId)!.ownerThread});
+  }
 
   readHandoff(context: unknown, leaseId: string, previousVersion: number, expectedCurrentVersion: number) {
     return this.ownership.readHandoff(context, leaseId, previousVersion, expectedCurrentVersion);

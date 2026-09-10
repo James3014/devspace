@@ -283,3 +283,133 @@ test("C3 late predecessor success or rejection cannot overwrite successor reconc
     } finally {deliver();await oldResponse;successor?.close();f.manager.close();}
   }
 });
+
+function cutoverFixture() {
+  const root=realpathSync(mkdtempSync(join(tmpdir(),"devspace-c3-cutover-")));
+  const config=loadConfig({DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_ALLOWED_ROOTS:root,DEVSPACE_STATE_DIR:join(root,"state"),DEVSPACE_WORKTREE_ROOT:join(root,"worktrees"),DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",PORT:"1"});
+  const context=Object.freeze({});const grant={repository:"owner/repo",goal:"cutover",coordinatorThread:"controller",evidenceHash:"fixture-grant"};
+  const input={attemptKey:"start",currentIdentity:{serverInstanceId:"old-runtime",sourceCommit:"old-source",buildId:"old-build"},expectedIdentity:{sourceCommit:"target-source",buildId:"target-build"}};
+  let ownership:ControlPlaneOwnershipStore;let leaseId="";let permitted=true;
+  const sort=(v:any):any=>v&&typeof v==="object"?Object.fromEntries(Object.entries(v).filter(([,v])=>v!==undefined).sort(([a],[b])=>a.localeCompare(b)).map(([k,v])=>[k,sort(v)])):v;
+  const request={version:"devspace.execution.v1",baseRevision:input.currentIdentity.sourceCommit,stateRoot:config.stateDir,currentIdentity:input.currentIdentity,expectedIdentity:input.expectedIdentity};
+  const hash=createHash("sha256").update(JSON.stringify(sort(request))).digest("hex");
+  const options:ControlPlaneConsumerOptions={resolveOwnerContext:c=>c===context?{ownerThread:"controller"}:undefined,verifyGrantEvidence:g=>permitted&&JSON.stringify(g)===JSON.stringify(grant),resolveEffectBinding:(c,s)=>c===context&&permitted&&s.requestHash===hash&&s.operation==="cutover_start"?{leaseId,leaseVersion:ownership.get(leaseId)!.version,requestHash:hash,role:"controller"}:undefined};
+  const manager=new DurableOperationManager(config,undefined,undefined,undefined,options);ownership=manager.store.createOwnershipStore(options);ownership.putGrantEvidence(context,grant,0);
+  leaseId=ownership.acquire(context,{repositoryKey:grant.repository,resourceKind:"filesystem",resourceId:config.stateDir,resource:config.stateDir,operation:"cutover_start",scope:[config.stateDir],baseRevision:input.currentIdentity.sourceCommit,expiresAt:new Date(Date.now()+60000).toISOString(),idempotencyKey:"cutover",grant}).leaseId;
+  return {manager,config,context,input,options,ownership,leaseId,revoke:()=>{permitted=false;}};
+}
+
+test("C3 cutover start correlates real state, retains pin, replays once and denies revoked reconciliation", async()=>{
+  const {CutoverStateStore}=await import("./cutover-state.js");const f=cutoverFixture();
+  try {
+    const result=f.manager.startCutover(f.input,f.context);
+    assert.equal(result.status,"succeeded");
+    const record=new CutoverStateStore(f.config.stateDir).get()!;
+    assert.equal(record.coordinationBinding?.operationHandle,result.operationId);
+    assert.equal(f.ownership.get(f.leaseId)?.operationHandle,result.operationId);
+    assert.deepEqual(f.manager.startCutover(f.input,f.context),result);
+    const reopened=new DurableOperationManager(f.config,undefined,undefined,undefined,f.options);
+    try {assert.equal(reopened.reconcileCutoverStart(result.operationId,f.context).receipt?.cutoverId,record.cutoverId);} finally {reopened.close();}
+    const before=JSON.stringify(f.manager.store.getByOperationId(result.operationId));f.revoke();
+    assert.throws(()=>f.manager.reconcileCutoverStart(result.operationId,f.context),/authority|binding/);
+    assert.equal(JSON.stringify(f.manager.store.getByOperationId(result.operationId)),before);
+  } finally {f.manager.close();}
+});
+
+test("C3 cutover crash windows never retry and only exact bound file can reconcile", async()=>{
+  const {CutoverStateStore}=await import("./cutover-state.js");
+  for (const afterWrite of [false,true]) {
+    const f=cutoverFixture();const original=CutoverStateStore.prototype.begin;let calls=0;
+    try {
+      CutoverStateStore.prototype.begin=function(input){calls++;if(afterWrite) original.call(this,input);throw new Error("lost cutover response");};
+      const result=f.manager.startCutover(f.input,f.context);
+      assert.equal(result.status,"outcome_unknown");assert.equal(calls,1);
+      CutoverStateStore.prototype.begin=original;
+      const reopened=new DurableOperationManager(f.config,undefined,undefined,undefined,f.options);
+      try {
+        assert.equal(reopened.store.getByOperationId(result.operationId)?.status,"outcome_unknown");
+        if (afterWrite) assert.equal(reopened.startCutover(f.input,f.context).status,"succeeded");
+        else {
+          assert.throws(()=>reopened.startCutover(f.input,f.context),/no retry or release/);
+          new CutoverStateStore(f.config.stateDir).begin({oldServerIdentity:f.input.currentIdentity,expectedNewIdentity:f.input.expectedIdentity});
+          assert.throws(()=>reopened.reconcileCutoverStart(result.operationId,f.context),/exact persisted correlation/);
+        }
+        assert.equal(f.ownership.get(f.leaseId)?.operationHandle,result.operationId);
+      } finally {reopened.close();}
+    } finally {CutoverStateStore.prototype.begin=original;f.manager.close();}
+  }
+});
+
+test("C3 cutover missing authority, worker role and changed target deny before file writes", async()=>{
+  const {CutoverStateStore}=await import("./cutover-state.js");const f=cutoverFixture();const bare=new DurableOperationManager(f.config);
+  try {
+    assert.throws(()=>bare.startCutover(f.input,f.context),/trusted host authority/);
+    assert.throws(()=>f.manager.startCutover(f.input,{}),/binding/);
+    assert.throws(()=>f.manager.startCutover({...f.input,expectedIdentity:{...f.input.expectedIdentity,buildId:"changed"}},f.context),/binding/);
+    const original=f.options.resolveEffectBinding;f.options.resolveEffectBinding=(c,s)=>{const b=original(c,s);return b?{...b,role:"worker"}:undefined;};
+    assert.throws(()=>f.manager.startCutover(f.input,f.context),/controller authority/);
+    assert.equal(new CutoverStateStore(f.config.stateDir).get(),undefined);
+    assert.equal(f.ownership.get(f.leaseId)?.operationHandle,undefined);
+  } finally {bare.close();f.manager.close();}
+});
+
+test("C3 separate cutover processes share intent and pin before the real file write", async()=>{
+  const {existsSync}=await import("node:fs");const f=cutoverFixture();
+  const marker=join(f.config.stateDir,"before-begin");const release=join(f.config.stateDir,"release-begin");
+  const ready=join(f.config.stateDir,"second-ready");const go=join(f.config.stateDir,"second-go");
+  const childSource=`
+    import {DurableOperationManager} from ${JSON.stringify(new URL("./durable-operations.ts",import.meta.url).href)};
+    import {CutoverStateStore} from ${JSON.stringify(new URL("./cutover-state.js",import.meta.url).href)};
+    import {existsSync,writeFileSync} from 'node:fs';
+    const payload=JSON.parse(process.env.CUTOVER_FIXTURE);const context={};let ownership;
+    const options={resolveOwnerContext:c=>c===context?{ownerThread:'controller'}:undefined,verifyGrantEvidence:g=>JSON.stringify(g)===JSON.stringify(payload.grant),resolveEffectBinding:(c,s)=>c===context&&s.requestHash===payload.hash?{leaseId:payload.leaseId,leaseVersion:ownership.get(payload.leaseId).version,requestHash:s.requestHash,role:'controller'}:undefined};
+    const manager=new DurableOperationManager(payload.config,undefined,undefined,undefined,options);ownership=manager.store.createOwnershipStore(options);
+    if(!payload.pause){writeFileSync(payload.ready,'ready');const deadline=Date.now()+15000;while(!existsSync(payload.go)&&Date.now()<deadline)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20);}
+    if(payload.pause){const original=CutoverStateStore.prototype.begin;CutoverStateStore.prototype.begin=function(input){writeFileSync(payload.marker,'pinned');const deadline=Date.now()+15000;while(!existsSync(payload.release)&&Date.now()<deadline)Atomics.wait(new Int32Array(new SharedArrayBuffer(4)),0,0,20);if(!existsSync(payload.release))throw new Error('fixture timeout');return original.call(this,input);};}
+    try{process.stdout.write(JSON.stringify({result:manager.startCutover(payload.input,context)}));}catch(e){process.stdout.write(JSON.stringify({error:e.code||e.message}));}finally{manager.close();}
+  `;
+  const lease=f.ownership.get(f.leaseId)!;
+  const grant=lease.grant;
+  // Capture the approved hash from the trusted fixture's fixed request.
+  const sort=(v:any):any=>v&&typeof v==='object'?Object.fromEntries(Object.entries(v).sort(([a],[b])=>a.localeCompare(b)).map(([k,v])=>[k,sort(v)])):v;
+  const hash=createHash('sha256').update(JSON.stringify(sort({version:'devspace.execution.v1',baseRevision:f.input.currentIdentity.sourceCommit,stateRoot:f.config.stateDir,currentIdentity:f.input.currentIdentity,expectedIdentity:f.input.expectedIdentity}))).digest('hex');
+  const launch=(pause:boolean,attemptKey:string)=>{
+    const child=spawn(process.execPath,["--import","tsx","--input-type=module","-e",childSource],{env:{...process.env,CUTOVER_FIXTURE:JSON.stringify({config:f.config,input:{...f.input,attemptKey},leaseId:f.leaseId,grant,hash,pause,marker,release,ready,go})},stdio:['ignore','pipe','pipe']});
+    let out='';let err='';child.stdout.on('data',b=>out+=b);child.stderr.on('data',b=>err+=b);
+    return new Promise<any>((resolve,reject)=>{child.on('error',reject);child.on('exit',code=>code===0?resolve(JSON.parse(out)):reject(new Error(err)));});
+  };
+  try {
+    const secondPromise=launch(false,'second');
+    for(let n=0;n<500&&!existsSync(ready);n++)await new Promise(r=>setTimeout(r,20));
+    assert.equal(existsSync(ready),true);
+    const first=launch(true,'first');
+    for(let n=0;n<500&&!existsSync(marker);n++)await new Promise(r=>setTimeout(r,20));
+    assert.equal(existsSync(marker),true);
+    const pinned=f.ownership.get(f.leaseId)!;
+    assert.equal(f.manager.store.getByOperationId(pinned.operationHandle!)?.status,'started');
+    writeFileSync(go,'compete');const second=await secondPromise;assert.ok(second.error);
+    assert.equal(f.manager.store.getByOperationId(pinned.operationHandle!)?.status,'started');
+    writeFileSync(release,'continue');const result=await first;assert.equal(result.result.status,'succeeded');
+    assert.equal(f.ownership.get(f.leaseId)?.operationHandle,result.result.operationId);
+  } finally {writeFileSync(go,'compete');writeFileSync(release,'continue');f.manager.close();}
+});
+
+test("C3 cutover callback drift cannot reach begin or overwrite durable evidence", async()=>{
+  const {CutoverStateStore}=await import("./cutover-state.js");
+  for (const duringCatch of [false,true]) {
+    const f=cutoverFixture();const begin=CutoverStateStore.prototype.begin;const resolve=f.options.resolveEffectBinding;
+    let reachedBegin=false;let changed=false;
+    try {
+      CutoverStateStore.prototype.begin=function(){reachedBegin=true;throw new Error('before file write');};
+      f.options.resolveEffectBinding=(c,s)=>{
+        const binding=resolve(c,s);const record=f.manager.store.getByOperationId(s.operationId);
+        if(record&&!changed&&(!duringCatch||reachedBegin)) {changed=true;f.manager.store.finish(record.operationId,{status:'failed',retrySafe:false,receipt:{newerEvidence:true}});}
+        return binding;
+      };
+      if(duringCatch) assert.throws(()=>f.manager.startCutover(f.input,f.context),/CAS|newer durable|changed/);
+      else {assert.equal(f.manager.startCutover(f.input,f.context).status,'outcome_unknown');assert.equal(reachedBegin,false);}
+      assert.equal(new CutoverStateStore(f.config.stateDir).get(),undefined);
+      assert.ok(f.ownership.get(f.leaseId)?.operationHandle);
+    } finally {CutoverStateStore.prototype.begin=begin;f.manager.close();}
+  }
+});
