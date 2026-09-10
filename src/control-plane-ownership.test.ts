@@ -200,7 +200,7 @@ test("C2 production filesystem identity rejects aliases and allows disjoint scop
   const request={...input([a]),resource:root};
   try {
     const lease=store.acquire(context("one"),request);
-    assert.equal(lease.scope[0],realpathSync(a).replaceAll("\\","/"));
+    assert.equal(lease.scope[0],realpathSync.native(a).replaceAll("\\","/"));
     assert.throws(()=>store.acquire(context("two"),{...request,resourceId:"different-label",scope:[alias],idempotencyKey:"alias"}));
     assert.throws(()=>store.acquire(context("two"),{...request,resourceKind:"workspace",scope:[a+"/"],idempotencyKey:"trailing"}));
     assert.ok(store.acquire(context("two"),{...request,scope:[b],idempotencyKey:"distinct"}));
@@ -261,7 +261,7 @@ test("physical leases conflict across repository grants while disjoint resources
     const distinct=store.acquire(context("two"),request(1,b,"same-key"));assert.equal(distinct.repositoryKey,"owner/repo-b");
     assert.throws(()=>store.acquire(context("two"),{...request(1,b,"forged"),grant:grants[0]!}),/grant repository/);
     store.release(context("one"),first.leaseId,first.version);
-    assert.equal(store.acquire(context("two"),request(1,a,"after-release")).resource,a);
+    assert.equal(store.acquire(context("two"),request(1,a,"after-release")).resource,realpathSync.native(a).replaceAll("\\","/"));
   }finally{sqlite.close();rmSync(root,{recursive:true,force:true});}
 });
 
@@ -283,7 +283,7 @@ test("persisted cross-repository overlaps deny replay, authorization and new pin
     const request={...input([a]),repositoryKey:grants[0]!.repository,grant:grants[0]!,resourceKind:"filesystem",resourceId:a,resource:a};
     const first=store.acquire(context("one"),request);const second=store.acquire(context("two"),{...input([b]),repositoryKey:grants[1]!.repository,grant:grants[1]!,resourceKind:"filesystem",resourceId:b,resource:b});
     // Reproduce a row accepted by the previous repository-filtered implementation.
-    sqlite.prepare("update control_plane_resource_leases set resource_id=?,resource=?,scope_json=? where lease_id=?").run(a,a,JSON.stringify([a]),second.leaseId);
+    sqlite.prepare("update control_plane_resource_leases set resource_id=?,resource=?,scope_json=? where lease_id=?").run(first.resourceId,first.resource,JSON.stringify(first.scope),second.leaseId);
     const before=sqlite.prepare("select * from control_plane_resource_leases order by lease_id").all();
     assert.throws(()=>store.acquire(context("one"),request),/overlapping resource/);
     for(const [lease,owner] of [[first,"one"],[second,"two"]] as const){assert.throws(()=>store.assertHeld(context(owner),lease.leaseId,1,lease.operation,lease.baseRevision),/overlapping resource/);assert.throws(()=>store.beginOperation(context(owner),lease.leaseId,1,"new-effect"),/overlapping resource/);}
@@ -292,7 +292,7 @@ test("persisted cross-repository overlaps deny replay, authorization and new pin
     assert.throws(()=>store.assertHeld(context("one"),first.leaseId,1,first.operation,first.baseRevision),/overlapping resource/);
     sqlite.prepare("update control_plane_resource_leases set scope_json='null' where lease_id=?").run(second.leaseId);
     assert.throws(()=>store.assertHeld(context("one"),first.leaseId,1,first.operation,first.baseRevision),e=>e instanceof ControlPlaneOwnershipError&&e.code==="MALFORMED");
-    sqlite.prepare("update control_plane_resource_leases set scope_json=? where lease_id=?").run(JSON.stringify([a]),second.leaseId);
+    sqlite.prepare("update control_plane_resource_leases set scope_json=? where lease_id=?").run(JSON.stringify(first.scope),second.leaseId);
     store.release(context("two"),second.leaseId,1);
     assert.equal(store.assertHeld(context("one"),first.leaseId,1,first.operation,first.baseRevision).leaseId,first.leaseId);
     callbackConflictLease=second.leaseId;
