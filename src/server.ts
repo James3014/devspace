@@ -1,6 +1,6 @@
 import type { ControlPlaneConsumerOptions } from "./control-plane-consumer.js";
 import { ControlPlaneOwnershipError } from "./control-plane-ownership.js";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { access, realpath } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
@@ -1394,6 +1394,7 @@ export interface CutoverMcpControlContext {
 function registerCutoverMcpTools(
   server: McpServer,
   control: CutoverMcpControlContext,
+  durableOperations?: DurableOperationManager,
 ): void {
   const cutoverRecordSchema = z.record(z.string(), z.unknown());
   const modeSchema = z.enum(["normal", "drain", "reconcile-only"]);
@@ -1435,15 +1436,19 @@ function registerCutoverMcpTools(
         expectedBuildId: z.string().min(1),
         expectedCapabilityManifestSha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
         expiresAt: z.string().optional(),
+        attemptKey: z.string().min(1).optional().describe("Stable attempt identity; defaults to a digest of runtime, resolved target and expiry."),
       },
       outputSchema: {
         cutover: cutoverRecordSchema,
+        operationId: z.string(),
         mode: modeSchema,
       },
       _meta: {},
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ expectedSourceCommit, expectedBuildId, expectedCapabilityManifestSha256, expiresAt }) => {
+    async ({ expectedSourceCommit, expectedBuildId, expectedCapabilityManifestSha256, expiresAt, attemptKey }, extra) => {
+      const context = dependencyConsumerContext(extra);
+      if (!durableOperations) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "cutover start requires trusted host coordination");
       if (expectedCapabilityManifestSha256 && control.probeBuildReady) {
         const probe = await control.probeBuildReady({
           sourceCommit: expectedSourceCommit,
@@ -1459,18 +1464,21 @@ function registerCutoverMcpTools(
       }
       const capabilityManifestSha256 = expectedCapabilityManifestSha256
         ?? control.controller.currentIdentity.capabilityManifestSha256;
-      const record = control.controller.begin(
-        {
-          sourceCommit: expectedSourceCommit,
-          buildId: expectedBuildId,
-          ...(capabilityManifestSha256 ? { capabilityManifestSha256 } : {}),
-        },
-        expiresAt,
-      );
+      const expectedIdentity = {
+        sourceCommit: expectedSourceCommit,
+        buildId: expectedBuildId,
+        ...(capabilityManifestSha256 ? { capabilityManifestSha256 } : {}),
+      };
+      const currentIdentity = control.controller.currentIdentity;
+      const defaultAttempt = createHash("sha256").update(JSON.stringify({currentIdentity,expectedIdentity,expiresAt})).digest("hex");
+      const operation = durableOperations.startCutover({attemptKey:attemptKey ?? defaultAttempt,currentIdentity,expectedIdentity,expiresAt},context);
+      if (operation.status !== "succeeded") throw new CutoverStateError(`Cutover operation ${operation.operationId} requires exact operation_reconcile; no new start is authorized.`);
+      const record = control.controller.record();
+      if (!record || record.cutoverId !== operation.receipt?.cutoverId) throw new CutoverStateError(`Cutover operation ${operation.operationId} readback changed; reconciliation required.`);
       const mode = control.controller.mode();
       return {
         content: [textBlock(`Started cutover ${record.cutoverId}; mode=${mode}.`) ],
-        structuredContent: { cutover: record as unknown as Record<string, unknown>, mode },
+        structuredContent: { cutover: record as unknown as Record<string, unknown>, mode, operationId:operation.operationId },
       };
     },
   );
@@ -2173,7 +2181,7 @@ export function createMcpServer(
   );
 
   registerRepositoryIntelligenceTools(server, config, workspaces);
-  if (cutoverControl) registerCutoverMcpTools(server, cutoverControl);
+  if (cutoverControl) registerCutoverMcpTools(server, cutoverControl, durableOperations);
 
   registerAppResource(
     server,
@@ -2461,7 +2469,7 @@ export function createMcpServer(
       operationId: z.string(),
       attemptKey: z.string(),
       requestHash: z.string(),
-      kind: z.enum(["workspace_clone", "dependency_sync", "nexus_gateway_recover"]),
+      kind: z.enum(["workspace_clone", "dependency_sync", "nexus_gateway_recover", "cutover_start"]),
       authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]),
       scopeRoot: z.string(),
       workspaceId: z.string().optional(),
@@ -2722,7 +2730,7 @@ export function createMcpServer(
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       },
       async ({ operationId }, extra) => {
-        const context = durableOperations.store.getByOperationId(operationId)?.kind === "dependency_sync"
+        const context = ["dependency_sync", "cutover_start"].includes(durableOperations.store.getByOperationId(operationId)?.kind ?? "")
           ? dependencyConsumerContext(extra) : undefined;
         return operationResponse(await durableOperations.reconcile(operationId, context));
       },

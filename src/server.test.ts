@@ -412,15 +412,18 @@ test("cutover MCP control exposes bounded lease lifecycle and schedules self res
       assert.ok(tools.tools.some((tool) => tool.name === name), `missing ${name}`);
     }
 
-    const started = structuredContent(await client.callTool({
+    const deniedStart = await client.callTool({
       name: "cutover_start",
       arguments: {
         expectedSourceCommit: "b".repeat(40),
         expectedBuildId: "new-build",
         expectedCapabilityManifestSha256: "a".repeat(64),
       },
-    }));
-    assert.equal((started.cutover as Record<string, unknown>).phase, "prepared");
+    });
+    assert.equal(deniedStart.isError,true);
+    assert.equal(cutoverController.record(),undefined);
+    // Trusted fixture setup for the following lifecycle-handler checks.
+    cutoverController.begin({sourceCommit:"b".repeat(40),buildId:"new-build",capabilityManifestSha256:"a".repeat(64)});
 
     const drained = structuredContent(await client.callTool({
       name: "cutover_drain",
@@ -2118,14 +2121,14 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
   await provider.authorize(oauthClient,{redirectUri:"http://localhost/callback",codeChallenge:"fixture",scopes:config.oauth.scopes,resource:new URL("/mcp",config.publicBaseUrl)}, {req:{method:"POST",body:{owner_token:config.oauth.ownerToken}},redirect:(_status:number,url:string)=>{redirect=url;}} as never);
   const tokens=await provider.exchangeAuthorizationCode(oauthClient,new URL(redirect).searchParams.get("code")!);
   const grant={repository:"owner/repo",goal:"http-fixture",coordinatorThread:"controller",evidenceHash:"external-fixture-proof"};
-  let approvedHash=""; let leaseId=""; let readerClient:unknown; let successorClientId="";
+  let approvedHash=""; let leaseId=""; let readerClient:unknown; let successorClientId=""; let cutoverLeaseId=""; let cutoverHash="";
   let ownership: import("./control-plane-ownership.js").ControlPlaneOwnershipStore;
   const authenticated=(c:unknown)=>!!c && (c as {clientId?:string}).clientId===oauthClient.client_id && typeof (c as {sessionId?:string}).sessionId==="string";
   const coordination:import("./control-plane-consumer.js").ControlPlaneConsumerOptions={
     readDependencyReconciliation:c=>{readerClient=(c as {clientId:string}).clientId;return undefined;},
     resolveOwnerContext:c=>authenticated(c)?{ownerThread:"delegated-cli-worker"}:successorClientId && (c as {clientId?:string})?.clientId===successorClientId ? {ownerThread:"successor"}:undefined,
     verifyGrantEvidence:g=>JSON.stringify(g)===JSON.stringify(grant),
-    resolveEffectBinding:(c,subject)=>authenticated(c) && subject.workspaceRoot===project && subject.baseRevision===base && subject.requestHash===approvedHash ? {leaseId,leaseVersion:ownership.get(leaseId)!.version,requestHash:approvedHash,role:"worker"}:undefined,
+    resolveEffectBinding:(c,subject)=>subject.operation==="cutover_start" && (c as {clientId?:string})?.clientId===successorClientId && cutoverHash && subject.requestHash===cutoverHash ? {leaseId:cutoverLeaseId,leaseVersion:ownership.get(cutoverLeaseId)!.version,requestHash:cutoverHash,role:"controller"} : authenticated(c) && subject.workspaceRoot===project && subject.baseRevision===base && subject.requestHash===approvedHash ? {leaseId,leaseVersion:ownership.get(leaseId)!.version,requestHash:approvedHash,role:"worker"}:undefined,
   };
   const running=createServer(config,{coordination});
   const manager=new DurableOperationManager(config,undefined,undefined,undefined,coordination);
@@ -2178,9 +2181,39 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
         forbiddenOverlap:[project],tests:["http-witness"],evidence:["terminal-operation"],remainingGap:"next revision",nextGate:"readback",expiresAt:current.expiresAt,
       });
       const readArgs={leaseId,previousVersion:handoff.previousVersion,expectedCurrentVersion:handoff.newVersion};
-      const started=await otherClient.callTool({name:"cutover_start",arguments:{expectedSourceCommit:"a".repeat(40),expectedBuildId:"handoff-fixture"}});
+      const startArgs={expectedSourceCommit:"a".repeat(40),expectedBuildId:"handoff-fixture",attemptKey:"http-cutover"};
+      const missingGrant=await otherClient.callTool({name:"cutover_start",arguments:startArgs});
+      assert.equal(missingGrant.isError,true);
+      assert.equal(new CutoverStateStore(config.stateDir).get(),undefined);
+      const status=structuredContent(await otherClient.callTool({name:"cutover_status",arguments:{}})).status as {currentServerIdentity:import("./cutover-state.js").CutoverServerIdentity};
+      const currentIdentity=status.currentServerIdentity;
+      const expectedIdentity={sourceCommit:startArgs.expectedSourceCommit,buildId:startArgs.expectedBuildId,capabilityManifestSha256:currentIdentity.capabilityManifestSha256};
+      const sorted=(v:any):any=>v&&typeof v==="object"?Object.fromEntries(Object.entries(v).filter(([,v])=>v!==undefined).sort(([a],[b])=>a.localeCompare(b)).map(([k,v])=>[k,sorted(v)])):v;
+      cutoverHash=sha(JSON.stringify(sorted({version:"devspace.execution.v1",baseRevision:currentIdentity.sourceCommit,stateRoot:config.stateDir,currentIdentity,expectedIdentity})));
+      const cutoverContext={clientId:successorClientId,sessionId:"fixture-recipient"};
+      cutoverLeaseId=ownership.acquire(cutoverContext,{repositoryKey:grant.repository,resourceKind:"filesystem",resourceId:config.stateDir,resource:config.stateDir,operation:"cutover_start",scope:[config.stateDir],baseRevision:currentIdentity.sourceCommit,expiresAt:new Date(Date.now()+60000).toISOString(),idempotencyKey:"cutover-http",grant}).leaseId;
+      const started=await otherClient.callTool({name:"cutover_start",arguments:startArgs});
       assert.equal(started.isError,undefined,JSON.stringify(started));
       const cutoverId=(structuredContent(started).cutover as {cutoverId:string}).cutoverId;
+      const operationId=structuredContent(started).operationId as string;
+      assert.equal(typeof operationId,"string");
+      assert.equal(ownership.get(cutoverLeaseId)?.operationHandle,operationId);
+      const replayStart=await otherClient.callTool({name:"cutover_start",arguments:startArgs});
+      assert.equal((structuredContent(replayStart).cutover as {cutoverId:string}).cutoverId,cutoverId);
+      const wrongStart=await client.callTool({name:"cutover_start",arguments:startArgs,_meta:{clientId:successorClientId,ownerThread:"successor"}});
+      assert.equal(wrongStart.isError,true);
+      const beforeDenied=JSON.stringify([ownership.get(cutoverLeaseId),new CutoverStateStore(config.stateDir).get()]);
+      assert.equal((await otherClient.callTool({name:"cutover_start",arguments:{...startArgs,attemptKey:"new-attempt"}})).isError,true);
+      assert.equal((await otherClient.callTool({name:"cutover_start",arguments:{...startArgs,expectedBuildId:"changed-target"}})).isError,true);
+      assert.equal(manager.store.getByAttempt(config.stateDir,"new-attempt"),undefined);
+      assert.equal(JSON.stringify([ownership.get(cutoverLeaseId),new CutoverStateStore(config.stateDir).get()]),beforeDenied);
+      assert.equal((await client.callTool({name:"operation_reconcile",arguments:{operationId},_meta:{clientId:successorClientId}})).isError,true);
+
+      const reconciledStart=await otherClient.callTool({name:"operation_reconcile",arguments:{operationId}});
+      assert.equal(reconciledStart.isError,undefined,JSON.stringify(reconciledStart));
+      assert.equal(structuredContent(reconciledStart).kind,"cutover_start");
+      assert.equal((new CutoverStateStore(config.stateDir).get()?.coordinationBinding)?.operationHandle,operationId);
+
       const drained=await otherClient.callTool({name:"cutover_drain",arguments:{cutoverId}});
       assert.equal(drained.isError,undefined,JSON.stringify(drained));
       const cutoverStore=new CutoverStateStore(config.stateDir);
@@ -2820,6 +2853,14 @@ test("P0-4: real server /mcp HTTP boundary permits transport reconnect during dr
       }),
     });
     assert.equal(startRes.status, 200);
+    const startText=await startRes.text();
+    const startData=startText.split("\n").find(line=>line.startsWith("data: "));
+    assert.equal(JSON.parse(startData?startData.slice(6):startText).result.isError,true);
+    assert.equal(new CutoverStateStore(stateDir).get(),undefined);
+    // Arrange drain through the trusted fixture API; this test covers reconnect.
+    const runtime=await (await fetch(`http://127.0.0.1:${port}/identity`)).json() as any;
+    new CutoverStateStore(stateDir).begin({oldServerIdentity:{serverInstanceId:runtime.serverInstanceId,sourceCommit:runtime.sourceCommit,buildId:runtime.buildId,capabilityManifestSha256:runtime.capabilityManifest.manifestSha256},expectedNewIdentity:{sourceCommit:"a".repeat(40),buildId:"build-p04"}});
+
 
     // 3. Client 2 (reconnecting ChatGPT connector after drop, starting new session during drain)
     const init2Res = await fetch(mcpUrl, {

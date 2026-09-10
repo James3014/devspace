@@ -30,6 +30,15 @@ export interface ControlPlaneConsumerOptions extends ControlPlaneOwnershipOption
 export class ControlPlaneConsumer {
   constructor(private readonly ownership: ControlPlaneOwnershipStore, private readonly options: ControlPlaneConsumerOptions) {}
 
+  pinCutover(context: unknown, subject: EffectSubject, expected: EffectBinding) {
+    const current = this.authorize(context,subject);
+    if (subject.operation !== "cutover_start" || current.role !== "controller" || JSON.stringify(current) !== JSON.stringify(expected)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","cutover authority changed before pin");
+    const owner = this.ownership.get(current.leaseId)!.ownerThread;
+    const pinned = this.ownership.beginOperation(context,current.leaseId,current.leaseVersion,subject.operationId);
+    if (pinned.leaseId !== current.leaseId || pinned.ownerThread !== owner || pinned.operationHandle !== subject.operationId || pinned.version !== current.leaseVersion+1) throw new ControlPlaneOwnershipError("CAS_CONFLICT","cutover pin result changed");
+    return Object.freeze({leaseId:pinned.leaseId,pinnedLeaseVersion:pinned.version,operationHandle:subject.operationId,requestHash:subject.requestHash,ownerThread:pinned.ownerThread});
+  }
+
   cutoverBinding(context: unknown, subject: EffectSubject, binding: EffectBinding, pinnedVersion: number) {
     if (subject.operation !== "cutover_start" || binding.role !== "controller") throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "cutover requires controller authority");
     this.assertPinned(context, subject, binding, pinnedVersion);

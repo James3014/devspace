@@ -52,6 +52,7 @@ export interface CutoverIdentityComparison {
 export const CUTOVER_SAFE_TOOLS: ReadonlySet<string> = new Set([
   // Core cutover control & recovery
   "cutover_status",
+  "cutover_start", // Guarded handler admits only authorized starts or exact replay.
   "cutover_drain",
   "cutover_restart_self",
   "cutover_reconcile",

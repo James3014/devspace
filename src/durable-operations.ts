@@ -386,8 +386,7 @@ export class DurableOperationManager {
         if (existing.requestHash !== requestHash || existing.kind !== "cutover_start") throw new DurableOperationError("OPERATION_REPLAY_CONFLICT","cutover attempt changed",existing);
         return {record:existing,created:false};
       }
-      const pinnedVersion = consumer.pin(context,subject,binding);
-      const coordinationBinding = consumer.cutoverBinding(context,subject,binding,pinnedVersion);
+      const coordinationBinding = consumer.pinCutover(context,subject,binding);
       return this.store.createOrReplay({operationId,attemptKey:snapshot.attemptKey,requestHash,kind:"cutover_start",authorityMode:"OWNER_DIRECT",scopeRoot:stateRoot,request:{...request,coordinationBinding}});
     });
     if (!intent.created) return this.reconcileCutoverStart(operationId,context);
