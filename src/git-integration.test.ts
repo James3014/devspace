@@ -175,10 +175,7 @@ test("write-denied destination rejects late apply failure without changing track
     let windowsAclSid: string | undefined;
     let windowsAclApplied = false;
     try {
-      if (process.platform === "win32") {
-        // Installed immediately before git apply, after the final re-fence.
-        // This keeps readiness checks independent of the write denial.
-      } else {
+      if (process.platform !== "win32") {
         chmodSync(destination, 0o555);
       }
       const result = await integrateCandidate({
@@ -191,8 +188,9 @@ test("write-denied destination rejects late apply failure without changing track
               assert.equal(sidMatches.length, 1, "whoami must return exactly one current-user SID");
               windowsAclSid = sidMatches[0];
               windowsAclApplied = true;
-              const targetFile = join(destination, "a.ts");
-              execFileSync("icacls", [targetFile, "/deny", `*${windowsAclSid}:(W,D)`], { encoding: "utf8" });
+              execFileSync("icacls", [destination, "/deny", `*${windowsAclSid}:(OI)(CI)(W,D,DC)`], {
+                encoding: "utf8",
+              });
             }
           : undefined,
       });
@@ -208,8 +206,7 @@ test("write-denied destination rejects late apply failure without changing track
     } finally {
       if (process.platform === "win32") {
         if (windowsAclApplied && windowsAclSid !== undefined) {
-          const targetFile = join(destination, "a.ts");
-          execFileSync("icacls", [targetFile, "/remove:d", `*${windowsAclSid}`], { encoding: "utf8" });
+          execFileSync("icacls", [destination, "/remove:d", `*${windowsAclSid}`], { encoding: "utf8" });
         }
       } else {
         chmodSync(destination, 0o755);
