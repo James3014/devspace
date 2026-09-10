@@ -303,6 +303,7 @@ export class ControlPlaneOwnershipStore {
     return this.sqlite.transaction(() => {
       const lease = this.get(leaseId);
       if (!lease) throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "lease not found");
+      this.assertPhysicalBinding(lease);
       verifyGrant(this.options, immutable(lease.grant), immutable(owner));
       this.assertCurrentGrant(lease.grant, lease.grantVersion);
       const current = this.get(leaseId);
@@ -326,6 +327,7 @@ export class ControlPlaneOwnershipStore {
     return this.sqlite.transaction(() => {
       const lease = this.get(leaseId);
       if (!lease) throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "lease not found");
+      this.assertPhysicalBinding(lease);
       verifyGrant(this.options, immutable(lease.grant), immutable(owner));
       this.assertCurrentGrant(lease.grant, lease.grantVersion);
       if (lease.ownerThread !== owner.ownerThread || JSON.stringify(this.get(leaseId)) !== JSON.stringify(lease)) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "reconciliation owner changed");
@@ -372,6 +374,7 @@ export class ControlPlaneOwnershipStore {
     return this.sqlite.transaction(() => {
       const lease = this.get(leaseId);
       if (!lease) throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "lease not found");
+      this.assertPhysicalBinding(lease);
       verifyGrant(this.options, immutable(lease.grant), immutable(from));
       verifyGrant(this.options, immutable(receipt.recipientGrant), immutable(to));
       this.assertCurrentGrant(lease.grant, lease.grantVersion);

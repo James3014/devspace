@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, mkdirSync, symlinkSync, realpathSync } from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, symlinkSync, realpathSync, renameSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn, execFileSync } from "node:child_process";
@@ -225,5 +225,24 @@ test("C2 malformed persisted lease identity fails closed without resetting recor
   for (const patch of ["grant_json='null'", "scope_json='[1]'", "operation_state='active'", "repository_key='wrong/repo'", "updated_at='invalid'"]) {
     const sqlite=db();const store=new ControlPlaneOwnershipStore(sqlite,options);
     try {const lease=store.acquire(context("owner"),input());sqlite.exec(`update control_plane_resource_leases set ${patch}`);const before=sqlite.prepare("select * from control_plane_resource_leases").all();assert.throws(()=>store.get(lease.leaseId),(error:unknown)=>error instanceof ControlPlaneOwnershipError && error.code==='MALFORMED');assert.deepEqual(sqlite.prepare("select * from control_plane_resource_leases").all(),before);} finally {sqlite.close();}
+  }
+});
+
+
+test("C2 symlink replacement denies renew, reconcile, replay and handoff without state changes", () => {
+  for(const replay of [false,true]) {
+    const root=mkdtempSync(join(tmpdir(),"devspace-drift-"));const bound=join(root,"bound");const moved=join(root,"moved");const other=join(root,"other");mkdirSync(bound);mkdirSync(other);
+    const sqlite=db();const store=new ControlPlaneOwnershipStore(sqlite,{resolveOwnerContext:options.resolveOwnerContext,verifyGrantEvidence:options.verifyGrantEvidence,verifyReconciliationEvidence:()=>true});
+    try {
+      const lease=store.acquire(context("owner"),{...input([bound]),resource:bound});store.beginOperation(context("owner"),lease.leaseId,1,"effect");
+      const evidence={leaseId:lease.leaseId,ownerThread:"owner",operationHandle:"effect",operation:lease.operation,baseRevision:lease.baseRevision,leaseVersion:2,state:"finished" as const};
+      if(replay)store.reconcile(context("owner"),lease.leaseId,2,evidence);
+      renameSync(bound,moved);symlinkSync(other,bound,"junction");
+      const before=sqlite.prepare("select * from control_plane_resource_leases").all();const receipts=sqlite.prepare("select * from control_plane_reconciliation_receipts").all();
+      assert.throws(()=>store.renew(context("owner"),lease.leaseId,replay?3:2,new Date(Date.now()+120000).toISOString()));
+      assert.throws(()=>store.reconcile(context("owner"),lease.leaseId,2,evidence));
+      assert.throws(()=>store.handoff(context("owner"),lease.leaseId,replay?3:2,context("other"),{resource:lease.resource,scope:lease.scope,baseRevision:lease.baseRevision,candidateRevision:"candidate",liveOperation:lease.operation,liveHandle:replay?"":"effect",checkpoint:"checkpoint",grantDependency:lease.grant,grantVersion:lease.grantVersion,recipientGrant:lease.grant,recipientGrantVersion:lease.grantVersion,forbiddenOverlap:lease.scope,tests:[],evidence:["proof"],remainingGap:"unknown",nextGate:"reconcile",expiresAt:lease.expiresAt}));
+      assert.deepEqual(sqlite.prepare("select * from control_plane_resource_leases").all(),before);assert.deepEqual(sqlite.prepare("select * from control_plane_reconciliation_receipts").all(),receipts);assert.equal((sqlite.prepare("select count(*) n from control_plane_handoff_receipts").get() as {n:number}).n,0);
+    } finally {sqlite.close();rmSync(root,{recursive:true,force:true});}
   }
 });
