@@ -174,19 +174,19 @@ test("write-denied destination rejects late apply failure without changing track
     // bits do not deny writes there.
     let windowsAclSid: string | undefined;
     let windowsAclApplied = false;
-    if (process.platform === "win32") {
-      const whoami = execFileSync("whoami", ["/user", "/fo", "csv", "/nh"], { encoding: "utf8" });
-      const sidMatches = whoami.match(/\bS-\d-(?:\d+-){1,14}\d+\b/g) ?? [];
-      assert.equal(sidMatches.length, 1, "whoami must return exactly one current-user SID");
-      windowsAclSid = sidMatches[0];
-      execFileSync("icacls", [destination, "/deny", `*${windowsAclSid}:(OI)(CI)(W,D,DC)`], {
-        encoding: "utf8",
-      });
-      windowsAclApplied = true;
-    } else {
-      chmodSync(destination, 0o555);
-    }
     try {
+      if (process.platform === "win32") {
+        const whoami = execFileSync("whoami", ["/user", "/fo", "csv", "/nh"], { encoding: "utf8" });
+        const sidMatches = whoami.match(/\bS-\d-(?:\d+-){1,14}\d+\b/g) ?? [];
+        assert.equal(sidMatches.length, 1, "whoami must return exactly one current-user SID");
+        windowsAclSid = sidMatches[0];
+        windowsAclApplied = true;
+        execFileSync("icacls", [destination, "/deny", `*${windowsAclSid}:(OI)(CI)(W,D,DC)`], {
+          encoding: "utf8",
+        });
+      } else {
+        chmodSync(destination, 0o555);
+      }
       const result = await integrateCandidate({ ...input, confirmApply: true });
       assert.equal(result.applied, false);
       assert.ok(result.blockers.some((b) => b.code === "INTEGRATION_NOT_EXPRESSIBLE"));
