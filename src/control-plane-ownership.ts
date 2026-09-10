@@ -361,6 +361,25 @@ export class ControlPlaneOwnershipStore {
   private transition(consumerContext: unknown, leaseId: string, expectedVersion: number, terminalState: "released" | "handed_off"): ResourceLease { const owner = ownerFor(this.options, consumerContext); const now = new Date(this.now()).toISOString(); const tx = this.sqlite.transaction(() => { const row = this.sqlite.prepare("select * from control_plane_resource_leases where lease_id=?").get(leaseId) as LeaseRow | undefined; if (!row) throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "lease not found"); const lease = rowLease(row); this.assertPhysicalBinding(lease); verifyGrant(this.options, lease.grant, owner); this.assertCurrentGrant(lease.grant, lease.grantVersion); if (lease.operationHandle) throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "active operation must finish or transfer before release"); const result = this.sqlite.prepare("update control_plane_resource_leases set terminal_state=?, version=version+1, updated_at=? where lease_id=? and owner_thread=? and version=? and terminal_state is null").run(terminalState, now, leaseId, owner.ownerThread, expectedVersion); if (result.changes !== 1) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "lease changed before transition"); return rowLease(this.sqlite.prepare("select * from control_plane_resource_leases where lease_id=?").get(leaseId) as LeaseRow); }); return tx.immediate(); }
   beginOperation(consumerContext: unknown, leaseId: string, expectedVersion: number, handle: string): ResourceLease { bounded(handle, "operation handle"); const owner = ownerFor(this.options, consumerContext); const now = new Date(this.now()).toISOString(); const tx = this.sqlite.transaction(() => { const row = this.sqlite.prepare("select * from control_plane_resource_leases where lease_id=?").get(leaseId) as LeaseRow | undefined; if (!row) throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "lease not found"); const lease = rowLease(row); this.assertPhysicalBinding(lease); verifyGrant(this.options, lease.grant, owner); this.assertCurrentGrant(lease.grant, lease.grantVersion); if (lease.ownerThread !== owner.ownerThread || lease.version !== expectedVersion || lease.terminalState || lease.operationHandle) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "operation pin no longer matches"); if (Date.parse(lease.expiresAt) <= this.now()) throw new ControlPlaneOwnershipError("EXPIRED", "lease is expired and requires reconciliation"); const result = this.sqlite.prepare("update control_plane_resource_leases set active_operation_handle=?, operation_state='active', version=version+1, updated_at=? where lease_id=? and owner_thread=? and version=? and terminal_state is null and active_operation_handle is null").run(handle, now, leaseId, owner.ownerThread, expectedVersion); if (result.changes !== 1) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "operation pin raced"); return rowLease(this.sqlite.prepare("select * from control_plane_resource_leases where lease_id=?").get(leaseId) as LeaseRow); }); return tx.immediate(); }
   finishOperation(consumerContext: unknown, leaseId: string, expectedVersion: number, handle: string): ResourceLease { bounded(handle, "operation handle"); const owner = ownerFor(this.options, consumerContext); const now = new Date(this.now()).toISOString(); const tx = this.sqlite.transaction(() => { const row = this.sqlite.prepare("select * from control_plane_resource_leases where lease_id=?").get(leaseId) as LeaseRow | undefined; if (!row) throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "lease not found"); const lease = rowLease(row); this.assertPhysicalBinding(lease); verifyGrant(this.options, lease.grant, owner); this.assertCurrentGrant(lease.grant, lease.grantVersion); const result = this.sqlite.prepare("update control_plane_resource_leases set active_operation_handle=null, operation_state='finished', version=version+1, updated_at=? where lease_id=? and owner_thread=? and version=? and active_operation_handle=? and terminal_state is null").run(now, leaseId, owner.ownerThread, expectedVersion, handle); if (result.changes !== 1) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "operation completion no longer matches"); return rowLease(this.sqlite.prepare("select * from control_plane_resource_leases where lease_id=?").get(leaseId) as LeaseRow); }); return tx.immediate(); }
+  readHandoff(consumerContext: unknown, leaseId: string, previousVersion: number, expectedCurrentVersion: number): {receipt: HandoffReceipt; currentLease: ResourceLease} {
+    if (!Number.isSafeInteger(previousVersion) || previousVersion < 1 || !Number.isSafeInteger(expectedCurrentVersion) || expectedCurrentVersion <= previousVersion) throw new ControlPlaneOwnershipError("INVALID_INPUT", "invalid handoff readback versions");
+    const owner = immutable(ownerFor(this.options, consumerContext));
+    return this.sqlite.transaction(() => {
+      const lease = this.get(leaseId);
+      if (!lease || lease.ownerThread !== owner.ownerThread || lease.version !== expectedCurrentVersion) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "current handoff owner/version required");
+      this.assertPhysicalBinding(lease);
+      verifyGrant(this.options, immutable(lease.grant), owner);
+      this.assertCurrentGrant(lease.grant, lease.grantVersion);
+      if (JSON.stringify(this.get(leaseId)) !== JSON.stringify(lease)) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "handoff readback authority changed");
+      const rows = this.sqlite.prepare("select * from control_plane_handoff_receipts where lease_id=? and previous_version=? limit 2").all(leaseId, previousVersion) as Record<string, unknown>[];
+      if (rows.length !== 1) throw new ControlPlaneOwnershipError("MALFORMED", "exactly one handoff receipt is required");
+      const receipt = parseHandoffReceipt(rows[0]!);
+      if (receipt.toOwnerThread !== owner.ownerThread || receipt.recipientGrant.goal !== lease.grant.goal || receipt.newVersion > lease.version || receipt.repositoryKey !== lease.repositoryKey || receipt.resourceKind !== lease.resourceKind || receipt.resourceId !== lease.resourceId || receipt.resource !== lease.resource || receipt.baseRevision !== lease.baseRevision || receipt.liveOperation !== lease.operation || JSON.stringify(receipt.scope) !== JSON.stringify(lease.scope)) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "historical receipt does not belong to current recipient/resource");
+      // Expiry and historical pin are returned as evidence, never refreshed or used as effect authority.
+      return immutable({receipt, currentLease:lease});
+    }).immediate();
+  }
+
   handoff(consumerContext: unknown, leaseId: string, expectedVersion: number, recipientContext: unknown, input: HandoffInput): HandoffReceipt {
     const from = ownerFor(this.options, consumerContext); const to = ownerFor(this.options, recipientContext);
     if (from.ownerThread === to.ownerThread) throw new ControlPlaneOwnershipError("INVALID_INPUT", "handoff recipient must differ");
@@ -410,3 +429,33 @@ export interface HandoffReceipt {
   remainingGap: string; nextGate: string; expiresAt: string; createdAt: string;
 }
 export type HandoffInput = Omit<HandoffReceipt, "schema" | "receiptId" | "leaseId" | "repositoryKey" | "resourceKind" | "resourceId" | "fromOwnerThread" | "toOwnerThread" | "previousVersion" | "newVersion" | "createdAt">;
+
+function parseHandoffReceipt(row: Record<string, unknown>): HandoffReceipt {
+  try {
+    if (typeof row.receipt_json !== "string" || Buffer.byteLength(row.receipt_json) > MAX_JSON_BYTES) throw new Error("invalid size");
+    const value = JSON.parse(row.receipt_json) as HandoffReceipt;
+    if (!value || typeof value !== "object" || Array.isArray(value) || value.schema !== CONTROL_PLANE_SCHEMA) throw new Error("invalid schema");
+    const keys = ["schema","receiptId","leaseId","repositoryKey","resourceKind","resourceId","resource","fromOwnerThread","toOwnerThread","previousVersion","newVersion","baseRevision","scope","candidateRevision","liveOperation","liveHandle","checkpoint","grantDependency","grantVersion","recipientGrant","recipientGrantVersion","forbiddenOverlap","tests","evidence","remainingGap","nextGate","expiresAt","createdAt"];
+    if (JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(keys.sort())) throw new Error("invalid fields");
+    for (const key of ["receiptId","leaseId","repositoryKey","resourceKind","resourceId","resource","fromOwnerThread","toOwnerThread","baseRevision","candidateRevision","liveOperation","checkpoint","nextGate"] as const) bounded(value[key], key);
+    if (!SAFE_ID.test(value.fromOwnerThread) || !SAFE_ID.test(value.toOwnerThread) || value.fromOwnerThread === value.toOwnerThread) throw new Error("invalid parties");
+    if (typeof value.liveHandle !== "string" || value.liveHandle.length > 1024 || typeof value.remainingGap !== "string") throw new Error("invalid text");
+    for (const key of ["scope","forbiddenOverlap","tests","evidence"] as const) {
+      if (!Array.isArray(value[key]) || value[key].length > 512 || value[key].some(item => typeof item !== "string" || !item || item.length > 1024)) throw new Error("invalid references");
+    }
+    if (!value.evidence.length || JSON.stringify(normalizeScope(value.scope)) !== JSON.stringify(value.scope)) throw new Error("invalid scope/evidence");
+    for (const key of ["previousVersion","newVersion","grantVersion","recipientGrantVersion"] as const) if (!Number.isSafeInteger(value[key]) || value[key] < 1) throw new Error("invalid version");
+    if (typeof value.createdAt !== "string" || typeof value.expiresAt !== "string" || value.newVersion !== value.previousVersion + 1 || !Number.isFinite(Date.parse(value.createdAt)) || !Number.isFinite(Date.parse(value.expiresAt)) || Date.parse(value.expiresAt) <= Date.parse(value.createdAt)) throw new Error("invalid lifetime/version");
+    for (const grant of [value.grantDependency,value.recipientGrant]) {
+      if (!grant || JSON.stringify(Object.keys(grant).sort()) !== JSON.stringify(["coordinatorThread","evidenceHash","goal","repository"])) throw new Error("invalid grant binding");
+      for (const key of ["repository","goal","coordinatorThread","evidenceHash"] as const) bounded(grant[key], key);
+      if (normalizeRepositoryKey(grant.repository) !== value.repositoryKey) throw new Error("grant repository mismatch");
+    }
+    if (value.grantDependency.goal !== value.recipientGrant.goal) throw new Error("grant goal mismatch");
+    const bindings = {receipt_id:value.receiptId,lease_id:value.leaseId,resource:value.resource,from_owner_thread:value.fromOwnerThread,to_owner_thread:value.toOwnerThread,previous_version:value.previousVersion,new_version:value.newVersion,created_at:value.createdAt};
+    for (const [key, expected] of Object.entries(bindings)) if (row[key] !== expected) throw new Error("receipt metadata mismatch");
+    return value;
+  } catch {
+    throw new ControlPlaneOwnershipError("MALFORMED", "persisted handoff receipt is malformed");
+  }
+}

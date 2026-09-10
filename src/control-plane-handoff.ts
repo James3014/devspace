@@ -4,6 +4,11 @@ import { ControlPlaneOwnershipStore, type HandoffInput, type HandoffReceipt } fr
 export class ControlPlaneHandoff {
   constructor(private readonly ownership: ControlPlaneOwnershipStore) {}
 
+  /** Reads existing history under current owner/grant CAS; never repeats the transfer. */
+  readback(consumerContext: unknown, leaseId: string, previousVersion: number, expectedCurrentVersion: number) {
+    return this.ownership.readHandoff(consumerContext, leaseId, previousVersion, expectedCurrentVersion);
+  }
+
   transfer(
     consumerContext: unknown,
     leaseId: string,
