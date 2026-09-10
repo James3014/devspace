@@ -181,7 +181,8 @@ test("write-denied destination rejects late apply failure without changing track
         assert.equal(sidMatches.length, 1, "whoami must return exactly one current-user SID");
         windowsAclSid = sidMatches[0];
         windowsAclApplied = true;
-        execFileSync("icacls", [destination, "/deny", `*${windowsAclSid}:(OI)(CI)(W,D,DC)`], {
+        const targetFile = join(destination, "a.ts");
+        execFileSync("icacls", [targetFile, "/deny", `*${windowsAclSid}:(W,D)`], {
           encoding: "utf8",
         });
       } else {
@@ -197,7 +198,8 @@ test("write-denied destination rejects late apply failure without changing track
     } finally {
       if (process.platform === "win32") {
         if (windowsAclApplied && windowsAclSid !== undefined) {
-          execFileSync("icacls", [destination, "/remove:d", `*${windowsAclSid}`], { encoding: "utf8" });
+          const targetFile = join(destination, "a.ts");
+          execFileSync("icacls", [targetFile, "/remove:d", `*${windowsAclSid}`], { encoding: "utf8" });
         }
       } else {
         chmodSync(destination, 0o755);
