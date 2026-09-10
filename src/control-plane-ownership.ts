@@ -44,6 +44,27 @@ export interface ResourceLease extends ResourceLeaseInput {
   operationState?: "active" | "finished";
 }
 
+export interface ReconciliationEvidence {
+  leaseId: string;
+  ownerThread: string;
+  operationHandle: string;
+  operation: string;
+  baseRevision: string;
+  leaseVersion: number;
+  state: "finished" | "failed" | "not_running" | "unknown" | "running";
+  detail?: string;
+}
+
+export interface ReconciliationReceipt {
+  schema: typeof CONTROL_PLANE_SCHEMA;
+  receiptId: string;
+  leaseId: string;
+  previousVersion: number;
+  newVersion: number;
+  evidence: ReconciliationEvidence;
+  createdAt: string;
+}
+
 export function normalizeRepositoryKey(value: string): string {
   bounded(value, "repositoryKey");
   const normalized = value.trim().toLowerCase();
@@ -57,6 +78,7 @@ export type GrantEvidenceVerifier = (reference: GrantEvidenceReference, owner: T
 export interface ControlPlaneOwnershipOptions {
   resolveOwnerContext?: OwnerContextResolver;
   verifyGrantEvidence?: GrantEvidenceVerifier;
+  verifyReconciliationEvidence?: (evidence: ReconciliationEvidence, lease: ResourceLease, authority: TrustedOwnerContext) => boolean;
   now?: () => number;
   newId?: () => string;
 }
@@ -123,7 +145,17 @@ export function initializeControlPlaneOwnershipDatabase(sqlite: Database.Databas
       evidence_hash text not null, version integer not null, updated_at text not null,
       primary key(repository, goal, coordinator_thread)
     );
+    create table if not exists control_plane_reconciliation_receipts (
+      receipt_id text primary key,
+      lease_id text not null,
+      previous_version integer not null,
+      new_version integer not null,
+      evidence_json text not null,
+      created_at text not null,
+      foreign key (lease_id) references control_plane_resource_leases(lease_id)
+    );
   `);
+  sqlite.exec("create unique index if not exists control_plane_reconciliation_identity on control_plane_reconciliation_receipts(lease_id, previous_version)");
   const columns = sqlite.prepare("pragma table_info(control_plane_resource_leases)").all() as Array<{ name: string }>;
   if (!columns.some((column) => column.name === "grant_version")) {
     sqlite.exec("alter table control_plane_resource_leases add column grant_version integer not null default 0");
@@ -165,7 +197,23 @@ function ownerFor(options: ControlPlaneOwnershipOptions, context: unknown): Trus
 }
 function verifyGrant(options: ControlPlaneOwnershipOptions, grant: GrantEvidenceReference, owner: TrustedOwnerContext): void {
   bounded(grant.repository, "grant.repository"); bounded(grant.goal, "grant.goal"); bounded(grant.coordinatorThread, "grant.coordinatorThread"); bounded(grant.evidenceHash, "grant.evidenceHash");
-  if (!options.verifyGrantEvidence?.(grant, owner)) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "authoritative grant evidence was not verified");
+  if (options.verifyGrantEvidence?.(grant, owner) !== true) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "authoritative grant evidence was not verified");
+}
+
+function immutable<T>(value: T): T {
+  const copy = structuredClone(value);
+  const freeze = (item: unknown): void => {
+    if (item && typeof item === "object") { Object.values(item).forEach(freeze); Object.freeze(item); }
+  };
+  freeze(copy);
+  return copy;
+}
+function canonicalReconciliation(value: ReconciliationEvidence): ReconciliationEvidence {
+  if (!value || typeof value !== "object" || Object.keys(value).some(key => !["leaseId", "ownerThread", "operationHandle", "operation", "baseRevision", "leaseVersion", "state", "detail"].includes(key))) throw new ControlPlaneOwnershipError("INVALID_INPUT", "invalid reconciliation evidence");
+  for (const key of ["leaseId", "ownerThread", "operationHandle", "operation", "baseRevision"] as const) bounded(value[key], key);
+  if (value.state !== "finished" && value.state !== "failed") throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "effect outcome remains unresolved");
+  if (value.detail !== undefined) bounded(value.detail, "detail");
+  return {leaseId:value.leaseId, ownerThread:value.ownerThread, operationHandle:value.operationHandle, operation:value.operation, baseRevision:value.baseRevision, leaseVersion:value.leaseVersion, state:value.state, ...(value.detail !== undefined ? {detail:value.detail} : {})};
 }
 
 interface LeaseRow { lease_id: string; repository_key: string; resource_kind: string; resource_id: string; resource: string; operation: string; scope_json: string; base_revision: string; idempotency_key: string; owner_thread: string; grant_json: string; grant_version: number; version: number; terminal_state: string | null; expires_at: string; created_at: string; updated_at: string; active_operation_handle: string | null; operation_state: string | null; }
@@ -215,6 +263,59 @@ export class ControlPlaneOwnershipStore {
   assertHeld(consumerContext: unknown, leaseId: string, expectedVersion: number, operation: string, baseRevision: string): ResourceLease {
     const owner = ownerFor(this.options, consumerContext); const tx = this.sqlite.transaction(() => { const row = this.sqlite.prepare("select * from control_plane_resource_leases where lease_id=?").get(leaseId) as LeaseRow | undefined; if (!row) throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "lease not found"); const lease = rowLease(row); verifyGrant(this.options, lease.grant, owner); this.assertCurrentGrant(lease.grant, lease.grantVersion); if (lease.ownerThread !== owner.ownerThread || lease.version !== expectedVersion || lease.operation !== operation || lease.baseRevision !== baseRevision || lease.terminalState) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "lease evidence no longer matches"); if (Date.parse(lease.expiresAt) <= this.now()) throw new ControlPlaneOwnershipError("EXPIRED", "lease is expired and requires reconciliation"); return lease; }); return tx.immediate();
   }
+  renew(consumerContext: unknown, leaseId: string, expectedVersion: number, expiresAt: string): ResourceLease {
+    const owner = ownerFor(this.options, consumerContext);
+    return this.sqlite.transaction(() => {
+      const lease = this.get(leaseId);
+      if (!lease) throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "lease not found");
+      verifyGrant(this.options, immutable(lease.grant), immutable(owner));
+      this.assertCurrentGrant(lease.grant, lease.grantVersion);
+      const current = this.get(leaseId);
+      if (JSON.stringify(current) !== JSON.stringify(lease) || lease.ownerThread !== owner.ownerThread || lease.version !== expectedVersion || lease.terminalState) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "renewal binding changed");
+      const now = this.now();
+      if (Date.parse(lease.expiresAt) <= now) throw new ControlPlaneOwnershipError("EXPIRED", "expired lease requires reconciliation");
+      validExpiry(expiresAt, now);
+      if (Date.parse(expiresAt) <= Date.parse(lease.expiresAt)) throw new ControlPlaneOwnershipError("INVALID_INPUT", "renewal must extend expiry");
+      const result = this.sqlite.prepare("update control_plane_resource_leases set expires_at=?,version=version+1,updated_at=? where lease_id=? and version=? and owner_thread=? and terminal_state is null")
+        .run(expiresAt, new Date(now).toISOString(), leaseId, expectedVersion, owner.ownerThread);
+      if (result.changes !== 1) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "renewal raced");
+      return this.get(leaseId)!;
+    }).immediate();
+  }
+
+  reconcile(consumerContext: unknown, leaseId: string, expectedVersion: number, input: ReconciliationEvidence): ReconciliationReceipt {
+    const owner = ownerFor(this.options, consumerContext);
+    const evidence = canonicalReconciliation(input);
+    const evidenceJson = JSON.stringify(evidence);
+    if (!Number.isSafeInteger(expectedVersion) || expectedVersion < 1 || evidence.leaseVersion !== expectedVersion || evidence.leaseId !== leaseId || evidence.ownerThread !== owner.ownerThread) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "reconciliation identity mismatch");
+    return this.sqlite.transaction(() => {
+      const lease = this.get(leaseId);
+      if (!lease) throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "lease not found");
+      verifyGrant(this.options, immutable(lease.grant), immutable(owner));
+      this.assertCurrentGrant(lease.grant, lease.grantVersion);
+      if (lease.ownerThread !== owner.ownerThread || JSON.stringify(this.get(leaseId)) !== JSON.stringify(lease)) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "reconciliation owner changed");
+      const previous = this.sqlite.prepare("select * from control_plane_reconciliation_receipts where lease_id=? and previous_version=?").get(leaseId, expectedVersion) as {receipt_id:string;lease_id:string;previous_version:number;new_version:number;evidence_json:string;created_at:string} | undefined;
+      if (previous) {
+        if (previous.evidence_json !== evidenceJson) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "reconciliation replay payload changed");
+        return {schema: CONTROL_PLANE_SCHEMA, receiptId: previous.receipt_id, leaseId, previousVersion: previous.previous_version, newVersion: previous.new_version, evidence, createdAt: previous.created_at};
+      }
+      if (lease.terminalState || lease.version !== expectedVersion || lease.operationHandle !== evidence.operationHandle || lease.operation !== evidence.operation || lease.baseRevision !== evidence.baseRevision) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "reconciliation evidence does not match pinned operation");
+      // The injected verifier must establish terminal effect state, not transport failure.
+      if (this.options.verifyReconciliationEvidence?.(immutable(evidence), immutable(lease), immutable(owner)) !== true) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "trusted terminal effect proof required");
+      verifyGrant(this.options, immutable(lease.grant), immutable(owner));
+      this.assertCurrentGrant(lease.grant, lease.grantVersion);
+      if (JSON.stringify(this.get(leaseId)) !== JSON.stringify(lease)) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "lease changed during verification");
+      const now = this.now();
+      const receipt: ReconciliationReceipt = {schema: CONTROL_PLANE_SCHEMA, receiptId: `reconcile_${randomUUID()}`, leaseId, previousVersion: expectedVersion, newVersion: expectedVersion + 1, evidence, createdAt: new Date(now).toISOString()};
+      const result = this.sqlite.prepare("update control_plane_resource_leases set active_operation_handle=null,operation_state='finished',terminal_state=?,version=version+1,updated_at=? where lease_id=? and version=? and owner_thread=? and active_operation_handle=? and terminal_state is null")
+        .run(Date.parse(lease.expiresAt) <= now ? "expired_reconciled" : null, receipt.createdAt, leaseId, expectedVersion, owner.ownerThread, evidence.operationHandle);
+      if (result.changes !== 1) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "reconciliation raced");
+      this.sqlite.prepare("insert into control_plane_reconciliation_receipts(receipt_id,lease_id,previous_version,new_version,evidence_json,created_at) values(?,?,?,?,?,?)")
+        .run(receipt.receiptId, leaseId, expectedVersion, receipt.newVersion, evidenceJson, receipt.createdAt);
+      return receipt;
+    }).immediate();
+  }
+
   release(consumerContext: unknown, leaseId: string, expectedVersion: number): ResourceLease { return this.transition(consumerContext, leaseId, expectedVersion, "released"); }
   private transition(consumerContext: unknown, leaseId: string, expectedVersion: number, terminalState: "released" | "handed_off"): ResourceLease { const owner = ownerFor(this.options, consumerContext); const now = new Date(this.now()).toISOString(); const tx = this.sqlite.transaction(() => { const row = this.sqlite.prepare("select * from control_plane_resource_leases where lease_id=?").get(leaseId) as LeaseRow | undefined; if (!row) throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "lease not found"); const lease = rowLease(row); verifyGrant(this.options, lease.grant, owner); this.assertCurrentGrant(lease.grant, lease.grantVersion); if (lease.operationHandle) throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "active operation must finish or transfer before release"); const result = this.sqlite.prepare("update control_plane_resource_leases set terminal_state=?, version=version+1, updated_at=? where lease_id=? and owner_thread=? and version=? and terminal_state is null").run(terminalState, now, leaseId, owner.ownerThread, expectedVersion); if (result.changes !== 1) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "lease changed before transition"); return rowLease(this.sqlite.prepare("select * from control_plane_resource_leases where lease_id=?").get(leaseId) as LeaseRow); }); return tx.immediate(); }
   beginOperation(consumerContext: unknown, leaseId: string, expectedVersion: number, handle: string): ResourceLease { bounded(handle, "operation handle"); const owner = ownerFor(this.options, consumerContext); const now = new Date(this.now()).toISOString(); const tx = this.sqlite.transaction(() => { const row = this.sqlite.prepare("select * from control_plane_resource_leases where lease_id=?").get(leaseId) as LeaseRow | undefined; if (!row) throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "lease not found"); const lease = rowLease(row); verifyGrant(this.options, lease.grant, owner); this.assertCurrentGrant(lease.grant, lease.grantVersion); if (lease.ownerThread !== owner.ownerThread || lease.version !== expectedVersion || lease.terminalState || lease.operationHandle) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "operation pin no longer matches"); if (Date.parse(lease.expiresAt) <= this.now()) throw new ControlPlaneOwnershipError("EXPIRED", "lease is expired and requires reconciliation"); const result = this.sqlite.prepare("update control_plane_resource_leases set active_operation_handle=?, operation_state='active', version=version+1, updated_at=? where lease_id=? and owner_thread=? and version=? and terminal_state is null and active_operation_handle is null").run(handle, now, leaseId, owner.ownerThread, expectedVersion); if (result.changes !== 1) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "operation pin raced"); return rowLease(this.sqlite.prepare("select * from control_plane_resource_leases where lease_id=?").get(leaseId) as LeaseRow); }); return tx.immediate(); }

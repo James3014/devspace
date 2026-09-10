@@ -43,3 +43,132 @@ test("completion matrix uses opaque revision plus expected version CAS", () => {
 test("two independent processes race for one overlapping lease", async () => { const root = mkdtempSync(join(tmpdir(), "devspace-control-plane-race-")); const databasePath = join(root, "state.sqlite"); const script = `import Database from "better-sqlite3"; import { ControlPlaneOwnershipStore } from "./src/control-plane-ownership.ts"; const db = new Database(process.argv[1]); const o={resolveOwnerContext:(v)=>({ownerThread:String(v)}),verifyGrantEvidence:()=>true}; const s=new ControlPlaneOwnershipStore(db,o); try { s.putGrantEvidence(process.argv[2],{repository:"owner/repo",goal:"g",coordinatorThread:"c",evidenceHash:"h"},0); const l=s.acquire(process.argv[2],{repositoryKey:"owner/repo",resourceKind:"checkout",resourceId:"main",resource:"checkout",operation:"write",scope:["/repo/src"],baseRevision:"sha",expiresAt:new Date(Date.now()+60000).toISOString(),idempotencyKey:process.argv[2],grant:{repository:"owner/repo",goal:"g",coordinatorThread:"c",evidenceHash:"h"}}); console.log("won:"+l.ownerThread); } catch(e) { console.log("lost:"+(e.code||"error")); } finally { db.close(); }`;
   const run = (owner: string) => new Promise<string>((resolve) => { const child = spawn(process.execPath, ["--import", "tsx", "-e", script, databasePath, owner], { cwd: process.cwd() }); let out = ""; child.stdout.on("data", (chunk) => { out += chunk; }); child.on("close", () => resolve(out.trim())); });
   try { const results = await Promise.all([run("one"), run("two")]); assert.equal(results.filter((value) => value.startsWith("won:")).length, 1); assert.equal(results.filter((value) => value.startsWith("lost:")).length, 1); } finally { rmSync(root, { recursive: true, force: true }); } });
+
+test("C1 renew preserves identity and pin while fencing stale, expired and revoked authority", () => {
+  const sqlite = db(); let now = Date.now(); let allowed = true;
+  const store = new ControlPlaneOwnershipStore(sqlite, {...options, now: () => now, verifyGrantEvidence: () => allowed});
+  try {
+    const lease = store.acquire(context("owner"), input());
+    const pinned = store.beginOperation(context("owner"), lease.leaseId, 1, "effect-1");
+    const renewed = store.renew(context("owner"), lease.leaseId, 2, new Date(now + 120_000).toISOString());
+    assert.equal(renewed.version, 3);
+    for (const key of ["ownerThread", "resource", "baseRevision", "operationHandle", "grantVersion"] as const) assert.deepEqual(renewed[key], pinned[key]);
+    assert.deepEqual(renewed.scope, pinned.scope);
+    assert.throws(() => store.renew(context("other"), lease.leaseId, 3, new Date(now + 180_000).toISOString()));
+    assert.throws(() => store.renew(context("owner"), lease.leaseId, 2, new Date(now + 180_000).toISOString()));
+    assert.throws(() => store.renew(context("owner"), lease.leaseId, 3, renewed.expiresAt));
+    assert.throws(() => store.renew(context("owner"), lease.leaseId, 3, new Date(now + 25 * 3600_000).toISOString()));
+    allowed = false;
+    assert.throws(() => store.renew(context("owner"), lease.leaseId, 3, new Date(now + 180_000).toISOString()));
+    allowed = true; now += 121_000;
+    assert.throws(() => store.renew(context("owner"), lease.leaseId, 3, new Date(now + 180_000).toISOString()));
+    assert.equal(store.get(lease.leaseId)?.operationHandle, "effect-1");
+  } finally { sqlite.close(); }
+});
+
+test("C1 reconcile requires exact trusted terminal proof, retains unknown pin and atomically replays after reopen", () => {
+  const root = mkdtempSync(join(tmpdir(), "devspace-reconcile-")); const path = join(root, "state.sqlite");
+  let sqlite = new Database(path); let now = Date.now(); let allowed = true; let verified: unknown = true;
+  const opts = {...options, now: () => now, verifyGrantEvidence: () => allowed,
+    verifyReconciliationEvidence: () => verified as boolean};
+  let store = new ControlPlaneOwnershipStore(sqlite, opts);
+  try {
+    store.putGrantEvidence(context("owner"), grant, 0);
+    const lease = store.acquire(context("owner"), input());
+    store.beginOperation(context("owner"), lease.leaseId, 1, "effect-1");
+    const evidence = {leaseId: lease.leaseId, ownerThread: "owner", operationHandle: "effect-1", operation: "write", baseRevision: "sha-a", leaseVersion: 2, state: "finished" as const};
+    for (const state of ["unknown", "running", "not_running"] as const) assert.throws(() => store.reconcile(context("owner"), lease.leaseId, 2, {...evidence, state}));
+    for (const wrong of [{ownerThread: "other"}, {operationHandle: "wrong"}, {operation: "wrong"}, {baseRevision: "wrong"}, {leaseVersion: 1}]) assert.throws(() => store.reconcile(context("owner"), lease.leaseId, 2, {...evidence, ...wrong}));
+    for (const value of [false, undefined, "true", Promise.resolve(true)]) { verified = value; assert.throws(() => store.reconcile(context("owner"), lease.leaseId, 2, evidence)); }
+    verified = true;
+    sqlite.exec("create trigger deny_receipt before insert on control_plane_reconciliation_receipts begin select raise(ABORT, 'injected receipt failure'); end");
+    assert.throws(() => store.reconcile(context("owner"), lease.leaseId, 2, evidence), /injected receipt failure/);
+    assert.equal(store.get(lease.leaseId)?.version, 2); assert.equal(store.get(lease.leaseId)?.operationHandle, "effect-1");
+    sqlite.exec("drop trigger deny_receipt");
+    now += 61_000;
+    assert.throws(() => store.reconcile(context("owner"), lease.leaseId, 2, {...evidence, state: "unknown"}));
+    assert.throws(() => store.acquire(context("other"), {...input(), expiresAt: new Date(now + 60_000).toISOString(), idempotencyKey: "steal"}));
+    const receipt = store.reconcile(context("owner"), lease.leaseId, 2, evidence);
+    assert.equal(receipt.newVersion, 3); assert.equal(store.get(lease.leaseId)?.terminalState, "expired_reconciled");
+    assert.equal(store.get(lease.leaseId)?.operationHandle, undefined);
+    sqlite.close(); sqlite = new Database(path); store = new ControlPlaneOwnershipStore(sqlite, opts);
+    assert.deepEqual(store.reconcile(context("owner"), lease.leaseId, 2, evidence), receipt);
+    assert.throws(() => store.reconcile(context("owner"), lease.leaseId, 2, {...evidence, detail: "changed"}));
+    allowed = false; assert.throws(() => store.reconcile(context("owner"), lease.leaseId, 2, evidence));
+    assert.equal((sqlite.prepare("select count(*) n from control_plane_reconciliation_receipts").get() as {n:number}).n, 1);
+  } finally { sqlite.close(); rmSync(root, {recursive:true, force:true}); }
+});
+
+test("C1 successful reconciliation retains unexpired ownership and replay never clears a newer pin", () => {
+  const sqlite = db();
+  const store = new ControlPlaneOwnershipStore(sqlite, {...options, verifyReconciliationEvidence: (e, l, o) => {
+    assert.ok(Object.isFrozen(e) && Object.isFrozen(l) && Object.isFrozen(l.grant) && Object.isFrozen(o)); return true;
+  }});
+  try {
+    const lease = store.acquire(context("owner"), input()); store.beginOperation(context("owner"), lease.leaseId, 1, "old");
+    const evidence = {leaseId:lease.leaseId, ownerThread:"owner", operationHandle:"old", operation:"write", baseRevision:"sha-a", leaseVersion:2, state:"failed" as const};
+    const receipt = store.reconcile(context("owner"), lease.leaseId, 2, evidence);
+    assert.equal(store.get(lease.leaseId)?.terminalState, undefined);
+    store.beginOperation(context("owner"), lease.leaseId, 3, "new");
+    assert.deepEqual(store.reconcile(context("owner"), lease.leaseId, 2, evidence), receipt);
+    assert.equal(store.get(lease.leaseId)?.operationHandle, "new"); assert.equal(store.get(lease.leaseId)?.version, 4);
+    store.putGrantEvidence(context("owner"), {...grant, evidenceHash:"hash"}, 1);
+    assert.throws(() => store.reconcile(context("owner"), lease.leaseId, 2, evidence), ControlPlaneOwnershipError);
+  } finally { sqlite.close(); }
+});
+
+test("C1 callback mutation, throw and missing verifier roll back; grant ABA and legacy unbound deny", () => {
+  for (const scenario of ["reenter", "throw", "missing", "aba", "legacy"] as const) {
+    const sqlite = db();
+    const store = new ControlPlaneOwnershipStore(sqlite, {...options, verifyGrantEvidence: () => true,
+      ...(scenario === "missing" ? {} : {verifyReconciliationEvidence: () => {
+        if (scenario === "throw") throw Error("verifier failed");
+        if (scenario === "reenter") sqlite.prepare("update control_plane_resource_leases set version=version+1").run();
+        return true;
+      }})});
+    try {
+      const lease = store.acquire(context("owner"), input()); store.beginOperation(context("owner"), lease.leaseId, 1, "op");
+      if (scenario === "aba") {store.putGrantEvidence(context("owner"), {...grant,evidenceHash:"h2"},1);store.putGrantEvidence(context("owner"), grant,2);}
+      if (scenario === "legacy") sqlite.prepare("update control_plane_resource_leases set grant_version=0").run();
+      const evidence = {leaseId:lease.leaseId, ownerThread:"owner", operationHandle:"op", operation:"write", baseRevision:"sha-a", leaseVersion:2, state:"finished" as const};
+      assert.throws(() => store.reconcile(context("owner"), lease.leaseId, 2, evidence));
+      const row = sqlite.prepare("select version,active_operation_handle from control_plane_resource_leases").get();
+      assert.deepEqual(row, {version:2, active_operation_handle:"op"});
+      assert.equal((sqlite.prepare("select count(*) n from control_plane_reconciliation_receipts").get() as {n:number}).n, 0);
+      if (scenario === "aba" || scenario === "legacy") assert.throws(() => store.renew(context("owner"),lease.leaseId,2,new Date(Date.now()+120000).toISOString()));
+    } finally { sqlite.close(); }
+  }
+});
+
+test("C1 two processes race at renewal/reconciliation CAS after grant is seeded", async () => {
+  for (const action of ["renew", "reconcile"] as const) {
+    const root = mkdtempSync(join(tmpdir(), "devspace-c1-race-")); const path=join(root,"state.sqlite");
+    const sqlite = new Database(path); const store = new ControlPlaneOwnershipStore(sqlite, options);
+    store.putGrantEvidence(context("owner"), grant, 0);
+    const lease=store.acquire(context("owner"),input()); store.beginOperation(context("owner"),lease.leaseId,1,"op"); sqlite.close();
+    const script = `import Database from 'better-sqlite3'; import {ControlPlaneOwnershipStore} from './src/control-plane-ownership.ts';
+      const db=new Database(process.argv[1]);db.pragma('busy_timeout=5000');
+      const s=new ControlPlaneOwnershipStore(db,{resolveOwnerContext:()=>({ownerThread:'owner'}),verifyGrantEvidence:()=>true,verifyReconciliationEvidence:()=>true});
+      process.stdout.write('ready\\n'); process.stdin.once('data',()=>{try {
+        if(process.argv[3]==='renew') s.renew({},process.argv[2],2,new Date(Date.now()+120000+Number(process.argv[4])*1000).toISOString());
+        else s.reconcile({},process.argv[2],2,{leaseId:process.argv[2],ownerThread:'owner',operationHandle:'op',operation:'write',baseRevision:'sha-a',leaseVersion:2,state:'finished',detail:process.argv[4]});
+        console.log('won');
+      }catch(e){console.log('lost:'+e.code)}finally{db.close()}});`;
+    const children = ["1","2"].map(n => {
+      const child=spawn(process.execPath,["--import","tsx","--input-type=module","-e",script,path,lease.leaseId,action,n],{cwd:process.cwd()});
+      let output=""; let error="";
+      const ready=new Promise<void>((resolve,reject)=>{child.on('error',reject);child.stdout.on('data',chunk=>{output+=chunk;if(output.includes('ready'))resolve()});});
+      const done=new Promise<string>((resolve,reject)=>{child.stderr.on('data',chunk=>error+=chunk);child.on('close',code=>code===0?resolve(output):reject(Error(error)));});
+      return {child,ready,done};
+    });
+    try {
+      await Promise.all(children.map(c=>c.ready)); children.forEach(c=>c.child.stdin.end('go'));
+      const results=await Promise.all(children.map(c=>c.done));
+      assert.equal(results.filter(r=>r.includes('\nwon')).length,1); assert.equal(results.filter(r=>r.includes('lost:CAS_CONFLICT')).length,1);
+      const reopened=new Database(path);try {
+        assert.equal((reopened.prepare('select version from control_plane_resource_leases').get() as {version:number}).version,3);
+        assert.equal((reopened.prepare('select count(*) n from control_plane_reconciliation_receipts').get() as {n:number}).n,action==='reconcile'?1:0);
+      } finally {reopened.close();}
+    } finally {children.forEach(c=>c.child.kill());rmSync(root,{recursive:true,force:true});}
+  }
+});
