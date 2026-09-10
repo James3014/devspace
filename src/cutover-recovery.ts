@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isDeepStrictEqual } from "node:util";
 import { loadConfig } from "./config.js";
 import {
   BUILD_IDENTITY_RELATIVE_PATH,
@@ -585,6 +586,19 @@ export async function performNativeCrossDomainBindingRepair(
       schema: CUTOVER_BINDING_REPAIR_SCHEMA,
       cutoverId: options.cutoverId,
       reason: CUTOVER_BINDING_REPAIR_REASON,
+      repairControlSurfaceIdentity: options.requesterIdentity,
+      observedTargetRuntimeIdentity: {
+        serverInstanceId,
+        sourceCommit,
+        buildId,
+        capabilityManifestSha256,
+      },
+      originalCutoverExpectedIdentity: before.expectedNewIdentity,
+      effectiveRepairedIdentity: {
+        sourceCommit,
+        buildId,
+        capabilityManifestSha256,
+      },
       originalBoundDigest: before.expectedNewIdentity.capabilityManifestSha256!,
       originalDigestField: "expectedNewIdentity.capabilityManifestSha256",
       provenActualDigestDomain: "build_manifest_sha256",
@@ -597,6 +611,25 @@ export async function performNativeCrossDomainBindingRepair(
       repairedAt: nowIso,
       physicalProbeEvidence: `Target package at ${targetRoot} verified: build_manifest_sha256=${targetPackage.buildManifestSha256} equals expectedNewIdentity.capabilityManifestSha256.`,
     };
+
+    // Atomic CAS check before durable write (G71-R6)
+    const latest = store.get();
+    if (!latest || latest.cutoverId !== before.cutoverId) {
+      throw new CutoverStateError("Concurrent modification detected: active cutover changed during repair evaluation.");
+    }
+    if (latest.phase !== "drained") {
+      throw new CutoverStateError(`Concurrent modification detected: cutover phase transitioned to ${latest.phase}.`);
+    }
+    if (latest.updatedAt !== before.updatedAt) {
+      throw new CutoverStateError("Concurrent modification detected: cutover was updated during repair evaluation.");
+    }
+    if (latest.expectedNewIdentity.capabilityManifestSha256 !== before.expectedNewIdentity.capabilityManifestSha256) {
+      throw new CutoverStateError("Concurrent modification detected: expectedNewIdentity changed during repair evaluation.");
+    }
+    if (latest.bindingRepair && !isDeepStrictEqual(latest.bindingRepair, repairReceipt)) {
+      throw new CutoverStateError("Concurrent modification detected: conflicting bindingRepair already recorded.");
+    }
+
     store.recordBindingRepair(options.cutoverId, repairReceipt);
 
     const witness: DurableReconciliationWitness = {
@@ -619,6 +652,7 @@ export async function performNativeCrossDomainBindingRepair(
       closedByServerInstanceId: serverInstanceId,
       ...witness,
       reconciledAt: nowIso,
+      terminalReason: undefined,
     };
     const closed = store.close(options.cutoverId, reconciliationReceipt);
     committedRecord = closed;

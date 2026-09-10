@@ -82,6 +82,7 @@ export interface ExpectedCutoverIdentity {
  */
 export function effectiveExpectedIdentity(record: DurableCutoverRecord): ExpectedCutoverIdentity {
   if (record.bindingRepair) {
+    assertValidBindingRepair(record.bindingRepair, record);
     return {
       sourceCommit: record.expectedNewIdentity.sourceCommit,
       buildId: record.expectedNewIdentity.buildId,
@@ -178,6 +179,12 @@ export interface CutoverBindingRepairReceipt {
   schema: typeof CUTOVER_BINDING_REPAIR_SCHEMA;
   cutoverId: string;
   reason: typeof CUTOVER_BINDING_REPAIR_REASON;
+  // 4 distinct identities required by G71-R1
+  repairControlSurfaceIdentity: CutoverServerIdentity;
+  observedTargetRuntimeIdentity: CutoverServerIdentity;
+  originalCutoverExpectedIdentity: ExpectedCutoverIdentity;
+  effectiveRepairedIdentity: ExpectedCutoverIdentity;
+
   originalBoundDigest: string;
   originalDigestField: "expectedNewIdentity.capabilityManifestSha256";
   provenActualDigestDomain: "build_manifest_sha256";
@@ -988,15 +995,7 @@ function parseRecord(raw: string): DurableCutoverRecord {
   }
   const record = value as DurableCutoverRecord;
   if (record.bindingRepair) {
-    const repair = record.bindingRepair;
-    if (
-      repair.cutoverId !== record.cutoverId ||
-      repair.originalBoundDigest !== record.expectedNewIdentity.capabilityManifestSha256 ||
-      repair.sourceCommit !== record.expectedNewIdentity.sourceCommit ||
-      repair.buildId !== record.expectedNewIdentity.buildId
-    ) {
-      throw new CutoverStateError("Durable cutover record is malformed; binding repair receipt is inconsistent.");
-    }
+    assertValidBindingRepair(record.bindingRepair, record);
   }
   if (record.observedReplacement) {
     const receipt = record.observedReplacement;
@@ -1111,8 +1110,41 @@ function isBindingRepairReceipt(value: unknown): value is CutoverBindingRepairRe
     typeof receipt.repairedAt === "string" &&
     Number.isFinite(Date.parse(receipt.repairedAt)) &&
     typeof receipt.physicalProbeEvidence === "string" &&
-    receipt.physicalProbeEvidence.length > 0,
+    receipt.physicalProbeEvidence.length > 0 &&
+    (!receipt.repairControlSurfaceIdentity || isIdentity(receipt.repairControlSurfaceIdentity)) &&
+    (!receipt.observedTargetRuntimeIdentity || isIdentity(receipt.observedTargetRuntimeIdentity)) &&
+    (!receipt.originalCutoverExpectedIdentity || isExpectedIdentity(receipt.originalCutoverExpectedIdentity)) &&
+    (!receipt.effectiveRepairedIdentity || isExpectedIdentity(receipt.effectiveRepairedIdentity)),
   );
+}
+
+export function assertValidBindingRepair(
+  repair: CutoverBindingRepairReceipt,
+  record: DurableCutoverRecord,
+): void {
+  if (
+    repair.schema !== CUTOVER_BINDING_REPAIR_SCHEMA ||
+    repair.cutoverId !== record.cutoverId ||
+    repair.reason !== CUTOVER_BINDING_REPAIR_REASON ||
+    repair.originalBoundDigest !== record.expectedNewIdentity.capabilityManifestSha256 ||
+    repair.sourceCommit !== record.expectedNewIdentity.sourceCommit ||
+    repair.buildId !== record.expectedNewIdentity.buildId ||
+    (repair.effectiveRepairedIdentity &&
+      (repair.effectiveRepairedIdentity.sourceCommit !== record.expectedNewIdentity.sourceCommit ||
+        repair.effectiveRepairedIdentity.buildId !== record.expectedNewIdentity.buildId ||
+        repair.effectiveRepairedIdentity.capabilityManifestSha256 !== repair.correctCapabilityManifestSha256)) ||
+    (repair.observedTargetRuntimeIdentity &&
+      (repair.observedTargetRuntimeIdentity.serverInstanceId !== repair.observedServerInstanceId ||
+        repair.observedTargetRuntimeIdentity.sourceCommit !== record.expectedNewIdentity.sourceCommit ||
+        repair.observedTargetRuntimeIdentity.buildId !== record.expectedNewIdentity.buildId)) ||
+    (repair.originalCutoverExpectedIdentity &&
+      (repair.originalCutoverExpectedIdentity.sourceCommit !== record.expectedNewIdentity.sourceCommit ||
+        repair.originalCutoverExpectedIdentity.buildId !== record.expectedNewIdentity.buildId ||
+        repair.originalCutoverExpectedIdentity.capabilityManifestSha256 !== record.expectedNewIdentity.capabilityManifestSha256)) ||
+    repair.observedServerInstanceId === record.oldServerIdentity.serverInstanceId
+  ) {
+    throw new CutoverStateError("Durable cutover record is malformed; binding repair receipt is inconsistent.");
+  }
 }
 
 function isSupersessionReceipt(value: unknown): value is CutoverSupersessionReceipt {

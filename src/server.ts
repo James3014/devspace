@@ -1331,6 +1331,7 @@ export interface CutoverMcpControlContext {
     newlyRecovered: boolean;
     mode: CutoverMode;
   }>;
+  canRepairBinding?: (cutoverId: string) => boolean;
   executeBindingRepair?: (input: {
     cutoverId: string;
     workspaceId: string;
@@ -1709,11 +1710,13 @@ function registerCutoverMcpTools(
           activeRecord &&
           activeRecord.cutoverId === cutoverId &&
           activeRecord.phase === "drained" &&
+          activeRecord.restartRequest?.restartScheduledAt &&
           comparison &&
           comparison.serverInstanceChanged &&
           comparison.sourceMatches &&
           comparison.buildMatches &&
           !comparison.capabilityManifestMatches &&
+          control.canRepairBinding?.(cutoverId) &&
           control.executeBindingRepair
         ) {
           record = await control.executeBindingRepair({ cutoverId, workspaceId, agentId });
@@ -4722,6 +4725,14 @@ export function createServer(
       schema: CUTOVER_BINDING_REPAIR_SCHEMA,
       cutoverId: input.cutoverId,
       reason: CUTOVER_BINDING_REPAIR_REASON,
+      repairControlSurfaceIdentity: current,
+      observedTargetRuntimeIdentity: current,
+      originalCutoverExpectedIdentity: active.expectedNewIdentity,
+      effectiveRepairedIdentity: {
+        sourceCommit: current.sourceCommit,
+        buildId: current.buildId,
+        capabilityManifestSha256: current.capabilityManifestSha256,
+      },
       originalBoundDigest: active.expectedNewIdentity.capabilityManifestSha256,
       originalDigestField: "expectedNewIdentity.capabilityManifestSha256",
       provenActualDigestDomain: "build_manifest_sha256",
@@ -4750,6 +4761,25 @@ export function createServer(
       witnessKind: "exact-pair",
       detail: [{ unit: "native-mcp", ok: true, detail: "cross-domain digest misbinding repaired and reconciled" }],
     }));
+  };
+
+  const canRepairBinding = (cutoverId: string): boolean => {
+    const active = cutoverController.record();
+    if (!active || active.cutoverId !== cutoverId || active.phase !== "drained") return false;
+    if (!active.restartRequest?.restartScheduledAt) return false;
+    try {
+      const targetRoot =
+        config.mcpCutoverBuildReadyRoot ??
+        process.env.DEVSPACE_PACKAGE_ROOT ??
+        resolve(dirname(fileURLToPath(import.meta.url)), "..");
+      const probed = probeTargetPackage(targetRoot);
+      return Boolean(
+        probed.buildManifestSha256 &&
+        probed.buildManifestSha256 === active.expectedNewIdentity.capabilityManifestSha256,
+      );
+    } catch {
+      return false;
+    }
   };
 
   const codexGoals = config.codexGoalsEnabled
@@ -5073,6 +5103,7 @@ export function createServer(
             ...(advanceCutover ? { advance: advanceCutover } : {}),
             enumerateReconciliation: enumerateDurableReconciliationState,
             executeObservedReplacementRecovery,
+            canRepairBinding,
             executeBindingRepair,
           },
 

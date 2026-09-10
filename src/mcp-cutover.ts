@@ -233,6 +233,13 @@ export class McpCutoverController {
   status(transportEvidence: CutoverDrainEvidence): Record<string, unknown> {
     const record = this.store.get();
     const superseded = this.store.supersededRecord();
+    const repairObservability = record?.bindingRepair
+      ? {
+          originalExpectedIdentity: record.expectedNewIdentity,
+          effectiveExpectedIdentity: effectiveExpectedIdentity(record),
+          bindingRepair: record.bindingRepair,
+        }
+      : {};
     return {
       cutover: record,
       supersededCutover:
@@ -241,6 +248,7 @@ export class McpCutoverController {
           : undefined,
       currentServerIdentity: this.currentIdentity,
       comparison: record ? compareServerIdentity(record, this.currentIdentity) : undefined,
+      ...repairObservability,
       transportEvidence,
       mode: this.mode(),
       reconciliationRequired: Boolean(record && record.phase !== "closed"),

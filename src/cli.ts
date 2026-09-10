@@ -792,14 +792,23 @@ async function runCutoverCommand(args: string[]): Promise<void> {
     const status = cutoverSeamStatus(resolveSeamStateDir());
     if (json) printJson(status);
     else {
-      const active = status.active as { cutoverId?: string; phase?: string } | undefined;
+      const active = status.active as {
+        cutoverId?: string;
+        phase?: string;
+        expectedNewIdentity?: { capabilityManifestSha256?: string };
+        bindingRepair?: { correctCapabilityManifestSha256?: string; reason?: string };
+      } | undefined;
       const superseded = status.superseded as { cutoverId?: string; phase?: string } | undefined;
-      console.log(
-        [
-          `Active cutover: ${active ? `${active.cutoverId} (${active.phase})` : "none"}`,
-          `Terminally superseded: ${superseded ? superseded.cutoverId : "none"}`,
-        ].join("\n"),
-      );
+      const lines = [
+        `Active cutover: ${active ? `${active.cutoverId} (${active.phase})` : "none"}`,
+        `Terminally superseded: ${superseded ? superseded.cutoverId : "none"}`,
+      ];
+      if (active?.bindingRepair) {
+        lines.push(
+          `Repaired binding: original capability=${active.expectedNewIdentity?.capabilityManifestSha256}; effective capability=${active.bindingRepair.correctCapabilityManifestSha256}; reason=${active.bindingRepair.reason}`,
+        );
+      }
+      console.log(lines.join("\n"));
     }
     return;
   }
@@ -829,18 +838,9 @@ function printCutoverHelp(): void {
       "",
       "Usage:",
       "  devspace cutover status [--json]",
-      "  devspace cutover recover --cutover-id <id> --expected-source-commit <40hex> --expected-build-id <id>",
+      "  devspace cutover recover --cutover-id <id> --commit <sha> --build-id <id> [--capability-sha <sha>] [--package-root <path>] [--json]",
       "  devspace cutover observe --cutover-id <id> --workspace-id <id> --agent-id <id> [--json]",
-      "  devspace cutover repair --cutover-id <id> --workspace-id <id> --agent-id <id> [--package-root <path>] [--json]",
-      "      [--expected-capability-manifest-sha256 <64hex>] [--active-sessions <n>] [--oldest-age-ms <n>]",
-      "      [--build-ready-verified-by <identity>] [--build-ready-evidence <detail>] [--expires-at <ISO>] [--json]",
-      "",
-      "The recover subcommand supersedes one stale unresolved cutover lease and",
-      "establishes its successor bound to the expected target, then durably drains,",
-      "requests, and schedules the successor restart. It never restarts the service;",
-      "the operator performs the single launchctl kickstart after the durable",
-      "restart-scheduled marker exists. Requires the configured state directory and",
-      "either a configured DEVSPACE_BUILD_READY_ROOT probe or --build-ready-verified-by.",
+      "  devspace cutover repair --cutover-id <id> --workspace-id <id> --agent-id <id> [--server-url <url>] [--package-root <path>] [--state-dir <path>] [--json]",
       "",
       "The repair subcommand repairs a successor cutover blocked by CROSS_DOMAIN_DIGEST_MISBINDING",
       "where the target build-manifest digest was mistakenly bound as the capability manifest digest.",
@@ -900,6 +900,8 @@ async function runCutoverRepair(args: string[]): Promise<void> {
   let workspaceId: string | undefined;
   let agentId: string | undefined;
   let packageRoot: string | undefined;
+  let serverUrl: string | undefined;
+  let stateDir: string | undefined;
   let json = false;
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
@@ -913,27 +915,30 @@ async function runCutoverRepair(args: string[]): Promise<void> {
     else if (argument === "--workspace-id") workspaceId = value();
     else if (argument === "--agent-id") agentId = value();
     else if (argument === "--package-root") packageRoot = value();
+    else if (argument === "--server-url") serverUrl = value();
+    else if (argument === "--state-dir") stateDir = value();
     else throw new Error(`Unknown cutover repair flag: ${argument}`);
   }
   if (!cutoverId || !workspaceId || !agentId) {
-    throw new Error("Usage: devspace cutover repair --cutover-id <id> --workspace-id <id> --agent-id <id> [--package-root <path>] [--json]");
+    throw new Error("Usage: devspace cutover repair --cutover-id <id> --workspace-id <id> --agent-id <id> [--server-url <url>] [--package-root <path>] [--state-dir <path>] [--json]");
   }
   const config = loadConfig();
   const requesterIdentity = readRunningBuildIdentity(runningPackageRoot());
   if (!requesterIdentity) {
     throw new Error("Unable to read the executing accepted build identity; refusing cross-domain binding repair.");
   }
-  const endpoint = new URL(`http://${config.host}:${config.port}/mcp`);
+  const endpoint = serverUrl ? new URL(serverUrl) : new URL(`http://${config.host}:${config.port}/mcp`);
+  const effectivePackageRoot = packageRoot ?? config.mcpCutoverBuildReadyRoot ?? process.env.DEVSPACE_PACKAGE_ROOT ?? runningPackageRoot();
   const result = await performNativeCrossDomainBindingRepair({
     serverUrl: endpoint,
     publicBaseUrl: new URL(config.publicBaseUrl),
-    stateDir: config.stateDir,
+    stateDir: stateDir ?? config.stateDir,
     cutoverId,
     workspaceId,
     agentId,
     ownerToken: config.oauth.ownerToken,
     requesterIdentity,
-    ...(packageRoot ? { packageRoot } : {}),
+    packageRoot: effectivePackageRoot,
   });
   if (json) {
     printJson(result);

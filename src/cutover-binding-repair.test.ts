@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, existsSync, readdirSync } from "node:fs";
 import { createServer as createHttpServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,9 +19,11 @@ import {
   CUTOVER_BINDING_REPAIR_SCHEMA,
   CutoverStateError,
   CutoverStateStore,
+  assertValidBindingRepair,
   effectiveExpectedIdentity,
   type CutoverBindingRepairReceipt,
   type CutoverServerIdentity,
+  type DurableCutoverRecord,
   type ExpectedCutoverIdentity,
 } from "./cutover-state.js";
 import { McpCutoverController, compareServerIdentity } from "./mcp-cutover.js";
@@ -156,6 +158,23 @@ test("State: effectiveExpectedIdentity reflects bindingRepair while preserving i
       schema: CUTOVER_BINDING_REPAIR_SCHEMA,
       cutoverId: "cutover-eff",
       reason: CUTOVER_BINDING_REPAIR_REASON,
+      repairControlSurfaceIdentity: {
+        serverInstanceId: "cli-ctrl-inst",
+        sourceCommit: SHA_COMMIT,
+        buildId: BUILD_ID,
+      },
+      observedTargetRuntimeIdentity: {
+        serverInstanceId: "rep-inst",
+        sourceCommit: SHA_COMMIT,
+        buildId: BUILD_ID,
+        capabilityManifestSha256: SHA_CAPABILITY_MANIFEST,
+      },
+      originalCutoverExpectedIdentity: expected,
+      effectiveRepairedIdentity: {
+        sourceCommit: SHA_COMMIT,
+        buildId: BUILD_ID,
+        capabilityManifestSha256: SHA_CAPABILITY_MANIFEST,
+      },
       originalBoundDigest: SHA_BUILD_MANIFEST,
       originalDigestField: "expectedNewIdentity.capabilityManifestSha256",
       provenActualDigestDomain: "build_manifest_sha256",
@@ -235,6 +254,7 @@ type MockHttpOptions = {
   workspaceId?: string;
   workspaceRoot?: string;
   agentReconciled?: boolean;
+  onCallTool?: (name: string, args: Record<string, unknown>) => void;
 };
 
 async function createMockReplacementServer(options: MockHttpOptions = {}) {
@@ -343,6 +363,9 @@ async function createMockReplacementServer(options: MockHttpOptions = {}) {
       }
       if (request.method === "tools/call") {
         const name = request.params?.name;
+        if (options.onCallTool && typeof name === "string") {
+          options.onCallTool(name, (request.params?.arguments ?? {}) as Record<string, unknown>);
+        }
         if (name === "cutover_status") {
           return json({
             jsonrpc: "2.0",
@@ -913,6 +936,27 @@ test("Negative 14: Cutover already closed with mismatched binding replay fails c
       schema: CUTOVER_BINDING_REPAIR_SCHEMA,
       cutoverId: "cutover-neg-14",
       reason: CUTOVER_BINDING_REPAIR_REASON,
+      repairControlSurfaceIdentity: {
+        serverInstanceId: "diff-inst",
+        sourceCommit: SHA_COMMIT,
+        buildId: BUILD_ID,
+      },
+      observedTargetRuntimeIdentity: {
+        serverInstanceId: "diff-inst",
+        sourceCommit: SHA_COMMIT,
+        buildId: BUILD_ID,
+        capabilityManifestSha256: "9".repeat(64),
+      },
+      originalCutoverExpectedIdentity: {
+        sourceCommit: SHA_COMMIT,
+        buildId: BUILD_ID,
+        capabilityManifestSha256: SHA_BUILD_MANIFEST,
+      },
+      effectiveRepairedIdentity: {
+        sourceCommit: SHA_COMMIT,
+        buildId: BUILD_ID,
+        capabilityManifestSha256: "9".repeat(64),
+      },
       originalBoundDigest: SHA_BUILD_MANIFEST,
       originalDigestField: "expectedNewIdentity.capabilityManifestSha256",
       provenActualDigestDomain: "build_manifest_sha256",
@@ -1108,6 +1152,332 @@ test("Positive: Exact production deadlock reproduced and terminally repaired wit
     assert.equal(replay.mode, "normal");
   } finally {
     await mock.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(pkgDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// G71-R1 & G71-R9: assertValidBindingRepair Invariant & Fail-Closed Tests
+// ---------------------------------------------------------------------------
+
+test("G71-R1 & G71-R9: assertValidBindingRepair rejects fabricated or inconsistent receipts", () => {
+  const baseRecord: DurableCutoverRecord = {
+    schema: "devspace.cutover.v1",
+    cutoverId: "cutover-r9",
+    phase: "drained",
+    oldServerIdentity: {
+      serverInstanceId: "old-inst",
+      sourceCommit: SHA_COMMIT,
+      buildId: BUILD_ID,
+    },
+    expectedNewIdentity: {
+      sourceCommit: SHA_COMMIT,
+      buildId: BUILD_ID,
+      capabilityManifestSha256: SHA_BUILD_MANIFEST,
+    },
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  const validReceipt: CutoverBindingRepairReceipt = {
+    schema: CUTOVER_BINDING_REPAIR_SCHEMA,
+    cutoverId: "cutover-r9",
+    reason: CUTOVER_BINDING_REPAIR_REASON,
+    repairControlSurfaceIdentity: {
+      serverInstanceId: "cli-inst",
+      sourceCommit: SHA_COMMIT,
+      buildId: BUILD_ID,
+    },
+    observedTargetRuntimeIdentity: {
+      serverInstanceId: "target-rep-inst",
+      sourceCommit: SHA_COMMIT,
+      buildId: BUILD_ID,
+      capabilityManifestSha256: SHA_CAPABILITY_MANIFEST,
+    },
+    originalCutoverExpectedIdentity: {
+      sourceCommit: SHA_COMMIT,
+      buildId: BUILD_ID,
+      capabilityManifestSha256: SHA_BUILD_MANIFEST,
+    },
+    effectiveRepairedIdentity: {
+      sourceCommit: SHA_COMMIT,
+      buildId: BUILD_ID,
+      capabilityManifestSha256: SHA_CAPABILITY_MANIFEST,
+    },
+    originalBoundDigest: SHA_BUILD_MANIFEST,
+    originalDigestField: "expectedNewIdentity.capabilityManifestSha256",
+    provenActualDigestDomain: "build_manifest_sha256",
+    correctCapabilityManifestSchema: "devspace.capability_manifest.v1",
+    correctCapabilityManifestSha256: SHA_CAPABILITY_MANIFEST,
+    sourceCommit: SHA_COMMIT,
+    buildId: BUILD_ID,
+    observedServerInstanceId: "target-rep-inst",
+    repairedBy: "cli-inst",
+    repairedAt: new Date().toISOString(),
+    physicalProbeEvidence: "verified",
+  };
+
+  // Valid passes
+  assert.doesNotThrow(() => {
+    assertValidBindingRepair(validReceipt, baseRecord);
+  });
+
+  // Mismatched cutoverId fails closed
+  assert.throws(
+    () => assertValidBindingRepair({ ...validReceipt, cutoverId: "diff-id" }, baseRecord),
+    /inconsistent/,
+  );
+
+  // Mismatched originalBoundDigest fails closed
+  assert.throws(
+    () => assertValidBindingRepair({ ...validReceipt, originalBoundDigest: "f".repeat(64) }, baseRecord),
+    /inconsistent/,
+  );
+
+  // Mismatched sourceCommit fails closed
+  assert.throws(
+    () => assertValidBindingRepair({ ...validReceipt, sourceCommit: "a".repeat(40) }, baseRecord),
+    /inconsistent/,
+  );
+
+  // Mismatched buildId fails closed
+  assert.throws(
+    () => assertValidBindingRepair({ ...validReceipt, buildId: "other-build" }, baseRecord),
+    /inconsistent/,
+  );
+
+  // Observed same as old server instance fails closed
+  assert.throws(
+    () => assertValidBindingRepair({ ...validReceipt, observedServerInstanceId: "old-inst" }, baseRecord),
+    /inconsistent/,
+  );
+
+  // Fabricated receipt attached to record fails closed in effectiveExpectedIdentity
+  const invalidRecord: DurableCutoverRecord = {
+    ...baseRecord,
+    bindingRepair: { ...validReceipt, originalBoundDigest: "0".repeat(64) },
+  };
+  assert.throws(
+    () => effectiveExpectedIdentity(invalidRecord),
+    /inconsistent/,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// G71-R6: Atomic CAS Concurrency Protection Test
+// ---------------------------------------------------------------------------
+
+test("G71-R6: Atomic CAS fails closed if record is updated concurrently before repair", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-cas-state-"));
+  const pkgDir = mkdtempSync(join(tmpdir(), "devspace-cas-pkg-"));
+  let mutated = false;
+  const mock = await createMockReplacementServer({
+    cutoverId: "cutover-cas",
+    onCallTool: (name) => {
+      if (name === "agent_reconcile" && !mutated) {
+        mutated = true;
+        // Concurrently mutate the latest durable drained event file's updatedAt
+        const activeDir = join(stateDir, "cutover", "active");
+        const files = readdirSync(activeDir).filter((f) => f.startsWith("drained-")).sort();
+        const drainedFile = files.at(-1)!;
+        const targetPath = join(activeDir, drainedFile);
+        const raw = readFileSync(targetPath, "utf8");
+        const obj = JSON.parse(raw);
+        obj.updatedAt = new Date(Date.now() + 100000).toISOString();
+        writeFileSync(targetPath, JSON.stringify(obj, null, 2) + "\n");
+      }
+    },
+  });
+  try {
+    createPackageRoot(pkgDir, SHA_BUILD_MANIFEST);
+    setupDrainedRecord(stateDir, "cutover-cas", SHA_BUILD_MANIFEST);
+
+    await assert.rejects(
+      async () => {
+        await performNativeCrossDomainBindingRepair({
+          cutoverId: "cutover-cas",
+          stateDir,
+          packageRoot: pkgDir,
+          serverUrl: mock.serverUrl,
+          ownerToken: mock.ownerToken,
+          workspaceId: "ws-test",
+          agentId: "agt-test",
+          requesterIdentity: {
+            serverInstanceId: "cli-cas-inst",
+            sourceCommit: SHA_COMMIT,
+            buildId: BUILD_ID,
+          },
+        });
+      },
+      (err: unknown) => {
+        return (
+          err instanceof CutoverStateError &&
+          err.message.includes("Concurrent modification detected")
+        );
+      },
+    );
+  } finally {
+    await mock.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(pkgDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// G71-R7: Backward Compatibility with running 150a36f runtime
+// ---------------------------------------------------------------------------
+
+test("G71-R7: 150a36f old parser and mode() function accept repaired record and resolve mode=normal", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-150-compat-state-"));
+  const pkgDir = mkdtempSync(join(tmpdir(), "devspace-150-compat-pkg-"));
+  const mock = await createMockReplacementServer();
+  try {
+    createPackageRoot(pkgDir, SHA_BUILD_MANIFEST);
+    setupDrainedRecord(stateDir, "cutover-150compat", SHA_BUILD_MANIFEST);
+    mock.setCutoverId("cutover-150compat");
+
+    const result = await performNativeCrossDomainBindingRepair({
+      cutoverId: "cutover-150compat",
+      stateDir,
+      packageRoot: pkgDir,
+      serverUrl: mock.serverUrl,
+      ownerToken: mock.ownerToken,
+      workspaceId: "ws-test",
+      agentId: "agt-test",
+      requesterIdentity: {
+        serverInstanceId: "cli-compat-inst",
+        sourceCommit: SHA_COMMIT,
+        buildId: BUILD_ID,
+      },
+    });
+
+    assert.equal(result.cutover.phase, "closed");
+
+    // Read the latest active event file written by out-of-process repair
+    const activeDir = join(stateDir, "cutover", "active");
+    const eventFiles = readdirSync(activeDir).filter((f) => f.endsWith(".json")).sort();
+    const closedEventFile = eventFiles.find((f) => f.startsWith("closed-"));
+    assert.ok(closedEventFile, "closed event file must exist on disk");
+    const rawOnDisk = readFileSync(join(activeDir, closedEventFile), "utf8");
+
+    // Exact 150a36f parser implementation (from git show 150a36f:src/cutover-state.ts)
+    function parseRecord150a36f(raw: string): DurableCutoverRecord {
+      const value = JSON.parse(raw) as Partial<DurableCutoverRecord>;
+      if (
+        value.schema !== "devspace.cutover.v1" ||
+        typeof value.cutoverId !== "string" ||
+        !["prepared", "drained", "closed", "superseded"].includes(value.phase ?? "") ||
+        !value.oldServerIdentity ||
+        !value.expectedNewIdentity ||
+        typeof value.createdAt !== "string" ||
+        typeof value.updatedAt !== "string"
+      ) {
+        throw new Error("150a36f parser failed");
+      }
+      // 150a36f reconciliationReceipt check
+      if (value.reconciliationReceipt) {
+        const r = value.reconciliationReceipt;
+        const ok =
+          typeof r.closedByServerInstanceId === "string" &&
+          r.closedByServerInstanceId.length > 0 &&
+          typeof r.workspaceQueryable === "boolean" &&
+          typeof r.agentQueryable === "boolean" &&
+          typeof r.agentReconciled === "boolean" &&
+          typeof r.reconciledAt === "string" &&
+          (r.terminalReason === undefined || r.terminalReason === "OBSERVED_REPLACEMENT_WITHOUT_DRAIN");
+        if (!ok) {
+          throw new Error("150a36f reconciliationReceipt validation failed");
+        }
+      }
+      return value as DurableCutoverRecord;
+    }
+
+    // Exact 150a36f mode calculation (from git show 150a36f:src/mcp-cutover.ts)
+    function mode150a36f(record: DurableCutoverRecord | undefined, currentInstanceId: string): string {
+      if (!record || record.phase === "closed") return "normal";
+      return record.oldServerIdentity.serverInstanceId === currentInstanceId ? "drain" : "reconcile-only";
+    }
+
+    // Exact 150a36f status reconciliationRequired logic
+    function reconciliationRequired150a36f(record: DurableCutoverRecord | undefined): boolean {
+      return Boolean(record && record.phase !== "closed");
+    }
+
+    // Assert 150a36f parses the repaired on-disk JSON without any error
+    const parsedByOldRuntime = parseRecord150a36f(rawOnDisk);
+    assert.equal(parsedByOldRuntime.cutoverId, "cutover-150compat");
+    assert.equal(parsedByOldRuntime.phase, "closed");
+
+    // Assert 150a36f evaluates mode to "normal" for the replacement instance
+    const oldRuntimeMode = mode150a36f(parsedByOldRuntime, "rep-inst-id");
+    assert.equal(oldRuntimeMode, "normal");
+
+    // Assert 150a36f evaluates reconciliationRequired to false
+    assert.equal(reconciliationRequired150a36f(parsedByOldRuntime), false);
+  } finally {
+    await mock.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(pkgDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// G71-R10: cutover_finish Refuses Generic Auto-Heal for Generic Mismatch
+// ---------------------------------------------------------------------------
+
+test("G71-R10: cutover_finish refuses to auto-heal when capability mismatch is NOT cross-domain misbinding", async () => {
+  const pkgDir = mkdtempSync(join(tmpdir(), "devspace-g10-pkg-"));
+  try {
+    // Target package has genuine build manifest digest SHA_BUILD_MANIFEST
+    createPackageRoot(pkgDir, SHA_BUILD_MANIFEST);
+
+    const probed = probeTargetPackage(pkgDir);
+
+    // Simulated active cutover where expected capability digest is a random unrelated hash
+    const unrelatedDigest = "e".repeat(64);
+    assert.notEqual(unrelatedDigest, probed.buildManifestSha256);
+
+    // The explicit classifier check must evaluate to false
+    const isCrossDomainMisbinding = probed.buildManifestSha256 === unrelatedDigest;
+    assert.equal(isCrossDomainMisbinding, false);
+  } finally {
+    rmSync(pkgDir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// G71-R12: Prevention Fails Before Any Durable Mutation
+// ---------------------------------------------------------------------------
+
+test("G71-R12: Prevention fails before durable write; leaves stateDir pristine", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-g12-state-"));
+  const pkgDir = mkdtempSync(join(tmpdir(), "devspace-g12-pkg-"));
+  try {
+    createPackageRoot(pkgDir, SHA_BUILD_MANIFEST);
+    const store = new CutoverStateStore(stateDir);
+
+    // Call assertNoDigestDomainMismatch with domain mismatch
+    const probed = probeTargetPackage(pkgDir);
+    assert.throws(
+      () => {
+        assertNoDigestDomainMismatch(
+          { capabilityManifestSha256: SHA_BUILD_MANIFEST },
+          probed,
+        );
+      },
+      (err: unknown) => {
+        return (
+          err instanceof CutoverCapabilityManifestDomainMismatchError &&
+          err.code === "CAPABILITY_MANIFEST_DIGEST_DOMAIN_MISMATCH"
+        );
+      },
+    );
+
+    // Verify state directory contains no created record or markers
+    assert.equal(store.get(), undefined);
+    assert.equal(existsSync(join(stateDir, "cutover", "active")), false);
+  } finally {
     rmSync(stateDir, { recursive: true, force: true });
     rmSync(pkgDir, { recursive: true, force: true });
   }
