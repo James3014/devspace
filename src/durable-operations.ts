@@ -21,7 +21,7 @@ import { EXECUTION_PROTOCOL_VERSION, type ExecutionAuthorityMode } from "./execu
 const spawn = nativeSpawn;
 const crossSpawn = createRequire(import.meta.url)("cross-spawn") as typeof import("node:child_process").spawn;
 
-export type DurableOperationKind = "workspace_clone" | "dependency_sync" | "nexus_gateway_recover" | "cutover_start";
+export type DurableOperationKind = "workspace_clone" | "dependency_sync" | "nexus_gateway_recover" | "cutover_start" | "host_operation";
 export type DurableOperationStatus = "started" | "succeeded" | "failed" | "outcome_unknown";
 export type DependencySyncRecipe = "npm_ci" | "pnpm_frozen" | "uv_frozen";
 
@@ -267,7 +267,7 @@ export class DurableOperationStore {
     const now = new Date().toISOString();
     this.database.sqlite.prepare(`
       update durable_operations
-      set status = ?, retry_safe = ?, receipt_json = ?, error_code = ?, error_message = ?, updated_at = ?
+      set status = ?, retry_safe = ?, receipt_json = coalesce(?, receipt_json), error_code = ?, error_message = ?, updated_at = ?
       where operation_id = ?
     `).run(
       patch.status,
@@ -280,6 +280,32 @@ export class DurableOperationStore {
     );
     const record = this.getByOperationId(operationId);
     if (!record) throw new Error(`Unknown durable operation: ${operationId}`);
+    return record;
+  }
+
+  finishHostOperation(
+    operationId: string,
+    patch: Parameters<DurableOperationStore["finish"]>[1],
+  ): DurableOperationRecord {
+    const now = new Date().toISOString();
+    const result = this.database.sqlite.prepare(`
+      update durable_operations
+      set status = ?, retry_safe = ?, receipt_json = coalesce(?, receipt_json), error_code = ?, error_message = ?, updated_at = ?
+      where operation_id = ? and kind = 'host_operation' and status = 'started'
+    `).run(patch.status, String(patch.retrySafe), patch.receipt ? JSON.stringify(patch.receipt) : null, patch.errorCode ?? null, patch.errorMessage ?? null, now, operationId);
+    const record = this.getByOperationId(operationId);
+    if (!record) throw new Error(`Unknown durable operation: ${operationId}`);
+    if (result.changes !== 1 && record.status === "started") throw new DurableOperationError("OPERATION_IN_PROGRESS", `Host operation ${operationId} changed concurrently.` , record);
+    return record;
+  }
+
+  recordHostOperationReceipt(operationId: string, receipt: Record<string, unknown>): DurableOperationRecord {
+    const result = this.database.sqlite.prepare(
+      "update durable_operations set receipt_json = ?, updated_at = ? where operation_id = ? and kind = 'host_operation' and status = 'started'",
+    ).run(JSON.stringify(receipt), new Date().toISOString(), operationId);
+    const record = this.getByOperationId(operationId);
+    if (!record) throw new Error(`Unknown durable operation: ${operationId}`);
+    if (result.changes !== 1) throw new DurableOperationError("OPERATION_IN_PROGRESS", `Host operation ${operationId} changed concurrently.`, record);
     return record;
   }
 }
