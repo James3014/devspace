@@ -158,6 +158,12 @@ export class DurableOperationStore {
 
   atomic<T>(work: () => T): T { return this.database.sqlite.transaction(work).immediate(); }
 
+  recordDependencyTerminal(operationId: string, requestHash: string, leaseId: string, exitCode: number, frozenInputsUnchanged: boolean): void {
+    if (!Number.isSafeInteger(exitCode)) throw new Error("Invalid terminal exit status");
+    this.database.sqlite.prepare("insert into dependency_terminal_witnesses(operation_id,request_hash,lease_id,exit_code,frozen_inputs_unchanged) values(?,?,?,?,?)")
+      .run(operationId,requestHash,leaseId,exitCode,frozenInputsUnchanged?1:0);
+  }
+
   markInterruptedUnknown(): number {
     const now = new Date().toISOString();
     const result = this.database.sqlite.prepare(`
@@ -565,9 +571,7 @@ export class DurableOperationManager {
     return this.consumer.readHandoff(consumerContext, leaseId, previousVersion, expectedCurrentVersion);
   }
 
-  async dependencySync(input: DependencySyncInput, consumerContext?: unknown): Promise<DurableOperationRecord> {
-    if (!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency sync requires a trusted host authority reader");
-    const consumer = this.consumer;
+  async planDependencySync(input: DependencySyncInput) {
     assertAttemptKey(input.attemptKey);
     const authorityMode = input.authorityMode ?? "OWNER_DIRECT";
     if (authorityMode !== "OWNER_DIRECT") {
@@ -597,6 +601,13 @@ export class DurableOperationManager {
     const requestHash = hashJson(request);
     const operationId = stableOperationId("dependency_sync", workspaceRoot, input.attemptKey);
     const subject = {operationId, requestHash, workspaceRoot, baseRevision, operation: "dependency_sync" as const};
+    return {subject, request, workspaceRoot, authorityMode, frozenInputs, before, baseRevision, requestHash, operationId};
+  }
+
+  async dependencySync(input: DependencySyncInput, consumerContext?: unknown): Promise<DurableOperationRecord> {
+    if (!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency sync requires a trusted host authority reader");
+    const consumer = this.consumer;
+    const {subject, request, workspaceRoot, authorityMode, frozenInputs, before, baseRevision, requestHash, operationId} = await this.planDependencySync(input);
     const { record, created, binding, pinnedVersion } = this.store.atomic(() => {
       const binding = consumer.authorize(consumerContext, subject);
       const value = this.store.createOrReplay({
@@ -627,7 +638,9 @@ export class DurableOperationManager {
     const result = await this.runCommand(command.command, command.args, workspaceRoot);
     if (result.exitCode === null) throw new Error("Command termination is unconfirmed");
     const after = await hashFiles(workspaceRoot, frozenInputs);
-    if (hashJson(before) !== hashJson(after)) {
+    const frozenInputsUnchanged = hashJson(before) === hashJson(after) && await readGitHead(workspaceRoot) === baseRevision;
+    this.store.recordDependencyTerminal(operationId,requestHash,binding.leaseId,result.exitCode,frozenInputsUnchanged);
+    if (!frozenInputsUnchanged) {
       return finish({
         status: "failed",
         retrySafe: false,

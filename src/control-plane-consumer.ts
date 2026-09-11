@@ -1,7 +1,7 @@
 import { realpathSync } from "node:fs";
 import type { CutoverServerIdentity, BuildReadyReceipt } from "./cutover-state.js";
 import { projectCompletion, type CompletionSelection } from "./current-completion-matrix.js";
-import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type ControlPlaneOwnershipOptions, type ReconciliationEvidence, type HandoffInput } from "./control-plane-ownership.js";
+import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type ControlPlaneOwnershipOptions, type ReconciliationEvidence, type HandoffInput, type ResourceLease } from "./control-plane-ownership.js";
 
 export interface EffectSubject {
   operationId: string;
@@ -27,7 +27,7 @@ export interface ControlPlaneConsumerOptions extends ControlPlaneOwnershipOption
   readCompletionContract?(context: unknown, selection: Readonly<CompletionSelection>): unknown;
   readCompletionEvidence?(context: unknown, selection: Readonly<CompletionSelection>): unknown;
   /** Host lookup of a previously authenticated recipient; handle is not identity evidence. */
-  resolveHandoffRecipient?(senderContext: unknown, recipientHandle: string): unknown;
+  resolveHandoffRecipient?(senderContext: unknown, recipientHandle: string, lease: Readonly<ResourceLease>, receipt: Readonly<HandoffInput>): unknown;
   readDependencyReconciliation?(context: unknown, subject: Readonly<EffectSubject>): DependencyReconciliationEvidence | undefined;
   /** Verifies an external terminal witness, including exit code and frozen-input result. */
   verifyDependencyReconciliation?(evidence: Readonly<DependencyReconciliationEvidence>, subject: Readonly<EffectSubject>): boolean;
@@ -78,7 +78,9 @@ export class ControlPlaneConsumer {
   }
 
   handoff(context: unknown, leaseId: string, expectedVersion: number, recipientHandle: string, receipt: HandoffInput) {
-    const recipient = this.options.resolveHandoffRecipient?.(context,recipientHandle);
+    const lease=this.ownership.get(leaseId);
+    if(!lease || lease.version!==expectedVersion) throw new ControlPlaneOwnershipError("CAS_CONFLICT","handoff lease version changed");
+    const recipient = this.options.resolveHandoffRecipient?.(context,recipientHandle,Object.freeze(structuredClone(lease)),Object.freeze(structuredClone(receipt)));
     if (recipient === undefined || recipient === null) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","trusted authenticated handoff recipient is unavailable");
     return this.ownership.handoff(context,leaseId,expectedVersion,recipient,receipt);
   }
