@@ -22,7 +22,8 @@ interface PairingRow {
   id: string; client_id: string; session_id: string; credential_hash: string;
   expires_at: number; binding_id: string | null;
 }
-interface Binding { row: BindingRow; contract: CarrierContract; root: BindingRow; }
+interface Validity { version: number; expires_at: string; }
+interface Binding { row: BindingRow; contract: CarrierContract; root: BindingRow; validity: Validity; generation: string; }
 const subjectJson = (s: EffectSubject) => JSON.stringify({operationId:s.operationId,requestHash:s.requestHash,workspaceRoot:s.workspaceRoot,baseRevision:s.baseRevision,operation:s.operation});
 const digest = (value: string) => createHash("sha256").update(value).digest("hex");
 function deny(message = "A current paired carrier is required"): never {
@@ -65,7 +66,7 @@ export class CarrierBindingStore {
         this.assertSubject(binding.contract, subject);
         const lease = this.effectLease(binding,subject);
         if (!lease) return undefined;
-        return {leaseId:lease.leaseId,leaseVersion:lease.version,requestHash:subject.requestHash,role:binding.contract.role};
+        return {leaseId:lease.leaseId,leaseVersion:lease.version,requestHash:subject.requestHash,role:binding.contract.role,authorityVersion:binding.generation};
       },
       readDependencyReconciliation: (context,subject) => {
         const binding=this.current(context);
@@ -102,7 +103,7 @@ export class CarrierBindingStore {
         if(lease.ownerThread!==sender.row.id || lease.baseRevision!==recipient.contract.baseRevision ||
           !recipient.contract.operations.includes(lease.operation as "dependency_sync") ||
           lease.scope.some(path=>!recipient.contract.scope.some(root=>contains(root,physical(path)))) ||
-          Date.parse(receipt.expiresAt)>Date.parse(recipient.contract.expiresAt)) deny("Transferred lease exceeds recipient authority");
+          Date.parse(receipt.expiresAt)>Date.parse(recipient.validity.expires_at)) deny("Transferred lease exceeds recipient authority");
         const proof = Object.freeze({});
         this.recipients.set(proof,handle);
         return proof;
@@ -138,6 +139,7 @@ export class CarrierBindingStore {
       const child=this.validateContract(contract);
       if(child.role!=="worker") deny("Delegation cannot create a controller");
       this.assertNarrower(parent.contract,child);
+      if(Date.parse(child.expiresAt)>Date.parse(parent.validity.expires_at)) deny("Delegation exceeds current parent validity");
       return this.issue(pendingId,child,parent.row.id);
     }).immediate();
   }
@@ -154,6 +156,42 @@ export class CarrierBindingStore {
     return this.public(binding);
   }
   status(context: unknown) { return this.public(this.current(context)); }
+  inspectLocal(id: string) {
+    const row=this.database.sqlite.prepare("select id,parent_id,version,revoked,contract_json from carrier_bindings where id=?").get(id) as Omit<BindingRow,"client_id"|"credential_hash">|undefined;
+    if(!row) deny("Missing carrier record");
+    const validity=this.readValidity(id);
+    return {id:row.id,parentId:row.parent_id,version:row.version,revoked:row.revoked!==0,contract:this.validateContract(JSON.parse(row.contract_json),false),validity:{version:validity.version,expiresAt:validity.expires_at}};
+  }
+  /** Local validity approval never changes immutable authority or revocation. */
+  reauthorizeLocal(id: string, expectedValidityVersion: number, expiresAt: string) {
+    return this.database.sqlite.transaction(()=>{
+      const binding=this.active(id,new Set(),true);
+      if(!Number.isSafeInteger(expectedValidityVersion) || expectedValidityVersion<1 || expectedValidityVersion>=Number.MAX_SAFE_INTEGER || binding.validity.version!==expectedValidityVersion) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Validity version changed");
+      const now=this.now(), expiry=Date.parse(expiresAt);
+      if(typeof expiresAt!=="string" || !Number.isFinite(expiry) || new Date(expiry).toISOString()!==expiresAt || expiry<=now || expiry>now+24*60*60*1000 || expiry<=Date.parse(binding.validity.expires_at)) deny("Validity approval must extend expiry within the 24-hour lease bound");
+      if(binding.row.parent_id && expiry>Date.parse(this.active(binding.row.parent_id).validity.expires_at)) deny("Validity exceeds current parent authorization");
+      const update=this.database.sqlite.prepare("update carrier_validity set version=version+1,expires_at=? where carrier_id=? and version=?").run(expiresAt,id,expectedValidityVersion);
+      if(update.changes!==1) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Validity approval raced");
+      return this.public(this.active(id));
+    }).immediate();
+  }
+  readLease(context: unknown, leaseId: string) {
+    const binding=this.current(context), lease=this.ownership.get(leaseId);
+    if(!lease || lease.ownerThread!==binding.row.id || lease.baseRevision!==binding.contract.baseRevision || !binding.contract.operations.includes(lease.operation as "dependency_sync") || lease.scope.some(path=>!binding.contract.scope.some(root=>contains(root,physical(path))))) deny("Lease is outside this carrier authority");
+    return lease;
+  }
+  releaseLease(context: unknown, leaseId: string, expectedVersion: number) {
+    return this.database.sqlite.transaction(()=>{
+      const lease=this.readLease(context,leaseId);
+      if(lease.operationHandle || lease.operationState==="active") deny("Pinned effects must be reconciled before release");
+      return this.ownership.release(context,leaseId,expectedVersion);
+    }).immediate();
+  }
+  private readValidity(id: string): Validity {
+    const validity=this.database.sqlite.prepare("select version,expires_at from carrier_validity where carrier_id=?").get(id) as Validity|undefined;
+    if(!validity || !Number.isSafeInteger(validity.version) || validity.version<1 || typeof validity.expires_at!=="string" || !Number.isFinite(Date.parse(validity.expires_at)) || new Date(validity.expires_at).toISOString()!==validity.expires_at) deny("Invalid or missing carrier validity");
+    return validity;
+  }
   revokeLocal(id: string, expectedVersion: number) {
     return this.database.sqlite.transaction(()=>this.revoke(id,expectedVersion)).immediate();
   }
@@ -186,7 +224,7 @@ export class CarrierBindingStore {
       const lease=held ? this.ownership.assertHeld(context,held.leaseId,held.version,subject.operation,subject.baseRevision) : this.ownership.acquire(context,{
         repositoryKey:binding.contract.repository,resourceKind:"filesystem",resourceId:subject.workspaceRoot,
         resource:subject.workspaceRoot,scope:[subject.workspaceRoot],operation:subject.operation,
-        baseRevision:subject.baseRevision,expiresAt:binding.contract.expiresAt,idempotencyKey:subject.operationId,grant,
+        baseRevision:subject.baseRevision,expiresAt:binding.validity.expires_at,idempotencyKey:subject.operationId,grant,
       });
       this.database.sqlite.prepare("insert into carrier_effect_bindings values(?,?,?,?)").run(binding.row.id,subject.operationId,subjectJson(subject),lease.leaseId);
       return lease;
@@ -219,20 +257,23 @@ export class CarrierBindingStore {
     if(binding.row.client_id!==principal.clientId) deny();
     return binding;
   }
-  private active(id: string, seen = new Set<string>()): Binding {
+  private active(id: string, seen = new Set<string>(), allowExpiredSelf = false): Binding {
     if(seen.has(id) || seen.size>=32) deny("Invalid delegation lineage");
     seen.add(id);
     const row=this.database.sqlite.prepare("select * from carrier_bindings where id=?").get(id) as BindingRow|undefined;
     if(!row || row.revoked!==0 || row.version!==1) deny("Carrier expired or revoked");
-    const contract=this.validateContract(JSON.parse(row.contract_json) as CarrierContract);
+    const validity=this.readValidity(id);
+    if(!allowExpiredSelf && Date.parse(validity.expires_at)<=this.now()) deny("Carrier validity expired");
+    const contract=this.validateContract(JSON.parse(row.contract_json) as CarrierContract,false);
     if(JSON.stringify(contract)!==row.contract_json) deny("Persisted contract is not canonical");
     if(row.parent_id) {
       const parent=this.active(row.parent_id,seen);
       if(parent.contract.role!=="controller" || contract.role!=="worker") deny();
       this.assertNarrower(parent.contract,contract);
-      return {row,contract,root:parent.root};
+      if(Date.parse(validity.expires_at)>Date.parse(parent.validity.expires_at)) deny("Child validity exceeds parent");
+      return {row,contract,root:parent.root,validity,generation:`${parent.generation}/${id}:${validity.version}`};
     }
-    return {row,contract,root:row};
+    return {row,contract,root:row,validity,generation:`${id}:${validity.version}`};
   }
   private issue(pendingId: string, input: CarrierContract, parentId: string|null) {
     const contract=this.validateContract(input);
@@ -241,6 +282,7 @@ export class CarrierBindingStore {
     const id=`carrier_${randomUUID()}`;
     this.database.sqlite.prepare("insert into carrier_bindings(id,client_id,credential_hash,parent_id,version,contract_json) values(?,?,?,?,1,?)")
       .run(id,pending.client_id,pending.credential_hash,parentId,JSON.stringify(contract));
+    this.database.sqlite.prepare("insert into carrier_validity(carrier_id,version,expires_at) values(?,1,?)").run(id,contract.expiresAt);
     this.database.sqlite.prepare("update carrier_pairings set binding_id=? where id=? and binding_id is null").run(id,pendingId);
     const binding=this.active(id);
     const grant=this.grant(binding);
@@ -256,16 +298,16 @@ export class CarrierBindingStore {
     if(result.changes!==1) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Revocation version changed");
     return {id,version:expectedVersion+1,revoked:true};
   }
-  private public(binding: Binding) { return {id:binding.row.id,version:binding.row.version,parentId:binding.row.parent_id,contract:binding.contract,grant:this.grant(binding)}; }
+  private public(binding: Binding) { return {id:binding.row.id,version:binding.row.version,parentId:binding.row.parent_id,contract:binding.contract,grant:this.grant(binding),validity:{version:binding.validity.version,expiresAt:binding.validity.expires_at},authorityVersion:binding.generation}; }
   private grant(binding: Binding): GrantEvidenceReference {
     const root=JSON.parse(binding.root.contract_json) as CarrierContract;
     return {repository:root.repository,goal:root.goal,coordinatorThread:binding.root.id,evidenceHash:digest(binding.root.contract_json)};
   }
-  private validateContract(input: CarrierContract): CarrierContract {
+  private validateContract(input: CarrierContract, requireFuture = true): CarrierContract {
     if(!input || !["controller","worker"].includes(input.role) || typeof input.goal!=="string" || !input.goal.trim() || input.goal.length>160 ||
       !/^[a-f0-9]{40,64}$/.test(input.baseRevision) || !Array.isArray(input.scope) || input.scope.length<1 || input.scope.length>64 ||
       !Array.isArray(input.operations) || input.operations.length<1 || input.operations.some(op=>op!=="dependency_sync") ||
-      !Number.isFinite(Date.parse(input.expiresAt)) || Date.parse(input.expiresAt)<=this.now()) deny("Invalid or expired carrier contract");
+      !Number.isFinite(Date.parse(input.expiresAt)) || (requireFuture && Date.parse(input.expiresAt)<=this.now())) deny("Invalid or expired carrier contract");
     if(input.operations.includes("cutover_start")) deny("Built-in carrier pairing currently supports dependency operations only");
     return {repository:normalizeRepositoryKey(input.repository),goal:input.goal,role:input.role,
       scope:[...new Set(input.scope.map(physical))].sort(),baseRevision:input.baseRevision,
@@ -273,7 +315,7 @@ export class CarrierBindingStore {
   }
   private assertNarrower(parent: CarrierContract, child: CarrierContract) {
     if(parent.repository!==child.repository || parent.goal!==child.goal || parent.baseRevision!==child.baseRevision ||
-      Date.parse(child.expiresAt)>Date.parse(parent.expiresAt) || child.operations.some(op=>!parent.operations.includes(op)) ||
+      child.operations.some(op=>!parent.operations.includes(op)) ||
       child.scope.some(path=>!parent.scope.some(root=>contains(root,path)))) deny("Delegation exceeds parent scope");
   }
   private assertSubject(contract: CarrierContract, subject: EffectSubject) {

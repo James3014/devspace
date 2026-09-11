@@ -21,8 +21,8 @@ function fixture() {
   const approved=store.approveLocal(request.pendingId,contract);
   store.redeem(controller,request.credential);
   const db=openDatabase(root);
-  const snapshot=()=>JSON.stringify({bindings:db.sqlite.prepare("select * from carrier_bindings order by id").all(),effects:db.sqlite.prepare("select * from carrier_effect_bindings order by operation_id").all(),leases:db.sqlite.prepare("select * from control_plane_resource_leases order by lease_id").all()});
-  return {root,workspace,store,controller,worker,contract,request,approved,snapshot,advance:()=>{now+=120000;},close:()=>{db.close();store.close();rmSync(root,{recursive:true,force:true});}};
+  const snapshot=()=>JSON.stringify({validity:db.sqlite.prepare("select * from carrier_validity order by carrier_id").all(),bindings:db.sqlite.prepare("select * from carrier_bindings order by id").all(),effects:db.sqlite.prepare("select * from carrier_effect_bindings order by operation_id").all(),leases:db.sqlite.prepare("select * from control_plane_resource_leases order by lease_id").all()});
+  return {root,workspace,store,db,controller,worker,contract,request,approved,snapshot,advance:()=>{now+=120000;},close:()=>{db.close();store.close();rmSync(root,{recursive:true,force:true});}};
 }
 test("shared OAuth and forged metadata cannot impersonate a paired carrier; reconnect requires credential possession",()=>{
   const f=fixture();try {
@@ -134,5 +134,150 @@ test("handoff preserves the pinned operation; terminal proof permits successor r
     const before=f.snapshot();
     await assert.rejects(()=>manager!.dependencySync(input,sender));
     assert.equal(f.snapshot(),before);
+  } finally {manager?.close();f.close();}
+});
+
+
+test("reauthorization preserves identity and grant, rejects stale or unbounded approval, and requires explicit idle lease release",()=>{
+  const f=fixture();try {
+    const subject={operationId:"idle",requestHash:"b".repeat(64),workspaceRoot:f.workspace,baseRevision:f.contract.baseRevision,operation:"dependency_sync" as const};
+    const lease=f.store.prepareEffect(f.controller,subject);
+    f.advance();
+    assert.throws(()=>f.store.status(f.controller));
+    const until=new Date(Date.parse(f.contract.expiresAt)+240000).toISOString();
+    const before=f.snapshot();
+    for(const invalid of ["invalid",new Date(Date.parse(f.contract.expiresAt)+48*60*60*1000).toISOString()]) assert.throws(()=>f.store.reauthorizeLocal(f.approved.id,1,invalid));
+    assert.throws(()=>f.store.reauthorizeLocal(f.approved.id,2,until));
+    assert.equal(f.snapshot(),before);
+    const renewed=f.store.reauthorizeLocal(f.approved.id,1,until);
+    assert.equal(renewed.id,f.approved.id);
+    assert.deepEqual(renewed.contract,f.approved.contract);
+    assert.deepEqual(renewed.grant,f.approved.grant);
+    assert.equal(renewed.validity.version,2);
+    assert.notEqual(renewed.authorityVersion,f.approved.authorityVersion);
+    const after=f.snapshot();
+    assert.throws(()=>f.store.reauthorizeLocal(f.approved.id,1,until));
+    assert.equal(f.snapshot(),after);
+    f.store.forgetSession(f.controller.sessionId);
+    assert.equal(f.store.redeem(f.controller,f.request.credential).id,f.approved.id);
+    assert.equal(f.store.readLease(f.controller,lease.leaseId).leaseId,lease.leaseId);
+    assert.throws(()=>f.store.prepareEffect(f.controller,{...subject,operationId:"next"}));
+    assert.throws(()=>f.store.releaseLease(f.worker,lease.leaseId,lease.version));
+    assert.throws(()=>f.store.releaseLease(f.controller,lease.leaseId,lease.version+1));
+    assert.equal(f.store.releaseLease(f.controller,lease.leaseId,lease.version).terminalState,"released");
+    assert.notEqual(f.store.prepareEffect(f.controller,{...subject,operationId:"next"}).leaseId,lease.leaseId);
+    assert.ok(!JSON.stringify(f.store.inspectLocal(f.approved.id)).includes(f.request.credential));
+  } finally {f.close();}
+});
+
+test("renewal cannot unpin unknown effects, renew children implicitly, or revive revoked ancestry",()=>{
+  const f=fixture();try {
+    const request=f.store.requestPairing(f.worker);
+    const child=f.store.delegate(f.controller,request.pendingId,{...f.contract,role:"worker"});
+    f.store.redeem(f.worker,request.credential);
+    const subject={operationId:"unknown",requestHash:"b".repeat(64),workspaceRoot:f.workspace,baseRevision:f.contract.baseRevision,operation:"dependency_sync" as const};
+    const lease=f.store.prepareEffect(f.worker,subject);
+    const pinned=f.store.ownership.beginOperation(f.worker,lease.leaseId,lease.version,subject.operationId);
+    f.advance();
+    const until=new Date(Date.parse(f.contract.expiresAt)+240000).toISOString();
+    assert.throws(()=>f.store.reauthorizeLocal(child.id,1,until));
+    f.store.reauthorizeLocal(f.approved.id,1,until);
+    assert.throws(()=>f.store.status(f.worker));
+    assert.throws(()=>f.store.reauthorizeLocal(child.id,1,new Date(Date.parse(until)+1).toISOString()));
+    f.store.reauthorizeLocal(child.id,1,until);
+    const before=f.snapshot();
+    assert.equal(f.store.readers.readDependencyReconciliation?.(f.worker,subject),undefined);
+    assert.throws(()=>f.store.releaseLease(f.worker,lease.leaseId,pinned.version));
+    assert.throws(()=>f.store.prepareEffect(f.worker,{...subject,operationId:"retry"}));
+    assert.throws(()=>f.store.reauthorizeLocal(child.id,2,new Date(Date.parse(until)+48*60*60*1000).toISOString()));
+    assert.equal(f.snapshot(),before);
+    assert.equal(f.store.ownership.get(lease.leaseId)?.operationHandle,subject.operationId);
+    f.store.revokeLocal(f.approved.id,1);
+    const revoked=f.snapshot();
+    assert.throws(()=>f.store.reauthorizeLocal(f.approved.id,2,new Date(Date.parse(until)+60000).toISOString()));
+    assert.throws(()=>f.store.reauthorizeLocal(child.id,2,new Date(Date.parse(until)+60000).toISOString()));
+    assert.equal(f.snapshot(),revoked);
+  } finally {f.close();}
+});
+
+test("persisted validity rejects competing approvals and malformed records",()=>{
+  const f=fixture();const other=new CarrierBindingStore(f.root);try {
+    const until=new Date(Date.parse(f.contract.expiresAt)+240000).toISOString();
+    const accepted=f.store.reauthorizeLocal(f.approved.id,1,until);
+    assert.deepEqual(other.inspectLocal(f.approved.id).validity,accepted.validity);
+    const before=f.snapshot();
+    assert.throws(()=>other.reauthorizeLocal(f.approved.id,1,new Date(Date.parse(until)+60000).toISOString()));
+    assert.equal(f.snapshot(),before);
+    assert.equal(other.redeem(f.worker,f.request.credential).authorityVersion,accepted.authorityVersion);
+    for(const invalid of ["invalid","2027-01-01",""]) {
+      f.db.sqlite.prepare("update carrier_validity set expires_at=? where carrier_id=?").run(invalid,f.approved.id);
+      const malformed=f.snapshot();
+      assert.throws(()=>f.store.status(f.controller));
+      assert.throws(()=>f.store.inspectLocal(f.approved.id));
+      assert.throws(()=>f.store.reauthorizeLocal(f.approved.id,2,until));
+      assert.equal(f.snapshot(),malformed);
+    }
+  } finally {other.close();f.close();}
+});
+
+test("migration preserves existing authority and pinned ownership",()=>{
+  const f=fixture();let migrated:CarrierBindingStore|undefined;try {
+    const subject={operationId:"migration-pin",requestHash:"b".repeat(64),workspaceRoot:f.workspace,baseRevision:f.contract.baseRevision,operation:"dependency_sync" as const};
+    const lease=f.store.prepareEffect(f.controller,subject);
+    const pinned=f.store.ownership.beginOperation(f.controller,lease.leaseId,lease.version,subject.operationId);
+    const before=f.db.sqlite.prepare("select * from carrier_bindings order by id").all();
+    // Reconstruct the preceding schema only in this disposable fixture.
+    f.db.sqlite.exec("drop table carrier_validity; delete from devspace_schema_migrations where version=16");
+    migrated=new CarrierBindingStore(f.root);
+    assert.deepEqual(f.db.sqlite.prepare("select * from carrier_bindings order by id").all(),before);
+    const resumed=migrated.redeem(f.controller,f.request.credential);
+    assert.equal(resumed.id,f.approved.id);
+    assert.deepEqual(resumed.grant,f.approved.grant);
+    assert.deepEqual(resumed.validity,{version:1,expiresAt:f.contract.expiresAt});
+    assert.deepEqual(migrated.ownership.get(lease.leaseId),pinned);
+  } finally {migrated?.close();f.close();}
+});
+
+for(const expire of [true,false]) test(`validity drift fences completion and original carrier recovers without command replay (expired=${expire})`,async()=>{
+  const f=fixture();let manager:DurableOperationManager|undefined;
+  try {
+    execFileSync("git",["init"],{cwd:f.workspace,stdio:"ignore"});
+    execFileSync("git",["-c","user.name=Fixture","-c","user.email=fixture@example.test","commit","--allow-empty","-m","fixture"],{cwd:f.workspace,stdio:"ignore"});
+    const base=execFileSync("git",["rev-parse","HEAD"],{cwd:f.workspace,encoding:"utf8"}).trim();
+    writeFileSync(join(f.workspace,"package.json"),'{"name":"fixture","version":"1.0.0"}');
+    writeFileSync(join(f.workspace,"package-lock.json"),'{"lockfileVersion":3,"packages":{}}');
+    const sender={clientId:"shared-oauth",sessionId:"sender"}, successor={clientId:"shared-oauth",sessionId:"successor"};
+    const contract={...f.contract,baseRevision:base};
+    const a=f.store.requestPairing(sender),b=f.store.requestPairing(successor);
+    const from=f.store.approveLocal(a.pendingId,contract),to=f.store.approveLocal(b.pendingId,contract);
+    f.store.redeem(sender,a.credential);f.store.redeem(successor,b.credential);
+    let launched!:()=>void, finish!:()=>void;
+    const started=new Promise<void>(resolve=>{launched=resolve;});
+    const terminal=new Promise<void>(resolve=>{finish=resolve;});
+    const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_ALLOWED_ROOTS:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",PORT:"1"});
+    manager=new DurableOperationManager(config,async()=>{launched();await terminal;return {exitCode:0,stdout:"",stderr:""};},undefined,undefined,f.store.readers);
+    const input={workspaceId:"fixture-workspace",workspaceRoot:f.workspace,attemptKey:"handoff-terminal",recipe:"npm_ci" as const};
+    const plan=await manager.planDependencySync(input);
+    const lease=f.store.prepareEffect(sender,plan.subject);
+    const running=manager.dependencySync(input,sender);
+    await started;
+    const pinned=f.store.ownership.get(lease.leaseId)!;
+    if(expire) f.advance();
+    await assert.rejects(()=>manager!.reconcile(plan.subject.operationId,sender));
+    const renewed=f.store.reauthorizeLocal(from.id,1,new Date(Date.parse(contract.expiresAt)+240000).toISOString());
+    assert.deepEqual(renewed.grant,from.grant);
+    assert.equal(f.store.ownership.get(lease.leaseId)?.operationHandle,plan.subject.operationId);
+    finish();
+    assert.equal((await running).status,"outcome_unknown");
+    const recovered=await manager.reconcile(plan.subject.operationId,sender);
+    assert.equal(recovered.status,"succeeded");
+    const terminalSnapshot=f.snapshot();
+    assert.deepEqual(await manager.reconcile(plan.subject.operationId,sender),recovered);
+    assert.equal(f.snapshot(),terminalSnapshot);
+    assert.equal(f.store.ownership.get(lease.leaseId)?.operationHandle,undefined);
+    assert.equal(f.store.ownership.get(lease.leaseId)?.ownerThread,from.id);
+    assert.equal(f.store.ownership.get(lease.leaseId)?.terminalState,expire ? "expired_reconciled" : undefined);
+    const nextPlan=await manager.planDependencySync({...input,attemptKey:"next-after-recovery"});
+    assert.equal(f.store.prepareEffect(sender,nextPlan.subject).leaseId===lease.leaseId,!expire);
   } finally {manager?.close();f.close();}
 });

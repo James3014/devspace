@@ -433,6 +433,8 @@ function printHelp(): void {
       "  devspace models          List available models in catalog",
       "  devspace models refresh  Refresh current provider model catalog and bump generation",
       "  devspace carrier inspect <pending-id>",
+      "  devspace carrier show <carrier-id>",
+      "  devspace carrier reauthorize <carrier-id> --validity-version <version> --until <ISO expiry>",
       "  devspace carrier approve <pending-id> --contract <file> --confirm <pending-id>",
       "  devspace carrier revoke <carrier-id> --version <version>",
       "  devspace agents ls       List subagent sessions",
@@ -1265,6 +1267,13 @@ function runCarrierCommand(args: string[]): void {
   try {
     let result:unknown;
     if(action==="inspect" && flags.length===0) result=bindings.pending(id);
+    else if(action==="show" && flags.length===0) result=bindings.inspectLocal(id);
+    else if(action==="reauthorize" && flags.length===4 && flags[0]==="--validity-version" && flags[2]==="--until") {
+      const record=bindings.inspectLocal(id);
+      const roots=[...config.allowedRoots,config.worktreeRoot].map(canonicalizePath);
+      if(record.contract.scope.some(path=>!roots.some(root=>isPathInsideRoot(canonicalizePath(path),root)))) throw new Error("Carrier scope exceeds current configured roots.");
+      result=bindings.reauthorizeLocal(id,Number(flags[1]),flags[3]!);
+    }
     else if(action==="approve" && flags.length===4 && flags[0]==="--contract" && flags[2]==="--confirm" && flags[3]===id) {
       const contract=JSON.parse(readFileSync(resolve(flags[1]!),"utf8")) as CarrierContract;
       const roots=[...config.allowedRoots,config.worktreeRoot].map(canonicalizePath);

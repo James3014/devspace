@@ -2695,6 +2695,8 @@ export function createMcpServer(
       registerAppTool(server,"coordination_pair",{...registration,title:"Request a carrier pairing",description:"Request local Owner approval. Save the returned private credential for this carrier; it grants nothing until approval. Never copy it into handoff receipts or other conversations.",inputSchema:{}},async(_,extra)=>result(carrierBindings.requestPairing(dependencyConsumerContext(extra))));
       registerAppTool(server,"coordination_resume",{...registration,title:"Resume a paired carrier",description:"Prove possession of this carrier's private credential on the current authenticated MCP session. Caller conversation metadata cannot substitute for this proof.",inputSchema:{credential:z.string()}},async({credential},extra)=>result(carrierBindings.redeem(dependencyConsumerContext(extra),credential)));
       registerAppTool(server,"coordination_carrier_status",{...registration,annotations:{...registration.annotations,readOnlyHint:true},title:"Read paired carrier",description:"Read current bounded authority, including parent revocation. Contains no credential.",inputSchema:{}},async(_,extra)=>result(carrierBindings.status(dependencyConsumerContext(extra))));
+      registerAppTool(server,"coordination_lease_read",{...registration,annotations:{...registration.annotations,readOnlyHint:true},title:"Read an owned resource lease",description:"Read the exact owned lease version, expiry and operation pin. Does not renew or release it.",inputSchema:{leaseId:z.string()}},async({leaseId},extra)=>result(carrierBindings.readLease(dependencyConsumerContext(extra),leaseId)));
+      registerAppTool(server,"coordination_lease_release",{...registration,title:"Release an unpinned owned lease",description:"Explicitly release an owned lease by exact version. Active or unknown operation pins must be reconciled first.",inputSchema:{leaseId:z.string(),expectedVersion:z.number().int().positive()}},async({leaseId,expectedVersion},extra)=>result(carrierBindings.releaseLease(dependencyConsumerContext(extra),leaseId,expectedVersion)));
       registerAppTool(server,"coordination_delegate",{...registration,title:"Delegate bounded work",description:"Approve a worker's pending pairing within the current controller's scope and expiry. Cannot create controller authority.",inputSchema:{pendingId:z.string(),contract:contractSchema}},async({pendingId,contract},extra)=>result(carrierBindings.delegate(dependencyConsumerContext(extra),pendingId,contract)));
       registerAppTool(server,"coordination_revoke_worker",{...registration,title:"Revoke delegated worker",description:"Revoke an exact child authority version. Existing unknown effects remain pinned and require reconciliation.",inputSchema:{carrierId:z.string(),expectedVersion:z.number().int().positive()}},async({carrierId,expectedVersion},extra)=>result(carrierBindings.revokeDelegation(dependencyConsumerContext(extra),carrierId,expectedVersion)));
       registerAppTool(server,"coordination_prepare_dependencies",{...registration,title:"Prepare bounded dependency operation",description:"Bind a frozen dependency recipe to the paired carrier and acquire its existing resource lease. Does not execute the recipe. Use the same inputs with dependency_sync.",inputSchema:{workspaceId:z.string(),attemptKey:z.string(),recipe:z.enum(["npm_ci","pnpm_frozen","uv_frozen"])}},async(args,extra)=>{
@@ -4746,6 +4748,8 @@ function dependencyConsumerContext(extra: {authInfo?: {clientId: string; scopes:
 }
 
 export interface CreateServerOptions {
+  /** Trusted host clock, never supplied through MCP metadata. */
+  carrierClock?: () => number;
   /** Trusted host reader only; OAuth identity alone does not grant resource ownership. */
   coordination?: ControlPlaneConsumerOptions;
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
@@ -4983,7 +4987,7 @@ export function createServer(
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
   initializationCleanups.push(() => processSessions.shutdown());
-  const carrierBindings = options.coordination ? undefined : new CarrierBindingStore(config.stateDir);
+  const carrierBindings = options.coordination ? undefined : new CarrierBindingStore(config.stateDir, options.carrierClock);
   if (carrierBindings) initializationCleanups.push(() => carrierBindings.close());
   const durableOperations = new DurableOperationManager(config, undefined, undefined, undefined, options.coordination ?? carrierBindings?.readers);
   initializationCleanups.push(() => durableOperations.close());
