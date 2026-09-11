@@ -6,14 +6,14 @@ import test from "node:test";
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CarrierBindingStore, type CarrierContract } from "./carrier-binding.js";
+import { CarrierBindingStore, type CarrierContract, type CarrierCompletionBinding } from "./carrier-binding.js";
 import { openDatabase } from "./db/client.js";
 
-function fixture() {
+function fixture(completionBindings: readonly CarrierCompletionBinding[] = []) {
   const root=realpathSync(mkdtempSync(join(tmpdir(),"carrier-test-"))).replaceAll("\\","/");
   const workspace=join(root,"workspace");mkdirSync(workspace);
   let now=Date.now();
-  const store=new CarrierBindingStore(root,()=>now);
+  const store=new CarrierBindingStore(root,()=>now,completionBindings);
   const controller={clientId:"shared-oauth",sessionId:"controller-session"};
   const worker={clientId:"shared-oauth",sessionId:"worker-session"};
   const contract:CarrierContract={repository:"James3014/devspace",goal:"issue62",role:"controller",scope:[workspace],baseRevision:"a".repeat(40),operations:["dependency_sync"],expiresAt:new Date(now+60000).toISOString()};
@@ -24,6 +24,53 @@ function fixture() {
   const snapshot=()=>JSON.stringify({validity:db.sqlite.prepare("select * from carrier_validity order by carrier_id").all(),bindings:db.sqlite.prepare("select * from carrier_bindings order by id").all(),effects:db.sqlite.prepare("select * from carrier_effect_bindings order by operation_id").all(),leases:db.sqlite.prepare("select * from control_plane_resource_leases order by lease_id").all()});
   return {root,workspace,store,db,controller,worker,contract,request,approved,snapshot,advance:()=>{now+=120000;},close:()=>{db.close();store.close();rmSync(root,{recursive:true,force:true});}};
 }
+test("completion readers remain paired, scoped and independent of candidate base",()=>{
+  const selection={goal:"issue62",subject:"delivery",candidate:"b".repeat(40)};
+  const readers={readContract:(s:typeof selection)=>({...s}),readEvidence:()=>[]};
+  const entry={repository:"James3014/devspace",goal:"issue62",subject:"delivery",readers};
+  const f=fixture([entry]);try {
+    assert.deepEqual(f.store.readers.readCompletionContract!(f.controller,selection),selection);
+    readers.readContract=()=>{throw new Error("replacement must not run");};
+    entry.subject="changed";
+    assert.deepEqual(f.store.readers.readCompletionContract!(f.controller,selection),selection);
+    assert.throws(()=>f.store.readers.readCompletionContract!(f.worker,selection));
+    assert.throws(()=>f.store.readers.readCompletionContract!(f.controller,{...selection,goal:"other"}));
+    assert.throws(()=>f.store.readers.readCompletionContract!(f.controller,{...selection,subject:"other"}));
+    f.advance();
+    assert.throws(()=>f.store.readers.readCompletionEvidence!(f.controller,selection));
+  } finally {f.close();}
+});
+test("completion reader cannot return accepted evidence after revoking its carrier",()=>{
+  let invoked=false;
+  let revoke=()=>{};
+  const f=fixture([{repository:"James3014/devspace",goal:"issue62",subject:"delivery",readers:{readContract:()=>({}),readEvidence:()=>{invoked=true;revoke();return [];}}}]);
+  try {
+    revoke=()=>{f.store.revokeLocal(f.approved.id,1);};
+    assert.throws(()=>f.store.readers.readCompletionEvidence!(f.controller,{goal:"issue62",subject:"delivery",candidate:"b".repeat(40)}));
+    assert.equal(invoked,true);
+  } finally {f.close();}
+});
+test("completion binding rejects foreign repositories and ambiguous configuration",()=>{
+  const binding={repository:"other/repository",goal:"issue62",subject:"delivery",readers:{readContract:()=>({}),readEvidence:()=>[]}};
+  const f=fixture([binding]);try {
+    assert.throws(()=>f.store.readers.readCompletionContract!(f.controller,{goal:"issue62",subject:"delivery",candidate:"b".repeat(40)}));
+    assert.throws(()=>new CarrierBindingStore(f.root,Date.now,[binding,{...binding,repository:"OTHER/REPOSITORY"}]),/Duplicate/);
+    assert.throws(()=>new CarrierBindingStore(f.root,Date.now,[{...binding,readers:{} as never}]),/Invalid/);
+  } finally {f.close();}
+});
+test("completion selectors are immutable and expiry during callback rejects its output",()=>{
+  let advance=()=>{},called=false;
+  const f=fixture([{repository:"James3014/devspace",goal:"issue62",subject:"delivery",readers:{
+    readContract:s=>{assert.equal(Object.isFrozen(s),true);return s;},
+    readEvidence:()=>{called=true;advance();return [];},
+  }}]);try {
+    const selection={goal:"issue62",subject:"delivery",candidate:"b".repeat(40)};
+    assert.deepEqual(f.store.readers.readCompletionContract!(f.controller,selection),selection);
+    advance=f.advance;
+    assert.throws(()=>f.store.readers.readCompletionEvidence!(f.controller,selection));
+    assert.equal(called,true);
+  } finally {f.close();}
+});
 test("shared OAuth and forged metadata cannot impersonate a paired carrier; reconnect requires credential possession",()=>{
   const f=fixture();try {
     const before=f.snapshot();

@@ -1,4 +1,4 @@
-import { CarrierBindingStore } from "./carrier-binding.js";
+import { CarrierBindingStore, type CarrierCompletionBinding } from "./carrier-binding.js";
 import type { ControlPlaneConsumerOptions } from "./control-plane-consumer.js";
 import { ControlPlaneOwnershipError } from "./control-plane-ownership.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -4752,6 +4752,8 @@ export interface CreateServerOptions {
   carrierClock?: () => number;
   /** Trusted host reader only; OAuth identity alone does not grant resource ownership. */
   coordination?: ControlPlaneConsumerOptions;
+  /** Evidence-only host bindings; cannot replace carrier identity or grant readers. */
+  completionBindings?: readonly CarrierCompletionBinding[];
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
   chatSwarmInitializationHook?: () => void;
 }
@@ -4957,6 +4959,7 @@ export function createServer(
   config = loadConfig(),
   options: CreateServerOptions = {},
 ): RunningServer {
+  if (options.coordination && options.completionBindings !== undefined) throw new Error("Custom coordination readers and completion-only bindings are mutually exclusive.");
   const incomingArtifactAdapters = options.incomingArtifactAdapters
     ?? [createOpenAIIncomingArtifactAdapter()];
   const allowedHosts = config.allowedHosts.includes("*")
@@ -4987,7 +4990,7 @@ export function createServer(
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
   initializationCleanups.push(() => processSessions.shutdown());
-  const carrierBindings = options.coordination ? undefined : new CarrierBindingStore(config.stateDir, options.carrierClock);
+  const carrierBindings = options.coordination ? undefined : new CarrierBindingStore(config.stateDir, options.carrierClock, options.completionBindings);
   if (carrierBindings) initializationCleanups.push(() => carrierBindings.close());
   const durableOperations = new DurableOperationManager(config, undefined, undefined, undefined, options.coordination ?? carrierBindings?.readers);
   initializationCleanups.push(() => durableOperations.close());
