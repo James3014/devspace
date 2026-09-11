@@ -2319,6 +2319,7 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
       assert.equal(JSON.stringify(cutoverStore.get()),beforeCutover);
       // Drain admission cannot transfer an unresolved effect, even with an exact receipt.
       const pinned=ownership.get(cutoverLeaseId)!;
+      const {openDatabase}=await import("./db/client.js");
       const handoffDb=openDatabase(config.stateDir);
       const receiptSnapshot=()=>JSON.stringify(handoffDb.sqlite.prepare("select * from control_plane_handoff_receipts order by receipt_id").all());
       const receiptsBefore=receiptSnapshot();
