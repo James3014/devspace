@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { isAbsolute, relative, sep } from "node:path";
+import { isAbsolute, join, relative, sep } from "node:path";
 import { canonicalizePath } from "./roots.js";
 import type { CapabilityManifest } from "./capability-manifest.js";
 
@@ -60,7 +60,9 @@ export interface IntegrationBlocker {
     | "DESTINATION_HEAD_MISMATCH"
     | "DIRTY_OVERLAP"
     | "DIRTY_DESTINATION"
-    | "INTEGRATION_NOT_EXPRESSIBLE";
+    | "INTEGRATION_NOT_EXPRESSIBLE"
+    | "PARTIAL_APPLY_DETECTED"
+    | "APPLY_EFFECT_UNKNOWN";
   detail: string;
 }
 
@@ -97,11 +99,21 @@ export interface IntegrationReadiness {
   unknowns: string[];
 }
 
+export type IntegrationEffectState =
+  | "NOT_STARTED"
+  | "CONFIRMED_NO_EFFECT"
+  | "PARTIAL_EFFECT"
+  | "EFFECT_UNKNOWN"
+  | "APPLIED";
+
 export interface IntegrationApplyResult {
   applied: boolean;
   appliedRange: { base: string; head: string };
   appliedTrackedFiles: number;
   blockers: IntegrationBlocker[];
+  effectState: IntegrationEffectState;
+  reconciliationRequired: boolean;
+  affectedTrackedPaths: string[];
 }
 
 export interface CandidatePromotionInput {
@@ -190,6 +202,7 @@ const GIT_TIMEOUT_MS = 15_000;
 interface GitResult {
   ok: boolean;
   stdout: string;
+  stderr?: string;
 }
 
 function runGit(args: string[], cwd: string, input?: string): Promise<GitResult> {
@@ -203,17 +216,21 @@ function runGit(args: string[], cwd: string, input?: string): Promise<GitResult>
       } catch {
         // best-effort
       }
-      resolvePromise({ ok: false, stdout: "" });
+      resolvePromise({ ok: false, stdout: "", stderr: "command timed out" });
     }, GIT_TIMEOUT_MS);
     const child = execFile(
       "git",
-      args,
-      { cwd, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" }, maxBuffer: 64 * 1024 * 1024 },
-      (error, stdout) => {
+      ["-C", cwd, ...args],
+      { env: { ...process.env, GIT_TERMINAL_PROMPT: "0" }, maxBuffer: 64 * 1024 * 1024 },
+      (error, stdout, stderr) => {
         if (completed) return;
         completed = true;
         clearTimeout(timer);
-        resolvePromise({ ok: !error, stdout: stdout ?? "" });
+        resolvePromise({
+          ok: !error,
+          stdout: stdout ?? "",
+          stderr: stderr ?? (error ? error.message : ""),
+        });
       },
     );
     if (input !== undefined) child.stdin?.end(input, "utf8");
@@ -227,6 +244,19 @@ function containedWithin(root: string, candidate: string): boolean {
 
 function splitLines(value: string): string[] {
   return value.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+}
+
+function parseNameStatus(stdout: string): { status: string; path: string }[] {
+  const results: { status: string; path: string }[] = [];
+  for (const line of splitLines(stdout)) {
+    const parts = line.split("\t");
+    if (parts.length >= 2) {
+      const status = parts[0];
+      const path = parts[parts.length - 1];
+      results.push({ status, path });
+    }
+  }
+  return results;
 }
 
 const EXACT_COMMIT_SHA_PATTERN = /^[0-9a-f]{40}$/;
@@ -539,10 +569,19 @@ export type BeforeMutationHook = () => void | Promise<void>;
  */
 export type BeforeApplyHook = () => void | Promise<void>;
 
+/**
+ * Deterministic test/observation seam: invoked immediately after a failed
+ * `git apply` and BEFORE post-failure destination inspection. It lets tests
+ * simulate inspection failures (e.g. file read or git command errors).
+ * Production callers omit it.
+ */
+export type PostApplyInspectionHook = () => void | Promise<void>;
+
 export interface CandidateApplyInput extends CandidateRangeIdentity {
   confirmApply?: boolean;
   beforeMutationHook?: BeforeMutationHook;
   beforeApplyHook?: BeforeApplyHook;
+  postApplyInspectionHook?: PostApplyInspectionHook;
 }
 
 /**
@@ -623,8 +662,13 @@ async function refenceDestinationBeforeMutation(
  * Exact safety guarantees — stated precisely, no more:
  * - readiness plus the same-call re-fence catch any drift OBSERVABLE at those
  *   two points in time;
- * - `git apply` without --reject is patch-atomic: the Candidate patch is either
- *   applied as a whole or not at all; there is never a partial patch;
+ * - `git apply` without --reject is NOT guaranteed atomic in the presence of
+ *   filesystem write obstructions (e.g. non-empty directory collisions): real
+ *   `git apply` can partially write or delete files before exiting non-zero;
+ * - when `git apply` fails, destination state is physically inspected and
+ *   classified: CONFIRMED_NO_EFFECT if readback proves no files were modified,
+ *   PARTIAL_EFFECT if candidate paths were mutated/deleted/added, or
+ *   EFFECT_UNKNOWN if inspection cannot cleanly verify;
  * - arbitrary external mutation AFTER the final re-fence is NOT excluded by
  *   this primitive;
  * - a compatible concurrent edit to a Candidate path may therefore coexist with
@@ -636,7 +680,7 @@ async function refenceDestinationBeforeMutation(
 export async function integrateCandidate(
   input: CandidateApplyInput,
 ): Promise<IntegrationApplyResult> {
-  const { beforeMutationHook, beforeApplyHook, ...identity } = input;
+  const { beforeMutationHook, beforeApplyHook, postApplyInspectionHook, ...identity } = input;
   const readiness = await inspectIntegrationReadiness(identity);
   if (!readiness.technicallyReadyToApply) {
     return {
@@ -644,6 +688,9 @@ export async function integrateCandidate(
       appliedRange: { base: identity.candidateBase, head: identity.candidateHead },
       appliedTrackedFiles: 0,
       blockers: readiness.blockers,
+      effectState: "NOT_STARTED",
+      reconciliationRequired: false,
+      affectedTrackedPaths: [],
     };
   }
   if (input.confirmApply !== true) {
@@ -657,6 +704,9 @@ export async function integrateCandidate(
           detail: "confirmApply was not set: preparation only, no mutation performed.",
         },
       ],
+      effectState: "NOT_STARTED",
+      reconciliationRequired: false,
+      affectedTrackedPaths: [],
     };
   }
 
@@ -683,12 +733,61 @@ export async function integrateCandidate(
       appliedRange: { base: canonicalBase, head: canonicalHead },
       appliedTrackedFiles: 0,
       blockers: refenceBlockers,
+      effectState: "NOT_STARTED",
+      reconciliationRequired: false,
+      affectedTrackedPaths: [],
     };
   }
 
+  // Bounded pre-apply baseline: captured immediately before producing and applying
+  // the patch, ensuring post-failure inspection can distinguish pre-existing
+  // unrelated dirt from changes introduced during this apply attempt.
+  const baselineHeadResult = await runGit(["rev-parse", "HEAD"], destination);
+  if (!baselineHeadResult.ok || !baselineHeadResult.stdout.trim()) {
+    return {
+      applied: false,
+      appliedRange: { base: canonicalBase, head: canonicalHead },
+      appliedTrackedFiles: 0,
+      blockers: [
+        {
+          code: "DESTINATION_UNAVAILABLE",
+          detail: "Destination HEAD could not be read before apply.",
+        },
+      ],
+      effectState: "NOT_STARTED",
+      reconciliationRequired: false,
+      affectedTrackedPaths: [],
+    };
+  }
+  const baselineHead = baselineHeadResult.stdout.trim().toLowerCase();
+
+  const baselineTracked = await runGit(["diff", "--name-status"], destination);
+  const baselineStaged = await runGit(["diff", "--cached", "--name-status"], destination);
+  const baselineUntracked = await runGit(["ls-files", "--others", "--exclude-standard"], destination);
+  if (!baselineTracked.ok || !baselineStaged.ok || !baselineUntracked.ok) {
+    return {
+      applied: false,
+      appliedRange: { base: canonicalBase, head: canonicalHead },
+      appliedTrackedFiles: 0,
+      blockers: [
+        {
+          code: "DESTINATION_UNAVAILABLE",
+          detail: "Destination dirty state could not be read before apply.",
+        },
+      ],
+      effectState: "NOT_STARTED",
+      reconciliationRequired: false,
+      affectedTrackedPaths: [],
+    };
+  }
+
+  const preDirtyTracked = new Set(parseNameStatus(baselineTracked.stdout).map((e) => e.path));
+  const preDirtyStaged = new Set(parseNameStatus(baselineStaged.stdout).map((e) => e.path));
+  const preUntracked = new Set(splitLines(baselineUntracked.stdout));
+
   // Residual-window observation seam (tests only): runs after the final
-  // re-fence, immediately before apply. Mutations here are NOT fenced — that is
-  // exactly the documented residual concurrency limitation.
+  // re-fence and baseline capture, immediately before apply. Mutations here are NOT
+  // fenced — that is exactly the documented residual concurrency limitation.
   await beforeApplyHook?.();
 
   const patch = await runGit(
@@ -706,34 +805,190 @@ export async function integrateCandidate(
           detail: "Committed Candidate patch could not be produced at apply time.",
         },
       ],
+      effectState: "NOT_STARTED",
+      reconciliationRequired: false,
+      affectedTrackedPaths: [],
     };
   }
 
-  // Patch-atomic by design: git apply without --reject lands the whole patch
-  // or writes nothing. It does NOT exclude concurrent writers.
-  const applied = (
-    await runGit(["apply", "--binary", "--whitespace=nowarn", "-"], destination, patch.stdout)
-  ).ok;
-  if (!applied) {
+  const applyResult = await runGit(
+    ["apply", "--binary", "--whitespace=nowarn", "-"],
+    destination,
+    patch.stdout,
+  );
+
+  if (applyResult.ok) {
+    const changed = await runGit(["diff", "--name-only"], destination);
+    const postChangedPaths = changed.ok ? splitLines(changed.stdout) : [];
+    const candidateSet = new Set(readiness.candidateChangedPaths);
+    const affected = postChangedPaths.filter((path) => candidateSet.has(path));
+    return {
+      applied: true,
+      appliedRange: { base: canonicalBase, head: canonicalHead },
+      appliedTrackedFiles: postChangedPaths.length,
+      blockers: [],
+      effectState: "APPLIED",
+      reconciliationRequired: false,
+      affectedTrackedPaths: affected.length > 0 ? affected : postChangedPaths,
+    };
+  }
+
+  // Apply failed: never assume patch-atomicity. Run physical post-failure inspection.
+  const applyErrMsg = applyResult.stderr?.trim() || "git apply failed at apply time";
+
+  // Test seam for simulating post-failure inspection error (G11)
+  try {
+    await postApplyInspectionHook?.();
+  } catch (inspectionHookErr: any) {
+    const errorMsg = inspectionHookErr?.message ?? String(inspectionHookErr);
     return {
       applied: false,
       appliedRange: { base: canonicalBase, head: canonicalHead },
       appliedTrackedFiles: 0,
       blockers: [
         {
-          code: "INTEGRATION_NOT_EXPRESSIBLE",
-          detail: "git apply failed at apply time; the destination was left unchanged.",
+          code: "APPLY_EFFECT_UNKNOWN",
+          detail: `git apply failed (${applyErrMsg}) and post-failure inspection failed: ${errorMsg}. Reconciliation is required before retry.`,
         },
       ],
+      effectState: "EFFECT_UNKNOWN",
+      reconciliationRequired: true,
+      affectedTrackedPaths: [],
     };
   }
 
-  const changed = await runGit(["diff", "--name-only"], destination);
+  const postHeadResult = await runGit(["rev-parse", "HEAD"], destination);
+  if (!postHeadResult.ok || !postHeadResult.stdout.trim()) {
+    return {
+      applied: false,
+      appliedRange: { base: canonicalBase, head: canonicalHead },
+      appliedTrackedFiles: 0,
+      blockers: [
+        {
+          code: "APPLY_EFFECT_UNKNOWN",
+          detail: `git apply failed (${applyErrMsg}) and destination HEAD could not be read. Reconciliation is required before retry.`,
+        },
+      ],
+      effectState: "EFFECT_UNKNOWN",
+      reconciliationRequired: true,
+      affectedTrackedPaths: [],
+    };
+  }
+  const postHead = postHeadResult.stdout.trim().toLowerCase();
+  if (postHead !== baselineHead) {
+    return {
+      applied: false,
+      appliedRange: { base: canonicalBase, head: canonicalHead },
+      appliedTrackedFiles: 0,
+      blockers: [
+        {
+          code: "APPLY_EFFECT_UNKNOWN",
+          detail: `git apply failed (${applyErrMsg}) and destination HEAD unexpectedly changed from ${baselineHead} to ${postHead}. Reconciliation is required before retry.`,
+        },
+      ],
+      effectState: "EFFECT_UNKNOWN",
+      reconciliationRequired: true,
+      affectedTrackedPaths: [],
+    };
+  }
+
+  const postTracked = await runGit(["diff", "--name-status"], destination);
+  const postStaged = await runGit(["diff", "--cached", "--name-status"], destination);
+  const postUntracked = await runGit(["ls-files", "--others", "--exclude-standard"], destination);
+
+  if (!postTracked.ok || !postStaged.ok || !postUntracked.ok) {
+    const failedCmd = !postTracked.ok
+      ? `diff (${postTracked.stderr?.trim() ?? ""})`
+      : !postStaged.ok
+        ? `diff --cached (${postStaged.stderr?.trim() ?? ""})`
+        : `ls-files (${postUntracked.stderr?.trim() ?? ""})`;
+    return {
+      applied: false,
+      appliedRange: { base: canonicalBase, head: canonicalHead },
+      appliedTrackedFiles: 0,
+      blockers: [
+        {
+          code: "APPLY_EFFECT_UNKNOWN",
+          detail: `git apply failed (${applyErrMsg}) and destination dirty state could not be inspected (${failedCmd}). Reconciliation is required before retry.`,
+        },
+      ],
+      effectState: "EFFECT_UNKNOWN",
+      reconciliationRequired: true,
+      affectedTrackedPaths: [],
+    };
+  }
+
+  const candidateSet = new Set(readiness.candidateChangedPaths);
+  const newlyDirtyTracked = parseNameStatus(postTracked.stdout)
+    .map((e) => e.path)
+    .filter((path) => !preDirtyTracked.has(path));
+  const newlyDirtyStaged = parseNameStatus(postStaged.stdout)
+    .map((e) => e.path)
+    .filter((path) => !preDirtyStaged.has(path));
+  const newlyUntracked = splitLines(postUntracked.stdout)
+    .filter((path) => !preUntracked.has(path));
+
+  const affectedCandidatePaths = [
+    ...new Set([
+      ...newlyDirtyTracked.filter((path) => candidateSet.has(path)),
+      ...newlyDirtyStaged.filter((path) => candidateSet.has(path)),
+      ...newlyUntracked.filter((path) => candidateSet.has(path)),
+    ]),
+  ].sort();
+
+  if (affectedCandidatePaths.length > 0) {
+    return {
+      applied: false,
+      appliedRange: { base: canonicalBase, head: canonicalHead },
+      appliedTrackedFiles: affectedCandidatePaths.length,
+      blockers: [
+        {
+          code: "PARTIAL_APPLY_DETECTED",
+          detail: `git apply failed at apply time (${applyErrMsg}) with partial filesystem effects on: ${affectedCandidatePaths.join(", ")}. Reconciliation is required before retry.`,
+        },
+      ],
+      effectState: "PARTIAL_EFFECT",
+      reconciliationRequired: true,
+      affectedTrackedPaths: affectedCandidatePaths,
+    };
+  }
+
+  // If candidate paths were untouched, check if concurrent mutations occurred outside candidateSet
+  const otherNewDirty = [
+    ...newlyDirtyTracked.filter((path) => !candidateSet.has(path)),
+    ...newlyDirtyStaged.filter((path) => !candidateSet.has(path)),
+  ];
+  if (otherNewDirty.length > 0) {
+    return {
+      applied: false,
+      appliedRange: { base: canonicalBase, head: canonicalHead },
+      appliedTrackedFiles: 0,
+      blockers: [
+        {
+          code: "APPLY_EFFECT_UNKNOWN",
+          detail: `git apply failed (${applyErrMsg}) and concurrent external mutations occurred during apply (${otherNewDirty.join(", ")}). Reconciliation is required before retry.`,
+        },
+      ],
+      effectState: "EFFECT_UNKNOWN",
+      reconciliationRequired: true,
+      affectedTrackedPaths: [],
+    };
+  }
+
+  // Destination physically confirmed unchanged relative to baseline
   return {
-    applied: true,
+    applied: false,
     appliedRange: { base: canonicalBase, head: canonicalHead },
-    appliedTrackedFiles: changed.ok ? splitLines(changed.stdout).length : 0,
-    blockers: [],
+    appliedTrackedFiles: 0,
+    blockers: [
+      {
+        code: "INTEGRATION_NOT_EXPRESSIBLE",
+        detail: `git apply failed at apply time (${applyErrMsg}); destination confirmed unchanged.`,
+      },
+    ],
+    effectState: "CONFIRMED_NO_EFFECT",
+    reconciliationRequired: false,
+    affectedTrackedPaths: [],
   };
 }
 

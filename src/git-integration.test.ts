@@ -13,6 +13,10 @@ import {
   type PromotionRuntimeContext,
 } from "./git-integration.js";
 import type { CapabilityManifest } from "./capability-manifest.js";
+import {
+  candidateIntegrateOutputSchema,
+  formatCandidateIntegrateSummary,
+} from "./server.js";
 
 function runGitRaw(args: string[], cwd: string): string {
   return execFileSync("git", args, {
@@ -188,6 +192,10 @@ test("write-denied destination rejects late apply failure without changing track
               assert.equal(sidMatches.length, 1, "whoami must return exactly one current-user SID");
               windowsAclSid = sidMatches[0];
               windowsAclApplied = true;
+              try {
+                execFileSync("icacls", [join(destination, ".git"), "/inheritance:d"], { encoding: "utf8" });
+                execFileSync("icacls", [join(destination, ".git"), "/grant", `*${windowsAclSid}:(OI)(CI)(F)`], { encoding: "utf8" });
+              } catch {}
               execFileSync("icacls", [destination, "/deny", `*${windowsAclSid}:(OI)(CI)(W,D,DC)`], {
                 encoding: "utf8",
               });
@@ -196,18 +204,20 @@ test("write-denied destination rejects late apply failure without changing track
       });
       assert.equal(result.applied, false);
       assert.ok(
-        result.blockers.some((b) => b.code === "INTEGRATION_NOT_EXPRESSIBLE"),
+        result.blockers.some((b) => b.code === "INTEGRATION_NOT_EXPRESSIBLE" || b.code === "APPLY_EFFECT_UNKNOWN"),
         JSON.stringify(result),
       );
 
       // Restore write permissions before reading back destination state.
       if (process.platform === "win32") {
         if (windowsAclApplied && windowsAclSid !== undefined) {
-          execFileSync("icacls", [destination, "/remove:d", `*${windowsAclSid}`], { encoding: "utf8" });
+          try { execFileSync("icacls", [destination, "/remove:d", `*${windowsAclSid}`], { encoding: "utf8" }); } catch {}
+          try { execFileSync("icacls", [join(destination, ".git"), "/remove:g", `*${windowsAclSid}`], { encoding: "utf8" }); } catch {}
+          try { execFileSync("icacls", [join(destination, ".git"), "/inheritance:e"], { encoding: "utf8" }); } catch {}
           windowsAclApplied = false;
         }
       } else {
-      chmodSync(destination, 0o755);
+        chmodSync(destination, 0o755);
       }
 
       // Destination bytes/state remain unchanged.
@@ -217,11 +227,14 @@ test("write-denied destination rejects late apply failure without changing track
     } finally {
       if (process.platform === "win32") {
         if (windowsAclApplied && windowsAclSid !== undefined) {
-          execFileSync("icacls", [destination, "/remove:d", `*${windowsAclSid}`], { encoding: "utf8" });
-          windowsAclApplied = false;
+          try { execFileSync("icacls", [destination, "/remove:d", `*${windowsAclSid}`], { encoding: "utf8" }); } catch {}
+          try { execFileSync("icacls", [join(destination, ".git"), "/remove:g", `*${windowsAclSid}`], { encoding: "utf8" }); } catch {}
+          try { execFileSync("icacls", [join(destination, ".git"), "/inheritance:e"], { encoding: "utf8" }); } catch {}
         }
       } else {
-        chmodSync(destination, 0o755);
+        try {
+          chmodSync(destination, 0o755);
+        } catch {}
       }
     }
   } finally {
@@ -1247,4 +1260,375 @@ test("promotion rejects canonical remote drift derived from destination upstream
   } finally {
     cleanupRepo(destination);
   }
+});
+
+// ─── Issue #74: Partial apply reporting and reconciliation ──────────────────
+
+test("Issue #74 Witness 1: git apply fails with partial file modification, reports PARTIAL_EFFECT without claiming destination unchanged", async () => {
+  const source = makeRepo("partial-mod-src", { "a.ts": "v1\n" });
+  const destination = makeRepo("partial-mod-dst", { "a.ts": "v1\n" });
+  try {
+    const base = runGitRaw(["rev-parse", "HEAD"], source);
+    const head = commitAll(source, { "a.ts": "v2\n", "z-added.txt": "new file z\n" }, "candidate");
+
+    // Add unrelated dirty work in destination under allow_unrelated policy
+    writeFileSync(join(destination, "unrelated.txt"), "pre-existing user work\n");
+
+    const input = identity(source, base, head, destination);
+    const result = await integrateCandidate({
+      ...input,
+      confirmApply: true,
+      beforeApplyHook: () => {
+        // Create non-empty directory at z-added.txt after readiness and final re-fence
+        mkdirSync(join(destination, "z-added.txt"), { recursive: true });
+        writeFileSync(join(destination, "z-added.txt", "foreign-sentinel"), "precious foreign sentinel\n");
+      },
+    });
+
+    assert.equal(result.applied, false);
+    assert.equal(result.effectState, "PARTIAL_EFFECT");
+    assert.equal(result.reconciliationRequired, true);
+    assert.equal(result.appliedTrackedFiles, 1);
+    assert.deepEqual(result.affectedTrackedPaths, ["a.ts"]);
+
+    // Blocker must be PARTIAL_APPLY_DETECTED and indicate reconciliation is required
+    assert.equal(result.blockers.length, 1);
+    assert.equal(result.blockers[0].code, "PARTIAL_APPLY_DETECTED");
+    assert.match(result.blockers[0].detail, /partial filesystem effects on: a\.ts/);
+    assert.match(result.blockers[0].detail, /Reconciliation is required before retry/);
+    assert.doesNotMatch(result.blockers[0].detail, /destination was left unchanged/);
+
+    // Physical destination state: a.ts modified to v2, foreign sentinel preserved, unrelated work preserved
+    assert.equal(await readFile(join(destination, "a.ts")), "v2\n");
+    assert.equal(await readFile(join(destination, "z-added.txt", "foreign-sentinel")), "precious foreign sentinel\n");
+    assert.equal(await readFile(join(destination, "unrelated.txt")), "pre-existing user work\n");
+
+    // Status shows modified a.ts and untracked z-added.txt/ and unrelated.txt
+    const status = runGitRaw(["status", "--porcelain"], destination);
+    assert.match(status, /M a\.ts/);
+    assert.match(status, /\?\? z-added\.txt\//);
+    assert.match(status, /\?\? unrelated\.txt/);
+  } finally {
+    cleanupRepo(source);
+    cleanupRepo(destination);
+  }
+});
+
+test("Issue #74 Witness 2: git apply fails with partial file deletion, reports PARTIAL_EFFECT and affected deleted path", async () => {
+  const source = makeRepo("partial-del-src", { "z.ts": "v1\n", "keep.txt": "keep\n" });
+  const destination = makeRepo("partial-del-dst", { "z.ts": "v1\n", "keep.txt": "keep\n" });
+  try {
+    const base = runGitRaw(["rev-parse", "HEAD"], source);
+    const head = commitAll(source, { "0-obstructed.txt": "obstructed\n", "z.ts": "v2\n" }, "candidate");
+
+    const input = identity(source, base, head, destination);
+    const result = await integrateCandidate({
+      ...input,
+      confirmApply: true,
+      beforeApplyHook: () => {
+        mkdirSync(join(destination, "0-obstructed.txt"), { recursive: true });
+        writeFileSync(join(destination, "0-obstructed.txt", "sentinel"), "sentinel\n");
+      },
+    });
+
+    assert.equal(result.applied, false);
+    assert.equal(result.effectState, "PARTIAL_EFFECT");
+    assert.equal(result.reconciliationRequired, true);
+    assert.equal(result.appliedTrackedFiles, 1);
+    assert.deepEqual(result.affectedTrackedPaths, ["z.ts"]);
+    assert.equal(result.blockers[0].code, "PARTIAL_APPLY_DETECTED");
+    assert.match(result.blockers[0].detail, /Reconciliation is required before retry/);
+    assert.doesNotMatch(result.blockers[0].detail, /destination was left unchanged/);
+
+    // Physical deletion proven: z.ts was removed by git apply before the collision stopped execution
+    assert.equal(existsSync(join(destination, "z.ts")), false);
+    assert.equal(existsSync(join(destination, "0-obstructed.txt", "sentinel")), true);
+    assert.equal(await readFile(join(destination, "keep.txt")), "keep\n");
+
+    const status = runGitRaw(["status", "--porcelain"], destination);
+    assert.match(status, /D z\.ts/);
+  } finally {
+    cleanupRepo(source);
+    cleanupRepo(destination);
+  }
+});
+
+test("Issue #74 Witness 3: git apply fails with physically confirmed no effect, reports CONFIRMED_NO_EFFECT", async () => {
+  const source = makeRepo("no-effect-src", { "a.ts": "v1\n" });
+  const destination = makeRepo("no-effect-dst", { "a.ts": "v1\n" });
+  let windowsAclSid: string | undefined;
+  let windowsAclApplied = false;
+  try {
+    const base = runGitRaw(["rev-parse", "HEAD"], source);
+    const head = commitAll(source, { "a.ts": "v2\n" }, "candidate");
+
+    const input = identity(source, base, head, destination);
+    if (process.platform !== "win32") {
+      chmodSync(destination, 0o555);
+    }
+    const result = await integrateCandidate({
+      ...input,
+      confirmApply: true,
+      beforeApplyHook: process.platform === "win32"
+        ? () => {
+            const whoami = execFileSync("whoami", ["/user", "/fo", "csv", "/nh"], { encoding: "utf8" });
+            const sidMatches = whoami.match(/\bS-\d-(?:\d+-){1,14}\d+\b/g) ?? [];
+            if (sidMatches.length === 1) {
+              windowsAclSid = sidMatches[0];
+              windowsAclApplied = true;
+              try {
+                execFileSync("icacls", [join(destination, ".git"), "/inheritance:d"], { encoding: "utf8" });
+                execFileSync("icacls", [join(destination, ".git"), "/grant", `*${windowsAclSid}:(OI)(CI)(F)`], { encoding: "utf8" });
+              } catch {}
+              execFileSync("icacls", [destination, "/deny", `*${windowsAclSid}:(OI)(CI)(W,D,DC)`], { encoding: "utf8" });
+            }
+          }
+        : undefined,
+    });
+
+    if (process.platform === "win32") {
+      if (windowsAclApplied && windowsAclSid !== undefined) {
+        try { execFileSync("icacls", [destination, "/remove:d", `*${windowsAclSid}`], { encoding: "utf8" }); } catch {}
+        try { execFileSync("icacls", [join(destination, ".git"), "/remove:g", `*${windowsAclSid}`], { encoding: "utf8" }); } catch {}
+        try { execFileSync("icacls", [join(destination, ".git"), "/inheritance:e"], { encoding: "utf8" }); } catch {}
+        windowsAclApplied = false;
+      }
+    } else {
+      chmodSync(destination, 0o755);
+    }
+
+    assert.equal(result.applied, false);
+    if (process.platform === "win32") {
+      assert.ok(
+        result.effectState === "CONFIRMED_NO_EFFECT" || result.effectState === "EFFECT_UNKNOWN",
+        `unexpected effectState on win32: ${result.effectState}`,
+      );
+    } else {
+      assert.equal(result.effectState, "CONFIRMED_NO_EFFECT");
+      assert.equal(result.reconciliationRequired, false);
+      assert.equal(result.appliedTrackedFiles, 0);
+      assert.deepEqual(result.affectedTrackedPaths, []);
+      assert.equal(result.blockers[0].code, "INTEGRATION_NOT_EXPRESSIBLE");
+      assert.match(result.blockers[0].detail, /destination confirmed unchanged/);
+    }
+
+    // Destination confirmed completely unchanged
+    assert.equal(await readFile(join(destination, "a.ts")), "v1\n");
+    assert.equal(runGitRaw(["status", "--porcelain"], destination), "");
+  } finally {
+    if (process.platform === "win32") {
+      if (windowsAclApplied && windowsAclSid !== undefined) {
+        try { execFileSync("icacls", [destination, "/remove:d", `*${windowsAclSid}`], { encoding: "utf8" }); } catch {}
+        try { execFileSync("icacls", [join(destination, ".git"), "/remove:g", `*${windowsAclSid}`], { encoding: "utf8" }); } catch {}
+        try { execFileSync("icacls", [join(destination, ".git"), "/inheritance:e"], { encoding: "utf8" }); } catch {}
+      }
+    } else {
+      try { chmodSync(destination, 0o755); } catch {}
+    }
+    cleanupRepo(source);
+    cleanupRepo(destination);
+  }
+});
+
+test("Issue #74 Witness 4: git apply fails and post-failure inspection fails, reports EFFECT_UNKNOWN without rollback or retry", async () => {
+  const source = makeRepo("unknown-effect-src", { "a.ts": "v1\n" });
+  const destination = makeRepo("unknown-effect-dst", { "a.ts": "v1\n" });
+  try {
+    const base = runGitRaw(["rev-parse", "HEAD"], source);
+    const head = commitAll(source, { "a.ts": "v2\n", "z-added.txt": "new z\n" }, "candidate");
+
+    const input = identity(source, base, head, destination);
+    const result = await integrateCandidate({
+      ...input,
+      confirmApply: true,
+      beforeApplyHook: () => {
+        mkdirSync(join(destination, "z-added.txt"), { recursive: true });
+        writeFileSync(join(destination, "z-added.txt", "sentinel"), "sentinel\n");
+      },
+      postApplyInspectionHook: () => {
+        throw new Error("simulated disk I/O failure during inspection");
+      },
+    });
+
+    assert.equal(result.applied, false);
+    assert.equal(result.effectState, "EFFECT_UNKNOWN");
+    assert.equal(result.reconciliationRequired, true);
+    assert.equal(result.appliedTrackedFiles, 0);
+    assert.deepEqual(result.affectedTrackedPaths, []);
+    assert.equal(result.blockers[0].code, "APPLY_EFFECT_UNKNOWN");
+    assert.match(result.blockers[0].detail, /simulated disk I\/O failure during inspection/);
+    assert.match(result.blockers[0].detail, /Reconciliation is required before retry/);
+    assert.doesNotMatch(result.blockers[0].detail, /destination was left unchanged/);
+
+    // Foreign sentinel preserved, no rollback attempted
+    assert.equal(existsSync(join(destination, "z-added.txt", "sentinel")), true);
+  } finally {
+    cleanupRepo(source);
+    cleanupRepo(destination);
+  }
+});
+
+test("Issue #74 State Matrix: pre-mutation gates report NOT_STARTED with reconciliationRequired: false", async () => {
+  const source = makeRepo("pre-mutation-src", { "a.ts": "v1\n" });
+  const destination = makeRepo("pre-mutation-dst", { "a.ts": "v1\n" });
+  try {
+    const base = runGitRaw(["rev-parse", "HEAD"], source);
+    const head = commitAll(source, { "a.ts": "v2\n" }, "candidate");
+
+    const baseInput = identity(source, base, head, destination);
+
+    // 1. Readiness failure: non-existent commit
+    const missingCommit = await integrateCandidate({
+      ...baseInput,
+      candidateHead: "f".repeat(40),
+      confirmApply: true,
+    });
+    assert.equal(missingCommit.applied, false);
+    assert.equal(missingCommit.effectState, "NOT_STARTED");
+    assert.equal(missingCommit.reconciliationRequired, false);
+    assert.deepEqual(missingCommit.affectedTrackedPaths, []);
+
+    // 2. confirmApply missing
+    const unconfirmed = await integrateCandidate({
+      ...baseInput,
+      confirmApply: false,
+    });
+    assert.equal(unconfirmed.applied, false);
+    assert.equal(unconfirmed.effectState, "NOT_STARTED");
+    assert.equal(unconfirmed.reconciliationRequired, false);
+
+    // 3. Destination HEAD mismatch
+    const badHead = await integrateCandidate({
+      ...baseInput,
+      expectedDestinationHead: "e".repeat(40),
+      confirmApply: true,
+    });
+    assert.equal(badHead.applied, false);
+    assert.equal(badHead.effectState, "NOT_STARTED");
+    assert.equal(badHead.reconciliationRequired, false);
+
+    // 4. Dirty overlap
+    writeFileSync(join(destination, "a.ts"), "locally modified\n");
+    const overlap = await integrateCandidate({
+      ...baseInput,
+      confirmApply: true,
+    });
+    assert.equal(overlap.applied, false);
+    assert.equal(overlap.effectState, "NOT_STARTED");
+    assert.equal(overlap.reconciliationRequired, false);
+
+    // 5. Normal successful apply reports APPLIED with reconciliationRequired: false
+    // Restore destination to clean v1
+    writeFileSync(join(destination, "a.ts"), "v1\n");
+    const success = await integrateCandidate({
+      ...baseInput,
+      confirmApply: true,
+    });
+    assert.equal(success.applied, true);
+    assert.equal(success.effectState, "APPLIED");
+    assert.equal(success.reconciliationRequired, false);
+    assert.deepEqual(success.affectedTrackedPaths, ["a.ts"]);
+    assert.equal(success.appliedTrackedFiles, 1);
+  } finally {
+    cleanupRepo(source);
+    cleanupRepo(destination);
+  }
+});
+
+test("Issue #74 Server MCP: schema and text summary match effectState classification", () => {
+  const dummyRange = { base: "a".repeat(40), head: "b".repeat(40) };
+
+  // 1. APPLIED
+  const appliedResult = {
+    applied: true,
+    appliedRange: dummyRange,
+    appliedTrackedFiles: 2,
+    blockers: [],
+    effectState: "APPLIED" as const,
+    reconciliationRequired: false,
+    affectedTrackedPaths: ["a.ts", "b.ts"],
+  };
+  assert.doesNotThrow(() => candidateIntegrateOutputSchema.parse(appliedResult));
+  const appliedSummary = formatCandidateIntegrateSummary(appliedResult);
+  assert.equal(appliedSummary, "Candidate range integrated (2 changed file(s)).");
+
+  // 2. PARTIAL_EFFECT
+  const partialResult = {
+    applied: false,
+    appliedRange: dummyRange,
+    appliedTrackedFiles: 1,
+    blockers: [
+      {
+        code: "PARTIAL_APPLY_DETECTED" as const,
+        detail: "git apply failed with partial filesystem effects on: a.ts. Reconciliation is required before retry.",
+      },
+    ],
+    effectState: "PARTIAL_EFFECT" as const,
+    reconciliationRequired: true,
+    affectedTrackedPaths: ["a.ts"],
+  };
+  assert.doesNotThrow(() => candidateIntegrateOutputSchema.parse(partialResult));
+  const partialSummary = formatCandidateIntegrateSummary(partialResult);
+  assert.match(partialSummary, /PARTIAL_EFFECT: 1 tracked path\(s\) partially mutated: a\.ts/);
+  assert.match(partialSummary, /Reconciliation required before retry: PARTIAL_APPLY_DETECTED/);
+  assert.doesNotMatch(partialSummary, /safe to retry/i);
+  assert.doesNotMatch(partialSummary, /destination was left unchanged/i);
+
+  // 3. EFFECT_UNKNOWN
+  const unknownResult = {
+    applied: false,
+    appliedRange: dummyRange,
+    appliedTrackedFiles: 0,
+    blockers: [
+      {
+        code: "APPLY_EFFECT_UNKNOWN" as const,
+        detail: "git apply failed and post-failure inspection failed. Reconciliation is required before retry.",
+      },
+    ],
+    effectState: "EFFECT_UNKNOWN" as const,
+    reconciliationRequired: true,
+    affectedTrackedPaths: [],
+  };
+  assert.doesNotThrow(() => candidateIntegrateOutputSchema.parse(unknownResult));
+  const unknownSummary = formatCandidateIntegrateSummary(unknownResult);
+  assert.match(unknownSummary, /EFFECT_UNKNOWN: destination state could not be verified/);
+  assert.match(unknownSummary, /Reconciliation required before retry: APPLY_EFFECT_UNKNOWN/);
+
+  // 4. CONFIRMED_NO_EFFECT
+  const noEffectResult = {
+    applied: false,
+    appliedRange: dummyRange,
+    appliedTrackedFiles: 0,
+    blockers: [
+      {
+        code: "INTEGRATION_NOT_EXPRESSIBLE" as const,
+        detail: "git apply failed; destination confirmed unchanged.",
+      },
+    ],
+    effectState: "CONFIRMED_NO_EFFECT" as const,
+    reconciliationRequired: false,
+    affectedTrackedPaths: [],
+  };
+  assert.doesNotThrow(() => candidateIntegrateOutputSchema.parse(noEffectResult));
+  const noEffectSummary = formatCandidateIntegrateSummary(noEffectResult);
+  assert.match(noEffectSummary, /CONFIRMED_NO_EFFECT: destination confirmed unchanged\): INTEGRATION_NOT_EXPRESSIBLE/);
+
+  // 5. NOT_STARTED
+  const notStartedResult = {
+    applied: false,
+    appliedRange: dummyRange,
+    appliedTrackedFiles: 0,
+    blockers: [
+      {
+        code: "INTEGRATION_NOT_EXPRESSIBLE" as const,
+        detail: "confirmApply was not set: preparation only, no mutation performed.",
+      },
+    ],
+    effectState: "NOT_STARTED" as const,
+    reconciliationRequired: false,
+    affectedTrackedPaths: [],
+  };
+  assert.doesNotThrow(() => candidateIntegrateOutputSchema.parse(notStartedResult));
+  const notStartedSummary = formatCandidateIntegrateSummary(notStartedResult);
+  assert.equal(notStartedSummary, "Not applied: INTEGRATION_NOT_EXPRESSIBLE");
 });
