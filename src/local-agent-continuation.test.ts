@@ -619,3 +619,108 @@ test("issue #5: continuation restores live timing during active turns and stabil
     f.clean();
   }
 });
+
+test("continuation rejects continuation when providerSessionId is missing with REBIND_REQUIRED (Issue #15 Residual A/D)", async () => {
+  const f = setupGitFixture();
+  const agyProfiles: LocalAgentProfile[] = [
+    {
+      name: "agy-reviewer",
+      description: "test agy",
+      provider: "agy",
+      disabled: false,
+      filePath: "agy.md",
+      body: "agy prompt",
+      write_mode: "allowed",
+    },
+  ];
+  // Simulate an agy agent turn that exited without establishing a providerSessionId
+  const { manager, clean } = setupManager({}, async () => ({
+    provider: "agy",
+    providerSessionId: null,
+    items: [],
+    finalResponse: "partial without session",
+  }));
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_missing_sess",
+      workspaceRoot: f.repo,
+      profileName: "agy-reviewer",
+      prompt: "work",
+      profiles: agyProfiles,
+    });
+    let record = (manager as any).store.getById(started.agentId);
+    const promptFile = `${f.root}/prompt-miss.txt`;
+    writeFileSync(promptFile, "work");
+    await manager.runWorkerTurnFromFile(started.agentId, promptFile, record.workerToken!);
+
+    record = (manager as any).store.getById(started.agentId);
+    assert.equal(record.status, "idle");
+    assert.equal(record.providerSessionId, undefined);
+
+    // Subsequent continuation MUST fail with REBIND_REQUIRED to prevent silent --new-project conversation
+    await assert.rejects(
+      manager.continueAgent({
+        workspaceId: "ws_missing_sess",
+        workspaceRoot: f.repo,
+        agentId: started.agentId,
+        prompt: "continue without session",
+      }),
+      (err: any) =>
+        err.code === "REBIND_REQUIRED" &&
+        /lost or unestablished provider session identity/i.test(err.message),
+    );
+  } finally {
+    await clean();
+    f.clean();
+  }
+});
+
+test("reconcileAgent reports KNOWN_UNVERIFIED or UNKNOWN rather than projecting local record.status (Issue #15 Residual C)", async () => {
+  const f = setupGitFixture();
+  const { manager, clean } = setupManager({}, async () => ({
+    provider: "codex",
+    providerSessionId: "sess-reconcile-test",
+    items: [],
+    finalResponse: "done",
+  }));
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_reconcile_test",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "work",
+      profiles: mockProfiles,
+    });
+
+    // Case 1: Before turn finishes, providerSessionId is not yet known -> providerState is UNKNOWN
+    const earlyReconcile = await manager.reconcileAgent({
+      workspaceId: "ws_reconcile_test",
+      workspaceRoot: f.repo,
+      isolated: true,
+      agentId: started.agentId,
+    });
+    assert.equal(earlyReconcile.agentState, "starting");
+    assert.equal(earlyReconcile.providerState, "UNKNOWN");
+
+    // Complete turn
+    const record = (manager as any).store.getById(started.agentId);
+    const promptFile = `${f.root}/prompt-rec.txt`;
+    writeFileSync(promptFile, "work");
+    await manager.runWorkerTurnFromFile(started.agentId, promptFile, record.workerToken!);
+
+    // Case 2: After turn finishes with providerSessionId established -> providerState is KNOWN_UNVERIFIED, NOT 'idle'
+    const postReconcile = await manager.reconcileAgent({
+      workspaceId: "ws_reconcile_test",
+      workspaceRoot: f.repo,
+      isolated: true,
+      agentId: started.agentId,
+    });
+    assert.equal(postReconcile.agentState, "idle");
+    assert.equal(postReconcile.providerState, "KNOWN_UNVERIFIED");
+    assert.notEqual(postReconcile.providerState, postReconcile.agentState);
+  } finally {
+    await clean();
+    f.clean();
+  }
+});
+
