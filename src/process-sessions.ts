@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { realpathSync } from "node:fs";
+import { StringDecoder } from "node:string_decoder";
 import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
 
 const DEFAULT_EXEC_YIELD_MS = 10_000;
@@ -705,15 +706,22 @@ export class ProcessSessionManager {
           });
         })();
 
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
+
     session.process = {
       write: (data) => child.stdin.write(data),
       kill: (signal = "SIGTERM") => terminateProcessTree(child, signal, detached),
       resize: input.tty ? () => undefined : undefined,
     };
-    child.stdout.on("data", (data: Buffer) => this.append(session, data.toString("utf8")));
-    child.stderr.on("data", (data: Buffer) => this.append(session, data.toString("utf8")));
+    child.stdout.on("data", (data: Buffer) => this.append(session, stdoutDecoder.write(data)));
+    child.stderr.on("data", (data: Buffer) => this.append(session, stderrDecoder.write(data)));
     child.on("error", (error) => this.append(session, `${error.message}\n`));
-    child.on("close", (code, signal) => this.finish(session, code ?? undefined, signal ?? undefined));
+    child.on("close", (code, signal) => {
+      this.append(session, stdoutDecoder.end());
+      this.append(session, stderrDecoder.end());
+      this.finish(session, code ?? undefined, signal ?? undefined);
+    });
   }
 
   private async startPty(session: ProcessSession, input: StartCommandInput): Promise<void> {
