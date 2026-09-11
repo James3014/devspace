@@ -56,6 +56,17 @@ export interface ServerConfig {
   repositoryIntelligenceRoot?: string;
   repositoryIntelligenceExpectedHead?: string;
   repositoryIntelligencePythonBin?: string;
+  hostOperationsEnabled?: boolean;
+  hostOperationExecutable?: string;
+  hostOperationExecutableSha256?: string;
+  hostOperationAllowedPaths?: string[];
+  hostOperationOwnerClientId?: string;
+  hostOperationCwd?: string;
+  hostOperationArgv?: string[];
+  hostOperationReadPaths?: string[];
+  hostOperationMaxWallMs?: number;
+  hostOperationMaxIdleMs?: number;
+  hostOperationAllowLongLived?: boolean;
 }
 
 function parsePort(value: string | number | undefined): number {
@@ -415,7 +426,26 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     repositoryIntelligencePythonBin: parseRepositoryIntelligencePythonBin(
       env.DEVSPACE_REPOSITORY_INTELLIGENCE_PYTHON_BIN,
     ),
+    hostOperationsEnabled: parseBoolean(env.DEVSPACE_HOST_OPERATIONS),
+    hostOperationExecutable: env.DEVSPACE_HOST_OPERATION_EXECUTABLE?.trim() || undefined,
+    hostOperationExecutableSha256: env.DEVSPACE_HOST_OPERATION_EXECUTABLE_SHA256?.trim() || undefined,
+    hostOperationAllowedPaths: parsePathList(env.DEVSPACE_HOST_OPERATION_ALLOWED_PATHS),
+    hostOperationOwnerClientId: env.DEVSPACE_HOST_OPERATION_OWNER_CLIENT_ID?.trim() || undefined,
+    hostOperationCwd: env.DEVSPACE_HOST_OPERATION_CWD?.trim() || undefined,
+    hostOperationArgv: parseHostOperationArgv(env.DEVSPACE_HOST_OPERATION_ARGV),
+    hostOperationReadPaths: parsePathList(env.DEVSPACE_HOST_OPERATION_READ_PATHS),
+    hostOperationMaxWallMs: env.DEVSPACE_HOST_OPERATION_MAX_WALL_MS ? parsePositiveInteger(env.DEVSPACE_HOST_OPERATION_MAX_WALL_MS, 30_000, "DEVSPACE_HOST_OPERATION_MAX_WALL_MS", 120_000) : undefined,
+    hostOperationMaxIdleMs: env.DEVSPACE_HOST_OPERATION_MAX_IDLE_MS ? parsePositiveInteger(env.DEVSPACE_HOST_OPERATION_MAX_IDLE_MS, 30_000, "DEVSPACE_HOST_OPERATION_MAX_IDLE_MS", 120_000) : undefined,
+    hostOperationAllowLongLived: parseBoolean(env.DEVSPACE_HOST_OPERATION_ALLOW_LONG_LIVED),
   };
+}
+
+function parseHostOperationArgv(value: string | undefined): string[] | undefined {
+  if (!value?.trim()) return undefined;
+  let parsed: unknown;
+  try { parsed = JSON.parse(value); } catch { throw new Error("Invalid DEVSPACE_HOST_OPERATION_ARGV: expected a JSON string array"); }
+  if (!Array.isArray(parsed) || parsed.some(item => typeof item !== "string" || item.includes("\0"))) throw new Error("Invalid DEVSPACE_HOST_OPERATION_ARGV: expected a JSON string array without NUL bytes");
+  return parsed;
 }
 
 function numberConfigValue(value: number | undefined): string | undefined {

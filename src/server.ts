@@ -102,6 +102,7 @@ import {
   NEXUS_GATEWAY_RECOVERY_SCHEMA,
   type DurableOperationRecord,
 } from "./durable-operations.js";
+import { HostOperationRegistrar } from "./host-operations.js";
 import {
   CodexGoalSessionManager,
   type CodexGoalState,
@@ -1399,6 +1400,7 @@ function registerCutoverMcpTools(
   server: McpServer,
   control: CutoverMcpControlContext,
   durableOperations?: DurableOperationManager,
+  hostOperations?: HostOperationRegistrar,
 ): void {
   const cutoverRecordSchema = z.record(z.string(), z.unknown());
   const modeSchema = z.enum(["normal", "drain", "reconcile-only"]);
@@ -2197,6 +2199,7 @@ export function createMcpServer(
   clineCatalogService?: ClineCatalogService,
   chatSwarmLifecycle?: ChatSwarmLifecycle,
   carrierBindings?: CarrierBindingStore,
+  hostOperations?: HostOperationRegistrar,
 ): McpServer {
   const runtimeBuildIdentity = runtimeBuildIdentityContext?.identity
     ?? describeRuntimeBuildIdentity({
@@ -2527,7 +2530,7 @@ export function createMcpServer(
       operationId: z.string(),
       attemptKey: z.string(),
       requestHash: z.string(),
-      kind: z.enum(["workspace_clone", "dependency_sync", "nexus_gateway_recover", "cutover_start"]),
+      kind: z.enum(["workspace_clone", "dependency_sync", "nexus_gateway_recover", "cutover_start", "host_operation"]),
       authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]),
       scopeRoot: z.string(),
       workspaceId: z.string().optional(),
@@ -2546,6 +2549,25 @@ export function createMcpServer(
       )],
       structuredContent: operation as unknown as Record<string, unknown>,
     });
+
+    if (hostOperations) {
+      const hostInput = {
+        attemptKey: z.string().min(1).max(128),
+        executablePath: z.string(),
+        argv: z.array(z.string()).min(1).max(32),
+        cwd: z.string(),
+        allowedPaths: z.object({ write: z.array(z.string()).min(1).max(16), read: z.array(z.string()).max(16).optional() }),
+        maxWallMs: z.number().int().positive().max(120_000),
+        maxIdleMs: z.number().int().positive().max(120_000),
+        allowLongLivedProcess: z.boolean(),
+        workspaceRoot: z.string().optional(),
+      };
+      registerAppTool(server, "host_operation_preflight", { title: "Host operation preflight", description: "Preflight one startup-authorized macOS host operation. Requires trusted Owner context; does not execute.", inputSchema: hostInput, _meta: {}, annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false } }, async (input, extra) => { const owner = dependencyConsumerContext(extra); const output = await hostOperations.preflight(input, owner.clientId); return { content: [textBlock(JSON.stringify(output))], structuredContent: output }; });
+      registerAppTool(server, "host_operation_start", { title: "Start host operation", description: "Start one exact startup-authorized host operation under the OS sandbox.", inputSchema: hostInput, outputSchema: durableOperationOutputSchema, _meta: {}, annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false } }, async (input, extra) => { const owner = dependencyConsumerContext(extra); return operationResponse(await hostOperations.start(input, owner.clientId)); });
+      registerAppTool(server, "host_operation_status", { title: "Host operation status", description: "Read one exact host operation.", inputSchema: { operationId: z.string().min(1) }, outputSchema: durableOperationOutputSchema, _meta: {}, annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false } }, async ({ operationId }, extra) => { const owner = dependencyConsumerContext(extra); return operationResponse(hostOperations.status(operationId, owner.clientId)); });
+      registerAppTool(server, "host_operation_reconcile", { title: "Reconcile host operation", description: "Reconcile one exact host operation after timeout, disconnect, or restart.", inputSchema: { operationId: z.string().min(1) }, outputSchema: durableOperationOutputSchema, _meta: {}, annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false } }, async ({ operationId }, extra) => { const owner = dependencyConsumerContext(extra); return operationResponse(await hostOperations.reconcile(operationId, owner.clientId)); });
+      registerAppTool(server, "host_operation_cancel", { title: "Cancel host operation", description: "Cancel only the exact owned process for one host operation.", inputSchema: { operationId: z.string().min(1) }, outputSchema: durableOperationOutputSchema, _meta: {}, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false } }, async ({ operationId }, extra) => { const owner = dependencyConsumerContext(extra); return operationResponse(await hostOperations.cancel(operationId, owner.clientId)); });
+    }
 
     const nexusSafeId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
     const nexusHash = z.string().regex(/^[0-9a-f]{64}$/);
@@ -5078,6 +5100,21 @@ export function createServer(
   if (carrierBindings) initializationCleanups.push(() => carrierBindings.close());
   const durableOperations = new DurableOperationManager(config, undefined, undefined, undefined, options.coordination ?? carrierBindings?.readers);
   initializationCleanups.push(() => durableOperations.close());
+  const hostOperations = config.hostOperationsEnabled && config.hostOperationExecutable && config.hostOperationExecutableSha256 && config.hostOperationOwnerClientId && config.hostOperationCwd
+    ? new HostOperationRegistrar(durableOperations.store, {
+      enabled: true,
+      ownerClientId: config.hostOperationOwnerClientId,
+      executablePath: config.hostOperationExecutable,
+      executableSha256: config.hostOperationExecutableSha256,
+      argv: config.hostOperationArgv ?? [],
+      cwd: config.hostOperationCwd,
+      allowedPaths: { write: config.hostOperationAllowedPaths ?? [], read: config.hostOperationReadPaths ?? [] },
+      maxWallMs: config.hostOperationMaxWallMs ?? 30_000,
+      maxIdleMs: config.hostOperationMaxIdleMs ?? 30_000,
+      allowLongLivedProcess: config.hostOperationAllowLongLived === true,
+    })
+    : undefined;
+  if (hostOperations) initializationCleanups.push(() => { void hostOperations.dispose(); });
   const opencodeCatalogSource = createMcpOpencodeCatalogSource();
   initializationCleanups.push(() => opencodeCatalogSource.close());
   const clineCatalogService = new ClineCatalogService();
@@ -5720,6 +5757,7 @@ export function createServer(
           clineCatalogService,
           chatSwarmLifecycle,
           carrierBindings,
+          hostOperations,
         );
         await server.connect(transport);
       } else {
@@ -5757,6 +5795,7 @@ export function createServer(
         logSessionCloseResults("server_shutdown", results);
         codexGoals?.shutdown();
         processSessions.shutdown();
+        await hostOperations?.dispose();
         durableOperations.close();
         carrierBindings?.close();
         chatSwarmLifecycle?.close();

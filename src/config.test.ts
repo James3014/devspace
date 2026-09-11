@@ -321,3 +321,8 @@ assert.deepEqual(fileConfig.allowedHosts, [
   "::1",
   "devspace.example.com",
 ]);
+
+assert.deepEqual(loadConfig({ ...baseEnv, DEVSPACE_HOST_OPERATION_ARGV: JSON.stringify(["fixture.mjs", "marker"]) }).hostOperationArgv, ["fixture.mjs", "marker"]);
+assert.throws(() => loadConfig({ ...baseEnv, DEVSPACE_HOST_OPERATION_ARGV: "{bad" }), /Invalid DEVSPACE_HOST_OPERATION_ARGV/);
+assert.throws(() => loadConfig({ ...baseEnv, DEVSPACE_HOST_OPERATION_ARGV: JSON.stringify(["ok", "bad\0arg"]) }), /Invalid DEVSPACE_HOST_OPERATION_ARGV/);
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_HOST_OPERATIONS: "1" }).hostOperationExecutable, undefined);
