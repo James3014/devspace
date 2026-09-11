@@ -1,6 +1,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, realpathSync, symlinkSync } from "node:fs";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
 import { resolveAgyExecutable } from "./local-agent-availability.js";
 import { createThrottledActivityTouch } from "./local-agent-activity.js";
@@ -322,7 +323,7 @@ export function resolveAgyGitMetadataDirs(workspace: string): string[] {
     "git",
     ["rev-parse", "--path-format=absolute", "--git-common-dir"],
     {
-      cwd: workspace,
+      cwd: workspaceRoot,
       encoding: "utf8",
       env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
       windowsHide: true,
@@ -434,6 +435,8 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
 
     let stdout = "";
     let stderr = "";
+    const stdoutDecoder = new StringDecoder("utf8");
+    const stderrDecoder = new StringDecoder("utf8");
 
     // Any provider output byte is proof of life. Agy --print emits nothing
     // until the full JSON response, but if it does stream anything (progress
@@ -444,11 +447,11 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
     });
 
     child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString("utf8");
+      stdout += stdoutDecoder.write(chunk);
       activityTouch.touch();
     });
     child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString("utf8");
+      stderr += stderrDecoder.write(chunk);
       activityTouch.touch();
     });
 
@@ -504,6 +507,8 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
       // the caller is never held open by an inherited pipe.
       if (exitInfo) {
         await drainOwnedChildOutput(child, () => stdout, () => stderr);
+        stdout += stdoutDecoder.end();
+        stderr += stderrDecoder.end();
       }
       await closeOwnedChildPipes(child);
     }
