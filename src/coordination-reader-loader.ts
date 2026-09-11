@@ -3,8 +3,19 @@ import { readFile } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { parse } from "acorn";
 import type { ControlPlaneConsumerOptions } from "./control-plane-consumer.js";
+import { snapshotCarrierCompletionBindings, type CarrierCompletionBinding } from "./carrier-binding.js";
 
 export interface CoordinationReaderSelection { modulePath: string; sha256: string; }
+export interface ServeReaderSelections { coordination?: CoordinationReaderSelection; completion?: CoordinationReaderSelection; }
+
+export function parseServeReaderArgs(args: string[]): ServeReaderSelections {
+  const completion = args.some(arg=>arg.startsWith("--completion-reader-"));
+  const coordination = args.some(arg=>arg.startsWith("--coordination-reader-"));
+  if (completion && coordination) throw new Error("Completion-only and coordination reader modes are mutually exclusive.");
+  if (!completion) return {coordination:parseCoordinationReaderArgs(args)};
+  const converted=args.map((arg,index)=>index%2===0 ? arg.replace(/^--completion-reader-/,"--coordination-reader-") : arg);
+  return {completion:parseCoordinationReaderArgs(converted)};
+}
 
 export function parseCoordinationReaderArgs(args: string[]): CoordinationReaderSelection | undefined {
   const values = new Map<string, string>();
@@ -47,14 +58,30 @@ function validateModule(source: string): void {
   }
 }
 
+async function loadVerifiedModule(selection: CoordinationReaderSelection): Promise<Record<string, unknown>> {
+  const bytes = await readFile(selection.modulePath);
+  if (createHash("sha256").update(bytes).digest("hex") !== selection.sha256) throw new Error("Digest mismatch.");
+  validateModule(bytes.toString("utf8"));
+  return import(`data:text/javascript;base64,${bytes.toString("base64")}`);
+}
+
+export async function loadCompletionBindings(selection: CoordinationReaderSelection | undefined, stateDir: string): Promise<readonly CarrierCompletionBinding[] | undefined> {
+  if (!selection) return undefined;
+  try {
+    const module=await loadVerifiedModule(selection);
+    if (typeof module.createCompletionBindings !== "function") throw new Error("Factory missing.");
+    const bindings=await module.createCompletionBindings(Object.freeze({stateDir}));
+    return snapshotCarrierCompletionBindings(bindings);
+  } catch {
+    throw new Error("Completion reader bootstrap failed; verify the selected artifact and reader contract.");
+  }
+}
+
 export async function loadCoordinationReaders(selection: CoordinationReaderSelection | undefined, stateDir: string): Promise<ControlPlaneConsumerOptions | undefined> {
   if (!selection) return undefined;
   try {
     // Read once: the imported data URL contains exactly the bytes whose digest was checked.
-    const bytes = await readFile(selection.modulePath);
-    if (createHash("sha256").update(bytes).digest("hex") !== selection.sha256) throw new Error("Digest mismatch.");
-    validateModule(bytes.toString("utf8"));
-    const module = await import(`data:text/javascript;base64,${bytes.toString("base64")}`) as { createCoordinationReaders?: unknown };
+    const module = await loadVerifiedModule(selection);
     if (typeof module.createCoordinationReaders !== "function") throw new Error("Factory missing.");
     const readers: unknown = await module.createCoordinationReaders(Object.freeze({ stateDir }));
     if (!readers || typeof readers !== "object" || Array.isArray(readers)) throw new Error("Invalid readers.");

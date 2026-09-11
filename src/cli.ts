@@ -11,7 +11,7 @@ import * as prompts from "@clack/prompts";
 import { getShellConfig } from "@earendil-works/pi-coding-agent";
 import { satisfies } from "semver";
 import { loadConfig } from "./config.js";
-import { loadCoordinationReaders, parseCoordinationReaderArgs, type CoordinationReaderSelection } from "./coordination-reader-loader.js";
+import { loadCoordinationReaders, loadCompletionBindings, parseServeReaderArgs, type ServeReaderSelections } from "./coordination-reader-loader.js";
 import { resolveCliWorkspaceContext } from "./cli-workspace.js";
 import { resolveSubagentsConfig } from "./local-agent-config.js";
 import {
@@ -95,7 +95,7 @@ async function main(argv: string[]): Promise<void> {
 
   switch (command) {
     case "serve": {
-      const selection = parseCoordinationReaderArgs(args);
+      const selection = parseServeReaderArgs(args);
       await ensureConfigured();
       await serve(selection);
       return;
@@ -313,7 +313,7 @@ async function runInit({ force }: { force: boolean }): Promise<void> {
   }
 }
 
-async function serve(selection?: CoordinationReaderSelection): Promise<void> {
+async function serve(selection: ServeReaderSelections = {}): Promise<void> {
   const sqliteStatus = checkSqliteNative();
   if (sqliteStatus !== "ok") {
     throw new Error(
@@ -329,8 +329,9 @@ async function serve(selection?: CoordinationReaderSelection): Promise<void> {
 
   const { createServer } = await import("./server.js");
   const config = loadConfig();
-  const coordination = await loadCoordinationReaders(selection, config.stateDir);
-  const { app, close, localAgentProviders } = createServer(config, coordination ? { coordination } : {});
+  const coordination = await loadCoordinationReaders(selection.coordination, config.stateDir);
+  const completionBindings = await loadCompletionBindings(selection.completion, config.stateDir);
+  const { app, close, localAgentProviders } = createServer(config, coordination ? { coordination } : {completionBindings});
   const httpServer = app.listen(config.port, config.host, () => {
     console.log(`devspace listening on http://${config.host}:${config.port}/mcp`);
     console.log(`public base url: ${config.publicBaseUrl}`);
