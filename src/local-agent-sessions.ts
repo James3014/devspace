@@ -816,6 +816,16 @@ export class LocalAgentSessionManager {
     // ── Continuation admission gates (all read-only; run before mutation) ──
     const admissionFailures: string[] = [];
 
+    if (
+      record.providerContinuityState === "LOST" ||
+      (record.provider === "agy" && !record.providerSessionId)
+    ) {
+      throw new AgentSessionError(
+        "REBIND_REQUIRED",
+        `Agent ${agentId} has lost or unestablished provider session identity (${record.provider}); continuation cannot silently start a new provider conversation without explicit rebind.`,
+      );
+    }
+
     const directSelection = record.executionContract?.directSelection;
     if (directSelection) {
       if (!isLocalAgentProvider(directSelection.provider)) {
@@ -1330,7 +1340,7 @@ export class LocalAgentSessionManager {
       agentId: record.id,
       dispatch: dispatchContractOutput(record.executionContract?.dispatchIntent),
       agentState: record.status,
-      providerState: record.status,
+      providerState: record.providerContinuityState ?? (record.providerSessionId ? "KNOWN_UNVERIFIED" : "UNKNOWN"),
       providerSessionId: record.providerSessionId,
       terminalReason: record.terminalReason,
       workspace: {

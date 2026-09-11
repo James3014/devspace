@@ -220,3 +220,77 @@ await assert.rejects(
   TypeError,
   "programmer defects must not be reclassified as provider failures",
 );
+
+// ── Controlled macOS ordering witness (Issue #15 Residual proof gap B) ──
+// Prove: prompt accepted -> first session_id observed/persisted -> first possible tool/side effect
+{
+  const observedEvents: string[] = [];
+  const orderingQuery: ClaudeQueryLike = {
+    [Symbol.asyncIterator]() {
+      let step = 0;
+      return {
+        next: async () => {
+          step += 1;
+          if (step === 1) {
+            // First provider packet emits session_id
+            return {
+              done: false,
+              value: {
+                type: "status",
+                session_id: "claude-ord-123",
+              },
+            };
+          }
+          if (step === 2) {
+            // Second packet is first possible tool_use / side-effect
+            observedEvents.push("tool_use_emitted");
+            return {
+              done: false,
+              value: {
+                type: "tool_use",
+                session_id: "claude-ord-123",
+                tool: "edit",
+              },
+            };
+          }
+          if (step === 3) {
+            return {
+              done: false,
+              value: {
+                type: "result",
+                session_id: "claude-ord-123",
+                result: "completed",
+              },
+            };
+          }
+          return { done: true, value: undefined };
+        },
+      };
+    },
+    close() {},
+    async setPermissionMode() {},
+    async applyFlagSettings() {},
+  };
+
+  const driver = new ClaudeLocalAgentDriver(async () => orderingQuery, { PATH: "/usr/bin" });
+  const runtimeResult = await driver.createRuntime(context);
+  assert.equal(runtimeResult.isOk(), true);
+  if (runtimeResult.isErr()) throw runtimeResult.error;
+
+  const runResult = await runtimeResult.value.run(
+    { prompt: "ordered test", workspaceRoot: "/tmp/project" },
+    {
+      onSessionId: async (id) => {
+        observedEvents.push(`session_id_persisted:${id}`);
+      },
+    },
+  );
+  assert.equal(runResult.isOk(), true);
+
+  // Exact assertion: session_id is observed/persisted BEFORE tool_use_emitted
+  assert.deepEqual(observedEvents, [
+    "session_id_persisted:claude-ord-123",
+    "tool_use_emitted",
+  ]);
+}
+

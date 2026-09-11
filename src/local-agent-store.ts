@@ -94,6 +94,7 @@ export interface LocalAgentRecord {
   errorCode?: string;
   errorRetryable?: boolean;
   errorDetails?: AgentProviderFailureDetails;
+  providerContinuityState?: "KNOWN_UNVERIFIED" | "RESUME_VERIFIED" | "LOST" | "UNKNOWN";
   createdAt: string;
   updatedAt: string;
 }
