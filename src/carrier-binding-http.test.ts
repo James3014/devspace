@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import { createServer as createTcpServer } from "node:net";
+import { fileURLToPath } from "node:url";
 import { mkdtempSync, mkdirSync, cpSync, writeFileSync, existsSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,6 +21,73 @@ function data(result: Awaited<ReturnType<Client["callTool"]>>): Record<string,an
   const content=result.content as Array<{type:string;text?:string}>;
   return JSON.parse(content.find(item=>item.type==="text")!.text!);
 }
+test("CLI completion-only startup preserves pairing and rejects altered or mixed modules",async()=>{
+  const root=realpathSync(mkdtempSync(join(tmpdir(),"completion-cli-")));
+  const socket=createTcpServer();
+  await new Promise<void>(resolve=>socket.listen(0,"127.0.0.1",resolve));
+  const port=(socket.address() as {port:number}).port;
+  await new Promise<void>(resolve=>socket.close(()=>resolve()));
+  const env={...process.env,DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_STATE_DIR:join(root,"state"),DEVSPACE_ALLOWED_ROOTS:root,DEVSPACE_WORKTREE_ROOT:join(root,"worktrees"),DEVSPACE_SUBAGENTS:"false",DEVSPACE_PUBLIC_BASE_URL:`http://127.0.0.1:${port}`,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",PORT:String(port)};
+  const config=loadConfig(env);
+  const provider=new SingleUserOAuthProvider(config.oauth,new URL("/mcp",config.publicBaseUrl),config.stateDir);
+  const oauthClient=await provider.clientsStore.registerClient!({redirect_uris:["http://localhost/callback"],client_name:"CLI fixture",token_endpoint_auth_method:"none"});
+  let redirect="";
+  await provider.authorize(oauthClient,{redirectUri:"http://localhost/callback",codeChallenge:"fixture",scopes:config.oauth.scopes,resource:new URL("/mcp",config.publicBaseUrl)},{req:{method:"POST",body:{owner_token:config.oauth.ownerToken}},redirect:(_status:number,url:string)=>{redirect=url;}} as never);
+  const tokens=await provider.exchangeAuthorizationCode(oauthClient,new URL(redirect).searchParams.get("code")!);
+  const artifact=join(root,"completion.mjs");
+  const source=`export function createCompletionBindings(context){
+    if(!Object.isFrozen(context)) throw new Error('context');
+    return [{repository:'James3014/devspace',goal:'issue62',subject:'cli-fixture',readers:{
+      readContract:s=>({...s,source:'synthetic-cli-test-only',requiredLayers:['SOURCE'],criteria:[{id:'source',layer:'SOURCE',sourceRevision:s.candidate,environment:'test',surface:'CLI',independent:true,maxAgeMs:60000}]}),
+      readEvidence:()=>[]}}];}`;
+  writeFileSync(artifact,source);
+  const digest=createHash("sha256").update(source).digest("hex");
+  const cli=process.env.DEVSPACE_TEST_INSTALLED_CLI;
+  const entry=cli ? [cli] : ["--import","tsx",fileURLToPath(new URL("./cli.ts",import.meta.url))];
+  const flags=["--completion-reader-module",artifact,"--completion-reader-sha256",digest];
+  const child=spawn(process.execPath,[...entry,"serve",...flags],{env,stdio:["ignore","pipe","pipe"]});
+  const client=new Client({name:"CLI completion fixture",version:"1"});
+  try {
+    await new Promise<void>((resolve,reject)=>{
+      const timer=setTimeout(()=>reject(new Error("CLI readiness timeout")),20000);
+      child.once("error",error=>{clearTimeout(timer);reject(error);});
+      child.once("exit",code=>{clearTimeout(timer);reject(new Error(`CLI exited before readiness: ${code}`));});
+      let output="";
+      child.stdout.on("data",chunk=>{output+=chunk.toString();if(output.includes("devspace listening on")){clearTimeout(timer);resolve();}});
+      child.stderr.on("data",()=>{});
+    });
+    await client.connect(new StreamableHTTPClientTransport(new URL("/mcp",config.publicBaseUrl),{requestInit:{headers:{Authorization:`Bearer ${tokens.access_token}`}}}));
+    assert.equal((await client.callTool({name:"coordination_carrier_status",arguments:{}})).isError,true);
+    const pending=data(await client.callTool({name:"coordination_pair",arguments:{}}));
+    const contractPath=join(root,"contract.json");
+    writeFileSync(contractPath,JSON.stringify({repository:"James3014/devspace",goal:"issue62",role:"controller",scope:[root],baseRevision:"a".repeat(40),operations:["dependency_sync"],expiresAt:new Date(Date.now()+60000).toISOString()}));
+    execFileSync(process.execPath,[...entry,"carrier","inspect",pending.pendingId],{env,stdio:"pipe"});
+    execFileSync(process.execPath,[...entry,"carrier","approve",pending.pendingId,"--contract",contractPath,"--confirm",pending.pendingId],{env,stdio:"pipe"});
+    data(await client.callTool({name:"coordination_resume",arguments:{credential:pending.credential}}));
+    const projection=data(await client.callTool({name:"coordination_completion_read",arguments:{goal:"issue62",subject:"cli-fixture",candidate:"b".repeat(40)}})).projection;
+    assert.equal(projection.contractSource,"synthetic-cli-test-only");
+    assert.equal(projection.status,"INCOMPLETE");
+    assert.equal(projection.criteria[0].gap,"MISSING_EVIDENCE");
+  } finally {
+    await client.close().catch(()=>{});
+    if(child.exitCode===null){
+      const exited=new Promise<void>(resolve=>child.once("exit",()=>resolve()));
+      const killTimer=setTimeout(()=>child.kill("SIGKILL"),5000);
+      child.kill("SIGTERM");await exited;clearTimeout(killTimer);
+    }
+    provider.close();
+  }
+  try {
+    writeFileSync(artifact,"throw new Error('PRIVATE_DETAIL');");
+    for(const args of [flags,[...flags,"--coordination-reader-module",artifact,"--coordination-reader-sha256",digest]]) {
+      const failed=spawnSync(process.execPath,[...entry,"serve",...args],{env,encoding:"utf8",timeout:20000});
+      assert.notEqual(failed.status,0);
+      assert.equal(failed.error,undefined);
+      assert.doesNotMatch(failed.stdout,/devspace listening on/);
+      assert.doesNotMatch(failed.stderr,/PRIVATE_DETAIL/);
+    }
+  } finally {rmSync(root,{recursive:true,force:true});}
+});
 test("real HTTP clients sharing OAuth pair independently, delegate, resume, execute frozen npm and reject revoked identity",async()=>{
   const root=realpathSync(mkdtempSync(join(tmpdir(),"carrier-http-")));
   const project=join(root,"project");mkdirSync(project);

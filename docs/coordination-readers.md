@@ -31,8 +31,23 @@ not equal the carrier's base revision.
 Hosts must independently establish the contract source, artifact integrity and
 verification provenance before supplying these readers. The projector validates
 records but does not authenticate a claimed artifact hash or reviewer identity.
-There is no default file reader, CLI source selection, matrix fallback or implicit
+There is no default file reader, automatic source selection, matrix fallback or implicit
 grant. This embedding interface alone does not establish production acceptance.
+
+For a CLI host, select an independently reviewed completion-only module explicitly:
+
+```sh
+devspace serve --completion-reader-module /absolute/path/completion.mjs --completion-reader-sha256 <64-hex-sha256>
+```
+
+The module exports `createCompletionBindings({ stateDir })`, returning the same
+binding array described above. Its exact bytes use the existing verified module
+loader and syntax restrictions. Only completion bindings are accepted; authority
+hooks and extra fields are rejected. Do not combine these flags with coordination
+reader flags. Missing flags, invalid bindings or a changed digest fail startup.
+Pairing remains available. Selecting the module pins executable code, not evidence
+truth: the reviewed reader must still validate its canonical sources, artifact
+integrity and acceptance provenance. Synthetic fixtures cannot establish delivery.
 
 Without a custom reader module, the server now exposes a local pairing path for
 bounded dependency operations. Unpaired sessions have no coordination authority.

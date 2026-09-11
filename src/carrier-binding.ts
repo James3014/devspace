@@ -14,20 +14,29 @@ export interface CarrierCompletionBinding {
   readers: CompletionReaders;
 }
 
-function completionBindingsSnapshot(bindings: readonly CarrierCompletionBinding[]) {
-  const result = new Map<string, Readonly<CompletionReaders>>();
+export function snapshotCarrierCompletionBindings(bindings: readonly CarrierCompletionBinding[]): readonly CarrierCompletionBinding[] {
+  if (!Array.isArray(bindings)) throw new Error("Invalid completion reader bindings.");
+  const result: CarrierCompletionBinding[] = [];
+  const keys = new Set<string>();
   for (const binding of bindings) {
-    if (!binding || typeof binding.repository !== "string" || !binding.repository.trim() ||
-        typeof binding.goal !== "string" || !binding.goal.trim() ||
-        typeof binding.subject !== "string" || !binding.subject.trim() ||
-        typeof binding.readers?.readContract !== "function" || typeof binding.readers?.readEvidence !== "function") {
+    if (!binding || typeof binding !== "object" || Array.isArray(binding)) throw new Error("Invalid completion reader binding.");
+    const {repository,goal,subject,readers}=binding;
+    if (!readers || typeof readers !== "object" || Array.isArray(readers)) throw new Error("Invalid completion reader binding.");
+    const {readContract,readEvidence}=readers;
+    if (typeof repository !== "string" || !repository.trim() ||
+        typeof goal !== "string" || !goal.trim() || typeof subject !== "string" || !subject.trim() ||
+        typeof readContract !== "function" || typeof readEvidence !== "function" ||
+        Object.keys(binding).some(key=>!["repository","goal","subject","readers"].includes(key)) ||
+        Object.keys(readers).some(key=>!["readContract","readEvidence"].includes(key))) {
       throw new Error("Invalid completion reader binding.");
     }
-    const key = JSON.stringify([normalizeRepositoryKey(binding.repository), binding.goal, binding.subject]);
-    if (result.has(key)) throw new Error("Duplicate completion reader binding.");
-    result.set(key, Object.freeze({readContract: binding.readers.readContract, readEvidence: binding.readers.readEvidence}));
+    const normalizedRepository=normalizeRepositoryKey(repository);
+    const key = JSON.stringify([normalizedRepository, goal, subject]);
+    if (keys.has(key)) throw new Error("Duplicate completion reader binding.");
+    keys.add(key);
+    result.push(Object.freeze({repository:normalizedRepository,goal,subject,readers:Object.freeze({readContract,readEvidence})}));
   }
-  return result;
+  return Object.freeze(result);
 }
 
 export interface CarrierContract {
@@ -78,7 +87,9 @@ export class CarrierBindingStore {
   readonly ownership: ControlPlaneOwnershipStore;
 
   constructor(stateDir: string, private readonly now: () => number = Date.now, completionBindings: readonly CarrierCompletionBinding[] = []) {
-    const completions = completionBindingsSnapshot(completionBindings);
+    const completions = new Map(snapshotCarrierCompletionBindings(completionBindings).map(binding=>[
+      JSON.stringify([binding.repository,binding.goal,binding.subject]),binding.readers,
+    ]));
     const readCompletion = (context: unknown, selection: Readonly<CompletionSelection>, hook: keyof CompletionReaders) => {
       const before = this.current(context);
       const selected = Object.freeze({...selection});
