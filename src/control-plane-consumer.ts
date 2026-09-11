@@ -1,7 +1,7 @@
 import { realpathSync } from "node:fs";
 import type { CutoverServerIdentity, BuildReadyReceipt } from "./cutover-state.js";
 import { projectCompletion, type CompletionSelection } from "./current-completion-matrix.js";
-import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type ControlPlaneOwnershipOptions, type ReconciliationEvidence, type ReconciliationReceipt, type HandoffInput, type ResourceLease } from "./control-plane-ownership.js";
+import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type ControlPlaneOwnershipOptions, type ReconciliationEvidence, type ReconciliationReceipt, type HandoffInput, type TakeoverInput, type ResourceLease } from "./control-plane-ownership.js";
 
 export interface EffectSubject {
   operationId: string;
@@ -110,6 +110,18 @@ export class ControlPlaneConsumer {
 
   readHandoff(context: unknown, leaseId: string, previousVersion: number, expectedCurrentVersion: number) {
     return this.ownership.readHandoff(context, leaseId, previousVersion, expectedCurrentVersion);
+  }
+
+  latestContinuation(context: unknown) {
+    return this.ownership.latestContinuation(context);
+  }
+
+  takeover(context: unknown, leaseId: string, expectedVersion: number, input: TakeoverInput) {
+    return this.ownership.takeover(context, leaseId, expectedVersion, input);
+  }
+
+  readTakeover(context: unknown, leaseId: string, previousVersion: number, expectedCurrentVersion: number) {
+    return this.ownership.readTakeover(context, leaseId, previousVersion, expectedCurrentVersion);
   }
 
   authorize(context: unknown, subject: EffectSubject): EffectBinding {

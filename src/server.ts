@@ -2761,6 +2761,80 @@ export function createMcpServer(
 
     registerAppTool(
       server,
+      "coordination_continuation_latest",
+      {
+        title: "Discover latest unfinished continuation",
+        description: "Discover the latest eligible continuation for context rollover. Returns structured status (TAKEOVER_ELIGIBLE, NO_CONTINUATION, etc.).",
+        inputSchema: {},
+        outputSchema: { status: z.string(), message: z.string().optional() },
+        _meta: {},
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      },
+      async (_, extra) => {
+        const result = durableOperations.latestContinuation(dependencyConsumerContext(extra));
+        return { content: [textBlock(JSON.stringify(result, null, 2))], structuredContent: result as unknown as Record<string, unknown> };
+      },
+    );
+
+    registerAppTool(
+      server,
+      "coordination_continuation_takeover",
+      {
+        title: "Take over an unfinished continuation",
+        description: "Atomically take over an eligible continuation from an abandoned controller session using lease CAS.",
+        inputSchema: {
+          leaseId: z.string().min(1),
+          expectedVersion: z.number().int().positive(),
+          takeoverReason: z.string().min(1),
+          checkpoint: z.string().optional(),
+          candidateRevision: z.string().optional(),
+          tests: z.array(z.string()).optional(),
+          evidence: z.array(z.string()).optional(),
+          remainingGap: z.string().optional(),
+          nextGate: z.string().optional(),
+          reconciledEffects: z.array(z.string()).optional(),
+        },
+        outputSchema: { receipt: z.record(z.string(), z.unknown()) },
+        _meta: {},
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+      },
+      async ({ leaseId, expectedVersion, takeoverReason, checkpoint, candidateRevision, tests, evidence, remainingGap, nextGate, reconciledEffects }, extra) => {
+        const receipt = durableOperations.takeover(
+          leaseId,
+          expectedVersion,
+          { takeoverReason, checkpoint, candidateRevision, tests, evidence, remainingGap, nextGate, reconciledEffects },
+          dependencyConsumerContext(extra),
+        );
+        return {
+          content: [textBlock(`Took over continuation for lease ${leaseId}; newVersion=${receipt.newVersion}.`)],
+          structuredContent: { receipt: receipt as unknown as Record<string, unknown> },
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
+      "coordination_continuation_readback",
+      {
+        title: "Read takeover receipt",
+        description: "Recover an existing takeover receipt under current authenticated owner and lease-version checks.",
+        inputSchema: {
+          leaseId: z.string().min(1),
+          previousVersion: z.number().int().positive(),
+          expectedCurrentVersion: z.number().int().positive(),
+        },
+        outputSchema: { receipt: z.record(z.string(), z.unknown()) },
+        _meta: {},
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      },
+      async ({ leaseId, previousVersion, expectedCurrentVersion }, extra) => {
+        const result = durableOperations.readTakeover(leaseId, previousVersion, expectedCurrentVersion, dependencyConsumerContext(extra));
+        return { content: [textBlock(JSON.stringify(result))], structuredContent: result as unknown as Record<string, unknown> };
+      },
+    );
+
+    registerAppTool(
+      server,
       "dependency_sync",
       {
         title: "Synchronize dependencies",

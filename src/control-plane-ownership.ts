@@ -179,8 +179,23 @@ export function initializeControlPlaneOwnershipDatabase(sqlite: Database.Databas
       created_at text not null,
       foreign key (lease_id) references control_plane_resource_leases(lease_id)
     );
+    create table if not exists control_plane_takeover_receipts (
+      receipt_id text primary key,
+      continuation_id text not null,
+      lease_id text not null,
+      resource text not null,
+      from_owner_thread text not null,
+      to_owner_thread text not null,
+      previous_version integer not null,
+      new_version integer not null,
+      takeover_reason text not null,
+      receipt_json text not null,
+      created_at text not null,
+      foreign key (lease_id) references control_plane_resource_leases(lease_id)
+    );
   `);
   sqlite.exec("create unique index if not exists control_plane_reconciliation_identity on control_plane_reconciliation_receipts(lease_id, previous_version)");
+  sqlite.exec("create unique index if not exists control_plane_takeover_identity on control_plane_takeover_receipts(lease_id, previous_version)");
   const columns = sqlite.prepare("pragma table_info(control_plane_resource_leases)").all() as Array<{ name: string }>;
   if (!columns.some((column) => column.name === "grant_version")) {
     sqlite.exec("alter table control_plane_resource_leases add column grant_version integer not null default 0");
@@ -454,6 +469,190 @@ export class ControlPlaneOwnershipStore {
       return value;
     }).immediate();
   }
+
+  latestContinuation(consumerContext: unknown): LatestContinuationResult {
+    const caller = ownerFor(this.options, consumerContext);
+    const rows = this.sqlite.prepare("select * from control_plane_resource_leases where terminal_state is null order by updated_at desc limit 10").all() as LeaseRow[];
+    if (rows.length === 0) return { status: "NO_CONTINUATION", message: "No active uncompleted continuations found." };
+    const candidates: ContinuationCandidate[] = rows.map((r) => {
+      const lease = rowLease(r);
+      const isCallerOwner = lease.ownerThread === caller.ownerThread;
+      const isExpired = Date.parse(lease.expiresAt) <= this.now();
+      let status: ContinuationStatus = "TAKEOVER_ELIGIBLE";
+      if (isCallerOwner) status = "CONTINUATION_READ_ONLY";
+      else if (lease.operationHandle || lease.operationState === "active") status = "TAKEOVER_BLOCKED_ACTIVE_EFFECT";
+      else if (isExpired) status = "LEASE_EXPIRED_OR_REBOUND";
+
+      let checkpoint = "active-task-lease";
+      let candidateRevision = lease.baseRevision;
+      let remainingGap = "execution";
+      let nextGate = "DEVSPACE_CRASH_SAFE_CONTINUATION_G0_REBIND";
+      let evidence: string[] = [lease.resource];
+
+      const takeoverRow = this.sqlite.prepare("select receipt_json from control_plane_takeover_receipts where lease_id=? order by new_version desc limit 1").get(lease.leaseId) as { receipt_json: string } | undefined;
+      if (takeoverRow) {
+        try {
+          const parsed = JSON.parse(takeoverRow.receipt_json);
+          if (parsed.checkpoint) checkpoint = parsed.checkpoint;
+          if (parsed.candidateRevision) candidateRevision = parsed.candidateRevision;
+          if (parsed.remainingGap) remainingGap = parsed.remainingGap;
+          if (parsed.nextGate) nextGate = parsed.nextGate;
+          if (Array.isArray(parsed.evidence)) evidence = parsed.evidence;
+        } catch {}
+      } else {
+        const handoffRow = this.sqlite.prepare("select receipt_json from control_plane_handoff_receipts where lease_id=? order by new_version desc limit 1").get(lease.leaseId) as { receipt_json: string } | undefined;
+        if (handoffRow) {
+          try {
+            const parsed = JSON.parse(handoffRow.receipt_json);
+            if (parsed.checkpoint) checkpoint = parsed.checkpoint;
+            if (parsed.candidateRevision) candidateRevision = parsed.candidateRevision;
+            if (parsed.remainingGap) remainingGap = parsed.remainingGap;
+            if (parsed.nextGate) nextGate = parsed.nextGate;
+            if (Array.isArray(parsed.evidence)) evidence = parsed.evidence;
+          } catch {}
+        }
+      }
+
+      return {
+        continuationId: `cont_${lease.leaseId}`,
+        leaseId: lease.leaseId,
+        version: lease.version,
+        repositoryKey: lease.repositoryKey,
+        resourceKind: lease.resourceKind,
+        resourceId: lease.resourceId,
+        resource: lease.resource,
+        ownerThread: lease.ownerThread,
+        status,
+        baseRevision: lease.baseRevision,
+        candidateRevision,
+        scope: lease.scope,
+        activeOperationHandle: lease.operationHandle,
+        operationState: lease.operationState,
+        checkpoint,
+        evidence,
+        remainingGap,
+        nextGate,
+        grant: lease.grant,
+        grantVersion: lease.grantVersion,
+        updatedAt: lease.updatedAt,
+        expiresAt: lease.expiresAt,
+      };
+    });
+
+    if (candidates.length > 1) {
+      return { status: "MULTIPLE_CONTINUATIONS", candidates, message: `Found ${candidates.length} candidate continuations. Explicit selection required.` };
+    }
+    const single = candidates[0]!;
+    return { status: single.status, continuation: single, message: `Found continuation ${single.continuationId} for ${single.repositoryKey} (${single.status}).` };
+  }
+
+  takeover(consumerContext: unknown, leaseId: string, expectedVersion: number, input: TakeoverInput): TakeoverReceipt {
+    const to = ownerFor(this.options, consumerContext);
+    bounded(input.takeoverReason, "takeover reason");
+    const existing = this.sqlite.prepare("select * from control_plane_takeover_receipts where lease_id=? and previous_version=? limit 2").all(leaseId, expectedVersion) as Record<string, unknown>[];
+    if (existing.length === 1) {
+      const receipt = parseTakeoverReceipt(existing[0]!);
+      if (receipt.toOwnerThread === to.ownerThread) return receipt;
+    }
+    const checkpoint = input.checkpoint ? bounded(input.checkpoint, "checkpoint") : "recovered-at-context-rollover";
+    const nextGate = input.nextGate ? bounded(input.nextGate, "next gate") : "DEVSPACE_CRASH_SAFE_CONTINUATION_G0_REBIND";
+    const remainingGap = typeof input.remainingGap === "string" ? input.remainingGap : "verification";
+    const candidateRevision = input.candidateRevision ? bounded(input.candidateRevision, "candidate revision") : "";
+    const tests = input.tests ? [...input.tests] : [];
+    const evidence = input.evidence && input.evidence.length ? [...input.evidence] : ["takeover-context-rollover"];
+    const reconciledEffects = input.reconciledEffects ? [...input.reconciledEffects] : [];
+
+    return this.sqlite.transaction(() => {
+      const lease = this.get(leaseId);
+      if (!lease) throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "lease not found");
+      this.assertPhysicalBinding(lease);
+      this.assertCurrentGrant(lease.grant, lease.grantVersion);
+
+      const fromOwnerThread = lease.ownerThread;
+      if (fromOwnerThread === to.ownerThread) throw new ControlPlaneOwnershipError("INVALID_INPUT", "takeover recipient must differ from current owner");
+      if (lease.version !== expectedVersion || lease.terminalState) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "takeover lease version no longer matches or is terminal");
+      if (lease.operationHandle !== undefined || lease.operationState === "active") throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "active operation must be reconciled before takeover");
+      const now = this.now();
+      if (Date.parse(lease.expiresAt) <= now) throw new ControlPlaneOwnershipError("EXPIRED", "lease is expired; renew or reconcile required");
+
+      const recipientGrant = input.recipientGrant ?? lease.grant;
+      const recipientGrantVersion = input.recipientGrantVersion ?? lease.grantVersion;
+      verifyGrant(this.options, immutable(recipientGrant), immutable(to));
+      this.assertCurrentGrant(recipientGrant, recipientGrantVersion);
+      if (normalizeRepositoryKey(recipientGrant.repository) !== lease.repositoryKey || recipientGrant.goal !== lease.grant.goal) {
+        throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "recipient grant changes repository or goal");
+      }
+
+      const newVersion = expectedVersion + 1;
+      const createdAt = new Date(now).toISOString();
+      const receiptId = `takeover_${randomUUID()}`;
+      const continuationId = `cont_${lease.leaseId}`;
+      const value: TakeoverReceipt = {
+        schema: CONTROL_PLANE_SCHEMA,
+        receiptId,
+        continuationId,
+        leaseId,
+        repositoryKey: lease.repositoryKey,
+        resourceKind: lease.resourceKind,
+        resourceId: lease.resourceId,
+        resource: lease.resource,
+        fromOwnerThread,
+        toOwnerThread: to.ownerThread,
+        previousVersion: expectedVersion,
+        newVersion,
+        baseRevision: lease.baseRevision,
+        scope: lease.scope,
+        candidateRevision: candidateRevision || lease.baseRevision,
+        checkpoint,
+        takeoverReason: input.takeoverReason,
+        recipientGrant,
+        recipientGrantVersion,
+        tests,
+        evidence,
+        remainingGap,
+        nextGate,
+        reconciledEffects,
+        createdAt,
+      };
+      const json = JSON.stringify(value);
+      if (Buffer.byteLength(json) > MAX_JSON_BYTES) throw new ControlPlaneOwnershipError("INVALID_INPUT", "takeover receipt is too large");
+
+      const result = this.sqlite.prepare(
+        "update control_plane_resource_leases set owner_thread=?, grant_json=?, grant_version=?, version=version+1, updated_at=? where lease_id=? and owner_thread=? and version=? and terminal_state is null and active_operation_handle is null and (operation_state is null or operation_state <> 'active')"
+      ).run(to.ownerThread, JSON.stringify(recipientGrant), recipientGrantVersion, createdAt, leaseId, fromOwnerThread, expectedVersion);
+      if (result.changes !== 1) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "takeover raced");
+
+      this.sqlite.prepare(
+        "insert into control_plane_takeover_receipts(receipt_id,continuation_id,lease_id,resource,from_owner_thread,to_owner_thread,previous_version,new_version,takeover_reason,receipt_json,created_at) values(?,?,?,?,?,?,?,?,?,?,?)"
+      ).run(receiptId, continuationId, leaseId, lease.resource, fromOwnerThread, to.ownerThread, expectedVersion, newVersion, input.takeoverReason, json, createdAt);
+
+      return value;
+    }).immediate();
+  }
+
+  readTakeover(consumerContext: unknown, leaseId: string, previousVersion: number, expectedCurrentVersion: number): { receipt: TakeoverReceipt; currentLease: ResourceLease } {
+    if (!Number.isSafeInteger(previousVersion) || previousVersion < 1 || !Number.isSafeInteger(expectedCurrentVersion) || expectedCurrentVersion <= previousVersion) {
+      throw new ControlPlaneOwnershipError("INVALID_INPUT", "invalid takeover readback versions");
+    }
+    const owner = immutable(ownerFor(this.options, consumerContext));
+    return this.sqlite.transaction(() => {
+      const lease = this.get(leaseId);
+      if (!lease || lease.ownerThread !== owner.ownerThread || lease.version !== expectedCurrentVersion) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT", "current takeover owner/version required");
+      }
+      this.assertPhysicalBinding(lease);
+      verifyGrant(this.options, immutable(lease.grant), owner);
+      this.assertCurrentGrant(lease.grant, lease.grantVersion);
+      const rows = this.sqlite.prepare("select * from control_plane_takeover_receipts where lease_id=? and previous_version=? limit 2").all(leaseId, previousVersion) as Record<string, unknown>[];
+      if (rows.length !== 1) throw new ControlPlaneOwnershipError("MALFORMED", "exactly one takeover receipt is required");
+      const receipt = parseTakeoverReceipt(rows[0]!);
+      if (receipt.toOwnerThread !== owner.ownerThread || receipt.newVersion > lease.version || receipt.leaseId !== lease.leaseId) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT", "historical takeover receipt does not match current owner/lease");
+      }
+      return immutable({ receipt, currentLease: lease });
+    }).immediate();
+  }
+
   get(leaseId: string): ResourceLease | undefined { const row = this.sqlite.prepare("select * from control_plane_resource_leases where lease_id=?").get(leaseId) as LeaseRow | undefined; return row ? rowLease(row) : undefined; }
   private now(): number { return this.options.now?.() ?? Date.now(); }
 }
@@ -500,3 +699,107 @@ function parseHandoffReceipt(row: Record<string, unknown>): HandoffReceipt {
     throw new ControlPlaneOwnershipError("MALFORMED", "persisted handoff receipt is malformed");
   }
 }
+
+export type ContinuationStatus =
+  | "NO_CONTINUATION"
+  | "MULTIPLE_CONTINUATIONS"
+  | "CONTINUATION_READ_ONLY"
+  | "TAKEOVER_ELIGIBLE"
+  | "TAKEOVER_BLOCKED_ACTIVE_EFFECT"
+  | "RECONCILIATION_REQUIRED"
+  | "TAKEOVER_COMPLETED"
+  | "STALE_FORMER_OWNER"
+  | "GRANT_INVALID"
+  | "LEASE_EXPIRED_OR_REBOUND";
+
+export interface ContinuationCandidate {
+  continuationId: string;
+  leaseId: string;
+  version: number;
+  repositoryKey: string;
+  resourceKind: string;
+  resourceId: string;
+  resource: string;
+  ownerThread: string;
+  status: ContinuationStatus;
+  baseRevision: string;
+  candidateRevision?: string;
+  scope: readonly string[];
+  activeOperationHandle?: string;
+  operationState?: string;
+  checkpoint?: string;
+  evidence?: readonly string[];
+  remainingGap?: string;
+  nextGate?: string;
+  grant: GrantEvidenceReference;
+  grantVersion: number;
+  updatedAt: string;
+  expiresAt: string;
+}
+
+export interface LatestContinuationResult {
+  status: ContinuationStatus;
+  continuation?: ContinuationCandidate;
+  candidates?: ContinuationCandidate[];
+  message?: string;
+}
+
+export interface TakeoverReceipt {
+  schema: typeof CONTROL_PLANE_SCHEMA;
+  receiptId: string;
+  continuationId: string;
+  leaseId: string;
+  repositoryKey: string;
+  resourceKind: string;
+  resourceId: string;
+  resource: string;
+  fromOwnerThread: string;
+  toOwnerThread: string;
+  previousVersion: number;
+  newVersion: number;
+  baseRevision: string;
+  candidateRevision: string;
+  scope: readonly string[];
+  checkpoint: string;
+  takeoverReason: string;
+  recipientGrant: GrantEvidenceReference;
+  recipientGrantVersion: number;
+  tests: readonly string[];
+  evidence: readonly string[];
+  remainingGap: string;
+  nextGate: string;
+  reconciledEffects: readonly string[];
+  createdAt: string;
+}
+
+export type TakeoverInput = {
+  takeoverReason: string;
+  recipientGrant?: GrantEvidenceReference;
+  recipientGrantVersion?: number;
+  checkpoint?: string;
+  candidateRevision?: string;
+  tests?: string[];
+  evidence?: string[];
+  remainingGap?: string;
+  nextGate?: string;
+  reconciledEffects?: string[];
+};
+
+function parseTakeoverReceipt(row: Record<string, unknown>): TakeoverReceipt {
+  try {
+    if (typeof row.receipt_json !== "string" || Buffer.byteLength(row.receipt_json) > MAX_JSON_BYTES) throw new Error("invalid size");
+    const value = JSON.parse(row.receipt_json) as TakeoverReceipt;
+    if (!value || typeof value !== "object" || Array.isArray(value) || value.schema !== CONTROL_PLANE_SCHEMA) throw new Error("invalid schema");
+    for (const key of ["receiptId", "continuationId", "leaseId", "repositoryKey", "resourceKind", "resourceId", "resource", "fromOwnerThread", "toOwnerThread", "baseRevision", "candidateRevision", "checkpoint", "takeoverReason", "nextGate"] as const) bounded(value[key], key);
+    if (!SAFE_ID.test(value.fromOwnerThread) || !SAFE_ID.test(value.toOwnerThread) || value.fromOwnerThread === value.toOwnerThread) throw new Error("invalid parties");
+    if (value.newVersion !== value.previousVersion + 1) throw new Error("invalid version");
+    const bindings = { receipt_id: value.receiptId, continuation_id: value.continuationId, lease_id: value.leaseId, resource: value.resource, from_owner_thread: value.fromOwnerThread, to_owner_thread: value.toOwnerThread, previous_version: value.previousVersion, new_version: value.newVersion, created_at: value.createdAt };
+    for (const [key, expected] of Object.entries(bindings)) {
+      if (row[key] !== expected) throw new Error(`receipt metadata mismatch on ${key}`);
+    }
+    return value;
+  } catch {
+    throw new ControlPlaneOwnershipError("MALFORMED", "persisted takeover receipt is malformed");
+  }
+}
+

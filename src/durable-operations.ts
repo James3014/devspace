@@ -5,7 +5,7 @@ import { isDeepStrictEqual } from "node:util";
 import { McpCutoverController, compareServerIdentity, type DurableReconciliationWitness } from "./mcp-cutover.js";
 import { CutoverStateStore, type CutoverServerIdentity, type CutoverDrainEvidence, type BuildReadyReceipt, type ExpectedCutoverIdentity, type CutoverCoordinationBinding } from "./cutover-state.js";
 import { ControlPlaneConsumer, type ControlPlaneConsumerOptions, type DependencyReconciliationEvidence } from "./control-plane-consumer.js";
-import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type HandoffInput, type ReconciliationReceipt } from "./control-plane-ownership.js";
+import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type HandoffInput, type TakeoverInput, type ReconciliationReceipt } from "./control-plane-ownership.js";
 import { createHash } from "node:crypto";
 import { spawn as nativeSpawn } from "node:child_process";
 import { createRequire } from "node:module";
@@ -587,6 +587,21 @@ export class DurableOperationManager {
   readHandoff(leaseId: string, previousVersion: number, expectedCurrentVersion: number, consumerContext?: unknown) {
     if (!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "handoff readback requires trusted host authority");
     return this.consumer.readHandoff(consumerContext, leaseId, previousVersion, expectedCurrentVersion);
+  }
+
+  latestContinuation(context?: unknown) {
+    if (!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "continuation discovery requires trusted host authority");
+    return this.consumer.latestContinuation(context);
+  }
+
+  takeover(leaseId: string, expectedVersion: number, input: TakeoverInput, context?: unknown) {
+    if (!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "takeover requires trusted host authority");
+    return this.consumer.takeover(context, leaseId, expectedVersion, input);
+  }
+
+  readTakeover(leaseId: string, previousVersion: number, expectedCurrentVersion: number, context?: unknown) {
+    if (!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "takeover readback requires trusted host authority");
+    return this.consumer.readTakeover(context, leaseId, previousVersion, expectedCurrentVersion);
   }
 
   async planDependencySync(input: DependencySyncInput) {
