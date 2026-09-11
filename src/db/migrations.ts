@@ -79,6 +79,7 @@ const migrations: Migration[] = [
   },
   { version: 15, name: "carrier-bindings", up: migrateCarrierBindings },
   { version: 16, name: "carrier-validity", up: migrateCarrierValidity },
+  { version: 17, name: "chat-swarm-join-requests", up: migrateChatSwarmJoinRequests },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -468,5 +469,32 @@ function migrateCarrierValidity(sqlite: Database.Database): void {
     );
     insert into carrier_validity(carrier_id, version, expires_at)
       select id, 1, json_extract(contract_json, '$.expiresAt') from carrier_bindings;
+  `);
+}
+
+function migrateChatSwarmJoinRequests(sqlite: Database.Database): void {
+  sqlite.exec(`
+    alter table chat_swarms add column revision integer not null default 1 check (revision > 0);
+
+    create table if not exists chat_swarm_join_requests (
+      id text primary key,
+      swarm_id text not null references chat_swarms(id) on delete cascade,
+      attempt_key text not null,
+      request_hash text not null,
+      requester_fingerprint text not null,
+      label text not null,
+      version integer not null default 1 check (version > 0),
+      status text not null check (status in ('PENDING', 'APPROVED', 'EXPIRED')),
+      approved_worker_id text references chat_swarm_workers(id),
+      requested_at text not null,
+      expires_at text not null,
+      approved_at text,
+      check (expires_at > requested_at),
+      unique (swarm_id, attempt_key)
+    );
+    create index if not exists chat_swarm_join_requests_swarm_requester_idx
+      on chat_swarm_join_requests(swarm_id, requester_fingerprint, status);
+    create index if not exists chat_swarm_join_requests_status_idx
+      on chat_swarm_join_requests(swarm_id, status, expires_at);
   `);
 }

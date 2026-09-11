@@ -10,6 +10,8 @@ import { LocalAgentProviderError } from "./local-agent-runtime.js";
 import { MINIMUM_CODEX_RUNTIME_VERSION } from "./codex-runtime.js";
 
 const originalDependencyRoot = process.env.DEVSPACE_DEPENDENCY_ROOT;
+const originalAgyCommand = process.env.AGY_COMMAND;
+process.env.AGY_COMMAND = process.execPath;
 const codexRuntimeRoot = mkdtempSync(join(tmpdir(), "devspace-continuation-codex-runtime-"));
 mkdirSync(join(codexRuntimeRoot, "node_modules", "@openai", "codex-sdk"), { recursive: true });
 writeFileSync(
@@ -39,6 +41,8 @@ process.env.DEVSPACE_DEPENDENCY_ROOT = codexRuntimeRoot;
 after(() => {
   if (originalDependencyRoot === undefined) delete process.env.DEVSPACE_DEPENDENCY_ROOT;
   else process.env.DEVSPACE_DEPENDENCY_ROOT = originalDependencyRoot;
+  if (originalAgyCommand === undefined) delete process.env.AGY_COMMAND;
+  else process.env.AGY_COMMAND = originalAgyCommand;
   rmSync(codexRuntimeRoot, { recursive: true, force: true });
 });
 

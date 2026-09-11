@@ -1,9 +1,68 @@
 import { ChatSwarmError, type ChatSwarm, type ChatSwarmTask, type ChatSwarmWorker, type TaskRequest, type ReconciliationEvidence } from "./chat-swarm-contract.js";
 import { ChatSwarmStore, type CreateSwarmInput, type CreateWorkerInput } from "./chat-swarm-store.js";
-import { resolveChatSwarmIdentity, type ChatSwarmIdentityEvidence } from "./request-meta.js";
+import { resolveChatSwarmIdentity, ChatSwarmIdentityError, type ChatSwarmIdentityEvidence } from "./request-meta.js";
 
 export interface DispatchRequest extends TaskRequest { id?: string; }
 export interface JoinRequest extends Omit<CreateWorkerInput, "swarmId" | "carrierConversationFingerprint" | "sessionIdentityFingerprint"> { sessionIdentityFingerprint?: string; }
+
+export interface PeerStatusResult {
+  identity: {
+    status: "RESOLVED" | "MISSING" | "AMBIGUOUS" | "MALFORMED";
+    source?: string;
+    trustClassification?: string;
+    fingerprint?: string;
+  };
+  state: "UNBOUND" | "PENDING_APPROVAL" | "APPROVED" | "BOUND" | "BLOCKED";
+  deliveryMode: "POLLING_ONLY";
+  pendingRequest?: {
+    requestId: string;
+    label: string;
+    version: number;
+    expiresAt: string;
+  };
+  boundWorker?: {
+    workerId: string;
+    label: string;
+    continuationEpoch: number;
+    currentTaskId?: string;
+  };
+  blocker?: {
+    code: string;
+    message: string;
+    stage: string;
+  };
+}
+
+export interface InspectRosterWorker {
+  id: string;
+  label: string;
+  lifecycleState: string;
+  currentTaskId?: string;
+  continuationEpoch: number;
+  updatedAt: string;
+}
+
+export interface InspectPendingRequest {
+  requestId: string;
+  requesterFingerprint: string;
+  label: string;
+  version: number;
+  requestedAt: string;
+  expiresAt: string;
+}
+
+export interface SwarmInspectResult {
+  swarm: {
+    id: string;
+    status: string;
+    workerLimit: number;
+    revision: number;
+    createdAt: string;
+  };
+  roster: InspectRosterWorker[];
+  pendingRequests: InspectPendingRequest[];
+  observedDeliveryMode: "POLLING_ONLY";
+}
 
 export class ChatSwarmCoordinator {
   constructor(readonly store: ChatSwarmStore) {}
@@ -53,6 +112,213 @@ export class ChatSwarmCoordinator {
   checkpoint(meta: unknown, workerId: string, expectedEpoch: number, leaseExpiresAt: string, checkpoint: Record<string, unknown>): ChatSwarmWorker {
     this.requireWorkerIdentity(meta, workerId);
     return this.store.checkpointWorker(workerId, expectedEpoch, leaseExpiresAt, checkpoint);
+  }
+
+  peerStatus(meta: unknown, swarmId?: string): PeerStatusResult {
+    let identityEvidence: ChatSwarmIdentityEvidence | undefined;
+    let identityError: unknown;
+    try {
+      identityEvidence = this.identity(meta);
+    } catch (err) {
+      identityError = err;
+    }
+
+    if (!identityEvidence) {
+      let status: "MISSING" | "AMBIGUOUS" | "MALFORMED" = "MISSING";
+      let blockerCode = "IDENTITY_MISSING";
+      let message = "no verified conversation identity headers present";
+
+      if (identityError instanceof ChatSwarmIdentityError) {
+        if (identityError.code === "AMBIGUOUS") {
+          status = "AMBIGUOUS";
+          blockerCode = "IDENTITY_AMBIGUOUS";
+          message = "conflicting conversation identity headers found";
+        } else if (identityError.code === "MALFORMED") {
+          status = "MALFORMED";
+          blockerCode = "IDENTITY_MALFORMED";
+          message = identityError.message || "malformed conversation identity headers";
+        } else {
+          status = "MISSING";
+          blockerCode = "IDENTITY_MISSING";
+          message = identityError.message || "no verified conversation identity headers present";
+        }
+      }
+
+      return {
+        identity: {
+          status,
+        },
+        state: "BLOCKED",
+        deliveryMode: "POLLING_ONLY",
+        blocker: {
+          code: blockerCode,
+          message,
+          stage: "identity_validated",
+        },
+      };
+    }
+
+    const fingerprint = identityEvidence.fingerprint;
+    const baseIdentity = {
+      status: "RESOLVED" as const,
+      source: identityEvidence.source,
+      trustClassification: "CARRIER_HEADER",
+      fingerprint,
+    };
+
+    if (!swarmId) {
+      return {
+        identity: baseIdentity,
+        state: "UNBOUND",
+        deliveryMode: "POLLING_ONLY",
+      };
+    }
+
+    const swarm = this.store.getSwarm(swarmId);
+    if (!swarm) {
+      return {
+        identity: baseIdentity,
+        state: "BLOCKED",
+        deliveryMode: "POLLING_ONLY",
+        blocker: {
+          code: "NOT_FOUND",
+          message: "swarm not found",
+          stage: "admission_denied",
+        },
+      };
+    }
+
+    const worker = this.store.getWorkerByFingerprint(swarmId, fingerprint);
+    if (worker) {
+      return {
+        identity: baseIdentity,
+        state: "BOUND",
+        deliveryMode: "POLLING_ONLY",
+        boundWorker: {
+          workerId: worker.id,
+          label: worker.label,
+          continuationEpoch: worker.continuationEpoch,
+          currentTaskId: worker.currentTaskId,
+        },
+      };
+    }
+
+    const request = this.store.getLatestJoinRequestByFingerprint(swarmId, fingerprint);
+    if (request) {
+      if (request.status === "PENDING") {
+        const isExpired = new Date(request.expiresAt).getTime() <= Date.now();
+        if (isExpired) {
+          return {
+            identity: baseIdentity,
+            state: "BLOCKED",
+            deliveryMode: "POLLING_ONLY",
+            blocker: {
+              code: "REQUEST_EXPIRED",
+              message: "join request has expired",
+              stage: "admission_denied",
+            },
+          };
+        }
+        return {
+          identity: baseIdentity,
+          state: "PENDING_APPROVAL",
+          deliveryMode: "POLLING_ONLY",
+          pendingRequest: {
+            requestId: request.id,
+            label: request.label,
+            version: request.version,
+            expiresAt: request.expiresAt,
+          },
+        };
+      }
+      if (request.status === "APPROVED" && request.approvedWorkerId) {
+        const approvedWorker = this.store.getWorker(request.approvedWorkerId);
+        if (approvedWorker) {
+          return {
+            identity: baseIdentity,
+            state: "APPROVED",
+            deliveryMode: "POLLING_ONLY",
+            boundWorker: {
+              workerId: approvedWorker.id,
+              label: approvedWorker.label,
+              continuationEpoch: approvedWorker.continuationEpoch,
+              currentTaskId: approvedWorker.currentTaskId,
+            },
+          };
+        }
+      }
+    }
+
+    return {
+      identity: baseIdentity,
+      state: "UNBOUND",
+      deliveryMode: "POLLING_ONLY",
+    };
+  }
+
+  inspect(meta: unknown, swarmId: string, cursor?: string, limit = 50): SwarmInspectResult {
+    this.assertOwner(meta, swarmId);
+    const swarm = this.store.getSwarm(swarmId);
+    if (!swarm) throw new ChatSwarmError("NOT_FOUND", "swarm not found");
+
+    const workers = this.store.listWorkers(swarmId);
+    const roster: InspectRosterWorker[] = workers.map((w) => ({
+      id: w.id,
+      label: w.label,
+      lifecycleState: w.lifecycleState,
+      currentTaskId: w.currentTaskId,
+      continuationEpoch: w.continuationEpoch,
+      updatedAt: w.updatedAt,
+    }));
+
+    const pendingRequestsRaw = this.store.listPendingJoinRequests(swarmId, limit, cursor);
+    const pendingRequests: InspectPendingRequest[] = pendingRequestsRaw.map((req) => ({
+      requestId: req.id,
+      requesterFingerprint: req.requesterFingerprint,
+      label: req.label,
+      version: req.version,
+      requestedAt: req.requestedAt,
+      expiresAt: req.expiresAt,
+    }));
+
+    return {
+      swarm: {
+        id: swarm.id,
+        status: swarm.status,
+        workerLimit: swarm.workerLimit,
+        revision: swarm.revision,
+        createdAt: swarm.createdAt,
+      },
+      roster,
+      pendingRequests,
+      observedDeliveryMode: "POLLING_ONLY",
+    };
+  }
+
+  createJoinRequest(meta: unknown, swarmId: string, label: string, attemptKey: string) {
+    const identity = this.identity(meta);
+    return this.store.createJoinRequestAtomic({
+      swarmId,
+      label,
+      attemptKey,
+      requesterFingerprint: identity.fingerprint,
+    });
+  }
+
+  approveJoin(
+    meta: unknown,
+    swarmId: string,
+    requestId: string,
+    expectedRequestVersion: number,
+    expectedSwarmVersion: number,
+  ) {
+    this.assertOwner(meta, swarmId);
+    return this.store.approveJoinRequestAtomic({
+      swarmId,
+      requestId,
+      expectedRequestVersion,
+      expectedSwarmVersion,
+    });
   }
 
   expireLease(workerId: string, at: string): ChatSwarmTask | undefined { return this.store.expireWorkerLease(workerId, at); }

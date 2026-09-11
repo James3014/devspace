@@ -772,7 +772,7 @@ test("Chat Swarm production registration is opt-in and uses the shared lifecycle
   const enabled = await fixture(t, { chatSwarm: true });
   const tools = await enabled.client.listTools();
   const swarmTools = tools.tools.filter((tool) => tool.name.startsWith("chat_swarm_"));
-  assert.equal(swarmTools.length, 10);
+  assert.equal(swarmTools.length, 14);
   assert.ok(swarmTools.every((tool) => tool.inputSchema));
   const expectedShapes = chatSwarmToolInputShapes(enabled.config);
   assertRegisteredChatSwarmSchemaParity(swarmTools, expectedShapes);

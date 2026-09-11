@@ -57,6 +57,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 14, name: "chat-swarm-runtime-owner" },
       { version: 15, name: "carrier-bindings" },
       { version: 16, name: "carrier-validity" },
+      { version: 17, name: "chat-swarm-join-requests" },
     ]);
   } finally {
     database.close();
