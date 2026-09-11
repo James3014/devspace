@@ -243,7 +243,7 @@ test("authority and hashed credentials survive reopen; sessions do not; expiry d
   } finally {reopened?.close();f.close();}
 });
 
-test("handoff preserves the pinned operation; terminal proof permits successor recovery after predecessor revocation",async()=>{
+test("handoff denies a pinned operation and permits terminal replay after predecessor revocation",async()=>{
   const f=fixture();let manager:DurableOperationManager|undefined;
   try {
     execFileSync("git",["init"],{cwd:f.workspace,stdio:"ignore"});
@@ -267,22 +267,29 @@ test("handoff preserves the pinned operation; terminal proof permits successor r
     const running=manager.dependencySync(input,sender);
     await started;
     const pinned=f.store.ownership.get(lease.leaseId)!;
-    manager.handoff(lease.leaseId,pinned.version,to.id,{
+    const packet={
       resource:lease.resource,baseRevision:base,scope:lease.scope,candidateRevision:base,
       liveOperation:lease.operation,liveHandle:plan.subject.operationId,checkpoint:"test-started",
       grantDependency:from.grant,grantVersion:1,recipientGrant:to.grant,recipientGrantVersion:1,
       forbiddenOverlap:lease.scope,tests:["terminal-test"],evidence:["test-command-started"],remainingGap:"wait for terminal proof",nextGate:"reconcile",expiresAt:lease.expiresAt,
-    },sender);
+    };
+    const beforeHandoff=f.snapshot();
+    assert.throws(()=>manager!.handoff(lease.leaseId,pinned.version,to.id,packet,sender), /reconcile/);
+    assert.equal(f.snapshot(),beforeHandoff);
+    assert.equal(f.store.ownership.get(lease.leaseId)?.ownerThread,from.id);
+    finish();
+    const completed=await running;
+    assert.equal(completed.status,"succeeded");
+    const terminalLease=f.store.ownership.get(lease.leaseId)!;
+    manager.handoff(lease.leaseId,terminalLease.version,to.id,{...packet,liveHandle:"",remainingGap:"",nextGate:"continue"},sender);
     assert.equal(f.store.readers.resolveEffectBinding(sender,plan.subject),undefined);
     assert.equal(f.store.readers.resolveEffectBinding(successor,plan.subject)?.leaseId,lease.leaseId);
     await assert.rejects(()=>manager!.reconcile(plan.subject.operationId,sender));
     f.store.revokeLocal(from.id,1);
-    finish();
-    assert.equal((await running).status,"outcome_unknown");
-    const recovered=await manager.reconcile(plan.subject.operationId,successor);
-    assert.equal(recovered.status,"succeeded");
+    const recovered=await manager.dependencySync(input,successor);
+    assert.deepEqual(recovered,completed);
     const terminalSnapshot=f.snapshot();
-    assert.deepEqual(await manager.reconcile(plan.subject.operationId,successor),recovered);
+    assert.deepEqual(await manager.dependencySync(input,successor),recovered);
     assert.equal(f.snapshot(),terminalSnapshot);
     assert.equal(f.store.ownership.get(lease.leaseId)?.operationHandle,undefined);
     assert.equal(f.store.ownership.get(lease.leaseId)?.ownerThread,to.id);

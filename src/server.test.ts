@@ -2317,17 +2317,23 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
       assert.equal(stale.isError,true);
       assert.equal(JSON.stringify(ownership.get(leaseId)),beforeRead);
       assert.equal(JSON.stringify(cutoverStore.get()),beforeCutover);
-      // Drain admission permits only an exact existing-lease transfer; the live pin survives.
+      // Drain admission cannot transfer an unresolved effect, even with an exact receipt.
       const pinned=ownership.get(cutoverLeaseId)!;
+      const {openDatabase}=await import("./db/client.js");
+      const handoffDb=openDatabase(config.stateDir);
+      const receiptSnapshot=()=>JSON.stringify(handoffDb.sqlite.prepare("select * from control_plane_handoff_receipts order by receipt_id").all());
+      const receiptsBefore=receiptSnapshot();
       const pinnedReceipt={...handoffInput,resource:pinned.resource,scope:pinned.scope,baseRevision:pinned.baseRevision,liveOperation:pinned.operation,liveHandle:operationId,grantDependency:pinned.grant,grantVersion:pinned.grantVersion,recipientGrant:pinned.grant,recipientGrantVersion:pinned.grantVersion,expiresAt:pinned.expiresAt};
       const pinTransfer=await otherClient.callTool({name:"coordination_handoff",arguments:{leaseId:cutoverLeaseId,expectedVersion:pinned.version,recipientHandle:"original-client",receipt:pinnedReceipt}});
-      assert.equal(pinTransfer.isError,undefined,JSON.stringify(pinTransfer));
-      assert.equal(ownership.get(cutoverLeaseId)?.operationHandle,operationId);
-      assert.equal(ownership.get(cutoverLeaseId)?.ownerThread,"delegated-cli-worker");
-      assert.equal((await otherClient.callTool({name:"cutover_drain",arguments:{cutoverId}})).isError,true);
+      assert.equal(pinTransfer.isError,true,JSON.stringify(pinTransfer));
+      assert.deepEqual(ownership.get(cutoverLeaseId),pinned);
+      assert.equal(receiptSnapshot(),receiptsBefore);
+      handoffDb.sqlite.close();
+      assert.equal((await client.callTool({name:"cutover_drain",arguments:{cutoverId}})).isError,true);
+      assert.equal((await otherClient.callTool({name:"cutover_drain",arguments:{cutoverId}})).isError,undefined);
       assert.equal(JSON.stringify(cutoverStore.get()),beforeCutover);
-      assert.equal((await otherClient.callTool({name:"operation_reconcile",arguments:{operationId}})).isError,true);
-      // Receiving the lease does not promote a worker to controller.
+      assert.equal((await otherClient.callTool({name:"operation_reconcile",arguments:{operationId}})).isError,undefined);
+      // The rejected recipient still has no cutover authority.
       assert.equal((await client.callTool({name:"operation_reconcile",arguments:{operationId}})).isError,true);
       await assert.rejects(otherClient.callTool({name:"dependency_sync",arguments:input}),/CUTOVER_RECONCILIATION_REQUIRED/);
 

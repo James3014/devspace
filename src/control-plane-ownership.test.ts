@@ -14,6 +14,42 @@ const options = { resolveResourceIdentity: (input: Parameters<ControlPlaneOwners
 function input(scope = ["/repo/src/a"]): Parameters<ControlPlaneOwnershipStore["acquire"]>[1] { return { repositoryKey: "owner/repo", resourceKind: "checkout", resourceId: "main", resource: "checkout", operation: "write", scope, baseRevision: "sha-a", expiresAt: new Date(Date.now() + 60_000).toISOString(), idempotencyKey: `key-${scope.join("-")}`, grant }; }
 function db() { const sqlite = new Database(":memory:"); initializeControlPlaneOwnershipDatabase(sqlite); sqlite.prepare("insert into control_plane_grant_evidence(repository,goal,coordinator_thread,evidence_hash,version,updated_at) values(?,?,?,?,?,?)").run(grant.repository, grant.goal, grant.coordinatorThread, grant.evidenceHash, 1, new Date().toISOString()); return sqlite; }
 
+test("handoff rejects an unresolved pin without changing ownership or receipts", () => {
+  const sqlite = db();
+  const store = new ControlPlaneOwnershipStore(sqlite, {...options, verifyReconciliationEvidence: () => true});
+  try {
+    const lease = store.acquire(context("from"), input());
+    const pin = store.beginOperation(context("from"), lease.leaseId, 1, "unknown-effect");
+    const packet = {resource: lease.resource, candidateRevision: "candidate", baseRevision: lease.baseRevision, scope: lease.scope, grantDependency: lease.grant, grantVersion: lease.grantVersion, recipientGrant: lease.grant, recipientGrantVersion: lease.grantVersion, checkpoint: "checkpoint", liveOperation: lease.operation, liveHandle: "unknown-effect", forbiddenOverlap: lease.scope, tests: ["test"], evidence: ["receipt"], remainingGap: "unknown", nextGate: "reconcile", expiresAt: lease.expiresAt};
+    assert.throws(() => store.handoff(context("from"), lease.leaseId, pin.version, context("to"), packet), (error: unknown) => error instanceof ControlPlaneOwnershipError && error.code === "OWNERSHIP_CONFLICT");
+    assert.deepEqual(store.get(lease.leaseId), pin);
+    assert.equal((sqlite.prepare("select count(*) as n from control_plane_handoff_receipts").get() as {n: number}).n, 0);
+    store.reconcile(context("from"), lease.leaseId, pin.version, {leaseId: lease.leaseId, ownerThread: "from", operationHandle: "unknown-effect", operation: lease.operation, baseRevision: lease.baseRevision, leaseVersion: pin.version, state: "finished"});
+    const terminal = store.get(lease.leaseId)!;
+    assert.equal(terminal.operationHandle, undefined);
+    const receipt = store.handoff(context("from"), lease.leaseId, terminal.version, context("to"), {...packet, liveHandle: "", remainingGap: "", nextGate: "continue"});
+    assert.equal(receipt.newVersion, terminal.version + 1);
+  } finally { sqlite.close(); }
+});
+
+test("handoff rolls back a pin inserted by a callback after binding checks", () => {
+  const sqlite = db(); let armed = false;
+  const store = new ControlPlaneOwnershipStore(sqlite, {...options, now: () => {
+    if (armed) sqlite.prepare("update control_plane_resource_leases set active_operation_handle='racing-effect', operation_state='active'").run();
+    return Date.now();
+  }});
+  try {
+    const lease = store.acquire(context("from"), input());
+    const packet = {resource: lease.resource, candidateRevision: "candidate", baseRevision: lease.baseRevision, scope: lease.scope, grantDependency: lease.grant, grantVersion: lease.grantVersion, recipientGrant: lease.grant, recipientGrantVersion: lease.grantVersion, checkpoint: "checkpoint", liveOperation: lease.operation, liveHandle: "", forbiddenOverlap: lease.scope, tests: ["race"], evidence: ["receipt"], remainingGap: "", nextGate: "continue", expiresAt: lease.expiresAt};
+    armed = true;
+    assert.throws(() => store.handoff(context("from"), lease.leaseId, lease.version, context("to"), packet), (error: unknown) => error instanceof ControlPlaneOwnershipError && error.code === "CAS_CONFLICT");
+    armed = false;
+    assert.deepEqual(store.get(lease.leaseId), lease);
+    assert.equal((sqlite.prepare("select count(*) as n from control_plane_handoff_receipts").get() as {n: number}).n, 0);
+    assert.equal(store.handoff(context("from"), lease.leaseId, lease.version, context("to"), packet).newVersion, 2);
+  } finally { sqlite.close(); }
+});
+
 test("expired cutover terminal assertion preserves ordinary expiry, owner and callback fences",()=>{
   const sqlite=db();let now=Date.now(),armed="";
   const store=new ControlPlaneOwnershipStore(sqlite,{...options,now:()=>now,
@@ -52,7 +88,7 @@ test("ancestor and descendant scopes conflict; expired unresolved lease cannot b
 
 test("handoff is atomic and stale owner/version cannot mutate", () => { const sqlite = db(); const store = new ControlPlaneOwnershipStore(sqlite, options); try { const lease = store.acquire(context("from"), input()); const receipt = store.handoff(context("from"), lease.leaseId, 1, context("to"), { resource: "checkout", candidateRevision: "sha-b", baseRevision: lease.baseRevision, scope: lease.scope, grantDependency: lease.grant, grantVersion: lease.grantVersion, recipientGrant: lease.grant, recipientGrantVersion: lease.grantVersion, checkpoint: "checkpoint-ref", liveOperation: lease.operation, liveHandle: "", forbiddenOverlap: ["/repo"], tests: ["race"], evidence: ["evidence"], remainingGap: "none", nextGate: "review", expiresAt: lease.expiresAt }); assert.equal(receipt.newVersion, 2); assert.throws(() => store.assertHeld(context("from"), lease.leaseId, 1, "write", "sha-a"), (error: unknown) => error instanceof ControlPlaneOwnershipError && error.code === "CAS_CONFLICT"); assert.equal(store.assertHeld(context("to"), lease.leaseId, 2, "write", "sha-a").ownerThread, "to"); } finally { sqlite.close(); } });
 
-test("operation pin closes the release/handoff TOCTOU window", () => { const sqlite = db(); const store = new ControlPlaneOwnershipStore(sqlite, options); try { const lease = store.acquire(context("from"), input()); const pinned = store.beginOperation(context("from"), lease.leaseId, 1, "run-1"); assert.equal(pinned.operationHandle, "run-1"); assert.throws(() => store.release(context("from"), lease.leaseId, 2), (error: unknown) => error instanceof ControlPlaneOwnershipError && error.code === "OWNERSHIP_CONFLICT"); assert.throws(() => store.handoff(context("from"), lease.leaseId, 2, context("to"), { resource: "checkout", candidateRevision: "sha-b", baseRevision: lease.baseRevision, scope: lease.scope, grantDependency: lease.grant, grantVersion: lease.grantVersion, recipientGrant: lease.grant, recipientGrantVersion: lease.grantVersion, checkpoint: "checkpoint-ref", liveOperation: lease.operation, liveHandle: "wrong", forbiddenOverlap: ["/repo"], tests: [], evidence: ["checkpoint-proof"], remainingGap: "none", nextGate: "review", expiresAt: lease.expiresAt }), (error: unknown) => error instanceof ControlPlaneOwnershipError && error.code === "CAS_CONFLICT"); const receipt = store.handoff(context("from"), lease.leaseId, 2, context("to"), { resource: "checkout", candidateRevision: "sha-b", baseRevision: lease.baseRevision, scope: lease.scope, grantDependency: lease.grant, grantVersion: lease.grantVersion, recipientGrant: lease.grant, recipientGrantVersion: lease.grantVersion, checkpoint: "checkpoint-ref", liveOperation: lease.operation, liveHandle: "run-1", forbiddenOverlap: ["/repo"], tests: [], evidence: ["checkpoint-proof"], remainingGap: "none", nextGate: "review", expiresAt: lease.expiresAt }); assert.equal(receipt.liveHandle, "run-1"); const finished = store.finishOperation(context("to"), lease.leaseId, 3, "run-1"); assert.equal(finished.operationState, "finished"); } finally { sqlite.close(); } });
+test("operation pin closes the release/handoff TOCTOU window", () => { const sqlite = db(); const store = new ControlPlaneOwnershipStore(sqlite, options); try { const lease = store.acquire(context("from"), input()); const pinned = store.beginOperation(context("from"), lease.leaseId, 1, "run-1"); assert.equal(pinned.operationHandle, "run-1"); assert.throws(() => store.release(context("from"), lease.leaseId, 2), (error: unknown) => error instanceof ControlPlaneOwnershipError && error.code === "OWNERSHIP_CONFLICT"); assert.throws(() => store.handoff(context("from"), lease.leaseId, 2, context("to"), { resource: "checkout", candidateRevision: "sha-b", baseRevision: lease.baseRevision, scope: lease.scope, grantDependency: lease.grant, grantVersion: lease.grantVersion, recipientGrant: lease.grant, recipientGrantVersion: lease.grantVersion, checkpoint: "checkpoint-ref", liveOperation: lease.operation, liveHandle: "wrong", forbiddenOverlap: ["/repo"], tests: [], evidence: ["checkpoint-proof"], remainingGap: "none", nextGate: "review", expiresAt: lease.expiresAt }), (error: unknown) => error instanceof ControlPlaneOwnershipError && error.code === "CAS_CONFLICT"); assert.throws(() => store.handoff(context("from"), lease.leaseId, 2, context("to"), { resource: "checkout", candidateRevision: "sha-b", baseRevision: lease.baseRevision, scope: lease.scope, grantDependency: lease.grant, grantVersion: lease.grantVersion, recipientGrant: lease.grant, recipientGrantVersion: lease.grantVersion, checkpoint: "checkpoint-ref", liveOperation: lease.operation, liveHandle: "run-1", forbiddenOverlap: ["/repo"], tests: [], evidence: ["checkpoint-proof"], remainingGap: "none", nextGate: "review", expiresAt: lease.expiresAt }), /reconcile/); const finished = store.finishOperation(context("from"), lease.leaseId, 2, "run-1"); assert.equal(finished.operationState, "finished"); } finally { sqlite.close(); } });
 
 test("repository aliases canonicalize before overlap checks", () => { const sqlite = db(); const store = new ControlPlaneOwnershipStore(sqlite, options); try { store.acquire(context("one"), input(["/repo/src"])); assert.throws(() => store.acquire(context("two"), { ...input(["/repo/src/child"]), repositoryKey: "OWNER/REPO", idempotencyKey: "canonical-alias" }), (error: unknown) => error instanceof ControlPlaneOwnershipError && error.code === "OWNERSHIP_CONFLICT"); assert.throws(() => store.acquire(context("two"), { ...input(["repo/src"]), idempotencyKey: "relative" }), (error: unknown) => error instanceof ControlPlaneOwnershipError && error.code === "INVALID_INPUT"); } finally { sqlite.close(); } });
 
@@ -177,13 +213,13 @@ test("C1/C2 two processes race at renewal/reconciliation/handoff CAS after grant
     const root = mkdtempSync(join(tmpdir(), "devspace-c1-race-")); const path=join(root,"state.sqlite");
     const sqlite = new Database(path); const store = new ControlPlaneOwnershipStore(sqlite, options);
     store.putGrantEvidence(context("owner"), grant, 0);
-    const lease=store.acquire(context("owner"),input()); store.beginOperation(context("owner"),lease.leaseId,1,"op"); sqlite.close();
+    const lease=store.acquire(context("owner"),input()); store.beginOperation(context("owner"),lease.leaseId,1,"op"); if(action==="handoff") store.finishOperation(context("owner"),lease.leaseId,2,"op"); sqlite.close();
     const script = `import Database from 'better-sqlite3'; import {ControlPlaneOwnershipStore} from './src/control-plane-ownership.ts';
       const db=new Database(process.argv[1]);db.pragma('busy_timeout=5000');
       const s=new ControlPlaneOwnershipStore(db,{resolveResourceIdentity:i=>i,resolveOwnerContext:()=>({ownerThread:'owner'}),verifyGrantEvidence:()=>true,verifyReconciliationEvidence:()=>true});
       process.stdout.write('ready\\n'); process.stdin.once('data',()=>{try {
         if(process.argv[3]==='renew') s.renew({},process.argv[2],2,new Date(Date.now()+120000+Number(process.argv[4])*1000).toISOString());
-        else if(process.argv[3]==='handoff') { const lease=s.get(process.argv[2]); const target=process.argv[4]; const handoffStore=new ControlPlaneOwnershipStore(db,{resolveResourceIdentity:i=>i,resolveOwnerContext:(v)=>({ownerThread:String(v)}),verifyGrantEvidence:()=>true}); handoffStore.handoff('owner',lease.leaseId,2,target,{resource:lease.resource,baseRevision:lease.baseRevision,scope:lease.scope,candidateRevision:'candidate',liveOperation:lease.operation,liveHandle:'op',checkpoint:'checkpoint',grantDependency:lease.grant,grantVersion:lease.grantVersion,recipientGrant:lease.grant,recipientGrantVersion:lease.grantVersion,forbiddenOverlap:lease.scope,tests:[],evidence:['proof'],remainingGap:'unknown',nextGate:'reconcile',expiresAt:lease.expiresAt}); }
+        else if(process.argv[3]==='handoff') { const lease=s.get(process.argv[2]); const target=process.argv[4]; const handoffStore=new ControlPlaneOwnershipStore(db,{resolveResourceIdentity:i=>i,resolveOwnerContext:(v)=>({ownerThread:String(v)}),verifyGrantEvidence:()=>true}); handoffStore.handoff('owner',lease.leaseId,3,target,{resource:lease.resource,baseRevision:lease.baseRevision,scope:lease.scope,candidateRevision:'candidate',liveOperation:lease.operation,liveHandle:'',checkpoint:'checkpoint',grantDependency:lease.grant,grantVersion:lease.grantVersion,recipientGrant:lease.grant,recipientGrantVersion:lease.grantVersion,forbiddenOverlap:lease.scope,tests:[],evidence:['proof'],remainingGap:'',nextGate:'continue',expiresAt:lease.expiresAt}); }
         else s.reconcile({},process.argv[2],2,{leaseId:process.argv[2],ownerThread:'owner',operationHandle:'op',operation:'write',baseRevision:'sha-a',leaseVersion:2,state:'finished',detail:process.argv[4]});
         console.log('won');
       }catch(e){console.log('lost:'+e.code)}finally{db.close()}});`;
@@ -199,11 +235,11 @@ test("C1/C2 two processes race at renewal/reconciliation/handoff CAS after grant
       const results=await Promise.all(children.map(c=>c.done));
       assert.equal(results.filter(r=>r.includes('\nwon')).length,1); assert.equal(results.filter(r=>r.includes('lost:CAS_CONFLICT')).length,1);
       const reopened=new Database(path);try {
-        assert.equal((reopened.prepare('select version from control_plane_resource_leases').get() as {version:number}).version,3);
+        assert.equal((reopened.prepare('select version from control_plane_resource_leases').get() as {version:number}).version,action==="handoff"?4:3);
         assert.equal((reopened.prepare('select count(*) n from control_plane_reconciliation_receipts').get() as {n:number}).n,action==='reconcile'?1:0);
         if(action==='handoff') {
           assert.equal((reopened.prepare('select count(*) n from control_plane_handoff_receipts').get() as {n:number}).n,1);
-          const state=new ControlPlaneOwnershipStore(reopened,options).get(lease.leaseId)!;assert.ok(['1','2'].includes(state.ownerThread));assert.equal(state.operationHandle,'op');
+          const state=new ControlPlaneOwnershipStore(reopened,options).get(lease.leaseId)!;assert.ok(['1','2'].includes(state.ownerThread));assert.equal(state.operationHandle,undefined);assert.equal(state.operationState,'finished');
         }
       } finally {reopened.close();}
     } finally {children.forEach(c=>c.child.kill());rmSync(root,{recursive:true,force:true});}
