@@ -78,6 +78,7 @@ const migrations: Migration[] = [
     up: migrateChatSwarmRuntimeOwner,
   },
   { version: 15, name: "carrier-bindings", up: migrateCarrierBindings },
+  { version: 16, name: "carrier-validity", up: migrateCarrierValidity },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -455,5 +456,17 @@ function migrateCarrierBindings(sqlite: Database.Database): void {
       subject_json text not null, lease_id text not null,
       primary key(binding_id, operation_id)
     );
+  `);
+}
+
+function migrateCarrierValidity(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table carrier_validity (
+      carrier_id text primary key references carrier_bindings(id),
+      version integer not null check(version > 0),
+      expires_at text not null
+    );
+    insert into carrier_validity(carrier_id, version, expires_at)
+      select id, 1, json_extract(contract_json, '$.expiresAt') from carrier_bindings;
   `);
 }

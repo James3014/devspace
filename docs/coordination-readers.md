@@ -63,3 +63,14 @@ This built-in contract currently rejects cutover operations. Existing custom rea
 cutover integration remains separate. Pairing demonstrates possession of a carrier
 credential, not native ChatGPT conversation attestation. HTTP SDK tests establish
 the transport path; they do not establish deployment or native host acceptance.
+
+
+### Reauthorize an expired carrier and resume safely
+
+`devspace carrier show <carrier-id>` reads the immutable contract, revocation state, and validity version without disclosing credentials. The local operator can extend validity with `devspace carrier reauthorize <carrier-id> --validity-version <version> --until <ISO expiry>`. The future expiry must be within the existing 24-hour lease bound. This compare-and-swap update preserves the carrier ID, credential, scope, base and grant hash. Stale versions and revoked carriers are rejected. Children cannot exceed active parent validity; renewing a parent does not renew expired children.
+
+The existing credential can then resume an authenticated MCP session. Renewal never clears a live operation pin or invents completion evidence. Reconcile interrupted operations using their persisted terminal witnesses; without a witness, the operation stays pinned. Changes to carrier or ancestor validity during execution fence completion even when the immutable grant is unchanged.
+
+For an expired lease without a pinned effect, use `coordination_lease_read`, then explicitly release that exact version with `coordination_lease_release`. Prepare a distinct operation after reconciliation or release. Preparation never silently deletes or revives expired ownership. These commands use the existing ownership store.
+
+Local approval proves local operating-system access and bounded credential possession. It does not attest a ChatGPT conversation, deploy the package, or prove native ChatGPT execution.

@@ -11,6 +11,8 @@ export interface EffectSubject {
   operation: "dependency_sync" | "cutover_start";
 }
 export interface EffectBinding {
+  /** Trusted authority generation; changes fence in-flight completion. */
+  authorityVersion?: string;
   leaseId: string;
   leaseVersion: number;
   requestHash: string;
@@ -138,7 +140,7 @@ export class ControlPlaneConsumer {
 
   assertPinned(context: unknown, subject: EffectSubject, binding: EffectBinding, pinnedVersion: number): void {
     const current = this.authorize(context, subject);
-    if (current.leaseId !== binding.leaseId || current.leaseVersion !== pinnedVersion || current.role !== binding.role) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "effect completion authority changed");
+    if (current.leaseId !== binding.leaseId || current.leaseVersion !== pinnedVersion || current.role !== binding.role || current.authorityVersion !== binding.authorityVersion) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "effect completion authority changed");
     const lease = this.ownership.get(binding.leaseId);
     if (lease?.operationHandle !== subject.operationId || lease.version !== pinnedVersion) throw new ControlPlaneOwnershipError("CAS_CONFLICT", "operation pin changed");
   }

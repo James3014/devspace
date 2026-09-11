@@ -35,8 +35,9 @@ test("real HTTP clients sharing OAuth pair independently, delegate, resume, exec
   let redirect="";
   await provider.authorize(oauthClient,{redirectUri:"http://localhost/callback",codeChallenge:"fixture",scopes:config.oauth.scopes,resource:new URL("/mcp",config.publicBaseUrl)}, {req:{method:"POST",body:{owner_token:config.oauth.ownerToken}},redirect:(_status:number,url:string)=>{redirect=url;}} as never);
   const tokens=await provider.exchangeAuthorizationCode(oauthClient,new URL(redirect).searchParams.get("code")!);
-  const running=createServer(config);
-  const localOwner=new CarrierBindingStore(config.stateDir);
+  let now=Date.now();
+  const running=createServer(config,{carrierClock:()=>now});
+  const localOwner=new CarrierBindingStore(config.stateDir,()=>now);
   const database=openDatabase(config.stateDir);
   const snapshot=()=>JSON.stringify({effects:database.sqlite.prepare("select * from carrier_effect_bindings order by operation_id").all(),leases:database.sqlite.prepare("select * from control_plane_resource_leases order by lease_id").all(),operations:database.sqlite.prepare("select * from durable_operations order by operation_id").all()});
   const listener=running.app.listen(0,"127.0.0.1");
@@ -107,6 +108,22 @@ test("real HTTP clients sharing OAuth pair independently, delegate, resume, exec
     assert.equal(transferred.status,"succeeded");
     assert.equal(transferred.operationId,secondPrepared.subject.operationId);
     assert.equal((database.sqlite.prepare("select count(*) as count from control_plane_resource_leases where resource=?").get(lease.resource) as {count:number}).count,1);
+    now=Date.parse(contract.expiresAt)+1000;
+    assert.equal((await successor.callTool({name:"coordination_lease_read",arguments:{leaseId:lease.leaseId}})).isError,true);
+    const refreshed=localOwner.reauthorizeLocal(nextOwner.id,1,new Date(now+120000).toISOString());
+    assert.equal(refreshed.id,nextOwner.id);
+    assert.deepEqual(refreshed.grant,nextOwner.grant);
+    const recoveredClient=await connect("reauthorized-controller");
+    data(await recoveredClient.callTool({name:"coordination_resume",arguments:{credential:nextPair.credential}}));
+    const expiredLease=data(await recoveredClient.callTool({name:"coordination_lease_read",arguments:{leaseId:lease.leaseId}}));
+    assert.equal(expiredLease.operationHandle,undefined);
+    const freshArgs={...secondArgs,attemptKey:"after-explicit-release"};
+    assert.equal((await recoveredClient.callTool({name:"coordination_prepare_dependencies",arguments:freshArgs})).isError,true);
+    data(await recoveredClient.callTool({name:"coordination_lease_release",arguments:{leaseId:lease.leaseId,expectedVersion:expiredLease.version}}));
+    const freshPrepared=data(await recoveredClient.callTool({name:"coordination_prepare_dependencies",arguments:freshArgs}));
+    assert.notEqual(freshPrepared.lease.leaseId,lease.leaseId);
+    assert.equal(data(await recoveredClient.callTool({name:"dependency_sync",arguments:freshArgs})).status,"succeeded");
+
 
   } finally {
     for(const client of clients) await client.close().catch(()=>{});
