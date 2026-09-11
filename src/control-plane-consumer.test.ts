@@ -238,7 +238,7 @@ test("C3 reconciliation callbacks cannot change verified outcome, record, or bin
   }
 });
 
-test("C3 late predecessor success or rejection cannot overwrite successor reconciliation", async () => {
+test("C3 late predecessor result cannot overwrite terminal reconciliation followed by handoff", async () => {
   for (const lateResult of ["success", "rejection"] as const) {
     let deliver!:()=>void;
     let started!:()=>void;
@@ -258,22 +258,21 @@ test("C3 late predecessor success or rejection cannot overwrite successor reconc
     try {
       await effectFinished;
       const prior=f.lease();
-      f.ownership.handoff(f.context,prior.leaseId,prior.version,successorContext,{
+      const proof={leaseId:prior.leaseId,ownerThread:prior.ownerThread,operationHandle:prior.operationHandle!,operation:prior.operation,baseRevision:prior.baseRevision,leaseVersion:prior.version,state:"finished" as const,requestHash:f.approvedHash,exitCode:0,frozenInputsUnchanged:true};
+      const recoveryOptions:ControlPlaneConsumerOptions={...f.options,
+        verifyDependencyReconciliation:e=>JSON.stringify(e)===JSON.stringify(proof),
+        verifyReconciliationEvidence:e=>e.ownerThread===prior.ownerThread && e.operationHandle===proof.operationHandle && e.detail===JSON.stringify({requestHash:proof.requestHash,exitCode:0,frozenInputsUnchanged:true}),
+      };
+      successor=new DurableOperationManager(f.config,undefined,undefined,undefined,recoveryOptions);
+      const terminal=successor.reconcileDependencySync(proof.operationHandle,proof,f.context);
+      assert.equal(terminal.status,"succeeded");
+      const reconciled=f.lease();
+      f.ownership.handoff(f.context,prior.leaseId,reconciled.version,successorContext,{
         resource:prior.resource,candidateRevision:f.base,baseRevision:prior.baseRevision,scope:prior.scope,
         grantDependency:prior.grant,grantVersion:prior.grantVersion,recipientGrant:prior.grant,recipientGrantVersion:prior.grantVersion,
-        checkpoint:"verified-effect-completed-response-pending",liveOperation:prior.operation,liveHandle:prior.operationHandle!,
-        forbiddenOverlap:[f.root],tests:["late-result"],evidence:["independent-terminal-proof"],remainingGap:"reconcile",nextGate:"reconcile",expiresAt:prior.expiresAt,
+        checkpoint:"verified-effect-completed-response-pending",liveOperation:prior.operation,liveHandle:"",
+        forbiddenOverlap:[f.root],tests:["late-result"],evidence:["independent-terminal-proof"],remainingGap:"",nextGate:"continue",expiresAt:prior.expiresAt,
       });
-      const transferred=f.lease();
-      const proof={leaseId:transferred.leaseId,ownerThread:"successor",operationHandle:transferred.operationHandle!,operation:transferred.operation,baseRevision:transferred.baseRevision,leaseVersion:transferred.version,state:"finished" as const,requestHash:f.approvedHash,exitCode:0,frozenInputsUnchanged:true};
-      const successorOptions:ControlPlaneConsumerOptions={...f.options,
-        resolveEffectBinding:(c,s)=>c===successorContext && s.requestHash===f.approvedHash ? {leaseId:f.leaseId,leaseVersion:f.lease().version,requestHash:f.approvedHash,role:"worker"}:undefined,
-        verifyDependencyReconciliation:e=>JSON.stringify(e)===JSON.stringify(proof),
-        verifyReconciliationEvidence:e=>e.ownerThread==="successor" && e.operationHandle===proof.operationHandle && e.detail===JSON.stringify({requestHash:proof.requestHash,exitCode:0,frozenInputsUnchanged:true}),
-      };
-      successor=new DurableOperationManager(f.config,undefined,undefined,undefined,successorOptions);
-      const terminal=successor.reconcileDependencySync(proof.operationHandle,proof,successorContext);
-      assert.equal(terminal.status,"succeeded");
       const successorLease=f.lease();
       deliver();
       const late=await oldResponse;
@@ -445,7 +444,7 @@ test("C3 cutover reconciliation rejects another lease with the same operation ha
   } finally {f.manager.close();}
 });
 
-test("C3 cutover reconciliation follows legitimate same-lease handoff and fences former owner", ()=>{
+test("C3 active cutover rejects handoff and preserves original owner reconciliation", ()=>{
   const f=cutoverFixture();const recipient={};
   try {
     const result=f.manager.startCutover(f.input,f.context);const lease=f.ownership.get(f.leaseId)!;
@@ -460,14 +459,15 @@ test("C3 cutover reconciliation follows legitimate same-lease handoff and fences
     assert.throws(()=>f.manager.handoff(f.leaseId,lease.version,"recipient",handoffInput,f.context),/trusted authenticated handoff recipient/);
     assert.equal(JSON.stringify(f.ownership.get(f.leaseId)),snapshot);
     f.options.resolveHandoffRecipient=recipientReader;
-    f.manager.handoff(f.leaseId,lease.version,"recipient",handoffInput,f.context);
-    assert.equal(f.manager.reconcileCutoverStart(result.operationId,recipient).operationId,result.operationId);
-    f.options.approveCutoverLifecycle=(c,subject,action)=>c===recipient&&subject.operationId===result.operationId&&action.action==="drain";
+    assert.throws(()=>f.manager.handoff(f.leaseId,lease.version,"recipient",handoffInput,f.context), /reconcile/);
+    assert.equal(JSON.stringify(f.ownership.get(f.leaseId)),snapshot);
+    assert.equal(f.manager.reconcileCutoverStart(result.operationId,f.context).operationId,result.operationId);
+    f.options.approveCutoverLifecycle=(c,subject,action)=>c===f.context&&subject.operationId===result.operationId&&action.action==="drain";
     const cutoverId=result.receipt!.cutoverId as string;
-    assert.equal(f.manager.drainCutover(cutoverId,f.input.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),recipient).phase,"drained");
-    assert.throws(()=>f.manager.drainCutover(cutoverId,f.input.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),f.context));
+    assert.equal(f.manager.drainCutover(cutoverId,f.input.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),f.context).phase,"drained");
+    assert.throws(()=>f.manager.drainCutover(cutoverId,f.input.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),recipient));
 
-    assert.throws(()=>f.manager.reconcileCutoverStart(result.operationId,f.context),/owner|binding|CAS|lease evidence/);
+    assert.throws(()=>f.manager.reconcileCutoverStart(result.operationId,recipient),/owner|binding|CAS|lease evidence/);
     assert.equal(f.ownership.get(f.leaseId)?.operationHandle,result.operationId);
   } finally {f.manager.close();}
 });
@@ -566,8 +566,9 @@ test("C3 finish denial and uncertain terminal writes retain the original pin",as
       assert.equal(file.phase,["close-response","terminal-write"].includes(failure)?"closed":"drained");
       if(failure==="wrong-runtime") assert.equal(calls,0);
       if(failure==="handoff") {
-        await assert.rejects(f.manager.finishCutover(id,replacement,pair,async()=>witness,f.context));
-        assert.equal((await f.manager.finishCutover(id,replacement,pair,async()=>witness,recipient)).phase,"closed");
+        assert.equal(f.ownership.get(f.leaseId)?.ownerThread,pin.ownerThread);
+        await assert.rejects(f.manager.finishCutover(id,replacement,pair,async()=>witness,recipient));
+        assert.equal((await f.manager.finishCutover(id,replacement,pair,async()=>witness,f.context)).phase,"closed");
       }
       if(["close-response","terminal-write"].includes(failure)) {
         CutoverStateStore.prototype.close=originalClose;f.manager.store.finish=originalFinish;
