@@ -2266,8 +2266,7 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
       const beforeDrain=JSON.stringify(new CutoverStateStore(config.stateDir).get());
       assert.equal((await client.callTool({name:"cutover_drain",arguments:{cutoverId},_meta:{clientId:successorClientId}})).isError,true);
       assert.equal(JSON.stringify(new CutoverStateStore(config.stateDir).get()),beforeDrain);
-      assert.equal((await client.callTool({name:"cutover_drain",arguments:{cutoverId}})).isError,true);
-      assert.equal((await otherClient.callTool({name:"cutover_drain",arguments:{cutoverId}})).isError,undefined);
+      assert.equal((await otherClient.callTool({name:"cutover_drain",arguments:{cutoverId}})).isError,true);
       assert.equal(JSON.stringify(new CutoverStateStore(config.stateDir).get()),beforeDrain);
       approvedDrainId=cutoverId;
       const drained=await otherClient.callTool({name:"cutover_drain",arguments:{cutoverId}});
@@ -2330,7 +2329,8 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
       assert.deepEqual(ownership.get(cutoverLeaseId),pinned);
       assert.equal(receiptSnapshot(),receiptsBefore);
       handoffDb.sqlite.close();
-      assert.equal((await otherClient.callTool({name:"cutover_drain",arguments:{cutoverId}})).isError,true);
+      assert.equal((await client.callTool({name:"cutover_drain",arguments:{cutoverId}})).isError,true);
+      assert.equal((await otherClient.callTool({name:"cutover_drain",arguments:{cutoverId}})).isError,undefined);
       assert.equal(JSON.stringify(cutoverStore.get()),beforeCutover);
       assert.equal((await otherClient.callTool({name:"operation_reconcile",arguments:{operationId}})).isError,undefined);
       // The rejected recipient still has no cutover authority.
