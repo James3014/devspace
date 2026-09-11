@@ -74,6 +74,7 @@ try {
   await import("./process-sessions.test.js");
   diagnosticPhase = "process-sessions-import-complete";
   console.error(`[process-sessions-ci] phase=${diagnosticPhase}`);
+  await import("./issue63-utf8-stream.test.js");
 } finally {
   diagnosticPhase = "cleanup-start";
   console.error(`[process-sessions-ci] phase=${diagnosticPhase}`);
