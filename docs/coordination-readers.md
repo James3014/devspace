@@ -90,8 +90,8 @@ frozen-input/base readback are persisted as an immutable terminal witness, allow
 `operation_reconcile` to close that same pinned effect under current authority.
 Without a recorded terminal witness, uncertainty stays pinned and is not retried.
 
-This built-in contract currently rejects cutover operations. Existing custom reader
-cutover integration remains separate. Pairing demonstrates possession of a carrier
+The built-in contract supports a separately approved controller-only cutover as
+described below. Existing custom reader integration remains separate. Pairing demonstrates possession of a carrier
 credential, not native ChatGPT conversation attestation. HTTP SDK tests establish
 the transport path; they do not establish deployment or native host acceptance.
 
@@ -105,3 +105,41 @@ The existing credential can then resume an authenticated MCP session. Renewal ne
 For an expired lease without a pinned effect, use `coordination_lease_read`, then explicitly release that exact version with `coordination_lease_release`. Prepare a distinct operation after reconciliation or release. Preparation never silently deletes or revives expired ownership. These commands use the existing ownership store.
 
 Local approval proves local operating-system access and bounded credential possession. It does not attest a ChatGPT conversation, deploy the package, or prove native ChatGPT execution.
+
+### Approve one exact cutover
+
+A local cutover approval uses a root controller with `operations: ["cutover_start"]`
+and `scope: [stateRoot]`. The state root must be the exact canonical configured
+`stateDir`. This exception does not add the state directory to allowed workspace
+roots and cannot be used by dependency contracts. Cutover authority cannot be
+delegated or handed off. Existing custom host readers retain their own contract.
+
+The additional strict `cutover` object contains:
+
+- `stateRoot`, `attemptKey`, and an ISO `expiresAt` no later than initial carrier expiry;
+- `currentIdentity`: exact original `serverInstanceId`, `sourceCommit`, `buildId`, and `capabilityManifestSha256`;
+- `expectedIdentity`: exact replacement source, build and capability digest;
+- `restart`: exact `buildReady` (`verifiedBy`, `verifiedAt`, nonempty `evidence`), `actuator: "launchd-self"`, `serviceLabel`, and `launchdTarget`;
+- `finish`: exact `workspaceId` and `agentId` for the reconciliation witness.
+
+The original source is the carrier's frozen `baseRevision` throughout recovery.
+Unknown source identities cannot be approved. The operator must verify build-ready
+evidence before approval; the live build probe is still required before scheduling.
+No future replacement instance ID or generated cutover ID is invented at approval.
+The durable request correlates that generated ID; finish requires a different
+instance with the approved replacement identity and the approved witness selection.
+
+After local `carrier approve` and credential resume, call
+`coordination_prepare_cutover` with explicit `attemptKey`, `expectedSourceCommit`,
+`expectedBuildId`, `expectedCapabilityManifestSha256`, and `expiresAt`, then pass
+the same inputs to `cutover_start`. Preparation uses the actual server identity
+and configured state root. Its request hash and operation ID must match approval;
+changed inputs are rejected before the cutover write. Drain, restart and finish
+continue through existing durable consumer checks and retain uncertain effects.
+
+After the cutover deadline, preparation, a new start, drain and restart are denied.
+Only exact persisted reconciliation/finish remains permitted under current carrier
+authority **and an unexpired resource lease**. Carrier reauthorization does not
+extend the cutover deadline or renew an expired resource lease. An expired pinned
+resource lease remains rejected and pinned; its cutover recovery is an outstanding
+integration requirement, not permission to restart or delete state.

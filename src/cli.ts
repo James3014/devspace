@@ -1271,14 +1271,12 @@ function runCarrierCommand(args: string[]): void {
     else if(action==="show" && flags.length===0) result=bindings.inspectLocal(id);
     else if(action==="reauthorize" && flags.length===4 && flags[0]==="--validity-version" && flags[2]==="--until") {
       const record=bindings.inspectLocal(id);
-      const roots=[...config.allowedRoots,config.worktreeRoot].map(canonicalizePath);
-      if(record.contract.scope.some(path=>!roots.some(root=>isPathInsideRoot(canonicalizePath(path),root)))) throw new Error("Carrier scope exceeds current configured roots.");
+      bindings.validateLocalScope(record.contract,[...config.allowedRoots,config.worktreeRoot]);
       result=bindings.reauthorizeLocal(id,Number(flags[1]),flags[3]!);
     }
     else if(action==="approve" && flags.length===4 && flags[0]==="--contract" && flags[2]==="--confirm" && flags[3]===id) {
       const contract=JSON.parse(readFileSync(resolve(flags[1]!),"utf8")) as CarrierContract;
-      const roots=[...config.allowedRoots,config.worktreeRoot].map(canonicalizePath);
-      if(!Array.isArray(contract.scope) || contract.scope.some(path=>!roots.some(root=>isPathInsideRoot(canonicalizePath(path),root)))) throw new Error("Carrier scope exceeds configured roots.");
+      bindings.validateLocalScope(contract,[...config.allowedRoots,config.worktreeRoot]);
       result=bindings.approveLocal(id,contract);
     } else if(action==="revoke" && flags.length===2 && flags[0]==="--version") result=bindings.revokeLocal(id,Number(flags[1]));
     else throw new Error("Invalid carrier arguments. Inspect the exact pending pairing before approving its bounded contract.");

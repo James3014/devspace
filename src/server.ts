@@ -97,6 +97,7 @@ import type { WorkspaceSession } from "./workspace-store.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
 import {
   DurableOperationManager,
+  planCutoverStart,
   DurableOperationError,
   NEXUS_GATEWAY_RECOVERY_SCHEMA,
   type DurableOperationRecord,
@@ -2705,6 +2706,15 @@ export function createMcpServer(
         await workspaces.assertConversationMutationAllowed(args.workspaceId,openAiConversationScopeId(extra._meta));
         const workspace=workspaces.getWorkspace(args.workspaceId);
         const plan=await durableOperations.planDependencySync({...args,workspaceRoot:workspace.root});
+        return result({subject:plan.subject,lease:carrierBindings.prepareEffect(context,plan.subject)});
+      });
+      if(cutoverControl) registerAppTool(server,"coordination_prepare_cutover",{...registration,title:"Prepare an approved cutover",description:"Bind the exact locally approved cutover request to this paired controller and the running server. Acquires the resource lease without starting or restarting. Use these same explicit inputs with cutover_start.",inputSchema:{
+        attemptKey:z.string().min(1),expectedSourceCommit:z.string().regex(/^[a-f0-9]{40}$/),expectedBuildId:z.string().min(1),expectedCapabilityManifestSha256:z.string().regex(/^[a-f0-9]{64}$/),expiresAt:z.string(),
+      }},async(args,extra)=>{
+        const context=dependencyConsumerContext(extra);
+        carrierBindings.status(context);
+        const plan=planCutoverStart(config.stateDir,{attemptKey:args.attemptKey,currentIdentity:cutoverControl.controller.currentIdentity,
+          expectedIdentity:{sourceCommit:args.expectedSourceCommit,buildId:args.expectedBuildId,capabilityManifestSha256:args.expectedCapabilityManifestSha256},expiresAt:args.expiresAt});
         return result({subject:plan.subject,lease:carrierBindings.prepareEffect(context,plan.subject)});
       });
     }
