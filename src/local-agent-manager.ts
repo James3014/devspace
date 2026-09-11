@@ -9,6 +9,7 @@ import {
   isAgentProviderError,
   isLocalAgentError,
   isProgrammerDefect,
+  redactSensitiveText,
   type LocalAgentError,
 } from "./local-agent-errors.js";
 import {
@@ -343,7 +344,7 @@ export class LocalAgentManager {
       const updated = this.store.updateResult(record.id, {
         providerSessionId: runResult.providerSessionId ?? current.value.providerSessionId,
         status: "idle",
-        latestResponse: runResult.finalResponse,
+        latestResponse: redactSensitiveText(runResult.finalResponse),
         error: undefined,
         errorCode: undefined,
         errorRetryable: undefined,
@@ -391,7 +392,7 @@ export class LocalAgentManager {
       : undefined;
     const persisted = this.store.updateResult(record.id, {
       status: "error",
-      error: error.message,
+      error: redactSensitiveText(error.message),
       errorCode: error.code,
       errorRetryable: error.retryable,
       ...(failureDetails ? { errorDetails: failureDetails } : {}),
@@ -402,7 +403,7 @@ export class LocalAgentManager {
       providerSessionIdPrefix: record.providerSessionId?.slice(0, 8),
       durationMs: Math.max(0, Date.now() - startedAt),
       errorCode: error.code,
-      error: error.message,
+      error: redactSensitiveText(error.message),
       causeType: safeCauseType("cause" in error ? error.cause : undefined),
       persistenceFailed: persisted.isErr(),
     });
@@ -589,7 +590,7 @@ export class LocalAgentManager {
     event: string,
     fields: Record<string, unknown>,
   ): void {
-    this.logger?.(level, event, fields);
+    this.logger?.(level, event, redactLogFields(fields));
   }
 }
 
@@ -608,6 +609,13 @@ function safeCauseType(cause: unknown): string | undefined {
     if (nested instanceof Error) return nested.name;
   }
   return cause === undefined ? undefined : typeof cause;
+}
+
+function redactLogFields(fields: Record<string, unknown>): Record<string, unknown> {
+  return Object.fromEntries(Object.entries(fields).map(([key, value]) => [
+    key,
+    typeof value === "string" ? redactSensitiveText(value) : value,
+  ]));
 }
 
 function agentNotFound(agentId: string): AgentTargetError {

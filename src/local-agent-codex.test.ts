@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import {
   CodexAppServerRuntime,
   CodexLocalAgentDriver,
+  MAX_CODEX_FRAME_BYTES,
   codexCommandEnvironment,
   parseCodexVersion,
   resolveCodexCommand,
@@ -58,6 +59,10 @@ if (process.platform !== "win32") {
 import readline from "node:readline";
 let turn = 0;
 const output = (value) => process.stdout.write(JSON.stringify(value) + "\\n");
+const outputChunked = (value) => {
+  const bytes = Buffer.from(JSON.stringify(value) + "\\n", "utf8");
+  for (let offset = 0; offset < bytes.length; offset += 3) process.stdout.write(bytes.subarray(offset, offset + 3));
+};
 readline.createInterface({ input: process.stdin }).on("line", (line) => {
   const message = JSON.parse(line);
   if (message.method === "initialize") {
@@ -82,7 +87,40 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
         return;
       }
       if (message.params.input[0].text === "empty") {
-        output({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: turnId, status: "completed", items: [] } } });
+        output({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: turnId, status: "completed" } } });
+        return;
+      }
+      if (message.params.input[0].text === "oversized-no-newline") {
+        process.stdout.write("x".repeat(${MAX_CODEX_FRAME_BYTES + 1}));
+        return;
+      }
+      if (message.params.input[0].text === "oversized-jsonl") {
+        process.stdout.write(JSON.stringify({ method: "item/completed", params: { threadId: message.params.threadId, turnId, item: { type: "agentMessage", text: "x".repeat(${MAX_CODEX_FRAME_BYTES}) } } }) + "\\n");
+        return;
+      }
+      if (message.params.input[0].text === "boundary-unicode") {
+        const item = { type: "agentMessage", text: "🙂".repeat(2048) };
+        outputChunked({ method: "item/completed", params: { threadId: message.params.threadId, turnId, item } });
+        outputChunked({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: turnId, status: "completed", items: [item] } } });
+        return;
+      }
+      if (message.params.input[0].text === "boundary-exact") {
+        const item = { type: "agentMessage", text: "🙂".repeat(2048) };
+        const event = { method: "item/completed", params: { threadId: message.params.threadId, turnId, item } };
+        const encoded = () => Buffer.byteLength(JSON.stringify(event), "utf8");
+        item.text += "a".repeat(${MAX_CODEX_FRAME_BYTES} - encoded());
+        if (encoded() !== ${MAX_CODEX_FRAME_BYTES}) throw new Error("fixture could not reach exact frame boundary");
+        output(event);
+        output({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: turnId, status: "completed" } } });
+        return;
+      }
+      if (message.params.input[0].text === "eof-final") {
+        const item = { type: "agentMessage", text: "EOF response" };
+        process.stdout.end(JSON.stringify({ method: "turn/completed", params: { threadId: message.params.threadId, turn: { id: turnId, status: "completed", items: [item] } } }), () => process.exit(0));
+        return;
+      }
+      if (message.params.input[0].text === "invalid-byte-oversize") {
+        process.stdout.write(Buffer.concat([Buffer.alloc(${MAX_CODEX_FRAME_BYTES}, 0x78), Buffer.from([0xff])]));
         return;
       }
       const item = { type: "agentMessage", text: "fake response " + turn };
@@ -149,8 +187,71 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
   } finally {
     await runtime.close();
     await runtime.close();
-    await rm(root, { recursive: true, force: true });
   }
+
+  for (const prompt of ["oversized-no-newline", "oversized-jsonl"] as const) {
+    const oversizedRuntime = new CodexAppServerRuntime({ command, env: process.env });
+    try {
+      await oversizedRuntime.initialize();
+      const result = await oversizedRuntime.run({ prompt, workspaceRoot: "/tmp/project" });
+      assert.equal(result.isErr(), true, `${prompt} must fail`);
+      if (result.isErr()) {
+        assert.equal(result.error.code, "PROVIDER_PROTOCOL_ERROR");
+        assert.match(result.error.message, /frame exceeds/);
+      }
+      const deadline = Date.now() + 1_000;
+      while (oversizedRuntime.isAlive() && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 10));
+      assert.equal(oversizedRuntime.isAlive(), false, `${prompt} must terminate the child`);
+    } finally {
+      await oversizedRuntime.close();
+    }
+  }
+
+  const boundaryRuntime = new CodexAppServerRuntime({ command, env: process.env });
+  try {
+    await boundaryRuntime.initialize();
+    const result = await boundaryRuntime.run({ prompt: "boundary-unicode", workspaceRoot: "/tmp/project" });
+    assert.equal(result.isOk(), true);
+    if (result.isOk()) assert.equal(result.value.finalResponse, "🙂".repeat(2048));
+  } finally {
+    await boundaryRuntime.close();
+  }
+
+  const exactBoundaryRuntime = new CodexAppServerRuntime({ command, env: process.env });
+  try {
+    await exactBoundaryRuntime.initialize();
+    const result = await exactBoundaryRuntime.run({ prompt: "boundary-exact", workspaceRoot: "/tmp/project" });
+    assert.equal(result.isOk(), true);
+    if (result.isOk()) {
+      assert.ok(result.value.finalResponse.startsWith("🙂"));
+      assert.ok(result.value.finalResponse.endsWith("a"));
+      assert.equal(Buffer.byteLength(JSON.stringify({ method: "item/completed", params: { threadId: "thread_new", turnId: "turn_1", item: { type: "agentMessage", text: result.value.finalResponse } } }), "utf8"), MAX_CODEX_FRAME_BYTES);
+    }
+  } finally {
+    await exactBoundaryRuntime.close();
+  }
+
+  const eofRuntime = new CodexAppServerRuntime({ command, env: process.env });
+  try {
+    await eofRuntime.initialize();
+    const result = await eofRuntime.run({ prompt: "eof-final", workspaceRoot: "/tmp/project" });
+    assert.equal(result.isOk(), true);
+    if (result.isOk()) assert.equal(result.value.finalResponse, "EOF response");
+  } finally {
+    await eofRuntime.close();
+  }
+
+  const invalidByteRuntime = new CodexAppServerRuntime({ command, env: process.env });
+  try {
+    await invalidByteRuntime.initialize();
+    const result = await invalidByteRuntime.run({ prompt: "invalid-byte-oversize", workspaceRoot: "/tmp/project" });
+    assert.equal(result.isErr(), true);
+    if (result.isErr()) assert.equal(result.error.code, "PROVIDER_PROTOCOL_ERROR");
+  } finally {
+    await invalidByteRuntime.close();
+  }
+
+  await rm(root, { recursive: true, force: true });
 }
 
 const unavailable = await new CodexLocalAgentDriver({}, () => undefined).createRuntime(cachedContext);

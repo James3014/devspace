@@ -121,6 +121,14 @@ await pool.run(driver, {
   onSessionId: (id) => { callbackSessionId = id; },
 });
 assert.equal(callbackSessionId, firstRecord.providerSessionId);
+const requiredSessionCallbackFailure = await pool.run(driver, {
+  agentId: "agt_required_callback_failure",
+  provider: "opencode",
+  workspaceRoot: "/tmp/project",
+}, { prompt: "required callback failure", workspaceRoot: "/tmp/project" }, {
+  onSessionId: () => { throw new Error("required session callback failed"); },
+});
+assert.equal(requiredSessionCallbackFailure.isErr(), true, "required session identity callback must fail closed");
 assert.deepEqual(switchInputs[0], {
   sessionID: "session_1",
   model: { providerID: "anthropic", id: "sonnet", variant: "low" },
@@ -191,6 +199,27 @@ assert.equal(readinessWaitCalls, 0, "OpenCode should not rely on the unavailable
 assert.equal(readinessActivityCalls, 6, "OpenCode should touch setup plus changed provider evidence, not every unchanged poll");
 await readinessPool.close();
 
+for (const [observer, neverSettles] of [
+  [() => new Promise<void>(() => undefined), true],
+  [async () => { throw new Error("best-effort observer rejected asynchronously"); }, false],
+] as const) {
+  let observerCalls = 0;
+  const isolatedPool = new LocalAgentRuntimePool();
+  const result = await Promise.race([
+    isolatedPool.run(readinessDriver, {
+      agentId: `agt_observer_${observerCalls++}`,
+      provider: "opencode",
+      workspaceRoot: "/tmp/project",
+    }, { prompt: "observer isolation", workspaceRoot: "/tmp/project" }, {
+      onActivity: () => { observerCalls += 1; return observer(); },
+    }),
+    new Promise<never>((_, reject) => setTimeout(() => reject(new Error("OpenCode observer isolation timed out")), 2_000)),
+  ]);
+  assert.equal(result.isOk(), true, "best-effort observer must not block OpenCode completion");
+  if (neverSettles) assert.ok(observerCalls <= 2, `observer should be coalesced, got ${observerCalls}`);
+  await isolatedPool.close();
+}
+
 const longSessionRequests: Array<{ cursor?: string; order?: string }> = [];
 const longSessionClient = {
   v2: {
@@ -258,6 +287,157 @@ assert.ok(
   "OpenCode should follow the continuation cursor",
 );
 await longSessionPool.close();
+
+const oversizedClient = {
+  v2: {
+    session: {
+      async create() { return { data: { data: { id: "session_oversized" } } }; },
+      async switchAgent() {},
+      async prompt() { return { data: { data: { id: "prompt_oversized" } } }; },
+      async active() { return { data: { data: {} } }; },
+      async messages(input: unknown) {
+        if (!(input as { cursor?: string }).cursor) {
+          return {
+            data: {
+              data: Array.from({ length: 400 }, (_, index) => ({
+                type: "assistant", id: `stale-${index}`, finish: "stop",
+                content: [{ type: "text", text: `stale result ${index} ${"x".repeat(5000)}` }],
+                metadata: index === 0 ? { trace: "y".repeat(600_000) } : undefined,
+              })),
+              cursor: { next: "oversized-next" },
+            },
+          };
+        }
+        return {
+          data: {
+            data: [
+              { type: "user", id: "prompt_oversized" },
+              ...Array.from({ length: 400 }, (_, index) => ({
+                type: "assistant", id: `progress-${index}`, finish: "tool-calls",
+                content: [{ type: "text", text: index === 0 ? "z".repeat(600_000) : `progress ${index}` }],
+              })),
+              { type: "assistant", id: "final_oversized", finish: "stop", content: [{ type: "text", text: "current final" }] },
+            ],
+            cursor: {},
+          },
+        };
+      },
+    },
+  },
+} as unknown as OpencodeClientLike;
+const oversizedPool = new LocalAgentRuntimePool();
+const oversizedDriver = new OpencodeLocalAgentDriver(async () => ({
+  client: oversizedClient,
+  server: { close: () => undefined },
+}));
+const oversizedResult = await oversizedPool.run(oversizedDriver, {
+  agentId: "agt_oversized_session",
+  provider: "opencode",
+  workspaceRoot: "/tmp/project",
+}, { prompt: "oversized session", workspaceRoot: "/tmp/project" });
+assert.equal(oversizedResult.isOk(), true);
+if (oversizedResult.isOk()) {
+  assert.equal(oversizedResult.value.finalResponse, "current final");
+  const retained = oversizedResult.value.items[1] as { data?: unknown[] };
+  assert.ok((retained.data?.length ?? 0) <= 129, "history/progress retention must remain bounded");
+  assert.equal(retained.data?.some((message) => (message as { id?: string }).id === "stale-0"), false, "an oversized historical record must be suppressed");
+  const retention = retained as { retention?: { suppressedMessages?: number; suppressedBytes?: number; suppressedBytesAreEstimate?: boolean } };
+  assert.ok((retention.retention?.suppressedMessages ?? 0) > 0, "suppression count must be visible");
+  assert.ok((retention.retention?.suppressedBytes ?? 0) > 0, "suppression bytes must be visible");
+  assert.equal(retention.retention?.suppressedBytesAreEstimate, true, "suppression byte semantics must be explicit");
+}
+await oversizedPool.close();
+
+const boundaryClient = {
+  v2: {
+    session: {
+      async create() { return { data: { data: { id: "session_boundary" } } }; },
+      async switchAgent() {},
+      async prompt() { return { data: { data: { id: "prompt_boundary" } } }; },
+      async active() { return { data: { data: {} } }; },
+      async messages(input: unknown) {
+        if (!(input as { cursor?: string }).cursor) return {
+          data: { data: [
+            { type: "user", id: "prompt_boundary" },
+            { type: "assistant", id: "current_progress", finish: "tool-calls", content: [{ type: "text", text: "progress" }] },
+          ], cursor: { next: "boundary-next" } },
+        };
+        return {
+          data: { data: [
+            { type: "user", id: "next-user", metadata: { trace: "q".repeat(1_100_000) } },
+            ...Array.from({ length: 300 }, (_, index) => ({
+              type: "assistant", id: `foreign-progress-${index}`, finish: "tool-calls",
+              content: [{ type: "text", text: `foreign progress ${index}` }],
+            })),
+            { type: "assistant", id: "foreign-final", finish: "stop", content: [{ type: "text", text: "foreign final" }] },
+          ], cursor: {} },
+        };
+      },
+    },
+  },
+} as unknown as OpencodeClientLike;
+const boundaryPool = new LocalAgentRuntimePool();
+const boundaryDriver = new OpencodeLocalAgentDriver(async () => ({
+  client: boundaryClient,
+  server: { close: () => undefined },
+}));
+const boundaryResult = await boundaryPool.run(boundaryDriver, {
+  agentId: "agt_boundary_session",
+  provider: "opencode",
+  workspaceRoot: "/tmp/project",
+}, { prompt: "boundary session", workspaceRoot: "/tmp/project" });
+assert.equal(boundaryResult.isErr(), true, "a later user turn must not satisfy the current prompt");
+if (boundaryResult.isErr()) {
+  assert.equal(boundaryResult.error.code, "PROVIDER_PROTOCOL_ERROR");
+  assert.doesNotMatch(boundaryResult.error.message, /foreign final/);
+}
+await boundaryPool.close();
+
+let oversizedFinalText = "x".repeat(512 * 1024);
+let oversizedFinalMetadata: unknown;
+const oversizedFinalClient = {
+  v2: {
+    session: {
+      async create() { return { data: { data: { id: "session_oversized_final" } } }; },
+      async switchAgent() {},
+      async prompt() { return { data: { data: { id: "prompt_oversized_final" } } }; },
+      async active() { return { data: { data: {} } }; },
+      async messages() {
+        return { data: { data: [
+          { type: "user", id: "prompt_oversized_final" },
+          { type: "assistant", id: "final_too_large", finish: "stop", metadata: oversizedFinalMetadata, content: [{ type: "text", text: oversizedFinalText }] },
+        ], cursor: {} } };
+      },
+    },
+  },
+} as unknown as OpencodeClientLike;
+const oversizedFinalPool = new LocalAgentRuntimePool();
+const oversizedFinalDriver = new OpencodeLocalAgentDriver(async () => ({
+  client: oversizedFinalClient,
+  server: { close: () => undefined },
+}));
+const exactFinalResult = await oversizedFinalPool.run(oversizedFinalDriver, {
+  agentId: "agt_oversized_final",
+  provider: "opencode",
+  workspaceRoot: "/tmp/project",
+}, { prompt: "exact final", workspaceRoot: "/tmp/project" });
+assert.equal(exactFinalResult.isOk(), true, "a final exactly at the retained byte bound must pass");
+oversizedFinalMetadata = { trace: "m".repeat(1_100_000) };
+const oversizedFinalMetadataResult = await oversizedFinalPool.run(oversizedFinalDriver, {
+  agentId: "agt_oversized_final_metadata",
+  provider: "opencode",
+  workspaceRoot: "/tmp/project",
+}, { prompt: "oversized final metadata", workspaceRoot: "/tmp/project" });
+assert.equal(oversizedFinalMetadataResult.isErr(), true, "oversized terminal metadata must fail closed");
+oversizedFinalText = "x".repeat(512 * 1024 + 1);
+const oversizedFinalResult = await oversizedFinalPool.run(oversizedFinalDriver, {
+  agentId: "agt_oversized_final",
+  provider: "opencode",
+  workspaceRoot: "/tmp/project",
+}, { prompt: "oversized final", workspaceRoot: "/tmp/project" });
+assert.equal(oversizedFinalResult.isErr(), true, "an oversized current final must fail closed");
+if (oversizedFinalResult.isErr()) assert.equal(oversizedFinalResult.error.code, "PROVIDER_PROTOCOL_ERROR");
+await oversizedFinalPool.close();
 
 // Exercise the generated SDK against a mock HTTP server using the actual v2
 // response shape. An earlier turn and a tool-call assistant step must not
@@ -366,7 +546,7 @@ const emptyResult = await emptyResultPool.run(emptyResultDriver, {
 assert.equal(emptyResult.isErr(), true, "an empty OpenCode result must remain a protocol failure");
 if (emptyResult.isErr()) {
   assert.equal(emptyResult.error.code, "PROVIDER_PROTOCOL_ERROR");
-  assert.match(emptyResult.error.message, /session=session_empty_result, prompt=prompt_empty_result, finish=stop, messages=5/);
+  assert.match(emptyResult.error.message, /session=session_empty_result, prompt=prompt_empty_result, finish=stop, messages=3/);
   assert.doesNotMatch(emptyResult.error.message, /old task result/);
 }
 await emptyResultPool.close();
