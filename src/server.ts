@@ -28,6 +28,7 @@ import {
   inspectIntegrationReadiness,
   promoteCandidate,
   probeRemoteWritability,
+  type IntegrationApplyResult,
 } from "./git-integration.js";
 import {
   isArtifactDownloadSupportedPlatform,
@@ -2145,6 +2146,38 @@ function assertDirectClineCatalogSelection(selector: AgentSelector, catalog: Awa
   if (selector.provider !== "cline") return;
   const validation = validateClineModelAndThinking(selector.model, selector.cliProviderId as "cline" | "cline-pass" | undefined, selector.effort, catalog.clineCatalog);
   if (!validation.valid) throw new AgentSessionError(validation.blockerCode ?? "EXACT_MODEL_UNAVAILABLE", validation.reason ?? "Cline selection is unavailable.");
+}
+
+export const candidateIntegrateOutputSchema = z.object({
+  applied: z.boolean(),
+  appliedRange: z.object({ base: z.string(), head: z.string() }),
+  appliedTrackedFiles: z.number(),
+  blockers: z.array(z.object({ code: z.string(), detail: z.string() })),
+  effectState: z.enum([
+    "NOT_STARTED",
+    "CONFIRMED_NO_EFFECT",
+    "PARTIAL_EFFECT",
+    "EFFECT_UNKNOWN",
+    "APPLIED",
+  ]),
+  reconciliationRequired: z.boolean(),
+  affectedTrackedPaths: z.array(z.string()),
+});
+
+export function formatCandidateIntegrateSummary(output: IntegrationApplyResult): string {
+  if (output.applied) {
+    return `Candidate range integrated (${output.appliedTrackedFiles} changed file(s)).`;
+  }
+  if (output.effectState === "PARTIAL_EFFECT") {
+    return `Not applied (PARTIAL_EFFECT: ${output.affectedTrackedPaths.length} tracked path(s) partially mutated: ${output.affectedTrackedPaths.join(", ")}). Reconciliation required before retry${output.blockers.length > 0 ? `: ${output.blockers.map((blocker) => blocker.code).join(", ")}` : "."}`;
+  }
+  if (output.effectState === "EFFECT_UNKNOWN") {
+    return `Not applied (EFFECT_UNKNOWN: destination state could not be verified). Reconciliation required before retry${output.blockers.length > 0 ? `: ${output.blockers.map((blocker) => blocker.code).join(", ")}` : "."}`;
+  }
+  if (output.effectState === "CONFIRMED_NO_EFFECT") {
+    return `Not applied (CONFIRMED_NO_EFFECT: destination confirmed unchanged)${output.blockers.length > 0 ? `: ${output.blockers.map((blocker) => blocker.code).join(", ")}` : "."}`;
+  }
+  return `Not applied${output.blockers.length > 0 ? `: ${output.blockers.map((blocker) => blocker.code).join(", ")}` : "."}`;
 }
 
 export function createMcpServer(
@@ -4387,19 +4420,14 @@ export function createMcpServer(
     {
       title: "Integrate candidate",
       description:
-        "Apply one exact immutable committed Candidate range (candidateBase..candidateHead) onto a destination checkout after every identity gate passes (commit/tree existence, base ancestry, destination base, dirty-overlap policy). The payload comes only from the committed range; untracked workspace files are never included. Fails closed with the destination unchanged on any mismatch.",
+        "Apply one exact immutable committed Candidate range (candidateBase..candidateHead) onto a destination checkout after every identity gate passes (commit/tree existence, base ancestry, destination base, dirty-overlap policy). The payload comes only from the committed range; untracked workspace files are never included. Pre-mutation checks refuse without mutation. If apply-time filesystem writes fail, physical effects are inspected, classified (CONFIRMED_NO_EFFECT, PARTIAL_EFFECT, or EFFECT_UNKNOWN), and reconciliation is flagged when required.",
       inputSchema: {
         ...candidateRangeInputSchema,
         confirmApply: z
           .boolean()
           .describe("Must be true to apply. Without it the operation stays read-only preparation."),
       },
-      outputSchema: {
-        applied: z.boolean(),
-        appliedRange: z.object({ base: z.string(), head: z.string() }),
-        appliedTrackedFiles: z.number(),
-        blockers: z.array(z.object({ code: z.string(), detail: z.string() })),
-      },
+      outputSchema: candidateIntegrateOutputSchema,
       _meta: {},
       annotations: {
         readOnlyHint: false,
@@ -4423,9 +4451,7 @@ export function createMcpServer(
         dirtyPolicy,
         confirmApply,
       });
-      const summary = output.applied
-        ? `Candidate range integrated (${output.appliedTrackedFiles} changed file(s)).`
-        : `Not applied${output.blockers.length > 0 ? `: ${output.blockers.map((blocker) => blocker.code).join(", ")}` : "."}`;
+      const summary = formatCandidateIntegrateSummary(output);
       return {
         content: [textBlock(summary)],
         structuredContent: output as unknown as Record<string, unknown>,
