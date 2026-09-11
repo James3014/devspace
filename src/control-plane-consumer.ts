@@ -1,7 +1,7 @@
 import { realpathSync } from "node:fs";
 import type { CutoverServerIdentity, BuildReadyReceipt } from "./cutover-state.js";
 import { projectCompletion, type CompletionSelection } from "./current-completion-matrix.js";
-import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type ControlPlaneOwnershipOptions, type ReconciliationEvidence, type HandoffInput, type ResourceLease } from "./control-plane-ownership.js";
+import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type ControlPlaneOwnershipOptions, type ReconciliationEvidence, type ReconciliationReceipt, type HandoffInput, type ResourceLease } from "./control-plane-ownership.js";
 
 export interface EffectSubject {
   operationId: string;
@@ -77,6 +77,27 @@ export class ControlPlaneConsumer {
       readContract:s=>readCompletionContract(context,s),
       readEvidence:s=>readCompletionEvidence(context,s),
     });
+  }
+  authorizeCutoverFinish(context: unknown, subject: EffectSubject, action: CutoverLifecycleAction, terminalReplay: boolean, recoveryReceipt?: ReconciliationReceipt) {
+    const binding=this.options.resolveEffectBinding(context,Object.freeze({...subject}));
+    if(!binding || binding.role!=="controller" || binding.requestHash!==subject.requestHash || subject.operation!=="cutover_start" || action.action!=="finish") throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","cutover finish requires exact controller binding");
+    const lease=this.ownership.get(binding.leaseId);
+    const now=(this.options.now??Date.now)();
+    if(lease && Date.parse(lease.expiresAt)>now && !recoveryReceipt) return {binding:this.authorizeCutoverLifecycle(context,subject,action,!terminalReplay),recovery:false};
+    if(terminalReplay!==!!recoveryReceipt) throw new ControlPlaneOwnershipError("CAS_CONFLICT","expired finish replay lacks exact recovery receipt");
+    const approved=JSON.parse(JSON.stringify(action)) as CutoverLifecycleAction;
+    for(const value of Object.values(approved)) if(value&&typeof value==="object") Object.freeze(value);
+    if(this.options.approveCutoverLifecycle?.(context,Object.freeze({...subject}),Object.freeze(approved))!==true) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","explicit terminal recovery approval required");
+    const current=this.ownership.assertPinnedForTerminalRecovery(context,binding.leaseId,binding.leaseVersion,subject.operation,subject.baseRevision,subject.operationId,recoveryReceipt);
+    const root=realpathSync.native(subject.workspaceRoot).replaceAll("\\","/");
+    if(current.resource!==root || current.scope.length!==1 || current.scope[0]!==root || JSON.stringify(this.options.resolveEffectBinding(context,Object.freeze({...subject})))!==JSON.stringify(binding) || JSON.stringify(this.ownership.get(binding.leaseId))!==JSON.stringify(current)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal recovery authority or resource changed");
+    return {binding:{...binding},recovery:true};
+  }
+  reconcileCutoverFinish(context: unknown, subject: EffectSubject, action: CutoverLifecycleAction, expected: EffectBinding, detail: string): ReconciliationReceipt {
+    const current=this.authorizeCutoverFinish(context,subject,action,false);
+    if(!current.recovery || JSON.stringify(current.binding)!==JSON.stringify(expected)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal reconciliation binding changed");
+    const lease=this.ownership.get(expected.leaseId)!;
+    return this.ownership.reconcile(context,lease.leaseId,lease.version,{leaseId:lease.leaseId,ownerThread:lease.ownerThread,operationHandle:subject.operationId,operation:subject.operation,baseRevision:subject.baseRevision,leaseVersion:lease.version,state:"finished",detail});
   }
 
   handoff(context: unknown, leaseId: string, expectedVersion: number, recipientHandle: string, receipt: HandoffInput) {

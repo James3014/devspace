@@ -5,7 +5,7 @@ import { isDeepStrictEqual } from "node:util";
 import { McpCutoverController, compareServerIdentity, type DurableReconciliationWitness } from "./mcp-cutover.js";
 import { CutoverStateStore, type CutoverServerIdentity, type CutoverDrainEvidence, type BuildReadyReceipt, type ExpectedCutoverIdentity, type CutoverCoordinationBinding } from "./cutover-state.js";
 import { ControlPlaneConsumer, type ControlPlaneConsumerOptions, type DependencyReconciliationEvidence } from "./control-plane-consumer.js";
-import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type HandoffInput } from "./control-plane-ownership.js";
+import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type HandoffInput, type ReconciliationReceipt } from "./control-plane-ownership.js";
 import { createHash } from "node:crypto";
 import { spawn as nativeSpawn } from "node:child_process";
 import { createRequire } from "node:module";
@@ -42,6 +42,10 @@ export function planCutoverStart(stateDir: string, input: CutoverStartInput) {
   const operationId = stableOperationId("cutover_start",stateRoot,snapshot.attemptKey);
   const subject = {operationId,requestHash,workspaceRoot:stateRoot,baseRevision:request.baseRevision,operation:"cutover_start" as const};
   return {snapshot,stateRoot,request,requestHash,operationId,subject};
+}
+export function cutoverTerminalRecordHash(record: NonNullable<ReturnType<CutoverStateStore["get"]>>) {
+  const {expired,...durable}=record;
+  return hashJson(durable);
 }
 
 const SAFE_NEXUS_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
@@ -529,7 +533,7 @@ export class DurableOperationManager {
     const identity=Object.freeze({...currentIdentity}),pair=Object.freeze({...preferredPair});
     const action={action:"finish" as const,cutoverId,currentIdentity:identity,preferredPair:pair};
     const cutoverStore=new CutoverStateStore(canonicalizePath(this.config.stateDir));
-    const digest=(record: NonNullable<ReturnType<CutoverStateStore["get"]>>)=>{const {expired,...durable}=record;return hashJson(durable);};
+    const digest=cutoverTerminalRecordHash;
     const readBound=()=>{
       const file=cutoverStore.get();
       if(!file?.coordinationBinding||file.cutoverId!==cutoverId) throw new ControlPlaneOwnershipError("CAS_CONFLICT","finish requires exact bound cutover generation");
@@ -539,13 +543,13 @@ export class DurableOperationManager {
       if(hashJson(request)!==intent.requestHash||request.stateRoot!==intent.scopeRoot||!isDeepStrictEqual(coordinationBinding,file.coordinationBinding)||!isDeepStrictEqual(request.currentIdentity,file.oldServerIdentity)||!isDeepStrictEqual(request.expectedIdentity,file.expectedNewIdentity)||request.expiresAt!==file.expiresAt) throw new ControlPlaneOwnershipError("CAS_CONFLICT","finish intent or file correlation changed");
       const subject={operationId:intent.operationId,requestHash:intent.requestHash,workspaceRoot:intent.scopeRoot,baseRevision:intent.request.baseRevision,operation:"cutover_start" as const};
       const replay=intent.receipt?.lifecycleTerminal===true;
-      const binding=consumer.authorizeCutoverLifecycle(context,subject,action,!replay);
+      const {binding,recovery}=consumer.authorizeCutoverFinish(context,subject,action,replay,intent.receipt?.expiredLeaseRecovery as ReconciliationReceipt|undefined);
       if(binding.leaseId!==file.coordinationBinding.leaseId) throw new ControlPlaneOwnershipError("CAS_CONFLICT","finish authorized lease differs from generation");
       const comparison=compareServerIdentity(file,identity);
       if(!Object.values(comparison).every(Boolean)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","finish replacement runtime identity mismatch");
       if(file.phase!=="drained"&&file.phase!=="closed") throw new ControlPlaneOwnershipError("CAS_CONFLICT","bound finish requires drained generation; recovery is separate");
       if(replay&&(file.phase!=="closed"||intent.receipt?.terminalRecordHash!==digest(file)||!isDeepStrictEqual(intent.receipt?.lifecycleAction,action))) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal replay receipt mismatch");
-      return {file,intent,subject,binding,replay};
+      return {file,intent,subject,binding,replay,recovery};
     };
     const validWitness=(w:DurableReconciliationWitness|undefined)=>!!w&&w.workspaceQueryable===true&&w.agentQueryable===true&&w.agentReconciled===true&&w.witnessWorkspaceId===pair.workspaceId&&w.witnessAgentId===pair.agentId;
     const initial=this.store.atomic(readBound);
@@ -561,10 +565,11 @@ export class DurableOperationManager {
       const closed=cutoverStore.get();const receipt=closed?.reconciliationReceipt;
       if(!closed||closed.phase!=="closed"||closed.cutoverId!==cutoverId||!isDeepStrictEqual(closed.coordinationBinding,current.file.coordinationBinding)||!validWitness(receipt)||receipt?.closedByServerInstanceId!==identity.serverInstanceId||!Number.isFinite(Date.parse(receipt.reconciledAt))||Date.parse(receipt.reconciledAt)>Date.now()) throw new ControlPlaneOwnershipError("CAS_CONFLICT","closed file lacks exact terminal witness");
       if(current.replay) return closed;
-      consumer.finish(context,current.subject,current.binding,current.binding.leaseVersion);
+      const expiredLeaseRecovery=current.recovery ? consumer.reconcileCutoverFinish(context,current.subject,action,current.binding,JSON.stringify({kind:"cutover_terminal",cutoverId,requestHash:current.subject.requestHash,terminalRecordHash:digest(closed)})) : undefined;
+      if(!current.recovery) consumer.finish(context,current.subject,current.binding,current.binding.leaseVersion);
       if(!isDeepStrictEqual(cutoverStore.get(),closed)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal file changed during final authority check");
       if(!isDeepStrictEqual(this.store.getByOperationId(current.intent.operationId),current.intent)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal intent changed during final authority check");
-      this.store.finish(current.intent.operationId,{status:"succeeded",retrySafe:false,receipt:{...current.intent.receipt,lifecycleTerminal:true,terminalRecordHash:digest(closed),lifecycleAction:action}});
+      this.store.finish(current.intent.operationId,{status:"succeeded",retrySafe:false,receipt:{...current.intent.receipt,lifecycleTerminal:true,terminalRecordHash:digest(closed),lifecycleAction:action,...(expiredLeaseRecovery?{expiredLeaseRecovery}:{})}});
       return closed;
     });
   }

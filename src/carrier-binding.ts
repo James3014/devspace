@@ -3,10 +3,10 @@ import { realpathSync } from "node:fs";
 import { isAbsolute, relative } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
-import { planCutoverStart } from "./durable-operations.js";
+import { planCutoverStart, cutoverTerminalRecordHash } from "./durable-operations.js";
 import { CutoverStateStore } from "./cutover-state.js";
 import { openDatabase } from "./db/client.js";
-import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, normalizeRepositoryKey, type GrantEvidenceReference } from "./control-plane-ownership.js";
+import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, normalizeRepositoryKey, type GrantEvidenceReference, type ReconciliationEvidence, type ResourceLease } from "./control-plane-ownership.js";
 import type { ControlPlaneConsumerOptions, DependencyReconciliationEvidence, EffectSubject } from "./control-plane-consumer.js";
 import type { CompletionReaders, CompletionSelection } from "./current-completion-matrix.js";
 
@@ -180,6 +180,7 @@ export class CarrierBindingStore {
       verifyDependencyReconciliation: (evidence,subject) => this.verifyTerminal(evidence,subject),
       verifyReconciliationEvidence: (evidence,lease,owner) => {
         this.active(owner.ownerThread);
+        if(evidence.operation==="cutover_start") return this.verifyCutoverTerminal(evidence,lease,owner.ownerThread);
         let detail: {requestHash?:unknown;exitCode?:unknown;frozenInputsUnchanged?:unknown};
         try {detail=JSON.parse(evidence.detail??"");} catch {return false;}
         const witness=this.terminal(evidence.operationHandle);
@@ -331,6 +332,27 @@ export class CarrierBindingStore {
   }
   private terminal(operationId: string) {
     return this.database.sqlite.prepare("select * from dependency_terminal_witnesses where operation_id=?").get(operationId) as {operation_id:string;request_hash:string;lease_id:string;exit_code:number;frozen_inputs_unchanged:number}|undefined;
+  }
+  private verifyCutoverTerminal(evidence: Readonly<ReconciliationEvidence>, lease: Readonly<ResourceLease>, ownerThread: string): boolean {
+    const binding=this.active(ownerThread), approved=binding.contract.cutover;
+    if(!approved || binding.row.parent_id || binding.contract.role!=="controller" || evidence.state!=="finished" || lease.ownerThread!==ownerThread || lease.operationHandle!==evidence.operationHandle) return false;
+    const plan=planCutoverStart(approved.stateRoot,approved);
+    if(evidence.operationHandle!==plan.operationId || evidence.baseRevision!==plan.subject.baseRevision || lease.resource!==approved.stateRoot) return false;
+    const row=this.database.sqlite.prepare("select request_hash,request_json from durable_operations where operation_id=? and kind='cutover_start'").get(plan.operationId) as {request_hash:string;request_json:string}|undefined;
+    if(!row || row.request_hash!==plan.requestHash) return false;
+    let request:Record<string,unknown>,detail:unknown;
+    try {request=JSON.parse(row.request_json);detail=JSON.parse(evidence.detail??"");} catch {return false;}
+    const {coordinationBinding,...original}=request;
+    const file=new CutoverStateStore(approved.stateRoot).get();
+    if(!file || file.phase!=="closed" || !isDeepStrictEqual(original,JSON.parse(JSON.stringify(plan.request))) ||
+      !isDeepStrictEqual(file.coordinationBinding,coordinationBinding) || file.coordinationBinding?.leaseId!==lease.leaseId || file.coordinationBinding.ownerThread!==ownerThread ||
+      file.coordinationBinding.operationHandle!==plan.operationId || file.coordinationBinding.requestHash!==plan.requestHash ||
+      !isDeepStrictEqual(file.oldServerIdentity,approved.currentIdentity) || !isDeepStrictEqual(file.expectedNewIdentity,approved.expectedIdentity) || file.expiresAt!==approved.expiresAt) return false;
+    const witness=file.reconciliationReceipt;
+    if(!witness || !witness.closedByServerInstanceId || witness.closedByServerInstanceId===approved.currentIdentity.serverInstanceId ||
+      !witness.workspaceQueryable || !witness.agentQueryable || !witness.agentReconciled || witness.witnessWorkspaceId!==approved.finish.workspaceId || witness.witnessAgentId!==approved.finish.agentId ||
+      !Number.isFinite(Date.parse(witness.reconciledAt)) || Date.parse(witness.reconciledAt)>this.now()) return false;
+    return isDeepStrictEqual(detail,{kind:"cutover_terminal",cutoverId:file.cutoverId,requestHash:plan.requestHash,terminalRecordHash:cutoverTerminalRecordHash(file)});
   }
   private verifyTerminal(evidence: Readonly<DependencyReconciliationEvidence>, subject: Readonly<EffectSubject>): boolean {
     const witness=this.terminal(subject.operationId);

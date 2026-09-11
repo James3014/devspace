@@ -139,7 +139,17 @@ continue through existing durable consumer checks and retain uncertain effects.
 
 After the cutover deadline, preparation, a new start, drain and restart are denied.
 Only exact persisted reconciliation/finish remains permitted under current carrier
-authority **and an unexpired resource lease**. Carrier reauthorization does not
-extend the cutover deadline or renew an expired resource lease. An expired pinned
-resource lease remains rejected and pinned; its cutover recovery is an outstanding
-integration requirement, not permission to restart or delete state.
+authority. Carrier reauthorization does not extend the cutover deadline or renew
+an expired resource lease. For an expired pinned cutover, `cutover_finish` uses a
+terminal-recovery check that preserves the original owner, grant version, resource,
+operation, pin and CAS. It cannot authorize start, drain or restart. After a positive
+replacement/workspace/agent witness, the exact closed file is independently checked
+against the immutable approval and durable request before the existing ownership
+reconciler records `expired_reconciled` and clears the pin.
+
+If the file closes but the database transaction fails, retrying the same finish
+validates that exact closed record before completing reconciliation. A committed
+replay must match both the saved terminal action/receipt and the current resulting
+lease version and state. An expired or revoked carrier, wrong witness, changed
+owner/grant/pin, or unresolved effect remains denied. Recovery never reacquires a
+resource or treats timeout as evidence that an effect finished.

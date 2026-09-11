@@ -8,6 +8,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CarrierBindingStore, type CarrierContract, type CarrierCompletionBinding } from "./carrier-binding.js";
 import { openDatabase } from "./db/client.js";
+import { CutoverStateStore } from "./cutover-state.js";
 
 function fixture(completionBindings: readonly CarrierCompletionBinding[] = []) {
   const root=realpathSync(mkdtempSync(join(tmpdir(),"carrier-test-"))).replaceAll("\\","/");
@@ -24,7 +25,8 @@ function fixture(completionBindings: readonly CarrierCompletionBinding[] = []) {
   const snapshot=()=>JSON.stringify({validity:db.sqlite.prepare("select * from carrier_validity order by carrier_id").all(),bindings:db.sqlite.prepare("select * from carrier_bindings order by id").all(),effects:db.sqlite.prepare("select * from carrier_effect_bindings order by operation_id").all(),leases:db.sqlite.prepare("select * from control_plane_resource_leases order by lease_id").all()});
   return {root,workspace,store,db,controller,worker,contract,request,approved,snapshot,advance:(ms=120000)=>{now+=ms;},clock:()=>now,close:()=>{db.close();store.close();rmSync(root,{recursive:true,force:true});}};
 }
-for(const expireLease of [false,true]) test(`local cutover approval binds execution and recovery (expired lease=${expireLease})`,async()=>{
+for(const scenario of ["current","expired","close-response","terminal-write","revoke-witness","renew-witness","stale-replay"]) test(`local cutover approval binds execution and recovery (${scenario})`,async()=>{
+  const expireLease=scenario!=="current";
   const f=fixture();
   try {
     const context={clientId:"shared-oauth",sessionId:"cutover-controller"};
@@ -82,23 +84,50 @@ for(const expireLease of [false,true]) test(`local cutover approval binds execut
     try {
       if(expireLease) {
         f.advance(40000);
+        assert.throws(()=>resumedStore.redeem(successor,pairing.credential),/expired/i);
         resumedStore.reauthorizeLocal(approved.id,1,new Date(f.clock()+60000).toISOString());
       }
       assert.throws(()=>resumedStore.status(successor));
       resumedStore.redeem(successor,pairing.credential);
       const replacement={serverInstanceId:"replacement",...cutover.expectedIdentity};
       const witness={workspaceQueryable:true,agentQueryable:true,agentReconciled:true,witnessWorkspaceId:cutover.finish.workspaceId,witnessAgentId:cutover.finish.agentId};
-      if(expireLease) {
-        await assert.rejects(resumedManager.finishCutover(id,replacement,cutover.finish,async()=>{throw new Error("expired lease must not consume witness");},successor),/expired/i);
-        assert.equal(resumedStore.readLease(successor,lease.leaseId).operationHandle,start.operationId);
-        assert.equal(scheduled,1);
-        return;
-      }
       await assert.rejects(resumedManager.finishCutover(id,cutover.currentIdentity,cutover.finish,async()=>witness,successor));
       await assert.rejects(resumedManager.finishCutover(id,replacement,{...cutover.finish,agentId:"wrong"},async()=>witness,successor));
+      if(expireLease) {
+        const pin=resumedStore.readLease(successor,lease.leaseId);
+        assert.throws(()=>resumedStore.ownership.reconcile(successor,pin.leaseId,pin.version,{leaseId:pin.leaseId,leaseVersion:pin.version,ownerThread:pin.ownerThread,operation:pin.operation,operationHandle:start.operationId,baseRevision:pin.baseRevision,state:"finished",detail:JSON.stringify({kind:"cutover_terminal",cutoverId:id,requestHash:start.requestHash,terminalRecordHash:"0".repeat(64)})}),/terminal effect proof/);
+        assert.deepEqual(resumedStore.readLease(successor,lease.leaseId),pin);
+      }
+      if(scenario==="revoke-witness" || scenario==="renew-witness") {
+        await assert.rejects(resumedManager.finishCutover(id,replacement,cutover.finish,async()=>{
+          if(scenario==="revoke-witness") resumedStore.revokeLocal(approved.id,1);
+          else resumedStore.reauthorizeLocal(approved.id,2,new Date(f.clock()+120000).toISOString());
+          return witness;
+        },successor));
+        assert.equal(resumedStore.ownership.get(lease.leaseId)?.operationHandle,start.operationId);
+        assert.equal(new CutoverStateStore(f.root).get()?.phase,"drained");
+        assert.equal(scheduled,1);
+        if(scenario==="revoke-witness") return;
+      }
+      if(scenario==="close-response" || scenario==="terminal-write") {
+        const close=CutoverStateStore.prototype.close;
+        const finish=resumedManager.store.finish.bind(resumedManager.store);
+        if(scenario==="close-response") CutoverStateStore.prototype.close=function(...args){close.apply(this,args);throw new Error("lost closed-file response");};
+        else resumedManager.store.finish=(...args)=>{if(args[1].receipt?.lifecycleTerminal) throw new Error("terminal database write failed");return finish(...args);};
+        try {await assert.rejects(resumedManager.finishCutover(id,replacement,cutover.finish,async()=>witness,successor),/lost closed-file|terminal database/);}
+        finally {CutoverStateStore.prototype.close=close;resumedManager.store.finish=finish;}
+        assert.equal(new CutoverStateStore(f.root).get()?.phase,"closed");
+        assert.equal(resumedStore.readLease(successor,lease.leaseId).operationHandle,start.operationId);
+        assert.equal(resumedStore.readLease(successor,lease.leaseId).terminalState,undefined);
+      }
       assert.equal((await resumedManager.finishCutover(id,replacement,cutover.finish,async()=>witness,successor)).phase,"closed");
       assert.equal((await resumedManager.finishCutover(id,replacement,cutover.finish,async()=>{throw new Error("no repeat witness");},successor)).phase,"closed");
       assert.equal(resumedStore.readLease(successor,lease.leaseId).operationHandle,undefined);
+      if(expireLease) assert.equal(resumedStore.readLease(successor,lease.leaseId).terminalState,"expired_reconciled");
+      if(scenario==="stale-replay") {
+        f.db.sqlite.prepare("update control_plane_resource_leases set version=version+1 where lease_id=?").run(lease.leaseId);
+        await assert.rejects(resumedManager.finishCutover(id,replacement,cutover.finish,async()=>{throw new Error("must not repeat witness");},successor),/replay changed/);
+      }
       assert.equal(scheduled,1);
     } finally {resumedManager.close();resumedStore.close();}
   } finally {f.close();}
