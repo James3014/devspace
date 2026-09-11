@@ -323,7 +323,7 @@ export function resolveAgyGitMetadataDirs(workspace: string): string[] {
     "git",
     ["rev-parse", "--path-format=absolute", "--git-common-dir"],
     {
-      cwd: workspaceRoot,
+      cwd: workspace,
       encoding: "utf8",
       env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
       windowsHide: true,
