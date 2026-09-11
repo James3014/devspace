@@ -207,33 +207,28 @@ interface GitResult {
 
 function runGit(args: string[], cwd: string, input?: string): Promise<GitResult> {
   return new Promise((resolvePromise) => {
-    let completed = false;
-    const timer = setTimeout(() => {
-      if (completed) return;
-      completed = true;
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // best-effort
-      }
-      resolvePromise({ ok: false, stdout: "", stderr: "command timed out" });
-    }, GIT_TIMEOUT_MS);
-    const child = execFile(
-      "git",
-      ["-C", cwd, ...args],
-      { env: { ...process.env, GIT_TERMINAL_PROMPT: "0" }, maxBuffer: 64 * 1024 * 1024 },
-      (error, stdout, stderr) => {
-        if (completed) return;
-        completed = true;
-        clearTimeout(timer);
-        resolvePromise({
-          ok: !error,
-          stdout: stdout ?? "",
-          stderr: stderr ?? (error ? error.message : ""),
-        });
-      },
-    );
-    if (input !== undefined) child.stdin?.end(input, "utf8");
+    try {
+      const child = execFile(
+        "git",
+        ["-C", cwd, ...args],
+        {
+          env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+          maxBuffer: 64 * 1024 * 1024,
+          timeout: GIT_TIMEOUT_MS,
+          killSignal: "SIGKILL",
+        },
+        (error, stdout, stderr) => {
+          resolvePromise({
+            ok: !error,
+            stdout: stdout ?? "",
+            stderr: error?.killed ? "command timed out" : (stderr ?? (error ? error.message : "")),
+          });
+        },
+      );
+      if (input !== undefined) child.stdin?.end(input, "utf8");
+    } catch (error) {
+      resolvePromise({ ok: false, stdout: "", stderr: String(error) });
+    }
   });
 }
 

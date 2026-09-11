@@ -5444,6 +5444,8 @@ export function createServer(
     next();
   });
 
+  app.use(["/token", "/revoke"], express.json());
+
   app.use(
     mcpAuthRouter({
       provider: oauthProvider,
