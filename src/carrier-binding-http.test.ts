@@ -104,6 +104,17 @@ test("CLI completion-only startup preserves pairing and rejects altered or mixed
       assert.equal(readback.coordinationBinding.requestHash,prepared.subject.requestHash);
       data(await cutoverClient.callTool({name:"cutover_drain",arguments:{cutoverId:started.cutover.cutoverId}}));
       assert.equal(data(await cutoverClient.callTool({name:"cutover_status",arguments:{}})).status.cutover.phase,"drained");
+      await cutoverClient.close();
+      const reconnect=new Client({name:"drained-reconnect",version:"1"});
+      try {
+        await reconnect.connect(new StreamableHTTPClientTransport(new URL("/mcp",config.publicBaseUrl),{requestInit:{headers:{Authorization:`Bearer ${tokens.access_token}`}}}));
+        assert.equal((await reconnect.callTool({name:"coordination_resume",arguments:{credential:"x".repeat(43)}})).isError,true);
+        data(await reconnect.callTool({name:"coordination_resume",arguments:{credential:pendingCutover.credential}}));
+        assert.equal(data(await reconnect.callTool({name:"coordination_lease_read",arguments:{leaseId:prepared.lease.leaseId}})).operationHandle,started.operationId);
+        for(const request of [{name:"coordination_pair",arguments:{}},{name:"coordination_prepare_cutover",arguments:args},{name:"coordination_delegate",arguments:{pendingId:pendingCutover.pendingId,contract:approved}}]) {
+          await assert.rejects(reconnect.callTool(request),/CUTOVER_RECONCILIATION_REQUIRED/);
+        }
+      } finally {await reconnect.close().catch(()=>{});}
       }
     } finally {await cutoverClient.close().catch(()=>{});}
   } finally {
