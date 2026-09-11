@@ -14,6 +14,38 @@ const options = { resolveResourceIdentity: (input: Parameters<ControlPlaneOwners
 function input(scope = ["/repo/src/a"]): Parameters<ControlPlaneOwnershipStore["acquire"]>[1] { return { repositoryKey: "owner/repo", resourceKind: "checkout", resourceId: "main", resource: "checkout", operation: "write", scope, baseRevision: "sha-a", expiresAt: new Date(Date.now() + 60_000).toISOString(), idempotencyKey: `key-${scope.join("-")}`, grant }; }
 function db() { const sqlite = new Database(":memory:"); initializeControlPlaneOwnershipDatabase(sqlite); sqlite.prepare("insert into control_plane_grant_evidence(repository,goal,coordinator_thread,evidence_hash,version,updated_at) values(?,?,?,?,?,?)").run(grant.repository, grant.goal, grant.coordinatorThread, grant.evidenceHash, 1, new Date().toISOString()); return sqlite; }
 
+test("expired cutover terminal assertion preserves ordinary expiry, owner and callback fences",()=>{
+  const sqlite=db();let now=Date.now(),armed="";
+  const store=new ControlPlaneOwnershipStore(sqlite,{...options,now:()=>now,
+    resolveResourceIdentity:value=>{
+      if(armed==="physical-cas") sqlite.prepare("update control_plane_resource_leases set version=version+1").run();
+      return armed==="physical-root"?{...value,resourceId:"other"}:value;
+    },
+    verifyGrantEvidence:value=>{
+      if(armed==="grant-cas") sqlite.prepare("update control_plane_grant_evidence set version=version+1").run();
+      return armed!=="deny" && options.verifyGrantEvidence(value);
+    },
+  });
+  try {
+    const lease=store.acquire(context("owner"),{...input(),operation:"cutover_start"});
+    const pin=store.beginOperation(context("owner"),lease.leaseId,lease.version,"cutover-op");
+    const check=()=>store.assertPinnedForTerminalRecovery(context("owner"),pin.leaseId,pin.version,"cutover_start",pin.baseRevision,"cutover-op");
+    assert.throws(check,/expired lease/);
+    now+=120000;
+    assert.throws(()=>store.assertHeld(context("owner"),pin.leaseId,pin.version,"cutover_start",pin.baseRevision),/expired/);
+    assert.deepEqual(check(),store.get(pin.leaseId));
+    for(const owner of ["foreign",""]) assert.throws(()=>store.assertPinnedForTerminalRecovery(context(owner),pin.leaseId,pin.version,"cutover_start",pin.baseRevision,"cutover-op"));
+    for(const handle of ["wrong",""]) assert.throws(()=>store.assertPinnedForTerminalRecovery(context("owner"),pin.leaseId,pin.version,"cutover_start",pin.baseRevision,handle));
+    assert.throws(()=>store.assertPinnedForTerminalRecovery(context("owner"),pin.leaseId,pin.version,"dependency_sync",pin.baseRevision,"cutover-op"));
+    const snapshot=()=>JSON.stringify([store.get(pin.leaseId),store.getGrantEvidence(grant.repository,grant.goal,grant.coordinatorThread)]);
+    const before=snapshot();
+    for(const drift of ["physical-cas","physical-root","grant-cas","deny"]) {
+      armed=drift;assert.throws(check);armed="";assert.equal(snapshot(),before);
+    }
+    assert.equal(store.get(pin.leaseId)?.operationHandle,"cutover-op");
+  } finally {sqlite.close();}
+});
+
 test("acquire/assert/release requires verified grant and trusted owner context", () => { const sqlite = db(); const store = new ControlPlaneOwnershipStore(sqlite, options); try { const lease = store.acquire(context("owner"), input()); assert.equal(store.assertHeld(context("owner"), lease.leaseId, 1, "write", "sha-a").ownerThread, "owner"); assert.throws(() => store.acquire({ thread: "attacker" }, { ...input(), grant: { ...grant, evidenceHash: "forged" } }), (error: unknown) => error instanceof ControlPlaneOwnershipError && error.code === "AUTHORITY_REQUIRED"); assert.throws(() => store.assertHeld({}, lease.leaseId, 1, "write", "sha-a"), (error: unknown) => error instanceof ControlPlaneOwnershipError && error.code === "AUTHORITY_REQUIRED"); const released = store.release(context("owner"), lease.leaseId, 1); assert.equal(released.terminalState, "released"); assert.throws(() => store.assertHeld(context("owner"), lease.leaseId, 2, "write", "sha-a"), ControlPlaneOwnershipError); } finally { sqlite.close(); } });
 
 test("ancestor and descendant scopes conflict; expired unresolved lease cannot be stolen", () => { const sqlite = db(); const store = new ControlPlaneOwnershipStore(sqlite, options); try { const lease = store.acquire(context("one"), input(["/repo"])); assert.throws(() => store.acquire(context("two"), { ...input(["/repo/src"]), idempotencyKey: "descendant" }), (error: unknown) => error instanceof ControlPlaneOwnershipError && error.code === "OWNERSHIP_CONFLICT"); const expired = { ...lease, expiresAt: new Date(Date.now() - 1).toISOString() }; sqlite.prepare("update control_plane_resource_leases set expires_at=? where lease_id=?").run(expired.expiresAt, lease.leaseId); assert.throws(() => store.acquire(context("three"), { ...input(["/repo"]), idempotencyKey: "expired-steal" }), (error: unknown) => error instanceof ControlPlaneOwnershipError && error.code === "OWNERSHIP_CONFLICT"); } finally { sqlite.close(); } });

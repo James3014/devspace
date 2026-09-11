@@ -334,6 +334,30 @@ export class ControlPlaneOwnershipStore {
       return this.get(leaseId)!;
     }).immediate();
   }
+  /** Terminal cutover recovery only. Never use this check to launch an effect. */
+  assertPinnedForTerminalRecovery(consumerContext: unknown, leaseId: string, expectedVersion: number, operation: string, baseRevision: string, operationHandle: string, replay?: ReconciliationReceipt): ResourceLease {
+    const owner=ownerFor(this.options,consumerContext);
+    return this.sqlite.transaction(()=>{
+      const lease=this.get(leaseId);
+      if(!lease || operation!=="cutover_start" || lease.operation!==operation || lease.baseRevision!==baseRevision || lease.ownerThread!==owner.ownerThread || lease.version!==expectedVersion) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal recovery identity changed");
+      this.assertPhysicalBinding(lease);
+      verifyGrant(this.options,immutable(lease.grant),immutable(owner));
+      this.assertCurrentGrant(lease.grant,lease.grantVersion);
+      if(Date.parse(lease.expiresAt)>this.now()) throw new ControlPlaneOwnershipError("INVALID_INPUT","terminal recovery requires an expired lease");
+      if(replay) {
+        if(replay.leaseId!==leaseId || replay.newVersion!==lease.version || replay.previousVersion+1!==replay.newVersion ||
+          lease.terminalState!=="expired_reconciled" || lease.operationState!=="finished" || lease.operationHandle!==undefined ||
+          replay.evidence.ownerThread!==lease.ownerThread || replay.evidence.operation!==operation || replay.evidence.baseRevision!==baseRevision || replay.evidence.operationHandle!==operationHandle || replay.evidence.state!=="finished") throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal recovery replay changed");
+        const stored=this.reconcile(consumerContext,leaseId,replay.previousVersion,replay.evidence);
+        if(JSON.stringify(stored)!==JSON.stringify(replay)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal recovery receipt changed");
+      } else if(lease.terminalState || lease.operationState!=="active" || lease.operationHandle!==operationHandle) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal recovery requires original active pin");
+      this.assertNoOverlap(lease,leaseId);
+      verifyGrant(this.options,immutable(lease.grant),immutable(owner));
+      this.assertCurrentGrant(lease.grant,lease.grantVersion);
+      if(JSON.stringify(this.get(leaseId))!==JSON.stringify(lease)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal recovery lease changed during verification");
+      return lease;
+    }).immediate();
+  }
 
   reconcile(consumerContext: unknown, leaseId: string, expectedVersion: number, input: ReconciliationEvidence): ReconciliationReceipt {
     const owner = ownerFor(this.options, consumerContext);
