@@ -1,0 +1,118 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, mkdirSync, cpSync, writeFileSync, existsSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { loadConfig } from "./config.js";
+import { createServer } from "./server.js";
+import { SingleUserOAuthProvider } from "./oauth-provider.js";
+import { CarrierBindingStore, type CarrierContract } from "./carrier-binding.js";
+import { openDatabase } from "./db/client.js";
+
+function data(result: Awaited<ReturnType<Client["callTool"]>>): Record<string,any> {
+  assert.notEqual(result.isError,true,JSON.stringify(result));
+  if(result.structuredContent) return result.structuredContent;
+  const content=result.content as Array<{type:string;text?:string}>;
+  return JSON.parse(content.find(item=>item.type==="text")!.text!);
+}
+test("real HTTP clients sharing OAuth pair independently, delegate, resume, execute frozen npm and reject revoked identity",async()=>{
+  const root=realpathSync(mkdtempSync(join(tmpdir(),"carrier-http-")));
+  const project=join(root,"project");mkdirSync(project);
+  const git=(args:string[])=>execFileSync("git",args,{cwd:project,encoding:"utf8",stdio:["ignore","pipe","pipe"]}).trim();
+  git(["init"]);git(["-c","user.name=Fixture","-c","user.email=fixture@example.test","commit","--allow-empty","-m","fixture"]);
+  const base=git(["rev-parse","HEAD"]);
+  const vendor=join(project,"vendor","canary-local");mkdirSync(vendor,{recursive:true});
+  writeFileSync(join(vendor,"package.json"),JSON.stringify({name:"canary-local",version:"1.0.0"}));
+  writeFileSync(join(vendor,"witness.txt"),"ISSUE62_INSTALLED_DEPENDENCY_CANARY");
+  writeFileSync(join(project,"package.json"),JSON.stringify({name:"carrier-canary",version:"1.0.0",dependencies:{"canary-local":"file:vendor/canary-local"}}));
+  writeFileSync(join(project,"package-lock.json"),JSON.stringify({name:"carrier-canary",version:"1.0.0",lockfileVersion:3,packages:{"":{name:"carrier-canary",version:"1.0.0",dependencies:{"canary-local":"file:vendor/canary-local"}},"node_modules/canary-local":{resolved:"vendor/canary-local",link:true},"vendor/canary-local":{version:"1.0.0"}}}));
+  const config=loadConfig({DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_ALLOWED_ROOTS:root,DEVSPACE_STATE_DIR:join(root,"state"),DEVSPACE_WORKTREE_ROOT:join(root,"worktrees"),DEVSPACE_SUBAGENTS:"false",DEVSPACE_PUBLIC_BASE_URL:"http://127.0.0.1:1",DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",PORT:"1"});
+  const provider=new SingleUserOAuthProvider(config.oauth,new URL("/mcp",config.publicBaseUrl),config.stateDir);
+  const oauthClient=await provider.clientsStore.registerClient!({redirect_uris:["http://localhost/callback"],client_name:"shared carrier fixture",token_endpoint_auth_method:"none"});
+  let redirect="";
+  await provider.authorize(oauthClient,{redirectUri:"http://localhost/callback",codeChallenge:"fixture",scopes:config.oauth.scopes,resource:new URL("/mcp",config.publicBaseUrl)}, {req:{method:"POST",body:{owner_token:config.oauth.ownerToken}},redirect:(_status:number,url:string)=>{redirect=url;}} as never);
+  const tokens=await provider.exchangeAuthorizationCode(oauthClient,new URL(redirect).searchParams.get("code")!);
+  const running=createServer(config);
+  const localOwner=new CarrierBindingStore(config.stateDir);
+  const database=openDatabase(config.stateDir);
+  const snapshot=()=>JSON.stringify({effects:database.sqlite.prepare("select * from carrier_effect_bindings order by operation_id").all(),leases:database.sqlite.prepare("select * from control_plane_resource_leases order by lease_id").all(),operations:database.sqlite.prepare("select * from durable_operations order by operation_id").all()});
+  const listener=running.app.listen(0,"127.0.0.1");
+  await new Promise<void>(resolve=>listener.once("listening",resolve));
+  const url=new URL(`http://127.0.0.1:${(listener.address() as {port:number}).port}/mcp`);
+  const clients:Client[]=[];
+  async function connect(name:string) {
+    const client=new Client({name,version:"1"});clients.push(client);
+    await client.connect(new StreamableHTTPClientTransport(url,{requestInit:{headers:{Authorization:`Bearer ${tokens.access_token}`}}}));
+    return client;
+  }
+  try {
+    const controller=await connect("controller"), worker=await connect("worker");
+    const request=data(await controller.callTool({name:"coordination_pair",arguments:{}}));
+    const contract:CarrierContract={repository:"James3014/devspace",goal:"issue62",role:"controller",scope:[root],baseRevision:base,operations:["dependency_sync"],expiresAt:new Date(Date.now()+120000).toISOString()};
+    localOwner.approveLocal(request.pendingId,contract);
+    data(await controller.callTool({name:"coordination_resume",arguments:{credential:request.credential}}));
+    const pending=data(await worker.callTool({name:"coordination_pair",arguments:{}}));
+    const child=data(await controller.callTool({name:"coordination_delegate",arguments:{pendingId:pending.pendingId,contract:{...contract,role:"worker",scope:[project]}}}));
+    data(await worker.callTool({name:"coordination_resume",arguments:{credential:pending.credential}}));
+    const opened=data(await worker.callTool({name:"open_workspace",arguments:{path:project,mode:"checkout"}}));
+    const args={workspaceId:opened.workspaceId,attemptKey:"carrier-real-npm",recipe:"npm_ci"};
+    const imposter=await connect("same-client-imposter");
+    const before=snapshot();
+    assert.equal((await imposter.callTool({name:"coordination_prepare_dependencies",arguments:args,_meta:{ownerThread:child.id,role:"controller"}})).isError,true);
+    assert.equal((await worker.callTool({name:"coordination_delegate",arguments:{pendingId:pending.pendingId,contract}})).isError,true);
+    assert.equal(snapshot(),before);
+    const prepared=data(await worker.callTool({name:"coordination_prepare_dependencies",arguments:args}));
+    await worker.close();
+    const resumed=await connect("worker-reconnected");
+    assert.equal((await resumed.callTool({name:"dependency_sync",arguments:args})).isError,true);
+    data(await resumed.callTool({name:"coordination_resume",arguments:{credential:pending.credential}}));
+    const result=data(await resumed.callTool({name:"dependency_sync",arguments:args}));
+    assert.equal(result.status,"succeeded");
+    assert.equal(result.operationId,prepared.subject.operationId);
+    assert.ok(existsSync(join(project,"node_modules","canary-local","witness.txt")),"real npm created installed state");
+    assert.equal(data(await resumed.callTool({name:"dependency_sync",arguments:args})).operationId,result.operationId);
+    const nextArgs={...args,attemptKey:"carrier-next-operation"};
+    const nextPrepared=data(await resumed.callTool({name:"coordination_prepare_dependencies",arguments:nextArgs}));
+    assert.equal(nextPrepared.lease.leaseId,prepared.lease.leaseId);
+    assert.equal(data(await resumed.callTool({name:"dependency_sync",arguments:nextArgs})).status,"succeeded");
+    data(await controller.callTool({name:"coordination_revoke_worker",arguments:{carrierId:child.id,expectedVersion:child.version}}));
+    const revoked=snapshot();
+    assert.equal((await resumed.callTool({name:"dependency_sync",arguments:args})).isError,true);
+    assert.equal((await imposter.callTool({name:"coordination_resume",arguments:{credential:pending.credential}})).isError,true);
+    assert.equal(snapshot(),revoked);
+    const second=join(root,"second-project");
+    cpSync(project,second,{recursive:true,filter:path=>!path.includes("node_modules")});
+    const secondOpened=data(await controller.callTool({name:"open_workspace",arguments:{path:second,mode:"checkout"}}));
+    const secondArgs={workspaceId:secondOpened.workspaceId,attemptKey:"controller-handoff",recipe:"npm_ci"};
+    const secondPrepared=data(await controller.callTool({name:"coordination_prepare_dependencies",arguments:secondArgs}));
+    const successor=await connect("next-controller");
+    const nextPair=data(await successor.callTool({name:"coordination_pair",arguments:{}}));
+    const nextOwner=localOwner.approveLocal(nextPair.pendingId,contract);
+    data(await successor.callTool({name:"coordination_resume",arguments:{credential:nextPair.credential}}));
+    const lease=secondPrepared.lease;
+    const receipt={resource:lease.resource,baseRevision:base,scope:lease.scope,candidateRevision:base,liveOperation:lease.operation,liveHandle:"",checkpoint:"prepared-http",grantDependency:lease.grant,grantVersion:lease.grantVersion,recipientGrant:nextOwner.grant,recipientGrantVersion:1,forbiddenOverlap:lease.scope,tests:["http-pairing"],evidence:["prepared-http-effect"],remainingGap:"execute prepared operation",nextGate:"dependency_sync",expiresAt:lease.expiresAt};
+    const narrow=await connect("insufficient-scope-controller");
+    const narrowPair=data(await narrow.callTool({name:"coordination_pair",arguments:{}}));
+    const narrowOwner=localOwner.approveLocal(narrowPair.pendingId,{...contract,scope:[project]});
+    data(await narrow.callTool({name:"coordination_resume",arguments:{credential:narrowPair.credential}}));
+    const beforeHandoff=snapshot();
+    assert.equal((await controller.callTool({name:"coordination_handoff",arguments:{leaseId:lease.leaseId,expectedVersion:lease.version,recipientHandle:narrowOwner.id,receipt:{...receipt,recipientGrant:narrowOwner.grant}}})).isError,true);
+    assert.equal(snapshot(),beforeHandoff);
+    data(await controller.callTool({name:"coordination_handoff",arguments:{leaseId:lease.leaseId,expectedVersion:lease.version,recipientHandle:nextOwner.id,receipt}}));
+    assert.equal((await controller.callTool({name:"dependency_sync",arguments:secondArgs})).isError,true);
+    const transferred=data(await successor.callTool({name:"dependency_sync",arguments:secondArgs}));
+    assert.equal(transferred.status,"succeeded");
+    assert.equal(transferred.operationId,secondPrepared.subject.operationId);
+    assert.equal((database.sqlite.prepare("select count(*) as count from control_plane_resource_leases where resource=?").get(lease.resource) as {count:number}).count,1);
+
+  } finally {
+    for(const client of clients) await client.close().catch(()=>{});
+    await running.close();
+    await new Promise<void>((resolve,reject)=>listener.close(error=>error?reject(error):resolve()));
+    database.close();localOwner.close();provider.close();
+    rmSync(root,{recursive:true,force:true});
+  }
+});

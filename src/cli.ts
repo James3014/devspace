@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import { readFileSync } from "node:fs";
+import { CarrierBindingStore, type CarrierContract } from "./carrier-binding.js";
+import { canonicalizePath, isPathInsideRoot } from "./roots.js";
 import { createRequire } from "node:module";
 import { stdin as input, stdout as output } from "node:process";
 import { resolve } from "node:path";
@@ -80,7 +83,7 @@ import {
 } from "./cutover-build-ready.js";
 import type { ExpectedCutoverIdentity } from "./cutover-state.js";
 
-type Command = "serve" | "init" | "doctor" | "config" | "agents" | "models" | "cutover" | "help" | "version";
+type Command = "serve" | "init" | "doctor" | "config" | "agents" | "models" | "cutover" | "carrier" | "help" | "version";
 const require = createRequire(import.meta.url);
 const SUPPORTED_NODE_RANGE = ">=20.12 <27";
 
@@ -112,6 +115,9 @@ async function main(argv: string[]): Promise<void> {
     case "models":
       await runModelsCommand(args);
       return;
+    case "carrier":
+      runCarrierCommand(args);
+      return;
     case "cutover":
       await runCutoverCommand(args);
       return;
@@ -126,7 +132,7 @@ async function main(argv: string[]): Promise<void> {
 
 function normalizeCommand(command: string | undefined): Command {
   if (!command || command === "serve" || command === "start") return "serve";
-  if (command === "init" || command === "doctor" || command === "config" || command === "agents" || command === "models" || command === "cutover") return command;
+  if (command === "init" || command === "doctor" || command === "config" || command === "agents" || command === "models" || command === "cutover" || command === "carrier") return command;
   if (command === "help" || command === "--help" || command === "-h") return "help";
   if (command === "version" || command === "--version" || command === "-v") return "version";
   throw new Error(`Unknown command: ${command}`);
@@ -426,6 +432,9 @@ function printHelp(): void {
       "  devspace config set publicBaseUrl <url|null>",
       "  devspace models          List available models in catalog",
       "  devspace models refresh  Refresh current provider model catalog and bump generation",
+      "  devspace carrier inspect <pending-id>",
+      "  devspace carrier approve <pending-id> --contract <file> --confirm <pending-id>",
+      "  devspace carrier revoke <carrier-id> --version <version>",
       "  devspace agents ls       List subagent sessions",
       "  devspace agents run <profile-or-provider> [--model <model>] [--effort <level>] <prompt>",
       "  devspace agents continue <id> [--model <model>] [--effort <level>] <prompt>",
@@ -1247,3 +1256,22 @@ main(process.argv.slice(2)).catch((error) => {
   console.error(error instanceof Error ? error.message : String(error));
   process.exitCode = 1;
 });
+
+function runCarrierCommand(args: string[]): void {
+  const [action,id,...flags]=args;
+  if(!id) throw new Error("Carrier command requires an exact ID.");
+  const config=loadConfig();
+  const bindings=new CarrierBindingStore(config.stateDir);
+  try {
+    let result:unknown;
+    if(action==="inspect" && flags.length===0) result=bindings.pending(id);
+    else if(action==="approve" && flags.length===4 && flags[0]==="--contract" && flags[2]==="--confirm" && flags[3]===id) {
+      const contract=JSON.parse(readFileSync(resolve(flags[1]!),"utf8")) as CarrierContract;
+      const roots=[...config.allowedRoots,config.worktreeRoot].map(canonicalizePath);
+      if(!Array.isArray(contract.scope) || contract.scope.some(path=>!roots.some(root=>isPathInsideRoot(canonicalizePath(path),root)))) throw new Error("Carrier scope exceeds configured roots.");
+      result=bindings.approveLocal(id,contract);
+    } else if(action==="revoke" && flags.length===2 && flags[0]==="--version") result=bindings.revokeLocal(id,Number(flags[1]));
+    else throw new Error("Invalid carrier arguments. Inspect the exact pending pairing before approving its bounded contract.");
+    console.log(JSON.stringify(result,null,2));
+  } finally { bindings.close(); }
+}

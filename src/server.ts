@@ -1,3 +1,4 @@
+import { CarrierBindingStore } from "./carrier-binding.js";
 import type { ControlPlaneConsumerOptions } from "./control-plane-consumer.js";
 import { ControlPlaneOwnershipError } from "./control-plane-ownership.js";
 import { createHash, randomUUID } from "node:crypto";
@@ -2161,6 +2162,7 @@ export function createMcpServer(
   opencodeCatalogSource?: ReturnType<typeof createMcpOpencodeCatalogSource>,
   clineCatalogService?: ClineCatalogService,
   chatSwarmLifecycle?: ChatSwarmLifecycle,
+  carrierBindings?: CarrierBindingStore,
 ): McpServer {
   const runtimeBuildIdentity = runtimeBuildIdentityContext?.identity
     ?? describeRuntimeBuildIdentity({
@@ -2652,6 +2654,25 @@ export function createMcpServer(
         }
       },
     );
+
+    if (carrierBindings) {
+      const contractSchema=z.object({repository:z.string(),goal:z.string(),role:z.enum(["controller","worker"]),scope:z.array(z.string()),baseRevision:z.string(),operations:z.array(z.literal("dependency_sync")),expiresAt:z.string()}).strict();
+      const registration={annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:false,openWorldHint:false},_meta:{}};
+      const result=(value:unknown)=>({content:[textBlock(JSON.stringify(value))]});
+      registerAppTool(server,"coordination_pair",{...registration,title:"Request a carrier pairing",description:"Request local Owner approval. Save the returned private credential for this carrier; it grants nothing until approval. Never copy it into handoff receipts or other conversations.",inputSchema:{}},async(_,extra)=>result(carrierBindings.requestPairing(dependencyConsumerContext(extra))));
+      registerAppTool(server,"coordination_resume",{...registration,title:"Resume a paired carrier",description:"Prove possession of this carrier's private credential on the current authenticated MCP session. Caller conversation metadata cannot substitute for this proof.",inputSchema:{credential:z.string()}},async({credential},extra)=>result(carrierBindings.redeem(dependencyConsumerContext(extra),credential)));
+      registerAppTool(server,"coordination_carrier_status",{...registration,annotations:{...registration.annotations,readOnlyHint:true},title:"Read paired carrier",description:"Read current bounded authority, including parent revocation. Contains no credential.",inputSchema:{}},async(_,extra)=>result(carrierBindings.status(dependencyConsumerContext(extra))));
+      registerAppTool(server,"coordination_delegate",{...registration,title:"Delegate bounded work",description:"Approve a worker's pending pairing within the current controller's scope and expiry. Cannot create controller authority.",inputSchema:{pendingId:z.string(),contract:contractSchema}},async({pendingId,contract},extra)=>result(carrierBindings.delegate(dependencyConsumerContext(extra),pendingId,contract)));
+      registerAppTool(server,"coordination_revoke_worker",{...registration,title:"Revoke delegated worker",description:"Revoke an exact child authority version. Existing unknown effects remain pinned and require reconciliation.",inputSchema:{carrierId:z.string(),expectedVersion:z.number().int().positive()}},async({carrierId,expectedVersion},extra)=>result(carrierBindings.revokeDelegation(dependencyConsumerContext(extra),carrierId,expectedVersion)));
+      registerAppTool(server,"coordination_prepare_dependencies",{...registration,title:"Prepare bounded dependency operation",description:"Bind a frozen dependency recipe to the paired carrier and acquire its existing resource lease. Does not execute the recipe. Use the same inputs with dependency_sync.",inputSchema:{workspaceId:z.string(),attemptKey:z.string(),recipe:z.enum(["npm_ci","pnpm_frozen","uv_frozen"])}},async(args,extra)=>{
+        const context=dependencyConsumerContext(extra);
+        carrierBindings.status(context);
+        await workspaces.assertConversationMutationAllowed(args.workspaceId,openAiConversationScopeId(extra._meta));
+        const workspace=workspaces.getWorkspace(args.workspaceId);
+        const plan=await durableOperations.planDependencySync({...args,workspaceRoot:workspace.root});
+        return result({subject:plan.subject,lease:carrierBindings.prepareEffect(context,plan.subject)});
+      });
+    }
 
     registerAppTool(server,"coordination_completion_read",{
       title:"Read current delivery evidence",
@@ -4936,7 +4957,9 @@ export function createServer(
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
   initializationCleanups.push(() => processSessions.shutdown());
-  const durableOperations = new DurableOperationManager(config, undefined, undefined, undefined, options.coordination);
+  const carrierBindings = options.coordination ? undefined : new CarrierBindingStore(config.stateDir);
+  if (carrierBindings) initializationCleanups.push(() => carrierBindings.close());
+  const durableOperations = new DurableOperationManager(config, undefined, undefined, undefined, options.coordination ?? carrierBindings?.readers);
   initializationCleanups.push(() => durableOperations.close());
   const opencodeCatalogSource = createMcpOpencodeCatalogSource();
   initializationCleanups.push(() => opencodeCatalogSource.close());
@@ -5536,6 +5559,7 @@ export function createServer(
 
         transport.onclose = () => {
           const closedSessionId = transport?.sessionId;
+          if (closedSessionId) carrierBindings?.forgetSession(closedSessionId);
           if (closedSessionId && transports.remove(closedSessionId)) {
             logEvent(config.logging, "info", "mcp_session_closed", {
               reason: "transport_close",
@@ -5576,6 +5600,7 @@ export function createServer(
           opencodeCatalogSource,
           clineCatalogService,
           chatSwarmLifecycle,
+          carrierBindings,
         );
         await server.connect(transport);
       } else {
@@ -5614,6 +5639,7 @@ export function createServer(
         codexGoals?.shutdown();
         processSessions.shutdown();
         durableOperations.close();
+        carrierBindings?.close();
         chatSwarmLifecycle?.close();
         chatSwarmRuntimeOwner?.close();
         agentSessionManager?.close();

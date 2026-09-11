@@ -77,6 +77,7 @@ const migrations: Migration[] = [
     name: "chat-swarm-runtime-owner",
     up: migrateChatSwarmRuntimeOwner,
   },
+  { version: 15, name: "carrier-bindings", up: migrateCarrierBindings },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -431,4 +432,28 @@ function addColumnIfMissing(
   if (columns.some((existingColumn) => existingColumn.name === column)) return;
 
   sqlite.exec(`alter table ${table} add column ${column} ${definition}`);
+}
+
+function migrateCarrierBindings(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table carrier_pairings (
+      id text primary key, client_id text not null, session_id text not null,
+      credential_hash text not null unique, expires_at integer not null,
+      binding_id text unique
+    );
+    create table carrier_bindings (
+      id text primary key, client_id text not null, credential_hash text not null unique,
+      parent_id text references carrier_bindings(id), version integer not null,
+      revoked integer not null default 0, contract_json text not null
+    );
+    create table dependency_terminal_witnesses (
+      operation_id text primary key, request_hash text not null, lease_id text not null,
+      exit_code integer not null, frozen_inputs_unchanged integer not null
+    );
+    create table carrier_effect_bindings (
+      binding_id text not null references carrier_bindings(id), operation_id text not null,
+      subject_json text not null, lease_id text not null,
+      primary key(binding_id, operation_id)
+    );
+  `);
 }
