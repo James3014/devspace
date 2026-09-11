@@ -36,7 +36,14 @@ test("real HTTP clients sharing OAuth pair independently, delegate, resume, exec
   await provider.authorize(oauthClient,{redirectUri:"http://localhost/callback",codeChallenge:"fixture",scopes:config.oauth.scopes,resource:new URL("/mcp",config.publicBaseUrl)}, {req:{method:"POST",body:{owner_token:config.oauth.ownerToken}},redirect:(_status:number,url:string)=>{redirect=url;}} as never);
   const tokens=await provider.exchangeAuthorizationCode(oauthClient,new URL(redirect).searchParams.get("code")!);
   let now=Date.now();
-  const running=createServer(config,{carrierClock:()=>now});
+  const selection={goal:"issue62",subject:"delivery",candidate:"b".repeat(40)};
+  let verificationState="INDEPENDENTLY_VERIFIED",verifier="reviewer";
+  const completionBindings=[{repository:"James3014/devspace",goal:"issue62",subject:"delivery",readers:{
+    readContract:()=>({...selection,source:"fixture-contract",requiredLayers:["SOURCE"],criteria:[{id:"source",layer:"SOURCE",sourceRevision:selection.candidate,environment:"fixture",surface:"HTTP",independent:true,maxAgeMs:60000}]}),
+    readEvidence:()=>[{criterionId:"source",layer:"SOURCE",sourceRevision:selection.candidate,candidate:selection.candidate,subject:selection.subject,source:"fixture-evidence",command:"fixture",result:"PASS",artifactSha256:"a".repeat(64),environment:"fixture",surface:"HTTP",verifier,implementer:"implementer",verificationState,observedAt:new Date(now-1000).toISOString(),expiresAt:new Date(now+60000).toISOString(),limitations:[],nextGate:"native acceptance"}],
+  }}];
+  assert.throws(()=>createServer(config,{completionBindings,coordination:{} as never}),/mutually exclusive/);
+  const running=createServer(config,{carrierClock:()=>now,completionBindings});
   const localOwner=new CarrierBindingStore(config.stateDir,()=>now);
   const database=openDatabase(config.stateDir);
   const snapshot=()=>JSON.stringify({effects:database.sqlite.prepare("select * from carrier_effect_bindings order by operation_id").all(),leases:database.sqlite.prepare("select * from control_plane_resource_leases order by lease_id").all(),operations:database.sqlite.prepare("select * from durable_operations order by operation_id").all()});
@@ -55,6 +62,16 @@ test("real HTTP clients sharing OAuth pair independently, delegate, resume, exec
     const contract:CarrierContract={repository:"James3014/devspace",goal:"issue62",role:"controller",scope:[root],baseRevision:base,operations:["dependency_sync"],expiresAt:new Date(Date.now()+120000).toISOString()};
     localOwner.approveLocal(request.pendingId,contract);
     data(await controller.callTool({name:"coordination_resume",arguments:{credential:request.credential}}));
+    const completion=()=>controller.callTool({name:"coordination_completion_read",arguments:selection});
+    assert.equal(data(await completion()).projection.status,"COMPLETE");
+    verificationState="HANDOFF_REPORTED";
+    assert.equal(data(await completion()).projection.status,"INCOMPLETE");
+    verificationState="INDEPENDENTLY_VERIFIED";verifier="implementer";
+    assert.equal(data(await completion()).projection.status,"INCOMPLETE");
+    verifier="reviewer";
+    const foreign=data(await controller.callTool({name:"coordination_completion_read",arguments:{...selection,subject:"foreign"}})).projection;
+    assert.equal(foreign.status,"BLOCKED");
+    assert.deepEqual(foreign.criteria,[]);
     const pending=data(await worker.callTool({name:"coordination_pair",arguments:{}}));
     const child=data(await controller.callTool({name:"coordination_delegate",arguments:{pendingId:pending.pendingId,contract:{...contract,role:"worker",scope:[project]}}}));
     data(await worker.callTool({name:"coordination_resume",arguments:{credential:pending.credential}}));

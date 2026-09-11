@@ -4,6 +4,31 @@ import { isAbsolute, relative } from "node:path";
 import { openDatabase } from "./db/client.js";
 import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, normalizeRepositoryKey, type GrantEvidenceReference } from "./control-plane-ownership.js";
 import type { ControlPlaneConsumerOptions, DependencyReconciliationEvidence, EffectSubject } from "./control-plane-consumer.js";
+import type { CompletionReaders, CompletionSelection } from "./current-completion-matrix.js";
+
+/** Host-selected evidence access only; this never grants resource authority. */
+export interface CarrierCompletionBinding {
+  repository: string;
+  goal: string;
+  subject: string;
+  readers: CompletionReaders;
+}
+
+function completionBindingsSnapshot(bindings: readonly CarrierCompletionBinding[]) {
+  const result = new Map<string, Readonly<CompletionReaders>>();
+  for (const binding of bindings) {
+    if (!binding || typeof binding.repository !== "string" || !binding.repository.trim() ||
+        typeof binding.goal !== "string" || !binding.goal.trim() ||
+        typeof binding.subject !== "string" || !binding.subject.trim() ||
+        typeof binding.readers?.readContract !== "function" || typeof binding.readers?.readEvidence !== "function") {
+      throw new Error("Invalid completion reader binding.");
+    }
+    const key = JSON.stringify([normalizeRepositoryKey(binding.repository), binding.goal, binding.subject]);
+    if (result.has(key)) throw new Error("Duplicate completion reader binding.");
+    result.set(key, Object.freeze({readContract: binding.readers.readContract, readEvidence: binding.readers.readEvidence}));
+  }
+  return result;
+}
 
 export interface CarrierContract {
   repository: string;
@@ -52,10 +77,26 @@ export class CarrierBindingStore {
   readonly readers: ControlPlaneConsumerOptions;
   readonly ownership: ControlPlaneOwnershipStore;
 
-  constructor(stateDir: string, private readonly now: () => number = Date.now) {
+  constructor(stateDir: string, private readonly now: () => number = Date.now, completionBindings: readonly CarrierCompletionBinding[] = []) {
+    const completions = completionBindingsSnapshot(completionBindings);
+    const readCompletion = (context: unknown, selection: Readonly<CompletionSelection>, hook: keyof CompletionReaders) => {
+      const before = this.current(context);
+      const selected = Object.freeze({...selection});
+      if (selected.goal !== before.contract.goal) deny("Completion selection exceeds carrier authority");
+      const readers = completions.get(JSON.stringify([before.contract.repository, selected.goal, selected.subject]));
+      if (!readers) deny("Trusted completion source binding is unavailable");
+      const value = readers[hook](selected);
+      const after = this.current(context);
+      if (before.row.id !== after.row.id || before.generation !== after.generation) deny("Completion authority changed during read");
+      return value;
+    };
     this.database = openDatabase(stateDir);
     this.readers = {
       now,
+      ...(completions.size ? {
+        readCompletionContract: (context: unknown, selection: Readonly<CompletionSelection>) => readCompletion(context, selection, "readContract"),
+        readCompletionEvidence: (context: unknown, selection: Readonly<CompletionSelection>) => readCompletion(context, selection, "readEvidence"),
+      } : {}),
       resolveOwnerContext: context => ({ownerThread:this.current(context).row.id}),
       verifyGrantEvidence: (grant, owner) => {
         const binding = this.active(owner.ownerThread);

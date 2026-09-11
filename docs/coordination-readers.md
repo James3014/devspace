@@ -18,6 +18,22 @@ Configured bootstrap failure stops startup before listening and reports a bounde
 
 ## Built-in carrier pairing
 
+Embedding hosts may pass `completionBindings` to `createServer`: an array of
+`{ repository, goal, subject, readers: { readContract, readEvidence } }` entries.
+This evidence-only option preserves built-in pairing and cannot be combined with
+custom `coordination` readers. Keys and callback references are captured at startup;
+duplicate or malformed bindings fail startup. Each callback checks the current
+carrier before and after reading, including expiry, revocation and authority
+generation. Repository, goal and subject must match the host-selected binding.
+The selected candidate is validated by the existing completion projector and need
+not equal the carrier's base revision.
+
+Hosts must independently establish the contract source, artifact integrity and
+verification provenance before supplying these readers. The projector validates
+records but does not authenticate a claimed artifact hash or reviewer identity.
+There is no default file reader, CLI source selection, matrix fallback or implicit
+grant. This embedding interface alone does not establish production acceptance.
+
 Without a custom reader module, the server now exposes a local pairing path for
 bounded dependency operations. Unpaired sessions have no coordination authority.
 An explicitly configured custom reader retains exclusive control; the built-in
