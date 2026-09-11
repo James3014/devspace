@@ -25,6 +25,25 @@ export type DurableOperationKind = "workspace_clone" | "dependency_sync" | "nexu
 export type DurableOperationStatus = "started" | "succeeded" | "failed" | "outcome_unknown";
 export type DependencySyncRecipe = "npm_ci" | "pnpm_frozen" | "uv_frozen";
 
+export interface CutoverStartInput {
+  attemptKey: string;
+  currentIdentity: CutoverServerIdentity;
+  expectedIdentity: ExpectedCutoverIdentity;
+  expiresAt?: string;
+}
+
+/** One exact request identity for preparation and execution; creates no durable state. */
+export function planCutoverStart(stateDir: string, input: CutoverStartInput) {
+  assertAttemptKey(input.attemptKey);
+  const snapshot = JSON.parse(JSON.stringify(input)) as CutoverStartInput;
+  const stateRoot = canonicalizePath(stateDir);
+  const request = {version:EXECUTION_PROTOCOL_VERSION,baseRevision:snapshot.currentIdentity.sourceCommit,stateRoot,currentIdentity:snapshot.currentIdentity,expectedIdentity:snapshot.expectedIdentity,expiresAt:snapshot.expiresAt};
+  const requestHash = hashJson(request);
+  const operationId = stableOperationId("cutover_start",stateRoot,snapshot.attemptKey);
+  const subject = {operationId,requestHash,workspaceRoot:stateRoot,baseRevision:request.baseRevision,operation:"cutover_start" as const};
+  return {snapshot,stateRoot,request,requestHash,operationId,subject};
+}
+
 const SAFE_NEXUS_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const HEX64 = /^[0-9a-f]{64}$/;
 const NEXUS_DEPLOYMENT_ID = /^r1-[0-9a-f]{40}$/;
@@ -377,15 +396,9 @@ export class DurableOperationManager {
     });
   }
 
-  startCutover(input: {attemptKey: string; currentIdentity: CutoverServerIdentity; expectedIdentity: ExpectedCutoverIdentity; expiresAt?: string}, context?: unknown): DurableOperationRecord {
+  startCutover(input: CutoverStartInput, context?: unknown): DurableOperationRecord {
     if (!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "cutover start requires trusted host authority");
-    assertAttemptKey(input.attemptKey);
-    const snapshot = JSON.parse(JSON.stringify(input)) as typeof input;
-    const stateRoot = canonicalizePath(this.config.stateDir);
-    const request = {version:EXECUTION_PROTOCOL_VERSION,baseRevision:snapshot.currentIdentity.sourceCommit,stateRoot,currentIdentity:snapshot.currentIdentity,expectedIdentity:snapshot.expectedIdentity,expiresAt:snapshot.expiresAt};
-    const requestHash = hashJson(request);
-    const operationId = stableOperationId("cutover_start",stateRoot,snapshot.attemptKey);
-    const subject = {operationId,requestHash,workspaceRoot:stateRoot,baseRevision:request.baseRevision,operation:"cutover_start" as const};
+    const {snapshot,stateRoot,request,requestHash,operationId,subject} = planCutoverStart(this.config.stateDir,input);
     const consumer = this.consumer;
     const intent = this.store.atomic(() => {
       const binding = consumer.authorize(context,subject);

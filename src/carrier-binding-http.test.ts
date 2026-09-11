@@ -23,11 +23,12 @@ function data(result: Awaited<ReturnType<Client["callTool"]>>): Record<string,an
 }
 test("CLI completion-only startup preserves pairing and rejects altered or mixed modules",async()=>{
   const root=realpathSync(mkdtempSync(join(tmpdir(),"completion-cli-")));
+  const workspace=join(root,"workspace");mkdirSync(workspace);
   const socket=createTcpServer();
   await new Promise<void>(resolve=>socket.listen(0,"127.0.0.1",resolve));
   const port=(socket.address() as {port:number}).port;
   await new Promise<void>(resolve=>socket.close(()=>resolve()));
-  const env={...process.env,DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_STATE_DIR:join(root,"state"),DEVSPACE_ALLOWED_ROOTS:root,DEVSPACE_WORKTREE_ROOT:join(root,"worktrees"),DEVSPACE_SUBAGENTS:"false",DEVSPACE_PUBLIC_BASE_URL:`http://127.0.0.1:${port}`,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",PORT:String(port)};
+  const env={...process.env,DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_STATE_DIR:join(root,"state"),DEVSPACE_ALLOWED_ROOTS:workspace,DEVSPACE_WORKTREE_ROOT:join(root,"worktrees"),DEVSPACE_SUBAGENTS:"false",DEVSPACE_PUBLIC_BASE_URL:`http://127.0.0.1:${port}`,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",PORT:String(port)};
   const config=loadConfig(env);
   const provider=new SingleUserOAuthProvider(config.oauth,new URL("/mcp",config.publicBaseUrl),config.stateDir);
   const oauthClient=await provider.clientsStore.registerClient!({redirect_uris:["http://localhost/callback"],client_name:"CLI fixture",token_endpoint_auth_method:"none"});
@@ -60,7 +61,7 @@ test("CLI completion-only startup preserves pairing and rejects altered or mixed
     assert.equal((await client.callTool({name:"coordination_carrier_status",arguments:{}})).isError,true);
     const pending=data(await client.callTool({name:"coordination_pair",arguments:{}}));
     const contractPath=join(root,"contract.json");
-    writeFileSync(contractPath,JSON.stringify({repository:"James3014/devspace",goal:"issue62",role:"controller",scope:[root],baseRevision:"a".repeat(40),operations:["dependency_sync"],expiresAt:new Date(Date.now()+60000).toISOString()}));
+    writeFileSync(contractPath,JSON.stringify({repository:"James3014/devspace",goal:"issue62",role:"controller",scope:[workspace],baseRevision:"a".repeat(40),operations:["dependency_sync"],expiresAt:new Date(Date.now()+60000).toISOString()}));
     execFileSync(process.execPath,[...entry,"carrier","inspect",pending.pendingId],{env,stdio:"pipe"});
     execFileSync(process.execPath,[...entry,"carrier","approve",pending.pendingId,"--contract",contractPath,"--confirm",pending.pendingId],{env,stdio:"pipe"});
     data(await client.callTool({name:"coordination_resume",arguments:{credential:pending.credential}}));
@@ -68,6 +69,54 @@ test("CLI completion-only startup preserves pairing and rejects altered or mixed
     assert.equal(projection.contractSource,"synthetic-cli-test-only");
     assert.equal(projection.status,"INCOMPLETE");
     assert.equal(projection.criteria[0].gap,"MISSING_EVIDENCE");
+    const cutoverClient=new Client({name:"CLI cutover fixture",version:"1"});
+    try {
+      await cutoverClient.connect(new StreamableHTTPClientTransport(new URL("/mcp",config.publicBaseUrl),{requestInit:{headers:{Authorization:`Bearer ${tokens.access_token}`}}}));
+      const status=data(await cutoverClient.callTool({name:"cutover_status",arguments:{}})).status;
+      const identity=status.currentServerIdentity;
+      const expiry=new Date(Date.now()+60000).toISOString();
+      const args={attemptKey:"installed-cli-cutover",expectedSourceCommit:"b".repeat(40),expectedBuildId:"target-fixture",expectedCapabilityManifestSha256:"d".repeat(64),expiresAt:expiry};
+      assert.equal((await cutoverClient.callTool({name:"coordination_prepare_cutover",arguments:args})).isError,true);
+      const pendingCutover=data(await cutoverClient.callTool({name:"coordination_pair",arguments:{}}));
+      const approved={repository:"James3014/devspace",goal:"issue62",role:"controller",scope:[config.stateDir],baseRevision:identity.sourceCommit,operations:["cutover_start"],expiresAt:expiry,
+        cutover:{stateRoot:config.stateDir,attemptKey:args.attemptKey,currentIdentity:identity,expectedIdentity:{sourceCommit:args.expectedSourceCommit,buildId:args.expectedBuildId,capabilityManifestSha256:args.expectedCapabilityManifestSha256},expiresAt:expiry,
+          restart:{buildReady:{verifiedBy:"fixture",verifiedAt:new Date().toISOString(),evidence:"synthetic isolated test only"},actuator:"launchd-self",serviceLabel:"isolated-test",launchdTarget:"gui/501/isolated-test"},finish:{workspaceId:"ws_fixture",agentId:"agt_fixture"}}};
+      const approvalPath=join(root,"cutover-contract.json");
+      // A cutover-shaped field cannot expand a dependency contract to stateDir.
+      writeFileSync(approvalPath,JSON.stringify({...approved,operations:["dependency_sync"]}));
+      assert.throws(()=>execFileSync(process.execPath,[...entry,"carrier","approve",pendingCutover.pendingId,"--contract",approvalPath,"--confirm",pendingCutover.pendingId],{env,stdio:"pipe"}));
+      writeFileSync(approvalPath,JSON.stringify(approved));
+      if(identity.sourceCommit==="unverified") {
+        assert.equal(cli,undefined,"Installed CLI must carry a verified source identity");
+        assert.throws(()=>execFileSync(process.execPath,[...entry,"carrier","approve",pendingCutover.pendingId,"--contract",approvalPath,"--confirm",pendingCutover.pendingId],{env,stdio:"pipe"}));
+        assert.equal((await cutoverClient.callTool({name:"coordination_prepare_cutover",arguments:args})).isError,true);
+      } else {
+      execFileSync(process.execPath,[...entry,"carrier","approve",pendingCutover.pendingId,"--contract",approvalPath,"--confirm",pendingCutover.pendingId],{env,stdio:"pipe"});
+      data(await cutoverClient.callTool({name:"coordination_resume",arguments:{credential:pendingCutover.credential}}));
+      assert.equal((await cutoverClient.callTool({name:"coordination_prepare_cutover",arguments:{...args,expectedBuildId:"wrong-target"}})).isError,true);
+      const prepared=data(await cutoverClient.callTool({name:"coordination_prepare_cutover",arguments:args}));
+      assert.equal(prepared.subject.baseRevision,identity.sourceCommit);
+      assert.equal((await cutoverClient.callTool({name:"cutover_start",arguments:{...args,attemptKey:"changed"}})).isError,true);
+      const started=data(await cutoverClient.callTool({name:"cutover_start",arguments:args}));
+      assert.equal(started.operationId,prepared.subject.operationId);
+      const readback=data(await cutoverClient.callTool({name:"cutover_status",arguments:{}})).status.cutover;
+      assert.equal(readback.coordinationBinding.operationHandle,prepared.subject.operationId);
+      assert.equal(readback.coordinationBinding.requestHash,prepared.subject.requestHash);
+      data(await cutoverClient.callTool({name:"cutover_drain",arguments:{cutoverId:started.cutover.cutoverId}}));
+      assert.equal(data(await cutoverClient.callTool({name:"cutover_status",arguments:{}})).status.cutover.phase,"drained");
+      await cutoverClient.close();
+      const reconnect=new Client({name:"drained-reconnect",version:"1"});
+      try {
+        await reconnect.connect(new StreamableHTTPClientTransport(new URL("/mcp",config.publicBaseUrl),{requestInit:{headers:{Authorization:`Bearer ${tokens.access_token}`}}}));
+        assert.equal((await reconnect.callTool({name:"coordination_resume",arguments:{credential:"x".repeat(43)}})).isError,true);
+        data(await reconnect.callTool({name:"coordination_resume",arguments:{credential:pendingCutover.credential}}));
+        assert.equal(data(await reconnect.callTool({name:"coordination_lease_read",arguments:{leaseId:prepared.lease.leaseId}})).operationHandle,started.operationId);
+        for(const request of [{name:"coordination_pair",arguments:{}},{name:"coordination_prepare_cutover",arguments:args},{name:"coordination_delegate",arguments:{pendingId:pendingCutover.pendingId,contract:approved}}]) {
+          await assert.rejects(reconnect.callTool(request),/CUTOVER_RECONCILIATION_REQUIRED/);
+        }
+      } finally {await reconnect.close().catch(()=>{});}
+      }
+    } finally {await cutoverClient.close().catch(()=>{});}
   } finally {
     await client.close().catch(()=>{});
     if(child.exitCode===null){

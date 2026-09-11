@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, mkdirSync, symlinkSync, unlinkSync, realpathSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, symlinkSync, unlinkSync, realpathSync, writeFileSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync, spawn } from "node:child_process";
@@ -298,6 +298,22 @@ function cutoverFixture() {
   leaseId=ownership.acquire(context,{repositoryKey:grant.repository,resourceKind:"filesystem",resourceId:config.stateDir,resource:config.stateDir,operation:"cutover_start",scope:[config.stateDir],baseRevision:input.currentIdentity.sourceCommit,expiresAt:new Date(Date.now()+60000).toISOString(),idempotencyKey:"cutover",grant}).leaseId;
   return {manager,config,context,input,options,ownership,leaseId,revoke:()=>{permitted=false;}};
 }
+
+test("C3 cutover planning shares the exact execution identity without creating an intent", async()=>{
+  const module=await import("./durable-operations.js");
+  const f=cutoverFixture();
+  try {
+    const plan=module.planCutoverStart(f.config.stateDir,f.input);
+    assert.equal(f.manager.store.getByOperationId(plan.subject.operationId),undefined);
+    const result=f.manager.startCutover(f.input,f.context);
+    assert.equal(result.operationId,plan.subject.operationId);
+    assert.equal(result.requestHash,plan.subject.requestHash);
+    const {coordinationBinding,...request}=result.request;
+    assert.deepEqual(request,JSON.parse(JSON.stringify(plan.request)));
+    assert.equal(plan.subject.baseRevision,f.input.currentIdentity.sourceCommit);
+    assert.notEqual(module.planCutoverStart(f.config.stateDir,{...f.input,expectedIdentity:{...f.input.expectedIdentity,buildId:"other"}}).subject.requestHash,plan.subject.requestHash);
+  } finally {f.manager.close();rmSync(f.config.allowedRoots[0]!,{recursive:true,force:true});}
+});
 
 test("C3 cutover start correlates real state, retains pin, replays once and denies revoked reconciliation", async()=>{
   const {CutoverStateStore}=await import("./cutover-state.js");const f=cutoverFixture();

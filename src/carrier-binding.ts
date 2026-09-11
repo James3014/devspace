@@ -1,6 +1,10 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { realpathSync } from "node:fs";
 import { isAbsolute, relative } from "node:path";
+import { isDeepStrictEqual } from "node:util";
+import { z } from "zod";
+import { planCutoverStart } from "./durable-operations.js";
+import { CutoverStateStore } from "./cutover-state.js";
 import { openDatabase } from "./db/client.js";
 import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, normalizeRepositoryKey, type GrantEvidenceReference } from "./control-plane-ownership.js";
 import type { ControlPlaneConsumerOptions, DependencyReconciliationEvidence, EffectSubject } from "./control-plane-consumer.js";
@@ -47,7 +51,20 @@ export interface CarrierContract {
   baseRevision: string;
   operations: Array<"dependency_sync" | "cutover_start">;
   expiresAt: string;
+  cutover?: CarrierCutoverContract;
 }
+const nonempty=z.string().min(1).max(4096);
+const revision=z.string().regex(/^[a-f0-9]{40,64}$/);
+const timestamp=z.string().datetime();
+const targetIdentity=z.object({sourceCommit:revision,buildId:nonempty,capabilityManifestSha256:z.string().regex(/^[a-f0-9]{64}$/)}).strict();
+const cutoverSchema=z.object({
+  stateRoot:nonempty,attemptKey:nonempty,
+  currentIdentity:targetIdentity.extend({serverInstanceId:nonempty}).strict(),
+  expectedIdentity:targetIdentity,expiresAt:timestamp,
+  restart:z.object({buildReady:z.object({verifiedBy:nonempty,verifiedAt:timestamp,evidence:nonempty}).strict(),actuator:z.literal("launchd-self"),serviceLabel:nonempty,launchdTarget:nonempty}).strict(),
+  finish:z.object({workspaceId:nonempty,agentId:nonempty}).strict(),
+}).strict();
+export type CarrierCutoverContract=z.infer<typeof cutoverSchema>;
 interface BindingRow {
   id: string; client_id: string; credential_hash: string; parent_id: string | null;
   version: number; revoked: number; contract_json: string;
@@ -86,7 +103,7 @@ export class CarrierBindingStore {
   readonly readers: ControlPlaneConsumerOptions;
   readonly ownership: ControlPlaneOwnershipStore;
 
-  constructor(stateDir: string, private readonly now: () => number = Date.now, completionBindings: readonly CarrierCompletionBinding[] = []) {
+  constructor(private readonly stateDir: string, private readonly now: () => number = Date.now, completionBindings: readonly CarrierCompletionBinding[] = []) {
     const completions = new Map(snapshotCarrierCompletionBindings(completionBindings).map(binding=>[
       JSON.stringify([binding.repository,binding.goal,binding.subject]),binding.readers,
     ]));
@@ -116,9 +133,30 @@ export class CarrierBindingStore {
       resolveEffectBinding: (context, subject) => {
         const binding = this.current(context);
         this.assertSubject(binding.contract, subject);
+        if(binding.contract.cutover && Date.parse(binding.contract.cutover.expiresAt)<=this.now()) {
+          const persisted=this.database.sqlite.prepare("select request_hash from durable_operations where operation_id=? and kind='cutover_start'").get(subject.operationId) as {request_hash:string}|undefined;
+          if(!persisted || persisted.request_hash!==subject.requestHash) deny("Cutover approval expired; only persisted reconciliation is permitted");
+        }
         const lease = this.effectLease(binding,subject);
         if (!lease) return undefined;
         return {leaseId:lease.leaseId,leaseVersion:lease.version,requestHash:subject.requestHash,role:binding.contract.role,authorityVersion:binding.generation};
+      },
+      approveCutoverLifecycle: (context,subject,action) => {
+        const binding=this.current(context), approved=binding.contract.cutover;
+        this.assertSubject(binding.contract,subject);
+        if(!approved || binding.row.parent_id || binding.contract.role!=="controller") return false;
+        const file=new CutoverStateStore(approved.stateRoot).get();
+        if(!file || file.cutoverId!==action.cutoverId || file.coordinationBinding?.operationHandle!==subject.operationId ||
+          file.coordinationBinding.requestHash!==subject.requestHash || file.coordinationBinding.ownerThread!==binding.row.id) return false;
+        if(action.action==="finish") {
+          const {serverInstanceId,...identity}=action.currentIdentity;
+          return !!serverInstanceId && serverInstanceId!==approved.currentIdentity.serverInstanceId &&
+            isDeepStrictEqual(identity,approved.expectedIdentity) && isDeepStrictEqual(action,{action:"finish",cutoverId:file.cutoverId,currentIdentity:action.currentIdentity,preferredPair:approved.finish});
+        }
+        if(Date.parse(approved.expiresAt)<=this.now()) return false;
+        if(action.action==="drain") return isDeepStrictEqual(action,{action:"drain",cutoverId:file.cutoverId,currentIdentity:approved.currentIdentity});
+        return action.action==="restart" && isDeepStrictEqual(action,{action:"restart",cutoverId:file.cutoverId,currentIdentity:approved.currentIdentity,buildReady:approved.restart.buildReady,
+          actuator:{actuator:approved.restart.actuator,serviceLabel:approved.restart.serviceLabel,launchdTarget:approved.restart.launchdTarget}});
       },
       readDependencyReconciliation: (context,subject) => {
         const binding=this.current(context);
@@ -151,6 +189,7 @@ export class CarrierBindingStore {
       },
       resolveHandoffRecipient: (context, handle, lease, receipt) => {
         const sender=this.current(context), recipient=this.active(handle);
+        if(sender.contract.cutover || recipient.contract.cutover || lease.operation==="cutover_start") deny("Cutover authority cannot be transferred");
         if (sender.contract.role !== "controller" || sender.contract.repository !== recipient.contract.repository || sender.contract.goal !== recipient.contract.goal || sender.contract.baseRevision !== recipient.contract.baseRevision) deny();
         if(lease.ownerThread!==sender.row.id || lease.baseRevision!==recipient.contract.baseRevision ||
           !recipient.contract.operations.includes(lease.operation as "dependency_sync") ||
@@ -184,9 +223,16 @@ export class CarrierBindingStore {
   approveLocal(pendingId: string, contract: CarrierContract) {
     return this.database.sqlite.transaction(()=>this.issue(pendingId,contract,null)).immediate();
   }
+  /** CLI root validation does not turn the state resource into an allowed workspace. */
+  validateLocalScope(input: CarrierContract, allowedRoots: string[]): CarrierContract {
+    const contract=this.validateContract(input,false);
+    if(!contract.cutover && contract.scope.some(path=>!allowedRoots.some(root=>contains(physical(root),path)))) deny("Carrier scope exceeds configured roots");
+    return contract;
+  }
   delegate(context: unknown, pendingId: string, contract: CarrierContract) {
     return this.database.sqlite.transaction(()=>{
       const parent=this.current(context);
+      if(parent.contract.cutover || contract.cutover || contract.operations.includes("cutover_start")) deny("Cutover authority cannot be delegated");
       if(parent.contract.role!=="controller") deny("Workers cannot delegate or promote themselves");
       const child=this.validateContract(contract);
       if(child.role!=="worker") deny("Delegation cannot create a controller");
@@ -259,6 +305,7 @@ export class CarrierBindingStore {
     return this.database.sqlite.transaction(()=>{
       const binding=this.current(context);
       this.assertSubject(binding.contract,subject);
+      if(binding.contract.cutover && Date.parse(binding.contract.cutover.expiresAt)<=this.now()) deny("Cutover preparation approval expired");
       const transferred=this.effectLease(binding,subject);
       if(transferred) return this.ownership.assertHeld(context,transferred.leaseId,transferred.version,subject.operation,subject.baseRevision);
       const existing=this.database.sqlite.prepare("select subject_json,lease_id from carrier_effect_bindings where binding_id=? and operation_id=?").get(binding.row.id,subject.operationId) as {subject_json:string;lease_id:string}|undefined;
@@ -358,12 +405,22 @@ export class CarrierBindingStore {
   private validateContract(input: CarrierContract, requireFuture = true): CarrierContract {
     if(!input || !["controller","worker"].includes(input.role) || typeof input.goal!=="string" || !input.goal.trim() || input.goal.length>160 ||
       !/^[a-f0-9]{40,64}$/.test(input.baseRevision) || !Array.isArray(input.scope) || input.scope.length<1 || input.scope.length>64 ||
-      !Array.isArray(input.operations) || input.operations.length<1 || input.operations.some(op=>op!=="dependency_sync") ||
+      !Array.isArray(input.operations) || input.operations.length<1 || input.operations.some(op=>op!=="dependency_sync" && op!=="cutover_start") ||
       !Number.isFinite(Date.parse(input.expiresAt)) || (requireFuture && Date.parse(input.expiresAt)<=this.now())) deny("Invalid or expired carrier contract");
-    if(input.operations.includes("cutover_start")) deny("Built-in carrier pairing currently supports dependency operations only");
+    let cutover:CarrierCutoverContract|undefined;
+    if(input.operations.includes("cutover_start") || input.cutover!==undefined) {
+      const parsed=cutoverSchema.safeParse(input.cutover);
+      if(!parsed.success || Object.keys(input).some(key=>!["repository","goal","role","scope","baseRevision","operations","expiresAt","cutover"].includes(key))) deny("Invalid cutover approval");
+      cutover=parsed.data;
+      if(input.role!=="controller" || input.operations.length!==1 || input.operations[0]!=="cutover_start" || input.scope.length!==1 ||
+        physical(cutover.stateRoot)!==physical(this.stateDir) || cutover.stateRoot!==physical(cutover.stateRoot) || physical(input.scope[0]!)!==cutover.stateRoot ||
+        input.baseRevision!==cutover.currentIdentity.sourceCommit || Date.parse(cutover.expiresAt)>Date.parse(input.expiresAt) ||
+        (requireFuture && Date.parse(cutover.expiresAt)<=this.now()) || Date.parse(cutover.restart.buildReady.verifiedAt)>this.now()) deny("Cutover approval exceeds exact local resource or validity");
+      planCutoverStart(cutover.stateRoot,cutover);
+    }
     return {repository:normalizeRepositoryKey(input.repository),goal:input.goal,role:input.role,
       scope:[...new Set(input.scope.map(physical))].sort(),baseRevision:input.baseRevision,
-      operations:[...new Set(input.operations)].sort(),expiresAt:new Date(input.expiresAt).toISOString()};
+      operations:[...new Set(input.operations)].sort(),expiresAt:new Date(input.expiresAt).toISOString(),...(cutover?{cutover}:{})};
   }
   private assertNarrower(parent: CarrierContract, child: CarrierContract) {
     if(parent.repository!==child.repository || parent.goal!==child.goal || parent.baseRevision!==child.baseRevision ||
@@ -374,5 +431,6 @@ export class CarrierBindingStore {
     if(!subject || !/^[a-f0-9]{64}$/.test(subject.requestHash) || !/^[A-Za-z0-9._:-]{1,160}$/.test(subject.operationId) ||
       !contract.operations.includes(subject.operation) || subject.baseRevision!==contract.baseRevision ||
       !contract.scope.some(root=>contains(root,physical(subject.workspaceRoot)))) deny("Effect exceeds paired authority");
+    if(contract.cutover && !isDeepStrictEqual(subject,planCutoverStart(contract.cutover.stateRoot,contract.cutover).subject)) deny("Effect differs from exact approved cutover request");
   }
 }

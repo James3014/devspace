@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { DurableOperationManager } from "./durable-operations.js";
+import { DurableOperationManager, planCutoverStart } from "./durable-operations.js";
 import { loadConfig } from "./config.js";
 import test from "node:test";
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
@@ -22,8 +22,87 @@ function fixture(completionBindings: readonly CarrierCompletionBinding[] = []) {
   store.redeem(controller,request.credential);
   const db=openDatabase(root);
   const snapshot=()=>JSON.stringify({validity:db.sqlite.prepare("select * from carrier_validity order by carrier_id").all(),bindings:db.sqlite.prepare("select * from carrier_bindings order by id").all(),effects:db.sqlite.prepare("select * from carrier_effect_bindings order by operation_id").all(),leases:db.sqlite.prepare("select * from control_plane_resource_leases order by lease_id").all()});
-  return {root,workspace,store,db,controller,worker,contract,request,approved,snapshot,advance:()=>{now+=120000;},close:()=>{db.close();store.close();rmSync(root,{recursive:true,force:true});}};
+  return {root,workspace,store,db,controller,worker,contract,request,approved,snapshot,advance:(ms=120000)=>{now+=ms;},clock:()=>now,close:()=>{db.close();store.close();rmSync(root,{recursive:true,force:true});}};
 }
+for(const expireLease of [false,true]) test(`local cutover approval binds execution and recovery (expired lease=${expireLease})`,async()=>{
+  const f=fixture();
+  try {
+    const context={clientId:"shared-oauth",sessionId:"cutover-controller"};
+    const pairing=f.store.requestPairing(context);
+    const cutover={stateRoot:f.root,attemptKey:"approved-cutover",
+      currentIdentity:{serverInstanceId:"original",sourceCommit:f.contract.baseRevision,buildId:"old",capabilityManifestSha256:"c".repeat(64)},
+      expectedIdentity:{sourceCommit:"b".repeat(40),buildId:"new",capabilityManifestSha256:"d".repeat(64)},
+      expiresAt:new Date(Date.parse(f.contract.expiresAt)-30000).toISOString(),
+      restart:{buildReady:{verifiedBy:"independent",verifiedAt:new Date(Date.parse(f.contract.expiresAt)-60000).toISOString(),evidence:"exact package digest"},actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"},
+      finish:{workspaceId:"ws_test",agentId:"agt_test"}};
+    const contract={...f.contract,scope:[f.root],operations:["cutover_start" as const],cutover};
+    const before=f.snapshot();
+    for(const invalid of [
+      {...contract,role:"worker" as const},
+      {...contract,scope:[f.workspace]},
+      {...contract,operations:["dependency_sync" as const],cutover},
+      {...contract,cutover:{...cutover,stateRoot:f.workspace}},
+      {...contract,cutover:{...cutover,expectedIdentity:{...cutover.expectedIdentity,capabilityManifestSha256:"invalid"}}},
+      {...contract,cutover:{...cutover,currentIdentity:{...cutover.currentIdentity,sourceCommit:"unverified"}}},
+      {...contract,cutover:{...cutover,expiresAt:new Date(Date.parse(contract.expiresAt)+1).toISOString()}},
+      {...contract,cutover:{...cutover,restart:{...cutover.restart,buildReady:{...cutover.restart.buildReady,evidence:""}}}},
+      {...contract,cutover:{...cutover,extraAuthority:true}},
+    ]) {
+      assert.throws(()=>f.store.approveLocal(pairing.pendingId,invalid));
+      assert.equal(f.snapshot(),before);
+    }
+    const approved=f.store.approveLocal(pairing.pendingId,contract);
+    f.store.redeem(context,pairing.credential);
+    const plan=planCutoverStart(f.root,cutover);
+    const lease=f.store.prepareEffect(context,plan.subject);
+    assert.equal(lease.operation,"cutover_start");
+    assert.throws(()=>f.store.prepareEffect(context,planCutoverStart(f.root,{...cutover,attemptKey:"other"}).subject));
+    assert.throws(()=>f.store.prepareEffect(context,planCutoverStart(f.root,{...cutover,expectedIdentity:{...cutover.expectedIdentity,buildId:"wrong"}}).subject));
+    const child=f.store.requestPairing(f.worker);
+    assert.throws(()=>f.store.delegate(context,child.pendingId,{...contract,role:"worker"}));
+    const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
+    const manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    let scheduled=0;
+    const actuator={actuator:"launchd-self" as const,serviceLabel:cutover.restart.serviceLabel,launchdTarget:cutover.restart.launchdTarget,schedule:()=>{scheduled++;return {scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:cutover.restart.serviceLabel,launchdTarget:cutover.restart.launchdTarget};}};
+    const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
+    try {
+      assert.throws(()=>manager.drainCutover(id,{...cutover.currentIdentity,serverInstanceId:"other"},()=>({activeSessions:0,oldestAgeMs:0}),context));
+      assert.equal(manager.drainCutover(id,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context).phase,"drained");
+      await assert.rejects(manager.restartCutover(id,cutover.currentIdentity,{...cutover.restart.buildReady,evidence:"wrong"},async()=>({buildReady:true,detail:"test"}),actuator,context));
+      await manager.restartCutover(id,cutover.currentIdentity,cutover.restart.buildReady,async()=>({buildReady:true,detail:"test"}),actuator,context);
+      await manager.restartCutover(id,cutover.currentIdentity,cutover.restart.buildReady,async()=>{throw new Error("replay must not probe");},actuator,context);
+      assert.equal(scheduled,1);
+      f.advance(40000);
+      assert.throws(()=>f.store.prepareEffect(context,plan.subject),/expired/);
+      await assert.rejects(manager.restartCutover(id,cutover.currentIdentity,cutover.restart.buildReady,async()=>({buildReady:true,detail:"test"}),actuator,context));
+    } finally {manager.close();}
+    const resumedStore=new CarrierBindingStore(f.root,f.clock);
+    const resumedManager=new DurableOperationManager(config,undefined,undefined,undefined,resumedStore.readers);
+    const successor={clientId:context.clientId,sessionId:"replacement-session"};
+    try {
+      if(expireLease) {
+        f.advance(40000);
+        resumedStore.reauthorizeLocal(approved.id,1,new Date(f.clock()+60000).toISOString());
+      }
+      assert.throws(()=>resumedStore.status(successor));
+      resumedStore.redeem(successor,pairing.credential);
+      const replacement={serverInstanceId:"replacement",...cutover.expectedIdentity};
+      const witness={workspaceQueryable:true,agentQueryable:true,agentReconciled:true,witnessWorkspaceId:cutover.finish.workspaceId,witnessAgentId:cutover.finish.agentId};
+      if(expireLease) {
+        await assert.rejects(resumedManager.finishCutover(id,replacement,cutover.finish,async()=>{throw new Error("expired lease must not consume witness");},successor),/expired/i);
+        assert.equal(resumedStore.readLease(successor,lease.leaseId).operationHandle,start.operationId);
+        assert.equal(scheduled,1);
+        return;
+      }
+      await assert.rejects(resumedManager.finishCutover(id,cutover.currentIdentity,cutover.finish,async()=>witness,successor));
+      await assert.rejects(resumedManager.finishCutover(id,replacement,{...cutover.finish,agentId:"wrong"},async()=>witness,successor));
+      assert.equal((await resumedManager.finishCutover(id,replacement,cutover.finish,async()=>witness,successor)).phase,"closed");
+      assert.equal((await resumedManager.finishCutover(id,replacement,cutover.finish,async()=>{throw new Error("no repeat witness");},successor)).phase,"closed");
+      assert.equal(resumedStore.readLease(successor,lease.leaseId).operationHandle,undefined);
+      assert.equal(scheduled,1);
+    } finally {resumedManager.close();resumedStore.close();}
+  } finally {f.close();}
+});
 test("completion readers remain paired, scoped and independent of candidate base",()=>{
   const selection={goal:"issue62",subject:"delivery",candidate:"b".repeat(40)};
   const readers={readContract:(s:typeof selection)=>({...s}),readEvidence:()=>[]};
