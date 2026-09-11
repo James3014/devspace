@@ -2,9 +2,10 @@ import { timingSafeEqual } from "node:crypto";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import {
   assertBounded, assertTaskState, ChatSwarmError, hashContent, hashCredential, isExecutionActive, isTerminal,
-  MAX_ID_BYTES, MAX_JSON_BYTES, MAX_PROMPT_BYTES, MAX_RESULT_BYTES, newId, requestHash,
+  MAX_ID_BYTES, MAX_JSON_BYTES, MAX_PROMPT_BYTES, MAX_RESULT_BYTES, newId, requestHash, joinRequestHash,
   type ChatSwarm, type ChatSwarmAttempt, type ChatSwarmRuntimeKind, type ChatSwarmTask,
   type ChatSwarmTaskState, type ChatSwarmWorker, type TaskRequest, type ReconciliationEvidence,
+  type ChatSwarmJoinRequest, type ChatSwarmJoinRequestStatus, JOIN_REQUEST_STATES,
 } from "./chat-swarm-contract.js";
 
 type Row = Record<string, unknown>;
@@ -42,7 +43,7 @@ export class ChatSwarmStore {
     const metadata = input.metadata ?? {};
     const metadataJson = json(metadata); assertBounded(metadataJson, MAX_JSON_BYTES, "metadata");
     const createdAt = now(); const id = input.id ?? newId("swarm");
-    this.sqlite.prepare(`insert into chat_swarms (id,status,owner_identity_fingerprint,worker_limit,invite_credential_hash,metadata_json,created_at,updated_at) values (?,?,?,?,?,?,?,?)`).run(id, "ACTIVE", owner, input.workerLimit, input.inviteCredential ? hashCredential(input.inviteCredential) : null, metadataJson, createdAt, createdAt);
+    this.sqlite.prepare(`insert into chat_swarms (id,status,owner_identity_fingerprint,worker_limit,invite_credential_hash,metadata_json,revision,created_at,updated_at) values (?,?,?,?,?,?,?,?,?)`).run(id, "ACTIVE", owner, input.workerLimit, input.inviteCredential ? hashCredential(input.inviteCredential) : null, metadataJson, 1, createdAt, createdAt);
     return this.getSwarm(id)!;
   }
   getSwarm(id: string): ChatSwarm | undefined { const row = this.sqlite.prepare("select * from chat_swarms where id = ?").get(id) as Row | undefined; return row && swarmFrom(row); }
@@ -251,6 +252,212 @@ export class ChatSwarmStore {
   }
   private requireTask(id: string): ChatSwarmTask { const task = this.getTask(id); if (!task) throw new ChatSwarmError("NOT_FOUND", `task '${id}' not found`); return task; }
   private requireWorker(id: string): ChatSwarmWorker { const worker = this.getWorker(id); if (!worker) throw new ChatSwarmError("NOT_FOUND", `worker '${id}' not found`); return worker; }
+  createJoinRequestAtomic(input: {
+    swarmId: string;
+    attemptKey: string;
+    requesterFingerprint: string;
+    label: string;
+    ttlSeconds?: number;
+  }): { request: ChatSwarmJoinRequest; created: boolean } {
+    assertBounded(input.attemptKey, MAX_ID_BYTES, "attemptKey");
+    assertBounded(input.label, MAX_ID_BYTES, "label");
+    if (!/^[0-9a-f]{64}$/.test(input.requesterFingerprint)) {
+      throw new ChatSwarmError("INVALID_INPUT", "requesterFingerprint must be a SHA-256 fingerprint");
+    }
+    const hash = joinRequestHash({
+      swarmId: input.swarmId,
+      label: input.label,
+      requesterFingerprint: input.requesterFingerprint,
+    });
+    const operation = this.sqlite.transaction(() => {
+      const swarm = this.getSwarm(input.swarmId);
+      if (!swarm) throw new ChatSwarmError("NOT_FOUND", "swarm not found");
+      if (swarm.status !== "ACTIVE") throw new ChatSwarmError("INVALID_STATE", "swarm is not active");
+
+      const timestamp = now();
+      // Lazy expiry of stale pending requests during consequential write
+      this.sqlite
+        .prepare("update chat_swarm_join_requests set status = 'EXPIRED' where status = 'PENDING' and expires_at <= ?")
+        .run(timestamp);
+
+      const existingRow = this.sqlite
+        .prepare("select * from chat_swarm_join_requests where swarm_id = ? and attempt_key = ?")
+        .get(input.swarmId, input.attemptKey) as Row | undefined;
+
+      if (existingRow) {
+        const existing = joinRequestFrom(existingRow);
+        if (existing.requestHash !== hash) {
+          throw new ChatSwarmError("REPLAY_CONFLICT", "join request attemptKey is bound to different inputs");
+        }
+        return { request: existing, created: false };
+      }
+
+      // Check active unexpired pending requests count for this peer
+      const pendingCountRow = this.sqlite
+        .prepare("select count(*) as count from chat_swarm_join_requests where swarm_id = ? and requester_fingerprint = ? and status = 'PENDING' and expires_at > ?")
+        .get(input.swarmId, input.requesterFingerprint, timestamp) as { count: number };
+      if (Number(pendingCountRow.count) >= 10) {
+        throw new ChatSwarmError("CAPACITY_FULL", "too many pending join requests for this peer");
+      }
+
+      const id = newId("joinreq");
+      const ttl = (input.ttlSeconds && input.ttlSeconds > 0) ? input.ttlSeconds : 900;
+      const expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
+
+      this.sqlite
+        .prepare(`
+          insert into chat_swarm_join_requests (
+            id, swarm_id, attempt_key, request_hash, requester_fingerprint,
+            label, version, status, approved_worker_id, requested_at, expires_at, approved_at
+          ) values (?, ?, ?, ?, ?, ?, 1, 'PENDING', null, ?, ?, null)
+        `)
+        .run(id, input.swarmId, input.attemptKey, hash, input.requesterFingerprint, input.label, timestamp, expiresAt);
+
+      return { request: this.getJoinRequest(id)!, created: true };
+    });
+    return operation.immediate();
+  }
+
+  getJoinRequest(id: string): ChatSwarmJoinRequest | undefined {
+    const row = this.sqlite.prepare("select * from chat_swarm_join_requests where id = ?").get(id) as Row | undefined;
+    return row && joinRequestFrom(row);
+  }
+
+  getJoinRequestByAttemptKey(swarmId: string, attemptKey: string): ChatSwarmJoinRequest | undefined {
+    const row = this.sqlite.prepare("select * from chat_swarm_join_requests where swarm_id = ? and attempt_key = ?").get(swarmId, attemptKey) as Row | undefined;
+    return row && joinRequestFrom(row);
+  }
+
+  listPendingJoinRequests(swarmId: string, limit = 50, cursor?: string, effectiveNow = new Date().toISOString()): ChatSwarmJoinRequest[] {
+    const safeLimit = Math.max(1, Math.min(limit, 100));
+    const query = cursor
+      ? "select * from chat_swarm_join_requests where swarm_id = ? and status = 'PENDING' and expires_at > ? and id > ? order by id asc limit ?"
+      : "select * from chat_swarm_join_requests where swarm_id = ? and status = 'PENDING' and expires_at > ? order by id asc limit ?";
+    const rows = (cursor
+      ? this.sqlite.prepare(query).all(swarmId, effectiveNow, cursor, safeLimit)
+      : this.sqlite.prepare(query).all(swarmId, effectiveNow, safeLimit)) as Row[];
+    return rows.map(joinRequestFrom);
+  }
+
+  getWorkerByFingerprint(swarmId: string, fingerprint: string): ChatSwarmWorker | undefined {
+    const row = this.sqlite
+      .prepare("select * from chat_swarm_workers where swarm_id = ? and carrier_conversation_fingerprint = ? limit 1")
+      .get(swarmId, fingerprint) as Row | undefined;
+    return row && workerFrom(row);
+  }
+
+  getLatestJoinRequestByFingerprint(swarmId: string, fingerprint: string, effectiveNow = new Date().toISOString()): ChatSwarmJoinRequest | undefined {
+    const row = this.sqlite
+      .prepare("select * from chat_swarm_join_requests where swarm_id = ? and requester_fingerprint = ? and status = 'PENDING' and expires_at > ? order by requested_at desc, id desc limit 1")
+      .get(swarmId, fingerprint, effectiveNow) as Row | undefined;
+    return row && joinRequestFrom(row);
+  }
+
+  approveJoinRequestAtomic(input: {
+    swarmId: string;
+    requestId: string;
+    expectedRequestVersion: number;
+    expectedSwarmVersion: number;
+  }): { request: ChatSwarmJoinRequest; worker: ChatSwarmWorker } {
+    assertBounded(input.requestId, MAX_ID_BYTES, "requestId");
+    if (!Number.isInteger(input.expectedSwarmVersion) || input.expectedSwarmVersion < 1) {
+      throw new ChatSwarmError("INVALID_INPUT", "expectedSwarmVersion must be a positive integer");
+    }
+    const operation = this.sqlite.transaction(() => {
+      const swarmRow = this.sqlite
+        .prepare("select * from chat_swarms where id = ? and status = 'ACTIVE'")
+        .get(input.swarmId) as Row | undefined;
+      if (!swarmRow) throw new ChatSwarmError("NOT_FOUND", "swarm not found or not active");
+
+      const currentSwarmRevision = Number(swarmRow.revision ?? 1);
+      if (currentSwarmRevision !== input.expectedSwarmVersion) {
+        throw new ChatSwarmError("CAS_DRIFT", `swarm revision mismatch: expected ${input.expectedSwarmVersion} but found ${currentSwarmRevision}`);
+      }
+
+      const reqRow = this.sqlite
+        .prepare("select * from chat_swarm_join_requests where id = ? and swarm_id = ?")
+        .get(input.requestId, input.swarmId) as Row | undefined;
+      if (!reqRow) throw new ChatSwarmError("REQUEST_NOT_FOUND", "join request not found in swarm");
+
+      const request = joinRequestFrom(reqRow);
+
+      if (request.status === "APPROVED") {
+        if (request.approvedWorkerId) {
+          const existingWorker = this.getWorker(request.approvedWorkerId);
+          if (existingWorker) {
+            return { request, worker: existingWorker };
+          }
+        }
+      }
+
+      if (request.status === "EXPIRED") {
+        throw new ChatSwarmError("EXPIRED", "join request has expired");
+      }
+
+      if (request.status !== "PENDING") {
+        throw new ChatSwarmError("INVALID_STATE", `join request status is '${request.status}'`);
+      }
+
+      const timestamp = now();
+      if (new Date(request.expiresAt).getTime() <= new Date(timestamp).getTime()) {
+        this.sqlite
+          .prepare("update chat_swarm_join_requests set status = 'EXPIRED' where id = ? and status = 'PENDING'")
+          .run(request.id);
+        throw new ChatSwarmError("EXPIRED", "join request has expired");
+      }
+
+      if (request.version !== input.expectedRequestVersion) {
+        throw new ChatSwarmError("VERSION_CONFLICT", `expected request version ${input.expectedRequestVersion} but found ${request.version}`);
+      }
+
+      const workerCountRow = this.sqlite
+        .prepare("select count(*) as count from chat_swarm_workers where swarm_id = ?")
+        .get(input.swarmId) as { count: number };
+      const currentWorkerCount = Number(workerCountRow.count);
+
+      let worker = this.getWorkerByFingerprint(input.swarmId, request.requesterFingerprint);
+      if (!worker) {
+        if (currentWorkerCount >= Number(swarmRow.worker_limit)) {
+          throw new ChatSwarmError("CAPACITY_FULL", "swarm worker limit reached");
+        }
+        const workerId = newId("worker");
+        this.sqlite
+          .prepare(`
+            insert into chat_swarm_workers (
+              id, swarm_id, label, runtime_kind, session_identity_fingerprint,
+              carrier_conversation_fingerprint, lifecycle_state, current_task_id,
+              lease_json, checkpoint_json, continuation_epoch, created_at, updated_at
+            ) values (?, ?, ?, 'mcp_peer', null, ?, 'AVAILABLE', null, null, null, 0, ?, ?)
+          `)
+          .run(workerId, input.swarmId, request.label, request.requesterFingerprint, timestamp, timestamp);
+        worker = this.getWorker(workerId)!;
+      }
+
+      const newVersion = request.version + 1;
+      const updateResult = this.sqlite
+        .prepare(`
+          update chat_swarm_join_requests
+          set status = 'APPROVED', version = ?, approved_worker_id = ?, approved_at = ?
+          where id = ? and version = ? and status = 'PENDING'
+        `)
+        .run(newVersion, worker.id, timestamp, request.id, request.version);
+
+      if (updateResult.changes === 0) {
+        throw new ChatSwarmError("VERSION_CONFLICT", "concurrent update conflict on join request");
+      }
+
+      const updateSwarm = this.sqlite
+        .prepare("update chat_swarms set revision = revision + 1, updated_at = ? where id = ? and revision = ?")
+        .run(timestamp, input.swarmId, currentSwarmRevision);
+
+      if (updateSwarm.changes === 0) {
+        throw new ChatSwarmError("CAS_DRIFT", "concurrent update conflict on swarm revision");
+      }
+
+      return { request: this.getJoinRequest(request.id)!, worker };
+    });
+    return operation.immediate();
+  }
   recoverAfterRestart(): number {
     const timestamp = now();
     const operation = this.sqlite.transaction(() => {
@@ -265,7 +472,27 @@ export class ChatSwarmStore {
   }
 }
 
-function swarmFrom(row: Row): ChatSwarm { const status = String(row.status); if (status !== "ACTIVE" && status !== "CLOSED") throw new ChatSwarmError("INVALID_STATE", `unknown swarm state '${status}'`); return { id: String(row.id), status, ownerIdentityFingerprint: String(row.owner_identity_fingerprint), workerLimit: Number(row.worker_limit), inviteCredentialHash: row.invite_credential_hash == null ? undefined : String(row.invite_credential_hash), metadata: parseObject(row.metadata_json, "swarm metadata") ?? {}, createdAt: String(row.created_at), updatedAt: String(row.updated_at) }; }
+function swarmFrom(row: Row): ChatSwarm { const status = String(row.status); if (status !== "ACTIVE" && status !== "CLOSED") throw new ChatSwarmError("INVALID_STATE", `unknown swarm state '${status}'`); return { id: String(row.id), status, ownerIdentityFingerprint: String(row.owner_identity_fingerprint), workerLimit: Number(row.worker_limit), inviteCredentialHash: row.invite_credential_hash == null ? undefined : String(row.invite_credential_hash), metadata: parseObject(row.metadata_json, "swarm metadata") ?? {}, revision: Number(row.revision ?? 1), createdAt: String(row.created_at), updatedAt: String(row.updated_at) }; }
 function workerFrom(row: Row): ChatSwarmWorker { const lifecycleState = String(row.lifecycle_state); if (!(WORKER_STATES as readonly string[]).includes(lifecycleState)) throw new ChatSwarmError("INVALID_STATE", `unknown worker state '${lifecycleState}'`); return { id: String(row.id), swarmId: String(row.swarm_id), label: String(row.label), runtimeKind: String(row.runtime_kind), sessionIdentityFingerprint: row.session_identity_fingerprint == null ? undefined : String(row.session_identity_fingerprint), carrierConversationFingerprint: row.carrier_conversation_fingerprint == null ? undefined : String(row.carrier_conversation_fingerprint), lifecycleState: lifecycleState as ChatSwarmWorker["lifecycleState"], currentTaskId: row.current_task_id == null ? undefined : String(row.current_task_id), lease: parseObject(row.lease_json, "worker lease"), checkpoint: parseObject(row.checkpoint_json, "worker checkpoint"), continuationEpoch: Number(row.continuation_epoch), createdAt: String(row.created_at), updatedAt: String(row.updated_at) }; }
 function taskFrom(row: Row): ChatSwarmTask { const state = String(row.lifecycle_state); assertTaskState(state); const payload = parseObject(row.payload_json, "task payload"); const reconciliation = parseObject(row.reconciliation_json, "reconciliation"); return { id: String(row.id), swarmId: String(row.swarm_id), taskKey: String(row.task_key), requestHash: String(row.request_hash), prompt: String(row.prompt), payload: payload ?? {}, preferredWorkerId: row.preferred_worker_id == null ? undefined : String(row.preferred_worker_id), assignedWorkerId: row.assigned_worker_id == null ? undefined : String(row.assigned_worker_id), lifecycleState: state, result: row.result == null ? undefined : String(row.result), errorCode: row.error_code == null ? undefined : String(row.error_code), errorMessage: row.error_message == null ? undefined : String(row.error_message), retrySafe: row.retry_safe === "true", reconciliation, createdAt: String(row.created_at), updatedAt: String(row.updated_at), completedAt: row.completed_at == null ? undefined : String(row.completed_at), collectedAt: row.collected_at == null ? undefined : String(row.collected_at) }; }
 export function attemptFrom(row: Row): ChatSwarmAttempt { const effectState = String(row.effect_state); if (!(EFFECT_STATES as readonly string[]).includes(effectState)) throw new ChatSwarmError("INVALID_STATE", `unknown attempt effect state '${effectState}'`); return { id: String(row.id), taskId: String(row.task_id), attemptNumber: Number(row.attempt_number), runtimeKind: String(row.runtime_kind), effectState, runtimeReceipt: parseObject(row.runtime_receipt_json, "attempt receipt"), startedAt: row.started_at == null ? undefined : String(row.started_at), acknowledgedAt: row.acknowledged_at == null ? undefined : String(row.acknowledged_at), finishedAt: row.finished_at == null ? undefined : String(row.finished_at), createdAt: String(row.created_at) }; }
+function joinRequestFrom(row: Row): ChatSwarmJoinRequest {
+  const status = String(row.status);
+  if (!(JOIN_REQUEST_STATES as readonly string[]).includes(status)) {
+    throw new ChatSwarmError("INVALID_STATE", `unknown join request status '${status}'`);
+  }
+  return {
+    id: String(row.id),
+    swarmId: String(row.swarm_id),
+    attemptKey: String(row.attempt_key),
+    requestHash: String(row.request_hash),
+    requesterFingerprint: String(row.requester_fingerprint),
+    label: String(row.label),
+    version: Number(row.version),
+    status: status as ChatSwarmJoinRequestStatus,
+    approvedWorkerId: row.approved_worker_id == null ? undefined : String(row.approved_worker_id),
+    requestedAt: String(row.requested_at),
+    expiresAt: String(row.expires_at),
+    approvedAt: row.approved_at == null ? undefined : String(row.approved_at),
+  };
+}

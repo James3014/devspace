@@ -16,7 +16,7 @@ export type ChatSwarmRuntimeKind = "mcp_peer" | "opencli_web" | "openai_api" | (
 
 export interface ChatSwarm {
   id: string; status: ChatSwarmStatus; ownerIdentityFingerprint: string; workerLimit: number;
-  inviteCredentialHash?: string; metadata: Record<string, unknown>; createdAt: string; updatedAt: string;
+  inviteCredentialHash?: string; metadata: Record<string, unknown>; revision: number; createdAt: string; updatedAt: string;
 }
 export interface ChatSwarmWorker {
   id: string; swarmId: string; label: string; runtimeKind: ChatSwarmRuntimeKind;
@@ -48,9 +48,92 @@ export interface ReconciliationEvidence {
   evidenceRef: string;
 }
 
+export const JOIN_REQUEST_STATES = ["PENDING", "APPROVED", "EXPIRED"] as const;
+export type ChatSwarmJoinRequestStatus = (typeof JOIN_REQUEST_STATES)[number];
+
+export interface ChatSwarmJoinRequest {
+  id: string;
+  swarmId: string;
+  attemptKey: string;
+  requestHash: string;
+  requesterFingerprint: string;
+  label: string;
+  version: number;
+  status: ChatSwarmJoinRequestStatus;
+  approvedWorkerId?: string;
+  requestedAt: string;
+  expiresAt: string;
+  approvedAt?: string;
+}
+
+export const SWARM_ERROR_CODES = [
+  "INVALID_INPUT",
+  "REPLAY_CONFLICT",
+  "NOT_FOUND",
+  "OWNERSHIP_CONFLICT",
+  "INVALID_STATE",
+  "TERMINAL_IMMUTABLE",
+  "RECONCILIATION_REQUIRED",
+  "HOST_REPORTED_ACTION_BLOCK",
+  "HOST_CONVERSATION_UNSUPPORTED",
+  "TOOL_SCHEMA_STALE",
+  "TRANSPORT_UNKNOWN",
+  "IDENTITY_MISSING",
+  "IDENTITY_AMBIGUOUS",
+  "IDENTITY_MALFORMED",
+  "INVITE_EXPIRED",
+  "OWNER_MISMATCH",
+  "VERSION_CONFLICT",
+  "CAS_DRIFT",
+  "CAPACITY_FULL",
+  "REQUEST_EXPIRED",
+  "EXPIRED",
+  "REQUEST_NOT_FOUND",
+] as const;
+export type ChatSwarmErrorCode = (typeof SWARM_ERROR_CODES)[number];
+
+export type ChatSwarmErrorLayer = "contract" | "store" | "coordinator" | "transport" | "host";
+export type ChatSwarmErrorStage = "received" | "identity_validated" | "admission_denied" | "committed" | "response_produced";
+
+export interface ChatSwarmErrorDetails {
+  code: ChatSwarmErrorCode;
+  layer: ChatSwarmErrorLayer;
+  stage: ChatSwarmErrorStage;
+  operation?: string;
+  message: string;
+}
+
 export class ChatSwarmError extends Error {
-  constructor(readonly code: "INVALID_INPUT" | "REPLAY_CONFLICT" | "NOT_FOUND" | "OWNERSHIP_CONFLICT" | "INVALID_STATE" | "TERMINAL_IMMUTABLE" | "RECONCILIATION_REQUIRED", message: string) {
-    super(message); this.name = "ChatSwarmError";
+  readonly code: ChatSwarmErrorCode;
+  readonly layer: ChatSwarmErrorLayer;
+  readonly stage: ChatSwarmErrorStage;
+  readonly operation?: string;
+
+  constructor(
+    code: ChatSwarmErrorCode,
+    message: string,
+    options?: {
+      layer?: ChatSwarmErrorLayer;
+      stage?: ChatSwarmErrorStage;
+      operation?: string;
+    },
+  ) {
+    super(message);
+    this.name = "ChatSwarmError";
+    this.code = code;
+    this.layer = options?.layer ?? "coordinator";
+    this.stage = options?.stage ?? "admission_denied";
+    this.operation = options?.operation;
+  }
+
+  toDetails(): ChatSwarmErrorDetails {
+    return {
+      code: this.code,
+      layer: this.layer,
+      stage: this.stage,
+      operation: this.operation,
+      message: this.message,
+    };
   }
 }
 
@@ -67,6 +150,14 @@ export function canonicalize(value: unknown): unknown {
 export function requestHash(request: Pick<TaskRequest, "prompt"> & Partial<Pick<TaskRequest, "payload" | "preferredWorkerId" | "swarmId" | "taskKey">>): string {
   return createHash("sha256").update(JSON.stringify(canonicalize({
     prompt: request.prompt, payload: request.payload ?? {}, preferredWorkerId: request.preferredWorkerId ?? null,
+  }))).digest("hex");
+}
+
+export function joinRequestHash(input: { swarmId: string; label: string; requesterFingerprint: string }): string {
+  return createHash("sha256").update(JSON.stringify(canonicalize({
+    swarmId: input.swarmId,
+    label: input.label,
+    requesterFingerprint: input.requesterFingerprint,
   }))).digest("hex");
 }
 

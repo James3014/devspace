@@ -23,8 +23,23 @@ test("registers ten typed swarm tools and disabled config registers none", async
     assert.equal(registerChatSwarmTools(disabled, { coordinator: f.coordinator, config: { ...config, chatSwarmEnabled: false }, authorizeInvite: () => true }), 0);
     assert.deepEqual(Object.keys(tools(disabled)), []);
     const server = new McpServer({ name: "enabled", version: "1" });
-    assert.equal(registerChatSwarmTools(server, { coordinator: f.coordinator, config, authorizeInvite: () => true }), 10);
-    assert.deepEqual(Object.keys(tools(server)).sort(), ["chat_swarm_cancel", "chat_swarm_close", "chat_swarm_collect", "chat_swarm_create", "chat_swarm_dispatch", "chat_swarm_join", "chat_swarm_next", "chat_swarm_reconcile", "chat_swarm_status", "chat_swarm_submit"]);
+    assert.equal(registerChatSwarmTools(server, { coordinator: f.coordinator, config, authorizeInvite: () => true }), 14);
+    assert.deepEqual(Object.keys(tools(server)).sort(), [
+      "chat_swarm_approve_join",
+      "chat_swarm_cancel",
+      "chat_swarm_close",
+      "chat_swarm_collect",
+      "chat_swarm_create",
+      "chat_swarm_dispatch",
+      "chat_swarm_inspect",
+      "chat_swarm_join",
+      "chat_swarm_join_request",
+      "chat_swarm_next",
+      "chat_swarm_peer_status",
+      "chat_swarm_reconcile",
+      "chat_swarm_status",
+      "chat_swarm_submit",
+    ]);
     assert.throws(() => tools(server).chat_swarm_submit.inputSchema.parse({ workerId: "w", taskId: "t", result: "x".repeat(config.chatSwarmResultMaxChars + 1) }));
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const client = new Client({ name: "swarm-tools-client", version: "1" });
