@@ -65,7 +65,8 @@ export function requestIp(req: Request, trustProxy: boolean | number): string | 
 }
 
 export function requestPath(req: Request): string {
-  return req.path || req.url.split("?")[0] || req.url;
+  const url = req.originalUrl || req.url || req.path || "/";
+  return url.split("?")[0] || "/";
 }
 
 export function sessionIdPrefix(sessionId: string | undefined): string | undefined {

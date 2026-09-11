@@ -280,7 +280,7 @@ test("native tools are opt-in and exactly read-only when enabled", async () => {
 });
 
 const EXTRACTED_ENGINE_ROOT = "/Users/jameschen/Workspace/repository-intelligence-engine";
-const EXTRACTED_ENGINE_HEAD = "a8b9a00a6f3ea3e9ade0c6ef494d0fa88a2d73b2";
+const EXTRACTED_ENGINE_HEAD = "282e26255577dde2c4d542f75ee12628c9b55490";
 
 if (existsSync(join(EXTRACTED_ENGINE_ROOT, ".git"))) {
   test("live integration binds the productized Repository Intelligence engine HEAD", async () => {

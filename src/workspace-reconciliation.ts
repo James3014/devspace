@@ -41,29 +41,24 @@ const GIT_TIMEOUT_MS = 5_000;
 
 function runGit(args: string[], cwd: string): Promise<GitExecResult> {
   return new Promise((resolvePromise) => {
-    let completed = false;
-    let timer: NodeJS.Timeout | undefined;
-    const child = execFile(
-      "git",
-      args,
-      { cwd, env: { ...process.env, GIT_TERMINAL_PROMPT: "0" }, maxBuffer: 10 * 1024 * 1024 },
-      (error, stdout) => {
-        if (completed) return;
-        completed = true;
-        if (timer) clearTimeout(timer);
-        resolvePromise({ ok: !error, stdout: stdout ?? "" });
-      },
-    );
-    timer = setTimeout(() => {
-      if (completed) return;
-      completed = true;
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        // best-effort
-      }
+    try {
+      execFile(
+        "git",
+        args,
+        {
+          cwd,
+          env: { ...process.env, GIT_TERMINAL_PROMPT: "0" },
+          maxBuffer: 10 * 1024 * 1024,
+          timeout: GIT_TIMEOUT_MS,
+          killSignal: "SIGKILL",
+        },
+        (error, stdout) => {
+          resolvePromise({ ok: !error, stdout: stdout ?? "" });
+        },
+      );
+    } catch {
       resolvePromise({ ok: false, stdout: "" });
-    }, GIT_TIMEOUT_MS);
+    }
   });
 }
 
