@@ -7,6 +7,7 @@ import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import {
   AcpLocalAgentDriver,
   AcpRuntime,
+  appendAcpQueueValue,
   acpCommandArgs,
   resolveAcpCommand,
   selectAcpPermissionOption,
@@ -204,6 +205,175 @@ await closeOnlyRuntime.close();
     { sessionId, configId: "model", value: requestedModel },
   ]);
   assert.equal(calls.filter(({ method }) => method === "session/prompt").length, 1);
+}
+
+// ACP output retention keeps authoritative assistant text separate from bounded
+// disposable previews and reports suppression through both result items and the
+// opt-in diagnostic surface.
+{
+  const boundedQueues = new Map<string, { values: unknown[] }>();
+  const observations: Array<Record<string, unknown>> = [];
+  const boundedConnection = {
+    agent: {
+      async request(method: string, params?: unknown): Promise<unknown> {
+        const sessionId = (params as { sessionId?: string } | undefined)?.sessionId ?? "bounded-session";
+        if (method === "session/new") {
+          boundedQueues.set(sessionId, { values: [] });
+          return { sessionId };
+        }
+        if (method === "session/prompt") {
+          const queue = boundedQueues.get(sessionId);
+          for (let index = 0; index < 10_001; index += 1) {
+            appendAcpQueueValue(queue!, {
+              update: {
+                sessionUpdate: "plan",
+                content: { type: "text", text: `preview-${index}` },
+              },
+            });
+          }
+          appendAcpQueueValue(queue!, {
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: { type: "text", text: "authoritative final" },
+            },
+          });
+          return { stopReason: "end_turn" };
+        }
+        return {};
+      },
+    },
+    close() {},
+    closed: new Promise<void>(() => undefined),
+  };
+  const boundedRuntime = new AcpRuntime({
+    provider: "cursor",
+    command: "cursor-agent",
+    args: ["acp"],
+    env: {},
+    capabilities: { resume: false, close: false },
+    queues: boundedQueues,
+    diagnosticObserver: (observation) => { observations.push(observation as unknown as Record<string, unknown>); },
+  }, boundedConnection);
+  const boundedResult = await boundedRuntime.run({ prompt: "bounded", workspaceRoot: "/tmp/project" });
+  assert.equal(boundedResult.isOk(), true);
+  if (boundedResult.isErr()) throw boundedResult.error;
+  assert.equal(boundedResult.value.finalResponse, "authoritative final");
+  const retentionItem = boundedResult.value.items.at(-1) as Record<string, unknown>;
+  assert.equal(retentionItem.kind, "devspace_acp_output_retention");
+  assert.equal((retentionItem.previewSuppressedItems as number) > 0, true);
+  assert.equal(observations.length, 1);
+  const retention = observations[0].outputRetention as Record<string, unknown>;
+  assert.equal((retention.previewSuppressedItems as number) > 0, true);
+  assert.equal(retention.requiredOutputTruncated, false);
+  assert.doesNotMatch(JSON.stringify(observations[0]), /preview-10000/);
+  await boundedRuntime.close();
+}
+
+// Required assistant text is bounded in UTF-8 bytes, coalesced into one part,
+// and an overflow is an explicit protocol failure rather than partial success.
+{
+  const requiredQueues = new Map<string, { values: unknown[] }>();
+  const requiredConnection = {
+    agent: {
+      async request(method: string, params?: unknown): Promise<unknown> {
+        const sessionId = (params as { sessionId?: string } | undefined)?.sessionId ?? "required-session";
+        if (method === "session/new") {
+          requiredQueues.set(sessionId, { values: [] });
+          return { sessionId };
+        }
+        if (method === "session/prompt") {
+          const queue = requiredQueues.get(sessionId)!;
+          const prompt = (params as { prompt?: Array<{ text?: string }> } | undefined)?.prompt?.[0]?.text;
+          if (prompt === "exact") {
+            appendAcpQueueValue(queue, {
+              update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "a".repeat(1_048_574) } },
+            });
+            appendAcpQueueValue(queue, {
+              update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "é" } },
+            });
+            appendAcpQueueValue(queue, {
+              update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "" } },
+            });
+            return { stopReason: "end_turn" };
+          }
+          appendAcpQueueValue(queue, {
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "a".repeat(1_048_575) } },
+          });
+          appendAcpQueueValue(queue, {
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "é" } },
+          });
+          return { stopReason: "end_turn" };
+        }
+        return {};
+      },
+    },
+    close() {},
+    closed: new Promise<void>(() => undefined),
+  };
+  const requiredRuntime = new AcpRuntime({
+    provider: "cursor",
+    command: "cursor-agent",
+    args: ["acp"],
+    env: {},
+    capabilities: { resume: false, close: false },
+    queues: requiredQueues,
+  }, requiredConnection);
+  const exactResult = await requiredRuntime.run({ prompt: "exact", workspaceRoot: "/tmp/project" });
+  assert.equal(exactResult.isOk(), true);
+  if (exactResult.isOk()) assert.equal(Buffer.byteLength(exactResult.value.finalResponse, "utf8"), 1_048_576);
+  const requiredResult = await requiredRuntime.run({ prompt: "required", workspaceRoot: "/tmp/project" });
+  assert.equal(requiredResult.isErr(), true);
+  if (requiredResult.isErr()) {
+    assert.equal(requiredResult.error.code, "PROVIDER_PROTOCOL_ERROR");
+    assert.match(requiredResult.error.message, /requiredOutputBytes=1048575/);
+    assert.match(requiredResult.error.message, /requiredEvidenceBytes=0/);
+  }
+  await requiredRuntime.close();
+}
+
+// Unknown/non-text updates are required evidence. Exceeding their bounded
+// retention fails closed instead of treating them as disposable previews.
+{
+  const evidenceQueues = new Map<string, { values: unknown[] }>();
+  const evidenceConnection = {
+    agent: {
+      async request(method: string, params?: unknown): Promise<unknown> {
+        const sessionId = (params as { sessionId?: string } | undefined)?.sessionId ?? "evidence-session";
+        if (method === "session/new") {
+          evidenceQueues.set(sessionId, { values: [] });
+          return { sessionId };
+        }
+        if (method === "session/prompt") {
+          const queue = evidenceQueues.get(sessionId)!;
+          let deeplyNested: Record<string, unknown> = { leaf: true };
+          for (let depth = 0; depth < 256; depth += 1) deeplyNested = { child: deeplyNested };
+          appendAcpQueueValue(queue, { update: { sessionUpdate: "vendor_required_event", deeplyNested } });
+          for (let index = 0; index < 4_097; index += 1) {
+            appendAcpQueueValue(queue, { update: { sessionUpdate: "vendor_required_event", index } });
+          }
+          appendAcpQueueValue(queue, {
+            update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "must not succeed" } },
+          });
+          return { stopReason: "end_turn" };
+        }
+        return {};
+      },
+    },
+    close() {},
+    closed: new Promise<void>(() => undefined),
+  };
+  const evidenceRuntime = new AcpRuntime({
+    provider: "cursor",
+    command: "cursor-agent",
+    args: ["acp"],
+    env: {},
+    capabilities: { resume: false, close: false },
+    queues: evidenceQueues,
+  }, evidenceConnection);
+  const evidenceResult = await evidenceRuntime.run({ prompt: "evidence", workspaceRoot: "/tmp/project" });
+  assert.equal(evidenceResult.isErr(), true);
+  if (evidenceResult.isErr()) assert.match(evidenceResult.error.message, /requiredEvidenceItems=4096/);
+  await evidenceRuntime.close();
 }
 
 {

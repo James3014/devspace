@@ -61,6 +61,9 @@ class FakeRuntime implements LocalAgentRuntime {
       await callbacks?.onSessionId?.("thread_early");
       return Result.err(providerFailure("provider failed after session creation"));
     }
+    if (input.prompt.includes("log-secret")) {
+      return Result.err(providerFailure("provider failed token=synthetic-secret-value-9f3a"));
+    }
     if (input.prompt.includes("defect")) throw new TypeError("internal defect");
     if (input.prompt.includes("fail")) return Result.err(providerFailure("provider failed"));
     if (input.prompt.includes("hold")) {
@@ -69,7 +72,9 @@ class FakeRuntime implements LocalAgentRuntime {
     return Result.ok({
       provider: this.provider,
       providerSessionId: "thread_test",
-      finalResponse: `response:${input.prompt}`,
+      finalResponse: input.prompt.includes("secret")
+        ? "response Bearer synthetic-secret-value-9f3a OPENAI_API_KEY=synthetic-secret-value-9f3a"
+        : `response:${input.prompt}`,
       items: [],
     });
   }
@@ -115,6 +120,7 @@ function providerFailure(message: string): AgentProviderExecutionError {
 }
 
 const store = new LocalAgentStore(stateDir);
+const loggedFields: Record<string, unknown>[] = [];
 const stale = store.create({
   workspaceId: scope.workspaceId,
   workspaceRoot: root,
@@ -129,6 +135,7 @@ const manager = new LocalAgentManager({
   pool: new LocalAgentRuntimePool(),
   loadProfiles: async () => [profile, disabledProfile],
   allowedRoots: [root],
+  logger: (_level, _event, fields) => { loggedFields.push(fields); },
   subagents,
 });
 
@@ -263,6 +270,25 @@ const second = unwrap(await manager.start({
 await waitFor(() => getRecord(second.id).status === "idle");
 assert.notEqual(first.id, second.id);
 assert.equal(runtimes.size, 2, "different agents receive independent logical runtimes");
+
+const secretResult = unwrap(await manager.start({
+  target: "reviewer",
+  prompt: "secret response",
+  workspaceId: scope.workspaceId,
+  workspaceRoot: root,
+}));
+await waitFor(() => getRecord(secretResult.id).status === "idle");
+assert.doesNotMatch(getRecord(secretResult.id).latestResponse ?? "", /synthetic-secret-value-9f3a/);
+assert.match(getRecord(secretResult.id).latestResponse ?? "", /\[REDACTED\]/);
+
+const loggedSecret = unwrap(await manager.start({
+  target: "reviewer",
+  prompt: "log-secret fail",
+  workspaceId: scope.workspaceId,
+  workspaceRoot: root,
+}));
+await waitFor(() => getRecord(loggedSecret.id).status === "error");
+assert.equal(loggedFields.some((fields) => String(fields.error ?? "").includes("synthetic-secret-value-9f3a")), false);
 
 const failed = unwrap(await manager.start({
   target: "reviewer",

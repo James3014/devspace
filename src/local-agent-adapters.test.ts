@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import { delimiter } from "node:path";
 import {
   claudeCommandEnvironment,
+  AGY_MAX_STDERR_BYTES,
+  AGY_MAX_STDOUT_BYTES,
   createLocalAgentAdapter,
   extractOpenCodeFinalResponse,
   extractPiFinalResponse,
@@ -12,6 +14,7 @@ import {
 import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
 import { LocalAgentProviderError } from "./local-agent-runtime.js";
+import { AgentProviderProtocolError } from "./local-agent-errors.js";
 
 const providers: LocalAgentProvider[] = [
   "codex",
@@ -521,7 +524,32 @@ if (args.includes("--print")) {
     console.log(JSON.stringify({ status: "SUCCESS", conversation_id: "123" }));
     process.exit(0);
   }
+  if (prompt === "STDOUT_EXACT_LIMIT" || prompt === "STDOUT_UTF8_EXACT_LIMIT" || prompt === "STDOUT_OVER_LIMIT") {
+    const limit = Number(process.env.AGY_OUTPUT_LIMIT);
+    const base = { status: "SUCCESS", conversation_id: "boundary-conv-id", response: "" };
+    const responseBytes = limit - Buffer.byteLength(JSON.stringify(base), "utf8") + (prompt === "STDOUT_OVER_LIMIT" ? 1 : 0);
+    const response = prompt === "STDOUT_UTF8_EXACT_LIMIT"
+      ? "😀".repeat(Math.floor(responseBytes / 4)) + "x".repeat(responseBytes % 4)
+      : "x".repeat(responseBytes);
+    process.stdout.write(JSON.stringify({ ...base, response }));
+    process.exitCode = 0;
+  }
+  else if (prompt === "STDERR_EXACT_LIMIT") {
+    process.stderr.write("e".repeat(Number(process.env.AGY_ERROR_LIMIT)));
+    console.log(JSON.stringify({ status: "SUCCESS", conversation_id: "stderr-boundary", response: "stderr boundary ok" }));
+    process.exitCode = 0;
+  }
+  else if (prompt === "STDERR_OVER_LIMIT_SUCCESS") {
+    process.stderr.write("e".repeat(Number(process.env.AGY_ERROR_LIMIT) + 1));
+    console.log(JSON.stringify({ status: "SUCCESS", conversation_id: "stderr-over-limit", response: "stderr suppression preserved final" }));
+    process.exitCode = 0;
+  }
+  else if (prompt === "STDERR_OVER_LIMIT_FAILURE") {
+    process.stderr.write("e".repeat(Number(process.env.AGY_ERROR_LIMIT) + 1));
+    process.exitCode = 1;
+  }
 
+  else {
   const responseObj = {
     status: "SUCCESS",
     conversation_id: args.includes("--conversation") ? args[args.indexOf("--conversation") + 1] : "new-conv-id",
@@ -529,6 +557,7 @@ if (args.includes("--print")) {
   };
   console.log(JSON.stringify(responseObj));
   process.exit(0);
+  }
 }
 `;
 
@@ -580,6 +609,8 @@ try {
     DEVSPACE_OAUTH_OWNER_TOKEN: "DO_NOT_LEAK",
     DEVSPACE_OAUTH_SCOPES: "devspace",
     DEVSPACE_SENSITIVE_SECRET: "DO_NOT_LEAK",
+    AGY_OUTPUT_LIMIT: String(AGY_MAX_STDOUT_BYTES),
+    AGY_ERROR_LIMIT: String(AGY_MAX_STDERR_BYTES),
   };
   process.env = testEnv;
 
@@ -646,6 +677,13 @@ try {
     assert.match(result.finalResponse, /effort=,/);
   }
 
+  await assert.rejects(
+    () => adapter.run({ prompt: "required-start-failure", workspaceRoot: process.cwd() }, {
+      onExecutionStarted: () => { throw new Error("required execution callback failed"); },
+    }),
+    /required execution callback failed/,
+  );
+
   // C2. Byte-level heartbeat: streamed provider output must touch activity so
   // the idle supervisor cannot mistake a working provider for a hung one
   // (Nexus issue 731).
@@ -663,6 +701,68 @@ try {
     assert.ok(
       activityTouchTimes.length >= 2,
       `expected at least two mid-run activity touches from streamed output, got ${activityTouchTimes.length}`,
+    );
+  }
+
+  for (const observer of [
+    () => new Promise<void>(() => undefined),
+    async () => { throw new Error("best-effort observer rejected asynchronously"); },
+  ]) {
+    const result = await Promise.race([
+      adapter.run({ prompt: "STREAM_HEARTBEAT", workspaceRoot: process.cwd(), writeMode: "allowed" }, { onActivity: observer }),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Agy observer isolation timed out")), 6_000)),
+    ]);
+    assert.equal(result.provider, "agy");
+    assert.match(result.finalResponse, /streamed ok/);
+  }
+
+  // Bounded stdout/stderr retention: exact byte boundaries remain usable;
+  // overflow is machine-visible and cannot become a false successful result.
+  {
+    const exact = await adapter.run({ prompt: "STDOUT_EXACT_LIMIT", workspaceRoot: process.cwd() });
+    assert.equal(exact.providerSessionId, "boundary-conv-id");
+    assert.equal(Buffer.byteLength(JSON.stringify(exact.items[0]), "utf8"), AGY_MAX_STDOUT_BYTES);
+
+    const utf8Exact = await adapter.run({ prompt: "STDOUT_UTF8_EXACT_LIMIT", workspaceRoot: process.cwd() });
+    assert.equal(Buffer.byteLength(JSON.stringify(utf8Exact.items[0]), "utf8"), AGY_MAX_STDOUT_BYTES);
+    assert.match(utf8Exact.finalResponse, /😀/);
+
+    await assert.rejects(
+      () => adapter.run({ prompt: "STDOUT_OVER_LIMIT", workspaceRoot: process.cwd() }),
+      (error: unknown) => {
+        assert.ok(error instanceof AgentProviderProtocolError);
+        assert.equal(error.code, "PROVIDER_PROTOCOL_ERROR");
+        assert.equal(error.provider, "agy");
+        assert.equal(error.stdoutTruncated, true);
+        assert.equal(error.stdoutLimitBytes, AGY_MAX_STDOUT_BYTES);
+        assert.match(error.message, /AGY_STDOUT_TRUNCATED/);
+        return true;
+      },
+    );
+
+    const stderrExact = await adapter.run({ prompt: "STDERR_EXACT_LIMIT", workspaceRoot: process.cwd() });
+    assert.equal(stderrExact.providerSessionId, "stderr-boundary");
+
+    const stderrOver = await adapter.run({ prompt: "STDERR_OVER_LIMIT_SUCCESS", workspaceRoot: process.cwd() });
+    assert.equal(stderrOver.providerSessionId, "stderr-over-limit");
+    assert.equal(stderrOver.finalResponse, "stderr suppression preserved final");
+    assert.deepEqual(stderrOver.items[1], {
+      type: "agy_output_retention",
+      stdout: { limitBytes: AGY_MAX_STDOUT_BYTES, totalBytes: Buffer.byteLength(JSON.stringify(stderrOver.items[0]), "utf8") + 1, retainedBytes: Buffer.byteLength(JSON.stringify(stderrOver.items[0]), "utf8") + 1, truncated: false },
+      stderr: { limitBytes: AGY_MAX_STDERR_BYTES, totalBytes: AGY_MAX_STDERR_BYTES + 1, retainedBytes: AGY_MAX_STDERR_BYTES, truncated: true },
+    });
+
+    await assert.rejects(
+      () => adapter.run({ prompt: "STDERR_OVER_LIMIT_FAILURE", workspaceRoot: process.cwd() }),
+      (error: unknown) => {
+        assert.match(String(error), /Agy exited with non-zero code 1/);
+        assert.match(String(error), /AGY_STDERR_TRUNCATED/);
+        assert.ok(
+          Buffer.byteLength(String(error), "utf8") <= AGY_MAX_STDERR_BYTES + 256,
+          "stderr failure evidence must remain bounded",
+        );
+        return true;
+      },
     );
   }
 

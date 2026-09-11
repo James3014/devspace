@@ -44,6 +44,7 @@ import {
   AgentProviderFailureError,
   describeAgentProviderError,
   isAgentProviderError,
+  redactSensitiveText,
   type AgentProviderFailureDetails,
 } from "./local-agent-errors.js";
 import { validateOpencodeModelAndVariant, type OpencodeCatalogSnapshot } from "./local-agent-opencode-catalog.js";
@@ -1933,7 +1934,7 @@ export class LocalAgentSessionManager {
         workerToken,
         providerSessionId: result.providerSessionId ?? undefined,
         status: "idle",
-        latestResponse: result.finalResponse,
+        latestResponse: redactSensitiveText(result.finalResponse),
         error: scopeViolated
           ? `Agent wrote outside the declared write scope. Offending paths: ${scope.unexpectedPaths.join(", ")}`
           : undefined,
@@ -1943,7 +1944,8 @@ export class LocalAgentSessionManager {
         turnEndBaseline,
       });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
+      const originalMessage = error instanceof Error ? error.message : String(error);
+      const message = redactSensitiveText(originalMessage);
       const scope = await this.computeCumulativeScopeEvidence(agentId);
       const endState = await inspectWorkspacePhysicalState(
         this.store.getById(agentId)?.workspaceRoot ?? claimed.workspaceRoot,
@@ -1965,17 +1967,17 @@ export class LocalAgentSessionManager {
           model: error.model,
           variant: error.variant,
           providerSessionId: error.providerSessionId,
-          providerMessage: error.providerMessage ?? error.message,
+          providerMessage: redactSensitiveText(error.providerMessage ?? error.message),
         };
         providerSessionId = error.providerSessionId;
-        latestResponse = error.providerMessage;
+        latestResponse = error.providerMessage === undefined ? undefined : redactSensitiveText(error.providerMessage);
       } else if (isAgentProviderError(error)) {
         errorCode = error.code;
         errorRetryable = error.retryable;
         errorDetails = describeAgentProviderError(error);
       } else if (error instanceof LocalAgentProviderError) {
         providerSessionId = error.providerSessionId;
-        latestResponse = error.finalResponse;
+        latestResponse = error.finalResponse === undefined ? undefined : redactSensitiveText(error.finalResponse);
       }
 
       this.store.failTurnCAS({
@@ -1993,7 +1995,7 @@ export class LocalAgentSessionManager {
             ? "launch_failed"
             : isAgentProviderError(error) || error instanceof LocalAgentProviderError
               ? "provider_error"
-              : classifyProviderError(message),
+              : classifyProviderError(originalMessage),
         scopeState: scope.scopeState,
         cumulativeChangedPaths: scope.workerChangedPaths,
         turnEndBaseline: endState

@@ -47,6 +47,11 @@ function clineCliProviderId(context: LocalAgentRuntimeContext): ClineCliProvider
 }
 
 const MAX_ACP_QUEUE_ITEMS = 10_000;
+const MAX_ACP_QUEUE_BYTES = 8 * 1024 * 1024;
+const MAX_ACP_REQUIRED_OUTPUT_BYTES = 1 * 1024 * 1024;
+const MAX_ACP_REQUIRED_EVIDENCE_ITEMS = 4_096;
+const MAX_ACP_VALUE_ESTIMATE_DEPTH = 64;
+const MAX_ACP_VALUE_ESTIMATE_NODES = 100_000;
 const MAX_ACP_STDERR_BYTES = 32 * 1024;
 const ACP_INITIALIZE_TIMEOUT_MS = 10_000;
 const ACP_GROK_PROMPT_COMPLETION_TIMEOUT_MS = 10 * 60_000;
@@ -77,8 +82,27 @@ interface AcpCapabilities {
   additionalDirectories?: boolean;
 }
 
-interface AcpSessionQueue {
+export interface AcpSessionQueue {
   values: unknown[];
+  previewBytes?: number;
+  suppressedPreviewItems?: number;
+  suppressedPreviewBytes?: number;
+  requiredEvidence?: unknown[];
+  requiredEvidenceBytes?: number;
+  requiredOutputParts?: string[];
+  requiredOutputBytes?: number;
+  requiredOutputTruncated?: boolean;
+  requiredEvidenceTruncated?: boolean;
+}
+
+export interface AcpOutputRetentionSummary {
+  previewSuppressedItems: number;
+  previewSuppressedBytes: number;
+  requiredEvidenceItems: number;
+  requiredEvidenceBytes: number;
+  requiredOutputBytes: number;
+  requiredOutputTruncated: boolean;
+  requiredEvidenceTruncated: boolean;
 }
 
 export interface AcpDiagnosticObservation {
@@ -89,6 +113,7 @@ export interface AcpDiagnosticObservation {
   updateTypes: string[];
   updateContentTypes: string[];
   updateContentBytes: number;
+  outputRetention: AcpOutputRetentionSummary;
   classifiedErrorCode?: string;
 }
 
@@ -208,7 +233,7 @@ export class AcpRuntime implements LocalAgentRuntime {
         try {
           if (callbacks?.onActivity) this.activityCallbacks.set(sessionId, callbacks.onActivity);
           await callbacks?.onActivity?.();
-          queue.values.length = 0;
+          resetAcpQueue(queue);
           const standardResponse = this.connection.agent.request("session/prompt", {
             sessionId,
             prompt: [{ type: "text", text: input.prompt }],
@@ -227,7 +252,7 @@ export class AcpRuntime implements LocalAgentRuntime {
               { model: input.model, variant: input.effort },
               this.stderrTail?.(),
             );
-            this.emitDiagnostic(sessionId, undefined, queue.values, classified?.code);
+            this.emitDiagnostic(sessionId, undefined, queue.values, classified?.code, acpOutputRetention(queue));
             if (classified) throw classified;
             throw cause;
           }
@@ -237,7 +262,19 @@ export class AcpRuntime implements LocalAgentRuntime {
             this.grokCompletionRegistry?.markCompleted(sessionId, promptId);
           }
           const updates = queue.values.splice(0);
-          const finalResponse = extractAcpText(updates);
+          const retention = acpOutputRetention(queue);
+          if (retention.requiredOutputTruncated || retention.requiredEvidenceTruncated) {
+            this.emitDiagnostic(sessionId, response, updates, "PROVIDER_PROTOCOL_ERROR", retention);
+            throw new AgentProviderProtocolError({
+              code: "PROVIDER_PROTOCOL_ERROR",
+              provider: this.provider,
+              operation: "run",
+              retryable: false,
+              cause: retention,
+              message: `${this.provider} ACP output exceeded the bounded required-evidence retention limit (requiredOutputBytes=${retention.requiredOutputBytes}, requiredEvidenceBytes=${retention.requiredEvidenceBytes}, requiredEvidenceItems=${retention.requiredEvidenceItems}).`,
+            });
+          }
+          const finalResponse = extractAcpText(queue.requiredOutputParts ?? [], updates);
           if (!finalResponse) {
             const classified = classifyAcpError(
               response,
@@ -246,7 +283,7 @@ export class AcpRuntime implements LocalAgentRuntime {
               { model: input.model, variant: input.effort },
               this.stderrTail?.(),
             );
-            this.emitDiagnostic(sessionId, response, updates, classified?.code ?? "PROVIDER_PROTOCOL_ERROR");
+            this.emitDiagnostic(sessionId, response, updates, classified?.code ?? "PROVIDER_PROTOCOL_ERROR", retention);
             if (classified) throw classified;
             throw new AgentProviderProtocolError({
               code: "PROVIDER_PROTOCOL_ERROR",
@@ -257,11 +294,22 @@ export class AcpRuntime implements LocalAgentRuntime {
               message: `${this.provider} ACP did not return a final assistant response.`,
             });
           }
+          if (retention.previewSuppressedItems > 0) {
+            this.emitDiagnostic(sessionId, response, updates, undefined, retention);
+          }
+          const retentionItem = retention.previewSuppressedItems > 0
+            ? [{ kind: "devspace_acp_output_retention", ...retention }]
+            : [];
+          const requiredAssistantItem = queue.requiredOutputParts?.length
+            ? [{ update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: finalResponse } } }]
+            : [];
           return {
             provider: this.provider,
             providerSessionId: sessionId,
             finalResponse,
-            items: updates,
+            // Items are bounded provider evidence for callers that retain them;
+            // durable finalResponse persistence remains the authoritative sink.
+            items: [...(queue.requiredEvidence ?? []), ...updates, ...requiredAssistantItem, ...retentionItem],
           };
         } finally {
           this.child?.stdout?.off("data", onProviderBytes);
@@ -279,6 +327,7 @@ export class AcpRuntime implements LocalAgentRuntime {
     response: unknown,
     updates: unknown[],
     classifiedErrorCode?: string,
+    outputRetention: AcpOutputRetentionSummary = emptyAcpOutputRetention(),
   ): void {
     if (!this.diagnosticObserver) return;
     const observation: AcpDiagnosticObservation = {
@@ -287,6 +336,7 @@ export class AcpRuntime implements LocalAgentRuntime {
       responseKeys: diagnosticResponseKeys(response),
       ...(diagnosticStopReason(response) ? { stopReason: diagnosticStopReason(response) } : {}),
       ...diagnosticUpdateSummary(updates),
+      outputRetention,
       ...(classifiedErrorCode ? { classifiedErrorCode } : {}),
     };
     try {
@@ -1033,8 +1083,9 @@ export function classifyAcpError(
   return undefined;
 }
 
-function extractAcpText(updates: unknown[]): string {
-  return updates
+function extractAcpText(requiredParts: string[], fallbackUpdates: unknown[] = []): string {
+  if (requiredParts.length > 0) return requiredParts.join("").trim();
+  return fallbackUpdates
     .map((value) => {
       const update = asRecord(asRecord(value)?.update);
       const content = asRecord(update?.content);
@@ -1172,9 +1223,165 @@ function hasAcpConfigOptions(value: unknown): boolean {
   return Array.isArray(response?.configOptions);
 }
 
-function appendAcpQueueValue(queue: AcpSessionQueue, value: unknown): void {
-  if (queue.values.length >= MAX_ACP_QUEUE_ITEMS) queue.values.shift();
+export function appendAcpQueueValue(queue: AcpSessionQueue, value: unknown): void {
+  const update = asRecord(asRecord(value)?.update);
+  const content = asRecord(update?.content);
+  const sessionUpdate = update?.sessionUpdate;
+  const text = content?.type === "text" && typeof content.text === "string" ? content.text : undefined;
+  const isAssistantText = sessionUpdate === "agent_message_chunk" && text !== undefined;
+  const isDisposablePreview = ACP_DISPOSABLE_PREVIEW_UPDATES.has(sessionUpdate)
+    && (content === undefined || content.type === "text");
+
+  if (isAssistantText) {
+    appendAcpRequiredText(queue, text);
+    return;
+  }
+
+  const bytes = acpValueBytes(value);
+  if (!isDisposablePreview) {
+    const requiredEvidence = queue.requiredEvidence ?? (queue.requiredEvidence = []);
+    const requiredEvidenceBytes = queue.requiredEvidenceBytes ?? 0;
+    if (requiredEvidence.length >= MAX_ACP_REQUIRED_EVIDENCE_ITEMS || requiredEvidenceBytes + bytes > MAX_ACP_QUEUE_BYTES) {
+      queue.requiredEvidenceTruncated = true;
+      return;
+    }
+    requiredEvidence.push(value);
+    queue.requiredEvidenceBytes = requiredEvidenceBytes + bytes;
+    return;
+  }
+
+  const previewBytes = queue.previewBytes ?? 0;
+  if (queue.values.length >= MAX_ACP_QUEUE_ITEMS || previewBytes + bytes > MAX_ACP_QUEUE_BYTES) {
+    queue.suppressedPreviewItems = (queue.suppressedPreviewItems ?? 0) + 1;
+    queue.suppressedPreviewBytes = (queue.suppressedPreviewBytes ?? 0) + bytes;
+    return;
+  }
   queue.values.push(value);
+  queue.previewBytes = previewBytes + bytes;
+}
+
+const ACP_DISPOSABLE_PREVIEW_UPDATES = new Set<unknown>([
+  "agent_thought_chunk",
+  "plan",
+  "available_commands_update",
+  "current_mode_update",
+  "config_option_update",
+  "usage_update",
+  "user_message_chunk",
+]);
+
+function resetAcpQueue(queue: AcpSessionQueue): void {
+  queue.values.length = 0;
+  queue.previewBytes = 0;
+  queue.suppressedPreviewItems = 0;
+  queue.suppressedPreviewBytes = 0;
+  queue.requiredEvidence = [];
+  queue.requiredEvidenceBytes = 0;
+  queue.requiredOutputParts = [];
+  queue.requiredOutputBytes = 0;
+  queue.requiredOutputTruncated = false;
+  queue.requiredEvidenceTruncated = false;
+}
+
+function appendAcpRequiredText(queue: AcpSessionQueue, text: string): void {
+  if (!text) return;
+  const currentBytes = queue.requiredOutputBytes ?? 0;
+  const remainingBytes = MAX_ACP_REQUIRED_OUTPUT_BYTES - currentBytes;
+  if (remainingBytes <= 0) {
+    queue.requiredOutputTruncated = true;
+    return;
+  }
+  const textBytes = Buffer.byteLength(text, "utf8");
+  const accepted = textBytes <= remainingBytes ? text : utf8Prefix(text, remainingBytes);
+  const acceptedBytes = Buffer.byteLength(accepted, "utf8");
+  if (accepted) {
+    const parts = queue.requiredOutputParts ?? (queue.requiredOutputParts = []);
+    if (parts.length === 0) parts.push(accepted);
+    else parts[0] += accepted;
+    queue.requiredOutputBytes = currentBytes + acceptedBytes;
+  }
+  if (acceptedBytes !== textBytes) queue.requiredOutputTruncated = true;
+}
+
+function utf8Prefix(value: string, maxBytes: number): string {
+  let bytes = 0;
+  let prefix = "";
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > maxBytes) break;
+    prefix += character;
+    bytes += characterBytes;
+  }
+  return prefix;
+}
+
+function acpValueBytes(value: unknown): number {
+  return boundedAcpValueBytes(value, new Set<object>(), MAX_ACP_QUEUE_BYTES + 1, 0, { count: 0 });
+}
+
+function boundedAcpValueBytes(
+  value: unknown,
+  seen: Set<object>,
+  remaining: number,
+  depth: number,
+  budget: { count: number },
+): number {
+  if (remaining <= 0) return MAX_ACP_QUEUE_BYTES + 1;
+  if (depth > MAX_ACP_VALUE_ESTIMATE_DEPTH || ++budget.count > MAX_ACP_VALUE_ESTIMATE_NODES) {
+    return MAX_ACP_QUEUE_BYTES + 1;
+  }
+  if (value === null) return 4;
+  switch (typeof value) {
+    case "string": return Math.min(remaining, Buffer.byteLength(value, "utf8") + 2);
+    case "number":
+    case "boolean": return Math.min(remaining, 8);
+    case "undefined": return 4;
+    case "bigint": return Math.min(remaining, 24);
+    case "function": return 0;
+    case "symbol": return 0;
+  }
+  if (seen.has(value)) return remaining;
+  seen.add(value);
+  let total = 2;
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      total += boundedAcpValueBytes(item, seen, remaining - total, depth + 1, budget) + 1;
+      if (total >= remaining) return MAX_ACP_QUEUE_BYTES + 1;
+    }
+    return total;
+  }
+  const record = value as Record<string, unknown>;
+  for (const key in value) {
+    if (!Object.prototype.hasOwnProperty.call(value, key)) continue;
+    total += Buffer.byteLength(key, "utf8") + 3;
+    total += boundedAcpValueBytes(record[key], seen, remaining - total, depth + 1, budget);
+    if (total >= remaining) return MAX_ACP_QUEUE_BYTES + 1;
+  }
+  return total;
+}
+
+function acpOutputRetention(queue: AcpSessionQueue): AcpOutputRetentionSummary {
+  return {
+    previewSuppressedItems: queue.suppressedPreviewItems ?? 0,
+    previewSuppressedBytes: queue.suppressedPreviewBytes ?? 0,
+    requiredEvidenceItems: queue.requiredEvidence?.length ?? 0,
+    requiredEvidenceBytes: queue.requiredEvidenceBytes ?? 0,
+    requiredOutputBytes: queue.requiredOutputBytes ?? 0,
+    requiredOutputTruncated: queue.requiredOutputTruncated ?? false,
+    requiredEvidenceTruncated: queue.requiredEvidenceTruncated ?? false,
+  };
+}
+
+function emptyAcpOutputRetention(): AcpOutputRetentionSummary {
+  return {
+    previewSuppressedItems: 0,
+    previewSuppressedBytes: 0,
+    requiredEvidenceItems: 0,
+    requiredEvidenceBytes: 0,
+    requiredOutputBytes: 0,
+    requiredOutputTruncated: false,
+    requiredEvidenceTruncated: false,
+  };
 }
 
 function appendTail(current: string, chunk: string, maxBytes: number): string {

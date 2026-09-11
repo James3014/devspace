@@ -17,6 +17,7 @@ import {
 import { runOmpAcpLocalAgent } from "./local-agent-omp.js";
 import { inspectCodexRuntime } from "./codex-runtime.js";
 import { inspectScratchOwnership } from "./provider-scratch.js";
+import { AgentProviderProtocolError } from "./local-agent-errors.js";
 import {
   AcpLocalAgentDriver,
   resolveAcpCommand,
@@ -58,6 +59,8 @@ export interface LocalAgentDriverOptions {
 const AGY_PRINT_TIMEOUT_SECONDS = 600;
 const AGY_AGENT_TIMEOUT_MS = 610_000;
 const AGY_OUTPUT_DRAIN_TIMEOUT_MS = 1_000;
+export const AGY_MAX_STDOUT_BYTES = 1 * 1024 * 1024;
+export const AGY_MAX_STDERR_BYTES = 1 * 1024 * 1024;
 
 function inputEnvironment(input: LocalAgentRunInput): NodeJS.ProcessEnv {
   return input.environment ?? process.env;
@@ -433,25 +436,22 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
 
     assertPipedChild(child);
 
-    let stdout = "";
-    let stderr = "";
-    const stdoutDecoder = new StringDecoder("utf8");
-    const stderrDecoder = new StringDecoder("utf8");
+    const stdoutCapture = new BoundedUtf8Capture(AGY_MAX_STDOUT_BYTES);
+    const stderrCapture = new BoundedUtf8Capture(AGY_MAX_STDERR_BYTES);
 
     // Any provider output byte is proof of life. Agy --print emits nothing
     // until the full JSON response, but if it does stream anything (progress
     // on stderr etc.) the idle supervisor must not mistake it for a hung
     // worker. Throttled because every touch persists to the session store.
-    const activityTouch = createThrottledActivityTouch(() => {
-      void callbacks?.onActivity?.();
-    });
+    const notifyActivity = bestEffortActivityNotifier(callbacks?.onActivity);
+    const activityTouch = createThrottledActivityTouch(notifyActivity);
 
     child.stdout.on("data", (chunk: Buffer) => {
-      stdout += stdoutDecoder.write(chunk);
+      stdoutCapture.append(chunk);
       activityTouch.touch();
     });
     child.stderr.on("data", (chunk: Buffer) => {
-      stderr += stderrDecoder.write(chunk);
+      stderrCapture.append(chunk);
       activityTouch.touch();
     });
 
@@ -506,26 +506,48 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
       // Once the exact child has exited, close only our owned handles so that
       // the caller is never held open by an inherited pipe.
       if (exitInfo) {
-        await drainOwnedChildOutput(child, () => stdout, () => stderr);
-        stdout += stdoutDecoder.end();
-        stderr += stderrDecoder.end();
+        await drainOwnedChildOutput(child, () => stdoutCapture.value, () => stderrCapture.value);
+        stdoutCapture.finish();
+        stderrCapture.finish();
       }
       await closeOwnedChildPipes(child);
     }
+
+    const stdout = stdoutCapture.value;
+    const stderr = stderrCapture.value;
 
     if (isTimedOut) {
       throw new Error("Agy execution timed out.");
     }
 
     if (exitInfo.code !== 0) {
+      const truncationMarkers = [
+        stdoutCapture.truncated ? "AGY_STDOUT_TRUNCATED" : "",
+        stderrCapture.truncated ? "AGY_STDERR_TRUNCATED" : "",
+      ].filter(Boolean).join(", ");
       throw new Error(
-        `Agy exited with non-zero code ${exitInfo.code ?? "null"} (signal: ${exitInfo.signal ?? "null"}). Stderr: ${stderr.trim()}`,
+        `Agy exited with non-zero code ${exitInfo.code ?? "null"} (signal: ${exitInfo.signal ?? "null"}).${truncationMarkers ? ` Output truncation: ${truncationMarkers}.` : ""} Stderr: ${stderr.trim()}`,
       );
+    }
+
+    if (stdoutCapture.truncated) {
+      const message = `Agy stdout exceeded ${AGY_MAX_STDOUT_BYTES} byte limit (AGY_STDOUT_TRUNCATED).`;
+      throw new AgentProviderProtocolError({
+        code: "PROVIDER_PROTOCOL_ERROR",
+        provider: this.provider,
+        operation: "run",
+        retryable: false,
+        message,
+        stdoutBytes: stdoutCapture.totalBytesSeen,
+        stdoutRetainedBytes: stdoutCapture.retainedBytesSeen,
+        stdoutLimitBytes: AGY_MAX_STDOUT_BYTES,
+        stdoutTruncated: true,
+      });
     }
 
     // Agy's JSON protocol has no trustworthy incremental event boundary;
     // record activity only once the complete provider response is available.
-    await callbacks?.onActivity?.();
+    notifyActivity();
 
     let parsed: any;
     try {
@@ -558,11 +580,17 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
       throw new Error(`Agy execution response is missing response content or it is empty.`);
     }
 
+    const outputMetadata = stderrCapture.truncated ? {
+      type: "agy_output_retention",
+      stdout: stdoutCapture.metadata(),
+      stderr: stderrCapture.metadata(),
+    } : undefined;
+
     return {
       provider: this.provider,
       providerSessionId: conversation_id,
       finalResponse: response.trim(),
-      items: [parsed],
+      items: outputMetadata ? [parsed, outputMetadata] : [parsed],
     };
   }
 }
@@ -611,6 +639,88 @@ async function drainOwnedChildOutput(
     onData();
     if (stdoutEnded && stderrEnded) finish();
   });
+}
+
+class BoundedUtf8Capture {
+  private readonly decoder = new StringDecoder("utf8");
+  private retained = "";
+  private totalBytes = 0;
+  private retainedBytes = 0;
+  truncated = false;
+
+  constructor(private readonly maxBytes: number) {}
+
+  get value(): string {
+    return this.retained;
+  }
+
+  get totalBytesSeen(): number {
+    return this.totalBytes;
+  }
+
+  get retainedBytesSeen(): number {
+    return this.retainedBytes;
+  }
+
+  metadata(): { limitBytes: number; totalBytes: number; retainedBytes: number; truncated: boolean } {
+    return {
+      limitBytes: this.maxBytes,
+      totalBytes: this.totalBytes,
+      retainedBytes: this.retainedBytes,
+      truncated: this.truncated,
+    };
+  }
+
+  append(chunk: Buffer): void {
+    this.totalBytes += chunk.byteLength;
+    if (this.truncated) return;
+    this.appendDecoded(this.decoder.write(chunk));
+    if (this.totalBytes > this.maxBytes) this.truncated = true;
+  }
+
+  finish(): void {
+    if (this.truncated) return;
+    this.appendDecoded(this.decoder.end());
+    if (this.totalBytes > this.maxBytes) this.truncated = true;
+  }
+
+  private appendDecoded(text: string): void {
+    if (!text) return;
+    const remainingBytes = this.maxBytes - this.retainedBytes;
+    if (remainingBytes <= 0) {
+      this.truncated = true;
+      return;
+    }
+    const accepted = utf8Prefix(text, remainingBytes);
+    this.retained += accepted;
+    this.retainedBytes += Buffer.byteLength(accepted, "utf8");
+    if (accepted.length !== text.length) this.truncated = true;
+  }
+}
+
+function utf8Prefix(value: string, maxBytes: number): string {
+  let bytes = 0;
+  let prefix = "";
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, "utf8");
+    if (bytes + characterBytes > maxBytes) break;
+    prefix += character;
+    bytes += characterBytes;
+  }
+  return prefix;
+}
+
+function bestEffortActivityNotifier(callback?: () => void | Promise<void>): () => void {
+  let pending = false;
+  return () => {
+    if (!callback || pending) return;
+    pending = true;
+    try {
+      Promise.resolve(callback()).catch(() => undefined).finally(() => { pending = false; });
+    } catch {
+      pending = false;
+    }
+  };
 }
 
 function assertPipedChild(child: ReturnType<typeof spawn>): asserts child is import("node:child_process").ChildProcessWithoutNullStreams {

@@ -786,7 +786,7 @@ test("runWorkerTurnFromFile persists generic AgentProviderError diagnostics", as
           operation: "run",
           message: "OpenCode agent execution failed.",
           retryable: false,
-          cause: new Error("provider runtime rejected request"),
+          cause: new Error("provider runtime rejected request token=synthetic-secret-value-9f3a"),
         });
       },
     );
@@ -818,8 +818,49 @@ test("runWorkerTurnFromFile persists generic AgentProviderError diagnostics", as
       model: undefined,
       variant: undefined,
       providerSessionId: undefined,
-      providerMessage: "Error: provider runtime rejected request",
+      providerMessage: "Error: provider runtime rejected request token=[REDACTED]",
     });
+  } finally {
+    clean();
+  }
+});
+
+test("runWorkerTurnFromFile redacts successful provider output before durable status readback", async () => {
+  const { stateDir, clean } = setupFixture();
+  try {
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    const { join } = await import("node:path");
+    const config = { stateDir, subagents: true, oauth: { scopes: ["devspace"] } } as any;
+    const projectRoot = join(stateDir, "project-success-redaction");
+    mkdirSync(projectRoot, { recursive: true });
+    const manager = new LocalAgentSessionManager(
+      config,
+      undefined,
+      undefined,
+      async () => ({
+        provider: "codex",
+        providerSessionId: "thread-redaction",
+        finalResponse: "done Bearer synthetic-secret-value-9f3a",
+        items: [],
+      }),
+    );
+    const store = (manager as any).store;
+    const record = store.create({
+      workspaceId: "ws_success_redaction",
+      workspaceRoot: projectRoot,
+      profileName: "codex-test",
+      provider: "codex",
+      lifecycleKind: "detached_worker_v2",
+    });
+    const token = "worker-token-success-redaction";
+    store.prepareWorker(record.id, token);
+    const promptFile = join(config.stateDir, `prompt-${record.id}.json`);
+    writeFileSync(promptFile, "test prompt");
+    await manager.runWorkerTurnFromFile(record.id, promptFile, token);
+    const updated = store.getById(record.id)!;
+    assert.equal(updated.status, "idle");
+    assert.equal(updated.latestResponse, "done Bearer [REDACTED]");
+    assert.equal(updated.providerSessionId, "thread-redaction");
   } finally {
     clean();
   }
@@ -857,7 +898,7 @@ test("runWorkerTurnFromFile persists typed AgentProviderFailureError details", a
           model: "cline-pass/glm-5.3-flash",
           variant: "high",
           providerSessionId: "sess-cline-live-1",
-          providerMessage: "ClinePass entitlement required",
+          providerMessage: "ClinePass entitlement required api_key=synthetic-secret-value-9f3a",
         });
       },
     );
@@ -890,7 +931,7 @@ test("runWorkerTurnFromFile persists typed AgentProviderFailureError details", a
       model: "cline-pass/glm-5.3-flash",
       variant: "high",
       providerSessionId: "sess-cline-live-1",
-      providerMessage: "ClinePass entitlement required",
+      providerMessage: "ClinePass entitlement required api_key=[REDACTED]",
     });
   } finally {
     clean();

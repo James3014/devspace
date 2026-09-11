@@ -27,6 +27,17 @@ import type {
 
 const OPENCODE_SESSION_POLL_INTERVAL_MS = 250;
 const OPENCODE_SESSION_POLL_TIMEOUT_MS = 5 * 60_000;
+const MAX_OPENCODE_RETAINED_HISTORY_MESSAGES = 256;
+const MAX_OPENCODE_RETAINED_TURN_MESSAGES = 128;
+const MAX_OPENCODE_RETAINED_HISTORY_BYTES = 512 * 1024;
+const MAX_OPENCODE_RETAINED_TURN_BYTES = 512 * 1024;
+const MAX_OPENCODE_REQUIRED_EVIDENCE_BYTES = 1024 * 1024;
+
+interface OpencodeRetentionEvidence {
+  suppressedMessages: number;
+  suppressedBytes: number;
+  suppressedBytesAreEstimate: true;
+}
 
 export type OpencodeClientLike = Pick<OpencodeClient, "v2">;
 
@@ -64,13 +75,14 @@ export class OpencodeRuntime implements LocalAgentRuntime {
           });
         }
         try {
+          const notifyActivity = bestEffortActivityNotifier(callbacks?.onActivity);
           await assertOpencodeHealthy(this.client);
-          await callbacks?.onActivity?.();
+          notifyActivity();
           const resumed = Boolean(input.providerSessionId);
           const initialModel = input.model ? parseOpencodeModel(input.model, input.effort) : undefined;
           const sessionId = input.providerSessionId ?? await createOpencodeSession(this.client, input, initialModel);
           await callbacks?.onSessionId?.(sessionId);
-          await callbacks?.onActivity?.();
+          notifyActivity();
           await this.client.v2.session.switchAgent({
             sessionID: sessionId,
             agent: opencodeAgentFor(input.writeMode),
@@ -81,7 +93,7 @@ export class OpencodeRuntime implements LocalAgentRuntime {
             await this.client.v2.session.switchModel({ sessionID: sessionId, model }, { throwOnError: true });
           }
           const promptResult = await promptOpencodeSession(this.client, sessionId, input);
-          await callbacks?.onActivity?.();
+          notifyActivity();
           const modelInfo = {
             model: input.model,
             variant: initialModel?.variant ?? input.effort,
@@ -98,7 +110,7 @@ export class OpencodeRuntime implements LocalAgentRuntime {
               message: "OpenCode did not acknowledge the current prompt with a message id.",
             });
           }
-          await waitForOpencodeSession(this.client, sessionId, promptResult, callbacks?.onActivity, modelInfo);
+          await waitForOpencodeSession(this.client, sessionId, promptResult, notifyActivity, modelInfo);
           const messages = await readOpencodeMessages(this.client, sessionId, promptId);
           const finalResponse = requireFinalResponse(
             extractOpenCodeFinalResponseForPrompt(messages, promptId),
@@ -339,7 +351,7 @@ async function waitForOpencodeSession(
   client: OpencodeClientLike,
   sessionId: string,
   promptResult: unknown,
-  onActivity?: () => void | Promise<void>,
+  onActivity?: () => void,
   modelInfo: { model?: string; variant?: string } = {},
 ): Promise<void> {
   // OpenCode 1.18 accepts the prompt before its foreground drain is ready.
@@ -375,7 +387,7 @@ async function waitForOpencodeSession(
     });
     if (activityFingerprint !== previousActivityFingerprint) {
       previousActivityFingerprint = activityFingerprint;
-      await onActivity?.();
+      onActivity?.();
     }
 
     const completed = hasCompletedOpenCodeTurn(messages, promptId);
@@ -393,6 +405,19 @@ async function waitForOpencodeSession(
   }
 }
 
+function bestEffortActivityNotifier(callback?: () => void | Promise<void>): () => void {
+  let pending = false;
+  return () => {
+    if (!callback || pending) return;
+    pending = true;
+    try {
+      Promise.resolve(callback()).catch(() => undefined).finally(() => { pending = false; });
+    } catch {
+      pending = false;
+    }
+  };
+}
+
 async function readOpencodeMessages(
   client: OpencodeClientLike,
   sessionId: string,
@@ -400,6 +425,7 @@ async function readOpencodeMessages(
 ): Promise<SessionMessagesResponse> {
   const messages: SessionMessagesResponse["data"] = [];
   const seenCursors = new Set<string>();
+  const retention: OpencodeRetentionEvidence = { suppressedMessages: 0, suppressedBytes: 0, suppressedBytesAreEstimate: true };
   let cursor: string | undefined;
 
   while (true) {
@@ -409,7 +435,10 @@ async function readOpencodeMessages(
       ...(cursor ? { cursor } : { order: "asc" }),
     }, { throwOnError: true });
     const page = result.data;
-    messages.push(...page.data);
+    for (const message of page.data) {
+      messages.push(message);
+      retainBoundedOpencodeMessages(messages, promptId, retention);
+    }
 
     // A prompt-specific read can stop as soon as the submitted turn is
     // complete. Reads without a prompt id still walk the full history because
@@ -424,7 +453,169 @@ async function readOpencodeMessages(
     cursor = nextCursor;
   }
 
-  return { data: messages, cursor: {} };
+  if (promptId !== undefined && hasOpenCodeLaterUserTurn(messages, promptId)
+    && !hasCompletedOpenCodeTurn({ data: messages }, promptId)) {
+    throw opencodeRetentionFailure("current-turn final response was not retained before a later user turn");
+  }
+
+  return { data: messages, cursor: {}, retention } as SessionMessagesResponse & { retention: OpencodeRetentionEvidence };
+}
+
+function hasOpenCodeLaterUserTurn(messages: SessionMessagesResponse["data"], promptId: string): boolean {
+  const promptIndex = messages.findIndex((message) => {
+    const record = asRecord(message);
+    const info = asRecord(record?.info) ?? record;
+    return info?.id === promptId && (info?.role === "user" || record?.type === "user");
+  });
+  if (promptIndex < 0) return false;
+  return messages.slice(promptIndex + 1).some((message) => {
+    const record = asRecord(message);
+    const info = asRecord(record?.info) ?? record;
+    return info?.role === "user" || record?.type === "user";
+  });
+}
+
+function retainBoundedOpencodeMessages(
+  messages: SessionMessagesResponse["data"],
+  promptId?: string,
+  retention: OpencodeRetentionEvidence = { suppressedMessages: 0, suppressedBytes: 0, suppressedBytesAreEstimate: true },
+): void {
+  const promptIndex = promptId === undefined ? -1 : messages.findIndex((message) => {
+    const record = asRecord(message);
+    const info = asRecord(record?.info) ?? record;
+    return info?.id === promptId && (info?.role === "user" || record?.type === "user");
+  });
+  const nextUserIndex = promptIndex < 0 ? -1 : messages.slice(promptIndex + 1).findIndex((message) => {
+    const record = asRecord(message);
+    const info = asRecord(record?.info) ?? record;
+    return info?.role === "user" || record?.type === "user";
+  });
+  const turnEnd = nextUserIndex < 0 ? messages.length : promptIndex + 1 + nextUserIndex;
+  if (promptIndex >= 0) {
+    const currentTurn = messages.slice(promptIndex, turnEnd);
+    let terminalIndex = -1;
+    for (let index = currentTurn.length - 1; index >= 0; index -= 1) {
+      const message = currentTurn[index];
+      const record = asRecord(message);
+      const info = asRecord(record?.info) ?? record;
+      const role = typeof info?.role === "string" ? info.role : record?.type;
+      const finish = typeof info?.finish === "string" ? info.finish : record?.finish;
+      if (role === "assistant" && isTerminalOpenCodeFinish(finish)) { terminalIndex = index; break; }
+    }
+    const terminal = terminalIndex >= 0 ? currentTurn[terminalIndex] : undefined;
+    const finalText = terminal === undefined ? "" : extractOpenCodeAssistantMessageText(terminal);
+    if (terminal !== undefined && boundedMessageBytes(terminal, MAX_OPENCODE_REQUIRED_EVIDENCE_BYTES + 1) > MAX_OPENCODE_REQUIRED_EVIDENCE_BYTES) {
+      throw opencodeRetentionFailure("current-turn terminal evidence exceeds the retained evidence bound");
+    }
+    if (Buffer.byteLength(finalText, "utf8") > MAX_OPENCODE_RETAINED_TURN_BYTES) {
+      throw opencodeRetentionFailure("current-turn final response exceeds the retained evidence bound");
+    }
+    const prompt = currentTurn[0]!;
+    const promptBytes = boundedMessageBytes(prompt, MAX_OPENCODE_RETAINED_TURN_BYTES + 1);
+    if (promptBytes > MAX_OPENCODE_RETAINED_TURN_BYTES) {
+      throw opencodeRetentionFailure("current-turn prompt exceeds the retained evidence bound");
+    }
+    const progress = currentTurn.filter((_, index) => index !== 0 && index !== terminalIndex);
+    const requiredErrors = progress.filter((message) => {
+      const record = asRecord(message);
+      const info = asRecord(record?.info);
+      return record?.error !== undefined || info?.error !== undefined;
+    });
+    if (requiredErrors.length > MAX_OPENCODE_RETAINED_TURN_MESSAGES) {
+      throw opencodeRetentionFailure("current-turn error evidence exceeds the retained item bound");
+    }
+    const requiredErrorBytes = requiredErrors.reduce((total, message) => total + boundedMessageBytes(message, MAX_OPENCODE_REQUIRED_EVIDENCE_BYTES + 1), 0);
+    if (requiredErrorBytes > MAX_OPENCODE_REQUIRED_EVIDENCE_BYTES) {
+      throw opencodeRetentionFailure("current-turn error evidence exceeds the retained evidence bound");
+    }
+    const retainedProgress: SessionMessagesResponse["data"] = [...requiredErrors];
+    let progressBytes = requiredErrorBytes;
+    const progressLimit = MAX_OPENCODE_RETAINED_TURN_MESSAGES - 1 - (terminal === undefined ? 0 : 1);
+    for (let index = progress.length - 1; index >= 0 && retainedProgress.length < progressLimit; index -= 1) {
+      const message = progress[index]!;
+      if (requiredErrors.includes(message)) continue;
+      const bytes = boundedMessageBytes(message, MAX_OPENCODE_RETAINED_TURN_BYTES + 1);
+      if (bytes > MAX_OPENCODE_RETAINED_TURN_BYTES - promptBytes - progressBytes) continue;
+      retainedProgress.push(message);
+      progressBytes += bytes;
+    }
+    retainedProgress.reverse();
+    retainedProgress.sort((left, right) => currentTurn.indexOf(left) - currentTurn.indexOf(right));
+    const retainedTurn = [prompt, ...retainedProgress, ...(terminal === undefined ? [] : [terminal])];
+    const nextUser = nextUserIndex >= 0 ? messages[turnEnd] : undefined;
+    if (nextUser !== undefined && boundedMessageBytes(nextUser, MAX_OPENCODE_REQUIRED_EVIDENCE_BYTES + 1) > MAX_OPENCODE_REQUIRED_EVIDENCE_BYTES) {
+      throw opencodeRetentionFailure("later-user boundary evidence exceeds the retained evidence bound");
+    }
+    const droppedBefore = messages.slice(0, promptIndex);
+    const retainedSet = new Set(retainedTurn);
+    const droppedCurrent = currentTurn.filter((message) => !retainedSet.has(message));
+    const droppedAfterBoundary = messages.slice(turnEnd + (nextUserIndex >= 0 ? 1 : 0));
+    const dropped = [...droppedBefore, ...droppedCurrent, ...droppedAfterBoundary];
+    retention.suppressedMessages += dropped.length;
+    retention.suppressedBytes += dropped.reduce((total, message) => total + boundedMessageBytes(message), 0);
+    messages.splice(0, messages.length, ...retainedTurn, ...(nextUser ? [nextUser] : []));
+    return;
+  }
+  if (messages.length <= MAX_OPENCODE_RETAINED_HISTORY_MESSAGES
+    && messages.reduce((total, message) => total + boundedMessageBytes(message), 0) <= MAX_OPENCODE_RETAINED_HISTORY_BYTES) return;
+  const retained: SessionMessagesResponse["data"] = [];
+  let retainedBytes = 0;
+  for (let index = messages.length - 1; index >= 0 && retained.length < MAX_OPENCODE_RETAINED_HISTORY_MESSAGES; index -= 1) {
+    const message = messages[index]!;
+    const bytes = boundedMessageBytes(message, MAX_OPENCODE_RETAINED_HISTORY_BYTES + 1);
+    if (bytes > MAX_OPENCODE_RETAINED_HISTORY_BYTES - retainedBytes) continue;
+    retained.push(message);
+    retainedBytes += bytes;
+  }
+  retained.reverse();
+  const retainedSet = new Set(retained);
+  const dropped = messages.filter((message) => !retainedSet.has(message));
+  retention.suppressedMessages += dropped.length;
+  retention.suppressedBytes += dropped.reduce((total, message) => total + boundedMessageBytes(message), 0);
+  messages.splice(0, messages.length, ...retained);
+}
+
+function boundedMessageBytes(message: unknown, limit = MAX_OPENCODE_RETAINED_HISTORY_BYTES + 1): number {
+  return boundedValueBytes(message, limit);
+}
+
+function boundedValueBytes(value: unknown, limit: number, depth = 0, state = { nodes: 0 }): number {
+  if (limit <= 0) return 0;
+  if (state.nodes++ > 2048) return limit + 1;
+  if (value === null || value === undefined) return 4;
+  if (typeof value === "string") return Math.min(limit, Buffer.byteLength(value, "utf8"));
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint") return Math.min(limit, String(value).length);
+  if (depth >= 6) return limit + 1;
+  if (Array.isArray(value)) {
+    let total = 2;
+    if (value.length > 512) return limit + 1;
+    for (const item of value) {
+      total += boundedValueBytes(item, limit - total, depth + 1, state);
+      if (total >= limit) return limit;
+    }
+    return Math.min(limit, total);
+  }
+  const record = asRecord(value);
+  if (!record) return 16;
+  let total = 2;
+  let entryCount = 0;
+  for (const key in record) {
+    if (++entryCount > 128) return limit + 1;
+    const item = record[key];
+    total += Buffer.byteLength(key, "utf8") + boundedValueBytes(item, limit - total, depth + 1, state);
+    if (total >= limit) return limit;
+  }
+  return Math.min(limit, total);
+}
+
+function opencodeRetentionFailure(message: string): AgentProviderProtocolError {
+  return new AgentProviderProtocolError({
+    code: "PROVIDER_PROTOCOL_ERROR",
+    provider: "opencode",
+    operation: "retain_session_messages",
+    retryable: false,
+    message: `OpenCode retained evidence is incomplete: ${message}.`,
+  });
 }
 
 function extractOpenCodePromptId(value: unknown): string | undefined {

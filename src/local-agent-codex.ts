@@ -1,7 +1,7 @@
 import { homedir } from "node:os";
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { delimiter, join, resolve } from "node:path";
-import { createInterface } from "node:readline";
+import { StringDecoder } from "node:string_decoder";
 import {
   AgentProviderExecutionError,
   AgentProviderProtocolError,
@@ -218,7 +218,6 @@ async function waitForProcessExit(
       child.removeListener("exit", onExit);
       resolve(false);
     }, timeoutMs);
-    timer.unref();
     const onExit = () => {
       clearTimeout(timer);
       resolve(true);
@@ -304,6 +303,7 @@ export class CodexLocalAgentDriver implements LocalAgentDriver {
 }
 
 const MAX_TURN_ITEMS = 10_000;
+export const MAX_CODEX_FRAME_BYTES = 1024 * 1024;
 const MAX_STDERR_BYTES = 32 * 1024;
 
 interface CodexEvent {
@@ -334,14 +334,18 @@ class CodexAppServerRpc {
   private readonly turns = new Map<string, CodexTurnAccumulator>();
   private nextId = 1;
   private fatalError?: Error;
-  private buffer = "";
+  private stdoutDecoder = new StringDecoder("utf8");
+  private line = "";
+  private lineBytes = 0;
   private stderr = "";
+  private childTerminationTimer?: NodeJS.Timeout;
 
   constructor(
     private readonly child: ChildProcessWithoutNullStreams,
     private readonly version?: string,
   ) {
-    createInterface({ input: child.stdout, crlfDelay: Infinity }).on("line", (line) => this.handleLine(line));
+    child.stdout.on("data", (chunk: Buffer) => this.handleChunk(chunk));
+    child.stdout.once("end", () => this.handleEnd());
     child.stdin.on("error", (error) => this.fail(error));
     child.stderr.on("data", (chunk: Buffer) => {
       this.stderr = appendTail(this.stderr, chunk.toString("utf8"), MAX_STDERR_BYTES);
@@ -390,11 +394,14 @@ class CodexAppServerRpc {
 
   fail(error: Error): void {
     if (this.fatalError) return;
-    this.fatalError = new Error(`${error.message}${this.stderr.trim() ? `\n${this.stderr.trim()}` : ""}${this.version ? `\ncodex version: ${this.version}` : ""}`);
+    this.fatalError = error instanceof AgentProviderProtocolError
+      ? error
+      : new Error(`${error.message}${this.stderr.trim() ? `\n${this.stderr.trim()}` : ""}${this.version ? `\ncodex version: ${this.version}` : ""}`);
     for (const pending of this.pending.values()) pending.reject(this.fatalError);
     for (const turn of this.turns.values()) turn.reject(this.fatalError);
     this.pending.clear();
     this.turns.clear();
+    if (error instanceof AgentProviderProtocolError) this.terminateChild();
   }
 
   private write(message: Record<string, unknown>): void {
@@ -402,10 +409,45 @@ class CodexAppServerRpc {
     this.child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
+  private handleChunk(chunk: Buffer): void {
+    let offset = 0;
+    while (offset < chunk.length) {
+      const newline = chunk.indexOf(0x0a, offset);
+      const end = newline === -1 ? chunk.length : newline;
+      const segment = chunk.subarray(offset, end);
+      if (this.lineBytes + segment.length > MAX_CODEX_FRAME_BYTES) {
+        this.fail(new AgentProviderProtocolError({
+          code: "PROVIDER_PROTOCOL_ERROR",
+          provider: "codex",
+          operation: "receive",
+          retryable: false,
+          message: `Codex app-server frame exceeds ${MAX_CODEX_FRAME_BYTES} bytes.`,
+        }));
+        return;
+      }
+      this.lineBytes += segment.length;
+      this.line += this.stdoutDecoder.write(segment);
+      offset = newline === -1 ? chunk.length : newline + 1;
+      if (newline === -1) return;
+      this.line += this.stdoutDecoder.end();
+      this.handleLine(this.line);
+      this.line = "";
+      this.lineBytes = 0;
+      this.stdoutDecoder = new StringDecoder("utf8");
+    }
+  }
+
+  private handleEnd(): void {
+    if (this.fatalError || this.lineBytes === 0) return;
+    this.line += this.stdoutDecoder.end();
+    this.handleLine(this.line);
+    this.line = "";
+    this.lineBytes = 0;
+    this.stdoutDecoder = new StringDecoder("utf8");
+  }
+
   private handleLine(line: string): void {
-    this.buffer += line;
-    const trimmed = this.buffer.trim();
-    this.buffer = "";
+    const trimmed = line.trim();
     if (!trimmed) return;
     let message: Record<string, unknown>;
     try {
@@ -441,6 +483,15 @@ class CodexAppServerRpc {
     if (event.method !== "turn/completed" || !turnMatchesEvent(turn, event)) return;
     turn.completed = event;
     turn.resolve({ event, items: turn.items.slice() });
+  }
+
+  private terminateChild(): void {
+    if (this.child.exitCode !== null) return;
+    terminateProcessTree(this.child, "SIGTERM", process.platform !== "win32");
+    this.childTerminationTimer = setTimeout(() => {
+      if (this.child.exitCode === null) terminateProcessTree(this.child, "SIGKILL", process.platform !== "win32");
+    }, 1_000);
+    this.childTerminationTimer.unref();
   }
 
   private findTurn(event: CodexEvent): CodexTurnAccumulator | undefined {
