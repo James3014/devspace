@@ -2,10 +2,18 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 import { LocalAgentSessionManager, AgentSessionError, getWorkerProcessOwnership } from "./local-agent-sessions.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
+
+const originalAgyCommand = process.env.AGY_COMMAND;
+process.env.AGY_COMMAND = process.execPath;
+
+after(() => {
+  if (originalAgyCommand === undefined) delete process.env.AGY_COMMAND;
+  else process.env.AGY_COMMAND = originalAgyCommand;
+});
 
 function setupFixture() {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-agent-sessions-test-"));
