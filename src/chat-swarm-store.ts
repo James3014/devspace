@@ -26,6 +26,9 @@ const EFFECT_STATES = ["CLAIMED", "RUNNING", "RESULT_READY", "CANCEL_REQUESTED",
 
 export interface CreateSwarmInput { id?: string; ownerIdentity?: string; ownerIdentityFingerprint?: string; workerLimit: number; inviteCredential?: string; metadata?: Record<string, unknown>; }
 export interface CreateWorkerInput { id?: string; swarmId: string; label: string; runtimeKind: ChatSwarmRuntimeKind; sessionIdentityFingerprint?: string; carrierConversationFingerprint?: string; }
+export type CarrierOperationKind = "ENSURE_EXISTING" | "WAKE";
+export type CarrierOperationState = "PREPARED" | "IN_FLIGHT" | "SUCCEEDED" | "UNSUPPORTED" | "RECONCILE_REQUIRED";
+export interface CarrierOperationRecord { operationId: string; operationKey: string; slotKey: string; swarmId: string; workerId: string; taskId?: string; attemptId?: string; carrierKind: string; carrierFingerprint: string; bindingEpoch: number; adapterConfigHash: string; kind: CarrierOperationKind; state: CarrierOperationState; request: Record<string, unknown>; receipt?: Record<string, unknown>; version: number; createdAt: string; updatedAt: string; }
 
 export class ChatSwarmStore {
   private readonly database: DatabaseHandle;
@@ -35,6 +38,31 @@ export class ChatSwarmStore {
     this.database = openDatabase(stateDir);
   }
   close(): void { this.database.close(); }
+
+  createCarrierOperation(input: Omit<CarrierOperationRecord, "version" | "createdAt" | "updatedAt">): CarrierOperationRecord {
+    const requestJson = JSON.stringify(input.request); const receiptJson = input.receipt === undefined ? null : JSON.stringify(input.receipt);
+    assertBounded(requestJson, MAX_JSON_BYTES, "carrier operation request"); if (receiptJson) { assertBounded(receiptJson, MAX_JSON_BYTES, "carrier operation receipt"); validateCarrierReceipt(input.receipt!); }
+    const timestamp = now();
+    const operation = this.sqlite.transaction(() => {
+      const existing = this.sqlite.prepare("select * from chat_swarm_carrier_operations where slot_key=?").get(input.slotKey) as Row | undefined;
+      if (existing) {
+        const prior = carrierOperationFrom(existing);
+        if (!sameCarrierOperationMaterial(prior, input)) throw new ChatSwarmError("REPLAY_CONFLICT", "carrier operation key is bound to different material");
+        return prior;
+      }
+      this.sqlite.prepare(`insert into chat_swarm_carrier_operations (operation_id,operation_key,slot_key,swarm_id,worker_id,task_id,attempt_id,carrier_kind,carrier_fingerprint,binding_epoch,adapter_config_hash,kind,state,request_json,receipt_json,version,created_at,updated_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1,?,?)`).run(input.operationId,input.operationKey,input.slotKey,input.swarmId,input.workerId,input.taskId ?? null,input.attemptId ?? null,input.carrierKind,input.carrierFingerprint,input.bindingEpoch,input.adapterConfigHash,input.kind,input.state,requestJson,receiptJson,timestamp,timestamp);
+      return this.getCarrierOperation(input.operationId)!;
+    }); return operation.immediate();
+  }
+  getCarrierOperation(operationId: string): CarrierOperationRecord | undefined { const row = this.sqlite.prepare("select * from chat_swarm_carrier_operations where operation_id=?").get(operationId) as Row | undefined; return row && carrierOperationFrom(row); }
+  getCarrierOperationByKey(operationKey: string): CarrierOperationRecord | undefined { const row = this.sqlite.prepare("select * from chat_swarm_carrier_operations where operation_key=? or slot_key=?").get(operationKey, operationKey) as Row | undefined; return row && carrierOperationFrom(row); }
+  listCarrierOperations(swarmId: string): CarrierOperationRecord[] { return (this.sqlite.prepare("select * from chat_swarm_carrier_operations where swarm_id=? order by updated_at desc").all(swarmId) as Row[]).map(carrierOperationFrom); }
+  casCarrierOperation(operationId: string, expectedVersion: number, from: CarrierOperationState, state: CarrierOperationState, receipt?: Record<string, unknown>): CarrierOperationRecord {
+    const receiptJson = receipt === undefined ? undefined : JSON.stringify(receipt); if (receiptJson && receipt) { assertBounded(receiptJson, MAX_JSON_BYTES, "carrier operation receipt"); validateCarrierReceipt(receipt); }
+    const result = this.sqlite.prepare("update chat_swarm_carrier_operations set state=?,receipt_json=coalesce(?,receipt_json),version=version+1,updated_at=? where operation_id=? and version=? and state=?").run(state, receiptJson ?? null, now(), operationId, expectedVersion, from);
+    if (result.changes !== 1) throw new ChatSwarmError("CAS_DRIFT", "carrier operation changed during update"); return this.getCarrierOperation(operationId)!;
+  }
+  fenceCarrierOperations(): number { const result = this.sqlite.prepare("update chat_swarm_carrier_operations set state='RECONCILE_REQUIRED',version=version+1,updated_at=? where state='IN_FLIGHT'").run(now()); return Number(result.changes); }
 
   createSwarm(input: CreateSwarmInput): ChatSwarm {
     if (!Number.isInteger(input.workerLimit) || input.workerLimit < 1 || input.workerLimit > 1000) throw new ChatSwarmError("INVALID_INPUT", "workerLimit must be between 1 and 1000");
@@ -74,6 +102,7 @@ export class ChatSwarmStore {
   }
   getWorker(id: string): ChatSwarmWorker | undefined { const row = this.sqlite.prepare("select * from chat_swarm_workers where id = ?").get(id) as Row | undefined; return row && workerFrom(row); }
   listWorkers(swarmId: string): ChatSwarmWorker[] { return (this.sqlite.prepare("select * from chat_swarm_workers where swarm_id = ? order by id").all(swarmId) as Row[]).map(workerFrom); }
+  hasQueuedPreferredTask(workerId: string): boolean { return Boolean(this.sqlite.prepare("select 1 from chat_swarm_tasks where preferred_worker_id=? and lifecycle_state='QUEUED' limit 1").get(workerId)); }
   findWorkerByCarrier(swarmId: string, fingerprint: string): ChatSwarmWorker | undefined { const row = this.sqlite.prepare("select * from chat_swarm_workers where swarm_id = ? and carrier_conversation_fingerprint = ? limit 1").get(swarmId, fingerprint) as Row | undefined; return row && workerFrom(row); }
   joinWorkerAtomic(swarmId: string, carrierFingerprint: string, input: CreateWorkerInput): ChatSwarmWorker {
     const operation = this.sqlite.transaction(() => {
@@ -594,6 +623,14 @@ function swarmFrom(row: Row): ChatSwarm { const status = String(row.status); if 
 function workerFrom(row: Row): ChatSwarmWorker { const lifecycleState = String(row.lifecycle_state); if (!(WORKER_STATES as readonly string[]).includes(lifecycleState)) throw new ChatSwarmError("INVALID_STATE", `unknown worker state '${lifecycleState}'`); return { id: String(row.id), swarmId: String(row.swarm_id), label: String(row.label), runtimeKind: String(row.runtime_kind), sessionIdentityFingerprint: row.session_identity_fingerprint == null ? undefined : String(row.session_identity_fingerprint), carrierConversationFingerprint: row.carrier_conversation_fingerprint == null ? undefined : String(row.carrier_conversation_fingerprint), lifecycleState: lifecycleState as ChatSwarmWorker["lifecycleState"], currentTaskId: row.current_task_id == null ? undefined : String(row.current_task_id), lease: parseObject(row.lease_json, "worker lease"), checkpoint: parseObject(row.checkpoint_json, "worker checkpoint"), continuationEpoch: Number(row.continuation_epoch), createdAt: String(row.created_at), updatedAt: String(row.updated_at) }; }
 function taskFrom(row: Row): ChatSwarmTask { const state = String(row.lifecycle_state); assertTaskState(state); const payload = parseObject(row.payload_json, "task payload"); const reconciliation = parseObject(row.reconciliation_json, "reconciliation"); return { id: String(row.id), swarmId: String(row.swarm_id), taskKey: String(row.task_key), requestHash: String(row.request_hash), prompt: String(row.prompt), payload: payload ?? {}, preferredWorkerId: row.preferred_worker_id == null ? undefined : String(row.preferred_worker_id), assignedWorkerId: row.assigned_worker_id == null ? undefined : String(row.assigned_worker_id), lifecycleState: state, result: row.result == null ? undefined : String(row.result), errorCode: row.error_code == null ? undefined : String(row.error_code), errorMessage: row.error_message == null ? undefined : String(row.error_message), retrySafe: row.retry_safe === "true", reconciliation, createdAt: String(row.created_at), updatedAt: String(row.updated_at), completedAt: row.completed_at == null ? undefined : String(row.completed_at), collectedAt: row.collected_at == null ? undefined : String(row.collected_at) }; }
 export function attemptFrom(row: Row): ChatSwarmAttempt { const effectState = String(row.effect_state); if (!(EFFECT_STATES as readonly string[]).includes(effectState)) throw new ChatSwarmError("INVALID_STATE", `unknown attempt effect state '${effectState}'`); return { id: String(row.id), taskId: String(row.task_id), attemptNumber: Number(row.attempt_number), runtimeKind: String(row.runtime_kind), effectState, runtimeReceipt: parseObject(row.runtime_receipt_json, "attempt receipt"), startedAt: row.started_at == null ? undefined : String(row.started_at), acknowledgedAt: row.acknowledged_at == null ? undefined : String(row.acknowledged_at), finishedAt: row.finished_at == null ? undefined : String(row.finished_at), createdAt: String(row.created_at) }; }
+
+function validateCarrierReceipt(receipt: Record<string, unknown>): void {
+  const allowed = new Set(["disposition", "remoteMayContinue", "reason"]);
+  if (Object.keys(receipt).some((key) => !allowed.has(key))) throw new ChatSwarmError("INVALID_INPUT", "carrier receipt contains unsupported fields");
+  if (receipt.disposition !== undefined && !["READY", "DELIVERED", "UNKNOWN", "UNSUPPORTED"].includes(String(receipt.disposition))) throw new ChatSwarmError("INVALID_INPUT", "carrier receipt disposition is malformed");
+  if (receipt.remoteMayContinue !== undefined && typeof receipt.remoteMayContinue !== "boolean") throw new ChatSwarmError("INVALID_INPUT", "carrier receipt continuation flag is malformed");
+  if (receipt.reason !== undefined && (typeof receipt.reason !== "string" || receipt.reason.length > 256)) throw new ChatSwarmError("INVALID_INPUT", "carrier receipt reason is malformed");
+}
 function joinRequestFrom(row: Row): ChatSwarmJoinRequest {
   const status = String(row.status);
   if (!(JOIN_REQUEST_STATES as readonly string[]).includes(status)) {
@@ -613,4 +650,14 @@ function joinRequestFrom(row: Row): ChatSwarmJoinRequest {
     expiresAt: String(row.expires_at),
     approvedAt: row.approved_at == null ? undefined : String(row.approved_at),
   };
+}
+function carrierOperationFrom(row: Row): CarrierOperationRecord {
+  const state = String(row.state); const kind = String(row.kind);
+  if (!["PREPARED","IN_FLIGHT","SUCCEEDED","UNSUPPORTED","RECONCILE_REQUIRED"].includes(state) || !["ENSURE_EXISTING","WAKE"].includes(kind)) throw new ChatSwarmError("INVALID_STATE", "invalid carrier operation state");
+  const request = parseObject(row.request_json, "carrier operation request"); if (!request) throw new ChatSwarmError("INVALID_STATE", "missing carrier operation request");
+  const receipt = parseObject(row.receipt_json, "carrier operation receipt");
+  return { operationId:String(row.operation_id),operationKey:String(row.operation_key),slotKey:String(row.slot_key),swarmId:String(row.swarm_id),workerId:String(row.worker_id),taskId:row.task_id == null ? undefined : String(row.task_id),attemptId:row.attempt_id == null ? undefined : String(row.attempt_id),carrierKind:String(row.carrier_kind),carrierFingerprint:String(row.carrier_fingerprint),bindingEpoch:Number(row.binding_epoch),adapterConfigHash:String(row.adapter_config_hash),kind:kind as CarrierOperationKind,state:state as CarrierOperationState,request,receipt,version:Number(row.version),createdAt:String(row.created_at),updatedAt:String(row.updated_at) };
+}
+function sameCarrierOperationMaterial(a: CarrierOperationRecord, b: Omit<CarrierOperationRecord, "version" | "createdAt" | "updatedAt">): boolean {
+  return a.slotKey===b.slotKey && a.swarmId===b.swarmId && a.workerId===b.workerId && a.taskId===(b.taskId ?? undefined) && a.attemptId===(b.attemptId ?? undefined) && a.carrierKind===b.carrierKind && a.carrierFingerprint===b.carrierFingerprint && a.bindingEpoch===b.bindingEpoch && a.adapterConfigHash===b.adapterConfigHash && a.kind===b.kind && JSON.stringify(a.request)===JSON.stringify(b.request);
 }

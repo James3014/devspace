@@ -247,6 +247,31 @@ export const chatSwarmAttempts = sqliteTable(
   ],
 );
 
+export const chatSwarmCarrierOperations = sqliteTable(
+  "chat_swarm_carrier_operations",
+  {
+    operationId: text("operation_id").primaryKey(),
+    operationKey: text("operation_key").notNull(),
+    slotKey: text("slot_key").notNull().unique(),
+    swarmId: text("swarm_id").notNull().references(() => chatSwarms.id, { onDelete: "cascade" }),
+    workerId: text("worker_id").notNull().references(() => chatSwarmWorkers.id, { onDelete: "cascade" }),
+    taskId: text("task_id").references(() => chatSwarmTasks.id, { onDelete: "cascade" }),
+    attemptId: text("attempt_id").references(() => chatSwarmAttempts.id, { onDelete: "cascade" }),
+    carrierKind: text("carrier_kind").notNull(),
+    carrierFingerprint: text("carrier_fingerprint").notNull(),
+    bindingEpoch: integer("binding_epoch").notNull(),
+    adapterConfigHash: text("adapter_config_hash").notNull(),
+    kind: text("kind").notNull(),
+    state: text("state").notNull(),
+    requestJson: text("request_json").notNull(),
+    receiptJson: text("receipt_json"),
+    version: integer("version").notNull(),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [index("chat_swarm_carrier_operations_worker_idx").on(table.workerId, table.bindingEpoch, table.updatedAt)],
+);
+
 export type LocalAgentSessionRow = typeof localAgentSessions.$inferSelect;
 export type NewLocalAgentSessionRow = typeof localAgentSessions.$inferInsert;
 export type DurableOperationRow = typeof durableOperations.$inferSelect;

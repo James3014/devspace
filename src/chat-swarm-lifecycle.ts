@@ -1,6 +1,7 @@
 import { ChatSwarmError } from "./chat-swarm-contract.js";
 import { ChatSwarmCoordinator } from "./chat-swarm-coordinator.js";
 import { ChatSwarmStore } from "./chat-swarm-store.js";
+import { ChatSwarmCarrierManager, type ChatSwarmCarrierAdapter, type CarrierResult, type CarrierStatusResult } from "./chat-swarm-carrier.js";
 
 export type ChatSwarmLifecycleMode = "normal" | "drain" | "reconcile-only";
 export type ChatSwarmLifecycleAction =
@@ -24,6 +25,7 @@ export interface ChatSwarmLifecycleOptions {
   stateDir: string;
   enabled?: boolean;
   mode?: () => ChatSwarmLifecycleMode;
+  carrierAdapter?: ChatSwarmCarrierAdapter;
 }
 
 export interface ChatSwarmAdmissionContext {
@@ -41,6 +43,7 @@ export class ChatSwarmLifecycle {
   readonly coordinator?: ChatSwarmCoordinator;
   private readonly modeProvider: () => ChatSwarmLifecycleMode;
   private closed = false;
+  private readonly carrierManager?: ChatSwarmCarrierManager;
 
   constructor(options: ChatSwarmLifecycleOptions) {
     this.enabled = options.enabled ?? true;
@@ -49,13 +52,19 @@ export class ChatSwarmLifecycle {
       const store = new ChatSwarmStore(options.stateDir);
       this.store = store;
       this.coordinator = new ChatSwarmCoordinator(store);
+      if (options.carrierAdapter) this.carrierManager = new ChatSwarmCarrierManager(store, this.coordinator, options.carrierAdapter);
     }
   }
 
   recoverAfterStartup(): number {
     this.requireEnabled();
+    this.store!.fenceCarrierOperations();
     return this.store!.recoverAfterRestart();
   }
+
+  async ensureCarriers(meta: unknown, input: { swarmId: string; capacity: number; adapterConfigHash: string }): Promise<CarrierResult[]> { this.requireCarrierEffects(); return this.carrierManager!.ensure(meta, input.swarmId, input.capacity, input.adapterConfigHash); }
+  carrierStatus(meta: unknown, swarmId: string): CarrierStatusResult { this.requireEnabled(); if (!this.carrierManager) throw new ChatSwarmError("INVALID_STATE", "carrier adapter is unavailable"); return this.carrierManager.status(meta, swarmId); }
+  async carrierWake(meta: unknown, input: { swarmId: string; workerId: string; expectedEpoch: number; taskId?: string; adapterConfigHash: string }): Promise<CarrierResult> { this.requireCarrierEffects(); return this.carrierManager!.wake(meta, input); }
 
   admit(action: ChatSwarmLifecycleAction, context: ChatSwarmAdmissionContext = {}): void {
     this.requireEnabled();
@@ -83,4 +92,5 @@ export class ChatSwarmLifecycle {
     }
     if (this.closed) throw new ChatSwarmError("INVALID_STATE", "chat swarm lifecycle is closed");
   }
+  private requireCarrierEffects(): void { this.requireEnabled(); if (this.modeProvider() !== "normal") throw new ChatSwarmError("INVALID_STATE", "carrier effects are unavailable while lifecycle is not normal"); if (!this.carrierManager) throw new ChatSwarmError("INVALID_STATE", "carrier adapter is unavailable"); }
 }

@@ -5,6 +5,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { ChatSwarmError } from "./chat-swarm-contract.js";
 import { ChatSwarmLifecycle, type ChatSwarmLifecycleMode } from "./chat-swarm-lifecycle.js";
+import type { ChatSwarmCarrierAdapter } from "./chat-swarm-carrier.js";
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "devspace-chat-swarm-lifecycle-"));
@@ -85,4 +86,11 @@ test("disabled lifecycle has no store and closes safely", () => {
     lifecycle.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("carrier effects require injected adapter, owner, normal mode, and explicit startup recovery", async () => {
+  const root = mkdtempSync(join(tmpdir(), "devspace-chat-swarm-carrier-lifecycle-")); let mode: ChatSwarmLifecycleMode = "normal";
+  const adapter: ChatSwarmCarrierAdapter = { kind: "fake", capabilities: () => ({ boundedWait: "UNSUPPORTED", eventWake: "UNSUPPORTED", resultReadback: "UNSUPPORTED", durableReplay: "SUPPORTED" }), ensureExisting: async (input) => ({ disposition: "READY", operationId: input.operationId, swarmId: input.swarmId, workerId: input.workerId, expectedEpoch: input.expectedEpoch, carrierKind: input.carrierKind, carrierFingerprint: input.carrierFingerprint, remoteMayContinue: false }), wake: async (input) => ({ disposition: "UNSUPPORTED", operationId: input.operationId, swarmId: input.swarmId, workerId: input.workerId, expectedEpoch: input.expectedEpoch, carrierKind: input.carrierKind, carrierFingerprint: input.carrierFingerprint, remoteMayContinue: false }) };
+  const lifecycle = new ChatSwarmLifecycle({ stateDir: root, mode: () => mode, carrierAdapter: adapter }); const owner = { "openai/session": "owner" };
+  try { const swarm = lifecycle.coordinator!.createSwarm(owner, { workerLimit: 1 }); lifecycle.store!.createWorker({ swarmId: swarm.id, label: "peer", runtimeKind: "mcp_peer", carrierConversationFingerprint: "a".repeat(64) }); const status = lifecycle.carrierStatus(owner, swarm.id); assert.equal(status.workers.length, 1); mode = "drain"; await assert.rejects(lifecycle.ensureCarriers(owner, { swarmId: swarm.id, capacity: 1, adapterConfigHash: "b".repeat(64) }), /carrier effects are unavailable/); mode = "normal"; assert.equal(lifecycle.recoverAfterStartup(), 0); } finally { lifecycle.close(); rmSync(root, { recursive: true, force: true }); }
 });
