@@ -10,6 +10,7 @@ export type ChatSwarmLifecycleAction =
   | "next"
   | "submit"
   | "status"
+  | "list_tasks"
   | "collect"
   | "cancel"
   | "reconcile"
@@ -62,7 +63,7 @@ export class ChatSwarmLifecycle {
     if (mode === "normal") return;
 
     if (action === "next" && context.existingTask === true) return;
-    if (["status", "collect", "cancel", "reconcile", "submit", "peer_status", "inspect"].includes(action)) return;
+    if (["status", "list_tasks", "collect", "cancel", "reconcile", "submit", "peer_status", "inspect"].includes(action)) return;
 
     throw new ChatSwarmError(
       "INVALID_STATE",

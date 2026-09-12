@@ -16,14 +16,14 @@ function close(f: ReturnType<typeof fixture>) { f.store.close(); rmSync(f.root, 
 function tools(server: McpServer): Record<string, { handler: (input: any, extra: any) => Promise<any>; inputSchema: any }> { return (server as any)._registeredTools; }
 const now = () => new Date().toISOString();
 
-test("registers ten typed swarm tools and disabled config registers none", async () => {
+test("registers typed swarm tools and disabled config registers none", async () => {
   const f = fixture();
   try {
     const disabled = new McpServer({ name: "disabled", version: "1" });
     assert.equal(registerChatSwarmTools(disabled, { coordinator: f.coordinator, config: { ...config, chatSwarmEnabled: false }, authorizeInvite: () => true }), 0);
     assert.deepEqual(Object.keys(tools(disabled)), []);
     const server = new McpServer({ name: "enabled", version: "1" });
-    assert.equal(registerChatSwarmTools(server, { coordinator: f.coordinator, config, authorizeInvite: () => true }), 14);
+    assert.equal(registerChatSwarmTools(server, { coordinator: f.coordinator, config, authorizeInvite: () => true }), 15);
     assert.deepEqual(Object.keys(tools(server)).sort(), [
       "chat_swarm_approve_join",
       "chat_swarm_cancel",
@@ -34,6 +34,7 @@ test("registers ten typed swarm tools and disabled config registers none", async
       "chat_swarm_inspect",
       "chat_swarm_join",
       "chat_swarm_join_request",
+      "chat_swarm_list_tasks",
       "chat_swarm_next",
       "chat_swarm_peer_status",
       "chat_swarm_reconcile",
@@ -41,6 +42,10 @@ test("registers ten typed swarm tools and disabled config registers none", async
       "chat_swarm_submit",
     ]);
     assert.throws(() => tools(server).chat_swarm_submit.inputSchema.parse({ workerId: "w", taskId: "t", result: "x".repeat(config.chatSwarmResultMaxChars + 1) }));
+    assert.throws(() => tools(server).chat_swarm_list_tasks.inputSchema.parse({ swarmId: "s", cursor: "" }));
+    assert.throws(() => tools(server).chat_swarm_list_tasks.inputSchema.parse({ swarmId: "s", cursor: "x".repeat(1025) }));
+    assert.throws(() => tools(server).chat_swarm_list_tasks.inputSchema.parse({ swarmId: "s", limit: 0 }));
+    assert.throws(() => tools(server).chat_swarm_list_tasks.inputSchema.parse({ swarmId: "s", limit: 101 }));
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
     const client = new Client({ name: "swarm-tools-client", version: "1" });
     await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
@@ -127,6 +132,8 @@ test("production-shaped handlers enforce owner, worker, invite TTL, and drain ad
     assert.equal(drainSubmit.isError, undefined);
     const blockedDispatch = await drainClient.callTool({ name: "chat_swarm_dispatch", arguments: { swarmId: swarmIdForTask, taskKey: "drain-blocked", prompt: "p" }, _meta: owner });
     assert.equal(blockedDispatch.isError, true);
+    const drainLedger = await drainClient.callTool({ name: "chat_swarm_list_tasks", arguments: { swarmId: swarmIdForTask }, _meta: owner });
+    assert.equal(drainLedger.isError, undefined);
     await drainClient.close();
     await drainServer.close();
     const wrongWorker = await normal.chat_swarm_submit.handler({ workerId, taskId: task.structuredContent.id, result: "x" }, { _meta: { "openai/session": "other" } });

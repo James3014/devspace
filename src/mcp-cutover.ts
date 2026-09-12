@@ -83,6 +83,7 @@ export const CUTOVER_SAFE_TOOLS: ReadonlySet<string> = new Set([
   "chat_swarm_next",
   "chat_swarm_submit",
   "chat_swarm_status",
+  "chat_swarm_list_tasks",
   "chat_swarm_collect",
   "chat_swarm_reconcile",
   "chat_swarm_cancel",

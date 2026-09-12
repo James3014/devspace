@@ -1,4 +1,4 @@
-import { ChatSwarmError, type ChatSwarm, type ChatSwarmTask, type ChatSwarmWorker, type TaskRequest, type ReconciliationEvidence } from "./chat-swarm-contract.js";
+import { ChatSwarmError, type ChatSwarm, type ChatSwarmTask, type ChatSwarmWorker, type TaskRequest, type ReconciliationEvidence, type ChatSwarmTaskLedgerPage } from "./chat-swarm-contract.js";
 import { ChatSwarmStore, type CreateSwarmInput, type CreateWorkerInput } from "./chat-swarm-store.js";
 import { resolveChatSwarmIdentity, ChatSwarmIdentityError, type ChatSwarmIdentityEvidence } from "./request-meta.js";
 
@@ -87,6 +87,11 @@ export class ChatSwarmCoordinator {
     const task = this.store.getTask(taskId);
     if (!task || task.swarmId !== swarmId) throw new ChatSwarmError("NOT_FOUND", "task not found in swarm");
     return task;
+  }
+
+  listTasks(meta: unknown, swarmId: string, cursor?: string, limit = 50): ChatSwarmTaskLedgerPage {
+    this.assertOwner(meta, swarmId);
+    return this.store.listTaskLedger(swarmId, cursor, limit);
   }
 
   collect(meta: unknown, swarmId: string, taskId: string): ChatSwarmTask { this.requireOwnedTask(meta, swarmId, taskId); return this.store.collectTask(taskId); }

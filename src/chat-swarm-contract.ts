@@ -31,6 +31,13 @@ export interface ChatSwarmTask {
   retrySafe: boolean; reconciliation?: Record<string, unknown>; createdAt: string; updatedAt: string;
   completedAt?: string; collectedAt?: string;
 }
+export interface ChatSwarmTaskSummary {
+  taskId: string; taskKey: string; preferredWorkerId?: string; assignedWorkerId?: string;
+  lifecycleState: ChatSwarmTaskState; latestAttemptId?: string; latestAttemptNumber?: number;
+  createdAt: string; updatedAt: string; completedAt?: string; collectedAt?: string;
+  resultPresent: boolean; resultHash?: string;
+}
+export interface ChatSwarmTaskLedgerPage { tasks: ChatSwarmTaskSummary[]; nextCursor?: string; }
 export interface ChatSwarmAttempt {
   id: string; taskId: string; attemptNumber: number; runtimeKind: ChatSwarmRuntimeKind;
   effectState: string; runtimeReceipt?: Record<string, unknown>; startedAt?: string;

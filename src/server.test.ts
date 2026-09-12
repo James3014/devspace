@@ -772,7 +772,7 @@ test("Chat Swarm production registration is opt-in and uses the shared lifecycle
   const enabled = await fixture(t, { chatSwarm: true });
   const tools = await enabled.client.listTools();
   const swarmTools = tools.tools.filter((tool) => tool.name.startsWith("chat_swarm_"));
-  assert.equal(swarmTools.length, 14);
+  assert.equal(swarmTools.length, 15);
   assert.ok(swarmTools.every((tool) => tool.inputSchema));
   const expectedShapes = chatSwarmToolInputShapes(enabled.config);
   assertRegisteredChatSwarmSchemaParity(swarmTools, expectedShapes);
@@ -782,11 +782,15 @@ test("Chat Swarm production registration is opt-in and uses the shared lifecycle
     chat_swarm_next: { workerId: z.string().min(1) },
   }));
   assert.ok(swarmTools.find((tool) => tool.name === "chat_swarm_status")?.annotations?.readOnlyHint);
+  assert.ok(swarmTools.find((tool) => tool.name === "chat_swarm_list_tasks")?.annotations?.readOnlyHint);
   const owner = { "openai/session": "server-owner" };
   const created = await enabled.client.callTool({ name: "chat_swarm_create", arguments: { workerLimit: 1 }, _meta: owner });
   assert.equal(created.isError, undefined);
   const createdValue = created.structuredContent as Record<string, any>;
   assert.equal(createdValue.swarm.status, "ACTIVE");
+  const ledger = await enabled.client.callTool({ name: "chat_swarm_list_tasks", arguments: { swarmId: createdValue.swarm.id }, _meta: owner });
+  assert.equal(ledger.isError, undefined);
+  assert.deepEqual((ledger.structuredContent as any).tasks, []);
   const workerCall = await enabled.client.callTool({
     name: "chat_swarm_join",
     arguments: { swarmId: createdValue.swarm.id, inviteCredential: createdValue.inviteCredential, label: "server-peer", runtimeKind: "mcp_peer" },

@@ -16,6 +16,7 @@ export type ChatSwarmAdmissionAction =
   | "reconcile"
   | "collect"
   | "status"
+  | "list_tasks"
   | "close"
   | "peer_status"
   | "inspect"
@@ -36,6 +37,8 @@ const boundedObject = z.record(z.string(), z.unknown()).superRefine((value, ctx)
 const metadata = boundedObject.optional();
 const createMetadata = boundedObject.refine((value) => Buffer.byteLength(JSON.stringify(value), "utf8") <= 60 * 1024, "metadata leaves room for invite issuance metadata").optional();
 const taskResult = z.object({ id, swarmId: id, taskKey: id, requestHash: z.string(), prompt: z.string(), payload: boundedObject, preferredWorkerId: id.optional(), assignedWorkerId: id.optional(), lifecycleState: z.string(), result: z.string().optional(), errorCode: z.string().optional(), errorMessage: z.string().optional(), retrySafe: z.boolean(), reconciliation: boundedObject.optional(), createdAt: z.string(), updatedAt: z.string(), completedAt: z.string().optional(), collectedAt: z.string().optional() });
+const taskSummary = z.object({ taskId: id, taskKey: id, preferredWorkerId: id.optional(), assignedWorkerId: id.optional(), lifecycleState: z.string(), latestAttemptId: id.optional(), latestAttemptNumber: z.number().int().positive().optional(), createdAt: z.string(), updatedAt: z.string(), completedAt: z.string().optional(), collectedAt: z.string().optional(), resultPresent: z.boolean(), resultHash: z.string().length(64).optional() });
+const taskLedgerResult = z.object({ tasks: z.array(taskSummary), nextCursor: z.string().optional() });
 const workerResult = z.object({ id, swarmId: id, label: id, runtimeKind: z.literal("mcp_peer"), sessionIdentityFingerprint: z.string().optional(), carrierConversationFingerprint: z.string().optional(), lifecycleState: z.string(), currentTaskId: id.optional(), lease: boundedObject.optional(), checkpoint: boundedObject.optional(), continuationEpoch: z.number().int().nonnegative(), createdAt: z.string(), updatedAt: z.string() });
 const swarmResult = z.object({ id, status: z.enum(["ACTIVE", "CLOSED"]), ownerIdentityFingerprint: z.string().regex(/^[0-9a-f]{64}$/), workerLimit: z.number().int().positive(), inviteCredentialHash: z.string().optional(), metadata: boundedObject, revision: z.number().int().positive(), createdAt: z.string(), updatedAt: z.string() });
 const createResult = z.object({ swarm: swarmResult, inviteCredential: z.string(), inviteIssuedAt: z.string() });
@@ -141,6 +144,7 @@ export function chatSwarmToolInputShapes(config: Pick<ServerConfig, "chatSwarmMa
     chat_swarm_create: { workerLimit: z.number().int().min(1).max(config.chatSwarmMaxWorkers), metadata: createMetadata },
     chat_swarm_dispatch: { swarmId, taskKey: id, prompt: z.string().min(1).max(64 * 1024), payload: metadata, preferredWorkerId: workerId.optional(), id: id.optional() },
     chat_swarm_status: { swarmId, taskId },
+    chat_swarm_list_tasks: { swarmId, cursor: z.string().min(1).max(1024).optional(), limit: z.number().int().min(1).max(100).optional() },
     chat_swarm_collect: { swarmId, taskId },
     chat_swarm_cancel: { swarmId, taskId },
     chat_swarm_reconcile: { swarmId, taskId, decision: z.enum(["REQUEUE", "FAILED", "RESULT_READY"]), result: z.string().max(config.chatSwarmResultMaxChars).optional(), evidence: evidence.optional() },
@@ -253,6 +257,9 @@ export function registerChatSwarmTools(
   server.registerTool("chat_swarm_status", { title: "Inspect swarm task", description: "Read one task without changing it.", inputSchema: schemas.chat_swarm_status, outputSchema: taskResult, annotations: { readOnlyHint: true, idempotentHint: true } }, async (input: any, extra) => {
     try { admit("status"); return success(coordinator.status(meta(extra), input.swarmId, input.taskId)); } catch (error) { return failure(error, "status"); }
   });
+  server.registerTool("chat_swarm_list_tasks", { title: "List swarm task ledger", description: "Read bounded redacted task summaries for the owning controller after context loss.", inputSchema: schemas.chat_swarm_list_tasks, outputSchema: taskLedgerResult, annotations: { readOnlyHint: true, idempotentHint: true } }, async (input: any, extra) => {
+    try { admit("list_tasks"); return success(coordinator.listTasks(meta(extra), input.swarmId, input.cursor, input.limit)); } catch (error) { return failure(error, "list_tasks"); }
+  });
   server.registerTool("chat_swarm_collect", { title: "Collect swarm result", description: "Idempotently mark a ready result collected.", inputSchema: schemas.chat_swarm_collect, outputSchema: taskResult, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true } }, async (input: any, extra) => {
     try { admit("collect"); return success(coordinator.collect(meta(extra), input.swarmId, input.taskId)); } catch (error) { return failure(error, "collect"); }
   });
@@ -286,5 +293,5 @@ export function registerChatSwarmTools(
   server.registerTool("chat_swarm_approve_join", { title: "Approve peer join request", description: "Owner approves a pending peer join request and atomically binds a worker slot.", inputSchema: schemas.chat_swarm_approve_join, outputSchema: approveJoinResult, annotations: { readOnlyHint: false, idempotentHint: true } }, async (input: any, extra) => {
     try { admit("approve_join"); return success(coordinator.approveJoin(meta(extra), input.swarmId, input.requestId, input.expectedRequestVersion, input.expectedSwarmVersion)); } catch (error) { return failure(error, "approve_join"); }
   });
-  return 14;
+  return 15;
 }

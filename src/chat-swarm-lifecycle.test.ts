@@ -50,7 +50,7 @@ test("drain permits current-task next and uncertainty-safe completion, but rejec
     }
     assert.doesNotThrow(() => f.lifecycle.admit("next", { existingTask: true }));
     assert.throws(() => f.lifecycle.admit("next", { existingTask: false }), ChatSwarmError);
-    for (const action of ["submit", "status", "collect", "cancel", "reconcile"] as const) {
+    for (const action of ["submit", "status", "list_tasks", "collect", "cancel", "reconcile"] as const) {
       assert.doesNotThrow(() => f.lifecycle.admit(action));
     }
   } finally {
@@ -62,7 +62,7 @@ test("reconcile-only permits inspection and explicit recovery actions only", () 
   const f = fixture();
   try {
     f.setMode("reconcile-only");
-    for (const action of ["status", "collect", "cancel", "reconcile", "submit"] as const) {
+    for (const action of ["status", "list_tasks", "collect", "cancel", "reconcile", "submit"] as const) {
       assert.doesNotThrow(() => f.lifecycle.admit(action));
     }
     for (const action of ["create", "join", "dispatch", "next", "close"] as const) {

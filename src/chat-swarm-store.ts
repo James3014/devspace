@@ -5,6 +5,7 @@ import {
   MAX_ID_BYTES, MAX_JSON_BYTES, MAX_PROMPT_BYTES, MAX_RESULT_BYTES, newId, requestHash, joinRequestHash,
   type ChatSwarm, type ChatSwarmAttempt, type ChatSwarmRuntimeKind, type ChatSwarmTask,
   type ChatSwarmTaskState, type ChatSwarmWorker, type TaskRequest, type ReconciliationEvidence,
+  type ChatSwarmTaskLedgerPage, type ChatSwarmTaskSummary,
   type ChatSwarmJoinRequest, type ChatSwarmJoinRequestStatus, JOIN_REQUEST_STATES,
 } from "./chat-swarm-contract.js";
 
@@ -122,10 +123,36 @@ export class ChatSwarmStore {
   }
   getTask(id: string): ChatSwarmTask | undefined { const row = this.sqlite.prepare("select * from chat_swarm_tasks where id = ?").get(id) as Row | undefined; return row && taskFrom(row); }
   getTaskByKey(swarmId: string, taskKey: string): ChatSwarmTask | undefined { const row = this.sqlite.prepare("select * from chat_swarm_tasks where swarm_id = ? and task_key = ?").get(swarmId, taskKey) as Row | undefined; return row && taskFrom(row); }
+  listTaskLedger(swarmId: string, cursor?: string, limit = 50): ChatSwarmTaskLedgerPage {
+    if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new ChatSwarmError("INVALID_INPUT", "limit must be between 1 and 100");
+    let after: { swarmId: string; createdAt: string; taskId: string; rowid: number } | undefined;
+    if (cursor !== undefined) {
+      assertBounded(cursor, 1024, "cursor");
+      try {
+        const decoded = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8")) as Record<string, unknown>;
+        if (typeof decoded.swarmId !== "string" || typeof decoded.createdAt !== "string" || typeof decoded.taskId !== "string" || typeof decoded.rowid !== "number" || !Number.isSafeInteger(decoded.rowid)) throw new Error();
+        after = { swarmId: decoded.swarmId, createdAt: decoded.createdAt, taskId: decoded.taskId, rowid: decoded.rowid };
+      } catch { throw new ChatSwarmError("INVALID_INPUT", "cursor is invalid"); }
+      if (after.swarmId !== swarmId) throw new ChatSwarmError("OWNERSHIP_CONFLICT", "cursor does not belong to swarm");
+      const anchor = this.sqlite.prepare("select rowid as task_rowid,created_at,id from chat_swarm_tasks where swarm_id=? and id=?").get(swarmId, after.taskId) as { task_rowid: number; created_at: string; id: string } | undefined;
+      if (!anchor || Number(anchor.task_rowid) !== after.rowid || String(anchor.created_at) !== after.createdAt) throw new ChatSwarmError("INVALID_INPUT", "cursor anchor is invalid");
+    }
+    const rows = after
+      ? this.sqlite.prepare("select rowid as task_rowid,* from chat_swarm_tasks where swarm_id=? and (created_at > ? or (created_at = ? and rowid > ?)) order by created_at asc,rowid asc limit ?").all(swarmId, after.createdAt, after.createdAt, after.rowid, limit + 1) as Row[]
+      : this.sqlite.prepare("select rowid as task_rowid,* from chat_swarm_tasks where swarm_id=? order by created_at asc,rowid asc limit ?").all(swarmId, limit + 1) as Row[];
+    const pageRows = rows.slice(0, limit);
+    const tasks: ChatSwarmTaskSummary[] = pageRows.map((row) => {
+      const task = taskFrom(row);
+      const attempt = this.sqlite.prepare("select id,attempt_number from chat_swarm_attempts where task_id=? order by attempt_number desc limit 1").get(task.id) as { id: string; attempt_number: number } | undefined;
+      return { taskId: task.id, taskKey: task.taskKey, preferredWorkerId: task.preferredWorkerId, assignedWorkerId: task.assignedWorkerId, lifecycleState: task.lifecycleState, latestAttemptId: attempt?.id, latestAttemptNumber: attempt?.attempt_number, createdAt: task.createdAt, updatedAt: task.updatedAt, completedAt: task.completedAt, collectedAt: task.collectedAt, resultPresent: task.result !== undefined, resultHash: task.result === undefined ? undefined : hashContent(task.result) };
+    });
+    const last = pageRows[pageRows.length - 1];
+    return { tasks, nextCursor: rows.length > limit && last ? Buffer.from(JSON.stringify({ swarmId, createdAt: String(last.created_at), taskId: String(last.id), rowid: Number(last.task_rowid) }), "utf8").toString("base64url") : undefined };
+  }
   countQueuedTasks(swarmId: string): number { return Number((this.sqlite.prepare("select count(*) as count from chat_swarm_tasks where swarm_id=? and lifecycle_state='QUEUED'").get(swarmId) as { count: number }).count); }
-  nextQueuedTask(swarmId: string, preferredWorkerId?: string): ChatSwarmTask | undefined { const row = this.sqlite.prepare("select * from chat_swarm_tasks where swarm_id = ? and lifecycle_state = 'QUEUED' and (? is null or preferred_worker_id is null or preferred_worker_id = ?) order by created_at, id limit 1").get(swarmId, preferredWorkerId ?? null, preferredWorkerId ?? null) as Row | undefined; return row && taskFrom(row); }
+  nextQueuedTask(swarmId: string, preferredWorkerId?: string): ChatSwarmTask | undefined { const row = this.sqlite.prepare("select * from chat_swarm_tasks where swarm_id = ? and lifecycle_state = 'QUEUED' and (? is null or preferred_worker_id is null or preferred_worker_id = ?) order by created_at,rowid limit 1").get(swarmId, preferredWorkerId ?? null, preferredWorkerId ?? null) as Row | undefined; return row && taskFrom(row); }
   claimNextQueuedTaskAtomic(workerId: string): ChatSwarmTask | undefined {
-    const operation = this.sqlite.transaction(() => { const worker = this.requireWorker(workerId); if (this.getSwarm(worker.swarmId)?.status !== "ACTIVE") return undefined; if (worker.lifecycleState !== "AVAILABLE" || worker.currentTaskId) return undefined; const row = this.sqlite.prepare("select * from chat_swarm_tasks where swarm_id=? and lifecycle_state='QUEUED' and (preferred_worker_id is null or preferred_worker_id=?) order by created_at,id limit 1").get(worker.swarmId, workerId) as Row | undefined; if (!row) return undefined; const task = taskFrom(row); const timestamp = now(); const previous = this.sqlite.prepare("select coalesce(max(attempt_number),0) as number from chat_swarm_attempts where task_id=?").get(task.id) as { number:number }; this.claimTaskInTransaction(task.id, workerId, worker.runtimeKind, timestamp, Number(previous.number)+1); return this.requireTask(task.id); }); return operation.immediate();
+    const operation = this.sqlite.transaction(() => { const worker = this.requireWorker(workerId); if (this.getSwarm(worker.swarmId)?.status !== "ACTIVE") return undefined; if (worker.lifecycleState !== "AVAILABLE" || worker.currentTaskId) return undefined; const row = this.sqlite.prepare("select * from chat_swarm_tasks where swarm_id=? and lifecycle_state='QUEUED' and (preferred_worker_id is null or preferred_worker_id=?) order by created_at,rowid limit 1").get(worker.swarmId, workerId) as Row | undefined; if (!row) return undefined; const task = taskFrom(row); const timestamp = now(); const previous = this.sqlite.prepare("select coalesce(max(attempt_number),0) as number from chat_swarm_attempts where task_id=?").get(task.id) as { number:number }; this.claimTaskInTransaction(task.id, workerId, worker.runtimeKind, timestamp, Number(previous.number)+1); return this.requireTask(task.id); }); return operation.immediate();
   }
   dispatchTaskAtomic(input: TaskRequest & { id?: string }, queueLimit?: number): ChatSwarmTask {
     assertBounded(input.prompt, MAX_PROMPT_BYTES, "prompt"); assertBounded(input.taskKey, MAX_ID_BYTES, "taskKey"); if (input.id) assertBounded(input.id, MAX_ID_BYTES, "task id");
@@ -133,12 +160,20 @@ export class ChatSwarmStore {
     const operation = this.sqlite.transaction(() => {
       const swarm = this.getSwarm(input.swarmId); if (!swarm) throw new ChatSwarmError("NOT_FOUND", "swarm not found"); if (swarm.status !== "ACTIVE") throw new ChatSwarmError("INVALID_STATE", "swarm is not active");
       const hash = requestHash(input); const existing = this.sqlite.prepare("select * from chat_swarm_tasks where swarm_id=? and task_key=?").get(input.swarmId, input.taskKey) as Row | undefined;
-      if (existing) { const task = taskFrom(existing); if (task.requestHash !== hash) throw new ChatSwarmError("REPLAY_CONFLICT", "task replay material differs"); if (task.lifecycleState !== "QUEUED") return task; }
+      if (existing) { const task = taskFrom(existing); if (task.requestHash !== hash) throw new ChatSwarmError("REPLAY_CONFLICT", "task replay material differs"); return task; }
       if (!existing && queueLimit !== undefined && this.countQueuedTasks(input.swarmId) >= queueLimit) throw new ChatSwarmError("INVALID_INPUT", "swarm queue limit reached");
-      const taskId = existing ? String(existing.id) : input.id ?? newId("task"); const timestamp = now();
-      if (!existing) this.insertTaskRow(input, taskId, hash, payloadJson, timestamp);
+      const taskId = input.id ?? newId("task"); const timestamp = now();
+      this.insertTaskRow(input, taskId, hash, payloadJson, timestamp);
       const worker = input.preferredWorkerId ? this.requireWorker(input.preferredWorkerId) : this.listWorkers(input.swarmId).find((candidate) => candidate.lifecycleState === "AVAILABLE");
-      if (!worker) return this.requireTask(taskId); if (worker.swarmId !== input.swarmId || worker.lifecycleState !== "AVAILABLE" || worker.currentTaskId) throw new ChatSwarmError("OWNERSHIP_CONFLICT", "dispatch target is unavailable");
+      if (!worker) return this.requireTask(taskId);
+      if (worker.swarmId !== input.swarmId) throw new ChatSwarmError("OWNERSHIP_CONFLICT", "dispatch target belongs to another swarm");
+      if (worker.lifecycleState === "DISABLED" || worker.lifecycleState === "RECONCILE_REQUIRED") throw new ChatSwarmError("RECONCILIATION_REQUIRED", "dispatch target requires reconciliation");
+      if (worker.lifecycleState === "BUSY" && worker.currentTaskId) {
+        const current = this.getTask(worker.currentTaskId);
+        if (!current || current.swarmId !== input.swarmId || current.assignedWorkerId !== worker.id || !isExecutionActive(current.lifecycleState)) throw new ChatSwarmError("OWNERSHIP_CONFLICT", "dispatch target busy pointer is inconsistent");
+        return this.requireTask(taskId);
+      }
+      if (worker.lifecycleState !== "AVAILABLE" || worker.currentTaskId) throw new ChatSwarmError("OWNERSHIP_CONFLICT", "dispatch target is internally inconsistent");
       const task = this.requireTask(taskId); if (task.preferredWorkerId && task.preferredWorkerId !== worker.id) throw new ChatSwarmError("OWNERSHIP_CONFLICT", "dispatch target does not satisfy preference");
       const previous = this.sqlite.prepare("select coalesce(max(attempt_number),0) as number from chat_swarm_attempts where task_id=?").get(taskId) as { number:number }; this.claimTaskInTransaction(taskId, worker.id, worker.runtimeKind, timestamp, Number(previous.number)+1); return this.requireTask(taskId);
     }); return operation.immediate();
