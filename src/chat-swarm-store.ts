@@ -6,6 +6,7 @@ import {
   type ChatSwarm, type ChatSwarmAttempt, type ChatSwarmRuntimeKind, type ChatSwarmTask,
   type ChatSwarmTaskState, type ChatSwarmWorker, type TaskRequest, type ReconciliationEvidence,
   type ChatSwarmJoinRequest, type ChatSwarmJoinRequestStatus, JOIN_REQUEST_STATES,
+  type ChatSwarmTaskSummary, type ChatSwarmTaskListResult,
 } from "./chat-swarm-contract.js";
 
 type Row = Record<string, unknown>;
@@ -123,9 +124,24 @@ export class ChatSwarmStore {
   getTask(id: string): ChatSwarmTask | undefined { const row = this.sqlite.prepare("select * from chat_swarm_tasks where id = ?").get(id) as Row | undefined; return row && taskFrom(row); }
   getTaskByKey(swarmId: string, taskKey: string): ChatSwarmTask | undefined { const row = this.sqlite.prepare("select * from chat_swarm_tasks where swarm_id = ? and task_key = ?").get(swarmId, taskKey) as Row | undefined; return row && taskFrom(row); }
   countQueuedTasks(swarmId: string): number { return Number((this.sqlite.prepare("select count(*) as count from chat_swarm_tasks where swarm_id=? and lifecycle_state='QUEUED'").get(swarmId) as { count: number }).count); }
-  nextQueuedTask(swarmId: string, preferredWorkerId?: string): ChatSwarmTask | undefined { const row = this.sqlite.prepare("select * from chat_swarm_tasks where swarm_id = ? and lifecycle_state = 'QUEUED' and (? is null or preferred_worker_id is null or preferred_worker_id = ?) order by created_at, id limit 1").get(swarmId, preferredWorkerId ?? null, preferredWorkerId ?? null) as Row | undefined; return row && taskFrom(row); }
+  nextQueuedTask(swarmId: string, preferredWorkerId?: string): ChatSwarmTask | undefined {
+    const row = this.sqlite.prepare("select * from chat_swarm_tasks where swarm_id = ? and lifecycle_state = 'QUEUED' and (? is null or preferred_worker_id is null or preferred_worker_id = ?) order by (case when ? is not null and preferred_worker_id = ? then 0 else 1 end), rowid asc limit 1").get(swarmId, preferredWorkerId ?? null, preferredWorkerId ?? null, preferredWorkerId ?? null, preferredWorkerId ?? null) as Row | undefined;
+    return row && taskFrom(row);
+  }
   claimNextQueuedTaskAtomic(workerId: string): ChatSwarmTask | undefined {
-    const operation = this.sqlite.transaction(() => { const worker = this.requireWorker(workerId); if (this.getSwarm(worker.swarmId)?.status !== "ACTIVE") return undefined; if (worker.lifecycleState !== "AVAILABLE" || worker.currentTaskId) return undefined; const row = this.sqlite.prepare("select * from chat_swarm_tasks where swarm_id=? and lifecycle_state='QUEUED' and (preferred_worker_id is null or preferred_worker_id=?) order by created_at,id limit 1").get(worker.swarmId, workerId) as Row | undefined; if (!row) return undefined; const task = taskFrom(row); const timestamp = now(); const previous = this.sqlite.prepare("select coalesce(max(attempt_number),0) as number from chat_swarm_attempts where task_id=?").get(task.id) as { number:number }; this.claimTaskInTransaction(task.id, workerId, worker.runtimeKind, timestamp, Number(previous.number)+1); return this.requireTask(task.id); }); return operation.immediate();
+    const operation = this.sqlite.transaction(() => {
+      const worker = this.requireWorker(workerId);
+      if (this.getSwarm(worker.swarmId)?.status !== "ACTIVE") return undefined;
+      if (worker.lifecycleState !== "AVAILABLE" || worker.currentTaskId) return undefined;
+      const row = this.sqlite.prepare("select * from chat_swarm_tasks where swarm_id=? and lifecycle_state='QUEUED' and (preferred_worker_id is null or preferred_worker_id=?) order by (case when preferred_worker_id=? then 0 else 1 end), rowid asc limit 1").get(worker.swarmId, workerId, workerId) as Row | undefined;
+      if (!row) return undefined;
+      const task = taskFrom(row);
+      const timestamp = now();
+      const previous = this.sqlite.prepare("select coalesce(max(attempt_number),0) as number from chat_swarm_attempts where task_id=?").get(task.id) as { number:number };
+      this.claimTaskInTransaction(task.id, workerId, worker.runtimeKind, timestamp, Number(previous.number)+1);
+      return this.requireTask(task.id);
+    });
+    return operation.immediate();
   }
   dispatchTaskAtomic(input: TaskRequest & { id?: string }, queueLimit?: number): ChatSwarmTask {
     assertBounded(input.prompt, MAX_PROMPT_BYTES, "prompt"); assertBounded(input.taskKey, MAX_ID_BYTES, "taskKey"); if (input.id) assertBounded(input.id, MAX_ID_BYTES, "task id");
@@ -137,11 +153,113 @@ export class ChatSwarmStore {
       if (!existing && queueLimit !== undefined && this.countQueuedTasks(input.swarmId) >= queueLimit) throw new ChatSwarmError("INVALID_INPUT", "swarm queue limit reached");
       const taskId = existing ? String(existing.id) : input.id ?? newId("task"); const timestamp = now();
       if (!existing) this.insertTaskRow(input, taskId, hash, payloadJson, timestamp);
-      const worker = input.preferredWorkerId ? this.requireWorker(input.preferredWorkerId) : this.listWorkers(input.swarmId).find((candidate) => candidate.lifecycleState === "AVAILABLE");
-      if (!worker) return this.requireTask(taskId); if (worker.swarmId !== input.swarmId || worker.lifecycleState !== "AVAILABLE" || worker.currentTaskId) throw new ChatSwarmError("OWNERSHIP_CONFLICT", "dispatch target is unavailable");
+      let worker: ChatSwarmWorker | undefined;
+      if (input.preferredWorkerId) {
+        worker = this.requireWorker(input.preferredWorkerId);
+        if (worker.swarmId !== input.swarmId) throw new ChatSwarmError("OWNERSHIP_CONFLICT", "worker belongs to another swarm");
+        if (worker.lifecycleState === "DISABLED") throw new ChatSwarmError("OWNERSHIP_CONFLICT", "dispatch target is disabled");
+      } else {
+        worker = this.listWorkers(input.swarmId).find((candidate) => candidate.lifecycleState === "AVAILABLE" && !candidate.currentTaskId);
+      }
+      if (!worker || worker.lifecycleState !== "AVAILABLE" || worker.currentTaskId) {
+        return this.requireTask(taskId);
+      }
       const task = this.requireTask(taskId); if (task.preferredWorkerId && task.preferredWorkerId !== worker.id) throw new ChatSwarmError("OWNERSHIP_CONFLICT", "dispatch target does not satisfy preference");
       const previous = this.sqlite.prepare("select coalesce(max(attempt_number),0) as number from chat_swarm_attempts where task_id=?").get(taskId) as { number:number }; this.claimTaskInTransaction(taskId, worker.id, worker.runtimeKind, timestamp, Number(previous.number)+1); return this.requireTask(taskId);
     }); return operation.immediate();
+  }
+
+  listTasks(
+    swarmId: string,
+    options: { limit?: number; cursor?: string; lifecycleState?: ChatSwarmTaskState } = {},
+  ): ChatSwarmTaskListResult {
+    const limit = Math.min(Math.max(1, options.limit ?? 50), 100);
+    const cursor = options.cursor;
+    let cursorRowId: number | null = null;
+    if (cursor) {
+      try {
+        const decoded = Buffer.from(cursor, "base64url").toString("utf-8");
+        const num = Number(decoded);
+        if (Number.isInteger(num) && num > 0) {
+          cursorRowId = num;
+        }
+      } catch {
+        // ignore invalid cursor
+      }
+    }
+
+    const state = options.lifecycleState;
+
+    const totalCountRow = this.sqlite.prepare(
+      "select count(*) as count from chat_swarm_tasks where swarm_id = ? and (? is null or lifecycle_state = ?)"
+    ).get(swarmId, state ?? null, state ?? null) as { count: number };
+    const totalCount = Number(totalCountRow?.count ?? 0);
+
+    let query = `
+      select
+        t.rowid as row_id,
+        t.id, t.task_key, t.preferred_worker_id, t.assigned_worker_id,
+        t.lifecycle_state, t.result, t.error_code, t.error_message,
+        t.created_at, t.updated_at, t.completed_at, t.collected_at,
+        (select max(attempt_number) from chat_swarm_attempts a where a.task_id = t.id) as latest_attempt_number
+      from chat_swarm_tasks t
+      where t.swarm_id = ?
+        and (? is null or t.lifecycle_state = ?)
+    `;
+    const params: unknown[] = [swarmId, state ?? null, state ?? null];
+
+    if (cursorRowId !== null) {
+      query += ` and t.rowid < ?`;
+      params.push(cursorRowId);
+    }
+
+    query += ` order by t.rowid desc limit ?`;
+    params.push(limit + 1);
+
+    const rows = this.sqlite.prepare(query).all(...params) as (Row & { row_id: number })[];
+    const hasMore = rows.length > limit;
+    const pageRows = hasMore ? rows.slice(0, limit) : rows;
+
+    const tasks: ChatSwarmTaskSummary[] = pageRows.map((r) => {
+      const resultText = r.result != null ? String(r.result) : undefined;
+      const hasResult = resultText !== undefined;
+      const resultHash = resultText ? hashContent(resultText) : undefined;
+      return {
+        taskId: String(r.id),
+        taskKey: String(r.task_key),
+        preferredWorkerId: r.preferred_worker_id != null ? String(r.preferred_worker_id) : undefined,
+        assignedWorkerId: r.assigned_worker_id != null ? String(r.assigned_worker_id) : undefined,
+        lifecycleState: String(r.lifecycle_state) as ChatSwarmTaskState,
+        latestAttemptNumber: r.latest_attempt_number != null ? Number(r.latest_attempt_number) : undefined,
+        createdAt: String(r.created_at),
+        updatedAt: String(r.updated_at),
+        completedAt: r.completed_at != null ? String(r.completed_at) : undefined,
+        collectedAt: r.collected_at != null ? String(r.collected_at) : undefined,
+        hasResult,
+        ...(resultHash ? { resultHash } : {}),
+        ...(r.error_code != null ? { errorCode: String(r.error_code) } : {}),
+        ...(r.error_message != null ? { errorMessage: String(r.error_message) } : {}),
+      };
+    });
+
+    let nextCursor: string | undefined;
+    if (hasMore && pageRows.length > 0) {
+      const last = pageRows[pageRows.length - 1]!;
+      nextCursor = Buffer.from(String(last.row_id)).toString("base64url");
+    }
+
+    return { swarmId, tasks, nextCursor, totalCount };
+  }
+
+  getTaskCounts(swarmId: string): Record<string, number> {
+    const rows = this.sqlite.prepare(
+      "select lifecycle_state, count(*) as count from chat_swarm_tasks where swarm_id = ? group by lifecycle_state"
+    ).all(swarmId) as { lifecycle_state: string; count: number }[];
+    const counts: Record<string, number> = {};
+    for (const r of rows) {
+      counts[r.lifecycle_state] = Number(r.count);
+    }
+    return counts;
   }
 
   claimTask(taskId: string, workerId: string): ChatSwarmTask {

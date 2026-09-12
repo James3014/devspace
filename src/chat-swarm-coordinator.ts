@@ -1,4 +1,14 @@
-import { ChatSwarmError, type ChatSwarm, type ChatSwarmTask, type ChatSwarmWorker, type TaskRequest, type ReconciliationEvidence } from "./chat-swarm-contract.js";
+import {
+  ChatSwarmError,
+  type ChatSwarm,
+  type ChatSwarmTask,
+  type ChatSwarmWorker,
+  type TaskRequest,
+  type ReconciliationEvidence,
+  type ChatSwarmTaskSummary,
+  type ChatSwarmTaskListResult,
+  type ChatSwarmTaskState,
+} from "./chat-swarm-contract.js";
 import { ChatSwarmStore, type CreateSwarmInput, type CreateWorkerInput } from "./chat-swarm-store.js";
 import { resolveChatSwarmIdentity, ChatSwarmIdentityError, type ChatSwarmIdentityEvidence } from "./request-meta.js";
 
@@ -61,6 +71,8 @@ export interface SwarmInspectResult {
   };
   roster: InspectRosterWorker[];
   pendingRequests: InspectPendingRequest[];
+  taskCounts?: Record<string, number>;
+  recentTasks?: ChatSwarmTaskSummary[];
   observedDeliveryMode: "POLLING_ONLY";
 }
 
@@ -281,6 +293,9 @@ export class ChatSwarmCoordinator {
       expiresAt: req.expiresAt,
     }));
 
+    const taskCounts = this.store.getTaskCounts(swarmId);
+    const recentTasksResult = this.store.listTasks(swarmId, { limit: 10 });
+
     return {
       swarm: {
         id: swarm.id,
@@ -291,8 +306,19 @@ export class ChatSwarmCoordinator {
       },
       roster,
       pendingRequests,
+      taskCounts,
+      recentTasks: recentTasksResult.tasks,
       observedDeliveryMode: "POLLING_ONLY",
     };
+  }
+
+  listTasks(
+    meta: unknown,
+    swarmId: string,
+    options: { limit?: number; cursor?: string; lifecycleState?: ChatSwarmTaskState } = {},
+  ): ChatSwarmTaskListResult {
+    this.assertOwner(meta, swarmId);
+    return this.store.listTasks(swarmId, options);
   }
 
   createJoinRequest(meta: unknown, swarmId: string, label: string, attemptKey: string) {

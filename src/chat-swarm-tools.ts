@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v4";
-import { ChatSwarmError } from "./chat-swarm-contract.js";
+import { ChatSwarmError, TASK_STATES } from "./chat-swarm-contract.js";
 import { ChatSwarmCoordinator } from "./chat-swarm-coordinator.js";
 import { ChatSwarmIdentityError } from "./request-meta.js";
 import type { ServerConfig } from "./config.js";
@@ -19,6 +19,7 @@ export type ChatSwarmAdmissionAction =
   | "close"
   | "peer_status"
   | "inspect"
+  | "tasks"
   | "join_request"
   | "approve_join";
 
@@ -70,6 +71,30 @@ const peerStatusResult = z.object({
   }).optional(),
 });
 
+const taskSummarySchema = z.object({
+  taskId: id,
+  taskKey: id,
+  preferredWorkerId: id.optional(),
+  assignedWorkerId: id.optional(),
+  lifecycleState: z.string(),
+  latestAttemptNumber: z.number().int().positive().optional(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  completedAt: z.string().optional(),
+  collectedAt: z.string().optional(),
+  hasResult: z.boolean(),
+  resultHash: z.string().optional(),
+  errorCode: z.string().optional(),
+  errorMessage: z.string().optional(),
+});
+
+const tasksResult = z.object({
+  swarmId: id,
+  tasks: z.array(taskSummarySchema),
+  nextCursor: z.string().optional(),
+  totalCount: z.number().int().nonnegative(),
+});
+
 const inspectResult = z.object({
   swarm: z.object({
     id,
@@ -94,6 +119,8 @@ const inspectResult = z.object({
     requestedAt: z.string(),
     expiresAt: z.string(),
   })),
+  taskCounts: z.record(z.string(), z.number()).optional(),
+  recentTasks: z.array(taskSummarySchema).optional(),
   observedDeliveryMode: z.literal("POLLING_ONLY"),
 });
 
@@ -150,6 +177,7 @@ export function chatSwarmToolInputShapes(config: Pick<ServerConfig, "chatSwarmMa
     chat_swarm_submit: { workerId, taskId, result: z.string().min(1).max(config.chatSwarmResultMaxChars) },
     chat_swarm_peer_status: { swarmId: swarmId.optional() },
     chat_swarm_inspect: { swarmId, cursor: z.string().optional(), limit: z.number().int().min(1).max(100).optional() },
+    chat_swarm_tasks: { swarmId, limit: z.number().int().min(1).max(100).optional(), cursor: z.string().optional(), lifecycleState: z.enum(TASK_STATES).optional() },
     chat_swarm_join_request: { swarmId, label: id, attemptKey: id },
     chat_swarm_approve_join: { swarmId, requestId: id, expectedRequestVersion: z.number().int().positive(), expectedSwarmVersion: z.number().int().positive() },
   };
@@ -280,11 +308,14 @@ export function registerChatSwarmTools(
   server.registerTool("chat_swarm_inspect", { title: "Inspect swarm roster and admission", description: "Read swarm roster, pending join requests, and delivery mode as the swarm owner.", inputSchema: schemas.chat_swarm_inspect, outputSchema: inspectResult, annotations: { readOnlyHint: true, idempotentHint: true } }, async (input: any, extra) => {
     try { admit("inspect"); return success(coordinator.inspect(meta(extra), input.swarmId, input.cursor, input.limit)); } catch (error) { return failure(error, "inspect"); }
   });
+  server.registerTool("chat_swarm_tasks", { title: "List swarm tasks", description: "Enumerate the swarm task ledger with bounded summaries as the swarm owner.", inputSchema: schemas.chat_swarm_tasks, outputSchema: tasksResult, annotations: { readOnlyHint: true, idempotentHint: true } }, async (input: any, extra) => {
+    try { admit("tasks"); return success(coordinator.listTasks(meta(extra), input.swarmId, { limit: input.limit, cursor: input.cursor, lifecycleState: input.lifecycleState })); } catch (error) { return failure(error, "tasks"); }
+  });
   server.registerTool("chat_swarm_join_request", { title: "Request to join swarm", description: "Create a bounded pending request to join an active swarm without secrets.", inputSchema: schemas.chat_swarm_join_request, outputSchema: joinRequestResult, annotations: { readOnlyHint: false, idempotentHint: true } }, async (input: any, extra) => {
     try { admit("join_request"); return success(coordinator.createJoinRequest(meta(extra), input.swarmId, input.label, input.attemptKey)); } catch (error) { return failure(error, "join_request"); }
   });
   server.registerTool("chat_swarm_approve_join", { title: "Approve peer join request", description: "Owner approves a pending peer join request and atomically binds a worker slot.", inputSchema: schemas.chat_swarm_approve_join, outputSchema: approveJoinResult, annotations: { readOnlyHint: false, idempotentHint: true } }, async (input: any, extra) => {
     try { admit("approve_join"); return success(coordinator.approveJoin(meta(extra), input.swarmId, input.requestId, input.expectedRequestVersion, input.expectedSwarmVersion)); } catch (error) { return failure(error, "approve_join"); }
   });
-  return 14;
+  return 15;
 }
