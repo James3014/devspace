@@ -16,6 +16,7 @@ export type ChatSwarmLifecycleAction =
   | "close"
   | "peer_status"
   | "inspect"
+  | "tasks"
   | "join_request"
   | "approve_join";
 
@@ -62,7 +63,7 @@ export class ChatSwarmLifecycle {
     if (mode === "normal") return;
 
     if (action === "next" && context.existingTask === true) return;
-    if (["status", "collect", "cancel", "reconcile", "submit", "peer_status", "inspect"].includes(action)) return;
+    if (["status", "collect", "cancel", "reconcile", "submit", "peer_status", "inspect", "tasks"].includes(action)) return;
 
     throw new ChatSwarmError(
       "INVALID_STATE",

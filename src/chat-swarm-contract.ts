@@ -41,6 +41,30 @@ export interface TaskRequest {
   swarmId: string; taskKey: string; prompt: string; payload?: Record<string, unknown>;
   preferredWorkerId?: string;
 }
+
+export interface ChatSwarmTaskSummary {
+  taskId: string;
+  taskKey: string;
+  preferredWorkerId?: string;
+  assignedWorkerId?: string;
+  lifecycleState: ChatSwarmTaskState;
+  latestAttemptNumber?: number;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string;
+  collectedAt?: string;
+  hasResult: boolean;
+  resultHash?: string;
+  errorCode?: string;
+  errorMessage?: string;
+}
+
+export interface ChatSwarmTaskListResult {
+  swarmId: string;
+  tasks: ChatSwarmTaskSummary[];
+  nextCursor?: string;
+  totalCount: number;
+}
 export interface ReconciliationEvidence {
   taskId: string;
   attemptId: string;
