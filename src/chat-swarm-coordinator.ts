@@ -349,6 +349,9 @@ export class ChatSwarmCoordinator {
 
   expireLease(workerId: string, at: string): ChatSwarmTask | undefined { return this.store.expireWorkerLease(workerId, at); }
 
+  assertOwnerForLifecycle(meta: unknown, swarmId: string): void { this.assertOwner(meta, swarmId); }
+  admittedCarrierWorkers(swarmId: string): ChatSwarmWorker[] { const swarm = this.store.getSwarm(swarmId); if (!swarm) throw new ChatSwarmError("NOT_FOUND", "swarm not found"); return this.store.listWorkers(swarmId).filter((worker) => worker.lifecycleState !== "DISABLED" && worker.lifecycleState !== "RECONCILE_REQUIRED" && !!worker.carrierConversationFingerprint); }
+
   private identity(meta: unknown): ChatSwarmIdentityEvidence { return resolveChatSwarmIdentity(meta); }
   private assertOwner(meta: unknown, swarmId: string): void { const identity = this.identity(meta); const swarm = this.store.getSwarm(swarmId); if (!swarm) throw new ChatSwarmError("NOT_FOUND", "swarm not found"); if (swarm.ownerIdentityFingerprint !== identity.fingerprint) throw new ChatSwarmError("OWNERSHIP_CONFLICT", "controller identity does not own swarm"); }
   private requireOwnedTask(meta: unknown, swarmId: string, taskId: string): ChatSwarmTask { this.assertOwner(meta, swarmId); const task = this.store.getTask(taskId); if (!task || task.swarmId !== swarmId) throw new ChatSwarmError("OWNERSHIP_CONFLICT", "task does not belong to asserted swarm"); return task; }

@@ -80,6 +80,7 @@ const migrations: Migration[] = [
   { version: 15, name: "carrier-bindings", up: migrateCarrierBindings },
   { version: 16, name: "carrier-validity", up: migrateCarrierValidity },
   { version: 17, name: "chat-swarm-join-requests", up: migrateChatSwarmJoinRequests },
+  { version: 18, name: "chat-swarm-carrier-operations", up: migrateChatSwarmCarrierOperations },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -387,6 +388,33 @@ function migrateChatSwarmCore(sqlite: Database.Database): void {
     create index if not exists chat_swarm_attempts_task_idx on chat_swarm_attempts(task_id, attempt_number);
     create index if not exists chat_swarm_attempts_effect_idx on chat_swarm_attempts(effect_state);
     create unique index if not exists chat_swarm_attempts_ordinal_idx on chat_swarm_attempts(task_id, attempt_number);
+  `);
+}
+
+function migrateChatSwarmCarrierOperations(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists chat_swarm_carrier_operations (
+      operation_id text primary key,
+      operation_key text not null,
+      slot_key text not null unique,
+      swarm_id text not null references chat_swarms(id) on delete cascade,
+      worker_id text not null references chat_swarm_workers(id) on delete cascade,
+      task_id text references chat_swarm_tasks(id) on delete cascade,
+      attempt_id text references chat_swarm_attempts(id) on delete cascade,
+      carrier_kind text not null,
+      carrier_fingerprint text not null,
+      binding_epoch integer not null,
+      adapter_config_hash text not null,
+      kind text not null,
+      state text not null,
+      request_json text not null,
+      receipt_json text,
+      version integer not null,
+      created_at text not null,
+      updated_at text not null
+    );
+    create index if not exists chat_swarm_carrier_operations_worker_idx
+      on chat_swarm_carrier_operations(worker_id, binding_epoch, updated_at desc);
   `);
 }
 
