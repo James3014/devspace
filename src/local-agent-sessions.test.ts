@@ -2,10 +2,18 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
-import test from "node:test";
+import test, { after } from "node:test";
 import { LocalAgentSessionManager, AgentSessionError, getWorkerProcessOwnership } from "./local-agent-sessions.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
+
+const originalAgyCommand = process.env.AGY_COMMAND;
+process.env.AGY_COMMAND = process.execPath;
+
+after(() => {
+  if (originalAgyCommand === undefined) delete process.env.AGY_COMMAND;
+  else process.env.AGY_COMMAND = originalAgyCommand;
+});
 
 function setupFixture() {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-agent-sessions-test-"));
@@ -241,7 +249,7 @@ test("direct provider/model identity survives durable worker reload without a di
       async (profile: LocalAgentProfile | undefined) => {
         assert.ok(profile);
         observedProfile = profile;
-        return { provider: profile.provider, providerSessionId: null, finalResponse: "direct-ok", items: [] };
+        return { provider: profile.provider, providerSessionId: "direct-session-1", finalResponse: "direct-ok", items: [] };
       },
     );
     const replayed = await manager.startAgent({
@@ -481,7 +489,11 @@ test("LocalAgentSessionManager - launch failure fail-closed behavior", async () 
     assert.match(recordInDb.error || "", /Permission denied/);
     await assert.rejects(
       manager.continueAgent({ workspaceId: "ws_test", workspaceRoot, agentId: recordInDb.id, prompt: "continue launch failure test" }),
-      (err: any) => { assert.equal(err.code, "WORKER_LAUNCH_FAILED"); return true; },
+      (err: any) => {
+        assert.equal(err.code, "REBIND_REQUIRED");
+        assert.match(err.message, /provider session identity/i);
+        return true;
+      },
     );
     const recordAfterFailedContinue = manager.getRecordByPrefixOrId(recordInDb.id);
     assert.ok(recordAfterFailedContinue);
@@ -677,8 +689,8 @@ test("LocalAgentSessionManager - Cross-conversation recovery regression", async 
     const statusB = await manager.getAgentStatus({ workspaceId: "ws_B", workspaceRoot, agentId });
     assert.equal(statusB.status, "starting");
 
-    // Set status to idle so we can continue it
-    settleAgent(manager, agentId);
+    // Establish provider continuity so this test exercises cross-conversation reuse rather than rebind fencing.
+    settleAgent(manager, agentId, { providerSessionId: "provider-session-cross-convo" });
 
     // ws_B can continue it
     const continueB = await manager.continueAgent({

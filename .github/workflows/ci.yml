@@ -63,3 +63,24 @@ jobs:
 
       - name: Doctor
         run: node dist/cli.js doctor
+
+  local-agent-sessions:
+    name: Local agent sessions (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test local agent sessions
+        run: npm run test:local-agent-sessions
