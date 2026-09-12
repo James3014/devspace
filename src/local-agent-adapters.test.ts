@@ -33,6 +33,10 @@ for (const provider of providers) {
   assert.equal(adapter.provider, provider);
   assert.equal(typeof adapter.runtimeKey, "function");
   assert.equal(typeof adapter.run, "function");
+  assert.equal(
+    adapter.sessionBindingCapability,
+    provider === "agy" || provider === "claude" ? "LATE_BINDING" : "PRE_EFFECT",
+  );
 }
 
 assert.deepEqual(

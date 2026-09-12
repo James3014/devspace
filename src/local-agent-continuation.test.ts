@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import test, { after } from "node:test";
 import { LocalAgentSessionManager } from "./local-agent-sessions.js";
+import { createLocalAgentStore } from "./local-agent-store.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
 import { LocalAgentProviderError } from "./local-agent-runtime.js";
 import { MINIMUM_CODEX_RUNTIME_VERSION } from "./codex-runtime.js";
@@ -133,6 +134,16 @@ test("continuation is admitted after a clean within-scope turn", async () => {
       agentId: started.agentId,
     });
     assert.equal(status.status, "idle");
+    assert.equal(status.providerContinuity?.state, "KNOWN_UNVERIFIED");
+    assert.equal(status.providerContinuity?.providerSessionId, "sess-1");
+    const firstReconcile = await manager.reconcileAgent({
+      workspaceId: "ws_cont_ok",
+      workspaceRoot: f.repo,
+      isolated: true,
+      agentId: started.agentId,
+    });
+    assert.equal(firstReconcile.providerState, "UNKNOWN");
+    assert.equal(firstReconcile.providerContinuity?.state, "KNOWN_UNVERIFIED");
 
     const continued = await manager.continueAgent({
       workspaceId: "ws_cont_ok",
@@ -141,6 +152,88 @@ test("continuation is admitted after a clean within-scope turn", async () => {
       prompt: "continue work",
     });
     assert.equal(continued.continued, true);
+
+    const launched2 = (manager as any).store.getById(started.agentId);
+    const promptFile2 = `${f.root}/prompt-${started.agentId}-2.txt`;
+    writeFileSync(promptFile2, "continue work");
+    await manager.runWorkerTurnFromFile(started.agentId, promptFile2, launched2.workerToken!);
+    const resumed = await manager.getAgentStatus({
+      workspaceId: "ws_cont_ok",
+      workspaceRoot: f.repo,
+      agentId: started.agentId,
+    });
+    assert.equal(resumed.status, "idle");
+    assert.equal(resumed.providerContinuity?.state, "RESUME_VERIFIED");
+    assert.equal(resumed.providerContinuity?.providerSessionId, "sess-1");
+    assert.ok(resumed.providerContinuity?.verifiedAt);
+  } finally {
+    await clean();
+    f.clean();
+  }
+});
+
+test("session id drift cannot preserve RESUME_VERIFIED without same-session evidence", async () => {
+  const f = setupGitFixture();
+  let turn = 0;
+  const { manager, clean } = setupManager({}, async () => {
+    turn += 1;
+    return {
+      provider: "codex",
+      providerSessionId: turn <= 2 ? "sess-stable" : "sess-drifted",
+      items: [],
+      finalResponse: `done-${turn}`,
+    };
+  });
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_session_drift",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "turn one",
+      profiles: mockProfiles,
+    });
+    let record = (manager as any).store.getById(started.agentId);
+    let promptFile = `${f.root}/prompt-drift-1.txt`;
+    writeFileSync(promptFile, "turn one");
+    await manager.runWorkerTurnFromFile(started.agentId, promptFile, record.workerToken!);
+
+    await manager.continueAgent({
+      workspaceId: "ws_session_drift",
+      workspaceRoot: f.repo,
+      agentId: started.agentId,
+      prompt: "turn two",
+    });
+    record = (manager as any).store.getById(started.agentId);
+    promptFile = `${f.root}/prompt-drift-2.txt`;
+    writeFileSync(promptFile, "turn two");
+    await manager.runWorkerTurnFromFile(started.agentId, promptFile, record.workerToken!);
+    let status = await manager.getAgentStatus({
+      workspaceId: "ws_session_drift",
+      workspaceRoot: f.repo,
+      agentId: started.agentId,
+    });
+    assert.equal(status.providerContinuity?.state, "RESUME_VERIFIED");
+    assert.equal(status.providerContinuity?.providerSessionId, "sess-stable");
+
+    await manager.continueAgent({
+      workspaceId: "ws_session_drift",
+      workspaceRoot: f.repo,
+      agentId: started.agentId,
+      prompt: "turn three with provider drift",
+    });
+    record = (manager as any).store.getById(started.agentId);
+    promptFile = `${f.root}/prompt-drift-3.txt`;
+    writeFileSync(promptFile, "turn three");
+    await manager.runWorkerTurnFromFile(started.agentId, promptFile, record.workerToken!);
+    status = await manager.getAgentStatus({
+      workspaceId: "ws_session_drift",
+      workspaceRoot: f.repo,
+      agentId: started.agentId,
+    });
+    assert.equal(status.providerSessionId, "sess-drifted");
+    assert.equal(status.providerContinuity?.providerSessionId, "sess-drifted");
+    assert.equal(status.providerContinuity?.state, "KNOWN_UNVERIFIED");
+    assert.equal(status.providerContinuity?.verifiedAt, undefined);
   } finally {
     await clean();
     f.clean();
@@ -493,6 +586,108 @@ test("provider error mid-turn still records turn-end baseline and preserves cand
   }
 });
 
+test("late-binding provider failure after execution starts loses continuity and blocks silent fresh continuation", async () => {
+  const f = setupGitFixture();
+  const { manager, clean } = setupManager();
+  try {
+    const store = (manager as any).store;
+    const record = store.create({
+      workspaceId: "ws_late_lost",
+      workspaceRoot: f.repo,
+      profileName: "agy-late",
+      provider: "agy",
+      lifecycleKind: "detached_worker_v2",
+    });
+    const generation = record.lifecycleState?.activeTurn?.generation;
+    assert.ok(generation);
+    const workerToken = "late-binding-worker-token";
+    assert.equal(store.prepareWorkerCAS(record.id, generation, workerToken).applied, true);
+    assert.equal(store.claimWorkerCAS(record.id, generation, workerToken, 424242).applied, true);
+    store.markExecutionStarted(record.id, workerToken, undefined, generation);
+    const executing = store.getById(record.id);
+    assert.ok(executing.lifecycleState?.activeTurn?.executionStartedAt);
+    assert.equal(executing.lifecycleState?.continuity?.bindingCapability, "LATE_BINDING");
+    assert.equal(store.failTurnCAS({
+      agentId: record.id,
+      generation,
+      workerToken,
+      error: "provider response lost before conversation id",
+      terminalReason: "provider_error",
+      scopeState: "WITHIN_SCOPE",
+      cumulativeChangedPaths: [],
+      turnEndBaseline: { changedPaths: [], head: f.head, fingerprints: {} },
+    }).applied, true);
+
+    const status = await manager.getAgentStatus({
+      workspaceId: "ws_late_lost",
+      workspaceRoot: f.repo,
+      agentId: record.id,
+    });
+    assert.equal(status.providerContinuity?.state, "LOST");
+    assert.equal(status.providerContinuity?.bindingCapability, "LATE_BINDING");
+    assert.match(status.providerContinuity?.reason ?? "", /before session ID was bound/i);
+
+    const before = store.getById(record.id);
+    await assert.rejects(
+      manager.continueAgent({
+        workspaceId: "ws_late_lost",
+        workspaceRoot: f.repo,
+        agentId: record.id,
+        prompt: "must not become a new provider project",
+      }),
+      (error: any) => error.code === "REBIND_REQUIRED" && /continuity was lost/i.test(error.message),
+    );
+    const after = store.getById(record.id);
+    assert.equal(after.status, before.status);
+    assert.equal(after.updatedAt, before.updatedAt);
+    assert.equal(after.providerSessionId, undefined);
+  } finally {
+    await clean();
+    f.clean();
+  }
+});
+
+test("pre-effect provider failure without a session id is not mislabeled as lost continuity", async () => {
+  const f = setupGitFixture();
+  const { manager, clean } = setupManager();
+  try {
+    const store = (manager as any).store;
+    const record = store.create({
+      workspaceId: "ws_pre_effect_none",
+      workspaceRoot: f.repo,
+      profileName: "codex-pre-effect",
+      provider: "codex",
+      lifecycleKind: "detached_worker_v2",
+    });
+    const generation = record.lifecycleState?.activeTurn?.generation;
+    assert.ok(generation);
+    const workerToken = "pre-effect-worker-token";
+    assert.equal(store.prepareWorkerCAS(record.id, generation, workerToken).applied, true);
+    assert.equal(store.claimWorkerCAS(record.id, generation, workerToken, 424243).applied, true);
+    store.markExecutionStarted(record.id, workerToken, undefined, generation);
+    assert.equal(store.failTurnCAS({
+      agentId: record.id,
+      generation,
+      workerToken,
+      error: "startup failed before pre-effect session binding",
+      terminalReason: "provider_error",
+      scopeState: "WITHIN_SCOPE",
+      cumulativeChangedPaths: [],
+      turnEndBaseline: { changedPaths: [], head: f.head, fingerprints: {} },
+    }).applied, true);
+    const status = await manager.getAgentStatus({
+      workspaceId: "ws_pre_effect_none",
+      workspaceRoot: f.repo,
+      agentId: record.id,
+    });
+    assert.equal(status.providerContinuity?.state, "NONE");
+    assert.equal(status.providerContinuity?.bindingCapability, "PRE_EFFECT");
+  } finally {
+    await clean();
+    f.clean();
+  }
+});
+
 test("issue #5: continuation restores live timing during active turns and stabilizes upon terminal completion", async () => {
   const f = setupGitFixture();
   let turnCount = 0;
@@ -712,7 +907,7 @@ test("reconcileAgent reports KNOWN_UNVERIFIED or UNKNOWN rather than projecting 
     writeFileSync(promptFile, "work");
     await manager.runWorkerTurnFromFile(started.agentId, promptFile, record.workerToken!);
 
-    // Case 2: After turn finishes with providerSessionId established -> providerState is KNOWN_UNVERIFIED, NOT 'idle'
+    // Case 2: After turn finishes with providerSessionId established -> providerState is UNKNOWN, NOT 'idle'
     const postReconcile = await manager.reconcileAgent({
       workspaceId: "ws_reconcile_test",
       workspaceRoot: f.repo,
@@ -720,8 +915,81 @@ test("reconcileAgent reports KNOWN_UNVERIFIED or UNKNOWN rather than projecting 
       agentId: started.agentId,
     });
     assert.equal(postReconcile.agentState, "idle");
-    assert.equal(postReconcile.providerState, "KNOWN_UNVERIFIED");
+    assert.equal(postReconcile.providerState, "UNKNOWN");
+    assert.equal(postReconcile.providerContinuity?.state, "KNOWN_UNVERIFIED");
     assert.notEqual(postReconcile.providerState, postReconcile.agentState);
+  } finally {
+    await clean();
+    f.clean();
+  }
+});
+
+test("new continuity evidence survives durable reopen and malformed evidence fails closed", async () => {
+  const f = setupGitFixture();
+  const { manager, config, clean } = setupManager();
+  try {
+    const store = (manager as any).store;
+    const record = store.create({
+      workspaceId: "ws_reopen_continuity",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      provider: "codex",
+      lifecycleKind: "detached_worker_v2",
+    });
+    const generation = record.lifecycleState?.activeTurn?.generation;
+    assert.ok(generation);
+    const workerToken = "reopen-token";
+    store.prepareWorkerCAS(record.id, generation, workerToken);
+    store.claimWorkerCAS(record.id, generation, workerToken, 55555);
+    store.markExecutionStarted(record.id, workerToken, undefined, generation);
+    store.finishTurnCAS({
+      agentId: record.id,
+      generation,
+      workerToken,
+      providerSessionId: "sess-reopen-1",
+      status: "idle",
+      scopeState: "WITHIN_SCOPE",
+      cumulativeChangedPaths: [],
+      turnEndBaseline: { changedPaths: [], head: f.head, fingerprints: {} },
+    });
+
+    // Reopen store from database file to verify durable survival
+    const reloaded = createLocalAgentStore(config.stateDir);
+    try {
+      const recovered = reloaded.getById(record.id);
+      assert.ok(recovered);
+      assert.equal(recovered.lifecycleState?.continuity?.state, "KNOWN_UNVERIFIED");
+      assert.equal(recovered.lifecycleState?.continuity?.providerSessionId, "sess-reopen-1");
+      assert.equal(recovered.lifecycleState?.continuity?.bindingCapability, "PRE_EFFECT");
+      assert.equal(recovered.lifecycleState?.lifecycleCorrupt, undefined);
+
+      // Verify malformed continuity fails closed via lifecycleCorrupt
+      const db = (reloaded as any).database.sqlite;
+      const corruptContinuityLifecycle = JSON.stringify({
+        lifecycleKind: "detached_worker_v2",
+        continuity: { state: "INVALID_STATE" },
+      });
+      db.prepare("update local_agent_sessions set lifecycle_state = ? where id = ?").run(
+        corruptContinuityLifecycle,
+        record.id,
+      );
+      const afterCorruptContinuity = reloaded.getById(record.id);
+      assert.equal(afterCorruptContinuity?.lifecycleState?.lifecycleCorrupt, true);
+
+      // Verify malformed continuationSessionIdAtStart fails closed via lifecycleCorrupt
+      const corruptContinuationStartLifecycle = JSON.stringify({
+        lifecycleKind: "detached_worker_v2",
+        continuationSessionIdAtStart: 12345,
+      });
+      db.prepare("update local_agent_sessions set lifecycle_state = ? where id = ?").run(
+        corruptContinuationStartLifecycle,
+        record.id,
+      );
+      const afterCorruptStart = reloaded.getById(record.id);
+      assert.equal(afterCorruptStart?.lifecycleState?.lifecycleCorrupt, true);
+    } finally {
+      await reloaded.close();
+    }
   } finally {
     await clean();
     f.clean();

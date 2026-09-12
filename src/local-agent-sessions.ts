@@ -9,6 +9,7 @@ import type { ServerConfig } from "./config.js";
 import {
   createLocalAgentStore,
   isDetachedLifecycle,
+  resolveProviderContinuity,
   LocalAgentReplayConflictError,
   LocalAgentStore,
   type LocalAgentRecord,
@@ -22,7 +23,12 @@ import {
 } from "./local-agent-availability.js";
 import { runLocalAgentProvider } from "./local-agent-adapters.js";
 import { resolveEffectiveExecutionIdlePolicy } from "./local-agent-idle-policy.js";
-import { LocalAgentProviderError, type LocalAgentRunCallbacks, type LocalAgentRunResult } from "./local-agent-runtime.js";
+import {
+  LocalAgentProviderError,
+  type LocalAgentRunCallbacks,
+  type LocalAgentRunResult,
+  type ProviderContinuityEvidence,
+} from "./local-agent-runtime.js";
 import { terminateProcessTree, type KillableProcess } from "./process-platform.js";
 import {
   type AgentTerminalReason,
@@ -257,6 +263,7 @@ export interface AgentStatusOutput {
     blocked?: boolean;
     reason?: string;
   };
+  providerContinuity?: ProviderContinuityEvidence;
 }
 
 export interface ReconcileAgentInput {
@@ -291,6 +298,7 @@ export interface ReconcileAgentOutput {
     wallMs: number;
     idleMs: number;
   };
+  providerContinuity?: ProviderContinuityEvidence;
 }
 
 export type ReadinessValue = boolean | "unknown";
@@ -817,10 +825,14 @@ export class LocalAgentSessionManager {
     // ── Continuation admission gates (all read-only; run before mutation) ──
     const admissionFailures: string[] = [];
 
-    if (
-      record.providerContinuityState === "LOST" ||
-      (record.provider === "agy" && !record.providerSessionId)
-    ) {
+    const continuity = resolveProviderContinuity(record);
+    if (continuity.state === "LOST") {
+      throw new AgentSessionError(
+        "REBIND_REQUIRED",
+        `Continuation of agent ${agentId} is blocked because session continuity was lost: ${continuity.reason ?? "Late-binding provider session was lost after execution started."} Explicit rebind is required.`,
+      );
+    }
+    if (record.provider === "agy" && !record.providerSessionId) {
       throw new AgentSessionError(
         "REBIND_REQUIRED",
         `Agent ${agentId} has lost or unestablished provider session identity (${record.provider}); continuation cannot silently start a new provider conversation without explicit rebind.`,
@@ -1341,7 +1353,7 @@ export class LocalAgentSessionManager {
       agentId: record.id,
       dispatch: dispatchContractOutput(record.executionContract?.dispatchIntent),
       agentState: record.status,
-      providerState: record.providerContinuityState ?? (record.providerSessionId ? "KNOWN_UNVERIFIED" : "UNKNOWN"),
+      providerState: "UNKNOWN",
       providerSessionId: record.providerSessionId,
       terminalReason: record.terminalReason,
       workspace: {
@@ -1362,6 +1374,7 @@ export class LocalAgentSessionManager {
         wallMs: timing.wallMs,
         idleMs: timing.idleMs,
       },
+      providerContinuity: resolveProviderContinuity(record),
     };
   }
 
@@ -2629,6 +2642,7 @@ function recordToStatusOutput(
     if (lifecycle.terminalReason !== undefined) output.terminalReason = lifecycle.terminalReason;
     if (lifecycle.scopeState !== undefined) output.scopeState = lifecycle.scopeState;
   }
+  output.providerContinuity = resolveProviderContinuity(record);
   return output;
 }
 

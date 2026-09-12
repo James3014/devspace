@@ -13,6 +13,8 @@ import {
   type LocalAgentRunCallbacks,
   type LocalAgentRunInput,
   type LocalAgentRunResult,
+  type ProviderSessionBindingCapability,
+  providerSessionBindingCapabilityFor,
 } from "./local-agent-runtime.js";
 import { runOmpAcpLocalAgent } from "./local-agent-omp.js";
 import { inspectCodexRuntime } from "./codex-runtime.js";
@@ -45,6 +47,7 @@ import {
 export interface LocalAgentAdapter {
   readonly provider: LocalAgentProvider;
   readonly executionActivityCapability: ExecutionActivityCapability;
+  readonly sessionBindingCapability: ProviderSessionBindingCapability;
   runtimeKey(): string;
   run(input: LocalAgentRunInput, callbacks?: LocalAgentRunCallbacks): Promise<LocalAgentRunResult>;
 }
@@ -86,6 +89,12 @@ export function getLocalAgentExecutionActivityCapability(
   return createLocalAgentAdapter(provider).executionActivityCapability;
 }
 
+export function getLocalAgentSessionBindingCapability(
+  provider: LocalAgentProvider,
+): ProviderSessionBindingCapability {
+  return createLocalAgentAdapter(provider).sessionBindingCapability;
+}
+
 export function createLocalAgentAdapter(
   provider: LocalAgentProvider,
   options: LocalAgentDriverOptions = {},
@@ -117,10 +126,12 @@ export function createLocalAgentAdapter(
 class DriverBackedLocalAgentAdapter implements LocalAgentAdapter {
   readonly provider: LocalAgentProvider;
   readonly executionActivityCapability: ExecutionActivityCapability;
+  readonly sessionBindingCapability: ProviderSessionBindingCapability;
 
   constructor(private readonly driver: LocalAgentDriver) {
     this.provider = driver.provider;
     this.executionActivityCapability = driver.executionActivityCapability ?? "UNAVAILABLE";
+    this.sessionBindingCapability = driver.sessionBindingCapability ?? providerSessionBindingCapabilityFor(driver.provider);
   }
 
   runtimeKey(): string {
@@ -163,6 +174,7 @@ class DriverBackedLocalAgentAdapter implements LocalAgentAdapter {
 class CodexLocalAgentAdapter implements LocalAgentAdapter {
   readonly provider = "codex" as const;
   readonly executionActivityCapability = "TRUSTWORTHY" as const;
+  readonly sessionBindingCapability = "PRE_EFFECT" as const;
 
   runtimeKey(): string {
     return this.provider;
@@ -188,6 +200,7 @@ class CodexLocalAgentAdapter implements LocalAgentAdapter {
 class OmpLocalAgentAdapter implements LocalAgentAdapter {
   readonly provider = "omp" as const;
   readonly executionActivityCapability = "TRUSTWORTHY" as const;
+  readonly sessionBindingCapability = "PRE_EFFECT" as const;
 
   runtimeKey(): string {
     return this.provider;
@@ -379,6 +392,7 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
   // Agy --print can remain silent until the final response. Raw-byte touches are useful
   // when present, but silence is not a trustworthy liveness signal for hard idle fencing.
   readonly executionActivityCapability = "UNAVAILABLE" as const;
+  readonly sessionBindingCapability = "LATE_BINDING" as const;
 
   runtimeKey(): string {
     return this.provider;

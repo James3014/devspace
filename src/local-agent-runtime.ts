@@ -13,6 +13,21 @@ import type { LocalAgentProvider } from "./local-agent-profiles.js";
 
 export type LocalAgentWriteMode = "read_only" | "allowed" | "full_access";
 
+export type ProviderSessionBindingCapability = "PRE_EFFECT" | "LATE_BINDING";
+export type ProviderContinuityState = "NONE" | "KNOWN_UNVERIFIED" | "RESUME_VERIFIED" | "LOST";
+
+export function providerSessionBindingCapabilityFor(provider: LocalAgentProvider | string): ProviderSessionBindingCapability {
+  return provider === "agy" || provider === "claude" ? "LATE_BINDING" : "PRE_EFFECT";
+}
+
+export interface ProviderContinuityEvidence {
+  state: ProviderContinuityState;
+  providerSessionId?: string;
+  bindingCapability?: ProviderSessionBindingCapability;
+  verifiedAt?: string;
+  reason?: string;
+}
+
 export interface LocalAgentRunInput {
   prompt: string;
   workspaceRoot: string;
@@ -82,6 +97,8 @@ export interface LocalAgentDriver {
   readonly provider: LocalAgentProvider;
   /** Whether provider/runtime events are trustworthy enough for a terminating execution-idle fence. */
   readonly executionActivityCapability?: ExecutionActivityCapability;
+  /** Whether provider session binding is established before semantic execution or late-bound. */
+  readonly sessionBindingCapability?: ProviderSessionBindingCapability;
   runtimeKey(context: LocalAgentRuntimeContext): string;
   createRuntime(context: LocalAgentRuntimeContext): Promise<Result<LocalAgentRuntime, AgentProviderError>>;
   readonly idleTimeoutMs?: number;

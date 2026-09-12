@@ -28,6 +28,11 @@ import {
   serializeExecutionGenerationBinding,
   type ExecutionGenerationBinding,
 } from "./execution-protocol.js";
+import {
+  providerSessionBindingCapabilityFor,
+  type ProviderSessionBindingCapability,
+  type ProviderContinuityEvidence,
+} from "./local-agent-runtime.js";
 
 export type LocalAgentStatus = "starting" | "running" | "idle" | "error" | "stopped";
 
@@ -58,6 +63,31 @@ export interface AgentLifecycleState {
   terminationBlocked?: {
     detectedAt: string;
     reason: string;
+  };
+  continuity?: ProviderContinuityEvidence;
+  /** Provider session identity that already existed before the active continuation turn began. */
+  continuationSessionIdAtStart?: string;
+}
+
+export function resolveProviderBindingCapability(provider: string): ProviderSessionBindingCapability {
+  return providerSessionBindingCapabilityFor(provider);
+}
+
+export function resolveProviderContinuity(record: LocalAgentRecord): ProviderContinuityEvidence {
+  if (record.lifecycleState?.continuity) {
+    return record.lifecycleState.continuity;
+  }
+  const bindingCapability = resolveProviderBindingCapability(record.provider);
+  if (record.providerSessionId) {
+    return {
+      state: "KNOWN_UNVERIFIED",
+      providerSessionId: record.providerSessionId,
+      bindingCapability,
+    };
+  }
+  return {
+    state: "NONE",
+    bindingCapability,
   };
 }
 
@@ -94,7 +124,6 @@ export interface LocalAgentRecord {
   errorCode?: string;
   errorRetryable?: boolean;
   errorDetails?: AgentProviderFailureDetails;
-  providerContinuityState?: "KNOWN_UNVERIFIED" | "RESUME_VERIFIED" | "LOST" | "UNKNOWN";
   createdAt: string;
   updatedAt: string;
 }
@@ -299,9 +328,17 @@ export class LocalAgentStore {
               executionIdlePolicy: input.executionIdlePolicy,
               launchState: "not_started",
             },
+            continuity: {
+              state: "NONE",
+              bindingCapability: resolveProviderBindingCapability(input.provider),
+            },
           }
         : {
             activeTurn: { turnStartedAt: now },
+            continuity: {
+              state: "NONE",
+              bindingCapability: resolveProviderBindingCapability(input.provider),
+            },
           },
       status: "starting",
       createdAt: now,
@@ -552,6 +589,7 @@ export class LocalAgentStore {
           executionIdlePolicy: input.executionIdlePolicy,
           launchState: "not_started",
         },
+        continuationSessionIdAtStart: current.providerSessionId,
         terminationPending: undefined,
         lifecycleCorrupt: undefined,
       };
@@ -817,11 +855,28 @@ export class LocalAgentStore {
       ) {
         return { applied: false, previous: current, current };
       }
+      const previousContinuity = lifecycle.continuity;
+      const bindingCapability = previousContinuity?.bindingCapability ?? resolveProviderBindingCapability(current.provider);
+      const isContinuation = Boolean(current.providerSessionId && current.providerSessionId === providerSessionId);
+      const continuity: ProviderContinuityEvidence = {
+        state: isContinuation && previousContinuity?.state === "RESUME_VERIFIED"
+          ? "RESUME_VERIFIED"
+          : isContinuation
+            ? (previousContinuity?.state ?? "KNOWN_UNVERIFIED")
+            : "KNOWN_UNVERIFIED",
+        providerSessionId,
+        bindingCapability,
+        verifiedAt: isContinuation ? previousContinuity?.verifiedAt : undefined,
+      };
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        continuity,
+      };
       const now = new Date().toISOString();
       const result = this.database.sqlite.prepare(
-        `update local_agent_sessions set provider_session_id = ?, updated_at = ?
+        `update local_agent_sessions set provider_session_id = ?, lifecycle_state = ?, updated_at = ?
          where id = ? and worker_token = ? and updated_at = ?`,
-      ).run(providerSessionId, now, id, workerToken, current.updatedAt);
+      ).run(providerSessionId, JSON.stringify(lifecycleState), now, id, workerToken, current.updatedAt);
       const refreshed = this.getById(id) ?? current;
       return { applied: result.changes === 1, previous: current, current: refreshed };
     });
@@ -843,6 +898,68 @@ export class LocalAgentStore {
       ) {
         return { applied: false, previous: current, current };
       }
+      const previousContinuity = lifecycle.continuity;
+      const bindingCapability = previousContinuity?.bindingCapability ?? resolveProviderBindingCapability(current.provider);
+      const effectiveSessionId = input.providerSessionId ?? current.providerSessionId;
+      const continuationSessionIdAtStart = lifecycle.continuationSessionIdAtStart;
+      const resumedSameSession = Boolean(
+        continuationSessionIdAtStart &&
+        effectiveSessionId &&
+        continuationSessionIdAtStart === effectiveSessionId
+      );
+      const executionStarted = Boolean(lifecycle.activeTurn?.executionStartedAt);
+      const settledAt = new Date().toISOString();
+
+      let continuity: ProviderContinuityEvidence;
+      if (input.status === "idle") {
+        if (resumedSameSession) {
+          continuity = {
+            state: "RESUME_VERIFIED",
+            providerSessionId: effectiveSessionId,
+            bindingCapability,
+            verifiedAt: settledAt,
+          };
+        } else if (effectiveSessionId) {
+          const preservesVerifiedSession = previousContinuity?.state === "RESUME_VERIFIED" &&
+            previousContinuity.providerSessionId === effectiveSessionId;
+          continuity = {
+            state: preservesVerifiedSession ? "RESUME_VERIFIED" : "KNOWN_UNVERIFIED",
+            providerSessionId: effectiveSessionId,
+            bindingCapability,
+            verifiedAt: preservesVerifiedSession ? previousContinuity.verifiedAt : undefined,
+          };
+        } else {
+          continuity = {
+            state: "NONE",
+            bindingCapability,
+          };
+        }
+      } else {
+        if (!effectiveSessionId && executionStarted && bindingCapability === "LATE_BINDING") {
+          continuity = {
+            state: "LOST",
+            bindingCapability: "LATE_BINDING",
+            reason: "Late-binding turn failed after execution started but before session ID was bound; side effects may have occurred.",
+          };
+        } else if (effectiveSessionId) {
+          const preservesVerifiedSession = previousContinuity?.state === "RESUME_VERIFIED" &&
+            previousContinuity.providerSessionId === effectiveSessionId;
+          continuity = {
+            state: preservesVerifiedSession ? "RESUME_VERIFIED" : "KNOWN_UNVERIFIED",
+            providerSessionId: effectiveSessionId,
+            bindingCapability,
+            verifiedAt: preservesVerifiedSession ? previousContinuity.verifiedAt : undefined,
+            reason: previousContinuity?.reason,
+          };
+        } else {
+          continuity = {
+            state: previousContinuity?.state === "LOST" ? "LOST" : "NONE",
+            bindingCapability,
+            reason: previousContinuity?.reason,
+          };
+        }
+      }
+
       const lifecycleState: AgentLifecycleState = {
         ...lifecycle,
         lastExecutionIdlePolicy: lifecycle.activeTurn?.executionIdlePolicy,
@@ -851,6 +968,8 @@ export class LocalAgentStore {
         lastSettledGeneration: input.generation,
         cumulativeChangedPaths: input.cumulativeChangedPaths ?? lifecycle.cumulativeChangedPaths,
         turnEndBaseline: input.turnEndBaseline ?? lifecycle.turnEndBaseline,
+        continuity,
+        continuationSessionIdAtStart: undefined,
       };
       const errorCode = input.status === "idle" ? null : input.errorCode ?? null;
       const errorRetryable = input.status === "idle" ? null : input.errorRetryable === undefined ? null : String(input.errorRetryable);
@@ -860,7 +979,7 @@ export class LocalAgentStore {
           ? input.errorDetails
           : input.errorDetails ? JSON.stringify(input.errorDetails) : null;
 
-      const now = new Date().toISOString();
+      const now = settledAt;
       const result = this.database.sqlite.prepare(
         `update local_agent_sessions set provider_session_id = coalesce(?, provider_session_id),
           status = ?, latest_response = ?, error = ?, error_code = ?, error_retryable = ?, error_details = ?,
@@ -917,6 +1036,7 @@ export class LocalAgentStore {
         ...lifecycle,
         lastExecutionIdlePolicy: lifecycle.activeTurn?.executionIdlePolicy,
         activeTurn: undefined,
+        continuationSessionIdAtStart: undefined,
         lastSettledGeneration: generation,
       };
       const now = new Date().toISOString();
@@ -990,10 +1110,25 @@ export class LocalAgentStore {
         workerPid: current.workerPid,
         launchState: activeTurn.launchState,
       };
+      const previousContinuity = lifecycle.continuity;
+      const bindingCapability = previousContinuity?.bindingCapability ?? resolveProviderBindingCapability(current.provider);
+      const executionStarted = Boolean(activeTurn.executionStartedAt);
+      const effectiveSessionId = current.providerSessionId;
+
+      let continuity = previousContinuity;
+      if (!effectiveSessionId && executionStarted && bindingCapability === "LATE_BINDING") {
+        continuity = {
+          state: "LOST",
+          bindingCapability: "LATE_BINDING",
+          reason: `Late-binding turn terminated (${input.terminalReason}) after execution started but before session ID was bound; side effects may have occurred.`,
+        };
+      }
+
       const lifecycleState: AgentLifecycleState = {
         ...lifecycle,
         lastExecutionIdlePolicy: activeTurn.executionIdlePolicy,
         activeTurn: undefined,
+        continuationSessionIdAtStart: undefined,
         termination: {
           pending: true,
           fencedAt: now,
@@ -1003,6 +1138,7 @@ export class LocalAgentStore {
           previousWorkerToken: current.workerToken,
         },
         terminationPending: pending,
+        continuity,
       };
       const scopeState = input.terminalReason === "scope_violation"
         ? "SCOPE_VIOLATION"
@@ -1087,6 +1223,7 @@ export class LocalAgentStore {
       const lifecycleState: AgentLifecycleState = {
         ...current.lifecycleState,
         terminationPending: undefined,
+        continuationSessionIdAtStart: undefined,
         termination: undefined,
         lifecycleCorrupt: undefined,
         lastSettledGeneration: input.generation,
@@ -1528,6 +1665,14 @@ function readLifecycleState(value: string | null | undefined): AgentLifecycleSta
     if (termination) state.termination = termination;
     const lastExecutionIdlePolicy = readEffectiveExecutionIdlePolicy(parsed.lastExecutionIdlePolicy);
     if (lastExecutionIdlePolicy) state.lastExecutionIdlePolicy = lastExecutionIdlePolicy;
+    const continuity = readProviderContinuityEvidence(parsed.continuity);
+    const continuityLooking = parsed.continuity !== undefined && parsed.continuity !== null;
+    if (continuity) state.continuity = continuity;
+    const continuationSessionIdAtStart = parsed.continuationSessionIdAtStart;
+    if (typeof continuationSessionIdAtStart === "string" && continuationSessionIdAtStart) {
+      state.continuationSessionIdAtStart = continuationSessionIdAtStart;
+    }
+    const continuationStartLooking = continuationSessionIdAtStart !== undefined && continuationSessionIdAtStart !== null;
     if (!detached) {
       const legacyActiveTurn = readLegacyActiveTurnState(parsed.activeTurn);
       if (legacyActiveTurn) state.activeTurn = legacyActiveTurn;
@@ -1546,6 +1691,8 @@ function readLifecycleState(value: string | null | undefined): AgentLifecycleSta
       (activeLooking && !activeTurn) ||
       (pendingLooking && !terminationPending) ||
       (blockedLooking && !terminationBlocked) ||
+      (continuityLooking && !continuity) ||
+      (continuationStartLooking && (typeof continuationSessionIdAtStart !== "string" || !continuationSessionIdAtStart)) ||
       authorityStateCount > 1
     ) {
       state.lifecycleCorrupt = true;
@@ -1560,6 +1707,34 @@ function readLifecycleState(value: string | null | undefined): AgentLifecycleSta
       ? { lifecycleKind: "detached_worker_v2", lifecycleCorrupt: true }
       : undefined;
   }
+}
+
+function readProviderContinuityEvidence(value: unknown): ProviderContinuityEvidence | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const state = record.state;
+  if (state !== "NONE" && state !== "KNOWN_UNVERIFIED" && state !== "RESUME_VERIFIED" && state !== "LOST") {
+    return undefined;
+  }
+  const bindingCapability = record.bindingCapability;
+  if (bindingCapability !== undefined && bindingCapability !== "PRE_EFFECT" && bindingCapability !== "LATE_BINDING") {
+    return undefined;
+  }
+  if (record.providerSessionId !== undefined && (typeof record.providerSessionId !== "string" || !record.providerSessionId)) {
+    return undefined;
+  }
+  if (record.verifiedAt !== undefined &&
+      (typeof record.verifiedAt !== "string" || !Number.isFinite(Date.parse(record.verifiedAt)))) {
+    return undefined;
+  }
+  if (record.reason !== undefined && typeof record.reason !== "string") return undefined;
+  return {
+    state,
+    ...(typeof record.providerSessionId === "string" ? { providerSessionId: record.providerSessionId } : {}),
+    ...(bindingCapability === "PRE_EFFECT" || bindingCapability === "LATE_BINDING" ? { bindingCapability } : {}),
+    ...(typeof record.verifiedAt === "string" ? { verifiedAt: record.verifiedAt } : {}),
+    ...(typeof record.reason === "string" ? { reason: record.reason } : {}),
+  };
 }
 
 function readPhysicalTerminationState(value: unknown): PhysicalTerminationState | undefined {

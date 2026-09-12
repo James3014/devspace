@@ -3769,6 +3769,13 @@ export function createMcpServer(
       exclusiveOwnership: z.boolean(),
       intentHash: z.string(),
     });
+    const PROVIDER_CONTINUITY_OUTPUT_SCHEMA = z.object({
+      state: z.enum(["NONE", "KNOWN_UNVERIFIED", "RESUME_VERIFIED", "LOST"]),
+      providerSessionId: z.string().optional(),
+      bindingCapability: z.enum(["PRE_EFFECT", "LATE_BINDING"]).optional(),
+      verifiedAt: z.string().optional(),
+      reason: z.string().optional(),
+    });
     registerAppTool(
       server,
       "agent_catalog",
@@ -4068,6 +4075,7 @@ export function createMcpServer(
           terminalReason: z.string().optional(),
           scopeState: z.string().optional(),
           termination: AGENT_TERMINATION_OUTPUT_SCHEMA.optional(),
+          providerContinuity: PROVIDER_CONTINUITY_OUTPUT_SCHEMA.optional(),
         },
         _meta: {},
         annotations: { readOnlyHint: true },
@@ -4119,6 +4127,7 @@ export function createMcpServer(
           latestResponse: z.string().optional(),
           error: z.string().optional(),
           termination: AGENT_TERMINATION_OUTPUT_SCHEMA.optional(),
+          providerContinuity: PROVIDER_CONTINUITY_OUTPUT_SCHEMA.optional(),
           createdAt: z.string(),
           updatedAt: z.string(),
         },
@@ -4352,6 +4361,7 @@ export function createMcpServer(
             wallMs: z.number(),
             idleMs: z.number(),
           }),
+          providerContinuity: PROVIDER_CONTINUITY_OUTPUT_SCHEMA.optional(),
         },
         _meta: {},
         annotations: { readOnlyHint: true },
