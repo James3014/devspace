@@ -1,3 +1,4 @@
+import type { SessionGenerationSnapshot } from "./deployment-convergence.js";
 export interface ClosableMcpTransport {
   close(): Promise<void>;
 }
@@ -12,6 +13,8 @@ interface McpSessionEntry<TTransport> {
   lastActivityAt: number;
   inFlight: number;
   pendingClose: boolean;
+  snapshot?: SessionGenerationSnapshot;
+  server?: any;
 }
 
 export interface McpSessionRegistryOptions {
@@ -43,7 +46,11 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     return this.sessions.size;
   }
 
-  register(sessionId: string, transport: TTransport): void {
+  register(
+    sessionId: string,
+    transport: TTransport,
+    metadata?: { snapshot?: SessionGenerationSnapshot; server?: any },
+  ): void {
     const evicted: Array<{ sessionId: string; transport: TTransport }> =
       this.maxSessions !== undefined ? this.evictIdleToLimit() : [];
     this.sessions.set(sessionId, {
@@ -51,8 +58,37 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
       lastActivityAt: this.now(),
       inFlight: 0,
       pendingClose: false,
+      snapshot: metadata?.snapshot,
+      server: metadata?.server,
     });
     void closeSessions(evicted);
+  }
+
+
+  getSnapshot(sessionId: string): SessionGenerationSnapshot | undefined {
+    return this.sessions.get(sessionId)?.snapshot;
+  }
+
+  setSnapshot(sessionId: string, snapshot: SessionGenerationSnapshot): void {
+    const entry = this.sessions.get(sessionId);
+    if (entry) entry.snapshot = snapshot;
+  }
+
+  getServer(sessionId: string): any | undefined {
+    return this.sessions.get(sessionId)?.server;
+  }
+
+  setServer(sessionId: string, server: any): void {
+    const entry = this.sessions.get(sessionId);
+    if (entry) entry.server = server;
+  }
+
+  getAllServers(): any[] {
+    const servers: any[] = [];
+    for (const entry of this.sessions.values()) {
+      if (entry.server) servers.push(entry.server);
+    }
+    return servers;
   }
 
   private evictIdleToLimit(): Array<{ sessionId: string; transport: TTransport }> {
