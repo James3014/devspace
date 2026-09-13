@@ -3,6 +3,7 @@ import test from "node:test";
 import "./chat-swarm-continuation-coordinator.test.js";
 import "./chat-swarm-continuation-restart-fence.test.js";
 import "./chat-swarm-continuation-stale-carrier.test.js";
+import "./chat-swarm-continuation-terminal-replay.test.js";
 import { ChatSwarmError } from "./chat-swarm-contract.js";
 import {
   assertContinuationCommitAllowed,
