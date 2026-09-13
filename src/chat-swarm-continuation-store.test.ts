@@ -96,7 +96,7 @@ test("durable continuation request replays exactly and changed target conflicts 
   }
 });
 
-test("parallel prepared targets are bounded by commit-time epoch CAS", () => {
+test("parallel prepared targets terminate losers as SUPERSEDED at winner commit", () => {
   const f = fixture();
   const continuation = new ChatSwarmContinuationStore(f.root);
   try {
@@ -116,15 +116,21 @@ test("parallel prepared targets are bounded by commit-time epoch CAS", () => {
     assert.equal(winner.status, "APPROVED");
     assert.equal(f.swarmStore.getWorker(f.worker.id)!.carrierConversationFingerprint, targetA);
 
+    const loser = continuation.getRequest(requestB.id)!;
+    assert.equal(loser.status, "SUPERSEDED");
+    assert.equal(loser.version, 2);
     assert.throws(
       () => continuation.approveRequest(f.ownerFingerprint, {
         swarmId: f.swarm.id,
         requestId: requestB.id,
-        expectedRequestVersion: 1,
+        expectedRequestVersion: 2,
         expectedSwarmVersion: 2,
       }),
-      (error: unknown) => error instanceof ChatSwarmError && error.code === "CAS_DRIFT",
+      (error: unknown) => error instanceof ChatSwarmError && error.code === "OWNERSHIP_CONFLICT",
     );
+
+    assert.equal(continuation.recoverAfterRestart(), 0);
+    assert.equal(continuation.getRequest(requestB.id)?.status, "SUPERSEDED");
     assert.equal(f.swarmStore.getWorker(f.worker.id)!.continuationEpoch, 1);
     assert.equal(f.swarmStore.getWorker(f.worker.id)!.carrierConversationFingerprint, targetA);
   } finally {
