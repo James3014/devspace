@@ -1,0 +1,65 @@
+name: Issue 123 one-shot wiring
+
+on:
+  push:
+    branches:
+      - codex/issue-123-physical-host-registry-g1
+    paths:
+      - .github/workflows/issue-123-wire.yml
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Verify exact server base
+        run: test "$(git hash-object src/server.ts)" = "89bd83bb4fcf2e96a7c18683f348d2a658889992"
+      - name: Apply exact bounded wiring patch
+        run: node scripts/issue-123-wire.mjs
+      - name: Verify patch scope
+        shell: bash
+        run: |
+          test "$(git diff --name-only)" = "src/server.ts"
+          git diff --check
+          git diff -- src/server.ts
+      - run: npm ci
+      - run: npm run test:physical-host-registry
+      - run: npm run typecheck
+      - run: npm run build
+
+  apply:
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Reconcile exact branch head
+        shell: bash
+        run: |
+          git fetch origin codex/issue-123-physical-host-registry-g1
+          test "$(git rev-parse origin/codex/issue-123-physical-host-registry-g1)" = "${GITHUB_SHA}"
+          test "$(git hash-object src/server.ts)" = "89bd83bb4fcf2e96a7c18683f348d2a658889992"
+      - name: Apply exact bounded wiring patch
+        run: node scripts/issue-123-wire.mjs
+      - name: Verify and commit only server wiring
+        shell: bash
+        run: |
+          test "$(git diff --name-only)" = "src/server.ts"
+          git diff --check
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/server.ts
+          git commit -m "feat: wire physical host registry MCP tools"
+          git push origin HEAD:codex/issue-123-physical-host-registry-g1
