@@ -45,6 +45,7 @@ interface DurableRow {
 
 interface PersistedRequest {
   schema: typeof REQUEST_SCHEMA;
+  version: number;
   swarmId: string;
   workerId: string;
   attemptKey: string;
@@ -95,8 +96,7 @@ export class ChatSwarmContinuationStore {
     }
 
     const tx = this.database.sqlite.transaction(() => {
-      const swarm = this.requireActiveSwarm(input.swarmId);
-      void swarm;
+      this.requireActiveSwarm(input.swarmId);
       const worker = this.workerSnapshot(input.workerId);
       const material = prepareContinuationMaterial(
         worker,
@@ -129,6 +129,7 @@ export class ChatSwarmContinuationStore {
       const expiresAt = new Date(this.clock().getTime() + ttlSeconds * 1000).toISOString();
       const request: PersistedRequest = {
         schema: REQUEST_SCHEMA,
+        version: 1,
         swarmId: input.swarmId,
         workerId: input.workerId,
         attemptKey: input.attemptKey,
@@ -244,12 +245,19 @@ export class ChatSwarmContinuationStore {
         targetCarrierFingerprint: request.targetCarrierFingerprint,
         checkpointHash: request.checkpointHash,
       };
+      const nextRequest = persistedFromRequest(request, request.version + 1);
       const operationUpdate = this.database.sqlite.prepare(`
         update durable_operations
-        set status='succeeded',retry_safe='false',receipt_json=?,error_code=null,
+        set status='succeeded',retry_safe='false',request_json=?,receipt_json=?,error_code=null,
             error_message=null,updated_at=?
         where operation_id=? and kind=? and status='started'
-      `).run(JSON.stringify(receipt), now, request.id, KIND);
+      `).run(
+        JSON.stringify(nextRequest),
+        JSON.stringify(receipt),
+        now,
+        request.id,
+        KIND,
+      );
       if (operationUpdate.changes !== 1) {
         throw new ChatSwarmError("VERSION_CONFLICT", "continuation request changed during transfer");
       }
@@ -295,14 +303,25 @@ export class ChatSwarmContinuationStore {
 
   recoverAfterRestart(): number {
     const now = this.nowIso();
-    const result = this.database.sqlite.prepare(`
-      update durable_operations
-      set status='outcome_unknown',retry_safe='false',error_code='RECONCILIATION_REQUIRED',
-          error_message='DevSpace restarted while continuation was pending; reconcile exact binding before approval.',
-          updated_at=?
-      where kind=? and status='started'
-    `).run(now, KIND);
-    return Number(result.changes);
+    const tx = this.database.sqlite.transaction(() => {
+      const rows = this.database.sqlite.prepare(
+        "select * from durable_operations where kind=? and scope_root=? and status='started'",
+      ).all(KIND, this.scopeRoot) as DurableRow[];
+      for (const row of rows) {
+        const request = this.toRequest(row);
+        const nextRequest = persistedFromRequest(request, request.version + 1);
+        this.database.sqlite.prepare(`
+          update durable_operations
+          set status='outcome_unknown',retry_safe='false',request_json=?,
+              error_code='RECONCILIATION_REQUIRED',
+              error_message='DevSpace restarted while continuation was pending; reconcile exact binding before approval.',
+              updated_at=?
+          where operation_id=? and kind=? and status='started'
+        `).run(JSON.stringify(nextRequest), now, row.operation_id, KIND);
+      }
+      return rows.length;
+    });
+    return tx.immediate();
   }
 
   reconcileUnknownNoEffect(
@@ -328,11 +347,12 @@ export class ChatSwarmContinuationStore {
         this.expireDurable(request.id, now);
         throw new ChatSwarmError("EXPIRED", "continuation request expired during reconciliation");
       }
+      const nextRequest = persistedFromRequest(request, request.version + 1);
       const result = this.database.sqlite.prepare(`
         update durable_operations
-        set status='started',error_code=null,error_message=null,updated_at=?
+        set status='started',request_json=?,error_code=null,error_message=null,updated_at=?
         where operation_id=? and kind=? and status='outcome_unknown'
-      `).run(now, request.id, KIND);
+      `).run(JSON.stringify(nextRequest), now, request.id, KIND);
       if (result.changes !== 1) {
         throw new ChatSwarmError("CAS_DRIFT", "continuation reconciliation changed concurrently");
       }
@@ -409,12 +429,16 @@ export class ChatSwarmContinuationStore {
   }
 
   private expireDurable(requestId: string, now: string): void {
+    const durable = this.requireDurable(requestId);
+    const request = this.toRequest(durable);
+    if (request.status !== "PENDING") return;
+    const nextRequest = persistedFromRequest(request, request.version + 1);
     this.database.sqlite.prepare(`
       update durable_operations
-      set status='failed',retry_safe='false',error_code='EXPIRED',
+      set status='failed',retry_safe='false',request_json=?,error_code='EXPIRED',
           error_message='Continuation request expired before transfer.',updated_at=?
       where operation_id=? and kind=? and status='started'
-    `).run(now, requestId, KIND);
+    `).run(JSON.stringify(nextRequest), now, requestId, KIND);
   }
 
   private assertCommittedBinding(request: ChatSwarmContinuationRequest): void {
@@ -458,7 +482,8 @@ export class ChatSwarmContinuationStore {
         if (
           receipt.targetEpoch !== persisted.targetEpoch ||
           receipt.targetCarrierFingerprint !== persisted.targetCarrierFingerprint ||
-          receipt.checkpointHash !== persisted.checkpointHash
+          receipt.checkpointHash !== persisted.checkpointHash ||
+          !Number.isFinite(Date.parse(receipt.approvedAt))
         ) throw new Error("receipt binding mismatch");
         approvedAt = receipt.approvedAt;
       } catch {
@@ -477,7 +502,7 @@ export class ChatSwarmContinuationStore {
       sourceCarrierFingerprint: persisted.sourceCarrierFingerprint,
       targetCarrierFingerprint: persisted.targetCarrierFingerprint,
       checkpointHash: persisted.checkpointHash,
-      version: row.status === "started" ? 1 : 2,
+      version: persisted.version,
       status,
       requestedAt: persisted.requestedAt,
       expiresAt: persisted.expiresAt,
@@ -508,9 +533,32 @@ function continuationMaterialHash(request: PersistedRequest): string {
   })).digest("hex");
 }
 
+function persistedFromRequest(
+  request: ChatSwarmContinuationRequest,
+  version: number,
+): PersistedRequest {
+  return {
+    schema: REQUEST_SCHEMA,
+    version,
+    swarmId: request.swarmId,
+    workerId: request.workerId,
+    attemptKey: request.attemptKey,
+    sourceEpoch: request.sourceEpoch,
+    targetEpoch: request.targetEpoch,
+    sourceCarrierFingerprint: request.sourceCarrierFingerprint,
+    targetCarrierFingerprint: request.targetCarrierFingerprint,
+    checkpointHash: request.checkpointHash,
+    requestedAt: request.requestedAt,
+    expiresAt: request.expiresAt,
+  };
+}
+
 function validatePersistedRequest(request: PersistedRequest): void {
   if (!request || request.schema !== REQUEST_SCHEMA) {
     throw new ChatSwarmError("INVALID_STATE", "persisted continuation request schema mismatch");
+  }
+  if (!Number.isSafeInteger(request.version) || request.version < 1) {
+    throw new ChatSwarmError("INVALID_STATE", "persisted continuation request version is malformed");
   }
   for (const [label, value] of [
     ["source carrier fingerprint", request.sourceCarrierFingerprint],
