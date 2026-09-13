@@ -139,6 +139,7 @@ export class ChatSwarmContinuationStore {
 
       const now = this.nowIso();
       this.persistExpiredPendingForWorker(input.workerId, now);
+      this.assertNoUnresolvedContinuation(input.workerId, now);
       const pendingCount = this.listPendingDurableForWorker(input.workerId).length;
       if (pendingCount >= MAX_PENDING_PER_WORKER) {
         throw new ChatSwarmError("CAPACITY_FULL", "too many pending continuation requests for worker");
@@ -480,6 +481,24 @@ export class ChatSwarmContinuationStore {
       "select * from durable_operations where kind=? and scope_root=? and status='started'",
     ).all(KIND, this.scopeRoot) as DurableRow[];
     return rows.filter((row) => readPersistedRequest(row).workerId === workerId);
+  }
+
+  private assertNoUnresolvedContinuation(workerId: string, now: string): void {
+    const rows = this.database.sqlite.prepare(
+      "select * from durable_operations where kind=? and scope_root=? and status='outcome_unknown'",
+    ).all(KIND, this.scopeRoot) as DurableRow[];
+    for (const row of rows) {
+      const request = this.toRequest(row);
+      if (request.workerId !== workerId) continue;
+      if (Date.parse(request.expiresAt) <= Date.parse(now)) {
+        this.persistExpired(request.id, now);
+        continue;
+      }
+      throw new ChatSwarmError(
+        "RECONCILIATION_REQUIRED",
+        "worker has an unresolved continuation outcome; reconcile it before creating another replacement",
+      );
+    }
   }
 
   private persistExpiredPendingForWorker(workerId: string, now: string): void {
