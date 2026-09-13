@@ -145,17 +145,6 @@ export class ChatSwarmContinuationStore {
       );
       this.assertTargetCarrierAvailable(authenticatedTargetCarrierFingerprint, input.workerId);
       this.assertTargetCarrierNotRetired(authenticatedTargetCarrierFingerprint, input.workerId);
-      const requestHash = createHash("sha256").update(JSON.stringify({
-        attemptKey: input.attemptKey,
-        checkpointHash: material.checkpointHash,
-        sourceCarrierFingerprint: material.sourceCarrierFingerprint,
-        sourceEpoch: material.sourceEpoch,
-        swarmId: input.swarmId,
-        targetCarrierFingerprint: material.targetCarrierFingerprint,
-        targetEpoch: material.targetEpoch,
-        ttlSeconds,
-        workerId: input.workerId,
-      })).digest("hex");
 
       const now = this.nowIso();
       this.persistExpiredPendingForWorker(input.workerId, now);
@@ -182,6 +171,7 @@ export class ChatSwarmContinuationStore {
         requestedAt,
         expiresAt,
       };
+      const requestHash = continuationMaterialHash(request);
       const operationId = newId("continuation");
       this.database.sqlite.prepare(`
         insert into durable_operations (
@@ -611,6 +601,9 @@ export class ChatSwarmContinuationStore {
     if (row.scope_root !== this.scopeRoot) {
       throw new ChatSwarmError("INVALID_STATE", "durable continuation scope root mismatch");
     }
+    if (row.created_at !== persisted.requestedAt) {
+      throw new ChatSwarmError("INVALID_STATE", "persisted continuation creation timestamp mismatch");
+    }
     if (stableAttemptKey(persisted.swarmId, persisted.workerId, persisted.attemptKey) !== row.attempt_key) {
       throw new ChatSwarmError("INVALID_STATE", "persisted continuation attempt identity mismatch");
     }
@@ -700,6 +693,8 @@ function continuationMaterialHash(request: PersistedRequest): string {
   return createHash("sha256").update(JSON.stringify({
     attemptKey: request.attemptKey,
     checkpointHash: request.checkpointHash,
+    expiresAt: request.expiresAt,
+    requestedAt: request.requestedAt,
     sourceCarrierFingerprint: request.sourceCarrierFingerprint,
     sourceEpoch: request.sourceEpoch,
     swarmId: request.swarmId,
