@@ -116,6 +116,7 @@ export class ChatSwarmContinuationStore {
         authenticatedTargetCarrierFingerprint,
       );
       this.assertTargetCarrierAvailable(authenticatedTargetCarrierFingerprint, input.workerId);
+      this.assertTargetCarrierNotRetired(authenticatedTargetCarrierFingerprint, input.workerId);
       const requestHash = createHash("sha256").update(JSON.stringify({
         attemptKey: input.attemptKey,
         checkpointHash: material.checkpointHash,
@@ -258,6 +259,7 @@ export class ChatSwarmContinuationStore {
       const worker = this.workerSnapshot(request.workerId);
       assertContinuationCommitAllowed(worker, request);
       this.assertTargetCarrierAvailable(request.targetCarrierFingerprint, request.workerId);
+      this.assertTargetCarrierNotRetired(request.targetCarrierFingerprint, request.workerId);
 
       const workerUpdate = this.database.sqlite.prepare(`
         update chat_swarm_workers
@@ -467,6 +469,24 @@ export class ChatSwarmContinuationStore {
     `).get(targetCarrierFingerprint) as Row | undefined;
     if (row && String(row.id) !== workerId) {
       throw new ChatSwarmError("OWNERSHIP_CONFLICT", "target carrier is already bound to another worker");
+    }
+  }
+
+  private assertTargetCarrierNotRetired(targetCarrierFingerprint: string, workerId: string): void {
+    const rows = this.database.sqlite.prepare(
+      "select * from durable_operations where kind=? and scope_root=? and status='succeeded'",
+    ).all(KIND, this.scopeRoot) as DurableRow[];
+    for (const row of rows) {
+      const request = this.toRequest(row);
+      if (
+        request.workerId === workerId &&
+        request.sourceCarrierFingerprint === targetCarrierFingerprint
+      ) {
+        throw new ChatSwarmError(
+          "OWNERSHIP_CONFLICT",
+          "target carrier is retired by an accepted continuation and cannot be rebound",
+        );
+      }
     }
   }
 
