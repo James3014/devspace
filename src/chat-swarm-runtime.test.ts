@@ -12,7 +12,10 @@ import {
   type ManagedConversationEvidence,
   type RuntimePreflight,
 } from "./chat-swarm-runtime.js";
-import { wakeManagedDispatchedTask } from "./chat-swarm-runtime-delivery.js";
+import {
+  ensureManagedRuntime,
+  wakeManagedDispatchedTask,
+} from "./chat-swarm-runtime-delivery.js";
 import type {
   CarrierCallInput,
   CarrierEnsureEvidence,
@@ -30,6 +33,7 @@ class FakeManagedAdapter implements ChatSwarmManagedCarrierAdapter {
   provisionCalls = 0;
   bootstrapCalls = 0;
   wakeCalls = 0;
+  ensureExistingCalls = 0;
   recoverCalls = 0;
   stopCalls = 0;
   failProvision = false;
@@ -102,6 +106,7 @@ class FakeManagedAdapter implements ChatSwarmManagedCarrierAdapter {
   }
 
   async ensureExisting(input: CarrierCallInput): Promise<CarrierEnsureEvidence> {
+    this.ensureExistingCalls += 1;
     return {
       disposition: "READY",
       operationId: input.operationId,
@@ -183,6 +188,21 @@ test("concurrent runtime ensure creates only missing managed workers and exact r
         .filter((worker) => worker.lifecycleState !== "DISABLED").length,
       3,
     );
+  } finally {
+    cleanup(f);
+  }
+});
+
+test("cold ensure reconciles exact existing carriers before declaring the pool healthy", async () => {
+  const f = fixture();
+  try {
+    await f.manager.ensure(f.owner, f.swarm.id, 2);
+    assert.equal(f.adapter.ensureExistingCalls, 0);
+    const cold = await ensureManagedRuntime(f.manager, f.owner, f.swarm.id, 2);
+    assert.equal(cold.slots.filter((slot) => slot.state === "PARKED").length, 2);
+    assert.equal(f.adapter.ensureExistingCalls, 2);
+    assert.equal(f.adapter.provisionCalls, 2);
+    assert.equal(f.adapter.bootstrapCalls, 2);
   } finally {
     cleanup(f);
   }
