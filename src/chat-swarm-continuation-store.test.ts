@@ -59,7 +59,7 @@ function createInput(f: ReturnType<typeof fixture>, attemptKey = "continuation-a
   };
 }
 
-test("durable continuation request replays exactly and rejects changed target material", () => {
+test("durable continuation request replays exactly and changed target conflicts on the same attempt", () => {
   const f = fixture();
   const continuation = new ChatSwarmContinuationStore(f.root);
   try {
@@ -75,16 +75,58 @@ test("durable continuation request replays exactly and rejects changed target ma
     assert.equal(replay.request.id, first.request.id);
     assert.equal(replay.request.requestHash, first.request.requestHash);
 
-    const otherTarget = resolveChatSwarmIdentity({ "openai/conversation_id": "continuation-target-other" }).fingerprint;
+    const otherTarget = resolveChatSwarmIdentity({
+      "openai/conversation_id": "continuation-target-other",
+    }).fingerprint;
     assert.throws(
       () => continuation.createRequest(otherTarget, createInput(f)),
       (error: unknown) => error instanceof ChatSwarmError && error.code === "REPLAY_CONFLICT",
     );
 
-    assert.throws(
-      () => continuation.createRequest(f.targetFingerprint, createInput(f, "continuation-attempt-2")),
-      (error: unknown) => error instanceof ChatSwarmError && error.code === "OWNERSHIP_CONFLICT",
+    const second = continuation.createRequest(
+      otherTarget,
+      createInput(f, "continuation-attempt-2"),
     );
+    assert.equal(second.created, true);
+    assert.notEqual(second.request.id, first.request.id);
+    assert.equal(second.request.sourceEpoch, 0);
+    assert.equal(second.request.targetEpoch, 1);
+  } finally {
+    cleanup(f, continuation);
+  }
+});
+
+test("parallel prepared targets are bounded by commit-time epoch CAS", () => {
+  const f = fixture();
+  const continuation = new ChatSwarmContinuationStore(f.root);
+  try {
+    const targetA = f.targetFingerprint;
+    const targetB = resolveChatSwarmIdentity({
+      "openai/conversation_id": "continuation-target-b",
+    }).fingerprint;
+    const requestA = continuation.createRequest(targetA, createInput(f, "parallel-a")).request;
+    const requestB = continuation.createRequest(targetB, createInput(f, "parallel-b")).request;
+
+    const winner = continuation.approveRequest(f.ownerFingerprint, {
+      swarmId: f.swarm.id,
+      requestId: requestA.id,
+      expectedRequestVersion: 1,
+      expectedSwarmVersion: 1,
+    });
+    assert.equal(winner.status, "APPROVED");
+    assert.equal(f.swarmStore.getWorker(f.worker.id)!.carrierConversationFingerprint, targetA);
+
+    assert.throws(
+      () => continuation.approveRequest(f.ownerFingerprint, {
+        swarmId: f.swarm.id,
+        requestId: requestB.id,
+        expectedRequestVersion: 1,
+        expectedSwarmVersion: 2,
+      }),
+      (error: unknown) => error instanceof ChatSwarmError && error.code === "CAS_DRIFT",
+    );
+    assert.equal(f.swarmStore.getWorker(f.worker.id)!.continuationEpoch, 1);
+    assert.equal(f.swarmStore.getWorker(f.worker.id)!.carrierConversationFingerprint, targetA);
   } finally {
     cleanup(f, continuation);
   }
@@ -223,10 +265,13 @@ test("expired continuation cannot transfer and target readback remains bounded t
     const targetRead = continuation.getLatestForTarget(f.swarm.id, f.targetFingerprint);
     assert.equal(targetRead?.id, created.request.id);
 
-    const otherFingerprint = resolveChatSwarmIdentity({ "openai/conversation_id": "not-the-target" }).fingerprint;
+    const otherFingerprint = resolveChatSwarmIdentity({
+      "openai/conversation_id": "not-the-target",
+    }).fingerprint;
     assert.equal(continuation.getLatestForTarget(f.swarm.id, otherFingerprint), undefined);
 
     now = new Date("2026-09-13T05:00:02.000Z");
+    assert.equal(continuation.getRequest(created.request.id)?.status, "EXPIRED");
     assert.throws(
       () => continuation.approveRequest(f.ownerFingerprint, {
         swarmId: f.swarm.id,
