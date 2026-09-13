@@ -227,7 +227,7 @@ test("managed bootstrap requires the exact created ChatGPT conversation identity
   }
 });
 
-test("targeted dispatch wake is a delivery hint and preserves queued task truth", async () => {
+test("targeted dispatch wake is a delivery hint and preserves canonical claimed task truth", async () => {
   const f = fixture();
   try {
     const status = await f.manager.ensure(f.owner, f.swarm.id, 2);
@@ -238,10 +238,11 @@ test("targeted dispatch wake is a delivery hint and preserves queued task truth"
       prompt: "bounded reasoning task",
       preferredWorkerId: workerId,
     });
-    assert.equal(task.lifecycleState, "QUEUED");
+    assert.equal(task.lifecycleState, "CLAIMED");
+    assert.equal(task.assignedWorkerId, workerId);
     await f.manager.wakeForDispatchedTask(f.owner, task);
     assert.equal(f.adapter.wakeCalls, 1);
-    assert.equal(f.coordinator.store.getTask(task.id)?.lifecycleState, "QUEUED");
+    assert.equal(f.coordinator.store.getTask(task.id)?.lifecycleState, "CLAIMED");
   } finally {
     cleanup(f);
   }
@@ -273,7 +274,8 @@ test("busy targeted worker is never evicted during scale-down", async () => {
       prompt: "do not evict",
       preferredWorkerId: tailWorker,
     });
-    f.store.claimTask(task.id, tailWorker);
+    assert.equal(task.lifecycleState, "CLAIMED");
+    assert.equal(task.assignedWorkerId, tailWorker);
     const scaled = await f.manager.scale(f.owner, f.swarm.id, 2);
     assert.equal(f.coordinator.store.getWorker(tailWorker)?.lifecycleState, "BUSY");
     assert.equal(
