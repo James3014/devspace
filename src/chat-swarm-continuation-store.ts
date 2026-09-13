@@ -108,6 +108,34 @@ export class ChatSwarmContinuationStore {
     }
 
     const tx = this.database.sqlite.transaction(() => {
+      const durableAttemptKey = stableAttemptKey(input.swarmId, input.workerId, input.attemptKey);
+      const existing = this.getDurableByAttempt(durableAttemptKey);
+      if (existing) {
+        if (existing.kind !== KIND) {
+          throw new ChatSwarmError("REPLAY_CONFLICT", "continuation attemptKey is bound to different material");
+        }
+        const persisted = readPersistedRequest(existing);
+        const replayHash = continuationMaterialHash({
+          ...persisted,
+          swarmId: input.swarmId,
+          workerId: input.workerId,
+          attemptKey: input.attemptKey,
+          sourceEpoch: input.sourceEpoch,
+          targetEpoch: input.sourceEpoch + 1,
+          targetCarrierFingerprint: authenticatedTargetCarrierFingerprint,
+          ttlSeconds,
+        });
+        if (existing.request_hash !== replayHash) {
+          throw new ChatSwarmError("REPLAY_CONFLICT", "continuation attemptKey is bound to different material");
+        }
+        const replay = this.toRequest(existing);
+        if (replay.status === "EXPIRED" && (existing.status === "started" || existing.status === "outcome_unknown")) {
+          this.persistExpired(replay.id, this.nowIso());
+          return { request: this.getRequest(replay.id)!, created: false };
+        }
+        return { request: replay, created: false };
+      }
+
       this.requireActiveSwarm(input.swarmId);
       const worker = this.workerSnapshot(input.workerId);
       const material = prepareContinuationMaterial(
@@ -128,15 +156,6 @@ export class ChatSwarmContinuationStore {
         ttlSeconds,
         workerId: input.workerId,
       })).digest("hex");
-
-      const durableAttemptKey = stableAttemptKey(input.swarmId, input.workerId, input.attemptKey);
-      const existing = this.getDurableByAttempt(durableAttemptKey);
-      if (existing) {
-        if (existing.kind !== KIND || existing.request_hash !== requestHash) {
-          throw new ChatSwarmError("REPLAY_CONFLICT", "continuation attemptKey is bound to different material");
-        }
-        return { request: this.toRequest(existing), created: false };
-      }
 
       const now = this.nowIso();
       this.persistExpiredPendingForWorker(input.workerId, now);
