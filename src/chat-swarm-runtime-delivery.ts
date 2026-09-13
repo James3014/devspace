@@ -9,6 +9,10 @@ import type {
   RuntimeStatusResult,
 } from "./chat-swarm-runtime.js";
 
+const PROCESS_CARRIER_GENERATION = hashContent(
+  `${process.pid}:${performance.timeOrigin}`,
+);
+
 function adapterConfigHash(manager: ChatSwarmRuntimeManager): string {
   return (
     manager.adapter.configHash ??
@@ -35,15 +39,17 @@ export async function readManagedRuntimeStatus(
 
 /**
  * Before provisioning missing capacity, reconcile/reopen the exact existing
- * managed carriers through the #116 durable ENSURE_EXISTING journal. This is
- * the cold-start/restart fence: durable slot presence alone never proves the
- * browser carrier is healthy.
+ * managed carriers through the #116 durable ENSURE_EXISTING journal. The
+ * generation is stable for one DevSpace process and changes across restart, so
+ * repeated ensure in one boot is idempotent while a cold boot performs a fresh
+ * physical carrier health check.
  */
 export async function ensureManagedRuntime(
   manager: ChatSwarmRuntimeManager,
   meta: unknown,
   swarmId: string,
   desiredWorkers?: number,
+  operationGeneration = PROCESS_CARRIER_GENERATION,
 ): Promise<RuntimeStatusResult> {
   if (manager.runtimeConfig.enabled) {
     const managedWorkerIds = new Set(
@@ -71,6 +77,7 @@ export async function ensureManagedRuntime(
         swarmId,
         managedAdmitted.length,
         adapterConfigHash(manager),
+        operationGeneration,
       );
       if (results.some((result) => result.state === "RECONCILE_REQUIRED")) {
         throw new ChatSwarmError(
