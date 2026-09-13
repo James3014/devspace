@@ -5,6 +5,7 @@ import {
   WORKER_AUTO_COMPACT_CAPSULE_SCHEMA,
   evaluateWorkerAutoCompact,
   prepareWorkerAutoCompact,
+  verifyWorkerAutoCompactCapsule,
   type WorkerContextPressureSignal,
 } from "./chat-swarm-auto-compact.js";
 
@@ -86,6 +87,7 @@ test("estimated pressure remains explicitly estimated and prepares only at a saf
     sourceEpoch: 4,
     capsuleHash: result.capsule?.capsuleHash,
   });
+  assert.doesNotThrow(() => verifyWorkerAutoCompactCapsule(result.capsule));
 });
 
 test("non-host pressure cannot be labeled exact", () => {
@@ -191,6 +193,21 @@ test("capsule structurally excludes raw checkpoint, transcript, reasoning, tool 
     assert.equal(Object.prototype.hasOwnProperty.call(capsule, forbidden), false, forbidden);
   }
   assert.equal(typeof capsule.checkpointHash, "string");
+});
+
+test("capsule verifier rejects version mismatch, hash corruption, material tampering and unsupported fields", () => {
+  const capsule = prepare().capsule!;
+  for (const corrupted of [
+    { ...capsule, schema: "chat_swarm.worker_auto_compact_capsule.v2" },
+    { ...capsule, capsuleHash: "0".repeat(64) },
+    { ...capsule, contextSummary: "tampered after hash" },
+    { ...capsule, transcript: "must never be accepted" },
+  ]) {
+    assert.throws(
+      () => verifyWorkerAutoCompactCapsule(corrupted),
+      (error: unknown) => error instanceof ChatSwarmError && error.code === "INVALID_STATE",
+    );
+  }
 });
 
 test("capsule and reference bounds fail closed", () => {
