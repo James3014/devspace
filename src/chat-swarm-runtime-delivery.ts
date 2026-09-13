@@ -1,12 +1,92 @@
 import {
   canonicalize,
+  ChatSwarmError,
   hashContent,
   type ChatSwarmTask,
 } from "./chat-swarm-contract.js";
-import type { ChatSwarmRuntimeManager } from "./chat-swarm-runtime.js";
+import type {
+  ChatSwarmRuntimeManager,
+  RuntimeStatusResult,
+} from "./chat-swarm-runtime.js";
 
-function fallbackAdapterConfigHash(kind: string): string {
-  return hashContent(JSON.stringify(canonicalize({ kind })));
+function adapterConfigHash(manager: ChatSwarmRuntimeManager): string {
+  return (
+    manager.adapter.configHash ??
+    hashContent(JSON.stringify(canonicalize({ kind: manager.adapter.kind })))
+  );
+}
+
+/**
+ * Merge the existing carrier-operation journal into the managed-pool status so
+ * an unresolved ENSURE/WAKE cannot be hidden by an otherwise healthy registry.
+ */
+export async function readManagedRuntimeStatus(
+  manager: ChatSwarmRuntimeManager,
+  meta: unknown,
+  swarmId: string,
+): Promise<RuntimeStatusResult> {
+  const status = await manager.status(meta, swarmId);
+  const carrier = manager.carrierManager.status(meta, swarmId);
+  if (carrier.workers.some((worker) => worker.state === "RECONCILE_REQUIRED")) {
+    status.state = "RECONCILE_REQUIRED";
+  }
+  return status;
+}
+
+/**
+ * Before provisioning missing capacity, reconcile/reopen the exact existing
+ * managed carriers through the #116 durable ENSURE_EXISTING journal. This is
+ * the cold-start/restart fence: durable slot presence alone never proves the
+ * browser carrier is healthy.
+ */
+export async function ensureManagedRuntime(
+  manager: ChatSwarmRuntimeManager,
+  meta: unknown,
+  swarmId: string,
+  desiredWorkers?: number,
+): Promise<RuntimeStatusResult> {
+  if (manager.runtimeConfig.enabled) {
+    const managedWorkerIds = new Set(
+      manager.registry
+        .listSlots(swarmId)
+        .filter(
+          (slot) =>
+            slot.state !== "STOPPED" &&
+            slot.state !== "RECONCILE_REQUIRED" &&
+            Boolean(slot.workerId),
+        )
+        .map((slot) => slot.workerId!),
+    );
+    const admitted = manager.coordinator.admittedCarrierWorkers(swarmId);
+    const managedAdmitted = admitted.filter((worker) => managedWorkerIds.has(worker.id));
+
+    // A mixed manual/managed swarm cannot be safely projected through the
+    // all-admitted #116 ensure API. Do not pretend manual carriers are managed.
+    if (
+      managedAdmitted.length > 0 &&
+      managedAdmitted.length === admitted.length
+    ) {
+      const results = await manager.carrierManager.ensure(
+        meta,
+        swarmId,
+        managedAdmitted.length,
+        adapterConfigHash(manager),
+      );
+      if (results.some((result) => result.state === "RECONCILE_REQUIRED")) {
+        throw new ChatSwarmError(
+          "RECONCILIATION_REQUIRED",
+          "an existing managed carrier has an unresolved ensure outcome",
+        );
+      }
+    }
+  }
+
+  const ensured = await manager.ensure(meta, swarmId, desiredWorkers);
+  const carrier = manager.carrierManager.status(meta, swarmId);
+  if (carrier.workers.some((worker) => worker.state === "RECONCILE_REQUIRED")) {
+    ensured.state = "RECONCILE_REQUIRED";
+  }
+  return ensured;
 }
 
 /**
@@ -49,8 +129,7 @@ export async function wakeManagedDispatchedTask(
       workerId: worker.id,
       expectedEpoch: worker.continuationEpoch,
       taskId: task.id,
-      adapterConfigHash:
-        manager.adapter.configHash ?? fallbackAdapterConfigHash(manager.adapter.kind),
+      adapterConfigHash: adapterConfigHash(manager),
     });
   } catch {
     // Canonical dispatch is already durable. Wake is a delivery hint only;
