@@ -1,3 +1,4 @@
+import { ChatSwarmError } from "./chat-swarm-contract.js";
 import type {
   ApproveContinuationRequestInput,
   ChatSwarmContinuationRequest,
@@ -38,6 +39,13 @@ export class ChatSwarmContinuationCoordinator {
     requestId: string,
   ): ChatSwarmContinuationRequest {
     this.swarmCoordinator.assertOwnerForLifecycle(meta, swarmId);
+    const request = this.store.getRequest(requestId);
+    if (!request || request.swarmId !== swarmId) {
+      throw new ChatSwarmError(
+        "OWNERSHIP_CONFLICT",
+        "continuation request does not belong to asserted swarm",
+      );
+    }
     const identity = resolveChatSwarmIdentity(meta);
     return this.store.reconcileUnknownNoEffect(identity.fingerprint, requestId);
   }
