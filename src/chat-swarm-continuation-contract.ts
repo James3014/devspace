@@ -1,4 +1,9 @@
-export const CHAT_SWARM_CONTINUATION_STATES = ["PENDING", "APPROVED", "EXPIRED"] as const;
+export const CHAT_SWARM_CONTINUATION_STATES = [
+  "PENDING",
+  "APPROVED",
+  "EXPIRED",
+  "RECONCILE_REQUIRED",
+] as const;
 
 export type ChatSwarmContinuationState = (typeof CHAT_SWARM_CONTINUATION_STATES)[number];
 
@@ -25,14 +30,12 @@ export interface CreateContinuationRequestInput {
   workerId: string;
   attemptKey: string;
   sourceEpoch: number;
-  targetCarrierFingerprint: string;
   ttlSeconds?: number;
 }
 
 export interface ApproveContinuationRequestInput {
   swarmId: string;
   requestId: string;
-  ownerIdentityFingerprint: string;
   expectedRequestVersion: number;
   expectedSwarmVersion: number;
 }
