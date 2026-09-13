@@ -62,6 +62,7 @@ test("pressure below threshold does not require Auto Compact", () => {
   assert.equal(result.state, "NOT_REQUIRED");
   assert.equal(result.compactRequired, false);
   assert.equal(result.safeToPrepare, false);
+  assert.equal(result.prepareAtRatio, 0.8);
 });
 
 test("estimated pressure remains explicitly estimated and prepares only at a safe boundary", () => {
@@ -69,9 +70,11 @@ test("estimated pressure remains explicitly estimated and prepares only at a saf
   assert.equal(result.decision.state, "PREPARE_REQUIRED");
   assert.equal(result.decision.compactRequired, true);
   assert.equal(result.decision.safeToPrepare, true);
+  assert.equal(result.decision.prepareAtRatio, 0.8);
   assert.equal(result.capsule?.schema, WORKER_AUTO_COMPACT_CAPSULE_SCHEMA);
   assert.equal(result.capsule?.pressure.precision, "ESTIMATED");
   assert.equal(result.capsule?.pressure.source, "DEVSPACE_ESTIMATE");
+  assert.equal(result.capsule?.prepareAtRatio, 0.8);
   assert.equal(result.capsule?.summaryAuthority, "CONTEXT_ONLY");
   assert.match(result.capsule?.checkpointHash ?? "", /^[0-9a-f]{64}$/);
   assert.match(result.capsule?.capsuleHash ?? "", /^[0-9a-f]{64}$/);
@@ -100,6 +103,26 @@ test("non-host pressure cannot be labeled exact", () => {
     pressure: pressure({ precision: "EXACT", source: "HOST_NATIVE" }),
     prepareAtRatio: 0.8,
   }));
+});
+
+test("unknown pressure precision or source fails closed at runtime", () => {
+  assert.throws(
+    () => evaluateWorkerAutoCompact({
+      worker: worker(),
+      pressure: { ...pressure(), precision: "MAGICAL" as WorkerContextPressureSignal["precision"] },
+      prepareAtRatio: 0.8,
+    }),
+    (error: unknown) => error instanceof ChatSwarmError && error.code === "INVALID_INPUT",
+  );
+
+  assert.throws(
+    () => evaluateWorkerAutoCompact({
+      worker: worker(),
+      pressure: { ...pressure(), source: "UNTRUSTED" as WorkerContextPressureSignal["source"] },
+      prepareAtRatio: 0.8,
+    }),
+    (error: unknown) => error instanceof ChatSwarmError && error.code === "INVALID_INPUT",
+  );
 });
 
 test("busy worker waits for an idle boundary without producing a replacement intent", () => {
@@ -141,11 +164,13 @@ test("capsule hash is deterministic and material changes alter the hash", () => 
   const second = prepare();
   const changedSummary = prepare({ contextSummary: "different bounded context" });
   const changedPressure = prepare({ pressure: pressure({ utilizationRatio: 0.9 }) });
+  const changedThreshold = prepare({ prepareAtRatio: 0.81 });
   const changedEpoch = prepare({ worker: worker({ continuationEpoch: 5 }) });
 
   assert.equal(first.capsule?.capsuleHash, second.capsule?.capsuleHash);
   assert.notEqual(first.capsule?.capsuleHash, changedSummary.capsule?.capsuleHash);
   assert.notEqual(first.capsule?.capsuleHash, changedPressure.capsule?.capsuleHash);
+  assert.notEqual(first.capsule?.capsuleHash, changedThreshold.capsule?.capsuleHash);
   assert.notEqual(first.capsule?.capsuleHash, changedEpoch.capsule?.capsuleHash);
 });
 
@@ -181,6 +206,13 @@ test("capsule and reference bounds fail closed", () => {
 
   assert.throws(
     () => prepare({ blockers: Array.from({ length: 17 }, (_, index) => `blocker-${index}`) }),
+    (error: unknown) => error instanceof ChatSwarmError && error.code === "INVALID_INPUT",
+  );
+});
+
+test("capsule creation cannot predate its pressure observation", () => {
+  assert.throws(
+    () => prepare({ createdAt: "2026-09-13T09:29:59.999Z" }),
     (error: unknown) => error instanceof ChatSwarmError && error.code === "INVALID_INPUT",
   );
 });
