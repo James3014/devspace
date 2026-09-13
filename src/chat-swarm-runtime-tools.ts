@@ -13,8 +13,8 @@ const slotSchema = z.object({
   runtimeSlot: z.number().int().positive(),
   generation: z.number().int().nonnegative(),
   state: z.enum([
-    "PROVISIONING", "CARRIER_CREATED", "SETUP_REQUIRED", "SWARM_BOUND", "PARKED",
-    "BUSY", "RECONCILE_REQUIRED", "STOPPED",
+    "PROVISIONING", "CARRIER_CREATED", "BOOTSTRAPPING", "SETUP_REQUIRED",
+    "SWARM_BOUND", "PARKED", "BUSY", "STOPPING", "RECONCILE_REQUIRED", "STOPPED",
   ]),
   projectUrl: z.string(),
   browserProfileId: sha,
@@ -104,10 +104,12 @@ function failure(error: unknown, operation: string): ToolResult {
 }
 
 function requestMeta(extra: { _meta?: unknown }): unknown { return extra._meta ?? {}; }
-
 type RuntimeManagerFactory = () => ChatSwarmRuntimeManager;
 
-async function withManager<T>(factory: RuntimeManagerFactory, fn: (manager: ChatSwarmRuntimeManager) => Promise<T> | T): Promise<T> {
+async function withManager<T>(
+  factory: RuntimeManagerFactory,
+  fn: (manager: ChatSwarmRuntimeManager) => Promise<T> | T,
+): Promise<T> {
   const manager = factory();
   try { return await fn(manager); }
   finally { manager.close(); }
