@@ -7,6 +7,7 @@ import { ChatSwarmError } from "./chat-swarm-contract.js";
 import { ChatSwarmCoordinator } from "./chat-swarm-coordinator.js";
 import { ChatSwarmStore } from "./chat-swarm-store.js";
 import { ChatSwarmContinuationStore } from "./chat-swarm-continuation-store.js";
+import { openDatabase } from "./db/client.js";
 import { resolveChatSwarmIdentity } from "./request-meta.js";
 
 function fixture() {
@@ -59,7 +60,7 @@ function createInput(f: ReturnType<typeof fixture>, attemptKey = "continuation-a
   };
 }
 
-test("durable continuation request replays exactly and changed target conflicts on the same attempt", () => {
+test("durable continuation request replays exactly and changed material conflicts on the same attempt", () => {
   const f = fixture();
   const continuation = new ChatSwarmContinuationStore(f.root);
   try {
@@ -69,11 +70,20 @@ test("durable continuation request replays exactly and changed target conflicts 
     assert.equal(first.request.version, 1);
     assert.equal(first.request.sourceEpoch, 0);
     assert.equal(first.request.targetEpoch, 1);
+    assert.equal(first.request.ttlSeconds, 15 * 60);
 
     const replay = continuation.createRequest(f.targetFingerprint, createInput(f));
     assert.equal(replay.created, false);
     assert.equal(replay.request.id, first.request.id);
     assert.equal(replay.request.requestHash, first.request.requestHash);
+
+    assert.throws(
+      () => continuation.createRequest(f.targetFingerprint, {
+        ...createInput(f),
+        ttlSeconds: 1,
+      }),
+      (error: unknown) => error instanceof ChatSwarmError && error.code === "REPLAY_CONFLICT",
+    );
 
     const otherTarget = resolveChatSwarmIdentity({
       "openai/conversation_id": "continuation-target-other",
@@ -291,6 +301,34 @@ test("expired continuation cannot transfer and target readback remains bounded t
     assert.equal(expired.status, "EXPIRED");
     assert.equal(expired.version, 2);
     assert.equal(f.swarmStore.getWorker(f.worker.id)!.continuationEpoch, 0);
+  } finally {
+    cleanup(f, continuation);
+  }
+});
+
+test("persisted continuation attempt identity tamper fails closed", () => {
+  const f = fixture();
+  const continuation = new ChatSwarmContinuationStore(f.root);
+  try {
+    const created = continuation.createRequest(f.targetFingerprint, createInput(f, "tamper-attempt"));
+    const database = openDatabase(f.root);
+    try {
+      const row = database.sqlite.prepare(
+        "select request_json from durable_operations where operation_id=?",
+      ).get(created.request.id) as { request_json: string };
+      const request = JSON.parse(row.request_json) as Record<string, unknown>;
+      request.attemptKey = "tampered-attempt";
+      database.sqlite.prepare(
+        "update durable_operations set request_json=? where operation_id=?",
+      ).run(JSON.stringify(request), created.request.id);
+    } finally {
+      database.close();
+    }
+
+    assert.throws(
+      () => continuation.getRequest(created.request.id),
+      (error: unknown) => error instanceof ChatSwarmError && error.code === "INVALID_STATE",
+    );
   } finally {
     cleanup(f, continuation);
   }
