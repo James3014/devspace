@@ -36,3 +36,32 @@ test("atomic next claim refuses a closed swarm", () => { const f = fixture(); tr
 test("lease expiry parses equivalent offsets identically and rejects malformed observations", () => { const one = fixture(); const two = fixture(); try { const taskOne = one.store.createTask({ swarmId: one.swarm.id, taskKey: "lease-one", prompt: "p" }).task; one.store.claimTask(taskOne.id, one.worker.id); const taskTwo = two.store.createTask({ swarmId: two.swarm.id, taskKey: "lease-two", prompt: "p" }).task; two.store.claimTask(taskTwo.id, two.worker.id); const lease = new Date(Date.now() + 10_000).toISOString(); one.store.checkpointWorker(one.worker.id, 0, lease, {}); two.store.checkpointWorker(two.worker.id, 0, lease, {}); const sameInstant = lease.replace("Z", "+00:00"); assert.equal(one.store.expireWorkerLease(one.worker.id, lease)?.lifecycleState, "RECONCILE_REQUIRED"); assert.equal(two.store.expireWorkerLease(two.worker.id, sameInstant)?.lifecycleState, "RECONCILE_REQUIRED"); assert.throws(() => two.store.expireWorkerLease(two.worker.id, "not-a-time"), (e: unknown) => e instanceof ChatSwarmError && e.code === "INVALID_INPUT"); } finally { cleanup(one); cleanup(two); } });
 
 test("carrier journal upgrades from a persisted v17 database", () => { const f = fixture(); try { const sqlite = (f.store as unknown as { sqlite: { exec: (sql: string) => void } }).sqlite; sqlite.exec("drop table chat_swarm_carrier_operations; delete from devspace_schema_migrations where version=18;"); f.store.close(); f.store = new ChatSwarmStore(f.root); const reopened = (f.store as unknown as { sqlite: { prepare: (sql: string) => { get: () => { name?: string } } } }).sqlite; assert.equal(reopened.prepare("select name from sqlite_master where type='table' and name='chat_swarm_carrier_operations'").get()?.name, "chat_swarm_carrier_operations"); } finally { cleanup(f); } });
+
+test("typed Chat Swarm migration preserves unresolved task history, hashes records, and replays without a second effect", () => {
+  const source = fixture();
+  const destinationRoot = mkdtempSync(join(tmpdir(), "devspace-chat-swarm-destination-"));
+  const destination = new ChatSwarmStore(destinationRoot);
+  const binding = (role: string, stateDirectory: string) => ({ serverInstanceId: `${role}-server`, sourceCommit: "a".repeat(40), buildId: `${role}-build`, capabilityManifestSha256: "b".repeat(64), catalogGeneration: "catalog-1", stateDirectory });
+  try {
+    const task = source.store.createTask({ swarmId: source.swarm.id, taskKey: "migrate", prompt: "preserve" }).task;
+    source.store.claimTask(task.id, source.worker.id);
+    source.store.recoverAfterRestart();
+    const bundle = source.store.exportMigrationBundle({ operationId: "migration-operation", sourceBinding: binding("source", source.root), destinationBinding: binding("destination", destinationRoot) });
+    assert.equal(bundle.tasks[0]?.lifecycleState, "RECONCILE_REQUIRED");
+    assert.equal(bundle.tasks[0]?.retrySafe, false);
+    assert.equal(JSON.stringify(bundle).includes("oauth"), false);
+    const first = destination.importMigrationBundle(bundle, binding("destination", destinationRoot));
+    const replay = destination.importMigrationBundle(bundle, binding("destination", destinationRoot));
+    assert.deepEqual(replay, first);
+    assert.equal(destination.getTask(task.id)?.lifecycleState, "RECONCILE_REQUIRED");
+    assert.equal(first.contentHash, bundle.contentHash);
+    const tampered = { ...bundle, tasks: [{ ...bundle.tasks[0]!, prompt: "tampered" }] };
+    assert.throws(() => destination.importMigrationBundle(tampered, binding("destination", destinationRoot)), (error: unknown) => error instanceof ChatSwarmError && error.code === "REPLAY_CONFLICT");
+    const secret = { ...bundle, sourceBinding: { ...bundle.sourceBinding, oauthSecret: "x" } as typeof bundle.sourceBinding };
+    assert.throws(() => destination.importMigrationBundle(secret, binding("destination", destinationRoot)), /OAuth secrets/);
+  } finally {
+    destination.close();
+    cleanup(source);
+    rmSync(destinationRoot, { recursive: true, force: true });
+  }
+});

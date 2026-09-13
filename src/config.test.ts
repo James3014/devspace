@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadConfig } from "./config.js";
+import { loadConfig, readControlPlaneInventory } from "./config.js";
 
 const emptyConfigDir = mkdtempSync(join(tmpdir(), "devspace-empty-config-test-"));
 const baseEnv = {
@@ -321,6 +321,78 @@ assert.deepEqual(fileConfig.allowedHosts, [
   "::1",
   "devspace.example.com",
 ]);
+
+const topologyManifest = {
+  schema: "devspace.control_plane_topology_manifest.v1",
+  observedAt: new Date().toISOString(),
+  maxAgeSeconds: 300,
+  inventory: {
+    services: [
+      {
+        role: "primary",
+        roleKind: "AUTHORITATIVE_PRODUCTION",
+        serviceIdentity: { serviceName: "primary", serverInstanceId: "server-primary" },
+        endpoint: { url: "https://primary.invalid", port: 7677 },
+        oauth: { clientIds: [] },
+        stateDirectory: "/state/primary",
+        allowedRoots: ["/workspace"],
+        buildIdentity: { sourceCommit: "a".repeat(40), buildId: "build-primary" },
+        capabilityManifest: { sha256: "b".repeat(64), catalogGeneration: "catalog-1", tools: [] },
+        featureFlags: {},
+        durableState: { workspaceSessions: 0, agentSessions: 0, durableOperations: 0, oauthClients: 0, activeSwarms: 0, workers: 0, tasks: 0, inFlightOperations: 0, unknownOperations: 0, reconcileRequired: 0 },
+        runtimeOwner: { held: false },
+        configuredMaxCapacity: 5,
+      },
+    ],
+    canonicalRole: "primary",
+    retirementCandidateRole: "primary",
+  },
+};
+writeFileSync(join(configDir, "control-plane.json"), JSON.stringify(topologyManifest));
+const topologyConfig = loadConfig({ DEVSPACE_CONFIG_DIR: configDir });
+assert.equal(topologyConfig.controlPlaneInventory?.canonicalRole, "primary");
+assert.equal(topologyConfig.controlPlaneInventory?.manifestRequired, true);
+assert.equal(topologyConfig.controlPlaneManifestPath, join(configDir, "control-plane.json"));
+writeFileSync(join(configDir, "control-plane.json"), JSON.stringify({ ...topologyManifest, inventory: { ...topologyManifest.inventory, services: [{ ...topologyManifest.inventory.services[0], roleKind: undefined }] } }));
+assert.throws(() => loadConfig({ DEVSPACE_CONFIG_DIR: configDir }), /roleKind/);
+writeFileSync(join(configDir, "control-plane.json"), JSON.stringify({ ...topologyManifest, inventory: { ...topologyManifest.inventory, services: [{ ...topologyManifest.inventory.services[0], oauth: { secret: "must-not-load" } }] } }));
+assert.throws(() => loadConfig({ DEVSPACE_CONFIG_DIR: configDir }), /secrets or tokens/);
+
+{
+  const reloadDir = mkdtempSync(join(tmpdir(), "devspace-control-plane-reload-"));
+  const manifestPath = join(reloadDir, "control-plane.json");
+  try {
+    const firstManifest = {
+      ...topologyManifest,
+      observedAt: new Date().toISOString(),
+      inventory: {
+        ...topologyManifest.inventory,
+        services: [{
+          ...topologyManifest.inventory.services[0],
+          capabilityManifest: { ...topologyManifest.inventory.services[0].capabilityManifest, catalogGeneration: "catalog-before" },
+        }],
+      },
+    };
+    writeFileSync(manifestPath, JSON.stringify(firstManifest));
+    assert.equal(readControlPlaneInventory(manifestPath).services[0]?.capabilityManifest.catalogGeneration, "catalog-before");
+
+    const secondManifest = {
+      ...firstManifest,
+      observedAt: new Date().toISOString(),
+      inventory: {
+        ...firstManifest.inventory,
+        services: [{
+          ...firstManifest.inventory.services[0],
+          capabilityManifest: { ...firstManifest.inventory.services[0].capabilityManifest, catalogGeneration: "catalog-after" },
+        }],
+      },
+    };
+    writeFileSync(manifestPath, JSON.stringify(secondManifest));
+    assert.equal(readControlPlaneInventory(manifestPath).services[0]?.capabilityManifest.catalogGeneration, "catalog-after");
+  } finally {
+    rmSync(reloadDir, { recursive: true, force: true });
+  }
+}
 
 assert.deepEqual(loadConfig({ ...baseEnv, DEVSPACE_HOST_OPERATION_ARGV: JSON.stringify(["fixture.mjs", "marker"]) }).hostOperationArgv, ["fixture.mjs", "marker"]);
 assert.throws(() => loadConfig({ ...baseEnv, DEVSPACE_HOST_OPERATION_ARGV: "{bad" }), /Invalid DEVSPACE_HOST_OPERATION_ARGV/);

@@ -1,5 +1,6 @@
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, realpathSync, symlinkSync } from "node:fs";
+import { createRequire } from "node:module";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
@@ -41,6 +42,8 @@ import {
   extractPiProviderError,
   type PiSessionFactory,
 } from "./local-agent-pi.js";
+
+const crossSpawn = createRequire(import.meta.url)("cross-spawn") as typeof import("node:child_process").spawn;
 
 export interface LocalAgentAdapter {
   readonly provider: LocalAgentProvider;
@@ -427,7 +430,10 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
       await callbacks.onExecutionStarted();
     }
 
-    const child = spawn(agyExecutable, args, {
+    const commandSpawn = process.platform === "win32" && /\.(?:cmd|bat)$/i.test(agyExecutable)
+      ? crossSpawn
+      : spawn;
+    const child = commandSpawn(agyExecutable, args, {
       cwd: input.workspaceRoot,
       env: agyCommandEnvironment(environment),
       stdio: ["pipe", "pipe", "pipe"],

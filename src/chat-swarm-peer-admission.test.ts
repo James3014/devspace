@@ -450,31 +450,38 @@ test("readonly peer_status and inspect do not mutate database state or bump vers
 test("lifecycle drain admission permits peer_status and inspect but blocks join_request and approve_join", () => {
   let mode: "normal" | "drain" = "normal";
   const f = fixture();
-  const lifecycle = new ChatSwarmLifecycle({
-    stateDir: f.root,
-    enabled: true,
-    mode: () => mode,
-  });
+  let lifecycle: ChatSwarmLifecycle | undefined;
 
   try {
-    assert.doesNotThrow(() => lifecycle.admit("peer_status"));
-    assert.doesNotThrow(() => lifecycle.admit("inspect"));
-    assert.doesNotThrow(() => lifecycle.admit("join_request"));
-    assert.doesNotThrow(() => lifecycle.admit("approve_join"));
+    const activeLifecycle = new ChatSwarmLifecycle({
+      stateDir: f.root,
+      enabled: true,
+      mode: () => mode,
+    });
+    lifecycle = activeLifecycle;
+
+    assert.doesNotThrow(() => activeLifecycle.admit("peer_status"));
+    assert.doesNotThrow(() => activeLifecycle.admit("inspect"));
+    assert.doesNotThrow(() => activeLifecycle.admit("join_request"));
+    assert.doesNotThrow(() => activeLifecycle.admit("approve_join"));
 
     mode = "drain";
-    assert.doesNotThrow(() => lifecycle.admit("peer_status"));
-    assert.doesNotThrow(() => lifecycle.admit("inspect"));
+    assert.doesNotThrow(() => activeLifecycle.admit("peer_status"));
+    assert.doesNotThrow(() => activeLifecycle.admit("inspect"));
     assert.throws(
-      () => lifecycle.admit("join_request"),
+      () => activeLifecycle.admit("join_request"),
       (err: unknown) => err instanceof ChatSwarmError && err.code === "INVALID_STATE",
     );
     assert.throws(
-      () => lifecycle.admit("approve_join"),
+      () => activeLifecycle.admit("approve_join"),
       (err: unknown) => err instanceof ChatSwarmError && err.code === "INVALID_STATE",
     );
   } finally {
-    cleanup(f);
+    try {
+      lifecycle?.close();
+    } finally {
+      cleanup(f);
+    }
   }
 });
 

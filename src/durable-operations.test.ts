@@ -5,6 +5,7 @@ import { access, chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { ChatSwarmStore } from "./chat-swarm-store.js";
 import { promisify } from "node:util";
 import type { ControlPlaneOwnershipStore } from "./control-plane-ownership.js";
 import type { ControlPlaneConsumerOptions } from "./control-plane-consumer.js";
@@ -14,6 +15,7 @@ import {
   DurableOperationError,
   DurableOperationManager,
   DurableOperationStore,
+  chatSwarmMigrationOperationId,
   NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256,
   NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE,
   NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE,
@@ -155,6 +157,73 @@ test("workspace_clone clones a local repository inside allowed roots and exact r
       manager.close();
     }
   } finally {
+    await f.cleanup();
+  }
+});
+
+test("chat swarm migration executor is readback-bound, idempotent, and refuses unknown replay", async () => {
+  const f = await fixture();
+  const destinationRoot = await mkdtemp(join(tmpdir(), "devspace-migration-destination-"));
+  const source = new ChatSwarmStore(f.config.stateDir);
+  const destination = new ChatSwarmStore(destinationRoot);
+  const binding = (role: string, stateDirectory: string) => ({
+    serverInstanceId: `${role}-server`,
+    sourceCommit: "a".repeat(40),
+    buildId: `${role}-build`,
+    capabilityManifestSha256: "b".repeat(64),
+    catalogGeneration: "catalog-1",
+    stateDirectory,
+  });
+  try {
+    const swarm = source.createSwarm({ ownerIdentity: "owner", workerLimit: 2 });
+    const worker = source.createWorker({ swarmId: swarm.id, label: "peer", runtimeKind: "mcp_peer" });
+    const task = source.createTask({ swarmId: swarm.id, taskKey: "executor", prompt: "preserve" }).task;
+    source.claimTask(task.id, worker.id);
+    source.recoverAfterRestart();
+    const sourceBinding = binding("source", f.config.stateDir);
+    const destinationBinding = binding("destination", destinationRoot);
+    const attemptKey = "migration-executor-1";
+    // The destination binding is known before export; the operation identity is
+    // derived from that canonical destination root and the attempt key.
+    const operationId = chatSwarmMigrationOperationId(destinationRoot, attemptKey);
+    assert.notEqual(operationId, chatSwarmMigrationOperationId(f.config.stateDir, attemptKey));
+    const bundle = source.exportMigrationBundle({ operationId, sourceBinding, destinationBinding });
+    assert.equal(bundle.operationId, operationId);
+    const canonicalConfig = loadConfig({
+      DEVSPACE_CONFIG_DIR: join(destinationRoot, ".config"),
+      DEVSPACE_ALLOWED_ROOTS: destinationRoot,
+      DEVSPACE_WORKTREE_ROOT: join(destinationRoot, ".worktrees"),
+      DEVSPACE_STATE_DIR: destinationRoot,
+      DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+      PORT: "1",
+    });
+    const manager = new DurableOperationManager(canonicalConfig);
+    try {
+      const preparation = manager.prepareChatSwarmMigration({ attemptKey, bundle, destinationBinding });
+      const first = manager.applyChatSwarmMigration(preparation, destination);
+      assert.equal(first.status, "succeeded");
+      assert.equal(first.retrySafe, false);
+      assert.equal(destination.getTask(task.id)?.lifecycleState, "RECONCILE_REQUIRED");
+      assert.equal(source.listSwarms().some((item) => item.id === swarm.id), true);
+      assert.equal(source.listWorkers(swarm.id).some((item) => item.id === worker.id), true);
+      assert.equal(source.getTask(task.id)?.lifecycleState, "RECONCILE_REQUIRED");
+      const replay = manager.applyChatSwarmMigration(preparation, destination);
+      assert.deepEqual(replay, first);
+      assert.equal(destination.readMigrationReadback(bundle).contentHash, bundle.contentHash);
+
+      const unknownAttempt = "migration-executor-unknown";
+      const unknownOperationId = chatSwarmMigrationOperationId(destinationRoot, unknownAttempt);
+      const unknownBundle = source.exportMigrationBundle({ operationId: unknownOperationId, sourceBinding, destinationBinding });
+      const unknownPreparation = manager.prepareChatSwarmMigration({ attemptKey: unknownAttempt, bundle: unknownBundle, destinationBinding });
+      manager.store.finish(unknownPreparation.operationId, { status: "outcome_unknown", retrySafe: false, errorCode: "RECONCILIATION_REQUIRED" });
+      assert.throws(() => manager.applyChatSwarmMigration(unknownPreparation, destination), (error: unknown) => error instanceof DurableOperationError && error.code === "OPERATION_OUTCOME_UNKNOWN");
+    } finally {
+      manager.close();
+    }
+  } finally {
+    source.close();
+    destination.close();
+    await rm(destinationRoot, { recursive: true, force: true });
     await f.cleanup();
   }
 });

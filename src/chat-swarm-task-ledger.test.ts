@@ -448,27 +448,33 @@ test("restart with active work preserves RECONCILE_REQUIRED semantics and leaves
 
 test("drain rejects new dispatch but permits task ledger reads", () => {
   const f = setupFixture();
+  let lifecycle: ChatSwarmLifecycle | undefined;
   try {
     let mode: "normal" | "drain" = "normal";
-    const lifecycle = new ChatSwarmLifecycle({
+    const activeLifecycle = new ChatSwarmLifecycle({
       stateDir: f.root,
       mode: () => mode,
     });
+    lifecycle = activeLifecycle;
 
     mode = "drain";
     // New dispatch should be denied
     assert.throws(
-      () => lifecycle.admit("dispatch"),
+      () => activeLifecycle.admit("dispatch"),
       (err: any) => err.code === "INVALID_STATE" && /is unavailable while cutover is drain/i.test(err.message),
     );
 
     // tasks and inspect are permitted in drain mode
-    assert.doesNotThrow(() => lifecycle.admit("tasks"));
-    assert.doesNotThrow(() => lifecycle.admit("inspect"));
-    assert.doesNotThrow(() => lifecycle.admit("status"));
-    assert.doesNotThrow(() => lifecycle.admit("collect"));
+    assert.doesNotThrow(() => activeLifecycle.admit("tasks"));
+    assert.doesNotThrow(() => activeLifecycle.admit("inspect"));
+    assert.doesNotThrow(() => activeLifecycle.admit("status"));
+    assert.doesNotThrow(() => activeLifecycle.admit("collect"));
   } finally {
-    f.clean();
+    try {
+      lifecycle?.close();
+    } finally {
+      f.clean();
+    }
   }
 });
 

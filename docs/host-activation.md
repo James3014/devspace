@@ -86,3 +86,19 @@ The OpenCLI manifest should bind only the user adapter, packaged adapter, corres
 This primitive is host execution mechanics only. `OWNER_DIRECT` remains the current activation authority lane. A future `NEXUS_GOVERNED` lane must fail closed until DevSpace can verify a canonical Nexus execution grant; it must not infer authority from Candidate existence, model output, Issue state, or this receipt.
 
 `APPLIED` is only activation truth. It does not mean the runtime has passed production canary, semantic acceptance, release, or public-claim gates.
+
+## Single-authority production control plane
+
+### Dated G0 observation (2026-09-13)
+
+The Issue #133 G0 inventory recorded `dev2` on `7677` as the intended canonical service, with launchd identity `com.jameschen.devspace-chatgpt`, public endpoint `devspace.snowskill.app`, source `da4be27769c72e42ec24882145d8a84a804a4999`, build `devspace-1.0.7-da4be277`, server `cbad1224-d199-432d-9858-b06596839f85`, capability manifest `b5af10e4e4af21cd735a094c3cd0afb31320ea0f473c0819148aa5248bf2c718`, and state directory `~/.local/share/devspace-chatgpt`. These values are historical evidence, not production defaults. A fresh witness did **not** find the Chat Swarm/runtime tools on `7677`; no claim that the six-tool surface is live is valid yet.
+
+The same G0 record named the other physical service as a non-authoritative migration source. Its observed build ID was `devspace-1.0.7-ab22dc9d`; its catalog generation was unresolved. Allowed roots, tool inventory, service labels, and other fields remain unknown until an authenticated inventory manifest supplies them. OAuth secrets, tokens, and client rows are never migration payloads.
+
+### Desired G1 topology and gates
+
+The desired topology has exactly one explicit `AUTHORITATIVE_PRODUCTION` role. Any canary or migration source must declare an explicit non-authoritative role in the validated topology manifest; connector names and historical host names are not role evidence. The canonical service owns the production endpoint, OAuth authority, allowed roots, capability manifest, catalog generation, and durable state. Chat Swarm migration uses typed domain records, exact source/destination bindings, content hashes, CAS/collision checks, and pre/post readback; it never attaches, copies, or merges SQLite files.
+
+Before launching a manifest-bound production service, the host must set `DEVSPACE_SERVER_INSTANCE_ID` to a strict UUID that exactly matches that service's `serviceIdentity.serverInstanceId`. A missing or malformed launch binding fails startup closed; an unmanifested development/test startup may continue to generate a runtime UUID. The configured `control-plane.json` is refreshed by writing a fully validated replacement to a sibling temporary file and atomically renaming it over the exact configured path. Long-lived services reread that path for each migration or readiness evaluation, so a partial or invalid replacement never becomes an implied topology truth.
+
+Retirement is fail-closed until the readback-bound migration receipt and retired/read-only attestation prove zero active stranded records or authority (historical swarms, workers, tasks, and terminal or `RECONCILE_REQUIRED` rows remain queryable in the source), no in-flight/unknown operational state, a released runtime owner, exact identity/manifest/catalog bindings, the canonical six-tool surface, and configured capacity of at least five. `OUTCOME_UNKNOWN` is not retry permission. G3 remains pending until post-cutover authenticated `tools/list` proves the required runtime tools and the session/catalog acknowledgement path is current.

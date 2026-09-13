@@ -34,7 +34,7 @@ import {
   isArtifactDownloadSupportedPlatform,
   registerArtifactTools,
 } from "./artifact-tools.js";
-import { loadConfig, type ServerConfig, type WidgetMode } from "./config.js";
+import { loadConfig, readControlPlaneInventory, type ServerConfig, type WidgetMode } from "./config.js";
 import {
   createOpenAIIncomingArtifactAdapter,
   type IncomingArtifactAdapter,
@@ -97,6 +97,7 @@ import type { WorkspaceSession } from "./workspace-store.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
 import {
   DurableOperationManager,
+  chatSwarmMigrationOperationId,
   planCutoverStart,
   DurableOperationError,
   NEXUS_GATEWAY_RECOVERY_SCHEMA,
@@ -111,6 +112,7 @@ import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { openAiConversationScopeId } from "./request-meta.js";
 import { isReadOnlyInspectionCommand } from "./conversation-isolation.js";
 import { ChatSwarmLifecycle } from "./chat-swarm-lifecycle.js";
+import type { ChatSwarmStore, ChatSwarmMigrationBundle } from "./chat-swarm-store.js";
 import { registerChatSwarmTools, chatSwarmToolInputShapes } from "./chat-swarm-tools.js";
 import { ChatSwarmRuntimeOwner } from "./chat-swarm-runtime-owner.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
@@ -141,6 +143,13 @@ import {
   type MultiRoleDeploymentEvaluation,
   type ServiceRoleDeploymentIdentity,
 } from "./deployment-convergence.js";
+import {
+  evaluateControlPlaneConvergence,
+  ControlPlaneConvergenceError,
+  type ControlPlaneConvergenceEvaluation,
+  type ControlPlaneInventory,
+  type ControlPlaneServiceBinding,
+} from "./control-plane-convergence.js";
 import {
   deriveLoadedCapabilityManifest,
   type CapabilityManifest,
@@ -1376,6 +1385,7 @@ export interface RuntimeBuildIdentityContext {
   identity: RuntimeBuildIdentity;
   latestProfileCatalogGeneration: { value: string };
   capabilityManifest?: CapabilityManifest;
+  onCatalogGenerationChanged?: () => Promise<number> | number;
 }
 
 export interface CutoverMcpControlContext {
@@ -1412,6 +1422,7 @@ export interface CutoverMcpControlContext {
   }) => Promise<DurableCutoverRecord>;
   sessionConvergence?: (sessionId?: string) => SessionConvergenceEvaluation;
   multiRoleEvaluator?: () => MultiRoleDeploymentEvaluation;
+  controlPlaneEvaluator?: () => ControlPlaneConvergenceEvaluation;
 }
 
 
@@ -1437,6 +1448,7 @@ function registerCutoverMcpTools(
       outputSchema: {
         sessionConvergence: z.record(z.string(), z.unknown()).optional(),
         multiRoleConvergence: z.record(z.string(), z.unknown()).optional(),
+        controlPlaneConvergence: z.record(z.string(), z.unknown()).optional(),
         cutoverStatus: z.record(z.string(), z.unknown()),
       },
       _meta: {},
@@ -1446,13 +1458,15 @@ function registerCutoverMcpTools(
       const cutoverStatus = control.controller.status(control.transportEvidence());
       const sessionConvergence = control.sessionConvergence?.(sessionId);
       const multiRoleConvergence = control.multiRoleEvaluator?.();
+      const controlPlaneConvergence = control.controlPlaneEvaluator?.();
       return {
         content: [textBlock(
-          `Capability convergence: session=${sessionConvergence?.state ?? "n/a"}, multiRoleConverged=${String(multiRoleConvergence?.converged ?? true)}, cutoverMode=${String(cutoverStatus.mode)}.`,
+          `Capability convergence: session=${sessionConvergence?.state ?? "n/a"}, multiRoleConverged=${String(multiRoleConvergence?.converged ?? true)}, controlPlane=${controlPlaneConvergence?.converged ? "CONVERGED" : controlPlaneConvergence ? "BLOCKED" : "unbound"}, cutoverMode=${String(cutoverStatus.mode)}.`,
         )],
         structuredContent: {
           sessionConvergence: sessionConvergence as unknown as Record<string, unknown> | undefined,
           multiRoleConvergence: multiRoleConvergence as unknown as Record<string, unknown> | undefined,
+          controlPlaneConvergence: controlPlaneConvergence as unknown as Record<string, unknown> | undefined,
           cutoverStatus,
         },
       };
@@ -1987,6 +2001,201 @@ function registerCutoverMcpTools(
   }
 }
 
+function registerControlPlaneMigrationTools(
+  server: McpServer,
+  durableOperations: DurableOperationManager,
+  chatSwarmStore: ChatSwarmStore,
+  controlPlaneEvaluator?: () => ControlPlaneConvergenceEvaluation,
+  controlPlaneInventory?: ControlPlaneInventory,
+  controlPlaneInventoryReader?: () => ControlPlaneInventory,
+  runtimeIdentity?: RuntimeBuildIdentity,
+  capabilityManifest?: CapabilityManifest,
+  catalogGeneration?: string,
+): void {
+  const bindingShape = {
+    serverInstanceId: z.string().min(1),
+    sourceCommit: z.string().regex(/^[0-9a-f]{40}$/),
+    buildId: z.string().min(1),
+    capabilityManifestSha256: z.string().regex(/^[0-9a-f]{64}$/),
+    catalogGeneration: z.string().min(1),
+    stateDirectory: z.string().min(1),
+  };
+  const bundleShape = {
+    schema: z.literal("devspace.chat_swarm_migration_bundle.v1"),
+    operationId: z.string().min(1),
+    sourceBinding: z.object(bindingShape).strict(),
+    destinationBinding: z.object(bindingShape).strict(),
+    contentHash: z.string().regex(/^[0-9a-f]{64}$/),
+    swarms: z.array(z.record(z.string(), z.unknown())).max(10_000),
+    workers: z.array(z.record(z.string(), z.unknown())).max(50_000),
+    tasks: z.array(z.record(z.string(), z.unknown())).max(100_000),
+    attempts: z.array(z.record(z.string(), z.unknown())).max(100_000),
+    carrierOperations: z.array(z.record(z.string(), z.unknown())).max(100_000),
+  };
+  const bundleSchema = z.object(bundleShape).strict();
+  const operationSchema = z.object({ operationId: z.string().min(1) }).strict();
+  const destinationSchema = z.object(bindingShape).strict();
+  const output = (operation: DurableOperationRecord) => ({
+    content: [textBlock(`${operation.kind} ${operation.operationId}: status=${operation.status}, retrySafe=${operation.retrySafe}.`)],
+    structuredContent: operation as unknown as Record<string, unknown>,
+  });
+
+  const freshInventory = (): ControlPlaneInventory => {
+    const currentInventory = controlPlaneInventoryReader?.() ?? controlPlaneInventory;
+    if (!currentInventory?.manifestRequired || !runtimeIdentity || !capabilityManifest || !catalogGeneration) {
+      throw new ControlPlaneConvergenceError("MISSING_INVENTORY", "migration export requires a configured fresh topology manifest and running identity");
+    }
+    const observedAt = Date.parse(currentInventory.observedAt ?? "");
+    const maxAgeSeconds = currentInventory.maxAgeSeconds;
+    if (!Number.isFinite(observedAt) || !Number.isSafeInteger(maxAgeSeconds) || Date.now() - observedAt > Number(maxAgeSeconds) * 1000 || observedAt > Date.now() + 30_000) {
+      throw new ControlPlaneConvergenceError("TOPOLOGY_MANIFEST_STALE", "migration export requires a fresh topology manifest");
+    }
+    const authoritative = currentInventory.services.filter((service) => service.roleKind === "AUTHORITATIVE_PRODUCTION");
+    if (authoritative.length !== 1) throw new ControlPlaneConvergenceError("DUPLICATE_PRODUCTION_OWNERS", "migration path requires exactly one authoritative production service");
+    const knownRoleKinds = new Set(["AUTHORITATIVE_PRODUCTION", "NON_AUTHORITATIVE_CANARY", "NON_AUTHORITATIVE_MIGRATION_SOURCE", "NON_AUTHORITATIVE_TEST"]);
+    if (currentInventory.services.some((service) => typeof service.roleKind !== "string" || !knownRoleKinds.has(service.roleKind))) {
+      throw new ControlPlaneConvergenceError("MISSING_INVENTORY", "migration path requires an explicit known roleKind for every physical service");
+    }
+    if (!currentInventory.services.some((service) => service.role === currentInventory.canonicalRole && service.roleKind === "AUTHORITATIVE_PRODUCTION")) {
+      throw new ControlPlaneConvergenceError("CANONICAL_ROLE_INVALID", "migration path requires an explicit authoritative canonical role");
+    }
+    if (currentInventory.services.filter((service) => service.roleKind === "NON_AUTHORITATIVE_MIGRATION_SOURCE").length !== 1) {
+      throw new ControlPlaneConvergenceError("MISSING_INVENTORY", "migration path requires exactly one explicitly named migration source");
+    }
+    return currentInventory;
+  };
+
+  const bindingForRole = (roleKind: "AUTHORITATIVE_PRODUCTION" | "NON_AUTHORITATIVE_MIGRATION_SOURCE"): ControlPlaneServiceBinding => {
+    const inventory = freshInventory();
+    const service = inventory.services.find((candidate) => candidate.roleKind === roleKind && (roleKind !== "AUTHORITATIVE_PRODUCTION" || candidate.role === inventory.canonicalRole));
+    if (!service) throw new ControlPlaneConvergenceError("MISSING_INVENTORY", `topology manifest has no ${roleKind} binding`);
+    const binding: ControlPlaneServiceBinding = {
+      serverInstanceId: service.serviceIdentity.serverInstanceId,
+      sourceCommit: service.buildIdentity.sourceCommit,
+      buildId: service.buildIdentity.buildId,
+      capabilityManifestSha256: service.capabilityManifest.sha256,
+      catalogGeneration: service.capabilityManifest.catalogGeneration,
+      stateDirectory: service.stateDirectory,
+    };
+    return binding;
+  };
+
+  const sourceBinding = (): ControlPlaneServiceBinding => {
+    const binding = bindingForRole("NON_AUTHORITATIVE_MIGRATION_SOURCE");
+    if (binding.serverInstanceId !== runtimeIdentity!.serverInstanceId || binding.sourceCommit !== runtimeIdentity!.sourceCommit || binding.buildId !== runtimeIdentity!.buildId || binding.capabilityManifestSha256 !== capabilityManifest!.manifestSha256 || binding.catalogGeneration !== catalogGeneration || binding.stateDirectory !== runtimeIdentity!.stateRoot) {
+      throw new ControlPlaneConvergenceError("IDENTITY_DRIFT", "topology manifest does not exactly bind the running migration source");
+    }
+    return binding;
+  };
+
+  const canonicalBinding = (): ControlPlaneServiceBinding => bindingForRole("AUTHORITATIVE_PRODUCTION");
+  const requireCanonicalDestination = (destinationBinding: ControlPlaneServiceBinding): void => {
+    const expected = canonicalBinding();
+    if (["serverInstanceId", "sourceCommit", "buildId", "capabilityManifestSha256", "catalogGeneration", "stateDirectory"].some((key) => destinationBinding[key as keyof ControlPlaneServiceBinding] !== expected[key as keyof ControlPlaneServiceBinding])) {
+      throw new ControlPlaneConvergenceError("IDENTITY_DRIFT", "destination binding does not exactly match the canonical production identity");
+    }
+  };
+  const requireCanonicalRuntime = (): void => {
+    const binding = canonicalBinding();
+    if (binding.serverInstanceId !== runtimeIdentity!.serverInstanceId || binding.sourceCommit !== runtimeIdentity!.sourceCommit || binding.buildId !== runtimeIdentity!.buildId || binding.capabilityManifestSha256 !== capabilityManifest!.manifestSha256 || binding.catalogGeneration !== catalogGeneration || binding.stateDirectory !== runtimeIdentity!.stateRoot) {
+      throw new ControlPlaneConvergenceError("IDENTITY_DRIFT", "migration apply/reconcile requires the canonical production runtime");
+    }
+  };
+
+  registerAppTool(server, "chat_swarm_migration_export", {
+    title: "Export Chat Swarm migration bundle",
+    description: "Export typed Chat Swarm domain records from the explicitly bound non-authoritative migration source. OAuth secrets, tokens, and client rows are rejected and never included.",
+    inputSchema: {
+      attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/),
+      destinationBinding: destinationSchema,
+      swarmIds: z.array(z.string().min(1).max(256)).max(10_000).optional(),
+    },
+    _meta: {},
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, async ({ attemptKey, destinationBinding, swarmIds }, extra) => {
+    dependencyConsumerContext(extra);
+    requireCanonicalDestination(destinationBinding as ControlPlaneServiceBinding);
+    const operationId = chatSwarmMigrationOperationId((destinationBinding as ControlPlaneServiceBinding).stateDirectory, attemptKey);
+    const bundle = chatSwarmStore.exportMigrationBundle({ operationId, sourceBinding: sourceBinding(), destinationBinding: destinationBinding as ControlPlaneServiceBinding, swarmIds });
+    return {
+      content: [textBlock(`Chat Swarm migration bundle ${bundle.operationId}: ${bundle.tasks.length} task records, contentHash=${bundle.contentHash}.`)],
+      structuredContent: bundle as unknown as Record<string, unknown>,
+    };
+  });
+
+  registerAppTool(server, "chat_swarm_migration_prepare", {
+    title: "Prepare Chat Swarm migration",
+    description: "Bind one typed Chat Swarm domain-record bundle to an exact canonical destination identity. Preparation creates no effect and never copies OAuth/client records.",
+    inputSchema: { attemptKey: z.string().min(1), destinationBinding: destinationSchema, bundle: bundleSchema },
+    _meta: {},
+    annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false },
+  }, async ({ attemptKey, destinationBinding, bundle }, extra) => {
+    dependencyConsumerContext(extra);
+    requireCanonicalRuntime();
+    requireCanonicalDestination(destinationBinding as ControlPlaneServiceBinding);
+    const prepared = durableOperations.prepareChatSwarmMigration({ attemptKey, destinationBinding, bundle: bundle as unknown as ChatSwarmMigrationBundle });
+    const operation = durableOperations.store.getByOperationId(prepared.operationId);
+    if (!operation) throw new Error("migration preparation did not persist its durable operation identity");
+    return { ...output(operation), structuredContent: { ...operation, phase: "PREPARED", contentHash: prepared.bundle.contentHash } };
+  });
+
+  registerAppTool(server, "chat_swarm_migration_status", {
+    title: "Read Chat Swarm migration status",
+    description: "Read one exact migration operation from the existing durable operation ledger.",
+    inputSchema: operationSchema,
+    _meta: {},
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, async ({ operationId }, extra) => {
+    dependencyConsumerContext(extra);
+    const operation = durableOperations.store.getByOperationId(operationId);
+    if (!operation || operation.kind !== "chat_swarm_reconciliation") throw new Error("unknown Chat Swarm migration operation");
+    return output(operation);
+  });
+
+  registerAppTool(server, "chat_swarm_migration_apply", {
+    title: "Apply Chat Swarm migration",
+    description: "Apply a prepared domain-record bundle with exact bindings, CAS/collision checks, pre/post readback, and no SQLite attachment or second effect.",
+    inputSchema: { attemptKey: z.string().min(1), destinationBinding: destinationSchema, bundle: bundleSchema },
+    _meta: {},
+    annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false },
+  }, async ({ attemptKey, destinationBinding, bundle }, extra) => {
+    dependencyConsumerContext(extra);
+    requireCanonicalRuntime();
+    requireCanonicalDestination(destinationBinding as ControlPlaneServiceBinding);
+    const prepared = durableOperations.prepareChatSwarmMigration({ attemptKey, destinationBinding, bundle: bundle as unknown as ChatSwarmMigrationBundle });
+    return output(durableOperations.applyChatSwarmMigration(prepared, chatSwarmStore));
+  });
+
+  registerAppTool(server, "chat_swarm_migration_reconcile", {
+    title: "Reconcile Chat Swarm migration",
+    description: "Read back the exact destination bundle after an uncertain effect; OUTCOME_UNKNOWN is never retry permission.",
+    inputSchema: { attemptKey: z.string().min(1), destinationBinding: destinationSchema, bundle: bundleSchema },
+    _meta: {},
+    annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false },
+  }, async ({ attemptKey, destinationBinding, bundle }, extra) => {
+    dependencyConsumerContext(extra);
+    requireCanonicalRuntime();
+    requireCanonicalDestination(destinationBinding as ControlPlaneServiceBinding);
+    const prepared = durableOperations.prepareChatSwarmMigration({ attemptKey, destinationBinding, bundle: bundle as unknown as ChatSwarmMigrationBundle });
+    return output(durableOperations.reconcileChatSwarmMigration(prepared, chatSwarmStore));
+  });
+
+  registerAppTool(server, "control_plane_retirement_readiness", {
+    title: "Read control-plane retirement readiness",
+    description: "Read exact topology, migration receipt, durable-state, OAuth-authority, runtime-owner, capacity, tool-surface, and session/catalog gates. This never retires or stops a service.",
+    inputSchema: {},
+    _meta: {},
+    annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+  }, async (_, extra) => {
+    dependencyConsumerContext(extra);
+    const evaluation = controlPlaneEvaluator?.();
+    return {
+      content: [textBlock(evaluation ? `Retirement readiness: ${evaluation.eligibleToRetire ? "READY" : "BLOCKED"}.` : "Retirement readiness: BLOCKED (no trusted topology manifest).")],
+      structuredContent: { ready: evaluation?.eligibleToRetire === true, evaluation },
+    };
+  });
+}
+
 function describeOutcome(outcome: OrchestrationOutcome): string {
   switch (outcome.outcome) {
     case "restart_scheduled":
@@ -2274,6 +2483,10 @@ export function createMcpServer(
   chatSwarmLifecycle?: ChatSwarmLifecycle,
   carrierBindings?: CarrierBindingStore,
   hostOperations?: HostOperationRegistrar,
+  /** Test-only topology injection; production uses the validated config manifest. */
+  controlPlaneInventoryOverride?: ControlPlaneInventory,
+  /** Production-only reread of the exact configured manifest path. */
+  controlPlaneInventoryReader?: () => ControlPlaneInventory,
 ): McpServer {
   const runtimeBuildIdentity = runtimeBuildIdentityContext?.identity
     ?? describeRuntimeBuildIdentity({
@@ -2321,6 +2534,20 @@ export function createMcpServer(
     allowedRoots: config.allowedRoots,
   });
   if (cutoverControl) registerCutoverMcpTools(server, cutoverControl, durableOperations);
+  const controlPlaneInventory = controlPlaneInventoryOverride ?? config.controlPlaneInventory;
+  if (durableOperations && chatSwarmLifecycle?.store && controlPlaneInventory?.manifestRequired === true) {
+    registerControlPlaneMigrationTools(
+      server,
+      durableOperations,
+      chatSwarmLifecycle.store,
+      cutoverControl?.controlPlaneEvaluator,
+      controlPlaneInventory,
+      controlPlaneInventoryReader,
+      runtimeBuildIdentity,
+      capabilityManifest,
+      latestProfileCatalogGeneration.value,
+    );
+  }
 
   registerAppResource(
     server,
@@ -2480,7 +2707,11 @@ export function createMcpServer(
         sourceCommit: runtimeBuildIdentity.sourceCommit,
         profileCatalogGeneration: workspace.profileCatalogGeneration ?? "unresolved",
       };
+      const previousCatalogGeneration = latestProfileCatalogGeneration.value;
       latestProfileCatalogGeneration.value = devspaceBuildReceipt.profileCatalogGeneration;
+      if (previousCatalogGeneration !== latestProfileCatalogGeneration.value) {
+        await runtimeBuildIdentityContext?.onCatalogGenerationChanged?.();
+      }
       const cardAgentsFiles = agentsFiles.map((file) => ({
         path: formatAgentsPath(file.path, workspace.root),
         content: file.content,
@@ -2608,7 +2839,7 @@ export function createMcpServer(
       operationId: z.string(),
       attemptKey: z.string(),
       requestHash: z.string(),
-      kind: z.enum(["workspace_clone", "dependency_sync", "nexus_gateway_recover", "cutover_start", "host_operation"]),
+      kind: z.enum(["workspace_clone", "dependency_sync", "nexus_gateway_recover", "cutover_start", "host_operation", "chat_swarm_reconciliation"]),
       authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]),
       scopeRoot: z.string(),
       workspaceId: z.string().optional(),
@@ -4957,6 +5188,8 @@ export interface CreateServerOptions {
   completionBindings?: readonly CarrierCompletionBinding[];
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
   chatSwarmInitializationHook?: () => void;
+  /** Test-only injection; production serve loads the validated manifest through ServerConfig. */
+  controlPlaneInventory?: ControlPlaneInventory;
 }
 
 export interface DurableReconciliationResolverDependencies {
@@ -5156,10 +5389,33 @@ export async function resolveDurableReconciliationWitnessFromInventory(
   };
 }
 
+const SERVER_INSTANCE_ID_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function requireManifestBoundServerInstanceId(value: string | undefined): string {
+  const normalized = value?.trim();
+  if (!normalized) {
+    throw new Error("DEVSPACE_SERVER_INSTANCE_ID is required when a production control-plane manifest is configured");
+  }
+  if (!SERVER_INSTANCE_ID_UUID.test(normalized)) {
+    throw new Error("DEVSPACE_SERVER_INSTANCE_ID must be a valid UUID when a production control-plane manifest is configured");
+  }
+  return normalized;
+}
+
 export function createServer(
   config = loadConfig(),
   options: CreateServerOptions = {},
 ): RunningServer {
+  const manifestBoundServerInstanceId = config.controlPlaneInventory?.manifestRequired === true
+    ? requireManifestBoundServerInstanceId(process.env.DEVSPACE_SERVER_INSTANCE_ID)
+    : undefined;
+  const controlPlaneInventoryReader = options.controlPlaneInventory
+    ? () => options.controlPlaneInventory!
+    : config.controlPlaneInventory?.manifestRequired === true
+      ? () => readControlPlaneInventory(config.controlPlaneManifestPath)
+      : config.controlPlaneInventory
+        ? () => config.controlPlaneInventory!
+        : undefined;
   if (options.coordination && options.completionBindings !== undefined) throw new Error("Custom coordination readers and completion-only bindings are mutually exclusive.");
   const incomingArtifactAdapters = options.incomingArtifactAdapters
     ?? [createOpenAIIncomingArtifactAdapter()];
@@ -5173,6 +5429,20 @@ export function createServer(
   const transports = new McpSessionRegistry<Transport>({
     maxSessions: config.mcpSessionMaxSessions,
   });
+  const broadcastToolListChanged = async (): Promise<number> => {
+    const servers = transports.getAllServers();
+    let sent = 0;
+    for (const server of servers) {
+      if (typeof server?.sendToolListChanged !== "function") continue;
+      try {
+        await server.sendToolListChanged();
+        sent += 1;
+      } catch {
+        // A disconnected session is removed by its transport close path.
+      }
+    }
+    return sent;
+  };
   const mcpUrl = new URL("/mcp", config.publicBaseUrl);
   const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
   const initializationCleanups: Array<() => void> = [];
@@ -5227,6 +5497,7 @@ export function createServer(
     configRoot: devspaceConfigDir(process.env),
     stateRoot: config.stateDir,
     profileCatalogGeneration: "unresolved",
+    ...(manifestBoundServerInstanceId ? { serverInstanceId: manifestBoundServerInstanceId } : {}),
   });
   const latestProfileCatalogGeneration = { value: runtimeBuildIdentity.profileCatalogGeneration };
   const agentSessionManager = config.subagents.enabled
@@ -5779,8 +6050,7 @@ export function createServer(
       }
 
       if (sessionId) {
-        const sessionServer = transports.getServer(sessionId);
-        if (sessionServer?._registeredTools && !(toolName in sessionServer._registeredTools)) {
+        if (cutoverController.mode() === "normal" && toolName !== "capability_convergence_status" && toolName !== "tools/list") {
           const sessionSnapshot = transports.getSnapshot(sessionId);
           const convergence = evaluateSessionConvergence(sessionSnapshot, {
             serverInstanceId: runtimeBuildIdentity.serverInstanceId,
@@ -5788,6 +6058,7 @@ export function createServer(
             buildId: runtimeBuildIdentity.buildId,
             capabilityManifestSha256: capabilityManifest.manifestSha256,
             catalogGeneration: latestProfileCatalogGeneration.value,
+            freshness: runtimeBuildIdentity.startedAt,
             cutoverMode: cutoverController.mode(),
             reconciliationRequired: cutoverController.mode() !== "normal",
           });
@@ -5806,7 +6077,7 @@ export function createServer(
               jsonrpc: "2.0",
               error: {
                 code: -32003,
-                message: `[STALE_MCP_SESSION:${convergence.state}] Tool '${toolName}' is not present in the current session catalog. ${convergence.details}. Reconnect required: ${convergence.reconnectRequired}.`,
+                message: `[STALE_MCP_SESSION:${convergence.state}] Session generation is not current for tool '${toolName}'. ${convergence.details}. Reconnect required: ${convergence.reconnectRequired}.`,
                 data: disposition,
               },
               id: req.body?.id ?? null,
@@ -5839,16 +6110,14 @@ export function createServer(
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId) => {
             if (transport) {
-              const clientCaps = req.body?.params?.capabilities;
-              const clientSupportsListChanged = Boolean(clientCaps?.tools?.listChanged);
               const snapshot: SessionGenerationSnapshot = {
                 serverInstanceId: runtimeBuildIdentity.serverInstanceId,
                 sourceCommit: runtimeBuildIdentity.sourceCommit,
                 buildId: runtimeBuildIdentity.buildId,
                 capabilityManifestSha256: capabilityManifest.manifestSha256,
                 catalogGeneration: latestProfileCatalogGeneration.value,
+                freshness: runtimeBuildIdentity.startedAt,
                 sessionInitializedAt: new Date().toISOString(),
-                clientSupportsListChanged,
               };
               transports.register(newSessionId, transport, { snapshot });
             }
@@ -5884,6 +6153,7 @@ export function createServer(
             identity: runtimeBuildIdentity,
             latestProfileCatalogGeneration,
             capabilityManifest,
+            onCatalogGenerationChanged: broadcastToolListChanged,
           },
           durableOperations,
           {
@@ -5908,6 +6178,7 @@ export function createServer(
                 buildId: runtimeBuildIdentity.buildId,
                 capabilityManifestSha256: capabilityManifest.manifestSha256,
                 catalogGeneration: latestProfileCatalogGeneration.value,
+                freshness: runtimeBuildIdentity.startedAt,
                 cutoverMode: cutoverController.mode(),
                 reconciliationRequired: cutoverController.mode() !== "normal",
               });
@@ -5916,6 +6187,7 @@ export function createServer(
               const roles: ServiceRoleDeploymentIdentity[] = [
                 {
                   role: "primary",
+                  roleKind: "AUTHORITATIVE_PRODUCTION",
                   expectedCommit: runtimeBuildIdentity.sourceCommit,
                   expectedBuildId: runtimeBuildIdentity.buildId,
                   runningBuild: {
@@ -5931,24 +6203,27 @@ export function createServer(
               ];
               return evaluateMultiRoleConvergence(roles);
             },
+            ...(controlPlaneInventoryReader
+              ? { controlPlaneEvaluator: () => evaluateControlPlaneConvergence(controlPlaneInventoryReader()) }
+              : {}),
           },
           opencodeCatalogSource,
           clineCatalogService,
           chatSwarmLifecycle,
           carrierBindings,
           hostOperations,
+          options.controlPlaneInventory,
+          controlPlaneInventoryReader,
         );
         if (transport.sessionId) {
-          const clientCaps = req.body?.params?.capabilities;
-          const clientSupportsListChanged = Boolean(clientCaps?.tools?.listChanged);
           const initialSnapshot: SessionGenerationSnapshot = {
             serverInstanceId: runtimeBuildIdentity.serverInstanceId,
             sourceCommit: runtimeBuildIdentity.sourceCommit,
             buildId: runtimeBuildIdentity.buildId,
             capabilityManifestSha256: capabilityManifest.manifestSha256,
             catalogGeneration: latestProfileCatalogGeneration.value,
+            freshness: runtimeBuildIdentity.startedAt,
             sessionInitializedAt: new Date().toISOString(),
-            clientSupportsListChanged,
           };
           transports.setSnapshot(transport.sessionId, initialSnapshot);
           transports.setServer(transport.sessionId, server);
@@ -5962,6 +6237,20 @@ export function createServer(
       if (sessionId) transports.beginRequest(sessionId);
       try {
         await transport.handleRequest(req, res, req.body);
+        if (sessionId && req.method === "POST" && req.body?.method === "tools/list") {
+          const snapshot = transports.getSnapshot(sessionId);
+          if (snapshot) {
+            transports.acknowledgeToolsList(sessionId, {
+              ...snapshot,
+              serverInstanceId: runtimeBuildIdentity.serverInstanceId,
+              sourceCommit: runtimeBuildIdentity.sourceCommit,
+              buildId: runtimeBuildIdentity.buildId,
+              capabilityManifestSha256: capabilityManifest.manifestSha256,
+              catalogGeneration: latestProfileCatalogGeneration.value,
+              freshness: runtimeBuildIdentity.startedAt,
+            });
+          }
+        }
       } finally {
         if (sessionId) await transports.endRequest(sessionId);
       }
@@ -5977,22 +6266,6 @@ export function createServer(
   });
 
   let closePromise: Promise<void> | undefined;
-  const broadcastToolListChanged = async (): Promise<number> => {
-    const servers = transports.getAllServers();
-    let sent = 0;
-    for (const s of servers) {
-      if (typeof s?.sendToolListChanged === "function") {
-        try {
-          await s.sendToolListChanged();
-          sent += 1;
-        } catch {
-          // ignore disconnected or errored transport
-        }
-      }
-    }
-    return sent;
-  };
-
   return {
     app,
     config,

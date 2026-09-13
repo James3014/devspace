@@ -195,11 +195,17 @@ test("real HTTP clients sharing OAuth pair independently, delegate, resume, exec
     const child=data(await controller.callTool({name:"coordination_delegate",arguments:{pendingId:pending.pendingId,contract:{...contract,role:"worker",scope:[project]}}}));
     data(await worker.callTool({name:"coordination_resume",arguments:{credential:pending.credential}}));
     const opened=data(await worker.callTool({name:"open_workspace",arguments:{path:project,mode:"checkout"}}));
+    const refreshedTools=await worker.listTools();
+    assert.ok(refreshedTools.tools.some(tool=>tool.name==="coordination_delegate"));
+    const refreshedControllerTools=await controller.listTools();
+    assert.ok(refreshedControllerTools.tools.some(tool=>tool.name==="coordination_revoke_worker"));
     const args={workspaceId:opened.workspaceId,attemptKey:"carrier-real-npm",recipe:"npm_ci"};
     const imposter=await connect("same-client-imposter");
     const before=snapshot();
     assert.equal((await imposter.callTool({name:"coordination_prepare_dependencies",arguments:args,_meta:{ownerThread:child.id,role:"controller"}})).isError,true);
-    assert.equal((await worker.callTool({name:"coordination_delegate",arguments:{pendingId:pending.pendingId,contract}})).isError,true);
+    const rejectedDelegation=await worker.callTool({name:"coordination_delegate",arguments:{pendingId:pending.pendingId,contract}});
+    assert.equal(rejectedDelegation.isError,true);
+    assert.doesNotMatch(JSON.stringify(rejectedDelegation),/STALE_MCP_SESSION/);
     assert.equal(snapshot(),before);
     const prepared=data(await worker.callTool({name:"coordination_prepare_dependencies",arguments:args}));
     await worker.close();

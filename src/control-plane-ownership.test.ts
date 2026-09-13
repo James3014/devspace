@@ -142,7 +142,7 @@ test("C1 reconcile requires exact trusted terminal proof, retains unknown pin an
   let store = new ControlPlaneOwnershipStore(sqlite, opts);
   try {
     store.putGrantEvidence(context("owner"), grant, 0);
-    const lease = store.acquire(context("owner"), input());
+    const lease = store.acquire(context("owner"), {...input(), expiresAt: new Date(now + 60_000).toISOString()});
     store.beginOperation(context("owner"), lease.leaseId, 1, "effect-1");
     const evidence = {leaseId: lease.leaseId, ownerThread: "owner", operationHandle: "effect-1", operation: "write", baseRevision: "sha-a", leaseVersion: 2, state: "finished" as const};
     for (const state of ["unknown", "running", "not_running"] as const) assert.throws(() => store.reconcile(context("owner"), lease.leaseId, 2, {...evidence, state}));

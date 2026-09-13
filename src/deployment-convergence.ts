@@ -14,7 +14,7 @@ export type SessionConvergenceState =
   | "STALE_CAPABILITY_MANIFEST"
   | "STALE_SESSION_CATALOG"
   | "RECONNECT_REQUIRED"
-  | "RECONCILIATION_REQUIRED";
+  | "RECONCILE_REQUIRED";
 
 export interface SessionGenerationSnapshot {
   serverInstanceId: string;
@@ -23,7 +23,7 @@ export interface SessionGenerationSnapshot {
   capabilityManifestSha256: string;
   catalogGeneration: string;
   sessionInitializedAt: string;
-  clientSupportsListChanged?: boolean;
+  freshness?: string;
 }
 
 export interface SessionConvergenceEvaluation {
@@ -40,6 +40,7 @@ export interface SessionConvergenceEvaluation {
     buildId: string;
     capabilityManifestSha256: string;
     catalogGeneration: string;
+    freshness?: string;
     cutoverMode: string;
     reconciliationRequired: boolean;
   };
@@ -258,6 +259,7 @@ export function evaluateSessionConvergence(
     buildId: string;
     capabilityManifestSha256: string;
     catalogGeneration: string;
+    freshness?: string;
     cutoverMode: string;
     reconciliationRequired: boolean;
   },
@@ -271,7 +273,7 @@ export function evaluateSessionConvergence(
   if (currentServer.reconciliationRequired || currentServer.cutoverMode !== "normal") {
     return {
       ...base,
-      state: "RECONCILIATION_REQUIRED",
+      state: "RECONCILE_REQUIRED",
       converged: false,
       reconnectRequired: false,
       reconciliationRequired: true,
@@ -306,14 +308,37 @@ export function evaluateSessionConvergence(
     };
   }
 
-  // 4. Capability manifest digest changed
-  if (sessionSnapshot.capabilityManifestSha256 !== currentServer.capabilityManifestSha256) {
-    const reconnect = !sessionSnapshot.clientSupportsListChanged;
+  // Source/build identity is part of the session binding. A process may keep
+  // the same instance id while loading a different artifact, so this is still
+  // a stale server rather than a tool-not-found condition.
+  if (
+    sessionSnapshot.sourceCommit !== currentServer.sourceCommit ||
+    sessionSnapshot.buildId !== currentServer.buildId ||
+    // A current process that exposes freshness must not silently accept a
+    // legacy/unbound session.  The binding is deliberately fail-closed when
+    // either side has a freshness marker and the values differ (including an
+    // absent marker on the session).
+    ((sessionSnapshot.freshness !== undefined || currentServer.freshness !== undefined) &&
+      sessionSnapshot.freshness !== currentServer.freshness)
+  ) {
     return {
       ...base,
-      state: reconnect ? "RECONNECT_REQUIRED" : "STALE_CAPABILITY_MANIFEST",
+      state: "STALE_SERVER",
       converged: false,
-      reconnectRequired: reconnect,
+      reconnectRequired: true,
+      reconciliationRequired: false,
+      activeDrift: true,
+      details: "Server source/build/freshness identity changed; session reconnect required",
+    };
+  }
+
+  // 4. Capability manifest digest changed
+  if (sessionSnapshot.capabilityManifestSha256 !== currentServer.capabilityManifestSha256) {
+    return {
+      ...base,
+      state: "STALE_CAPABILITY_MANIFEST",
+      converged: false,
+      reconnectRequired: false,
       reconciliationRequired: false,
       activeDrift: true,
       details: "Capability manifest digest changed from " + sessionSnapshot.capabilityManifestSha256 + " to " + currentServer.capabilityManifestSha256,
@@ -322,12 +347,11 @@ export function evaluateSessionConvergence(
 
   // 5. Tool catalog generation changed
   if (sessionSnapshot.catalogGeneration !== currentServer.catalogGeneration) {
-    const reconnect = !sessionSnapshot.clientSupportsListChanged;
     return {
       ...base,
-      state: reconnect ? "RECONNECT_REQUIRED" : "STALE_SESSION_CATALOG",
+      state: "STALE_SESSION_CATALOG",
       converged: false,
-      reconnectRequired: reconnect,
+      reconnectRequired: false,
       reconciliationRequired: false,
       activeDrift: true,
       details: "Tool catalog generation changed from " + sessionSnapshot.catalogGeneration + " to " + currentServer.catalogGeneration,
@@ -347,7 +371,9 @@ export function evaluateSessionConvergence(
 }
 
 export interface ServiceRoleDeploymentIdentity {
-  role: string; // e.g. "dev2" (port 7677) or "dev-c" (port 7678)
+  role: string;
+  /** Explicit topology role; omitted values fail topology convergence. */
+  roleKind?: "AUTHORITATIVE_PRODUCTION" | "NON_AUTHORITATIVE_CANARY" | "NON_AUTHORITATIVE_MIGRATION_SOURCE" | "NON_AUTHORITATIVE_TEST";
   expectedCommit: string;
   expectedBuildId?: string;
   runningBuild?: RunningBuildIdentity;
@@ -360,8 +386,20 @@ export interface MultiRoleDeploymentEvaluation {
   converged: boolean;
   activeDrift: boolean;
   reconciliationRequired: boolean;
+  topologyValid: boolean;
+  authoritativeRole?: string;
+  authoritativeProductionRoles: string[];
+  nonAuthoritativeRoles: string[];
+  missingRoleKindRoles: string[];
   roleStates: Record<string, DeploymentConvergenceEvaluation>;
   summary: string;
+}
+
+function explicitRoleKind(role: ServiceRoleDeploymentIdentity): ServiceRoleDeploymentIdentity["roleKind"] {
+  const candidate = role.roleKind;
+  return candidate && new Set(["AUTHORITATIVE_PRODUCTION", "NON_AUTHORITATIVE_CANARY", "NON_AUTHORITATIVE_MIGRATION_SOURCE", "NON_AUTHORITATIVE_TEST"]).has(candidate)
+    ? candidate
+    : undefined;
 }
 
 export function evaluateMultiRoleConvergence(
@@ -374,6 +412,19 @@ export function evaluateMultiRoleConvergence(
   let activeDrift = false;
   let reconciliationRequired = false;
   const driftedRoles: string[] = [];
+  const missingRoleKindRoles = roles.filter((role) => !explicitRoleKind(role)).map((role) => role.role);
+  const authoritativeProductionRoles = roles
+    .filter((role) => explicitRoleKind(role) === "AUTHORITATIVE_PRODUCTION")
+    .map((role) => role.role);
+  const nonAuthoritativeRoles = roles
+    .filter((role) => explicitRoleKind(role) !== undefined && explicitRoleKind(role) !== "AUTHORITATIVE_PRODUCTION")
+    .map((role) => role.role);
+  const topologyValid = authoritativeProductionRoles.length === 1 && missingRoleKindRoles.length === 0;
+  if (!topologyValid) {
+    converged = false;
+    reconciliationRequired = true;
+    driftedRoles.push(`topology (expected exactly one explicit AUTHORITATIVE_PRODUCTION and explicit roleKind for every role; found ${authoritativeProductionRoles.length}, missing ${missingRoleKindRoles.length})`);
+  }
 
   for (const roleDef of roles) {
     const snapshot: DeploymentIdentitySnapshot = {
@@ -414,9 +465,14 @@ export function evaluateMultiRoleConvergence(
     converged,
     activeDrift,
     reconciliationRequired,
+    topologyValid,
+    authoritativeRole: authoritativeProductionRoles[0],
+    authoritativeProductionRoles,
+    nonAuthoritativeRoles,
+    missingRoleKindRoles,
     roleStates,
     summary: converged
-      ? "All " + roles.length + " service roles are converged."
+      ? `Authoritative role ${authoritativeProductionRoles[0]} is converged; ${nonAuthoritativeRoles.length} non-authoritative role(s) are explicitly named.`
       : "Drift detected in roles: " + driftedRoles.join(", ") + ".",
   };
 }

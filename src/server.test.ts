@@ -31,6 +31,7 @@ import { ChatSwarmLifecycle } from "./chat-swarm-lifecycle.js";
 import { ChatSwarmRuntimeAlreadyOwnedError } from "./chat-swarm-runtime-owner.js";
 import { ChatSwarmStore } from "./chat-swarm-store.js";
 import { chatSwarmToolInputShapes } from "./chat-swarm-tools.js";
+import type { ControlPlaneInventory } from "./control-plane-convergence.js";
 
 import { SqliteOAuthStore, SqliteOAuthClientsStore } from "./oauth-store.js";
 
@@ -115,6 +116,77 @@ test("configures Express with an exact trusted proxy hop count", async () => {
     assert.equal(running.app.get("trust proxy"), 1);
   } finally {
     await running.close();
+  }
+});
+
+test("manifest-bound production startup requires and binds the launch UUID", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-manifest-bound-server-"));
+  const configDir = join(root, "config");
+  const stateDir = join(root, "state");
+  await mkdir(configDir, { recursive: true });
+  const serverInstanceId = "123e4567-e89b-42d3-a456-426614174000";
+  await writeFile(join(configDir, "control-plane.json"), JSON.stringify({
+    schema: "devspace.control_plane_topology_manifest.v1",
+    observedAt: new Date().toISOString(),
+    maxAgeSeconds: 300,
+    inventory: {
+      services: [{
+        role: "primary",
+        roleKind: "AUTHORITATIVE_PRODUCTION",
+        serviceIdentity: { serviceName: "primary", serverInstanceId },
+        endpoint: { url: "https://primary.invalid", port: 7677 },
+        oauth: { clientIds: [] },
+        stateDirectory: stateDir,
+        allowedRoots: [root],
+        buildIdentity: { sourceCommit: "a".repeat(40), buildId: "fixture-build" },
+        capabilityManifest: { sha256: "b".repeat(64), catalogGeneration: "fixture-catalog", tools: [] },
+        featureFlags: {},
+        durableState: {
+          workspaceSessions: 0, agentSessions: 0, durableOperations: 0, oauthClients: 0,
+          activeSwarms: 0, workers: 0, tasks: 0, inFlightOperations: 0, unknownOperations: 0,
+          reconcileRequired: 0,
+        },
+        runtimeOwner: { held: false },
+        routingAuthority: { active: true, endpoint: "https://primary.invalid" },
+        configuredMaxCapacity: 5,
+      }],
+      canonicalRole: "primary",
+      retirementCandidateRole: "migration-source",
+    },
+  }));
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: configDir,
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_WORKTREE_ROOT: join(root, "worktrees"),
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  const previousLaunchId = process.env.DEVSPACE_SERVER_INSTANCE_ID;
+  let running: ReturnType<typeof createServer> | undefined;
+  let listener: ReturnType<ReturnType<typeof createServer>["app"]["listen"]> | undefined;
+  try {
+    delete process.env.DEVSPACE_SERVER_INSTANCE_ID;
+    assert.throws(() => createServer(config), /DEVSPACE_SERVER_INSTANCE_ID is required/);
+    process.env.DEVSPACE_SERVER_INSTANCE_ID = "not-a-uuid";
+    assert.throws(() => createServer(config), /DEVSPACE_SERVER_INSTANCE_ID must be a valid UUID/);
+
+    process.env.DEVSPACE_SERVER_INSTANCE_ID = serverInstanceId;
+    running = createServer(config);
+    listener = running.app.listen(0, "127.0.0.1");
+    await new Promise<void>((resolve, reject) => {
+      listener?.once("listening", resolve);
+      listener?.once("error", reject);
+    });
+    const address = listener.address() as { port: number };
+    const identity = await (await fetch(`http://127.0.0.1:${address.port}/identity`)).json() as { serverInstanceId: string };
+    assert.equal(identity.serverInstanceId, serverInstanceId);
+  } finally {
+    if (listener) await new Promise<void>((resolve) => listener?.close(() => resolve()));
+    await running?.close();
+    if (previousLaunchId === undefined) delete process.env.DEVSPACE_SERVER_INSTANCE_ID;
+    else process.env.DEVSPACE_SERVER_INSTANCE_ID = previousLaunchId;
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -632,6 +704,7 @@ async function fixture(
     toolchains?: string;
     toolMode?: "full" | "minimal" | "codex";
     chatSwarm?: boolean;
+    controlPlaneInventory?: ControlPlaneInventory;
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -736,6 +809,9 @@ async function fixture(
     undefined,
     undefined,
     chatSwarmLifecycle,
+    undefined,
+    undefined,
+    options.controlPlaneInventory,
   );
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "devspace-test-client", version: "1.0.0" });
@@ -764,6 +840,62 @@ async function fixture(
   return { client, project, config, stateDir, close };
 }
 
+function testControlPlaneInventory(): ControlPlaneInventory {
+  const service = (
+    role: string,
+    roleKind: "AUTHORITATIVE_PRODUCTION" | "NON_AUTHORITATIVE_MIGRATION_SOURCE",
+    stateDirectory: string,
+  ) => ({
+    role,
+    roleKind,
+    serviceIdentity: { serviceName: `${role}-service`, serverInstanceId: `${role}-server` },
+    endpoint: { url: `https://${role}.invalid`, port: roleKind === "AUTHORITATIVE_PRODUCTION" ? 7677 : 7678 },
+    oauth: { clientIds: [] },
+    stateDirectory,
+    allowedRoots: [stateDirectory],
+    buildIdentity: { sourceCommit: "a".repeat(40), buildId: `${role}-build` },
+    capabilityManifest: {
+      sha256: "b".repeat(64),
+      catalogGeneration: `${role}-catalog`,
+      tools: [
+        "chat_swarm_runtime_status",
+        "chat_swarm_runtime_ensure",
+        "chat_swarm_runtime_scale",
+        "chat_swarm_runtime_recover",
+        "chat_swarm_runtime_stop",
+        "chat_swarm_runtime_bootstrap",
+      ],
+    },
+    featureFlags: { chatSwarm: true },
+    durableState: {
+      workspaceSessions: 0,
+      agentSessions: 0,
+      durableOperations: 0,
+      oauthClients: 0,
+      activeSwarms: 0,
+      workers: 0,
+      tasks: 0,
+      inFlightOperations: 0,
+      unknownOperations: 0,
+      reconcileRequired: 0,
+    },
+    runtimeOwner: { held: false },
+    routingAuthority: { active: roleKind === "AUTHORITATIVE_PRODUCTION", endpoint: `https://${role}.invalid` },
+    configuredMaxCapacity: roleKind === "AUTHORITATIVE_PRODUCTION" ? 5 : 0,
+  });
+  return {
+    services: [
+      service("primary", "AUTHORITATIVE_PRODUCTION", "/state/primary"),
+      service("migration-source", "NON_AUTHORITATIVE_MIGRATION_SOURCE", "/state/migration-source"),
+    ],
+    canonicalRole: "primary",
+    retirementCandidateRole: "migration-source",
+    observedAt: new Date().toISOString(),
+    maxAgeSeconds: 300,
+    manifestRequired: true,
+  };
+}
+
 test("Chat Swarm production registration is opt-in and uses the shared lifecycle", async (t) => {
   const disabled = await fixture(t);
   assert.equal((await disabled.client.listTools()).tools.some((tool) => tool.name === "chat_swarm_create"), false);
@@ -773,6 +905,16 @@ test("Chat Swarm production registration is opt-in and uses the shared lifecycle
   const tools = await enabled.client.listTools();
   const swarmTools = tools.tools.filter((tool) => tool.name.startsWith("chat_swarm_"));
   assert.equal(swarmTools.length, 21);
+  for (const name of [
+    "chat_swarm_migration_export",
+    "chat_swarm_migration_prepare",
+    "chat_swarm_migration_status",
+    "chat_swarm_migration_apply",
+    "chat_swarm_migration_reconcile",
+    "control_plane_retirement_readiness",
+  ]) {
+    assert.equal(tools.tools.some((tool) => tool.name === name), false, `unvalidated inventory must not register ${name}`);
+  }
   assert.ok(swarmTools.every((tool) => tool.inputSchema));
   const expectedShapes = chatSwarmToolInputShapes(enabled.config);
   assertRegisteredChatSwarmSchemaParity(swarmTools, expectedShapes);
@@ -809,6 +951,23 @@ test("Chat Swarm production registration is opt-in and uses the shared lifecycle
   assert.equal((collected.structuredContent as Record<string, any>).lifecycleState, "COLLECTED");
   const closed = await enabled.client.callTool({ name: "chat_swarm_close", arguments: { swarmId: createdValue.swarm.id }, _meta: owner });
   assert.equal((closed.structuredContent as Record<string, any>).status, "CLOSED");
+});
+
+test("manifest-bound Chat Swarm servers expose control-plane migration tools", async (t) => {
+  const manifestBound = await fixture(t, { chatSwarm: true, controlPlaneInventory: testControlPlaneInventory() });
+  const manifestTools = await manifestBound.client.listTools();
+  const manifestSwarmTools = manifestTools.tools.filter((tool) => tool.name.startsWith("chat_swarm_"));
+  assert.equal(manifestSwarmTools.length, 26);
+  for (const name of [
+    "chat_swarm_migration_export",
+    "chat_swarm_migration_prepare",
+    "chat_swarm_migration_status",
+    "chat_swarm_migration_apply",
+    "chat_swarm_migration_reconcile",
+    "control_plane_retirement_readiness",
+  ]) {
+    assert.ok(manifestTools.tools.some((tool) => tool.name === name), `validated inventory should register ${name}`);
+  }
 });
 
 function trackServerStoreCloses(t: TestContext) {
@@ -2249,9 +2408,16 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
     const opened=await callOpen(client,project,"http-fixture-conversation");
     const workspaceId=structuredContent(opened).workspaceId as string;
     assert.equal(typeof workspaceId,"string",JSON.stringify(opened));
+    // open_workspace refreshes the catalog generation. A compliant MCP client
+    // need not advertise listChanged support; an explicit tools/list is the
+    // authoritative acknowledgement for this active session.
+    const refreshedTools=await client.listTools();
+    assert.ok(refreshedTools.tools.some(tool=>tool.name==="dependency_sync"));
     const input={workspaceId,attemptKey:"http-fixture",recipe:"npm_ci",authorityMode:"OWNER_DIRECT"};
     const denied=await client.callTool({name:"dependency_sync",arguments:input,_meta:{ownerThread:"controller",role:"controller"}});
     assert.equal(denied.isError,true);
+    assert.doesNotMatch(JSON.stringify(denied),/STALE_MCP_SESSION/);
+    assert.match(JSON.stringify(denied),/trusted effect binding required/);
     const sha=(value:string|Buffer)=>createHash("sha256").update(value).digest("hex");
     approvedHash=sha(JSON.stringify({baseRevision:base,frozenInputs:{"package-lock.json":sha(await readFile(join(project,"package-lock.json"))),"package.json":sha(await readFile(join(project,"package.json")))},recipe:"npm_ci",version:"devspace.execution.v1",workspaceId,workspaceRoot:project}));
     const trustedContext={clientId:oauthClient.client_id,sessionId:transport.sessionId};
