@@ -65,9 +65,27 @@ jobs:
         run: node dist/cli.js doctor
 
   chat-swarm-continuation:
-    name: Chat Swarm continuation focused (macOS)
+    name: Chat Swarm continuation ${{ matrix.name }} (macOS)
     runs-on: macos-latest
     timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: coordinator
+            file: src/chat-swarm-continuation-coordinator.test.ts
+          - name: durable-store
+            file: src/chat-swarm-continuation-store.test.ts
+          - name: restart-fence
+            file: src/chat-swarm-continuation-restart-fence.test.ts
+          - name: retired-carrier
+            file: src/chat-swarm-continuation-stale-carrier.test.ts
+          - name: terminal-replay
+            file: src/chat-swarm-continuation-terminal-replay.test.ts
+          - name: corruption-fence
+            file: src/chat-swarm-continuation-corruption-fence.test.ts
+          - name: aggregate-domain
+            file: src/chat-swarm-continuation-domain.test.ts
 
     steps:
       - name: Checkout
@@ -82,51 +100,8 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - id: coordinator
-        name: Continuation coordinator
-        continue-on-error: true
-        run: npx tsx src/chat-swarm-continuation-coordinator.test.ts
-
-      - id: store
-        name: Continuation durable store
-        continue-on-error: true
-        run: npx tsx src/chat-swarm-continuation-store.test.ts
-
-      - id: restart_fence
-        name: Continuation restart fence
-        continue-on-error: true
-        run: npx tsx src/chat-swarm-continuation-restart-fence.test.ts
-
-      - id: stale_carrier
-        name: Continuation retired-carrier fence
-        continue-on-error: true
-        run: npx tsx src/chat-swarm-continuation-stale-carrier.test.ts
-
-      - id: terminal_replay
-        name: Continuation terminal replay
-        continue-on-error: true
-        run: npx tsx src/chat-swarm-continuation-terminal-replay.test.ts
-
-      - id: corruption_fence
-        name: Continuation corruption fence
-        continue-on-error: true
-        run: npx tsx src/chat-swarm-continuation-corruption-fence.test.ts
-
-      - id: domain
-        name: Continuation aggregate/domain
-        continue-on-error: true
-        run: npx tsx src/chat-swarm-continuation-domain.test.ts
-
-      - name: Require focused continuation green
-        if: always()
-        run: |
-          test "${{ steps.coordinator.outcome }}" = "success"
-          test "${{ steps.store.outcome }}" = "success"
-          test "${{ steps.restart_fence.outcome }}" = "success"
-          test "${{ steps.stale_carrier.outcome }}" = "success"
-          test "${{ steps.terminal_replay.outcome }}" = "success"
-          test "${{ steps.corruption_fence.outcome }}" = "success"
-          test "${{ steps.domain.outcome }}" = "success"
+      - name: Run focused continuation test
+        run: npx tsx ${{ matrix.file }}
 
   local-agent-sessions:
     name: Local agent sessions (macOS)
