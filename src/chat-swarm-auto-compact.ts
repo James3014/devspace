@@ -13,6 +13,27 @@ export const WORKER_AUTO_COMPACT_CAPSULE_MAX_BYTES = 48 * 1024;
 
 const PRESSURE_PRECISIONS = ["ESTIMATED", "EXACT"] as const;
 const PRESSURE_SOURCES = ["DEVSPACE_ESTIMATE", "CARRIER_ESTIMATE", "HOST_NATIVE"] as const;
+const CAPSULE_KEYS = [
+  "schema",
+  "swarmId",
+  "workerId",
+  "sourceEpoch",
+  "checkpointHash",
+  "pressure",
+  "prepareAtRatio",
+  "roleInstructions",
+  "contextSummary",
+  "summaryAuthority",
+  "taskRefs",
+  "resultRefs",
+  "evidenceRefs",
+  "blockers",
+  "claimCeiling",
+  "createdAt",
+  "capsuleHash",
+] as const;
+const PRESSURE_KEYS = ["precision", "source", "utilizationRatio", "provenance", "observedAt"] as const;
+const SHA256 = /^[0-9a-f]{64}$/;
 const MAX_PROVENANCE_BYTES = 2 * 1024;
 const MAX_ROLE_BYTES = 8 * 1024;
 const MAX_SUMMARY_BYTES = 16 * 1024;
@@ -219,6 +240,79 @@ export function prepareWorkerAutoCompact(input: WorkerAutoCompactPrepareInput): 
   };
 }
 
+export function verifyWorkerAutoCompactCapsule(value: unknown): WorkerAutoCompactCapsule {
+  const record = requireRecord(value, "capsule");
+  assertExactKeys(record, CAPSULE_KEYS, "capsule");
+  if (record.schema !== WORKER_AUTO_COMPACT_CAPSULE_SCHEMA) {
+    invalidCapsule("unsupported schema");
+  }
+
+  const pressureRecord = requireRecord(record.pressure, "pressure");
+  assertExactKeys(pressureRecord, PRESSURE_KEYS, "pressure");
+  const pressure: WorkerContextPressureSignal = {
+    precision: requireString(pressureRecord.precision, "pressure.precision") as WorkerContextPressurePrecision,
+    source: requireString(pressureRecord.source, "pressure.source") as WorkerContextPressureSource,
+    utilizationRatio: requireNumber(pressureRecord.utilizationRatio, "pressure.utilizationRatio"),
+    provenance: requireString(pressureRecord.provenance, "pressure.provenance"),
+    observedAt: requireString(pressureRecord.observedAt, "pressure.observedAt"),
+  };
+
+  const capsule: WorkerAutoCompactCapsule = {
+    schema: WORKER_AUTO_COMPACT_CAPSULE_SCHEMA,
+    swarmId: requireString(record.swarmId, "swarmId"),
+    workerId: requireString(record.workerId, "workerId"),
+    sourceEpoch: requireNumber(record.sourceEpoch, "sourceEpoch"),
+    checkpointHash: requireString(record.checkpointHash, "checkpointHash"),
+    pressure,
+    prepareAtRatio: requireNumber(record.prepareAtRatio, "prepareAtRatio"),
+    roleInstructions: requireString(record.roleInstructions, "roleInstructions"),
+    contextSummary: requireString(record.contextSummary, "contextSummary"),
+    summaryAuthority: requireString(record.summaryAuthority, "summaryAuthority") as "CONTEXT_ONLY",
+    taskRefs: requireStringArray(record.taskRefs, "taskRefs"),
+    resultRefs: requireStringArray(record.resultRefs, "resultRefs"),
+    evidenceRefs: requireStringArray(record.evidenceRefs, "evidenceRefs"),
+    blockers: requireStringArray(record.blockers, "blockers"),
+    claimCeiling: requireString(record.claimCeiling, "claimCeiling"),
+    createdAt: requireString(record.createdAt, "createdAt"),
+    capsuleHash: requireString(record.capsuleHash, "capsuleHash"),
+  };
+
+  try {
+    assertBounded(capsule.swarmId, MAX_ID_BYTES, "swarmId");
+    assertBounded(capsule.workerId, MAX_ID_BYTES, "workerId");
+    validateEpoch(capsule.sourceEpoch);
+    validatePressure(capsule.pressure);
+    validateThreshold(capsule.prepareAtRatio);
+    assertBounded(capsule.roleInstructions, MAX_ROLE_BYTES, "roleInstructions");
+    assertBounded(capsule.contextSummary, MAX_SUMMARY_BYTES, "contextSummary");
+    assertBounded(capsule.claimCeiling, MAX_CLAIM_CEILING_BYTES, "claimCeiling");
+    validateTimestamp(capsule.createdAt, "createdAt");
+    validateRefs(capsule.taskRefs, "taskRefs");
+    validateRefs(capsule.resultRefs, "resultRefs");
+    validateRefs(capsule.evidenceRefs, "evidenceRefs");
+    validateBlockers(capsule.blockers);
+  } catch (error) {
+    if (error instanceof ChatSwarmError) invalidCapsule(error.message);
+    throw error;
+  }
+
+  if (capsule.summaryAuthority !== "CONTEXT_ONLY") invalidCapsule("summaryAuthority must be CONTEXT_ONLY");
+  if (!SHA256.test(capsule.checkpointHash)) invalidCapsule("checkpointHash must be a SHA-256 hash");
+  if (!SHA256.test(capsule.capsuleHash)) invalidCapsule("capsuleHash must be a SHA-256 hash");
+  if (Date.parse(capsule.createdAt) < Date.parse(capsule.pressure.observedAt)) {
+    invalidCapsule("createdAt precedes the pressure observation");
+  }
+
+  const { capsuleHash, ...payload } = capsule;
+  const canonicalJson = JSON.stringify(canonicalize(payload));
+  if (Buffer.byteLength(canonicalJson, "utf8") > WORKER_AUTO_COMPACT_CAPSULE_MAX_BYTES) {
+    invalidCapsule(`capsule exceeds ${WORKER_AUTO_COMPACT_CAPSULE_MAX_BYTES} bytes`);
+  }
+  if (hashContent(canonicalJson) !== capsuleHash) invalidCapsule("capsule hash mismatch");
+
+  return capsule;
+}
+
 function decision(
   input: WorkerAutoCompactDecisionInput,
   state: WorkerAutoCompactDecisionState,
@@ -304,4 +398,36 @@ function validateTimestamp(value: string, label: string): void {
   if (!Number.isFinite(Date.parse(value))) {
     throw new ChatSwarmError("INVALID_INPUT", `${label} must be a valid timestamp`);
   }
+}
+
+function requireRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!value || Array.isArray(value) || typeof value !== "object") invalidCapsule(`${label} must be an object`);
+  return value as Record<string, unknown>;
+}
+
+function requireString(value: unknown, label: string): string {
+  if (typeof value !== "string") invalidCapsule(`${label} must be a string`);
+  return value;
+}
+
+function requireNumber(value: unknown, label: string): number {
+  if (typeof value !== "number") invalidCapsule(`${label} must be a number`);
+  return value;
+}
+
+function requireStringArray(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    invalidCapsule(`${label} must be an array of strings`);
+  }
+  return [...value] as string[];
+}
+
+function assertExactKeys(record: Record<string, unknown>, allowed: readonly string[], label: string): void {
+  const allowedSet = new Set(allowed);
+  const extras = Object.keys(record).filter((key) => !allowedSet.has(key));
+  if (extras.length > 0) invalidCapsule(`${label} contains unsupported fields: ${extras.join(",")}`);
+}
+
+function invalidCapsule(message: string): never {
+  throw new ChatSwarmError("INVALID_STATE", `invalid Auto Compact capsule: ${message}`);
 }
