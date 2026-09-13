@@ -33,6 +33,7 @@ export interface PreparedContinuationMaterial {
 export function prepareContinuationMaterial(
   worker: WorkerContinuationSnapshot,
   input: CreateContinuationRequestInput,
+  authenticatedTargetCarrierFingerprint: string,
 ): PreparedContinuationMaterial {
   if (worker.swarmId !== input.swarmId || worker.workerId !== input.workerId) {
     throw new ChatSwarmError("OWNERSHIP_CONFLICT", "worker does not match requested swarm identity");
@@ -48,7 +49,7 @@ export function prepareContinuationMaterial(
     "source carrier fingerprint",
   );
   const targetCarrierFingerprint = requireFingerprint(
-    input.targetCarrierFingerprint,
+    authenticatedTargetCarrierFingerprint,
     "target carrier fingerprint",
   );
   if (sourceCarrierFingerprint === targetCarrierFingerprint) {
