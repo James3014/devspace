@@ -14,7 +14,7 @@ function fixture() {
   const swarmStore = new ChatSwarmStore(root);
   const swarmCoordinator = new ChatSwarmCoordinator(swarmStore);
   const continuationStore = new ChatSwarmContinuationStore(root);
-  const continuation = new ChatSwarmContinuationCoordinator(continuationStore);
+  const continuation = new ChatSwarmContinuationCoordinator(continuationStore, swarmCoordinator);
   const ownerMeta = { "openai/session": "continuation-owner" };
   const attackerMeta = { "openai/session": "continuation-attacker" };
   const sourceMeta = { "openai/conversation_id": "continuation-source" };
