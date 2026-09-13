@@ -160,3 +160,22 @@ assert.equal(boundedRegistry.get("middle"), middle);
 await boundedRegistry.endRequest("middle");
 assert.equal(boundedRegistry.size, 3);
 assert.equal(boundedRegistry.get("middle"), middle);
+
+// Snapshot and server registration tests
+const snapshotRegistry = new McpSessionRegistry<FakeTransport>();
+const t1 = createTransport();
+const initialSnapshot = {
+  serverInstanceId: "srv-1",
+  sourceCommit: "commit-1",
+  buildId: "build-1",
+  capabilityManifestSha256: "man-1",
+  catalogGeneration: "gen-1",
+  sessionInitializedAt: new Date().toISOString(),
+};
+snapshotRegistry.register("sess-1", t1, { snapshot: initialSnapshot, server: { id: "mock-server" } });
+assert.deepEqual(snapshotRegistry.getSnapshot("sess-1"), initialSnapshot);
+assert.deepEqual(snapshotRegistry.getServer("sess-1"), { id: "mock-server" });
+assert.equal(snapshotRegistry.getAllServers().length, 1);
+
+snapshotRegistry.setSnapshot("sess-1", { ...initialSnapshot, catalogGeneration: "gen-2" });
+assert.equal(snapshotRegistry.getSnapshot("sess-1")?.catalogGeneration, "gen-2");

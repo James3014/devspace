@@ -134,6 +134,14 @@ import { createMcpOpencodeCatalogSource } from "./local-agent-opencode-mcp-catal
 import { ClineCatalogService, isClineCatalogFresh, validateClineModelAndThinking, type ClineCatalogSnapshot } from "./local-agent-cline-catalog.js";
 import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build-identity.js";
 import {
+  evaluateSessionConvergence,
+  evaluateMultiRoleConvergence,
+  type SessionGenerationSnapshot,
+  type SessionConvergenceEvaluation,
+  type MultiRoleDeploymentEvaluation,
+  type ServiceRoleDeploymentIdentity,
+} from "./deployment-convergence.js";
+import {
   deriveLoadedCapabilityManifest,
   type CapabilityManifest,
 } from "./capability-manifest.js";
@@ -257,6 +265,7 @@ interface RunningServer {
   config: ServerConfig;
   localAgentProviders: LocalAgentProviderStatus[];
   close(): Promise<void>;
+  broadcastToolListChanged(): Promise<number>;
 }
 
 type ToolContent =
@@ -1401,6 +1410,8 @@ export interface CutoverMcpControlContext {
     workspaceId: string;
     agentId: string;
   }) => Promise<DurableCutoverRecord>;
+  sessionConvergence?: (sessionId?: string) => SessionConvergenceEvaluation;
+  multiRoleEvaluator?: () => MultiRoleDeploymentEvaluation;
 }
 
 
@@ -1412,6 +1423,41 @@ function registerCutoverMcpTools(
 ): void {
   const cutoverRecordSchema = z.record(z.string(), z.unknown());
   const modeSchema = z.enum(["normal", "drain", "reconcile-only"]);
+
+  registerAppTool(
+    server,
+    "capability_convergence_status",
+    {
+      title: "Capability convergence status",
+      description:
+        "Read multi-layer capability generation convergence evaluation across desired source, installed package, running service, capability manifest, and active MCP session tool catalog.",
+      inputSchema: {
+        sessionId: z.string().optional().describe("Optional MCP session ID to evaluate session convergence."),
+      },
+      outputSchema: {
+        sessionConvergence: z.record(z.string(), z.unknown()).optional(),
+        multiRoleConvergence: z.record(z.string(), z.unknown()).optional(),
+        cutoverStatus: z.record(z.string(), z.unknown()),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ sessionId }) => {
+      const cutoverStatus = control.controller.status(control.transportEvidence());
+      const sessionConvergence = control.sessionConvergence?.(sessionId);
+      const multiRoleConvergence = control.multiRoleEvaluator?.();
+      return {
+        content: [textBlock(
+          `Capability convergence: session=${sessionConvergence?.state ?? "n/a"}, multiRoleConverged=${String(multiRoleConvergence?.converged ?? true)}, cutoverMode=${String(cutoverStatus.mode)}.`,
+        )],
+        structuredContent: {
+          sessionConvergence: sessionConvergence as unknown as Record<string, unknown> | undefined,
+          multiRoleConvergence: multiRoleConvergence as unknown as Record<string, unknown> | undefined,
+          cutoverStatus,
+        },
+      };
+    },
+  );
 
   registerAppTool(
     server,
@@ -5721,14 +5767,53 @@ export function createServer(
       req.body?.method === "tools/call" &&
       typeof req.body?.params?.name === "string"
     ) {
+      const toolName = req.body.params.name;
       try {
-        cutoverController.assertToolAllowed(req.body.params.name);
+        cutoverController.assertToolAllowed(toolName);
       } catch (error) {
         if (error instanceof CutoverBlockedError) {
           sendJsonRpcError(res, 409, -32002, error.message);
           return;
         }
         throw error;
+      }
+
+      if (sessionId) {
+        const sessionServer = transports.getServer(sessionId);
+        if (sessionServer?._registeredTools && !(toolName in sessionServer._registeredTools)) {
+          const sessionSnapshot = transports.getSnapshot(sessionId);
+          const convergence = evaluateSessionConvergence(sessionSnapshot, {
+            serverInstanceId: runtimeBuildIdentity.serverInstanceId,
+            sourceCommit: runtimeBuildIdentity.sourceCommit,
+            buildId: runtimeBuildIdentity.buildId,
+            capabilityManifestSha256: capabilityManifest.manifestSha256,
+            catalogGeneration: latestProfileCatalogGeneration.value,
+            cutoverMode: cutoverController.mode(),
+            reconciliationRequired: cutoverController.mode() !== "normal",
+          });
+          if (convergence.state !== "CURRENT") {
+            const disposition = {
+              staleSessionState: convergence.state,
+              details: convergence.details,
+              reconnectRequired: convergence.reconnectRequired,
+              reconciliationRequired: convergence.reconciliationRequired,
+              currentServerCommit: runtimeBuildIdentity.sourceCommit,
+              sessionBoundCommit: sessionSnapshot?.sourceCommit,
+              currentCatalogGeneration: latestProfileCatalogGeneration.value,
+              sessionBoundCatalogGeneration: sessionSnapshot?.catalogGeneration,
+            };
+            res.status(409).json({
+              jsonrpc: "2.0",
+              error: {
+                code: -32003,
+                message: `[STALE_MCP_SESSION:${convergence.state}] Tool '${toolName}' is not present in the current session catalog. ${convergence.details}. Reconnect required: ${convergence.reconnectRequired}.`,
+                data: disposition,
+              },
+              id: req.body?.id ?? null,
+            });
+            return;
+          }
+        }
       }
     }
 
@@ -5753,7 +5838,20 @@ export function createServer(
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId) => {
-            if (transport) transports.register(newSessionId, transport);
+            if (transport) {
+              const clientCaps = req.body?.params?.capabilities;
+              const clientSupportsListChanged = Boolean(clientCaps?.tools?.listChanged);
+              const snapshot: SessionGenerationSnapshot = {
+                serverInstanceId: runtimeBuildIdentity.serverInstanceId,
+                sourceCommit: runtimeBuildIdentity.sourceCommit,
+                buildId: runtimeBuildIdentity.buildId,
+                capabilityManifestSha256: capabilityManifest.manifestSha256,
+                catalogGeneration: latestProfileCatalogGeneration.value,
+                sessionInitializedAt: new Date().toISOString(),
+                clientSupportsListChanged,
+              };
+              transports.register(newSessionId, transport, { snapshot });
+            }
             logEvent(config.logging, "info", "mcp_session_created", {
               requestId,
               sessionIdPrefix: sessionIdPrefix(newSessionId),
@@ -5801,6 +5899,38 @@ export function createServer(
             executeObservedReplacementRecovery,
             canRepairBinding,
             executeBindingRepair,
+            sessionConvergence: (targetSessionId?: string) => {
+              const sid = targetSessionId ?? sessionId;
+              const sessionSnapshot = sid ? transports.getSnapshot(sid) : undefined;
+              return evaluateSessionConvergence(sessionSnapshot, {
+                serverInstanceId: runtimeBuildIdentity.serverInstanceId,
+                sourceCommit: runtimeBuildIdentity.sourceCommit,
+                buildId: runtimeBuildIdentity.buildId,
+                capabilityManifestSha256: capabilityManifest.manifestSha256,
+                catalogGeneration: latestProfileCatalogGeneration.value,
+                cutoverMode: cutoverController.mode(),
+                reconciliationRequired: cutoverController.mode() !== "normal",
+              });
+            },
+            multiRoleEvaluator: () => {
+              const roles: ServiceRoleDeploymentIdentity[] = [
+                {
+                  role: "primary",
+                  expectedCommit: runtimeBuildIdentity.sourceCommit,
+                  expectedBuildId: runtimeBuildIdentity.buildId,
+                  runningBuild: {
+                    commit: runtimeBuildIdentity.sourceCommit,
+                    buildId: runtimeBuildIdentity.buildId,
+                    serverInstanceId: runtimeBuildIdentity.serverInstanceId,
+                    manifestSha256: capabilityManifest.manifestSha256,
+                    capabilities: capabilityManifest.capabilities,
+                    cutoverMode: cutoverController.mode(),
+                    reconciliationRequired: cutoverController.mode() !== "normal",
+                  },
+                },
+              ];
+              return evaluateMultiRoleConvergence(roles);
+            },
           },
           opencodeCatalogSource,
           clineCatalogService,
@@ -5808,6 +5938,21 @@ export function createServer(
           carrierBindings,
           hostOperations,
         );
+        if (transport.sessionId) {
+          const clientCaps = req.body?.params?.capabilities;
+          const clientSupportsListChanged = Boolean(clientCaps?.tools?.listChanged);
+          const initialSnapshot: SessionGenerationSnapshot = {
+            serverInstanceId: runtimeBuildIdentity.serverInstanceId,
+            sourceCommit: runtimeBuildIdentity.sourceCommit,
+            buildId: runtimeBuildIdentity.buildId,
+            capabilityManifestSha256: capabilityManifest.manifestSha256,
+            catalogGeneration: latestProfileCatalogGeneration.value,
+            sessionInitializedAt: new Date().toISOString(),
+            clientSupportsListChanged,
+          };
+          transports.setSnapshot(transport.sessionId, initialSnapshot);
+          transports.setServer(transport.sessionId, server);
+        }
         await server.connect(transport);
       } else {
         sendJsonRpcError(res, 400, -32000, "No valid MCP session");
@@ -5832,10 +5977,27 @@ export function createServer(
   });
 
   let closePromise: Promise<void> | undefined;
+  const broadcastToolListChanged = async (): Promise<number> => {
+    const servers = transports.getAllServers();
+    let sent = 0;
+    for (const s of servers) {
+      if (typeof s?.sendToolListChanged === "function") {
+        try {
+          await s.sendToolListChanged();
+          sent += 1;
+        } catch {
+          // ignore disconnected or errored transport
+        }
+      }
+    }
+    return sent;
+  };
+
   return {
     app,
     config,
     localAgentProviders,
+    broadcastToolListChanged,
     close: () => {
       closePromise ??= (async () => {
         clearInterval(sessionCleanupTimer);

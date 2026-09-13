@@ -64,6 +64,7 @@ export const CUTOVER_SAFE_TOOLS: ReadonlySet<string> = new Set([
   "cutover_finish",
   "cutover_recover",
   "cutover_repair_binding",
+  "capability_convergence_status",
 
   // Agent inspection & reconciliation
   "agent_status",

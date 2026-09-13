@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   evaluateDeploymentConvergence,
+  evaluateSessionConvergence,
+  evaluateMultiRoleConvergence,
   assertDeploymentCandidateValid,
   DeploymentConvergenceError,
   type DeploymentIdentitySnapshot,
@@ -169,4 +171,151 @@ test("Positive test: assertDeploymentCandidateValid accepts valid candidate desc
   };
 
   assert.doesNotThrow(() => assertDeploymentCandidateValid(validCandidate, currentAccepted));
+});
+
+test("SessionConvergence: CURRENT when snapshot matches server identity", () => {
+  const current = {
+    serverInstanceId: "srv-1",
+    sourceCommit: "commit-1",
+    buildId: "build-1",
+    capabilityManifestSha256: "man-1",
+    catalogGeneration: "gen-1",
+    cutoverMode: "normal",
+    reconciliationRequired: false,
+  };
+  const snapshot = {
+    serverInstanceId: "srv-1",
+    sourceCommit: "commit-1",
+    buildId: "build-1",
+    capabilityManifestSha256: "man-1",
+    catalogGeneration: "gen-1",
+    sessionInitializedAt: new Date().toISOString(),
+  };
+  const result = evaluateSessionConvergence(snapshot, current);
+  assert.equal(result.state, "CURRENT");
+  assert.equal(result.converged, true);
+  assert.equal(result.reconnectRequired, false);
+});
+
+test("SessionConvergence: RECONCILIATION_REQUIRED when server is in cutover drain mode", () => {
+  const current = {
+    serverInstanceId: "srv-1",
+    sourceCommit: "commit-1",
+    buildId: "build-1",
+    capabilityManifestSha256: "man-1",
+    catalogGeneration: "gen-1",
+    cutoverMode: "drain",
+    reconciliationRequired: true,
+  };
+  const snapshot = {
+    serverInstanceId: "srv-1",
+    sourceCommit: "commit-1",
+    buildId: "build-1",
+    capabilityManifestSha256: "man-1",
+    catalogGeneration: "gen-1",
+    sessionInitializedAt: new Date().toISOString(),
+  };
+  const result = evaluateSessionConvergence(snapshot, current);
+  assert.equal(result.state, "RECONCILIATION_REQUIRED");
+  assert.equal(result.reconciliationRequired, true);
+});
+
+test("SessionConvergence: STALE_SERVER when server instance changed", () => {
+  const current = {
+    serverInstanceId: "srv-2",
+    sourceCommit: "commit-1",
+    buildId: "build-1",
+    capabilityManifestSha256: "man-1",
+    catalogGeneration: "gen-1",
+    cutoverMode: "normal",
+    reconciliationRequired: false,
+  };
+  const snapshot = {
+    serverInstanceId: "srv-1",
+    sourceCommit: "commit-1",
+    buildId: "build-1",
+    capabilityManifestSha256: "man-1",
+    catalogGeneration: "gen-1",
+    sessionInitializedAt: new Date().toISOString(),
+  };
+  const result = evaluateSessionConvergence(snapshot, current);
+  assert.equal(result.state, "STALE_SERVER");
+  assert.equal(result.reconnectRequired, true);
+  assert.equal(result.converged, false);
+});
+
+test("SessionConvergence: STALE_CAPABILITY_MANIFEST or RECONNECT_REQUIRED based on client capabilities", () => {
+  const current = {
+    serverInstanceId: "srv-1",
+    sourceCommit: "commit-1",
+    buildId: "build-1",
+    capabilityManifestSha256: "man-2",
+    catalogGeneration: "gen-1",
+    cutoverMode: "normal",
+    reconciliationRequired: false,
+  };
+  const s1 = {
+    serverInstanceId: "srv-1",
+    sourceCommit: "commit-1",
+    buildId: "build-1",
+    capabilityManifestSha256: "man-1",
+    catalogGeneration: "gen-1",
+    sessionInitializedAt: new Date().toISOString(),
+    clientSupportsListChanged: false,
+  };
+  assert.equal(evaluateSessionConvergence(s1, current).state, "RECONNECT_REQUIRED");
+
+  const s2 = { ...s1, clientSupportsListChanged: true };
+  const r2 = evaluateSessionConvergence(s2, current);
+  assert.equal(r2.state, "STALE_CAPABILITY_MANIFEST");
+  assert.equal(r2.reconnectRequired, false);
+});
+
+test("MultiRoleConvergence: aggregates convergence status across service roles", () => {
+  const roles = [
+    {
+      role: "dev2",
+      expectedCommit: "commit-1",
+      expectedBuildId: "build-1",
+      runningBuild: {
+        commit: "commit-1",
+        buildId: "build-1",
+        serverInstanceId: "inst-1",
+        manifestSha256: "hash-1",
+        capabilities: [
+          "agent_start.tool",
+          "agent_start.executionContract.authorityMode",
+          "agent_start.executionContract.idleTimeoutMs",
+          "agent_start.executionContract.nexusGrant",
+        ],
+        cutoverMode: "normal",
+        reconciliationRequired: false,
+      },
+    },
+    {
+      role: "dev-c",
+      expectedCommit: "commit-2",
+      expectedBuildId: "build-2",
+      runningBuild: {
+        commit: "commit-1",
+        buildId: "build-1",
+        serverInstanceId: "inst-2",
+        manifestSha256: "hash-1",
+        capabilities: [
+          "agent_start.tool",
+          "agent_start.executionContract.authorityMode",
+          "agent_start.executionContract.idleTimeoutMs",
+          "agent_start.executionContract.nexusGrant",
+        ],
+        cutoverMode: "normal",
+        reconciliationRequired: false,
+      },
+    },
+  ];
+
+  const evalResult = evaluateMultiRoleConvergence(roles);
+  assert.equal(evalResult.converged, false);
+  assert.equal(evalResult.roleStates["dev2"].converged, true);
+  assert.equal(evalResult.roleStates["dev-c"].converged, false);
+  assert.ok(evalResult.summary.includes("dev-c"));
 });

@@ -8,6 +8,44 @@ export type DeploymentConvergenceState =
   | "RECONCILIATION_REQUIRED"
   | "CONVERGED";
 
+export type SessionConvergenceState =
+  | "CURRENT"
+  | "STALE_SERVER"
+  | "STALE_CAPABILITY_MANIFEST"
+  | "STALE_SESSION_CATALOG"
+  | "RECONNECT_REQUIRED"
+  | "RECONCILIATION_REQUIRED";
+
+export interface SessionGenerationSnapshot {
+  serverInstanceId: string;
+  sourceCommit: string;
+  buildId: string;
+  capabilityManifestSha256: string;
+  catalogGeneration: string;
+  sessionInitializedAt: string;
+  clientSupportsListChanged?: boolean;
+}
+
+export interface SessionConvergenceEvaluation {
+  state: SessionConvergenceState;
+  converged: boolean;
+  reconnectRequired: boolean;
+  reconciliationRequired: boolean;
+  activeDrift: boolean;
+  details: string;
+  sessionSnapshot?: SessionGenerationSnapshot;
+  serverGeneration: {
+    serverInstanceId: string;
+    sourceCommit: string;
+    buildId: string;
+    capabilityManifestSha256: string;
+    catalogGeneration: string;
+    cutoverMode: string;
+    reconciliationRequired: boolean;
+  };
+}
+
+
 export interface RemoteMainIdentity {
   commit: string;
 }
@@ -210,4 +248,175 @@ export function assertDeploymentCandidateValid(
       `Candidate ${candidate.commit} removes currently accepted capabilities: ${droppedCaps.join(", ")}`,
     );
   }
+}
+
+export function evaluateSessionConvergence(
+  sessionSnapshot: SessionGenerationSnapshot | undefined,
+  currentServer: {
+    serverInstanceId: string;
+    sourceCommit: string;
+    buildId: string;
+    capabilityManifestSha256: string;
+    catalogGeneration: string;
+    cutoverMode: string;
+    reconciliationRequired: boolean;
+  },
+): SessionConvergenceEvaluation {
+  const base = {
+    sessionSnapshot,
+    serverGeneration: currentServer,
+  };
+
+  // 1. Server is draining or requires reconciliation
+  if (currentServer.reconciliationRequired || currentServer.cutoverMode !== "normal") {
+    return {
+      ...base,
+      state: "RECONCILIATION_REQUIRED",
+      converged: false,
+      reconnectRequired: false,
+      reconciliationRequired: true,
+      activeDrift: false,
+      details: "Live runtime is in cutover mode '" + currentServer.cutoverMode + "' or reconciliationRequired=true",
+    };
+  }
+
+  // 2. No session snapshot provided or unknown session
+  if (!sessionSnapshot) {
+    return {
+      ...base,
+      state: "RECONNECT_REQUIRED",
+      converged: false,
+      reconnectRequired: true,
+      reconciliationRequired: false,
+      activeDrift: true,
+      details: "No active session generation snapshot bound to this request context; reconnect required",
+    };
+  }
+
+  // 3. Server instance changed (e.g. process restarted)
+  if (sessionSnapshot.serverInstanceId !== currentServer.serverInstanceId) {
+    return {
+      ...base,
+      state: "STALE_SERVER",
+      converged: false,
+      reconnectRequired: true,
+      reconciliationRequired: false,
+      activeDrift: true,
+      details: "Server instance changed from " + sessionSnapshot.serverInstanceId + " to " + currentServer.serverInstanceId + "; session reconnect required",
+    };
+  }
+
+  // 4. Capability manifest digest changed
+  if (sessionSnapshot.capabilityManifestSha256 !== currentServer.capabilityManifestSha256) {
+    const reconnect = !sessionSnapshot.clientSupportsListChanged;
+    return {
+      ...base,
+      state: reconnect ? "RECONNECT_REQUIRED" : "STALE_CAPABILITY_MANIFEST",
+      converged: false,
+      reconnectRequired: reconnect,
+      reconciliationRequired: false,
+      activeDrift: true,
+      details: "Capability manifest digest changed from " + sessionSnapshot.capabilityManifestSha256 + " to " + currentServer.capabilityManifestSha256,
+    };
+  }
+
+  // 5. Tool catalog generation changed
+  if (sessionSnapshot.catalogGeneration !== currentServer.catalogGeneration) {
+    const reconnect = !sessionSnapshot.clientSupportsListChanged;
+    return {
+      ...base,
+      state: reconnect ? "RECONNECT_REQUIRED" : "STALE_SESSION_CATALOG",
+      converged: false,
+      reconnectRequired: reconnect,
+      reconciliationRequired: false,
+      activeDrift: true,
+      details: "Tool catalog generation changed from " + sessionSnapshot.catalogGeneration + " to " + currentServer.catalogGeneration,
+    };
+  }
+
+  // 6. Fully converged
+  return {
+    ...base,
+    state: "CURRENT",
+    converged: true,
+    reconnectRequired: false,
+    reconciliationRequired: false,
+    activeDrift: false,
+    details: "Session generation is fully synchronized with live server identity and tool catalog",
+  };
+}
+
+export interface ServiceRoleDeploymentIdentity {
+  role: string; // e.g. "dev2" (port 7677) or "dev-c" (port 7678)
+  expectedCommit: string;
+  expectedBuildId?: string;
+  runningBuild?: RunningBuildIdentity;
+  installedBuild?: InstalledBuildIdentity;
+  hostBinding?: HostBindingIdentity;
+  pinned?: boolean;
+}
+
+export interface MultiRoleDeploymentEvaluation {
+  converged: boolean;
+  activeDrift: boolean;
+  reconciliationRequired: boolean;
+  roleStates: Record<string, DeploymentConvergenceEvaluation>;
+  summary: string;
+}
+
+export function evaluateMultiRoleConvergence(
+  roles: ServiceRoleDeploymentIdentity[],
+  remoteMain?: RemoteMainIdentity,
+  requiredCapabilities?: string[],
+): MultiRoleDeploymentEvaluation {
+  const roleStates: Record<string, DeploymentConvergenceEvaluation> = {};
+  let converged = true;
+  let activeDrift = false;
+  let reconciliationRequired = false;
+  const driftedRoles: string[] = [];
+
+  for (const roleDef of roles) {
+    const snapshot: DeploymentIdentitySnapshot = {
+      remoteMain,
+      acceptedDeployment: {
+        commit: roleDef.expectedCommit,
+        buildId: roleDef.expectedBuildId,
+        pinned: roleDef.pinned,
+      },
+      installedBuild: roleDef.installedBuild ?? {
+        commit: roleDef.runningBuild?.commit ?? "uninstalled",
+        buildId: roleDef.runningBuild?.buildId ?? "uninstalled",
+        manifestSha256: roleDef.runningBuild?.manifestSha256 ?? "",
+      },
+      runningBuild: roleDef.runningBuild ?? {
+        commit: "unknown",
+        buildId: "unknown",
+        serverInstanceId: "unknown",
+        manifestSha256: "",
+        cutoverMode: "drain",
+        reconciliationRequired: true,
+      },
+      hostBinding: roleDef.hostBinding,
+    };
+
+    const evalResult = evaluateDeploymentConvergence(snapshot, requiredCapabilities);
+    roleStates[roleDef.role] = evalResult;
+
+    if (!evalResult.converged) {
+      converged = false;
+      driftedRoles.push(roleDef.role + " (" + evalResult.state + ")");
+    }
+    if (evalResult.activeDrift) activeDrift = true;
+    if (evalResult.reconciliationRequired) reconciliationRequired = true;
+  }
+
+  return {
+    converged,
+    activeDrift,
+    reconciliationRequired,
+    roleStates,
+    summary: converged
+      ? "All " + roles.length + " service roles are converged."
+      : "Drift detected in roles: " + driftedRoles.join(", ") + ".",
+  };
 }
