@@ -93,6 +93,16 @@ const boundedHash = (value: string, label: string) => {
   return value;
 };
 
+const boundedGeneration = (value: string): string => {
+  if (!value.trim() || Buffer.byteLength(value, "utf8") > 256) {
+    throw new ChatSwarmError(
+      "INVALID_INPUT",
+      "carrier operation generation must be a non-empty value up to 256 bytes",
+    );
+  }
+  return value;
+};
+
 const safeJson = (value: Record<string, unknown>) => {
   const keys = Object.keys(value);
   const allowed = [
@@ -104,6 +114,7 @@ const safeJson = (value: Record<string, unknown>) => {
     "carrierKind",
     "carrierFingerprint",
     "adapterConfigHash",
+    "operationGeneration",
     "kind",
   ];
   if (keys.some((key) => !allowed.includes(key))) {
@@ -125,8 +136,8 @@ const safeJson = (value: Record<string, unknown>) => {
       );
     }
     if (
-      ["swarmId", "workerId", "carrierKind", "kind"].includes(key) &&
-      (typeof item !== "string" || item.length === 0 || item.length > 256)
+      ["swarmId", "workerId", "carrierKind", "kind", "operationGeneration"].includes(key) &&
+      (typeof item !== "string" || item.length === 0 || Buffer.byteLength(item, "utf8") > 256)
     ) {
       throw new ChatSwarmError(
         "INVALID_INPUT",
@@ -186,6 +197,7 @@ export class ChatSwarmCarrierManager {
     swarmId: string,
     capacity: number,
     adapterConfigHash: string,
+    operationGeneration = "default",
   ): Promise<CarrierResult[]> {
     this.coordinator.assertOwnerForLifecycle(meta, swarmId);
     if (this.store.getSwarm(swarmId)?.status !== "ACTIVE") {
@@ -201,6 +213,7 @@ export class ChatSwarmCarrierManager {
       );
     }
     boundedHash(adapterConfigHash, "adapterConfigHash");
+    boundedGeneration(operationGeneration);
 
     const workers = this.coordinator.admittedCarrierWorkers(swarmId);
     if (workers.length === 0 || workers.length < capacity) {
@@ -244,7 +257,11 @@ export class ChatSwarmCarrierManager {
                 "UNSUPPORTED",
                 "TARGETED_WORKER_PROTECTED",
               )
-            : this.ensureWorker(worker, adapterConfigHash),
+            : this.ensureWorker(
+                worker,
+                adapterConfigHash,
+                operationGeneration,
+              ),
       ),
     );
   }
@@ -423,12 +440,14 @@ export class ChatSwarmCarrierManager {
   private async ensureWorker(
     worker: NonNullable<ReturnType<ChatSwarmStore["getWorker"]>>,
     config: string,
+    operationGeneration: string,
   ): Promise<CarrierResult> {
     const fingerprint = worker.carrierConversationFingerprint!;
     const slotKey = this.slotKey({
       swarmId: worker.swarmId,
       workerId: worker.id,
       epoch: worker.continuationEpoch,
+      operationGeneration,
       kind: "ENSURE_EXISTING",
     });
     const operationKey = this.operationKey({
@@ -444,6 +463,7 @@ export class ChatSwarmCarrierManager {
       carrierKind: worker.runtimeKind,
       carrierFingerprint: fingerprint,
       adapterConfigHash: config,
+      operationGeneration,
       kind: "ENSURE_EXISTING",
     });
     const op = this.store.createCarrierOperation({
@@ -664,6 +684,7 @@ export class ChatSwarmCarrierManager {
     taskId?: string;
     attemptId?: string;
     epoch: number;
+    operationGeneration?: string;
     kind: string;
   }): string {
     return `carrier-slot-${hash(
@@ -671,6 +692,7 @@ export class ChatSwarmCarrierManager {
         ...input,
         taskId: input.taskId ?? null,
         attemptId: input.attemptId ?? null,
+        operationGeneration: input.operationGeneration ?? null,
       }),
     )}`;
   }
