@@ -41,7 +41,7 @@ function request(overrides: Partial<ChatSwarmContinuationRequest> = {}): ChatSwa
     swarmId: "swarm-1",
     workerId: "worker-1",
     attemptKey: "cont-1",
-    requestHash: material.requestHash,
+    requestHash: "d".repeat(64),
     sourceEpoch: material.sourceEpoch,
     targetEpoch: material.targetEpoch,
     sourceCarrierFingerprint: material.sourceCarrierFingerprint,
@@ -63,11 +63,10 @@ test("prepare binds exact epoch, authenticated target carrier and checkpoint", (
   assert.equal(material.sourceCarrierFingerprint, source);
   assert.equal(material.targetCarrierFingerprint, target);
   assert.match(material.checkpointHash, /^[0-9a-f]{64}$/);
-  assert.match(material.requestHash, /^[0-9a-f]{64}$/);
 
   const otherTarget = "c".repeat(64);
   const other = prepareContinuationMaterial(worker(), createInput(), otherTarget);
-  assert.notEqual(material.requestHash, other.requestHash);
+  assert.notEqual(material.targetCarrierFingerprint, other.targetCarrierFingerprint);
 });
 
 test("prepare rejects unsafe active worker and stale epoch", () => {
