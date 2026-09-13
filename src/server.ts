@@ -157,6 +157,13 @@ import {
   AGENT_LIST_DEFAULT_LIMIT,
 } from "./local-agent-sessions.js";
 import { parseExecutionContract, type ExecutionContract } from "./local-agent-contract.js";
+import {
+  CAPABILITY_DISCOVERY_INDEX_PATH,
+  CAPABILITY_DISCOVERY_RECEIPT_SCHEMA,
+  NEXUS_CAPABILITY_REPOSITORY,
+  renderCapabilityDiscoveryForWorker,
+  verifyCapabilityDiscoveryReceipt,
+} from "./capability-discovery.js";
 import { runToolchainVerifier, resolveToolchainExecutable } from "./local-agent-toolchains.js";
 import {
   runRepositoryIntelligenceOperation,
@@ -1980,6 +1987,23 @@ function createAgentStartInputSchema() {
     authorityPath: z.string().startsWith("tasks/"),
     authoritySha256: z.string().regex(/^[0-9a-f]{64}$/),
   }).strict();
+  const capabilityDiscovery = z.object({
+    schema: z.literal(CAPABILITY_DISCOVERY_RECEIPT_SCHEMA),
+    repository: z.literal(NEXUS_CAPABILITY_REPOSITORY),
+    indexRevision: z.string().regex(/^[0-9a-f]{40}$/),
+    indexPath: z.literal(CAPABILITY_DISCOVERY_INDEX_PATH),
+    indexSha256: z.string().regex(/^[0-9a-f]{64}$/),
+    intent: z.string().min(1),
+    disposition: z.enum(["REUSE_EXISTING", "EXTEND_EXISTING", "WRAP_EXISTING", "NEW_CAPABILITY_JUSTIFIED", "BLOCKED_UNKNOWN"]),
+    matchedCapabilityIds: z.array(z.string().min(1)),
+    evidence: z.object({
+      architecture: z.array(z.string().min(1)).min(1),
+      source: z.array(z.string().min(1)).min(1),
+      history: z.array(z.string().min(1)).min(1),
+      runtime: z.array(z.string().min(1)).min(1),
+    }).strict(),
+    newCapabilityJustification: z.string().min(1).optional(),
+  }).strict();
   const executionContract = z.object({
     authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).optional().describe(
       "Execution authority lane. OWNER_DIRECT is the backwards-compatible default. NEXUS_GOVERNED requires canonical Nexus authority evidence and never falls back to direct authority.",
@@ -1989,6 +2013,9 @@ function createAgentStartInputSchema() {
     ),
     dispatchIntent: dispatchIntent.describe(
       "Controller-authored bounded task semantics. Dev MCP transports and mechanically enforces applicable scope/ownership constraints but does not gain planner, verifier, acceptance, merge, or release authority.",
+    ),
+    capabilityDiscovery: capabilityDiscovery.describe(
+      "Reuse-before-invention discovery receipt bound to current canonical Nexus main and the exact capability discovery index bytes. Required for write-capable delegated workers; this is navigation evidence, not routing or mutation authority.",
     ),
     expectedHead: z.string().describe(
       "40-character commit SHA. If supplied, agent_start fails closed when workspace HEAD no longer matches.",
@@ -3915,8 +3942,25 @@ export function createMcpServer(
         assertDirectClineCatalogSelection({ profile, provider, model, effort, cliProviderId }, profileCatalog);
         const profiles = selection.profiles;
         const selectedProfile = profiles.find((candidate) => candidate.name === selection.profileName);
+        let discoveryContext: string | undefined;
         if (selectedProfile?.write_mode !== "read_only") {
           await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
+          if (!contract?.capabilityDiscovery) {
+            throw new AgentSessionError(
+              "INVALID_EXECUTION_CONTRACT",
+              "CAPABILITY_DISCOVERY_REQUIRED: write-capable delegated execution requires a current Nexus capability discovery receipt before worker launch.",
+            );
+          }
+          try {
+            discoveryContext = renderCapabilityDiscoveryForWorker(
+              await verifyCapabilityDiscoveryReceipt(contract.capabilityDiscovery),
+            );
+          } catch (error) {
+            throw new AgentSessionError(
+              "INVALID_EXECUTION_CONTRACT",
+              error instanceof Error ? error.message : String(error),
+            );
+          }
         }
         const boundContractBase = selection.directSelection
           ? { ...(contract ?? {}), directSelection: selection.directSelection }
@@ -3931,7 +3975,7 @@ export function createMcpServer(
           workspaceId,
           workspaceRoot: workspace.root,
           profileName: selection.profileName,
-          prompt,
+          prompt: discoveryContext ? `${discoveryContext}\n\n${prompt}` : prompt,
           profiles,
           profileCatalog,
           attemptKey,

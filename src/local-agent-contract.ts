@@ -5,6 +5,10 @@ import {
   type ExecutionAuthorityMode,
   type NexusExecutionGrantRef,
 } from "./execution-protocol.js";
+import {
+  parseCapabilityDiscoveryReceipt,
+  type CapabilityDiscoveryReceipt,
+} from "./capability-discovery.js";
 
 /**
  * Structured execution contract for a DevSpace subagent turn.
@@ -63,6 +67,8 @@ export interface ExecutionContract {
   nexusGrant?: NexusExecutionGrantRef;
   /** Controller-authored bounded work semantics, transported durably by DevSpace. */
   dispatchIntent?: DispatchIntent;
+  /** Verified reuse-before-invention discovery evidence for mutating delegated work. */
+  capabilityDiscovery?: CapabilityDiscoveryReceipt;
   /**
    * If supplied, agent_start fails closed when the workspace HEAD no longer
    * matches before any worker mutation.
@@ -222,6 +228,10 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
 
   if (record.dispatchIntent !== undefined) {
     contract.dispatchIntent = parseDispatchIntent(record.dispatchIntent);
+  }
+
+  if (record.capabilityDiscovery !== undefined) {
+    contract.capabilityDiscovery = parseCapabilityDiscoveryReceipt(record.capabilityDiscovery);
   }
 
   if (record.expectedHead !== undefined) {

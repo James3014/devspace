@@ -38,6 +38,11 @@ const REQUIRED_CAPABILITIES = [
     tool: "agent_start",
     fieldPath: "executionContract.nexusGrant",
   },
+  {
+    id: "agent_start.executionContract.capabilityDiscovery",
+    tool: "agent_start",
+    fieldPath: "executionContract.capabilityDiscovery",
+  },
 ] as const;
 
 function unwrap(schema: SchemaLike | undefined): SchemaLike | undefined {
