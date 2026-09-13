@@ -621,17 +621,37 @@ export class ChatSwarmContinuationStore {
 
     let status: ChatSwarmContinuationRequest["status"];
     if (row.status === "started") {
+      if (row.receipt_json !== null || row.error_code !== null || row.error_message !== null) {
+        throw new ChatSwarmError("INVALID_STATE", "pending continuation terminal metadata is malformed");
+      }
       status = Date.parse(persisted.expiresAt) <= this.clock().getTime() ? "EXPIRED" : "PENDING";
-    } else if (row.status === "succeeded") status = "APPROVED";
-    else if (row.status === "failed" && row.error_code === "EXPIRED") status = "EXPIRED";
-    else if (row.status === "failed" && row.error_code === "SUPERSEDED") status = "SUPERSEDED";
-    else if (row.status === "outcome_unknown") status = "RECONCILE_REQUIRED";
-    else throw new ChatSwarmError("INVALID_STATE", `unsupported durable continuation status '${row.status}'`);
+    } else if (row.status === "succeeded") {
+      if (row.receipt_json === null || row.error_code !== null || row.error_message !== null) {
+        throw new ChatSwarmError("INVALID_STATE", "approved continuation terminal metadata is malformed");
+      }
+      status = "APPROVED";
+    } else if (row.status === "failed" && (row.error_code === "EXPIRED" || row.error_code === "SUPERSEDED")) {
+      if (row.receipt_json !== null || !row.error_message) {
+        throw new ChatSwarmError("INVALID_STATE", "failed continuation terminal metadata is malformed");
+      }
+      status = row.error_code === "EXPIRED" ? "EXPIRED" : "SUPERSEDED";
+    } else if (row.status === "outcome_unknown") {
+      if (
+        row.receipt_json !== null ||
+        row.error_code !== "RECONCILIATION_REQUIRED" ||
+        !row.error_message
+      ) {
+        throw new ChatSwarmError("INVALID_STATE", "unresolved continuation terminal metadata is malformed");
+      }
+      status = "RECONCILE_REQUIRED";
+    } else {
+      throw new ChatSwarmError("INVALID_STATE", `unsupported durable continuation status '${row.status}'`);
+    }
 
     let approvedAt: string | undefined;
-    if (row.receipt_json) {
+    if (status === "APPROVED") {
       try {
-        const receipt = JSON.parse(row.receipt_json) as PersistedReceipt;
+        const receipt = JSON.parse(row.receipt_json!) as PersistedReceipt;
         if (receipt.schema !== RECEIPT_SCHEMA) throw new Error("receipt schema mismatch");
         if (
           receipt.targetEpoch !== persisted.targetEpoch ||
