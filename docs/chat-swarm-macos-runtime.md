@@ -44,6 +44,8 @@ When Chat Swarm is enabled in the normal server configuration, DevSpace exposes:
 - `chat_swarm_runtime_stop`
 - `chat_swarm_runtime_bootstrap`
 
+These six managed-runtime tools extend the 15 existing Chat Swarm tools, so the enabled production surface contains 21 `chat_swarm_*` tools in total.
+
 `runtime_status` is read-only. The remaining tools are consequential lifecycle operations and preserve durable operation/reconciliation semantics.
 
 ## Managed provisioning contract
