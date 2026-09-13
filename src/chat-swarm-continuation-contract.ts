@@ -19,6 +19,7 @@ export interface ChatSwarmContinuationRequest {
   sourceCarrierFingerprint: string;
   targetCarrierFingerprint: string;
   checkpointHash: string;
+  ttlSeconds: number;
   version: number;
   status: ChatSwarmContinuationState;
   requestedAt: string;
