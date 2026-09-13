@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -98,6 +98,11 @@ test("host activation reconciliation never calls unreceipted postimages APPLIED"
     await writeFile(f.second, f.secondNew);
     const unknown = await reconcileHostActivation(bound, "host_no_receipt");
     assert.equal(unknown.classification, "EFFECT_UNKNOWN");
+    const direct = await applyHostActivation(f.manifestPath, bound.manifestSha256, "host_all_post", [f.root], [f.manifestPath]);
+    assert.equal(direct.classification, "EFFECT_UNKNOWN");
+    assert.equal(direct.changedByOperation, false);
+    const sameOperation = await reconcileHostActivation(bound, "host_all_post");
+    assert.equal(sameOperation.classification, "EFFECT_UNKNOWN");
     await writeFile(f.second, f.secondOld);
     const partial = await reconcileHostActivation(bound, "host_partial");
     assert.equal(partial.classification, "PARTIAL_EFFECT");
@@ -123,5 +128,36 @@ test("host activation rejects a target outside the startup-approved write scope"
   try {
     await mkdir(allowed);
     await assert.rejects(() => bindHostActivation(f.manifestPath, [allowed], [f.manifestPath]), /outside the startup-approved host operation scope/);
+  } finally { await f.cleanup(); }
+});
+
+test("host activation canonicalizes macOS path aliases but rejects symlink escape", async () => {
+  const f = await fixture();
+  const allowed = join(f.root, "allowed");
+  const outside = join(f.root, "outside");
+  const linkedParent = join(allowed, "linked");
+  const escapedTarget = join(linkedParent, "escaped.js");
+  try {
+    await mkdir(allowed);
+    await mkdir(outside);
+    await writeFile(join(outside, "escaped.js"), "old\n");
+    await symlink(outside, linkedParent);
+    const escapedManifest: HostActivationManifest = {
+      schema: HOST_ACTIVATION_MANIFEST_SCHEMA,
+      kind: "OPENCLI_CHATGPT_ADAPTER_OVERLAY",
+      receiptDir: join(allowed, "receipts"),
+      targets: [{
+        targetId: "escaped",
+        path: escapedTarget,
+        expectedPreimageSha256: digest("old\n"),
+        expectedPostimageSha256: digest("new\n"),
+        transform: { kind: "replace_exact_utf8", oldText: "old\n", newText: "new\n" },
+      }],
+    };
+    await writeFile(f.manifestPath, JSON.stringify(escapedManifest, null, 2));
+    await assert.rejects(
+      () => bindHostActivation(f.manifestPath, [allowed], [f.manifestPath]),
+      /outside the startup-approved host operation scope/,
+    );
   } finally { await f.cleanup(); }
 });

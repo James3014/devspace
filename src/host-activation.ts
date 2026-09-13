@@ -106,20 +106,22 @@ export async function bindHostActivation(
   allowedWritePaths: readonly string[],
   allowedReadPaths: readonly string[],
 ): Promise<BoundHostActivation> {
+  const canonicalWritePaths = await Promise.all(allowedWritePaths.map((path) => canonicalScopePath(path, "activation write scope")));
+  const canonicalReadPaths = await Promise.all(allowedReadPaths.map((path) => canonicalScopePath(path, "activation read scope")));
   const canonicalManifest = await canonicalExistingFile(manifestPath, "activation manifest");
-  assertAllowed(canonicalManifest, allowedReadPaths, "activation manifest");
+  assertAllowed(canonicalManifest, canonicalReadPaths, "activation manifest");
   const raw = await readFile(canonicalManifest);
   const manifestSha256 = sha256(raw);
   const manifest = parseManifest(JSON.parse(raw.toString("utf8")));
   const canonicalReceiptDir = await canonicalFutureDirectory(manifest.receiptDir, "activation receipt directory");
-  assertAllowed(canonicalReceiptDir, allowedWritePaths, "activation receipt directory");
+  assertAllowed(canonicalReceiptDir, canonicalWritePaths, "activation receipt directory");
   const seen = new Set<string>();
   const targets: Array<Pick<HostActivationTarget, "targetId" | "path" | "expectedPreimageSha256" | "expectedPostimageSha256">> = [];
   for (const target of manifest.targets) {
     if (seen.has(target.targetId)) throw new HostActivationError("HOST_ACTIVATION_INVALID", `Duplicate activation target id: ${target.targetId}`);
     seen.add(target.targetId);
     const canonicalTarget = await canonicalExistingFile(target.path, `activation target ${target.targetId}`);
-    assertAllowed(canonicalTarget, allowedWritePaths, `activation target ${target.targetId}`);
+    assertAllowed(canonicalTarget, canonicalWritePaths, `activation target ${target.targetId}`);
     targets.push({
       targetId: target.targetId,
       path: canonicalTarget,
@@ -163,11 +165,12 @@ export async function applyHostActivation(
   if (initial.targets.every((target) => target.state === "postimage")) {
     return persistReceipt({
       ...initial,
-      classification: "APPLIED",
+      classification: "EFFECT_UNKNOWN",
       changedByOperation: false,
       schema: HOST_ACTIVATION_RECEIPT_SCHEMA,
       operationId,
       createdAt: new Date().toISOString(),
+      error: "Targets match the declared postimages but no prior receipt proves this operation produced them.",
     });
   }
   if (!initial.targets.every((target) => target.state === "preimage")) {
@@ -303,7 +306,7 @@ async function observeBoundActivation(binding: BoundHostActivation, operationId:
   else if (prior?.classification === "ROLLED_BACK" && allPre) classification = "ROLLED_BACK";
   else if (prior?.classification === "APPLIED" && allPost) classification = "APPLIED";
   else if (allPre) classification = "CONFIRMED_NO_EFFECT";
-  else if (allPost) classification = prior ? "APPLIED" : "EFFECT_UNKNOWN";
+  else if (allPost) classification = "EFFECT_UNKNOWN";
   else if (anyUnreadable) classification = "EFFECT_UNKNOWN";
   else if (anyPost) classification = "PARTIAL_EFFECT";
   else classification = "EFFECT_UNKNOWN";
@@ -371,9 +374,15 @@ async function canonicalExistingFile(path: string, label: string): Promise<strin
   const requested = resolve(path);
   const info = await lstat(requested).catch(() => undefined);
   if (!info?.isFile() || info.isSymbolicLink()) throw new HostActivationError("HOST_ACTIVATION_INVALID", `${label} must be a regular non-symlink file.`);
-  const canonical = await realpath(requested);
-  if (canonical !== requested) throw new HostActivationError("HOST_ACTIVATION_INVALID", `${label} must not traverse symlinked ancestors.`);
-  return canonical;
+  return realpath(requested);
+}
+
+async function canonicalScopePath(path: string, label: string): Promise<string> {
+  if (!isAbsolute(path)) throw new HostActivationError("HOST_ACTIVATION_INVALID", `${label} must be absolute.`);
+  const requested = resolve(path);
+  const info = await lstat(requested).catch(() => undefined);
+  if (!info || info.isSymbolicLink()) throw new HostActivationError("HOST_ACTIVATION_INVALID", `${label} must be an existing non-symlink path.`);
+  return realpath(requested);
 }
 
 async function canonicalFutureDirectory(path: string, label: string): Promise<string> {
@@ -382,15 +391,15 @@ async function canonicalFutureDirectory(path: string, label: string): Promise<st
   try {
     const info = await lstat(requested);
     if (!info.isDirectory() || info.isSymbolicLink()) throw new HostActivationError("HOST_ACTIVATION_INVALID", `${label} must be a regular non-symlink directory.`);
-    const canonical = await realpath(requested);
-    if (canonical !== requested) throw new HostActivationError("HOST_ACTIVATION_INVALID", `${label} must not traverse symlinked ancestors.`);
-    return canonical;
+    return realpath(requested);
   } catch (error) {
     if (error instanceof HostActivationError) throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw new HostActivationError("HOST_ACTIVATION_INVALID", `${label} could not be inspected.`);
     const parent = dirname(requested);
+    const parentInfo = await lstat(parent).catch(() => undefined);
+    if (!parentInfo?.isDirectory() || parentInfo.isSymbolicLink()) throw new HostActivationError("HOST_ACTIVATION_INVALID", `${label} parent must be a regular non-symlink directory.`);
     const canonicalParent = await realpath(parent);
-    if (canonicalParent !== parent) throw new HostActivationError("HOST_ACTIVATION_INVALID", `${label} parent must not traverse symlinked ancestors.`);
-    return requested;
+    return join(canonicalParent, basename(requested));
   }
 }
 

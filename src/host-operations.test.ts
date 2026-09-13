@@ -7,6 +7,7 @@ import test from "node:test";
 import { DurableOperationStore } from "./durable-operations.js";
 import { HostOperationRegistrar, type HostOperationReceipt } from "./host-operations.js";
 import type { BoundHostOperation, HostOperationPolicy, HostOperationRequest } from "./host-operation-policy.js";
+import { HOST_ACTIVATION_MANIFEST_SCHEMA, type HostActivationManifest } from "./host-activation.js";
 
 const executable = process.execPath;
 const fixtureSource = `import { appendFileSync } from "node:fs";
@@ -154,6 +155,73 @@ test("dispose terminates a pending short process before awaiting its start", asy
     const result = await pendingStart;
     assert.notEqual(result.status, "started");
   } finally { h.store.close(); await rm(h.root, { recursive: true, force: true }); }
+});
+
+test("activation preflight blocks mixed state and fresh all-post start remains outcome_unknown", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-host-activation-registrar-"));
+  const store = new DurableOperationStore(root);
+  const runner = join(root, "runner.mjs");
+  const manifestPath = join(root, "manifest.json");
+  const first = join(root, "first.js");
+  const second = join(root, "second.js");
+  const oldFirst = "first-old\n";
+  const oldSecond = "second-old\n";
+  const newFirst = "first-new\n";
+  const newSecond = "second-new\n";
+  const hash = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
+  try {
+    await writeFile(runner, "process.exit(99);\n");
+    await writeFile(first, oldFirst);
+    await writeFile(second, oldSecond);
+    const manifest: HostActivationManifest = {
+      schema: HOST_ACTIVATION_MANIFEST_SCHEMA,
+      kind: "OPENCLI_CHATGPT_ADAPTER_OVERLAY",
+      receiptDir: join(root, "receipts"),
+      targets: [
+        { targetId: "first", path: first, expectedPreimageSha256: hash(oldFirst), expectedPostimageSha256: hash(newFirst), transform: { kind: "replace_exact_utf8", oldText: oldFirst, newText: newFirst } },
+        { targetId: "second", path: second, expectedPreimageSha256: hash(oldSecond), expectedPostimageSha256: hash(newSecond), transform: { kind: "replace_exact_utf8", oldText: oldSecond, newText: newSecond } },
+      ],
+    };
+    await writeFile(manifestPath, JSON.stringify(manifest));
+    const executableHash = hash(await readFile(executable));
+    const argv = [runner, "--activation-manifest", manifestPath];
+    const policy: HostOperationPolicy = {
+      enabled: true,
+      ownerClientId: "owner-client",
+      executablePath: executable,
+      executableSha256: executableHash,
+      argv,
+      cwd: root,
+      allowedPaths: { write: [root], read: [runner, manifestPath] },
+      maxWallMs: 1_000,
+      maxIdleMs: 1_000,
+      allowLongLivedProcess: false,
+    };
+    const registrar = new HostOperationRegistrar(store, policy, async () => { throw new Error("activation child must not start for non-preimage state"); });
+    const request: Omit<HostOperationRequest, "clientId"> = {
+      attemptKey: "activation-existing-postimages",
+      executablePath: executable,
+      argv,
+      cwd: root,
+      allowedPaths: { write: [root], read: [runner, manifestPath] },
+      maxWallMs: 1_000,
+      maxIdleMs: 1_000,
+      allowLongLivedProcess: false,
+    };
+    await writeFile(first, newFirst);
+    const mixed = await registrar.preflight(request, "owner-client");
+    assert.equal(mixed.status, "blocked");
+    await writeFile(second, newSecond);
+    const started = await registrar.start(request, "owner-client");
+    assert.equal(started.status, "outcome_unknown");
+    assert.equal((started.receipt as unknown as HostOperationReceipt).observedPaths.status, "collected");
+    const observed = (started.receipt as unknown as HostOperationReceipt).observedPaths;
+    assert.equal(observed.status === "collected" ? observed.activation.classification : undefined, "EFFECT_UNKNOWN");
+    await registrar.dispose();
+  } finally {
+    store.close();
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 {

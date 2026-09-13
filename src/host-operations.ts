@@ -63,7 +63,7 @@ export class HostOperationRegistrar {
     const requestHash = activationRequestHash(bound.requestHash, activation);
     const activationObservation = activation ? await preflightHostActivation(activation) : undefined;
     return {
-      status: activationObservation && !activationObservation.targets.every((target) => target.state === "preimage" || target.state === "postimage") ? "blocked" : "ready",
+      status: activationObservation && activationObservation.classification !== "CONFIRMED_NO_EFFECT" ? "blocked" : "ready",
       operationId: bound.operationId,
       requestHash,
       executable: bound.request.executablePath,
@@ -95,12 +95,12 @@ export class HostOperationRegistrar {
     if (activation) {
       const before = await preflightHostActivation(activation);
       const allPre = before.targets.every((target) => target.state === "preimage");
-      const allPost = before.targets.every((target) => target.state === "postimage");
-      if (allPost) {
-        return this.finishActivation(bound.operationId, operation.record, activationReceipt(bound, { ...before, classification: "APPLIED", changedByOperation: false }));
-      }
       if (!allPre) {
-        const classification: HostActivationClassification = before.targets.some((target) => target.state === "unreadable") ? "EFFECT_UNKNOWN" : "BLOCKED_PREIMAGE_DRIFT";
+        const classification: HostActivationClassification = before.classification === "PARTIAL_EFFECT"
+          ? "PARTIAL_EFFECT"
+          : before.classification === "BLOCKED_PREIMAGE_DRIFT"
+            ? "BLOCKED_PREIMAGE_DRIFT"
+            : "EFFECT_UNKNOWN";
         return this.finishActivation(bound.operationId, operation.record, activationReceipt(bound, { ...before, classification, changedByOperation: false }));
       }
     }

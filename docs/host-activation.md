@@ -1,6 +1,6 @@
 # Host activation
 
-Host activation is the typed, host-scoped production-effect mode built on top of the existing startup-authorized host operation executor. It exists for the narrow case where a validated Candidate must be installed into fixed local runtime surfaces outside an ordinary DevSpace workspace without falling back to an arbitrary shell command.
+Host activation is the macOS-only, typed, host-scoped production-effect mode built on top of the existing startup-authorized host operation executor. It exists for the narrow case where a validated Candidate must be installed into fixed local runtime surfaces outside an ordinary DevSpace workspace without falling back to an arbitrary shell command.
 
 The first admitted activation kind is `OPENCLI_CHATGPT_ADAPTER_OVERLAY`. The caller does not choose target paths, transformations, or an executable at runtime. Those values are frozen by the startup host-operation policy and by one read-only activation manifest passed in the exact startup-authorized argv.
 
@@ -74,12 +74,12 @@ DEVSPACE_HOST_OPERATION_EXECUTABLE=/absolute/path/to/node
 DEVSPACE_HOST_OPERATION_EXECUTABLE_SHA256=<exact sha256>
 DEVSPACE_HOST_OPERATION_ARGV=["/absolute/path/to/devspace/dist/host-activation-cli.js","--activation-manifest","/absolute/path/to/opencli-overlay-manifest.json"]
 DEVSPACE_HOST_OPERATION_CWD=/absolute/approved/cwd
-DEVSPACE_HOST_OPERATION_ALLOWED_PATHS=/fixed/activation/target/or/parent,/fixed/receipt/dir
-DEVSPACE_HOST_OPERATION_READ_PATHS=/absolute/path/to/opencli-overlay-manifest.json
+DEVSPACE_HOST_OPERATION_ALLOWED_PATHS=/fixed/adapter/parent,/fixed/test/parent,/fixed/launcher/parent,/fixed/receipt/dir
+DEVSPACE_HOST_OPERATION_READ_PATHS=/absolute/path/to/devspace/dist/host-activation-cli.js,/absolute/path/to/devspace/dist/host-activation.js,/absolute/path/to/devspace/package.json,/absolute/path/to/opencli-overlay-manifest.json
 DEVSPACE_HOST_OPERATION_ALLOW_LONG_LIVED=false
 ```
 
-The OpenCLI manifest should bind only the user adapter, packaged adapter, corresponding regression-test files, launcher pin, and the activation receipt directory required by the accepted overlay. It must not grant general `$HOME`, package-manager, shell, service-control, credential, or repository mutation authority.
+The OpenCLI manifest should bind only the user adapter, packaged adapter, corresponding regression-test files, launcher pin, and the activation receipt directory required by the accepted overlay. Startup write scope should use the narrowest fixed parent directories needed for atomic sibling-temp replacement, never a general `$HOME` or package root. Because host-operation read scope is exact-file based, it must also list the packaged activation CLI module, its imported activation module, the package metadata needed for ESM resolution, and the immutable activation manifest. It must not grant general `$HOME`, package-manager, shell, service-control, credential, or repository mutation authority.
 
 ## Authority boundary
 
