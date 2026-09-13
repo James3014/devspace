@@ -57,6 +57,7 @@ interface PersistedRequest {
   sourceCarrierFingerprint: string;
   targetCarrierFingerprint: string;
   checkpointHash: string;
+  ttlSeconds: number;
   requestedAt: string;
   expiresAt: string;
 }
@@ -115,11 +116,22 @@ export class ChatSwarmContinuationStore {
         authenticatedTargetCarrierFingerprint,
       );
       this.assertTargetCarrierAvailable(authenticatedTargetCarrierFingerprint, input.workerId);
+      const requestHash = createHash("sha256").update(JSON.stringify({
+        attemptKey: input.attemptKey,
+        checkpointHash: material.checkpointHash,
+        sourceCarrierFingerprint: material.sourceCarrierFingerprint,
+        sourceEpoch: material.sourceEpoch,
+        swarmId: input.swarmId,
+        targetCarrierFingerprint: material.targetCarrierFingerprint,
+        targetEpoch: material.targetEpoch,
+        ttlSeconds,
+        workerId: input.workerId,
+      })).digest("hex");
 
       const durableAttemptKey = stableAttemptKey(input.swarmId, input.workerId, input.attemptKey);
       const existing = this.getDurableByAttempt(durableAttemptKey);
       if (existing) {
-        if (existing.kind !== KIND || existing.request_hash !== material.requestHash) {
+        if (existing.kind !== KIND || existing.request_hash !== requestHash) {
           throw new ChatSwarmError("REPLAY_CONFLICT", "continuation attemptKey is bound to different material");
         }
         return { request: this.toRequest(existing), created: false };
@@ -145,6 +157,7 @@ export class ChatSwarmContinuationStore {
         sourceCarrierFingerprint: material.sourceCarrierFingerprint,
         targetCarrierFingerprint: material.targetCarrierFingerprint,
         checkpointHash: material.checkpointHash,
+        ttlSeconds,
         requestedAt,
         expiresAt,
       };
@@ -158,7 +171,7 @@ export class ChatSwarmContinuationStore {
       `).run(
         operationId,
         durableAttemptKey,
-        material.requestHash,
+        requestHash,
         KIND,
         "OWNER_DIRECT",
         this.scopeRoot,
@@ -537,6 +550,12 @@ export class ChatSwarmContinuationStore {
       throw new ChatSwarmError("INVALID_STATE", "durable continuation operation authority is malformed");
     }
     const persisted = readPersistedRequest(row);
+    if (row.scope_root !== this.scopeRoot) {
+      throw new ChatSwarmError("INVALID_STATE", "durable continuation scope root mismatch");
+    }
+    if (stableAttemptKey(persisted.swarmId, persisted.workerId, persisted.attemptKey) !== row.attempt_key) {
+      throw new ChatSwarmError("INVALID_STATE", "persisted continuation attempt identity mismatch");
+    }
     const requestHash = continuationMaterialHash(persisted);
     if (requestHash !== row.request_hash) {
       throw new ChatSwarmError("INVALID_STATE", "persisted continuation request hash mismatch");
@@ -579,6 +598,7 @@ export class ChatSwarmContinuationStore {
       sourceCarrierFingerprint: persisted.sourceCarrierFingerprint,
       targetCarrierFingerprint: persisted.targetCarrierFingerprint,
       checkpointHash: persisted.checkpointHash,
+      ttlSeconds: persisted.ttlSeconds,
       version: persisted.version,
       status,
       requestedAt: persisted.requestedAt,
@@ -600,12 +620,14 @@ function stableAttemptKey(swarmId: string, workerId: string, attemptKey: string)
 
 function continuationMaterialHash(request: PersistedRequest): string {
   return createHash("sha256").update(JSON.stringify({
+    attemptKey: request.attemptKey,
     checkpointHash: request.checkpointHash,
     sourceCarrierFingerprint: request.sourceCarrierFingerprint,
     sourceEpoch: request.sourceEpoch,
     swarmId: request.swarmId,
     targetCarrierFingerprint: request.targetCarrierFingerprint,
     targetEpoch: request.targetEpoch,
+    ttlSeconds: request.ttlSeconds,
     workerId: request.workerId,
   })).digest("hex");
 }
@@ -625,6 +647,7 @@ function persistedFromRequest(
     sourceCarrierFingerprint: request.sourceCarrierFingerprint,
     targetCarrierFingerprint: request.targetCarrierFingerprint,
     checkpointHash: request.checkpointHash,
+    ttlSeconds: request.ttlSeconds,
     requestedAt: request.requestedAt,
     expiresAt: request.expiresAt,
   };
@@ -648,6 +671,9 @@ function validatePersistedRequest(request: PersistedRequest): void {
   if (!Number.isSafeInteger(request.version) || request.version < 1) {
     throw new ChatSwarmError("INVALID_STATE", "persisted continuation request version is malformed");
   }
+  if (!Number.isInteger(request.ttlSeconds) || request.ttlSeconds < 1 || request.ttlSeconds > MAX_TTL_SECONDS) {
+    throw new ChatSwarmError("INVALID_STATE", "persisted continuation ttl is malformed");
+  }
   for (const [label, value] of [
     ["source carrier fingerprint", request.sourceCarrierFingerprint],
     ["target carrier fingerprint", request.targetCarrierFingerprint],
@@ -663,8 +689,13 @@ function validatePersistedRequest(request: PersistedRequest): void {
   if (!request.swarmId || !request.workerId || !request.attemptKey) {
     throw new ChatSwarmError("INVALID_STATE", "persisted continuation identity is incomplete");
   }
-  if (!Number.isFinite(Date.parse(request.requestedAt)) || !Number.isFinite(Date.parse(request.expiresAt))) {
+  const requestedMs = Date.parse(request.requestedAt);
+  const expiresMs = Date.parse(request.expiresAt);
+  if (!Number.isFinite(requestedMs) || !Number.isFinite(expiresMs)) {
     throw new ChatSwarmError("INVALID_STATE", "persisted continuation timestamps are malformed");
+  }
+  if (expiresMs - requestedMs !== request.ttlSeconds * 1000) {
+    throw new ChatSwarmError("INVALID_STATE", "persisted continuation expiry does not match ttl");
   }
 }
 
