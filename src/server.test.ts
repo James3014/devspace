@@ -1453,6 +1453,74 @@ test("subagents: controller dispatchIntent crosses the MCP schema without gainin
   assert.equal(invalidClaim.isError, true);
 });
 
+test("subagents: write-capable direct dispatch requires capability discovery before launch", async (t) => {
+  const context = await fixture(t, {
+    git: true,
+    subagents: { enabled: true, providers: [{ id: "codex", enabled: true }] },
+  });
+  const openResult = await callOpen(context.client, context.project, "chat-capability-discovery-required");
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+  const intent = {
+    taskId: "task-discovery-required",
+    attemptId: "attempt-discovery-required",
+    objective: "Perform one bounded implementation only after existing capability discovery.",
+    roleIntent: "DEEP_ENGINEERING",
+    readScope: ["src"],
+    writeScope: ["src"],
+    exclusiveOwnership: true,
+    acceptanceCriteria: ["Mutation never starts without a current discovery receipt."],
+    verificationRequired: true,
+    claimCeiling: "CANDIDATE_READY",
+  };
+
+  const missing = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      provider: "codex",
+      model: "gpt-test",
+      prompt: "must not launch",
+      attemptKey: intent.attemptId,
+      executionContract: { dispatchIntent: intent, writePaths: ["src"] },
+    },
+  });
+  assert.equal(missing.isError, true);
+  assert.match(responseText(missing), /CAPABILITY_DISCOVERY_REQUIRED/i);
+
+  const blocked = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      provider: "codex",
+      model: "gpt-test",
+      prompt: "must still not launch",
+      attemptKey: "attempt-discovery-blocked",
+      executionContract: {
+        dispatchIntent: { ...intent, attemptId: "attempt-discovery-blocked" },
+        writePaths: ["src"],
+        capabilityDiscovery: {
+          schema: "nexus.capability_discovery_receipt.v1",
+          repository: "James3014/Nexus-new",
+          indexRevision: "a".repeat(40),
+          indexPath: "docs/agents/CAPABILITY_DISCOVERY_INDEX.v1.json",
+          indexSha256: "b".repeat(64),
+          intent: "Discovery is incomplete.",
+          disposition: "BLOCKED_UNKNOWN",
+          matchedCapabilityIds: [],
+          evidence: {
+            architecture: ["searched architecture"],
+            source: ["searched source"],
+            history: ["searched history"],
+            runtime: ["searched runtime"],
+          },
+        },
+      },
+    },
+  });
+  assert.equal(blocked.isError, true);
+  assert.match(responseText(blocked), /BLOCKED_UNKNOWN|complete discovery/i);
+});
+
 test("subagents: NEXUS_GOVERNED fails closed at the MCP boundary without complete canonical grant evidence", async (t) => {
   const context = await fixture(t, { git: true, subagents: true });
   const openResult = await callOpen(context.client, context.project, "chat-nexus-governed-missing-grant");
