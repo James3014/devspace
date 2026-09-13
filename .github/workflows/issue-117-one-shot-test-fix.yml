@@ -1,0 +1,49 @@
+name: Issue 117 one-shot stale test fix
+
+on:
+  push:
+    branches:
+      - codex/issue-117-zero-touch-runtime-g1
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.event.head_commit.message == 'chore(issue-117): install one-shot stale-test patcher'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout exact issue branch
+        uses: actions/checkout@v4
+        with:
+          ref: codex/issue-117-zero-touch-runtime-g1
+          fetch-depth: 0
+
+      - name: Replace the one stale tool-count assertion
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('src/server.test.ts')
+          text = path.read_text()
+          old = '  assert.equal(swarmTools.length, 15);\n'
+          new = '  assert.equal(swarmTools.length, 21);\n'
+          count = text.count(old)
+          if count != 1:
+              raise SystemExit(f'expected exactly one stale assertion, observed {count}')
+          path.write_text(text.replace(old, new, 1))
+          PY
+          git diff --check
+          git diff -- src/server.test.ts
+
+      - name: Commit bounded repair and remove this one-shot workflow
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/workflows/issue-117-one-shot-test-fix.yml
+          git add src/server.test.ts
+          git diff --cached --check
+          git commit -m 'test(chat-swarm): account for managed runtime tools'
+          git push origin HEAD:codex/issue-117-zero-touch-runtime-g1
