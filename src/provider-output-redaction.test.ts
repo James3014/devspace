@@ -18,15 +18,24 @@ const secret = "synthetic-secret-value-9f3a";
 
 type FailureMode = "malformed" | "eof" | "nonzero" | "fatal" | "cancel";
 
+function createFixtureCommand(root: string, name: string, source: string): string {
+  const script = join(root, `${name}.js`);
+  writeFileSync(script, `#!${process.execPath}\n${source}`, { mode: 0o700 });
+  chmodSync(script, 0o700);
+  if (process.platform !== "win32") return script;
+  const command = join(root, `${name}.cmd`);
+  const quotePath = (value: string) => `"${value.replaceAll("%", "%%").replaceAll('"', '""')}"`;
+  writeFileSync(command, `@echo off\r\n${quotePath(process.execPath)} ${quotePath(script)} %*\r\n`, { mode: 0o700 });
+  return command;
+}
+
 async function runtimeFor(provider: LocalAgentProvider, root: string, failure?: FailureMode): Promise<LocalAgentRuntime> {
   if (provider === "agy") {
     const scratch = createProviderScratch(`redaction-${process.pid}`);
     const originalHome = join(root, "original-home");
     mkdirSync(join(originalHome, ".gemini", "antigravity-cli", "conversations"), { recursive: true });
     writeFileSync(join(originalHome, ".gemini", "antigravity-cli", "antigravity-oauth-token"), "fixture-token");
-    const command = join(root, "fake-agy.js");
-    writeFileSync(command, `#!${process.execPath}\nprocess.stderr.write("diagnostic Bearer synthetic-secret-value-9f3a\\n");\n${failure === "nonzero" ? "process.exit(7);" : failure === "malformed" ? "console.log(\"{malformed\");" : failure === "eof" ? "process.stdout.write(JSON.stringify({status:\"SUCCESS\",conversation_id:\"agy-session\",response:\"token=synthetic-secret-value-9f3a\"}).slice(0,-2));" : "console.log(JSON.stringify({status:\"SUCCESS\",conversation_id:\"agy-session\",response:\"done Bearer synthetic-secret-value-9f3a\"}));"}\n`, { mode: 0o700 });
-    chmodSync(command, 0o700);
+    const command = createFixtureCommand(root, "fake-agy", `process.stderr.write("diagnostic Bearer synthetic-secret-value-9f3a\\n");\n${failure === "nonzero" ? "process.exit(7);" : failure === "malformed" ? "console.log(\"{malformed\");" : failure === "eof" ? "process.stdout.write(JSON.stringify({status:\"SUCCESS\",conversation_id:\"agy-session\",response:\"token=synthetic-secret-value-9f3a\"}).slice(0,-2));" : "console.log(JSON.stringify({status:\"SUCCESS\",conversation_id:\"agy-session\",response:\"done Bearer synthetic-secret-value-9f3a\"}));"}\n`);
     const adapter = createLocalAgentAdapter("agy");
     return { provider: "agy", isAlive: () => true, releaseSession: async () => {}, close: async () => { cleanupProviderScratch(scratch.root); }, run: async (input, callbacks) => Result.ok(await adapter.run({ ...input, environment: { ...input.environment, HOME: originalHome, AGY_COMMAND: command, DEVSPACE_PROVIDER_SCRATCH: scratch.root } }, callbacks)) };
   }
@@ -39,9 +48,7 @@ async function runtimeFor(provider: LocalAgentProvider, root: string, failure?: 
     const client = { v2: { health: { async get() { return { data: { healthy: true } }; } }, session: { async create() { return { data: { data: { id: "opencode-session" } } }; }, async switchAgent() {}, async switchModel() {}, async get() { return { data: { data: {} } }; }, async prompt() { return { data: { data: { id: "opencode-prompt" } } }; }, async wait() {}, async messages() { return { data: { data: [{ type: "user", id: "opencode-prompt" }, { info: { role: "assistant", finish: "stop" }, parts: [{ type: "text", text: "done Bearer synthetic-secret-value-9f3a" }] }] } }; } } } } as unknown as OpencodeClientLike;
     return new OpencodeRuntime(client, { close() {} });
   }
-  const command = join(root, "fake-codex.js");
-  writeFileSync(command, `#!/usr/bin/env node\nimport { writeFileSync } from "node:fs"; import readline from "node:readline"; const out=v=>{const b=Buffer.from(JSON.stringify(v)+"\\n"); for(let i=0;i<b.length;i+=3) process.stdout.write(b.subarray(i,i+3));}; readline.createInterface({input:process.stdin}).on("line",line=>{const m=JSON.parse(line); if(m.method==="initialize") return out({id:m.id,result:{}}); if(m.method==="thread/start") return out({id:m.id,result:{thread:{id:"codex-session"}}}); if(m.method==="turn/start"){process.stderr.write("diagnostic Bearer syn"); process.stderr.write("thetic-secret-value-9f3a\\n"); out({id:m.id,result:{turn:{id:"turn-1"}}}); ${failure === "cancel" ? `writeFileSync(${JSON.stringify(join(root, "READY"))}, "ready"); setTimeout(() => process.exit(0), 8000);` : `setImmediate(()=>{${failure ? "out({method:\"turn/completed\",params:{threadId:m.params.threadId,turn:{id:\"turn-1\",status:\"failed\",error:{message:\"provider failed Bearer synthetic-secret-value-9f3a\"}}}});" : "const item={type:\"agentMessage\",text:\"done Bearer synthetic-secret-value-9f3a\"}; out({method:\"item/completed\",params:{threadId:m.params.threadId,turnId:\"turn-1\",item}}); out({method:\"turn/completed\",params:{threadId:m.params.threadId,turn:{id:\"turn-1\",status:\"completed\",items:[item]}}});"}});`}}});\n`, { mode: 0o700 });
-  chmodSync(command, 0o700);
+  const command = createFixtureCommand(root, "fake-codex", `import { writeFileSync } from "node:fs"; import readline from "node:readline"; const out=v=>{const b=Buffer.from(JSON.stringify(v)+"\\n"); for(let i=0;i<b.length;i+=3) process.stdout.write(b.subarray(i,i+3));}; readline.createInterface({input:process.stdin}).on("line",line=>{const m=JSON.parse(line); if(m.method==="initialize") return out({id:m.id,result:{}}); if(m.method==="thread/start") return out({id:m.id,result:{thread:{id:"codex-session"}}}); if(m.method==="turn/start"){process.stderr.write("diagnostic Bearer syn"); process.stderr.write("thetic-secret-value-9f3a\\n"); out({id:m.id,result:{turn:{id:"turn-1"}}}); ${failure === "cancel" ? `writeFileSync(${JSON.stringify(join(root, "READY"))}, "ready"); setTimeout(() => process.exit(0), 8000);` : `setImmediate(()=>{${failure ? "out({method:\"turn/completed\",params:{threadId:m.params.threadId,turn:{id:\"turn-1\",status:\"failed\",error:{message:\"provider failed Bearer synthetic-secret-value-9f3a\"}}}});" : "const item={type:\"agentMessage\",text:\"done Bearer synthetic-secret-value-9f3a\"}; out({method:\"item/completed\",params:{threadId:m.params.threadId,turnId:\"turn-1\",item}}); out({method:\"turn/completed\",params:{threadId:m.params.threadId,turn:{id:\"turn-1\",status:\"completed\",items:[item]}}});"}});`}}});\n`);
   const runtime = new CodexAppServerRuntime({ command, env: process.env });
   await runtime.initialize();
   return runtime;
