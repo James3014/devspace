@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import "./chat-swarm-auto-compact.test.js";
 import "./chat-swarm-continuation-coordinator.test.js";
 import "./chat-swarm-continuation-corruption-fence.test.js";
 import "./chat-swarm-continuation-restart-fence.test.js";
