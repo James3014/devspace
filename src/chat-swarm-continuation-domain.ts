@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto";
 import {
   canonicalize,
   ChatSwarmError,
@@ -22,7 +21,6 @@ export interface WorkerContinuationSnapshot {
 }
 
 export interface PreparedContinuationMaterial {
-  requestHash: string;
   sourceEpoch: number;
   targetEpoch: number;
   sourceCarrierFingerprint: string;
@@ -62,20 +60,8 @@ export function prepareContinuationMaterial(
   const checkpointJson = JSON.stringify(canonicalize(worker.checkpoint));
   const checkpointHash = hashContent(checkpointJson);
   const targetEpoch = input.sourceEpoch + 1;
-  const requestHash = createHash("sha256")
-    .update(JSON.stringify(canonicalize({
-      swarmId: input.swarmId,
-      workerId: input.workerId,
-      sourceEpoch: input.sourceEpoch,
-      targetEpoch,
-      sourceCarrierFingerprint,
-      targetCarrierFingerprint,
-      checkpointHash,
-    })))
-    .digest("hex");
 
   return {
-    requestHash,
     sourceEpoch: input.sourceEpoch,
     targetEpoch,
     sourceCarrierFingerprint,
