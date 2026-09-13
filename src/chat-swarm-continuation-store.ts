@@ -339,6 +339,12 @@ export class ChatSwarmContinuationStore {
       `).all(KIND, this.scopeRoot) as DurableRow[];
       let changed = 0;
       for (const row of rows) {
+        const persisted = readPersistedRequest(row);
+        if (Date.parse(persisted.expiresAt) <= Date.parse(now)) {
+          this.persistExpired(row.operation_id, now);
+          changed += 1;
+          continue;
+        }
         if (row.status === "outcome_unknown" && row.error_message === CONTINUATION_RESTART_MESSAGE) {
           continue;
         }
@@ -378,14 +384,14 @@ export class ChatSwarmContinuationStore {
       if (String(swarm.owner_identity_fingerprint) !== ownerIdentityFingerprint) {
         throw new ChatSwarmError("OWNERSHIP_CONFLICT", "controller identity does not own swarm");
       }
-      const worker = this.workerSnapshot(request.workerId);
-      const pendingView: ChatSwarmContinuationRequest = { ...request, status: "PENDING" };
-      assertContinuationCommitAllowed(worker, pendingView);
       const now = this.nowIso();
       if (Date.parse(request.expiresAt) <= Date.parse(now)) {
         this.persistExpired(request.id, now);
         return { ok: false, code: "EXPIRED", message: "continuation request expired during reconciliation" };
       }
+      const worker = this.workerSnapshot(request.workerId);
+      const pendingView: ChatSwarmContinuationRequest = { ...request, status: "PENDING" };
+      assertContinuationCommitAllowed(worker, pendingView);
       const nextRequest = persistedFromRequest(request, request.version + 1);
       const result = this.database.sqlite.prepare(`
         update durable_operations
