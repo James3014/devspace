@@ -25,6 +25,8 @@ const SHA256 = /^[0-9a-f]{64}$/;
 const DEFAULT_TTL_SECONDS = 15 * 60;
 const MAX_TTL_SECONDS = 60 * 60;
 const MAX_PENDING_PER_WORKER = 10;
+const CONTINUATION_RESTART_MESSAGE =
+  "DevSpace restarted while continuation was pending; reconcile exact binding before approval.";
 
 type Row = Record<string, unknown>;
 
@@ -331,22 +333,32 @@ export class ChatSwarmContinuationStore {
   recoverAfterRestart(): number {
     const now = this.nowIso();
     const tx = this.database.sqlite.transaction(() => {
-      const rows = this.database.sqlite.prepare(
-        "select * from durable_operations where kind=? and scope_root=? and status='started'",
-      ).all(KIND, this.scopeRoot) as DurableRow[];
+      const rows = this.database.sqlite.prepare(`
+        select * from durable_operations
+        where kind=? and scope_root=? and status in ('started','outcome_unknown')
+      `).all(KIND, this.scopeRoot) as DurableRow[];
+      let changed = 0;
       for (const row of rows) {
+        if (row.status === "outcome_unknown" && row.error_message === CONTINUATION_RESTART_MESSAGE) {
+          continue;
+        }
         const request = this.toRequest(row);
         const nextRequest = persistedFromRequest(request, request.version + 1);
-        this.database.sqlite.prepare(`
+        const result = this.database.sqlite.prepare(`
           update durable_operations
           set status='outcome_unknown',retry_safe='false',request_json=?,
-              error_code='RECONCILIATION_REQUIRED',
-              error_message='DevSpace restarted while continuation was pending; reconcile exact binding before approval.',
-              updated_at=?
-          where operation_id=? and kind=? and status='started'
-        `).run(JSON.stringify(nextRequest), now, row.operation_id, KIND);
+              error_code='RECONCILIATION_REQUIRED',error_message=?,updated_at=?
+          where operation_id=? and kind=? and status in ('started','outcome_unknown')
+        `).run(
+          JSON.stringify(nextRequest),
+          CONTINUATION_RESTART_MESSAGE,
+          now,
+          row.operation_id,
+          KIND,
+        );
+        changed += Number(result.changes);
       }
-      return rows.length;
+      return changed;
     });
     return tx.immediate();
   }
