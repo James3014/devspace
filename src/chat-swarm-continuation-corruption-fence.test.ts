@@ -64,7 +64,10 @@ test("corrupt pending continuation identity fences all new continuation work", (
       }),
       (error: unknown) => error instanceof ChatSwarmError && error.code === "INVALID_STATE",
     );
-    assert.equal(continuation.getLatestForTarget(swarm.id, targetB), undefined);
+    assert.throws(
+      () => continuation.getLatestForTarget(swarm.id, targetB),
+      (error: unknown) => error instanceof ChatSwarmError && error.code === "INVALID_STATE",
+    );
     assert.equal(swarmStore.getWorker(worker.id)?.continuationEpoch, 0);
   } finally {
     continuation.close();
