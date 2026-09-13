@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { createHash } from "node:crypto";
+import { resolveClineExecutable } from "./local-agent-availability.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -265,7 +266,8 @@ export class ClineCatalogService {
   private async doRefresh(): Promise<ClineCatalogSnapshot> {
     let runtime: ClineRuntimeIdentity;
     try {
-      runtime = this.options.probeRuntime ? await this.options.probeRuntime() : await probeClineRuntime(this.options.command);
+      const command = this.options.command ?? resolveClineExecutable() ?? "cline";
+      runtime = this.options.probeRuntime ? await this.options.probeRuntime() : await probeClineRuntime(command);
     } catch (error) {
       this.snapshot = this.failedSnapshot(UNKNOWN_RUNTIME, error instanceof Error ? error.message : "Cline runtime probe failed.");
       return this.snapshot;

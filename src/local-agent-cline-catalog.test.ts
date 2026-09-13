@@ -69,6 +69,25 @@ assert.equal(missingFeed.getSnapshot().source, "cli-capability");
 const unsupported = new ClineCatalogService({ probeRuntime: async () => ({ ...runtime, supportsModelFlag: false }) });
 assert.equal((await unsupported.refresh()).state, "BLOCKED");
 
+const previousClineCommand = process.env.CLINE_COMMAND;
+try {
+  process.env.CLINE_COMMAND = process.execPath;
+  const resolvedCommandService = new ClineCatalogService({
+    endpoint: "fixture",
+    fetchCatalog: async () => ({ status: 200, json: async () => feed }),
+  });
+  const resolvedCommandSnapshot = await resolvedCommandService.refresh();
+  assert.equal(
+    resolvedCommandSnapshot.runtime.command,
+    process.execPath,
+    "catalog runtime probe must use the shared Cline executable resolver",
+  );
+  assert.equal(resolvedCommandSnapshot.state, "BLOCKED", "node is not a Cline runtime; this fixture only proves executable resolution");
+} finally {
+  if (previousClineCommand === undefined) delete process.env.CLINE_COMMAND;
+  else process.env.CLINE_COMMAND = previousClineCommand;
+}
+
 const malformed = new ClineCatalogService({ endpoint: "fixture", probeRuntime: async () => runtime, fetchCatalog: async () => ({ status: 200, json: async () => ({ data: [{ id: "bad" }] }) }) });
 assert.equal((await malformed.refresh()).state, "BLOCKED");
 
