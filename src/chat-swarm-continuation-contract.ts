@@ -2,6 +2,7 @@ export const CHAT_SWARM_CONTINUATION_STATES = [
   "PENDING",
   "APPROVED",
   "EXPIRED",
+  "SUPERSEDED",
   "RECONCILE_REQUIRED",
 ] as const;
 
