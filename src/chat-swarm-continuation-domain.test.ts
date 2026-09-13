@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import "./chat-swarm-continuation-coordinator.test.js";
 import { ChatSwarmError } from "./chat-swarm-contract.js";
 import {
   assertContinuationCommitAllowed,
