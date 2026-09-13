@@ -46,6 +46,7 @@ function request(overrides: Partial<ChatSwarmContinuationRequest> = {}): ChatSwa
     sourceCarrierFingerprint: material.sourceCarrierFingerprint,
     targetCarrierFingerprint: material.targetCarrierFingerprint,
     checkpointHash: material.checkpointHash,
+    ttlSeconds: 15 * 60,
     version: 1,
     status: "PENDING",
     requestedAt: "2026-09-13T00:00:00.000Z",
