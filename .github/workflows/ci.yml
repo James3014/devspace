@@ -11,6 +11,21 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  diff-check:
+    name: Diff check (PR)
+    if: github.event_name == 'pull_request'
+    runs-on: macos-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Git diff check
+        run: git diff --check "${{ github.event.pull_request.base.sha }}...HEAD"
+
   smoke:
     name: Smoke (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -63,6 +78,45 @@ jobs:
 
       - name: Doctor
         run: node dist/cli.js doctor
+
+  chat-swarm-continuation:
+    name: Chat Swarm continuation ${{ matrix.name }} (macOS)
+    runs-on: macos-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: coordinator
+            file: src/chat-swarm-continuation-coordinator.test.ts
+          - name: durable-store
+            file: src/chat-swarm-continuation-store.test.ts
+          - name: restart-fence
+            file: src/chat-swarm-continuation-restart-fence.test.ts
+          - name: retired-carrier
+            file: src/chat-swarm-continuation-stale-carrier.test.ts
+          - name: terminal-replay
+            file: src/chat-swarm-continuation-terminal-replay.test.ts
+          - name: corruption-fence
+            file: src/chat-swarm-continuation-corruption-fence.test.ts
+          - name: aggregate-domain
+            file: src/chat-swarm-continuation-domain.test.ts
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run focused continuation test
+        run: npx tsx ${{ matrix.file }}
 
   local-agent-sessions:
     name: Local agent sessions (macOS)
