@@ -6,6 +6,7 @@ import { ChatSwarmCoordinator } from "./chat-swarm-coordinator.js";
 import { ChatSwarmIdentityError } from "./request-meta.js";
 import type { ServerConfig } from "./config.js";
 import { ChatSwarmRuntimeManager } from "./chat-swarm-runtime.js";
+import { wakeManagedDispatchedTask } from "./chat-swarm-runtime-delivery.js";
 import {
   chatSwarmRuntimeToolInputShapes,
   registerChatSwarmRuntimeTools,
@@ -267,7 +268,7 @@ export function registerChatSwarmTools(
       if (runtimeFactory) {
         try {
           const runtime = runtimeFactory();
-          try { await runtime.wakeForDispatchedTask(meta(extra), task); }
+          try { await wakeManagedDispatchedTask(runtime, meta(extra), task); }
           finally { runtime.close(); }
         } catch {
           // Task truth is already durable. Wake is only a delivery hint and cannot fail dispatch.
