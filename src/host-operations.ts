@@ -1,9 +1,23 @@
+import { createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { execFileSync } from "node:child_process";
 import { terminateProcessTree } from "./process-platform.js";
 import { redactSensitiveText } from "./local-agent-errors.js";
 import type { DurableOperationRecord, DurableOperationStore } from "./durable-operations.js";
 import { bindHostOperation, prepareHostOperationSandbox, type HostOperationPolicy, type HostOperationRequest, type BoundHostOperation } from "./host-operation-policy.js";
+import {
+  bindHostActivation,
+  hostActivationManifestPathFromArgv,
+  preflightHostActivation,
+  reconcileHostActivation,
+  type BoundHostActivation,
+  type HostActivationClassification,
+  type HostActivationObservation,
+} from "./host-activation.js";
+
+export type HostOperationObservedPaths =
+  | { status: "not_collected" }
+  | { status: "collected"; activation: HostActivationObservation };
 
 export interface HostOperationReceipt {
   operationId: string;
@@ -21,7 +35,7 @@ export interface HostOperationReceipt {
   repository?: { preHead?: string; preDirty?: boolean; postHead?: string; postDirty?: boolean };
   effectTarget: "HOST_OPERATION";
   executor: { kind: "devspace_host_executor"; pid: number; provider: null; model: null; profile: null; session: null };
-  observedPaths: { status: "not_collected" };
+  observedPaths: HostOperationObservedPaths;
 }
 
 export class HostOperationError extends Error {
@@ -45,30 +59,78 @@ export class HostOperationRegistrar {
 
   async preflight(input: Omit<HostOperationRequest, "clientId">, ownerClientId: string): Promise<Record<string, unknown>> {
     const bound = await this.bind(input, ownerClientId);
-    return { status: "ready", operationId: bound.operationId, requestHash: bound.requestHash, executable: bound.request.executablePath, argvFingerprint: bound.argvFingerprint, allowedPaths: bound.request.allowedPaths.write, network: "none", limits: bound.limits };
+    const activation = await this.bindActivation(bound);
+    const requestHash = activationRequestHash(bound.requestHash, activation);
+    const activationObservation = activation ? await preflightHostActivation(activation) : undefined;
+    return {
+      status: activationObservation && activationObservation.classification !== "CONFIRMED_NO_EFFECT" ? "blocked" : "ready",
+      operationId: bound.operationId,
+      requestHash,
+      executable: bound.request.executablePath,
+      argvFingerprint: bound.argvFingerprint,
+      allowedPaths: bound.request.allowedPaths.write,
+      network: "none",
+      limits: bound.limits,
+      ...(activation ? { activation: { binding: activation, observation: activationObservation } } : {}),
+    };
   }
 
   async start(input: Omit<HostOperationRequest, "clientId">, ownerClientId: string): Promise<DurableOperationRecord> {
     if (this.disposed) throw new HostOperationError("HOST_OPERATION_DISABLED", "Host operation registrar is shut down.");
     const bound = await this.bind(input, ownerClientId);
+    const activation = await this.bindActivation(bound);
     if (this.disposed) throw new HostOperationError("HOST_OPERATION_DISABLED", "Host operation registrar is shut down.");
-    const operation = this.store.createOrReplay({ operationId: bound.operationId, attemptKey: input.attemptKey, requestHash: bound.requestHash, kind: "host_operation", authorityMode: "OWNER_DIRECT", scopeRoot: bound.scopeRoot, request: bound.request as unknown as Record<string, unknown> });
+    const requestHash = activationRequestHash(bound.requestHash, activation);
+    const durableRequest = activation
+      ? { ...bound.request, activation, hostBinding: { executableSha256: bound.executableSha256, argvFingerprint: bound.argvFingerprint } }
+      : bound.request;
+    const operation = this.store.createOrReplay({ operationId: bound.operationId, attemptKey: input.attemptKey, requestHash, kind: "host_operation", authorityMode: "OWNER_DIRECT", scopeRoot: bound.scopeRoot, request: durableRequest as unknown as Record<string, unknown> });
     if (!operation.created) {
       if (operation.record.status === "succeeded" || operation.record.status === "failed") return operation.record;
       const inFlight = this.inFlight.get(operation.record.operationId);
       if (inFlight) return inFlight;
       throw new HostOperationError("HOST_OPERATION_RECONCILIATION_REQUIRED", `Host operation ${operation.record.operationId} requires reconciliation before retry.`);
     }
+
+    if (activation) {
+      const before = await preflightHostActivation(activation);
+      const allPre = before.targets.every((target) => target.state === "preimage");
+      if (!allPre) {
+        const classification: HostActivationClassification = before.classification === "PARTIAL_EFFECT"
+          ? "PARTIAL_EFFECT"
+          : before.classification === "BLOCKED_PREIMAGE_DRIFT"
+            ? "BLOCKED_PREIMAGE_DRIFT"
+            : "EFFECT_UNKNOWN";
+        return this.finishActivation(bound.operationId, operation.record, activationReceipt(bound, { ...before, classification, changedByOperation: false }));
+      }
+    }
+
     const work = (async () => {
       let receipt: HostOperationReceipt;
       try {
-        receipt = await this.execute(bound);
+        receipt = await this.execute(bound, activation);
       } catch (error) {
+        if (activation) {
+          try {
+            const observed = await reconcileHostActivation(activation, bound.operationId);
+            return this.finishActivation(bound.operationId, this.require(bound.operationId), activationReceipt(bound, observed), error instanceof Error ? error.message : String(error));
+          } catch (reconcileError) {
+            return this.store.finishHostOperation(bound.operationId, { status: "outcome_unknown", retrySafe: false, errorCode: "RECONCILIATION_REQUIRED", errorMessage: reconcileError instanceof Error ? reconcileError.message : String(reconcileError) });
+          }
+        }
         return this.store.finishHostOperation(bound.operationId, { status: "outcome_unknown", retrySafe: false, errorCode: "RECONCILIATION_REQUIRED", errorMessage: error instanceof Error ? error.message : String(error) });
       }
       if (receipt.outcome === "running") {
         this.store.recordHostOperationReceipt(bound.operationId, receipt as unknown as Record<string, unknown>);
         return this.require(bound.operationId);
+      }
+      if (activation) {
+        try {
+          const observed = await reconcileHostActivation(activation, bound.operationId);
+          return this.finishActivation(bound.operationId, this.require(bound.operationId), { ...receipt, observedPaths: { status: "collected", activation: observed }, outcome: activationOutcome(observed.classification), reconciliation: "complete" });
+        } catch (error) {
+          return this.store.finishHostOperation(bound.operationId, { status: "outcome_unknown", retrySafe: false, errorCode: "RECONCILIATION_REQUIRED", errorMessage: error instanceof Error ? error.message : String(error), receipt: receipt as unknown as Record<string, unknown> });
+        }
       }
       return this.store.finishHostOperation(bound.operationId, { status: receipt.outcome === "succeeded" ? "succeeded" : "failed", retrySafe: false, receipt: receipt as unknown as Record<string, unknown> });
     })();
@@ -109,9 +171,22 @@ export class HostOperationRegistrar {
   async reconcile(operationId: string, ownerClientId: string): Promise<DurableOperationRecord> {
     const record = this.requireOwned(operationId, ownerClientId);
     if (record.kind !== "host_operation") throw new HostOperationError("HOST_OPERATION_INVALID", "Operation is not a host operation.");
+    if (record.status === "succeeded" || record.status === "failed") return record;
+    const activation = activationBindingFromRecord(record);
     if (record.status === "started") {
       const owned = this.processes.get(operationId);
       if (owned && await this.isSameProcess(owned)) return record;
+    }
+    if (activation) {
+      try {
+        const observed = await reconcileHostActivation(activation, operationId);
+        const receipt = activationReceiptFromRecord(record, observed);
+        return this.finishActivation(operationId, record, receipt);
+      } catch (error) {
+        return this.finishUnknown(record, error instanceof Error ? error.message : String(error));
+      }
+    }
+    if (record.status === "started") {
       // A replacement registrar has no live ChildProcess ownership. Persisted
       // PID/start/group data is diagnostic only and cannot authorize adoption
       // or cancellation after restart.
@@ -155,12 +230,45 @@ export class HostOperationRegistrar {
     return bindHostOperation(this.policy, { ...input, clientId: ownerClientId }, ownerClientId);
   }
 
-  private async execute(bound: BoundHostOperation): Promise<HostOperationReceipt> {
+  private async bindActivation(bound: BoundHostOperation): Promise<BoundHostActivation | undefined> {
+    const manifestPath = hostActivationManifestPathFromArgv(bound.request.argv);
+    if (!manifestPath) return undefined;
+    if (bound.request.allowLongLivedProcess) throw new HostOperationError("HOST_OPERATION_INVALID", "Host activation operations cannot be long-lived.");
+    try {
+      return await bindHostActivation(manifestPath, bound.request.allowedPaths.write, bound.request.allowedPaths.read ?? []);
+    } catch (error) {
+      throw new HostOperationError("HOST_OPERATION_INVALID", error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  private finishActivation(operationId: string, record: DurableOperationRecord, receipt: HostOperationReceipt, detail?: string): DurableOperationRecord {
+    const classification = receipt.observedPaths.status === "collected" ? receipt.observedPaths.activation.classification : "EFFECT_UNKNOWN";
+    const patch = activationFinishPatch(classification, receipt, detail);
+    if (record.status === "started") return this.store.finishHostOperation(operationId, patch);
+    if (record.status === "outcome_unknown") return this.store.finish(operationId, patch);
+    return record;
+  }
+
+  private finishUnknown(record: DurableOperationRecord, message: string): DurableOperationRecord {
+    const patch = { status: "outcome_unknown" as const, retrySafe: false, errorCode: "RECONCILIATION_REQUIRED", errorMessage: message };
+    return record.status === "started" ? this.store.finishHostOperation(record.operationId, patch) : this.store.finish(record.operationId, patch);
+  }
+
+  private async execute(bound: BoundHostOperation, activation?: BoundHostActivation): Promise<HostOperationReceipt> {
     const wrapped = await this.prepareSandbox(bound);
     if (this.disposed) throw new HostOperationError("HOST_OPERATION_DISABLED", "Host operation registrar is shut down.");
     const repositoryPre = captureRepositoryWitness(bound.request.workspaceRoot);
     const receiptMeta = { effectTarget: "HOST_OPERATION" as const, executor: { kind: "devspace_host_executor" as const, pid: process.pid, provider: null, model: null, profile: null, session: null }, observedPaths: { status: "not_collected" as const } };
-    const child = spawn(wrapped.argv[0]!, wrapped.argv.slice(1), { cwd: bound.request.cwd, env: wrapped.env, shell: false, detached: true, stdio: ["ignore", "pipe", "pipe"] });
+    const env = activation
+      ? {
+        ...wrapped.env,
+        DEVSPACE_HOST_OPERATION_ID: bound.operationId,
+        DEVSPACE_HOST_ACTIVATION_MANIFEST_SHA256: activation.manifestSha256,
+        DEVSPACE_HOST_ACTIVATION_WRITE_PATHS: JSON.stringify(bound.request.allowedPaths.write),
+        DEVSPACE_HOST_ACTIVATION_READ_PATHS: JSON.stringify(bound.request.allowedPaths.read ?? []),
+      }
+      : wrapped.env;
+    const child = spawn(wrapped.argv[0]!, wrapped.argv.slice(1), { cwd: bound.request.cwd, env, shell: false, detached: true, stdio: ["ignore", "pipe", "pipe"] });
     this.pending.add(child);
     child.on("error", () => { /* execute/reconcile reports the durable unknown outcome */ });
     let childExited = false;
@@ -232,6 +340,74 @@ export class HostOperationRegistrar {
       return current.startTime === processInfo.startTime && current.processGroup === processInfo.processGroup && current.command === processInfo.command;
     } catch { return false; }
   }
+}
+
+function activationRequestHash(hostRequestHash: string, activation: BoundHostActivation | undefined): string {
+  if (!activation) return hostRequestHash;
+  return createHash("sha256").update(JSON.stringify({ hostRequestHash, activationManifestSha256: activation.manifestSha256, activationKind: activation.kind })).digest("hex");
+}
+
+function activationBindingFromRecord(record: DurableOperationRecord): BoundHostActivation | undefined {
+  const value = record.request.activation;
+  if (!value || typeof value !== "object") return undefined;
+  const activation = value as Partial<BoundHostActivation>;
+  if (typeof activation.manifestPath !== "string" || typeof activation.manifestSha256 !== "string" || typeof activation.kind !== "string" || typeof activation.receiptDir !== "string" || !Array.isArray(activation.targets)) return undefined;
+  return activation as BoundHostActivation;
+}
+
+function activationReceipt(bound: BoundHostOperation, observed: HostActivationObservation): HostOperationReceipt {
+  return {
+    operationId: bound.operationId,
+    attemptKey: bound.attemptKey,
+    executable: bound.executable,
+    executableSha256: bound.executableSha256,
+    argvFingerprint: bound.argvFingerprint,
+    allowedPaths: [...bound.allowedPaths],
+    network: "none",
+    outcome: activationOutcome(observed.classification),
+    reconciliation: "complete",
+    effectTarget: "HOST_OPERATION",
+    executor: { kind: "devspace_host_executor", pid: process.pid, provider: null, model: null, profile: null, session: null },
+    observedPaths: { status: "collected", activation: observed },
+  };
+}
+
+function activationReceiptFromRecord(record: DurableOperationRecord, observed: HostActivationObservation): HostOperationReceipt {
+  const existing = (record.receipt ?? {}) as Partial<HostOperationReceipt>;
+  const request = record.request as unknown as HostOperationRequest & { hostBinding?: { executableSha256?: string; argvFingerprint?: string } };
+  return {
+    operationId: record.operationId,
+    attemptKey: record.attemptKey,
+    executable: existing.executable ?? request.executablePath,
+    executableSha256: existing.executableSha256 ?? request.hostBinding?.executableSha256 ?? "unknown",
+    argvFingerprint: existing.argvFingerprint ?? request.hostBinding?.argvFingerprint ?? "unknown",
+    allowedPaths: existing.allowedPaths ?? [...(request.allowedPaths?.write ?? [])],
+    network: "none",
+    process: existing.process,
+    outcome: activationOutcome(observed.classification),
+    reconciliation: "complete",
+    exitCode: existing.exitCode,
+    signal: existing.signal,
+    repository: existing.repository,
+    effectTarget: "HOST_OPERATION",
+    executor: existing.executor ?? { kind: "devspace_host_executor", pid: process.pid, provider: null, model: null, profile: null, session: null },
+    observedPaths: { status: "collected", activation: observed },
+  };
+}
+
+function activationOutcome(classification: HostActivationClassification): HostOperationReceipt["outcome"] {
+  if (classification === "APPLIED") return "succeeded";
+  if (classification === "PARTIAL_EFFECT" || classification === "EFFECT_UNKNOWN") return "unknown";
+  return "failed";
+}
+
+function activationFinishPatch(classification: HostActivationClassification, receipt: HostOperationReceipt, detail?: string): Parameters<DurableOperationStore["finish"]>[1] {
+  if (classification === "APPLIED") return { status: "succeeded", retrySafe: false, receipt: receipt as unknown as Record<string, unknown> };
+  if (classification === "PARTIAL_EFFECT" || classification === "EFFECT_UNKNOWN") {
+    return { status: "outcome_unknown", retrySafe: false, errorCode: "RECONCILIATION_REQUIRED", errorMessage: detail ?? `Host activation physical state is ${classification}.`, receipt: receipt as unknown as Record<string, unknown> };
+  }
+  const errorCode = classification === "BLOCKED_PREIMAGE_DRIFT" ? "BLOCKED_PREIMAGE_DRIFT" : classification === "ROLLED_BACK" ? "HOST_ACTIVATION_ROLLED_BACK" : "HOST_ACTIVATION_CONFIRMED_NO_EFFECT";
+  return { status: "failed", retrySafe: false, errorCode, errorMessage: detail ?? `Host activation ended as ${classification}.`, receipt: receipt as unknown as Record<string, unknown> };
 }
 
 function captureRepositoryWitness(workspaceRoot: string | undefined, phase?: "post"): { preHead?: string; preDirty?: boolean; postHead?: string; postDirty?: boolean } {
