@@ -3,6 +3,10 @@ import * as z from "zod/v4";
 import { ChatSwarmError } from "./chat-swarm-contract.js";
 import { ChatSwarmIdentityError } from "./request-meta.js";
 import type { ChatSwarmRuntimeManager } from "./chat-swarm-runtime.js";
+import {
+  ensureManagedRuntime,
+  readManagedRuntimeStatus,
+} from "./chat-swarm-runtime-delivery.js";
 
 const id = z.string().min(1).max(256);
 const sha = z.string().regex(/^[0-9a-f]{64}$/);
@@ -132,19 +136,36 @@ export function registerChatSwarmRuntimeTools(
     outputSchema: runtimeStatusSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
   }, async (input: any, extra) => {
-    try { admit("status"); return success(await withManager(managerFactory, (manager) => manager.status(requestMeta(extra), input.swarmId))); }
-    catch (error) { return failure(error, "runtime_status"); }
+    try {
+      admit("status");
+      return success(
+        await withManager(managerFactory, (manager) =>
+          readManagedRuntimeStatus(manager, requestMeta(extra), input.swarmId),
+        ),
+      );
+    } catch (error) { return failure(error, "runtime_status"); }
   });
 
   server.registerTool("chat_swarm_runtime_ensure", {
     title: "Ensure managed ChatGPT worker capacity",
-    description: "Idempotently create/restore only missing managed worker carriers, bind exact peer identities, and park them for targeted wake.",
+    description: "Idempotently reconcile existing exact carriers, then create/restore only missing managed workers and park them for targeted wake.",
     inputSchema: schemas.chat_swarm_runtime_ensure,
     outputSchema: runtimeStatusSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: true },
   }, async (input: any, extra) => {
-    try { admit("dispatch"); return success(await withManager(managerFactory, (manager) => manager.ensure(requestMeta(extra), input.swarmId, input.desiredWorkers))); }
-    catch (error) { return failure(error, "runtime_ensure"); }
+    try {
+      admit("dispatch");
+      return success(
+        await withManager(managerFactory, (manager) =>
+          ensureManagedRuntime(
+            manager,
+            requestMeta(extra),
+            input.swarmId,
+            input.desiredWorkers,
+          ),
+        ),
+      );
+    } catch (error) { return failure(error, "runtime_ensure"); }
   });
 
   server.registerTool("chat_swarm_runtime_scale", {
