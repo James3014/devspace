@@ -11,6 +11,8 @@ import {
 export const WORKER_AUTO_COMPACT_CAPSULE_SCHEMA = "chat_swarm.worker_auto_compact_capsule.v1" as const;
 export const WORKER_AUTO_COMPACT_CAPSULE_MAX_BYTES = 48 * 1024;
 
+const PRESSURE_PRECISIONS = ["ESTIMATED", "EXACT"] as const;
+const PRESSURE_SOURCES = ["DEVSPACE_ESTIMATE", "CARRIER_ESTIMATE", "HOST_NATIVE"] as const;
 const MAX_PROVENANCE_BYTES = 2 * 1024;
 const MAX_ROLE_BYTES = 8 * 1024;
 const MAX_SUMMARY_BYTES = 16 * 1024;
@@ -21,8 +23,8 @@ const MAX_REFS_PER_KIND = 32;
 const MAX_BLOCKERS = 16;
 const MAX_TIMESTAMP_BYTES = 128;
 
-export type WorkerContextPressurePrecision = "ESTIMATED" | "EXACT";
-export type WorkerContextPressureSource = "DEVSPACE_ESTIMATE" | "CARRIER_ESTIMATE" | "HOST_NATIVE";
+export type WorkerContextPressurePrecision = (typeof PRESSURE_PRECISIONS)[number];
+export type WorkerContextPressureSource = (typeof PRESSURE_SOURCES)[number];
 
 export interface WorkerContextPressureSignal {
   precision: WorkerContextPressurePrecision;
@@ -57,6 +59,7 @@ export interface WorkerAutoCompactDecision {
   safeToPrepare: boolean;
   reason: string;
   sourceEpoch: number;
+  prepareAtRatio: number;
   checkpointHash?: string;
 }
 
@@ -67,6 +70,7 @@ export interface WorkerAutoCompactCapsule {
   sourceEpoch: number;
   checkpointHash: string;
   pressure: WorkerContextPressureSignal;
+  prepareAtRatio: number;
   roleInstructions: string;
   contextSummary: string;
   summaryAuthority: "CONTEXT_ONLY";
@@ -145,6 +149,7 @@ export function evaluateWorkerAutoCompact(input: WorkerAutoCompactDecisionInput)
     safeToPrepare: true,
     reason: "context pressure reached the configured threshold at a safe worker boundary",
     sourceEpoch: input.worker.continuationEpoch,
+    prepareAtRatio: input.prepareAtRatio,
     checkpointHash,
   };
 }
@@ -159,6 +164,9 @@ export function prepareWorkerAutoCompact(input: WorkerAutoCompactPrepareInput): 
   assertBounded(input.contextSummary, MAX_SUMMARY_BYTES, "contextSummary");
   assertBounded(input.claimCeiling, MAX_CLAIM_CEILING_BYTES, "claimCeiling");
   validateTimestamp(input.createdAt, "createdAt");
+  if (Date.parse(input.createdAt) < Date.parse(input.pressure.observedAt)) {
+    throw new ChatSwarmError("INVALID_INPUT", "createdAt cannot precede the pressure observation");
+  }
 
   const taskRefs = validateRefs(input.taskRefs ?? [], "taskRefs");
   const resultRefs = validateRefs(input.resultRefs ?? [], "resultRefs");
@@ -172,6 +180,7 @@ export function prepareWorkerAutoCompact(input: WorkerAutoCompactPrepareInput): 
     sourceEpoch: input.worker.continuationEpoch,
     checkpointHash: decisionResult.checkpointHash,
     pressure: input.pressure,
+    prepareAtRatio: input.prepareAtRatio,
     roleInstructions: input.roleInstructions,
     contextSummary: input.contextSummary,
     summaryAuthority: "CONTEXT_ONLY" as const,
@@ -223,6 +232,7 @@ function decision(
     safeToPrepare,
     reason,
     sourceEpoch: input.worker.continuationEpoch,
+    prepareAtRatio: input.prepareAtRatio,
   };
 }
 
@@ -232,6 +242,12 @@ function validateWorkerIdentity(worker: WorkerAutoCompactDecisionInput["worker"]
 }
 
 function validatePressure(pressure: WorkerContextPressureSignal): void {
+  if (!(PRESSURE_PRECISIONS as readonly string[]).includes(pressure.precision)) {
+    throw new ChatSwarmError("INVALID_INPUT", "unknown context pressure precision");
+  }
+  if (!(PRESSURE_SOURCES as readonly string[]).includes(pressure.source)) {
+    throw new ChatSwarmError("INVALID_INPUT", "unknown context pressure source");
+  }
   if (!Number.isFinite(pressure.utilizationRatio) || pressure.utilizationRatio < 0 || pressure.utilizationRatio > 1) {
     throw new ChatSwarmError("INVALID_INPUT", "context utilizationRatio must be between 0 and 1");
   }
