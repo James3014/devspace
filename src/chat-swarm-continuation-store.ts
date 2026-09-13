@@ -69,7 +69,11 @@ interface PersistedReceipt {
 
 type ApprovalOutcome =
   | { ok: true; request: ChatSwarmContinuationRequest }
-  | { ok: false; code: "EXPIRED" | "RECONCILIATION_REQUIRED"; message: string };
+  | {
+      ok: false;
+      code: "EXPIRED" | "RECONCILIATION_REQUIRED" | "OWNERSHIP_CONFLICT";
+      message: string;
+    };
 
 export class ChatSwarmContinuationStore {
   private readonly database: DatabaseHandle;
@@ -200,6 +204,13 @@ export class ChatSwarmContinuationStore {
         this.persistExpired(input.requestId, this.nowIso());
         return { ok: false, code: "EXPIRED", message: "continuation request has expired" };
       }
+      if (request.status === "SUPERSEDED") {
+        return {
+          ok: false,
+          code: "OWNERSHIP_CONFLICT",
+          message: "another continuation target already advanced this worker epoch",
+        };
+      }
       if (request.status === "RECONCILE_REQUIRED") {
         return {
           ok: false,
@@ -283,6 +294,7 @@ export class ChatSwarmContinuationStore {
         throw new ChatSwarmError("CAS_DRIFT", "swarm revision changed during continuation transfer");
       }
 
+      this.supersedeCompetingRequests(request, now);
       return { ok: true, request: this.getRequest(request.id)! };
     });
 
@@ -446,6 +458,31 @@ export class ChatSwarmContinuationStore {
     }
   }
 
+  private supersedeCompetingRequests(
+    winner: ChatSwarmContinuationRequest,
+    now: string,
+  ): void {
+    for (const row of this.listPendingDurableForWorker(winner.workerId)) {
+      if (row.operation_id === winner.id) continue;
+      const other = this.toRequest(row);
+      if (
+        other.sourceEpoch !== winner.sourceEpoch ||
+        other.sourceCarrierFingerprint !== winner.sourceCarrierFingerprint
+      ) continue;
+      if (Date.parse(other.expiresAt) <= Date.parse(now)) {
+        this.persistExpired(other.id, now);
+        continue;
+      }
+      const nextRequest = persistedFromRequest(other, other.version + 1);
+      this.database.sqlite.prepare(`
+        update durable_operations
+        set status='failed',retry_safe='false',request_json=?,error_code='SUPERSEDED',
+            error_message='Another continuation target atomically advanced this worker epoch.',updated_at=?
+        where operation_id=? and kind=? and status='started'
+      `).run(JSON.stringify(nextRequest), now, other.id, KIND);
+    }
+  }
+
   private requireDurable(requestId: string): DurableRow {
     const row = this.database.sqlite.prepare(
       "select * from durable_operations where operation_id=? and kind=? limit 1",
@@ -492,6 +529,7 @@ export class ChatSwarmContinuationStore {
       status = Date.parse(persisted.expiresAt) <= this.clock().getTime() ? "EXPIRED" : "PENDING";
     } else if (row.status === "succeeded") status = "APPROVED";
     else if (row.status === "failed" && row.error_code === "EXPIRED") status = "EXPIRED";
+    else if (row.status === "failed" && row.error_code === "SUPERSEDED") status = "SUPERSEDED";
     else if (row.status === "outcome_unknown") status = "RECONCILE_REQUIRED";
     else throw new ChatSwarmError("INVALID_STATE", `unsupported durable continuation status '${row.status}'`);
 
