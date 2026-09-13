@@ -95,6 +95,36 @@ test("corrupt pending continuation identity fences all new continuation work", (
   }
 });
 
+test("shifted absolute expiry with unchanged TTL fails closed", () => {
+  const f = fixture();
+  try {
+    const created = createRequest(f, "shifted-expiry");
+    const database = openDatabase(f.root);
+    try {
+      const row = database.sqlite.prepare(
+        "select request_json from durable_operations where operation_id=?",
+      ).get(created.request.id) as { request_json: string };
+      const request = JSON.parse(row.request_json) as Record<string, unknown>;
+      const requestedAt = Date.parse(String(request.requestedAt));
+      const expiresAt = Date.parse(String(request.expiresAt));
+      request.requestedAt = new Date(requestedAt + 60_000).toISOString();
+      request.expiresAt = new Date(expiresAt + 60_000).toISOString();
+      database.sqlite.prepare(
+        "update durable_operations set request_json=? where operation_id=?",
+      ).run(JSON.stringify(request), created.request.id);
+    } finally {
+      database.close();
+    }
+
+    assert.throws(
+      () => f.continuation.getRequest(created.request.id),
+      (error: unknown) => error instanceof ChatSwarmError && error.code === "INVALID_STATE",
+    );
+  } finally {
+    cleanup(f);
+  }
+});
+
 test("succeeded continuation without approval receipt fails closed", () => {
   const f = fixture();
   try {
