@@ -20,7 +20,8 @@ import type {
 import { ChatSwarmCoordinator } from "./chat-swarm-coordinator.js";
 import { ChatSwarmStore } from "./chat-swarm-store.js";
 
-const fingerprint = (value: string) => createHash("sha256").update(value).digest("hex");
+const fingerprint = (value: string) =>
+  createHash("sha256").update(value).digest("hex");
 
 class FakeManagedAdapter implements ChatSwarmManagedCarrierAdapter {
   readonly kind = "mac_web_chatgpt";
@@ -31,6 +32,7 @@ class FakeManagedAdapter implements ChatSwarmManagedCarrierAdapter {
   recoverCalls = 0;
   stopCalls = 0;
   failProvision = false;
+  failStop = false;
   recoverReady = true;
   onBootstrap?: (operationId: string, rawIdentity: string) => void;
   readonly rawIdentities = new Map<number, string>();
@@ -88,11 +90,14 @@ class FakeManagedAdapter implements ChatSwarmManagedCarrierAdapter {
 
   async recover(_slot: ManagedCarrierSlot) {
     this.recoverCalls += 1;
-    return this.recoverReady ? { ready: true } : { ready: false, blocker: "carrier_lost" };
+    return this.recoverReady
+      ? { ready: true }
+      : { ready: false, blocker: "carrier_lost" };
   }
 
   async stop(_slot: ManagedCarrierSlot): Promise<void> {
     this.stopCalls += 1;
+    if (this.failStop) throw new Error("close acknowledgement lost");
   }
 
   async ensureExisting(input: CarrierCallInput): Promise<CarrierEnsureEvidence> {
@@ -157,22 +162,29 @@ function cleanup(f: ReturnType<typeof fixture>) {
   rmSync(f.root, { recursive: true, force: true });
 }
 
-test("runtime ensure creates only missing managed workers and exact replay creates no duplicates", async () => {
+test("concurrent runtime ensure creates only missing managed workers and exact replay creates no duplicates", async () => {
   const f = fixture();
   try {
-    const first = await f.manager.ensure(f.owner, f.swarm.id, 3);
-    assert.equal(first.state, "READY");
+    const [first, concurrent] = await Promise.all([
+      f.manager.ensure(f.owner, f.swarm.id, 3),
+      f.manager.ensure(f.owner, f.swarm.id, 3),
+    ]);
     assert.equal(first.slots.length, 3);
-    assert.equal(first.slots.filter((slot) => slot.state === "PARKED").length, 3);
-    assert.equal(new Set(first.slots.map((slot) => slot.workerId)).size, 3);
+    assert.equal(concurrent.slots.length, 3);
+    const final = await f.manager.ensure(f.owner, f.swarm.id, 3);
+    assert.equal(final.slots.filter((slot) => slot.state === "PARKED").length, 3);
+    assert.equal(new Set(final.slots.map((slot) => slot.workerId)).size, 3);
     assert.equal(f.adapter.provisionCalls, 3);
     assert.equal(f.adapter.bootstrapCalls, 3);
-
-    const replay = await f.manager.ensure(f.owner, f.swarm.id, 3);
-    assert.equal(replay.slots.length, 3);
-    assert.equal(f.adapter.provisionCalls, 3);
-    assert.equal(f.coordinator.store.listWorkers(f.swarm.id).filter((worker) => worker.lifecycleState !== "DISABLED").length, 3);
-  } finally { cleanup(f); }
+    assert.equal(
+      f.coordinator.store
+        .listWorkers(f.swarm.id)
+        .filter((worker) => worker.lifecycleState !== "DISABLED").length,
+      3,
+    );
+  } finally {
+    cleanup(f);
+  }
 });
 
 test("managed bootstrap requires the exact created ChatGPT conversation identity", () => {
@@ -186,13 +198,19 @@ test("managed bootstrap requires the exact created ChatGPT conversation identity
     );
     const prepared = f.registry.prepareProvision(slot, 5_000);
     assert.ok(prepared.operation);
+    assert.equal(f.registry.claimProvision(prepared.operation!.operationId), true);
     f.registry.markCarrierCreated(prepared.operation!.operationId, {
       conversationUrl: "https://chatgpt.com/c/exact-managed-conversation",
       conversationFingerprint: fingerprint("exact-managed-conversation"),
       appBinding: "READY",
     });
+    assert.equal(f.registry.claimBootstrap(prepared.operation!.operationId), true);
     assert.throws(
-      () => f.manager.bootstrap({ "openai/session": "wrong-conversation" }, prepared.operation!.operationId),
+      () =>
+        f.manager.bootstrap(
+          { "openai/session": "wrong-conversation" },
+          prepared.operation!.operationId,
+        ),
       /does not match the managed carrier/,
     );
     const accepted = f.manager.bootstrap(
@@ -200,8 +218,13 @@ test("managed bootstrap requires the exact created ChatGPT conversation identity
       prepared.operation!.operationId,
     );
     assert.equal(accepted.slot.state, "PARKED");
-    assert.equal(accepted.worker.carrierConversationFingerprint, fingerprint("exact-managed-conversation"));
-  } finally { cleanup(f); }
+    assert.equal(
+      accepted.worker.carrierConversationFingerprint,
+      fingerprint("exact-managed-conversation"),
+    );
+  } finally {
+    cleanup(f);
+  }
 });
 
 test("targeted dispatch wake is a delivery hint and preserves queued task truth", async () => {
@@ -219,7 +242,9 @@ test("targeted dispatch wake is a delivery hint and preserves queued task truth"
     await f.manager.wakeForDispatchedTask(f.owner, task);
     assert.equal(f.adapter.wakeCalls, 1);
     assert.equal(f.coordinator.store.getTask(task.id)?.lifecycleState, "QUEUED");
-  } finally { cleanup(f); }
+  } finally {
+    cleanup(f);
+  }
 });
 
 test("scale 3 to 5 to 2 retires only safe idle tail workers", async () => {
@@ -232,10 +257,12 @@ test("scale 3 to 5 to 2 retires only safe idle tail workers", async () => {
     assert.equal(two.slots.filter((slot) => slot.state !== "STOPPED").length, 2);
     assert.equal(f.adapter.provisionCalls, 5);
     assert.equal(f.adapter.stopCalls, 3);
-  } finally { cleanup(f); }
+  } finally {
+    cleanup(f);
+  }
 });
 
-test("busy or reconcile-required worker cannot be scaled down", async () => {
+test("busy targeted worker is never evicted during scale-down", async () => {
   const f = fixture(3);
   try {
     const status = await f.manager.ensure(f.owner, f.swarm.id, 3);
@@ -247,9 +274,43 @@ test("busy or reconcile-required worker cannot be scaled down", async () => {
       preferredWorkerId: tailWorker,
     });
     f.store.claimTask(task.id, tailWorker);
-    await assert.rejects(f.manager.scale(f.owner, f.swarm.id, 2), /not enough safe idle workers/);
+    const scaled = await f.manager.scale(f.owner, f.swarm.id, 2);
     assert.equal(f.coordinator.store.getWorker(tailWorker)?.lifecycleState, "BUSY");
-  } finally { cleanup(f); }
+    assert.equal(
+      scaled.slots.some(
+        (slot) => slot.workerId === tailWorker && slot.state !== "STOPPED",
+      ),
+      true,
+    );
+    assert.equal(f.adapter.stopCalls, 1);
+  } finally {
+    cleanup(f);
+  }
+});
+
+test("stop fences worker authority before browser close and unknown close never retries blindly", async () => {
+  const f = fixture();
+  try {
+    const status = await f.manager.ensure(f.owner, f.swarm.id, 1);
+    const workerId = status.slots[0]!.workerId!;
+    f.adapter.failStop = true;
+    await assert.rejects(
+      f.manager.stop(f.owner, f.swarm.id, workerId),
+      /outcome is unknown/,
+    );
+    assert.equal(
+      f.coordinator.store.getWorker(workerId)?.lifecycleState,
+      "DISABLED",
+    );
+    assert.equal(f.adapter.stopCalls, 1);
+    await assert.rejects(
+      f.manager.stop(f.owner, f.swarm.id, workerId),
+      /managed worker carrier not found|reconciliation/,
+    );
+    assert.equal(f.adapter.stopCalls, 1);
+  } finally {
+    cleanup(f);
+  }
 });
 
 test("recovery reopens the exact saved conversation and never mints a replacement task attempt", async () => {
@@ -257,14 +318,19 @@ test("recovery reopens the exact saved conversation and never mints a replacemen
   try {
     const status = await f.manager.ensure(f.owner, f.swarm.id, 1);
     const workerId = status.slots[0]!.workerId!;
-    const before = f.coordinator.store.listAttempts(
-      f.coordinator.store.createTask({ swarmId: f.swarm.id, taskKey: "no-attempt", prompt: "queued" }).task.id,
-    ).length;
+    const task = f.coordinator.store.createTask({
+      swarmId: f.swarm.id,
+      taskKey: "no-attempt",
+      prompt: "queued",
+    }).task;
+    assert.equal(f.coordinator.store.listAttempts(task.id).length, 0);
     const recovered = await f.manager.recover(f.owner, f.swarm.id, workerId);
     assert.equal(recovered.slots[0]!.workerId, workerId);
     assert.equal(f.adapter.recoverCalls, 1);
-    assert.equal(before, 0);
-  } finally { cleanup(f); }
+    assert.equal(f.coordinator.store.listAttempts(task.id).length, 0);
+  } finally {
+    cleanup(f);
+  }
 });
 
 test("response loss after possible carrier create is pinned for reconciliation and not reprovisioned", async () => {
@@ -278,7 +344,9 @@ test("response loss after possible carrier create is pinned for reconciliation a
     const replay = await f.manager.ensure(f.owner, f.swarm.id, 1);
     assert.equal(replay.slots[0]!.state, "RECONCILE_REQUIRED");
     assert.equal(f.adapter.provisionCalls, 1);
-  } finally { cleanup(f); }
+  } finally {
+    cleanup(f);
+  }
 });
 
 test("managed registry survives reopen without duplicating logical workers", async () => {
@@ -292,7 +360,7 @@ test("managed registry survives reopen without duplicating logical workers", asy
     assert.deepEqual(slots.map((slot) => slot.workerId), ids);
     assert.equal(slots.every((slot) => slot.state === "PARKED"), true);
     reopened.close();
-    // Prevent cleanup from closing the already closed registry a second time.
-    (f.manager as any).registry.close = () => undefined;
-  } finally { cleanup(f); }
+  } finally {
+    cleanup(f);
+  }
 });
