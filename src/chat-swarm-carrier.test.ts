@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import "./chat-swarm-runtime.test.js";
 import { ChatSwarmCarrierManager, type CarrierCallInput, type ChatSwarmCarrierAdapter } from "./chat-swarm-carrier.js";
 import { ChatSwarmCoordinator } from "./chat-swarm-coordinator.js";
 import { ChatSwarmStore } from "./chat-swarm-store.js";
@@ -24,6 +25,8 @@ test("restart fences intent before acknowledgement and late completion cannot ov
 test("missing admitted capacity never invokes adapter", async () => { const f = fixture(); const adapter = new FakeAdapter(); try { const manager = new ChatSwarmCarrierManager(f.store, f.coordinator, adapter); const result = await manager.ensure(f.owner, f.swarm.id, 2, "d".repeat(64)); assert.equal(result[0]?.blocker, "ADMISSION_REQUIRED"); assert.equal(adapter.calls, 0); } finally { cleanup(f); } });
 
 test("wake binds exact task attempt and preserves canonical task state", async () => { const f = fixture(); const adapter = new FakeAdapter(); try { const manager = new ChatSwarmCarrierManager(f.store, f.coordinator, adapter); const task = f.store.createTask({ swarmId: f.swarm.id, taskKey: "wake", prompt: "p" }).task; f.store.claimTask(task.id, f.worker.id); const before = f.store.getTask(task.id); const result = await manager.wake(f.owner, { swarmId: f.swarm.id, workerId: f.worker.id, expectedEpoch: 0, taskId: task.id, adapterConfigHash: "e".repeat(64) }); assert.equal(result.state, "SUCCEEDED"); assert.deepEqual(f.store.getTask(task.id), before); assert.ok(result.attemptId); } finally { cleanup(f); } });
+
+test("queued preferred task can wake exact parked worker before claim", async () => { const f = fixture(); const adapter = new FakeAdapter(); try { const manager = new ChatSwarmCarrierManager(f.store, f.coordinator, adapter); const task = f.store.createTask({ swarmId: f.swarm.id, taskKey: "queued-wake", prompt: "p", preferredWorkerId: f.worker.id }).task; const result = await manager.wake(f.owner, { swarmId: f.swarm.id, workerId: f.worker.id, expectedEpoch: 0, taskId: task.id, adapterConfigHash: "e".repeat(64) }); assert.equal(result.state, "SUCCEEDED"); assert.equal(result.taskId, task.id); assert.equal(result.attemptId, undefined); assert.equal(f.store.getTask(task.id)?.lifecycleState, "QUEUED"); } finally { cleanup(f); } });
 
 test("unknown delivery is pinned and never blindly retried", async () => { const f = fixture(); const adapter = new FakeAdapter(); adapter.mode = "unknown"; try { const manager = new ChatSwarmCarrierManager(f.store, f.coordinator, adapter); const result = await manager.wake(f.owner, { swarmId: f.swarm.id, workerId: f.worker.id, expectedEpoch: 0, adapterConfigHash: "f".repeat(64) }); assert.equal(result.state, "RECONCILE_REQUIRED"); const replay = await manager.wake(f.owner, { swarmId: f.swarm.id, workerId: f.worker.id, expectedEpoch: 0, adapterConfigHash: "f".repeat(64) }); assert.equal(replay.operationId, result.operationId); assert.equal(adapter.calls, 1); } finally { cleanup(f); } });
 
