@@ -519,7 +519,7 @@ export class ChatSwarmContinuationStore {
     const rows = this.database.sqlite.prepare(
       "select * from durable_operations where kind=? and scope_root=? and status='started'",
     ).all(KIND, this.scopeRoot) as DurableRow[];
-    return rows.filter((row) => readPersistedRequest(row).workerId === workerId);
+    return rows.filter((row) => this.toRequest(row).workerId === workerId);
   }
 
   private assertNoUnresolvedContinuation(workerId: string, now: string): void {
@@ -542,7 +542,7 @@ export class ChatSwarmContinuationStore {
 
   private persistExpiredPendingForWorker(workerId: string, now: string): void {
     for (const row of this.listPendingDurableForWorker(workerId)) {
-      const request = readPersistedRequest(row);
+      const request = this.toRequest(row);
       if (Date.parse(request.expiresAt) <= Date.parse(now)) this.persistExpired(row.operation_id, now);
     }
   }
