@@ -169,6 +169,7 @@ import {
   runRepositoryIntelligenceOperation,
   type RepositoryIntelligenceOperation,
 } from "./repository-intelligence.js";
+import { registerPhysicalHostRegistryTools } from "./physical-host-registry.js";
 
 type Transport = StreamableHTTPServerTransport;
 const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
@@ -2269,6 +2270,10 @@ export function createMcpServer(
   );
 
   registerRepositoryIntelligenceTools(server, config, workspaces);
+  registerPhysicalHostRegistryTools(server, {
+    registryPath: process.env.DEVSPACE_PHYSICAL_HOST_REGISTRY,
+    allowedRoots: config.allowedRoots,
+  });
   if (cutoverControl) registerCutoverMcpTools(server, cutoverControl, durableOperations);
 
   registerAppResource(
