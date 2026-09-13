@@ -11,7 +11,7 @@ import { openDatabase } from "./db/client.js";
 import { CutoverStateStore } from "./cutover-state.js";
 
 function fixture(completionBindings: readonly CarrierCompletionBinding[] = []) {
-  const root=realpathSync(mkdtempSync(join(tmpdir(),"carrier-test-")));
+  const root=realpathSync.native(mkdtempSync(join(tmpdir(),"carrier-test-"))).replaceAll("\\","/");
   const workspace=join(root,"workspace");mkdirSync(workspace);
   let now=Date.now();
   const store=new CarrierBindingStore(root,()=>now,completionBindings);
