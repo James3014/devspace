@@ -145,7 +145,7 @@ export class ChatSwarmContinuationStore {
       }
 
       const requestedAt = now;
-      const expiresAt = new Date(this.clock().getTime() + ttlSeconds * 1000).toISOString();
+      const expiresAt = new Date(Date.parse(requestedAt) + ttlSeconds * 1000).toISOString();
       const request: PersistedRequest = {
         schema: REQUEST_SCHEMA,
         version: 1,
