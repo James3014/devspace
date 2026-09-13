@@ -121,3 +121,27 @@ test("only exact owner may approve, including idempotent approved readback", () 
     cleanup(f);
   }
 });
+
+test("same owner cannot reconcile a continuation through a different swarm id", () => {
+  const f = fixture();
+  try {
+    const created = f.continuation.request(f.targetMeta, {
+      swarmId: f.swarm.id,
+      workerId: f.worker.id,
+      attemptKey: "cross-swarm-reconcile",
+      sourceEpoch: 0,
+    });
+    const otherSwarm = f.continuation.swarmCoordinator.createSwarm(f.ownerMeta, {
+      workerLimit: 1,
+      metadata: { test: "other-swarm" },
+    });
+
+    assert.throws(
+      () => f.continuation.reconcileNoEffect(f.ownerMeta, otherSwarm.id, created.request.id),
+      (error: unknown) => error instanceof ChatSwarmError && error.code === "OWNERSHIP_CONFLICT",
+    );
+    assert.equal(f.continuationStore.getRequest(created.request.id)?.status, "PENDING");
+  } finally {
+    cleanup(f);
+  }
+});
