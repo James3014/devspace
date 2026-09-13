@@ -5,40 +5,92 @@ import { ChatSwarmError, TASK_STATES } from "./chat-swarm-contract.js";
 import { ChatSwarmCoordinator } from "./chat-swarm-coordinator.js";
 import { ChatSwarmIdentityError } from "./request-meta.js";
 import type { ServerConfig } from "./config.js";
+import { ChatSwarmRuntimeManager } from "./chat-swarm-runtime.js";
+import {
+  chatSwarmRuntimeToolInputShapes,
+  registerChatSwarmRuntimeTools,
+} from "./chat-swarm-runtime-tools.js";
 
 export type ChatSwarmAdmissionAction =
-  | "create"
-  | "join"
-  | "dispatch"
-  | "worker_next"
-  | "submit"
-  | "cancel"
-  | "reconcile"
-  | "collect"
-  | "status"
-  | "close"
-  | "peer_status"
-  | "inspect"
-  | "tasks"
-  | "join_request"
-  | "approve_join";
+  | "create" | "join" | "dispatch" | "worker_next" | "submit" | "cancel"
+  | "reconcile" | "collect" | "status" | "close" | "peer_status" | "inspect"
+  | "tasks" | "join_request" | "approve_join";
+
+type ChatSwarmToolConfig = Pick<
+  ServerConfig,
+  | "chatSwarmEnabled"
+  | "chatSwarmMaxWorkers"
+  | "chatSwarmQueueLimit"
+  | "chatSwarmResultMaxChars"
+  | "chatSwarmInviteTtlSeconds"
+> & Partial<Pick<ServerConfig, "stateDir">>;
 
 export interface ChatSwarmToolRegistrationOptions {
   coordinator: ChatSwarmCoordinator;
-  config: Pick<ServerConfig, "chatSwarmEnabled" | "chatSwarmMaxWorkers" | "chatSwarmQueueLimit" | "chatSwarmResultMaxChars" | "chatSwarmInviteTtlSeconds">;
+  config: ChatSwarmToolConfig;
   admit?: (action: ChatSwarmAdmissionAction, context?: { existingTask?: boolean }) => void;
   authorizeInvite?: (input: { swarmId: string; credential: string; issuedAt: string; ttlSeconds: number }) => boolean;
 }
 
 const id = z.string().min(1).max(256);
 const boundedObject = z.record(z.string(), z.unknown()).superRefine((value, ctx) => {
-  if (Buffer.byteLength(JSON.stringify(value), "utf8") > 64 * 1024) ctx.addIssue({ code: "custom", message: "object exceeds 64 KiB" });
+  if (Buffer.byteLength(JSON.stringify(value), "utf8") > 64 * 1024) {
+    ctx.addIssue({ code: "custom", message: "object exceeds 64 KiB" });
+  }
 });
 const metadata = boundedObject.optional();
-const createMetadata = boundedObject.refine((value) => Buffer.byteLength(JSON.stringify(value), "utf8") <= 60 * 1024, "metadata leaves room for invite issuance metadata").optional();
-const taskResult = z.object({ id, swarmId: id, taskKey: id, requestHash: z.string(), prompt: z.string(), payload: boundedObject, preferredWorkerId: id.optional(), assignedWorkerId: id.optional(), lifecycleState: z.string(), result: z.string().optional(), errorCode: z.string().optional(), errorMessage: z.string().optional(), retrySafe: z.boolean(), reconciliation: boundedObject.optional(), createdAt: z.string(), updatedAt: z.string(), completedAt: z.string().optional(), collectedAt: z.string().optional() });
-const workerResult = z.object({ id, swarmId: id, label: id, runtimeKind: z.literal("mcp_peer"), sessionIdentityFingerprint: z.string().optional(), carrierConversationFingerprint: z.string().optional(), lifecycleState: z.string(), currentTaskId: id.optional(), lease: boundedObject.optional(), checkpoint: boundedObject.optional(), continuationEpoch: z.number().int().nonnegative(), createdAt: z.string(), updatedAt: z.string() });
-const swarmResult = z.object({ id, status: z.enum(["ACTIVE", "CLOSED"]), ownerIdentityFingerprint: z.string().regex(/^[0-9a-f]{64}$/), workerLimit: z.number().int().positive(), inviteCredentialHash: z.string().optional(), metadata: boundedObject, revision: z.number().int().positive(), createdAt: z.string(), updatedAt: z.string() });
+const createMetadata = boundedObject
+  .refine(
+    (value) => Buffer.byteLength(JSON.stringify(value), "utf8") <= 60 * 1024,
+    "metadata leaves room for invite issuance metadata",
+  )
+  .optional();
+const taskResult = z.object({
+  id,
+  swarmId: id,
+  taskKey: id,
+  requestHash: z.string(),
+  prompt: z.string(),
+  payload: boundedObject,
+  preferredWorkerId: id.optional(),
+  assignedWorkerId: id.optional(),
+  lifecycleState: z.string(),
+  result: z.string().optional(),
+  errorCode: z.string().optional(),
+  errorMessage: z.string().optional(),
+  retrySafe: z.boolean(),
+  reconciliation: boundedObject.optional(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+  completedAt: z.string().optional(),
+  collectedAt: z.string().optional(),
+});
+const workerResult = z.object({
+  id,
+  swarmId: id,
+  label: id,
+  runtimeKind: z.literal("mcp_peer"),
+  sessionIdentityFingerprint: z.string().optional(),
+  carrierConversationFingerprint: z.string().optional(),
+  lifecycleState: z.string(),
+  currentTaskId: id.optional(),
+  lease: boundedObject.optional(),
+  checkpoint: boundedObject.optional(),
+  continuationEpoch: z.number().int().nonnegative(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+const swarmResult = z.object({
+  id,
+  status: z.enum(["ACTIVE", "CLOSED"]),
+  ownerIdentityFingerprint: z.string().regex(/^[0-9a-f]{64}$/),
+  workerLimit: z.number().int().positive(),
+  inviteCredentialHash: z.string().optional(),
+  metadata: boundedObject,
+  revision: z.number().int().positive(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
 const createResult = z.object({ swarm: swarmResult, inviteCredential: z.string(), inviteIssuedAt: z.string() });
 const nextResult = z.object({ task: taskResult.nullable() });
 const evidence = z.object({ taskId: id, attemptId: id, disposition: z.literal("NO_EFFECT"), evidenceRef: z.string().min(1).max(1024) });
@@ -52,23 +104,9 @@ const peerStatusResult = z.object({
   }),
   state: z.enum(["UNBOUND", "PENDING_APPROVAL", "APPROVED", "BOUND", "BLOCKED"]),
   deliveryMode: z.literal("POLLING_ONLY"),
-  pendingRequest: z.object({
-    requestId: id,
-    label: id,
-    version: z.number().int().positive(),
-    expiresAt: z.string(),
-  }).optional(),
-  boundWorker: z.object({
-    workerId: id,
-    label: id,
-    continuationEpoch: z.number().int().nonnegative(),
-    currentTaskId: id.optional(),
-  }).optional(),
-  blocker: z.object({
-    code: z.string(),
-    message: z.string(),
-    stage: z.string(),
-  }).optional(),
+  pendingRequest: z.object({ requestId: id, label: id, version: z.number().int().positive(), expiresAt: z.string() }).optional(),
+  boundWorker: z.object({ workerId: id, label: id, continuationEpoch: z.number().int().nonnegative(), currentTaskId: id.optional() }).optional(),
+  blocker: z.object({ code: z.string(), message: z.string(), stage: z.string() }).optional(),
 });
 
 const taskSummarySchema = z.object({
@@ -87,80 +125,40 @@ const taskSummarySchema = z.object({
   errorCode: z.string().optional(),
   errorMessage: z.string().optional(),
 });
-
 const tasksResult = z.object({
   swarmId: id,
   tasks: z.array(taskSummarySchema),
   nextCursor: z.string().optional(),
   totalCount: z.number().int().nonnegative(),
 });
-
 const inspectResult = z.object({
-  swarm: z.object({
-    id,
-    status: z.string(),
-    workerLimit: z.number().int().positive(),
-    revision: z.number().int().positive(),
-    createdAt: z.string(),
-  }),
-  roster: z.array(z.object({
-    id,
-    label: id,
-    lifecycleState: z.string(),
-    currentTaskId: id.optional(),
-    continuationEpoch: z.number().int().nonnegative(),
-    updatedAt: z.string(),
-  })),
-  pendingRequests: z.array(z.object({
-    requestId: id,
-    requesterFingerprint: z.string(),
-    label: id,
-    version: z.number().int().positive(),
-    requestedAt: z.string(),
-    expiresAt: z.string(),
-  })),
+  swarm: z.object({ id, status: z.string(), workerLimit: z.number().int().positive(), revision: z.number().int().positive(), createdAt: z.string() }),
+  roster: z.array(z.object({ id, label: id, lifecycleState: z.string(), currentTaskId: id.optional(), continuationEpoch: z.number().int().nonnegative(), updatedAt: z.string() })),
+  pendingRequests: z.array(z.object({ requestId: id, requesterFingerprint: z.string(), label: id, version: z.number().int().positive(), requestedAt: z.string(), expiresAt: z.string() })),
   taskCounts: z.record(z.string(), z.number()).optional(),
   recentTasks: z.array(taskSummarySchema).optional(),
   observedDeliveryMode: z.literal("POLLING_ONLY"),
 });
-
 const joinRequestResult = z.object({
   request: z.object({
-    id,
-    swarmId: id,
-    attemptKey: id,
-    requestHash: z.string(),
-    requesterFingerprint: z.string(),
-    label: id,
-    version: z.number().int().positive(),
-    status: z.enum(["PENDING", "APPROVED", "EXPIRED"]),
-    approvedWorkerId: id.optional(),
-    requestedAt: z.string(),
-    expiresAt: z.string(),
-    approvedAt: z.string().optional(),
+    id, swarmId: id, attemptKey: id, requestHash: z.string(), requesterFingerprint: z.string(), label: id,
+    version: z.number().int().positive(), status: z.enum(["PENDING", "APPROVED", "EXPIRED"]),
+    approvedWorkerId: id.optional(), requestedAt: z.string(), expiresAt: z.string(), approvedAt: z.string().optional(),
   }),
   created: z.boolean(),
 });
-
 const approveJoinResult = z.object({
   request: z.object({
-    id,
-    swarmId: id,
-    attemptKey: id,
-    requestHash: z.string(),
-    requesterFingerprint: z.string(),
-    label: id,
-    version: z.number().int().positive(),
-    status: z.enum(["PENDING", "APPROVED", "EXPIRED"]),
-    approvedWorkerId: id.optional(),
-    requestedAt: z.string(),
-    expiresAt: z.string(),
-    approvedAt: z.string().optional(),
+    id, swarmId: id, attemptKey: id, requestHash: z.string(), requesterFingerprint: z.string(), label: id,
+    version: z.number().int().positive(), status: z.enum(["PENDING", "APPROVED", "EXPIRED"]),
+    approvedWorkerId: id.optional(), requestedAt: z.string(), expiresAt: z.string(), approvedAt: z.string().optional(),
   }),
   worker: workerResult,
 });
 
-export function chatSwarmToolInputShapes(config: Pick<ServerConfig, "chatSwarmMaxWorkers" | "chatSwarmResultMaxChars">): Record<string, Record<string, z.ZodType>> {
+export function chatSwarmToolInputShapes(
+  config: Pick<ServerConfig, "chatSwarmMaxWorkers" | "chatSwarmResultMaxChars">,
+): Record<string, Record<string, z.ZodType>> {
   const swarmId = id.describe("Swarm identifier.");
   const taskId = id.describe("Task identifier.");
   const workerId = id.describe("Worker identifier.");
@@ -180,12 +178,18 @@ export function chatSwarmToolInputShapes(config: Pick<ServerConfig, "chatSwarmMa
     chat_swarm_tasks: { swarmId, limit: z.number().int().min(1).max(100).optional(), cursor: z.string().optional(), lifecycleState: z.enum(TASK_STATES).optional() },
     chat_swarm_join_request: { swarmId, label: id, attemptKey: id },
     chat_swarm_approve_join: { swarmId, requestId: id, expectedRequestVersion: z.number().int().positive(), expectedSwarmVersion: z.number().int().positive() },
+    ...chatSwarmRuntimeToolInputShapes(config),
   };
 }
 
-export function createChatSwarmToolInputSchemas(config: Pick<ServerConfig, "chatSwarmMaxWorkers" | "chatSwarmResultMaxChars">): Record<string, z.ZodObject<any>> {
-  return Object.fromEntries(Object.entries(chatSwarmToolInputShapes(config)).map(([name, shape]) => [name, z.object(shape)])) as Record<string, z.ZodObject<any>>;
+export function createChatSwarmToolInputSchemas(
+  config: Pick<ServerConfig, "chatSwarmMaxWorkers" | "chatSwarmResultMaxChars">,
+): Record<string, z.ZodObject<any>> {
+  return Object.fromEntries(
+    Object.entries(chatSwarmToolInputShapes(config)).map(([name, shape]) => [name, z.object(shape)]),
+  ) as Record<string, z.ZodObject<any>>;
 }
+
 type ToolResult = {
   content: [{ type: "text"; text: string }];
   structuredContent?: Record<string, unknown>;
@@ -198,46 +202,16 @@ function success(value: unknown): ToolResult {
 
 function failure(error: unknown, operation?: string): ToolResult {
   if (error instanceof ChatSwarmError) {
-    const details = {
-      code: error.code,
-      layer: error.layer,
-      stage: error.stage,
-      operation: operation ?? error.operation,
-      message: error.message,
-    };
-    return {
-      isError: true,
-      structuredContent: { error: details },
-      content: [{ type: "text", text: `[${details.code}] ${details.message}` }],
-    };
+    const details = { code: error.code, layer: error.layer, stage: error.stage, operation: operation ?? error.operation, message: error.message };
+    return { isError: true, structuredContent: { error: details }, content: [{ type: "text", text: `[${details.code}] ${details.message}` }] };
   }
   if (error instanceof ChatSwarmIdentityError) {
-    const details = {
-      code: `IDENTITY_${error.code}`,
-      layer: "HOST",
-      stage: "identity_validated",
-      operation,
-      message: error.message,
-    };
-    return {
-      isError: true,
-      structuredContent: { error: details },
-      content: [{ type: "text", text: `[${details.code}] ${details.message}` }],
-    };
+    const details = { code: `IDENTITY_${error.code}`, layer: "HOST", stage: "identity_validated", operation, message: error.message };
+    return { isError: true, structuredContent: { error: details }, content: [{ type: "text", text: `[${details.code}] ${details.message}` }] };
   }
   const message = error instanceof Error ? error.message : String(error);
-  const details = {
-    code: "INTERNAL_ERROR",
-    layer: "SYSTEM",
-    stage: "EXECUTE",
-    operation,
-    message,
-  };
-  return {
-    isError: true,
-    structuredContent: { error: details },
-    content: [{ type: "text", text: `[INTERNAL_ERROR] ${message}` }],
-  };
+  const details = { code: "INTERNAL_ERROR", layer: "SYSTEM", stage: "EXECUTE", operation, message };
+  return { isError: true, structuredContent: { error: details }, content: [{ type: "text", text: `[INTERNAL_ERROR] ${message}` }] };
 }
 
 function meta(extra: { _meta?: unknown }): unknown { return extra._meta ?? {}; }
@@ -259,7 +233,9 @@ function requireFreshInvite(
   if (!coordinator.store.verifyInviteCredential(swarmId, credential)) {
     throw new ChatSwarmError("OWNERSHIP_CONFLICT", "invite credential is not authorized");
   }
-  if (authorizeInvite && !authorizeInvite({ swarmId, credential, issuedAt, ttlSeconds })) throw new ChatSwarmError("OWNERSHIP_CONFLICT", "invite credential is not admitted");
+  if (authorizeInvite && !authorizeInvite({ swarmId, credential, issuedAt, ttlSeconds })) {
+    throw new ChatSwarmError("OWNERSHIP_CONFLICT", "invite credential is not admitted");
+  }
 }
 
 export function registerChatSwarmTools(
@@ -268,54 +244,106 @@ export function registerChatSwarmTools(
 ): number {
   if (!config.chatSwarmEnabled) return 0;
   const schemas = createChatSwarmToolInputSchemas(config);
-  const swarmId = id.describe("Swarm identifier.");
-  const taskId = id.describe("Task identifier.");
-  const workerId = id.describe("Worker identifier.");
+
+  const runtimeFactory = config.stateDir
+    ? () => new ChatSwarmRuntimeManager(coordinator, { stateDir: config.stateDir!, chatSwarmMaxWorkers: config.chatSwarmMaxWorkers })
+    : undefined;
 
   server.registerTool("chat_swarm_create", { title: "Create ChatGPT swarm", description: "Create an owner-bound ChatGPT peer swarm.", inputSchema: schemas.chat_swarm_create, outputSchema: createResult }, async (input: any, extra) => {
-    try { admit("create"); if (input.metadata && Buffer.byteLength(JSON.stringify(input.metadata), "utf8") > 60 * 1024) throw new ChatSwarmError("INVALID_INPUT", "metadata leaves room for invite issuance metadata"); const inviteCredential = randomBytes(32).toString("base64url"); const inviteIssuedAt = new Date().toISOString(); const swarm = coordinator.createSwarm(meta(extra), { ...input, inviteCredential, metadata: { ...(input.metadata ?? {}), chatSwarmInviteIssuedAt: inviteIssuedAt } }); return success({ swarm, inviteCredential, inviteIssuedAt }); } catch (error) { return failure(error, "create"); }
+    try {
+      admit("create");
+      if (input.metadata && Buffer.byteLength(JSON.stringify(input.metadata), "utf8") > 60 * 1024) throw new ChatSwarmError("INVALID_INPUT", "metadata leaves room for invite issuance metadata");
+      const inviteCredential = randomBytes(32).toString("base64url");
+      const inviteIssuedAt = new Date().toISOString();
+      const swarm = coordinator.createSwarm(meta(extra), { ...input, inviteCredential, metadata: { ...(input.metadata ?? {}), chatSwarmInviteIssuedAt: inviteIssuedAt } });
+      return success({ swarm, inviteCredential, inviteIssuedAt });
+    } catch (error) { return failure(error, "create"); }
   });
+
   server.registerTool("chat_swarm_dispatch", { title: "Dispatch swarm task", description: "Create or replay a bounded task and dispatch it to an eligible peer worker.", inputSchema: schemas.chat_swarm_dispatch, outputSchema: taskResult }, async (input: any, extra) => {
-    try { admit("dispatch"); return success(coordinator.dispatch(meta(extra), input, config.chatSwarmQueueLimit)); } catch (error) { return failure(error, "dispatch"); }
+    try {
+      admit("dispatch");
+      const task = coordinator.dispatch(meta(extra), input, config.chatSwarmQueueLimit);
+      if (runtimeFactory) {
+        try {
+          const runtime = runtimeFactory();
+          try { await runtime.wakeForDispatchedTask(meta(extra), task); }
+          finally { runtime.close(); }
+        } catch {
+          // Task truth is already durable. Wake is only a delivery hint and cannot fail dispatch.
+        }
+      }
+      return success(task);
+    } catch (error) { return failure(error, "dispatch"); }
   });
+
   server.registerTool("chat_swarm_status", { title: "Inspect swarm task", description: "Read one task without changing it.", inputSchema: schemas.chat_swarm_status, outputSchema: taskResult, annotations: { readOnlyHint: true, idempotentHint: true } }, async (input: any, extra) => {
-    try { admit("status"); return success(coordinator.status(meta(extra), input.swarmId, input.taskId)); } catch (error) { return failure(error, "status"); }
+    try { admit("status"); return success(coordinator.status(meta(extra), input.swarmId, input.taskId)); }
+    catch (error) { return failure(error, "status"); }
   });
   server.registerTool("chat_swarm_collect", { title: "Collect swarm result", description: "Idempotently mark a ready result collected.", inputSchema: schemas.chat_swarm_collect, outputSchema: taskResult, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true } }, async (input: any, extra) => {
-    try { admit("collect"); return success(coordinator.collect(meta(extra), input.swarmId, input.taskId)); } catch (error) { return failure(error, "collect"); }
+    try { admit("collect"); return success(coordinator.collect(meta(extra), input.swarmId, input.taskId)); }
+    catch (error) { return failure(error, "collect"); }
   });
   server.registerTool("chat_swarm_cancel", { title: "Cancel swarm task", description: "Cancel queued work or request cancellation while preserving uncertain worker effects.", inputSchema: schemas.chat_swarm_cancel, outputSchema: taskResult }, async (input: any, extra) => {
-    try { admit("cancel"); return success(coordinator.cancel(meta(extra), input.swarmId, input.taskId)); } catch (error) { return failure(error, "cancel"); }
+    try { admit("cancel"); return success(coordinator.cancel(meta(extra), input.swarmId, input.taskId)); }
+    catch (error) { return failure(error, "cancel"); }
   });
   server.registerTool("chat_swarm_reconcile", { title: "Reconcile swarm task", description: "Apply an explicit bounded reconciliation decision.", inputSchema: schemas.chat_swarm_reconcile, outputSchema: taskResult }, async (input: any, extra) => {
-    try { admit("reconcile"); return success(coordinator.reconcile(meta(extra), input.swarmId, input.taskId, input.decision, input.result, input.evidence)); } catch (error) { return failure(error, "reconcile"); }
+    try { admit("reconcile"); return success(coordinator.reconcile(meta(extra), input.swarmId, input.taskId, input.decision, input.result, input.evidence)); }
+    catch (error) { return failure(error, "reconcile"); }
   });
   server.registerTool("chat_swarm_close", { title: "Close ChatGPT swarm", description: "Close an owner swarm after all pending work is terminal.", inputSchema: schemas.chat_swarm_close, outputSchema: swarmResult }, async (input: any, extra) => {
-    try { admit("close"); return success(coordinator.close(meta(extra), input.swarmId)); } catch (error) { return failure(error, "close"); }
+    try { admit("close"); return success(coordinator.close(meta(extra), input.swarmId)); }
+    catch (error) { return failure(error, "close"); }
   });
   server.registerTool("chat_swarm_join", { title: "Join ChatGPT swarm", description: "Join a swarm with a verified MCP peer identity and a fresh invite.", inputSchema: schemas.chat_swarm_join, outputSchema: workerResult }, async (input: any, extra) => {
-    try { admit("join"); requireFreshInvite(coordinator, authorizeInvite, input.swarmId, input.inviteCredential, config.chatSwarmInviteTtlSeconds); return success(coordinator.joinWorker(meta(extra), input.swarmId, input)); } catch (error) { return failure(error, "join"); }
+    try {
+      admit("join");
+      requireFreshInvite(coordinator, authorizeInvite, input.swarmId, input.inviteCredential, config.chatSwarmInviteTtlSeconds);
+      return success(coordinator.joinWorker(meta(extra), input.swarmId, input));
+    } catch (error) { return failure(error, "join"); }
   });
   server.registerTool("chat_swarm_next", { title: "Get next swarm task", description: "Return the worker's current task or atomically claim the next queued task.", inputSchema: schemas.chat_swarm_next, outputSchema: nextResult }, async (input: any, extra) => {
-    try { const worker = coordinator.store.getWorker(input.workerId); admit("worker_next", { existingTask: Boolean(worker?.currentTaskId) }); return success({ task: coordinator.nextTask(meta(extra), input.workerId, worker?.currentTaskId) ?? null }); } catch (error) { return failure(error, "next"); }
+    try {
+      const worker = coordinator.store.getWorker(input.workerId);
+      admit("worker_next", { existingTask: Boolean(worker?.currentTaskId) });
+      return success({ task: coordinator.nextTask(meta(extra), input.workerId, worker?.currentTaskId) ?? null });
+    } catch (error) { return failure(error, "next"); }
   });
   server.registerTool("chat_swarm_submit", { title: "Submit swarm result", description: "Submit an owned worker result; terminal replay is idempotent.", inputSchema: schemas.chat_swarm_submit, outputSchema: taskResult }, async (input: any, extra) => {
-    try { admit("submit"); return success(coordinator.submit(meta(extra), input.workerId, input.taskId, input.result)); } catch (error) { return failure(error, "submit"); }
+    try { admit("submit"); return success(coordinator.submit(meta(extra), input.workerId, input.taskId, input.result)); }
+    catch (error) { return failure(error, "submit"); }
   });
   server.registerTool("chat_swarm_peer_status", { title: "Inspect peer swarm status", description: "Read current caller identity and swarm binding status without changing state.", inputSchema: schemas.chat_swarm_peer_status, outputSchema: peerStatusResult, annotations: { readOnlyHint: true, idempotentHint: true } }, async (input: any, extra) => {
-    try { admit("peer_status"); return success(coordinator.peerStatus(meta(extra), input.swarmId)); } catch (error) { return failure(error, "peer_status"); }
+    try { admit("peer_status"); return success(coordinator.peerStatus(meta(extra), input.swarmId)); }
+    catch (error) { return failure(error, "peer_status"); }
   });
   server.registerTool("chat_swarm_inspect", { title: "Inspect swarm roster and admission", description: "Read swarm roster, pending join requests, and delivery mode as the swarm owner.", inputSchema: schemas.chat_swarm_inspect, outputSchema: inspectResult, annotations: { readOnlyHint: true, idempotentHint: true } }, async (input: any, extra) => {
-    try { admit("inspect"); return success(coordinator.inspect(meta(extra), input.swarmId, input.cursor, input.limit)); } catch (error) { return failure(error, "inspect"); }
+    try { admit("inspect"); return success(coordinator.inspect(meta(extra), input.swarmId, input.cursor, input.limit)); }
+    catch (error) { return failure(error, "inspect"); }
   });
   server.registerTool("chat_swarm_tasks", { title: "List swarm tasks", description: "Enumerate the swarm task ledger with bounded summaries as the swarm owner.", inputSchema: schemas.chat_swarm_tasks, outputSchema: tasksResult, annotations: { readOnlyHint: true, idempotentHint: true } }, async (input: any, extra) => {
-    try { admit("tasks"); return success(coordinator.listTasks(meta(extra), input.swarmId, { limit: input.limit, cursor: input.cursor, lifecycleState: input.lifecycleState })); } catch (error) { return failure(error, "tasks"); }
+    try { admit("tasks"); return success(coordinator.listTasks(meta(extra), input.swarmId, { limit: input.limit, cursor: input.cursor, lifecycleState: input.lifecycleState })); }
+    catch (error) { return failure(error, "tasks"); }
   });
   server.registerTool("chat_swarm_join_request", { title: "Request to join swarm", description: "Create a bounded pending request to join an active swarm without secrets.", inputSchema: schemas.chat_swarm_join_request, outputSchema: joinRequestResult, annotations: { readOnlyHint: false, idempotentHint: true } }, async (input: any, extra) => {
-    try { admit("join_request"); return success(coordinator.createJoinRequest(meta(extra), input.swarmId, input.label, input.attemptKey)); } catch (error) { return failure(error, "join_request"); }
+    try { admit("join_request"); return success(coordinator.createJoinRequest(meta(extra), input.swarmId, input.label, input.attemptKey)); }
+    catch (error) { return failure(error, "join_request"); }
   });
   server.registerTool("chat_swarm_approve_join", { title: "Approve peer join request", description: "Owner approves a pending peer join request and atomically binds a worker slot.", inputSchema: schemas.chat_swarm_approve_join, outputSchema: approveJoinResult, annotations: { readOnlyHint: false, idempotentHint: true } }, async (input: any, extra) => {
-    try { admit("approve_join"); return success(coordinator.approveJoin(meta(extra), input.swarmId, input.requestId, input.expectedRequestVersion, input.expectedSwarmVersion)); } catch (error) { return failure(error, "approve_join"); }
+    try { admit("approve_join"); return success(coordinator.approveJoin(meta(extra), input.swarmId, input.requestId, input.expectedRequestVersion, input.expectedSwarmVersion)); }
+    catch (error) { return failure(error, "approve_join"); }
   });
-  return 15;
+
+  let count = 15;
+  if (runtimeFactory) {
+    count += registerChatSwarmRuntimeTools(
+      server,
+      runtimeFactory,
+      config,
+      (action) => admit(action),
+    );
+  }
+  return count;
 }
