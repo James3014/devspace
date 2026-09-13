@@ -23,14 +23,17 @@ function worker(overrides: Partial<WorkerContinuationSnapshot> = {}): WorkerCont
   };
 }
 
-function request(overrides: Partial<ChatSwarmContinuationRequest> = {}): ChatSwarmContinuationRequest {
-  const material = prepareContinuationMaterial(worker(), {
+function createInput(attemptKey = "cont-1", sourceEpoch = 4) {
+  return {
     swarmId: "swarm-1",
     workerId: "worker-1",
-    attemptKey: "cont-1",
-    sourceEpoch: 4,
-    targetCarrierFingerprint: target,
-  });
+    attemptKey,
+    sourceEpoch,
+  };
+}
+
+function request(overrides: Partial<ChatSwarmContinuationRequest> = {}): ChatSwarmContinuationRequest {
+  const material = prepareContinuationMaterial(worker(), createInput(), target);
   return {
     id: "contreq-1",
     swarmId: "swarm-1",
@@ -50,43 +53,40 @@ function request(overrides: Partial<ChatSwarmContinuationRequest> = {}): ChatSwa
   };
 }
 
-test("prepare binds exact epoch, carriers and checkpoint", () => {
-  const material = prepareContinuationMaterial(worker(), {
-    swarmId: "swarm-1",
-    workerId: "worker-1",
-    attemptKey: "cont-1",
-    sourceEpoch: 4,
-    targetCarrierFingerprint: target,
-  });
+test("prepare binds exact epoch, authenticated target carrier and checkpoint", () => {
+  const material = prepareContinuationMaterial(worker(), createInput(), target);
   assert.equal(material.sourceEpoch, 4);
   assert.equal(material.targetEpoch, 5);
   assert.equal(material.sourceCarrierFingerprint, source);
   assert.equal(material.targetCarrierFingerprint, target);
   assert.match(material.checkpointHash, /^[0-9a-f]{64}$/);
   assert.match(material.requestHash, /^[0-9a-f]{64}$/);
+
+  const otherTarget = "c".repeat(64);
+  const other = prepareContinuationMaterial(worker(), createInput(), otherTarget);
+  assert.notEqual(material.requestHash, other.requestHash);
 });
 
 test("prepare rejects unsafe active worker and stale epoch", () => {
   assert.throws(
-    () => prepareContinuationMaterial(worker({ lifecycleState: "BUSY", currentTaskId: "task-live" }), {
-      swarmId: "swarm-1",
-      workerId: "worker-1",
-      attemptKey: "cont-2",
-      sourceEpoch: 4,
-      targetCarrierFingerprint: target,
-    }),
+    () => prepareContinuationMaterial(
+      worker({ lifecycleState: "BUSY", currentTaskId: "task-live" }),
+      createInput("cont-2"),
+      target,
+    ),
     (error: unknown) => error instanceof ChatSwarmError && error.code === "RECONCILIATION_REQUIRED",
   );
 
   assert.throws(
-    () => prepareContinuationMaterial(worker(), {
-      swarmId: "swarm-1",
-      workerId: "worker-1",
-      attemptKey: "cont-3",
-      sourceEpoch: 3,
-      targetCarrierFingerprint: target,
-    }),
+    () => prepareContinuationMaterial(worker(), createInput("cont-3", 3), target),
     (error: unknown) => error instanceof ChatSwarmError && error.code === "OWNERSHIP_CONFLICT",
+  );
+});
+
+test("prepare rejects reuse of the current carrier as target", () => {
+  assert.throws(
+    () => prepareContinuationMaterial(worker(), createInput("cont-same"), source),
+    (error: unknown) => error instanceof ChatSwarmError && error.code === "INVALID_INPUT",
   );
 });
 
