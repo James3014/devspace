@@ -74,6 +74,25 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
     if (entry) entry.snapshot = snapshot;
   }
 
+  /** Record the exact generation an active session acknowledged via tools/list. */
+  acknowledgeToolsList(sessionId: string, snapshot: SessionGenerationSnapshot): boolean {
+    const entry = this.sessions.get(sessionId);
+    const current = entry?.snapshot;
+    if (!current) return false;
+    if (
+      current.serverInstanceId !== snapshot.serverInstanceId ||
+      current.sourceCommit !== snapshot.sourceCommit ||
+      current.buildId !== snapshot.buildId ||
+      current.freshness !== snapshot.freshness
+    ) return false;
+    entry.snapshot = {
+      ...current,
+      capabilityManifestSha256: snapshot.capabilityManifestSha256,
+      catalogGeneration: snapshot.catalogGeneration,
+    };
+    return true;
+  }
+
   getServer(sessionId: string): any | undefined {
     return this.sessions.get(sessionId)?.server;
   }

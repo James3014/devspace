@@ -197,7 +197,7 @@ test("SessionConvergence: CURRENT when snapshot matches server identity", () => 
   assert.equal(result.reconnectRequired, false);
 });
 
-test("SessionConvergence: RECONCILIATION_REQUIRED when server is in cutover drain mode", () => {
+test("SessionConvergence: RECONCILE_REQUIRED when server is in cutover drain mode", () => {
   const current = {
     serverInstanceId: "srv-1",
     sourceCommit: "commit-1",
@@ -216,7 +216,7 @@ test("SessionConvergence: RECONCILIATION_REQUIRED when server is in cutover drai
     sessionInitializedAt: new Date().toISOString(),
   };
   const result = evaluateSessionConvergence(snapshot, current);
-  assert.equal(result.state, "RECONCILIATION_REQUIRED");
+  assert.equal(result.state, "RECONCILE_REQUIRED");
   assert.equal(result.reconciliationRequired, true);
 });
 
@@ -244,7 +244,7 @@ test("SessionConvergence: STALE_SERVER when server instance changed", () => {
   assert.equal(result.converged, false);
 });
 
-test("SessionConvergence: STALE_CAPABILITY_MANIFEST or RECONNECT_REQUIRED based on client capabilities", () => {
+test("SessionConvergence: manifest and catalog drift stay stale until tools/list acknowledgement", () => {
   const current = {
     serverInstanceId: "srv-1",
     sourceCommit: "commit-1",
@@ -254,27 +254,52 @@ test("SessionConvergence: STALE_CAPABILITY_MANIFEST or RECONNECT_REQUIRED based 
     cutoverMode: "normal",
     reconciliationRequired: false,
   };
-  const s1 = {
+  const manifestStale = {
     serverInstanceId: "srv-1",
     sourceCommit: "commit-1",
     buildId: "build-1",
     capabilityManifestSha256: "man-1",
     catalogGeneration: "gen-1",
     sessionInitializedAt: new Date().toISOString(),
-    clientSupportsListChanged: false,
   };
-  assert.equal(evaluateSessionConvergence(s1, current).state, "RECONNECT_REQUIRED");
+  const manifestResult = evaluateSessionConvergence(manifestStale, current);
+  assert.equal(manifestResult.state, "STALE_CAPABILITY_MANIFEST");
+  assert.equal(manifestResult.reconnectRequired, false);
 
-  const s2 = { ...s1, clientSupportsListChanged: true };
-  const r2 = evaluateSessionConvergence(s2, current);
-  assert.equal(r2.state, "STALE_CAPABILITY_MANIFEST");
-  assert.equal(r2.reconnectRequired, false);
+  const catalogStale = { ...manifestStale, capabilityManifestSha256: "man-2", catalogGeneration: "gen-0" };
+  const catalogResult = evaluateSessionConvergence(catalogStale, current);
+  assert.equal(catalogResult.state, "STALE_SESSION_CATALOG");
+  assert.equal(catalogResult.reconnectRequired, false);
+});
+
+test("SessionConvergence: source/build/freshness identity drift is STALE_SERVER", () => {
+  const current = {
+    serverInstanceId: "srv-1",
+    sourceCommit: "commit-2",
+    buildId: "build-2",
+    capabilityManifestSha256: "man-1",
+    catalogGeneration: "gen-1",
+    freshness: "fresh-2",
+    cutoverMode: "normal",
+    reconciliationRequired: false,
+  };
+  const snapshot = {
+    serverInstanceId: "srv-1",
+    sourceCommit: "commit-1",
+    buildId: "build-1",
+    capabilityManifestSha256: "man-1",
+    catalogGeneration: "gen-1",
+    freshness: "fresh-1",
+    sessionInitializedAt: new Date().toISOString(),
+  };
+  assert.equal(evaluateSessionConvergence(snapshot, current).state, "STALE_SERVER");
 });
 
 test("MultiRoleConvergence: aggregates convergence status across service roles", () => {
   const roles = [
     {
       role: "dev2",
+      roleKind: "AUTHORITATIVE_PRODUCTION" as const,
       expectedCommit: "commit-1",
       expectedBuildId: "build-1",
       runningBuild: {
@@ -294,6 +319,7 @@ test("MultiRoleConvergence: aggregates convergence status across service roles",
     },
     {
       role: "dev-c",
+      roleKind: "NON_AUTHORITATIVE_MIGRATION_SOURCE" as const,
       expectedCommit: "commit-2",
       expectedBuildId: "build-2",
       runningBuild: {
@@ -318,4 +344,67 @@ test("MultiRoleConvergence: aggregates convergence status across service roles",
   assert.equal(evalResult.roleStates["dev2"].converged, true);
   assert.equal(evalResult.roleStates["dev-c"].converged, false);
   assert.ok(evalResult.summary.includes("dev-c"));
+});
+
+test("MultiRoleConvergence: rejects competing authoritative production roles", () => {
+  const role = (name: string) => ({
+    role: name,
+    roleKind: "AUTHORITATIVE_PRODUCTION" as const,
+    expectedCommit: "commit-1",
+    expectedBuildId: "build-1",
+    runningBuild: {
+      commit: "commit-1",
+      buildId: "build-1",
+      serverInstanceId: name,
+      manifestSha256: "hash-1",
+      capabilities: [
+        "agent_start.tool",
+        "agent_start.executionContract.authorityMode",
+        "agent_start.executionContract.idleTimeoutMs",
+        "agent_start.executionContract.nexusGrant",
+      ],
+      cutoverMode: "normal",
+      reconciliationRequired: false,
+    },
+  });
+  const result = evaluateMultiRoleConvergence([role("dev2"), role("dev3")]);
+  assert.equal(result.topologyValid, false);
+  assert.equal(result.reconciliationRequired, true);
+  assert.deepEqual(result.authoritativeProductionRoles, ["dev2", "dev3"]);
+});
+
+test("MultiRoleConvergence: missing role kind never guesses from connector names", () => {
+  const result = evaluateMultiRoleConvergence([{
+    role: "dev-c",
+    expectedCommit: "commit-1",
+    expectedBuildId: "build-1",
+    runningBuild: {
+      commit: "commit-1",
+      buildId: "build-1",
+      serverInstanceId: "dev-c",
+      manifestSha256: "hash-1",
+      capabilities: [
+        "agent_start.tool",
+        "agent_start.executionContract.authorityMode",
+        "agent_start.executionContract.idleTimeoutMs",
+        "agent_start.executionContract.nexusGrant",
+      ],
+      cutoverMode: "normal",
+      reconciliationRequired: false,
+    },
+  }]);
+  assert.equal(result.topologyValid, false);
+  assert.deepEqual(result.missingRoleKindRoles, ["dev-c"]);
+  assert.equal(result.authoritativeProductionRoles.length, 0);
+});
+
+test("MultiRoleConvergence: unknown role kind is also topology-invalid", () => {
+  const result = evaluateMultiRoleConvergence([{
+    role: "mystery",
+    roleKind: "UNKNOWN" as never,
+    expectedCommit: "commit-1",
+    runningBuild: undefined,
+  }]);
+  assert.equal(result.topologyValid, false);
+  assert.deepEqual(result.missingRoleKindRoles, ["mystery"]);
 });

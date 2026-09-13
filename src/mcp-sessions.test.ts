@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { evaluateSessionConvergence, type SessionGenerationSnapshot } from "./deployment-convergence.js";
 import { McpSessionRegistry } from "./mcp-sessions.js";
 
 interface FakeTransport {
@@ -179,3 +180,36 @@ assert.equal(snapshotRegistry.getAllServers().length, 1);
 
 snapshotRegistry.setSnapshot("sess-1", { ...initialSnapshot, catalogGeneration: "gen-2" });
 assert.equal(snapshotRegistry.getSnapshot("sess-1")?.catalogGeneration, "gen-2");
+
+// A listChanged notification is only a hint: any active session's subsequent
+// tools/list request is the acknowledgement that advances that exact snapshot.
+const currentSnapshot: SessionGenerationSnapshot = {
+  ...initialSnapshot,
+  capabilityManifestSha256: "man-2",
+  catalogGeneration: "gen-3",
+};
+const acknowledgementRegistry = new McpSessionRegistry<FakeTransport>();
+acknowledgementRegistry.register("active", createTransport(), { snapshot: initialSnapshot });
+acknowledgementRegistry.register("another-active", createTransport(), { snapshot: initialSnapshot });
+const staleServer = { ...currentSnapshot, cutoverMode: "normal", reconciliationRequired: false };
+assert.equal(evaluateSessionConvergence(acknowledgementRegistry.getSnapshot("active")!, staleServer).state, "STALE_CAPABILITY_MANIFEST");
+// Exercise the actual MCP request sequence: notification is only a hint, and
+// the client's subsequent tools/list request is the authoritative acknowledgement.
+const requestSequence = [
+  { method: "notifications/tools/list_changed" },
+  { method: "tools/list" },
+] as const;
+for (const request of requestSequence) {
+  if (request.method === "tools/list") {
+    assert.equal(acknowledgementRegistry.acknowledgeToolsList("active", currentSnapshot), true);
+  }
+}
+assert.equal(acknowledgementRegistry.getSnapshot("active")?.catalogGeneration, "gen-3");
+const currentServer = { ...currentSnapshot, cutoverMode: "normal", reconciliationRequired: false };
+assert.equal(evaluateSessionConvergence(acknowledgementRegistry.getSnapshot("active")!, currentServer).state, "CURRENT");
+assert.equal(acknowledgementRegistry.acknowledgeToolsList("another-active", currentSnapshot), true);
+assert.equal(acknowledgementRegistry.acknowledgeToolsList("missing", currentSnapshot), false);
+const reconnectServer = { ...currentServer, serverInstanceId: "srv-new", sourceCommit: "commit-new", buildId: "build-new", freshness: "fresh-new" };
+assert.equal(acknowledgementRegistry.acknowledgeToolsList("another-active", reconnectServer), false);
+assert.equal(evaluateSessionConvergence(acknowledgementRegistry.getSnapshot("another-active")!, reconnectServer).state, "STALE_SERVER");
+assert.equal(evaluateSessionConvergence(undefined, reconnectServer).state, "RECONNECT_REQUIRED");

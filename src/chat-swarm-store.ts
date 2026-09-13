@@ -1,13 +1,14 @@
 import { timingSafeEqual } from "node:crypto";
-import { openDatabase, type DatabaseHandle } from "./db/client.js";
+import { openDatabase, type DatabaseHandle, type SqliteDatabase } from "./db/client.js";
 import {
   assertBounded, assertTaskState, ChatSwarmError, hashContent, hashCredential, isExecutionActive, isTerminal,
   MAX_ID_BYTES, MAX_JSON_BYTES, MAX_PROMPT_BYTES, MAX_RESULT_BYTES, newId, requestHash, joinRequestHash,
-  type ChatSwarm, type ChatSwarmAttempt, type ChatSwarmRuntimeKind, type ChatSwarmTask,
+  canonicalize, type ChatSwarm, type ChatSwarmAttempt, type ChatSwarmRuntimeKind, type ChatSwarmTask,
   type ChatSwarmTaskState, type ChatSwarmWorker, type TaskRequest, type ReconciliationEvidence,
   type ChatSwarmJoinRequest, type ChatSwarmJoinRequestStatus, JOIN_REQUEST_STATES,
   type ChatSwarmTaskSummary, type ChatSwarmTaskListResult,
 } from "./chat-swarm-contract.js";
+import type { ControlPlaneServiceBinding } from "./control-plane-convergence.js";
 
 type Row = Record<string, unknown>;
 const json = (value: unknown): string => JSON.stringify(value ?? {});
@@ -30,6 +31,27 @@ export type CarrierOperationKind = "ENSURE_EXISTING" | "WAKE";
 export type CarrierOperationState = "PREPARED" | "IN_FLIGHT" | "SUCCEEDED" | "UNSUPPORTED" | "RECONCILE_REQUIRED";
 export interface CarrierOperationRecord { operationId: string; operationKey: string; slotKey: string; swarmId: string; workerId: string; taskId?: string; attemptId?: string; carrierKind: string; carrierFingerprint: string; bindingEpoch: number; adapterConfigHash: string; kind: CarrierOperationKind; state: CarrierOperationState; request: Record<string, unknown>; receipt?: Record<string, unknown>; version: number; createdAt: string; updatedAt: string; }
 
+export interface ChatSwarmMigrationBundle {
+  schema: "devspace.chat_swarm_migration_bundle.v1";
+  operationId: string;
+  sourceBinding: ControlPlaneServiceBinding;
+  destinationBinding: ControlPlaneServiceBinding;
+  contentHash: string;
+  swarms: ChatSwarm[];
+  workers: ChatSwarmWorker[];
+  tasks: ChatSwarmTask[];
+  attempts: ChatSwarmAttempt[];
+  carrierOperations: CarrierOperationRecord[];
+}
+
+export interface ChatSwarmMigrationReadback {
+  schema: "devspace.chat_swarm_migration_readback.v1";
+  operationId: string;
+  contentHash: string;
+  counts: { swarms: number; workers: number; tasks: number; attempts: number; carrierOperations: number };
+  unresolvedTaskIds: string[];
+}
+
 export class ChatSwarmStore {
   private readonly database: DatabaseHandle;
   private get sqlite() { return this.database.sqlite; }
@@ -38,6 +60,96 @@ export class ChatSwarmStore {
     this.database = openDatabase(stateDir);
   }
   close(): void { this.database.close(); }
+
+  listSwarms(): ChatSwarm[] {
+    return (this.sqlite.prepare("select * from chat_swarms order by id").all() as Row[]).map(swarmFrom);
+  }
+
+  listAllTasksForMigration(swarmId: string): ChatSwarmTask[] {
+    return listAllTasksFromDb(this.sqlite, swarmId);
+  }
+
+  readMigrationReadback(bundle: Pick<ChatSwarmMigrationBundle, "operationId" | "swarms" | "workers" | "tasks" | "attempts" | "carrierOperations">): ChatSwarmMigrationReadback {
+    return migrationReadback(this, bundle as ChatSwarmMigrationBundle);
+  }
+
+  /** Export validated domain records; this never reads or attaches the SQLite file. */
+  exportMigrationBundle(input: {
+    operationId: string;
+    sourceBinding: ControlPlaneServiceBinding;
+    destinationBinding: ControlPlaneServiceBinding;
+    swarmIds?: string[];
+  }): ChatSwarmMigrationBundle {
+    if (!input.operationId.trim()) throw new ChatSwarmError("INVALID_INPUT", "migration operationId is required");
+    validateMigrationBinding(input.sourceBinding, "source");
+    validateMigrationBinding(input.destinationBinding, "destination");
+    if (input.swarmIds && (input.swarmIds.length > 10_000 || input.swarmIds.some((id) => typeof id !== "string" || id.length === 0 || id.length > MAX_ID_BYTES))) throw new ChatSwarmError("INVALID_INPUT", "migration swarmIds are malformed or exceed the bounded limit");
+    const selected = input.swarmIds ? new Set(input.swarmIds) : undefined;
+    const swarms = this.listSwarms().filter((swarm) => !selected || selected.has(swarm.id));
+    const workers = swarms.flatMap((swarm) => this.listWorkers(swarm.id));
+    const tasks = swarms.flatMap((swarm) => this.listAllTasksForMigration(swarm.id));
+    const taskIds = new Set(tasks.map((task) => task.id));
+    const attempts = tasks.flatMap((task) => this.listAttempts(task.id));
+    const carrierOperations = swarms.flatMap((swarm) => this.listCarrierOperations(swarm.id));
+    if (tasks.some((task) => task.lifecycleState === "RECONCILE_REQUIRED" && task.retrySafe)) {
+      throw new ChatSwarmError("RECONCILIATION_REQUIRED", "a RECONCILE_REQUIRED task cannot be exported as retry-safe");
+    }
+    if (workers.some((worker) => worker.currentTaskId && !taskIds.has(worker.currentTaskId))) {
+      throw new ChatSwarmError("INVALID_STATE", "worker currentTaskId is not present in the exported task records");
+    }
+    const payload = migrationPayload({ swarms, workers, tasks, attempts, carrierOperations });
+    const bundle: ChatSwarmMigrationBundle = {
+      schema: "devspace.chat_swarm_migration_bundle.v1",
+      operationId: input.operationId,
+      sourceBinding: structuredClone(input.sourceBinding),
+      destinationBinding: structuredClone(input.destinationBinding),
+      contentHash: hashContent(JSON.stringify(payload)),
+      swarms,
+      workers,
+      tasks,
+      attempts,
+      carrierOperations,
+    };
+    rejectMigrationSecrets(bundle);
+    return bundle;
+  }
+
+  /** Import domain records with exact binding, collision, and idempotency checks. */
+  importMigrationBundle(bundle: ChatSwarmMigrationBundle, expectedDestinationBinding: ControlPlaneServiceBinding): ChatSwarmMigrationReadback {
+    validateMigrationBundle(bundle, expectedDestinationBinding);
+    const result = this.sqlite.transaction(() => {
+      for (const swarm of bundle.swarms) {
+        const existing = this.getSwarm(swarm.id);
+        if (existing) assertSameMigrationRecord(existing, swarm, `swarm '${swarm.id}'`);
+        else this.sqlite.prepare("insert into chat_swarms (id,status,owner_identity_fingerprint,worker_limit,invite_credential_hash,metadata_json,revision,created_at,updated_at) values (?,?,?,?,?,?,?,?,?)").run(swarm.id, swarm.status, swarm.ownerIdentityFingerprint, swarm.workerLimit, swarm.inviteCredentialHash ?? null, JSON.stringify(swarm.metadata), swarm.revision, swarm.createdAt, swarm.updatedAt);
+      }
+      for (const worker of bundle.workers) {
+        const existing = this.getWorker(worker.id);
+        if (existing) assertSameMigrationRecord(existing, worker, `worker '${worker.id}'`);
+        else this.sqlite.prepare("insert into chat_swarm_workers (id,swarm_id,label,runtime_kind,session_identity_fingerprint,carrier_conversation_fingerprint,lifecycle_state,current_task_id,lease_json,checkpoint_json,continuation_epoch,created_at,updated_at) values (?,?,?,?,?,?,?,null,?,?,?,?,?)").run(worker.id, worker.swarmId, worker.label, worker.runtimeKind, worker.sessionIdentityFingerprint ?? null, worker.carrierConversationFingerprint ?? null, worker.lifecycleState, worker.lease ? JSON.stringify(worker.lease) : null, worker.checkpoint ? JSON.stringify(worker.checkpoint) : null, worker.continuationEpoch, worker.createdAt, worker.updatedAt);
+      }
+      for (const task of bundle.tasks) {
+        const existing = this.getTask(task.id);
+        if (existing) assertSameMigrationRecord(existing, task, `task '${task.id}'`);
+        else this.sqlite.prepare("insert into chat_swarm_tasks (id,swarm_id,task_key,request_hash,prompt,payload_json,preferred_worker_id,assigned_worker_id,lifecycle_state,result,error_code,error_message,retry_safe,reconciliation_json,created_at,updated_at,completed_at,collected_at) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(task.id, task.swarmId, task.taskKey, task.requestHash, task.prompt, JSON.stringify(task.payload), task.preferredWorkerId ?? null, task.assignedWorkerId ?? null, task.lifecycleState, task.result ?? null, task.errorCode ?? null, task.errorMessage ?? null, String(task.retrySafe), task.reconciliation ? JSON.stringify(task.reconciliation) : null, task.createdAt, task.updatedAt, task.completedAt ?? null, task.collectedAt ?? null);
+      }
+      for (const worker of bundle.workers) {
+        this.sqlite.prepare("update chat_swarm_workers set current_task_id=? where id=? and current_task_id is null").run(worker.currentTaskId ?? null, worker.id);
+      }
+      for (const attempt of bundle.attempts) {
+        const existing = this.getAttempt(attempt.id);
+        if (existing) assertSameMigrationRecord(existing, attempt, `attempt '${attempt.id}'`);
+        else this.sqlite.prepare("insert into chat_swarm_attempts (id,task_id,attempt_number,runtime_kind,effect_state,runtime_receipt_json,started_at,acknowledged_at,finished_at,created_at) values (?,?,?,?,?,?,?,?,?,?)").run(attempt.id, attempt.taskId, attempt.attemptNumber, attempt.runtimeKind, attempt.effectState, attempt.runtimeReceipt ? JSON.stringify(attempt.runtimeReceipt) : null, attempt.startedAt ?? null, attempt.acknowledgedAt ?? null, attempt.finishedAt ?? null, attempt.createdAt);
+      }
+      for (const operation of bundle.carrierOperations) {
+        const existing = this.getCarrierOperation(operation.operationId);
+        if (existing) assertSameMigrationRecord(existing, operation, `carrier operation '${operation.operationId}'`);
+        else this.sqlite.prepare("insert into chat_swarm_carrier_operations (operation_id,operation_key,slot_key,swarm_id,worker_id,task_id,attempt_id,carrier_kind,binding_epoch,adapter_config_hash,kind,state,request_json,receipt_json,version,created_at,updated_at,carrier_fingerprint) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)").run(operation.operationId, operation.operationKey, operation.slotKey, operation.swarmId, operation.workerId, operation.taskId ?? null, operation.attemptId ?? null, operation.carrierKind, operation.bindingEpoch, operation.adapterConfigHash, operation.kind, operation.state, JSON.stringify(operation.request), operation.receipt ? JSON.stringify(operation.receipt) : null, operation.version, operation.createdAt, operation.updatedAt, operation.carrierFingerprint);
+      }
+      return migrationReadback(this, bundle);
+    });
+    return result.immediate();
+  }
 
   createCarrierOperation(input: Omit<CarrierOperationRecord, "version" | "createdAt" | "updatedAt">): CarrierOperationRecord {
     const requestJson = JSON.stringify(input.request); const receiptJson = input.receipt === undefined ? null : JSON.stringify(input.receipt);
@@ -617,6 +729,62 @@ export class ChatSwarmStore {
     });
     return operation.immediate();
   }
+}
+
+function listAllTasksFromDb(sqlite: SqliteDatabase, swarmId: string): ChatSwarmTask[] {
+  return (sqlite.prepare("select * from chat_swarm_tasks where swarm_id = ? order by id").all(swarmId) as Row[]).map(taskFrom);
+}
+
+function migrationPayload(records: Pick<ChatSwarmMigrationBundle, "swarms" | "workers" | "tasks" | "attempts" | "carrierOperations">): unknown {
+  return canonicalize({ swarms: records.swarms, workers: records.workers, tasks: records.tasks, attempts: records.attempts, carrierOperations: records.carrierOperations });
+}
+
+function rejectMigrationSecrets(bundle: unknown): void {
+  const serialized = JSON.stringify(bundle);
+  if (/"[^"\n]*(?:oauth|secret|token|client[_-]?id|access[_-]?token|refresh[_-]?token)[^"\n]*"\s*:/i.test(serialized)) {
+    throw new ChatSwarmError("INVALID_INPUT", "Chat Swarm migration bundles cannot contain OAuth secrets, tokens, or client rows");
+  }
+}
+
+function assertSameMigrationRecord(actual: unknown, expected: unknown, label: string): void {
+  if (JSON.stringify(canonicalize(actual)) !== JSON.stringify(canonicalize(expected))) {
+    throw new ChatSwarmError("REPLAY_CONFLICT", `migration collision for ${label}`);
+  }
+}
+
+function validateMigrationBundle(bundle: ChatSwarmMigrationBundle, expectedDestinationBinding: ControlPlaneServiceBinding): void {
+  if (!bundle || bundle.schema !== "devspace.chat_swarm_migration_bundle.v1" || !bundle.operationId.trim()) throw new ChatSwarmError("INVALID_INPUT", "migration bundle schema or operation identity is invalid");
+  validateMigrationBinding(bundle.sourceBinding, "source");
+  validateMigrationBinding(bundle.destinationBinding, "destination");
+  validateMigrationBinding(expectedDestinationBinding, "expected destination");
+  if (JSON.stringify(canonicalize(bundle.destinationBinding)) !== JSON.stringify(canonicalize(expectedDestinationBinding))) throw new ChatSwarmError("OWNERSHIP_CONFLICT", "migration destination binding does not match the exact expected identity");
+  rejectMigrationSecrets(bundle);
+  const payload = migrationPayload(bundle);
+  if (hashContent(JSON.stringify(payload)) !== bundle.contentHash) throw new ChatSwarmError("REPLAY_CONFLICT", "migration bundle content hash does not match its domain records");
+  for (const value of [bundle.swarms, bundle.workers, bundle.tasks, bundle.attempts, bundle.carrierOperations]) if (!Array.isArray(value)) throw new ChatSwarmError("INVALID_INPUT", "migration bundle domain records are malformed");
+  if (bundle.tasks.some((task) => task.lifecycleState === "RECONCILE_REQUIRED" && task.retrySafe)) throw new ChatSwarmError("RECONCILIATION_REQUIRED", "RECONCILE_REQUIRED task cannot become retry-safe during migration");
+}
+
+function validateMigrationBinding(binding: ControlPlaneServiceBinding, label: string): void {
+  if (!binding || typeof binding.serverInstanceId !== "string" || binding.serverInstanceId.length === 0 || !/^[0-9a-f]{40}$/.test(binding.sourceCommit) || typeof binding.buildId !== "string" || binding.buildId.length === 0 || !/^[0-9a-f]{64}$/.test(binding.capabilityManifestSha256) || typeof binding.catalogGeneration !== "string" || binding.catalogGeneration.length === 0 || typeof binding.stateDirectory !== "string" || binding.stateDirectory.length === 0) {
+    throw new ChatSwarmError("INVALID_INPUT", `migration ${label} binding is malformed`);
+  }
+}
+
+function migrationReadback(store: ChatSwarmStore, bundle: ChatSwarmMigrationBundle): ChatSwarmMigrationReadback {
+  const swarms = bundle.swarms.map((item) => store.getSwarm(item.id)).filter((item): item is ChatSwarm => Boolean(item));
+  const workers = swarms.flatMap((swarm) => store.listWorkers(swarm.id));
+  const tasks = swarms.flatMap((swarm) => store.listAllTasksForMigration(swarm.id));
+  const attempts = tasks.flatMap((task) => store.listAttempts(task.id));
+  const carrierOperations = swarms.flatMap((swarm) => store.listCarrierOperations(swarm.id));
+  const records = { swarms, workers, tasks, attempts, carrierOperations };
+  return {
+    schema: "devspace.chat_swarm_migration_readback.v1",
+    operationId: bundle.operationId,
+    contentHash: hashContent(JSON.stringify(migrationPayload(records))),
+    counts: { swarms: swarms.length, workers: workers.length, tasks: tasks.length, attempts: attempts.length, carrierOperations: carrierOperations.length },
+    unresolvedTaskIds: tasks.filter((task) => task.lifecycleState === "RECONCILE_REQUIRED").map((task) => task.id).sort(),
+  };
 }
 
 function swarmFrom(row: Row): ChatSwarm { const status = String(row.status); if (status !== "ACTIVE" && status !== "CLOSED") throw new ChatSwarmError("INVALID_STATE", `unknown swarm state '${status}'`); return { id: String(row.id), status, ownerIdentityFingerprint: String(row.owner_identity_fingerprint), workerLimit: Number(row.worker_limit), inviteCredentialHash: row.invite_credential_hash == null ? undefined : String(row.invite_credential_hash), metadata: parseObject(row.metadata_json, "swarm metadata") ?? {}, revision: Number(row.revision ?? 1), createdAt: String(row.created_at), updatedAt: String(row.updated_at) }; }

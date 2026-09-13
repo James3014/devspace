@@ -44,43 +44,31 @@ test("Issue #133: SessionConvergence detects stale server across restart", () =>
   assert.ok(evalResult.details.includes("Server instance changed"));
 });
 
-test("Issue #133: SessionConvergence detects capability manifest change with client listChanged support", () => {
+test("Issue #133: SessionConvergence keeps manifest drift stale until tools/list acknowledgement", () => {
   const current = {
     serverInstanceId: "srv-1",
-    sourceCommit: "commit-2",
-    buildId: "build-2",
+    sourceCommit: "commit-1",
+    buildId: "build-1",
     capabilityManifestSha256: "manifest-new",
     catalogGeneration: "gen-1",
     cutoverMode: "normal",
     reconciliationRequired: false,
   };
 
-  // Client supporting listChanged
-  const sessionWithSupport: SessionGenerationSnapshot = {
+  const session: SessionGenerationSnapshot = {
     serverInstanceId: "srv-1",
     sourceCommit: "commit-1",
     buildId: "build-1",
     capabilityManifestSha256: "manifest-old",
     catalogGeneration: "gen-1",
     sessionInitializedAt: new Date().toISOString(),
-    clientSupportsListChanged: true,
   };
 
-  const evalSupported = evaluateSessionConvergence(sessionWithSupport, current);
-  assert.equal(evalSupported.state, "STALE_CAPABILITY_MANIFEST");
-  assert.equal(evalSupported.converged, false);
-  assert.equal(evalSupported.reconnectRequired, false); // client can receive notification
-  assert.equal(evalSupported.activeDrift, true);
-
-  // Client without listChanged support
-  const sessionWithoutSupport: SessionGenerationSnapshot = {
-    ...sessionWithSupport,
-    clientSupportsListChanged: false,
-  };
-
-  const evalUnsupported = evaluateSessionConvergence(sessionWithoutSupport, current);
-  assert.equal(evalUnsupported.state, "RECONNECT_REQUIRED");
-  assert.equal(evalUnsupported.reconnectRequired, true);
+  const evaluation = evaluateSessionConvergence(session, current);
+  assert.equal(evaluation.state, "STALE_CAPABILITY_MANIFEST");
+  assert.equal(evaluation.converged, false);
+  assert.equal(evaluation.reconnectRequired, false);
+  assert.equal(evaluation.activeDrift, true);
 });
 
 test("Issue #133: McpSessionRegistry preserves and updates generation snapshots & server references", () => {
@@ -100,7 +88,6 @@ test("Issue #133: McpSessionRegistry preserves and updates generation snapshots 
     capabilityManifestSha256: "hash-1",
     catalogGeneration: "gen-1",
     sessionInitializedAt: new Date().toISOString(),
-    clientSupportsListChanged: true,
   };
 
   registry.register("session-1", transport, { snapshot, server: mockServer });
@@ -118,6 +105,7 @@ test("Issue #133: MultiRoleConvergence evaluates 7677 (dev2) and 7678 (dev-c) di
   const roles: ServiceRoleDeploymentIdentity[] = [
     {
       role: "dev2-stable",
+      roleKind: "AUTHORITATIVE_PRODUCTION",
       expectedCommit: "commit-main-latest",
       expectedBuildId: "build-latest",
       installedBuild: {
@@ -142,6 +130,7 @@ test("Issue #133: MultiRoleConvergence evaluates 7677 (dev2) and 7678 (dev-c) di
     },
     {
       role: "dev-c-canary",
+      roleKind: "NON_AUTHORITATIVE_CANARY",
       expectedCommit: "commit-main-latest",
       expectedBuildId: "build-latest",
       installedBuild: {

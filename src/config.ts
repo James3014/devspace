@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
 import { expandHomePath, isPathInsideRoot } from "./roots.js";
 import type { LoggingConfig, LogFormat, LogLevel } from "./logger.js";
 import type { OAuthConfig } from "./oauth-provider.js";
@@ -7,6 +8,7 @@ import type { ToolchainSpec } from "./local-agent-toolchains.js";
 import { parseToolchains } from "./local-agent-toolchains.js";
 import { devspaceAgentsDir, devspaceSkillsDir, loadDevspaceFiles } from "./user-config.js";
 import { resolveSubagentsConfig, type SubagentsConfig } from "./local-agent-config.js";
+import { parseControlPlaneTopologyManifest, type ControlPlaneInventory } from "./control-plane-convergence.js";
 
 export type ToolMode = "minimal" | "full" | "codex";
 export type WidgetMode = "off" | "changes" | "full";
@@ -52,6 +54,9 @@ export interface ServerConfig {
   chatSwarmQueueLimit: number;
   chatSwarmResultMaxChars: number;
   chatSwarmInviteTtlSeconds: number;
+  /** Validated topology loaded from the configured DevSpace config root. */
+  controlPlaneInventory?: ControlPlaneInventory;
+  controlPlaneManifestPath: string;
   mcpCutoverBuildReadyRoot?: string;
   repositoryIntelligenceRoot?: string;
   repositoryIntelligenceExpectedHead?: string;
@@ -297,6 +302,30 @@ function parseRepositoryIntelligencePythonBin(value: string | undefined): string
   return raw || undefined;
 }
 
+/**
+ * Re-read one exact, configured topology manifest path.
+ *
+ * Production callers use this helper at operation/evaluation boundaries so a
+ * long-lived server observes an atomically replaced manifest without
+ * retaining a startup snapshot. Missing, malformed, or schema-invalid files
+ * fail closed rather than implying convergence.
+ */
+export function readControlPlaneInventory(path: string): ControlPlaneInventory {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(path, "utf8")) as unknown;
+  } catch (error) {
+    throw new Error(`Unable to read ${path}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  return parseControlPlaneTopologyManifest(raw);
+}
+
+function loadControlPlaneInventory(configDir: string): { inventory?: ControlPlaneInventory; path: string } {
+  const path = join(configDir, "control-plane.json");
+  if (!existsSync(path)) return { path };
+  return { inventory: readControlPlaneInventory(path), path };
+}
+
 function parseRepositoryIntelligenceExpectedHead(
   value: string | undefined,
   rootConfigured: boolean,
@@ -316,6 +345,7 @@ function parseRepositoryIntelligenceExpectedHead(
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
   const files = loadDevspaceFiles(env);
+  const controlPlane = loadControlPlaneInventory(files.dir);
   const host = env.HOST ?? files.config.host ?? "127.0.0.1";
   const port = parsePort(env.PORT ?? files.config.port);
   const publicBaseUrl = parsePublicBaseUrl(
@@ -406,6 +436,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       "DEVSPACE_CHAT_SWARM_INVITE_TTL_SECONDS",
       7 * 24 * 60 * 60,
     ),
+    controlPlaneInventory: controlPlane.inventory,
+    controlPlaneManifestPath: controlPlane.path,
     mcpCutoverBuildReadyRoot: parseBuildReadyRoot(
       env.DEVSPACE_BUILD_READY_ROOT ?? files.config.mcpCutoverBuildReadyRoot,
       allowedRoots,
