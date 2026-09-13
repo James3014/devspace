@@ -12,6 +12,7 @@ import {
   type ManagedConversationEvidence,
   type RuntimePreflight,
 } from "./chat-swarm-runtime.js";
+import { wakeManagedDispatchedTask } from "./chat-swarm-runtime-delivery.js";
 import type {
   CarrierCallInput,
   CarrierEnsureEvidence,
@@ -240,7 +241,7 @@ test("targeted dispatch wake is a delivery hint and preserves canonical claimed 
     });
     assert.equal(task.lifecycleState, "CLAIMED");
     assert.equal(task.assignedWorkerId, workerId);
-    await f.manager.wakeForDispatchedTask(f.owner, task);
+    await wakeManagedDispatchedTask(f.manager, f.owner, task);
     assert.equal(f.adapter.wakeCalls, 1);
     assert.equal(f.coordinator.store.getTask(task.id)?.lifecycleState, "CLAIMED");
   } finally {
