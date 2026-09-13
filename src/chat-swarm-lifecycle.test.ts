@@ -6,6 +6,7 @@ import test from "node:test";
 import { ChatSwarmError } from "./chat-swarm-contract.js";
 import { ChatSwarmLifecycle, type ChatSwarmLifecycleMode } from "./chat-swarm-lifecycle.js";
 import type { ChatSwarmCarrierAdapter } from "./chat-swarm-carrier.js";
+import { DurableOperationStore } from "./durable-operations.js";
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "devspace-chat-swarm-lifecycle-"));
@@ -42,7 +43,7 @@ test("shares one coordinator and keeps startup recovery explicit", () => {
   }
 });
 
-test("startup recovery fences pending continuation without changing worker epoch", () => {
+test("startup recovery normalizes continuation after generic durable-operation fencing", () => {
   const f = fixture();
   try {
     const owner = { "openai/session": "continuation-owner" };
@@ -67,6 +68,17 @@ test("startup recovery fences pending continuation without changing worker epoch
       sourceEpoch: 0,
     }).request;
     assert.equal(request.status, "PENDING");
+    assert.equal(request.version, 1);
+
+    const genericDurableStore = new DurableOperationStore(f.root);
+    try {
+      assert.equal(genericDurableStore.markInterruptedUnknown(), 1);
+    } finally {
+      genericDurableStore.close();
+    }
+    const genericFenced = f.lifecycle.continuationStore!.getRequest(request.id)!;
+    assert.equal(genericFenced.status, "RECONCILE_REQUIRED");
+    assert.equal(genericFenced.version, 1);
 
     const second = new ChatSwarmLifecycle({ stateDir: f.root });
     try {
@@ -79,6 +91,8 @@ test("startup recovery fences pending continuation without changing worker epoch
         f.lifecycle.store!.getWorker(worker.id)!.carrierConversationFingerprint,
         worker.carrierConversationFingerprint,
       );
+      assert.equal(second.continuationCoordinator!.recoverAfterRestart(), 0);
+      assert.equal(f.lifecycle.continuationStore!.getRequest(request.id)!.version, 2);
     } finally {
       second.close();
     }
