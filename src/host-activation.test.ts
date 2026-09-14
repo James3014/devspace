@@ -62,6 +62,32 @@ test("host activation applies exact postimages, persists rollback first, and rec
   } finally { await f.cleanup(); }
 });
 
+test("authoritative control-plane cutover activation applies both targets with exact postimage readback", async () => {
+  const f = await fixture();
+  try {
+    const controlPlaneManifest = { ...f.manifest, kind: "DEVSPACE_CONTROL_PLANE_CUTOVER" };
+    await writeFile(f.manifestPath, JSON.stringify(controlPlaneManifest, null, 2));
+    const bound = await bindHostActivation(f.manifestPath, [f.root], [f.manifestPath]);
+    assert.equal(bound.kind, "DEVSPACE_CONTROL_PLANE_CUTOVER");
+    const receipt = await applyHostActivation(f.manifestPath, bound.manifestSha256, "control_plane_cutover", [f.root], [f.manifestPath]);
+    assert.equal(receipt.classification, "APPLIED");
+    assert.deepEqual(receipt.targets.map((target) => target.state), ["postimage", "postimage"]);
+    assert.equal(await readFile(f.first, "utf8"), f.firstNew);
+    assert.equal(await readFile(f.second, "utf8"), f.secondNew);
+  } finally { await f.cleanup(); }
+});
+
+test("host activation rejects unsupported kinds", async () => {
+  const f = await fixture();
+  try {
+    await writeFile(f.manifestPath, JSON.stringify({ ...f.manifest, kind: "UNSUPPORTED_KIND" }, null, 2));
+    await assert.rejects(
+      () => bindHostActivation(f.manifestPath, [f.root], [f.manifestPath]),
+      /Unsupported activation kind/,
+    );
+  } finally { await f.cleanup(); }
+});
+
 test("host activation blocks on preimage drift before any target write", async () => {
   const f = await fixture();
   try {
