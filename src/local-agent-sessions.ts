@@ -13,6 +13,7 @@ import {
   LocalAgentStore,
   type LocalAgentRecord,
   type LocalAgentStatus,
+  type OpencodeCatalogDriftEvidencePayload,
 } from "./local-agent-store.js";
 import { isLocalAgentProvider, loadLocalAgentProfiles, type LocalAgentProfile } from "./local-agent-profiles.js";
 import {
@@ -293,7 +294,7 @@ export interface AgentStatusOutput {
   error?: string;
   errorCode?: string;
   errorRetryable?: boolean;
-  errorDetails?: AgentProviderFailureDetails;
+  errorDetails?: AgentProviderFailureDetails | OpencodeCatalogDriftEvidencePayload;
   createdAt: string;
   updatedAt: string;
   startedAt?: string;
@@ -2032,9 +2033,20 @@ export class LocalAgentSessionManager {
       let latestResponse: string | undefined;
       let errorCode: string | undefined;
       let errorRetryable: boolean | undefined;
-      let errorDetails: AgentProviderFailureDetails | string | undefined;
+      let errorDetails: AgentProviderFailureDetails | OpencodeCatalogDriftEvidencePayload | string | undefined;
 
-      if (AgentProviderFailureError.is(error)) {
+      if (error instanceof OpencodeCatalogDriftError) {
+        errorCode = error.code;
+        errorRetryable = false;
+        errorDetails = {
+          code: error.code,
+          errorClass: "CATALOG_RECEIPT_DRIFT",
+          retryable: false,
+          driftKind: error.driftKind,
+          expected: error.evidence.expected,
+          observed: error.evidence.observed,
+        };
+      } else if (AgentProviderFailureError.is(error)) {
         errorCode = error.code;
         errorRetryable = error.retryable;
         errorDetails = {

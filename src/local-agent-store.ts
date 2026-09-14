@@ -70,6 +70,38 @@ export interface PhysicalTerminationState {
   previousWorkerToken?: string;
 }
 
+/**
+ * Durable attribution payload for a pre-provider catalog drift refusal.
+ * This is a contract failure, not a provider execution failure: it carries
+ * no provider message, session, or model Route claim. All identity material
+ * is bounded (hashes, enums, timestamps); raw host paths never persist here.
+ */
+export interface OpencodeCatalogDriftEvidencePayload {
+  code: "OPENCODE_CATALOG_RECEIPT_DRIFTED";
+  errorClass: "CATALOG_RECEIPT_DRIFT";
+  retryable: false;
+  driftKind:
+    | "GENERATION_CHANGED"
+    | "SOURCE_CHANGED"
+    | "SNAPSHOT_EXPIRED"
+    | "FRESHNESS_CHANGED"
+    | "RUNTIME_IDENTITY_CHANGED";
+  expected: {
+    generation: string;
+    source: string;
+    freshness: string;
+    runtimeIdentityFingerprint: string;
+  };
+  observed: {
+    generation: string;
+    source: string;
+    freshness: string;
+    runtimeIdentityFingerprint: string;
+    liveFetchedAt?: string;
+    liveExpiresAt?: string;
+  };
+}
+
 export interface LocalAgentRecord {
   id: string;
   workspaceId?: string;
@@ -93,7 +125,7 @@ export interface LocalAgentRecord {
   error?: string;
   errorCode?: string;
   errorRetryable?: boolean;
-  errorDetails?: AgentProviderFailureDetails;
+  errorDetails?: AgentProviderFailureDetails | OpencodeCatalogDriftEvidencePayload;
   providerContinuityState?: "KNOWN_UNVERIFIED" | "RESUME_VERIFIED" | "LOST" | "UNKNOWN";
   createdAt: string;
   updatedAt: string;
@@ -183,7 +215,7 @@ export interface FinishTurnCasInput {
   error?: string;
   errorCode?: string;
   errorRetryable?: boolean;
-  errorDetails?: AgentProviderFailureDetails | string;
+  errorDetails?: AgentProviderFailureDetails | OpencodeCatalogDriftEvidencePayload | string;
   terminalReason?: AgentTerminalReason;
   scopeState?: ScopeState;
   cumulativeChangedPaths?: string[];
@@ -1346,10 +1378,42 @@ function rowToLocalAgentRecord(row: LocalAgentRow): LocalAgentRecord {
   };
 }
 
-function readErrorDetails(value: string | null): AgentProviderFailureDetails | undefined {
+function readErrorDetails(
+  value: string | null,
+): AgentProviderFailureDetails | OpencodeCatalogDriftEvidencePayload | undefined {
   if (!value) return undefined;
   try {
     const parsed = JSON.parse(value) as Partial<AgentProviderFailureDetails>;
+    const drifted = parsed as Partial<OpencodeCatalogDriftEvidencePayload>;
+    if (
+      drifted.code === "OPENCODE_CATALOG_RECEIPT_DRIFTED" &&
+      typeof drifted.driftKind === "string" &&
+      drifted.expected !== undefined &&
+      typeof drifted.expected === "object" &&
+      drifted.observed !== undefined &&
+      typeof drifted.observed === "object"
+    ) {
+      return {
+        code: "OPENCODE_CATALOG_RECEIPT_DRIFTED",
+        errorClass: "CATALOG_RECEIPT_DRIFT",
+        retryable: false,
+        driftKind: drifted.driftKind,
+        expected: {
+          generation: String(drifted.expected.generation ?? ""),
+          source: String(drifted.expected.source ?? ""),
+          freshness: String(drifted.expected.freshness ?? ""),
+          runtimeIdentityFingerprint: String(drifted.expected.runtimeIdentityFingerprint ?? ""),
+        },
+        observed: {
+          generation: String(drifted.observed.generation ?? ""),
+          source: String(drifted.observed.source ?? ""),
+          freshness: String(drifted.observed.freshness ?? ""),
+          runtimeIdentityFingerprint: String(drifted.observed.runtimeIdentityFingerprint ?? ""),
+          ...(typeof drifted.observed.liveFetchedAt === "string" ? { liveFetchedAt: drifted.observed.liveFetchedAt } : {}),
+          ...(typeof drifted.observed.liveExpiresAt === "string" ? { liveExpiresAt: drifted.observed.liveExpiresAt } : {}),
+        },
+      };
+    }
     if (parsed.code && parsed.errorClass) {
       return {
         code: parsed.code,
