@@ -249,6 +249,93 @@ test("retirement preserves queryable historical swarms, workers, tasks, and reco
   assert.ok(blockedCanonical.blockers.some((blocker) => blocker.role === "dev2" && blocker.code === "MISSING_CANONICAL_TOOL"));
 });
 
+test("retirement receipt destination proof survives canonical generation upgrades but not state or binding drift", () => {
+  const candidate = service({
+    role: "migration-source",
+    roleKind: "NON_AUTHORITATIVE_MIGRATION_SOURCE",
+    oauth: { callback: "ASL8H7jj-9BS", clientIds: [] },
+    routingAuthority: { active: false },
+    durableState: {
+      workspaceSessions: 0,
+      agentSessions: 0,
+      durableOperations: 0,
+      oauthClients: 0,
+      activeSwarms: 0,
+      workers: 0,
+      tasks: 0,
+      inFlightOperations: 0,
+      unknownOperations: 0,
+      reconcileRequired: 0,
+    },
+  });
+  const originalCanonical = service();
+  const base = { services: [originalCanonical, candidate], canonicalRole: "dev2", retirementCandidateRole: "migration-source" } satisfies ControlPlaneInventory;
+  const plan = planControlPlaneReconciliation(base, {
+    operationId: "retire-historical-destination",
+    request: { sourceRole: "migration-source", destinationRole: "dev2", domains: ["chat_swarm_records"] },
+  });
+  const receipt = recordControlPlaneOutcome(
+    plan,
+    recordControlPlaneOutcome(plan, undefined, { state: "IN_FLIGHT" }),
+    { state: "SUCCEEDED", evidenceRef: "migration:readback:historical-destination", contentHash: "e".repeat(64) },
+  );
+  const attestedCandidate = { ...candidate, retiredReadOnlyAttestation: {
+    schema: "devspace.retired_read_only_authority_attestation.v1" as const,
+    state: "RETIRED_READ_ONLY" as const,
+    operationId: receipt.operationId,
+    requestHash: receipt.requestHash,
+    sourceRole: receipt.sourceRole,
+    destinationRole: receipt.destinationRole,
+    readOnly: true as const,
+    historicalStateQueryable: true as const,
+    routingAuthorityReleased: true as const,
+    oauthAuthorityReleased: true as const,
+    runtimeOwnerReleased: true as const,
+    activeSessions: 0 as const,
+    contentHash: receipt.contentHash,
+  } } satisfies PhysicalServiceInventory;
+  const retired = { ...base, services: [originalCanonical, attestedCandidate], retirementReceipt: receipt } satisfies ControlPlaneInventory;
+  assert.equal(evaluateControlPlaneConvergence(retired).eligibleToRetire, true);
+
+  const advancedCanonical = service({
+    buildIdentity: { sourceCommit: "c".repeat(40), buildId: "devspace-2.0-c" },
+    capabilityManifest: { sha256: "d".repeat(64), catalogGeneration: "catalog-2", tools: [...CANONICAL_CHAT_SWARM_RUNTIME_TOOLS] },
+  });
+  const advanced = evaluateControlPlaneConvergence({ ...retired, services: [advancedCanonical, attestedCandidate] });
+  assert.equal(advanced.eligibleToRetire, true);
+  assert.equal(advanced.blockers.length, 0);
+
+  const changedStateDirectory = evaluateControlPlaneConvergence({
+    ...retired,
+    services: [{ ...advancedCanonical, stateDirectory: "/state/dev2-new" }, attestedCandidate],
+  });
+  assert.equal(changedStateDirectory.eligibleToRetire, false);
+  assert.ok(changedStateDirectory.blockers.some((blocker) => blocker.code === "RECONCILE_REQUIRED_STATE"));
+
+  const malformedReceipt = evaluateControlPlaneConvergence({
+    ...retired,
+    services: [advancedCanonical, attestedCandidate],
+    retirementReceipt: { ...receipt, destinationBinding: { ...receipt.destinationBinding, capabilityManifestSha256: "invalid" } },
+  });
+  assert.equal(malformedReceipt.eligibleToRetire, false);
+  assert.ok(malformedReceipt.blockers.some((blocker) => blocker.code === "RECONCILE_REQUIRED_STATE"));
+
+  const failedReceipt = evaluateControlPlaneConvergence({
+    ...retired,
+    services: [advancedCanonical, attestedCandidate],
+    retirementReceipt: { ...receipt, state: "FAILED" },
+  });
+  assert.equal(failedReceipt.eligibleToRetire, false);
+  assert.ok(failedReceipt.blockers.some((blocker) => blocker.code === "RECONCILE_REQUIRED_STATE"));
+
+  const sourceBindingDrift = evaluateControlPlaneConvergence({
+    ...retired,
+    services: [{ ...advancedCanonical }, { ...attestedCandidate, sourceDrift: true, stateDirectory: "/state/migration-drift" }],
+  });
+  assert.equal(sourceBindingDrift.eligibleToRetire, false);
+  assert.ok(sourceBindingDrift.blockers.some((blocker) => blocker.code === "SOURCE_DRIFT"));
+});
+
 test("retirement rejects an attestation bound to another migration receipt", () => {
   const candidate = service({ role: "migration-source", roleKind: "NON_AUTHORITATIVE_MIGRATION_SOURCE", oauth: { clientIds: [] }, routingAuthority: { active: false } });
   const base = { services: [service(), candidate], canonicalRole: "dev2", retirementCandidateRole: "migration-source" } satisfies ControlPlaneInventory;

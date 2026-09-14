@@ -441,7 +441,8 @@ export function evaluateControlPlaneConvergence(
       retirement &&
       canonical &&
       JSON.stringify(canonicalize(retirementReceipt.sourceBinding)) === JSON.stringify(canonicalize(serviceBinding(retirement))) &&
-      JSON.stringify(canonicalize(retirementReceipt.destinationBinding)) === JSON.stringify(canonicalize(serviceBinding(canonical))) &&
+      validRecordedBinding(retirementReceipt.destinationBinding) &&
+      retirementReceipt.destinationBinding.stateDirectory === (inventory.canonicalStateDirectory ?? canonical.stateDirectory) &&
       typeof retirementReceipt.evidenceRef === "string" &&
       retirementReceipt.evidenceRef.length > 0 &&
       retirementReceipt.retryAllowed === false &&
@@ -502,6 +503,19 @@ function serviceBinding(service: PhysicalServiceInventory): ControlPlaneServiceB
     catalogGeneration: service.capabilityManifest.catalogGeneration,
     stateDirectory: service.stateDirectory,
   };
+}
+
+function validRecordedBinding(value: unknown): value is ControlPlaneServiceBinding {
+  const binding = recordValue(value);
+  return Boolean(
+    binding &&
+      typeof binding.serverInstanceId === "string" && binding.serverInstanceId.length > 0 && binding.serverInstanceId !== "unknown" &&
+      typeof binding.sourceCommit === "string" && COMMIT.test(binding.sourceCommit) &&
+      typeof binding.buildId === "string" && binding.buildId.length > 0 && binding.buildId !== "unknown" &&
+      typeof binding.capabilityManifestSha256 === "string" && SHA256.test(binding.capabilityManifestSha256) &&
+      typeof binding.catalogGeneration === "string" && binding.catalogGeneration.length > 0 && binding.catalogGeneration !== "unknown" &&
+      typeof binding.stateDirectory === "string" && binding.stateDirectory.length > 0 && binding.stateDirectory !== "unknown",
+  );
 }
 
 export function planControlPlaneReconciliation(inventory: ControlPlaneInventory, input: ReconciliationPlanRequest): ControlPlaneReconciliationPlan {
