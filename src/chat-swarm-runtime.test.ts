@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  CdpMacWebDriver,
   ChatSwarmRuntimeManager,
   ChatSwarmRuntimeStore,
   type ChatSwarmManagedCarrierAdapter,
@@ -167,6 +168,55 @@ function cleanup(f: ReturnType<typeof fixture>) {
   f.store.close();
   rmSync(f.root, { recursive: true, force: true });
 }
+
+function cdpDriverForSelectorTest() {
+  return new CdpMacWebDriver({
+    enabled: true,
+    stateDir: "/tmp/devspace-runtime-selector-test",
+    maxWorkers: 3,
+    poolDefault: 3,
+    projectUrl: "https://chatgpt.com/g/g-p-runtime-test/project",
+    cdpEndpoint: "http://[::1]:9222",
+    browserProfileDir: "/tmp/devspace-runtime-selector-profile",
+    appLabel: "devspace",
+    operationTimeoutMs: 5_000,
+    bootstrapWaitMs: 5_000,
+  });
+}
+
+test("CDP composer readiness ignores hidden fallback textareas and prefers visible editable composer", async () => {
+  const driver = cdpDriverForSelectorTest();
+  let expression = "";
+  (driver as any).evaluate = async (_target: unknown, candidate: string) => {
+    expression = candidate;
+    return true;
+  };
+  await (driver as any).waitForComposer(
+    { id: "target-1", url: "https://chatgpt.com/" },
+    new Date(Date.now() + 1_000).toISOString(),
+  );
+  assert.match(expression, /getBoundingClientRect/);
+  assert.match(expression, /style\.display !== 'none'/);
+  assert.ok(expression.indexOf("[contenteditable=\"true\"]") < expression.indexOf("textarea"));
+});
+
+test("CDP prompt delivery targets the visible editable composer before textarea fallback", async () => {
+  const driver = cdpDriverForSelectorTest();
+  let expression = "";
+  (driver as any).evaluate = async (_target: unknown, candidate: string) => {
+    expression = candidate;
+    return { ok: true };
+  };
+  await (driver as any).sendPromptToTarget(
+    { id: "target-1", url: "https://chatgpt.com/" },
+    "probe",
+    new Date(Date.now() + 1_000).toISOString(),
+  );
+  assert.match(expression, /getBoundingClientRect/);
+  assert.match(expression, /data-testid="send-button"/);
+  assert.ok(expression.indexOf("const editable=") < expression.indexOf("const textarea="));
+  assert.match(expression, /const el=editable\|\|textarea/);
+});
 
 test("concurrent runtime ensure creates only missing managed workers and exact replay creates no duplicates", async () => {
   const f = fixture();
