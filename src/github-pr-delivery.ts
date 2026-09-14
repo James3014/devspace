@@ -131,12 +131,16 @@ export type GitHubPrEffectCode =
   | "EFFECT_FORBIDDEN"
   | "EFFECT_NOT_FOUND"
   | "EFFECT_TRANSPORT_LOST"
+  | "EFFECT_CONFLICT_EXISTING"
   | "EFFECT_FAILED";
 
 /**
  * Host-side transport failure. `effectPossiblyApplied` distinguishes a
  * definitive failure (safe to reason about, retry only when proven safe)
  * from a lost acknowledgement (must reconcile before any retry).
+ * `EFFECT_CONFLICT_EXISTING` is definitive remote state, not ambiguity:
+ * the remote refused a duplicate create because the exact PR already
+ * exists (GitHub answers such creates with 422). It carries that PR.
  */
 export class GitHubPrEffectError extends Error {
   constructor(
@@ -144,6 +148,7 @@ export class GitHubPrEffectError extends Error {
     readonly retryable: boolean,
     readonly effectPossiblyApplied: boolean,
     message: string,
+    readonly existingPr?: GitHubPrRef,
   ) {
     super(message);
     this.name = "GitHubPrEffectError";
@@ -251,6 +256,47 @@ function isEffectError(error: unknown): error is GitHubPrEffectError {
   return error instanceof GitHubPrEffectError;
 }
 
+function isSameRepository(observed: string, expected: string): boolean {
+  return observed.trim().toLowerCase() === expected.trim().toLowerCase();
+}
+
+/** Physical Candidate identity key for in-process delivery serialization. */
+function candidateLockKey(request: NormalizedPrDeliveryRequest): string {
+  return [
+    request.repository,
+    request.baseBranch,
+    request.expectedBaseSha,
+    request.candidateBranch,
+    request.expectedCandidateHeadSha,
+  ].join("\0");
+}
+
+const candidateLocks = new Map<string, Promise<void>>();
+
+/**
+ * Serialize the recheck-then-create window per physical Candidate within
+ * this process. The initial fast-path check stays outside the lock; the
+ * atomic commit (re-list, adopt-or-create) runs inside, so two concurrent
+ * same-Candidate attempts can never both pass an empty check into create.
+ * Cross-process races fall back to the remote atomic conflict seam
+ * (`EFFECT_CONFLICT_EXISTING`). Entries are removed on release.
+ */
+async function withCandidateLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const prior = candidateLocks.get(key) ?? Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  candidateLocks.set(key, current);
+  await prior;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (candidateLocks.get(key) === current) candidateLocks.delete(key);
+  }
+}
+
 /** Physical Candidate identity: exact SHAs plus exact branch binding. Never title or Issue similarity. */
 function isExactPrMatch(ref: GitHubPrRef, request: NormalizedPrDeliveryRequest): boolean {
   return (
@@ -329,8 +375,9 @@ export async function preflightPrDelivery(
     candidateBranch: normalized.candidateBranch,
     detail,
   });
+  let connectedRepository: string;
   try {
-    await adapter.readRepository();
+    connectedRepository = (await adapter.readRepository()).name;
   } catch (error) {
     if (isEffectError(error)) {
       if (error.code === "EFFECT_AUTH_UNAVAILABLE") return base("GITHUB_AUTH_UNAVAILABLE", "GitHub credentials are unavailable for this delivery path.");
@@ -338,6 +385,12 @@ export async function preflightPrDelivery(
       return base("REPOSITORY_NOT_AUTHORIZED", "Repository is not authorized for this delivery path.");
     }
     return base("GITHUB_NETWORK_UNAVAILABLE", "Repository probe failed without attributable transport evidence.");
+  }
+  if (!isSameRepository(connectedRepository, normalized.repository)) {
+    return base(
+      "REPOSITORY_NOT_AUTHORIZED",
+      "Connected repository does not match the requested delivery repository.",
+    );
   }
   let observedBaseSha: string | undefined;
   let observedCandidateHeadSha: string | undefined;
@@ -466,6 +519,25 @@ export async function runPrDeliveryEffect(
     operation: failRecord(store, operationId, errorCode, errorMessage, retrySafe),
   });
 
+  // Physical repository binding immediately before any possible write:
+  // the connected repository must be the requested one, not merely reachable.
+  try {
+    const connected = await adapter.readRepository();
+    if (!isSameRepository(connected.name, normalized.repository)) {
+      return refuse(
+        "REMOTE_IDENTITY_DRIFT",
+        "Connected repository does not match the requested delivery repository; refusing before write.",
+        false,
+      );
+    }
+  } catch (error) {
+    return refuse(
+      "PRE_WRITE_TRANSPORT",
+      "Repository binding could not be revalidated before write; refusing.",
+      true,
+    );
+  }
+
   // Fresh remote revalidation immediately before any possible write.
   for (
     const [branch, expected, label] of [
@@ -512,62 +584,98 @@ export async function runPrDeliveryEffect(
     return { outcome: "COMPLETED", operation, pr: matched };
   }
 
-  let created_ref: GitHubPrRef;
-  try {
-    created_ref = await adapter.createPr({
-      title: normalized.title,
-      body: normalized.body,
-      headBranch: normalized.candidateBranch,
-      baseBranch: normalized.baseBranch,
-      ...(normalized.issueNumber === undefined ? {} : { issueNumber: normalized.issueNumber }),
-    });
-  } catch (error) {
-    if (isEffectError(error) && error.effectPossiblyApplied) {
+  // Atomic commit window, serialized per physical Candidate identity: re-list
+  // under the lock, adopt an exact match without creating, and only then
+  // create. Concurrent same-Candidate attempts therefore converge on one
+  // remote PR instead of racing two check-before-create windows. Cross-process
+  // races fall back to the remote atomic conflict seam below.
+  return withCandidateLock(candidateLockKey(normalized), async (): Promise<GitHubPrDeliveryResult> => {
+    let relisted: GitHubPrRef[];
+    try {
+      relisted = await adapter.listOpenPrs({ headBranch: normalized.candidateBranch, baseBranch: normalized.baseBranch });
+    } catch (error) {
+      return refuse("PRE_WRITE_TRANSPORT", "Existing-PR recheck failed before write; refusing.", true);
+    }
+    const rematched = relisted.find((ref) => isExactPrMatch(ref, normalized));
+    if (rematched) {
+      const operation = store.finish(operationId, {
+        status: "succeeded",
+        retrySafe: false,
+        receipt: prReceipt(normalized, rematched, true),
+      });
+      return { outcome: "COMPLETED", operation, pr: rematched };
+    }
+
+    let created_ref: GitHubPrRef;
+    try {
+      created_ref = await adapter.createPr({
+        title: normalized.title,
+        body: normalized.body,
+        headBranch: normalized.candidateBranch,
+        baseBranch: normalized.baseBranch,
+        ...(normalized.issueNumber === undefined ? {} : { issueNumber: normalized.issueNumber }),
+      });
+    } catch (error) {
+      if (
+        isEffectError(error) &&
+        error.code === "EFFECT_CONFLICT_EXISTING" &&
+        error.existingPr !== undefined &&
+        isExactPrMatch(error.existingPr, normalized)
+      ) {
+        // Definitive remote state, not ambiguity: the atomic create refused
+        // because the exact PR already exists. Adopt it without creating.
+        const operation = store.finish(operationId, {
+          status: "succeeded",
+          retrySafe: false,
+          receipt: prReceipt(normalized, error.existingPr, true),
+        });
+        return { outcome: "COMPLETED", operation, pr: error.existingPr };
+      }
+      if (isEffectError(error) && error.effectPossiblyApplied) {
+        const operation = store.finish(operationId, {
+          status: "outcome_unknown",
+          retrySafe: false,
+          errorCode: "RECONCILIATION_REQUIRED",
+          errorMessage: "PR create acknowledgement was lost; the remote effect may have applied. Reconcile before any retry.",
+        });
+        return { outcome: "OUTCOME_UNKNOWN", operation };
+      }
+      const message = isEffectError(error) ? `PR create failed: ${error.code}.` : "PR create failed without attributable evidence.";
+      return refuse("CREATE_FAILED", message, !isEffectError(error) || !error.effectPossiblyApplied);
+    }
+
+    // Exact readback of the full physical Candidate identity; a mismatch on
+    // repository, branches, or SHAs is ambiguity, not success.
+    let readback: GitHubPrRef;
+    try {
+      readback = await adapter.readPr(created_ref.number);
+    } catch (error) {
       const operation = store.finish(operationId, {
         status: "outcome_unknown",
         retrySafe: false,
         errorCode: "RECONCILIATION_REQUIRED",
-        errorMessage: "PR create acknowledgement was lost; the remote effect may have applied. Reconcile before any retry.",
+        errorMessage: "PR was created but exact readback failed; reconcile before any retry.",
+        receipt: prReceipt(normalized, created_ref, false),
       });
-      return { outcome: "OUTCOME_UNKNOWN", operation };
+      return { outcome: "OUTCOME_UNKNOWN", operation, pr: created_ref };
     }
-    const message = isEffectError(error) ? `PR create failed: ${error.code}.` : "PR create failed without attributable evidence.";
-    return refuse("CREATE_FAILED", message, !isEffectError(error) || !error.effectPossiblyApplied);
-  }
-
-  // Exact readback of what was created; a mismatch is ambiguity, not success.
-  let readback: GitHubPrRef;
-  try {
-    readback = await adapter.readPr(created_ref.number);
-  } catch (error) {
+    if (!isExactPrMatch(readback, normalized)) {
+      const operation = store.finish(operationId, {
+        status: "outcome_unknown",
+        retrySafe: false,
+        errorCode: "RECONCILIATION_REQUIRED",
+        errorMessage: "Created PR readback does not match the accepted Candidate identity; reconcile before any retry.",
+        receipt: prReceipt(normalized, readback, false),
+      });
+      return { outcome: "OUTCOME_UNKNOWN", operation, pr: readback };
+    }
     const operation = store.finish(operationId, {
-      status: "outcome_unknown",
+      status: "succeeded",
       retrySafe: false,
-      errorCode: "RECONCILIATION_REQUIRED",
-      errorMessage: "PR was created but exact readback failed; reconcile before any retry.",
-      receipt: prReceipt(normalized, created_ref, false),
-    });
-    return { outcome: "OUTCOME_UNKNOWN", operation, pr: created_ref };
-  }
-  if (
-    readback.headSha.toLowerCase() !== normalized.expectedCandidateHeadSha ||
-    readback.baseSha.toLowerCase() !== normalized.expectedBaseSha
-  ) {
-    const operation = store.finish(operationId, {
-      status: "outcome_unknown",
-      retrySafe: false,
-      errorCode: "RECONCILIATION_REQUIRED",
-      errorMessage: "Created PR readback does not match the accepted Candidate identity; reconcile before any retry.",
       receipt: prReceipt(normalized, readback, false),
     });
-    return { outcome: "OUTCOME_UNKNOWN", operation, pr: readback };
-  }
-  const operation = store.finish(operationId, {
-    status: "succeeded",
-    retrySafe: false,
-    receipt: prReceipt(normalized, readback, false),
+    return { outcome: "COMPLETED", operation, pr: readback };
   });
-  return { outcome: "COMPLETED", operation, pr: readback };
 }
 
 /**

@@ -45,15 +45,19 @@ interface FakeCounts {
 
 class FakeGitHub implements GitHubPrEffectAdapter {
   readonly counts: FakeCounts = { repoReads: 0, branchReads: 0, lists: 0, prReads: 0, creates: 0 };
+  repoName = "James3014/devspace";
   repoError?: GitHubPrEffectError;
   repoForbidden = false;
   heads: Record<string, string | "missing"> = { main: BASE_SHA, "codex/issue-115-probe": HEAD_SHA };
   headError?: GitHubPrEffectError;
   prs: GitHubPrRef[] = [];
   listError?: GitHubPrEffectError;
-  createMode: "ok" | "lost-ack" | "refused" = "ok";
+  listGate?: () => Promise<void>;
+  createMode: "ok" | "lost-ack" | "refused" | "conflict" = "ok";
   createError = new GitHubPrEffectError("EFFECT_FAILED", false, false, "create refused");
+  conflictRef?: GitHubPrRef;
   readError?: GitHubPrEffectError;
+  readPrOverride?: GitHubPrRef;
   writeCapability: "unknown" | "unavailable" = "unknown";
   private nextNumber = 100;
 
@@ -63,7 +67,7 @@ class FakeGitHub implements GitHubPrEffectAdapter {
     if (this.repoForbidden) {
       throw new GitHubPrEffectError("EFFECT_FORBIDDEN", false, false, "repository not authorized");
     }
-    return { name: "James3014/devspace" };
+    return { name: this.repoName };
   }
 
   async readBranchHead(branch: string): Promise<{ sha: string } | { missing: true }> {
@@ -76,6 +80,7 @@ class FakeGitHub implements GitHubPrEffectAdapter {
 
   async listOpenPrs(input: { headBranch: string; baseBranch: string }): Promise<GitHubPrRef[]> {
     this.counts.lists += 1;
+    if (this.listGate) await this.listGate();
     if (this.listError) throw this.listError;
     return this.prs.filter(
       (pr) => pr.state === "open" && pr.headBranch === input.headBranch && pr.baseBranch === input.baseBranch,
@@ -85,6 +90,7 @@ class FakeGitHub implements GitHubPrEffectAdapter {
   async readPr(prNumber: number): Promise<GitHubPrRef> {
     this.counts.prReads += 1;
     if (this.readError) throw this.readError;
+    if (this.readPrOverride && this.readPrOverride.number === prNumber) return this.readPrOverride;
     const found = this.prs.find((pr) => pr.number === prNumber);
     if (!found) throw new GitHubPrEffectError("EFFECT_NOT_FOUND", false, false, "PR not found");
     return found;
@@ -93,8 +99,15 @@ class FakeGitHub implements GitHubPrEffectAdapter {
   async createPr(input: { title: string; body: string; headBranch: string; baseBranch: string; issueNumber?: number }): Promise<GitHubPrRef> {
     this.counts.creates += 1;
     if (this.createMode === "refused") throw this.createError;
+    if (this.createMode === "conflict") {
+      // Models the remote atomic conflict seam: the exact PR already exists,
+      // so the remote refuses the duplicate instead of persisting one.
+      const existing = this.conflictRef ?? this.prs.find((pr) => pr.state === "open");
+      if (!existing) throw new GitHubPrEffectError("EFFECT_FAILED", false, false, "conflict without referent");
+      throw new GitHubPrEffectError("EFFECT_CONFLICT_EXISTING", false, false, "exact PR already exists", existing);
+    }
     const ref: GitHubPrRef = {
-      repository: "James3014/devspace",
+      repository: this.repoName,
       number: this.nextNumber++,
       url: `https://github.com/James3014/devspace/pull/${this.nextNumber - 1}`,
       headSha: HEAD_SHA,
@@ -457,6 +470,186 @@ test("invalid request identity fails closed before any effect", async () => {
     );
     assert.equal(fake.counts.creates, 0);
     assert.equal(fake.counts.branchReads, 0);
+  } finally {
+    clean();
+  }
+});
+
+// ─── Repair A: exact repository binding ──────────────────────────────────────
+
+test("wrong connected repository fails preflight without writes", async () => {
+  const fake = new FakeGitHub();
+  fake.repoName = "OtherOrg/other-repo";
+  const preflight = await preflightPrDelivery(fake, baseRequest());
+  assert.equal(preflight.status, "REPOSITORY_NOT_AUTHORIZED");
+  assert.equal(fake.counts.creates, 0);
+});
+
+test("repository drift between preflight and delivery refuses with zero creates", async () => {
+  const { store, clean } = setupStore();
+  try {
+    const fake = new FakeGitHub();
+    const preflight = await preflightPrDelivery(fake, baseRequest());
+    assert.equal(preflight.status, "GITHUB_PR_READY");
+    fake.repoName = "OtherOrg/other-repo";
+    const result = await runPrDeliveryEffect(store, fake, baseRequest());
+    assert.equal(result.outcome, "FAILED");
+    assert.equal(result.operation.errorCode, "REMOTE_IDENTITY_DRIFT");
+    assert.equal(fake.counts.creates, 0);
+  } finally {
+    clean();
+  }
+});
+
+test("readback with same SHAs but wrong repository is not COMPLETED", async () => {
+  const { store, clean } = setupStore();
+  try {
+    const fake = new FakeGitHub();
+    // The first created PR always takes number 100 on a fresh fake; observe
+    // it through a readback that carries identical SHAs for a foreign repo.
+    fake.readPrOverride = {
+      repository: "OtherOrg/other-repo",
+      number: 100,
+      url: "https://github.com/OtherOrg/other-repo/pull/200",
+      headSha: HEAD_SHA,
+      baseSha: BASE_SHA,
+      baseBranch: "main",
+      headBranch: "codex/issue-115-probe",
+      title: "probe delivery",
+      state: "open",
+    };
+    const result = await runPrDeliveryEffect(store, fake, baseRequest({ attemptKey: "readback-repo-1" }));
+    assert.equal(result.outcome, "OUTCOME_UNKNOWN");
+    assert.equal(result.operation.status, "outcome_unknown");
+    assert.equal(fake.counts.creates, 1);
+  } finally {
+    clean();
+  }
+});
+
+test("readback with same SHAs but wrong branches is not COMPLETED", async () => {
+  const { store, clean } = setupStore();
+  try {
+    const fake = new FakeGitHub();
+    const created: GitHubPrRef = {
+      repository: "James3014/devspace",
+      number: 201,
+      url: "https://github.com/James3014/devspace/pull/201",
+      headSha: HEAD_SHA,
+      baseSha: BASE_SHA,
+      baseBranch: "main",
+      headBranch: "codex/issue-115-probe",
+      title: "probe delivery",
+      state: "open",
+    };
+    fake.createMode = "ok";
+    // Force the readback path to observe a wrong-branch ref by overriding it.
+    const realCreate = fake.createPr.bind(fake);
+    fake.createPr = async (input) => {
+      const ref = await realCreate(input);
+      fake.readPrOverride = { ...ref, headBranch: "codex/wrong-branch" };
+      return ref;
+    };
+    const result = await runPrDeliveryEffect(store, fake, baseRequest({ attemptKey: "readback-branch-1" }));
+    assert.equal(result.outcome, "OUTCOME_UNKNOWN");
+    assert.equal(result.operation.status, "outcome_unknown");
+  } finally {
+    clean();
+  }
+});
+
+test("closed exact-SHA PR is not adopted as the delivered PR", async () => {
+  const { store, clean } = setupStore();
+  try {
+    const fake = new FakeGitHub();
+    fake.prs.push({
+      repository: "James3014/devspace",
+      number: 42,
+      url: "https://github.com/James3014/devspace/pull/42",
+      headSha: HEAD_SHA,
+      baseSha: BASE_SHA,
+      baseBranch: "main",
+      headBranch: "codex/issue-115-probe",
+      title: "probe delivery",
+      issueNumber: 115,
+      state: "closed",
+    });
+    const result = await runPrDeliveryEffect(store, fake, baseRequest());
+    assert.equal(result.outcome, "COMPLETED");
+    assert.notEqual(result.pr?.number, 42);
+    assert.equal(result.pr?.state, "open");
+    assert.equal(result.pr?.headSha, HEAD_SHA);
+    assert.equal(fake.counts.creates, 1);
+  } finally {
+    clean();
+  }
+});
+
+// ─── Repair B: cross-operation concurrent duplicate prevention ───────────────
+
+test("forced check-then-check race still persists exactly one remote PR", async () => {
+  const { store, clean } = setupStore();
+  try {
+    const fake = new FakeGitHub();
+    let arrivals = 0;
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // Force both attempts through their initial exact-match checks with none
+    // visible; disarm before releasing so lock-phase rechecks observe truth.
+    fake.listGate = async () => {
+      arrivals += 1;
+      if (arrivals <= 2) await released;
+    };
+    const attemptA = runPrDeliveryEffect(store, fake, baseRequest({ attemptKey: "race-attempt-A" }));
+    const attemptB = runPrDeliveryEffect(store, fake, baseRequest({ attemptKey: "race-attempt-B" }));
+    while (arrivals < 2) await new Promise((resolve) => setTimeout(resolve, 5));
+    fake.listGate = undefined;
+    release();
+    const [first, second] = await Promise.all([attemptA, attemptB]);
+    assert.equal(first.outcome, "COMPLETED");
+    assert.equal(second.outcome, "COMPLETED");
+    assert.equal(fake.counts.creates, 1);
+    assert.equal(fake.prs.length, 1);
+    const openExact = fake.prs.filter((pr) => pr.state === "open" && pr.headSha === HEAD_SHA && pr.baseSha === BASE_SHA);
+    assert.equal(openExact.length, 1);
+    assert.equal(first.pr?.number, second.pr?.number);
+    assert.notEqual(first.operation.operationId, second.operation.operationId);
+  } finally {
+    clean();
+  }
+});
+
+test("remote atomic conflict resolves the loser to the same PR", async () => {
+  const { store, clean } = setupStore();
+  try {
+    const fake = new FakeGitHub();
+    const winner: GitHubPrRef = {
+      repository: "James3014/devspace",
+      number: 300,
+      url: "https://github.com/James3014/devspace/pull/300",
+      headSha: HEAD_SHA,
+      baseSha: BASE_SHA,
+      baseBranch: "main",
+      headBranch: "codex/issue-115-probe",
+      title: "probe delivery",
+      issueNumber: 115,
+      state: "open",
+    };
+    // Stale replica reads hide the winner; the authoritative create refuses
+    // the duplicate exactly as GitHub answers 422 for an existing head PR.
+    fake.prs.push(winner);
+    fake.listOpenPrs = async () => {
+      fake.counts.lists += 1;
+      return [];
+    };
+    fake.createMode = "conflict";
+    fake.conflictRef = winner;
+    const result = await runPrDeliveryEffect(store, fake, baseRequest({ attemptKey: "conflict-loser-1" }));
+    assert.equal(result.outcome, "COMPLETED");
+    assert.equal(result.pr?.number, 300);
+    assert.equal(fake.prs.length, 1);
   } finally {
     clean();
   }
