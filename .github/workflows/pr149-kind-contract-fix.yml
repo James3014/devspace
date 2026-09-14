@@ -1,0 +1,43 @@
+name: PR149 preserve durable kind contract
+on:
+  push:
+    branches: [codex/issue-148-development-boundary-wave2]
+permissions:
+  contents: write
+jobs:
+  fix:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: {node-version: 22, cache: npm}
+      - run: npm ci
+      - name: Preserve exact kind API
+        shell: python
+        run: |
+          from pathlib import Path
+          p=Path('src/durable-operations.ts')
+          s=p.read_text()
+          old='''export type DurableOperationKind =\n  | "workspace_clone"\n  | "dependency_sync"\n  | "nexus_gateway_recover"\n  | "cutover_start"\n  | "host_operation"\n  | (string & {});'''
+          new='''export type DurableOperationKind =\n  | "workspace_clone"\n  | "dependency_sync"\n  | "nexus_gateway_recover"\n  | "cutover_start"\n  | "host_operation"\n  | "chat_swarm_reconciliation";'''
+          if s.count(old)!=1: raise SystemExit('unexpected DurableOperationKind source')
+          s=s.replace(old,new,1)
+          old2='export function durableOperationId(kind: string, scopeRoot: string, attemptKey: string): string {'
+          new2='export function durableOperationId(kind: DurableOperationKind, scopeRoot: string, attemptKey: string): string {'
+          if s.count(old2)!=1: raise SystemExit('unexpected durableOperationId signature')
+          p.write_text(s.replace(old2,new2,1))
+      - run: |
+          npm run typecheck
+          npx tsx src/development-boundaries.test.ts
+          npx tsx src/durable-operations-ci.test.ts
+          git diff --check
+      - name: Commit source only
+        run: |
+          git config user.name James3014
+          git config user.email liligogo523@gmail.com
+          git rm .github/workflows/pr149-kind-contract-fix.yml
+          git add src/durable-operations.ts
+          git commit -m "refactor(architecture): preserve durable kind contract"
+          git push origin HEAD:codex/issue-148-development-boundary-wave2
