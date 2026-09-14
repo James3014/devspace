@@ -281,7 +281,7 @@ test("OpenCLI provisioning captures the exact project conversation before waitin
   assert.equal(calls[0]?.[calls[0]!.indexOf("--site-session") + 1], "ephemeral");
 });
 
-test("OpenCLI wake reopens the exact conversation and rejects identity drift", async () => {
+test("OpenCLI wake reopens the exact conversation", async () => {
   const driver = openCliDriverForTest();
   const calls: string[][] = [];
   (driver as any).runJson = async (args: string[]) => {
@@ -308,6 +308,33 @@ test("OpenCLI wake reopens the exact conversation and rejects identity drift", a
   assert.equal(ask[ask.indexOf("--conversation") + 1], "opencli-managed-02");
   assert.equal(ask[ask.indexOf("--wait") + 1], "false");
   assert.equal(ask[ask.indexOf("--site-session") + 1], "ephemeral");
+});
+
+test("OpenCLI wake fails closed when the returned conversation identity drifts", async () => {
+  const driver = openCliDriverForTest();
+  (driver as any).runJson = async (args: string[]) => {
+    if (args[1] === "detail") {
+      return [
+        { Role: "User", Text: "init", Generating: false },
+        { Role: "Assistant", Text: "READY_FOR_BOOTSTRAP", Generating: false },
+      ];
+    }
+    return [{
+      conversationId: "opencli-managed-wrong",
+      conversationUrl: "https://chatgpt.com/g/g-p-runtime-test/c/opencli-managed-wrong",
+      response: "",
+    }];
+  };
+  const result = await driver.sendPrompt(
+    "https://chatgpt.com/g/g-p-runtime-test/c/opencli-managed-02",
+    "@devspace wake",
+    new Date(Date.now() + 1_000).toISOString(),
+  );
+  assert.deepEqual(result, {
+    delivered: false,
+    remoteMayContinue: true,
+    blocker: "OPENCLI_CONVERSATION_IDENTITY_DRIFT",
+  });
 });
 
 test("concurrent runtime ensure creates only missing managed workers and exact replay creates no duplicates", async () => {

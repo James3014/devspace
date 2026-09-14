@@ -39,7 +39,7 @@ const runtimeStatusSchema = z.object({
   maxWorkers: z.number().int().positive(),
   adapter: z.object({
     kind: z.literal("mac_web_chatgpt"),
-    controlMechanism: z.literal("CDP"),
+    controlMechanism: z.enum(["CDP", "OPENCLI"]),
     projectConfigured: z.boolean(),
     appBinding: z.enum(["READY", "UNKNOWN", "DISABLED", "STALE"]),
     blocker: z.string().optional(),
