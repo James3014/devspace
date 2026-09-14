@@ -84,6 +84,7 @@ type ToolResult = {
   content: [{ type: "text"; text: string }];
   structuredContent?: Record<string, unknown>;
   isError?: boolean;
+  _meta?: Record<string, unknown>;
 };
 
 function success(value: unknown): ToolResult {
@@ -93,16 +94,16 @@ function success(value: unknown): ToolResult {
 function failure(error: unknown, operation: string): ToolResult {
   if (error instanceof ChatSwarmError) {
     const details = { code: error.code, layer: error.layer, stage: error.stage, operation, message: error.message };
-    return { isError: true, structuredContent: { error: details }, content: [{ type: "text", text: `[${details.code}] ${details.message}` }] };
+    return { isError: true, _meta: { "devspace/error": details }, content: [{ type: "text", text: `[${details.code}] ${details.message}` }] };
   }
   if (error instanceof ChatSwarmIdentityError) {
     const details = { code: `IDENTITY_${error.code}`, layer: "HOST", stage: "identity_validated", operation, message: error.message };
-    return { isError: true, structuredContent: { error: details }, content: [{ type: "text", text: `[${details.code}] ${details.message}` }] };
+    return { isError: true, _meta: { "devspace/error": details }, content: [{ type: "text", text: `[${details.code}] ${details.message}` }] };
   }
   const message = error instanceof Error ? error.message : String(error);
   return {
     isError: true,
-    structuredContent: { error: { code: "INTERNAL_ERROR", layer: "SYSTEM", stage: "EXECUTE", operation, message } },
+    _meta: { "devspace/error": { code: "INTERNAL_ERROR", layer: "SYSTEM", stage: "EXECUTE", operation, message } },
     content: [{ type: "text", text: `[INTERNAL_ERROR] ${message}` }],
   };
 }
