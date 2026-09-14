@@ -1506,7 +1506,7 @@ export class CdpMacWebDriver implements MacWebDriver {
     while (Date.now() < Date.parse(deadlineAt)) {
       const ready = await this.evaluate<boolean>(
         target,
-        `Boolean(document.querySelector('textarea') || document.querySelector('[contenteditable="true"]'))`,
+        `(() => { const visible=(el) => { const rect=el.getBoundingClientRect(); const style=getComputedStyle(el); return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden'; }; return Boolean([...document.querySelectorAll('[contenteditable="true"]')].find(visible) || [...document.querySelectorAll('textarea')].find(visible)); })()`,
       ).catch(() => false);
       if (ready) return;
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
@@ -1535,7 +1535,7 @@ export class CdpMacWebDriver implements MacWebDriver {
     const encoded = JSON.stringify(prompt);
     const result = await this.evaluate<{ ok: boolean; reason?: string }>(
       target,
-      `(() => { const prompt=${encoded}; const textarea=document.querySelector('textarea'); const editable=document.querySelector('[contenteditable="true"]'); const el=textarea||editable; if(!el) return {ok:false,reason:'composer_missing'}; el.focus(); if(textarea){ const setter=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')?.set; setter?.call(textarea,prompt); textarea.dispatchEvent(new Event('input',{bubbles:true})); } else { editable.textContent=prompt; editable.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:prompt})); } const button=document.querySelector('[data-testid="send-button"]') || [...document.querySelectorAll('button')].find(b => /send/i.test((b.getAttribute('aria-label')||b.textContent||''))); if(!button || button.disabled) return {ok:false,reason:'send_button_missing_or_disabled'}; button.click(); return {ok:true}; })()`,
+      `(() => { const prompt=${encoded}; const visible=(el) => { const rect=el.getBoundingClientRect(); const style=getComputedStyle(el); return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden'; }; const editable=[...document.querySelectorAll('[contenteditable="true"]')].find(visible); const textarea=[...document.querySelectorAll('textarea')].find(visible); const el=editable||textarea; if(!el) return {ok:false,reason:'composer_missing'}; el.focus(); if(editable){ editable.textContent=prompt; editable.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:prompt})); } else { const setter=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')?.set; setter?.call(textarea,prompt); textarea.dispatchEvent(new Event('input',{bubbles:true})); } const button=document.querySelector('[data-testid="send-button"]') || [...document.querySelectorAll('button')].find(b => /send/i.test((b.getAttribute('aria-label')||b.textContent||''))); if(!button || button.disabled) return {ok:false,reason:'send_button_missing_or_disabled'}; button.click(); return {ok:true}; })()`,
     );
     if (!result?.ok) {
       throw new Error(result?.reason ?? "ChatGPT prompt delivery failed");
