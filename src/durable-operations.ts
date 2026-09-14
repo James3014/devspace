@@ -27,7 +27,7 @@ export type DurableOperationKind =
   | "nexus_gateway_recover"
   | "cutover_start"
   | "host_operation"
-  | (string & {});
+  | "chat_swarm_reconciliation";
 export type DurableOperationStatus = "started" | "succeeded" | "failed" | "outcome_unknown";
 export type DependencySyncRecipe = "npm_ci" | "pnpm_frozen" | "uv_frozen";
 
@@ -1143,7 +1143,7 @@ function stableOperationId(kind: DurableOperationKind, scopeRoot: string, attemp
   return `op_${createHash("sha256").update(`${kind}\0${resolve(scopeRoot)}\0${attemptKey}`).digest("hex").slice(0, 16)}`;
 }
 
-export function durableOperationId(kind: string, scopeRoot: string, attemptKey: string): string {
+export function durableOperationId(kind: DurableOperationKind, scopeRoot: string, attemptKey: string): string {
   assertAttemptKey(attemptKey);
   return stableOperationId(kind, scopeRoot, attemptKey);
 }
