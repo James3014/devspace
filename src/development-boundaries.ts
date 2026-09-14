@@ -20,6 +20,9 @@ export const CONTROL_SUBSTRATE_KERNEL_MODULES = [
   "control-plane-ownership.ts",
   "host-operation-policy.ts",
   "process-platform.ts",
+  "sensitive-text.ts",
+  "durable-operations.ts",
+  "host-operations.ts",
 ] as const;
 
 /** Legitimate application wiring points. Composition is not authority transfer. */
@@ -37,20 +40,11 @@ export const REPLACEABLE_EDGE_SPECIFIER_PREFIXES = [
   "./provider-scratch",
 ] as const;
 
-export const DEVELOPMENT_BOUNDARY_DEBT = [
-  {
-    module: "durable-operations.ts",
-    role: "MIXED_DEBT" as const,
-    reason:
-      "The durable operation ledger also owns ChatSwarm migration preparation/apply/reconcile helpers. Split strategy-specific migration wiring before promoting the module into the control kernel.",
-  },
-  {
-    module: "host-operations.ts",
-    role: "MIXED_DEBT" as const,
-    reason:
-      "Host-operation execution currently imports local-agent error redaction and the mixed durable-operations module. Move shared redaction and durable ledger contracts behind neutral control modules first.",
-  },
-] as const;
+export const DEVELOPMENT_BOUNDARY_DEBT: ReadonlyArray<{
+  module: string;
+  role: "MIXED_DEBT";
+  reason: string;
+}> = [];
 
 export const DEVELOPMENT_BOUNDARY_RULES = Object.freeze({
   controlSubstrateMayImportReplaceableEdges: false,

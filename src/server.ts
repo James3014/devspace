@@ -97,7 +97,6 @@ import type { WorkspaceSession } from "./workspace-store.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
 import {
   DurableOperationManager,
-  chatSwarmMigrationOperationId,
   planCutoverStart,
   DurableOperationError,
   NEXUS_GATEWAY_RECOVERY_SCHEMA,
@@ -113,6 +112,7 @@ import { openAiConversationScopeId } from "./request-meta.js";
 import { isReadOnlyInspectionCommand } from "./conversation-isolation.js";
 import { ChatSwarmLifecycle } from "./chat-swarm-lifecycle.js";
 import type { ChatSwarmStore, ChatSwarmMigrationBundle } from "./chat-swarm-store.js";
+import { ChatSwarmMigrationCoordinator, chatSwarmMigrationOperationId } from "./chat-swarm-migration.js";
 import { registerChatSwarmTools, chatSwarmToolInputShapes } from "./chat-swarm-tools.js";
 import { ChatSwarmRuntimeOwner } from "./chat-swarm-runtime-owner.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
@@ -2006,6 +2006,7 @@ function registerControlPlaneMigrationTools(
   server: McpServer,
   durableOperations: DurableOperationManager,
   chatSwarmStore: ChatSwarmStore,
+  stateDirectory: string,
   controlPlaneEvaluator?: () => ControlPlaneConvergenceEvaluation,
   controlPlaneInventory?: ControlPlaneInventory,
   controlPlaneInventoryReader?: () => ControlPlaneInventory,
@@ -2013,6 +2014,7 @@ function registerControlPlaneMigrationTools(
   capabilityManifest?: CapabilityManifest,
   catalogGeneration?: string,
 ): void {
+  const migrations = new ChatSwarmMigrationCoordinator(durableOperations.store, stateDirectory);
   const bindingShape = {
     serverInstanceId: z.string().min(1),
     sourceCommit: z.string().regex(/^[0-9a-f]{40}$/),
@@ -2135,7 +2137,7 @@ function registerControlPlaneMigrationTools(
     dependencyConsumerContext(extra);
     requireCanonicalRuntime();
     requireCanonicalDestination(destinationBinding as ControlPlaneServiceBinding);
-    const prepared = durableOperations.prepareChatSwarmMigration({ attemptKey, destinationBinding, bundle: bundle as unknown as ChatSwarmMigrationBundle });
+    const prepared = migrations.prepare({ attemptKey, destinationBinding, bundle: bundle as unknown as ChatSwarmMigrationBundle });
     const operation = durableOperations.store.getByOperationId(prepared.operationId);
     if (!operation) throw new Error("migration preparation did not persist its durable operation identity");
     return { ...output(operation), structuredContent: { ...operation, phase: "PREPARED", contentHash: prepared.bundle.contentHash } };
@@ -2164,8 +2166,8 @@ function registerControlPlaneMigrationTools(
     dependencyConsumerContext(extra);
     requireCanonicalRuntime();
     requireCanonicalDestination(destinationBinding as ControlPlaneServiceBinding);
-    const prepared = durableOperations.prepareChatSwarmMigration({ attemptKey, destinationBinding, bundle: bundle as unknown as ChatSwarmMigrationBundle });
-    return output(durableOperations.applyChatSwarmMigration(prepared, chatSwarmStore));
+    const prepared = migrations.prepare({ attemptKey, destinationBinding, bundle: bundle as unknown as ChatSwarmMigrationBundle });
+    return output(migrations.apply(prepared, chatSwarmStore));
   });
 
   registerAppTool(server, "chat_swarm_migration_reconcile", {
@@ -2178,8 +2180,8 @@ function registerControlPlaneMigrationTools(
     dependencyConsumerContext(extra);
     requireCanonicalRuntime();
     requireCanonicalDestination(destinationBinding as ControlPlaneServiceBinding);
-    const prepared = durableOperations.prepareChatSwarmMigration({ attemptKey, destinationBinding, bundle: bundle as unknown as ChatSwarmMigrationBundle });
-    return output(durableOperations.reconcileChatSwarmMigration(prepared, chatSwarmStore));
+    const prepared = migrations.prepare({ attemptKey, destinationBinding, bundle: bundle as unknown as ChatSwarmMigrationBundle });
+    return output(migrations.reconcile(prepared, chatSwarmStore));
   });
 
   registerAppTool(server, "control_plane_retirement_readiness", {
@@ -2542,6 +2544,7 @@ export function createMcpServer(
       server,
       durableOperations,
       chatSwarmLifecycle.store,
+      config.stateDir,
       cutoverControl?.controlPlaneEvaluator,
       controlPlaneInventory,
       controlPlaneInventoryReader,

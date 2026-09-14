@@ -28,15 +28,19 @@ Cognitive/coordination strategy includes worker topology, ChatSwarm coordination
 
 `server.ts` and `cli.ts` are composition roots. They are expected to wire control and replaceable layers together. An import from a composition root is therefore not evidence that the imported component belongs to the control substrate.
 
-## Current migration debt
+## Resolved second-wave debt
 
-The first fence intentionally does not pretend the repository is already fully separated.
+The first boundary slice recorded two mixed dependencies. The second wave resolves them without changing authority semantics:
 
-`durable-operations.ts` mixes the generic durable operation ledger with ChatSwarm migration preparation/apply/reconcile behavior. The generic ledger remains strategically important, but the ChatSwarm migration adapter is replaceable strategy-specific wiring. Split those concerns before promoting the module into the clean control kernel.
+- shared bounded diagnostic redaction lives in `sensitive-text.ts`, so both provider adapters and host control can consume a neutral utility without control importing `local-agent-*`;
+- ChatSwarm migration preparation/apply/reconcile lives in `chat-swarm-migration.ts`, a replaceable strategy-side coordinator that consumes the neutral `DurableOperationStore`;
+- `durable-operations.ts` remains the durable operation ledger and generic effect/reconciliation substrate; it no longer imports ChatSwarm implementation modules;
+- `host-operations.ts` consumes only neutral control/infrastructure dependencies and is promoted with `durable-operations.ts` into the clean control kernel;
+- `server.ts` remains the composition root that wires durable control and ChatSwarm migration strategy together.
 
-`host-operations.ts` currently imports redaction from `local-agent-errors.ts` and consumes the mixed `durable-operations.ts` surface. Shared redaction should move to a neutral utility, and host operations should consume a neutral durable-operation contract/store surface before this module is promoted into the kernel.
+The migration operation kind and receipt schemas remain backward compatible. `OUTCOME_UNKNOWN` still does not authorize replay, and physical destination readback remains required for migration reconciliation.
 
-These entries are explicit debt, not permanent exceptions. New control code must not use them as precedent for additional provider/carrier/strategy coupling.
+Future mixed dependencies must be recorded explicitly as new debt rather than weakening the dependency fence.
 
 ## Dependency rule
 
