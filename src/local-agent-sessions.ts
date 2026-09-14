@@ -127,6 +127,64 @@ export class AgentSessionError extends Error {
   }
 }
 
+/**
+ * Which material OpenCode catalog drift predicate refused a pre-provider turn.
+ * The guard stays fail-closed; this only names the first predicate that fired
+ * so a later witness can distinguish a real catalog change from stale
+ * snapshot/scope bookkeeping without weakening the refusal.
+ */
+export type OpencodeCatalogDriftKind =
+  | "GENERATION_CHANGED"
+  | "SOURCE_CHANGED"
+  | "SNAPSHOT_EXPIRED"
+  | "FRESHNESS_CHANGED"
+  | "RUNTIME_IDENTITY_CHANGED";
+
+/** Bounded expected-vs-observed drift tuple. Fingerprints only, no raw paths. */
+export interface OpencodeCatalogDriftEvidence {
+  expected: {
+    generation: string;
+    source: string;
+    freshness: string;
+    runtimeIdentityFingerprint: string;
+  };
+  observed: {
+    generation: string;
+    source: string;
+    freshness: string;
+    runtimeIdentityFingerprint: string;
+    liveFetchedAt?: string;
+    liveExpiresAt?: string;
+  };
+}
+
+/**
+ * Fail-closed OpenCode catalog drift refusal with attribution.
+ * The message keeps the historical refusal sentence verbatim and appends the
+ * machine-readable drift kind, so every existing durable/log surface that only
+ * carries the message still identifies the predicate. Structured evidence
+ * lives on the error fields; host-sensitive identity is fingerprinted and
+ * never emitted raw.
+ */
+export class OpencodeCatalogDriftError extends Error {
+  readonly code = "OPENCODE_CATALOG_RECEIPT_DRIFTED" as const;
+  constructor(
+    readonly driftKind: OpencodeCatalogDriftKind,
+    readonly evidence: OpencodeCatalogDriftEvidence,
+  ) {
+    super(
+      "Persisted OpenCode catalog receipt drifted before provider invocation; refusing execution."
+      + ` Drift: ${driftKind}.`,
+    );
+    this.name = "OpencodeCatalogDriftError";
+  }
+}
+
+/** Stable bounded fingerprint for host-sensitive runtime identity strings. */
+export function fingerprintCatalogRuntimeIdentity(value: string): string {
+  return createHash("sha256").update(value, "utf8").digest("hex").slice(0, 16);
+}
+
 /** Raised when the worker workspace fails the canonical containment gate. */
 export class WorkspaceContainmentError extends Error {
   constructor(message: string) {
@@ -1836,12 +1894,31 @@ export class LocalAgentSessionManager {
       if (catalogReceipt?.provider === "opencode") {
         const liveCatalog = await this.opencodeCatalogSource.acquire();
         const runtimeIdentity = `${liveCatalog.runtime?.source ?? "unknown"}:${liveCatalog.runtime?.version ?? "unknown"}:${liveCatalog.runtime?.executable ?? "unknown"}`;
-        if (liveCatalog.generation !== catalogReceipt.generation
-          || liveCatalog.source !== catalogReceipt.source
-          || !catalogSnapshotIsFresh(liveCatalog.fetchedAt, liveCatalog.expiresAt)
-          || (liveCatalog.freshness ?? "unknown") !== catalogReceipt.freshness
-          || runtimeIdentity !== catalogReceipt.runtimeIdentity) {
-          throw new Error("Persisted OpenCode catalog receipt drifted before provider invocation; refusing execution.");
+        const liveFresh = liveCatalog.freshness ?? "unknown";
+        const driftKind: OpencodeCatalogDriftKind | undefined =
+          liveCatalog.generation !== catalogReceipt.generation ? "GENERATION_CHANGED"
+          : liveCatalog.source !== catalogReceipt.source ? "SOURCE_CHANGED"
+          : !catalogSnapshotIsFresh(liveCatalog.fetchedAt, liveCatalog.expiresAt) ? "SNAPSHOT_EXPIRED"
+          : liveFresh !== catalogReceipt.freshness ? "FRESHNESS_CHANGED"
+          : runtimeIdentity !== catalogReceipt.runtimeIdentity ? "RUNTIME_IDENTITY_CHANGED"
+          : undefined;
+        if (driftKind !== undefined) {
+          throw new OpencodeCatalogDriftError(driftKind, {
+            expected: {
+              generation: catalogReceipt.generation,
+              source: catalogReceipt.source,
+              freshness: catalogReceipt.freshness,
+              runtimeIdentityFingerprint: fingerprintCatalogRuntimeIdentity(catalogReceipt.runtimeIdentity),
+            },
+            observed: {
+              generation: liveCatalog.generation,
+              source: liveCatalog.source,
+              freshness: liveFresh,
+              runtimeIdentityFingerprint: fingerprintCatalogRuntimeIdentity(runtimeIdentity),
+              ...(liveCatalog.fetchedAt === undefined ? {} : { liveFetchedAt: liveCatalog.fetchedAt }),
+              ...(liveCatalog.expiresAt === undefined ? {} : { liveExpiresAt: liveCatalog.expiresAt }),
+            },
+          });
         }
         const validation = validateOpencodeModelAndVariant(catalogReceipt.model, catalogReceipt.effort, liveCatalog);
         if (!validation.valid) throw new Error(validation.reason ?? "Persisted OpenCode catalog receipt is no longer valid.");
