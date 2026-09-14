@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { spawn, type ChildProcess } from "node:child_process";
 import { execFileSync } from "node:child_process";
 import { terminateProcessTree } from "./process-platform.js";
-import { redactSensitiveText } from "./local-agent-errors.js";
+import { redactSensitiveText } from "./sensitive-redaction.js";
 import type { DurableOperationRecord, DurableOperationStore } from "./durable-operations.js";
 import { bindHostOperation, prepareHostOperationSandbox, type HostOperationPolicy, type HostOperationRequest, type BoundHostOperation } from "./host-operation-policy.js";
 import {

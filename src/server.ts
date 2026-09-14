@@ -97,12 +97,12 @@ import type { WorkspaceSession } from "./workspace-store.js";
 import { ProcessSessionManager, type ProcessSnapshot } from "./process-sessions.js";
 import {
   DurableOperationManager,
-  chatSwarmMigrationOperationId,
   planCutoverStart,
   DurableOperationError,
   NEXUS_GATEWAY_RECOVERY_SCHEMA,
   type DurableOperationRecord,
 } from "./durable-operations.js";
+import { ChatSwarmMigrationCoordinator, chatSwarmMigrationOperationId } from "./chat-swarm-migration.js";
 import { HostOperationRegistrar } from "./host-operations.js";
 import {
   CodexGoalSessionManager,
@@ -2135,7 +2135,7 @@ function registerControlPlaneMigrationTools(
     dependencyConsumerContext(extra);
     requireCanonicalRuntime();
     requireCanonicalDestination(destinationBinding as ControlPlaneServiceBinding);
-    const prepared = durableOperations.prepareChatSwarmMigration({ attemptKey, destinationBinding, bundle: bundle as unknown as ChatSwarmMigrationBundle });
+    const prepared = new ChatSwarmMigrationCoordinator(durableOperations.store, (destinationBinding as ControlPlaneServiceBinding).stateDirectory).prepareChatSwarmMigration({ attemptKey, destinationBinding, bundle: bundle as unknown as ChatSwarmMigrationBundle });
     const operation = durableOperations.store.getByOperationId(prepared.operationId);
     if (!operation) throw new Error("migration preparation did not persist its durable operation identity");
     return { ...output(operation), structuredContent: { ...operation, phase: "PREPARED", contentHash: prepared.bundle.contentHash } };
@@ -2164,8 +2164,8 @@ function registerControlPlaneMigrationTools(
     dependencyConsumerContext(extra);
     requireCanonicalRuntime();
     requireCanonicalDestination(destinationBinding as ControlPlaneServiceBinding);
-    const prepared = durableOperations.prepareChatSwarmMigration({ attemptKey, destinationBinding, bundle: bundle as unknown as ChatSwarmMigrationBundle });
-    return output(durableOperations.applyChatSwarmMigration(prepared, chatSwarmStore));
+    const prepared = new ChatSwarmMigrationCoordinator(durableOperations.store, (destinationBinding as ControlPlaneServiceBinding).stateDirectory).prepareChatSwarmMigration({ attemptKey, destinationBinding, bundle: bundle as unknown as ChatSwarmMigrationBundle });
+    return output(new ChatSwarmMigrationCoordinator(durableOperations.store, (destinationBinding as ControlPlaneServiceBinding).stateDirectory).applyChatSwarmMigration(prepared, chatSwarmStore));
   });
 
   registerAppTool(server, "chat_swarm_migration_reconcile", {
@@ -2178,8 +2178,8 @@ function registerControlPlaneMigrationTools(
     dependencyConsumerContext(extra);
     requireCanonicalRuntime();
     requireCanonicalDestination(destinationBinding as ControlPlaneServiceBinding);
-    const prepared = durableOperations.prepareChatSwarmMigration({ attemptKey, destinationBinding, bundle: bundle as unknown as ChatSwarmMigrationBundle });
-    return output(durableOperations.reconcileChatSwarmMigration(prepared, chatSwarmStore));
+    const prepared = new ChatSwarmMigrationCoordinator(durableOperations.store, (destinationBinding as ControlPlaneServiceBinding).stateDirectory).prepareChatSwarmMigration({ attemptKey, destinationBinding, bundle: bundle as unknown as ChatSwarmMigrationBundle });
+    return output(new ChatSwarmMigrationCoordinator(durableOperations.store, (destinationBinding as ControlPlaneServiceBinding).stateDirectory).reconcileChatSwarmMigration(prepared, chatSwarmStore));
   });
 
   registerAppTool(server, "control_plane_retirement_readiness", {
