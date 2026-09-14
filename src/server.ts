@@ -144,6 +144,7 @@ import {
   type ServiceRoleDeploymentIdentity,
 } from "./deployment-convergence.js";
 import {
+  assertExactServiceCatalogGeneration,
   evaluateControlPlaneConvergence,
   ControlPlaneConvergenceError,
   type ControlPlaneConvergenceEvaluation,
@@ -2062,6 +2063,7 @@ function registerControlPlaneMigrationTools(
     if (currentInventory.services.filter((service) => service.roleKind === "NON_AUTHORITATIVE_MIGRATION_SOURCE").length !== 1) {
       throw new ControlPlaneConvergenceError("MISSING_INVENTORY", "migration path requires exactly one explicitly named migration source");
     }
+    for (const service of currentInventory.services) assertExactServiceCatalogGeneration(service);
     return currentInventory;
   };
 

@@ -7,6 +7,12 @@ export type ControlPlaneRoleKind =
   | "NON_AUTHORITATIVE_MIGRATION_SOURCE"
   | "NON_AUTHORITATIVE_TEST";
 
+/** Whether a capability catalog generation is service-wide or session-bound. */
+export type ControlPlaneCatalogGenerationScope = "EXACT_SERVICE" | "SESSION_SCOPED";
+
+/** Stable topology policy value used when no one service-wide catalog exists. */
+export const SESSION_SCOPED_CATALOG_GENERATION = "SESSION_SCOPED";
+
 export const CANONICAL_CHAT_SWARM_RUNTIME_TOOLS = [
   "chat_swarm_runtime_status",
   "chat_swarm_runtime_ensure",
@@ -73,6 +79,8 @@ export interface PhysicalServiceInventory {
   capabilityManifest: {
     sha256: string;
     catalogGeneration: string;
+    /** Omitted manifests are legacy EXACT_SERVICE bindings. */
+    catalogGenerationScope?: ControlPlaneCatalogGenerationScope;
     tools: string[];
   };
   featureFlags: Record<string, boolean | string | number>;
@@ -266,6 +274,8 @@ export function parseControlPlaneTopologyManifest(raw: unknown): ControlPlaneInv
     if (/secret|token/i.test(JSON.stringify(item))) {
       throw new ControlPlaneConvergenceError("MISSING_INVENTORY", "topology manifests cannot contain OAuth secrets or tokens");
     }
+    const policyBlocker = catalogGenerationPolicyBlocker(item as unknown as Pick<PhysicalServiceInventory, "role" | "capabilityManifest" | "expected">);
+    if (policyBlocker) throw new ControlPlaneConvergenceError(policyBlocker.code, policyBlocker.detail);
   }
   return {
     ...inventory as unknown as Omit<ControlPlaneInventory, "observedAt" | "maxAgeSeconds" | "manifestRequired">,
@@ -291,12 +301,46 @@ function requestHash(value: unknown): string {
   return createHash("sha256").update(JSON.stringify(canonicalize(value))).digest("hex");
 }
 
+function catalogGenerationPolicyBlocker(service: Pick<PhysicalServiceInventory, "role" | "capabilityManifest" | "expected">): ControlPlaneBlocker | undefined {
+  const manifest = service.capabilityManifest;
+  if (!manifest || typeof manifest.catalogGeneration !== "string") return undefined;
+  const scope = manifest.catalogGenerationScope;
+  if (scope !== undefined && scope !== "EXACT_SERVICE" && scope !== "SESSION_SCOPED") {
+    return { code: "MISSING_INVENTORY", role: service.role, detail: "catalogGenerationScope must be EXACT_SERVICE or SESSION_SCOPED" };
+  }
+  const effectiveScope = scope ?? "EXACT_SERVICE";
+  if (effectiveScope === "SESSION_SCOPED") {
+    if (manifest.catalogGeneration !== SESSION_SCOPED_CATALOG_GENERATION) {
+      return { code: "MISSING_INVENTORY", role: service.role, detail: "SESSION_SCOPED topology must use the stable SESSION_SCOPED catalog sentinel" };
+    }
+    if (service.expected?.catalogGeneration !== undefined) {
+      return { code: "MISSING_INVENTORY", role: service.role, detail: "SESSION_SCOPED topology cannot claim an exact expected catalog generation" };
+    }
+  } else if (manifest.catalogGeneration === SESSION_SCOPED_CATALOG_GENERATION) {
+    return { code: "MISSING_INVENTORY", role: service.role, detail: "EXACT_SERVICE topology cannot use the SESSION_SCOPED catalog sentinel" };
+  }
+  return undefined;
+}
+
+/** Migration effects require a service-wide, exact catalog generation. */
+export function assertExactServiceCatalogGeneration(service: PhysicalServiceInventory, context = "migration"): void {
+  const policyBlocker = catalogGenerationPolicyBlocker(service);
+  if (policyBlocker) throw new ControlPlaneConvergenceError(policyBlocker.code, `${context} requires a valid exact catalog binding: ${policyBlocker.detail}`);
+  if (service.capabilityManifest?.catalogGenerationScope === "SESSION_SCOPED") {
+    throw new ControlPlaneConvergenceError("SESSION_CATALOG_DRIFT", `${context} effects are disabled for SESSION_SCOPED catalog topology`);
+  }
+  if (typeof service.capabilityManifest?.catalogGeneration !== "string" || service.capabilityManifest.catalogGeneration.length === 0 || service.capabilityManifest.catalogGeneration === "unknown") {
+    throw new ControlPlaneConvergenceError("MISSING_INVENTORY", `${context} requires an exact catalog generation`);
+  }
+}
+
 function nonNegativeInteger(value: number): boolean {
   return Number.isSafeInteger(value) && value >= 0;
 }
 
 function inventoryBlockers(service: PhysicalServiceInventory, canonical: PhysicalServiceInventory | undefined, minimumCapacity: number): ControlPlaneBlocker[] {
   const blockers: ControlPlaneBlocker[] = [];
+  const catalogPolicyBlocker = catalogGenerationPolicyBlocker(service);
   const isCanonicalProduction = canonical?.role === service.role && canonical.roleKind === "AUTHORITATIVE_PRODUCTION" && service.roleKind === "AUTHORITATIVE_PRODUCTION";
   const missing = [
     ["service identity", service.serviceIdentity?.serviceName],
@@ -331,9 +375,10 @@ function inventoryBlockers(service: PhysicalServiceInventory, canonical: Physica
     !service.runtimeOwner ||
     !service.routingAuthority ||
     typeof service.routingAuthority.active !== "boolean" ||
-    (service.durableState.activeReconcileRequired !== undefined && !nonNegativeInteger(service.durableState.activeReconcileRequired))
+    (service.durableState.activeReconcileRequired !== undefined && !nonNegativeInteger(service.durableState.activeReconcileRequired)) ||
+    catalogPolicyBlocker
   ) {
-    blockers.push({ code: "MISSING_INVENTORY", role: service.role, detail: `inventory is incomplete (${missing.map(([label]) => label).join(", ") || "nested state"})` });
+    blockers.push(catalogPolicyBlocker ?? { code: "MISSING_INVENTORY", role: service.role, detail: `inventory is incomplete (${missing.map(([label]) => label).join(", ") || "nested state"})` });
     return blockers;
   }
   if (!COMMIT.test(service.buildIdentity.sourceCommit)) blockers.push({ code: "IDENTITY_DRIFT", role: service.role, detail: "sourceCommit is not a full commit identity" });
@@ -526,6 +571,8 @@ export function planControlPlaneReconciliation(inventory: ControlPlaneInventory,
   if (!ROLE_KINDS.has(source.roleKind) || !ROLE_KINDS.has(destination.roleKind)) throw new ControlPlaneConvergenceError("MISSING_INVENTORY", "reconciliation requires explicit known role kinds for source and destination");
   if (source.roleKind === "AUTHORITATIVE_PRODUCTION" && source.role !== inventory.canonicalRole) throw new ControlPlaneConvergenceError("DUPLICATE_PRODUCTION_OWNERS", "cannot reconcile from a competing production owner");
   if (destination.role !== inventory.canonicalRole) throw new ControlPlaneConvergenceError("CANONICAL_ROLE_INVALID", "reconciliation destination must be the selected canonical role");
+  assertExactServiceCatalogGeneration(source);
+  assertExactServiceCatalogGeneration(destination);
   if (input.request.domains.some((domain) => !["workspace_sessions", "agent_sessions", "durable_operations", "chat_swarm_records", "oauth_authority"].includes(domain))) throw new ControlPlaneConvergenceError("INVALID_PLAN", "unknown reconciliation domain");
   if (input.operationId.trim().length === 0) throw new ControlPlaneConvergenceError("INVALID_PLAN", "operationId is required");
   const hash = requestHash({ operationId: input.operationId, request: input.request });

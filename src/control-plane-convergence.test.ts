@@ -3,6 +3,8 @@ import test from "node:test";
 import {
   CANONICAL_CHAT_SWARM_RUNTIME_TOOLS,
   ControlPlaneConvergenceError,
+  SESSION_SCOPED_CATALOG_GENERATION,
+  type ControlPlaneCatalogGenerationScope,
   type ControlPlaneInventory,
   type PhysicalServiceInventory,
   evaluateControlPlaneConvergence,
@@ -120,6 +122,99 @@ test("topology manifests fail closed when role kind is missing or freshness is s
   const stale = parseControlPlaneTopologyManifest(base);
   const result = evaluateControlPlaneConvergence(stale);
   assert.ok(result.blockers.some((blocker) => blocker.code === "TOPOLOGY_MANIFEST_STALE"));
+});
+
+test("catalog generation scope is explicit, backward compatible, and rejects ambiguous topology", () => {
+  const base = {
+    schema: "devspace.control_plane_topology_manifest.v1",
+    observedAt: new Date().toISOString(),
+    maxAgeSeconds: 60,
+    inventory: { services: [service()], canonicalRole: "dev2", retirementCandidateRole: "dev2" },
+  };
+  const legacy = parseControlPlaneTopologyManifest(base);
+  assert.equal(legacy.services[0]?.capabilityManifest.catalogGenerationScope, undefined);
+
+  const sessionScoped = parseControlPlaneTopologyManifest({
+    ...base,
+    inventory: {
+      ...base.inventory,
+      services: [{
+        ...service(),
+        capabilityManifest: {
+          ...service().capabilityManifest,
+          catalogGeneration: SESSION_SCOPED_CATALOG_GENERATION,
+          catalogGenerationScope: "SESSION_SCOPED",
+        },
+      }],
+    },
+  });
+  assert.equal(sessionScoped.services[0]?.capabilityManifest.catalogGeneration, SESSION_SCOPED_CATALOG_GENERATION);
+  assert.equal(sessionScoped.services[0]?.capabilityManifest.catalogGenerationScope, "SESSION_SCOPED");
+
+  assert.throws(() => parseControlPlaneTopologyManifest({
+    ...base,
+    inventory: {
+      ...base.inventory,
+      services: [{
+        ...service(),
+        capabilityManifest: { ...service().capabilityManifest, catalogGenerationScope: "SESSION_SCOPED", catalogGeneration: "volatile-generation" },
+      }],
+    },
+  }), /stable SESSION_SCOPED/);
+  assert.throws(() => parseControlPlaneTopologyManifest({
+    ...base,
+    inventory: {
+      ...base.inventory,
+      services: [{
+        ...service(),
+        capabilityManifest: { ...service().capabilityManifest, catalogGenerationScope: "SESSION_SCOPED", catalogGeneration: SESSION_SCOPED_CATALOG_GENERATION },
+        expected: { catalogGeneration: "volatile-generation" },
+      }],
+    },
+  }), /cannot claim an exact/);
+  assert.throws(() => parseControlPlaneTopologyManifest({
+    ...base,
+    inventory: {
+      ...base.inventory,
+      services: [{
+        ...service(),
+        capabilityManifest: { ...service().capabilityManifest, catalogGenerationScope: "EXACT_SERVICE", catalogGeneration: SESSION_SCOPED_CATALOG_GENERATION },
+      }],
+    },
+  }), /EXACT_SERVICE topology/);
+  assert.throws(() => parseControlPlaneTopologyManifest({
+    ...base,
+    inventory: {
+      ...base.inventory,
+      services: [{
+        ...service(),
+        capabilityManifest: { ...service().capabilityManifest, catalogGeneration: SESSION_SCOPED_CATALOG_GENERATION, catalogGenerationScope: "BROKEN" as ControlPlaneCatalogGenerationScope },
+      }],
+    },
+  }), /catalogGenerationScope/);
+});
+
+test("session-scoped catalogs are accepted for convergence but refuse new migration plans", () => {
+  const scopedCanonical = service({
+    capabilityManifest: {
+      ...service().capabilityManifest,
+      catalogGeneration: SESSION_SCOPED_CATALOG_GENERATION,
+      catalogGenerationScope: "SESSION_SCOPED",
+    },
+  });
+  const scopedInventory = { services: [scopedCanonical], canonicalRole: "dev2", retirementCandidateRole: "dev2" } satisfies ControlPlaneInventory;
+  const evaluation = evaluateControlPlaneConvergence(scopedInventory);
+  assert.equal(evaluation.blockers.some((blocker) => blocker.code === "MISSING_INVENTORY"), false);
+  assert.throws(() => planControlPlaneReconciliation(scopedInventory, {
+    operationId: "session-scoped-refusal",
+    request: { sourceRole: "dev2", destinationRole: "dev2", domains: [] },
+  }), (error: unknown) => error instanceof ControlPlaneConvergenceError && error.code === "SESSION_CATALOG_DRIFT");
+
+  const malformed = evaluateControlPlaneConvergence({
+    ...scopedInventory,
+    services: [{ ...scopedCanonical, expected: { catalogGeneration: "volatile-generation" } }],
+  });
+  assert.ok(malformed.blockers.some((blocker) => blocker.code === "MISSING_INVENTORY"));
 });
 
 test("retirement is blocked while active state, owner lease, routing, or OAuth authority is stranded", () => {
@@ -304,6 +399,18 @@ test("retirement receipt destination proof survives canonical generation upgrade
   const advanced = evaluateControlPlaneConvergence({ ...retired, services: [advancedCanonical, attestedCandidate] });
   assert.equal(advanced.eligibleToRetire, true);
   assert.equal(advanced.blockers.length, 0);
+
+  const sessionScopedCanonical = service({
+    buildIdentity: { sourceCommit: "c".repeat(40), buildId: "devspace-2.0-d" },
+    capabilityManifest: {
+      sha256: "d".repeat(64),
+      catalogGeneration: SESSION_SCOPED_CATALOG_GENERATION,
+      catalogGenerationScope: "SESSION_SCOPED",
+      tools: [...CANONICAL_CHAT_SWARM_RUNTIME_TOOLS],
+    },
+  });
+  const sessionScopedReady = evaluateControlPlaneConvergence({ ...retired, services: [sessionScopedCanonical, attestedCandidate] });
+  assert.equal(sessionScopedReady.eligibleToRetire, true);
 
   const changedStateDirectory = evaluateControlPlaneConvergence({
     ...retired,
