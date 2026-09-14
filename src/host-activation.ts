@@ -4,7 +4,7 @@ import { basename, dirname, isAbsolute, join, relative, resolve } from "node:pat
 
 export const HOST_ACTIVATION_MANIFEST_SCHEMA = "devspace.host_activation_manifest.v1" as const;
 export const HOST_ACTIVATION_RECEIPT_SCHEMA = "devspace.host_activation_receipt.v1" as const;
-export const HOST_ACTIVATION_KINDS = ["OPENCLI_CHATGPT_ADAPTER_OVERLAY"] as const;
+export const HOST_ACTIVATION_KINDS = ["OPENCLI_CHATGPT_ADAPTER_OVERLAY", "DEVSPACE_CONTROL_PLANE_CUTOVER"] as const;
 export type HostActivationKind = typeof HOST_ACTIVATION_KINDS[number];
 
 export type HostActivationClassification =

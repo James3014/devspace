@@ -2,7 +2,9 @@
 
 Host activation is the macOS-only, typed, host-scoped production-effect mode built on top of the existing startup-authorized host operation executor. It exists for the narrow case where a validated Candidate must be installed into fixed local runtime surfaces outside an ordinary DevSpace workspace without falling back to an arbitrary shell command.
 
-The first admitted activation kind is `OPENCLI_CHATGPT_ADAPTER_OVERLAY`. The caller does not choose target paths, transformations, or an executable at runtime. Those values are frozen by the startup host-operation policy and by one read-only activation manifest passed in the exact startup-authorized argv.
+The admitted activation kinds are `OPENCLI_CHATGPT_ADAPTER_OVERLAY` and `DEVSPACE_CONTROL_PLANE_CUTOVER`. The latter is reserved for an exact canonical service-wrapper and `control-plane.json` topology-manifest cutover. The caller does not choose target paths, transformations, or an executable at runtime. Those values are frozen by the startup host-operation policy and by one read-only activation manifest passed in the exact startup-authorized argv.
+
+`DEVSPACE_CONTROL_PLANE_CUTOVER` may name only the fixed canonical service wrapper and topology manifest files required by the cutover, plus its receipt directory. Every path must remain inside the startup-approved read/write scopes and use the existing exact-preimage/exact-postimage transaction. This kind is not shell authority: it never invokes `launchctl`, accepts a generic command, or expands the approved scope at runtime.
 
 ## Safety model
 
