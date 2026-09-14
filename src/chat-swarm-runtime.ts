@@ -1533,16 +1533,45 @@ export class CdpMacWebDriver implements MacWebDriver {
       throw new Error("prompt delivery deadline elapsed before send");
     }
     const encoded = JSON.stringify(prompt);
-    const result = await this.evaluate<{ ok: boolean; reason?: string }>(
+    const injected = await this.evaluate<{ ok: boolean; reason?: string }>(
       target,
-      `(() => { const prompt=${encoded}; const visible=(el) => { const rect=el.getBoundingClientRect(); const style=getComputedStyle(el); return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden'; }; const editable=[...document.querySelectorAll('[contenteditable="true"]')].find(visible); const textarea=[...document.querySelectorAll('textarea')].find(visible); const el=editable||textarea; if(!el) return {ok:false,reason:'composer_missing'}; el.focus(); if(editable){ editable.textContent=prompt; editable.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:prompt})); } else { const setter=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')?.set; setter?.call(textarea,prompt); textarea.dispatchEvent(new Event('input',{bubbles:true})); } const button=document.querySelector('[data-testid="send-button"]') || [...document.querySelectorAll('button')].find(b => /send/i.test((b.getAttribute('aria-label')||b.textContent||''))); if(!button || button.disabled) return {ok:false,reason:'send_button_missing_or_disabled'}; button.click(); return {ok:true}; })()`,
+      `(() => { const prompt=${encoded}; const visible=(el) => { const rect=el.getBoundingClientRect(); const style=getComputedStyle(el); return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden'; }; const editable=[...document.querySelectorAll('[contenteditable="true"]')].find(visible); const textarea=[...document.querySelectorAll('textarea')].find(visible); const el=editable||textarea; if(!el) return {ok:false,reason:'composer_missing'}; el.focus(); if(editable){ editable.textContent=prompt; editable.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:prompt})); } else { const setter=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')?.set; setter?.call(textarea,prompt); textarea.dispatchEvent(new Event('input',{bubbles:true})); } return {ok:true}; })()`,
     );
-    if (!result?.ok) {
-      throw new Error(result?.reason ?? "ChatGPT prompt delivery failed");
+    if (!injected?.ok) {
+      throw new Error(injected?.reason ?? "ChatGPT prompt injection failed");
     }
-    if (Date.now() > Date.parse(deadlineAt)) {
-      throw new Error("prompt delivery exceeded deadline");
+
+    let sendReady = false;
+    while (Date.now() < Date.parse(deadlineAt)) {
+      sendReady = await this.evaluate<boolean>(
+        target,
+        `(() => { const button=document.querySelector('[data-testid="send-button"]') || [...document.querySelectorAll('button')].find(b => /send/i.test((b.getAttribute('aria-label')||b.textContent||''))); return Boolean(button && !button.disabled && button.getAttribute('aria-disabled') !== 'true'); })()`,
+      ).catch(() => false);
+      if (sendReady) break;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
     }
+    if (!sendReady) {
+      throw new Error("send_button_missing_or_disabled");
+    }
+
+    const clicked = await this.evaluate<boolean>(
+      target,
+      `(() => { const button=document.querySelector('[data-testid="send-button"]') || [...document.querySelectorAll('button')].find(b => /send/i.test((b.getAttribute('aria-label')||b.textContent||''))); if(!button || button.disabled || button.getAttribute('aria-disabled') === 'true') return false; button.click(); return true; })()`,
+    );
+    if (!clicked) {
+      throw new Error("send_button_missing_or_disabled");
+    }
+
+    let acknowledged = false;
+    while (Date.now() < Date.parse(deadlineAt)) {
+      acknowledged = await this.evaluate<boolean>(
+        target,
+        `(() => { const visible=(el) => { const rect=el.getBoundingClientRect(); const style=getComputedStyle(el); return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden'; }; const editable=[...document.querySelectorAll('[contenteditable="true"]')].find(visible); const textarea=[...document.querySelectorAll('textarea')].find(visible); const value=editable ? (editable.textContent||'') : (textarea?.value||''); return value.trim().length === 0; })()`,
+      ).catch(() => false);
+      if (acknowledged) return;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+    }
+    throw new Error("prompt delivery was not acknowledged before deadline");
   }
 
   private async waitForConversationUrl(

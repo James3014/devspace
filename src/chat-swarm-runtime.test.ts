@@ -200,22 +200,58 @@ test("CDP composer readiness ignores hidden fallback textareas and prefers visib
   assert.ok(expression.indexOf("[contenteditable=\"true\"]") < expression.indexOf("textarea"));
 });
 
-test("CDP prompt delivery targets the visible editable composer before textarea fallback", async () => {
+test("CDP prompt delivery waits for send readiness and composer-clear acknowledgement", async () => {
   const driver = cdpDriverForSelectorTest();
-  let expression = "";
+  const expressions: string[] = [];
+  const results: unknown[] = [
+    { ok: true },
+    false,
+    true,
+    true,
+    false,
+    true,
+  ];
   (driver as any).evaluate = async (_target: unknown, candidate: string) => {
-    expression = candidate;
-    return { ok: true };
+    expressions.push(candidate);
+    return results.shift();
   };
   await (driver as any).sendPromptToTarget(
     { id: "target-1", url: "https://chatgpt.com/" },
     "probe",
-    new Date(Date.now() + 1_000).toISOString(),
+    new Date(Date.now() + 2_000).toISOString(),
   );
-  assert.match(expression, /getBoundingClientRect/);
-  assert.match(expression, /data-testid="send-button"/);
-  assert.ok(expression.indexOf("const editable=") < expression.indexOf("const textarea="));
-  assert.match(expression, /const el=editable\|\|textarea/);
+  assert.equal(results.length, 0);
+  assert.equal(expressions.length, 6);
+  assert.match(expressions[0]!, /getBoundingClientRect/);
+  assert.ok(
+    expressions[0]!.indexOf("const editable=") < expressions[0]!.indexOf("const textarea="),
+  );
+  assert.match(expressions[0]!, /const el=editable\|\|textarea/);
+  assert.match(expressions[1]!, /data-testid="send-button"/);
+  assert.match(expressions[1]!, /aria-disabled/);
+  assert.match(expressions[3]!, /button\.click\(\)/);
+  assert.match(expressions[4]!, /value\.trim\(\)\.length === 0/);
+});
+
+test("CDP prompt delivery does not report success when click is not acknowledged", async () => {
+  const driver = cdpDriverForSelectorTest();
+  let call = 0;
+  (driver as any).evaluate = async () => {
+    call += 1;
+    if (call === 1) return { ok: true };
+    if (call === 2) return true;
+    if (call === 3) return true;
+    return false;
+  };
+  await assert.rejects(
+    () =>
+      (driver as any).sendPromptToTarget(
+        { id: "target-1", url: "https://chatgpt.com/" },
+        "probe",
+        new Date(Date.now() + 300).toISOString(),
+      ),
+    /prompt delivery was not acknowledged before deadline/,
+  );
 });
 
 test("concurrent runtime ensure creates only missing managed workers and exact replay creates no duplicates", async () => {
