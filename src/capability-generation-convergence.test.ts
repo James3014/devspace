@@ -71,6 +71,33 @@ test("Issue #133: SessionConvergence keeps manifest drift stale until tools/list
   assert.equal(evaluation.activeDrift, true);
 });
 
+test("Issue #133: session catalog generations remain exact per session and tools/list acknowledgement clears only the bound generation", () => {
+  const current = {
+    serverInstanceId: "srv-1",
+    sourceCommit: "commit-1",
+    buildId: "build-1",
+    capabilityManifestSha256: "manifest-1",
+    catalogGeneration: "workspace-generation-2",
+    sessionInitializedAt: new Date().toISOString(),
+    cutoverMode: "normal",
+    reconciliationRequired: false,
+  };
+  const snapshot: SessionGenerationSnapshot = {
+    ...current,
+    catalogGeneration: "workspace-generation-1",
+    sessionInitializedAt: new Date().toISOString(),
+  };
+  const stale = evaluateSessionConvergence(snapshot, current);
+  assert.equal(stale.state, "STALE_SESSION_CATALOG");
+  assert.equal(stale.reconnectRequired, false);
+
+  const registry = new McpSessionRegistry<{ close(): Promise<void> }>();
+  registry.register("session-scoped", { close: async () => {} }, { snapshot });
+  assert.equal(registry.acknowledgeToolsList("session-scoped", current), true);
+  assert.equal(evaluateSessionConvergence(registry.getSnapshot("session-scoped"), current).state, "CURRENT");
+  assert.equal(registry.getSnapshot("session-scoped")?.catalogGeneration, "workspace-generation-2");
+});
+
 test("Issue #133: McpSessionRegistry preserves and updates generation snapshots & server references", () => {
   const registry = new McpSessionRegistry<{ close(): Promise<void> }>();
   const transport = { close: async () => {} };
