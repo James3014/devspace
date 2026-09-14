@@ -1,0 +1,142 @@
+name: PR148 apply development boundary wave2
+on:
+  push:
+    branches: [codex/issue-148-development-boundary-wave2]
+permissions:
+  contents: write
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with: {fetch-depth: 0}
+      - uses: actions/setup-node@v4
+        with: {node-version: 22, cache: npm}
+      - run: npm ci
+      - name: Apply exact boundary extraction
+        shell: python
+        run: |
+          from pathlib import Path
+          import json
+
+          def r(p): return Path(p).read_text()
+          def w(p, s): Path(p).write_text(s)
+          def one(s, old, new, label):
+              n=s.count(old)
+              if n != 1: raise SystemExit(f"{label}: expected 1 match, got {n}")
+              return s.replace(old,new,1)
+
+          # Shared redaction: move exact implementation to a neutral module.
+          e=r('src/local-agent-errors.ts')
+          start=e.index('/**\n * Redact provider material only after it has been decoded/assembled.')
+          end=e.index('\n\nexport function isAgentDaemonError', start)
+          redaction=e[start:end].replace(
+              '/**\n * Redact provider material only after it has been decoded/assembled. Provider\n * adapters retain output until a protocol boundary, so a credential split\n * across transport chunks is still matched here before persistence/logging.\n */',
+              '/** Redact assembled sensitive material at a neutral infrastructure boundary. */'
+          )
+          w('src/sensitive-redaction.ts', redaction+'\n')
+          e=e[:start]+e[end+2:]
+          anchor='import {\n  isLocalAgentProvider,\n  type LocalAgentProvider,\n} from "./local-agent-profiles.js";\n'
+          e=one(e,anchor,anchor+'import { redactSensitiveText } from "./sensitive-redaction.js";\nexport { redactSensitiveText } from "./sensitive-redaction.js";\n','local errors import')
+          w('src/local-agent-errors.ts',e)
+
+          h=r('src/host-operations.ts')
+          h=one(h,'import { redactSensitiveText } from "./local-agent-errors.js";\n','import { redactSensitiveText } from "./sensitive-redaction.js";\n','host redaction import')
+          w('src/host-operations.ts',h)
+
+          # ChatSwarm migration: extract strategy code, leave durable ledger neutral.
+          d=r('src/durable-operations.ts')
+          d=one(d,'import { ChatSwarmStore, type ChatSwarmMigrationBundle, type ChatSwarmMigrationReadback } from "./chat-swarm-store.js";\n','','swarm import')
+          d=one(d,'import type { ControlPlaneServiceBinding } from "./control-plane-convergence.js";\n','','binding import')
+          d=one(d,'export type DurableOperationKind = "workspace_clone" | "dependency_sync" | "nexus_gateway_recover" | "cutover_start" | "host_operation" | "chat_swarm_reconciliation";\n','export type DurableOperationKind =\n  | "workspace_clone"\n  | "dependency_sync"\n  | "nexus_gateway_recover"\n  | "cutover_start"\n  | "host_operation"\n  | (string & {});\n','kind type')
+
+          ps=d.index('export interface ChatSwarmMigrationPreparation {')
+          pe=d.index('\n\nexport type CommandRunner',ps)
+          prep=d[ps:pe]
+          d=d[:ps]+d[pe+2:]
+
+          ms=d.index('  prepareChatSwarmMigration(input: {')
+          me=d.index('  private async executeNexusGatewayRecovery(',ms)
+          methods=d[ms:me].replace('this.config.stateDir','this.destinationStateDirectory')
+          methods=methods.replace('hashJson(request)','hashDurableRequest(request)')
+          methods=methods.replace('JSON.stringify(sortJson(input.bundle.destinationBinding)) !== JSON.stringify(sortJson(input.destinationBinding))','!isDeepStrictEqual(input.bundle.destinationBinding, input.destinationBinding)')
+          methods=methods.replace('redactSecrets(error instanceof Error ? error.message : String(error))','redactSensitiveText(error instanceof Error ? error.message : String(error))')
+          d=d[:ms]+d[me:]
+
+          hs=d.index('function migrationReadbackMatches(')
+          he=d.index('\n\nfunction stableOperationId',hs)
+          readback=d[hs:he]
+          d=d[:hs]+d[he+2:]
+
+          old='''function stableOperationId(kind: DurableOperationKind, scopeRoot: string, attemptKey: string): string {\n  return `op_${createHash("sha256").update(`${kind}\\0${resolve(scopeRoot)}\\0${attemptKey}`).digest("hex").slice(0, 16)}`;\n}\n\nexport function chatSwarmMigrationOperationId(destinationStateDirectory: string, attemptKey: string): string {\n  assertAttemptKey(attemptKey);\n  return stableOperationId("chat_swarm_reconciliation", destinationStateDirectory, attemptKey);\n}\n\nfunction hashJson(value: unknown): string {\n  return createHash("sha256").update(JSON.stringify(sortJson(value))).digest("hex");\n}\n'''
+          new='''function stableOperationId(kind: DurableOperationKind, scopeRoot: string, attemptKey: string): string {\n  return `op_${createHash("sha256").update(`${kind}\\0${resolve(scopeRoot)}\\0${attemptKey}`).digest("hex").slice(0, 16)}`;\n}\n\nexport function durableOperationId(kind: string, scopeRoot: string, attemptKey: string): string {\n  assertAttemptKey(attemptKey);\n  return stableOperationId(kind, scopeRoot, attemptKey);\n}\n\nfunction hashJson(value: unknown): string {\n  return createHash("sha256").update(JSON.stringify(sortJson(value))).digest("hex");\n}\n\nexport function hashDurableRequest(value: unknown): string {\n  return hashJson(value);\n}\n'''
+          d=one(d,old,new,'durable helpers')
+          w('src/durable-operations.ts',d)
+
+          migration='''import { isDeepStrictEqual } from "node:util";\nimport type { ControlPlaneServiceBinding } from "./control-plane-convergence.js";\nimport {\n  DurableOperationError,\n  durableOperationId,\n  hashDurableRequest,\n  type DurableOperationRecord,\n  type DurableOperationStore,\n} from "./durable-operations.js";\nimport { ChatSwarmStore, type ChatSwarmMigrationBundle, type ChatSwarmMigrationReadback } from "./chat-swarm-store.js";\nimport { redactSensitiveText } from "./sensitive-redaction.js";\n\n'''
+          migration+=prep+'\n\n'
+          migration+='''export function chatSwarmMigrationOperationId(destinationStateDirectory: string, attemptKey: string): string {\n  return durableOperationId("chat_swarm_reconciliation", destinationStateDirectory, attemptKey);\n}\n\nexport class ChatSwarmMigrationCoordinator {\n  constructor(\n    private readonly store: DurableOperationStore,\n    private readonly destinationStateDirectory: string,\n  ) {}\n\n'''
+          migration+=methods.replace('  prepareChatSwarmMigration','  prepareChatSwarmMigration').rstrip()+'\n}\n\n'+readback+'\n'
+          w('src/chat-swarm-migration.ts',migration)
+
+          s=r('src/server.ts')
+          s=one(s,'  DurableOperationManager,\n  chatSwarmMigrationOperationId,\n  planCutoverStart,\n','  DurableOperationManager,\n  planCutoverStart,\n','server durable import')
+          marker='} from "./durable-operations.js";\n'
+          s=one(s,marker,marker+'import { ChatSwarmMigrationCoordinator, chatSwarmMigrationOperationId } from "./chat-swarm-migration.js";\n','server migration import')
+          s=one(s,'function registerControlPlaneMigrationTools(\n  server: McpServer,\n  durableOperations: DurableOperationManager,\n  chatSwarmStore: ChatSwarmStore,\n','function registerControlPlaneMigrationTools(\n  server: McpServer,\n  durableOperations: DurableOperationManager,\n  chatSwarmStore: ChatSwarmStore,\n','server signature')
+          s=s.replace('durableOperations.prepareChatSwarmMigration(', 'new ChatSwarmMigrationCoordinator(durableOperations.store, config.stateDir).prepareChatSwarmMigration(')
+          s=s.replace('durableOperations.applyChatSwarmMigration(', 'new ChatSwarmMigrationCoordinator(durableOperations.store, config.stateDir).applyChatSwarmMigration(')
+          s=s.replace('durableOperations.reconcileChatSwarmMigration(', 'new ChatSwarmMigrationCoordinator(durableOperations.store, config.stateDir).reconcileChatSwarmMigration(')
+          w('src/server.ts',s)
+
+          t=r('src/durable-operations.test.ts')
+          t=t.replace('  chatSwarmMigrationOperationId,\n','')
+          imp='import { ChatSwarmStore } from "./chat-swarm-store.js";\n'
+          t=one(t,imp,imp+'import { ChatSwarmMigrationCoordinator, chatSwarmMigrationOperationId } from "./chat-swarm-migration.js";\n','migration test import')
+          t=one(t,'    const manager = new DurableOperationManager(canonicalConfig);\n    try {\n      const preparation = manager.prepareChatSwarmMigration({ attemptKey, bundle, destinationBinding });','    const manager = new DurableOperationManager(canonicalConfig);\n    const migration = new ChatSwarmMigrationCoordinator(manager.store, destinationRoot);\n    try {\n      const preparation = migration.prepareChatSwarmMigration({ attemptKey, bundle, destinationBinding });','test coordinator')
+          t=t.replace('manager.applyChatSwarmMigration(', 'migration.applyChatSwarmMigration(')
+          t=t.replace('manager.prepareChatSwarmMigration(', 'migration.prepareChatSwarmMigration(')
+          t=t.replace('manager.reconcileChatSwarmMigration(', 'migration.reconcileChatSwarmMigration(')
+          w('src/durable-operations.test.ts',t)
+
+          b=r('src/development-boundaries.ts')
+          b=one(b,'  "process-platform.ts",\n] as const;\n','  "process-platform.ts",\n  "sensitive-redaction.ts",\n  "durable-operations.ts",\n  "host-operations.ts",\n] as const;\n','kernel promotion')
+          ds=b.index('export const DEVELOPMENT_BOUNDARY_DEBT = [')
+          de=b.index('\n\nexport const DEVELOPMENT_BOUNDARY_RULES',ds)
+          b=b[:ds]+'export const DEVELOPMENT_BOUNDARY_DEBT: ReadonlyArray<{ module: string; role: "MIXED_DEBT"; reason: string }> = [];'+b[de:]
+          w('src/development-boundaries.ts',b)
+
+          p=json.loads(r('package.json'))
+          script=p['scripts']['test']
+          if 'tsx src/development-boundaries.test.ts' not in script:
+              script=script.replace('npm run test:node-pty-permissions && ','npm run test:node-pty-permissions && tsx src/development-boundaries.test.ts && ',1)
+          p['scripts']['test']=script
+          w('package.json',json.dumps(p,indent=2)+'\n')
+
+          doc=r('docs/development-boundaries.md')
+          doc=doc.replace('The executable source of truth for the first boundary slice is `src/development-boundaries.ts`; `src/development-boundaries.test.ts` prevents declared control-substrate modules from acquiring direct dependencies on replaceable provider, carrier, or strategy code.','The executable source of truth is `src/development-boundaries.ts`; `src/development-boundaries.test.ts` prevents declared control-substrate modules from acquiring direct dependencies on replaceable provider, carrier, or strategy code. The same fence runs in normal `npm test` and CI.')
+          a=doc.index('## Current migration debt')
+          z=doc.index('\n## Dependency rule',a)
+          resolved='''## Resolved second-wave debt\n\nThe second boundary slice removes the two explicit debts recorded by the first fence:\n\n- shared sensitive-text redaction lives in neutral `sensitive-redaction.ts`; provider code re-exports it for compatibility while `host-operations.ts` consumes the neutral utility directly;\n- ChatSwarm migration preparation/apply/reconcile lives in `chat-swarm-migration.ts`, which consumes the neutral durable-operation store. `durable-operations.ts` no longer imports ChatSwarm implementation modules.\n\n`durable-operations.ts`, `host-operations.ts`, and `sensitive-redaction.ts` are therefore part of the declared control kernel. `server.ts` remains the composition root. `DEVELOPMENT_BOUNDARY_DEBT` is empty at this revision; future mixed modules must be recorded explicitly rather than silently promoted.\n'''
+          doc=doc[:a]+resolved+doc[z:]
+          w('docs/development-boundaries.md',doc)
+      - name: Verify
+        run: |
+          npm run typecheck
+          npx tsx src/development-boundaries.test.ts
+          npx tsx src/durable-operations-ci.test.ts
+          npx tsx src/local-agent-errors.test.ts
+          npx tsx src/provider-output-redaction.test.ts
+          npx tsx src/host-operations.test.ts
+          npm run build
+          git diff --check
+      - name: Commit final source without helper
+        run: |
+          git config user.name James3014
+          git config user.email liligogo523@gmail.com
+          git rm .github/workflows/pr148-apply.yml
+          git add src docs package.json
+          git commit -m "refactor(architecture): resolve DevSpace boundary debt"
+          git push origin HEAD:codex/issue-148-development-boundary-wave2
