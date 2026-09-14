@@ -70,6 +70,14 @@ export interface ExecutionContract {
   /** Verified reuse-before-invention discovery evidence for mutating delegated work. */
   capabilityDiscovery?: CapabilityDiscoveryReceipt;
   /**
+   * Exact transport pointer to an already-open Core-bound mutation session.
+   * Carries provenance only; it grants no route, approval, or completion authority.
+   */
+  coreMutation?: {
+    sessionId: string;
+    bindingHash: string;
+  };
+  /**
    * If supplied, agent_start fails closed when the workspace HEAD no longer
    * matches before any worker mutation.
    */
@@ -232,6 +240,23 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
 
   if (record.capabilityDiscovery !== undefined) {
     contract.capabilityDiscovery = parseCapabilityDiscoveryReceipt(record.capabilityDiscovery);
+  }
+
+  if (record.coreMutation !== undefined) {
+    if (typeof record.coreMutation !== "object" || record.coreMutation === null || Array.isArray(record.coreMutation)) {
+      throw new Error("executionContract.coreMutation must be an object.");
+    }
+    const coreMutation = record.coreMutation as Record<string, unknown>;
+    const keys = Object.keys(coreMutation).sort().join(",");
+    if (keys !== "bindingHash,sessionId"
+      || typeof coreMutation.sessionId !== "string" || !/^cms_[0-9a-f]{32}$/.test(coreMutation.sessionId)
+      || typeof coreMutation.bindingHash !== "string" || !/^sha256:[0-9a-f]{64}$/.test(coreMutation.bindingHash)) {
+      throw new Error("executionContract.coreMutation requires exact sessionId and bindingHash.");
+    }
+    contract.coreMutation = {
+      sessionId: coreMutation.sessionId,
+      bindingHash: coreMutation.bindingHash,
+    };
   }
 
   if (record.expectedHead !== undefined) {

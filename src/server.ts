@@ -21,7 +21,7 @@ import {
 import express from "express";
 import type { Request, Response } from "express";
 import * as z from "zod/v4";
-import { applyPatch } from "./apply-patch.js";
+import { applyPatch, parsePatch } from "./apply-patch.js";
 import { commitCandidate, pushCandidate, GitCandidateError } from "./git-candidate.js";
 import {
   integrateCandidate,
@@ -29,6 +29,7 @@ import {
   promoteCandidate,
   probeRemoteWritability,
   type IntegrationApplyResult,
+  type IntegrationReadiness,
 } from "./git-integration.js";
 import {
   isArtifactDownloadSupportedPlatform,
@@ -118,6 +119,17 @@ import { ChatSwarmRuntimeOwner } from "./chat-swarm-runtime-owner.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
+import {
+  CoreMutationSessionStore,
+  type CoreMutationAdmission,
+} from "./core-mutation-session.js";
+import {
+  coreMutationAdmissionOutput,
+  coreMutationCandidateOutput,
+  createCoreMutationGuard,
+  registerCoreMutationSessionTools,
+  type CoreMutationGuard,
+} from "./core-mutation-tools.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 import {
   summarizeLocalAgentProfile,
@@ -752,6 +764,7 @@ function processOutputSchema(): z.ZodRawShape {
     timedOut: z.boolean().optional(),
     wallTimeMs: z.number().nonnegative(),
     outputTruncated: z.boolean(),
+    coreMutation: z.record(z.string(), z.unknown()).optional(),
   });
 }
 
@@ -760,6 +773,7 @@ function processToolResponse(
   workspaceId: string,
   snapshot: ProcessSnapshot,
   summary: Record<string, unknown>,
+  coreMutation?: CoreMutationAdmission,
 ) {
   const result = processResult(snapshot);
   const content = [textBlock(result)];
@@ -786,6 +800,7 @@ function processToolResponse(
       timedOut: snapshot.timedOut,
       wallTimeMs: snapshot.wallTimeMs,
       outputTruncated: snapshot.outputTruncated,
+      ...(coreMutation?.bound ? { coreMutation: coreMutationAdmissionOutput(coreMutation) } : {}),
     },
   };
 }
@@ -795,7 +810,9 @@ function registerCodexProcessTools(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
   processSessions: ProcessSessionManager,
+  coreMutation?: CoreMutationGuard,
 ): void {
+  const processCoreBindings = new Map<number, { bound: boolean; sessionId?: string; bindingHash?: string }>();
   registerAppTool(
     server,
     "exec_command",
@@ -846,12 +863,16 @@ function registerCodexProcessTools(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens, attemptKey, timeout }, { _meta }) => {
+    async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens, attemptKey, timeout }, extra) => {
       const startedAt = performance.now();
-      if (!isReadOnlyInspectionCommand(cmd)) {
-        await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
+      const mutationCapable = !isReadOnlyInspectionCommand(cmd);
+      if (mutationCapable) {
+        await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       }
       const workspace = workspaces.getWorkspace(workspaceId);
+      const coreAdmission = mutationCapable && coreMutation
+        ? await coreMutation.admit({ workspaceId, extra, pathContainment: "NOT_PROVEN" })
+        : undefined;
       const cwd = workspaces.resolveWorkingDirectory(workspace, workingDirectory);
       const snapshot = await processSessions.start({
         workspaceId,
@@ -866,6 +887,14 @@ function registerCodexProcessTools(
         attemptKey,
         timeoutSeconds: timeout,
       });
+
+      if (coreAdmission && snapshot.sessionId !== undefined) {
+        processCoreBindings.set(snapshot.sessionId, {
+          bound: coreAdmission.bound,
+          ...(coreAdmission.sessionId ? { sessionId: coreAdmission.sessionId } : {}),
+          ...(coreAdmission.bindingHash ? { bindingHash: coreAdmission.bindingHash } : {}),
+        });
+      }
 
       logToolCall(config, {
         tool: "exec_command",
@@ -883,7 +912,7 @@ function registerCodexProcessTools(
         running: snapshot.running,
         exitCode: snapshot.exitCode,
         wallTimeMs: snapshot.wallTimeMs,
-      });
+      }, coreAdmission);
     },
   );
 
@@ -919,9 +948,26 @@ function registerCodexProcessTools(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, sessionId, chars, columns, rows, yieldTimeMs, maxOutputTokens }) => {
+    async ({ workspaceId, sessionId, chars, columns, rows, yieldTimeMs, maxOutputTokens }, extra) => {
       const startedAt = performance.now();
       workspaces.getWorkspace(workspaceId);
+      let coreAdmission: CoreMutationAdmission | undefined;
+      if (chars && chars.length > 0 && coreMutation) {
+        const original = processCoreBindings.get(sessionId);
+        const active = coreMutation.active(workspaceId);
+        if (original?.bound) {
+          coreAdmission = await coreMutation.admit({
+            workspaceId,
+            extra,
+            pointer: { required: true, sessionId: original.sessionId, bindingHash: original.bindingHash },
+            pathContainment: "NOT_PROVEN",
+          });
+        } else if (active) {
+          throw new Error(
+            "[CORE_MUTATION_SESSION_REQUIRED] This process was launched outside the active Core mutation session; write_stdin cannot retroactively attach trusted provenance.",
+          );
+        }
+      }
       const snapshot = await processSessions.write({
         workspaceId,
         sessionId,
@@ -931,6 +977,8 @@ function registerCodexProcessTools(
         yieldTimeMs,
         maxOutputTokens,
       });
+
+      if (!snapshot.running) processCoreBindings.delete(sessionId);
 
       logToolCall(config, {
         tool: "write_stdin",
@@ -945,12 +993,15 @@ function registerCodexProcessTools(
         running: snapshot.running,
         exitCode: snapshot.exitCode,
         wallTimeMs: snapshot.wallTimeMs,
-      });
+      }, coreAdmission);
     },
   );
 }
 
-function codexGoalStateStructured(state: CodexGoalState): Record<string, unknown> {
+function codexGoalStateStructured(
+  state: CodexGoalState,
+  coreMutation?: CoreMutationAdmission,
+): Record<string, unknown> {
   return {
     goalId: state.goalId,
     workspaceId: state.workspaceId,
@@ -967,6 +1018,7 @@ function codexGoalStateStructured(state: CodexGoalState): Record<string, unknown
     baseHead: state.baseHead,
     terminalReason: state.terminalReason,
     error: state.error,
+    ...(coreMutation?.bound ? { coreMutation: coreMutationAdmissionOutput(coreMutation) } : {}),
   };
 }
 
@@ -988,7 +1040,9 @@ function registerCodexGoalTools(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
   goals: CodexGoalSessionManager,
+  coreMutation?: CoreMutationGuard,
 ): void {
+  const goalCoreBindings = new Map<string, { bound: boolean; sessionId?: string; bindingHash?: string }>();
   const GOAL_START_ANNOTATIONS = {
     readOnlyHint: false,
     destructiveHint: true,
@@ -1041,10 +1095,13 @@ function registerCodexGoalTools(
       _meta: {},
       annotations: GOAL_START_ANNOTATIONS,
     },
-    async ({ workspaceId, goal, model, reasoningEffort, expectedHead }, { _meta }) => {
+    async ({ workspaceId, goal, model, reasoningEffort, expectedHead }, extra) => {
       const startedAt = performance.now();
-      await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
+      await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
+      const coreAdmission = coreMutation
+        ? await coreMutation.admit({ workspaceId, extra, pathContainment: "NOT_PROVEN" })
+        : undefined;
       let state: CodexGoalState;
       try {
         state = await goals.startPrompt({
@@ -1062,6 +1119,13 @@ function registerCodexGoalTools(
         }, [textBlock(error instanceof Error ? error.message : String(error))], startedAt);
         throw error;
       }
+      if (coreAdmission) {
+        goalCoreBindings.set(state.goalId, {
+          bound: coreAdmission.bound,
+          ...(coreAdmission.sessionId ? { sessionId: coreAdmission.sessionId } : {}),
+          ...(coreAdmission.bindingHash ? { bindingHash: coreAdmission.bindingHash } : {}),
+        });
+      }
       logToolCall(config, {
         tool: "codex_goal_start",
         workspaceId,
@@ -1070,7 +1134,7 @@ function registerCodexGoalTools(
       });
       return {
         content: [textBlock(codexGoalResultText("started", state))],
-        structuredContent: codexGoalStateStructured(state),
+        structuredContent: codexGoalStateStructured(state, coreAdmission),
       };
     },
   );
@@ -1154,9 +1218,26 @@ function registerCodexGoalTools(
         openWorldHint: true,
       },
     },
-    async ({ workspaceId, goalId, message }, { _meta }) => {
-      await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
+    async ({ workspaceId, goalId, message }, extra) => {
+      await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       workspaces.getWorkspace(workspaceId);
+      let coreAdmission: CoreMutationAdmission | undefined;
+      if (coreMutation) {
+        const original = goalCoreBindings.get(goalId);
+        const active = coreMutation.active(workspaceId);
+        if (original?.bound) {
+          coreAdmission = await coreMutation.admit({
+            workspaceId,
+            extra,
+            pointer: { required: true, sessionId: original.sessionId, bindingHash: original.bindingHash },
+            pathContainment: "NOT_PROVEN",
+          });
+        } else if (active) {
+          throw new Error(
+            "[CORE_MUTATION_SESSION_REQUIRED] This Codex goal was launched outside the active Core mutation session; continuation cannot retroactively attach trusted provenance.",
+          );
+        }
+      }
       const state = await goals.continue(workspaceId, goalId, message);
       logToolCall(config, {
         tool: "codex_goal_continue",
@@ -1166,7 +1247,7 @@ function registerCodexGoalTools(
       });
       return {
         content: [textBlock(codexGoalResultText("continued", state))],
-        structuredContent: codexGoalStateStructured(state),
+        structuredContent: codexGoalStateStructured(state, coreAdmission),
       };
     },
   );
@@ -2275,6 +2356,12 @@ function createAgentStartInputSchema() {
     capabilityDiscovery: capabilityDiscovery.describe(
       "Reuse-before-invention discovery receipt bound to current canonical Nexus main and the exact capability discovery index bytes. Required for write-capable delegated workers; this is navigation evidence, not routing or mutation authority.",
     ),
+    coreMutation: z.object({
+      sessionId: z.string().regex(/^cms_[0-9a-f]{32}$/),
+      bindingHash: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+    }).strict().describe(
+      "Exact pointer to an already-open Core-bound mutation session. This carries provenance only and grants no routing, acceptance, merge, or release authority.",
+    ),
     expectedHead: z.string().describe(
       "40-character commit SHA. If supplied, agent_start fails closed when workspace HEAD no longer matches.",
     ),
@@ -2450,6 +2537,7 @@ export const candidateIntegrateOutputSchema = z.object({
   ]),
   reconciliationRequired: z.boolean(),
   affectedTrackedPaths: z.array(z.string()),
+  coreMutation: z.record(z.string(), z.unknown()).optional(),
 });
 
 export function formatCandidateIntegrateSummary(output: IntegrationApplyResult): string {
@@ -2466,6 +2554,45 @@ export function formatCandidateIntegrateSummary(output: IntegrationApplyResult):
     return `Not applied (CONFIRMED_NO_EFFECT: destination confirmed unchanged)${output.blockers.length > 0 ? `: ${output.blockers.map((blocker) => blocker.code).join(", ")}` : "."}`;
   }
   return `Not applied${output.blockers.length > 0 ? `: ${output.blockers.map((blocker) => blocker.code).join(", ")}` : "."}`;
+}
+
+function samePathSet(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  const orderedLeft = [...left].sort();
+  const orderedRight = [...right].sort();
+  return orderedLeft.every((path, index) => path === orderedRight[index]);
+}
+
+function requireCoreCandidateProvenance(
+  coreMutation: CoreMutationGuard,
+  readiness: IntegrationReadiness,
+) {
+  const canonicalHead = readiness.canonicalHead;
+  const canonicalBase = readiness.canonicalBase;
+  const candidateTree = readiness.candidateTreeId;
+  if (!canonicalHead || !canonicalBase || !candidateTree) {
+    throw new Error(
+      "[CORE_CANDIDATE_PROVENANCE_UNVERIFIABLE] Candidate identity is incomplete after integration readiness checks.",
+    );
+  }
+  const provenance = coreMutation.candidate(canonicalHead);
+  if (!provenance) {
+    throw new Error(
+      `[CORE_CANDIDATE_PROVENANCE_REQUIRED] Candidate ${canonicalHead} has no durable Core-bound source provenance.`,
+    );
+  }
+  if (
+    provenance.candidateHead !== canonicalHead ||
+    provenance.candidateTree !== candidateTree ||
+    provenance.sourceHead !== canonicalBase ||
+    !samePathSet(provenance.changedPaths, readiness.candidateChangedPaths) ||
+    !samePathSet(provenance.deletedPaths, readiness.candidateDeletedPaths)
+  ) {
+    throw new Error(
+      `[CORE_CANDIDATE_PROVENANCE_CONFLICT] Candidate ${canonicalHead} physical readiness does not match its durable Core provenance.`,
+    );
+  }
+  return provenance;
 }
 
 export function createMcpServer(
@@ -2489,6 +2616,7 @@ export function createMcpServer(
   controlPlaneInventoryOverride?: ControlPlaneInventory,
   /** Production-only reread of the exact configured manifest path. */
   controlPlaneInventoryReader?: () => ControlPlaneInventory,
+  coreMutationSessions?: CoreMutationSessionStore,
 ): McpServer {
   const runtimeBuildIdentity = runtimeBuildIdentityContext?.identity
     ?? describeRuntimeBuildIdentity({
@@ -2529,6 +2657,9 @@ export function createMcpServer(
       instructions: serverInstructions(config),
     },
   );
+
+  const coreMutationGuard = createCoreMutationGuard(workspaces, coreMutationSessions);
+  registerCoreMutationSessionTools(server, workspaces, coreMutationSessions);
 
   registerRepositoryIntelligenceTools(server, config, workspaces);
   registerPhysicalHostRegistryTools(server, {
@@ -3370,15 +3501,25 @@ export function createMcpServer(
           .describe("File path to write, relative to the workspace root."),
         content: z.string().describe("Complete new file content."),
       },
-      outputSchema: resultOutputSchema(),
+      outputSchema: resultOutputSchema({
+        coreMutation: z.record(z.string(), z.unknown()).optional(),
+      }),
       ...toolWidgetDescriptorMeta(config, "write"),
       annotations: WRITE_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, ...input }, { _meta }) => {
+    async ({ workspaceId, ...input }, extra) => {
       const startedAt = performance.now();
-      await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
+      await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
       workspaces.resolvePath(workspace, input.path);
+      const coreAdmission = coreMutationGuard
+        ? await coreMutationGuard.admit({
+            workspaceId,
+            extra,
+            paths: [input.path],
+            pathContainment: "STRUCTURED_SINK_ENFORCED",
+          })
+        : undefined;
       const response = await writeFileTool(input, {
         cwd: workspace.root,
         root: workspace.root,
@@ -3424,6 +3565,7 @@ export function createMcpServer(
         },
         structuredContent: {
           result: contentText(response.content),
+          ...(coreAdmission?.bound ? { coreMutation: coreMutationAdmissionOutput(coreAdmission) } : {}),
         },
       };
     },
@@ -3458,15 +3600,24 @@ export function createMcpServer(
       },
       outputSchema: resultOutputSchema({
         status: z.literal("applied"),
+        coreMutation: z.record(z.string(), z.unknown()).optional(),
       }),
       ...toolWidgetDescriptorMeta(config, "edit"),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, ...input }, { _meta }) => {
+    async ({ workspaceId, ...input }, extra) => {
       const startedAt = performance.now();
-      await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
+      await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
       workspaces.resolvePath(workspace, input.path);
+      const coreAdmission = coreMutationGuard
+        ? await coreMutationGuard.admit({
+            workspaceId,
+            extra,
+            paths: [input.path],
+            pathContainment: "STRUCTURED_SINK_ENFORCED",
+          })
+        : undefined;
       const response = await editFileTool(input, {
         cwd: workspace.root,
         root: workspace.root,
@@ -3515,6 +3666,7 @@ export function createMcpServer(
         structuredContent: {
           status: "applied",
           result: contentText(editContent),
+          ...(coreAdmission?.bound ? { coreMutation: coreMutationAdmissionOutput(coreAdmission) } : {}),
         },
       };
     },
@@ -3547,14 +3699,31 @@ export function createMcpServer(
               operation: z.enum(["add", "update", "delete", "move"]),
             }),
           ),
+          coreMutation: z.record(z.string(), z.unknown()).optional(),
         }),
         ...toolWidgetDescriptorMeta(config, "edit"),
         annotations: EDIT_TOOL_ANNOTATIONS,
       },
-      async ({ workspaceId, patch }, { _meta }) => {
+      async ({ workspaceId, patch }, extra) => {
         const startedAt = performance.now();
-        await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
+        await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
         const workspace = workspaces.getWorkspace(workspaceId);
+        const actions = parsePatch(patch);
+        const mutationPaths = actions.flatMap((action) =>
+          action.kind === "update" && action.moveTo ? [action.path, action.moveTo] : [action.path],
+        );
+        const deletedPaths = actions.flatMap((action) =>
+          action.kind === "delete" || (action.kind === "update" && action.moveTo) ? [action.path] : [],
+        );
+        const coreAdmission = coreMutationGuard
+          ? await coreMutationGuard.admit({
+              workspaceId,
+              extra,
+              paths: mutationPaths,
+              deletedPaths,
+              pathContainment: "STRUCTURED_SINK_ENFORCED",
+            })
+          : undefined;
         const applied = await applyPatch(workspace.root, patch);
         const paths = applied.files.map((file) => file.path).join(", ");
         const result = `Applied patch to ${applied.files.length} file(s): ${paths}`;
@@ -3591,6 +3760,7 @@ export function createMcpServer(
             additions: applied.additions,
             removals: applied.removals,
             files: applied.files,
+            ...(coreAdmission?.bound ? { coreMutation: coreMutationAdmissionOutput(coreAdmission) } : {}),
           },
         };
       },
@@ -3923,12 +4093,16 @@ export function createMcpServer(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, workingDirectory, command, timeout, attemptKey, yieldTimeMs, maxOutputTokens }, { _meta }) => {
+    async ({ workspaceId, workingDirectory, command, timeout, attemptKey, yieldTimeMs, maxOutputTokens }, extra) => {
       const startedAt = performance.now();
-      if (!isReadOnlyInspectionCommand(command)) {
-        await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
+      const mutationCapable = !isReadOnlyInspectionCommand(command);
+      if (mutationCapable) {
+        await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       }
       const workspace = workspaces.getWorkspace(workspaceId);
+      const coreAdmission = mutationCapable && coreMutationGuard
+        ? await coreMutationGuard.admit({ workspaceId, extra, pathContainment: "NOT_PROVEN" })
+        : undefined;
       const cwd = workspaces.resolveWorkingDirectory(
         workspace,
         workingDirectory,
@@ -3963,7 +4137,7 @@ export function createMcpServer(
         durationMs: Math.round(performance.now() - startedAt),
       });
 
-      return processToolResponse(toolNames.shell, workspaceId, snapshot, summary);
+      return processToolResponse(toolNames.shell, workspaceId, snapshot, summary, coreAdmission);
     },
   );
   }
@@ -4040,14 +4214,14 @@ export function createMcpServer(
   );
 
   if (config.toolMode === "codex") {
-    registerCodexProcessTools(server, config, workspaces, processSessions);
+    registerCodexProcessTools(server, config, workspaces, processSessions, coreMutationGuard);
   }
 
   // Narrow opt-in Codex Goal capability. Available in every tool mode, but it
   // exposes only special-purpose goal actions; generic exec_command/write_stdin
   // stay hidden outside codex mode.
   if (config.codexGoalsEnabled && codexGoals) {
-    registerCodexGoalTools(server, config, workspaces, codexGoals);
+    registerCodexGoalTools(server, config, workspaces, codexGoals, coreMutationGuard);
   }
 
   if (config.artifactsEnabled && isArtifactDownloadSupportedPlatform()) {
@@ -4199,11 +4373,12 @@ export function createMcpServer(
           createdAt: z.string(),
           updatedAt: z.string(),
           executionIdlePolicy: AGENT_IDLE_POLICY_OUTPUT_SCHEMA.optional(),
+          coreMutation: z.record(z.string(), z.unknown()).optional(),
         },
         _meta: {},
         annotations: AGENT_TOOL_ANNOTATIONS_WRITE,
       },
-      async ({ workspaceId, profile, provider, model, effort, cliProviderId, prompt, attemptKey, executionContract }, { _meta }) => {
+      async ({ workspaceId, profile, provider, model, effort, cliProviderId, prompt, attemptKey, executionContract }, extra) => {
         const selectorError = validateAgentSelector({ profile, provider, model, effort, cliProviderId });
         if (selectorError) throw new AgentSessionError("UNKNOWN_PROFILE", selectorError);
         const workspace = workspaces.getWorkspace(workspaceId);
@@ -4227,8 +4402,9 @@ export function createMcpServer(
         const profiles = selection.profiles;
         const selectedProfile = profiles.find((candidate) => candidate.name === selection.profileName);
         let discoveryContext: string | undefined;
+        let coreAdmission: CoreMutationAdmission | undefined;
         if (selectedProfile?.write_mode !== "read_only") {
-          await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
+          await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
           if (!contract?.capabilityDiscovery) {
             throw new AgentSessionError(
               "INVALID_EXECUTION_CONTRACT",
@@ -4236,9 +4412,27 @@ export function createMcpServer(
             );
           }
           try {
-            discoveryContext = renderCapabilityDiscoveryForWorker(
-              await verifyCapabilityDiscoveryReceipt(contract.capabilityDiscovery),
-            );
+            const verifiedDiscovery = await verifyCapabilityDiscoveryReceipt(contract.capabilityDiscovery);
+            discoveryContext = renderCapabilityDiscoveryForWorker(verifiedDiscovery);
+            if (coreMutationGuard && (coreMutationGuard.active(workspaceId) || contract.coreMutation)) {
+              if (!contract.coreMutation || !contract.writePaths || contract.writePaths.length === 0) {
+                throw new Error(
+                  "CORE_MUTATION_POINTER_REQUIRED: an active/bound Core mutation session requires exact coreMutation sessionId/bindingHash and writePaths before provider launch.",
+                );
+              }
+              coreMutationGuard.assertDiscovery(workspaceId, verifiedDiscovery.receipt);
+              coreAdmission = await coreMutationGuard.admit({
+                workspaceId,
+                extra,
+                pointer: {
+                  required: true,
+                  sessionId: contract.coreMutation.sessionId,
+                  bindingHash: contract.coreMutation.bindingHash,
+                },
+                paths: contract.writePaths,
+                pathContainment: "NOT_PROVEN",
+              });
+            }
           } catch (error) {
             throw new AgentSessionError(
               "INVALID_EXECUTION_CONTRACT",
@@ -4273,7 +4467,10 @@ export function createMcpServer(
         });
         return {
           content: [textBlock(`Started agent ${output.agentId} (${output.profileName}). Use agent_status to check progress.`)],
-          structuredContent: output as unknown as Record<string, unknown>,
+          structuredContent: {
+            ...(output as unknown as Record<string, unknown>),
+            ...(coreAdmission?.bound ? { coreMutation: coreMutationAdmissionOutput(coreAdmission) } : {}),
+          },
         };
       },
     );
@@ -4310,19 +4507,49 @@ export function createMcpServer(
           updatedAt: z.string(),
           executionIdlePolicy: AGENT_IDLE_POLICY_OUTPUT_SCHEMA.optional(),
           continued: z.boolean(),
+          coreMutation: z.record(z.string(), z.unknown()).optional(),
         },
         _meta: {},
         annotations: AGENT_TOOL_ANNOTATIONS_WRITE,
       },
-      async ({ workspaceId, agentId, prompt, idleTimeoutMode, idleTimeoutMs }, { _meta }) => {
+      async ({ workspaceId, agentId, prompt, idleTimeoutMode, idleTimeoutMs }, extra) => {
         const workspace = workspaces.getWorkspace(workspaceId);
         const { catalog: profileCatalog, opencodeCatalog, clineCatalog } = await loadMcpProfileCatalog(config, workspace.root, opencodeCatalogSource, clineCatalogService);
         const currentAgent = agentSessionManager.getRecordByPrefixOrId(agentId);
         const currentProfile = currentAgent
           ? profileCatalog.profiles.find((candidate) => candidate.name === currentAgent.profileName)
           : undefined;
+        let coreAdmission: CoreMutationAdmission | undefined;
         if (currentProfile?.write_mode !== "read_only") {
-          await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
+          await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
+          if (coreMutationGuard) {
+            const contract = currentAgent?.executionContract;
+            const active = coreMutationGuard.active(workspaceId);
+            if (contract?.coreMutation) {
+              if (!contract.writePaths || contract.writePaths.length === 0) {
+                throw new AgentSessionError(
+                  "INVALID_EXECUTION_CONTRACT",
+                  "CORE_MUTATION_POINTER_REQUIRED: persisted Core-bound execution is missing writePaths.",
+                );
+              }
+              coreAdmission = await coreMutationGuard.admit({
+                workspaceId,
+                extra,
+                pointer: {
+                  required: true,
+                  sessionId: contract.coreMutation.sessionId,
+                  bindingHash: contract.coreMutation.bindingHash,
+                },
+                paths: contract.writePaths,
+                pathContainment: "NOT_PROVEN",
+              });
+            } else if (active) {
+              throw new AgentSessionError(
+                "INVALID_EXECUTION_CONTRACT",
+                "CORE_MUTATION_SESSION_REQUIRED: historical unbound agent cannot continue inside an active Core mutation session.",
+              );
+            }
+          }
         }
         const output = await agentSessionManager.continueAgent({
           workspaceId,
@@ -4344,7 +4571,10 @@ export function createMcpServer(
         });
         return {
           content: [textBlock(`Continuing agent ${output.agentId} (${output.profileName}). Use agent_status to check progress.`)],
-          structuredContent: output as unknown as Record<string, unknown>,
+          structuredContent: {
+            ...(output as unknown as Record<string, unknown>),
+            ...(coreAdmission?.bound ? { coreMutation: coreMutationAdmissionOutput(coreAdmission) } : {}),
+          },
         };
       },
     );
@@ -4811,6 +5041,7 @@ export function createMcpServer(
         candidateBaseVerified: z.boolean(),
         candidateBaseIsAncestor: z.boolean(),
         candidateChangedPaths: z.array(z.string()),
+        candidateDeletedPaths: z.array(z.string()),
         destinationBaseMatches: z.boolean(),
         destinationOverlap: z.string(),
         overlappingPaths: z.array(z.string()),
@@ -4872,12 +5103,38 @@ export function createMcpServer(
         openWorldHint: false,
       },
     },
-    async ({ sourceWorkspaceId, candidateBase, candidateHead, destinationWorkspaceId, expectedDestinationHead, dirtyPolicy, confirmApply }, { _meta }) => {
+    async ({ sourceWorkspaceId, candidateBase, candidateHead, destinationWorkspaceId, expectedDestinationHead, dirtyPolicy, confirmApply }, extra) => {
       if (confirmApply) {
-        await workspaces.assertConversationMutationAllowed(destinationWorkspaceId, openAiConversationScopeId(_meta));
+        await workspaces.assertConversationMutationAllowed(destinationWorkspaceId, openAiConversationScopeId(extra._meta));
       }
       const source = workspaces.getWorkspace(sourceWorkspaceId);
       const destination = workspaces.getWorkspace(destinationWorkspaceId);
+      let coreAdmission: CoreMutationAdmission | undefined;
+      let coreCandidate: NonNullable<ReturnType<CoreMutationGuard["candidate"]>> | undefined;
+      const destinationCore = confirmApply ? coreMutationGuard?.active(destinationWorkspaceId) : undefined;
+      if (confirmApply && coreMutationGuard && destinationCore) {
+        const readiness = await inspectIntegrationReadiness({
+          sourceWorkspaceRoot: source.root,
+          candidateBase,
+          candidateHead,
+          destinationWorkspaceRoot: destination.root,
+          expectedDestinationHead,
+          dirtyPolicy,
+        });
+        if (!readiness.technicallyReadyToApply) {
+          throw new Error(
+            `[CANDIDATE_INTEGRATION_NOT_READY] ${readiness.blockers.map((blocker) => blocker.code).join(", ") || "readiness unknown"}`,
+          );
+        }
+        coreCandidate = requireCoreCandidateProvenance(coreMutationGuard, readiness);
+        coreAdmission = await coreMutationGuard.admit({
+          workspaceId: destinationWorkspaceId,
+          extra,
+          paths: readiness.candidateChangedPaths,
+          deletedPaths: readiness.candidateDeletedPaths,
+          pathContainment: "STRUCTURED_SINK_ENFORCED",
+        });
+      }
       const output = await integrateCandidate({
         sourceWorkspaceRoot: source.root,
         candidateBase,
@@ -4890,7 +5147,17 @@ export function createMcpServer(
       const summary = formatCandidateIntegrateSummary(output);
       return {
         content: [textBlock(summary)],
-        structuredContent: output as unknown as Record<string, unknown>,
+        structuredContent: {
+          ...(output as unknown as Record<string, unknown>),
+          ...(coreAdmission?.bound && coreCandidate
+            ? {
+                coreMutation: {
+                  sourceCandidate: coreMutationCandidateOutput(coreCandidate),
+                  destinationAdmission: coreMutationAdmissionOutput(coreAdmission),
+                },
+              }
+            : {}),
+        },
       };
     },
   );
@@ -4971,6 +5238,7 @@ export function createMcpServer(
           canonicalHead: z.string().optional(),
           acceptanceStatus: z.literal("external_not_granted_here"),
           blockers: z.array(z.object({ code: z.string(), detail: z.string() })),
+          coreMutation: z.record(z.string(), z.unknown()).optional(),
         },
         _meta: {},
         annotations: {
@@ -4993,9 +5261,41 @@ export function createMcpServer(
         expectedBuildId,
         expectedCapabilityManifestSha256,
         confirmPromote,
-      }) => {
+      }, extra) => {
+        if (confirmPromote) {
+          await workspaces.assertConversationMutationAllowed(
+            destinationWorkspaceId,
+            openAiConversationScopeId(extra._meta),
+          );
+        }
         const source = workspaces.getWorkspace(sourceWorkspaceId);
         const destination = workspaces.getWorkspace(destinationWorkspaceId);
+        let coreAdmission: CoreMutationAdmission | undefined;
+        let coreCandidate: NonNullable<ReturnType<CoreMutationGuard["candidate"]>> | undefined;
+        const destinationCore = confirmPromote ? coreMutationGuard?.active(destinationWorkspaceId) : undefined;
+        if (confirmPromote && coreMutationGuard && destinationCore) {
+          const readiness = await inspectIntegrationReadiness({
+            sourceWorkspaceRoot: source.root,
+            candidateBase,
+            candidateHead,
+            destinationWorkspaceRoot: destination.root,
+            expectedDestinationHead,
+            dirtyPolicy: "pristine",
+          });
+          if (!readiness.technicallyReadyToApply) {
+            throw new Error(
+              `[CANDIDATE_PROMOTION_NOT_READY] ${readiness.blockers.map((blocker) => blocker.code).join(", ") || "readiness unknown"}`,
+            );
+          }
+          coreCandidate = requireCoreCandidateProvenance(coreMutationGuard, readiness);
+          coreAdmission = await coreMutationGuard.admit({
+            workspaceId: destinationWorkspaceId,
+            extra,
+            paths: readiness.candidateChangedPaths,
+            deletedPaths: readiness.candidateDeletedPaths,
+            pathContainment: "STRUCTURED_SINK_ENFORCED",
+          });
+        }
         const output = await promoteCandidate({
           sourceWorkspaceRoot: source.root,
           candidateBase,
@@ -5022,7 +5322,17 @@ export function createMcpServer(
           : `Candidate not promoted: ${output.blockers.map((blocker) => blocker.code).join(", ")}.`;
         return {
           content: [textBlock(summary)],
-          structuredContent: output as unknown as Record<string, unknown>,
+          structuredContent: {
+            ...(output as unknown as Record<string, unknown>),
+            ...(coreAdmission?.bound && coreCandidate
+              ? {
+                  coreMutation: {
+                    sourceCandidate: coreMutationCandidateOutput(coreCandidate),
+                    destinationAdmission: coreMutationAdmissionOutput(coreAdmission),
+                  },
+                }
+              : {}),
+          },
         };
       },
     );
@@ -5056,6 +5366,7 @@ export function createMcpServer(
           paths: z.array(z.string()),
           detached: z.boolean(),
           created: z.literal(true),
+          coreMutation: z.record(z.string(), z.unknown()).optional(),
         },
         _meta: {},
         annotations: {
@@ -5065,7 +5376,7 @@ export function createMcpServer(
           openWorldHint: false,
         },
       },
-      async ({ workspaceId, expectedHead, message, paths }) => {
+      async ({ workspaceId, expectedHead, message, paths }, extra) => {
         const workspace = workspaces.getWorkspace(workspaceId);
         if (workspace.mode !== "worktree" || !workspace.worktree?.managed) {
           throw new Error(
@@ -5073,6 +5384,34 @@ export function createMcpServer(
           );
         }
         try {
+          const coreAdmission = coreMutationGuard
+            ? await coreMutationGuard.admit({
+                workspaceId,
+                extra,
+                paths,
+                pathContainment: "STRUCTURED_SINK_ENFORCED",
+              })
+            : undefined;
+          if (coreAdmission?.bound && coreMutationGuard) {
+            const preCommitSnapshot = await coreMutationGuard.snapshot({ workspaceId, extra });
+            if (preCommitSnapshot.scopeEscapePaths.length > 0) {
+              throw new Error(
+                `[CORE_MUTATION_SCOPE_ESCAPE] Untrusted paths exist before Candidate formation: ${preCommitSnapshot.scopeEscapePaths.join(", ")}`,
+              );
+            }
+            if (preCommitSnapshot.deletionViolation) {
+              throw new Error(
+                `[CORE_MUTATION_DELETION_FORBIDDEN] AcceptanceContract forbids deletion: ${preCommitSnapshot.deletedPaths.join(", ")}`,
+              );
+            }
+            const requested = new Set(paths);
+            const uncommitted = preCommitSnapshot.changedPaths.filter((path) => !requested.has(path));
+            if (uncommitted.length > 0) {
+              throw new Error(
+                `[CORE_CANDIDATE_PATH_SET_INCOMPLETE] Candidate paths omit Core-bound workspace changes: ${uncommitted.join(", ")}`,
+              );
+            }
+          }
           const result = await commitCandidate({
             workspaceId,
             workspaceRoot: workspace.root,
@@ -5080,6 +5419,14 @@ export function createMcpServer(
             message,
             paths,
           });
+          const coreCandidate = coreAdmission?.bound && coreMutationGuard
+            ? await coreMutationGuard.recordCandidate({
+                workspaceId,
+                extra,
+                candidateHead: result.commitSha,
+                candidateTree: result.treeSha,
+              })
+            : undefined;
           return {
             content: [textBlock(`Successfully created Candidate commit ${result.commitSha}`)],
             structuredContent: {
@@ -5091,6 +5438,11 @@ export function createMcpServer(
               paths: result.paths,
               detached: result.detached,
               created: true as const,
+              ...(coreCandidate
+                ? { coreMutation: coreMutationCandidateOutput(coreCandidate) }
+                : coreAdmission?.bound
+                  ? { coreMutation: coreMutationAdmissionOutput(coreAdmission) }
+                  : {}),
             },
           };
         } catch (err: any) {
@@ -5120,6 +5472,7 @@ export function createMcpServer(
           remote: z.string(),
           branch: z.string(),
           pushedSha: z.string(),
+          coreMutation: z.record(z.string(), z.unknown()).optional(),
         },
         _meta: {},
         annotations: {
@@ -5129,7 +5482,7 @@ export function createMcpServer(
           openWorldHint: true,
         },
       },
-      async ({ workspaceId, expectedHead, remote, branch }) => {
+      async ({ workspaceId, expectedHead, remote, branch }, extra) => {
         const workspace = workspaces.getWorkspace(workspaceId);
         if (workspace.mode !== "worktree" || !workspace.worktree?.managed) {
           throw new Error(
@@ -5137,6 +5490,39 @@ export function createMcpServer(
           );
         }
         try {
+          const activeCore = coreMutationGuard?.active(workspaceId);
+          const coreCandidate = coreMutationGuard?.candidate(expectedHead.toLowerCase());
+          if (activeCore && !coreCandidate) {
+            throw new Error(
+              "[CORE_CANDIDATE_PROVENANCE_REQUIRED] Active Core-bound workspace cannot publish an unbound Candidate HEAD.",
+            );
+          }
+          if (coreCandidate && !activeCore) {
+            throw new Error(
+              "[CORE_MUTATION_SESSION_REQUIRED] Core-bound Candidate publication requires its original mutation session to remain active until push completes.",
+            );
+          }
+          if (
+            activeCore &&
+            coreCandidate &&
+            (coreCandidate.bindingHash !== activeCore.bindingHash || coreCandidate.sessionId !== activeCore.id)
+          ) {
+            throw new Error(
+              "[CORE_CANDIDATE_PROVENANCE_CONFLICT] Candidate provenance does not match the active Core mutation binding.",
+            );
+          }
+          const coreAdmission = activeCore && coreMutationGuard
+            ? await coreMutationGuard.admit({
+                workspaceId,
+                extra,
+                pointer: {
+                  required: true,
+                  sessionId: activeCore.id,
+                  bindingHash: activeCore.bindingHash,
+                },
+                pathContainment: "NOT_PROVEN",
+              })
+            : undefined;
           const result = await pushCandidate({
             workspaceRoot: workspace.root,
             expectedHead,
@@ -5151,6 +5537,11 @@ export function createMcpServer(
               remote: result.remote,
               branch: result.branch,
               pushedSha: result.pushedSha,
+              ...(coreCandidate
+                ? { coreMutation: coreMutationCandidateOutput(coreCandidate) }
+                : coreAdmission?.bound
+                  ? { coreMutation: coreMutationAdmissionOutput(coreAdmission) }
+                  : {}),
             },
           };
         } catch (err: any) {
@@ -5463,6 +5854,8 @@ export function createServer(
   const reviewCheckpoints = createReviewCheckpointManager();
   const processSessions = new ProcessSessionManager();
   initializationCleanups.push(() => processSessions.shutdown());
+  const coreMutationSessions = new CoreMutationSessionStore(config.stateDir);
+  initializationCleanups.push(() => coreMutationSessions.close());
   const carrierBindings = options.coordination ? undefined : new CarrierBindingStore(config.stateDir, options.carrierClock, options.completionBindings);
   if (carrierBindings) initializationCleanups.push(() => carrierBindings.close());
   const durableOperations = new DurableOperationManager(config, undefined, undefined, undefined, options.coordination ?? carrierBindings?.readers);
@@ -6216,6 +6609,7 @@ export function createServer(
           hostOperations,
           options.controlPlaneInventory,
           controlPlaneInventoryReader,
+          coreMutationSessions,
         );
         if (transport.sessionId) {
           const initialSnapshot: SessionGenerationSnapshot = {
@@ -6283,6 +6677,7 @@ export function createServer(
         processSessions.shutdown();
         await hostOperations?.dispose();
         durableOperations.close();
+        coreMutationSessions.close();
         carrierBindings?.close();
         chatSwarmLifecycle?.close();
         chatSwarmRuntimeOwner?.close();

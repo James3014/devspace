@@ -81,6 +81,7 @@ const migrations: Migration[] = [
   { version: 16, name: "carrier-validity", up: migrateCarrierValidity },
   { version: 17, name: "chat-swarm-join-requests", up: migrateChatSwarmJoinRequests },
   { version: 18, name: "chat-swarm-carrier-operations", up: migrateChatSwarmCarrierOperations },
+  { version: 19, name: "core-mutation-sessions", up: migrateCoreMutationSessions },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -415,6 +416,49 @@ function migrateChatSwarmCarrierOperations(sqlite: Database.Database): void {
     );
     create index if not exists chat_swarm_carrier_operations_worker_idx
       on chat_swarm_carrier_operations(worker_id, binding_epoch, updated_at desc);
+  `);
+}
+
+function migrateCoreMutationSessions(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists core_mutation_sessions (
+      id text primary key,
+      workspace_session_id text not null references workspace_sessions(id) on delete cascade,
+      actor_key text not null,
+      binding_id text not null,
+      binding_hash text not null unique,
+      binding_json text not null,
+      source_head text not null,
+      source_tree text not null,
+      status text not null check (status in ('ACTIVE', 'COMPLETED', 'ABANDONED')),
+      first_effect_at text,
+      last_effect_at text,
+      created_at text not null,
+      updated_at text not null,
+      closed_at text
+    );
+    create unique index if not exists core_mutation_sessions_one_active_workspace_idx
+      on core_mutation_sessions(workspace_session_id)
+      where status = 'ACTIVE';
+    create index if not exists core_mutation_sessions_workspace_idx
+      on core_mutation_sessions(workspace_session_id, updated_at desc);
+
+    create table if not exists core_mutation_candidates (
+      candidate_head text primary key,
+      candidate_tree text not null,
+      session_id text not null,
+      workspace_session_id text not null,
+      binding_hash text not null,
+      acceptance_contract_hash text not null,
+      source_head text not null,
+      source_tree text not null,
+      changed_paths_json text not null,
+      deleted_paths_json text not null,
+      diff_hash text not null,
+      created_at text not null
+    );
+    create index if not exists core_mutation_candidates_binding_idx
+      on core_mutation_candidates(binding_hash, created_at desc);
   `);
 }
 

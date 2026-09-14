@@ -1987,6 +1987,7 @@ test("agent_start schema preserves #28 heartbeat and G9/G10 authority capabiliti
     ?? contract.properties;
   assert.ok(contractProps.authorityMode);
   assert.ok(contractProps.nexusGrant);
+  assert.ok(contractProps.coreMutation, "agent_start must expose the exact Core mutation session pointer");
   assert.ok(contractProps.idleTimeoutMs);
   assert.match(contractProps.idleTimeoutMs.description, /terminated.*no provider activity/i);
 });
