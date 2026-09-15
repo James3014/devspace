@@ -244,8 +244,8 @@ assert.throws(
   /Invalid DEVSPACE_ARTIFACT_MAX_FILE_BYTES: 0/,
 );
 
-assert.equal(loadConfig(baseEnv).mcpSessionIdleTimeoutMs, 6 * 60 * 60 * 1000);
-assert.equal(loadConfig(baseEnv).mcpSessionMaxSessions, 2048);
+assert.equal(loadConfig(baseEnv).mcpSessionIdleTimeoutMs, 30 * 60 * 1000);
+assert.equal(loadConfig(baseEnv).mcpSessionMaxSessions, 256);
 assert.equal(loadConfig(baseEnv).mcpCutoverBuildReadyRoot, undefined);
 assert.equal(
   loadConfig({ ...baseEnv, DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS: "30000" }).mcpSessionIdleTimeoutMs,

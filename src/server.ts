@@ -63,6 +63,7 @@ import {
 import {
   McpSessionRegistry,
   type McpSessionCloseResult,
+  type McpSessionDisposalReason,
 } from "./mcp-sessions.js";
 import {
   CutoverStateError,
@@ -201,6 +202,14 @@ class ReboundTransport extends StreamableHTTPServerTransport {
 
   override get sessionId(): string {
     return this.reboundSessionId;
+  }
+}
+class McpSessionRegistrationError extends Error {
+  constructor(reason: "capacity_exhausted" | "duplicate_session") {
+    super(reason === "capacity_exhausted"
+      ? "MCP session capacity exhausted; all resident sessions are in-flight"
+      : "MCP session registration rejected for an already-registered session");
+    this.name = "McpSessionRegistrationError";
   }
 }
 const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
@@ -5526,8 +5535,11 @@ export function createServer(
     host: config.host,
     ...(allowedHosts ? { allowedHosts } : {}),
   });
+  let notifyRegistryDisposal: (sessionId: string, transport: Transport, reason: McpSessionDisposalReason) => void = () => {};
   const transports = new McpSessionRegistry<Transport>({
     maxSessions: config.mcpSessionMaxSessions,
+    idleTimeoutMs: config.mcpSessionIdleTimeoutMs,
+    onDispose: (sessionId, transport, reason) => notifyRegistryDisposal(sessionId, transport, reason),
   });
   const broadcastToolListChanged = async (): Promise<number> => {
     const servers = transports.getAllServers();
@@ -5968,12 +5980,9 @@ export function createServer(
       .then(() => enumerateDurableReconciliationState())
       .then((durableBundle) => {
         const metrics = transports.metrics();
-        const inFlight = transports.inFlightStats();
         const cutoverRecord = cutoverController.record();
         logEvent(config.logging, "info", "mcp_metrics", {
-          activeSessions: metrics.activeSessions,
-          oldestAgeMs: metrics.oldestAgeMs,
-          inflightRequestCount: inFlight.inFlightRequestCount,
+          ...metrics,
           durable: {
             workspaceSessions: durableBundle.workspaceSessions,
             agentSessions: durableBundle.agentSessions,
@@ -6180,6 +6189,10 @@ export function createServer(
   const reboundSessionIds = new Set<string>();
   const reboundTransportDisposals = new WeakSet<object>();
   const closedReboundSessionIds = new Set<string>();
+  notifyRegistryDisposal = (sessionId) => {
+    carrierBindings?.forgetSession(sessionId);
+    reboundSessionIds.delete(sessionId);
+  };
   const reboundSessionTombstoneLimit = config.mcpSessionMaxSessions ?? 256;
   const rememberReboundSession = (sessionId: string) => {
     reboundSessionIds.delete(sessionId);
@@ -6205,11 +6218,11 @@ export function createServer(
   ) => {
     transport.onclose = () => {
       const closedSessionId = registrySessionId ?? transport.sessionId;
-      if (closedSessionId && !reboundTransportDisposals.has(transport)) {
-        carrierBindings?.forgetSession(closedSessionId);
-        reboundSessionIds.delete(closedSessionId);
-      }
-      if (closedSessionId && transports.remove(closedSessionId)) {
+      if (closedSessionId && transports.remove(closedSessionId, transport)) {
+        if (!reboundTransportDisposals.has(transport)) {
+          carrierBindings?.forgetSession(closedSessionId);
+          reboundSessionIds.delete(closedSessionId);
+        }
         logEvent(config.logging, "info", "mcp_session_closed", {
           reason: "transport_close",
           sessionIdPrefix: sessionIdPrefix(closedSessionId),
@@ -6320,6 +6333,7 @@ export function createServer(
     try {
       let transport: Transport | undefined;
       let registrySessionId = sessionId;
+      let registryRequestBegun = false;
 
       if (sessionId) {
         transport = transports.get(sessionId);
@@ -6361,7 +6375,7 @@ export function createServer(
           setTransportCloseHandler(transport, sessionId);
           const server = createSessionServer(sessionId);
           await server.connect(transport);
-          transports.register(sessionId, transport, {
+          const registration = transports.register(sessionId, transport, {
             snapshot: {
               serverInstanceId: runtimeBuildIdentity.serverInstanceId,
               sourceCommit: runtimeBuildIdentity.sourceCommit,
@@ -6373,6 +6387,17 @@ export function createServer(
             },
             server,
           });
+          if (!registration.accepted) {
+            sendJsonRpcError(
+              res,
+              503,
+              -32004,
+              registration.reason === "capacity_exhausted"
+                ? "MCP session capacity exhausted; retry after a session becomes available."
+                : "MCP session registration rejected; retry with a fresh session.",
+            );
+            return;
+          }
           rememberReboundSession(sessionId);
           registrySessionId = sessionId;
           res.setHeader("mcp-session-id", sessionId);
@@ -6382,6 +6407,10 @@ export function createServer(
           return;
         }
       } else if (initializeRequest) {
+        if (!transports.admitRegistration()) {
+          sendJsonRpcError(res, 503, -32004, "MCP session capacity exhausted; retry after a session becomes available.");
+          return;
+        }
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSessionId) => {
@@ -6395,7 +6424,12 @@ export function createServer(
                 freshness: runtimeBuildIdentity.startedAt,
                 sessionInitializedAt: new Date().toISOString(),
               };
-              transports.register(newSessionId, transport, { snapshot });
+              const registration = transports.register(newSessionId, transport, { snapshot, server });
+              if (!registration.accepted) {
+                throw new McpSessionRegistrationError(registration.reason);
+              }
+              registrySessionId = newSessionId;
+              registryRequestBegun = transports.beginRequest(newSessionId);
             }
             logEvent(config.logging, "info", "mcp_session_created", {
               requestId,
@@ -6427,7 +6461,9 @@ export function createServer(
         return;
       }
 
-      if (registrySessionId) transports.beginRequest(registrySessionId);
+      if (registrySessionId && !registryRequestBegun) {
+        registryRequestBegun = transports.beginRequest(registrySessionId);
+      }
       try {
         await transport.handleRequest(req, res, req.body);
         if (
@@ -6447,7 +6483,7 @@ export function createServer(
           });
         }
       } finally {
-        if (registrySessionId) await transports.endRequest(registrySessionId);
+        if (registrySessionId && registryRequestBegun) await transports.endRequest(registrySessionId);
       }
     } catch (error) {
       logEvent(config.logging, "error", "mcp_request_error", {
@@ -6455,7 +6491,11 @@ export function createServer(
         error: error instanceof Error ? error.message : String(error),
       });
       if (!res.headersSent) {
-        sendJsonRpcError(res, 500, -32603, "Internal server error");
+        if (error instanceof McpSessionRegistrationError) {
+          sendJsonRpcError(res, 503, -32004, error.message);
+        } else {
+          sendJsonRpcError(res, 500, -32603, "Internal server error");
+        }
       }
     }
   });
