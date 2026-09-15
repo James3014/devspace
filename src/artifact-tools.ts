@@ -21,6 +21,7 @@ import {
   type IncomingArtifactAdapter,
 } from "./incoming-artifacts.js";
 import { logEvent } from "./logger.js";
+import { registerRepositoryIntelligenceArtifactTool } from "./repository-intelligence-artifact.js";
 import type { WorkspaceRegistry } from "./workspaces.js";
 
 const ARTIFACT_WRITE_ANNOTATIONS = {
@@ -132,6 +133,8 @@ export function registerArtifactTools(
       };
     }),
   );
+
+  registerRepositoryIntelligenceArtifactTool(server, config, workspaces);
 }
 
 /**
