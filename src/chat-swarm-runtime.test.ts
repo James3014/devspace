@@ -182,7 +182,7 @@ function cdpDriverForSelectorTest() {
     openCliExecutable: "opencli",
     cdpEndpoint: "http://[::1]:9222",
     browserProfileDir: "/tmp/devspace-runtime-selector-profile",
-    appLabel: "devspace",
+    appLabel: "dev",
     operationTimeoutMs: 5_000,
     bootstrapWaitMs: 5_000,
   });
@@ -233,7 +233,7 @@ function openCliDriverForTest() {
     openCliExecutable: "/opt/homebrew/bin/opencli",
     cdpEndpoint: "http://127.0.0.1:9222",
     browserProfileDir: "/tmp/devspace-runtime-opencli-profile",
-    appLabel: "devspace",
+    appLabel: "dev",
     operationTimeoutMs: 5_000,
     bootstrapWaitMs: 5_000,
   });
@@ -247,7 +247,7 @@ test("runtime config selects OpenCLI explicitly while preserving CDP as the defa
   });
   assert.equal(opencli.transport, "opencli");
   assert.equal(opencli.openCliExecutable, "/Users/test/.npm-global/bin/opencli");
-  assert.equal(opencli.appLabel, "devspace");
+  assert.equal(opencli.appLabel, "dev");
   const fallback = loadChatSwarmRuntimeConfig(base, {});
   assert.equal(fallback.transport, "cdp");
 });
@@ -288,7 +288,7 @@ test("OpenCLI provisioning captures transport and authenticated peer identities 
   assert.notEqual(evidence.conversationFingerprint, peerFingerprint);
   assert.equal(evidence.appBinding, "READY");
   assert.deepEqual(calls[0]?.slice(0, 2), ["chatgpt", "ask"]);
-  assert.match(calls[0]?.[2] ?? "", /chat_swarm_peer_status/);
+  assert.match(calls[0]?.[2] ?? "", /^@dev Call chat_swarm_peer_status exactly once/);
   assert.equal(calls[0]?.includes("--project"), true);
   assert.equal(calls[0]?.[calls[0]!.indexOf("--project") + 1], "runtime-test");
   assert.equal(calls[0]?.includes("--new"), true);
@@ -598,15 +598,17 @@ test("recovery reopens the exact saved conversation and never mints a replacemen
   }
 });
 
-test("response loss after possible carrier create is pinned for reconciliation and not reprovisioned", async () => {
+test("response loss stops the current ensure at the first uncertain carrier and is not reprovisioned", async () => {
   const f = fixture();
   f.adapter.failProvision = true;
   try {
-    const first = await f.manager.ensure(f.owner, f.swarm.id, 1);
+    const first = await f.manager.ensure(f.owner, f.swarm.id, 3);
     assert.equal(first.state, "RECONCILE_REQUIRED");
+    assert.equal(first.slots.length, 1);
     assert.equal(first.slots[0]!.state, "RECONCILE_REQUIRED");
     assert.equal(f.adapter.provisionCalls, 1);
-    const replay = await f.manager.ensure(f.owner, f.swarm.id, 1);
+    const replay = await f.manager.ensure(f.owner, f.swarm.id, 3);
+    assert.equal(replay.slots.length, 1);
     assert.equal(replay.slots[0]!.state, "RECONCILE_REQUIRED");
     assert.equal(f.adapter.provisionCalls, 1);
   } finally {
