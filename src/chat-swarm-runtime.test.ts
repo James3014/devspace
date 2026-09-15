@@ -294,7 +294,8 @@ test("OpenCLI provisioning captures transport and authenticated peer identities 
   assert.equal(calls[0]?.includes("--new"), true);
   assert.equal(calls[0]?.includes("--wait"), true);
   assert.equal(calls[0]?.[calls[0]!.indexOf("--wait") + 1], "false");
-  assert.equal(calls[0]?.[calls[0]!.indexOf("--site-session") + 1], "ephemeral");
+  assert.equal(calls[0]?.[calls[0]!.indexOf("--site-session") + 1], "persistent");
+  assert.equal(calls[0]?.[calls[0]!.indexOf("--keep-tab") + 1], "true");
   assert.equal(calls[0]?.[calls[0]!.indexOf("--trace") + 1], "retain-on-failure");
 });
 
@@ -350,7 +351,8 @@ test("OpenCLI wake reopens the exact conversation", async () => {
   const ask = calls.find((args) => args[1] === "ask")!;
   assert.equal(ask[ask.indexOf("--conversation") + 1], "opencli-managed-02");
   assert.equal(ask[ask.indexOf("--wait") + 1], "false");
-  assert.equal(ask[ask.indexOf("--site-session") + 1], "ephemeral");
+  assert.equal(ask[ask.indexOf("--site-session") + 1], "persistent");
+  assert.equal(ask[ask.indexOf("--keep-tab") + 1], "true");
   assert.equal(ask[ask.indexOf("--trace") + 1], "retain-on-failure");
 });
 

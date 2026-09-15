@@ -1423,9 +1423,9 @@ export class OpenCliMacWebDriver implements MacWebDriver {
         "--wait",
         "false",
         "--site-session",
-        "ephemeral",
+        "persistent",
         "--keep-tab",
-        "false",
+        "true",
         "--trace",
         "retain-on-failure",
         "-f",
@@ -1476,9 +1476,9 @@ export class OpenCliMacWebDriver implements MacWebDriver {
           "--wait",
           "false",
           "--site-session",
-          "ephemeral",
+          "persistent",
           "--keep-tab",
-          "false",
+          "true",
           "--trace",
           "retain-on-failure",
           "-f",
@@ -1551,7 +1551,7 @@ export class OpenCliMacWebDriver implements MacWebDriver {
         rows.every((row) => row.Generating !== true) &&
         last?.Role === "Assistant"
       ) return;
-      await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 2000));
     }
     throw new Error("OpenCLI ChatGPT conversation did not become idle before deadline");
   }
@@ -1608,7 +1608,9 @@ export class OpenCliMacWebDriver implements MacWebDriver {
         "detail",
         conversationIdFromUrl(conversationUrl),
         "--site-session",
-        "ephemeral",
+        "persistent",
+        "--keep-tab",
+        "true",
         "-f",
         "json",
       ],
