@@ -24,14 +24,138 @@ export type GitCandidateErrorCode =
   | "GIT_STAGING_VIOLATION"
   | "GIT_EXECUTION_ERROR";
 
+export type GitCandidateEffectState =
+  | "CONFIRMED_NO_EFFECT"
+  | "CONFIRMED_LOCAL_COMMIT"
+  | "CONFIRMED_REMOTE_PUSH"
+  | "EFFECT_UNKNOWN";
+
+export interface GitCandidateEffectEvidence {
+  state: GitCandidateEffectState;
+  retryAllowed: false;
+  reconciliationRequired: boolean;
+  observedHead?: string;
+  observedTree?: string;
+  expectedPushedSha?: string;
+  remote?: string;
+  branch?: string;
+  guidance: string;
+}
+
+export type GitCandidateCommandRunner = (
+  args: string[],
+  cwd: string,
+  timeoutMs?: number,
+) => Promise<{ stdout: string; stderr: string }>;
+
 export class GitCandidateError extends Error {
   constructor(
     readonly code: GitCandidateErrorCode,
     message: string,
+    readonly effect?: GitCandidateEffectEvidence,
   ) {
     super(message);
     this.name = "GitCandidateError";
   }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+async function commitFailureEvidence(
+  runner: GitCandidateCommandRunner,
+  workspaceRoot: string,
+  previousHead: string,
+  original: unknown,
+): Promise<GitCandidateError> {
+  const message = errorMessage(original);
+  try {
+    const observedHead = (await runner(["rev-parse", "HEAD"], workspaceRoot, 10_000)).stdout.trim();
+    let observedTree: string | undefined;
+    try {
+      observedTree = (await runner(["rev-parse", "HEAD^{tree}"], workspaceRoot, 10_000)).stdout.trim();
+    } catch {
+      // HEAD is still exact effect evidence even when tree readback is unavailable.
+    }
+    const advanced = /^[0-9a-f]{40}$/.test(observedHead) && observedHead !== previousHead;
+    return new GitCandidateError(
+      "GIT_EXECUTION_ERROR",
+      `${message} Post-error Git reconciliation observed HEAD ${observedHead}${observedTree ? ` and tree ${observedTree}` : ""}.`,
+      {
+        state: advanced ? "CONFIRMED_LOCAL_COMMIT" : "CONFIRMED_NO_EFFECT",
+        retryAllowed: false,
+        reconciliationRequired: advanced,
+        observedHead,
+        ...(observedTree ? { observedTree } : {}),
+        guidance: advanced
+          ? "The local commit exists. Reconcile the exact attempt; do not retry or replace it."
+          : "The expected local commit is not present. Preserve the staged state and reconcile before any retry.",
+      },
+    );
+  } catch {
+    return new GitCandidateError(
+      "GIT_EXECUTION_ERROR",
+      `${message} Post-error Git HEAD/tree reconciliation was unavailable; effect outcome is unknown.`,
+      {
+        state: "EFFECT_UNKNOWN",
+        retryAllowed: false,
+        reconciliationRequired: true,
+        guidance: "Reconcile the exact attempt from physical Git state; do not retry or create a replacement attempt.",
+      },
+    );
+  }
+}
+
+async function remoteRefObservation(
+  runner: GitCandidateCommandRunner,
+  workspaceRoot: string,
+  remote: string,
+  branch: string,
+): Promise<{ available: true; sha: string } | { available: false; error: unknown }> {
+  try {
+    const result = await runner(["ls-remote", "--heads", remote, `refs/heads/${branch}`], workspaceRoot, 10_000);
+    return { available: true, sha: result.stdout.trim().split(/\s+/)[0] ?? "" };
+  } catch (error) {
+    return { available: false, error };
+  }
+}
+
+function pushFailureWithEvidence(input: {
+  original: unknown;
+  expectedHead: string;
+  remote: string;
+  branch: string;
+  observation: { available: true; sha: string } | { available: false; error: unknown };
+}): GitCandidateError {
+  const base = errorMessage(input.original);
+  if (!input.observation.available) {
+    return new GitCandidateError("GIT_EXECUTION_ERROR", `${base} Remote reconciliation also failed: ${errorMessage(input.observation.error)}`, {
+      state: "EFFECT_UNKNOWN",
+      retryAllowed: false,
+      reconciliationRequired: true,
+      expectedPushedSha: input.expectedHead,
+      remote: input.remote,
+      branch: input.branch,
+      guidance: "Remote effect is unknown. Reconcile the exact ref; do not retry or create a replacement attempt.",
+    });
+  }
+  const confirmed = input.observation.sha === input.expectedHead;
+  return new GitCandidateError(
+    "GIT_EXECUTION_ERROR",
+    `${base} Remote reconciliation observed ${input.remote}/${input.branch} at ${input.observation.sha || "absent"}.`,
+    {
+      state: confirmed ? "CONFIRMED_REMOTE_PUSH" : "CONFIRMED_NO_EFFECT",
+      retryAllowed: false,
+      reconciliationRequired: confirmed,
+      expectedPushedSha: input.expectedHead,
+      remote: input.remote,
+      branch: input.branch,
+      guidance: confirmed
+        ? "The expected remote push is confirmed. Reconcile the exact attempt; do not retry."
+        : "The expected SHA is not present at the remote ref. Reconcile before any retry.",
+    },
+  );
 }
 
 /**
@@ -70,7 +194,7 @@ export function gitCommandEnvironment(env: NodeJS.ProcessEnv): Record<string, st
 /**
  * Execute a git command using execFile with terminal prompts disabled and bounded timeout.
  */
-async function runGit(
+async function defaultGitRunner(
   args: string[],
   cwd: string,
   timeoutMs: number = 10000,
@@ -179,8 +303,10 @@ export async function commitCandidate(options: {
   expectedHead: string;
   message: string;
   paths: string[];
+  gitRunner?: GitCandidateCommandRunner;
 }): Promise<GitCommitOutput> {
   const { workspaceId, workspaceRoot, expectedHead, message, paths } = options;
+  const runGit = options.gitRunner ?? defaultGitRunner;
 
   // 1. Basic expected HEAD validation (40-char SHA1)
   if (!/^[0-9a-fA-F]{40}$/.test(expectedHead)) {
@@ -310,7 +436,7 @@ export async function commitCandidate(options: {
   try {
     await runGit(["commit", "-m", message], resolvedWorkspaceRoot, 30000);
   } catch (err: any) {
-    throw new GitCandidateError("GIT_EXECUTION_ERROR", `Git commit failed: ${err.message}`);
+    throw await commitFailureEvidence(runGit, resolvedWorkspaceRoot, expectedHead, err);
   }
 
   // 10. Fetch new HEAD & Tree SHAs and verify parent
@@ -322,11 +448,16 @@ export async function commitCandidate(options: {
     const { stdout: treeOut } = await runGit(["rev-parse", "HEAD^{tree}"], resolvedWorkspaceRoot, 10000);
     treeSha = treeOut;
   } catch (err) {
-    throw new GitCandidateError("GIT_EXECUTION_ERROR", "Failed to resolve new Git HEAD after commit.");
+    throw await commitFailureEvidence(runGit, resolvedWorkspaceRoot, expectedHead, err);
   }
 
   if (newHead === expectedHead) {
-    throw new GitCandidateError("GIT_EXECUTION_ERROR", `Git HEAD did not advance after commit. HEAD remains at ${expectedHead}`);
+    throw await commitFailureEvidence(
+      runGit,
+      resolvedWorkspaceRoot,
+      expectedHead,
+      new GitCandidateError("GIT_EXECUTION_ERROR", `Git HEAD did not advance after commit. HEAD remains at ${expectedHead}`),
+    );
   }
 
   let parentHead = "";
@@ -334,13 +465,15 @@ export async function commitCandidate(options: {
     const { stdout } = await runGit(["rev-parse", "HEAD^1"], resolvedWorkspaceRoot, 10000);
     parentHead = stdout;
   } catch (err) {
-    throw new GitCandidateError("GIT_EXECUTION_ERROR", "Failed to verify commit parent SHA.");
+    throw await commitFailureEvidence(runGit, resolvedWorkspaceRoot, expectedHead, err);
   }
 
   if (parentHead !== expectedHead) {
-    throw new GitCandidateError(
-      "GIT_EXECUTION_ERROR",
-      `Commit parent verification failed. Parent is ${parentHead}, expected ${expectedHead}`,
+    throw await commitFailureEvidence(
+      runGit,
+      resolvedWorkspaceRoot,
+      expectedHead,
+      new GitCandidateError("GIT_EXECUTION_ERROR", `Commit parent verification failed. Parent is ${parentHead}, expected ${expectedHead}`),
     );
   }
 
@@ -372,8 +505,10 @@ export async function pushCandidate(options: {
   expectedHead: string;
   remote: string;
   branch: string;
+  gitRunner?: GitCandidateCommandRunner;
 }): Promise<{ remote: string; branch: string; pushedSha: string }> {
   const { workspaceRoot, expectedHead, remote, branch } = options;
+  const runGit = options.gitRunner ?? defaultGitRunner;
 
   // 1. Basic expected HEAD validation
   if (!/^[0-9a-fA-F]{40}$/.test(expectedHead)) {
@@ -507,32 +642,22 @@ export async function pushCandidate(options: {
   // 6. Push exact SHA: refs push remote expectedHead:refs/heads/<branch>
   try {
     await runGit(["push", remote, `${expectedHead}:refs/heads/${branch}`], resolvedWorkspaceRoot, 60000);
-  } catch (err: any) {
-    throw new GitCandidateError("GIT_EXECUTION_ERROR", `Git push failed: ${err.message}`);
+  } catch (error) {
+    const observation = await remoteRefObservation(runGit, resolvedWorkspaceRoot, remote, branch);
+    throw pushFailureWithEvidence({ original: error, expectedHead, remote, branch, observation });
   }
 
   // 7. Verify remote ref SHA equals expectedHead
-  let remoteRefSha = "";
-  try {
-    const { stdout } = await runGit(["ls-remote", "--heads", remote, `refs/heads/${branch}`], resolvedWorkspaceRoot, 10000);
-    const parts = stdout.split(/\s+/);
-    if (parts.length > 0 && parts[0]) {
-      remoteRefSha = parts[0].trim();
-    }
-  } catch (err: any) {
-    throw new GitCandidateError("GIT_EXECUTION_ERROR", `Failed to read back remote ref SHA: ${err.message}`);
+  const initialObservation = await remoteRefObservation(runGit, resolvedWorkspaceRoot, remote, branch);
+  if (initialObservation.available && initialObservation.sha === expectedHead) {
+    return { remote, branch, pushedSha: expectedHead };
   }
-
-  if (remoteRefSha !== expectedHead) {
-    throw new GitCandidateError(
-      "GIT_EXECUTION_ERROR",
-      `Remote ref verification failed. Remote ref has SHA ${remoteRefSha}, expected ${expectedHead}`,
-    );
+  const reconciledObservation = await remoteRefObservation(runGit, resolvedWorkspaceRoot, remote, branch);
+  if (reconciledObservation.available && reconciledObservation.sha === expectedHead) {
+    return { remote, branch, pushedSha: expectedHead };
   }
-
-  return {
-    remote,
-    branch,
-    pushedSha: expectedHead,
-  };
+  const original = initialObservation.available
+    ? new GitCandidateError("GIT_EXECUTION_ERROR", `Remote ref verification failed. Remote ref has SHA ${initialObservation.sha || "absent"}, expected ${expectedHead}`)
+    : initialObservation.error;
+  throw pushFailureWithEvidence({ original, expectedHead, remote, branch, observation: reconciledObservation });
 }

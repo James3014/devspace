@@ -81,6 +81,7 @@ const migrations: Migration[] = [
   { version: 16, name: "carrier-validity", up: migrateCarrierValidity },
   { version: 17, name: "chat-swarm-join-requests", up: migrateChatSwarmJoinRequests },
   { version: 18, name: "chat-swarm-carrier-operations", up: migrateChatSwarmCarrierOperations },
+  { version: 19, name: "core-mutation-sessions", up: migrateCoreMutationSessions },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -415,6 +416,62 @@ function migrateChatSwarmCarrierOperations(sqlite: Database.Database): void {
     );
     create index if not exists chat_swarm_carrier_operations_worker_idx
       on chat_swarm_carrier_operations(worker_id, binding_epoch, updated_at desc);
+  `);
+}
+
+function migrateCoreMutationSessions(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists core_mutation_sessions (
+      id text primary key,
+      workspace_session_id text not null references workspace_sessions(id) on delete cascade,
+      actor_key text not null,
+      binding_id text not null,
+      operation_id text not null,
+      attempt_id text not null,
+      binding_hash text not null unique,
+      binding_json text not null,
+      source_head text not null,
+      source_tree text not null,
+      status text not null check (status in ('ACTIVE', 'COMPLETED', 'ABANDONED')),
+      freshness_state text not null check (freshness_state in ('FRESH', 'EXPIRED')),
+      rebind_state text not null check (rebind_state in ('BOUND_CURRENT', 'REBIND_REQUIRED')),
+      writer_reconciliation_state text not null default 'CLEAR' check (writer_reconciliation_state in ('CLEAR', 'OUTCOME_UNKNOWN')),
+      writer_domains_json text not null default '[]',
+      first_effect_at text,
+      last_effect_at text,
+      created_at text not null,
+      updated_at text not null,
+      closed_at text
+    );
+    create unique index if not exists core_mutation_sessions_one_active_workspace_idx
+      on core_mutation_sessions(workspace_session_id)
+      where status = 'ACTIVE';
+    create unique index if not exists core_mutation_sessions_logical_attempt_idx
+      on core_mutation_sessions(operation_id, attempt_id);
+    create index if not exists core_mutation_sessions_workspace_idx
+      on core_mutation_sessions(workspace_session_id, updated_at desc);
+
+    create table if not exists core_mutation_candidates (
+      candidate_head text primary key,
+      candidate_tree text not null,
+      session_id text not null,
+      workspace_session_id text not null,
+      binding_hash text not null,
+      acceptance_contract_hash text not null,
+      source_head text not null,
+      source_tree text not null,
+      changed_paths_json text not null,
+      deleted_paths_json text not null,
+      diff_hash text not null,
+      change_set_id text not null,
+      change_set_hash text not null,
+      change_set_json text not null,
+      change_manifest_hash text not null,
+      change_manifest_json text not null,
+      created_at text not null
+    );
+    create index if not exists core_mutation_candidates_binding_idx
+      on core_mutation_candidates(binding_hash, created_at desc);
   `);
 }
 

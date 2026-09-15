@@ -39,6 +39,62 @@ export const loadedAgentFiles = sqliteTable(
   ],
 );
 
+export const coreMutationSessions = sqliteTable(
+  "core_mutation_sessions",
+  {
+    id: text("id").primaryKey(),
+    workspaceSessionId: text("workspace_session_id")
+      .notNull()
+      .references(() => workspaceSessions.id, { onDelete: "cascade" }),
+    actorKey: text("actor_key").notNull(),
+    bindingId: text("binding_id").notNull(),
+    operationId: text("operation_id").notNull(),
+    attemptId: text("attempt_id").notNull(),
+    bindingHash: text("binding_hash").notNull().unique(),
+    bindingJson: text("binding_json").notNull(),
+    sourceHead: text("source_head").notNull(),
+    sourceTree: text("source_tree").notNull(),
+    status: text("status").notNull(),
+    freshnessState: text("freshness_state").notNull(),
+    rebindState: text("rebind_state").notNull(),
+    writerReconciliationState: text("writer_reconciliation_state").notNull().default("CLEAR"),
+    writerDomainsJson: text("writer_domains_json").notNull().default("[]"),
+    firstEffectAt: text("first_effect_at"),
+    lastEffectAt: text("last_effect_at"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+    closedAt: text("closed_at"),
+  },
+  (table) => [
+    uniqueIndex("core_mutation_sessions_logical_attempt_idx").on(table.operationId, table.attemptId),
+    index("core_mutation_sessions_workspace_idx").on(table.workspaceSessionId, table.updatedAt),
+  ],
+);
+
+export const coreMutationCandidates = sqliteTable(
+  "core_mutation_candidates",
+  {
+    candidateHead: text("candidate_head").primaryKey(),
+    candidateTree: text("candidate_tree").notNull(),
+    sessionId: text("session_id").notNull(),
+    workspaceSessionId: text("workspace_session_id").notNull(),
+    bindingHash: text("binding_hash").notNull(),
+    acceptanceContractHash: text("acceptance_contract_hash").notNull(),
+    sourceHead: text("source_head").notNull(),
+    sourceTree: text("source_tree").notNull(),
+    changedPathsJson: text("changed_paths_json").notNull(),
+    deletedPathsJson: text("deleted_paths_json").notNull(),
+    diffHash: text("diff_hash").notNull(),
+    changeSetId: text("change_set_id").notNull(),
+    changeSetHash: text("change_set_hash").notNull(),
+    changeSetJson: text("change_set_json").notNull(),
+    changeManifestHash: text("change_manifest_hash").notNull(),
+    changeManifestJson: text("change_manifest_json").notNull(),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => [index("core_mutation_candidates_binding_idx").on(table.bindingHash, table.createdAt)],
+);
+
 export const workspaceConversationBindings = sqliteTable(
   "workspace_conversation_bindings",
   {
@@ -129,6 +185,10 @@ export type WorkspaceSessionRow = typeof workspaceSessions.$inferSelect;
 export type NewWorkspaceSessionRow = typeof workspaceSessions.$inferInsert;
 export type LoadedAgentFileRow = typeof loadedAgentFiles.$inferSelect;
 export type NewLoadedAgentFileRow = typeof loadedAgentFiles.$inferInsert;
+export type CoreMutationSessionRow = typeof coreMutationSessions.$inferSelect;
+export type NewCoreMutationSessionRow = typeof coreMutationSessions.$inferInsert;
+export type CoreMutationCandidateRow = typeof coreMutationCandidates.$inferSelect;
+export type NewCoreMutationCandidateRow = typeof coreMutationCandidates.$inferInsert;
 export type WorkspaceConversationBindingRow = typeof workspaceConversationBindings.$inferSelect;
 export type NewWorkspaceConversationBindingRow = typeof workspaceConversationBindings.$inferInsert;
 export const durableOperations = sqliteTable(
