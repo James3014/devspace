@@ -16,6 +16,7 @@ import {
   DurableOperationError,
   DurableOperationManager,
   DurableOperationStore,
+  NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256,
   NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256,
   NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE,
   NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE,
@@ -616,6 +617,17 @@ test("nexus_gateway_recover malformed manager output fails closed as uncertain",
   } finally {
     await f.cleanup();
   }
+});
+
+test("Nexus Gateway recovery trust roots track the accepted #526 r10 lineage", () => {
+  assert.equal(
+    NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256,
+    "6873dde17e08d4020620c2408e414327b176be723f5f23f01bee754b2627502c",
+  );
+  assert.equal(
+    NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256,
+    "3cd032639f69349bd44e61dec41551957e9034157febfff83e7fb3c89b5ef798",
+  );
 });
 
 test("fixed Nexus bridge rejects manager hash mismatch before importing manager code", { skip: process.platform !== "darwin" }, async () => {
