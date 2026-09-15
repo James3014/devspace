@@ -139,7 +139,10 @@ class FakeManagedAdapter implements ChatSwarmManagedCarrierAdapter {
   }
 }
 
-function fixture(workerLimit = 5) {
+function fixture(
+  workerLimit = 5,
+  transport: "cdp" | "opencli" = "cdp",
+) {
   const root = mkdtempSync(join(tmpdir(), "devspace-runtime-117-"));
   const store = new ChatSwarmStore(root);
   const coordinator = new ChatSwarmCoordinator(store);
@@ -150,6 +153,7 @@ function fixture(workerLimit = 5) {
   const env: NodeJS.ProcessEnv = {
     DEVSPACE_CHAT_SWARM_RUNTIME: "1",
     DEVSPACE_CHAT_SWARM_PROJECT_URL: "https://chatgpt.com/g/g-p-runtime-test/project",
+    DEVSPACE_CHAT_SWARM_TRANSPORT: transport,
     DEVSPACE_CHAT_SWARM_POOL_DEFAULT: "3",
     DEVSPACE_CHAT_SWARM_RUNTIME_TIMEOUT_MS: "5000",
     DEVSPACE_CHAT_SWARM_BOOTSTRAP_WAIT_MS: "5000",
@@ -252,7 +256,7 @@ test("runtime config selects OpenCLI explicitly while preserving CDP as the defa
   assert.equal(fallback.transport, "cdp");
 });
 
-test("OpenCLI provisioning captures transport and authenticated peer identities separately", async () => {
+test("OpenCLI provisioning durably exposes the conversation handle before peer identity readback", async () => {
   const driver = openCliDriverForTest();
   const calls: string[][] = [];
   const peerFingerprint = "a".repeat(64);
@@ -275,15 +279,23 @@ test("OpenCLI provisioning captures transport and authenticated peer identities 
       response: "",
     }];
   };
-  const evidence = await driver.createManagedConversation(
+  const observed = await driver.createManagedConversation(
     "https://chatgpt.com/g/g-p-runtime-test/project",
     new Date(Date.now() + 1_000).toISOString(),
   );
   assert.equal(
-    evidence.conversationUrl,
+    observed.conversationUrl,
     "https://chatgpt.com/g/g-p-runtime-test/c/opencli-managed-01",
   );
-  assert.equal(evidence.conversationFingerprint, fingerprint("opencli-managed-01"));
+  assert.equal(observed.conversationFingerprint, fingerprint("opencli-managed-01"));
+  assert.equal(observed.authenticatedPeerFingerprint, undefined);
+  assert.equal(observed.appBinding, "UNKNOWN");
+  assert.equal(calls.filter((call) => call[1] === "detail").length, 0);
+
+  const evidence = await driver.resolveManagedConversationIdentity!(
+    observed.conversationUrl,
+    new Date(Date.now() + 1_000).toISOString(),
+  );
   assert.equal(evidence.authenticatedPeerFingerprint, peerFingerprint);
   assert.notEqual(evidence.conversationFingerprint, peerFingerprint);
   assert.equal(evidence.appBinding, "READY");
@@ -297,7 +309,7 @@ test("OpenCLI provisioning captures transport and authenticated peer identities 
   assert.equal(calls[0]?.[calls[0]!.indexOf("--site-session") + 1], "ephemeral");
 });
 
-test("OpenCLI provisioning fails closed when the authenticated peer probe is malformed", async () => {
+test("OpenCLI peer identity resolution fails closed while preserving the observed conversation handle", async () => {
   const driver = openCliDriverForTest();
   let probePrompt = "";
   (driver as any).runJson = async (args: string[]) => {
@@ -314,9 +326,14 @@ test("OpenCLI provisioning fails closed when the authenticated peer probe is mal
       response: "",
     }];
   };
+  const observed = await driver.createManagedConversation(
+    "https://chatgpt.com/g/g-p-runtime-test/project",
+    new Date(Date.now() + 1_000).toISOString(),
+  );
+  assert.equal(observed.conversationFingerprint, fingerprint("opencli-managed-bad-peer"));
   await assert.rejects(
-    () => driver.createManagedConversation(
-      "https://chatgpt.com/g/g-p-runtime-test/project",
+    () => driver.resolveManagedConversationIdentity!(
+      observed.conversationUrl,
       new Date(Date.now() + 1_000).toISOString(),
     ),
     /peer identity probe did not return a valid fingerprint/,
@@ -396,6 +413,31 @@ test("runtime provision lease spans all bounded provisioning phases", async () =
     assert.equal(
       observedLeaseMs,
       f.manager.runtimeConfig.operationTimeoutMs * 2 +
+        f.manager.runtimeConfig.bootstrapWaitMs,
+    );
+    assert.equal(status.slots[0]?.state, "PARKED");
+  } finally {
+    cleanup(f);
+  }
+});
+
+test("OpenCLI runtime lease spans handle, peer identity, bootstrap, and bound-wait phases", async () => {
+  const f = fixture(5, "opencli");
+  try {
+    let observedLeaseMs = 0;
+    f.adapter.onBootstrap = (operationId, rawIdentity) => {
+      const operation = f.registry.getProvision(operationId);
+      assert.ok(operation);
+      observedLeaseMs =
+        Date.parse(operation.request.expiresAt) -
+        Date.parse(operation.request.requestedAt);
+      f.manager.bootstrap({ "openai/session": rawIdentity }, operationId);
+    };
+
+    const status = await f.manager.ensure(f.owner, f.swarm.id, 1);
+    assert.equal(
+      observedLeaseMs,
+      f.manager.runtimeConfig.operationTimeoutMs * 3 +
         f.manager.runtimeConfig.bootstrapWaitMs,
     );
     assert.equal(status.slots[0]?.state, "PARKED");
@@ -611,6 +653,125 @@ test("response loss stops the current ensure at the first uncertain carrier and 
     assert.equal(replay.slots.length, 1);
     assert.equal(replay.slots[0]!.state, "RECONCILE_REQUIRED");
     assert.equal(f.adapter.provisionCalls, 1);
+  } finally {
+    cleanup(f);
+  }
+});
+
+test("deferred peer identity resolution binds bootstrap authority to the authenticated peer", async () => {
+  const f = fixture();
+  const peerRawIdentity = "authenticated-managed-peer-1";
+  const peerFingerprint = fingerprint(peerRawIdentity);
+  (f.adapter as any).resolveProvisionIdentity = async (input: {
+    conversationUrl: string;
+  }): Promise<ManagedConversationEvidence> => ({
+    conversationUrl: input.conversationUrl,
+    conversationFingerprint: fingerprint("managed-conversation-1"),
+    authenticatedPeerFingerprint: peerFingerprint,
+    appBinding: "READY",
+  });
+  f.adapter.onBootstrap = (operationId) => {
+    f.manager.bootstrap({ "openai/session": peerRawIdentity }, operationId);
+  };
+  try {
+    const status = await f.manager.ensure(f.owner, f.swarm.id, 1);
+    assert.equal(status.slots[0]?.state, "PARKED");
+    assert.equal(
+      status.slots[0]?.conversationFingerprint,
+      fingerprint("managed-conversation-1"),
+    );
+    assert.equal(status.slots[0]?.authenticatedPeerFingerprint, peerFingerprint);
+    assert.notEqual(
+      status.slots[0]?.conversationFingerprint,
+      status.slots[0]?.authenticatedPeerFingerprint,
+    );
+    assert.equal(f.adapter.provisionCalls, 1);
+    assert.equal(f.adapter.bootstrapCalls, 1);
+  } finally {
+    cleanup(f);
+  }
+});
+
+test("ensure resumes peer identity readback from a durably observed handle without reprovisioning", async () => {
+  const f = fixture();
+  const slot = f.registry.ensureSlot(
+    f.swarm.id,
+    1,
+    "https://chatgpt.com/g/g-p-runtime-test/project",
+    "1".repeat(64),
+  );
+  const prepared = f.registry.prepareProvision(slot, 30_000);
+  assert.ok(prepared.operation);
+  assert.equal(f.registry.claimProvision(prepared.operation!.operationId), true);
+  const transportRawIdentity = "managed-conversation-1";
+  const transportFingerprint = fingerprint(transportRawIdentity);
+  f.registry.markCarrierObserved(prepared.operation!.operationId, {
+    conversationUrl: `https://chatgpt.com/c/${transportRawIdentity}`,
+    conversationFingerprint: transportFingerprint,
+    appBinding: "UNKNOWN",
+  });
+
+  const peerRawIdentity = "resumed-authenticated-peer-1";
+  const peerFingerprint = fingerprint(peerRawIdentity);
+  let resolveCalls = 0;
+  (f.adapter as any).resolveProvisionIdentity = async (input: {
+    conversationUrl: string;
+  }): Promise<ManagedConversationEvidence> => {
+    resolveCalls += 1;
+    assert.equal(input.conversationUrl, `https://chatgpt.com/c/${transportRawIdentity}`);
+    return {
+      conversationUrl: input.conversationUrl,
+      conversationFingerprint: transportFingerprint,
+      authenticatedPeerFingerprint: peerFingerprint,
+      appBinding: "READY",
+    };
+  };
+  f.adapter.onBootstrap = (operationId) => {
+    f.manager.bootstrap({ "openai/session": peerRawIdentity }, operationId);
+  };
+
+  try {
+    const status = await f.manager.ensure(f.owner, f.swarm.id, 1);
+    assert.equal(status.slots[0]?.state, "PARKED");
+    assert.equal(status.slots[0]?.authenticatedPeerFingerprint, peerFingerprint);
+    assert.equal(f.adapter.provisionCalls, 0);
+    assert.equal(resolveCalls, 1);
+    assert.equal(f.adapter.bootstrapCalls, 1);
+  } finally {
+    cleanup(f);
+  }
+});
+
+test("peer identity timeout preserves the exact observed conversation handle and stops further provisioning", async () => {
+  const f = fixture();
+  (f.adapter as any).resolveProvisionIdentity = async (input: {
+    conversationUrl: string;
+  }) => {
+    assert.match(input.conversationUrl, /managed-conversation-1$/);
+    throw new Error("peer identity readback timed out");
+  };
+  try {
+    const first = await f.manager.ensure(f.owner, f.swarm.id, 3);
+    assert.equal(first.state, "RECONCILE_REQUIRED");
+    assert.equal(first.slots.length, 1);
+    assert.equal(first.slots[0]!.state, "RECONCILE_REQUIRED");
+    assert.match(first.slots[0]!.conversationUrl ?? "", /managed-conversation-1$/);
+    assert.equal(
+      first.slots[0]!.conversationFingerprint,
+      fingerprint("managed-conversation-1"),
+    );
+    assert.equal(first.slots[0]!.authenticatedPeerFingerprint, undefined);
+    assert.equal(first.slots[0]!.blocker, "peer identity readback timed out");
+    assert.equal(f.adapter.provisionCalls, 1);
+    assert.equal(f.adapter.bootstrapCalls, 0);
+
+    const operation = f.registry.getProvision(first.slots[0]!.lastOperationId!);
+    assert.equal(operation?.status, "outcome_unknown");
+    assert.match(operation?.receipt?.conversationUrl ?? "", /managed-conversation-1$/);
+    assert.equal(
+      operation?.receipt?.conversationFingerprint,
+      fingerprint("managed-conversation-1"),
+    );
   } finally {
     cleanup(f);
   }
