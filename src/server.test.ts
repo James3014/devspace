@@ -303,7 +303,7 @@ test("initialize rejects explicitly when every resident MCP session is in flight
         name: "exec_command",
         arguments: {
           workspaceId,
-          cmd: `${JSON.stringify(process.execPath)} -e "setTimeout(() => process.exit(0), 1000)"`,
+          cmd: "tail -f README.md",
           attemptKey: "session-capacity:slow",
           yieldTimeMs: 1000,
         },
