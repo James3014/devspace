@@ -19,7 +19,7 @@ import {
   RESOURCE_MIME_TYPE,
 } from "@modelcontextprotocol/ext-apps/server";
 import express from "express";
-import type { Request, Response } from "express";
+import type { NextFunction, Request, Response } from "express";
 import * as z from "zod/v4";
 import { applyPatch } from "./apply-patch.js";
 import { commitCandidate, pushCandidate, GitCandidateError } from "./git-candidate.js";
@@ -55,7 +55,11 @@ import {
   runShellTool,
   writeFileTool,
 } from "./pi-tools.js";
-import { SingleUserOAuthProvider } from "./oauth-provider.js";
+import {
+  OAUTH_TOKEN_FAILURE_CLASSES,
+  SingleUserOAuthProvider,
+  type OAuthTokenFailureClass,
+} from "./oauth-provider.js";
 import {
   McpSessionRegistry,
   type McpSessionCloseResult,
@@ -551,6 +555,76 @@ function requestLogFields(req: Request, config: ServerConfig): Record<string, un
     referer: req.header("referer"),
     contentLength: req.header("content-length"),
   };
+}
+
+function oauthRequestLogFields(req: Request, config: ServerConfig): Record<string, unknown> {
+  const fields = requestLogFields(req, config);
+  delete fields.origin;
+  delete fields.referer;
+  return fields;
+}
+
+function isOAuthTokenFailureClass(value: unknown): value is OAuthTokenFailureClass {
+  return typeof value === "string" && Object.values(OAUTH_TOKEN_FAILURE_CLASSES).includes(value as OAuthTokenFailureClass);
+}
+
+function classifyOAuthTokenFailure(body: Record<string, unknown>): OAuthTokenFailureClass | undefined {
+  if (isOAuthTokenFailureClass(body.failure_class)) return body.failure_class;
+  if (body.error === "invalid_request") return OAUTH_TOKEN_FAILURE_CLASSES.REQUEST_SHAPE_VALIDATION;
+  return undefined;
+}
+
+function classifyOAuthTokenResponse(body: unknown): Record<string, unknown> | unknown {
+  if (!body || typeof body !== "object" || Array.isArray(body)) return body;
+  const response = body as Record<string, unknown>;
+  if (typeof response.error !== "string") return body;
+
+  const failureClass = classifyOAuthTokenFailure(response);
+  if (failureClass) return { ...response, failure_class: failureClass };
+  if (Object.hasOwn(response, "failure_class")) {
+    const { failure_class: _unvalidatedFailureClass, ...withoutFailureClass } = response;
+    return withoutFailureClass;
+  }
+  return response;
+}
+
+function installOAuthTokenResponseSafety(config: ServerConfig) {
+  return (req: Request, res: Response, next: () => void): void => {
+    const json = res.json.bind(res) as (body: unknown) => Response;
+    res.json = ((body: unknown) => {
+      const classified = classifyOAuthTokenResponse(body);
+      if (classified && typeof classified === "object" && !Array.isArray(classified) && typeof (classified as Record<string, unknown>).error === "string") {
+        const failureClass = classifyOAuthTokenFailure(classified as Record<string, unknown>);
+        logEvent(config.logging, "warn", "oauth_token_failure", {
+          requestId: res.locals.requestId as string | undefined,
+          method: req.method,
+          path: "/token",
+          oauthError: (classified as Record<string, unknown>).error,
+          ...(failureClass ? { failureClass } : {}),
+          ...oauthRequestLogFields(req, config),
+        });
+      }
+      return json(classified);
+    }) as typeof res.json;
+    next();
+  };
+}
+
+function handleOAuthTokenBodyParseError(
+  error: unknown,
+  req: Request,
+  res: Response,
+  next: NextFunction,
+): void {
+  if (!error || typeof error !== "object" || (error as { type?: unknown }).type !== "entity.parse.failed") {
+    next(error);
+    return;
+  }
+  res.status(400).json({
+    error: "invalid_request",
+    error_description: "Token request validation failed.",
+    failure_class: OAUTH_TOKEN_FAILURE_CLASSES.REQUEST_SHAPE_VALIDATION,
+  });
 }
 
 function logToolCall(config: ServerConfig, fields: ToolLogFields): void {
@@ -5940,14 +6014,18 @@ export function createServer(
         path,
         status: res.statusCode,
         durationMs: Math.round(performance.now() - startedAt),
-        ...requestLogFields(req, config),
+        ...(path === "/token" || path === "/revoke"
+          ? oauthRequestLogFields(req, config)
+          : requestLogFields(req, config)),
       });
     });
 
     next();
   });
 
+  app.use("/token", installOAuthTokenResponseSafety(config));
   app.use(["/token", "/revoke"], express.json());
+  app.use("/token", handleOAuthTokenBodyParseError);
 
   app.use(
     mcpAuthRouter({

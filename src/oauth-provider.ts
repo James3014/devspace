@@ -12,6 +12,32 @@ import type {
 import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
 import { SqliteOAuthClientsStore, SqliteOAuthStore } from "./oauth-store.js";
 
+export const OAUTH_TOKEN_FAILURE_CLASSES = {
+  INVALID_REFRESH_TOKEN: "invalid_refresh_token",
+  INVALID_AUTHORIZATION_CODE: "invalid_authorization_code",
+  INVALID_RESOURCE: "invalid_resource",
+  INVALID_REDIRECT: "invalid_redirect",
+  REQUEST_SHAPE_VALIDATION: "request_shape_validation",
+} as const;
+
+export type OAuthTokenFailureClass = (typeof OAUTH_TOKEN_FAILURE_CLASSES)[keyof typeof OAUTH_TOKEN_FAILURE_CLASSES];
+
+export class ClassifiedInvalidGrantError extends InvalidGrantError {
+  constructor(
+    message: string,
+    readonly failureClass: Exclude<OAuthTokenFailureClass, "request_shape_validation">,
+  ) {
+    super(message);
+  }
+
+  override toResponseObject() {
+    return {
+      ...super.toResponseObject(),
+      failure_class: this.failureClass,
+    };
+  }
+}
+
 export interface OAuthConfig {
   ownerToken: string;
   accessTokenTtlSeconds: number;
@@ -197,10 +223,16 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   ): Promise<OAuthTokens> {
     const record = this.validCodeRecord(client, authorizationCode);
     if (redirectUri && redirectUri !== record.params.redirectUri) {
-      throw new InvalidGrantError("redirect_uri does not match the authorization request");
+      throw new ClassifiedInvalidGrantError(
+        "redirect_uri does not match the authorization request",
+        OAUTH_TOKEN_FAILURE_CLASSES.INVALID_REDIRECT,
+      );
     }
     if (resource && !checkResourceAllowed({ requestedResource: resource, configuredResource: this.resourceServerUrl })) {
-      throw new InvalidGrantError("Invalid resource");
+      throw new ClassifiedInvalidGrantError(
+        "Invalid resource",
+        OAUTH_TOKEN_FAILURE_CLASSES.INVALID_RESOURCE,
+      );
     }
 
     this.codes.delete(authorizationCode);
@@ -216,10 +248,16 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
     const refreshTokenHash = hashToken(refreshToken);
     const record = this.oauthStore.getRefreshToken(refreshTokenHash);
     if (!record || record.clientId !== client.client_id || record.expiresAt < Math.floor(Date.now() / 1000)) {
-      throw new InvalidGrantError("Invalid refresh token");
+      throw new ClassifiedInvalidGrantError(
+        "Invalid refresh token",
+        OAUTH_TOKEN_FAILURE_CLASSES.INVALID_REFRESH_TOKEN,
+      );
     }
     if (resource && !checkResourceAllowed({ requestedResource: resource, configuredResource: this.resourceServerUrl })) {
-      throw new InvalidGrantError("Invalid resource");
+      throw new ClassifiedInvalidGrantError(
+        "Invalid resource",
+        OAUTH_TOKEN_FAILURE_CLASSES.INVALID_RESOURCE,
+      );
     }
 
     const requestedScopes = scopes ?? record.scopes;
@@ -266,7 +304,10 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
   ): AuthorizationCodeRecord {
     const record = this.codes.get(authorizationCode);
     if (!record || record.clientId !== client.client_id || record.expiresAtMs < Date.now()) {
-      throw new InvalidGrantError("Invalid authorization code");
+      throw new ClassifiedInvalidGrantError(
+        "Invalid authorization code",
+        OAUTH_TOKEN_FAILURE_CLASSES.INVALID_AUTHORIZATION_CODE,
+      );
     }
     return record;
   }
@@ -303,7 +344,10 @@ export class SingleUserOAuthProvider implements OAuthServerProvider {
       consumedRefreshTokenHash,
     );
     if (!saved) {
-      throw new InvalidGrantError("Invalid refresh token");
+      throw new ClassifiedInvalidGrantError(
+        "Invalid refresh token",
+        OAUTH_TOKEN_FAILURE_CLASSES.INVALID_REFRESH_TOKEN,
+      );
     }
 
     return {
