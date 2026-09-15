@@ -85,6 +85,10 @@ export interface IntegrationReadiness {
   candidateBaseIsAncestor: boolean;
   /** Exact committed changed-path set derived from candidateBase..candidateHead. */
   candidateChangedPaths: string[];
+  /** Exact committed deletion set derived from candidateBase..candidateHead. */
+  candidateDeletedPaths: string[];
+  /** False means deletion policy cannot be evaluated and readiness stays fail-closed. */
+  candidateDeletedPathsKnown: boolean;
   destinationBaseMatches: boolean;
   destinationOverlap: "none" | "overlap" | "unknown";
   overlappingPaths: string[];
@@ -345,6 +349,8 @@ export async function inspectIntegrationReadiness(
       candidateBaseVerified: false,
       candidateBaseIsAncestor: false,
       candidateChangedPaths: [],
+      candidateDeletedPaths: [],
+      candidateDeletedPathsKnown: false,
       destinationBaseMatches: false,
       destinationOverlap: "unknown",
       overlappingPaths: [],
@@ -396,6 +402,8 @@ export async function inspectIntegrationReadiness(
 
   let candidateBaseIsAncestor = false;
   let candidateChangedPaths: string[] = [];
+  let candidateDeletedPaths: string[] = [];
+  let candidateDeletedPathsKnown = false;
   if (candidateCommitVerified && candidateBaseVerified) {
     const ancestor = await runGit(
       ["merge-base", "--is-ancestor", canonicalBase, canonicalHead],
@@ -416,6 +424,16 @@ export async function inspectIntegrationReadiness(
         unknowns.push("committed Candidate changed paths could not be derived.");
       } else {
         candidateChangedPaths = [...new Set(splitLines(diffNames.stdout))].sort();
+        const deletedNames = await runGit(
+          ["diff", "--diff-filter=D", "--name-only", `${canonicalBase}..${canonicalHead}`],
+          source,
+        );
+        if (!deletedNames.ok) {
+          unknowns.push("committed Candidate deleted paths could not be derived.");
+        } else {
+          candidateDeletedPaths = [...new Set(splitLines(deletedNames.stdout))].sort();
+          candidateDeletedPathsKnown = true;
+        }
       }
     }
   }
@@ -520,6 +538,7 @@ export async function inspectIntegrationReadiness(
     candidateBaseIsAncestor &&
     candidateChangedPaths.length > 0 &&
     candidateTreeId !== undefined &&
+    candidateDeletedPathsKnown &&
     destinationBaseMatches &&
     destinationOverlap === "none" &&
     !(dirtyPolicy === "pristine" && unrelatedDestinationDirtyPaths.length > 0) &&
@@ -533,6 +552,8 @@ export async function inspectIntegrationReadiness(
     candidateBaseVerified,
     candidateBaseIsAncestor,
     candidateChangedPaths,
+    candidateDeletedPaths,
+    candidateDeletedPathsKnown,
     destinationBaseMatches,
     destinationOverlap,
     overlappingPaths,

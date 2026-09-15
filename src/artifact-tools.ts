@@ -6,10 +6,11 @@ import {
   mkdir,
   open,
   readdir,
+  realpath,
   unlink,
   type FileHandle,
 } from "node:fs/promises";
-import { isAbsolute, join, normalize, sep } from "node:path";
+import { isAbsolute, join, normalize, relative, sep } from "node:path";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import * as z from "zod/v4";
@@ -22,6 +23,7 @@ import {
 } from "./incoming-artifacts.js";
 import { logEvent } from "./logger.js";
 import type { WorkspaceRegistry } from "./workspaces.js";
+import type { CoreMutationGuard } from "./core-mutation-tools.js";
 
 const ARTIFACT_WRITE_ANNOTATIONS = {
   readOnlyHint: false,
@@ -33,6 +35,7 @@ const NO_FOLLOW = fsConstants.O_NOFOLLOW ?? 0;
 const DIRECTORY_FLAGS = fsConstants.O_RDONLY | (fsConstants.O_DIRECTORY ?? 0) | NO_FOLLOW;
 const PARTIAL_PREFIX = ".devspace-download-";
 const PARTIAL_SUFFIX = ".partial";
+const STAGING_DIRECTORY = "incoming-artifact-staging";
 const STALE_PARTIAL_AGE_MS = 24 * 60 * 60 * 1_000;
 const MAX_STALE_PARTIAL_CLEANUP = 32;
 const ARTIFACT_DOWNLOAD_PLATFORMS = new Set<NodeJS.Platform>(["linux"]);
@@ -50,6 +53,7 @@ export interface ArtifactToolRegistrationOptions {
   config: ServerConfig;
   workspaces: WorkspaceRegistry;
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
+  coreMutation?: CoreMutationGuard;
 }
 
 export interface DownloadIncomingArtifactInput {
@@ -82,12 +86,44 @@ interface ArtifactDestination {
   name: string;
 }
 
+interface ArtifactDownloadTestHooks {
+  platform?: NodeJS.Platform;
+  directoryAnchorPath?(handle: FileHandle, openedPath: string): string;
+  syncDestinationDirectory?(handle: FileHandle): Promise<void>;
+}
+
+interface ArtifactEffectBinding {
+  destinationPath: string;
+  expectedSize: number;
+  expectedSha256: string;
+}
+
+class ArtifactEffectUnknownError extends ArtifactError {
+  readonly effectState = "EFFECT_UNKNOWN" as const;
+  readonly reconciliationRequired = true;
+  readonly retrySafe = false;
+  readonly destinationPath: string;
+  readonly expectedSize: number;
+  readonly expectedSha256: string;
+
+  constructor(binding: ArtifactEffectBinding) {
+    super(
+      "artifact_destination_effect_unknown",
+      `[EFFECT_UNKNOWN] Atomic artifact publication may have applied destination ${JSON.stringify(binding.destinationPath)} with expectedSize=${binding.expectedSize} and expectedSha256=${binding.expectedSha256}; reconciliation is required and this operation must not be retried.`,
+    );
+    this.destinationPath = binding.destinationPath;
+    this.expectedSize = binding.expectedSize;
+    this.expectedSha256 = binding.expectedSha256;
+  }
+}
+
 export function registerArtifactTools(
   server: McpServer,
   {
     config,
     workspaces,
     incomingArtifactAdapters = [],
+    coreMutation,
   }: ArtifactToolRegistrationOptions,
 ): void {
   const incomingRegistry = new IncomingArtifactAdapterRegistry(incomingArtifactAdapters);
@@ -112,22 +148,36 @@ export function registerArtifactTools(
       },
       outputSchema: {
         path: z.string(),
+        coreMutation: z.record(z.string(), z.unknown()).optional(),
       },
       _meta: { "openai/fileParams": ["file"] },
       annotations: ARTIFACT_WRITE_ANNOTATIONS,
     },
-    async (input) => executeArtifactTool(config, input, async () => {
+    async (input, extra) => executeArtifactTool(config, input, async () => {
+      const destination = normalizeArtifactDestination(input.path);
       const workspace = workspaces.getWorkspace(input.workspaceId);
+      const admission = coreMutation
+        ? await coreMutation.admit({
+            workspaceId: input.workspaceId,
+            extra,
+            paths: [destination.path],
+            pathContainment: "STRUCTURED_SINK_ENFORCED",
+          })
+        : undefined;
       const downloaded = await downloadIncomingArtifact({
         registry: incomingRegistry,
         workspaceId: workspace.id,
         workspaceRoot: workspace.root,
+        stateDir: config.stateDir,
         maxFileBytes: config.artifactMaxFileBytes,
         file: input.file,
-        path: input.path,
+        path: destination.path,
       });
       return {
-        publicResult: { path: downloaded.path },
+        publicResult: {
+          path: downloaded.path,
+          ...(admission?.bound ? { coreMutation: { bound: true, claim: admission.claim, pathContainment: admission.pathContainment, sessionId: admission.sessionId, bindingHash: admission.bindingHash, acceptanceContractHash: admission.acceptanceContractHash } } : {}),
+        },
         logResult: downloaded,
       };
     }),
@@ -137,28 +187,35 @@ export function registerArtifactTools(
 /**
  * Stream a trusted native file directly into one already-open workspace.
  *
- * Bytes are written to an exclusive partial beside the requested destination,
- * hashed and size-checked, fsynced, and only then published without overwriting
- * the requested workspace path. No project-level staging directory is created.
+ * Bytes are written to an exclusive DevSpace-owned staging entry beneath the
+ * configured state directory, hashed and size-checked, fsynced, and only then
+ * hard-linked atomically to the requested workspace path without overwriting it.
+ * Destination parent directories must already exist, so the destination file is
+ * the download's only workspace path effect.
  */
 export async function downloadIncomingArtifact({
   registry,
   workspaceId,
   workspaceRoot,
+  stateDir,
   maxFileBytes,
   file,
   path,
   publishLink = link,
+  testHooks,
 }: {
   registry: IncomingArtifactAdapterRegistry;
   workspaceId: string;
   workspaceRoot: string;
+  stateDir: string;
   maxFileBytes: number;
   file: unknown;
   path: string;
   publishLink?: typeof link;
+  /** Internal executable-test seam. Production callers must use descriptor anchors. */
+  testHooks?: ArtifactDownloadTestHooks;
 }): Promise<DownloadIncomingArtifactResult> {
-  if (!isArtifactDownloadSupportedPlatform()) {
+  if (!isArtifactDownloadSupportedPlatform(testHooks?.platform)) {
     throw new ArtifactError(
       "artifact_platform_unsupported",
       "Native file download requires descriptor-anchored directory operations on this platform.",
@@ -176,15 +233,54 @@ export async function downloadIncomingArtifact({
       "A selected workspace is required for native file download.",
     );
   }
+  if (!stateDir) {
+    throw new ArtifactError(
+      "artifact_state_directory_invalid",
+      "A configured DevSpace state directory is required for native file download.",
+    );
+  }
 
   const destination = normalizeArtifactDestination(path);
-  const opened = await registry.open(file);
+  let opened: Awaited<ReturnType<IncomingArtifactAdapterRegistry["open"]>> | undefined;
   let workspaceHandle: FileHandle | undefined;
+  let stateDirectoryHandle: FileHandle | undefined;
+  let stagingDirectory: SecureDestinationDirectory | undefined;
   let destinationDirectory: SecureDestinationDirectory | undefined;
   let partialPath: string | undefined;
   let handle: FileHandle | undefined;
 
   try {
+    workspaceHandle = await openDirectoryNoFollow(
+      workspaceRoot,
+      "artifact_workspace_unsafe",
+      "Selected workspace root is not a real directory.",
+    );
+    stateDirectoryHandle = await openDirectoryNoFollow(
+      stateDir,
+      "artifact_state_directory_unsafe",
+      "Configured DevSpace state directory is not a real directory.",
+    );
+    await assertStagingOutsideWorkspace(
+      stateDirectoryHandle,
+      stateDir,
+      workspaceHandle,
+      workspaceRoot,
+      testHooks,
+    );
+    stagingDirectory = await prepareStagingDirectory(
+      stateDirectoryHandle,
+      stateDir,
+      testHooks,
+    );
+    await cleanupStalePartials(stagingDirectory);
+    destinationDirectory = await prepareDestinationDirectory(
+      workspaceHandle,
+      workspaceRoot,
+      destination.parentParts,
+      testHooks,
+    );
+
+    opened = await registry.open(file);
     if (opened.size !== undefined && opened.size > maxFileBytes) {
       throw new ArtifactError(
         "artifact_file_too_large",
@@ -192,19 +288,8 @@ export async function downloadIncomingArtifact({
       );
     }
 
-    workspaceHandle = await openDirectoryNoFollow(
-      workspaceRoot,
-      "artifact_workspace_unsafe",
-      "Selected workspace root is not a real directory.",
-    );
-    destinationDirectory = await prepareDestinationDirectory(
-      workspaceHandle,
-      destination.parentParts,
-    );
-    await cleanupStalePartials(destinationDirectory);
-
     partialPath = join(
-      destinationDirectory.anchorPath,
+      stagingDirectory.anchorPath,
       `${PARTIAL_PREFIX}${randomUUID()}${PARTIAL_SUFFIX}`,
     );
     handle = await open(
@@ -258,13 +343,19 @@ export async function downloadIncomingArtifact({
       );
     }
 
+    const sha256 = `sha256:${hash.digest("hex")}`;
     await publishDestination(
       destinationDirectory,
       partialPath,
       destination.name,
       writtenEntry,
-      handle,
       publishLink,
+      {
+        destinationPath: destination.path,
+        expectedSize: size,
+        expectedSha256: sha256,
+      },
+      testHooks?.syncDestinationDirectory,
     );
     await unlink(partialPath).catch(() => undefined);
     partialPath = undefined;
@@ -272,15 +363,17 @@ export async function downloadIncomingArtifact({
     return {
       path: destination.path,
       size,
-      sha256: `sha256:${hash.digest("hex")}`,
+      sha256,
     };
   } catch (error) {
-    opened.stream.destroy();
+    opened?.stream.destroy();
     throw error;
   } finally {
     await handle?.close().catch(() => undefined);
     if (partialPath) await unlink(partialPath).catch(() => undefined);
     await destinationDirectory?.close().catch(() => undefined);
+    await stagingDirectory?.close().catch(() => undefined);
+    await stateDirectoryHandle?.close().catch(() => undefined);
     await workspaceHandle?.close().catch(() => undefined);
   }
 }
@@ -368,7 +461,14 @@ async function assertDirectoryHandle(handle: FileHandle): Promise<void> {
   }
 }
 
-function descriptorDirectoryPath(handle: FileHandle): string {
+function descriptorDirectoryPath(
+  handle: FileHandle,
+  openedPath?: string,
+  testHooks?: ArtifactDownloadTestHooks,
+): string {
+  if (testHooks?.directoryAnchorPath && openedPath) {
+    return testHooks.directoryAnchorPath(handle, openedPath);
+  }
   if (isArtifactDownloadSupportedPlatform()) return `/proc/self/fd/${handle.fd}`;
   throw new ArtifactError(
     "artifact_platform_unsupported",
@@ -421,11 +521,13 @@ function normalizeArtifactDestination(value: string): ArtifactDestination {
 
 async function prepareDestinationDirectory(
   rootHandle: FileHandle,
+  workspaceRoot: string,
   parentParts: readonly string[],
+  testHooks?: ArtifactDownloadTestHooks,
 ): Promise<SecureDestinationDirectory> {
   const openedHandles: FileHandle[] = [];
   let parentHandle = rootHandle;
-  let parentAnchor = descriptorDirectoryPath(rootHandle);
+  let parentAnchor = descriptorDirectoryPath(rootHandle, workspaceRoot, testHooks);
 
   try {
     for (const part of parentParts) {
@@ -436,7 +538,11 @@ async function prepareDestinationDirectory(
       );
       openedHandles.push(child);
       parentHandle = child;
-      parentAnchor = descriptorDirectoryPath(child);
+      parentAnchor = descriptorDirectoryPath(
+        child,
+        join(parentAnchor, part),
+        testHooks,
+      );
     }
 
     return {
@@ -456,6 +562,82 @@ async function prepareDestinationDirectory(
   }
 }
 
+async function prepareStagingDirectory(
+  stateDirectoryHandle: FileHandle,
+  stateDir: string,
+  testHooks?: ArtifactDownloadTestHooks,
+): Promise<SecureDestinationDirectory> {
+  await assertDirectoryHandle(stateDirectoryHandle);
+  const stateAnchor = descriptorDirectoryPath(
+    stateDirectoryHandle,
+    stateDir,
+    testHooks,
+  );
+  const stagingPath = join(stateAnchor, STAGING_DIRECTORY);
+  try {
+    await mkdir(stagingPath, { mode: 0o700 });
+  } catch (error) {
+    if (!isNodeError(error) || error.code !== "EEXIST") throw error;
+  }
+
+  const handle = await openDirectoryNoFollow(
+    stagingPath,
+    "artifact_staging_directory_unsafe",
+    "DevSpace artifact staging directory must be a real private directory.",
+  );
+  try {
+    const entry = await handle.stat();
+    if (
+      (entry.mode & 0o077) !== 0
+      || (process.getuid?.() !== undefined && entry.uid !== process.getuid?.())
+    ) {
+      throw new ArtifactError(
+        "artifact_staging_directory_unsafe",
+        "DevSpace artifact staging directory must be owned by the current user and inaccessible to other users.",
+      );
+    }
+    return {
+      handle,
+      anchorPath: descriptorDirectoryPath(handle, stagingPath, testHooks),
+      async close() {
+        await handle.close().catch(() => undefined);
+      },
+    };
+  } catch (error) {
+    await handle.close().catch(() => undefined);
+    throw error;
+  }
+}
+
+async function assertStagingOutsideWorkspace(
+  stateDirectoryHandle: FileHandle,
+  stateDir: string,
+  workspaceHandle: FileHandle,
+  workspaceRoot: string,
+  testHooks?: ArtifactDownloadTestHooks,
+): Promise<void> {
+  const [statePath, workspacePath] = await Promise.all([
+    realpath(descriptorDirectoryPath(stateDirectoryHandle, stateDir, testHooks)),
+    realpath(descriptorDirectoryPath(workspaceHandle, workspaceRoot, testHooks)),
+  ]);
+  const stagingPath = join(statePath, STAGING_DIRECTORY);
+  if (isPathWithin(stagingPath, workspacePath) || isPathWithin(workspacePath, stagingPath)) {
+    throw new ArtifactError(
+      "artifact_staging_workspace_overlap",
+      "DevSpace artifact staging must be outside the selected workspace.",
+    );
+  }
+}
+
+function isPathWithin(path: string, root: string): boolean {
+  const relation = relative(root, path);
+  return relation === "" || (
+    relation !== ".."
+    && !relation.startsWith(`..${sep}`)
+    && !isAbsolute(relation)
+  );
+}
+
 async function ensureWorkspaceChildDirectory(
   parentHandle: FileHandle,
   parentAnchor: string,
@@ -463,12 +645,6 @@ async function ensureWorkspaceChildDirectory(
 ): Promise<FileHandle> {
   await assertDirectoryHandle(parentHandle);
   const path = join(parentAnchor, name);
-  try {
-    await mkdir(path, { mode: 0o755 });
-  } catch (error) {
-    if (!isNodeError(error) || error.code !== "EEXIST") throw error;
-  }
-
   return openDirectoryNoFollow(
     path,
     "artifact_destination_parent_unsafe",
@@ -481,14 +657,14 @@ async function publishDestination(
   partialPath: string,
   filename: string,
   writtenEntry: Awaited<ReturnType<FileHandle["stat"]>>,
-  handle: FileHandle,
   publishLink: typeof link,
+  effectBinding: ArtifactEffectBinding,
+  syncDestinationDirectory: (handle: FileHandle) => Promise<void> = (handle) => handle.sync(),
 ): Promise<void> {
   await assertDirectoryHandle(directory.handle);
   const candidate = join(directory.anchorPath, filename);
   try {
     await publishLink(partialPath, candidate);
-    assertPublishedArtifactEntry(await lstat(candidate), writtenEntry);
   } catch (error) {
     if (isNodeError(error) && error.code === "EEXIST") {
       throw new ArtifactError(
@@ -496,10 +672,25 @@ async function publishDestination(
         "Artifact destination already exists.",
       );
     }
+    if (
+      isNodeError(error)
+      && ["EXDEV", "ENOSYS", "ENOTSUP", "EOPNOTSUPP", "EPERM"].includes(error.code ?? "")
+    ) {
+      throw new ArtifactError(
+        "artifact_atomic_publish_unavailable",
+        "Artifact destination does not support the required atomic no-overwrite publication primitive.",
+      );
+    }
     // Once the destination path exists, never unlink it during failure cleanup.
     // Another process may have replaced that path after publication, and a
     // path-based verification followed by unlink would introduce another race.
     throw error;
+  }
+  try {
+    assertPublishedArtifactEntry(await lstat(candidate), writtenEntry);
+    await syncDestinationDirectory(directory.handle);
+  } catch {
+    throw new ArtifactEffectUnknownError(effectBinding);
   }
 }
 

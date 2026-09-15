@@ -59,6 +59,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 16, name: "carrier-validity" },
       { version: 17, name: "chat-swarm-join-requests" },
       { version: 18, name: "chat-swarm-carrier-operations" },
+      { version: 19, name: "core-mutation-sessions" },
     ]);
   } finally {
     database.close();
