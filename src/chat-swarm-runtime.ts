@@ -1421,7 +1421,7 @@ export class OpenCliMacWebDriver implements MacWebDriver {
         "--new",
         "true",
         "--wait",
-        "false",
+        "true",
         "--site-session",
         "persistent",
         "--keep-tab",
@@ -1437,11 +1437,16 @@ export class OpenCliMacWebDriver implements MacWebDriver {
     if (!conversationUrl) {
       throw new Error("OpenCLI did not return a ChatGPT conversation URL");
     }
-    await this.waitForConversationIdle(conversationUrl, deadlineAt);
-    const authenticatedPeerFingerprint = this.peerFingerprintFromDetail(
-      await this.detail(conversationUrl, deadlineAt),
-      probePrompt,
+    const responseText = rows[0]?.response ?? "";
+    const match = /DEVSPACE_PEER_FINGERPRINT=([0-9a-f]{64})/u.exec(
+      responseText.trim(),
     );
+    const authenticatedPeerFingerprint = match?.[1]
+      ? match[1]
+      : this.peerFingerprintFromDetail(
+          await this.detail(conversationUrl, deadlineAt),
+          probePrompt,
+        );
     return {
       conversationUrl,
       conversationFingerprint: conversationFingerprintFromUrl(conversationUrl),
@@ -1456,16 +1461,6 @@ export class OpenCliMacWebDriver implements MacWebDriver {
     deadlineAt: string,
   ): Promise<{ delivered: boolean; remoteMayContinue: boolean; blocker?: string }> {
     try {
-      await this.waitForConversationIdle(conversationUrl, deadlineAt);
-    } catch (error) {
-      return {
-        delivered: false,
-        remoteMayContinue: false,
-        blocker: error instanceof Error ? error.message : String(error),
-      };
-    }
-
-    try {
       const rows = await this.runJson<OpenCliConversationRow[]>(
         [
           "chatgpt",
@@ -1474,7 +1469,7 @@ export class OpenCliMacWebDriver implements MacWebDriver {
           "--conversation",
           conversationIdFromUrl(conversationUrl),
           "--wait",
-          "false",
+          "true",
           "--site-session",
           "persistent",
           "--keep-tab",
