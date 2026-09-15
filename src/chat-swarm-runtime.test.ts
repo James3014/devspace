@@ -295,6 +295,7 @@ test("OpenCLI provisioning captures transport and authenticated peer identities 
   assert.equal(calls[0]?.includes("--wait"), true);
   assert.equal(calls[0]?.[calls[0]!.indexOf("--wait") + 1], "false");
   assert.equal(calls[0]?.[calls[0]!.indexOf("--site-session") + 1], "ephemeral");
+  assert.equal(calls[0]?.[calls[0]!.indexOf("--trace") + 1], "retain-on-failure");
 });
 
 test("OpenCLI provisioning fails closed when the authenticated peer probe is malformed", async () => {
@@ -350,6 +351,7 @@ test("OpenCLI wake reopens the exact conversation", async () => {
   assert.equal(ask[ask.indexOf("--conversation") + 1], "opencli-managed-02");
   assert.equal(ask[ask.indexOf("--wait") + 1], "false");
   assert.equal(ask[ask.indexOf("--site-session") + 1], "ephemeral");
+  assert.equal(ask[ask.indexOf("--trace") + 1], "retain-on-failure");
 });
 
 test("OpenCLI wake fails closed when the returned conversation identity drifts", async () => {
