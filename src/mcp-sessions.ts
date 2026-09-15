@@ -77,8 +77,12 @@ export class McpSessionRegistry<TTransport extends ClosableMcpTransport> {
   /** Record the exact generation an active session acknowledged via tools/list. */
   acknowledgeToolsList(sessionId: string, snapshot: SessionGenerationSnapshot): boolean {
     const entry = this.sessions.get(sessionId);
+    if (!entry || entry.pendingClose) return false;
     const current = entry?.snapshot;
-    if (!current) return false;
+    if (!current) {
+      entry.snapshot = snapshot;
+      return true;
+    }
     if (
       current.serverInstanceId !== snapshot.serverInstanceId ||
       current.sourceCommit !== snapshot.sourceCommit ||

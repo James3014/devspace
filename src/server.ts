@@ -6253,19 +6253,21 @@ export function createServer(
       if (sessionId) transports.beginRequest(sessionId);
       try {
         await transport.handleRequest(req, res, req.body);
-        if (sessionId && req.method === "POST" && req.body?.method === "tools/list") {
-          const snapshot = transports.getSnapshot(sessionId);
-          if (snapshot) {
-            transports.acknowledgeToolsList(sessionId, {
-              ...snapshot,
-              serverInstanceId: runtimeBuildIdentity.serverInstanceId,
-              sourceCommit: runtimeBuildIdentity.sourceCommit,
-              buildId: runtimeBuildIdentity.buildId,
-              capabilityManifestSha256: capabilityManifest.manifestSha256,
-              catalogGeneration: latestProfileCatalogGeneration.value,
-              freshness: runtimeBuildIdentity.startedAt,
-            });
-          }
+        if (
+          sessionId &&
+          req.method === "POST" &&
+          req.body?.method === "tools/list" &&
+          cutoverController.mode() === "normal"
+        ) {
+          transports.acknowledgeToolsList(sessionId, {
+            serverInstanceId: runtimeBuildIdentity.serverInstanceId,
+            sourceCommit: runtimeBuildIdentity.sourceCommit,
+            buildId: runtimeBuildIdentity.buildId,
+            capabilityManifestSha256: capabilityManifest.manifestSha256,
+            catalogGeneration: latestProfileCatalogGeneration.value,
+            freshness: runtimeBuildIdentity.startedAt,
+            sessionInitializedAt: new Date().toISOString(),
+          });
         }
       } finally {
         if (sessionId) await transports.endRequest(sessionId);
