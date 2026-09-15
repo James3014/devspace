@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import test, { after } from "node:test";
-import { LocalAgentSessionManager, AgentSessionError, getWorkerProcessOwnership } from "./local-agent-sessions.js";
+import { LocalAgentSessionManager, AgentSessionError, OpencodeCatalogDriftError, fingerprintCatalogRuntimeIdentity, getWorkerProcessOwnership } from "./local-agent-sessions.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
 
@@ -947,5 +947,251 @@ test("runWorkerTurnFromFile persists typed AgentProviderFailureError details", a
     });
   } finally {
     clean();
+  }
+});
+
+// ─── OpenCode catalog drift attribution (issue #58) ──────────────────────────
+// Production-path coverage: the pre-provider guard in runWorkerTurnFromFile
+// must reject each material drift with an attributable kind while keeping the
+// exact fail-closed behavior, and must never leak host-sensitive identity.
+
+function driftLiveSnapshot(overrides: Record<string, unknown> = {}): unknown {
+  return {
+    generation: "drift-live-gen",
+    source: "sdk",
+    fetchedAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    freshness: "fresh",
+    runtime: { source: "sdk", version: "unknown" },
+    entries: [],
+    ...overrides,
+  };
+}
+
+function driftReceipt(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    provider: "opencode",
+    model: "opencode/probe-model",
+    source: "sdk",
+    generation: "drift-live-gen",
+    fetchedAt: new Date().toISOString(),
+    freshness: "fresh",
+    runtimeIdentity: "sdk:unknown:unknown",
+    ...overrides,
+  };
+}
+
+async function runOpencodeDriftTurn(liveSnapshot: unknown): Promise<{
+  clean: () => void;
+  closeOnly: () => void;
+  stateDir: string;
+  config: any;
+  turnInvocations: number;
+  record: any;
+}> {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-drift-test-"));
+  const config = {
+    stateDir,
+    subagents: true,
+    oauth: { scopes: ["devspace"] },
+  } as any;
+  let turnInvocations = 0;
+  const fakeSource = {
+    acquire: async () => liveSnapshot,
+    close: () => undefined,
+  };
+  const manager = new LocalAgentSessionManager(
+    config,
+    async () => {},
+    async () => true,
+    async () => {
+      turnInvocations += 1;
+      throw new Error("provider must not be invoked after drift refusal");
+    },
+    undefined,
+    undefined,
+    undefined,
+    fakeSource as never,
+  );
+  const projectRoot = join(stateDir, "project");
+  mkdirSync(projectRoot, { recursive: true });
+  const store = (manager as any).store as LocalAgentStore;
+  const created = store.create({
+    workspaceId: "ws_drift",
+    workspaceRoot: projectRoot,
+    profileName: "opencode-test",
+    provider: "opencode",
+    model: "opencode/probe-model",
+    lifecycleKind: "detached_worker_v2",
+    executionContract: { catalogReceipt: driftReceipt() } as any,
+  });
+  const token = "drift-worker-token";
+  store.prepareWorker(created.id, token);
+  const promptFile = join(stateDir, `prompt-${created.id}.txt`);
+  writeFileSync(promptFile, "drift probe");
+  await manager.runWorkerTurnFromFile(created.id, promptFile, token);
+  const closeOnly = () => {
+    try {
+      manager.close();
+    } catch {}
+  };
+  const clean = () => {
+    closeOnly();
+    try {
+      rmSync(stateDir, { recursive: true, force: true });
+    } catch {}
+  };
+  return { clean, closeOnly, stateDir, config, turnInvocations, record: store.getById(created.id)! };
+}
+
+for (
+  const [kind, liveOverride] of [
+    ["GENERATION_CHANGED", { generation: "drift-other-gen" }],
+    ["SOURCE_CHANGED", { source: "cli" }],
+    [
+      "SNAPSHOT_EXPIRED",
+      {
+        fetchedAt: new Date(Date.now() - 120_000).toISOString(),
+        expiresAt: new Date(Date.now() - 60_000).toISOString(),
+      },
+    ],
+    ["FRESHNESS_CHANGED", { freshness: "stale" }],
+    ["RUNTIME_IDENTITY_CHANGED", { runtime: { source: "sdk", version: "unknown", executable: "/drift/probe/opencode" } }],
+  ] as const
+) {
+  test(`OpenCode catalog drift is rejected and attributable: ${kind}`, async () => {
+    const { clean, turnInvocations, record } = await runOpencodeDriftTurn(driftLiveSnapshot(liveOverride));
+    try {
+      assert.equal(record.status, "error");
+      assert.equal(record.terminalReason, "provider_error");
+      assert.match(
+        record.error ?? "",
+        new RegExp(`^Persisted OpenCode catalog receipt drifted before provider invocation; refusing execution\\. Drift: ${kind}\\.$`),
+      );
+      assert.equal(turnInvocations, 0, "drift refusal must precede provider invocation");
+    } finally {
+      clean();
+    }
+  });
+}
+
+test("OpenCode unchanged receipt reaches model validation instead of drift refusal", async () => {
+  const { clean, turnInvocations, record } = await runOpencodeDriftTurn(driftLiveSnapshot());
+  try {
+    assert.equal(record.status, "error");
+    assert.match(record.error ?? "", /not available in the current catalog/);
+    assert.doesNotMatch(record.error ?? "", /Drift: /);
+    assert.equal(turnInvocations, 0);
+  } finally {
+    clean();
+  }
+});
+
+test("OpenCode drift evidence never exposes host-sensitive runtime identity", () => {
+  const raw = "sdk:unknown:/home/u/.secret-tokens/opencode";
+  const error = new OpencodeCatalogDriftError("RUNTIME_IDENTITY_CHANGED", {
+    expected: {
+      generation: "drift-live-gen",
+      source: "sdk",
+      freshness: "fresh",
+      runtimeIdentityFingerprint: fingerprintCatalogRuntimeIdentity("sdk:unknown:unknown"),
+    },
+    observed: {
+      generation: "drift-live-gen",
+      source: "sdk",
+      freshness: "fresh",
+      runtimeIdentityFingerprint: fingerprintCatalogRuntimeIdentity(raw),
+    },
+  });
+  assert.equal(error.code, "OPENCODE_CATALOG_RECEIPT_DRIFTED");
+  assert.equal(error.driftKind, "RUNTIME_IDENTITY_CHANGED");
+  assert.match(error.message, /Drift: RUNTIME_IDENTITY_CHANGED\./);
+  const serialized = JSON.stringify({ message: error.message, code: error.code, evidence: error.evidence });
+  assert.ok(!serialized.includes(".secret-tokens"), "raw host path must not appear in drift evidence");
+  assert.ok(!serialized.includes(raw), "raw runtime identity must not appear in drift evidence");
+  assert.equal(fingerprintCatalogRuntimeIdentity(raw), fingerprintCatalogRuntimeIdentity(raw));
+  assert.equal(fingerprintCatalogRuntimeIdentity(raw).length, 16);
+  assert.notEqual(fingerprintCatalogRuntimeIdentity(raw), fingerprintCatalogRuntimeIdentity("sdk:unknown:unknown"));
+});
+
+test("OpenCode drift evidence survives durable persistence and store reopen: RUNTIME_IDENTITY_CHANGED", async () => {
+  const secretExecutable = "/home/u/.secret-tokens/opencode";
+  const first = await runOpencodeDriftTurn(
+    driftLiveSnapshot({ runtime: { source: "sdk", version: "unknown", executable: secretExecutable } }),
+  );
+  const agentId = first.record.id;
+  assert.equal(first.record.status, "error");
+  assert.equal(first.turnInvocations, 0, "drift refusal must precede provider invocation");
+  // Reopen the same durable store; nothing may come from the ephemeral Error.
+  first.closeOnly();
+  const manager2 = new LocalAgentSessionManager(
+    first.config,
+    async () => {},
+    async () => true,
+  );
+  try {
+    const store2 = (manager2 as any).store as LocalAgentStore;
+    const reread = store2.getById(agentId)!;
+    assert.equal(reread.status, "error");
+    assert.equal(reread.errorCode, "OPENCODE_CATALOG_RECEIPT_DRIFTED");
+    assert.match(reread.error ?? "", /Drift: RUNTIME_IDENTITY_CHANGED\./);
+    const details = reread.errorDetails as any;
+    assert.equal(details?.code, "OPENCODE_CATALOG_RECEIPT_DRIFTED");
+    assert.equal(details?.driftKind, "RUNTIME_IDENTITY_CHANGED");
+    assert.deepEqual(details?.expected, {
+      generation: "drift-live-gen",
+      source: "sdk",
+      freshness: "fresh",
+      runtimeIdentityFingerprint: fingerprintCatalogRuntimeIdentity("sdk:unknown:unknown"),
+    });
+    assert.equal(details?.observed?.generation, "drift-live-gen");
+    assert.equal(details?.observed?.source, "sdk");
+    assert.equal(details?.observed?.freshness, "fresh");
+    assert.equal(
+      details?.observed?.runtimeIdentityFingerprint,
+      fingerprintCatalogRuntimeIdentity(`sdk:unknown:${secretExecutable}`),
+    );
+    assert.equal(typeof details?.observed?.liveFetchedAt, "string");
+    assert.equal(typeof details?.observed?.liveExpiresAt, "string");
+    const serialized = JSON.stringify(reread);
+    assert.ok(!serialized.includes(secretExecutable), "raw executable path must not persist");
+    assert.ok(!serialized.includes(".secret-tokens"), "secret-looking path must not persist");
+  } finally {
+    try {
+      manager2.close();
+    } catch {}
+    try {
+      rmSync(first.stateDir, { recursive: true, force: true });
+    } catch {}
+  }
+});
+
+test("OpenCode drift evidence survives durable persistence and store reopen: GENERATION_CHANGED", async () => {
+  const first = await runOpencodeDriftTurn(driftLiveSnapshot({ generation: "drift-other-gen" }));
+  const agentId = first.record.id;
+  assert.equal(first.record.status, "error");
+  assert.equal(first.turnInvocations, 0, "drift refusal must precede provider invocation");
+  first.closeOnly();
+  const manager2 = new LocalAgentSessionManager(
+    first.config,
+    async () => {},
+    async () => true,
+  );
+  try {
+    const store2 = (manager2 as any).store as LocalAgentStore;
+    const reread = store2.getById(agentId)!;
+    assert.equal(reread.errorCode, "OPENCODE_CATALOG_RECEIPT_DRIFTED");
+    const details = reread.errorDetails as any;
+    assert.equal(details?.driftKind, "GENERATION_CHANGED");
+    assert.equal(details?.expected?.generation, "drift-live-gen");
+    assert.equal(details?.observed?.generation, "drift-other-gen");
+    assert.match(reread.error ?? "", /Drift: GENERATION_CHANGED\./);
+  } finally {
+    try {
+      manager2.close();
+    } catch {}
+    try {
+      rmSync(first.stateDir, { recursive: true, force: true });
+    } catch {}
   }
 });
