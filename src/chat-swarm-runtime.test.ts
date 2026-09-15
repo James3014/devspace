@@ -470,7 +470,10 @@ test("managed bootstrap binds the authenticated peer separately from the browser
       authenticatedPeerFingerprint: peerFingerprint,
       appBinding: "READY",
     });
-    assert.equal(f.registry.claimBootstrap(prepared.operation!.operationId), true);
+    assert.equal(
+      f.registry.claimBootstrap(prepared.operation!.operationId, 5_000),
+      true,
+    );
     assert.throws(
       () =>
         f.manager.bootstrap(
