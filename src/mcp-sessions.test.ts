@@ -213,3 +213,19 @@ const reconnectServer = { ...currentServer, serverInstanceId: "srv-new", sourceC
 assert.equal(acknowledgementRegistry.acknowledgeToolsList("another-active", reconnectServer), false);
 assert.equal(evaluateSessionConvergence(acknowledgementRegistry.getSnapshot("another-active")!, reconnectServer).state, "STALE_SERVER");
 assert.equal(evaluateSessionConvergence(undefined, reconnectServer).state, "RECONNECT_REQUIRED");
+
+// A tools/list refresh may rebind an existing active transport whose snapshot
+// was lost during a server restart, but it must not create or revive sessions.
+const rebindRegistry = new McpSessionRegistry<FakeTransport>();
+rebindRegistry.register("active-without-snapshot", createTransport());
+assert.equal(rebindRegistry.acknowledgeToolsList("active-without-snapshot", currentSnapshot), true);
+assert.deepEqual(rebindRegistry.getSnapshot("active-without-snapshot"), currentSnapshot);
+assert.equal(evaluateSessionConvergence(rebindRegistry.getSnapshot("active-without-snapshot"), currentServer).state, "CURRENT");
+rebindRegistry.register("removed-before-refresh", createTransport());
+assert.equal(rebindRegistry.remove("removed-before-refresh"), true);
+assert.equal(rebindRegistry.acknowledgeToolsList("removed-before-refresh", currentSnapshot), false);
+const closingRegistry = new McpSessionRegistry<FakeTransport>();
+closingRegistry.register("closing", createTransport());
+assert.equal(closingRegistry.beginRequest("closing"), true);
+void closingRegistry.closeAll();
+assert.equal(closingRegistry.acknowledgeToolsList("closing", currentSnapshot), false);

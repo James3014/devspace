@@ -190,8 +190,18 @@ import {
 import { registerPhysicalHostRegistryTools } from "./physical-host-registry.js";
 
 type Transport = StreamableHTTPServerTransport;
+class ReboundTransport extends StreamableHTTPServerTransport {
+  constructor(private readonly reboundSessionId: string) {
+    super({ sessionIdGenerator: undefined });
+  }
+
+  override get sessionId(): string {
+    return this.reboundSessionId;
+  }
+}
 const MCP_SESSION_CLEANUP_INTERVAL_MS = 5 * 60 * 1_000;
 const AGENT_SUPERVISION_INTERVAL_MS = 2_000;
+const MCP_SESSION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const AGENT_TERMINATION_OUTPUT_SCHEMA = z.object({
   pending: z.boolean(),
   generation: z.string().optional(),
@@ -6013,6 +6023,123 @@ export function createServer(
     ...(advanceCutover ? { advance: advanceCutover } : {}),
   });
 
+  const createSessionServer = (requestSessionId?: string) => createMcpServer(
+    config,
+    workspaces,
+    reviewCheckpoints,
+    processSessions,
+    resolveLocalAgentProviders,
+    incomingArtifactAdapters,
+    agentSessionManager,
+    codexGoals,
+    {
+      identity: runtimeBuildIdentity,
+      latestProfileCatalogGeneration,
+      capabilityManifest,
+      onCatalogGenerationChanged: broadcastToolListChanged,
+    },
+    durableOperations,
+    {
+      controller: cutoverController,
+      transportEvidence: () => transports.metrics(),
+      reconcileDurableState: reconcileCutoverDurableState,
+      ...(restartSelfActuator ? { restartSelf: restartSelfActuator } : {}),
+      ...(buildReadyProbe ? { probeBuildReady: buildReadyProbe } : {}),
+      inspectWorkspace: (workspaceId) => workspaces.inspectWorkspace(workspaceId),
+      listWorkspaceSessions: () => workspaceStore.listSessions(),
+      ...(advanceCutover ? { advance: advanceCutover } : {}),
+      enumerateReconciliation: enumerateDurableReconciliationState,
+      executeObservedReplacementRecovery,
+      canRepairBinding,
+      executeBindingRepair,
+      sessionConvergence: (targetSessionId?: string) => {
+        const sid = targetSessionId ?? requestSessionId;
+        const sessionSnapshot = sid ? transports.getSnapshot(sid) : undefined;
+        return evaluateSessionConvergence(sessionSnapshot, {
+          serverInstanceId: runtimeBuildIdentity.serverInstanceId,
+          sourceCommit: runtimeBuildIdentity.sourceCommit,
+          buildId: runtimeBuildIdentity.buildId,
+          capabilityManifestSha256: capabilityManifest.manifestSha256,
+          catalogGeneration: latestProfileCatalogGeneration.value,
+          freshness: runtimeBuildIdentity.startedAt,
+          cutoverMode: cutoverController.mode(),
+          reconciliationRequired: cutoverController.mode() !== "normal",
+        });
+      },
+      multiRoleEvaluator: () => {
+        const roles: ServiceRoleDeploymentIdentity[] = [
+          {
+            role: "primary",
+            roleKind: "AUTHORITATIVE_PRODUCTION",
+            expectedCommit: runtimeBuildIdentity.sourceCommit,
+            expectedBuildId: runtimeBuildIdentity.buildId,
+            runningBuild: {
+              commit: runtimeBuildIdentity.sourceCommit,
+              buildId: runtimeBuildIdentity.buildId,
+              serverInstanceId: runtimeBuildIdentity.serverInstanceId,
+              manifestSha256: capabilityManifest.manifestSha256,
+              capabilities: capabilityManifest.capabilities,
+              cutoverMode: cutoverController.mode(),
+              reconciliationRequired: cutoverController.mode() !== "normal",
+            },
+          },
+        ];
+        return evaluateMultiRoleConvergence(roles);
+      },
+      ...(controlPlaneInventoryReader
+        ? { controlPlaneEvaluator: () => evaluateControlPlaneConvergence(controlPlaneInventoryReader()) }
+        : {}),
+    },
+    opencodeCatalogSource,
+    clineCatalogService,
+    chatSwarmLifecycle,
+    carrierBindings,
+    hostOperations,
+    options.controlPlaneInventory,
+    controlPlaneInventoryReader,
+  );
+
+  const reboundSessionIds = new Set<string>();
+  const reboundTransportDisposals = new WeakSet<object>();
+  const closedReboundSessionIds = new Set<string>();
+  const reboundSessionTombstoneLimit = config.mcpSessionMaxSessions ?? 256;
+  const rememberReboundSession = (sessionId: string) => {
+    reboundSessionIds.delete(sessionId);
+    reboundSessionIds.add(sessionId);
+    while (reboundSessionIds.size > reboundSessionTombstoneLimit) {
+      const oldest = reboundSessionIds.values().next().value as string | undefined;
+      if (!oldest) break;
+      reboundSessionIds.delete(oldest);
+    }
+  };
+  const rememberClosedReboundSession = (sessionId: string) => {
+    closedReboundSessionIds.delete(sessionId);
+    closedReboundSessionIds.add(sessionId);
+    while (closedReboundSessionIds.size > reboundSessionTombstoneLimit) {
+      const oldest = closedReboundSessionIds.values().next().value as string | undefined;
+      if (!oldest) break;
+      closedReboundSessionIds.delete(oldest);
+    }
+  };
+  const setTransportCloseHandler = (
+    transport: Transport,
+    registrySessionId?: string,
+  ) => {
+    transport.onclose = () => {
+      const closedSessionId = registrySessionId ?? transport.sessionId;
+      if (closedSessionId && !reboundTransportDisposals.has(transport)) {
+        carrierBindings?.forgetSession(closedSessionId);
+        reboundSessionIds.delete(closedSessionId);
+      }
+      if (closedSessionId && transports.remove(closedSessionId)) {
+        logEvent(config.logging, "info", "mcp_session_closed", {
+          reason: "transport_close",
+          sessionIdPrefix: sessionIdPrefix(closedSessionId),
+        });
+      }
+    };
+  };
+
   app.all("/mcp", async (req, res) => {
     const requestId = res.locals.requestId as string | undefined;
     const sessionId = req.header("mcp-session-id");
@@ -6114,9 +6241,64 @@ export function createServer(
 
     try {
       let transport: Transport | undefined;
+      let registrySessionId = sessionId;
 
       if (sessionId) {
         transport = transports.get(sessionId);
+        const isReboundSession = reboundSessionIds.has(sessionId);
+        if (transport && isReboundSession && req.method === "DELETE") {
+          const server = transports.getServer(sessionId);
+          transports.remove(sessionId);
+          reboundSessionIds.delete(sessionId);
+          rememberClosedReboundSession(sessionId);
+          carrierBindings?.forgetSession(sessionId);
+          try {
+            if (server && typeof server.close === "function") await server.close();
+            else await transport.close();
+          } catch (error) {
+            logEvent(config.logging, "warn", "mcp_session_close_failed", {
+              reason: "transport_close",
+              sessionIdPrefix: sessionIdPrefix(sessionId),
+              error: error instanceof Error ? error.message : String(error),
+            });
+          }
+          res.sendStatus(200);
+          return;
+        }
+        if (transport && reboundSessionIds.has(sessionId) && req.method !== "DELETE") {
+          transports.remove(sessionId);
+          reboundTransportDisposals.add(transport);
+          await transport.close();
+          transport = undefined;
+        }
+        if (
+          !transport &&
+          req.method === "POST" &&
+          (req.body?.method === "tools/list" || isReboundSession) &&
+          cutoverController.mode() === "normal" &&
+          MCP_SESSION_ID_PATTERN.test(sessionId) &&
+          !closedReboundSessionIds.has(sessionId)
+        ) {
+          transport = new ReboundTransport(sessionId);
+          setTransportCloseHandler(transport, sessionId);
+          const server = createSessionServer(sessionId);
+          await server.connect(transport);
+          transports.register(sessionId, transport, {
+            snapshot: {
+              serverInstanceId: runtimeBuildIdentity.serverInstanceId,
+              sourceCommit: runtimeBuildIdentity.sourceCommit,
+              buildId: runtimeBuildIdentity.buildId,
+              capabilityManifestSha256: capabilityManifest.manifestSha256,
+              catalogGeneration: latestProfileCatalogGeneration.value,
+              freshness: runtimeBuildIdentity.startedAt,
+              sessionInitializedAt: new Date().toISOString(),
+            },
+            server,
+          });
+          rememberReboundSession(sessionId);
+          registrySessionId = sessionId;
+          res.setHeader("mcp-session-id", sessionId);
+        }
         if (!transport) {
           sendJsonRpcError(res, 404, -32000, "Unknown MCP session");
           return;
@@ -6145,92 +6327,9 @@ export function createServer(
           },
         });
 
-        transport.onclose = () => {
-          const closedSessionId = transport?.sessionId;
-          if (closedSessionId) carrierBindings?.forgetSession(closedSessionId);
-          if (closedSessionId && transports.remove(closedSessionId)) {
-            logEvent(config.logging, "info", "mcp_session_closed", {
-              reason: "transport_close",
-              sessionIdPrefix: sessionIdPrefix(closedSessionId),
-            });
-          }
-        };
+        setTransportCloseHandler(transport);
 
-        const server = createMcpServer(
-          config,
-          workspaces,
-          reviewCheckpoints,
-          processSessions,
-          resolveLocalAgentProviders,
-          incomingArtifactAdapters,
-          agentSessionManager,
-          codexGoals,
-          {
-            identity: runtimeBuildIdentity,
-            latestProfileCatalogGeneration,
-            capabilityManifest,
-            onCatalogGenerationChanged: broadcastToolListChanged,
-          },
-          durableOperations,
-          {
-            controller: cutoverController,
-            transportEvidence: () => transports.metrics(),
-            reconcileDurableState: reconcileCutoverDurableState,
-            ...(restartSelfActuator ? { restartSelf: restartSelfActuator } : {}),
-            ...(buildReadyProbe ? { probeBuildReady: buildReadyProbe } : {}),
-            inspectWorkspace: (workspaceId) => workspaces.inspectWorkspace(workspaceId),
-            listWorkspaceSessions: () => workspaceStore.listSessions(),
-            ...(advanceCutover ? { advance: advanceCutover } : {}),
-            enumerateReconciliation: enumerateDurableReconciliationState,
-            executeObservedReplacementRecovery,
-            canRepairBinding,
-            executeBindingRepair,
-            sessionConvergence: (targetSessionId?: string) => {
-              const sid = targetSessionId ?? sessionId;
-              const sessionSnapshot = sid ? transports.getSnapshot(sid) : undefined;
-              return evaluateSessionConvergence(sessionSnapshot, {
-                serverInstanceId: runtimeBuildIdentity.serverInstanceId,
-                sourceCommit: runtimeBuildIdentity.sourceCommit,
-                buildId: runtimeBuildIdentity.buildId,
-                capabilityManifestSha256: capabilityManifest.manifestSha256,
-                catalogGeneration: latestProfileCatalogGeneration.value,
-                freshness: runtimeBuildIdentity.startedAt,
-                cutoverMode: cutoverController.mode(),
-                reconciliationRequired: cutoverController.mode() !== "normal",
-              });
-            },
-            multiRoleEvaluator: () => {
-              const roles: ServiceRoleDeploymentIdentity[] = [
-                {
-                  role: "primary",
-                  roleKind: "AUTHORITATIVE_PRODUCTION",
-                  expectedCommit: runtimeBuildIdentity.sourceCommit,
-                  expectedBuildId: runtimeBuildIdentity.buildId,
-                  runningBuild: {
-                    commit: runtimeBuildIdentity.sourceCommit,
-                    buildId: runtimeBuildIdentity.buildId,
-                    serverInstanceId: runtimeBuildIdentity.serverInstanceId,
-                    manifestSha256: capabilityManifest.manifestSha256,
-                    capabilities: capabilityManifest.capabilities,
-                    cutoverMode: cutoverController.mode(),
-                    reconciliationRequired: cutoverController.mode() !== "normal",
-                  },
-                },
-              ];
-              return evaluateMultiRoleConvergence(roles);
-            },
-            ...(controlPlaneInventoryReader
-              ? { controlPlaneEvaluator: () => evaluateControlPlaneConvergence(controlPlaneInventoryReader()) }
-              : {}),
-          },
-          opencodeCatalogSource,
-          clineCatalogService,
-          chatSwarmLifecycle,
-          carrierBindings,
-          hostOperations,
-          options.controlPlaneInventory,
-          controlPlaneInventoryReader,
-        );
+        const server = createSessionServer(sessionId);
         if (transport.sessionId) {
           const initialSnapshot: SessionGenerationSnapshot = {
             serverInstanceId: runtimeBuildIdentity.serverInstanceId,
@@ -6250,25 +6349,27 @@ export function createServer(
         return;
       }
 
-      if (sessionId) transports.beginRequest(sessionId);
+      if (registrySessionId) transports.beginRequest(registrySessionId);
       try {
         await transport.handleRequest(req, res, req.body);
-        if (sessionId && req.method === "POST" && req.body?.method === "tools/list") {
-          const snapshot = transports.getSnapshot(sessionId);
-          if (snapshot) {
-            transports.acknowledgeToolsList(sessionId, {
-              ...snapshot,
-              serverInstanceId: runtimeBuildIdentity.serverInstanceId,
-              sourceCommit: runtimeBuildIdentity.sourceCommit,
-              buildId: runtimeBuildIdentity.buildId,
-              capabilityManifestSha256: capabilityManifest.manifestSha256,
-              catalogGeneration: latestProfileCatalogGeneration.value,
-              freshness: runtimeBuildIdentity.startedAt,
-            });
-          }
+        if (
+          registrySessionId &&
+          req.method === "POST" &&
+          req.body?.method === "tools/list" &&
+          cutoverController.mode() === "normal"
+        ) {
+          transports.acknowledgeToolsList(registrySessionId, {
+            serverInstanceId: runtimeBuildIdentity.serverInstanceId,
+            sourceCommit: runtimeBuildIdentity.sourceCommit,
+            buildId: runtimeBuildIdentity.buildId,
+            capabilityManifestSha256: capabilityManifest.manifestSha256,
+            catalogGeneration: latestProfileCatalogGeneration.value,
+            freshness: runtimeBuildIdentity.startedAt,
+            sessionInitializedAt: new Date().toISOString(),
+          });
         }
       } finally {
-        if (sessionId) await transports.endRequest(sessionId);
+        if (registrySessionId) await transports.endRequest(registrySessionId);
       }
     } catch (error) {
       logEvent(config.logging, "error", "mcp_request_error", {
