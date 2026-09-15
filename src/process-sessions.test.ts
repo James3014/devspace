@@ -847,6 +847,57 @@ try {
   assert.equal(r7_second.running, false);
   assert.match(r7_second.output, /mat7_large_output_budget/);
 
+  const coreBindingA = {
+    sessionId: `cms_${"a".repeat(32)}`,
+    bindingHash: `sha256:${"b".repeat(64)}`,
+  };
+  const coreBindingB = {
+    sessionId: `cms_${"c".repeat(32)}`,
+    bindingHash: `sha256:${"d".repeat(64)}`,
+  };
+  const coreBoundProcess = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: `${node} -e "setTimeout(() => process.exit(0), 100)"`,
+    yieldTimeMs: 10,
+    attemptKey: "matrix:core-binding",
+    coreMutation: coreBindingA,
+  } as Parameters<ProcessSessionManager["start"]>[0]);
+  assert.deepEqual(
+    (coreBoundProcess as unknown as { coreMutation?: unknown }).coreMutation,
+    coreBindingA,
+    "process snapshots must retain the exact Core binding used before spawn",
+  );
+  assert.equal(
+    g2Manager.inspectCoreMutationWriters(coreBindingA.sessionId, coreBindingA.bindingHash),
+    "ACTIVE",
+  );
+  assert.equal(
+    g2Manager.inspectCoreMutationWriters(coreBindingB.sessionId, coreBindingB.bindingHash),
+    "UNKNOWN",
+  );
+  await assert.rejects(
+    g2Manager.start({
+      workspaceId: "ws_g2",
+      cwd: process.cwd(),
+      command: `${node} -e "setTimeout(() => process.exit(0), 100)"`,
+      yieldTimeMs: 10,
+      attemptKey: "matrix:core-binding",
+      coreMutation: coreBindingB,
+    } as Parameters<ProcessSessionManager["start"]>[0]),
+    /ATTEMPT_REPLAY_CONFLICT/,
+    "an attempt cannot replay under a changed Core binding",
+  );
+  await g2Manager.getStatus({
+    workspaceId: "ws_g2",
+    attemptKey: "matrix:core-binding",
+    yieldTimeMs: 1_000,
+  });
+  assert.equal(
+    g2Manager.inspectCoreMutationWriters(coreBindingA.sessionId, coreBindingA.bindingHash),
+    "CLEAR",
+  );
+
   // Internal PTY polling must continue waiting after a non-destructive
   // snapshot has already retained initial output.
   const retainedOutput = await g2Manager.start({

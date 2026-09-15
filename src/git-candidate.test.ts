@@ -572,3 +572,107 @@ test("commitCandidate - macOS var/private/var alias verification", async () => {
     f.clean();
   }
 });
+
+test("commitCandidate classifies a failing pre-commit hook as confirmed no effect", async () => {
+  const f = setupGitFixture();
+  try {
+    const hookPath = join(f.cloneDir, ".git", "hooks", "pre-commit");
+    writeFileSync(hookPath, "#!/bin/sh\nprintf 'escape\\n' > hook-failure-escape.txt\nexit 17\n");
+    execFileSync("chmod", ["+x", hookPath]);
+    writeFileSync(join(f.worktreeDir, "hook-failure.txt"), "candidate\n");
+    await assert.rejects(
+      commitCandidate({ workspaceId: "ws", workspaceRoot: f.worktreeDir, expectedHead: f.worktreeHead, message: "hook failure", paths: ["hook-failure.txt"] }),
+      (error: unknown) => {
+        assert.ok(error instanceof GitCandidateError);
+        assert.equal(error.effect?.state, "CONFIRMED_NO_EFFECT");
+        assert.equal(error.effect?.observedHead, f.worktreeHead);
+        assert.equal(error.effect?.retryAllowed, false);
+        assert.equal(runGitRaw(["rev-parse", "HEAD"], f.worktreeDir), f.worktreeHead);
+        return true;
+      },
+    );
+  } finally {
+    f.clean();
+  }
+});
+
+test("commitCandidate preserves confirmed commit when first identity readback fails", async () => {
+  const f = setupGitFixture();
+  try {
+    writeFileSync(join(f.worktreeDir, "readback.txt"), "candidate\n");
+    let committed = false;
+    let failedReadbacks = 0;
+    const gitRunner = async (args: string[], cwd: string) => {
+      if (committed && args.join(" ") === "rev-parse HEAD" && failedReadbacks++ === 0) {
+        throw new Error("injected first post-commit HEAD readback failure");
+      }
+      const stdout = runGitRaw(args, cwd);
+      if (args[0] === "commit") committed = true;
+      return { stdout, stderr: "" };
+    };
+    await assert.rejects(
+      commitCandidate({ workspaceId: "ws", workspaceRoot: f.worktreeDir, expectedHead: f.worktreeHead, message: "readback failure", paths: ["readback.txt"], gitRunner } as Parameters<typeof commitCandidate>[0]),
+      (error: unknown) => {
+        assert.ok(error instanceof GitCandidateError);
+        assert.equal(error.effect?.state, "CONFIRMED_LOCAL_COMMIT");
+        assert.equal(error.effect?.observedHead, runGitRaw(["rev-parse", "HEAD"], f.worktreeDir));
+        assert.match(String(error.effect?.observedTree), /^[0-9a-f]{40}$/);
+        assert.match(error.message, /injected first post-commit HEAD readback failure/);
+        return true;
+      },
+    );
+  } finally {
+    f.clean();
+  }
+});
+
+test("pushCandidate reconciles expected remote SHA after initial readback failure", async () => {
+  const f = setupGitFixture();
+  try {
+    writeFileSync(join(f.worktreeDir, "push-reconcile.txt"), "candidate\n");
+    const commit = await commitCandidate({ workspaceId: "ws", workspaceRoot: f.worktreeDir, expectedHead: f.worktreeHead, message: "push reconcile", paths: ["push-reconcile.txt"] });
+    let readbacks = 0;
+    const gitRunner = async (args: string[], cwd: string) => {
+      if (args[0] === "ls-remote" && readbacks++ === 0) throw new Error("injected initial remote readback failure");
+      return { stdout: runGitRaw(args, cwd), stderr: "" };
+    };
+    const result = await pushCandidate({ workspaceRoot: f.worktreeDir, expectedHead: commit.commitSha, remote: "origin", branch: "reconciled-readback", gitRunner } as Parameters<typeof pushCandidate>[0]);
+    assert.equal(result.pushedSha, commit.commitSha);
+    assert.equal(readbacks, 2, "push must perform one bounded reconciliation readback");
+  } finally {
+    f.clean();
+  }
+});
+
+test("pushCandidate preserves EFFECT_UNKNOWN when push succeeds but both readbacks fail", async () => {
+  const f = setupGitFixture();
+  try {
+    writeFileSync(join(f.worktreeDir, "push-unknown.txt"), "candidate\n");
+    const commit = await commitCandidate({ workspaceId: "ws", workspaceRoot: f.worktreeDir, expectedHead: f.worktreeHead, message: "push unknown", paths: ["push-unknown.txt"] });
+    let readbacks = 0;
+    const gitRunner = async (args: string[], cwd: string) => {
+      if (args[0] === "ls-remote") {
+        readbacks += 1;
+        throw new Error(`injected remote readback failure ${readbacks}`);
+      }
+      return { stdout: runGitRaw(args, cwd), stderr: "" };
+    };
+    await assert.rejects(
+      pushCandidate({ workspaceRoot: f.worktreeDir, expectedHead: commit.commitSha, remote: "origin", branch: "unknown-readback", gitRunner } as Parameters<typeof pushCandidate>[0]),
+      (error: unknown) => {
+        assert.ok(error instanceof GitCandidateError);
+        assert.equal(error.effect?.state, "EFFECT_UNKNOWN");
+        assert.equal(error.effect?.expectedPushedSha, commit.commitSha);
+        assert.equal(error.effect?.remote, "origin");
+        assert.equal(error.effect?.branch, "unknown-readback");
+        assert.equal(error.effect?.retryAllowed, false);
+        assert.match(error.message, /injected remote readback failure/);
+        return true;
+      },
+    );
+    assert.equal(readbacks, 2);
+    assert.equal(runGitRaw(["rev-parse", "refs/heads/unknown-readback"], f.bareDir), commit.commitSha);
+  } finally {
+    f.clean();
+  }
+});
