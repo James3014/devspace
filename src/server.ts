@@ -192,6 +192,7 @@ import {
   runRepositoryIntelligenceOperation,
   type RepositoryIntelligenceOperation,
 } from "./repository-intelligence.js";
+import { registerRepositoryIntelligenceArtifactTool } from "./repository-intelligence-artifact.js";
 import { registerPhysicalHostRegistryTools } from "./physical-host-registry.js";
 
 type Transport = StreamableHTTPServerTransport;
@@ -1418,6 +1419,8 @@ function registerRepositoryIntelligenceTools(
       },
     },
   ];
+
+  registerRepositoryIntelligenceArtifactTool(server, config, workspaces);
 
   for (const spec of specs) {
     registerAppTool(
