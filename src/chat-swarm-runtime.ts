@@ -34,6 +34,7 @@ const MAX_RUNTIME_WORKERS = 64;
 const DEFAULT_RUNTIME_WORKERS = 3;
 const DEFAULT_OPERATION_TIMEOUT_MS = 60_000;
 const DEFAULT_BOOTSTRAP_WAIT_MS = 45_000;
+const DEFAULT_PROVISION_STAGGER_MS = 8_000;
 const MAX_RUNTIME_TIMEOUT_MS = 120_000;
 
 type Row = Record<string, unknown>;
@@ -71,6 +72,7 @@ export interface ChatSwarmRuntimeConfig {
   appLabel: string;
   operationTimeoutMs: number;
   bootstrapWaitMs: number;
+  provisionStaggerMs: number;
 }
 
 export interface ManagedCarrierSlot {
@@ -128,6 +130,7 @@ interface ProvisionReceipt {
   schema: typeof PROVISION_RECEIPT_SCHEMA;
   disposition:
     | "PREPARED"
+    | "TRANSPORT_OBSERVED"
     | "CARRIER_CREATED"
     | "BOOTSTRAPPING"
     | "BOUND"
@@ -197,9 +200,12 @@ export interface RuntimeStatusResult {
   slots: ManagedCarrierSlot[];
 }
 
-export interface ManagedConversationEvidence {
+export interface TransportConversationEvidence {
   conversationUrl: string;
   conversationFingerprint: string;
+}
+
+export interface ManagedConversationEvidence extends TransportConversationEvidence {
   authenticatedPeerFingerprint?: string;
   appBinding: "READY" | "UNKNOWN" | "DISABLED" | "STALE";
 }
@@ -240,6 +246,7 @@ export interface MacWebDriver {
   createManagedConversation(
     projectUrl: string,
     deadlineAt: string,
+    onTransportObserved?: (evidence: TransportConversationEvidence) => void,
   ): Promise<ManagedConversationEvidence>;
   sendPrompt(
     conversationUrl: string,
@@ -341,6 +348,13 @@ export function loadChatSwarmRuntimeConfig(
       1_000,
       MAX_RUNTIME_TIMEOUT_MS,
       "DEVSPACE_CHAT_SWARM_BOOTSTRAP_WAIT_MS",
+    ),
+    provisionStaggerMs: boundedInt(
+      env.DEVSPACE_CHAT_SWARM_PROVISION_STAGGER_MS,
+      DEFAULT_PROVISION_STAGGER_MS,
+      0,
+      MAX_RUNTIME_TIMEOUT_MS,
+      "DEVSPACE_CHAT_SWARM_PROVISION_STAGGER_MS",
     ),
   };
 }
@@ -644,6 +658,68 @@ export class ChatSwarmRuntimeStore {
       .prepare("update durable_operations set status='started',updated_at=? where operation_id=? and kind=? and scope_root=? and status='prepared'")
       .run(nowIso(), operationId, PROVISION_KIND, this.scopeRoot);
     return result.changes === 1;
+  }
+
+  markTransportObserved(
+    operationId: string,
+    evidence: TransportConversationEvidence,
+  ): ManagedCarrierSlot {
+    assertFingerprint(evidence.conversationFingerprint, "conversation fingerprint");
+    const tx = this.database.sqlite.transaction(() => {
+      const operation = this.requireProvision(operationId);
+      if (operation.status === "outcome_unknown") {
+        throw new ChatSwarmError(
+          "RECONCILIATION_REQUIRED",
+          "provision outcome is unknown; do not create another carrier",
+        );
+      }
+      if (operation.status !== "started") {
+        if (
+          operation.receipt?.conversationFingerprint === evidence.conversationFingerprint &&
+          operation.receipt?.conversationUrl === evidence.conversationUrl
+        ) {
+          return this.getSlot(operation.request.swarmId, operation.request.runtimeSlot)!;
+        }
+        throw new ChatSwarmError("INVALID_STATE", "provision operation is not active");
+      }
+      const conflicting = this.getSlotByFingerprint(evidence.conversationFingerprint);
+      if (
+        conflicting &&
+        (conflicting.swarmId !== operation.request.swarmId ||
+          conflicting.runtimeSlot !== operation.request.runtimeSlot)
+      ) {
+        throw new ChatSwarmError(
+          "OWNERSHIP_CONFLICT",
+          "conversation is already managed by another runtime slot",
+        );
+      }
+      const observedAt = nowIso();
+      const receipt: ProvisionReceipt = {
+        schema: PROVISION_RECEIPT_SCHEMA,
+        disposition: "TRANSPORT_OBSERVED",
+        conversationUrl: evidence.conversationUrl,
+        conversationFingerprint: evidence.conversationFingerprint,
+        remoteMayContinue: true,
+        observedAt,
+      };
+      this.updateProvision(operationId, "started", receipt);
+      const slot = this.getSlot(operation.request.swarmId, operation.request.runtimeSlot)!;
+      this.updateSlotReceipt(
+        slot,
+        {
+          schema: SLOT_RECEIPT_SCHEMA,
+          generation: operation.request.generation,
+          state: "PROVISIONING",
+          conversationUrl: evidence.conversationUrl,
+          conversationFingerprint: evidence.conversationFingerprint,
+          lastOperationId: operationId,
+          updatedAt: observedAt,
+        },
+        "started",
+      );
+      return this.getSlot(operation.request.swarmId, operation.request.runtimeSlot)!;
+    });
+    return tx.immediate();
   }
 
   markCarrierCreated(
@@ -1409,43 +1485,61 @@ export class OpenCliMacWebDriver implements MacWebDriver {
   async createManagedConversation(
     projectUrl: string,
     deadlineAt: string,
+    onTransportObserved?: (evidence: TransportConversationEvidence) => void,
   ): Promise<ManagedConversationEvidence> {
     const probePrompt = this.peerIdentityProbePrompt();
-    const rows = await this.runJson<OpenCliConversationRow[]>(
-      [
-        "chatgpt",
-        "ask",
-        probePrompt,
-        "--project",
-        openCliProjectId(projectUrl),
-        "--new",
-        "true",
-        "--wait",
-        "false",
-        "--site-session",
-        "ephemeral",
-        "--keep-tab",
-        "false",
-        "-f",
-        "json",
-      ],
-      deadlineAt,
-    );
+    let rows: OpenCliConversationRow[];
+    try {
+      rows = await this.runJson<OpenCliConversationRow[]>(
+        [
+          "chatgpt",
+          "ask",
+          probePrompt,
+          "--project",
+          openCliProjectId(projectUrl),
+          "--new",
+          "true",
+          "--wait",
+          "false",
+          "--site-session",
+          "ephemeral",
+          "--keep-tab",
+          "false",
+          "-f",
+          "json",
+        ],
+        deadlineAt,
+      );
+    } catch (error) {
+      throw new Error(
+        `OPENCLI_CREATE_CONVERSATION_FAILED:${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
     const conversationUrl = rows[0]?.conversationUrl?.trim();
     if (!conversationUrl) {
-      throw new Error("OpenCLI did not return a ChatGPT conversation URL");
+      throw new Error("OPENCLI_CREATE_CONVERSATION_FAILED:missing conversation URL");
     }
-    await this.waitForConversationIdle(conversationUrl, deadlineAt);
-    const authenticatedPeerFingerprint = this.peerFingerprintFromDetail(
-      await this.detail(conversationUrl, deadlineAt),
-      probePrompt,
-    );
-    return {
+    const transportEvidence: TransportConversationEvidence = {
       conversationUrl,
       conversationFingerprint: conversationFingerprintFromUrl(conversationUrl),
-      authenticatedPeerFingerprint,
-      appBinding: "READY",
     };
+    onTransportObserved?.(transportEvidence);
+    try {
+      await this.waitForConversationIdle(conversationUrl, deadlineAt);
+      const authenticatedPeerFingerprint = this.peerFingerprintFromDetail(
+        await this.detail(conversationUrl, deadlineAt),
+        probePrompt,
+      );
+      return {
+        ...transportEvidence,
+        authenticatedPeerFingerprint,
+        appBinding: "READY",
+      };
+    } catch (error) {
+      throw new Error(
+        `OPENCLI_PEER_PROBE_FAILED:${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
   }
 
   async sendPrompt(
@@ -1702,6 +1796,7 @@ export class CdpMacWebDriver implements MacWebDriver {
   async createManagedConversation(
     projectUrl: string,
     deadlineAt: string,
+    onTransportObserved?: (evidence: TransportConversationEvidence) => void,
   ): Promise<ManagedConversationEvidence> {
     await this.ensureRuntime(deadlineAt);
     const target = await this.newTarget(projectUrl, deadlineAt);
@@ -1713,9 +1808,13 @@ export class CdpMacWebDriver implements MacWebDriver {
       deadlineAt,
     );
     const conversationUrl = await this.waitForConversationUrl(target, deadlineAt);
-    return {
+    const evidence = {
       conversationUrl,
       conversationFingerprint: conversationFingerprintFromUrl(conversationUrl),
+    };
+    onTransportObserved?.(evidence);
+    return {
+      ...evidence,
       appBinding,
     };
   }
@@ -2035,7 +2134,13 @@ export class MacWebChatCarrierAdapter implements ChatSwarmManagedCarrierAdapter 
     projectUrl: string;
     deadlineAt: string;
   }): Promise<ManagedConversationEvidence> {
-    return this.driver.createManagedConversation(input.projectUrl, input.deadlineAt);
+    return this.driver.createManagedConversation(
+      input.projectUrl,
+      input.deadlineAt,
+      (evidence) => {
+        this.registry.markTransportObserved(input.operationId, evidence);
+      },
+    );
   }
 
   async bootstrap(input: {
@@ -2167,6 +2272,7 @@ export class ChatSwarmRuntimeManager {
   readonly registry: ChatSwarmRuntimeStore;
   readonly adapter: ChatSwarmManagedCarrierAdapter;
   readonly carrierManager: ChatSwarmCarrierManager;
+  private readonly sleepFn: (ms: number) => Promise<void>;
 
   constructor(
     readonly coordinator: ChatSwarmCoordinator,
@@ -2175,12 +2281,14 @@ export class ChatSwarmRuntimeManager {
       env?: NodeJS.ProcessEnv;
       adapter?: ChatSwarmManagedCarrierAdapter;
       registry?: ChatSwarmRuntimeStore;
+      sleep?: (ms: number) => Promise<void>;
     } = {},
   ) {
     this.runtimeConfig = loadChatSwarmRuntimeConfig(serverConfig, options.env);
     this.registry = options.registry ?? new ChatSwarmRuntimeStore(this.runtimeConfig.stateDir);
     this.adapter =
       options.adapter ?? new MacWebChatCarrierAdapter(this.runtimeConfig, this.registry);
+    this.sleepFn = options.sleep ?? ((ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms)));
     this.carrierManager = new ChatSwarmCarrierManager(
       coordinator.store,
       coordinator,
@@ -2259,6 +2367,7 @@ export class ChatSwarmRuntimeManager {
 
     const projectUrl = this.runtimeConfig.projectUrl!;
     const browserProfileId = profileId(this.runtimeConfig.browserProfileDir);
+    let createdCarriersThisEnsure = 0;
     for (let runtimeSlot = 1; runtimeSlot <= desiredWorkers; runtimeSlot += 1) {
       let slot = this.registry.ensureSlot(
         swarmId,
@@ -2305,6 +2414,9 @@ export class ChatSwarmRuntimeManager {
       }
 
       if (operation.status === "started" && !operation.receipt?.conversationUrl) {
+        if (createdCarriersThisEnsure > 0 && this.runtimeConfig.provisionStaggerMs > 0) {
+          await this.sleepFn(this.runtimeConfig.provisionStaggerMs);
+        }
         let evidence: ManagedConversationEvidence;
         try {
           evidence = await this.adapter.provision({
@@ -2325,6 +2437,7 @@ export class ChatSwarmRuntimeManager {
         }
         slot = this.registry.markCarrierCreated(operation.operationId, evidence);
         operation = this.registry.getProvision(operation.operationId)!;
+        createdCarriersThisEnsure += 1;
       }
 
       if (slot.state === "SETUP_REQUIRED" || !slot.conversationUrl) continue;
