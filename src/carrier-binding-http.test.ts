@@ -13,6 +13,7 @@ import { loadConfig } from "./config.js";
 import { createServer } from "./server.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
 import { CarrierBindingStore, type CarrierContract } from "./carrier-binding.js";
+import { CutoverStateStore } from "./cutover-state.js";
 import { openDatabase } from "./db/client.js";
 
 function data(result: Awaited<ReturnType<Client["callTool"]>>): Record<string,any> {
@@ -273,5 +274,169 @@ test("real HTTP clients sharing OAuth pair independently, delegate, resume, exec
     await new Promise<void>((resolve,reject)=>listener.close(error=>error?reject(error):resolve()));
     database.close();localOwner.close();provider.close();
     rmSync(root,{recursive:true,force:true});
+  }
+});
+
+test("approved cutover credential survives fresh MCP sessions for prepare and start", async () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "carrier-cutover-credential-")));
+  const stateDir = join(root, "state");
+  const identityPath = join(root, "build-identity.json");
+  const sourceCommit = "a".repeat(40);
+  const buildId = "devspace-g3-cutover-fixture";
+  const capabilityManifestSha256 = "b".repeat(64);
+  writeFileSync(identityPath, JSON.stringify({
+    package_name: "@waishnav/devspace",
+    package_version: "test",
+    source_commit: sourceCommit,
+    source_dirty: false,
+    build_id: buildId,
+    build_manifest_sha256: capabilityManifestSha256,
+    built_at: new Date().toISOString(),
+  }));
+  const previousIdentityPath = process.env.DEVSPACE_BUILD_IDENTITY_PATH;
+  process.env.DEVSPACE_BUILD_IDENTITY_PATH = identityPath;
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, "config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_WORKTREE_ROOT: join(root, "worktrees"),
+    DEVSPACE_SUBAGENTS: "false",
+    DEVSPACE_PUBLIC_BASE_URL: "http://127.0.0.1:1",
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  const provider = new SingleUserOAuthProvider(config.oauth, new URL("/mcp", config.publicBaseUrl), stateDir);
+  const oauthClient = await provider.clientsStore.registerClient!({
+    redirect_uris: ["http://localhost/callback"],
+    client_name: "cutover credential fixture",
+    token_endpoint_auth_method: "none",
+  });
+  let redirect = "";
+  await provider.authorize(
+    oauthClient,
+    {
+      redirectUri: "http://localhost/callback",
+      codeChallenge: "fixture",
+      scopes: config.oauth.scopes,
+      resource: new URL("/mcp", config.publicBaseUrl),
+    },
+    {
+      req: { method: "POST", body: { owner_token: config.oauth.ownerToken } },
+      redirect: (_status: number, url: string) => { redirect = url; },
+    } as never,
+  );
+  const tokens = await provider.exchangeAuthorizationCode(oauthClient, new URL(redirect).searchParams.get("code")!);
+  const running = createServer(config);
+  const localOwner = new CarrierBindingStore(stateDir);
+  const database = openDatabase(stateDir);
+  const snapshot = () => JSON.stringify({
+    effects: database.sqlite.prepare("select * from carrier_effect_bindings order by operation_id").all(),
+    leases: database.sqlite.prepare("select * from control_plane_resource_leases order by lease_id").all(),
+    operations: database.sqlite.prepare("select * from durable_operations order by operation_id").all(),
+    cutover: new CutoverStateStore(stateDir).get(),
+  });
+  const listener = running.app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve, reject) => {
+    listener.once("listening", () => resolve());
+    listener.once("error", reject);
+  });
+  const url = new URL(`http://127.0.0.1:${(listener.address() as { port: number }).port}/mcp`);
+  const clients: Client[] = [];
+  const connect = async (name: string) => {
+    const client = new Client({ name, version: "1" });
+    clients.push(client);
+    await client.connect(new StreamableHTTPClientTransport(url, {
+      requestInit: { headers: { Authorization: `Bearer ${tokens.access_token}` } },
+    }));
+    return client;
+  };
+  try {
+    const resumedSession = await connect("cutover-resume-session");
+    const pending = data(await resumedSession.callTool({ name: "coordination_pair", arguments: {} }));
+    const status = data(await resumedSession.callTool({ name: "cutover_status", arguments: {} })).status;
+    const currentIdentity = status.currentServerIdentity;
+    const expiry = new Date(Date.now() + 120_000).toISOString();
+    const expectedIdentity = {
+      sourceCommit: "c".repeat(40),
+      buildId: "target-g3-build",
+      capabilityManifestSha256: "d".repeat(64),
+    };
+    const args = {
+      attemptKey: "g3-fresh-session-cutover",
+      expectedSourceCommit: expectedIdentity.sourceCommit,
+      expectedBuildId: expectedIdentity.buildId,
+      expectedCapabilityManifestSha256: expectedIdentity.capabilityManifestSha256,
+      expiresAt: expiry,
+    };
+    const contract: CarrierContract = {
+      repository: "James3014/devspace",
+      goal: "issue163-g3",
+      role: "controller",
+      scope: [stateDir],
+      baseRevision: currentIdentity.sourceCommit,
+      operations: ["cutover_start"],
+      expiresAt: expiry,
+      cutover: {
+        stateRoot: stateDir,
+        attemptKey: args.attemptKey,
+        currentIdentity,
+        expectedIdentity,
+        expiresAt: expiry,
+        restart: {
+          buildReady: { verifiedBy: "fixture", verifiedAt: new Date().toISOString(), evidence: "isolated HTTP regression" },
+          actuator: "launchd-self",
+          serviceLabel: "isolated-test",
+          launchdTarget: "gui/501/isolated-test",
+        },
+        finish: { workspaceId: "ws_fixture", agentId: "agt_fixture" },
+      },
+    };
+    localOwner.approveLocal(pending.pendingId, contract);
+    const resumed = await resumedSession.callTool({ name: "coordination_resume", arguments: { credential: pending.credential } });
+    assert.equal(resumed.isError, undefined, JSON.stringify(resumed));
+    assert.equal(JSON.stringify(resumed).includes(pending.credential), false);
+
+    const wrongSession = await connect("cutover-wrong-credential");
+    const beforeWrongCredential = snapshot();
+    const wrong = await wrongSession.callTool({
+      name: "coordination_prepare_cutover",
+      arguments: { ...args, carrierCredential: "X".repeat(43) },
+    });
+    assert.equal(wrong.isError, true);
+    assert.equal(snapshot(), beforeWrongCredential);
+    assert.equal(JSON.stringify(wrong).includes(pending.credential), false);
+
+    const prepareSession = await connect("cutover-prepare-session");
+    const prepared = data(await prepareSession.callTool({
+      name: "coordination_prepare_cutover",
+      arguments: { ...args, carrierCredential: pending.credential },
+    }));
+    assert.equal(typeof prepared.subject.operationId, "string");
+    assert.equal(JSON.stringify(prepared).includes(pending.credential), false);
+
+    const startSession = await connect("cutover-start-session");
+    const started = data(await startSession.callTool({
+      name: "cutover_start",
+      arguments: { ...args, carrierCredential: pending.credential },
+    }));
+    const replayed = data(await startSession.callTool({
+      name: "cutover_start",
+      arguments: { ...args, carrierCredential: pending.credential },
+    }));
+    assert.equal(started.operationId, prepared.subject.operationId);
+    assert.equal(replayed.operationId, started.operationId);
+    assert.equal(replayed.cutover.cutoverId, started.cutover.cutoverId);
+    assert.equal(JSON.stringify([started, replayed]).includes(pending.credential), false);
+    assert.equal((database.sqlite.prepare("select count(*) as count from durable_operations where kind='cutover_start'").get() as { count: number }).count, 1);
+  } finally {
+    for (const client of clients) await client.close().catch(() => {});
+    await running.close();
+    await new Promise<void>((resolve, reject) => listener.close(error => error ? reject(error) : resolve()));
+    database.close();
+    localOwner.close();
+    provider.close();
+    if (previousIdentityPath === undefined) delete process.env.DEVSPACE_BUILD_IDENTITY_PATH;
+    else process.env.DEVSPACE_BUILD_IDENTITY_PATH = previousIdentityPath;
+    rmSync(root, { recursive: true, force: true });
   }
 });

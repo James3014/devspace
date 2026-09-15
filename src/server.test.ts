@@ -2687,7 +2687,7 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
       const handoff=structuredContent(transferred).receipt as unknown as import("./control-plane-ownership.js").HandoffReceipt;
       const readArgs={leaseId,previousVersion:handoff.previousVersion,expectedCurrentVersion:handoff.newVersion};
       const startArgs={expectedSourceCommit:"a".repeat(40),expectedBuildId:"handoff-fixture",attemptKey:"http-cutover"};
-      const missingGrant=await otherClient.callTool({name:"cutover_start",arguments:startArgs});
+      const missingGrant=await otherClient.callTool({name:"cutover_start",arguments:{...startArgs,carrierCredential:"X".repeat(43)}});
       assert.equal(missingGrant.isError,true);
       assert.equal(new CutoverStateStore(config.stateDir).get(),undefined);
       const status=structuredContent(await otherClient.callTool({name:"cutover_status",arguments:{}})).status as {currentServerIdentity:import("./cutover-state.js").CutoverServerIdentity};
