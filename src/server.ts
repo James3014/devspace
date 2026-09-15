@@ -1524,6 +1524,7 @@ function registerCutoverMcpTools(
   server: McpServer,
   control: CutoverMcpControlContext,
   durableOperations?: DurableOperationManager,
+  carrierBindings?: CarrierBindingStore,
   hostOperations?: HostOperationRegistrar,
 ): void {
   const cutoverRecordSchema = z.record(z.string(), z.unknown());
@@ -1605,6 +1606,7 @@ function registerCutoverMcpTools(
         expectedCapabilityManifestSha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
         expiresAt: z.string().optional(),
         attemptKey: z.string().min(1).optional().describe("Stable attempt identity; defaults to a digest of runtime, resolved target and expiry."),
+        carrierCredential: z.string().optional().describe("Optional approved carrier credential for this exact operation when reconnecting on a fresh MCP session."),
       },
       outputSchema: {
         cutover: cutoverRecordSchema,
@@ -1614,9 +1616,10 @@ function registerCutoverMcpTools(
       _meta: {},
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ expectedSourceCommit, expectedBuildId, expectedCapabilityManifestSha256, expiresAt, attemptKey }, extra) => {
+    async ({ expectedSourceCommit, expectedBuildId, expectedCapabilityManifestSha256, expiresAt, attemptKey, carrierCredential }, extra) => {
       const context = dependencyConsumerContext(extra);
       if (!durableOperations) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "cutover start requires trusted host coordination");
+      if (carrierCredential !== undefined && carrierBindings) carrierBindings.redeem(context, carrierCredential);
       if (expectedCapabilityManifestSha256 && control.probeBuildReady) {
         const probe = await control.probeBuildReady({
           sourceCommit: expectedSourceCommit,
@@ -2628,7 +2631,7 @@ export function createMcpServer(
     registryPath: process.env.DEVSPACE_PHYSICAL_HOST_REGISTRY,
     allowedRoots: config.allowedRoots,
   });
-  if (cutoverControl) registerCutoverMcpTools(server, cutoverControl, durableOperations);
+  if (cutoverControl) registerCutoverMcpTools(server, cutoverControl, durableOperations, carrierBindings, hostOperations);
   const controlPlaneInventory = controlPlaneInventoryOverride ?? config.controlPlaneInventory;
   if (durableOperations && chatSwarmLifecycle?.store && controlPlaneInventory?.manifestRequired === true) {
     registerControlPlaneMigrationTools(
@@ -3149,9 +3152,10 @@ export function createMcpServer(
         return result({subject:plan.subject,lease:carrierBindings.prepareEffect(context,plan.subject)});
       });
       if(cutoverControl) registerAppTool(server,"coordination_prepare_cutover",{...registration,title:"Prepare an approved cutover",description:"Bind the exact locally approved cutover request to this paired controller and the running server. Acquires the resource lease without starting or restarting. Use these same explicit inputs with cutover_start.",inputSchema:{
-        attemptKey:z.string().min(1),expectedSourceCommit:z.string().regex(/^[a-f0-9]{40}$/),expectedBuildId:z.string().min(1),expectedCapabilityManifestSha256:z.string().regex(/^[a-f0-9]{64}$/),expiresAt:z.string(),
+        attemptKey:z.string().min(1),expectedSourceCommit:z.string().regex(/^[a-f0-9]{40}$/),expectedBuildId:z.string().min(1),expectedCapabilityManifestSha256:z.string().regex(/^[a-f0-9]{64}$/),expiresAt:z.string(),carrierCredential:z.string().optional().describe("Optional approved carrier credential for this exact operation when reconnecting on a fresh MCP session."),
       }},async(args,extra)=>{
         const context=dependencyConsumerContext(extra);
+        if(args.carrierCredential !== undefined) carrierBindings.redeem(context,args.carrierCredential);
         carrierBindings.status(context);
         const plan=planCutoverStart(config.stateDir,{attemptKey:args.attemptKey,currentIdentity:cutoverControl.controller.currentIdentity,
           expectedIdentity:{sourceCommit:args.expectedSourceCommit,buildId:args.expectedBuildId,capabilityManifestSha256:args.expectedCapabilityManifestSha256},expiresAt:args.expiresAt});
