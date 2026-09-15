@@ -63,6 +63,8 @@ export interface ChatSwarmRuntimeConfig {
   maxWorkers: number;
   poolDefault: number;
   projectUrl?: string;
+  transport: "cdp" | "opencli";
+  openCliExecutable: string;
   cdpEndpoint: string;
   browserExecutable?: string;
   browserProfileDir: string;
@@ -170,7 +172,7 @@ export interface RuntimeStopRecord {
 export interface RuntimePreflight {
   ready: boolean;
   state: "READY" | "CONFIGURED_NOT_READY" | "SETUP_REQUIRED";
-  controlMechanism: "CDP";
+  controlMechanism: "CDP" | "OPENCLI";
   browserVersion?: string;
   appBinding: "READY" | "UNKNOWN" | "DISABLED" | "STALE";
   blocker?: string;
@@ -184,7 +186,7 @@ export interface RuntimeStatusResult {
   maxWorkers: number;
   adapter: {
     kind: "mac_web_chatgpt";
-    controlMechanism: "CDP";
+    controlMechanism: RuntimePreflight["controlMechanism"];
     projectConfigured: boolean;
     appBinding: RuntimePreflight["appBinding"];
     blocker?: string;
@@ -291,6 +293,11 @@ export function loadChatSwarmRuntimeConfig(
     maxWorkers,
     "DEVSPACE_CHAT_SWARM_POOL_DEFAULT",
   );
+  const transport = (env.DEVSPACE_CHAT_SWARM_TRANSPORT?.trim().toLowerCase() || "cdp");
+  if (transport !== "cdp" && transport !== "opencli") {
+    throw new Error("DEVSPACE_CHAT_SWARM_TRANSPORT must be cdp or opencli");
+  }
+  const openCliExecutable = env.DEVSPACE_CHAT_SWARM_OPENCLI_BIN?.trim() || "opencli";
   const cdpEndpoint = (
     env.DEVSPACE_CHAT_SWARM_CDP_ENDPOINT?.trim() || "http://127.0.0.1:9222"
   ).replace(/\/$/, "");
@@ -298,7 +305,7 @@ export function loadChatSwarmRuntimeConfig(
   if (!["http:", "https:"].includes(cdp.protocol)) {
     throw new Error("DEVSPACE_CHAT_SWARM_CDP_ENDPOINT must be http(s)");
   }
-  const appLabel = env.DEVSPACE_CHAT_SWARM_APP_LABEL?.trim() || "dev-c";
+  const appLabel = env.DEVSPACE_CHAT_SWARM_APP_LABEL?.trim() || "devspace";
   if (appLabel.length > 128) {
     throw new Error("DEVSPACE_CHAT_SWARM_APP_LABEL exceeds 128 characters");
   }
@@ -308,6 +315,8 @@ export function loadChatSwarmRuntimeConfig(
     maxWorkers,
     poolDefault,
     projectUrl: requireChatGptUrl(env.DEVSPACE_CHAT_SWARM_PROJECT_URL),
+    transport,
+    openCliExecutable,
     cdpEndpoint,
     browserExecutable: env.DEVSPACE_CHAT_SWARM_BROWSER_BIN?.trim() || undefined,
     browserProfileDir: resolve(
@@ -1242,6 +1251,299 @@ export class ChatSwarmRuntimeStore {
   }
 }
 
+function openCliProjectId(value: string): string {
+  const url = new URL(value);
+  if (
+    url.protocol !== "https:" ||
+    (url.hostname !== "chatgpt.com" && url.hostname !== "www.chatgpt.com")
+  ) {
+    throw new ChatSwarmError("INVALID_INPUT", "OpenCLI project must be on chatgpt.com");
+  }
+  const match = url.pathname.match(/\/g\/g-p-([^/]+)/);
+  if (!match?.[1]) {
+    throw new ChatSwarmError(
+      "IDENTITY_MISSING",
+      "ChatGPT project URL does not expose a project identity",
+    );
+  }
+  return decodeURIComponent(match[1]);
+}
+
+interface OpenCliConversationRow {
+  conversationId?: string;
+  conversationUrl?: string;
+  response?: string;
+}
+
+interface OpenCliStatusRow {
+  Status?: string;
+  Login?: string;
+  Url?: string;
+}
+
+interface OpenCliDetailRow {
+  Role?: string;
+  Text?: string;
+  Generating?: boolean;
+}
+
+export class OpenCliMacWebDriver implements MacWebDriver {
+  constructor(private readonly config: ChatSwarmRuntimeConfig) {}
+
+  async preflight(): Promise<RuntimePreflight> {
+    if (process.platform !== "darwin") {
+      return {
+        ready: false,
+        state: "CONFIGURED_NOT_READY",
+        controlMechanism: "OPENCLI",
+        appBinding: "UNKNOWN",
+        blocker: "MACOS_REQUIRED",
+      };
+    }
+    if (!this.config.projectUrl) {
+      return {
+        ready: false,
+        state: "CONFIGURED_NOT_READY",
+        controlMechanism: "OPENCLI",
+        appBinding: "UNKNOWN",
+        blocker: "PROJECT_URL_REQUIRED",
+      };
+    }
+    try {
+      const rows = await this.runJson<OpenCliStatusRow[]>(
+        ["chatgpt", "status", "--site-session", "ephemeral", "-f", "json"],
+        new Date(Date.now() + this.config.operationTimeoutMs).toISOString(),
+      );
+      const status = rows[0];
+      const ready = status?.Status === "Connected" && status?.Login === "Yes";
+      return {
+        ready,
+        state: ready ? "READY" : "CONFIGURED_NOT_READY",
+        controlMechanism: "OPENCLI",
+        appBinding: "UNKNOWN",
+        blocker: ready
+          ? undefined
+          : `OPENCLI_CHATGPT_NOT_READY:${status?.Status ?? "UNKNOWN"}:${status?.Login ?? "UNKNOWN"}`,
+      };
+    } catch (error) {
+      return {
+        ready: false,
+        state: "CONFIGURED_NOT_READY",
+        controlMechanism: "OPENCLI",
+        appBinding: "UNKNOWN",
+        blocker: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  async createManagedConversation(
+    projectUrl: string,
+    deadlineAt: string,
+  ): Promise<ManagedConversationEvidence> {
+    const rows = await this.runJson<OpenCliConversationRow[]>(
+      [
+        "chatgpt",
+        "ask",
+        "Managed DevSpace worker carrier initialization. Reply exactly READY_FOR_BOOTSTRAP. Do not call tools yet.",
+        "--project",
+        openCliProjectId(projectUrl),
+        "--new",
+        "true",
+        "--wait",
+        "false",
+        "--site-session",
+        "ephemeral",
+        "--keep-tab",
+        "false",
+        "-f",
+        "json",
+      ],
+      deadlineAt,
+    );
+    const conversationUrl = rows[0]?.conversationUrl?.trim();
+    if (!conversationUrl) {
+      throw new Error("OpenCLI did not return a ChatGPT conversation URL");
+    }
+    return {
+      conversationUrl,
+      conversationFingerprint: conversationFingerprintFromUrl(conversationUrl),
+      appBinding: "UNKNOWN",
+    };
+  }
+
+  async sendPrompt(
+    conversationUrl: string,
+    prompt: string,
+    deadlineAt: string,
+  ): Promise<{ delivered: boolean; remoteMayContinue: boolean; blocker?: string }> {
+    try {
+      await this.waitForConversationIdle(conversationUrl, deadlineAt);
+    } catch (error) {
+      return {
+        delivered: false,
+        remoteMayContinue: false,
+        blocker: error instanceof Error ? error.message : String(error),
+      };
+    }
+
+    try {
+      const rows = await this.runJson<OpenCliConversationRow[]>(
+        [
+          "chatgpt",
+          "ask",
+          prompt,
+          "--conversation",
+          conversationIdFromUrl(conversationUrl),
+          "--wait",
+          "false",
+          "--site-session",
+          "ephemeral",
+          "--keep-tab",
+          "false",
+          "-f",
+          "json",
+        ],
+        deadlineAt,
+      );
+      const observedUrl = rows[0]?.conversationUrl?.trim();
+      if (
+        !observedUrl ||
+        conversationFingerprintFromUrl(observedUrl) !==
+          conversationFingerprintFromUrl(conversationUrl)
+      ) {
+        return {
+          delivered: false,
+          remoteMayContinue: true,
+          blocker: "OPENCLI_CONVERSATION_IDENTITY_DRIFT",
+        };
+      }
+      return { delivered: true, remoteMayContinue: true };
+    } catch (error) {
+      const observed = await this.promptObserved(
+        conversationUrl,
+        prompt,
+        deadlineAt,
+      ).catch(() => false);
+      return {
+        delivered: observed,
+        remoteMayContinue: true,
+        blocker: observed
+          ? undefined
+          : error instanceof Error
+            ? error.message
+            : String(error),
+      };
+    }
+  }
+
+  async recoverConversation(
+    conversationUrl: string,
+    deadlineAt: string,
+  ): Promise<{ ready: boolean; blocker?: string }> {
+    try {
+      const rows = await this.detail(conversationUrl, deadlineAt);
+      return rows.length > 0
+        ? { ready: true }
+        : { ready: false, blocker: "OPENCLI_CONVERSATION_EMPTY" };
+    } catch (error) {
+      return {
+        ready: false,
+        blocker: error instanceof Error ? error.message : String(error),
+      };
+    }
+  }
+
+  async closeConversation(_conversationUrl: string): Promise<void> {
+    // Ephemeral OpenCLI sessions do not retain a browser-tab lease after the command.
+    // DevSpace stop still fences worker authority before reaching this transport seam.
+  }
+
+  private async waitForConversationIdle(
+    conversationUrl: string,
+    deadlineAt: string,
+  ): Promise<void> {
+    while (Date.now() < Date.parse(deadlineAt)) {
+      const rows = await this.detail(conversationUrl, deadlineAt);
+      const last = rows.at(-1);
+      if (
+        rows.length > 0 &&
+        rows.every((row) => row.Generating !== true) &&
+        last?.Role === "Assistant"
+      ) return;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
+    }
+    throw new Error("OpenCLI ChatGPT conversation did not become idle before deadline");
+  }
+
+  private async promptObserved(
+    conversationUrl: string,
+    prompt: string,
+    deadlineAt: string,
+  ): Promise<boolean> {
+    const rows = await this.detail(conversationUrl, deadlineAt);
+    return rows.some((row) => row.Role === "User" && row.Text === prompt);
+  }
+
+  private detail(
+    conversationUrl: string,
+    deadlineAt: string,
+  ): Promise<OpenCliDetailRow[]> {
+    return this.runJson<OpenCliDetailRow[]>(
+      [
+        "chatgpt",
+        "detail",
+        conversationIdFromUrl(conversationUrl),
+        "--site-session",
+        "ephemeral",
+        "-f",
+        "json",
+      ],
+      deadlineAt,
+    );
+  }
+
+  private async runJson<T>(args: string[], deadlineAt: string): Promise<T> {
+    const remaining = Math.max(1, Date.parse(deadlineAt) - Date.now());
+    return await new Promise<T>((resolvePromise, rejectPromise) => {
+      const child = spawn(this.config.openCliExecutable, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      let stdout = "";
+      let stderr = "";
+      let settled = false;
+      const finish = (callback: () => void) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        callback();
+      };
+      const timer = setTimeout(() => {
+        try { child.kill("SIGTERM"); } catch {}
+        finish(() => rejectPromise(new Error("OpenCLI command exceeded deadline")));
+      }, Math.min(remaining, this.config.operationTimeoutMs));
+      child.stdout?.on("data", (chunk) => { stdout += String(chunk); });
+      child.stderr?.on("data", (chunk) => { stderr += String(chunk); });
+      child.on("error", (error) => finish(() => rejectPromise(error)));
+      child.on("close", (code) => finish(() => {
+        if (code !== 0) {
+          const detail = (stderr.trim() || stdout.trim()).slice(0, 1200);
+          rejectPromise(new Error(`OpenCLI command failed (${code ?? "unknown"}): ${detail}`));
+          return;
+        }
+        try {
+          resolvePromise(JSON.parse(stdout.trim()) as T);
+        } catch (error) {
+          rejectPromise(
+            new Error(
+              `OpenCLI returned invalid JSON: ${error instanceof Error ? error.message : String(error)}`,
+            ),
+          );
+        }
+      }));
+    });
+  }
+}
+
 export class CdpMacWebDriver implements MacWebDriver {
   constructor(private readonly config: ChatSwarmRuntimeConfig) {}
 
@@ -1558,7 +1860,7 @@ export class CdpMacWebDriver implements MacWebDriver {
   }
 }
 
-export function conversationFingerprintFromUrl(value: string): string {
+function conversationIdFromUrl(value: string): string {
   const url = new URL(value);
   if (
     url.protocol !== "https:" ||
@@ -1576,7 +1878,11 @@ export function conversationFingerprintFromUrl(value: string): string {
       "conversation URL does not expose a bounded conversation identity",
     );
   }
-  return createHash("sha256").update(decodeURIComponent(match[1])).digest("hex");
+  return decodeURIComponent(match[1]);
+}
+
+export function conversationFingerprintFromUrl(value: string): string {
+  return createHash("sha256").update(conversationIdFromUrl(value)).digest("hex");
 }
 
 export class MacWebChatCarrierAdapter implements ChatSwarmManagedCarrierAdapter {
@@ -1586,10 +1892,14 @@ export class MacWebChatCarrierAdapter implements ChatSwarmManagedCarrierAdapter 
   constructor(
     readonly config: ChatSwarmRuntimeConfig,
     readonly registry: ChatSwarmRuntimeStore,
-    readonly driver: MacWebDriver = new CdpMacWebDriver(config),
+    readonly driver: MacWebDriver = config.transport === "opencli"
+      ? new OpenCliMacWebDriver(config)
+      : new CdpMacWebDriver(config),
   ) {
     this.configHash = canonicalHash({
-      cdpEndpoint: config.cdpEndpoint,
+      transport: config.transport,
+      openCliExecutable: config.transport === "opencli" ? config.openCliExecutable : null,
+      cdpEndpoint: config.transport === "cdp" ? config.cdpEndpoint : null,
       projectUrl: config.projectUrl ?? null,
       browserProfileId: profileId(config.browserProfileDir),
       appLabel: config.appLabel,
@@ -1627,7 +1937,7 @@ export class MacWebChatCarrierAdapter implements ChatSwarmManagedCarrierAdapter 
     deadlineAt: string;
   }) {
     const prompt =
-      `DevSpace managed worker bootstrap. Call chat_swarm_runtime_bootstrap exactly once with operationId=${input.operationId}. ` +
+      `@${this.config.appLabel} DevSpace managed worker bootstrap. Call chat_swarm_runtime_bootstrap exactly once with operationId=${input.operationId}. ` +
       "Use only the returned workerId for later chat_swarm_next/chat_swarm_submit calls. Do not copy credentials or invent authority. After bootstrap succeeds, stop and wait for a wake.";
     const sent = await this.driver.sendPrompt(
       input.conversationUrl,
@@ -1708,7 +2018,7 @@ export class MacWebChatCarrierAdapter implements ChatSwarmManagedCarrierAdapter 
       };
     }
     const prompt =
-      `DevSpace wake for logical worker ${input.workerId}. Call chat_swarm_next(workerId=${input.workerId}) exactly once. ` +
+      `@${this.config.appLabel} DevSpace wake for logical worker ${input.workerId}. Call chat_swarm_next(workerId=${input.workerId}) exactly once. ` +
       "If a task is returned, execute only that canonical task and submit with chat_swarm_submit. If no task is returned, stop. Do not retry an ambiguous external effect.";
     const sent = await this.driver.sendPrompt(
       slot.conversationUrl,
@@ -1770,7 +2080,7 @@ export class ChatSwarmRuntimeManager {
         {
           ready: false,
           state: "CONFIGURED_NOT_READY",
-          controlMechanism: "CDP",
+          controlMechanism: this.runtimeConfig.transport === "opencli" ? "OPENCLI" : "CDP",
           appBinding: "UNKNOWN",
           blocker: "DEVSPACE_CHAT_SWARM_RUNTIME_DISABLED",
         },
@@ -2211,7 +2521,7 @@ export class ChatSwarmRuntimeManager {
       maxWorkers: this.runtimeConfig.maxWorkers,
       adapter: {
         kind: "mac_web_chatgpt",
-        controlMechanism: "CDP",
+        controlMechanism: preflight.controlMechanism,
         projectConfigured: Boolean(this.runtimeConfig.projectUrl),
         appBinding: preflight.appBinding,
         blocker: preflight.blocker,

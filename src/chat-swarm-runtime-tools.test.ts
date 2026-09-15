@@ -70,6 +70,20 @@ test("runtime tool errors use MCP metadata without violating success output sche
       slots: [],
     };
     assert.equal(registered.chat_swarm_runtime_status.outputSchema.safeParse(validStatus).success, true);
+    assert.equal(
+      registered.chat_swarm_runtime_status.outputSchema.safeParse({
+        ...validStatus,
+        adapter: { ...validStatus.adapter, controlMechanism: "OPENCLI" },
+      }).success,
+      true,
+    );
+    assert.equal(
+      registered.chat_swarm_runtime_status.outputSchema.safeParse({
+        ...validStatus,
+        adapter: { ...validStatus.adapter, controlMechanism: "UNKNOWN" },
+      }).success,
+      false,
+    );
     assert.equal(registered.chat_swarm_runtime_status.outputSchema.safeParse({ ...validStatus, slots: "invalid" }).success, false);
 
     for (const [name, arguments_] of runtimeTools) {
