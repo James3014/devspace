@@ -443,3 +443,57 @@ for(const expire of [true,false]) test(`validity drift fences completion and ori
     assert.equal(f.store.prepareEffect(sender,nextPlan.subject).leaseId===lease.leaseId,!expire);
   } finally {manager?.close();f.close();}
 });
+
+test("coordination_resume supports pendingId on same session once approved and gives diagnostic error when unapproved", () => {
+  const f = fixture();
+  try {
+    const context = { clientId: "shared-oauth", sessionId: "new-session" };
+    const pairing = f.store.requestPairing(context);
+
+    // 1. Calling redeem before approval produces diagnostic error with approval command
+    assert.throws(
+      () => f.store.redeem(context, { pendingId: pairing.pendingId }),
+      (err: any) => {
+        assert.equal(err.code, "AUTHORITY_REQUIRED");
+        assert.match(err.message, /awaiting host Owner approval/);
+        assert.match(err.message, new RegExp(pairing.pendingId));
+        return true;
+      },
+    );
+
+    // Calling with credential token also gives diagnostic error
+    assert.throws(
+      () => f.store.redeem(context, pairing.credential),
+      (err: any) => {
+        assert.equal(err.code, "AUTHORITY_REQUIRED");
+        assert.match(err.message, /awaiting host Owner approval/);
+        return true;
+      },
+    );
+
+    // 2. Approve via local Owner CLI
+    const contract: CarrierContract = {
+      repository: "James3014/devspace",
+      goal: "issue156",
+      role: "controller",
+      scope: [f.workspace],
+      baseRevision: "b".repeat(40),
+      operations: ["dependency_sync"],
+      expiresAt: new Date(Date.now() + 60000).toISOString(),
+    };
+    const approved = f.store.approveLocal(pairing.pendingId, contract);
+
+    // 3. Different session cannot hijack pendingId without credential token
+    const otherSession = { clientId: "shared-oauth", sessionId: "attacker-session" };
+    assert.throws(
+      () => f.store.redeem(otherSession, { pendingId: pairing.pendingId }),
+      /verification token is required to resume from another session/,
+    );
+
+    // 4. Same session can resume using pendingId directly without exposing credential
+    const resumed = f.store.redeem(context, { pendingId: pairing.pendingId });
+    assert.equal(resumed.id, approved.id);
+  } finally {
+    f.close();
+  }
+});

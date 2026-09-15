@@ -3026,8 +3026,22 @@ export function createMcpServer(
       const contractSchema=z.object({repository:z.string(),goal:z.string(),role:z.enum(["controller","worker"]),scope:z.array(z.string()),baseRevision:z.string(),operations:z.array(z.literal("dependency_sync")),expiresAt:z.string()}).strict();
       const registration={annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:false,openWorldHint:false},_meta:{}};
       const result=(value:unknown)=>({content:[textBlock(JSON.stringify(value))]});
-      registerAppTool(server,"coordination_pair",{...registration,title:"Request a carrier pairing",description:"Request local Owner approval. Save the returned private credential for this carrier; it grants nothing until approval. Never copy it into handoff receipts or other conversations.",inputSchema:{}},async(_,extra)=>result(carrierBindings.requestPairing(dependencyConsumerContext(extra))));
-      registerAppTool(server,"coordination_resume",{...registration,title:"Resume a paired carrier",description:"Prove possession of this carrier's private credential on the current authenticated MCP session. Caller conversation metadata cannot substitute for this proof.",inputSchema:{credential:z.string()}},async({credential},extra)=>result(carrierBindings.redeem(dependencyConsumerContext(extra),credential)));
+      registerAppTool(server,"coordination_pair",{...registration,title:"Request a carrier pairing",description:"Request local Owner approval. Save the returned pendingId; once approved locally by the Owner via CLI, resume the carrier using coordination_resume with the pendingId.",inputSchema:{}},async(_,extra)=>result(carrierBindings.requestPairing(dependencyConsumerContext(extra))));
+      registerAppTool(server,"coordination_resume",{...registration,title:"Resume a paired carrier",description:"Resume a paired carrier on the current authenticated MCP session using the pendingId once approved by the host Owner, or verification token.",inputSchema:{pendingId:z.string().optional().describe("The pendingId returned from coordination_pair once approved by the Owner"),token:z.string().optional().describe("Optional pairing verification token"),credential:z.string().optional().describe("Legacy pairing verification token")}},async(args,extra)=>{
+        try {
+          const res = carrierBindings.redeem(dependencyConsumerContext(extra), args);
+          return result(res);
+        } catch (error) {
+          if (error instanceof ControlPlaneOwnershipError) {
+            return {
+              content: [textBlock(`${error.code}: ${error.message}`)],
+              isError: true,
+              structuredContent: { code: error.code, message: error.message },
+            };
+          }
+          throw error;
+        }
+      });
       registerAppTool(server,"coordination_carrier_status",{...registration,annotations:{...registration.annotations,readOnlyHint:true},title:"Read paired carrier",description:"Read current bounded authority, including parent revocation. Contains no credential.",inputSchema:{}},async(_,extra)=>result(carrierBindings.status(dependencyConsumerContext(extra))));
       registerAppTool(server,"coordination_lease_read",{...registration,annotations:{...registration.annotations,readOnlyHint:true},title:"Read an owned resource lease",description:"Read the exact owned lease version, expiry and operation pin. Does not renew or release it.",inputSchema:{leaseId:z.string()}},async({leaseId},extra)=>result(carrierBindings.readLease(dependencyConsumerContext(extra),leaseId)));
       registerAppTool(server,"coordination_lease_release",{...registration,title:"Release an unpinned owned lease",description:"Explicitly release an owned lease by exact version. Active or unknown operation pins must be reconciled first.",inputSchema:{leaseId:z.string(),expectedVersion:z.number().int().positive()}},async({leaseId,expectedVersion},extra)=>result(carrierBindings.releaseLease(dependencyConsumerContext(extra),leaseId,expectedVersion)));
