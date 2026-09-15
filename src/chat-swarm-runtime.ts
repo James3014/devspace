@@ -224,6 +224,7 @@ export interface ChatSwarmManagedCarrierAdapter extends ChatSwarmCarrierAdapter 
   }): Promise<{
     disposition: "DELIVERED" | "UNKNOWN" | "SETUP_REQUIRED";
     remoteMayContinue: boolean;
+    blocker?: string;
   }>;
   recover(slot: ManagedCarrierSlot): Promise<{ ready: boolean; blocker?: string }>;
   stop(slot: ManagedCarrierSlot): Promise<void>;
@@ -1464,15 +1465,13 @@ export class OpenCliMacWebDriver implements MacWebDriver {
     }
 
     try {
-      const rows = await this.runJson<OpenCliConversationRow[]>(
+      const rows = await this.runJson<Array<{ Status?: string; InjectedText?: string }>>(
         [
           "chatgpt",
-          "ask",
+          "send",
           prompt,
           "--conversation",
           conversationIdFromUrl(conversationUrl),
-          "--wait",
-          "false",
           "--site-session",
           "ephemeral",
           "--keep-tab",
@@ -1482,19 +1481,20 @@ export class OpenCliMacWebDriver implements MacWebDriver {
         ],
         deadlineAt,
       );
-      const observedUrl = rows[0]?.conversationUrl?.trim();
-      if (
-        !observedUrl ||
-        conversationFingerprintFromUrl(observedUrl) !==
-          conversationFingerprintFromUrl(conversationUrl)
-      ) {
-        return {
-          delivered: false,
-          remoteMayContinue: true,
-          blocker: "OPENCLI_CONVERSATION_IDENTITY_DRIFT",
-        };
-      }
-      return { delivered: true, remoteMayContinue: true };
+      const acknowledged =
+        rows[0]?.Status === "Success" && rows[0]?.InjectedText === prompt;
+      const observed = acknowledged
+        ? await this.promptObserved(conversationUrl, prompt, deadlineAt).catch(() => false)
+        : false;
+      return observed
+        ? { delivered: true, remoteMayContinue: true }
+        : {
+            delivered: false,
+            remoteMayContinue: true,
+            blocker: acknowledged
+              ? "OPENCLI_PROMPT_NOT_OBSERVED"
+              : "OPENCLI_SEND_NOT_ACKNOWLEDGED",
+          };
     } catch (error) {
       const observed = await this.promptObserved(
         conversationUrl,
@@ -2061,6 +2061,7 @@ export class MacWebChatCarrierAdapter implements ChatSwarmManagedCarrierAdapter 
           ? ("SETUP_REQUIRED" as const)
           : ("UNKNOWN" as const),
         remoteMayContinue: sent.remoteMayContinue,
+        blocker: sent.blocker,
       };
     }
     return { disposition: "DELIVERED" as const, remoteMayContinue: true };
@@ -2369,7 +2370,7 @@ export class ChatSwarmRuntimeManager {
             operation.operationId,
             delivered.disposition === "SETUP_REQUIRED"
               ? "HOST_APP_BINDING_SETUP_REQUIRED"
-              : "BOOTSTRAP_DELIVERY_UNKNOWN",
+              : delivered.blocker ?? "BOOTSTRAP_DELIVERY_UNKNOWN",
           );
         }
         continue;
