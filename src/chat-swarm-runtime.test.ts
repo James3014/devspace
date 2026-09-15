@@ -417,7 +417,7 @@ test("concurrent runtime ensure creates only missing managed workers and exact r
 });
 
 test("provision lease covers the bounded provision, bootstrap delivery, and acknowledgement lifecycle", async () => {
-  const f = fixture(1, {
+  const f = fixture(3, {
     operationTimeoutMs: 1_000,
     bootstrapWaitMs: 1_000,
     bootstrapDelayMs: 1_100,
@@ -437,7 +437,7 @@ test("provision lease covers the bounded provision, bootstrap delivery, and ackn
 });
 
 test("managed bootstrap still rejects a provision after its bounded lifecycle lease expires", async () => {
-  const f = fixture(1);
+  const f = fixture(3);
   try {
     const slot = f.registry.ensureSlot(
       f.swarm.id,
