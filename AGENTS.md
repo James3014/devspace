@@ -1,5 +1,14 @@
 # DevSpace
 
+## RepoLearn activation
+
+- RepoLearn: `ENABLED`.
+- Canonical source: `James3014/repo-learning`.
+- Capability: `repo-learning`.
+- Mode: `guided`.
+- If RepoLearn or its learning-state backend is unavailable, continue normal engineering without weakening this repository's authority or verification requirements.
+- This pointer activates/references canonical RepoLearn only; it does not redefine trigger, assessment, mastery, persistence, or cue-fading policy.
+
 DevSpace is a local development execution layer for MCP hosts such as ChatGPT and Claude. It gives a remote host workspace-scoped tools for reading, editing, searching, running commands, managing Git worktrees, reviewing changes, and coordinating bounded subagents on the user's machine.
 
 Pi's SDK currently provides mature local coding primitives. DevSpace wraps those primitives in a Streamable HTTP MCP server and adds the product-specific boundaries around them: approved roots, workspace state, instructions, process sessions, worktrees, artifacts, review checkpoints, widgets, and subagent execution.
