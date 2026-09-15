@@ -7,6 +7,7 @@ import test from "node:test";
 import {
   CdpMacWebDriver,
   OpenCliMacWebDriver,
+  MacWebChatCarrierAdapter,
   ChatSwarmRuntimeManager,
   ChatSwarmRuntimeStore,
   loadChatSwarmRuntimeConfig,
@@ -139,7 +140,13 @@ class FakeManagedAdapter implements ChatSwarmManagedCarrierAdapter {
   }
 }
 
-function fixture(workerLimit = 5) {
+function fixture(
+  workerLimit = 5,
+  options: {
+    provisionStaggerMs?: number;
+    sleep?: (ms: number) => Promise<void>;
+  } = {},
+) {
   const root = mkdtempSync(join(tmpdir(), "devspace-runtime-117-"));
   const store = new ChatSwarmStore(root);
   const coordinator = new ChatSwarmCoordinator(store);
@@ -153,11 +160,12 @@ function fixture(workerLimit = 5) {
     DEVSPACE_CHAT_SWARM_POOL_DEFAULT: "3",
     DEVSPACE_CHAT_SWARM_RUNTIME_TIMEOUT_MS: "5000",
     DEVSPACE_CHAT_SWARM_BOOTSTRAP_WAIT_MS: "5000",
+    DEVSPACE_CHAT_SWARM_PROVISION_STAGGER_MS: String(options.provisionStaggerMs ?? 0),
   };
   const manager = new ChatSwarmRuntimeManager(
     coordinator,
     { stateDir: root, chatSwarmMaxWorkers: workerLimit },
-    { env, registry, adapter },
+    { env, registry, adapter, sleep: options.sleep },
   );
   adapter.onBootstrap = (operationId, rawIdentity) => {
     manager.bootstrap({ "openai/session": rawIdentity }, operationId);
@@ -185,6 +193,7 @@ function cdpDriverForSelectorTest() {
     appLabel: "dev",
     operationTimeoutMs: 5_000,
     bootstrapWaitMs: 5_000,
+    provisionStaggerMs: 0,
   });
 }
 
@@ -236,6 +245,7 @@ function openCliDriverForTest() {
     appLabel: "dev",
     operationTimeoutMs: 5_000,
     bootstrapWaitMs: 5_000,
+    provisionStaggerMs: 0,
   });
 }
 
@@ -248,6 +258,7 @@ test("runtime config selects OpenCLI explicitly while preserving CDP as the defa
   assert.equal(opencli.transport, "opencli");
   assert.equal(opencli.openCliExecutable, "/Users/test/.npm-global/bin/opencli");
   assert.equal(opencli.appLabel, "dev");
+  assert.equal(opencli.provisionStaggerMs, 8_000);
   const fallback = loadChatSwarmRuntimeConfig(base, {});
   assert.equal(fallback.transport, "cdp");
 });
@@ -321,6 +332,114 @@ test("OpenCLI provisioning fails closed when the authenticated peer probe is mal
     ),
     /peer identity probe did not return a valid fingerprint/,
   );
+});
+
+test("OpenCLI provisioning durably records the exact conversation before peer probe completion", async () => {
+  const f = fixture();
+  try {
+    const driver = openCliDriverForTest();
+    (driver as any).runJson = async (args: string[]) => {
+      if (args[1] === "detail") {
+        throw new Error("OpenCLI command exceeded deadline");
+      }
+      return [{
+        conversationId: "opencli-managed-partial",
+        conversationUrl: "https://chatgpt.com/g/g-p-runtime-test/c/opencli-managed-partial",
+        response: "",
+      }];
+    };
+    const adapter = new MacWebChatCarrierAdapter(
+      f.manager.runtimeConfig,
+      f.registry,
+      driver,
+    );
+    const slot = f.registry.ensureSlot(
+      f.swarm.id,
+      1,
+      "https://chatgpt.com/g/g-p-runtime-test/project",
+      "1".repeat(64),
+    );
+    const prepared = f.registry.prepareProvision(slot, 5_000);
+    assert.ok(prepared.operation);
+    assert.equal(f.registry.claimProvision(prepared.operation.operationId), true);
+
+    await assert.rejects(
+      () => adapter.provision({
+        operationId: prepared.operation!.operationId,
+        swarmId: f.swarm.id,
+        runtimeSlot: 1,
+        projectUrl: "https://chatgpt.com/g/g-p-runtime-test/project",
+        deadlineAt: new Date(Date.now() + 1_000).toISOString(),
+      }),
+      /OPENCLI_PEER_PROBE_FAILED:OpenCLI command exceeded deadline/,
+    );
+
+    const observed = f.registry.getProvision(prepared.operation.operationId)!;
+    assert.equal(observed.status, "transport_observed");
+    assert.equal(observed.receipt?.disposition, "TRANSPORT_OBSERVED");
+    assert.equal(
+      observed.receipt?.conversationUrl,
+      "https://chatgpt.com/g/g-p-runtime-test/c/opencli-managed-partial",
+    );
+    assert.equal(
+      observed.receipt?.conversationFingerprint,
+      fingerprint("opencli-managed-partial"),
+    );
+
+    f.registry.markProvisionUnknown(
+      prepared.operation.operationId,
+      "OPENCLI_PEER_PROBE_FAILED:OpenCLI command exceeded deadline",
+    );
+    const reconciled = f.registry.getSlot(f.swarm.id, 1)!;
+    assert.equal(reconciled.state, "RECONCILE_REQUIRED");
+    assert.equal(
+      reconciled.conversationUrl,
+      "https://chatgpt.com/g/g-p-runtime-test/c/opencli-managed-partial",
+    );
+    assert.equal(
+      reconciled.conversationFingerprint,
+      fingerprint("opencli-managed-partial"),
+    );
+  } finally {
+    cleanup(f);
+  }
+});
+
+test("transport-observed provision state fails closed on replay without reprovision or bootstrap", async () => {
+  const f = fixture();
+  try {
+    const slot = f.registry.ensureSlot(
+      f.swarm.id,
+      1,
+      "https://chatgpt.com/g/g-p-runtime-test/project",
+      "1".repeat(64),
+    );
+    const prepared = f.registry.prepareProvision(slot, 5_000);
+    assert.ok(prepared.operation);
+    assert.equal(f.registry.claimProvision(prepared.operation.operationId), true);
+    f.registry.markTransportObserved(prepared.operation.operationId, {
+      conversationUrl: "https://chatgpt.com/g/g-p-runtime-test/c/crash-window-conversation",
+      conversationFingerprint: fingerprint("crash-window-conversation"),
+    });
+
+    const replay = await f.manager.ensure(f.owner, f.swarm.id, 1);
+    assert.equal(replay.state, "RECONCILE_REQUIRED");
+    assert.equal(replay.slots[0]?.state, "RECONCILE_REQUIRED");
+    assert.equal(
+      replay.slots[0]?.conversationUrl,
+      "https://chatgpt.com/g/g-p-runtime-test/c/crash-window-conversation",
+    );
+    assert.equal(f.adapter.provisionCalls, 0);
+    assert.equal(f.adapter.bootstrapCalls, 0);
+    const operation = f.registry.getProvision(prepared.operation.operationId)!;
+    assert.equal(operation.status, "outcome_unknown");
+    assert.equal(
+      replay.slots[0]?.blocker,
+      "TRANSPORT_IDENTITY_OBSERVED_PEER_IDENTITY_UNVERIFIED",
+    );
+  } finally {
+    cleanup(f);
+  }
 });
 
 test("OpenCLI wake reopens the exact conversation", async () => {
@@ -424,6 +543,27 @@ test("concurrent runtime ensure creates only missing managed workers and exact r
         .filter((worker) => worker.lifecycleState !== "DISABLED").length,
       3,
     );
+  } finally {
+    cleanup(f);
+  }
+});
+
+test("fresh multi-worker ensure staggers external carrier creation without delaying healthy replay", async () => {
+  const delays: number[] = [];
+  const f = fixture(5, {
+    provisionStaggerMs: 8_000,
+    sleep: async (ms) => { delays.push(ms); },
+  });
+  try {
+    const first = await f.manager.ensure(f.owner, f.swarm.id, 3);
+    assert.equal(first.slots.filter((slot) => slot.state === "PARKED").length, 3);
+    assert.deepEqual(delays, [8_000, 8_000]);
+    assert.equal(f.adapter.provisionCalls, 3);
+
+    const replay = await f.manager.ensure(f.owner, f.swarm.id, 3);
+    assert.equal(replay.slots.filter((slot) => slot.state === "PARKED").length, 3);
+    assert.deepEqual(delays, [8_000, 8_000]);
+    assert.equal(f.adapter.provisionCalls, 3);
   } finally {
     cleanup(f);
   }
