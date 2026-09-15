@@ -42,6 +42,8 @@ class FakeManagedAdapter implements ChatSwarmManagedCarrierAdapter {
   failProvision = false;
   failStop = false;
   recoverReady = true;
+  provisionDelayMs = 0;
+  bootstrapDelayMs = 0;
   onBootstrap?: (operationId: string, rawIdentity: string) => void;
   readonly rawIdentities = new Map<number, string>();
 
@@ -72,6 +74,9 @@ class FakeManagedAdapter implements ChatSwarmManagedCarrierAdapter {
     deadlineAt: string;
   }): Promise<ManagedConversationEvidence> {
     this.provisionCalls += 1;
+    if (this.provisionDelayMs > 0) {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, this.provisionDelayMs));
+    }
     if (this.failProvision) throw new Error("response lost after possible create");
     const rawIdentity = `managed-conversation-${input.runtimeSlot}`;
     this.rawIdentities.set(input.runtimeSlot, rawIdentity);
@@ -91,6 +96,9 @@ class FakeManagedAdapter implements ChatSwarmManagedCarrierAdapter {
     deadlineAt: string;
   }) {
     this.bootstrapCalls += 1;
+    if (this.bootstrapDelayMs > 0) {
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, this.bootstrapDelayMs));
+    }
     const rawIdentity = this.rawIdentities.get(input.runtimeSlot)!;
     this.onBootstrap?.(input.operationId, rawIdentity);
     return { disposition: "DELIVERED" as const, remoteMayContinue: true };
@@ -139,7 +147,10 @@ class FakeManagedAdapter implements ChatSwarmManagedCarrierAdapter {
   }
 }
 
-function fixture(workerLimit = 5) {
+function fixture(
+  workerLimit = 5,
+  timing: { operationTimeoutMs?: number; bootstrapWaitMs?: number } = {},
+) {
   const root = mkdtempSync(join(tmpdir(), "devspace-runtime-117-"));
   const store = new ChatSwarmStore(root);
   const coordinator = new ChatSwarmCoordinator(store);
@@ -151,8 +162,8 @@ function fixture(workerLimit = 5) {
     DEVSPACE_CHAT_SWARM_RUNTIME: "1",
     DEVSPACE_CHAT_SWARM_PROJECT_URL: "https://chatgpt.com/g/g-p-runtime-test/project",
     DEVSPACE_CHAT_SWARM_POOL_DEFAULT: "3",
-    DEVSPACE_CHAT_SWARM_RUNTIME_TIMEOUT_MS: "5000",
-    DEVSPACE_CHAT_SWARM_BOOTSTRAP_WAIT_MS: "5000",
+    DEVSPACE_CHAT_SWARM_RUNTIME_TIMEOUT_MS: String(timing.operationTimeoutMs ?? 5_000),
+    DEVSPACE_CHAT_SWARM_BOOTSTRAP_WAIT_MS: String(timing.bootstrapWaitMs ?? 5_000),
   };
   const manager = new ChatSwarmRuntimeManager(
     coordinator,
@@ -398,6 +409,26 @@ test("concurrent runtime ensure creates only missing managed workers and exact r
         .listWorkers(f.swarm.id)
         .filter((worker) => worker.lifecycleState !== "DISABLED").length,
       3,
+    );
+  } finally {
+    cleanup(f);
+  }
+});
+
+test("bootstrap authority lease covers sequential bounded provisioning phases", async () => {
+  const f = fixture(1, { operationTimeoutMs: 1_000, bootstrapWaitMs: 1_000 });
+  f.adapter.provisionDelayMs = 800;
+  f.adapter.bootstrapDelayMs = 300;
+  try {
+    const status = await f.manager.ensure(f.owner, f.swarm.id, 1);
+    assert.equal(status.slots[0]?.state, "PARKED");
+    assert.equal(f.adapter.provisionCalls, 1);
+    assert.equal(f.adapter.bootstrapCalls, 1);
+    assert.equal(
+      f.coordinator.store
+        .listWorkers(f.swarm.id)
+        .filter((worker) => worker.lifecycleState !== "DISABLED").length,
+      1,
     );
   } finally {
     cleanup(f);
