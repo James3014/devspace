@@ -352,6 +352,9 @@ function nowIso(): string { return new Date().toISOString(); }
 function profileId(path: string): string {
   return createHash("sha256").update(resolve(path)).digest("hex");
 }
+function runtimeProvisionLeaseMs(config: ChatSwarmRuntimeConfig): number {
+  return config.operationTimeoutMs * 2 + config.bootstrapWaitMs;
+}
 function slotAttemptKey(swarmId: string, runtimeSlot: number): string {
   return `chat-swarm-runtime-slot:${swarmId}:${runtimeSlot}`;
 }
@@ -2278,7 +2281,7 @@ export class ChatSwarmRuntimeManager {
 
       const prepared = this.registry.prepareProvision(
         slot,
-        this.runtimeConfig.operationTimeoutMs,
+        runtimeProvisionLeaseMs(this.runtimeConfig),
       );
       slot = prepared.slot;
       if (!prepared.operation) continue;

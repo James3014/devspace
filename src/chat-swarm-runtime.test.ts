@@ -379,6 +379,31 @@ test("OpenCLI wake fails closed when the returned conversation identity drifts",
   });
 });
 
+test("runtime provision lease spans all bounded provisioning phases", async () => {
+  const f = fixture();
+  try {
+    let observedLeaseMs = 0;
+    f.adapter.onBootstrap = (operationId, rawIdentity) => {
+      const operation = f.registry.getProvision(operationId);
+      assert.ok(operation);
+      observedLeaseMs =
+        Date.parse(operation.request.expiresAt) -
+        Date.parse(operation.request.requestedAt);
+      f.manager.bootstrap({ "openai/session": rawIdentity }, operationId);
+    };
+
+    const status = await f.manager.ensure(f.owner, f.swarm.id, 1);
+    assert.equal(
+      observedLeaseMs,
+      f.manager.runtimeConfig.operationTimeoutMs * 2 +
+        f.manager.runtimeConfig.bootstrapWaitMs,
+    );
+    assert.equal(status.slots[0]?.state, "PARKED");
+  } finally {
+    cleanup(f);
+  }
+});
+
 test("concurrent runtime ensure creates only missing managed workers and exact replay creates no duplicates", async () => {
   const f = fixture();
   try {
