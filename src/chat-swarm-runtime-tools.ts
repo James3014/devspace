@@ -25,6 +25,7 @@ const slotSchema = z.object({
   workerId: id.optional(),
   conversationUrl: z.string().optional(),
   conversationFingerprint: sha.optional(),
+  authenticatedPeerFingerprint: sha.optional(),
   continuationEpoch: z.number().int().nonnegative().optional(),
   lastOperationId: id.optional(),
   blocker: z.string().optional(),

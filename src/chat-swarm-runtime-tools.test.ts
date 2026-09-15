@@ -74,6 +74,21 @@ test("runtime tool errors use MCP metadata without violating success output sche
       registered.chat_swarm_runtime_status.outputSchema.safeParse({
         ...validStatus,
         adapter: { ...validStatus.adapter, controlMechanism: "OPENCLI" },
+        slots: [{
+          managedCarrierId: "managed-1",
+          swarmId: "swarm-1",
+          runtimeSlot: 1,
+          generation: 1,
+          state: "PARKED",
+          projectUrl: "https://chatgpt.com/g/g-p-runtime-test/project",
+          browserProfileId: "b".repeat(64),
+          workerId: "worker-1",
+          conversationUrl: "https://chatgpt.com/c/conversation-1",
+          conversationFingerprint: "c".repeat(64),
+          authenticatedPeerFingerprint: "d".repeat(64),
+          continuationEpoch: 0,
+          updatedAt: new Date().toISOString(),
+        }],
       }).success,
       true,
     );
