@@ -309,7 +309,7 @@ export function loadChatSwarmRuntimeConfig(
   if (!["http:", "https:"].includes(cdp.protocol)) {
     throw new Error("DEVSPACE_CHAT_SWARM_CDP_ENDPOINT must be http(s)");
   }
-  const appLabel = env.DEVSPACE_CHAT_SWARM_APP_LABEL?.trim() || "devspace";
+  const appLabel = env.DEVSPACE_CHAT_SWARM_APP_LABEL?.trim() || "dev";
   if (appLabel.length > 128) {
     throw new Error("DEVSPACE_CHAT_SWARM_APP_LABEL exceeds 128 characters");
   }
@@ -1563,9 +1563,8 @@ export class OpenCliMacWebDriver implements MacWebDriver {
 
   private peerIdentityProbePrompt(): string {
     return (
-      `@${this.config.appLabel} Call chat_swarm_peer_status with no swarmId exactly once. ` +
-      "Then reply exactly DEVSPACE_PEER_FINGERPRINT=<the exact 64-hex identity.fingerprint from the tool result>. " +
-      "Do not call any other tool."
+      `@${this.config.appLabel} Call chat_swarm_peer_status exactly once with no swarmId. ` +
+      "Reply only DEVSPACE_PEER_FINGERPRINT=<identity.fingerprint>."
     );
   }
 
@@ -2048,8 +2047,8 @@ export class MacWebChatCarrierAdapter implements ChatSwarmManagedCarrierAdapter 
     deadlineAt: string;
   }) {
     const prompt =
-      `@${this.config.appLabel} DevSpace managed worker bootstrap. Call chat_swarm_runtime_bootstrap exactly once with operationId=${input.operationId}. ` +
-      "Use only the returned workerId for later chat_swarm_next/chat_swarm_submit calls. Do not copy credentials or invent authority. After bootstrap succeeds, stop and wait for a wake.";
+      `@${this.config.appLabel} Call chat_swarm_runtime_bootstrap exactly once with operationId=${input.operationId}. ` +
+      "Stop after the tool returns.";
     const sent = await this.driver.sendPrompt(
       input.conversationUrl,
       prompt,
@@ -2141,8 +2140,8 @@ export class MacWebChatCarrierAdapter implements ChatSwarmManagedCarrierAdapter 
       };
     }
     const prompt =
-      `@${this.config.appLabel} DevSpace wake for logical worker ${input.workerId}. Call chat_swarm_next(workerId=${input.workerId}) exactly once. ` +
-      "If a task is returned, execute only that canonical task and submit with chat_swarm_submit. If no task is returned, stop. Do not retry an ambiguous external effect.";
+      `@${this.config.appLabel} Call chat_swarm_next exactly once with workerId=${input.workerId}. ` +
+      "If it returns a task, complete only that task and call chat_swarm_submit exactly once with the returned taskId and this workerId. If it returns no task, stop.";
     const sent = await this.driver.sendPrompt(
       slot.conversationUrl,
       prompt,
@@ -2288,7 +2287,7 @@ export class ChatSwarmRuntimeManager {
       let operation = prepared.operation;
 
       if (operation.status === "outcome_unknown" || slot.state === "RECONCILE_REQUIRED") {
-        continue;
+        break;
       }
       if (operation.status === "succeeded") {
         continue;
@@ -2322,7 +2321,7 @@ export class ChatSwarmRuntimeManager {
             operation.operationId,
             error instanceof Error ? error.message : String(error),
           );
-          continue;
+          break;
         }
         slot = this.registry.markCarrierCreated(operation.operationId, evidence);
         operation = this.registry.getProvision(operation.operationId)!;
@@ -2371,6 +2370,7 @@ export class ChatSwarmRuntimeManager {
               ? "HOST_APP_BINDING_SETUP_REQUIRED"
               : "BOOTSTRAP_DELIVERY_UNKNOWN",
           );
+          break;
         }
         continue;
       }
@@ -2387,6 +2387,7 @@ export class ChatSwarmRuntimeManager {
             operation.operationId,
             error instanceof Error ? error.message : String(error),
           );
+          break;
         }
       }
     }
