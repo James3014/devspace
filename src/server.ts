@@ -24,6 +24,11 @@ import * as z from "zod/v4";
 import { applyPatch } from "./apply-patch.js";
 import { commitCandidate, pushCandidate, GitCandidateError } from "./git-candidate.js";
 import {
+  GITHUB_PR_DELIVERY_OPERATION_KIND,
+  PrDeliveryLifecycleError,
+  projectPrDeliveryLifecycle,
+} from "./pr-delivery-lifecycle.js";
+import {
   integrateCandidate,
   inspectIntegrationReadiness,
   promoteCandidate,
@@ -3247,6 +3252,34 @@ export function createMcpServer(
         const operation = durableOperations.store.getByOperationId(operationId);
         if (!operation) throw new DurableOperationError("RECONCILIATION_REQUIRED", `Unknown durable operation: ${operationId}`);
         return operationResponse(operation);
+      },
+    );
+
+    registerAppTool(
+      server,
+      "pr_delivery_lifecycle_read",
+      {
+        title: "PR delivery lifecycle projection",
+        description:
+          "Project one exact github_pr_delivery durable operation to its controller-visible G4 lifecycle state (PR_DELIVERY_PREPARED, PR_DELIVERY_IN_FLIGHT, PR_DELIVERED, PR_DELIVERY_RECONCILE_REQUIRED, or PR_DELIVERY_BLOCKED). Pure read-only projection over the existing durable operation and its G0-G3 receipt; performs no GitHub call, no reconciliation, no retry, and emits no CI or merge state.",
+        inputSchema: { operationId: z.string().min(1) },
+        _meta: {},
+        annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      },
+      async ({ operationId }) => {
+        const operation = durableOperations.store.getByOperationId(operationId);
+        if (!operation) throw new DurableOperationError("RECONCILIATION_REQUIRED", `Unknown durable operation: ${operationId}`);
+        if (operation.kind !== GITHUB_PR_DELIVERY_OPERATION_KIND) {
+          throw new PrDeliveryLifecycleError(
+            "WRONG_OPERATION_KIND",
+            `pr_delivery_lifecycle_read only projects '${GITHUB_PR_DELIVERY_OPERATION_KIND}' operations, got '${operation.kind}'.`,
+          );
+        }
+        const projection = projectPrDeliveryLifecycle(operation);
+        return {
+          content: [textBlock(JSON.stringify(projection))],
+          structuredContent: { projection: projection as unknown as Record<string, unknown> },
+        };
       },
     );
 
