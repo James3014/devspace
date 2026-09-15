@@ -323,22 +323,24 @@ test("OpenCLI provisioning fails closed when the authenticated peer probe is mal
   );
 });
 
-test("OpenCLI wake reopens the exact conversation", async () => {
+test("OpenCLI continuation uses send and confirms delivery by exact prompt readback", async () => {
   const driver = openCliDriverForTest();
   const calls: string[][] = [];
+  let sent = false;
   (driver as any).runJson = async (args: string[]) => {
     calls.push(args);
     if (args[1] === "detail") {
       return [
         { Role: "User", Text: "init", Generating: false },
         { Role: "Assistant", Text: "READY_FOR_BOOTSTRAP", Generating: false },
+        ...(sent ? [{ Role: "User", Text: "@devspace wake", Generating: false }] : []),
       ];
     }
-    return [{
-      conversationId: "opencli-managed-02",
-      conversationUrl: "https://chatgpt.com/g/g-p-runtime-test/c/opencli-managed-02",
-      response: "",
-    }];
+    if (args[1] === "send") {
+      sent = true;
+      return [{ Status: "Success", InjectedText: "@devspace wake" }];
+    }
+    throw new Error(`unexpected OpenCLI command: ${args[1]}`);
   };
   const result = await driver.sendPrompt(
     "https://chatgpt.com/g/g-p-runtime-test/c/opencli-managed-02",
@@ -346,13 +348,13 @@ test("OpenCLI wake reopens the exact conversation", async () => {
     new Date(Date.now() + 1_000).toISOString(),
   );
   assert.deepEqual(result, { delivered: true, remoteMayContinue: true });
-  const ask = calls.find((args) => args[1] === "ask")!;
-  assert.equal(ask[ask.indexOf("--conversation") + 1], "opencli-managed-02");
-  assert.equal(ask[ask.indexOf("--wait") + 1], "false");
-  assert.equal(ask[ask.indexOf("--site-session") + 1], "ephemeral");
+  const send = calls.find((args) => args[1] === "send")!;
+  assert.equal(send[send.indexOf("--conversation") + 1], "opencli-managed-02");
+  assert.equal(send.includes("--wait"), false);
+  assert.equal(send[send.indexOf("--site-session") + 1], "ephemeral");
 });
 
-test("OpenCLI wake fails closed when the returned conversation identity drifts", async () => {
+test("OpenCLI continuation fails closed when send acknowledgement has no prompt readback", async () => {
   const driver = openCliDriverForTest();
   (driver as any).runJson = async (args: string[]) => {
     if (args[1] === "detail") {
@@ -361,11 +363,10 @@ test("OpenCLI wake fails closed when the returned conversation identity drifts",
         { Role: "Assistant", Text: "READY_FOR_BOOTSTRAP", Generating: false },
       ];
     }
-    return [{
-      conversationId: "opencli-managed-wrong",
-      conversationUrl: "https://chatgpt.com/g/g-p-runtime-test/c/opencli-managed-wrong",
-      response: "",
-    }];
+    if (args[1] === "send") {
+      return [{ Status: "Success", InjectedText: "@devspace wake" }];
+    }
+    throw new Error(`unexpected OpenCLI command: ${args[1]}`);
   };
   const result = await driver.sendPrompt(
     "https://chatgpt.com/g/g-p-runtime-test/c/opencli-managed-02",
@@ -375,7 +376,7 @@ test("OpenCLI wake fails closed when the returned conversation identity drifts",
   assert.deepEqual(result, {
     delivered: false,
     remoteMayContinue: true,
-    blocker: "OPENCLI_CONVERSATION_IDENTITY_DRIFT",
+    blocker: "OPENCLI_PROMPT_NOT_OBSERVED",
   });
 });
 
