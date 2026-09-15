@@ -3594,6 +3594,19 @@ test("Issue #163: restart preserves durable refresh rotation and classifies toke
     assert.equal(replayAfterRestartBody.error, "invalid_grant");
     assert.equal(replayAfterRestartBody.failure_class, "invalid_refresh_token");
 
+    const scopeEscalation = await postToken({
+      grant_type: "refresh_token",
+      client_id: client.client_id,
+      refresh_token: afterRestartBody.refresh_token!,
+      resource: mcpUrl,
+      scope: "devspace escalated",
+    });
+    assert.equal(scopeEscalation.status, 400);
+    const scopeEscalationBody = await noSecrets(scopeEscalation, [afterRestartBody.refresh_token!, ownerToken, client.client_id]);
+    assert.equal(scopeEscalationBody.error, "access_denied");
+    assert.equal(scopeEscalationBody.error_description, "Refresh token cannot grant requested scopes");
+    assert.equal(Object.hasOwn(scopeEscalationBody, "failure_class"), false);
+
     const invalidResource = await postToken({
       grant_type: "refresh_token",
       client_id: client.client_id,
@@ -3638,6 +3651,20 @@ test("Issue #163: restart preserves durable refresh rotation and classifies toke
     assert.equal(authorization.status, 302);
     const issuedCode = new URL(authorization.headers.get("location") ?? "https://invalid.invalid").searchParams.get("code");
     assert.ok(issuedCode);
+
+    const wrongVerifier = await postToken({
+      grant_type: "authorization_code",
+      client_id: client.client_id,
+      code: issuedCode,
+      code_verifier: "issue-163-wrong-verifier",
+      redirect_uri: redirectUri,
+      resource: mcpUrl,
+    });
+    assert.equal(wrongVerifier.status, 400);
+    const wrongVerifierBody = await noSecrets(wrongVerifier, [issuedCode, ownerToken, client.client_id]);
+    assert.equal(wrongVerifierBody.error, "invalid_grant");
+    assert.equal(wrongVerifierBody.error_description, "code_verifier does not match the challenge");
+    assert.equal(Object.hasOwn(wrongVerifierBody, "failure_class"), false);
 
     const invalidRedirect = await postToken({
       grant_type: "authorization_code",

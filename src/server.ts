@@ -568,62 +568,43 @@ function isOAuthTokenFailureClass(value: unknown): value is OAuthTokenFailureCla
   return typeof value === "string" && Object.values(OAUTH_TOKEN_FAILURE_CLASSES).includes(value as OAuthTokenFailureClass);
 }
 
-function classifyOAuthTokenFailure(req: Request, body: Record<string, unknown>): OAuthTokenFailureClass | undefined {
+function classifyOAuthTokenFailure(body: Record<string, unknown>): OAuthTokenFailureClass | undefined {
   if (isOAuthTokenFailureClass(body.failure_class)) return body.failure_class;
   if (body.error === "invalid_request") return OAUTH_TOKEN_FAILURE_CLASSES.REQUEST_SHAPE_VALIDATION;
-  if (body.error !== "invalid_grant") return undefined;
-
-  const grantType = typeof req.body?.grant_type === "string" ? req.body.grant_type : undefined;
-  if (grantType === "refresh_token") return OAUTH_TOKEN_FAILURE_CLASSES.INVALID_REFRESH_TOKEN;
-  if (grantType === "authorization_code") return OAUTH_TOKEN_FAILURE_CLASSES.INVALID_AUTHORIZATION_CODE;
   return undefined;
 }
 
-function redactOAuthTokenResponse(
-  req: Request,
-  body: unknown,
-): Record<string, unknown> | unknown {
+function classifyOAuthTokenResponse(body: unknown): Record<string, unknown> | unknown {
   if (!body || typeof body !== "object" || Array.isArray(body)) return body;
   const response = body as Record<string, unknown>;
   if (typeof response.error !== "string") return body;
 
-  const failureClass = classifyOAuthTokenFailure(req, response);
-  const description = failureClass === OAUTH_TOKEN_FAILURE_CLASSES.REQUEST_SHAPE_VALIDATION
-    ? "Token request validation failed."
-    : failureClass === OAUTH_TOKEN_FAILURE_CLASSES.INVALID_REFRESH_TOKEN
-      ? "Invalid refresh token"
-      : failureClass === OAUTH_TOKEN_FAILURE_CLASSES.INVALID_AUTHORIZATION_CODE
-        ? "Invalid authorization code"
-        : failureClass === OAUTH_TOKEN_FAILURE_CLASSES.INVALID_RESOURCE
-          ? "Invalid resource"
-          : failureClass === OAUTH_TOKEN_FAILURE_CLASSES.INVALID_REDIRECT
-            ? "redirect_uri does not match the authorization request"
-            : "OAuth token request failed.";
-
-  return {
-    error: response.error,
-    error_description: description,
-    ...(failureClass ? { failure_class: failureClass } : {}),
-  };
+  const failureClass = classifyOAuthTokenFailure(response);
+  if (failureClass) return { ...response, failure_class: failureClass };
+  if (Object.hasOwn(response, "failure_class")) {
+    const { failure_class: _unvalidatedFailureClass, ...withoutFailureClass } = response;
+    return withoutFailureClass;
+  }
+  return response;
 }
 
 function installOAuthTokenResponseSafety(config: ServerConfig) {
   return (req: Request, res: Response, next: () => void): void => {
     const json = res.json.bind(res) as (body: unknown) => Response;
     res.json = ((body: unknown) => {
-      const redacted = redactOAuthTokenResponse(req, body);
-      if (redacted && typeof redacted === "object" && !Array.isArray(redacted) && typeof (redacted as Record<string, unknown>).error === "string") {
-        const failureClass = classifyOAuthTokenFailure(req, redacted as Record<string, unknown>);
+      const classified = classifyOAuthTokenResponse(body);
+      if (classified && typeof classified === "object" && !Array.isArray(classified) && typeof (classified as Record<string, unknown>).error === "string") {
+        const failureClass = classifyOAuthTokenFailure(classified as Record<string, unknown>);
         logEvent(config.logging, "warn", "oauth_token_failure", {
           requestId: res.locals.requestId as string | undefined,
           method: req.method,
           path: "/token",
-          oauthError: (redacted as Record<string, unknown>).error,
+          oauthError: (classified as Record<string, unknown>).error,
           ...(failureClass ? { failureClass } : {}),
           ...oauthRequestLogFields(req, config),
         });
       }
-      return json(redacted);
+      return json(classified);
     }) as typeof res.json;
     next();
   };
