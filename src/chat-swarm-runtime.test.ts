@@ -161,7 +161,7 @@ function fixture(
   const env: NodeJS.ProcessEnv = {
     DEVSPACE_CHAT_SWARM_RUNTIME: "1",
     DEVSPACE_CHAT_SWARM_PROJECT_URL: "https://chatgpt.com/g/g-p-runtime-test/project",
-    DEVSPACE_CHAT_SWARM_POOL_DEFAULT: "3",
+    DEVSPACE_CHAT_SWARM_POOL_DEFAULT: String(Math.min(3, workerLimit)),
     DEVSPACE_CHAT_SWARM_RUNTIME_TIMEOUT_MS: String(timing.operationTimeoutMs ?? 5_000),
     DEVSPACE_CHAT_SWARM_BOOTSTRAP_WAIT_MS: String(timing.bootstrapWaitMs ?? 5_000),
   };
