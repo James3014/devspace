@@ -6,8 +6,10 @@ import { join } from "node:path";
 import test from "node:test";
 import {
   CdpMacWebDriver,
+  OpenCliMacWebDriver,
   ChatSwarmRuntimeManager,
   ChatSwarmRuntimeStore,
+  loadChatSwarmRuntimeConfig,
   type ChatSwarmManagedCarrierAdapter,
   type ManagedCarrierSlot,
   type ManagedConversationEvidence,
@@ -176,6 +178,8 @@ function cdpDriverForSelectorTest() {
     maxWorkers: 3,
     poolDefault: 3,
     projectUrl: "https://chatgpt.com/g/g-p-runtime-test/project",
+    transport: "cdp",
+    openCliExecutable: "opencli",
     cdpEndpoint: "http://[::1]:9222",
     browserProfileDir: "/tmp/devspace-runtime-selector-profile",
     appLabel: "devspace",
@@ -216,6 +220,121 @@ test("CDP prompt delivery targets the visible editable composer before textarea 
   assert.match(expression, /data-testid="send-button"/);
   assert.ok(expression.indexOf("const editable=") < expression.indexOf("const textarea="));
   assert.match(expression, /const el=editable\|\|textarea/);
+});
+
+function openCliDriverForTest() {
+  return new OpenCliMacWebDriver({
+    enabled: true,
+    stateDir: "/tmp/devspace-runtime-opencli-test",
+    maxWorkers: 3,
+    poolDefault: 3,
+    projectUrl: "https://chatgpt.com/g/g-p-runtime-test/project",
+    transport: "opencli",
+    openCliExecutable: "/opt/homebrew/bin/opencli",
+    cdpEndpoint: "http://127.0.0.1:9222",
+    browserProfileDir: "/tmp/devspace-runtime-opencli-profile",
+    appLabel: "devspace",
+    operationTimeoutMs: 5_000,
+    bootstrapWaitMs: 5_000,
+  });
+}
+
+test("runtime config selects OpenCLI explicitly while preserving CDP as the default fallback", () => {
+  const base = { stateDir: "/tmp/devspace-runtime-config-test", chatSwarmMaxWorkers: 3 };
+  const opencli = loadChatSwarmRuntimeConfig(base, {
+    DEVSPACE_CHAT_SWARM_TRANSPORT: "opencli",
+    DEVSPACE_CHAT_SWARM_OPENCLI_BIN: "/Users/test/.npm-global/bin/opencli",
+  });
+  assert.equal(opencli.transport, "opencli");
+  assert.equal(opencli.openCliExecutable, "/Users/test/.npm-global/bin/opencli");
+  assert.equal(opencli.appLabel, "devspace");
+  const fallback = loadChatSwarmRuntimeConfig(base, {});
+  assert.equal(fallback.transport, "cdp");
+});
+
+test("OpenCLI provisioning captures the exact project conversation before waiting for the remote turn", async () => {
+  const driver = openCliDriverForTest();
+  const calls: string[][] = [];
+  (driver as any).runJson = async (args: string[]) => {
+    calls.push(args);
+    return [{
+      conversationId: "opencli-managed-01",
+      conversationUrl: "https://chatgpt.com/g/g-p-runtime-test/c/opencli-managed-01",
+      response: "",
+    }];
+  };
+  const evidence = await driver.createManagedConversation(
+    "https://chatgpt.com/g/g-p-runtime-test/project",
+    new Date(Date.now() + 1_000).toISOString(),
+  );
+  assert.equal(
+    evidence.conversationUrl,
+    "https://chatgpt.com/g/g-p-runtime-test/c/opencli-managed-01",
+  );
+  assert.equal(evidence.conversationFingerprint, fingerprint("opencli-managed-01"));
+  assert.deepEqual(calls[0]?.slice(0, 2), ["chatgpt", "ask"]);
+  assert.equal(calls[0]?.includes("--project"), true);
+  assert.equal(calls[0]?.[calls[0]!.indexOf("--project") + 1], "runtime-test");
+  assert.equal(calls[0]?.includes("--new"), true);
+  assert.equal(calls[0]?.includes("--wait"), true);
+  assert.equal(calls[0]?.[calls[0]!.indexOf("--wait") + 1], "false");
+  assert.equal(calls[0]?.[calls[0]!.indexOf("--site-session") + 1], "ephemeral");
+});
+
+test("OpenCLI wake reopens the exact conversation", async () => {
+  const driver = openCliDriverForTest();
+  const calls: string[][] = [];
+  (driver as any).runJson = async (args: string[]) => {
+    calls.push(args);
+    if (args[1] === "detail") {
+      return [
+        { Role: "User", Text: "init", Generating: false },
+        { Role: "Assistant", Text: "READY_FOR_BOOTSTRAP", Generating: false },
+      ];
+    }
+    return [{
+      conversationId: "opencli-managed-02",
+      conversationUrl: "https://chatgpt.com/g/g-p-runtime-test/c/opencli-managed-02",
+      response: "",
+    }];
+  };
+  const result = await driver.sendPrompt(
+    "https://chatgpt.com/g/g-p-runtime-test/c/opencli-managed-02",
+    "@devspace wake",
+    new Date(Date.now() + 1_000).toISOString(),
+  );
+  assert.deepEqual(result, { delivered: true, remoteMayContinue: true });
+  const ask = calls.find((args) => args[1] === "ask")!;
+  assert.equal(ask[ask.indexOf("--conversation") + 1], "opencli-managed-02");
+  assert.equal(ask[ask.indexOf("--wait") + 1], "false");
+  assert.equal(ask[ask.indexOf("--site-session") + 1], "ephemeral");
+});
+
+test("OpenCLI wake fails closed when the returned conversation identity drifts", async () => {
+  const driver = openCliDriverForTest();
+  (driver as any).runJson = async (args: string[]) => {
+    if (args[1] === "detail") {
+      return [
+        { Role: "User", Text: "init", Generating: false },
+        { Role: "Assistant", Text: "READY_FOR_BOOTSTRAP", Generating: false },
+      ];
+    }
+    return [{
+      conversationId: "opencli-managed-wrong",
+      conversationUrl: "https://chatgpt.com/g/g-p-runtime-test/c/opencli-managed-wrong",
+      response: "",
+    }];
+  };
+  const result = await driver.sendPrompt(
+    "https://chatgpt.com/g/g-p-runtime-test/c/opencli-managed-02",
+    "@devspace wake",
+    new Date(Date.now() + 1_000).toISOString(),
+  );
+  assert.deepEqual(result, {
+    delivered: false,
+    remoteMayContinue: true,
+    blocker: "OPENCLI_CONVERSATION_IDENTITY_DRIFT",
+  });
 });
 
 test("concurrent runtime ensure creates only missing managed workers and exact replay creates no duplicates", async () => {
