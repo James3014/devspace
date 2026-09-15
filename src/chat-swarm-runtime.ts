@@ -136,6 +136,7 @@ interface ProvisionReceipt {
   conversationUrl?: string;
   conversationFingerprint?: string;
   authenticatedPeerFingerprint?: string;
+  bootstrapExpiresAt?: string;
   workerId?: string;
   remoteMayContinue: boolean;
   observedAt: string;
@@ -739,8 +740,15 @@ export class ChatSwarmRuntimeStore {
     return tx.immediate();
   }
 
-  claimBootstrap(operationId: string): boolean {
+  claimBootstrap(operationId: string, ttlMs: number): boolean {
+    if (!Number.isSafeInteger(ttlMs) || ttlMs <= 0) {
+      throw new ChatSwarmError(
+        "INVALID_STATE",
+        "bootstrap authority lease ttl must be a positive integer",
+      );
+    }
     const observedAt = nowIso();
+    const bootstrapExpiresAt = new Date(Date.parse(observedAt) + ttlMs).toISOString();
     const tx = this.database.sqlite.transaction(() => {
       const operation = this.requireProvision(operationId);
       if (operation.status !== "carrier_created") return false;
@@ -751,6 +759,7 @@ export class ChatSwarmRuntimeStore {
         conversationFingerprint: operation.receipt?.conversationFingerprint,
         authenticatedPeerFingerprint:
           operation.receipt?.authenticatedPeerFingerprint,
+        bootstrapExpiresAt,
         remoteMayContinue: true,
         observedAt,
       };
@@ -799,6 +808,7 @@ export class ChatSwarmRuntimeStore {
         conversationFingerprint: operation.receipt?.conversationFingerprint,
         authenticatedPeerFingerprint:
           operation.receipt?.authenticatedPeerFingerprint,
+        bootstrapExpiresAt: operation.receipt?.bootstrapExpiresAt,
         workerId: operation.receipt?.workerId,
         remoteMayContinue: true,
         observedAt,
@@ -873,6 +883,7 @@ export class ChatSwarmRuntimeStore {
         conversationFingerprint: operation.receipt.conversationFingerprint,
         authenticatedPeerFingerprint:
           operation.receipt.authenticatedPeerFingerprint,
+        bootstrapExpiresAt: operation.receipt.bootstrapExpiresAt,
         workerId: worker.id,
         remoteMayContinue: false,
         observedAt,
@@ -2342,7 +2353,10 @@ export class ChatSwarmRuntimeManager {
       }
 
       if (operation.status === "carrier_created") {
-        if (!this.registry.claimBootstrap(operation.operationId)) {
+        if (!this.registry.claimBootstrap(
+          operation.operationId,
+          this.runtimeConfig.operationTimeoutMs + this.runtimeConfig.bootstrapWaitMs,
+        )) {
           await this.waitForPeerInvocation(slot).catch(() => undefined);
           continue;
         }
@@ -2407,7 +2421,9 @@ export class ChatSwarmRuntimeManager {
         "runtime provision operation not found",
       );
     }
-    if (Date.parse(operation.request.expiresAt) <= Date.now()) {
+    const authorityExpiresAt =
+      operation.receipt?.bootstrapExpiresAt ?? operation.request.expiresAt;
+    if (Date.parse(authorityExpiresAt) <= Date.now()) {
       throw new ChatSwarmError(
         "REQUEST_EXPIRED",
         "runtime provision operation expired",
