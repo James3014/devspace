@@ -10,6 +10,7 @@ import test, { after, type TestContext } from "node:test";
 import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import * as z from "zod/v4";
 import { loadConfig, type ServerConfig } from "./config.js";
 import type { LocalAgentProviderAvailability } from "./local-agent-availability.js";
@@ -116,6 +117,227 @@ test("configures Express with an exact trusted proxy hop count", async () => {
     assert.equal(running.app.get("trust proxy"), 1);
   } finally {
     await running.close();
+  }
+});
+
+test("health and identity expose aggregate MCP session lifecycle metrics", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-session-metrics-http-"));
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_STATE_DIR: join(root, ".state"),
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    DEVSPACE_PUBLIC_BASE_URL: "http://127.0.0.1:0",
+    DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS: "1234",
+    DEVSPACE_MCP_SESSION_MAX_SESSIONS: "2",
+    PORT: "1",
+  });
+  const running = createServer(config);
+  const listener = running.app.listen(0, "127.0.0.1");
+  try {
+    await new Promise<void>((resolve, reject) => {
+      listener.once("listening", () => resolve());
+      listener.once("error", reject);
+    });
+    const requiredMetrics = [
+      "activeSessions",
+      "oldestAgeMs",
+      "highWaterActiveSessions",
+      "registrations",
+      "reusedRequests",
+      "idleCloses",
+      "capacityEvictions",
+      "capacityRejections",
+      "closeErrors",
+      "disposalCallbackErrors",
+      "inFlightRequestCount",
+      "sessionsWithInFlight",
+      "sessionsPendingClose",
+      "configuredMaxSessions",
+      "configuredIdleTimeoutMs",
+    ];
+    for (const path of ["healthz", "identity"]) {
+      const body = await (await fetch(`http://127.0.0.1:${(listener.address() as AddressInfo).port}/${path}`)).json() as Record<string, any>;
+      const mcp = body.mcp as Record<string, unknown>;
+      for (const metric of requiredMetrics) assert.equal(metric in mcp, true, `${path} missing ${metric}`);
+      assert.equal(mcp.activeSessions, 0);
+      assert.equal(mcp.highWaterActiveSessions, 0);
+      assert.equal(mcp.disposalCallbackErrors, 0);
+      assert.equal(mcp.configuredMaxSessions, 2);
+      assert.equal(mcp.configuredIdleTimeoutMs, 1234);
+      assert.equal("sessionId" in mcp, false);
+      assert.equal(JSON.stringify(mcp).includes("test-owner-token"), false);
+    }
+  } finally {
+    await new Promise<void>((resolve) => listener.close(() => resolve()));
+    await running.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("initialize rejects explicitly when every resident MCP session is in flight", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-session-capacity-http-"));
+  const project = join(root, "project");
+  const stateDir = join(root, ".state");
+  await mkdir(project, { recursive: true });
+  await execFileAsync("git", ["init", "--initial-branch=main"], { cwd: project });
+  await writeFile(join(project, "README.md"), "capacity test\n");
+  await execFileAsync("git", ["add", "README.md"], { cwd: project });
+  await execFileAsync("git", ["-c", "user.name=DevSpace Test", "-c", "user.email=devspace-test@example.com", "commit", "-m", "fixture"], { cwd: project });
+  const port = await new Promise<number>((resolve, reject) => {
+    const probe = createNetServer();
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address() as AddressInfo;
+      probe.close((error) => error ? reject(error) : resolve(address.port));
+    });
+    probe.once("error", reject);
+  });
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const mcpUrl = `${baseUrl}/mcp`;
+  const accessToken = "session-capacity-access-token";
+  const oauthStore = new SqliteOAuthStore(stateDir);
+  const clientsStore = new SqliteOAuthClientsStore(oauthStore, ["127.0.0.1", "localhost"]);
+  const clientRecord = clientsStore.registerClient({
+    redirect_uris: [`${baseUrl}/callback`],
+    client_name: "session-capacity-client",
+  });
+  oauthStore.saveTokenPair({
+    accessTokenHash: createHash("sha256").update(accessToken).digest("base64url"),
+    accessToken: {
+      clientId: clientRecord.client_id,
+      scopes: ["devspace"],
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      resource: mcpUrl,
+    },
+    refreshTokenHash: createHash("sha256").update("session-capacity-refresh").digest("base64url"),
+    refreshToken: {
+      clientId: clientRecord.client_id,
+      scopes: ["devspace"],
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      resource: mcpUrl,
+    },
+  });
+  oauthStore.close();
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    DEVSPACE_PUBLIC_BASE_URL: baseUrl,
+    DEVSPACE_TOOL_MODE: "codex",
+    DEVSPACE_MCP_SESSION_MAX_SESSIONS: "1",
+    DEVSPACE_MCP_SESSION_IDLE_TIMEOUT_MS: "600000",
+    PORT: String(port),
+  });
+  const running = createServer(config);
+  const httpServer = running.app.listen(port, "127.0.0.1");
+  const post = (sessionId: string | undefined, body: unknown) => fetch(mcpUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${accessToken}`,
+      "Accept": "application/json, text/event-stream",
+      ...(sessionId ? { "mcp-session-id": sessionId } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  const parseMcpResponse = async (response: globalThis.Response): Promise<Record<string, any>> => {
+    const text = await response.text();
+    const dataLine = text.split("\n").find((line) => line.startsWith("data: "));
+    return JSON.parse(dataLine ? dataLine.slice(6) : text) as Record<string, any>;
+  };
+  try {
+    await new Promise<void>((resolve) => httpServer.once("listening", () => resolve()));
+    const initialized = await post(undefined, {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "session-capacity-client", version: "1.0.0" },
+      },
+    });
+    assert.equal(initialized.status, 200);
+    const sessionId = initialized.headers.get("mcp-session-id");
+    assert.ok(sessionId);
+
+    const opened = await post(sessionId, {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        _meta: { "openai/session": "session-capacity-test" },
+        name: "open_workspace",
+        arguments: { path: project, mode: "worktree" },
+      },
+    });
+    assert.equal(opened.status, 200);
+    const openedPayload = await parseMcpResponse(opened);
+    const workspaceId = openedPayload.result?.structuredContent?.workspaceId as string | undefined;
+    assert.ok(workspaceId);
+
+    const listed = await post(sessionId, {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/list",
+      params: {},
+    });
+    assert.equal(listed.status, 200);
+
+    const slowRequest = post(sessionId, {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: {
+        _meta: { "openai/session": "session-capacity-test" },
+        name: "exec_command",
+        arguments: {
+          workspaceId,
+          cmd: `${JSON.stringify(process.execPath)} -e "setTimeout(() => process.exit(0), 1000)"`,
+          attemptKey: "session-capacity:slow",
+          yieldTimeMs: 1000,
+        },
+      },
+    });
+    let saturated = false;
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      const identity = await fetch(`${baseUrl}/identity`);
+      const identityBody = await identity.json() as { mcp?: { activeSessions?: number; inFlightRequestCount?: number } };
+      if (identityBody.mcp?.activeSessions === 1 && identityBody.mcp.inFlightRequestCount === 1) {
+        saturated = true;
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    if (!saturated) {
+      const slowFailure = await slowRequest;
+      assert.fail(`first session must be in flight before saturation request; slow status=${slowFailure.status} body=${await slowFailure.text()}`);
+    }
+
+    const rejected = await post(undefined, {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "session-capacity-client-2", version: "1.0.0" },
+      },
+    });
+    assert.equal(rejected.status, 503);
+    const rejectedPayload = await parseMcpResponse(rejected);
+    assert.equal(rejectedPayload.error?.code, -32004);
+    assert.match(String(rejectedPayload.error?.message), /capacity exhausted/i);
+    for (const path of ["identity", "healthz"]) {
+      const readback = await (await fetch(`${baseUrl}/${path}`)).json() as { mcp?: { capacityRejections?: number } };
+      assert.equal(readback.mcp?.capacityRejections, 1, `${path} must count the preflight rejection once`);
+    }
+    assert.equal((await slowRequest).status, 200);
+  } finally {
+    await new Promise<void>((resolve) => httpServer.close(() => resolve()));
+    await running.close();
+    await rm(root, { recursive: true, force: true });
   }
 });
 
@@ -3415,6 +3637,46 @@ test("Issue #159: authenticated old session can rebind after server restart thro
     const reboundPayload = await parseResponse(reboundTools);
     assert.ok(Array.isArray(reboundPayload.result?.tools));
     const reboundSessionId = reboundTools.headers.get("mcp-session-id") ?? oldSessionId!;
+
+    const originalTransportClose = StreamableHTTPServerTransport.prototype.close;
+    // Hold the first displaced transport close after removal so the second
+    // HTTP rebind can install the survivor before the loser close callback.
+    let releaseClosingTransport!: () => void;
+    let observeClosingTransport!: () => void;
+    const releaseClose = new Promise<void>((resolve) => { releaseClosingTransport = resolve; });
+    const closeStarted = new Promise<void>((resolve) => { observeClosingTransport = resolve; });
+    let blockNextClose = true;
+    StreamableHTTPServerTransport.prototype.close = async function () {
+      if (blockNextClose) {
+        blockNextClose = false;
+        observeClosingTransport();
+        await releaseClose;
+      }
+      await originalTransportClose.call(this);
+    };
+    try {
+      const firstConcurrentRebind = post(reboundSessionId, { jsonrpc: "2.0", id: 20, method: "tools/list", params: {} });
+      await closeStarted;
+      const secondConcurrentRebind = post(reboundSessionId, { jsonrpc: "2.0", id: 21, method: "tools/list", params: {} });
+      const secondConcurrentResponse = await secondConcurrentRebind;
+      assert.ok([200, 503].includes(secondConcurrentResponse.status));
+      await secondConcurrentResponse.text();
+      releaseClosingTransport();
+      const firstConcurrentResponse = await firstConcurrentRebind;
+      assert.ok([200, 503].includes(firstConcurrentResponse.status));
+      await firstConcurrentResponse.text();
+      assert.deepEqual(
+        [firstConcurrentResponse.status, secondConcurrentResponse.status].sort((a, b) => a - b),
+        [200, 503],
+      );
+    } finally {
+      StreamableHTTPServerTransport.prototype.close = originalTransportClose;
+      releaseClosingTransport();
+    }
+    const survivor = await post(reboundSessionId, { jsonrpc: "2.0", id: 22, method: "tools/list", params: {} });
+    assert.equal(survivor.status, 200);
+    const survivorPayload = await parseResponse(survivor);
+    assert.ok(Array.isArray(survivorPayload.result?.tools));
 
     const consequential = await post(reboundSessionId, {
       jsonrpc: "2.0",
