@@ -375,7 +375,7 @@ test("OpenCLI provisioning durably records the exact conversation before peer pr
     );
 
     const observed = f.registry.getProvision(prepared.operation.operationId)!;
-    assert.equal(observed.status, "started");
+    assert.equal(observed.status, "transport_observed");
     assert.equal(observed.receipt?.disposition, "TRANSPORT_OBSERVED");
     assert.equal(
       observed.receipt?.conversationUrl,
@@ -399,6 +399,43 @@ test("OpenCLI provisioning durably records the exact conversation before peer pr
     assert.equal(
       reconciled.conversationFingerprint,
       fingerprint("opencli-managed-partial"),
+    );
+  } finally {
+    cleanup(f);
+  }
+});
+
+test("transport-observed provision state fails closed on replay without reprovision or bootstrap", async () => {
+  const f = fixture();
+  try {
+    const slot = f.registry.ensureSlot(
+      f.swarm.id,
+      1,
+      "https://chatgpt.com/g/g-p-runtime-test/project",
+      "1".repeat(64),
+    );
+    const prepared = f.registry.prepareProvision(slot, 5_000);
+    assert.ok(prepared.operation);
+    assert.equal(f.registry.claimProvision(prepared.operation.operationId), true);
+    f.registry.markTransportObserved(prepared.operation.operationId, {
+      conversationUrl: "https://chatgpt.com/g/g-p-runtime-test/c/crash-window-conversation",
+      conversationFingerprint: fingerprint("crash-window-conversation"),
+    });
+
+    const replay = await f.manager.ensure(f.owner, f.swarm.id, 1);
+    assert.equal(replay.state, "RECONCILE_REQUIRED");
+    assert.equal(replay.slots[0]?.state, "RECONCILE_REQUIRED");
+    assert.equal(
+      replay.slots[0]?.conversationUrl,
+      "https://chatgpt.com/g/g-p-runtime-test/c/crash-window-conversation",
+    );
+    assert.equal(f.adapter.provisionCalls, 0);
+    assert.equal(f.adapter.bootstrapCalls, 0);
+    const operation = f.registry.getProvision(prepared.operation.operationId)!;
+    assert.equal(operation.status, "outcome_unknown");
+    assert.equal(
+      replay.slots[0]?.blocker,
+      "TRANSPORT_IDENTITY_OBSERVED_PEER_IDENTITY_UNVERIFIED",
     );
   } finally {
     cleanup(f);

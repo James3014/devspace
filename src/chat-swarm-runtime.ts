@@ -702,7 +702,7 @@ export class ChatSwarmRuntimeStore {
         remoteMayContinue: true,
         observedAt,
       };
-      this.updateProvision(operationId, "started", receipt);
+      this.updateProvision(operationId, "transport_observed", receipt);
       const slot = this.getSlot(operation.request.swarmId, operation.request.runtimeSlot)!;
       this.updateSlotReceipt(
         slot,
@@ -744,7 +744,7 @@ export class ChatSwarmRuntimeStore {
           "provision outcome is unknown; do not create another carrier",
         );
       }
-      if (operation.status !== "started") {
+      if (operation.status !== "started" && operation.status !== "transport_observed") {
         throw new ChatSwarmError("INVALID_STATE", "provision operation is not active");
       }
       const conflicting = this.getSlotByFingerprint(evidence.conversationFingerprint);
@@ -2396,6 +2396,13 @@ export class ChatSwarmRuntimeManager {
       let operation = prepared.operation;
 
       if (operation.status === "outcome_unknown" || slot.state === "RECONCILE_REQUIRED") {
+        break;
+      }
+      if (operation.status === "transport_observed") {
+        this.registry.markProvisionUnknown(
+          operation.operationId,
+          "TRANSPORT_IDENTITY_OBSERVED_PEER_IDENTITY_UNVERIFIED",
+        );
         break;
       }
       if (operation.status === "succeeded") {
