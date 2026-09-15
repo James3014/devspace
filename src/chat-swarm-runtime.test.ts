@@ -698,7 +698,7 @@ test("ensure resumes peer identity readback from a durably observed handle witho
     f.swarm.id,
     1,
     "https://chatgpt.com/g/g-p-runtime-test/project",
-    "1".repeat(64),
+    f.adapter.configHash,
   );
   const prepared = f.registry.prepareProvision(slot, 30_000);
   assert.ok(prepared.operation);
