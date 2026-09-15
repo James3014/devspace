@@ -3313,6 +3313,164 @@ test("P0-4: real server /mcp HTTP boundary permits transport reconnect during dr
   }
 });
 
+test("Issue #159: authenticated old session can rebind after server restart through tools/list", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-159-http-"));
+  const project = join(root, "project");
+  const stateDir = join(root, ".state");
+  await mkdir(project, { recursive: true });
+  const port = await new Promise<number>((resolve, reject) => {
+    const probe = createNetServer();
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address() as AddressInfo;
+      probe.close((error) => error ? reject(error) : resolve(address.port));
+    });
+    probe.once("error", reject);
+  });
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const mcpUrl = `${baseUrl}/mcp`;
+  const accessToken = "issue-159-access-token";
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    DEVSPACE_PUBLIC_BASE_URL: baseUrl,
+    PORT: String(port),
+  });
+  const oauthStore = new SqliteOAuthStore(stateDir);
+  const clientsStore = new SqliteOAuthClientsStore(oauthStore, ["127.0.0.1", "localhost"]);
+  const clientRecord = clientsStore.registerClient({
+    redirect_uris: [`${baseUrl}/callback`],
+    client_name: "issue-159-client",
+  });
+  oauthStore.saveTokenPair({
+    accessTokenHash: createHash("sha256").update(accessToken).digest("base64url"),
+    accessToken: {
+      clientId: clientRecord.client_id,
+      scopes: ["devspace"],
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      resource: mcpUrl,
+    },
+    refreshTokenHash: createHash("sha256").update("issue-159-refresh").digest("base64url"),
+    refreshToken: {
+      clientId: clientRecord.client_id,
+      scopes: ["devspace"],
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      resource: mcpUrl,
+    },
+  });
+  oauthStore.close();
+
+  const post = (sessionId: string, body: unknown, token = accessToken) => fetch(mcpUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${token}`,
+      "Accept": "application/json, text/event-stream",
+      "mcp-protocol-version": "2024-11-05",
+      ...(sessionId ? { "mcp-session-id": sessionId } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  const parseResponse = async (response: globalThis.Response): Promise<Record<string, any>> => {
+    const text = await response.text();
+    const dataLine = text.split("\n").find((line) => line.startsWith("data: "));
+    return JSON.parse(dataLine ? dataLine.slice(6) : text) as Record<string, any>;
+  };
+  let firstListener: ReturnType<ReturnType<typeof createServer>["app"]["listen"]> | undefined;
+  let secondListener: ReturnType<ReturnType<typeof createServer>["app"]["listen"]> | undefined;
+  let thirdListener: ReturnType<ReturnType<typeof createServer>["app"]["listen"]> | undefined;
+  let first: ReturnType<typeof createServer> | undefined;
+  let second: ReturnType<typeof createServer> | undefined;
+  let third: ReturnType<typeof createServer> | undefined;
+  try {
+    first = createServer(config);
+    firstListener = first.app.listen(port, "127.0.0.1");
+    await new Promise<void>((resolve) => firstListener?.once("listening", resolve));
+    const initialized = await post("", {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "issue-159-client", version: "1.0.0" },
+      },
+    });
+    assert.equal(initialized.status, 200);
+    const oldSessionId = initialized.headers.get("mcp-session-id");
+    assert.match(oldSessionId ?? "", /^[0-9a-f-]{36}$/);
+
+    await new Promise<void>((resolve) => firstListener?.close(() => resolve()));
+    await first.close();
+    firstListener = undefined;
+    first = undefined;
+
+    second = createServer(config);
+    secondListener = second.app.listen(port, "127.0.0.1");
+    await new Promise<void>((resolve) => secondListener?.once("listening", resolve));
+
+    const reboundTools = await post(oldSessionId!, { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} });
+    assert.equal(reboundTools.status, 200);
+    const reboundPayload = await parseResponse(reboundTools);
+    assert.ok(Array.isArray(reboundPayload.result?.tools));
+    const reboundSessionId = reboundTools.headers.get("mcp-session-id") ?? oldSessionId!;
+
+    const consequential = await post(reboundSessionId, {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: { name: "open_workspace", arguments: { path: project } },
+    });
+    const consequentialText = await consequential.text();
+    assert.equal(consequential.status, 200, consequentialText);
+    const consequentialDataLine = consequentialText.split("\n").find((line) => line.startsWith("data: "));
+    const consequentialPayload = JSON.parse(consequentialDataLine ? consequentialDataLine.slice(6) : consequentialText) as Record<string, any>;
+    assert.doesNotMatch(JSON.stringify(consequentialPayload), /RECONNECT_REQUIRED|STALE_MCP_SESSION/);
+
+    const unauthenticatedUnknown = await post("22222222-2222-4222-8222-222222222222", { jsonrpc: "2.0", id: 4, method: "tools/list", params: {} }, "");
+    assert.equal(unauthenticatedUnknown.status, 401);
+    const malformed = await post("not-a-session-id", { jsonrpc: "2.0", id: 5, method: "tools/list", params: {} });
+    assert.notEqual(malformed.status, 200);
+
+    const closed = await fetch(mcpUrl, {
+      method: "DELETE",
+      headers: {
+        "Authorization": `Bearer ${accessToken}`,
+        "Accept": "application/json, text/event-stream",
+        "mcp-protocol-version": "2024-11-05",
+        "mcp-session-id": reboundSessionId,
+      },
+    });
+    const closedText = await closed.text();
+    assert.equal(closed.status, 200, closedText);
+    const afterClose = await post(reboundSessionId, { jsonrpc: "2.0", id: 6, method: "tools/list", params: {} });
+    assert.notEqual(afterClose.status, 200);
+
+    await new Promise<void>((resolve) => secondListener?.close(() => resolve()));
+    await second.close();
+    secondListener = undefined;
+    second = undefined;
+    new CutoverStateStore(stateDir).begin({
+      oldServerIdentity: { serverInstanceId: "issue-159-old", sourceCommit: "old", buildId: "old" },
+      expectedNewIdentity: { sourceCommit: "new", buildId: "new" },
+    });
+    third = createServer(config);
+    thirdListener = third.app.listen(port, "127.0.0.1");
+    await new Promise<void>((resolve) => thirdListener?.once("listening", resolve));
+    const nonNormal = await post("11111111-1111-4111-8111-111111111111", { jsonrpc: "2.0", id: 7, method: "tools/list", params: {} });
+    assert.notEqual(nonNormal.status, 200);
+  } finally {
+    if (thirdListener) await new Promise<void>((resolve) => thirdListener?.close(() => resolve()));
+    await third?.close();
+    if (secondListener) await new Promise<void>((resolve) => secondListener?.close(() => resolve()));
+    await second?.close();
+    if (firstListener) await new Promise<void>((resolve) => firstListener?.close(() => resolve()));
+    await first?.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("prepared finish rejects each wrong replacement identity without durable mutation", async () => {
   const mismatches = [
     { label: "source", sourceCommit: "e".repeat(40), buildId: "target-build", capabilityManifestSha256: "a".repeat(64) },
