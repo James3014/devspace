@@ -2,7 +2,7 @@
 
 This document defines dependency direction inside DevSpace. It is an engineering boundary, not a new runtime authority model.
 
-The executable source of truth for the first boundary slice is `src/development-boundaries.ts`; `src/development-boundaries.test.ts` prevents declared control-substrate modules from acquiring direct dependencies on replaceable provider, carrier, or strategy code.
+The executable source of truth is `src/development-boundaries.ts`; `src/development-boundaries.test.ts` prevents declared control-substrate modules from acquiring direct dependencies on replaceable provider, carrier, or strategy code. The same fence runs in normal `npm test` and CI.
 
 ## Control substrate
 
@@ -28,15 +28,14 @@ Cognitive/coordination strategy includes worker topology, ChatSwarm coordination
 
 `server.ts` and `cli.ts` are composition roots. They are expected to wire control and replaceable layers together. An import from a composition root is therefore not evidence that the imported component belongs to the control substrate.
 
-## Current migration debt
+## Resolved second-wave debt
 
-The first fence intentionally does not pretend the repository is already fully separated.
+The second boundary slice removes the two explicit debts recorded by the first fence:
 
-`durable-operations.ts` mixes the generic durable operation ledger with ChatSwarm migration preparation/apply/reconcile behavior. The generic ledger remains strategically important, but the ChatSwarm migration adapter is replaceable strategy-specific wiring. Split those concerns before promoting the module into the clean control kernel.
+- shared sensitive-text redaction lives in neutral `sensitive-redaction.ts`; provider code re-exports it for compatibility while `host-operations.ts` consumes the neutral utility directly;
+- ChatSwarm migration preparation/apply/reconcile lives in `chat-swarm-migration.ts`, which consumes the neutral durable-operation store. `durable-operations.ts` no longer imports ChatSwarm implementation modules.
 
-`host-operations.ts` currently imports redaction from `local-agent-errors.ts` and consumes the mixed `durable-operations.ts` surface. Shared redaction should move to a neutral utility, and host operations should consume a neutral durable-operation contract/store surface before this module is promoted into the kernel.
-
-These entries are explicit debt, not permanent exceptions. New control code must not use them as precedent for additional provider/carrier/strategy coupling.
+`durable-operations.ts`, `host-operations.ts`, and `sensitive-redaction.ts` are therefore part of the declared control kernel. `server.ts` remains the composition root. `DEVELOPMENT_BOUNDARY_DEBT` is empty at this revision; future mixed modules must be recorded explicitly rather than silently promoted.
 
 ## Dependency rule
 
