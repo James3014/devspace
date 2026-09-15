@@ -252,11 +252,23 @@ test("runtime config selects OpenCLI explicitly while preserving CDP as the defa
   assert.equal(fallback.transport, "cdp");
 });
 
-test("OpenCLI provisioning captures the exact project conversation before waiting for the remote turn", async () => {
+test("OpenCLI provisioning captures transport and authenticated peer identities separately", async () => {
   const driver = openCliDriverForTest();
   const calls: string[][] = [];
+  const peerFingerprint = "a".repeat(64);
   (driver as any).runJson = async (args: string[]) => {
     calls.push(args);
+    if (args[1] === "detail") {
+      const probePrompt = calls.find((call) => call[1] === "ask")?.[2] ?? "";
+      return [
+        { Role: "User", Text: probePrompt, Generating: false },
+        {
+          Role: "Assistant",
+          Text: `DEVSPACE_PEER_FINGERPRINT=${peerFingerprint}`,
+          Generating: false,
+        },
+      ];
+    }
     return [{
       conversationId: "opencli-managed-01",
       conversationUrl: "https://chatgpt.com/g/g-p-runtime-test/c/opencli-managed-01",
@@ -272,13 +284,43 @@ test("OpenCLI provisioning captures the exact project conversation before waitin
     "https://chatgpt.com/g/g-p-runtime-test/c/opencli-managed-01",
   );
   assert.equal(evidence.conversationFingerprint, fingerprint("opencli-managed-01"));
+  assert.equal(evidence.authenticatedPeerFingerprint, peerFingerprint);
+  assert.notEqual(evidence.conversationFingerprint, peerFingerprint);
+  assert.equal(evidence.appBinding, "READY");
   assert.deepEqual(calls[0]?.slice(0, 2), ["chatgpt", "ask"]);
+  assert.match(calls[0]?.[2] ?? "", /chat_swarm_peer_status/);
   assert.equal(calls[0]?.includes("--project"), true);
   assert.equal(calls[0]?.[calls[0]!.indexOf("--project") + 1], "runtime-test");
   assert.equal(calls[0]?.includes("--new"), true);
   assert.equal(calls[0]?.includes("--wait"), true);
   assert.equal(calls[0]?.[calls[0]!.indexOf("--wait") + 1], "false");
   assert.equal(calls[0]?.[calls[0]!.indexOf("--site-session") + 1], "ephemeral");
+});
+
+test("OpenCLI provisioning fails closed when the authenticated peer probe is malformed", async () => {
+  const driver = openCliDriverForTest();
+  let probePrompt = "";
+  (driver as any).runJson = async (args: string[]) => {
+    if (args[1] === "detail") {
+      return [
+        { Role: "User", Text: probePrompt, Generating: false },
+        { Role: "Assistant", Text: "DEVSPACE_PEER_FINGERPRINT=not-valid", Generating: false },
+      ];
+    }
+    probePrompt = args[2] ?? "";
+    return [{
+      conversationId: "opencli-managed-bad-peer",
+      conversationUrl: "https://chatgpt.com/g/g-p-runtime-test/c/opencli-managed-bad-peer",
+      response: "",
+    }];
+  };
+  await assert.rejects(
+    () => driver.createManagedConversation(
+      "https://chatgpt.com/g/g-p-runtime-test/project",
+      new Date(Date.now() + 1_000).toISOString(),
+    ),
+    /peer identity probe did not return a valid fingerprint/,
+  );
 });
 
 test("OpenCLI wake reopens the exact conversation", async () => {
@@ -377,7 +419,7 @@ test("cold ensure reconciles exact existing carriers before declaring the pool h
   }
 });
 
-test("managed bootstrap requires the exact created ChatGPT conversation identity", () => {
+test("managed bootstrap binds the authenticated peer separately from the browser conversation", () => {
   const f = fixture();
   try {
     const slot = f.registry.ensureSlot(
@@ -389,28 +431,34 @@ test("managed bootstrap requires the exact created ChatGPT conversation identity
     const prepared = f.registry.prepareProvision(slot, 5_000);
     assert.ok(prepared.operation);
     assert.equal(f.registry.claimProvision(prepared.operation!.operationId), true);
+    const transportFingerprint = fingerprint("exact-managed-conversation");
+    const peerFingerprint = fingerprint("authenticated-peer-identity");
     f.registry.markCarrierCreated(prepared.operation!.operationId, {
       conversationUrl: "https://chatgpt.com/c/exact-managed-conversation",
-      conversationFingerprint: fingerprint("exact-managed-conversation"),
+      conversationFingerprint: transportFingerprint,
+      authenticatedPeerFingerprint: peerFingerprint,
       appBinding: "READY",
     });
     assert.equal(f.registry.claimBootstrap(prepared.operation!.operationId), true);
     assert.throws(
       () =>
         f.manager.bootstrap(
-          { "openai/session": "wrong-conversation" },
+          { "openai/session": "exact-managed-conversation" },
           prepared.operation!.operationId,
         ),
-      /does not match the managed carrier/,
+      /authenticated peer does not match the managed carrier/,
     );
     const accepted = f.manager.bootstrap(
-      { "openai/session": "exact-managed-conversation" },
+      { "openai/session": "authenticated-peer-identity" },
       prepared.operation!.operationId,
     );
     assert.equal(accepted.slot.state, "PARKED");
-    assert.equal(
+    assert.equal(accepted.slot.conversationFingerprint, transportFingerprint);
+    assert.equal(accepted.slot.authenticatedPeerFingerprint, peerFingerprint);
+    assert.equal(accepted.worker.carrierConversationFingerprint, peerFingerprint);
+    assert.notEqual(
       accepted.worker.carrierConversationFingerprint,
-      fingerprint("exact-managed-conversation"),
+      accepted.slot.conversationFingerprint,
     );
   } finally {
     cleanup(f);

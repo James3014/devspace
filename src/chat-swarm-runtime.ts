@@ -84,6 +84,7 @@ export interface ManagedCarrierSlot {
   workerId?: string;
   conversationUrl?: string;
   conversationFingerprint?: string;
+  authenticatedPeerFingerprint?: string;
   continuationEpoch?: number;
   lastOperationId?: string;
   blocker?: string;
@@ -105,6 +106,7 @@ interface SlotReceipt {
   workerId?: string;
   conversationUrl?: string;
   conversationFingerprint?: string;
+  authenticatedPeerFingerprint?: string;
   continuationEpoch?: number;
   lastOperationId?: string;
   blocker?: string;
@@ -133,6 +135,7 @@ interface ProvisionReceipt {
     | "UNKNOWN";
   conversationUrl?: string;
   conversationFingerprint?: string;
+  authenticatedPeerFingerprint?: string;
   workerId?: string;
   remoteMayContinue: boolean;
   observedAt: string;
@@ -197,6 +200,7 @@ export interface RuntimeStatusResult {
 export interface ManagedConversationEvidence {
   conversationUrl: string;
   conversationFingerprint: string;
+  authenticatedPeerFingerprint?: string;
   appBinding: "READY" | "UNKNOWN" | "DISABLED" | "STALE";
 }
 
@@ -431,6 +435,22 @@ export class ChatSwarmRuntimeStore {
     return undefined;
   }
 
+  getSlotByAuthenticatedPeerFingerprint(
+    fingerprint: string,
+  ): ManagedCarrierSlot | undefined {
+    const rows = this.database.sqlite
+      .prepare("select * from durable_operations where kind=? and scope_root=?")
+      .all(SLOT_KIND, this.scopeRoot) as Row[];
+    for (const row of rows) {
+      const slot = this.slotFrom(row);
+      if (
+        slot.authenticatedPeerFingerprint === fingerprint &&
+        slot.state !== "STOPPED"
+      ) return slot;
+    }
+    return undefined;
+  }
+
   ensureSlot(
     swarmId: string,
     runtimeSlot: number,
@@ -628,6 +648,12 @@ export class ChatSwarmRuntimeStore {
     evidence: ManagedConversationEvidence,
   ): ManagedCarrierSlot {
     assertFingerprint(evidence.conversationFingerprint, "conversation fingerprint");
+    if (evidence.authenticatedPeerFingerprint) {
+      assertFingerprint(
+        evidence.authenticatedPeerFingerprint,
+        "authenticated peer fingerprint",
+      );
+    }
     const tx = this.database.sqlite.transaction(() => {
       const operation = this.requireProvision(operationId);
       if (operation.status === "succeeded" && operation.receipt?.workerId) {
@@ -653,6 +679,21 @@ export class ChatSwarmRuntimeStore {
           "conversation is already managed by another runtime slot",
         );
       }
+      const peerConflict = evidence.authenticatedPeerFingerprint
+        ? this.getSlotByAuthenticatedPeerFingerprint(
+            evidence.authenticatedPeerFingerprint,
+          )
+        : undefined;
+      if (
+        peerConflict &&
+        (peerConflict.swarmId !== operation.request.swarmId ||
+          peerConflict.runtimeSlot !== operation.request.runtimeSlot)
+      ) {
+        throw new ChatSwarmError(
+          "OWNERSHIP_CONFLICT",
+          "authenticated peer is already managed by another runtime slot",
+        );
+      }
       const observedAt = nowIso();
       const setupRequired =
         evidence.appBinding === "DISABLED" || evidence.appBinding === "STALE";
@@ -661,6 +702,7 @@ export class ChatSwarmRuntimeStore {
         disposition: setupRequired ? "SETUP_REQUIRED" : "CARRIER_CREATED",
         conversationUrl: evidence.conversationUrl,
         conversationFingerprint: evidence.conversationFingerprint,
+        authenticatedPeerFingerprint: evidence.authenticatedPeerFingerprint,
         remoteMayContinue: false,
         observedAt,
       };
@@ -680,6 +722,7 @@ export class ChatSwarmRuntimeStore {
           state: setupRequired ? "SETUP_REQUIRED" : "CARRIER_CREATED",
           conversationUrl: evidence.conversationUrl,
           conversationFingerprint: evidence.conversationFingerprint,
+          authenticatedPeerFingerprint: evidence.authenticatedPeerFingerprint,
           lastOperationId: operationId,
           ...(setupRequired
             ? { blocker: `HOST_APP_BINDING_${evidence.appBinding}` }
@@ -703,6 +746,8 @@ export class ChatSwarmRuntimeStore {
         disposition: "BOOTSTRAPPING",
         conversationUrl: operation.receipt?.conversationUrl,
         conversationFingerprint: operation.receipt?.conversationFingerprint,
+        authenticatedPeerFingerprint:
+          operation.receipt?.authenticatedPeerFingerprint,
         remoteMayContinue: true,
         observedAt,
       };
@@ -725,6 +770,8 @@ export class ChatSwarmRuntimeStore {
           state: "BOOTSTRAPPING",
           conversationUrl: operation.receipt?.conversationUrl,
           conversationFingerprint: operation.receipt?.conversationFingerprint,
+          authenticatedPeerFingerprint:
+            operation.receipt?.authenticatedPeerFingerprint,
           lastOperationId: operationId,
           updatedAt: observedAt,
         },
@@ -747,6 +794,8 @@ export class ChatSwarmRuntimeStore {
         disposition: "UNKNOWN",
         conversationUrl: operation.receipt?.conversationUrl,
         conversationFingerprint: operation.receipt?.conversationFingerprint,
+        authenticatedPeerFingerprint:
+          operation.receipt?.authenticatedPeerFingerprint,
         workerId: operation.receipt?.workerId,
         remoteMayContinue: true,
         observedAt,
@@ -768,6 +817,8 @@ export class ChatSwarmRuntimeStore {
           workerId: slot.workerId,
           conversationUrl: operation.receipt?.conversationUrl,
           conversationFingerprint: operation.receipt?.conversationFingerprint,
+          authenticatedPeerFingerprint:
+            operation.receipt?.authenticatedPeerFingerprint,
           continuationEpoch: slot.continuationEpoch,
           lastOperationId: operationId,
           blocker,
@@ -798,11 +849,13 @@ export class ChatSwarmRuntimeStore {
           "carrier identity is not established",
         );
       }
+      const expectedPeerFingerprint =
+        operation.receipt.authenticatedPeerFingerprint ??
+        operation.receipt.conversationFingerprint;
       if (
         !["carrier_created", "bootstrapping"].includes(operation.status) ||
         worker.swarmId !== operation.request.swarmId ||
-        worker.carrierConversationFingerprint !==
-          operation.receipt.conversationFingerprint
+        worker.carrierConversationFingerprint !== expectedPeerFingerprint
       ) {
         throw new ChatSwarmError(
           "OWNERSHIP_CONFLICT",
@@ -815,6 +868,8 @@ export class ChatSwarmRuntimeStore {
         disposition: "BOUND",
         conversationUrl: operation.receipt.conversationUrl,
         conversationFingerprint: operation.receipt.conversationFingerprint,
+        authenticatedPeerFingerprint:
+          operation.receipt.authenticatedPeerFingerprint,
         workerId: worker.id,
         remoteMayContinue: false,
         observedAt,
@@ -830,6 +885,8 @@ export class ChatSwarmRuntimeStore {
           workerId: worker.id,
           conversationUrl: operation.receipt.conversationUrl,
           conversationFingerprint: operation.receipt.conversationFingerprint,
+          authenticatedPeerFingerprint:
+            operation.receipt.authenticatedPeerFingerprint,
           continuationEpoch: worker.continuationEpoch,
           lastOperationId: operationId,
           updatedAt: observedAt,
@@ -851,6 +908,7 @@ export class ChatSwarmRuntimeStore {
       workerId: current.workerId,
       conversationUrl: current.conversationUrl,
       conversationFingerprint: current.conversationFingerprint,
+      authenticatedPeerFingerprint: current.authenticatedPeerFingerprint,
       continuationEpoch: current.continuationEpoch,
       lastOperationId: current.lastOperationId,
       updatedAt: nowIso(),
@@ -927,6 +985,7 @@ export class ChatSwarmRuntimeStore {
           workerId: current.workerId,
           conversationUrl: current.conversationUrl,
           conversationFingerprint: current.conversationFingerprint,
+          authenticatedPeerFingerprint: current.authenticatedPeerFingerprint,
           continuationEpoch: current.continuationEpoch,
           lastOperationId: operationId,
           updatedAt: requestedAt,
@@ -1027,6 +1086,7 @@ export class ChatSwarmRuntimeStore {
           workerId: slot.workerId,
           conversationUrl: slot.conversationUrl,
           conversationFingerprint: slot.conversationFingerprint,
+          authenticatedPeerFingerprint: slot.authenticatedPeerFingerprint,
           continuationEpoch: slot.continuationEpoch,
           lastOperationId: operationId,
           blocker,
@@ -1232,6 +1292,12 @@ export class ChatSwarmRuntimeStore {
     if (receipt.conversationFingerprint) {
       assertFingerprint(receipt.conversationFingerprint, "managed carrier fingerprint");
     }
+    if (receipt.authenticatedPeerFingerprint) {
+      assertFingerprint(
+        receipt.authenticatedPeerFingerprint,
+        "managed carrier authenticated peer fingerprint",
+      );
+    }
     return {
       managedCarrierId: String(row.operation_id),
       swarmId: request.swarmId,
@@ -1243,6 +1309,7 @@ export class ChatSwarmRuntimeStore {
       workerId: receipt.workerId,
       conversationUrl: receipt.conversationUrl,
       conversationFingerprint: receipt.conversationFingerprint,
+      authenticatedPeerFingerprint: receipt.authenticatedPeerFingerprint,
       continuationEpoch: receipt.continuationEpoch,
       lastOperationId: receipt.lastOperationId,
       blocker: receipt.blocker,
@@ -1340,11 +1407,12 @@ export class OpenCliMacWebDriver implements MacWebDriver {
     projectUrl: string,
     deadlineAt: string,
   ): Promise<ManagedConversationEvidence> {
+    const probePrompt = this.peerIdentityProbePrompt();
     const rows = await this.runJson<OpenCliConversationRow[]>(
       [
         "chatgpt",
         "ask",
-        "Managed DevSpace worker carrier initialization. Reply exactly READY_FOR_BOOTSTRAP. Do not call tools yet.",
+        probePrompt,
         "--project",
         openCliProjectId(projectUrl),
         "--new",
@@ -1364,10 +1432,16 @@ export class OpenCliMacWebDriver implements MacWebDriver {
     if (!conversationUrl) {
       throw new Error("OpenCLI did not return a ChatGPT conversation URL");
     }
+    await this.waitForConversationIdle(conversationUrl, deadlineAt);
+    const authenticatedPeerFingerprint = this.peerFingerprintFromDetail(
+      await this.detail(conversationUrl, deadlineAt),
+      probePrompt,
+    );
     return {
       conversationUrl,
       conversationFingerprint: conversationFingerprintFromUrl(conversationUrl),
-      appBinding: "UNKNOWN",
+      authenticatedPeerFingerprint,
+      appBinding: "READY",
     };
   }
 
@@ -1482,6 +1556,40 @@ export class OpenCliMacWebDriver implements MacWebDriver {
   ): Promise<boolean> {
     const rows = await this.detail(conversationUrl, deadlineAt);
     return rows.some((row) => row.Role === "User" && row.Text === prompt);
+  }
+
+  private peerIdentityProbePrompt(): string {
+    return (
+      `@${this.config.appLabel} Call chat_swarm_peer_status with no swarmId exactly once. ` +
+      "Then reply exactly DEVSPACE_PEER_FINGERPRINT=<the exact 64-hex identity.fingerprint from the tool result>. " +
+      "Do not call any other tool."
+    );
+  }
+
+  private peerFingerprintFromDetail(
+    rows: OpenCliDetailRow[],
+    probePrompt: string,
+  ): string {
+    let probeIndex = -1;
+    for (let index = rows.length - 1; index >= 0; index -= 1) {
+      if (rows[index]?.Role === "User" && rows[index]?.Text === probePrompt) {
+        probeIndex = index;
+        break;
+      }
+    }
+    if (probeIndex < 0) {
+      throw new Error("OpenCLI peer identity probe prompt was not observed");
+    }
+    const assistant = rows
+      .slice(probeIndex + 1)
+      .find((row) => row.Role === "Assistant");
+    const match = /^DEVSPACE_PEER_FINGERPRINT=([0-9a-f]{64})$/u.exec(
+      assistant?.Text?.trim() ?? "",
+    );
+    if (!match?.[1]) {
+      throw new Error("OpenCLI peer identity probe did not return a valid fingerprint");
+    }
+    return match[1];
   }
 
   private detail(
@@ -1972,8 +2080,14 @@ export class MacWebChatCarrierAdapter implements ChatSwarmManagedCarrierAdapter 
   }
 
   async ensureExisting(input: CarrierCallInput): Promise<CarrierEnsureEvidence> {
-    const slot = this.registry.getSlotByFingerprint(input.carrierFingerprint);
-    if (!slot?.conversationUrl || slot.workerId !== input.workerId) {
+    const slot = this.registry.getSlotByWorker(input.swarmId, input.workerId);
+    const slotAuthorityFingerprint =
+      slot?.authenticatedPeerFingerprint ?? slot?.conversationFingerprint;
+    if (
+      !slot?.conversationUrl ||
+      slot.workerId !== input.workerId ||
+      slotAuthorityFingerprint !== input.carrierFingerprint
+    ) {
       return {
         disposition: "UNSUPPORTED",
         operationId: input.operationId,
@@ -2002,8 +2116,14 @@ export class MacWebChatCarrierAdapter implements ChatSwarmManagedCarrierAdapter 
   }
 
   async wake(input: CarrierCallInput): Promise<CarrierWakeEvidence> {
-    const slot = this.registry.getSlotByFingerprint(input.carrierFingerprint);
-    if (!slot?.conversationUrl || slot.workerId !== input.workerId) {
+    const slot = this.registry.getSlotByWorker(input.swarmId, input.workerId);
+    const slotAuthorityFingerprint =
+      slot?.authenticatedPeerFingerprint ?? slot?.conversationFingerprint;
+    if (
+      !slot?.conversationUrl ||
+      slot.workerId !== input.workerId ||
+      slotAuthorityFingerprint !== input.carrierFingerprint
+    ) {
       return {
         disposition: "UNSUPPORTED",
         operationId: input.operationId,
@@ -2206,10 +2326,12 @@ export class ChatSwarmRuntimeManager {
       }
 
       if (slot.state === "SETUP_REQUIRED" || !slot.conversationUrl) continue;
-      const existingWorker = slot.conversationFingerprint
+      const slotAuthorityFingerprint =
+        slot.authenticatedPeerFingerprint ?? slot.conversationFingerprint;
+      const existingWorker = slotAuthorityFingerprint
         ? this.coordinator.store.findWorkerByCarrier(
             swarmId,
-            slot.conversationFingerprint,
+            slotAuthorityFingerprint,
           )
         : undefined;
       if (existingWorker) {
@@ -2287,33 +2409,35 @@ export class ChatSwarmRuntimeManager {
         "runtime provision operation expired",
       );
     }
-    const fingerprint = operation.receipt?.conversationFingerprint;
-    if (!fingerprint) {
+    const transportFingerprint = operation.receipt?.conversationFingerprint;
+    if (!transportFingerprint) {
       throw new ChatSwarmError(
         "INVALID_STATE",
         "runtime provision has no observed conversation identity",
       );
     }
-    if (identity.fingerprint !== fingerprint) {
+    const authenticatedPeerFingerprint =
+      operation.receipt?.authenticatedPeerFingerprint ?? transportFingerprint;
+    if (identity.fingerprint !== authenticatedPeerFingerprint) {
       throw new ChatSwarmError(
         "OWNERSHIP_CONFLICT",
-        "caller conversation does not match the managed carrier created for this operation",
+        "caller authenticated peer does not match the managed carrier created for this operation",
       );
     }
     const existing = this.coordinator.store.findWorkerByCarrier(
       operation.request.swarmId,
-      fingerprint,
+      authenticatedPeerFingerprint,
     );
     const worker =
       existing ??
       this.coordinator.store.joinWorkerAtomic(
         operation.request.swarmId,
-        fingerprint,
+        authenticatedPeerFingerprint,
         {
           swarmId: operation.request.swarmId,
           label: managedWorkerLabel(operation.request.runtimeSlot),
           runtimeKind: "mcp_peer",
-          carrierConversationFingerprint: fingerprint,
+          carrierConversationFingerprint: authenticatedPeerFingerprint,
         },
       );
     return { slot: this.registry.bindWorker(operationId, worker), worker };
