@@ -242,16 +242,64 @@ export class CarrierBindingStore {
       return this.issue(pendingId,child,parent.row.id);
     }).immediate();
   }
-  redeem(context: unknown, credential: string) {
+  redeem(context: unknown, credentialOrOptions: string | { pendingId?: string; credential?: string; token?: string }) {
     const principal=transport(context);
-    if(typeof credential!=="string" || !/^[A-Za-z0-9_-]{43}$/.test(credential)) deny();
-    const row=this.database.sqlite.prepare("select id from carrier_bindings where credential_hash=? and client_id=?").get(digest(credential),principal.clientId) as {id:string}|undefined;
-    if(!row) deny();
-    const binding=this.active(row.id);
+    const options = typeof credentialOrOptions === "string" ? { credential: credentialOrOptions } : (credentialOrOptions ?? {});
+    const cred = options.token ?? options.credential;
+    const pendingId = options.pendingId;
+
+    if (!cred && !pendingId) deny("A valid pendingId or credential token is required");
+
+    let bindingId: string | undefined;
+
+    if (cred) {
+      if(typeof cred!=="string" || !/^[A-Za-z0-9_-]{43}$/.test(cred)) deny();
+      const credHash = digest(cred);
+      const row=this.database.sqlite.prepare("select id from carrier_bindings where credential_hash=? and client_id=?").get(credHash,principal.clientId) as {id:string}|undefined;
+      if (row) {
+        bindingId = row.id;
+      } else {
+        const pairing = this.database.sqlite.prepare("select id,client_id,session_id,expires_at,binding_id from carrier_pairings where credential_hash=? and client_id=?").get(credHash, principal.clientId) as PairingRow | undefined;
+        if (pairing) {
+          if (pairing.expires_at <= this.now()) {
+            throw new ControlPlaneOwnershipError("EXPIRED", `Pairing ${pairing.id} has expired. Request a new pairing via coordination_pair.`);
+          }
+          if (!pairing.binding_id) {
+            throw new ControlPlaneOwnershipError(
+              "AUTHORITY_REQUIRED",
+              `Pairing ${pairing.id} is awaiting host Owner approval. Run in terminal: devspace carriers approve ${pairing.id} --contract <contract.json> --confirm ${pairing.id}`,
+            );
+          }
+          bindingId = pairing.binding_id;
+        } else {
+          deny();
+        }
+      }
+    } else if (pendingId) {
+      if (typeof pendingId !== "string" || !/^pair_[A-Za-z0-9_-]+$/.test(pendingId)) deny("Invalid pendingId format");
+      const pairing = this.database.sqlite.prepare("select id,client_id,session_id,expires_at,binding_id from carrier_pairings where id=? and client_id=?").get(pendingId, principal.clientId) as PairingRow | undefined;
+      if (!pairing) deny("Pairing request not found");
+      if (pairing.expires_at <= this.now()) {
+        throw new ControlPlaneOwnershipError("EXPIRED", `Pairing ${pairing.id} has expired. Request a new pairing via coordination_pair.`);
+      }
+      if (!pairing.binding_id) {
+        throw new ControlPlaneOwnershipError(
+          "AUTHORITY_REQUIRED",
+          `Pairing ${pairing.id} is awaiting host Owner approval. Run in terminal: devspace carriers approve ${pairing.id} --contract <contract.json> --confirm ${pairing.id}`,
+        );
+      }
+      if (pairing.session_id !== principal.sessionId) {
+        deny("Pairing belongs to a different session; verification token is required to resume from another session");
+      }
+      bindingId = pairing.binding_id;
+    }
+
+    if (!bindingId) deny();
+    const binding=this.active(bindingId);
     const key=JSON.stringify([principal.clientId,principal.sessionId]);
     const existing=this.sessions.get(key);
-    if(existing && existing!==row.id) deny("An MCP session cannot change its carrier");
-    this.sessions.set(key,row.id);
+    if(existing && existing!==bindingId) deny("An MCP session cannot change its carrier");
+    this.sessions.set(key,bindingId);
     return this.public(binding);
   }
   status(context: unknown) { return this.public(this.current(context)); }

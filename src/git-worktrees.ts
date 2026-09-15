@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { mkdir, realpath, rm, stat } from "node:fs/promises";
+import { mkdir, realpath, rm, stat, symlink } from "node:fs/promises";
 import { basename, join, relative, resolve } from "node:path";
 import type { ServerConfig } from "./config.js";
 import { assertAllowedPath, isPathInsideRoot } from "./roots.js";
@@ -104,6 +104,17 @@ export async function createManagedWorktree(input: {
       "GIT_WORKTREE_CREATE_FAILED",
       `Git failed to create the managed worktree. ${message}`,
     );
+  }
+
+  try {
+    const sourceNodeModules = join(sourceRoot, "node_modules");
+    const targetNodeModules = join(worktreePath, "node_modules");
+    const nodeModulesStat = await stat(sourceNodeModules).catch(() => null);
+    if (nodeModulesStat?.isDirectory()) {
+      await symlink(sourceNodeModules, targetNodeModules).catch(() => {});
+    }
+  } catch {
+    // Non-blocking best-effort dependency sharing for probe/verification runs
   }
 
   return {
