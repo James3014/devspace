@@ -10,9 +10,11 @@ import { verifyRepositoryIntelligenceEngineHead } from "./repository-intelligenc
 import type { WorkspaceRegistry } from "./workspaces.js";
 
 const execFileAsync = promisify(execFile);
-const ARTIFACT_NAME_PREFIX = "repository-intelligence-pr-";
+const EVENT_ARTIFACT_NAME_PREFIX = "repository-intelligence-pr-";
+const TERMINAL_ARTIFACT_NAME_PREFIX = "repository-intelligence-terminal-pr-";
 const CLAIM_CEILING = "ADVISORY_EVIDENCE_ONLY" as const;
-const SNAPSHOT_SEMANTICS = "PR_EVENT_SNAPSHOT_NOT_TERMINAL_CI" as const;
+const EVENT_SNAPSHOT_SEMANTICS = "PR_EVENT_SNAPSHOT_NOT_TERMINAL_CI" as const;
+const TERMINAL_SNAPSHOT_SEMANTICS = "OBSERVED_CHECK_SET_TERMINAL_AFTER_QUIESCENCE" as const;
 const DEFAULT_TIMEOUT_MS = 45_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 
@@ -23,10 +25,16 @@ const READ_ONLY_OPEN_WORLD_ANNOTATIONS = {
   openWorldHint: true,
 };
 
+export type RepositoryIntelligenceSnapshotKind = "event" | "terminal";
+export type RepositoryIntelligenceSnapshotSemantics =
+  | typeof EVENT_SNAPSHOT_SEMANTICS
+  | typeof TERMINAL_SNAPSHOT_SEMANTICS;
+
 export interface RepositoryIntelligenceArtifactInput {
   repository: string;
   prNumber: number;
   expectedHead: string;
+  snapshotKind?: RepositoryIntelligenceSnapshotKind;
 }
 
 export interface RepositoryIntelligenceArtifactResult {
@@ -34,6 +42,7 @@ export interface RepositoryIntelligenceArtifactResult {
   repository: string;
   prNumber: number;
   expectedHead: string;
+  snapshotKind: RepositoryIntelligenceSnapshotKind;
   artifactId: number;
   artifactName: string;
   artifactDigest: string;
@@ -44,7 +53,7 @@ export interface RepositoryIntelligenceArtifactResult {
   readiness: string | null;
   cfiStatus: string | null;
   eiaDecision: string | null;
-  snapshotSemantics: typeof SNAPSHOT_SEMANTICS;
+  snapshotSemantics: RepositoryIntelligenceSnapshotSemantics;
   engineHead: string;
 }
 
@@ -64,7 +73,7 @@ export interface RepositoryIntelligenceArtifactDependencies {
   ) => Promise<{ stdout: string; stderr: string }>;
 }
 
-function normalizeInput(input: RepositoryIntelligenceArtifactInput): RepositoryIntelligenceArtifactInput {
+function normalizeInput(input: RepositoryIntelligenceArtifactInput): Required<RepositoryIntelligenceArtifactInput> {
   const repository = input.repository.trim();
   if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository)) {
     throw new Error("Repository Intelligence artifact repository must be owner/name");
@@ -76,7 +85,22 @@ function normalizeInput(input: RepositoryIntelligenceArtifactInput): RepositoryI
   if (!/^[0-9a-f]{40}$/.test(expectedHead)) {
     throw new Error("Repository Intelligence artifact expectedHead must be a full 40-hex SHA");
   }
-  return { repository, prNumber: input.prNumber, expectedHead };
+  const snapshotKind = input.snapshotKind ?? "event";
+  if (snapshotKind !== "event" && snapshotKind !== "terminal") {
+    throw new Error("Repository Intelligence artifact snapshotKind must be event or terminal");
+  }
+  return { repository, prNumber: input.prNumber, expectedHead, snapshotKind };
+}
+
+function expectedSemantics(kind: RepositoryIntelligenceSnapshotKind): RepositoryIntelligenceSnapshotSemantics {
+  return kind === "terminal" ? TERMINAL_SNAPSHOT_SEMANTICS : EVENT_SNAPSHOT_SEMANTICS;
+}
+
+function expectedArtifactName(input: Required<RepositoryIntelligenceArtifactInput>): string {
+  const prefix = input.snapshotKind === "terminal"
+    ? TERMINAL_ARTIFACT_NAME_PREFIX
+    : EVENT_ARTIFACT_NAME_PREFIX;
+  return `${prefix}${input.prNumber}-${input.expectedHead}`;
 }
 
 function isSha256(value: unknown): value is string {
@@ -97,8 +121,9 @@ function nullableString(value: unknown, field: string): string | null {
 
 export function validateRepositoryIntelligenceArtifactPayload(
   value: unknown,
-  expected: RepositoryIntelligenceArtifactInput,
+  expectedInput: RepositoryIntelligenceArtifactInput,
 ): Omit<RepositoryIntelligenceArtifactResult, "engineHead"> {
+  const expected = normalizeInput(expectedInput);
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new Error("Repository Intelligence artifact helper returned a non-object JSON payload");
   }
@@ -113,16 +138,20 @@ export function validateRepositoryIntelligenceArtifactPayload(
   ) {
     throw new Error("Repository Intelligence artifact subject mismatch");
   }
+  if (payload.snapshotKind !== expected.snapshotKind) {
+    throw new Error("Repository Intelligence artifact snapshot kind mismatch");
+  }
   if (payload.claimCeiling !== CLAIM_CEILING) {
     throw new Error("Repository Intelligence artifact claim ceiling mismatch");
   }
-  if (payload.snapshotSemantics !== SNAPSHOT_SEMANTICS) {
+  const semantics = expectedSemantics(expected.snapshotKind);
+  if (payload.snapshotSemantics !== semantics) {
     throw new Error("Repository Intelligence artifact snapshot semantics mismatch");
   }
   if (!Number.isSafeInteger(payload.artifactId) || Number(payload.artifactId) <= 0) {
     throw new Error("Repository Intelligence artifact id is invalid");
   }
-  const expectedName = `${ARTIFACT_NAME_PREFIX}${expected.prNumber}-${expected.expectedHead}`;
+  const expectedName = expectedArtifactName(expected);
   if (payload.artifactName !== expectedName) {
     throw new Error("Repository Intelligence artifact name mismatch");
   }
@@ -167,6 +196,7 @@ export function validateRepositoryIntelligenceArtifactPayload(
     repository: expected.repository,
     prNumber: expected.prNumber,
     expectedHead: expected.expectedHead,
+    snapshotKind: expected.snapshotKind,
     artifactId: Number(payload.artifactId),
     artifactName: expectedName,
     artifactDigest: payload.artifactDigest,
@@ -177,7 +207,7 @@ export function validateRepositoryIntelligenceArtifactPayload(
     readiness: nullableString(payload.readiness, "readiness"),
     cfiStatus: nullableString(payload.cfiStatus, "cfiStatus"),
     eiaDecision: nullableString(payload.eiaDecision, "eiaDecision"),
-    snapshotSemantics: SNAPSHOT_SEMANTICS,
+    snapshotSemantics: semantics,
   };
 }
 
@@ -236,6 +266,7 @@ export async function consumeRepositoryIntelligenceArtifact(
         "--repository", normalized.repository,
         "--pr-number", String(normalized.prNumber),
         "--expected-head", normalized.expectedHead,
+        "--snapshot-kind", normalized.snapshotKind,
       ],
       {
         cwd: root,
@@ -274,7 +305,7 @@ export function registerRepositoryIntelligenceArtifactTool(
     {
       title: "Repository Intelligence artifact",
       description:
-        "Read and canonically verify the exact GitHub Actions Repository Intelligence artifact for one PR head. Returns advisory PR-event snapshot evidence only; it does not prove terminal CI, accept a Candidate, dispatch workers, approve, merge, release, or activate runtime state.",
+        "Read and canonically verify one exact-head Repository Intelligence GitHub Actions artifact. snapshotKind=event returns PR-event timing only. snapshotKind=terminal returns evidence that the observed external check/status set was terminal and stable after quiescence; it still does not prove required-check completeness, Candidate acceptance, approval, merge readiness, release, or runtime activation.",
       inputSchema: {
         workspaceId: z.string().min(1).describe(
           "Workspace to use. Reuse the current project's workspaceId.",
@@ -288,6 +319,9 @@ export function registerRepositoryIntelligenceArtifactTool(
         expectedHead: z.string().regex(/^[0-9a-fA-F]{40}$/).describe(
           "Exact pull-request head SHA expected inside the artifact.",
         ),
+        snapshotKind: z.enum(["event", "terminal"]).optional().describe(
+          "Artifact timing kind. Defaults to event for backward compatibility.",
+        ),
       },
       _meta: {},
       annotations: READ_ONLY_OPEN_WORLD_ANNOTATIONS,
@@ -298,6 +332,7 @@ export function registerRepositoryIntelligenceArtifactTool(
         repository: input.repository,
         prNumber: input.prNumber,
         expectedHead: input.expectedHead,
+        snapshotKind: input.snapshotKind,
       });
       return {
         content: [{ type: "text" as const, text: JSON.stringify(result) }],
