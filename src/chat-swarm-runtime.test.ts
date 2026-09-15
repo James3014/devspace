@@ -42,6 +42,7 @@ class FakeManagedAdapter implements ChatSwarmManagedCarrierAdapter {
   failProvision = false;
   failStop = false;
   recoverReady = true;
+  bootstrapDelayMs = 0;
   onBootstrap?: (operationId: string, rawIdentity: string) => void;
   readonly rawIdentities = new Map<number, string>();
 
@@ -91,6 +92,9 @@ class FakeManagedAdapter implements ChatSwarmManagedCarrierAdapter {
     deadlineAt: string;
   }) {
     this.bootstrapCalls += 1;
+    if (this.bootstrapDelayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.bootstrapDelayMs));
+    }
     const rawIdentity = this.rawIdentities.get(input.runtimeSlot)!;
     this.onBootstrap?.(input.operationId, rawIdentity);
     return { disposition: "DELIVERED" as const, remoteMayContinue: true };
@@ -139,7 +143,14 @@ class FakeManagedAdapter implements ChatSwarmManagedCarrierAdapter {
   }
 }
 
-function fixture(workerLimit = 5) {
+function fixture(
+  workerLimit = 5,
+  options: {
+    operationTimeoutMs?: number;
+    bootstrapWaitMs?: number;
+    bootstrapDelayMs?: number;
+  } = {},
+) {
   const root = mkdtempSync(join(tmpdir(), "devspace-runtime-117-"));
   const store = new ChatSwarmStore(root);
   const coordinator = new ChatSwarmCoordinator(store);
@@ -151,14 +162,15 @@ function fixture(workerLimit = 5) {
     DEVSPACE_CHAT_SWARM_RUNTIME: "1",
     DEVSPACE_CHAT_SWARM_PROJECT_URL: "https://chatgpt.com/g/g-p-runtime-test/project",
     DEVSPACE_CHAT_SWARM_POOL_DEFAULT: "3",
-    DEVSPACE_CHAT_SWARM_RUNTIME_TIMEOUT_MS: "5000",
-    DEVSPACE_CHAT_SWARM_BOOTSTRAP_WAIT_MS: "5000",
+    DEVSPACE_CHAT_SWARM_RUNTIME_TIMEOUT_MS: String(options.operationTimeoutMs ?? 5_000),
+    DEVSPACE_CHAT_SWARM_BOOTSTRAP_WAIT_MS: String(options.bootstrapWaitMs ?? 5_000),
   };
   const manager = new ChatSwarmRuntimeManager(
     coordinator,
     { stateDir: root, chatSwarmMaxWorkers: workerLimit },
     { env, registry, adapter },
   );
+  adapter.bootstrapDelayMs = options.bootstrapDelayMs ?? 0;
   adapter.onBootstrap = (operationId, rawIdentity) => {
     manager.bootstrap({ "openai/session": rawIdentity }, operationId);
   };
@@ -398,6 +410,58 @@ test("concurrent runtime ensure creates only missing managed workers and exact r
         .listWorkers(f.swarm.id)
         .filter((worker) => worker.lifecycleState !== "DISABLED").length,
       3,
+    );
+  } finally {
+    cleanup(f);
+  }
+});
+
+test("provision lease covers the bounded provision, bootstrap delivery, and acknowledgement lifecycle", async () => {
+  const f = fixture(1, {
+    operationTimeoutMs: 1_000,
+    bootstrapWaitMs: 1_000,
+    bootstrapDelayMs: 1_100,
+  });
+  try {
+    const status = await f.manager.ensure(f.owner, f.swarm.id, 1);
+    assert.equal(status.slots[0]?.state, "PARKED");
+    const operation = f.registry.getProvision(status.slots[0]!.lastOperationId!);
+    assert.ok(operation);
+    assert.equal(
+      Date.parse(operation.request.expiresAt) - Date.parse(operation.request.requestedAt),
+      3_000,
+    );
+  } finally {
+    cleanup(f);
+  }
+});
+
+test("managed bootstrap still rejects a provision after its bounded lifecycle lease expires", async () => {
+  const f = fixture(1);
+  try {
+    const slot = f.registry.ensureSlot(
+      f.swarm.id,
+      1,
+      "https://chatgpt.com/g/g-p-runtime-test/project",
+      "1".repeat(64),
+    );
+    const prepared = f.registry.prepareProvision(slot, 10);
+    assert.ok(prepared.operation);
+    assert.equal(f.registry.claimProvision(prepared.operation!.operationId), true);
+    f.registry.markCarrierCreated(prepared.operation!.operationId, {
+      conversationUrl: "https://chatgpt.com/c/expired-managed-conversation",
+      conversationFingerprint: fingerprint("expired-managed-conversation"),
+      appBinding: "READY",
+    });
+    assert.equal(f.registry.claimBootstrap(prepared.operation!.operationId), true);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    assert.throws(
+      () =>
+        f.manager.bootstrap(
+          { "openai/session": "expired-managed-conversation" },
+          prepared.operation!.operationId,
+        ),
+      /runtime provision operation expired/,
     );
   } finally {
     cleanup(f);

@@ -2257,6 +2257,9 @@ export class ChatSwarmRuntimeManager {
 
     const projectUrl = this.runtimeConfig.projectUrl!;
     const browserProfileId = profileId(this.runtimeConfig.browserProfileDir);
+    const provisionLifecycleTtlMs =
+      this.runtimeConfig.operationTimeoutMs * 2 +
+      this.runtimeConfig.bootstrapWaitMs;
     for (let runtimeSlot = 1; runtimeSlot <= desiredWorkers; runtimeSlot += 1) {
       let slot = this.registry.ensureSlot(
         swarmId,
@@ -2278,7 +2281,7 @@ export class ChatSwarmRuntimeManager {
 
       const prepared = this.registry.prepareProvision(
         slot,
-        this.runtimeConfig.operationTimeoutMs,
+        provisionLifecycleTtlMs,
       );
       slot = prepared.slot;
       if (!prepared.operation) continue;
