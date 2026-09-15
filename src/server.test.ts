@@ -3471,6 +3471,219 @@ test("Issue #159: authenticated old session can rebind after server restart thro
   }
 });
 
+test("Issue #163: restart preserves durable refresh rotation and classifies token failures without secrets", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-163-oauth-http-"));
+  const stateDir = join(root, "state");
+  const ownerToken = "issue-163-owner-token-that-is-long-enough";
+  const port = await new Promise<number>((resolve, reject) => {
+    const probe = createNetServer();
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address() as AddressInfo;
+      probe.close((error) => error ? reject(error) : resolve(address.port));
+    });
+  });
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const mcpUrl = `${baseUrl}/mcp`;
+  const redirectUri = `${baseUrl}/callback`;
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, "config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_OAUTH_OWNER_TOKEN: ownerToken,
+    DEVSPACE_PUBLIC_BASE_URL: baseUrl,
+    PORT: String(port),
+  });
+  const seed = new SingleUserOAuthProvider(config.oauth, new URL("/mcp", config.publicBaseUrl), stateDir);
+  const registeredClient = await seed.clientsStore.registerClient?.({
+    redirect_uris: [redirectUri],
+    client_name: "issue-163-client",
+    token_endpoint_auth_method: "none",
+  });
+  assert.ok(registeredClient);
+  const client = registeredClient;
+  const seedCode = "issue-163-seed-code";
+  const codeVerifier = "issue-163-code-verifier";
+  const codeChallenge = createHash("sha256").update(codeVerifier).digest("base64url");
+  seed["codes"].set(seedCode, {
+    clientId: client.client_id,
+    params: {
+      redirectUri,
+      codeChallenge,
+      scopes: config.oauth.scopes,
+      resource: new URL(mcpUrl),
+    },
+    expiresAtMs: Date.now() + 60_000,
+  });
+  const initial = await seed.exchangeAuthorizationCode(client, seedCode, undefined, redirectUri, new URL(mcpUrl));
+  seed.close();
+
+  const encode = (body: Record<string, string>) => new URLSearchParams(body).toString();
+  const postToken = (body: Record<string, string>, contentType: "form" | "json" = "form") => fetch(`${baseUrl}/token`, {
+    method: "POST",
+    headers: {
+      "Content-Type": contentType === "form" ? "application/x-www-form-urlencoded" : "application/json",
+      Accept: "application/json",
+      Connection: "close",
+    },
+    body: contentType === "form" ? encode(body) : JSON.stringify(body),
+  });
+  const noSecrets = async (response: Response, secrets: string[]) => {
+    const text = await response.text();
+    for (const secret of secrets) assert.equal(text.includes(secret), false, `response leaked ${secret}`);
+    return JSON.parse(text) as Record<string, unknown>;
+  };
+  const start = async () => {
+    const running = createServer(config);
+    const listener = running.app.listen(port, "127.0.0.1");
+    await new Promise<void>((resolve, reject) => {
+      listener.once("listening", () => resolve());
+      listener.once("error", reject);
+    });
+    return { running, listener };
+  };
+
+  let first: Awaited<ReturnType<typeof start>> | undefined;
+  let second: Awaited<ReturnType<typeof start>> | undefined;
+  try {
+    first = await start();
+    const rotatedResponse = await postToken({
+      grant_type: "refresh_token",
+      client_id: client.client_id,
+      refresh_token: initial.refresh_token!,
+      resource: mcpUrl,
+    });
+    assert.equal(rotatedResponse.status, 200);
+    const rotated = await rotatedResponse.json() as { refresh_token?: string };
+    assert.ok(rotated.refresh_token);
+
+    const replay = await postToken({
+      grant_type: "refresh_token",
+      client_id: client.client_id,
+      refresh_token: initial.refresh_token!,
+      resource: mcpUrl,
+    });
+    assert.equal(replay.status, 400);
+    const replayBody = await noSecrets(replay, [initial.refresh_token!, ownerToken, client.client_id]);
+    assert.equal(replayBody.error, "invalid_grant");
+    assert.equal(replayBody.failure_class, "invalid_refresh_token");
+
+    await new Promise<void>((resolve) => first?.listener.close(() => resolve()));
+    await first.running.close();
+    first = undefined;
+
+    second = await start();
+    const afterRestart = await postToken({
+      grant_type: "refresh_token",
+      client_id: client.client_id,
+      refresh_token: rotated.refresh_token!,
+      resource: mcpUrl,
+    }, "json");
+    assert.equal(afterRestart.status, 200);
+    const afterRestartBody = await afterRestart.json() as { refresh_token?: string };
+    assert.ok(afterRestartBody.refresh_token);
+
+    const replayAfterRestart = await postToken({
+      grant_type: "refresh_token",
+      client_id: client.client_id,
+      refresh_token: initial.refresh_token!,
+      resource: mcpUrl,
+    }, "json");
+    assert.equal(replayAfterRestart.status, 400);
+    const replayAfterRestartBody = await noSecrets(replayAfterRestart, [initial.refresh_token!, ownerToken, client.client_id]);
+    assert.equal(replayAfterRestartBody.error, "invalid_grant");
+    assert.equal(replayAfterRestartBody.failure_class, "invalid_refresh_token");
+
+    const invalidResource = await postToken({
+      grant_type: "refresh_token",
+      client_id: client.client_id,
+      refresh_token: afterRestartBody.refresh_token!,
+      resource: "https://attacker.invalid/mcp?secret=redirect-query",
+    });
+    assert.equal(invalidResource.status, 400);
+    const invalidResourceBody = await noSecrets(invalidResource, [afterRestartBody.refresh_token!, ownerToken, "redirect-query"]);
+    assert.equal(invalidResourceBody.error, "invalid_grant");
+    assert.equal(invalidResourceBody.failure_class, "invalid_resource");
+
+    const invalidCode = await postToken({
+      grant_type: "authorization_code",
+      client_id: client.client_id,
+      code: "stale-authorization-code",
+      code_verifier: codeVerifier,
+      redirect_uri: redirectUri,
+      resource: mcpUrl,
+    });
+    assert.equal(invalidCode.status, 400);
+    const invalidCodeBody = await noSecrets(invalidCode, ["stale-authorization-code", ownerToken, client.client_id]);
+    assert.equal(invalidCodeBody.error, "invalid_grant");
+    assert.equal(invalidCodeBody.failure_class, "invalid_authorization_code");
+
+    const authorizationParams = {
+      response_type: "code",
+      client_id: client.client_id,
+      redirect_uri: redirectUri,
+      code_challenge: codeChallenge,
+      code_challenge_method: "S256",
+      scope: config.oauth.scopes.join(" "),
+      resource: mcpUrl,
+    };
+    const authorizationPage = await fetch(`${baseUrl}/authorize?${encode(authorizationParams)}`);
+    assert.equal(authorizationPage.status, 200);
+    const authorization = await fetch(`${baseUrl}/authorize`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: encode({ ...authorizationParams, owner_token: ownerToken }),
+    });
+    assert.equal(authorization.status, 302);
+    const issuedCode = new URL(authorization.headers.get("location") ?? "https://invalid.invalid").searchParams.get("code");
+    assert.ok(issuedCode);
+
+    const invalidRedirect = await postToken({
+      grant_type: "authorization_code",
+      client_id: client.client_id,
+      code: issuedCode,
+      code_verifier: codeVerifier,
+      redirect_uri: `${baseUrl}/wrong?redirect-secret=query-value`,
+      resource: mcpUrl,
+    });
+    assert.equal(invalidRedirect.status, 400);
+    const invalidRedirectBody = await noSecrets(invalidRedirect, [issuedCode, ownerToken, "query-value"]);
+    assert.equal(invalidRedirectBody.error, "invalid_grant");
+    assert.equal(invalidRedirectBody.failure_class, "invalid_redirect");
+
+    const malformed = await postToken({ client_id: client.client_id });
+    assert.equal(malformed.status, 400);
+    const malformedBody = await noSecrets(malformed, [ownerToken, client.client_id]);
+    assert.equal(malformedBody.error, "invalid_request");
+    assert.equal(malformedBody.failure_class, "request_shape_validation");
+
+    const malformedJson = await fetch(`${baseUrl}/token`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        Connection: "close",
+      },
+      body: `{"grant_type":"refresh_token","refresh_token":"malformed-json-token",`,
+    });
+    assert.equal(malformedJson.status, 400);
+    const malformedJsonBody = await noSecrets(malformedJson, ["malformed-json-token", ownerToken, client.client_id]);
+    assert.equal(malformedJsonBody.error, "invalid_request");
+    assert.equal(malformedJsonBody.failure_class, "request_shape_validation");
+  } finally {
+    if (second) {
+      await new Promise<void>((resolve) => second?.listener.close(() => resolve()));
+      await second.running.close();
+    }
+    if (first) {
+      await new Promise<void>((resolve) => first?.listener.close(() => resolve()));
+      await first.running.close();
+    }
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("prepared finish rejects each wrong replacement identity without durable mutation", async () => {
   const mismatches = [
     { label: "source", sourceCommit: "e".repeat(40), buildId: "target-build", capabilityManifestSha256: "a".repeat(64) },
