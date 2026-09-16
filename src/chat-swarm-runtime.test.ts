@@ -832,6 +832,52 @@ function existingCdpFixture(t: test.TestContext, metadata = "43123\n/devtools/br
   };
 }
 
+test("carrier effects never use conversation identity as missing peer authority", async (t) => {
+  const f = existingCdpFixture(t);
+  const conversationUrl = "https://chatgpt.com/c/worker-a";
+  const conversationFingerprint = fingerprint("worker-a");
+  const slot: ManagedCarrierSlot = {
+    managedCarrierId: "legacy-conversation-only",
+    swarmId: "swarm",
+    runtimeSlot: 1,
+    generation: 1,
+    state: "PARKED",
+    projectUrl: f.config.projectUrl!,
+    browserProfileId: "1".repeat(64),
+    workerId: "worker",
+    conversationUrl,
+    conversationFingerprint,
+    continuationEpoch: 0,
+    lastOperationId: "legacy-operation",
+    updatedAt: new Date().toISOString(),
+  };
+  const registry = {
+    getSlotByWorker: (swarmId: string, workerId: string) =>
+      swarmId === slot.swarmId && workerId === slot.workerId ? slot : undefined,
+  } as unknown as ChatSwarmRuntimeStore;
+  const adapter = new MacWebChatCarrierAdapter(f.config, registry, f.driver);
+  const input: CarrierCallInput = {
+    operationId: "carrier-operation",
+    operationKey: "carrier-operation-key",
+    swarmId: slot.swarmId,
+    workerId: slot.workerId!,
+    carrierKind: "mcp_peer",
+    carrierFingerprint: conversationFingerprint,
+    expectedEpoch: 0,
+    adapterConfigHash: adapter.configHash,
+    signal: new AbortController().signal,
+    deadlineAt: f.deadline(),
+  };
+  const ensured = await adapter.ensureExisting(input);
+  assert.equal(ensured.disposition, "UNSUPPORTED");
+  assert.equal(ensured.remoteMayContinue, false);
+  const woke = await adapter.wake({ ...input, taskId: "task" });
+  assert.equal(woke.disposition, "UNSUPPORTED");
+  assert.equal(woke.remoteMayContinue, false);
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.sockets.length, 0);
+});
+
 test("existing-session missing or malformed metadata fails closed before connection", async (t) => {
   const f = existingCdpFixture(t, "");
   let result = await f.driver.preflight();

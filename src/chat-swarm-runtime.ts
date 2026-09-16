@@ -2336,8 +2336,7 @@ export class MacWebChatCarrierAdapter implements ChatSwarmManagedCarrierAdapter 
 
   async ensureExisting(input: CarrierCallInput): Promise<CarrierEnsureEvidence> {
     const slot = this.registry.getSlotByWorker(input.swarmId, input.workerId);
-    const slotAuthorityFingerprint =
-      slot?.authenticatedPeerFingerprint ?? slot?.conversationFingerprint;
+    const slotAuthorityFingerprint = slot?.authenticatedPeerFingerprint;
     if (
       !slot?.conversationUrl ||
       slot.workerId !== input.workerId ||
@@ -2372,8 +2371,7 @@ export class MacWebChatCarrierAdapter implements ChatSwarmManagedCarrierAdapter 
 
   async wake(input: CarrierCallInput): Promise<CarrierWakeEvidence> {
     const slot = this.registry.getSlotByWorker(input.swarmId, input.workerId);
-    const slotAuthorityFingerprint =
-      slot?.authenticatedPeerFingerprint ?? slot?.conversationFingerprint;
+    const slotAuthorityFingerprint = slot?.authenticatedPeerFingerprint;
     if (
       !slot?.conversationUrl ||
       slot.workerId !== input.workerId ||
