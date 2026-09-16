@@ -224,6 +224,32 @@ export class CarrierBindingStore {
   approveLocal(pendingId: string, contract: CarrierContract) {
     return this.database.sqlite.transaction(()=>this.issue(pendingId,contract,null)).immediate();
   }
+  /** Owner-local recovery rebinds one pending verifier to the same durable carrier. It never creates authority. */
+  recoverLocal(pendingId: string, carrierId: string, expectedVersion: number, expectedValidityVersion: number) {
+    return this.database.sqlite.transaction(()=>{
+      const pending=this.database.sqlite.prepare("select * from carrier_pairings where id=?").get(pendingId) as PairingRow|undefined;
+      if(!pending || pending.expires_at<=this.now()) deny("Recovery request missing or expired");
+      const before=this.active(carrierId);
+      if(before.row.client_id!==pending.client_id) deny("Recovery request OAuth client does not match carrier");
+      if(before.row.version!==expectedVersion || before.validity.version!==expectedValidityVersion) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Carrier or validity version changed");
+      if(pending.binding_id) {
+        if(pending.binding_id!==carrierId || before.row.credential_hash!==pending.credential_hash) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Recovery request already consumed by different state");
+        return {carrier:this.public(before),replayed:true};
+      }
+      const previousHash=before.row.credential_hash;
+      const update=this.database.sqlite.prepare("update carrier_bindings set credential_hash=? where id=? and version=? and revoked=0 and credential_hash=?")
+        .run(pending.credential_hash,carrierId,expectedVersion,previousHash);
+      if(update.changes!==1) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Carrier credential changed");
+      this.database.sqlite.prepare("delete from carrier_pairings where binding_id=? and credential_hash=?")
+        .run(carrierId,previousHash);
+      const claim=this.database.sqlite.prepare("update carrier_pairings set binding_id=? where id=? and binding_id is null")
+        .run(carrierId,pendingId);
+      if(claim.changes!==1) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Recovery request raced");
+      const after=this.active(carrierId);
+      if(after.row.version!==before.row.version || after.validity.version!==before.validity.version || after.generation!==before.generation || JSON.stringify(after.contract)!==JSON.stringify(before.contract) || JSON.stringify(this.grant(after))!==JSON.stringify(this.grant(before))) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Recovery changed carrier authority");
+      return {carrier:this.public(after),replayed:false};
+    }).immediate();
+  }
   /** CLI root validation does not turn the state resource into an allowed workspace. */
   validateLocalScope(input: CarrierContract, allowedRoots: string[]): CarrierContract {
     const contract=this.validateContract(input,false);

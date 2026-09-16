@@ -1292,6 +1292,12 @@ function runCarrierCommand(args: string[]): void {
       if(intent.schema!=="devspace.carrier_credential_rotation.v1" || intent.carrierId!==id || intent.expectedVersion!==expectedVersion || intent.expectedValidityVersion!==expectedValidityVersion || !/^[a-f0-9]{64}$/.test(intent.expectedCredentialHash) || !/^[A-Za-z0-9_-]{43}$/.test(intent.credential) || Object.keys(intent).sort().join(",")!=="carrierId,credential,expectedCredentialHash,expectedValidityVersion,expectedVersion,schema") throw new Error("Carrier credential intent file does not match the requested rotation");
       result={...bindings.rotateCredentialLocal(id,expectedVersion,expectedValidityVersion,intent.expectedCredentialHash,intent.credential),credentialFile:intentPath};
     }
+    else if(action==="recover" && flags.length===8 && flags[0]==="--carrier" && flags[2]==="--version" && flags[4]==="--validity-version" && flags[6]==="--confirm" && flags[7]===flags[1]) {
+      const carrierId=flags[1]!, expectedVersion=Number(flags[3]), expectedValidityVersion=Number(flags[5]);
+      const record=bindings.inspectLocal(carrierId);
+      bindings.validateLocalScope(record.contract,[...config.allowedRoots,config.worktreeRoot]);
+      result=bindings.recoverLocal(id,carrierId,expectedVersion,expectedValidityVersion);
+    }
     else if(action==="approve" && flags.length===4 && flags[0]==="--contract" && flags[2]==="--confirm" && flags[3]===id) {
       const contract=JSON.parse(readFileSync(resolve(flags[1]!),"utf8")) as CarrierContract;
       bindings.validateLocalScope(contract,[...config.allowedRoots,config.worktreeRoot]);

@@ -65,7 +65,29 @@ test("CLI completion-only startup preserves pairing and rejects altered or mixed
     writeFileSync(contractPath,JSON.stringify({repository:"James3014/devspace",goal:"issue62",role:"controller",scope:[workspace],baseRevision:"a".repeat(40),operations:["dependency_sync"],expiresAt:new Date(Date.now()+60000).toISOString()}));
     execFileSync(process.execPath,[...entry,"carrier","inspect",pending.pendingId],{env,stdio:"pipe"});
     execFileSync(process.execPath,[...entry,"carrier","approve",pending.pendingId,"--contract",contractPath,"--confirm",pending.pendingId],{env,stdio:"pipe"});
-    data(await client.callTool({name:"coordination_resume",arguments:{credential:pending.credential}}));
+    const originalCarrier=data(await client.callTool({name:"coordination_resume",arguments:{credential:pending.credential}}));
+
+    const recoveryClient=new Client({name:"fresh recovery fixture",version:"1"});
+    try {
+      await recoveryClient.connect(new StreamableHTTPClientTransport(new URL("/mcp",config.publicBaseUrl),{requestInit:{headers:{Authorization:`Bearer ${tokens.access_token}`}}}));
+      assert.equal((await recoveryClient.callTool({name:"coordination_carrier_status",arguments:{}})).isError,true);
+      const recovery=data(await recoveryClient.callTool({name:"coordination_recovery_request",arguments:{}}));
+      assert.equal((await recoveryClient.callTool({name:"coordination_resume",arguments:{pendingId:recovery.pendingId}})).isError,true);
+      const recoverArgs=[...entry,"carrier","recover",recovery.pendingId,"--carrier",originalCarrier.id,"--version",String(originalCarrier.version),"--validity-version",String(originalCarrier.validity.version),"--confirm",originalCarrier.id];
+      const first=JSON.parse(execFileSync(process.execPath,recoverArgs,{env,encoding:"utf8"})) as {carrier:typeof originalCarrier;replayed:boolean};
+      assert.equal(first.replayed,false);
+      assert.deepEqual(first.carrier,originalCarrier);
+      const replay=JSON.parse(execFileSync(process.execPath,recoverArgs,{env,encoding:"utf8"})) as typeof first;
+      assert.equal(replay.replayed,true);
+      assert.deepEqual(replay.carrier,originalCarrier);
+      assert.deepEqual(data(await recoveryClient.callTool({name:"coordination_resume",arguments:{pendingId:recovery.pendingId}})),originalCarrier);
+      const oldCredentialClient=new Client({name:"old verifier fixture",version:"1"});
+      try {
+        await oldCredentialClient.connect(new StreamableHTTPClientTransport(new URL("/mcp",config.publicBaseUrl),{requestInit:{headers:{Authorization:`Bearer ${tokens.access_token}`}}}));
+        assert.equal((await oldCredentialClient.callTool({name:"coordination_resume",arguments:{credential:pending.credential}})).isError,true);
+      } finally {await oldCredentialClient.close().catch(()=>{});}
+    } finally {await recoveryClient.close().catch(()=>{});}
+
     const projection=data(await client.callTool({name:"coordination_completion_read",arguments:{goal:"issue62",subject:"cli-fixture",candidate:"b".repeat(40)}})).projection;
     assert.equal(projection.contractSource,"synthetic-cli-test-only");
     assert.equal(projection.status,"INCOMPLETE");

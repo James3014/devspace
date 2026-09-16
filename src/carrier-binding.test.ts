@@ -372,6 +372,36 @@ test("local credential rotation is CAS-bound, idempotent, and preserves carrier 
   } finally {f.close();}
 });
 
+test("owner-approved recovery rebinds one pending verifier to the same durable carrier",()=>{
+  const f=fixture();try {
+    const before=f.store.status(f.controller);
+    const carrierRowsBefore=f.db.sqlite.prepare("select count(*) as count from carrier_bindings").get() as {count:number};
+    f.store.forgetSession(f.controller.sessionId);
+    const fresh={clientId:f.controller.clientId,sessionId:"fresh-recovery-session"};
+    const request=f.store.requestPairing(fresh);
+    assert.throws(()=>f.store.redeem(fresh,{pendingId:request.pendingId}));
+
+    const recovered=f.store.recoverLocal(request.pendingId,before.id,before.version,before.validity.version);
+    assert.equal(recovered.replayed,false);
+    assert.deepEqual(recovered.carrier,before);
+    assert.deepEqual(f.store.inspectLocal(before.id),{
+      id:before.id,parentId:before.parentId,version:before.version,revoked:false,contract:before.contract,validity:before.validity,
+    });
+    assert.equal((f.db.sqlite.prepare("select count(*) as count from carrier_bindings").get() as {count:number}).count,carrierRowsBefore.count);
+    assert.throws(()=>f.store.redeem({clientId:f.controller.clientId,sessionId:"old-verifier"},f.request.credential));
+    assert.deepEqual(f.store.redeem(fresh,{pendingId:request.pendingId}),before);
+
+    const replay=f.store.recoverLocal(request.pendingId,before.id,before.version,before.validity.version);
+    assert.equal(replay.replayed,true);
+    assert.deepEqual(replay.carrier,before);
+    assert.throws(()=>f.store.recoverLocal(request.pendingId,"carrier_missing",before.version,before.validity.version));
+
+    const foreign={clientId:"different-oauth",sessionId:"foreign-recovery"};
+    const foreignRequest=f.store.requestPairing(foreign);
+    assert.throws(()=>f.store.recoverLocal(foreignRequest.pendingId,before.id,before.version,before.validity.version));
+  } finally {f.close();}
+});
+
 test("carrier CLI persists a private replayable rotation intent and never prints the verifier",()=>{
   const f=fixture();try {
     const cli=fileURLToPath(new URL("./cli.ts",import.meta.url));
