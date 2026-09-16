@@ -1827,7 +1827,11 @@ class ExistingChromeControl {
     });
   }
 
-  async evaluate<T>(targetId: string, expression: string): Promise<T> {
+  async targetCommand<T>(
+    targetId: string,
+    method: string,
+    params: Record<string, unknown> = {},
+  ): Promise<T> {
     let sessionId = this.sessions.get(targetId);
     if (!sessionId) {
       const attached = await this.command<{ sessionId: string }>("Target.attachToTarget", { targetId, flatten: true });
@@ -1835,8 +1839,14 @@ class ExistingChromeControl {
       sessionId = attached.sessionId;
       this.sessions.set(targetId, sessionId);
     }
-    const result = await this.command<{ result?: { value?: T }; exceptionDetails?: unknown }>(
-      "Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true }, sessionId,
+    return this.command<T>(method, params, sessionId);
+  }
+
+  async evaluate<T>(targetId: string, expression: string): Promise<T> {
+    const result = await this.targetCommand<{ result?: { value?: T }; exceptionDetails?: unknown }>(
+      targetId,
+      "Runtime.evaluate",
+      { expression, returnByValue: true, awaitPromise: true },
     );
     if (result.exceptionDetails) throw new Error("CHATGPT_EVALUATION_FAILED");
     return result.result?.value as T;
@@ -2111,8 +2121,12 @@ export class CdpMacWebDriver implements MacWebDriver {
     }
   }
 
-  private async evaluate<T>(target: CdpTarget, expression: string): Promise<T> {
-    if (this.control) return this.control.evaluate<T>(target.id, expression);
+  private async pageCommand<T>(
+    target: CdpTarget,
+    method: string,
+    params: Record<string, unknown> = {},
+  ): Promise<T> {
+    if (this.control) return this.control.targetCommand<T>(target.id, method, params);
     if (!target.webSocketDebuggerUrl) {
       target =
         (await this.targets(
@@ -2130,16 +2144,9 @@ export class CdpMacWebDriver implements MacWebDriver {
       const ws = new WebSocketCtor(target.webSocketDebuggerUrl!);
       const timer = setTimeout(() => {
         try { ws.close(); } catch {}
-        rejectPromise(new Error("CDP evaluate timed out"));
+        rejectPromise(new Error(`CDP ${method} timed out`));
       }, Math.min(10_000, this.config.operationTimeoutMs));
-      ws.onopen = () =>
-        ws.send(
-          JSON.stringify({
-            id: 1,
-            method: "Runtime.evaluate",
-            params: { expression, returnByValue: true, awaitPromise: true },
-          }),
-        );
+      ws.onopen = () => ws.send(JSON.stringify({ id: 1, method, params }));
       ws.onerror = () => {
         clearTimeout(timer);
         rejectPromise(new Error("CDP websocket failed"));
@@ -2147,19 +2154,29 @@ export class CdpMacWebDriver implements MacWebDriver {
       ws.onmessage = (event: { data: string }) => {
         const payload = JSON.parse(String(event.data)) as {
           id?: number;
-          result?: { result?: { value?: T } };
+          result?: T;
           error?: { message?: string };
         };
         if (payload.id !== 1) return;
         clearTimeout(timer);
         try { ws.close(); } catch {}
         if (payload.error) {
-          rejectPromise(new Error(payload.error.message ?? "CDP evaluate failed"));
+          rejectPromise(new Error(payload.error.message ?? `CDP ${method} failed`));
         } else {
-          resolvePromise(payload.result?.result?.value as T);
+          resolvePromise(payload.result as T);
         }
       };
     });
+  }
+
+  private async evaluate<T>(target: CdpTarget, expression: string): Promise<T> {
+    const result = await this.pageCommand<{ result?: { value?: T }; exceptionDetails?: unknown }>(
+      target,
+      "Runtime.evaluate",
+      { expression, returnByValue: true, awaitPromise: true },
+    );
+    if (result.exceptionDetails) throw new Error("CHATGPT_EVALUATION_FAILED");
+    return result.result?.value as T;
   }
 
   private async waitForComposer(target: CdpTarget, deadlineAt: string): Promise<void> {
@@ -2196,12 +2213,68 @@ export class CdpMacWebDriver implements MacWebDriver {
     }
     const encoded = JSON.stringify(prompt);
     const expectedUrl = JSON.stringify(expectedConversationUrl ?? null);
-    const result = await this.evaluate<{ ok: boolean; reason?: string }>(
+    const composer = await this.evaluate<{
+      ok: boolean;
+      kind?: "editable" | "textarea";
+      reason?: string;
+    }>(
       target,
-      `(() => { const expectedUrl=${expectedUrl}; if(expectedUrl && location.href !== expectedUrl) return {ok:false,reason:'CHATGPT_CONVERSATION_IDENTITY_DRIFT'}; const prompt=${encoded}; const visible=(el) => { const rect=el.getBoundingClientRect(); const style=getComputedStyle(el); return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden'; }; const editable=[...document.querySelectorAll('[contenteditable="true"]')].find(visible); const textarea=[...document.querySelectorAll('textarea')].find(visible); const el=editable||textarea; if(!el) return {ok:false,reason:'composer_missing'}; el.focus(); if(editable){ const range=document.createRange(); range.selectNodeContents(editable); const selection=window.getSelection(); if(!selection) return {ok:false,reason:'composer_selection_unavailable'}; selection.removeAllRanges(); selection.addRange(range); const inserted=document.execCommand('insertText',false,prompt); selection.removeAllRanges(); if(!inserted) return {ok:false,reason:'composer_insert_failed'}; } else { const setter=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')?.set; setter?.call(textarea,prompt); textarea.dispatchEvent(new Event('input',{bubbles:true})); } const button=document.querySelector('[data-testid="send-button"]') || [...document.querySelectorAll('button')].find(b => /send/i.test((b.getAttribute('aria-label')||b.textContent||''))); if(!button || button.disabled) return {ok:false,reason:'send_button_missing_or_disabled'}; button.click(); return {ok:true}; })()`,
+      `(() => { const expectedUrl=${expectedUrl}; if(expectedUrl && location.href !== expectedUrl) return {ok:false,reason:'CHATGPT_CONVERSATION_IDENTITY_DRIFT'}; const prompt=${encoded}; const visible=(el) => { const rect=el.getBoundingClientRect(); const style=getComputedStyle(el); return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden'; }; const editable=[...document.querySelectorAll('[contenteditable="true"]')].find(visible); const textarea=[...document.querySelectorAll('textarea')].find(visible); const el=editable||textarea; if(!el) return {ok:false,reason:'composer_missing'}; el.focus(); if(editable) return {ok:true,kind:'editable'}; const setter=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')?.set; if(!setter) return {ok:false,reason:'textarea_setter_missing'}; setter.call(textarea,prompt); textarea.dispatchEvent(new Event('input',{bubbles:true})); return {ok:true,kind:'textarea'}; })()`,
     );
-    if (!result?.ok) {
-      throw new Error(result?.reason ?? "ChatGPT prompt delivery failed");
+    if (!composer?.ok || !composer.kind) {
+      throw new Error(composer?.reason ?? "ChatGPT composer preparation failed");
+    }
+    if (composer.kind === "editable") {
+      await this.pageCommand(target, "Input.dispatchKeyEvent", {
+        type: "keyDown",
+        modifiers: 4,
+        key: "a",
+        code: "KeyA",
+        windowsVirtualKeyCode: 65,
+      });
+      await this.pageCommand(target, "Input.dispatchKeyEvent", {
+        type: "keyUp",
+        modifiers: 4,
+        key: "a",
+        code: "KeyA",
+        windowsVirtualKeyCode: 65,
+      });
+      await this.pageCommand(target, "Input.dispatchKeyEvent", {
+        type: "keyDown",
+        key: "Backspace",
+        code: "Backspace",
+        windowsVirtualKeyCode: 8,
+      });
+      await this.pageCommand(target, "Input.dispatchKeyEvent", {
+        type: "keyUp",
+        key: "Backspace",
+        code: "Backspace",
+        windowsVirtualKeyCode: 8,
+      });
+      await this.pageCommand(target, "Input.insertText", { text: prompt });
+    }
+
+    let sendReady = false;
+    while (Date.now() < Date.parse(deadlineAt)) {
+      const readiness = await this.evaluate<{ ready: boolean; reason?: string }>(
+        target,
+        `(() => { const expectedUrl=${expectedUrl}; if(expectedUrl && location.href !== expectedUrl) return {ready:false,reason:'CHATGPT_CONVERSATION_IDENTITY_DRIFT'}; const button=document.querySelector('[data-testid="send-button"]') || [...document.querySelectorAll('button')].find(b => /send/i.test((b.getAttribute('aria-label')||b.textContent||''))); return {ready:Boolean(button && !button.disabled)}; })()`,
+      );
+      if (readiness?.reason) throw new Error(readiness.reason);
+      if (readiness?.ready) {
+        sendReady = true;
+        break;
+      }
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
+    }
+    if (!sendReady) throw new Error("send_button_missing_or_disabled");
+
+    const sent = await this.evaluate<{ ok: boolean; reason?: string }>(
+      target,
+      `(() => { const expectedUrl=${expectedUrl}; if(expectedUrl && location.href !== expectedUrl) return {ok:false,reason:'CHATGPT_CONVERSATION_IDENTITY_DRIFT'}; const button=document.querySelector('[data-testid="send-button"]') || [...document.querySelectorAll('button')].find(b => /send/i.test((b.getAttribute('aria-label')||b.textContent||''))); if(!button || button.disabled) return {ok:false,reason:'send_button_missing_or_disabled'}; button.click(); return {ok:true}; })()`,
+    );
+    if (!sent?.ok) {
+      throw new Error(sent?.reason ?? "ChatGPT prompt delivery failed");
     }
     if (Date.now() > Date.parse(deadlineAt)) {
       throw new Error("prompt delivery exceeded deadline");

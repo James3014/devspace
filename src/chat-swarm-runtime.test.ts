@@ -207,26 +207,65 @@ test("CDP composer readiness ignores hidden fallback textareas and prefers visib
   assert.ok(expression.indexOf("[contenteditable=\"true\"]") < expression.indexOf("textarea"));
 });
 
-test("CDP prompt delivery targets the visible editable composer before textarea fallback", async () => {
+test("CDP prompt delivery uses exact-target Input commands for visible editable composer", async () => {
   const driver = cdpDriverForSelectorTest();
-  let expression = "";
+  const expressions: string[] = [];
+  const commands: Array<{ method: string; params: Record<string, unknown> }> = [];
   (driver as any).evaluate = async (_target: unknown, candidate: string) => {
-    expression = candidate;
+    expressions.push(candidate);
+    if (candidate.includes("const editable=")) return { ok: true, kind: "editable" };
+    if (candidate.includes("return {ready:Boolean")) return { ready: true };
     return { ok: true };
+  };
+  (driver as any).pageCommand = async (
+    _target: unknown,
+    method: string,
+    params: Record<string, unknown>,
+  ) => {
+    commands.push({ method, params });
+    return {};
   };
   await (driver as any).sendPromptToTarget(
     { id: "target-1", url: "https://chatgpt.com/" },
     "probe",
     new Date(Date.now() + 1_000).toISOString(),
+    "https://chatgpt.com/",
   );
-  assert.match(expression, /getBoundingClientRect/);
-  assert.match(expression, /data-testid="send-button"/);
-  assert.ok(expression.indexOf("const editable=") < expression.indexOf("const textarea="));
-  assert.match(expression, /const el=editable\|\|textarea/);
-  assert.match(expression, /document\.createRange\(\)/);
-  assert.match(expression, /selectNodeContents\(editable\)/);
-  assert.match(expression, /document\.execCommand\('insertText',false,prompt\)/);
-  assert.doesNotMatch(expression, /editable\.textContent=prompt/);
+  assert.match(expressions[0]!, /getBoundingClientRect/);
+  assert.ok(expressions[0]!.indexOf("const editable=") < expressions[0]!.indexOf("const textarea="));
+  assert.match(expressions[0]!, /CHATGPT_CONVERSATION_IDENTITY_DRIFT/);
+  assert.doesNotMatch(expressions.join("\n"), /document\.execCommand/);
+  assert.doesNotMatch(expressions.join("\n"), /editable\.textContent=prompt/);
+  assert.deepEqual(commands, [
+    { method: "Input.dispatchKeyEvent", params: { type: "keyDown", modifiers: 4, key: "a", code: "KeyA", windowsVirtualKeyCode: 65 } },
+    { method: "Input.dispatchKeyEvent", params: { type: "keyUp", modifiers: 4, key: "a", code: "KeyA", windowsVirtualKeyCode: 65 } },
+    { method: "Input.dispatchKeyEvent", params: { type: "keyDown", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8 } },
+    { method: "Input.dispatchKeyEvent", params: { type: "keyUp", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8 } },
+    { method: "Input.insertText", params: { text: "probe" } },
+  ]);
+  assert.match(expressions.at(-1)!, /button\.click\(\)/);
+});
+
+test("CDP prompt delivery keeps textarea fallback on the DOM value/input path", async () => {
+  const driver = cdpDriverForSelectorTest();
+  const expressions: string[] = [];
+  let pageCommands = 0;
+  (driver as any).evaluate = async (_target: unknown, candidate: string) => {
+    expressions.push(candidate);
+    if (candidate.includes("const editable=")) return { ok: true, kind: "textarea" };
+    if (candidate.includes("return {ready:Boolean")) return { ready: true };
+    return { ok: true };
+  };
+  (driver as any).pageCommand = async () => { pageCommands += 1; };
+  await (driver as any).sendPromptToTarget(
+    { id: "target-1", url: "https://chatgpt.com/" },
+    "probe",
+    new Date(Date.now() + 1_000).toISOString(),
+  );
+  assert.match(expressions[0]!, /HTMLTextAreaElement\.prototype/);
+  assert.match(expressions[0]!, /setter\.call\(textarea,prompt\)/);
+  assert.match(expressions[0]!, /textarea\.dispatchEvent\(new Event\('input'/);
+  assert.equal(pageCommands, 0);
 });
 
 function openCliDriverForTest() {
@@ -795,19 +834,24 @@ function existingCdpFixture(t: test.TestContext, metadata = "43123\n/devtools/br
           result = { sessionId }; break;
         }
         case "Target.closeTarget": targets.delete(command.params.targetId); result = { success: true }; break;
+        case "Input.dispatchKeyEvent": result = {}; break;
+        case "Input.insertText": result = {}; break;
         case "Runtime.evaluate": {
           const url = targets.get(sessions.get(command.sessionId)!);
           assert.ok(url, "evaluation must be attached to one live target");
           const expression: string = command.params.expression;
           let value: any = true;
           if (expression === "location.href") value = url;
-          else if (expression.includes("const prompt=")) {
-            if (disconnectAfterSend) { this.close(); return; }
+          else if (expression.includes("const editable=")) {
             if (driftBeforeSend) {
               targets.set(sessions.get(command.sessionId)!, "https://chatgpt.com/c/unrelated");
-              // Execute the actual guard, before any DOM write could happen.
-              value = new Function("location", expression.replace("(() =>", "return (() =>"))({ href: "https://chatgpt.com/c/unrelated" });
-            } else value = { ok: true };
+              value = { ok: false, reason: "CHATGPT_CONVERSATION_IDENTITY_DRIFT" };
+            } else value = { ok: true, kind: "editable" };
+          }
+          else if (expression.includes("return {ready:Boolean")) value = { ready: true };
+          else if (expression.includes("button.click()")) {
+            if (disconnectAfterSend) { this.close(); return; }
+            value = { ok: true };
           }
           else if (expression.includes("const label=")) {
             const text = domState === "unknown" ? "ChatGPT" : `dev ${domState}`;
@@ -968,7 +1012,8 @@ macOsOnlyTest("existing-session prompt acknowledgement loss remains unknown and 
   assert.equal(result.delivered, false);
   assert.equal(result.remoteMayContinue, true);
   assert.match(result.blocker!, /BROWSER_CONTROL_UNAVAILABLE:DISCONNECTED/);
-  assert.equal(f.calls.filter(c => c.method === "Runtime.evaluate" && c.params.expression.includes("const prompt=")).length, 1);
+  assert.equal(f.calls.filter(c => c.method === "Input.insertText").length, 1);
+  assert.equal(f.calls.filter(c => c.method === "Runtime.evaluate" && c.params.expression.includes("button.click()")).length, 1);
   assert.equal(f.calls.filter(c => c.method === "Target.createTarget").length, 0);
   assert.equal(f.sockets.length, 1);
 });
@@ -996,7 +1041,7 @@ macOsOnlyTest("existing-session recovery after target deletion reopens only the 
   const url = "https://chatgpt.com/c/worker-a";
   assert.equal((await f.driver.recoverConversation(url, f.deadline())).ready, true);
   assert.deepEqual(f.calls.filter(c => c.method === "Target.createTarget").map(c => c.params.url), [url]);
-  assert.equal(f.calls.filter(c => c.method === "Runtime.evaluate" && c.params.expression.includes("const prompt=")).length, 0);
+  assert.equal(f.calls.filter(c => c.method === "Input.insertText").length, 0);
   assert.equal(f.targets.get("target-b"), "https://chatgpt.com/c/worker-b");
 });
 
