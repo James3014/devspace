@@ -223,6 +223,10 @@ test("CDP prompt delivery targets the visible editable composer before textarea 
   assert.match(expression, /data-testid="send-button"/);
   assert.ok(expression.indexOf("const editable=") < expression.indexOf("const textarea="));
   assert.match(expression, /const el=editable\|\|textarea/);
+  assert.match(expression, /document\.createRange\(\)/);
+  assert.match(expression, /selectNodeContents\(editable\)/);
+  assert.match(expression, /document\.execCommand\('insertText',false,prompt\)/);
+  assert.doesNotMatch(expression, /editable\.textContent=prompt/);
 });
 
 function openCliDriverForTest() {
