@@ -752,6 +752,7 @@ export function createLocalAgentDrivers(
     new AcpLocalAgentDriver("cursor", options.env),
     new AcpLocalAgentDriver("copilot", options.env),
     new AcpLocalAgentDriver("grok", options.env),
+    new AcpLocalAgentDriver("cline", options.env),
   ];
 }
 

@@ -5,6 +5,7 @@ import {
   AGY_MAX_STDERR_BYTES,
   AGY_MAX_STDOUT_BYTES,
   createLocalAgentAdapter,
+  createLocalAgentDrivers,
   extractOpenCodeFinalResponse,
   extractPiFinalResponse,
   extractPiProviderError,
@@ -26,6 +27,7 @@ const providers: LocalAgentProvider[] = [
   "copilot",
   "grok",
   "agy",
+  "cline",
 ];
 
 for (const provider of providers) {
@@ -33,6 +35,22 @@ for (const provider of providers) {
   assert.equal(adapter.provider, provider);
   assert.equal(typeof adapter.runtimeKey, "function");
   assert.equal(typeof adapter.run, "function");
+}
+
+{
+  const drivers = createLocalAgentDrivers();
+  const driverProviders = drivers.map((d) => d.provider);
+  assert.ok(driverProviders.includes("cline"), "createLocalAgentDrivers must include cline driver");
+  assert.deepEqual(driverProviders, [
+    "codex",
+    "claude",
+    "opencode",
+    "pi",
+    "cursor",
+    "copilot",
+    "grok",
+    "cline",
+  ]);
 }
 
 assert.deepEqual(
