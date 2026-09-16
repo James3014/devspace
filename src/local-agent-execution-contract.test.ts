@@ -4101,14 +4101,14 @@ test("pathspec-magic-looking filename is fingerprinted literally", async () => {
   }
 });
 
-test("catalog receipt gates real worker turn before provider runner and rejects drift", async () => {
+test("OpenCode catalog receipt allows generation-only refresh and rejects semantic drift", async () => {
   const f = setupGitFixture();
   let launched: { promptFile: string; workerToken: string } | undefined;
   let providerCalls = 0;
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-catalog-receipt-state-"));
   const config = { stateDir, subagents: true, oauth: { scopes: ["devspace"] }, agentMaxConcurrent: 8, toolchains: [] } as any;
   const entry = { providerId: "opencode", modelId: "test", fullName: "opencode/test", variants: ["high"], variantsKnown: true, status: "active" };
-  const makeSnapshot = (generation: string) => ({ entries: [entry], fetchedAt: new Date().toISOString(), source: "sdk" as const, generation, version: "test", freshness: "fresh" as const, runtime: { version: "test", source: "sdk" as const }, lastSuccessAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString() });
+  const makeSnapshot = (generation: string, entries = [entry]) => ({ entries, fetchedAt: new Date().toISOString(), source: "sdk" as const, generation, version: "test", freshness: "fresh" as const, runtime: { version: "test", source: "sdk" as const }, lastSuccessAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60_000).toISOString() });
   let current = makeSnapshot("receipt-g1");
   const catalogSource = { acquire: async () => current, close: () => {} } as any;
   let reopened: LocalAgentSessionManager | undefined;
@@ -4123,9 +4123,11 @@ test("catalog receipt gates real worker turn before provider runner and rejects 
     assert.equal(providerCalls, 1);
 
     // Reopen the same durable store and continue through the real manager
-    // boundary; the receipt must still bind the same catalog scope.
+    // boundary. A refreshed catalog generation is allowed when the exact
+    // OpenCode model/variant, source, runtime identity, and freshness still match.
     manager.close();
     launched = undefined;
+    current = makeSnapshot("receipt-g2");
     reopened = new LocalAgentSessionManager(config, async (_id: string, promptFile: string, workerToken: string) => { launched = { promptFile, workerToken }; }, async () => true, async (_profile: any, record: any) => { providerCalls += 1; return { provider: record.provider, providerSessionId: null, finalResponse: "continued", items: [] }; }, undefined, undefined, undefined, catalogSource);
     const continued = await reopened.continueAgent({ workspaceId: "ws_1", workspaceRoot: f.repo, agentId: started.agentId, prompt: "continue", profiles: [profile], profileCatalog, opencodeCatalog: current });
     const continuedLaunch = launched as { promptFile: string; workerToken: string } | undefined;
@@ -4134,12 +4136,20 @@ test("catalog receipt gates real worker turn before provider runner and rejects 
     assert.equal(providerCalls, 2);
 
     const second = await reopened.startAgent({ workspaceId: "ws_1", workspaceRoot: f.repo, profileName: profile.name, prompt: "read", profiles: [profile], profileCatalog, executionContract: contract });
-    current = makeSnapshot("receipt-g2");
-    const driftLaunch = launched as { promptFile: string; workerToken: string } | undefined;
-    assert.ok(driftLaunch);
-    const before = providerCalls;
-    await reopened.runWorkerTurnFromFile(second.agentId, driftLaunch.promptFile, driftLaunch.workerToken);
-    assert.equal(providerCalls, before, "catalog drift must reject before provider invocation");
+    current = makeSnapshot("receipt-g3");
+    const refreshLaunch = launched as { promptFile: string; workerToken: string } | undefined;
+    assert.ok(refreshLaunch);
+    const beforeRefresh = providerCalls;
+    await reopened.runWorkerTurnFromFile(second.agentId, refreshLaunch.promptFile, refreshLaunch.workerToken);
+    assert.equal(providerCalls, beforeRefresh + 1, "generation-only catalog refresh must not block provider invocation");
+
+    const third = await reopened.startAgent({ workspaceId: "ws_1", workspaceRoot: f.repo, profileName: profile.name, prompt: "read", profiles: [profile], profileCatalog, executionContract: contract });
+    current = makeSnapshot("receipt-g4", []);
+    const removedModelLaunch = launched as { promptFile: string; workerToken: string } | undefined;
+    assert.ok(removedModelLaunch);
+    const beforeRemoval = providerCalls;
+    await reopened.runWorkerTurnFromFile(third.agentId, removedModelLaunch.promptFile, removedModelLaunch.workerToken);
+    assert.equal(providerCalls, beforeRemoval, "removing the exact model must still reject before provider invocation");
   } finally {
     manager.close();
     try { reopened?.close(); } catch { /* already closed */ }

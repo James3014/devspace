@@ -1,9 +1,25 @@
 import assert from "node:assert/strict";
-import { createMcpOpencodeCatalogSource } from "./local-agent-opencode-mcp-catalog.js";
+import {
+  createMcpOpencodeCatalogSource,
+  defaultMcpOpencodeCatalogFactory,
+} from "./local-agent-opencode-mcp-catalog.js";
 
 function fakeClient(model = "mcp-model") {
   return { v2: { model: { list: async () => ({ data: { data: [{ id: model, providerID: "opencode", variants: [], status: "active", enabled: true }] } }) } } } as never;
 }
+
+let capturedDefaultOptions: { hostname?: string; port?: number; timeout?: number } | undefined;
+let defaultFactoryCloseCalls = 0;
+const defaultLifecycle = await defaultMcpOpencodeCatalogFactory(
+  (async (options?: { hostname?: string; port?: number; timeout?: number }) => {
+    capturedDefaultOptions = options;
+    return { client: fakeClient(), server: { close: () => { defaultFactoryCloseCalls += 1; } } };
+  }) as never,
+  async () => 54_323,
+);
+assert.deepEqual(capturedDefaultOptions, { hostname: "127.0.0.1", port: 54_323, timeout: 30_000 });
+defaultLifecycle.server.close();
+assert.equal(defaultFactoryCloseCalls, 1);
 
 let factoryCalls = 0;
 let closeCalls = 0;

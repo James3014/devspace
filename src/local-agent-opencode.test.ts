@@ -4,6 +4,7 @@ import { createOpencodeClient } from "@opencode-ai/sdk/v2";
 import {
   DEFAULT_OPENCODE_STARTUP_TIMEOUT_MS,
   MAX_OPENCODE_STARTUP_TIMEOUT_MS,
+  allocateOpencodeLoopbackPort,
   defaultOpencodeFactory,
   opencodeAgentConfig,
   OpencodeLocalAgentDriver,
@@ -673,9 +674,22 @@ assert.equal(resolveOpencodeStartupTimeoutMs({ DEVSPACE_OPENCODE_STARTUP_TIMEOUT
 assert.equal(resolveOpencodeStartupTimeoutMs({ DEVSPACE_OPENCODE_STARTUP_TIMEOUT_MS: "120001" }), 120_000);
 assert.equal(resolveOpencodeStartupTimeoutMs({ DEVSPACE_OPENCODE_TIMEOUT_MS: "10000" }), 30_000);
 
+const allocatedPort = await allocateOpencodeLoopbackPort();
+assert.ok(Number.isInteger(allocatedPort) && allocatedPort > 0, "loopback allocator returns a concrete TCP port");
+const allocationProbe = http.createServer();
+await new Promise<void>((resolve, reject) => {
+  allocationProbe.once("error", reject);
+  allocationProbe.listen(allocatedPort, "127.0.0.1", () => resolve());
+});
+await new Promise<void>((resolve, reject) => allocationProbe.close((error) => error ? reject(error) : resolve()));
+
 let capturedTimeout: number | undefined;
+let capturedHostname: string | undefined;
+let capturedPort: number | undefined;
 const mockSdkLoader = async () => ({
-  createOpencode: async (options?: { timeout?: number; config?: unknown }) => {
+  createOpencode: async (options?: { hostname?: string; port?: number; timeout?: number; config?: unknown }) => {
+    capturedHostname = options?.hostname;
+    capturedPort = options?.port;
     capturedTimeout = options?.timeout;
     assert.deepEqual(options?.config, {
       agent: {
@@ -687,7 +701,11 @@ const mockSdkLoader = async () => ({
     return { client, server: { close: () => undefined } };
   },
 });
-await defaultOpencodeFactory({}, undefined, mockSdkLoader as any);
+await defaultOpencodeFactory({}, undefined, mockSdkLoader as any, async () => 54_321);
+assert.equal(capturedHostname, "127.0.0.1");
+assert.equal(capturedPort, 54_321);
 assert.equal(capturedTimeout, 30_000);
-await defaultOpencodeFactory({ DEVSPACE_OPENCODE_STARTUP_TIMEOUT_MS: "55000" }, undefined, mockSdkLoader as any);
+await defaultOpencodeFactory({ DEVSPACE_OPENCODE_STARTUP_TIMEOUT_MS: "55000" }, undefined, mockSdkLoader as any, async () => 54_322);
+assert.equal(capturedHostname, "127.0.0.1");
+assert.equal(capturedPort, 54_322);
 assert.equal(capturedTimeout, 55_000);

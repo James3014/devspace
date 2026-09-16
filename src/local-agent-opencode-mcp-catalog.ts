@@ -1,16 +1,25 @@
 import { createOpencode } from "@opencode-ai/sdk/v2";
-import type { OpencodeClientLike, OpencodeServerLike } from "./local-agent-opencode.js";
+import {
+  allocateOpencodeLoopbackPort,
+  type OpencodeClientLike,
+  type OpencodeServerLike,
+} from "./local-agent-opencode.js";
 import { acquireOpencodeCatalog, type OpencodeCatalogSnapshot } from "./local-agent-opencode-catalog.js";
 
 export type McpCatalogLifecycle = { client: OpencodeClientLike; server: OpencodeServerLike };
 export type McpCatalogFactory = () => Promise<McpCatalogLifecycle>;
 
 /**
- * The MCP catalog gets an isolated SDK server. Port 0 lets the OS choose an
- * available localhost endpoint, so discovery cannot occupy the dispatch port.
+ * The MCP catalog gets an isolated SDK server on a pre-allocated loopback
+ * port. OpenCode 1.18.x treats --port=0 as its default 4096 rather than an OS
+ * ephemeral-port request, so passing 0 would collide with worker runtimes.
  */
-export async function defaultMcpOpencodeCatalogFactory(): Promise<McpCatalogLifecycle> {
-  return createOpencode({ hostname: "127.0.0.1", port: 0, timeout: 30_000 });
+export async function defaultMcpOpencodeCatalogFactory(
+  create: typeof createOpencode = createOpencode,
+  allocatePort: () => Promise<number> = allocateOpencodeLoopbackPort,
+): Promise<McpCatalogLifecycle> {
+  const port = await allocatePort();
+  return create({ hostname: "127.0.0.1", port, timeout: 30_000 });
 }
 
 export function createMcpOpencodeCatalogSource(factory: McpCatalogFactory = defaultMcpOpencodeCatalogFactory, options: { retryMs?: number } = {}) {

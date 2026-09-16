@@ -841,7 +841,7 @@ export class LocalAgentSessionManager {
     const receipt = record.executionContract?.catalogReceipt;
     if (receipt) {
       const snapshot = receipt.provider === "opencode" ? input.opencodeCatalog : receipt.provider === "cline" ? input.clineCatalog : undefined;
-      if (!snapshot || snapshot.generation !== receipt.generation) {
+      if (!snapshot) {
         throw new AgentSessionError("REBIND_REQUIRED", `Agent ${agentId} catalog receipt is stale or unavailable; explicit rebind is required.`);
       }
       if (receipt.provider === "opencode") {
@@ -850,6 +850,9 @@ export class LocalAgentSessionManager {
         const runtimeIdentity = `${opencode.runtime?.source ?? "unknown"}:${opencode.runtime?.version ?? "unknown"}:${opencode.runtime?.executable ?? "unknown"}`;
         if (!validation.valid || opencode.source !== receipt.source || !catalogSnapshotIsFresh(opencode.fetchedAt, opencode.expiresAt) || (opencode.freshness ?? "unknown") !== receipt.freshness || runtimeIdentity !== receipt.runtimeIdentity) throw new AgentSessionError("REBIND_REQUIRED", validation.reason ?? "Persisted OpenCode catalog receipt is no longer valid.");
       } else if (receipt.provider === "cline") {
+        if (snapshot.generation !== receipt.generation) {
+          throw new AgentSessionError("REBIND_REQUIRED", `Agent ${agentId} catalog receipt is stale or unavailable; explicit rebind is required.`);
+        }
         const cline = snapshot as ClineCatalogSnapshot;
         const exact = cline.entries.filter((entry) => entry.cliProviderId === (receipt.cliProviderId ?? "cline") && entry.fullName === receipt.model);
         const runtimeIdentity = `${cline.runtime.cliProviderId}:${cline.runtime.version}:${cline.runtime.command}`;
@@ -1836,8 +1839,7 @@ export class LocalAgentSessionManager {
       if (catalogReceipt?.provider === "opencode") {
         const liveCatalog = await this.opencodeCatalogSource.acquire();
         const runtimeIdentity = `${liveCatalog.runtime?.source ?? "unknown"}:${liveCatalog.runtime?.version ?? "unknown"}:${liveCatalog.runtime?.executable ?? "unknown"}`;
-        if (liveCatalog.generation !== catalogReceipt.generation
-          || liveCatalog.source !== catalogReceipt.source
+        if (liveCatalog.source !== catalogReceipt.source
           || !catalogSnapshotIsFresh(liveCatalog.fetchedAt, liveCatalog.expiresAt)
           || (liveCatalog.freshness ?? "unknown") !== catalogReceipt.freshness
           || runtimeIdentity !== catalogReceipt.runtimeIdentity) {

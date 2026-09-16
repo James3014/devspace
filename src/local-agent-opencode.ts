@@ -1,3 +1,4 @@
+import { createServer } from "node:net";
 import type {
   ModelRef,
   OpencodeClient,
@@ -196,6 +197,26 @@ export class OpencodeLocalAgentDriver implements LocalAgentDriver {
 export const DEFAULT_OPENCODE_STARTUP_TIMEOUT_MS = 30_000;
 export const MAX_OPENCODE_STARTUP_TIMEOUT_MS = 120_000;
 
+export async function allocateOpencodeLoopbackPort(): Promise<number> {
+  const probe = createServer();
+  return new Promise<number>((resolve, reject) => {
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address();
+      if (!address || typeof address === "string" || address.port <= 0) {
+        probe.close();
+        reject(new Error("Failed to allocate an ephemeral loopback port for OpenCode."));
+        return;
+      }
+      const port = address.port;
+      probe.close((error) => {
+        if (error) reject(error);
+        else resolve(port);
+      });
+    });
+  });
+}
+
 export function resolveOpencodeStartupTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env.DEVSPACE_OPENCODE_STARTUP_TIMEOUT_MS;
   if (raw === undefined || raw.trim() === "") return DEFAULT_OPENCODE_STARTUP_TIMEOUT_MS;
@@ -217,9 +238,13 @@ export async function defaultOpencodeFactory(
   env: NodeJS.ProcessEnv = process.env,
   _context?: LocalAgentRuntimeContext,
   loadSdk: () => Promise<OpencodeSdkModuleLike> = () => import("@opencode-ai/sdk/v2"),
+  allocatePort: () => Promise<number> = allocateOpencodeLoopbackPort,
 ): Promise<{ client: OpencodeClientLike; server: OpencodeServerLike }> {
   const { createOpencode } = await loadSdk();
+  const port = await allocatePort();
   return createOpencode({
+    hostname: "127.0.0.1",
+    port,
     timeout: resolveOpencodeStartupTimeoutMs(env),
     config: {
       agent: {
