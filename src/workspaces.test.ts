@@ -7,6 +7,7 @@ import test, { type TestContext } from "node:test";
 import { promisify } from "node:util";
 import { loadConfig, type ServerConfig } from "./config.js";
 import { GitWorktreeError } from "./git-worktrees.js";
+import { formatPathForPrompt } from "./skills.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
 import { WorkspaceRegistry } from "./workspaces.js";
 
@@ -62,6 +63,35 @@ test("a checkout exposes initial and nested instruction context while filtering 
       ["root instructions\n"],
     );
   }
+});
+
+test("advertised home skill paths round-trip through workspace read resolution", async (t) => {
+  const context = await fixture(t);
+  const originalHome = process.env.HOME;
+  process.env.HOME = context.root;
+  t.after(() => {
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+  });
+
+  const skillDir = join(context.root, ".agents", "skills", "home-skill");
+  await mkdir(skillDir, { recursive: true });
+  await writeFile(
+    join(skillDir, "SKILL.md"),
+    ["---", "name: home-skill", "description: Test home skill.", "---", "", "# Home Skill", ""].join("\n"),
+  );
+
+  const registry = new WorkspaceRegistry(context.config);
+  const opened = await registry.openWorkspace(context.root);
+  const skill = opened.workspace.skills.find((candidate) => candidate.name === "home-skill");
+  assert.ok(skill);
+
+  const advertisedPath = formatPathForPrompt(skill.filePath);
+  assert.equal(advertisedPath, "~/.agents/skills/home-skill/SKILL.md");
+
+  const resolved = registry.resolveReadPath(opened.workspace, advertisedPath);
+  assert.equal(resolved.absolutePath, skill.filePath);
+  assert.equal(resolved.skillRead?.isSkillFile, true);
 });
 
 test("opening a missing checkout creates its workspace root", async (t) => {
