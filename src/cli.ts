@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { CarrierBindingStore, type CarrierContract } from "./carrier-binding.js";
 import { canonicalizePath, isPathInsideRoot } from "./roots.js";
 import { createRequire } from "node:module";
@@ -1273,6 +1274,23 @@ function runCarrierCommand(args: string[]): void {
       const record=bindings.inspectLocal(id);
       bindings.validateLocalScope(record.contract,[...config.allowedRoots,config.worktreeRoot]);
       result=bindings.reauthorizeLocal(id,Number(flags[1]),flags[3]!);
+    }
+    else if(action==="rotate-credential" && flags.length===8 && flags[0]==="--version" && flags[2]==="--validity-version" && flags[4]==="--credential-file" && flags[6]==="--confirm" && flags[7]===id) {
+      const expectedVersion=Number(flags[1]), expectedValidityVersion=Number(flags[3]), intentPath=resolve(flags[5]!);
+      const record=bindings.inspectLocal(id);
+      bindings.validateLocalScope(record.contract,[...config.allowedRoots,config.worktreeRoot]);
+      let intent: {schema:string;carrierId:string;expectedVersion:number;expectedValidityVersion:number;expectedCredentialHash:string;credential:string};
+      if(existsSync(intentPath)) {
+        const stats=lstatSync(intentPath);
+        if(!stats.isFile() || stats.isSymbolicLink() || (process.platform!=="win32" && ((stats.mode & 0o077)!==0 || (typeof process.getuid==="function" && stats.uid!==process.getuid())))) throw new Error("Carrier credential intent file must be an owner-private regular file");
+        intent=JSON.parse(readFileSync(intentPath,"utf8"));
+      } else {
+        const state=bindings.credentialRotationStateLocal(id,expectedVersion,expectedValidityVersion);
+        intent={schema:"devspace.carrier_credential_rotation.v1",carrierId:id,expectedVersion,expectedValidityVersion,expectedCredentialHash:state.credentialHash,credential:randomBytes(32).toString("base64url")};
+        writeFileSync(intentPath,`${JSON.stringify(intent)}\n`,{encoding:"utf8",flag:"wx",mode:0o600});
+      }
+      if(intent.schema!=="devspace.carrier_credential_rotation.v1" || intent.carrierId!==id || intent.expectedVersion!==expectedVersion || intent.expectedValidityVersion!==expectedValidityVersion || !/^[a-f0-9]{64}$/.test(intent.expectedCredentialHash) || !/^[A-Za-z0-9_-]{43}$/.test(intent.credential) || Object.keys(intent).sort().join(",")!=="carrierId,credential,expectedCredentialHash,expectedValidityVersion,expectedVersion,schema") throw new Error("Carrier credential intent file does not match the requested rotation");
+      result={...bindings.rotateCredentialLocal(id,expectedVersion,expectedValidityVersion,intent.expectedCredentialHash,intent.credential),credentialFile:intentPath};
     }
     else if(action==="approve" && flags.length===4 && flags[0]==="--contract" && flags[2]==="--confirm" && flags[3]===id) {
       const contract=JSON.parse(readFileSync(resolve(flags[1]!),"utf8")) as CarrierContract;

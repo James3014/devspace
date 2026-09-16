@@ -309,6 +309,32 @@ export class CarrierBindingStore {
     const validity=this.readValidity(id);
     return {id:row.id,parentId:row.parent_id,version:row.version,revoked:row.revoked!==0,contract:this.validateContract(JSON.parse(row.contract_json),false),validity:{version:validity.version,expiresAt:validity.expires_at}};
   }
+  /** Local credential recovery state exposes only a high-entropy verifier hash, never the verifier itself. */
+  credentialRotationStateLocal(id: string, expectedVersion: number, expectedValidityVersion: number) {
+    const before=this.active(id);
+    if(before.row.version!==expectedVersion || before.validity.version!==expectedValidityVersion) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Carrier or validity version changed");
+    return {carrier:this.public(before),credentialHash:before.row.credential_hash};
+  }
+  /** Local credential rotation changes only verifier possession; authority, grant and validity stay fixed. */
+  rotateCredentialLocal(id: string, expectedVersion: number, expectedValidityVersion: number, expectedCredentialHash: string, credential: string) {
+    if(!/^[a-f0-9]{64}$/.test(expectedCredentialHash)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Invalid expected credential hash");
+    if(!/^[A-Za-z0-9_-]{43}$/.test(credential)) deny("Invalid replacement credential");
+    return this.database.sqlite.transaction(()=>{
+      const before=this.active(id);
+      if(before.row.version!==expectedVersion || before.validity.version!==expectedValidityVersion) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Carrier or validity version changed");
+      const nextHash=digest(credential);
+      if(before.row.credential_hash===nextHash) return {carrier:this.public(before),credentialHash:nextHash,replayed:true};
+      if(before.row.credential_hash!==expectedCredentialHash) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Carrier credential changed");
+      const update=this.database.sqlite.prepare("update carrier_bindings set credential_hash=? where id=? and version=? and revoked=0 and credential_hash=?")
+        .run(nextHash,id,expectedVersion,expectedCredentialHash);
+      if(update.changes!==1) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Carrier credential changed");
+      this.database.sqlite.prepare("update carrier_pairings set credential_hash=? where binding_id=? and credential_hash=?")
+        .run(nextHash,id,expectedCredentialHash);
+      const after=this.active(id);
+      if(after.row.version!==before.row.version || after.validity.version!==before.validity.version || after.generation!==before.generation || JSON.stringify(after.contract)!==JSON.stringify(before.contract) || JSON.stringify(this.grant(after))!==JSON.stringify(this.grant(before))) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Credential rotation changed carrier authority");
+      return {carrier:this.public(after),credentialHash:nextHash,replayed:false};
+    }).immediate();
+  }
   /** Local validity approval never changes immutable authority or revocation. */
   reauthorizeLocal(id: string, expectedValidityVersion: number, expiresAt: string) {
     return this.database.sqlite.transaction(()=>{

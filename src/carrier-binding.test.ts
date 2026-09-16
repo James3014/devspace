@@ -3,9 +3,10 @@ import { execFileSync } from "node:child_process";
 import { DurableOperationManager, planCutoverStart } from "./durable-operations.js";
 import { loadConfig } from "./config.js";
 import test from "node:test";
-import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { CarrierBindingStore, type CarrierContract, type CarrierCompletionBinding } from "./carrier-binding.js";
 import { openDatabase } from "./db/client.js";
 import { CutoverStateStore } from "./cutover-state.js";
@@ -329,6 +330,88 @@ test("reauthorization preserves identity and grant, rejects stale or unbounded a
     assert.equal(f.store.releaseLease(f.controller,lease.leaseId,lease.version).terminalState,"released");
     assert.notEqual(f.store.prepareEffect(f.controller,{...subject,operationId:"next"}).leaseId,lease.leaseId);
     assert.ok(!JSON.stringify(f.store.inspectLocal(f.approved.id)).includes(f.request.credential));
+  } finally {f.close();}
+});
+
+test("local credential rotation is CAS-bound, idempotent, and preserves carrier authority",()=>{
+  const f=fixture();try {
+    const before=f.store.status(f.controller);
+    const state=f.store.credentialRotationStateLocal(f.approved.id,before.version,before.validity.version);
+    assert.deepEqual(state.carrier,before);
+    assert.match(state.credentialHash,/^[a-f0-9]{64}$/);
+    assert.ok(!JSON.stringify(state).includes(f.request.credential));
+
+    const credential="A".repeat(43);
+    const rotated=f.store.rotateCredentialLocal(f.approved.id,before.version,before.validity.version,state.credentialHash,credential);
+    assert.equal(rotated.replayed,false);
+    assert.deepEqual(rotated.carrier,before);
+    assert.match(rotated.credentialHash,/^[a-f0-9]{64}$/);
+    assert.equal(Object.prototype.hasOwnProperty.call(rotated,"credential"),false);
+    assert.deepEqual(f.store.inspectLocal(f.approved.id),{
+      id:before.id,parentId:before.parentId,version:before.version,revoked:false,contract:before.contract,validity:before.validity,
+    });
+
+    const replay=f.store.rotateCredentialLocal(f.approved.id,before.version,before.validity.version,state.credentialHash,credential);
+    assert.equal(replay.replayed,true);
+    assert.deepEqual(replay.carrier,before);
+    assert.equal(replay.credentialHash,rotated.credentialHash);
+    assert.throws(()=>f.store.rotateCredentialLocal(f.approved.id,before.version,before.validity.version,state.credentialHash,"B".repeat(43)));
+
+    f.store.forgetSession(f.controller.sessionId);
+    assert.throws(()=>f.store.redeem(f.controller,f.request.credential));
+    const replacement={clientId:f.controller.clientId,sessionId:"replacement-session"};
+    assert.deepEqual(f.store.redeem(replacement,credential),before);
+    assert.throws(()=>f.store.redeem({clientId:"different-oauth",sessionId:"other"},credential));
+    assert.throws(()=>f.store.credentialRotationStateLocal(f.approved.id,before.version+1,before.validity.version));
+    assert.throws(()=>f.store.rotateCredentialLocal(f.approved.id,before.version,before.validity.version+1,rotated.credentialHash,credential));
+    assert.throws(()=>f.store.rotateCredentialLocal(f.approved.id,before.version,before.validity.version,"bad",credential));
+    assert.throws(()=>f.store.rotateCredentialLocal(f.approved.id,before.version,before.validity.version,rotated.credentialHash,"bad"));
+
+    f.store.revokeLocal(f.approved.id,before.version);
+    assert.throws(()=>f.store.rotateCredentialLocal(f.approved.id,before.version,before.validity.version,rotated.credentialHash,credential));
+  } finally {f.close();}
+});
+
+test("carrier CLI persists a private replayable rotation intent and never prints the verifier",()=>{
+  const f=fixture();try {
+    const cli=fileURLToPath(new URL("./cli.ts",import.meta.url));
+    const env={...process.env,
+      DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_ALLOWED_ROOTS:f.root,
+      DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees"),DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"};
+    const before=f.store.status(f.controller), intentPath=join(f.root,"rotation-intent.json");
+    const args=["--import","tsx",cli,"carrier","rotate-credential",before.id,"--version",String(before.version),"--validity-version",String(before.validity.version),"--credential-file",intentPath,"--confirm",before.id];
+    const output=execFileSync(process.execPath,args,{env,encoding:"utf8"});
+    const rotated=JSON.parse(output) as {carrier:typeof before;credentialHash:string;replayed:boolean;credentialFile:string};
+    const intent=JSON.parse(readFileSync(intentPath,"utf8")) as {credential:string;expectedCredentialHash:string};
+    assert.deepEqual(rotated.carrier,before);
+    assert.equal(rotated.replayed,false);
+    assert.equal(rotated.credentialFile,intentPath);
+    assert.match(rotated.credentialHash,/^[a-f0-9]{64}$/);
+    assert.match(intent.credential,/^[A-Za-z0-9_-]{43}$/);
+    assert.equal(Object.prototype.hasOwnProperty.call(rotated,"credential"),false);
+    assert.equal(output.includes(intent.credential),false);
+    if(process.platform!=="win32") assert.equal(lstatSync(intentPath).mode & 0o077,0);
+
+    const replayOutput=execFileSync(process.execPath,args,{env,encoding:"utf8"});
+    const replay=JSON.parse(replayOutput) as typeof rotated;
+    assert.equal(replay.replayed,true);
+    assert.equal(replay.credentialHash,rotated.credentialHash);
+    assert.equal((JSON.parse(readFileSync(intentPath,"utf8")) as {credential:string}).credential,intent.credential);
+
+    f.store.forgetSession(f.controller.sessionId);
+    assert.throws(()=>f.store.redeem(f.controller,f.request.credential));
+    assert.deepEqual(f.store.redeem({clientId:f.controller.clientId,sessionId:"cli-replacement"},intent.credential),before);
+    assert.throws(()=>execFileSync(process.execPath,[...args.slice(0,-1),"wrong-carrier"],{env,stdio:"pipe"}));
+
+    const insecurePath=join(f.root,"insecure-intent.json");
+    writeFileSync(insecurePath,readFileSync(intentPath));
+    if(process.platform!=="win32") chmodSync(insecurePath,0o644);
+    assert.throws(()=>execFileSync(process.execPath,[...args.slice(0,11),insecurePath,...args.slice(12)],{env,stdio:"pipe"}));
+    if(process.platform!=="win32") {
+      const symlinkPath=join(f.root,"symlink-intent.json");
+      symlinkSync(intentPath,symlinkPath);
+      assert.throws(()=>execFileSync(process.execPath,[...args.slice(0,11),symlinkPath,...args.slice(12)],{env,stdio:"pipe"}));
+    }
   } finally {f.close();}
 });
 
