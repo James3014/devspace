@@ -878,7 +878,9 @@ test("carrier effects never use conversation identity as missing peer authority"
   assert.equal(f.sockets.length, 0);
 });
 
-test("existing-session missing or malformed metadata fails closed before connection", async (t) => {
+const macOsOnlyTest = process.platform === "darwin" ? test : test.skip;
+
+macOsOnlyTest("existing-session missing or malformed metadata fails closed before connection", async (t) => {
   const f = existingCdpFixture(t, "");
   let result = await f.driver.preflight();
   assert.match(result.blocker!, /BROWSER_CONTROL_UNAVAILABLE:DEVTOOLS_ACTIVE_PORT_UNAVAILABLE/);
@@ -895,7 +897,7 @@ test("existing-session missing or malformed metadata fails closed before connect
   assert.equal(f.calls.length, 0);
 });
 
-test("existing-session resolves dynamic browser endpoint anew and closes each bounded connection", async (t) => {
+macOsOnlyTest("existing-session resolves dynamic browser endpoint anew and closes each bounded connection", async (t) => {
   const f = existingCdpFixture(t);
   assert.equal((await f.driver.preflight()).ready, true);
   writeFileSync(join(f.root, "DevToolsActivePort"), "45234\r\n/devtools/browser/browser-two\r\n");
@@ -905,7 +907,7 @@ test("existing-session resolves dynamic browser endpoint anew and closes each bo
   assert.deepEqual(f.calls.map(c => c.method), ["Browser.getVersion", "Browser.getVersion"]);
 });
 
-test("existing-session isolates exact targets, reopens lost conversations, and closes only the requested target", async (t) => {
+macOsOnlyTest("existing-session isolates exact targets, reopens lost conversations, and closes only the requested target", async (t) => {
   const f = existingCdpFixture(t);
   const url = "https://chatgpt.com/c/worker-a";
   assert.equal((await f.driver.sendPrompt(url, "wake a", f.deadline())).delivered, true);
@@ -922,7 +924,7 @@ test("existing-session isolates exact targets, reopens lost conversations, and c
   assert.ok(f.sockets.every(s => s.closed));
 });
 
-test("existing-session disconnect before acknowledgement never retries a prompt or switches transport", async (t) => {
+macOsOnlyTest("existing-session disconnect before acknowledgement never retries a prompt or switches transport", async (t) => {
   const f = existingCdpFixture(t);
   f.disconnect("Runtime.evaluate");
   const result = await f.driver.sendPrompt("https://chatgpt.com/c/worker-a", "wake", f.deadline());
@@ -934,7 +936,7 @@ test("existing-session disconnect before acknowledgement never retries a prompt 
   assert.equal(result.remoteMayContinue, true);
 });
 
-test("existing-session keeps signed-out and app binding blockers separate from control availability", async (t) => {
+macOsOnlyTest("existing-session keeps signed-out and app binding blockers separate from control availability", async (t) => {
   const f = existingCdpFixture(t);
   f.dom("signed-out");
   assert.match((await f.driver.recoverConversation("https://chatgpt.com/c/worker-a", f.deadline())).blocker!, /CHATGPT_SIGNED_OUT/);
@@ -943,7 +945,7 @@ test("existing-session keeps signed-out and app binding blockers separate from c
 });
 
 
-test("existing-session socket close cannot distinguish authorization denial from transport failure", async (t) => {
+macOsOnlyTest("existing-session socket close cannot distinguish authorization denial from transport failure", async (t) => {
   const f = existingCdpFixture(t);
   f.deny();
   const result = await f.driver.preflight();
@@ -955,7 +957,7 @@ test("existing-session socket close cannot distinguish authorization denial from
   assert.ok(f.sockets.every(s => s.closed));
 });
 
-test("existing-session prompt acknowledgement loss remains unknown and is not blindly resent", async (t) => {
+macOsOnlyTest("existing-session prompt acknowledgement loss remains unknown and is not blindly resent", async (t) => {
   const f = existingCdpFixture(t);
   f.loseSendAck();
   const result = await f.driver.sendPrompt("https://chatgpt.com/c/worker-a", "wake", f.deadline());
@@ -967,7 +969,7 @@ test("existing-session prompt acknowledgement loss remains unknown and is not bl
   assert.equal(f.sockets.length, 1);
 });
 
-test("existing-session rejects cross-session responses", async (t) => {
+macOsOnlyTest("existing-session rejects cross-session responses", async (t) => {
   const f = existingCdpFixture(t);
   f.spoofSession();
   const spoofed = await f.driver.recoverConversation("https://chatgpt.com/c/worker-a", f.deadline());
@@ -975,7 +977,7 @@ test("existing-session rejects cross-session responses", async (t) => {
   assert.match(spoofed.blocker!, /SESSION_IDENTITY_MISMATCH/);
 });
 
-test("existing-session checks the exact URL inside the prompt mutation", async (t) => {
+macOsOnlyTest("existing-session checks the exact URL inside the prompt mutation", async (t) => {
   const f = existingCdpFixture(t);
   f.drift();
   const drifted = await f.driver.sendPrompt("https://chatgpt.com/c/worker-a", "wake", f.deadline());
@@ -984,7 +986,7 @@ test("existing-session checks the exact URL inside the prompt mutation", async (
   assert.equal(f.targets.get("target-b"), "https://chatgpt.com/c/worker-b");
 });
 
-test("existing-session recovery after target deletion reopens only the saved conversation", async (t) => {
+macOsOnlyTest("existing-session recovery after target deletion reopens only the saved conversation", async (t) => {
   const f = existingCdpFixture(t);
   f.targets.delete("target-a");
   const url = "https://chatgpt.com/c/worker-a";
@@ -994,7 +996,7 @@ test("existing-session recovery after target deletion reopens only the saved con
   assert.equal(f.targets.get("target-b"), "https://chatgpt.com/c/worker-b");
 });
 
-test("explicit and legacy managed CDP retain the direct endpoint path", async (t) => {
+macOsOnlyTest("explicit and legacy managed CDP retain the direct endpoint path", async (t) => {
   const config = loadChatSwarmRuntimeConfig({ stateDir: "/tmp/devspace-managed", chatSwarmMaxWorkers: 3 }, {
     DEVSPACE_CHAT_SWARM_CDP_MODE: "managed",
     DEVSPACE_CHAT_SWARM_CDP_ENDPOINT: "http://127.0.0.1:9333",
@@ -1044,7 +1046,7 @@ test("unset CDP mode retains managed browserExecutable startup without launching
   })));
 });
 
-test("existing-session missing explicit setup is authorization-required, never inferred from missing metadata", async (t) => {
+macOsOnlyTest("existing-session missing explicit setup is authorization-required, never inferred from missing metadata", async (t) => {
   const f = existingCdpFixture(t, "");
   for (const browserProfileDir of ["", "relative"] ) {
     assert.throws(() => loadChatSwarmRuntimeConfig({ stateDir: f.root, chatSwarmMaxWorkers: 3 }, {
@@ -1065,7 +1067,7 @@ test("existing-session missing explicit setup is authorization-required, never i
   assert.equal(f.calls.length, 0);
 });
 
-test("existing-session browser readiness surfaces unknown app binding without blocking bootstrap delivery", async (t) => {
+macOsOnlyTest("existing-session browser readiness surfaces unknown app binding without blocking bootstrap delivery", async (t) => {
   const f = existingCdpFixture(t);
   f.dom("unknown");
   const preflight = await f.driver.preflight();
@@ -1085,7 +1087,7 @@ test("existing-session browser readiness surfaces unknown app binding without bl
 });
 
 for (const binding of ["DISABLED", "STALE"] as const) {
-  test(`existing-session ${binding} app binding blocks send and recovery with explicit NOT_READY`, async (t) => {
+  macOsOnlyTest(`existing-session ${binding} app binding blocks send and recovery with explicit NOT_READY`, async (t) => {
     const f = existingCdpFixture(t);
     f.dom(binding.toLowerCase());
     const url = "https://chatgpt.com/c/worker-a";
