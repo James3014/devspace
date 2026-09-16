@@ -1,7 +1,9 @@
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { constants } from "node:fs";
+import { open } from "node:fs/promises";
 import { homedir } from "node:os";
-import { join, resolve } from "node:path";
+import { isAbsolute, join, resolve } from "node:path";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import {
   ChatSwarmError,
@@ -66,6 +68,7 @@ export interface ChatSwarmRuntimeConfig {
   transport: "cdp" | "opencli";
   openCliExecutable: string;
   cdpEndpoint: string;
+  cdpMode?: "existing-session" | "managed";
   browserExecutable?: string;
   browserProfileDir: string;
   appLabel: string;
@@ -301,6 +304,19 @@ export function loadChatSwarmRuntimeConfig(
   if (transport !== "cdp" && transport !== "opencli") {
     throw new Error("DEVSPACE_CHAT_SWARM_TRANSPORT must be cdp or opencli");
   }
+  const cdpMode = env.DEVSPACE_CHAT_SWARM_CDP_MODE?.trim() || "managed";
+  if (cdpMode !== "existing-session" && cdpMode !== "managed") {
+    throw new Error("DEVSPACE_CHAT_SWARM_CDP_MODE must be existing-session or managed");
+  }
+  const profileDir = env.DEVSPACE_CHAT_SWARM_BROWSER_PROFILE_DIR?.trim();
+  if (cdpMode === "existing-session") {
+    if (transport !== "cdp" || !profileDir || !isAbsolute(profileDir)) {
+      throw new Error("existing-session requires CDP and an explicit absolute DEVSPACE_CHAT_SWARM_BROWSER_PROFILE_DIR (Chrome user-data-dir)");
+    }
+    if (env.DEVSPACE_CHAT_SWARM_BROWSER_BIN?.trim() || env.DEVSPACE_CHAT_SWARM_CDP_ENDPOINT?.trim()) {
+      throw new Error("existing-session uses only DevToolsActivePort; BROWSER_BIN and CDP_ENDPOINT must be unset");
+    }
+  }
   const openCliExecutable = env.DEVSPACE_CHAT_SWARM_OPENCLI_BIN?.trim() || "opencli";
   const cdpEndpoint = (
     env.DEVSPACE_CHAT_SWARM_CDP_ENDPOINT?.trim() || "http://127.0.0.1:9222"
@@ -322,9 +338,10 @@ export function loadChatSwarmRuntimeConfig(
     transport,
     openCliExecutable,
     cdpEndpoint,
+    cdpMode,
     browserExecutable: env.DEVSPACE_CHAT_SWARM_BROWSER_BIN?.trim() || undefined,
     browserProfileDir: resolve(
-      env.DEVSPACE_CHAT_SWARM_BROWSER_PROFILE_DIR?.trim() ||
+      profileDir ||
         join(homedir(), ".devspace", "chat-swarm-browser"),
     ),
     appLabel,
@@ -1658,8 +1675,143 @@ export class OpenCliMacWebDriver implements MacWebDriver {
   }
 }
 
+// One bounded browser control connection per lifecycle operation. Neither this
+// connection nor its flattened CDP sessions are durable worker identity.
+class ExistingChromeControl {
+  private nextId = 0;
+  private readonly pending = new Map<number, {
+    resolve: (value: any) => void;
+    reject: (error: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+    sessionId?: string;
+  }>();
+  private readonly sessions = new Map<string, string>();
+  private failure?: Error;
+
+  private constructor(private readonly socket: WebSocket, private readonly deadline: number) {}
+
+  static async connect(config: ChatSwarmRuntimeConfig, deadlineAt: string): Promise<ExistingChromeControl> {
+    if (!isAbsolute(config.browserProfileDir)) {
+      throw new Error("BROWSER_CONTROL_UNAVAILABLE:EXPLICIT_USER_DATA_DIR_REQUIRED");
+    }
+    let metadata: string;
+    try {
+      // Read only this public endpoint artifact, never profile/session material.
+      const file = await open(join(config.browserProfileDir, "DevToolsActivePort"), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      try {
+        const stat = await file.stat();
+        if (!stat.isFile() || stat.size > 1024) {
+          throw new Error("BROWSER_CONTROL_UNAVAILABLE:DEVTOOLS_ACTIVE_PORT_MALFORMED");
+        }
+        const buffer = Buffer.alloc(1025);
+        const { bytesRead } = await file.read(buffer, 0, buffer.length, 0);
+        metadata = buffer.subarray(0, bytesRead).toString("utf8");
+      } finally { await file.close(); }
+    } catch (error) {
+      if (error instanceof Error && error.message.startsWith("BROWSER_CONTROL_UNAVAILABLE:")) throw error;
+      throw new Error("BROWSER_CONTROL_UNAVAILABLE:DEVTOOLS_ACTIVE_PORT_UNAVAILABLE");
+    }
+    const match = /^([1-9][0-9]{0,4})\r?\n(\/devtools\/browser\/[A-Za-z0-9_-]+)(?:\r?\n)?$/.exec(metadata);
+    if (metadata.length > 1024 || !match || Number(match[1]) > 65535) {
+      throw new Error("BROWSER_CONTROL_UNAVAILABLE:DEVTOOLS_ACTIVE_PORT_MALFORMED");
+    }
+    const deadline = Math.min(Date.parse(deadlineAt), Date.now() + config.operationTimeoutMs);
+    if (!Number.isFinite(deadline) || deadline <= Date.now()) {
+      throw new Error("BROWSER_CONTROL_UNAVAILABLE:DEADLINE");
+    }
+    let socket: WebSocket;
+    try { socket = new WebSocket(`ws://127.0.0.1:${match[1]}${match[2]}`); }
+    catch { throw new Error("BROWSER_CONTROL_UNAVAILABLE:WEBSOCKET_UNAVAILABLE"); }
+    const control = new ExistingChromeControl(socket, deadline);
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      const timer = setTimeout(() => {
+        control.fail("AUTHORIZATION_OR_CONNECTION_TIMEOUT");
+        rejectPromise(control.failure);
+      }, deadline - Date.now());
+      const unavailable = () => {
+        clearTimeout(timer);
+        control.fail("AUTHORIZATION_OR_CONNECTION_CLOSED");
+        rejectPromise(control.failure);
+      };
+      socket.onerror = unavailable;
+      socket.onclose = unavailable;
+      socket.onopen = () => {
+        clearTimeout(timer);
+        socket.onerror = () => control.fail("CONNECTION_ERROR");
+        socket.onclose = () => control.fail("DISCONNECTED");
+        resolvePromise();
+      };
+      socket.onmessage = (event) => {
+        try {
+          const message = JSON.parse(String(event.data));
+          const pending = control.pending.get(message.id);
+          if (!pending) return;
+          if (message.sessionId !== pending.sessionId) { control.fail("SESSION_IDENTITY_MISMATCH"); return; }
+          clearTimeout(pending.timer);
+          control.pending.delete(message.id);
+          if (message.error) pending.reject(new Error("BROWSER_CONTROL_UNAVAILABLE:CDP_COMMAND_REJECTED"));
+          else pending.resolve(message.result);
+        } catch { control.fail("MALFORMED_CDP_RESPONSE"); }
+      };
+    });
+    return control;
+  }
+
+  private fail(reason: string): void {
+    if (this.failure) return;
+    this.failure = new Error(`BROWSER_CONTROL_UNAVAILABLE:${reason}`);
+    for (const pending of this.pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(this.failure);
+    }
+    this.pending.clear();
+    this.sessions.clear();
+    try { this.socket.close(); } catch {}
+  }
+
+  close(): void { this.fail("CLOSED"); }
+
+  async command<T>(method: string, params: Record<string, unknown> = {}, sessionId?: string): Promise<T> {
+    if (this.failure) throw this.failure;
+    if (Date.now() >= this.deadline) {
+      this.fail("DEADLINE");
+      throw this.failure;
+    }
+    return new Promise<T>((resolvePromise, rejectPromise) => {
+      const id = ++this.nextId;
+      const timer = setTimeout(() => this.fail("COMMAND_TIMEOUT"), this.deadline - Date.now());
+      this.pending.set(id, { resolve: resolvePromise, reject: rejectPromise, timer, sessionId });
+      try { this.socket.send(JSON.stringify({ id, method, params, ...(sessionId ? { sessionId } : {}) })); }
+      catch { this.fail("SEND_FAILED"); }
+    });
+  }
+
+  async evaluate<T>(targetId: string, expression: string): Promise<T> {
+    let sessionId = this.sessions.get(targetId);
+    if (!sessionId) {
+      const attached = await this.command<{ sessionId: string }>("Target.attachToTarget", { targetId, flatten: true });
+      if (!attached.sessionId) throw new Error("BROWSER_CONTROL_UNAVAILABLE:ATTACH_FAILED");
+      sessionId = attached.sessionId;
+      this.sessions.set(targetId, sessionId);
+    }
+    const result = await this.command<{ result?: { value?: T }; exceptionDetails?: unknown }>(
+      "Runtime.evaluate", { expression, returnByValue: true, awaitPromise: true }, sessionId,
+    );
+    if (result.exceptionDetails) throw new Error("CHATGPT_EVALUATION_FAILED");
+    return result.result?.value as T;
+  }
+}
+
 export class CdpMacWebDriver implements MacWebDriver {
+  private control?: ExistingChromeControl;
   constructor(private readonly config: ChatSwarmRuntimeConfig) {}
+
+  private async withExistingControl<T>(deadlineAt: string, action: (driver: CdpMacWebDriver) => Promise<T>): Promise<T> {
+    const driver = new CdpMacWebDriver(this.config);
+    driver.control = await ExistingChromeControl.connect(this.config, deadlineAt);
+    try { return await action(driver); }
+    finally { driver.control.close(); }
+  }
 
   async preflight(): Promise<RuntimePreflight> {
     if (process.platform !== "darwin") {
@@ -1681,10 +1833,17 @@ export class CdpMacWebDriver implements MacWebDriver {
       };
     }
     try {
-      const version = await this.fetchJson<{ Browser?: string }>(
-        "/json/version",
-        new Date(Date.now() + this.config.operationTimeoutMs).toISOString(),
-      );
+      if (this.config.cdpMode === "existing-session" && !this.control) {
+        return await this.withExistingControl(
+          new Date(Date.now() + this.config.operationTimeoutMs).toISOString(),
+          (driver) => driver.preflight(),
+        );
+      }
+      const version = this.control
+        ? { Browser: (await this.control.command<{ product: string }>("Browser.getVersion")).product }
+        : await this.fetchJson<{ Browser?: string }>(
+            "/json/version", new Date(Date.now() + this.config.operationTimeoutMs).toISOString(),
+          );
       return {
         ready: true,
         state: "READY",
@@ -1707,6 +1866,9 @@ export class CdpMacWebDriver implements MacWebDriver {
     projectUrl: string,
     deadlineAt: string,
   ): Promise<ManagedConversationEvidence> {
+    if (this.config.cdpMode === "existing-session" && !this.control) {
+      return this.withExistingControl(deadlineAt, (driver) => driver.createManagedConversation(projectUrl, deadlineAt));
+    }
     await this.ensureRuntime(deadlineAt);
     const target = await this.newTarget(projectUrl, deadlineAt);
     await this.waitForComposer(target, deadlineAt);
@@ -1730,9 +1892,15 @@ export class CdpMacWebDriver implements MacWebDriver {
     deadlineAt: string,
   ): Promise<{ delivered: boolean; remoteMayContinue: boolean; blocker?: string }> {
     try {
+      if (this.config.cdpMode === "existing-session" && !this.control) {
+        return await this.withExistingControl(deadlineAt, (driver) => driver.sendPrompt(conversationUrl, prompt, deadlineAt));
+      }
       await this.ensureRuntime(deadlineAt);
       const target = await this.openOrReuse(conversationUrl, deadlineAt);
       await this.waitForComposer(target, deadlineAt);
+      if (await this.evaluate<string>(target, "location.href") !== conversationUrl) {
+        throw new Error("CHATGPT_CONVERSATION_IDENTITY_DRIFT");
+      }
       const binding = await this.observeAppBinding(target);
       if (binding === "DISABLED" || binding === "STALE") {
         return {
@@ -1741,7 +1909,7 @@ export class CdpMacWebDriver implements MacWebDriver {
           blocker: `HOST_APP_BINDING_${binding}`,
         };
       }
-      await this.sendPromptToTarget(target, prompt, deadlineAt);
+      await this.sendPromptToTarget(target, prompt, deadlineAt, conversationUrl);
       return { delivered: true, remoteMayContinue: true };
     } catch (error) {
       return {
@@ -1757,9 +1925,15 @@ export class CdpMacWebDriver implements MacWebDriver {
     deadlineAt: string,
   ): Promise<{ ready: boolean; blocker?: string }> {
     try {
+      if (this.config.cdpMode === "existing-session" && !this.control) {
+        return await this.withExistingControl(deadlineAt, (driver) => driver.recoverConversation(conversationUrl, deadlineAt));
+      }
       await this.ensureRuntime(deadlineAt);
       const target = await this.openOrReuse(conversationUrl, deadlineAt);
       await this.waitForComposer(target, deadlineAt);
+      if (await this.evaluate<string>(target, "location.href") !== conversationUrl) {
+        throw new Error("CHATGPT_CONVERSATION_IDENTITY_DRIFT");
+      }
       const binding = await this.observeAppBinding(target);
       if (binding === "DISABLED" || binding === "STALE") {
         return { ready: false, blocker: `HOST_APP_BINDING_${binding}` };
@@ -1775,9 +1949,17 @@ export class CdpMacWebDriver implements MacWebDriver {
 
   async closeConversation(conversationUrl: string): Promise<void> {
     const deadlineAt = new Date(Date.now() + this.config.operationTimeoutMs).toISOString();
+    if (this.config.cdpMode === "existing-session" && !this.control) {
+      return this.withExistingControl(deadlineAt, (driver) => driver.closeConversation(conversationUrl));
+    }
     const targets = await this.targets(deadlineAt);
     const exact = targets.find((target) => target.url === conversationUrl);
     if (!exact) return;
+    if (this.control) {
+      const closed = await this.control.command<{ success: boolean }>("Target.closeTarget", { targetId: exact.id });
+      if (!closed.success) throw new Error("BROWSER_CONTROL_UNAVAILABLE:CLOSE_FAILED");
+      return;
+    }
     const response = await this.boundedFetch(
       `${this.config.cdpEndpoint}/json/close/${encodeURIComponent(exact.id)}`,
       { method: "PUT" },
@@ -1789,7 +1971,7 @@ export class CdpMacWebDriver implements MacWebDriver {
   private async ensureRuntime(deadlineAt: string): Promise<void> {
     const ready = await this.preflight();
     if (ready.ready) return;
-    if (!this.config.browserExecutable) {
+    if (this.config.cdpMode === "existing-session" || !this.config.browserExecutable) {
       throw new ChatSwarmError(
         "HOST_CONVERSATION_UNSUPPORTED",
         ready.blocker ?? "CDP browser runtime is unavailable",
@@ -1820,6 +2002,11 @@ export class CdpMacWebDriver implements MacWebDriver {
   }
 
   private async newTarget(url: string, deadlineAt: string): Promise<CdpTarget> {
+    if (this.control) {
+      const result = await this.control.command<{ targetId: string }>("Target.createTarget", { url });
+      if (!result.targetId) throw new Error("BROWSER_CONTROL_UNAVAILABLE:CREATE_TARGET_FAILED");
+      return { id: result.targetId, url };
+    }
     const response = await this.boundedFetch(
       `${this.config.cdpEndpoint}/json/new?${encodeURIComponent(url)}`,
       { method: "PUT" },
@@ -1830,10 +2017,16 @@ export class CdpMacWebDriver implements MacWebDriver {
   }
 
   private async targets(deadlineAt: string): Promise<CdpTarget[]> {
+    if (this.control) {
+      const result = await this.control.command<{ targetInfos: Array<{ targetId: string; url: string; type: string }> }>("Target.getTargets");
+      return result.targetInfos.filter(target => target.type === "page")
+        .map(target => ({ id: target.targetId, url: target.url }));
+    }
     return this.fetchJson<CdpTarget[]>("/json/list", deadlineAt);
   }
 
   private async openOrReuse(url: string, deadlineAt: string): Promise<CdpTarget> {
+    conversationIdFromUrl(url);
     return (
       (await this.targets(deadlineAt)).find((target) => target.url === url) ??
       (await this.newTarget(url, deadlineAt))
@@ -1869,6 +2062,7 @@ export class CdpMacWebDriver implements MacWebDriver {
   }
 
   private async evaluate<T>(target: CdpTarget, expression: string): Promise<T> {
+    if (this.control) return this.control.evaluate<T>(target.id, expression);
     if (!target.webSocketDebuggerUrl) {
       target =
         (await this.targets(
@@ -1920,10 +2114,11 @@ export class CdpMacWebDriver implements MacWebDriver {
 
   private async waitForComposer(target: CdpTarget, deadlineAt: string): Promise<void> {
     while (Date.now() < Date.parse(deadlineAt)) {
-      const ready = await this.evaluate<boolean>(
+      const ready = await this.evaluate<boolean | "SIGNED_OUT">(
         target,
-        `(() => { const visible=(el) => { const rect=el.getBoundingClientRect(); const style=getComputedStyle(el); return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden'; }; return Boolean([...document.querySelectorAll('[contenteditable="true"]')].find(visible) || [...document.querySelectorAll('textarea')].find(visible)); })()`,
-      ).catch(() => false);
+        `(() => { const visible=(el) => { const rect=el.getBoundingClientRect(); const style=getComputedStyle(el); return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden'; }; if ((location.pathname === '/auth' || location.pathname.startsWith('/auth/')) || [...document.querySelectorAll('a,button')].some(el => visible(el) && /^(log in|sign in)$/i.test(el.textContent?.trim()||''))) return 'SIGNED_OUT'; return Boolean([...document.querySelectorAll('[contenteditable="true"]')].find(visible) || [...document.querySelectorAll('textarea')].find(visible)); })()`,
+      );
+      if (ready === "SIGNED_OUT") throw new Error("CHATGPT_SIGNED_OUT");
       if (ready) return;
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
     }
@@ -1937,21 +2132,23 @@ export class CdpMacWebDriver implements MacWebDriver {
     return this.evaluate<"READY" | "UNKNOWN" | "DISABLED" | "STALE">(
       target,
       `(() => { const text=(document.body?.innerText||'').toLowerCase(); const label=${label}; if (text.includes(label) && !text.includes(label+' disabled')) return 'READY'; if (text.includes(label+' disabled')) return 'DISABLED'; return 'UNKNOWN'; })()`,
-    ).catch(() => "UNKNOWN");
+    );
   }
 
   private async sendPromptToTarget(
     target: CdpTarget,
     prompt: string,
     deadlineAt: string,
+    expectedConversationUrl?: string,
   ): Promise<void> {
     if (Date.now() >= Date.parse(deadlineAt)) {
       throw new Error("prompt delivery deadline elapsed before send");
     }
     const encoded = JSON.stringify(prompt);
+    const expectedUrl = JSON.stringify(expectedConversationUrl ?? null);
     const result = await this.evaluate<{ ok: boolean; reason?: string }>(
       target,
-      `(() => { const prompt=${encoded}; const visible=(el) => { const rect=el.getBoundingClientRect(); const style=getComputedStyle(el); return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden'; }; const editable=[...document.querySelectorAll('[contenteditable="true"]')].find(visible); const textarea=[...document.querySelectorAll('textarea')].find(visible); const el=editable||textarea; if(!el) return {ok:false,reason:'composer_missing'}; el.focus(); if(editable){ editable.textContent=prompt; editable.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:prompt})); } else { const setter=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')?.set; setter?.call(textarea,prompt); textarea.dispatchEvent(new Event('input',{bubbles:true})); } const button=document.querySelector('[data-testid="send-button"]') || [...document.querySelectorAll('button')].find(b => /send/i.test((b.getAttribute('aria-label')||b.textContent||''))); if(!button || button.disabled) return {ok:false,reason:'send_button_missing_or_disabled'}; button.click(); return {ok:true}; })()`,
+      `(() => { const expectedUrl=${expectedUrl}; if(expectedUrl && location.href !== expectedUrl) return {ok:false,reason:'CHATGPT_CONVERSATION_IDENTITY_DRIFT'}; const prompt=${encoded}; const visible=(el) => { const rect=el.getBoundingClientRect(); const style=getComputedStyle(el); return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden'; }; const editable=[...document.querySelectorAll('[contenteditable="true"]')].find(visible); const textarea=[...document.querySelectorAll('textarea')].find(visible); const el=editable||textarea; if(!el) return {ok:false,reason:'composer_missing'}; el.focus(); if(editable){ editable.textContent=prompt; editable.dispatchEvent(new InputEvent('input',{bubbles:true,inputType:'insertText',data:prompt})); } else { const setter=Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype,'value')?.set; setter?.call(textarea,prompt); textarea.dispatchEvent(new Event('input',{bubbles:true})); } const button=document.querySelector('[data-testid="send-button"]') || [...document.querySelectorAll('button')].find(b => /send/i.test((b.getAttribute('aria-label')||b.textContent||''))); if(!button || button.disabled) return {ok:false,reason:'send_button_missing_or_disabled'}; button.click(); return {ok:true}; })()`,
     );
     if (!result?.ok) {
       throw new Error(result?.reason ?? "ChatGPT prompt delivery failed");
@@ -1966,7 +2163,7 @@ export class CdpMacWebDriver implements MacWebDriver {
     deadlineAt: string,
   ): Promise<string> {
     while (Date.now() < Date.parse(deadlineAt)) {
-      const url = await this.evaluate<string>(target, "location.href").catch(() => "");
+      const url = await this.evaluate<string>(target, "location.href");
       if (url && /\/c\/[^/?#]+/.test(url)) return url;
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
     }
@@ -2013,7 +2210,8 @@ export class MacWebChatCarrierAdapter implements ChatSwarmManagedCarrierAdapter 
     this.configHash = canonicalHash({
       transport: config.transport,
       openCliExecutable: config.transport === "opencli" ? config.openCliExecutable : null,
-      cdpEndpoint: config.transport === "cdp" ? config.cdpEndpoint : null,
+      cdpEndpoint: config.transport === "cdp" && config.cdpMode !== "existing-session" ? config.cdpEndpoint : null,
+      ...(config.cdpMode === "existing-session" ? { cdpMode: config.cdpMode } : {}),
       projectUrl: config.projectUrl ?? null,
       browserProfileId: profileId(config.browserProfileDir),
       appLabel: config.appLabel,

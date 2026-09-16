@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -632,4 +634,280 @@ test("managed registry survives reopen without duplicating logical workers", asy
   } finally {
     cleanup(f);
   }
+});
+
+test("CDP existing-session requires explicit mode and absolute profile; unset mode preserves managed config", () => {
+  const base = { stateDir: "/tmp/devspace-runtime-config-test", chatSwarmMaxWorkers: 3 };
+  const config = loadChatSwarmRuntimeConfig(base, {});
+  assert.equal(config.cdpMode, "managed");
+  assert.equal(config.appLabel, "dev");
+  for (const env of [
+    { DEVSPACE_CHAT_SWARM_CDP_MODE: "auto" },
+    { DEVSPACE_CHAT_SWARM_CDP_MODE: "existing-session" },
+    { DEVSPACE_CHAT_SWARM_CDP_MODE: "existing-session", DEVSPACE_CHAT_SWARM_BROWSER_PROFILE_DIR: "relative" },
+    { DEVSPACE_CHAT_SWARM_CDP_MODE: "existing-session", DEVSPACE_CHAT_SWARM_BROWSER_PROFILE_DIR: "/explicit", DEVSPACE_CHAT_SWARM_BROWSER_BIN: "/chrome" },
+    { DEVSPACE_CHAT_SWARM_CDP_MODE: "existing-session", DEVSPACE_CHAT_SWARM_BROWSER_PROFILE_DIR: "/explicit", DEVSPACE_CHAT_SWARM_CDP_ENDPOINT: "http://127.0.0.1:9222" },
+  ]) assert.throws(() => loadChatSwarmRuntimeConfig(base, env));
+  assert.equal(loadChatSwarmRuntimeConfig(base, { DEVSPACE_CHAT_SWARM_CDP_MODE: "managed" }).cdpMode, "managed");
+  const legacy = loadChatSwarmRuntimeConfig(base, {
+    DEVSPACE_CHAT_SWARM_CDP_ENDPOINT: "http://127.0.0.1:9333",
+    DEVSPACE_CHAT_SWARM_BROWSER_BIN: "/explicit/chrome",
+    DEVSPACE_CHAT_SWARM_BROWSER_PROFILE_DIR: "/explicit/managed-profile",
+  });
+  assert.equal(legacy.cdpMode, "managed");
+  assert.equal(legacy.cdpEndpoint, "http://127.0.0.1:9333");
+  assert.equal(legacy.browserExecutable, "/explicit/chrome");
+  assert.equal(legacy.browserProfileDir, "/explicit/managed-profile");
+});
+
+function existingCdpFixture(t: test.TestContext, metadata = "43123\n/devtools/browser/browser-one\n") {
+  const root = mkdtempSync(join(tmpdir(), "devspace-existing-cdp-"));
+  if (metadata) writeFileSync(join(root, "DevToolsActivePort"), metadata);
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const config = loadChatSwarmRuntimeConfig({ stateDir: root, chatSwarmMaxWorkers: 3 }, {
+    DEVSPACE_CHAT_SWARM_CDP_MODE: "existing-session",
+    DEVSPACE_CHAT_SWARM_BROWSER_PROFILE_DIR: root,
+    DEVSPACE_CHAT_SWARM_PROJECT_URL: "https://chatgpt.com/g/g-p-test/project",
+    DEVSPACE_CHAT_SWARM_RUNTIME_TIMEOUT_MS: "1000",
+  });
+  const calls: Array<{ method: string; params: any; sessionId?: string }> = [];
+  const sockets: FakeSocket[] = [];
+  const targets = new Map([["target-a", "https://chatgpt.com/c/worker-a"], ["target-b", "https://chatgpt.com/c/worker-b"]]);
+  const sessions = new Map<string, string>();
+  let disconnectOn = "";
+  let domState = "ready";
+  let denyConnection = false;
+  let wrongSession = false;
+  let driftBeforeSend = false;
+  let disconnectAfterSend = false;
+  class FakeSocket {
+    onopen?: () => void;
+    onmessage?: (event: { data: string }) => void;
+    onerror?: () => void;
+    onclose?: () => void;
+    closed = false;
+    constructor(readonly url: string) { sockets.push(this); queueMicrotask(() => denyConnection ? this.onclose?.() : this.onopen?.()); }
+    close() { this.closed = true; queueMicrotask(() => this.onclose?.()); }
+    send(data: string) {
+      const command = JSON.parse(data);
+      calls.push(command);
+      if (command.method === disconnectOn) { this.close(); return; }
+      let result: any = {};
+      switch (command.method) {
+        case "Browser.getVersion": result = { product: "Chrome/fake" }; break;
+        case "Target.getTargets": result = { targetInfos: [...targets].map(([targetId,url]) => ({ targetId, url, type: "page" })) }; break;
+        case "Target.createTarget": {
+          const targetId = `reopened-${targets.size}`;
+          targets.set(targetId, command.params.url);
+          result = { targetId }; break;
+        }
+        case "Target.attachToTarget": {
+          assert.equal(command.params.flatten, true);
+          const sessionId = `session-${sessions.size}`;
+          sessions.set(sessionId, command.params.targetId);
+          result = { sessionId }; break;
+        }
+        case "Target.closeTarget": targets.delete(command.params.targetId); result = { success: true }; break;
+        case "Runtime.evaluate": {
+          const url = targets.get(sessions.get(command.sessionId)!);
+          assert.ok(url, "evaluation must be attached to one live target");
+          const expression: string = command.params.expression;
+          let value: any = true;
+          if (expression === "location.href") value = url;
+          else if (expression.includes("const prompt=")) {
+            if (disconnectAfterSend) { this.close(); return; }
+            if (driftBeforeSend) {
+              targets.set(sessions.get(command.sessionId)!, "https://chatgpt.com/c/unrelated");
+              // Execute the actual guard, before any DOM write could happen.
+              value = new Function("location", expression.replace("(() =>", "return (() =>"))({ href: "https://chatgpt.com/c/unrelated" });
+            } else value = { ok: true };
+          }
+          else if (expression.includes("const label=")) value = domState === "disabled" ? "DISABLED" : "READY";
+          else value = domState === "signed-out" ? "SIGNED_OUT" : true;
+          result = { result: { value } }; break;
+        }
+        default: assert.fail(`unexpected CDP command ${command.method}`);
+      }
+      queueMicrotask(() => this.onmessage?.({ data: JSON.stringify({ id: command.id, sessionId: wrongSession && command.sessionId ? "foreign-session" : command.sessionId, result }) }));
+    }
+  }
+  t.mock.method(globalThis, "WebSocket", function (url: string) { return new FakeSocket(url); } as any);
+  t.mock.method(globalThis, "fetch", async () => { assert.fail("existing-session must use the metadata browser websocket, never HTTP/default port"); });
+  return {
+    root, config, calls, sockets, targets, sessions,
+    driver: new CdpMacWebDriver(config),
+    deadline: () => new Date(Date.now() + 1500).toISOString(),
+    disconnect: (method: string) => { disconnectOn = method; },
+    dom: (state: string) => { domState = state; },
+    deny: () => { denyConnection = true; },
+    spoofSession: () => { wrongSession = true; },
+    drift: () => { driftBeforeSend = true; },
+    loseSendAck: () => { disconnectAfterSend = true; },
+  };
+}
+
+test("existing-session missing or malformed metadata fails closed before connection", async (t) => {
+  const f = existingCdpFixture(t, "");
+  let result = await f.driver.preflight();
+  assert.match(result.blocker!, /BROWSER_CONTROL_UNAVAILABLE:DEVTOOLS_ACTIVE_PORT_UNAVAILABLE/);
+  for (const invalid of ["", "0\n/devtools/browser/id", "65536\n/devtools/browser/id", "1e3\n/devtools/browser/id", "9222junk\n/devtools/browser/id", "9222", "9222\nws://evil/", "9222\n//evil", "9222\n/devtools/browser/id?redirect=1", "9222\n/devtools/browser/../id", "9222\n/devtools/browser/id\nextra", "x".repeat(2048)]) {
+    writeFileSync(join(f.root, "DevToolsActivePort"), invalid);
+    result = await f.driver.preflight();
+    assert.equal(result.ready, false);
+    assert.match(result.blocker!, /BROWSER_CONTROL_UNAVAILABLE:DEVTOOLS_ACTIVE_PORT_MALFORMED/);
+  }
+  // Even an incorrectly assembled internal config cannot launch Chrome in this mode.
+  const unsafe = new CdpMacWebDriver({ ...f.config, browserExecutable: "/must-not-spawn" });
+  await assert.rejects(unsafe.createManagedConversation(f.config.projectUrl!, f.deadline()), /BROWSER_CONTROL_UNAVAILABLE/);
+  assert.equal(f.sockets.length, 0);
+  assert.equal(f.calls.length, 0);
+});
+
+test("existing-session resolves dynamic browser endpoint anew and closes each bounded connection", async (t) => {
+  const f = existingCdpFixture(t);
+  assert.equal((await f.driver.preflight()).ready, true);
+  writeFileSync(join(f.root, "DevToolsActivePort"), "45234\r\n/devtools/browser/browser-two\r\n");
+  assert.equal((await f.driver.preflight()).ready, true);
+  assert.deepEqual(f.sockets.map(s => s.url), ["ws://127.0.0.1:43123/devtools/browser/browser-one", "ws://127.0.0.1:45234/devtools/browser/browser-two"]);
+  assert.ok(f.sockets.every(s => s.closed));
+  assert.deepEqual(f.calls.map(c => c.method), ["Browser.getVersion", "Browser.getVersion"]);
+});
+
+test("existing-session isolates exact targets, reopens lost conversations, and closes only the requested target", async (t) => {
+  const f = existingCdpFixture(t);
+  const url = "https://chatgpt.com/c/worker-a";
+  assert.equal((await f.driver.sendPrompt(url, "wake a", f.deadline())).delivered, true);
+  assert.deepEqual(f.calls.filter(c => c.method === "Target.attachToTarget").map(c => c.params.targetId), ["target-a"]);
+  f.targets.set("target-a", "https://chatgpt.com/c/someone-else");
+  const recovered = await f.driver.recoverConversation(url, f.deadline());
+  assert.equal(recovered.ready, true);
+  assert.deepEqual(f.calls.filter(c => c.method === "Target.createTarget").map(c => c.params.url), [url]);
+  assert.equal(f.targets.get("target-b"), "https://chatgpt.com/c/worker-b");
+  assert.equal(f.targets.get("target-a"), "https://chatgpt.com/c/someone-else");
+  await f.driver.closeConversation(url);
+  assert.equal(f.targets.size, 2);
+  assert.equal(f.calls.filter(c => c.method === "Target.closeTarget").length, 1);
+  assert.ok(f.sockets.every(s => s.closed));
+});
+
+test("existing-session disconnect before acknowledgement never retries a prompt or switches transport", async (t) => {
+  const f = existingCdpFixture(t);
+  f.disconnect("Runtime.evaluate");
+  const result = await f.driver.sendPrompt("https://chatgpt.com/c/worker-a", "wake", f.deadline());
+  assert.equal(result.delivered, false);
+  assert.match(result.blocker!, /BROWSER_CONTROL_UNAVAILABLE/);
+  assert.equal(f.calls.filter(c => c.method === "Runtime.evaluate").length, 1);
+  assert.equal(f.calls.filter(c => c.method === "Target.createTarget").length, 0);
+  assert.equal(f.sockets.length, 1);
+  assert.equal(result.remoteMayContinue, true);
+});
+
+test("existing-session keeps signed-out and app binding blockers separate from control availability", async (t) => {
+  const f = existingCdpFixture(t);
+  f.dom("signed-out");
+  assert.match((await f.driver.recoverConversation("https://chatgpt.com/c/worker-a", f.deadline())).blocker!, /CHATGPT_SIGNED_OUT/);
+  f.dom("disabled");
+  assert.match((await f.driver.sendPrompt("https://chatgpt.com/c/worker-a", "wake", f.deadline())).blocker!, /HOST_APP_BINDING_DISABLED/);
+});
+
+
+test("existing-session authorization denial closes control without issuing commands", async (t) => {
+  const f = existingCdpFixture(t);
+  f.deny();
+  const result = await f.driver.preflight();
+  assert.equal(result.ready, false);
+  assert.equal(result.appBinding, "UNKNOWN");
+  assert.match(result.blocker!, /BROWSER_CONTROL_UNAVAILABLE:AUTHORIZATION_OR_CONNECTION_CLOSED/);
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.sockets.length, 1);
+  assert.ok(f.sockets.every(s => s.closed));
+});
+
+test("existing-session prompt acknowledgement loss remains unknown and is not blindly resent", async (t) => {
+  const f = existingCdpFixture(t);
+  f.loseSendAck();
+  const result = await f.driver.sendPrompt("https://chatgpt.com/c/worker-a", "wake", f.deadline());
+  assert.equal(result.delivered, false);
+  assert.equal(result.remoteMayContinue, true);
+  assert.match(result.blocker!, /BROWSER_CONTROL_UNAVAILABLE:DISCONNECTED/);
+  assert.equal(f.calls.filter(c => c.method === "Runtime.evaluate" && c.params.expression.includes("const prompt=")).length, 1);
+  assert.equal(f.calls.filter(c => c.method === "Target.createTarget").length, 0);
+  assert.equal(f.sockets.length, 1);
+});
+
+test("existing-session rejects cross-session responses", async (t) => {
+  const f = existingCdpFixture(t);
+  f.spoofSession();
+  const spoofed = await f.driver.recoverConversation("https://chatgpt.com/c/worker-a", f.deadline());
+  assert.equal(spoofed.ready, false);
+  assert.match(spoofed.blocker!, /SESSION_IDENTITY_MISMATCH/);
+});
+
+test("existing-session checks the exact URL inside the prompt mutation", async (t) => {
+  const f = existingCdpFixture(t);
+  f.drift();
+  const drifted = await f.driver.sendPrompt("https://chatgpt.com/c/worker-a", "wake", f.deadline());
+  assert.equal(drifted.delivered, false);
+  assert.match(drifted.blocker!, /CHATGPT_CONVERSATION_IDENTITY_DRIFT/);
+  assert.equal(f.targets.get("target-b"), "https://chatgpt.com/c/worker-b");
+});
+
+test("existing-session recovery after target deletion reopens only the saved conversation", async (t) => {
+  const f = existingCdpFixture(t);
+  f.targets.delete("target-a");
+  const url = "https://chatgpt.com/c/worker-a";
+  assert.equal((await f.driver.recoverConversation(url, f.deadline())).ready, true);
+  assert.deepEqual(f.calls.filter(c => c.method === "Target.createTarget").map(c => c.params.url), [url]);
+  assert.equal(f.calls.filter(c => c.method === "Runtime.evaluate" && c.params.expression.includes("const prompt=")).length, 0);
+  assert.equal(f.targets.get("target-b"), "https://chatgpt.com/c/worker-b");
+});
+
+test("explicit and legacy managed CDP retain the direct endpoint path", async (t) => {
+  const config = loadChatSwarmRuntimeConfig({ stateDir: "/tmp/devspace-managed", chatSwarmMaxWorkers: 3 }, {
+    DEVSPACE_CHAT_SWARM_CDP_MODE: "managed",
+    DEVSPACE_CHAT_SWARM_CDP_ENDPOINT: "http://127.0.0.1:9333",
+    DEVSPACE_CHAT_SWARM_PROJECT_URL: "https://chatgpt.com/g/g-p-test/project",
+  });
+  const calls: string[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string | URL | Request) => {
+    calls.push(String(url));
+    return new Response(JSON.stringify({ Browser: "Chrome/managed" }));
+  });
+  for (const cdpMode of ["managed", undefined] as const) {
+    assert.equal((await new CdpMacWebDriver({ ...config, cdpMode }).preflight()).ready, true);
+  }
+  assert.deepEqual(calls, ["http://127.0.0.1:9333/json/version", "http://127.0.0.1:9333/json/version"]);
+});
+
+
+test("unset CDP mode retains managed browserExecutable startup without launching a real browser", async (t) => {
+  const calls: Array<{ executable: string; args: string[]; options: unknown }> = [];
+  let unrefs = 0;
+  t.mock.method(childProcess, "spawn", ((executable: string, args: string[], options: unknown) => {
+    calls.push({ executable, args, options });
+    return { unref: () => { unrefs += 1; } };
+  }) as any);
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  const config = loadChatSwarmRuntimeConfig({ stateDir: "/tmp/devspace-managed", chatSwarmMaxWorkers: 3 }, {
+    DEVSPACE_CHAT_SWARM_CDP_ENDPOINT: "http://127.0.0.1:9333",
+    DEVSPACE_CHAT_SWARM_BROWSER_BIN: "/explicit/chrome",
+    DEVSPACE_CHAT_SWARM_BROWSER_PROFILE_DIR: "/explicit/managed-profile",
+    DEVSPACE_CHAT_SWARM_PROJECT_URL: "https://chatgpt.com/g/g-p-test/project",
+  });
+  for (const cdpMode of [config.cdpMode, undefined]) {
+    const driver = new CdpMacWebDriver({ ...config, cdpMode });
+    let probes = 0;
+    t.mock.method(driver, "preflight", async () => ({
+      ready: ++probes > 1, state: "CONFIGURED_NOT_READY", controlMechanism: "CDP", appBinding: "UNKNOWN",
+    } as RuntimePreflight));
+    await (driver as any).ensureRuntime(new Date(Date.now() + 1500).toISOString());
+    assert.equal(probes, 2);
+  }
+  assert.equal(unrefs, 2);
+  assert.deepEqual(calls, [0, 1].map(() => ({
+    executable: "/explicit/chrome",
+    args: ["--remote-debugging-port=9333", "--user-data-dir=/explicit/managed-profile", "--no-first-run", "--no-default-browser-check", config.projectUrl!],
+    options: { detached: true, stdio: "ignore" },
+  })));
 });
