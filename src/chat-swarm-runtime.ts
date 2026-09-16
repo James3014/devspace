@@ -859,9 +859,49 @@ export class ChatSwarmRuntimeStore {
     return tx.immediate();
   }
 
-  bindWorker(operationId: string, worker: ChatSwarmWorker): ManagedCarrierSlot {
+  bindWorker(
+    operationId: string,
+    worker: ChatSwarmWorker,
+    observedBootstrapPeerFingerprint?: string,
+  ): ManagedCarrierSlot {
     const tx = this.database.sqlite.transaction(() => {
       const operation = this.requireProvision(operationId);
+      const recordedPeerFingerprint = operation.receipt?.authenticatedPeerFingerprint;
+      if (
+        recordedPeerFingerprint &&
+        observedBootstrapPeerFingerprint &&
+        recordedPeerFingerprint !== observedBootstrapPeerFingerprint
+      ) {
+        throw new ChatSwarmError(
+          "OWNERSHIP_CONFLICT",
+          "caller authenticated peer does not match the managed carrier created for this operation",
+        );
+      }
+      // Only the authenticated bootstrap caller may establish an unknown peer.
+      const expectedPeerFingerprint =
+        recordedPeerFingerprint ?? observedBootstrapPeerFingerprint;
+      if (
+        !expectedPeerFingerprint ||
+        worker.swarmId !== operation.request.swarmId ||
+        worker.carrierConversationFingerprint !== expectedPeerFingerprint
+      ) {
+        throw new ChatSwarmError(
+          "OWNERSHIP_CONFLICT",
+          "worker does not match managed provision identity",
+        );
+      }
+      assertFingerprint(expectedPeerFingerprint, "authenticated peer fingerprint");
+      const peerConflict = this.getSlotByAuthenticatedPeerFingerprint(expectedPeerFingerprint);
+      if (
+        peerConflict &&
+        (peerConflict.swarmId !== operation.request.swarmId ||
+          peerConflict.runtimeSlot !== operation.request.runtimeSlot)
+      ) {
+        throw new ChatSwarmError(
+          "OWNERSHIP_CONFLICT",
+          "authenticated peer is already managed by another runtime slot",
+        );
+      }
       if (operation.status === "succeeded" && operation.receipt?.workerId) {
         if (operation.receipt.workerId !== worker.id) {
           throw new ChatSwarmError(
@@ -877,14 +917,7 @@ export class ChatSwarmRuntimeStore {
           "carrier identity is not established",
         );
       }
-      const expectedPeerFingerprint =
-        operation.receipt.authenticatedPeerFingerprint ??
-        operation.receipt.conversationFingerprint;
-      if (
-        !["carrier_created", "bootstrapping"].includes(operation.status) ||
-        worker.swarmId !== operation.request.swarmId ||
-        worker.carrierConversationFingerprint !== expectedPeerFingerprint
-      ) {
+      if (!["carrier_created", "bootstrapping"].includes(operation.status)) {
         throw new ChatSwarmError(
           "OWNERSHIP_CONFLICT",
           "worker does not match managed provision identity",
@@ -896,8 +929,7 @@ export class ChatSwarmRuntimeStore {
         disposition: "BOUND",
         conversationUrl: operation.receipt.conversationUrl,
         conversationFingerprint: operation.receipt.conversationFingerprint,
-        authenticatedPeerFingerprint:
-          operation.receipt.authenticatedPeerFingerprint,
+        authenticatedPeerFingerprint: expectedPeerFingerprint,
         workerId: worker.id,
         remoteMayContinue: false,
         observedAt,
@@ -913,8 +945,7 @@ export class ChatSwarmRuntimeStore {
           workerId: worker.id,
           conversationUrl: operation.receipt.conversationUrl,
           conversationFingerprint: operation.receipt.conversationFingerprint,
-          authenticatedPeerFingerprint:
-            operation.receipt.authenticatedPeerFingerprint,
+          authenticatedPeerFingerprint: expectedPeerFingerprint,
           continuationEpoch: worker.continuationEpoch,
           lastOperationId: operationId,
           updatedAt: observedAt,
@@ -2550,8 +2581,7 @@ export class ChatSwarmRuntimeManager {
       }
 
       if (slot.state === "SETUP_REQUIRED" || !slot.conversationUrl) continue;
-      const slotAuthorityFingerprint =
-        slot.authenticatedPeerFingerprint ?? slot.conversationFingerprint;
+      const slotAuthorityFingerprint = slot.authenticatedPeerFingerprint;
       const existingWorker = slotAuthorityFingerprint
         ? this.coordinator.store.findWorkerByCarrier(
             swarmId,
@@ -2642,12 +2672,27 @@ export class ChatSwarmRuntimeManager {
         "runtime provision has no observed conversation identity",
       );
     }
-    const authenticatedPeerFingerprint =
-      operation.receipt?.authenticatedPeerFingerprint ?? transportFingerprint;
-    if (identity.fingerprint !== authenticatedPeerFingerprint) {
+    const authenticatedPeerFingerprint = identity.fingerprint;
+    if (
+      operation.receipt?.authenticatedPeerFingerprint &&
+      operation.receipt.authenticatedPeerFingerprint !== authenticatedPeerFingerprint
+    ) {
       throw new ChatSwarmError(
         "OWNERSHIP_CONFLICT",
         "caller authenticated peer does not match the managed carrier created for this operation",
+      );
+    }
+    const peerConflict = this.registry.getSlotByAuthenticatedPeerFingerprint(
+      authenticatedPeerFingerprint,
+    );
+    if (
+      peerConflict &&
+      (peerConflict.swarmId !== operation.request.swarmId ||
+        peerConflict.runtimeSlot !== operation.request.runtimeSlot)
+    ) {
+      throw new ChatSwarmError(
+        "OWNERSHIP_CONFLICT",
+        "authenticated peer is already managed by another runtime slot",
       );
     }
     const existing = this.coordinator.store.findWorkerByCarrier(
@@ -2666,7 +2711,10 @@ export class ChatSwarmRuntimeManager {
           carrierConversationFingerprint: authenticatedPeerFingerprint,
         },
       );
-    return { slot: this.registry.bindWorker(operationId, worker), worker };
+    return {
+      slot: this.registry.bindWorker(operationId, worker, identity.fingerprint),
+      worker,
+    };
   }
 
   async wakeForDispatchedTask(meta: unknown, task: ChatSwarmTask): Promise<void> {

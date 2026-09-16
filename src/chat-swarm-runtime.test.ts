@@ -478,6 +478,12 @@ test("managed bootstrap binds the authenticated peer separately from the browser
         ),
       /authenticated peer does not match the managed carrier/,
     );
+    assert.equal(f.store.listWorkers(f.swarm.id).length, 0);
+    assert.equal(f.registry.getSlot(f.swarm.id, 1)?.state, "BOOTSTRAPPING");
+    assert.equal(
+      f.registry.getProvision(prepared.operation.operationId)?.receipt?.authenticatedPeerFingerprint,
+      peerFingerprint,
+    );
     const accepted = f.manager.bootstrap(
       { "openai/session": "authenticated-peer-identity" },
       prepared.operation!.operationId,
@@ -494,6 +500,82 @@ test("managed bootstrap binds the authenticated peer separately from the browser
     cleanup(f);
   }
 });
+
+for (const sameSwarm of [true, false]) {
+  test(`authenticated bootstrap rejects a peer already bound to another slot (${sameSwarm ? "same" : "different"} swarm)`, () => {
+    const f = fixture();
+    try {
+      const otherSwarm = sameSwarm ? f.swarm : f.coordinator.createSwarm(
+        { "openai/session": "other-owner" }, { workerLimit: 5 },
+      );
+      const prepare = (swarmId: string, runtimeSlot: number) => {
+        const slot = f.registry.ensureSlot(swarmId, runtimeSlot,
+          "https://chatgpt.com/g/g-p-runtime-test/project", "1".repeat(64));
+        const { operation } = f.registry.prepareProvision(slot, 5_000);
+        assert.ok(operation);
+        assert.equal(f.registry.claimProvision(operation.operationId), true);
+        const conversation = `conversation-${runtimeSlot}`;
+        f.registry.markCarrierCreated(operation.operationId, {
+          conversationUrl: `https://chatgpt.com/c/${conversation}`,
+          conversationFingerprint: fingerprint(conversation), appBinding: "READY",
+        });
+        assert.equal(f.registry.claimBootstrap(operation.operationId), true);
+        return operation.operationId;
+      };
+      const firstOperation = prepare(f.swarm.id, 1);
+      const secondOperation = prepare(otherSwarm.id, 2);
+      const meta = { "openai/session": "shared-authenticated-peer" };
+      const first = f.manager.bootstrap(meta, firstOperation);
+      assert.throws(() => f.manager.bootstrap(meta, secondOperation), {
+        code: "OWNERSHIP_CONFLICT",
+        message: "authenticated peer is already managed by another runtime slot",
+      });
+      assert.equal(f.registry.getSlot(otherSwarm.id, 2)?.workerId, undefined);
+      assert.equal(f.registry.getSlot(otherSwarm.id, 2)?.authenticatedPeerFingerprint, undefined);
+      assert.equal(f.registry.getProvision(secondOperation)?.status, "bootstrapping");
+      assert.deepEqual(f.registry.getSlot(f.swarm.id, 1), first.slot);
+      assert.equal(f.store.listWorkers(f.swarm.id).length, 1);
+      if (!sameSwarm) assert.equal(f.store.listWorkers(otherSwarm.id).length, 0);
+      const replay = f.manager.bootstrap(meta, firstOperation);
+      assert.equal(replay.worker.id, first.worker.id);
+      assert.throws(() => f.manager.bootstrap(
+        { "openai/session": "different-peer-after-binding" }, firstOperation,
+      ), /authenticated peer does not match/);
+    } finally { cleanup(f); }
+  });
+}
+
+for (const provisionKnowsPeer of [false, true]) {
+  test(`existing worker ensure ${provisionKnowsPeer ? "uses provisioned peer fast path" : "requires actual bootstrap for unknown peer"}`, async (t) => {
+    const f = fixture();
+    try {
+      const peerFingerprint = fingerprint("managed-conversation-1");
+      const existing = f.store.joinWorkerAtomic(f.swarm.id, peerFingerprint, {
+        swarmId: f.swarm.id, label: "existing-worker", runtimeKind: "mcp_peer",
+        carrierConversationFingerprint: peerFingerprint,
+      });
+      const provision = f.adapter.provision.bind(f.adapter);
+      t.mock.method(f.adapter, "provision", async (input: Parameters<typeof provision>[0]) => ({
+        ...await provision(input),
+        authenticatedPeerFingerprint: provisionKnowsPeer ? peerFingerprint : undefined,
+      }));
+      const bootstrap = f.adapter.bootstrap.bind(f.adapter);
+      t.mock.method(f.adapter, "bootstrap", async (input: Parameters<typeof bootstrap>[0]) => {
+        assert.equal(f.registry.getSlot(f.swarm.id, 1)?.authenticatedPeerFingerprint, undefined);
+        assert.throws(() => f.registry.bindWorker(input.operationId, existing), /worker does not match managed provision identity/);
+        return bootstrap(input);
+      });
+      const bound = await f.manager.ensure(f.owner, f.swarm.id, 1);
+      assert.equal(bound.slots[0]?.state, "PARKED");
+      assert.equal(bound.slots[0]?.workerId, existing.id);
+      assert.equal(bound.slots[0]?.authenticatedPeerFingerprint, peerFingerprint);
+      await f.manager.ensure(f.owner, f.swarm.id, 1);
+      assert.equal(f.adapter.bootstrapCalls, provisionKnowsPeer ? 0 : 1);
+      assert.equal(f.adapter.provisionCalls, 1);
+      assert.equal(f.store.listWorkers(f.swarm.id).length, 1);
+    } finally { cleanup(f); }
+  });
+}
 
 test("targeted dispatch wake is a delivery hint and preserves canonical claimed task truth", async () => {
   const f = fixture();
@@ -983,6 +1065,12 @@ for (const binding of ["DISABLED", "STALE"] as const) {
 test("runtime status surfaces binding uncertainty and authenticated bootstrap can resolve the slot", async (t) => {
   const f = fixture();
   try {
+    const peerFingerprint = fingerprint("actual-bootstrap-peer");
+    f.adapter.onBootstrap = (operationId) => {
+      assert.equal(f.registry.getProvision(operationId)?.receipt?.authenticatedPeerFingerprint, undefined);
+      assert.throws(() => f.manager.bootstrap({}, operationId), /identity evidence/);
+      f.manager.bootstrap({ "openai/session": "actual-bootstrap-peer" }, operationId);
+    };
     t.mock.method(f.adapter, "preflight", async () => ({
       ready: true, state: "READY", controlMechanism: "CDP", appBinding: "UNKNOWN",
     } as RuntimePreflight));
@@ -1005,10 +1093,18 @@ test("runtime status surfaces binding uncertainty and authenticated bootstrap ca
     assert.equal(bound.state, "READY");
     assert.equal(bound.slots[0]?.state, "PARKED");
     assert.equal(bound.slots[0]?.blocker, undefined);
-    assert.ok(bound.slots[0]?.authenticatedPeerFingerprint);
+    assert.equal(bound.slots[0]?.authenticatedPeerFingerprint, peerFingerprint);
+    assert.notEqual(bound.slots[0]?.conversationFingerprint, peerFingerprint);
+    const persisted = new ChatSwarmRuntimeStore(f.root);
+    try {
+      assert.deepEqual(persisted.getSlot(f.swarm.id, 1), bound.slots[0]);
+      assert.equal(persisted.getProvision(bound.slots[0]!.lastOperationId!)?.receipt?.authenticatedPeerFingerprint,
+        peerFingerprint);
+    } finally { persisted.close(); }
     await f.manager.ensure(f.owner, f.swarm.id, 1);
     assert.equal(f.adapter.provisionCalls, 1);
     assert.equal(f.adapter.bootstrapCalls, 1);
+    assert.equal(f.store.listWorkers(f.swarm.id).length, 1);
   } finally { cleanup(f); }
 });
 
