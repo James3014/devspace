@@ -1,11 +1,14 @@
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
 import { createHash } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
   CdpMacWebDriver,
+  MacWebChatCarrierAdapter,
   OpenCliMacWebDriver,
   ChatSwarmRuntimeManager,
   ChatSwarmRuntimeStore,
@@ -475,6 +478,12 @@ test("managed bootstrap binds the authenticated peer separately from the browser
         ),
       /authenticated peer does not match the managed carrier/,
     );
+    assert.equal(f.store.listWorkers(f.swarm.id).length, 0);
+    assert.equal(f.registry.getSlot(f.swarm.id, 1)?.state, "BOOTSTRAPPING");
+    assert.equal(
+      f.registry.getProvision(prepared.operation.operationId)?.receipt?.authenticatedPeerFingerprint,
+      peerFingerprint,
+    );
     const accepted = f.manager.bootstrap(
       { "openai/session": "authenticated-peer-identity" },
       prepared.operation!.operationId,
@@ -491,6 +500,82 @@ test("managed bootstrap binds the authenticated peer separately from the browser
     cleanup(f);
   }
 });
+
+for (const sameSwarm of [true, false]) {
+  test(`authenticated bootstrap rejects a peer already bound to another slot (${sameSwarm ? "same" : "different"} swarm)`, () => {
+    const f = fixture();
+    try {
+      const otherSwarm = sameSwarm ? f.swarm : f.coordinator.createSwarm(
+        { "openai/session": "other-owner" }, { workerLimit: 5 },
+      );
+      const prepare = (swarmId: string, runtimeSlot: number) => {
+        const slot = f.registry.ensureSlot(swarmId, runtimeSlot,
+          "https://chatgpt.com/g/g-p-runtime-test/project", "1".repeat(64));
+        const { operation } = f.registry.prepareProvision(slot, 5_000);
+        assert.ok(operation);
+        assert.equal(f.registry.claimProvision(operation.operationId), true);
+        const conversation = `conversation-${runtimeSlot}`;
+        f.registry.markCarrierCreated(operation.operationId, {
+          conversationUrl: `https://chatgpt.com/c/${conversation}`,
+          conversationFingerprint: fingerprint(conversation), appBinding: "READY",
+        });
+        assert.equal(f.registry.claimBootstrap(operation.operationId), true);
+        return operation.operationId;
+      };
+      const firstOperation = prepare(f.swarm.id, 1);
+      const secondOperation = prepare(otherSwarm.id, 2);
+      const meta = { "openai/session": "shared-authenticated-peer" };
+      const first = f.manager.bootstrap(meta, firstOperation);
+      assert.throws(() => f.manager.bootstrap(meta, secondOperation), {
+        code: "OWNERSHIP_CONFLICT",
+        message: "authenticated peer is already managed by another runtime slot",
+      });
+      assert.equal(f.registry.getSlot(otherSwarm.id, 2)?.workerId, undefined);
+      assert.equal(f.registry.getSlot(otherSwarm.id, 2)?.authenticatedPeerFingerprint, undefined);
+      assert.equal(f.registry.getProvision(secondOperation)?.status, "bootstrapping");
+      assert.deepEqual(f.registry.getSlot(f.swarm.id, 1), first.slot);
+      assert.equal(f.store.listWorkers(f.swarm.id).length, 1);
+      if (!sameSwarm) assert.equal(f.store.listWorkers(otherSwarm.id).length, 0);
+      const replay = f.manager.bootstrap(meta, firstOperation);
+      assert.equal(replay.worker.id, first.worker.id);
+      assert.throws(() => f.manager.bootstrap(
+        { "openai/session": "different-peer-after-binding" }, firstOperation,
+      ), /authenticated peer does not match/);
+    } finally { cleanup(f); }
+  });
+}
+
+for (const provisionKnowsPeer of [false, true]) {
+  test(`existing worker ensure ${provisionKnowsPeer ? "uses provisioned peer fast path" : "requires actual bootstrap for unknown peer"}`, async (t) => {
+    const f = fixture();
+    try {
+      const peerFingerprint = fingerprint("managed-conversation-1");
+      const existing = f.store.joinWorkerAtomic(f.swarm.id, peerFingerprint, {
+        swarmId: f.swarm.id, label: "existing-worker", runtimeKind: "mcp_peer",
+        carrierConversationFingerprint: peerFingerprint,
+      });
+      const provision = f.adapter.provision.bind(f.adapter);
+      t.mock.method(f.adapter, "provision", async (input: Parameters<typeof provision>[0]) => ({
+        ...await provision(input),
+        authenticatedPeerFingerprint: provisionKnowsPeer ? peerFingerprint : undefined,
+      }));
+      const bootstrap = f.adapter.bootstrap.bind(f.adapter);
+      t.mock.method(f.adapter, "bootstrap", async (input: Parameters<typeof bootstrap>[0]) => {
+        assert.equal(f.registry.getSlot(f.swarm.id, 1)?.authenticatedPeerFingerprint, undefined);
+        assert.throws(() => f.registry.bindWorker(input.operationId, existing), /worker does not match managed provision identity/);
+        return bootstrap(input);
+      });
+      const bound = await f.manager.ensure(f.owner, f.swarm.id, 1);
+      assert.equal(bound.slots[0]?.state, "PARKED");
+      assert.equal(bound.slots[0]?.workerId, existing.id);
+      assert.equal(bound.slots[0]?.authenticatedPeerFingerprint, peerFingerprint);
+      await f.manager.ensure(f.owner, f.swarm.id, 1);
+      assert.equal(f.adapter.bootstrapCalls, provisionKnowsPeer ? 0 : 1);
+      assert.equal(f.adapter.provisionCalls, 1);
+      assert.equal(f.store.listWorkers(f.swarm.id).length, 1);
+    } finally { cleanup(f); }
+  });
+}
 
 test("targeted dispatch wake is a delivery hint and preserves canonical claimed task truth", async () => {
   const f = fixture();
@@ -632,4 +717,491 @@ test("managed registry survives reopen without duplicating logical workers", asy
   } finally {
     cleanup(f);
   }
+});
+
+test("CDP existing-session requires explicit mode and absolute profile; unset mode preserves managed config", () => {
+  const base = { stateDir: "/tmp/devspace-runtime-config-test", chatSwarmMaxWorkers: 3 };
+  const config = loadChatSwarmRuntimeConfig(base, {});
+  assert.equal(config.cdpMode, "managed");
+  assert.equal(config.appLabel, "dev");
+  for (const env of [
+    { DEVSPACE_CHAT_SWARM_CDP_MODE: "auto" },
+    { DEVSPACE_CHAT_SWARM_CDP_MODE: "existing-session" },
+    { DEVSPACE_CHAT_SWARM_CDP_MODE: "existing-session", DEVSPACE_CHAT_SWARM_BROWSER_PROFILE_DIR: "relative" },
+    { DEVSPACE_CHAT_SWARM_CDP_MODE: "existing-session", DEVSPACE_CHAT_SWARM_BROWSER_PROFILE_DIR: "/explicit", DEVSPACE_CHAT_SWARM_BROWSER_BIN: "/chrome" },
+    { DEVSPACE_CHAT_SWARM_CDP_MODE: "existing-session", DEVSPACE_CHAT_SWARM_BROWSER_PROFILE_DIR: "/explicit", DEVSPACE_CHAT_SWARM_CDP_ENDPOINT: "http://127.0.0.1:9222" },
+  ]) assert.throws(() => loadChatSwarmRuntimeConfig(base, env));
+  assert.equal(loadChatSwarmRuntimeConfig(base, { DEVSPACE_CHAT_SWARM_CDP_MODE: "managed" }).cdpMode, "managed");
+  const legacy = loadChatSwarmRuntimeConfig(base, {
+    DEVSPACE_CHAT_SWARM_CDP_ENDPOINT: "http://127.0.0.1:9333",
+    DEVSPACE_CHAT_SWARM_BROWSER_BIN: "/explicit/chrome",
+    DEVSPACE_CHAT_SWARM_BROWSER_PROFILE_DIR: "/explicit/managed-profile",
+  });
+  assert.equal(legacy.cdpMode, "managed");
+  assert.equal(legacy.cdpEndpoint, "http://127.0.0.1:9333");
+  assert.equal(legacy.browserExecutable, "/explicit/chrome");
+  assert.equal(legacy.browserProfileDir, "/explicit/managed-profile");
+});
+
+function existingCdpFixture(t: test.TestContext, metadata = "43123\n/devtools/browser/browser-one\n") {
+  const root = mkdtempSync(join(tmpdir(), "devspace-existing-cdp-"));
+  if (metadata) writeFileSync(join(root, "DevToolsActivePort"), metadata);
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const config = loadChatSwarmRuntimeConfig({ stateDir: root, chatSwarmMaxWorkers: 3 }, {
+    DEVSPACE_CHAT_SWARM_CDP_MODE: "existing-session",
+    DEVSPACE_CHAT_SWARM_BROWSER_PROFILE_DIR: root,
+    DEVSPACE_CHAT_SWARM_PROJECT_URL: "https://chatgpt.com/g/g-p-test/project",
+    DEVSPACE_CHAT_SWARM_RUNTIME_TIMEOUT_MS: "1000",
+  });
+  const calls: Array<{ method: string; params: any; sessionId?: string }> = [];
+  const sockets: FakeSocket[] = [];
+  const targets = new Map([["target-a", "https://chatgpt.com/c/worker-a"], ["target-b", "https://chatgpt.com/c/worker-b"]]);
+  const sessions = new Map<string, string>();
+  let disconnectOn = "";
+  let domState = "ready";
+  let denyConnection = false;
+  let wrongSession = false;
+  let driftBeforeSend = false;
+  let disconnectAfterSend = false;
+  class FakeSocket {
+    onopen?: () => void;
+    onmessage?: (event: { data: string }) => void;
+    onerror?: () => void;
+    onclose?: () => void;
+    closed = false;
+    constructor(readonly url: string) { sockets.push(this); queueMicrotask(() => denyConnection ? this.onclose?.() : this.onopen?.()); }
+    close() { this.closed = true; queueMicrotask(() => this.onclose?.()); }
+    send(data: string) {
+      const command = JSON.parse(data);
+      calls.push(command);
+      if (command.method === disconnectOn) { this.close(); return; }
+      let result: any = {};
+      switch (command.method) {
+        case "Browser.getVersion": result = { product: "Chrome/fake" }; break;
+        case "Target.getTargets": result = { targetInfos: [...targets].map(([targetId,url]) => ({ targetId, url, type: "page" })) }; break;
+        case "Target.createTarget": {
+          const targetId = `reopened-${targets.size}`;
+          targets.set(targetId, command.params.url);
+          result = { targetId }; break;
+        }
+        case "Target.attachToTarget": {
+          assert.equal(command.params.flatten, true);
+          const sessionId = `session-${sessions.size}`;
+          sessions.set(sessionId, command.params.targetId);
+          result = { sessionId }; break;
+        }
+        case "Target.closeTarget": targets.delete(command.params.targetId); result = { success: true }; break;
+        case "Runtime.evaluate": {
+          const url = targets.get(sessions.get(command.sessionId)!);
+          assert.ok(url, "evaluation must be attached to one live target");
+          const expression: string = command.params.expression;
+          let value: any = true;
+          if (expression === "location.href") value = url;
+          else if (expression.includes("const prompt=")) {
+            if (disconnectAfterSend) { this.close(); return; }
+            if (driftBeforeSend) {
+              targets.set(sessions.get(command.sessionId)!, "https://chatgpt.com/c/unrelated");
+              // Execute the actual guard, before any DOM write could happen.
+              value = new Function("location", expression.replace("(() =>", "return (() =>"))({ href: "https://chatgpt.com/c/unrelated" });
+            } else value = { ok: true };
+          }
+          else if (expression.includes("const label=")) {
+            const text = domState === "unknown" ? "ChatGPT" : `dev ${domState}`;
+            value = new Function("document", `return ${expression}`)({ body: { innerText: text } });
+          }
+          else value = domState === "signed-out" ? "SIGNED_OUT" : true;
+          result = { result: { value } }; break;
+        }
+        default: assert.fail(`unexpected CDP command ${command.method}`);
+      }
+      queueMicrotask(() => this.onmessage?.({ data: JSON.stringify({ id: command.id, sessionId: wrongSession && command.sessionId ? "foreign-session" : command.sessionId, result }) }));
+    }
+  }
+  t.mock.method(globalThis, "WebSocket", function (url: string) { return new FakeSocket(url); } as any);
+  t.mock.method(globalThis, "fetch", async () => { assert.fail("existing-session must use the metadata browser websocket, never HTTP/default port"); });
+  return {
+    root, config, calls, sockets, targets, sessions,
+    driver: new CdpMacWebDriver(config),
+    deadline: () => new Date(Date.now() + 1500).toISOString(),
+    disconnect: (method: string) => { disconnectOn = method; },
+    dom: (state: string) => { domState = state; },
+    deny: () => { denyConnection = true; },
+    spoofSession: () => { wrongSession = true; },
+    drift: () => { driftBeforeSend = true; },
+    loseSendAck: () => { disconnectAfterSend = true; },
+  };
+}
+
+test("carrier effects never use conversation identity as missing peer authority", async (t) => {
+  const f = existingCdpFixture(t);
+  const conversationUrl = "https://chatgpt.com/c/worker-a";
+  const conversationFingerprint = fingerprint("worker-a");
+  const slot: ManagedCarrierSlot = {
+    managedCarrierId: "legacy-conversation-only",
+    swarmId: "swarm",
+    runtimeSlot: 1,
+    generation: 1,
+    state: "PARKED",
+    projectUrl: f.config.projectUrl!,
+    browserProfileId: "1".repeat(64),
+    workerId: "worker",
+    conversationUrl,
+    conversationFingerprint,
+    continuationEpoch: 0,
+    lastOperationId: "legacy-operation",
+    updatedAt: new Date().toISOString(),
+  };
+  const registry = {
+    getSlotByWorker: (swarmId: string, workerId: string) =>
+      swarmId === slot.swarmId && workerId === slot.workerId ? slot : undefined,
+  } as unknown as ChatSwarmRuntimeStore;
+  const adapter = new MacWebChatCarrierAdapter(f.config, registry, f.driver);
+  const input: CarrierCallInput = {
+    operationId: "carrier-operation",
+    operationKey: "carrier-operation-key",
+    swarmId: slot.swarmId,
+    workerId: slot.workerId!,
+    carrierKind: "mcp_peer",
+    carrierFingerprint: conversationFingerprint,
+    expectedEpoch: 0,
+    adapterConfigHash: adapter.configHash,
+    signal: new AbortController().signal,
+    deadlineAt: f.deadline(),
+  };
+  const ensured = await adapter.ensureExisting(input);
+  assert.equal(ensured.disposition, "UNSUPPORTED");
+  assert.equal(ensured.remoteMayContinue, false);
+  const woke = await adapter.wake({ ...input, taskId: "task" });
+  assert.equal(woke.disposition, "UNSUPPORTED");
+  assert.equal(woke.remoteMayContinue, false);
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.sockets.length, 0);
+});
+
+const macOsOnlyTest = process.platform === "darwin" ? test : test.skip;
+
+macOsOnlyTest("existing-session missing or malformed metadata fails closed before connection", async (t) => {
+  const f = existingCdpFixture(t, "");
+  let result = await f.driver.preflight();
+  assert.match(result.blocker!, /BROWSER_CONTROL_UNAVAILABLE:DEVTOOLS_ACTIVE_PORT_UNAVAILABLE/);
+  for (const invalid of ["", "0\n/devtools/browser/id", "65536\n/devtools/browser/id", "1e3\n/devtools/browser/id", "9222junk\n/devtools/browser/id", "9222", "9222\nws://evil/", "9222\n//evil", "9222\n/devtools/browser/id?redirect=1", "9222\n/devtools/browser/../id", "9222\n/devtools/browser/id\nextra", "x".repeat(2048)]) {
+    writeFileSync(join(f.root, "DevToolsActivePort"), invalid);
+    result = await f.driver.preflight();
+    assert.equal(result.ready, false);
+    assert.match(result.blocker!, /BROWSER_CONTROL_UNAVAILABLE:DEVTOOLS_ACTIVE_PORT_MALFORMED/);
+  }
+  // Even an incorrectly assembled internal config cannot launch Chrome in this mode.
+  const unsafe = new CdpMacWebDriver({ ...f.config, browserExecutable: "/must-not-spawn" });
+  await assert.rejects(unsafe.createManagedConversation(f.config.projectUrl!, f.deadline()), /BROWSER_CONTROL_UNAVAILABLE/);
+  assert.equal(f.sockets.length, 0);
+  assert.equal(f.calls.length, 0);
+});
+
+macOsOnlyTest("existing-session resolves dynamic browser endpoint anew and closes each bounded connection", async (t) => {
+  const f = existingCdpFixture(t);
+  assert.equal((await f.driver.preflight()).ready, true);
+  writeFileSync(join(f.root, "DevToolsActivePort"), "45234\r\n/devtools/browser/browser-two\r\n");
+  assert.equal((await f.driver.preflight()).ready, true);
+  assert.deepEqual(f.sockets.map(s => s.url), ["ws://127.0.0.1:43123/devtools/browser/browser-one", "ws://127.0.0.1:45234/devtools/browser/browser-two"]);
+  assert.ok(f.sockets.every(s => s.closed));
+  assert.deepEqual(f.calls.map(c => c.method), ["Browser.getVersion", "Browser.getVersion"]);
+});
+
+macOsOnlyTest("existing-session isolates exact targets, reopens lost conversations, and closes only the requested target", async (t) => {
+  const f = existingCdpFixture(t);
+  const url = "https://chatgpt.com/c/worker-a";
+  assert.equal((await f.driver.sendPrompt(url, "wake a", f.deadline())).delivered, true);
+  assert.deepEqual(f.calls.filter(c => c.method === "Target.attachToTarget").map(c => c.params.targetId), ["target-a"]);
+  f.targets.set("target-a", "https://chatgpt.com/c/someone-else");
+  const recovered = await f.driver.recoverConversation(url, f.deadline());
+  assert.equal(recovered.ready, true);
+  assert.deepEqual(f.calls.filter(c => c.method === "Target.createTarget").map(c => c.params.url), [url]);
+  assert.equal(f.targets.get("target-b"), "https://chatgpt.com/c/worker-b");
+  assert.equal(f.targets.get("target-a"), "https://chatgpt.com/c/someone-else");
+  await f.driver.closeConversation(url);
+  assert.equal(f.targets.size, 2);
+  assert.equal(f.calls.filter(c => c.method === "Target.closeTarget").length, 1);
+  assert.ok(f.sockets.every(s => s.closed));
+});
+
+macOsOnlyTest("existing-session disconnect before acknowledgement never retries a prompt or switches transport", async (t) => {
+  const f = existingCdpFixture(t);
+  f.disconnect("Runtime.evaluate");
+  const result = await f.driver.sendPrompt("https://chatgpt.com/c/worker-a", "wake", f.deadline());
+  assert.equal(result.delivered, false);
+  assert.match(result.blocker!, /BROWSER_CONTROL_UNAVAILABLE/);
+  assert.equal(f.calls.filter(c => c.method === "Runtime.evaluate").length, 1);
+  assert.equal(f.calls.filter(c => c.method === "Target.createTarget").length, 0);
+  assert.equal(f.sockets.length, 1);
+  assert.equal(result.remoteMayContinue, true);
+});
+
+macOsOnlyTest("existing-session keeps signed-out and app binding blockers separate from control availability", async (t) => {
+  const f = existingCdpFixture(t);
+  f.dom("signed-out");
+  assert.match((await f.driver.recoverConversation("https://chatgpt.com/c/worker-a", f.deadline())).blocker!, /CHATGPT_SIGNED_OUT/);
+  f.dom("disabled");
+  assert.equal((await f.driver.sendPrompt("https://chatgpt.com/c/worker-a", "wake", f.deadline())).blocker, "HOST_APP_BINDING_NOT_READY:DISABLED");
+});
+
+
+macOsOnlyTest("existing-session socket close cannot distinguish authorization denial from transport failure", async (t) => {
+  const f = existingCdpFixture(t);
+  f.deny();
+  const result = await f.driver.preflight();
+  assert.equal(result.ready, false);
+  assert.equal(result.appBinding, "UNKNOWN");
+  assert.match(result.blocker!, /BROWSER_CONTROL_UNAVAILABLE:AUTHORIZATION_OR_CONNECTION_CLOSED/);
+  assert.equal(f.calls.length, 0);
+  assert.equal(f.sockets.length, 1);
+  assert.ok(f.sockets.every(s => s.closed));
+});
+
+macOsOnlyTest("existing-session prompt acknowledgement loss remains unknown and is not blindly resent", async (t) => {
+  const f = existingCdpFixture(t);
+  f.loseSendAck();
+  const result = await f.driver.sendPrompt("https://chatgpt.com/c/worker-a", "wake", f.deadline());
+  assert.equal(result.delivered, false);
+  assert.equal(result.remoteMayContinue, true);
+  assert.match(result.blocker!, /BROWSER_CONTROL_UNAVAILABLE:DISCONNECTED/);
+  assert.equal(f.calls.filter(c => c.method === "Runtime.evaluate" && c.params.expression.includes("const prompt=")).length, 1);
+  assert.equal(f.calls.filter(c => c.method === "Target.createTarget").length, 0);
+  assert.equal(f.sockets.length, 1);
+});
+
+macOsOnlyTest("existing-session rejects cross-session responses", async (t) => {
+  const f = existingCdpFixture(t);
+  f.spoofSession();
+  const spoofed = await f.driver.recoverConversation("https://chatgpt.com/c/worker-a", f.deadline());
+  assert.equal(spoofed.ready, false);
+  assert.match(spoofed.blocker!, /SESSION_IDENTITY_MISMATCH/);
+});
+
+macOsOnlyTest("existing-session checks the exact URL inside the prompt mutation", async (t) => {
+  const f = existingCdpFixture(t);
+  f.drift();
+  const drifted = await f.driver.sendPrompt("https://chatgpt.com/c/worker-a", "wake", f.deadline());
+  assert.equal(drifted.delivered, false);
+  assert.match(drifted.blocker!, /CHATGPT_CONVERSATION_IDENTITY_DRIFT/);
+  assert.equal(f.targets.get("target-b"), "https://chatgpt.com/c/worker-b");
+});
+
+macOsOnlyTest("existing-session recovery after target deletion reopens only the saved conversation", async (t) => {
+  const f = existingCdpFixture(t);
+  f.targets.delete("target-a");
+  const url = "https://chatgpt.com/c/worker-a";
+  assert.equal((await f.driver.recoverConversation(url, f.deadline())).ready, true);
+  assert.deepEqual(f.calls.filter(c => c.method === "Target.createTarget").map(c => c.params.url), [url]);
+  assert.equal(f.calls.filter(c => c.method === "Runtime.evaluate" && c.params.expression.includes("const prompt=")).length, 0);
+  assert.equal(f.targets.get("target-b"), "https://chatgpt.com/c/worker-b");
+});
+
+macOsOnlyTest("explicit and legacy managed CDP retain the direct endpoint path", async (t) => {
+  const config = loadChatSwarmRuntimeConfig({ stateDir: "/tmp/devspace-managed", chatSwarmMaxWorkers: 3 }, {
+    DEVSPACE_CHAT_SWARM_CDP_MODE: "managed",
+    DEVSPACE_CHAT_SWARM_CDP_ENDPOINT: "http://127.0.0.1:9333",
+    DEVSPACE_CHAT_SWARM_PROJECT_URL: "https://chatgpt.com/g/g-p-test/project",
+  });
+  const calls: string[] = [];
+  t.mock.method(globalThis, "fetch", async (url: string | URL | Request) => {
+    calls.push(String(url));
+    return new Response(JSON.stringify({ Browser: "Chrome/managed" }));
+  });
+  for (const cdpMode of ["managed", undefined] as const) {
+    assert.equal((await new CdpMacWebDriver({ ...config, cdpMode }).preflight()).ready, true);
+  }
+  assert.deepEqual(calls, ["http://127.0.0.1:9333/json/version", "http://127.0.0.1:9333/json/version"]);
+});
+
+
+test("unset CDP mode retains managed browserExecutable startup without launching a real browser", async (t) => {
+  const calls: Array<{ executable: string; args: string[]; options: unknown }> = [];
+  let unrefs = 0;
+  t.mock.method(childProcess, "spawn", ((executable: string, args: string[], options: unknown) => {
+    calls.push({ executable, args, options });
+    return { unref: () => { unrefs += 1; } };
+  }) as any);
+  syncBuiltinESMExports();
+  t.after(() => { t.mock.restoreAll(); syncBuiltinESMExports(); });
+  const config = loadChatSwarmRuntimeConfig({ stateDir: "/tmp/devspace-managed", chatSwarmMaxWorkers: 3 }, {
+    DEVSPACE_CHAT_SWARM_CDP_ENDPOINT: "http://127.0.0.1:9333",
+    DEVSPACE_CHAT_SWARM_BROWSER_BIN: "/explicit/chrome",
+    DEVSPACE_CHAT_SWARM_BROWSER_PROFILE_DIR: "/explicit/managed-profile",
+    DEVSPACE_CHAT_SWARM_PROJECT_URL: "https://chatgpt.com/g/g-p-test/project",
+  });
+  for (const cdpMode of [config.cdpMode, undefined]) {
+    const driver = new CdpMacWebDriver({ ...config, cdpMode });
+    let probes = 0;
+    t.mock.method(driver, "preflight", async () => ({
+      ready: ++probes > 1, state: "CONFIGURED_NOT_READY", controlMechanism: "CDP", appBinding: "UNKNOWN",
+    } as RuntimePreflight));
+    await (driver as any).ensureRuntime(new Date(Date.now() + 1500).toISOString());
+    assert.equal(probes, 2);
+  }
+  assert.equal(unrefs, 2);
+  assert.deepEqual(calls, [0, 1].map(() => ({
+    executable: "/explicit/chrome",
+    args: ["--remote-debugging-port=9333", "--user-data-dir=/explicit/managed-profile", "--no-first-run", "--no-default-browser-check", config.projectUrl!],
+    options: { detached: true, stdio: "ignore" },
+  })));
+});
+
+macOsOnlyTest("existing-session missing explicit setup is authorization-required, never inferred from missing metadata", async (t) => {
+  const f = existingCdpFixture(t, "");
+  for (const browserProfileDir of ["", "relative"] ) {
+    assert.throws(() => loadChatSwarmRuntimeConfig({ stateDir: f.root, chatSwarmMaxWorkers: 3 }, {
+      DEVSPACE_CHAT_SWARM_CDP_MODE: "existing-session",
+      DEVSPACE_CHAT_SWARM_BROWSER_PROFILE_DIR: browserProfileDir,
+    }), /BROWSER_AUTHORIZATION_REQUIRED:EXPLICIT_USER_DATA_DIR_REQUIRED/);
+    const driver = new CdpMacWebDriver({ ...f.config, browserProfileDir });
+    const result = await driver.preflight();
+    assert.equal(result.ready, false);
+    assert.equal(result.state, "SETUP_REQUIRED");
+    assert.equal(result.blocker, "BROWSER_AUTHORIZATION_REQUIRED:EXPLICIT_USER_DATA_DIR_REQUIRED");
+    await assert.rejects(driver.createManagedConversation(f.config.projectUrl!, f.deadline()), /BROWSER_AUTHORIZATION_REQUIRED/);
+  }
+  const unavailable = await f.driver.preflight();
+  assert.equal(unavailable.state, "CONFIGURED_NOT_READY");
+  assert.equal(unavailable.blocker, "BROWSER_CONTROL_UNAVAILABLE:DEVTOOLS_ACTIVE_PORT_UNAVAILABLE");
+  assert.equal(f.sockets.length, 0);
+  assert.equal(f.calls.length, 0);
+});
+
+macOsOnlyTest("existing-session browser readiness surfaces unknown app binding without blocking bootstrap delivery", async (t) => {
+  const f = existingCdpFixture(t);
+  f.dom("unknown");
+  const preflight = await f.driver.preflight();
+  assert.equal(preflight.ready, true);
+  assert.equal(preflight.appBinding, "UNKNOWN");
+  assert.equal(preflight.blocker, "HOST_APP_BINDING_NOT_READY:UNKNOWN");
+  const url = "https://chatgpt.com/c/worker-a";
+  assert.deepEqual(await f.driver.sendPrompt(url, "bootstrap", f.deadline()), {
+    delivered: true, remoteMayContinue: true, blocker: "HOST_APP_BINDING_NOT_READY:UNKNOWN",
+  });
+  assert.deepEqual(await f.driver.recoverConversation(url, f.deadline()), {
+    ready: true, blocker: "HOST_APP_BINDING_NOT_READY:UNKNOWN",
+  });
+  assert.equal(f.calls.filter(c => c.method === "Runtime.evaluate" && c.params.expression.includes("const prompt=")).length, 1);
+  assert.ok(f.calls.filter(c => c.method === "Target.attachToTarget").every(c => c.params.targetId === "target-a"));
+  assert.equal(f.targets.get("target-b"), "https://chatgpt.com/c/worker-b");
+});
+
+for (const binding of ["DISABLED", "STALE"] as const) {
+  macOsOnlyTest(`existing-session ${binding} app binding blocks send and recovery with explicit NOT_READY`, async (t) => {
+    const f = existingCdpFixture(t);
+    f.dom(binding.toLowerCase());
+    const url = "https://chatgpt.com/c/worker-a";
+    assert.deepEqual(await f.driver.sendPrompt(url, "wake", f.deadline()), {
+      delivered: false, remoteMayContinue: false, blocker: `HOST_APP_BINDING_NOT_READY:${binding}`,
+    });
+    assert.deepEqual(await f.driver.recoverConversation(url, f.deadline()), {
+      ready: false, blocker: `HOST_APP_BINDING_NOT_READY:${binding}`,
+    });
+    const registry = new ChatSwarmRuntimeStore(f.root);
+    try {
+      const adapter = new MacWebChatCarrierAdapter(f.config, registry, f.driver);
+      const bootstrap = await adapter.bootstrap({ operationId: "operation", swarmId: "swarm", runtimeSlot: 1,
+        conversationUrl: url, workerLabel: "worker", deadlineAt: f.deadline() });
+      assert.equal(bootstrap.disposition, "SETUP_REQUIRED");
+      assert.equal(bootstrap.remoteMayContinue, false);
+      assert.equal(bootstrap.blocker, `HOST_APP_BINDING_NOT_READY:${binding}`);
+    } finally { registry.close(); }
+    assert.equal(f.calls.filter(c => c.method === "Runtime.evaluate" && c.params.expression.includes("const prompt=")).length, 0);
+  });
+}
+
+test("runtime status surfaces binding uncertainty and authenticated bootstrap can resolve the slot", async (t) => {
+  const f = fixture();
+  try {
+    const peerFingerprint = fingerprint("actual-bootstrap-peer");
+    f.adapter.onBootstrap = (operationId) => {
+      assert.equal(f.registry.getProvision(operationId)?.receipt?.authenticatedPeerFingerprint, undefined);
+      assert.throws(() => f.manager.bootstrap({}, operationId), /identity evidence/);
+      f.manager.bootstrap({ "openai/session": "actual-bootstrap-peer" }, operationId);
+    };
+    t.mock.method(f.adapter, "preflight", async () => ({
+      ready: true, state: "READY", controlMechanism: "CDP", appBinding: "UNKNOWN",
+    } as RuntimePreflight));
+    const provision = f.adapter.provision.bind(f.adapter);
+    t.mock.method(f.adapter, "provision", async (input: Parameters<typeof provision>[0]) => ({
+      ...await provision(input), appBinding: "UNKNOWN" as const,
+    }));
+    const bootstrap = f.adapter.bootstrap.bind(f.adapter);
+    t.mock.method(f.adapter, "bootstrap", async (input: Parameters<typeof bootstrap>[0]) => {
+      const pending = await f.manager.status(f.owner, f.swarm.id);
+      assert.equal(pending.state, "DEGRADED");
+      assert.equal(pending.slots[0]?.blocker, "HOST_APP_BINDING_NOT_READY:UNKNOWN");
+      assert.equal(pending.slots[0]?.workerId, undefined);
+      return bootstrap(input);
+    });
+    const initial = await f.manager.status(f.owner, f.swarm.id);
+    assert.equal(initial.adapter.blocker, "HOST_APP_BINDING_NOT_READY:UNKNOWN");
+    assert.equal(initial.slots.length, 0);
+    const bound = await f.manager.ensure(f.owner, f.swarm.id, 1);
+    assert.equal(bound.state, "READY");
+    assert.equal(bound.slots[0]?.state, "PARKED");
+    assert.equal(bound.slots[0]?.blocker, undefined);
+    assert.equal(bound.slots[0]?.authenticatedPeerFingerprint, peerFingerprint);
+    assert.notEqual(bound.slots[0]?.conversationFingerprint, peerFingerprint);
+    const persisted = new ChatSwarmRuntimeStore(f.root);
+    try {
+      assert.deepEqual(persisted.getSlot(f.swarm.id, 1), bound.slots[0]);
+      assert.equal(persisted.getProvision(bound.slots[0]!.lastOperationId!)?.receipt?.authenticatedPeerFingerprint,
+        peerFingerprint);
+    } finally { persisted.close(); }
+    await f.manager.ensure(f.owner, f.swarm.id, 1);
+    assert.equal(f.adapter.provisionCalls, 1);
+    assert.equal(f.adapter.bootstrapCalls, 1);
+    assert.equal(f.store.listWorkers(f.swarm.id).length, 1);
+  } finally { cleanup(f); }
+});
+
+for (const binding of ["DISABLED", "STALE"] as const) {
+  test(`runtime retains ${binding} binding reason in durable status without bootstrap or reprovision`, async (t) => {
+    const f = fixture();
+    try {
+      const provision = f.adapter.provision.bind(f.adapter);
+      t.mock.method(f.adapter, "provision", async (input: Parameters<typeof provision>[0]) => ({
+        ...await provision(input), appBinding: binding,
+      }));
+      const status = await f.manager.ensure(f.owner, f.swarm.id, 1);
+      assert.equal(status.slots[0]?.state, "SETUP_REQUIRED");
+      assert.equal(status.slots[0]?.blocker, `HOST_APP_BINDING_NOT_READY:${binding}`);
+      await f.manager.ensure(f.owner, f.swarm.id, 1);
+      assert.equal(f.adapter.bootstrapCalls, 0);
+      assert.equal(f.adapter.provisionCalls, 1);
+    } finally { cleanup(f); }
+  });
+}
+
+test("binding disabled after creation survives bootstrap mapping and remains reconcile-required without resend", async (t) => {
+  const f = fixture();
+  try {
+    t.mock.method(f.adapter, "bootstrap", async () => {
+      f.adapter.bootstrapCalls += 1;
+      return { disposition: "SETUP_REQUIRED", remoteMayContinue: false,
+        blocker: "HOST_APP_BINDING_NOT_READY:DISABLED" } as any;
+    });
+    const status = await f.manager.ensure(f.owner, f.swarm.id, 1);
+    assert.equal(status.state, "RECONCILE_REQUIRED");
+    assert.equal(status.slots[0]?.blocker, "HOST_APP_BINDING_NOT_READY:DISABLED");
+    await f.manager.ensure(f.owner, f.swarm.id, 1);
+    assert.equal(f.adapter.bootstrapCalls, 1);
+    assert.equal(f.adapter.provisionCalls, 1);
+  } finally { cleanup(f); }
+});
+
+test("missing authenticated peer acknowledgement is unresolved and never grants bootstrap retry", async () => {
+  const f = fixture();
+  try {
+    f.adapter.onBootstrap = undefined;
+    f.manager.runtimeConfig.bootstrapWaitMs = 1;
+    const status = await f.manager.ensure(f.owner, f.swarm.id, 1);
+    assert.equal(status.state, "RECONCILE_REQUIRED");
+    assert.match(status.slots[0]!.blocker!, /^PEER_IDENTITY_UNRESOLVED:/);
+    await f.manager.ensure(f.owner, f.swarm.id, 1);
+    assert.equal(f.adapter.bootstrapCalls, 1);
+    assert.equal(f.adapter.provisionCalls, 1);
+    assert.equal(status.slots[0]?.workerId, undefined);
+  } finally { cleanup(f); }
 });
