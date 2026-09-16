@@ -176,6 +176,7 @@ export interface RuntimeStopRecord {
 }
 
 export interface RuntimePreflight {
+  // Browser control readiness only; UNKNOWN app binding may be proven by bootstrap.
   ready: boolean;
   state: "READY" | "CONFIGURED_NOT_READY" | "SETUP_REQUIRED";
   controlMechanism: "CDP" | "OPENCLI";
@@ -227,6 +228,7 @@ export interface ChatSwarmManagedCarrierAdapter extends ChatSwarmCarrierAdapter 
   }): Promise<{
     disposition: "DELIVERED" | "UNKNOWN" | "SETUP_REQUIRED";
     remoteMayContinue: boolean;
+    blocker?: string;
   }>;
   recover(slot: ManagedCarrierSlot): Promise<{ ready: boolean; blocker?: string }>;
   stop(slot: ManagedCarrierSlot): Promise<void>;
@@ -258,6 +260,10 @@ export interface MacWebDriver {
 
 function boolEnv(value: string | undefined): boolean {
   return ["1", "true", "yes", "on"].includes(value?.trim().toLowerCase() ?? "");
+}
+
+function appBindingBlocker(binding: RuntimePreflight["appBinding"]): string | undefined {
+  return binding === "READY" ? undefined : `HOST_APP_BINDING_NOT_READY:${binding}`;
 }
 
 function boundedInt(
@@ -310,8 +316,11 @@ export function loadChatSwarmRuntimeConfig(
   }
   const profileDir = env.DEVSPACE_CHAT_SWARM_BROWSER_PROFILE_DIR?.trim();
   if (cdpMode === "existing-session") {
-    if (transport !== "cdp" || !profileDir || !isAbsolute(profileDir)) {
-      throw new Error("existing-session requires CDP and an explicit absolute DEVSPACE_CHAT_SWARM_BROWSER_PROFILE_DIR (Chrome user-data-dir)");
+    if (transport !== "cdp") {
+      throw new Error("existing-session requires CDP");
+    }
+    if (!profileDir || !isAbsolute(profileDir)) {
+      throw new Error("BROWSER_AUTHORIZATION_REQUIRED:EXPLICIT_USER_DATA_DIR_REQUIRED: existing-session requires an explicit absolute DEVSPACE_CHAT_SWARM_BROWSER_PROFILE_DIR (Chrome user-data-dir)");
     }
     if (env.DEVSPACE_CHAT_SWARM_BROWSER_BIN?.trim() || env.DEVSPACE_CHAT_SWARM_CDP_ENDPOINT?.trim()) {
       throw new Error("existing-session uses only DevToolsActivePort; BROWSER_BIN and CDP_ENDPOINT must be unset");
@@ -731,7 +740,7 @@ export class ChatSwarmRuntimeStore {
         setupRequired ? "outcome_unknown" : "carrier_created",
         receipt,
         setupRequired ? "HOST_APP_BINDING_SETUP_REQUIRED" : undefined,
-        setupRequired ? `HOST_APP_BINDING_${evidence.appBinding}` : undefined,
+        setupRequired ? appBindingBlocker(evidence.appBinding) : undefined,
       );
       const slot = this.getSlot(operation.request.swarmId, operation.request.runtimeSlot)!;
       this.updateSlotReceipt(
@@ -744,9 +753,7 @@ export class ChatSwarmRuntimeStore {
           conversationFingerprint: evidence.conversationFingerprint,
           authenticatedPeerFingerprint: evidence.authenticatedPeerFingerprint,
           lastOperationId: operationId,
-          ...(setupRequired
-            ? { blocker: `HOST_APP_BINDING_${evidence.appBinding}` }
-            : {}),
+          blocker: appBindingBlocker(evidence.appBinding),
           updatedAt: observedAt,
         },
         setupRequired ? "outcome_unknown" : "started",
@@ -793,6 +800,7 @@ export class ChatSwarmRuntimeStore {
           authenticatedPeerFingerprint:
             operation.receipt?.authenticatedPeerFingerprint,
           lastOperationId: operationId,
+          blocker: slot.blocker,
           updatedAt: observedAt,
         },
         "started",
@@ -1150,7 +1158,7 @@ export class ChatSwarmRuntimeStore {
             rejectPromise(
               new ChatSwarmError(
                 "TRANSPORT_UNKNOWN",
-                "managed worker bootstrap acknowledgement timed out",
+                "PEER_IDENTITY_UNRESOLVED: managed worker bootstrap acknowledgement timed out",
               ),
             );
             return;
@@ -1692,7 +1700,9 @@ class ExistingChromeControl {
 
   static async connect(config: ChatSwarmRuntimeConfig, deadlineAt: string): Promise<ExistingChromeControl> {
     if (!isAbsolute(config.browserProfileDir)) {
-      throw new Error("BROWSER_CONTROL_UNAVAILABLE:EXPLICIT_USER_DATA_DIR_REQUIRED");
+      // Missing explicit selection is known setup evidence. An absent endpoint
+      // artifact or closed socket is not evidence that Chrome consent was denied.
+      throw new Error("BROWSER_AUTHORIZATION_REQUIRED:EXPLICIT_USER_DATA_DIR_REQUIRED");
     }
     let metadata: string;
     try {
@@ -1850,14 +1860,17 @@ export class CdpMacWebDriver implements MacWebDriver {
         controlMechanism: "CDP",
         browserVersion: version.Browser,
         appBinding: "UNKNOWN",
+        blocker: appBindingBlocker("UNKNOWN"),
       };
     } catch (error) {
+      const blocker = error instanceof Error ? error.message : String(error);
       return {
         ready: false,
-        state: "CONFIGURED_NOT_READY",
+        state: blocker.startsWith("BROWSER_AUTHORIZATION_REQUIRED:")
+          ? "SETUP_REQUIRED" : "CONFIGURED_NOT_READY",
         controlMechanism: "CDP",
         appBinding: "UNKNOWN",
-        blocker: error instanceof Error ? error.message : String(error),
+        blocker,
       };
     }
   }
@@ -1906,11 +1919,14 @@ export class CdpMacWebDriver implements MacWebDriver {
         return {
           delivered: false,
           remoteMayContinue: false,
-          blocker: `HOST_APP_BINDING_${binding}`,
+          blocker: appBindingBlocker(binding),
         };
       }
       await this.sendPromptToTarget(target, prompt, deadlineAt, conversationUrl);
-      return { delivered: true, remoteMayContinue: true };
+      return {
+        delivered: true, remoteMayContinue: true,
+        ...(binding === "UNKNOWN" ? { blocker: appBindingBlocker(binding) } : {}),
+      };
     } catch (error) {
       return {
         delivered: false,
@@ -1936,9 +1952,12 @@ export class CdpMacWebDriver implements MacWebDriver {
       }
       const binding = await this.observeAppBinding(target);
       if (binding === "DISABLED" || binding === "STALE") {
-        return { ready: false, blocker: `HOST_APP_BINDING_${binding}` };
+        return { ready: false, blocker: appBindingBlocker(binding) };
       }
-      return { ready: true };
+      return {
+        ready: true,
+        ...(binding === "UNKNOWN" ? { blocker: appBindingBlocker(binding) } : {}),
+      };
     } catch (error) {
       return {
         ready: false,
@@ -2131,7 +2150,7 @@ export class CdpMacWebDriver implements MacWebDriver {
     const label = JSON.stringify(this.config.appLabel.toLowerCase());
     return this.evaluate<"READY" | "UNKNOWN" | "DISABLED" | "STALE">(
       target,
-      `(() => { const text=(document.body?.innerText||'').toLowerCase(); const label=${label}; if (text.includes(label) && !text.includes(label+' disabled')) return 'READY'; if (text.includes(label+' disabled')) return 'DISABLED'; return 'UNKNOWN'; })()`,
+      `(() => { const text=(document.body?.innerText||'').toLowerCase(); const label=${label}; if (text.includes(label+' disabled')) return 'DISABLED'; if (text.includes(label+' stale')) return 'STALE'; if (text.includes(label)) return 'READY'; return 'UNKNOWN'; })()`,
     );
   }
 
@@ -2262,6 +2281,7 @@ export class MacWebChatCarrierAdapter implements ChatSwarmManagedCarrierAdapter 
           ? ("SETUP_REQUIRED" as const)
           : ("UNKNOWN" as const),
         remoteMayContinue: sent.remoteMayContinue,
+        blocker: sent.blocker,
       };
     }
     return { disposition: "DELIVERED" as const, remoteMayContinue: true };
@@ -2568,9 +2588,9 @@ export class ChatSwarmRuntimeManager {
         if (!rebound?.workerId) {
           this.registry.markProvisionUnknown(
             operation.operationId,
-            delivered.disposition === "SETUP_REQUIRED"
-              ? "HOST_APP_BINDING_SETUP_REQUIRED"
-              : "BOOTSTRAP_DELIVERY_UNKNOWN",
+            delivered.blocker ?? (delivered.disposition === "SETUP_REQUIRED"
+              ? "HOST_APP_BINDING_NOT_READY:SETUP_REQUIRED"
+              : "BOOTSTRAP_DELIVERY_UNKNOWN"),
           );
           break;
         }
@@ -2854,7 +2874,7 @@ export class ChatSwarmRuntimeManager {
         controlMechanism: preflight.controlMechanism,
         projectConfigured: Boolean(this.runtimeConfig.projectUrl),
         appBinding: preflight.appBinding,
-        blocker: preflight.blocker,
+        blocker: preflight.blocker ?? appBindingBlocker(preflight.appBinding),
       },
       slots,
     };
