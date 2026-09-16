@@ -211,6 +211,8 @@ export function resolveClineExecutable(env: NodeJS.ProcessEnv = process.env): st
   if (resolvedPath) return resolvedPath;
   const home = env.HOME ?? homedir();
   for (const fallback of [
+    join(home, ".npm-global", "bin", "cline"),
+    join(home, ".npm-global", "lib", "node_modules", "cline", "bin", "cline"),
     join(home, ".npm-global", "lib", "node_modules", "cline", "bin", ".cline"),
     join(home, ".cline", "bin", "cline"),
   ]) {

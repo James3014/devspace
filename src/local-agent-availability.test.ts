@@ -63,3 +63,22 @@ assert.equal(
   });
   assert.equal(agyPath, process.execPath);
 }
+
+{
+  const availability = checkLocalAgentProviderAvailability("cline", {
+    ...process.env,
+    CLINE_COMMAND: process.execPath,
+  });
+  assert.equal(availability.available, true);
+}
+
+{
+  const availability = checkLocalAgentProviderAvailability("cline", {
+    ...process.env,
+    PATH: "",
+    CLINE_COMMAND: undefined,
+    HOME: "/nonexistent-home",
+  });
+  assert.equal(availability.available, false);
+  assert.match(availability.reason ?? "", /cline executable not found/);
+}
