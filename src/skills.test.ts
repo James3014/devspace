@@ -170,6 +170,23 @@ try {
   });
   assert.deepEqual(loadWorkspaceSkills(disabledConfig, projectRoot).skills, []);
 
+  const explicitOnlyConfig = loadConfig({
+    DEVSPACE_ALLOWED_ROOTS: projectRoot,
+    DEVSPACE_AGENT_DIR: agentDir,
+    DEVSPACE_SKILL_PATHS: join(globalAgentsSkills, "agent-global-skill"),
+    DEVSPACE_SKILLS: "1",
+    DEVSPACE_SKILL_DEFAULTS: "0",
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    PORT: "1",
+  });
+  assert.deepEqual(effectiveSkillPaths(explicitOnlyConfig, projectRoot), [
+    join(globalAgentsSkills, "agent-global-skill"),
+  ]);
+  assert.deepEqual(
+    loadWorkspaceSkills(explicitOnlyConfig, projectRoot).skills.map((skill) => skill.name),
+    ["agent-global-skill"],
+  );
+
   const config = loadConfig({
     DEVSPACE_ALLOWED_ROOTS: projectRoot,
     DEVSPACE_AGENT_DIR: agentDir,

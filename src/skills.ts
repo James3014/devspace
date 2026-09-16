@@ -43,9 +43,11 @@ export function effectiveSkillPaths(config: ServerConfig, cwd: string): string[]
       ? bundledSkills
       : undefined,
   ];
-  const defaultPaths = defaultPathCandidates.filter(
-    (path): path is string => path !== undefined && existsSync(path),
-  );
+  const defaultPaths = config.skillDefaultsEnabled
+    ? defaultPathCandidates.filter(
+        (path): path is string => path !== undefined && existsSync(path),
+      )
+    : [];
 
   const seen = new Set<string>();
   return [...defaultPaths, ...config.skillPaths]

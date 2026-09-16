@@ -36,6 +36,7 @@ export interface ServerConfig {
   artifactsEnabled: boolean;
   artifactMaxFileBytes: number;
   skillsEnabled: boolean;
+  skillDefaultsEnabled: boolean;
   skillPaths: string[];
   devspaceSkillsDir: string;
   devspaceAgentsDir: string;
@@ -382,6 +383,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       "DEVSPACE_ARTIFACT_MAX_FILE_BYTES",
     ),
     skillsEnabled: env.DEVSPACE_SKILLS === undefined ? true : parseBoolean(env.DEVSPACE_SKILLS),
+    skillDefaultsEnabled:
+      env.DEVSPACE_SKILL_DEFAULTS === undefined ? true : parseBoolean(env.DEVSPACE_SKILL_DEFAULTS),
     skillPaths: parsePathList(env.DEVSPACE_SKILL_PATHS),
     devspaceSkillsDir: devspaceSkillsDir(env),
     devspaceAgentsDir: devspaceAgentsDir(env),

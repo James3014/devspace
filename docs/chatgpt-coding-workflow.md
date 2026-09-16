@@ -130,6 +130,8 @@ It also keeps compatibility with:
 - `DEVSPACE_AGENT_DIR/skills`, defaulting to `~/.codex/skills`
 - additional paths from `DEVSPACE_SKILL_PATHS`
 
+Set `DEVSPACE_SKILL_DEFAULTS=0` when a host should expose only the explicitly configured `DEVSPACE_SKILL_PATHS`. This keeps Skill loading enabled without advertising every default global/project Skill directory.
+
 When Subagents are enabled, DevSpace discovers agent profiles
 from `~/.devspace/agents/*.md` and project `.devspace/agents/*.md`.
 `open_workspace` exposes a compact catalog with profile names, descriptions,
