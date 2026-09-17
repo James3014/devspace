@@ -302,6 +302,41 @@ test("CDP managed conversation waits for the initialization turn to become idle 
   ]);
 });
 
+test("CDP initialization idle gate polls busy state and preserves exact-conversation fences", async () => {
+  const driver = cdpDriverForSelectorTest();
+  const expressions: string[] = [];
+  const states = ["BUSY", "IDLE"];
+  (driver as any).evaluate = async (_target: unknown, expression: string) => {
+    expressions.push(expression);
+    return states.shift();
+  };
+
+  await (driver as any).waitForConversationIdle(
+    { id: "target-init", url: "https://chatgpt.com/g/g-p-runtime-test/c/worker-init" },
+    "https://chatgpt.com/g/g-p-runtime-test/c/worker-init",
+    new Date(Date.now() + 1_000).toISOString(),
+  );
+
+  assert.equal(expressions.length, 2);
+  assert.match(expressions[0]!, /location\.href !== expectedUrl/);
+  assert.match(expressions[0]!, /data-message-author-role=\\"assistant\\"/);
+  assert.match(expressions[0]!, /READY_FOR_BOOTSTRAP/);
+  assert.match(expressions[0]!, /stop \(generating\|streaming\)/);
+});
+
+test("CDP initialization idle gate fails closed on conversation drift", async () => {
+  const driver = cdpDriverForSelectorTest();
+  (driver as any).evaluate = async () => "DRIFT";
+  await assert.rejects(
+    () => (driver as any).waitForConversationIdle(
+      { id: "target-init", url: "https://chatgpt.com/g/g-p-runtime-test/c/worker-init" },
+      "https://chatgpt.com/g/g-p-runtime-test/c/worker-init",
+      new Date(Date.now() + 1_000).toISOString(),
+    ),
+    /CHATGPT_CONVERSATION_IDENTITY_DRIFT/,
+  );
+});
+
 function openCliDriverForTest() {
   return new OpenCliMacWebDriver({
     enabled: true,
