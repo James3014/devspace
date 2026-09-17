@@ -3094,6 +3094,270 @@ test("Git integration and promotion reject an unprovenanced Candidate", async (t
   assert.equal((await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: context.project })).stdout.trim(), destination.head);
 });
 
+test("two-clock candidate path set incomplete failure does not wedge session", async (t) => {
+  const conversationScopeId = "core-two-clock-path-set-incomplete";
+  const conversation = { "openai/session": conversationScopeId };
+  const context = await fixture(t, { git: true, gitCandidates: true, coreMutation: true });
+  const opened = await callOpen(context.client, context.project, conversationScopeId, "worktree");
+  const workspace = structuredContent(opened) as Record<string, any>;
+  const workspaceId = workspace.workspaceId as string;
+  const workspaceRoot = workspace.root as string;
+  const bound = await bindTestCoreSession({
+    fixture: context,
+    workspaceId,
+    workspaceRoot,
+    conversationScopeId,
+    allowedPaths: ["clock1.txt", "clock2.txt"],
+    workspaceMode: "managed_worktree",
+  });
+
+  // Write clock1 file
+  await context.client.callTool({
+    name: "write",
+    arguments: { workspaceId, path: "clock1.txt", content: "clock1 content\n" },
+    _meta: conversation,
+  });
+
+  // Commit clock1 (Clock 1 formation)
+  const commit1 = await context.client.callTool({
+    name: "git_commit",
+    arguments: { workspaceId, expectedHead: bound.head, message: "commit clock1", paths: ["clock1.txt"] },
+    _meta: conversation,
+  });
+  assert.equal(commit1.isError, undefined, responseText(commit1));
+  const head1 = structuredContent(commit1).commitSha as string;
+
+  // Modify clock1.txt and write clock2.txt (Clock 2 changes)
+  await context.client.callTool({
+    name: "write",
+    arguments: { workspaceId, path: "clock1.txt", content: "clock1 updated\n" },
+    _meta: conversation,
+  });
+  await context.client.callTool({
+    name: "write",
+    arguments: { workspaceId, path: "clock2.txt", content: "clock2 content\n" },
+    _meta: conversation,
+  });
+
+  // Call git_commit with incomplete paths (passing only clock1.txt, omitting clock2.txt)
+  const incompleteCommit = await context.client.callTool({
+    name: "git_commit",
+    arguments: { workspaceId, expectedHead: head1, message: "incomplete candidate", paths: ["clock1.txt"] },
+    _meta: conversation,
+  });
+  assert.equal(incompleteCommit.isError, true);
+  assert.match(responseText(incompleteCommit), /CORE_CANDIDATE_PATH_SET_INCOMPLETE.*clock2\.txt/);
+
+  // Assert session is NOT wedged: no SYNCHRONOUS_GIT, status is ACTIVE, rebindState is BOUND_CURRENT
+  const sessionRecord = context.coreMutationSessions!.getById(bound.session.id);
+  assert.ok(sessionRecord);
+  assert.equal(sessionRecord.status, "ACTIVE");
+  assert.equal(sessionRecord.rebindState, "BOUND_CURRENT");
+  assert.ok(!sessionRecord.writerDomains.includes("SYNCHRONOUS_GIT"), "SYNCHRONOUS_GIT must not be present");
+
+  // Call git_commit with complete paths -> succeeds!
+  const commit2 = await context.client.callTool({
+    name: "git_commit",
+    arguments: { workspaceId, expectedHead: head1, message: "commit both clocks", paths: ["clock1.txt", "clock2.txt"] },
+    _meta: conversation,
+  });
+  assert.equal(commit2.isError, undefined, responseText(commit2));
+  const head2 = structuredContent(commit2).commitSha as string;
+  assert.notEqual(head2, head1);
+});
+
+test("stranded session with SYNCHRONOUS_GIT is physically reconciled on retry and succeeds", async (t) => {
+  const conversationScopeId = "core-stranded-reconcile-retry";
+  const conversation = { "openai/session": conversationScopeId };
+  const context = await fixture(t, { git: true, gitCandidates: true, coreMutation: true });
+  const opened = await callOpen(context.client, context.project, conversationScopeId, "worktree");
+  const workspace = structuredContent(opened) as Record<string, any>;
+  const workspaceId = workspace.workspaceId as string;
+  const workspaceRoot = workspace.root as string;
+  const bound = await bindTestCoreSession({
+    fixture: context,
+    workspaceId,
+    workspaceRoot,
+    conversationScopeId,
+    allowedPaths: ["recovery.txt"],
+    workspaceMode: "managed_worktree",
+  });
+
+  await context.client.callTool({
+    name: "write",
+    arguments: { workspaceId, path: "recovery.txt", content: "recoverable content\n" },
+    _meta: conversation,
+  });
+
+  // Artificially admit SYNCHRONOUS_GIT to simulate a stranded session
+  const actorKey = `openai:${createHash("sha256").update(conversationScopeId).digest("hex")}`;
+  await context.coreMutationSessions!.admitEffect({
+    workspaceSessionId: workspaceId,
+    workspaceRoot,
+    workspaceMode: "worktree",
+    managed: true,
+    actorKey,
+    pointer: { required: true, sessionId: bound.session.id, bindingHash: bound.session.bindingHash },
+    paths: ["recovery.txt"],
+    pathContainment: "NOT_PROVEN",
+    synchronousPostEffectCheck: true,
+  });
+
+  // Verify session now has SYNCHRONOUS_GIT
+  let sessionRecord = context.coreMutationSessions!.getById(bound.session.id);
+  assert.ok(sessionRecord?.writerDomains.includes("SYNCHRONOUS_GIT"));
+
+  // First call to git_commit: fails closed with CORE_MUTATION_RECONCILED_RETRY_REQUIRED and does NOT commit
+  const firstAttempt = await context.client.callTool({
+    name: "git_commit",
+    arguments: { workspaceId, expectedHead: bound.head, message: "attempt commit on stranded session", paths: ["recovery.txt"] },
+    _meta: conversation,
+  });
+  assert.equal(firstAttempt.isError, true);
+  assert.match(responseText(firstAttempt), /CORE_MUTATION_RECONCILED_RETRY_REQUIRED/);
+  const currentHead = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspaceRoot })).stdout.trim();
+  assert.equal(currentHead, bound.head, "No commit must be created on reconciliation retry requirement");
+
+  // Verify SYNCHRONOUS_GIT has been cleared
+  sessionRecord = context.coreMutationSessions!.getById(bound.session.id);
+  assert.ok(sessionRecord);
+  assert.ok(!sessionRecord.writerDomains.includes("SYNCHRONOUS_GIT"), "SYNCHRONOUS_GIT must be cleared after reconciliation");
+
+  // Second call to git_commit: now succeeds cleanly!
+  const secondAttempt = await context.client.callTool({
+    name: "git_commit",
+    arguments: { workspaceId, expectedHead: bound.head, message: "retry commit after reconciliation", paths: ["recovery.txt"] },
+    _meta: conversation,
+  });
+  assert.equal(secondAttempt.isError, undefined, responseText(secondAttempt));
+  const newHead = structuredContent(secondAttempt).commitSha as string;
+  assert.notEqual(newHead, bound.head);
+});
+
+test("pre-effect scope escape violation fails closed without creating commit", async (t) => {
+  const conversationScopeId = "core-pre-effect-scope-escape";
+  const conversation = { "openai/session": conversationScopeId };
+  const context = await fixture(t, { git: true, gitCandidates: true, coreMutation: true });
+  const opened = await callOpen(context.client, context.project, conversationScopeId, "worktree");
+  const workspace = structuredContent(opened) as Record<string, any>;
+  const workspaceId = workspace.workspaceId as string;
+  const workspaceRoot = workspace.root as string;
+  const bound = await bindTestCoreSession({
+    fixture: context,
+    workspaceId,
+    workspaceRoot,
+    conversationScopeId,
+    allowedPaths: ["allowed.txt"],
+    workspaceMode: "managed_worktree",
+  });
+
+  // Write to allowed path
+  await context.client.callTool({
+    name: "write",
+    arguments: { workspaceId, path: "allowed.txt", content: "allowed content\n" },
+    _meta: conversation,
+  });
+
+  // Write untrusted file directly to filesystem (outside allowedPaths)
+  await writeFile(join(workspaceRoot, "untrusted-escape.txt"), "escape\n");
+
+  const commit = await context.client.callTool({
+    name: "git_commit",
+    arguments: { workspaceId, expectedHead: bound.head, message: "must fail scope escape", paths: ["allowed.txt"] },
+    _meta: conversation,
+  });
+  assert.equal(commit.isError, true);
+  assert.match(responseText(commit), /CORE_MUTATION_SCOPE_ESCAPE.*untrusted-escape\.txt/);
+  const headAfter = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspaceRoot })).stdout.trim();
+  assert.equal(headAfter, bound.head, "No commit must be formed when pre-effect scope escape is detected");
+});
+
+test("pre-effect deletion violation fails closed when AcceptanceContract forbids deletion", async (t) => {
+  const conversationScopeId = "core-pre-effect-deletion-forbidden";
+  const conversation = { "openai/session": conversationScopeId };
+  const context = await fixture(t, { git: true, gitCandidates: true, coreMutation: true });
+  const opened = await callOpen(context.client, context.project, conversationScopeId, "worktree");
+  const workspace = structuredContent(opened) as Record<string, any>;
+  const workspaceId = workspace.workspaceId as string;
+  const workspaceRoot = workspace.root as string;
+
+  // First commit a file to the repository baseline
+  await writeFile(join(workspaceRoot, "existing-file.txt"), "initial\n");
+  await execFileAsync("git", ["add", "existing-file.txt"], { cwd: workspaceRoot });
+  await execFileAsync("git", ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "-m", "add existing file"], { cwd: workspaceRoot });
+  const newBaseHead = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspaceRoot })).stdout.trim();
+
+  const bound = await bindTestCoreSession({
+    fixture: context,
+    workspaceId,
+    workspaceRoot,
+    conversationScopeId,
+    allowedPaths: ["existing-file.txt"],
+    deletionPolicy: "FORBID",
+    workspaceMode: "managed_worktree",
+  });
+
+  // Delete the file from workspace
+  await rm(join(workspaceRoot, "existing-file.txt"));
+
+  const commit = await context.client.callTool({
+    name: "git_commit",
+    arguments: { workspaceId, expectedHead: newBaseHead, message: "must fail deletion", paths: ["existing-file.txt"] },
+    _meta: conversation,
+  });
+  assert.equal(commit.isError, true);
+  assert.match(responseText(commit), /CORE_MUTATION_DELETION_FORBIDDEN/);
+  const headAfter = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspaceRoot })).stdout.trim();
+  assert.equal(headAfter, newBaseHead, "No commit must be created on deletion violation");
+});
+
+test("Core-bound Candidate records full cryptographic provenance in structuredContent", async (t) => {
+  const conversationScopeId = "core-provenance-validation";
+  const conversation = { "openai/session": conversationScopeId };
+  const context = await fixture(t, { git: true, gitCandidates: true, coreMutation: true });
+  const opened = await callOpen(context.client, context.project, conversationScopeId, "worktree");
+  const workspace = structuredContent(opened) as Record<string, any>;
+  const workspaceId = workspace.workspaceId as string;
+  const workspaceRoot = workspace.root as string;
+  const bound = await bindTestCoreSession({
+    fixture: context,
+    workspaceId,
+    workspaceRoot,
+    conversationScopeId,
+    allowedPaths: ["prov.txt"],
+    workspaceMode: "managed_worktree",
+  });
+
+  await context.client.callTool({
+    name: "write",
+    arguments: { workspaceId, path: "prov.txt", content: "provenance bytes\n" },
+    _meta: conversation,
+  });
+
+  const commit = await context.client.callTool({
+    name: "git_commit",
+    arguments: { workspaceId, expectedHead: bound.head, message: "test: provenance", paths: ["prov.txt"] },
+    _meta: conversation,
+  });
+  assert.equal(commit.isError, undefined, responseText(commit));
+  const content = structuredContent(commit);
+  assert.ok(content.commitSha);
+  assert.equal(content.previousHead, bound.head);
+
+  const core = content.coreMutation as Record<string, any>;
+  assert.ok(core, "coreMutation must be present on git_commit result");
+  assert.equal(core.sessionId, bound.session.id);
+  assert.equal(core.bindingHash, bound.session.bindingHash);
+  assert.equal(core.acceptanceContractHash, bound.binding.core.acceptance_contract_hash);
+  assert.equal(core.sourceHead, bound.head);
+  assert.equal(core.candidateHead, content.commitSha);
+  assert.match(String(core.candidateTree), /^[0-9a-f]{40}$/);
+  assert.match(String(core.diffHash), /^sha256:[0-9a-f]{64}$/);
+  assert.match(String(core.changeSetHash), /^sha256:[0-9a-f]{64}$/);
+  assert.ok(core.changeSetId);
+  assert.match(String(core.changeManifestHash), /^sha256:[0-9a-f]{64}$/);
+});
+
 test("agent_start schema preserves #28 heartbeat and G9/G10 authority capabilities", async (t) => {
   const context = await fixture(t, { subagents: true });
   const tools = await context.client.listTools();
