@@ -1933,6 +1933,7 @@ export class CdpMacWebDriver implements MacWebDriver {
       deadlineAt,
     );
     const conversationUrl = await this.waitForConversationUrl(target, deadlineAt);
+    await this.waitForConversationIdle(target, conversationUrl, deadlineAt);
     return {
       conversationUrl,
       conversationFingerprint: conversationFingerprintFromUrl(conversationUrl),
@@ -2291,6 +2292,25 @@ export class CdpMacWebDriver implements MacWebDriver {
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 250));
     }
     throw new Error("ChatGPT conversation identity did not become observable before deadline");
+  }
+
+  private async waitForConversationIdle(
+    target: CdpTarget,
+    expectedConversationUrl: string,
+    deadlineAt: string,
+  ): Promise<void> {
+    const expectedUrl = JSON.stringify(expectedConversationUrl);
+    while (Date.now() < Date.parse(deadlineAt)) {
+      const state = await this.evaluate<"IDLE" | "BUSY" | "SIGNED_OUT" | "DRIFT">(
+        target,
+        `(() => { const expectedUrl=${expectedUrl}; if(location.href !== expectedUrl) return 'DRIFT'; const visible=(el) => { const rect=el.getBoundingClientRect(); const style=getComputedStyle(el); return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden'; }; if ((location.pathname === '/auth' || location.pathname.startsWith('/auth/')) || [...document.querySelectorAll('a,button')].some(el => visible(el) && /^(log in|sign in)$/i.test(el.textContent?.trim()||''))) return 'SIGNED_OUT'; const generating=Boolean([...document.querySelectorAll('button')].find(el => visible(el) && ((el.getAttribute('data-testid')||'').includes('stop') || /stop (generating|streaming)/i.test(el.getAttribute('aria-label')||el.textContent||'')))); const composer=Boolean([...document.querySelectorAll('[contenteditable="true"]')].find(visible) || [...document.querySelectorAll('textarea')].find(visible)); const initialized=[...document.querySelectorAll('[data-message-author-role="assistant"]')].some(el => (el.textContent||'').trim() === 'READY_FOR_BOOTSTRAP'); return !generating && composer && initialized ? 'IDLE' : 'BUSY'; })()`,
+      );
+      if (state === "SIGNED_OUT") throw new Error("CHATGPT_SIGNED_OUT");
+      if (state === "DRIFT") throw new Error("CHATGPT_CONVERSATION_IDENTITY_DRIFT");
+      if (state === "IDLE") return;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+    }
+    throw new Error("ChatGPT initialization turn did not become idle before deadline");
   }
 }
 
