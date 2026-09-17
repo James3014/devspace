@@ -268,6 +268,75 @@ test("CDP prompt delivery keeps textarea fallback on the DOM value/input path", 
   assert.equal(pageCommands, 0);
 });
 
+test("CDP managed conversation waits for the initialization turn to become idle before exposing identity", async () => {
+  const driver = cdpDriverForSelectorTest();
+  const calls: string[] = [];
+  const target = { id: "target-init", url: "https://chatgpt.com/g/g-p-runtime-test/project" };
+  (driver as any).ensureRuntime = async () => { calls.push("ensure-runtime"); };
+  (driver as any).newTarget = async () => { calls.push("new-target"); return target; };
+  (driver as any).waitForComposer = async () => { calls.push("composer-ready"); };
+  (driver as any).observeAppBinding = async () => { calls.push("app-binding"); return "READY"; };
+  (driver as any).sendPromptToTarget = async () => { calls.push("initialization-sent"); };
+  (driver as any).waitForConversationUrl = async () => {
+    calls.push("conversation-identity");
+    return "https://chatgpt.com/g/g-p-runtime-test/c/worker-init";
+  };
+  (driver as any).waitForConversationIdle = async (_target: unknown, expectedUrl: string) => {
+    calls.push(`idle:${expectedUrl}`);
+  };
+
+  const evidence = await driver.createManagedConversation(
+    "https://chatgpt.com/g/g-p-runtime-test/project",
+    new Date(Date.now() + 1_000).toISOString(),
+  );
+
+  assert.equal(evidence.conversationUrl, "https://chatgpt.com/g/g-p-runtime-test/c/worker-init");
+  assert.deepEqual(calls, [
+    "ensure-runtime",
+    "new-target",
+    "composer-ready",
+    "app-binding",
+    "initialization-sent",
+    "conversation-identity",
+    "idle:https://chatgpt.com/g/g-p-runtime-test/c/worker-init",
+  ]);
+});
+
+test("CDP initialization idle gate polls busy state and preserves exact-conversation fences", async () => {
+  const driver = cdpDriverForSelectorTest();
+  const expressions: string[] = [];
+  const states = ["BUSY", "IDLE"];
+  (driver as any).evaluate = async (_target: unknown, expression: string) => {
+    expressions.push(expression);
+    return states.shift();
+  };
+
+  await (driver as any).waitForConversationIdle(
+    { id: "target-init", url: "https://chatgpt.com/g/g-p-runtime-test/c/worker-init" },
+    "https://chatgpt.com/g/g-p-runtime-test/c/worker-init",
+    new Date(Date.now() + 1_000).toISOString(),
+  );
+
+  assert.equal(expressions.length, 2);
+  assert.match(expressions[0]!, /location\.href !== expectedUrl/);
+  assert.match(expressions[0]!, /data-message-author-role="assistant"/);
+  assert.match(expressions[0]!, /READY_FOR_BOOTSTRAP/);
+  assert.match(expressions[0]!, /stop \(generating\|streaming\)/);
+});
+
+test("CDP initialization idle gate fails closed on conversation drift", async () => {
+  const driver = cdpDriverForSelectorTest();
+  (driver as any).evaluate = async () => "DRIFT";
+  await assert.rejects(
+    () => (driver as any).waitForConversationIdle(
+      { id: "target-init", url: "https://chatgpt.com/g/g-p-runtime-test/c/worker-init" },
+      "https://chatgpt.com/g/g-p-runtime-test/c/worker-init",
+      new Date(Date.now() + 1_000).toISOString(),
+    ),
+    /CHATGPT_CONVERSATION_IDENTITY_DRIFT/,
+  );
+});
+
 function openCliDriverForTest() {
   return new OpenCliMacWebDriver({
     enabled: true,
