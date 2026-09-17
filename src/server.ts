@@ -5546,16 +5546,46 @@ export function createMcpServer(
         let committed: Awaited<ReturnType<typeof commitCandidate>> | undefined;
         let coreAdmission: CoreMutationAdmission | undefined;
         try {
-          coreAdmission = coreMutationGuard
-            ? await coreMutationGuard.admit({ workspaceId, extra, paths, pathContainment: "NOT_PROVEN", synchronousPostEffectCheck: true })
-            : undefined;
-          if (coreAdmission?.bound && coreMutationGuard) {
-            const before = await coreMutationGuard.snapshot({ workspaceId, extra });
-            if (before.scopeEscapePaths.length > 0) throw new Error(`[CORE_MUTATION_SCOPE_ESCAPE] Untrusted paths exist before Candidate formation: ${before.scopeEscapePaths.join(", ")}`);
-            if (before.deletionViolation) throw new Error(`[CORE_MUTATION_DELETION_FORBIDDEN] AcceptanceContract forbids deletion: ${before.deletedPaths.join(", ")}`);
+          const activeCore = coreMutationGuard?.require({ workspaceId, extra });
+          if (activeCore && coreMutationGuard) {
+            const before = await coreMutationGuard.snapshot({
+              workspaceId,
+              extra,
+              pointer: { required: true, sessionId: activeCore.id, bindingHash: activeCore.bindingHash },
+            });
+            if (before.scopeEscapePaths.length > 0) {
+              throw new Error(`[CORE_MUTATION_SCOPE_ESCAPE] Untrusted paths exist before Candidate formation: ${before.scopeEscapePaths.join(", ")}`);
+            }
+            if (before.deletionViolation) {
+              throw new Error(`[CORE_MUTATION_DELETION_FORBIDDEN] AcceptanceContract forbids deletion: ${before.deletedPaths.join(", ")}`);
+            }
             const requested = new Set(paths);
             const omitted = before.changedPaths.filter((path) => !requested.has(path));
-            if (omitted.length > 0) throw new Error(`[CORE_CANDIDATE_PATH_SET_INCOMPLETE] Candidate paths omit Core-bound workspace changes: ${omitted.join(", ")}`);
+            if (omitted.length > 0) {
+              throw new Error(`[CORE_CANDIDATE_PATH_SET_INCOMPLETE] Candidate paths omit Core-bound workspace changes: ${omitted.join(", ")}`);
+            }
+            try {
+              coreAdmission = await coreMutationGuard.admit({
+                workspaceId,
+                extra,
+                pointer: { required: true, sessionId: activeCore.id, bindingHash: activeCore.bindingHash },
+                paths,
+                pathContainment: "NOT_PROVEN",
+                synchronousPostEffectCheck: true,
+              });
+            } catch (admitErr: any) {
+              if (/CORE_MUTATION_RECONCILE_REQUIRED/.test(String(admitErr?.message))) {
+                await coreMutationGuard.reconcileSynchronousEffect({
+                  workspaceId,
+                  extra,
+                  pointer: { sessionId: activeCore.id, bindingHash: activeCore.bindingHash },
+                });
+                throw new Error(
+                  "[CORE_MUTATION_RECONCILED_RETRY_REQUIRED] Prior unresolved synchronous Git effect was physically reconciled; retry the exact git_commit request.",
+                );
+              }
+              throw admitErr;
+            }
           }
           const result = await commitCandidate({
             workspaceId,
@@ -5621,8 +5651,13 @@ export function createMcpServer(
             }
             throw new Error(`[${err.code}] ${err.message} ${evidence}`);
           }
-          const code = err instanceof GitCandidateError ? err.code : "GIT_EXECUTION_ERROR";
-          throw new Error(`[${code}] ${err.message}`);
+          if (err instanceof GitCandidateError) {
+            throw new Error(`[${err.code}] ${err.message}`);
+          }
+          if (err instanceof Error && /^\[[A-Z0-9_]+\]/.test(err.message)) {
+            throw err;
+          }
+          throw new Error(`[GIT_EXECUTION_ERROR] ${err?.message ?? String(err)}`);
         }
       },
     );
