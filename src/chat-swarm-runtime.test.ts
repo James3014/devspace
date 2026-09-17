@@ -319,7 +319,7 @@ test("CDP initialization idle gate polls busy state and preserves exact-conversa
 
   assert.equal(expressions.length, 2);
   assert.match(expressions[0]!, /location\.href !== expectedUrl/);
-  assert.match(expressions[0]!, /data-message-author-role=\\"assistant\\"/);
+  assert.match(expressions[0]!, /data-message-author-role="assistant"/);
   assert.match(expressions[0]!, /READY_FOR_BOOTSTRAP/);
   assert.match(expressions[0]!, /stop \(generating\|streaming\)/);
 });
