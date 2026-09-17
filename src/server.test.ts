@@ -1476,6 +1476,48 @@ test("Core-bound mutation session tools are registered for durable mutation admi
   const tools = await context.client.listTools();
   assert.ok(tools.tools.some((tool) => tool.name === "core_mutation_session_open"));
   assert.ok(tools.tools.some((tool) => tool.name === "core_mutation_session_status"));
+  assert.ok(tools.tools.some((tool) => tool.name === "core_mutation_session_reconcile_synchronous"));
+});
+
+test("Core synchronous Git reconciliation clears the exact writer pin without replaying Git", async (t) => {
+  const conversationScopeId = "core-sync-git-reconcile";
+  const conversation = { "openai/session": conversationScopeId };
+  const context = await fixture(t, { git: true, coreMutation: true });
+  const opened = await callOpen(context.client, context.project, conversationScopeId);
+  const workspaceId = structuredContent(opened).workspaceId as string;
+  const bound = await bindTestCoreSession({
+    fixture: context,
+    workspaceId,
+    workspaceRoot: context.project,
+    conversationScopeId,
+    allowedPaths: ["AGENTS.md"],
+  });
+  const actorKey = `openai:${createHash("sha256").update(conversationScopeId).digest("hex")}`;
+  await context.coreMutationSessions!.admitEffect({
+    workspaceSessionId: workspaceId,
+    workspaceRoot: context.project,
+    workspaceMode: "checkout",
+    managed: false,
+    actorKey,
+    pointer: { required: true, sessionId: bound.session.id, bindingHash: bound.session.bindingHash },
+    paths: ["AGENTS.md"],
+    pathContainment: "NOT_PROVEN",
+    synchronousPostEffectCheck: true,
+  });
+  const beforeHead = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: context.project })).stdout.trim();
+  assert.deepEqual(context.coreMutationSessions!.getById(bound.session.id)?.writerDomains, ["SYNCHRONOUS_GIT"]);
+  assert.equal(context.coreMutationSessions!.getById(bound.session.id)?.writerReconciliationState, "OUTCOME_UNKNOWN");
+
+  const reconciled = await context.client.callTool({
+    name: "core_mutation_session_reconcile_synchronous",
+    arguments: { workspaceId, sessionId: bound.session.id, bindingHash: bound.session.bindingHash },
+    _meta: conversation,
+  });
+  assert.equal(reconciled.isError, undefined, responseText(reconciled));
+  const session = structuredContent(reconciled).session as Record<string, unknown>;
+  assert.deepEqual(session.writerDomains, []);
+  assert.equal(session.writerReconciliationState, "CLEAR");
+  assert.equal((await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: context.project })).stdout.trim(), beforeHead);
 });
 
 test("createMcpServer without Core store fails closed unless explicit test bypass is supplied", async (t) => {

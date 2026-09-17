@@ -366,6 +366,51 @@ export function registerCoreMutationSessionTools(
 
   registerAppTool(
     server,
+    "core_mutation_session_reconcile_synchronous",
+    {
+      title: "Reconcile Core synchronous Git effect",
+      description:
+        "Inspect the exact physical workspace after an unresolved synchronous Git effect and clear only the SYNCHRONOUS_GIT writer pin when scope and deletion checks remain valid. This never retries Git, clears other writer domains, or grants completion authority.",
+      inputSchema: {
+        workspaceId: z.string(),
+        sessionId: z.string(),
+        bindingHash: z.string(),
+      },
+      outputSchema: z.object({
+        session: outputSchema,
+        snapshot: z.record(z.string(), z.unknown()),
+      }),
+      _meta: {},
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
+    },
+    async ({ workspaceId, sessionId, bindingHash }, extra) => {
+      const workspace = workspaces.getWorkspace(workspaceId);
+      try {
+        const reconciled = await store.reconcileSynchronousEffect({
+          sessionId,
+          workspaceSessionId: workspaceId,
+          workspaceRoot: workspace.root,
+          actorKey: actorKeyRequired(extra),
+          bindingHash,
+        });
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Core synchronous Git effect reconciled for ${sessionId}; no Git effect was replayed.`,
+          }],
+          structuredContent: {
+            session: publicSession(reconciled.session),
+            snapshot: reconciled.snapshot as unknown as Record<string, unknown>,
+          },
+        };
+      } catch (error) {
+        throw toolError(error);
+      }
+    },
+  );
+
+  registerAppTool(
+    server,
     "core_mutation_session_snapshot",
     {
       title: "Materialize Core ChangeSet snapshot",
