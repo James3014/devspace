@@ -18,7 +18,9 @@ import {
   assertAllowedPath,
   isPathInsideRoot,
   resolveAllowedPath,
+  canonicalizePath,
 } from "./roots.js";
+
 import {
   loadWorkspaceSkills,
   markSkillActivated,
@@ -74,6 +76,13 @@ export interface Workspace {
   profileCatalogEntries?: ProfileCatalogEntry[];
   activatedSkillDirs: Set<string>;
   availableAgentsFiles?: AvailableAgentsFile[];
+  /**
+   * Freshness-bound Cline catalog snapshot from the last full catalog load.
+   * Preserved across warm reopens so profile truth is not downgraded to
+   * exact_model_unavailable when no live Cline evidence is present.
+   * Only replaced when refresh=true or the snapshot is explicitly stale.
+   */
+  clineCatalogSnapshot?: import("./local-agent-cline-catalog.js").ClineCatalogSnapshot;
 }
 
 export interface WorkspaceContext {
@@ -88,6 +97,17 @@ export interface WorkspaceReadPath {
   absolutePath: string;
   readRoots: string[];
   skillRead?: SkillReadResolution;
+  /**
+   * Set when a pre-operation ancestor scan discovers nested instruction files
+   * (AGENTS.md / CLAUDE.md) that have not yet been loaded by the model.
+   *
+   * When present the target operation MUST NOT be executed. The model must
+   * read each path in `instructionPaths` (in order), then retry the original
+   * operation. This is the NESTED_INSTRUCTION_REBIND_REQUIRED contract.
+   */
+  nestedInstructionRebindRequired?: {
+    instructionPaths: string[];
+  };
 }
 
 export interface OpenWorkspaceInput {
@@ -267,10 +287,27 @@ export class WorkspaceRegistry {
     workspace: Workspace,
     options?: OpenWorkspaceOptions,
   ): Promise<WorkspaceContext> {
-    const catalog = await loadProfileCatalog(this.config, workspace.root);
+    // Freshness contract: warm reopen must not downgrade already-bound profile
+    // truth by calling loadProfileCatalog without live Cline catalog evidence.
+    //
+    // Strategy:
+    //   - Pass the existing clineCatalogSnapshot so Cline profiles retain their
+    //     bound state (advertised / exact_model_unavailable) from the last full load.
+    //   - Only with refresh=true do we replace the snapshot with a bounded
+    //     invalidation that uses the current catalog truth.
+    //   - UNKNOWN semantics are preserved: an UNKNOWN snapshot stays UNKNOWN;
+    //     it is never silently converted to UNAVAILABLE.
+    const existingClineSnapshot = workspace.clineCatalogSnapshot;
+    const catalog = await loadProfileCatalog(this.config, workspace.root, {
+      clineCatalog: existingClineSnapshot,
+    });
     workspace.agentProfiles = catalog.profiles;
     workspace.profileCatalogGeneration = catalog.generation;
     workspace.profileCatalogEntries = catalogEntriesOf(catalog);
+    // Preserve snapshot: if refresh gave us a new snapshot, store it.
+    if (catalog.clineCatalog) {
+      workspace.clineCatalogSnapshot = catalog.clineCatalog;
+    }
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
     let availableAgentsFiles = workspace.availableAgentsFiles;
     if (options?.refresh || !availableAgentsFiles) {
@@ -292,6 +329,7 @@ export class WorkspaceRegistry {
     };
   }
 
+
   invalidateAgentsCache(workspaceId: string): void {
     const workspace = this.workspaces.get(workspaceId);
     if (workspace) {
@@ -307,7 +345,9 @@ export class WorkspaceRegistry {
       workspace.availableAgentsFiles = [];
     }
     const exists = existsSync(resolved);
-    const existingIndex = workspace.availableAgentsFiles.findIndex((f) => resolve(f.path) === resolved);
+    const existingIndex = workspace.availableAgentsFiles.findIndex(
+      (f) => resolve(f.path).toLowerCase() === resolved.toLowerCase(),
+    );
     if (exists && existingIndex === -1) {
       workspace.availableAgentsFiles.push({ path: resolved });
       workspace.availableAgentsFiles.sort((a, b) => a.path.localeCompare(b.path));
@@ -332,15 +372,18 @@ export class WorkspaceRegistry {
         const candidate = join(currentDir, name);
         if (candidate === join(root, name)) continue;
 
-        const exists = existsSync(candidate);
-        const resolvedCandidate = resolve(candidate);
-        const idx = workspace.availableAgentsFiles.findIndex((f) => resolve(f.path) === resolvedCandidate);
+        if (!existsSync(candidate)) {
+          const resolvedCandidate = resolve(candidate);
+          const idx = workspace.availableAgentsFiles.findIndex((f) => resolve(f.path).toLowerCase() === resolvedCandidate.toLowerCase());
+          if (idx !== -1) workspace.availableAgentsFiles.splice(idx, 1);
+          continue;
+        }
 
-        if (exists && idx === -1) {
-          workspace.availableAgentsFiles.push({ path: resolvedCandidate });
+        const realCandidate = canonicalizePath(candidate);
+        const idx = workspace.availableAgentsFiles.findIndex((f) => canonicalizePath(f.path).toLowerCase() === realCandidate.toLowerCase());
+        if (idx === -1) {
+          workspace.availableAgentsFiles.push({ path: realCandidate });
           workspace.availableAgentsFiles.sort((a, b) => a.path.localeCompare(b.path));
-        } else if (!exists && idx !== -1) {
-          workspace.availableAgentsFiles.splice(idx, 1);
         }
       }
 
@@ -350,6 +393,67 @@ export class WorkspaceRegistry {
       currentDir = parentDir;
     }
   }
+
+  /**
+   * Pre-operation ancestor check: O(depth) scan along the ancestor chain of
+   * `targetPath`, returning paths of nested instruction files (AGENTS.md /
+   * CLAUDE.md) that exist on disk but have NOT yet been registered into
+   * `workspace.availableAgentsFiles`.
+   *
+   * This must be called BEFORE the target operation. If the returned array is
+   * non-empty, the caller must return NESTED_INSTRUCTION_REBIND_REQUIRED and
+   * must not execute the target operation until the model has read each path.
+   *
+   * Complexity: O(depth × |CONTEXT_FILE_NAMES|) — no global walk.
+   */
+  preOperationAncestorCheck(workspace: Workspace, targetAbsPath: string): string[] {
+    const root = resolve(workspace.root);
+    let currentDir = existsSync(targetAbsPath) && statSync(targetAbsPath).isDirectory()
+      ? targetAbsPath
+      : dirname(targetAbsPath);
+
+    if (!workspace.availableAgentsFiles) {
+      workspace.availableAgentsFiles = [];
+    }
+
+    const newlyDiscovered: string[] = [];
+    const realTarget = canonicalizePath(targetAbsPath);
+
+    while (currentDir.startsWith(root)) {
+      for (const name of CONTEXT_FILE_NAMES) {
+        const candidate = join(currentDir, name);
+        // Root-level instruction files are already handled at open_workspace time.
+        if (candidate === join(root, name)) continue;
+
+        if (!existsSync(candidate)) {
+          // Prune stale entries for deleted instructions
+          const resolvedCandidate = resolve(candidate);
+          const idx = workspace.availableAgentsFiles.findIndex((f) => resolve(f.path).toLowerCase() === resolvedCandidate.toLowerCase());
+          if (idx !== -1) workspace.availableAgentsFiles.splice(idx, 1);
+          continue;
+        }
+
+        const realCandidate = canonicalizePath(candidate);
+        // An instruction file itself is not an ancestor of itself; do not block operating directly on it.
+        if (realCandidate.toLowerCase() === realTarget.toLowerCase()) continue;
+
+        const alreadyKnown = workspace.availableAgentsFiles.some((f) => canonicalizePath(f.path).toLowerCase() === realCandidate.toLowerCase());
+        if (!alreadyKnown && !newlyDiscovered.some((p) => canonicalizePath(p).toLowerCase() === realCandidate.toLowerCase())) {
+          newlyDiscovered.push(realCandidate);
+        }
+      }
+
+      if (currentDir === root) break;
+      const parentDir = dirname(currentDir);
+      if (parentDir === currentDir) break;
+      currentDir = parentDir;
+    }
+
+    return newlyDiscovered;
+  }
+
+
+
 
   getWorkspace(workspaceId: string): Workspace {
     const workspace = this.workspaces.get(workspaceId);
@@ -528,8 +632,25 @@ export class WorkspaceRegistry {
       };
     }
 
+    const absolutePath = this.resolvePath(workspace, inputPath);
+
+    // B: Pre-operation ancestor instruction enforcement.
+    // Run O(depth) ancestor scan BEFORE executing the operation.
+    // If new nested instruction files are found, block the operation and
+    // require the model to read them first (NESTED_INSTRUCTION_REBIND_REQUIRED).
+    // Skill file reads are exempt: they are already under authority of an
+    // activated skill and do not need additional instruction pre-admission.
+    const newInstructions = this.preOperationAncestorCheck(workspace, absolutePath);
+    if (newInstructions.length > 0) {
+      return {
+        absolutePath,
+        readRoots: [workspace.root],
+        nestedInstructionRebindRequired: { instructionPaths: newInstructions },
+      };
+    }
+
     return {
-      absolutePath: this.resolvePath(workspace, inputPath),
+      absolutePath,
       readRoots: [workspace.root],
     };
   }
@@ -593,7 +714,12 @@ export class WorkspaceRegistry {
       workspace.agentProfiles = catalog.profiles;
       workspace.profileCatalogGeneration = catalog.generation;
       workspace.profileCatalogEntries = catalogEntriesOf(catalog);
+      // Bind cold-open Cline snapshot so warm reopens can preserve profile truth.
+      if (catalog.clineCatalog) {
+        workspace.clineCatalogSnapshot = catalog.clineCatalog;
+      }
     }
+
 
     this.store?.createSession({
       id: workspace.id,

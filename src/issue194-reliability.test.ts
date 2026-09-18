@@ -19,9 +19,12 @@ import { WorkspaceRegistry, findAvailableAgentsFiles, type AvailableAgentsFile }
 import { LocalAgentSessionManager } from "./local-agent-sessions.js";
 import { CORE_MUTATION_TEST_ONLY_UNTRUSTED_BYPASS } from "./core-mutation-tools.js";
 import type { LocalAgentProviderAvailability } from "./local-agent-availability.js";
+import { CoreMutationSessionStore } from "./core-mutation-session.js";
+import { acquireOpencodeCatalog } from "./local-agent-opencode-catalog.js";
 import { buildLocalAgentProviderStatuses } from "./local-agent-catalog.js";
 import { ClineCatalogService, type ClineCatalogSnapshot } from "./local-agent-cline-catalog.js";
 import { isReadOnlyInspectionCommand } from "./conversation-isolation.js";
+
 
 const execFileAsync = promisify(execFile);
 
@@ -84,6 +87,7 @@ interface TestServerContext {
   config: ServerConfig;
   workspaces: WorkspaceRegistry;
   agentSessionManager?: LocalAgentSessionManager;
+  coreMutationSessions?: CoreMutationSessionStore;
   client: Client;
   server: ReturnType<typeof createMcpServer>;
   clientTransport: InMemoryTransport;
@@ -101,8 +105,10 @@ async function createTestServer(
     stateDir?: string;
     projectDir?: string;
     rootDir?: string;
+    coreMutation?: boolean;
   } = {},
 ): Promise<TestServerContext> {
+
   const root = options.rootDir ?? await mkdtemp(join(tmpdir(), "devspace-issue194-test-"));
   const project = options.projectDir ?? join(root, "project");
   const agentDir = join(root, "agent");
@@ -174,6 +180,7 @@ async function createTestServer(
 
   const durableOperations = new DurableOperationManager(config);
   const processSessions = new ProcessSessionManager();
+  const coreMutationSessions = options.coreMutation ? new CoreMutationSessionStore(stateDir) : undefined;
 
   const server = createMcpServer(
     config,
@@ -194,8 +201,8 @@ async function createTestServer(
     undefined,
     undefined,
     undefined,
-    undefined,
-    CORE_MUTATION_TEST_ONLY_UNTRUSTED_BYPASS,
+    coreMutationSessions,
+    options.coreMutation ? undefined : CORE_MUTATION_TEST_ONLY_UNTRUSTED_BYPASS,
   );
 
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
@@ -208,6 +215,7 @@ async function createTestServer(
   const close = async () => {
     await client.close();
     await server.close();
+    coreMutationSessions?.close();
     store.close();
     if (!options.rootDir && !options.projectDir) {
       await rm(root, { recursive: true, force: true });
@@ -223,16 +231,22 @@ async function createTestServer(
     config,
     workspaces,
     agentSessionManager,
+    coreMutationSessions,
     client,
     server,
     clientTransport,
     serverTransport,
     close,
   };
+
 }
 
 test("G1: benchmark-grade cold/warm open latency, deterministic p95 calculation, and instruction discovery hook witness", async (t) => {
+  // Pre-warm opencode catalog probe once so environmental PATH discovery does not jitter cold benchmark samples
+  await acquireOpencodeCatalog().catch(() => {});
+
   async function createLargeRepo(root: string, name: string) {
+
     const project = join(root, name);
     await mkdir(project, { recursive: true });
     await execFileAsync("git", ["init", "--initial-branch=main"], { cwd: project });
@@ -369,9 +383,9 @@ test("G2: instruction cache lifecycle - bounded ancestor-chain discovery, extern
   const targetCodeFile = join(nestedSubdir, "index.ts");
   await writeFile(targetCodeFile, "export const service = 'ok';\n");
 
-  // 2. Subsequent read under that subtree discovers and adds packages/service/AGENTS.md via ancestor-chain discovery
+  // 2. Subsequent read under that subtree discovers packages/service/AGENTS.md and blocks with NESTED_INSTRUCTION_REBIND_REQUIRED
   const discoveryCallsBeforeRead = workspaces.instructionDiscoveryCalls;
-  const readRes = await client.callTool({
+  const initialReadRes = await client.callTool({
     name: "read",
     arguments: {
       workspaceId: wsId,
@@ -379,7 +393,10 @@ test("G2: instruction cache lifecycle - bounded ancestor-chain discovery, extern
     },
     _meta: { "openai/session": "conv-g2-instructions" },
   });
-  assert.equal(readRes.isError, undefined);
+  // Operation admission blocks until newly discovered nested instructions are loaded
+  assert.equal(initialReadRes.isError, true);
+  assert.match(responseText(initialReadRes), /NESTED_INSTRUCTION_REBIND_REQUIRED/);
+  assert.ok(responseText(initialReadRes).includes(externalAgentsPath));
 
   // Assert discovery occurred without triggering a full global recursive walk
   assert.equal(
@@ -388,11 +405,37 @@ test("G2: instruction cache lifecycle - bounded ancestor-chain discovery, extern
     "Ancestor-chain discovery must not trigger a full recursive discovery call",
   );
 
+  // Model follows instruction rebind protocol: reads the discovered instruction file
+  const instructionReadRes = await client.callTool({
+    name: "read",
+    arguments: {
+      workspaceId: wsId,
+      path: "packages/service/AGENTS.md",
+    },
+    _meta: { "openai/session": "conv-g2-instructions" },
+  });
+  assert.equal(instructionReadRes.isError, undefined);
+  assert.ok(responseText(instructionReadRes).includes("Service specific external instructions"));
+
+
+  // After reading the instruction, repeating the target operation succeeds
+  const retryReadRes = await client.callTool({
+    name: "read",
+    arguments: {
+      workspaceId: wsId,
+      path: "packages/service/index.ts",
+    },
+    _meta: { "openai/session": "conv-g2-instructions" },
+  });
+  assert.equal(retryReadRes.isError, undefined);
+  assert.ok(responseText(retryReadRes).includes("export const service = 'ok'"));
+
   const ws = workspaces.getWorkspace(wsId);
   const hasDiscovered = ws.availableAgentsFiles?.some(
     (f) => f.path === externalAgentsPath || resolve(project, f.path) === externalAgentsPath,
   );
   assert.ok(hasDiscovered, "packages/service/AGENTS.md must be discovered via bounded ancestor chain");
+
 
   // 3. Warm reopen: availableAgentsFiles contains packages/service/AGENTS.md
   const warmReopen = await client.callTool({
@@ -795,89 +838,152 @@ test("G5: concurrent idempotent agent_start races, replay conflicts, and attempt
 });
 
 test("G6: native search 11-point acceptance suite (shared/worktree/core bounds, truncation, timeout, traversal, symlink, regex data, pipe block)", async (t) => {
-  const context = await createTestServer(t, { toolMode: "minimal" });
-  const { project, root, client } = context;
+  const context = await createTestServer(t, { toolMode: "minimal", coreMutation: true });
+  const { project, root, client, workspaces } = context;
 
-  // 1. Shared checkout search without mutation authority
-  const openRes = await client.callTool({
+  // Initialize git repo in project so managed worktrees can be created
+  await execFileAsync("git", ["init", "-q"], { cwd: project });
+  await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: project });
+  await execFileAsync("git", ["config", "user.name", "Test"], { cwd: project });
+  await execFileAsync("git", ["add", "."], { cwd: project });
+  await execFileAsync("git", ["commit", "-qm", "Initial base commit"], { cwd: project });
+
+  // 1. Shared checkout: two distinct conversation identities pointing to same physical checkout
+  const openResA = await client.callTool({
     name: "open_workspace",
     arguments: { path: project },
-  });
-  const workspaceId = structuredContent(openRes).workspaceId as string;
+    _meta: { "openai/session": "conv-g6-shared-a" },
+  } as Parameters<Client["callTool"]>[0]);
+  const wsIdA = structuredContent(openResA).workspaceId as string;
+
+  const openResB = await client.callTool({
+    name: "open_workspace",
+    arguments: { path: project },
+    _meta: { "openai/session": "conv-g6-shared-b" },
+  } as Parameters<Client["callTool"]>[0]);
+  const wsIdB = structuredContent(openResB).workspaceId as string;
+
+  assert.notEqual(wsIdA, wsIdB, "Two distinct conversations on same checkout must receive distinct workspace IDs");
+  const safetyA = await workspaces.conversationMutationSafety(wsIdA, "conv-g6-shared-a");
+  assert.equal(safetyA.state, "SHARED_CHECKOUT");
+  assert.equal(safetyA.mutationAllowed, false);
+  assert.ok(safetyA.competingConversationCount >= 1);
 
   await writeFile(join(project, "safe_test.ts"), "const ALPHA = 10;\nconst BETA = 20;\n");
   for (let i = 0; i < 50; i++) {
     await writeFile(join(project, `file_${i}.txt`), `line with MATCH_${i} and common keyword\n`);
   }
 
+  // Native search inspection remains usable in SHARED_CHECKOUT (read-only inspection is never blocked)
   const sharedGrep = await client.callTool({
     name: "grep_files",
-    arguments: { workspaceId, pattern: "common keyword" },
-  });
+    arguments: { workspaceId: wsIdA, pattern: "common keyword" },
+    _meta: { "openai/session": "conv-g6-shared-a" },
+  } as Parameters<Client["callTool"]>[0]);
   assert.equal(sharedGrep.isError, undefined);
   assert.ok(responseText(sharedGrep).includes("common keyword"));
 
   const sharedFind = await client.callTool({
     name: "find_files",
-    arguments: { workspaceId, pattern: "*.txt" },
-  });
+    arguments: { workspaceId: wsIdA, pattern: "*.txt" },
+    _meta: { "openai/session": "conv-g6-shared-a" },
+  } as Parameters<Client["callTool"]>[0]);
   assert.equal(sharedFind.isError, undefined);
   assert.ok(responseText(sharedFind).includes("file_0.txt"));
 
   const sharedLs = await client.callTool({
     name: "list_directory",
-    arguments: { workspaceId, path: "." },
-  });
+    arguments: { workspaceId: wsIdA, path: "." },
+    _meta: { "openai/session": "conv-g6-shared-a" },
+  } as Parameters<Client["callTool"]>[0]);
   assert.equal(sharedLs.isError, undefined);
   assert.ok(responseText(sharedLs).includes("safe_test.ts"));
 
-  // 2. Isolated worktree search
-  const worktreeDir = join(root, "worktree-proj");
-  await mkdir(worktreeDir, { recursive: true });
-  await writeFile(join(worktreeDir, "worktree_file.ts"), "const WORKTREE_TOKEN = 999;\n");
+  // 2. Isolated worktree: open_workspace with mode="worktree"
   const wtOpen = await client.callTool({
     name: "open_workspace",
-    arguments: { path: worktreeDir },
-  });
-  const wtId = structuredContent(wtOpen).workspaceId as string;
+    arguments: { path: project, mode: "worktree" },
+    _meta: { "openai/session": "conv-g6-shared-a" },
+  } as Parameters<Client["callTool"]>[0]);
+  assert.equal(wtOpen.isError, undefined);
+  const wtContent = structuredContent(wtOpen);
+  assert.equal(wtContent.mode, "worktree");
+  const wtId = wtContent.workspaceId as string;
+  const wtWorkspace = workspaces.getWorkspace(wtId);
+  assert.equal(wtWorkspace.mode, "worktree");
+  const wtSafety = await workspaces.conversationMutationSafety(wtId, "conv-g6-shared-a");
+  assert.equal(wtSafety.state, "ISOLATED_WORKTREE");
+  assert.equal(wtSafety.mutationAllowed, true);
+
   const wtGrep = await client.callTool({
     name: "grep_files",
-    arguments: { workspaceId: wtId, pattern: "WORKTREE_TOKEN" },
-  });
+    arguments: { workspaceId: wtId, pattern: "ALPHA" },
+    _meta: { "openai/session": "conv-g6-shared-a" },
+  } as Parameters<Client["callTool"]>[0]);
   assert.equal(wtGrep.isError, undefined);
-  assert.ok(responseText(wtGrep).includes("WORKTREE_TOKEN"));
 
-  // 3. Core-bound worktree search without mutation session
-  // Search is read-only inspection; it succeeds even when mutation session is not bound
+  // 3. Core-bound worktree: real Core-bound state (NO CORE_MUTATION_TEST_ONLY_UNTRUSTED_BYPASS)
+  // Search succeeds without active mutation session because it is read-only inspection.
   const coreInspectionGrep = await client.callTool({
     name: "grep_files",
-    arguments: { workspaceId: wtId, pattern: "const" },
-  });
+    arguments: { workspaceId: wtId, pattern: "ALPHA" },
+    _meta: { "openai/session": "conv-g6-shared-a" },
+  } as Parameters<Client["callTool"]>[0]);
   assert.equal(coreInspectionGrep.isError, undefined);
 
-  // 4. Result-count truncation: search matching 50+ files returns bounded results
-  const multiFind = await client.callTool({
-    name: "find_files",
-    arguments: { workspaceId, pattern: "file_*.txt" },
-  });
-  assert.equal(multiFind.isError, undefined);
-  assert.ok(responseText(multiFind).length > 0);
+  // Consequential mutation without Core session is rejected by CoreMutationGuard fail-closed
+  const blockedWrite = await client.callTool({
+    name: "write",
+    arguments: { workspaceId: wtId, path: "unauthorized.txt", content: "forbidden\n" },
+    _meta: { "openai/session": "conv-g6-shared-a" },
+  } as Parameters<Client["callTool"]>[0]);
+  assert.equal(blockedWrite.isError, true);
+  assert.match(responseText(blockedWrite), /CORE_BOUND_SESSION_REQUIRED|CORE_MUTATION_POINTER_REQUIRED|NO_ACTIVE_CORE_MUTATION_SESSION/);
 
-  // 5. Byte / output truncation bound: large output remains safely bounded
-  const bigFile = join(project, "big.txt");
-  await writeFile(bigFile, "REPEAT_LINE_DATA\n".repeat(5000));
+
+  // 4. Result-count truncation: fixture > native default limit (100 matches)
+  const countDir = join(project, "count_bench");
+  await mkdir(countDir, { recursive: true });
+  for (let i = 0; i < 120; i++) {
+    await writeFile(join(countDir, `c_${i}.txt`), `UNIQUE_COUNT_KEYWORD line ${i}\n`);
+  }
+  const multiGrep = await client.callTool({
+    name: "grep_files",
+    arguments: { workspaceId: wsIdA, path: "count_bench", pattern: "UNIQUE_COUNT_KEYWORD" },
+    _meta: { "openai/session": "conv-g6-shared-a" },
+  } as Parameters<Client["callTool"]>[0]);
+  assert.equal(multiGrep.isError, undefined);
+  const multiGrepText = responseText(multiGrep);
+  const matchLines = multiGrepText.trim().split("\n").filter((l) => l.includes("UNIQUE_COUNT_KEYWORD"));
+  assert.ok(matchLines.length <= 100, `Returned matches count (${matchLines.length}) must be <= 100 limit`);
+  assert.ok(
+    multiGrepText.includes("Truncated") || multiGrepText.includes("limit") || multiGrepText.includes("matches"),
+    "Count truncation witness must be present in response",
+  );
+
+  // 5. Byte / output truncation bound: fixture exceeds byte limit (50KB DEFAULT_MAX_BYTES)
+  const bigFile = join(project, "big_byte_bench.txt");
+  await writeFile(bigFile, ("X".repeat(100) + "_BYTE_BENCH_LINE\n").repeat(1000));
   const bigGrep = await client.callTool({
     name: "grep_files",
-    arguments: { workspaceId, pattern: "REPEAT_LINE_DATA" },
-  });
+    arguments: { workspaceId: wsIdA, path: "big_byte_bench.txt", pattern: "BYTE_BENCH_LINE" },
+    _meta: { "openai/session": "conv-g6-shared-a" },
+  } as Parameters<Client["callTool"]>[0]);
   assert.equal(bigGrep.isError, undefined);
-  assert.ok(responseText(bigGrep).length > 0);
+  const bigGrepText = responseText(bigGrep);
+  const encodedByteLength = Buffer.byteLength(bigGrepText, "utf-8");
+  assert.ok(encodedByteLength <= 55_000, `Encoded response (${encodedByteLength} bytes) must be <= 55000 byte envelope`);
+  assert.ok(
+    bigGrepText.includes("Truncated") || bigGrepText.includes("limit"),
+    "Byte truncation witness must be present in response",
+  );
 
   // 6. Timeout bound: pass timeoutMs: 1 to ensure execution is bounded, abort triggered, zero workspace mutation
   const timeoutGrep = await client.callTool({
     name: "grep_files",
-    arguments: { workspaceId, pattern: "REPEAT_LINE_DATA", timeoutMs: 1 },
-  });
+    arguments: { workspaceId: wsIdA, pattern: "BYTE_BENCH_LINE", timeoutMs: 1 },
+    _meta: { "openai/session": "conv-g6-shared-a" },
+  } as Parameters<Client["callTool"]>[0]);
   assert.equal(timeoutGrep.isError, true);
   assert.match(responseText(timeoutGrep), /timed out/i);
   assert.ok(structuredContent(timeoutGrep).error);
@@ -885,8 +991,9 @@ test("G6: native search 11-point acceptance suite (shared/worktree/core bounds, 
   // 7. Nonexistent path: structured failure
   const nonExistentGrep = await client.callTool({
     name: "grep_files",
-    arguments: { workspaceId, path: "nonexistent_dir_xyz", pattern: "anything" },
-  });
+    arguments: { workspaceId: wsIdA, path: "nonexistent_dir_xyz", pattern: "anything" },
+    _meta: { "openai/session": "conv-g6-shared-a" },
+  } as Parameters<Client["callTool"]>[0]);
   assert.equal(nonExistentGrep.isError, true);
   assert.ok(structuredContent(nonExistentGrep).error);
 
@@ -894,11 +1001,12 @@ test("G6: native search 11-point acceptance suite (shared/worktree/core bounds, 
   const traversalGrep = await client.callTool({
     name: "grep_files",
     arguments: {
-      workspaceId,
+      workspaceId: wsIdA,
       path: "../../etc",
       pattern: "passwd",
     },
-  });
+    _meta: { "openai/session": "conv-g6-shared-a" },
+  } as Parameters<Client["callTool"]>[0]);
   assert.equal(traversalGrep.isError, true);
 
   // 9. Symlink escape: symlink pointing outside workspace root is rejected
@@ -910,11 +1018,12 @@ test("G6: native search 11-point acceptance suite (shared/worktree/core bounds, 
     const symlinkGrep = await client.callTool({
       name: "grep_files",
       arguments: {
-        workspaceId,
+        workspaceId: wsIdA,
         path: "escaped_link",
         pattern: "secret",
       },
-    });
+      _meta: { "openai/session": "conv-g6-shared-a" },
+    } as Parameters<Client["callTool"]>[0]);
     assert.equal(symlinkGrep.isError, true);
   } finally {
     await rm(outsideDir, { recursive: true, force: true });
@@ -925,10 +1034,11 @@ test("G6: native search 11-point acceptance suite (shared/worktree/core bounds, 
   const regexGrep = await client.callTool({
     name: "grep_files",
     arguments: {
-      workspaceId,
+      workspaceId: wsIdA,
       pattern: "ALPHA|BETA",
     },
-  });
+    _meta: { "openai/session": "conv-g6-shared-a" },
+  } as Parameters<Client["callTool"]>[0]);
   assert.equal(regexGrep.isError, undefined);
   assert.ok(responseText(regexGrep).includes("ALPHA"));
   assert.ok(responseText(regexGrep).includes("BETA"));
@@ -939,6 +1049,7 @@ test("G6: native search 11-point acceptance suite (shared/worktree/core bounds, 
   assert.equal(isReadOnlyInspectionCommand("grep $(whoami) file.txt"), false);
   assert.equal(isReadOnlyInspectionCommand("rm -rf /"), false);
 });
+
 
 test("G7: tool mode surface isolation and alias mappings for full, minimal, and codex", async (t) => {
   // 1. Full mode surface

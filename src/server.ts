@@ -3689,6 +3689,30 @@ export function createMcpServer(
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       const readPath = workspaces.resolveReadPath(workspace, input.path);
+
+      // B: Ancestor instruction pre-admission enforcement.
+      // If new nested instruction files were discovered, block the operation
+      // and require the model to read them before retrying.
+      if (readPath.nestedInstructionRebindRequired) {
+        const { instructionPaths } = readPath.nestedInstructionRebindRequired;
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text" as const,
+              text: [
+                `NESTED_INSTRUCTION_REBIND_REQUIRED: Nested repository instruction file(s) were discovered that must be read before operating on '${input.path}'.`,
+                ``,
+                `Read each of the following instruction files (in order), then retry the original operation:`,
+                ...instructionPaths.map((p, i) => `  ${i + 1}. ${p}`),
+                ``,
+                `This is required by repository instruction authority. Do not proceed with the original operation until all listed instruction files have been read.`,
+              ].join("\n"),
+            },
+          ],
+        };
+      }
+
       const response = await readFileTool(
         { ...input, path: readPath.absolutePath },
         {
@@ -3739,6 +3763,8 @@ export function createMcpServer(
     },
   );
 
+
+
   if (config.toolMode !== "codex") {
   registerAppTool(
     server,
@@ -3764,7 +3790,25 @@ export function createMcpServer(
       const startedAt = performance.now();
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
-      workspaces.resolvePath(workspace, input.path);
+      const absPath = workspaces.resolvePath(workspace, input.path);
+
+      // B: Pre-operation ancestor instruction enforcement for mutation sinks.
+      const newInstructions = workspaces.preOperationAncestorCheck(workspace, absPath);
+      if (newInstructions.length > 0) {
+        return {
+          isError: true,
+          content: [{
+            type: "text" as const,
+            text: [
+              `NESTED_INSTRUCTION_REBIND_REQUIRED: Nested repository instruction file(s) must be read before writing '${input.path}'.`,
+              `Read each of the following instruction files (in order), then retry:`,
+              ...newInstructions.map((p, i) => `  ${i + 1}. ${p}`),
+              `Mutation is blocked until all listed instruction files have been read.`,
+            ].join("\n"),
+          }],
+        };
+      }
+
       const coreAdmission = coreMutationGuard
         ? await coreMutationGuard.admit({ workspaceId, extra, paths: [input.path], pathContainment: "STRUCTURED_SINK_ENFORCED" })
         : undefined;
@@ -3772,6 +3816,7 @@ export function createMcpServer(
         cwd: workspace.root,
         root: workspace.root,
       });
+
 
       if (response.isError) {
         logFailedToolResponse(config, {
@@ -3861,7 +3906,25 @@ export function createMcpServer(
       const startedAt = performance.now();
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
-      workspaces.resolvePath(workspace, input.path);
+      const absEditPath = workspaces.resolvePath(workspace, input.path);
+
+      // B: Pre-operation ancestor instruction enforcement for mutation sinks.
+      const newEditInstructions = workspaces.preOperationAncestorCheck(workspace, absEditPath);
+      if (newEditInstructions.length > 0) {
+        return {
+          isError: true,
+          content: [{
+            type: "text" as const,
+            text: [
+              `NESTED_INSTRUCTION_REBIND_REQUIRED: Nested repository instruction file(s) must be read before editing '${input.path}'.`,
+              `Read each of the following instruction files (in order), then retry:`,
+              ...newEditInstructions.map((p, i) => `  ${i + 1}. ${p}`),
+              `Mutation is blocked until all listed instruction files have been read.`,
+            ].join("\n"),
+          }],
+        };
+      }
+
       const coreAdmission = coreMutationGuard
         ? await coreMutationGuard.admit({ workspaceId, extra, paths: [input.path], pathContainment: "STRUCTURED_SINK_ENFORCED" })
         : undefined;
@@ -3869,6 +3932,7 @@ export function createMcpServer(
         cwd: workspace.root,
         root: workspace.root,
       });
+
 
       if (response.isError) {
         logFailedToolResponse(config, {
@@ -3967,10 +4031,39 @@ export function createMcpServer(
         const actions = parsePatch(patch);
         const mutationPaths = actions.flatMap((action) => action.kind === "update" && action.moveTo ? [action.path, action.moveTo] : [action.path]);
         const deletedPaths = actions.flatMap((action) => action.kind === "delete" || (action.kind === "update" && action.moveTo) ? [action.path] : []);
+
+        // B: Pre-operation ancestor instruction enforcement for apply_patch.
+        // Check all mutation paths. Fail closed if any path discovers new instructions.
+        const allNewInstructions: string[] = [];
+        for (const mutPath of mutationPaths) {
+          try {
+            const absP = workspaces.resolvePath(workspace, mutPath);
+            const discovered = workspaces.preOperationAncestorCheck(workspace, absP);
+            for (const d of discovered) {
+              if (!allNewInstructions.includes(d)) allNewInstructions.push(d);
+            }
+          } catch { /* path validation errors are handled by applyPatch itself */ }
+        }
+        if (allNewInstructions.length > 0) {
+          return {
+            isError: true,
+            content: [{
+              type: "text" as const,
+              text: [
+                `NESTED_INSTRUCTION_REBIND_REQUIRED: Nested repository instruction file(s) must be read before applying patch.`,
+                `Read each of the following instruction files (in order), then retry:`,
+                ...allNewInstructions.map((p, i) => `  ${i + 1}. ${p}`),
+                `Mutation is blocked until all listed instruction files have been read.`,
+              ].join("\n"),
+            }],
+          };
+        }
+
         const coreAdmission = coreMutationGuard
           ? await coreMutationGuard.admit({ workspaceId, extra, paths: mutationPaths, deletedPaths, pathContainment: "STRUCTURED_SINK_ENFORCED" })
           : undefined;
         const applied = await applyPatch(workspace.root, patch);
+
         const paths = applied.files.map((file) => file.path).join(", ");
         const result = `Applied patch to ${applied.files.length} file(s): ${paths}`;
         const content = [textBlock(result)];
