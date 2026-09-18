@@ -386,6 +386,9 @@ export class LocalAgentStore {
       readStoredExecutionState(row.execution_contract).startReplay?.key === attemptKey
     );
     if (matches.length === 0) return undefined;
+    if (matches.length > 1) {
+      throw new LocalAgentReplayConflictError(matches[0]!.id);
+    }
     return rowToLocalAgentRecord(matches[0]!);
   }
 

@@ -46,9 +46,19 @@ export function resolveChatSwarmIdentity(meta: unknown): ChatSwarmIdentityEviden
 export function openAiConversationScopeId(
   meta: unknown,
 ): string | undefined {
+  if (typeof meta !== "object" || meta === null) return undefined;
+  const values: Array<{ source: (typeof CHAT_SWARM_IDENTITY_KEYS)[number]; value: string }> = [];
   for (const key of CHAT_SWARM_IDENTITY_KEYS) {
-    const value = metadataString(meta, key);
-    if (value) return value;
+    if (!(key in (meta as Record<string, unknown>))) continue;
+    const value = (meta as Record<string, unknown>)[key];
+    if (typeof value === "string" && value.trim().length > 0) {
+      values.push({ source: key, value: value.trim() });
+    }
   }
-  return undefined;
+  if (values.length === 0) return undefined;
+  const distinct = new Set(values.map(({ value }) => value));
+  if (distinct.size !== 1) {
+    throw new ChatSwarmIdentityError("AMBIGUOUS", "Conflicting ChatGPT conversation identity evidence in request metadata");
+  }
+  return values[0]!.value;
 }
