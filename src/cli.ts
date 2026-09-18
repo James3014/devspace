@@ -843,11 +843,15 @@ async function runCutoverCommand(args: string[]): Promise<void> {
     await runCutoverRepair(args.slice(1));
     return;
   }
+  if (subcommand === "abort-expired-prepared" || subcommand === "recover-expired-prepared") {
+    runCutoverAbortExpiredPrepared(args.slice(1));
+    return;
+  }
   if (subcommand === "help" || subcommand === "--help" || subcommand === "-h" || subcommand === undefined) {
     printCutoverHelp();
     return;
   }
-  throw new Error("Usage: devspace cutover <status|recover|observe|repair>");
+  throw new Error("Usage: devspace cutover <status|recover|observe|repair|abort-expired-prepared>");
 }
 
 function printCutoverHelp(): void {
@@ -860,6 +864,7 @@ function printCutoverHelp(): void {
       "  devspace cutover recover --cutover-id <id> --commit <sha> --build-id <id> [--capability-sha <sha>] [--package-root <path>] [--json]",
       "  devspace cutover observe --cutover-id <id> --workspace-id <id> --agent-id <id> [--json]",
       "  devspace cutover repair --cutover-id <id> --workspace-id <id> --agent-id <id> [--server-url <url>] [--package-root <path>] [--state-dir <path>] [--json]",
+      "  devspace cutover abort-expired-prepared --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--json]",
       "",
       "The repair subcommand repairs a successor cutover blocked by CROSS_DOMAIN_DIGEST_MISBINDING",
       "where the target build-manifest digest was mistakenly bound as the capability manifest digest.",
@@ -993,6 +998,51 @@ async function runCutoverRepair(args: string[]): Promise<void> {
   console.log(
     `Repaired binding ${result.cutover.cutoverId}: phase=${result.cutover.phase}; server=${result.serverInstanceId}; newlyRecovered=${String(result.newlyRecovered)}`,
   );
+}
+
+function runCutoverAbortExpiredPrepared(args: string[]): void {
+  let cutoverId: string | undefined;
+  let carrierId: string | undefined;
+  let version: number | undefined;
+  let validityVersion: number | undefined;
+  let confirmCutoverId: string | undefined;
+  let json = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    const value = (): string => {
+      const next = args[++index];
+      if (!next) throw new Error(`${argument} requires a value.`);
+      return next;
+    };
+    if (argument === "--json") json = true;
+    else if (argument === "--cutover-id") cutoverId = value();
+    else if (argument === "--carrier") carrierId = value();
+    else if (argument === "--version") version = Number(value());
+    else if (argument === "--validity-version") validityVersion = Number(value());
+    else if (argument === "--confirm") confirmCutoverId = value();
+    else throw new Error(`Unknown cutover abort-expired-prepared flag: ${argument}`);
+  }
+  if (!cutoverId || !carrierId || !Number.isSafeInteger(version) || !Number.isSafeInteger(validityVersion) || (version ?? 0) < 1 || (validityVersion ?? 0) < 1 || !confirmCutoverId) {
+    throw new Error("Usage: devspace cutover abort-expired-prepared --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--json]");
+  }
+  const config = loadConfig();
+  const bindings = new CarrierBindingStore(config.stateDir);
+  try {
+    const result = bindings.recoverExpiredPreparedCutoverLocal({
+      cutoverId,
+      carrierId,
+      expectedVersion: version as number,
+      expectedValidityVersion: validityVersion as number,
+      confirmCutoverId,
+    });
+    if (json) {
+      printJson(result);
+      return;
+    }
+    console.log(`Recovered expired prepared cutover ${result.cutover.cutoverId}: phase=${result.cutover.phase}; lease=${result.lease.terminalState}; replayed=${String(result.replayed)}`);
+  } finally {
+    bindings.close();
+  }
 }
 
 function parseCutoverRecoverArgs(args: string[]): CutoverRecoverCliOptions {
