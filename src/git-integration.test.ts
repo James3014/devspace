@@ -90,6 +90,8 @@ const LOADED_MANIFEST: CapabilityManifest = {
     "agent_start.executionContract.authorityMode",
     "agent_start.executionContract.idleTimeoutMs",
     "agent_start.executionContract.nexusGrant",
+    "agent_start.executionContract.authorizedToolCeiling",
+    "agent_start.executionContract.toolProjectionManifest",
     "agent_start.tool",
   ],
   missing: [],
