@@ -1,9 +1,13 @@
 import {
+  normalizeToolIntentSet,
   parseDispatchIntent,
   parseNexusExecutionGrantRef,
+  parseToolProjectionManifest,
   type DispatchIntent,
   type ExecutionAuthorityMode,
   type NexusExecutionGrantRef,
+  type ToolIntentId,
+  type ToolProjectionManifest,
 } from "./execution-protocol.js";
 import {
   parseCapabilityDiscoveryReceipt,
@@ -67,6 +71,16 @@ export interface ExecutionContract {
   nexusGrant?: NexusExecutionGrantRef;
   /** Controller-authored bounded work semantics, transported durably by DevSpace. */
   dispatchIntent?: DispatchIntent;
+  /**
+   * Single durable/replay-bound tool-scope authority for this execution.
+   * Provider adapters and derived manifests may only narrow this ceiling.
+   */
+  authorizedToolCeiling?: ToolIntentId[];
+  /**
+   * Optional derived projection carried by value for exact replay/content identity.
+   * It is evidence of a bounded selection, never an independent authority source.
+   */
+  toolProjectionManifest?: ToolProjectionManifest;
   /** Verified reuse-before-invention discovery evidence for mutating delegated work. */
   capabilityDiscovery?: CapabilityDiscoveryReceipt;
   /** Exact pointer to an already-open Core-bound mutation session. */
@@ -232,6 +246,20 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
     contract.dispatchIntent = parseDispatchIntent(record.dispatchIntent);
   }
 
+  if (record.authorizedToolCeiling !== undefined) {
+    if (!Array.isArray(record.authorizedToolCeiling)) {
+      throw new Error("executionContract.authorizedToolCeiling must be an array.");
+    }
+    contract.authorizedToolCeiling = normalizeToolIntentSet(
+      record.authorizedToolCeiling as string[],
+      "executionContract.authorizedToolCeiling",
+    );
+  }
+
+  if (record.toolProjectionManifest !== undefined) {
+    contract.toolProjectionManifest = parseToolProjectionManifest(record.toolProjectionManifest);
+  }
+
   if (record.capabilityDiscovery !== undefined) {
     contract.capabilityDiscovery = parseCapabilityDiscoveryReceipt(record.capabilityDiscovery);
   }
@@ -331,6 +359,26 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
   if (authorityMode === "NEXUS_GOVERNED") {
     if (!contract.nexusGrant || !contract.dispatchIntent || !contract.expectedHead) {
       throw new Error("NEXUS_GOVERNED execution requires nexusGrant, dispatchIntent, and expectedHead.");
+    }
+  }
+
+  if (contract.toolProjectionManifest) {
+    if (!contract.authorizedToolCeiling) {
+      throw new Error("executionContract.toolProjectionManifest requires authorizedToolCeiling.");
+    }
+    const manifest = contract.toolProjectionManifest;
+    const ceilingKey = contract.authorizedToolCeiling.join("\n");
+    if (manifest.authorizedToolCeiling.join("\n") !== ceilingKey) {
+      throw new Error("executionContract.toolProjectionManifest authorizedToolCeiling must exactly match the durable executionContract.authorizedToolCeiling.");
+    }
+    if (manifest.authority.mode !== authorityMode
+      || manifest.authority.issuer !== (authorityMode === "OWNER_DIRECT" ? "owner" : "nexus")) {
+      throw new Error("executionContract.toolProjectionManifest authority must match executionContract authorityMode.");
+    }
+    if (contract.dispatchIntent
+      && (manifest.identity.taskId !== contract.dispatchIntent.taskId
+        || manifest.identity.attemptId !== contract.dispatchIntent.attemptId)) {
+      throw new Error("executionContract.toolProjectionManifest task/attempt must match dispatchIntent.");
     }
   }
 

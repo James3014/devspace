@@ -3,17 +3,24 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 import {
   EXECUTION_PROTOCOL_VERSION,
+  TOOL_INTENT_NAMESPACE,
+  TOOL_PROJECTION_MANIFEST_SCHEMA,
   ExecutionProtocolError,
   assertExecutionAuthority,
+  assertExecutionBindingToolManifest,
+  assertToolManifestRef,
   assertSameExecutionGeneration,
   assertNexusGrantAuthorizesExecution,
   buildExecutionGenerationBinding,
   hashDispatchIntent,
   hashExecutionBinding,
   hashNexusExecutionGrant,
+  hashToolProjectionManifest,
   parseDispatchIntent,
   parseNexusExecutionGrantRef,
+  parseToolProjectionManifest,
   renderDispatchIntentForWorker,
+  toolProjectionManifestRef,
   validateResolvedNexusExecutionGrant,
   type DispatchIntent,
   type ExecutionBinding,
@@ -259,5 +266,83 @@ test("execution generation accepts exact generation and rejects substitution or 
   assert.throws(
     () => assertSameExecutionGeneration(undefined, generation),
     (error: unknown) => error instanceof ExecutionProtocolError && error.code === "LEGACY_EXECUTION_BINDING_MISSING",
+  );
+});
+
+function ownerToolManifest() {
+  return parseToolProjectionManifest({
+    schema: TOOL_PROJECTION_MANIFEST_SCHEMA,
+    namespace: TOOL_INTENT_NAMESPACE,
+    identity: { taskId: "task-1", attemptId: "attempt-1" },
+    authority: { mode: "OWNER_DIRECT", issuer: "owner" },
+    authorizedToolCeiling: ["workspace.read", "workspace.search_text", "process.execute"],
+    candidateTools: ["process.execute", "workspace.read", "workspace.search_text"],
+    selectedTools: ["workspace.read", "process.execute"],
+    orderingMode: "ORDER_INDEPENDENT",
+  });
+}
+
+test("ToolProjectionManifest canonicalizes order-independent sets and hashes deterministically", () => {
+  const manifest = ownerToolManifest();
+  assert.deepEqual(manifest.authorizedToolCeiling, ["process.execute", "workspace.read", "workspace.search_text"]);
+  assert.deepEqual(manifest.selectedTools, ["process.execute", "workspace.read"]);
+  assert.match(hashToolProjectionManifest(manifest), /^[a-f0-9]{64}$/);
+  assert.equal(toolProjectionManifestRef(manifest), `sha256:${hashToolProjectionManifest(manifest)}`);
+});
+
+test("ToolProjectionManifest rejects widening, unknown ids, duplicates, and hidden order", () => {
+  const base = ownerToolManifest();
+  for (const invalid of [
+    { ...base, candidateTools: [...base.candidateTools, "workspace.mutate"] },
+    { ...base, selectedTools: [...base.selectedTools, "workspace.list"] },
+    { ...base, selectedTools: ["workspace.read", "workspace.read"] },
+    { ...base, selectedTools: ["provider.native.magic"] },
+    { ...base, candidateOrder: [...base.candidateTools] },
+  ]) {
+    assert.throws(
+      () => parseToolProjectionManifest(invalid),
+      (error: unknown) => error instanceof ExecutionProtocolError
+        && error.code === "INVALID_TOOL_PROJECTION_MANIFEST",
+    );
+  }
+});
+
+test("ToolProjectionManifest preserves explicit order-sensitive candidate order only when it is an exact permutation", () => {
+  const base = ownerToolManifest();
+  const ordered = parseToolProjectionManifest({
+    ...base,
+    orderingMode: "ORDER_SENSITIVE",
+    candidateOrder: ["workspace.search_text", "process.execute", "workspace.read"],
+  });
+  assert.deepEqual(ordered.candidateOrder, ["workspace.search_text", "process.execute", "workspace.read"]);
+  assert.throws(
+    () => parseToolProjectionManifest({
+      ...base,
+      orderingMode: "ORDER_SENSITIVE",
+      candidateOrder: ["workspace.read"],
+    }),
+    (error: unknown) => error instanceof ExecutionProtocolError
+      && error.code === "INVALID_TOOL_PROJECTION_MANIFEST",
+  );
+});
+
+test("ExecutionBinding tool manifest reference is content, identity, and authority bound", () => {
+  const manifest = ownerToolManifest();
+  const binding = ownerBinding();
+  binding.capabilities.toolManifestRef = toolProjectionManifestRef(manifest);
+  assert.doesNotThrow(() => assertExecutionBindingToolManifest(binding, manifest));
+
+  assert.throws(
+    () => assertToolManifestRef("sha256:" + "0".repeat(64), manifest),
+    (error: unknown) => error instanceof ExecutionProtocolError
+      && error.code === "TOOL_MANIFEST_REF_MISMATCH",
+  );
+  assert.throws(
+    () => assertExecutionBindingToolManifest({
+      ...binding,
+      identity: { ...binding.identity, attemptId: "other-attempt" },
+    }, manifest),
+    (error: unknown) => error instanceof ExecutionProtocolError
+      && error.code === "TOOL_MANIFEST_REF_MISMATCH",
   );
 });
