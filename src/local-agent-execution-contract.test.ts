@@ -10,7 +10,7 @@ import { databasePath } from "./db/client.js";
 import { LocalAgentSessionManager, AgentSessionError } from "./local-agent-sessions.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
-import type { ScopeBaseline } from "./local-agent-contract.js";
+import { parseExecutionContract, serializeExecutionContract, deserializeExecutionContract, type ScopeBaseline } from "./local-agent-contract.js";
 import { LocalAgentProviderError } from "./local-agent-runtime.js";
 import { ClineCatalogService } from "./local-agent-cline-catalog.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
@@ -23,6 +23,8 @@ import {
 } from "./workspace-reconciliation.js";
 import type { WorkspacePhysicalState } from "./workspace-reconciliation.js";
 import {
+  TOOL_INTENT_NAMESPACE,
+  TOOL_PROJECTION_MANIFEST_SCHEMA,
   hashDispatchIntent,
   hashNexusExecutionGrant,
   type DispatchIntent,
@@ -4206,4 +4208,88 @@ test("ClinePass receipt survives reopen and rejects family/runtime/source drift 
     await runRejected({ ...contract, catalogReceipt: { ...contract.catalogReceipt, generation: familySnapshot.generation, fetchedAt: familySnapshot.fetchedAt, runtimeIdentity: `cline:${familySnapshot.runtime.version}:${familySnapshot.runtime.command}` } }, { ...catalog, clineCatalog: familySnapshot });
     reopened.close();
   } finally { manager.close(); f.clean(); rmSync(stateDir, { recursive: true, force: true }); if (previousCommand === undefined) delete process.env.CLINE_COMMAND; else process.env.CLINE_COMMAND = previousCommand; }
+});
+
+test("G2 tool ceiling is durable, canonical, and replay-stable in ExecutionContract", () => {
+  const raw = {
+    authorityMode: "OWNER_DIRECT",
+    authorizedToolCeiling: ["workspace.search_text", "workspace.read", "process.execute"],
+    toolProjectionManifest: {
+      schema: TOOL_PROJECTION_MANIFEST_SCHEMA,
+      namespace: TOOL_INTENT_NAMESPACE,
+      identity: { taskId: "issue-982-g2", attemptId: "attempt-1" },
+      authority: { mode: "OWNER_DIRECT", issuer: "owner" },
+      authorizedToolCeiling: ["process.execute", "workspace.read", "workspace.search_text"],
+      candidateTools: ["workspace.search_text", "workspace.read"],
+      selectedTools: ["workspace.read"],
+      orderingMode: "ORDER_INDEPENDENT",
+    },
+  };
+  const parsed = parseExecutionContract(raw)!;
+  assert.deepEqual(parsed.authorizedToolCeiling, ["process.execute", "workspace.read", "workspace.search_text"]);
+  const serialized = serializeExecutionContract(parsed);
+  assert.deepEqual(deserializeExecutionContract(serialized), parsed);
+});
+
+test("G2 ToolProjectionManifest cannot become a second tool authority", () => {
+  const base = {
+    authorityMode: "OWNER_DIRECT",
+    authorizedToolCeiling: ["workspace.read", "workspace.search_text"],
+    toolProjectionManifest: {
+      schema: TOOL_PROJECTION_MANIFEST_SCHEMA,
+      namespace: TOOL_INTENT_NAMESPACE,
+      identity: { taskId: "issue-982-g2", attemptId: "attempt-1" },
+      authority: { mode: "OWNER_DIRECT", issuer: "owner" },
+      authorizedToolCeiling: ["workspace.read"],
+      candidateTools: ["workspace.read"],
+      selectedTools: ["workspace.read"],
+      orderingMode: "ORDER_INDEPENDENT",
+    },
+  };
+  assert.throws(
+    () => parseExecutionContract(base),
+    /authorizedToolCeiling must exactly match the durable executionContract\.authorizedToolCeiling/,
+  );
+});
+
+test("G2 ToolProjectionManifest authority and dispatch identity fail closed on mismatch", () => {
+  const intent: DispatchIntent = {
+    taskId: "task-a",
+    attemptId: "attempt-a",
+    objective: "bounded",
+    roleIntent: "DEEP_ENGINEERING",
+    writeScope: ["src"],
+    exclusiveOwnership: true,
+    acceptanceCriteria: ["bounded"],
+    verificationRequired: true,
+    claimCeiling: "CANDIDATE_READY",
+  };
+  const manifest = {
+    schema: TOOL_PROJECTION_MANIFEST_SCHEMA,
+    namespace: TOOL_INTENT_NAMESPACE,
+    identity: { taskId: "task-b", attemptId: "attempt-a" },
+    authority: { mode: "NEXUS_GOVERNED", issuer: "nexus" },
+    authorizedToolCeiling: ["workspace.read"],
+    candidateTools: ["workspace.read"],
+    selectedTools: ["workspace.read"],
+    orderingMode: "ORDER_INDEPENDENT",
+  };
+  assert.throws(() => parseExecutionContract({
+    authorityMode: "OWNER_DIRECT",
+    dispatchIntent: intent,
+    writePaths: ["src"],
+    authorizedToolCeiling: ["workspace.read"],
+    toolProjectionManifest: manifest,
+  }), /authority must match executionContract authorityMode/);
+
+  assert.throws(() => parseExecutionContract({
+    authorityMode: "OWNER_DIRECT",
+    dispatchIntent: intent,
+    writePaths: ["src"],
+    authorizedToolCeiling: ["workspace.read"],
+    toolProjectionManifest: {
+      ...manifest,
+      authority: { mode: "OWNER_DIRECT", issuer: "owner" },
+    },
+  }), /task\/attempt must match dispatchIntent/);
 });

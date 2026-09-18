@@ -30,6 +30,36 @@ export type DispatchClaimCeiling = "RESULT_RETURNED" | "IMPLEMENTED" | "CANDIDAT
 
 export const NEXUS_EXECUTION_GRANT_SCHEMA = "nexus.devspace.execution_grant.v1" as const;
 export const NEXUS_CANONICAL_REPOSITORY = "James3014/Nexus-new" as const;
+export const TOOL_INTENT_NAMESPACE = "devspace.tool_intent.v1" as const;
+export const TOOL_PROJECTION_MANIFEST_SCHEMA = "devspace.tool_projection_manifest.v1" as const;
+
+export type ToolIntentId =
+  | "workspace.read"
+  | "workspace.search_text"
+  | "workspace.search_paths"
+  | "workspace.list"
+  | "workspace.mutate"
+  | "process.execute";
+
+export type ToolProjectionOrderingMode = "ORDER_INDEPENDENT" | "ORDER_SENSITIVE";
+
+export interface ToolProjectionManifest {
+  schema: typeof TOOL_PROJECTION_MANIFEST_SCHEMA;
+  namespace: typeof TOOL_INTENT_NAMESPACE;
+  identity: {
+    taskId: string;
+    attemptId: string;
+  };
+  authority: {
+    mode: ExecutionAuthorityMode;
+    issuer: "owner" | "nexus";
+  };
+  authorizedToolCeiling: ToolIntentId[];
+  candidateTools: ToolIntentId[];
+  selectedTools: ToolIntentId[];
+  orderingMode: ToolProjectionOrderingMode;
+  candidateOrder?: ToolIntentId[];
+}
 
 /**
  * Caller-supplied pointer to immutable Nexus authority. The pointer is not
@@ -206,6 +236,8 @@ export class ExecutionProtocolError extends Error {
       | "NEXUS_AUTHORITY_NOT_VALIDATED"
       | "INVALID_NEXUS_EXECUTION_GRANT"
       | "AUTHORITY_EVIDENCE_MISMATCH"
+      | "INVALID_TOOL_PROJECTION_MANIFEST"
+      | "TOOL_MANIFEST_REF_MISMATCH"
       | "EXECUTION_GENERATION_MISMATCH"
       | "LEGACY_EXECUTION_BINDING_MISSING",
     message: string,
@@ -477,6 +509,146 @@ export function validateDispatchIntent(intent: DispatchIntent): void {
       "Read-only dispatch intent must not claim exclusive mutation ownership.",
     );
   }
+}
+
+const TOOL_INTENT_IDS = new Set<ToolIntentId>([
+  "workspace.read",
+  "workspace.search_text",
+  "workspace.search_paths",
+  "workspace.list",
+  "workspace.mutate",
+  "process.execute",
+]);
+
+export function normalizeToolIntentSet(value: readonly string[], field = "tool intent set"): ToolIntentId[] {
+  if (!Array.isArray(value)) {
+    throw new ExecutionProtocolError("INVALID_TOOL_PROJECTION_MANIFEST", `${field} must be an array.`);
+  }
+  const seen = new Set<string>();
+  const normalized: ToolIntentId[] = [];
+  for (const raw of value) {
+    if (typeof raw !== "string" || !TOOL_INTENT_IDS.has(raw as ToolIntentId)) {
+      throw new ExecutionProtocolError("INVALID_TOOL_PROJECTION_MANIFEST", `${field} contains unknown tool intent: ${String(raw)}`);
+    }
+    if (seen.has(raw)) {
+      throw new ExecutionProtocolError("INVALID_TOOL_PROJECTION_MANIFEST", `${field} contains duplicate tool intent: ${raw}`);
+    }
+    seen.add(raw);
+    normalized.push(raw as ToolIntentId);
+  }
+  return normalized.sort((a, b) => a.localeCompare(b));
+}
+
+function toolIntentOrder(value: unknown, field: string): ToolIntentId[] {
+  if (!Array.isArray(value)) {
+    throw new ExecutionProtocolError("INVALID_TOOL_PROJECTION_MANIFEST", `${field} must be an array.`);
+  }
+  const seen = new Set<string>();
+  return value.map((raw) => {
+    if (typeof raw !== "string" || !TOOL_INTENT_IDS.has(raw as ToolIntentId)) {
+      throw new ExecutionProtocolError("INVALID_TOOL_PROJECTION_MANIFEST", `${field} contains unknown tool intent: ${String(raw)}`);
+    }
+    if (seen.has(raw)) {
+      throw new ExecutionProtocolError("INVALID_TOOL_PROJECTION_MANIFEST", `${field} contains duplicate tool intent: ${raw}`);
+    }
+    seen.add(raw);
+    return raw as ToolIntentId;
+  });
+}
+
+export function parseToolProjectionManifest(value: unknown): ToolProjectionManifest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ExecutionProtocolError("INVALID_TOOL_PROJECTION_MANIFEST", "ToolProjectionManifest must be an object.");
+  }
+  const record = value as Record<string, unknown>;
+  const identity = record.identity as Record<string, unknown> | undefined;
+  const authority = record.authority as Record<string, unknown> | undefined;
+  if (record.schema !== TOOL_PROJECTION_MANIFEST_SCHEMA || record.namespace !== TOOL_INTENT_NAMESPACE) {
+    throw new ExecutionProtocolError("INVALID_TOOL_PROJECTION_MANIFEST", "ToolProjectionManifest schema/namespace mismatch.");
+  }
+  if (!identity || typeof identity !== "object" || Array.isArray(identity)
+    || typeof identity.taskId !== "string" || !identity.taskId.trim()
+    || typeof identity.attemptId !== "string" || !identity.attemptId.trim()) {
+    throw new ExecutionProtocolError("INVALID_TOOL_PROJECTION_MANIFEST", "ToolProjectionManifest requires taskId and attemptId.");
+  }
+  if (!authority || typeof authority !== "object" || Array.isArray(authority)
+    || (authority.mode !== "OWNER_DIRECT" && authority.mode !== "NEXUS_GOVERNED")
+    || (authority.issuer !== "owner" && authority.issuer !== "nexus")) {
+    throw new ExecutionProtocolError("INVALID_TOOL_PROJECTION_MANIFEST", "ToolProjectionManifest authority is invalid.");
+  }
+  if ((authority.mode === "OWNER_DIRECT" && authority.issuer !== "owner")
+    || (authority.mode === "NEXUS_GOVERNED" && authority.issuer !== "nexus")) {
+    throw new ExecutionProtocolError("INVALID_TOOL_PROJECTION_MANIFEST", "ToolProjectionManifest authority mode/issuer mismatch.");
+  }
+
+  const authorizedToolCeiling = normalizeToolIntentSet(record.authorizedToolCeiling as string[], "authorizedToolCeiling");
+  const candidateTools = normalizeToolIntentSet(record.candidateTools as string[], "candidateTools");
+  const selectedTools = normalizeToolIntentSet(record.selectedTools as string[], "selectedTools");
+  const ceiling = new Set(authorizedToolCeiling);
+  const candidates = new Set(candidateTools);
+  if (!candidateTools.every((tool) => ceiling.has(tool))) {
+    throw new ExecutionProtocolError("INVALID_TOOL_PROJECTION_MANIFEST", "candidateTools exceed authorizedToolCeiling.");
+  }
+  if (!selectedTools.every((tool) => candidates.has(tool))) {
+    throw new ExecutionProtocolError("INVALID_TOOL_PROJECTION_MANIFEST", "selectedTools exceed candidateTools.");
+  }
+
+  const orderingMode = record.orderingMode as ToolProjectionOrderingMode;
+  if (orderingMode !== "ORDER_INDEPENDENT" && orderingMode !== "ORDER_SENSITIVE") {
+    throw new ExecutionProtocolError("INVALID_TOOL_PROJECTION_MANIFEST", "orderingMode must be ORDER_INDEPENDENT or ORDER_SENSITIVE.");
+  }
+  let candidateOrder: ToolIntentId[] | undefined;
+  if (orderingMode === "ORDER_INDEPENDENT") {
+    if (record.candidateOrder !== undefined) {
+      throw new ExecutionProtocolError("INVALID_TOOL_PROJECTION_MANIFEST", "ORDER_INDEPENDENT manifest must not carry candidateOrder.");
+    }
+  } else {
+    candidateOrder = toolIntentOrder(record.candidateOrder, "candidateOrder");
+    if (candidateOrder.length !== candidateTools.length
+      || !candidateTools.every((tool) => candidateOrder!.includes(tool))) {
+      throw new ExecutionProtocolError("INVALID_TOOL_PROJECTION_MANIFEST", "candidateOrder must be an exact permutation of candidateTools.");
+    }
+  }
+
+  return {
+    schema: TOOL_PROJECTION_MANIFEST_SCHEMA,
+    namespace: TOOL_INTENT_NAMESPACE,
+    identity: { taskId: identity.taskId.trim(), attemptId: identity.attemptId.trim() },
+    authority: { mode: authority.mode, issuer: authority.issuer },
+    authorizedToolCeiling,
+    candidateTools,
+    selectedTools,
+    orderingMode,
+    ...(candidateOrder ? { candidateOrder } : {}),
+  };
+}
+
+export function hashToolProjectionManifest(value: ToolProjectionManifest): string {
+  return sha256(canonicalJson(parseToolProjectionManifest(value)));
+}
+
+export function toolProjectionManifestRef(value: ToolProjectionManifest): string {
+  return `sha256:${hashToolProjectionManifest(value)}`;
+}
+
+export function assertToolManifestRef(ref: string, manifest: ToolProjectionManifest): void {
+  if (!/^sha256:[0-9a-f]{64}$/.test(ref) || ref !== toolProjectionManifestRef(manifest)) {
+    throw new ExecutionProtocolError("TOOL_MANIFEST_REF_MISMATCH", "toolManifestRef does not match ToolProjectionManifest content identity.");
+  }
+}
+
+export function assertExecutionBindingToolManifest(binding: ExecutionBinding, manifestValue: ToolProjectionManifest): void {
+  const manifest = parseToolProjectionManifest(manifestValue);
+  if (binding.identity.taskId !== manifest.identity.taskId || binding.identity.attemptId !== manifest.identity.attemptId) {
+    throw new ExecutionProtocolError("TOOL_MANIFEST_REF_MISMATCH", "ExecutionBinding task/attempt does not match ToolProjectionManifest.");
+  }
+  if (binding.authority.mode !== manifest.authority.mode || binding.authority.issuer !== manifest.authority.issuer) {
+    throw new ExecutionProtocolError("TOOL_MANIFEST_REF_MISMATCH", "ExecutionBinding authority does not match ToolProjectionManifest.");
+  }
+  if (!binding.capabilities.toolManifestRef) {
+    throw new ExecutionProtocolError("TOOL_MANIFEST_REF_MISMATCH", "ExecutionBinding is missing toolManifestRef.");
+  }
+  assertToolManifestRef(binding.capabilities.toolManifestRef, manifest);
 }
 
 export function renderDispatchIntentForWorker(intent: DispatchIntent): string {
