@@ -13,6 +13,11 @@ import {
   parseCapabilityDiscoveryReceipt,
   type CapabilityDiscoveryReceipt,
 } from "./capability-discovery.js";
+import {
+  assertLocalEffectProjectionCoherence,
+  parseLocalEffectProjection,
+  type LocalEffectProjection,
+} from "./local-effect-enforcement.js";
 
 /**
  * Structured execution contract for a DevSpace subagent turn.
@@ -81,6 +86,12 @@ export interface ExecutionContract {
    * It is evidence of a bounded selection, never an independent authority source.
    */
   toolProjectionManifest?: ToolProjectionManifest;
+  /**
+   * Derived local-effect projection consumed by provider adapters. It narrows
+   * execution mechanics only and cannot add tool, route, model, or worker authority.
+   * Filesystem write authority remains solely in writePaths.
+   */
+  effectProjection?: LocalEffectProjection;
   /** Verified reuse-before-invention discovery evidence for mutating delegated work. */
   capabilityDiscovery?: CapabilityDiscoveryReceipt;
   /** Exact pointer to an already-open Core-bound mutation session. */
@@ -260,6 +271,10 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
     contract.toolProjectionManifest = parseToolProjectionManifest(record.toolProjectionManifest);
   }
 
+  if (record.effectProjection !== undefined) {
+    contract.effectProjection = parseLocalEffectProjection(record.effectProjection);
+  }
+
   if (record.capabilityDiscovery !== undefined) {
     contract.capabilityDiscovery = parseCapabilityDiscoveryReceipt(record.capabilityDiscovery);
   }
@@ -397,6 +412,12 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
       );
     }
   }
+
+  assertLocalEffectProjectionCoherence(
+    contract.effectProjection,
+    contract.toolProjectionManifest?.selectedTools,
+    contract.writePaths,
+  );
 
   return Object.keys(contract).length > 0 ? contract : undefined;
 }

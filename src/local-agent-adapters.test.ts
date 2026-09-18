@@ -18,6 +18,7 @@ import type { LocalAgentProvider } from "./local-agent-profiles.js";
 import { LocalAgentProviderError } from "./local-agent-runtime.js";
 import { AgentProviderProtocolError } from "./local-agent-errors.js";
 import { buildOmpAcpArgs, ompToolsForSelection } from "./local-agent-omp.js";
+import { LOCAL_EFFECT_PROJECTION_SCHEMA } from "./local-effect-enforcement.js";
 
 const providers: LocalAgentProvider[] = [
   "codex",
@@ -1112,5 +1113,65 @@ for (const provider of ["codex", "grok", "agy", "cline"] as const) {
       return true;
     },
     `${provider} must fail before semantic execution when ToolProjectionManifest is present`,
+  );
+}
+
+
+{
+  const effectProjection = {
+    schema: LOCAL_EFFECT_PROJECTION_SCHEMA,
+    process: { mode: "DENY" as const },
+    network: { egress: "DENY" as const },
+    git: { mode: "DENY" as const },
+  };
+  await assert.rejects(
+    runLocalAgentProvider("opencode", {
+      prompt: "must not claim a V2 hard effect seam",
+      workspaceRoot: "/tmp/project",
+      writeMode: "read_only",
+      selectedToolIntents: ["workspace.read"],
+      effectProjection,
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof AgentProviderProtocolError);
+      assert.equal(error.code, "PROVIDER_PROTOCOL_ERROR");
+      assert.match(error.message, /does not expose a DevSpace-owned hard effect-enforcement seam on the V2 session path/);
+      return true;
+    },
+    "OpenCode effect projection must fail before provider execution when the V2 path has no proven hard seam",
+  );
+
+  await assert.rejects(
+    runLocalAgentProvider("omp", {
+      prompt: "must hard-bound mutation",
+      workspaceRoot: "/tmp/project",
+      writeMode: "allowed",
+      selectedToolIntents: ["workspace.read", "workspace.mutate"],
+      writePaths: ["src/owned"],
+      effectProjection,
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof AgentProviderProtocolError);
+      assert.equal(error.code, "PROVIDER_PROTOCOL_ERROR");
+      assert.match(error.message, /bounded writePaths .* no proven physical enforcement seam/);
+      return true;
+    },
+    "OMP must fail before provider spawn when bounded mutation cannot be physically enforced",
+  );
+
+  await assert.rejects(
+    runLocalAgentProvider("omp", {
+      prompt: "must not expose shell",
+      workspaceRoot: "/tmp/project",
+      writeMode: "allowed",
+      selectedToolIntents: ["workspace.read", "process.execute"],
+      effectProjection,
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof AgentProviderProtocolError);
+      assert.match(error.message, /cannot select process\.execute because DevSpace has no proven OS process\/network isolation seam/);
+      return true;
+    },
+    "OMP must not relabel its missing shell-effect boundary as enforced",
   );
 }

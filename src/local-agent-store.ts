@@ -28,6 +28,10 @@ import {
   serializeExecutionGenerationBinding,
   type ExecutionGenerationBinding,
 } from "./execution-protocol.js";
+import {
+  parseLocalEffectEnforcementReceipt,
+  type LocalEffectEnforcementReceipt,
+} from "./local-effect-enforcement.js";
 
 export type LocalAgentStatus = "starting" | "running" | "idle" | "error" | "stopped";
 
@@ -47,6 +51,8 @@ export interface AgentLifecycleState {
   activeTurn?: ActiveTurnState;
   /** Effective idle policy of the most recently settled turn, retained as terminal evidence. */
   lastExecutionIdlePolicy?: EffectiveExecutionIdlePolicy;
+  /** Derived provider-native effect-enforcement evidence for the most recently settled turn. */
+  lastEffectEnforcementReceipt?: LocalEffectEnforcementReceipt;
   /** Compatibility projection for the original termination callback API. */
   termination?: PhysicalTerminationState;
   terminationPending?: TerminationPendingState;
@@ -188,6 +194,7 @@ export interface FinishTurnCasInput {
   scopeState?: ScopeState;
   cumulativeChangedPaths?: string[];
   turnEndBaseline?: ScopeBaseline;
+  effectEnforcementReceipt?: LocalEffectEnforcementReceipt;
 }
 
 export interface CompleteTerminationCasInput {
@@ -846,6 +853,7 @@ export class LocalAgentStore {
       const lifecycleState: AgentLifecycleState = {
         ...lifecycle,
         lastExecutionIdlePolicy: lifecycle.activeTurn?.executionIdlePolicy,
+        lastEffectEnforcementReceipt: input.effectEnforcementReceipt,
         activeTurn: undefined,
         terminationPending: undefined,
         lastSettledGeneration: input.generation,
@@ -1528,6 +1536,15 @@ function readLifecycleState(value: string | null | undefined): AgentLifecycleSta
     if (termination) state.termination = termination;
     const lastExecutionIdlePolicy = readEffectiveExecutionIdlePolicy(parsed.lastExecutionIdlePolicy);
     if (lastExecutionIdlePolicy) state.lastExecutionIdlePolicy = lastExecutionIdlePolicy;
+    const effectReceiptLooking =
+      parsed.lastEffectEnforcementReceipt !== undefined &&
+      parsed.lastEffectEnforcementReceipt !== null;
+    const lastEffectEnforcementReceipt = parseLocalEffectEnforcementReceipt(
+      parsed.lastEffectEnforcementReceipt,
+    );
+    if (lastEffectEnforcementReceipt) {
+      state.lastEffectEnforcementReceipt = lastEffectEnforcementReceipt;
+    }
     if (!detached) {
       const legacyActiveTurn = readLegacyActiveTurnState(parsed.activeTurn);
       if (legacyActiveTurn) state.activeTurn = legacyActiveTurn;
@@ -1546,6 +1563,7 @@ function readLifecycleState(value: string | null | undefined): AgentLifecycleSta
       (activeLooking && !activeTurn) ||
       (pendingLooking && !terminationPending) ||
       (blockedLooking && !terminationBlocked) ||
+      (effectReceiptLooking && !lastEffectEnforcementReceipt) ||
       authorityStateCount > 1
     ) {
       state.lifecycleCorrupt = true;

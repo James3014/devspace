@@ -69,6 +69,7 @@ import {
   ExecutionProtocolError,
 } from "./execution-protocol.js";
 import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build-identity.js";
+import type { LocalEffectEnforcementReceipt } from "./local-effect-enforcement.js";
 import { devspaceConfigDir } from "./user-config.js";
 import {
   classifyScopeState,
@@ -248,6 +249,7 @@ export interface AgentStatusOutput {
   scopeState?: ScopeState;
   dispatch?: DispatchContractOutput;
   executionIdlePolicy?: EffectiveExecutionIdlePolicy;
+  effectEnforcementReceipt?: LocalEffectEnforcementReceipt;
   termination?: {
     pending: boolean;
     generation?: string;
@@ -273,6 +275,7 @@ export interface ReconcileAgentOutput {
   providerState?: string;
   providerSessionId?: string;
   terminalReason?: AgentTerminalReason;
+  effectEnforcementReceipt?: LocalEffectEnforcementReceipt;
   workspace: {
     head?: string;
     dirty: boolean;
@@ -1347,6 +1350,7 @@ export class LocalAgentSessionManager {
       providerState: record.providerContinuityState ?? (record.providerSessionId ? "KNOWN_UNVERIFIED" : "UNKNOWN"),
       providerSessionId: record.providerSessionId,
       terminalReason: record.terminalReason,
+      effectEnforcementReceipt: record.lifecycleState?.lastEffectEnforcementReceipt,
       workspace: {
         head: physical.head,
         dirty: physical.dirty,
@@ -1944,6 +1948,7 @@ export class LocalAgentSessionManager {
         scopeState: scope.scopeState,
         cumulativeChangedPaths: [...cumulative].sort(),
         turnEndBaseline,
+        effectEnforcementReceipt: result.effectEnforcementReceipt,
       });
     } catch (error) {
       const originalMessage = error instanceof Error ? error.message : String(error);
@@ -2391,6 +2396,8 @@ async function runLocalAgentProfile(
       effort: record.effort ?? profile.effort,
       cliProviderId: profile.cliProviderId,
       selectedToolIntents: record.executionContract?.toolProjectionManifest?.selectedTools,
+      writePaths: record.executionContract?.writePaths,
+      effectProjection: record.executionContract?.effectProjection,
       environment,
     },
     callbacks,
@@ -2419,6 +2426,8 @@ async function runRawLocalAgentProvider(
       model: record.model,
       effort: record.effort,
       selectedToolIntents: record.executionContract?.toolProjectionManifest?.selectedTools,
+      writePaths: record.executionContract?.writePaths,
+      effectProjection: record.executionContract?.effectProjection,
       environment,
     },
     callbacks,
@@ -2600,6 +2609,9 @@ function recordToStatusOutput(
   const executionIdlePolicy = record.lifecycleState?.activeTurn?.executionIdlePolicy
     ?? record.lifecycleState?.lastExecutionIdlePolicy;
   if (executionIdlePolicy) output.executionIdlePolicy = executionIdlePolicy;
+  if (record.lifecycleState?.lastEffectEnforcementReceipt) {
+    output.effectEnforcementReceipt = record.lifecycleState.lastEffectEnforcementReceipt;
+  }
   const dispatch = dispatchContractOutput(record.executionContract?.dispatchIntent);
   if (dispatch) output.dispatch = dispatch;
   if (record.providerSessionId !== undefined) output.providerSessionId = record.providerSessionId;

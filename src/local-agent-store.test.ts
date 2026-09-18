@@ -6,6 +6,10 @@ import Database from "better-sqlite3";
 import { databasePath } from "./db/client.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 import type { ScopeBaseline } from "./local-agent-contract.js";
+import {
+  buildLocalEffectEnforcementReceipt,
+  LOCAL_EFFECT_PROJECTION_SCHEMA,
+} from "./local-effect-enforcement.js";
 
 const root = mkdtempSync(join(tmpdir(), "devspace-local-agent-store-test-"));
 const stores: LocalAgentStore[] = [];
@@ -77,6 +81,42 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
     error: "provider failed",
   });
   assert.equal(failed.providerSessionId, "omp-session-existing");
+
+  const effectReceiptRecord = store.create({
+    workspaceId: "ws_1",
+    workspaceRoot: join(root, "project"),
+    profileName: "effect-receipt",
+    provider: "omp",
+    lifecycleKind: "detached_worker_v2",
+  });
+  store.prepareWorker(effectReceiptRecord.id, "token-effect-receipt");
+  const effectClaim = store.claimWorker(effectReceiptRecord.id, "token-effect-receipt", 1002)!;
+  const effectReceipt = buildLocalEffectEnforcementReceipt({
+    provider: "omp",
+    model: "google/gemini-3.7-flash",
+    writeMode: "read_only",
+    selectedToolIntents: ["workspace.read", "workspace.search_text"],
+    effectProjection: {
+      schema: LOCAL_EFFECT_PROJECTION_SCHEMA,
+      process: { mode: "DENY" },
+      network: { egress: "DENY" },
+      git: { mode: "DENY" },
+    },
+    enforcementSurface: { tools: "grep,read", shell: "deny", network: "deny" },
+  });
+  assert.equal(store.finishTurnCAS({
+    agentId: effectReceiptRecord.id,
+    generation: effectClaim.lifecycleState!.activeTurn!.generation!,
+    workerToken: "token-effect-receipt",
+    status: "idle",
+    latestResponse: "done",
+    effectEnforcementReceipt: effectReceipt,
+  }).applied, true);
+  assert.deepEqual(
+    store.getById(effectReceiptRecord.id)?.lifecycleState?.lastEffectEnforcementReceipt,
+    effectReceipt,
+    "provider-native effect receipt must survive durable store round-trip",
+  );
 
   const fenced = store.create({
     workspaceId: "ws_1",
@@ -267,7 +307,7 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
 
   assert.deepEqual(
     store.list({ workspaceId: "ws_1" }).map((agent) => agent.id).sort(),
-    [created.id, failedContinuation.id, fenced.id, generationGuarded.id, createdFromOtherStore.id].sort(),
+    [created.id, failedContinuation.id, effectReceiptRecord.id, fenced.id, generationGuarded.id, createdFromOtherStore.id].sort(),
   );
 
   const legacyStateDir = join(root, "legacy-state");
