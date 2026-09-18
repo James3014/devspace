@@ -31,6 +31,11 @@ import {
   type NexusExecutionGrant,
   type NexusExecutionGrantRef,
 } from "./execution-protocol.js";
+import {
+  buildLocalEffectEnforcementReceipt,
+  LOCAL_EFFECT_PROJECTION_SCHEMA,
+  parseLocalEffectEnforcementReceipt,
+} from "./local-effect-enforcement.js";
 
 const originalDependencyRoot = process.env.DEVSPACE_DEPENDENCY_ROOT;
 const codexRuntimeRoot = mkdtempSync(join(tmpdir(), "devspace-contract-codex-runtime-"));
@@ -327,6 +332,99 @@ test("AC-2 agent_start rejects STALE_WORKSPACE before worker mutation when HEAD 
 });
 
 // AC-3: writePaths are represented in durable agent state.
+
+test("Wave 3 provider effect receipt persists through status and reconcile", async () => {
+  const f = setupGitFixture();
+  const originalOmpCommand = process.env.OMP_COMMAND;
+  process.env.OMP_COMMAND = process.execPath;
+  let launched: { promptFile: string; workerToken: string } | undefined;
+  const effectProjection = {
+    schema: LOCAL_EFFECT_PROJECTION_SCHEMA,
+    process: { mode: "DENY" as const },
+    network: { egress: "DENY" as const },
+    git: { mode: "DENY" as const },
+  };
+  const receipt = buildLocalEffectEnforcementReceipt({
+    provider: "omp",
+    writeMode: "read_only",
+    selectedToolIntents: ["workspace.read"],
+    effectProjection,
+    enforcementSurface: { tools: "read", network: "deny", git: "deny" },
+  });
+  const profile: LocalAgentProfile = {
+    name: "wave3-omp",
+    description: "Wave 3 receipt fixture",
+    provider: "omp",
+    disabled: false,
+    filePath: "wave3-omp.md",
+    body: "",
+    write_mode: "read_only",
+  };
+  const { manager, clean } = setupManager(
+    {},
+    async () => ({
+      provider: "omp",
+      providerSessionId: "omp-wave3",
+      finalResponse: "bounded",
+      items: [],
+      effectEnforcementReceipt: receipt,
+    }),
+    async (_agentId: string, promptFile: string, workerToken: string) => {
+      launched = { promptFile, workerToken };
+      return undefined;
+    },
+  );
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_wave3_receipt",
+      workspaceRoot: f.repo,
+      profileName: profile.name,
+      prompt: "read only",
+      profiles: [profile],
+      executionContract: {
+        authorityMode: "OWNER_DIRECT",
+        authorizedToolCeiling: ["workspace.read"],
+        toolProjectionManifest: {
+          schema: TOOL_PROJECTION_MANIFEST_SCHEMA,
+          namespace: TOOL_INTENT_NAMESPACE,
+          identity: { taskId: "wave3-receipt", attemptId: "attempt-1" },
+          authority: { mode: "OWNER_DIRECT", issuer: "owner" },
+          authorizedToolCeiling: ["workspace.read"],
+          candidateTools: ["workspace.read"],
+          selectedTools: ["workspace.read"],
+          orderingMode: "ORDER_INDEPENDENT",
+        },
+        effectProjection,
+      },
+    });
+    assert.ok(launched);
+    await manager.runWorkerTurnFromFile(
+      started.agentId,
+      launched!.promptFile,
+      launched!.workerToken,
+    );
+    const status = await manager.getAgentStatus({
+      workspaceId: "ws_wave3_receipt",
+      workspaceRoot: f.repo,
+      agentId: started.agentId,
+    });
+    assert.deepEqual(status.effectEnforcementReceipt, receipt);
+
+    const reconciled = await manager.reconcileAgent({
+      workspaceId: "ws_wave3_receipt",
+      workspaceRoot: f.repo,
+      isolated: true,
+      agentId: started.agentId,
+    });
+    assert.deepEqual(reconciled.effectEnforcementReceipt, receipt);
+  } finally {
+    if (originalOmpCommand === undefined) delete process.env.OMP_COMMAND;
+    else process.env.OMP_COMMAND = originalOmpCommand;
+    clean();
+    f.clean();
+  }
+});
+
 test("AC-3 executionContract writePaths are durable", async () => {
   const f = setupGitFixture();
   const { manager, clean } = setupManager();
@@ -4323,4 +4421,183 @@ test("G2 ToolProjectionManifest authority and dispatch identity fail closed on m
       authority: { mode: "OWNER_DIRECT", issuer: "owner" },
     },
   }), /task\/attempt must match dispatchIntent/);
+});
+
+
+test("Wave 3 local effect projection is replay-stable and process selection fails closed", () => {
+  const raw = {
+    authorityMode: "OWNER_DIRECT",
+    authorizedToolCeiling: ["process.execute", "workspace.read"],
+    toolProjectionManifest: {
+      schema: TOOL_PROJECTION_MANIFEST_SCHEMA,
+      namespace: TOOL_INTENT_NAMESPACE,
+      identity: { taskId: "wave3", attemptId: "attempt-1" },
+      authority: { mode: "OWNER_DIRECT", issuer: "owner" },
+      authorizedToolCeiling: ["process.execute", "workspace.read"],
+      candidateTools: ["process.execute", "workspace.read"],
+      selectedTools: ["workspace.read"],
+      orderingMode: "ORDER_INDEPENDENT",
+    },
+    effectProjection: {
+      schema: LOCAL_EFFECT_PROJECTION_SCHEMA,
+      process: { mode: "DENY" },
+      network: { egress: "DENY" },
+      git: { mode: "DENY" },
+    },
+  };
+  const parsed = parseExecutionContract(raw)!;
+  assert.deepEqual(parsed.effectProjection, raw.effectProjection);
+  assert.deepEqual(deserializeExecutionContract(serializeExecutionContract(parsed)), parsed);
+
+  assert.throws(
+    () =>
+      parseExecutionContract({
+        ...raw,
+        toolProjectionManifest: {
+          ...raw.toolProjectionManifest,
+          selectedTools: ["process.execute", "workspace.read"],
+        },
+      }),
+    /cannot select process\.execute because DevSpace has no proven OS process\/network isolation seam/,
+  );
+});
+
+test("Wave 3 local effect projection cannot widen process, network, or Git effects", () => {
+  const base = {
+    authorityMode: "OWNER_DIRECT",
+    authorizedToolCeiling: ["workspace.read"],
+    toolProjectionManifest: {
+      schema: TOOL_PROJECTION_MANIFEST_SCHEMA,
+      namespace: TOOL_INTENT_NAMESPACE,
+      identity: { taskId: "wave3", attemptId: "attempt-2" },
+      authority: { mode: "OWNER_DIRECT", issuer: "owner" },
+      authorizedToolCeiling: ["workspace.read"],
+      candidateTools: ["workspace.read"],
+      selectedTools: ["workspace.read"],
+      orderingMode: "ORDER_INDEPENDENT",
+    },
+    effectProjection: {
+      schema: LOCAL_EFFECT_PROJECTION_SCHEMA,
+      process: { mode: "DENY" },
+      network: { egress: "DENY" },
+      git: { mode: "DENY" },
+    },
+  };
+  assert.ok(parseExecutionContract(base));
+
+  assert.throws(
+    () =>
+      parseExecutionContract({
+        ...base,
+        effectProjection: {
+          ...base.effectProjection,
+          process: { mode: "ALLOW" },
+        },
+      }),
+    /process\.mode must be DENY in v1/,
+  );
+  assert.throws(
+    () =>
+      parseExecutionContract({
+        ...base,
+        effectProjection: {
+          ...base.effectProjection,
+          network: { egress: "ALLOW" },
+        },
+      }),
+    /network\.egress must be DENY in v1/,
+  );
+  assert.throws(
+    () =>
+      parseExecutionContract({
+        ...base,
+        effectProjection: {
+          ...base.effectProjection,
+          git: { mode: "READ_ONLY" },
+        },
+      }),
+    /git\.mode must be DENY in v1/,
+  );
+});
+
+test("Wave 3 hard workspace mutation requires literal bounded writePaths outside .git", () => {
+  const base = {
+    authorityMode: "OWNER_DIRECT",
+    authorizedToolCeiling: ["workspace.mutate", "workspace.read"],
+    toolProjectionManifest: {
+      schema: TOOL_PROJECTION_MANIFEST_SCHEMA,
+      namespace: TOOL_INTENT_NAMESPACE,
+      identity: { taskId: "wave3", attemptId: "attempt-3" },
+      authority: { mode: "OWNER_DIRECT", issuer: "owner" },
+      authorizedToolCeiling: ["workspace.mutate", "workspace.read"],
+      candidateTools: ["workspace.mutate", "workspace.read"],
+      selectedTools: ["workspace.mutate", "workspace.read"],
+      orderingMode: "ORDER_INDEPENDENT",
+    },
+    effectProjection: {
+      schema: LOCAL_EFFECT_PROJECTION_SCHEMA,
+      process: { mode: "DENY" },
+      network: { egress: "DENY" },
+      git: { mode: "DENY" },
+    },
+  };
+
+  assert.throws(
+    () => parseExecutionContract(base),
+    /workspace\.mutate requires executionContract\.writePaths/,
+  );
+  assert.throws(
+    () => parseExecutionContract({ ...base, writePaths: [".git/config"] }),
+    /must not include \.git/,
+  );
+  assert.throws(
+    () => parseExecutionContract({ ...base, writePaths: ["src/*"] }),
+    /literal POSIX-style paths without glob metacharacters/,
+  );
+
+  const parsed = parseExecutionContract({ ...base, writePaths: ["src/owned"] })!;
+  assert.deepEqual(parsed.writePaths, ["src/owned"]);
+});
+
+
+test("Wave 3 enforcement receipt readback rejects tampered native surface or tool identity", () => {
+  const receipt = buildLocalEffectEnforcementReceipt({
+    provider: "omp",
+    model: "google/gemini-3.7-flash",
+    writeMode: "read_only",
+    selectedToolIntents: ["workspace.read", "workspace.search_text"],
+    effectProjection: {
+      schema: LOCAL_EFFECT_PROJECTION_SCHEMA,
+      process: { mode: "DENY" },
+      network: { egress: "DENY" },
+      git: { mode: "DENY" },
+    },
+    enforcementSurface: {
+      tools: "grep,read",
+      shell: "deny",
+      network: "deny",
+    },
+  });
+  assert.deepEqual(parseLocalEffectEnforcementReceipt(receipt), receipt);
+
+  assert.equal(
+    parseLocalEffectEnforcementReceipt({
+      ...receipt,
+      enforcementSurface: {
+        tools: "bash,grep,read",
+        shell: "allow",
+        network: "deny",
+      },
+    }),
+    undefined,
+    "native enforcement surface changes must invalidate the durable receipt hash",
+  );
+  assert.equal(
+    parseLocalEffectEnforcementReceipt({
+      ...receipt,
+      selectedToolIntents: ["workspace.read", "provider.hidden_tool"],
+    }),
+    undefined,
+    "provider-native or unknown tool ids cannot be smuggled into durable enforcement evidence",
+  );
 });

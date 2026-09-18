@@ -9,6 +9,10 @@ import {
   type LocalAgentRunInput,
   type LocalAgentRunResult,
 } from "./local-agent-runtime.js";
+import {
+  assertLocalEffectProjectionCoherence,
+  buildLocalEffectEnforcementReceipt,
+} from "./local-effect-enforcement.js";
 
 const DEFAULT_OMP_TIMEOUT_MS = 600_000;
 const OMP_WRITE_TOOLS = "read,edit,write,grep,glob,todo";
@@ -183,6 +187,18 @@ export async function runOmpAcpLocalAgent(
   input: LocalAgentRunInput,
   callbacks?: LocalAgentRunCallbacks,
 ): Promise<LocalAgentRunResult> {
+  if (input.effectProjection) {
+    assertLocalEffectProjectionCoherence(
+      input.effectProjection,
+      input.selectedToolIntents,
+      input.writePaths,
+    );
+    if (input.selectedToolIntents?.includes("workspace.mutate")) {
+      throw new Error(
+        "OMP cannot hard-enforce bounded writePaths for workspace.mutate under local effect projection.",
+      );
+    }
+  }
   const { client, methods, ndJsonStream, PROTOCOL_VERSION } = await import("@agentclientprotocol/sdk");
   const tempRoot = await mkdtemp(join(tmpdir(), "devspace-omp-acp-"));
   const configPath = join(tempRoot, "omp-devspace.yml");
@@ -260,11 +276,26 @@ export async function runOmpAcpLocalAgent(
     }
     if (!activeSessionId) throw new Error("OMP ACP did not return a session id.");
 
+    const effectEnforcementReceipt = input.effectProjection && input.selectedToolIntents
+      ? buildLocalEffectEnforcementReceipt({
+          provider: "omp",
+          model: input.model,
+          writeMode: input.writeMode,
+          selectedToolIntents: input.selectedToolIntents,
+          writePaths: input.writePaths,
+          effectProjection: input.effectProjection,
+          enforcementSurface: {
+            tools: ompToolsForSelection(input.selectedToolIntents, input.writeMode),
+            config: OMP_DEVSPACE_CONFIG,
+          },
+        })
+      : undefined;
     return {
       provider: "omp",
       providerSessionId: activeSessionId,
       finalResponse,
       items,
+      ...(effectEnforcementReceipt ? { effectEnforcementReceipt } : {}),
     };
   } catch (error) {
     const detail = stderr.trim();

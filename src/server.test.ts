@@ -3387,6 +3387,13 @@ test("agent_start schema preserves #28 heartbeat and G9/G10 authority capabiliti
   assert.equal(manifestProps.schema.const, "devspace.tool_projection_manifest.v1");
   assert.equal(manifestProps.namespace.const, "devspace.tool_intent.v1");
   assert.ok(manifestProps.selectedTools);
+  assert.ok(contractProps.effectProjection, "agent_start must expose the local hard-effect projection");
+  const effectProps = contractProps.effectProjection.anyOf?.find((entry: any) => entry.type === "object")?.properties
+    ?? contractProps.effectProjection.properties;
+  assert.equal(effectProps.schema.const, "devspace.local_effect_projection.v1");
+  assert.equal(effectProps.process.properties.mode.const, "DENY");
+  assert.equal(effectProps.network.properties.egress.const, "DENY");
+  assert.equal(effectProps.git.properties.mode.const, "DENY");
 });
 
 test("agent_start MCP transports durable tool authority and projection into the stored execution contract", async (t) => {
@@ -3416,6 +3423,12 @@ test("agent_start MCP transports durable tool authority and projection into the 
         authorityMode: "OWNER_DIRECT",
         authorizedToolCeiling: ["workspace.search_text", "workspace.read"],
         toolProjectionManifest: manifest,
+        effectProjection: {
+          schema: "devspace.local_effect_projection.v1",
+          process: { mode: "DENY" },
+          network: { egress: "DENY" },
+          git: { mode: "DENY" },
+        },
       },
     },
   });
@@ -3434,6 +3447,12 @@ test("agent_start MCP transports durable tool authority and projection into the 
     ]);
     assert.deepEqual(record.executionContract?.toolProjectionManifest?.selectedTools, ["workspace.read"]);
     assert.equal(record.executionContract?.toolProjectionManifest?.authority.mode, "OWNER_DIRECT");
+    assert.deepEqual(record.executionContract?.effectProjection, {
+      schema: "devspace.local_effect_projection.v1",
+      process: { mode: "DENY" },
+      network: { egress: "DENY" },
+      git: { mode: "DENY" },
+    });
   } finally {
     store.close();
   }

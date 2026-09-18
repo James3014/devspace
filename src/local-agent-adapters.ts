@@ -19,6 +19,7 @@ import { runOmpAcpLocalAgent } from "./local-agent-omp.js";
 import { inspectCodexRuntime } from "./codex-runtime.js";
 import { inspectScratchOwnership } from "./provider-scratch.js";
 import { AgentProviderProtocolError } from "./local-agent-errors.js";
+import { assertLocalEffectProjectionCoherence } from "./local-effect-enforcement.js";
 import {
   AcpLocalAgentDriver,
   resolveAcpCommand,
@@ -88,6 +89,59 @@ export async function runLocalAgentProvider(
       retryable: false,
       message: `${provider} does not expose a proven per-tool restriction seam for ToolProjectionManifest; refusing wider provider execution.`,
     });
+  }
+  if (input.effectProjection !== undefined) {
+    try {
+      assertLocalEffectProjectionCoherence(
+        input.effectProjection,
+        input.selectedToolIntents,
+        input.writePaths,
+      );
+    } catch (error) {
+      throw new AgentProviderProtocolError({
+        code: "PROVIDER_PROTOCOL_ERROR",
+        provider,
+        operation: "effect_projection",
+        retryable: false,
+        message: error instanceof Error ? error.message : String(error),
+      });
+    }
+    if (input.selectedToolIntents === undefined) {
+      throw new AgentProviderProtocolError({
+        code: "PROVIDER_PROTOCOL_ERROR",
+        provider,
+        operation: "effect_projection",
+        retryable: false,
+        message: "Local effect projection requires an exact selected-tool projection.",
+      });
+    }
+    if (provider === "opencode") {
+      throw new AgentProviderProtocolError({
+        code: "PROVIDER_PROTOCOL_ERROR",
+        provider,
+        operation: "effect_projection",
+        retryable: false,
+        message: "OpenCode 1.18.x does not expose a DevSpace-owned hard effect-enforcement seam on the V2 session path; refusing effect-projected execution.",
+      });
+    }
+    if (provider !== "omp") {
+      throw new AgentProviderProtocolError({
+        code: "PROVIDER_PROTOCOL_ERROR",
+        provider,
+        operation: "effect_projection",
+        retryable: false,
+        message: `${provider} does not expose a proven hard local-effect enforcement seam; refusing execution.`,
+      });
+    }
+    if (input.selectedToolIntents.includes("workspace.mutate")) {
+      throw new AgentProviderProtocolError({
+        code: "PROVIDER_PROTOCOL_ERROR",
+        provider,
+        operation: "effect_projection",
+        retryable: false,
+        message: "OMP can hard-enforce only its read/search tool subset; bounded writePaths have no proven physical enforcement seam, so projected workspace mutation is refused.",
+      });
+    }
   }
   return createLocalAgentAdapter(provider).run(input, callbacks);
 }

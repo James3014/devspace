@@ -10,6 +10,10 @@ import type {
 import type { AgentProviderError } from "./local-agent-errors.js";
 import type { ExecutionActivityCapability } from "./local-agent-contract.js";
 import type { ToolIntentId } from "./execution-protocol.js";
+import type {
+  LocalEffectEnforcementReceipt,
+  LocalEffectProjection,
+} from "./local-effect-enforcement.js";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
 
 export type LocalAgentWriteMode = "read_only" | "allowed" | "full_access";
@@ -26,6 +30,10 @@ export interface LocalAgentRunInput {
   effortOverrideRequested?: boolean;
   /** Already-authorized transport-neutral selection derived from the persisted ToolProjectionManifest. */
   selectedToolIntents?: ToolIntentId[];
+  /** Canonical filesystem write scope from the persisted ExecutionContract. */
+  writePaths?: string[];
+  /** Derived local-effect narrowing consumed by provider adapters. */
+  effectProjection?: LocalEffectProjection;
   /** Per-turn environment after any configured read-only toolchain bridge. */
   environment?: NodeJS.ProcessEnv;
 }
@@ -35,6 +43,8 @@ export interface LocalAgentRunResult {
   providerSessionId: string | null;
   finalResponse: string;
   items: unknown[];
+  /** Derived evidence of the provider-native effect controls constructed for this turn. */
+  effectEnforcementReceipt?: LocalEffectEnforcementReceipt;
 }
 
 export interface LocalAgentRunCallbacks {

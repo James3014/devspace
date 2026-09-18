@@ -157,6 +157,34 @@ export DEVSPACE_REPOSITORY_INTELLIGENCE_PYTHON_BIN=/path/to/python3
 
 This registers `repository_intelligence_revision`, `repository_intelligence_readiness`, `repository_intelligence_overlap`, `repository_intelligence_ci`, `repository_intelligence_impact`, `repository_intelligence_cfi`, and `repository_intelligence_eia`. They accept normalized structured evidence, verify the exact engine Git HEAD before every invocation, call `repository_intelligence.cli` without a shell, and return the verified identity as `engine.head`. PR, CI, and automation outputs remain bounded by `PR_INTELLIGENCE_ONLY`, `CI_EVIDENCE_ONLY`, and `AUTOMATION_ADVISORY_ONLY`. DevSpace does not fetch GitHub, parse source, write state, invoke an LLM, dispatch a worker, approve, or merge.
 
+### Hard local-effect projection for subagents
+
+`agent_start.executionContract.effectProjection` is an optional derived restriction for
+local-agent execution. It does not grant authority and it does not replace
+`authorizedToolCeiling`, `toolProjectionManifest`, or `writePaths`.
+
+When present:
+
+- `writePaths` remains the single filesystem write scope.
+- `process.execute` is denied in v1. DevSpace does not treat shell permission rules as an OS sandbox.
+- Network egress and Git effects are denied in v1 unless the provider path has a proven physical
+  restriction seam.
+- OMP is admitted only for the read/search subset that its native `--tools` surface plus the
+  fixed DevSpace OMP config can physically restrict. Projected filesystem mutation or process
+  execution is rejected before provider execution.
+- OpenCode effect projection is fail-closed on the current V2 session path. DevSpace does not
+  treat legacy `agent`/`permission` configuration as hard enforcement because that policy is not
+  consumed by the observed OpenCode 1.18.x V2 execution path.
+- Other providers without a proven hard effect-enforcement seam are rejected rather than relying
+  on a prompt-level restriction or post-hoc scope observation.
+
+A successful effect-enforced provider turn records
+`devspace.local_effect_enforcement_receipt.v1`, including the exact provider enforcement surface
+and a content hash, and persists that derived evidence for status/reconciliation readback.
+
+This applies to local-agent execution contracts only. The generic DevSpace shell/command
+tools still run with the local user's authority and are not a general sandbox.
+
 ## Mental Model
 
 DevSpace is remote access to selected local folders.

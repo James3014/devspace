@@ -200,6 +200,7 @@ import {
   TOOL_INTENT_NAMESPACE,
   TOOL_PROJECTION_MANIFEST_SCHEMA,
 } from "./execution-protocol.js";
+import { LOCAL_EFFECT_PROJECTION_SCHEMA } from "./local-effect-enforcement.js";
 import {
   CAPABILITY_DISCOVERY_INDEX_PATH,
   CAPABILITY_DISCOVERY_RECEIPT_SCHEMA,
@@ -2524,6 +2525,12 @@ function createAgentStartInputSchema() {
     orderingMode: z.enum(["ORDER_INDEPENDENT", "ORDER_SENSITIVE"]),
     candidateOrder: z.array(toolIntentId).optional(),
   }).strict();
+  const effectProjection = z.object({
+    schema: z.literal(LOCAL_EFFECT_PROJECTION_SCHEMA),
+    process: z.object({ mode: z.literal("DENY") }).strict(),
+    network: z.object({ egress: z.literal("DENY") }).strict(),
+    git: z.object({ mode: z.literal("DENY") }).strict(),
+  }).strict();
   const executionContract = z.object({
     authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).optional().describe(
       "Execution authority lane. OWNER_DIRECT is the backwards-compatible default. NEXUS_GOVERNED requires canonical Nexus authority evidence and never falls back to direct authority.",
@@ -2543,6 +2550,9 @@ function createAgentStartInputSchema() {
     toolProjectionManifest: toolProjectionManifest.describe(
       "Derived transport-neutral tool projection. It may narrow the durable ceiling but never grants or widens tool authority.",
     ),
+    effectProjection: effectProjection.describe(
+      "Derived local-effect restriction consumed by enforceable provider adapters. Filesystem write scope remains exclusively in writePaths. v1 denies process execution, worker-tool network egress, and Git effects because DevSpace has no proven OS sandbox seam for them; unenforceable combinations fail closed.",
+    ),
     coreMutation: z.object({
       sessionId: z.string().regex(/^cms_[0-9a-f]{32}$/),
       bindingHash: z.string().regex(/^sha256:[0-9a-f]{64}$/),
@@ -2553,7 +2563,7 @@ function createAgentStartInputSchema() {
       "40-character commit SHA. If supplied, agent_start fails closed when workspace HEAD no longer matches.",
     ),
     writePaths: z.array(z.string()).describe(
-      "Exact intended writable paths relative to the workspace root. Observed and aborted on violation; not a hard sandbox.",
+      "Canonical writable path scope relative to the workspace root. Legacy execution is observed-and-aborted. Under effectProjection, mutation is admitted only when a provider has a proven pre-effect path-enforcement seam; Wave 3 v1 otherwise fails closed before provider execution.",
     ),
     maxFiles: z.number().int().min(1).describe("Maximum number of files the worker may change."),
     toolchainId: z.string().describe(
