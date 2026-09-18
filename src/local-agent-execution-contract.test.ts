@@ -4231,6 +4231,37 @@ test("G2 tool ceiling is durable, canonical, and replay-stable in ExecutionContr
   assert.deepEqual(deserializeExecutionContract(serialized), parsed);
 });
 
+test("G2 tool ceiling and ToolProjectionManifest participate as a fail-closed pair", () => {
+  assert.throws(
+    () => parseExecutionContract({
+      authorityMode: "OWNER_DIRECT",
+      authorizedToolCeiling: ["workspace.read"],
+    }),
+    /authorizedToolCeiling requires toolProjectionManifest/,
+  );
+
+  assert.throws(
+    () => parseExecutionContract({
+      authorityMode: "OWNER_DIRECT",
+      toolProjectionManifest: {
+        schema: TOOL_PROJECTION_MANIFEST_SCHEMA,
+        namespace: TOOL_INTENT_NAMESPACE,
+        identity: { taskId: "issue-982-g2", attemptId: "attempt-pairing" },
+        authority: { mode: "OWNER_DIRECT", issuer: "owner" },
+        authorizedToolCeiling: ["workspace.read"],
+        candidateTools: ["workspace.read"],
+        selectedTools: ["workspace.read"],
+        orderingMode: "ORDER_INDEPENDENT",
+      },
+    }),
+    /toolProjectionManifest requires authorizedToolCeiling/,
+  );
+
+  assert.deepEqual(parseExecutionContract({ authorityMode: "OWNER_DIRECT" }), {
+    authorityMode: "OWNER_DIRECT",
+  });
+});
+
 test("G2 ToolProjectionManifest cannot become a second tool authority", () => {
   const base = {
     authorityMode: "OWNER_DIRECT",

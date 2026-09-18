@@ -362,6 +362,10 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
     }
   }
 
+  if (contract.authorizedToolCeiling && !contract.toolProjectionManifest) {
+    throw new Error("executionContract.authorizedToolCeiling requires toolProjectionManifest.");
+  }
+
   if (contract.toolProjectionManifest) {
     if (!contract.authorizedToolCeiling) {
       throw new Error("executionContract.toolProjectionManifest requires authorizedToolCeiling.");
