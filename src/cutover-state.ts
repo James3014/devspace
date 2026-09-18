@@ -19,9 +19,11 @@ const CUTOVER_RESTART_SCHEDULED_SCHEMA = "devspace.cutover_restart_scheduled.v1"
 export const CUTOVER_RECOVERY_INTENT_SCHEMA = "devspace.cutover_recovery_intent.v1" as const;
 export const CUTOVER_SUPERSEDED_SCHEMA = "devspace.cutover_superseded.v1" as const;
 export const CUTOVER_OBSERVED_REPLACEMENT_SCHEMA = "devspace.cutover_observed_replacement.v1" as const;
+export const CUTOVER_EXPIRED_PREPARED_NO_EFFECT_SCHEMA = "devspace.cutover_expired_prepared_no_effect.v1" as const;
 
 export const CUTOVER_SUPERSEDED_REASON = "STALE_TARGET_SUPERSEDED" as const;
 export const CUTOVER_OBSERVED_REPLACEMENT_REASON = "OBSERVED_REPLACEMENT_WITHOUT_DRAIN" as const;
+export const CUTOVER_EXPIRED_PREPARED_NO_EFFECT_REASON = "EXPIRED_PREPARED_NO_EFFECT" as const;
 export const CUTOVER_BINDING_REPAIR_SCHEMA = "devspace.cutover_binding_repair.v1" as const;
 export const CUTOVER_BINDING_REPAIR_REASON = "CROSS_DOMAIN_DIGEST_MISBINDING" as const;
 
@@ -120,7 +122,7 @@ export interface CutoverReconciliationReceipt {
   agentQueryable: boolean;
   agentReconciled: boolean;
   reconciledAt: string;
-  terminalReason?: typeof CUTOVER_OBSERVED_REPLACEMENT_REASON;
+  terminalReason?: typeof CUTOVER_OBSERVED_REPLACEMENT_REASON | typeof CUTOVER_EXPIRED_PREPARED_NO_EFFECT_REASON;
   preRestartDrainObserved?: boolean;
   witnessWorkspaceId?: string;
   witnessAgentId?: string;
@@ -144,6 +146,21 @@ export interface CutoverObservedReplacementReceipt {
   witnessWorkspaceSessions: number;
   witnessAgentSessions: number;
   witnessKind: string;
+  reconciliationReceipt: CutoverReconciliationReceipt;
+}
+
+export interface CutoverExpiredPreparedNoEffectReceipt {
+  schema: typeof CUTOVER_EXPIRED_PREPARED_NO_EFFECT_SCHEMA;
+  cutoverId: string;
+  terminalReason: typeof CUTOVER_EXPIRED_PREPARED_NO_EFFECT_REASON;
+  preRestartDrainObserved: false;
+  restartRequested: false;
+  restartScheduled: false;
+  oldServerIdentity: CutoverServerIdentity;
+  expectedIdentity: ExpectedCutoverIdentity;
+  coordinationBinding: Readonly<CutoverCoordinationBinding>;
+  recoveredBy: string;
+  recoveredAt: string;
   reconciliationReceipt: CutoverReconciliationReceipt;
 }
 
@@ -228,6 +245,8 @@ export interface DurableCutoverRecord {
   supersession?: CutoverSupersessionReceipt;
   /** Present only on a record closed via observed replacement recovery without drain. */
   observedReplacement?: CutoverObservedReplacementReceipt;
+  /** Present only on a coordination-bound prepared cutover closed after expiry with no drain/restart effect. */
+  expiredPreparedNoEffect?: CutoverExpiredPreparedNoEffectReceipt;
   /** Present only on a record with a verified cross-domain digest repair. */
   bindingRepair?: CutoverBindingRepairReceipt;
 }
@@ -800,6 +819,80 @@ export class CutoverStateStore {
   }
 
   /**
+   * Terminally close an expired coordination-bound prepared cutover when no drain or
+   * restart effect was ever recorded. This does not reconcile the external ownership
+   * lease; the host-local recovery caller must do that separately and idempotently.
+   */
+  recoverExpiredPreparedNoEffect(input: {
+    cutoverId: string;
+    recoveredBy: string;
+  }): { record: DurableCutoverRecord; newlyRecovered: boolean } {
+    const active = this.get();
+    if (!active) throw new CutoverStateError("No durable cutover record exists.");
+    if (active.cutoverId !== input.cutoverId) {
+      throw new CutoverStateError(`Cutover id mismatch: active cutover is ${active.cutoverId}.`);
+    }
+    if (!input.recoveredBy.trim()) {
+      throw new CutoverStateError("Expired prepared recovery requires a non-empty recovery identity.");
+    }
+    if (active.phase === "closed" && active.expiredPreparedNoEffect) {
+      if (active.expiredPreparedNoEffect.recoveredBy !== input.recoveredBy) {
+        throw new CutoverStateError("[RECOVERY_BINDING_MISMATCH] Expired prepared recovery identity changed.");
+      }
+      return { record: active, newlyRecovered: false };
+    }
+    if (active.phase !== "prepared" || !active.coordinationBinding) {
+      throw new CutoverStateError("Expired prepared recovery requires one coordination-bound prepared cutover.");
+    }
+    if (!active.expiresAt || this.now() < Date.parse(active.expiresAt)) {
+      throw new CutoverStateError("Expired prepared recovery requires the cutover approval to be expired.");
+    }
+    if (active.drainEvidence || active.restartRequest || active.observedReplacement || active.supersession) {
+      throw new CutoverStateError("Expired prepared recovery refuses any drain, restart, observed-replacement, or supersession evidence.");
+    }
+    const markers = this.markerPaths(active);
+    if (existsSync(markers.restartRequested) || existsSync(markers.restartScheduled)) {
+      throw new CutoverStateError("Expired prepared recovery refuses durable restart markers.");
+    }
+    const recoveredAt = new Date(this.now()).toISOString();
+    const reconciliationReceipt: CutoverReconciliationReceipt = {
+      closedByServerInstanceId: active.oldServerIdentity.serverInstanceId,
+      workspaceQueryable: false,
+      agentQueryable: false,
+      agentReconciled: false,
+      reconciledAt: recoveredAt,
+      terminalReason: CUTOVER_EXPIRED_PREPARED_NO_EFFECT_REASON,
+      preRestartDrainObserved: false,
+      witnessKind: "expired-prepared-no-effect",
+    };
+    const expiredPreparedNoEffect: CutoverExpiredPreparedNoEffectReceipt = {
+      schema: CUTOVER_EXPIRED_PREPARED_NO_EFFECT_SCHEMA,
+      cutoverId: active.cutoverId,
+      terminalReason: CUTOVER_EXPIRED_PREPARED_NO_EFFECT_REASON,
+      preRestartDrainObserved: false,
+      restartRequested: false,
+      restartScheduled: false,
+      oldServerIdentity: active.oldServerIdentity,
+      expectedIdentity: active.expectedNewIdentity,
+      coordinationBinding: active.coordinationBinding,
+      recoveredBy: input.recoveredBy,
+      recoveredAt,
+      reconciliationReceipt,
+    };
+    const record = this.replace({
+      ...withoutDiagnostic(active),
+      phase: "closed",
+      reconciliationReceipt,
+      expiredPreparedNoEffect,
+      updatedAt: recoveredAt,
+    });
+    if (!record.expiredPreparedNoEffect || !isDeepStrictEqual(record.expiredPreparedNoEffect, expiredPreparedNoEffect)) {
+      throw new CutoverStateError("Expired prepared recovery durable readback changed.");
+    }
+    return { record, newlyRecovered: true };
+  }
+
+  /**
    * Terminally close one cutover where the replacement server is already running with
    * exact expected source/build/capability identity, but pre-restart drain evidence
    * was absent (e.g. transport initialization rejection before cutover_drain reached handler).
@@ -1034,6 +1127,7 @@ function parseRecord(raw: string): DurableCutoverRecord {
     (value.supersession !== undefined && !isSupersessionReceipt(value.supersession)) ||
     (value.reconciliationReceipt !== undefined && !isReconciliationReceipt(value.reconciliationReceipt)) ||
     (value.observedReplacement !== undefined && !isObservedReplacementReceipt(value.observedReplacement)) ||
+    (value.expiredPreparedNoEffect !== undefined && !isExpiredPreparedNoEffectReceipt(value.expiredPreparedNoEffect)) ||
     (value.bindingRepair !== undefined && !isBindingRepairReceipt(value.bindingRepair))
   ) {
     throw new CutoverStateError("Durable cutover record is malformed; reconciliation is required.");
@@ -1068,6 +1162,27 @@ function parseRecord(raw: string): DurableCutoverRecord {
       throw new CutoverStateError("Durable cutover record is malformed; observed replacement binding is inconsistent.");
     }
   }
+  if (record.expiredPreparedNoEffect) {
+    const receipt = record.expiredPreparedNoEffect;
+    if (
+      receipt.cutoverId !== record.cutoverId ||
+      record.phase !== "closed" ||
+      record.drainEvidence !== undefined ||
+      record.restartRequest !== undefined ||
+      record.observedReplacement !== undefined ||
+      record.supersession !== undefined ||
+      !record.coordinationBinding ||
+      !isDeepStrictEqual(receipt.coordinationBinding, record.coordinationBinding) ||
+      !identitiesEqual(receipt.oldServerIdentity, record.oldServerIdentity) ||
+      !expectedIdentitiesEqual(receipt.expectedIdentity, record.expectedNewIdentity) ||
+      !isDeepStrictEqual(record.reconciliationReceipt, receipt.reconciliationReceipt) ||
+      receipt.reconciliationReceipt.closedByServerInstanceId !== record.oldServerIdentity.serverInstanceId ||
+      receipt.reconciliationReceipt.terminalReason !== CUTOVER_EXPIRED_PREPARED_NO_EFFECT_REASON ||
+      receipt.reconciliationReceipt.preRestartDrainObserved !== false
+    ) {
+      throw new CutoverStateError("Durable cutover record is malformed; expired prepared recovery binding is inconsistent.");
+    }
+  }
   return record;
 }
 
@@ -1096,7 +1211,7 @@ function isReconciliationReceipt(value: unknown): value is CutoverReconciliation
     typeof receipt.reconciledAt === "string" &&
     Number.isFinite(Date.parse(receipt.reconciledAt)) &&
     (receipt.preRestartDrainObserved === undefined || typeof receipt.preRestartDrainObserved === "boolean") &&
-    (receipt.terminalReason === undefined || receipt.terminalReason === CUTOVER_OBSERVED_REPLACEMENT_REASON),
+    (receipt.terminalReason === undefined || receipt.terminalReason === CUTOVER_OBSERVED_REPLACEMENT_REASON || receipt.terminalReason === CUTOVER_EXPIRED_PREPARED_NO_EFFECT_REASON),
   );
 }
 
@@ -1127,6 +1242,30 @@ function isObservedReplacementReceipt(value: unknown): value is CutoverObservedR
     typeof receipt.witnessKind === "string" &&
     receipt.reconciliationReceipt !== undefined &&
     isReconciliationReceipt(receipt.reconciliationReceipt),
+  );
+}
+
+function isExpiredPreparedNoEffectReceipt(value: unknown): value is CutoverExpiredPreparedNoEffectReceipt {
+  const receipt = value as Partial<CutoverExpiredPreparedNoEffectReceipt> | undefined;
+  return Boolean(
+    receipt &&
+    receipt.schema === CUTOVER_EXPIRED_PREPARED_NO_EFFECT_SCHEMA &&
+    typeof receipt.cutoverId === "string" &&
+    receipt.cutoverId.length > 0 &&
+    receipt.terminalReason === CUTOVER_EXPIRED_PREPARED_NO_EFFECT_REASON &&
+    receipt.preRestartDrainObserved === false &&
+    receipt.restartRequested === false &&
+    receipt.restartScheduled === false &&
+    isIdentity(receipt.oldServerIdentity) &&
+    isExpectedIdentity(receipt.expectedIdentity) &&
+    receipt.coordinationBinding !== undefined &&
+    (() => { try { validatedCoordinationBinding(receipt.coordinationBinding); return true; } catch { return false; } })() &&
+    typeof receipt.recoveredBy === "string" &&
+    receipt.recoveredBy.length > 0 &&
+    typeof receipt.recoveredAt === "string" &&
+    Number.isFinite(Date.parse(receipt.recoveredAt)) &&
+    receipt.reconciliationReceipt !== undefined &&
+    isReconciliationReceipt(receipt.reconciliationReceipt)
   );
 }
 

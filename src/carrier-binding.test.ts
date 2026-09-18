@@ -176,6 +176,82 @@ test("expired coordination-bound prepared cutover can terminally reconcile an ex
   } finally {f.close();}
 });
 
+test("host-local recovery terminally closes only an expired prepared cutover with zero lifecycle effect",()=>{
+  const f=fixture();
+  const context={clientId:"shared-oauth",sessionId:"expired-prepared-controller"};
+  let manager:DurableOperationManager|undefined;
+  try {
+    const pairing=f.store.requestPairing(context);
+    const cutover={stateRoot:f.root,attemptKey:"expired-prepared-no-effect",
+      currentIdentity:{serverInstanceId:"original",sourceCommit:f.contract.baseRevision,buildId:"old",capabilityManifestSha256:"c".repeat(64)},
+      expectedIdentity:{sourceCommit:"b".repeat(40),buildId:"new",capabilityManifestSha256:"d".repeat(64)},
+      expiresAt:new Date(f.clock()+30000).toISOString(),
+      restart:{buildReady:{verifiedBy:"fixture",verifiedAt:new Date(f.clock()).toISOString(),evidence:"no-effect recovery fixture"},actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"},
+      finish:{workspaceId:"ws_test",agentId:"agt_test"}};
+    const contract={...f.contract,scope:[f.root],operations:["cutover_start" as const],cutover,expiresAt:new Date(f.clock()+60000).toISOString()};
+    const approved=f.store.approveLocal(pairing.pendingId,contract);
+    f.store.redeem(context,pairing.credential);
+    const plan=planCutoverStart(f.root,cutover);
+    const lease=f.store.prepareEffect(context,plan.subject);
+    const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config2"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees2"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
+    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
+    const validityBefore=f.store.inspectLocal(approved.id).validity;
+    f.advance(120000);
+    assert.throws(()=>f.store.recoverExpiredPreparedCutoverLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:"wrong"}),/confirmation/i);
+    assert.throws(()=>f.store.recoverExpiredPreparedCutoverLocal({cutoverId:id,carrierId:approved.id,expectedVersion:2,expectedValidityVersion:1,confirmCutoverId:id}),/version/i);
+    const recovered=f.store.recoverExpiredPreparedCutoverLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:id});
+    assert.equal(recovered.replayed,false);
+    assert.equal(recovered.cutover.phase,"closed");
+    assert.equal(recovered.cutover.expiredPreparedNoEffect?.terminalReason,"EXPIRED_PREPARED_NO_EFFECT");
+    assert.equal(recovered.cutover.drainEvidence,undefined);
+    assert.equal(recovered.cutover.restartRequest,undefined);
+    assert.equal(recovered.cutover.reconciliationReceipt?.workspaceQueryable,false);
+    assert.equal(recovered.cutover.reconciliationReceipt?.preRestartDrainObserved,false);
+    assert.equal(recovered.lease.leaseId,lease.leaseId);
+    assert.equal(recovered.lease.terminalState,"expired_reconciled");
+    assert.equal(recovered.lease.operationState,"finished");
+    assert.equal(recovered.lease.operationHandle,undefined);
+    assert.equal(recovered.operation.receipt?.lifecycleTerminal,true);
+    assert.equal(recovered.operation.receipt?.recoveryKind,"expired_prepared_no_effect");
+    assert.equal(f.store.inspectLocal(approved.id).validity.version,validityBefore.version);
+    assert.equal(f.store.inspectLocal(approved.id).validity.expiresAt,validityBefore.expiresAt);
+    const replay=f.store.recoverExpiredPreparedCutoverLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:id});
+    assert.equal(replay.replayed,true);
+    assert.deepEqual(replay.cutover,recovered.cutover);
+    assert.deepEqual(replay.reconciliation,recovered.reconciliation);
+  } finally {manager?.close();f.close();}
+});
+
+test("host-local expired prepared recovery rejects any prior drain effect",()=>{
+  const f=fixture();
+  const context={clientId:"shared-oauth",sessionId:"expired-prepared-drained"};
+  let manager:DurableOperationManager|undefined;
+  try {
+    const pairing=f.store.requestPairing(context);
+    const cutover={stateRoot:f.root,attemptKey:"expired-prepared-drained",
+      currentIdentity:{serverInstanceId:"original",sourceCommit:f.contract.baseRevision,buildId:"old",capabilityManifestSha256:"c".repeat(64)},
+      expectedIdentity:{sourceCommit:"b".repeat(40),buildId:"new",capabilityManifestSha256:"d".repeat(64)},
+      expiresAt:new Date(f.clock()+30000).toISOString(),
+      restart:{buildReady:{verifiedBy:"fixture",verifiedAt:new Date(f.clock()).toISOString(),evidence:"drain rejection fixture"},actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"},
+      finish:{workspaceId:"ws_test",agentId:"agt_test"}};
+    const contract={...f.contract,scope:[f.root],operations:["cutover_start" as const],cutover,expiresAt:new Date(f.clock()+60000).toISOString()};
+    const approved=f.store.approveLocal(pairing.pendingId,contract);
+    f.store.redeem(context,pairing.credential);
+    const plan=planCutoverStart(f.root,cutover);f.store.prepareEffect(context,plan.subject);
+    const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config3"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees3"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
+    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
+    f.store.readers.approveCutoverLifecycle=()=>true;
+    manager.drainCutover(id,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
+    f.advance(120000);
+    const before=JSON.stringify(new CutoverStateStore(f.root).get());
+    assert.throws(()=>f.store.recoverExpiredPreparedCutoverLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:id}),/non-prepared|drain/i);
+    assert.equal(JSON.stringify(new CutoverStateStore(f.root).get()),before);
+    assert.equal(f.store.ownership.get((start.request.coordinationBinding as {leaseId:string}).leaseId)?.operationHandle,start.operationId);
+  } finally {manager?.close();f.close();}
+});
+
 test("completion readers remain paired, scoped and independent of candidate base",()=>{
   const selection={goal:"issue62",subject:"delivery",candidate:"b".repeat(40)};
   const readers={readContract:(s:typeof selection)=>({...s}),readEvidence:()=>[]};
