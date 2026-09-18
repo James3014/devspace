@@ -373,6 +373,22 @@ export class LocalAgentStore {
     return record;
   }
 
+  findRecordByAttemptKey(
+    workspaceRoot: string,
+    attemptKey: string,
+  ): LocalAgentRecord | undefined {
+    const rows = this.database.sqlite
+      .prepare("select * from local_agent_sessions")
+      .all() as LocalAgentRow[];
+    const canonicalRoot = canonicalizePath(workspaceRoot);
+    const matches = rows.filter((row) =>
+      canonicalizePath(row.workspace_root) === canonicalRoot &&
+      readStoredExecutionState(row.execution_contract).startReplay?.key === attemptKey
+    );
+    if (matches.length === 0) return undefined;
+    return rowToLocalAgentRecord(matches[0]!);
+  }
+
   createOrReplay(
     input: CreateLocalAgentRecordInput & { workspaceId: string; startReplay: StartReplayBinding },
   ): { record: LocalAgentRecord; created: boolean } {

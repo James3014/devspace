@@ -1,4 +1,6 @@
 import { randomBytes } from "node:crypto";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
 import type { Stats } from "node:fs";
 import type {
   WorkspaceConversationBinding,
@@ -39,6 +41,8 @@ import {
   type ConversationMutationSafety,
 } from "./conversation-isolation.js";
 
+const execFileAsync = promisify(execFile);
+
 export interface LoadedAgentsFile {
   path: string;
   content: string;
@@ -69,6 +73,7 @@ export interface Workspace {
   profileCatalogGeneration?: string;
   profileCatalogEntries?: ProfileCatalogEntry[];
   activatedSkillDirs: Set<string>;
+  availableAgentsFiles?: AvailableAgentsFile[];
 }
 
 export interface WorkspaceContext {
@@ -260,7 +265,11 @@ export class WorkspaceRegistry {
     workspace.profileCatalogGeneration = catalog.generation;
     workspace.profileCatalogEntries = catalogEntriesOf(catalog);
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
-    const availableAgentsFiles = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
+    let availableAgentsFiles = workspace.availableAgentsFiles;
+    if (!availableAgentsFiles) {
+      availableAgentsFiles = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
+      workspace.availableAgentsFiles = availableAgentsFiles;
+    }
 
     return {
       workspace,
@@ -525,6 +534,7 @@ export class WorkspaceRegistry {
     this.workspaces.set(workspace.id, workspace);
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
     const availableAgentsFiles = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
+    workspace.availableAgentsFiles = availableAgentsFiles;
 
     return {
       workspace,
@@ -585,6 +595,14 @@ export class WorkspaceRegistry {
     root: string,
     loadedFiles: LoadedAgentsFile[],
   ): Promise<AvailableAgentsFile[]> {
+    return findAvailableAgentsFiles(root, loadedFiles);
+  }
+}
+
+export async function findAvailableAgentsFiles(
+  root: string,
+  loadedFiles: LoadedAgentsFile[] = [],
+): Promise<AvailableAgentsFile[]> {
     const loadedPaths = new Set(loadedFiles.map((file) => resolve(file.path)));
     const loadedRealPaths = new Set<string>();
     for (const file of loadedFiles) {
@@ -593,19 +611,49 @@ export class WorkspaceRegistry {
     }
     const discovered: AvailableAgentsFile[] = [];
 
-    await walkWorkspace(root, async (path, entry) => {
-      if (!entry.isFile()) return;
-      if (!CONTEXT_FILE_NAMES.has(entry.name)) return;
-      if (loadedPaths.has(path)) return;
-      const realPath = await tryRealpath(path);
-      if (realPath && loadedRealPaths.has(realPath)) return;
+    let gitDiscovered: string[] | undefined;
+    try {
+      const { stdout } = await execFileAsync(
+        "git",
+        [
+          "ls-files",
+          "--cached",
+          "--others",
+          "--exclude-standard",
+          "--",
+          ":(glob)**/AGENTS.md",
+          ":(glob)**/AGENTS.MD",
+          ":(glob)**/CLAUDE.md",
+          ":(glob)**/CLAUDE.MD",
+        ],
+        { cwd: root, maxBuffer: 1024 * 1024, timeout: 2000 },
+      );
+      gitDiscovered = stdout.trim().split("\n").filter(Boolean).map((p) => resolve(root, p));
+    } catch {
+      // Non-git directory or git error; fall back to walkWorkspace
+    }
 
-      discovered.push({ path });
-    });
+    if (gitDiscovered !== undefined) {
+      for (const filePath of gitDiscovered) {
+        if (loadedPaths.has(filePath)) continue;
+        const realPath = await tryRealpath(filePath);
+        if (realPath && loadedRealPaths.has(realPath)) continue;
+        discovered.push({ path: filePath });
+      }
+    } else {
+      await walkWorkspace(root, async (path, entry) => {
+        if (!entry.isFile()) return;
+        if (!CONTEXT_FILE_NAMES.has(entry.name)) return;
+        if (loadedPaths.has(path)) return;
+        const realPath = await tryRealpath(path);
+        if (realPath && loadedRealPaths.has(realPath)) return;
+
+        discovered.push({ path });
+      });
+    }
 
     return discovered.sort((a, b) => a.path.localeCompare(b.path));
   }
-}
 
 async function canonicalPath(path: string): Promise<string> {
   const missingSegments: string[] = [];

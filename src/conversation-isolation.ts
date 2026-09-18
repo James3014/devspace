@@ -42,6 +42,34 @@ const READ_ONLY_GIT_SUBCOMMANDS = new Set([
   "merge-base",
 ]);
 
+function maskSafeQuotedStrings(input: string): string {
+  let result = "";
+  let i = 0;
+  while (i < input.length) {
+    const char = input[i];
+    if (char === "'") {
+      const nextQuote = input.indexOf("'", i + 1);
+      if (nextQuote === -1) return input;
+      result += "'" + "X".repeat(nextQuote - i - 1) + "'";
+      i = nextQuote + 1;
+    } else if (char === '"') {
+      const nextQuote = input.indexOf('"', i + 1);
+      if (nextQuote === -1) return input;
+      const inner = input.slice(i + 1, nextQuote);
+      if (inner.includes("$") || inner.includes("`") || inner.includes("\\")) {
+        result += '"' + inner + '"';
+      } else {
+        result += '"' + "X".repeat(inner.length) + '"';
+      }
+      i = nextQuote + 1;
+    } else {
+      result += char;
+      i++;
+    }
+  }
+  return result;
+}
+
 /**
  * Conservative classification used only to decide whether a shell command may
  * run while two ChatGPT conversations share one physical checkout. Unknown or
@@ -50,7 +78,8 @@ const READ_ONLY_GIT_SUBCOMMANDS = new Set([
 export function isReadOnlyInspectionCommand(command: string): boolean {
   const trimmed = command.trim();
   if (!trimmed) return true;
-  if (/[;|<>`\n]/.test(trimmed) || trimmed.includes("$(") || trimmed.includes("||")) {
+  const masked = maskSafeQuotedStrings(trimmed);
+  if (/[;|<>`\n]/.test(masked) || masked.includes("$(") || masked.includes("||")) {
     return false;
   }
 

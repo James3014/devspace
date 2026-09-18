@@ -399,6 +399,10 @@ const toolNames = {
   grep: "grep",
   glob: "glob",
   ls: "ls",
+  listDirectory: "list_directory",
+  findFiles: "find_files",
+  grepFiles: "grep_files",
+  applyPatch: "apply_patch",
   shell: "bash",
 } as const;
 
@@ -448,9 +452,7 @@ function serverInstructions(config: ServerConfig): string {
     return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}${agentToolsInstruction}${gitCandidatesInstruction}${codexGoalsInstruction}${repositoryIntelligenceInstruction}`;
   }
 
-  const inspection = config.toolMode !== "full"
-    ? `In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use ${toolNames.shell} with command-line tools such as grep, rg, find, ls, and tree for search and directory inspection. `
-    : `Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. `;
+  const inspection = `Prefer ${toolNames.read}, ${toolNames.grepFiles}, ${toolNames.findFiles}, and ${toolNames.listDirectory} for file and directory inspection. Do not rely on bash for simple search or directory listing. `;
 
   const skills = config.skillsEnabled
     ? `When ${toolNames.openWorkspace} returns available skills and a task matches a skill, use ${toolNames.read} to read that skill's path before proceeding. Skill paths may be outside the workspace, but ${toolNames.read} only permits advertised SKILL.md files and files under already-loaded skill directories. `
@@ -458,7 +460,7 @@ function serverInstructions(config: ServerConfig): string {
 
   const agentsMd = `Follow instructions returned by ${toolNames.openWorkspace}. Before working under a path listed in availableAgentsFiles, use ${toolNames.read} to inspect that instruction file and follow it. `;
 
-  return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}${agentToolsInstruction}${gitCandidatesInstruction}${codexGoalsInstruction}${repositoryIntelligenceInstruction}`;
+  return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. ${agentsMd}${skills}${inspection}Prefer ${toolNames.edit} for targeted modifications, ${toolNames.applyPatch} for multi-file or structured patches, ${toolNames.write} only for new files or complete rewrites, and ${toolNames.shell} for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not create or modify files with ${toolNames.shell}; avoid shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or any command whose purpose is to write project files.${artifactInstruction}${showChangesInstruction}${agentToolsInstruction}${gitCandidatesInstruction}${codexGoalsInstruction}${repositoryIntelligenceInstruction}`;
 }
 
 function formatVisibleAgent(agent: {
@@ -2701,9 +2703,17 @@ function catalogReceiptForProfile(
   return undefined;
 }
 
-function assertDirectClineCatalogSelection(selector: AgentSelector, catalog: Awaited<ReturnType<typeof loadProfileCatalog>>): void {
-  if (selector.provider !== "cline") return;
-  const validation = validateClineModelAndThinking(selector.model, selector.cliProviderId as "cline" | "cline-pass" | undefined, selector.effort, catalog.clineCatalog);
+function assertDirectClineCatalogSelection(
+  selectedProfile: LocalAgentProfile | undefined,
+  catalog: Awaited<ReturnType<typeof loadProfileCatalog>>,
+): void {
+  if (selectedProfile?.provider !== "cline") return;
+  const validation = validateClineModelAndThinking(
+    selectedProfile.model,
+    selectedProfile.cliProviderId as "cline" | "cline-pass" | undefined,
+    selectedProfile.effort,
+    catalog.clineCatalog,
+  );
   if (!validation.valid) throw new AgentSessionError(validation.blockerCode ?? "EXACT_MODEL_UNAVAILABLE", validation.reason ?? "Cline selection is unavailable.");
 }
 
@@ -3856,7 +3866,13 @@ export function createMcpServer(
           workspaceId,
           path: input.path,
         }, response.content, startedAt);
-        return response;
+        return {
+          ...response,
+          content: [
+            ...response.content,
+            textBlock("Edit failed: exact match not found for oldText. Do not use fuzzy matching. Recovery procedure: 1. Use read to inspect the current file content around the target region. 2. Retry edit once with exact fresh text matching the latest content."),
+          ],
+        };
       }
 
       const stats = countDiffStats(
@@ -3900,10 +3916,9 @@ export function createMcpServer(
   );
   }
 
-  if (config.toolMode === "codex") {
-    registerAppTool(
-      server,
-      "apply_patch",
+  registerAppTool(
+    server,
+    "apply_patch",
       {
         title: "Apply patch",
         description:
@@ -3982,7 +3997,6 @@ export function createMcpServer(
         };
       },
     );
-  }
 
   if (config.widgets === "changes") {
     registerAppTool(
@@ -4039,216 +4053,211 @@ export function createMcpServer(
     );
   }
 
-  if (config.toolMode === "full") {
-    registerAppTool(
-      server,
-      toolNames.grep,
-      {
-        title: "Grep",
-        description:
-          "Search file contents in a workspace. Use this before broad reads when looking for symbols, text, or usage sites. Respects project ignore rules.",
-        inputSchema: {
-          workspaceId: z
-            .string()
-            .describe(workspaceIdDescription),
-          pattern: z.string().describe("Search pattern."),
-          path: z
-            .string()
-            .optional()
-            .describe(
-              "Optional path or glob scope relative to the workspace root.",
-            ),
-          include: z.string().optional().describe("Optional include glob."),
-        },
-        outputSchema: resultOutputSchema(),
-        ...toolWidgetDescriptorMeta(config, "search"),
-        annotations: { readOnlyHint: true },
-      },
-      async ({ workspaceId, ...input }) => {
-        const startedAt = performance.now();
-        const workspace = workspaces.getWorkspace(workspaceId);
-        if (input.path) workspaces.resolvePath(workspace, input.path);
-        const response = await grepFilesTool(input, {
-          cwd: workspace.root,
-          root: workspace.root,
-        });
+  const grepToolDef = {
+    title: "Grep",
+    description:
+      "Search file contents in a workspace. Use this before broad reads when looking for symbols, text, or usage sites. Respects project ignore rules.",
+    inputSchema: {
+      workspaceId: z
+        .string()
+        .describe(workspaceIdDescription),
+      pattern: z.string().describe("Search pattern."),
+      path: z
+        .string()
+        .optional()
+        .describe(
+          "Optional path or glob scope relative to the workspace root.",
+        ),
+      include: z.string().optional().describe("Optional include glob."),
+    },
+    outputSchema: resultOutputSchema(),
+    ...toolWidgetDescriptorMeta(config, "search"),
+    annotations: { readOnlyHint: true },
+  };
+  const grepHandler = async ({ workspaceId, ...input }: { workspaceId: string; pattern: string; path?: string; include?: string }) => {
+    const startedAt = performance.now();
+    const workspace = workspaces.getWorkspace(workspaceId);
+    if (input.path) workspaces.resolvePath(workspace, input.path);
+    const response = await grepFilesTool(input, {
+      cwd: workspace.root,
+      root: workspace.root,
+    });
 
-        if (response.isError) {
-          logFailedToolResponse(config, {
-            tool: toolNames.grep,
-            workspaceId,
-            path: input.path,
-          }, response.content, startedAt);
-          return response;
-        }
+    if (response.isError) {
+      logFailedToolResponse(config, {
+        tool: toolNames.grep,
+        workspaceId,
+        path: input.path,
+      }, response.content, startedAt);
+      return response;
+    }
 
-        const summary = {
-          pattern: input.pattern,
-          scope: input.path ?? ".",
-          ...textSummary(response.content),
-        };
-        logToolCall(config, {
-          tool: toolNames.grep,
+    const summary = {
+      pattern: input.pattern,
+      scope: input.path ?? ".",
+      ...textSummary(response.content),
+    };
+    logToolCall(config, {
+      tool: toolNames.grep,
+      workspaceId,
+      path: input.path,
+      success: true,
+      durationMs: Math.round(performance.now() - startedAt),
+    });
+
+    return {
+      ...response,
+      _meta: {
+        tool: toolNames.grep,
+        card: {
           workspaceId,
           path: input.path,
-          success: true,
-          durationMs: Math.round(performance.now() - startedAt),
-        });
-
-        return {
-          ...response,
-          _meta: {
-            tool: toolNames.grep,
-            card: {
-              workspaceId,
-              path: input.path,
-              summary,
-              payload: { content: response.content },
-            },
-          },
-          structuredContent: {
-            result: contentText(response.content),
-          },
-        };
-      },
-    );
-
-    registerAppTool(
-      server,
-      toolNames.glob,
-      {
-        title: "Glob",
-        description:
-          "Find files by glob pattern in a workspace. Use this to discover filenames or narrow file sets before reading. Respects project ignore rules.",
-        inputSchema: {
-          workspaceId: z
-            .string()
-            .describe(workspaceIdDescription),
-          pattern: z.string().describe("File glob pattern."),
-          path: z
-            .string()
-            .optional()
-            .describe("Optional path scope relative to the workspace root."),
+          summary,
+          payload: { content: response.content },
         },
-        outputSchema: resultOutputSchema(),
-        ...toolWidgetDescriptorMeta(config, "search"),
-        annotations: { readOnlyHint: true },
       },
-      async ({ workspaceId, ...input }) => {
-        const startedAt = performance.now();
-        const workspace = workspaces.getWorkspace(workspaceId);
-        if (input.path) workspaces.resolvePath(workspace, input.path);
-        const response = await findFilesTool(input, {
-          cwd: workspace.root,
-          root: workspace.root,
-        });
+      structuredContent: {
+        result: contentText(response.content),
+      },
+    };
+  };
 
-        if (response.isError) {
-          logFailedToolResponse(config, {
-            tool: toolNames.glob,
-            workspaceId,
-            path: input.path,
-          }, response.content, startedAt);
-          return response;
-        }
+  registerAppTool(server, toolNames.grepFiles, grepToolDef, grepHandler);
+  registerAppTool(server, toolNames.grep, grepToolDef, grepHandler);
 
-        const summary = {
-          pattern: input.pattern,
-          scope: input.path ?? ".",
-          ...textSummary(response.content),
-        };
-        logToolCall(config, {
-          tool: toolNames.glob,
+  const globToolDef = {
+    title: "Glob",
+    description:
+      "Find files by glob pattern in a workspace. Use this to discover filenames or narrow file sets before reading. Respects project ignore rules.",
+    inputSchema: {
+      workspaceId: z
+        .string()
+        .describe(workspaceIdDescription),
+      pattern: z.string().describe("File glob pattern."),
+      path: z
+        .string()
+        .optional()
+        .describe("Optional path scope relative to the workspace root."),
+    },
+    outputSchema: resultOutputSchema(),
+    ...toolWidgetDescriptorMeta(config, "search"),
+    annotations: { readOnlyHint: true },
+  };
+  const globHandler = async ({ workspaceId, ...input }: { workspaceId: string; pattern: string; path?: string }) => {
+    const startedAt = performance.now();
+    const workspace = workspaces.getWorkspace(workspaceId);
+    if (input.path) workspaces.resolvePath(workspace, input.path);
+    const response = await findFilesTool(input, {
+      cwd: workspace.root,
+      root: workspace.root,
+    });
+
+    if (response.isError) {
+      logFailedToolResponse(config, {
+        tool: toolNames.glob,
+        workspaceId,
+        path: input.path,
+      }, response.content, startedAt);
+      return response;
+    }
+
+    const summary = {
+      pattern: input.pattern,
+      scope: input.path ?? ".",
+      ...textSummary(response.content),
+    };
+    logToolCall(config, {
+      tool: toolNames.glob,
+      workspaceId,
+      path: input.path,
+      success: true,
+      durationMs: Math.round(performance.now() - startedAt),
+    });
+
+    return {
+      ...response,
+      _meta: {
+        tool: toolNames.glob,
+        card: {
           workspaceId,
           path: input.path,
-          success: true,
-          durationMs: Math.round(performance.now() - startedAt),
-        });
-
-        return {
-          ...response,
-          _meta: {
-            tool: toolNames.glob,
-            card: {
-              workspaceId,
-              path: input.path,
-              summary,
-              payload: { content: response.content },
-            },
-          },
-          structuredContent: {
-            result: contentText(response.content),
-          },
-        };
-      },
-    );
-
-    registerAppTool(
-      server,
-      toolNames.ls,
-      {
-        title: "Ls",
-        description:
-          "List a directory in a workspace. Use this for directory inspection before reading files.",
-        inputSchema: {
-          workspaceId: z
-            .string()
-            .describe(workspaceIdDescription),
-          path: z
-            .string()
-            .describe(
-              "Directory path to list, relative to the workspace root.",
-            ),
+          summary,
+          payload: { content: response.content },
         },
-        outputSchema: resultOutputSchema(),
-        ...toolWidgetDescriptorMeta(config, "directory"),
-        annotations: { readOnlyHint: true },
       },
-      async ({ workspaceId, ...input }) => {
-        const startedAt = performance.now();
-        const workspace = workspaces.getWorkspace(workspaceId);
-        workspaces.resolvePath(workspace, input.path);
-        const response = await listDirectoryTool(input, {
-          cwd: workspace.root,
-          root: workspace.root,
-        });
+      structuredContent: {
+        result: contentText(response.content),
+      },
+    };
+  };
 
-        if (response.isError) {
-          logFailedToolResponse(config, {
-            tool: toolNames.ls,
-            workspaceId,
-            path: input.path,
-          }, response.content, startedAt);
-          return response;
-        }
+  registerAppTool(server, toolNames.findFiles, globToolDef, globHandler);
+  registerAppTool(server, toolNames.glob, globToolDef, globHandler);
 
-        const summary = textSummary(response.content);
-        logToolCall(config, {
-          tool: toolNames.ls,
+  const lsToolDef = {
+    title: "Ls",
+    description:
+      "List a directory in a workspace. Use this for directory inspection before reading files.",
+    inputSchema: {
+      workspaceId: z
+        .string()
+        .describe(workspaceIdDescription),
+      path: z
+        .string()
+        .describe(
+          "Directory path to list, relative to the workspace root.",
+        ),
+    },
+    outputSchema: resultOutputSchema(),
+    ...toolWidgetDescriptorMeta(config, "directory"),
+    annotations: { readOnlyHint: true },
+  };
+  const lsHandler = async ({ workspaceId, ...input }: { workspaceId: string; path: string }) => {
+    const startedAt = performance.now();
+    const workspace = workspaces.getWorkspace(workspaceId);
+    workspaces.resolvePath(workspace, input.path);
+    const response = await listDirectoryTool(input, {
+      cwd: workspace.root,
+      root: workspace.root,
+    });
+
+    if (response.isError) {
+      logFailedToolResponse(config, {
+        tool: toolNames.ls,
+        workspaceId,
+        path: input.path,
+      }, response.content, startedAt);
+      return response;
+    }
+
+    const summary = textSummary(response.content);
+    logToolCall(config, {
+      tool: toolNames.ls,
+      workspaceId,
+      path: input.path,
+      success: true,
+      durationMs: Math.round(performance.now() - startedAt),
+    });
+
+    return {
+      ...response,
+      _meta: {
+        tool: toolNames.ls,
+        card: {
           workspaceId,
           path: input.path,
-          success: true,
-          durationMs: Math.round(performance.now() - startedAt),
-        });
-
-        return {
-          ...response,
-          _meta: {
-            tool: toolNames.ls,
-            card: {
-              workspaceId,
-              path: input.path,
-              summary,
-              payload: { content: response.content },
-            },
-          },
-          structuredContent: {
-            result: contentText(response.content),
-          },
-        };
+          summary,
+          payload: { content: response.content },
+        },
       },
-    );
-  }
+      structuredContent: {
+        result: contentText(response.content),
+      },
+    };
+  };
+
+  registerAppTool(server, toolNames.listDirectory, lsToolDef, lsHandler);
+  registerAppTool(server, toolNames.ls, lsToolDef, lsHandler);
 
   if (config.toolMode !== "codex") {
   registerAppTool(
@@ -4257,12 +4266,8 @@ export function createMcpServer(
     {
       title: "Bash",
       description: config.subagents.enabled
-        ? (config.toolMode !== "full"
-          ? `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, search, file discovery, and directory inspection. In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use command-line tools such as grep, rg, find, ls, and tree for those read-only inspection actions. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read} for direct file reads. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication. Do not use bash to call \`devspace agents\` when native agent tools are available.`
-          : `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication. Do not use bash to call \`devspace agents\` when native agent tools are available.`)
-        : (config.toolMode !== "full"
-          ? `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, search, file discovery, and directory inspection. In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use command-line tools such as grep, rg, find, ls, and tree for those read-only inspection actions. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read} for direct file reads. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`
-          : `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`),
+        ? `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes, ${toolNames.applyPatch} for structured patches, and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grepFiles}, ${toolNames.findFiles}, and ${toolNames.listDirectory} for file and directory inspection. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication. Do not use bash to call \`devspace agents\` when native agent tools are available.`
+        : `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes, ${toolNames.applyPatch} for structured patches, and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grepFiles}, ${toolNames.findFiles}, and ${toolNames.listDirectory} for file and directory inspection. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`,
 
       inputSchema: {
         workspaceId: z
@@ -4621,9 +4626,9 @@ export function createMcpServer(
           config,
           contract,
         );
-        assertDirectClineCatalogSelection({ profile, provider, model, effort, cliProviderId }, profileCatalog);
         const profiles = selection.profiles;
         const selectedProfile = profiles.find((candidate) => candidate.name === selection.profileName);
+        assertDirectClineCatalogSelection(selectedProfile, profileCatalog);
         let coreAdmission: CoreMutationAdmission | undefined;
         let discoveryContext: string | undefined;
         if (selectedProfile?.write_mode !== "read_only") {
@@ -4804,10 +4809,11 @@ export function createMcpServer(
       {
         title: "Agent status",
         description:
-          "Retrieve the status and result of a durable subagent session. Optionally poll for up to waitMs milliseconds.",
+          "Retrieve the status and result of a durable subagent session. Accepts either agentId or attemptKey. Optionally poll for up to waitMs milliseconds.",
         inputSchema: {
           workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
-          agentId: z.string().describe("Exact agent ID returned by agent_start."),
+          agentId: z.string().optional().describe("Exact agent ID returned by agent_start. Provide agentId or attemptKey."),
+          attemptKey: z.string().optional().describe("Idempotent dispatch attempt key passed to agent_start. Provide agentId or attemptKey."),
           waitMs: z
             .number()
             .int()
@@ -4849,12 +4855,24 @@ export function createMcpServer(
         _meta: {},
         annotations: { readOnlyHint: true },
       },
-      async ({ workspaceId, agentId, waitMs }) => {
+      async ({ workspaceId, agentId, attemptKey, waitMs }) => {
         const workspace = workspaces.getWorkspace(workspaceId);
+        let resolvedAgentId = agentId;
+        if (!resolvedAgentId && attemptKey) {
+          const record = agentSessionManager.findRecordByAttemptKey(workspace.root, attemptKey);
+          if (record) {
+            resolvedAgentId = record.id;
+          } else {
+            throw new AgentSessionError("UNKNOWN_AGENT", `No agent found for attemptKey: ${attemptKey}`);
+          }
+        }
+        if (!resolvedAgentId) {
+          throw new AgentSessionError("UNKNOWN_AGENT", "Either agentId or attemptKey must be provided to agent_status.");
+        }
         const output = await agentSessionManager.getAgentStatus({
           workspaceId,
           workspaceRoot: workspace.root,
-          agentId,
+          agentId: resolvedAgentId,
           waitMs,
         });
         const statusLine = output.terminal
@@ -5053,8 +5071,9 @@ export function createMcpServer(
           profileCatalog.profiles,
           config,
         );
-        assertDirectClineCatalogSelection({ profile, provider, model, effort, cliProviderId }, profileCatalog);
         const profiles = selection.profiles;
+        const selectedProfile = profiles.find((candidate) => candidate.name === selection.profileName);
+        assertDirectClineCatalogSelection(selectedProfile, profileCatalog);
         const output = await agentSessionManager.preflightAgent({
           workspaceId,
           workspaceRoot: workspace.root,
@@ -5102,10 +5121,11 @@ export function createMcpServer(
       {
         title: "Reconcile agent",
         description:
-          "Read-only physical reconciliation for an exact durable agent. Reports what actually happened in the workspace regardless of provider/session status. A provider timeout/error does NOT imply no candidate exists. Never retries mutation.",
+          "Read-only physical reconciliation for an exact durable agent. Accepts either agentId or attemptKey. Reports what actually happened in the workspace regardless of provider/session status. A provider timeout/error does NOT imply no candidate exists. Never retries mutation.",
         inputSchema: {
           workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
-          agentId: z.string().describe("Exact agent ID returned by agent_start."),
+          agentId: z.string().optional().describe("Exact agent ID returned by agent_start. Provide agentId or attemptKey."),
+          attemptKey: z.string().optional().describe("Idempotent dispatch attempt key passed to agent_start. Provide agentId or attemptKey."),
         },
         outputSchema: {
           agentId: z.string(),
@@ -5133,13 +5153,25 @@ export function createMcpServer(
         _meta: {},
         annotations: { readOnlyHint: true },
       },
-      async ({ workspaceId, agentId }) => {
+      async ({ workspaceId, agentId, attemptKey }) => {
         const workspace = workspaces.getWorkspace(workspaceId);
+        let resolvedAgentId = agentId;
+        if (!resolvedAgentId && attemptKey) {
+          const record = agentSessionManager.findRecordByAttemptKey(workspace.root, attemptKey);
+          if (record) {
+            resolvedAgentId = record.id;
+          } else {
+            throw new AgentSessionError("UNKNOWN_AGENT", `No agent found for attemptKey: ${attemptKey}`);
+          }
+        }
+        if (!resolvedAgentId) {
+          throw new AgentSessionError("UNKNOWN_AGENT", "Either agentId or attemptKey must be provided to agent_reconcile.");
+        }
         const output = await agentSessionManager.reconcileAgent({
           workspaceId,
           workspaceRoot: workspace.root,
           isolated: workspace.mode === "worktree",
-          agentId,
+          agentId: resolvedAgentId,
         });
         const candidateLine = output.candidate.present
           ? `Candidate present (${output.candidate.changedPaths.length} changed path(s), scope=${output.candidate.scopeState}).`

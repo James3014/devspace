@@ -25,7 +25,7 @@ export interface ClineCatalogEntry {
   thinkingKnown: boolean;
   supportsReasoning: boolean | "unknown";
   free: ClineFreeStatus;
-  accountEntitlement: "unknown";
+  accountEntitlement: "unknown" | "entitled" | "missing";
   source: "cline-api" | "fixture";
 }
 
@@ -38,6 +38,7 @@ export interface ClineRuntimeIdentity {
   supportedThinking: readonly ClineThinkingLevel[];
   /** True only after an executable session API proves the requested level. */
   thinkingVerified?: boolean;
+  clinePassEntitled?: boolean;
 }
 
 export interface ClineCatalogSnapshot {
@@ -71,7 +72,7 @@ export interface ClineCatalogResponse {
 
 export interface ClineModelValidationResult {
   valid: boolean;
-  blockerCode?: "EXACT_MODEL_UNAVAILABLE" | "VARIANT_UNAVAILABLE";
+  blockerCode?: "EXACT_MODEL_UNAVAILABLE" | "VARIANT_UNAVAILABLE" | "CLINEPASS_ENTITLEMENT_REQUIRED";
   reason?: string;
 }
 
@@ -90,6 +91,15 @@ export function validateClineModelAndThinking(
   const exact = snapshot?.entries.filter((entry) => entry.cliProviderId === family && entry.fullName === model) ?? [];
   if (!snapshot || !isClineCatalogFresh(snapshot) || exact.length !== 1) {
     return { valid: false, blockerCode: "EXACT_MODEL_UNAVAILABLE", reason: `Cline model '${model ?? ""}' is not established for cliProviderId '${family}'.` };
+  }
+  const isClinePass = family === "cline-pass";
+  const entitlementMissing = exact[0].accountEntitlement === "missing" || (isClinePass && snapshot.runtime.clinePassEntitled === false);
+  if (entitlementMissing) {
+    return {
+      valid: false,
+      blockerCode: "CLINEPASS_ENTITLEMENT_REQUIRED",
+      reason: `ClinePass subscription entitlement is missing for model '${model}'.`,
+    };
   }
   if (effort && (snapshot.runtime.thinkingVerified !== true || !exact[0].thinkingKnown || !exact[0].thinking.includes(effort as ClineThinkingLevel))) {
     return { valid: false, blockerCode: "VARIANT_UNAVAILABLE", reason: `Cline thinking level '${effort}' is not verified for '${model}'.` };

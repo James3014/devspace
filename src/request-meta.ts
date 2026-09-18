@@ -46,5 +46,9 @@ export function resolveChatSwarmIdentity(meta: unknown): ChatSwarmIdentityEviden
 export function openAiConversationScopeId(
   meta: unknown,
 ): string | undefined {
-  return metadataString(meta, "openai/session");
+  for (const key of CHAT_SWARM_IDENTITY_KEYS) {
+    const value = metadataString(meta, key);
+    if (value) return value;
+  }
+  return undefined;
 }
