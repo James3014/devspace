@@ -23,6 +23,11 @@ test("valid OpenAI session metadata returns the raw opaque session value", () =>
   assert.equal(openAiConversationScopeId({ "openai/session": "chat-session-opaque-value" }), "chat-session-opaque-value");
 });
 
+test("valid OpenAI conversation_id or chatgpt/session metadata returns the raw value", () => {
+  assert.equal(openAiConversationScopeId({ "openai/conversation_id": "conv-123" }), "conv-123");
+  assert.equal(openAiConversationScopeId({ "chatgpt/session": "chatgpt-456" }), "chatgpt-456");
+});
+
 test("unrelated metadata fields do not alter the selected conversation scope", () => {
   assert.equal(openAiConversationScopeId({ "openai/session": "chat-session-opaque-value", "openai/subject": "user-1", "openai/organization": "org-1" }), "chat-session-opaque-value");
 });

@@ -187,6 +187,10 @@ test("shell classifier permits bounded inspection but treats tests/builds and un
   assert.equal(isReadOnlyInspectionCommand("git status --short && git diff --stat"), true);
   assert.equal(isReadOnlyInspectionCommand("rg -n foo src && git rev-parse HEAD"), true);
   assert.equal(isReadOnlyInspectionCommand("git branch --show-current"), true);
+  assert.equal(isReadOnlyInspectionCommand('rg "foo|bar" src'), true);
+  assert.equal(isReadOnlyInspectionCommand("grep -E 'foo|bar' src/file.ts"), true);
+  assert.equal(isReadOnlyInspectionCommand("cat file | grep foo"), false);
+  assert.equal(isReadOnlyInspectionCommand('rg "foo$(rm -rf *)" src'), false);
   assert.equal(isReadOnlyInspectionCommand("npm test"), false);
   assert.equal(isReadOnlyInspectionCommand("git checkout main"), false);
   assert.equal(isReadOnlyInspectionCommand("rg foo src > out.txt"), false);

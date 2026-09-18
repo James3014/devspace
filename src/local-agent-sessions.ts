@@ -48,7 +48,7 @@ import {
   type AgentProviderFailureDetails,
 } from "./local-agent-errors.js";
 import { validateOpencodeModelAndVariant, type OpencodeCatalogSnapshot } from "./local-agent-opencode-catalog.js";
-import { isClineCatalogFresh, type ClineCatalogSnapshot } from "./local-agent-cline-catalog.js";
+import { isClineCatalogFresh, validateClineModelAndThinking, type ClineCatalogSnapshot } from "./local-agent-cline-catalog.js";
 import type { ClineCatalogService } from "./local-agent-cline-catalog.js";
 import { ClineCatalogService as ClineCatalogServiceImpl } from "./local-agent-cline-catalog.js";
 import { createMcpOpencodeCatalogSource } from "./local-agent-opencode-mcp-catalog.js";
@@ -96,6 +96,7 @@ export type AgentErrorCode =
   | "PROVIDER_UNAVAILABLE"
   | "EXACT_MODEL_UNAVAILABLE"
   | "VARIANT_UNAVAILABLE"
+  | "CLINEPASS_ENTITLEMENT_REQUIRED"
   | "PROVIDER_UNAVAILABLE"
   | "UNKNOWN_AGENT"
   | "AGENT_WORKSPACE_MISMATCH"
@@ -675,6 +676,21 @@ export class LocalAgentSessionManager {
       }
     }
 
+    if (profile.provider === "cline") {
+      const modelValidation = validateClineModelAndThinking(
+        profile.model,
+        profile.cliProviderId as "cline" | "cline-pass" | undefined,
+        profile.effort,
+        input.profileCatalog?.clineCatalog,
+      );
+      if (!modelValidation.valid) {
+        throw new AgentSessionError(
+          modelValidation.blockerCode!,
+          modelValidation.reason!,
+        );
+      }
+    }
+
     const executionGeneration = this.resolveExecutionGeneration(
       profile,
       input.profileCatalog?.generation ?? "unresolved",
@@ -1131,6 +1147,10 @@ export class LocalAgentSessionManager {
     return this.store.list();
   }
 
+  findRecordByAttemptKey(workspaceRoot: string, attemptKey: string): LocalAgentRecord | undefined {
+    return this.store.findRecordByAttemptKey(workspaceRoot, attemptKey);
+  }
+
   /**
    * Read-only preflight for an exact workspace + agent profile.
    * Reports readiness evidence without routing, admission, or mutation
@@ -1254,6 +1274,24 @@ export class LocalAgentSessionManager {
             code: modelValidation.blockerCode!,
             detail: modelValidation.reason!,
           });
+        }
+      }
+
+      if (runtimeReady && profile.provider === "cline") {
+        const modelValidation = validateClineModelAndThinking(
+          profile.model,
+          profile.cliProviderId as "cline" | "cline-pass" | undefined,
+          profile.effort,
+          input.profileCatalog?.clineCatalog,
+        );
+        if (!modelValidation.valid) {
+          blockers.push({
+            code: modelValidation.blockerCode!,
+            detail: modelValidation.reason!,
+          });
+        }
+        if (input.profileCatalog?.clineCatalog?.state === "UNKNOWN") {
+          unknowns.push("clineCatalog is UNKNOWN: Cline model catalog is unverified/stale; provider execution cannot be proven READY.");
         }
       }
     }
