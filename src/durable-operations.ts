@@ -581,9 +581,10 @@ export class DurableOperationManager {
       if(binding.leaseId!==file.coordinationBinding.leaseId) throw new ControlPlaneOwnershipError("CAS_CONFLICT","finish authorized lease differs from generation");
       const comparison=compareServerIdentity(file,identity);
       if(!Object.values(comparison).every(Boolean)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","finish replacement runtime identity mismatch");
-      if(file.phase!=="drained"&&file.phase!=="closed") throw new ControlPlaneOwnershipError("CAS_CONFLICT","bound finish requires drained generation; recovery is separate");
+      const expiredPreparedRecovery=recovery&&file.phase==="prepared"&&!file.drainEvidence&&!file.restartRequest;
+      if(file.phase!=="drained"&&file.phase!=="closed"&&!expiredPreparedRecovery) throw new ControlPlaneOwnershipError("CAS_CONFLICT","bound finish requires drained generation unless exact expired prepared recovery applies");
       if(replay&&(file.phase!=="closed"||intent.receipt?.terminalRecordHash!==digest(file)||!isDeepStrictEqual(intent.receipt?.lifecycleAction,action))) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal replay receipt mismatch");
-      return {file,intent,subject,binding,replay,recovery};
+      return {file,intent,subject,binding,replay,recovery,expiredPreparedRecovery};
     };
     const validWitness=(w:DurableReconciliationWitness|undefined)=>!!w&&w.workspaceQueryable===true&&w.agentQueryable===true&&w.agentReconciled===true&&w.witnessWorkspaceId===pair.workspaceId&&w.witnessAgentId===pair.agentId;
     const initial=this.store.atomic(readBound);
@@ -594,7 +595,9 @@ export class DurableOperationManager {
       if(!isDeepStrictEqual(current,initial)||!isDeepStrictEqual(cutoverStore.get(),current.file)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","finish binding changed while reconciliation was pending");
       if(current.file.phase!=="closed") {
         if(!validWitness(witness)) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","finish requires positive exact workspace/agent witness");
-        new McpCutoverController(cutoverStore,identity).finishWithWitness(cutoverId,witness!);
+        const controller=new McpCutoverController(cutoverStore,identity);
+        if(current.expiredPreparedRecovery) controller.finishExpiredPreparedRecoveryWithWitness(cutoverId,witness!);
+        else controller.finishWithWitness(cutoverId,witness!);
       }
       const closed=cutoverStore.get();const receipt=closed?.reconciliationReceipt;
       if(!closed||closed.phase!=="closed"||closed.cutoverId!==cutoverId||!isDeepStrictEqual(closed.coordinationBinding,current.file.coordinationBinding)||!validWitness(receipt)||receipt?.closedByServerInstanceId!==identity.serverInstanceId||!Number.isFinite(Date.parse(receipt.reconciledAt))||Date.parse(receipt.reconciledAt)>Date.now()) throw new ControlPlaneOwnershipError("CAS_CONFLICT","closed file lacks exact terminal witness");

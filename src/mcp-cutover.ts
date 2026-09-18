@@ -355,6 +355,29 @@ export class McpCutoverController {
     };
     return this.store.close(cutoverId, receipt);
   }
+
+  finishExpiredPreparedRecoveryWithWitness(cutoverId: string, witness: DurableReconciliationWitness): DurableCutoverRecord {
+    const record=this.store.get();
+    if(!record) throw new CutoverStateError("No durable cutover record exists.");
+    if(record.cutoverId!==cutoverId) throw new CutoverStateError(`Cutover id mismatch: active cutover is ${record.cutoverId}.`);
+    if(record.phase==="closed") return record;
+    if(record.phase!=="prepared" || record.drainEvidence || record.restartRequest) {
+      throw new CutoverStateError("Expired prepared recovery requires an untouched prepared cutover with no drain or restart evidence.");
+    }
+    const comparison=compareServerIdentity(record,this.currentIdentity);
+    if(!Object.values(comparison).every(Boolean)) {
+      throw new CutoverStateError("Expired prepared recovery requires an exact replacement runtime identity with a changed serverInstanceId.");
+    }
+    if(!witness.workspaceQueryable || !witness.agentQueryable || !witness.agentReconciled) {
+      throw new CutoverStateError("Expired prepared recovery requires a fully positive durable agent/workspace reconciliation witness.");
+    }
+    const receipt: CutoverReconciliationReceipt={
+      closedByServerInstanceId:this.currentIdentity.serverInstanceId,
+      ...witness,
+      reconciledAt:new Date(this.now()).toISOString(),
+    };
+    return this.store.close(cutoverId,receipt);
+  }
 }
 
 

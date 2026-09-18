@@ -133,6 +133,49 @@ for(const scenario of ["current","expired","close-response","terminal-write","re
     } finally {resumedManager.close();resumedStore.close();}
   } finally {f.close();}
 });
+test("expired coordination-bound prepared cutover can terminally reconcile an exact observed replacement",async()=>{
+  const f=fixture();
+  try {
+    const context={clientId:"shared-oauth",sessionId:"prepared-recovery-controller"};
+    const pairing=f.store.requestPairing(context);
+    const cutover={stateRoot:f.root,attemptKey:"expired-prepared-recovery",
+      currentIdentity:{serverInstanceId:"original",sourceCommit:f.contract.baseRevision,buildId:"old",capabilityManifestSha256:"c".repeat(64)},
+      expectedIdentity:{sourceCommit:"b".repeat(40),buildId:"new",capabilityManifestSha256:"d".repeat(64)},
+      expiresAt:new Date(f.clock()+20000).toISOString(),
+      restart:{buildReady:{verifiedBy:"independent",verifiedAt:new Date(f.clock()).toISOString(),evidence:"exact package digest"},actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"},
+      finish:{workspaceId:"ws_prepared",agentId:"agt_prepared"}};
+    const contract={...f.contract,scope:[f.root],operations:["cutover_start" as const],cutover};
+    const approved=f.store.approveLocal(pairing.pendingId,contract);
+    f.store.redeem(context,pairing.credential);
+    const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
+    const manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    try {
+      f.store.prepareEffect(context,planCutoverStart(f.root,cutover).subject);
+      const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
+      const replacement={serverInstanceId:"replacement",...cutover.expectedIdentity};
+      const witness={workspaceQueryable:true,agentQueryable:true,agentReconciled:true,witnessWorkspaceId:cutover.finish.workspaceId,witnessAgentId:cutover.finish.agentId};
+      let witnessCalls=0;
+      await assert.rejects(manager.finishCutover(id,replacement,cutover.finish,async()=>{witnessCalls++;return witness;},context),/drained generation|prepared recovery/);
+      assert.equal(witnessCalls,0);
+      assert.equal(new CutoverStateStore(f.root).get()?.phase,"prepared");
+      f.advance(70000);
+      f.store.reauthorizeLocal(approved.id,1,new Date(f.clock()+60000).toISOString());
+      await assert.rejects(manager.finishCutover(id,{...replacement,serverInstanceId:cutover.currentIdentity.serverInstanceId},cutover.finish,async()=>{witnessCalls++;return witness;},context),/terminal recovery approval|required|runtime identity mismatch/);
+      assert.equal(witnessCalls,0);
+      const closed=await manager.finishCutover(id,replacement,cutover.finish,async()=>{witnessCalls++;return witness;},context);
+      assert.equal(closed.phase,"closed");
+      assert.equal(witnessCalls,1);
+      assert.equal(closed.drainEvidence,undefined);
+      assert.equal(closed.restartRequest,undefined);
+      const lease=f.store.ownership.get(closed.coordinationBinding!.leaseId)!;
+      assert.equal(lease.operationHandle,undefined);
+      assert.equal(lease.terminalState,"expired_reconciled");
+      assert.equal(manager.store.getByOperationId(start.operationId)?.receipt?.lifecycleTerminal,true);
+      assert.deepEqual(await manager.finishCutover(id,replacement,cutover.finish,async()=>{throw new Error("must not repeat witness");},context),closed);
+    } finally {manager.close();}
+  } finally {f.close();}
+});
+
 test("completion readers remain paired, scoped and independent of candidate base",()=>{
   const selection={goal:"issue62",subject:"delivery",candidate:"b".repeat(40)};
   const readers={readContract:(s:typeof selection)=>({...s}),readEvidence:()=>[]};

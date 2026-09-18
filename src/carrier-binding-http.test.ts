@@ -450,6 +450,24 @@ test("approved cutover credential survives fresh MCP sessions for prepare and st
     assert.equal(replayed.cutover.cutoverId, started.cutover.cutoverId);
     assert.equal(JSON.stringify([started, replayed]).includes(pending.credential), false);
     assert.equal((database.sqlite.prepare("select count(*) as count from durable_operations where kind='cutover_start'").get() as { count: number }).count, 1);
+
+    const finishSession = await connect("cutover-finish-fresh-session");
+    const beforeWrongFinish = snapshot();
+    const wrongFinish = await finishSession.callTool({ name: "cutover_finish", arguments: {
+      cutoverId: started.cutover.cutoverId, workspaceId: contract.cutover!.finish.workspaceId, agentId: contract.cutover!.finish.agentId,
+      carrierCredential: "Y".repeat(43),
+    } });
+    assert.equal(wrongFinish.isError, true);
+    assert.equal(snapshot(), beforeWrongFinish);
+    const correctCredentialFinish = await finishSession.callTool({ name: "cutover_finish", arguments: {
+      cutoverId: started.cutover.cutoverId, workspaceId: contract.cutover!.finish.workspaceId, agentId: contract.cutover!.finish.agentId,
+      carrierCredential: pending.credential,
+    } });
+    assert.equal(correctCredentialFinish.isError, true);
+    assert.match(JSON.stringify(correctCredentialFinish.content), /explicit cutover lifecycle approval required|replacement runtime identity mismatch|serverInstance/i);
+    assert.doesNotMatch(JSON.stringify(correctCredentialFinish.content), /current paired carrier/i);
+    assert.equal(snapshot(), beforeWrongFinish);
+    assert.equal(JSON.stringify(correctCredentialFinish).includes(pending.credential), false);
   } finally {
     for (const client of clients) await client.close().catch(() => {});
     await running.close();
