@@ -3372,6 +3372,84 @@ test("agent_start schema preserves #28 heartbeat and G9/G10 authority capabiliti
   assert.ok(contractProps.coreMutation, "write-capable agent_start must expose the exact durable Core pointer");
   assert.ok(contractProps.idleTimeoutMs);
   assert.match(contractProps.idleTimeoutMs.description, /terminated.*no provider activity/i);
+  assert.ok(contractProps.authorizedToolCeiling, "agent_start must expose the durable tool authority ceiling");
+  assert.deepEqual((contractProps.authorizedToolCeiling.items.enum as string[]).slice().sort(), [
+    "process.execute",
+    "workspace.list",
+    "workspace.mutate",
+    "workspace.read",
+    "workspace.search_paths",
+    "workspace.search_text",
+  ]);
+  assert.ok(contractProps.toolProjectionManifest, "agent_start must expose the derived ToolProjectionManifest");
+  const manifestProps = contractProps.toolProjectionManifest.anyOf?.find((entry: any) => entry.type === "object")?.properties
+    ?? contractProps.toolProjectionManifest.properties;
+  assert.equal(manifestProps.schema.const, "devspace.tool_projection_manifest.v1");
+  assert.equal(manifestProps.namespace.const, "devspace.tool_intent.v1");
+  assert.ok(manifestProps.selectedTools);
+});
+
+test("agent_start MCP transports durable tool authority and projection into the stored execution contract", async (t) => {
+  const context = await fixture(t, { subagents: true });
+  const workspaceId = structuredContent(
+    await callOpen(context.client, context.project, "tool-projection-roundtrip"),
+  ).workspaceId as string;
+
+  const manifest = {
+    schema: "devspace.tool_projection_manifest.v1",
+    namespace: "devspace.tool_intent.v1",
+    identity: { taskId: "task-tool-projection", attemptId: "attempt-tool-projection" },
+    authority: { mode: "OWNER_DIRECT", issuer: "owner" },
+    authorizedToolCeiling: ["workspace.read", "workspace.search_text"],
+    candidateTools: ["workspace.read", "workspace.search_text"],
+    selectedTools: ["workspace.read"],
+    orderingMode: "ORDER_INDEPENDENT",
+  };
+
+  const start = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "transport the bounded tool projection",
+      executionContract: {
+        authorityMode: "OWNER_DIRECT",
+        authorizedToolCeiling: ["workspace.search_text", "workspace.read"],
+        toolProjectionManifest: manifest,
+      },
+    },
+  });
+  assert.equal(start.isError, undefined, responseText(start));
+  const agentId = structuredContent(start).agentId as string;
+  assert.ok(agentId);
+
+  const { LocalAgentStore } = await import("./local-agent-store.js");
+  const store = new LocalAgentStore(context.stateDir);
+  try {
+    const record = store.getById(agentId);
+    assert.ok(record);
+    assert.deepEqual(record.executionContract?.authorizedToolCeiling, [
+      "workspace.read",
+      "workspace.search_text",
+    ]);
+    assert.deepEqual(record.executionContract?.toolProjectionManifest?.selectedTools, ["workspace.read"]);
+    assert.equal(record.executionContract?.toolProjectionManifest?.authority.mode, "OWNER_DIRECT");
+  } finally {
+    store.close();
+  }
+
+  const providerNativeId = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "reject provider-native tool id",
+      executionContract: {
+        authorizedToolCeiling: ["codex.shell"],
+      },
+    },
+  });
+  assert.equal(providerNativeId.isError, true);
 });
 
 test("direct agent selectors reject disabled providers before preflight", async (t) => {

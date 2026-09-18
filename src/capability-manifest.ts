@@ -43,6 +43,16 @@ const REQUIRED_CAPABILITIES = [
     tool: "agent_start",
     fieldPath: "executionContract.capabilityDiscovery",
   },
+  {
+    id: "agent_start.executionContract.authorizedToolCeiling",
+    tool: "agent_start",
+    fieldPath: "executionContract.authorizedToolCeiling",
+  },
+  {
+    id: "agent_start.executionContract.toolProjectionManifest",
+    tool: "agent_start",
+    fieldPath: "executionContract.toolProjectionManifest",
+  },
 ] as const;
 
 function unwrap(schema: SchemaLike | undefined): SchemaLike | undefined {

@@ -33,13 +33,16 @@ export const NEXUS_CANONICAL_REPOSITORY = "James3014/Nexus-new" as const;
 export const TOOL_INTENT_NAMESPACE = "devspace.tool_intent.v1" as const;
 export const TOOL_PROJECTION_MANIFEST_SCHEMA = "devspace.tool_projection_manifest.v1" as const;
 
-export type ToolIntentId =
-  | "workspace.read"
-  | "workspace.search_text"
-  | "workspace.search_paths"
-  | "workspace.list"
-  | "workspace.mutate"
-  | "process.execute";
+export const TOOL_INTENT_IDS = [
+  "workspace.read",
+  "workspace.search_text",
+  "workspace.search_paths",
+  "workspace.list",
+  "workspace.mutate",
+  "process.execute",
+] as const;
+
+export type ToolIntentId = (typeof TOOL_INTENT_IDS)[number];
 
 export type ToolProjectionOrderingMode = "ORDER_INDEPENDENT" | "ORDER_SENSITIVE";
 
@@ -511,14 +514,7 @@ export function validateDispatchIntent(intent: DispatchIntent): void {
   }
 }
 
-const TOOL_INTENT_IDS = new Set<ToolIntentId>([
-  "workspace.read",
-  "workspace.search_text",
-  "workspace.search_paths",
-  "workspace.list",
-  "workspace.mutate",
-  "process.execute",
-]);
+const TOOL_INTENT_ID_SET = new Set<ToolIntentId>(TOOL_INTENT_IDS);
 
 export function normalizeToolIntentSet(value: readonly string[], field = "tool intent set"): ToolIntentId[] {
   if (!Array.isArray(value)) {
@@ -527,7 +523,7 @@ export function normalizeToolIntentSet(value: readonly string[], field = "tool i
   const seen = new Set<string>();
   const normalized: ToolIntentId[] = [];
   for (const raw of value) {
-    if (typeof raw !== "string" || !TOOL_INTENT_IDS.has(raw as ToolIntentId)) {
+    if (typeof raw !== "string" || !TOOL_INTENT_ID_SET.has(raw as ToolIntentId)) {
       throw new ExecutionProtocolError("INVALID_TOOL_PROJECTION_MANIFEST", `${field} contains unknown tool intent: ${String(raw)}`);
     }
     if (seen.has(raw)) {
@@ -545,7 +541,7 @@ function toolIntentOrder(value: unknown, field: string): ToolIntentId[] {
   }
   const seen = new Set<string>();
   return value.map((raw) => {
-    if (typeof raw !== "string" || !TOOL_INTENT_IDS.has(raw as ToolIntentId)) {
+    if (typeof raw !== "string" || !TOOL_INTENT_ID_SET.has(raw as ToolIntentId)) {
       throw new ExecutionProtocolError("INVALID_TOOL_PROJECTION_MANIFEST", `${field} contains unknown tool intent: ${String(raw)}`);
     }
     if (seen.has(raw)) {
