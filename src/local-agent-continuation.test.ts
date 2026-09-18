@@ -529,6 +529,10 @@ test("issue #5: continuation restores live timing during active turns and stabil
     });
     assert.equal(term1Status1.status, "idle");
     assert.equal(term1Status1.idleMs, 0);
+    assert.equal(
+      (manager as any).store.getById(started.agentId).providerContinuityState,
+      "KNOWN_UNVERIFIED",
+    );
     const term1WallMs = term1Status1.wallMs!;
     assert.ok(typeof term1WallMs === "number" && term1WallMs >= 0);
 
@@ -569,6 +573,11 @@ test("issue #5: continuation restores live timing during active turns and stabil
       agentId: started.agentId,
     });
     assert.equal(activeStatus1.status, "starting");
+    assert.equal(
+      (manager as any).store.getById(started.agentId).providerContinuityState,
+      "KNOWN_UNVERIFIED",
+      "A new continuation turn must require fresh same-session evidence.",
+    );
     await new Promise((resolve) => setTimeout(resolve, 25));
     const activeStatus2 = await manager.getAgentStatus({
       workspaceId: "ws_cont_timing",
@@ -594,6 +603,10 @@ test("issue #5: continuation restores live timing during active turns and stabil
     });
     assert.equal(term2Status1.status, "idle");
     assert.equal(term2Status1.idleMs, 0);
+    assert.equal(
+      (manager as any).store.getById(started.agentId).providerContinuityState,
+      "RESUME_VERIFIED",
+    );
     const term2WallMs = term2Status1.wallMs!;
     assert.ok(term2WallMs >= term1WallMs, "Turn 2 terminal wallMs must be >= turn 1 terminal wallMs");
 
@@ -615,6 +628,7 @@ test("issue #5: continuation restores live timing during active turns and stabil
       const reloadedReconcile = await reloaded.reconcileAgent(reconcileInput);
       assert.equal(reloadedReconcile.activity.wallMs, term2WallMs);
       assert.equal(reloadedReconcile.activity.idleMs, 0);
+      assert.equal(reloadedReconcile.providerState, "RESUME_VERIFIED");
     } finally {
       await reloaded.close();
     }
@@ -660,6 +674,7 @@ test("continuation rejects continuation when providerSessionId is missing with R
     record = (manager as any).store.getById(started.agentId);
     assert.equal(record.status, "idle");
     assert.equal(record.providerSessionId, undefined);
+    assert.equal(record.providerContinuityState, "LOST");
 
     // Subsequent continuation MUST fail with REBIND_REQUIRED to prevent silent --new-project conversation
     await assert.rejects(
@@ -721,6 +736,7 @@ test("reconcileAgent reports KNOWN_UNVERIFIED or UNKNOWN rather than projecting 
     });
     assert.equal(postReconcile.agentState, "idle");
     assert.equal(postReconcile.providerState, "KNOWN_UNVERIFIED");
+    assert.equal((manager as any).store.getById(started.agentId).providerContinuityState, "KNOWN_UNVERIFIED");
     assert.notEqual(postReconcile.providerState, postReconcile.agentState);
   } finally {
     await clean();

@@ -30,6 +30,7 @@ import {
 } from "./execution-protocol.js";
 
 export type LocalAgentStatus = "starting" | "running" | "idle" | "error" | "stopped";
+export type ProviderContinuityState = "KNOWN_UNVERIFIED" | "RESUME_VERIFIED" | "LOST" | "UNKNOWN";
 
 /**
  * Durable cross-turn scope lifecycle evidence persisted beside the baseline.
@@ -94,7 +95,7 @@ export interface LocalAgentRecord {
   errorCode?: string;
   errorRetryable?: boolean;
   errorDetails?: AgentProviderFailureDetails;
-  providerContinuityState?: "KNOWN_UNVERIFIED" | "RESUME_VERIFIED" | "LOST" | "UNKNOWN";
+  providerContinuityState?: ProviderContinuityState;
   createdAt: string;
   updatedAt: string;
 }
@@ -209,6 +210,7 @@ interface LocalAgentRow {
   model: string | null;
   effort: string | null;
   provider_session_id: string | null;
+  provider_continuity_state: string | null;
   worker_pid: number | null;
   worker_token: string | null;
   execution_contract: string | null;
@@ -286,6 +288,7 @@ export class LocalAgentStore {
       provider: input.provider,
       model: input.model,
       effort: input.effort,
+      providerContinuityState: "UNKNOWN",
       executionContract: input.executionContract,
       executionGeneration: input.executionGeneration,
       startReplay: input.startReplay,
@@ -318,13 +321,14 @@ export class LocalAgentStore {
           provider,
           model,
           effort,
+          provider_continuity_state,
           execution_contract,
           execution_generation,
           lifecycle_state,
           status,
           created_at,
           updated_at
-        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         record.id,
@@ -334,6 +338,7 @@ export class LocalAgentStore {
         record.provider,
         record.model ?? null,
         record.effort ?? null,
+        record.providerContinuityState,
         serializeStoredExecutionState(record.executionContract, record.startReplay),
         serializeExecutionGenerationBinding(record.executionGeneration),
         record.lifecycleState ? JSON.stringify(record.lifecycleState) : null,
@@ -452,6 +457,13 @@ export class LocalAgentStore {
         ...patch,
         updatedAt: new Date().toISOString(),
       };
+      const providerSessionPatched = Object.prototype.hasOwnProperty.call(patch, "providerSessionId");
+      const updatedProviderContinuityState: ProviderContinuityState = patch.providerContinuityState
+        ?? (providerSessionPatched
+          ? current.providerSessionId && updated.providerSessionId && current.providerSessionId !== updated.providerSessionId
+            ? "LOST"
+            : updated.providerSessionId ? "KNOWN_UNVERIFIED" : "UNKNOWN"
+          : current.providerContinuityState ?? (current.providerSessionId ? "KNOWN_UNVERIFIED" : "UNKNOWN"));
 
       const result = this.database.sqlite.prepare(
         `update local_agent_sessions set
@@ -462,6 +474,7 @@ export class LocalAgentStore {
           model = ?,
           effort = ?,
           provider_session_id = ?,
+          provider_continuity_state = ?,
           worker_pid = ?,
           worker_token = ?,
           execution_contract = ?,
@@ -487,6 +500,7 @@ export class LocalAgentStore {
         updated.model ?? null,
         updated.effort ?? null,
         updated.providerSessionId ?? null,
+        updatedProviderContinuityState,
         updated.workerPid ?? null,
         updated.workerToken ?? null,
         serializeStoredExecutionState(updated.executionContract, updated.startReplay),
@@ -535,6 +549,7 @@ export class LocalAgentStore {
         lifecycle?.activeTurn ||
         lifecycle?.terminationPending ||
         lifecycle?.lifecycleCorrupt ||
+        current.providerContinuityState === "LOST" ||
         (input.expectedUpdatedAt !== undefined && current.updatedAt !== input.expectedUpdatedAt) ||
         (input.expectedPreviousGeneration !== undefined &&
           lifecycle?.lastSettledGeneration !== input.expectedPreviousGeneration)
@@ -555,13 +570,16 @@ export class LocalAgentStore {
         terminationPending: undefined,
         lifecycleCorrupt: undefined,
       };
+      const continuityState: ProviderContinuityState = current.providerSessionId
+        ? "KNOWN_UNVERIFIED"
+        : "UNKNOWN";
       const result = this.database.sqlite.prepare(
         `update local_agent_sessions set
           status = 'starting', latest_response = null, error = null,
           error_code = null, error_retryable = null, terminal_reason = null,
-          worker_pid = null, worker_token = null, lifecycle_state = ?, updated_at = ?
+          provider_continuity_state = ?, worker_pid = null, worker_token = null, lifecycle_state = ?, updated_at = ?
          where id = ? and updated_at = ?`,
-      ).run(JSON.stringify(updatedLifecycle), now, input.agentId, current.updatedAt);
+      ).run(continuityState, JSON.stringify(updatedLifecycle), now, input.agentId, current.updatedAt);
       const refreshed = this.getById(input.agentId) ?? current;
       return { applied: result.changes === 1, previous: current, current: refreshed };
     });
@@ -817,11 +835,22 @@ export class LocalAgentStore {
       ) {
         return { applied: false, previous: current, current };
       }
+      const sessionChanged = current.providerContinuityState === "LOST" || Boolean(
+        current.providerSessionId && current.providerSessionId !== providerSessionId,
+      );
+      const continuityState: ProviderContinuityState = sessionChanged
+        ? "LOST"
+        : lifecycle.lastSettledGeneration && current.providerSessionId === providerSessionId
+          ? "RESUME_VERIFIED"
+          : "KNOWN_UNVERIFIED";
+      const storedProviderSessionId = continuityState === "LOST"
+        ? current.providerSessionId
+        : providerSessionId;
       const now = new Date().toISOString();
       const result = this.database.sqlite.prepare(
-        `update local_agent_sessions set provider_session_id = ?, updated_at = ?
+        `update local_agent_sessions set provider_session_id = ?, provider_continuity_state = ?, updated_at = ?
          where id = ? and worker_token = ? and updated_at = ?`,
-      ).run(providerSessionId, now, id, workerToken, current.updatedAt);
+      ).run(storedProviderSessionId ?? null, continuityState, now, id, workerToken, current.updatedAt);
       const refreshed = this.getById(id) ?? current;
       return { applied: result.changes === 1, previous: current, current: refreshed };
     });
@@ -860,15 +889,40 @@ export class LocalAgentStore {
           ? input.errorDetails
           : input.errorDetails ? JSON.stringify(input.errorDetails) : null;
 
+      const suppliedProviderSessionId = input.providerSessionId;
+      const sessionChanged = Boolean(
+        current.providerSessionId && suppliedProviderSessionId && current.providerSessionId !== suppliedProviderSessionId,
+      );
+      let providerContinuityState: ProviderContinuityState = current.providerContinuityState
+        ?? (current.providerSessionId ? "KNOWN_UNVERIFIED" : "UNKNOWN");
+      let providerSessionId = current.providerSessionId ?? suppliedProviderSessionId;
+      if (providerContinuityState === "LOST" || sessionChanged) {
+        providerContinuityState = "LOST";
+        providerSessionId = current.providerSessionId;
+      } else if (suppliedProviderSessionId) {
+        if (
+          input.status === "idle" &&
+          lifecycle.lastSettledGeneration &&
+          current.providerSessionId === suppliedProviderSessionId
+        ) {
+          providerContinuityState = "RESUME_VERIFIED";
+        } else if (providerContinuityState !== "RESUME_VERIFIED") {
+          providerContinuityState = "KNOWN_UNVERIFIED";
+        }
+      } else if (!providerSessionId && current.provider === "agy") {
+        providerContinuityState = "LOST";
+      }
+
       const now = new Date().toISOString();
       const result = this.database.sqlite.prepare(
-        `update local_agent_sessions set provider_session_id = coalesce(?, provider_session_id),
+        `update local_agent_sessions set provider_session_id = ?, provider_continuity_state = ?,
           status = ?, latest_response = ?, error = ?, error_code = ?, error_retryable = ?, error_details = ?,
           terminal_reason = ?, scope_state = ?,
           worker_pid = null, worker_token = null, lifecycle_state = ?, updated_at = ?
          where id = ? and status = 'running' and worker_token = ? and updated_at = ?`,
       ).run(
-        input.providerSessionId ?? null,
+        providerSessionId ?? null,
+        providerContinuityState,
         input.status,
         input.latestResponse ?? null,
         input.error ?? null,
@@ -1326,6 +1380,7 @@ function rowToLocalAgentRecord(row: LocalAgentRow): LocalAgentRecord {
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
     providerSessionId: row.provider_session_id ?? undefined,
+    providerContinuityState: readProviderContinuityState(row.provider_continuity_state, row.provider_session_id),
     workerPid: row.worker_pid ?? undefined,
     workerToken: row.worker_token ?? undefined,
     executionContract: storedExecution.executionContract,
@@ -1344,6 +1399,21 @@ function rowToLocalAgentRecord(row: LocalAgentRow): LocalAgentRecord {
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function readProviderContinuityState(
+  value: string | null,
+  providerSessionId: string | null,
+): ProviderContinuityState {
+  if (
+    value === "KNOWN_UNVERIFIED" ||
+    value === "RESUME_VERIFIED" ||
+    value === "LOST" ||
+    value === "UNKNOWN"
+  ) {
+    return value;
+  }
+  return providerSessionId ? "KNOWN_UNVERIFIED" : "UNKNOWN";
 }
 
 function readErrorDetails(value: string | null): AgentProviderFailureDetails | undefined {

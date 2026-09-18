@@ -1906,6 +1906,11 @@ export class LocalAgentSessionManager {
           if (!bound.applied) {
             throw new Error(`Agent ${claimed.id} is no longer active under its turn generation.`);
           }
+          if (bound.current?.providerContinuityState === "LOST") {
+            throw new Error(
+              `Provider session identity changed for agent ${claimed.id}; continuity is LOST and explicit rebind is required.`,
+            );
+          }
         },
       };
       let result: LocalAgentRunResult;

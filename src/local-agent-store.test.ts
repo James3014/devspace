@@ -24,6 +24,7 @@ try {
 
   assert.match(created.id, /^agt_[a-f0-9]{8}$/);
   assert.equal(created.status, "starting");
+  assert.equal(created.providerContinuityState, "UNKNOWN");
   assert.equal(store.getById(created.id)?.effort, "high");
   assert.equal(store.getById(created.id)?.profileName, "reviewer");
   assert.equal(store.getById(created.id.slice(0, 7)), undefined);
@@ -42,6 +43,7 @@ try {
   assert.equal(updated.effort, "medium");
   assert.equal(updated.errorCode, "PROVIDER_UNAVAILABLE");
   assert.equal(updated.errorRetryable, false);
+  assert.equal(updated.providerContinuityState, "KNOWN_UNVERIFIED");
   assert.equal(store.getById("thread_123"), undefined);
   const storedError = store.getById(created.id);
   assert.equal(storedError?.error, "Codex executable was not found.");
@@ -77,6 +79,146 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
     error: "provider failed",
   });
   assert.equal(failed.providerSessionId, "omp-session-existing");
+  assert.equal(failed.providerContinuityState, "KNOWN_UNVERIFIED");
+
+  const continuityStateDir = join(root, "provider-continuity-state");
+  let continuityStore = new LocalAgentStore(continuityStateDir);
+  const continuityAgent = continuityStore.create({
+    workspaceId: "ws_continuity",
+    workspaceRoot: join(root, "continuity-project"),
+    profileName: "continuity-worker",
+    provider: "codex",
+    lifecycleKind: "detached_worker_v2",
+  });
+  assert.equal(continuityAgent.providerContinuityState, "UNKNOWN");
+  continuityStore.prepareWorker(continuityAgent.id, "continuity-token-1");
+  const continuityClaim1 = continuityStore.claimWorker(continuityAgent.id, "continuity-token-1", 3001)!;
+  const continuityGeneration1 = continuityClaim1.lifecycleState!.activeTurn!.generation!;
+  const firstIdentity = continuityStore.bindProviderSessionCAS(
+    continuityAgent.id,
+    continuityGeneration1,
+    "continuity-token-1",
+    "provider-session-1",
+  );
+  assert.equal(firstIdentity.applied, true);
+  assert.equal(firstIdentity.current?.providerContinuityState, "KNOWN_UNVERIFIED");
+  assert.equal(continuityStore.finishTurnCAS({
+    agentId: continuityAgent.id,
+    generation: continuityGeneration1,
+    workerToken: "continuity-token-1",
+    status: "idle",
+    terminalReason: "completed",
+  }).applied, true);
+  continuityStore.close();
+
+  continuityStore = new LocalAgentStore(continuityStateDir);
+  const firstReopen = continuityStore.getById(continuityAgent.id)!;
+  assert.equal(firstReopen.providerSessionId, "provider-session-1");
+  assert.equal(firstReopen.providerContinuityState, "KNOWN_UNVERIFIED");
+  const continuation1 = continuityStore.beginContinuationCAS({
+    agentId: continuityAgent.id,
+    expectedPreviousGeneration: firstReopen.lifecycleState?.lastSettledGeneration,
+    expectedUpdatedAt: firstReopen.updatedAt,
+  });
+  assert.equal(continuation1.applied, true);
+  assert.equal(continuation1.current?.providerContinuityState, "KNOWN_UNVERIFIED");
+  const continuityGeneration2 = continuation1.current!.lifecycleState!.activeTurn!.generation!;
+  assert.equal(continuityStore.prepareWorkerCAS(
+    continuityAgent.id,
+    continuityGeneration2,
+    "continuity-token-2",
+  ).applied, true);
+  assert.equal(continuityStore.claimWorkerCAS(
+    continuityAgent.id,
+    continuityGeneration2,
+    "continuity-token-2",
+    3002,
+  ).applied, true);
+  const resumedIdentity = continuityStore.bindProviderSessionCAS(
+    continuityAgent.id,
+    continuityGeneration2,
+    "continuity-token-2",
+    "provider-session-1",
+  );
+  assert.equal(resumedIdentity.applied, true);
+  assert.equal(resumedIdentity.current?.providerContinuityState, "RESUME_VERIFIED");
+  assert.equal(continuityStore.finishTurnCAS({
+    agentId: continuityAgent.id,
+    generation: continuityGeneration2,
+    workerToken: "continuity-token-2",
+    status: "idle",
+    terminalReason: "completed",
+  }).applied, true);
+  continuityStore.close();
+
+  continuityStore = new LocalAgentStore(continuityStateDir);
+  const resumeReopen = continuityStore.getById(continuityAgent.id)!;
+  assert.equal(resumeReopen.providerContinuityState, "RESUME_VERIFIED");
+  const continuation2 = continuityStore.beginContinuationCAS({
+    agentId: continuityAgent.id,
+    expectedPreviousGeneration: resumeReopen.lifecycleState?.lastSettledGeneration,
+    expectedUpdatedAt: resumeReopen.updatedAt,
+  });
+  assert.equal(continuation2.applied, true);
+  assert.equal(continuation2.current?.providerContinuityState, "KNOWN_UNVERIFIED");
+  const continuityGeneration3 = continuation2.current!.lifecycleState!.activeTurn!.generation!;
+  assert.equal(continuityStore.prepareWorkerCAS(
+    continuityAgent.id,
+    continuityGeneration3,
+    "continuity-token-3",
+  ).applied, true);
+  assert.equal(continuityStore.claimWorkerCAS(
+    continuityAgent.id,
+    continuityGeneration3,
+    "continuity-token-3",
+    3003,
+  ).applied, true);
+  const changedIdentity = continuityStore.bindProviderSessionCAS(
+    continuityAgent.id,
+    continuityGeneration3,
+    "continuity-token-3",
+    "provider-session-2",
+  );
+  assert.equal(changedIdentity.applied, true);
+  assert.equal(changedIdentity.current?.providerContinuityState, "LOST");
+  assert.equal(changedIdentity.current?.providerSessionId, "provider-session-1");
+  assert.equal(continuityStore.failTurnCAS({
+    agentId: continuityAgent.id,
+    generation: continuityGeneration3,
+    workerToken: "continuity-token-3",
+    error: "provider session identity changed",
+    terminalReason: "provider_error",
+  }).applied, true);
+  continuityStore.close();
+
+  continuityStore = new LocalAgentStore(continuityStateDir);
+  stores.push(continuityStore);
+  const lostReopen = continuityStore.getById(continuityAgent.id)!;
+  assert.equal(lostReopen.providerContinuityState, "LOST");
+  assert.equal(lostReopen.providerSessionId, "provider-session-1");
+  assert.equal(continuityStore.beginContinuationCAS({
+    agentId: continuityAgent.id,
+    expectedPreviousGeneration: lostReopen.lifecycleState?.lastSettledGeneration,
+    expectedUpdatedAt: lostReopen.updatedAt,
+  }).applied, false);
+
+  const agyWithoutIdentity = continuityStore.create({
+    workspaceId: "ws_continuity",
+    workspaceRoot: join(root, "continuity-project"),
+    profileName: "agy-worker",
+    provider: "agy",
+    lifecycleKind: "detached_worker_v2",
+  });
+  continuityStore.prepareWorker(agyWithoutIdentity.id, "agy-continuity-token");
+  const agyClaim = continuityStore.claimWorker(agyWithoutIdentity.id, "agy-continuity-token", 3004)!;
+  assert.equal(continuityStore.finishTurnCAS({
+    agentId: agyWithoutIdentity.id,
+    generation: agyClaim.lifecycleState!.activeTurn!.generation!,
+    workerToken: "agy-continuity-token",
+    status: "idle",
+    terminalReason: "completed",
+  }).applied, true);
+  assert.equal(continuityStore.getById(agyWithoutIdentity.id)?.providerContinuityState, "LOST");
 
   const fenced = store.create({
     workspaceId: "ws_1",
@@ -327,6 +469,7 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
   assert.equal(legacyRecord?.effort, "high");
   assert.equal(legacyRecord?.errorCode, undefined);
   assert.equal(legacyRecord?.errorRetryable, undefined);
+  assert.equal(legacyRecord?.providerContinuityState, "UNKNOWN");
   const upgradedRecord = upgradedStore.update("agt_legacy", {
     errorCode: "DAEMON_TIMEOUT",
     errorRetryable: true,
