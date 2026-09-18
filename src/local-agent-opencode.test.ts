@@ -566,6 +566,49 @@ assert.deepEqual(opencodePermissionFor("allowed"), {
 });
 const readOnlyPermissions = opencodePermissionFor("read_only");
 assert.equal(typeof readOnlyPermissions === "object" ? readOnlyPermissions.bash : undefined, "deny");
+
+assert.deepEqual(
+  opencodePermissionFor("allowed", ["workspace.read", "workspace.search_text", "process.execute"]),
+  {
+    read: "allow",
+    edit: "deny",
+    glob: "deny",
+    grep: "allow",
+    list: "deny",
+    bash: "allow",
+    task: "deny",
+    external_directory: "deny",
+  },
+  "OpenCode projection must deny every unselected native tool",
+);
+assert.deepEqual(
+  opencodePermissionFor("read_only", ["workspace.mutate", "process.execute", "workspace.list"]),
+  {
+    read: "deny",
+    edit: "deny",
+    glob: "deny",
+    grep: "deny",
+    list: "allow",
+    bash: "deny",
+    task: "deny",
+    external_directory: "deny",
+  },
+  "existing write-mode policy may narrow selected intents but must never widen them",
+);
+assert.deepEqual(
+  opencodeAgentConfig("allowed", ["workspace.search_paths"]).permission,
+  {
+    read: "deny",
+    edit: "deny",
+    glob: "allow",
+    grep: "deny",
+    list: "deny",
+    bash: "deny",
+    task: "deny",
+    external_directory: "deny",
+  },
+);
+
 for (const writeMode of ["read_only", "allowed", "full_access"] as const) {
   const config = opencodeAgentConfig(writeMode);
   assert.equal(config.mode, "primary");
@@ -709,3 +752,45 @@ await defaultOpencodeFactory({ DEVSPACE_OPENCODE_STARTUP_TIMEOUT_MS: "55000" }, 
 assert.equal(capturedHostname, "127.0.0.1");
 assert.equal(capturedPort, 54_322);
 assert.equal(capturedTimeout, 55_000);
+
+let projectedFactoryConfig: unknown;
+const projectedSdkLoader = async () => ({
+  createOpencode: async (options?: { config?: unknown }) => {
+    projectedFactoryConfig = options?.config;
+    return { client, server: { close: () => undefined } };
+  },
+});
+await defaultOpencodeFactory(
+  {},
+  {
+    agentId: "agt_projected",
+    provider: "opencode",
+    workspaceRoot: "/tmp/project",
+    selectedToolIntents: ["workspace.read", "workspace.search_text"],
+  },
+  projectedSdkLoader as any,
+  async () => 54_323,
+);
+assert.deepEqual(projectedFactoryConfig, {
+  agent: {
+    devspace_read_only: opencodeAgentConfig("read_only", ["workspace.read", "workspace.search_text"]),
+    devspace_allowed: opencodeAgentConfig("allowed", ["workspace.read", "workspace.search_text"]),
+    devspace_full_access: opencodeAgentConfig("full_access", ["workspace.read", "workspace.search_text"]),
+  },
+});
+
+{
+  const keyDriver = new OpencodeLocalAgentDriver(factory);
+  const legacyKey = keyDriver.runtimeKey({
+    agentId: "legacy",
+    provider: "opencode",
+    workspaceRoot: "/tmp/project",
+  });
+  const projectedKey = keyDriver.runtimeKey({
+    agentId: "projected",
+    provider: "opencode",
+    workspaceRoot: "/tmp/project",
+    selectedToolIntents: ["workspace.read", "workspace.search_text"],
+  });
+  assert.equal(projectedKey, `${legacyKey}:tools:workspace.read,workspace.search_text`);
+}

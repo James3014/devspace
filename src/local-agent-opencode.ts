@@ -177,8 +177,10 @@ export class OpencodeLocalAgentDriver implements LocalAgentDriver {
 
   private readonly factory: OpencodeFactory;
 
-  runtimeKey(_context: LocalAgentRuntimeContext): string {
-    return `opencode:default:${getOpencodeCatalogGeneration()}`;
+  runtimeKey(context: LocalAgentRuntimeContext): string {
+    const base = `opencode:default:${getOpencodeCatalogGeneration()}`;
+    if (context.selectedToolIntents === undefined) return base;
+    return `${base}:tools:${context.selectedToolIntents.join(",")}`;
   }
 
   async createRuntime(context: LocalAgentRuntimeContext) {
@@ -248,21 +250,24 @@ export async function defaultOpencodeFactory(
     timeout: resolveOpencodeStartupTimeoutMs(env),
     config: {
       agent: {
-        devspace_read_only: opencodeAgentConfig("read_only"),
-        devspace_allowed: opencodeAgentConfig("allowed"),
-        devspace_full_access: opencodeAgentConfig("full_access"),
+        devspace_read_only: opencodeAgentConfig("read_only", _context?.selectedToolIntents),
+        devspace_allowed: opencodeAgentConfig("allowed", _context?.selectedToolIntents),
+        devspace_full_access: opencodeAgentConfig("full_access", _context?.selectedToolIntents),
       },
     },
   });
 }
 
-export function opencodeAgentConfig(writeMode: LocalAgentRunInput["writeMode"]): {
+export function opencodeAgentConfig(
+  writeMode: LocalAgentRunInput["writeMode"],
+  selectedToolIntents?: LocalAgentRunInput["selectedToolIntents"],
+): {
   mode: "primary";
   permission: PermissionConfig;
 } {
   return {
     mode: "primary",
-    permission: opencodePermissionFor(writeMode),
+    permission: opencodePermissionFor(writeMode, selectedToolIntents),
   };
 }
 
@@ -288,16 +293,32 @@ export function opencodeAgentFor(writeMode: LocalAgentRunInput["writeMode"]): st
   }
 }
 
-export function opencodePermissionFor(writeMode: LocalAgentRunInput["writeMode"]): PermissionConfig {
+export function opencodePermissionFor(
+  writeMode: LocalAgentRunInput["writeMode"],
+  selectedToolIntents?: LocalAgentRunInput["selectedToolIntents"],
+): PermissionConfig {
   const allowed = writeMode !== "read_only";
   const unrestricted = writeMode === "full_access";
+  if (selectedToolIntents === undefined) {
+    return {
+      read: "allow",
+      edit: allowed ? "allow" : "deny",
+      glob: "allow",
+      grep: "allow",
+      list: "allow",
+      bash: allowed ? "allow" : "deny",
+      task: "deny",
+      external_directory: unrestricted ? "allow" : "deny",
+    };
+  }
+  const selected = new Set(selectedToolIntents);
   return {
-    read: "allow",
-    edit: allowed ? "allow" : "deny",
-    glob: "allow",
-    grep: "allow",
-    list: "allow",
-    bash: allowed ? "allow" : "deny",
+    read: selected.has("workspace.read") ? "allow" : "deny",
+    edit: allowed && selected.has("workspace.mutate") ? "allow" : "deny",
+    glob: selected.has("workspace.search_paths") ? "allow" : "deny",
+    grep: selected.has("workspace.search_text") ? "allow" : "deny",
+    list: selected.has("workspace.list") ? "allow" : "deny",
+    bash: allowed && selected.has("process.execute") ? "allow" : "deny",
     task: "deny",
     external_directory: unrestricted ? "allow" : "deny",
   };

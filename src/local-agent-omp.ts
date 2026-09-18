@@ -14,6 +14,34 @@ const DEFAULT_OMP_TIMEOUT_MS = 600_000;
 const OMP_WRITE_TOOLS = "read,edit,write,grep,glob,todo";
 const OMP_READ_ONLY_TOOLS = "read,grep,glob,todo";
 
+export function ompToolsForSelection(
+  selectedToolIntents: LocalAgentRunInput["selectedToolIntents"],
+  writeMode: LocalAgentRunInput["writeMode"],
+): string {
+  if (selectedToolIntents === undefined) {
+    return writeMode === "allowed" ? OMP_WRITE_TOOLS : OMP_READ_ONLY_TOOLS;
+  }
+  const native = new Set<string>();
+  for (const intent of selectedToolIntents) {
+    switch (intent) {
+      case "workspace.read": native.add("read"); break;
+      case "workspace.search_text": native.add("grep"); break;
+      case "workspace.search_paths": native.add("glob"); break;
+      case "workspace.mutate":
+        if (writeMode !== "allowed" && writeMode !== "full_access") {
+          throw new Error("OMP cannot expose workspace.mutate while the execution write mode is read-only.");
+        }
+        native.add("edit");
+        native.add("write");
+        break;
+      case "workspace.list":
+      case "process.execute":
+        throw new Error(`OMP cannot enforce selected tool intent '${intent}' on the current --tools surface.`);
+    }
+  }
+  return [...native].sort().join(",");
+}
+
 const OMP_DEVSPACE_CONFIG = `advisor:\n  enabled: false\ntools:\n  approvalMode: write\n  approval:\n    bash: deny\n    ask: deny\n    debug: deny\n    eval: deny\n    github: deny\n    inspect_image: deny\n    browser: deny\n    computer: deny\n    checkpoint: deny\n    rewind: deny\n    security_scan: deny\n    task: deny\n    hub: deny\n    web_search: deny\n    memory_edit: deny\n    retain: deny\n    recall: deny\n    reflect: deny\n    learn: deny\n    manage_skill: deny\nmcp:\n  enableProjectConfig: false\nbrowser:\n  enabled: false\nweb_search:\n  enabled: false\nasync:\n  enabled: false\nprewalk:\n  enabled: false\n`;
 
 export function ompCommandEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
@@ -76,7 +104,7 @@ export function buildOmpAcpArgs(input: LocalAgentRunInput, configPath: string): 
     "--approval-mode",
     "write",
     "--tools",
-    input.writeMode === "allowed" ? OMP_WRITE_TOOLS : OMP_READ_ONLY_TOOLS,
+    ompToolsForSelection(input.selectedToolIntents, input.writeMode),
   ];
   if (input.model) args.push("--model", input.model);
   if (input.effort) args.push("--thinking", input.effort);

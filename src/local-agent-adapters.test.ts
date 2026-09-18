@@ -6,6 +6,7 @@ import {
   AGY_MAX_STDOUT_BYTES,
   createLocalAgentAdapter,
   createLocalAgentDrivers,
+  runLocalAgentProvider,
   extractOpenCodeFinalResponse,
   extractPiFinalResponse,
   extractPiProviderError,
@@ -16,6 +17,7 @@ import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
 import { LocalAgentProviderError } from "./local-agent-runtime.js";
 import { AgentProviderProtocolError } from "./local-agent-errors.js";
+import { buildOmpAcpArgs, ompToolsForSelection } from "./local-agent-omp.js";
 
 const providers: LocalAgentProvider[] = [
   "codex",
@@ -1063,4 +1065,52 @@ try {
   }
   cleanupProviderScratch(agyScratch.root);
   rmSync(tempMockDir, { recursive: true, force: true });
+}
+
+assert.equal(
+  ompToolsForSelection(["workspace.read", "workspace.search_text", "workspace.search_paths"], "read_only"),
+  "glob,grep,read",
+  "OMP projection must contain only selected native read/search tools",
+);
+assert.equal(
+  ompToolsForSelection(["workspace.mutate", "workspace.read"], "allowed"),
+  "edit,read,write",
+  "OMP workspace.mutate maps deterministically to edit+write without legacy todo/default expansion",
+);
+assert.throws(
+  () => ompToolsForSelection(["process.execute"], "allowed"),
+  /cannot enforce selected tool intent 'process\.execute'/,
+);
+assert.throws(
+  () => ompToolsForSelection(["workspace.mutate"], "read_only"),
+  /cannot expose workspace\.mutate while the execution write mode is read-only/,
+);
+{
+  const args = buildOmpAcpArgs({
+    prompt: "bounded",
+    workspaceRoot: "/tmp/project",
+    writeMode: "allowed",
+    selectedToolIntents: ["workspace.read", "workspace.mutate"],
+  }, "/tmp/omp-config.yml");
+  const toolsIndex = args.indexOf("--tools");
+  assert.notEqual(toolsIndex, -1);
+  assert.equal(args[toolsIndex + 1], "edit,read,write");
+  assert.doesNotMatch(args[toolsIndex + 1] ?? "", /todo|grep|glob|bash/);
+}
+
+for (const provider of ["codex", "grok", "agy", "cline"] as const) {
+  await assert.rejects(
+    runLocalAgentProvider(provider, {
+      prompt: "must not run wider",
+      workspaceRoot: "/tmp/project",
+      selectedToolIntents: ["workspace.read"],
+    }),
+    (error: unknown) => {
+      assert.ok(error instanceof AgentProviderProtocolError);
+      assert.equal(error.code, "PROVIDER_PROTOCOL_ERROR");
+      assert.match(error.message, /does not expose a proven per-tool restriction seam/);
+      return true;
+    },
+    `${provider} must fail before semantic execution when ToolProjectionManifest is present`,
+  );
 }

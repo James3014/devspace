@@ -9,6 +9,7 @@ import type {
 } from "@openai/codex-sdk";
 import type { AgentProviderError } from "./local-agent-errors.js";
 import type { ExecutionActivityCapability } from "./local-agent-contract.js";
+import type { ToolIntentId } from "./execution-protocol.js";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
 
 export type LocalAgentWriteMode = "read_only" | "allowed" | "full_access";
@@ -23,6 +24,8 @@ export interface LocalAgentRunInput {
   cliProviderId?: "cline" | "cline-pass";
   modelOverrideRequested?: boolean;
   effortOverrideRequested?: boolean;
+  /** Already-authorized transport-neutral selection derived from the persisted ToolProjectionManifest. */
+  selectedToolIntents?: ToolIntentId[];
   /** Per-turn environment after any configured read-only toolchain bridge. */
   environment?: NodeJS.ProcessEnv;
 }
@@ -59,6 +62,7 @@ export interface LocalAgentRuntimeContext {
   model?: string;
   effort?: string;
   cliProviderId?: "cline" | "cline-pass";
+  selectedToolIntents?: ToolIntentId[];
   agentDir?: string;
 }
 

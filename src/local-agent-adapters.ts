@@ -80,6 +80,15 @@ export async function runLocalAgentProvider(
   input: LocalAgentRunInput,
   callbacks?: LocalAgentRunCallbacks,
 ): Promise<LocalAgentRunResult> {
+  if (input.selectedToolIntents !== undefined && provider !== "omp" && provider !== "opencode") {
+    throw new AgentProviderProtocolError({
+      code: "PROVIDER_PROTOCOL_ERROR",
+      provider,
+      operation: "tool_projection",
+      retryable: false,
+      message: `${provider} does not expose a proven per-tool restriction seam for ToolProjectionManifest; refusing wider provider execution.`,
+    });
+  }
   return createLocalAgentAdapter(provider).run(input, callbacks);
 }
 
@@ -144,6 +153,7 @@ class DriverBackedLocalAgentAdapter implements LocalAgentAdapter {
       model: input.model,
       effort: input.effort,
       cliProviderId: input.cliProviderId,
+      selectedToolIntents: input.selectedToolIntents,
     };
     const created = await this.driver.createRuntime(context);
     if (!created.isOk()) {
