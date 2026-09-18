@@ -74,6 +74,8 @@ export interface ClineModelValidationResult {
   valid: boolean;
   blockerCode?: "EXACT_MODEL_UNAVAILABLE" | "VARIANT_UNAVAILABLE" | "CLINEPASS_ENTITLEMENT_REQUIRED";
   reason?: string;
+  unknown?: boolean;
+  unknownReason?: string;
 }
 
 /**
@@ -88,9 +90,20 @@ export function validateClineModelAndThinking(
   snapshot: ClineCatalogSnapshot | undefined,
 ): ClineModelValidationResult {
   const family = cliProviderId ?? "cline";
-  const exact = snapshot?.entries.filter((entry) => entry.cliProviderId === family && entry.fullName === model) ?? [];
-  if (!snapshot || !isClineCatalogFresh(snapshot) || exact.length !== 1) {
-    return { valid: false, blockerCode: "EXACT_MODEL_UNAVAILABLE", reason: `Cline model '${model ?? ""}' is not established for cliProviderId '${family}'.` };
+  if (!snapshot || !isClineCatalogFresh(snapshot) || snapshot.state === "UNKNOWN") {
+    return {
+      valid: false,
+      unknown: true,
+      unknownReason: `Cline model catalog is unverified/stale (${snapshot?.state ?? "NO_SNAPSHOT"}); exact model availability cannot be proven.`,
+    };
+  }
+  const exact = snapshot.entries.filter((entry) => entry.cliProviderId === family && entry.fullName === model);
+  if (exact.length !== 1) {
+    return {
+      valid: false,
+      blockerCode: "EXACT_MODEL_UNAVAILABLE",
+      reason: `Cline model '${model ?? ""}' is not established for cliProviderId '${family}'.`,
+    };
   }
   const isClinePass = family === "cline-pass";
   const entitlementMissing = exact[0].accountEntitlement === "missing" || (isClinePass && snapshot.runtime.clinePassEntitled === false);

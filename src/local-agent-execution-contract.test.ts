@@ -4167,7 +4167,7 @@ test("ClinePass receipt survives reopen and rejects family/runtime/source drift 
   const previousCommand = process.env.CLINE_COMMAND; process.env.CLINE_COMMAND = clineBin;
   let calls = 0; let launched: any; let runtimeCommand = clineBin;
   const feed = { clinePass: [{ id: "openai/gpt-6-astra", thinkingLevels: ["high"] }], free: [] };
-  const service = new ClineCatalogService({ probeRuntime: async () => ({ command: runtimeCommand, cliProviderId: "cline", version: "1", supportsProviderFlag: true, supportsModelFlag: true, supportedThinking: ["high"] }), fetchCatalog: async () => ({ status: 200, json: async () => feed }) });
+  const service = new ClineCatalogService({ probeRuntime: async () => ({ command: runtimeCommand, cliProviderId: "cline", version: "1", supportsProviderFlag: true, supportsModelFlag: true, supportedThinking: ["high"], thinkingVerified: true }), fetchCatalog: async () => ({ status: 200, json: async () => feed }) });
   const snapshot = await service.refresh(true);
   const source = { acquire: async () => ({ entries: [], fetchedAt: new Date().toISOString(), source: "fallback" as const, generation: "unused", version: "x", freshness: "unknown" as const, runtime: { version: "x", source: "unknown" as const } }), close: () => {} } as any;
   const config = { stateDir, subagents: true, oauth: { scopes: ["devspace"] }, agentMaxConcurrent: 8, toolchains: [] } as any;
@@ -4185,7 +4185,14 @@ test("ClinePass receipt survives reopen and rejects family/runtime/source drift 
     const callsBeforeRejectedCases = calls;
     const runRejected = async (caseContract: any, caseCatalog: any = catalog) => {
       launched = undefined;
-      const rejected = await reopened.startAgent({ workspaceId: "ws_1", workspaceRoot: f.repo, profileName: profile.name, prompt: "reject", profiles: [profile], profileCatalog: caseCatalog, executionContract: caseContract });
+      let rejected: any;
+      try {
+        rejected = await reopened.startAgent({ workspaceId: "ws_1", workspaceRoot: f.repo, profileName: profile.name, prompt: "reject", profiles: [profile], profileCatalog: caseCatalog, executionContract: caseContract });
+      } catch (error: any) {
+        assert.ok(error instanceof AgentSessionError);
+        assert.equal(calls, callsBeforeRejectedCases);
+        return;
+      }
       assert.ok(launched);
       await reopened.runWorkerTurnFromFile(rejected.agentId, launched.promptFile, launched.workerToken);
       assert.equal(calls, callsBeforeRejectedCases);

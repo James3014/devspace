@@ -113,7 +113,9 @@ export type AgentErrorCode =
   | "INVALID_EXECUTION_CONTRACT"
   | "OVERLAPPING_MUTATION_OWNERSHIP"
   | "INVALID_ATTEMPT_KEY"
+  | "ATTEMPT_KEY_REQUIRED"
   | "ATTEMPT_REPLAY_CONFLICT"
+  | "CLINE_CATALOG_UNVERIFIED"
   | "CONTINUATION_ADMISSION_FAILED"
   | "NEXUS_AUTHORITY_REJECTED"
   | "REBIND_REQUIRED";
@@ -685,8 +687,8 @@ export class LocalAgentSessionManager {
       );
       if (!modelValidation.valid) {
         throw new AgentSessionError(
-          modelValidation.blockerCode!,
-          modelValidation.reason!,
+          modelValidation.blockerCode ?? "CLINE_CATALOG_UNVERIFIED",
+          modelValidation.reason ?? modelValidation.unknownReason ?? "Cline model validation failed.",
         );
       }
     }
@@ -1285,13 +1287,17 @@ export class LocalAgentSessionManager {
           input.profileCatalog?.clineCatalog,
         );
         if (!modelValidation.valid) {
-          blockers.push({
-            code: modelValidation.blockerCode!,
-            detail: modelValidation.reason!,
-          });
-        }
-        if (input.profileCatalog?.clineCatalog?.state === "UNKNOWN") {
-          unknowns.push("clineCatalog is UNKNOWN: Cline model catalog is unverified/stale; provider execution cannot be proven READY.");
+          if (modelValidation.unknown) {
+            unknowns.push(
+              modelValidation.unknownReason ??
+              "clineCatalog is UNKNOWN: Cline model catalog is unverified/stale; provider execution cannot be proven READY.",
+            );
+          } else if (modelValidation.blockerCode) {
+            blockers.push({
+              code: modelValidation.blockerCode,
+              detail: modelValidation.reason!,
+            });
+          }
         }
       }
     }

@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import { existsSync, type Stats } from "node:fs";
+import { existsSync, statSync, type Stats } from "node:fs";
 import type {
   WorkspaceConversationBinding,
   WorkspaceMode,
@@ -121,6 +121,7 @@ type DirectoryOps = {
 };
 
 export class WorkspaceRegistry {
+  public instructionDiscoveryCalls = 0;
   private readonly workspaces = new Map<string, Workspace>();
   private readonly pendingCheckoutOpens = new Map<string, Promise<WorkspaceContext>>();
 
@@ -273,6 +274,7 @@ export class WorkspaceRegistry {
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
     let availableAgentsFiles = workspace.availableAgentsFiles;
     if (options?.refresh || !availableAgentsFiles) {
+      this.instructionDiscoveryCalls++;
       availableAgentsFiles = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
       workspace.availableAgentsFiles = availableAgentsFiles;
     } else {
@@ -311,6 +313,41 @@ export class WorkspaceRegistry {
       workspace.availableAgentsFiles.sort((a, b) => a.path.localeCompare(b.path));
     } else if (!exists && existingIndex !== -1) {
       workspace.availableAgentsFiles.splice(existingIndex, 1);
+    }
+  }
+
+  discoverAncestorInstructions(workspace: Workspace, targetPath: string): void {
+    const absTarget = this.resolvePath(workspace, targetPath);
+    const root = resolve(workspace.root);
+    let currentDir = existsSync(absTarget) && statSync(absTarget).isDirectory()
+      ? absTarget
+      : dirname(absTarget);
+
+    if (!workspace.availableAgentsFiles) {
+      workspace.availableAgentsFiles = [];
+    }
+
+    while (currentDir.startsWith(root)) {
+      for (const name of CONTEXT_FILE_NAMES) {
+        const candidate = join(currentDir, name);
+        if (candidate === join(root, name)) continue;
+
+        const exists = existsSync(candidate);
+        const resolvedCandidate = resolve(candidate);
+        const idx = workspace.availableAgentsFiles.findIndex((f) => resolve(f.path) === resolvedCandidate);
+
+        if (exists && idx === -1) {
+          workspace.availableAgentsFiles.push({ path: resolvedCandidate });
+          workspace.availableAgentsFiles.sort((a, b) => a.path.localeCompare(b.path));
+        } else if (!exists && idx !== -1) {
+          workspace.availableAgentsFiles.splice(idx, 1);
+        }
+      }
+
+      if (currentDir === root) break;
+      const parentDir = dirname(currentDir);
+      if (parentDir === currentDir) break;
+      currentDir = parentDir;
     }
   }
 
@@ -502,6 +539,7 @@ export class WorkspaceRegistry {
       markSkillActivated(workspace.activatedSkillDirs, readPath.skillRead.skill);
     }
     this.notifyInstructionFileAccess(workspace, readPath.absolutePath);
+    this.discoverAncestorInstructions(workspace, readPath.absolutePath);
   }
 
   resolveWorkingDirectory(workspace: Workspace, workingDirectory: string | undefined): string {
@@ -568,6 +606,7 @@ export class WorkspaceRegistry {
     });
     this.workspaces.set(workspace.id, workspace);
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
+    this.instructionDiscoveryCalls++;
     const availableAgentsFiles = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
     workspace.availableAgentsFiles = availableAgentsFiles;
 

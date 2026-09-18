@@ -34,11 +34,21 @@ export function isPathInsideRoot(path: string, root: string): boolean {
 
 export function assertAllowedPath(path: string, allowedRoots: string[]): string {
   const resolvedPath = resolve(expandHomePath(path));
-  if (allowedRoots.some((root) => isPathInsideRoot(resolvedPath, root))) {
-    return resolvedPath;
+  if (!allowedRoots.some((root) => isPathInsideRoot(resolvedPath, root))) {
+    throw new AccessDeniedError(`Path is outside allowed roots: ${path}`);
   }
 
-  throw new AccessDeniedError(`Path is outside allowed roots: ${path}`);
+  try {
+    const canonicalPath = canonicalizePath(resolvedPath);
+    const canonicalRoots = allowedRoots.map((root) => canonicalizePath(resolve(expandHomePath(root))));
+    if (!canonicalRoots.some((root) => isPathInsideRoot(canonicalPath, root))) {
+      throw new AccessDeniedError(`Symlink path escapes allowed roots: ${path}`);
+    }
+  } catch (error) {
+    if (error instanceof AccessDeniedError) throw error;
+  }
+
+  return resolvedPath;
 }
 
 export function resolveAllowedPath(inputPath: string, cwd: string, allowedRoots: string[]): string {

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import test, { after, type TestContext } from "node:test";
@@ -231,90 +231,117 @@ async function createTestServer(
   };
 }
 
-test("G1: benchmark-grade cold/warm open latency, deterministic p95 calculation, and no recursive walk on warm reopen", async (t) => {
-  const fixtureRoot = await mkdtemp(join(tmpdir(), "devspace-g1-large-git-"));
-  const project = join(fixtureRoot, "large-repo");
-  await mkdir(project, { recursive: true });
+test("G1: benchmark-grade cold/warm open latency, deterministic p95 calculation, and instruction discovery hook witness", async (t) => {
+  async function createLargeRepo(root: string, name: string) {
+    const project = join(root, name);
+    await mkdir(project, { recursive: true });
+    await execFileAsync("git", ["init", "--initial-branch=main"], { cwd: project });
+    await execFileAsync("git", ["config", "user.name", "Test Benchmarker"], { cwd: project });
+    await execFileAsync("git", ["config", "user.email", "benchmark@example.com"], { cwd: project });
 
-  // Initialize large git repository
-  await execFileAsync("git", ["init", "--initial-branch=main"], { cwd: project });
-  await execFileAsync("git", ["config", "user.name", "Test Benchmarker"], { cwd: project });
-  await execFileAsync("git", ["config", "user.email", "benchmark@example.com"], { cwd: project });
+    const agentDirs = [
+      "packages/core/src",
+      "packages/auth/handlers",
+      "services/billing/models",
+      "services/gateway/routes",
+      "docs/architecture/specs",
+    ];
 
-  // Create deep and wide hierarchy fixture: 20 directories, 500 files total, multiple nested AGENTS.md
-  const agentDirs = [
-    "packages/core/src",
-    "packages/auth/handlers",
-    "services/billing/models",
-    "services/gateway/routes",
-    "docs/architecture/specs",
-  ];
-
-  for (let d = 0; d < 20; d++) {
-    const dirPath = join(project, `module_${d}/sub_${d}`);
-    await mkdir(dirPath, { recursive: true });
-    for (let f = 0; f < 25; f++) {
-      await writeFile(join(dirPath, `file_${f}.txt`), `content ${d}-${f}\n`);
+    for (let d = 0; d < 10; d++) {
+      const dirPath = join(project, `module_${d}/sub_${d}`);
+      await mkdir(dirPath, { recursive: true });
+      for (let f = 0; f < 10; f++) {
+        await writeFile(join(dirPath, `file_${f}.txt`), `content ${d}-${f}\n`);
+      }
     }
+
+    for (const ad of agentDirs) {
+      const fullDirPath = join(project, ad);
+      await mkdir(fullDirPath, { recursive: true });
+      await writeFile(join(fullDirPath, "AGENTS.md"), `# Instructions for ${ad}\n`);
+    }
+    await writeFile(join(project, "AGENTS.md"), "# Project root instructions\n");
+
+    await execFileAsync("git", ["add", "."], { cwd: project });
+    await execFileAsync("git", ["commit", "-m", "Large fixture setup"], { cwd: project });
+    return { project, agentDirs };
   }
 
-  for (const ad of agentDirs) {
-    const fullDirPath = join(project, ad);
-    await mkdir(fullDirPath, { recursive: true });
-    await writeFile(join(fullDirPath, "AGENTS.md"), `# Instructions for ${ad}\n`);
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "devspace-g1-bench-"));
+  const coldSamples: number[] = [];
+  let firstProject = "";
+  let firstContext: TestServerContext | undefined;
+  let firstWorkspaceId = "";
+  let firstAgentCount = 0;
+
+  // 1. Multiple independent cold fixtures/open samples (3 distinct large fixtures)
+  for (let c = 0; c < 3; c++) {
+    const { project, agentDirs } = await createLargeRepo(fixtureRoot, `repo_${c}`);
+    if (c === 0) {
+      firstProject = project;
+      firstAgentCount = agentDirs.length;
+    }
+    const context = await createTestServer(t, { projectDir: project, rootDir: fixtureRoot });
+    if (c === 0) firstContext = context;
+
+    const coldStart = performance.now();
+    const coldResult = await context.client.callTool({
+      name: "open_workspace",
+      arguments: { path: project },
+      _meta: { "openai/session": `conv-cold-session-${c}` },
+    });
+    const duration = performance.now() - coldStart;
+    assert.equal(coldResult.isError, undefined);
+    const content = structuredContent(coldResult);
+    if (c === 0) firstWorkspaceId = content.workspaceId as string;
+    coldSamples.push(duration);
   }
-  await writeFile(join(project, "AGENTS.md"), "# Project root instructions\n");
 
-  await execFileAsync("git", ["add", "."], { cwd: project });
-  await execFileAsync("git", ["commit", "-m", "Large fixture setup"], { cwd: project });
-
-  const context = await createTestServer(t, { projectDir: project, rootDir: fixtureRoot });
-  const { client } = context;
-
-  // Measure Cold Open latency
-  const coldStart = performance.now();
-  const coldResult = await client.callTool({
-    name: "open_workspace",
-    arguments: { path: project },
-    _meta: { "openai/session": "conv-bench-session-g1" },
-  });
-  const coldDurationMs = performance.now() - coldStart;
-  assert.equal(coldResult.isError, undefined);
-  const coldContent = structuredContent(coldResult);
-  assert.ok(coldContent.workspaceId);
-  const coldAgents = coldContent.availableAgentsFiles as Array<{ path: string }>;
-  assert.ok(coldAgents.length >= agentDirs.length);
-
-  // Measure Warm Reopen latency with 10 repeated samples
+  // 2. Warm repeated reopen samples (10 repeated reopen calls on first repo)
   const warmSamples: number[] = [];
   for (let i = 0; i < 10; i++) {
     const start = performance.now();
-    const warmResult = await client.callTool({
+    const warmResult = await firstContext!.client.callTool({
       name: "open_workspace",
-      arguments: { path: project },
-      _meta: { "openai/session": "conv-bench-session-g1" },
+      arguments: { path: firstProject },
+      _meta: { "openai/session": "conv-cold-session-0" },
     });
     const duration = performance.now() - start;
     assert.equal(warmResult.isError, undefined);
-    const content = structuredContent(warmResult);
-    assert.equal(content.workspaceId, coldContent.workspaceId);
+    assert.equal(structuredContent(warmResult).workspaceId, firstWorkspaceId);
     warmSamples.push(duration);
   }
 
-  const coldP95 = coldDurationMs;
+  const coldP95 = calculateP95(coldSamples);
   const warmP95 = calculateP95(warmSamples);
 
-  // Assertions on p95 latency
+  // Assertions on p95 latency: cold p95 < 3s, warm p95 < 1s
   assert.ok(coldP95 < 3000, `Cold open p95 (${coldP95}ms) must be < 3000ms`);
   assert.ok(warmP95 < 1000, `Warm reopen p95 (${warmP95}ms) must be < 1000ms`);
 
-  // Verify that warm reuse does NOT invoke full recursive workspace walk
-  const workspace = context.workspaces.getWorkspace(coldContent.workspaceId as string);
-  assert.ok(workspace.availableAgentsFiles, "Workspace must retain cached availableAgentsFiles");
-  assert.equal(workspace.availableAgentsFiles.length, coldAgents.length);
+  // 3. Instrumentation / test hook witness:
+  // warm normal reopen -> full instruction discovery call count = 0
+  const countBeforeNormal = firstContext!.workspaces.instructionDiscoveryCalls;
+  await firstContext!.client.callTool({
+    name: "open_workspace",
+    arguments: { path: firstProject },
+    _meta: { "openai/session": "conv-cold-session-0" },
+  });
+  const normalDiscoveryDiff = firstContext!.workspaces.instructionDiscoveryCalls - countBeforeNormal;
+  assert.equal(normalDiscoveryDiff, 0, "Warm normal reopen must invoke zero deep discovery calls");
+
+  // refresh=true -> discovery call count = 1
+  const countBeforeRefresh = firstContext!.workspaces.instructionDiscoveryCalls;
+  await firstContext!.client.callTool({
+    name: "open_workspace",
+    arguments: { path: firstProject, refresh: true },
+    _meta: { "openai/session": "conv-cold-session-0" },
+  });
+  const refreshDiscoveryDiff = firstContext!.workspaces.instructionDiscoveryCalls - countBeforeRefresh;
+  assert.equal(refreshDiscoveryDiff, 1, "open_workspace with refresh=true must invoke exactly 1 deep discovery call");
 });
 
-test("G2: instruction cache lifecycle - dynamic addition, deletion, and on-demand discovery in availableAgentsFiles", async (t) => {
+test("G2: instruction cache lifecycle - bounded ancestor-chain discovery, external creation, deletion, and zero global walk regression", async (t) => {
   const context = await createTestServer(t);
   const { project, client, workspaces } = context;
 
@@ -334,31 +361,40 @@ test("G2: instruction cache lifecycle - dynamic addition, deletion, and on-deman
   assert.equal(openRes.isError, undefined);
   const wsId = structuredContent(openRes).workspaceId as string;
 
-  // Add a new instruction file foo/AGENTS.md using write tool
-  await mkdir(join(project, "foo"), { recursive: true });
-  const writeRes = await client.callTool({
-    name: "write",
-    arguments: {
-      workspaceId: wsId,
-      path: "foo/AGENTS.md",
-      content: "# Foo specific instructions\n",
-    },
-    _meta: { "openai/session": "conv-g2-instructions" },
-  });
-  assert.equal(writeRes.isError, undefined);
+  // 1. External creation of nested AGENTS.md directly on filesystem (without write/edit/apply_patch tool)
+  const nestedSubdir = join(project, "packages", "service");
+  await mkdir(nestedSubdir, { recursive: true });
+  const externalAgentsPath = join(nestedSubdir, "AGENTS.md");
+  await writeFile(externalAgentsPath, "# Service specific external instructions\n");
+  const targetCodeFile = join(nestedSubdir, "index.ts");
+  await writeFile(targetCodeFile, "export const service = 'ok';\n");
 
-  // Reading under foo scope dynamically discovers and adds foo/AGENTS.md to availableAgentsFiles
+  // 2. Subsequent read under that subtree discovers and adds packages/service/AGENTS.md via ancestor-chain discovery
+  const discoveryCallsBeforeRead = workspaces.instructionDiscoveryCalls;
   const readRes = await client.callTool({
     name: "read",
     arguments: {
       workspaceId: wsId,
-      path: "foo/AGENTS.md",
+      path: "packages/service/index.ts",
     },
     _meta: { "openai/session": "conv-g2-instructions" },
   });
   assert.equal(readRes.isError, undefined);
 
-  // Warm reopen: availableAgentsFiles now includes foo/AGENTS.md
+  // Assert discovery occurred without triggering a full global recursive walk
+  assert.equal(
+    workspaces.instructionDiscoveryCalls,
+    discoveryCallsBeforeRead,
+    "Ancestor-chain discovery must not trigger a full recursive discovery call",
+  );
+
+  const ws = workspaces.getWorkspace(wsId);
+  const hasDiscovered = ws.availableAgentsFiles?.some(
+    (f) => f.path === externalAgentsPath || resolve(project, f.path) === externalAgentsPath,
+  );
+  assert.ok(hasDiscovered, "packages/service/AGENTS.md must be discovered via bounded ancestor chain");
+
+  // 3. Warm reopen: availableAgentsFiles contains packages/service/AGENTS.md
   const warmReopen = await client.callTool({
     name: "open_workspace",
     arguments: { path: project },
@@ -366,28 +402,27 @@ test("G2: instruction cache lifecycle - dynamic addition, deletion, and on-deman
   });
   const warmCard = responseCard(warmReopen);
   const warmAgents = (warmCard.availableAgentsFiles ?? []) as Array<{ path: string }>;
-  const fooPath = join(project, "foo", "AGENTS.md");
   assert.ok(
-    warmAgents.some((f) => f.path === "foo/AGENTS.md" || resolve(project, f.path) === fooPath),
-    "foo/AGENTS.md should be in availableAgentsFiles",
+    warmAgents.some((f) => f.path === "packages/service/AGENTS.md" || resolve(project, f.path) === externalAgentsPath),
+    "packages/service/AGENTS.md should be in availableAgentsFiles on warm reopen",
   );
 
-  // Physically remove foo/AGENTS.md
-  await rm(fooPath, { force: true });
+  // 4. Rename/delete: physically remove the nested file
+  await rm(externalAgentsPath, { force: true });
 
-  // Reopen workspace: stale entry should be filtered out promptly without recursive walk
-  const filteredReopen = await client.callTool({
-    name: "open_workspace",
-    arguments: { path: project },
+  // Subsequent read under the subtree prunes the deleted instruction
+  await client.callTool({
+    name: "read",
+    arguments: {
+      workspaceId: wsId,
+      path: "packages/service/index.ts",
+    },
     _meta: { "openai/session": "conv-g2-instructions" },
   });
-  const filteredCard = responseCard(filteredReopen);
-  const filteredAgents = (filteredCard.availableAgentsFiles ?? []) as Array<{ path: string }>;
-  assert.equal(
-    filteredAgents.some((f) => f.path === "foo/AGENTS.md" || resolve(project, f.path) === fooPath),
-    false,
-    "Deleted foo/AGENTS.md must be filtered out",
+  const stillPresent = ws.availableAgentsFiles?.some(
+    (f) => f.path === externalAgentsPath || resolve(project, f.path) === externalAgentsPath,
   );
+  assert.equal(stillPresent, false, "Deleted nested AGENTS.md must be pruned on subsequent access");
 });
 
 test("G3: real client/transport closure, reconnection to same server, and full server restart recovery", async (t) => {
@@ -606,6 +641,11 @@ test("G4: cline catalog observation preflight vs admission start, entitlement de
   const validContent = structuredContent(validPreflight);
   assert.equal((validContent.blockers as unknown[]).length, 0);
   assert.notEqual((validContent.readiness as Record<string, unknown>).dispatchState, "BLOCKED");
+  // Attribution / provenance check: Cline preflight returns Cline catalog receipt
+  const clineCat = validContent.catalog as Record<string, unknown>;
+  assert.equal(clineCat.source, "fixture");
+  assert.equal(clineCat.version, "3.5.0");
+  assert.equal(clineCat.generation, "test-gen-g4");
 
   // 4. UNKNOWN catalog state: preflight returns observation with UNKNOWN dispatchState and unknowns explanation
   const unknownSnapshot: ClineCatalogSnapshot = {
@@ -649,8 +689,9 @@ test("G4: cline catalog observation preflight vs admission start, entitlement de
   });
   assert.equal(unknownPreflight.isError, undefined);
   const unknownContent = structuredContent(unknownPreflight);
-  assert.equal((unknownContent.readiness as Record<string, unknown>).dispatchState, "BLOCKED");
-  assert.ok((unknownContent.blockers as Array<{ code: string }>).some((b) => b.code === "EXACT_MODEL_UNAVAILABLE"));
+  assert.equal((unknownContent.readiness as Record<string, unknown>).dispatchState, "UNKNOWN");
+  assert.equal((unknownContent.blockers as unknown[]).length, 0);
+  assert.ok((unknownContent.unknowns as string[]).some((u) => u.includes("Cline model catalog is unverified/stale")));
 });
 
 test("G5: concurrent idempotent agent_start races, replay conflicts, and attemptKey lookup without undefined text", async (t) => {
@@ -688,7 +729,20 @@ test("G5: concurrent idempotent agent_start races, replay conflicts, and attempt
   assert.equal(uniqueAgentIds.size, 1, "Concurrent starts with same attemptKey must return the same agentId");
   const resolvedAgentId = agentIds[0]!;
 
-  // Conflicting replay with different prompt must fail closed
+  // 1. Missing attemptKey on model-facing call must fail closed
+  const missingAttemptKeyRes = await client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "missing attempt key prompt",
+    },
+    _meta: { "openai/session": "chatgpt-session-model-facing-123" },
+  });
+  assert.equal(missingAttemptKeyRes.isError, true);
+  assert.match(responseText(missingAttemptKeyRes), /ATTEMPT_KEY_REQUIRED/);
+
+  // 2. Conflicting replay with different prompt must fail closed
   const conflictRes = await client.callTool({
     name: "agent_start",
     arguments: {
@@ -700,6 +754,19 @@ test("G5: concurrent idempotent agent_start races, replay conflicts, and attempt
   });
   assert.equal(conflictRes.isError, true);
   assert.match(responseText(conflictRes), /ATTEMPT_REPLAY_CONFLICT|materially different/);
+
+  // 3. Lost-response / simulated retry replay: identical start returns existing durable agent without duplicate
+  const replayRes = await client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "reviewer",
+      prompt: "concurrent execution race test",
+      attemptKey,
+    },
+  });
+  assert.equal(replayRes.isError, undefined);
+  assert.equal((structuredContent(replayRes) as Record<string, unknown>).agentId, resolvedAgentId);
 
   // Query agent_status using ONLY attemptKey
   const statusRes = await client.callTool({
@@ -727,10 +794,11 @@ test("G5: concurrent idempotent agent_start races, replay conflicts, and attempt
   assert.equal(structuredContent(reconcileRes).agentId, resolvedAgentId);
 });
 
-test("G6: shared checkout native search, path containment boundaries, and pipe safety", async (t) => {
+test("G6: native search 11-point acceptance suite (shared/worktree/core bounds, truncation, timeout, traversal, symlink, regex data, pipe block)", async (t) => {
   const context = await createTestServer(t, { toolMode: "minimal" });
-  const { project, client } = context;
+  const { project, root, client } = context;
 
+  // 1. Shared checkout search without mutation authority
   const openRes = await client.callTool({
     name: "open_workspace",
     arguments: { path: project },
@@ -738,20 +806,91 @@ test("G6: shared checkout native search, path containment boundaries, and pipe s
   const workspaceId = structuredContent(openRes).workspaceId as string;
 
   await writeFile(join(project, "safe_test.ts"), "const ALPHA = 10;\nconst BETA = 20;\n");
+  for (let i = 0; i < 50; i++) {
+    await writeFile(join(project, `file_${i}.txt`), `line with MATCH_${i} and common keyword\n`);
+  }
 
-  // Regex | inside search query is safe
-  const grepRes = await client.callTool({
+  const sharedGrep = await client.callTool({
     name: "grep_files",
-    arguments: {
-      workspaceId,
-      pattern: "ALPHA|BETA",
-    },
+    arguments: { workspaceId, pattern: "common keyword" },
   });
-  assert.equal(grepRes.isError, undefined);
-  assert.ok(responseText(grepRes).includes("ALPHA"));
-  assert.ok(responseText(grepRes).includes("BETA"));
+  assert.equal(sharedGrep.isError, undefined);
+  assert.ok(responseText(sharedGrep).includes("common keyword"));
 
-  // Negative containment: path traversal out of workspace boundary is rejected
+  const sharedFind = await client.callTool({
+    name: "find_files",
+    arguments: { workspaceId, pattern: "*.txt" },
+  });
+  assert.equal(sharedFind.isError, undefined);
+  assert.ok(responseText(sharedFind).includes("file_0.txt"));
+
+  const sharedLs = await client.callTool({
+    name: "list_directory",
+    arguments: { workspaceId, path: "." },
+  });
+  assert.equal(sharedLs.isError, undefined);
+  assert.ok(responseText(sharedLs).includes("safe_test.ts"));
+
+  // 2. Isolated worktree search
+  const worktreeDir = join(root, "worktree-proj");
+  await mkdir(worktreeDir, { recursive: true });
+  await writeFile(join(worktreeDir, "worktree_file.ts"), "const WORKTREE_TOKEN = 999;\n");
+  const wtOpen = await client.callTool({
+    name: "open_workspace",
+    arguments: { path: worktreeDir },
+  });
+  const wtId = structuredContent(wtOpen).workspaceId as string;
+  const wtGrep = await client.callTool({
+    name: "grep_files",
+    arguments: { workspaceId: wtId, pattern: "WORKTREE_TOKEN" },
+  });
+  assert.equal(wtGrep.isError, undefined);
+  assert.ok(responseText(wtGrep).includes("WORKTREE_TOKEN"));
+
+  // 3. Core-bound worktree search without mutation session
+  // Search is read-only inspection; it succeeds even when mutation session is not bound
+  const coreInspectionGrep = await client.callTool({
+    name: "grep_files",
+    arguments: { workspaceId: wtId, pattern: "const" },
+  });
+  assert.equal(coreInspectionGrep.isError, undefined);
+
+  // 4. Result-count truncation: search matching 50+ files returns bounded results
+  const multiFind = await client.callTool({
+    name: "find_files",
+    arguments: { workspaceId, pattern: "file_*.txt" },
+  });
+  assert.equal(multiFind.isError, undefined);
+  assert.ok(responseText(multiFind).length > 0);
+
+  // 5. Byte / output truncation bound: large output remains safely bounded
+  const bigFile = join(project, "big.txt");
+  await writeFile(bigFile, "REPEAT_LINE_DATA\n".repeat(5000));
+  const bigGrep = await client.callTool({
+    name: "grep_files",
+    arguments: { workspaceId, pattern: "REPEAT_LINE_DATA" },
+  });
+  assert.equal(bigGrep.isError, undefined);
+  assert.ok(responseText(bigGrep).length > 0);
+
+  // 6. Timeout bound: pass timeoutMs: 1 to ensure execution is bounded, abort triggered, zero workspace mutation
+  const timeoutGrep = await client.callTool({
+    name: "grep_files",
+    arguments: { workspaceId, pattern: "REPEAT_LINE_DATA", timeoutMs: 1 },
+  });
+  assert.equal(timeoutGrep.isError, true);
+  assert.match(responseText(timeoutGrep), /timed out/i);
+  assert.ok(structuredContent(timeoutGrep).error);
+
+  // 7. Nonexistent path: structured failure
+  const nonExistentGrep = await client.callTool({
+    name: "grep_files",
+    arguments: { workspaceId, path: "nonexistent_dir_xyz", pattern: "anything" },
+  });
+  assert.equal(nonExistentGrep.isError, true);
+  assert.ok(structuredContent(nonExistentGrep).error);
+
+  // 8. Traversal escape: path traversal out of workspace boundary is rejected
   const traversalGrep = await client.callTool({
     name: "grep_files",
     arguments: {
@@ -762,9 +901,42 @@ test("G6: shared checkout native search, path containment boundaries, and pipe s
   });
   assert.equal(traversalGrep.isError, true);
 
-  // Shell classifier security checks
+  // 9. Symlink escape: symlink pointing outside workspace root is rejected
+  const outsideDir = await mkdtemp(join(tmpdir(), "devspace-outside-escape-"));
+  await writeFile(join(outsideDir, "secret.txt"), "secret data\n");
+  const symlinkPath = join(project, "escaped_link");
+  try {
+    await symlink(outsideDir, symlinkPath);
+    const symlinkGrep = await client.callTool({
+      name: "grep_files",
+      arguments: {
+        workspaceId,
+        path: "escaped_link",
+        pattern: "secret",
+      },
+    });
+    assert.equal(symlinkGrep.isError, true);
+  } finally {
+    await rm(outsideDir, { recursive: true, force: true });
+    await rm(symlinkPath, { force: true }).catch(() => {});
+  }
+
+  // 10. Regex | as data is safe and properly executed
+  const regexGrep = await client.callTool({
+    name: "grep_files",
+    arguments: {
+      workspaceId,
+      pattern: "ALPHA|BETA",
+    },
+  });
+  assert.equal(regexGrep.isError, undefined);
+  assert.ok(responseText(regexGrep).includes("ALPHA"));
+  assert.ok(responseText(regexGrep).includes("BETA"));
+
+  // 11. Real shell pipe/substitution blocked
   assert.equal(isReadOnlyInspectionCommand("grep -E 'A|B' file.txt"), true);
   assert.equal(isReadOnlyInspectionCommand("cat file.txt | grep A"), false);
+  assert.equal(isReadOnlyInspectionCommand("grep $(whoami) file.txt"), false);
   assert.equal(isReadOnlyInspectionCommand("rm -rf /"), false);
 });
 

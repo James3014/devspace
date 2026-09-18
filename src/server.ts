@@ -2714,7 +2714,7 @@ function assertDirectClineCatalogSelection(
     selectedProfile.effort,
     catalog.clineCatalog,
   );
-  if (!validation.valid) throw new AgentSessionError(validation.blockerCode ?? "EXACT_MODEL_UNAVAILABLE", validation.reason ?? "Cline selection is unavailable.");
+  if (!validation.valid) throw new AgentSessionError(validation.blockerCode ?? "CLINE_CATALOG_UNVERIFIED", validation.reason ?? validation.unknownReason ?? "Cline selection is unavailable.");
 }
 
 export const candidateIntegrateOutputSchema = z.object({
@@ -4087,19 +4087,20 @@ export function createMcpServer(
           "Optional path or glob scope relative to the workspace root.",
         ),
       include: z.string().optional().describe("Optional include glob."),
+      timeoutMs: z.number().int().positive().optional().describe("Optional bounded timeout in milliseconds."),
     },
     outputSchema: resultOutputSchema(),
     ...toolWidgetDescriptorMeta(config, "search"),
     annotations: { readOnlyHint: true },
   };
-  const grepHandler = async ({ workspaceId, ...input }: { workspaceId: string; pattern: string; path?: string; include?: string }) => {
+  const grepHandler = async ({ workspaceId, ...input }: { workspaceId: string; pattern: string; path?: string; include?: string; timeoutMs?: number }) => {
     const startedAt = performance.now();
     const workspace = workspaces.getWorkspace(workspaceId);
     if (input.path) workspaces.resolvePath(workspace, input.path);
     const response = await grepFilesTool(input, {
       cwd: workspace.root,
       root: workspace.root,
-    });
+    }, { timeoutMs: input.timeoutMs });
 
     if (response.isError) {
       logFailedToolResponse(config, {
@@ -4107,7 +4108,12 @@ export function createMcpServer(
         workspaceId,
         path: input.path,
       }, response.content, startedAt);
-      return response;
+      return {
+        ...response,
+        structuredContent: {
+          error: contentText(response.content),
+        },
+      };
     }
 
     const summary = {
@@ -4156,19 +4162,20 @@ export function createMcpServer(
         .string()
         .optional()
         .describe("Optional path scope relative to the workspace root."),
+      timeoutMs: z.number().int().positive().optional().describe("Optional bounded timeout in milliseconds."),
     },
     outputSchema: resultOutputSchema(),
     ...toolWidgetDescriptorMeta(config, "search"),
     annotations: { readOnlyHint: true },
   };
-  const globHandler = async ({ workspaceId, ...input }: { workspaceId: string; pattern: string; path?: string }) => {
+  const globHandler = async ({ workspaceId, ...input }: { workspaceId: string; pattern: string; path?: string; timeoutMs?: number }) => {
     const startedAt = performance.now();
     const workspace = workspaces.getWorkspace(workspaceId);
     if (input.path) workspaces.resolvePath(workspace, input.path);
     const response = await findFilesTool(input, {
       cwd: workspace.root,
       root: workspace.root,
-    });
+    }, { timeoutMs: input.timeoutMs });
 
     if (response.isError) {
       logFailedToolResponse(config, {
@@ -4176,7 +4183,12 @@ export function createMcpServer(
         workspaceId,
         path: input.path,
       }, response.content, startedAt);
-      return response;
+      return {
+        ...response,
+        structuredContent: {
+          error: contentText(response.content),
+        },
+      };
     }
 
     const summary = {
@@ -4225,19 +4237,20 @@ export function createMcpServer(
         .describe(
           "Directory path to list, relative to the workspace root.",
         ),
+      timeoutMs: z.number().int().positive().optional().describe("Optional bounded timeout in milliseconds."),
     },
     outputSchema: resultOutputSchema(),
     ...toolWidgetDescriptorMeta(config, "directory"),
     annotations: { readOnlyHint: true },
   };
-  const lsHandler = async ({ workspaceId, ...input }: { workspaceId: string; path: string }) => {
+  const lsHandler = async ({ workspaceId, ...input }: { workspaceId: string; path: string; timeoutMs?: number }) => {
     const startedAt = performance.now();
     const workspace = workspaces.getWorkspace(workspaceId);
     workspaces.resolvePath(workspace, input.path);
     const response = await listDirectoryTool(input, {
       cwd: workspace.root,
       root: workspace.root,
-    });
+    }, { timeoutMs: input.timeoutMs });
 
     if (response.isError) {
       logFailedToolResponse(config, {
@@ -4245,7 +4258,12 @@ export function createMcpServer(
         workspaceId,
         path: input.path,
       }, response.content, startedAt);
-      return response;
+      return {
+        ...response,
+        structuredContent: {
+          error: contentText(response.content),
+        },
+      };
     }
 
     const summary = textSummary(response.content);
@@ -4688,6 +4706,13 @@ export function createMcpServer(
             );
           }
         }
+        const conversationScope = openAiConversationScopeId(extra._meta);
+        if (conversationScope && !attemptKey) {
+          throw new AgentSessionError(
+            "ATTEMPT_KEY_REQUIRED",
+            "ATTEMPT_KEY_REQUIRED: Missing attemptKey: model-facing dispatch requires a stable attemptKey for replay safety and idempotency.",
+          );
+        }
         const boundContractBase = selection.directSelection
           ? { ...(contract ?? {}), directSelection: selection.directSelection }
           : (contract ?? {});
@@ -5120,13 +5145,35 @@ export function createMcpServer(
           structuredContent: {
             ...output,
             conversationSafety,
-            catalog: {
-              source: opencodeCatalog.source,
-              fetchedAt: opencodeCatalog.fetchedAt,
-              generation: opencodeCatalog.generation,
-              freshness: opencodeCatalog.freshness ?? "unknown",
-              version: opencodeCatalog.version,
-            },
+            catalog: (() => {
+              const effectiveProvider = selectedProfile?.provider ?? selection.directSelection?.provider ?? provider;
+              if (effectiveProvider === "cline") {
+                const clineCat = profileCatalog.clineCatalog;
+                return {
+                  source: clineCat?.source ?? "none",
+                  fetchedAt: clineCat?.fetchedAt ?? "unknown",
+                  generation: clineCat?.generation ?? "unknown",
+                  freshness: clineCat ? (isClineCatalogFresh(clineCat) ? "fresh" : (clineCat.state.toLowerCase() || "unknown")) : "unknown",
+                  version: clineCat?.runtime?.version ?? "unknown",
+                };
+              }
+              if (effectiveProvider === "opencode") {
+                return {
+                  source: opencodeCatalog.source,
+                  fetchedAt: opencodeCatalog.fetchedAt,
+                  generation: opencodeCatalog.generation,
+                  freshness: opencodeCatalog.freshness ?? "unknown",
+                  version: opencodeCatalog.version,
+                };
+              }
+              return {
+                source: "not_applicable",
+                fetchedAt: "not_applicable",
+                generation: "not_applicable",
+                freshness: "not_applicable",
+                version: "not_applicable",
+              };
+            })(),
           } as unknown as Record<string, unknown>,
         };
       },
