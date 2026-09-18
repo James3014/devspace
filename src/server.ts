@@ -196,6 +196,11 @@ import {
 } from "./local-agent-sessions.js";
 import { parseExecutionContract, type ExecutionContract } from "./local-agent-contract.js";
 import {
+  TOOL_INTENT_IDS,
+  TOOL_INTENT_NAMESPACE,
+  TOOL_PROJECTION_MANIFEST_SCHEMA,
+} from "./execution-protocol.js";
+import {
   CAPABILITY_DISCOVERY_INDEX_PATH,
   CAPABILITY_DISCOVERY_RECEIPT_SCHEMA,
   NEXUS_CAPABILITY_REPOSITORY,
@@ -2498,6 +2503,24 @@ function createAgentStartInputSchema() {
     }).strict(),
     newCapabilityJustification: z.string().min(1).optional(),
   }).strict();
+  const toolIntentId = z.enum(TOOL_INTENT_IDS);
+  const toolProjectionManifest = z.object({
+    schema: z.literal(TOOL_PROJECTION_MANIFEST_SCHEMA),
+    namespace: z.literal(TOOL_INTENT_NAMESPACE),
+    identity: z.object({
+      taskId: z.string().min(1),
+      attemptId: z.string().min(1),
+    }).strict(),
+    authority: z.object({
+      mode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]),
+      issuer: z.enum(["owner", "nexus"]),
+    }).strict(),
+    authorizedToolCeiling: z.array(toolIntentId),
+    candidateTools: z.array(toolIntentId),
+    selectedTools: z.array(toolIntentId),
+    orderingMode: z.enum(["ORDER_INDEPENDENT", "ORDER_SENSITIVE"]),
+    candidateOrder: z.array(toolIntentId).optional(),
+  }).strict();
   const executionContract = z.object({
     authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).optional().describe(
       "Execution authority lane. OWNER_DIRECT is the backwards-compatible default. NEXUS_GOVERNED requires canonical Nexus authority evidence and never falls back to direct authority.",
@@ -2510,6 +2533,12 @@ function createAgentStartInputSchema() {
     ),
     capabilityDiscovery: capabilityDiscovery.describe(
       "Reuse-before-invention discovery receipt bound to current canonical Nexus main and the exact capability discovery index bytes. Required for write-capable delegated workers; this is navigation evidence, not routing or mutation authority.",
+    ),
+    authorizedToolCeiling: z.array(toolIntentId).describe(
+      "Durable transport-neutral tool authority ceiling for this execution. Provider adapters may only narrow it.",
+    ),
+    toolProjectionManifest: toolProjectionManifest.describe(
+      "Derived transport-neutral tool projection. It may narrow the durable ceiling but never grants or widens tool authority.",
     ),
     coreMutation: z.object({
       sessionId: z.string().regex(/^cms_[0-9a-f]{32}$/),
