@@ -2969,6 +2969,10 @@ export function createMcpServer(
           .string()
           .optional()
           .describe("Git ref to base a worktree on. Only used with mode=\"worktree\". Defaults to HEAD."),
+        refresh: z
+          .boolean()
+          .optional()
+          .describe("Optional flag to force refreshing cached availableAgentsFiles and profile catalog without reopening the checkout."),
       },
       outputSchema: {
         workspaceId: z.string(),
@@ -3006,7 +3010,7 @@ export function createMcpServer(
       ...toolWidgetDescriptorMeta(config, "workspace"),
       annotations: { readOnlyHint: true },
     },
-    async ({ path, mode, baseRef }, { _meta }) => {
+    async ({ path, mode, baseRef, refresh }, { _meta }) => {
       const startedAt = performance.now();
       const conversationScopeId = openAiConversationScopeId(_meta);
       const {
@@ -3017,12 +3021,14 @@ export function createMcpServer(
         includeBootstrapContext,
       } = await workspaces.openWorkspace(
         { path, mode, baseRef },
-        { conversationScopeId },
+        { conversationScopeId, refresh },
       );
-      const discoveredCatalog = await loadMcpProfileCatalog(config, workspace.root, opencodeCatalogSource, clineCatalogService);
-      workspace.agentProfiles = discoveredCatalog.catalog.profiles;
-      workspace.profileCatalogGeneration = discoveredCatalog.catalog.generation;
-      workspace.profileCatalogEntries = discoveredCatalog.catalog.entries;
+      if (!workspaceReused || refresh || workspace.agentProfiles.length === 0) {
+        const discoveredCatalog = await loadMcpProfileCatalog(config, workspace.root, opencodeCatalogSource, clineCatalogService);
+        workspace.agentProfiles = discoveredCatalog.catalog.profiles;
+        workspace.profileCatalogGeneration = discoveredCatalog.catalog.generation;
+        workspace.profileCatalogEntries = discoveredCatalog.catalog.entries;
+      }
       const conversationSafety = await workspaces.conversationMutationSafety(
         workspace.id,
         conversationScopeId,
@@ -3791,6 +3797,10 @@ export function createMcpServer(
         durationMs: Math.round(performance.now() - startedAt),
       });
 
+      if (input.path.endsWith("AGENTS.md") || input.path.endsWith("CLAUDE.md")) {
+        workspaces.invalidateAgentsCache(workspaceId);
+      }
+
       return {
         ...response,
         _meta: {
@@ -3892,6 +3902,10 @@ export function createMcpServer(
         durationMs: Math.round(performance.now() - startedAt),
       });
 
+      if (input.path.endsWith("AGENTS.md") || input.path.endsWith("CLAUDE.md")) {
+        workspaces.invalidateAgentsCache(workspaceId);
+      }
+
       return {
         content: editContent,
         _meta: {
@@ -3970,6 +3984,10 @@ export function createMcpServer(
           success: true,
           durationMs: Math.round(performance.now() - startedAt),
         });
+
+        if (applied.files.some((f) => f.path.endsWith("AGENTS.md") || f.path.endsWith("CLAUDE.md"))) {
+          workspaces.invalidateAgentsCache(workspaceId);
+        }
 
         return {
           content,
@@ -4876,8 +4894,8 @@ export function createMcpServer(
           waitMs,
         });
         const statusLine = output.terminal
-          ? `Agent ${agentId} is ${output.status}.`
-          : `Agent ${agentId} is ${output.status} (still running).`;
+          ? `Agent ${resolvedAgentId} is ${output.status}.`
+          : `Agent ${resolvedAgentId} is ${output.status} (still running).`;
         const responseLine = output.latestResponse ? `\nResponse: ${output.latestResponse}` : "";
         const errorLine = output.error ? `\nError: ${output.error}` : "";
         return {
@@ -5073,7 +5091,6 @@ export function createMcpServer(
         );
         const profiles = selection.profiles;
         const selectedProfile = profiles.find((candidate) => candidate.name === selection.profileName);
-        assertDirectClineCatalogSelection(selectedProfile, profileCatalog);
         const output = await agentSessionManager.preflightAgent({
           workspaceId,
           workspaceRoot: workspace.root,

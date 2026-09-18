@@ -1,7 +1,7 @@
 import { randomBytes } from "node:crypto";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
-import type { Stats } from "node:fs";
+import { existsSync, type Stats } from "node:fs";
 import type {
   WorkspaceConversationBinding,
   WorkspaceMode,
@@ -98,6 +98,7 @@ export interface OpenWorkspaceInput {
 
 export interface OpenWorkspaceOptions {
   conversationScopeId?: string;
+  refresh?: boolean;
 }
 
 const CONVERSATION_COLLISION_ACTIVE_WINDOW_MS = 6 * 60 * 60 * 1_000;
@@ -165,6 +166,7 @@ export class WorkspaceRegistry {
       workspaceInput,
       conversationScopeId,
       targetKey,
+      openOptions,
     );
     this.pendingCheckoutOpens.set(operationKey, open);
 
@@ -191,13 +193,14 @@ export class WorkspaceRegistry {
     input: OpenWorkspaceInput,
     conversationScopeId: string,
     targetKey: string,
+    options?: OpenWorkspaceOptions,
   ): Promise<WorkspaceContext> {
     const binding = this.store?.getConversationBinding(conversationScopeId, targetKey);
     if (binding) {
       const reusableWorkspace = await this.findReusableCheckoutWorkspace(binding);
 
       if (reusableWorkspace) {
-        const context = await this.reusedWorkspaceContext(reusableWorkspace);
+        const context = await this.reusedWorkspaceContext(reusableWorkspace, options);
         this.store?.touchConversationBinding(conversationScopeId, targetKey);
         return {
           ...context,
@@ -259,15 +262,22 @@ export class WorkspaceRegistry {
     return JSON.stringify(["checkout", projectKey, null]);
   }
 
-  private async reusedWorkspaceContext(workspace: Workspace): Promise<WorkspaceContext> {
+  private async reusedWorkspaceContext(
+    workspace: Workspace,
+    options?: OpenWorkspaceOptions,
+  ): Promise<WorkspaceContext> {
     const catalog = await loadProfileCatalog(this.config, workspace.root);
     workspace.agentProfiles = catalog.profiles;
     workspace.profileCatalogGeneration = catalog.generation;
     workspace.profileCatalogEntries = catalogEntriesOf(catalog);
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
     let availableAgentsFiles = workspace.availableAgentsFiles;
-    if (!availableAgentsFiles) {
+    if (options?.refresh || !availableAgentsFiles) {
       availableAgentsFiles = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
+      workspace.availableAgentsFiles = availableAgentsFiles;
+    } else {
+      // Invalidation correctness: prune deleted files without expensive recursive walk
+      availableAgentsFiles = availableAgentsFiles.filter((f) => existsSync(f.path));
       workspace.availableAgentsFiles = availableAgentsFiles;
     }
 
@@ -278,6 +288,30 @@ export class WorkspaceRegistry {
       workspaceReused: true,
       includeBootstrapContext: true,
     };
+  }
+
+  invalidateAgentsCache(workspaceId: string): void {
+    const workspace = this.workspaces.get(workspaceId);
+    if (workspace) {
+      workspace.availableAgentsFiles = undefined;
+    }
+  }
+
+  notifyInstructionFileAccess(workspace: Workspace, filePath: string): void {
+    const fileName = basename(filePath);
+    if (!CONTEXT_FILE_NAMES.has(fileName)) return;
+    const resolved = resolve(filePath);
+    if (!workspace.availableAgentsFiles) {
+      workspace.availableAgentsFiles = [];
+    }
+    const exists = existsSync(resolved);
+    const existingIndex = workspace.availableAgentsFiles.findIndex((f) => resolve(f.path) === resolved);
+    if (exists && existingIndex === -1) {
+      workspace.availableAgentsFiles.push({ path: resolved });
+      workspace.availableAgentsFiles.sort((a, b) => a.path.localeCompare(b.path));
+    } else if (!exists && existingIndex !== -1) {
+      workspace.availableAgentsFiles.splice(existingIndex, 1);
+    }
   }
 
   getWorkspace(workspaceId: string): Workspace {
@@ -467,6 +501,7 @@ export class WorkspaceRegistry {
     if (readPath.skillRead?.isSkillFile) {
       markSkillActivated(workspace.activatedSkillDirs, readPath.skillRead.skill);
     }
+    this.notifyInstructionFileAccess(workspace, readPath.absolutePath);
   }
 
   resolveWorkingDirectory(workspace: Workspace, workingDirectory: string | undefined): string {

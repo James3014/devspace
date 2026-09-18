@@ -43,4 +43,12 @@ test("same identity aliases are accepted but conflicting or transport-only metad
   assert.equal(resolveChatSwarmIdentity({ "openai/session": "same", "chatgpt/session": "same" }).fingerprint, resolveChatSwarmIdentity({ "openai/session": "same" }).fingerprint);
   assert.throws(() => resolveChatSwarmIdentity({ "openai/session": "a", "openai/conversationId": "b" }), (error: unknown) => error instanceof ChatSwarmIdentityError && error.code === "AMBIGUOUS");
   assert.throws(() => resolveChatSwarmIdentity({ "mcp/session": "transport-only" }), (error: unknown) => error instanceof ChatSwarmIdentityError && error.code === "MISSING");
+
+  // Parity in openAiConversationScopeId
+  assert.equal(openAiConversationScopeId({ "openai/session": "same", "chatgpt/session": "same" }), "same");
+  assert.throws(
+    () => openAiConversationScopeId({ "openai/session": "a", "openai/conversation_id": "b" }),
+    (error: unknown) => error instanceof ChatSwarmIdentityError && error.code === "AMBIGUOUS",
+  );
+  assert.equal(openAiConversationScopeId({ "openai/conversation_id": "c", "mcp-session-id": "transport-only" }), "c");
 });

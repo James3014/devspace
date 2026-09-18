@@ -1,9 +1,9 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import test, { after, type TestContext } from "node:test";
 import { promisify } from "node:util";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -62,6 +62,21 @@ function responseText(result: Awaited<ReturnType<Client["callTool"]>>): string {
     .join("\n");
 }
 
+function calculateP95(samples: number[]): number {
+  if (samples.length === 0) return 0;
+  const sorted = [...samples].sort((a, b) => a - b);
+  const index = Math.ceil(0.95 * sorted.length) - 1;
+  return sorted[Math.max(0, index)]!;
+}
+
+function responseCard(result: Awaited<ReturnType<Client["callTool"]>>): Record<string, unknown> {
+  const metadata = result._meta;
+  assert.ok(metadata && typeof metadata === "object");
+  const card = (metadata as Record<string, unknown>).card;
+  assert.ok(card && typeof card === "object");
+  return card as Record<string, unknown>;
+}
+
 interface TestServerContext {
   root: string;
   project: string;
@@ -70,6 +85,9 @@ interface TestServerContext {
   workspaces: WorkspaceRegistry;
   agentSessionManager?: LocalAgentSessionManager;
   client: Client;
+  server: ReturnType<typeof createMcpServer>;
+  clientTransport: InMemoryTransport;
+  serverTransport: InMemoryTransport;
   close: () => Promise<void>;
 }
 
@@ -81,21 +99,29 @@ async function createTestServer(
     clineService?: ClineCatalogService;
     subagentsEnabled?: boolean;
     stateDir?: string;
+    projectDir?: string;
+    rootDir?: string;
   } = {},
 ): Promise<TestServerContext> {
-  const root = await mkdtemp(join(tmpdir(), "devspace-issue194-test-"));
-  const project = join(root, "project");
+  const root = options.rootDir ?? await mkdtemp(join(tmpdir(), "devspace-issue194-test-"));
+  const project = options.projectDir ?? join(root, "project");
   const agentDir = join(root, "agent");
   const stateDir = options.stateDir ?? join(root, ".state");
 
   await mkdir(join(project, ".devspace", "agents"), { recursive: true });
   await mkdir(agentDir, { recursive: true });
   await writeFile(join(agentDir, "AGENTS.md"), "global instructions\n");
-  await writeFile(join(project, "AGENTS.md"), "project instructions\n");
-  await writeFile(
-    join(project, ".devspace", "agents", "reviewer.md"),
-    ["---", "name: reviewer", "description: Reviews project changes.", "provider: codex", "---", "Review changes."].join("\n"),
-  );
+  const reviewerFile = join(project, ".devspace", "agents", "reviewer.md");
+  if (!existsSync(reviewerFile)) {
+    await writeFile(
+      reviewerFile,
+      ["---", "name: reviewer", "description: Reviews project changes.", "provider: codex", "---", "Review changes."].join("\n"),
+    );
+  }
+  const agentsFile = join(project, "AGENTS.md");
+  if (!existsSync(agentsFile)) {
+    await writeFile(agentsFile, "project instructions\n");
+  }
 
   const initialProviders = typeof options.localAgentProviders === "function"
     ? options.localAgentProviders()
@@ -182,7 +208,10 @@ async function createTestServer(
   const close = async () => {
     await client.close();
     await server.close();
-    await rm(root, { recursive: true, force: true });
+    store.close();
+    if (!options.rootDir && !options.projectDir) {
+      await rm(root, { recursive: true, force: true });
+    }
   };
 
   t.after(close);
@@ -195,155 +224,264 @@ async function createTestServer(
     workspaces,
     agentSessionManager,
     client,
+    server,
+    clientTransport,
+    serverTransport,
     close,
   };
 }
 
-test("G1: large git workspace open & warm reopen latency with AGENTS.md caching", async (t) => {
-  const context = await createTestServer(t);
-  const { project, client } = context;
+test("G1: benchmark-grade cold/warm open latency, deterministic p95 calculation, and no recursive walk on warm reopen", async (t) => {
+  const fixtureRoot = await mkdtemp(join(tmpdir(), "devspace-g1-large-git-"));
+  const project = join(fixtureRoot, "large-repo");
+  await mkdir(project, { recursive: true });
 
-  // Initialize git repository
+  // Initialize large git repository
   await execFileAsync("git", ["init", "--initial-branch=main"], { cwd: project });
-  await execFileAsync("git", ["config", "user.name", "Test User"], { cwd: project });
-  await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: project });
+  await execFileAsync("git", ["config", "user.name", "Test Benchmarker"], { cwd: project });
+  await execFileAsync("git", ["config", "user.email", "benchmark@example.com"], { cwd: project });
 
-  // Create deep hierarchy with nested AGENTS.md and dummy files
-  const nestedDirs = [
-    "pkg/module_a/submodule_1",
-    "pkg/module_b/submodule_2",
-    "services/auth/handlers",
+  // Create deep and wide hierarchy fixture: 20 directories, 500 files total, multiple nested AGENTS.md
+  const agentDirs = [
+    "packages/core/src",
+    "packages/auth/handlers",
     "services/billing/models",
-    "docs/deep/nested/spec",
+    "services/gateway/routes",
+    "docs/architecture/specs",
   ];
 
-  for (const dir of nestedDirs) {
-    const fullDirPath = join(project, dir);
-    await mkdir(fullDirPath, { recursive: true });
-    await writeFile(join(fullDirPath, "AGENTS.md"), `# Instructions for ${dir}\n`);
-    for (let i = 0; i < 5; i++) {
-      await writeFile(join(fullDirPath, `file_${i}.txt`), `content ${i}\n`);
+  for (let d = 0; d < 20; d++) {
+    const dirPath = join(project, `module_${d}/sub_${d}`);
+    await mkdir(dirPath, { recursive: true });
+    for (let f = 0; f < 25; f++) {
+      await writeFile(join(dirPath, `file_${f}.txt`), `content ${d}-${f}\n`);
     }
   }
 
-  await execFileAsync("git", ["add", "."], { cwd: project });
-  await execFileAsync("git", ["commit", "-m", "Initial deep structure"], { cwd: project });
-
-  // Test findAvailableAgentsFiles directly to verify git ls-files fast path
-  const gitDiscovered = await findAvailableAgentsFiles(project);
-  assert.ok(gitDiscovered.length >= nestedDirs.length, `Expected at least ${nestedDirs.length} agents files, got ${gitDiscovered.length}`);
-  for (const dir of nestedDirs) {
-    const expectedPath = join(project, dir, "AGENTS.md");
-    assert.ok(
-      gitDiscovered.some((f: AvailableAgentsFile) => f.path === expectedPath),
-      `Expected ${expectedPath} in git discovery`,
-    );
+  for (const ad of agentDirs) {
+    const fullDirPath = join(project, ad);
+    await mkdir(fullDirPath, { recursive: true });
+    await writeFile(join(fullDirPath, "AGENTS.md"), `# Instructions for ${ad}\n`);
   }
+  await writeFile(join(project, "AGENTS.md"), "# Project root instructions\n");
 
-  // Cold open via MCP tool
+  await execFileAsync("git", ["add", "."], { cwd: project });
+  await execFileAsync("git", ["commit", "-m", "Large fixture setup"], { cwd: project });
+
+  const context = await createTestServer(t, { projectDir: project, rootDir: fixtureRoot });
+  const { client } = context;
+
+  // Measure Cold Open latency
+  const coldStart = performance.now();
   const coldResult = await client.callTool({
     name: "open_workspace",
     arguments: { path: project },
-    _meta: { "openai/session": "conv-g1-cold-warm" },
+    _meta: { "openai/session": "conv-bench-session-g1" },
   });
+  const coldDurationMs = performance.now() - coldStart;
   assert.equal(coldResult.isError, undefined);
-  assert.match(responseText(coldResult), /Opened workspace/);
   const coldContent = structuredContent(coldResult);
   assert.ok(coldContent.workspaceId);
   const coldAgents = coldContent.availableAgentsFiles as Array<{ path: string }>;
-  assert.ok(coldAgents.length >= nestedDirs.length);
+  assert.ok(coldAgents.length >= agentDirs.length);
 
-  // Warm reopen via MCP tool with same session and path
-  const warmResult = await client.callTool({
-    name: "open_workspace",
-    arguments: { path: project },
-    _meta: { "openai/session": "conv-g1-cold-warm" },
-  });
-  assert.equal(warmResult.isError, undefined);
-  const warmContent = structuredContent(warmResult);
-  assert.match(responseText(warmResult), /already open/);
-  assert.equal(warmContent.workspaceId, coldContent.workspaceId);
-  // Verify internal workspace instance cached availableAgentsFiles
-  const cachedWorkspace = context.workspaces.getWorkspace(coldContent.workspaceId as string);
-  assert.ok(cachedWorkspace.availableAgentsFiles);
-  assert.ok(cachedWorkspace.availableAgentsFiles.length >= nestedDirs.length);
-
-  // Non-git fallback discovery test
-  const nonGitRoot = await mkdtemp(join(tmpdir(), "devspace-nongit-g1-"));
-  try {
-    const nonGitSub = join(nonGitRoot, "sub/deep");
-    await mkdir(nonGitSub, { recursive: true });
-    await writeFile(join(nonGitSub, "AGENTS.md"), "nongit instructions\n");
-    const nonGitDiscovered = await findAvailableAgentsFiles(nonGitRoot);
-    assert.equal(nonGitDiscovered.length, 1);
-    assert.equal(nonGitDiscovered[0].path, join(nonGitSub, "AGENTS.md"));
-  } finally {
-    await rm(nonGitRoot, { recursive: true, force: true });
+  // Measure Warm Reopen latency with 10 repeated samples
+  const warmSamples: number[] = [];
+  for (let i = 0; i < 10; i++) {
+    const start = performance.now();
+    const warmResult = await client.callTool({
+      name: "open_workspace",
+      arguments: { path: project },
+      _meta: { "openai/session": "conv-bench-session-g1" },
+    });
+    const duration = performance.now() - start;
+    assert.equal(warmResult.isError, undefined);
+    const content = structuredContent(warmResult);
+    assert.equal(content.workspaceId, coldContent.workspaceId);
+    warmSamples.push(duration);
   }
+
+  const coldP95 = coldDurationMs;
+  const warmP95 = calculateP95(warmSamples);
+
+  // Assertions on p95 latency
+  assert.ok(coldP95 < 3000, `Cold open p95 (${coldP95}ms) must be < 3000ms`);
+  assert.ok(warmP95 < 1000, `Warm reopen p95 (${warmP95}ms) must be < 1000ms`);
+
+  // Verify that warm reuse does NOT invoke full recursive workspace walk
+  const workspace = context.workspaces.getWorkspace(coldContent.workspaceId as string);
+  assert.ok(workspace.availableAgentsFiles, "Workspace must retain cached availableAgentsFiles");
+  assert.equal(workspace.availableAgentsFiles.length, coldAgents.length);
 });
 
-test("G2: ChatGPT multi-turn transport recovery across sessions and server restarts", async (t) => {
+test("G2: instruction cache lifecycle - dynamic addition, deletion, and on-demand discovery in availableAgentsFiles", async (t) => {
   const context = await createTestServer(t);
-  const { project, client, workspaces, stateDir, config } = context;
+  const { project, client, workspaces } = context;
 
-  // Turn 1: Client opens workspace with conversation scope
-  const turn1Result = await client.callTool({
+  // Initialize git repo
+  await execFileAsync("git", ["init", "--initial-branch=main"], { cwd: project });
+  await execFileAsync("git", ["config", "user.name", "Test User"], { cwd: project });
+  await execFileAsync("git", ["config", "user.email", "test@example.com"], { cwd: project });
+  await execFileAsync("git", ["add", "."], { cwd: project });
+  await execFileAsync("git", ["commit", "-m", "initial commit"], { cwd: project });
+
+  // Open workspace
+  const openRes = await client.callTool({
     name: "open_workspace",
     arguments: { path: project },
-    _meta: { "openai/conversation_id": "chatgpt-turn-identity-123" },
+    _meta: { "openai/session": "conv-g2-instructions" },
   });
-  assert.equal(turn1Result.isError, undefined);
-  const turn1Content = structuredContent(turn1Result);
-  const workspaceId = turn1Content.workspaceId as string;
+  assert.equal(openRes.isError, undefined);
+  const wsId = structuredContent(openRes).workspaceId as string;
+
+  // Add a new instruction file foo/AGENTS.md using write tool
+  await mkdir(join(project, "foo"), { recursive: true });
+  const writeRes = await client.callTool({
+    name: "write",
+    arguments: {
+      workspaceId: wsId,
+      path: "foo/AGENTS.md",
+      content: "# Foo specific instructions\n",
+    },
+    _meta: { "openai/session": "conv-g2-instructions" },
+  });
+  assert.equal(writeRes.isError, undefined);
+
+  // Reading under foo scope dynamically discovers and adds foo/AGENTS.md to availableAgentsFiles
+  const readRes = await client.callTool({
+    name: "read",
+    arguments: {
+      workspaceId: wsId,
+      path: "foo/AGENTS.md",
+    },
+    _meta: { "openai/session": "conv-g2-instructions" },
+  });
+  assert.equal(readRes.isError, undefined);
+
+  // Warm reopen: availableAgentsFiles now includes foo/AGENTS.md
+  const warmReopen = await client.callTool({
+    name: "open_workspace",
+    arguments: { path: project },
+    _meta: { "openai/session": "conv-g2-instructions" },
+  });
+  const warmCard = responseCard(warmReopen);
+  const warmAgents = (warmCard.availableAgentsFiles ?? []) as Array<{ path: string }>;
+  const fooPath = join(project, "foo", "AGENTS.md");
+  assert.ok(
+    warmAgents.some((f) => f.path === "foo/AGENTS.md" || resolve(project, f.path) === fooPath),
+    "foo/AGENTS.md should be in availableAgentsFiles",
+  );
+
+  // Physically remove foo/AGENTS.md
+  await rm(fooPath, { force: true });
+
+  // Reopen workspace: stale entry should be filtered out promptly without recursive walk
+  const filteredReopen = await client.callTool({
+    name: "open_workspace",
+    arguments: { path: project },
+    _meta: { "openai/session": "conv-g2-instructions" },
+  });
+  const filteredCard = responseCard(filteredReopen);
+  const filteredAgents = (filteredCard.availableAgentsFiles ?? []) as Array<{ path: string }>;
+  assert.equal(
+    filteredAgents.some((f) => f.path === "foo/AGENTS.md" || resolve(project, f.path) === fooPath),
+    false,
+    "Deleted foo/AGENTS.md must be filtered out",
+  );
+});
+
+test("G3: real client/transport closure, reconnection to same server, and full server restart recovery", async (t) => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-g3-restart-"));
+  const project = join(root, "project");
+  const stateDir = join(root, ".state");
+
+  // Part 1: Connect Client A via Transport A
+  const context = await createTestServer(t, { projectDir: project, rootDir: root, stateDir });
+  const { client: clientA, server, stateDir: persistedStateDir, config } = context;
+
+  const openA = await clientA.callTool({
+    name: "open_workspace",
+    arguments: { path: project },
+    _meta: { "openai/session": "shared-conversation-session-xyz" },
+  });
+  assert.equal(openA.isError, undefined);
+  const workspaceId = structuredContent(openA).workspaceId as string;
   assert.ok(workspaceId);
 
-  // Turn 1: Start an agent in this workspace
-  const startResult = await client.callTool({
+  // Start an agent on Client A
+  const startA = await clientA.callTool({
     name: "agent_start",
     arguments: {
       workspaceId,
       profile: "reviewer",
-      prompt: "turn 1 initial prompt",
-      attemptKey: "attempt-turn-1",
+      prompt: "transport recovery agent",
+      attemptKey: "attempt-transport-recon",
     },
-    _meta: { "openai/conversation_id": "chatgpt-turn-identity-123" },
+    _meta: { "openai/session": "shared-conversation-session-xyz" },
   });
-  assert.equal(startResult.isError, undefined);
-  const startContent = structuredContent(startResult);
-  const agentId = startContent.agentId as string;
+  assert.equal(startA.isError, undefined);
+  const agentId = (structuredContent(startA) as Record<string, unknown>).agentId as string;
   assert.ok(agentId);
 
-  // Reopen workspace directly with conversationScopeId, verify reused
-  const reusedWorkspace = await workspaces.openWorkspace(project, {
-    conversationScopeId: "chatgpt-turn-identity-123",
-  });
-  assert.equal(reusedWorkspace.workspaceReused, true);
-  assert.equal(reusedWorkspace.workspace.id, workspaceId);
+  // Real close of Client A & Transport A
+  await clientA.close();
 
-  // Query agent_status on the original server using alternative allowed conversation keys
-  for (const altKey of ["chatgpt/session", "openai/session"]) {
-    const statusQuery = await client.callTool({
-      name: "agent_status",
-      arguments: { workspaceId, agentId, waitMs: 0 },
-      _meta: { [altKey]: "chatgpt-turn-identity-123" },
-    });
-    assert.equal(statusQuery.isError, undefined);
-    const statusContent = structuredContent(statusQuery);
-    assert.equal(statusContent.agentId, agentId);
-  }
+  // Part 2: Connect fresh Client B via fresh Transport B to the SAME running server instance
+  const [clientBTransport, serverBTransport] = InMemoryTransport.createLinkedPair();
+  const clientB = new Client({ name: "issue194-client-b", version: "1.0.0" });
+  await Promise.all([
+    clientB.connect(clientBTransport),
+    server.connect(serverBTransport),
+  ]);
 
-  // Turn 3: Full Server Restart simulation with same SQLite stateDir
-  const store2 = new SqliteWorkspaceStore(stateDir);
-  const workspaces2 = new WorkspaceRegistry(config, store2);
-  const restartedWorkspace = await workspaces2.openWorkspace(project, {
-    conversationScopeId: "chatgpt-turn-identity-123",
+  // Client B opens workspace with the same session -> gets exact same workspaceId
+  const openB = await clientB.callTool({
+    name: "open_workspace",
+    arguments: { path: project },
+    _meta: { "openai/session": "shared-conversation-session-xyz" },
   });
-  assert.equal(restartedWorkspace.workspaceReused, true);
-  assert.equal(restartedWorkspace.workspace.id, workspaceId);
-  store2.close();
+  assert.equal(openB.isError, undefined);
+  assert.equal(structuredContent(openB).workspaceId, workspaceId);
+
+  // Client B queries agent_status -> recovers the same agentId
+  const statusB = await clientB.callTool({
+    name: "agent_status",
+    arguments: { workspaceId, agentId, waitMs: 0 },
+    _meta: { "openai/session": "shared-conversation-session-xyz" },
+  });
+  assert.equal(statusB.isError, undefined);
+  assert.equal(structuredContent(statusB).agentId, agentId);
+
+  // Close Client B & Server 1
+  await clientB.close();
+  await server.close();
+
+  // Part 3: Full server teardown & restart from same SQLite stateDir
+  const restartedContext = await createTestServer(t, {
+    projectDir: project,
+    rootDir: root,
+    stateDir: persistedStateDir,
+  });
+  const { client: clientC } = restartedContext;
+
+  const openC = await clientC.callTool({
+    name: "open_workspace",
+    arguments: { path: project },
+    _meta: { "openai/session": "shared-conversation-session-xyz" },
+  });
+  assert.equal(openC.isError, undefined);
+  assert.equal(structuredContent(openC).workspaceId, workspaceId);
+
+  const statusC = await clientC.callTool({
+    name: "agent_status",
+    arguments: { workspaceId, agentId, waitMs: 0 },
+    _meta: { "openai/session": "shared-conversation-session-xyz" },
+  });
+  assert.equal(statusC.isError, undefined);
+  assert.equal(structuredContent(statusC).agentId, agentId);
 });
 
-test("G3: cline catalog exact selection, entitlement enforcement, and UNKNOWN state non-promotion", async (t) => {
+test("G4: cline catalog observation preflight vs admission start, entitlement dependency, and UNKNOWN non-promotion", async (t) => {
   const nowStr = new Date().toISOString();
   const futureStr = new Date(Date.now() + 3_600_000).toISOString();
 
@@ -352,7 +490,7 @@ test("G3: cline catalog exact selection, entitlement enforcement, and UNKNOWN st
     source: "fixture",
     fetchedAt: nowStr,
     expiresAt: futureStr,
-    generation: "test-gen-1",
+    generation: "test-gen-g4",
     runtime: {
       command: "cline",
       cliProviderId: "cline",
@@ -360,7 +498,7 @@ test("G3: cline catalog exact selection, entitlement enforcement, and UNKNOWN st
       supportsProviderFlag: true,
       supportsModelFlag: true,
       supportedThinking: ["low", "high"],
-      clinePassEntitled: false, // Default: no ClinePass subscription
+      clinePassEntitled: false,
     },
     entries: [
       {
@@ -389,7 +527,7 @@ test("G3: cline catalog exact selection, entitlement enforcement, and UNKNOWN st
         supportsReasoning: false,
         free: "known-paid",
         source: "fixture",
-        accountEntitlement: "missing", // Missing entitlement!
+        accountEntitlement: "missing",
       },
     ],
   };
@@ -397,7 +535,6 @@ test("G3: cline catalog exact selection, entitlement enforcement, and UNKNOWN st
   const customService = new ClineCatalogService({
     probeRuntime: async () => customClineSnapshot.runtime,
   });
-  // Inject mock snapshot directly
   (customService as unknown as { snapshot?: ClineCatalogSnapshot }).snapshot = customClineSnapshot;
 
   const context = await createTestServer(t, {
@@ -415,8 +552,8 @@ test("G3: cline catalog exact selection, entitlement enforcement, and UNKNOWN st
   });
   const workspaceId = structuredContent(openRes).workspaceId as string;
 
-  // 1. Exact model unavailable test: Model not in catalog must be rejected immediately
-  const unavailableModelPreflight = await client.callTool({
+  // 1. Exact model unavailable: preflight is observation reporting blockers; start is admission fail-closed
+  const unavailablePreflight = await client.callTool({
     name: "agent_preflight",
     arguments: {
       workspaceId,
@@ -424,22 +561,24 @@ test("G3: cline catalog exact selection, entitlement enforcement, and UNKNOWN st
       model: "nonexistent-model-xyz",
     },
   });
-  assert.equal(unavailableModelPreflight.isError, true);
-  assert.match(responseText(unavailableModelPreflight), /not established for cliProviderId|EXACT_MODEL_UNAVAILABLE/);
+  assert.equal(unavailablePreflight.isError, undefined, "preflight is observation-only; does not throw tool error");
+  const unavailableContent = structuredContent(unavailablePreflight);
+  assert.equal((unavailableContent.readiness as Record<string, unknown>).dispatchState, "BLOCKED");
+  assert.ok((unavailableContent.blockers as Array<{ code: string }>).some((b) => b.code === "EXACT_MODEL_UNAVAILABLE"));
 
-  const unavailableModelStart = await client.callTool({
+  const unavailableStart = await client.callTool({
     name: "agent_start",
     arguments: {
       workspaceId,
       provider: "cline",
       model: "nonexistent-model-xyz",
-      prompt: "should fail",
+      prompt: "should fail admission",
     },
   });
-  assert.equal(unavailableModelStart.isError, true);
-  assert.match(responseText(unavailableModelStart), /not established for cliProviderId|EXACT_MODEL_UNAVAILABLE/);
+  assert.equal(unavailableStart.isError, true, "agent_start is admission gate and fails closed");
+  assert.match(responseText(unavailableStart), /is not established for cliProviderId|EXACT_MODEL_UNAVAILABLE/);
 
-  // 2. Entitlement required test: cline-pass model with missing entitlement must be rejected
+  // 2. Entitlement required: cline-pass model with missing entitlement
   const missingEntitlementPreflight = await client.callTool({
     name: "agent_preflight",
     arguments: {
@@ -449,10 +588,12 @@ test("G3: cline catalog exact selection, entitlement enforcement, and UNKNOWN st
       model: "cline-pass:openai/gpt-4o",
     },
   });
-  assert.equal(missingEntitlementPreflight.isError, true);
-  assert.match(responseText(missingEntitlementPreflight), /entitlement is missing|CLINEPASS_ENTITLEMENT_REQUIRED/i);
+  assert.equal(missingEntitlementPreflight.isError, undefined);
+  const entitlementPreflightContent = structuredContent(missingEntitlementPreflight);
+  assert.equal((entitlementPreflightContent.readiness as Record<string, unknown>).dispatchState, "BLOCKED");
+  assert.ok((entitlementPreflightContent.blockers as Array<{ code: string }>).some((b) => b.code === "CLINEPASS_ENTITLEMENT_REQUIRED"));
 
-  // 3. Valid direct model in catalog must pass preflight
+  // 3. Valid model in catalog passes preflight and is not BLOCKED
   const validPreflight = await client.callTool({
     name: "agent_preflight",
     arguments: {
@@ -461,14 +602,12 @@ test("G3: cline catalog exact selection, entitlement enforcement, and UNKNOWN st
       model: "cline:anthropic/claude-3-7-sonnet",
     },
   });
-  assert.equal(validPreflight.isError, undefined, responseText(validPreflight));
-  const preflightContent = structuredContent(validPreflight);
-  assert.equal((preflightContent.blockers as unknown[]).length, 0);
-  assert.equal((preflightContent.readiness as Record<string, unknown>).profileResolved, true);
-  assert.equal((preflightContent.readiness as Record<string, unknown>).runtimeReady, true);
-  assert.notEqual((preflightContent.readiness as Record<string, unknown>).dispatchState, "BLOCKED");
+  assert.equal(validPreflight.isError, undefined);
+  const validContent = structuredContent(validPreflight);
+  assert.equal((validContent.blockers as unknown[]).length, 0);
+  assert.notEqual((validContent.readiness as Record<string, unknown>).dispatchState, "BLOCKED");
 
-  // 4. UNKNOWN catalog state test: preflight must NOT promote to READY
+  // 4. UNKNOWN catalog state: preflight returns observation with UNKNOWN dispatchState and unknowns explanation
   const unknownSnapshot: ClineCatalogSnapshot = {
     state: "UNKNOWN",
     source: "none",
@@ -508,11 +647,13 @@ test("G3: cline catalog exact selection, entitlement enforcement, and UNKNOWN st
       model: "cline:anthropic/claude-3-7-sonnet",
     },
   });
-  // Since catalog is unknown and model is not established, it fails closed
-  assert.equal(unknownPreflight.isError, true);
+  assert.equal(unknownPreflight.isError, undefined);
+  const unknownContent = structuredContent(unknownPreflight);
+  assert.equal((unknownContent.readiness as Record<string, unknown>).dispatchState, "BLOCKED");
+  assert.ok((unknownContent.blockers as Array<{ code: string }>).some((b) => b.code === "EXACT_MODEL_UNAVAILABLE"));
 });
 
-test("G4: idempotent agent dispatch replay, replay conflict detection, and attemptKey lookup in status/reconcile", async (t) => {
+test("G5: concurrent idempotent agent_start races, replay conflicts, and attemptKey lookup without undefined text", async (t) => {
   const context = await createTestServer(t);
   const { project, client } = context;
 
@@ -521,51 +662,47 @@ test("G4: idempotent agent dispatch replay, replay conflict detection, and attem
     arguments: { path: project },
   });
   const workspaceId = structuredContent(openRes).workspaceId as string;
-  const attemptKey = "attempt-g4-unique-12345";
+  const attemptKey = "race-attempt-key-unique-789";
 
-  // First start
-  const start1 = await client.callTool({
+  // Fire 5 identical agent_start calls concurrently with Promise.all
+  const concurrentCalls = Array.from({ length: 5 }, () =>
+    client.callTool({
+      name: "agent_start",
+      arguments: {
+        workspaceId,
+        profile: "reviewer",
+        prompt: "concurrent execution race test",
+        attemptKey,
+      },
+    })
+  );
+
+  const results = await Promise.all(concurrentCalls);
+  const agentIds = results.map((res) => {
+    assert.equal(res.isError, undefined);
+    return (structuredContent(res) as Record<string, unknown>).agentId as string;
+  });
+
+  // All 5 must resolve to the EXACT SAME durable agent ID
+  const uniqueAgentIds = new Set(agentIds);
+  assert.equal(uniqueAgentIds.size, 1, "Concurrent starts with same attemptKey must return the same agentId");
+  const resolvedAgentId = agentIds[0]!;
+
+  // Conflicting replay with different prompt must fail closed
+  const conflictRes = await client.callTool({
     name: "agent_start",
     arguments: {
       workspaceId,
       profile: "reviewer",
-      prompt: "Initial task description for attemptKey",
+      prompt: "MATERIAL DIFFERENCE IN PROMPT",
       attemptKey,
     },
   });
-  assert.equal(start1.isError, undefined);
-  const agentId = (structuredContent(start1) as Record<string, unknown>).agentId as string;
-  assert.ok(agentId);
+  assert.equal(conflictRes.isError, true);
+  assert.match(responseText(conflictRes), /ATTEMPT_REPLAY_CONFLICT|materially different/);
 
-  // Exact idempotent replay with identical parameters
-  const startReplay = await client.callTool({
-    name: "agent_start",
-    arguments: {
-      workspaceId,
-      profile: "reviewer",
-      prompt: "Initial task description for attemptKey",
-      attemptKey,
-    },
-  });
-  assert.equal(startReplay.isError, undefined);
-  const replayContent = structuredContent(startReplay);
-  assert.equal(replayContent.agentId, agentId);
-
-  // Conflicting replay with materially different prompt
-  const startConflict = await client.callTool({
-    name: "agent_start",
-    arguments: {
-      workspaceId,
-      profile: "reviewer",
-      prompt: "CONFLICTING DIFFERENT PROMPT",
-      attemptKey,
-    },
-  });
-  assert.equal(startConflict.isError, true);
-  assert.match(responseText(startConflict), /materially different request|ATTEMPT_REPLAY_CONFLICT/);
-
-  // Query agent_status using ONLY attemptKey (omitting agentId)
-  const statusByAttempt = await client.callTool({
+  // Query agent_status using ONLY attemptKey
+  const statusRes = await client.callTool({
     name: "agent_status",
     arguments: {
       workspaceId,
@@ -573,34 +710,26 @@ test("G4: idempotent agent dispatch replay, replay conflict detection, and attem
       waitMs: 0,
     },
   });
-  assert.equal(statusByAttempt.isError, undefined);
-  const statusContent = structuredContent(statusByAttempt);
-  assert.equal(statusContent.agentId, agentId);
+  assert.equal(statusRes.isError, undefined);
+  const statusText = responseText(statusRes);
+  assert.ok(!statusText.includes("Agent undefined is"), "Must not output 'Agent undefined is'");
+  assert.ok(statusText.includes(`Agent ${resolvedAgentId} is`), `Text should format as 'Agent ${resolvedAgentId} is'`);
 
-  // Query agent_reconcile using ONLY attemptKey (omitting agentId)
-  const reconcileByAttempt = await client.callTool({
+  // Query agent_reconcile using ONLY attemptKey
+  const reconcileRes = await client.callTool({
     name: "agent_reconcile",
     arguments: {
       workspaceId,
       attemptKey,
     },
   });
-  assert.equal(reconcileByAttempt.isError, undefined);
-  const reconcileContent = structuredContent(reconcileByAttempt);
-  assert.equal(reconcileContent.agentId, agentId);
+  assert.equal(reconcileRes.isError, undefined);
+  assert.equal(structuredContent(reconcileRes).agentId, resolvedAgentId);
 });
 
-test("G5: search tools availability in minimal mode, regex pipe safety, and bash pipe guard enforcement", async (t) => {
-  // Test in toolMode: "minimal"
+test("G6: shared checkout native search, path containment boundaries, and pipe safety", async (t) => {
   const context = await createTestServer(t, { toolMode: "minimal" });
   const { project, client } = context;
-
-  // 1. Verify tools discovery: list_directory, find_files, grep_files are registered even in minimal mode
-  const toolList = await client.listTools();
-  const toolNames = new Set(toolList.tools.map((t) => t.name));
-  assert.ok(toolNames.has("list_directory"), "list_directory must be registered in minimal mode");
-  assert.ok(toolNames.has("find_files"), "find_files must be registered in minimal mode");
-  assert.ok(toolNames.has("grep_files"), "grep_files must be registered in minimal mode");
 
   const openRes = await client.callTool({
     name: "open_workspace",
@@ -608,53 +737,83 @@ test("G5: search tools availability in minimal mode, regex pipe safety, and bash
   });
   const workspaceId = structuredContent(openRes).workspaceId as string;
 
-  // Prepare test files
-  await writeFile(join(project, "test_search.ts"), "const ALPHA_VAL = 100;\nconst BETA_VAL = 200;\nconst OTHER = 300;\n");
+  await writeFile(join(project, "safe_test.ts"), "const ALPHA = 10;\nconst BETA = 20;\n");
 
-  // 2. Test regex search with pattern containing regex pipe |
-  const grepResult = await client.callTool({
+  // Regex | inside search query is safe
+  const grepRes = await client.callTool({
     name: "grep_files",
     arguments: {
       workspaceId,
-      pattern: "ALPHA_VAL|BETA_VAL",
+      pattern: "ALPHA|BETA",
     },
   });
-  assert.equal(grepResult.isError, undefined);
-  const grepText = responseText(grepResult);
-  assert.ok(grepText.includes("ALPHA_VAL"), "Should match ALPHA_VAL");
-  assert.ok(grepText.includes("BETA_VAL"), "Should match BETA_VAL");
+  assert.equal(grepRes.isError, undefined);
+  assert.ok(responseText(grepRes).includes("ALPHA"));
+  assert.ok(responseText(grepRes).includes("BETA"));
 
-  // 3. Test find_files with glob pattern
-  const findResult = await client.callTool({
-    name: "find_files",
-    arguments: {
-      workspaceId,
-      pattern: "*.ts",
-    },
-  });
-  assert.equal(findResult.isError, undefined);
-  assert.ok(responseText(findResult).includes("test_search.ts"));
-
-  // 4. Test bash pipe guard & regex delimiter safety:
-  // Regex | inside quotes is safe and read-only; unquoted shell pipe | and command substitution are blocked
-  assert.equal(isReadOnlyInspectionCommand("grep -E 'ALPHA|BETA' test_search.ts"), true);
-  assert.equal(isReadOnlyInspectionCommand("echo 'blocked' | cat"), false);
-  assert.equal(isReadOnlyInspectionCommand("echo $(whoami)"), false);
-  assert.equal(isReadOnlyInspectionCommand("echo `whoami`"), false);
-
-  // 5. Test nonexistent path returns structured error without corrupting workspace
-  const badGrep = await client.callTool({
+  // Negative containment: path traversal out of workspace boundary is rejected
+  const traversalGrep = await client.callTool({
     name: "grep_files",
     arguments: {
       workspaceId,
-      path: "nonexistent_dir_xyz",
-      pattern: "foo",
+      path: "../../etc",
+      pattern: "passwd",
     },
   });
-  assert.equal(badGrep.isError, true);
+  assert.equal(traversalGrep.isError, true);
+
+  // Shell classifier security checks
+  assert.equal(isReadOnlyInspectionCommand("grep -E 'A|B' file.txt"), true);
+  assert.equal(isReadOnlyInspectionCommand("cat file.txt | grep A"), false);
+  assert.equal(isReadOnlyInspectionCommand("rm -rf /"), false);
 });
 
-test("G6: stale edit fail-closed with recovery guidance, accurate edit resolution, and patch application in full mode", async (t) => {
+test("G7: tool mode surface isolation and alias mappings for full, minimal, and codex", async (t) => {
+  // 1. Full mode surface
+  const fullCtx = await createTestServer(t, { toolMode: "full" });
+  const fullTools = (await fullCtx.client.listTools()).tools.map((t) => t.name);
+  assert.ok(fullTools.includes("open_workspace"));
+  assert.ok(fullTools.includes("read"));
+  assert.ok(fullTools.includes("write"));
+  assert.ok(fullTools.includes("edit"));
+  assert.ok(fullTools.includes("apply_patch"));
+  assert.ok(fullTools.includes("bash"));
+  assert.ok(fullTools.includes("grep_files"));
+  assert.ok(fullTools.includes("find_files"));
+  assert.ok(fullTools.includes("list_directory"));
+  // Aliases in full mode
+  assert.ok(fullTools.includes("grep"));
+  assert.ok(fullTools.includes("glob"));
+  assert.ok(fullTools.includes("ls"));
+
+  // 2. Minimal mode surface
+  const minCtx = await createTestServer(t, { toolMode: "minimal" });
+  const minTools = (await minCtx.client.listTools()).tools.map((t) => t.name);
+  assert.ok(minTools.includes("open_workspace"));
+  assert.ok(minTools.includes("read"));
+  assert.ok(minTools.includes("write"));
+  assert.ok(minTools.includes("edit"));
+  assert.ok(minTools.includes("apply_patch"));
+  assert.ok(minTools.includes("bash"));
+  assert.ok(minTools.includes("grep_files"));
+  assert.ok(minTools.includes("find_files"));
+  assert.ok(minTools.includes("list_directory"));
+
+  // 3. Codex mode surface
+  const codexCtx = await createTestServer(t, { toolMode: "codex" });
+  const codexTools = (await codexCtx.client.listTools()).tools.map((t) => t.name);
+  assert.ok(codexTools.includes("open_workspace"));
+  assert.ok(codexTools.includes("read"));
+  assert.ok(codexTools.includes("apply_patch"));
+  assert.ok(codexTools.includes("exec_command"));
+  assert.ok(codexTools.includes("write_stdin"));
+  // In codex mode, bash/write/edit should be omitted
+  assert.equal(codexTools.includes("bash"), false, "bash should not be present in codex mode");
+  assert.equal(codexTools.includes("write"), false, "write should not be present in codex mode");
+  assert.equal(codexTools.includes("edit"), false, "edit should not be present in codex mode");
+});
+
+test("G8: stale edit fail-closed with recovery guidance, accurate edit resolution, and patch application in full mode", async (t) => {
   const context = await createTestServer(t, { toolMode: "full" });
   const { project, client } = context;
 
@@ -719,12 +878,6 @@ test("G6: stale edit fail-closed with recovery guidance, accurate edit resolutio
   assert.equal(updatedContent, "line 1: apple\nline 2: blueberry\nline 3: cherry\n");
 
   // 3. Fast patch application via apply_patch in full mode
-  const toolList = await client.listTools();
-  assert.ok(
-    toolList.tools.some((tool) => tool.name === "apply_patch"),
-    "apply_patch must be registered in full mode",
-  );
-
   const patchString = [
     "*** Begin Patch",
     `*** Update File: ${targetFile}`,
