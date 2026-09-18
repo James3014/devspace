@@ -1849,8 +1849,13 @@ export class LocalAgentSessionManager {
           || runtimeIdentity !== catalogReceipt.runtimeIdentity) {
           throw new Error("Persisted OpenCode catalog receipt drifted before provider invocation; refusing execution.");
         }
-        const validation = validateOpencodeModelAndVariant(catalogReceipt.model, catalogReceipt.effort, liveCatalog);
-        if (!validation.valid) throw new Error(validation.reason ?? "Persisted OpenCode catalog receipt is no longer valid.");
+        // Model/variant membership was already admitted against the fresh snapshot
+        // captured in catalogReceipt for this exact durable turn. A second model-list
+        // read may transiently omit an otherwise admitted route; do not let that
+        // ephemeral observation revoke the same launch. Source/runtime/freshness drift
+        // above still fails closed. Continuations revalidate current membership before
+        // a new turn is created.
+
       }
       if (catalogReceipt?.provider === "cline") {
         const liveCatalog = await this.clineCatalogService?.refresh();

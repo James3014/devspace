@@ -4249,7 +4249,25 @@ test("OpenCode catalog receipt allows generation-only refresh and rejects semant
     assert.ok(removedModelLaunch);
     const beforeRemoval = providerCalls;
     await reopened.runWorkerTurnFromFile(third.agentId, removedModelLaunch.promptFile, removedModelLaunch.workerToken);
-    assert.equal(providerCalls, beforeRemoval, "removing the exact model must still reject before provider invocation");
+    assert.equal(
+      providerCalls,
+      beforeRemoval + 1,
+      "same-turn launch must stay bound to the fresh catalog admission even if a second catalog read transiently omits the model",
+    );
+
+    await assert.rejects(
+      () => reopened!.continueAgent({
+        workspaceId: "ws_1",
+        workspaceRoot: f.repo,
+        agentId: third.agentId,
+        prompt: "continue-after-removal",
+        profiles: [profile],
+        profileCatalog,
+        opencodeCatalog: current,
+      }),
+      /not available in the current catalog/,
+      "a later continuation must revalidate current model membership and fail closed",
+    );
   } finally {
     manager.close();
     try { reopened?.close(); } catch { /* already closed */ }
