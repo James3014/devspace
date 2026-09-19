@@ -550,6 +550,14 @@ async function inspectManagedClones(input: HostStorageRetentionInput): Promise<H
       artifacts.push({ ...base, lifecycle: "FOREIGN", reason: "clone destination does not resolve beneath its DevSpace ownership root" });
       continue;
     }
+    if (!(await pathInsideAnyCanonicalRoot(canonicalDestination, input.allowedRoots))) {
+      artifacts.push({
+        ...base,
+        lifecycle: "FOREIGN",
+        reason: "managed clone is outside the current configured filesystem allowlist",
+      });
+      continue;
+    }
     if (operation.status === "started" || operation.status === "outcome_unknown") {
       artifacts.push({
         ...base,
