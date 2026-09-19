@@ -320,10 +320,14 @@ export class WorkspaceRegistry {
     return this.store?.listConversationBindings?.() ?? [];
   }
 
-  deleteDurableSession(workspaceId: string): void {
+  assertDurableSessionUnloaded(workspaceId: string): void {
     if (this.workspaces.has(workspaceId)) {
       throw new Error(`Workspace ${workspaceId} is loaded and cannot be garbage-collected.`);
     }
+  }
+
+  deleteDurableSession(workspaceId: string): void {
+    this.assertDurableSessionUnloaded(workspaceId);
     this.store?.deleteSession?.(workspaceId);
   }
 
