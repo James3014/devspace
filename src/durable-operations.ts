@@ -215,6 +215,17 @@ export class DurableOperationStore {
     return row ? rowToRecord(row) : undefined;
   }
 
+  list(kind?: DurableOperationKind): DurableOperationRecord[] {
+    const rows = (kind
+      ? this.database.sqlite.prepare(
+          "select * from durable_operations where kind = ? order by updated_at desc",
+        ).all(kind)
+      : this.database.sqlite.prepare(
+          "select * from durable_operations order by updated_at desc",
+        ).all()) as DurableOperationRow[];
+    return rows.map(rowToRecord);
+  }
+
   getByAttempt(scopeRoot: string, attemptKey: string): DurableOperationRecord | undefined {
     const row = this.database.sqlite.prepare(
       "select * from durable_operations where scope_root = ? and attempt_key = ? limit 1",

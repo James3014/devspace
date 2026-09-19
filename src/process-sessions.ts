@@ -873,6 +873,23 @@ export class ProcessSessionManager {
     };
   }
 
+  retentionWorkspaceStates(): Map<string, "ACTIVE" | "UNKNOWN"> {
+    const states = new Map<string, "ACTIVE" | "UNKNOWN">();
+    for (const session of this.sessions.values()) {
+      const state =
+        session.running || session.processTreeState === "still-running"
+          ? "ACTIVE"
+          : session.processTreeState === "unknown"
+            ? "UNKNOWN"
+            : undefined;
+      if (!state) continue;
+      if (state === "ACTIVE" || !states.has(session.workspaceId)) {
+        states.set(session.workspaceId, state);
+      }
+    }
+    return states;
+  }
+
   getCoreMutationBinding(workspaceId: string, sessionId: number): CoreMutationProcessBinding | undefined {
     const binding = this.getOwnedSession(workspaceId, sessionId).coreMutation;
     return binding ? { ...binding } : undefined;

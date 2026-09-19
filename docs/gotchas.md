@@ -150,9 +150,46 @@ shows the combined changes and advances the review point automatically.
 
 ## Data Retention
 
-DevSpace does not currently prune workspace sessions, conversation bindings,
-or review refs. A future product retention policy will define safe cleanup for
-these records; no automatic deletion is performed today.
+DevSpace exposes an ownership-aware storage inventory and an explicit garbage-
+collection apply step through the MCP tools `storage_inventory` and
+`storage_gc`.
+
+The inventory is fail-closed. Checkout directories are user-owned and are never
+physical deletion targets; only old, unreferenced DevSpace session metadata can
+be collected. Managed worktrees are reclaimable only when they are outside the
+active server registry, have no live/unknown process, conversation or agent
+reference, are clean, remain registered to their source repository, still match
+their opening base commit, and have passed the retention grace period. Clean
+worktrees with later commits are retained.
+
+Receipt-owned clones below a `.devspace-chatgpt` ownership root are inventoried
+separately. They become reclaimable only when their durable `workspace_clone`
+operation succeeded, no workspace/agent still references them, their Git root is
+clean, and HEAD still matches the clone receipt. Repositories found under that
+root without a durable creation receipt stay `UNKNOWN`; clones placed at an
+explicit user path outside that ownership root are not deletion targets.
+
+Release cleanup accepts only real directories inside the canonical DevSpace
+release root with the expected package identity. It pins a release matching the
+running source revision, preserves bounded activation/rollback references, and
+keeps the newest rollback candidates. Browser profiles require positive durable
+terminal/unreferenced carrier evidence (or an explicit DevSpace lifecycle
+marker), plus a successful host-process check proving no process still uses the
+profile. Missing browser reference/process evidence remains `UNKNOWN`.
+
+Backup-like verification/build directories under the package root are also
+inventoried, but naming and location alone never grant deletion authority.
+Unmarked legacy backups remain `UNKNOWN`; only a canonical in-root artifact
+with an explicit DevSpace terminal marker can become `GC_ELIGIBLE`.
+
+`storage_gc` requires the exact plan id returned by `storage_inventory` and
+rebuilds the inventory before deletion. Before the first destructive effect it
+atomically claims a durable GC journal, then records the exact artifact before
+each effect. A completed journal makes exact replay idempotent; an interrupted,
+corrupt, or partially applied journal returns
+`STORAGE_RECONCILIATION_REQUIRED` instead of re-running deletion. Provider-owned
+state such as `~/.codex` or `~/.gemini`, and broad temporary roots such as
+`/private/tmp`, are outside this GC authority.
 
 ## MCP Workspace Path Rejected
 

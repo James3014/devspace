@@ -316,6 +316,21 @@ export class WorkspaceRegistry {
     return this.store?.listSessions() ?? [];
   }
 
+  listConversationBindings(): WorkspaceConversationBinding[] {
+    return this.store?.listConversationBindings?.() ?? [];
+  }
+
+  assertDurableSessionUnloaded(workspaceId: string): void {
+    if (this.workspaces.has(workspaceId)) {
+      throw new Error(`Workspace ${workspaceId} is loaded and cannot be garbage-collected.`);
+    }
+  }
+
+  deleteDurableSession(workspaceId: string): void {
+    this.assertDurableSessionUnloaded(workspaceId);
+    this.store?.deleteSession?.(workspaceId);
+  }
+
   inspectWorkspace(
     workspaceId: string,
   ): { session?: WorkspaceSession; loaded: boolean } {

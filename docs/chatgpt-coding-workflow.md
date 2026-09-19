@@ -95,6 +95,21 @@ Each worktree-mode call creates a new managed worktree and returns a new
 `open_workspace` in worktree mode again only when another isolated worktree is
 actually required.
 
+Long-running hosts can inspect retained DevSpace storage with
+`storage_inventory`. The returned plan identifies ownership evidence,
+active/pinned state, trustworthy age/last-use signals, blockers, and exact
+`GC_ELIGIBLE` artifacts. Destructive cleanup is a separate `storage_gc` call
+bound to that exact plan id. Managed worktrees with dirty files, later commits,
+durable conversation bindings, loaded workspace state, live/unknown process
+state, or resumable/unreconciled agents are retained.
+
+The same inventory covers DevSpace session metadata, receipt-owned repositories
+below `.devspace-chatgpt`, retained releases, and browser runtime profiles.
+User checkouts, explicit clones outside a DevSpace ownership root, provider
+state, and unproven legacy artifacts are not deletion targets. GC writes a
+durable journal before destructive effects; interrupted cleanup requires
+reconciliation and exact completed-plan replay is idempotent.
+
 Uncommitted source checkout changes are not copied into the managed worktree.
 DevSpace reports when the source checkout was dirty so the model can decide how
 to proceed with the user.

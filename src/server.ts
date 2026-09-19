@@ -121,6 +121,7 @@ import { ChatSwarmLifecycle } from "./chat-swarm-lifecycle.js";
 import type { ChatSwarmStore, ChatSwarmMigrationBundle } from "./chat-swarm-store.js";
 import { registerChatSwarmTools, chatSwarmToolInputShapes } from "./chat-swarm-tools.js";
 import { ChatSwarmRuntimeOwner } from "./chat-swarm-runtime-owner.js";
+import { ChatSwarmRuntimeStore } from "./chat-swarm-runtime.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
@@ -215,6 +216,8 @@ import {
 } from "./repository-intelligence.js";
 import { registerRepositoryIntelligenceArtifactTool } from "./repository-intelligence-artifact.js";
 import { registerPhysicalHostRegistryTools } from "./physical-host-registry.js";
+import { canonicalizePath } from "./roots.js";
+import { applyHostStoragePlan, buildHostStoragePlan, resolveHostStorageRoot } from "./host-storage-retention.js";
 
 type Transport = StreamableHTTPServerTransport;
 class ReboundTransport extends StreamableHTTPServerTransport {
@@ -2864,6 +2867,109 @@ export function createMcpServer(
     ?? { value: runtimeBuildIdentity.profileCatalogGeneration };
   const agentStartInputSchema = createAgentStartInputSchema();
   const agentPreflightInputSchema = createAgentPreflightInputSchema();
+
+  const hostStorageInput = () => {
+    const workspaceSessions = workspaces.listSessions();
+    const browserProfileStates = new Map<string, "ACTIVE" | "TERMINAL" | "UNKNOWN">();
+    let browserReferenceStateAvailable = false;
+    let browserStore: ChatSwarmRuntimeStore | undefined;
+    try {
+      browserStore = new ChatSwarmRuntimeStore(config.stateDir);
+      const grouped = new Map<string, Set<"ACTIVE" | "TERMINAL" | "UNKNOWN">>();
+      for (const slot of browserStore.listAllSlots()) {
+        const state =
+          slot.state === "STOPPED"
+            ? "TERMINAL"
+            : slot.state === "RECONCILE_REQUIRED"
+              ? "UNKNOWN"
+              : "ACTIVE";
+        const states = grouped.get(slot.browserProfileId) ?? new Set();
+        states.add(state);
+        grouped.set(slot.browserProfileId, states);
+      }
+      for (const [profileId, states] of grouped) {
+        browserProfileStates.set(
+          profileId,
+          states.has("ACTIVE")
+            ? "ACTIVE"
+            : states.has("UNKNOWN")
+              ? "UNKNOWN"
+              : "TERMINAL",
+        );
+      }
+      browserReferenceStateAvailable = true;
+    } catch {
+      browserReferenceStateAvailable = false;
+    } finally {
+      browserStore?.close();
+    }
+
+    return {
+      stateDir: config.stateDir,
+      worktreeRoot: config.worktreeRoot,
+      packageRoot: resolveHostStorageRoot(resolve(dirname(fileURLToPath(import.meta.url)), "..")),
+      workspaceSessions,
+      conversationBindings: workspaces.listConversationBindings(),
+      loadedWorkspaceIds: new Set(
+        workspaceSessions
+          .filter((session) => workspaces.inspectWorkspace(session.id).loaded)
+          .map((session) => session.id),
+      ),
+      agentRecords: agentSessionManager?.listAllAgentRecords() ?? [],
+      processWorkspaceStates: processSessions.retentionWorkspaceStates(),
+      durableOperations: durableOperations?.store.list() ?? [],
+      allowedRoots: config.allowedRoots,
+      browserProfileStates,
+      browserReferenceStateAvailable,
+      activeSourceCommit: runtimeBuildIdentity.sourceCommit,
+    };
+  };
+
+  const assertStoragePathUnreferenced = (path: string): void => {
+    const canonical = canonicalizePath(path);
+    const processStates = processSessions.retentionWorkspaceStates();
+    for (const session of workspaces.listSessions()) {
+      if (canonicalizePath(session.root) !== canonical) continue;
+      if (workspaces.inspectWorkspace(session.id).loaded) {
+        throw new Error(`Path is loaded by workspace ${session.id}.`);
+      }
+      if (processStates.has(session.id)) {
+        throw new Error(`Path has active or unresolved process-session state for workspace ${session.id}.`);
+      }
+    }
+    for (const record of agentSessionManager?.listAllAgentRecords() ?? []) {
+      if (canonicalizePath(record.workspaceRoot) !== canonical) continue;
+      const unresolvedLifecycle = Boolean(
+        record.lifecycleState?.terminationPending ||
+        record.lifecycleState?.lifecycleCorrupt ||
+        record.lifecycleState?.terminationBlocked ||
+        record.lifecycleState?.activeTurn ||
+        record.terminalReason === "unknown" ||
+        record.scopeState === "UNKNOWN",
+      );
+      if (
+        record.status === "starting" ||
+        record.status === "running" ||
+        record.status === "idle" ||
+        unresolvedLifecycle
+      ) {
+        throw new Error(`Path has active or unresolved agent state ${record.id}.`);
+      }
+    }
+    for (const operation of durableOperations?.store.list() ?? []) {
+      if (operation.status !== "started" && operation.status !== "outcome_unknown") continue;
+      if (canonicalizePath(operation.scopeRoot) === canonical) {
+        throw new Error(`Path has unresolved durable operation ${operation.operationId}.`);
+      }
+      if (operation.workspaceId) {
+        const session = workspaces.listSessions().find((candidate) => candidate.id === operation.workspaceId);
+        if (session && canonicalizePath(session.root) === canonical) {
+          throw new Error(`Path has unresolved durable operation ${operation.operationId} for workspace ${operation.workspaceId}.`);
+        }
+      }
+    }
+  };
+
   const capabilityManifest = runtimeBuildIdentityContext?.capabilityManifest
     ?? deriveLoadedCapabilityManifest(
       config.subagents && agentSessionManager
@@ -2892,6 +2998,66 @@ export function createMcpServer(
     },
   );
 
+  registerAppTool(
+    server,
+    "storage_inventory",
+    {
+      title: "Inspect DevSpace storage retention",
+      description:
+        "Read-only inventory of DevSpace-owned host storage. Classifies managed worktrees, retained releases, and browser runtimes without deleting anything. Unknown or foreign paths fail closed.",
+      inputSchema: {},
+      outputSchema: {
+        plan: z.record(z.string(), z.unknown()),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async () => {
+      const plan = await buildHostStoragePlan(hostStorageInput());
+      return {
+        content: [
+          textBlock(
+            `Storage inventory ${plan.planId}: ${plan.artifacts.length} artifact(s), ${plan.reclaimableBytes} reclaimable byte(s).`,
+          ),
+        ],
+        structuredContent: { plan: plan as unknown as Record<string, unknown> },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "storage_gc",
+    {
+      title: "Apply exact DevSpace storage GC plan",
+      description:
+        "Destructively applies one exact storage_inventory plan after re-reading current ownership/lifecycle evidence. Refuses stale plans; active, dirty, referenced, unknown, foreign, and provider-owned state is retained.",
+      inputSchema: {
+        expectedPlanId: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+        confirm: z.literal(true),
+      },
+      outputSchema: {
+        result: z.record(z.string(), z.unknown()),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ expectedPlanId }) => {
+      const result = await applyHostStoragePlan(hostStorageInput(), expectedPlanId, {
+        assertWorkspaceSessionUnloaded: (workspaceId) => workspaces.assertDurableSessionUnloaded(workspaceId),
+        deleteWorkspaceSession: (workspaceId) => workspaces.deleteDurableSession(workspaceId),
+        assertPathUnreferenced: assertStoragePathUnreferenced,
+      });
+      return {
+        content: [
+          textBlock(
+            `Storage GC ${result.planId}: removed ${result.removed.length} artifact(s), reclaimed ${result.reclaimedBytes} byte(s), skipped ${result.skipped.length}.`,
+          ),
+        ],
+        structuredContent: { result: result as unknown as Record<string, unknown> },
+      };
+    },
+  );
   const coreMutationGuard = createCoreMutationGuard(workspaces, coreMutationSessions, coreMutationTestOnlyBypass);
   const inspectCoreWriterDomain = (
     session: CoreMutationSessionRecord,

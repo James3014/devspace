@@ -43,10 +43,12 @@ export interface WorkspaceStore {
   getSession(id: string): WorkspaceSession | undefined;
   listSessions(): WorkspaceSession[];
   touchSession(id: string): void;
+  deleteSession?(id: string): void;
   getConversationBinding(
     conversationScopeId: string,
     targetKey: string,
   ): WorkspaceConversationBinding | undefined;
+  listConversationBindings?(): WorkspaceConversationBinding[];
   listConversationBindingsForTarget(targetKey: string): WorkspaceConversationBinding[];
   setConversationBinding(input: {
     conversationScopeId: string;
@@ -133,6 +135,13 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       .run();
   }
 
+  deleteSession(id: string): void {
+    this.database.db
+      .delete(workspaceSessions)
+      .where(eq(workspaceSessions.id, id))
+      .run();
+  }
+
   getConversationBinding(
     conversationScopeId: string,
     targetKey: string,
@@ -149,6 +158,14 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
       .get();
 
     return row ? rowToWorkspaceConversationBinding(row) : undefined;
+  }
+
+  listConversationBindings(): WorkspaceConversationBinding[] {
+    return this.database.db
+      .select()
+      .from(workspaceConversationBindings)
+      .all()
+      .map(rowToWorkspaceConversationBinding);
   }
 
   listConversationBindingsForTarget(targetKey: string): WorkspaceConversationBinding[] {
