@@ -982,7 +982,7 @@ test("owner-local drained restart reuses exact carrier authority without MCP ses
 
     await assert.rejects(
       performLocalBoundCutoverRestart({
-        config,cutoverId,carrierId:approved.id,expectedCarrierVersion:2,expectedValidityVersion:1,
+        config,cutoverId,carrierId:approved.id,expectedCarrierVersion:2,expectedValidityVersion:1,carrierCredential:pairing.credential,
         confirmCutoverId:cutoverId,packageRoot:f.root,
       },dependencies),
       /version changed/i,
@@ -992,6 +992,16 @@ test("owner-local drained restart reuses exact carrier authority without MCP ses
     await assert.rejects(
       performLocalBoundCutoverRestart({
         config,cutoverId,carrierId:approved.id,expectedCarrierVersion:1,expectedValidityVersion:1,
+        carrierCredential:"x".repeat(43),
+        confirmCutoverId:cutoverId,packageRoot:f.root,
+      },dependencies),
+      /credential/i,
+    );
+    assert.equal(f.snapshot(),drainedSnapshot);
+
+    await assert.rejects(
+      performLocalBoundCutoverRestart({
+        config,cutoverId,carrierId:approved.id,expectedCarrierVersion:1,expectedValidityVersion:1,carrierCredential:pairing.credential,
         confirmCutoverId:cutoverId,packageRoot:f.root,
       },{
         ...dependencies,
