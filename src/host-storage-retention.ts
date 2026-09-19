@@ -671,24 +671,55 @@ async function samePhysicalPath(left: string, right: string): Promise<boolean> {
 
 async function inspectReleases(input: HostStorageRetentionInput): Promise<HostStorageArtifact[]> {
   const releaseRoot = join(resolve(input.packageRoot), "releases");
+  const canonicalReleaseRoot = await canonicalPath(releaseRoot);
   const dirs = await directoryChildren(releaseRoot);
   if (dirs.length === 0) return [];
 
-  const activeRoot = await realpath(resolve(input.packageRoot)).catch(() => resolve(input.packageRoot));
   const pinnedReferences = await collectReleaseReferences(input.stateDir, releaseRoot);
   const owned: Array<{ path: string; name: string; sizeBytes: number; modifiedAt: string; mtimeMs: number }> = [];
   const foreign: HostStorageArtifact[] = [];
 
   for (const name of dirs) {
-    const path = join(releaseRoot, name);
+    const rawPath = join(releaseRoot, name);
+    const path = await canonicalPath(rawPath);
     if (!/^release-[A-Za-z0-9._-]+$/u.test(name)) {
       foreign.push({
         id: `release:${name}`,
         kind: "release",
         path,
+        ownershipRoot: canonicalReleaseRoot,
         lifecycle: "FOREIGN",
         reason: "entry does not match DevSpace release naming",
         sizeBytes: await directorySize(path),
+        ownershipEvidence: "release naming/identity contract did not match",
+      });
+      continue;
+    }
+    if (!isPathInsideRoot(path, canonicalReleaseRoot) || path === canonicalReleaseRoot) {
+      foreign.push({
+        id: `release:${name}`,
+        kind: "release",
+        path,
+        ownershipRoot: canonicalReleaseRoot,
+        lifecycle: "FOREIGN",
+        reason: "release entry resolves outside the DevSpace release root",
+        sizeBytes: await directorySize(path),
+        ownershipEvidence: "canonical release-root containment failed",
+      });
+      continue;
+    }
+
+    const stats = await lstat(path).catch(() => undefined);
+    if (!stats || stats.isSymbolicLink() || !stats.isDirectory()) {
+      foreign.push({
+        id: `release:${name}`,
+        kind: "release",
+        path,
+        ownershipRoot: canonicalReleaseRoot,
+        lifecycle: "UNKNOWN",
+        reason: "release entry is not a real directory",
+        sizeBytes: await directorySize(path),
+        ownershipEvidence: "release path shape is not safely owned",
       });
       continue;
     }
@@ -699,19 +730,21 @@ async function inspectReleases(input: HostStorageRetentionInput): Promise<HostSt
         id: `release:${name}`,
         kind: "release",
         path,
+        ownershipRoot: canonicalReleaseRoot,
         lifecycle: "UNKNOWN",
         reason: "release directory lacks a matching DevSpace package identity",
         sizeBytes: await directorySize(path),
+        ownershipEvidence: "package identity could not prove DevSpace ownership",
       });
       continue;
     }
-    const stats = await stat(path);
+    const dirStats = await stat(path);
     owned.push({
       path,
       name,
       sizeBytes: await directorySize(path),
-      modifiedAt: stats.mtime.toISOString(),
-      mtimeMs: stats.mtimeMs,
+      modifiedAt: dirStats.mtime.toISOString(),
+      mtimeMs: dirStats.mtimeMs,
     });
   }
 
@@ -720,48 +753,60 @@ async function inspectReleases(input: HostStorageRetentionInput): Promise<HostSt
   const keep = new Set(owned.slice(0, keepCount).map((entry) => entry.path));
 
   const artifacts = owned.map<HostStorageArtifact>((entry) => {
-    const canonical = resolve(entry.path);
-    if (activeRoot === canonical || isPathInsideRoot(activeRoot, canonical)) {
+    const releaseRevision = entry.name.slice("release-".length);
+    if (
+      input.activeSourceCommit &&
+      /^[0-9a-f]{7,40}$/u.test(releaseRevision) &&
+      input.activeSourceCommit.startsWith(releaseRevision)
+    ) {
       return {
         id: `release:${entry.name}`,
         kind: "release",
-        path: canonical,
+        path: entry.path,
+        ownershipRoot: canonicalReleaseRoot,
         lifecycle: "ACTIVE",
-        reason: "currently executing package root resolves inside this release",
+        reason: "release revision matches the currently running DevSpace source commit",
         sizeBytes: entry.sizeBytes,
         modifiedAt: entry.modifiedAt,
+        ownershipEvidence: "DevSpace package identity plus running source revision match",
       };
     }
-    if (pinnedReferences.has(canonical)) {
+    if (pinnedReferences.has(entry.path) || pinnedReferences.has(resolve(entry.path))) {
       return {
         id: `release:${entry.name}`,
         kind: "release",
-        path: canonical,
+        path: entry.path,
+        ownershipRoot: canonicalReleaseRoot,
         lifecycle: "PINNED",
         reason: "release is referenced by a bounded DevSpace activation/rollback receipt",
         sizeBytes: entry.sizeBytes,
         modifiedAt: entry.modifiedAt,
+        ownershipEvidence: "DevSpace package identity plus durable activation/rollback reference",
       };
     }
     if (keep.has(entry.path)) {
       return {
         id: `release:${entry.name}`,
         kind: "release",
-        path: canonical,
+        path: entry.path,
+        ownershipRoot: canonicalReleaseRoot,
         lifecycle: "PINNED",
         reason: `release is inside the newest ${keepCount} rollback candidates`,
         sizeBytes: entry.sizeBytes,
         modifiedAt: entry.modifiedAt,
+        ownershipEvidence: "DevSpace package identity plus rollback-count retention policy",
       };
     }
     return {
       id: `release:${entry.name}`,
       kind: "release",
-      path: canonical,
+      path: entry.path,
+      ownershipRoot: canonicalReleaseRoot,
       lifecycle: "GC_ELIGIBLE",
-      reason: "owned release is outside rollback retention and has no bounded receipt reference",
+      reason: "owned release is outside rollback retention and has no active/reference evidence",
       sizeBytes: entry.sizeBytes,
       modifiedAt: entry.modifiedAt,
+      ownershipEvidence: "DevSpace release root, release naming, and package identity all matched",
     };
   });
 
