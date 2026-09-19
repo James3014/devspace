@@ -909,6 +909,36 @@ async function inspectVerificationArtifacts(input: HostStorageRetentionInput): P
   return artifacts;
 }
 
+async function releaseOwnershipEvidence(path: string, name: string): Promise<string | undefined> {
+  const directPackage = await readJson(join(path, "package.json"));
+  if (directPackage?.name === "@waishnav/devspace") {
+    return "direct release package identifies @waishnav/devspace";
+  }
+
+  const releaseRevision = name.slice("release-".length);
+  if (!/^[0-9a-f]{7,40}$/u.test(releaseRevision)) return undefined;
+
+  const nestedRaw = join(path, "node_modules", "@waishnav", "devspace");
+  const nestedStats = await lstat(nestedRaw).catch(() => undefined);
+  if (!nestedStats || nestedStats.isSymbolicLink() || !nestedStats.isDirectory()) return undefined;
+
+  const nestedPath = await canonicalPath(nestedRaw);
+  const releasePath = await canonicalPath(path);
+  if (!isPathInsideRoot(nestedPath, releasePath) || nestedPath === releasePath) return undefined;
+
+  const nestedPackage = await readJson(join(nestedPath, "package.json"));
+  if (nestedPackage?.name !== "@waishnav/devspace") return undefined;
+
+  const buildIdentity = await readJson(join(nestedPath, "generated", "build-identity.json"));
+  const sourceCommit =
+    typeof buildIdentity?.source_commit === "string" ? buildIdentity.source_commit : undefined;
+  if (!sourceCommit || !/^[0-9a-f]{40}$/u.test(sourceCommit) || !sourceCommit.startsWith(releaseRevision)) {
+    return undefined;
+  }
+
+  return "deployment wrapper contains @waishnav/devspace with release-matching build identity";
+}
+
 async function inspectReleases(input: HostStorageRetentionInput): Promise<HostStorageArtifact[]> {
   const releaseRoot = join(resolve(input.packageRoot), "releases");
   const canonicalReleaseRoot = await canonicalPath(releaseRoot);
@@ -916,7 +946,14 @@ async function inspectReleases(input: HostStorageRetentionInput): Promise<HostSt
   if (dirs.length === 0) return [];
 
   const pinnedReferences = await collectReleaseReferences(input.stateDir, releaseRoot);
-  const owned: Array<{ path: string; name: string; sizeBytes: number; modifiedAt: string; mtimeMs: number }> = [];
+  const owned: Array<{
+    path: string;
+    name: string;
+    sizeBytes: number;
+    modifiedAt: string;
+    mtimeMs: number;
+    ownershipEvidence: string;
+  }> = [];
   const foreign: HostStorageArtifact[] = [];
 
   for (const name of dirs) {
@@ -964,8 +1001,8 @@ async function inspectReleases(input: HostStorageRetentionInput): Promise<HostSt
       continue;
     }
 
-    const packageJson = await readJson(join(path, "package.json"));
-    if (packageJson?.name !== "@waishnav/devspace") {
+    const ownershipEvidence = await releaseOwnershipEvidence(path, name);
+    if (!ownershipEvidence) {
       foreign.push({
         id: `release:${name}`,
         kind: "release",
@@ -974,7 +1011,7 @@ async function inspectReleases(input: HostStorageRetentionInput): Promise<HostSt
         lifecycle: "UNKNOWN",
         reason: "release directory lacks a matching DevSpace package identity",
         sizeBytes: await directorySize(path),
-        ownershipEvidence: "package identity could not prove DevSpace ownership",
+        ownershipEvidence: "package/build identity could not prove DevSpace ownership",
       });
       continue;
     }
@@ -985,6 +1022,7 @@ async function inspectReleases(input: HostStorageRetentionInput): Promise<HostSt
       sizeBytes: await directorySize(path),
       modifiedAt: dirStats.mtime.toISOString(),
       mtimeMs: dirStats.mtimeMs,
+      ownershipEvidence,
     });
   }
 
@@ -1008,7 +1046,7 @@ async function inspectReleases(input: HostStorageRetentionInput): Promise<HostSt
         reason: "release revision matches the currently running DevSpace source commit",
         sizeBytes: entry.sizeBytes,
         modifiedAt: entry.modifiedAt,
-        ownershipEvidence: "DevSpace package identity plus running source revision match",
+        ownershipEvidence: `${entry.ownershipEvidence}; running source revision match`,
       };
     }
     if (pinnedReferences.has(entry.path) || pinnedReferences.has(resolve(entry.path))) {
@@ -1021,7 +1059,7 @@ async function inspectReleases(input: HostStorageRetentionInput): Promise<HostSt
         reason: "release is referenced by a bounded DevSpace activation/rollback receipt",
         sizeBytes: entry.sizeBytes,
         modifiedAt: entry.modifiedAt,
-        ownershipEvidence: "DevSpace package identity plus durable activation/rollback reference",
+        ownershipEvidence: `${entry.ownershipEvidence}; durable activation/rollback reference`,
       };
     }
     if (keep.has(entry.path)) {
@@ -1034,7 +1072,7 @@ async function inspectReleases(input: HostStorageRetentionInput): Promise<HostSt
         reason: `release is inside the newest ${keepCount} rollback candidates`,
         sizeBytes: entry.sizeBytes,
         modifiedAt: entry.modifiedAt,
-        ownershipEvidence: "DevSpace package identity plus rollback-count retention policy",
+        ownershipEvidence: `${entry.ownershipEvidence}; rollback-count retention policy`,
       };
     }
     return {
@@ -1046,7 +1084,7 @@ async function inspectReleases(input: HostStorageRetentionInput): Promise<HostSt
       reason: "owned release is outside rollback retention and has no active/reference evidence",
       sizeBytes: entry.sizeBytes,
       modifiedAt: entry.modifiedAt,
-      ownershipEvidence: "DevSpace release root, release naming, and package identity all matched",
+      ownershipEvidence: `${entry.ownershipEvidence}; release root and naming contract matched`,
     };
   });
 
