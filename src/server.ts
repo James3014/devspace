@@ -217,7 +217,7 @@ import {
 import { registerRepositoryIntelligenceArtifactTool } from "./repository-intelligence-artifact.js";
 import { registerPhysicalHostRegistryTools } from "./physical-host-registry.js";
 import { canonicalizePath } from "./roots.js";
-import { applyHostStoragePlan, buildHostStoragePlan } from "./host-storage-retention.js";
+import { applyHostStoragePlan, buildHostStoragePlan, resolveHostStorageRoot } from "./host-storage-retention.js";
 
 type Transport = StreamableHTTPServerTransport;
 class ReboundTransport extends StreamableHTTPServerTransport {
@@ -2907,7 +2907,7 @@ export function createMcpServer(
     return {
       stateDir: config.stateDir,
       worktreeRoot: config.worktreeRoot,
-      packageRoot: resolve(dirname(fileURLToPath(import.meta.url)), ".."),
+      packageRoot: resolveHostStorageRoot(resolve(dirname(fileURLToPath(import.meta.url)), "..")),
       workspaceSessions,
       conversationBindings: workspaces.listConversationBindings(),
       loadedWorkspaceIds: new Set(
