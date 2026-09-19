@@ -1020,6 +1020,7 @@ interface ScriptedSnapshotInput {
   output?: string;
   outputTruncated?: boolean;
   running?: boolean;
+  processTreeState?: ProcessSnapshot["processTreeState"];
 }
 
 function snapshotFor(input: ScriptedSnapshotInput): ProcessSnapshot {
@@ -1028,6 +1029,7 @@ function snapshotFor(input: ScriptedSnapshotInput): ProcessSnapshot {
     output: input.output ?? "",
     outputTruncated: input.outputTruncated ?? false,
     running: input.running ?? true,
+    processTreeState: input.processTreeState,
     wallTimeMs: 10,
   };
 }
@@ -1426,6 +1428,61 @@ class TerminalHandshakeBackend implements GoalProcessBackend {
     this.terminated = true;
   }
 }
+
+
+class UnresolvedCancelTreeBackend implements GoalProcessBackend {
+  private terminated = false;
+  private activated = false;
+
+  constructor(private readonly workspaceRoot: string) {}
+
+  async start(): Promise<ProcessSnapshot> {
+    return snapshotFor({
+      output: `model: gpt-5.6-sol medium
+directory: ${this.workspaceRoot}
+Ask Codex to do anything
+`,
+    });
+  }
+
+  async write(input: WriteStdinInput): Promise<ProcessSnapshot> {
+    if (this.terminated) {
+      return snapshotFor({ running: false, processTreeState: "still-running" });
+    }
+    if (input.chars?.includes("/goal ") || input.chars === "\r") {
+      this.activated = true;
+      return snapshotFor({ output: "Pursuing goal\n" });
+    }
+    return snapshotFor({ output: this.activated ? "" : "" });
+  }
+
+  terminate(): void {
+    this.terminated = true;
+  }
+}
+
+test("Codex Goal cancel surfaces unresolved owned descendant cleanup", async () => {
+  const workspace = realpathSync(tmpdir());
+  const backend = new UnresolvedCancelTreeBackend(workspace);
+  const manager = scriptedGoalManager(backend);
+  try {
+    const started = await manager.start({
+      workspaceId: "ws_process_tree_reconcile",
+      workspaceRoot: workspace,
+      goal: "prove cancellation",
+      model: "gpt-5.6-sol",
+    });
+    assert.equal(started.goalActiveObserved, true);
+
+    const cancelled = await manager.cancel("ws_process_tree_reconcile", started.goalId);
+    assert.equal(cancelled.terminal, true);
+    assert.equal(cancelled.processTreeState, "still-running");
+    assert.equal(cancelled.terminalReason, "cancel_reconciliation_required");
+    assert.match(cancelled.error ?? "", /owned descendant cleanup is still-running/);
+  } finally {
+    manager.shutdown();
+  }
+});
 
 test("Codex Goal answers only the bounded startup terminal handshake before typing /goal", async () => {
   const workspace = realpathSync(tmpdir());

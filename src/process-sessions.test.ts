@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { createRequire } from "node:module";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   HeadTailBuffer,
@@ -967,4 +968,118 @@ try {
   assert.match(`${terminatedPty.output}${terminatedReady.output}${terminatedStatus.output}`, /before-terminate/);
 } finally {
   g2Manager.shutdown();
+}
+
+
+if (process.platform === "darwin") {
+  const sleep = (milliseconds: number) => new Promise<void>((resolve) => setTimeout(resolve, milliseconds));
+  const processAlive = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code !== "ESRCH";
+    }
+  };
+  const waitForPidFile = async (path: string): Promise<number> => {
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline) {
+      try {
+        const pid = Number(readFileSync(path, "utf8"));
+        if (Number.isInteger(pid) && pid > 0) return pid;
+      } catch {}
+      await sleep(25);
+    }
+    throw new Error(`Timed out waiting for process witness file ${path}`);
+  };
+
+  const verifyOwnedDescendantCleanup = async (tty: boolean): Promise<void> => {
+    const root = mkdtempSync(join("/tmp", tty ? "devspace-tree-pty-" : "devspace-tree-pipe-"));
+    const childPidPath = join(root, "child.pid");
+    const grandchildPidPath = join(root, "grandchild.pid");
+    const childScript = join(root, "child.mjs");
+    const parentScript = join(root, "parent.mjs");
+    writeFileSync(
+      childScript,
+      [
+        'import { spawn } from "node:child_process";',
+        'import { writeFileSync } from "node:fs";',
+        `const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { detached: true, stdio: "ignore" });`,
+        "child.unref();",
+        `writeFileSync(${JSON.stringify(grandchildPidPath)}, String(child.pid));`,
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+    );
+    writeFileSync(
+      parentScript,
+      [
+        'import { spawn } from "node:child_process";',
+        'import { writeFileSync } from "node:fs";',
+        `const child = spawn(process.execPath, [${JSON.stringify(childScript)}], { stdio: "ignore" });`,
+        `writeFileSync(${JSON.stringify(childPidPath)}, String(child.pid));`,
+        "setInterval(() => {}, 1000);",
+      ].join("\n"),
+    );
+
+    const sentinel = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      detached: true,
+      stdio: "ignore",
+    });
+    sentinel.unref();
+    const manager = new ProcessSessionManager({ completedSessionTtlMs: 60_000 });
+    let childPid = 0;
+    let grandchildPid = 0;
+    try {
+      const started = await manager.start({
+        workspaceId: tty ? "ws_tree_pty" : "ws_tree_pipe",
+        cwd: root,
+        command: "owned process tree witness",
+        executable: process.execPath,
+        args: [parentScript],
+        tty,
+        yieldTimeMs: 50,
+      });
+      assert.equal(started.running, true);
+      assert.ok(started.sessionId);
+      childPid = await waitForPidFile(childPidPath);
+      grandchildPid = await waitForPidFile(grandchildPidPath);
+      assert.equal(processAlive(childPid), true);
+      assert.equal(processAlive(grandchildPid), true);
+      assert.equal(processAlive(sentinel.pid!), true);
+
+      manager.terminate(tty ? "ws_tree_pty" : "ws_tree_pipe", started.sessionId!);
+
+      let reconciled = await manager.getStatus({
+        workspaceId: tty ? "ws_tree_pty" : "ws_tree_pipe",
+        sessionId: started.sessionId!,
+        yieldTimeMs: 1_000,
+      });
+      const deadline = Date.now() + 2_000;
+      while (reconciled.processTreeState !== "terminated" && Date.now() < deadline) {
+        await sleep(50);
+        reconciled = await manager.getStatus({
+          workspaceId: tty ? "ws_tree_pty" : "ws_tree_pipe",
+          sessionId: started.sessionId!,
+          yieldTimeMs: 50,
+        });
+      }
+
+      assert.equal(reconciled.running, false);
+      assert.equal(reconciled.processTreeState, "terminated");
+      assert.equal(processAlive(childPid), false);
+      assert.equal(processAlive(grandchildPid), false, "detached grandchild must not survive a clean termination claim");
+      assert.equal(processAlive(sentinel.pid!), true, "unrelated process must remain alive");
+    } finally {
+      manager.shutdown();
+      for (const pid of [grandchildPid, childPid, sentinel.pid ?? 0]) {
+        if (pid <= 0) continue;
+        try { process.kill(pid, "SIGKILL"); } catch {}
+      }
+      await sleep(50);
+      rmSync(root, { recursive: true, force: true });
+    }
+  };
+
+  await verifyOwnedDescendantCleanup(false);
+  await verifyOwnedDescendantCleanup(true);
 }

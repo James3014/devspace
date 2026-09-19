@@ -23,7 +23,14 @@ import {
 import { runLocalAgentProvider } from "./local-agent-adapters.js";
 import { resolveEffectiveExecutionIdlePolicy } from "./local-agent-idle-policy.js";
 import { LocalAgentProviderError, type LocalAgentRunCallbacks, type LocalAgentRunResult } from "./local-agent-runtime.js";
-import { terminateProcessTree, type KillableProcess } from "./process-platform.js";
+import {
+  inspectOwnedProcessTree,
+  signalOwnedProcessTree,
+  terminateProcessTree,
+  type KillableProcess,
+  type OwnedProcessIdentity,
+  type OwnedProcessTreeState,
+} from "./process-platform.js";
 import {
   type AgentTerminalReason,
   type EffectiveExecutionIdlePolicy,
@@ -2354,18 +2361,58 @@ async function terminateOwnedWorker(record: LocalAgentRecord): Promise<boolean> 
     },
   };
 
-  terminateProcessTree(killable, "SIGTERM", process.platform !== "win32");
+  const termReceipt = terminateProcessTree(killable, "SIGTERM", process.platform !== "win32");
+  const proofRequired = termReceipt.supported;
+  if (proofRequired && !termReceipt.captureComplete) return false;
+
+  let trackedDescendants = [...termReceipt.descendants];
   const postTermState = await waitForWorkerExitOrForeign(pid, record.id, workerToken, 1_000);
-  if (postTermState === "absent" || postTermState === "foreign") {
+  const postTermTreeState = proofRequired
+    ? await waitForOwnedProcessTreeState(trackedDescendants, 1_000)
+    : undefined;
+
+  const rootTerminated = postTermState === "absent" || postTermState === "foreign";
+  if (rootTerminated && (!proofRequired || postTermTreeState === "terminated")) {
     return true;
   }
-  if (postTermState !== "owned") {
+  if (!rootTerminated && postTermState !== "owned") {
     return false;
   }
 
-  terminateProcessTree(killable, "SIGKILL", process.platform !== "win32");
+  if (proofRequired && postTermTreeState !== "terminated") {
+    signalOwnedProcessTree(trackedDescendants, "SIGKILL", undefined, false);
+  }
+
+  if (postTermState === "owned") {
+    const killReceipt = terminateProcessTree(killable, "SIGKILL", process.platform !== "win32");
+    if (proofRequired && !killReceipt.captureComplete) return false;
+    if (killReceipt.descendants.length > 0) {
+      const merged = new Map<number, OwnedProcessIdentity>();
+      for (const target of trackedDescendants) merged.set(target.pid, target);
+      for (const target of killReceipt.descendants) merged.set(target.pid, target);
+      trackedDescendants = [...merged.values()];
+    }
+  }
+
   const postKillState = await waitForWorkerExitOrForeign(pid, record.id, workerToken, 500);
-  return postKillState === "absent" || postKillState === "foreign";
+  const postKillTreeState = proofRequired
+    ? await waitForOwnedProcessTreeState(trackedDescendants, 500)
+    : undefined;
+  return (postKillState === "absent" || postKillState === "foreign")
+    && (!proofRequired || postKillTreeState === "terminated");
+}
+
+async function waitForOwnedProcessTreeState(
+  descendants: readonly OwnedProcessIdentity[],
+  timeoutMs: number,
+): Promise<OwnedProcessTreeState> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const state = inspectOwnedProcessTree(descendants) ?? "unknown";
+    if (state === "terminated" || state === "unknown") return state;
+    await sleep(50);
+  }
+  return inspectOwnedProcessTree(descendants) ?? "unknown";
 }
 
 async function waitForWorkerExitOrForeign(

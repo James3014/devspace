@@ -68,6 +68,7 @@ export interface CodexGoalState {
   baseHead?: string;
   terminalReason?: string;
   error?: string;
+  processTreeState?: ProcessSnapshot["processTreeState"];
   coreMutation?: CoreMutationProcessBinding;
 }
 
@@ -88,6 +89,7 @@ interface GoalSession {
   signal?: string;
   terminalReason?: string;
   error?: string;
+  processTreeState?: ProcessSnapshot["processTreeState"];
   recentOutput: HeadTailBuffer;
   readiness?: DestructiveDeltaReadiness;
   readinessBlocked?: string;
@@ -1158,6 +1160,15 @@ export class CodexGoalSessionManager {
     if (!converged) {
       session.terminalReason = "cancel_timeout";
       session.error = `Cancellation did not converge within ${this.cancelTimeoutMs}ms.`;
+      if (process.platform === "darwin" && session.processTreeState === undefined) {
+        session.processTreeState = "unknown";
+      }
+    } else {
+      await this.pollSession(session, Math.min(this.cancelTimeoutMs, 5_000));
+      if (session.processTreeState !== undefined && session.processTreeState !== "terminated") {
+        session.terminalReason = "cancel_reconciliation_required";
+        session.error = `Cancellation ended the root process, but owned descendant cleanup is ${session.processTreeState}.`;
+      }
     }
     return this.stateFor(session, "");
   }
@@ -1379,6 +1390,9 @@ export class CodexGoalSessionManager {
     workspaceRoot?: string,
   ): string {
     this.recordOutput(session, snapshot.output);
+    if (snapshot.processTreeState !== undefined) {
+      session.processTreeState = snapshot.processTreeState;
+    }
     if (workspaceRoot !== undefined && session.readiness) {
       session.readiness.absorb(snapshot, workspaceRoot, session.model);
       if (session.readiness.blockReason === "truncation") {
@@ -1442,6 +1456,7 @@ export class CodexGoalSessionManager {
       ...(session.coreMutation ? { coreMutation: { ...session.coreMutation } } : {}),
       ...(session.terminalReason ? { terminalReason: session.terminalReason } : {}),
       ...(session.error ? { error: session.error } : {}),
+      ...(session.processTreeState ? { processTreeState: session.processTreeState } : {}),
     };
   }
 }
