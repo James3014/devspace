@@ -124,6 +124,39 @@ test("topology manifests fail closed when role kind is missing or freshness is s
   assert.ok(result.blockers.some((blocker) => blocker.code === "TOPOLOGY_MANIFEST_STALE"));
 });
 
+test("fresh topology attestation cannot hide canonical runtime identity drift", () => {
+  const current = service();
+  const staleGeneration = service({
+    serviceIdentity: { ...current.serviceIdentity, serverInstanceId: "server-old" },
+    buildIdentity: { sourceCommit: "c".repeat(40), buildId: "devspace-old" },
+    capabilityManifest: {
+      ...current.capabilityManifest,
+      sha256: "d".repeat(64),
+    },
+  });
+  const result = evaluateControlPlaneConvergence({
+    services: [staleGeneration, syntheticMigrationSource],
+    canonicalRole: "dev2",
+    retirementCandidateRole: "migration-source",
+    observedAt: new Date().toISOString(),
+    maxAgeSeconds: 60,
+    manifestRequired: true,
+  }, {
+    currentCanonicalRuntime: {
+      serverInstanceId: current.serviceIdentity.serverInstanceId,
+      sourceCommit: current.buildIdentity.sourceCommit,
+      buildId: current.buildIdentity.buildId,
+      capabilityManifestSha256: current.capabilityManifest.sha256,
+      stateDirectory: current.stateDirectory,
+    },
+  });
+
+  assert.equal(result.converged, false);
+  assert.ok(result.blockers.some((blocker) => blocker.code === "IDENTITY_DRIFT"));
+  assert.ok(result.blockers.some((blocker) => blocker.code === "CAPABILITY_MANIFEST_DRIFT"));
+  assert.equal(result.blockers.some((blocker) => blocker.code === "TOPOLOGY_MANIFEST_STALE"), false);
+});
+
 test("catalog generation scope is explicit, backward compatible, and rejects ambiguous topology", () => {
   const base = {
     schema: "devspace.control_plane_topology_manifest.v1",

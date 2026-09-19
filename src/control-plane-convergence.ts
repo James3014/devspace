@@ -437,7 +437,16 @@ function retirementBlockers(service: PhysicalServiceInventory, receipt: ControlP
 
 export function evaluateControlPlaneConvergence(
   inventory: ControlPlaneInventory,
-  options: { minimumCapacity?: number } = {},
+  options: {
+    minimumCapacity?: number;
+    currentCanonicalRuntime?: {
+      serverInstanceId: string;
+      sourceCommit: string;
+      buildId: string;
+      capabilityManifestSha256: string;
+      stateDirectory: string;
+    };
+  } = {},
 ): ControlPlaneConvergenceEvaluation {
   const minimumCapacity = options.minimumCapacity ?? 5;
   const blockers: ControlPlaneBlocker[] = [];
@@ -456,6 +465,28 @@ export function evaluateControlPlaneConvergence(
   if (!canonical) blockers.push({ code: "CANONICAL_ROLE_INVALID", detail: `canonical role '${inventory.canonicalRole}' is absent from the physical inventory` });
   if (!retirement) blockers.push({ code: "RETIREMENT_CANDIDATE_INVALID", detail: `retirement candidate '${inventory.retirementCandidateRole}' is absent from the physical inventory` });
   if (canonical && canonical.roleKind !== "AUTHORITATIVE_PRODUCTION") blockers.push({ code: "CANONICAL_ROLE_INVALID", role: canonical.role, detail: "canonical role must be AUTHORITATIVE_PRODUCTION" });
+  if (canonical && options.currentCanonicalRuntime) {
+    const current = options.currentCanonicalRuntime;
+    if (
+      canonical.serviceIdentity.serverInstanceId !== current.serverInstanceId ||
+      canonical.buildIdentity.sourceCommit !== current.sourceCommit ||
+      canonical.buildIdentity.buildId !== current.buildId ||
+      canonical.stateDirectory !== current.stateDirectory
+    ) {
+      blockers.push({
+        code: "IDENTITY_DRIFT",
+        role: canonical.role,
+        detail: "fresh topology manifest canonical identity does not match the running canonical runtime",
+      });
+    }
+    if (canonical.capabilityManifest.sha256 !== current.capabilityManifestSha256) {
+      blockers.push({
+        code: "CAPABILITY_MANIFEST_DRIFT",
+        role: canonical.role,
+        detail: "fresh topology manifest capability manifest does not match the running canonical runtime",
+      });
+    }
+  }
   if (retirement && retirement.role === inventory.canonicalRole) blockers.push({ code: "RETIREMENT_CANDIDATE_INVALID", role: retirement.role, detail: "the canonical production service cannot also be its retirement candidate" });
   if (retirement && retirement.roleKind === "AUTHORITATIVE_PRODUCTION" && retirement.role !== inventory.canonicalRole) blockers.push({ code: "RETIREMENT_CANDIDATE_INVALID", role: retirement.role, detail: "an authoritative production owner cannot be a retirement candidate" });
   if (canonical && inventory.canonicalStateDirectory !== undefined && inventory.canonicalStateDirectory !== canonical.stateDirectory) {

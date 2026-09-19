@@ -6738,7 +6738,17 @@ export function createServer(
         return evaluateMultiRoleConvergence(roles);
       },
       ...(controlPlaneInventoryReader
-        ? { controlPlaneEvaluator: () => evaluateControlPlaneConvergence(controlPlaneInventoryReader()) }
+        ? {
+            controlPlaneEvaluator: () => evaluateControlPlaneConvergence(controlPlaneInventoryReader(), {
+              currentCanonicalRuntime: {
+                serverInstanceId: runtimeBuildIdentity.serverInstanceId,
+                sourceCommit: runtimeBuildIdentity.sourceCommit,
+                buildId: runtimeBuildIdentity.buildId,
+                capabilityManifestSha256: capabilityManifest.manifestSha256,
+                stateDirectory: config.stateDir,
+              },
+            }),
+          }
         : {}),
     },
     opencodeCatalogSource,
