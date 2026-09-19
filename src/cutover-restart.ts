@@ -43,8 +43,11 @@ export interface BoundLaunchdRestartOptions {
   livePid: number;
   serviceLabel: string;
   launchdTarget: string;
+  delayMs?: number;
+  schedule?: (callback: () => void, delayMs: number) => TimerHandle;
   inspectLaunchdTarget?: (command: string, args: string[]) => { status: number | null; stdout: string };
-  kickstart?: (command: string, args: string[]) => { status: number | null; stderr?: string };
+  spawnDetached?: (command: string, args: string[]) => void;
+  onError?: (error: Error) => void;
 }
 
 /**
@@ -88,13 +91,21 @@ export function createBoundLaunchdRestartActuator(
   };
   if (!ownsBoundPid()) return undefined;
 
-  const kickstart = options.kickstart ?? ((command, args) => {
-    const result = spawnSync(command, args, {
-      encoding: "utf8",
+  const delayMs = options.delayMs ?? 750;
+  const schedule = options.schedule ?? ((callback, delay) => setTimeout(callback, delay));
+  const spawnDetached = options.spawnDetached ?? ((command, args) => {
+    const child = spawn(command, args, {
+      detached: true,
+      stdio: "ignore",
       shell: false,
-      stdio: ["ignore", "ignore", "pipe"],
     });
-    return { status: result.status, stderr: result.stderr ?? "" };
+    child.once("error", (error) => {
+      (options.onError ?? ((value) => console.error("devspace bound restart actuator failed", value)))(error);
+    });
+    child.unref();
+  });
+  const onError = options.onError ?? ((error: Error) => {
+    console.error("devspace bound restart actuator failed", error);
   });
 
   return {
@@ -102,13 +113,20 @@ export function createBoundLaunchdRestartActuator(
     serviceLabel: options.serviceLabel,
     launchdTarget: expectedTarget,
     schedule(): SelfRestartReceipt {
-      if (!ownsBoundPid()) {
-        throw new Error("Bound launchd service PID changed before restart scheduling.");
-      }
-      const result = kickstart("/bin/launchctl", ["kickstart", "-k", expectedTarget]);
-      if (result.status !== 0) {
-        throw new Error(`Bound launchd restart failed with status ${String(result.status)}${result.stderr ? `: ${result.stderr.trim()}` : ""}`);
-      }
+      // Keep this timer referenced. The owner-local CLI may exit immediately
+      // after restartCutover commits its durable scheduled marker; the delay
+      // ensures the SQLite transaction is released before launchd starts the
+      // replacement server.
+      schedule(() => {
+        try {
+          if (!ownsBoundPid()) {
+            throw new Error("Bound launchd service PID changed before deferred restart.");
+          }
+          spawnDetached("/bin/launchctl", ["kickstart", "-k", expectedTarget]);
+        } catch (error) {
+          onError(error instanceof Error ? error : new Error(String(error)));
+        }
+      }, delayMs);
       return {
         scheduled: true,
         actuator: "launchd-self",
