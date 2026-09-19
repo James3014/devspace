@@ -265,6 +265,38 @@ test("loaded, bound, process-active, process-unknown, resumable-agent, agent-rec
   assert.equal(artifact(plan, "workspace:ws_committed").lifecycle, "TERMINAL_BUT_RETAINED");
 });
 
+test("unresolved durable operation keeps an otherwise collectable worktree in reconciliation-required state", async () => {
+  const f = fixture();
+  const path = makeWorktree(f, "operation-unknown");
+  const operation: DurableOperationRecord = {
+    operationId: "op_dependency_unknown",
+    attemptKey: "dependency-unknown",
+    requestHash: "b".repeat(64),
+    kind: "dependency_sync",
+    authorityMode: "OWNER_DIRECT",
+    scopeRoot: path,
+    workspaceId: "ws_operation_unknown",
+    status: "outcome_unknown",
+    retrySafe: false,
+    request: { workspaceId: "ws_operation_unknown", workspaceRoot: path },
+    errorCode: "RECONCILIATION_REQUIRED",
+    errorMessage: "simulated unknown effect",
+    createdAt: "2026-09-17T00:00:00.000Z",
+    updatedAt: "2026-09-17T00:00:00.000Z",
+  };
+
+  const plan = await buildHostStoragePlan(input(f, {
+    workspaceSessions: [session(f, "ws_operation_unknown", path)],
+    durableOperations: [operation],
+  }));
+
+  const target = artifact(plan, "workspace:ws_operation_unknown");
+  assert.equal(target.lifecycle, "UNKNOWN");
+  assert.equal(target.disposition, "RECONCILE");
+  assert.match(target.reason, /unresolved durable operation op_dependency_unknown/);
+  assert.equal(existsSync(path), true);
+});
+
 test("canonical containment rejects a managed-worktree symlink that resolves outside worktreeRoot", async () => {
   const f = fixture();
   const outside = makeWorktree(f, "outside", join(f.root, "outside-worktree"));
