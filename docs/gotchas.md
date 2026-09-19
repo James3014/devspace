@@ -155,20 +155,36 @@ collection apply step through the MCP tools `storage_inventory` and
 `storage_gc`.
 
 The inventory is fail-closed. Checkout directories are user-owned and are never
-deletion targets. Managed worktrees are reclaimable only when they are outside
-the active server registry, have no durable conversation binding or resumable
-agent, are clean, remain registered to their source repository, and have passed
-the retention grace period. Release cleanup recognizes only DevSpace package
-releases, keeps the newest rollback candidates, and preserves releases referenced
-by bounded activation/cutover receipts. Browser runtime directories require an
-explicit DevSpace ownership/lifecycle marker; unmarked historical profiles remain
-`UNKNOWN` and are not deleted.
+physical deletion targets; only old, unreferenced DevSpace session metadata can
+be collected. Managed worktrees are reclaimable only when they are outside the
+active server registry, have no live/unknown process, conversation or agent
+reference, are clean, remain registered to their source repository, still match
+their opening base commit, and have passed the retention grace period. Clean
+worktrees with later commits are retained.
+
+Receipt-owned clones below a `.devspace-chatgpt` ownership root are inventoried
+separately. They become reclaimable only when their durable `workspace_clone`
+operation succeeded, no workspace/agent still references them, their Git root is
+clean, and HEAD still matches the clone receipt. Repositories found under that
+root without a durable creation receipt stay `UNKNOWN`; clones placed at an
+explicit user path outside that ownership root are not deletion targets.
+
+Release cleanup accepts only real directories inside the canonical DevSpace
+release root with the expected package identity. It pins a release matching the
+running source revision, preserves bounded activation/rollback references, and
+keeps the newest rollback candidates. Browser profiles require positive durable
+terminal/unreferenced carrier evidence (or an explicit DevSpace lifecycle
+marker), plus a successful host-process check proving no process still uses the
+profile. Missing browser reference/process evidence remains `UNKNOWN`.
 
 `storage_gc` requires the exact plan id returned by `storage_inventory` and
-rebuilds the inventory before any deletion. Drift therefore fails closed instead
-of applying an old cleanup decision. Provider-owned state such as `~/.codex`
-or `~/.gemini`, and broad temporary roots such as `/private/tmp`, are outside
-this GC authority.
+rebuilds the inventory before deletion. Before the first destructive effect it
+atomically claims a durable GC journal, then records the exact artifact before
+each effect. A completed journal makes exact replay idempotent; an interrupted,
+corrupt, or partially applied journal returns
+`STORAGE_RECONCILIATION_REQUIRED` instead of re-running deletion. Provider-owned
+state such as `~/.codex` or `~/.gemini`, and broad temporary roots such as
+`/private/tmp`, are outside this GC authority.
 
 ## MCP Workspace Path Rejected
 
