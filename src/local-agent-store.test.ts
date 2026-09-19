@@ -48,11 +48,23 @@ try {
   assert.equal(updated.errorCode, "PROVIDER_UNAVAILABLE");
   assert.equal(updated.errorRetryable, false);
   assert.equal(updated.providerContinuityState, "KNOWN_UNVERIFIED");
+  assert.equal(updated.providerSessionId, "thread_123");
   assert.equal(store.getById("thread_123"), undefined);
   const storedError = store.getById(created.id);
   assert.equal(storedError?.error, "Codex executable was not found.");
   assert.equal(storedError?.errorCode, "PROVIDER_UNAVAILABLE");
   assert.equal(storedError?.errorRetryable, false);
+  assert.equal(storedError?.providerContinuityState, "KNOWN_UNVERIFIED");
+  assert.equal(storedError?.providerSessionId, "thread_123");
+
+  const mismatched = store.update(created.id, {
+    providerSessionId: "thread_456",
+  });
+  assert.equal(mismatched.providerContinuityState, "LOST");
+  assert.equal(mismatched.providerSessionId, "thread_123");
+  const readbackMismatched = store.getById(created.id);
+  assert.equal(readbackMismatched?.providerContinuityState, "LOST");
+  assert.equal(readbackMismatched?.providerSessionId, "thread_123");
   assert.equal(store.update(created.id, { latestResponse: undefined }).latestResponse, undefined);
   assert.deepEqual(
     store.list({ workspaceRoot: join(root, "project") }).map((agent) => agent.latestResponse),

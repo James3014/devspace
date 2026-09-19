@@ -459,19 +459,29 @@ export class LocalAgentStore {
         );
       }
 
+      const providerSessionPatched = Object.prototype.hasOwnProperty.call(patch, "providerSessionId");
+      const sessionMismatch = Boolean(
+        current.providerSessionId &&
+        patch.providerSessionId &&
+        current.providerSessionId !== patch.providerSessionId,
+      );
+      const updatedProviderContinuityState: ProviderContinuityState = sessionMismatch
+        ? "LOST"
+        : patch.providerContinuityState
+          ?? (providerSessionPatched
+            ? patch.providerSessionId ? "KNOWN_UNVERIFIED" : "UNKNOWN"
+            : current.providerContinuityState ?? (current.providerSessionId ? "KNOWN_UNVERIFIED" : "UNKNOWN"));
+      const updatedProviderSessionId = sessionMismatch
+        ? current.providerSessionId
+        : (providerSessionPatched ? patch.providerSessionId : current.providerSessionId);
+
       const updated: LocalAgentRecord = {
         ...current,
         ...patch,
+        providerSessionId: updatedProviderSessionId,
+        providerContinuityState: updatedProviderContinuityState,
         updatedAt: new Date().toISOString(),
       };
-      const providerSessionPatched = Object.prototype.hasOwnProperty.call(patch, "providerSessionId");
-      const updatedProviderContinuityState: ProviderContinuityState = patch.providerContinuityState
-        ?? (providerSessionPatched
-          ? current.providerSessionId && updated.providerSessionId && current.providerSessionId !== updated.providerSessionId
-            ? "LOST"
-            : updated.providerSessionId ? "KNOWN_UNVERIFIED" : "UNKNOWN"
-          : current.providerContinuityState ?? (current.providerSessionId ? "KNOWN_UNVERIFIED" : "UNKNOWN"));
-
       const result = this.database.sqlite.prepare(
         `update local_agent_sessions set
           workspace_id = ?,
