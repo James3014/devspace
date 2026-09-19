@@ -90,12 +90,17 @@ interface BrowserMarker {
 }
 
 export async function buildHostStoragePlan(input: HostStorageRetentionInput): Promise<HostStoragePlan> {
-  const generatedAt = new Date(input.nowMs ?? Date.now()).toISOString();
+  const nowMs = input.nowMs ?? Date.now();
+  const generatedAt = new Date(nowMs).toISOString();
   const artifacts = [
     ...(await inspectWorkspaces(input)),
+    ...(await inspectWorkspaceRecords(input)),
+    ...(await inspectManagedClones(input)),
     ...(await inspectReleases(input)),
     ...(await inspectBrowserRuntimes(input)),
-  ].sort((a, b) => (a.kind + ":" + a.path).localeCompare(b.kind + ":" + b.path));
+  ]
+    .map((artifact) => decorateArtifact(artifact, nowMs))
+    .sort((a, b) => (a.kind + ":" + a.path).localeCompare(b.kind + ":" + b.path));
   const reclaimableBytes = artifacts
     .filter((artifact) => artifact.lifecycle === "GC_ELIGIBLE")
     .reduce((total, artifact) => total + artifact.sizeBytes, 0);
