@@ -619,10 +619,10 @@ test("nexus_gateway_recover malformed manager output fails closed as uncertain",
   }
 });
 
-test("Nexus Gateway recovery trust roots track the accepted #526 r10 lineage", () => {
+test("Nexus Gateway recovery trust roots track the current accepted #526 R2 lineage", () => {
   assert.equal(
     NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256,
-    "6873dde17e08d4020620c2408e414327b176be723f5f23f01bee754b2627502c",
+    "3f0c34204bef175fcfad7150c5919d96f6b3735813cea5258bdcd51e37d4baeb",
   );
   assert.equal(
     NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256,
