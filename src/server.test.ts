@@ -4793,6 +4793,114 @@ test("P0-4: real server /mcp HTTP boundary permits transport reconnect during dr
   }
 });
 
+test("Issue #15 Wave 4B: capability convergence resolves the initialized request session without an explicit sessionId", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-wave4b-session-"));
+  const stateDir = join(root, ".state");
+  const port = await new Promise<number>((resolve, reject) => {
+    const probe = createNetServer();
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address() as AddressInfo;
+      probe.close((error) => error ? reject(error) : resolve(address.port));
+    });
+    probe.once("error", reject);
+  });
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const mcpUrl = `${baseUrl}/mcp`;
+  const accessToken = "wave4b-access-token";
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    DEVSPACE_PUBLIC_BASE_URL: baseUrl,
+    PORT: String(port),
+  });
+  const oauthStore = new SqliteOAuthStore(stateDir);
+  const clientsStore = new SqliteOAuthClientsStore(oauthStore, ["127.0.0.1", "localhost"]);
+  const clientRecord = clientsStore.registerClient({
+    redirect_uris: [`${baseUrl}/callback`],
+    client_name: "wave4b-client",
+  });
+  oauthStore.saveTokenPair({
+    accessTokenHash: createHash("sha256").update(accessToken).digest("base64url"),
+    accessToken: {
+      clientId: clientRecord.client_id,
+      scopes: ["devspace"],
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      resource: mcpUrl,
+    },
+    refreshTokenHash: createHash("sha256").update("wave4b-refresh").digest("base64url"),
+    refreshToken: {
+      clientId: clientRecord.client_id,
+      scopes: ["devspace"],
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      resource: mcpUrl,
+    },
+  });
+  oauthStore.close();
+
+  const post = (sessionId: string, body: unknown) => fetch(mcpUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${accessToken}`,
+      "Accept": "application/json, text/event-stream",
+      "mcp-protocol-version": "2024-11-05",
+      ...(sessionId ? { "mcp-session-id": sessionId } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  const parseResponse = async (response: globalThis.Response): Promise<Record<string, any>> => {
+    const body = await response.text();
+    const dataLine = body.split("\n").find((line) => line.startsWith("data: "));
+    return JSON.parse(dataLine ? dataLine.slice(6) : body) as Record<string, any>;
+  };
+
+  const running = createServer(config);
+  const listener = running.app.listen(port, "127.0.0.1");
+  await new Promise<void>((resolve) => listener.once("listening", resolve));
+  try {
+    const initialized = await post("", {
+      jsonrpc: "2.0",
+      id: 1,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "wave4b-client", version: "1.0.0" },
+      },
+    });
+    assert.equal(initialized.status, 200);
+    const sessionId = initialized.headers.get("mcp-session-id");
+    assert.match(sessionId ?? "", /^[0-9a-f-]{36}$/);
+
+    const convergence = await post(sessionId!, {
+      jsonrpc: "2.0",
+      id: 2,
+      method: "tools/call",
+      params: {
+        name: "capability_convergence_status",
+        arguments: {},
+      },
+    });
+    assert.equal(convergence.status, 200);
+    const payload = await parseResponse(convergence);
+    const session = payload.result?.structuredContent?.sessionConvergence as {
+      state?: string;
+      converged?: boolean;
+      sessionSnapshot?: { serverInstanceId?: string };
+      serverGeneration?: { serverInstanceId?: string };
+    } | undefined;
+    assert.equal(session?.state, "CURRENT");
+    assert.equal(session?.converged, true);
+    assert.equal(session?.sessionSnapshot?.serverInstanceId, session?.serverGeneration?.serverInstanceId);
+  } finally {
+    await new Promise<void>((resolve) => listener.close(() => resolve()));
+    await running.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("Issue #159: authenticated old session can rebind after server restart through tools/list", async () => {
   const root = await mkdtemp(join(tmpdir(), "devspace-159-http-"));
   const project = join(root, "project");

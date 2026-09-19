@@ -6674,7 +6674,7 @@ export function createServer(
     ...(advanceCutover ? { advance: advanceCutover } : {}),
   });
 
-  const createSessionServer = (requestSessionId?: string) => createMcpServer(
+  const createSessionServer = (resolveRequestSessionId: () => string | undefined) => createMcpServer(
     config,
     workspaces,
     reviewCheckpoints,
@@ -6704,7 +6704,7 @@ export function createServer(
       canRepairBinding,
       executeBindingRepair,
       sessionConvergence: (targetSessionId?: string) => {
-        const sid = targetSessionId ?? requestSessionId;
+        const sid = targetSessionId ?? resolveRequestSessionId();
         const sessionSnapshot = sid ? transports.getSnapshot(sid) : undefined;
         return evaluateSessionConvergence(sessionSnapshot, {
           serverInstanceId: runtimeBuildIdentity.serverInstanceId,
@@ -6938,7 +6938,7 @@ export function createServer(
         ) {
           transport = new ReboundTransport(sessionId);
           setTransportCloseHandler(transport, sessionId);
-          const server = createSessionServer(sessionId);
+          const server = createSessionServer(() => registrySessionId);
           await server.connect(transport);
           const registration = transports.register(sessionId, transport, {
             snapshot: {
@@ -7006,7 +7006,7 @@ export function createServer(
 
         setTransportCloseHandler(transport);
 
-        const server = createSessionServer(sessionId);
+        const server = createSessionServer(() => registrySessionId);
         if (transport.sessionId) {
           const initialSnapshot: SessionGenerationSnapshot = {
             serverInstanceId: runtimeBuildIdentity.serverInstanceId,
