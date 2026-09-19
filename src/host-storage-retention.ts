@@ -115,13 +115,36 @@ export async function buildHostStoragePlan(input: HostStorageRetentionInput): Pr
   };
 }
 
+export interface HostStorageApplyCallbacks {
+  deleteWorkspaceSession: (workspaceId: string) => void;
+  assertWorkspaceSessionUnloaded?: (workspaceId: string) => void;
+  assertPathUnreferenced?: (path: string) => void;
+}
+
+interface HostStorageApplyJournal extends HostStorageApplyResult {
+  journalSchema: "devspace.host_storage_gc_journal.v1";
+  status: "applying" | "reconciliation_required" | "completed";
+  currentArtifactId?: string;
+  updatedAt: string;
+}
+
 export async function applyHostStoragePlan(
   input: HostStorageRetentionInput,
   expectedPlanId: string,
-  callbacks: { deleteWorkspaceSession: (workspaceId: string) => void },
+  callbacks: HostStorageApplyCallbacks,
 ): Promise<HostStorageApplyResult> {
-  const replay = await readApplyReceipt(input.stateDir, expectedPlanId);
-  if (replay) return replay;
+  const existing = await readApplyJournal(input.stateDir, expectedPlanId);
+  if (existing.state === "corrupt") {
+    throw new Error(
+      `STORAGE_RECONCILIATION_REQUIRED: GC receipt for ${expectedPlanId} is unreadable; reconcile physical state before another apply.`,
+    );
+  }
+  if (existing.state === "valid") {
+    if (existing.journal.status === "completed") return journalResult(existing.journal);
+    throw new Error(
+      `STORAGE_RECONCILIATION_REQUIRED: GC plan ${expectedPlanId} was interrupted while ${existing.journal.currentArtifactId ?? "preparing cleanup"}; reconcile physical state before another apply.`,
+    );
+  }
 
   const fresh = await buildHostStoragePlan(input);
   if (fresh.planId !== expectedPlanId) {
@@ -130,72 +153,163 @@ export async function applyHostStoragePlan(
     );
   }
 
-  const removed: HostStorageApplyResult["removed"] = [];
-  const skipped: HostStorageApplyResult["skipped"] = [];
+  const journal: HostStorageApplyJournal = {
+    journalSchema: "devspace.host_storage_gc_journal.v1",
+    schema: HOST_STORAGE_RETENTION_SCHEMA,
+    planId: fresh.planId,
+    status: "applying",
+    reclaimedBytes: 0,
+    removed: [],
+    skipped: fresh.artifacts
+      .filter((artifact) => artifact.lifecycle !== "GC_ELIGIBLE")
+      .map((artifact) => ({
+        id: artifact.id,
+        kind: artifact.kind,
+        path: artifact.path,
+        reason: artifact.reason,
+      })),
+    updatedAt: new Date().toISOString(),
+  };
+  await claimApplyJournal(input.stateDir, journal);
 
   for (const artifact of fresh.artifacts) {
-    if (artifact.lifecycle !== "GC_ELIGIBLE") {
-      skipped.push({ id: artifact.id, kind: artifact.kind, path: artifact.path, reason: artifact.reason });
-      continue;
-    }
+    if (artifact.lifecycle !== "GC_ELIGIBLE") continue;
+
+    journal.currentArtifactId = artifact.id;
+    journal.updatedAt = new Date().toISOString();
+    await writeApplyJournal(input.stateDir, journal);
 
     try {
       if (artifact.kind === "managed_worktree") {
         if (!artifact.workspaceId || !artifact.sourceRoot) {
           throw new Error("managed worktree inventory is missing workspace/source identity");
         }
+        callbacks.assertWorkspaceSessionUnloaded?.(artifact.workspaceId);
         await removeManagedWorktreeArtifact(artifact);
         callbacks.deleteWorkspaceSession(artifact.workspaceId);
+      } else if (artifact.kind === "workspace_record") {
+        if (!artifact.workspaceId) {
+          throw new Error("workspace record inventory is missing workspace identity");
+        }
+        callbacks.assertWorkspaceSessionUnloaded?.(artifact.workspaceId);
+        await removeWorkspaceReviewRefs(artifact);
+        callbacks.deleteWorkspaceSession(artifact.workspaceId);
+      } else if (artifact.kind === "managed_clone") {
+        callbacks.assertPathUnreferenced?.(artifact.path);
+        await removeOwnedDirectory(artifact.path, artifact.ownershipRoot);
       } else if (artifact.kind === "release" || artifact.kind === "browser_runtime") {
-        await removeOwnedDirectory(artifact.path);
+        await removeOwnedDirectory(artifact.path, artifact.ownershipRoot);
       } else {
-        throw new Error("checkout workspaces are never DevSpace-owned deletion targets");
+        throw new Error("user-owned checkout directories are never DevSpace deletion targets");
       }
-      removed.push({ id: artifact.id, kind: artifact.kind, path: artifact.path, bytes: artifact.sizeBytes });
-    } catch (error) {
-      skipped.push({
+
+      journal.removed.push({
         id: artifact.id,
         kind: artifact.kind,
         path: artifact.path,
-        reason: `apply_failed:${error instanceof Error ? error.message : String(error)}`,
+        bytes: artifact.sizeBytes,
       });
+      journal.reclaimedBytes += artifact.sizeBytes;
+      delete journal.currentArtifactId;
+      journal.updatedAt = new Date().toISOString();
+      await writeApplyJournal(input.stateDir, journal);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      journal.status = "reconciliation_required";
+      journal.skipped.push({
+        id: artifact.id,
+        kind: artifact.kind,
+        path: artifact.path,
+        reason: `apply_failed:${message}`,
+      });
+      journal.updatedAt = new Date().toISOString();
+      await writeApplyJournal(input.stateDir, journal);
+      throw new Error(
+        `STORAGE_RECONCILIATION_REQUIRED: cleanup for ${artifact.id} may have partially applied: ${message}`,
+      );
     }
   }
 
-  const result: HostStorageApplyResult = {
-    schema: HOST_STORAGE_RETENTION_SCHEMA,
-    planId: fresh.planId,
-    reclaimedBytes: removed.reduce((total, entry) => total + entry.bytes, 0),
-    removed,
-    skipped,
-  };
-  await writeApplyReceipt(input.stateDir, result);
-  return result;
+  journal.status = "completed";
+  delete journal.currentArtifactId;
+  journal.updatedAt = new Date().toISOString();
+  await writeApplyJournal(input.stateDir, journal);
+  return journalResult(journal);
 }
 
-async function readApplyReceipt(
+function journalResult(journal: HostStorageApplyJournal): HostStorageApplyResult {
+  return {
+    schema: journal.schema,
+    planId: journal.planId,
+    reclaimedBytes: journal.reclaimedBytes,
+    removed: journal.removed,
+    skipped: journal.skipped,
+  };
+}
+
+async function readApplyJournal(
   stateDir: string,
   planId: string,
-): Promise<HostStorageApplyResult | undefined> {
-  const receipt = await readJson(applyReceiptPath(stateDir, planId));
-  if (
-    receipt?.schema !== HOST_STORAGE_RETENTION_SCHEMA ||
-    receipt.planId !== planId ||
-    !Array.isArray(receipt.removed) ||
-    !Array.isArray(receipt.skipped) ||
-    typeof receipt.reclaimedBytes !== "number"
-  ) {
-    return undefined;
+): Promise<
+  | { state: "absent" }
+  | { state: "corrupt" }
+  | { state: "valid"; journal: HostStorageApplyJournal }
+> {
+  const path = applyReceiptPath(stateDir, planId);
+  let raw: string;
+  try {
+    raw = await readFile(path, "utf8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "ENOENT") return { state: "absent" };
+    return { state: "corrupt" };
   }
-  return receipt as unknown as HostStorageApplyResult;
+
+  try {
+    const value = JSON.parse(raw) as Partial<HostStorageApplyJournal>;
+    if (
+      value.journalSchema !== "devspace.host_storage_gc_journal.v1" ||
+      value.schema !== HOST_STORAGE_RETENTION_SCHEMA ||
+      value.planId !== planId ||
+      !["applying", "reconciliation_required", "completed"].includes(String(value.status)) ||
+      !Array.isArray(value.removed) ||
+      !Array.isArray(value.skipped) ||
+      typeof value.reclaimedBytes !== "number" ||
+      typeof value.updatedAt !== "string"
+    ) {
+      return { state: "corrupt" };
+    }
+    return { state: "valid", journal: value as HostStorageApplyJournal };
+  } catch {
+    return { state: "corrupt" };
+  }
 }
 
-async function writeApplyReceipt(stateDir: string, result: HostStorageApplyResult): Promise<void> {
-  const path = applyReceiptPath(stateDir, result.planId);
-  const dir = join(resolve(stateDir), "host-storage-retention", "receipts");
-  await mkdir(dir, { recursive: true });
+async function claimApplyJournal(stateDir: string, journal: HostStorageApplyJournal): Promise<void> {
+  const path = applyReceiptPath(stateDir, journal.planId);
+  await mkdir(dirname(path), { recursive: true });
+  try {
+    await writeFile(path, JSON.stringify(journal, null, 2) + "\n", {
+      encoding: "utf8",
+      mode: 0o600,
+      flag: "wx",
+    });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException)?.code === "EEXIST") {
+      throw new Error(
+        `STORAGE_RECONCILIATION_REQUIRED: GC plan ${journal.planId} was claimed concurrently; read its receipt before another apply.`,
+      );
+    }
+    throw error;
+  }
+}
+
+async function writeApplyJournal(stateDir: string, journal: HostStorageApplyJournal): Promise<void> {
+  const path = applyReceiptPath(stateDir, journal.planId);
   const temp = path + ".tmp";
-  await writeFile(temp, JSON.stringify(result, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  await writeFile(temp, JSON.stringify(journal, null, 2) + "\n", {
+    encoding: "utf8",
+    mode: 0o600,
+  });
   await rename(temp, path);
 }
 
