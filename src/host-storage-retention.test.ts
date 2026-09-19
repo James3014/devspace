@@ -410,6 +410,29 @@ test("browser-runtime symlink escapes are foreign and never deletion targets", a
   assert.equal(existsSync(outside), true);
 });
 
+test("verification/build backups require an explicit DevSpace terminal marker before deletion", async () => {
+  const f = fixture();
+  const unknown = join(f.packageRoot, ".wave-package-backup-old");
+  const terminal = join(f.packageRoot, ".verify-build-backup-terminal");
+  mkdirSync(unknown, { recursive: true });
+  mkdirSync(terminal, { recursive: true });
+  writeFileSync(join(terminal, ".devspace-storage.json"), JSON.stringify({
+    schema: HOST_STORAGE_BROWSER_MARKER_SCHEMA,
+    owner: "devspace",
+    kind: "verification_artifact",
+    lifecycle: "terminal",
+  }));
+
+  const args = input(f);
+  const plan = await buildHostStoragePlan(args);
+  assert.equal(artifact(plan, "verification-artifact:.wave-package-backup-old").lifecycle, "UNKNOWN");
+  assert.equal(artifact(plan, "verification-artifact:.verify-build-backup-terminal").lifecycle, "GC_ELIGIBLE");
+
+  await applyHostStoragePlan(args, plan.planId, { deleteWorkspaceSession: () => {} });
+  assert.equal(existsSync(unknown), true);
+  assert.equal(existsSync(terminal), false);
+});
+
 test("apply refuses a stale inventory hash before any deletion", async () => {
   const f = fixture();
   const releases = join(f.packageRoot, "releases");
