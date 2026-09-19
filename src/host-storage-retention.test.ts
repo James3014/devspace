@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   symlinkSync,
   utimesSync,
   writeFileSync,
@@ -297,7 +298,7 @@ test("receipt-owned hidden DevSpace clones can be collected while changed or unt
   const plan = await buildHostStoragePlan(args);
   assert.equal(artifact(plan, "managed-clone:op_clean").lifecycle, "GC_ELIGIBLE");
   assert.equal(artifact(plan, "managed-clone:op_changed").lifecycle, "TERMINAL_BUT_RETAINED");
-  const legacy = plan.artifacts.find((entry) => entry.path === resolve(untracked));
+  const legacy = plan.artifacts.find((entry) => entry.path === realpathSync(untracked));
   assert.ok(legacy);
   assert.equal(legacy.lifecycle, "UNKNOWN");
 
