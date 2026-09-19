@@ -475,9 +475,17 @@ async function inspectGitWorktree(
       timeout: 10_000,
       maxBuffer: 4 * 1024 * 1024,
     });
-    const registered = String(registration.stdout)
-      .split("\n")
-      .some((line) => line === `worktree ${worktreePath}`);
+    const canonicalWorktreePath = await realpath(worktreePath).catch(() => resolve(worktreePath));
+    let registered = false;
+    for (const line of String(registration.stdout).split("\n")) {
+      if (!line.startsWith("worktree ")) continue;
+      const listedPath = line.slice("worktree ".length);
+      const canonicalListedPath = await realpath(listedPath).catch(() => resolve(listedPath));
+      if (canonicalListedPath === canonicalWorktreePath) {
+        registered = true;
+        break;
+      }
+    }
     if (!registered) {
       return { state: "unknown", reason: "physical worktree is not registered by its source repository" };
     }
