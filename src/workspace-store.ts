@@ -43,12 +43,12 @@ export interface WorkspaceStore {
   getSession(id: string): WorkspaceSession | undefined;
   listSessions(): WorkspaceSession[];
   touchSession(id: string): void;
-  deleteSession(id: string): void;
+  deleteSession?(id: string): void;
   getConversationBinding(
     conversationScopeId: string,
     targetKey: string,
   ): WorkspaceConversationBinding | undefined;
-  listConversationBindings(): WorkspaceConversationBinding[];
+  listConversationBindings?(): WorkspaceConversationBinding[];
   listConversationBindingsForTarget(targetKey: string): WorkspaceConversationBinding[];
   setConversationBinding(input: {
     conversationScopeId: string;
