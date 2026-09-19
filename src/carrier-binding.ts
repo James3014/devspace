@@ -335,6 +335,63 @@ export class CarrierBindingStore {
     const validity=this.readValidity(id);
     return {id:row.id,parentId:row.parent_id,version:row.version,revoked:row.revoked!==0,contract:this.validateContract(JSON.parse(row.contract_json),false),validity:{version:validity.version,expiresAt:validity.expires_at}};
   }
+  /**
+   * Owner-local bridge for one already-approved DRAINED cutover generation.
+   * This mints no authority and persists nothing: it only projects the exact
+   * existing root carrier into an opaque in-process context consumed by the
+   * same ControlPlaneConsumer lifecycle checks used by MCP sessions.
+   */
+  localDrainedCutoverContext(input: {
+    cutoverId: string;
+    carrierId: string;
+    expectedVersion: number;
+    expectedValidityVersion: number;
+    confirmCutoverId: string;
+  }) {
+    if(input.confirmCutoverId!==input.cutoverId) deny("Restart confirmation must equal the exact cutover id");
+    if(!Number.isSafeInteger(input.expectedVersion) || input.expectedVersion<1 ||
+      !Number.isSafeInteger(input.expectedValidityVersion) || input.expectedValidityVersion<1) {
+      throw new ControlPlaneOwnershipError("CAS_CONFLICT","Carrier or validity version is invalid");
+    }
+    return this.database.sqlite.transaction(()=>{
+      const binding=this.active(input.carrierId);
+      if(binding.row.version!==input.expectedVersion || binding.validity.version!==input.expectedValidityVersion) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT","Carrier or validity version changed");
+      }
+      const approved=binding.contract.cutover;
+      if(binding.row.parent_id || binding.contract.role!=="controller" || !approved ||
+        binding.contract.operations.length!==1 || binding.contract.operations[0]!=="cutover_start") {
+        deny("Local cutover restart requires the exact root controller cutover authority");
+      }
+      if(physical(approved.stateRoot)!==physical(this.stateDir)) {
+        deny("Local cutover restart state root differs from approved authority");
+      }
+      const plan=planCutoverStart(approved.stateRoot,approved);
+      const file=new CutoverStateStore(approved.stateRoot).get();
+      if(!file || file.cutoverId!==input.cutoverId || file.phase!=="drained" || !file.coordinationBinding) {
+        deny("Local cutover restart requires the exact drained coordination-bound generation");
+      }
+      if(file.coordinationBinding.ownerThread!==binding.row.id ||
+        file.coordinationBinding.operationHandle!==plan.operationId ||
+        file.coordinationBinding.requestHash!==plan.requestHash ||
+        !isDeepStrictEqual(file.oldServerIdentity,approved.currentIdentity) ||
+        !isDeepStrictEqual(file.expectedNewIdentity,approved.expectedIdentity) ||
+        file.expiresAt!==approved.expiresAt) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT","Cutover generation differs from approved carrier contract");
+      }
+      const lease=this.effectLease(binding,plan.subject);
+      if(!lease || lease.leaseId!==file.coordinationBinding.leaseId ||
+        lease.version!==file.coordinationBinding.pinnedLeaseVersion ||
+        lease.operationHandle!==plan.operationId ||
+        lease.ownerThread!==binding.row.id) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT","Cutover lease differs from approved generation");
+      }
+      const context=Object.freeze({});
+      this.recipients.set(context,binding.row.id);
+      return {context,carrier:this.public(binding),cutover:approved,lease};
+    }).immediate();
+  }
+
   /** Local credential recovery state exposes only a high-entropy verifier hash, never the verifier itself. */
   credentialRotationStateLocal(id: string, expectedVersion: number, expectedValidityVersion: number) {
     const before=this.active(id);
