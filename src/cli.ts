@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, lstatSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { CarrierBindingStore, type CarrierContract } from "./carrier-binding.js";
 import { canonicalizePath, isPathInsideRoot } from "./roots.js";
@@ -875,7 +875,7 @@ function printCutoverHelp(): void {
       "  devspace cutover repair --cutover-id <id> --workspace-id <id> --agent-id <id> [--server-url <url>] [--package-root <path>] [--state-dir <path>] [--json]",
       "  devspace cutover abort-expired-prepared --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--json]",
       "  devspace cutover recover-capability-mismatch --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--json]",
-      "  devspace cutover restart-bound --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --package-root <path> --confirm <id> [--json]",
+      "  devspace cutover restart-bound --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --credential-file <owner-private-intent.json> --package-root <path> --confirm <id> [--json]",
       "",
       "The repair subcommand repairs a successor cutover blocked by CROSS_DOMAIN_DIGEST_MISBINDING",
       "where the target build-manifest digest was mistakenly bound as the capability manifest digest.",
@@ -891,6 +891,7 @@ async function runCutoverRestartBound(args: string[]): Promise<void> {
   let carrierId: string | undefined;
   let version: number | undefined;
   let validityVersion: number | undefined;
+  let credentialFile: string | undefined;
   let packageRoot: string | undefined;
   let confirmCutoverId: string | undefined;
   let json = false;
@@ -906,37 +907,69 @@ async function runCutoverRestartBound(args: string[]): Promise<void> {
     else if (argument === "--carrier") carrierId = value();
     else if (argument === "--version") version = Number(value());
     else if (argument === "--validity-version") validityVersion = Number(value());
+    else if (argument === "--credential-file") credentialFile = resolve(value());
     else if (argument === "--package-root") packageRoot = resolve(value());
     else if (argument === "--confirm") confirmCutoverId = value();
     else throw new Error(`Unknown cutover restart-bound flag: ${argument}`);
   }
-  if (!cutoverId || !carrierId || !packageRoot || confirmCutoverId !== cutoverId ||
+  const usage = "Usage: devspace cutover restart-bound --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --credential-file <owner-private-intent.json> --package-root <path> --confirm <id> [--json]";
+  if (!cutoverId || !carrierId || !credentialFile || !packageRoot || confirmCutoverId !== cutoverId ||
       !Number.isSafeInteger(version) || (version ?? 0) < 1 ||
       !Number.isSafeInteger(validityVersion) || (validityVersion ?? 0) < 1) {
-    throw new Error("Usage: devspace cutover restart-bound --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --package-root <path> --confirm <id> [--json]");
+    throw new Error(usage);
   }
-  const result = await performLocalBoundCutoverRestart({
-    config: loadConfig(),
-    cutoverId,
-    carrierId,
-    expectedCarrierVersion: version!,
-    expectedValidityVersion: validityVersion!,
-    confirmCutoverId,
-    packageRoot,
-  });
-  const payload = {
-    cutoverId: result.record.cutoverId,
-    phase: result.record.phase,
-    scheduled: result.scheduled,
-    outcome: result.outcome,
-    liveIdentity: result.liveIdentity,
-    packageRoot: result.packageRoot,
+
+  const stats = lstatSync(credentialFile);
+  if (!stats.isFile() || stats.isSymbolicLink() ||
+      (process.platform !== "win32" && ((stats.mode & 0o077) !== 0 ||
+        (typeof process.getuid === "function" && stats.uid !== process.getuid())))) {
+    throw new Error("Carrier credential intent file must be an owner-private regular file");
+  }
+  const intent = JSON.parse(readFileSync(credentialFile, "utf8")) as {
+    schema?: unknown;
+    carrierId?: unknown;
+    expectedVersion?: unknown;
+    expectedValidityVersion?: unknown;
+    expectedCredentialHash?: unknown;
+    credential?: unknown;
   };
-  if (json) {
-    printJson(payload);
-    return;
+  if (intent.schema !== "devspace.carrier_credential_rotation.v1" ||
+      intent.carrierId !== carrierId ||
+      intent.expectedVersion !== version ||
+      intent.expectedValidityVersion !== validityVersion ||
+      typeof intent.expectedCredentialHash !== "string" || !/^[a-f0-9]{64}$/.test(intent.expectedCredentialHash) ||
+      typeof intent.credential !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(intent.credential) ||
+      Object.keys(intent).sort().join(",") !== "carrierId,credential,expectedCredentialHash,expectedValidityVersion,expectedVersion,schema") {
+    throw new Error("Carrier credential intent file does not match the requested bound restart");
   }
-  console.log(`Bound cutover restart ${payload.cutoverId}: phase=${payload.phase}; scheduled=${String(payload.scheduled)}; outcome=${payload.outcome}.`);
+
+  try {
+    const result = await performLocalBoundCutoverRestart({
+      config: loadConfig(),
+      cutoverId,
+      carrierId,
+      expectedCarrierVersion: version!,
+      expectedValidityVersion: validityVersion!,
+      carrierCredential: intent.credential,
+      confirmCutoverId,
+      packageRoot,
+    });
+    const payload = {
+      cutoverId: result.record.cutoverId,
+      phase: result.record.phase,
+      scheduled: result.scheduled,
+      outcome: result.outcome,
+      liveIdentity: result.liveIdentity,
+      packageRoot: result.packageRoot,
+    };
+    if (json) {
+      printJson(payload);
+      return;
+    }
+    console.log(`Bound cutover restart ${payload.cutoverId}: phase=${payload.phase}; scheduled=${String(payload.scheduled)}; outcome=${payload.outcome}.`);
+  } finally {
+    try { unlinkSync(credentialFile); } catch {}
+  }
 }
 
 async function runCutoverObserve(args: string[]): Promise<void> {
