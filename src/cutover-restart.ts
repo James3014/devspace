@@ -37,6 +37,88 @@ const LAUNCHD_LABEL = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
  * target domain; launchd supplies XPC_SERVICE_NAME and the current uid binds
  * the gui domain.
  */
+export interface BoundLaunchdRestartOptions {
+  platform?: NodeJS.Platform;
+  uid?: number;
+  livePid: number;
+  serviceLabel: string;
+  launchdTarget: string;
+  inspectLaunchdTarget?: (command: string, args: string[]) => { status: number | null; stdout: string };
+  kickstart?: (command: string, args: string[]) => { status: number | null; stderr?: string };
+}
+
+/**
+ * Host-local restart actuator for an already-approved cutover. Unlike the
+ * self-restart actuator, this process is not the launchd-managed server, so
+ * every effect is bound to the approved label/target and the currently
+ * observed live server PID. The target is re-checked immediately before the
+ * kickstart so a process-generation race fails closed after the durable
+ * scheduled marker rather than restarting an unbound service.
+ */
+export function createBoundLaunchdRestartActuator(
+  options: BoundLaunchdRestartOptions,
+): SelfRestartActuator | undefined {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "darwin") return undefined;
+  if (
+    !options.serviceLabel ||
+    options.serviceLabel === "0" ||
+    options.serviceLabel === "(null)" ||
+    !LAUNCHD_LABEL.test(options.serviceLabel)
+  ) return undefined;
+
+  const uid = options.uid ?? process.getuid?.();
+  if (!Number.isInteger(uid) || (uid ?? -1) < 0) return undefined;
+  if (!Number.isInteger(options.livePid) || options.livePid <= 0) return undefined;
+
+  const expectedTarget = `gui/${uid}/${options.serviceLabel}`;
+  if (options.launchdTarget !== expectedTarget) return undefined;
+
+  const inspectLaunchdTarget = options.inspectLaunchdTarget ?? ((command, args) => {
+    const result = spawnSync(command, args, {
+      encoding: "utf8",
+      shell: false,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return { status: result.status, stdout: result.stdout ?? "" };
+  });
+  const ownsBoundPid = () => {
+    const inspection = inspectLaunchdTarget("/bin/launchctl", ["print", expectedTarget]);
+    return inspection.status === 0 && launchdOutputOwnsPid(inspection.stdout, options.livePid);
+  };
+  if (!ownsBoundPid()) return undefined;
+
+  const kickstart = options.kickstart ?? ((command, args) => {
+    const result = spawnSync(command, args, {
+      encoding: "utf8",
+      shell: false,
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    return { status: result.status, stderr: result.stderr ?? "" };
+  });
+
+  return {
+    actuator: "launchd-self",
+    serviceLabel: options.serviceLabel,
+    launchdTarget: expectedTarget,
+    schedule(): SelfRestartReceipt {
+      if (!ownsBoundPid()) {
+        throw new Error("Bound launchd service PID changed before restart scheduling.");
+      }
+      const result = kickstart("/bin/launchctl", ["kickstart", "-k", expectedTarget]);
+      if (result.status !== 0) {
+        throw new Error(`Bound launchd restart failed with status ${String(result.status)}${result.stderr ? `: ${result.stderr.trim()}` : ""}`);
+      }
+      return {
+        scheduled: true,
+        actuator: "launchd-self",
+        serviceLabel: options.serviceLabel,
+        launchdTarget: expectedTarget,
+      };
+    },
+  };
+}
+
 export function createLaunchdSelfRestartActuator(
   options: LaunchdSelfRestartOptions = {},
 ): SelfRestartActuator | undefined {
