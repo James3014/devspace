@@ -177,7 +177,7 @@ test("release retention pins newest rollback candidates and removes only older o
     writeFileSync(join(path, "package.json"), JSON.stringify({ name: "@waishnav/devspace" }));
     writeFileSync(join(path, "payload.bin"), "x".repeat(stamp * 32));
     const when = new Date(1_700_000_000_000 + stamp * 1000);
-    execFileSync("touch", ["-mt", when.toISOString().replace(/[-:]/g, "").slice(0, 12), path]);
+    utimesSync(path, when, when);
   }
   const foreign = join(releases, "release-foreign");
   mkdirSync(foreign);
