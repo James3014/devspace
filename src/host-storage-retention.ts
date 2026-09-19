@@ -827,7 +827,7 @@ async function inspectBrowserRuntimes(input: HostStorageRetentionInput): Promise
 async function inspectGitWorktree(
   worktreePath: string,
   sourceRoot: string,
-): Promise<{ state: "known"; dirty: boolean } | { state: "unknown"; reason: string }> {
+): Promise<{ state: "known"; dirty: boolean; head: string } | { state: "unknown"; reason: string }> {
   try {
     const statusResult = await execFileAsync("git", ["-C", worktreePath, "status", "--porcelain=v1"], {
       encoding: "utf8",
@@ -853,7 +853,16 @@ async function inspectGitWorktree(
     if (!registered) {
       return { state: "unknown", reason: "physical worktree is not registered by its source repository" };
     }
-    return { state: "known", dirty: String(statusResult.stdout).trim().length > 0 };
+    const headResult = await execFileAsync("git", ["-C", worktreePath, "rev-parse", "HEAD"], {
+      encoding: "utf8",
+      timeout: 10_000,
+      maxBuffer: 2 * 1024 * 1024,
+    });
+    return {
+      state: "known",
+      dirty: String(statusResult.stdout).trim().length > 0,
+      head: String(headResult.stdout).trim(),
+    };
   } catch (error) {
     return {
       state: "unknown",
