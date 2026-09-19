@@ -346,6 +346,7 @@ export class CarrierBindingStore {
     carrierId: string;
     expectedVersion: number;
     expectedValidityVersion: number;
+    carrierCredential: string;
     confirmCutoverId: string;
   }) {
     if(input.confirmCutoverId!==input.cutoverId) deny("Restart confirmation must equal the exact cutover id");
@@ -355,6 +356,10 @@ export class CarrierBindingStore {
     }
     return this.database.sqlite.transaction(()=>{
       const binding=this.active(input.carrierId);
+      if(typeof input.carrierCredential!=="string" || !/^[A-Za-z0-9_-]{43}$/.test(input.carrierCredential) ||
+        digest(input.carrierCredential)!==binding.row.credential_hash) {
+        deny("Local cutover restart requires possession of the current carrier credential");
+      }
       if(binding.row.version!==input.expectedVersion || binding.validity.version!==input.expectedValidityVersion) {
         throw new ControlPlaneOwnershipError("CAS_CONFLICT","Carrier or validity version changed");
       }
