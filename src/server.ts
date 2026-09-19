@@ -2961,6 +2961,12 @@ export function createMcpServer(
       if (canonicalizePath(operation.scopeRoot) === canonical) {
         throw new Error(`Path has unresolved durable operation ${operation.operationId}.`);
       }
+      if (operation.workspaceId) {
+        const session = workspaces.listSessions().find((candidate) => candidate.id === operation.workspaceId);
+        if (session && canonicalizePath(session.root) === canonical) {
+          throw new Error(`Path has unresolved durable operation ${operation.operationId} for workspace ${operation.workspaceId}.`);
+        }
+      }
     }
   };
 
