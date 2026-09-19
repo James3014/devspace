@@ -150,9 +150,25 @@ shows the combined changes and advances the review point automatically.
 
 ## Data Retention
 
-DevSpace does not currently prune workspace sessions, conversation bindings,
-or review refs. A future product retention policy will define safe cleanup for
-these records; no automatic deletion is performed today.
+DevSpace exposes an ownership-aware storage inventory and an explicit garbage-
+collection apply step through the MCP tools `storage_inventory` and
+`storage_gc`.
+
+The inventory is fail-closed. Checkout directories are user-owned and are never
+deletion targets. Managed worktrees are reclaimable only when they are outside
+the active server registry, have no durable conversation binding or resumable
+agent, are clean, remain registered to their source repository, and have passed
+the retention grace period. Release cleanup recognizes only DevSpace package
+releases, keeps the newest rollback candidates, and preserves releases referenced
+by bounded activation/cutover receipts. Browser runtime directories require an
+explicit DevSpace ownership/lifecycle marker; unmarked historical profiles remain
+`UNKNOWN` and are not deleted.
+
+`storage_gc` requires the exact plan id returned by `storage_inventory` and
+rebuilds the inventory before any deletion. Drift therefore fails closed instead
+of applying an old cleanup decision. Provider-owned state such as `~/.codex`
+or `~/.gemini`, and broad temporary roots such as `/private/tmp`, are outside
+this GC authority.
 
 ## MCP Workspace Path Rejected
 
