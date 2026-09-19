@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import { lstat, mkdir, opendir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
@@ -294,7 +294,7 @@ async function readApplyJournal(
 
 async function claimApplyJournal(stateDir: string, journal: HostStorageApplyJournal): Promise<void> {
   const path = applyReceiptPath(stateDir, journal.planId);
-  await mkdir(dirname(path), { recursive: true });
+  await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   try {
     await writeFile(path, JSON.stringify(journal, null, 2) + "\n", {
       encoding: "utf8",
@@ -313,10 +313,11 @@ async function claimApplyJournal(stateDir: string, journal: HostStorageApplyJour
 
 async function writeApplyJournal(stateDir: string, journal: HostStorageApplyJournal): Promise<void> {
   const path = applyReceiptPath(stateDir, journal.planId);
-  const temp = path + ".tmp";
+  const temp = path + ".tmp-" + randomUUID();
   await writeFile(temp, JSON.stringify(journal, null, 2) + "\n", {
     encoding: "utf8",
     mode: 0o600,
+    flag: "wx",
   });
   await rename(temp, path);
 }
