@@ -327,6 +327,93 @@ test("expired prepared recovery crash after cutover close replays only operation
   } finally {DurableOperationStore.prototype.finish=originalFinish;manager?.close();f.close();}
 });
 
+test("host-local capability expectation mismatch recovery closes the failed cutover and releases its lease",async()=>{
+  const f=fixture();
+  const context={clientId:"shared-oauth",sessionId:"capability-mismatch-controller"};
+  let manager:DurableOperationManager|undefined;
+  try {
+    const pairing=f.store.requestPairing(context);
+    const predecessorCapability="c".repeat(64);
+    const observedCapability="e".repeat(64);
+    const cutover={stateRoot:f.root,attemptKey:"capability-mismatch",
+      currentIdentity:{serverInstanceId:"original",sourceCommit:f.contract.baseRevision,buildId:"old",capabilityManifestSha256:predecessorCapability},
+      expectedIdentity:{sourceCommit:"b".repeat(40),buildId:"new",capabilityManifestSha256:predecessorCapability},
+      expiresAt:new Date(f.clock()+120000).toISOString(),
+      restart:{buildReady:{verifiedBy:"fixture",verifiedAt:new Date(f.clock()).toISOString(),evidence:"exact target build"},actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"},
+      finish:{workspaceId:"ws_test",agentId:"agt_test"}};
+    const contract={...f.contract,scope:[f.root],operations:["cutover_start" as const],cutover,expiresAt:new Date(f.clock()+180000).toISOString()};
+    const approved=f.store.approveLocal(pairing.pendingId,contract);
+    f.store.redeem(context,pairing.credential);
+    const plan=planCutoverStart(f.root,cutover);
+    const preparedLease=f.store.prepareEffect(context,plan.subject);
+    const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config-cap-mismatch"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees-cap-mismatch"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
+    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
+    manager.drainCutover(id,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
+    const actuator={actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service",schedule:()=>({scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"})};
+    await manager.restartCutover(id,cutover.currentIdentity,cutover.restart.buildReady,async()=>({buildReady:true,detail:"exact target build"}),actuator,context);
+    const before=new CutoverStateStore(f.root).get()!;
+    assert.equal(before.phase,"drained");
+    assert.ok(before.restartRequest?.restartScheduledAt);
+    assert.equal(f.store.ownership.get(preparedLease.leaseId)?.operationHandle,start.operationId);
+
+    const observed={serverInstanceId:"replacement",sourceCommit:cutover.expectedIdentity.sourceCommit,buildId:cutover.expectedIdentity.buildId,capabilityManifestSha256:observedCapability};
+    assert.throws(()=>f.store.recoverCapabilityExpectationMismatchLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:id,observedIdentity:{...observed,sourceCommit:"f".repeat(40)}}),/exact replacement source\/build/i);
+    assert.equal(new CutoverStateStore(f.root).get()?.phase,"drained");
+    assert.equal(f.store.ownership.get(preparedLease.leaseId)?.operationHandle,start.operationId);
+
+    const recovered=f.store.recoverCapabilityExpectationMismatchLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:id,observedIdentity:observed});
+    assert.equal(recovered.replayed,false);
+    assert.equal(recovered.cutover.phase,"closed");
+    assert.equal(recovered.cutover.reconciliationReceipt?.terminalReason,"CAPABILITY_EXPECTATION_MISMATCH");
+    assert.equal(recovered.cutover.reconciliationReceipt?.preRestartDrainObserved,true);
+    assert.equal(recovered.cutover.capabilityExpectationMismatch?.observedIdentity.capabilityManifestSha256,observedCapability);
+    assert.equal(recovered.lease.terminalState,"released");
+    assert.equal(recovered.lease.operationState,"finished");
+    assert.equal(recovered.lease.operationHandle,undefined);
+    assert.equal(recovered.operation.status,"failed");
+    assert.equal(recovered.operation.errorCode,"CAPABILITY_EXPECTATION_MISMATCH");
+    assert.equal(recovered.operation.receipt?.lifecycleTerminal,true);
+    assert.equal(recovered.operation.receipt?.recoveryKind,"capability_expectation_mismatch");
+
+    const replay=f.store.recoverCapabilityExpectationMismatchLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:id,observedIdentity:observed});
+    assert.equal(replay.replayed,true);
+    assert.deepEqual(replay.cutover,recovered.cutover);
+    assert.deepEqual(replay.reconciliation,recovered.reconciliation);
+    assert.equal(replay.lease.terminalState,"released");
+  } finally {manager?.close();f.close();}
+});
+
+test("host-local capability expectation mismatch recovery refuses a target digest that was not copied from the predecessor",async()=>{
+  const f=fixture();
+  const context={clientId:"shared-oauth",sessionId:"capability-mismatch-not-predecessor"};
+  let manager:DurableOperationManager|undefined;
+  try {
+    const pairing=f.store.requestPairing(context);
+    const cutover={stateRoot:f.root,attemptKey:"capability-mismatch-not-predecessor",
+      currentIdentity:{serverInstanceId:"original",sourceCommit:f.contract.baseRevision,buildId:"old",capabilityManifestSha256:"c".repeat(64)},
+      expectedIdentity:{sourceCommit:"b".repeat(40),buildId:"new",capabilityManifestSha256:"d".repeat(64)},
+      expiresAt:new Date(f.clock()+120000).toISOString(),
+      restart:{buildReady:{verifiedBy:"fixture",verifiedAt:new Date(f.clock()).toISOString(),evidence:"different expected capability"},actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"},
+      finish:{workspaceId:"ws_test",agentId:"agt_test"}};
+    const contract={...f.contract,scope:[f.root],operations:["cutover_start" as const],cutover,expiresAt:new Date(f.clock()+180000).toISOString()};
+    const approved=f.store.approveLocal(pairing.pendingId,contract);
+    f.store.redeem(context,pairing.credential);
+    const plan=planCutoverStart(f.root,cutover);
+    const lease=f.store.prepareEffect(context,plan.subject);
+    const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config-cap-mismatch-negative"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees-cap-mismatch-negative"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
+    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
+    manager.drainCutover(id,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
+    const actuator={actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service",schedule:()=>({scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"})};
+    await manager.restartCutover(id,cutover.currentIdentity,cutover.restart.buildReady,async()=>({buildReady:true,detail:"different expected capability"}),actuator,context);
+    const observed={serverInstanceId:"replacement",sourceCommit:cutover.expectedIdentity.sourceCommit,buildId:cutover.expectedIdentity.buildId,capabilityManifestSha256:"e".repeat(64)};
+    assert.throws(()=>f.store.recoverCapabilityExpectationMismatchLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:id,observedIdentity:observed}),/predecessor capability digest reused/i);
+    assert.equal(new CutoverStateStore(f.root).get()?.phase,"drained");
+    assert.equal(f.store.ownership.get(lease.leaseId)?.operationHandle,start.operationId);
+  } finally {manager?.close();f.close();}
+});
+
 test("completion readers remain paired, scoped and independent of candidate base",()=>{
   const selection={goal:"issue62",subject:"delivery",candidate:"b".repeat(40)};
   const readers={readContract:(s:typeof selection)=>({...s}),readEvidence:()=>[]};

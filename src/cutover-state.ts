@@ -20,10 +20,12 @@ export const CUTOVER_RECOVERY_INTENT_SCHEMA = "devspace.cutover_recovery_intent.
 export const CUTOVER_SUPERSEDED_SCHEMA = "devspace.cutover_superseded.v1" as const;
 export const CUTOVER_OBSERVED_REPLACEMENT_SCHEMA = "devspace.cutover_observed_replacement.v1" as const;
 export const CUTOVER_EXPIRED_PREPARED_NO_EFFECT_SCHEMA = "devspace.cutover_expired_prepared_no_effect.v1" as const;
+export const CUTOVER_CAPABILITY_EXPECTATION_MISMATCH_SCHEMA = "devspace.cutover_capability_expectation_mismatch.v1" as const;
 
 export const CUTOVER_SUPERSEDED_REASON = "STALE_TARGET_SUPERSEDED" as const;
 export const CUTOVER_OBSERVED_REPLACEMENT_REASON = "OBSERVED_REPLACEMENT_WITHOUT_DRAIN" as const;
 export const CUTOVER_EXPIRED_PREPARED_NO_EFFECT_REASON = "EXPIRED_PREPARED_NO_EFFECT" as const;
+export const CUTOVER_CAPABILITY_EXPECTATION_MISMATCH_REASON = "CAPABILITY_EXPECTATION_MISMATCH" as const;
 export const CUTOVER_BINDING_REPAIR_SCHEMA = "devspace.cutover_binding_repair.v1" as const;
 export const CUTOVER_BINDING_REPAIR_REASON = "CROSS_DOMAIN_DIGEST_MISBINDING" as const;
 
@@ -122,7 +124,7 @@ export interface CutoverReconciliationReceipt {
   agentQueryable: boolean;
   agentReconciled: boolean;
   reconciledAt: string;
-  terminalReason?: typeof CUTOVER_OBSERVED_REPLACEMENT_REASON | typeof CUTOVER_EXPIRED_PREPARED_NO_EFFECT_REASON;
+  terminalReason?: typeof CUTOVER_OBSERVED_REPLACEMENT_REASON | typeof CUTOVER_EXPIRED_PREPARED_NO_EFFECT_REASON | typeof CUTOVER_CAPABILITY_EXPECTATION_MISMATCH_REASON;
   preRestartDrainObserved?: boolean;
   witnessWorkspaceId?: string;
   witnessAgentId?: string;
@@ -158,6 +160,22 @@ export interface CutoverExpiredPreparedNoEffectReceipt {
   restartScheduled: false;
   oldServerIdentity: CutoverServerIdentity;
   expectedIdentity: ExpectedCutoverIdentity;
+  coordinationBinding: Readonly<CutoverCoordinationBinding>;
+  recoveredBy: string;
+  recoveredAt: string;
+  reconciliationReceipt: CutoverReconciliationReceipt;
+}
+
+export interface CutoverCapabilityExpectationMismatchReceipt {
+  schema: typeof CUTOVER_CAPABILITY_EXPECTATION_MISMATCH_SCHEMA;
+  cutoverId: string;
+  terminalReason: typeof CUTOVER_CAPABILITY_EXPECTATION_MISMATCH_REASON;
+  preRestartDrainObserved: true;
+  restartRequested: true;
+  restartScheduled: true;
+  oldServerIdentity: CutoverServerIdentity;
+  expectedIdentity: ExpectedCutoverIdentity;
+  observedIdentity: CutoverServerIdentity;
   coordinationBinding: Readonly<CutoverCoordinationBinding>;
   recoveredBy: string;
   recoveredAt: string;
@@ -247,6 +265,8 @@ export interface DurableCutoverRecord {
   observedReplacement?: CutoverObservedReplacementReceipt;
   /** Present only on a coordination-bound prepared cutover closed after expiry with no drain/restart effect. */
   expiredPreparedNoEffect?: CutoverExpiredPreparedNoEffectReceipt;
+  /** Present only on a coordination-bound drained cutover closed as a failed capability-expectation attempt. */
+  capabilityExpectationMismatch?: CutoverCapabilityExpectationMismatchReceipt;
   /** Present only on a record with a verified cross-domain digest repair. */
   bindingRepair?: CutoverBindingRepairReceipt;
 }
@@ -893,6 +913,98 @@ export class CutoverStateStore {
   }
 
   /**
+   * Terminally close one coordination-bound drained cutover after a verified replacement
+   * loaded the exact expected source/build but a different capability manifest because the
+   * target expectation reused the predecessor capability digest. This records a failed
+   * deployment attempt only; it never accepts the replacement or rewrites the expected target.
+   */
+  recoverCapabilityExpectationMismatch(input: {
+    cutoverId: string;
+    recoveredBy: string;
+    observedIdentity: CutoverServerIdentity;
+  }): { record: DurableCutoverRecord; newlyRecovered: boolean } {
+    const active = this.get();
+    if (!active) throw new CutoverStateError("No durable cutover record exists.");
+    if (active.cutoverId !== input.cutoverId) {
+      throw new CutoverStateError(`Cutover id mismatch: active cutover is ${active.cutoverId}.`);
+    }
+    if (!input.recoveredBy.trim()) {
+      throw new CutoverStateError("Capability expectation recovery requires a non-empty recovery identity.");
+    }
+    if (active.phase === "closed" && active.capabilityExpectationMismatch) {
+      const prior = active.capabilityExpectationMismatch;
+      if (prior.recoveredBy !== input.recoveredBy || !identitiesEqual(prior.observedIdentity, input.observedIdentity)) {
+        throw new CutoverStateError("[RECOVERY_BINDING_MISMATCH] Capability expectation recovery identity changed.");
+      }
+      return { record: active, newlyRecovered: false };
+    }
+    if (active.phase !== "drained" || !active.coordinationBinding || !active.drainEvidence) {
+      throw new CutoverStateError("Capability expectation recovery requires one coordination-bound drained cutover.");
+    }
+    if (!active.restartRequest?.restartScheduledAt || !active.restartRequest.restartScheduledForServerInstanceId) {
+      throw new CutoverStateError("Capability expectation recovery requires a durably scheduled restart.");
+    }
+    if (input.observedIdentity.serverInstanceId === active.oldServerIdentity.serverInstanceId) {
+      throw new CutoverStateError("Capability expectation recovery requires a replacement server instance.");
+    }
+    if (input.observedIdentity.sourceCommit !== active.expectedNewIdentity.sourceCommit ||
+        input.observedIdentity.buildId !== active.expectedNewIdentity.buildId) {
+      throw new CutoverStateError("Capability expectation recovery requires the exact expected source/build.");
+    }
+    const expectedCapability = active.expectedNewIdentity.capabilityManifestSha256;
+    const oldCapability = active.oldServerIdentity.capabilityManifestSha256;
+    const observedCapability = input.observedIdentity.capabilityManifestSha256;
+    if (!expectedCapability || !oldCapability || !observedCapability ||
+        expectedCapability !== oldCapability || observedCapability === expectedCapability) {
+      throw new CutoverStateError("Capability expectation recovery only handles a predecessor capability digest reused as the target expectation.");
+    }
+    if (active.restartRequest.requestedByServerInstanceId !== active.oldServerIdentity.serverInstanceId ||
+        active.restartRequest.restartScheduledForServerInstanceId !== active.oldServerIdentity.serverInstanceId) {
+      throw new CutoverStateError("Capability expectation recovery restart lineage does not match the original server.");
+    }
+    if (active.observedReplacement || active.expiredPreparedNoEffect || active.supersession || active.bindingRepair) {
+      throw new CutoverStateError("Capability expectation recovery refuses conflicting terminal or repair evidence.");
+    }
+    const recoveredAt = new Date(this.now()).toISOString();
+    const reconciliationReceipt: CutoverReconciliationReceipt = {
+      closedByServerInstanceId: input.observedIdentity.serverInstanceId,
+      workspaceQueryable: false,
+      agentQueryable: false,
+      agentReconciled: false,
+      reconciledAt: recoveredAt,
+      terminalReason: CUTOVER_CAPABILITY_EXPECTATION_MISMATCH_REASON,
+      preRestartDrainObserved: true,
+      witnessKind: "capability-expectation-mismatch",
+    };
+    const capabilityExpectationMismatch: CutoverCapabilityExpectationMismatchReceipt = {
+      schema: CUTOVER_CAPABILITY_EXPECTATION_MISMATCH_SCHEMA,
+      cutoverId: active.cutoverId,
+      terminalReason: CUTOVER_CAPABILITY_EXPECTATION_MISMATCH_REASON,
+      preRestartDrainObserved: true,
+      restartRequested: true,
+      restartScheduled: true,
+      oldServerIdentity: active.oldServerIdentity,
+      expectedIdentity: active.expectedNewIdentity,
+      observedIdentity: input.observedIdentity,
+      coordinationBinding: active.coordinationBinding,
+      recoveredBy: input.recoveredBy,
+      recoveredAt,
+      reconciliationReceipt,
+    };
+    const record = this.replace({
+      ...withoutDiagnostic(active),
+      phase: "closed",
+      reconciliationReceipt,
+      capabilityExpectationMismatch,
+      updatedAt: recoveredAt,
+    });
+    if (!record.capabilityExpectationMismatch || !isDeepStrictEqual(record.capabilityExpectationMismatch, capabilityExpectationMismatch)) {
+      throw new CutoverStateError("Capability expectation recovery durable readback changed.");
+    }
+    return { record, newlyRecovered: true };
+  }
+
+  /**
    * Terminally close one cutover where the replacement server is already running with
    * exact expected source/build/capability identity, but pre-restart drain evidence
    * was absent (e.g. transport initialization rejection before cutover_drain reached handler).
@@ -1128,6 +1240,7 @@ function parseRecord(raw: string): DurableCutoverRecord {
     (value.reconciliationReceipt !== undefined && !isReconciliationReceipt(value.reconciliationReceipt)) ||
     (value.observedReplacement !== undefined && !isObservedReplacementReceipt(value.observedReplacement)) ||
     (value.expiredPreparedNoEffect !== undefined && !isExpiredPreparedNoEffectReceipt(value.expiredPreparedNoEffect)) ||
+    (value.capabilityExpectationMismatch !== undefined && !isCapabilityExpectationMismatchReceipt(value.capabilityExpectationMismatch)) ||
     (value.bindingRepair !== undefined && !isBindingRepairReceipt(value.bindingRepair))
   ) {
     throw new CutoverStateError("Durable cutover record is malformed; reconciliation is required.");
@@ -1183,6 +1296,43 @@ function parseRecord(raw: string): DurableCutoverRecord {
       throw new CutoverStateError("Durable cutover record is malformed; expired prepared recovery binding is inconsistent.");
     }
   }
+  if (record.capabilityExpectationMismatch) {
+    const receipt = record.capabilityExpectationMismatch;
+    if (
+      receipt.cutoverId !== record.cutoverId ||
+      record.phase !== "closed" ||
+      !record.coordinationBinding ||
+      !record.drainEvidence ||
+      !record.restartRequest?.restartScheduledAt ||
+      !record.restartRequest.restartScheduledForServerInstanceId ||
+      record.observedReplacement !== undefined ||
+      record.expiredPreparedNoEffect !== undefined ||
+      record.supersession !== undefined ||
+      record.bindingRepair !== undefined ||
+      !isDeepStrictEqual(receipt.coordinationBinding, record.coordinationBinding) ||
+      !identitiesEqual(receipt.oldServerIdentity, record.oldServerIdentity) ||
+      !expectedIdentitiesEqual(receipt.expectedIdentity, record.expectedNewIdentity) ||
+      !isDeepStrictEqual(record.reconciliationReceipt, receipt.reconciliationReceipt) ||
+      receipt.observedIdentity.serverInstanceId === record.oldServerIdentity.serverInstanceId ||
+      receipt.observedIdentity.sourceCommit !== record.expectedNewIdentity.sourceCommit ||
+      receipt.observedIdentity.buildId !== record.expectedNewIdentity.buildId ||
+      !record.expectedNewIdentity.capabilityManifestSha256 ||
+      !record.oldServerIdentity.capabilityManifestSha256 ||
+      !receipt.observedIdentity.capabilityManifestSha256 ||
+      record.expectedNewIdentity.capabilityManifestSha256 !== record.oldServerIdentity.capabilityManifestSha256 ||
+      receipt.observedIdentity.capabilityManifestSha256 === record.expectedNewIdentity.capabilityManifestSha256 ||
+      record.restartRequest.requestedByServerInstanceId !== record.oldServerIdentity.serverInstanceId ||
+      record.restartRequest.restartScheduledForServerInstanceId !== record.oldServerIdentity.serverInstanceId ||
+      receipt.reconciliationReceipt.closedByServerInstanceId !== receipt.observedIdentity.serverInstanceId ||
+      receipt.reconciliationReceipt.terminalReason !== CUTOVER_CAPABILITY_EXPECTATION_MISMATCH_REASON ||
+      receipt.reconciliationReceipt.preRestartDrainObserved !== true ||
+      receipt.preRestartDrainObserved !== true ||
+      receipt.restartRequested !== true ||
+      receipt.restartScheduled !== true
+    ) {
+      throw new CutoverStateError("Durable cutover record is malformed; capability expectation mismatch recovery binding is inconsistent.");
+    }
+  }
   return record;
 }
 
@@ -1211,7 +1361,7 @@ function isReconciliationReceipt(value: unknown): value is CutoverReconciliation
     typeof receipt.reconciledAt === "string" &&
     Number.isFinite(Date.parse(receipt.reconciledAt)) &&
     (receipt.preRestartDrainObserved === undefined || typeof receipt.preRestartDrainObserved === "boolean") &&
-    (receipt.terminalReason === undefined || receipt.terminalReason === CUTOVER_OBSERVED_REPLACEMENT_REASON || receipt.terminalReason === CUTOVER_EXPIRED_PREPARED_NO_EFFECT_REASON),
+    (receipt.terminalReason === undefined || receipt.terminalReason === CUTOVER_OBSERVED_REPLACEMENT_REASON || receipt.terminalReason === CUTOVER_EXPIRED_PREPARED_NO_EFFECT_REASON || receipt.terminalReason === CUTOVER_CAPABILITY_EXPECTATION_MISMATCH_REASON),
   );
 }
 
@@ -1258,6 +1408,31 @@ function isExpiredPreparedNoEffectReceipt(value: unknown): value is CutoverExpir
     receipt.restartScheduled === false &&
     isIdentity(receipt.oldServerIdentity) &&
     isExpectedIdentity(receipt.expectedIdentity) &&
+    receipt.coordinationBinding !== undefined &&
+    (() => { try { validatedCoordinationBinding(receipt.coordinationBinding); return true; } catch { return false; } })() &&
+    typeof receipt.recoveredBy === "string" &&
+    receipt.recoveredBy.length > 0 &&
+    typeof receipt.recoveredAt === "string" &&
+    Number.isFinite(Date.parse(receipt.recoveredAt)) &&
+    receipt.reconciliationReceipt !== undefined &&
+    isReconciliationReceipt(receipt.reconciliationReceipt)
+  );
+}
+
+function isCapabilityExpectationMismatchReceipt(value: unknown): value is CutoverCapabilityExpectationMismatchReceipt {
+  const receipt = value as Partial<CutoverCapabilityExpectationMismatchReceipt> | undefined;
+  return Boolean(
+    receipt &&
+    receipt.schema === CUTOVER_CAPABILITY_EXPECTATION_MISMATCH_SCHEMA &&
+    typeof receipt.cutoverId === "string" &&
+    receipt.cutoverId.length > 0 &&
+    receipt.terminalReason === CUTOVER_CAPABILITY_EXPECTATION_MISMATCH_REASON &&
+    receipt.preRestartDrainObserved === true &&
+    receipt.restartRequested === true &&
+    receipt.restartScheduled === true &&
+    isIdentity(receipt.oldServerIdentity) &&
+    isExpectedIdentity(receipt.expectedIdentity) &&
+    isIdentity(receipt.observedIdentity) &&
     receipt.coordinationBinding !== undefined &&
     (() => { try { validatedCoordinationBinding(receipt.coordinationBinding); return true; } catch { return false; } })() &&
     typeof receipt.recoveredBy === "string" &&
