@@ -215,6 +215,7 @@ import {
 } from "./repository-intelligence.js";
 import { registerRepositoryIntelligenceArtifactTool } from "./repository-intelligence-artifact.js";
 import { registerPhysicalHostRegistryTools } from "./physical-host-registry.js";
+import { applyHostStoragePlan, buildHostStoragePlan } from "./host-storage-retention.js";
 
 type Transport = StreamableHTTPServerTransport;
 class ReboundTransport extends StreamableHTTPServerTransport {
@@ -2864,6 +2865,82 @@ export function createMcpServer(
     ?? { value: runtimeBuildIdentity.profileCatalogGeneration };
   const agentStartInputSchema = createAgentStartInputSchema();
   const agentPreflightInputSchema = createAgentPreflightInputSchema();
+
+  const hostStorageInput = () => {
+    const workspaceSessions = workspaces.listSessions();
+    return {
+      stateDir: config.stateDir,
+      worktreeRoot: config.worktreeRoot,
+      packageRoot: resolve(dirname(fileURLToPath(import.meta.url)), ".."),
+      workspaceSessions,
+      conversationBindings: workspaces.listConversationBindings(),
+      loadedWorkspaceIds: new Set(
+        workspaceSessions
+          .filter((session) => workspaces.inspectWorkspace(session.id).loaded)
+          .map((session) => session.id),
+      ),
+      agentRecords: agentSessionManager?.listAllAgentRecords() ?? [],
+    };
+  };
+
+  registerAppTool(
+    server,
+    "storage_inventory",
+    {
+      title: "Inspect DevSpace storage retention",
+      description:
+        "Read-only inventory of DevSpace-owned host storage. Classifies managed worktrees, retained releases, and browser runtimes without deleting anything. Unknown or foreign paths fail closed.",
+      inputSchema: {},
+      outputSchema: {
+        plan: z.record(z.string(), z.unknown()),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async () => {
+      const plan = await buildHostStoragePlan(hostStorageInput());
+      return {
+        content: [
+          textBlock(
+            `Storage inventory ${plan.planId}: ${plan.artifacts.length} artifact(s), ${plan.reclaimableBytes} reclaimable byte(s).`,
+          ),
+        ],
+        structuredContent: { plan: plan as unknown as Record<string, unknown> },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "storage_gc",
+    {
+      title: "Apply exact DevSpace storage GC plan",
+      description:
+        "Destructively applies one exact storage_inventory plan after re-reading current ownership/lifecycle evidence. Refuses stale plans; active, dirty, referenced, unknown, foreign, and provider-owned state is retained.",
+      inputSchema: {
+        expectedPlanId: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+        confirm: z.literal(true),
+      },
+      outputSchema: {
+        result: z.record(z.string(), z.unknown()),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ expectedPlanId }) => {
+      const result = await applyHostStoragePlan(hostStorageInput(), expectedPlanId, {
+        deleteWorkspaceSession: (workspaceId) => workspaces.deleteDurableSession(workspaceId),
+      });
+      return {
+        content: [
+          textBlock(
+            `Storage GC ${result.planId}: removed ${result.removed.length} artifact(s), reclaimed ${result.reclaimedBytes} byte(s), skipped ${result.skipped.length}.`,
+          ),
+        ],
+        structuredContent: { result: result as unknown as Record<string, unknown> },
+      };
+    },
+  );
   const capabilityManifest = runtimeBuildIdentityContext?.capabilityManifest
     ?? deriveLoadedCapabilityManifest(
       config.subagents && agentSessionManager
