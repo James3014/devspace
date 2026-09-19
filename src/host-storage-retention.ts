@@ -1,8 +1,9 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
 import { lstat, mkdir, opendir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
-import { join, resolve } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
+import type { DurableOperationRecord } from "./durable-operations.js";
 import type { LocalAgentRecord } from "./local-agent-store.js";
 import { safeWorkspaceRefSegment } from "./git.js";
 import { isPathInsideRoot } from "./roots.js";
@@ -17,7 +18,9 @@ export const DEFAULT_WORKTREE_GRACE_MS = 24 * 60 * 60 * 1000;
 
 export type StorageArtifactKind =
   | "managed_worktree"
+  | "workspace_record"
   | "workspace_checkout"
+  | "managed_clone"
   | "release"
   | "browser_runtime";
 
@@ -39,6 +42,12 @@ export interface HostStorageArtifact {
   modifiedAt?: string;
   workspaceId?: string;
   sourceRoot?: string;
+  ownershipRoot?: string;
+  ownershipEvidence?: string;
+  blockers?: string[];
+  disposition?: "RETAIN" | "DELETE" | "RECONCILE" | "NOT_OWNED";
+  lastUseAt?: string;
+  ageMs?: number;
 }
 
 export interface HostStoragePlan {
@@ -65,6 +74,9 @@ export interface HostStorageRetentionInput {
   conversationBindings: WorkspaceConversationBinding[];
   loadedWorkspaceIds: Set<string>;
   agentRecords: LocalAgentRecord[];
+  processWorkspaceStates: Map<string, "ACTIVE" | "UNKNOWN">;
+  durableOperations: DurableOperationRecord[];
+  allowedRoots: string[];
   nowMs?: number;
   releaseKeepCount?: number;
   worktreeGraceMs?: number;
