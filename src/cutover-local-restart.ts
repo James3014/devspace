@@ -41,6 +41,7 @@ export interface LocalBoundCutoverRestartInput {
   carrierId: string;
   expectedCarrierVersion: number;
   expectedValidityVersion: number;
+  carrierCredential: string;
   confirmCutoverId: string;
   packageRoot: string;
 }
@@ -119,6 +120,7 @@ export async function performLocalBoundCutoverRestart(
       carrierId:input.carrierId,
       expectedVersion:input.expectedCarrierVersion,
       expectedValidityVersion:input.expectedValidityVersion,
+      carrierCredential:input.carrierCredential,
       confirmCutoverId:input.confirmCutoverId,
     });
     const approved=local.cutover;
