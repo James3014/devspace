@@ -77,6 +77,7 @@ export interface HostStorageRetentionInput {
   processWorkspaceStates: Map<string, "ACTIVE" | "UNKNOWN">;
   durableOperations: DurableOperationRecord[];
   allowedRoots: string[];
+  activeSourceCommit?: string;
   nowMs?: number;
   releaseKeepCount?: number;
   worktreeGraceMs?: number;
