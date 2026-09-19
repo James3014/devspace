@@ -859,11 +859,13 @@ function processResult(snapshot: ProcessSnapshot): string {
     ? (snapshot.attemptKey
         ? `Process running with session ID ${snapshot.sessionId} (attemptKey: ${snapshot.attemptKey}).`
         : `Process running with session ID ${snapshot.sessionId}.`)
-    : snapshot.timedOut
-      ? `Process timed out and was terminated.`
-      : snapshot.signal
-        ? `Process exited after signal ${snapshot.signal}.`
-        : `Process exited with code ${snapshot.exitCode ?? "unknown"}.`;
+    : snapshot.processTreeState && snapshot.processTreeState !== "terminated"
+      ? `Process exited, but owned descendant cleanup is ${snapshot.processTreeState}.`
+      : snapshot.timedOut
+        ? `Process timed out and was terminated.`
+        : snapshot.signal
+          ? `Process exited after signal ${snapshot.signal}.`
+          : `Process exited with code ${snapshot.exitCode ?? "unknown"}.`;
   return snapshot.output ? `${snapshot.output.replace(/\n$/, "")}\n${status}` : status;
 }
 
@@ -875,6 +877,7 @@ function processOutputSchema(): z.ZodRawShape {
     exitCode: z.number().int().optional(),
     signal: z.string().optional(),
     timedOut: z.boolean().optional(),
+    processTreeState: z.enum(["terminated", "still-running", "unknown"]).optional(),
     wallTimeMs: z.number().nonnegative(),
     outputTruncated: z.boolean(),
     coreMutation: z.record(z.string(), z.unknown()).optional(),
@@ -891,7 +894,10 @@ function processToolResponse(
   const result = processResult(snapshot);
   const content = [textBlock(result)];
   const outputSummary = textSummary(snapshot.output ? [textBlock(snapshot.output)] : []);
-  const isError = !snapshot.running && (snapshot.exitCode !== 0 || snapshot.timedOut === true);
+  const isError = !snapshot.running
+    && (snapshot.exitCode !== 0
+      || snapshot.timedOut === true
+      || (snapshot.processTreeState !== undefined && snapshot.processTreeState !== "terminated"));
   return {
     content,
     ...(isError ? { isError: true } : {}),
@@ -911,6 +917,7 @@ function processToolResponse(
       exitCode: snapshot.exitCode,
       signal: snapshot.signal,
       timedOut: snapshot.timedOut,
+      processTreeState: snapshot.processTreeState,
       wallTimeMs: snapshot.wallTimeMs,
       outputTruncated: snapshot.outputTruncated,
       ...(coreMutation?.bound ? { coreMutation: coreMutationAdmissionOutput(coreMutation) } : {}),
@@ -1163,6 +1170,7 @@ function codexGoalStateStructured(state: CodexGoalState, coreMutation?: CoreMuta
     baseHead: state.baseHead,
     terminalReason: state.terminalReason,
     error: state.error,
+    processTreeState: state.processTreeState,
     ...(coreMutation?.bound
       ? { coreMutation: coreMutationAdmissionOutput(coreMutation) }
       : state.coreMutation
@@ -1182,8 +1190,11 @@ function codexGoalStateStructured(state: CodexGoalState, coreMutation?: CoreMuta
 }
 
 function codexGoalResultText(action: string, state: CodexGoalState): string {
+  const treeDetail = state.processTreeState && state.processTreeState !== "terminated"
+    ? `, processTree=${state.processTreeState}`
+    : "";
   const status = state.terminal
-    ? `terminal (${state.terminalReason ?? "exited"}, exitCode=${state.exitCode ?? "unknown"})`
+    ? `terminal (${state.terminalReason ?? "exited"}, exitCode=${state.exitCode ?? "unknown"}${treeDetail})`
     : state.goalActiveObserved
       ? "running with Goal Mode active"
       : "running";
@@ -1249,6 +1260,7 @@ function registerCodexGoalTools(
         baseHead: z.string().optional(),
         terminalReason: z.string().optional(),
         error: z.string().optional(),
+        processTreeState: z.enum(["terminated", "still-running", "unknown"]).optional(),
         coreMutation: z.record(z.string(), z.unknown()).optional(),
       },
       _meta: {},
@@ -1322,6 +1334,7 @@ function registerCodexGoalTools(
         baseHead: z.string().optional(),
         terminalReason: z.string().optional(),
         error: z.string().optional(),
+        processTreeState: z.enum(["terminated", "still-running", "unknown"]).optional(),
         coreMutation: z.record(z.string(), z.unknown()).optional(),
       },
       _meta: {},
@@ -1366,6 +1379,7 @@ function registerCodexGoalTools(
         baseHead: z.string().optional(),
         terminalReason: z.string().optional(),
         error: z.string().optional(),
+        processTreeState: z.enum(["terminated", "still-running", "unknown"]).optional(),
         coreMutation: z.record(z.string(), z.unknown()).optional(),
       },
       _meta: {},
@@ -1435,6 +1449,7 @@ function registerCodexGoalTools(
         baseHead: z.string().optional(),
         terminalReason: z.string().optional(),
         error: z.string().optional(),
+        processTreeState: z.enum(["terminated", "still-running", "unknown"]).optional(),
       },
       _meta: {},
       annotations: {

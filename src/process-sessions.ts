@@ -1,7 +1,14 @@
 import { spawn } from "node:child_process";
 import { realpathSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
-import { resolveShellCommand, terminateProcessTree } from "./process-platform.js";
+import {
+  inspectOwnedProcessTree,
+  resolveShellCommand,
+  terminateProcessTree,
+  type OwnedProcessIdentity,
+  type OwnedProcessTreeState,
+  type ProcessTreeTerminationReceipt,
+} from "./process-platform.js";
 
 const DEFAULT_EXEC_YIELD_MS = 10_000;
 const DEFAULT_INTERACTIVE_YIELD_MS = 250;
@@ -87,6 +94,7 @@ export interface ProcessSnapshot {
   exitCode?: number;
   signal?: string;
   timedOut?: boolean;
+  processTreeState?: OwnedProcessTreeState;
   wallTimeMs: number;
   coreMutation?: CoreMutationProcessBinding;
 }
@@ -211,6 +219,9 @@ interface ProcessSession {
   exitCode?: number;
   signal?: string;
   timedOut?: boolean;
+  ownedDescendants?: OwnedProcessIdentity[];
+  processTreeCaptureComplete?: boolean;
+  processTreeState?: OwnedProcessTreeState;
   exitPromise: Promise<void>;
   resolveExit: () => void;
   executionTimer?: NodeJS.Timeout;
@@ -723,7 +734,9 @@ export class ProcessSessionManager {
 
     session.process = {
       write: (data) => child.stdin.write(data),
-      kill: (signal = "SIGTERM") => terminateProcessTree(child, signal, detached),
+      kill: (signal = "SIGTERM") => {
+        this.recordProcessTreeReceipt(session, terminateProcessTree(child, signal, detached));
+      },
       resize: input.tty ? () => undefined : undefined,
     };
     child.stdout.on("data", (data: Buffer) => this.append(session, stdoutDecoder.write(data)));
@@ -775,7 +788,16 @@ export class ProcessSessionManager {
 
     session.process = {
       write: (data) => pty.write(data),
-      kill: (signal) => killPtyProcess(pty, signal),
+      kill: (signal = "SIGTERM") => {
+        const root = {
+          pid: pty.pid,
+          kill(innerSignal: NodeJS.Signals = "SIGTERM") {
+            killPtyProcess(pty, innerSignal);
+            return true;
+          },
+        };
+        this.recordProcessTreeReceipt(session, terminateProcessTree(root, signal, false));
+      },
       resize: (columns, rows) => pty.resize(columns, rows),
     };
     pty.onData((data) => this.append(session, data));
@@ -783,6 +805,23 @@ export class ProcessSessionManager {
       this.finish(session, exitCode, signal === 0 ? undefined : String(signal));
       disposeWindowsPtyResources(pty);
     });
+  }
+
+  private recordProcessTreeReceipt(
+    session: ProcessSession,
+    receipt: ProcessTreeTerminationReceipt,
+  ): void {
+    if (!receipt.supported) return;
+    session.processTreeCaptureComplete = receipt.captureComplete;
+    if (receipt.descendants.length > 0) {
+      const merged = new Map<number, OwnedProcessIdentity>();
+      for (const target of session.ownedDescendants ?? []) merged.set(target.pid, target);
+      for (const target of receipt.descendants) merged.set(target.pid, target);
+      session.ownedDescendants = [...merged.values()];
+    } else if (!session.ownedDescendants) {
+      session.ownedDescendants = [];
+    }
+    session.processTreeState = receipt.captureComplete ? (receipt.state ?? "unknown") : "unknown";
   }
 
   private finish(session: ProcessSession, exitCode?: number, signal?: string): void {
@@ -815,6 +854,10 @@ export class ProcessSessionManager {
       ? session.buffer.drain(maxCharacters)
       : session.buffer.peek(maxCharacters);
 
+    if (session.processTreeCaptureComplete && session.ownedDescendants) {
+      session.processTreeState = inspectOwnedProcessTree(session.ownedDescendants) ?? session.processTreeState ?? "unknown";
+    }
+
     return {
       sessionId: session.running ? session.id : undefined,
       attemptKey: session.attemptKey,
@@ -824,6 +867,7 @@ export class ProcessSessionManager {
       exitCode: session.exitCode,
       signal: session.signal,
       timedOut: session.timedOut,
+      processTreeState: session.processTreeState,
       wallTimeMs: Date.now() - session.startedAt,
       coreMutation: session.coreMutation ? { ...session.coreMutation } : undefined,
     };
