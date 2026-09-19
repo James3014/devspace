@@ -753,6 +753,8 @@ export class LocalAgentSessionManager {
         expectedHead: contract.expectedHead,
         profile: profileName,
         writePaths: contract.writePaths ?? [],
+        authorizedToolCeiling: contract.authorizedToolCeiling,
+        toolProjectionManifest: contract.toolProjectionManifest,
       });
     } catch (error) {
       const detail = error instanceof Error ? error.message : String(error);
