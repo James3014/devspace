@@ -22,7 +22,8 @@ export type StorageArtifactKind =
   | "workspace_checkout"
   | "managed_clone"
   | "release"
-  | "browser_runtime";
+  | "browser_runtime"
+  | "verification_artifact";
 
 export type StorageLifecycle =
   | "ACTIVE"
@@ -85,10 +86,10 @@ export interface HostStorageRetentionInput {
   worktreeGraceMs?: number;
 }
 
-interface BrowserMarker {
+interface StorageMarker {
   schema: typeof HOST_STORAGE_BROWSER_MARKER_SCHEMA;
   owner: "devspace";
-  kind: "browser_runtime";
+  kind: "browser_runtime" | "verification_artifact";
   lifecycle: "active" | "terminal";
 }
 
@@ -99,6 +100,7 @@ export async function buildHostStoragePlan(input: HostStorageRetentionInput): Pr
     ...(await inspectWorkspaces(input)),
     ...(await inspectWorkspaceRecords(input)),
     ...(await inspectManagedClones(input)),
+    ...(await inspectVerificationArtifacts(input)),
     ...(await inspectReleases(input)),
     ...(await inspectBrowserRuntimes(input)),
   ]
@@ -199,7 +201,11 @@ export async function applyHostStoragePlan(
       } else if (artifact.kind === "managed_clone") {
         callbacks.assertPathUnreferenced?.(artifact.path);
         await removeOwnedDirectory(artifact.path, artifact.ownershipRoot);
-      } else if (artifact.kind === "release" || artifact.kind === "browser_runtime") {
+      } else if (
+        artifact.kind === "release" ||
+        artifact.kind === "browser_runtime" ||
+        artifact.kind === "verification_artifact"
+      ) {
         await removeOwnedDirectory(artifact.path, artifact.ownershipRoot);
       } else {
         throw new Error("user-owned checkout directories are never DevSpace deletion targets");
@@ -785,6 +791,65 @@ async function samePhysicalPath(left: string, right: string): Promise<boolean> {
   return (await canonicalPath(left)) === (await canonicalPath(right));
 }
 
+async function inspectVerificationArtifacts(input: HostStorageRetentionInput): Promise<HostStorageArtifact[]> {
+  const root = resolve(input.packageRoot);
+  const canonicalRoot = await canonicalPath(root);
+  const names = (await directoryChildren(root)).filter((name) =>
+    /^\..*(?:backup|verification|verify|build-artifact)/iu.test(name),
+  );
+  const artifacts: HostStorageArtifact[] = [];
+  for (const name of names) {
+    const rawPath = join(root, name);
+    const rawStats = await lstat(rawPath).catch(() => undefined);
+    const path = await canonicalPath(rawPath);
+    const base = {
+      id: `verification-artifact:${name}`,
+      kind: "verification_artifact" as const,
+      path,
+      ownershipRoot: canonicalRoot,
+      sizeBytes: await directorySize(rawPath),
+      modifiedAt: rawStats?.mtime.toISOString(),
+      ownershipEvidence: "candidate DevSpace verification/build backup under the package root",
+    };
+    if (!rawStats || rawStats.isSymbolicLink() || !rawStats.isDirectory()) {
+      artifacts.push({ ...base, lifecycle: "FOREIGN", reason: "verification artifact is not a real directory" });
+      continue;
+    }
+    if (!isPathInsideRoot(path, canonicalRoot) || path === canonicalRoot) {
+      artifacts.push({ ...base, lifecycle: "FOREIGN", reason: "verification artifact resolves outside the package root" });
+      continue;
+    }
+    const marker = (await readJson(join(path, ".devspace-storage.json"))) as Partial<StorageMarker> | undefined;
+    const markerOwned =
+      marker?.schema === HOST_STORAGE_BROWSER_MARKER_SCHEMA &&
+      marker.owner === "devspace" &&
+      marker.kind === "verification_artifact";
+    if (!markerOwned) {
+      artifacts.push({
+        ...base,
+        lifecycle: "UNKNOWN",
+        reason: "backup-like directory lacks a trusted DevSpace ownership/lifecycle marker",
+      });
+      continue;
+    }
+    if (marker.lifecycle === "active") {
+      artifacts.push({ ...base, lifecycle: "ACTIVE", reason: "DevSpace marker reports active verification/build artifact" });
+      continue;
+    }
+    if (marker.lifecycle === "terminal") {
+      artifacts.push({
+        ...base,
+        lifecycle: "GC_ELIGIBLE",
+        reason: "DevSpace-marked verification/build artifact is explicitly terminal",
+        ownershipEvidence: "canonical package-root containment plus explicit DevSpace terminal marker",
+      });
+      continue;
+    }
+    artifacts.push({ ...base, lifecycle: "UNKNOWN", reason: "verification artifact marker lifecycle is not recognized" });
+  }
+  return artifacts;
+}
+
 async function inspectReleases(input: HostStorageRetentionInput): Promise<HostStorageArtifact[]> {
   const releaseRoot = join(resolve(input.packageRoot), "releases");
   const canonicalReleaseRoot = await canonicalPath(releaseRoot);
@@ -969,7 +1034,7 @@ async function inspectBrowserRuntimes(input: HostStorageRetentionInput): Promise
     const profileState =
       input.browserProfileStates.get(browserProfileId(rawPath)) ??
       input.browserProfileStates.get(browserProfileId(path));
-    const marker = (await readJson(join(path, ".devspace-storage.json"))) as Partial<BrowserMarker> | undefined;
+    const marker = (await readJson(join(path, ".devspace-storage.json"))) as Partial<StorageMarker> | undefined;
     const markerOwned =
       marker?.schema === HOST_STORAGE_BROWSER_MARKER_SCHEMA &&
       marker.owner === "devspace" &&
