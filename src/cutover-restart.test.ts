@@ -117,8 +117,11 @@ test("bound restart actuator requires the approved target to own the live pid", 
   );
 });
 
-test("bound restart actuator rechecks pid before one exact kickstart", () => {
+test("bound restart actuator defers one exact kickstart until after schedule returns", () => {
   let inspections = 0;
+  let callback: (() => void) | undefined;
+  let delay: number | undefined;
+  let unrefCount = 0;
   const launches: Array<{ command: string; args: string[] }> = [];
   const actuator = createBoundLaunchdRestartActuator({
     platform: "darwin",
@@ -126,16 +129,19 @@ test("bound restart actuator rechecks pid before one exact kickstart", () => {
     livePid: 4321,
     serviceLabel: "com.example.devspace",
     launchdTarget: "gui/501/com.example.devspace",
+    delayMs: 321,
     inspectLaunchdTarget: (command, args) => {
       inspections += 1;
       assert.equal(command, "/bin/launchctl");
       assert.deepEqual(args, ["print", "gui/501/com.example.devspace"]);
       return { status: 0, stdout: "pid = 4321\n" };
     },
-    kickstart: (command, args) => {
-      launches.push({ command, args });
-      return { status: 0 };
+    schedule: (scheduled, delayMs) => {
+      callback = scheduled;
+      delay = delayMs;
+      return { unref: () => { unrefCount += 1; } };
     },
+    spawnDetached: (command, args) => launches.push({ command, args }),
   });
   assert.ok(actuator);
   assert.deepEqual(actuator.schedule(), {
@@ -144,6 +150,12 @@ test("bound restart actuator rechecks pid before one exact kickstart", () => {
     serviceLabel: "com.example.devspace",
     launchdTarget: "gui/501/com.example.devspace",
   });
+  assert.equal(delay, 321);
+  assert.equal(unrefCount, 0, "owner-local timer must keep the CLI alive through deferred launch");
+  assert.equal(inspections, 1, "second PID check must happen after the durable transaction returns");
+  assert.deepEqual(launches, []);
+
+  callback?.();
   assert.equal(inspections, 2);
   assert.deepEqual(launches, [{
     command: "/bin/launchctl",
@@ -151,9 +163,11 @@ test("bound restart actuator rechecks pid before one exact kickstart", () => {
   }]);
 });
 
-test("bound restart actuator fails closed when launchd pid changes after binding", () => {
+test("bound restart actuator records an asynchronous PID-race error and does not kickstart", () => {
   let inspections = 0;
+  let callback: (() => void) | undefined;
   let launches = 0;
+  const errors: Error[] = [];
   const actuator = createBoundLaunchdRestartActuator({
     platform: "darwin",
     uid: 501,
@@ -164,12 +178,21 @@ test("bound restart actuator fails closed when launchd pid changes after binding
       inspections += 1;
       return { status: 0, stdout: inspections === 1 ? "pid = 4321\n" : "pid = 9999\n" };
     },
-    kickstart: () => {
-      launches += 1;
-      return { status: 0 };
+    schedule: (scheduled) => {
+      callback = scheduled;
+      return {};
     },
+    spawnDetached: () => {
+      launches += 1;
+    },
+    onError: (error) => errors.push(error),
   });
   assert.ok(actuator);
-  assert.throws(() => actuator.schedule(), /PID changed/i);
+  const receipt = actuator.schedule();
+  assert.equal(receipt.scheduled, true);
   assert.equal(launches, 0);
+  callback?.();
+  assert.equal(launches, 0);
+  assert.equal(errors.length, 1);
+  assert.match(errors[0]!.message, /PID changed/i);
 });
