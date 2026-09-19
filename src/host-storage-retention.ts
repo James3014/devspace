@@ -16,6 +16,20 @@ export const HOST_STORAGE_BROWSER_MARKER_SCHEMA = "devspace.storage_artifact.v1"
 export const DEFAULT_RELEASE_KEEP_COUNT = 3;
 export const DEFAULT_WORKTREE_GRACE_MS = 24 * 60 * 60 * 1000;
 
+export function resolveHostStorageRoot(runtimePackageRoot: string): string {
+  const root = resolve(runtimePackageRoot);
+  if (basename(root) !== "devspace") return root;
+
+  const parent = dirname(root);
+  if (basename(parent) === "node_modules") return dirname(parent);
+
+  const grandparent = dirname(parent);
+  if (basename(grandparent) === "node_modules") return dirname(grandparent);
+
+  return root;
+}
+
+
 export type StorageArtifactKind =
   | "managed_worktree"
   | "workspace_record"
