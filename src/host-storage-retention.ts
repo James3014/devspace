@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { execFile } from "node:child_process";
-import { lstat, opendir, readFile, realpath, rm, stat } from "node:fs/promises";
+import { lstat, mkdir, opendir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import type { LocalAgentRecord } from "./local-agent-store.js";
@@ -102,6 +102,9 @@ export async function applyHostStoragePlan(
   expectedPlanId: string,
   callbacks: { deleteWorkspaceSession: (workspaceId: string) => void },
 ): Promise<HostStorageApplyResult> {
+  const replay = await readApplyReceipt(input.stateDir, expectedPlanId);
+  if (replay) return replay;
+
   const fresh = await buildHostStoragePlan(input);
   if (fresh.planId !== expectedPlanId) {
     throw new Error(
@@ -141,13 +144,47 @@ export async function applyHostStoragePlan(
     }
   }
 
-  return {
+  const result: HostStorageApplyResult = {
     schema: HOST_STORAGE_RETENTION_SCHEMA,
     planId: fresh.planId,
     reclaimedBytes: removed.reduce((total, entry) => total + entry.bytes, 0),
     removed,
     skipped,
   };
+  await writeApplyReceipt(input.stateDir, result);
+  return result;
+}
+
+async function readApplyReceipt(
+  stateDir: string,
+  planId: string,
+): Promise<HostStorageApplyResult | undefined> {
+  const receipt = await readJson(applyReceiptPath(stateDir, planId));
+  if (
+    receipt?.schema !== HOST_STORAGE_RETENTION_SCHEMA ||
+    receipt.planId !== planId ||
+    !Array.isArray(receipt.removed) ||
+    !Array.isArray(receipt.skipped) ||
+    typeof receipt.reclaimedBytes !== "number"
+  ) {
+    return undefined;
+  }
+  return receipt as unknown as HostStorageApplyResult;
+}
+
+async function writeApplyReceipt(stateDir: string, result: HostStorageApplyResult): Promise<void> {
+  const path = applyReceiptPath(stateDir, result.planId);
+  const dir = join(resolve(stateDir), "host-storage-retention", "receipts");
+  await mkdir(dir, { recursive: true });
+  const temp = path + ".tmp";
+  await writeFile(temp, JSON.stringify(result, null, 2) + "\n", { encoding: "utf8", mode: 0o600 });
+  await rename(temp, path);
+}
+
+function applyReceiptPath(stateDir: string, planId: string): string {
+  const digest = planId.replace(/^sha256:/u, "");
+  if (!/^[0-9a-f]{64}$/u.test(digest)) throw new Error("Invalid storage plan id.");
+  return join(resolve(stateDir), "host-storage-retention", "receipts", digest + ".json");
 }
 
 async function inspectWorkspaces(input: HostStorageRetentionInput): Promise<HostStorageArtifact[]> {
