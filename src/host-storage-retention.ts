@@ -78,6 +78,7 @@ export interface HostStorageRetentionInput {
   durableOperations: DurableOperationRecord[];
   allowedRoots: string[];
   browserProfileStates: Map<string, "ACTIVE" | "TERMINAL" | "UNKNOWN">;
+  browserReferenceStateAvailable: boolean;
   activeSourceCommit?: string;
   nowMs?: number;
   releaseKeepCount?: number;
@@ -997,6 +998,15 @@ async function inspectBrowserRuntimes(input: HostStorageRetentionInput): Promise
         ...base,
         lifecycle: "UNKNOWN",
         reason: "browser runtime has no positive terminal/unreferenced lifecycle evidence",
+      });
+      continue;
+    }
+
+    if (!input.browserReferenceStateAvailable) {
+      artifacts.push({
+        ...base,
+        lifecycle: "UNKNOWN",
+        reason: "durable browser-reference state is unavailable; terminal evidence cannot authorize deletion",
       });
       continue;
     }
