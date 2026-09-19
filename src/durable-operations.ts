@@ -59,9 +59,10 @@ const HEX64 = /^[0-9a-f]{64}$/;
 const NEXUS_DEPLOYMENT_ID = /^r1-[0-9a-f]{40}$/;
 export const NEXUS_GATEWAY_RECOVERY_SCHEMA = "nexus.gateway.durable_recovery_request.v2" as const;
 export const NEXUS_GATEWAY_INTERPRETER = "/Users/jameschen/Workspace/Nexus-new/.venv/bin/python";
-// Nexus-new #526 successor-manager / r10 recovery lineage. The exact accepted
-// bytes are unchanged from accepted source 6d1e3221 through current 40ad671e.
-export const NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256 = "6873dde17e08d4020620c2408e414327b176be723f5f23f01bee754b2627502c";
+// Nexus-new #526 current accepted recovery manager. PR #979 final head d623d5d0
+// bounded the persistent bare-repository fsck timeout without changing recovery authority semantics.
+
+export const NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256 = "3f0c34204bef175fcfad7150c5919d96f6b3735813cea5258bdcd51e37d4baeb";
 export const NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256 = "3cd032639f69349bd44e61dec41551957e9034157febfff83e7fb3c89b5ef798";
 export const NEXUS_GATEWAY_STATE_ROOT = join(homedir(), "Library", "Application Support", "Nexus", "gateway-direct");
 
