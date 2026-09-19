@@ -83,6 +83,7 @@ import {
   probeTargetPackage,
 } from "./cutover-build-ready.js";
 import type { ExpectedCutoverIdentity } from "./cutover-state.js";
+import { performLocalBoundCutoverRestart } from "./cutover-local-restart.js";
 
 type Command = "serve" | "init" | "doctor" | "config" | "agents" | "models" | "cutover" | "carrier" | "help" | "version";
 const require = createRequire(import.meta.url);
@@ -851,11 +852,15 @@ async function runCutoverCommand(args: string[]): Promise<void> {
     await runCutoverCapabilityMismatchRecovery(args.slice(1));
     return;
   }
+  if (subcommand === "restart-bound") {
+    await runCutoverRestartBound(args.slice(1));
+    return;
+  }
   if (subcommand === "help" || subcommand === "--help" || subcommand === "-h" || subcommand === undefined) {
     printCutoverHelp();
     return;
   }
-  throw new Error("Usage: devspace cutover <status|recover|observe|repair|abort-expired-prepared>");
+  throw new Error("Usage: devspace cutover <status|recover|observe|repair|abort-expired-prepared|restart-bound>");
 }
 
 function printCutoverHelp(): void {
@@ -870,6 +875,7 @@ function printCutoverHelp(): void {
       "  devspace cutover repair --cutover-id <id> --workspace-id <id> --agent-id <id> [--server-url <url>] [--package-root <path>] [--state-dir <path>] [--json]",
       "  devspace cutover abort-expired-prepared --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--json]",
       "  devspace cutover recover-capability-mismatch --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--json]",
+      "  devspace cutover restart-bound --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --package-root <path> --confirm <id> [--json]",
       "",
       "The repair subcommand repairs a successor cutover blocked by CROSS_DOMAIN_DIGEST_MISBINDING",
       "where the target build-manifest digest was mistakenly bound as the capability manifest digest.",
@@ -878,6 +884,59 @@ function printCutoverHelp(): void {
       "the cutover without replaying the restart.",
     ].join("\n"),
   );
+}
+
+async function runCutoverRestartBound(args: string[]): Promise<void> {
+  let cutoverId: string | undefined;
+  let carrierId: string | undefined;
+  let version: number | undefined;
+  let validityVersion: number | undefined;
+  let packageRoot: string | undefined;
+  let confirmCutoverId: string | undefined;
+  let json = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    const value = (): string => {
+      const next = args[++index];
+      if (!next) throw new Error(`${argument} requires a value.`);
+      return next;
+    };
+    if (argument === "--json") json = true;
+    else if (argument === "--cutover-id") cutoverId = value();
+    else if (argument === "--carrier") carrierId = value();
+    else if (argument === "--version") version = Number(value());
+    else if (argument === "--validity-version") validityVersion = Number(value());
+    else if (argument === "--package-root") packageRoot = resolve(value());
+    else if (argument === "--confirm") confirmCutoverId = value();
+    else throw new Error(`Unknown cutover restart-bound flag: ${argument}`);
+  }
+  if (!cutoverId || !carrierId || !packageRoot || confirmCutoverId !== cutoverId ||
+      !Number.isSafeInteger(version) || (version ?? 0) < 1 ||
+      !Number.isSafeInteger(validityVersion) || (validityVersion ?? 0) < 1) {
+    throw new Error("Usage: devspace cutover restart-bound --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --package-root <path> --confirm <id> [--json]");
+  }
+  const result = await performLocalBoundCutoverRestart({
+    config: loadConfig(),
+    cutoverId,
+    carrierId,
+    expectedCarrierVersion: version!,
+    expectedValidityVersion: validityVersion!,
+    confirmCutoverId,
+    packageRoot,
+  });
+  const payload = {
+    cutoverId: result.record.cutoverId,
+    phase: result.record.phase,
+    scheduled: result.scheduled,
+    outcome: result.outcome,
+    liveIdentity: result.liveIdentity,
+    packageRoot: result.packageRoot,
+  };
+  if (json) {
+    printJson(payload);
+    return;
+  }
+  console.log(`Bound cutover restart ${payload.cutoverId}: phase=${payload.phase}; scheduled=${String(payload.scheduled)}; outcome=${payload.outcome}.`);
 }
 
 async function runCutoverObserve(args: string[]): Promise<void> {
