@@ -796,6 +796,7 @@ async function inspectReleases(input: HostStorageRetentionInput): Promise<HostSt
 
   for (const name of dirs) {
     const rawPath = join(releaseRoot, name);
+    const rawStats = await lstat(rawPath).catch(() => undefined);
     const path = await canonicalPath(rawPath);
     if (!/^release-[A-Za-z0-9._-]+$/u.test(name)) {
       foreign.push({
@@ -824,8 +825,7 @@ async function inspectReleases(input: HostStorageRetentionInput): Promise<HostSt
       continue;
     }
 
-    const stats = await lstat(path).catch(() => undefined);
-    if (!stats || stats.isSymbolicLink() || !stats.isDirectory()) {
+    if (!rawStats || rawStats.isSymbolicLink() || !rawStats.isDirectory()) {
       foreign.push({
         id: `release:${name}`,
         kind: "release",
@@ -930,59 +930,126 @@ async function inspectReleases(input: HostStorageRetentionInput): Promise<HostSt
 
 async function inspectBrowserRuntimes(input: HostStorageRetentionInput): Promise<HostStorageArtifact[]> {
   const root = join(resolve(input.stateDir), "browser-runtimes");
+  const canonicalRoot = await canonicalPath(root);
   const dirs = await directoryChildren(root);
   const artifacts: HostStorageArtifact[] = [];
   for (const name of dirs) {
-    const path = join(root, name);
-    const sizeBytes = await directorySize(path);
-    const marker = (await readJson(join(path, ".devspace-storage.json"))) as Partial<BrowserMarker> | undefined;
-    if (
-      marker?.schema !== HOST_STORAGE_BROWSER_MARKER_SCHEMA ||
-      marker.owner !== "devspace" ||
-      marker.kind !== "browser_runtime"
-    ) {
-      artifacts.push({
-        id: `browser-runtime:${name}`,
-        kind: "browser_runtime",
-        path,
-        lifecycle: "UNKNOWN",
-        reason: "browser runtime has no trusted DevSpace ownership/lifecycle marker",
-        sizeBytes,
-      });
-      continue;
-    }
-    if (marker.lifecycle === "active") {
-      artifacts.push({
-        id: `browser-runtime:${name}`,
-        kind: "browser_runtime",
-        path,
-        lifecycle: "ACTIVE",
-        reason: "DevSpace marker reports active browser runtime",
-        sizeBytes,
-      });
-      continue;
-    }
-    if (marker.lifecycle === "terminal") {
-      artifacts.push({
-        id: `browser-runtime:${name}`,
-        kind: "browser_runtime",
-        path,
-        lifecycle: "GC_ELIGIBLE",
-        reason: "DevSpace-owned browser runtime has an explicit terminal marker",
-        sizeBytes,
-      });
-      continue;
-    }
-    artifacts.push({
+    const rawPath = join(root, name);
+    const rawStats = await lstat(rawPath).catch(() => undefined);
+    const path = await canonicalPath(rawPath);
+    const sizeBytes = await directorySize(rawPath);
+    const base = {
       id: `browser-runtime:${name}`,
-      kind: "browser_runtime",
+      kind: "browser_runtime" as const,
       path,
-      lifecycle: "UNKNOWN",
-      reason: "browser runtime marker lifecycle is not recognized",
+      ownershipRoot: canonicalRoot,
       sizeBytes,
+      modifiedAt: rawStats?.mtime.toISOString(),
+      ownershipEvidence: "artifact resides under the DevSpace browser-runtimes state root",
+    };
+
+    if (!rawStats || rawStats.isSymbolicLink() || !rawStats.isDirectory()) {
+      artifacts.push({
+        ...base,
+        lifecycle: "FOREIGN",
+        reason: "browser runtime entry is not a real owned directory",
+      });
+      continue;
+    }
+    if (!isPathInsideRoot(path, canonicalRoot) || path === canonicalRoot) {
+      artifacts.push({
+        ...base,
+        lifecycle: "FOREIGN",
+        reason: "browser runtime resolves outside the DevSpace browser-runtimes root",
+      });
+      continue;
+    }
+
+    const profileState = input.browserProfileStates.get(browserProfileId(path));
+    const marker = (await readJson(join(path, ".devspace-storage.json"))) as Partial<BrowserMarker> | undefined;
+    const markerOwned =
+      marker?.schema === HOST_STORAGE_BROWSER_MARKER_SCHEMA &&
+      marker.owner === "devspace" &&
+      marker.kind === "browser_runtime";
+
+    if (profileState === "ACTIVE" || (markerOwned && marker.lifecycle === "active")) {
+      artifacts.push({
+        ...base,
+        lifecycle: "ACTIVE",
+        reason: profileState === "ACTIVE"
+          ? "durable Chat Swarm carrier state still references this browser profile"
+          : "DevSpace ownership marker reports active browser runtime",
+      });
+      continue;
+    }
+    if (profileState === "UNKNOWN") {
+      artifacts.push({
+        ...base,
+        lifecycle: "UNKNOWN",
+        reason: "durable Chat Swarm carrier state requires reconciliation for this browser profile",
+      });
+      continue;
+    }
+
+    const terminalEvidence = profileState === "TERMINAL" || (markerOwned && marker.lifecycle === "terminal");
+    if (!terminalEvidence) {
+      artifacts.push({
+        ...base,
+        lifecycle: "UNKNOWN",
+        reason: "browser runtime has no positive terminal/unreferenced lifecycle evidence",
+      });
+      continue;
+    }
+
+    const processState = await browserProfileProcessState(path);
+    if (processState === "active") {
+      artifacts.push({
+        ...base,
+        lifecycle: "ACTIVE",
+        reason: "a live host process still references this browser profile",
+      });
+      continue;
+    }
+    if (processState === "unknown") {
+      artifacts.push({
+        ...base,
+        lifecycle: "UNKNOWN",
+        reason: "host process evidence is unavailable; browser profile deletion fails closed",
+      });
+      continue;
+    }
+
+    artifacts.push({
+      ...base,
+      lifecycle: "GC_ELIGIBLE",
+      reason: "DevSpace-owned browser profile is durably terminal/unreferenced and no live host process references it",
     });
   }
   return artifacts;
+}
+
+function browserProfileId(path: string): string {
+  return createHash("sha256").update(resolve(path)).digest("hex");
+}
+
+async function browserProfileProcessState(path: string): Promise<"active" | "terminal" | "unknown"> {
+  try {
+    const result = await execFileAsync("ps", ["-axo", "command="], {
+      encoding: "utf8",
+      timeout: 10_000,
+      maxBuffer: 8 * 1024 * 1024,
+    });
+    const needles = [
+      `--user-data-dir=${path}`,
+      `--user-data-dir="${path}"`,
+      `--user-data-dir='${path}'`,
+    ];
+    return String(result.stdout).split("\n").some((line) => needles.some((needle) => line.includes(needle)))
+      ? "active"
+      : "terminal";
+  } catch {
+    return "unknown";
+  }
 }
 
 async function inspectGitWorktree(
@@ -1097,7 +1164,9 @@ async function directoryChildren(root: string): Promise<string[]> {
   try {
     const dir = await opendir(root);
     const names: string[] = [];
-    for await (const entry of dir) if (entry.isDirectory()) names.push(entry.name);
+    for await (const entry of dir) {
+      if (entry.isDirectory() || entry.isSymbolicLink()) names.push(entry.name);
+    }
     return names.sort();
   } catch {
     return [];
