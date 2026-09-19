@@ -19,6 +19,7 @@ import {
   applyHostStoragePlan,
   buildHostStoragePlan,
   HOST_STORAGE_BROWSER_MARKER_SCHEMA,
+  resolveHostStorageRoot,
   type HostStorageRetentionInput,
 } from "./host-storage-retention.js";
 import type { LocalAgentRecord } from "./local-agent-store.js";
@@ -27,6 +28,21 @@ import type { WorkspaceConversationBinding, WorkspaceSession } from "./workspace
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", ["-C", cwd, ...args], { encoding: "utf8" }).trim();
 }
+
+test("installed package root resolves to the DevSpace host install root", () => {
+  assert.equal(
+    resolveHostStorageRoot("/opt/devspace-chatgpt/node_modules/@waishnav/devspace"),
+    resolve("/opt/devspace-chatgpt"),
+  );
+  assert.equal(
+    resolveHostStorageRoot("/opt/devspace-chatgpt/node_modules/devspace"),
+    resolve("/opt/devspace-chatgpt"),
+  );
+  assert.equal(
+    resolveHostStorageRoot("/workspace/devspace"),
+    resolve("/workspace/devspace"),
+  );
+});
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "devspace-retention-"));
