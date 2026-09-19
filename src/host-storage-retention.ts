@@ -595,6 +595,19 @@ async function inspectManagedClones(input: HostStorageRetentionInput): Promise<H
       continue;
     }
 
+    const unresolvedCloneOperation = await unresolvedDurableOperationForPath(
+      canonicalDestination,
+      input.durableOperations,
+    );
+    if (unresolvedCloneOperation) {
+      artifacts.push({
+        ...base,
+        lifecycle: "UNKNOWN",
+        reason: `managed clone has unresolved durable operation ${unresolvedCloneOperation.operationId} (${unresolvedCloneOperation.status})`,
+      });
+      continue;
+    }
+
     const expectedHead = typeof operation.receipt?.head === "string" ? operation.receipt.head : undefined;
     if (!expectedHead) {
       artifacts.push({ ...base, lifecycle: "UNKNOWN", reason: "successful workspace_clone lacks a receipt-bound HEAD identity" });
@@ -669,6 +682,18 @@ function workspaceReferenceState(
   if (processState === "UNKNOWN") {
     return { lifecycle: "UNKNOWN", reason: "workspace process-tree termination state is unknown" };
   }
+  const unresolvedOperation = input.durableOperations.find(
+    (operation) =>
+      operation.workspaceId === workspaceId &&
+      (operation.status === "started" || operation.status === "outcome_unknown"),
+  );
+  if (unresolvedOperation) {
+    return {
+      lifecycle: "UNKNOWN",
+      reason: `workspace has unresolved durable operation ${unresolvedOperation.operationId} (${unresolvedOperation.status})`,
+    };
+  }
+
   const bindingCount = input.conversationBindings.filter(
     (binding) => binding.workspaceSessionId === workspaceId,
   ).length;
@@ -725,6 +750,17 @@ async function cloneHasWorkspaceReference(
     ) return true;
   }
   return false;
+}
+
+async function unresolvedDurableOperationForPath(
+  path: string,
+  operations: DurableOperationRecord[],
+): Promise<DurableOperationRecord | undefined> {
+  for (const operation of operations) {
+    if (operation.status !== "started" && operation.status !== "outcome_unknown") continue;
+    if (await samePhysicalPath(operation.scopeRoot, path)) return operation;
+  }
+  return undefined;
 }
 
 async function inspectManagedClone(
