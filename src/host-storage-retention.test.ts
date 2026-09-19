@@ -101,11 +101,10 @@ test("clean unreferenced old managed worktree becomes GC eligible and apply is i
   assert.equal(deleted, 1);
   assert.equal(git(f.source, "worktree", "list", "--porcelain").includes(path), false);
 
-  const after = await buildHostStoragePlan({ ...args, workspaceSessions: [] });
-  const replay = await applyHostStoragePlan({ ...args, workspaceSessions: [] }, after.planId, {
+  const replay = await applyHostStoragePlan({ ...args, workspaceSessions: [] }, plan.planId, {
     deleteWorkspaceSession: () => { deleted += 1; },
   });
-  assert.equal(replay.removed.length, 0);
+  assert.deepEqual(replay, result);
   assert.equal(deleted, 1);
 });
 
