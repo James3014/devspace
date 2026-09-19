@@ -23,6 +23,7 @@ import {
 } from "./workspace-reconciliation.js";
 import type { WorkspacePhysicalState } from "./workspace-reconciliation.js";
 import {
+  NEXUS_TOOL_AUTHORITY_SCHEMA,
   TOOL_INTENT_NAMESPACE,
   TOOL_PROJECTION_MANIFEST_SCHEMA,
   hashDispatchIntent,
@@ -30,6 +31,7 @@ import {
   type DispatchIntent,
   type NexusExecutionGrant,
   type NexusExecutionGrantRef,
+  type ToolIntentId,
 } from "./execution-protocol.js";
 import {
   buildLocalEffectEnforcementReceipt,
@@ -4618,4 +4620,139 @@ test("Wave 3 enforcement receipt readback rejects tampered native surface or too
     undefined,
     "provider-native or unknown tool ids cannot be smuggled into durable enforcement evidence",
   );
+});
+
+
+test("Wave B NEXUS_GOVERNED tool projection is grant-bound before durable record or provider launch", async () => {
+  const f = setupGitFixture();
+  let launches = 0;
+  const ceiling: ToolIntentId[] = [
+    "workspace.read",
+    "workspace.search_text",
+    "workspace.search_paths",
+    "workspace.list",
+  ];
+  const manifestFor = (intent: DispatchIntent, authorized: ToolIntentId[] = [...ceiling]) => ({
+    schema: TOOL_PROJECTION_MANIFEST_SCHEMA,
+    namespace: TOOL_INTENT_NAMESPACE,
+    identity: { taskId: intent.taskId, attemptId: intent.attemptId },
+    authority: { mode: "NEXUS_GOVERNED" as const, issuer: "nexus" as const },
+    authorizedToolCeiling: authorized,
+    candidateTools: authorized,
+    selectedTools: ["workspace.read" as const],
+    orderingMode: "ORDER_INDEPENDENT" as const,
+  });
+  const authority = {
+    schema: NEXUS_TOOL_AUTHORITY_SCHEMA,
+    namespace: TOOL_INTENT_NAMESPACE,
+    plannerDecisionHash: "1".repeat(64),
+    plannerPlanHash: "2".repeat(64),
+    policyHash: "3".repeat(64),
+    authorizedToolCeiling: [...ceiling],
+  };
+
+
+  const missingIntent = controllerDispatchIntent("attempt-waveb-missing-authority", []);
+  const missingGrant = governedGrant(missingIntent, f.head);
+  const missing = setupManager({}, undefined, async () => { launches += 1; }, async () => missingGrant);
+  try {
+    await assert.rejects(
+      missing.manager.startAgent({
+        workspaceId: "ws_waveb_missing",
+        workspaceRoot: f.repo,
+        profileName: "reviewer",
+        prompt: "read one file",
+        profiles: mockProfiles,
+        attemptKey: missingIntent.attemptId,
+        executionContract: {
+          authorityMode: "NEXUS_GOVERNED",
+          nexusGrant: governedRef(),
+          dispatchIntent: missingIntent,
+          expectedHead: f.head,
+          authorizedToolCeiling: [...ceiling],
+          toolProjectionManifest: manifestFor(missingIntent),
+        },
+      }),
+      (error: any) => error instanceof AgentSessionError
+        && error.code === "NEXUS_AUTHORITY_REJECTED"
+        && /requires tracked Nexus grant toolAuthority/.test(error.message),
+    );
+    assert.equal(launches, 0);
+    assert.equal(missing.manager.listAgents({ workspaceId: "ws_waveb_missing" }).length, 0);
+  } finally {
+    missing.clean();
+  }
+
+
+  const validIntent = controllerDispatchIntent("attempt-waveb-valid-authority", []);
+  const validGrant = governedGrant(validIntent, f.head, { toolAuthority: authority });
+  const valid = setupManager({}, undefined, async () => { launches += 1; }, async () => validGrant);
+  try {
+    const started = await valid.manager.startAgent({
+      workspaceId: "ws_waveb_valid",
+      workspaceRoot: f.repo,
+      profileName: "reviewer",
+      prompt: "read one file",
+      profiles: mockProfiles,
+      attemptKey: validIntent.attemptId,
+      executionContract: {
+        authorityMode: "NEXUS_GOVERNED",
+        nexusGrant: governedRef(),
+        dispatchIntent: validIntent,
+        expectedHead: f.head,
+        authorizedToolCeiling: [...ceiling],
+        toolProjectionManifest: manifestFor(validIntent),
+      },
+    });
+    assert.equal(launches, 1);
+    const reopened = new LocalAgentStore(valid.stateDir);
+    try {
+      const persisted = reopened.getById(started.agentId)!;
+      assert.deepEqual(persisted.executionContract?.toolProjectionManifest?.selectedTools, ["workspace.read"]);
+      assert.deepEqual(persisted.executionContract?.authorizedToolCeiling, [
+        "workspace.list",
+        "workspace.read",
+        "workspace.search_paths",
+        "workspace.search_text",
+      ]);
+    } finally {
+      reopened.close();
+    }
+  } finally {
+    valid.clean();
+  }
+
+
+  const widenIntent = controllerDispatchIntent("attempt-waveb-widen", []);
+  const widenGrant = governedGrant(widenIntent, f.head, { toolAuthority: authority });
+  const widen = setupManager({}, undefined, async () => { launches += 1; }, async () => widenGrant);
+  try {
+    const widened = [...ceiling, "workspace.mutate" as const];
+    await assert.rejects(
+      widen.manager.startAgent({
+        workspaceId: "ws_waveb_widen",
+        workspaceRoot: f.repo,
+        profileName: "reviewer",
+        prompt: "must not launch",
+        profiles: mockProfiles,
+        attemptKey: widenIntent.attemptId,
+        executionContract: {
+          authorityMode: "NEXUS_GOVERNED",
+          nexusGrant: governedRef(),
+          dispatchIntent: widenIntent,
+          expectedHead: f.head,
+          authorizedToolCeiling: widened,
+          toolProjectionManifest: manifestFor(widenIntent, widened),
+        },
+      }),
+      (error: any) => error instanceof AgentSessionError
+        && error.code === "NEXUS_AUTHORITY_REJECTED"
+        && /does not match tracked Nexus grant toolAuthority/.test(error.message),
+    );
+    assert.equal(launches, 1);
+    assert.equal(widen.manager.listAgents({ workspaceId: "ws_waveb_widen" }).length, 0);
+  } finally {
+    widen.clean();
+    f.clean();
+  }
 });

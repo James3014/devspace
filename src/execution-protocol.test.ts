@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import test from "node:test";
 import {
   EXECUTION_PROTOCOL_VERSION,
+  NEXUS_TOOL_AUTHORITY_SCHEMA,
   TOOL_INTENT_NAMESPACE,
   TOOL_PROJECTION_MANIFEST_SCHEMA,
   ExecutionProtocolError,
@@ -17,6 +18,7 @@ import {
   hashNexusExecutionGrant,
   hashToolProjectionManifest,
   parseDispatchIntent,
+  parseNexusExecutionGrant,
   parseNexusExecutionGrantRef,
   parseToolProjectionManifest,
   renderDispatchIntentForWorker,
@@ -344,5 +346,134 @@ test("ExecutionBinding tool manifest reference is content, identity, and authori
     }, manifest),
     (error: unknown) => error instanceof ExecutionProtocolError
       && error.code === "TOOL_MANIFEST_REF_MISMATCH",
+  );
+});
+
+
+test("Wave B governed tool authority is grant-hash bound and projection validation fails closed", () => {
+  const intent: DispatchIntent = {
+    ...controllerIntent(),
+    taskId: "issue-982-wave-b",
+    attemptId: "wave-b-attempt-1",
+    writeScope: [],
+    exclusiveOwnership: false,
+    claimCeiling: "RESULT_RETURNED",
+  };
+  const historicalGrant = nexusGrant(intent);
+  const baseInput = {
+    dispatchIntent: intent,
+    expectedHead: historicalGrant.devspaceBaseRevision,
+    profile: historicalGrant.profile,
+    writePaths: [],
+    now: new Date("2026-09-02T06:00:00.000Z"),
+  };
+  assert.doesNotThrow(() => assertNexusGrantAuthorizesExecution({ ...baseInput, grant: historicalGrant }));
+
+  const toolAuthority = {
+    schema: NEXUS_TOOL_AUTHORITY_SCHEMA,
+    namespace: TOOL_INTENT_NAMESPACE,
+    plannerDecisionHash: "1".repeat(64),
+    plannerPlanHash: "2".repeat(64),
+    policyHash: "3".repeat(64),
+    authorizedToolCeiling: [
+      "workspace.read",
+      "workspace.search_text",
+      "workspace.search_paths",
+      "workspace.list",
+    ],
+  } as const;
+  const grantWithAuthority = {
+    ...historicalGrant,
+    toolAuthority: {
+      ...toolAuthority,
+      authorizedToolCeiling: [...toolAuthority.authorizedToolCeiling],
+    },
+  };
+  grantWithAuthority.grantHash = hashNexusExecutionGrant(grantWithAuthority);
+
+  const manifest = {
+    schema: TOOL_PROJECTION_MANIFEST_SCHEMA,
+    namespace: TOOL_INTENT_NAMESPACE,
+    identity: { taskId: intent.taskId, attemptId: intent.attemptId },
+    authority: { mode: "NEXUS_GOVERNED" as const, issuer: "nexus" as const },
+    authorizedToolCeiling: [...toolAuthority.authorizedToolCeiling],
+    candidateTools: [...toolAuthority.authorizedToolCeiling],
+    selectedTools: ["workspace.read" as const],
+    orderingMode: "ORDER_INDEPENDENT" as const,
+  };
+
+
+  assert.doesNotThrow(() => assertNexusGrantAuthorizesExecution({
+    ...baseInput,
+    grant: grantWithAuthority,
+    authorizedToolCeiling: [...toolAuthority.authorizedToolCeiling],
+    toolProjectionManifest: manifest,
+  }));
+
+  assert.throws(
+    () => assertNexusGrantAuthorizesExecution({
+      ...baseInput,
+      grant: historicalGrant,
+      authorizedToolCeiling: [...toolAuthority.authorizedToolCeiling],
+      toolProjectionManifest: manifest,
+    }),
+    (error: unknown) => error instanceof ExecutionProtocolError
+      && error.code === "AUTHORITY_EVIDENCE_MISMATCH"
+      && /requires tracked Nexus grant toolAuthority/.test(error.message),
+  );
+
+  const widenedCeiling = [...toolAuthority.authorizedToolCeiling, "workspace.mutate" as const];
+  assert.throws(
+    () => assertNexusGrantAuthorizesExecution({
+      ...baseInput,
+      grant: grantWithAuthority,
+      authorizedToolCeiling: widenedCeiling,
+      toolProjectionManifest: { ...manifest, authorizedToolCeiling: widenedCeiling },
+    }),
+    (error: unknown) => error instanceof ExecutionProtocolError
+      && error.code === "AUTHORITY_EVIDENCE_MISMATCH"
+      && /does not match tracked Nexus grant toolAuthority/.test(error.message),
+  );
+
+
+  const tampered = {
+    ...grantWithAuthority,
+    toolAuthority: {
+      ...grantWithAuthority.toolAuthority,
+      authorizedToolCeiling: ["workspace.read" as const],
+    },
+  };
+  assert.throws(
+    () => assertNexusGrantAuthorizesExecution({ ...baseInput, grant: tampered }),
+    (error: unknown) => error instanceof ExecutionProtocolError
+      && error.code === "INVALID_NEXUS_EXECUTION_GRANT"
+      && /grant hash mismatch/.test(error.message),
+  );
+
+  const badHashAuthority = {
+    ...grantWithAuthority,
+    toolAuthority: {
+      ...grantWithAuthority.toolAuthority,
+      plannerDecisionHash: "bad",
+    },
+  };
+  badHashAuthority.grantHash = hashNexusExecutionGrant(badHashAuthority as any);
+  assert.throws(
+    () => assertNexusGrantAuthorizesExecution({ ...baseInput, grant: badHashAuthority as any }),
+    (error: unknown) => error instanceof ExecutionProtocolError
+      && error.code === "INVALID_NEXUS_EXECUTION_GRANT",
+  );
+
+  assert.throws(
+    () => parseNexusExecutionGrant({
+      ...historicalGrant,
+      toolAuthority: {
+        schema: NEXUS_TOOL_AUTHORITY_SCHEMA,
+        namespace: TOOL_INTENT_NAMESPACE,
+      },
+    }),
+    (error: unknown) => error instanceof ExecutionProtocolError
+      && error.code === "INVALID_NEXUS_EXECUTION_GRANT"
+      && /exact governed tool-authority fields/.test(error.message),
   );
 });

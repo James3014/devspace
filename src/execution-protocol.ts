@@ -29,6 +29,7 @@ export type DispatchRoleIntent =
 export type DispatchClaimCeiling = "RESULT_RETURNED" | "IMPLEMENTED" | "CANDIDATE_READY";
 
 export const NEXUS_EXECUTION_GRANT_SCHEMA = "nexus.devspace.execution_grant.v1" as const;
+export const NEXUS_TOOL_AUTHORITY_SCHEMA = "nexus.devspace.tool_authority.v1" as const;
 export const NEXUS_CANONICAL_REPOSITORY = "James3014/Nexus-new" as const;
 export const TOOL_INTENT_NAMESPACE = "devspace.tool_intent.v1" as const;
 export const TOOL_PROJECTION_MANIFEST_SCHEMA = "devspace.tool_projection_manifest.v1" as const;
@@ -62,6 +63,15 @@ export interface ToolProjectionManifest {
   selectedTools: ToolIntentId[];
   orderingMode: ToolProjectionOrderingMode;
   candidateOrder?: ToolIntentId[];
+}
+
+export interface NexusToolAuthority {
+  schema: typeof NEXUS_TOOL_AUTHORITY_SCHEMA;
+  namespace: typeof TOOL_INTENT_NAMESPACE;
+  plannerDecisionHash: string;
+  plannerPlanHash: string;
+  policyHash: string;
+  authorizedToolCeiling: ToolIntentId[];
 }
 
 /**
@@ -102,6 +112,7 @@ export interface NexusExecutionGrant {
   revocationState: "NOT_REVOKED" | "REVOKED";
   revokedAt: string | null;
   revocationReason: string | null;
+  toolAuthority?: NexusToolAuthority;
   grantHash: string;
 }
 
@@ -314,6 +325,37 @@ export function validateNexusExecutionGrantRef(ref: NexusExecutionGrantRef): voi
   validateNexusAuthorityPath(ref.authorityPath, "nexusGrant.authorityPath");
 }
 
+export function parseNexusToolAuthority(value: unknown): NexusToolAuthority {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", "toolAuthority must be an object.");
+  }
+  const record = value as Record<string, unknown>;
+  const keys = Object.keys(record).sort().join(",");
+  if (keys !== "authorizedToolCeiling,namespace,plannerDecisionHash,plannerPlanHash,policyHash,schema") {
+    throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", "toolAuthority must contain the exact governed tool-authority fields.");
+  }
+  if (record.schema !== NEXUS_TOOL_AUTHORITY_SCHEMA || record.namespace !== TOOL_INTENT_NAMESPACE) {
+    throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", "toolAuthority schema/namespace mismatch.");
+  }
+  requireHex(record.plannerDecisionHash as string, 64, "toolAuthority.plannerDecisionHash");
+  requireHex(record.plannerPlanHash as string, 64, "toolAuthority.plannerPlanHash");
+  requireHex(record.policyHash as string, 64, "toolAuthority.policyHash");
+  const normalized = normalizeToolIntentSet(
+    record.authorizedToolCeiling as string[],
+    "toolAuthority.authorizedToolCeiling",
+  );
+  const present = new Set(normalized);
+  const canonical = TOOL_INTENT_IDS.filter((tool) => present.has(tool));
+  return {
+    schema: NEXUS_TOOL_AUTHORITY_SCHEMA,
+    namespace: TOOL_INTENT_NAMESPACE,
+    plannerDecisionHash: record.plannerDecisionHash as string,
+    plannerPlanHash: record.plannerPlanHash as string,
+    policyHash: record.policyHash as string,
+    authorizedToolCeiling: canonical,
+  };
+}
+
 export function parseNexusExecutionGrant(value: unknown): NexusExecutionGrant {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", "Tracked Nexus execution grant must be an object.");
@@ -338,6 +380,7 @@ export function parseNexusExecutionGrant(value: unknown): NexusExecutionGrant {
     revocationState: record.revocationState as "NOT_REVOKED" | "REVOKED",
     revokedAt: record.revokedAt as string | null,
     revocationReason: record.revocationReason as string | null,
+    ...(record.toolAuthority === undefined ? {} : { toolAuthority: parseNexusToolAuthority(record.toolAuthority) }),
     grantHash: record.grantHash as string,
   };
   validateNexusExecutionGrant(grant);
@@ -388,6 +431,8 @@ export function assertNexusGrantAuthorizesExecution(input: {
   expectedHead: string;
   profile: string;
   writePaths: string[];
+  authorizedToolCeiling?: ToolIntentId[];
+  toolProjectionManifest?: ToolProjectionManifest;
   now?: Date;
 }): AuthorityValidationEvidence {
   const { grant, dispatchIntent, expectedHead, profile, writePaths } = input;
@@ -424,7 +469,67 @@ export function assertNexusGrantAuthorizesExecution(input: {
   if (claimCeilingRank(dispatchIntent.claimCeiling) > claimCeilingRank(grant.claimCeiling)) {
     throw new ExecutionProtocolError("AUTHORITY_EVIDENCE_MISMATCH", "Dispatch claim ceiling exceeds Nexus grant authority.");
   }
+  assertNexusGrantToolProjection({
+    grant,
+    dispatchIntent,
+    authorizedToolCeiling: input.authorizedToolCeiling,
+    toolProjectionManifest: input.toolProjectionManifest,
+  });
   return { kind: "NEXUS_VALIDATED", grantId: grant.grantId, grantHash: grant.grantHash };
+}
+
+export function assertNexusGrantToolProjection(input: {
+  grant: NexusExecutionGrant;
+  dispatchIntent: DispatchIntent;
+  authorizedToolCeiling?: ToolIntentId[];
+  toolProjectionManifest?: ToolProjectionManifest;
+}): void {
+  const participates = input.authorizedToolCeiling !== undefined || input.toolProjectionManifest !== undefined;
+  if (!participates) return;
+  if (!input.authorizedToolCeiling || !input.toolProjectionManifest) {
+    throw new ExecutionProtocolError(
+      "AUTHORITY_EVIDENCE_MISMATCH",
+      "Governed tool projection requires both authorizedToolCeiling and ToolProjectionManifest.",
+    );
+  }
+  if (!input.grant.toolAuthority) {
+    throw new ExecutionProtocolError(
+      "AUTHORITY_EVIDENCE_MISMATCH",
+      "Governed tool projection requires tracked Nexus grant toolAuthority.",
+    );
+  }
+
+  const grantAuthority = parseNexusToolAuthority(input.grant.toolAuthority);
+  const executionCeiling = normalizeToolIntentSet(input.authorizedToolCeiling, "execution authorizedToolCeiling");
+  const manifest = parseToolProjectionManifest(input.toolProjectionManifest);
+  const sameSet = (left: readonly string[], right: readonly string[]) =>
+    left.length === right.length && left.every((value) => right.includes(value));
+
+  if (!sameSet(executionCeiling, grantAuthority.authorizedToolCeiling)) {
+    throw new ExecutionProtocolError(
+      "AUTHORITY_EVIDENCE_MISMATCH",
+      "Execution authorizedToolCeiling does not match tracked Nexus grant toolAuthority.",
+    );
+  }
+  if (manifest.authority.mode !== "NEXUS_GOVERNED" || manifest.authority.issuer !== "nexus") {
+    throw new ExecutionProtocolError(
+      "AUTHORITY_EVIDENCE_MISMATCH",
+      "Governed ToolProjectionManifest must be issued by Nexus.",
+    );
+  }
+  if (manifest.identity.taskId !== input.dispatchIntent.taskId
+    || manifest.identity.attemptId !== input.dispatchIntent.attemptId) {
+    throw new ExecutionProtocolError(
+      "AUTHORITY_EVIDENCE_MISMATCH",
+      "ToolProjectionManifest task/attempt does not match governed dispatch intent.",
+    );
+  }
+  if (!sameSet(manifest.authorizedToolCeiling, executionCeiling)) {
+    throw new ExecutionProtocolError(
+      "AUTHORITY_EVIDENCE_MISMATCH",
+      "ToolProjectionManifest ceiling does not match execution authorizedToolCeiling.",
+    );
+  }
 }
 
 export function validateNexusExecutionGrant(grant: NexusExecutionGrant): void {
@@ -459,6 +564,15 @@ export function validateNexusExecutionGrant(grant: NexusExecutionGrant): void {
   }
   if (grant.revocationState === "REVOKED" && (!grant.revokedAt || !grant.revocationReason)) {
     throw new ExecutionProtocolError("INVALID_NEXUS_EXECUTION_GRANT", "Revoked Nexus execution grant requires revocation metadata.");
+  }
+  if (grant.toolAuthority) {
+    const normalized = parseNexusToolAuthority(grant.toolAuthority);
+    if (normalized.authorizedToolCeiling.join("\n") !== grant.toolAuthority.authorizedToolCeiling.join("\n")) {
+      throw new ExecutionProtocolError(
+        "INVALID_NEXUS_EXECUTION_GRANT",
+        "toolAuthority.authorizedToolCeiling must use canonical DevSpace tool-intent order.",
+      );
+    }
   }
   requireHex(grant.grantHash, 64, "grantHash");
   if (grant.grantHash !== hashNexusExecutionGrant(grant)) {
