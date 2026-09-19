@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { CarrierBindingStore, type CarrierContract, type CarrierCompletionBinding } from "./carrier-binding.js";
 import { openDatabase } from "./db/client.js";
 import { CutoverStateStore } from "./cutover-state.js";
+import { performLocalBoundCutoverRestart } from "./cutover-local-restart.js";
 
 function fixture(completionBindings: readonly CarrierCompletionBinding[] = []) {
   const root=realpathSync.native(mkdtempSync(join(tmpdir(),"carrier-test-"))).replaceAll("\\","/");
@@ -887,6 +888,141 @@ test("coordination_resume supports pendingId on same session once approved and g
     // 4. Same session can resume using pendingId directly without exposing credential
     const resumed = f.store.redeem(context, { pendingId: pairing.pendingId });
     assert.equal(resumed.id, approved.id);
+  } finally {
+    f.close();
+  }
+});
+
+
+test("owner-local drained restart reuses exact carrier authority without MCP session affinity", async () => {
+  const f=fixture();
+  try {
+    const context={clientId:"shared-oauth",sessionId:"cutover-restart-controller"};
+    const pairing=f.store.requestPairing(context);
+    const cutover={
+      stateRoot:f.root,
+      attemptKey:"bound-local-restart",
+      currentIdentity:{
+        serverInstanceId:"live-old",
+        sourceCommit:f.contract.baseRevision,
+        buildId:"old-build",
+        capabilityManifestSha256:"c".repeat(64),
+      },
+      expectedIdentity:{
+        sourceCommit:"b".repeat(40),
+        buildId:"new-build",
+        capabilityManifestSha256:"d".repeat(64),
+      },
+      expiresAt:new Date(f.clock()+30000).toISOString(),
+      restart:{
+        buildReady:{
+          verifiedBy:"independent",
+          verifiedAt:new Date(f.clock()).toISOString(),
+          evidence:"exact target package",
+        },
+        actuator:"launchd-self" as const,
+        serviceLabel:"test.service",
+        launchdTarget:"gui/501/test.service",
+      },
+      finish:{workspaceId:"ws_test",agentId:"agt_test"},
+    };
+    const contract:CarrierContract={
+      ...f.contract,
+      scope:[f.root],
+      operations:["cutover_start"],
+      expiresAt:new Date(f.clock()+60000).toISOString(),
+      cutover,
+    };
+    const approved=f.store.approveLocal(pairing.pendingId,contract);
+    f.store.redeem(context,pairing.credential);
+    const plan=planCutoverStart(f.root,cutover);
+    f.store.prepareEffect(context,plan.subject);
+    const config=loadConfig({
+      DEVSPACE_CONFIG_DIR:join(f.root,"config"),
+      DEVSPACE_ALLOWED_ROOTS:f.workspace,
+      DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees"),
+      DEVSPACE_STATE_DIR:f.root,
+      DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",
+      HOST:"127.0.0.1",
+      PORT:"7677",
+    });
+    const setup=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    const start=setup.startCutover(cutover,context);
+    const cutoverId=start.receipt!.cutoverId as string;
+    setup.drainCutover(cutoverId,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
+    setup.close();
+
+    f.store.forgetSession(context.sessionId);
+    assert.throws(()=>f.store.status(context),/paired carrier/i);
+
+    const drainedSnapshot=f.snapshot();
+    const health=()=>({
+      build:{source_commit:cutover.currentIdentity.sourceCommit,build_id:cutover.currentIdentity.buildId,pid:4321},
+      capabilityManifest:{manifestSha256:cutover.currentIdentity.capabilityManifestSha256},
+      mcp:{serverInstanceId:cutover.currentIdentity.serverInstanceId,cutoverMode:"drain",reconciliationRequired:true},
+    });
+    const actuatorCalls: Array<{livePid:number;serviceLabel:string;launchdTarget:string}>=[];
+    let scheduled=0;
+    const dependencies={
+      readHealth:async()=>health(),
+      probeTarget:async()=>({buildReady:true,detail:"exact package"}),
+      createActuator:(options:{livePid:number;serviceLabel:string;launchdTarget:string})=>{
+        actuatorCalls.push(options);
+        return {
+          actuator:"launchd-self" as const,
+          serviceLabel:options.serviceLabel,
+          launchdTarget:options.launchdTarget,
+          schedule:()=>{
+            scheduled+=1;
+            return {scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:options.serviceLabel,launchdTarget:options.launchdTarget};
+          },
+        };
+      },
+    };
+
+    await assert.rejects(
+      performLocalBoundCutoverRestart({
+        config,cutoverId,carrierId:approved.id,expectedCarrierVersion:2,expectedValidityVersion:1,
+        confirmCutoverId:cutoverId,packageRoot:f.root,
+      },dependencies),
+      /version changed/i,
+    );
+    assert.equal(f.snapshot(),drainedSnapshot);
+
+    await assert.rejects(
+      performLocalBoundCutoverRestart({
+        config,cutoverId,carrierId:approved.id,expectedCarrierVersion:1,expectedValidityVersion:1,
+        confirmCutoverId:cutoverId,packageRoot:f.root,
+      },{
+        ...dependencies,
+        readHealth:async()=>({
+          ...health(),
+          build:{...health().build,build_id:"wrong-build"},
+        }),
+      }),
+      /does not match the approved drained predecessor/i,
+    );
+    assert.equal(f.snapshot(),drainedSnapshot);
+
+    const first=await performLocalBoundCutoverRestart({
+      config,cutoverId,carrierId:approved.id,expectedCarrierVersion:1,expectedValidityVersion:1,
+      confirmCutoverId:cutoverId,packageRoot:f.root,
+    },dependencies);
+    assert.equal(first.scheduled,true);
+    assert.equal(scheduled,1);
+    assert.deepEqual(actuatorCalls.at(-1),{
+      livePid:4321,
+      serviceLabel:"test.service",
+      launchdTarget:"gui/501/test.service",
+    });
+    assert.ok(new CutoverStateStore(f.root).get()?.restartRequest?.restartScheduledAt);
+
+    const replay=await performLocalBoundCutoverRestart({
+      config,cutoverId,carrierId:approved.id,expectedCarrierVersion:1,expectedValidityVersion:1,
+      confirmCutoverId:cutoverId,packageRoot:f.root,
+    },dependencies);
+    assert.equal(replay.scheduled,false);
+    assert.equal(scheduled,1);
   } finally {
     f.close();
   }
