@@ -1106,22 +1106,43 @@ async function removeManagedWorktreeArtifact(artifact: HostStorageArtifact): Pro
     timeout: 30_000,
     maxBuffer: 4 * 1024 * 1024,
   });
-  const segment = safeWorkspaceRefSegment(artifact.workspaceId!);
+  await removeWorkspaceReviewRefs(artifact);
+}
+
+async function removeWorkspaceReviewRefs(artifact: HostStorageArtifact): Promise<void> {
+  if (!artifact.workspaceId || !artifact.sourceRoot) return;
+  let gitRoot: string;
+  try {
+    gitRoot = String((await execFileAsync(
+      "git",
+      ["-C", artifact.sourceRoot, "rev-parse", "--show-toplevel"],
+      { encoding: "utf8", timeout: 10_000, maxBuffer: 2 * 1024 * 1024 },
+    )).stdout).trim();
+  } catch {
+    return;
+  }
+  const segment = safeWorkspaceRefSegment(artifact.workspaceId);
   for (const suffix of ["open", "baseline"]) {
     await execFileAsync(
       "git",
-      ["-C", sourceRoot, "update-ref", "-d", `refs/devspace/review/${segment}/${suffix}`],
+      ["-C", gitRoot, "update-ref", "-d", `refs/devspace/review/${segment}/${suffix}`],
       { encoding: "utf8", timeout: 10_000, maxBuffer: 2 * 1024 * 1024 },
-    ).catch(() => undefined);
+    );
   }
 }
 
-async function removeOwnedDirectory(path: string): Promise<void> {
-  const stats = await lstat(path);
-  if (stats.isSymbolicLink() || !stats.isDirectory()) {
+async function removeOwnedDirectory(path: string, ownershipRoot: string | undefined): Promise<void> {
+  if (!ownershipRoot) throw new Error("owned storage deletion target lacks an ownership root");
+  const rawStats = await lstat(path);
+  if (rawStats.isSymbolicLink() || !rawStats.isDirectory()) {
     throw new Error("owned storage deletion target must be a real directory");
   }
-  await rm(path, { recursive: true, force: false });
+  const canonicalTarget = await canonicalPath(path);
+  const canonicalRoot = await canonicalPath(ownershipRoot);
+  if (canonicalTarget === canonicalRoot || !isPathInsideRoot(canonicalTarget, canonicalRoot)) {
+    throw new Error("owned storage deletion target escaped its canonical ownership root");
+  }
+  await rm(canonicalTarget, { recursive: true, force: false });
 }
 
 async function collectReleaseReferences(stateDir: string, releaseRoot: string): Promise<Set<string>> {
@@ -1204,6 +1225,26 @@ async function readJson(path: string): Promise<Record<string, unknown> | undefin
   }
 }
 
+function decorateArtifact(artifact: HostStorageArtifact, nowMs: number): HostStorageArtifact {
+  const signal = artifact.lastUseAt ?? artifact.modifiedAt;
+  const signalMs = signal ? Date.parse(signal) : Number.NaN;
+  const ageMs = Number.isFinite(signalMs) ? Math.max(0, nowMs - signalMs) : undefined;
+  const disposition: NonNullable<HostStorageArtifact["disposition"]> =
+    artifact.lifecycle === "GC_ELIGIBLE"
+      ? "DELETE"
+      : artifact.lifecycle === "UNKNOWN"
+        ? "RECONCILE"
+        : artifact.lifecycle === "FOREIGN"
+          ? "NOT_OWNED"
+          : "RETAIN";
+  return {
+    ...artifact,
+    ...(ageMs === undefined ? {} : { ageMs }),
+    disposition,
+    blockers: artifact.lifecycle === "GC_ELIGIBLE" ? [] : [artifact.reason],
+  };
+}
+
 function hashPlan(artifacts: HostStorageArtifact[]): string {
   const stable = artifacts.map((artifact) => ({
     id: artifact.id,
@@ -1215,6 +1256,10 @@ function hashPlan(artifacts: HostStorageArtifact[]): string {
     modifiedAt: artifact.modifiedAt ?? null,
     workspaceId: artifact.workspaceId ?? null,
     sourceRoot: artifact.sourceRoot ?? null,
+    ownershipRoot: artifact.ownershipRoot ?? null,
+    ownershipEvidence: artifact.ownershipEvidence ?? null,
+    disposition: artifact.disposition ?? null,
+    lastUseAt: artifact.lastUseAt ?? null,
   }));
   return `sha256:${createHash("sha256").update(JSON.stringify(stable)).digest("hex")}`;
 }
