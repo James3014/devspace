@@ -847,6 +847,10 @@ async function runCutoverCommand(args: string[]): Promise<void> {
     runCutoverAbortExpiredPrepared(args.slice(1));
     return;
   }
+  if (subcommand === "recover-capability-mismatch") {
+    await runCutoverCapabilityMismatchRecovery(args.slice(1));
+    return;
+  }
   if (subcommand === "help" || subcommand === "--help" || subcommand === "-h" || subcommand === undefined) {
     printCutoverHelp();
     return;
@@ -865,6 +869,7 @@ function printCutoverHelp(): void {
       "  devspace cutover observe --cutover-id <id> --workspace-id <id> --agent-id <id> [--json]",
       "  devspace cutover repair --cutover-id <id> --workspace-id <id> --agent-id <id> [--server-url <url>] [--package-root <path>] [--state-dir <path>] [--json]",
       "  devspace cutover abort-expired-prepared --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--json]",
+      "  devspace cutover recover-capability-mismatch --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--json]",
       "",
       "The repair subcommand repairs a successor cutover blocked by CROSS_DOMAIN_DIGEST_MISBINDING",
       "where the target build-manifest digest was mistakenly bound as the capability manifest digest.",
@@ -1040,6 +1045,80 @@ function runCutoverAbortExpiredPrepared(args: string[]): void {
       return;
     }
     console.log(`Recovered expired prepared cutover ${result.cutover.cutoverId}: phase=${result.cutover.phase}; lease=${result.lease.terminalState}; replayed=${String(result.replayed)}`);
+  } finally {
+    bindings.close();
+  }
+}
+
+async function runCutoverCapabilityMismatchRecovery(args: string[]): Promise<void> {
+  let cutoverId: string | undefined;
+  let carrierId: string | undefined;
+  let version: number | undefined;
+  let validityVersion: number | undefined;
+  let confirmCutoverId: string | undefined;
+  let json = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    const value = (): string => {
+      const next = args[++index];
+      if (!next) throw new Error(`${argument} requires a value.`);
+      return next;
+    };
+    if (argument === "--json") json = true;
+    else if (argument === "--cutover-id") cutoverId = value();
+    else if (argument === "--carrier") carrierId = value();
+    else if (argument === "--version") version = Number(value());
+    else if (argument === "--validity-version") validityVersion = Number(value());
+    else if (argument === "--confirm") confirmCutoverId = value();
+    else throw new Error(`Unknown cutover recover-capability-mismatch flag: ${argument}`);
+  }
+  if (!cutoverId || !carrierId || !Number.isSafeInteger(version) || !Number.isSafeInteger(validityVersion) || (version ?? 0) < 1 || (validityVersion ?? 0) < 1 || !confirmCutoverId) {
+    throw new Error("Usage: devspace cutover recover-capability-mismatch --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--json]");
+  }
+  const config = loadConfig();
+  if (!["127.0.0.1", "localhost", "::1"].includes(config.host)) {
+    throw new Error("Capability expectation recovery requires a loopback DevSpace host.");
+  }
+  const healthUrl = new URL("/healthz", `http://${config.host}:${config.port}`);
+  const response = await fetch(healthUrl, { redirect: "error" });
+  if (!response.ok) throw new Error(`DevSpace /healthz failed with HTTP ${response.status}.`);
+  const health = await response.json() as {
+    ok?: unknown;
+    build?: { source_commit?: unknown; build_id?: unknown };
+    capabilityManifest?: { manifestSha256?: unknown; missing?: unknown };
+    mcp?: { serverInstanceId?: unknown };
+  };
+  const sourceCommit = health.build?.source_commit;
+  const buildId = health.build?.build_id;
+  const capabilityManifestSha256 = health.capabilityManifest?.manifestSha256;
+  const serverInstanceId = health.mcp?.serverInstanceId;
+  if (
+    health.ok !== true ||
+    typeof sourceCommit !== "string" || !/^[0-9a-f]{40}$/.test(sourceCommit) ||
+    typeof buildId !== "string" || !buildId ||
+    typeof capabilityManifestSha256 !== "string" || !/^[0-9a-f]{64}$/.test(capabilityManifestSha256) ||
+    typeof serverInstanceId !== "string" || !serverInstanceId ||
+    !Array.isArray(health.capabilityManifest?.missing) || health.capabilityManifest.missing.length !== 0
+  ) {
+    throw new Error("Live /healthz identity or capability manifest is malformed; refusing recovery.");
+  }
+  const bindings = new CarrierBindingStore(config.stateDir);
+  try {
+    const result = bindings.recoverCapabilityExpectationMismatchLocal({
+      cutoverId,
+      carrierId,
+      expectedVersion: version as number,
+      expectedValidityVersion: validityVersion as number,
+      confirmCutoverId,
+      observedIdentity: { serverInstanceId, sourceCommit, buildId, capabilityManifestSha256 },
+    });
+    if (json) {
+      printJson(result);
+      return;
+    }
+    console.log(
+      `Recovered failed capability expectation cutover ${result.cutover.cutoverId}: phase=${result.cutover.phase}; lease=${result.lease.terminalState}; replayed=${String(result.replayed)}`,
+    );
   } finally {
     bindings.close();
   }

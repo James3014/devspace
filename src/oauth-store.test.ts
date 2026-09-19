@@ -60,6 +60,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 17, name: "chat-swarm-join-requests" },
       { version: 18, name: "chat-swarm-carrier-operations" },
       { version: 19, name: "core-mutation-sessions" },
+      { version: 20, name: "local-agent-provider-continuity" },
     ]);
   } finally {
     database.close();

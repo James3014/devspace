@@ -82,6 +82,7 @@ const migrations: Migration[] = [
   { version: 17, name: "chat-swarm-join-requests", up: migrateChatSwarmJoinRequests },
   { version: 18, name: "chat-swarm-carrier-operations", up: migrateChatSwarmCarrierOperations },
   { version: 19, name: "core-mutation-sessions", up: migrateCoreMutationSessions },
+  { version: 20, name: "local-agent-provider-continuity", up: migrateLocalAgentProviderContinuity },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -280,6 +281,18 @@ function migrateLocalAgentErrorDetails(sqlite: Database.Database): void {
 
 function migrateLocalAgentExecutionGeneration(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "local_agent_sessions", "execution_generation", "text");
+}
+
+function migrateLocalAgentProviderContinuity(sqlite: Database.Database): void {
+  addColumnIfMissing(sqlite, "local_agent_sessions", "provider_continuity_state", "text");
+  sqlite.exec(`
+    update local_agent_sessions
+    set provider_continuity_state = case
+      when provider_session_id is not null then 'KNOWN_UNVERIFIED'
+      else 'UNKNOWN'
+    end
+    where provider_continuity_state is null;
+  `);
 }
 
 function migrateDurableOperations(sqlite: Database.Database): void {
