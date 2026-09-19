@@ -207,23 +207,9 @@ function applyReceiptPath(stateDir: string, planId: string): string {
 async function inspectWorkspaces(input: HostStorageRetentionInput): Promise<HostStorageArtifact[]> {
   const nowMs = input.nowMs ?? Date.now();
   const graceMs = input.worktreeGraceMs ?? DEFAULT_WORKTREE_GRACE_MS;
-  const bindingsByWorkspace = new Map<string, number>();
-  for (const binding of input.conversationBindings) {
-    bindingsByWorkspace.set(
-      binding.workspaceSessionId,
-      (bindingsByWorkspace.get(binding.workspaceSessionId) ?? 0) + 1,
-    );
-  }
-
-  const agentsByWorkspace = new Map<string, LocalAgentRecord[]>();
-  for (const record of input.agentRecords) {
-    if (!record.workspaceId) continue;
-    const records = agentsByWorkspace.get(record.workspaceId) ?? [];
-    records.push(record);
-    agentsByWorkspace.set(record.workspaceId, records);
-  }
-
+  const canonicalWorktreeRoot = await canonicalPath(input.worktreeRoot);
   const artifacts: HostStorageArtifact[] = [];
+
   for (const session of input.workspaceSessions) {
     const kind: StorageArtifactKind =
       session.mode === "worktree" && session.managed ? "managed_worktree" : "workspace_checkout";
@@ -234,6 +220,7 @@ async function inspectWorkspaces(input: HostStorageRetentionInput): Promise<Host
       path,
       sizeBytes: await directorySize(path),
       workspaceId: session.id,
+      lastUseAt: session.lastUsedAt,
       ...(session.sourceRoot ? { sourceRoot: resolve(session.sourceRoot) } : {}),
     };
 
@@ -242,62 +229,97 @@ async function inspectWorkspaces(input: HostStorageRetentionInput): Promise<Host
         ...base,
         lifecycle: "FOREIGN",
         reason: "checkout path is user-owned and is never a DevSpace deletion target",
+        ownershipEvidence: "physical checkout was supplied by the user; only its DevSpace session record is owned",
       });
       continue;
     }
 
-    if (!isPathInsideRoot(path, resolve(input.worktreeRoot))) {
+    const canonicalWorktreePath = await canonicalPath(path);
+    if (!isPathInsideRoot(canonicalWorktreePath, canonicalWorktreeRoot)) {
       artifacts.push({
         ...base,
+        path: canonicalWorktreePath,
         lifecycle: "FOREIGN",
-        reason: "managed-worktree record is outside configured worktreeRoot",
-      });
-      continue;
-    }
-
-    if (input.loadedWorkspaceIds.has(session.id)) {
-      artifacts.push({ ...base, lifecycle: "ACTIVE", reason: "workspace is loaded in the running server" });
-      continue;
-    }
-
-    const bindingCount = bindingsByWorkspace.get(session.id) ?? 0;
-    if (bindingCount > 0) {
-      artifacts.push({
-        ...base,
-        lifecycle: "PINNED",
-        reason: `workspace has ${bindingCount} durable conversation binding(s)`,
-      });
-      continue;
-    }
-
-    const agentRecords = agentsByWorkspace.get(session.id) ?? [];
-    const liveAgents = agentRecords.filter(
-      (record) => record.status === "starting" || record.status === "running" || record.status === "idle",
-    );
-    if (liveAgents.length > 0) {
-      artifacts.push({
-        ...base,
-        lifecycle: "PINNED",
-        reason: `workspace has ${liveAgents.length} resumable/running agent record(s)`,
+        reason: "managed-worktree record resolves outside configured worktreeRoot",
+        ownershipEvidence: "canonical containment check failed",
       });
       continue;
     }
 
     if (!session.sourceRoot) {
-      artifacts.push({ ...base, lifecycle: "UNKNOWN", reason: "managed worktree lacks source repository identity" });
+      artifacts.push({
+        ...base,
+        path: canonicalWorktreePath,
+        lifecycle: "UNKNOWN",
+        reason: "managed worktree lacks source repository identity",
+      });
       continue;
     }
 
-    const gitState = await inspectGitWorktree(path, resolve(session.sourceRoot));
+    const canonicalSourceRoot = await canonicalPath(session.sourceRoot);
+    if (!(await pathInsideAnyCanonicalRoot(canonicalSourceRoot, input.allowedRoots))) {
+      artifacts.push({
+        ...base,
+        path: canonicalWorktreePath,
+        sourceRoot: canonicalSourceRoot,
+        lifecycle: "FOREIGN",
+        reason: "managed worktree source repository resolves outside configured allowed roots",
+        ownershipEvidence: "source repository authority is outside DevSpace allowed roots",
+      });
+      continue;
+    }
+
+    const reference = workspaceReferenceState(session.id, input);
+    if (reference) {
+      artifacts.push({
+        ...base,
+        path: canonicalWorktreePath,
+        sourceRoot: canonicalSourceRoot,
+        lifecycle: reference.lifecycle,
+        reason: reference.reason,
+      });
+      continue;
+    }
+
+    const gitState = await inspectGitWorktree(canonicalWorktreePath, canonicalSourceRoot);
     if (gitState.state === "unknown") {
-      artifacts.push({ ...base, lifecycle: "UNKNOWN", reason: gitState.reason });
+      artifacts.push({
+        ...base,
+        path: canonicalWorktreePath,
+        sourceRoot: canonicalSourceRoot,
+        lifecycle: "UNKNOWN",
+        reason: gitState.reason,
+      });
       continue;
     }
     if (gitState.dirty) {
       artifacts.push({
         ...base,
+        path: canonicalWorktreePath,
+        sourceRoot: canonicalSourceRoot,
         lifecycle: "TERMINAL_BUT_RETAINED",
         reason: "managed worktree has uncommitted/untracked changes",
+      });
+      continue;
+    }
+
+    if (!session.baseSha) {
+      artifacts.push({
+        ...base,
+        path: canonicalWorktreePath,
+        sourceRoot: canonicalSourceRoot,
+        lifecycle: "UNKNOWN",
+        reason: "managed worktree lacks its opening base commit identity",
+      });
+      continue;
+    }
+    if (gitState.head !== session.baseSha) {
+      artifacts.push({
+        ...base,
+        path: canonicalWorktreePath,
+        sourceRoot: canonicalSourceRoot,
+        lifecycle: "TERMINAL_BUT_RETAINED",
+        reason: "managed worktree contains committed HEAD state that differs from its opening base commit",
       });
       continue;
     }
@@ -306,6 +328,8 @@ async function inspectWorkspaces(input: HostStorageRetentionInput): Promise<Host
     if (!Number.isFinite(lastUsedMs) || nowMs - lastUsedMs < graceMs) {
       artifacts.push({
         ...base,
+        path: canonicalWorktreePath,
+        sourceRoot: canonicalSourceRoot,
         lifecycle: "TERMINAL_BUT_RETAINED",
         reason: "managed worktree is clean/unreferenced but still inside the retention grace window",
       });
@@ -314,11 +338,334 @@ async function inspectWorkspaces(input: HostStorageRetentionInput): Promise<Host
 
     artifacts.push({
       ...base,
+      path: canonicalWorktreePath,
+      sourceRoot: canonicalSourceRoot,
+      ownershipRoot: canonicalWorktreeRoot,
       lifecycle: "GC_ELIGIBLE",
-      reason: "DevSpace-owned managed worktree is unloaded, unbound, agent-terminal, clean, and past grace",
+      reason: "DevSpace-owned managed worktree is unloaded, unbound, process-free, agent-terminal, clean, unchanged from its base commit, and past grace",
+      ownershipEvidence: "durable managed-worktree session plus canonical containment in configured worktreeRoot",
     });
   }
   return artifacts;
+}
+
+async function inspectWorkspaceRecords(input: HostStorageRetentionInput): Promise<HostStorageArtifact[]> {
+  const nowMs = input.nowMs ?? Date.now();
+  const graceMs = input.worktreeGraceMs ?? DEFAULT_WORKTREE_GRACE_MS;
+  const artifacts: HostStorageArtifact[] = [];
+  for (const session of input.workspaceSessions) {
+    if (session.mode !== "checkout" || session.managed) continue;
+    const reference = workspaceReferenceState(session.id, input);
+    const base: HostStorageArtifact = {
+      id: `workspace-record:${session.id}`,
+      kind: "workspace_record",
+      path: resolve(session.root),
+      workspaceId: session.id,
+      sourceRoot: resolve(session.root),
+      sizeBytes: 0,
+      lifecycle: "UNKNOWN",
+      reason: "workspace record state has not been classified",
+      lastUseAt: session.lastUsedAt,
+      ownershipEvidence: "DevSpace durable workspace/session row; physical checkout remains user-owned",
+    };
+    if (reference) {
+      artifacts.push({ ...base, lifecycle: reference.lifecycle, reason: reference.reason });
+      continue;
+    }
+    const lastUsedMs = Date.parse(session.lastUsedAt);
+    if (!Number.isFinite(lastUsedMs) || nowMs - lastUsedMs < graceMs) {
+      artifacts.push({
+        ...base,
+        lifecycle: "TERMINAL_BUT_RETAINED",
+        reason: "unreferenced checkout session metadata is still inside the retention grace window",
+      });
+      continue;
+    }
+    artifacts.push({
+      ...base,
+      lifecycle: "GC_ELIGIBLE",
+      reason: "DevSpace checkout session metadata is unloaded, unbound, process-free, agent-terminal, and past grace; the physical checkout is not deleted",
+    });
+  }
+  return artifacts;
+}
+
+async function inspectManagedClones(input: HostStorageRetentionInput): Promise<HostStorageArtifact[]> {
+  const nowMs = input.nowMs ?? Date.now();
+  const graceMs = input.worktreeGraceMs ?? DEFAULT_WORKTREE_GRACE_MS;
+  const cloneOperations = input.durableOperations.filter((operation) => operation.kind === "workspace_clone");
+  const managedRoots = new Set<string>();
+  const recordedPaths = new Set<string>();
+  const artifacts: HostStorageArtifact[] = [];
+
+  for (const operation of cloneOperations) {
+    const destination = typeof operation.request.destination === "string"
+      ? resolve(operation.request.destination)
+      : undefined;
+    if (!destination) continue;
+    const ownershipRoot = devspaceCloneRoot(destination);
+    if (!ownershipRoot) continue;
+    const canonicalOwnershipRoot = await canonicalPath(ownershipRoot);
+    const canonicalDestination = await canonicalPath(destination);
+    managedRoots.add(canonicalOwnershipRoot);
+    recordedPaths.add(canonicalDestination);
+
+    const base: HostStorageArtifact = {
+      id: `managed-clone:${operation.operationId}`,
+      kind: "managed_clone",
+      path: canonicalDestination,
+      ownershipRoot: canonicalOwnershipRoot,
+      sizeBytes: await directorySize(canonicalDestination),
+      modifiedAt: operation.updatedAt,
+      lastUseAt: operation.updatedAt,
+      lifecycle: "UNKNOWN",
+      reason: "managed clone state has not been classified",
+      ownershipEvidence: "durable workspace_clone operation under a .devspace-chatgpt ownership root",
+    };
+
+    if (!isPathInsideRoot(canonicalDestination, canonicalOwnershipRoot) || canonicalDestination === canonicalOwnershipRoot) {
+      artifacts.push({ ...base, lifecycle: "FOREIGN", reason: "clone destination does not resolve beneath its DevSpace ownership root" });
+      continue;
+    }
+    if (operation.status === "started" || operation.status === "outcome_unknown") {
+      artifacts.push({
+        ...base,
+        lifecycle: "UNKNOWN",
+        reason: `workspace_clone operation is ${operation.status}; reconciliation is required before deletion`,
+      });
+      continue;
+    }
+    if (operation.status !== "succeeded") {
+      artifacts.push({
+        ...base,
+        lifecycle: "UNKNOWN",
+        reason: "failed workspace_clone may have partial physical effects and is retained for reconciliation",
+      });
+      continue;
+    }
+
+    if (await cloneHasWorkspaceReference(canonicalDestination, input)) {
+      artifacts.push({ ...base, lifecycle: "PINNED", reason: "managed clone is referenced by a durable workspace/session or active agent" });
+      continue;
+    }
+
+    const expectedHead = typeof operation.receipt?.head === "string" ? operation.receipt.head : undefined;
+    if (!expectedHead) {
+      artifacts.push({ ...base, lifecycle: "UNKNOWN", reason: "successful workspace_clone lacks a receipt-bound HEAD identity" });
+      continue;
+    }
+    const gitState = await inspectManagedClone(canonicalDestination);
+    if (gitState.state === "unknown") {
+      artifacts.push({ ...base, lifecycle: "UNKNOWN", reason: gitState.reason });
+      continue;
+    }
+    if (gitState.dirty) {
+      artifacts.push({ ...base, lifecycle: "TERMINAL_BUT_RETAINED", reason: "managed clone has uncommitted/untracked state" });
+      continue;
+    }
+    if (gitState.head !== expectedHead) {
+      artifacts.push({
+        ...base,
+        lifecycle: "TERMINAL_BUT_RETAINED",
+        reason: "managed clone HEAD differs from the durable workspace_clone receipt",
+      });
+      continue;
+    }
+
+    const lastUsedMs = Date.parse(operation.updatedAt);
+    if (!Number.isFinite(lastUsedMs) || nowMs - lastUsedMs < graceMs) {
+      artifacts.push({
+        ...base,
+        lifecycle: "TERMINAL_BUT_RETAINED",
+        reason: "managed clone is clean/unreferenced but still inside the retention grace window",
+      });
+      continue;
+    }
+
+    artifacts.push({
+      ...base,
+      lifecycle: "GC_ELIGIBLE",
+      reason: "receipt-owned .devspace-chatgpt clone is unreferenced, clean, unchanged from its recorded HEAD, and past grace",
+    });
+  }
+
+  for (const root of managedRoots) {
+    for (const repositoryRoot of await discoverGitRepositoryRoots(root, 3)) {
+      const canonicalRepositoryRoot = await canonicalPath(repositoryRoot);
+      if (recordedPaths.has(canonicalRepositoryRoot)) continue;
+      artifacts.push({
+        id: `managed-clone-untracked:${createHash("sha256").update(canonicalRepositoryRoot).digest("hex").slice(0, 16)}`,
+        kind: "managed_clone",
+        path: canonicalRepositoryRoot,
+        ownershipRoot: root,
+        sizeBytes: await directorySize(canonicalRepositoryRoot),
+        lifecycle: "UNKNOWN",
+        reason: "Git repository exists under a DevSpace clone root without a durable workspace_clone receipt; ownership/lifecycle requires reconciliation",
+        ownershipEvidence: "location is inside .devspace-chatgpt, but no durable creation receipt was found",
+      });
+    }
+  }
+
+  return artifacts;
+}
+
+function workspaceReferenceState(
+  workspaceId: string,
+  input: HostStorageRetentionInput,
+): { lifecycle: "ACTIVE" | "PINNED" | "UNKNOWN"; reason: string } | undefined {
+  if (input.loadedWorkspaceIds.has(workspaceId)) {
+    return { lifecycle: "ACTIVE", reason: "workspace is loaded in the running server" };
+  }
+  const processState = input.processWorkspaceStates.get(workspaceId);
+  if (processState === "ACTIVE") {
+    return { lifecycle: "PINNED", reason: "workspace has a live process-session reference" };
+  }
+  if (processState === "UNKNOWN") {
+    return { lifecycle: "UNKNOWN", reason: "workspace process-tree termination state is unknown" };
+  }
+  const bindingCount = input.conversationBindings.filter(
+    (binding) => binding.workspaceSessionId === workspaceId,
+  ).length;
+  if (bindingCount > 0) {
+    return {
+      lifecycle: "PINNED",
+      reason: `workspace has ${bindingCount} durable conversation binding(s)`,
+    };
+  }
+
+  const agentRecords = input.agentRecords.filter((record) => record.workspaceId === workspaceId);
+  const liveAgents = agentRecords.filter(
+    (record) => record.status === "starting" || record.status === "running" || record.status === "idle",
+  );
+  if (liveAgents.length > 0) {
+    return {
+      lifecycle: "PINNED",
+      reason: `workspace has ${liveAgents.length} resumable/running agent record(s)`,
+    };
+  }
+  const uncertainAgents = agentRecords.filter(agentLifecycleRequiresReconciliation);
+  if (uncertainAgents.length > 0) {
+    return {
+      lifecycle: "UNKNOWN",
+      reason: `workspace has ${uncertainAgents.length} agent record(s) with unresolved termination/scope lifecycle evidence`,
+    };
+  }
+  return undefined;
+}
+
+function agentLifecycleRequiresReconciliation(record: LocalAgentRecord): boolean {
+  const lifecycle = record.lifecycleState;
+  return Boolean(
+    lifecycle?.terminationPending ||
+    lifecycle?.lifecycleCorrupt ||
+    lifecycle?.terminationBlocked ||
+    lifecycle?.activeTurn ||
+    record.terminalReason === "unknown" ||
+    record.scopeState === "UNKNOWN",
+  );
+}
+
+async function cloneHasWorkspaceReference(
+  clonePath: string,
+  input: HostStorageRetentionInput,
+): Promise<boolean> {
+  for (const session of input.workspaceSessions) {
+    if (await samePhysicalPath(session.root, clonePath)) return true;
+  }
+  for (const record of input.agentRecords) {
+    if (
+      (record.status === "starting" || record.status === "running" || record.status === "idle" || agentLifecycleRequiresReconciliation(record)) &&
+      await samePhysicalPath(record.workspaceRoot, clonePath)
+    ) return true;
+  }
+  return false;
+}
+
+async function inspectManagedClone(
+  clonePath: string,
+): Promise<{ state: "known"; dirty: boolean; head: string } | { state: "unknown"; reason: string }> {
+  try {
+    const stats = await lstat(clonePath);
+    if (stats.isSymbolicLink() || !stats.isDirectory()) {
+      return { state: "unknown", reason: "managed clone target is not a real directory" };
+    }
+    const topLevel = String((await execFileAsync("git", ["-C", clonePath, "rev-parse", "--show-toplevel"], {
+      encoding: "utf8", timeout: 10_000, maxBuffer: 2 * 1024 * 1024,
+    })).stdout).trim();
+    if (!(await samePhysicalPath(topLevel, clonePath))) {
+      return { state: "unknown", reason: "managed clone path is not the Git repository top level" };
+    }
+    const [statusResult, headResult] = await Promise.all([
+      execFileAsync("git", ["-C", clonePath, "status", "--porcelain=v1"], {
+        encoding: "utf8", timeout: 10_000, maxBuffer: 2 * 1024 * 1024,
+      }),
+      execFileAsync("git", ["-C", clonePath, "rev-parse", "HEAD"], {
+        encoding: "utf8", timeout: 10_000, maxBuffer: 2 * 1024 * 1024,
+      }),
+    ]);
+    return {
+      state: "known",
+      dirty: String(statusResult.stdout).trim().length > 0,
+      head: String(headResult.stdout).trim(),
+    };
+  } catch (error) {
+    return {
+      state: "unknown",
+      reason: `unable to prove managed clone state: ${error instanceof Error ? error.message : String(error)}`,
+    };
+  }
+}
+
+async function discoverGitRepositoryRoots(root: string, depth: number): Promise<string[]> {
+  const found: string[] = [];
+  async function walk(path: string, remaining: number): Promise<void> {
+    if (remaining < 0) return;
+    let dir;
+    try {
+      dir = await opendir(path);
+    } catch {
+      return;
+    }
+    const entries = [];
+    for await (const entry of dir) entries.push(entry);
+    if (entries.some((entry) => entry.name === ".git" && (entry.isDirectory() || entry.isFile()))) {
+      found.push(path);
+      return;
+    }
+    if (remaining === 0) return;
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name === "node_modules" || entry.name === ".git") continue;
+      await walk(join(path, entry.name), remaining - 1);
+    }
+  }
+  await walk(root, depth);
+  return found;
+}
+
+function devspaceCloneRoot(path: string): string | undefined {
+  let current = resolve(path);
+  while (true) {
+    if (basename(current) === ".devspace-chatgpt") return current;
+    const parent = dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
+}
+
+async function pathInsideAnyCanonicalRoot(path: string, roots: string[]): Promise<boolean> {
+  for (const root of roots) {
+    const canonicalRoot = await canonicalPath(root);
+    if (isPathInsideRoot(path, canonicalRoot)) return true;
+  }
+  return false;
+}
+
+async function canonicalPath(path: string): Promise<string> {
+  return realpath(resolve(path)).catch(() => resolve(path));
+}
+
+async function samePhysicalPath(left: string, right: string): Promise<boolean> {
+  return (await canonicalPath(left)) === (await canonicalPath(right));
 }
 
 async function inspectReleases(input: HostStorageRetentionInput): Promise<HostStorageArtifact[]> {
