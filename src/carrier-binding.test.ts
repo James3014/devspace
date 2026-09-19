@@ -1015,7 +1015,7 @@ test("owner-local drained restart reuses exact carrier authority without MCP ses
     assert.equal(f.snapshot(),drainedSnapshot);
 
     const first=await performLocalBoundCutoverRestart({
-      config,cutoverId,carrierId:approved.id,expectedCarrierVersion:1,expectedValidityVersion:1,
+      config,cutoverId,carrierId:approved.id,expectedCarrierVersion:1,expectedValidityVersion:1,carrierCredential:pairing.credential,
       confirmCutoverId:cutoverId,packageRoot:f.root,
     },dependencies);
     assert.equal(first.scheduled,true);
@@ -1028,7 +1028,7 @@ test("owner-local drained restart reuses exact carrier authority without MCP ses
     assert.ok(new CutoverStateStore(f.root).get()?.restartRequest?.restartScheduledAt);
 
     const replay=await performLocalBoundCutoverRestart({
-      config,cutoverId,carrierId:approved.id,expectedCarrierVersion:1,expectedValidityVersion:1,
+      config,cutoverId,carrierId:approved.id,expectedCarrierVersion:1,expectedValidityVersion:1,carrierCredential:pairing.credential,
       confirmCutoverId:cutoverId,packageRoot:f.root,
     },dependencies);
     assert.equal(replay.scheduled,false);
