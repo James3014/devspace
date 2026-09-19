@@ -2883,6 +2883,34 @@ export function createMcpServer(
     };
   };
 
+  const capabilityManifest = runtimeBuildIdentityContext?.capabilityManifest
+    ?? deriveLoadedCapabilityManifest(
+      config.subagents && agentSessionManager
+        ? {
+          agent_start: agentStartInputSchema,
+          agent_preflight: agentPreflightInputSchema,
+          agent_catalog: createAgentCatalogInputSchema(),
+          ...(config.chatSwarmEnabled && chatSwarmLifecycle?.enabled && chatSwarmLifecycle.coordinator
+            ? chatSwarmToolInputShapes(config)
+            : {}),
+        }
+        : config.chatSwarmEnabled && chatSwarmLifecycle?.enabled && chatSwarmLifecycle.coordinator
+          ? chatSwarmToolInputShapes(config)
+          : {},
+    );
+  const server = new McpServer(
+    {
+      name: "devspace",
+      title: "DevSpace",
+      version: "0.1.0",
+      description:
+        "Coding tools for project workspaces. Open each project or worktree once, then reuse its workspaceId.",
+    },
+    {
+      instructions: serverInstructions(config),
+    },
+  );
+
   registerAppTool(
     server,
     "storage_inventory",
@@ -2941,34 +2969,6 @@ export function createMcpServer(
       };
     },
   );
-  const capabilityManifest = runtimeBuildIdentityContext?.capabilityManifest
-    ?? deriveLoadedCapabilityManifest(
-      config.subagents && agentSessionManager
-        ? {
-          agent_start: agentStartInputSchema,
-          agent_preflight: agentPreflightInputSchema,
-          agent_catalog: createAgentCatalogInputSchema(),
-          ...(config.chatSwarmEnabled && chatSwarmLifecycle?.enabled && chatSwarmLifecycle.coordinator
-            ? chatSwarmToolInputShapes(config)
-            : {}),
-        }
-        : config.chatSwarmEnabled && chatSwarmLifecycle?.enabled && chatSwarmLifecycle.coordinator
-          ? chatSwarmToolInputShapes(config)
-          : {},
-    );
-  const server = new McpServer(
-    {
-      name: "devspace",
-      title: "DevSpace",
-      version: "0.1.0",
-      description:
-        "Coding tools for project workspaces. Open each project or worktree once, then reuse its workspaceId.",
-    },
-    {
-      instructions: serverInstructions(config),
-    },
-  );
-
   const coreMutationGuard = createCoreMutationGuard(workspaces, coreMutationSessions, coreMutationTestOnlyBypass);
   const inspectCoreWriterDomain = (
     session: CoreMutationSessionRecord,
