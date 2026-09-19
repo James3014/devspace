@@ -94,6 +94,22 @@ for (const args of [
   );
 }
 
+for (const args of [
+  ["cutover", "restart-bound", "--cutover-id", "c"],
+  ["cutover", "restart-bound", "--cutover-id", "c", "--carrier", "carrier", "--version", "0", "--validity-version", "1", "--credential-file", "/tmp/missing", "--package-root", "/tmp", "--confirm", "c"],
+  ["cutover", "restart-bound", "--cutover-id", "c", "--carrier", "carrier", "--version", "1", "--validity-version", "1", "--credential-file", "/tmp/missing", "--package-root", "/tmp", "--confirm", "other"],
+  ["cutover", "restart-bound", "--cutover-id", "c", "--carrier", "carrier", "--version", "1", "--validity-version", "1", "--credential-file", "/tmp/missing", "--package-root", "/tmp", "--confirm", "c", "--server-label", "forbidden"],
+  ["cutover", "restart-bound", "--cutover-id", "c", "--carrier", "carrier", "--version", "1", "--validity-version", "1", "--credential", "forbidden-raw-secret", "--package-root", "/tmp", "--confirm", "c"],
+]) {
+  assert.throws(
+    () => execFileSync("node", ["--import", "tsx", "src/cli.ts", ...args], { encoding: "utf8", env: { ...process.env, DEVSPACE_CONFIG_DIR: "/tmp/devspace-cli-invalid-bound-restart-test" } }),
+    (error: unknown) => {
+      const detail = error as { stderr?: string; status?: number };
+      return detail.status !== 0 && /Usage:|Unknown cutover restart-bound flag/.test(detail.stderr ?? "");
+    },
+  );
+}
+
 const root = mkdtempSync(join(tmpdir(), "devspace-cli-agents-test-"));
 // A fresh production-tsconfig compilation keeps tsx cold loading outside the
 // worker exit deadline. Both direct and CI-wrapper invocations use this fixture.

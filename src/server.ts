@@ -1857,7 +1857,7 @@ function registerCutoverMcpTools(
       {
         title: "Restart cutover server",
         description:
-          "Schedule exactly one restart of this macOS launchd-managed Dev MCP service after a drained cutover lease is durably bound. Requires a build-ready attestation (verifiedBy/verifiedAt) and additionally verifies the target build on disk when a build-ready root is configured. The service label comes only from launchd XPC_SERVICE_NAME; callers cannot supply a command, label, path, PID, or launchd domain. Duplicate calls never schedule a second restart and must be reconciled by server identity.",
+          "Schedule exactly one restart of this macOS launchd-managed Dev MCP service after a drained cutover lease is durably bound. A fresh session may present the already-approved carrier credential inline; this rebinds the same carrier and never widens authority. Requires a build-ready attestation (verifiedBy/verifiedAt) and additionally verifies the target build on disk when a build-ready root is configured. The service label comes only from launchd XPC_SERVICE_NAME; callers cannot supply a command, label, path, PID, or launchd domain. Duplicate calls never schedule a second restart and must be reconciled by server identity.",
         inputSchema: {
           cutoverId: z.string().min(1),
           buildReady: z.object({
@@ -1865,6 +1865,7 @@ function registerCutoverMcpTools(
             verifiedAt: z.string().refine((value) => Number.isFinite(Date.parse(value))),
             evidence: z.string().optional(),
           }),
+          carrierCredential: z.string().optional().describe("Optional approved carrier credential for this exact restart when reconnecting on a fresh MCP session."),
         },
         outputSchema: {
           cutover: cutoverRecordSchema,
@@ -1881,11 +1882,13 @@ function registerCutoverMcpTools(
         _meta: {},
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
       },
-      async ({ cutoverId, buildReady }, extra) => {
+      async ({ cutoverId, buildReady, carrierCredential }, extra) => {
         if(control.controller.record()?.coordinationBinding) {
           if(!durableOperations) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","restart requires trusted coordination");
+          const context=dependencyConsumerContext(extra);
+          if(carrierCredential!==undefined && carrierBindings) carrierBindings.redeem(context,carrierCredential);
           const actuator=control.restartSelf!;
-          const outcome=await durableOperations.restartCutover(cutoverId,control.controller.currentIdentity,buildReady,control.probeBuildReady??(async()=>({buildReady:true,detail:"trusted attestation only"})),actuator,dependencyConsumerContext(extra));
+          const outcome=await durableOperations.restartCutover(cutoverId,control.controller.currentIdentity,buildReady,control.probeBuildReady??(async()=>({buildReady:true,detail:"trusted attestation only"})),actuator,context);
           return {content:[textBlock("Restart scheduling intent is recorded; execution remains unconfirmed and must not be replayed.")],structuredContent:{cutover:outcome.record as unknown as Record<string,unknown>,mode:control.controller.mode(),restart:{scheduled:outcome.scheduled,alreadyRequested:!outcome.scheduled,scheduleBlocked:false,actuator:"launchd-self" as const,serviceLabel:actuator.serviceLabel,launchdTarget:actuator.launchdTarget}}};
         }
         const request = control.controller.requestRestart(cutoverId, buildReady);

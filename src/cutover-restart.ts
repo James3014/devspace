@@ -37,6 +37,106 @@ const LAUNCHD_LABEL = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
  * target domain; launchd supplies XPC_SERVICE_NAME and the current uid binds
  * the gui domain.
  */
+export interface BoundLaunchdRestartOptions {
+  platform?: NodeJS.Platform;
+  uid?: number;
+  livePid: number;
+  serviceLabel: string;
+  launchdTarget: string;
+  delayMs?: number;
+  schedule?: (callback: () => void, delayMs: number) => TimerHandle;
+  inspectLaunchdTarget?: (command: string, args: string[]) => { status: number | null; stdout: string };
+  spawnDetached?: (command: string, args: string[]) => void;
+  onError?: (error: Error) => void;
+}
+
+/**
+ * Host-local restart actuator for an already-approved cutover. Unlike the
+ * self-restart actuator, this process is not the launchd-managed server, so
+ * every effect is bound to the approved label/target and the currently
+ * observed live server PID. The target is re-checked immediately before the
+ * kickstart so a process-generation race fails closed after the durable
+ * scheduled marker rather than restarting an unbound service.
+ */
+export function createBoundLaunchdRestartActuator(
+  options: BoundLaunchdRestartOptions,
+): SelfRestartActuator | undefined {
+  const platform = options.platform ?? process.platform;
+  if (platform !== "darwin") return undefined;
+  if (
+    !options.serviceLabel ||
+    options.serviceLabel === "0" ||
+    options.serviceLabel === "(null)" ||
+    !LAUNCHD_LABEL.test(options.serviceLabel)
+  ) return undefined;
+
+  const uid = options.uid ?? process.getuid?.();
+  if (!Number.isInteger(uid) || (uid ?? -1) < 0) return undefined;
+  if (!Number.isInteger(options.livePid) || options.livePid <= 0) return undefined;
+
+  const expectedTarget = `gui/${uid}/${options.serviceLabel}`;
+  if (options.launchdTarget !== expectedTarget) return undefined;
+
+  const inspectLaunchdTarget = options.inspectLaunchdTarget ?? ((command, args) => {
+    const result = spawnSync(command, args, {
+      encoding: "utf8",
+      shell: false,
+      stdio: ["ignore", "pipe", "ignore"],
+    });
+    return { status: result.status, stdout: result.stdout ?? "" };
+  });
+  const ownsBoundPid = () => {
+    const inspection = inspectLaunchdTarget("/bin/launchctl", ["print", expectedTarget]);
+    return inspection.status === 0 && launchdOutputOwnsPid(inspection.stdout, options.livePid);
+  };
+  if (!ownsBoundPid()) return undefined;
+
+  const delayMs = options.delayMs ?? 750;
+  const schedule = options.schedule ?? ((callback, delay) => setTimeout(callback, delay));
+  const spawnDetached = options.spawnDetached ?? ((command, args) => {
+    const child = spawn(command, args, {
+      detached: true,
+      stdio: "ignore",
+      shell: false,
+    });
+    child.once("error", (error) => {
+      (options.onError ?? ((value) => console.error("devspace bound restart actuator failed", value)))(error);
+    });
+    child.unref();
+  });
+  const onError = options.onError ?? ((error: Error) => {
+    console.error("devspace bound restart actuator failed", error);
+  });
+
+  return {
+    actuator: "launchd-self",
+    serviceLabel: options.serviceLabel,
+    launchdTarget: expectedTarget,
+    schedule(): SelfRestartReceipt {
+      // Keep this timer referenced. The owner-local CLI may exit immediately
+      // after restartCutover commits its durable scheduled marker; the delay
+      // ensures the SQLite transaction is released before launchd starts the
+      // replacement server.
+      schedule(() => {
+        try {
+          if (!ownsBoundPid()) {
+            throw new Error("Bound launchd service PID changed before deferred restart.");
+          }
+          spawnDetached("/bin/launchctl", ["kickstart", "-k", expectedTarget]);
+        } catch (error) {
+          onError(error instanceof Error ? error : new Error(String(error)));
+        }
+      }, delayMs);
+      return {
+        scheduled: true,
+        actuator: "launchd-self",
+        serviceLabel: options.serviceLabel,
+        launchdTarget: expectedTarget,
+      };
+    },
+  };
+}
+
 export function createLaunchdSelfRestartActuator(
   options: LaunchdSelfRestartOptions = {},
 ): SelfRestartActuator | undefined {
