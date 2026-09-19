@@ -428,13 +428,16 @@ export class ChatSwarmRuntimeStore {
   }
 
   listSlots(swarmId: string): ManagedCarrierSlot[] {
+    return this.listAllSlots()
+      .filter((slot) => slot.swarmId === swarmId)
+      .sort((a, b) => a.runtimeSlot - b.runtimeSlot);
+  }
+
+  listAllSlots(): ManagedCarrierSlot[] {
     const rows = this.database.sqlite
       .prepare("select * from durable_operations where kind=? and scope_root=? order by created_at asc")
       .all(SLOT_KIND, this.scopeRoot) as Row[];
-    return rows
-      .map((row) => this.slotFrom(row))
-      .filter((slot) => slot.swarmId === swarmId)
-      .sort((a, b) => a.runtimeSlot - b.runtimeSlot);
+    return rows.map((row) => this.slotFrom(row));
   }
 
   getSlot(swarmId: string, runtimeSlot: number): ManagedCarrierSlot | undefined {
