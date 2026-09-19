@@ -966,7 +966,9 @@ async function inspectBrowserRuntimes(input: HostStorageRetentionInput): Promise
       continue;
     }
 
-    const profileState = input.browserProfileStates.get(browserProfileId(path));
+    const profileState =
+      input.browserProfileStates.get(browserProfileId(rawPath)) ??
+      input.browserProfileStates.get(browserProfileId(path));
     const marker = (await readJson(join(path, ".devspace-storage.json"))) as Partial<BrowserMarker> | undefined;
     const markerOwned =
       marker?.schema === HOST_STORAGE_BROWSER_MARKER_SCHEMA &&
@@ -1011,7 +1013,7 @@ async function inspectBrowserRuntimes(input: HostStorageRetentionInput): Promise
       continue;
     }
 
-    const processState = await browserProfileProcessState(path);
+    const processState = await browserProfileProcessState(rawPath, path);
     if (processState === "active") {
       artifacts.push({
         ...base,
@@ -1042,18 +1044,22 @@ function browserProfileId(path: string): string {
   return createHash("sha256").update(resolve(path)).digest("hex");
 }
 
-async function browserProfileProcessState(path: string): Promise<"active" | "terminal" | "unknown"> {
+async function browserProfileProcessState(
+  rawPath: string,
+  canonicalPathValue: string,
+): Promise<"active" | "terminal" | "unknown"> {
   try {
     const result = await execFileAsync("ps", ["-axo", "command="], {
       encoding: "utf8",
       timeout: 10_000,
       maxBuffer: 8 * 1024 * 1024,
     });
-    const needles = [
+    const candidates = new Set([resolve(rawPath), resolve(canonicalPathValue)]);
+    const needles = [...candidates].flatMap((path) => [
       `--user-data-dir=${path}`,
       `--user-data-dir="${path}"`,
       `--user-data-dir='${path}'`,
-    ];
+    ]);
     return String(result.stdout).split("\n").some((line) => needles.some((needle) => line.includes(needle)))
       ? "active"
       : "terminal";
