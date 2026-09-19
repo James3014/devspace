@@ -2917,7 +2917,7 @@ export function createMcpServer(
       ),
       agentRecords: agentSessionManager?.listAllAgentRecords() ?? [],
       processWorkspaceStates: processSessions.retentionWorkspaceStates(),
-      durableOperations: durableOperations?.store.list("workspace_clone") ?? [],
+      durableOperations: durableOperations?.store.list() ?? [],
       allowedRoots: config.allowedRoots,
       browserProfileStates,
       browserReferenceStateAvailable,
@@ -2954,6 +2954,12 @@ export function createMcpServer(
         unresolvedLifecycle
       ) {
         throw new Error(`Path has active or unresolved agent state ${record.id}.`);
+      }
+    }
+    for (const operation of durableOperations?.store.list() ?? []) {
+      if (operation.status !== "started" && operation.status !== "outcome_unknown") continue;
+      if (canonicalizePath(operation.scopeRoot) === canonical) {
+        throw new Error(`Path has unresolved durable operation ${operation.operationId}.`);
       }
     }
   };
