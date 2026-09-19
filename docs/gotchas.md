@@ -177,6 +177,11 @@ terminal/unreferenced carrier evidence (or an explicit DevSpace lifecycle
 marker), plus a successful host-process check proving no process still uses the
 profile. Missing browser reference/process evidence remains `UNKNOWN`.
 
+Backup-like verification/build directories under the package root are also
+inventoried, but naming and location alone never grant deletion authority.
+Unmarked legacy backups remain `UNKNOWN`; only a canonical in-root artifact
+with an explicit DevSpace terminal marker can become `GC_ELIGIBLE`.
+
 `storage_gc` requires the exact plan id returned by `storage_inventory` and
 rebuilds the inventory before deletion. Before the first destructive effect it
 atomically claims a durable GC journal, then records the exact artifact before
