@@ -121,6 +121,7 @@ import { ChatSwarmLifecycle } from "./chat-swarm-lifecycle.js";
 import type { ChatSwarmStore, ChatSwarmMigrationBundle } from "./chat-swarm-store.js";
 import { registerChatSwarmTools, chatSwarmToolInputShapes } from "./chat-swarm-tools.js";
 import { ChatSwarmRuntimeOwner } from "./chat-swarm-runtime-owner.js";
+import { ChatSwarmRuntimeStore } from "./chat-swarm-runtime.js";
 import { shutdownHttpServer } from "./server-shutdown.js";
 import { formatPathForPrompt } from "./skills.js";
 import { createWorkspaceStore } from "./workspace-store.js";
@@ -215,6 +216,7 @@ import {
 } from "./repository-intelligence.js";
 import { registerRepositoryIntelligenceArtifactTool } from "./repository-intelligence-artifact.js";
 import { registerPhysicalHostRegistryTools } from "./physical-host-registry.js";
+import { canonicalizePath } from "./roots.js";
 import { applyHostStoragePlan, buildHostStoragePlan } from "./host-storage-retention.js";
 
 type Transport = StreamableHTTPServerTransport;
@@ -2868,6 +2870,40 @@ export function createMcpServer(
 
   const hostStorageInput = () => {
     const workspaceSessions = workspaces.listSessions();
+    const browserProfileStates = new Map<string, "ACTIVE" | "TERMINAL" | "UNKNOWN">();
+    let browserReferenceStateAvailable = false;
+    let browserStore: ChatSwarmRuntimeStore | undefined;
+    try {
+      browserStore = new ChatSwarmRuntimeStore(config.stateDir);
+      const grouped = new Map<string, Set<"ACTIVE" | "TERMINAL" | "UNKNOWN">>();
+      for (const slot of browserStore.listAllSlots()) {
+        const state =
+          slot.state === "STOPPED"
+            ? "TERMINAL"
+            : slot.state === "RECONCILE_REQUIRED"
+              ? "UNKNOWN"
+              : "ACTIVE";
+        const states = grouped.get(slot.browserProfileId) ?? new Set();
+        states.add(state);
+        grouped.set(slot.browserProfileId, states);
+      }
+      for (const [profileId, states] of grouped) {
+        browserProfileStates.set(
+          profileId,
+          states.has("ACTIVE")
+            ? "ACTIVE"
+            : states.has("UNKNOWN")
+              ? "UNKNOWN"
+              : "TERMINAL",
+        );
+      }
+      browserReferenceStateAvailable = true;
+    } catch {
+      browserReferenceStateAvailable = false;
+    } finally {
+      browserStore?.close();
+    }
+
     return {
       stateDir: config.stateDir,
       worktreeRoot: config.worktreeRoot,
@@ -2880,7 +2916,46 @@ export function createMcpServer(
           .map((session) => session.id),
       ),
       agentRecords: agentSessionManager?.listAllAgentRecords() ?? [],
+      processWorkspaceStates: processSessions.retentionWorkspaceStates(),
+      durableOperations: durableOperations?.store.list("workspace_clone") ?? [],
+      allowedRoots: config.allowedRoots,
+      browserProfileStates,
+      browserReferenceStateAvailable,
+      activeSourceCommit: runtimeBuildIdentity.sourceCommit,
     };
+  };
+
+  const assertStoragePathUnreferenced = (path: string): void => {
+    const canonical = canonicalizePath(path);
+    const processStates = processSessions.retentionWorkspaceStates();
+    for (const session of workspaces.listSessions()) {
+      if (canonicalizePath(session.root) !== canonical) continue;
+      if (workspaces.inspectWorkspace(session.id).loaded) {
+        throw new Error(`Path is loaded by workspace ${session.id}.`);
+      }
+      if (processStates.has(session.id)) {
+        throw new Error(`Path has active or unresolved process-session state for workspace ${session.id}.`);
+      }
+    }
+    for (const record of agentSessionManager?.listAllAgentRecords() ?? []) {
+      if (canonicalizePath(record.workspaceRoot) !== canonical) continue;
+      const unresolvedLifecycle = Boolean(
+        record.lifecycleState?.terminationPending ||
+        record.lifecycleState?.lifecycleCorrupt ||
+        record.lifecycleState?.terminationBlocked ||
+        record.lifecycleState?.activeTurn ||
+        record.terminalReason === "unknown" ||
+        record.scopeState === "UNKNOWN",
+      );
+      if (
+        record.status === "starting" ||
+        record.status === "running" ||
+        record.status === "idle" ||
+        unresolvedLifecycle
+      ) {
+        throw new Error(`Path has active or unresolved agent state ${record.id}.`);
+      }
+    }
   };
 
   const capabilityManifest = runtimeBuildIdentityContext?.capabilityManifest
@@ -2957,7 +3032,9 @@ export function createMcpServer(
     },
     async ({ expectedPlanId }) => {
       const result = await applyHostStoragePlan(hostStorageInput(), expectedPlanId, {
+        assertWorkspaceSessionUnloaded: (workspaceId) => workspaces.assertDurableSessionUnloaded(workspaceId),
         deleteWorkspaceSession: (workspaceId) => workspaces.deleteDurableSession(workspaceId),
+        assertPathUnreferenced: assertStoragePathUnreferenced,
       });
       return {
         content: [
