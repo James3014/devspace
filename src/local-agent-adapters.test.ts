@@ -436,16 +436,19 @@ if (existsSync(join(isolatedHome, ".gemini", "config", "mcp_config.json"))) {
   process.exit(90);
 }
 const expectedAppData = process.env.EXPECTED_AGY_APPDATA;
+const expectedToken = process.env.EXPECTED_AGY_TOKEN;
 const isolatedAppData = join(isolatedHome, ".gemini", "antigravity-cli");
-if (!expectedAppData) {
-  console.error("MISSING_EXPECTED_AGY_APPDATA");
+if (!expectedAppData || !expectedToken) {
+  console.error("MISSING_EXPECTED_AGY_PROVIDER_STATE");
   process.exit(88);
 }
-for (const name of ["antigravity-oauth-token", "conversations"]) {
-  if (canonical(join(isolatedAppData, name)) !== canonical(join(expectedAppData, name))) {
-    console.error(\`AGY_PROVIDER_STATE_LINK_MISMATCH_\${name}\`);
-    process.exit(87);
-  }
+if (canonical(join(isolatedHome, ".gemini", "jetski-standalone-oauth-token")) !== canonical(expectedToken)) {
+  console.error("AGY_PROVIDER_STATE_LINK_MISMATCH_jetski-standalone-oauth-token");
+  process.exit(87);
+}
+if (canonical(join(isolatedAppData, "conversations")) !== canonical(join(expectedAppData, "conversations"))) {
+  console.error("AGY_PROVIDER_STATE_LINK_MISMATCH_conversations");
+  process.exit(87);
 }
 for (const forbidden of ["mcp", "scratch"]) {
   if (existsSync(join(isolatedAppData, forbidden))) {
@@ -588,10 +591,11 @@ writeFileSync(tempMockPath, mockAgySource, { mode: 0o755 });
 const ambientAgyHome = join(tempMockDir, "ambient-home");
 const ambientMcpConfig = join(ambientAgyHome, ".gemini", "config", "mcp_config.json");
 const ambientAgyAppData = join(ambientAgyHome, ".gemini", "antigravity-cli");
+const ambientAgyToken = join(ambientAgyHome, ".gemini", "jetski-standalone-oauth-token");
 mkdirSync(join(ambientAgyHome, ".gemini", "config"), { recursive: true });
 mkdirSync(join(ambientAgyAppData, "conversations"), { recursive: true });
 writeFileSync(ambientMcpConfig, '{"serena":{"command":"UNRELATED_GLOBAL_MCP_SENTINEL"}}\n');
-writeFileSync(join(ambientAgyAppData, "antigravity-oauth-token"), "TEST_AUTH_TOKEN\n", { mode: 0o600 });
+writeFileSync(ambientAgyToken, "TEST_AUTH_TOKEN\n", { mode: 0o600 });
 const agyScratch = createProviderScratch(`adapter_test_${process.pid}_${Date.now()}`);
 const originalEnv = process.env;
 const childProcess = createRequire(import.meta.url)("node:child_process") as typeof import("node:child_process");
@@ -626,6 +630,7 @@ try {
     DEVSPACE_PROVIDER_SCRATCH: agyScratch.root,
     EXPECTED_AGY_PROVIDER_SCRATCH: agyScratch.root,
     EXPECTED_AGY_APPDATA: ambientAgyAppData,
+    EXPECTED_AGY_TOKEN: ambientAgyToken,
     AMBIENT_AGY_HOME: ambientAgyHome,
     DEVSPACE_OAUTH_OWNER_TOKEN: "DO_NOT_LEAK",
     DEVSPACE_OAUTH_SCOPES: "devspace",

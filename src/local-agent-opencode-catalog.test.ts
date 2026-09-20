@@ -137,6 +137,24 @@ assert.equal(concurrentRefresh[0]?.source, "sdk");
 assert.deepEqual(concurrentRefresh[0]?.entries[0]?.variants, ["high"]);
 assert.equal(validateOpencodeModelAndVariant("opencode/muse-spark-1.3-contributor-free", "low", concurrentRefresh[0]).variantStatus, "unsupported");
 assert.equal(validateOpencodeModelAndVariant("opencode/big-pickle", undefined, concurrentRefresh[0]).blockerCode, "EXACT_MODEL_UNAVAILABLE", "removed live model must be rejected");
+
+// A successful-but-empty SDK response is not authoritative evidence that the
+// account has zero models. Fall through to the existing CLI catalog probe so a
+// provider API regression cannot turn a healthy local catalog into false-empty.
+const emptySdkFallback = await fetchOpencodeCatalog({
+  v2: { model: { list: async () => ({ data: { data: [] } }) } },
+} as never, {}, async (_file, args) => {
+  assert.deepEqual(args, ["models"]);
+  return {
+    stdout: "opencode/big-pickle\nopencode/mimo-v2.5-free\n",
+    executable: "/usr/local/bin/opencode",
+  };
+});
+assert.equal(emptySdkFallback.source, "cli");
+assert.equal(emptySdkFallback.freshness, "fresh");
+assert.deepEqual(emptySdkFallback.entries.map((entry) => entry.fullName), ["opencode/big-pickle", "opencode/mimo-v2.5-free"]);
+assert.equal(validateOpencodeModelAndVariant("opencode/big-pickle", undefined, emptySdkFallback).valid, true);
+
 const metadataCatalog = await fetchOpencodeCatalog({
   v2: { model: { list: async () => ({ data: { data: [{
     id: "metadata-model", providerID: "opencode", variants: [], status: "active", enabled: true,

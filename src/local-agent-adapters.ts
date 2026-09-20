@@ -308,34 +308,51 @@ export function agyCommandEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv
     throw new Error(`Agy isolated home escaped provider scratch: ${canonicalHome}`);
   }
 
-  // Agy stores its authenticated Antigravity token and durable conversation DBs
-  // under ~/.gemini/antigravity-cli, separately from global MCP configuration in
-  // ~/.gemini/config. Expose only those two provider-state paths into the
-  // isolated home. Do not link the application-data directory wholesale: it may
-  // contain cached MCP schemas, provider scratch, or other unrelated state.
+  // Agy 1.2.7 stores the standalone OAuth token at
+  // ~/.gemini/jetski-standalone-oauth-token while durable conversation state
+  // remains under ~/.gemini/antigravity-cli. Older Agy builds used
+  // antigravity-cli/antigravity-oauth-token, so retain that layout only as a
+  // fallback when the current token path is absent. Expose only the exact token
+  // and conversations directory into the isolated home; never link ~/.gemini or
+  // the application-data directory wholesale.
   const originalHome = next.HOME?.trim() || next.USERPROFILE?.trim();
   if (!originalHome) {
     throw new Error("Agy dispatch cannot isolate global config without the original user home.");
   }
   const canonicalOriginalHome = canonicalizeExistingPath(originalHome);
-  const sourceAppData = canonicalizeExistingPath(
-    join(canonicalOriginalHome, ".gemini", "antigravity-cli"),
-  );
-  if (!isPathWithin(sourceAppData, canonicalOriginalHome)) {
+  const sourceGeminiRoot = canonicalizeExistingPath(join(canonicalOriginalHome, ".gemini"));
+  const sourceAppData = canonicalizeExistingPath(join(sourceGeminiRoot, "antigravity-cli"));
+  if (!isPathWithin(sourceGeminiRoot, canonicalOriginalHome) || !isPathWithin(sourceAppData, sourceGeminiRoot)) {
     throw new Error(`Agy provider state escaped the original user home: ${sourceAppData}`);
   }
-  const isolatedAppData = join(canonicalHome, ".gemini", "antigravity-cli");
+
+  const currentTokenPath = join(sourceGeminiRoot, "jetski-standalone-oauth-token");
+  const legacyTokenPath = join(sourceAppData, "antigravity-oauth-token");
+  const usesCurrentTokenLayout = existsSync(currentTokenPath);
+  const sourceToken = canonicalizeExistingPath(usesCurrentTokenLayout ? currentTokenPath : legacyTokenPath);
+  if (!isPathWithin(sourceToken, sourceGeminiRoot)) {
+    throw new Error(`Agy provider token escaped its Gemini state root: ${sourceToken}`);
+  }
+  const sourceConversations = canonicalizeExistingPath(join(sourceAppData, "conversations"));
+  if (!isPathWithin(sourceConversations, sourceAppData)) {
+    throw new Error(`Agy provider conversations escaped its application-data root: ${sourceConversations}`);
+  }
+
+  const isolatedGeminiRoot = join(canonicalHome, ".gemini");
+  const isolatedAppData = join(isolatedGeminiRoot, "antigravity-cli");
   mkdirSync(isolatedAppData, { recursive: true, mode: 0o700 });
-  const providerStateLinks: Array<{ name: string; type: "file" | "dir" }> = [
-    { name: "antigravity-oauth-token", type: "file" },
-    { name: "conversations", type: "dir" },
+  const providerStateLinks: Array<{ name: string; source: string; target: string; type: "file" | "dir" }> = [
+    {
+      name: usesCurrentTokenLayout ? "jetski-standalone-oauth-token" : "antigravity-oauth-token",
+      source: sourceToken,
+      target: usesCurrentTokenLayout
+        ? join(isolatedGeminiRoot, "jetski-standalone-oauth-token")
+        : join(isolatedAppData, "antigravity-oauth-token"),
+      type: "file",
+    },
+    { name: "conversations", source: sourceConversations, target: join(isolatedAppData, "conversations"), type: "dir" },
   ];
-  for (const { name, type } of providerStateLinks) {
-    const source = canonicalizeExistingPath(join(sourceAppData, name));
-    if (!isPathWithin(source, sourceAppData)) {
-      throw new Error(`Agy provider state path escaped its application-data root: ${source}`);
-    }
-    const target = join(isolatedAppData, name);
+  for (const { name, source, target, type } of providerStateLinks) {
     if (existsSync(target)) {
       const existing = canonicalizeExistingPath(target);
       if (existing !== source) {

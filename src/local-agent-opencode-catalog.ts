@@ -180,6 +180,7 @@ export async function fetchOpencodeCatalog(client?: OpencodeClientLike, env: Nod
       const response = await withTimeout(client.v2.model.list({}, { throwOnError: true, signal: controller.signal }), SDK_TIMEOUT_MS, "SDK model catalog").catch((error) => { controller.abort(); throw error; });
       const list = response?.data?.data;
       if (!Array.isArray(list)) throw new Error("SDK model catalog response had no data array");
+      if (list.length === 0) throw new Error("SDK model catalog returned no model entries");
       const entries = list.map((item) => {
         if (typeof item?.id !== "string" || typeof item?.providerID !== "string") throw new Error("SDK model catalog contained malformed model entries");
         if (item.variants !== undefined && !Array.isArray(item.variants)) throw new Error("SDK model catalog contained malformed variants");
