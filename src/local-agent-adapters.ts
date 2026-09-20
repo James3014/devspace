@@ -341,15 +341,34 @@ export function agyCommandEnvironment(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv
   const isolatedGeminiRoot = join(canonicalHome, ".gemini");
   const isolatedAppData = join(isolatedGeminiRoot, "antigravity-cli");
   mkdirSync(isolatedAppData, { recursive: true, mode: 0o700 });
+  const tokenStateLinks: Array<{ name: string; source: string; target: string; type: "file" }> = usesCurrentTokenLayout
+    ? [
+        {
+          name: "jetski-standalone-oauth-token",
+          source: sourceToken,
+          target: join(isolatedGeminiRoot, "jetski-standalone-oauth-token"),
+          type: "file",
+        },
+        {
+          // Agy 1.2.7 still accepts the legacy Antigravity token filename when
+          // HOME is isolated. Keep both aliases bound to the same current token
+          // source instead of copying or maintaining two credential stores.
+          name: "antigravity-oauth-token",
+          source: sourceToken,
+          target: join(isolatedAppData, "antigravity-oauth-token"),
+          type: "file",
+        },
+      ]
+    : [
+        {
+          name: "antigravity-oauth-token",
+          source: sourceToken,
+          target: join(isolatedAppData, "antigravity-oauth-token"),
+          type: "file",
+        },
+      ];
   const providerStateLinks: Array<{ name: string; source: string; target: string; type: "file" | "dir" }> = [
-    {
-      name: usesCurrentTokenLayout ? "jetski-standalone-oauth-token" : "antigravity-oauth-token",
-      source: sourceToken,
-      target: usesCurrentTokenLayout
-        ? join(isolatedGeminiRoot, "jetski-standalone-oauth-token")
-        : join(isolatedAppData, "antigravity-oauth-token"),
-      type: "file",
-    },
+    ...tokenStateLinks,
     { name: "conversations", source: sourceConversations, target: join(isolatedAppData, "conversations"), type: "dir" },
   ];
   for (const { name, source, target, type } of providerStateLinks) {

@@ -446,6 +446,10 @@ if (canonical(join(isolatedHome, ".gemini", "jetski-standalone-oauth-token")) !=
   console.error("AGY_PROVIDER_STATE_LINK_MISMATCH_jetski-standalone-oauth-token");
   process.exit(87);
 }
+if (canonical(join(isolatedAppData, "antigravity-oauth-token")) !== canonical(expectedToken)) {
+  console.error("AGY_PROVIDER_STATE_LINK_MISMATCH_antigravity-oauth-token");
+  process.exit(87);
+}
 if (canonical(join(isolatedAppData, "conversations")) !== canonical(join(expectedAppData, "conversations"))) {
   console.error("AGY_PROVIDER_STATE_LINK_MISMATCH_conversations");
   process.exit(87);
