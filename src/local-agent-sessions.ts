@@ -21,6 +21,14 @@ import {
   resolveLocalAgentProviderExecutable,
 } from "./local-agent-availability.js";
 import { runLocalAgentProvider } from "./local-agent-adapters.js";
+import {
+  cancelCodegTask,
+  codegExecutionIdentity,
+  formatCodegTaskHandle,
+  inspectCodegTask,
+  isCodegProviderEnabled,
+  runCodegLocalAgent,
+} from "./local-agent-codeg.js";
 import { resolveEffectiveExecutionIdlePolicy } from "./local-agent-idle-policy.js";
 import { LocalAgentProviderError, type LocalAgentRunCallbacks, type LocalAgentRunResult } from "./local-agent-runtime.js";
 import {
@@ -658,8 +666,11 @@ export class LocalAgentSessionManager {
       }
     }
 
-    const availability = checkLocalAgentProviderAvailability(profile.provider, providerEnvironment);
-    const codexRuntime = profile.provider === "codex" && availability.available
+    const codegIdentity = codegExecutionIdentity(profile.provider, providerEnvironment);
+    const availability = codegIdentity
+      ? { available: true as const, reason: undefined }
+      : checkLocalAgentProviderAvailability(profile.provider, providerEnvironment);
+    const codexRuntime = !codegIdentity && profile.provider === "codex" && availability.available
       ? inspectCodexRuntime({ env: providerEnvironment })
       : undefined;
     if (!availability.available || (codexRuntime && !codexRuntime.ready)) {
@@ -671,7 +682,7 @@ export class LocalAgentSessionManager {
       );
     }
 
-    if (profile.provider === "opencode") {
+    if (profile.provider === "opencode" && !codegIdentity) {
       const modelValidation = validateOpencodeModelAndVariant(
         profile.model,
         profile.effort,
@@ -831,7 +842,9 @@ export class LocalAgentSessionManager {
 
     if (
       record.providerContinuityState === "LOST" ||
-      (record.provider === "agy" && !record.providerSessionId)
+      (record.provider === "agy" &&
+        !record.providerSessionId &&
+        !isCodegProviderEnabled(record.provider, process.env))
     ) {
       throw new AgentSessionError(
         "REBIND_REQUIRED",
@@ -1231,15 +1244,18 @@ export class LocalAgentSessionManager {
     let runtimeVersion: string | undefined;
     let executionIdentity = "none";
     if (profile) {
-      const availability = checkLocalAgentProviderAvailability(profile.provider, providerEnvironment);
+      const codegIdentity = codegExecutionIdentity(profile.provider, providerEnvironment);
+      const availability = codegIdentity
+        ? { available: true as const, reason: undefined }
+        : checkLocalAgentProviderAvailability(profile.provider, providerEnvironment);
       const codexRuntime: CodexRuntimeIdentity | undefined =
-        profile.provider === "codex" && availability.available
+        !codegIdentity && profile.provider === "codex" && availability.available
           ? inspectCodexRuntime({ env: providerEnvironment })
           : undefined;
       providerConfigured = availability.available;
       runtimeReady = availability.available && (codexRuntime?.ready ?? true);
-      executionIdentity = codexRuntime?.executable ?? profile.provider;
-      runtimeVersion = codexRuntime?.binaryVersion ?? getLocalAgentProviderRuntimeVersion(
+      executionIdentity = codegIdentity?.identity ?? codexRuntime?.executable ?? profile.provider;
+      runtimeVersion = codegIdentity?.version ?? codexRuntime?.binaryVersion ?? getLocalAgentProviderRuntimeVersion(
         profile.provider,
         providerEnvironment,
       );
@@ -1250,12 +1266,12 @@ export class LocalAgentSessionManager {
             availability.reason ?? codexRuntime?.reason ?? "unknown reason"
           }`,
         });
-      } else if (!codexRuntime) {
+      } else if (!codegIdentity && !codexRuntime) {
         const executable = resolveLocalAgentProviderExecutable(profile.provider, providerEnvironment);
         if (executable) executionIdentity = executable;
       }
 
-      if (runtimeReady && profile.provider === "opencode") {
+      if (runtimeReady && profile.provider === "opencode" && !codegIdentity) {
         const modelValidation = validateOpencodeModelAndVariant(
           profile.model,
           profile.effort,
@@ -1351,13 +1367,34 @@ export class LocalAgentSessionManager {
     );
 
     const timing = computeSessionTiming(record);
+    let providerState = record.providerContinuityState ?? (record.providerSessionId ? "KNOWN_UNVERIFIED" : "UNKNOWN");
+    let providerSessionId = record.providerSessionId;
+    if (isCodegProviderEnabled(record.provider, process.env)) {
+      try {
+        const codeg = await inspectCodegTask(
+          record.provider,
+          record.providerSessionId,
+          record.id,
+          record.workspaceRoot,
+          process.env,
+        );
+        if (codeg) {
+          providerState = `CODEG_${codeg.status.toUpperCase()}`;
+          providerSessionId ??= formatCodegTaskHandle(codeg.taskId);
+        } else {
+          providerState = "CODEG_UNKNOWN";
+        }
+      } catch {
+        providerState = "CODEG_UNKNOWN";
+      }
+    }
 
     return {
       agentId: record.id,
       dispatch: dispatchContractOutput(record.executionContract?.dispatchIntent),
       agentState: record.status,
-      providerState: record.providerContinuityState ?? (record.providerSessionId ? "KNOWN_UNVERIFIED" : "UNKNOWN"),
-      providerSessionId: record.providerSessionId,
+      providerState,
+      providerSessionId,
       terminalReason: record.terminalReason,
       effectEnforcementReceipt: record.lifecycleState?.lastEffectEnforcementReceipt,
       workspace: {
@@ -1560,14 +1597,17 @@ export class LocalAgentSessionManager {
     profileCatalogGeneration: string,
     environment: NodeJS.ProcessEnv,
   ): ExecutionGenerationBinding {
-    const availability = checkLocalAgentProviderAvailability(profile.provider, environment);
+    const codegIdentity = codegExecutionIdentity(profile.provider, environment);
+    const availability = codegIdentity
+      ? { available: true as const, reason: undefined }
+      : checkLocalAgentProviderAvailability(profile.provider, environment);
     if (!availability.available) {
       throw new AgentSessionError(
         "REBIND_REQUIRED",
         `Provider '${profile.provider}' is unavailable while rebinding execution generation: ${availability.reason ?? "unknown reason"}`,
       );
     }
-    const codexRuntime = profile.provider === "codex"
+    const codexRuntime = !codegIdentity && profile.provider === "codex"
       ? inspectCodexRuntime({ env: environment })
       : undefined;
     if (codexRuntime && !codexRuntime.ready) {
@@ -1576,10 +1616,10 @@ export class LocalAgentSessionManager {
         `Codex runtime is unavailable while rebinding execution generation: ${codexRuntime.reason ?? "unknown reason"}`,
       );
     }
-    const executable = codexRuntime?.executable
+    const executable = codegIdentity?.identity ?? codexRuntime?.executable
       ?? resolveLocalAgentProviderExecutable(profile.provider, environment)
       ?? profile.provider;
-    const runtimeVersion = codexRuntime?.binaryVersion
+    const runtimeVersion = codegIdentity?.version ?? codexRuntime?.binaryVersion
       ?? getLocalAgentProviderRuntimeVersion(profile.provider, environment);
     return buildExecutionGenerationBinding({
       profileCatalogGeneration,
@@ -1708,7 +1748,31 @@ export class LocalAgentSessionManager {
       let terminated = false;
       let failureDetail: string | undefined;
       try {
-        terminated = await this.terminator(record);
+        let codegHandle = record.providerSessionId;
+        if (isCodegProviderEnabled(record.provider, process.env) && !codegHandle) {
+          const discovered = await inspectCodegTask(
+            record.provider,
+            undefined,
+            record.id,
+            record.workspaceRoot,
+            process.env,
+          );
+          if (discovered) codegHandle = formatCodegTaskHandle(discovered.taskId);
+        }
+        if (codegHandle && isCodegProviderEnabled(record.provider, process.env)) {
+          const providerStopped = await cancelCodegTask(
+            record.provider,
+            codegHandle,
+            process.env,
+          );
+          if (!providerStopped) {
+            failureDetail = "Codeg task cancellation was not confirmed; local worker termination was not attempted.";
+          } else {
+            terminated = await this.terminator(record);
+          }
+        } else {
+          terminated = await this.terminator(record);
+        }
       } catch (error) {
         failureDetail = error instanceof Error ? error.message : String(error);
       }
@@ -2444,23 +2508,23 @@ async function runLocalAgentProfile(
   const body = profile.body.trim();
   const fullPrompt = body ? `${body}\n\nTask:\n${effectivePrompt}` : effectivePrompt;
   const environment = providerEnvironment(config, record, scratch);
-  return runLocalAgentProvider(
-    profile.provider,
-    {
-      prompt: fullPrompt,
-      workspaceRoot: record.workspaceRoot,
-      providerSessionId: record.providerSessionId,
-      writeMode: profile.write_mode === "allowed" ? "allowed" : "read_only",
-      model: record.model ?? profile.model,
-      effort: record.effort ?? profile.effort,
-      cliProviderId: profile.cliProviderId,
-      selectedToolIntents: record.executionContract?.toolProjectionManifest?.selectedTools,
-      writePaths: record.executionContract?.writePaths,
-      effectProjection: record.executionContract?.effectProjection,
-      environment,
-    },
-    callbacks,
-  );
+  const input = {
+    prompt: fullPrompt,
+    workspaceRoot: record.workspaceRoot,
+    providerSessionId: record.providerSessionId,
+    writeMode: profile.write_mode === "allowed" ? "allowed" as const : "read_only" as const,
+    model: record.model ?? profile.model,
+    effort: record.effort ?? profile.effort,
+    cliProviderId: profile.cliProviderId,
+    selectedToolIntents: record.executionContract?.toolProjectionManifest?.selectedTools,
+    writePaths: record.executionContract?.writePaths,
+    effectProjection: record.executionContract?.effectProjection,
+    environment,
+  };
+  if (isCodegProviderEnabled(profile.provider, environment)) {
+    return runCodegLocalAgent(record.id, profile.provider, input, callbacks, environment);
+  }
+  return runLocalAgentProvider(profile.provider, input, callbacks);
 }
 
 async function runRawLocalAgentProvider(
