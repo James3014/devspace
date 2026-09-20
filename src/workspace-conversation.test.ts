@@ -26,6 +26,39 @@ test("a conversation reuses its checkout context", async (t) => {
   assert.deepEqual(second.workspace.agentProfiles, first.workspace.agentProfiles);
 });
 
+test("warm reuse avoids a global instruction walk while lazy ancestor checks preserve nested authority", async (t) => {
+  const { project, registry } = await fixture(t);
+  const first = await registry.openWorkspace(project, { conversationScopeId: "chat-1" });
+  const nestedDir = join(project, "packages", "new-area");
+  const nestedInstruction = join(nestedDir, "AGENTS.md");
+  const nestedFile = join(nestedDir, "index.ts");
+
+  await mkdir(nestedDir, { recursive: true });
+  await writeFile(nestedInstruction, "nested instructions\n");
+  await writeFile(nestedFile, "export const value = 1;\n");
+
+  const warm = await registry.openWorkspace(project, { conversationScopeId: "chat-1" });
+  assert.equal(warm.workspace.id, first.workspace.id);
+  assert.equal(
+    warm.availableAgentsFiles.some((file) => file.path === nestedInstruction),
+    false,
+    "warm reuse must not rediscover the whole workspace",
+  );
+
+  const blocked = registry.resolveReadPath(warm.workspace, "packages/new-area/index.ts");
+  assert.deepEqual(
+    blocked.nestedInstructionRebindRequired?.instructionPaths,
+    [await realpath(nestedInstruction)],
+  );
+
+  const instructionRead = registry.resolveReadPath(warm.workspace, "packages/new-area/AGENTS.md");
+  assert.equal(instructionRead.nestedInstructionRebindRequired, undefined);
+  registry.markReadPathLoaded(warm.workspace, instructionRead);
+
+  const allowed = registry.resolveReadPath(warm.workspace, "packages/new-area/index.ts");
+  assert.equal(allowed.nestedInstructionRebindRequired, undefined);
+});
+
 test("different conversations receive separate checkout workspaces", async (t) => {
   const { project, registry } = await fixture(t);
 
@@ -149,6 +182,40 @@ test("checkout reuse survives a registry restart", async (t) => {
   });
 
   assert.equal(restored.workspace.id, first.workspace.id);
+});
+
+test("registry restart keeps warm reuse lazy and re-establishes nested instruction authority on demand", async (t) => {
+  const context = await fixture(t);
+  const first = await context.registry.openWorkspace(context.project, {
+    conversationScopeId: "chat-1",
+  });
+  context.closeStore(context.store);
+
+  const nestedDir = join(context.project, "packages", "after-restart");
+  const nestedInstruction = join(nestedDir, "AGENTS.md");
+  await mkdir(nestedDir, { recursive: true });
+  await writeFile(nestedInstruction, "restart instructions\n");
+  await writeFile(join(nestedDir, "index.ts"), "export const value = 1;\n");
+
+  const restoredStore = context.openStore();
+  const restoredRegistry = new WorkspaceRegistry(context.config, restoredStore);
+  const restored = await restoredRegistry.openWorkspace(context.project, {
+    conversationScopeId: "chat-1",
+  });
+
+  assert.equal(restored.workspace.id, first.workspace.id);
+  assert.equal(
+    restored.availableAgentsFiles.some((file) => file.path === nestedInstruction),
+    false,
+    "restored warm reuse must not rebuild nested instruction inventory with a global walk",
+  );
+  assert.deepEqual(
+    restoredRegistry.resolveReadPath(
+      restored.workspace,
+      "packages/after-restart/index.ts",
+    ).nestedInstructionRebindRequired?.instructionPaths,
+    [await realpath(nestedInstruction)],
+  );
 });
 
 test("a failed first context load does not consume bootstrap", async (t) => {
