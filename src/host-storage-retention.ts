@@ -535,6 +535,30 @@ async function inspectManagedClones(input: HostStorageRetentionInput): Promise<H
   const managedRoots = new Set<string>();
   const recordedPaths = new Set<string>();
   const artifacts: HostStorageArtifact[] = [];
+  const workspaceReferencePaths = new Set(
+    await Promise.all(input.workspaceSessions.map((session) => canonicalPath(session.root))),
+  );
+  const agentReferencePaths = new Set(
+    await Promise.all(
+      input.agentRecords
+        .filter(
+          (record) =>
+            record.status === "starting" ||
+            record.status === "running" ||
+            record.status === "idle" ||
+            agentLifecycleRequiresReconciliation(record),
+        )
+        .map((record) => canonicalPath(record.workspaceRoot)),
+    ),
+  );
+  const unresolvedOperationsByPath = new Map<string, DurableOperationRecord>();
+  for (const operation of input.durableOperations) {
+    if (operation.status !== "started" && operation.status !== "outcome_unknown") continue;
+    const canonicalScopeRoot = await canonicalPath(operation.scopeRoot);
+    if (!unresolvedOperationsByPath.has(canonicalScopeRoot)) {
+      unresolvedOperationsByPath.set(canonicalScopeRoot, operation);
+    }
+  }
 
   for (const operation of cloneOperations) {
     const destination = typeof operation.request.destination === "string"
@@ -590,15 +614,12 @@ async function inspectManagedClones(input: HostStorageRetentionInput): Promise<H
       continue;
     }
 
-    if (await cloneHasWorkspaceReference(canonicalDestination, input)) {
+    if (workspaceReferencePaths.has(canonicalDestination) || agentReferencePaths.has(canonicalDestination)) {
       artifacts.push({ ...base, lifecycle: "PINNED", reason: "managed clone is referenced by a durable workspace/session or active agent" });
       continue;
     }
 
-    const unresolvedCloneOperation = await unresolvedDurableOperationForPath(
-      canonicalDestination,
-      input.durableOperations,
-    );
+    const unresolvedCloneOperation = unresolvedOperationsByPath.get(canonicalDestination);
     if (unresolvedCloneOperation) {
       artifacts.push({
         ...base,
@@ -734,33 +755,6 @@ function agentLifecycleRequiresReconciliation(record: LocalAgentRecord): boolean
     record.terminalReason === "unknown" ||
     record.scopeState === "UNKNOWN",
   );
-}
-
-async function cloneHasWorkspaceReference(
-  clonePath: string,
-  input: HostStorageRetentionInput,
-): Promise<boolean> {
-  for (const session of input.workspaceSessions) {
-    if (await samePhysicalPath(session.root, clonePath)) return true;
-  }
-  for (const record of input.agentRecords) {
-    if (
-      (record.status === "starting" || record.status === "running" || record.status === "idle" || agentLifecycleRequiresReconciliation(record)) &&
-      await samePhysicalPath(record.workspaceRoot, clonePath)
-    ) return true;
-  }
-  return false;
-}
-
-async function unresolvedDurableOperationForPath(
-  path: string,
-  operations: DurableOperationRecord[],
-): Promise<DurableOperationRecord | undefined> {
-  for (const operation of operations) {
-    if (operation.status !== "started" && operation.status !== "outcome_unknown") continue;
-    if (await samePhysicalPath(operation.scopeRoot, path)) return operation;
-  }
-  return undefined;
 }
 
 async function inspectManagedClone(
@@ -1235,6 +1229,13 @@ async function inspectGitWorktree(
   sourceRoot: string,
 ): Promise<{ state: "known"; dirty: boolean; head: string } | { state: "unknown"; reason: string }> {
   try {
+    const worktreeStats = await lstat(worktreePath).catch(() => undefined);
+    if (!worktreeStats) {
+      return { state: "unknown", reason: "managed worktree path does not exist" };
+    }
+    if (worktreeStats.isSymbolicLink() || !worktreeStats.isDirectory()) {
+      return { state: "unknown", reason: "managed worktree path is not a real directory" };
+    }
     const statusResult = await execFileAsync("git", ["-C", worktreePath, "status", "--porcelain=v1"], {
       encoding: "utf8",
       timeout: 10_000,
