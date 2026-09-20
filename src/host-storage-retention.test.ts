@@ -308,6 +308,18 @@ test("canonical containment rejects a managed-worktree symlink that resolves out
   assert.equal(artifact(plan, "workspace:ws_escape").lifecycle, "FOREIGN");
 });
 
+test("missing managed worktree fails closed without requiring Git state", async () => {
+  const f = fixture();
+  const missing = join(f.worktreeRoot, "missing");
+  const plan = await buildHostStoragePlan(input(f, {
+    workspaceSessions: [session(f, "ws_missing", missing)],
+  }));
+  const target = artifact(plan, "workspace:ws_missing");
+  assert.equal(target.lifecycle, "UNKNOWN");
+  assert.match(target.reason, /path does not exist/);
+  assert.equal(target.sizeBytes, 0);
+});
+
 test("checkout physical root stays foreign while old unreferenced DevSpace session metadata can be collected", async () => {
   const f = fixture();
   const checkout = checkoutSession(f);
@@ -335,23 +347,31 @@ test("receipt-owned hidden DevSpace clones can be collected while changed or unt
   const f = fixture();
   const cloneA = join(f.cloneRoot, "clones", "old-clean");
   const cloneChanged = join(f.cloneRoot, "clones", "changed");
+  const cloneReferenced = join(f.cloneRoot, "clones", "referenced");
   const untracked = join(f.cloneRoot, "audits", "legacy");
-  for (const path of [cloneA, cloneChanged, untracked]) {
+  for (const path of [cloneA, cloneChanged, cloneReferenced, untracked]) {
     mkdirSync(join(path, ".."), { recursive: true });
     execFileSync("git", ["clone", "--quiet", f.source, path]);
   }
   const head = git(cloneA, "rev-parse", "HEAD");
   writeFileSync(join(cloneChanged, "change.txt"), "changed\n");
 
+  const referencedSession: WorkspaceSession = {
+    ...checkoutSession(f, "ws_clone_reference"),
+    root: cloneReferenced,
+  };
   const args = input(f, {
+    workspaceSessions: [referencedSession],
     durableOperations: [
       cloneOperation(f, cloneA, head, "succeeded", "op_clean"),
       cloneOperation(f, cloneChanged, head, "succeeded", "op_changed"),
+      cloneOperation(f, cloneReferenced, head, "succeeded", "op_referenced"),
     ],
   });
   const plan = await buildHostStoragePlan(args);
   assert.equal(artifact(plan, "managed-clone:op_clean").lifecycle, "GC_ELIGIBLE");
   assert.equal(artifact(plan, "managed-clone:op_changed").lifecycle, "TERMINAL_BUT_RETAINED");
+  assert.equal(artifact(plan, "managed-clone:op_referenced").lifecycle, "PINNED");
   const legacy = plan.artifacts.find((entry) => entry.path === realpathSync(untracked));
   assert.ok(legacy);
   assert.equal(legacy.lifecycle, "UNKNOWN");
