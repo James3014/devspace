@@ -310,7 +310,7 @@ test("canonical containment rejects a managed-worktree symlink that resolves out
 
 test("missing managed worktree fails closed without requiring Git state", async () => {
   const f = fixture();
-  const missing = join(f.worktreeRoot, "missing");
+  const missing = join(realpathSync(f.worktreeRoot), "missing");
   const plan = await buildHostStoragePlan(input(f, {
     workspaceSessions: [session(f, "ws_missing", missing)],
   }));
