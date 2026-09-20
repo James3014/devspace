@@ -9,6 +9,15 @@ import {
   type DeploymentIdentitySnapshot,
 } from "./deployment-convergence.js";
 
+const REQUIRED_RUNTIME_CAPABILITIES = [
+  "agent_start.tool",
+  "agent_start.executionContract.authorityMode",
+  "agent_start.executionContract.authorizedToolCeiling",
+  "agent_start.executionContract.toolProjectionManifest",
+  "agent_start.executionContract.idleTimeoutMs",
+  "agent_start.executionContract.nexusGrant",
+] as const;
+
 function baseSnapshot(): DeploymentIdentitySnapshot {
   return {
     remoteMain: { commit: "aabd562" },
@@ -17,24 +26,14 @@ function baseSnapshot(): DeploymentIdentitySnapshot {
       commit: "aabd562",
       buildId: "devspace-1.0.7-aabd562",
       manifestSha256: "hash-aabd",
-      capabilities: [
-        "agent_start.tool",
-        "agent_start.executionContract.authorityMode",
-        "agent_start.executionContract.idleTimeoutMs",
-        "agent_start.executionContract.nexusGrant",
-      ],
+      capabilities: [...REQUIRED_RUNTIME_CAPABILITIES],
     },
     runningBuild: {
       commit: "aabd562",
       buildId: "devspace-1.0.7-aabd562",
       serverInstanceId: "inst-1",
       manifestSha256: "hash-aabd",
-      capabilities: [
-        "agent_start.tool",
-        "agent_start.executionContract.authorityMode",
-        "agent_start.executionContract.idleTimeoutMs",
-        "agent_start.executionContract.nexusGrant",
-      ],
+      capabilities: [...REQUIRED_RUNTIME_CAPABILITIES],
       cutoverMode: "normal",
       reconciliationRequired: false,
     },
@@ -52,6 +51,22 @@ test("State: CONVERGED when all 5 identities match and required capabilities are
   assert.equal(evaluation.reconciliationRequired, false);
   assert.equal(evaluation.activeDrift, false);
   assert.equal(evaluation.missingCapabilities.length, 0);
+});
+
+test("State: identities do not converge when tool projection admission capabilities are absent", () => {
+  const snapshot = baseSnapshot();
+  snapshot.runningBuild.capabilities = snapshot.runningBuild.capabilities?.filter(
+    (capability) => capability !== "agent_start.executionContract.authorizedToolCeiling"
+      && capability !== "agent_start.executionContract.toolProjectionManifest",
+  );
+
+  const evaluation = evaluateDeploymentConvergence(snapshot);
+  assert.equal(evaluation.state, "CONVERGED");
+  assert.equal(evaluation.converged, false);
+  assert.deepEqual(evaluation.missingCapabilities, [
+    "agent_start.executionContract.authorizedToolCeiling",
+    "agent_start.executionContract.toolProjectionManifest",
+  ]);
 });
 
 test("State: RECONCILIATION_REQUIRED when runtime requires reconciliation or is draining", () => {
@@ -307,12 +322,7 @@ test("MultiRoleConvergence: aggregates convergence status across service roles",
         buildId: "build-1",
         serverInstanceId: "inst-1",
         manifestSha256: "hash-1",
-        capabilities: [
-          "agent_start.tool",
-          "agent_start.executionContract.authorityMode",
-          "agent_start.executionContract.idleTimeoutMs",
-          "agent_start.executionContract.nexusGrant",
-        ],
+        capabilities: [...REQUIRED_RUNTIME_CAPABILITIES],
         cutoverMode: "normal",
         reconciliationRequired: false,
       },
@@ -327,12 +337,7 @@ test("MultiRoleConvergence: aggregates convergence status across service roles",
         buildId: "build-1",
         serverInstanceId: "inst-2",
         manifestSha256: "hash-1",
-        capabilities: [
-          "agent_start.tool",
-          "agent_start.executionContract.authorityMode",
-          "agent_start.executionContract.idleTimeoutMs",
-          "agent_start.executionContract.nexusGrant",
-        ],
+        capabilities: [...REQUIRED_RUNTIME_CAPABILITIES],
         cutoverMode: "normal",
         reconciliationRequired: false,
       },
@@ -357,12 +362,7 @@ test("MultiRoleConvergence: rejects competing authoritative production roles", (
       buildId: "build-1",
       serverInstanceId: name,
       manifestSha256: "hash-1",
-      capabilities: [
-        "agent_start.tool",
-        "agent_start.executionContract.authorityMode",
-        "agent_start.executionContract.idleTimeoutMs",
-        "agent_start.executionContract.nexusGrant",
-      ],
+      capabilities: [...REQUIRED_RUNTIME_CAPABILITIES],
       cutoverMode: "normal",
       reconciliationRequired: false,
     },
@@ -383,12 +383,7 @@ test("MultiRoleConvergence: missing role kind never guesses from connector names
       buildId: "build-1",
       serverInstanceId: "dev-c",
       manifestSha256: "hash-1",
-      capabilities: [
-        "agent_start.tool",
-        "agent_start.executionContract.authorityMode",
-        "agent_start.executionContract.idleTimeoutMs",
-        "agent_start.executionContract.nexusGrant",
-      ],
+      capabilities: [...REQUIRED_RUNTIME_CAPABILITIES],
       cutoverMode: "normal",
       reconciliationRequired: false,
     },

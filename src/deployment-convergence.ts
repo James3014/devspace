@@ -114,6 +114,8 @@ export class DeploymentConvergenceError extends Error {
 const DEFAULT_REQUIRED_CAPABILITIES = [
   "agent_start.tool",
   "agent_start.executionContract.authorityMode",
+  "agent_start.executionContract.authorizedToolCeiling",
+  "agent_start.executionContract.toolProjectionManifest",
   "agent_start.executionContract.idleTimeoutMs",
   "agent_start.executionContract.nexusGrant",
 ];

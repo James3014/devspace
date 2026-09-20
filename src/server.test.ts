@@ -3369,9 +3369,45 @@ test("agent_start schema preserves #28 heartbeat and G9/G10 authority capabiliti
     ?? contract.properties;
   assert.ok(contractProps.authorityMode);
   assert.ok(contractProps.nexusGrant);
+  assert.ok(contractProps.authorizedToolCeiling, "agent_start must expose the durable authorized tool ceiling");
+  assert.ok(contractProps.toolProjectionManifest, "agent_start must expose the derived tool projection manifest");
   assert.ok(contractProps.coreMutation, "write-capable agent_start must expose the exact durable Core pointer");
   assert.ok(contractProps.idleTimeoutMs);
   assert.match(contractProps.idleTimeoutMs.description, /terminated.*no provider activity/i);
+});
+
+test("agent_start preserves tool projection authority through MCP admission", async (t) => {
+  const context = await fixture(t, { subagents: true });
+  const workspaceId = structuredContent(
+    await callOpen(context.client, context.project, "tool-projection-admission"),
+  ).workspaceId as string;
+
+  const result = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      provider: "codex",
+      model: "schema-canary",
+      prompt: "must fail in execution contract validation",
+      executionContract: {
+        authorityMode: "OWNER_DIRECT",
+        authorizedToolCeiling: ["workspace.read"],
+        toolProjectionManifest: {
+          schema: "devspace.tool_projection_manifest.v1",
+          namespace: "devspace.tool_intent.v1",
+          identity: { taskId: "tool-projection-admission", attemptId: "attempt-1" },
+          authority: { mode: "NEXUS_GOVERNED", issuer: "nexus" },
+          authorizedToolCeiling: ["workspace.read"],
+          candidateTools: ["workspace.read"],
+          selectedTools: ["workspace.read"],
+          orderingMode: "ORDER_INDEPENDENT",
+        },
+      },
+    },
+  });
+
+  assert.equal(result.isError, true);
+  assert.match(responseText(result), /toolProjectionManifest authority must match executionContract authorityMode/);
 });
 
 test("direct agent selectors reject disabled providers before preflight", async (t) => {

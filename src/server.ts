@@ -196,6 +196,10 @@ import {
 } from "./local-agent-sessions.js";
 import { parseExecutionContract, type ExecutionContract } from "./local-agent-contract.js";
 import {
+  TOOL_INTENT_NAMESPACE,
+  TOOL_PROJECTION_MANIFEST_SCHEMA,
+} from "./execution-protocol.js";
+import {
   CAPABILITY_DISCOVERY_INDEX_PATH,
   CAPABILITY_DISCOVERY_RECEIPT_SCHEMA,
   NEXUS_CAPABILITY_REPOSITORY,
@@ -2498,12 +2502,43 @@ function createAgentStartInputSchema() {
     }).strict(),
     newCapabilityJustification: z.string().min(1).optional(),
   }).strict();
+  const toolIntentId = z.enum([
+    "workspace.read",
+    "workspace.search_text",
+    "workspace.search_paths",
+    "workspace.list",
+    "workspace.mutate",
+    "process.execute",
+  ]);
+  const toolProjectionManifest = z.object({
+    schema: z.literal(TOOL_PROJECTION_MANIFEST_SCHEMA),
+    namespace: z.literal(TOOL_INTENT_NAMESPACE),
+    identity: z.object({
+      taskId: z.string().min(1),
+      attemptId: z.string().min(1),
+    }).strict(),
+    authority: z.object({
+      mode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]),
+      issuer: z.enum(["owner", "nexus"]),
+    }).strict(),
+    authorizedToolCeiling: z.array(toolIntentId),
+    candidateTools: z.array(toolIntentId),
+    selectedTools: z.array(toolIntentId),
+    orderingMode: z.enum(["ORDER_INDEPENDENT", "ORDER_SENSITIVE"]),
+    candidateOrder: z.array(toolIntentId).optional(),
+  }).strict();
   const executionContract = z.object({
     authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).optional().describe(
       "Execution authority lane. OWNER_DIRECT is the backwards-compatible default. NEXUS_GOVERNED requires canonical Nexus authority evidence and never falls back to direct authority.",
     ),
     nexusGrant: nexusGrant.optional().describe(
       "Immutable pointer to a canonical Nexus execution grant and its governing Task Card. Dev MCP independently verifies current Nexus main and tracked bytes before worker launch.",
+    ),
+    authorizedToolCeiling: z.array(toolIntentId).describe(
+      "Exact already-authorized canonical tool ceiling persisted in ExecutionContract. OWNER_DIRECT supplies it at trusted owner admission; NEXUS_GOVERNED supplies it from bound Nexus authority. DevSpace never infers it from provider catalogs or defaults.",
+    ),
+    toolProjectionManifest: toolProjectionManifest.describe(
+      "Derived tool projection evidence. selectedTools must remain within candidateTools and the persisted authorizedToolCeiling; this manifest never creates or widens tool authority.",
     ),
     dispatchIntent: dispatchIntent.describe(
       "Controller-authored bounded task semantics. Dev MCP transports and mechanically enforces applicable scope/ownership constraints but does not gain planner, verifier, acceptance, merge, or release authority.",

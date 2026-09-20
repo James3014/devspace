@@ -29,6 +29,16 @@ const REQUIRED_CAPABILITIES = [
     fieldPath: "executionContract.authorityMode",
   },
   {
+    id: "agent_start.executionContract.authorizedToolCeiling",
+    tool: "agent_start",
+    fieldPath: "executionContract.authorizedToolCeiling",
+  },
+  {
+    id: "agent_start.executionContract.toolProjectionManifest",
+    tool: "agent_start",
+    fieldPath: "executionContract.toolProjectionManifest",
+  },
+  {
     id: "agent_start.executionContract.idleTimeoutMs",
     tool: "agent_start",
     fieldPath: "executionContract.idleTimeoutMs",
