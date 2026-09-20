@@ -1173,6 +1173,7 @@ function runCutoverAbortExpiredPrepared(args: string[]): void {
   let version: number | undefined;
   let validityVersion: number | undefined;
   let confirmCutoverId: string | undefined;
+  let packageRoot: string | undefined;
   let json = false;
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index];
@@ -1187,6 +1188,7 @@ function runCutoverAbortExpiredPrepared(args: string[]): void {
     else if (argument === "--version") version = Number(value());
     else if (argument === "--validity-version") validityVersion = Number(value());
     else if (argument === "--confirm") confirmCutoverId = value();
+    else if (argument === "--package-root") packageRoot = resolve(value());
     else throw new Error(`Unknown cutover abort-expired-prepared flag: ${argument}`);
   }
   if (!cutoverId || !carrierId || !Number.isSafeInteger(version) || !Number.isSafeInteger(validityVersion) || (version ?? 0) < 1 || (validityVersion ?? 0) < 1 || !confirmCutoverId) {
@@ -1235,7 +1237,7 @@ async function runCutoverCapabilityMismatchRecovery(args: string[]): Promise<voi
     else throw new Error(`Unknown cutover recover-capability-mismatch flag: ${argument}`);
   }
   if (!cutoverId || !carrierId || !Number.isSafeInteger(version) || !Number.isSafeInteger(validityVersion) || (version ?? 0) < 1 || (validityVersion ?? 0) < 1 || !confirmCutoverId) {
-    throw new Error("Usage: devspace cutover recover-capability-mismatch --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--json]");
+    throw new Error("Usage: devspace cutover recover-capability-mismatch --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--package-root <path>] [--json]");
   }
   const config = loadConfig();
   if (!["127.0.0.1", "localhost", "::1"].includes(config.host)) {
@@ -1268,7 +1270,8 @@ async function runCutoverCapabilityMismatchRecovery(args: string[]): Promise<voi
   if (!activeCutover || activeCutover.cutoverId !== cutoverId) {
     throw new Error("Capability expectation recovery requires the exact active cutover.");
   }
-  const targetPackage = probeTargetPackage(runningPackageRoot());
+  const targetPackageRoot = packageRoot ?? config.mcpCutoverBuildReadyRoot ?? process.env.DEVSPACE_PACKAGE_ROOT ?? runningPackageRoot();
+  const targetPackage = probeTargetPackage(targetPackageRoot);
   if (targetPackage.sourceCommit !== sourceCommit || targetPackage.buildId !== buildId) {
     throw new Error("Running package identity does not match the live replacement source/build; refusing recovery.");
   }
