@@ -914,9 +914,9 @@ export class CutoverStateStore {
 
   /**
    * Terminally close one coordination-bound drained cutover after a verified replacement
-   * loaded the exact expected source/build but a different capability manifest because the
-   * target expectation reused the predecessor capability digest. This records a failed
-   * deployment attempt only; it never accepts the replacement or rewrites the expected target.
+   * loaded the exact expected source/build but a different capability manifest. This records
+   * a failed deployment attempt only; it never accepts the replacement or rewrites the
+   * expected target. Digest-domain mistakes remain owned by the binding-repair path.
    */
   recoverCapabilityExpectationMismatch(input: {
     cutoverId: string;
@@ -952,11 +952,9 @@ export class CutoverStateStore {
       throw new CutoverStateError("Capability expectation recovery requires the exact expected source/build.");
     }
     const expectedCapability = active.expectedNewIdentity.capabilityManifestSha256;
-    const oldCapability = active.oldServerIdentity.capabilityManifestSha256;
     const observedCapability = input.observedIdentity.capabilityManifestSha256;
-    if (!expectedCapability || !oldCapability || !observedCapability ||
-        expectedCapability !== oldCapability || observedCapability === expectedCapability) {
-      throw new CutoverStateError("Capability expectation recovery only handles a predecessor capability digest reused as the target expectation.");
+    if (!expectedCapability || !observedCapability || observedCapability === expectedCapability) {
+      throw new CutoverStateError("Capability expectation recovery requires a replacement capability manifest that differs from the bound expected capability.");
     }
     if (active.restartRequest.requestedByServerInstanceId !== active.oldServerIdentity.serverInstanceId ||
         active.restartRequest.restartScheduledForServerInstanceId !== active.oldServerIdentity.serverInstanceId) {
@@ -1317,9 +1315,7 @@ function parseRecord(raw: string): DurableCutoverRecord {
       receipt.observedIdentity.sourceCommit !== record.expectedNewIdentity.sourceCommit ||
       receipt.observedIdentity.buildId !== record.expectedNewIdentity.buildId ||
       !record.expectedNewIdentity.capabilityManifestSha256 ||
-      !record.oldServerIdentity.capabilityManifestSha256 ||
       !receipt.observedIdentity.capabilityManifestSha256 ||
-      record.expectedNewIdentity.capabilityManifestSha256 !== record.oldServerIdentity.capabilityManifestSha256 ||
       receipt.observedIdentity.capabilityManifestSha256 === record.expectedNewIdentity.capabilityManifestSha256 ||
       record.restartRequest.requestedByServerInstanceId !== record.oldServerIdentity.serverInstanceId ||
       record.restartRequest.restartScheduledForServerInstanceId !== record.oldServerIdentity.serverInstanceId ||

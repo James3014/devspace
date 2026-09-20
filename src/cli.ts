@@ -79,6 +79,7 @@ import {
 import { CutoverStateStore } from "./cutover-state.js";
 import {
   CutoverCapabilityManifestDomainMismatchError,
+  assertNoDigestDomainMismatch,
   probeBuildReady,
   probeTargetPackage,
 } from "./cutover-build-ready.js";
@@ -1263,6 +1264,16 @@ async function runCutoverCapabilityMismatchRecovery(args: string[]): Promise<voi
   ) {
     throw new Error("Live /healthz identity or capability manifest is malformed; refusing recovery.");
   }
+  const activeCutover = new CutoverStateStore(config.stateDir).get();
+  if (!activeCutover || activeCutover.cutoverId !== cutoverId) {
+    throw new Error("Capability expectation recovery requires the exact active cutover.");
+  }
+  const targetPackage = probeTargetPackage(runningPackageRoot());
+  if (targetPackage.sourceCommit !== sourceCommit || targetPackage.buildId !== buildId) {
+    throw new Error("Running package identity does not match the live replacement source/build; refusing recovery.");
+  }
+  assertNoDigestDomainMismatch(activeCutover.expectedNewIdentity, targetPackage);
+
   const bindings = new CarrierBindingStore(config.stateDir);
   try {
     const result = bindings.recoverCapabilityExpectationMismatchLocal({

@@ -520,9 +520,9 @@ export class CarrierBindingStore {
   /**
    * Host-local terminal recovery for one coordination-bound DRAINED cutover whose
    * replacement loaded the exact expected source/build but a different capability
-   * manifest because the target expectation reused the predecessor capability digest.
-   * This records a failed attempt, reconciles the original pin, and releases the lease.
-   * It never accepts the replacement, changes the expected target, or schedules restart.
+   * manifest. This records a failed attempt, reconciles the original pin, and releases
+   * the lease. It never accepts the replacement, changes the expected target, or
+   * schedules restart. Digest-domain mistakes remain owned by binding repair.
    */
   recoverCapabilityExpectationMismatchLocal(input: {
     cutoverId: string;
@@ -548,11 +548,9 @@ export class CarrierBindingStore {
        input.observedIdentity.sourceCommit!==approved.expectedIdentity.sourceCommit ||
        input.observedIdentity.buildId!==approved.expectedIdentity.buildId ||
        !input.observedIdentity.capabilityManifestSha256 ||
-       !approved.currentIdentity.capabilityManifestSha256 ||
        !approved.expectedIdentity.capabilityManifestSha256 ||
-       approved.expectedIdentity.capabilityManifestSha256!==approved.currentIdentity.capabilityManifestSha256 ||
        input.observedIdentity.capabilityManifestSha256===approved.expectedIdentity.capabilityManifestSha256) {
-      deny("Capability expectation recovery requires an exact replacement source/build with predecessor capability digest reused as target expectation");
+      deny("Capability expectation recovery requires an exact replacement source/build whose observed capability differs from the bound expected capability");
     }
     if(before.restartRequest.requestedByServerInstanceId!==approved.currentIdentity.serverInstanceId ||
        before.restartRequest.restartScheduledForServerInstanceId!==approved.currentIdentity.serverInstanceId) deny("Capability expectation recovery restart lineage changed");
@@ -621,7 +619,7 @@ export class CarrierBindingStore {
       if(current.receipt?.lifecycleTerminal===true) {
         if(current.receipt?.terminalRecordHash!==terminalHash || current.receipt?.recoveryKind!=="capability_expectation_mismatch" || !isDeepStrictEqual(current.receipt?.failedLeaseRecovery,reconciliation)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Capability expectation recovery terminal receipt changed");
       } else {
-        operations.finish(correlation.operationHandle,{status:"failed",retrySafe:false,receipt:{...current.receipt,lifecycleTerminal:true,terminalRecordHash:terminalHash,recoveryKind:"capability_expectation_mismatch",failedLeaseRecovery:reconciliation},errorCode:"CAPABILITY_EXPECTATION_MISMATCH",errorMessage:"Replacement source/build loaded, but the bound target capability manifest reused the predecessor digest."});
+        operations.finish(correlation.operationHandle,{status:"failed",retrySafe:false,receipt:{...current.receipt,lifecycleTerminal:true,terminalRecordHash:terminalHash,recoveryKind:"capability_expectation_mismatch",failedLeaseRecovery:reconciliation},errorCode:"CAPABILITY_EXPECTATION_MISMATCH",errorMessage:"Replacement source/build loaded, but the observed capability manifest differed from the bound expected capability."});
       }
 
       lease=localOwnership.get(correlation.leaseId)!;

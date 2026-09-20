@@ -385,7 +385,7 @@ test("host-local capability expectation mismatch recovery closes the failed cuto
   } finally {manager?.close();f.close();}
 });
 
-test("host-local capability expectation mismatch recovery refuses a target digest that was not copied from the predecessor",async()=>{
+test("host-local capability expectation mismatch recovery closes a stale expected capability that differs from the predecessor",async()=>{
   const f=fixture();
   const context={clientId:"shared-oauth",sessionId:"capability-mismatch-not-predecessor"};
   let manager:DurableOperationManager|undefined;
@@ -409,9 +409,17 @@ test("host-local capability expectation mismatch recovery refuses a target diges
     const actuator={actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service",schedule:()=>({scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"})};
     await manager.restartCutover(id,cutover.currentIdentity,cutover.restart.buildReady,async()=>({buildReady:true,detail:"different expected capability"}),actuator,context);
     const observed={serverInstanceId:"replacement",sourceCommit:cutover.expectedIdentity.sourceCommit,buildId:cutover.expectedIdentity.buildId,capabilityManifestSha256:"e".repeat(64)};
-    assert.throws(()=>f.store.recoverCapabilityExpectationMismatchLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:id,observedIdentity:observed}),/predecessor capability digest reused/i);
-    assert.equal(new CutoverStateStore(f.root).get()?.phase,"drained");
-    assert.equal(f.store.ownership.get(lease.leaseId)?.operationHandle,start.operationId);
+    const recovered=f.store.recoverCapabilityExpectationMismatchLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:id,observedIdentity:observed});
+    assert.equal(recovered.replayed,false);
+    assert.equal(recovered.cutover.phase,"closed");
+    assert.equal(recovered.cutover.capabilityExpectationMismatch?.expectedIdentity.capabilityManifestSha256,"d".repeat(64));
+    assert.equal(recovered.cutover.capabilityExpectationMismatch?.observedIdentity.capabilityManifestSha256,"e".repeat(64));
+    assert.equal(recovered.operation.status,"failed");
+    assert.equal(recovered.operation.errorCode,"CAPABILITY_EXPECTATION_MISMATCH");
+    assert.equal(recovered.operation.receipt?.lifecycleTerminal,true);
+    assert.equal(recovered.lease.operationHandle,undefined);
+    assert.equal(recovered.lease.operationState,"finished");
+    assert.ok(recovered.lease.terminalState === "released" || recovered.lease.terminalState === "expired_reconciled");
   } finally {manager?.close();f.close();}
 });
 
