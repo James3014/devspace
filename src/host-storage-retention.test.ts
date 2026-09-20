@@ -313,7 +313,13 @@ test("checkout physical root stays foreign while old unreferenced DevSpace sessi
   const checkout = checkoutSession(f);
   const args = input(f, { workspaceSessions: [checkout] });
   const plan = await buildHostStoragePlan(args);
-  assert.equal(artifact(plan, "workspace:ws_checkout").lifecycle, "FOREIGN");
+  const checkoutArtifact = artifact(plan, "workspace:ws_checkout");
+  assert.equal(checkoutArtifact.lifecycle, "FOREIGN");
+  assert.equal(
+    checkoutArtifact.sizeBytes,
+    0,
+    "user-owned checkout bytes are outside DevSpace GC ownership and must not be recursively scanned",
+  );
   assert.equal(artifact(plan, "workspace-record:ws_checkout").lifecycle, "GC_ELIGIBLE");
 
   let deleted = 0;
