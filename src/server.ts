@@ -3501,7 +3501,7 @@ export function createMcpServer(
         outputSchema: durableOperationOutputSchema,
         _meta: {},
         annotations: {
-          readOnlyHint: true,
+          readOnlyHint: false,
           destructiveHint: false,
           idempotentHint: true,
           openWorldHint: false,
