@@ -209,6 +209,10 @@ test("native tools are opt-in and exactly read-only when enabled", async () => {
       for (const name of REPOSITORY_INTELLIGENCE_TOOL_NAMES) {
         assert.equal(disabledTools.some((tool) => tool.name === name), false);
       }
+      assert.equal(
+        disabledTools.some((tool) => tool.name === "repository_intelligence_artifact"),
+        false,
+      );
     } finally {
       await disabledConnected.close();
     }
@@ -232,6 +236,14 @@ test("native tools are opt-in and exactly read-only when enabled", async () => {
         assert.equal(tool.annotations?.idempotentHint, true);
         assert.equal(tool.annotations?.openWorldHint, false);
       }
+      const artifactTool = tools.find(
+        (candidate) => candidate.name === "repository_intelligence_artifact",
+      );
+      assert.ok(artifactTool, "repository_intelligence_artifact must be registered");
+      assert.equal(artifactTool.annotations?.readOnlyHint, true);
+      assert.equal(artifactTool.annotations?.destructiveHint, false);
+      assert.equal(artifactTool.annotations?.idempotentHint, true);
+      assert.equal(artifactTool.annotations?.openWorldHint, true);
 
       const snapshot = { repository: "owner/repo", pr_number: 7, custom: "preserved" };
       const cases = [
