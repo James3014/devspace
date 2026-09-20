@@ -25,6 +25,7 @@ export type DurableOperationKind =
   | "workspace_clone"
   | "dependency_sync"
   | "nexus_gateway_recover"
+  | "nexus_gateway_recovery_preflight"
   | "cutover_start"
   | "host_operation"
   | "chat_swarm_reconciliation";
@@ -154,6 +155,7 @@ export class DurableOperationError extends Error {
       | "DEPENDENCY_SYNC_FAILED"
       | "FROZEN_INPUT_CHANGED"
       | "NEXUS_GATEWAY_REQUEST_INVALID"
+      | "NEXUS_GATEWAY_PREFLIGHT_FAILED"
       | "NEXUS_GATEWAY_RECOVERY_FAILED"
       | "NEXUS_GATEWAY_RECOVERY_UNCERTAIN"
       | "RECONCILIATION_REQUIRED",
@@ -197,15 +199,24 @@ export class DurableOperationStore {
 
   markInterruptedUnknown(): number {
     const now = new Date().toISOString();
+    const preflight = this.database.sqlite.prepare(`
+      update durable_operations
+      set status = 'outcome_unknown', retry_safe = 'false',
+          error_code = 'RECONCILIATION_REQUIRED',
+          error_message = 'DevSpace restarted while the read-only Gateway preflight was nonterminal; reconcile the same stored request.',
+          updated_at = ?
+      where status = 'started' and kind = 'nexus_gateway_recovery_preflight'
+    `).run(now);
     const result = this.database.sqlite.prepare(`
       update durable_operations
       set status = 'outcome_unknown', retry_safe = 'false',
           error_code = 'RECONCILIATION_REQUIRED',
           error_message = 'DevSpace restarted while the mutating operation was nonterminal; reconcile physical state before any replay.',
           updated_at = ?
-      where status = 'started' and kind not in ('dependency_sync', 'cutover_start')
+      where status = 'started'
+        and kind not in ('dependency_sync', 'cutover_start', 'nexus_gateway_recovery_preflight')
     `).run(now);
-    return result.changes;
+    return result.changes + preflight.changes;
   }
 
   getByOperationId(operationId: string): DurableOperationRecord | undefined {
@@ -807,12 +818,12 @@ export class DurableOperationManager {
     return await this.executeNexusGatewayRecovery(operationId, input.request, false);
   }
 
-  async nexusGatewayRecoveryPreflight(input: NexusGatewayRecoveryInput): Promise<NexusGatewayRecoveryPreflightResult> {
-    assertAttemptKey(input.attemptKey);
-    assertNexusGatewayRecoveryRequest(input.request);
+  private async evaluateNexusGatewayRecoveryPreflight(
+    request: NexusGatewayRecoveryRequest,
+  ): Promise<NexusGatewayRecoveryPreflightResult> {
     let bridge: NexusGatewayRecoveryBridgeResult;
     try {
-      bridge = await this.runNexusGatewayRecoveryPreflight(input.request);
+      bridge = await this.runNexusGatewayRecoveryPreflight(request);
     } catch (error) {
       return {
         status: "error",
@@ -872,6 +883,86 @@ export class DurableOperationManager {
       readiness,
       outcome,
     };
+  }
+
+
+  async nexusGatewayRecoveryPreflight(input: NexusGatewayRecoveryInput): Promise<NexusGatewayRecoveryPreflightResult> {
+    assertAttemptKey(input.attemptKey);
+    assertNexusGatewayRecoveryRequest(input.request);
+    return await this.evaluateNexusGatewayRecoveryPreflight(input.request);
+  }
+
+  async nexusGatewayRecoveryPreflightStart(input: NexusGatewayRecoveryInput): Promise<DurableOperationRecord> {
+    assertAttemptKey(input.attemptKey);
+    assertNexusGatewayRecoveryRequest(input.request);
+    const scopeRoot = NEXUS_GATEWAY_STATE_ROOT;
+    const request = { recoveryRequest: input.request };
+    const requestHash = hashJson(request);
+    const operationId = stableOperationId(
+      "nexus_gateway_recovery_preflight",
+      scopeRoot,
+      input.attemptKey,
+    );
+    const existing = this.store.getByAttempt(scopeRoot, input.attemptKey);
+    if (existing) {
+      if (
+        existing.requestHash !== requestHash
+        || existing.kind !== "nexus_gateway_recovery_preflight"
+      ) {
+        throw new DurableOperationError(
+          "OPERATION_REPLAY_CONFLICT",
+          `attemptKey '${input.attemptKey}' is already bound to a materially different ${existing.kind} request.`,
+          existing,
+        );
+      }
+      return existing;
+    }
+
+    const { record, created } = this.store.createOrReplay({
+      operationId,
+      attemptKey: input.attemptKey,
+      requestHash,
+      kind: "nexus_gateway_recovery_preflight",
+      authorityMode: "NEXUS_GOVERNED",
+      scopeRoot,
+      request,
+    });
+    if (created) {
+      void this.executeNexusGatewayRecoveryPreflight(
+        operationId,
+        input.request,
+        false,
+      ).catch(() => undefined);
+    }
+    return record;
+  }
+
+  private async executeNexusGatewayRecoveryPreflight(
+    operationId: string,
+    request: NexusGatewayRecoveryRequest,
+    reconciled: boolean,
+  ): Promise<DurableOperationRecord> {
+    const preflight = await this.evaluateNexusGatewayRecoveryPreflight(request);
+    const receipt = {
+      reconciled,
+      requestHash: request.request_hash,
+      preflight,
+    };
+    if (preflight.status === "passed") {
+      return this.store.finish(operationId, {
+        status: "succeeded",
+        retrySafe: false,
+        receipt,
+      });
+    }
+    return this.store.finish(operationId, {
+      status: "failed",
+      retrySafe: false,
+      errorCode: "NEXUS_GATEWAY_PREFLIGHT_FAILED",
+      errorMessage: preflight.errorMessage
+        ?? "Nexus Gateway recovery preflight failed closed.",
+      receipt,
+    });
   }
 
   private async executeNexusGatewayRecovery(
@@ -954,6 +1045,16 @@ export class DurableOperationManager {
       return this.reconcileDependencySync(operationId, this.consumer.readReconciliation(consumerContext, subject), consumerContext);
     }
     if (record.status !== "outcome_unknown" && record.status !== "started") return record;
+
+    if (record.kind === "nexus_gateway_recovery_preflight") {
+      const recoveryRequest = record.request.recoveryRequest;
+      assertNexusGatewayRecoveryRequest(recoveryRequest);
+      return await this.executeNexusGatewayRecoveryPreflight(
+        operationId,
+        recoveryRequest,
+        true,
+      );
+    }
 
     if (record.kind === "nexus_gateway_recover") {
       const recoveryRequest = record.request.recoveryRequest;
