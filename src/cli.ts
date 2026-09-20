@@ -856,11 +856,15 @@ async function runCutoverCommand(args: string[]): Promise<void> {
     await runCutoverRestartBound(args.slice(1));
     return;
   }
+  if (subcommand === "release-terminal-lease") {
+    runCutoverReleaseTerminalLease(args.slice(1));
+    return;
+  }
   if (subcommand === "help" || subcommand === "--help" || subcommand === "-h" || subcommand === undefined) {
     printCutoverHelp();
     return;
   }
-  throw new Error("Usage: devspace cutover <status|recover|observe|repair|abort-expired-prepared|restart-bound>");
+  throw new Error("Usage: devspace cutover <status|recover|observe|repair|abort-expired-prepared|recover-capability-mismatch|restart-bound|release-terminal-lease>");
 }
 
 function printCutoverHelp(): void {
@@ -876,6 +880,7 @@ function printCutoverHelp(): void {
       "  devspace cutover abort-expired-prepared --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--json]",
       "  devspace cutover recover-capability-mismatch --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--json]",
       "  devspace cutover restart-bound --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --credential-file <owner-private-intent.json> --package-root <path> --confirm <id> [--json]",
+      "  devspace cutover release-terminal-lease --cutover-id <id> --lease-id <id> --lease-version <n> --carrier <id> --carrier-version <n> --terminal-record-hash <sha256> --confirm <id> [--json]",
       "",
       "The repair subcommand repairs a successor cutover blocked by CROSS_DOMAIN_DIGEST_MISBINDING",
       "where the target build-manifest digest was mistakenly bound as the capability manifest digest.",
@@ -969,6 +974,70 @@ async function runCutoverRestartBound(args: string[]): Promise<void> {
     console.log(`Bound cutover restart ${payload.cutoverId}: phase=${payload.phase}; scheduled=${String(payload.scheduled)}; outcome=${payload.outcome}.`);
   } finally {
     try { unlinkSync(credentialFile); } catch {}
+  }
+}
+
+
+function runCutoverReleaseTerminalLease(args: string[]): void {
+  let cutoverId: string | undefined;
+  let leaseId: string | undefined;
+  let leaseVersion: number | undefined;
+  let carrierId: string | undefined;
+  let carrierVersion: number | undefined;
+  let terminalRecordHash: string | undefined;
+  let confirmCutoverId: string | undefined;
+  let json=false;
+  for(let index=0;index<args.length;index+=1) {
+    const argument=args[index];
+    const value=():string=>{
+      const next=args[++index];
+      if(!next) throw new Error(`${argument} requires a value.`);
+      return next;
+    };
+    if(argument==="--json") json=true;
+    else if(argument==="--cutover-id") cutoverId=value();
+    else if(argument==="--lease-id") leaseId=value();
+    else if(argument==="--lease-version") leaseVersion=Number(value());
+    else if(argument==="--carrier") carrierId=value();
+    else if(argument==="--carrier-version") carrierVersion=Number(value());
+    else if(argument==="--terminal-record-hash") terminalRecordHash=value();
+    else if(argument==="--confirm") confirmCutoverId=value();
+    else throw new Error(`Unknown cutover release-terminal-lease flag: ${argument}`);
+  }
+  const usage="Usage: devspace cutover release-terminal-lease --cutover-id <id> --lease-id <id> --lease-version <n> --carrier <id> --carrier-version <n> --terminal-record-hash <sha256> --confirm <id> [--json]";
+  if(!cutoverId || !leaseId || !carrierId || confirmCutoverId!==cutoverId ||
+     !Number.isSafeInteger(leaseVersion) || (leaseVersion??0)<1 ||
+     !Number.isSafeInteger(carrierVersion) || (carrierVersion??0)<2 ||
+     !terminalRecordHash || !/^[a-f0-9]{64}$/.test(terminalRecordHash)) {
+    throw new Error(usage);
+  }
+  const config=loadConfig();
+  const bindings=new CarrierBindingStore(config.stateDir);
+  try {
+    const result=bindings.releaseClosedCutoverLeaseLocal({
+      cutoverId,
+      leaseId,
+      expectedLeaseVersion:leaseVersion as number,
+      carrierId,
+      expectedCarrierVersion:carrierVersion as number,
+      expectedTerminalRecordHash:terminalRecordHash,
+      confirmCutoverId,
+    });
+    const payload={
+      cutoverId:result.cutover.cutoverId,
+      leaseId:result.lease.leaseId,
+      leaseVersion:result.lease.version,
+      terminalState:result.lease.terminalState,
+      operationState:result.lease.operationState,
+      replayed:result.replayed,
+    };
+    if(json) {
+      printJson(payload);
+      return;
+    }
+    console.log(`Released terminal cutover lease ${payload.leaseId}: version=${payload.leaseVersion}; terminal=${payload.terminalState}; replayed=${String(payload.replayed)}.`);
+  } finally {
+    bindings.close();
   }
 }
 
