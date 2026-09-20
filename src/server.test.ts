@@ -3707,7 +3707,7 @@ test("nexus_gateway_recover exposes only the fixed typed recovery contract", asy
   assert.deepEqual(
     (durablePreflight as unknown as { annotations?: Record<string, unknown> }).annotations,
     {
-      readOnlyHint: true,
+      readOnlyHint: false,
       destructiveHint: false,
       idempotentHint: true,
       openWorldHint: false,
