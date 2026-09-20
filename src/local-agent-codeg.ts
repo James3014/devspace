@@ -438,6 +438,34 @@ type CodegMaterializationOperation =
   | { kind: "copy"; file: string; source: string; target: string; mode: number }
   | { kind: "delete"; file: string; target: string };
 
+function assertNoSymlinkedParent(
+  root: string,
+  target: string,
+  file: string,
+  label: string,
+): void {
+  const rootPath = resolve(root);
+  const targetPath = resolve(target);
+  const rel = relative(rootPath, targetPath);
+  const segments = rel.split(sep).filter(Boolean);
+  let current = rootPath;
+  for (const segment of segments.slice(0, -1)) {
+    current = resolve(current, segment);
+    if (!existsSync(current)) break;
+    const stat = lstatSync(current);
+    if (stat.isSymbolicLink()) {
+      throw new Error(
+        `${label} parent for '${file}' is a symbolic link; refusing materialization.`,
+      );
+    }
+    if (!stat.isDirectory()) {
+      throw new Error(
+        `${label} parent for '${file}' is not a directory; refusing materialization.`,
+      );
+    }
+  }
+}
+
 function codegGitProvesDeletion(
   worktreeRoot: string,
   baseSha: string | null | undefined,
@@ -500,7 +528,12 @@ async function materializeCodegTask(
   }
 
   const localHead = gitText(input.workspaceRoot, ["rev-parse", "HEAD"]);
-  if (task.base_sha && task.base_sha !== localHead) {
+  if (!task.base_sha) {
+    throw new Error(
+      `Codeg task ${task.id} has no exact base_sha; refusing changed-file materialization.`,
+    );
+  }
+  if (task.base_sha !== localHead) {
     throw new Error(
       `Codeg task ${task.id} base ${task.base_sha} does not match DevSpace workspace HEAD ${localHead}; refusing stale materialization.`,
     );
@@ -518,6 +551,19 @@ async function materializeCodegTask(
     if (rel.startsWith(`..${sep}`) || rel === ".." || isAbsolute(rel)) {
       throw new Error(`Codeg changed-file path '${change.file}' escapes the DevSpace workspace.`);
     }
+
+    assertNoSymlinkedParent(
+      codegFolder.path,
+      source,
+      change.file,
+      "Codeg source",
+    );
+    assertNoSymlinkedParent(
+      root,
+      target,
+      change.file,
+      "DevSpace target",
+    );
 
     if (existsSync(source)) {
       const sourceStat = lstatSync(source);

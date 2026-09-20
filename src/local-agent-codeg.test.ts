@@ -631,6 +631,116 @@ test("Codeg materialization applies a deletion only when exact-base Git proves D
   }
 });
 
+test("Codeg materialization requires an exact task base before any physical write", async () => {
+  const root = mkdtempSync(join(tmpdir(), "devspace-codeg-base-required-"));
+  const workspace = join(root, "repo");
+  const codegWorktree = join(root, "codeg-task");
+  mkdirSync(workspace, { recursive: true });
+  try {
+    git(workspace, "init");
+    git(workspace, "config", "user.name", "DevSpace Test");
+    git(workspace, "config", "user.email", "devspace@example.test");
+    writeFileSync(join(workspace, "README.md"), "base\n");
+    git(workspace, "add", "README.md");
+    git(workspace, "commit", "-m", "base");
+    const base = git(workspace, "rev-parse", "HEAD");
+    git(workspace, "worktree", "add", "-b", "task/base-required", codegWorktree, base);
+    mkdirSync(join(codegWorktree, "allowed"), { recursive: true });
+    writeFileSync(join(codegWorktree, "allowed", "result.txt"), "NO-BASE\n");
+
+    const fake = createFakeCodeg({
+      existingTasks: [{
+        id: 156,
+        title: "[devspace:agt-base-required] codex",
+        status: "review",
+        result_summary: "base missing",
+        worktree_folder_id: 27,
+        base_sha: null,
+      }],
+      changedFiles: [{ file: "allowed/result.txt", additions: 1, deletions: 0 }],
+      folderPath: codegWorktree,
+    });
+
+    await assert.rejects(
+      runCodegLocalAgent(
+        "agt-base-required",
+        "codex",
+        {
+          prompt: "must not materialize without exact base",
+          workspaceRoot: workspace,
+          writeMode: "allowed",
+          writePaths: ["allowed"],
+        },
+        undefined,
+        envFor("codex"),
+        fake.fetchImpl,
+      ),
+      /has no exact base_sha/,
+    );
+    assert.equal(existsSync(join(workspace, "allowed", "result.txt")), false);
+  } finally {
+    try { git(workspace, "worktree", "remove", "--force", codegWorktree); } catch {}
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Codeg materialization refuses a symlinked DevSpace parent directory", async () => {
+  const root = mkdtempSync(join(tmpdir(), "devspace-codeg-target-parent-"));
+  const workspace = join(root, "repo");
+  const codegWorktree = join(root, "codeg-task");
+  const outside = join(root, "outside");
+  mkdirSync(workspace, { recursive: true });
+  mkdirSync(outside, { recursive: true });
+  try {
+    git(workspace, "init");
+    git(workspace, "config", "user.name", "DevSpace Test");
+    git(workspace, "config", "user.email", "devspace@example.test");
+    writeFileSync(join(workspace, "README.md"), "base\n");
+    git(workspace, "add", "README.md");
+    git(workspace, "commit", "-m", "base");
+    const base = git(workspace, "rev-parse", "HEAD");
+    git(workspace, "worktree", "add", "-b", "task/target-parent", codegWorktree, base);
+
+    mkdirSync(join(codegWorktree, "allowed"), { recursive: true });
+    writeFileSync(join(codegWorktree, "allowed", "result.txt"), "MUST-STAY-IN-WORKSPACE\n");
+    symlinkSync(outside, join(workspace, "allowed"));
+
+    const fake = createFakeCodeg({
+      existingTasks: [{
+        id: 157,
+        title: "[devspace:agt-target-parent] codex",
+        status: "review",
+        result_summary: "target parent",
+        worktree_folder_id: 28,
+        base_sha: base,
+      }],
+      changedFiles: [{ file: "allowed/result.txt", additions: 1, deletions: 0 }],
+      folderPath: codegWorktree,
+    });
+
+    await assert.rejects(
+      runCodegLocalAgent(
+        "agt-target-parent",
+        "codex",
+        {
+          prompt: "reject symlinked target parent",
+          workspaceRoot: workspace,
+          writeMode: "allowed",
+          writePaths: ["allowed"],
+        },
+        undefined,
+        envFor("codex"),
+        fake.fetchImpl,
+      ),
+      /parent.*symbolic link/i,
+    );
+    assert.equal(existsSync(join(outside, "result.txt")), false);
+  } finally {
+    try { git(workspace, "worktree", "remove", "--force", codegWorktree); } catch {}
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("Codeg backend fails closed for read-only and projected execution until hard enforcement exists", async () => {
   const fake = createFakeCodeg({});
   await assert.rejects(
