@@ -790,6 +790,174 @@ test("nexus_gateway_recovery_preflight passes with effect_started=false and read
   }
 });
 
+test("durable gateway preflight returns immediately, replays exact identity, and persists terminal evidence", async () => {
+  const f = await fixture();
+  try {
+    let release: ((value: { exitCode: number; stdout: string; stderr: string }) => void) | undefined;
+    const pending = new Promise<{ exitCode: number; stdout: string; stderr: string }>((resolvePromise) => {
+      release = resolvePromise;
+    });
+    const manager = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      async () => { throw new Error("recovery bridge must not be called"); },
+      async () => await pending,
+    );
+    try {
+      const request = recoveryRequest();
+      const started = await manager.nexusGatewayRecoveryPreflightStart({
+        attemptKey: "durable-preflight-1",
+        request,
+      });
+      assert.equal(started.status, "started");
+      assert.equal(started.kind, "nexus_gateway_recovery_preflight");
+
+      const replay = await manager.nexusGatewayRecoveryPreflightStart({
+        attemptKey: "durable-preflight-1",
+        request,
+      });
+      assert.equal(replay.operationId, started.operationId);
+      assert.equal(replay.requestHash, started.requestHash);
+
+      await assert.rejects(
+        manager.nexusGatewayRecoveryPreflightStart({
+          attemptKey: "durable-preflight-1",
+          request: recoveryRequest({ idempotency_fence: "different-fence" }),
+        }),
+        (error: unknown) => error instanceof DurableOperationError
+          && error.code === "OPERATION_REPLAY_CONFLICT",
+      );
+
+      assert.ok(release, "preflight runner must have started in background");
+      release({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          result: "BLOCKED",
+          effect_started: false,
+          evidence_hash: "1".repeat(64),
+          physical_observation: { readiness: ["TARGET_READY", "ROLLBACK_READY"] },
+        }),
+        stderr: "",
+      });
+
+      let terminal = manager.store.getByOperationId(started.operationId);
+      for (let index = 0; index < 50 && terminal?.status === "started"; index += 1) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 2));
+        terminal = manager.store.getByOperationId(started.operationId);
+      }
+      assert.equal(terminal?.status, "succeeded");
+      const preflight = terminal?.receipt?.preflight as Record<string, unknown>;
+      assert.equal(preflight.status, "passed");
+      assert.equal(preflight.effectStarted, false);
+      assert.deepEqual(preflight.readiness, ["TARGET_READY", "ROLLBACK_READY"]);
+      assert.equal(terminal?.receipt?.requestHash, request.request_hash);
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("durable gateway preflight restart becomes reconcile-only and reuses the same stored request", async () => {
+  const f = await fixture();
+  try {
+    const never = new Promise<{ exitCode: number; stdout: string; stderr: string }>(() => undefined);
+    const first = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      async () => { throw new Error("recovery bridge must not be called"); },
+      async () => await never,
+    );
+    const request = recoveryRequest();
+    const started = await first.nexusGatewayRecoveryPreflightStart({
+      attemptKey: "durable-preflight-restart-1",
+      request,
+    });
+    assert.equal(started.status, "started");
+    first.close();
+
+    let reconciledCalls = 0;
+    const second = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      async () => { throw new Error("recovery bridge must not be called"); },
+      async (observedRequest) => {
+        reconciledCalls += 1;
+        assert.deepEqual(observedRequest, request);
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            result: "BLOCKED",
+            effect_started: false,
+            evidence_hash: "2".repeat(64),
+            physical_observation: { readiness: ["TARGET_READY", "ROLLBACK_READY"] },
+          }),
+          stderr: "",
+        };
+      },
+    );
+    try {
+      const interrupted = second.store.getByOperationId(started.operationId);
+      assert.equal(interrupted?.status, "outcome_unknown");
+      assert.equal(interrupted?.errorCode, "RECONCILIATION_REQUIRED");
+      assert.match(interrupted?.errorMessage ?? "", /read-only Gateway preflight/);
+
+      const terminal = await second.reconcile(started.operationId);
+      assert.equal(reconciledCalls, 1);
+      assert.equal(terminal.status, "succeeded");
+      assert.equal(terminal.receipt?.reconciled, true);
+      assert.equal(terminal.receipt?.requestHash, request.request_hash);
+    } finally {
+      second.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("durable gateway preflight fails terminally if the preflight bridge reports an effect", async () => {
+  const f = await fixture();
+  try {
+    const manager = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      async () => { throw new Error("recovery bridge must not be called"); },
+      async () => ({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          result: "BLOCKED",
+          effect_started: true,
+          evidence_hash: "3".repeat(64),
+          physical_observation: { readiness: ["TARGET_READY", "ROLLBACK_READY"] },
+        }),
+        stderr: "",
+      }),
+    );
+    try {
+      const started = await manager.nexusGatewayRecoveryPreflightStart({
+        attemptKey: "durable-preflight-effect-leak-1",
+        request: recoveryRequest(),
+      });
+      let terminal = manager.store.getByOperationId(started.operationId);
+      for (let index = 0; index < 50 && terminal?.status === "started"; index += 1) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, 2));
+        terminal = manager.store.getByOperationId(started.operationId);
+      }
+      assert.equal(terminal?.status, "failed");
+      assert.equal(terminal?.errorCode, "NEXUS_GATEWAY_PREFLIGHT_FAILED");
+      const preflight = terminal?.receipt?.preflight as Record<string, unknown>;
+      assert.equal(preflight.status, "error");
+      assert.equal(preflight.effectStarted, true);
+      assert.match(String(preflight.errorMessage ?? ""), /effect/i);
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("nexus_gateway_recovery_preflight rejects authority schema mismatch", async () => {
   const f = await fixture();
   try {
