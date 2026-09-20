@@ -299,10 +299,12 @@ export class WorkspaceRegistry {
 
         if (!existsSync(candidate)) {
           const resolvedCandidate = canonicalizePath(candidate).toLowerCase();
-          workspace.availableAgentsFiles = workspace.availableAgentsFiles.filter(
-            (file) => canonicalizePath(file.path).toLowerCase() !== resolvedCandidate,
-          );
-          workspace.loadedInstructionPaths.delete(resolvedCandidate);
+          workspace.availableAgentsFiles = workspace.availableAgentsFiles.filter((file) => {
+            const resolvedFile = canonicalizePath(file.path).toLowerCase();
+            if (resolvedFile !== resolvedCandidate || existsSync(file.path)) return true;
+            workspace.loadedInstructionPaths?.delete(resolvedFile);
+            return false;
+          });
           continue;
         }
 
