@@ -645,6 +645,129 @@ export class CarrierBindingStore {
     } finally {operations.close();}
   }
 
+  /**
+   * Host-local terminal hygiene for one successfully closed coordination-bound cutover
+   * whose original root carrier has already been revoked. This can only destroy the
+   * stale lease. It never revives carrier authority, transfers ownership, changes the
+   * cutover target, starts work, or schedules a restart.
+   */
+  releaseClosedCutoverLeaseLocal(input: {
+    cutoverId: string;
+    leaseId: string;
+    expectedLeaseVersion: number;
+    carrierId: string;
+    expectedCarrierVersion: number;
+    expectedTerminalRecordHash: string;
+    confirmCutoverId: string;
+  }) {
+    if(input.confirmCutoverId!==input.cutoverId) deny("Terminal lease release confirmation must equal the exact cutover id");
+    if(!Number.isSafeInteger(input.expectedLeaseVersion) || input.expectedLeaseVersion<1 ||
+       !Number.isSafeInteger(input.expectedCarrierVersion) || input.expectedCarrierVersion<2 ||
+       !/^[a-f0-9]{64}$/.test(input.expectedTerminalRecordHash)) {
+      throw new ControlPlaneOwnershipError("CAS_CONFLICT","Terminal lease release identity is invalid");
+    }
+
+    const cutoverStore=new CutoverStateStore(this.stateDir,{now:this.now});
+    const closed=cutoverStore.get();
+    if(!closed || closed.cutoverId!==input.cutoverId || closed.phase!=="closed" || !closed.coordinationBinding) {
+      deny("Terminal lease release requires the exact closed coordination-bound cutover");
+    }
+    if(closed.coordinationBinding.leaseId!==input.leaseId ||
+       closed.expiredPreparedNoEffect || closed.capabilityExpectationMismatch || closed.observedReplacement ||
+       closed.supersession || closed.bindingRepair ||
+       !closed.drainEvidence || !closed.restartRequest?.restartScheduledAt ||
+       !closed.reconciliationReceipt?.workspaceQueryable || !closed.reconciliationReceipt.agentQueryable ||
+       !closed.reconciliationReceipt.agentReconciled) {
+      deny("Terminal lease release requires one normally completed cutover generation");
+    }
+
+    const row=this.database.sqlite.prepare("select * from carrier_bindings where id=?").get(input.carrierId) as BindingRow|undefined;
+    if(!row || row.revoked!==1 || row.version!==input.expectedCarrierVersion || row.parent_id) {
+      deny("Terminal lease release requires the exact revoked root carrier");
+    }
+    const contract=this.validateContract(JSON.parse(row.contract_json) as CarrierContract,false);
+    if(JSON.stringify(contract)!==row.contract_json || contract.role!=="controller" ||
+       contract.operations.length!==1 || contract.operations[0]!=="cutover_start" || !contract.cutover) {
+      deny("Terminal lease release requires canonical root cutover authority");
+    }
+    const approved=contract.cutover;
+    if(closed.coordinationBinding.ownerThread!==row.id ||
+       physical(approved.stateRoot)!==physical(this.stateDir) ||
+       !isDeepStrictEqual(closed.oldServerIdentity,approved.currentIdentity) ||
+       !isDeepStrictEqual(closed.expectedNewIdentity,approved.expectedIdentity) ||
+       closed.expiresAt!==approved.expiresAt) {
+      throw new ControlPlaneOwnershipError("CAS_CONFLICT","Terminal lease release cutover generation changed");
+    }
+
+    const plan=planCutoverStart(this.stateDir,approved);
+    const correlation=closed.coordinationBinding;
+    if(correlation.operationHandle!==plan.operationId || correlation.requestHash!==plan.requestHash) {
+      throw new ControlPlaneOwnershipError("CAS_CONFLICT","Terminal lease release operation correlation changed");
+    }
+    const terminalHash=cutoverTerminalRecordHash(closed);
+    if(terminalHash!==input.expectedTerminalRecordHash) {
+      throw new ControlPlaneOwnershipError("CAS_CONFLICT","Terminal cutover record hash changed");
+    }
+
+    const operations=new DurableOperationStore(this.stateDir);
+    try {
+      const operation=operations.getByOperationId(correlation.operationHandle);
+      if(!operation || operation.kind!=="cutover_start" || operation.status!=="succeeded" ||
+         operation.requestHash!==correlation.requestHash || operation.scopeRoot!==physical(this.stateDir) ||
+         operation.receipt?.cutoverId!==closed.cutoverId || operation.receipt?.startVerified!==true ||
+         operation.receipt?.lifecycleTerminal!==true || operation.receipt?.terminalRecordHash!==terminalHash) {
+        deny("Terminal lease release requires the exact successful terminal cutover operation");
+      }
+      const {coordinationBinding,...request}=operation.request;
+      if(!isDeepStrictEqual(coordinationBinding,correlation) || !isDeepStrictEqual(request,plan.request)) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT","Terminal lease release durable operation binding changed");
+      }
+
+      const localContext=Object.freeze({});
+      const grant:GrantEvidenceReference={
+        repository:contract.repository,
+        goal:contract.goal,
+        coordinatorThread:row.id,
+        evidenceHash:digest(row.contract_json),
+      };
+      const localOwnership=operations.createOwnershipStore({
+        now:this.now,
+        resolveOwnerContext: context=>context===localContext?{ownerThread:row.id}:undefined,
+        resolveEffectBinding: ()=>undefined,
+        verifyGrantEvidence: (candidate,owner)=>owner.ownerThread===row.id && isDeepStrictEqual(candidate,grant),
+      });
+      let lease=localOwnership.get(input.leaseId);
+      if(!lease || lease.leaseId!==correlation.leaseId || lease.ownerThread!==row.id ||
+         lease.operation!=="cutover_start" || lease.baseRevision!==contract.baseRevision ||
+         lease.resource!==physical(this.stateDir) || lease.scope.length!==1 || lease.scope[0]!==physical(this.stateDir) ||
+         lease.operationHandle!==undefined || lease.operationState!=="finished") {
+        deny("Terminal lease release lease binding changed or is not terminal");
+      }
+
+      if(lease.terminalState!==undefined) {
+        if(lease.terminalState!=="released" || lease.version!==input.expectedLeaseVersion+1) {
+          throw new ControlPlaneOwnershipError("CAS_CONFLICT","Terminal lease release replay changed");
+        }
+        return {cutover:closed,lease,operation,replayed:true};
+      }
+      if(lease.version!==input.expectedLeaseVersion) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT","Terminal lease release version changed");
+      }
+
+      lease=localOwnership.release(localContext,input.leaseId,input.expectedLeaseVersion);
+
+      const afterCutover=cutoverStore.get();
+      const afterOperation=operations.getByOperationId(correlation.operationHandle);
+      if(!afterCutover || !isDeepStrictEqual(afterCutover,closed) ||
+         !afterOperation || !isDeepStrictEqual(afterOperation,operation) ||
+         lease.terminalState!=="released" || lease.version!==input.expectedLeaseVersion+1 ||
+         lease.operationHandle!==undefined || lease.operationState!=="finished") {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT","Terminal lease release post-effect readback changed");
+      }
+      return {cutover:afterCutover,lease,operation:afterOperation,replayed:false};
+    } finally {operations.close();}
+  }
+
   readLease(context: unknown, leaseId: string) {
     const binding=this.current(context), lease=this.ownership.get(leaseId);
     if(!lease || lease.ownerThread!==binding.row.id || lease.baseRevision!==binding.contract.baseRevision || !binding.contract.operations.includes(lease.operation as "dependency_sync") || lease.scope.some(path=>!binding.contract.scope.some(root=>contains(root,physical(path))))) deny("Lease is outside this carrier authority");

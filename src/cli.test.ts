@@ -110,6 +110,24 @@ for (const args of [
   );
 }
 
+
+for (const args of [
+  ["cutover", "release-terminal-lease", "--cutover-id", "c"],
+  ["cutover", "release-terminal-lease", "--cutover-id", "c", "--lease-id", "l", "--lease-version", "0", "--carrier", "carrier", "--carrier-version", "2", "--terminal-record-hash", "a".repeat(64), "--confirm", "c"],
+  ["cutover", "release-terminal-lease", "--cutover-id", "c", "--lease-id", "l", "--lease-version", "1", "--carrier", "carrier", "--carrier-version", "1", "--terminal-record-hash", "a".repeat(64), "--confirm", "c"],
+  ["cutover", "release-terminal-lease", "--cutover-id", "c", "--lease-id", "l", "--lease-version", "1", "--carrier", "carrier", "--carrier-version", "2", "--terminal-record-hash", "invalid", "--confirm", "c"],
+  ["cutover", "release-terminal-lease", "--cutover-id", "c", "--lease-id", "l", "--lease-version", "1", "--carrier", "carrier", "--carrier-version", "2", "--terminal-record-hash", "a".repeat(64), "--confirm", "other"],
+  ["cutover", "release-terminal-lease", "--cutover-id", "c", "--lease-id", "l", "--lease-version", "1", "--carrier", "carrier", "--carrier-version", "2", "--terminal-record-hash", "a".repeat(64), "--confirm", "c", "--credential", "forbidden"],
+]) {
+  assert.throws(
+    () => execFileSync("node", ["--import", "tsx", "src/cli.ts", ...args], { encoding: "utf8", env: { ...process.env, DEVSPACE_CONFIG_DIR: "/tmp/devspace-cli-invalid-terminal-lease-release-test" } }),
+    (error: unknown) => {
+      const detail = error as { stderr?: string; status?: number };
+      return detail.status !== 0 && /Usage:|Unknown cutover release-terminal-lease flag/.test(detail.stderr ?? "");
+    },
+  );
+}
+
 const root = mkdtempSync(join(tmpdir(), "devspace-cli-agents-test-"));
 // A fresh production-tsconfig compilation keeps tsx cold loading outside the
 // worker exit deadline. Both direct and CI-wrapper invocations use this fixture.

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { DurableOperationManager, DurableOperationStore, planCutoverStart } from "./durable-operations.js";
+import { DurableOperationManager, DurableOperationStore, cutoverTerminalRecordHash, planCutoverStart } from "./durable-operations.js";
 import { loadConfig } from "./config.js";
 import test from "node:test";
 import { chmodSync, lstatSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
@@ -1034,6 +1034,125 @@ test("owner-local drained restart reuses exact carrier authority without MCP ses
     assert.equal(replay.scheduled,false);
     assert.equal(scheduled,1);
   } finally {
+    f.close();
+  }
+});
+
+
+test("terminal hygiene releases only the exact normally closed cutover lease after root carrier revocation", async () => {
+  const f=fixture();
+  let manager:DurableOperationManager|undefined;
+  try {
+    const context={clientId:"shared-oauth",sessionId:"terminal-hygiene-controller"};
+    const pairing=f.store.requestPairing(context);
+    const cutover={
+      stateRoot:f.root,
+      attemptKey:"terminal-hygiene-cutover",
+      currentIdentity:{serverInstanceId:"old-instance",sourceCommit:f.contract.baseRevision,buildId:"old-build",capabilityManifestSha256:"c".repeat(64)},
+      expectedIdentity:{sourceCommit:"b".repeat(40),buildId:"new-build",capabilityManifestSha256:"d".repeat(64)},
+      expiresAt:new Date(f.clock()+30000).toISOString(),
+      restart:{buildReady:{verifiedBy:"independent",verifiedAt:new Date(f.clock()).toISOString(),evidence:"exact package"},actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"},
+      finish:{workspaceId:"ws_terminal",agentId:"agt_terminal"},
+    };
+    const contract:CarrierContract={...f.contract,scope:[f.root],operations:["cutover_start"],expiresAt:new Date(f.clock()+60000).toISOString(),cutover};
+    const approved=f.store.approveLocal(pairing.pendingId,contract);
+    f.store.redeem(context,pairing.credential);
+    const plan=planCutoverStart(f.root,cutover);
+    const acquired=f.store.prepareEffect(context,plan.subject);
+    const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",HOST:"127.0.0.1",PORT:"7677"});
+    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    const start=manager.startCutover(cutover,context);
+    const cutoverId=start.receipt!.cutoverId as string;
+    manager.drainCutover(cutoverId,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
+    let scheduled=0;
+    await manager.restartCutover(cutoverId,cutover.currentIdentity,cutover.restart.buildReady,async()=>({buildReady:true,detail:"exact package"}),{
+      actuator:"launchd-self" as const,
+      serviceLabel:cutover.restart.serviceLabel,
+      launchdTarget:cutover.restart.launchdTarget,
+      schedule:()=>{scheduled+=1;return {scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:cutover.restart.serviceLabel,launchdTarget:cutover.restart.launchdTarget};},
+    },context);
+    assert.equal(scheduled,1);
+    const replacement={serverInstanceId:"replacement-instance",...cutover.expectedIdentity};
+    const witness={workspaceQueryable:true,agentQueryable:true,agentReconciled:true,witnessWorkspaceId:cutover.finish.workspaceId,witnessAgentId:cutover.finish.agentId};
+    await manager.finishCutover(cutoverId,replacement,cutover.finish,async()=>witness,context);
+
+    const closed=new CutoverStateStore(f.root).get()!;
+    assert.equal(closed.phase,"closed");
+    const terminalHash=cutoverTerminalRecordHash(closed);
+    const operations=new DurableOperationStore(f.root);
+    const terminalOperation=operations.getByOperationId(start.operationId)!;
+    operations.close();
+    assert.equal(terminalOperation.status,"succeeded");
+    assert.equal(terminalOperation.receipt?.lifecycleTerminal,true);
+    assert.equal(terminalOperation.receipt?.terminalRecordHash,terminalHash);
+    const terminalLease=f.store.ownership.get(acquired.leaseId)!;
+    assert.equal(terminalLease.operationState,"finished");
+    assert.equal(terminalLease.operationHandle,undefined);
+    assert.equal(terminalLease.terminalState,undefined);
+
+    assert.throws(()=>f.store.releaseClosedCutoverLeaseLocal({
+      cutoverId,leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version,
+      carrierId:approved.id,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash,confirmCutoverId:cutoverId,
+    }),/revoked/i);
+
+    const revoked=f.store.revokeLocal(approved.id,1);
+    assert.equal(revoked.version,2);
+    f.store.forgetSession(context.sessionId);
+    assert.throws(()=>f.store.releaseLease(context,acquired.leaseId,terminalLease.version),/paired carrier|revoked/i);
+
+    const beforeCutover=JSON.stringify(new CutoverStateStore(f.root).get());
+    const beforeOperation=JSON.stringify(terminalOperation);
+    for(const invalid of [
+      {leaseId:"lease_wrong",expectedLeaseVersion:terminalLease.version,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash},
+      {leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version+1,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash},
+      {leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version,expectedCarrierVersion:3,expectedTerminalRecordHash:terminalHash},
+      {leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version,expectedCarrierVersion:2,expectedTerminalRecordHash:"0".repeat(64)},
+    ]) {
+      assert.throws(()=>f.store.releaseClosedCutoverLeaseLocal({
+        cutoverId,carrierId:approved.id,confirmCutoverId:cutoverId,...invalid,
+      }));
+      assert.equal(f.store.ownership.get(acquired.leaseId)?.terminalState,undefined);
+    }
+
+    const released=f.store.releaseClosedCutoverLeaseLocal({
+      cutoverId,leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version,
+      carrierId:approved.id,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash,confirmCutoverId:cutoverId,
+    });
+    assert.equal(released.replayed,false);
+    assert.equal(released.lease.terminalState,"released");
+    assert.equal(released.lease.version,terminalLease.version+1);
+    assert.equal(released.lease.operationState,"finished");
+    assert.equal(released.lease.operationHandle,undefined);
+    assert.equal(JSON.stringify(new CutoverStateStore(f.root).get()),beforeCutover);
+    const finalOperations=new DurableOperationStore(f.root);
+    assert.equal(JSON.stringify(finalOperations.getByOperationId(start.operationId)),beforeOperation);
+    finalOperations.close();
+
+    const replay=f.store.releaseClosedCutoverLeaseLocal({
+      cutoverId,leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version,
+      carrierId:approved.id,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash,confirmCutoverId:cutoverId,
+    });
+    assert.equal(replay.replayed,true);
+    assert.equal(replay.lease.version,released.lease.version);
+
+    const successorContext={clientId:"shared-oauth",sessionId:"terminal-hygiene-successor"};
+    const successorPairing=f.store.requestPairing(successorContext);
+    const successorCutover={
+      ...cutover,
+      attemptKey:"terminal-hygiene-successor-cutover",
+      currentIdentity:{serverInstanceId:"replacement-instance",...cutover.expectedIdentity},
+      expectedIdentity:{sourceCommit:"e".repeat(40),buildId:"later-build",capabilityManifestSha256:"f".repeat(64)},
+      expiresAt:new Date(f.clock()+25000).toISOString(),
+      restart:{...cutover.restart,buildReady:{...cutover.restart.buildReady,verifiedAt:new Date(f.clock()).toISOString(),evidence:"later exact package"}},
+    };
+    const successorContract:CarrierContract={...contract,baseRevision:successorCutover.currentIdentity.sourceCommit,cutover:successorCutover};
+    f.store.approveLocal(successorPairing.pendingId,successorContract);
+    f.store.redeem(successorContext,successorPairing.credential);
+    const successorLease=f.store.prepareEffect(successorContext,planCutoverStart(f.root,successorCutover).subject);
+    assert.notEqual(successorLease.leaseId,acquired.leaseId);
+    assert.equal(successorLease.terminalState,undefined);
+  } finally {
+    manager?.close();
     f.close();
   }
 });
