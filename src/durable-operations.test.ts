@@ -820,6 +820,12 @@ test("durable gateway preflight returns immediately, replays exact identity, and
       assert.equal(replay.requestHash, started.requestHash);
 
       await assert.rejects(
+        manager.reconcile(started.operationId),
+        (error: unknown) => error instanceof DurableOperationError
+          && error.code === "OPERATION_IN_PROGRESS",
+      );
+
+      await assert.rejects(
         manager.nexusGatewayRecoveryPreflightStart({
           attemptKey: "durable-preflight-1",
           request: recoveryRequest({ idempotency_fence: "different-fence" }),
