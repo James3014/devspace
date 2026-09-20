@@ -932,7 +932,22 @@ export class DurableOperationManager {
         operationId,
         input.request,
         false,
-      ).catch(() => undefined);
+      ).catch((error) => {
+        try {
+          const current = this.store.getByOperationId(operationId);
+          if (current?.status !== "started") return;
+          this.store.finish(operationId, {
+            status: "outcome_unknown",
+            retrySafe: false,
+            errorCode: "RECONCILIATION_REQUIRED",
+            errorMessage:
+              `Durable Gateway preflight background execution was interrupted: ${redactSecrets(error instanceof Error ? error.message : String(error))}`,
+          });
+        } catch {
+          // If shutdown already closed the store, constructor recovery on the
+          // replacement server marks the nonterminal preflight for reconcile.
+        }
+      });
     }
     return record;
   }
@@ -1043,6 +1058,16 @@ export class DurableOperationManager {
       if (!this.consumer || typeof record.request.baseRevision !== "string") throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency reconciliation requires revision-bound host authority");
       const subject = {operationId, requestHash:record.requestHash, workspaceRoot:record.scopeRoot, baseRevision:record.request.baseRevision, operation:"dependency_sync" as const};
       return this.reconcileDependencySync(operationId, this.consumer.readReconciliation(consumerContext, subject), consumerContext);
+    }
+    if (
+      record.kind === "nexus_gateway_recovery_preflight"
+      && record.status === "started"
+    ) {
+      throw new DurableOperationError(
+        "OPERATION_IN_PROGRESS",
+        `Gateway preflight ${operationId} is still running; read operation_status instead of starting a second preflight.`,
+        record,
+      );
     }
     if (record.status !== "outcome_unknown" && record.status !== "started") return record;
 
