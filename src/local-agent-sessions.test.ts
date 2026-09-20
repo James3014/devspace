@@ -543,6 +543,132 @@ test("LocalAgentSessionManager - cancel passes exact running worker ownership", 
   }
 });
 
+test("LocalAgentSessionManager - Codeg-bound cancel fails closed when gateway configuration disappears", async () => {
+  const { manager, spawnedWorkers, terminatedWorkers, clean } = setupFixture();
+  const previous = {
+    providers: process.env.DEVSPACE_CODEG_PROVIDERS,
+    url: process.env.DEVSPACE_CODEG_URL,
+    token: process.env.DEVSPACE_CODEG_TOKEN,
+  };
+  try {
+    process.env.DEVSPACE_CODEG_PROVIDERS = "agy";
+    process.env.DEVSPACE_CODEG_URL = "http://127.0.0.1:31817";
+    process.env.DEVSPACE_CODEG_TOKEN = "session-test-token";
+
+    const workspaceRoot = "/Users/jameschen/Workspace/nexus";
+    const started = await manager.startAgent({
+      workspaceId: "ws_codeg_cancel_config_loss",
+      workspaceRoot,
+      profileName: "reviewer",
+      prompt: "bind codeg then lose config",
+      profiles: mockProfiles,
+    });
+    const store = (manager as any).store as LocalAgentStore;
+    const current = store.getById(started.agentId)!;
+    const generation = current.lifecycleState!.activeTurn!.generation!;
+    const workerToken = current.workerToken ?? spawnedWorkers[0]!.workerToken;
+    assert.equal(
+      store.bindProviderSessionCAS(
+        started.agentId,
+        generation,
+        workerToken,
+        "codeg-work-task:551",
+      ).applied,
+      true,
+    );
+    assert.match(store.getById(started.agentId)!.executionGeneration!.executionIdentity, /^codeg:/);
+
+    delete process.env.DEVSPACE_CODEG_PROVIDERS;
+    delete process.env.DEVSPACE_CODEG_URL;
+    delete process.env.DEVSPACE_CODEG_TOKEN;
+
+    await assert.rejects(
+      manager.cancelAgent({
+        workspaceId: "ws_codeg_cancel_config_loss",
+        workspaceRoot,
+        agentId: started.agentId,
+      }),
+      (err: any) => {
+        assert.equal(err.code, "WORKER_TERMINATION_FAILED");
+        return true;
+      },
+    );
+
+    assert.equal(terminatedWorkers.length, 0);
+    const after = store.getById(started.agentId)!;
+    assert.equal(after.lifecycleState?.terminationPending !== undefined, true);
+    assert.match(after.error ?? "", /Codeg execution is durably bound/i);
+  } finally {
+    if (previous.providers === undefined) delete process.env.DEVSPACE_CODEG_PROVIDERS;
+    else process.env.DEVSPACE_CODEG_PROVIDERS = previous.providers;
+    if (previous.url === undefined) delete process.env.DEVSPACE_CODEG_URL;
+    else process.env.DEVSPACE_CODEG_URL = previous.url;
+    if (previous.token === undefined) delete process.env.DEVSPACE_CODEG_TOKEN;
+    else process.env.DEVSPACE_CODEG_TOKEN = previous.token;
+    clean();
+  }
+});
+
+test("LocalAgentSessionManager - errored Codeg binding can begin a new fenced turn without replacing the handle", async () => {
+  const { manager, spawnedWorkers, clean } = setupFixture();
+  const previous = {
+    providers: process.env.DEVSPACE_CODEG_PROVIDERS,
+    url: process.env.DEVSPACE_CODEG_URL,
+    token: process.env.DEVSPACE_CODEG_TOKEN,
+  };
+  try {
+    process.env.DEVSPACE_CODEG_PROVIDERS = "agy";
+    process.env.DEVSPACE_CODEG_URL = "http://127.0.0.1:31817";
+    process.env.DEVSPACE_CODEG_TOKEN = "session-test-token";
+
+    const workspaceRoot = "/Users/jameschen/Workspace/nexus";
+    const started = await manager.startAgent({
+      workspaceId: "ws_codeg_error_recovery",
+      workspaceRoot,
+      profileName: "implementer",
+      prompt: "initial Codeg turn",
+      profiles: mockProfiles,
+    });
+    const store = (manager as any).store as LocalAgentStore;
+    const initial = store.getById(started.agentId)!;
+    assert.equal(
+      store.bindProviderSessionCAS(
+        started.agentId,
+        initial.lifecycleState!.activeTurn!.generation!,
+        initial.workerToken!,
+        "codeg-work-task:552",
+      ).applied,
+      true,
+    );
+    settleAgent(manager, started.agentId, {
+      status: "error",
+      providerSessionId: "codeg-work-task:552",
+      error: "detached worker ended before collection",
+      terminalReason: "provider_error",
+    });
+
+    const continued = await manager.continueAgent({
+      workspaceId: "ws_codeg_error_recovery",
+      workspaceRoot,
+      agentId: started.agentId,
+      prompt: "new prompt after durable error",
+      profiles: mockProfiles,
+    });
+
+    assert.equal(continued.status, "starting");
+    assert.equal(spawnedWorkers.length, 2);
+    assert.equal(store.getById(started.agentId)?.providerSessionId, "codeg-work-task:552");
+  } finally {
+    if (previous.providers === undefined) delete process.env.DEVSPACE_CODEG_PROVIDERS;
+    else process.env.DEVSPACE_CODEG_PROVIDERS = previous.providers;
+    if (previous.url === undefined) delete process.env.DEVSPACE_CODEG_URL;
+    else process.env.DEVSPACE_CODEG_URL = previous.url;
+    if (previous.token === undefined) delete process.env.DEVSPACE_CODEG_TOKEN;
+    else process.env.DEVSPACE_CODEG_TOKEN = previous.token;
+    clean();
+  }
+});
+
 test("LocalAgentSessionManager - cancel with default terminator: absent PID succeeds", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-agent-sessions-test-"));
   const config = { stateDir, subagents: true, oauth: { scopes: ["devspace"] } } as any;
@@ -874,6 +1000,47 @@ test("runWorkerTurnFromFile redacts successful provider output before durable st
     assert.equal(updated.latestResponse, "done Bearer [REDACTED]");
     assert.equal(updated.providerSessionId, "thread-redaction");
   } finally {
+    clean();
+  }
+});
+
+test("preflight binds explicitly selected Codeg Agy backend without requiring native Agy runtime", async () => {
+  const { manager, clean } = setupFixture();
+  const previous = {
+    providers: process.env.DEVSPACE_CODEG_PROVIDERS,
+    url: process.env.DEVSPACE_CODEG_URL,
+    token: process.env.DEVSPACE_CODEG_TOKEN,
+    agy: process.env.AGY_COMMAND,
+  };
+  try {
+    process.env.DEVSPACE_CODEG_PROVIDERS = "agy";
+    process.env.DEVSPACE_CODEG_URL = "http://127.0.0.1:31817";
+    process.env.DEVSPACE_CODEG_TOKEN = "session-test-token";
+    process.env.AGY_COMMAND = "/definitely/missing/native-agy";
+
+    const output = await manager.preflightAgent({
+      workspaceId: "ws_codeg_agy",
+      workspaceRoot: "/Users/jameschen/Workspace/nexus",
+      isolated: true,
+      profileName: "reviewer",
+      profiles: mockProfiles,
+    });
+
+    assert.equal(output.readiness.providerConfigured, true);
+    assert.equal(output.readiness.runtimeReady, true);
+    assert.equal(output.readiness.dispatchState, "UNKNOWN");
+    assert.equal(output.worker.executionIdentity, "codeg:http://127.0.0.1:31817:agy");
+    assert.equal(output.worker.runtimeVersion, "codeg-http-v1");
+    assert.equal(output.worker.executionIdentity.includes("session-test-token"), false);
+  } finally {
+    if (previous.providers === undefined) delete process.env.DEVSPACE_CODEG_PROVIDERS;
+    else process.env.DEVSPACE_CODEG_PROVIDERS = previous.providers;
+    if (previous.url === undefined) delete process.env.DEVSPACE_CODEG_URL;
+    else process.env.DEVSPACE_CODEG_URL = previous.url;
+    if (previous.token === undefined) delete process.env.DEVSPACE_CODEG_TOKEN;
+    else process.env.DEVSPACE_CODEG_TOKEN = previous.token;
+    if (previous.agy === undefined) delete process.env.AGY_COMMAND;
+    else process.env.AGY_COMMAND = previous.agy;
     clean();
   }
 });
