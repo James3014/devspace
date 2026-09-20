@@ -798,6 +798,7 @@ interface CutoverRecoverCliOptions {
   sourceCommit: string;
   buildId: string;
   capabilityManifestSha256?: string;
+  packageRoot?: string;
   activeSessions: number;
   oldestAgeMs: number;
   expiresAt?: string;
@@ -875,11 +876,11 @@ function printCutoverHelp(): void {
       "",
       "Usage:",
       "  devspace cutover status [--json]",
-      "  devspace cutover recover --cutover-id <id> --commit <sha> --build-id <id> [--capability-sha <sha>] [--package-root <path>] [--json]",
+      "  devspace cutover recover --cutover-id <id> --expected-source-commit <sha> --expected-build-id <id> [--expected-capability-manifest-sha256 <sha>] [--package-root <path>] --active-sessions <n> --oldest-age-ms <n> [--json]",
       "  devspace cutover observe --cutover-id <id> --workspace-id <id> --agent-id <id> [--json]",
       "  devspace cutover repair --cutover-id <id> --workspace-id <id> --agent-id <id> [--server-url <url>] [--package-root <path>] [--state-dir <path>] [--json]",
       "  devspace cutover abort-expired-prepared --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--json]",
-      "  devspace cutover recover-capability-mismatch --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--json]",
+      "  devspace cutover recover-capability-mismatch --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --package-root <path> --confirm <id> [--json]",
       "  devspace cutover restart-bound --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --credential-file <owner-private-intent.json> --package-root <path> --confirm <id> [--json]",
       "  devspace cutover release-terminal-lease --cutover-id <id> --lease-id <id> --lease-version <n> --carrier <id> --carrier-version <n> --terminal-record-hash <sha256> --confirm <id> [--json]",
       "",
@@ -1270,7 +1271,12 @@ async function runCutoverCapabilityMismatchRecovery(args: string[]): Promise<voi
   if (!activeCutover || activeCutover.cutoverId !== cutoverId) {
     throw new Error("Capability expectation recovery requires the exact active cutover.");
   }
-  const targetPackageRoot = packageRoot ?? config.mcpCutoverBuildReadyRoot ?? process.env.DEVSPACE_PACKAGE_ROOT ?? runningPackageRoot();
+  const targetPackageRoot = packageRoot ?? config.mcpCutoverBuildReadyRoot ?? process.env.DEVSPACE_PACKAGE_ROOT;
+  if (!targetPackageRoot) {
+    throw new Error(
+      "Capability expectation recovery requires --package-root, DEVSPACE_BUILD_READY_ROOT, or DEVSPACE_PACKAGE_ROOT for exact target attribution.",
+    );
+  }
   const targetPackage = probeTargetPackage(targetPackageRoot);
   if (targetPackage.sourceCommit !== sourceCommit || targetPackage.buildId !== buildId) {
     throw new Error("Running package identity does not match the live replacement source/build; refusing recovery.");
@@ -1324,6 +1330,9 @@ function parseCutoverRecoverArgs(args: string[]): CutoverRecoverCliOptions {
         break;
       case "--expected-capability-manifest-sha256":
         options.capabilityManifestSha256 = value();
+        break;
+      case "--package-root":
+        options.packageRoot = resolve(value());
         break;
       case "--active-sessions":
         options.activeSessions = parseNonNegativeIntOrThrow(value(), "--active-sessions");
@@ -1379,33 +1388,31 @@ async function runCutoverRecover(args: string[]): Promise<void> {
   ) {
     throw new Error("--expected-capability-manifest-sha256 must be a 64-character hex hash.");
   }
+  const config = loadConfig();
+  const targetPackageRoot = options.packageRoot ?? config.mcpCutoverBuildReadyRoot ?? process.env.DEVSPACE_PACKAGE_ROOT;
   if (options.capabilityManifestSha256 !== undefined) {
-    const targetRoot = runningPackageRoot();
-    try {
-      const targetPackage = probeTargetPackage(targetRoot);
-      if (
-        targetPackage.buildManifestSha256 !== undefined &&
-        options.capabilityManifestSha256 === targetPackage.buildManifestSha256
-      ) {
-        throw new CutoverCapabilityManifestDomainMismatchError();
-      }
-    } catch (err) {
-      if (err instanceof CutoverCapabilityManifestDomainMismatchError) throw err;
+    if (!targetPackageRoot) {
+      throw new Error(
+        "Capability-bound cutover recovery requires --package-root, DEVSPACE_BUILD_READY_ROOT, or DEVSPACE_PACKAGE_ROOT for exact target attribution.",
+      );
     }
+    assertNoDigestDomainMismatch(
+      { capabilityManifestSha256: options.capabilityManifestSha256 },
+      probeTargetPackage(targetPackageRoot),
+    );
   }
   if (options.expiresAt !== undefined && !Number.isFinite(Date.parse(options.expiresAt))) {
     throw new Error("--expires-at must be an ISO-8601 timestamp.");
   }
-  const config = loadConfig();
   const requesterIdentity = readRunningBuildIdentity(runningPackageRoot());
   if (!requesterIdentity) {
     throw new Error(
       "Unable to read the running build identity; run the recovery seam from an accepted DevSpace build.",
     );
   }
-  const buildReadyProbe = config.mcpCutoverBuildReadyRoot
+  const buildReadyProbe = targetPackageRoot
     ? (expected: ExpectedCutoverIdentity) =>
-        probeBuildReady({ packageRoot: runningPackageRoot(), expected })
+        probeBuildReady({ packageRoot: targetPackageRoot, expected })
     : undefined;
   const buildReadyAttestation = options.buildReadyVerifiedBy
     ? { verifiedBy: options.buildReadyVerifiedBy, ...(options.buildReadyEvidence ? { evidence: options.buildReadyEvidence } : {}) }

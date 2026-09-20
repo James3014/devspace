@@ -80,11 +80,16 @@ export function assertNoDigestDomainMismatch(
   expected: Partial<ExpectedCutoverIdentity>,
   targetPackage: { buildManifestSha256?: string },
 ): void {
+  if (expected.capabilityManifestSha256 === undefined) return;
   if (
-    expected.capabilityManifestSha256 !== undefined &&
-    targetPackage.buildManifestSha256 !== undefined &&
-    expected.capabilityManifestSha256 === targetPackage.buildManifestSha256
+    typeof targetPackage.buildManifestSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(targetPackage.buildManifestSha256)
   ) {
+    throw new CutoverBuildNotReadyError(
+      "Target package build identity lacks a valid build_manifest_sha256; capability digest domain cannot be proven.",
+    );
+  }
+  if (expected.capabilityManifestSha256 === targetPackage.buildManifestSha256) {
     throw new CutoverCapabilityManifestDomainMismatchError();
   }
 }

@@ -3,6 +3,7 @@ import test from "node:test";
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { createServer as createNetServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +13,8 @@ import { loadConfig } from "./config.js";
 import { localAgentDaemonPaths } from "./local-agent-daemon-lifecycle.js";
 import { encodeLocalAgentDaemonResponse } from "./local-agent-daemon-protocol.js";
 import { LocalAgentStore } from "./local-agent-store.js";
+import { CutoverStateStore } from "./cutover-state.js";
+import { BUILD_IDENTITY_RELATIVE_PATH } from "./cutover-build-ready.js";
 
 const execFileAsync = promisify(execFile);
 const require = createRequire(import.meta.url);
@@ -127,6 +130,64 @@ for (const args of [
     },
   );
 }
+
+
+
+test("cutover recover accepts explicit package root and fails closed when target build-manifest attribution is missing", async () => {
+  const root=mkdtempSync(join(tmpdir(),"devspace-cli-cutover-target-missing-"));
+  const target=join(root,"target");
+  try {
+    mkdirSync(join(target,"generated"),{recursive:true});
+    writeFileSync(join(target,BUILD_IDENTITY_RELATIVE_PATH),JSON.stringify({source_commit:"b".repeat(40),build_id:"new"}),"utf8");
+    await assert.rejects(
+      execFileAsync("node",["--import","tsx","src/cli.ts","cutover","recover",
+        "--cutover-id","cutover-test","--expected-source-commit","b".repeat(40),"--expected-build-id","new",
+        "--expected-capability-manifest-sha256","d".repeat(64),"--package-root",target,
+        "--active-sessions","0","--oldest-age-ms","0","--json"],{
+        cwd:process.cwd(),timeout:15000,env:{...process.env,DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_ALLOWED_ROOTS:root,DEVSPACE_WORKTREE_ROOT:join(root,"worktrees"),DEVSPACE_STATE_DIR:join(root,"state"),DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",HOST:"127.0.0.1",PORT:"1"},
+      }),
+      (error:unknown)=>/build_manifest_sha256|digest domain cannot be proven/i.test((error as {stderr?:string}).stderr??String(error)),
+    );
+  } finally {rmSync(root,{recursive:true,force:true});}
+});
+
+test("recover-capability-mismatch uses explicit target package and preserves cross-domain binding-repair ownership", async () => {
+  const root=mkdtempSync(join(tmpdir(),"devspace-cli-capability-domain-"));
+  const stateDir=join(root,"state"), target=join(root,"target"), expectedCapability="d".repeat(64);
+  mkdirSync(join(target,"generated"),{recursive:true});
+  mkdirSync(stateDir,{recursive:true});
+  const store=new CutoverStateStore(stateDir,{newId:()=>"cutover-domain-test"});
+  store.begin({
+    oldServerIdentity:{serverInstanceId:"old",sourceCommit:"a".repeat(40),buildId:"old",capabilityManifestSha256:"c".repeat(64)},
+    expectedNewIdentity:{sourceCommit:"b".repeat(40),buildId:"new",capabilityManifestSha256:expectedCapability},
+  });
+  const server=createHttpServer((req,res)=>{
+    if(req.url!=="/healthz"){res.statusCode=404;res.end();return;}
+    res.setHeader("content-type","application/json");
+    res.end(JSON.stringify({ok:true,build:{source_commit:"b".repeat(40),build_id:"new"},capabilityManifest:{manifestSha256:"e".repeat(64),missing:[]},mcp:{serverInstanceId:"replacement"}}));
+  });
+  await new Promise<void>((resolve,reject)=>server.listen(0,"127.0.0.1",resolve).once("error",reject));
+  const address=server.address();
+  assert.ok(address && typeof address==="object");
+  const baseEnv={...process.env,DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_ALLOWED_ROOTS:root,DEVSPACE_WORKTREE_ROOT:join(root,"worktrees"),DEVSPACE_STATE_DIR:stateDir,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",HOST:"127.0.0.1",PORT:String(address.port)};
+  try {
+    for(const identity of [
+      {source_commit:"b".repeat(40),build_id:"new"},
+      {source_commit:"b".repeat(40),build_id:"new",build_manifest_sha256:expectedCapability},
+    ]) {
+      writeFileSync(join(target,BUILD_IDENTITY_RELATIVE_PATH),JSON.stringify(identity),"utf8");
+      await assert.rejects(
+        execFileAsync("node",["--import","tsx","src/cli.ts","cutover","recover-capability-mismatch",
+          "--cutover-id","cutover-domain-test","--carrier","carrier-missing","--version","1","--validity-version","1",
+          "--package-root",target,"--confirm","cutover-domain-test","--json"],{cwd:process.cwd(),timeout:15000,env:baseEnv}),
+        (error:unknown)=>/build_manifest_sha256|CAPABILITY_MANIFEST_DIGEST_DOMAIN_MISMATCH|digest domain/i.test((error as {stderr?:string}).stderr??String(error)),
+      );
+    }
+  } finally {
+    await new Promise<void>(resolve=>server.close(()=>resolve()));
+    rmSync(root,{recursive:true,force:true});
+  }
+});
 
 const root = mkdtempSync(join(tmpdir(), "devspace-cli-agents-test-"));
 // A fresh production-tsconfig compilation keeps tsx cold loading outside the

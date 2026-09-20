@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { CarrierBindingStore, type CarrierContract, type CarrierCompletionBinding } from "./carrier-binding.js";
 import { openDatabase } from "./db/client.js";
 import { CutoverStateStore } from "./cutover-state.js";
+import { ControlPlaneOwnershipStore } from "./control-plane-ownership.js";
 import { performLocalBoundCutoverRestart } from "./cutover-local-restart.js";
 
 function fixture(completionBindings: readonly CarrierCompletionBinding[] = []) {
@@ -469,6 +470,49 @@ test("host-local capability expectation mismatch recovery accepts an arbitrary s
     assert.equal(recovered.operation.errorMessage,"Replacement source/build matched, but the observed capability manifest differed from the approved expected capability.");
     assert.equal(recovered.lease.terminalState,"released");
   } finally {manager?.close();f.close();}
+});
+
+
+
+for (const authorityRace of ["reauthorize", "revoke"] as const) test(`capability mismatch recovery fails closed when carrier ${authorityRace} races before reconciliation`, async () => {
+  const f=fixture();
+  const prepared=await prepareCapabilityMismatch(f,`capability-mismatch-${authorityRace}-race`,"d".repeat(64),"e".repeat(64));
+  const beforeCutover=new CutoverStateStore(f.root).get()!;
+  const beforeLease=f.store.ownership.get(prepared.preparedLease.leaseId)!;
+  const originalReconcile=ControlPlaneOwnershipStore.prototype.reconcile;
+  let injected=false;
+  try {
+    ControlPlaneOwnershipStore.prototype.reconcile=function(...args){
+      if(!injected){
+        injected=true;
+        if(authorityRace==="reauthorize") {
+          f.store.reauthorizeLocal(prepared.approved.id,1,new Date(f.clock()+240000).toISOString());
+        } else {
+          f.store.revokeLocal(prepared.approved.id,1);
+        }
+      }
+      return originalReconcile.apply(this,args);
+    };
+    assert.throws(
+      ()=>f.store.recoverCapabilityExpectationMismatchLocal({
+        cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,
+        confirmCutoverId:prepared.id,observedIdentity:prepared.observed,
+      }),
+      /carrier authority changed|identity or version changed|validity|revoked|CAS_CONFLICT/i,
+    );
+  } finally {
+    ControlPlaneOwnershipStore.prototype.reconcile=originalReconcile;
+  }
+  const afterCutover=new CutoverStateStore(f.root).get()!;
+  const afterLease=f.store.ownership.get(prepared.preparedLease.leaseId)!;
+  assert.deepEqual(afterCutover,beforeCutover);
+  assert.equal(afterLease.operationHandle,beforeLease.operationHandle);
+  assert.equal(afterLease.operationState,beforeLease.operationState);
+  assert.equal(afterLease.terminalState,beforeLease.terminalState);
+  assert.equal(afterLease.version,beforeLease.version);
+  assert.equal(prepared.manager.store.getByOperationId(prepared.start.operationId)?.receipt?.lifecycleTerminal,false);
+  prepared.manager.close();
+  f.close();
 });
 
 test("capability mismatch recovery resumes after lease reconciliation before cutover close",async()=>{

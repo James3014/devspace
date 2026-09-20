@@ -87,4 +87,18 @@ test("capability digest domain guard preserves binding-repair ownership", () => 
     { ...expected, capabilityManifestSha256: "c".repeat(64) },
     { buildManifestSha256 },
   ));
+  assert.throws(
+    () => assertNoDigestDomainMismatch(
+      { ...expected, capabilityManifestSha256: "c".repeat(64) },
+      {},
+    ),
+    CutoverBuildNotReadyError,
+  );
+  assert.throws(
+    () => assertNoDigestDomainMismatch(
+      { ...expected, capabilityManifestSha256: "c".repeat(64) },
+      { buildManifestSha256: "not-a-digest" },
+    ),
+    CutoverBuildNotReadyError,
+  );
 });

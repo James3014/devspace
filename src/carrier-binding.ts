@@ -538,6 +538,17 @@ export class CarrierBindingStore {
     if(!before || before.cutoverId!==input.cutoverId || !before.coordinationBinding) deny("Exact coordination-bound cutover is required");
     const binding=this.active(input.carrierId,new Set(),true);
     if(binding.row.id!==before.coordinationBinding.ownerThread || binding.row.version!==input.expectedVersion || binding.validity.version!==input.expectedValidityVersion) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Carrier recovery identity or version changed");
+    const authorityGeneration=binding.generation;
+    const authorityContract=structuredClone(binding.contract);
+    const grant=this.grant(binding);
+    const assertRecoveryAuthorityCurrent=()=>{
+      const current=this.active(input.carrierId,new Set(),true);
+      if(current.row.id!==binding.row.id || current.row.version!==input.expectedVersion || current.validity.version!==input.expectedValidityVersion ||
+         current.generation!==authorityGeneration || !isDeepStrictEqual(current.contract,authorityContract) || !isDeepStrictEqual(this.grant(current),grant)) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT","Capability expectation recovery carrier authority changed");
+      }
+      return current;
+    };
     if(binding.row.parent_id || binding.contract.role!=="controller" || !binding.contract.cutover || binding.contract.operations.length!==1 || binding.contract.operations[0]!=="cutover_start") deny("Capability expectation recovery requires the exact root controller cutover authority");
     const approved=binding.contract.cutover;
     if(physical(approved.stateRoot)!==physical(this.stateDir) || !isDeepStrictEqual(before.oldServerIdentity,approved.currentIdentity) || !isDeepStrictEqual(before.expectedNewIdentity,approved.expectedIdentity) || before.expiresAt!==approved.expiresAt) deny("Capability expectation recovery contract does not match the durable cutover generation");
@@ -576,14 +587,17 @@ export class CarrierBindingStore {
          operation.receipt?.restartState!=="requested") deny("Capability expectation recovery durable restart binding changed");
 
       const localContext=Object.freeze({});
-      const grant=this.grant(binding);
       const recoveryDetail=JSON.stringify({kind:"cutover_capability_expectation_mismatch",cutoverId:input.cutoverId,requestHash:correlation.requestHash,observedIdentity:input.observedIdentity});
       const localOwnership=operations.createOwnershipStore({
         now:this.now,
         resolveOwnerContext: context=>context===localContext?{ownerThread:binding.row.id}:undefined,
         resolveEffectBinding: ()=>undefined,
-        verifyGrantEvidence: (candidate,owner)=>owner.ownerThread===binding.row.id && isDeepStrictEqual(candidate,grant),
+        verifyGrantEvidence: (candidate,owner)=>{
+          assertRecoveryAuthorityCurrent();
+          return owner.ownerThread===binding.row.id && isDeepStrictEqual(candidate,grant);
+        },
         verifyReconciliationEvidence: (evidence,lease,owner)=>{
+          assertRecoveryAuthorityCurrent();
           const current=cutoverStore.get();
           if(!current || current.cutoverId!==input.cutoverId || !current.coordinationBinding) return false;
           if(current.phase!=="drained" && !(current.phase==="closed" && current.capabilityExpectationMismatch)) return false;
@@ -611,17 +625,25 @@ export class CarrierBindingStore {
       const afterLease=cutoverStore.get();
       if(!afterLease || afterLease.cutoverId!==before.cutoverId || (before.phase==="drained" && !isDeepStrictEqual(afterLease,before)) || (before.phase==="closed" && !isDeepStrictEqual(afterLease,before))) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Capability expectation recovery cutover changed after lease reconciliation");
 
-      const recovered=cutoverStore.recoverCapabilityExpectationMismatch({cutoverId:input.cutoverId,recoveredBy:binding.row.id,observedIdentity:input.observedIdentity});
+      const recovered=operations.atomic(()=>{
+        assertRecoveryAuthorityCurrent();
+        const currentCutover=cutoverStore.get();
+        if(!currentCutover || currentCutover.cutoverId!==afterLease.cutoverId || !isDeepStrictEqual(currentCutover,afterLease)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Capability expectation recovery cutover changed before terminal close");
+        return cutoverStore.recoverCapabilityExpectationMismatch({cutoverId:input.cutoverId,recoveredBy:binding.row.id,observedIdentity:input.observedIdentity});
+      });
       const canonicalClosed=cutoverStore.get();
       if(!canonicalClosed || canonicalClosed.cutoverId!==input.cutoverId || canonicalClosed.phase!=="closed" || !canonicalClosed.capabilityExpectationMismatch) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Capability expectation recovery canonical cutover readback is incomplete");
       const terminalHash=cutoverTerminalRecordHash(canonicalClosed);
-      const current=operations.getByOperationId(correlation.operationHandle);
-      if(!current || current.requestHash!==operation.requestHash || !isDeepStrictEqual(current.request,operation.request)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Capability expectation recovery durable intent changed");
-      if(current.receipt?.lifecycleTerminal===true) {
-        if(current.receipt?.terminalRecordHash!==terminalHash || current.receipt?.recoveryKind!=="capability_expectation_mismatch" || !isDeepStrictEqual(current.receipt?.failedLeaseRecovery,reconciliation)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Capability expectation recovery terminal receipt changed");
-      } else {
-        operations.finish(correlation.operationHandle,{status:"failed",retrySafe:false,receipt:{...current.receipt,lifecycleTerminal:true,terminalRecordHash:terminalHash,recoveryKind:"capability_expectation_mismatch",failedLeaseRecovery:reconciliation},errorCode:"CAPABILITY_EXPECTATION_MISMATCH",errorMessage:"Replacement source/build matched, but the observed capability manifest differed from the approved expected capability."});
-      }
+      operations.atomic(()=>{
+        assertRecoveryAuthorityCurrent();
+        const current=operations.getByOperationId(correlation.operationHandle);
+        if(!current || current.requestHash!==operation.requestHash || !isDeepStrictEqual(current.request,operation.request)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Capability expectation recovery durable intent changed");
+        if(current.receipt?.lifecycleTerminal===true) {
+          if(current.receipt?.terminalRecordHash!==terminalHash || current.receipt?.recoveryKind!=="capability_expectation_mismatch" || !isDeepStrictEqual(current.receipt?.failedLeaseRecovery,reconciliation)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Capability expectation recovery terminal receipt changed");
+        } else {
+          operations.finish(correlation.operationHandle,{status:"failed",retrySafe:false,receipt:{...current.receipt,lifecycleTerminal:true,terminalRecordHash:terminalHash,recoveryKind:"capability_expectation_mismatch",failedLeaseRecovery:reconciliation},errorCode:"CAPABILITY_EXPECTATION_MISMATCH",errorMessage:"Replacement source/build matched, but the observed capability manifest differed from the approved expected capability."});
+        }
+      });
 
       lease=localOwnership.get(correlation.leaseId)!;
       if(!lease.terminalState) lease=localOwnership.release(localContext,correlation.leaseId,lease.version);
