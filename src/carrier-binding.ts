@@ -733,6 +733,7 @@ export class CarrierBindingStore {
       const localOwnership=operations.createOwnershipStore({
         now:this.now,
         resolveOwnerContext: context=>context===localContext?{ownerThread:row.id}:undefined,
+        resolveEffectBinding: ()=>undefined,
         verifyGrantEvidence: (candidate,owner)=>owner.ownerThread===row.id && isDeepStrictEqual(candidate,grant),
       });
       let lease=localOwnership.get(input.leaseId);
