@@ -620,7 +620,7 @@ export class CarrierBindingStore {
       if(current.receipt?.lifecycleTerminal===true) {
         if(current.receipt?.terminalRecordHash!==terminalHash || current.receipt?.recoveryKind!=="capability_expectation_mismatch" || !isDeepStrictEqual(current.receipt?.failedLeaseRecovery,reconciliation)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Capability expectation recovery terminal receipt changed");
       } else {
-        operations.finish(correlation.operationHandle,{status:"failed",retrySafe:false,receipt:{...current.receipt,lifecycleTerminal:true,terminalRecordHash:terminalHash,recoveryKind:"capability_expectation_mismatch",failedLeaseRecovery:reconciliation},errorCode:"CAPABILITY_EXPECTATION_MISMATCH",errorMessage:"Replacement source/build loaded, but the observed capability manifest differed from the bound expected capability."});
+        operations.finish(correlation.operationHandle,{status:"failed",retrySafe:false,receipt:{...current.receipt,lifecycleTerminal:true,terminalRecordHash:terminalHash,recoveryKind:"capability_expectation_mismatch",failedLeaseRecovery:reconciliation},errorCode:"CAPABILITY_EXPECTATION_MISMATCH",errorMessage:"Replacement source/build matched, but the observed capability manifest differed from the approved expected capability."});
       }
 
       lease=localOwnership.get(correlation.leaseId)!;
