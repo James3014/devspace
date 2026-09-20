@@ -2320,7 +2320,7 @@ function registerControlPlaneMigrationTools(
 
   const sourceBinding = (): ControlPlaneServiceBinding => {
     const binding = bindingForRole("NON_AUTHORITATIVE_MIGRATION_SOURCE");
-    if (binding.serverInstanceId !== runtimeIdentity!.serverInstanceId || binding.sourceCommit !== runtimeIdentity!.sourceCommit || binding.buildId !== runtimeIdentity!.buildId || binding.capabilityManifestSha256 !== capabilityManifest!.manifestSha256 || binding.catalogGeneration !== catalogGeneration || binding.stateDirectory !== runtimeIdentity!.stateRoot) {
+    if (binding.serverInstanceId !== runtimeIdentity!.serviceInstanceId || binding.sourceCommit !== runtimeIdentity!.sourceCommit || binding.buildId !== runtimeIdentity!.buildId || binding.capabilityManifestSha256 !== capabilityManifest!.manifestSha256 || binding.catalogGeneration !== catalogGeneration || binding.stateDirectory !== runtimeIdentity!.stateRoot) {
       throw new ControlPlaneConvergenceError("IDENTITY_DRIFT", "topology manifest does not exactly bind the running migration source");
     }
     return binding;
@@ -2335,7 +2335,7 @@ function registerControlPlaneMigrationTools(
   };
   const requireCanonicalRuntime = (): void => {
     const binding = canonicalBinding();
-    if (binding.serverInstanceId !== runtimeIdentity!.serverInstanceId || binding.sourceCommit !== runtimeIdentity!.sourceCommit || binding.buildId !== runtimeIdentity!.buildId || binding.capabilityManifestSha256 !== capabilityManifest!.manifestSha256 || binding.catalogGeneration !== catalogGeneration || binding.stateDirectory !== runtimeIdentity!.stateRoot) {
+    if (binding.serverInstanceId !== runtimeIdentity!.serviceInstanceId || binding.sourceCommit !== runtimeIdentity!.sourceCommit || binding.buildId !== runtimeIdentity!.buildId || binding.capabilityManifestSha256 !== capabilityManifest!.manifestSha256 || binding.catalogGeneration !== catalogGeneration || binding.stateDirectory !== runtimeIdentity!.stateRoot) {
       throw new ControlPlaneConvergenceError("IDENTITY_DRIFT", "migration apply/reconcile requires the canonical production runtime");
     }
   };
@@ -5984,7 +5984,7 @@ export function createServer(
   config = loadConfig(),
   options: CreateServerOptions = {},
 ): RunningServer {
-  const manifestBoundServerInstanceId = config.controlPlaneInventory?.manifestRequired === true
+  const manifestBoundServiceInstanceId = config.controlPlaneInventory?.manifestRequired === true
     ? requireManifestBoundServerInstanceId(process.env.DEVSPACE_SERVER_INSTANCE_ID)
     : undefined;
   const controlPlaneInventoryReader = options.controlPlaneInventory
@@ -6080,7 +6080,7 @@ export function createServer(
     configRoot: devspaceConfigDir(process.env),
     stateRoot: config.stateDir,
     profileCatalogGeneration: "unresolved",
-    ...(manifestBoundServerInstanceId ? { serverInstanceId: manifestBoundServerInstanceId } : {}),
+    ...(manifestBoundServiceInstanceId ? { serviceInstanceId: manifestBoundServiceInstanceId } : {}),
   });
   const latestProfileCatalogGeneration = { value: runtimeBuildIdentity.profileCatalogGeneration };
   const agentSessionManager = config.subagents.enabled

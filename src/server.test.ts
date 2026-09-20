@@ -350,12 +350,12 @@ test("initialize rejects explicitly when every resident MCP session is in flight
   }
 });
 
-test("manifest-bound production startup requires and binds the launch UUID", async () => {
+test("manifest-bound production startup separates stable service identity from runtime generation", async () => {
   const root = await mkdtemp(join(tmpdir(), "devspace-manifest-bound-server-"));
   const configDir = join(root, "config");
   const stateDir = join(root, "state");
   await mkdir(configDir, { recursive: true });
-  const serverInstanceId = "123e4567-e89b-42d3-a456-426614174000";
+  const serviceInstanceId = "123e4567-e89b-42d3-a456-426614174000";
   await writeFile(join(configDir, "control-plane.json"), JSON.stringify({
     schema: "devspace.control_plane_topology_manifest.v1",
     observedAt: new Date().toISOString(),
@@ -364,7 +364,7 @@ test("manifest-bound production startup requires and binds the launch UUID", asy
       services: [{
         role: "primary",
         roleKind: "AUTHORITATIVE_PRODUCTION",
-        serviceIdentity: { serviceName: "primary", serverInstanceId },
+        serviceIdentity: { serviceName: "primary", serverInstanceId: serviceInstanceId },
         endpoint: { url: "https://primary.invalid", port: 7677 },
         oauth: { clientIds: [] },
         stateDirectory: stateDir,
@@ -394,27 +394,37 @@ test("manifest-bound production startup requires and binds the launch UUID", asy
     PORT: "1",
   });
   const previousLaunchId = process.env.DEVSPACE_SERVER_INSTANCE_ID;
-  let running: ReturnType<typeof createServer> | undefined;
-  let listener: ReturnType<ReturnType<typeof createServer>["app"]["listen"]> | undefined;
   try {
     delete process.env.DEVSPACE_SERVER_INSTANCE_ID;
     assert.throws(() => createServer(config), /DEVSPACE_SERVER_INSTANCE_ID is required/);
     process.env.DEVSPACE_SERVER_INSTANCE_ID = "not-a-uuid";
     assert.throws(() => createServer(config), /DEVSPACE_SERVER_INSTANCE_ID must be a valid UUID/);
 
-    process.env.DEVSPACE_SERVER_INSTANCE_ID = serverInstanceId;
-    running = createServer(config);
-    listener = running.app.listen(0, "127.0.0.1");
-    await new Promise<void>((resolve, reject) => {
-      listener?.once("listening", resolve);
-      listener?.once("error", reject);
-    });
-    const address = listener.address() as { port: number };
-    const identity = await (await fetch(`http://127.0.0.1:${address.port}/identity`)).json() as { serverInstanceId: string };
-    assert.equal(identity.serverInstanceId, serverInstanceId);
+    process.env.DEVSPACE_SERVER_INSTANCE_ID = serviceInstanceId;
+    const runtimeInstanceIds: string[] = [];
+    for (let generation = 0; generation < 2; generation += 1) {
+      const running = createServer(config);
+      const listener = running.app.listen(0, "127.0.0.1");
+      try {
+        await new Promise<void>((resolve, reject) => {
+          listener.once("listening", resolve);
+          listener.once("error", reject);
+        });
+        const address = listener.address() as { port: number };
+        const identity = await (await fetch(`http://127.0.0.1:${address.port}/identity`)).json() as {
+          serverInstanceId: string;
+          serviceInstanceId?: string;
+        };
+        assert.equal(identity.serviceInstanceId, serviceInstanceId);
+        assert.match(identity.serverInstanceId, /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
+        runtimeInstanceIds.push(identity.serverInstanceId);
+      } finally {
+        await new Promise<void>((resolve) => listener.close(() => resolve()));
+        await running.close();
+      }
+    }
+    assert.notEqual(runtimeInstanceIds[0], runtimeInstanceIds[1], "a replacement process must have a fresh runtime serverInstanceId");
   } finally {
-    if (listener) await new Promise<void>((resolve) => listener?.close(() => resolve()));
-    await running?.close();
     if (previousLaunchId === undefined) delete process.env.DEVSPACE_SERVER_INSTANCE_ID;
     else process.env.DEVSPACE_SERVER_INSTANCE_ID = previousLaunchId;
     await rm(root, { recursive: true, force: true });

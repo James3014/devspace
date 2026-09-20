@@ -31,7 +31,10 @@ export interface RuntimeBuildIdentity {
   buildId: string;
   buildManifestSha256?: string;
   builtAt: string;
+  /** Ephemeral process/runtime generation identity. Changes on every server process start. */
   serverInstanceId: string;
+  /** Stable manifest-bound physical service identity, when production topology requires one. */
+  serviceInstanceId?: string;
   pid: number;
   startedAt: string;
   listenPort: number;
@@ -106,6 +109,7 @@ export function describeRuntimeBuildIdentity(input: {
   pid?: number;
   startedAt?: Date;
   serverInstanceId?: string;
+  serviceInstanceId?: string;
 }): RuntimeBuildIdentity {
   const file = input.identityFile
     ?? loadBuildIdentityFile(input.env, input.packageRoot);
@@ -119,6 +123,7 @@ export function describeRuntimeBuildIdentity(input: {
     buildManifestSha256: file.build_manifest_sha256,
     builtAt: file.built_at,
     serverInstanceId: input.serverInstanceId ?? randomUUID(),
+    ...(input.serviceInstanceId ? { serviceInstanceId: input.serviceInstanceId } : {}),
     pid: input.pid ?? process.pid,
     startedAt: (input.startedAt ?? new Date()).toISOString(),
     listenPort: input.listenPort,
