@@ -356,7 +356,7 @@ async function inspectWorkspaces(input: HostStorageRetentionInput): Promise<Host
       id: `workspace:${session.id}`,
       kind,
       path,
-      sizeBytes: await directorySize(path),
+      sizeBytes: kind === "workspace_checkout" ? 0 : await directorySize(path),
       workspaceId: session.id,
       lastUseAt: session.lastUsedAt,
       ...(session.sourceRoot ? { sourceRoot: resolve(session.sourceRoot) } : {}),
