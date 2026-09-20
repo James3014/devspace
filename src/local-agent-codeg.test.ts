@@ -282,6 +282,7 @@ test("continuation addresses the same Codeg handle instead of creating a replace
   const fake = createFakeCodeg({
     existingTasks: [existing],
     taskStates: [
+      { status: "review", result_summary: "first result" },
       { status: "running", result_summary: null },
       { status: "review", result_summary: "second result" },
     ],
