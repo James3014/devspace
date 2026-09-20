@@ -455,6 +455,10 @@ test("continuation addresses the same Codeg handle instead of creating a replace
   const returned = fake.requests.find((entry) => entry.path === "/api/work_task_return");
   assert.equal(returned?.body.id, 88);
   assert.equal(returned?.body.feedback, "follow up");
+  assert.equal(
+    fake.requests.filter((entry) => entry.path === "/api/work_task_return").length,
+    1,
+  );
 });
 
 test("same-task recollection polls a bound running Codeg task without create, start, or return", async () => {
@@ -479,6 +483,7 @@ test("same-task recollection polls a bound running Codeg task without create, st
       workspaceRoot: "/tmp/codeg-codex-recollect",
       providerSessionId: "codeg-work-task:89",
       writeMode: "allowed",
+      recollectOnly: true,
     },
     undefined,
     envFor("codex"),
@@ -493,6 +498,129 @@ test("same-task recollection polls a bound running Codeg task without create, st
   const gets = fake.requests.filter((entry) => entry.path === "/api/work_task_get");
   assert.ok(gets.length >= 2);
   assert.equal(gets.every((entry) => entry.body.id === 89), true);
+});
+
+test("normal continuation rejects a running handle without durable recollection authority", async () => {
+  const fake = createFakeCodeg({
+    existingTasks: [{
+      id: 896,
+      title: "[devspace:agt-codex-running-continuation] codex",
+      status: "running",
+      result_summary: null,
+    }],
+    taskStates: [
+      { status: "running", result_summary: null },
+      { status: "review", result_summary: "must not be collected" },
+    ],
+  });
+
+  await assert.rejects(
+    runCodegLocalAgent(
+      "agt-codex-running-continuation",
+      "codex",
+      {
+        prompt: "must not infer recovery from remote status",
+        workspaceRoot: "/tmp/codeg-codex-running-continuation",
+        providerSessionId: "codeg-work-task:896",
+        writeMode: "allowed",
+      },
+      undefined,
+      envFor("codex"),
+      fake.fetchImpl,
+    ),
+    /recollectOnly.*durable lifecycle authority.*required/i,
+  );
+  assert.equal(fake.requests.filter((entry) => entry.path === "/api/work_task_get").length, 1);
+  assert.equal(fake.requests.filter((entry) => entry.path === "/api/work_task_create").length, 0);
+  assert.equal(fake.requests.filter((entry) => entry.path === "/api/work_task_start").length, 0);
+  assert.equal(fake.requests.filter((entry) => entry.path === "/api/work_task_return").length, 0);
+});
+
+test("recollection collects a review task directly when recovery races remote completion", async () => {
+  const fake = createFakeCodeg({
+    existingTasks: [{
+      id: 90,
+      title: "[devspace:agt-codex-review-race] codex",
+      status: "review",
+      result_summary: "already complete",
+    }],
+  });
+
+  const result = await runCodegLocalAgent(
+    "agt-codex-review-race",
+    "codex",
+    {
+      prompt: "must not be sent back to Codeg",
+      workspaceRoot: "/tmp/codeg-codex-review-race",
+      providerSessionId: "codeg-work-task:90",
+      writeMode: "allowed",
+      recollectOnly: true,
+    },
+    undefined,
+    envFor("codex"),
+    fake.fetchImpl,
+  );
+
+  assert.equal(result.finalResponse, "already complete");
+  assert.equal(fake.requests.filter((entry) => entry.path === "/api/work_task_return").length, 0);
+  assert.equal(fake.requests.filter((entry) => entry.path === "/api/work_task_start").length, 0);
+  assert.equal(fake.requests.filter((entry) => entry.path === "/api/work_task_create").length, 0);
+});
+
+test("recollection requires an exact durable Codeg handle before any remote create", async () => {
+  const fake = createFakeCodeg({});
+
+  await assert.rejects(
+    runCodegLocalAgent(
+      "agt-codex-missing-recollect-handle",
+      "codex",
+      {
+        prompt: "must fail closed",
+        workspaceRoot: "/tmp/codeg-codex-missing-recollect-handle",
+        writeMode: "allowed",
+        recollectOnly: true,
+      },
+      undefined,
+      envFor("codex"),
+      fake.fetchImpl,
+    ),
+    /recollectOnly.*providerSessionId/i,
+  );
+  assert.equal(fake.requests.length, 0);
+});
+
+test("recollection preserves failed and canceled Codeg tasks as terminal failures", async () => {
+  for (const status of ["failed", "canceled"] as const) {
+    const fake = createFakeCodeg({
+      existingTasks: [{
+        id: status === "failed" ? 94 : 95,
+        title: `[devspace:agt-codex-${status}] codex`,
+        status,
+        failure_reason: `${status} remotely`,
+      }],
+    });
+
+    await assert.rejects(
+      runCodegLocalAgent(
+        `agt-codex-${status}`,
+        "codex",
+        {
+          prompt: "must remain terminal",
+          workspaceRoot: `/tmp/codeg-codex-${status}`,
+          providerSessionId: formatCodegTaskHandle(status === "failed" ? 94 : 95),
+          writeMode: "allowed",
+          recollectOnly: true,
+        },
+        undefined,
+        envFor("codex"),
+        fake.fetchImpl,
+      ),
+      new RegExp(`settled as '${status}'`),
+    );
+    assert.equal(fake.requests.filter((entry) => entry.path === "/api/work_task_create").length, 0);
+    assert.equal(fake.requests.filter((entry) => entry.path === "/api/work_task_start").length, 0);
+    assert.equal(fake.requests.filter((entry) => entry.path === "/api/work_task_return").length, 0);
+  }
 });
 
 test("exact cancel touches only the bound Codeg task", async () => {

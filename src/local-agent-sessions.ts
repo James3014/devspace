@@ -29,6 +29,7 @@ import {
   isCodegProviderEnabled,
   parseCodegTaskHandle,
   runCodegLocalAgent,
+  type CodegRunInput,
 } from "./local-agent-codeg.js";
 import { resolveEffectiveExecutionIdlePolicy } from "./local-agent-idle-policy.js";
 import { LocalAgentProviderError, type LocalAgentRunCallbacks, type LocalAgentRunResult } from "./local-agent-runtime.js";
@@ -2555,7 +2556,11 @@ async function runLocalAgentProfile(
     environment,
   };
   if (isCodegProviderEnabled(profile.provider, environment)) {
-    return runCodegLocalAgent(record.id, profile.provider, input, callbacks, environment);
+    const codegInput: CodegRunInput = {
+      ...input,
+      recollectOnly: record.lifecycleState?.activeTurn?.recollectOnly === true,
+    };
+    return runCodegLocalAgent(record.id, profile.provider, codegInput, callbacks, environment);
   }
   return runLocalAgentProvider(profile.provider, input, callbacks);
 }

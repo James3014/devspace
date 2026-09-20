@@ -11,6 +11,7 @@ import type { ServerConfig } from "./config.js";
 import { canonicalizePath } from "./roots.js";
 import {
   type ActiveTurnState,
+  type AgentRecoveryIntent,
   type AgentLifecycleKind,
   type AgentTerminalReason,
   type AgentTurnLaunchState,
@@ -61,6 +62,8 @@ export interface AgentLifecycleState {
   lifecycleCorrupt?: true;
   /** Last generation settled by normal completion or verified termination. */
   lastSettledGeneration?: string;
+  /** Durable recollection intent for an exact Codeg task left by a lost turn. */
+  recoveryIntent?: AgentRecoveryIntent;
   /** Legacy detached row whose exact physical target cannot be reconstructed. */
   terminationBlocked?: {
     detectedAt: string;
@@ -575,15 +578,29 @@ export class LocalAgentStore {
       }
 
       const now = input.turnStartedAt ?? new Date().toISOString();
+      const previousRecovery = lifecycle?.recoveryIntent;
+      const recovery = previousRecovery
+        && previousRecovery.sourceGeneration === lifecycle.lastSettledGeneration
+        && previousRecovery.provider === current.provider
+        && previousRecovery.providerSessionId === current.providerSessionId
+        && isExactCodegBinding(current.provider, current.providerSessionId)
+        ? {
+            ...previousRecovery,
+            activeGeneration: undefined,
+          }
+        : undefined;
+      const generation = randomUUID();
       const updatedLifecycle: AgentLifecycleState = {
         ...lifecycle,
         activeTurn: {
-          generation: randomUUID(),
+          generation,
           turnStartedAt: now,
           lastActivityAt: now,
           executionIdlePolicy: input.executionIdlePolicy,
+          ...(recovery ? { recollectOnly: true } : {}),
           launchState: "not_started",
         },
+        recoveryIntent: recovery ? { ...recovery, activeGeneration: generation } : undefined,
         terminationPending: undefined,
         lifecycleCorrupt: undefined,
       };
@@ -894,6 +911,7 @@ export class LocalAgentStore {
         lastExecutionIdlePolicy: lifecycle.activeTurn?.executionIdlePolicy,
         lastEffectEnforcementReceipt: input.effectEnforcementReceipt,
         activeTurn: undefined,
+        recoveryIntent: undefined,
         terminationPending: undefined,
         lastSettledGeneration: input.generation,
         cumulativeChangedPaths: input.cumulativeChangedPaths ?? lifecycle.cumulativeChangedPaths,
@@ -929,6 +947,16 @@ export class LocalAgentStore {
         }
       } else if (!providerSessionId && current.provider === "agy") {
         providerContinuityState = "LOST";
+      }
+      if (providerContinuityState !== "LOST" && shouldScheduleCodegRecovery(
+        { provider: current.provider, providerSessionId },
+        input.status,
+        input.terminalReason,
+      )) {
+        lifecycleState.recoveryIntent = codegRecoveryIntent(
+          { provider: current.provider, providerSessionId },
+          input.generation,
+        );
       }
 
       const now = new Date().toISOString();
@@ -989,6 +1017,9 @@ export class LocalAgentStore {
         ...lifecycle,
         lastExecutionIdlePolicy: lifecycle.activeTurn?.executionIdlePolicy,
         activeTurn: undefined,
+        recoveryIntent: lifecycle.activeTurn?.recollectOnly
+          ? codegRecoveryIntent(current, generation)
+          : undefined,
         lastSettledGeneration: generation,
       };
       const now = new Date().toISOString();
@@ -1161,6 +1192,11 @@ export class LocalAgentStore {
         terminationPending: undefined,
         termination: undefined,
         lifecycleCorrupt: undefined,
+        recoveryIntent: pending.terminalStatus === "error"
+          && isRecoveryTerminalReason(pending.reason)
+          && current.providerContinuityState !== "LOST"
+          ? codegRecoveryIntent(current, input.generation)
+          : undefined,
         lastSettledGeneration: input.generation,
         cumulativeChangedPaths: input.cumulativeChangedPaths ?? current.lifecycleState?.cumulativeChangedPaths,
         turnEndBaseline: input.turnEndBaseline,
@@ -1612,6 +1648,9 @@ function readLifecycleState(value: string | null | undefined): AgentLifecycleSta
     if (detached && typeof parsed.lastSettledGeneration === "string" && parsed.lastSettledGeneration) {
       state.lastSettledGeneration = parsed.lastSettledGeneration;
     }
+    const recoveryIntentLooking = parsed.recoveryIntent !== undefined && parsed.recoveryIntent !== null;
+    const recoveryIntent = readRecoveryIntent(parsed.recoveryIntent);
+    if (recoveryIntent) state.recoveryIntent = recoveryIntent;
     const termination = readPhysicalTerminationState(parsed.termination);
     if (termination) state.termination = termination;
     const lastExecutionIdlePolicy = readEffectiveExecutionIdlePolicy(parsed.lastExecutionIdlePolicy);
@@ -1643,6 +1682,9 @@ function readLifecycleState(value: string | null | undefined): AgentLifecycleSta
       (activeLooking && !activeTurn) ||
       (pendingLooking && !terminationPending) ||
       (blockedLooking && !terminationBlocked) ||
+      (recoveryIntentLooking && !recoveryIntent) ||
+      (recoveryIntent?.activeGeneration !== undefined && recoveryIntent.activeGeneration !== activeTurn?.generation) ||
+      (activeTurn?.recollectOnly === true && recoveryIntent?.activeGeneration !== activeTurn.generation) ||
       (effectReceiptLooking && !lastEffectEnforcementReceipt) ||
       authorityStateCount > 1
     ) {
@@ -1698,6 +1740,7 @@ function readActiveTurnState(value: unknown): ActiveTurnState | undefined {
     !launchState ||
     (record.executionStartedAt !== undefined &&
       (typeof record.executionStartedAt !== "string" || !Number.isFinite(Date.parse(record.executionStartedAt))))
+    || (record.recollectOnly !== undefined && record.recollectOnly !== true)
   ) {
     return undefined;
   }
@@ -1713,7 +1756,35 @@ function readActiveTurnState(value: unknown): ActiveTurnState | undefined {
       ? record.lastActivityAt
       : undefined,
     executionIdlePolicy,
+    ...(record.recollectOnly === true ? { recollectOnly: true } : {}),
     launchState,
+  };
+}
+
+function readRecoveryIntent(value: unknown): AgentRecoveryIntent | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    record.kind !== "codeg_recollect" ||
+    record.recollectOnly !== true ||
+    typeof record.provider !== "string" ||
+    !isCodegProvider(record.provider) ||
+    typeof record.providerSessionId !== "string" ||
+    !isExactCodegHandle(record.providerSessionId) ||
+    typeof record.sourceGeneration !== "string" ||
+    !record.sourceGeneration ||
+    (record.activeGeneration !== undefined &&
+      (typeof record.activeGeneration !== "string" || !record.activeGeneration))
+  ) {
+    return undefined;
+  }
+  return {
+    kind: "codeg_recollect",
+    recollectOnly: true,
+    provider: record.provider,
+    providerSessionId: record.providerSessionId,
+    sourceGeneration: record.sourceGeneration,
+    ...(record.activeGeneration === undefined ? {} : { activeGeneration: record.activeGeneration }),
   };
 }
 
@@ -1801,6 +1872,54 @@ function readLaunchState(value: unknown): AgentTurnLaunchState | undefined {
   return value === "not_started" || value === "launching" || value === "spawned" || value === "claimed"
     ? value
     : undefined;
+}
+
+function isCodegProvider(provider: string): boolean {
+  return provider === "codex"
+    || provider === "opencode"
+    || provider === "grok"
+    || provider === "cline"
+    || provider === "agy";
+}
+
+function isExactCodegHandle(value: string | undefined): value is string {
+  if (typeof value !== "string" || !/^codeg-work-task:[1-9][0-9]*$/.test(value)) return false;
+  return Number.isSafeInteger(Number(value.slice("codeg-work-task:".length)));
+}
+
+function isExactCodegBinding(provider: string, providerSessionId: string | undefined): providerSessionId is string {
+  return isCodegProvider(provider) && isExactCodegHandle(providerSessionId);
+}
+
+function codegRecoveryIntent(
+  record: Pick<LocalAgentRecord, "provider" | "providerSessionId">,
+  sourceGeneration: string,
+): AgentRecoveryIntent | undefined {
+  const providerSessionId = record.providerSessionId;
+  if (!isExactCodegBinding(record.provider, providerSessionId)) return undefined;
+  return {
+    kind: "codeg_recollect",
+    recollectOnly: true,
+    provider: record.provider,
+    providerSessionId,
+    sourceGeneration,
+  };
+}
+
+function isRecoveryTerminalReason(reason: AgentTerminalReason | undefined): boolean {
+  return reason === undefined
+    || reason === "timeout"
+    || reason === "idle_timeout"
+    || reason === "provider_error"
+    || reason === "unknown";
+}
+
+function shouldScheduleCodegRecovery(
+  record: Pick<LocalAgentRecord, "provider" | "providerSessionId">,
+  status: "idle" | "error",
+  reason: AgentTerminalReason | undefined,
+): boolean {
+  return status === "error" && isRecoveryTerminalReason(reason) && isExactCodegBinding(record.provider, record.providerSessionId);
 }
 
 function laterLaunchState(

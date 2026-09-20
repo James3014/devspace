@@ -167,7 +167,27 @@ export interface ActiveTurnState {
   lastActivityAt?: string;
   /** Durable effective execution-idle policy for this exact turn. */
   executionIdlePolicy?: EffectiveExecutionIdlePolicy;
+  /**
+   * This turn is collecting the exact provider outcome left by a prior lost
+   * turn. The provider edge must not reinterpret it as a new continuation.
+   */
+  recollectOnly?: boolean;
   launchState?: AgentTurnLaunchState;
+}
+
+/**
+ * Durable provider recovery intent. This is lifecycle evidence, not prompt
+ * text or provider-status inference. `sourceGeneration` identifies the turn
+ * that lost local ownership; `activeGeneration` is filled by the continuation
+ * CAS that consumes the intent.
+ */
+export interface AgentRecoveryIntent {
+  kind: "codeg_recollect";
+  recollectOnly: true;
+  provider: string;
+  providerSessionId: string;
+  sourceGeneration: string;
+  activeGeneration?: string;
 }
 
 export interface TerminationPendingState {

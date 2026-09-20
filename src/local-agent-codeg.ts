@@ -80,6 +80,14 @@ export interface CodegTaskInspection {
   summary?: string;
 }
 
+/**
+ * Codeg-only execution input. Recovery intent is a DevSpace lifecycle
+ * marker, not part of the common native-provider runtime contract.
+ */
+export interface CodegRunInput extends LocalAgentRunInput {
+  recollectOnly?: boolean;
+}
+
 type FetchLike = (
   input: string | URL | Request,
   init?: RequestInit,
@@ -181,10 +189,10 @@ export function formatCodegTaskHandle(taskId: number): string {
 }
 
 export function parseCodegTaskHandle(handle: string | undefined): number | undefined {
-  if (!handle?.startsWith(CODEG_HANDLE_PREFIX)) return undefined;
+  if (!handle || !/^codeg-work-task:[1-9][0-9]*$/.test(handle)) return undefined;
   const raw = handle.slice(CODEG_HANDLE_PREFIX.length);
   const taskId = Number(raw);
-  return Number.isInteger(taskId) && taskId > 0 ? taskId : undefined;
+  return Number.isSafeInteger(taskId) && taskId > 0 ? taskId : undefined;
 }
 
 export function codegTaskTitle(agentId: string, provider: LocalAgentProvider): string {
@@ -795,7 +803,7 @@ async function createOrRecoverTask(
 async function startOrContinueTask(
   config: CodegGatewayConfig,
   task: CodegTaskSnapshot,
-  input: LocalAgentRunInput,
+  input: CodegRunInput,
   firstTurn: boolean,
   fetchImpl: FetchLike,
 ): Promise<CodegTaskSnapshot> {
@@ -829,12 +837,23 @@ async function startOrContinueTask(
     return task;
   }
 
-  // A durable provider handle can represent either a new DevSpace prompt
-  // (Codeg `review`) or the unsettled turn from a detached worker that was
-  // lost after the remote task started (`running`). Recollection is strictly
-  // read/poll-only: never send the recovery prompt back through `return`, and
-  // never create or start a replacement task.
-  if (task.status === "running") return task;
+  // A recollection marker is durable lifecycle authority. It is strictly
+  // read/poll-only regardless of the remote task status: never send the
+  // recovery prompt through `return`, and never create or start a replacement.
+  if (input.recollectOnly === true) {
+    if (task.status === "running" || CODEG_TERMINAL_SUCCESS.has(task.status) || CODEG_TERMINAL_FAILURE.has(task.status)) {
+      return task;
+    }
+    throw new Error(
+      `Codeg recollection requires an existing running or terminal task; task ${task.id} is '${task.status}', refusing create/start/return.`,
+    );
+  }
+
+  if (task.status === "running") {
+    throw new Error(
+      `Codeg task ${task.id} is still running; normal continuation is fail-closed because recollectOnly durable lifecycle authority is required.`,
+    );
+  }
 
   if (task.status !== "review") {
     throw new Error(
@@ -853,13 +872,16 @@ async function startOrContinueTask(
 export async function runCodegLocalAgent(
   agentId: string,
   provider: LocalAgentProvider,
-  input: LocalAgentRunInput,
+  input: CodegRunInput,
   callbacks?: LocalAgentRunCallbacks,
   env: NodeJS.ProcessEnv = process.env,
   fetchImpl: FetchLike = fetch,
 ): Promise<LocalAgentRunResult> {
   const config = resolveCodegGatewayConfig(provider, env);
   if (!config) throw new Error(`Codeg backend is not selected for '${provider}'.`);
+  if (input.recollectOnly === true && parseCodegTaskHandle(input.providerSessionId) === undefined) {
+    throw new Error("Codeg recollectOnly requires an exact providerSessionId handle.");
+  }
   taskConfig(provider, input);
 
   const existingTaskId = parseCodegTaskHandle(input.providerSessionId);

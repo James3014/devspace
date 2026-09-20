@@ -669,6 +669,123 @@ test("LocalAgentSessionManager - errored Codeg binding can begin a new fenced tu
   }
 });
 
+test("LocalAgentSessionManager - durable Codeg recovery marker reaches recollect-only gateway path", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-codeg-recovery-session-test-"));
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "devspace-codeg-recovery-workspace-"));
+  const devspaceAgentsDir = mkdtempSync(join(tmpdir(), "devspace-codeg-recovery-agents-"));
+  const spawnedWorkers: { agentId: string; promptFile: string; workerToken: string }[] = [];
+  const previousEnv = {
+    providers: process.env.DEVSPACE_CODEG_PROVIDERS,
+    url: process.env.DEVSPACE_CODEG_URL,
+    token: process.env.DEVSPACE_CODEG_TOKEN,
+  };
+  const previousFetch = globalThis.fetch;
+  const requests: string[] = [];
+  process.env.DEVSPACE_CODEG_PROVIDERS = "agy";
+  process.env.DEVSPACE_CODEG_URL = "http://127.0.0.1:31817";
+  process.env.DEVSPACE_CODEG_TOKEN = "session-test-token";
+  const config = {
+    stateDir,
+    devspaceAgentsDir,
+    subagents: { enabled: true, providers: [{ id: "agy", enabled: true }] },
+    oauth: { scopes: ["devspace"] },
+  } as any;
+  const manager = new LocalAgentSessionManager(
+    config,
+    async (agentId, promptFile, workerToken) => {
+      spawnedWorkers.push({ agentId, promptFile, workerToken });
+    },
+  );
+  try {
+    const profileName = "__direct__agy__recovery__";
+    const started = await manager.startAgent({
+      workspaceId: "ws_codeg_recovery_session",
+      workspaceRoot,
+      profileName,
+      prompt: "initial Codeg turn",
+      profiles: [{
+        name: profileName,
+        description: "direct Codeg recovery",
+        provider: "agy",
+        model: "recovery-model",
+        write_mode: "allowed",
+        filePath: "<direct-dispatch>",
+        body: "",
+        disabled: false,
+      }],
+      executionContract: {
+        directSelection: {
+          provider: "agy",
+          model: "recovery-model",
+          writeMode: "allowed",
+        },
+      },
+      attemptKey: "codeg-recovery-session",
+    });
+    const store = (manager as any).store as LocalAgentStore;
+    const initial = store.getById(started.agentId)!;
+    const initialGeneration = initial.lifecycleState!.activeTurn!.generation!;
+    assert.equal(store.bindProviderSessionCAS(
+      started.agentId,
+      initialGeneration,
+      initial.workerToken!,
+      "codeg-work-task:777",
+    ).applied, true);
+    assert.equal(store.claimWorkerCAS(
+      started.agentId,
+      initialGeneration,
+      initial.workerToken!,
+      process.pid,
+    ).applied, true);
+    assert.equal(store.finishTurnCAS({
+      agentId: started.agentId,
+      generation: initialGeneration,
+      workerToken: initial.workerToken!,
+      providerSessionId: "codeg-work-task:777",
+      status: "error",
+      error: "lost before collection",
+      terminalReason: "provider_error",
+    }).applied, true);
+
+    const continued = await manager.continueAgent({
+      workspaceId: "ws_codeg_recovery_session",
+      workspaceRoot,
+      agentId: started.agentId,
+      prompt: "must not be returned to Codeg",
+    });
+    const launch = spawnedWorkers.at(-1)!;
+    const originalFetch = previousFetch;
+    globalThis.fetch = (async (input: string | URL | Request) => {
+      const path = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url).pathname;
+      requests.push(path);
+      if (path === "/api/work_task_get") {
+        return new Response(JSON.stringify({ id: 777, status: "review", result_summary: "recovered" }), { status: 200 });
+      }
+      if (path === "/api/work_task_changed_files") {
+        return new Response("[]", { status: 200 });
+      }
+      return new Response(JSON.stringify({ error: "unexpected" }), { status: 404 });
+    }) as typeof globalThis.fetch;
+    await manager.runWorkerTurnFromFile(continued.agentId, launch.promptFile, launch.workerToken);
+    assert.equal(requests.filter((path) => path === "/api/work_task_return").length, 0);
+    assert.equal(manager.getRecordByPrefixOrId(started.agentId)?.status, "idle");
+    assert.equal(manager.getRecordByPrefixOrId(started.agentId)?.lifecycleState?.recoveryIntent, undefined);
+    globalThis.fetch = originalFetch;
+  } finally {
+    globalThis.fetch = previousFetch;
+    manager.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(workspaceRoot, { recursive: true, force: true });
+    rmSync(devspaceAgentsDir, { recursive: true, force: true });
+    if (previousEnv.providers === undefined) delete process.env.DEVSPACE_CODEG_PROVIDERS;
+    else process.env.DEVSPACE_CODEG_PROVIDERS = previousEnv.providers;
+    if (previousEnv.url === undefined) delete process.env.DEVSPACE_CODEG_URL;
+    else process.env.DEVSPACE_CODEG_URL = previousEnv.url;
+    if (previousEnv.token === undefined) delete process.env.DEVSPACE_CODEG_TOKEN;
+    else process.env.DEVSPACE_CODEG_TOKEN = previousEnv.token;
+  }
+});
+
 test("LocalAgentSessionManager - cancel with default terminator: absent PID succeeds", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-agent-sessions-test-"));
   const config = { stateDir, subagents: true, oauth: { scopes: ["devspace"] } } as any;

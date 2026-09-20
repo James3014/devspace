@@ -218,6 +218,117 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
     expectedUpdatedAt: lostReopen.updatedAt,
   }).applied, false);
 
+  const recoveryStateDir = join(root, "codeg-recovery-intent");
+  let recoveryStore = new LocalAgentStore(recoveryStateDir);
+  const recoveryAgent = recoveryStore.create({
+    workspaceId: "ws_recovery",
+    workspaceRoot: join(root, "recovery-project"),
+    profileName: "codex-recovery",
+    provider: "codex",
+    lifecycleKind: "detached_worker_v2",
+  });
+  recoveryStore.prepareWorker(recoveryAgent.id, "recovery-token");
+  const recoveryClaim = recoveryStore.claimWorker(recoveryAgent.id, "recovery-token", 3005)!;
+  const recoveryGeneration = recoveryClaim.lifecycleState!.activeTurn!.generation!;
+  assert.equal(recoveryStore.failTurnCAS({
+    agentId: recoveryAgent.id,
+    generation: recoveryGeneration,
+    workerToken: "recovery-token",
+    providerSessionId: "codeg-work-task:401",
+    error: "worker lost before collection",
+    terminalReason: "provider_error",
+  }).applied, true);
+  recoveryStore.close();
+
+  recoveryStore = new LocalAgentStore(recoveryStateDir);
+  stores.push(recoveryStore);
+  const recoveryReopened = recoveryStore.getById(recoveryAgent.id)!;
+  assert.deepEqual(recoveryReopened.lifecycleState?.recoveryIntent, {
+    kind: "codeg_recollect",
+    recollectOnly: true,
+    provider: "codex",
+    providerSessionId: "codeg-work-task:401",
+    sourceGeneration: recoveryGeneration,
+  });
+  const recoveryContinuation = recoveryStore.beginContinuationCAS({
+    agentId: recoveryAgent.id,
+    expectedPreviousGeneration: recoveryReopened.lifecycleState?.lastSettledGeneration,
+    expectedUpdatedAt: recoveryReopened.updatedAt,
+  });
+  assert.equal(recoveryContinuation.applied, true);
+  const recoveryActive = recoveryContinuation.current!.lifecycleState!;
+  assert.equal(recoveryActive.activeTurn?.recollectOnly, true);
+  assert.equal(
+    recoveryActive.recoveryIntent?.activeGeneration,
+    recoveryActive.activeTurn?.generation,
+  );
+  recoveryStore.prepareWorker(recoveryAgent.id, "recovery-token-2");
+  recoveryStore.claimWorker(recoveryAgent.id, "recovery-token-2", 3006);
+  assert.equal(recoveryStore.finishTurnCAS({
+    agentId: recoveryAgent.id,
+    generation: recoveryActive.activeTurn!.generation!,
+    workerToken: "recovery-token-2",
+    status: "idle",
+    terminalReason: "completed",
+  }).applied, true);
+  assert.equal(recoveryStore.getById(recoveryAgent.id)?.lifecycleState?.recoveryIntent, undefined);
+
+  const timeoutRecovery = recoveryStore.create({
+    workspaceId: "ws_recovery",
+    workspaceRoot: join(root, "recovery-timeout-project"),
+    profileName: "codex-timeout-recovery",
+    provider: "codex",
+    lifecycleKind: "detached_worker_v2",
+  });
+  recoveryStore.prepareWorker(timeoutRecovery.id, "timeout-token");
+  const timeoutClaim = recoveryStore.claimWorker(timeoutRecovery.id, "timeout-token", 3007)!;
+  const timeoutGeneration = timeoutClaim.lifecycleState!.activeTurn!.generation!;
+  recoveryStore.bindProviderSessionCAS(
+    timeoutRecovery.id,
+    timeoutGeneration,
+    "timeout-token",
+    "codeg-work-task:402",
+  );
+  const timeoutFence = recoveryStore.fenceActiveTurn({
+    agentId: timeoutRecovery.id,
+    terminalReason: "timeout",
+    error: "worker timeout",
+  });
+  const timeoutPending = timeoutFence.current!.lifecycleState!.terminationPending!;
+  assert.equal((recoveryStore as any).completeTerminationCAS({
+    agentId: timeoutRecovery.id,
+    generation: timeoutPending.generation,
+    workerPid: timeoutPending.workerPid,
+    workerToken: timeoutPending.workerToken,
+    turnEndBaseline: { changedPaths: [], head: null },
+  }).applied, true);
+  assert.equal(
+    recoveryStore.getById(timeoutRecovery.id)?.lifecycleState?.recoveryIntent?.providerSessionId,
+    "codeg-work-task:402",
+  );
+
+  const legacyRecoveryRow = recoveryStore.create({
+    workspaceId: "ws_recovery",
+    workspaceRoot: join(root, "legacy-recovery-project"),
+    profileName: "legacy-recovery",
+    provider: "codex",
+    lifecycleKind: "detached_worker_v2",
+  });
+  const legacyDatabase = new Database(databasePath(recoveryStateDir));
+  legacyDatabase.prepare("update local_agent_sessions set lifecycle_state = ? where id = ?")
+    .run(JSON.stringify({
+      lifecycleKind: "detached_worker_v2",
+      activeTurn: {
+        generation: legacyRecoveryRow.lifecycleState!.activeTurn!.generation,
+        turnStartedAt: new Date().toISOString(),
+        launchState: "not_started",
+      },
+    }), legacyRecoveryRow.id);
+  legacyDatabase.close();
+  const legacyReadback = recoveryStore.getById(legacyRecoveryRow.id)!;
+  assert.equal(legacyReadback.lifecycleState?.lifecycleCorrupt, undefined);
+  assert.equal(legacyReadback.lifecycleState?.activeTurn?.recollectOnly, undefined);
+
   const agyWithoutIdentity = continuityStore.create({
     workspaceId: "ws_continuity",
     workspaceRoot: join(root, "continuity-project"),
