@@ -1381,6 +1381,43 @@ async function directorySize(path: string): Promise<number> {
     return 0;
   }
   if (stats.isSymbolicLink() || !stats.isDirectory()) return stats.size;
+
+  const nativeSize = await nativeDirectorySize(path);
+  if (nativeSize !== undefined) return nativeSize;
+  return directorySizeByTraversal(path);
+}
+
+async function nativeDirectorySize(path: string): Promise<number | undefined> {
+  try {
+    const result = await execFileAsync("du", ["-sk", path], {
+      encoding: "utf8",
+      timeout: 30_000,
+      maxBuffer: 1024 * 1024,
+    });
+    const match = /^\s*(\d+)\b/u.exec(String(result.stdout));
+    if (!match) return undefined;
+    const kibibytes = Number(match[1]);
+    if (
+      !Number.isSafeInteger(kibibytes) ||
+      kibibytes < 0 ||
+      kibibytes > Math.floor(Number.MAX_SAFE_INTEGER / 1024)
+    ) {
+      return undefined;
+    }
+    return kibibytes * 1024;
+  } catch {
+    return undefined;
+  }
+}
+
+async function directorySizeByTraversal(path: string): Promise<number> {
+  let stats;
+  try {
+    stats = await lstat(path);
+  } catch {
+    return 0;
+  }
+  if (stats.isSymbolicLink() || !stats.isDirectory()) return stats.size;
   let total = stats.size;
   let dir;
   try {
@@ -1388,7 +1425,7 @@ async function directorySize(path: string): Promise<number> {
   } catch {
     return total;
   }
-  for await (const entry of dir) total += await directorySize(join(path, entry.name));
+  for await (const entry of dir) total += await directorySizeByTraversal(join(path, entry.name));
   return total;
 }
 
