@@ -3,7 +3,13 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { BUILD_IDENTITY_RELATIVE_PATH, CutoverBuildNotReadyError, probeBuildReady } from "./cutover-build-ready.js";
+import {
+  BUILD_IDENTITY_RELATIVE_PATH,
+  CutoverBuildNotReadyError,
+  CutoverCapabilityManifestDomainMismatchError,
+  assertNoDigestDomainMismatch,
+  probeBuildReady,
+} from "./cutover-build-ready.js";
 
 const expected = { sourceCommit: "a".repeat(40), buildId: "build-expected" };
 
@@ -66,4 +72,33 @@ test("CutoverBuildNotReadyError carries a stable fail-closed code", () => {
   const error = new CutoverBuildNotReadyError("probe blocked");
   assert.equal(error.code, "CUTOVER_BUILD_NOT_READY");
   assert.match(error.message, /CUTOVER_BUILD_NOT_READY/);
+});
+
+test("capability digest domain guard preserves binding-repair ownership", () => {
+  const buildManifestSha256 = "d".repeat(64);
+  assert.throws(
+    () => assertNoDigestDomainMismatch(
+      { ...expected, capabilityManifestSha256: buildManifestSha256 },
+      { buildManifestSha256 },
+    ),
+    CutoverCapabilityManifestDomainMismatchError,
+  );
+  assert.doesNotThrow(() => assertNoDigestDomainMismatch(
+    { ...expected, capabilityManifestSha256: "c".repeat(64) },
+    { buildManifestSha256 },
+  ));
+  assert.throws(
+    () => assertNoDigestDomainMismatch(
+      { ...expected, capabilityManifestSha256: "c".repeat(64) },
+      {},
+    ),
+    CutoverBuildNotReadyError,
+  );
+  assert.throws(
+    () => assertNoDigestDomainMismatch(
+      { ...expected, capabilityManifestSha256: "c".repeat(64) },
+      { buildManifestSha256: "not-a-digest" },
+    ),
+    CutoverBuildNotReadyError,
+  );
 });

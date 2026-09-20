@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { CarrierBindingStore, type CarrierContract, type CarrierCompletionBinding } from "./carrier-binding.js";
 import { openDatabase } from "./db/client.js";
 import { CutoverStateStore } from "./cutover-state.js";
+import { ControlPlaneOwnershipStore } from "./control-plane-ownership.js";
 import { performLocalBoundCutoverRestart } from "./cutover-local-restart.js";
 
 function fixture(completionBindings: readonly CarrierCompletionBinding[] = []) {
@@ -27,6 +28,33 @@ function fixture(completionBindings: readonly CarrierCompletionBinding[] = []) {
   const snapshot=()=>JSON.stringify({validity:db.sqlite.prepare("select * from carrier_validity order by carrier_id").all(),bindings:db.sqlite.prepare("select * from carrier_bindings order by id").all(),effects:db.sqlite.prepare("select * from carrier_effect_bindings order by operation_id").all(),leases:db.sqlite.prepare("select * from control_plane_resource_leases order by lease_id").all()});
   return {root,workspace,store,db,controller,worker,contract,request,approved,snapshot,advance:(ms=120000)=>{now+=ms;},clock:()=>now,close:()=>{db.close();store.close();rmSync(root,{recursive:true,force:true});}};
 }
+
+async function prepareCapabilityMismatch(f: ReturnType<typeof fixture>, sessionId: string, expectedCapability: string, observedCapability: string) {
+  const context={clientId:"shared-oauth",sessionId};
+  const pairing=f.store.requestPairing(context);
+  const cutover={stateRoot:f.root,attemptKey:`${sessionId}-cutover`,
+    currentIdentity:{serverInstanceId:"original",sourceCommit:f.contract.baseRevision,buildId:"old",capabilityManifestSha256:"c".repeat(64)},
+    expectedIdentity:{sourceCommit:"b".repeat(40),buildId:"new",capabilityManifestSha256:expectedCapability},
+    expiresAt:new Date(f.clock()+120000).toISOString(),
+    restart:{buildReady:{verifiedBy:"fixture",verifiedAt:new Date(f.clock()).toISOString(),evidence:"exact target build"},actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"},
+    finish:{workspaceId:"ws_test",agentId:"agt_test"}};
+  const contract={...f.contract,scope:[f.root],operations:["cutover_start" as const],cutover,expiresAt:new Date(f.clock()+180000).toISOString()};
+  const approved=f.store.approveLocal(pairing.pendingId,contract);
+  f.store.redeem(context,pairing.credential);
+  const plan=planCutoverStart(f.root,cutover);
+  const preparedLease=f.store.prepareEffect(context,plan.subject);
+  const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,`${sessionId}-config`),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,`${sessionId}-worktrees`),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
+  const manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+  const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
+  manager.drainCutover(id,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
+  let scheduled=0;
+  await manager.restartCutover(id,cutover.currentIdentity,cutover.restart.buildReady,async()=>({buildReady:true,detail:"exact target build"}),{
+    actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service",
+    schedule:()=>{scheduled+=1;return {scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"};},
+  },context);
+  return {context,cutover,approved,preparedLease,manager,start,id,scheduled:()=>scheduled,observed:{serverInstanceId:"replacement",sourceCommit:cutover.expectedIdentity.sourceCommit,buildId:cutover.expectedIdentity.buildId,capabilityManifestSha256:observedCapability}};
+}
+
 for(const scenario of ["current","expired","close-response","terminal-write","revoke-witness","renew-witness","stale-replay"]) test(`local cutover approval binds execution and recovery (${scenario})`,async()=>{
   const expireLease=scenario!=="current";
   const f=fixture();
@@ -359,7 +387,30 @@ test("host-local capability expectation mismatch recovery closes the failed cuto
     assert.equal(f.store.ownership.get(preparedLease.leaseId)?.operationHandle,start.operationId);
 
     const observed={serverInstanceId:"replacement",sourceCommit:cutover.expectedIdentity.sourceCommit,buildId:cutover.expectedIdentity.buildId,capabilityManifestSha256:observedCapability};
-    assert.throws(()=>f.store.recoverCapabilityExpectationMismatchLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:id,observedIdentity:{...observed,sourceCommit:"f".repeat(40)}}),/exact replacement source\/build/i);
+    for (const wrongIdentity of [
+      {...observed,sourceCommit:"f".repeat(40)},
+      {...observed,buildId:"wrong-build"},
+    ]) {
+      assert.throws(()=>f.store.recoverCapabilityExpectationMismatchLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:id,observedIdentity:wrongIdentity}),/exact replacement source\/build/i);
+    }
+    assert.throws(()=>f.store.recoverCapabilityExpectationMismatchLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:id,observedIdentity:{...cutover.expectedIdentity,serverInstanceId:"replacement-with-expected-capability"}}),/capability/i);
+    assert.throws(()=>f.store.recoverCapabilityExpectationMismatchLocal({cutoverId:"wrong-cutover",carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:"wrong-cutover",observedIdentity:observed}));
+    assert.throws(()=>f.store.recoverCapabilityExpectationMismatchLocal({cutoverId:id,carrierId:"wrong-carrier",expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:id,observedIdentity:observed}));
+    assert.throws(()=>f.store.recoverCapabilityExpectationMismatchLocal({cutoverId:id,carrierId:approved.id,expectedVersion:2,expectedValidityVersion:1,confirmCutoverId:id,observedIdentity:observed}),/version/i);
+    assert.throws(()=>f.store.recoverCapabilityExpectationMismatchLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:2,confirmCutoverId:id,observedIdentity:observed}),/version/i);
+    const originalGet=CutoverStateStore.prototype.get;
+    let forgeRequestHash=true;
+    CutoverStateStore.prototype.get=function(...args){
+      const record=originalGet.apply(this,args);
+      if(forgeRequestHash && record?.cutoverId===id && record.coordinationBinding){
+        forgeRequestHash=false;
+        return {...record,coordinationBinding:{...record.coordinationBinding,requestHash:"0".repeat(64)}};
+      }
+      return record;
+    };
+    try {
+      assert.throws(()=>f.store.recoverCapabilityExpectationMismatchLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:id,observedIdentity:observed}),/operation correlation changed/i);
+    } finally {CutoverStateStore.prototype.get=originalGet;}
     assert.equal(new CutoverStateStore(f.root).get()?.phase,"drained");
     assert.equal(f.store.ownership.get(preparedLease.leaseId)?.operationHandle,start.operationId);
 
@@ -385,7 +436,7 @@ test("host-local capability expectation mismatch recovery closes the failed cuto
   } finally {manager?.close();f.close();}
 });
 
-test("host-local capability expectation mismatch recovery refuses a target digest that was not copied from the predecessor",async()=>{
+test("host-local capability expectation mismatch recovery accepts an arbitrary stale expected capability",async()=>{
   const f=fixture();
   const context={clientId:"shared-oauth",sessionId:"capability-mismatch-not-predecessor"};
   let manager:DurableOperationManager|undefined;
@@ -409,10 +460,127 @@ test("host-local capability expectation mismatch recovery refuses a target diges
     const actuator={actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service",schedule:()=>({scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"})};
     await manager.restartCutover(id,cutover.currentIdentity,cutover.restart.buildReady,async()=>({buildReady:true,detail:"different expected capability"}),actuator,context);
     const observed={serverInstanceId:"replacement",sourceCommit:cutover.expectedIdentity.sourceCommit,buildId:cutover.expectedIdentity.buildId,capabilityManifestSha256:"e".repeat(64)};
-    assert.throws(()=>f.store.recoverCapabilityExpectationMismatchLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:id,observedIdentity:observed}),/predecessor capability digest reused/i);
-    assert.equal(new CutoverStateStore(f.root).get()?.phase,"drained");
-    assert.equal(f.store.ownership.get(lease.leaseId)?.operationHandle,start.operationId);
+    const recovered=f.store.recoverCapabilityExpectationMismatchLocal({cutoverId:id,carrierId:approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:id,observedIdentity:observed});
+    assert.equal(recovered.replayed,false);
+    assert.equal(recovered.cutover.phase,"closed");
+    assert.equal(recovered.cutover.expectedNewIdentity.capabilityManifestSha256,"d".repeat(64));
+    assert.equal(recovered.cutover.capabilityExpectationMismatch?.expectedIdentity.capabilityManifestSha256,"d".repeat(64));
+    assert.equal(recovered.cutover.capabilityExpectationMismatch?.oldServerIdentity.capabilityManifestSha256,"c".repeat(64));
+    assert.equal(recovered.cutover.capabilityExpectationMismatch?.observedIdentity.capabilityManifestSha256,"e".repeat(64));
+    assert.equal(recovered.operation.errorMessage,"Replacement source/build matched, but the observed capability manifest differed from the approved expected capability.");
+    assert.equal(recovered.lease.terminalState,"released");
   } finally {manager?.close();f.close();}
+});
+
+
+
+for (const authorityRace of ["reauthorize", "revoke"] as const) test(`capability mismatch recovery fails closed when carrier ${authorityRace} races before reconciliation`, async () => {
+  const f=fixture();
+  const prepared=await prepareCapabilityMismatch(f,`capability-mismatch-${authorityRace}-race`,"d".repeat(64),"e".repeat(64));
+  const beforeCutover=new CutoverStateStore(f.root).get()!;
+  const beforeLease=f.store.ownership.get(prepared.preparedLease.leaseId)!;
+  const originalReconcile=ControlPlaneOwnershipStore.prototype.reconcile;
+  let injected=false;
+  try {
+    ControlPlaneOwnershipStore.prototype.reconcile=function(...args){
+      if(!injected){
+        injected=true;
+        if(authorityRace==="reauthorize") {
+          f.store.reauthorizeLocal(prepared.approved.id,1,new Date(f.clock()+240000).toISOString());
+        } else {
+          f.store.revokeLocal(prepared.approved.id,1);
+        }
+      }
+      return originalReconcile.apply(this,args);
+    };
+    assert.throws(
+      ()=>f.store.recoverCapabilityExpectationMismatchLocal({
+        cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,
+        confirmCutoverId:prepared.id,observedIdentity:prepared.observed,
+      }),
+      /carrier authority changed|identity or version changed|validity|revoked|CAS_CONFLICT/i,
+    );
+  } finally {
+    ControlPlaneOwnershipStore.prototype.reconcile=originalReconcile;
+  }
+  const afterCutover=new CutoverStateStore(f.root).get()!;
+  const afterLease=f.store.ownership.get(prepared.preparedLease.leaseId)!;
+  assert.deepEqual(afterCutover,beforeCutover);
+  assert.equal(afterLease.operationHandle,beforeLease.operationHandle);
+  assert.equal(afterLease.operationState,beforeLease.operationState);
+  assert.equal(afterLease.terminalState,beforeLease.terminalState);
+  assert.equal(afterLease.version,beforeLease.version);
+  assert.equal(prepared.manager.store.getByOperationId(prepared.start.operationId)?.receipt?.lifecycleTerminal,false);
+  prepared.manager.close();
+  f.close();
+});
+
+test("capability mismatch recovery resumes after lease reconciliation before cutover close",async()=>{
+  const f=fixture();
+  const prepared=await prepareCapabilityMismatch(f,"capability-mismatch-crash-before-close","d".repeat(64),"e".repeat(64));
+  try {
+    const originalRecovery=CutoverStateStore.prototype.recoverCapabilityExpectationMismatch;
+    let injected=false;
+    CutoverStateStore.prototype.recoverCapabilityExpectationMismatch=function(...args){
+      if(!injected){injected=true;throw new Error("injected-after-lease-reconciliation");}
+      return originalRecovery.apply(this,args);
+    };
+    try {
+      assert.throws(()=>f.store.recoverCapabilityExpectationMismatchLocal({cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:prepared.id,observedIdentity:prepared.observed}),/injected-after-lease-reconciliation/);
+    } finally {CutoverStateStore.prototype.recoverCapabilityExpectationMismatch=originalRecovery;}
+
+    const partialCutover=new CutoverStateStore(f.root).get()!;
+    const partialLease=f.store.ownership.get(prepared.preparedLease.leaseId)!;
+    assert.equal(partialCutover.phase,"drained");
+    assert.equal(partialCutover.capabilityExpectationMismatch,undefined);
+    assert.equal(partialLease.operationHandle,undefined);
+    assert.equal(partialLease.operationState,"finished");
+    assert.equal(partialLease.terminalState,undefined);
+    assert.equal(prepared.scheduled(),1);
+
+    const resumed=f.store.recoverCapabilityExpectationMismatchLocal({cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:prepared.id,observedIdentity:prepared.observed});
+    assert.equal(resumed.replayed,false);
+    assert.equal(resumed.cutover.phase,"closed");
+    assert.equal(resumed.lease.terminalState,"released");
+    assert.equal(resumed.operation.status,"failed");
+    assert.equal(prepared.scheduled(),1);
+  } finally {prepared.manager.close();f.close();}
+});
+
+test("capability mismatch recovery resumes after cutover close before operation finalization",async()=>{
+  const f=fixture();
+  const prepared=await prepareCapabilityMismatch(f,"capability-mismatch-crash-after-close","d".repeat(64),"e".repeat(64));
+  try {
+    const originalFinish=DurableOperationStore.prototype.finish;
+    let injected=false;
+    DurableOperationStore.prototype.finish=function(...args){
+      if(!injected && args[1]?.receipt?.recoveryKind==="capability_expectation_mismatch"){
+        injected=true;
+        throw new Error("injected-after-cutover-close");
+      }
+      return originalFinish.apply(this,args);
+    };
+    try {
+      assert.throws(()=>f.store.recoverCapabilityExpectationMismatchLocal({cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:prepared.id,observedIdentity:prepared.observed}),/injected-after-cutover-close/);
+    } finally {DurableOperationStore.prototype.finish=originalFinish;}
+
+    const partialCutover=new CutoverStateStore(f.root).get()!;
+    const partialLease=f.store.ownership.get(prepared.preparedLease.leaseId)!;
+    assert.equal(partialCutover.phase,"closed");
+    assert.ok(partialCutover.capabilityExpectationMismatch);
+    assert.equal(partialLease.operationHandle,undefined);
+    assert.equal(partialLease.terminalState,undefined);
+    assert.notEqual(prepared.manager.store.getByOperationId(prepared.start.operationId)?.receipt?.lifecycleTerminal,true);
+    assert.equal(prepared.scheduled(),1);
+
+    const resumed=f.store.recoverCapabilityExpectationMismatchLocal({cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,confirmCutoverId:prepared.id,observedIdentity:prepared.observed});
+    assert.equal(resumed.replayed,true);
+    assert.equal(resumed.cutover.phase,"closed");
+    assert.equal(resumed.lease.terminalState,"released");
+    assert.equal(resumed.operation.status,"failed");
+    assert.equal(resumed.operation.receipt?.lifecycleTerminal,true);
+    assert.equal(prepared.scheduled(),1);
+  } finally {prepared.manager.close();f.close();}
 });
 
 test("completion readers remain paired, scoped and independent of candidate base",()=>{
