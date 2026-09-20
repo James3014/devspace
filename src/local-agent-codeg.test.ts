@@ -44,12 +44,20 @@ function createFakeCodeg(options: {
   taskStates?: any[];
   changedFiles?: Array<{ file: string; additions: number; deletions: number }>;
   folderPath?: string;
+  loseCreateAckOnce?: boolean;
+  loseStartAckOnce?: boolean;
+  loseCreateWithoutEffectOnce?: boolean;
+  loseStartWithoutEffectOnce?: boolean;
 }) {
   const requests: RequestRecord[] = [];
   let nextTaskId = 41;
   const tasks = new Map<number, any>();
   for (const task of options.existingTasks ?? []) tasks.set(task.id, { ...task });
   const stateQueue = [...(options.taskStates ?? [])];
+  let loseCreateAck = options.loseCreateAckOnce === true;
+  let loseStartAck = options.loseStartAckOnce === true;
+  let loseCreateWithoutEffect = options.loseCreateWithoutEffectOnce === true;
+  let loseStartWithoutEffect = options.loseStartWithoutEffectOnce === true;
 
   const fetchImpl = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
     const url = new URL(typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url);
@@ -66,6 +74,10 @@ function createFakeCodeg(options: {
       case "/api/work_task_list":
         return response([...tasks.values()]);
       case "/api/work_task_create": {
+        if (loseCreateWithoutEffect) {
+          loseCreateWithoutEffect = false;
+          throw new TypeError("simulated create acknowledgement loss before effect");
+        }
         const task = {
           id: nextTaskId++,
           status: "todo",
@@ -73,12 +85,24 @@ function createFakeCodeg(options: {
           ...body.draft,
         };
         tasks.set(task.id, task);
+        if (loseCreateAck) {
+          loseCreateAck = false;
+          throw new TypeError("simulated create acknowledgement loss");
+        }
         return response(task);
       }
       case "/api/work_task_start": {
         const task = tasks.get(body.id);
         if (!task) return response({ error: "missing" }, 404);
+        if (loseStartWithoutEffect) {
+          loseStartWithoutEffect = false;
+          throw new TypeError("simulated start acknowledgement loss before effect");
+        }
         task.status = "running";
+        if (loseStartAck) {
+          loseStartAck = false;
+          throw new TypeError("simulated start acknowledgement loss");
+        }
         return response(undefined);
       }
       case "/api/work_task_get": {
@@ -270,6 +294,128 @@ test("ambiguous create recovery reuses one exact Codeg task and refuses duplicat
     duplicate.requests.filter((entry) => entry.path === "/api/work_task_create").length,
     0,
   );
+});
+
+test("lost create acknowledgement reconciles the one durable task without duplicate create", async () => {
+  const fake = createFakeCodeg({
+    loseCreateAckOnce: true,
+    taskStates: [
+      { status: "running" },
+      { status: "review", result_summary: "create ack recovered" },
+    ],
+  });
+  const handles: string[] = [];
+
+  const result = await runCodegLocalAgent(
+    "agt-create-lost-ack",
+    "codex",
+    {
+      prompt: "recover create ack",
+      workspaceRoot: "/tmp/codeg-create-lost-ack",
+      writeMode: "allowed",
+    },
+    {
+      onSessionId: async (handle) => { handles.push(handle); },
+    },
+    envFor("codex"),
+    fake.fetchImpl,
+  );
+
+  assert.equal(result.providerSessionId, "codeg-work-task:41");
+  assert.deepEqual(handles, ["codeg-work-task:41"]);
+  assert.equal(
+    fake.requests.filter((entry) => entry.path === "/api/work_task_create").length,
+    1,
+  );
+  assert.equal(fake.tasks.size, 1);
+});
+
+test("lost start acknowledgement reconciles the same bound task without re-start", async () => {
+  const fake = createFakeCodeg({
+    loseStartAckOnce: true,
+    taskStates: [
+      { status: "running" },
+      { status: "review", result_summary: "start ack recovered" },
+    ],
+  });
+  const events: string[] = [];
+
+  const result = await runCodegLocalAgent(
+    "agt-start-lost-ack",
+    "codex",
+    {
+      prompt: "recover start ack",
+      workspaceRoot: "/tmp/codeg-start-lost-ack",
+      writeMode: "allowed",
+    },
+    {
+      onSessionId: async (handle) => { events.push(`session:${handle}`); },
+      onExecutionStarted: async () => { events.push("execution"); },
+    },
+    envFor("codex"),
+    fake.fetchImpl,
+  );
+
+  assert.equal(result.providerSessionId, "codeg-work-task:41");
+  assert.equal(
+    fake.requests.filter((entry) => entry.path === "/api/work_task_start").length,
+    1,
+  );
+  assert.ok(events[0]?.startsWith("session:codeg-work-task:41"));
+  assert.equal(events.includes("execution"), true);
+});
+
+test("lost create acknowledgement with no observable task never retries create", async () => {
+  const fake = createFakeCodeg({ loseCreateWithoutEffectOnce: true });
+
+  await assert.rejects(
+    runCodegLocalAgent(
+      "agt-create-unknown",
+      "codex",
+      {
+        prompt: "do not resend create",
+        workspaceRoot: "/tmp/codeg-create-unknown",
+        writeMode: "allowed",
+      },
+      undefined,
+      envFor("codex"),
+      fake.fetchImpl,
+    ),
+    /outcome is unknown.*create was not retried/i,
+  );
+
+  assert.equal(
+    fake.requests.filter((entry) => entry.path === "/api/work_task_create").length,
+    1,
+  );
+  assert.equal(fake.tasks.size, 0);
+});
+
+test("lost start acknowledgement with task still todo never retries start", async () => {
+  const fake = createFakeCodeg({ loseStartWithoutEffectOnce: true });
+
+  await assert.rejects(
+    runCodegLocalAgent(
+      "agt-start-unknown",
+      "codex",
+      {
+        prompt: "do not resend start",
+        workspaceRoot: "/tmp/codeg-start-unknown",
+        writeMode: "allowed",
+      },
+      undefined,
+      envFor("codex"),
+      fake.fetchImpl,
+    ),
+    /outcome is unresolved.*start was not retried/i,
+  );
+
+  assert.equal(
+    fake.requests.filter((entry) => entry.path === "/api/work_task_start").length,
+    1,
+  );
+  const task = [...fake.tasks.values()][0];
+  assert.equal(task?.status, "todo");
 });
 
 test("continuation addresses the same Codeg handle instead of creating a replacement", async () => {

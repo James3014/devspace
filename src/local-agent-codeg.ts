@@ -655,18 +655,48 @@ async function createOrRecoverTask(
   }
   if (existing.length === 1) return { task: existing[0], created: false };
 
-  const task = await postJson<CodegTaskSnapshot>(
-    config,
-    "work_task_create",
-    {
-      draft: {
-        folder_id: folderId,
-        title,
-        config: taskConfig(provider, input),
+  let task: CodegTaskSnapshot;
+  try {
+    task = await postJson<CodegTaskSnapshot>(
+      config,
+      "work_task_create",
+      {
+        draft: {
+          folder_id: folderId,
+          title,
+          config: taskConfig(provider, input),
+        },
       },
-    },
-    fetchImpl,
-  );
+      fetchImpl,
+    );
+  } catch (cause) {
+    // A transport error after create is an ambiguous remote effect. Never
+    // resend create. Reconcile the deterministic DevSpace title exactly once;
+    // zero matches remains OUTCOME_UNKNOWN for a later reconciliation gate.
+    let reconciled: CodegTaskSnapshot[];
+    try {
+      reconciled = (await listTasks(config, folderId, fetchImpl))
+        .filter((candidate) => candidate.title === title);
+    } catch {
+      throw new Error(
+        `Codeg work_task_create outcome is unknown for durable DevSpace agent ${agentId}; create was not retried.`,
+        { cause },
+      );
+    }
+    if (reconciled.length > 1) {
+      throw new Error(
+        `Codeg create reconciliation found ${reconciled.length} tasks for durable DevSpace agent ${agentId}; refusing ambiguous duplicate ownership.`,
+        { cause },
+      );
+    }
+    if (reconciled.length === 0) {
+      throw new Error(
+        `Codeg work_task_create outcome is unknown for durable DevSpace agent ${agentId}; no exact task is yet observable and create was not retried.`,
+        { cause },
+      );
+    }
+    task = reconciled[0]!;
+  }
   if (!task || !Number.isInteger(task.id) || task.id <= 0) {
     throw new Error("Codeg work_task_create returned no durable task id.");
   }
@@ -682,7 +712,29 @@ async function startOrContinueTask(
 ): Promise<CodegTaskSnapshot> {
   if (firstTurn) {
     if (task.status === "todo") {
-      await postJson<unknown>(config, "work_task_start", { id: task.id }, fetchImpl);
+      try {
+        await postJson<unknown>(config, "work_task_start", { id: task.id }, fetchImpl);
+      } catch (cause) {
+        // The exact task handle is already durable before start. A lost start
+        // acknowledgement may therefore be reconciled by reading that same
+        // task, but must never trigger a second start call.
+        let reconciled: CodegTaskSnapshot;
+        try {
+          reconciled = await getTask(config, task.id, fetchImpl);
+        } catch {
+          throw new Error(
+            `Codeg work_task_start outcome is unknown for task ${task.id}; start was not retried.`,
+            { cause },
+          );
+        }
+        if (reconciled.status === "todo") {
+          throw new Error(
+            `Codeg work_task_start outcome is unresolved for task ${task.id}; the exact task is still todo and start was not retried.`,
+            { cause },
+          );
+        }
+        return reconciled;
+      }
       return getTask(config, task.id, fetchImpl);
     }
     return task;
