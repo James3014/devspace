@@ -3700,6 +3700,34 @@ test("nexus_gateway_recover exposes only the fixed typed recovery contract", asy
   }
   assert.equal(requestSchema.additionalProperties, false, "recovery request must reject extra process-control fields");
 
+  const durablePreflight = tools.tools.find(
+    (tool) => tool.name === "nexus_gateway_recovery_preflight_start",
+  );
+  assert.ok(durablePreflight, "durable effect-free Gateway preflight start must be exposed");
+  assert.deepEqual(
+    (durablePreflight as unknown as { annotations?: Record<string, unknown> }).annotations,
+    {
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  );
+  assert.match(String(durablePreflight.description), /durable background operation/);
+  const durablePreflightSchema = durablePreflight.inputSchema as Record<string, unknown>;
+  const durablePreflightProperties = durablePreflightSchema.properties as Record<string, unknown>;
+  assert.deepEqual(Object.keys(durablePreflightProperties).sort(), ["attemptKey", "request"]);
+  const durableRequestSchema = durablePreflightProperties.request as Record<string, unknown>;
+  assert.deepEqual(
+    Object.keys((durableRequestSchema.properties as Record<string, unknown>)).sort(),
+    Object.keys(requestProperties).sort(),
+  );
+  assert.equal(
+    durableRequestSchema.additionalProperties,
+    false,
+    "durable preflight must preserve the strict recovery request schema",
+  );
+
   const invalid = await context.client.callTool({
     name: "nexus_gateway_recover",
     arguments: {
