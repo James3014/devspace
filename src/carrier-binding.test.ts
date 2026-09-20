@@ -1092,7 +1092,7 @@ test("terminal hygiene releases only the exact normally closed cutover lease aft
 
     assert.throws(()=>f.store.releaseClosedCutoverLeaseLocal({
       cutoverId,leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version,
-      carrierId:approved.id,expectedCarrierVersion:1,expectedTerminalRecordHash:terminalHash,confirmCutoverId:cutoverId,
+      carrierId:approved.id,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash,confirmCutoverId:cutoverId,
     }),/revoked/i);
 
     const revoked=f.store.revokeLocal(approved.id,1);
