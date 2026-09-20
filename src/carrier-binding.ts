@@ -548,6 +548,7 @@ export class CarrierBindingStore {
        input.observedIdentity.sourceCommit!==approved.expectedIdentity.sourceCommit ||
        input.observedIdentity.buildId!==approved.expectedIdentity.buildId ||
        !input.observedIdentity.capabilityManifestSha256 ||
+       !approved.currentIdentity.capabilityManifestSha256 ||
        !approved.expectedIdentity.capabilityManifestSha256 ||
        input.observedIdentity.capabilityManifestSha256===approved.expectedIdentity.capabilityManifestSha256) {
       deny("Capability expectation recovery requires an exact replacement source/build whose observed capability differs from the bound expected capability");

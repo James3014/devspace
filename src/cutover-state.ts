@@ -952,8 +952,9 @@ export class CutoverStateStore {
       throw new CutoverStateError("Capability expectation recovery requires the exact expected source/build.");
     }
     const expectedCapability = active.expectedNewIdentity.capabilityManifestSha256;
+    const oldCapability = active.oldServerIdentity.capabilityManifestSha256;
     const observedCapability = input.observedIdentity.capabilityManifestSha256;
-    if (!expectedCapability || !observedCapability || observedCapability === expectedCapability) {
+    if (!expectedCapability || !oldCapability || !observedCapability || observedCapability === expectedCapability) {
       throw new CutoverStateError("Capability expectation recovery requires a replacement capability manifest that differs from the bound expected capability.");
     }
     if (active.restartRequest.requestedByServerInstanceId !== active.oldServerIdentity.serverInstanceId ||
@@ -1315,6 +1316,7 @@ function parseRecord(raw: string): DurableCutoverRecord {
       receipt.observedIdentity.sourceCommit !== record.expectedNewIdentity.sourceCommit ||
       receipt.observedIdentity.buildId !== record.expectedNewIdentity.buildId ||
       !record.expectedNewIdentity.capabilityManifestSha256 ||
+      !record.oldServerIdentity.capabilityManifestSha256 ||
       !receipt.observedIdentity.capabilityManifestSha256 ||
       receipt.observedIdentity.capabilityManifestSha256 === record.expectedNewIdentity.capabilityManifestSha256 ||
       record.restartRequest.requestedByServerInstanceId !== record.oldServerIdentity.serverInstanceId ||
