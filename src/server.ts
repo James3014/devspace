@@ -3392,7 +3392,7 @@ export function createMcpServer(
       operationId: z.string(),
       attemptKey: z.string(),
       requestHash: z.string(),
-      kind: z.enum(["workspace_clone", "dependency_sync", "nexus_gateway_recover", "cutover_start", "host_operation", "chat_swarm_reconciliation"]),
+      kind: z.enum(["workspace_clone", "dependency_sync", "nexus_gateway_recover", "nexus_gateway_recovery_preflight", "cutover_start", "host_operation", "chat_swarm_reconciliation"]),
       authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]),
       scopeRoot: z.string(),
       workspaceId: z.string().optional(),
@@ -3473,6 +3473,48 @@ export function createMcpServer(
       async ({ attemptKey, request }) => {
         try {
           return operationResponse(await durableOperations.nexusGatewayRecover({ attemptKey, request }));
+        } catch (error) {
+          if (error instanceof DurableOperationError && error.operation) {
+            return {
+              content: [textBlock(`${error.code}: ${error.message}`)],
+              isError: true,
+              structuredContent: error.operation as unknown as Record<string, unknown>,
+            };
+          }
+          throw error;
+        }
+      },
+    );
+
+    registerAppTool(
+      server,
+      "nexus_gateway_recovery_preflight_start",
+      {
+        title: "Start durable Nexus Gateway recovery preflight",
+        description:
+          "Start one effect-free Nexus #526 Gateway recovery preflight as a durable background operation so long manager verification can outlive a single MCP request. Returns the stable operation immediately; use operation_status for readback and operation_reconcile only after restart or uncertain transport. It never starts Gateway recovery effects.",
+        inputSchema: {
+          attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
+            .describe("Stable durable preflight identity. Exact replay returns the same operation; conflicting reuse fails closed."),
+          request: nexusGatewayRecoveryRequestSchema,
+        },
+        outputSchema: durableOperationOutputSchema,
+        _meta: {},
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ attemptKey, request }) => {
+        try {
+          return operationResponse(
+            await durableOperations.nexusGatewayRecoveryPreflightStart({
+              attemptKey,
+              request,
+            }),
+          );
         } catch (error) {
           if (error instanceof DurableOperationError && error.operation) {
             return {
@@ -3790,7 +3832,7 @@ export function createMcpServer(
       {
         title: "Durable operation status",
         description:
-          "Read one exact durable workspace, dependency, or fixed Nexus Gateway recovery operation without starting, retrying, or replacing it.",
+          "Read one exact durable workspace, dependency, fixed Nexus Gateway recovery, or durable effect-free Gateway preflight operation without starting, retrying, or replacing it.",
         inputSchema: { operationId: z.string().min(1) },
         outputSchema: durableOperationOutputSchema,
         _meta: {},
@@ -3809,7 +3851,7 @@ export function createMcpServer(
       {
         title: "Reconcile durable operation",
         description:
-          "Reconcile physical state for one exact durable mutating operation after timeout/restart uncertainty. Workspace/dependency operations inspect without replay. A Nexus Gateway recovery re-enters only the same fixed manager seam with the same persisted request and idempotency fence so the Nexus #526 ledger can reconcile physical truth; callers cannot replace the request or select another process target.",
+          "Reconcile one exact durable operation after timeout or restart uncertainty. A durable Gateway preflight may re-run only the same stored read-only request. A Nexus Gateway recovery re-enters only the same fixed manager seam with the same persisted request and idempotency fence so the Nexus #526 ledger can reconcile physical truth; callers cannot replace the request or select another process target.",
         inputSchema: { operationId: z.string().min(1) },
         outputSchema: durableOperationOutputSchema,
         _meta: {},
