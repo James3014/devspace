@@ -27,6 +27,7 @@ import {
   formatCodegTaskHandle,
   inspectCodegTask,
   isCodegProviderEnabled,
+  parseCodegTaskHandle,
   runCodegLocalAgent,
 } from "./local-agent-codeg.js";
 import { resolveEffectiveExecutionIdlePolicy } from "./local-agent-idle-policy.js";
@@ -98,6 +99,11 @@ function catalogSnapshotIsFresh(fetchedAt: string | undefined, expiresAt: string
   const fetched = Date.parse(fetchedAt ?? "");
   const expires = expiresAt ? Date.parse(expiresAt) : NaN;
   return Number.isFinite(fetched) && fetched <= Date.now() && (!expiresAt || (Number.isFinite(expires) && Date.now() < expires));
+}
+
+function hasDurableCodegBinding(record: LocalAgentRecord): boolean {
+  return parseCodegTaskHandle(record.providerSessionId) !== undefined
+    || record.executionGeneration?.executionIdentity.startsWith("codeg:") === true;
 }
 
 // ─── Error codes ────────────────────────────────────────────────────────────
@@ -1369,23 +1375,33 @@ export class LocalAgentSessionManager {
     const timing = computeSessionTiming(record);
     let providerState = record.providerContinuityState ?? (record.providerSessionId ? "KNOWN_UNVERIFIED" : "UNKNOWN");
     let providerSessionId = record.providerSessionId;
-    if (isCodegProviderEnabled(record.provider, process.env)) {
+    if (hasDurableCodegBinding(record)) {
+      let codegConfigured = false;
       try {
-        const codeg = await inspectCodegTask(
-          record.provider,
-          record.providerSessionId,
-          record.id,
-          record.workspaceRoot,
-          process.env,
-        );
-        if (codeg) {
-          providerState = `CODEG_${codeg.status.toUpperCase()}`;
-          providerSessionId ??= formatCodegTaskHandle(codeg.taskId);
-        } else {
+        codegConfigured = isCodegProviderEnabled(record.provider, process.env);
+      } catch {
+        providerState = "CODEG_UNAVAILABLE";
+      }
+      if (!codegConfigured) {
+        providerState = "CODEG_UNAVAILABLE";
+      } else {
+        try {
+          const codeg = await inspectCodegTask(
+            record.provider,
+            record.providerSessionId,
+            record.id,
+            record.workspaceRoot,
+            process.env,
+          );
+          if (codeg) {
+            providerState = `CODEG_${codeg.status.toUpperCase()}`;
+            providerSessionId ??= formatCodegTaskHandle(codeg.taskId);
+          } else {
+            providerState = "CODEG_UNKNOWN";
+          }
+        } catch {
           providerState = "CODEG_UNKNOWN";
         }
-      } catch {
-        providerState = "CODEG_UNKNOWN";
       }
     }
 
@@ -1748,27 +1764,39 @@ export class LocalAgentSessionManager {
       let terminated = false;
       let failureDetail: string | undefined;
       try {
-        let codegHandle = record.providerSessionId;
-        if (isCodegProviderEnabled(record.provider, process.env) && !codegHandle) {
-          const discovered = await inspectCodegTask(
-            record.provider,
-            undefined,
-            record.id,
-            record.workspaceRoot,
-            process.env,
-          );
-          if (discovered) codegHandle = formatCodegTaskHandle(discovered.taskId);
-        }
-        if (codegHandle && isCodegProviderEnabled(record.provider, process.env)) {
-          const providerStopped = await cancelCodegTask(
-            record.provider,
-            codegHandle,
-            process.env,
-          );
-          if (!providerStopped) {
-            failureDetail = "Codeg task cancellation was not confirmed; local worker termination was not attempted.";
+        if (hasDurableCodegBinding(record)) {
+          if (!isCodegProviderEnabled(record.provider, process.env)) {
+            failureDetail =
+              "Codeg execution is durably bound, but the Codeg gateway configuration is unavailable; remote cancellation must be reconciled before local worker termination.";
           } else {
-            terminated = await this.terminator(record);
+            let codegHandle = parseCodegTaskHandle(record.providerSessionId) !== undefined
+              ? record.providerSessionId
+              : undefined;
+            if (!codegHandle) {
+              const discovered = await inspectCodegTask(
+                record.provider,
+                undefined,
+                record.id,
+                record.workspaceRoot,
+                process.env,
+              );
+              if (discovered) codegHandle = formatCodegTaskHandle(discovered.taskId);
+            }
+            if (!codegHandle) {
+              failureDetail =
+                "Codeg execution is durably bound, but the exact Codeg task could not be reconciled; local worker termination was not attempted.";
+            } else {
+              const providerStopped = await cancelCodegTask(
+                record.provider,
+                codegHandle,
+                process.env,
+              );
+              if (!providerStopped) {
+                failureDetail = "Codeg task cancellation was not confirmed; local worker termination was not attempted.";
+              } else {
+                terminated = await this.terminator(record);
+              }
+            }
           }
         } else {
           terminated = await this.terminator(record);

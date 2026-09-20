@@ -543,6 +543,72 @@ test("LocalAgentSessionManager - cancel passes exact running worker ownership", 
   }
 });
 
+test("LocalAgentSessionManager - Codeg-bound cancel fails closed when gateway configuration disappears", async () => {
+  const { manager, spawnedWorkers, terminatedWorkers, clean } = setupFixture();
+  const previous = {
+    providers: process.env.DEVSPACE_CODEG_PROVIDERS,
+    url: process.env.DEVSPACE_CODEG_URL,
+    token: process.env.DEVSPACE_CODEG_TOKEN,
+  };
+  try {
+    process.env.DEVSPACE_CODEG_PROVIDERS = "agy";
+    process.env.DEVSPACE_CODEG_URL = "http://127.0.0.1:31817";
+    process.env.DEVSPACE_CODEG_TOKEN = "session-test-token";
+
+    const workspaceRoot = "/Users/jameschen/Workspace/nexus";
+    const started = await manager.startAgent({
+      workspaceId: "ws_codeg_cancel_config_loss",
+      workspaceRoot,
+      profileName: "reviewer",
+      prompt: "bind codeg then lose config",
+      profiles: mockProfiles,
+    });
+    const store = (manager as any).store as LocalAgentStore;
+    const current = store.getById(started.agentId)!;
+    const generation = current.lifecycleState!.activeTurn!.generation!;
+    const workerToken = current.workerToken ?? spawnedWorkers[0]!.workerToken;
+    assert.equal(
+      store.bindProviderSessionCAS(
+        started.agentId,
+        generation,
+        workerToken,
+        "codeg-work-task:551",
+      ).applied,
+      true,
+    );
+    assert.match(store.getById(started.agentId)!.executionGeneration!.executionIdentity, /^codeg:/);
+
+    delete process.env.DEVSPACE_CODEG_PROVIDERS;
+    delete process.env.DEVSPACE_CODEG_URL;
+    delete process.env.DEVSPACE_CODEG_TOKEN;
+
+    await assert.rejects(
+      manager.cancelAgent({
+        workspaceId: "ws_codeg_cancel_config_loss",
+        workspaceRoot,
+        agentId: started.agentId,
+      }),
+      (err: any) => {
+        assert.equal(err.code, "WORKER_TERMINATION_FAILED");
+        return true;
+      },
+    );
+
+    assert.equal(terminatedWorkers.length, 0);
+    const after = store.getById(started.agentId)!;
+    assert.equal(after.lifecycleState?.terminationPending !== undefined, true);
+    assert.match(after.error ?? "", /Codeg execution is durably bound/i);
+  } finally {
+    if (previous.providers === undefined) delete process.env.DEVSPACE_CODEG_PROVIDERS;
+    else process.env.DEVSPACE_CODEG_PROVIDERS = previous.providers;
+    if (previous.url === undefined) delete process.env.DEVSPACE_CODEG_URL;
+    else process.env.DEVSPACE_CODEG_URL = previous.url;
+    if (previous.token === undefined) delete process.env.DEVSPACE_CODEG_TOKEN;
+    else process.env.DEVSPACE_CODEG_TOKEN = previous.token;
+    clean();
+  }
+});
+
 test("LocalAgentSessionManager - cancel with default terminator: absent PID succeeds", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-agent-sessions-test-"));
   const config = { stateDir, subagents: true, oauth: { scopes: ["devspace"] } } as any;

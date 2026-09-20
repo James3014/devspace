@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -460,6 +460,171 @@ test("Codeg materialization rejects out-of-scope changed files before touching D
       /outside the DevSpace write scope/,
     );
     assert.equal(git(workspace, "status", "--short"), "");
+  } finally {
+    try { git(workspace, "worktree", "remove", "--force", codegWorktree); } catch {}
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Codeg materialization preflights every changed path before touching the DevSpace workspace", async () => {
+  const root = mkdtempSync(join(tmpdir(), "devspace-codeg-preflight-"));
+  const workspace = join(root, "repo");
+  const codegWorktree = join(root, "codeg-task");
+  mkdirSync(workspace, { recursive: true });
+  try {
+    git(workspace, "init");
+    git(workspace, "config", "user.name", "DevSpace Test");
+    git(workspace, "config", "user.email", "devspace@example.test");
+    writeFileSync(join(workspace, "README.md"), "base\n");
+    git(workspace, "add", "README.md");
+    git(workspace, "commit", "-m", "base");
+    const base = git(workspace, "rev-parse", "HEAD");
+    git(workspace, "worktree", "add", "-b", "task/preflight", codegWorktree, base);
+
+    mkdirSync(join(codegWorktree, "allowed"), { recursive: true });
+    writeFileSync(join(codegWorktree, "allowed", "first.txt"), "FIRST\n");
+    symlinkSync(join(codegWorktree, "README.md"), join(codegWorktree, "allowed", "second.txt"));
+
+    const fake = createFakeCodeg({
+      existingTasks: [{
+        id: 153,
+        title: "[devspace:agt-preflight] codex",
+        status: "review",
+        result_summary: "preflight",
+        worktree_folder_id: 24,
+        base_sha: base,
+      }],
+      changedFiles: [
+        { file: "allowed/first.txt", additions: 1, deletions: 0 },
+        { file: "allowed/second.txt", additions: 1, deletions: 0 },
+      ],
+      folderPath: codegWorktree,
+    });
+
+    await assert.rejects(
+      runCodegLocalAgent(
+        "agt-preflight",
+        "codex",
+        {
+          prompt: "preflight all paths",
+          workspaceRoot: workspace,
+          writeMode: "allowed",
+          writePaths: ["allowed"],
+        },
+        undefined,
+        envFor("codex"),
+        fake.fetchImpl,
+      ),
+      /not a regular file/,
+    );
+    assert.equal(existsSync(join(workspace, "allowed", "first.txt")), false);
+    assert.equal(git(workspace, "status", "--short"), "");
+  } finally {
+    try { git(workspace, "worktree", "remove", "--force", codegWorktree); } catch {}
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Codeg materialization refuses an unproven missing-source deletion", async () => {
+  const root = mkdtempSync(join(tmpdir(), "devspace-codeg-delete-proof-"));
+  const workspace = join(root, "repo");
+  const codegWorktree = join(root, "codeg-task");
+  mkdirSync(workspace, { recursive: true });
+  try {
+    git(workspace, "init");
+    git(workspace, "config", "user.name", "DevSpace Test");
+    git(workspace, "config", "user.email", "devspace@example.test");
+    writeFileSync(join(workspace, "README.md"), "base\n");
+    git(workspace, "add", "README.md");
+    git(workspace, "commit", "-m", "base");
+    const base = git(workspace, "rev-parse", "HEAD");
+    git(workspace, "worktree", "add", "-b", "task/delete-proof", codegWorktree, base);
+
+    mkdirSync(join(workspace, "allowed"), { recursive: true });
+    writeFileSync(join(workspace, "allowed", "victim.txt"), "PREEXISTING\n");
+
+    const fake = createFakeCodeg({
+      existingTasks: [{
+        id: 154,
+        title: "[devspace:agt-delete-proof] codex",
+        status: "review",
+        result_summary: "delete proof",
+        worktree_folder_id: 25,
+        base_sha: base,
+      }],
+      changedFiles: [{ file: "allowed/victim.txt", additions: 0, deletions: 1 }],
+      folderPath: codegWorktree,
+    });
+
+    await assert.rejects(
+      runCodegLocalAgent(
+        "agt-delete-proof",
+        "codex",
+        {
+          prompt: "do not erase unrelated local file",
+          workspaceRoot: workspace,
+          writeMode: "allowed",
+          writePaths: ["allowed"],
+        },
+        undefined,
+        envFor("codex"),
+        fake.fetchImpl,
+      ),
+      /missing-source deletion is not proven by Git/,
+    );
+    assert.equal(readFileSync(join(workspace, "allowed", "victim.txt"), "utf8"), "PREEXISTING\n");
+  } finally {
+    try { git(workspace, "worktree", "remove", "--force", codegWorktree); } catch {}
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("Codeg materialization applies a deletion only when exact-base Git proves D status", async () => {
+  const root = mkdtempSync(join(tmpdir(), "devspace-codeg-delete-positive-"));
+  const workspace = join(root, "repo");
+  const codegWorktree = join(root, "codeg-task");
+  mkdirSync(join(workspace, "allowed"), { recursive: true });
+  try {
+    git(workspace, "init");
+    git(workspace, "config", "user.name", "DevSpace Test");
+    git(workspace, "config", "user.email", "devspace@example.test");
+    writeFileSync(join(workspace, "README.md"), "base\n");
+    writeFileSync(join(workspace, "allowed", "delete-me.txt"), "DELETE\n");
+    git(workspace, "add", "README.md", "allowed/delete-me.txt");
+    git(workspace, "commit", "-m", "base");
+    const base = git(workspace, "rev-parse", "HEAD");
+    git(workspace, "worktree", "add", "-b", "task/delete-positive", codegWorktree, base);
+    rmSync(join(codegWorktree, "allowed", "delete-me.txt"));
+
+    const fake = createFakeCodeg({
+      existingTasks: [{
+        id: 155,
+        title: "[devspace:agt-delete-positive] codex",
+        status: "review",
+        result_summary: "delete positive",
+        worktree_folder_id: 26,
+        base_sha: base,
+      }],
+      changedFiles: [{ file: "allowed/delete-me.txt", additions: 0, deletions: 1 }],
+      folderPath: codegWorktree,
+    });
+
+    await runCodegLocalAgent(
+      "agt-delete-positive",
+      "codex",
+      {
+        prompt: "apply proven deletion",
+        workspaceRoot: workspace,
+        writeMode: "allowed",
+        writePaths: ["allowed"],
+      },
+      undefined,
+      envFor("codex"),
+      fake.fetchImpl,
+    );
+
+    assert.equal(existsSync(join(workspace, "allowed", "delete-me.txt")), false);
+    assert.match(git(workspace, "status", "--short"), /D allowed\/delete-me\.txt/);
   } finally {
     try { git(workspace, "worktree", "remove", "--force", codegWorktree); } catch {}
     rmSync(root, { recursive: true, force: true });

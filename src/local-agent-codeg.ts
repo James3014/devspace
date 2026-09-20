@@ -434,6 +434,34 @@ async function getFolder(
   return folder;
 }
 
+type CodegMaterializationOperation =
+  | { kind: "copy"; file: string; source: string; target: string; mode: number }
+  | { kind: "delete"; file: string; target: string };
+
+function codegGitProvesDeletion(
+  worktreeRoot: string,
+  baseSha: string | null | undefined,
+  file: string,
+): boolean {
+  if (!baseSha) return false;
+  const result = spawnSync(
+    "git",
+    ["diff", "--name-only", "--diff-filter=D", "-z", baseSha, "--", file],
+    {
+      cwd: worktreeRoot,
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 5_000,
+    },
+  );
+  if (result.error || result.status !== 0) {
+    throw new Error(
+      `Unable to verify Codeg deletion provenance for '${file}': ${result.error?.message ?? String(result.stderr || result.status)}`,
+    );
+  }
+  return result.stdout.split("\0").filter(Boolean).includes(file);
+}
+
 async function materializeCodegTask(
   config: CodegGatewayConfig,
   task: CodegTaskSnapshot,
@@ -478,7 +506,11 @@ async function materializeCodegTask(
     );
   }
 
+  // Validate the complete physical change-set before the first DevSpace write.
+  // This prevents a later invalid path/type/deletion from leaving an earlier
+  // path partially materialized.
   const root = resolve(input.workspaceRoot);
+  const operations: CodegMaterializationOperation[] = [];
   for (const change of changedFiles) {
     const source = resolve(codegFolder.path, change.file);
     const target = resolve(root, change.file);
@@ -502,12 +534,21 @@ async function materializeCodegTask(
           );
         }
       }
-      mkdirSync(dirname(target), { recursive: true });
-      copyFileSync(source, target);
-      chmodSync(target, sourceStat.mode & 0o777);
+      operations.push({
+        kind: "copy",
+        file: change.file,
+        source,
+        target,
+        mode: sourceStat.mode & 0o777,
+      });
       continue;
     }
 
+    if (!codegGitProvesDeletion(codegFolder.path, task.base_sha, change.file)) {
+      throw new Error(
+        `Codeg changed path '${change.file}' has no source file, but its missing-source deletion is not proven by Git against the exact task base; refusing materialization.`,
+      );
+    }
     if (existsSync(target)) {
       const targetStat = lstatSync(target);
       if (!targetStat.isFile() || targetStat.isSymbolicLink()) {
@@ -515,8 +556,18 @@ async function materializeCodegTask(
           `DevSpace deletion target '${change.file}' is not a regular file; refusing materialization.`,
         );
       }
-      unlinkSync(target);
     }
+    operations.push({ kind: "delete", file: change.file, target });
+  }
+
+  for (const operation of operations) {
+    if (operation.kind === "copy") {
+      mkdirSync(dirname(operation.target), { recursive: true });
+      copyFileSync(operation.source, operation.target);
+      chmodSync(operation.target, operation.mode);
+      continue;
+    }
+    if (existsSync(operation.target)) unlinkSync(operation.target);
   }
 }
 
