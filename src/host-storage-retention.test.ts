@@ -174,6 +174,7 @@ test("dry-run classifies clean old managed worktree and apply is receipt-idempot
   assert.equal(target.lifecycle, "GC_ELIGIBLE");
   assert.equal(target.disposition, "DELETE");
   assert.deepEqual(target.blockers, []);
+  assert.ok(target.sizeBytes > 0, "DevSpace-owned managed worktrees retain physical storage accounting");
   assert.equal(existsSync(path), true, "inventory must be side-effect free");
 
   const result = await applyHostStoragePlan(args, plan.planId, {
