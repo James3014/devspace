@@ -406,6 +406,65 @@ test("release retention pins active and rollback candidates and removes only old
   assert.equal(readFileSync(join(foreign, "package.json"), "utf8").includes("not-devspace"), true);
 });
 
+test("release retention recognizes production wrapper layout only with matching nested build identity", async () => {
+  const f = fixture();
+  const releases = join(f.packageRoot, "releases");
+  mkdirSync(releases, { recursive: true });
+
+  const writeWrapper = (
+    name: string,
+    sourceCommit: string,
+    stamp: number,
+    options: { nestedPackageName?: string; omitIdentity?: boolean } = {},
+  ) => {
+    const path = join(releases, name);
+    const nested = join(path, "node_modules", "@waishnav", "devspace");
+    mkdirSync(join(nested, "generated"), { recursive: true });
+    writeFileSync(join(path, "package.json"), JSON.stringify({ name: name + ".tmp", version: "1.0.0" }));
+    writeFileSync(
+      join(nested, "package.json"),
+      JSON.stringify({ name: options.nestedPackageName ?? "@waishnav/devspace", version: "1.0.7" }),
+    );
+    if (!options.omitIdentity) {
+      writeFileSync(
+        join(nested, "generated", "build-identity.json"),
+        JSON.stringify({
+          package_name: "@waishnav/devspace",
+          package_version: "1.0.7",
+          source_commit: sourceCommit,
+          build_id: "devspace-1.0.7-" + sourceCommit.slice(0, 8),
+        }),
+      );
+    }
+    const when = new Date(1_700_000_000_000 + stamp * 1000);
+    utimesSync(path, when, when);
+    return path;
+  };
+
+  writeWrapper("release-11111111", "1111111111111111111111111111111111111111", 1);
+  writeWrapper("release-22222222", "2222222222222222222222222222222222222222", 2);
+  writeWrapper("release-abcdef12", "abcdef1234567890abcdef1234567890abcdef12", 3);
+  writeWrapper("release-44444444", "4444444444444444444444444444444444444444", 4);
+  writeWrapper("release-deadbeef", "feedfacefeedfacefeedfacefeedfacefeedface", 5);
+  writeWrapper("release-cafebabe", "cafebabecafebabecafebabecafebabecafebabe", 6, { omitIdentity: true });
+
+  const args = input(f, {
+    releaseKeepCount: 1,
+    activeSourceCommit: "abcdef1234567890abcdef1234567890abcdef12",
+  });
+  const plan = await buildHostStoragePlan(args);
+
+  assert.equal(artifact(plan, "release:release-abcdef12").lifecycle, "ACTIVE");
+  assert.equal(artifact(plan, "release:release-44444444").lifecycle, "PINNED");
+  assert.equal(artifact(plan, "release:release-11111111").lifecycle, "GC_ELIGIBLE");
+  assert.equal(artifact(plan, "release:release-deadbeef").lifecycle, "UNKNOWN");
+  assert.equal(artifact(plan, "release:release-cafebabe").lifecycle, "UNKNOWN");
+  assert.match(
+    artifact(plan, "release:release-11111111").ownershipEvidence ?? "",
+    /deployment wrapper contains @waishnav\/devspace/,
+  );
+});
+
 test("browser runtime GC requires ownership, durable terminal reference evidence, and no live profile process", async () => {
   const f = fixture();
   const root = join(f.stateDir, "browser-runtimes");
