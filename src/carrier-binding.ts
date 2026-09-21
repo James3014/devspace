@@ -518,6 +518,249 @@ export class CarrierBindingStore {
     } finally {operations.close();}
   }
   /**
+   * Host-local terminal recovery for one expired coordination-bound DRAINED cutover
+   * when a different replacement identity appeared before this cutover requested any
+   * restart. This never rewrites the approved target, schedules a restart, creates a
+   * successor, or borrows authority from the observed replacement.
+   */
+  recoverUnexpectedReplacementLocal(input: {
+    cutoverId: string;
+    carrierId: string;
+    expectedVersion: number;
+    expectedValidityVersion: number;
+    confirmCutoverId: string;
+    observedIdentity: CutoverServerIdentity;
+  }) {
+    if(input.confirmCutoverId!==input.cutoverId) deny("Recovery confirmation must equal the exact cutover id");
+    const cutoverStore=new CutoverStateStore(this.stateDir,{now:this.now});
+    const before=cutoverStore.get();
+    if(!before || before.cutoverId!==input.cutoverId || !before.coordinationBinding) deny("Exact coordination-bound cutover is required");
+    const binding=this.active(input.carrierId,new Set(),true);
+    if(binding.row.id!==before.coordinationBinding.ownerThread || binding.row.version!==input.expectedVersion || binding.validity.version!==input.expectedValidityVersion) {
+      throw new ControlPlaneOwnershipError("CAS_CONFLICT","Unexpected replacement recovery carrier identity or version changed");
+    }
+    const authorityGeneration=binding.generation;
+    const authorityContract=structuredClone(binding.contract);
+    const grant=this.grant(binding);
+    const assertRecoveryAuthorityCurrent=()=>{
+      const current=this.active(input.carrierId,new Set(),true);
+      if(current.row.id!==binding.row.id || current.row.version!==input.expectedVersion || current.validity.version!==input.expectedValidityVersion ||
+         current.generation!==authorityGeneration || !isDeepStrictEqual(current.contract,authorityContract) || !isDeepStrictEqual(this.grant(current),grant)) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT","Unexpected replacement recovery carrier authority changed");
+      }
+      return current;
+    };
+    if(binding.row.parent_id || binding.contract.role!=="controller" || !binding.contract.cutover ||
+       binding.contract.operations.length!==1 || binding.contract.operations[0]!=="cutover_start") {
+      deny("Unexpected replacement recovery requires the exact root controller cutover authority");
+    }
+    const approved=binding.contract.cutover;
+    if(Date.parse(binding.validity.expires_at)>this.now() || Date.parse(approved.expiresAt)>this.now()) {
+      deny("Unexpected replacement recovery requires both carrier validity and cutover approval to be expired");
+    }
+    if(physical(approved.stateRoot)!==physical(this.stateDir) ||
+       !isDeepStrictEqual(before.oldServerIdentity,approved.currentIdentity) ||
+       !isDeepStrictEqual(before.expectedNewIdentity,approved.expectedIdentity) ||
+       before.expiresAt!==approved.expiresAt) {
+      deny("Unexpected replacement recovery contract does not match the durable cutover generation");
+    }
+    if(before.phase!=="drained" && !(before.phase==="closed" && before.unexpectedReplacement)) {
+      deny("Unexpected replacement recovery requires the drained generation");
+    }
+    if(!before.drainEvidence || before.restartRequest || before.observedReplacement || before.expiredPreparedNoEffect ||
+       before.capabilityExpectationMismatch || before.supersession || before.bindingRepair) {
+      deny("Unexpected replacement recovery refuses missing drain, restart lineage, or conflicting terminal evidence");
+    }
+    if(input.observedIdentity.serverInstanceId===approved.currentIdentity.serverInstanceId ||
+       !input.observedIdentity.capabilityManifestSha256 ||
+       !approved.currentIdentity.capabilityManifestSha256 ||
+       !approved.expectedIdentity.capabilityManifestSha256 ||
+       (input.observedIdentity.sourceCommit===approved.expectedIdentity.sourceCommit &&
+        input.observedIdentity.buildId===approved.expectedIdentity.buildId &&
+        input.observedIdentity.capabilityManifestSha256===approved.expectedIdentity.capabilityManifestSha256)) {
+      deny("Unexpected replacement recovery requires a different complete replacement identity that does not equal the approved target");
+    }
+
+    const plan=planCutoverStart(this.stateDir,approved);
+    const correlation=before.coordinationBinding;
+    if(plan.subject.operationId!==correlation.operationHandle || plan.requestHash!==correlation.requestHash) {
+      deny("Unexpected replacement recovery operation correlation changed");
+    }
+
+    const operations=new DurableOperationStore(this.stateDir);
+    try {
+      const operation=operations.getByOperationId(correlation.operationHandle);
+      const terminalReplay=operation?.status==="failed" &&
+        operation.receipt?.lifecycleTerminal===true &&
+        operation.receipt?.recoveryKind==="unexpected_replacement_identity";
+      if(!operation || operation.kind!=="cutover_start" || (operation.status!=="succeeded" && !terminalReplay) ||
+         operation.requestHash!==correlation.requestHash || operation.scopeRoot!==physical(this.stateDir)) {
+        deny("Unexpected replacement recovery requires the exact successful cutover_start intent or its exact terminal replay");
+      }
+      const {coordinationBinding,...request}=operation.request;
+      if(!isDeepStrictEqual(coordinationBinding,correlation) || !isDeepStrictEqual(request,plan.request) ||
+         operation.receipt?.cutoverId!==before.cutoverId || operation.receipt?.startVerified!==true ||
+         operation.receipt?.restartAction!==undefined || operation.receipt?.restartState!==undefined) {
+        deny("Unexpected replacement recovery durable operation binding changed");
+      }
+
+      const localContext=Object.freeze({});
+      const recoveryDetail=JSON.stringify({
+        kind:"cutover_unexpected_replacement_identity",
+        cutoverId:input.cutoverId,
+        requestHash:correlation.requestHash,
+        observedIdentity:input.observedIdentity,
+        restartRequested:false,
+        restartScheduled:false,
+      });
+      const localOwnership=operations.createOwnershipStore({
+        now:this.now,
+        resolveOwnerContext: context=>context===localContext?{ownerThread:binding.row.id}:undefined,
+        resolveEffectBinding: ()=>undefined,
+        verifyGrantEvidence: (candidate,owner)=>{
+          assertRecoveryAuthorityCurrent();
+          return owner.ownerThread===binding.row.id && isDeepStrictEqual(candidate,grant);
+        },
+        verifyReconciliationEvidence: (evidence,lease,owner)=>{
+          assertRecoveryAuthorityCurrent();
+          const current=cutoverStore.get();
+          if(!current || current.cutoverId!==input.cutoverId || !current.coordinationBinding) return false;
+          if(current.phase!=="drained" && !(current.phase==="closed" && current.unexpectedReplacement)) return false;
+          if(!current.drainEvidence || current.restartRequest || current.observedReplacement ||
+             current.expiredPreparedNoEffect || current.capabilityExpectationMismatch ||
+             current.supersession || current.bindingRepair) return false;
+          return owner.ownerThread===binding.row.id &&
+            lease.leaseId===correlation.leaseId &&
+            lease.ownerThread===binding.row.id &&
+            lease.operation==="cutover_start" &&
+            lease.baseRevision===binding.contract.baseRevision &&
+            lease.operationHandle===correlation.operationHandle &&
+            evidence.leaseId===lease.leaseId &&
+            evidence.ownerThread===lease.ownerThread &&
+            evidence.operationHandle===correlation.operationHandle &&
+            evidence.operation==="cutover_start" &&
+            evidence.baseRevision===lease.baseRevision &&
+            evidence.leaseVersion===correlation.pinnedLeaseVersion &&
+            evidence.state==="failed" &&
+            evidence.detail===recoveryDetail;
+        },
+      });
+
+      const lease=localOwnership.get(correlation.leaseId);
+      if(!lease || lease.ownerThread!==binding.row.id || lease.operation!=="cutover_start" ||
+         lease.baseRevision!==binding.contract.baseRevision || lease.resource!==physical(this.stateDir) ||
+         lease.scope.length!==1 || lease.scope[0]!==physical(this.stateDir) ||
+         Date.parse(lease.expiresAt)>this.now()) {
+        deny("Unexpected replacement recovery lease binding changed or is not expired");
+      }
+      const reconciledReplay=lease.version===correlation.pinnedLeaseVersion+1 &&
+        lease.terminalState==="expired_reconciled" &&
+        lease.operationState==="finished" &&
+        lease.operationHandle===undefined;
+      if(lease.version===correlation.pinnedLeaseVersion) {
+        if(lease.terminalState || lease.operationState!=="active" || lease.operationHandle!==correlation.operationHandle) {
+          throw new ControlPlaneOwnershipError("CAS_CONFLICT","Unexpected replacement recovery requires the original active pin");
+        }
+      } else if(!reconciledReplay) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT","Unexpected replacement recovery lease version changed");
+      }
+
+      const evidence:ReconciliationEvidence={
+        leaseId:correlation.leaseId,
+        ownerThread:binding.row.id,
+        operationHandle:correlation.operationHandle,
+        operation:"cutover_start",
+        baseRevision:binding.contract.baseRevision,
+        leaseVersion:correlation.pinnedLeaseVersion,
+        state:"failed",
+        detail:recoveryDetail,
+      };
+      const reconciliation=localOwnership.reconcile(
+        localContext,
+        correlation.leaseId,
+        correlation.pinnedLeaseVersion,
+        evidence,
+      );
+      const afterLease=cutoverStore.get();
+      if(!afterLease || afterLease.cutoverId!==before.cutoverId ||
+         (before.phase==="drained" && !isDeepStrictEqual(afterLease,before)) ||
+         (before.phase==="closed" && !isDeepStrictEqual(afterLease,before))) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT","Unexpected replacement recovery cutover changed after lease reconciliation");
+      }
+
+      const recovered=operations.atomic(()=>{
+        assertRecoveryAuthorityCurrent();
+        const currentCutover=cutoverStore.get();
+        if(!currentCutover || currentCutover.cutoverId!==afterLease.cutoverId || !isDeepStrictEqual(currentCutover,afterLease)) {
+          throw new ControlPlaneOwnershipError("CAS_CONFLICT","Unexpected replacement recovery cutover changed before terminal close");
+        }
+        return cutoverStore.recoverUnexpectedReplacement({
+          cutoverId:input.cutoverId,
+          recoveredBy:binding.row.id,
+          observedIdentity:input.observedIdentity,
+        });
+      });
+      const canonicalClosed=cutoverStore.get();
+      if(!canonicalClosed || canonicalClosed.cutoverId!==input.cutoverId ||
+         canonicalClosed.phase!=="closed" || !canonicalClosed.unexpectedReplacement) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT","Unexpected replacement recovery canonical cutover readback is incomplete");
+      }
+
+      const terminalHash=cutoverTerminalRecordHash(canonicalClosed);
+      operations.atomic(()=>{
+        assertRecoveryAuthorityCurrent();
+        const current=operations.getByOperationId(correlation.operationHandle);
+        if(!current || current.requestHash!==operation.requestHash || !isDeepStrictEqual(current.request,operation.request)) {
+          throw new ControlPlaneOwnershipError("CAS_CONFLICT","Unexpected replacement recovery durable intent changed");
+        }
+        if(current.receipt?.lifecycleTerminal===true) {
+          if(current.receipt?.terminalRecordHash!==terminalHash ||
+             current.receipt?.recoveryKind!=="unexpected_replacement_identity" ||
+             !isDeepStrictEqual(current.receipt?.failedLeaseRecovery,reconciliation)) {
+            throw new ControlPlaneOwnershipError("CAS_CONFLICT","Unexpected replacement recovery terminal receipt changed");
+          }
+        } else {
+          operations.finish(correlation.operationHandle,{
+            status:"failed",
+            retrySafe:false,
+            receipt:{
+              ...current.receipt,
+              lifecycleTerminal:true,
+              terminalRecordHash:terminalHash,
+              recoveryKind:"unexpected_replacement_identity",
+              failedLeaseRecovery:reconciliation,
+            },
+            errorCode:"UNEXPECTED_REPLACEMENT_IDENTITY",
+            errorMessage:"A different replacement identity appeared after drain before this cutover requested a restart; the approved target was not rewritten or accepted.",
+          });
+        }
+      });
+
+      const finalOperation=operations.getByOperationId(correlation.operationHandle)!;
+      const finalLease=localOwnership.get(correlation.leaseId)!;
+      const finalCutover=cutoverStore.get()!;
+      const finalChecks={
+        cutoverClosed:finalCutover.phase==="closed",
+        unexpectedReceipt:Boolean(finalCutover.unexpectedReplacement),
+        terminalReason:finalCutover.reconciliationReceipt?.terminalReason==="UNEXPECTED_REPLACEMENT_IDENTITY",
+        restartAbsent:finalCutover.restartRequest===undefined,
+        leaseExpiredReconciled:finalLease.terminalState==="expired_reconciled",
+        leaseUnpinned:finalLease.operationHandle===undefined,
+        leaseFinished:finalLease.operationState==="finished",
+        operationFailed:finalOperation.status==="failed",
+        operationTerminal:finalOperation.receipt?.lifecycleTerminal===true,
+        terminalHash:finalOperation.receipt?.terminalRecordHash===cutoverTerminalRecordHash(finalCutover),
+      };
+      if(Object.values(finalChecks).some(value=>!value)) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT",`Unexpected replacement recovery final readback is incomplete: ${JSON.stringify(finalChecks)}`);
+      }
+      return {cutover:finalCutover,lease:finalLease,reconciliation,operation:finalOperation,replayed:!recovered.newlyRecovered};
+    } finally {
+      operations.close();
+    }
+  }
+
+  /**
    * Host-local terminal recovery for one coordination-bound DRAINED cutover whose
    * replacement loaded the exact expected source/build but a different capability
    * manifest. This records a failed attempt, reconciles the original pin, and releases
