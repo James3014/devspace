@@ -1825,7 +1825,10 @@ function registerCutoverMcpTools(
       title: "Drain cutover",
       description:
         "Record aggregate transport drain evidence for one exact cutover lease. Consequential MCP starts remain blocked while the lease is active.",
-      inputSchema: { cutoverId: z.string().min(1) },
+      inputSchema: {
+        cutoverId: z.string().min(1),
+        carrierCredential: z.string().optional().describe("Optional approved carrier credential for this exact drain when reconnecting on a fresh MCP session."),
+      },
       outputSchema: {
         cutover: cutoverRecordSchema,
         mode: modeSchema,
@@ -1833,12 +1836,12 @@ function registerCutoverMcpTools(
       _meta: {},
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     },
-    async ({ cutoverId }, extra) => {
+    async ({ cutoverId, carrierCredential }, extra) => {
       const existing=control.controller.record();
       // Legacy unbound generations retain their existing runtime fence only.
       // Malformed bindings throw from record(); they never enter this branch.
       const record = existing?.coordinationBinding
-        ? (()=>{if(!durableOperations) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","cutover drain requires trusted coordination");return durableOperations.drainCutover(cutoverId,control.controller.currentIdentity,control.transportEvidence,dependencyConsumerContext(extra));})()
+        ? (()=>{if(!durableOperations) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","cutover drain requires trusted coordination");const context=dependencyConsumerContext(extra);if(carrierCredential!==undefined && carrierBindings) carrierBindings.redeem(context,carrierCredential);return durableOperations.drainCutover(cutoverId,control.controller.currentIdentity,control.transportEvidence,context);})()
         : control.controller.recordDrain(cutoverId, control.transportEvidence());
       const mode = control.controller.mode();
       return {
