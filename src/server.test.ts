@@ -715,6 +715,12 @@ test("cutover MCP control exposes bounded lease lifecycle and schedules self res
     ]) {
       assert.ok(tools.tools.some((tool) => tool.name === name), `missing ${name}`);
     }
+    const drainTool = tools.tools.find((tool) => tool.name === "cutover_drain");
+    assert.ok(drainTool);
+    assert.ok(
+      (drainTool.inputSchema as { properties?: Record<string, unknown> }).properties?.carrierCredential,
+      "cutover_drain must expose inline carrierCredential for fresh-session rebind",
+    );
     const restartTool = tools.tools.find((tool) => tool.name === "cutover_restart_self");
     assert.ok(restartTool);
     assert.ok(
