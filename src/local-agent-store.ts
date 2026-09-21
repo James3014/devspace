@@ -281,6 +281,40 @@ export class LocalAgentStore {
     return rows.map(rowToLocalAgentRecord);
   }
 
+  /**
+   * Return only rows that can require the active-agent supervision pass.
+   *
+   * Active status is kept as a SQL predicate so legacy rows remain eligible
+   * for adoption/reconciliation. A durable terminationPending marker is also
+   * selected independently of status because fencing persists a terminal
+   * status before physical worker cleanup completes. The marker check is
+   * intentionally textual: it avoids deserializing historical lifecycle and
+   * execution blobs merely to discover that a terminal row is ineligible.
+   */
+  listSupervisionCandidates(scope: LocalAgentListScope = {}): LocalAgentRecord[] {
+    const clauses = [
+      "(status in ('starting', 'running') or instr(coalesce(lifecycle_state, ''), '\"terminationPending\"') > 0)",
+    ];
+    const parameters: string[] = [];
+    if (scope.workspaceId) {
+      clauses.push("workspace_id = ?");
+      parameters.push(scope.workspaceId);
+    }
+    if (scope.workspaceRoot) {
+      clauses.push("workspace_root = ?");
+      parameters.push(resolve(scope.workspaceRoot));
+    }
+
+    const rows = this.database.sqlite
+      .prepare(
+        `select * from local_agent_sessions
+         where ${clauses.join(" and ")}
+         order by updated_at desc`,
+      )
+      .all(...parameters) as LocalAgentRow[];
+    return rows.map(rowToLocalAgentRecord);
+  }
+
   listResult(scope: LocalAgentListScope = {}): BetterResult<LocalAgentRecord[], AgentStoreError> {
     return storeResult("list", () => this.list(scope));
   }

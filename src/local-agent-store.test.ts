@@ -75,6 +75,87 @@ assert.deepEqual(store.list({ workspaceId: "ws_other" }), []);
 assert.deepEqual(store.list({ workspaceId: "ws_1", workspaceRoot: join(root, "other") }), []);
 assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
 
+  const supervisionStateDir = join(root, "supervision-candidates");
+  let supervisionStore = new LocalAgentStore(supervisionStateDir);
+  const historicalTerminalIds: string[] = [];
+  for (let index = 0; index < 200; index += 1) {
+    const historical = supervisionStore.create({
+      workspaceId: "ws_history",
+      workspaceRoot: join(root, "history"),
+      profileName: "historical-worker",
+      provider: "codex",
+      executionContract: { maxWallMs: 60_000, writePaths: ["src"] },
+      lifecycleKind: "detached_worker_v2",
+    });
+    const generation = historical.lifecycleState!.activeTurn!.generation!;
+    supervisionStore.prepareWorker(historical.id, `history-token-${index}`);
+    supervisionStore.claimWorker(historical.id, `history-token-${index}`, 10_000 + index);
+    assert.equal(supervisionStore.finishTurnCAS({
+      agentId: historical.id,
+      generation,
+      workerToken: `history-token-${index}`,
+      status: "idle",
+      terminalReason: "completed",
+    }).applied, true);
+    historicalTerminalIds.push(historical.id);
+  }
+
+  const starting = supervisionStore.create({
+    workspaceId: "ws_active",
+    workspaceRoot: join(root, "active"),
+    profileName: "starting-worker",
+    provider: "codex",
+    lifecycleKind: "detached_worker_v2",
+  });
+  const running = supervisionStore.create({
+    workspaceId: "ws_active",
+    workspaceRoot: join(root, "active"),
+    profileName: "running-worker",
+    provider: "codex",
+    lifecycleKind: "detached_worker_v2",
+  });
+  supervisionStore.prepareWorker(running.id, "running-token");
+  supervisionStore.claimWorker(running.id, "running-token", 20_001);
+
+  const pending = supervisionStore.create({
+    workspaceId: "ws_pending",
+    workspaceRoot: join(root, "pending"),
+    profileName: "pending-worker",
+    provider: "codex",
+    lifecycleKind: "detached_worker_v2",
+  });
+  const pendingGeneration = pending.lifecycleState!.activeTurn!.generation!;
+  supervisionStore.prepareWorker(pending.id, "pending-token");
+  supervisionStore.claimWorker(pending.id, "pending-token", 20_002);
+  const supervisionFenced = supervisionStore.fenceActiveTurn({
+    agentId: pending.id,
+    expectedPhase: "any",
+    terminalReason: "timeout",
+    error: "pending cleanup",
+  });
+  assert.equal(supervisionFenced.applied, true);
+  assert.equal(supervisionFenced.current?.lifecycleState?.terminationPending?.generation, pendingGeneration);
+  assert.equal(supervisionFenced.current?.status, "error");
+
+  const terminalInventoryCount = supervisionStore.list().length;
+  assert.equal(terminalInventoryCount, historicalTerminalIds.length + 3);
+  assert.equal(supervisionStore.list().some((record) => record.id === historicalTerminalIds[0]), true);
+  const candidatesBeforeReopen = supervisionStore.listSupervisionCandidates();
+  assert.equal(candidatesBeforeReopen.some((record) => historicalTerminalIds.includes(record.id)), false);
+  assert.equal(candidatesBeforeReopen.some((record) => record.id === starting.id), true);
+  assert.equal(candidatesBeforeReopen.some((record) => record.id === running.id), true);
+  assert.equal(candidatesBeforeReopen.some((record) => record.id === pending.id), true);
+  assert.equal(candidatesBeforeReopen.find((record) => record.id === pending.id)?.status, "error");
+
+  supervisionStore.close();
+  supervisionStore = new LocalAgentStore(supervisionStateDir);
+  assert.equal(supervisionStore.list().length, terminalInventoryCount);
+  assert.equal(supervisionStore.list().some((record) => record.id === historicalTerminalIds[0]), true);
+  const candidatesAfterReopen = supervisionStore.listSupervisionCandidates();
+  assert.equal(candidatesAfterReopen.some((record) => record.id === pending.id), true);
+  assert.equal(candidatesAfterReopen.find((record) => record.id === pending.id)?.lifecycleState?.terminationPending?.generation, pendingGeneration);
+  stores.push(supervisionStore);
+
   const failedContinuation = store.create({
     workspaceId: "ws_1",
     workspaceRoot: join(root, "project"),

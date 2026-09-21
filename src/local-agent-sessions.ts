@@ -1389,7 +1389,7 @@ export class LocalAgentSessionManager {
    */
   async superviseActiveAgents(): Promise<void> {
     const now = Date.now();
-    for (const record of this.store.list()) {
+    for (const record of this.store.listSupervisionCandidates()) {
       if (!isDetachedLifecycle(record.lifecycleState)) {
         if (isActiveStatus(record.status)) {
           const reconciled = this.store.reconcileLegacyDetachedActiveCAS(record.id);
