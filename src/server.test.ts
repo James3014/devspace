@@ -635,6 +635,138 @@ test("checkout reuse and context suppression survive a registry restart", async 
   }
 });
 
+test("late nested instructions fail closed across read/write/edit until explicitly read", async (t) => {
+  const context = await fixture(t);
+  const opened = await callOpen(context.client, context.project, "chat-1");
+  const workspaceId = structuredContent(opened).workspaceId as string;
+  const nestedDir = join(context.project, "packages", "late");
+  const instructionPath = join(nestedDir, "AGENTS.md");
+  const targetPath = join(nestedDir, "index.ts");
+
+  await mkdir(nestedDir, { recursive: true });
+  await writeFile(instructionPath, "late instructions\n");
+  await writeFile(targetPath, "export const value = 1;\n");
+  await callOpen(context.client, context.project, "chat-1");
+
+  const meta = { "openai/session": "chat-1" };
+  const readBlocked = await context.client.callTool({
+    name: "read",
+    arguments: { workspaceId, path: "packages/late/index.ts" },
+    _meta: meta,
+  });
+  assert.equal(readBlocked.isError, true);
+  assert.match(responseText(readBlocked), /NESTED_INSTRUCTION_REBIND_REQUIRED/);
+  assert.doesNotMatch(responseText(readBlocked), /export const value/);
+
+  const writeBlocked = await context.client.callTool({
+    name: "write",
+    arguments: { workspaceId, path: "packages/late/new.ts", content: "export const fresh = 1;\n" },
+    _meta: meta,
+  });
+  assert.equal(writeBlocked.isError, true);
+  assert.equal(existsSync(join(nestedDir, "new.ts")), false);
+
+  const editBlocked = await context.client.callTool({
+    name: "edit",
+    arguments: {
+      workspaceId,
+      path: "packages/late/index.ts",
+      edits: [{ oldText: "value = 1", newText: "value = 2" }],
+    },
+    _meta: meta,
+  });
+  assert.equal(editBlocked.isError, true);
+  assert.equal(await readFile(targetPath, "utf8"), "export const value = 1;\n");
+
+  const instructionRead = await context.client.callTool({
+    name: "read",
+    arguments: { workspaceId, path: "packages/late/AGENTS.md" },
+    _meta: meta,
+  });
+  assert.equal(instructionRead.isError, undefined);
+
+  const readAllowed = await context.client.callTool({
+    name: "read",
+    arguments: { workspaceId, path: "packages/late/index.ts" },
+    _meta: meta,
+  });
+  assert.equal(readAllowed.isError, undefined);
+
+  const writeAllowed = await context.client.callTool({
+    name: "write",
+    arguments: { workspaceId, path: "packages/late/new.ts", content: "export const fresh = 1;\n" },
+    _meta: meta,
+  });
+  assert.equal(writeAllowed.isError, undefined);
+
+  const editAllowed = await context.client.callTool({
+    name: "edit",
+    arguments: {
+      workspaceId,
+      path: "packages/late/index.ts",
+      edits: [{ oldText: "value = 1", newText: "value = 2" }],
+    },
+    _meta: meta,
+  });
+  assert.equal(editAllowed.isError, undefined);
+
+  const staleEdit = await context.client.callTool({
+    name: "edit",
+    arguments: {
+      workspaceId,
+      path: "packages/late/index.ts",
+      edits: [{ oldText: "value = 1", newText: "value = 3" }],
+    },
+    _meta: meta,
+  });
+  assert.equal(staleEdit.isError, true);
+  assert.match(responseText(staleEdit), /Re-read the current target region/);
+});
+
+test("late nested instructions also fence codex apply_patch until explicitly read", async (t) => {
+  const context = await fixture(t, { toolMode: "codex" });
+  const opened = await callOpen(context.client, context.project, "chat-codex");
+  const workspaceId = structuredContent(opened).workspaceId as string;
+  const nestedDir = join(context.project, "packages", "late-patch");
+  const targetPath = join(nestedDir, "new.ts");
+
+  await mkdir(nestedDir, { recursive: true });
+  await writeFile(join(nestedDir, "AGENTS.md"), "late patch instructions\n");
+  await callOpen(context.client, context.project, "chat-codex");
+
+  const patch = [
+    "*** Begin Patch",
+    "*** Add File: packages/late-patch/new.ts",
+    "+export const patched = 1;",
+    "*** End Patch",
+  ].join("\n");
+  const meta = { "openai/session": "chat-codex" };
+
+  const blocked = await context.client.callTool({
+    name: "apply_patch",
+    arguments: { workspaceId, patch },
+    _meta: meta,
+  });
+  assert.equal(blocked.isError, true);
+  assert.match(responseText(blocked), /NESTED_INSTRUCTION_REBIND_REQUIRED/);
+  assert.equal(existsSync(targetPath), false);
+
+  const instructionRead = await context.client.callTool({
+    name: "read",
+    arguments: { workspaceId, path: "packages/late-patch/AGENTS.md" },
+    _meta: meta,
+  });
+  assert.equal(instructionRead.isError, undefined);
+
+  const applied = await context.client.callTool({
+    name: "apply_patch",
+    arguments: { workspaceId, patch },
+    _meta: meta,
+  });
+  assert.equal(applied.isError, undefined);
+  assert.equal(await readFile(targetPath, "utf8"), "export const patched = 1;\n");
+});
+
 test("cutover MCP control exposes bounded lease lifecycle and schedules self restart once", async () => {
   const root = await mkdtemp(join(tmpdir(), "devspace-cutover-mcp-control-"));
   const stateDir = join(root, ".state");

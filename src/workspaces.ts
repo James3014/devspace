@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto";
-import type { Stats } from "node:fs";
+import { existsSync, statSync, type Stats } from "node:fs";
 import type {
   WorkspaceConversationBinding,
   WorkspaceMode,
@@ -16,6 +16,7 @@ import {
   assertAllowedPath,
   isPathInsideRoot,
   resolveAllowedPath,
+  canonicalizePath,
 } from "./roots.js";
 import {
   loadWorkspaceSkills,
@@ -69,6 +70,8 @@ export interface Workspace {
   profileCatalogGeneration?: string;
   profileCatalogEntries?: ProfileCatalogEntry[];
   activatedSkillDirs: Set<string>;
+  availableAgentsFiles?: AvailableAgentsFile[];
+  loadedInstructionPaths?: Set<string>;
 }
 
 export interface WorkspaceContext {
@@ -83,6 +86,9 @@ export interface WorkspaceReadPath {
   absolutePath: string;
   readRoots: string[];
   skillRead?: SkillReadResolution;
+  nestedInstructionRebindRequired?: {
+    instructionPaths: string[];
+  };
 }
 
 export interface OpenWorkspaceInput {
@@ -260,7 +266,10 @@ export class WorkspaceRegistry {
     workspace.profileCatalogGeneration = catalog.generation;
     workspace.profileCatalogEntries = catalogEntriesOf(catalog);
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
-    const availableAgentsFiles = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
+    this.markInitialInstructionFilesLoaded(workspace, agentsFiles);
+    const availableAgentsFiles = (workspace.availableAgentsFiles ?? [])
+      .filter((file) => existsSync(file.path));
+    workspace.availableAgentsFiles = availableAgentsFiles;
 
     return {
       workspace,
@@ -269,6 +278,103 @@ export class WorkspaceRegistry {
       workspaceReused: true,
       includeBootstrapContext: true,
     };
+  }
+
+  preOperationAncestorCheck(workspace: Workspace, targetAbsPath: string): string[] {
+    const root = canonicalizePath(workspace.root);
+    const realTarget = canonicalizePath(targetAbsPath);
+    let currentDir = existsSync(targetAbsPath) && statSync(targetAbsPath).isDirectory()
+      ? realTarget
+      : dirname(realTarget);
+
+    workspace.availableAgentsFiles ??= [];
+    workspace.loadedInstructionPaths ??= new Set<string>();
+
+    const newlyDiscovered: string[] = [];
+
+    while (currentDir.startsWith(root)) {
+      for (const name of CONTEXT_FILE_NAMES) {
+        const candidate = join(currentDir, name);
+        if (candidate === join(root, name)) continue;
+
+        if (!existsSync(candidate)) {
+          const resolvedCandidate = canonicalizePath(candidate).toLowerCase();
+          workspace.availableAgentsFiles = workspace.availableAgentsFiles.filter((file) => {
+            const resolvedFile = canonicalizePath(file.path).toLowerCase();
+            if (resolvedFile !== resolvedCandidate || existsSync(file.path)) return true;
+            workspace.loadedInstructionPaths?.delete(resolvedFile);
+            return false;
+          });
+          continue;
+        }
+
+        const realCandidate = canonicalizePath(candidate);
+        if (!isPathInsideRoot(realCandidate, root)) continue;
+        const normalizedCandidate = realCandidate.toLowerCase();
+        if (normalizedCandidate === realTarget.toLowerCase()) continue;
+
+        const alreadyAvailable = workspace.availableAgentsFiles.some(
+          (file) => canonicalizePath(file.path).toLowerCase() === normalizedCandidate,
+        );
+        if (!alreadyAvailable) {
+          workspace.availableAgentsFiles.push({ path: realCandidate });
+          workspace.availableAgentsFiles.sort((a, b) => a.path.localeCompare(b.path));
+        }
+        if (
+          !workspace.loadedInstructionPaths.has(normalizedCandidate) &&
+          !newlyDiscovered.some(
+            (path) => canonicalizePath(path).toLowerCase() === normalizedCandidate,
+          )
+        ) {
+          newlyDiscovered.push(realCandidate);
+        }
+      }
+
+      if (currentDir === root) break;
+      const parentDir = dirname(currentDir);
+      if (parentDir === currentDir) break;
+      currentDir = parentDir;
+    }
+
+    return newlyDiscovered;
+  }
+
+  invalidateInstructionPath(workspace: Workspace, filePath: string): void {
+    if (!CONTEXT_FILE_NAMES.has(basename(filePath))) return;
+    const resolved = canonicalizePath(filePath).toLowerCase();
+    workspace.loadedInstructionPaths?.delete(resolved);
+    if (!existsSync(filePath)) {
+      workspace.availableAgentsFiles = (workspace.availableAgentsFiles ?? []).filter(
+        (file) => canonicalizePath(file.path).toLowerCase() !== resolved,
+      );
+    }
+  }
+
+  private notifyInstructionFileRead(workspace: Workspace, filePath: string): void {
+    if (!CONTEXT_FILE_NAMES.has(basename(filePath))) return;
+    const resolved = canonicalizePath(filePath);
+    const normalized = resolved.toLowerCase();
+    workspace.availableAgentsFiles ??= [];
+    workspace.loadedInstructionPaths ??= new Set<string>();
+    const known = workspace.availableAgentsFiles.some(
+      (file) => canonicalizePath(file.path).toLowerCase() === normalized,
+    );
+    if (!known) {
+      workspace.availableAgentsFiles.push({ path: resolved });
+      workspace.availableAgentsFiles.sort((a, b) => a.path.localeCompare(b.path));
+    }
+    workspace.loadedInstructionPaths.add(normalized);
+  }
+
+  private markInitialInstructionFilesLoaded(
+    workspace: Workspace,
+    agentsFiles: LoadedAgentsFile[],
+  ): void {
+    workspace.loadedInstructionPaths ??= new Set<string>();
+    for (const file of agentsFiles) {
+      if (!CONTEXT_FILE_NAMES.has(basename(file.path))) continue;
+      workspace.loadedInstructionPaths.add(canonicalizePath(file.path).toLowerCase());
+    }
   }
 
   getWorkspace(workspaceId: string): Workspace {
@@ -463,8 +569,18 @@ export class WorkspaceRegistry {
       };
     }
 
+    const absolutePath = this.resolvePath(workspace, inputPath);
+    const newInstructions = this.preOperationAncestorCheck(workspace, absolutePath);
+    if (newInstructions.length > 0) {
+      return {
+        absolutePath,
+        readRoots: [workspace.root],
+        nestedInstructionRebindRequired: { instructionPaths: newInstructions },
+      };
+    }
+
     return {
-      absolutePath: this.resolvePath(workspace, inputPath),
+      absolutePath,
       readRoots: [workspace.root],
     };
   }
@@ -473,6 +589,7 @@ export class WorkspaceRegistry {
     if (readPath.skillRead?.isSkillFile) {
       markSkillActivated(workspace.activatedSkillDirs, readPath.skillRead.skill);
     }
+    this.notifyInstructionFileRead(workspace, readPath.absolutePath);
   }
 
   resolveWorkingDirectory(workspace: Workspace, workingDirectory: string | undefined): string {
@@ -539,7 +656,9 @@ export class WorkspaceRegistry {
     });
     this.workspaces.set(workspace.id, workspace);
     const agentsFiles = await this.loadInitialAgentsFiles(workspace.root);
+    this.markInitialInstructionFilesLoaded(workspace, agentsFiles);
     const availableAgentsFiles = await this.findAvailableAgentsFiles(workspace.root, agentsFiles);
+    workspace.availableAgentsFiles = availableAgentsFiles;
 
     return {
       workspace,
