@@ -1335,7 +1335,7 @@ async function runCutoverUnexpectedReplacementRecovery(args: string[]): Promise<
     else throw new Error(`Unknown cutover recover-unexpected-replacement flag: ${argument}`);
   }
   if (!cutoverId || !carrierId || !Number.isSafeInteger(version) || !Number.isSafeInteger(validityVersion) ||
-      (version ?? 0) < 1 || (validityVersion ?? 0) < 1 || !confirmCutoverId || !packageRoot) {
+      (version ?? 0) < 1 || (validityVersion ?? 0) < 1 || !confirmCutoverId || confirmCutoverId !== cutoverId || !packageRoot) {
     throw new Error("Usage: devspace cutover recover-unexpected-replacement --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --package-root <path> --confirm <id> [--json]");
   }
 
@@ -1367,13 +1367,13 @@ async function runCutoverUnexpectedReplacementRecovery(args: string[]): Promise<
     throw new Error("Live /healthz identity or capability manifest is malformed; refusing unexpected replacement recovery.");
   }
 
-  const activeCutover = new CutoverStateStore(config.stateDir).get();
-  if (!activeCutover || activeCutover.cutoverId !== cutoverId) {
-    throw new Error("Unexpected replacement recovery requires the exact active cutover.");
-  }
   const targetPackage = probeTargetPackage(packageRoot);
   if (targetPackage.sourceCommit !== sourceCommit || targetPackage.buildId !== buildId) {
     throw new Error("Running package identity does not match the live observed replacement source/build; refusing recovery.");
+  }
+  const activeCutover = new CutoverStateStore(config.stateDir).get();
+  if (!activeCutover || activeCutover.cutoverId !== cutoverId) {
+    throw new Error("Unexpected replacement recovery requires the exact active cutover.");
   }
   if (
     activeCutover.expectedNewIdentity.sourceCommit === sourceCommit &&
