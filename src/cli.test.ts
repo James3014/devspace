@@ -115,6 +115,22 @@ for (const args of [
 
 
 for (const args of [
+  ["cutover", "recover-unexpected-replacement", "--cutover-id", "c"],
+  ["cutover", "recover-unexpected-replacement", "--cutover-id", "c", "--carrier", "carrier", "--version", "0", "--validity-version", "1", "--package-root", "/tmp", "--confirm", "c"],
+  ["cutover", "recover-unexpected-replacement", "--cutover-id", "c", "--carrier", "carrier", "--version", "1", "--validity-version", "1", "--package-root", "/tmp", "--confirm", "other"],
+  ["cutover", "recover-unexpected-replacement", "--cutover-id", "c", "--carrier", "carrier", "--version", "1", "--validity-version", "1", "--package-root", "/tmp", "--confirm", "c", "--credential", "forbidden"],
+]) {
+  assert.throws(
+    () => execFileSync("node", ["--import", "tsx", "src/cli.ts", ...args], { encoding: "utf8", env: { ...process.env, DEVSPACE_CONFIG_DIR: "/tmp/devspace-cli-invalid-unexpected-replacement-test" } }),
+    (error: unknown) => {
+      const detail = error as { stderr?: string; status?: number };
+      return detail.status !== 0 && /Usage:|Unknown cutover recover-unexpected-replacement flag/.test(detail.stderr ?? "");
+    },
+  );
+}
+
+
+for (const args of [
   ["cutover", "release-terminal-lease", "--cutover-id", "c"],
   ["cutover", "release-terminal-lease", "--cutover-id", "c", "--lease-id", "l", "--lease-version", "0", "--carrier", "carrier", "--carrier-version", "2", "--terminal-record-hash", "a".repeat(64), "--confirm", "c"],
   ["cutover", "release-terminal-lease", "--cutover-id", "c", "--lease-id", "l", "--lease-version", "1", "--carrier", "carrier", "--carrier-version", "1", "--terminal-record-hash", "a".repeat(64), "--confirm", "c"],
@@ -149,6 +165,45 @@ test("cutover recover accepts explicit package root and fails closed when target
       (error:unknown)=>/build_manifest_sha256|digest domain cannot be proven/i.test((error as {stderr?:string}).stderr??String(error)),
     );
   } finally {rmSync(root,{recursive:true,force:true});}
+});
+
+test("recover-unexpected-replacement requires physical package attribution before carrier recovery", async () => {
+  const root=mkdtempSync(join(tmpdir(),"devspace-cli-unexpected-replacement-attribution-"));
+  const stateDir=join(root,"state"), target=join(root,"target");
+  mkdirSync(join(target,"generated"),{recursive:true});
+  mkdirSync(stateDir,{recursive:true});
+  writeFileSync(
+    join(target,BUILD_IDENTITY_RELATIVE_PATH),
+    JSON.stringify({source_commit:"b".repeat(40),build_id:"wrong-package",build_manifest_sha256:"9".repeat(64)}),
+    "utf8",
+  );
+  const server=createHttpServer((req,res)=>{
+    if(req.url!=="/healthz"){res.statusCode=404;res.end();return;}
+    res.setHeader("content-type","application/json");
+    res.end(JSON.stringify({
+      ok:true,
+      build:{source_commit:"f".repeat(40),build_id:"replacement-build"},
+      capabilityManifest:{manifestSha256:"e".repeat(64),missing:[]},
+      mcp:{serverInstanceId:"replacement"},
+    }));
+  });
+  await new Promise<void>((resolve,reject)=>server.listen(0,"127.0.0.1",resolve).once("error",reject));
+  const address=server.address();
+  assert.ok(address && typeof address==="object");
+  try {
+    await assert.rejects(
+      execFileAsync("node",["--import","tsx","src/cli.ts","cutover","recover-unexpected-replacement",
+        "--cutover-id","cutover-unexpected-test","--carrier","carrier-missing","--version","1","--validity-version","1",
+        "--package-root",target,"--confirm","cutover-unexpected-test","--json"],{
+        cwd:process.cwd(),timeout:15000,
+        env:{...process.env,DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_ALLOWED_ROOTS:root,DEVSPACE_WORKTREE_ROOT:join(root,"worktrees"),DEVSPACE_STATE_DIR:stateDir,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",HOST:"127.0.0.1",PORT:String(address.port)},
+      }),
+      (error:unknown)=>/Running package identity does not match the live observed replacement source\/build/i.test((error as {stderr?:string}).stderr??String(error)),
+    );
+  } finally {
+    await new Promise<void>(resolve=>server.close(()=>resolve()));
+    rmSync(root,{recursive:true,force:true});
+  }
 });
 
 test("recover-capability-mismatch uses explicit target package and preserves cross-domain binding-repair ownership", async () => {

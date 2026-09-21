@@ -55,6 +55,28 @@ async function prepareCapabilityMismatch(f: ReturnType<typeof fixture>, sessionI
   return {context,cutover,approved,preparedLease,manager,start,id,scheduled:()=>scheduled,observed:{serverInstanceId:"replacement",sourceCommit:cutover.expectedIdentity.sourceCommit,buildId:cutover.expectedIdentity.buildId,capabilityManifestSha256:observedCapability}};
 }
 
+async function prepareUnexpectedReplacement(f: ReturnType<typeof fixture>, sessionId: string) {
+  const context={clientId:"shared-oauth",sessionId};
+  const pairing=f.store.requestPairing(context);
+  const cutover={stateRoot:f.root,attemptKey:`${sessionId}-cutover`,
+    currentIdentity:{serverInstanceId:"original",sourceCommit:f.contract.baseRevision,buildId:"old",capabilityManifestSha256:"c".repeat(64)},
+    expectedIdentity:{sourceCommit:"b".repeat(40),buildId:"new",capabilityManifestSha256:"d".repeat(64)},
+    expiresAt:new Date(f.clock()+30000).toISOString(),
+    restart:{buildReady:{verifiedBy:"fixture",verifiedAt:new Date(f.clock()).toISOString(),evidence:"exact original target"},actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"},
+    finish:{workspaceId:"ws_test",agentId:"agt_test"}};
+  const contract={...f.contract,scope:[f.root],operations:["cutover_start" as const],cutover,expiresAt:new Date(f.clock()+60000).toISOString()};
+  const approved=f.store.approveLocal(pairing.pendingId,contract);
+  f.store.redeem(context,pairing.credential);
+  const plan=planCutoverStart(f.root,cutover);
+  const preparedLease=f.store.prepareEffect(context,plan.subject);
+  const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,`${sessionId}-config`),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,`${sessionId}-worktrees`),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
+  const manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+  const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
+  manager.drainCutover(id,cutover.currentIdentity,()=>({activeSessions:0,oldestAgeMs:0}),context);
+  const observed={serverInstanceId:"replacement",sourceCommit:"f".repeat(40),buildId:"replacement-build",capabilityManifestSha256:"e".repeat(64)};
+  return {context,pairing,cutover,approved,preparedLease,manager,start,id,observed};
+}
+
 for(const scenario of ["current","expired","close-response","terminal-write","revoke-witness","renew-witness","stale-replay"]) test(`local cutover approval binds execution and recovery (${scenario})`,async()=>{
   const expireLease=scenario!=="current";
   const f=fixture();
@@ -354,6 +376,184 @@ test("expired prepared recovery crash after cutover close replays only operation
     assert.equal(replay.replayed,true);
     assert.equal(replay.operation.receipt?.lifecycleTerminal,true);
   } finally {DurableOperationStore.prototype.finish=originalFinish;manager?.close();f.close();}
+});
+
+test("host-local unexpected replacement recovery closes only an expired drained no-restart generation",async()=>{
+  const f=fixture();
+  const prepared=await prepareUnexpectedReplacement(f,"unexpected-replacement");
+  try {
+    assert.throws(
+      ()=>f.store.recoverUnexpectedReplacementLocal({
+        cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,
+        confirmCutoverId:prepared.id,observedIdentity:prepared.observed,
+      }),
+      /expired/i,
+    );
+    assert.equal(new CutoverStateStore(f.root).get()?.phase,"drained");
+    assert.equal(f.store.ownership.get(prepared.preparedLease.leaseId)?.operationHandle,prepared.start.operationId);
+
+    assert.throws(()=>f.store.recoverUnexpectedReplacementLocal({
+      cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,
+      confirmCutoverId:prepared.id,observedIdentity:{...prepared.cutover.expectedIdentity,serverInstanceId:"expected-target"},
+    }),/expired|different complete replacement identity/i);
+    assert.throws(()=>f.store.recoverUnexpectedReplacementLocal({
+      cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,
+      confirmCutoverId:prepared.id,observedIdentity:{...prepared.observed,serverInstanceId:prepared.cutover.currentIdentity.serverInstanceId},
+    }),/expired|different complete replacement identity/i);
+
+    f.advance(120000);
+    assert.throws(()=>f.store.recoverUnexpectedReplacementLocal({
+      cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:2,expectedValidityVersion:1,
+      confirmCutoverId:prepared.id,observedIdentity:prepared.observed,
+    }),/version/i);
+    assert.throws(()=>f.store.recoverUnexpectedReplacementLocal({
+      cutoverId:"wrong-cutover",carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,
+      confirmCutoverId:"wrong-cutover",observedIdentity:prepared.observed,
+    }));
+
+    const recovered=f.store.recoverUnexpectedReplacementLocal({
+      cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,
+      confirmCutoverId:prepared.id,observedIdentity:prepared.observed,
+    });
+    assert.equal(recovered.replayed,false);
+    assert.equal(recovered.cutover.phase,"closed");
+    assert.equal(recovered.cutover.reconciliationReceipt?.terminalReason,"UNEXPECTED_REPLACEMENT_IDENTITY");
+    assert.equal(recovered.cutover.reconciliationReceipt?.preRestartDrainObserved,true);
+    assert.equal(recovered.cutover.restartRequest,undefined);
+    assert.deepEqual(recovered.cutover.expectedNewIdentity,prepared.cutover.expectedIdentity);
+    assert.deepEqual(recovered.cutover.unexpectedReplacement?.observedIdentity,prepared.observed);
+    assert.equal(recovered.cutover.unexpectedReplacement?.restartRequested,false);
+    assert.equal(recovered.cutover.unexpectedReplacement?.restartScheduled,false);
+    assert.equal(recovered.lease.terminalState,"expired_reconciled");
+    assert.equal(recovered.lease.operationState,"finished");
+    assert.equal(recovered.lease.operationHandle,undefined);
+    assert.equal(recovered.operation.status,"failed");
+    assert.equal(recovered.operation.errorCode,"UNEXPECTED_REPLACEMENT_IDENTITY");
+    assert.equal(recovered.operation.receipt?.lifecycleTerminal,true);
+    assert.equal(recovered.operation.receipt?.recoveryKind,"unexpected_replacement_identity");
+
+    const replay=f.store.recoverUnexpectedReplacementLocal({
+      cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,
+      confirmCutoverId:prepared.id,observedIdentity:prepared.observed,
+    });
+    assert.equal(replay.replayed,true);
+    assert.deepEqual(replay.cutover,recovered.cutover);
+    assert.deepEqual(replay.reconciliation,recovered.reconciliation);
+  } finally {prepared.manager.close();f.close();}
+});
+
+test("unexpected replacement recovery refuses any restart lineage",async()=>{
+  const f=fixture();
+  const prepared=await prepareUnexpectedReplacement(f,"unexpected-replacement-restart-negative");
+  try {
+    let scheduled=0;
+    await prepared.manager.restartCutover(
+      prepared.id,
+      prepared.cutover.currentIdentity,
+      prepared.cutover.restart.buildReady,
+      async()=>({buildReady:true,detail:"exact original target"}),
+      {
+        actuator:"launchd-self" as const,
+        serviceLabel:"test.service",
+        launchdTarget:"gui/501/test.service",
+        schedule:()=>{scheduled+=1;return {scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"};},
+      },
+      prepared.context,
+    );
+    assert.equal(scheduled,1);
+    f.advance(120000);
+    assert.throws(()=>f.store.recoverUnexpectedReplacementLocal({
+      cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,
+      confirmCutoverId:prepared.id,observedIdentity:prepared.observed,
+    }),/restart lineage/i);
+    const stillDrained=new CutoverStateStore(f.root).get()!;
+    assert.equal(stillDrained.phase,"drained");
+    assert.ok(stillDrained.restartRequest?.restartScheduledAt);
+  } finally {prepared.manager.close();f.close();}
+});
+
+test("unexpected replacement recovery resumes after lease reconciliation before cutover close",async()=>{
+  const f=fixture();
+  const prepared=await prepareUnexpectedReplacement(f,"unexpected-replacement-crash-before-close");
+  const original=CutoverStateStore.prototype.recoverUnexpectedReplacement;
+  try {
+    f.advance(120000);
+    let injected=false;
+    CutoverStateStore.prototype.recoverUnexpectedReplacement=function(...args){
+      if(!injected){injected=true;throw new Error("injected-after-unexpected-lease-reconciliation");}
+      return original.apply(this,args);
+    };
+    assert.throws(()=>f.store.recoverUnexpectedReplacementLocal({
+      cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,
+      confirmCutoverId:prepared.id,observedIdentity:prepared.observed,
+    }),/injected-after-unexpected-lease-reconciliation/);
+    CutoverStateStore.prototype.recoverUnexpectedReplacement=original;
+
+    const partialCutover=new CutoverStateStore(f.root).get()!;
+    const partialLease=f.store.ownership.get(prepared.preparedLease.leaseId)!;
+    assert.equal(partialCutover.phase,"drained");
+    assert.equal(partialCutover.unexpectedReplacement,undefined);
+    assert.equal(partialLease.terminalState,"expired_reconciled");
+    assert.equal(partialLease.operationState,"finished");
+    assert.equal(partialLease.operationHandle,undefined);
+    assert.notEqual(prepared.manager.store.getByOperationId(prepared.start.operationId)?.receipt?.lifecycleTerminal,true);
+
+    const resumed=f.store.recoverUnexpectedReplacementLocal({
+      cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,
+      confirmCutoverId:prepared.id,observedIdentity:prepared.observed,
+    });
+    assert.equal(resumed.replayed,false);
+    assert.equal(resumed.cutover.phase,"closed");
+    assert.equal(resumed.lease.terminalState,"expired_reconciled");
+    assert.equal(resumed.operation.status,"failed");
+  } finally {
+    CutoverStateStore.prototype.recoverUnexpectedReplacement=original;
+    prepared.manager.close();
+    f.close();
+  }
+});
+
+test("unexpected replacement recovery resumes after cutover close before operation finalization",async()=>{
+  const f=fixture();
+  const prepared=await prepareUnexpectedReplacement(f,"unexpected-replacement-crash-after-close");
+  const originalFinish=DurableOperationStore.prototype.finish;
+  try {
+    f.advance(120000);
+    let injected=false;
+    DurableOperationStore.prototype.finish=function(operationId,patch){
+      if(!injected && patch.receipt?.recoveryKind==="unexpected_replacement_identity"){
+        injected=true;
+        throw new Error("injected-after-unexpected-cutover-close");
+      }
+      return originalFinish.call(this,operationId,patch);
+    };
+    assert.throws(()=>f.store.recoverUnexpectedReplacementLocal({
+      cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,
+      confirmCutoverId:prepared.id,observedIdentity:prepared.observed,
+    }),/injected-after-unexpected-cutover-close/);
+    DurableOperationStore.prototype.finish=originalFinish;
+
+    const partialCutover=new CutoverStateStore(f.root).get()!;
+    const partialLease=f.store.ownership.get(prepared.preparedLease.leaseId)!;
+    assert.equal(partialCutover.phase,"closed");
+    assert.ok(partialCutover.unexpectedReplacement);
+    assert.equal(partialLease.terminalState,"expired_reconciled");
+    assert.equal(partialLease.operationHandle,undefined);
+    assert.notEqual(prepared.manager.store.getByOperationId(prepared.start.operationId)?.receipt?.lifecycleTerminal,true);
+
+    const resumed=f.store.recoverUnexpectedReplacementLocal({
+      cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,
+      confirmCutoverId:prepared.id,observedIdentity:prepared.observed,
+    });
+    assert.equal(resumed.replayed,true);
+    assert.equal(resumed.cutover.phase,"closed");
+    assert.equal(resumed.operation.status,"failed");
+    assert.equal(resumed.operation.receipt?.lifecycleTerminal,true);
+  } finally {
+    DurableOperationStore.prototype.finish=originalFinish;
+    prepared.manager.close();
+    f.close();
+  }
 });
 
 test("host-local capability expectation mismatch recovery closes the failed cutover and releases its lease",async()=>{
