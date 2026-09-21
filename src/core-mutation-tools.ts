@@ -4,6 +4,7 @@ import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import * as z from "zod/v4";
 import {
   assertCapabilityDiscoveryBinding,
+  CORE_CHANGE_MANIFEST_SCHEMA,
   CoreMutationSessionError,
   CoreMutationSessionStore,
   parseRepositoryMutationBinding,
@@ -268,6 +269,57 @@ export function registerCoreMutationSessionTools(
 ): void {
   if (!store) return;
 
+  const snapshotOutputSchema = z.object({
+    sessionId: z.string(),
+    bindingHash: z.string(),
+    acceptanceContractHash: z.string(),
+    sourceRevision: z.string(),
+    sourceTree: z.string(),
+    targetRevision: z.string(),
+    targetTree: z.string(),
+    currentHead: z.string(),
+    currentHeadTree: z.string(),
+    dirty: z.boolean(),
+    changedPaths: z.array(z.string()),
+    deletedPaths: z.array(z.string()),
+    scopeEscapePaths: z.array(z.string()),
+    deletionViolation: z.boolean(),
+    diffHash: z.string(),
+    changeSetId: z.string(),
+    changeSetHash: z.string(),
+    changeSet: z.object({
+      change_set_id: z.string(),
+      source_revision: z.string(),
+      target_revision: z.string(),
+      diff_hash: z.string(),
+      paths: z.array(z.string()),
+      deleted_paths: z.array(z.string()),
+    }),
+    provenance: z.object({
+      operationId: z.string(),
+      attemptId: z.string(),
+      workspaceSessionId: z.string(),
+      bindingId: z.string(),
+      bindingHash: z.string(),
+    }),
+    changeManifest: z.object({
+      schema: z.literal(CORE_CHANGE_MANIFEST_SCHEMA),
+      source_tree: z.string(),
+      target_tree: z.string(),
+      entries: z.array(z.object({
+        path: z.string(),
+        change_type: z.enum(["ADD", "MODIFY", "DELETE"]),
+        before_oid: z.string().nullable(),
+        after_oid: z.string().nullable(),
+        before_mode: z.string().nullable(),
+        after_mode: z.string().nullable(),
+      })),
+      manifest_hash: z.string(),
+    }),
+    materializedGitObjects: z.boolean(),
+    objectStorage: z.enum(["CALLER_EXISTING", "ISOLATED_TEMPORARY"]),
+  });
+
   const outputSchema = z.object({
     id: z.string(),
     workspaceSessionId: z.string(),
@@ -378,7 +430,7 @@ export function registerCoreMutationSessionTools(
       },
       outputSchema: z.object({
         session: outputSchema,
-        snapshot: z.record(z.string(), z.unknown()),
+        snapshot: snapshotOutputSchema,
       }),
       _meta: {},
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false },
@@ -417,7 +469,7 @@ export function registerCoreMutationSessionTools(
       description:
         "Materialize the current worktree as a deterministic Git tree using an isolated temporary index and return Core-compatible physical ChangeSet inputs without changing caller index, HEAD, or working files.",
       inputSchema: { workspaceId: z.string(), sessionId: z.string() },
-      outputSchema: z.record(z.string(), z.unknown()),
+      outputSchema: snapshotOutputSchema,
       _meta: {},
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },

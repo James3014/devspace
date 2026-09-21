@@ -917,6 +917,55 @@ test("Core session binds clean source and snapshots deterministic worktree tree"
   }
 });
 
+test("Core manifest path ordering matches canonical cross-language lexical order", async () => {
+  const fixture = makeRepo();
+  const stateDir = join(fixture.root, "state");
+  const workspaceId = "ws_core_manifest_order";
+  const workspaceStore = createWorkspaceStore(stateDir);
+  workspaceStore.createSession({ id: workspaceId, root: fixture.repo, mode: "checkout" });
+  const store = new CoreMutationSessionStore(stateDir);
+  try {
+    const expectedPaths = [
+      "README.md",
+      "docs/EXTRACTION_STATUS.md",
+      "docs/current-source-ownership.json",
+    ];
+    const binding = makeBinding({
+      workspaceSessionId: workspaceId,
+      head: fixture.head,
+      tree: fixture.tree,
+      allowedPaths: expectedPaths,
+    });
+    const session = await store.open({
+      workspaceSessionId: workspaceId,
+      workspaceRoot: fixture.repo,
+      workspaceMode: "checkout",
+      managed: false,
+      actorKey: "actor:test",
+      binding,
+    });
+
+    mkdirSync(join(fixture.repo, "docs"));
+    writeFileSync(join(fixture.repo, "README.md"), "readme\n");
+    writeFileSync(join(fixture.repo, "docs", "EXTRACTION_STATUS.md"), "status\n");
+    writeFileSync(join(fixture.repo, "docs", "current-source-ownership.json"), "{}\n");
+
+    const snapshot = await store.snapshot({
+      sessionId: session.id,
+      workspaceSessionId: workspaceId,
+      workspaceRoot: fixture.repo,
+      actorKey: "actor:test",
+    });
+
+    assert.deepEqual(snapshot.changedPaths, expectedPaths);
+    assert.deepEqual(snapshot.changeManifest.entries.map((entry) => entry.path), expectedPaths);
+  } finally {
+    store.close();
+    workspaceStore.close?.();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("dirty bind and forbidden deletion fail closed", async () => {
   const fixture = makeRepo();
   const stateDir = join(fixture.root, "state");
