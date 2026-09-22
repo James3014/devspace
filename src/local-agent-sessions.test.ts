@@ -364,6 +364,39 @@ test("LocalAgentSessionManager - effective idle timeout does not apply during st
   }
 });
 
+test("LocalAgentSessionManager - supervision leaves unrelated terminal rows untouched", async () => {
+  const { manager, terminatedWorkers, clean } = setupFixture();
+  try {
+    const store = (manager as any).store as LocalAgentStore;
+    const record = store.create({
+      workspaceId: "ws_terminal_history",
+      workspaceRoot: "/Users/jameschen/Workspace/nexus",
+      profileName: "terminal-history",
+      provider: "codex",
+      executionContract: { maxWallMs: 1 },
+      lifecycleKind: "detached_worker_v2",
+    });
+    const generation = record.lifecycleState!.activeTurn!.generation!;
+    assert.equal(store.prepareWorkerCAS(record.id, generation, "terminal-history-token").applied, true);
+    assert.equal(store.claimWorkerCAS(record.id, generation, "terminal-history-token", 4245).applied, true);
+    assert.equal(store.finishTurnCAS({
+      agentId: record.id,
+      generation,
+      workerToken: "terminal-history-token",
+      status: "idle",
+      terminalReason: "completed",
+    }).applied, true);
+    const before = store.getById(record.id)!;
+
+    await manager.superviseActiveAgents();
+
+    assert.deepEqual(store.getById(record.id), before);
+    assert.equal(terminatedWorkers.length, 0);
+  } finally {
+    clean();
+  }
+});
+
 test("LocalAgentSessionManager - continueAgent identity and validation", async () => {
   const { manager, spawnedWorkers, clean } = setupFixture();
   try {
