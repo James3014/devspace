@@ -1623,6 +1623,34 @@ test("Core-bound mutation session tools are registered for durable mutation admi
   assert.ok(tools.tools.some((tool) => tool.name === "core_mutation_session_reconcile_synchronous"));
 });
 
+test("Core mutation snapshot tool returns the physical snapshot over MCP", async (t) => {
+  const conversationScopeId = "core-snapshot-mcp";
+  const conversation = { "openai/session": conversationScopeId };
+  const context = await fixture(t, { git: true, coreMutation: true });
+  const opened = await callOpen(context.client, context.project, conversationScopeId);
+  const workspaceId = structuredContent(opened).workspaceId as string;
+  const bound = await bindTestCoreSession({
+    fixture: context,
+    workspaceId,
+    workspaceRoot: context.project,
+    conversationScopeId,
+    allowedPaths: ["AGENTS.md"],
+  });
+
+  writeFileSync(join(context.project, "AGENTS.md"), "# changed\n");
+  const result = await context.client.callTool({
+    name: "core_mutation_session_snapshot",
+    arguments: { workspaceId, sessionId: bound.session.id },
+    _meta: conversation,
+  });
+
+  assert.equal(result.isError, undefined, responseText(result));
+  const snapshot = structuredContent(result);
+  assert.deepEqual(snapshot.changedPaths, ["AGENTS.md"]);
+  assert.equal(snapshot.sessionId, bound.session.id);
+  assert.equal(snapshot.bindingHash, bound.session.bindingHash);
+});
+
 test("Core synchronous Git reconciliation clears the exact writer pin without replaying Git", async (t) => {
   const conversationScopeId = "core-sync-git-reconcile";
   const conversation = { "openai/session": conversationScopeId };

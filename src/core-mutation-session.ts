@@ -1413,7 +1413,17 @@ async function buildPhysicalSnapshot(
       after_mode: after?.mode ?? null,
     });
   }
-  entries.sort((left, right) => left.path.localeCompare(right.path));
+  entries.sort((left, right) => {
+    const leftCodePoints = Array.from(left.path, (character) => character.codePointAt(0)!);
+    const rightCodePoints = Array.from(right.path, (character) => character.codePointAt(0)!);
+    const sharedLength = Math.min(leftCodePoints.length, rightCodePoints.length);
+    for (let index = 0; index < sharedLength; index += 1) {
+      if (leftCodePoints[index] !== rightCodePoints[index]) {
+        return leftCodePoints[index]! - rightCodePoints[index]!;
+      }
+    }
+    return leftCodePoints.length - rightCodePoints.length;
+  });
   const changeManifestCore = {
     source_tree: `git-tree:${sourceTreeOid}`,
     target_tree: `git-tree:${targetTree}`,
