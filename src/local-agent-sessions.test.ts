@@ -978,6 +978,8 @@ test("runWorkerTurnFromFile persists typed AgentProviderFailureError details", a
       providerSessionId: "sess-cline-live-1",
       providerMessage: "ClinePass entitlement required api_key=[REDACTED]",
     });
+
+    assert.equal(manager.countAllAgentRecords(), 1);
   } finally {
     clean();
   }

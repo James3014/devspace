@@ -1019,6 +1019,20 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
   assert.equal(readSuccess.errorRetryable, undefined);
   assert.equal(readSuccess.errorDetails, undefined);
 
+  // Case E: cheap count and countResult projection
+  const totalCount = store.count();
+  const totalCountResult = store.countResult();
+  assert.equal(totalCount >= 2, true);
+  assert.equal(totalCountResult.isOk(), true);
+  assert.equal(totalCountResult.unwrap(), totalCount);
+
+  const scopedWsCount = store.count({ workspaceId: "ws_success" });
+  assert.equal(scopedWsCount, 1);
+  const scopedWsAndRootCount = store.count({ workspaceId: "ws_success", workspaceRoot: join(root, "success") });
+  assert.equal(scopedWsAndRootCount, 1);
+  const absentWsCount = store.count({ workspaceId: "ws_nonexistent" });
+  assert.equal(absentWsCount, 0);
+
 } finally {
   for (const store of stores) {
     store.close();

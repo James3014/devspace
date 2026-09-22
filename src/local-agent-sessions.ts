@@ -1143,6 +1143,10 @@ export class LocalAgentSessionManager {
     return this.store.list();
   }
 
+  countAllAgentRecords(): number {
+    return this.store.count();
+  }
+
   /**
    * Read-only preflight for an exact workspace + agent profile.
    * Reports readiness evidence without routing, admission, or mutation
