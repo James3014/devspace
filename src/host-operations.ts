@@ -84,7 +84,7 @@ export class HostOperationRegistrar {
     const durableRequest = activation
       ? { ...bound.request, activation, hostBinding: { executableSha256: bound.executableSha256, argvFingerprint: bound.argvFingerprint } }
       : bound.request;
-    const operation = this.store.createOrReplay({ operationId: bound.operationId, attemptKey: input.attemptKey, requestHash, kind: "host_operation", authorityMode: "OWNER_DIRECT", scopeRoot: bound.scopeRoot, request: durableRequest as unknown as Record<string, unknown> });
+    const operation = this.store.createOrReplay({ operationId: bound.operationId, attemptKey: input.attemptKey, requestHash, kind: "host_operation", authorityMode: "OWNER_DIRECT", scopeRoot: bound.scopeRoot, workspaceId: bound.request.workspaceId, request: durableRequest as unknown as Record<string, unknown> });
     if (!operation.created) {
       if (operation.record.status === "succeeded" || operation.record.status === "failed") return operation.record;
       const inFlight = this.inFlight.get(operation.record.operationId);

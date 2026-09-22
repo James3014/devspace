@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { chmod, copyFile, mkdtemp, mkdir, readFile, rename, rm, symlink, writeFile } from "node:fs/promises";
+import { chmod, copyFile, mkdtemp, mkdir, readFile, realpath, rename, rm, symlink, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { SandboxManager } from "@anthropic-ai/sandbox-runtime";
@@ -164,7 +164,12 @@ if (process.platform !== "darwin") {
     await assert.rejects(() => bind("process.exit(0)", { argv: ["-e", "process.exit(1)"] }), /exactly match/);
     await assert.rejects(() => bind("process.exit(0)", { maxWallMs: 9_000 }), /time limits/);
     await assert.rejects(() => bind("process.exit(0)", { allowedPaths: { write: [sibling], read: [approvedRead] } }), /outside startup policy/);
-    await assert.rejects(() => bind("process.exit(0)", { workspaceRoot: allowed }), /intersects/);
+    await assert.rejects(() => bind("process.exit(0)", { workspaceRoot: allowed }), /supplied together/);
+    await assert.rejects(() => bind("process.exit(0)", { workspaceId: "ws-only" }), /supplied together/);
+    await assert.rejects(() => bind("process.exit(0)", { workspaceId: "ws-intersect", workspaceRoot: allowed }), /intersects/);
+    const workspaceBound = await bind("process.exit(0)", { workspaceId: "ws-exact", workspaceRoot: sibling });
+    assert.equal(workspaceBound.request.workspaceId, "ws-exact");
+    assert.equal(workspaceBound.request.workspaceRoot, await realpath(sibling));
 
     const readOnlyPolicy = { ...basePolicy, allowedPaths: { write: [], read: [approvedRead, runtimeConfig] }, argv: ["-e", "process.exit(0)"] };
     const readOnlyRequest: HostOperationRequest = {

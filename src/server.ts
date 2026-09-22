@@ -109,7 +109,7 @@ import {
   type DurableOperationRecord,
 } from "./durable-operations.js";
 import { ChatSwarmMigrationCoordinator, chatSwarmMigrationOperationId } from "./chat-swarm-migration.js";
-import { HostOperationRegistrar } from "./host-operations.js";
+import { HostOperationError, HostOperationRegistrar } from "./host-operations.js";
 import {
   CodexGoalSessionManager,
   type CodexGoalState,
@@ -3427,10 +3427,22 @@ export function createMcpServer(
         maxWallMs: z.number().int().positive().max(120_000),
         maxIdleMs: z.number().int().positive().max(120_000),
         allowLongLivedProcess: z.boolean(),
+        workspaceId: z.string().min(1).optional(),
         workspaceRoot: z.string().optional(),
       };
-      registerAppTool(server, "host_operation_preflight", { title: "Host operation preflight", description: "Preflight one startup-authorized macOS host operation. Requires trusted Owner context; does not execute.", inputSchema: hostInput, _meta: {}, annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false } }, async (input, extra) => { const owner = dependencyConsumerContext(extra); const output = await hostOperations.preflight(input, owner.clientId); return { content: [textBlock(JSON.stringify(output))], structuredContent: output }; });
-      registerAppTool(server, "host_operation_start", { title: "Start host operation", description: "Start one exact startup-authorized host operation under the OS sandbox.", inputSchema: hostInput, outputSchema: durableOperationOutputSchema, _meta: {}, annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false } }, async (input, extra) => { const owner = dependencyConsumerContext(extra); return operationResponse(await hostOperations.start(input, owner.clientId)); });
+      const bindHostOperationWorkspace = <T extends { workspaceId?: string; workspaceRoot?: string }>(input: T): T => {
+        if (input.workspaceId === undefined && input.workspaceRoot === undefined) return input;
+        if (input.workspaceId === undefined || input.workspaceRoot === undefined) {
+          throw new HostOperationError("HOST_OPERATION_INVALID", "workspaceId and workspaceRoot must be supplied together.");
+        }
+        const workspace = workspaces.getWorkspace(input.workspaceId);
+        if (canonicalizePath(workspace.root) !== canonicalizePath(input.workspaceRoot)) {
+          throw new HostOperationError("HOST_OPERATION_INVALID", "workspaceId does not match workspaceRoot.");
+        }
+        return { ...input, workspaceId: workspace.id, workspaceRoot: workspace.root };
+      };
+      registerAppTool(server, "host_operation_preflight", { title: "Host operation preflight", description: "Preflight one startup-authorized macOS host operation. Requires trusted Owner context; does not execute.", inputSchema: hostInput, _meta: {}, annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false } }, async (input, extra) => { const owner = dependencyConsumerContext(extra); const output = await hostOperations.preflight(bindHostOperationWorkspace(input), owner.clientId); return { content: [textBlock(JSON.stringify(output))], structuredContent: output }; });
+      registerAppTool(server, "host_operation_start", { title: "Start host operation", description: "Start one exact startup-authorized host operation under the OS sandbox.", inputSchema: hostInput, outputSchema: durableOperationOutputSchema, _meta: {}, annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false } }, async (input, extra) => { const owner = dependencyConsumerContext(extra); return operationResponse(await hostOperations.start(bindHostOperationWorkspace(input), owner.clientId)); });
       registerAppTool(server, "host_operation_status", { title: "Host operation status", description: "Read one exact host operation.", inputSchema: { operationId: z.string().min(1) }, outputSchema: durableOperationOutputSchema, _meta: {}, annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false } }, async ({ operationId }, extra) => { const owner = dependencyConsumerContext(extra); return operationResponse(hostOperations.status(operationId, owner.clientId)); });
       registerAppTool(server, "host_operation_reconcile", { title: "Reconcile host operation", description: "Reconcile one exact host operation after timeout, disconnect, or restart.", inputSchema: { operationId: z.string().min(1) }, outputSchema: durableOperationOutputSchema, _meta: {}, annotations: { readOnlyHint: false, idempotentHint: true, openWorldHint: false } }, async ({ operationId }, extra) => { const owner = dependencyConsumerContext(extra); return operationResponse(await hostOperations.reconcile(operationId, owner.clientId)); });
       registerAppTool(server, "host_operation_cancel", { title: "Cancel host operation", description: "Cancel only the exact owned process for one host operation.", inputSchema: { operationId: z.string().min(1) }, outputSchema: durableOperationOutputSchema, _meta: {}, annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false } }, async ({ operationId }, extra) => { const owner = dependencyConsumerContext(extra); return operationResponse(await hostOperations.cancel(operationId, owner.clientId)); });

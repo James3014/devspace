@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -141,8 +141,14 @@ test("HTTP host operation tools enforce owner binding and exact long-lived lifec
   let ownerClient = await connect(url, owner.accessToken, "host-owner-http");
   const foreign = await issueToken(provider, config, "host-foreign");
   const foreignClient = await connect(url, foreign.accessToken, "host-foreign-http");
+  const openedWorkspace = structured(await ownerClient.callTool({
+    name: "open_workspace",
+    arguments: { path: workspaceRoot, mode: "checkout" },
+  }));
+  const workspaceId = String(openedWorkspace.workspaceId);
   const request = {
     ...requestFor(root, executable, script, marker, workspaceRoot, runtimeReadPaths),
+    workspaceId,
     allowedPaths: { write: [effectsRoot], read: runtimeReadPaths },
     clientId: foreign.clientId,
     authorityMode: "NEXUS_GOVERNED",
@@ -159,7 +165,10 @@ test("HTTP host operation tools enforce owner binding and exact long-lived lifec
     const started = structured(await ownerClient.callTool({ name: "host_operation_start", arguments: request }));
     assert.equal(started.status, "started", JSON.stringify(started));
     assert.equal(started.authorityMode, "OWNER_DIRECT");
+    assert.equal(started.workspaceId, workspaceId);
     assert.equal(started.request.clientId, owner.clientId);
+    assert.equal(started.request.workspaceId, workspaceId);
+    assert.equal(started.request.workspaceRoot, realpathSync(workspaceRoot));
     assert.equal(started.receipt.repository.preHead, baseHead);
     assert.equal(started.receipt.repository.preDirty, false);
     operationId = started.operationId;
@@ -212,10 +221,107 @@ test("HTTP host operation tools enforce owner binding and exact long-lived lifec
 
     const differentArgv = { ...request, attemptKey: "different-argv", argv: [script, join(root, "other-marker.txt")] };
     assert.equal((await ownerClient.callTool({ name: "host_operation_preflight", arguments: differentArgv })).isError, true);
+
+    const missingWorkspaceId = { ...request, attemptKey: "missing-workspace-id" };
+    delete missingWorkspaceId.workspaceId;
+    assert.equal((await ownerClient.callTool({ name: "host_operation_preflight", arguments: missingWorkspaceId })).isError, true);
+
+    const wrongWorkspaceRoot = { ...request, attemptKey: "wrong-workspace-root", workspaceRoot: root };
+    assert.equal((await ownerClient.callTool({ name: "host_operation_preflight", arguments: wrongWorkspaceRoot })).isError, true);
+
+    const unknownWorkspace = { ...request, attemptKey: "unknown-workspace", workspaceId: "ws_not_real" };
+    assert.equal((await ownerClient.callTool({ name: "host_operation_preflight", arguments: unknownWorkspace })).isError, true);
   } finally {
     if (operationId) await ownerClient.callTool({ name: "host_operation_cancel", arguments: { operationId } }).catch(() => {});
     await ownerClient.close().catch(() => {});
     await foreignClient.close().catch(() => {});
+    await running.close();
+    await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
+    provider.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("HTTP host operation preflight binds exact workspace identity before effect", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-host-http-workspace-"));
+  const workspaceRoot = join(root, "workspace");
+  const canaryPath = join(root, "host-op-canary.out");
+  await mkdir(workspaceRoot);
+  writeFileSync(canaryPath, "");
+  execFileSync("git", ["init", "-q", workspaceRoot]);
+  execFileSync("git", ["-C", workspaceRoot, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "--allow-empty", "-m", "fixture"], { stdio: "ignore" });
+  const executable = "/usr/bin/true";
+  const executableSha256 = createHash("sha256").update(await readFile(executable)).digest("hex");
+  const config = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, "config"),
+    DEVSPACE_STATE_DIR: join(root, "state"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_WORKTREE_ROOT: join(root, "worktrees"),
+    DEVSPACE_SUBAGENTS: "false",
+    DEVSPACE_PUBLIC_BASE_URL: "http://127.0.0.1:1",
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+  });
+  const provider = new SingleUserOAuthProvider(config.oauth, new URL("/mcp", config.publicBaseUrl), config.stateDir);
+  const owner = await issueToken(provider, config, "host-workspace-owner");
+  Object.assign(config as any, {
+    hostOperationsEnabled: true,
+    hostOperationExecutable: executable,
+    hostOperationExecutableSha256: executableSha256,
+    hostOperationAllowedPaths: [canaryPath],
+    hostOperationReadPaths: [],
+    hostOperationOwnerClientId: owner.clientId,
+    hostOperationCwd: root,
+    hostOperationArgv: ["g3"],
+    hostOperationMaxWallMs: 8_000,
+    hostOperationMaxIdleMs: 8_000,
+    hostOperationAllowLongLived: false,
+  });
+  const running = createServer(config);
+  const listener = running.app.listen(0, "127.0.0.1");
+  await new Promise<void>((resolve) => listener.once("listening", resolve));
+  const client = await connect(
+    new URL(`http://127.0.0.1:${(listener.address() as { port: number }).port}/mcp`),
+    owner.accessToken,
+    "host-workspace-http",
+  );
+  try {
+    const opened = structured(await client.callTool({
+      name: "open_workspace",
+      arguments: { path: workspaceRoot, mode: "checkout" },
+    }));
+    const workspaceId = String(opened.workspaceId);
+    await client.listTools();
+    const request = {
+      attemptKey: "host-workspace-preflight",
+      executablePath: executable,
+      argv: ["g3"],
+      cwd: root,
+      allowedPaths: { write: [canaryPath], read: [] },
+      maxWallMs: 8_000,
+      maxIdleMs: 8_000,
+      allowLongLivedProcess: false,
+      workspaceId,
+      workspaceRoot,
+    };
+    const preflight = structured(await client.callTool({ name: "host_operation_preflight", arguments: request }));
+    assert.equal(preflight.status, "ready");
+
+    const wrongRoot = await client.callTool({
+      name: "host_operation_preflight",
+      arguments: { ...request, attemptKey: "host-workspace-wrong-root", workspaceRoot: root },
+    });
+    assert.equal(wrongRoot.isError, true);
+
+    const missingIdArgs = { ...request, attemptKey: "host-workspace-missing-id" } as Record<string, unknown>;
+    delete missingIdArgs.workspaceId;
+    assert.equal((await client.callTool({ name: "host_operation_preflight", arguments: missingIdArgs })).isError, true);
+
+    assert.equal((await client.callTool({
+      name: "host_operation_preflight",
+      arguments: { ...request, attemptKey: "host-workspace-unknown-id", workspaceId: "ws_not_real" },
+    })).isError, true);
+  } finally {
+    await client.close().catch(() => {});
     await running.close();
     await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
     provider.close();

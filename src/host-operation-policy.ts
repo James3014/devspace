@@ -30,6 +30,7 @@ export interface HostOperationRequest {
   maxWallMs: number;
   maxIdleMs: number;
   allowLongLivedProcess: boolean;
+  workspaceId?: string;
   workspaceRoot?: string;
 }
 
@@ -66,6 +67,9 @@ export async function bindHostOperation(
     deny("HOST_OPERATION_UNAUTHORIZED", "Host operation client identity does not match the startup-selected owner.");
   }
   validateRequestShape(request);
+  if ((request.workspaceId === undefined) !== (request.workspaceRoot === undefined)) {
+    deny("HOST_OPERATION_INVALID", "workspaceId and workspaceRoot must be supplied together.");
+  }
   const trusted = await normalizePolicy(policy);
   const executable = await canonicalFile(request.executablePath, "request executable");
   const executableSha256 = await sha256File(executable);
@@ -105,11 +109,12 @@ export async function bindHostOperation(
     maxWallMs: request.maxWallMs,
     maxIdleMs: request.maxIdleMs,
     allowLongLivedProcess: request.allowLongLivedProcess,
+    ...(request.workspaceId ? { workspaceId: request.workspaceId } : {}),
     ...(request.workspaceRoot ? { workspaceRoot: await canonicalDirectory(request.workspaceRoot, "workspace root") } : {}),
   } satisfies HostOperationRequest;
   const policyHash = hashJson({ ...trusted, writePaths: trusted.writePaths, readPaths: trusted.readPaths });
   const requestHash = hashJson({ policyHash, request: normalizedRequest });
-  const operationId = `host_${hashText(`${policyHash}\0${normalizedRequest.clientId}\0${request.attemptKey}\0${normalizedRequest.workspaceRoot ?? ""}`).slice(0, 32)}`;
+  const operationId = `host_${hashText(`${policyHash}\0${normalizedRequest.clientId}\0${request.attemptKey}\0${normalizedRequest.workspaceId ?? ""}\0${normalizedRequest.workspaceRoot ?? ""}`).slice(0, 32)}`;
   const bound = {
     request: deepFreeze(normalizedRequest),
     attemptKey: normalizedRequest.attemptKey,
