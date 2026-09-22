@@ -12,6 +12,7 @@ import {
   type CoreMutationCandidateProvenance,
   type CoreMutationPhysicalSnapshot,
   type CoreMutationManagedWriterDomain,
+  type CoreMutationOrphanProcessRecoveryEvidence,
 } from "./core-mutation-session.js";
 import {
   parseCapabilityDiscoveryReceipt,
@@ -77,6 +78,23 @@ function actorKey(extra: CoreMutationToolExtra): string | undefined {
     return `mcp:${createHash("sha256").update(clientId).digest("hex")}`;
   }
   return undefined;
+}
+
+export function assertCoreMutationRecoveryOwnerClient(
+  extra: CoreMutationToolExtra,
+  configuredOwnerClientId: string | undefined,
+): { clientId: string; recoveryActorKey: string } {
+  if (!configuredOwnerClientId) {
+    throw new Error("[CORE_MUTATION_RECOVERY_DISABLED] Owner recovery is not configured on this DevSpace runtime.");
+  }
+  const clientId = extra.authInfo?.clientId;
+  if (!clientId || clientId !== configuredOwnerClientId) {
+    throw new Error("[CORE_MUTATION_RECOVERY_OWNER_REQUIRED] Exact configured OAuth owner client identity is required for Core orphan recovery.");
+  }
+  return {
+    clientId,
+    recoveryActorKey: `mcp:${createHash("sha256").update(clientId).digest("hex")}`,
+  };
 }
 
 function actorKeyRequired(extra: CoreMutationToolExtra): string {
@@ -266,6 +284,7 @@ export function registerCoreMutationSessionTools(
     session: NonNullable<ReturnType<CoreMutationSessionStore["getById"]>>,
     domain: CoreMutationManagedWriterDomain,
   ) => Promise<"CLEAR" | "ACTIVE" | "UNKNOWN"> | "CLEAR" | "ACTIVE" | "UNKNOWN",
+  options: { recoveryOwnerClientId?: string } = {},
 ): void {
   if (!store) return;
 
@@ -415,6 +434,79 @@ export function registerCoreMutationSessionTools(
       };
     },
   );
+
+  if (options.recoveryOwnerClientId && inspectWriterDomain) {
+    registerAppTool(
+      server,
+      "core_mutation_session_recover_orphaned_process",
+      {
+        title: "Recover orphaned Core PROCESS writer",
+        description:
+          "Owner-only administrative recovery for one exact ACTIVE Core session whose original caller identity is unavailable and whose PROCESS writer is OUTCOME_UNKNOWN. Revalidates exact physical Git evidence, refuses live writers, clears only the PROCESS writer pin, preserves the original actor/session/worktree, and grants no retry, Candidate, mutation, completion, integration, merge, or release authority.",
+        inputSchema: {
+          workspaceId: z.string(),
+          sessionId: z.string(),
+          bindingHash: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+          evidence: z.object({
+            expectedOriginalActorKey: z.string().regex(/^(?:mcp|openai):[0-9a-f]{64}$/),
+            expectedSourceHead: z.string().regex(/^[0-9a-f]{40}$/),
+            expectedSourceTree: z.string().regex(/^[0-9a-f]{40}$/),
+            expectedCurrentHead: z.string().regex(/^[0-9a-f]{40}$/),
+            expectedTargetTree: z.string().regex(/^git-tree:[0-9a-f]{40}$/),
+            expectedDiffHash: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+            expectedChangedPaths: z.array(z.string().min(1)).max(100),
+            expectedDeletedPaths: z.array(z.string().min(1)).max(100),
+          }),
+          confirmNoRetryAuthority: z.literal(true),
+        },
+        outputSchema: z.object({
+          session: outputSchema,
+          snapshot: snapshotOutputSchema,
+          observedWriterState: z.enum(["CLEAR", "UNKNOWN"]),
+          alreadyReconciled: z.boolean(),
+          claim: z.literal("CORE_OWNER_ORPHAN_PROCESS_RECONCILED"),
+          retryAuthorityGranted: z.literal(false),
+          mutationAuthorityGranted: z.literal(false),
+          completionAuthorityGranted: z.literal(false),
+        }),
+        _meta: {},
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      },
+      async ({ workspaceId, sessionId, bindingHash, evidence }, extra) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const owner = assertCoreMutationRecoveryOwnerClient(extra, options.recoveryOwnerClientId);
+        try {
+          const recovered = await store.recoverOrphanedProcessEffect({
+            sessionId,
+            workspaceSessionId: workspaceId,
+            workspaceRoot: workspace.root,
+            recoveryActorKey: owner.recoveryActorKey,
+            bindingHash,
+            evidence: evidence as CoreMutationOrphanProcessRecoveryEvidence,
+            inspectProcessWriter: (session) => inspectWriterDomain(session, "PROCESS"),
+          });
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Core orphan PROCESS writer reconciled for ${sessionId}; no process, Git, Candidate, or retry effect was replayed.`,
+            }],
+            structuredContent: {
+              session: publicSession(recovered.session),
+              snapshot: recovered.snapshot as unknown as Record<string, unknown>,
+              observedWriterState: recovered.observedWriterState,
+              alreadyReconciled: recovered.alreadyReconciled,
+              claim: "CORE_OWNER_ORPHAN_PROCESS_RECONCILED" as const,
+              retryAuthorityGranted: false as const,
+              mutationAuthorityGranted: false as const,
+              completionAuthorityGranted: false as const,
+            },
+          };
+        } catch (error) {
+          throw toolError(error);
+        }
+      },
+    );
+  }
 
   registerAppTool(
     server,

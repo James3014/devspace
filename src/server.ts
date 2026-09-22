@@ -3082,7 +3082,9 @@ export function createMcpServer(
       ? "ACTIVE"
       : matchingAgents.length > 0 ? "CLEAR" : "UNKNOWN";
   };
-  registerCoreMutationSessionTools(server, workspaces, coreMutationSessions, inspectCoreWriterDomain);
+  registerCoreMutationSessionTools(server, workspaces, coreMutationSessions, inspectCoreWriterDomain, {
+    recoveryOwnerClientId: config.coreMutationRecoveryOwnerClientId,
+  });
 
   registerRepositoryIntelligenceTools(server, config, workspaces);
   registerPhysicalHostRegistryTools(server, {
