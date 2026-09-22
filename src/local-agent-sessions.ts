@@ -584,6 +584,7 @@ export class LocalAgentSessionManager {
     handle.agentId = agentId;
 
     // B1 / B2: Durable persistence via store CAS. Fail closed if CAS fails.
+    const existingLaunch = record.externalRuntimeBinding?.launch;
     const cas = this.store.bindExternalRuntimeBindingCAS({
       agentId,
       expectedAttemptKey: handle.attemptKey,
@@ -591,6 +592,20 @@ export class LocalAgentSessionManager {
       expectedUpdatedAt: record.updatedAt,
       binding: {
         runtimeKind: HERDR_RUNTIME_KIND,
+        launch: existingLaunch ?? {
+          state: "AGENT_OBSERVED",
+          launchRequestId: `HERDR-LAUNCH:${handle.attemptKey}:${handle.dispatchIntentHash.slice(0, 16)}`,
+          attemptKey: handle.attemptKey,
+          dispatchIntentHash: handle.dispatchIntentHash,
+          canonicalWorktreePath: handle.canonicalWorktreePath,
+          gitHeadBefore: handle.gitHeadBefore,
+          agentKind: handle.herdrAgentKind,
+          promptNonce: handle.promptNonce,
+          herdrWorkspaceId: handle.herdrWorkspaceId,
+          herdrPaneId: handle.herdrPaneId,
+          herdrAgentIdentity: handle.herdrAgentIdentity,
+          fencedAt: handle.launchTimestamp,
+        },
         handle: handle as unknown as Record<string, unknown>,
       },
     });

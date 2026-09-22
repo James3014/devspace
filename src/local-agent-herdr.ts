@@ -2,7 +2,9 @@ import { createConnection, type Socket } from "node:net";
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve, normalize } from "node:path";
-import type { LocalAgentStore } from "./local-agent-store.js";
+import type { LocalAgentStore, ExternalRuntimeLaunchFence, LocalAgentRecord } from "./local-agent-store.js";
+import { hashDispatchIntent } from "./execution-protocol.js";
+import { canonicalizePath } from "./roots.js";
 
 export const HERDR_DEFAULT_SOCKET_PATH = process.env.HERDR_SOCKET_PATH || "/Users/james/.config/herdr/herdr.sock";
 export const HERDR_RUNTIME_KIND = "HERDR" as const;
@@ -44,6 +46,7 @@ export interface HerdrExternalHandle {
 }
 
 export interface StartHerdrAgentParams {
+  agentId?: string;
   attemptKey: string;
   dispatchIntentHash: string;
   agentKind: HerdrAgentKind;
@@ -52,12 +55,15 @@ export interface StartHerdrAgentParams {
   requestedModel?: string;
   requestedEffort?: string;
   socketPath?: string;
+  store?: LocalAgentStore;
+  allowTestOnlyNonConsequential?: boolean;
 }
 
 export interface HerdrPromptOptions {
   timeoutMs?: number;
   until?: string[];
   store?: LocalAgentStore;
+  allowTestOnlyNonConsequential?: boolean;
 }
 
 export interface HerdrPromptResult {
@@ -263,28 +269,153 @@ export class HerdrThinGateway {
     private readonly store?: LocalAgentStore,
   ) {}
 
-  protected async sendRequest<T = unknown>(req: HerdrSocketRequest, timeoutMs: number = 10_000): Promise<HerdrSocketResponse<T>> {
-    return sendHerdrSocketRequest<T>(req, this.socketPath, timeoutMs);
+  protected async sendRequest<T = unknown>(
+    req: HerdrSocketRequest,
+    timeoutMs: number = 10_000,
+    socketPath?: string,
+  ): Promise<HerdrSocketResponse<T>> {
+    return sendHerdrSocketRequest<T>(req, socketPath || this.socketPath, timeoutMs);
+  }
+
+  /**
+   * List workspaces directly over socket.
+   */
+  async listWorkspaces(): Promise<Array<{ workspace_id: string; label?: string }>> {
+    const req: HerdrSocketRequest = {
+      id: `ws-list-${Date.now()}`,
+      method: "workspace.list",
+      params: {},
+    };
+    try {
+      const res = await this.sendRequest<{
+        type: string;
+        workspaces?: Array<{ workspace_id: string; label?: string }>;
+      }>(req, 3000);
+      return res.result?.workspaces || [];
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Show a workspace directly over socket.
+   */
+  async getWorkspace(workspaceId: string): Promise<{ workspace_id: string; root_pane_id?: string } | undefined> {
+    const req: HerdrSocketRequest = {
+      id: `ws-get-${Date.now()}`,
+      method: "workspace.get",
+      params: { target: workspaceId },
+    };
+    try {
+      const res = await this.sendRequest<{
+        workspace?: { workspace_id: string; root_pane_id?: string };
+      }>(req, 3000);
+      return res.result?.workspace;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async reconcileFencedLaunch(
+    params: StartHerdrAgentParams,
+    record: LocalAgentRecord,
+    launch: ExternalRuntimeLaunchFence,
+    canonicalPath: string,
+    gitHeadBefore: string,
+    store: LocalAgentStore,
+  ): Promise<HerdrExternalHandle | undefined> {
+    const wsLabel = `devspace-${params.attemptKey}`;
+    const agentName = ("ds-" + params.attemptKey.replace(/[^a-z0-9_-]/gi, "-").toLowerCase()).slice(0, 32);
+
+    let wsId = launch.herdrWorkspaceId;
+    let paneId = launch.herdrPaneId;
+
+    // 1. If workspace not observed, query HerdR to see if workspace was created
+    if (!wsId) {
+      const workspaces = await this.listWorkspaces();
+      const match = workspaces.find((w) => w.label === wsLabel);
+      if (match) {
+        wsId = match.workspace_id;
+        const wsDetails = await this.getWorkspace(wsId);
+        paneId = wsDetails?.root_pane_id || `${wsId}:p1`;
+        store.recordExternalRuntimeWorkspaceObservedCAS({
+          agentId: record.id,
+          attemptKey: params.attemptKey,
+          herdrWorkspaceId: wsId,
+          herdrPaneId: paneId,
+          observedCwd: canonicalPath,
+        });
+      } else {
+        return undefined;
+      }
+    }
+
+    // 2. Workspace is known; check agent
+    let agentIdentity = launch.herdrAgentIdentity;
+    if (!agentIdentity) {
+      const agentInfo = await this.getAgent(agentName);
+      if (agentInfo) {
+        agentIdentity = agentName;
+        store.recordExternalRuntimeAgentObservedCAS({
+          agentId: record.id,
+          attemptKey: params.attemptKey,
+          herdrAgentIdentity: agentName,
+        });
+      } else {
+        return undefined;
+      }
+    }
+
+    // 3. Both are positively observed! Build and bind completed handle
+    const handle: HerdrExternalHandle = {
+      schemaVersion: 1,
+      runtimeKind: HERDR_RUNTIME_KIND,
+      agentId: record.id,
+      herdrSocketPath: params.socketPath || this.socketPath,
+      herdrWorkspaceId: wsId,
+      herdrPaneId: paneId || `${wsId}:p1`,
+      herdrAgentIdentity: agentIdentity,
+      herdrAgentKind: params.agentKind,
+      ...(params.requestedModel ? { requestedModel: params.requestedModel } : {}),
+      ...(params.requestedEffort ? { requestedEffort: params.requestedEffort } : {}),
+      promptNonce: launch.promptNonce,
+      canonicalWorktreePath: canonicalPath,
+      workspaceId: params.workspaceId,
+      gitHeadBefore,
+      attemptKey: params.attemptKey,
+      dispatchIntentHash: params.dispatchIntentHash,
+      launchTimestamp: launch.fencedAt,
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    };
+
+    store.bindExternalRuntimeBindingCAS({
+      agentId: record.id,
+      expectedAttemptKey: params.attemptKey,
+      expectedDispatchIntentHash: params.dispatchIntentHash,
+      binding: {
+        runtimeKind: HERDR_RUNTIME_KIND,
+        launch: {
+          ...launch,
+          state: "AGENT_OBSERVED",
+          herdrWorkspaceId: wsId,
+          herdrPaneId: paneId || `${wsId}:p1`,
+          herdrAgentIdentity: agentIdentity,
+          updatedAt: new Date().toISOString(),
+        },
+        handle: handle as unknown as Record<string, unknown>,
+      },
+    });
+
+    this.registry.registerHandle(handle);
+    return handle;
   }
 
   /**
    * Start a bounded external agent in HerdR.
-   * Enforces N1 (duplicate prevention), N2 (conflicting replay), N4 (wrong worktree fail closed).
+   * Enforces pre-effect launch fence (C2), N1 (duplicate prevention), N2 (conflicting replay), N4 (wrong worktree fail closed).
    */
   async startExternalAgent(params: StartHerdrAgentParams): Promise<HerdrExternalHandle> {
-    const canonicalPath = normalize(resolve(params.canonicalWorktreePath));
-
-    // N1 & N2: Check existing handle
-    const existing = this.registry.getHandle(params.attemptKey);
-    if (existing) {
-      if (existing.dispatchIntentHash !== params.dispatchIntentHash) {
-        throw new Error(
-          `[N2 Conflicting Replay] attemptKey '${params.attemptKey}' already active with different intent hash '${existing.dispatchIntentHash}'`,
-        );
-      }
-      // N1: Return existing handle without creating a second agent/pane
-      return existing;
-    }
+    const canonicalPath = canonicalizePath(params.canonicalWorktreePath);
 
     // Git base fence (A9): must resolve exact 40-character commit SHA
     let gitHeadBefore = "";
@@ -305,17 +436,151 @@ export class HerdrThinGateway {
       );
     }
 
-    // Transport endpoint vs server instance identity (B5)
-    // herdrSocketPath is recorded as transport endpoint.
-    // HerdR 0.9.1 ping returns version/protocol but no server instance UUID;
-    // herdrServerIdentity is classified as undefined / NOT_OBSERVED.
-    const herdrSocketPath = this.socketPath;
+    const effectiveStore = params.store ?? this.store;
+    if (!params.allowTestOnlyNonConsequential && (!effectiveStore || !params.agentId)) {
+      throw new Error(
+        `[LAUNCH_NO_DURABLE_STORE] startExternalAgent requires a durable LocalAgentStore and agentId; in-memory-only execution is forbidden.`,
+      );
+    }
+
+    const herdrSocketPath = params.socketPath || this.socketPath;
     let herdrServerIdentity: string | undefined = undefined;
 
-    // 1. Create HerdR workspace with exact cwd
+    let record: LocalAgentRecord | undefined;
+    if (effectiveStore && params.agentId) {
+      record = effectiveStore.getById(params.agentId);
+      if (!record) {
+        throw new Error(`[UNKNOWN_AGENT] Agent record '${params.agentId}' not found in store.`);
+      }
+
+      if (record.startReplay?.key && record.startReplay.key !== params.attemptKey) {
+        throw new Error(
+          `[ATTEMPT_REPLAY_CONFLICT] Record attemptKey '${record.startReplay.key}' does not match launch attemptKey '${params.attemptKey}'`,
+        );
+      }
+
+      if (record.executionContract?.dispatchIntent) {
+        const recordHash = hashDispatchIntent(record.executionContract.dispatchIntent);
+        if (recordHash && recordHash !== params.dispatchIntentHash) {
+          throw new Error(
+            `[N2 Conflicting Replay] attemptKey '${params.attemptKey}' already active with different intent hash '${recordHash}'`,
+          );
+        }
+      }
+
+      if (canonicalizePath(record.workspaceRoot) !== canonicalPath) {
+        throw new Error(
+          `[N4 Wrong Worktree] Record workspaceRoot '${record.workspaceRoot}' does not match canonical worktree '${canonicalPath}'`,
+        );
+      }
+
+      const existingBinding = record.externalRuntimeBinding;
+      if (existingBinding?.handle && typeof existingBinding.handle === "object") {
+        const existing = existingBinding.handle as unknown as HerdrExternalHandle;
+        if (existing.dispatchIntentHash !== params.dispatchIntentHash) {
+          throw new Error(
+            `[N2 Conflicting Replay] attemptKey '${params.attemptKey}' already active with different intent hash '${existing.dispatchIntentHash}'`,
+          );
+        }
+        if (canonicalizePath(existing.canonicalWorktreePath) !== canonicalPath) {
+          throw new Error(
+            `[N4 Wrong Worktree] Observed cwd '${existing.canonicalWorktreePath}' does not match canonical worktree '${canonicalPath}'`,
+          );
+        }
+        if (existing.herdrAgentKind !== params.agentKind) {
+          throw new Error(
+            `[ATTEMPT_REPLAY_CONFLICT] Replay agentKind '${params.agentKind}' does not match durable handle agentKind '${existing.herdrAgentKind}'`,
+          );
+        }
+        if (existing.gitHeadBefore !== gitHeadBefore) {
+          throw new Error(
+            `[SOURCE_IDENTITY_DRIFT] Git HEAD '${gitHeadBefore}' drifted from bound gitHeadBefore '${existing.gitHeadBefore}'`,
+          );
+        }
+        this.registry.registerHandle(existing);
+        return existing;
+      }
+
+      if (existingBinding?.launch) {
+        const launch = existingBinding.launch;
+        if (launch.dispatchIntentHash !== params.dispatchIntentHash) {
+          throw new Error(
+            `[ATTEMPT_REPLAY_CONFLICT] Replay intent hash '${params.dispatchIntentHash}' does not match launch fence intent hash '${launch.dispatchIntentHash}'`,
+          );
+        }
+        if (canonicalizePath(launch.canonicalWorktreePath) !== canonicalPath) {
+          throw new Error(
+            `[N4 Wrong Worktree] Observed cwd '${launch.canonicalWorktreePath}' does not match canonical worktree '${canonicalPath}'`,
+          );
+        }
+        if (launch.agentKind !== params.agentKind) {
+          throw new Error(
+            `[ATTEMPT_REPLAY_CONFLICT] Replay agentKind '${params.agentKind}' does not match launch fence agentKind '${launch.agentKind}'`,
+          );
+        }
+        if (launch.gitHeadBefore !== gitHeadBefore) {
+          throw new Error(
+            `[SOURCE_IDENTITY_DRIFT] Git HEAD '${gitHeadBefore}' drifted from launch fence gitHeadBefore '${launch.gitHeadBefore}'`,
+          );
+        }
+
+        const reconciled = await this.reconcileFencedLaunch(
+          params,
+          record,
+          launch,
+          canonicalPath,
+          gitHeadBefore,
+          effectiveStore,
+        );
+        if (reconciled) {
+          return reconciled;
+        }
+        throw new Error(
+          `[OUTCOME_UNKNOWN] Launch fence exists for attemptKey '${params.attemptKey}' in state '${launch.state}', but external runtime state could not be positively reconciled. Cannot retry launch effects.`,
+        );
+      }
+    } else {
+      const existing = this.registry.getHandle(params.attemptKey);
+      if (existing) {
+        if (existing.dispatchIntentHash !== params.dispatchIntentHash) {
+          throw new Error(
+            `[N2 Conflicting Replay] attemptKey '${params.attemptKey}' already active with different intent hash '${existing.dispatchIntentHash}'`,
+          );
+        }
+        return existing;
+      }
+    }
+
+    const promptNonce = `HERDR-DISPATCH-${params.attemptKey}`;
     const wsLabel = `devspace-${params.attemptKey}`;
+    const agentName = ("ds-" + params.attemptKey.replace(/[^a-z0-9_-]/gi, "-").toLowerCase()).slice(0, 32);
+
+    // Pre-effect launch fence (Blocker C2)
+    if (effectiveStore && params.agentId) {
+      const fenceRes = effectiveStore.fenceExternalRuntimeLaunchCAS({
+        agentId: params.agentId,
+        attemptKey: params.attemptKey,
+        dispatchIntentHash: params.dispatchIntentHash,
+        canonicalWorktreePath: canonicalPath,
+        gitHeadBefore,
+        agentKind: params.agentKind,
+        requestedModel: params.requestedModel,
+        requestedEffort: params.requestedEffort,
+        promptNonce,
+        workspaceId: params.workspaceId,
+        expectedUpdatedAt: record?.updatedAt,
+      });
+
+      if (!fenceRes.applied) {
+        throw new Error(
+          `[LAUNCH_FENCE_FAILED] Failed to durably fence HerdR launch for attemptKey '${params.attemptKey}'; CAS failed. Zero external calls permitted.`,
+        );
+      }
+    }
+
+    // 1. Create HerdR workspace with exact cwd
     const wsReq: HerdrSocketRequest = {
-      id: `ws-create-${Date.now()}`,
+      id: `HERDR-LAUNCH:${params.attemptKey}:workspace`,
       method: "workspace.create",
       params: {
         cwd: canonicalPath,
@@ -324,39 +589,73 @@ export class HerdrThinGateway {
       },
     };
 
-    const wsRes = await sendHerdrSocketRequest<{
+    let wsRes: HerdrSocketResponse<{
       workspace: { workspace_id: string };
       root_pane: { pane_id: string; cwd: string; foreground_cwd: string };
-    }>(wsReq, this.socketPath);
+    }>;
+
+    try {
+      wsRes = await this.sendRequest(wsReq, 10_000, herdrSocketPath);
+    } catch (err) {
+      if (effectiveStore && params.agentId) {
+        effectiveStore.markExternalRuntimeLaunchOutcomeUnknownCAS({
+          agentId: params.agentId,
+          attemptKey: params.attemptKey,
+          reason: `workspace.create transport error: ${String(err)}`,
+        });
+      }
+      throw err;
+    }
 
     if (wsRes.error || !wsRes.result) {
+      if (effectiveStore && params.agentId) {
+        effectiveStore.markExternalRuntimeLaunchOutcomeUnknownCAS({
+          agentId: params.agentId,
+          attemptKey: params.attemptKey,
+          reason: `workspace.create failed: ${wsRes.error?.message}`,
+        });
+      }
       throw new Error(`HerdR workspace.create failed: ${wsRes.error?.message || "unknown error"}`);
     }
 
     const wsId = wsRes.result.workspace.workspace_id;
     const paneId = wsRes.result.root_pane.pane_id;
-    const observedCwd = normalize(resolve(wsRes.result.root_pane.cwd));
+    const observedCwd = canonicalizePath(wsRes.result.root_pane.cwd);
 
     // N4: Wrong worktree fail closed
     if (observedCwd !== canonicalPath) {
-      // Clean up workspace immediately
       await this.closeWorkspace(wsId).catch(() => {});
       throw new Error(
         `[N4 Wrong Worktree] Observed cwd '${observedCwd}' does not match canonical worktree '${canonicalPath}'`,
       );
     }
 
+    // Persist positive workspace observation BEFORE agent.start (Section 31 & 35)
+    if (effectiveStore && params.agentId) {
+      const wsPersistRes = effectiveStore.recordExternalRuntimeWorkspaceObservedCAS({
+        agentId: params.agentId,
+        attemptKey: params.attemptKey,
+        herdrWorkspaceId: wsId,
+        herdrPaneId: paneId,
+        observedCwd,
+      });
+
+      if (!wsPersistRes.applied) {
+        throw new Error(
+          `[OUTCOME_UNKNOWN] Workspace created (id=${wsId}), but failed to durably persist workspace observation in store; halting before agent.start.`,
+        );
+      }
+    }
+
     // 2. Start agent in pane
-    const agentName = ("ds-" + params.attemptKey.replace(/[^a-z0-9_-]/gi, "-").toLowerCase()).slice(0, 32);
     const args: string[] = [];
     if (params.agentKind === "opencode") {
       const model = params.requestedModel || "opencode/mimo-v2.6-flash-free";
       args.push("-m", model);
     }
-    // B3: Completely removed --dangerously-skip-permissions for agy.
 
     const agentReq: HerdrSocketRequest = {
-      id: `agent-start-${Date.now()}`,
+      id: `HERDR-LAUNCH:${params.attemptKey}:agent`,
       method: "agent.start",
       params: {
         name: agentName,
@@ -367,7 +666,7 @@ export class HerdrThinGateway {
       },
     };
 
-    const agentRes = await sendHerdrSocketRequest<{
+    let agentRes: HerdrSocketResponse<{
       agent: {
         agent: string;
         agent_status: string;
@@ -375,16 +674,51 @@ export class HerdrThinGateway {
         state_change_seq: number;
         interactive_ready: boolean;
       };
-    }>(agentReq, this.socketPath);
+    }>;
+
+    try {
+      agentRes = await this.sendRequest(agentReq, 15_000, herdrSocketPath);
+    } catch (err) {
+      if (effectiveStore && params.agentId) {
+        effectiveStore.markExternalRuntimeLaunchOutcomeUnknownCAS({
+          agentId: params.agentId,
+          attemptKey: params.attemptKey,
+          reason: `agent.start transport error: ${String(err)}`,
+        });
+      }
+      throw err;
+    }
 
     if (agentRes.error || !agentRes.result) {
       await this.closeWorkspace(wsId).catch(() => {});
+      if (effectiveStore && params.agentId) {
+        effectiveStore.markExternalRuntimeLaunchOutcomeUnknownCAS({
+          agentId: params.agentId,
+          attemptKey: params.attemptKey,
+          reason: `agent.start failed: ${agentRes.error?.message}`,
+        });
+      }
       throw new Error(`HerdR agent.start failed: ${agentRes.error?.message || "unknown error"}`);
+    }
+
+    // Persist positive agent observation BEFORE prompt (Section 32 & 36)
+    if (effectiveStore && params.agentId) {
+      const agentPersistRes = effectiveStore.recordExternalRuntimeAgentObservedCAS({
+        agentId: params.agentId,
+        attemptKey: params.attemptKey,
+        herdrAgentIdentity: agentName,
+      });
+
+      if (!agentPersistRes.applied) {
+        throw new Error(
+          `[OUTCOME_UNKNOWN] Agent started (name=${agentName}), but failed to durably persist agent observation in store; halting before prompt.`,
+        );
+      }
     }
 
     // Wait for agent to reach ready state over socket
     const waitReq: HerdrSocketRequest = {
-      id: `agent-wait-${Date.now()}`,
+      id: `HERDR-LAUNCH:${params.attemptKey}:agent-wait`,
       method: "agent.wait",
       params: {
         target: agentName,
@@ -392,7 +726,7 @@ export class HerdrThinGateway {
         timeout_ms: 15_000,
       },
     };
-    await sendHerdrSocketRequest(waitReq, this.socketPath).catch(() => {});
+    await this.sendRequest(waitReq, 15_000, herdrSocketPath).catch(() => {});
 
     // Read terminal visible output to fail closed against onboarding / trust / permission dialogs (A5 / N-TRUST / B3)
     let terminalOutput = await this.readPane(paneId);
@@ -407,10 +741,10 @@ export class HerdrThinGateway {
       );
     }
 
-    const promptNonce = `HERDR-DISPATCH-${params.attemptKey}-${Date.now()}`;
     const handle: HerdrExternalHandle = {
       schemaVersion: 1,
       runtimeKind: HERDR_RUNTIME_KIND,
+      agentId: params.agentId,
       herdrSocketPath,
       herdrServerIdentity,
       herdrWorkspaceId: wsId,
@@ -426,9 +760,42 @@ export class HerdrThinGateway {
       attemptKey: params.attemptKey,
       dispatchIntentHash: params.dispatchIntentHash,
       launchTimestamp: new Date().toISOString(),
-      // N8: Never claim physically enforced
       enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
     };
+
+    if (effectiveStore && params.agentId) {
+      const bindRes = effectiveStore.bindExternalRuntimeBindingCAS({
+        agentId: params.agentId,
+        expectedAttemptKey: params.attemptKey,
+        expectedDispatchIntentHash: params.dispatchIntentHash,
+        binding: {
+          runtimeKind: HERDR_RUNTIME_KIND,
+          launch: {
+            state: "AGENT_OBSERVED",
+            launchRequestId: `HERDR-LAUNCH:${params.attemptKey}:${params.dispatchIntentHash.slice(0, 16)}`,
+            attemptKey: params.attemptKey,
+            dispatchIntentHash: params.dispatchIntentHash,
+            canonicalWorktreePath: canonicalPath,
+            gitHeadBefore,
+            agentKind: params.agentKind,
+            ...(params.requestedModel ? { requestedModel: params.requestedModel } : {}),
+            ...(params.requestedEffort ? { requestedEffort: params.requestedEffort } : {}),
+            promptNonce,
+            ...(params.workspaceId ? { workspaceId: params.workspaceId } : {}),
+            herdrWorkspaceId: wsId,
+            herdrPaneId: paneId,
+            herdrAgentIdentity: agentName,
+            fencedAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          },
+          handle: handle as unknown as Record<string, unknown>,
+        },
+      });
+
+      if (!bindRes.applied) {
+        throw new Error(`[OUTCOME_UNKNOWN] Failed to bind final external runtime handle in store.`);
+      }
+    }
 
     this.registry.registerHandle(handle);
     return handle;
@@ -444,10 +811,10 @@ export class HerdrThinGateway {
       params: { target: agentName },
     };
     try {
-      const res = await sendHerdrSocketRequest<{
+      const res = await this.sendRequest<{
         type: string;
         agent?: { agent_status: string; interactive_ready: boolean };
-      }>(req, this.socketPath, 3000);
+      }>(req, 3000);
       return res.result?.agent;
     } catch {
       return undefined;
@@ -459,6 +826,7 @@ export class HerdrThinGateway {
    * Enforces N3: timeout or stalled prompt maps to OUTCOME_UNKNOWN; zero duplicate panes.
    * Enforces Option A (B4): one consequential prompt per attempt; rejects subsequent prompts.
    * Embeds durable handle.promptNonce into prompt.
+   * Enforces exact prompt fence CAS tuple (C1).
    */
   async promptExternalAgent(
     handle: HerdrExternalHandle,
@@ -466,6 +834,16 @@ export class HerdrThinGateway {
     options: HerdrPromptOptions = {},
   ): Promise<HerdrPromptResult> {
     const effectiveStore = options.store ?? this.store;
+    if (!options.allowTestOnlyNonConsequential && !effectiveStore) {
+      throw new Error(
+        `[PROMPT_NO_DURABLE_STORE] promptExternalAgent requires a durable LocalAgentStore; in-memory-only execution is forbidden.`,
+      );
+    }
+    if (!options.allowTestOnlyNonConsequential && !handle.agentId) {
+      throw new Error(
+        `[PROMPT_MISSING_AGENT_ID] HerdrExternalHandle must contain exact agentId; fail closed.`,
+      );
+    }
 
     // Fast in-memory registry check (Option A / B4)
     if (this.registry.hasPromptSubmitted(handle.attemptKey)) {
@@ -474,37 +852,18 @@ export class HerdrThinGateway {
       );
     }
 
-    // Durable check and CAS fence in store BEFORE any external socket effect (Blocker A)
-    if (effectiveStore) {
-      let record = handle.agentId ? effectiveStore.getById(handle.agentId) : undefined;
-      if (!record) {
-        const rows = effectiveStore.list();
-        record = rows.find(
-          (r) =>
-            r.startReplay?.key === handle.attemptKey ||
-            (r.externalRuntimeBinding?.handle &&
-              typeof r.externalRuntimeBinding.handle === "object" &&
-              (r.externalRuntimeBinding.handle as Record<string, unknown>).attemptKey === handle.attemptKey),
-        );
-      }
-
-      if (record?.externalRuntimeBinding?.promptState?.consequentialPromptFenced) {
-        this.registry.markPromptSubmitted(handle.attemptKey);
-        throw new Error(
-          `[N-TURN-OPTION-A] attemptKey '${handle.attemptKey}' has already submitted a consequential prompt; subsequent prompts on same handle are rejected.`,
-        );
-      }
-
+    // Exact durable check and CAS fence in store BEFORE any external socket effect (Blocker A & C1)
+    if (effectiveStore && handle.agentId) {
       const fenceRes = effectiveStore.fenceConsequentialPromptCAS({
-        agentId: handle.agentId ?? record?.id,
+        agentId: handle.agentId,
         attemptKey: handle.attemptKey,
+        dispatchIntentHash: handle.dispatchIntentHash,
         promptNonce: handle.promptNonce,
       });
 
       if (!fenceRes.applied) {
-        this.registry.markPromptSubmitted(handle.attemptKey);
         throw new Error(
-          `[N-TURN-OPTION-A] attemptKey '${handle.attemptKey}' prompt fence CAS failed (already fenced or conflict); cannot prompt external agent.`,
+          `[N-TURN-OPTION-A] attemptKey '${handle.attemptKey}' prompt fence CAS failed (already fenced or authority tuple mismatch); cannot prompt external agent.`,
         );
       }
     }
@@ -525,9 +884,6 @@ export class HerdrThinGateway {
     if (options.until && options.until.length > 0) {
       waitOptions.until = options.until;
     }
-
-    // Mark prompt as submitted under Option A
-    this.registry.markPromptSubmitted(handle.attemptKey);
 
     // B4: Embed durable handle.promptNonce
     const turnNonce = handle.promptNonce;
@@ -611,12 +967,12 @@ export class HerdrThinGateway {
       },
     };
     try {
-      const res = await sendHerdrSocketRequest<{
+      const res = await this.sendRequest<{
         type: string;
         read: {
           text: string;
         };
-      }>(req, this.socketPath);
+      }>(req);
       if (res.result?.read?.text !== undefined) {
         return res.result.read.text;
       }
@@ -640,7 +996,7 @@ export class HerdrThinGateway {
         keys,
       },
     };
-    await sendHerdrSocketRequest(req, this.socketPath).catch(() => {});
+    await this.sendRequest(req).catch(() => {});
   }
 
   /**
@@ -872,7 +1228,7 @@ export class HerdrThinGateway {
         workspace_id: workspaceId,
       },
     };
-    const res = await sendHerdrSocketRequest<{ type?: string }>(req, this.socketPath);
+    const res = await this.sendRequest<{ type?: string }>(req);
     if (res.error) {
       throw new Error(`HerdR workspace.close failed: ${res.error.message}`);
     }

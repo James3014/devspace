@@ -12,7 +12,11 @@ import {
   cleanPorcelainPath,
   parsePorcelainChangedPaths,
   type HerdrExternalHandle,
+  type HerdrSocketRequest,
+  type HerdrSocketResponse,
 } from "./local-agent-herdr.js";
+import { LocalAgentStore } from "./local-agent-store.js";
+import { hashDispatchIntent } from "./execution-protocol.js";
 
 test("HerdrGatewayRegistry enforces N1 duplicate prevention and N2 conflicting replay", () => {
   const registry = new HerdrGatewayRegistry();
@@ -225,7 +229,7 @@ test("HerdrThinGateway enforces N-TURN by rejecting prompts to busy agents", asy
   };
 
   await assert.rejects(
-    gateway.promptExternalAgent(handle, "consequential task"),
+    gateway.promptExternalAgent(handle, "consequential task", { allowTestOnlyNonConsequential: true }),
     (err: any) => {
       assert.match(err.message, /\[N-TURN\]/);
       return true;
@@ -234,63 +238,110 @@ test("HerdrThinGateway enforces N-TURN by rejecting prompts to busy agents", asy
 });
 
 test("HerdrThinGateway enforces Option A turn identity and durable nonce binding (B4, T1, T2, T3)", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-herdr-turn-test-"));
+  const store = new LocalAgentStore(stateDir);
   const registry = new HerdrGatewayRegistry();
-  const gateway = new HerdrThinGateway("/tmp/test.sock", registry);
+  const gateway = new HerdrThinGateway("/tmp/test.sock", registry, store);
 
-  const attemptKey = `turn-opt-a-${Date.now()}`;
-  const handle: HerdrExternalHandle = {
-    schemaVersion: 1,
-    runtimeKind: HERDR_RUNTIME_KIND,
-    herdrSocketPath: "/tmp/test.sock",
-    herdrWorkspaceId: "w1",
-    herdrPaneId: "p1",
-    herdrAgentIdentity: "ds-turn-agent",
-    herdrAgentKind: "opencode",
-    promptNonce: `DURABLE-NONCE-${attemptKey}`,
-    canonicalWorktreePath: "/tmp",
-    workspaceId: "ws1",
-    gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
-    attemptKey,
-    dispatchIntentHash: "intent-turn-a",
-    launchTimestamp: new Date().toISOString(),
-    enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
-  };
+  try {
+    const attemptKey = `turn-opt-a-${Date.now()}`;
+    const dispatchIntent = {
+      taskId: "task-opt-a",
+      attemptId: attemptKey,
+      objective: "Test Option A",
+      roleIntent: "DEEP_ENGINEERING" as const,
+      claimCeiling: "CANDIDATE_READY" as const,
+      context: ["test"],
+      readScope: ["src"],
+      writeScope: ["src"],
+      exclusiveOwnership: true,
+      forbiddenChanges: [],
+      acceptanceCriteria: ["pass"],
+      verificationRequired: true,
+      expectedArtifacts: [],
+    };
+    const dispatchIntentHash = hashDispatchIntent(dispatchIntent);
+    const agent = store.create({
+      workspaceId: "ws1",
+      workspaceRoot: "/tmp",
+      profileName: "reviewer",
+      provider: "opencode",
+      startReplay: { key: attemptKey, requestHash: "hash-opt-a" },
+      executionContract: {
+        writePaths: ["src"],
+        dispatchIntent,
+      },
+    });
 
-  registry.registerHandle(handle);
+    const promptNonce = `DURABLE-NONCE-${attemptKey}`;
+    const handle: HerdrExternalHandle = {
+      schemaVersion: 1,
+      runtimeKind: HERDR_RUNTIME_KIND,
+      agentId: agent.id,
+      herdrSocketPath: "/tmp/test.sock",
+      herdrWorkspaceId: "w1",
+      herdrPaneId: "p1",
+      herdrAgentIdentity: "ds-turn-agent",
+      herdrAgentKind: "opencode",
+      promptNonce,
+      canonicalWorktreePath: "/tmp",
+      workspaceId: "ws1",
+      gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+      attemptKey,
+      dispatchIntentHash,
+      launchTimestamp: new Date().toISOString(),
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    };
 
-  (gateway as any).getAgent = async () => ({
-    agent_status: "idle",
-    interactive_ready: true,
-  });
-  (gateway as any).readPane = async () => "ready\n";
+    store.bindExternalRuntimeBindingCAS({
+      agentId: agent.id,
+      expectedAttemptKey: attemptKey,
+      expectedDispatchIntentHash: dispatchIntentHash,
+      binding: {
+        runtimeKind: HERDR_RUNTIME_KIND,
+        handle: handle as unknown as Record<string, unknown>,
+      },
+    });
 
-  let capturedPrompt = "";
-  (gateway as any).sendRequest = async (req: any) => {
-    if (req.method === "agent.prompt") {
-      capturedPrompt = req.params?.text ?? "";
-      return { result: { agent: { agent_status: "done", interactive_ready: true } } };
-    }
-    return { result: {} };
-  };
+    registry.registerHandle(handle);
 
-  assert.equal(registry.hasPromptSubmitted(attemptKey), false);
+    (gateway as any).getAgent = async () => ({
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+    (gateway as any).readPane = async () => "ready\n";
 
-  // T1: First prompt submits successfully and embeds durable promptNonce
-  const firstRes = await gateway.promptExternalAgent(handle, "first prompt on handle");
-  assert.equal(firstRes.status, "done");
-  assert.equal(firstRes.turnNonce, handle.promptNonce);
-  assert.ok(capturedPrompt.includes(`[NEXUS_ATTEMPT_NONCE:${handle.promptNonce}]`));
-  assert.ok(capturedPrompt.includes("first prompt on handle"));
-  assert.equal(registry.hasPromptSubmitted(attemptKey), true);
+    let capturedPrompt = "";
+    (gateway as any).sendRequest = async (req: any) => {
+      if (req.method === "agent.prompt") {
+        capturedPrompt = req.params?.text ?? "";
+        return { result: { agent: { agent_status: "done", interactive_ready: true } } };
+      }
+      return { result: {} };
+    };
 
-  // T2: Second prompt rejected under Option A
-  await assert.rejects(
-    gateway.promptExternalAgent(handle, "second prompt on same handle"),
-    (err: any) => {
-      assert.match(err.message, /\[N-TURN-OPTION-A\]/);
-      return true;
-    },
-  );
+    assert.equal(registry.hasPromptSubmitted(attemptKey), false);
+
+    // T1: First prompt submits successfully and embeds durable promptNonce
+    const firstRes = await gateway.promptExternalAgent(handle, "first prompt on handle", { store });
+    assert.equal(firstRes.status, "done");
+    assert.equal(firstRes.turnNonce, handle.promptNonce);
+    assert.ok(capturedPrompt.includes(`[NEXUS_ATTEMPT_NONCE:${handle.promptNonce}]`));
+    assert.ok(capturedPrompt.includes("first prompt on handle"));
+    assert.equal(registry.hasPromptSubmitted(attemptKey), true);
+
+    // T2: Second prompt rejected under Option A
+    await assert.rejects(
+      gateway.promptExternalAgent(handle, "second prompt on same handle", { store }),
+      (err: any) => {
+        assert.match(err.message, /\[N-TURN-OPTION-A\]/);
+        return true;
+      },
+    );
+  } finally {
+    store.close();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
 });
 
 test("HerdrThinGateway enforces N-ATTEST by leaving effectiveModel undefined without readback", async () => {
@@ -326,7 +377,9 @@ test("HerdrThinGateway enforces N-ATTEST by leaving effectiveModel undefined wit
 });
 
 test("HerdrThinGateway live canary with OpenCode on isolated worktree", async () => {
-  const gateway = new HerdrThinGateway();
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-canary-oc-store-"));
+  const store = new LocalAgentStore(stateDir);
+  const gateway = new HerdrThinGateway(undefined, undefined, store);
   const worktreePath = "/Users/james/.devspace/worktrees/herdr-gateway-canary-oc";
 
   // Clean up any stale worktree
@@ -342,9 +395,38 @@ test("HerdrThinGateway live canary with OpenCode on isolated worktree", async ()
 
   try {
     const attemptKey = `canary-oc-${Date.now()}`;
+    const dispatchIntent = {
+      taskId: "task-canary-oc",
+      attemptId: attemptKey,
+      objective: "OpenCode live canary",
+      roleIntent: "DEEP_ENGINEERING" as const,
+      claimCeiling: "CANDIDATE_READY" as const,
+      context: ["test"],
+      readScope: ["src"],
+      writeScope: ["src", "oc_canary.txt"],
+      exclusiveOwnership: true,
+      forbiddenChanges: [],
+      acceptanceCriteria: ["pass"],
+      verificationRequired: true,
+      expectedArtifacts: [],
+    };
+    const dispatchIntentHash = hashDispatchIntent(dispatchIntent);
+    const agent = store.create({
+      workspaceId: "canary-ws-oc",
+      workspaceRoot: worktreePath,
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: attemptKey, requestHash: "hash-canary-oc" },
+      executionContract: {
+        writePaths: ["src", "oc_canary.txt"],
+        dispatchIntent,
+      },
+    });
+
     const handle = await gateway.startExternalAgent({
+      agentId: agent.id,
       attemptKey,
-      dispatchIntentHash: "intent-canary-oc",
+      dispatchIntentHash,
       agentKind: "opencode",
       canonicalWorktreePath: worktreePath,
       workspaceId: "canary-ws-oc",
@@ -381,6 +463,8 @@ test("HerdrThinGateway live canary with OpenCode on isolated worktree", async ()
     // Clean up
     await gateway.stopExternalAgent(handle);
   } finally {
+    store.close();
+    rmSync(stateDir, { recursive: true, force: true });
     try {
       execFileSync("git", ["-C", "/Users/james/workspace/devspace", "worktree", "remove", worktreePath, "--force"], { stdio: "ignore" });
     } catch {}
@@ -391,7 +475,9 @@ test("HerdrThinGateway live canary with OpenCode on isolated worktree", async ()
 });
 
 test("HerdrThinGateway live canary with Agy on isolated worktree", async () => {
-  const gateway = new HerdrThinGateway();
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-canary-agy-store-"));
+  const store = new LocalAgentStore(stateDir);
+  const gateway = new HerdrThinGateway(undefined, undefined, store);
   const worktreePath = "/Users/james/.devspace/worktrees/herdr-gateway-canary-agy";
 
   // Clean up any stale worktree
@@ -407,11 +493,40 @@ test("HerdrThinGateway live canary with Agy on isolated worktree", async () => {
 
   try {
     const attemptKey = `canary-agy-${Date.now()}`;
+    const dispatchIntent = {
+      taskId: "task-canary-agy",
+      attemptId: attemptKey,
+      objective: "Agy live canary",
+      roleIntent: "DEEP_ENGINEERING" as const,
+      claimCeiling: "CANDIDATE_READY" as const,
+      context: ["test"],
+      readScope: ["src"],
+      writeScope: ["src", "agy_canary.txt"],
+      exclusiveOwnership: true,
+      forbiddenChanges: [],
+      acceptanceCriteria: ["pass"],
+      verificationRequired: true,
+      expectedArtifacts: [],
+    };
+    const dispatchIntentHash = hashDispatchIntent(dispatchIntent);
+    const agent = store.create({
+      workspaceId: "canary-ws-agy",
+      workspaceRoot: worktreePath,
+      profileName: "worker",
+      provider: "agy",
+      startReplay: { key: attemptKey, requestHash: "hash-canary-agy" },
+      executionContract: {
+        writePaths: ["src", "agy_canary.txt"],
+        dispatchIntent,
+      },
+    });
+
     let handle: HerdrExternalHandle | undefined;
     try {
       handle = await gateway.startExternalAgent({
+        agentId: agent.id,
         attemptKey,
-        dispatchIntentHash: "intent-canary-agy",
+        dispatchIntentHash,
         agentKind: "agy",
         canonicalWorktreePath: worktreePath,
         workspaceId: "canary-ws-agy",
@@ -475,6 +590,8 @@ test("HerdrThinGateway live canary with Agy on isolated worktree", async () => {
     // Clean up
     await gateway.stopExternalAgent(handle);
   } finally {
+    store.close();
+    rmSync(stateDir, { recursive: true, force: true });
     try {
       execFileSync("git", ["-C", "/Users/james/workspace/devspace", "worktree", "remove", worktreePath, "--force"], { stdio: "ignore" });
     } catch {}
@@ -555,5 +672,707 @@ test("HerdrThinGateway reconciliation handles renames, spaces, deletions and sta
     assert.ok(rec.changedPaths.includes("renamed.txt"));
   } finally {
     rmSync(testDir, { recursive: true, force: true });
+  }
+});
+
+class SpyHerdrGateway extends HerdrThinGateway {
+  public workspaceCreateCalls = 0;
+  public agentStartCalls = 0;
+  public agentPromptCalls = 0;
+  public agentWaitCalls = 0;
+  public listWorkspacesCalls = 0;
+  public getWorkspaceCalls = 0;
+  public getAgentCalls = 0;
+
+  public failWorkspaceCreate = false;
+  public failAgentStart = false;
+  public simulatedWorkspaces: Array<{ workspace_id: string; label?: string }> = [];
+  public simulatedAgentStatus: { agent_status: string; interactive_ready: boolean } | undefined;
+
+  override async sendRequest<T = unknown>(
+    req: HerdrSocketRequest,
+    timeoutMs: number = 10_000,
+    socketPath?: string,
+  ): Promise<HerdrSocketResponse<T>> {
+    if (req.method === "workspace.create") {
+      this.workspaceCreateCalls++;
+      if (this.failWorkspaceCreate) {
+        throw new Error("Simulated network timeout during workspace.create");
+      }
+      const wsId = `sim-ws-${Date.now()}-${this.workspaceCreateCalls}`;
+      const paneId = `sim-pane-${Date.now()}-${this.workspaceCreateCalls}`;
+      return {
+        id: req.id,
+        result: {
+          workspace: { workspace_id: wsId },
+          root_pane: {
+            pane_id: paneId,
+            cwd: (req.params as any)?.cwd,
+            foreground_cwd: (req.params as any)?.cwd,
+          },
+        } as unknown as T,
+      };
+    }
+
+    if (req.method === "agent.start") {
+      this.agentStartCalls++;
+      if (this.failAgentStart) {
+        throw new Error("Simulated network timeout during agent.start");
+      }
+      return {
+        id: req.id,
+        result: {
+          agent: {
+            agent: (req.params as any)?.name,
+            agent_status: "running",
+            pane_id: (req.params as any)?.pane_id,
+            state_change_seq: 1,
+            interactive_ready: true,
+          },
+        } as unknown as T,
+      };
+    }
+
+    if (req.method === "agent.prompt") {
+      this.agentPromptCalls++;
+      return {
+        id: req.id,
+        result: {
+          agent: {
+            agent: (req.params as any)?.target,
+            agent_status: "done",
+            interactive_ready: true,
+          },
+        } as unknown as T,
+      };
+    }
+
+    if (req.method === "agent.wait") {
+      this.agentWaitCalls++;
+      return { id: req.id, result: {} as unknown as T };
+    }
+
+    if (req.method === "workspace.list") {
+      this.listWorkspacesCalls++;
+      return {
+        id: req.id,
+        result: {
+          type: "workspace.list",
+          workspaces: this.simulatedWorkspaces,
+        } as unknown as T,
+      };
+    }
+
+    if (req.method === "workspace.get") {
+      this.getWorkspaceCalls++;
+      return {
+        id: req.id,
+        result: {
+          workspace: {
+            workspace_id: (req.params as any)?.target,
+            root_pane_id: `${(req.params as any)?.target}:p1`,
+          },
+        } as unknown as T,
+      };
+    }
+
+    if (req.method === "agent.get") {
+      this.getAgentCalls++;
+      return {
+        id: req.id,
+        result: {
+          type: "agent.get",
+          agent: this.simulatedAgentStatus ?? {
+            agent_status: "idle",
+            interactive_ready: true,
+          },
+        } as unknown as T,
+      };
+    }
+
+    return { id: req.id, result: {} as unknown as T };
+  }
+
+  override async readPane(paneId: string, lines: number = 50): Promise<string> {
+    return "Ready prompt\n";
+  }
+}
+
+test("HerdrThinGateway prompt fence negative matrix and zero external calls (C1, PF-WRONG-ATTEMPT, PF-WRONG-DISPATCH, PF-WRONG-NONCE, PF-MISSING-HANDLE, PF-MALFORMED-HANDLE, PF-WRONG-RUNTIME, PF-CONCURRENT, PF-EXACT)", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-pf-matrix-"));
+  const store = new LocalAgentStore(stateDir);
+  const registry = new HerdrGatewayRegistry();
+  const spy = new SpyHerdrGateway("/tmp/test.sock", registry, store);
+
+  try {
+    const attemptKey = `pf-test-${Date.now()}`;
+    const dispatchIntent = {
+      taskId: "task-pf",
+      attemptId: attemptKey,
+      objective: "Test PF negative matrix",
+      roleIntent: "DEEP_ENGINEERING" as const,
+      claimCeiling: "CANDIDATE_READY" as const,
+      context: ["test"],
+      readScope: ["src"],
+      writeScope: ["src"],
+      exclusiveOwnership: true,
+      forbiddenChanges: [],
+      acceptanceCriteria: ["pass"],
+      verificationRequired: true,
+      expectedArtifacts: [],
+    };
+    const dispatchIntentHash = hashDispatchIntent(dispatchIntent);
+    const promptNonce = `DURABLE-NONCE-${attemptKey}`;
+
+    const agent = store.create({
+      workspaceId: "ws-pf",
+      workspaceRoot: "/tmp",
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: attemptKey, requestHash: "hash-pf" },
+      executionContract: {
+        writePaths: ["src"],
+        dispatchIntent,
+      },
+    });
+
+    const validHandle: HerdrExternalHandle = {
+      schemaVersion: 1,
+      runtimeKind: HERDR_RUNTIME_KIND,
+      agentId: agent.id,
+      herdrSocketPath: "/tmp/test.sock",
+      herdrWorkspaceId: "ws1",
+      herdrPaneId: "p1",
+      herdrAgentIdentity: "ds-pf-agent",
+      herdrAgentKind: "opencode",
+      promptNonce,
+      canonicalWorktreePath: "/tmp",
+      workspaceId: "ws-pf",
+      gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+      attemptKey,
+      dispatchIntentHash,
+      launchTimestamp: new Date().toISOString(),
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    };
+
+    // Bind valid handle into store
+    store.bindExternalRuntimeBindingCAS({
+      agentId: agent.id,
+      expectedAttemptKey: attemptKey,
+      expectedDispatchIntentHash: dispatchIntentHash,
+      binding: {
+        runtimeKind: HERDR_RUNTIME_KIND,
+        handle: validHandle as unknown as Record<string, unknown>,
+      },
+    });
+
+    // 1. PF-WRONG-AGENT-ATTEMPT: agentId points to agent with attemptKey, but handle has different attemptKey
+    const wrongAttemptHandle = { ...validHandle, attemptKey: "WRONG-ATTEMPT" };
+    await assert.rejects(
+      spy.promptExternalAgent(wrongAttemptHandle, "prompt text", { store }),
+      (err: any) => {
+        assert.match(err.message, /\[N-TURN-OPTION-A\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.agentPromptCalls, 0, "PF-WRONG-AGENT-ATTEMPT must result in 0 external prompt calls");
+
+    // 2. PF-WRONG-DISPATCH: handle has mismatched dispatchIntentHash
+    const wrongDispatchHandle = { ...validHandle, dispatchIntentHash: "WRONG-DISPATCH-HASH" };
+    await assert.rejects(
+      spy.promptExternalAgent(wrongDispatchHandle, "prompt text", { store }),
+      (err: any) => {
+        assert.match(err.message, /\[N-TURN-OPTION-A\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.agentPromptCalls, 0, "PF-WRONG-DISPATCH must result in 0 external prompt calls");
+
+    // 3. PF-WRONG-NONCE: caller provides handle with different promptNonce
+    const wrongNonceHandle = { ...validHandle, promptNonce: "WRONG-NONCE" };
+    await assert.rejects(
+      spy.promptExternalAgent(wrongNonceHandle, "prompt text", { store }),
+      (err: any) => {
+        assert.match(err.message, /\[N-TURN-OPTION-A\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.agentPromptCalls, 0, "PF-WRONG-NONCE must result in 0 external prompt calls");
+
+    // 4. PF-MISSING-HANDLE: agent record has no externalRuntimeBinding
+    const agentNoBinding = store.create({
+      workspaceId: "ws-pf-2",
+      workspaceRoot: "/tmp",
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: "attempt-no-binding", requestHash: "hash-pf-2" },
+      executionContract: {
+        writePaths: ["src"],
+        dispatchIntent: { ...dispatchIntent, attemptId: "attempt-no-binding" },
+      },
+    });
+    const handleNoBinding = { ...validHandle, agentId: agentNoBinding.id, attemptKey: "attempt-no-binding" };
+    await assert.rejects(
+      spy.promptExternalAgent(handleNoBinding, "prompt text", { store }),
+      (err: any) => {
+        assert.match(err.message, /\[N-TURN-OPTION-A\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.agentPromptCalls, 0, "PF-MISSING-HANDLE must result in 0 external prompt calls");
+
+    // 5. PF-MALFORMED-HANDLE: HERDR binding exists but lacks attemptKey / promptNonce
+    const agentMalformed = store.create({
+      workspaceId: "ws-pf-3",
+      workspaceRoot: "/tmp",
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: "attempt-malformed", requestHash: "hash-pf-3" },
+      executionContract: {
+        writePaths: ["src"],
+        dispatchIntent: { ...dispatchIntent, attemptId: "attempt-malformed" },
+      },
+    });
+    store.bindExternalRuntimeBindingCAS({
+      agentId: agentMalformed.id,
+      expectedAttemptKey: "attempt-malformed",
+      expectedDispatchIntentHash: dispatchIntentHash,
+      binding: {
+        runtimeKind: HERDR_RUNTIME_KIND,
+        handle: {} as any,
+      },
+    });
+    const handleMalformed = { ...validHandle, agentId: agentMalformed.id, attemptKey: "attempt-malformed" };
+    await assert.rejects(
+      spy.promptExternalAgent(handleMalformed, "prompt text", { store }),
+      (err: any) => {
+        assert.match(err.message, /\[N-TURN-OPTION-A\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.agentPromptCalls, 0, "PF-MALFORMED-HANDLE must result in 0 external prompt calls");
+
+    // 6. PF-WRONG-RUNTIME: binding exists but runtimeKind != HERDR
+    const agentWrongRuntime = store.create({
+      workspaceId: "ws-pf-4",
+      workspaceRoot: "/tmp",
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: "attempt-wrong-rt", requestHash: "hash-pf-4" },
+      executionContract: {
+        writePaths: ["src"],
+        dispatchIntent: { ...dispatchIntent, attemptId: "attempt-wrong-rt" },
+      },
+    });
+    store.bindExternalRuntimeBindingCAS({
+      agentId: agentWrongRuntime.id,
+      expectedAttemptKey: "attempt-wrong-rt",
+      expectedDispatchIntentHash: dispatchIntentHash,
+      binding: {
+        runtimeKind: "OTHER" as any,
+        handle: { ...validHandle, attemptKey: "attempt-wrong-rt" } as any,
+      },
+    });
+    const handleWrongRt = { ...validHandle, agentId: agentWrongRuntime.id, attemptKey: "attempt-wrong-rt" };
+    await assert.rejects(
+      spy.promptExternalAgent(handleWrongRt, "prompt text", { store }),
+      (err: any) => {
+        assert.match(err.message, /\[N-TURN-OPTION-A\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.agentPromptCalls, 0, "PF-WRONG-RUNTIME must result in 0 external prompt calls");
+
+    // 7. PF-CONCURRENT: stale expectedUpdatedAt
+    const staleRes = store.fenceConsequentialPromptCAS({
+      agentId: agent.id,
+      attemptKey,
+      dispatchIntentHash,
+      promptNonce,
+      expectedUpdatedAt: "1970-01-01T00:00:00.000Z",
+    });
+    assert.equal(staleRes.applied, false, "Concurrent CAS with stale expectedUpdatedAt must fail");
+    assert.equal(spy.agentPromptCalls, 0, "PF-CONCURRENT must result in 0 external prompt calls");
+
+    // Independent wrong handle reproducer (Section 49):
+    const directRes = store.fenceConsequentialPromptCAS({
+      agentId: agent.id,
+      attemptKey: "WRONG-ATTEMPT",
+      dispatchIntentHash,
+      promptNonce: "WRONG-NONCE",
+    });
+    assert.equal(directRes.applied, false);
+    const rereadAgent = store.getById(agent.id);
+    assert.equal(rereadAgent?.externalRuntimeBinding?.promptState, undefined);
+    assert.equal((rereadAgent?.externalRuntimeBinding?.handle as any)?.promptNonce, promptNonce);
+
+    // 8. PF-EXACT: exact authority tuple succeeds and issues exactly 1 socket call
+    const exactRes = await spy.promptExternalAgent(validHandle, "prompt text", { store });
+    assert.equal(exactRes.status, "done");
+    assert.equal(exactRes.turnNonce, promptNonce);
+    assert.equal(spy.agentPromptCalls, 1, "PF-EXACT must issue exactly 1 external agent.prompt call");
+  } finally {
+    store.close();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("HerdrThinGateway launch identity and lost-ack controls (C2, L1 to L10)", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-l-controls-"));
+  const store = new LocalAgentStore(stateDir);
+  const testRepo = mkdtempSync(join(tmpdir(), "devspace-herdr-l-repo-"));
+
+  try {
+    execFileSync("git", ["init", testRepo], { stdio: "ignore" });
+    execFileSync("git", ["-C", testRepo, "config", "user.name", "Test"], { stdio: "ignore" });
+    execFileSync("git", ["-C", testRepo, "config", "user.email", "test@test.com"], { stdio: "ignore" });
+    writeFileSync(join(testRepo, "test.txt"), "hello");
+    execFileSync("git", ["-C", testRepo, "add", "."], { stdio: "ignore" });
+    execFileSync("git", ["-C", testRepo, "commit", "-m", "init"], { stdio: "ignore" });
+    const initHead = execFileSync("git", ["-C", testRepo, "rev-parse", "HEAD"], { encoding: "utf-8" }).trim();
+
+    const attemptKey = `launch-test-${Date.now()}`;
+    const dispatchIntent = {
+      taskId: "task-launch-test",
+      attemptId: attemptKey,
+      objective: "Test launch controls",
+      roleIntent: "DEEP_ENGINEERING" as const,
+      claimCeiling: "CANDIDATE_READY" as const,
+      context: ["test"],
+      readScope: ["src"],
+      writeScope: ["src"],
+      exclusiveOwnership: true,
+      forbiddenChanges: [],
+      acceptanceCriteria: ["pass"],
+      verificationRequired: true,
+      expectedArtifacts: [],
+    };
+    const dispatchIntentHash = hashDispatchIntent(dispatchIntent);
+
+    const agent = store.create({
+      workspaceId: "ws-launch",
+      workspaceRoot: testRepo,
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: attemptKey, requestHash: "hash-launch" },
+      executionContract: {
+        writePaths: ["src"],
+        dispatchIntent,
+      },
+    });
+
+    // L1: FIRST LAUNCH
+    const spy1 = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    const handle1 = await spy1.startExternalAgent({
+      agentId: agent.id,
+      store,
+      attemptKey,
+      dispatchIntentHash,
+      agentKind: "opencode",
+      canonicalWorktreePath: testRepo,
+      workspaceId: "ws-launch",
+    });
+    assert.equal(spy1.workspaceCreateCalls, 1, "L1 must call workspace.create exactly once");
+    assert.equal(spy1.agentStartCalls, 1, "L1 must call agent.start exactly once");
+    assert.equal(handle1.attemptKey, attemptKey);
+    assert.equal(handle1.gitHeadBefore, initHead);
+
+    const recordL1 = store.getById(agent.id);
+    assert.equal(recordL1?.externalRuntimeBinding?.launch?.state, "AGENT_OBSERVED");
+    assert.ok(recordL1?.externalRuntimeBinding?.launch?.herdrWorkspaceId);
+    assert.ok(recordL1?.externalRuntimeBinding?.launch?.herdrAgentIdentity);
+    assert.ok(recordL1?.externalRuntimeBinding?.handle);
+
+    // L2: EXACT REPLAY
+    const spy2 = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    const handle2 = await spy2.startExternalAgent({
+      agentId: agent.id,
+      store,
+      attemptKey,
+      dispatchIntentHash,
+      agentKind: "opencode",
+      canonicalWorktreePath: testRepo,
+      workspaceId: "ws-launch",
+    });
+    assert.equal(spy2.workspaceCreateCalls, 0, "L2 exact replay must issue 0 workspace.create calls");
+    assert.equal(spy2.agentStartCalls, 0, "L2 exact replay must issue 0 agent.start calls");
+    assert.equal(handle2.attemptKey, handle1.attemptKey);
+
+    // L3: CONFLICTING INTENT
+    const spy3 = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    await assert.rejects(
+      spy3.startExternalAgent({
+        agentId: agent.id,
+        store,
+        attemptKey,
+        dispatchIntentHash: "DIFFERENT-INTENT-HASH",
+        agentKind: "opencode",
+        canonicalWorktreePath: testRepo,
+        workspaceId: "ws-launch",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[N2 Conflicting Replay\]/);
+        return true;
+      },
+    );
+    assert.equal(spy3.workspaceCreateCalls, 0, "L3 conflicting intent must issue 0 workspace.create calls");
+    assert.equal(spy3.agentStartCalls, 0, "L3 conflicting intent must issue 0 agent.start calls");
+
+    // L4: LOST ACK WORKSPACE
+    const attemptL4 = `launch-l4-${Date.now()}`;
+    const intentL4 = { ...dispatchIntent, attemptId: attemptL4 };
+    const hashL4 = hashDispatchIntent(intentL4);
+    const agentL4 = store.create({
+      workspaceId: "ws-launch-l4",
+      workspaceRoot: testRepo,
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: attemptL4, requestHash: "hash-l4" },
+      executionContract: { writePaths: ["src"], dispatchIntent: intentL4 },
+    });
+
+    const spyL4 = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    spyL4.failWorkspaceCreate = true;
+    await assert.rejects(
+      spyL4.startExternalAgent({
+        agentId: agentL4.id,
+        store,
+        attemptKey: attemptL4,
+        dispatchIntentHash: hashL4,
+        agentKind: "opencode",
+        canonicalWorktreePath: testRepo,
+        workspaceId: "ws-launch-l4",
+      }),
+    );
+    assert.equal(spyL4.workspaceCreateCalls, 1);
+    assert.equal(spyL4.agentStartCalls, 0);
+
+    const recordL4 = store.getById(agentL4.id);
+    assert.equal(recordL4?.externalRuntimeBinding?.launch?.state, "OUTCOME_UNKNOWN");
+
+    // L4 restart with NO observed workspace: must NOT retry workspace.create!
+    const spyL4Replay = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    await assert.rejects(
+      spyL4Replay.startExternalAgent({
+        agentId: agentL4.id,
+        store,
+        attemptKey: attemptL4,
+        dispatchIntentHash: hashL4,
+        agentKind: "opencode",
+        canonicalWorktreePath: testRepo,
+        workspaceId: "ws-launch-l4",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[OUTCOME_UNKNOWN\]/);
+        return true;
+      },
+    );
+    assert.equal(spyL4Replay.workspaceCreateCalls, 0, "L4 replay without observation must issue 0 workspace.create calls");
+
+    // L4 restart with positively observed workspace: reconciles without new workspace.create
+    const spyL4ReplayObserved = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    spyL4ReplayObserved.simulatedWorkspaces = [{ workspace_id: "ws-reconciled-l4", label: `devspace-${attemptL4}` }];
+    const handleL4Reconciled = await spyL4ReplayObserved.startExternalAgent({
+      agentId: agentL4.id,
+      store,
+      attemptKey: attemptL4,
+      dispatchIntentHash: hashL4,
+      agentKind: "opencode",
+      canonicalWorktreePath: testRepo,
+      workspaceId: "ws-launch-l4",
+    });
+    assert.equal(spyL4ReplayObserved.workspaceCreateCalls, 0, "L4 replay with observation must issue 0 workspace.create calls");
+    assert.equal(handleL4Reconciled.herdrWorkspaceId, "ws-reconciled-l4");
+
+    // L5: LOST ACK AGENT
+    const attemptL5 = `launch-l5-${Date.now()}`;
+    const intentL5 = { ...dispatchIntent, attemptId: attemptL5 };
+    const hashL5 = hashDispatchIntent(intentL5);
+    const agentL5 = store.create({
+      workspaceId: "ws-launch-l5",
+      workspaceRoot: testRepo,
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: attemptL5, requestHash: "hash-l5" },
+      executionContract: { writePaths: ["src"], dispatchIntent: intentL5 },
+    });
+
+    const spyL5 = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    spyL5.failAgentStart = true;
+    await assert.rejects(
+      spyL5.startExternalAgent({
+        agentId: agentL5.id,
+        store,
+        attemptKey: attemptL5,
+        dispatchIntentHash: hashL5,
+        agentKind: "opencode",
+        canonicalWorktreePath: testRepo,
+        workspaceId: "ws-launch-l5",
+      }),
+    );
+    assert.equal(spyL5.workspaceCreateCalls, 1);
+    assert.equal(spyL5.agentStartCalls, 1);
+
+    // L5 restart with positively observed agent: reconciles without new workspace.create or agent.start
+    const spyL5Replay = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    const handleL5Reconciled = await spyL5Replay.startExternalAgent({
+      agentId: agentL5.id,
+      store,
+      attemptKey: attemptL5,
+      dispatchIntentHash: hashL5,
+      agentKind: "opencode",
+      canonicalWorktreePath: testRepo,
+      workspaceId: "ws-launch-l5",
+    });
+    assert.equal(spyL5Replay.workspaceCreateCalls, 0, "L5 replay must issue 0 new workspace.create calls");
+    assert.equal(spyL5Replay.agentStartCalls, 0, "L5 replay must issue 0 new agent.start calls");
+    assert.ok(handleL5Reconciled.herdrAgentIdentity);
+
+    // L6: WORKSPACE PERSIST FAILURE
+    const attemptL6 = `launch-l6-${Date.now()}`;
+    const intentL6 = { ...dispatchIntent, attemptId: attemptL6 };
+    const hashL6 = hashDispatchIntent(intentL6);
+    const agentL6 = store.create({
+      workspaceId: "ws-launch-l6",
+      workspaceRoot: testRepo,
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: attemptL6, requestHash: "hash-l6" },
+      executionContract: { writePaths: ["src"], dispatchIntent: intentL6 },
+    });
+    const origWsObserved = store.recordExternalRuntimeWorkspaceObservedCAS.bind(store);
+    store.recordExternalRuntimeWorkspaceObservedCAS = () => ({ applied: false, reason: "simulated CAS error" });
+
+    const spyL6 = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    await assert.rejects(
+      spyL6.startExternalAgent({
+        agentId: agentL6.id,
+        store,
+        attemptKey: attemptL6,
+        dispatchIntentHash: hashL6,
+        agentKind: "opencode",
+        canonicalWorktreePath: testRepo,
+        workspaceId: "ws-launch-l6",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[OUTCOME_UNKNOWN\]/);
+        return true;
+      },
+    );
+    assert.equal(spyL6.agentStartCalls, 0, "L6 workspace persistence failure must halt before agent.start");
+    store.recordExternalRuntimeWorkspaceObservedCAS = origWsObserved;
+
+    // L7: AGENT PERSIST FAILURE
+    const attemptL7 = `launch-l7-${Date.now()}`;
+    const intentL7 = { ...dispatchIntent, attemptId: attemptL7 };
+    const hashL7 = hashDispatchIntent(intentL7);
+    const agentL7 = store.create({
+      workspaceId: "ws-launch-l7",
+      workspaceRoot: testRepo,
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: attemptL7, requestHash: "hash-l7" },
+      executionContract: { writePaths: ["src"], dispatchIntent: intentL7 },
+    });
+    const origAgentObserved = store.recordExternalRuntimeAgentObservedCAS.bind(store);
+    store.recordExternalRuntimeAgentObservedCAS = () => ({ applied: false, reason: "simulated CAS error" });
+
+    const spyL7 = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    await assert.rejects(
+      spyL7.startExternalAgent({
+        agentId: agentL7.id,
+        store,
+        attemptKey: attemptL7,
+        dispatchIntentHash: hashL7,
+        agentKind: "opencode",
+        canonicalWorktreePath: testRepo,
+        workspaceId: "ws-launch-l7",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[OUTCOME_UNKNOWN\]/);
+        return true;
+      },
+    );
+    assert.equal(spyL7.agentPromptCalls, 0, "L7 agent persistence failure must halt before prompt");
+    store.recordExternalRuntimeAgentObservedCAS = origAgentObserved;
+
+    // L8: WRONG WORKTREE
+    const wrongRepo = mkdtempSync(join(tmpdir(), "devspace-herdr-wrong-repo-"));
+    execFileSync("git", ["init", wrongRepo], { stdio: "ignore" });
+    execFileSync("git", ["-C", wrongRepo, "config", "user.name", "Test"], { stdio: "ignore" });
+    execFileSync("git", ["-C", wrongRepo, "config", "user.email", "test@test.com"], { stdio: "ignore" });
+    writeFileSync(join(wrongRepo, "test.txt"), "hello");
+    execFileSync("git", ["-C", wrongRepo, "add", "."], { stdio: "ignore" });
+    execFileSync("git", ["-C", wrongRepo, "commit", "-m", "init"], { stdio: "ignore" });
+
+    const spyL8 = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    await assert.rejects(
+      spyL8.startExternalAgent({
+        agentId: agent.id,
+        store,
+        attemptKey,
+        dispatchIntentHash,
+        agentKind: "opencode",
+        canonicalWorktreePath: wrongRepo,
+        workspaceId: "ws-launch",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[N4 Wrong Worktree\]/);
+        return true;
+      },
+    );
+    assert.equal(spyL8.workspaceCreateCalls, 0, "L8 wrong worktree must issue 0 workspace.create calls");
+    assert.equal(spyL8.agentStartCalls, 0, "L8 wrong worktree must issue 0 agent.start calls");
+    rmSync(wrongRepo, { recursive: true, force: true });
+
+    // L9: WRONG AGENT KIND
+    const spyL9 = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    await assert.rejects(
+      spyL9.startExternalAgent({
+        agentId: agent.id,
+        store,
+        attemptKey,
+        dispatchIntentHash,
+        agentKind: "agy",
+        canonicalWorktreePath: testRepo,
+        workspaceId: "ws-launch",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[ATTEMPT_REPLAY_CONFLICT\]/);
+        return true;
+      },
+    );
+    assert.equal(spyL9.workspaceCreateCalls, 0, "L9 wrong agent kind must issue 0 workspace.create calls");
+    assert.equal(spyL9.agentStartCalls, 0, "L9 wrong agent kind must issue 0 agent.start calls");
+
+    // L10: SOURCE HEAD DRIFT
+    // Commit to testRepo so HEAD drifts
+    writeFileSync(join(testRepo, "test.txt"), "hello modified");
+    execFileSync("git", ["-C", testRepo, "commit", "-am", "second commit"], { stdio: "ignore" });
+    const driftedHead = execFileSync("git", ["-C", testRepo, "rev-parse", "HEAD"], { encoding: "utf-8" }).trim();
+    assert.notEqual(driftedHead, initHead);
+
+    const spyL10 = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    await assert.rejects(
+      spyL10.startExternalAgent({
+        agentId: agent.id,
+        store,
+        attemptKey,
+        dispatchIntentHash,
+        agentKind: "opencode",
+        canonicalWorktreePath: testRepo,
+        workspaceId: "ws-launch",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[SOURCE_IDENTITY_DRIFT\]/);
+        return true;
+      },
+    );
+    assert.equal(spyL10.workspaceCreateCalls, 0, "L10 source head drift must issue 0 workspace.create calls");
+    assert.equal(spyL10.agentStartCalls, 0, "L10 source head drift must issue 0 agent.start calls");
+  } finally {
+    store.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(testRepo, { recursive: true, force: true });
   }
 });
