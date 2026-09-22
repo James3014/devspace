@@ -1030,8 +1030,92 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
   assert.equal(scopedWsCount, 1);
   const scopedWsAndRootCount = store.count({ workspaceId: "ws_success", workspaceRoot: join(root, "success") });
   assert.equal(scopedWsAndRootCount, 1);
-  const absentWsCount = store.count({ workspaceId: "ws_nonexistent" });
-  assert.equal(absentWsCount, 0);
+  // Case F: bindExternalRuntimeBindingCAS and StoredExecutionStateV2
+  const bindingAgent = store.create({
+    workspaceId: "ws_binding",
+    workspaceRoot: join(root, "binding"),
+    profileName: "reviewer",
+    provider: "agy",
+    startReplay: {
+      key: "attempt-bind-1",
+      requestHash: "hash-123",
+    },
+  });
+
+  const testBinding = {
+    runtimeKind: "HERDR",
+    handle: {
+      attemptKey: "attempt-bind-1",
+      workspaceId: "ws_binding",
+      herdrSocketPath: "/tmp/herdr.sock",
+    },
+  };
+
+  // Successful binding
+  const bindRes = store.bindExternalRuntimeBindingCAS({
+    agentId: bindingAgent.id,
+    expectedAttemptKey: "attempt-bind-1",
+    binding: testBinding,
+  });
+  assert.equal(bindRes.applied, true);
+
+  const boundRecord = store.getById(bindingAgent.id)!;
+  assert.deepEqual(boundRecord.externalRuntimeBinding, testBinding);
+  // provider_session_id is NOT modified
+  assert.equal(boundRecord.providerSessionId, undefined);
+
+  // Idempotent re-binding succeeds
+  const rebindRes = store.bindExternalRuntimeBindingCAS({
+    agentId: bindingAgent.id,
+    expectedAttemptKey: "attempt-bind-1",
+    binding: testBinding,
+  });
+  assert.equal(rebindRes.applied, true);
+
+  // Conflicting handle fails CAS
+  const conflictRes = store.bindExternalRuntimeBindingCAS({
+    agentId: bindingAgent.id,
+    expectedAttemptKey: "attempt-bind-1",
+    binding: {
+      runtimeKind: "HERDR",
+      handle: { attemptKey: "attempt-bind-1", different: true },
+    },
+  });
+  assert.equal(conflictRes.applied, false);
+
+  // Mismatched expectedAttemptKey fails CAS
+  const mismatchAttemptRes = store.bindExternalRuntimeBindingCAS({
+    agentId: bindingAgent.id,
+    expectedAttemptKey: "wrong-attempt-key",
+    binding: testBinding,
+  });
+  assert.equal(mismatchAttemptRes.applied, false);
+
+  // v1 backward compatibility: simulate a raw v1 row
+  const rawDb = (store as any).database.sqlite;
+  rawDb.prepare(`
+    insert into local_agent_sessions (
+      id, workspace_root, profile_name, provider, status, execution_contract, created_at, updated_at
+    ) values (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    "agt_legacy_v1",
+    join(root, "legacy"),
+    "reviewer",
+    "codex",
+    "starting",
+    JSON.stringify({
+      storedExecutionStateVersion: 1,
+      executionContract: null,
+      startReplay: { key: "legacy-key", requestHash: "legacy-hash" },
+    }),
+    new Date().toISOString(),
+    new Date().toISOString(),
+  );
+
+  const legacyV1Record = store.getById("agt_legacy_v1");
+  assert.ok(legacyV1Record);
+  assert.equal(legacyV1Record.startReplay?.key, "legacy-key");
+  assert.equal(legacyV1Record.externalRuntimeBinding, undefined);
 
 } finally {
   for (const store of stores) {

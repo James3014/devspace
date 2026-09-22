@@ -27,6 +27,7 @@ import {
   deserializeExecutionGenerationBinding,
   serializeExecutionGenerationBinding,
   type ExecutionGenerationBinding,
+  hashDispatchIntent,
 } from "./execution-protocol.js";
 import {
   parseLocalEffectEnforcementReceipt,
@@ -77,6 +78,18 @@ export interface PhysicalTerminationState {
   previousWorkerToken?: string;
 }
 
+export interface ExternalRuntimeBinding {
+  runtimeKind: string;
+  handle: Record<string, unknown>;
+}
+
+export interface BindExternalRuntimeBindingInput {
+  agentId: string;
+  expectedAttemptKey?: string;
+  expectedDispatchIntentHash?: string;
+  binding: ExternalRuntimeBinding;
+}
+
 export interface LocalAgentRecord {
   id: string;
   workspaceId?: string;
@@ -91,6 +104,7 @@ export interface LocalAgentRecord {
   executionContract?: ExecutionContract;
   executionGeneration?: ExecutionGenerationBinding;
   startReplay?: StartReplayBinding;
+  externalRuntimeBinding?: ExternalRuntimeBinding;
   terminalReason?: AgentTerminalReason;
   scopeState?: ScopeState;
   scopeBaseline?: ScopeBaseline;
@@ -117,6 +131,7 @@ export interface CreateLocalAgentRecordInput {
   executionIdlePolicy?: EffectiveExecutionIdlePolicy;
   executionGeneration?: ExecutionGenerationBinding;
   startReplay?: StartReplayBinding;
+  externalRuntimeBinding?: ExternalRuntimeBinding;
   lifecycleKind?: AgentLifecycleKind;
 }
 
@@ -369,6 +384,7 @@ export class LocalAgentStore {
       executionContract: input.executionContract,
       executionGeneration: input.executionGeneration,
       startReplay: input.startReplay,
+      externalRuntimeBinding: input.externalRuntimeBinding,
       lifecycleState: input.lifecycleKind === "detached_worker_v2"
         ? {
             lifecycleKind: "detached_worker_v2",
@@ -416,7 +432,7 @@ export class LocalAgentStore {
         record.model ?? null,
         record.effort ?? null,
         record.providerContinuityState,
-        serializeStoredExecutionState(record.executionContract, record.startReplay),
+        serializeStoredExecutionState(record.executionContract, record.startReplay, record.externalRuntimeBinding),
         serializeExecutionGenerationBinding(record.executionGeneration),
         record.lifecycleState ? JSON.stringify(record.lifecycleState) : null,
         record.status,
@@ -939,6 +955,61 @@ export class LocalAgentStore {
          where id = ? and worker_token = ? and updated_at = ?`,
       ).run(storedProviderSessionId ?? null, continuityState, now, id, workerToken, current.updatedAt);
       const refreshed = this.getById(id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return bind.immediate();
+  }
+
+  bindExternalRuntimeBindingCAS(input: BindExternalRuntimeBindingInput): LifecycleCasResult {
+    const bind = this.database.sqlite.transaction(() => {
+      const current = this.getById(input.agentId);
+      if (!current) return { applied: false };
+
+      // Validate attemptKey consistency if startReplay exists
+      if (
+        input.expectedAttemptKey &&
+        current.startReplay?.key &&
+        current.startReplay.key !== input.expectedAttemptKey
+      ) {
+        return { applied: false, previous: current, current };
+      }
+
+      // Validate dispatchIntentHash consistency if executionContract.dispatchIntent exists
+      if (
+        input.expectedDispatchIntentHash &&
+        current.executionContract?.dispatchIntent
+      ) {
+        const currentHash = hashDispatchIntent(current.executionContract.dispatchIntent);
+        if (currentHash !== input.expectedDispatchIntentHash) {
+          return { applied: false, previous: current, current };
+        }
+      }
+
+      // Check idempotency if already bound
+      if (current.externalRuntimeBinding) {
+        const existing = current.externalRuntimeBinding;
+        if (
+          existing.runtimeKind === input.binding.runtimeKind &&
+          JSON.stringify(existing.handle) === JSON.stringify(input.binding.handle)
+        ) {
+          return { applied: true, previous: current, current };
+        }
+        return { applied: false, previous: current, current };
+      }
+
+      const serialized = serializeStoredExecutionState(
+        current.executionContract,
+        current.startReplay,
+        input.binding,
+      );
+
+      const now = new Date().toISOString();
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set execution_contract = ?, updated_at = ?
+         where id = ? and updated_at = ?`,
+      ).run(serialized, now, current.id, current.updatedAt);
+
+      const refreshed = this.getById(current.id) ?? current;
       return { applied: result.changes === 1, previous: current, current: refreshed };
     });
     return bind.immediate();
@@ -1474,6 +1545,7 @@ function rowToLocalAgentRecord(row: LocalAgentRow): LocalAgentRecord {
     executionContract: storedExecution.executionContract,
     executionGeneration: deserializeExecutionGenerationBinding(row.execution_generation),
     startReplay: storedExecution.startReplay,
+    externalRuntimeBinding: storedExecution.externalRuntimeBinding,
     terminalReason: readTerminalReason(row.terminal_reason),
     scopeState: readScopeState(row.scope_state),
     scopeBaseline: readScopeBaseline(row.scope_baseline),
@@ -1543,33 +1615,50 @@ function storeResult<T>(operation: string, run: () => T): BetterResult<T, AgentS
 function serializeStoredExecutionState(
   executionContract: ExecutionContract | undefined,
   startReplay: StartReplayBinding | undefined,
+  externalRuntimeBinding?: ExternalRuntimeBinding,
 ): string | null {
-  if (!startReplay) return serializeExecutionContract(executionContract);
+  if (!startReplay && !externalRuntimeBinding) return serializeExecutionContract(executionContract);
   return JSON.stringify({
-    storedExecutionStateVersion: 1,
+    storedExecutionStateVersion: 2,
     executionContract: executionContract ?? null,
     startReplay,
+    externalRuntimeBinding,
   });
 }
 
 function readStoredExecutionState(value: string | null | undefined): {
   executionContract?: ExecutionContract;
   startReplay?: StartReplayBinding;
+  externalRuntimeBinding?: ExternalRuntimeBinding;
 } {
   if (!value) return {};
   try {
     const parsed = JSON.parse(value) as Record<string, unknown>;
-    if (parsed.storedExecutionStateVersion !== 1) {
-      return { executionContract: deserializeExecutionContract(value) };
+    if (parsed.storedExecutionStateVersion === 2) {
+      const replay = parsed.startReplay as Record<string, unknown> | undefined;
+      const startReplay = replay && typeof replay.key === "string" && typeof replay.requestHash === "string"
+        ? { key: replay.key, requestHash: replay.requestHash }
+        : undefined;
+      const executionContract = parsed.executionContract === null
+        ? undefined
+        : deserializeExecutionContract(JSON.stringify(parsed.executionContract));
+      const bindingRaw = parsed.externalRuntimeBinding as Record<string, unknown> | undefined;
+      const externalRuntimeBinding = bindingRaw && typeof bindingRaw.runtimeKind === "string" && bindingRaw.handle && typeof bindingRaw.handle === "object"
+        ? { runtimeKind: bindingRaw.runtimeKind, handle: bindingRaw.handle as Record<string, unknown> }
+        : undefined;
+      return { executionContract, startReplay, externalRuntimeBinding };
     }
-    const replay = parsed.startReplay as Record<string, unknown> | undefined;
-    const startReplay = replay && typeof replay.key === "string" && typeof replay.requestHash === "string"
-      ? { key: replay.key, requestHash: replay.requestHash }
-      : undefined;
-    const executionContract = parsed.executionContract === null
-      ? undefined
-      : deserializeExecutionContract(JSON.stringify(parsed.executionContract));
-    return { executionContract, startReplay };
+    if (parsed.storedExecutionStateVersion === 1) {
+      const replay = parsed.startReplay as Record<string, unknown> | undefined;
+      const startReplay = replay && typeof replay.key === "string" && typeof replay.requestHash === "string"
+        ? { key: replay.key, requestHash: replay.requestHash }
+        : undefined;
+      const executionContract = parsed.executionContract === null
+        ? undefined
+        : deserializeExecutionContract(JSON.stringify(parsed.executionContract));
+      return { executionContract, startReplay };
+    }
+    return { executionContract: deserializeExecutionContract(value) };
   } catch {
     return {};
   }

@@ -17,7 +17,8 @@ export type HerdrEnforcementState =
 export interface HerdrExternalHandle {
   schemaVersion: 1;
   runtimeKind: typeof HERDR_RUNTIME_KIND;
-  herdrServerIdentity: string;
+  herdrSocketPath: string;
+  herdrServerIdentity?: string;
   herdrWorkspaceId: string;
   herdrPaneId: string;
   herdrAgentIdentity: string;
@@ -152,6 +153,14 @@ export function detectBlockedOnboardingDialog(agentKind: HerdrAgentKind, termina
     terminalText.includes("Do you trust the contents of this project?") ||
     terminalText.includes("Do you trust the authors") ||
     terminalText.includes("Allow creation of this file?") ||
+    terminalText.includes("Allow execution of") ||
+    terminalText.includes("Allow file edit") ||
+    terminalText.includes("Do you want to allow") ||
+    terminalText.includes("Permission denied") ||
+    terminalText.includes("permission admission") ||
+    terminalText.includes("Waiting for approval") ||
+    terminalText.includes("Grant permission") ||
+    terminalText.includes("Allow this action?") ||
     terminalText.includes("Welcome to Codex") ||
     terminalText.includes("Sign in with ChatGPT") ||
     terminalText.includes("Sign in with Device Code") ||
@@ -167,9 +176,11 @@ export function detectBlockedOnboardingDialog(agentKind: HerdrAgentKind, termina
 /**
  * In-memory registry of active handles to enforce attemptKey deduplication (N1)
  * and conflicting replay prevention (N2).
+ * Enforces Option A (B4): tracks submitted prompts per attemptKey to reject subsequent prompts.
  */
 export class HerdrGatewayRegistry {
   private handlesByAttemptKey = new Map<string, HerdrExternalHandle>();
+  private submittedPromptAttemptKeys = new Set<string>();
 
   getHandle(attemptKey: string): HerdrExternalHandle | undefined {
     return this.handlesByAttemptKey.get(attemptKey);
@@ -188,13 +199,56 @@ export class HerdrGatewayRegistry {
     this.handlesByAttemptKey.set(handle.attemptKey, handle);
   }
 
+  markPromptSubmitted(attemptKey: string): void {
+    this.submittedPromptAttemptKeys.add(attemptKey);
+  }
+
+  hasPromptSubmitted(attemptKey: string): boolean {
+    return this.submittedPromptAttemptKeys.has(attemptKey);
+  }
+
   releaseHandle(attemptKey: string): void {
     this.handlesByAttemptKey.delete(attemptKey);
+    this.submittedPromptAttemptKeys.delete(attemptKey);
   }
 
   clear(): void {
     this.handlesByAttemptKey.clear();
+    this.submittedPromptAttemptKeys.clear();
   }
+}
+
+export function cleanPorcelainPath(raw: string): string {
+  const trimmed = raw.trim();
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
+    try {
+      return JSON.parse(trimmed) as string;
+    } catch {
+      return trimmed.slice(1, -1);
+    }
+  }
+  return trimmed;
+}
+
+export function parsePorcelainChangedPaths(statusOutput: string): string[] {
+  const paths: string[] = [];
+  for (const line of statusOutput.split("\n")) {
+    const trimmed = line.trimEnd();
+    if (!trimmed || trimmed.length < 3) continue;
+    const payload = trimmed.slice(3).trim();
+    if (!payload) continue;
+    if (payload.includes(" -> ")) {
+      const [src, dst] = payload.split(" -> ");
+      const cleanSrc = cleanPorcelainPath(src);
+      const cleanDst = cleanPorcelainPath(dst);
+      if (cleanSrc) paths.push(cleanSrc);
+      if (cleanDst) paths.push(cleanDst);
+    } else {
+      const clean = cleanPorcelainPath(payload);
+      if (clean) paths.push(clean);
+    }
+  }
+  return paths;
 }
 
 export const defaultHerdrGatewayRegistry = new HerdrGatewayRegistry();
@@ -243,18 +297,12 @@ export class HerdrThinGateway {
       );
     }
 
-    // Dynamic server identity query (A6)
-    let herdrServerIdentity = `unix:${this.socketPath}`;
-    try {
-      const ping = await sendHerdrSocketRequest<{ type: string; version?: string }>(
-        { id: `ping-${Date.now()}`, method: "ping", params: {} },
-        this.socketPath,
-        2000,
-      );
-      if (ping.result?.version) {
-        herdrServerIdentity = `herdr@${ping.result.version}:unix:${this.socketPath}`;
-      }
-    } catch {}
+    // Transport endpoint vs server instance identity (B5)
+    // herdrSocketPath is recorded as transport endpoint.
+    // HerdR 0.9.1 ping returns version/protocol but no server instance UUID;
+    // herdrServerIdentity is classified as undefined / NOT_OBSERVED.
+    const herdrSocketPath = this.socketPath;
+    let herdrServerIdentity: string | undefined = undefined;
 
     // 1. Create HerdR workspace with exact cwd
     const wsLabel = `devspace-${params.attemptKey}`;
@@ -291,14 +339,13 @@ export class HerdrThinGateway {
     }
 
     // 2. Start agent in pane
-    const agentName = `ds-${params.attemptKey}`;
+    const agentName = ("ds-" + params.attemptKey.replace(/[^a-z0-9_-]/gi, "-").toLowerCase()).slice(0, 32);
     const args: string[] = [];
     if (params.agentKind === "opencode") {
       const model = params.requestedModel || "opencode/mimo-v2.6-flash-free";
       args.push("-m", model);
-    } else if (params.agentKind === "agy") {
-      args.push("--dangerously-skip-permissions");
     }
+    // B3: Completely removed --dangerously-skip-permissions for agy.
 
     const agentReq: HerdrSocketRequest = {
       id: `agent-start-${Date.now()}`,
@@ -339,12 +386,16 @@ export class HerdrThinGateway {
     };
     await sendHerdrSocketRequest(waitReq, this.socketPath).catch(() => {});
 
-    // Read terminal visible output to fail closed against onboarding / trust dialogs (A5 / N-TRUST)
-    const terminalOutput = await this.readPane(paneId);
+    // Read terminal visible output to fail closed against onboarding / trust / permission dialogs (A5 / N-TRUST / B3)
+    let terminalOutput = await this.readPane(paneId);
+    if (!terminalOutput.trim()) {
+      await new Promise((r) => setTimeout(r, 1500));
+      terminalOutput = await this.readPane(paneId);
+    }
     if (detectBlockedOnboardingDialog(params.agentKind, terminalOutput)) {
       await this.closeWorkspace(wsId).catch(() => {});
       throw new Error(
-        `[Fail-Closed / N-TRUST] Agent '${params.agentKind}' is stuck at an unauthenticated onboarding/trust/permission dialog`,
+        `[Fail-Closed / N-TRUST] Agent '${params.agentKind}' is stuck at an unauthenticated onboarding/trust/permission dialog: BLOCKED_ON_PERMISSION_ADMISSION`,
       );
     }
 
@@ -352,6 +403,7 @@ export class HerdrThinGateway {
     const handle: HerdrExternalHandle = {
       schemaVersion: 1,
       runtimeKind: HERDR_RUNTIME_KIND,
+      herdrSocketPath,
       herdrServerIdentity,
       herdrWorkspaceId: wsId,
       herdrPaneId: paneId,
@@ -397,13 +449,21 @@ export class HerdrThinGateway {
   /**
    * Submit a prompt to an agent.
    * Enforces N3: timeout or stalled prompt maps to OUTCOME_UNKNOWN; zero duplicate panes.
-   * Enforces N-TURN: rejects prompt if agent is already busy on an unsettled turn.
+   * Enforces Option A (B4): one consequential prompt per attempt; rejects subsequent prompts.
+   * Embeds durable handle.promptNonce into prompt.
    */
   async promptExternalAgent(
     handle: HerdrExternalHandle,
     promptText: string,
     options: HerdrPromptOptions = {},
   ): Promise<HerdrPromptResult> {
+    // Option A (B4): One consequential prompt per attempt. Reject subsequent prompts on same handle.
+    if (this.registry.hasPromptSubmitted(handle.attemptKey)) {
+      throw new Error(
+        `[N-TURN-OPTION-A] attemptKey '${handle.attemptKey}' has already submitted a consequential prompt; subsequent prompts on same handle are rejected.`,
+      );
+    }
+
     // A7: Busy check (N-TURN)
     const agentInfo = await this.getAgent(handle.herdrAgentIdentity);
     if (agentInfo && (agentInfo.agent_status === "running" || agentInfo.agent_status === "prompting" || !agentInfo.interactive_ready)) {
@@ -420,8 +480,11 @@ export class HerdrThinGateway {
       waitOptions.until = options.until;
     }
 
-    // A7: Turn nonce binding
-    const turnNonce = `NEXUS-TURN-${handle.attemptKey}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    // Mark prompt as submitted under Option A
+    this.registry.markPromptSubmitted(handle.attemptKey);
+
+    // B4: Embed durable handle.promptNonce
+    const turnNonce = handle.promptNonce;
     const boundPrompt = `[NEXUS_ATTEMPT_NONCE:${turnNonce}]\n\n${promptText}`;
 
     const req: HerdrSocketRequest = {
@@ -454,10 +517,21 @@ export class HerdrThinGateway {
       }
 
       const statusStr = res.result?.agent?.agent_status;
+      const paneOutput = await this.readPane(handle.herdrPaneId);
+
+      // Check if blocked on permission admission or onboarding dialog (B3)
+      if (detectBlockedOnboardingDialog(handle.herdrAgentKind, paneOutput)) {
+        return {
+          turnNonce,
+          status: "blocked",
+          rawStatus: "BLOCKED_ON_PERMISSION_ADMISSION",
+          paneOutput,
+        };
+      }
+
       const normalizedStatus: "done" | "idle" | "blocked" | "OUTCOME_UNKNOWN" =
         statusStr === "done" ? "done" : statusStr === "idle" ? "idle" : statusStr === "blocked" ? "blocked" : "OUTCOME_UNKNOWN";
 
-      const paneOutput = await this.readPane(handle.herdrPaneId);
       return {
         turnNonce,
         status: normalizedStatus,
@@ -551,7 +625,7 @@ export class HerdrThinGateway {
         }).trim();
         if (diffOut) {
           for (const line of diffOut.split("\n")) {
-            const p = line.trim();
+            const p = cleanPorcelainPath(line.trim());
             if (p) changedPathsSet.add(p);
           }
         }
@@ -560,23 +634,20 @@ export class HerdrThinGateway {
       }
     }
 
-    // Working tree and untracked changes
+    // Working tree and untracked changes (P1, P2, P6, P7, P8)
     try {
-      const rawStatus = execFileSync("git", ["-C", worktree, "status", "--porcelain"], {
-        encoding: "utf-8",
-        stdio: ["ignore", "pipe", "ignore"],
-      });
+      const rawStatus = execFileSync(
+        "git",
+        ["-C", worktree, "status", "--porcelain=v1", "--untracked-files=all"],
+        {
+          encoding: "utf-8",
+          stdio: ["ignore", "pipe", "ignore"],
+        },
+      );
       if (rawStatus) {
-        for (const line of rawStatus.split("\n")) {
-          const trimmed = line.trimEnd();
-          if (!trimmed) continue;
-          const match = trimmed.match(/^.{1,2}\s+(.*)$/);
-          if (match && match[1]) {
-            const rawPath = match[1].includes(" -> ") ? match[1].split(" -> ")[1].trim() : match[1].trim();
-            // Remove quotes if git quoted a filename with special chars
-            const cleanPath = rawPath.replace(/^"(.*)"$/, "$1");
-            if (cleanPath) changedPathsSet.add(cleanPath);
-          }
+        const paths = parsePorcelainChangedPaths(rawStatus);
+        for (const p of paths) {
+          changedPathsSet.add(p);
         }
       }
     } catch {
@@ -676,6 +747,10 @@ export class HerdrThinGateway {
     }
 
     if (executionState === "BLOCKED") {
+      const reason =
+        lastPromptResult?.rawStatus === "BLOCKED_ON_PERMISSION_ADMISSION"
+          ? "Agent is blocked on interaction or onboarding: BLOCKED_ON_PERMISSION_ADMISSION."
+          : "Agent is blocked on interaction or onboarding.";
       return {
         settled: false,
         completionStatus: "NOT_COMPLETE",
@@ -685,7 +760,7 @@ export class HerdrThinGateway {
         unexpectedPaths,
         gitHeadAfter,
         enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
-        reason: "Agent is blocked on interaction or onboarding.",
+        reason,
       };
     }
 

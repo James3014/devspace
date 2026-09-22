@@ -6,7 +6,7 @@ import test, { after } from "node:test";
 import { LocalAgentSessionManager, AgentSessionError, getWorkerProcessOwnership } from "./local-agent-sessions.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
-import { type HerdrExternalHandle, defaultHerdrGatewayRegistry } from "./local-agent-herdr.js";
+import { type HerdrExternalHandle, HerdrThinGateway, defaultHerdrGatewayRegistry } from "./local-agent-herdr.js";
 
 const originalAgyCommand = process.env.AGY_COMMAND;
 process.env.AGY_COMMAND = process.execPath;
@@ -1003,7 +1003,7 @@ test("LocalAgentSessionManager - binds and retrieves HerdrExternalHandle for dur
     const handle: HerdrExternalHandle = {
       schemaVersion: 1,
       runtimeKind: "HERDR",
-      herdrServerIdentity: "herdr@0.9.1:unix:/Users/james/.config/herdr/herdr.sock",
+      herdrSocketPath: "/Users/james/.config/herdr/herdr.sock",
       herdrWorkspaceId: "w_test_1",
       herdrPaneId: "w_test_1:p1",
       herdrAgentIdentity: "ds-attempt-herdr-1",
@@ -1081,7 +1081,7 @@ test("LocalAgentSessionManager - persists HerdrExternalHandle across restart and
     const handle: HerdrExternalHandle = {
       schemaVersion: 1,
       runtimeKind: "HERDR",
-      herdrServerIdentity: "herdr@0.9.1:unix:/Users/james/.config/herdr/herdr.sock",
+      herdrSocketPath: "/Users/james/.config/herdr/herdr.sock",
       herdrWorkspaceId: "w_restart_1",
       herdrPaneId: "w_restart_1:p1",
       herdrAgentIdentity: "ds-attempt-restart-1",
@@ -1096,7 +1096,7 @@ test("LocalAgentSessionManager - persists HerdrExternalHandle across restart and
       enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
     };
 
-    // Bind handle in manager 1 (persists to SQLite provider_session_id)
+    // Bind handle in manager 1 (persists to SQLite execution_contract via store CAS)
     manager1.bindHerdrExternalHandle(startRes1.agentId, handle);
     assert.deepEqual(manager1.getHerdrExternalHandle("attempt-restart-1"), handle);
 
@@ -1107,6 +1107,19 @@ test("LocalAgentSessionManager - persists HerdrExternalHandle across restart and
       async (agentId, promptFile, workerToken) => { spawnedWorkers2.push({ agentId }); },
       async () => true,
     );
+
+    // Instrument spy gateway on manager2 to assert zero HerdR creation calls on replay (N1-R)
+    class SpyHerdrGateway extends HerdrThinGateway {
+      workspaceCreateCount = 0;
+      agentStartCount = 0;
+      override async startExternalAgent(params: any): Promise<any> {
+        this.workspaceCreateCount++;
+        this.agentStartCount++;
+        return super.startExternalAgent(params);
+      }
+    }
+    const spyGateway = new SpyHerdrGateway();
+    (manager2 as any).herdrGateway = spyGateway;
 
     // N1-R: Manager2 resolves durable handle from store despite empty in-memory map
     const recoveredHandle = manager2.getHerdrExternalHandle("attempt-restart-1");
@@ -1128,6 +1141,16 @@ test("LocalAgentSessionManager - persists HerdrExternalHandle across restart and
     assert.deepEqual(replayRes.herdrHandle, handle);
     assert.equal(spawnedWorkers2.length, 0);
 
+    // N1-R: HerdR gateway was NOT called on replay
+    assert.equal(spyGateway.workspaceCreateCount, 0);
+    assert.equal(spyGateway.agentStartCount, 0);
+
+    // B1: Verify providerSessionId was not contaminated and remains undefined
+    const recordInStore = manager2.getRecordByPrefixOrId(startRes1.agentId);
+    assert.equal(recordInStore?.providerSessionId, undefined);
+    assert.ok(recordInStore?.externalRuntimeBinding);
+    assert.equal(recordInStore?.externalRuntimeBinding?.runtimeKind, "HERDR");
+
     // Replay with conflicting prompt fails closed
     await assert.rejects(
       manager2.startAgent({
@@ -1140,6 +1163,8 @@ test("LocalAgentSessionManager - persists HerdrExternalHandle across restart and
       }),
       (err: any) => err instanceof AgentSessionError && err.code === "ATTEMPT_REPLAY_CONFLICT",
     );
+    assert.equal(spyGateway.workspaceCreateCount, 0);
+    assert.equal(spyGateway.agentStartCount, 0);
   } finally {
     defaultHerdrGatewayRegistry.releaseHandle("attempt-restart-1");
     rmSync(stateDir, { recursive: true, force: true });
@@ -1169,7 +1194,7 @@ test("LocalAgentSessionManager - rejects conflicting replay and enforcement stat
     const mismatchedHandle: HerdrExternalHandle = {
       schemaVersion: 1,
       runtimeKind: "HERDR",
-      herdrServerIdentity: "herdr@0.9.1:unix:/Users/james/.config/herdr/herdr.sock",
+      herdrSocketPath: "/Users/james/.config/herdr/herdr.sock",
       herdrWorkspaceId: "w_test_2",
       herdrPaneId: "w_test_2:p1",
       herdrAgentIdentity: "ds-attempt-other",

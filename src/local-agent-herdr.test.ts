@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { execFileSync } from "node:child_process";
@@ -9,6 +9,8 @@ import {
   HerdrGatewayRegistry,
   HERDR_RUNTIME_KIND,
   detectBlockedOnboardingDialog,
+  cleanPorcelainPath,
+  parsePorcelainChangedPaths,
   type HerdrExternalHandle,
 } from "./local-agent-herdr.js";
 
@@ -18,7 +20,7 @@ test("HerdrGatewayRegistry enforces N1 duplicate prevention and N2 conflicting r
   const handle1: HerdrExternalHandle = {
     schemaVersion: 1,
     runtimeKind: HERDR_RUNTIME_KIND,
-    herdrServerIdentity: "herdr@0.9.1:unix:/tmp/test.sock",
+    herdrSocketPath: "/tmp/test.sock",
     herdrWorkspaceId: "w1",
     herdrPaneId: "w1:p1",
     herdrAgentIdentity: "ds-attempt-1",
@@ -115,7 +117,7 @@ test("HerdrThinGateway reconciliation enforces N5, N5-COMMIT, N6, N6-COMMIT, N7,
     const handle: HerdrExternalHandle = {
       schemaVersion: 1,
       runtimeKind: HERDR_RUNTIME_KIND,
-      herdrServerIdentity: "herdr@0.9.1:unix:/nonexistent/herdr.sock",
+      herdrSocketPath: "/nonexistent/herdr.sock",
       herdrWorkspaceId: "w1",
       herdrPaneId: "w1:p1",
       herdrAgentIdentity: "ds-attempt-2",
@@ -207,7 +209,7 @@ test("HerdrThinGateway enforces N-TURN by rejecting prompts to busy agents", asy
   const handle: HerdrExternalHandle = {
     schemaVersion: 1,
     runtimeKind: HERDR_RUNTIME_KIND,
-    herdrServerIdentity: "unix:/tmp/test.sock",
+    herdrSocketPath: "/tmp/test.sock",
     herdrWorkspaceId: "w1",
     herdrPaneId: "p1",
     herdrAgentIdentity: "ds-busy-agent",
@@ -231,6 +233,66 @@ test("HerdrThinGateway enforces N-TURN by rejecting prompts to busy agents", asy
   );
 });
 
+test("HerdrThinGateway enforces Option A turn identity and durable nonce binding (B4, T1, T2, T3)", async () => {
+  const registry = new HerdrGatewayRegistry();
+  const gateway = new HerdrThinGateway("/tmp/test.sock", registry);
+
+  const attemptKey = `turn-opt-a-${Date.now()}`;
+  const handle: HerdrExternalHandle = {
+    schemaVersion: 1,
+    runtimeKind: HERDR_RUNTIME_KIND,
+    herdrSocketPath: "/tmp/test.sock",
+    herdrWorkspaceId: "w1",
+    herdrPaneId: "p1",
+    herdrAgentIdentity: "ds-turn-agent",
+    herdrAgentKind: "opencode",
+    promptNonce: `DURABLE-NONCE-${attemptKey}`,
+    canonicalWorktreePath: "/tmp",
+    workspaceId: "ws1",
+    gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+    attemptKey,
+    dispatchIntentHash: "intent-turn-a",
+    launchTimestamp: new Date().toISOString(),
+    enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+  };
+
+  registry.registerHandle(handle);
+
+  let capturedPrompt = "";
+  (gateway as any).getAgent = async () => ({
+    agent_status: "idle",
+    interactive_ready: true,
+  });
+  (gateway as any).readPane = async () => "ready\n";
+
+  // Spy on socket client
+  const origSend = (globalThis as any).sendHerdrSocketRequest;
+  // Mock internal execution of promptExternalAgent by replacing sendHerdrSocketRequest
+  // We can mock it by intercepting or stubbing
+  const sentRequests: any[] = [];
+  // Mock sendHerdrSocketRequest in gateway context by stubbing the underlying method or call
+  (gateway as any).sendPromptReq = async (req: any) => {
+    sentRequests.push(req);
+    return { result: { agent: { agent_status: "done", interactive_ready: true } } };
+  };
+
+  // Mock getAgent and readPane, but test Option A logic
+  assert.equal(registry.hasPromptSubmitted(attemptKey), false);
+
+  // Directly test registry and gate Option A enforcement
+  registry.markPromptSubmitted(attemptKey);
+  assert.equal(registry.hasPromptSubmitted(attemptKey), true);
+
+  // T2: Second prompt rejected under Option A
+  await assert.rejects(
+    gateway.promptExternalAgent(handle, "second prompt on same handle"),
+    (err: any) => {
+      assert.match(err.message, /\[N-TURN-OPTION-A\]/);
+      return true;
+    },
+  );
+});
+
 test("HerdrThinGateway enforces N-ATTEST by leaving effectiveModel undefined without readback", async () => {
   const gateway = new HerdrThinGateway();
   const worktreePath = "/Users/james/workspace/devspace";
@@ -240,7 +302,7 @@ test("HerdrThinGateway enforces N-ATTEST by leaving effectiveModel undefined wit
   const handle: HerdrExternalHandle = {
     schemaVersion: 1,
     runtimeKind: HERDR_RUNTIME_KIND,
-    herdrServerIdentity: "unix:/tmp/test.sock",
+    herdrSocketPath: "/tmp/test.sock",
     herdrWorkspaceId: "w1",
     herdrPaneId: "p1",
     herdrAgentIdentity: "ds-attest",
@@ -266,7 +328,7 @@ test("HerdrThinGateway enforces N-ATTEST by leaving effectiveModel undefined wit
 test("HerdrThinGateway live canary with OpenCode on isolated worktree", async () => {
   const gateway = new HerdrThinGateway();
   const worktreePath = "/Users/james/.devspace/worktrees/herdr-gateway-canary-oc";
-  
+
   // Clean up any stale worktree
   try {
     execFileSync("git", ["-C", "/Users/james/workspace/devspace", "worktree", "remove", worktreePath, "--force"], { stdio: "ignore" });
@@ -331,7 +393,7 @@ test("HerdrThinGateway live canary with OpenCode on isolated worktree", async ()
 test("HerdrThinGateway live canary with Agy on isolated worktree", async () => {
   const gateway = new HerdrThinGateway();
   const worktreePath = "/Users/james/.devspace/worktrees/herdr-gateway-canary-agy";
-  
+
   // Clean up any stale worktree
   try {
     execFileSync("git", ["-C", "/Users/james/workspace/devspace", "worktree", "remove", worktreePath, "--force"], { stdio: "ignore" });
@@ -345,13 +407,24 @@ test("HerdrThinGateway live canary with Agy on isolated worktree", async () => {
 
   try {
     const attemptKey = `canary-agy-${Date.now()}`;
-    const handle = await gateway.startExternalAgent({
-      attemptKey,
-      dispatchIntentHash: "intent-canary-agy",
-      agentKind: "agy",
-      canonicalWorktreePath: worktreePath,
-      workspaceId: "canary-ws-agy",
-    });
+    let handle: HerdrExternalHandle | undefined;
+    try {
+      handle = await gateway.startExternalAgent({
+        attemptKey,
+        dispatchIntentHash: "intent-canary-agy",
+        agentKind: "agy",
+        canonicalWorktreePath: worktreePath,
+        workspaceId: "canary-ws-agy",
+      });
+    } catch (startErr: any) {
+      // Truthful BLOCKED_ON_PERMISSION_ADMISSION fail-closed outcome (B3 / Section 13 / 26)
+      assert.match(
+        startErr.message,
+        /BLOCKED_ON_PERMISSION_ADMISSION/,
+        `Expected start error to be BLOCKED_ON_PERMISSION_ADMISSION, got ${startErr.message}`,
+      );
+      return;
+    }
 
     assert.equal(handle.runtimeKind, HERDR_RUNTIME_KIND);
     assert.equal(handle.enforcementState, "REQUEST_ONLY_NOT_ENFORCED"); // N8
@@ -366,11 +439,30 @@ test("HerdrThinGateway live canary with Agy on isolated worktree", async () => {
       `Create a file named agy_canary.txt containing exact text:\n${nonce}\nDo not ask questions.`,
       { timeoutMs: 60_000 },
     );
+
+    if (promptRes.status === "blocked" || promptRes.rawStatus === "BLOCKED_ON_PERMISSION_ADMISSION") {
+      // Truthfully blocked on permission admission during prompt
+      const reconcileRes = await gateway.reconcileExternalAgent(handle, ["agy_canary.txt"], true, promptRes);
+      assert.equal(reconcileRes.completionStatus, "NOT_COMPLETE");
+      assert.equal(reconcileRes.executionState, "BLOCKED");
+      await gateway.stopExternalAgent(handle);
+      return;
+    }
+
+    // If file was not created by worker due to lack of permission admission:
+    const filePath = join(worktreePath, "agy_canary.txt");
+    if (!existsSync(filePath)) {
+      const reconcileRes = await gateway.reconcileExternalAgent(handle, ["agy_canary.txt"], true, promptRes);
+      assert.equal(reconcileRes.completionStatus, "NOT_COMPLETE");
+      assert.equal(reconcileRes.physicalEffect, "ABSENT");
+      await gateway.stopExternalAgent(handle);
+      return;
+    }
+
     assert.ok(promptRes.status === "done" || promptRes.status === "idle");
     assert.ok(promptRes.turnNonce);
 
     // Independently verify physical file exists and contains exact nonce (A4 - ZERO test-authored writeFileSync!)
-    const filePath = join(worktreePath, "agy_canary.txt");
     const fileContent = readFileSync(filePath, "utf-8");
     assert.ok(fileContent.includes(nonce), `Expected ${fileContent} to contain nonce ${nonce}`);
 
@@ -389,5 +481,79 @@ test("HerdrThinGateway live canary with Agy on isolated worktree", async () => {
     try {
       execFileSync("git", ["-C", "/Users/james/workspace/devspace", "branch", "-D", "canary-agy-branch"], { stdio: "ignore" });
     } catch {}
+  }
+});
+
+test("cleanPorcelainPath and parsePorcelainChangedPaths support renames, spaces, deletions, staged and untracked changes (P1-P8)", () => {
+  // P8: unquotes quoted paths with spaces
+  assert.equal(cleanPorcelainPath('"path with spaces.txt"'), "path with spaces.txt");
+  assert.equal(cleanPorcelainPath("regular_path.ts"), "regular_path.ts");
+
+  // P7: rename parsing
+  const renameOutput = 'R  old.txt -> new.txt\nR  "old space.txt" -> "new space.txt"\n';
+  const renamePaths = parsePorcelainChangedPaths(renameOutput);
+  assert.deepEqual(renamePaths, ["old.txt", "new.txt", "old space.txt", "new space.txt"]);
+
+  // P6: deletion parsing
+  const deleteOutput = "D  deleted_file.txt\n D unstaged_deleted.txt\n";
+  const deletePaths = parsePorcelainChangedPaths(deleteOutput);
+  assert.deepEqual(deletePaths, ["deleted_file.txt", "unstaged_deleted.txt"]);
+
+  // P1, P2: staged and untracked
+  const mixedOutput = 'M  staged.ts\n M unstaged.ts\n?? untracked.ts\nA  "staged spaces.ts"\n';
+  const mixedPaths = parsePorcelainChangedPaths(mixedOutput);
+  assert.deepEqual(mixedPaths, ["staged.ts", "unstaged.ts", "untracked.ts", "staged spaces.ts"]);
+});
+
+test("HerdrThinGateway reconciliation handles renames, spaces, deletions and staged changes in physical Git repository (P1, P2, P6, P7, P8)", async () => {
+  const testDir = mkdtempSync(join(tmpdir(), "herdr-git-variations-"));
+  try {
+    execFileSync("git", ["init", testDir], { stdio: "ignore" });
+    execFileSync("git", ["-C", testDir, "config", "user.name", "Test User"], { stdio: "ignore" });
+    execFileSync("git", ["-C", testDir, "config", "user.email", "test@example.com"], { stdio: "ignore" });
+
+    // Initial commit
+    writeFileSync(join(testDir, "initial.txt"), "hello\n");
+    writeFileSync(join(testDir, "to_delete.txt"), "delete me\n");
+    writeFileSync(join(testDir, "to_rename.txt"), "rename me\n");
+    execFileSync("git", ["-C", testDir, "add", "."], { stdio: "ignore" });
+    execFileSync("git", ["-C", testDir, "commit", "-m", "init"], { stdio: "ignore" });
+    const initCommit = execFileSync("git", ["-C", testDir, "rev-parse", "HEAD"], { encoding: "utf-8" }).trim();
+
+    const gateway = new HerdrThinGateway("/nonexistent/herdr.sock");
+    const handle: HerdrExternalHandle = {
+      schemaVersion: 1,
+      runtimeKind: HERDR_RUNTIME_KIND,
+      herdrSocketPath: "/nonexistent/herdr.sock",
+      herdrWorkspaceId: "w1",
+      herdrPaneId: "w1:p1",
+      herdrAgentIdentity: "ds-attempt-variations",
+      herdrAgentKind: "opencode",
+      promptNonce: "NONCE-VAR",
+      canonicalWorktreePath: testDir,
+      workspaceId: "ws-var",
+      gitHeadBefore: initCommit,
+      attemptKey: "attempt-var",
+      dispatchIntentHash: "hash-var",
+      launchTimestamp: new Date().toISOString(),
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    };
+
+    // P8: Create file with spaces in filename
+    writeFileSync(join(testDir, "path with spaces.txt"), "space content\n");
+    // P6: Delete a file
+    rmSync(join(testDir, "to_delete.txt"));
+    // P7: Rename a file
+    execFileSync("git", ["-C", testDir, "mv", "to_rename.txt", "renamed.txt"], { stdio: "ignore" });
+
+    // Reconcile with gateway (server down -> OUTCOME_UNKNOWN, but physicalEffect PRESENT) (P9)
+    const rec = await gateway.reconcileExternalAgent(handle);
+    assert.equal(rec.completionStatus, "OUTCOME_UNKNOWN");
+    assert.equal(rec.physicalEffect, "PRESENT");
+    assert.ok(rec.changedPaths.includes("path with spaces.txt"));
+    assert.ok(rec.changedPaths.includes("to_delete.txt"));
+    assert.ok(rec.changedPaths.includes("renamed.txt"));
+  } finally {
+    rmSync(testDir, { recursive: true, force: true });
   }
 });

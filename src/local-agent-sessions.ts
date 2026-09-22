@@ -552,7 +552,8 @@ export class LocalAgentSessionManager {
    * Bind an immutable HerdrExternalHandle to an active agent record.
    * Enforces N1 (duplicate prevention), N2 (conflicting replay prevention),
    * and N8 (REQUEST_ONLY_NOT_ENFORCED).
-   * Enforces A1 (durable handle persistence across DevSpace / manager restarts).
+   * Enforces B1 (provider_session_id remains native provider identity)
+   * and B2 (first-class store CAS persistence without private DB bypass).
    */
   bindHerdrExternalHandle(agentId: string, handle: HerdrExternalHandle): void {
     const record = this.store.getById(agentId);
@@ -572,15 +573,23 @@ export class LocalAgentSessionManager {
       );
     }
 
-    // A1: Persist durable handle into existing database column provider_session_id
-    try {
-      const db = (this.store as any).database?.sqlite;
-      if (db) {
-        db.prepare(
-          "update local_agent_sessions set provider_session_id = ?, updated_at = ? where id = ?",
-        ).run(JSON.stringify(handle), new Date().toISOString(), agentId);
-      }
-    } catch {}
+    // B1 / B2: Durable persistence via store CAS. Fail closed if CAS fails.
+    const cas = this.store.bindExternalRuntimeBindingCAS({
+      agentId,
+      expectedAttemptKey: handle.attemptKey,
+      expectedDispatchIntentHash: handle.dispatchIntentHash,
+      binding: {
+        runtimeKind: HERDR_RUNTIME_KIND,
+        handle: handle as unknown as Record<string, unknown>,
+      },
+    });
+
+    if (!cas.applied) {
+      throw new AgentSessionError(
+        "ATTEMPT_REPLAY_CONFLICT",
+        `Failed to bind external runtime handle to agent ${agentId} due to durable CAS mismatch.`,
+      );
+    }
 
     defaultHerdrGatewayRegistry.registerHandle(handle);
     this.herdrHandles.set(agentId, handle);
@@ -589,27 +598,25 @@ export class LocalAgentSessionManager {
 
   /**
    * Retrieve a bound HerdrExternalHandle by agentId or attemptKey.
-   * Enforces A1 / N1-R: re-hydrates from durable store record if absent in memory.
+   * Enforces B1 / B2: re-hydrates from durable store record externalRuntimeBinding if absent in memory.
    */
   getHerdrExternalHandle(agentIdOrAttemptKey: string): HerdrExternalHandle | undefined {
     // 1. Check in-memory map
     const inMem = this.herdrHandles.get(agentIdOrAttemptKey);
     if (inMem) return inMem;
 
-    // 2. Recover from durable store record if possible (A1 / N1-R)
-    const parseHandle = (raw: string | undefined): HerdrExternalHandle | undefined => {
-      if (!raw) return undefined;
-      try {
-        const parsed = JSON.parse(raw);
-        if (parsed && parsed.runtimeKind === HERDR_RUNTIME_KIND && parsed.attemptKey) {
-          return parsed as HerdrExternalHandle;
-        }
-      } catch {}
+    // 2. Recover from durable store record externalRuntimeBinding
+    const extractHerdrHandle = (rec: LocalAgentRecord | undefined): HerdrExternalHandle | undefined => {
+      if (!rec?.externalRuntimeBinding) return undefined;
+      const { runtimeKind, handle } = rec.externalRuntimeBinding;
+      if (runtimeKind === HERDR_RUNTIME_KIND && handle && typeof handle === "object" && handle.attemptKey) {
+        return handle as unknown as HerdrExternalHandle;
+      }
       return undefined;
     };
 
     let rec = this.store.getById(agentIdOrAttemptKey);
-    let handle = parseHandle(rec?.providerSessionId);
+    let handle = extractHerdrHandle(rec);
 
     if (!handle) {
       const records = this.store.list();
@@ -618,7 +625,7 @@ export class LocalAgentSessionManager {
       );
       if (match) {
         rec = match;
-        handle = parseHandle(match.providerSessionId);
+        handle = extractHerdrHandle(match);
       }
     }
 
