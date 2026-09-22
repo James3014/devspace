@@ -6,6 +6,7 @@ import test, { after } from "node:test";
 import { LocalAgentSessionManager, AgentSessionError, getWorkerProcessOwnership } from "./local-agent-sessions.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
+import { type HerdrExternalHandle, defaultHerdrGatewayRegistry } from "./local-agent-herdr.js";
 
 const originalAgyCommand = process.env.AGY_COMMAND;
 process.env.AGY_COMMAND = process.execPath;
@@ -982,5 +983,133 @@ test("runWorkerTurnFromFile persists typed AgentProviderFailureError details", a
     assert.equal(manager.countAllAgentRecords(), 1);
   } finally {
     clean();
+  }
+});
+
+test("LocalAgentSessionManager - binds and retrieves HerdrExternalHandle for durable attempt records", async () => {
+  const { manager, clean } = setupFixture();
+  const projectRoot = mkdtempSync(join(tmpdir(), "devspace-herdr-session-test-"));
+
+  try {
+    const store = (manager as any).store;
+    const record = store.create({
+      workspaceId: "ws_herdr_test",
+      workspaceRoot: projectRoot,
+      profileName: "opencode-test",
+      provider: "opencode",
+      lifecycleKind: "detached_worker_v2",
+    });
+
+    const handle: HerdrExternalHandle = {
+      schemaVersion: 1,
+      runtimeKind: "HERDR",
+      herdrServerIdentity: "herdr@0.9.1:unix:/Users/james/.config/herdr/herdr.sock",
+      herdrWorkspaceId: "w_test_1",
+      herdrPaneId: "w_test_1:p1",
+      herdrAgentIdentity: "ds-attempt-herdr-1",
+      herdrAgentKind: "opencode",
+      effectiveModel: "opencode/mimo-v2.6-flash-free",
+      launchGeneration: 1,
+      promptNonce: "HERDR-DISPATCH-1",
+      canonicalWorktreePath: projectRoot,
+      workspaceId: "ws_herdr_test",
+      gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+      attemptKey: "attempt-herdr-1",
+      dispatchIntentHash: "intent-hash-herdr-1",
+      launchTimestamp: new Date().toISOString(),
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    };
+
+    // Bind handle to agent session
+    manager.bindHerdrExternalHandle(record.id, handle);
+
+    // Retrieve by agentId and attemptKey
+    assert.deepEqual(manager.getHerdrExternalHandle(record.id), handle);
+    assert.deepEqual(manager.getHerdrExternalHandle("attempt-herdr-1"), handle);
+
+    // Status includes herdrHandle
+    const status = await manager.getAgentStatus({
+      workspaceId: "ws_herdr_test",
+      workspaceRoot: projectRoot,
+      agentId: record.id,
+    });
+    assert.deepEqual(status.herdrHandle, handle);
+
+    // Reconcile includes herdrHandle
+    const reconcile = await manager.reconcileAgent({
+      workspaceId: "ws_herdr_test",
+      workspaceRoot: projectRoot,
+      isolated: false,
+      agentId: record.id,
+    });
+    assert.deepEqual(reconcile.herdrHandle, handle);
+    assert.equal(reconcile.herdrHandle?.enforcementState, "REQUEST_ONLY_NOT_ENFORCED"); // N8
+  } finally {
+    defaultHerdrGatewayRegistry.releaseHandle("attempt-herdr-1");
+    clean();
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("LocalAgentSessionManager - rejects conflicting replay and enforcement state violations for HerdrExternalHandle", async () => {
+  const { manager, clean } = setupFixture();
+  const projectRoot = mkdtempSync(join(tmpdir(), "devspace-herdr-conflict-test-"));
+
+  try {
+    const store = (manager as any).store;
+    const record = store.create({
+      workspaceId: "ws_conflict_test",
+      workspaceRoot: projectRoot,
+      profileName: "agy-test",
+      provider: "agy",
+      lifecycleKind: "detached_worker_v2",
+      startReplay: {
+        key: "bound-attempt-key",
+        requestHash: "req-hash-1",
+      },
+    });
+
+    // Mismatched attemptKey against record's startReplay key
+    const mismatchedHandle: HerdrExternalHandle = {
+      schemaVersion: 1,
+      runtimeKind: "HERDR",
+      herdrServerIdentity: "herdr@0.9.1:unix:/Users/james/.config/herdr/herdr.sock",
+      herdrWorkspaceId: "w_test_2",
+      herdrPaneId: "w_test_2:p1",
+      herdrAgentIdentity: "ds-attempt-other",
+      herdrAgentKind: "agy",
+      effectiveModel: "gemini-3.8-flash-high",
+      launchGeneration: 1,
+      promptNonce: "HERDR-DISPATCH-2",
+      canonicalWorktreePath: projectRoot,
+      workspaceId: "ws_conflict_test",
+      gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+      attemptKey: "different-attempt-key",
+      dispatchIntentHash: "intent-hash-other",
+      launchTimestamp: new Date().toISOString(),
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    };
+
+    assert.throws(
+      () => manager.bindHerdrExternalHandle(record.id, mismatchedHandle),
+      (err: any) => err instanceof AgentSessionError && err.code === "ATTEMPT_REPLAY_CONFLICT",
+    );
+
+    // Illegal PHYSICALLY_ENFORCED claim (N8 violation) fails closed
+    const illegalEnforcementHandle: HerdrExternalHandle = {
+      ...mismatchedHandle,
+      attemptKey: "bound-attempt-key",
+      enforcementState: "PHYSICALLY_ENFORCED" as any,
+    };
+
+    assert.throws(
+      () => manager.bindHerdrExternalHandle(record.id, illegalEnforcementHandle),
+      (err: any) => err instanceof AgentSessionError && err.code === "INVALID_EXECUTION_CONTRACT",
+    );
+  } finally {
+    defaultHerdrGatewayRegistry.releaseHandle("bound-attempt-key");
+    defaultHerdrGatewayRegistry.releaseHandle("different-attempt-key");
+    clean();
+    rmSync(projectRoot, { recursive: true, force: true });
   }
 });

@@ -85,6 +85,11 @@ import {
   readWorkspaceHead,
   type WorkerAttribution,
 } from "./workspace-reconciliation.js";
+import {
+  type HerdrExternalHandle,
+  HerdrThinGateway,
+  defaultHerdrGatewayRegistry,
+} from "./local-agent-herdr.js";
 
 function catalogSnapshotIsFresh(fetchedAt: string | undefined, expiresAt: string | undefined): boolean {
   const fetched = Date.parse(fetchedAt ?? "");
@@ -266,6 +271,7 @@ export interface AgentStatusOutput {
     blocked?: boolean;
     reason?: string;
   };
+  herdrHandle?: HerdrExternalHandle;
 }
 
 export interface ReconcileAgentInput {
@@ -277,6 +283,7 @@ export interface ReconcileAgentInput {
 
 export interface ReconcileAgentOutput {
   agentId: string;
+  herdrHandle?: HerdrExternalHandle;
   dispatch?: DispatchContractOutput;
   agentState: LocalAgentStatus;
   providerState?: string;
@@ -427,6 +434,7 @@ export interface StartAgentOutput {
   createdAt: string;
   updatedAt: string;
   executionIdlePolicy?: EffectiveExecutionIdlePolicy;
+  herdrHandle?: HerdrExternalHandle;
 }
 
 export interface ContinueAgentOutput extends StartAgentOutput {
@@ -497,6 +505,8 @@ export class LocalAgentSessionManager {
   private readonly clineCatalogService?: ClineCatalogService;
   private readonly opencodeCatalogSource: ReturnType<typeof createMcpOpencodeCatalogSource>;
   private readonly ownsOpencodeCatalogSource: boolean;
+  private readonly herdrGateway: HerdrThinGateway;
+  private readonly herdrHandles = new Map<string, HerdrExternalHandle>();
   private closed = false;
   private readonly terminationAttempts = new Map<string, Promise<boolean>>();
 
@@ -509,6 +519,7 @@ export class LocalAgentSessionManager {
     nexusGrantResolver?: NexusGrantResolver,
     clineCatalogService?: ClineCatalogService,
     opencodeCatalogSource?: ReturnType<typeof createMcpOpencodeCatalogSource>,
+    herdrGateway?: HerdrThinGateway,
   ) {
     this.store = createLocalAgentStore(config.stateDir);
     this.launcher = testLauncher ?? defaultWorkerLauncher;
@@ -518,6 +529,7 @@ export class LocalAgentSessionManager {
     this.clineCatalogService = clineCatalogService ?? new ClineCatalogServiceImpl();
     this.opencodeCatalogSource = opencodeCatalogSource ?? createMcpOpencodeCatalogSource();
     this.ownsOpencodeCatalogSource = opencodeCatalogSource === undefined;
+    this.herdrGateway = herdrGateway ?? new HerdrThinGateway();
     this.runtimeBuildIdentity = runtimeBuildIdentity ?? describeRuntimeBuildIdentity({
       env: process.env,
       listenPort: config.port,
@@ -533,6 +545,40 @@ export class LocalAgentSessionManager {
     this.closed = true;
     this.store.close();
     if (this.ownsOpencodeCatalogSource) this.opencodeCatalogSource.close();
+  }
+
+  /**
+   * Bind an immutable HerdrExternalHandle to an active agent record.
+   * Enforces N1 (duplicate prevention), N2 (conflicting replay prevention),
+   * and N8 (REQUEST_ONLY_NOT_ENFORCED).
+   */
+  bindHerdrExternalHandle(agentId: string, handle: HerdrExternalHandle): void {
+    const record = this.store.getById(agentId);
+    if (!record) {
+      throw new AgentSessionError("UNKNOWN_AGENT", `Unknown agent id: ${agentId}`);
+    }
+    if (record.startReplay?.key && record.startReplay.key !== handle.attemptKey) {
+      throw new AgentSessionError(
+        "ATTEMPT_REPLAY_CONFLICT",
+        `Cannot bind handle with attemptKey '${handle.attemptKey}' to agent ${agentId} bound to attemptKey '${record.startReplay.key}'`,
+      );
+    }
+    if ((handle.enforcementState as string) === "PHYSICALLY_ENFORCED") {
+      throw new AgentSessionError(
+        "INVALID_EXECUTION_CONTRACT",
+        `HerdR runtime handle cannot claim PHYSICALLY_ENFORCED; enforcement state must be REQUEST_ONLY_NOT_ENFORCED`,
+      );
+    }
+    defaultHerdrGatewayRegistry.registerHandle(handle);
+    this.herdrHandles.set(agentId, handle);
+    this.herdrHandles.set(handle.attemptKey, handle);
+  }
+
+  /**
+   * Retrieve a bound HerdrExternalHandle by agentId or attemptKey.
+   */
+  getHerdrExternalHandle(agentIdOrAttemptKey: string): HerdrExternalHandle | undefined {
+    return this.herdrHandles.get(agentIdOrAttemptKey);
   }
 
   /**
@@ -582,7 +628,10 @@ export class LocalAgentSessionManager {
     if (replayBinding) {
       try {
         const replay = this.store.resolveStartReplay(workspaceRoot, replayBinding);
-        if (replay) return recordToStartOutput(replay);
+        if (replay) {
+          const herdrHandle = attemptKey ? this.getHerdrExternalHandle(attemptKey) : this.getHerdrExternalHandle(replay.id);
+          return recordToStartOutput(replay, herdrHandle);
+        }
       } catch (error) {
         if (error instanceof LocalAgentReplayConflictError) {
           throw new AgentSessionError(
@@ -735,7 +784,8 @@ export class LocalAgentSessionManager {
     }
 
     if (created) await this.launchPrompt(record.id, bindDispatchIntentToPrompt(record.executionContract?.dispatchIntent, prompt));
-    return recordToStartOutput(this.store.getById(record.id) ?? record);
+    const herdrHandle = attemptKey ? this.getHerdrExternalHandle(attemptKey) : this.getHerdrExternalHandle(record.id);
+    return recordToStartOutput(this.store.getById(record.id) ?? record, herdrHandle);
   }
 
   private async assertExecutionAuthority(profileName: string, contract: ExecutionContract | undefined): Promise<AuthorityValidationEvidence> {
@@ -1066,7 +1116,8 @@ export class LocalAgentSessionManager {
       }
     }
 
-    return recordToStatusOutput(record, await this.buildLifecycleEvidence(record));
+    const herdrHandle = this.getHerdrExternalHandle(agentId) ?? (record.startReplay?.key ? this.getHerdrExternalHandle(record.startReplay.key) : undefined);
+    return recordToStatusOutput(record, await this.buildLifecycleEvidence(record), herdrHandle);
   }
 
   async cancelAgent(input: CancelAgentInput): Promise<AgentStatusOutput> {
@@ -1081,6 +1132,8 @@ export class LocalAgentSessionManager {
         `Agent ${agentId} belongs to workspace root '${record.workspaceRoot}', not '${workspaceRoot}'`,
       );
     }
+
+    const herdrHandle = this.getHerdrExternalHandle(agentId) ?? (record.startReplay?.key ? this.getHerdrExternalHandle(record.startReplay.key) : undefined);
 
     if (!isDetachedLifecycle(record.lifecycleState) && isActiveStatus(record.status)) {
       record = this.store.reconcileLegacyDetachedActiveCAS(agentId).current ?? record;
@@ -1098,7 +1151,7 @@ export class LocalAgentSessionManager {
       );
     }
     if (!isActiveStatus(record.status) && !record.lifecycleState?.terminationPending) {
-      return recordToStatusOutput(record);
+      return recordToStatusOutput(record, undefined, herdrHandle);
     }
     const terminated = await this.terminateActiveAgent(
       agentId,
@@ -1115,7 +1168,7 @@ export class LocalAgentSessionManager {
       );
     }
     const current = this.store.getById(agentId) ?? record;
-    return recordToStatusOutput(current);
+    return recordToStatusOutput(current, undefined, herdrHandle);
   }
 
   /**
@@ -1355,9 +1408,11 @@ export class LocalAgentSessionManager {
     );
 
     const timing = computeSessionTiming(record);
+    const herdrHandle = this.getHerdrExternalHandle(record.id) ?? (record.startReplay?.key ? this.getHerdrExternalHandle(record.startReplay.key) : undefined);
 
     return {
       agentId: record.id,
+      herdrHandle,
       dispatch: dispatchContractOutput(record.executionContract?.dispatchIntent),
       agentState: record.status,
       providerState: record.providerContinuityState ?? (record.providerSessionId ? "KNOWN_UNVERIFIED" : "UNKNOWN"),
@@ -2631,7 +2686,7 @@ function workspacePathsOverlap(left: string, right: string): boolean {
   return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 }
 
-function recordToStartOutput(record: LocalAgentRecord): StartAgentOutput {
+function recordToStartOutput(record: LocalAgentRecord, herdrHandle?: HerdrExternalHandle): StartAgentOutput {
   const output: StartAgentOutput = {
     agentId: record.id,
     status: record.status,
@@ -2641,6 +2696,7 @@ function recordToStartOutput(record: LocalAgentRecord): StartAgentOutput {
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
   };
+  if (herdrHandle !== undefined) output.herdrHandle = herdrHandle;
   if (record.model !== undefined) output.model = record.model;
   if (record.effort !== undefined) output.effort = record.effort;
   if (record.workspaceId !== undefined) output.workspaceId = record.workspaceId;
@@ -2655,6 +2711,7 @@ function recordToStartOutput(record: LocalAgentRecord): StartAgentOutput {
 function recordToStatusOutput(
   record: LocalAgentRecord,
   lifecycle?: LifecycleEvidence,
+  herdrHandle?: HerdrExternalHandle,
 ): AgentStatusOutput {
   const output: AgentStatusOutput = {
     agentId: record.id,
@@ -2666,6 +2723,7 @@ function recordToStatusOutput(
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
   };
+  if (herdrHandle !== undefined) output.herdrHandle = herdrHandle;
   if (record.model !== undefined) output.model = record.model;
   if (record.effort !== undefined) output.effort = record.effort;
   if (record.workspaceId !== undefined) output.workspaceId = record.workspaceId;
