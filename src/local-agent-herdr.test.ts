@@ -20,6 +20,7 @@ import {
 } from "./local-agent-herdr.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 import { hashDispatchIntent } from "./execution-protocol.js";
+import { LocalAgentSessionManager } from "./local-agent-sessions.js";
 
 test("HerdrGatewayRegistry enforces N1 duplicate prevention and N2 conflicting replay", () => {
   const registry = new HerdrGatewayRegistry();
@@ -161,6 +162,22 @@ test("HerdrThinGateway reconciliation enforces N5, N5-COMMIT, N6, N6-COMMIT, N7,
 
     // Mock live gateway to test terminal states
     const liveGateway = new HerdrThinGateway();
+    (liveGateway as any).getPane = async () => ({
+      pane_id: handle.herdrPaneId,
+      workspace_id: handle.herdrWorkspaceId,
+      cwd: testDir,
+      foreground_cwd: testDir,
+    });
+    (liveGateway as any).getAgent = async () => ({
+      name: handle.herdrAgentIdentity,
+      agent: handle.herdrAgentKind,
+      workspace_id: handle.herdrWorkspaceId,
+      pane_id: handle.herdrPaneId,
+      cwd: testDir,
+      foreground_cwd: testDir,
+      agent_status: "done",
+      interactive_ready: true,
+    });
 
     // N5: Worker settled terminal, but physical git status is clean -> NOT_COMPLETE
     const resClean = await liveGateway.reconcileExternalAgent(handle, ["feature.ts"], true, { status: "done", turnNonce: "turn-n5" });
@@ -209,8 +226,20 @@ test("HerdrThinGateway enforces N-TURN by rejecting prompts to busy agents", asy
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-herdr-busy-agent-"));
   const store = new LocalAgentStore(stateDir);
   const gateway = new HerdrThinGateway("/tmp/test.sock", undefined, store);
+  (gateway as any).getPane = async () => ({
+    pane_id: "p1",
+    workspace_id: "w1",
+    cwd: "/tmp",
+    foreground_cwd: "/tmp",
+  });
   // Mock getAgent to simulate an already busy agent
   (gateway as any).getAgent = async () => ({
+    name: "ds-busy-agent",
+    agent: "opencode",
+    workspace_id: "w1",
+    pane_id: "p1",
+    cwd: "/tmp",
+    foreground_cwd: "/tmp",
     agent_status: "running",
     interactive_ready: false,
   });
@@ -365,7 +394,19 @@ test("HerdrThinGateway enforces Option A turn identity and durable nonce binding
 
     registry.registerHandle(handle);
 
+    (gateway as any).getPane = async () => ({
+      pane_id: "p1",
+      workspace_id: "w1",
+      cwd: "/tmp",
+      foreground_cwd: "/tmp",
+    });
     (gateway as any).getAgent = async () => ({
+      name: "ds-turn-agent",
+      agent: "opencode",
+      workspace_id: "w1",
+      pane_id: "p1",
+      cwd: "/tmp",
+      foreground_cwd: "/tmp",
       agent_status: "idle",
       interactive_ready: true,
     });
@@ -375,7 +416,20 @@ test("HerdrThinGateway enforces Option A turn identity and durable nonce binding
     (gateway as any).sendRequest = async (req: any) => {
       if (req.method === "agent.prompt") {
         capturedPrompt = req.params?.text ?? "";
-        return { result: { agent: { agent_status: "done", interactive_ready: true } } };
+        return {
+          result: {
+            agent: {
+              name: "ds-turn-agent",
+              agent: "opencode",
+              workspace_id: "w1",
+              pane_id: "p1",
+              cwd: "/tmp",
+              foreground_cwd: "/tmp",
+              agent_status: "done",
+              interactive_ready: true,
+            },
+          },
+        };
       }
       return { result: {} };
     };
@@ -737,6 +791,7 @@ test("HerdrThinGateway reconciliation handles renames, spaces, deletions and sta
 
 class SpyHerdrGateway extends HerdrThinGateway {
   public workspaceCreateCalls = 0;
+  public workspaceCloseCalls = 0;
   public agentStartCalls = 0;
   public agentPromptCalls = 0;
   public agentWaitCalls = 0;
@@ -747,6 +802,7 @@ class SpyHerdrGateway extends HerdrThinGateway {
   public getAgentCalls = 0;
 
   public failWorkspaceCreate = false;
+  public failWorkspaceClose = false;
   public failAgentStart = false;
   public simulatedWorkspaces: Array<{ workspace_id: string; label?: string }> = [];
   public simulatedPanes: Array<HerdrPaneInfo> = [];
@@ -786,6 +842,14 @@ class SpyHerdrGateway extends HerdrThinGateway {
       };
     }
 
+    if (req.method === "workspace.close") {
+      this.workspaceCloseCalls++;
+      if (this.failWorkspaceClose) {
+        throw new Error("Simulated network timeout during workspace.close");
+      }
+      return { id: req.id, result: { type: "ok" } as unknown as T };
+    }
+
     if (req.method === "agent.start") {
       this.agentStartCalls++;
       if (this.failAgentStart) {
@@ -793,10 +857,11 @@ class SpyHerdrGateway extends HerdrThinGateway {
       }
       const name = (req.params as any)?.name;
       const paneId = (req.params as any)?.pane_id;
+      const kind = (req.params as any)?.kind;
       const pane = this.simulatedPanes.find((p) => p.pane_id === paneId);
       const agentInfo: HerdrAgentInfo = {
         name,
-        agent: name,
+        agent: kind || name,
         workspace_id: pane?.workspace_id || "sim-ws-default",
         pane_id: paneId,
         cwd: pane?.cwd,
@@ -808,12 +873,10 @@ class SpyHerdrGateway extends HerdrThinGateway {
       return {
         id: req.id,
         result: {
+          type: "agent_started",
           agent: {
-            agent: name,
-            agent_status: "running",
-            pane_id: paneId,
+            ...agentInfo,
             state_change_seq: 1,
-            interactive_ready: true,
           },
         } as unknown as T,
       };
@@ -821,11 +884,19 @@ class SpyHerdrGateway extends HerdrThinGateway {
 
     if (req.method === "agent.prompt") {
       this.agentPromptCalls++;
+      const target = (req.params as any)?.target;
+      const agentInfo = this.simulatedAgents.get(target);
       return {
         id: req.id,
         result: {
+          type: "agent_prompted",
           agent: {
-            agent: (req.params as any)?.target,
+            name: target,
+            agent: agentInfo?.agent || target,
+            workspace_id: agentInfo?.workspace_id,
+            pane_id: agentInfo?.pane_id,
+            cwd: agentInfo?.cwd,
+            foreground_cwd: agentInfo?.foreground_cwd,
             agent_status: "done",
             interactive_ready: true,
           },
@@ -988,6 +1059,21 @@ test("HerdrThinGateway prompt fence negative matrix and zero external calls (C1,
         runtimeKind: HERDR_RUNTIME_KIND,
         handle: validHandle as unknown as Record<string, unknown>,
       },
+    });
+
+    // Setup simulated pane and agent for live identity validation
+    spy.simulatedPanes = [
+      { pane_id: "p1", workspace_id: "ws1", cwd: "/tmp", foreground_cwd: "/tmp" },
+    ];
+    spy.simulatedAgents.set("ds-pf-agent", {
+      name: "ds-pf-agent",
+      agent: "opencode",
+      workspace_id: "ws1",
+      pane_id: "p1",
+      cwd: "/tmp",
+      foreground_cwd: "/tmp",
+      agent_status: "idle",
+      interactive_ready: true,
     });
 
     // 1. PF-WRONG-AGENT-ATTEMPT: agentId points to agent with attemptKey, but handle has different attemptKey
@@ -1209,6 +1295,8 @@ test("HerdrThinGateway launch identity and lost-ack controls (C2, L1 to L10)", a
 
     // L2: EXACT REPLAY
     const spy2 = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    spy2.simulatedPanes = [...spy1.simulatedPanes];
+    spy2.simulatedAgents = new Map(spy1.simulatedAgents);
     const handle2 = await spy2.startExternalAgent({
       agentId: agent.id,
       store,
@@ -2288,5 +2376,1248 @@ test("No-store failure matrix: LAUNCH_NO_DURABLE_STORE and PROMPT_NO_DURABLE_STO
     assert.equal(gatewayWithoutStore.agentPromptCalls, 0, "No agent.prompt calls when store is absent");
   } finally {
     rmSync(testRepo, { recursive: true, force: true });
+  }
+});
+
+function createIsolatedTestGitRepo(): { repoPath: string; headSha: string } {
+  const repoPath = mkdtempSync(join(tmpdir(), "devspace-herdr-test-repo-"));
+  execFileSync("git", ["init", repoPath], { stdio: "ignore" });
+  execFileSync("git", ["-C", repoPath, "config", "user.name", "Test"], { stdio: "ignore" });
+  execFileSync("git", ["-C", repoPath, "config", "user.email", "test@test.com"], { stdio: "ignore" });
+  writeFileSync(join(repoPath, "test.txt"), "hello world\n");
+  execFileSync("git", ["-C", repoPath, "add", "."], { stdio: "ignore" });
+  execFileSync("git", ["-C", repoPath, "commit", "-m", "init"], { stdio: "ignore" });
+  const headSha = execFileSync("git", ["-C", repoPath, "rev-parse", "HEAD"], { encoding: "utf-8" }).trim();
+  return { repoPath, headSha };
+}
+
+test("HerdrThinGateway first launch agent.start response identity validation (E1, FL-EXACT, FL-WRONG-WORKSPACE, FL-WRONG-PANE, FL-WRONG-CWD, FL-WRONG-NAME, FL-MISSING-IDENTITY, REPRODUCER-1)", async () => {
+  const { repoPath, headSha } = createIsolatedTestGitRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-fl-matrix-"));
+  const store = new LocalAgentStore(stateDir);
+
+  try {
+    const runLaunchCase = async (overrideResult?: (req: HerdrSocketRequest, defaultResult: any) => any) => {
+      const attemptKey = `fl-case-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const intent = {
+        taskId: `task-${attemptKey}`,
+        attemptId: attemptKey,
+        objective: "FL matrix test",
+        roleIntent: "DEEP_ENGINEERING" as const,
+        claimCeiling: "CANDIDATE_READY" as const,
+        context: ["test"],
+        readScope: ["src"],
+        writeScope: ["src"],
+        exclusiveOwnership: true,
+        forbiddenChanges: [],
+        acceptanceCriteria: ["pass"],
+        verificationRequired: true,
+        expectedArtifacts: [],
+      };
+      const hash = hashDispatchIntent(intent);
+      const agent = store.create({
+        workspaceId: "ws-fl",
+        workspaceRoot: repoPath,
+        profileName: "worker",
+        provider: "opencode",
+        startReplay: { key: attemptKey, requestHash: `req-${attemptKey}` },
+        executionContract: { writePaths: ["src"], dispatchIntent: intent },
+      });
+
+      const registry = new HerdrGatewayRegistry();
+      const spy = new SpyHerdrGateway("/tmp/test.sock", registry, store);
+
+      if (overrideResult) {
+        const origSend = spy.sendRequest.bind(spy);
+        spy.sendRequest = async (req, timeout, sock) => {
+          const res = await origSend(req, timeout, sock);
+          if (req.method === "agent.start") {
+            return overrideResult(req, res);
+          }
+          return res;
+        };
+      }
+
+      return {
+        attemptKey,
+        hash,
+        agent,
+        spy,
+        registry,
+        startPromise: spy.startExternalAgent({
+          agentId: agent.id,
+          store,
+          attemptKey,
+          dispatchIntentHash: hash,
+          agentKind: "opencode",
+          canonicalWorktreePath: repoPath,
+          workspaceId: "ws-fl",
+        }),
+      };
+    };
+
+    // 1. FL-EXACT: exact matching workspace, pane, cwd, and name -> succeeds
+    const cExact = await runLaunchCase();
+    const handleExact = await cExact.startPromise;
+    assert.ok(handleExact);
+    assert.equal(cExact.spy.workspaceCreateCalls, 1);
+    assert.equal(cExact.spy.agentStartCalls, 1);
+    assert.equal(cExact.spy.agentWaitCalls, 1);
+    assert.equal(cExact.spy.workspaceCloseCalls, 0);
+    const recExact = store.getById(cExact.agent.id);
+    assert.equal(recExact?.externalRuntimeBinding?.launch?.state, "AGENT_OBSERVED");
+    assert.ok(recExact?.externalRuntimeBinding?.handle);
+    assert.ok(cExact.registry.getHandle(cExact.attemptKey));
+
+    // 2. FL-WRONG-WORKSPACE: agent.start returns wrong workspace_id -> fails closed
+    const cWrongWs = await runLaunchCase((req, res) => ({
+      ...res,
+      result: {
+        ...res.result,
+        agent: {
+          ...res.result.agent,
+          workspace_id: "wrong-ws-returned",
+        },
+      },
+    }));
+    await assert.rejects(cWrongWs.startPromise, (err: any) => {
+      assert.match(err.message, /\[FAIL_CLOSED \/ E1\]/);
+      return true;
+    });
+    assert.equal(cWrongWs.spy.workspaceCloseCalls, 1, "Workspace must be closed upon validation failure");
+    assert.equal(cWrongWs.spy.agentWaitCalls, 0, "Zero agent.wait calls on validation failure");
+    const recWrongWs = store.getById(cWrongWs.agent.id);
+    assert.equal(recWrongWs?.externalRuntimeBinding?.launch?.state, "OUTCOME_UNKNOWN");
+    assert.equal(recWrongWs?.externalRuntimeBinding?.handle, undefined);
+    assert.equal(cWrongWs.registry.getHandle(cWrongWs.attemptKey), undefined);
+
+    // 3. FL-WRONG-PANE: agent.start returns wrong pane_id -> fails closed
+    const cWrongPane = await runLaunchCase((req, res) => ({
+      ...res,
+      result: {
+        ...res.result,
+        agent: {
+          ...res.result.agent,
+          pane_id: "wrong-pane-returned",
+        },
+      },
+    }));
+    await assert.rejects(cWrongPane.startPromise, (err: any) => {
+      assert.match(err.message, /\[FAIL_CLOSED \/ E1\]/);
+      return true;
+    });
+    assert.equal(cWrongPane.spy.workspaceCloseCalls, 1);
+    assert.equal(cWrongPane.spy.agentWaitCalls, 0);
+    assert.equal(store.getById(cWrongPane.agent.id)?.externalRuntimeBinding?.handle, undefined);
+    assert.equal(cWrongPane.registry.getHandle(cWrongPane.attemptKey), undefined);
+
+    // 4. FL-WRONG-CWD: agent.start returns wrong cwd -> fails closed
+    const cWrongCwd = await runLaunchCase((req, res) => ({
+      ...res,
+      result: {
+        ...res.result,
+        agent: {
+          ...res.result.agent,
+          cwd: "/completely/unrelated/path",
+          foreground_cwd: "/completely/unrelated/path",
+        },
+      },
+    }));
+    await assert.rejects(cWrongCwd.startPromise, (err: any) => {
+      assert.match(err.message, /\[FAIL_CLOSED \/ E1\]/);
+      return true;
+    });
+    assert.equal(cWrongCwd.spy.workspaceCloseCalls, 1);
+    assert.equal(cWrongCwd.spy.agentWaitCalls, 0);
+    assert.equal(store.getById(cWrongCwd.agent.id)?.externalRuntimeBinding?.handle, undefined);
+
+    // 5. FL-WRONG-NAME: agent.start returns wrong name -> fails closed
+    const cWrongName = await runLaunchCase((req, res) => ({
+      ...res,
+      result: {
+        ...res.result,
+        agent: {
+          ...res.result.agent,
+          name: "wrong-agent-name",
+        },
+      },
+    }));
+    await assert.rejects(cWrongName.startPromise, (err: any) => {
+      assert.match(err.message, /\[FAIL_CLOSED \/ E1\]/);
+      return true;
+    });
+    assert.equal(cWrongName.spy.workspaceCloseCalls, 1);
+    assert.equal(cWrongName.spy.agentWaitCalls, 0);
+    assert.equal(store.getById(cWrongName.agent.id)?.externalRuntimeBinding?.handle, undefined);
+
+    // 6. FL-MISSING-IDENTITY: agent.start returns empty identity fields -> fails closed
+    const cMissingId = await runLaunchCase((req, res) => ({
+      ...res,
+      result: {
+        type: "agent_started",
+        agent: {
+          agent_status: "running",
+          interactive_ready: true,
+        },
+      },
+    }));
+    await assert.rejects(cMissingId.startPromise, (err: any) => {
+      assert.match(err.message, /\[FAIL_CLOSED \/ E1\]/);
+      return true;
+    });
+    assert.equal(cMissingId.spy.workspaceCloseCalls, 1);
+    assert.equal(cMissingId.spy.agentWaitCalls, 0);
+    assert.equal(store.getById(cMissingId.agent.id)?.externalRuntimeBinding?.handle, undefined);
+
+    // 7. REPRODUCER-1: Verify that untrusted agent.start response never leaks into durable store or registry
+    assert.equal(cWrongWs.registry.getHandle(cWrongWs.attemptKey), undefined);
+    assert.equal(cWrongPane.registry.getHandle(cWrongPane.attemptKey), undefined);
+    assert.equal(cWrongCwd.registry.getHandle(cWrongCwd.attemptKey), undefined);
+    assert.equal(cWrongName.registry.getHandle(cWrongName.attemptKey), undefined);
+    assert.equal(cMissingId.registry.getHandle(cMissingId.attemptKey), undefined);
+  } finally {
+    store.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repoPath, { recursive: true, force: true });
+  }
+});
+
+test("HerdrThinGateway replay requires current live process continuity (E2, HR-EXACT-LIVE, HR-PANE-MISSING, HR-AGENT-MISSING, HR-PANE-WRONG-CWD, HR-AGENT-WRONG-WORKSPACE, HR-AGENT-WRONG-PANE, HR-AGENT-WRONG-CWD, HR-AGENT-WRONG-NAME, REPRODUCER-2)", async () => {
+  const { repoPath, headSha } = createIsolatedTestGitRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-hr-matrix-"));
+  const store = new LocalAgentStore(stateDir);
+
+  try {
+    const attemptKey = `hr-test-${Date.now()}`;
+    const intent = {
+      taskId: "task-hr",
+      attemptId: attemptKey,
+      objective: "HR replay matrix",
+      roleIntent: "DEEP_ENGINEERING" as const,
+      claimCeiling: "CANDIDATE_READY" as const,
+      context: ["test"],
+      readScope: ["src"],
+      writeScope: ["src"],
+      exclusiveOwnership: true,
+      forbiddenChanges: [],
+      acceptanceCriteria: ["pass"],
+      verificationRequired: true,
+      expectedArtifacts: [],
+    };
+    const hash = hashDispatchIntent(intent);
+    const agent = store.create({
+      workspaceId: "ws-hr",
+      workspaceRoot: repoPath,
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: attemptKey, requestHash: "hash-hr" },
+      executionContract: { writePaths: ["src"], dispatchIntent: intent },
+    });
+
+    const initRegistry = new HerdrGatewayRegistry();
+    const spyInit = new SpyHerdrGateway("/tmp/test.sock", initRegistry, store);
+    const initialHandle = await spyInit.startExternalAgent({
+      agentId: agent.id,
+      store,
+      attemptKey,
+      dispatchIntentHash: hash,
+      agentKind: "opencode",
+      canonicalWorktreePath: repoPath,
+      workspaceId: "ws-hr",
+    });
+
+    // 1. HR-EXACT-LIVE: Replay with live pane and agent alive -> succeeds
+    const regLive = new HerdrGatewayRegistry();
+    const spyLive = new SpyHerdrGateway("/tmp/test.sock", regLive, store);
+    spyLive.simulatedPanes = [...spyInit.simulatedPanes];
+    spyLive.simulatedAgents = new Map(spyInit.simulatedAgents);
+    const replayHandle = await spyLive.startExternalAgent({
+      agentId: agent.id,
+      store,
+      attemptKey,
+      dispatchIntentHash: hash,
+      agentKind: "opencode",
+      canonicalWorktreePath: repoPath,
+      workspaceId: "ws-hr",
+    });
+    assert.deepEqual(replayHandle, initialHandle);
+    assert.equal(spyLive.workspaceCreateCalls, 0);
+    assert.equal(spyLive.agentStartCalls, 0);
+    assert.ok(regLive.getHandle(attemptKey));
+
+    // 2. HR-PANE-MISSING: Pane missing -> fails closed
+    const spyPaneMissing = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    spyPaneMissing.simulatedPanes = []; // Pane missing!
+    spyPaneMissing.simulatedAgents = new Map(spyInit.simulatedAgents);
+    await assert.rejects(
+      spyPaneMissing.startExternalAgent({
+        agentId: agent.id,
+        store,
+        attemptKey,
+        dispatchIntentHash: hash,
+        agentKind: "opencode",
+        canonicalWorktreePath: repoPath,
+        workspaceId: "ws-hr",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[OUTCOME_UNKNOWN\]/);
+        return true;
+      },
+    );
+
+    // 3. HR-AGENT-MISSING: Agent missing -> fails closed
+    const spyAgentMissing = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    spyAgentMissing.simulatedPanes = [...spyInit.simulatedPanes];
+    spyAgentMissing.simulatedAgents = new Map(); // Agent missing!
+    await assert.rejects(
+      spyAgentMissing.startExternalAgent({
+        agentId: agent.id,
+        store,
+        attemptKey,
+        dispatchIntentHash: hash,
+        agentKind: "opencode",
+        canonicalWorktreePath: repoPath,
+        workspaceId: "ws-hr",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[OUTCOME_UNKNOWN\]/);
+        return true;
+      },
+    );
+
+    // 4. HR-PANE-WRONG-CWD: Pane cwd mismatch -> fails closed
+    const spyPaneWrongCwd = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    spyPaneWrongCwd.simulatedPanes = [
+      {
+        pane_id: initialHandle.herdrPaneId,
+        workspace_id: initialHandle.herdrWorkspaceId,
+        cwd: "/unrelated/cwd",
+        foreground_cwd: "/unrelated/cwd",
+      },
+    ];
+    spyPaneWrongCwd.simulatedAgents = new Map(spyInit.simulatedAgents);
+    await assert.rejects(
+      spyPaneWrongCwd.startExternalAgent({
+        agentId: agent.id,
+        store,
+        attemptKey,
+        dispatchIntentHash: hash,
+        agentKind: "opencode",
+        canonicalWorktreePath: repoPath,
+        workspaceId: "ws-hr",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[OUTCOME_UNKNOWN\]/);
+        return true;
+      },
+    );
+
+    // 5. HR-AGENT-WRONG-WORKSPACE: Agent belongs to wrong workspace -> fails closed
+    const spyAgentWrongWs = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    spyAgentWrongWs.simulatedPanes = [...spyInit.simulatedPanes];
+    spyAgentWrongWs.simulatedAgents = new Map([
+      [
+        initialHandle.herdrAgentIdentity,
+        {
+          name: initialHandle.herdrAgentIdentity,
+          agent: initialHandle.herdrAgentKind,
+          workspace_id: "wrong-ws",
+          pane_id: initialHandle.herdrPaneId,
+          cwd: repoPath,
+          foreground_cwd: repoPath,
+          agent_status: "idle",
+          interactive_ready: true,
+        },
+      ],
+    ]);
+    await assert.rejects(
+      spyAgentWrongWs.startExternalAgent({
+        agentId: agent.id,
+        store,
+        attemptKey,
+        dispatchIntentHash: hash,
+        agentKind: "opencode",
+        canonicalWorktreePath: repoPath,
+        workspaceId: "ws-hr",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[OUTCOME_UNKNOWN\]/);
+        return true;
+      },
+    );
+
+    // 6. HR-AGENT-WRONG-PANE: Agent belongs to wrong pane -> fails closed
+    const spyAgentWrongPane = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    spyAgentWrongPane.simulatedPanes = [...spyInit.simulatedPanes];
+    spyAgentWrongPane.simulatedAgents = new Map([
+      [
+        initialHandle.herdrAgentIdentity,
+        {
+          name: initialHandle.herdrAgentIdentity,
+          agent: initialHandle.herdrAgentKind,
+          workspace_id: initialHandle.herdrWorkspaceId,
+          pane_id: "wrong-pane",
+          cwd: repoPath,
+          foreground_cwd: repoPath,
+          agent_status: "idle",
+          interactive_ready: true,
+        },
+      ],
+    ]);
+    await assert.rejects(
+      spyAgentWrongPane.startExternalAgent({
+        agentId: agent.id,
+        store,
+        attemptKey,
+        dispatchIntentHash: hash,
+        agentKind: "opencode",
+        canonicalWorktreePath: repoPath,
+        workspaceId: "ws-hr",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[OUTCOME_UNKNOWN\]/);
+        return true;
+      },
+    );
+
+    // 7. HR-AGENT-WRONG-CWD: Agent cwd mismatch -> fails closed
+    const spyAgentWrongCwd = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    spyAgentWrongCwd.simulatedPanes = [...spyInit.simulatedPanes];
+    spyAgentWrongCwd.simulatedAgents = new Map([
+      [
+        initialHandle.herdrAgentIdentity,
+        {
+          name: initialHandle.herdrAgentIdentity,
+          agent: initialHandle.herdrAgentKind,
+          workspace_id: initialHandle.herdrWorkspaceId,
+          pane_id: initialHandle.herdrPaneId,
+          cwd: "/wrong/cwd",
+          foreground_cwd: "/wrong/cwd",
+          agent_status: "idle",
+          interactive_ready: true,
+        },
+      ],
+    ]);
+    await assert.rejects(
+      spyAgentWrongCwd.startExternalAgent({
+        agentId: agent.id,
+        store,
+        attemptKey,
+        dispatchIntentHash: hash,
+        agentKind: "opencode",
+        canonicalWorktreePath: repoPath,
+        workspaceId: "ws-hr",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[OUTCOME_UNKNOWN\]/);
+        return true;
+      },
+    );
+
+    // 8. HR-AGENT-WRONG-NAME: Agent name mismatch -> fails closed
+    const spyAgentWrongName = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    spyAgentWrongName.simulatedPanes = [...spyInit.simulatedPanes];
+    spyAgentWrongName.simulatedAgents = new Map([
+      [
+        initialHandle.herdrAgentIdentity,
+        {
+          name: "wrong-named-agent",
+          agent: initialHandle.herdrAgentKind,
+          workspace_id: initialHandle.herdrWorkspaceId,
+          pane_id: initialHandle.herdrPaneId,
+          cwd: repoPath,
+          foreground_cwd: repoPath,
+          agent_status: "idle",
+          interactive_ready: true,
+        },
+      ],
+    ]);
+    await assert.rejects(
+      spyAgentWrongName.startExternalAgent({
+        agentId: agent.id,
+        store,
+        attemptKey,
+        dispatchIntentHash: hash,
+        agentKind: "opencode",
+        canonicalWorktreePath: repoPath,
+        workspaceId: "ws-hr",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[OUTCOME_UNKNOWN\]/);
+        return true;
+      },
+    );
+
+    // 9. REPRODUCER-2: Verify zero handle registration in registry for all stale cases
+    assert.equal(spyPaneMissing.agentStartCalls, 0);
+    assert.equal(spyAgentMissing.agentStartCalls, 0);
+    assert.equal(spyPaneWrongCwd.agentStartCalls, 0);
+    assert.equal(spyAgentWrongWs.agentStartCalls, 0);
+    assert.equal(spyAgentWrongPane.agentStartCalls, 0);
+    assert.equal(spyAgentWrongCwd.agentStartCalls, 0);
+    assert.equal(spyAgentWrongName.agentStartCalls, 0);
+  } finally {
+    store.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repoPath, { recursive: true, force: true });
+  }
+});
+
+test("HerdrThinGateway prompt live identity validation and response checks (E3, PI-EXACT, PI-AGENT-MISSING, PI-PANE-MISSING, PI-WRONG-WORKSPACE, PI-WRONG-PANE, PI-WRONG-CWD, PI-WRONG-NAME, PI-IDENTITY-LOST-AFTER-FENCE, PI-RESPONSE-IDENTITY-MISMATCH, REPRODUCER-3)", async () => {
+  const { repoPath, headSha } = createIsolatedTestGitRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-pi-matrix-"));
+  const store = new LocalAgentStore(stateDir);
+
+  try {
+    const setupPromptContext = () => {
+      const attemptKey = `pi-case-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+      const intent = {
+        taskId: `task-${attemptKey}`,
+        attemptId: attemptKey,
+        objective: "PI matrix test",
+        roleIntent: "DEEP_ENGINEERING" as const,
+        claimCeiling: "CANDIDATE_READY" as const,
+        context: ["test"],
+        readScope: ["src"],
+        writeScope: ["src"],
+        exclusiveOwnership: true,
+        forbiddenChanges: [],
+        acceptanceCriteria: ["pass"],
+        verificationRequired: true,
+        expectedArtifacts: [],
+      };
+      const hash = hashDispatchIntent(intent);
+      const agent = store.create({
+        workspaceId: "ws-pi",
+        workspaceRoot: repoPath,
+        profileName: "worker",
+        provider: "opencode",
+        startReplay: { key: attemptKey, requestHash: `req-${attemptKey}` },
+        executionContract: { writePaths: ["src"], dispatchIntent: intent },
+      });
+
+      const promptNonce = `NONCE-${attemptKey}`;
+      const handle: HerdrExternalHandle = {
+        schemaVersion: 1,
+        runtimeKind: HERDR_RUNTIME_KIND,
+        agentId: agent.id,
+        herdrSocketPath: "/tmp/test.sock",
+        herdrWorkspaceId: `ws-pi-${attemptKey}`,
+        herdrPaneId: `pane-pi-${attemptKey}`,
+        herdrAgentIdentity: `agent-pi-${attemptKey}`,
+        herdrAgentKind: "opencode",
+        promptNonce,
+        canonicalWorktreePath: repoPath,
+        workspaceId: "ws-pi",
+        gitHeadBefore: headSha,
+        attemptKey,
+        dispatchIntentHash: hash,
+        launchTimestamp: new Date().toISOString(),
+        enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+      };
+
+      store.bindExternalRuntimeBindingCAS({
+        agentId: agent.id,
+        expectedAttemptKey: attemptKey,
+        expectedDispatchIntentHash: hash,
+        binding: {
+          runtimeKind: HERDR_RUNTIME_KIND,
+          handle: handle as unknown as Record<string, unknown>,
+        },
+      });
+
+      const registry = new HerdrGatewayRegistry();
+      const spy = new SpyHerdrGateway("/tmp/test.sock", registry, store);
+      return { attemptKey, hash, agent, handle, spy, registry };
+    };
+
+    // 1. PI-EXACT: valid live pane and agent -> prompt succeeds
+    const ctxExact = setupPromptContext();
+    ctxExact.spy.simulatedPanes = [
+      {
+        pane_id: ctxExact.handle.herdrPaneId,
+        workspace_id: ctxExact.handle.herdrWorkspaceId,
+        cwd: repoPath,
+        foreground_cwd: repoPath,
+      },
+    ];
+    ctxExact.spy.simulatedAgents.set(ctxExact.handle.herdrAgentIdentity, {
+      name: ctxExact.handle.herdrAgentIdentity,
+      agent: ctxExact.handle.herdrAgentKind,
+      workspace_id: ctxExact.handle.herdrWorkspaceId,
+      pane_id: ctxExact.handle.herdrPaneId,
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+    const promptRes = await ctxExact.spy.promptExternalAgent(ctxExact.handle, "prompt text", { store });
+    assert.equal(promptRes.status, "done");
+    assert.equal(ctxExact.spy.agentPromptCalls, 1);
+
+    // 2. PI-AGENT-MISSING: agent missing before prompt -> fails closed, 0 agent.prompt
+    const ctxAgMissing = setupPromptContext();
+    ctxAgMissing.spy.simulatedPanes = [
+      {
+        pane_id: ctxAgMissing.handle.herdrPaneId,
+        workspace_id: ctxAgMissing.handle.herdrWorkspaceId,
+        cwd: repoPath,
+        foreground_cwd: repoPath,
+      },
+    ];
+    ctxAgMissing.spy.simulatedAgents = new Map(); // Agent missing!
+    await assert.rejects(
+      ctxAgMissing.spy.promptExternalAgent(ctxAgMissing.handle, "prompt text", { store }),
+      (err: any) => {
+        assert.match(err.message, /\[FAIL_CLOSED \/ E3\]/);
+        return true;
+      },
+    );
+    assert.equal(ctxAgMissing.spy.agentPromptCalls, 0, "Zero agent.prompt calls on missing agent");
+
+    // 3. PI-PANE-MISSING: pane missing before prompt -> fails closed, 0 agent.prompt
+    const ctxPaneMissing = setupPromptContext();
+    ctxPaneMissing.spy.simulatedPanes = []; // Pane missing!
+    ctxPaneMissing.spy.simulatedAgents.set(ctxPaneMissing.handle.herdrAgentIdentity, {
+      name: ctxPaneMissing.handle.herdrAgentIdentity,
+      agent: ctxPaneMissing.handle.herdrAgentKind,
+      workspace_id: ctxPaneMissing.handle.herdrWorkspaceId,
+      pane_id: ctxPaneMissing.handle.herdrPaneId,
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+    await assert.rejects(
+      ctxPaneMissing.spy.promptExternalAgent(ctxPaneMissing.handle, "prompt text", { store }),
+      (err: any) => {
+        assert.match(err.message, /\[FAIL_CLOSED \/ E3\]/);
+        return true;
+      },
+    );
+    assert.equal(ctxPaneMissing.spy.agentPromptCalls, 0, "Zero agent.prompt calls on missing pane");
+
+    // 4. PI-WRONG-WORKSPACE: agent in wrong workspace -> fails closed, 0 agent.prompt
+    const ctxWrongWs = setupPromptContext();
+    ctxWrongWs.spy.simulatedPanes = [
+      {
+        pane_id: ctxWrongWs.handle.herdrPaneId,
+        workspace_id: ctxWrongWs.handle.herdrWorkspaceId,
+        cwd: repoPath,
+        foreground_cwd: repoPath,
+      },
+    ];
+    ctxWrongWs.spy.simulatedAgents.set(ctxWrongWs.handle.herdrAgentIdentity, {
+      name: ctxWrongWs.handle.herdrAgentIdentity,
+      agent: ctxWrongWs.handle.herdrAgentKind,
+      workspace_id: "wrong-ws",
+      pane_id: ctxWrongWs.handle.herdrPaneId,
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+    await assert.rejects(
+      ctxWrongWs.spy.promptExternalAgent(ctxWrongWs.handle, "prompt text", { store }),
+      (err: any) => {
+        assert.match(err.message, /\[FAIL_CLOSED \/ E3\]/);
+        return true;
+      },
+    );
+    assert.equal(ctxWrongWs.spy.agentPromptCalls, 0);
+
+    // 5. PI-WRONG-PANE: agent in wrong pane -> fails closed, 0 agent.prompt
+    const ctxWrongPane = setupPromptContext();
+    ctxWrongPane.spy.simulatedPanes = [
+      {
+        pane_id: ctxWrongPane.handle.herdrPaneId,
+        workspace_id: ctxWrongPane.handle.herdrWorkspaceId,
+        cwd: repoPath,
+        foreground_cwd: repoPath,
+      },
+    ];
+    ctxWrongPane.spy.simulatedAgents.set(ctxWrongPane.handle.herdrAgentIdentity, {
+      name: ctxWrongPane.handle.herdrAgentIdentity,
+      agent: ctxWrongPane.handle.herdrAgentKind,
+      workspace_id: ctxWrongPane.handle.herdrWorkspaceId,
+      pane_id: "wrong-pane",
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+    await assert.rejects(
+      ctxWrongPane.spy.promptExternalAgent(ctxWrongPane.handle, "prompt text", { store }),
+      (err: any) => {
+        assert.match(err.message, /\[FAIL_CLOSED \/ E3\]/);
+        return true;
+      },
+    );
+    assert.equal(ctxWrongPane.spy.agentPromptCalls, 0);
+
+    // 6. PI-WRONG-CWD: agent has wrong cwd -> fails closed, 0 agent.prompt
+    const ctxWrongCwd = setupPromptContext();
+    ctxWrongCwd.spy.simulatedPanes = [
+      {
+        pane_id: ctxWrongCwd.handle.herdrPaneId,
+        workspace_id: ctxWrongCwd.handle.herdrWorkspaceId,
+        cwd: repoPath,
+        foreground_cwd: repoPath,
+      },
+    ];
+    ctxWrongCwd.spy.simulatedAgents.set(ctxWrongCwd.handle.herdrAgentIdentity, {
+      name: ctxWrongCwd.handle.herdrAgentIdentity,
+      agent: ctxWrongCwd.handle.herdrAgentKind,
+      workspace_id: ctxWrongCwd.handle.herdrWorkspaceId,
+      pane_id: ctxWrongCwd.handle.herdrPaneId,
+      cwd: "/wrong/cwd",
+      foreground_cwd: "/wrong/cwd",
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+    await assert.rejects(
+      ctxWrongCwd.spy.promptExternalAgent(ctxWrongCwd.handle, "prompt text", { store }),
+      (err: any) => {
+        assert.match(err.message, /\[FAIL_CLOSED \/ E3\]/);
+        return true;
+      },
+    );
+    assert.equal(ctxWrongCwd.spy.agentPromptCalls, 0);
+
+    // 7. PI-WRONG-NAME: agent has wrong name -> fails closed, 0 agent.prompt
+    const ctxWrongName = setupPromptContext();
+    ctxWrongName.spy.simulatedPanes = [
+      {
+        pane_id: ctxWrongName.handle.herdrPaneId,
+        workspace_id: ctxWrongName.handle.herdrWorkspaceId,
+        cwd: repoPath,
+        foreground_cwd: repoPath,
+      },
+    ];
+    ctxWrongName.spy.simulatedAgents.set(ctxWrongName.handle.herdrAgentIdentity, {
+      name: "wrong-name",
+      agent: ctxWrongName.handle.herdrAgentKind,
+      workspace_id: ctxWrongName.handle.herdrWorkspaceId,
+      pane_id: ctxWrongName.handle.herdrPaneId,
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+    await assert.rejects(
+      ctxWrongName.spy.promptExternalAgent(ctxWrongName.handle, "prompt text", { store }),
+      (err: any) => {
+        assert.match(err.message, /\[FAIL_CLOSED \/ E3\]/);
+        return true;
+      },
+    );
+    assert.equal(ctxWrongName.spy.agentPromptCalls, 0);
+
+    // 8. PI-IDENTITY-LOST-AFTER-FENCE: agent exists before fence, but vanishes post-fence
+    const ctxLostAfterFence = setupPromptContext();
+    ctxLostAfterFence.spy.simulatedPanes = [
+      {
+        pane_id: ctxLostAfterFence.handle.herdrPaneId,
+        workspace_id: ctxLostAfterFence.handle.herdrWorkspaceId,
+        cwd: repoPath,
+        foreground_cwd: repoPath,
+      },
+    ];
+    ctxLostAfterFence.spy.simulatedAgents.set(ctxLostAfterFence.handle.herdrAgentIdentity, {
+      name: ctxLostAfterFence.handle.herdrAgentIdentity,
+      agent: ctxLostAfterFence.handle.herdrAgentKind,
+      workspace_id: ctxLostAfterFence.handle.herdrWorkspaceId,
+      pane_id: ctxLostAfterFence.handle.herdrPaneId,
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+
+    const origFence = store.fenceConsequentialPromptCAS.bind(store);
+    store.fenceConsequentialPromptCAS = (args) => {
+      const res = origFence(args);
+      ctxLostAfterFence.spy.simulatedAgents.clear();
+      return res;
+    };
+
+    await assert.rejects(
+      ctxLostAfterFence.spy.promptExternalAgent(ctxLostAfterFence.handle, "prompt text", { store }),
+      (err: any) => {
+        assert.match(err.message, /Agent live identity lost or mismatched after prompt fence/);
+        return true;
+      },
+    );
+    assert.equal(ctxLostAfterFence.spy.agentPromptCalls, 0, "Zero agent.prompt calls when identity lost after fence");
+
+    // Confirm fence is preserved: subsequent prompt attempt must be rejected under Option A
+    store.fenceConsequentialPromptCAS = origFence;
+    await assert.rejects(
+      ctxLostAfterFence.spy.promptExternalAgent(ctxLostAfterFence.handle, "retry prompt", { store }),
+      (err: any) => {
+        assert.match(err.message, /\[N-TURN-OPTION-A\]/);
+        return true;
+      },
+    );
+
+    // 9. PI-RESPONSE-IDENTITY-MISMATCH: agent.prompt response returns contradictory AgentInfo
+    const ctxRespMismatch = setupPromptContext();
+    ctxRespMismatch.spy.simulatedPanes = [
+      {
+        pane_id: ctxRespMismatch.handle.herdrPaneId,
+        workspace_id: ctxRespMismatch.handle.herdrWorkspaceId,
+        cwd: repoPath,
+        foreground_cwd: repoPath,
+      },
+    ];
+    ctxRespMismatch.spy.simulatedAgents.set(ctxRespMismatch.handle.herdrAgentIdentity, {
+      name: ctxRespMismatch.handle.herdrAgentIdentity,
+      agent: ctxRespMismatch.handle.herdrAgentKind,
+      workspace_id: ctxRespMismatch.handle.herdrWorkspaceId,
+      pane_id: ctxRespMismatch.handle.herdrPaneId,
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+
+    const origSend = ctxRespMismatch.spy.sendRequest.bind(ctxRespMismatch.spy);
+    ctxRespMismatch.spy.sendRequest = (async (req: any, timeout?: number, sock?: string): Promise<any> => {
+      const res: any = await origSend(req, timeout, sock);
+      if (req.method === "agent.prompt") {
+        return {
+          ...res,
+          result: {
+            ...res.result,
+            agent: {
+              ...res.result?.agent,
+              workspace_id: "contradicting-workspace-in-response",
+            },
+          },
+        };
+      }
+      return res;
+    }) as any;
+
+    const respResult = await ctxRespMismatch.spy.promptExternalAgent(ctxRespMismatch.handle, "prompt text", { store });
+    assert.equal(respResult.status, "OUTCOME_UNKNOWN");
+    assert.equal(respResult.rawStatus, "PROMPT_RESPONSE_IDENTITY_MISMATCH");
+
+    // 10. REPRODUCER-3: Verifies unobservable or mismatched agent never receives prompt
+    assert.equal(ctxAgMissing.spy.agentPromptCalls, 0);
+    assert.equal(ctxPaneMissing.spy.agentPromptCalls, 0);
+    assert.equal(ctxWrongWs.spy.agentPromptCalls, 0);
+    assert.equal(ctxWrongPane.spy.agentPromptCalls, 0);
+    assert.equal(ctxWrongCwd.spy.agentPromptCalls, 0);
+    assert.equal(ctxWrongName.spy.agentPromptCalls, 0);
+    assert.equal(ctxLostAfterFence.spy.agentPromptCalls, 0);
+  } finally {
+    store.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repoPath, { recursive: true, force: true });
+  }
+});
+
+test("HerdrThinGateway reconciliation live identity validation (E4, RI-EXACT-DONE, RI-EXACT-IDLE, RI-AGENT-MISSING-LAST-DONE, RI-AGENT-MISSING-LAST-IDLE, RI-WRONG-WORKSPACE, RI-WRONG-PANE, RI-WRONG-CWD, RI-WRONG-NAME, REPRODUCER-4)", async () => {
+  const { repoPath, headSha } = createIsolatedTestGitRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-ri-matrix-"));
+  const store = new LocalAgentStore(stateDir);
+
+  try {
+    const attemptKey = `ri-test-${Date.now()}`;
+    const handle: HerdrExternalHandle = {
+      schemaVersion: 1,
+      runtimeKind: HERDR_RUNTIME_KIND,
+      herdrSocketPath: "/tmp/test.sock",
+      herdrWorkspaceId: "ws-ri-test",
+      herdrPaneId: "pane-ri-test",
+      herdrAgentIdentity: "agent-ri-test",
+      herdrAgentKind: "opencode",
+      promptNonce: "NONCE-RI",
+      canonicalWorktreePath: repoPath,
+      workspaceId: "ws-ri",
+      gitHeadBefore: headSha,
+      attemptKey,
+      dispatchIntentHash: "hash-ri",
+      launchTimestamp: new Date().toISOString(),
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    };
+
+    const spy = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    const validPane: HerdrPaneInfo = {
+      pane_id: handle.herdrPaneId,
+      workspace_id: handle.herdrWorkspaceId,
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+    };
+    spy.simulatedPanes = [validPane];
+
+    // Helper to mock ping
+    const origSend = spy.sendRequest.bind(spy);
+    spy.sendRequest = async (req, timeout, sock) => {
+      if (req.method === "ping") {
+        return { id: req.id, result: { type: "pong" } as any };
+      }
+      return origSend(req, timeout, sock);
+    };
+
+    // 1. RI-EXACT-DONE: live agent positively observed with exact identity, status "done" -> SETTLED_TERMINAL
+    spy.simulatedAgents.set(handle.herdrAgentIdentity, {
+      name: handle.herdrAgentIdentity,
+      agent: handle.herdrAgentKind,
+      workspace_id: handle.herdrWorkspaceId,
+      pane_id: handle.herdrPaneId,
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "done",
+      interactive_ready: true,
+    });
+    const resDone = await spy.reconcileExternalAgent(handle, [], false);
+    assert.equal(resDone.executionState, "SETTLED_TERMINAL");
+    assert.equal(resDone.settled, true);
+
+    // 2. RI-EXACT-IDLE: live agent positively observed with exact identity, status "idle" -> SETTLED_TERMINAL
+    spy.simulatedAgents.set(handle.herdrAgentIdentity, {
+      name: handle.herdrAgentIdentity,
+      agent: handle.herdrAgentKind,
+      workspace_id: handle.herdrWorkspaceId,
+      pane_id: handle.herdrPaneId,
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+    const resIdle = await spy.reconcileExternalAgent(handle, [], false);
+    assert.equal(resIdle.executionState, "SETTLED_TERMINAL");
+    assert.equal(resIdle.settled, true);
+
+    // 3. RI-AGENT-MISSING-LAST-DONE: agent missing, lastPromptResult.status = "done" -> OUTCOME_UNKNOWN
+    spy.simulatedAgents.clear();
+    const resMissingDone = await spy.reconcileExternalAgent(handle, [], false, { status: "done", turnNonce: "turn-1" });
+    assert.equal(resMissingDone.executionState, "OUTCOME_UNKNOWN");
+    assert.equal(resMissingDone.settled, false);
+    assert.equal(resMissingDone.completionStatus, "OUTCOME_UNKNOWN");
+
+    // 4. RI-AGENT-MISSING-LAST-IDLE: agent missing, lastPromptResult.status = "idle" -> OUTCOME_UNKNOWN
+    const resMissingIdle = await spy.reconcileExternalAgent(handle, [], false, { status: "idle", turnNonce: "turn-2" });
+    assert.equal(resMissingIdle.executionState, "OUTCOME_UNKNOWN");
+    assert.equal(resMissingIdle.settled, false);
+    assert.equal(resMissingIdle.completionStatus, "OUTCOME_UNKNOWN");
+
+    // 5. RI-WRONG-WORKSPACE: agent workspace mismatch, lastPromptResult.status = "done" -> OUTCOME_UNKNOWN
+    spy.simulatedAgents.set(handle.herdrAgentIdentity, {
+      name: handle.herdrAgentIdentity,
+      agent: handle.herdrAgentKind,
+      workspace_id: "wrong-ws",
+      pane_id: handle.herdrPaneId,
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "done",
+      interactive_ready: true,
+    });
+    const resWrongWs = await spy.reconcileExternalAgent(handle, [], false, { status: "done", turnNonce: "turn-3" });
+    assert.equal(resWrongWs.executionState, "OUTCOME_UNKNOWN");
+    assert.equal(resWrongWs.settled, false);
+
+    // 6. RI-WRONG-PANE: agent pane mismatch, lastPromptResult.status = "done" -> OUTCOME_UNKNOWN
+    spy.simulatedAgents.set(handle.herdrAgentIdentity, {
+      name: handle.herdrAgentIdentity,
+      agent: handle.herdrAgentKind,
+      workspace_id: handle.herdrWorkspaceId,
+      pane_id: "wrong-pane",
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "done",
+      interactive_ready: true,
+    });
+    const resWrongPane = await spy.reconcileExternalAgent(handle, [], false, { status: "done", turnNonce: "turn-4" });
+    assert.equal(resWrongPane.executionState, "OUTCOME_UNKNOWN");
+    assert.equal(resWrongPane.settled, false);
+
+    // 7. RI-WRONG-CWD: agent cwd mismatch, lastPromptResult.status = "done" -> OUTCOME_UNKNOWN
+    spy.simulatedAgents.set(handle.herdrAgentIdentity, {
+      name: handle.herdrAgentIdentity,
+      agent: handle.herdrAgentKind,
+      workspace_id: handle.herdrWorkspaceId,
+      pane_id: handle.herdrPaneId,
+      cwd: "/wrong/cwd",
+      foreground_cwd: "/wrong/cwd",
+      agent_status: "done",
+      interactive_ready: true,
+    });
+    const resWrongCwd = await spy.reconcileExternalAgent(handle, [], false, { status: "done", turnNonce: "turn-5" });
+    assert.equal(resWrongCwd.executionState, "OUTCOME_UNKNOWN");
+    assert.equal(resWrongCwd.settled, false);
+
+    // 8. RI-WRONG-NAME: agent name mismatch, lastPromptResult.status = "done" -> OUTCOME_UNKNOWN
+    spy.simulatedAgents.set(handle.herdrAgentIdentity, {
+      name: "wrong-name",
+      agent: handle.herdrAgentKind,
+      workspace_id: handle.herdrWorkspaceId,
+      pane_id: handle.herdrPaneId,
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "done",
+      interactive_ready: true,
+    });
+    const resWrongName = await spy.reconcileExternalAgent(handle, [], false, { status: "done", turnNonce: "turn-6" });
+    assert.equal(resWrongName.executionState, "OUTCOME_UNKNOWN");
+    assert.equal(resWrongName.settled, false);
+
+    // 9. REPRODUCER-4: Stale done/idle evidence never marks vanished/wrong agent settled
+    assert.equal(resMissingDone.settled, false);
+    assert.equal(resMissingIdle.settled, false);
+    assert.equal(resWrongWs.settled, false);
+    assert.equal(resWrongPane.settled, false);
+    assert.equal(resWrongCwd.settled, false);
+    assert.equal(resWrongName.settled, false);
+  } finally {
+    store.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repoPath, { recursive: true, force: true });
+  }
+});
+
+test("HerdrThinGateway stop external agent identity validation and side-door elimination (E5, E6, SI-EXACT, SI-NO-STORE, SI-DURABLE-MISMATCH, SI-PANE-MISSING, SI-AGENT-MISSING, SI-WRONG-WORKSPACE, SI-WRONG-PANE, SI-WRONG-CWD, SI-WRONG-NAME, SI-CLOSE-ERROR, REPRODUCER-5)", async () => {
+  const { repoPath, headSha } = createIsolatedTestGitRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-si-matrix-"));
+  const store = new LocalAgentStore(stateDir);
+
+  try {
+    const attemptKey = `si-test-${Date.now()}`;
+    const intent = {
+      taskId: "task-si",
+      attemptId: attemptKey,
+      objective: "SI matrix test",
+      roleIntent: "DEEP_ENGINEERING" as const,
+      claimCeiling: "CANDIDATE_READY" as const,
+      context: ["test"],
+      readScope: ["src"],
+      writeScope: ["src"],
+      exclusiveOwnership: true,
+      forbiddenChanges: [],
+      acceptanceCriteria: ["pass"],
+      verificationRequired: true,
+      expectedArtifacts: [],
+    };
+    const hash = hashDispatchIntent(intent);
+    const agent = store.create({
+      workspaceId: "ws-si",
+      workspaceRoot: repoPath,
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: attemptKey, requestHash: "hash-si" },
+      executionContract: { writePaths: ["src"], dispatchIntent: intent },
+    });
+
+    const handle: HerdrExternalHandle = {
+      schemaVersion: 1,
+      runtimeKind: HERDR_RUNTIME_KIND,
+      agentId: agent.id,
+      herdrSocketPath: "/tmp/test.sock",
+      herdrWorkspaceId: "ws-si-herdr",
+      herdrPaneId: "pane-si-herdr",
+      herdrAgentIdentity: "agent-si-herdr",
+      herdrAgentKind: "opencode",
+      promptNonce: "NONCE-SI",
+      canonicalWorktreePath: repoPath,
+      workspaceId: "ws-si",
+      gitHeadBefore: headSha,
+      attemptKey,
+      dispatchIntentHash: hash,
+      launchTimestamp: new Date().toISOString(),
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    };
+
+    store.bindExternalRuntimeBindingCAS({
+      agentId: agent.id,
+      expectedAttemptKey: attemptKey,
+      expectedDispatchIntentHash: hash,
+      binding: {
+        runtimeKind: HERDR_RUNTIME_KIND,
+        handle: handle as unknown as Record<string, unknown>,
+      },
+    });
+
+    const registry = new HerdrGatewayRegistry();
+    registry.registerHandle(handle);
+
+    // 1. SI-NO-STORE: stopExternalAgent without store fails closed
+    const gatewayNoStore = new HerdrThinGateway("/tmp/test.sock", registry);
+    await assert.rejects(
+      gatewayNoStore.stopExternalAgent(handle),
+      (err: any) => {
+        assert.match(err.message, /\[STOP_NO_DURABLE_STORE\]/);
+        return true;
+      },
+    );
+
+    // 2. SI-DURABLE-MISMATCH: handle does not match durable store binding
+    const spy = new SpyHerdrGateway("/tmp/test.sock", registry, store);
+    const mismatchedHandle = { ...handle, herdrWorkspaceId: "different-ws-id" };
+    await assert.rejects(
+      spy.stopExternalAgent(mismatchedHandle),
+      (err: any) => {
+        assert.match(err.message, /\[STOP_DURABLE_MISMATCH\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.workspaceCloseCalls, 0, "Zero workspace.close on durable mismatch");
+
+    // 3. SI-PANE-MISSING: pane not in HerdR
+    spy.simulatedPanes = []; // Missing pane!
+    spy.simulatedAgents.set(handle.herdrAgentIdentity, {
+      name: handle.herdrAgentIdentity,
+      agent: handle.herdrAgentKind,
+      workspace_id: handle.herdrWorkspaceId,
+      pane_id: handle.herdrPaneId,
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+    await assert.rejects(
+      spy.stopExternalAgent(handle),
+      (err: any) => {
+        assert.match(err.message, /\[STOP_LIVE_IDENTITY_MISMATCH\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.workspaceCloseCalls, 0, "Zero workspace.close on missing pane");
+
+    // 4. SI-AGENT-MISSING: agent not in HerdR
+    spy.simulatedPanes = [
+      {
+        pane_id: handle.herdrPaneId,
+        workspace_id: handle.herdrWorkspaceId,
+        cwd: repoPath,
+        foreground_cwd: repoPath,
+      },
+    ];
+    spy.simulatedAgents.clear(); // Missing agent!
+    await assert.rejects(
+      spy.stopExternalAgent(handle),
+      (err: any) => {
+        assert.match(err.message, /\[STOP_LIVE_IDENTITY_MISMATCH\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.workspaceCloseCalls, 0, "Zero workspace.close on missing agent");
+
+    // 5. SI-WRONG-WORKSPACE: agent workspace mismatch
+    spy.simulatedAgents.set(handle.herdrAgentIdentity, {
+      name: handle.herdrAgentIdentity,
+      agent: handle.herdrAgentKind,
+      workspace_id: "wrong-ws",
+      pane_id: handle.herdrPaneId,
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+    await assert.rejects(
+      spy.stopExternalAgent(handle),
+      (err: any) => {
+        assert.match(err.message, /\[STOP_LIVE_IDENTITY_MISMATCH\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.workspaceCloseCalls, 0);
+
+    // 6. SI-WRONG-PANE: agent pane mismatch
+    spy.simulatedAgents.set(handle.herdrAgentIdentity, {
+      name: handle.herdrAgentIdentity,
+      agent: handle.herdrAgentKind,
+      workspace_id: handle.herdrWorkspaceId,
+      pane_id: "wrong-pane",
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+    await assert.rejects(
+      spy.stopExternalAgent(handle),
+      (err: any) => {
+        assert.match(err.message, /\[STOP_LIVE_IDENTITY_MISMATCH\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.workspaceCloseCalls, 0);
+
+    // 7. SI-WRONG-CWD: agent cwd mismatch
+    spy.simulatedAgents.set(handle.herdrAgentIdentity, {
+      name: handle.herdrAgentIdentity,
+      agent: handle.herdrAgentKind,
+      workspace_id: handle.herdrWorkspaceId,
+      pane_id: handle.herdrPaneId,
+      cwd: "/wrong/cwd",
+      foreground_cwd: "/wrong/cwd",
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+    await assert.rejects(
+      spy.stopExternalAgent(handle),
+      (err: any) => {
+        assert.match(err.message, /\[STOP_LIVE_IDENTITY_MISMATCH\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.workspaceCloseCalls, 0);
+
+    // 8. SI-WRONG-NAME: agent name mismatch
+    spy.simulatedAgents.set(handle.herdrAgentIdentity, {
+      name: "wrong-name",
+      agent: handle.herdrAgentKind,
+      workspace_id: handle.herdrWorkspaceId,
+      pane_id: handle.herdrPaneId,
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+    await assert.rejects(
+      spy.stopExternalAgent(handle),
+      (err: any) => {
+        assert.match(err.message, /\[STOP_LIVE_IDENTITY_MISMATCH\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.workspaceCloseCalls, 0);
+
+    // 9. SI-CLOSE-ERROR: workspace.close fails -> error not swallowed, registry handle NOT released
+    spy.simulatedAgents.set(handle.herdrAgentIdentity, {
+      name: handle.herdrAgentIdentity,
+      agent: handle.herdrAgentKind,
+      workspace_id: handle.herdrWorkspaceId,
+      pane_id: handle.herdrPaneId,
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+    spy.failWorkspaceClose = true;
+    await assert.rejects(
+      spy.stopExternalAgent(handle),
+      (err: any) => {
+        assert.match(err.message, /Simulated network timeout during workspace\.close/);
+        return true;
+      },
+    );
+    assert.ok(registry.getHandle(attemptKey), "Registry handle must NOT be released if close fails (A8)");
+
+    // 10. SI-EXACT: valid store and verified live identity -> succeeds, closes workspace, releases handle
+    spy.failWorkspaceClose = false;
+    assert.equal(spy.workspaceCloseCalls, 1);
+    await spy.stopExternalAgent(handle);
+    assert.equal(spy.workspaceCloseCalls, 2);
+    assert.equal(registry.getHandle(attemptKey), undefined, "Registry handle released upon successful close");
+
+    // 11. REPRODUCER-5: Consequential side-door elimination
+    assert.equal((HerdrThinGateway.prototype as any).sendPaneKeys, undefined, "sendPaneKeys must be removed from HerdrThinGateway");
+    assert.equal((LocalAgentSessionManager.prototype as any).getHerdrGateway, undefined, "getHerdrGateway must be removed from LocalAgentSessionManager");
+  } finally {
+    store.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repoPath, { recursive: true, force: true });
   }
 });

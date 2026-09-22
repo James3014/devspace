@@ -549,12 +549,6 @@ export class LocalAgentSessionManager {
     if (this.ownsOpencodeCatalogSource) this.opencodeCatalogSource.close();
   }
 
-  /**
-   * Return the manager's configured HerdrThinGateway.
-   */
-  getHerdrGateway(): HerdrThinGateway {
-    return this.herdrGateway;
-  }
 
   /**
    * Bind an immutable HerdrExternalHandle to an active agent record.

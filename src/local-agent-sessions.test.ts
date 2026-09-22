@@ -1287,8 +1287,33 @@ test("LocalAgentSessionManager - rejects conflicting replay and enforcement stat
 class SpyPromptGateway extends HerdrThinGateway {
   promptCallCount = 0;
   mockPromptOutcome: "done" | "timeout" | "error" | "blocked" = "done";
+  currentHandle?: HerdrExternalHandle;
 
-  override async getAgent(agentName: string) {
+  override async getPane(paneId: string): Promise<any> {
+    if (this.currentHandle && paneId === this.currentHandle.herdrPaneId) {
+      return {
+        pane_id: this.currentHandle.herdrPaneId,
+        workspace_id: this.currentHandle.herdrWorkspaceId,
+        cwd: this.currentHandle.canonicalWorktreePath,
+        foreground_cwd: this.currentHandle.canonicalWorktreePath,
+      };
+    }
+    return undefined;
+  }
+
+  override async getAgent(agentName: string): Promise<any> {
+    if (this.currentHandle && agentName === this.currentHandle.herdrAgentIdentity) {
+      return {
+        name: this.currentHandle.herdrAgentIdentity,
+        agent: this.currentHandle.herdrAgentKind,
+        workspace_id: this.currentHandle.herdrWorkspaceId,
+        pane_id: this.currentHandle.herdrPaneId,
+        cwd: this.currentHandle.canonicalWorktreePath,
+        foreground_cwd: this.currentHandle.canonicalWorktreePath,
+        agent_status: "idle",
+        interactive_ready: true,
+      };
+    }
     return { agent_status: "idle", interactive_ready: true };
   }
 
@@ -1314,7 +1339,16 @@ class SpyPromptGateway extends HerdrThinGateway {
       return {
         id: req.id,
         result: {
-          agent: { agent_status: this.mockPromptOutcome === "blocked" ? "blocked" : "done", interactive_ready: true },
+          agent: {
+            name: this.currentHandle?.herdrAgentIdentity,
+            agent: this.currentHandle?.herdrAgentKind,
+            workspace_id: this.currentHandle?.herdrWorkspaceId,
+            pane_id: this.currentHandle?.herdrPaneId,
+            cwd: this.currentHandle?.canonicalWorktreePath,
+            foreground_cwd: this.currentHandle?.canonicalWorktreePath,
+            agent_status: this.mockPromptOutcome === "blocked" ? "blocked" : "done",
+            interactive_ready: true,
+          },
         },
       };
     }
@@ -1392,6 +1426,7 @@ test("LocalAgentSessionManager - PROMPT-R1, R2, R3, R4 durable prompt fence surv
       manager1.bindHerdrExternalHandle(startRes.agentId, handle);
 
       const spyGateway1 = new SpyPromptGateway("/tmp/herdr.sock", defaultHerdrGatewayRegistry, (manager1 as any).store);
+      spyGateway1.currentHandle = handle;
       spyGateway1.mockPromptOutcome = c.outcome;
 
       // 1. Submit first prompt
@@ -1417,6 +1452,7 @@ test("LocalAgentSessionManager - PROMPT-R1, R2, R3, R4 durable prompt fence surv
       assert.ok(recoveredHandle, `${c.name}: handle must recover from store`);
 
       const spyGateway2 = new SpyPromptGateway("/tmp/herdr.sock", defaultHerdrGatewayRegistry, (manager2 as any).store);
+      spyGateway2.currentHandle = recoveredHandle!;
       assert.equal(spyGateway2.promptCallCount, 0);
 
       // 3. Second prompt on same attempt after restart MUST fail closed with [N-TURN-OPTION-A]
