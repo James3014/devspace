@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdtemp, mkdir, rm, stat, symlink, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, realpath, rm, stat, symlink, writeFile } from "node:fs/promises";
 import { platform, tmpdir } from "node:os";
 import { join } from "node:path";
 import test, { type TestContext } from "node:test";
@@ -26,6 +26,19 @@ test("a checkout exposes initial and nested instruction context while filtering 
   assert.deepEqual(
     opened.availableAgentsFiles.map((file) => file.path),
     [join(context.root, "nested", "AGENTS.md")],
+  );
+
+  const blockedNestedRead = context.registry.resolveReadPath(opened.workspace, "nested/file.txt");
+  assert.deepEqual(
+    blockedNestedRead.nestedInstructionRebindRequired?.instructionPaths,
+    [await realpath(join(context.root, "nested", "AGENTS.md"))],
+  );
+  const nestedInstructionRead = context.registry.resolveReadPath(opened.workspace, "nested/AGENTS.md");
+  assert.equal(nestedInstructionRead.nestedInstructionRebindRequired, undefined);
+  context.registry.markReadPathLoaded(opened.workspace, nestedInstructionRead);
+  assert.equal(
+    context.registry.resolveReadPath(opened.workspace, "nested/file.txt").nestedInstructionRebindRequired,
+    undefined,
   );
   assert.deepEqual(
     opened.workspace.agentProfiles.map((profile) => ({

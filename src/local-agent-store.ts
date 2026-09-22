@@ -281,6 +281,76 @@ export class LocalAgentStore {
     return rows.map(rowToLocalAgentRecord);
   }
 
+  /**
+   * Return only rows that can require the active-agent supervision pass.
+   *
+   * Active status is kept as a SQL predicate so legacy rows remain eligible
+   * for adoption/reconciliation. A durable terminationPending marker is also
+   * selected independently of status because fencing persists a terminal
+   * status before physical worker cleanup completes. The marker check is
+   * intentionally textual: it avoids deserializing historical lifecycle and
+   * execution blobs merely to discover that a terminal row is ineligible.
+   */
+  listSupervisionCandidates(scope: LocalAgentListScope = {}): LocalAgentRecord[] {
+    const clauses = [
+      "(status in ('starting', 'running') or instr(coalesce(lifecycle_state, ''), '\"terminationPending\"') > 0)",
+    ];
+    const parameters: string[] = [];
+    if (scope.workspaceId) {
+      clauses.push("workspace_id = ?");
+      parameters.push(scope.workspaceId);
+    }
+    if (scope.workspaceRoot) {
+      clauses.push("workspace_root = ?");
+      parameters.push(resolve(scope.workspaceRoot));
+    }
+
+    const rows = this.database.sqlite
+      .prepare(
+        `select * from local_agent_sessions
+         where ${clauses.join(" and ")}
+         order by updated_at desc`,
+      )
+      .all(...parameters) as LocalAgentRow[];
+    return rows.map(rowToLocalAgentRecord);
+  }
+
+  count(scope: LocalAgentListScope = {}): number {
+    let row: { count: number } | undefined;
+    if (scope.workspaceId && scope.workspaceRoot) {
+      row = this.database.sqlite
+        .prepare(
+          `select count(*) as count from local_agent_sessions
+           where workspace_id = ? and workspace_root = ?`,
+        )
+        .get(scope.workspaceId, resolve(scope.workspaceRoot)) as { count: number } | undefined;
+    } else if (scope.workspaceId) {
+      row = this.database.sqlite
+        .prepare(
+          `select count(*) as count from local_agent_sessions
+           where workspace_id = ?`,
+        )
+        .get(scope.workspaceId) as { count: number } | undefined;
+    } else if (scope.workspaceRoot) {
+      row = this.database.sqlite
+        .prepare(
+          `select count(*) as count from local_agent_sessions
+           where workspace_root = ?`,
+        )
+        .get(resolve(scope.workspaceRoot)) as { count: number } | undefined;
+    } else {
+      row = this.database.sqlite
+        .prepare("select count(*) as count from local_agent_sessions")
+        .get() as { count: number } | undefined;
+    }
+
+    return Number(row?.count ?? 0);
+  }
+
+  countResult(scope: LocalAgentListScope = {}): BetterResult<number, AgentStoreError> {
+    return storeResult("count", () => this.count(scope));
+  }
+
   listResult(scope: LocalAgentListScope = {}): BetterResult<LocalAgentRecord[], AgentStoreError> {
     return storeResult("list", () => this.list(scope));
   }

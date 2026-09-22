@@ -3915,6 +3915,17 @@ export function createMcpServer(
       const startedAt = performance.now();
       const workspace = workspaces.getWorkspace(workspaceId);
       const readPath = workspaces.resolveReadPath(workspace, input.path);
+      if (readPath.nestedInstructionRebindRequired) {
+        const { instructionPaths } = readPath.nestedInstructionRebindRequired;
+        return {
+          isError: true,
+          content: [textBlock([
+            `NESTED_INSTRUCTION_REBIND_REQUIRED: Nested repository instruction file(s) must be read before operating on '${input.path}'.`,
+            "Read each instruction file below in order, then retry the original operation:",
+            ...instructionPaths.map((path, index) => `  ${index + 1}. ${path}`),
+          ].join("\n"))],
+        };
+      }
       const response = await readFileTool(
         { ...input, path: readPath.absolutePath },
         {
@@ -3990,7 +4001,18 @@ export function createMcpServer(
       const startedAt = performance.now();
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
-      workspaces.resolvePath(workspace, input.path);
+      const absolutePath = workspaces.resolvePath(workspace, input.path);
+      const instructionPaths = workspaces.preOperationAncestorCheck(workspace, absolutePath);
+      if (instructionPaths.length > 0) {
+        return {
+          isError: true,
+          content: [textBlock([
+            `NESTED_INSTRUCTION_REBIND_REQUIRED: Nested repository instruction file(s) must be read before writing '${input.path}'.`,
+            "Read each instruction file below in order, then retry the write:",
+            ...instructionPaths.map((path, index) => `  ${index + 1}. ${path}`),
+          ].join("\n"))],
+        };
+      }
       const coreAdmission = coreMutationGuard
         ? await coreMutationGuard.admit({ workspaceId, extra, paths: [input.path], pathContainment: "STRUCTURED_SINK_ENFORCED" })
         : undefined;
@@ -4022,6 +4044,7 @@ export function createMcpServer(
         success: true,
         durationMs: Math.round(performance.now() - startedAt),
       });
+      workspaces.invalidateInstructionPath(workspace, absolutePath);
 
       return {
         ...response,
@@ -4083,7 +4106,18 @@ export function createMcpServer(
       const startedAt = performance.now();
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
-      workspaces.resolvePath(workspace, input.path);
+      const absolutePath = workspaces.resolvePath(workspace, input.path);
+      const instructionPaths = workspaces.preOperationAncestorCheck(workspace, absolutePath);
+      if (instructionPaths.length > 0) {
+        return {
+          isError: true,
+          content: [textBlock([
+            `NESTED_INSTRUCTION_REBIND_REQUIRED: Nested repository instruction file(s) must be read before editing '${input.path}'.`,
+            "Read each instruction file below in order, then retry the edit:",
+            ...instructionPaths.map((path, index) => `  ${index + 1}. ${path}`),
+          ].join("\n"))],
+        };
+      }
       const coreAdmission = coreMutationGuard
         ? await coreMutationGuard.admit({ workspaceId, extra, paths: [input.path], pathContainment: "STRUCTURED_SINK_ENFORCED" })
         : undefined;
@@ -4098,7 +4132,12 @@ export function createMcpServer(
           workspaceId,
           path: input.path,
         }, response.content, startedAt);
-        return response;
+        return {
+          ...response,
+          content: [textBlock(
+            `${contentText(response.content)}\n\nExact edit failed. Re-read the current target region, then retry once with fresh exact oldText. Do not use fuzzy replacement.`,
+          )],
+        };
       }
 
       const stats = countDiffStats(
@@ -4117,6 +4156,7 @@ export function createMcpServer(
         success: true,
         durationMs: Math.round(performance.now() - startedAt),
       });
+      workspaces.invalidateInstructionPath(workspace, absolutePath);
 
       return {
         content: editContent,
@@ -4180,6 +4220,23 @@ export function createMcpServer(
         const actions = parsePatch(patch);
         const mutationPaths = actions.flatMap((action) => action.kind === "update" && action.moveTo ? [action.path, action.moveTo] : [action.path]);
         const deletedPaths = actions.flatMap((action) => action.kind === "delete" || (action.kind === "update" && action.moveTo) ? [action.path] : []);
+        const instructionPaths = new Set<string>();
+        for (const mutationPath of mutationPaths) {
+          const absolutePath = workspaces.resolvePath(workspace, mutationPath);
+          for (const instructionPath of workspaces.preOperationAncestorCheck(workspace, absolutePath)) {
+            instructionPaths.add(instructionPath);
+          }
+        }
+        if (instructionPaths.size > 0) {
+          return {
+            isError: true,
+            content: [textBlock([
+              "NESTED_INSTRUCTION_REBIND_REQUIRED: Nested repository instruction file(s) must be read before applying this patch.",
+              "Read each instruction file below in order, then retry the patch:",
+              ...[...instructionPaths].map((path, index) => `  ${index + 1}. ${path}`),
+            ].join("\n"))],
+          };
+        }
         const coreAdmission = coreMutationGuard
           ? await coreMutationGuard.admit({ workspaceId, extra, paths: mutationPaths, deletedPaths, pathContainment: "STRUCTURED_SINK_ENFORCED" })
           : undefined;
@@ -4197,6 +4254,9 @@ export function createMcpServer(
           success: true,
           durationMs: Math.round(performance.now() - startedAt),
         });
+        for (const path of new Set([...mutationPaths, ...deletedPaths])) {
+          workspaces.invalidateInstructionPath(workspace, workspaces.resolvePath(workspace, path));
+        }
 
         return {
           content,
@@ -6755,15 +6815,14 @@ export function createServer(
     void transports
       .closeIdle(config.mcpSessionIdleTimeoutMs)
       .then((results) => logSessionCloseResults("idle_timeout", results))
-      .then(() => enumerateDurableReconciliationState())
-      .then((durableBundle) => {
+      .then(() => {
         const metrics = transports.metrics();
         const cutoverRecord = cutoverController.record();
         logEvent(config.logging, "info", "mcp_metrics", {
           ...metrics,
           durable: {
-            workspaceSessions: durableBundle.workspaceSessions,
-            agentSessions: durableBundle.agentSessions,
+            workspaceSessions: workspaceStore.listSessions().length,
+            agentSessions: agentSessionManager ? agentSessionManager.countAllAgentRecords() : 0,
           },
           cutoverBacklog: {
             active: cutoverController.mode() !== "normal",
