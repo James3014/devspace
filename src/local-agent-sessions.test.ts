@@ -911,6 +911,47 @@ test("runWorkerTurnFromFile redacts successful provider output before durable st
   }
 });
 
+test("preflight binds explicitly selected Codeg Agy backend without requiring native Agy runtime", async () => {
+  const { manager, clean } = setupFixture();
+  const previous = {
+    providers: process.env.DEVSPACE_CODEG_PROVIDERS,
+    url: process.env.DEVSPACE_CODEG_URL,
+    token: process.env.DEVSPACE_CODEG_TOKEN,
+    agy: process.env.AGY_COMMAND,
+  };
+  try {
+    process.env.DEVSPACE_CODEG_PROVIDERS = "agy";
+    process.env.DEVSPACE_CODEG_URL = "http://127.0.0.1:31817";
+    process.env.DEVSPACE_CODEG_TOKEN = "session-test-token";
+    process.env.AGY_COMMAND = "/definitely/missing/native-agy";
+
+    const output = await manager.preflightAgent({
+      workspaceId: "ws_codeg_agy",
+      workspaceRoot: "/Users/jameschen/Workspace/nexus",
+      isolated: true,
+      profileName: "reviewer",
+      profiles: mockProfiles,
+    });
+
+    assert.equal(output.readiness.providerConfigured, true);
+    assert.equal(output.readiness.runtimeReady, true);
+    assert.equal(output.readiness.dispatchState, "UNKNOWN");
+    assert.equal(output.worker.executionIdentity, "codeg:http://127.0.0.1:31817:agy");
+    assert.equal(output.worker.runtimeVersion, "codeg-http-v1");
+    assert.equal(output.worker.executionIdentity.includes("session-test-token"), false);
+  } finally {
+    if (previous.providers === undefined) delete process.env.DEVSPACE_CODEG_PROVIDERS;
+    else process.env.DEVSPACE_CODEG_PROVIDERS = previous.providers;
+    if (previous.url === undefined) delete process.env.DEVSPACE_CODEG_URL;
+    else process.env.DEVSPACE_CODEG_URL = previous.url;
+    if (previous.token === undefined) delete process.env.DEVSPACE_CODEG_TOKEN;
+    else process.env.DEVSPACE_CODEG_TOKEN = previous.token;
+    if (previous.agy === undefined) delete process.env.AGY_COMMAND;
+    else process.env.AGY_COMMAND = previous.agy;
+    clean();
+  }
+});
+
 test("runWorkerTurnFromFile persists typed AgentProviderFailureError details", async () => {
   const { stateDir, clean } = setupFixture();
   try {
