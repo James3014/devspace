@@ -7,6 +7,7 @@ import { LocalAgentSessionManager, AgentSessionError, getWorkerProcessOwnership 
 import { LocalAgentStore } from "./local-agent-store.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
 import { type HerdrExternalHandle, HerdrThinGateway, defaultHerdrGatewayRegistry } from "./local-agent-herdr.js";
+import { hashDispatchIntent } from "./execution-protocol.js";
 
 const originalAgyCommand = process.env.AGY_COMMAND;
 process.env.AGY_COMMAND = process.execPath;
@@ -991,6 +992,23 @@ test("LocalAgentSessionManager - binds and retrieves HerdrExternalHandle for dur
   const projectRoot = mkdtempSync(join(tmpdir(), "devspace-herdr-session-test-"));
 
   try {
+    const dispatchIntent = {
+      taskId: "task-herdr-1",
+      attemptId: "attempt-herdr-1",
+      objective: "Run herdr test",
+      roleIntent: "DEEP_ENGINEERING" as const,
+      claimCeiling: "CANDIDATE_READY" as const,
+      context: ["test"],
+      readScope: ["src"],
+      writeScope: ["src/local-agent-sessions.ts"],
+      exclusiveOwnership: true,
+      forbiddenChanges: [],
+      acceptanceCriteria: ["pass"],
+      verificationRequired: true,
+      expectedArtifacts: [],
+    };
+    const intentHash = hashDispatchIntent(dispatchIntent);
+
     const store = (manager as any).store;
     const record = store.create({
       workspaceId: "ws_herdr_test",
@@ -998,6 +1016,14 @@ test("LocalAgentSessionManager - binds and retrieves HerdrExternalHandle for dur
       profileName: "opencode-test",
       provider: "opencode",
       lifecycleKind: "detached_worker_v2",
+      startReplay: {
+        key: "attempt-herdr-1",
+        requestHash: "hash-1",
+      },
+      executionContract: {
+        writePaths: ["src/local-agent-sessions.ts"],
+        dispatchIntent,
+      },
     });
 
     const handle: HerdrExternalHandle = {
@@ -1013,7 +1039,7 @@ test("LocalAgentSessionManager - binds and retrieves HerdrExternalHandle for dur
       workspaceId: "ws_herdr_test",
       gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
       attemptKey: "attempt-herdr-1",
-      dispatchIntentHash: "intent-hash-herdr-1",
+      dispatchIntentHash: intentHash,
       launchTimestamp: new Date().toISOString(),
       enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
     };
@@ -1068,7 +1094,24 @@ test("LocalAgentSessionManager - persists HerdrExternalHandle across restart and
       async () => true,
     );
 
-    // Start an agent with attemptKey
+    const dispatchIntent = {
+      taskId: "task-restart-1",
+      attemptId: "attempt-restart-1",
+      objective: "Review restart task",
+      roleIntent: "DEEP_ENGINEERING" as const,
+      claimCeiling: "CANDIDATE_READY" as const,
+      context: ["test"],
+      readScope: ["src"],
+      writeScope: ["src/local-agent-sessions.ts"],
+      exclusiveOwnership: true,
+      forbiddenChanges: [],
+      acceptanceCriteria: ["pass"],
+      verificationRequired: true,
+      expectedArtifacts: [],
+    };
+    const intentHash = hashDispatchIntent(dispatchIntent);
+
+    // Start an agent with attemptKey and dispatchIntent
     const startRes1 = await manager1.startAgent({
       workspaceId: "ws_restart_test",
       workspaceRoot: projectRoot,
@@ -1076,6 +1119,10 @@ test("LocalAgentSessionManager - persists HerdrExternalHandle across restart and
       prompt: "review task",
       profiles: mockProfiles,
       attemptKey: "attempt-restart-1",
+      executionContract: {
+        writePaths: ["src/local-agent-sessions.ts"],
+        dispatchIntent,
+      },
     });
 
     const handle: HerdrExternalHandle = {
@@ -1091,7 +1138,7 @@ test("LocalAgentSessionManager - persists HerdrExternalHandle across restart and
       workspaceId: "ws_restart_test",
       gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
       attemptKey: "attempt-restart-1",
-      dispatchIntentHash: "intent-hash-restart-1",
+      dispatchIntentHash: intentHash,
       launchTimestamp: new Date().toISOString(),
       enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
     };
@@ -1134,6 +1181,10 @@ test("LocalAgentSessionManager - persists HerdrExternalHandle across restart and
       prompt: "review task",
       profiles: mockProfiles,
       attemptKey: "attempt-restart-1",
+      executionContract: {
+        writePaths: ["src/local-agent-sessions.ts"],
+        dispatchIntent,
+      },
     });
 
     // Same durable session and handle returned; 0 new workers launched
@@ -1230,5 +1281,163 @@ test("LocalAgentSessionManager - rejects conflicting replay and enforcement stat
     defaultHerdrGatewayRegistry.releaseHandle("different-attempt-key");
     clean();
     rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+class SpyPromptGateway extends HerdrThinGateway {
+  promptCallCount = 0;
+  mockPromptOutcome: "done" | "timeout" | "error" | "blocked" = "done";
+
+  override async getAgent(agentName: string) {
+    return { agent_status: "idle", interactive_ready: true };
+  }
+
+  override async readPane(paneId: string) {
+    if (this.mockPromptOutcome === "blocked") {
+      return "Do you trust the contents of this project?";
+    }
+    return "Output from agent";
+  }
+
+  protected override async sendRequest<T = unknown>(req: any, timeoutMs?: number): Promise<any> {
+    if (req.method === "agent.prompt") {
+      this.promptCallCount++;
+      if (this.mockPromptOutcome === "error") {
+        throw new Error("Simulated socket network disconnect");
+      }
+      if (this.mockPromptOutcome === "timeout") {
+        return {
+          id: req.id,
+          error: { code: "timeout", message: "Prompt timed out after 30000ms" },
+        };
+      }
+      return {
+        id: req.id,
+        result: {
+          agent: { agent_status: this.mockPromptOutcome === "blocked" ? "blocked" : "done", interactive_ready: true },
+        },
+      };
+    }
+    return { id: req.id, result: {} };
+  }
+}
+
+test("LocalAgentSessionManager - PROMPT-R1, R2, R3, R4 durable prompt fence survives DevSpace restart", async () => {
+  const cases: Array<{
+    name: string;
+    attemptKey: string;
+    outcome: "done" | "timeout" | "error" | "blocked";
+  }> = [
+    { name: "PROMPT-R1 (normal settlement)", attemptKey: "attempt-prompt-r1", outcome: "done" },
+    { name: "PROMPT-R2 (timeout OUTCOME_UNKNOWN)", attemptKey: "attempt-prompt-r2", outcome: "timeout" },
+    { name: "PROMPT-R3 (network/socket error)", attemptKey: "attempt-prompt-r3", outcome: "error" },
+    { name: "PROMPT-R4 (blocked onboarding dialog)", attemptKey: "attempt-prompt-r4", outcome: "blocked" },
+  ];
+
+  for (const c of cases) {
+    const stateDir = mkdtempSync(join(tmpdir(), `devspace-fence-${c.attemptKey}-`));
+    const projectRoot = mkdtempSync(join(tmpdir(), `devspace-fence-repo-${c.attemptKey}-`));
+    const config = { stateDir, subagents: true, oauth: { scopes: ["devspace"] } } as any;
+
+    try {
+      const manager1 = new LocalAgentSessionManager(config, async () => {}, async () => true);
+      const dispatchIntent = {
+        taskId: `task-${c.attemptKey}`,
+        attemptId: c.attemptKey,
+        objective: `Test durable fence for ${c.name}`,
+        roleIntent: "DEEP_ENGINEERING" as const,
+        claimCeiling: "CANDIDATE_READY" as const,
+        context: ["test"],
+        readScope: ["src"],
+        writeScope: ["src/local-agent-sessions.ts"],
+        exclusiveOwnership: true,
+        forbiddenChanges: [],
+        acceptanceCriteria: ["pass"],
+        verificationRequired: true,
+        expectedArtifacts: [],
+      };
+      const intentHash = hashDispatchIntent(dispatchIntent);
+
+      const startRes = await manager1.startAgent({
+        workspaceId: "ws_fence_test",
+        workspaceRoot: projectRoot,
+        profileName: "reviewer",
+        prompt: "test fence",
+        profiles: mockProfiles,
+        attemptKey: c.attemptKey,
+        executionContract: {
+          writePaths: ["src/local-agent-sessions.ts"],
+          dispatchIntent,
+        },
+      });
+
+      const handle: HerdrExternalHandle = {
+        schemaVersion: 1,
+        runtimeKind: "HERDR",
+        herdrSocketPath: "/tmp/herdr.sock",
+        herdrWorkspaceId: `w_${c.attemptKey}`,
+        herdrPaneId: `p_${c.attemptKey}`,
+        herdrAgentIdentity: `ds-${c.attemptKey}`,
+        herdrAgentKind: "agy",
+        promptNonce: `NONCE-${c.attemptKey}`,
+        canonicalWorktreePath: projectRoot,
+        workspaceId: "ws_fence_test",
+        gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+        attemptKey: c.attemptKey,
+        dispatchIntentHash: intentHash,
+        launchTimestamp: new Date().toISOString(),
+        enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+      };
+
+      manager1.bindHerdrExternalHandle(startRes.agentId, handle);
+
+      const spyGateway1 = new SpyPromptGateway("/tmp/herdr.sock", defaultHerdrGatewayRegistry, (manager1 as any).store);
+      spyGateway1.mockPromptOutcome = c.outcome;
+
+      // 1. Submit first prompt
+      if (c.outcome === "error") {
+        await assert.rejects(
+          async () => spyGateway1.promptExternalAgent(handle, "first prompt", { store: (manager1 as any).store }),
+          /Simulated socket network disconnect/,
+        );
+      } else {
+        const res = await spyGateway1.promptExternalAgent(handle, "first prompt", { store: (manager1 as any).store });
+        if (c.outcome === "done") assert.equal(res.status, "done");
+        if (c.outcome === "timeout") assert.equal(res.status, "OUTCOME_UNKNOWN");
+        if (c.outcome === "blocked") assert.equal(res.status, "blocked");
+      }
+      assert.equal(spyGateway1.promptCallCount, 1, `${c.name}: first prompt must call external agent once`);
+
+      // 2. Simulate DevSpace restart: clear process registry and instantiate fresh manager2
+      defaultHerdrGatewayRegistry.releaseHandle(c.attemptKey);
+      manager1.close();
+
+      const manager2 = new LocalAgentSessionManager(config, async () => {}, async () => true);
+      const recoveredHandle = manager2.getHerdrExternalHandle(c.attemptKey);
+      assert.ok(recoveredHandle, `${c.name}: handle must recover from store`);
+
+      const spyGateway2 = new SpyPromptGateway("/tmp/herdr.sock", defaultHerdrGatewayRegistry, (manager2 as any).store);
+      assert.equal(spyGateway2.promptCallCount, 0);
+
+      // 3. Second prompt on same attempt after restart MUST fail closed with [N-TURN-OPTION-A]
+      await assert.rejects(
+        async () => spyGateway2.promptExternalAgent(recoveredHandle!, "second prompt after restart", { store: (manager2 as any).store }),
+        /\[N-TURN-OPTION-A\]/,
+        `${c.name}: second prompt must be rejected with [N-TURN-OPTION-A]`,
+      );
+
+      // 4. CRUCIAL ASSERTION: Zero external agent.prompt calls made on the second prompt
+      assert.equal(
+        spyGateway2.promptCallCount,
+        0,
+        `${c.name}: external agent.prompt call count must be 0 on second prompt after restart`,
+      );
+
+      manager2.close();
+    } finally {
+      defaultHerdrGatewayRegistry.releaseHandle(c.attemptKey);
+      rmSync(stateDir, { recursive: true, force: true });
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
   }
 });

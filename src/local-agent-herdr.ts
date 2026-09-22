@@ -2,6 +2,7 @@ import { createConnection, type Socket } from "node:net";
 import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve, normalize } from "node:path";
+import type { LocalAgentStore } from "./local-agent-store.js";
 
 export const HERDR_DEFAULT_SOCKET_PATH = process.env.HERDR_SOCKET_PATH || "/Users/james/.config/herdr/herdr.sock";
 export const HERDR_RUNTIME_KIND = "HERDR" as const;
@@ -17,6 +18,7 @@ export type HerdrEnforcementState =
 export interface HerdrExternalHandle {
   schemaVersion: 1;
   runtimeKind: typeof HERDR_RUNTIME_KIND;
+  agentId?: string;
   herdrSocketPath: string;
   herdrServerIdentity?: string;
   herdrWorkspaceId: string;
@@ -55,6 +57,7 @@ export interface StartHerdrAgentParams {
 export interface HerdrPromptOptions {
   timeoutMs?: number;
   until?: string[];
+  store?: LocalAgentStore;
 }
 
 export interface HerdrPromptResult {
@@ -257,7 +260,12 @@ export class HerdrThinGateway {
   constructor(
     private readonly socketPath: string = HERDR_DEFAULT_SOCKET_PATH,
     private readonly registry: HerdrGatewayRegistry = defaultHerdrGatewayRegistry,
+    private readonly store?: LocalAgentStore,
   ) {}
+
+  protected async sendRequest<T = unknown>(req: HerdrSocketRequest, timeoutMs: number = 10_000): Promise<HerdrSocketResponse<T>> {
+    return sendHerdrSocketRequest<T>(req, this.socketPath, timeoutMs);
+  }
 
   /**
    * Start a bounded external agent in HerdR.
@@ -457,14 +465,52 @@ export class HerdrThinGateway {
     promptText: string,
     options: HerdrPromptOptions = {},
   ): Promise<HerdrPromptResult> {
-    // Option A (B4): One consequential prompt per attempt. Reject subsequent prompts on same handle.
+    const effectiveStore = options.store ?? this.store;
+
+    // Fast in-memory registry check (Option A / B4)
     if (this.registry.hasPromptSubmitted(handle.attemptKey)) {
       throw new Error(
         `[N-TURN-OPTION-A] attemptKey '${handle.attemptKey}' has already submitted a consequential prompt; subsequent prompts on same handle are rejected.`,
       );
     }
 
-    // A7: Busy check (N-TURN)
+    // Durable check and CAS fence in store BEFORE any external socket effect (Blocker A)
+    if (effectiveStore) {
+      let record = handle.agentId ? effectiveStore.getById(handle.agentId) : undefined;
+      if (!record) {
+        const rows = effectiveStore.list();
+        record = rows.find(
+          (r) =>
+            r.startReplay?.key === handle.attemptKey ||
+            (r.externalRuntimeBinding?.handle &&
+              typeof r.externalRuntimeBinding.handle === "object" &&
+              (r.externalRuntimeBinding.handle as Record<string, unknown>).attemptKey === handle.attemptKey),
+        );
+      }
+
+      if (record?.externalRuntimeBinding?.promptState?.consequentialPromptFenced) {
+        this.registry.markPromptSubmitted(handle.attemptKey);
+        throw new Error(
+          `[N-TURN-OPTION-A] attemptKey '${handle.attemptKey}' has already submitted a consequential prompt; subsequent prompts on same handle are rejected.`,
+        );
+      }
+
+      const fenceRes = effectiveStore.fenceConsequentialPromptCAS({
+        agentId: handle.agentId ?? record?.id,
+        attemptKey: handle.attemptKey,
+        promptNonce: handle.promptNonce,
+      });
+
+      if (!fenceRes.applied) {
+        this.registry.markPromptSubmitted(handle.attemptKey);
+        throw new Error(
+          `[N-TURN-OPTION-A] attemptKey '${handle.attemptKey}' prompt fence CAS failed (already fenced or conflict); cannot prompt external agent.`,
+        );
+      }
+    }
+
+    // Mark prompt as submitted under Option A
+    this.registry.markPromptSubmitted(handle.attemptKey);
     const agentInfo = await this.getAgent(handle.herdrAgentIdentity);
     if (agentInfo && (agentInfo.agent_status === "running" || agentInfo.agent_status === "prompting" || !agentInfo.interactive_ready)) {
       throw new Error(
@@ -498,9 +544,9 @@ export class HerdrThinGateway {
     };
 
     try {
-      const res = await sendHerdrSocketRequest<{
+      const res = await this.sendRequest<{
         agent: { agent_status: string; interactive_ready: boolean };
-      }>(req, this.socketPath, timeoutMs + 5000);
+      }>(req, timeoutMs + 5000);
 
       if (res.error) {
         // N3: timeout or stalled prompt maps strictly to OUTCOME_UNKNOWN

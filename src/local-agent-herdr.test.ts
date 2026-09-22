@@ -258,29 +258,29 @@ test("HerdrThinGateway enforces Option A turn identity and durable nonce binding
 
   registry.registerHandle(handle);
 
-  let capturedPrompt = "";
   (gateway as any).getAgent = async () => ({
     agent_status: "idle",
     interactive_ready: true,
   });
   (gateway as any).readPane = async () => "ready\n";
 
-  // Spy on socket client
-  const origSend = (globalThis as any).sendHerdrSocketRequest;
-  // Mock internal execution of promptExternalAgent by replacing sendHerdrSocketRequest
-  // We can mock it by intercepting or stubbing
-  const sentRequests: any[] = [];
-  // Mock sendHerdrSocketRequest in gateway context by stubbing the underlying method or call
-  (gateway as any).sendPromptReq = async (req: any) => {
-    sentRequests.push(req);
-    return { result: { agent: { agent_status: "done", interactive_ready: true } } };
+  let capturedPrompt = "";
+  (gateway as any).sendRequest = async (req: any) => {
+    if (req.method === "agent.prompt") {
+      capturedPrompt = req.params?.text ?? "";
+      return { result: { agent: { agent_status: "done", interactive_ready: true } } };
+    }
+    return { result: {} };
   };
 
-  // Mock getAgent and readPane, but test Option A logic
   assert.equal(registry.hasPromptSubmitted(attemptKey), false);
 
-  // Directly test registry and gate Option A enforcement
-  registry.markPromptSubmitted(attemptKey);
+  // T1: First prompt submits successfully and embeds durable promptNonce
+  const firstRes = await gateway.promptExternalAgent(handle, "first prompt on handle");
+  assert.equal(firstRes.status, "done");
+  assert.equal(firstRes.turnNonce, handle.promptNonce);
+  assert.ok(capturedPrompt.includes(`[NEXUS_ATTEMPT_NONCE:${handle.promptNonce}]`));
+  assert.ok(capturedPrompt.includes("first prompt on handle"));
   assert.equal(registry.hasPromptSubmitted(attemptKey), true);
 
   // T2: Second prompt rejected under Option A

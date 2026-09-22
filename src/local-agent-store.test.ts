@@ -10,6 +10,7 @@ import {
   buildLocalEffectEnforcementReceipt,
   LOCAL_EFFECT_PROJECTION_SCHEMA,
 } from "./local-effect-enforcement.js";
+import { hashDispatchIntent } from "./execution-protocol.js";
 
 const root = mkdtempSync(join(tmpdir(), "devspace-local-agent-store-test-"));
 const stores: LocalAgentStore[] = [];
@@ -1116,6 +1117,161 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
   assert.ok(legacyV1Record);
   assert.equal(legacyV1Record.startReplay?.key, "legacy-key");
   assert.equal(legacyV1Record.externalRuntimeBinding, undefined);
+
+  // Case G: Negative controls for CAS fail-closed on missing authority evidence (Blocker B)
+  // CAS-MISSING-ATTEMPT: startReplay absent, expectedAttemptKey supplied -> applied: false
+  const noReplayAgent = store.create({
+    workspaceId: "ws_no_replay",
+    workspaceRoot: join(root, "no_replay"),
+    profileName: "reviewer",
+    provider: "agy",
+  });
+  const missingAttemptRes = store.bindExternalRuntimeBindingCAS({
+    agentId: noReplayAgent.id,
+    expectedAttemptKey: "some-attempt-key",
+    binding: testBinding,
+  });
+  assert.equal(missingAttemptRes.applied, false, "CAS-MISSING-ATTEMPT must fail closed");
+
+  // CAS-MISSING-DISPATCH: dispatchIntent absent, expectedDispatchIntentHash supplied -> applied: false
+  const missingDispatchRes = store.bindExternalRuntimeBindingCAS({
+    agentId: noReplayAgent.id,
+    expectedDispatchIntentHash: "intent-hash-xyz",
+    binding: testBinding,
+  });
+  assert.equal(missingDispatchRes.applied, false, "CAS-MISSING-DISPATCH must fail closed");
+
+  // CAS-WRONG-ATTEMPT: startReplay is attempt-bind-wrong, expected is attempt-bind-expected -> applied: false
+  const wrongReplayAgent = store.create({
+    workspaceId: "ws_wrong_replay",
+    workspaceRoot: join(root, "wrong_replay"),
+    profileName: "reviewer",
+    provider: "agy",
+    startReplay: {
+      key: "attempt-bind-stored",
+      requestHash: "hash-stored",
+    },
+  });
+  const wrongAttemptRes = store.bindExternalRuntimeBindingCAS({
+    agentId: wrongReplayAgent.id,
+    expectedAttemptKey: "attempt-bind-expected",
+    binding: testBinding,
+  });
+  assert.equal(wrongAttemptRes.applied, false, "CAS-WRONG-ATTEMPT must fail closed");
+
+  // CAS-WRONG-DISPATCH: executionContract.dispatchIntent has different hash -> applied: false
+  const dispatchAgent = store.create({
+    workspaceId: "ws_dispatch",
+    workspaceRoot: join(root, "dispatch"),
+    profileName: "reviewer",
+    provider: "agy",
+    executionContract: {
+      writePaths: ["src/local-agent-store.ts"],
+      dispatchIntent: {
+        taskId: "task-intent-1",
+        attemptId: "attempt-intent-1",
+        objective: "Implement one bounded controller-contract seam.",
+        roleIntent: "DEEP_ENGINEERING",
+        claimCeiling: "CANDIDATE_READY",
+        context: ["Preserve existing execution mechanics."],
+        readScope: ["src"],
+        writeScope: ["src/local-agent-store.ts"],
+        exclusiveOwnership: true,
+        forbiddenChanges: ["Do not add route or acceptance authority to Dev MCP."],
+        acceptanceCriteria: ["Typed controller intent is durable and independently inspectable."],
+        verificationRequired: true,
+        expectedArtifacts: ["source diff"],
+      },
+    },
+    startReplay: {
+      key: "attempt-intent-1",
+      requestHash: "hash-intent-1",
+    },
+  });
+  const wrongDispatchRes = store.bindExternalRuntimeBindingCAS({
+    agentId: dispatchAgent.id,
+    expectedAttemptKey: "attempt-intent-1",
+    expectedDispatchIntentHash: "sha256-wrong-intent-hash",
+    binding: {
+      runtimeKind: "HERDR",
+      handle: { attemptKey: "attempt-intent-1" },
+    },
+  });
+  assert.equal(wrongDispatchRes.applied, false, "CAS-WRONG-DISPATCH must fail closed");
+
+  // CAS-CONCURRENT-UPDATE: stale updated_at -> applied: false
+  const staleUpdateRes = store.bindExternalRuntimeBindingCAS({
+    agentId: dispatchAgent.id,
+    expectedAttemptKey: "attempt-intent-1",
+    expectedUpdatedAt: "1970-01-01T00:00:00.000Z",
+    binding: {
+      runtimeKind: "HERDR",
+      handle: { attemptKey: "attempt-intent-1" },
+    },
+  });
+  assert.equal(staleUpdateRes.applied, false, "CAS-CONCURRENT-UPDATE must fail closed");
+
+  // CAS-EXACT: exact match for attemptKey and dispatchIntentHash -> applied: true
+  const correctDispatchHash = hashDispatchIntent(dispatchAgent.executionContract!.dispatchIntent!);
+  const exactRes = store.bindExternalRuntimeBindingCAS({
+    agentId: dispatchAgent.id,
+    expectedAttemptKey: "attempt-intent-1",
+    expectedDispatchIntentHash: correctDispatchHash,
+    expectedUpdatedAt: dispatchAgent.updatedAt,
+    binding: {
+      runtimeKind: "HERDR",
+      handle: { attemptKey: "attempt-intent-1" },
+    },
+  });
+  assert.equal(exactRes.applied, true, "CAS-EXACT must succeed");
+
+  // Case H: fenceConsequentialPromptCAS (Blocker A)
+  // 1. Cannot fence unbound agent
+  const unBoundFenceRes = store.fenceConsequentialPromptCAS({
+    agentId: noReplayAgent.id,
+    promptNonce: "nonce-unbound",
+  });
+  assert.equal(unBoundFenceRes.applied, false, "Cannot fence agent without externalRuntimeBinding");
+
+  // 2. Fence bound agent succeeds
+  const fenceRes1 = store.fenceConsequentialPromptCAS({
+    agentId: dispatchAgent.id,
+    promptNonce: "nonce-dispatch-1",
+  });
+  assert.equal(fenceRes1.applied, true, "fenceConsequentialPromptCAS must succeed");
+  const postFenceRecord = store.getById(dispatchAgent.id)!;
+  assert.equal(postFenceRecord.externalRuntimeBinding?.promptState?.consequentialPromptFenced, true);
+  assert.equal(postFenceRecord.externalRuntimeBinding?.promptState?.promptNonce, "nonce-dispatch-1");
+  assert.ok(postFenceRecord.externalRuntimeBinding?.promptState?.fencedAt);
+
+  // 3. Second fence on same agent/attemptKey fails CAS (Blocker A: one consequential prompt fence)
+  const fenceRes2 = store.fenceConsequentialPromptCAS({
+    agentId: dispatchAgent.id,
+    promptNonce: "nonce-dispatch-2",
+  });
+  assert.equal(fenceRes2.applied, false, "Second fence must fail CAS");
+
+  // 4. Fence by attemptKey lookup fails because already fenced
+  const fenceByAttemptRes = store.fenceConsequentialPromptCAS({
+    attemptKey: "attempt-intent-1",
+    promptNonce: "nonce-dispatch-3",
+  });
+  assert.equal(fenceByAttemptRes.applied, false, "Fence by attemptKey lookup must fail when already fenced");
+
+  // 5. DevSpace restart persistence: create a second store instance on same directory
+  const reopenedStore = new LocalAgentStore(root);
+  stores.push(reopenedStore);
+  const reopenedRecord = reopenedStore.getById(dispatchAgent.id)!;
+  assert.ok(reopenedRecord);
+  assert.equal(reopenedRecord.externalRuntimeBinding?.promptState?.consequentialPromptFenced, true);
+  assert.equal(reopenedRecord.externalRuntimeBinding?.promptState?.promptNonce, "nonce-dispatch-1");
+
+  // Fence on reopened store fails CAS
+  const reopenedFenceRes = reopenedStore.fenceConsequentialPromptCAS({
+    attemptKey: "attempt-intent-1",
+    promptNonce: "nonce-after-restart",
+  });
+  assert.equal(reopenedFenceRes.applied, false, "Fence after restart must fail CAS on already fenced attempt");
 
 } finally {
   for (const store of stores) {

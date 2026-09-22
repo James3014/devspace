@@ -90,6 +90,7 @@ import {
   HerdrThinGateway,
   defaultHerdrGatewayRegistry,
   HERDR_RUNTIME_KIND,
+  HERDR_DEFAULT_SOCKET_PATH,
 } from "./local-agent-herdr.js";
 
 function catalogSnapshotIsFresh(fetchedAt: string | undefined, expiresAt: string | undefined): boolean {
@@ -530,7 +531,7 @@ export class LocalAgentSessionManager {
     this.clineCatalogService = clineCatalogService ?? new ClineCatalogServiceImpl();
     this.opencodeCatalogSource = opencodeCatalogSource ?? createMcpOpencodeCatalogSource();
     this.ownsOpencodeCatalogSource = opencodeCatalogSource === undefined;
-    this.herdrGateway = herdrGateway ?? new HerdrThinGateway();
+    this.herdrGateway = herdrGateway ?? new HerdrThinGateway(HERDR_DEFAULT_SOCKET_PATH, defaultHerdrGatewayRegistry, this.store);
     this.runtimeBuildIdentity = runtimeBuildIdentity ?? describeRuntimeBuildIdentity({
       env: process.env,
       listenPort: config.port,
@@ -546,6 +547,13 @@ export class LocalAgentSessionManager {
     this.closed = true;
     this.store.close();
     if (this.ownsOpencodeCatalogSource) this.opencodeCatalogSource.close();
+  }
+
+  /**
+   * Return the manager's configured HerdrThinGateway.
+   */
+  getHerdrGateway(): HerdrThinGateway {
+    return this.herdrGateway;
   }
 
   /**
@@ -573,11 +581,14 @@ export class LocalAgentSessionManager {
       );
     }
 
+    handle.agentId = agentId;
+
     // B1 / B2: Durable persistence via store CAS. Fail closed if CAS fails.
     const cas = this.store.bindExternalRuntimeBindingCAS({
       agentId,
       expectedAttemptKey: handle.attemptKey,
       expectedDispatchIntentHash: handle.dispatchIntentHash,
+      expectedUpdatedAt: record.updatedAt,
       binding: {
         runtimeKind: HERDR_RUNTIME_KIND,
         handle: handle as unknown as Record<string, unknown>,
@@ -599,6 +610,7 @@ export class LocalAgentSessionManager {
   /**
    * Retrieve a bound HerdrExternalHandle by agentId or attemptKey.
    * Enforces B1 / B2: re-hydrates from durable store record externalRuntimeBinding if absent in memory.
+   * Enforces Option A / Blocker A: rehydrates durable promptState into gateway registry.
    */
   getHerdrExternalHandle(agentIdOrAttemptKey: string): HerdrExternalHandle | undefined {
     // 1. Check in-memory map
@@ -630,7 +642,11 @@ export class LocalAgentSessionManager {
     }
 
     if (handle) {
+      if (rec?.id) handle.agentId = rec.id;
       defaultHerdrGatewayRegistry.registerHandle(handle);
+      if (rec?.externalRuntimeBinding?.promptState?.consequentialPromptFenced) {
+        defaultHerdrGatewayRegistry.markPromptSubmitted(handle.attemptKey);
+      }
       if (rec) this.herdrHandles.set(rec.id, handle);
       this.herdrHandles.set(handle.attemptKey, handle);
       return handle;

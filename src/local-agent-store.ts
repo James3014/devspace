@@ -78,16 +78,31 @@ export interface PhysicalTerminationState {
   previousWorkerToken?: string;
 }
 
+export interface ExternalRuntimePromptState {
+  consequentialPromptFenced: boolean;
+  promptNonce: string;
+  fencedAt: string;
+}
+
 export interface ExternalRuntimeBinding {
   runtimeKind: string;
   handle: Record<string, unknown>;
+  promptState?: ExternalRuntimePromptState;
 }
 
 export interface BindExternalRuntimeBindingInput {
   agentId: string;
   expectedAttemptKey?: string;
   expectedDispatchIntentHash?: string;
+  expectedUpdatedAt?: string;
   binding: ExternalRuntimeBinding;
+}
+
+export interface FenceConsequentialPromptInput {
+  agentId?: string;
+  attemptKey?: string;
+  promptNonce: string;
+  expectedUpdatedAt?: string;
 }
 
 export interface LocalAgentRecord {
@@ -606,7 +621,7 @@ export class LocalAgentStore {
         updatedProviderContinuityState,
         updated.workerPid ?? null,
         updated.workerToken ?? null,
-        serializeStoredExecutionState(updated.executionContract, updated.startReplay),
+        serializeStoredExecutionState(updated.executionContract, updated.startReplay, updated.externalRuntimeBinding),
         serializeExecutionGenerationBinding(updated.executionGeneration),
         updated.terminalReason ?? null,
         updated.scopeState ?? null,
@@ -965,22 +980,24 @@ export class LocalAgentStore {
       const current = this.getById(input.agentId);
       if (!current) return { applied: false };
 
-      // Validate attemptKey consistency if startReplay exists
-      if (
-        input.expectedAttemptKey &&
-        current.startReplay?.key &&
-        current.startReplay.key !== input.expectedAttemptKey
-      ) {
+      if (input.expectedUpdatedAt !== undefined && current.updatedAt !== input.expectedUpdatedAt) {
         return { applied: false, previous: current, current };
       }
 
-      // Validate dispatchIntentHash consistency if executionContract.dispatchIntent exists
-      if (
-        input.expectedDispatchIntentHash &&
-        current.executionContract?.dispatchIntent
-      ) {
+      // Fail closed on attemptKey consistency
+      if (input.expectedAttemptKey !== undefined) {
+        if (!current.startReplay?.key || current.startReplay.key !== input.expectedAttemptKey) {
+          return { applied: false, previous: current, current };
+        }
+      }
+
+      // Fail closed on dispatchIntentHash consistency
+      if (input.expectedDispatchIntentHash !== undefined) {
+        if (!current.executionContract?.dispatchIntent) {
+          return { applied: false, previous: current, current };
+        }
         const currentHash = hashDispatchIntent(current.executionContract.dispatchIntent);
-        if (currentHash !== input.expectedDispatchIntentHash) {
+        if (!currentHash || currentHash !== input.expectedDispatchIntentHash) {
           return { applied: false, previous: current, current };
         }
       }
@@ -1013,6 +1030,71 @@ export class LocalAgentStore {
       return { applied: result.changes === 1, previous: current, current: refreshed };
     });
     return bind.immediate();
+  }
+
+  fenceConsequentialPromptCAS(input: FenceConsequentialPromptInput): LifecycleCasResult {
+    const fence = this.database.sqlite.transaction(() => {
+      let current: LocalAgentRecord | undefined;
+      if (input.agentId) {
+        current = this.getById(input.agentId);
+      }
+      if (!current && input.attemptKey) {
+        const rows = this.database.sqlite
+          .prepare("select * from local_agent_sessions")
+          .all() as LocalAgentRow[];
+        const match = rows.find((row) => {
+          const state = readStoredExecutionState(row.execution_contract);
+          return (
+            state.startReplay?.key === input.attemptKey ||
+            (state.externalRuntimeBinding?.handle &&
+              typeof state.externalRuntimeBinding.handle === "object" &&
+              (state.externalRuntimeBinding.handle as Record<string, unknown>).attemptKey === input.attemptKey)
+          );
+        });
+        if (match) current = rowToLocalAgentRecord(match);
+      }
+
+      if (!current) return { applied: false };
+
+      if (input.expectedUpdatedAt !== undefined && current.updatedAt !== input.expectedUpdatedAt) {
+        return { applied: false, previous: current, current };
+      }
+
+      // If already fenced, fail CAS
+      if (current.externalRuntimeBinding?.promptState?.consequentialPromptFenced) {
+        return { applied: false, previous: current, current };
+      }
+
+      // If externalRuntimeBinding does not exist, fail CAS
+      if (!current.externalRuntimeBinding) {
+        return { applied: false, previous: current, current };
+      }
+
+      const now = new Date().toISOString();
+      const updatedBinding: ExternalRuntimeBinding = {
+        ...current.externalRuntimeBinding,
+        promptState: {
+          consequentialPromptFenced: true,
+          promptNonce: input.promptNonce,
+          fencedAt: now,
+        },
+      };
+
+      const serialized = serializeStoredExecutionState(
+        current.executionContract,
+        current.startReplay,
+        updatedBinding,
+      );
+
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set execution_contract = ?, updated_at = ?
+         where id = ? and updated_at = ?`,
+      ).run(serialized, now, current.id, current.updatedAt);
+
+      const refreshed = this.getById(current.id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return fence.immediate();
   }
 
   finishTurnCAS(input: FinishTurnCasInput): LifecycleCasResult {
@@ -1643,8 +1725,13 @@ function readStoredExecutionState(value: string | null | undefined): {
         ? undefined
         : deserializeExecutionContract(JSON.stringify(parsed.executionContract));
       const bindingRaw = parsed.externalRuntimeBinding as Record<string, unknown> | undefined;
+      const promptState = readExternalRuntimePromptState(bindingRaw?.promptState);
       const externalRuntimeBinding = bindingRaw && typeof bindingRaw.runtimeKind === "string" && bindingRaw.handle && typeof bindingRaw.handle === "object"
-        ? { runtimeKind: bindingRaw.runtimeKind, handle: bindingRaw.handle as Record<string, unknown> }
+        ? {
+            runtimeKind: bindingRaw.runtimeKind,
+            handle: bindingRaw.handle as Record<string, unknown>,
+            ...(promptState ? { promptState } : {}),
+          }
         : undefined;
       return { executionContract, startReplay, externalRuntimeBinding };
     }
@@ -1662,6 +1749,23 @@ function readStoredExecutionState(value: string | null | undefined): {
   } catch {
     return {};
   }
+}
+
+function readExternalRuntimePromptState(value: unknown): ExternalRuntimePromptState | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.consequentialPromptFenced === "boolean" &&
+    typeof record.promptNonce === "string" &&
+    typeof record.fencedAt === "string"
+  ) {
+    return {
+      consequentialPromptFenced: record.consequentialPromptFenced,
+      promptNonce: record.promptNonce,
+      fencedAt: record.fencedAt,
+    };
+  }
+  return undefined;
 }
 
 function readStatus(status: string): LocalAgentStatus {
