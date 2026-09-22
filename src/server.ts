@@ -6815,15 +6815,14 @@ export function createServer(
     void transports
       .closeIdle(config.mcpSessionIdleTimeoutMs)
       .then((results) => logSessionCloseResults("idle_timeout", results))
-      .then(() => enumerateDurableReconciliationState())
-      .then((durableBundle) => {
+      .then(() => {
         const metrics = transports.metrics();
         const cutoverRecord = cutoverController.record();
         logEvent(config.logging, "info", "mcp_metrics", {
           ...metrics,
           durable: {
-            workspaceSessions: durableBundle.workspaceSessions,
-            agentSessions: durableBundle.agentSessions,
+            workspaceSessions: workspaceStore.listSessions().length,
+            agentSessions: agentSessionManager ? agentSessionManager.countAllAgentRecords() : 0,
           },
           cutoverBacklog: {
             active: cutoverController.mode() !== "normal",
