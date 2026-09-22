@@ -162,6 +162,24 @@ export interface CoreMutationPhysicalSnapshot {
   objectStorage: "CALLER_EXISTING" | "ISOLATED_TEMPORARY";
 }
 
+export interface CoreMutationOrphanProcessRecoveryEvidence {
+  expectedOriginalActorKey: string;
+  expectedSourceHead: string;
+  expectedSourceTree: string;
+  expectedCurrentHead: string;
+  expectedTargetTree: string;
+  expectedDiffHash: string;
+  expectedChangedPaths: string[];
+  expectedDeletedPaths: string[];
+}
+
+export interface CoreMutationOrphanProcessRecoveryResult {
+  session: CoreMutationSessionRecord;
+  snapshot: CoreMutationPhysicalSnapshot;
+  observedWriterState: "CLEAR" | "UNKNOWN";
+  alreadyReconciled: boolean;
+}
+
 export interface CoreMutationCandidateProvenance {
   candidateHead: string;
   candidateTree: string;
@@ -1085,6 +1103,101 @@ export class CoreMutationSessionStore {
       provenance.createdAt,
     );
     return this.getCandidate(input.candidateHead)!;
+  }
+
+  async recoverOrphanedProcessEffect(input: {
+    sessionId: string;
+    workspaceSessionId: string;
+    workspaceRoot: string;
+    recoveryActorKey: string;
+    bindingHash: string;
+    evidence: CoreMutationOrphanProcessRecoveryEvidence;
+    inspectProcessWriter: (session: CoreMutationSessionRecord) => Promise<"CLEAR" | "ACTIVE" | "UNKNOWN"> | "CLEAR" | "ACTIVE" | "UNKNOWN";
+    now?: Date;
+  }): Promise<CoreMutationOrphanProcessRecoveryResult> {
+    const record = this.getByIdRaw(input.sessionId);
+    if (!record || record.workspaceSessionId !== input.workspaceSessionId) {
+      throw new CoreMutationSessionError("CORE_MUTATION_SESSION_NOT_FOUND", "Core mutation session is not bound to this workspace.");
+    }
+    if (!input.recoveryActorKey || input.recoveryActorKey === record.actorKey) {
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_RECOVERY_ACTOR_INVALID",
+        "Owner recovery is only for an orphaned session whose original caller identity is unavailable.",
+      );
+    }
+    if (record.actorKey !== input.evidence.expectedOriginalActorKey) {
+      throw new CoreMutationSessionError("CORE_MUTATION_RECOVERY_ACTOR_MISMATCH", "Original Core mutation actor does not match recovery evidence.");
+    }
+    this.assertPointer(record, { sessionId: input.sessionId, bindingHash: input.bindingHash });
+    if (record.sourceHead !== input.evidence.expectedSourceHead || record.sourceTree !== input.evidence.expectedSourceTree) {
+      throw new CoreMutationSessionError("CORE_MUTATION_RECOVERY_SOURCE_MISMATCH", "Core source identity does not match recovery evidence.");
+    }
+    if (record.freshnessState !== "FRESH" || record.rebindState !== "BOUND_CURRENT") {
+      throw new CoreMutationSessionError("CORE_MUTATION_REBIND_REQUIRED", "Owner recovery requires a fresh, currently bound Core session.");
+    }
+    const processOnly = record.writerDomains.length === 1 && record.writerDomains[0] === "PROCESS";
+    const alreadyReconciled = record.writerReconciliationState === "CLEAR" && record.writerDomains.length === 0;
+    if (record.status !== "ACTIVE" || (!processOnly && !alreadyReconciled)) {
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_RECOVERY_NOT_APPLICABLE",
+        "Owner recovery only applies to an ACTIVE PROCESS-only OUTCOME_UNKNOWN session or an exact idempotent replay after recovery.",
+      );
+    }
+    if (processOnly && record.writerReconciliationState !== "OUTCOME_UNKNOWN") {
+      throw new CoreMutationSessionError("CORE_MUTATION_RECOVERY_NOT_APPLICABLE", "PROCESS recovery requires OUTCOME_UNKNOWN writer state.");
+    }
+    const observedWriterState = await input.inspectProcessWriter(record);
+    if (observedWriterState === "ACTIVE") {
+      throw new CoreMutationSessionError("CORE_MUTATION_RECOVERY_WRITER_ACTIVE", "A matching PROCESS writer is still active; owner recovery is not permitted.");
+    }
+    const snapshot = await materializeSnapshot(input.workspaceRoot, record);
+    if (snapshot.scopeEscapePaths.length > 0) {
+      this.markRebindRequired(record.id);
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_POST_EFFECT_SCOPE_ESCAPE",
+        `Recovered PROCESS effect changed paths outside AcceptanceContract: ${snapshot.scopeEscapePaths.join(", ")}.`,
+      );
+    }
+    if (snapshot.deletionViolation) {
+      this.markRebindRequired(record.id);
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_POST_EFFECT_DELETION_FORBIDDEN",
+        `Recovered PROCESS effect deleted forbidden paths: ${snapshot.deletedPaths.join(", ")}.`,
+      );
+    }
+    if (
+      snapshot.currentHead !== input.evidence.expectedCurrentHead ||
+      snapshot.targetTree !== input.evidence.expectedTargetTree ||
+      snapshot.diffHash !== input.evidence.expectedDiffHash ||
+      !sameStringSet(snapshot.changedPaths, input.evidence.expectedChangedPaths) ||
+      !sameStringSet(snapshot.deletedPaths, input.evidence.expectedDeletedPaths)
+    ) {
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_RECOVERY_PHYSICAL_MISMATCH",
+        "Current physical workspace does not match the exact owner recovery evidence.",
+      );
+    }
+    if (alreadyReconciled) {
+      return { session: record, snapshot, observedWriterState, alreadyReconciled: true };
+    }
+    const now = (input.now ?? new Date()).toISOString();
+    const reconciled = this.database.sqlite.prepare(`
+      update core_mutation_sessions
+      set writer_domains_json = '[]', writer_reconciliation_state = 'CLEAR', updated_at = ?
+      where id = ? and status = 'ACTIVE' and actor_key = ? and binding_hash = ?
+        and updated_at = ? and freshness_state = 'FRESH' and rebind_state = 'BOUND_CURRENT'
+        and writer_reconciliation_state = 'OUTCOME_UNKNOWN' and writer_domains_json = '["PROCESS"]'
+    `).run(
+      now,
+      record.id,
+      record.actorKey,
+      record.bindingHash,
+      record.updatedAt,
+    );
+    if (reconciled.changes !== 1) {
+      throw new CoreMutationSessionError("CORE_MUTATION_RECONCILE_REQUIRED", "Core session changed during owner recovery inspection; recovery CAS lost.");
+    }
+    return { session: this.getByIdRaw(record.id)!, snapshot, observedWriterState, alreadyReconciled: false };
   }
 
   async reconcileSynchronousEffect(input: {

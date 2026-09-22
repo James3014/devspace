@@ -43,7 +43,7 @@ import {
   NEXUS_CORE_PROTOCOL_VERSION,
   type RepositoryMutationBinding,
 } from "./core-mutation-session.js";
-import { CORE_MUTATION_TEST_ONLY_UNTRUSTED_BYPASS } from "./core-mutation-tools.js";
+import { assertCoreMutationRecoveryOwnerClient, CORE_MUTATION_TEST_ONLY_UNTRUSTED_BYPASS } from "./core-mutation-tools.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -1083,6 +1083,7 @@ async function fixture(
     chatSwarm?: boolean;
     controlPlaneInventory?: ControlPlaneInventory;
     coreMutation?: boolean | "enforced_missing";
+    coreMutationRecoveryOwnerClientId?: string;
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
@@ -1132,6 +1133,7 @@ async function fixture(
     DEVSPACE_GIT_CANDIDATES: options.gitCandidates ? "true" : "false",
     DEVSPACE_TOOLCHAINS: options.toolchains,
     DEVSPACE_CHAT_SWARM: options.chatSwarm ? "1" : "0",
+    DEVSPACE_CORE_MUTATION_RECOVERY_OWNER_CLIENT_ID: options.coreMutationRecoveryOwnerClientId,
   });
   let config: ServerConfig = {
     ...loadedConfig,
@@ -1621,6 +1623,29 @@ test("Core-bound mutation session tools are registered for durable mutation admi
   assert.ok(tools.tools.some((tool) => tool.name === "core_mutation_session_open"));
   assert.ok(tools.tools.some((tool) => tool.name === "core_mutation_session_status"));
   assert.ok(tools.tools.some((tool) => tool.name === "core_mutation_session_reconcile_synchronous"));
+});
+
+test("Core orphan PROCESS recovery tool is opt-in and exact-owner-client fenced", async (t) => {
+  const disabled = await fixture(t, { coreMutation: true });
+  const disabledTools = await disabled.client.listTools();
+  assert.equal(disabledTools.tools.some((tool) => tool.name === "core_mutation_session_recover_orphaned_process"), false);
+
+  const ownerClientId = "devspace-core-recovery-owner";
+  const enabled = await fixture(t, { coreMutation: true, coreMutationRecoveryOwnerClientId: ownerClientId });
+  const enabledTools = await enabled.client.listTools();
+  assert.equal(enabledTools.tools.some((tool) => tool.name === "core_mutation_session_recover_orphaned_process"), true);
+
+  assert.throws(
+    () => assertCoreMutationRecoveryOwnerClient({}, ownerClientId),
+    /CORE_MUTATION_RECOVERY_OWNER_REQUIRED/,
+  );
+  assert.throws(
+    () => assertCoreMutationRecoveryOwnerClient({ authInfo: { clientId: "foreign-client" } }, ownerClientId),
+    /CORE_MUTATION_RECOVERY_OWNER_REQUIRED/,
+  );
+  const owner = assertCoreMutationRecoveryOwnerClient({ authInfo: { clientId: ownerClientId } }, ownerClientId);
+  assert.equal(owner.clientId, ownerClientId);
+  assert.equal(owner.recoveryActorKey, `mcp:${createHash("sha256").update(ownerClientId).digest("hex")}`);
 });
 
 test("Core mutation snapshot tool returns the physical snapshot over MCP", async (t) => {
