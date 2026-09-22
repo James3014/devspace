@@ -29,7 +29,7 @@ export interface HerdrExternalHandle {
   effectiveModel?: string;
   effectiveEffort?: string;
   nativeProviderSessionId?: string;
-  launchGeneration: number;
+  launchGeneration?: number;
   promptNonce: string;
   canonicalWorktreePath: string;
   workspaceId: string;
@@ -57,6 +57,7 @@ export interface HerdrPromptOptions {
 }
 
 export interface HerdrPromptResult {
+  turnNonce?: string;
   status: "done" | "idle" | "blocked" | "OUTCOME_UNKNOWN";
   rawStatus?: string;
   paneOutput?: string;
@@ -64,9 +65,14 @@ export interface HerdrPromptResult {
   timeout?: boolean;
 }
 
+export type HerdrExecutionState = "SETTLED_TERMINAL" | "RUNNING" | "BLOCKED" | "OUTCOME_UNKNOWN";
+export type HerdrPhysicalEffect = "PRESENT" | "ABSENT" | "UNKNOWN";
+
 export interface HerdrReconciliationResult {
   settled: boolean;
   completionStatus: "COMPLETED" | "NOT_COMPLETE" | "SCOPE_VIOLATION" | "OUTCOME_UNKNOWN";
+  executionState: HerdrExecutionState;
+  physicalEffect: HerdrPhysicalEffect;
   changedPaths: string[];
   unexpectedPaths: string[];
   gitHeadAfter?: string;
@@ -142,23 +148,18 @@ export async function sendHerdrSocketRequest<T = unknown>(
  * Inspect terminal content to fail closed against onboarding / login dialogs (upstream #4343).
  */
 export function detectBlockedOnboardingDialog(agentKind: HerdrAgentKind, terminalText: string): boolean {
-  if (agentKind === "codex") {
-    return (
-      terminalText.includes("Welcome to Codex") ||
-      terminalText.includes("Sign in with ChatGPT") ||
-      terminalText.includes("Sign in with Device Code") ||
-      terminalText.includes("Provide your own API key") ||
-      terminalText.includes("Do you trust the authors")
-    );
-  }
-  if (agentKind === "cline") {
-    return terminalText.includes("authkit.cline.bot") || terminalText.includes("Enter this code in your browser");
-  }
-  if (agentKind === "agy") {
-    return (
-      terminalText.includes("Do you trust the contents of this project?") &&
-      !terminalText.includes("Antigravity CLI 1.2.8")
-    );
+  if (
+    terminalText.includes("Do you trust the contents of this project?") ||
+    terminalText.includes("Do you trust the authors") ||
+    terminalText.includes("Allow creation of this file?") ||
+    terminalText.includes("Welcome to Codex") ||
+    terminalText.includes("Sign in with ChatGPT") ||
+    terminalText.includes("Sign in with Device Code") ||
+    terminalText.includes("Provide your own API key") ||
+    terminalText.includes("authkit.cline.bot") ||
+    terminalText.includes("Enter this code in your browser")
+  ) {
+    return true;
   }
   return false;
 }
@@ -223,16 +224,37 @@ export class HerdrThinGateway {
       return existing;
     }
 
-    // Get current git HEAD in worktree
+    // Git base fence (A9): must resolve exact 40-character commit SHA
     let gitHeadBefore = "";
     try {
       gitHeadBefore = execFileSync("git", ["-C", canonicalPath, "rev-parse", "HEAD"], {
         encoding: "utf-8",
         stdio: ["ignore", "pipe", "ignore"],
       }).trim();
-    } catch {
-      gitHeadBefore = "UNKNOWN";
+    } catch (err) {
+      throw new Error(
+        `[A9 Git Base Fence] Failed to resolve exact Git HEAD in worktree '${canonicalPath}': ${String(err)}`,
+      );
     }
+
+    if (!/^[0-9a-f]{40}$/i.test(gitHeadBefore)) {
+      throw new Error(
+        `[A9 Git Base Fence] Invalid Git HEAD '${gitHeadBefore}' in worktree '${canonicalPath}'; must be a valid 40-character commit SHA`,
+      );
+    }
+
+    // Dynamic server identity query (A6)
+    let herdrServerIdentity = `unix:${this.socketPath}`;
+    try {
+      const ping = await sendHerdrSocketRequest<{ type: string; version?: string }>(
+        { id: `ping-${Date.now()}`, method: "ping", params: {} },
+        this.socketPath,
+        2000,
+      );
+      if (ping.result?.version) {
+        herdrServerIdentity = `herdr@${ping.result.version}:unix:${this.socketPath}`;
+      }
+    } catch {}
 
     // 1. Create HerdR workspace with exact cwd
     const wsLabel = `devspace-${params.attemptKey}`;
@@ -274,6 +296,8 @@ export class HerdrThinGateway {
     if (params.agentKind === "opencode") {
       const model = params.requestedModel || "opencode/mimo-v2.6-flash-free";
       args.push("-m", model);
+    } else if (params.agentKind === "agy") {
+      args.push("--dangerously-skip-permissions");
     }
 
     const agentReq: HerdrSocketRequest = {
@@ -315,32 +339,12 @@ export class HerdrThinGateway {
     };
     await sendHerdrSocketRequest(waitReq, this.socketPath).catch(() => {});
 
-    // Auto-confirm initial workspace trust prompt for agy if needed
-    let terminalOutput = await this.readPane(paneId);
-    if (params.agentKind === "agy" && terminalOutput.includes("Do you trust the contents of this project?")) {
-      await this.sendPaneKeys(paneId, ["enter"]);
-      // Wait for agy to settle into interactive prompt
-      await new Promise((resolve) => setTimeout(resolve, 1500));
-      await sendHerdrSocketRequest(
-        {
-          id: `agy-settle-${Date.now()}`,
-          method: "agent.wait",
-          params: {
-            target: agentName,
-            until: ["idle"],
-            timeout_ms: 5000,
-          },
-        },
-        this.socketPath,
-      ).catch(() => {});
-      terminalOutput = await this.readPane(paneId);
-    }
-
-    // Read terminal visible output to fail closed against onboarding dialogs
+    // Read terminal visible output to fail closed against onboarding / trust dialogs (A5 / N-TRUST)
+    const terminalOutput = await this.readPane(paneId);
     if (detectBlockedOnboardingDialog(params.agentKind, terminalOutput)) {
       await this.closeWorkspace(wsId).catch(() => {});
       throw new Error(
-        `[Fail-Closed] Agent '${params.agentKind}' is stuck at an unauthenticated onboarding/login dialog`,
+        `[Fail-Closed / N-TRUST] Agent '${params.agentKind}' is stuck at an unauthenticated onboarding/trust/permission dialog`,
       );
     }
 
@@ -348,15 +352,13 @@ export class HerdrThinGateway {
     const handle: HerdrExternalHandle = {
       schemaVersion: 1,
       runtimeKind: HERDR_RUNTIME_KIND,
-      herdrServerIdentity: `herdr@0.9.1:unix:${this.socketPath}`,
+      herdrServerIdentity,
       herdrWorkspaceId: wsId,
       herdrPaneId: paneId,
       herdrAgentIdentity: agentName,
       herdrAgentKind: params.agentKind,
-      requestedModel: params.requestedModel,
-      requestedEffort: params.requestedEffort,
-      effectiveModel: params.requestedModel || (params.agentKind === "opencode" ? "opencode/mimo-v2.6-flash-free" : "gemini-3.8-flash-high"),
-      launchGeneration: 1,
+      ...(params.requestedModel ? { requestedModel: params.requestedModel } : {}),
+      ...(params.requestedEffort ? { requestedEffort: params.requestedEffort } : {}),
       promptNonce,
       canonicalWorktreePath: canonicalPath,
       workspaceId: params.workspaceId,
@@ -373,14 +375,43 @@ export class HerdrThinGateway {
   }
 
   /**
+   * Query HerdR agent status directly over socket.
+   */
+  async getAgent(agentName: string): Promise<{ agent_status: string; interactive_ready: boolean } | undefined> {
+    const req: HerdrSocketRequest = {
+      id: `agent-get-${Date.now()}`,
+      method: "agent.get",
+      params: { target: agentName },
+    };
+    try {
+      const res = await sendHerdrSocketRequest<{
+        type: string;
+        agent?: { agent_status: string; interactive_ready: boolean };
+      }>(req, this.socketPath, 3000);
+      return res.result?.agent;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /**
    * Submit a prompt to an agent.
    * Enforces N3: timeout or stalled prompt maps to OUTCOME_UNKNOWN; zero duplicate panes.
+   * Enforces N-TURN: rejects prompt if agent is already busy on an unsettled turn.
    */
   async promptExternalAgent(
     handle: HerdrExternalHandle,
     promptText: string,
     options: HerdrPromptOptions = {},
   ): Promise<HerdrPromptResult> {
+    // A7: Busy check (N-TURN)
+    const agentInfo = await this.getAgent(handle.herdrAgentIdentity);
+    if (agentInfo && (agentInfo.agent_status === "running" || agentInfo.agent_status === "prompting" || !agentInfo.interactive_ready)) {
+      throw new Error(
+        `[N-TURN] Agent '${handle.herdrAgentIdentity}' is already busy in status '${agentInfo.agent_status}'; cannot submit new turn.`,
+      );
+    }
+
     const timeoutMs = options.timeoutMs ?? 30_000;
     const waitOptions: Record<string, unknown> = {
       timeout_ms: timeoutMs,
@@ -389,12 +420,16 @@ export class HerdrThinGateway {
       waitOptions.until = options.until;
     }
 
+    // A7: Turn nonce binding
+    const turnNonce = `NEXUS-TURN-${handle.attemptKey}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const boundPrompt = `[NEXUS_ATTEMPT_NONCE:${turnNonce}]\n\n${promptText}`;
+
     const req: HerdrSocketRequest = {
       id: `prompt-${Date.now()}`,
       method: "agent.prompt",
       params: {
         target: handle.herdrAgentIdentity,
-        text: promptText,
+        text: boundPrompt,
         wait: waitOptions,
       },
     };
@@ -408,6 +443,7 @@ export class HerdrThinGateway {
         // N3: timeout or stalled prompt maps strictly to OUTCOME_UNKNOWN
         if (res.error.code === "timeout" || res.error.code === "agent_prompt_stalled") {
           return {
+            turnNonce,
             status: "OUTCOME_UNKNOWN",
             rawStatus: res.error.code,
             timeout: res.error.code === "timeout",
@@ -423,6 +459,7 @@ export class HerdrThinGateway {
 
       const paneOutput = await this.readPane(handle.herdrPaneId);
       return {
+        turnNonce,
         status: normalizedStatus,
         rawStatus: statusStr,
         paneOutput,
@@ -431,6 +468,7 @@ export class HerdrThinGateway {
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes("timed out")) {
         return {
+          turnNonce,
           status: "OUTCOME_UNKNOWN",
           timeout: true,
         };
@@ -487,59 +525,65 @@ export class HerdrThinGateway {
 
   /**
    * Physical completion reconciliation.
-   * Enforces N5 (worker false success), N6 (unexpected path), N7 (runtime loss), N8 (enforcement truth).
+   * Enforces N5 (worker false success), N5-COMMIT (committed change detection),
+   * N6 (unexpected path), N6-COMMIT (unauthorized commit),
+   * N7 (runtime loss), N7-PHYSICAL (physical evidence preserved during runtime loss),
+   * N8 (enforcement truth).
    */
   async reconcileExternalAgent(
     handle: HerdrExternalHandle,
     expectedScope?: string[],
     expectMutation: boolean = true,
+    lastPromptResult?: HerdrPromptResult,
   ): Promise<HerdrReconciliationResult> {
     const worktree = handle.canonicalWorktreePath;
 
-    // N7: Check if HerdR server is reachable
-    let serverRunning = false;
-    try {
-      const ping = await sendHerdrSocketRequest<{ type: string }>({ id: "ping", method: "ping", params: {} }, this.socketPath, 2000);
-      serverRunning = ping.result?.type === "pong";
-    } catch {
-      serverRunning = false;
+    // 1. Physical Git state inspection (A2: independent of HerdR status)
+    const changedPathsSet = new Set<string>();
+    let gitInspectionFailed = false;
+
+    // Committed diff vs gitHeadBefore if valid 40-char SHA (N5-COMMIT, N6-COMMIT)
+    if (handle.gitHeadBefore && /^[0-9a-f]{40}$/i.test(handle.gitHeadBefore)) {
+      try {
+        const diffOut = execFileSync("git", ["-C", worktree, "diff", "--name-only", handle.gitHeadBefore], {
+          encoding: "utf-8",
+          stdio: ["ignore", "pipe", "ignore"],
+        }).trim();
+        if (diffOut) {
+          for (const line of diffOut.split("\n")) {
+            const p = line.trim();
+            if (p) changedPathsSet.add(p);
+          }
+        }
+      } catch {
+        gitInspectionFailed = true;
+      }
     }
 
-    if (!serverRunning) {
-      return {
-        settled: false,
-        completionStatus: "OUTCOME_UNKNOWN",
-        changedPaths: [],
-        unexpectedPaths: [],
-        enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
-        reason: "HerdR server is unreachable (UNRECOVERABLE_PROCESS_UPON_HEADLESS_RESTART).",
-      };
-    }
-
-    // Inspect physical repository state
-    let porcelainStatus = "";
+    // Working tree and untracked changes
     try {
-      porcelainStatus = execFileSync("git", ["-C", worktree, "status", "--porcelain"], {
+      const rawStatus = execFileSync("git", ["-C", worktree, "status", "--porcelain"], {
         encoding: "utf-8",
         stdio: ["ignore", "pipe", "ignore"],
-      }).trim();
-    } catch (e) {
-      return {
-        settled: false,
-        completionStatus: "OUTCOME_UNKNOWN",
-        changedPaths: [],
-        unexpectedPaths: [],
-        enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
-        reason: `Failed to inspect git status in worktree: ${String(e)}`,
-      };
+      });
+      if (rawStatus) {
+        for (const line of rawStatus.split("\n")) {
+          const trimmed = line.trimEnd();
+          if (!trimmed) continue;
+          const match = trimmed.match(/^.{1,2}\s+(.*)$/);
+          if (match && match[1]) {
+            const rawPath = match[1].includes(" -> ") ? match[1].split(" -> ")[1].trim() : match[1].trim();
+            // Remove quotes if git quoted a filename with special chars
+            const cleanPath = rawPath.replace(/^"(.*)"$/, "$1");
+            if (cleanPath) changedPathsSet.add(cleanPath);
+          }
+        }
+      }
+    } catch {
+      gitInspectionFailed = true;
     }
 
-    const changedPaths = porcelainStatus
-      ? porcelainStatus
-          .split("\n")
-          .map((line) => line.slice(3).trim())
-          .filter(Boolean)
-      : [];
+    const changedPaths = Array.from(changedPathsSet).sort();
 
     let gitHeadAfter: string | undefined;
     try {
@@ -549,11 +593,123 @@ export class HerdrThinGateway {
       }).trim();
     } catch {}
 
-    // N5: Worker false success -> If mutation was expected but changedPaths is empty, NOT_COMPLETE
-    if (expectMutation && changedPaths.length === 0) {
+    const physicalEffect: HerdrPhysicalEffect = gitInspectionFailed
+      ? "UNKNOWN"
+      : changedPaths.length > 0
+        ? "PRESENT"
+        : "ABSENT";
+
+    // Scope check
+    const unexpectedPaths: string[] = [];
+    if (expectedScope && expectedScope.length > 0) {
+      for (const p of changedPaths) {
+        if (!expectedScope.includes(p)) {
+          unexpectedPaths.push(p);
+        }
+      }
+    }
+
+    // 2. Execution settlement inspection (A3: separate from physical effect)
+    let executionState: HerdrExecutionState = "OUTCOME_UNKNOWN";
+
+    if (lastPromptResult?.status === "OUTCOME_UNKNOWN") {
+      executionState = "OUTCOME_UNKNOWN";
+    } else if (lastPromptResult?.status === "blocked") {
+      executionState = "BLOCKED";
+    } else {
+      // Check HerdR server health and agent status
+      let serverAlive = false;
+      try {
+        const ping = await sendHerdrSocketRequest<{ type: string }>({ id: "ping", method: "ping", params: {} }, this.socketPath, 2000);
+        serverAlive = ping.result?.type === "pong";
+      } catch {
+        serverAlive = false;
+      }
+
+      if (!serverAlive) {
+        executionState = "OUTCOME_UNKNOWN";
+      } else {
+        const agentInfo = await this.getAgent(handle.herdrAgentIdentity);
+        if (!agentInfo) {
+          executionState = lastPromptResult?.status === "done" || lastPromptResult?.status === "idle"
+            ? "SETTLED_TERMINAL"
+            : "OUTCOME_UNKNOWN";
+        } else if (agentInfo.agent_status === "running" || agentInfo.agent_status === "prompting") {
+          executionState = "RUNNING";
+        } else if (agentInfo.agent_status === "blocked") {
+          executionState = "BLOCKED";
+        } else if (agentInfo.agent_status === "idle" || agentInfo.agent_status === "done") {
+          executionState = "SETTLED_TERMINAL";
+        } else {
+          executionState = "OUTCOME_UNKNOWN";
+        }
+      }
+    }
+
+    // 3. Synthesize result (A3)
+    if (executionState === "OUTCOME_UNKNOWN") {
+      return {
+        settled: false,
+        completionStatus: "OUTCOME_UNKNOWN",
+        executionState,
+        physicalEffect,
+        changedPaths,
+        unexpectedPaths,
+        gitHeadAfter,
+        enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+        reason: "HerdR server is unreachable or prompt outcome is unknown (UNRECOVERABLE_PROCESS_UPON_HEADLESS_RESTART / timeout).",
+      };
+    }
+
+    if (executionState === "RUNNING") {
+      return {
+        settled: false,
+        completionStatus: "NOT_COMPLETE",
+        executionState,
+        physicalEffect,
+        changedPaths,
+        unexpectedPaths,
+        gitHeadAfter,
+        enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+        reason: "Agent execution is still running.",
+      };
+    }
+
+    if (executionState === "BLOCKED") {
+      return {
+        settled: false,
+        completionStatus: "NOT_COMPLETE",
+        executionState,
+        physicalEffect,
+        changedPaths,
+        unexpectedPaths,
+        gitHeadAfter,
+        enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+        reason: "Agent is blocked on interaction or onboarding.",
+      };
+    }
+
+    // executionState === "SETTLED_TERMINAL"
+    if (unexpectedPaths.length > 0) {
+      return {
+        settled: true,
+        completionStatus: "SCOPE_VIOLATION",
+        executionState,
+        physicalEffect,
+        changedPaths,
+        unexpectedPaths,
+        gitHeadAfter,
+        enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+        reason: `Physical changes touched paths outside authorized scope: ${unexpectedPaths.join(", ")}`,
+      };
+    }
+
+    if (expectMutation && physicalEffect === "ABSENT") {
       return {
         settled: true,
         completionStatus: "NOT_COMPLETE",
+        executionState,
+        physicalEffect,
         changedPaths: [],
         unexpectedPaths: [],
         gitHeadAfter,
@@ -562,48 +718,30 @@ export class HerdrThinGateway {
       };
     }
 
-    // N6: Unexpected path check -> If any changed path is outside expectedScope
-    const unexpectedPaths: string[] = [];
-    if (expectedScope && expectedScope.length > 0) {
-      for (const p of changedPaths) {
-        if (!expectedScope.includes(p)) {
-          unexpectedPaths.push(p);
-        }
-      }
-      if (unexpectedPaths.length > 0) {
-        return {
-          settled: true,
-          completionStatus: "SCOPE_VIOLATION",
-          changedPaths,
-          unexpectedPaths,
-          gitHeadAfter,
-          enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
-          reason: `Physical changes touched paths outside authorized scope: ${unexpectedPaths.join(", ")}`,
-        };
-      }
-    }
-
     return {
       settled: true,
       completionStatus: "COMPLETED",
+      executionState,
+      physicalEffect,
       changedPaths,
       unexpectedPaths: [],
       gitHeadAfter,
-      // N8: Never claim physically enforced
       enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
     };
   }
 
   /**
    * Stop an external agent and close its HerdR workspace.
+   * Enforces A8: close workspace first; release registry binding only upon successful close.
    */
   async stopExternalAgent(handle: HerdrExternalHandle): Promise<void> {
-    this.registry.releaseHandle(handle.attemptKey);
     await this.closeWorkspace(handle.herdrWorkspaceId);
+    this.registry.releaseHandle(handle.attemptKey);
   }
 
   /**
    * Close a HerdR workspace.
+   * Enforces A8: does not swallow close errors.
    */
   async closeWorkspace(workspaceId: string): Promise<void> {
     const req: HerdrSocketRequest = {
@@ -613,6 +751,9 @@ export class HerdrThinGateway {
         workspace_id: workspaceId,
       },
     };
-    await sendHerdrSocketRequest(req, this.socketPath).catch(() => {});
+    const res = await sendHerdrSocketRequest<{ type?: string }>(req, this.socketPath);
+    if (res.error) {
+      throw new Error(`HerdR workspace.close failed: ${res.error.message}`);
+    }
   }
 }

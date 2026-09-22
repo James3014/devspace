@@ -1008,8 +1008,6 @@ test("LocalAgentSessionManager - binds and retrieves HerdrExternalHandle for dur
       herdrPaneId: "w_test_1:p1",
       herdrAgentIdentity: "ds-attempt-herdr-1",
       herdrAgentKind: "opencode",
-      effectiveModel: "opencode/mimo-v2.6-flash-free",
-      launchGeneration: 1,
       promptNonce: "HERDR-DISPATCH-1",
       canonicalWorktreePath: projectRoot,
       workspaceId: "ws_herdr_test",
@@ -1051,6 +1049,104 @@ test("LocalAgentSessionManager - binds and retrieves HerdrExternalHandle for dur
   }
 });
 
+test("LocalAgentSessionManager - persists HerdrExternalHandle across restart and replay (A1, N1-R)", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-herdr-restart-test-"));
+  const config = {
+    stateDir,
+    subagents: true,
+    oauth: { scopes: ["devspace"] },
+  } as any;
+
+  const projectRoot = mkdtempSync(join(tmpdir(), "devspace-herdr-restart-repo-"));
+  const spawnedWorkers1: any[] = [];
+  const spawnedWorkers2: any[] = [];
+
+  try {
+    const manager1 = new LocalAgentSessionManager(
+      config,
+      async (agentId, promptFile, workerToken) => { spawnedWorkers1.push({ agentId }); },
+      async () => true,
+    );
+
+    // Start an agent with attemptKey
+    const startRes1 = await manager1.startAgent({
+      workspaceId: "ws_restart_test",
+      workspaceRoot: projectRoot,
+      profileName: "reviewer",
+      prompt: "review task",
+      profiles: mockProfiles,
+      attemptKey: "attempt-restart-1",
+    });
+
+    const handle: HerdrExternalHandle = {
+      schemaVersion: 1,
+      runtimeKind: "HERDR",
+      herdrServerIdentity: "herdr@0.9.1:unix:/Users/james/.config/herdr/herdr.sock",
+      herdrWorkspaceId: "w_restart_1",
+      herdrPaneId: "w_restart_1:p1",
+      herdrAgentIdentity: "ds-attempt-restart-1",
+      herdrAgentKind: "agy",
+      promptNonce: "HERDR-DISPATCH-RESTART-1",
+      canonicalWorktreePath: projectRoot,
+      workspaceId: "ws_restart_test",
+      gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+      attemptKey: "attempt-restart-1",
+      dispatchIntentHash: "intent-hash-restart-1",
+      launchTimestamp: new Date().toISOString(),
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    };
+
+    // Bind handle in manager 1 (persists to SQLite provider_session_id)
+    manager1.bindHerdrExternalHandle(startRes1.agentId, handle);
+    assert.deepEqual(manager1.getHerdrExternalHandle("attempt-restart-1"), handle);
+
+    // Simulate DevSpace restart: instantiate a fresh manager2 with same stateDir
+    defaultHerdrGatewayRegistry.releaseHandle("attempt-restart-1");
+    const manager2 = new LocalAgentSessionManager(
+      config,
+      async (agentId, promptFile, workerToken) => { spawnedWorkers2.push({ agentId }); },
+      async () => true,
+    );
+
+    // N1-R: Manager2 resolves durable handle from store despite empty in-memory map
+    const recoveredHandle = manager2.getHerdrExternalHandle("attempt-restart-1");
+    assert.ok(recoveredHandle);
+    assert.deepEqual(recoveredHandle, handle);
+
+    // Replay startAgent in manager2 with same attemptKey and prompt
+    const replayRes = await manager2.startAgent({
+      workspaceId: "ws_restart_test",
+      workspaceRoot: projectRoot,
+      profileName: "reviewer",
+      prompt: "review task",
+      profiles: mockProfiles,
+      attemptKey: "attempt-restart-1",
+    });
+
+    // Same durable session and handle returned; 0 new workers launched
+    assert.equal(replayRes.agentId, startRes1.agentId);
+    assert.deepEqual(replayRes.herdrHandle, handle);
+    assert.equal(spawnedWorkers2.length, 0);
+
+    // Replay with conflicting prompt fails closed
+    await assert.rejects(
+      manager2.startAgent({
+        workspaceId: "ws_restart_test",
+        workspaceRoot: projectRoot,
+        profileName: "reviewer",
+        prompt: "DIFFERENT conflicting prompt",
+        profiles: mockProfiles,
+        attemptKey: "attempt-restart-1",
+      }),
+      (err: any) => err instanceof AgentSessionError && err.code === "ATTEMPT_REPLAY_CONFLICT",
+    );
+  } finally {
+    defaultHerdrGatewayRegistry.releaseHandle("attempt-restart-1");
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("LocalAgentSessionManager - rejects conflicting replay and enforcement state violations for HerdrExternalHandle", async () => {
   const { manager, clean } = setupFixture();
   const projectRoot = mkdtempSync(join(tmpdir(), "devspace-herdr-conflict-test-"));
@@ -1078,8 +1174,6 @@ test("LocalAgentSessionManager - rejects conflicting replay and enforcement stat
       herdrPaneId: "w_test_2:p1",
       herdrAgentIdentity: "ds-attempt-other",
       herdrAgentKind: "agy",
-      effectiveModel: "gemini-3.8-flash-high",
-      launchGeneration: 1,
       promptNonce: "HERDR-DISPATCH-2",
       canonicalWorktreePath: projectRoot,
       workspaceId: "ws_conflict_test",

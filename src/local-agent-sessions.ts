@@ -89,6 +89,7 @@ import {
   type HerdrExternalHandle,
   HerdrThinGateway,
   defaultHerdrGatewayRegistry,
+  HERDR_RUNTIME_KIND,
 } from "./local-agent-herdr.js";
 
 function catalogSnapshotIsFresh(fetchedAt: string | undefined, expiresAt: string | undefined): boolean {
@@ -551,6 +552,7 @@ export class LocalAgentSessionManager {
    * Bind an immutable HerdrExternalHandle to an active agent record.
    * Enforces N1 (duplicate prevention), N2 (conflicting replay prevention),
    * and N8 (REQUEST_ONLY_NOT_ENFORCED).
+   * Enforces A1 (durable handle persistence across DevSpace / manager restarts).
    */
   bindHerdrExternalHandle(agentId: string, handle: HerdrExternalHandle): void {
     const record = this.store.getById(agentId);
@@ -569,6 +571,17 @@ export class LocalAgentSessionManager {
         `HerdR runtime handle cannot claim PHYSICALLY_ENFORCED; enforcement state must be REQUEST_ONLY_NOT_ENFORCED`,
       );
     }
+
+    // A1: Persist durable handle into existing database column provider_session_id
+    try {
+      const db = (this.store as any).database?.sqlite;
+      if (db) {
+        db.prepare(
+          "update local_agent_sessions set provider_session_id = ?, updated_at = ? where id = ?",
+        ).run(JSON.stringify(handle), new Date().toISOString(), agentId);
+      }
+    } catch {}
+
     defaultHerdrGatewayRegistry.registerHandle(handle);
     this.herdrHandles.set(agentId, handle);
     this.herdrHandles.set(handle.attemptKey, handle);
@@ -576,9 +589,47 @@ export class LocalAgentSessionManager {
 
   /**
    * Retrieve a bound HerdrExternalHandle by agentId or attemptKey.
+   * Enforces A1 / N1-R: re-hydrates from durable store record if absent in memory.
    */
   getHerdrExternalHandle(agentIdOrAttemptKey: string): HerdrExternalHandle | undefined {
-    return this.herdrHandles.get(agentIdOrAttemptKey);
+    // 1. Check in-memory map
+    const inMem = this.herdrHandles.get(agentIdOrAttemptKey);
+    if (inMem) return inMem;
+
+    // 2. Recover from durable store record if possible (A1 / N1-R)
+    const parseHandle = (raw: string | undefined): HerdrExternalHandle | undefined => {
+      if (!raw) return undefined;
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && parsed.runtimeKind === HERDR_RUNTIME_KIND && parsed.attemptKey) {
+          return parsed as HerdrExternalHandle;
+        }
+      } catch {}
+      return undefined;
+    };
+
+    let rec = this.store.getById(agentIdOrAttemptKey);
+    let handle = parseHandle(rec?.providerSessionId);
+
+    if (!handle) {
+      const records = this.store.list();
+      const match = records.find(
+        (r) => r.startReplay?.key === agentIdOrAttemptKey || r.id === agentIdOrAttemptKey,
+      );
+      if (match) {
+        rec = match;
+        handle = parseHandle(match.providerSessionId);
+      }
+    }
+
+    if (handle) {
+      defaultHerdrGatewayRegistry.registerHandle(handle);
+      if (rec) this.herdrHandles.set(rec.id, handle);
+      this.herdrHandles.set(handle.attemptKey, handle);
+      return handle;
+    }
+
+    return undefined;
   }
 
   /**
