@@ -105,6 +105,8 @@ export interface ExternalRuntimeLaunchFence {
   herdrWorkspaceId?: string;
   herdrPaneId?: string;
   herdrAgentIdentity?: string;
+  plannedAgentName?: string;
+  observedCwd?: string;
   fencedAt: string;
   updatedAt?: string;
 }
@@ -127,6 +129,7 @@ export interface FenceExternalRuntimeLaunchInput {
   requestedEffort?: string;
   promptNonce: string;
   workspaceId?: string;
+  plannedAgentName?: string;
   expectedUpdatedAt?: string;
 }
 
@@ -1169,6 +1172,7 @@ export class LocalAgentStore {
         ...(input.requestedEffort ? { requestedEffort: input.requestedEffort } : {}),
         promptNonce: input.promptNonce,
         ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}),
+        ...(input.plannedAgentName ? { plannedAgentName: input.plannedAgentName } : {}),
         fencedAt: now,
       };
 
@@ -1217,6 +1221,17 @@ export class LocalAgentStore {
         return { applied: false, previous: current, current };
       }
 
+      if (!input.herdrWorkspaceId || !input.herdrPaneId || !input.observedCwd) {
+        return { applied: false, previous: current, current };
+      }
+
+      if (
+        canonicalizePath(input.observedCwd) !==
+        canonicalizePath(binding.launch.canonicalWorktreePath)
+      ) {
+        return { applied: false, previous: current, current };
+      }
+
       if (
         binding.launch.herdrWorkspaceId === input.herdrWorkspaceId &&
         binding.launch.herdrPaneId === input.herdrPaneId
@@ -1230,6 +1245,7 @@ export class LocalAgentStore {
         state: "WORKSPACE_OBSERVED",
         herdrWorkspaceId: input.herdrWorkspaceId,
         herdrPaneId: input.herdrPaneId,
+        observedCwd: canonicalizePath(input.observedCwd),
         updatedAt: now,
       };
 
@@ -2136,6 +2152,8 @@ function readExternalRuntimeLaunchFence(value: unknown): ExternalRuntimeLaunchFe
       ...(typeof record.herdrWorkspaceId === "string" ? { herdrWorkspaceId: record.herdrWorkspaceId } : {}),
       ...(typeof record.herdrPaneId === "string" ? { herdrPaneId: record.herdrPaneId } : {}),
       ...(typeof record.herdrAgentIdentity === "string" ? { herdrAgentIdentity: record.herdrAgentIdentity } : {}),
+      ...(typeof record.plannedAgentName === "string" ? { plannedAgentName: record.plannedAgentName } : {}),
+      ...(typeof record.observedCwd === "string" ? { observedCwd: record.observedCwd } : {}),
       fencedAt: record.fencedAt,
       ...(typeof record.updatedAt === "string" ? { updatedAt: record.updatedAt } : {}),
     };

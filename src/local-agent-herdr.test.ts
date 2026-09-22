@@ -11,9 +11,12 @@ import {
   detectBlockedOnboardingDialog,
   cleanPorcelainPath,
   parsePorcelainChangedPaths,
+  buildDeterministicHerdrAgentName,
   type HerdrExternalHandle,
   type HerdrSocketRequest,
   type HerdrSocketResponse,
+  type HerdrPaneInfo,
+  type HerdrAgentInfo,
 } from "./local-agent-herdr.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 import { hashDispatchIntent } from "./execution-protocol.js";
@@ -203,38 +206,95 @@ test("HerdrThinGateway reconciliation enforces N5, N5-COMMIT, N6, N6-COMMIT, N7,
 });
 
 test("HerdrThinGateway enforces N-TURN by rejecting prompts to busy agents", async () => {
-  const gateway = new HerdrThinGateway();
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-herdr-busy-agent-"));
+  const store = new LocalAgentStore(stateDir);
+  const gateway = new HerdrThinGateway("/tmp/test.sock", undefined, store);
   // Mock getAgent to simulate an already busy agent
   (gateway as any).getAgent = async () => ({
     agent_status: "running",
     interactive_ready: false,
   });
 
+  const attemptKey = "attempt-busy";
+  const dispatchIntent = {
+    taskId: "task-busy",
+    attemptId: attemptKey,
+    objective: "Test busy agent",
+    roleIntent: "DEEP_ENGINEERING" as const,
+    claimCeiling: "CANDIDATE_READY" as const,
+    context: ["test"],
+    readScope: ["src"],
+    writeScope: ["src"],
+    exclusiveOwnership: true,
+    forbiddenChanges: [],
+    acceptanceCriteria: ["pass"],
+    verificationRequired: true,
+    expectedArtifacts: [],
+  };
+  const dispatchIntentHash = hashDispatchIntent(dispatchIntent);
+  const promptNonce = "NONCE-BUSY";
+
+  const agent = store.create({
+    provider: "local-runtime",
+    profileName: "worker",
+    workspaceRoot: "/tmp",
+    workspaceId: "ws1",
+    startReplay: { key: attemptKey, requestHash: "hash-busy" },
+    executionContract: { writePaths: ["src"], dispatchIntent },
+  });
+
   const handle: HerdrExternalHandle = {
     schemaVersion: 1,
     runtimeKind: HERDR_RUNTIME_KIND,
+    agentId: agent.id,
     herdrSocketPath: "/tmp/test.sock",
     herdrWorkspaceId: "w1",
     herdrPaneId: "p1",
     herdrAgentIdentity: "ds-busy-agent",
     herdrAgentKind: "opencode",
-    promptNonce: "NONCE",
+    promptNonce,
     canonicalWorktreePath: "/tmp",
     workspaceId: "ws1",
     gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
-    attemptKey: "attempt-busy",
-    dispatchIntentHash: "intent-busy",
+    attemptKey,
+    dispatchIntentHash,
     launchTimestamp: new Date().toISOString(),
     enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
   };
 
-  await assert.rejects(
-    gateway.promptExternalAgent(handle, "consequential task", { allowTestOnlyNonConsequential: true }),
-    (err: any) => {
-      assert.match(err.message, /\[N-TURN\]/);
-      return true;
+  store.bindExternalRuntimeBindingCAS({
+    agentId: agent.id,
+    expectedAttemptKey: attemptKey,
+    expectedDispatchIntentHash: dispatchIntentHash,
+    binding: {
+      runtimeKind: HERDR_RUNTIME_KIND,
+      launch: {
+        state: "AGENT_OBSERVED",
+        launchRequestId: `HERDR-LAUNCH:${attemptKey}:req`,
+        attemptKey,
+        dispatchIntentHash,
+        canonicalWorktreePath: "/tmp",
+        gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+        agentKind: "opencode",
+        promptNonce,
+        fencedAt: new Date().toISOString(),
+      },
+      handle: handle as unknown as Record<string, unknown>,
     },
-  );
+  });
+
+  try {
+    await assert.rejects(
+      gateway.promptExternalAgent(handle, "consequential task"),
+      (err: any) => {
+        assert.match(err.message, /\[N-TURN\]/);
+        return true;
+      },
+    );
+  } finally {
+    store.close();
+    rmSync(stateDir, { recursive: true, force: true });
+  }
 });
 
 test("HerdrThinGateway enforces Option A turn identity and durable nonce binding (B4, T1, T2, T3)", async () => {
@@ -682,12 +742,16 @@ class SpyHerdrGateway extends HerdrThinGateway {
   public agentWaitCalls = 0;
   public listWorkspacesCalls = 0;
   public getWorkspaceCalls = 0;
+  public listPanesCalls = 0;
+  public getPaneCalls = 0;
   public getAgentCalls = 0;
 
   public failWorkspaceCreate = false;
   public failAgentStart = false;
   public simulatedWorkspaces: Array<{ workspace_id: string; label?: string }> = [];
-  public simulatedAgentStatus: { agent_status: string; interactive_ready: boolean } | undefined;
+  public simulatedPanes: Array<HerdrPaneInfo> = [];
+  public simulatedAgents: Map<string, HerdrAgentInfo> = new Map();
+  public simulatedAgentStatus: HerdrAgentInfo | undefined;
 
   override async sendRequest<T = unknown>(
     req: HerdrSocketRequest,
@@ -701,14 +765,22 @@ class SpyHerdrGateway extends HerdrThinGateway {
       }
       const wsId = `sim-ws-${Date.now()}-${this.workspaceCreateCalls}`;
       const paneId = `sim-pane-${Date.now()}-${this.workspaceCreateCalls}`;
+      const cwd = (req.params as any)?.cwd;
+      const paneInfo: HerdrPaneInfo = {
+        pane_id: paneId,
+        workspace_id: wsId,
+        cwd,
+        foreground_cwd: cwd,
+      };
+      this.simulatedPanes.push(paneInfo);
       return {
         id: req.id,
         result: {
           workspace: { workspace_id: wsId },
           root_pane: {
             pane_id: paneId,
-            cwd: (req.params as any)?.cwd,
-            foreground_cwd: (req.params as any)?.cwd,
+            cwd,
+            foreground_cwd: cwd,
           },
         } as unknown as T,
       };
@@ -719,13 +791,27 @@ class SpyHerdrGateway extends HerdrThinGateway {
       if (this.failAgentStart) {
         throw new Error("Simulated network timeout during agent.start");
       }
+      const name = (req.params as any)?.name;
+      const paneId = (req.params as any)?.pane_id;
+      const pane = this.simulatedPanes.find((p) => p.pane_id === paneId);
+      const agentInfo: HerdrAgentInfo = {
+        name,
+        agent: name,
+        workspace_id: pane?.workspace_id || "sim-ws-default",
+        pane_id: paneId,
+        cwd: pane?.cwd,
+        foreground_cwd: pane?.foreground_cwd,
+        agent_status: "running",
+        interactive_ready: true,
+      };
+      this.simulatedAgents.set(name, agentInfo);
       return {
         id: req.id,
         result: {
           agent: {
-            agent: (req.params as any)?.name,
+            agent: name,
             agent_status: "running",
-            pane_id: (req.params as any)?.pane_id,
+            pane_id: paneId,
             state_change_seq: 1,
             interactive_ready: true,
           },
@@ -765,27 +851,65 @@ class SpyHerdrGateway extends HerdrThinGateway {
 
     if (req.method === "workspace.get") {
       this.getWorkspaceCalls++;
+      const target = (req.params as any)?.target;
+      const ws = this.simulatedWorkspaces.find((w) => w.workspace_id === target) || {
+        workspace_id: target,
+        label: target,
+      };
       return {
         id: req.id,
         result: {
-          workspace: {
-            workspace_id: (req.params as any)?.target,
-            root_pane_id: `${(req.params as any)?.target}:p1`,
-          },
+          type: "workspace_info",
+          workspace: ws,
+        } as unknown as T,
+      };
+    }
+
+    if (req.method === "pane.list") {
+      this.listPanesCalls++;
+      const targetWs = (req.params as any)?.workspace_id;
+      const filtered = targetWs
+        ? this.simulatedPanes.filter((p) => p.workspace_id === targetWs)
+        : this.simulatedPanes;
+      return {
+        id: req.id,
+        result: {
+          type: "pane_list",
+          panes: filtered,
+        } as unknown as T,
+      };
+    }
+
+    if (req.method === "pane.get") {
+      this.getPaneCalls++;
+      const paneId = (req.params as any)?.pane_id;
+      const pane = this.simulatedPanes.find((p) => p.pane_id === paneId);
+      return {
+        id: req.id,
+        result: {
+          type: "pane_info",
+          pane,
         } as unknown as T,
       };
     }
 
     if (req.method === "agent.get") {
       this.getAgentCalls++;
+      const target = (req.params as any)?.target;
+      const agent =
+        this.simulatedAgents.get(target) ??
+        (this.simulatedAgentStatus
+          ? {
+              name: target,
+              agent: target,
+              ...this.simulatedAgentStatus,
+            }
+          : undefined);
       return {
         id: req.id,
         result: {
           type: "agent.get",
-          agent: this.simulatedAgentStatus ?? {
-            agent_status: "idle",
-            interactive_ready: true,
-          },
+          agent,
         } as unknown as T,
       };
     }
@@ -1172,6 +1296,20 @@ test("HerdrThinGateway launch identity and lost-ack controls (C2, L1 to L10)", a
     // L4 restart with positively observed workspace: reconciles without new workspace.create
     const spyL4ReplayObserved = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
     spyL4ReplayObserved.simulatedWorkspaces = [{ workspace_id: "ws-reconciled-l4", label: `devspace-${attemptL4}` }];
+    spyL4ReplayObserved.simulatedPanes = [
+      { pane_id: "p-reconciled-l4", workspace_id: "ws-reconciled-l4", cwd: testRepo, foreground_cwd: testRepo },
+    ];
+    const agentNameL4 = buildDeterministicHerdrAgentName(attemptL4, hashL4);
+    spyL4ReplayObserved.simulatedAgents.set(agentNameL4, {
+      name: agentNameL4,
+      agent: agentNameL4,
+      workspace_id: "ws-reconciled-l4",
+      pane_id: "p-reconciled-l4",
+      cwd: testRepo,
+      foreground_cwd: testRepo,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
     const handleL4Reconciled = await spyL4ReplayObserved.startExternalAgent({
       agentId: agentL4.id,
       store,
@@ -1215,6 +1353,23 @@ test("HerdrThinGateway launch identity and lost-ack controls (C2, L1 to L10)", a
 
     // L5 restart with positively observed agent: reconciles without new workspace.create or agent.start
     const spyL5Replay = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    const agentNameL5 = buildDeterministicHerdrAgentName(attemptL5, hashL5);
+    const recordL5 = store.getById(agentL5.id)!;
+    const wsIdL5 = recordL5.externalRuntimeBinding!.launch!.herdrWorkspaceId!;
+    const paneIdL5 = recordL5.externalRuntimeBinding!.launch!.herdrPaneId!;
+    spyL5Replay.simulatedPanes = [
+      { pane_id: paneIdL5, workspace_id: wsIdL5, cwd: testRepo, foreground_cwd: testRepo },
+    ];
+    spyL5Replay.simulatedAgents.set(agentNameL5, {
+      name: agentNameL5,
+      agent: agentNameL5,
+      workspace_id: wsIdL5,
+      pane_id: paneIdL5,
+      cwd: testRepo,
+      foreground_cwd: testRepo,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
     const handleL5Reconciled = await spyL5Replay.startExternalAgent({
       agentId: agentL5.id,
       store,
@@ -1373,6 +1528,765 @@ test("HerdrThinGateway launch identity and lost-ack controls (C2, L1 to L10)", a
   } finally {
     store.close();
     rmSync(stateDir, { recursive: true, force: true });
+    rmSync(testRepo, { recursive: true, force: true });
+  }
+});
+
+test("HerdrThinGateway workspace reconciliation enforces physical cwd proof and fail-closed rules (REC-WORKSPACE-WRONG-CWD, REC-WORKSPACE-CWD-MISSING, REC-WORKSPACE-MULTIPLE-PANES, REC-PANE-NO-FABRICATION, R6-REPRO-1)", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-rec-ws-test-"));
+  const store = new LocalAgentStore(stateDir);
+  const testRepo = mkdtempSync(join(tmpdir(), "devspace-rec-ws-repo-"));
+
+  try {
+    execFileSync("git", ["init", testRepo], { stdio: "ignore" });
+    execFileSync("git", ["-C", testRepo, "config", "user.name", "Test"], { stdio: "ignore" });
+    execFileSync("git", ["-C", testRepo, "config", "user.email", "test@test.com"], { stdio: "ignore" });
+    writeFileSync(join(testRepo, "test.txt"), "hello");
+    execFileSync("git", ["-C", testRepo, "add", "."], { stdio: "ignore" });
+    execFileSync("git", ["-C", testRepo, "commit", "-m", "init"], { stdio: "ignore" });
+
+    // 1. REC-WORKSPACE-WRONG-CWD / R6-REPRO-1:
+    // Candidate workspace exists with matching label, but its pane points to /some/other/repo
+    const attempt1 = `rec-ws-wrong-cwd-${Date.now()}`;
+    const intent1 = {
+      taskId: "task-rec-1",
+      attemptId: attempt1,
+      objective: "REC-WORKSPACE-WRONG-CWD",
+      roleIntent: "DEEP_ENGINEERING" as const,
+      claimCeiling: "CANDIDATE_READY" as const,
+      context: ["test"],
+      readScope: ["src"],
+      writeScope: ["src"],
+      exclusiveOwnership: true,
+      forbiddenChanges: [],
+      acceptanceCriteria: ["pass"],
+      verificationRequired: true,
+      expectedArtifacts: [],
+    };
+    const hash1 = hashDispatchIntent(intent1);
+    const agent1 = store.create({
+      workspaceId: "ws-rec-1",
+      workspaceRoot: testRepo,
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: attempt1, requestHash: "hash-1" },
+      executionContract: { writePaths: ["src"], dispatchIntent: intent1 },
+    });
+
+    // Durable pre-effect launch fence created with OUTCOME_UNKNOWN (simulating lost-ack before observation)
+    const promptNonce1 = `NONCE-${attempt1}`;
+    store.fenceExternalRuntimeLaunchCAS({
+      agentId: agent1.id,
+      attemptKey: attempt1,
+      dispatchIntentHash: hash1,
+      canonicalWorktreePath: testRepo,
+      gitHeadBefore: execFileSync("git", ["-C", testRepo, "rev-parse", "HEAD"], { encoding: "utf-8" }).trim(),
+      agentKind: "opencode",
+      promptNonce: promptNonce1,
+      workspaceId: "ws-rec-1",
+    });
+
+    const registry1 = new HerdrGatewayRegistry();
+    const spy1 = new SpyHerdrGateway("/tmp/test.sock", registry1, store);
+    // Mock HerdR returns workspace matching label, but pane cwd is foreign
+    spy1.simulatedWorkspaces = [{ workspace_id: "wrong-ws-id", label: `devspace-${attempt1}` }];
+    spy1.simulatedPanes = [
+      {
+        pane_id: "wrong-pane-id",
+        workspace_id: "wrong-ws-id",
+        cwd: "/some/other/repo",
+        foreground_cwd: "/some/other/repo",
+      },
+    ];
+
+    await assert.rejects(
+      spy1.startExternalAgent({
+        agentId: agent1.id,
+        store,
+        attemptKey: attempt1,
+        dispatchIntentHash: hash1,
+        agentKind: "opencode",
+        canonicalWorktreePath: testRepo,
+        workspaceId: "ws-rec-1",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[OUTCOME_UNKNOWN\]/);
+        return true;
+      },
+    );
+    // Assert FAIL CLOSED: no durable workspace adoption, no agent attribution, no handle
+    const record1 = store.getById(agent1.id)!;
+    assert.equal(record1.externalRuntimeBinding?.launch?.herdrWorkspaceId, undefined, "Wrong workspace must NOT be adopted");
+    assert.equal(record1.externalRuntimeBinding?.launch?.herdrPaneId, undefined);
+    assert.equal(registry1.getHandle(attempt1), undefined, "Registry must NOT contain handle");
+    assert.equal(spy1.workspaceCreateCalls, 0, "No new workspace.create calls permitted");
+
+    // 2. REC-WORKSPACE-CWD-MISSING:
+    // Workspace label matches, but no pane has observable cwd (null or empty)
+    const attempt2 = `rec-ws-missing-cwd-${Date.now()}`;
+    const intent2 = { ...intent1, attemptId: attempt2 };
+    const hash2 = hashDispatchIntent(intent2);
+    const agent2 = store.create({
+      workspaceId: "ws-rec-2",
+      workspaceRoot: testRepo,
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: attempt2, requestHash: "hash-2" },
+      executionContract: { writePaths: ["src"], dispatchIntent: intent2 },
+    });
+    store.fenceExternalRuntimeLaunchCAS({
+      agentId: agent2.id,
+      attemptKey: attempt2,
+      dispatchIntentHash: hash2,
+      canonicalWorktreePath: testRepo,
+      gitHeadBefore: execFileSync("git", ["-C", testRepo, "rev-parse", "HEAD"], { encoding: "utf-8" }).trim(),
+      agentKind: "opencode",
+      promptNonce: `NONCE-${attempt2}`,
+      workspaceId: "ws-rec-2",
+    });
+
+    const spy2 = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    spy2.simulatedWorkspaces = [{ workspace_id: "missing-cwd-ws", label: `devspace-${attempt2}` }];
+    spy2.simulatedPanes = [
+      {
+        pane_id: "pane-null-cwd",
+        workspace_id: "missing-cwd-ws",
+        cwd: null,
+        foreground_cwd: null,
+      },
+    ];
+
+    await assert.rejects(
+      spy2.startExternalAgent({
+        agentId: agent2.id,
+        store,
+        attemptKey: attempt2,
+        dispatchIntentHash: hash2,
+        agentKind: "opencode",
+        canonicalWorktreePath: testRepo,
+        workspaceId: "ws-rec-2",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[OUTCOME_UNKNOWN\]/);
+        return true;
+      },
+    );
+    const record2 = store.getById(agent2.id)!;
+    assert.equal(record2.externalRuntimeBinding?.launch?.herdrWorkspaceId, undefined);
+
+    // 3. REC-WORKSPACE-MULTIPLE-PANES:
+    // Multiple panes match the workspace, none uniquely provable as launch root -> fail closed
+    const attempt3 = `rec-ws-multi-pane-${Date.now()}`;
+    const intent3 = { ...intent1, attemptId: attempt3 };
+    const hash3 = hashDispatchIntent(intent3);
+    const agent3 = store.create({
+      workspaceId: "ws-rec-3",
+      workspaceRoot: testRepo,
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: attempt3, requestHash: "hash-3" },
+      executionContract: { writePaths: ["src"], dispatchIntent: intent3 },
+    });
+    store.fenceExternalRuntimeLaunchCAS({
+      agentId: agent3.id,
+      attemptKey: attempt3,
+      dispatchIntentHash: hash3,
+      canonicalWorktreePath: testRepo,
+      gitHeadBefore: execFileSync("git", ["-C", testRepo, "rev-parse", "HEAD"], { encoding: "utf-8" }).trim(),
+      agentKind: "opencode",
+      promptNonce: `NONCE-${attempt3}`,
+      workspaceId: "ws-rec-3",
+    });
+
+    const spy3 = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    spy3.simulatedWorkspaces = [{ workspace_id: "multi-pane-ws", label: `devspace-${attempt3}` }];
+    spy3.simulatedPanes = [
+      { pane_id: "pane-1", workspace_id: "multi-pane-ws", cwd: testRepo, foreground_cwd: testRepo },
+      { pane_id: "pane-2", workspace_id: "multi-pane-ws", cwd: testRepo, foreground_cwd: testRepo },
+    ];
+
+    await assert.rejects(
+      spy3.startExternalAgent({
+        agentId: agent3.id,
+        store,
+        attemptKey: attempt3,
+        dispatchIntentHash: hash3,
+        agentKind: "opencode",
+        canonicalWorktreePath: testRepo,
+        workspaceId: "ws-rec-3",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[OUTCOME_UNKNOWN\]/);
+        return true;
+      },
+    );
+    const record3 = store.getById(agent3.id)!;
+    assert.equal(record3.externalRuntimeBinding?.launch?.herdrWorkspaceId, undefined);
+
+    // 4. REC-PANE-NO-FABRICATION:
+    // Workspace has zero panes returned -> must not fabricate `${wsId}:p1`
+    const attempt4 = `rec-ws-no-pane-${Date.now()}`;
+    const intent4 = { ...intent1, attemptId: attempt4 };
+    const hash4 = hashDispatchIntent(intent4);
+    const agent4 = store.create({
+      workspaceId: "ws-rec-4",
+      workspaceRoot: testRepo,
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: attempt4, requestHash: "hash-4" },
+      executionContract: { writePaths: ["src"], dispatchIntent: intent4 },
+    });
+    store.fenceExternalRuntimeLaunchCAS({
+      agentId: agent4.id,
+      attemptKey: attempt4,
+      dispatchIntentHash: hash4,
+      canonicalWorktreePath: testRepo,
+      gitHeadBefore: execFileSync("git", ["-C", testRepo, "rev-parse", "HEAD"], { encoding: "utf-8" }).trim(),
+      agentKind: "opencode",
+      promptNonce: `NONCE-${attempt4}`,
+      workspaceId: "ws-rec-4",
+    });
+
+    const spy4 = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    spy4.simulatedWorkspaces = [{ workspace_id: "no-pane-ws", label: `devspace-${attempt4}` }];
+    spy4.simulatedPanes = []; // Zero panes
+
+    await assert.rejects(
+      spy4.startExternalAgent({
+        agentId: agent4.id,
+        store,
+        attemptKey: attempt4,
+        dispatchIntentHash: hash4,
+        agentKind: "opencode",
+        canonicalWorktreePath: testRepo,
+        workspaceId: "ws-rec-4",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[OUTCOME_UNKNOWN\]/);
+        return true;
+      },
+    );
+    const record4 = store.getById(agent4.id)!;
+    assert.equal(record4.externalRuntimeBinding?.launch?.herdrPaneId, undefined, "Must NOT fabricate paneId");
+  } finally {
+    store.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(testRepo, { recursive: true, force: true });
+  }
+});
+
+test("HerdrThinGateway agent reconciliation enforces exact workspace, pane, and cwd identity (REC-AGENT-WRONG-WORKSPACE, REC-AGENT-WRONG-PANE, REC-AGENT-WRONG-CWD, REC-AGENT-EXACT)", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-rec-agent-test-"));
+  const store = new LocalAgentStore(stateDir);
+  const testRepo = mkdtempSync(join(tmpdir(), "devspace-rec-agent-repo-"));
+
+  try {
+    execFileSync("git", ["init", testRepo], { stdio: "ignore" });
+    execFileSync("git", ["-C", testRepo, "config", "user.name", "Test"], { stdio: "ignore" });
+    execFileSync("git", ["-C", testRepo, "config", "user.email", "test@test.com"], { stdio: "ignore" });
+    writeFileSync(join(testRepo, "test.txt"), "hello");
+    execFileSync("git", ["-C", testRepo, "add", "."], { stdio: "ignore" });
+    execFileSync("git", ["-C", testRepo, "commit", "-m", "init"], { stdio: "ignore" });
+    const gitHead = execFileSync("git", ["-C", testRepo, "rev-parse", "HEAD"], { encoding: "utf-8" }).trim();
+
+    // Common setup helper: launch fence with workspace already observed
+    function setupAgentWithObservedWorkspace(attemptKey: string, wsId: string, paneId: string) {
+      const intent = {
+        taskId: "task-agent-rec",
+        attemptId: attemptKey,
+        objective: "REC-AGENT",
+        roleIntent: "DEEP_ENGINEERING" as const,
+        claimCeiling: "CANDIDATE_READY" as const,
+        context: ["test"],
+        readScope: ["src"],
+        writeScope: ["src"],
+        exclusiveOwnership: true,
+        forbiddenChanges: [],
+        acceptanceCriteria: ["pass"],
+        verificationRequired: true,
+        expectedArtifacts: [],
+      };
+      const hash = hashDispatchIntent(intent);
+      const agent = store.create({
+        workspaceId: "ws-rec-ag",
+        workspaceRoot: testRepo,
+        profileName: "worker",
+        provider: "opencode",
+        startReplay: { key: attemptKey, requestHash: "hash-ag" },
+        executionContract: { writePaths: ["src"], dispatchIntent: intent },
+      });
+      store.fenceExternalRuntimeLaunchCAS({
+        agentId: agent.id,
+        attemptKey,
+        dispatchIntentHash: hash,
+        canonicalWorktreePath: testRepo,
+        gitHeadBefore: gitHead,
+        agentKind: "opencode",
+        promptNonce: `NONCE-${attemptKey}`,
+        workspaceId: "ws-rec-ag",
+      });
+      store.recordExternalRuntimeWorkspaceObservedCAS({
+        agentId: agent.id,
+        attemptKey,
+        herdrWorkspaceId: wsId,
+        herdrPaneId: paneId,
+        observedCwd: testRepo,
+      });
+      return { agent, hash };
+    }
+
+    // 1. REC-AGENT-WRONG-WORKSPACE: agent.workspace_id != expected workspace
+    const attempt1 = `rec-ag-wrong-ws-${Date.now()}`;
+    const { agent: agent1, hash: hash1 } = setupAgentWithObservedWorkspace(attempt1, "ws-correct-1", "pane-correct-1");
+    const spy1 = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    const agentName1 = buildDeterministicHerdrAgentName(attempt1, hash1);
+    spy1.simulatedPanes = [
+      { pane_id: "pane-correct-1", workspace_id: "ws-correct-1", cwd: testRepo, foreground_cwd: testRepo },
+    ];
+    spy1.simulatedAgents.set(agentName1, {
+      name: agentName1,
+      agent: agentName1,
+      workspace_id: "ws-DIFFERENT-1", // Mismatch!
+      pane_id: "pane-correct-1",
+      cwd: testRepo,
+      foreground_cwd: testRepo,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+
+    await assert.rejects(
+      spy1.startExternalAgent({
+        agentId: agent1.id,
+        store,
+        attemptKey: attempt1,
+        dispatchIntentHash: hash1,
+        agentKind: "opencode",
+        canonicalWorktreePath: testRepo,
+        workspaceId: "ws-rec-ag",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[OUTCOME_UNKNOWN\]/);
+        return true;
+      },
+    );
+    assert.equal(store.getById(agent1.id)?.externalRuntimeBinding?.launch?.herdrAgentIdentity, undefined);
+
+    // 2. REC-AGENT-WRONG-PANE: agent.pane_id != expected pane
+    const attempt2 = `rec-ag-wrong-pane-${Date.now()}`;
+    const { agent: agent2, hash: hash2 } = setupAgentWithObservedWorkspace(attempt2, "ws-correct-2", "pane-correct-2");
+    const spy2 = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    const agentName2 = buildDeterministicHerdrAgentName(attempt2, hash2);
+    spy2.simulatedPanes = [
+      { pane_id: "pane-correct-2", workspace_id: "ws-correct-2", cwd: testRepo, foreground_cwd: testRepo },
+    ];
+    spy2.simulatedAgents.set(agentName2, {
+      name: agentName2,
+      agent: agentName2,
+      workspace_id: "ws-correct-2",
+      pane_id: "pane-DIFFERENT-2", // Mismatch!
+      cwd: testRepo,
+      foreground_cwd: testRepo,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+
+    await assert.rejects(
+      spy2.startExternalAgent({
+        agentId: agent2.id,
+        store,
+        attemptKey: attempt2,
+        dispatchIntentHash: hash2,
+        agentKind: "opencode",
+        canonicalWorktreePath: testRepo,
+        workspaceId: "ws-rec-ag",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[OUTCOME_UNKNOWN\]/);
+        return true;
+      },
+    );
+    assert.equal(store.getById(agent2.id)?.externalRuntimeBinding?.launch?.herdrAgentIdentity, undefined);
+
+    // 3. REC-AGENT-WRONG-CWD: agent workspace/pane match, but cwd points to other repo
+    const attempt3 = `rec-ag-wrong-cwd-${Date.now()}`;
+    const { agent: agent3, hash: hash3 } = setupAgentWithObservedWorkspace(attempt3, "ws-correct-3", "pane-correct-3");
+    const spy3 = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    const agentName3 = buildDeterministicHerdrAgentName(attempt3, hash3);
+    spy3.simulatedPanes = [
+      { pane_id: "pane-correct-3", workspace_id: "ws-correct-3", cwd: testRepo, foreground_cwd: testRepo },
+    ];
+    spy3.simulatedAgents.set(agentName3, {
+      name: agentName3,
+      agent: agentName3,
+      workspace_id: "ws-correct-3",
+      pane_id: "pane-correct-3",
+      cwd: "/some/unrelated/path", // Mismatch!
+      foreground_cwd: "/some/unrelated/path",
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+
+    await assert.rejects(
+      spy3.startExternalAgent({
+        agentId: agent3.id,
+        store,
+        attemptKey: attempt3,
+        dispatchIntentHash: hash3,
+        agentKind: "opencode",
+        canonicalWorktreePath: testRepo,
+        workspaceId: "ws-rec-ag",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[OUTCOME_UNKNOWN\]/);
+        return true;
+      },
+    );
+    assert.equal(store.getById(agent3.id)?.externalRuntimeBinding?.launch?.herdrAgentIdentity, undefined);
+
+    // 4. REC-AGENT-EXACT: all physical fields match exact
+    const attempt4 = `rec-ag-exact-${Date.now()}`;
+    const { agent: agent4, hash: hash4 } = setupAgentWithObservedWorkspace(attempt4, "ws-correct-4", "pane-correct-4");
+    const registry4 = new HerdrGatewayRegistry();
+    const spy4 = new SpyHerdrGateway("/tmp/test.sock", registry4, store);
+    const agentName4 = buildDeterministicHerdrAgentName(attempt4, hash4);
+    spy4.simulatedPanes = [
+      { pane_id: "pane-correct-4", workspace_id: "ws-correct-4", cwd: testRepo, foreground_cwd: testRepo },
+    ];
+    spy4.simulatedAgents.set(agentName4, {
+      name: agentName4,
+      agent: agentName4,
+      workspace_id: "ws-correct-4",
+      pane_id: "pane-correct-4",
+      cwd: testRepo,
+      foreground_cwd: testRepo,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+
+    const handle4 = await spy4.startExternalAgent({
+      agentId: agent4.id,
+      store,
+      attemptKey: attempt4,
+      dispatchIntentHash: hash4,
+      agentKind: "opencode",
+      canonicalWorktreePath: testRepo,
+      workspaceId: "ws-rec-ag",
+    });
+
+    assert.equal(handle4.herdrWorkspaceId, "ws-correct-4");
+    assert.equal(handle4.herdrPaneId, "pane-correct-4");
+    assert.equal(handle4.herdrAgentIdentity, agentName4);
+    assert.equal(registry4.getHandle(attempt4)?.herdrAgentIdentity, agentName4);
+    assert.equal(store.getById(agent4.id)?.externalRuntimeBinding?.launch?.herdrAgentIdentity, agentName4);
+  } finally {
+    store.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(testRepo, { recursive: true, force: true });
+  }
+});
+
+test("Name collision regression test: distinct long attemptKeys with identical 32-char prefix do not collide (Section 18 & 33)", () => {
+  const prefix = "attempt-long-prefix-that-exceeds-32-chars-";
+  const attemptKeyA = `${prefix}alpha-11111111111111111111111111111111`;
+  const attemptKeyB = `${prefix}beta-222222222222222222222222222222222`;
+
+  const nameA = buildDeterministicHerdrAgentName(attemptKeyA, "intent-hash-a");
+  const nameB = buildDeterministicHerdrAgentName(attemptKeyB, "intent-hash-b");
+
+  assert.notEqual(nameA, nameB, "Deterministic agent names must not collide even when prefixes are identical");
+  assert.ok(nameA.length <= 32, `nameA length ${nameA.length} must be <= 32`);
+  assert.ok(nameB.length <= 32, `nameB length ${nameB.length} must be <= 32`);
+
+  // Same attemptKey and intentHash is strictly deterministic
+  const nameA2 = buildDeterministicHerdrAgentName(attemptKeyA, "intent-hash-a");
+  assert.equal(nameA, nameA2, "buildDeterministicHerdrAgentName must be deterministic across calls");
+});
+
+test("Reconciliation CAS failure matrix stops immediately and prevents registry leakage (REC-CAS-WORKSPACE-FAIL, REC-CAS-AGENT-FAIL, REC-CAS-FINAL-BIND-FAIL, R6-REPRO-2)", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-rec-cas-test-"));
+  const store = new LocalAgentStore(stateDir);
+  const testRepo = mkdtempSync(join(tmpdir(), "devspace-rec-cas-repo-"));
+
+  try {
+    execFileSync("git", ["init", testRepo], { stdio: "ignore" });
+    execFileSync("git", ["-C", testRepo, "config", "user.name", "Test"], { stdio: "ignore" });
+    execFileSync("git", ["-C", testRepo, "config", "user.email", "test@test.com"], { stdio: "ignore" });
+    writeFileSync(join(testRepo, "test.txt"), "hello");
+    execFileSync("git", ["-C", testRepo, "add", "."], { stdio: "ignore" });
+    execFileSync("git", ["-C", testRepo, "commit", "-m", "init"], { stdio: "ignore" });
+    const gitHead = execFileSync("git", ["-C", testRepo, "rev-parse", "HEAD"], { encoding: "utf-8" }).trim();
+
+    // 1. REC-CAS-WORKSPACE-FAIL:
+    // Workspace observed physically, but store.recordExternalRuntimeWorkspaceObservedCAS returns applied=false
+    const attempt1 = `rec-cas-ws-fail-${Date.now()}`;
+    const intent1 = {
+      taskId: "task-cas-1",
+      attemptId: attempt1,
+      objective: "REC-CAS-WORKSPACE-FAIL",
+      roleIntent: "DEEP_ENGINEERING" as const,
+      claimCeiling: "CANDIDATE_READY" as const,
+      context: ["test"],
+      readScope: ["src"],
+      writeScope: ["src"],
+      exclusiveOwnership: true,
+      forbiddenChanges: [],
+      acceptanceCriteria: ["pass"],
+      verificationRequired: true,
+      expectedArtifacts: [],
+    };
+    const hash1 = hashDispatchIntent(intent1);
+    const agent1 = store.create({
+      workspaceId: "ws-cas-1",
+      workspaceRoot: testRepo,
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: attempt1, requestHash: "hash-cas-1" },
+      executionContract: { writePaths: ["src"], dispatchIntent: intent1 },
+    });
+    store.fenceExternalRuntimeLaunchCAS({
+      agentId: agent1.id,
+      attemptKey: attempt1,
+      dispatchIntentHash: hash1,
+      canonicalWorktreePath: testRepo,
+      gitHeadBefore: gitHead,
+      agentKind: "opencode",
+      promptNonce: `NONCE-${attempt1}`,
+      workspaceId: "ws-cas-1",
+    });
+
+    const registry1 = new HerdrGatewayRegistry();
+    const spy1 = new SpyHerdrGateway("/tmp/test.sock", registry1, store);
+    spy1.simulatedWorkspaces = [{ workspace_id: "ws-cas-fail-1", label: `devspace-${attempt1}` }];
+    spy1.simulatedPanes = [
+      { pane_id: "pane-cas-fail-1", workspace_id: "ws-cas-fail-1", cwd: testRepo, foreground_cwd: testRepo },
+    ];
+
+    const origWsObserved = store.recordExternalRuntimeWorkspaceObservedCAS.bind(store);
+    store.recordExternalRuntimeWorkspaceObservedCAS = () => ({ applied: false, reason: "simulated failure" });
+
+    await assert.rejects(
+      spy1.startExternalAgent({
+        agentId: agent1.id,
+        store,
+        attemptKey: attempt1,
+        dispatchIntentHash: hash1,
+        agentKind: "opencode",
+        canonicalWorktreePath: testRepo,
+        workspaceId: "ws-cas-1",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[OUTCOME_UNKNOWN\]/);
+        return true;
+      },
+    );
+    // Assert: getAgent calls = 0, registry absent, no returned handle (Section 35)
+    assert.equal(spy1.getAgentCalls, 0, "Failed workspace CAS must stop before getAgent");
+    assert.equal(registry1.getHandle(attempt1), undefined, "Registry must NOT contain handle");
+    store.recordExternalRuntimeWorkspaceObservedCAS = origWsObserved;
+
+    // 2. REC-CAS-AGENT-FAIL:
+    // Workspace CAS succeeds, agent observed physically, but store.recordExternalRuntimeAgentObservedCAS returns applied=false
+    const attempt2 = `rec-cas-ag-fail-${Date.now()}`;
+    const intent2 = { ...intent1, attemptId: attempt2 };
+    const hash2 = hashDispatchIntent(intent2);
+    const agent2 = store.create({
+      workspaceId: "ws-cas-2",
+      workspaceRoot: testRepo,
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: attempt2, requestHash: "hash-cas-2" },
+      executionContract: { writePaths: ["src"], dispatchIntent: intent2 },
+    });
+    store.fenceExternalRuntimeLaunchCAS({
+      agentId: agent2.id,
+      attemptKey: attempt2,
+      dispatchIntentHash: hash2,
+      canonicalWorktreePath: testRepo,
+      gitHeadBefore: gitHead,
+      agentKind: "opencode",
+      promptNonce: `NONCE-${attempt2}`,
+      workspaceId: "ws-cas-2",
+    });
+    store.recordExternalRuntimeWorkspaceObservedCAS({
+      agentId: agent2.id,
+      attemptKey: attempt2,
+      herdrWorkspaceId: "ws-cas-ag-2",
+      herdrPaneId: "pane-cas-ag-2",
+      observedCwd: testRepo,
+    });
+
+    const registry2 = new HerdrGatewayRegistry();
+    const spy2 = new SpyHerdrGateway("/tmp/test.sock", registry2, store);
+    const agentName2 = buildDeterministicHerdrAgentName(attempt2, hash2);
+    spy2.simulatedPanes = [
+      { pane_id: "pane-cas-ag-2", workspace_id: "ws-cas-ag-2", cwd: testRepo, foreground_cwd: testRepo },
+    ];
+    spy2.simulatedAgents.set(agentName2, {
+      name: agentName2,
+      agent: agentName2,
+      workspace_id: "ws-cas-ag-2",
+      pane_id: "pane-cas-ag-2",
+      cwd: testRepo,
+      foreground_cwd: testRepo,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+
+    const origAgObserved = store.recordExternalRuntimeAgentObservedCAS.bind(store);
+    store.recordExternalRuntimeAgentObservedCAS = () => ({ applied: false, reason: "simulated failure" });
+
+    await assert.rejects(
+      spy2.startExternalAgent({
+        agentId: agent2.id,
+        store,
+        attemptKey: attempt2,
+        dispatchIntentHash: hash2,
+        agentKind: "opencode",
+        canonicalWorktreePath: testRepo,
+        workspaceId: "ws-cas-2",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[OUTCOME_UNKNOWN\]/);
+        return true;
+      },
+    );
+    assert.equal(registry2.getHandle(attempt2), undefined, "Registry must NOT contain handle after agent CAS failure");
+    store.recordExternalRuntimeAgentObservedCAS = origAgObserved;
+
+    // 3. REC-CAS-FINAL-BIND-FAIL:
+    // Workspace and agent CAS succeed, but bindExternalRuntimeBindingCAS returns applied=false
+    const attempt3 = `rec-cas-bind-fail-${Date.now()}`;
+    const intent3 = { ...intent1, attemptId: attempt3 };
+    const hash3 = hashDispatchIntent(intent3);
+    const agent3 = store.create({
+      workspaceId: "ws-cas-3",
+      workspaceRoot: testRepo,
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: attempt3, requestHash: "hash-cas-3" },
+      executionContract: { writePaths: ["src"], dispatchIntent: intent3 },
+    });
+    store.fenceExternalRuntimeLaunchCAS({
+      agentId: agent3.id,
+      attemptKey: attempt3,
+      dispatchIntentHash: hash3,
+      canonicalWorktreePath: testRepo,
+      gitHeadBefore: gitHead,
+      agentKind: "opencode",
+      promptNonce: `NONCE-${attempt3}`,
+      workspaceId: "ws-cas-3",
+    });
+    store.recordExternalRuntimeWorkspaceObservedCAS({
+      agentId: agent3.id,
+      attemptKey: attempt3,
+      herdrWorkspaceId: "ws-cas-bind-3",
+      herdrPaneId: "pane-cas-bind-3",
+      observedCwd: testRepo,
+    });
+
+    const registry3 = new HerdrGatewayRegistry();
+    const spy3 = new SpyHerdrGateway("/tmp/test.sock", registry3, store);
+    const agentName3 = buildDeterministicHerdrAgentName(attempt3, hash3);
+    spy3.simulatedPanes = [
+      { pane_id: "pane-cas-bind-3", workspace_id: "ws-cas-bind-3", cwd: testRepo, foreground_cwd: testRepo },
+    ];
+    spy3.simulatedAgents.set(agentName3, {
+      name: agentName3,
+      agent: agentName3,
+      workspace_id: "ws-cas-bind-3",
+      pane_id: "pane-cas-bind-3",
+      cwd: testRepo,
+      foreground_cwd: testRepo,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+
+    const origBind = store.bindExternalRuntimeBindingCAS.bind(store);
+    store.bindExternalRuntimeBindingCAS = () => ({ applied: false, reason: "simulated failure" });
+
+    await assert.rejects(
+      spy3.startExternalAgent({
+        agentId: agent3.id,
+        store,
+        attemptKey: attempt3,
+        dispatchIntentHash: hash3,
+        agentKind: "opencode",
+        canonicalWorktreePath: testRepo,
+        workspaceId: "ws-cas-3",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[OUTCOME_UNKNOWN\]/);
+        return true;
+      },
+    );
+    assert.equal(registry3.getHandle(attempt3), undefined, "Registry must NOT contain handle after final bind failure");
+    store.bindExternalRuntimeBindingCAS = origBind;
+  } finally {
+    store.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(testRepo, { recursive: true, force: true });
+  }
+});
+
+test("No-store failure matrix: LAUNCH_NO_DURABLE_STORE and PROMPT_NO_DURABLE_STORE with zero external calls (Section 36, 37, R6-REPRO-3)", async () => {
+  const testRepo = mkdtempSync(join(tmpdir(), "devspace-no-store-repo-"));
+  try {
+    execFileSync("git", ["init", testRepo], { stdio: "ignore" });
+    execFileSync("git", ["-C", testRepo, "config", "user.name", "Test"], { stdio: "ignore" });
+    execFileSync("git", ["-C", testRepo, "config", "user.email", "test@test.com"], { stdio: "ignore" });
+    writeFileSync(join(testRepo, "test.txt"), "hello");
+    execFileSync("git", ["-C", testRepo, "add", "."], { stdio: "ignore" });
+    execFileSync("git", ["-C", testRepo, "commit", "-m", "init"], { stdio: "ignore" });
+
+    const gatewayWithoutStore = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry());
+
+    // 1. LAUNCH_NO_DURABLE_STORE
+    await assert.rejects(
+      gatewayWithoutStore.startExternalAgent({
+        attemptKey: "attempt-no-store",
+        dispatchIntentHash: "hash-no-store",
+        agentKind: "opencode",
+        canonicalWorktreePath: testRepo,
+        workspaceId: "ws-no-store",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[LAUNCH_NO_DURABLE_STORE\]/);
+        return true;
+      },
+    );
+    assert.equal(gatewayWithoutStore.workspaceCreateCalls, 0, "No workspace.create calls when store is absent");
+    assert.equal(gatewayWithoutStore.agentStartCalls, 0, "No agent.start calls when store is absent");
+    assert.equal(gatewayWithoutStore.agentWaitCalls, 0, "No agent.wait calls when store is absent");
+
+    // 2. PROMPT_NO_DURABLE_STORE
+    const dummyHandle: HerdrExternalHandle = {
+      schemaVersion: 1,
+      runtimeKind: HERDR_RUNTIME_KIND,
+      agentId: "dummy-agent-id",
+      herdrSocketPath: "/tmp/test.sock",
+      herdrWorkspaceId: "w1",
+      herdrPaneId: "p1",
+      herdrAgentIdentity: "ds-no-store",
+      herdrAgentKind: "opencode",
+      promptNonce: "NONCE-NO-STORE",
+      canonicalWorktreePath: testRepo,
+      workspaceId: "ws-no-store",
+      gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+      attemptKey: "attempt-no-store",
+      dispatchIntentHash: "hash-no-store",
+      launchTimestamp: new Date().toISOString(),
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    };
+
+    await assert.rejects(
+      gatewayWithoutStore.promptExternalAgent(dummyHandle, "some prompt"),
+      (err: any) => {
+        assert.match(err.message, /\[PROMPT_NO_DURABLE_STORE\]/);
+        return true;
+      },
+    );
+    assert.equal(gatewayWithoutStore.agentPromptCalls, 0, "No agent.prompt calls when store is absent");
+  } finally {
     rmSync(testRepo, { recursive: true, force: true });
   }
 });

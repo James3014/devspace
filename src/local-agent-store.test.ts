@@ -11,6 +11,7 @@ import {
   LOCAL_EFFECT_PROJECTION_SCHEMA,
 } from "./local-effect-enforcement.js";
 import { hashDispatchIntent } from "./execution-protocol.js";
+import { canonicalizePath } from "./roots.js";
 
 const root = mkdtempSync(join(tmpdir(), "devspace-local-agent-store-test-"));
 const stores: LocalAgentStore[] = [];
@@ -1499,7 +1500,17 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
     promptNonce: "NONCE-LAUNCH-1",
   }).applied, true, "L-IDEMPOTENT-LAUNCH must succeed");
 
-  // L-WORKSPACE-OBSERVED: record positive workspace observation
+  // WORKSPACE-CAS-WRONG-CWD: wrong observedCwd fails closed
+  const wrongCwdRes = store.recordExternalRuntimeWorkspaceObservedCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    herdrWorkspaceId: "w_launch_1",
+    herdrPaneId: "p_launch_1",
+    observedCwd: join(root, "other_project"),
+  });
+  assert.equal(wrongCwdRes.applied, false, "WORKSPACE-CAS-WRONG-CWD must fail");
+
+  // WORKSPACE-CAS-EXACT-CWD: exact observedCwd succeeds
   const wsObservedRes = store.recordExternalRuntimeWorkspaceObservedCAS({
     agentId: launchAgent.id,
     attemptKey: "attempt-launch-1",
@@ -1507,11 +1518,12 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
     herdrPaneId: "p_launch_1",
     observedCwd: join(root, "launch_project"),
   });
-  assert.equal(wsObservedRes.applied, true, "recordExternalRuntimeWorkspaceObservedCAS must succeed");
+  assert.equal(wsObservedRes.applied, true, "WORKSPACE-CAS-EXACT-CWD must succeed");
   const postWsRecord = store.getById(launchAgent.id)!;
   assert.equal(postWsRecord.externalRuntimeBinding?.launch?.state, "WORKSPACE_OBSERVED");
   assert.equal(postWsRecord.externalRuntimeBinding?.launch?.herdrWorkspaceId, "w_launch_1");
   assert.equal(postWsRecord.externalRuntimeBinding?.launch?.herdrPaneId, "p_launch_1");
+  assert.equal(postWsRecord.externalRuntimeBinding?.launch?.observedCwd, canonicalizePath(join(root, "launch_project")));
 
   // L-AGENT-OBSERVED: record positive agent observation
   const agentObservedRes = store.recordExternalRuntimeAgentObservedCAS({
