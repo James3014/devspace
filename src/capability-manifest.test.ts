@@ -4,6 +4,7 @@ import * as z from "zod/v4";
 import {
   CAPABILITY_MANIFEST_SCHEMA,
   deriveLoadedCapabilityManifest,
+  mcpToolCatalogGeneration,
 } from "./capability-manifest.js";
 import { chatSwarmToolInputShapes } from "./chat-swarm-tools.js";
 
@@ -20,6 +21,22 @@ function agentStartInput(idleDescription = "heartbeat-backed idle supervision"):
     }).partial().optional(),
   };
 }
+
+test("MCP tool catalog generation changes when a conditionally enabled action changes", () => {
+  const baseline = mcpToolCatalogGeneration(["open_workspace", "write", "candidate_integrate"]);
+  const withGitCandidate = mcpToolCatalogGeneration([
+    "candidate_integrate",
+    "git_commit",
+    "open_workspace",
+    "write",
+  ]);
+
+  assert.notEqual(baseline, withGitCandidate);
+  assert.equal(
+    withGitCandidate,
+    mcpToolCatalogGeneration(["write", "git_commit", "candidate_integrate", "open_workspace", "git_commit"]),
+  );
+});
 
 test("loaded capability manifest is deterministic and derived from the registered agent_start schema", () => {
   const first = deriveLoadedCapabilityManifest({ agent_start: agentStartInput() });

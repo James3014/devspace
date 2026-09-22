@@ -33,6 +33,7 @@ import { ChatSwarmRuntimeAlreadyOwnedError } from "./chat-swarm-runtime-owner.js
 import { ChatSwarmStore } from "./chat-swarm-store.js";
 import { chatSwarmToolInputShapes } from "./chat-swarm-tools.js";
 import type { ControlPlaneInventory } from "./control-plane-convergence.js";
+import { mcpToolCatalogGeneration } from "./capability-manifest.js";
 
 import { SqliteOAuthStore, SqliteOAuthClientsStore } from "./oauth-store.js";
 import {
@@ -2870,6 +2871,21 @@ test("gitCandidates disabled: git tools are absent", async (t) => {
   assert.equal(gitTools.length, 0);
 });
 
+test("Issue #238: MCP tool catalog identity changes with conditional Git Candidate actions", async (t) => {
+  const withoutGitCandidates = await fixture(t, { gitCandidates: false });
+  const withGitCandidates = await fixture(t, { git: true, gitCandidates: true });
+
+  const withoutTools = (await withoutGitCandidates.client.listTools()).tools.map((tool) => tool.name);
+  const withTools = (await withGitCandidates.client.listTools()).tools.map((tool) => tool.name);
+
+  assert.equal(withoutTools.includes("git_commit"), false);
+  assert.equal(withTools.includes("git_commit"), true);
+  assert.notEqual(
+    mcpToolCatalogGeneration(withoutTools),
+    mcpToolCatalogGeneration(withTools),
+  );
+});
+
 test("gitCandidates enabled: git tools are present with schema validation", async (t) => {
   const context = await fixture(t, { git: true, gitCandidates: true });
   const tools = await context.client.listTools();
@@ -5113,12 +5129,14 @@ test("Issue #15 Wave 4B: capability convergence resolves the initialized request
     const session = payload.result?.structuredContent?.sessionConvergence as {
       state?: string;
       converged?: boolean;
-      sessionSnapshot?: { serverInstanceId?: string };
-      serverGeneration?: { serverInstanceId?: string };
+      sessionSnapshot?: { serverInstanceId?: string; catalogGeneration?: string };
+      serverGeneration?: { serverInstanceId?: string; catalogGeneration?: string; toolNames?: string[] };
     } | undefined;
     assert.equal(session?.state, "CURRENT");
     assert.equal(session?.converged, true);
     assert.equal(session?.sessionSnapshot?.serverInstanceId, session?.serverGeneration?.serverInstanceId);
+    assert.equal(session?.sessionSnapshot?.catalogGeneration, session?.serverGeneration?.catalogGeneration);
+    assert.ok(session?.serverGeneration?.toolNames?.includes("open_workspace"));
   } finally {
     await new Promise<void>((resolve) => listener.close(() => resolve()));
     await running.close();

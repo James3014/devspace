@@ -174,6 +174,7 @@ import {
 } from "./control-plane-convergence.js";
 import {
   deriveLoadedCapabilityManifest,
+  mcpToolCatalogGeneration,
   type CapabilityManifest,
 } from "./capability-manifest.js";
 import { devspaceConfigDir } from "./user-config.js";
@@ -1642,6 +1643,8 @@ function registerRepositoryIntelligenceTools(
 export interface RuntimeBuildIdentityContext {
   identity: RuntimeBuildIdentity;
   latestProfileCatalogGeneration: { value: string };
+  latestMcpToolCatalogGeneration?: { value: string };
+  latestMcpToolCatalogNames?: { value: string[] };
   capabilityManifest?: CapabilityManifest;
   onCatalogGenerationChanged?: () => Promise<number> | number;
 }
@@ -2871,6 +2874,10 @@ export function createMcpServer(
     });
   const latestProfileCatalogGeneration = runtimeBuildIdentityContext?.latestProfileCatalogGeneration
     ?? { value: runtimeBuildIdentity.profileCatalogGeneration };
+  const latestMcpToolCatalogGeneration = runtimeBuildIdentityContext?.latestMcpToolCatalogGeneration
+    ?? { value: "unresolved" };
+  const latestMcpToolCatalogNames = runtimeBuildIdentityContext?.latestMcpToolCatalogNames
+    ?? { value: [] as string[] };
   const agentStartInputSchema = createAgentStartInputSchema();
   const agentPreflightInputSchema = createAgentPreflightInputSchema();
 
@@ -3003,6 +3010,17 @@ export function createMcpServer(
       instructions: serverInstructions(config),
     },
   );
+
+  // Track the actual MCP registration surface through the SDK's public
+  // registerTool entry point. registerAppTool and sibling registrars all
+  // converge here, so this avoids a second hand-maintained tool inventory.
+  const registeredMcpToolNames = new Set<string>();
+  const registerMcpTool = server.registerTool.bind(server) as (...args: any[]) => unknown;
+  (server as unknown as { registerTool: (...args: any[]) => unknown }).registerTool =
+    (name: string, ...args: any[]) => {
+      registeredMcpToolNames.add(name);
+      return registerMcpTool(name, ...args);
+    };
 
   registerAppTool(
     server,
@@ -6126,6 +6144,8 @@ export function createMcpServer(
     });
   }
 
+  latestMcpToolCatalogNames.value = [...registeredMcpToolNames].sort();
+  latestMcpToolCatalogGeneration.value = mcpToolCatalogGeneration(latestMcpToolCatalogNames.value);
   return server;
 }
 
@@ -6464,6 +6484,8 @@ export function createServer(
     ...(manifestBoundServerInstanceId ? { serverInstanceId: manifestBoundServerInstanceId } : {}),
   });
   const latestProfileCatalogGeneration = { value: runtimeBuildIdentity.profileCatalogGeneration };
+  const latestMcpToolCatalogGeneration = { value: "unresolved" };
+  const latestMcpToolCatalogNames = { value: [] as string[] };
   const agentSessionManager = config.subagents.enabled
     ? new LocalAgentSessionManager(config, undefined, undefined, undefined, runtimeBuildIdentity, undefined, clineCatalogService, opencodeCatalogSource)
     : undefined;
@@ -6973,6 +6995,8 @@ export function createServer(
     {
       identity: runtimeBuildIdentity,
       latestProfileCatalogGeneration,
+      latestMcpToolCatalogGeneration,
+      latestMcpToolCatalogNames,
       capabilityManifest,
       onCatalogGenerationChanged: broadcastToolListChanged,
     },
@@ -6998,7 +7022,8 @@ export function createServer(
           sourceCommit: runtimeBuildIdentity.sourceCommit,
           buildId: runtimeBuildIdentity.buildId,
           capabilityManifestSha256: capabilityManifest.manifestSha256,
-          catalogGeneration: latestProfileCatalogGeneration.value,
+          catalogGeneration: latestMcpToolCatalogGeneration.value,
+          toolNames: latestMcpToolCatalogNames.value,
           freshness: runtimeBuildIdentity.startedAt,
           cutoverMode: cutoverController.mode(),
           reconciliationRequired: cutoverController.mode() !== "normal",
@@ -7143,7 +7168,8 @@ export function createServer(
             sourceCommit: runtimeBuildIdentity.sourceCommit,
             buildId: runtimeBuildIdentity.buildId,
             capabilityManifestSha256: capabilityManifest.manifestSha256,
-            catalogGeneration: latestProfileCatalogGeneration.value,
+            catalogGeneration: latestMcpToolCatalogGeneration.value,
+            toolNames: latestMcpToolCatalogNames.value,
             freshness: runtimeBuildIdentity.startedAt,
             cutoverMode: cutoverController.mode(),
             reconciliationRequired: cutoverController.mode() !== "normal",
@@ -7156,7 +7182,7 @@ export function createServer(
               reconciliationRequired: convergence.reconciliationRequired,
               currentServerCommit: runtimeBuildIdentity.sourceCommit,
               sessionBoundCommit: sessionSnapshot?.sourceCommit,
-              currentCatalogGeneration: latestProfileCatalogGeneration.value,
+              currentCatalogGeneration: latestMcpToolCatalogGeneration.value,
               sessionBoundCatalogGeneration: sessionSnapshot?.catalogGeneration,
             };
             res.status(409).json({
@@ -7233,7 +7259,7 @@ export function createServer(
               sourceCommit: runtimeBuildIdentity.sourceCommit,
               buildId: runtimeBuildIdentity.buildId,
               capabilityManifestSha256: capabilityManifest.manifestSha256,
-              catalogGeneration: latestProfileCatalogGeneration.value,
+              catalogGeneration: latestMcpToolCatalogGeneration.value,
               freshness: runtimeBuildIdentity.startedAt,
               sessionInitializedAt: new Date().toISOString(),
             },
@@ -7272,7 +7298,7 @@ export function createServer(
                 sourceCommit: runtimeBuildIdentity.sourceCommit,
                 buildId: runtimeBuildIdentity.buildId,
                 capabilityManifestSha256: capabilityManifest.manifestSha256,
-                catalogGeneration: latestProfileCatalogGeneration.value,
+                catalogGeneration: latestMcpToolCatalogGeneration.value,
                 freshness: runtimeBuildIdentity.startedAt,
                 sessionInitializedAt: new Date().toISOString(),
               };
@@ -7300,7 +7326,7 @@ export function createServer(
             sourceCommit: runtimeBuildIdentity.sourceCommit,
             buildId: runtimeBuildIdentity.buildId,
             capabilityManifestSha256: capabilityManifest.manifestSha256,
-            catalogGeneration: latestProfileCatalogGeneration.value,
+            catalogGeneration: latestMcpToolCatalogGeneration.value,
             freshness: runtimeBuildIdentity.startedAt,
             sessionInitializedAt: new Date().toISOString(),
           };
@@ -7329,7 +7355,7 @@ export function createServer(
             sourceCommit: runtimeBuildIdentity.sourceCommit,
             buildId: runtimeBuildIdentity.buildId,
             capabilityManifestSha256: capabilityManifest.manifestSha256,
-            catalogGeneration: latestProfileCatalogGeneration.value,
+            catalogGeneration: latestMcpToolCatalogGeneration.value,
             freshness: runtimeBuildIdentity.startedAt,
             sessionInitializedAt: new Date().toISOString(),
           });

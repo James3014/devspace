@@ -40,6 +40,7 @@ export interface SessionConvergenceEvaluation {
     buildId: string;
     capabilityManifestSha256: string;
     catalogGeneration: string;
+    toolNames?: string[];
     freshness?: string;
     cutoverMode: string;
     reconciliationRequired: boolean;
@@ -261,6 +262,7 @@ export function evaluateSessionConvergence(
     buildId: string;
     capabilityManifestSha256: string;
     catalogGeneration: string;
+    toolNames?: string[];
     freshness?: string;
     cutoverMode: string;
     reconciliationRequired: boolean;

@@ -99,6 +99,20 @@ function registeredSchemaFingerprint(tools: ToolInputSchemas): string | undefine
 }
 
 /**
+ * Stable identity of the effective MCP tool-name catalog.
+ *
+ * This is intentionally separate from the agent/profile catalog generation:
+ * adding or removing an MCP action must change session convergence identity
+ * even when provider/profile discovery is unchanged.
+ */
+export function mcpToolCatalogGeneration(toolNames: Iterable<string>): string {
+  const names = [...new Set(toolNames)].sort();
+  return createHash("sha256")
+    .update(JSON.stringify(names))
+    .digest("hex");
+}
+
+/**
  * Derive the runtime manifest from the same schema objects passed to MCP tool
  * registration. No source declaration or caller-supplied capability list is
  * treated as evidence.
