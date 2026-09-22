@@ -689,6 +689,127 @@ test("synchronous reconciliation never clears required PROCESS evidence", async 
   }
 });
 
+test("owner recovery clears only an exact orphaned PROCESS writer after physical evidence", async () => {
+  const fixture = makeRepo();
+  const stateDir = join(fixture.root, "state");
+  const workspaceId = "ws_core_orphan_process_recovery";
+  const workspaceStore = createWorkspaceStore(stateDir);
+  workspaceStore.createSession({ id: workspaceId, root: fixture.repo, mode: "checkout" });
+  const store = new CoreMutationSessionStore(stateDir);
+  const originalActor = `mcp:${"a".repeat(64)}`;
+  const recoveryActor = `mcp:${"b".repeat(64)}`;
+  try {
+    const binding = makeBinding({ workspaceSessionId: workspaceId, head: fixture.head, tree: fixture.tree });
+    const session = await store.open({
+      workspaceSessionId: workspaceId,
+      workspaceRoot: fixture.repo,
+      workspaceMode: "checkout",
+      managed: false,
+      actorKey: originalActor,
+      binding,
+    });
+    await store.admitEffect({
+      workspaceSessionId: workspaceId,
+      workspaceRoot: fixture.repo,
+      workspaceMode: "checkout",
+      managed: false,
+      actorKey: originalActor,
+      pointer: { required: true, sessionId: session.id, bindingHash: session.bindingHash },
+      pathContainment: "NOT_PROVEN",
+      writerDomain: "PROCESS",
+    });
+    writeFileSync(join(fixture.repo, "app.ts"), "export const value = 2;\n");
+    const expected = await store.snapshot({
+      sessionId: session.id,
+      workspaceSessionId: workspaceId,
+      workspaceRoot: fixture.repo,
+      actorKey: originalActor,
+    });
+    const evidence = {
+      expectedOriginalActorKey: originalActor,
+      expectedSourceHead: fixture.head,
+      expectedSourceTree: fixture.tree,
+      expectedCurrentHead: fixture.head,
+      expectedTargetTree: expected.targetTree,
+      expectedDiffHash: expected.diffHash,
+      expectedChangedPaths: expected.changedPaths,
+      expectedDeletedPaths: expected.deletedPaths,
+    };
+
+    await assert.rejects(
+      () => store.recoverOrphanedProcessEffect({
+        sessionId: session.id,
+        workspaceSessionId: workspaceId,
+        workspaceRoot: fixture.repo,
+        recoveryActorKey: recoveryActor,
+        bindingHash: session.bindingHash,
+        evidence,
+        inspectProcessWriter: () => "ACTIVE",
+      }),
+      (error: unknown) => error instanceof CoreMutationSessionError && error.code === "CORE_MUTATION_RECOVERY_WRITER_ACTIVE",
+    );
+    await assert.rejects(
+      () => store.recoverOrphanedProcessEffect({
+        sessionId: session.id,
+        workspaceSessionId: workspaceId,
+        workspaceRoot: fixture.repo,
+        recoveryActorKey: recoveryActor,
+        bindingHash: session.bindingHash,
+        evidence: { ...evidence, expectedOriginalActorKey: `mcp:${"c".repeat(64)}` },
+        inspectProcessWriter: () => "UNKNOWN",
+      }),
+      (error: unknown) => error instanceof CoreMutationSessionError && error.code === "CORE_MUTATION_RECOVERY_ACTOR_MISMATCH",
+    );
+    await assert.rejects(
+      () => store.recoverOrphanedProcessEffect({
+        sessionId: session.id,
+        workspaceSessionId: workspaceId,
+        workspaceRoot: fixture.repo,
+        recoveryActorKey: recoveryActor,
+        bindingHash: session.bindingHash,
+        evidence: { ...evidence, expectedDiffHash: `sha256:${"f".repeat(64)}` },
+        inspectProcessWriter: () => "UNKNOWN",
+      }),
+      (error: unknown) => error instanceof CoreMutationSessionError && error.code === "CORE_MUTATION_RECOVERY_PHYSICAL_MISMATCH",
+    );
+
+    const recovered = await store.recoverOrphanedProcessEffect({
+      sessionId: session.id,
+      workspaceSessionId: workspaceId,
+      workspaceRoot: fixture.repo,
+      recoveryActorKey: recoveryActor,
+      bindingHash: session.bindingHash,
+      evidence,
+      inspectProcessWriter: () => "UNKNOWN",
+    });
+    assert.equal(recovered.observedWriterState, "UNKNOWN");
+    assert.equal(recovered.alreadyReconciled, false);
+    assert.equal(recovered.session.actorKey, originalActor);
+    assert.equal(recovered.session.status, "ACTIVE");
+    assert.deepEqual(recovered.session.writerDomains, []);
+    assert.equal(recovered.session.writerReconciliationState, "CLEAR");
+    assert.equal(recovered.snapshot.diffHash, expected.diffHash);
+    assert.equal(recovered.snapshot.targetTree, expected.targetTree);
+
+    const replay = await store.recoverOrphanedProcessEffect({
+      sessionId: session.id,
+      workspaceSessionId: workspaceId,
+      workspaceRoot: fixture.repo,
+      recoveryActorKey: recoveryActor,
+      bindingHash: session.bindingHash,
+      evidence,
+      inspectProcessWriter: () => "UNKNOWN",
+    });
+    assert.equal(replay.alreadyReconciled, true);
+    assert.deepEqual(replay.session.writerDomains, []);
+    assert.equal(replay.session.writerReconciliationState, "CLEAR");
+  } finally {
+    store.close();
+    workspaceStore.close?.();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test("binding hashes, Core contract, and authority shape reject forgery", () => {
   const original = makeBinding({
     workspaceSessionId: "ws_core_forgery",

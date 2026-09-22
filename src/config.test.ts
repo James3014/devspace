@@ -50,6 +50,15 @@ assert.equal(loadConfig(baseEnv).codexGoalsEnabled, false);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_CODEX_GOALS: "1" }).codexGoalsEnabled, true);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_CODEX_GOALS: "0" }).codexGoalsEnabled, false);
 assert.equal(loadConfig(baseEnv).codexBin, undefined);
+assert.equal(loadConfig(baseEnv).coreMutationRecoveryOwnerClientId, undefined);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_CORE_MUTATION_RECOVERY_OWNER_CLIENT_ID: " devspace-owner-recovery " }).coreMutationRecoveryOwnerClientId,
+  "devspace-owner-recovery",
+);
+assert.equal(
+  loadConfig({ ...baseEnv, DEVSPACE_CORE_MUTATION_RECOVERY_OWNER_CLIENT_ID: "   " }).coreMutationRecoveryOwnerClientId,
+  undefined,
+);
 assert.equal(loadConfig({ ...baseEnv, DEVSPACE_CODEX_BIN: "/custom/codex" }).codexBin, "/custom/codex");
 assert.equal(loadConfig(baseEnv).repositoryIntelligenceRoot, undefined);
 assert.equal(loadConfig(baseEnv).repositoryIntelligenceExpectedHead, undefined);

@@ -73,6 +73,7 @@ export interface ServerConfig {
   hostOperationMaxWallMs?: number;
   hostOperationMaxIdleMs?: number;
   hostOperationAllowLongLived?: boolean;
+  coreMutationRecoveryOwnerClientId?: string;
 }
 
 function parsePort(value: string | number | undefined): number {
@@ -472,6 +473,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     hostOperationMaxWallMs: env.DEVSPACE_HOST_OPERATION_MAX_WALL_MS ? parsePositiveInteger(env.DEVSPACE_HOST_OPERATION_MAX_WALL_MS, 30_000, "DEVSPACE_HOST_OPERATION_MAX_WALL_MS", 120_000) : undefined,
     hostOperationMaxIdleMs: env.DEVSPACE_HOST_OPERATION_MAX_IDLE_MS ? parsePositiveInteger(env.DEVSPACE_HOST_OPERATION_MAX_IDLE_MS, 30_000, "DEVSPACE_HOST_OPERATION_MAX_IDLE_MS", 120_000) : undefined,
     hostOperationAllowLongLived: parseBoolean(env.DEVSPACE_HOST_OPERATION_ALLOW_LONG_LIVED),
+    coreMutationRecoveryOwnerClientId: env.DEVSPACE_CORE_MUTATION_RECOVERY_OWNER_CLIENT_ID?.trim() || undefined,
   };
 }
 
