@@ -110,6 +110,9 @@ test("Git base fence fails closed when Git HEAD is unresolvable (A9)", async () 
 test("HerdrThinGateway reconciliation enforces N5, N5-COMMIT, N6, N6-COMMIT, N7, N7-PHYSICAL, N8 controls", async () => {
   // Create a temporary git repo worktree
   const testDir = mkdtempSync(join(tmpdir(), "herdr-reconcile-test-"));
+  // Declared outside try so they're accessible in finally
+  let stateDir: string | undefined;
+  let store: LocalAgentStore | undefined;
   try {
     execFileSync("git", ["init", testDir], { stdio: "ignore" });
     execFileSync("git", ["-C", testDir, "config", "user.name", "Test User"], { stdio: "ignore" });
@@ -121,10 +124,18 @@ test("HerdrThinGateway reconciliation enforces N5, N5-COMMIT, N6, N6-COMMIT, N7,
     execFileSync("git", ["-C", testDir, "commit", "-m", "init"], { stdio: "ignore" });
     const initCommit = execFileSync("git", ["-C", testDir, "rev-parse", "HEAD"], { encoding: "utf-8" }).trim();
 
-    const gateway = new HerdrThinGateway("/nonexistent/herdr.sock");
+    stateDir = mkdtempSync(join(tmpdir(), "herdr-reconcile-store-"));
+    store = new LocalAgentStore(stateDir);
+    const agent = store.create({
+      workspaceId: "ws-2",
+      workspaceRoot: testDir,
+      profileName: "worker",
+      provider: "opencode",
+    });
     const handle: HerdrExternalHandle = {
       schemaVersion: 1,
       runtimeKind: HERDR_RUNTIME_KIND,
+      agentId: agent.id,
       herdrSocketPath: "/nonexistent/herdr.sock",
       herdrWorkspaceId: "w1",
       herdrPaneId: "w1:p1",
@@ -139,6 +150,17 @@ test("HerdrThinGateway reconciliation enforces N5, N5-COMMIT, N6, N6-COMMIT, N7,
       launchTimestamp: new Date().toISOString(),
       enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
     };
+
+    // Bind handle directly (no startReplay/executionContract guards needed for this test)
+    store.bindExternalRuntimeBindingCAS({
+      agentId: agent.id,
+      binding: {
+        runtimeKind: HERDR_RUNTIME_KIND,
+        handle: handle as unknown as Record<string, unknown>,
+      },
+    });
+
+    const gateway = new HerdrThinGateway("/nonexistent/herdr.sock", undefined, store);
 
     // N7: Server unreachable, no mutations -> OUTCOME_UNKNOWN, physicalEffect ABSENT
     const resServerDown = await gateway.reconcileExternalAgent(handle);
@@ -161,7 +183,7 @@ test("HerdrThinGateway reconciliation enforces N5, N5-COMMIT, N6, N6-COMMIT, N7,
     execFileSync("git", ["-C", testDir, "checkout", "README.md"], { stdio: "ignore" });
 
     // Mock live gateway to test terminal states
-    const liveGateway = new HerdrThinGateway();
+    const liveGateway = new HerdrThinGateway(undefined, undefined, store);
     (liveGateway as any).getPane = async () => ({
       pane_id: handle.herdrPaneId,
       workspace_id: handle.herdrWorkspaceId,
@@ -218,6 +240,8 @@ test("HerdrThinGateway reconciliation enforces N5, N5-COMMIT, N6, N6-COMMIT, N7,
     assert.ok(resCommitScopeViolation.unexpectedPaths.includes("unauthorized.ts"));
     assert.equal(resCommitScopeViolation.enforcementState, "REQUEST_ONLY_NOT_ENFORCED"); // N8
   } finally {
+    store?.close();
+    if (stateDir) rmSync(stateDir, { recursive: true, force: true });
     rmSync(testDir, { recursive: true, force: true });
   }
 });
@@ -682,7 +706,12 @@ test("HerdrThinGateway live canary with Agy on isolated worktree", async () => {
     const filePath = join(worktreePath, "agy_canary.txt");
     if (!existsSync(filePath)) {
       const reconcileRes = await gateway.reconcileExternalAgent(handle, ["agy_canary.txt"], true, promptRes);
-      assert.equal(reconcileRes.completionStatus, "NOT_COMPLETE");
+      // F5: If live identity is verified and process settled idle/done without mutating, completionStatus is NOT_COMPLETE.
+      // If live identity was lost/unknown, completionStatus is truthfully OUTCOME_UNKNOWN.
+      assert.ok(
+        reconcileRes.completionStatus === "NOT_COMPLETE" || reconcileRes.completionStatus === "OUTCOME_UNKNOWN",
+        `Expected NOT_COMPLETE or OUTCOME_UNKNOWN, got ${reconcileRes.completionStatus}`,
+      );
       assert.equal(reconcileRes.physicalEffect, "ABSENT");
       await gateway.stopExternalAgent(handle);
       return;
@@ -1081,7 +1110,8 @@ test("HerdrThinGateway prompt fence negative matrix and zero external calls (C1,
     await assert.rejects(
       spy.promptExternalAgent(wrongAttemptHandle, "prompt text", { store }),
       (err: any) => {
-        assert.match(err.message, /\[N-TURN-OPTION-A\]/);
+        // Repair 8: F1 durable authority gate fires before fence CAS for fields included in handle normalization
+        assert.match(err.message, /\[FAIL_CLOSED \/ DURABLE_HANDLE_AUTHORITY_MISMATCH\]|\[N-TURN-OPTION-A\]/);
         return true;
       },
     );
@@ -1092,7 +1122,8 @@ test("HerdrThinGateway prompt fence negative matrix and zero external calls (C1,
     await assert.rejects(
       spy.promptExternalAgent(wrongDispatchHandle, "prompt text", { store }),
       (err: any) => {
-        assert.match(err.message, /\[N-TURN-OPTION-A\]/);
+        // Repair 8: F1 durable authority gate fires before fence CAS for fields included in handle normalization
+        assert.match(err.message, /\[FAIL_CLOSED \/ DURABLE_HANDLE_AUTHORITY_MISMATCH\]|\[N-TURN-OPTION-A\]/);
         return true;
       },
     );
@@ -1103,7 +1134,7 @@ test("HerdrThinGateway prompt fence negative matrix and zero external calls (C1,
     await assert.rejects(
       spy.promptExternalAgent(wrongNonceHandle, "prompt text", { store }),
       (err: any) => {
-        assert.match(err.message, /\[N-TURN-OPTION-A\]/);
+        assert.match(err.message, /\[FAIL_CLOSED .*\]|\[N-TURN-OPTION-A\]/);
         return true;
       },
     );
@@ -1125,7 +1156,7 @@ test("HerdrThinGateway prompt fence negative matrix and zero external calls (C1,
     await assert.rejects(
       spy.promptExternalAgent(handleNoBinding, "prompt text", { store }),
       (err: any) => {
-        assert.match(err.message, /\[N-TURN-OPTION-A\]/);
+        assert.match(err.message, /\[FAIL_CLOSED .*\]|\[N-TURN-OPTION-A\]/);
         return true;
       },
     );
@@ -1156,7 +1187,7 @@ test("HerdrThinGateway prompt fence negative matrix and zero external calls (C1,
     await assert.rejects(
       spy.promptExternalAgent(handleMalformed, "prompt text", { store }),
       (err: any) => {
-        assert.match(err.message, /\[N-TURN-OPTION-A\]/);
+        assert.match(err.message, /\[FAIL_CLOSED .*\]|\[N-TURN-OPTION-A\]/);
         return true;
       },
     );
@@ -1187,7 +1218,7 @@ test("HerdrThinGateway prompt fence negative matrix and zero external calls (C1,
     await assert.rejects(
       spy.promptExternalAgent(handleWrongRt, "prompt text", { store }),
       (err: any) => {
-        assert.match(err.message, /\[N-TURN-OPTION-A\]/);
+        assert.match(err.message, /\[FAIL_CLOSED .*\]|\[N-TURN-OPTION-A\]/);
         return true;
       },
     );
@@ -1390,7 +1421,7 @@ test("HerdrThinGateway launch identity and lost-ack controls (C2, L1 to L10)", a
     const agentNameL4 = buildDeterministicHerdrAgentName(attemptL4, hashL4);
     spyL4ReplayObserved.simulatedAgents.set(agentNameL4, {
       name: agentNameL4,
-      agent: agentNameL4,
+      agent: "opencode",
       workspace_id: "ws-reconciled-l4",
       pane_id: "p-reconciled-l4",
       cwd: testRepo,
@@ -1450,7 +1481,7 @@ test("HerdrThinGateway launch identity and lost-ack controls (C2, L1 to L10)", a
     ];
     spyL5Replay.simulatedAgents.set(agentNameL5, {
       name: agentNameL5,
-      agent: agentNameL5,
+      agent: "opencode",
       workspace_id: wsIdL5,
       pane_id: paneIdL5,
       cwd: testRepo,
@@ -1933,7 +1964,7 @@ test("HerdrThinGateway agent reconciliation enforces exact workspace, pane, and 
     ];
     spy1.simulatedAgents.set(agentName1, {
       name: agentName1,
-      agent: agentName1,
+      agent: "opencode",
       workspace_id: "ws-DIFFERENT-1", // Mismatch!
       pane_id: "pane-correct-1",
       cwd: testRepo,
@@ -1969,7 +2000,7 @@ test("HerdrThinGateway agent reconciliation enforces exact workspace, pane, and 
     ];
     spy2.simulatedAgents.set(agentName2, {
       name: agentName2,
-      agent: agentName2,
+      agent: "opencode",
       workspace_id: "ws-correct-2",
       pane_id: "pane-DIFFERENT-2", // Mismatch!
       cwd: testRepo,
@@ -2005,7 +2036,7 @@ test("HerdrThinGateway agent reconciliation enforces exact workspace, pane, and 
     ];
     spy3.simulatedAgents.set(agentName3, {
       name: agentName3,
-      agent: agentName3,
+      agent: "opencode",
       workspace_id: "ws-correct-3",
       pane_id: "pane-correct-3",
       cwd: "/some/unrelated/path", // Mismatch!
@@ -2042,7 +2073,7 @@ test("HerdrThinGateway agent reconciliation enforces exact workspace, pane, and 
     ];
     spy4.simulatedAgents.set(agentName4, {
       name: agentName4,
-      agent: agentName4,
+      agent: "opencode",
       workspace_id: "ws-correct-4",
       pane_id: "pane-correct-4",
       cwd: testRepo,
@@ -2211,7 +2242,7 @@ test("Reconciliation CAS failure matrix stops immediately and prevents registry 
     ];
     spy2.simulatedAgents.set(agentName2, {
       name: agentName2,
-      agent: agentName2,
+      agent: "opencode",
       workspace_id: "ws-cas-ag-2",
       pane_id: "pane-cas-ag-2",
       cwd: testRepo,
@@ -2280,7 +2311,7 @@ test("Reconciliation CAS failure matrix stops immediately and prevents registry 
     ];
     spy3.simulatedAgents.set(agentName3, {
       name: agentName3,
-      agent: agentName3,
+      agent: "opencode",
       workspace_id: "ws-cas-bind-3",
       pane_id: "pane-cas-bind-3",
       cwd: testRepo,
@@ -3201,7 +3232,7 @@ test("HerdrThinGateway prompt live identity validation and response checks (E3, 
 
     const respResult = await ctxRespMismatch.spy.promptExternalAgent(ctxRespMismatch.handle, "prompt text", { store });
     assert.equal(respResult.status, "OUTCOME_UNKNOWN");
-    assert.equal(respResult.rawStatus, "PROMPT_RESPONSE_IDENTITY_MISMATCH");
+    assert.equal(respResult.rawStatus, "PROMPT_RESPONSE_IDENTITY_INCOMPLETE_OR_MISMATCH");
 
     // 10. REPRODUCER-3: Verifies unobservable or mismatched agent never receives prompt
     assert.equal(ctxAgMissing.spy.agentPromptCalls, 0);
@@ -3225,9 +3256,16 @@ test("HerdrThinGateway reconciliation live identity validation (E4, RI-EXACT-DON
 
   try {
     const attemptKey = `ri-test-${Date.now()}`;
+    const agent = store.create({
+      workspaceId: "ws-ri",
+      workspaceRoot: repoPath,
+      profileName: "worker",
+      provider: "opencode",
+    });
     const handle: HerdrExternalHandle = {
       schemaVersion: 1,
       runtimeKind: HERDR_RUNTIME_KIND,
+      agentId: agent.id,
       herdrSocketPath: "/tmp/test.sock",
       herdrWorkspaceId: "ws-ri-test",
       herdrPaneId: "pane-ri-test",
@@ -3242,6 +3280,14 @@ test("HerdrThinGateway reconciliation live identity validation (E4, RI-EXACT-DON
       launchTimestamp: new Date().toISOString(),
       enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
     };
+
+    store.bindExternalRuntimeBindingCAS({
+      agentId: agent.id,
+      binding: {
+        runtimeKind: HERDR_RUNTIME_KIND,
+        handle: handle as unknown as Record<string, unknown>,
+      },
+    });
 
     const spy = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
     const validPane: HerdrPaneInfo = {
@@ -3458,7 +3504,7 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
     await assert.rejects(
       spy.stopExternalAgent(mismatchedHandle),
       (err: any) => {
-        assert.match(err.message, /\[STOP_DURABLE_MISMATCH\]/);
+        assert.match(err.message, /\[FAIL_CLOSED \/ DURABLE_HANDLE_AUTHORITY_MISMATCH\]|\[STOP_DURABLE_MISMATCH\]/);
         return true;
       },
     );
@@ -3615,6 +3661,812 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
     // 11. REPRODUCER-5: Consequential side-door elimination
     assert.equal((HerdrThinGateway.prototype as any).sendPaneKeys, undefined, "sendPaneKeys must be removed from HerdrThinGateway");
     assert.equal((LocalAgentSessionManager.prototype as any).getHerdrGateway, undefined, "getHerdrGateway must be removed from LocalAgentSessionManager");
+  } finally {
+    store.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repoPath, { recursive: true, force: true });
+  }
+});
+
+test("HerdrThinGateway prompt exact durable handle authority (Blocker F1, F1-PROMPT-FORGED-PHYSICAL-TARGET, F1-PROMPT-WRONG-ATTEMPT, F1-PROMPT-WRONG-DISPATCH, F1-PROMPT-WRONG-NONCE, F1-PROMPT-WRONG-GIT-BASE, F1-PROMPT-WRONG-LOCAL-WORKSPACE, F1-PROMPT-WRONG-AGENT-KIND, PROMPT-REPRODUCER-F1)", async () => {
+  const { repoPath, headSha } = createIsolatedTestGitRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-f1-matrix-"));
+  const store = new LocalAgentStore(stateDir);
+
+  try {
+    const attemptKeyA = `attempt-f1-${Date.now()}`;
+    const intentA = {
+      taskId: "task-f1-a",
+      attemptId: attemptKeyA,
+      objective: "Test F1 authority",
+      roleIntent: "DEEP_ENGINEERING" as const,
+      claimCeiling: "CANDIDATE_READY" as const,
+      context: ["test"],
+      readScope: ["src"],
+      writeScope: ["src"],
+      exclusiveOwnership: true,
+      forbiddenChanges: [],
+      acceptanceCriteria: ["pass"],
+      verificationRequired: true,
+      expectedArtifacts: [],
+    };
+    const hashA = hashDispatchIntent(intentA);
+    const agentA = store.create({
+      workspaceId: "ws-f1",
+      workspaceRoot: repoPath,
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: attemptKeyA, requestHash: "hash-f1-a" },
+      executionContract: { writePaths: ["src"], dispatchIntent: intentA },
+    });
+
+    const durableHandleA: HerdrExternalHandle = {
+      schemaVersion: 1,
+      runtimeKind: HERDR_RUNTIME_KIND,
+      agentId: agentA.id,
+      herdrSocketPath: "/tmp/test.sock",
+      herdrWorkspaceId: "ws-A",
+      herdrPaneId: "pane-A",
+      herdrAgentIdentity: "agent-A",
+      herdrAgentKind: "opencode",
+      promptNonce: `NONCE-${attemptKeyA}`,
+      canonicalWorktreePath: repoPath,
+      workspaceId: "ws-f1",
+      gitHeadBefore: headSha,
+      attemptKey: attemptKeyA,
+      dispatchIntentHash: hashA,
+      launchTimestamp: new Date().toISOString(),
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    };
+
+    store.bindExternalRuntimeBindingCAS({
+      agentId: agentA.id,
+      expectedAttemptKey: attemptKeyA,
+      expectedDispatchIntentHash: hashA,
+      binding: {
+        runtimeKind: HERDR_RUNTIME_KIND,
+        handle: durableHandleA as unknown as Record<string, unknown>,
+      },
+    });
+
+    const registry = new HerdrGatewayRegistry();
+    const spy = new SpyHerdrGateway("/tmp/test.sock", registry, store);
+
+    // Simulate BOTH Target A and Target B as physically live in HerdR
+    spy.simulatedPanes = [
+      { pane_id: "pane-A", workspace_id: "ws-A", cwd: repoPath, foreground_cwd: repoPath },
+      { pane_id: "pane-B", workspace_id: "ws-B", cwd: repoPath, foreground_cwd: repoPath },
+    ];
+    spy.simulatedAgents.set("agent-A", {
+      name: "agent-A",
+      agent: "opencode",
+      workspace_id: "ws-A",
+      pane_id: "pane-A",
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+    spy.simulatedAgents.set("agent-B", {
+      name: "agent-B",
+      agent: "opencode",
+      workspace_id: "ws-B",
+      pane_id: "pane-B",
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+
+    // 1. F1-PROMPT-FORGED-PHYSICAL-TARGET: caller redirects prompt to agent-B
+    const forgedTargetHandle: HerdrExternalHandle = {
+      ...durableHandleA,
+      herdrWorkspaceId: "ws-B",
+      herdrPaneId: "pane-B",
+      herdrAgentIdentity: "agent-B",
+    };
+
+    await assert.rejects(
+      spy.promptExternalAgent(forgedTargetHandle, "malicious prompt", { store }),
+      (err: any) => {
+        assert.match(err.message, /\[FAIL_CLOSED \/ DURABLE_HANDLE_AUTHORITY_MISMATCH\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.agentPromptCalls, 0, "Forged target must NOT receive any external prompt calls");
+    assert.equal(store.getById(agentA.id)!.externalRuntimeBinding?.promptState, undefined, "Prompt fence must NOT be consumed");
+
+    // 2. F1-PROMPT-WRONG-ATTEMPT
+    await assert.rejects(
+      spy.promptExternalAgent({ ...durableHandleA, attemptKey: "forged-attempt" }, "prompt", { store }),
+      (err: any) => {
+        assert.match(err.message, /\[FAIL_CLOSED \/ DURABLE_HANDLE_AUTHORITY_MISMATCH\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.agentPromptCalls, 0);
+
+    // 3. F1-PROMPT-WRONG-DISPATCH
+    await assert.rejects(
+      spy.promptExternalAgent({ ...durableHandleA, dispatchIntentHash: "forged-hash" }, "prompt", { store }),
+      (err: any) => {
+        assert.match(err.message, /\[FAIL_CLOSED \/ DURABLE_HANDLE_AUTHORITY_MISMATCH\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.agentPromptCalls, 0);
+
+    // 4. F1-PROMPT-WRONG-NONCE
+    await assert.rejects(
+      spy.promptExternalAgent({ ...durableHandleA, promptNonce: "forged-nonce" }, "prompt", { store }),
+      (err: any) => {
+        assert.match(err.message, /\[FAIL_CLOSED \/ DURABLE_HANDLE_AUTHORITY_MISMATCH\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.agentPromptCalls, 0);
+
+    // 5. F1-PROMPT-WRONG-GIT-BASE
+    await assert.rejects(
+      spy.promptExternalAgent({ ...durableHandleA, gitHeadBefore: "forged-head" }, "prompt", { store }),
+      (err: any) => {
+        assert.match(err.message, /\[FAIL_CLOSED \/ DURABLE_HANDLE_AUTHORITY_MISMATCH\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.agentPromptCalls, 0);
+
+    // 6. F1-PROMPT-WRONG-LOCAL-WORKSPACE
+    await assert.rejects(
+      spy.promptExternalAgent({ ...durableHandleA, workspaceId: "forged-ws" }, "prompt", { store }),
+      (err: any) => {
+        assert.match(err.message, /\[FAIL_CLOSED \/ DURABLE_HANDLE_AUTHORITY_MISMATCH\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.agentPromptCalls, 0);
+
+    // 7. F1-PROMPT-WRONG-AGENT-KIND
+    await assert.rejects(
+      spy.promptExternalAgent({ ...durableHandleA, herdrAgentKind: "agy" }, "prompt", { store }),
+      (err: any) => {
+        assert.match(err.message, /\[FAIL_CLOSED \/ DURABLE_HANDLE_AUTHORITY_MISMATCH\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.agentPromptCalls, 0);
+
+    // 8. F1-PROMPT-RESPONSE-MISSING-IDENTITY (Comment 5785928588)
+    const origSend = spy.sendRequest.bind(spy);
+    spy.sendRequest = (async (req: any, timeout?: number, sock?: string): Promise<any> => {
+      if (req.method === "agent.prompt") {
+        spy.agentPromptCalls++;
+        return {
+          id: req.id,
+          result: {
+            agent: {
+              agent_status: "done",
+              interactive_ready: true,
+              // Intentionally omit workspace_id, pane_id, name, cwd
+            },
+          },
+        };
+      }
+      return origSend(req, timeout, sock);
+    }) as any;
+
+    const incompleteRespRes = await spy.promptExternalAgent(durableHandleA, "legitimate prompt", { store });
+    assert.equal(incompleteRespRes.status, "OUTCOME_UNKNOWN");
+    assert.equal(incompleteRespRes.rawStatus, "PROMPT_RESPONSE_IDENTITY_INCOMPLETE_OR_MISMATCH");
+    assert.equal(spy.agentPromptCalls, 1);
+  } finally {
+    store.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repoPath, { recursive: true, force: true });
+  }
+});
+
+test("HerdrThinGateway reconciliation exact durable authority (Blocker F2, F2-RECONCILE-NO-STORE, F2-RECONCILE-FORGED-HANDLE, F2-RECONCILE-EXACT, RECONCILE-REPRODUCER-F2)", async () => {
+  const { repoPath, headSha } = createIsolatedTestGitRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-f2-matrix-"));
+  const store = new LocalAgentStore(stateDir);
+
+  try {
+    const attemptKey = `attempt-f2-${Date.now()}`;
+    const agent = store.create({
+      workspaceId: "ws-f2",
+      workspaceRoot: repoPath,
+      profileName: "worker",
+      provider: "opencode",
+    });
+
+    const durableHandle: HerdrExternalHandle = {
+      schemaVersion: 1,
+      runtimeKind: HERDR_RUNTIME_KIND,
+      agentId: agent.id,
+      herdrSocketPath: "/tmp/test.sock",
+      herdrWorkspaceId: "ws-f2-target",
+      herdrPaneId: "pane-f2-target",
+      herdrAgentIdentity: "agent-f2-target",
+      herdrAgentKind: "opencode",
+      promptNonce: `NONCE-${attemptKey}`,
+      canonicalWorktreePath: repoPath,
+      workspaceId: "ws-f2",
+      gitHeadBefore: headSha,
+      attemptKey,
+      dispatchIntentHash: "hash-f2",
+      launchTimestamp: new Date().toISOString(),
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    };
+
+    store.bindExternalRuntimeBindingCAS({
+      agentId: agent.id,
+      binding: {
+        runtimeKind: HERDR_RUNTIME_KIND,
+        handle: durableHandle as unknown as Record<string, unknown>,
+      },
+    });
+
+    // Create physical mutation on disk
+    writeFileSync(join(repoPath, "f2_effect.txt"), "physical mutation occurred\n");
+
+    const spy = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    spy.simulatedPanes = [
+      { pane_id: durableHandle.herdrPaneId, workspace_id: durableHandle.herdrWorkspaceId, cwd: repoPath, foreground_cwd: repoPath },
+    ];
+    spy.simulatedAgents.set(durableHandle.herdrAgentIdentity, {
+      name: durableHandle.herdrAgentIdentity,
+      agent: durableHandle.herdrAgentKind,
+      workspace_id: durableHandle.herdrWorkspaceId,
+      pane_id: durableHandle.herdrPaneId,
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "done",
+      interactive_ready: true,
+    });
+    const origSend = spy.sendRequest.bind(spy);
+    spy.sendRequest = async (req, timeout, sock) => {
+      if (req.method === "ping") return { id: req.id, result: { type: "pong" } as any };
+      return origSend(req, timeout, sock);
+    };
+
+    // 1. F2-RECONCILE-NO-STORE: Gateway without store cannot attribute completion
+    const gatewayNoStore = new HerdrThinGateway("/tmp/test.sock", new HerdrGatewayRegistry(), undefined);
+    const resNoStore = await gatewayNoStore.reconcileExternalAgent(durableHandle, ["f2_effect.txt"], true, undefined, { store: undefined });
+    assert.equal(resNoStore.settled, false);
+    assert.equal(resNoStore.completionStatus, "OUTCOME_UNKNOWN");
+    assert.equal(resNoStore.executionState, "OUTCOME_UNKNOWN");
+    assert.equal(resNoStore.physicalEffect, "PRESENT");
+    assert.deepEqual(resNoStore.changedPaths, ["f2_effect.txt"]);
+    assert.match(resNoStore.reason || "", /\[DURABLE_AUTHORITY_MISSING\]/);
+
+    // 2. F2-RECONCILE-FORGED-HANDLE: Forged handle with wrong attemptKey cannot attribute completion
+    const forgedHandle: HerdrExternalHandle = {
+      ...durableHandle,
+      attemptKey: "forged-attempt-key",
+    };
+    const resForged = await spy.reconcileExternalAgent(forgedHandle, ["f2_effect.txt"], true, undefined, { store });
+    assert.equal(resForged.settled, false);
+    assert.equal(resForged.completionStatus, "OUTCOME_UNKNOWN");
+    assert.equal(resForged.executionState, "OUTCOME_UNKNOWN");
+    assert.equal(resForged.physicalEffect, "PRESENT");
+    assert.match(resForged.reason || "", /\[DURABLE_AUTHORITY_MISSING\]/);
+
+    // 3. F2-RECONCILE-EXACT: Exact durable authority + live target + physical mutation -> COMPLETED
+    const resExact = await spy.reconcileExternalAgent(durableHandle, ["f2_effect.txt"], true, undefined, { store });
+    assert.equal(resExact.settled, true);
+    assert.equal(resExact.completionStatus, "COMPLETED");
+    assert.equal(resExact.executionState, "SETTLED_TERMINAL");
+    assert.equal(resExact.physicalEffect, "PRESENT");
+    assert.deepEqual(resExact.changedPaths, ["f2_effect.txt"]);
+  } finally {
+    store.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repoPath, { recursive: true, force: true });
+  }
+});
+
+test("HerdrThinGateway stop exact durable authority (Blocker F3, F3-STOP-WRONG-ATTEMPT, F3-STOP-WRONG-DISPATCH, F3-STOP-WRONG-NONCE, F3-STOP-WRONG-GIT-BASE, F3-STOP-WRONG-WORKSPACE-ID, F3-STOP-WRONG-AGENT-KIND, F3-STOP-EXACT, STOP-REPRODUCER-F3)", async () => {
+  const { repoPath, headSha } = createIsolatedTestGitRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-f3-matrix-"));
+  const store = new LocalAgentStore(stateDir);
+
+  try {
+    const attemptKey = `attempt-f3-${Date.now()}`;
+    const agent = store.create({
+      workspaceId: "ws-f3",
+      workspaceRoot: repoPath,
+      profileName: "worker",
+      provider: "opencode",
+    });
+
+    const durableHandle: HerdrExternalHandle = {
+      schemaVersion: 1,
+      runtimeKind: HERDR_RUNTIME_KIND,
+      agentId: agent.id,
+      herdrSocketPath: "/tmp/test.sock",
+      herdrWorkspaceId: "ws-f3-stop",
+      herdrPaneId: "pane-f3-stop",
+      herdrAgentIdentity: "agent-f3-stop",
+      herdrAgentKind: "opencode",
+      promptNonce: `NONCE-${attemptKey}`,
+      canonicalWorktreePath: repoPath,
+      workspaceId: "ws-f3",
+      gitHeadBefore: headSha,
+      attemptKey,
+      dispatchIntentHash: "hash-f3",
+      launchTimestamp: new Date().toISOString(),
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    };
+
+    store.bindExternalRuntimeBindingCAS({
+      agentId: agent.id,
+      binding: {
+        runtimeKind: HERDR_RUNTIME_KIND,
+        handle: durableHandle as unknown as Record<string, unknown>,
+      },
+    });
+
+    const registry = new HerdrGatewayRegistry();
+    registry.registerHandle(durableHandle);
+
+    const spy = new SpyHerdrGateway("/tmp/test.sock", registry, store);
+    spy.simulatedPanes = [
+      { pane_id: durableHandle.herdrPaneId, workspace_id: durableHandle.herdrWorkspaceId, cwd: repoPath, foreground_cwd: repoPath },
+    ];
+    spy.simulatedAgents.set(durableHandle.herdrAgentIdentity, {
+      name: durableHandle.herdrAgentIdentity,
+      agent: durableHandle.herdrAgentKind,
+      workspace_id: durableHandle.herdrWorkspaceId,
+      pane_id: durableHandle.herdrPaneId,
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+
+    // 1. F3-STOP-WRONG-ATTEMPT
+    await assert.rejects(
+      spy.stopExternalAgent({ ...durableHandle, attemptKey: "forged-attempt" }),
+      (err: any) => {
+        assert.match(err.message, /\[FAIL_CLOSED \/ DURABLE_HANDLE_AUTHORITY_MISMATCH\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.workspaceCloseCalls, 0);
+
+    // 2. F3-STOP-WRONG-DISPATCH
+    await assert.rejects(
+      spy.stopExternalAgent({ ...durableHandle, dispatchIntentHash: "forged-hash" }),
+      (err: any) => {
+        assert.match(err.message, /\[FAIL_CLOSED \/ DURABLE_HANDLE_AUTHORITY_MISMATCH\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.workspaceCloseCalls, 0);
+
+    // 3. F3-STOP-WRONG-NONCE
+    await assert.rejects(
+      spy.stopExternalAgent({ ...durableHandle, promptNonce: "forged-nonce" }),
+      (err: any) => {
+        assert.match(err.message, /\[FAIL_CLOSED \/ DURABLE_HANDLE_AUTHORITY_MISMATCH\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.workspaceCloseCalls, 0);
+
+    // 4. F3-STOP-WRONG-GIT-BASE
+    await assert.rejects(
+      spy.stopExternalAgent({ ...durableHandle, gitHeadBefore: "forged-git-base" }),
+      (err: any) => {
+        assert.match(err.message, /\[FAIL_CLOSED \/ DURABLE_HANDLE_AUTHORITY_MISMATCH\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.workspaceCloseCalls, 0);
+
+    // 5. F3-STOP-WRONG-WORKSPACE-ID
+    await assert.rejects(
+      spy.stopExternalAgent({ ...durableHandle, workspaceId: "forged-workspace-id" }),
+      (err: any) => {
+        assert.match(err.message, /\[FAIL_CLOSED \/ DURABLE_HANDLE_AUTHORITY_MISMATCH\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.workspaceCloseCalls, 0);
+
+    // 6. F3-STOP-WRONG-AGENT-KIND
+    await assert.rejects(
+      spy.stopExternalAgent({ ...durableHandle, herdrAgentKind: "agy" }),
+      (err: any) => {
+        assert.match(err.message, /\[FAIL_CLOSED \/ DURABLE_HANDLE_AUTHORITY_MISMATCH\]/);
+        return true;
+      },
+    );
+    assert.equal(spy.workspaceCloseCalls, 0);
+
+    // 7. F3-STOP-EXACT
+    await spy.stopExternalAgent(durableHandle);
+    assert.equal(spy.workspaceCloseCalls, 1, "Exact durable handle must trigger workspace.close once");
+    assert.equal(registry.getHandle(attemptKey), undefined, "Registry handle released using authoritative attemptKey");
+  } finally {
+    store.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repoPath, { recursive: true, force: true });
+  }
+});
+
+test("HerdrThinGateway fenced launch reconciliation strict identity (Blocker F4, F4-PARTIAL-REPLAY-MISSING-WORKSPACE, F4-PARTIAL-REPLAY-MISSING-PANE, F4-PARTIAL-REPLAY-MISSING-NAME, F4-PARTIAL-REPLAY-MISSING-CWD, F4-PARTIAL-REPLAY-EXACT, REPLAY-REPRODUCER-F4)", async () => {
+  const { repoPath, headSha } = createIsolatedTestGitRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-f4-matrix-"));
+  const store = new LocalAgentStore(stateDir);
+
+  try {
+    const attemptKey = `attempt-f4-${Date.now()}`;
+    const intentF4 = {
+      taskId: "task-f4",
+      attemptId: attemptKey,
+      objective: "Test F4 replay",
+      roleIntent: "DEEP_ENGINEERING" as const,
+      claimCeiling: "CANDIDATE_READY" as const,
+      context: ["test"],
+      readScope: ["src"],
+      writeScope: ["src"],
+      exclusiveOwnership: true,
+      forbiddenChanges: [],
+      acceptanceCriteria: ["pass"],
+      verificationRequired: true,
+      expectedArtifacts: [],
+    };
+    const hash = hashDispatchIntent(intentF4);
+    const agent = store.create({
+      workspaceId: "ws-f4",
+      workspaceRoot: repoPath,
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: attemptKey, requestHash: "hash-f4" },
+      executionContract: { writePaths: ["src"], dispatchIntent: intentF4 },
+    });
+
+    const plannedAgentName = buildDeterministicHerdrAgentName(attemptKey, hash);
+    const promptNonce = `NONCE-${attemptKey}`;
+
+    // Helper to setup fenced launch in store
+    function setupFencedLaunch() {
+      store.fenceExternalRuntimeLaunchCAS({
+        agentId: agent.id,
+        attemptKey,
+        dispatchIntentHash: hash,
+        canonicalWorktreePath: repoPath,
+        gitHeadBefore: headSha,
+        agentKind: "opencode",
+        promptNonce,
+        workspaceId: "ws-f4",
+        plannedAgentName,
+        expectedUpdatedAt: store.getById(agent.id)!.updatedAt,
+      });
+      store.recordExternalRuntimeWorkspaceObservedCAS({
+        agentId: agent.id,
+        attemptKey,
+        herdrWorkspaceId: "ws-f4-rec",
+        herdrPaneId: "pane-f4-rec",
+        observedCwd: repoPath,
+      });
+    }
+
+    setupFencedLaunch();
+
+    const spy = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    spy.simulatedPanes = [
+      { pane_id: "pane-f4-rec", workspace_id: "ws-f4-rec", cwd: repoPath, foreground_cwd: repoPath },
+    ];
+
+    // 1. F4-PARTIAL-REPLAY-MISSING-WORKSPACE: getAgent missing workspace_id
+    spy.simulatedAgents.set(plannedAgentName, {
+      name: plannedAgentName,
+      agent: "opencode",
+      pane_id: "pane-f4-rec",
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+      // Intentionally missing workspace_id
+    });
+    await assert.rejects(
+      spy.startExternalAgent({
+        agentId: agent.id,
+        store,
+        attemptKey,
+        dispatchIntentHash: hash,
+        agentKind: "opencode",
+        canonicalWorktreePath: repoPath,
+        workspaceId: "ws-f4",
+      }),
+      /\[OUTCOME_UNKNOWN\]/,
+    );
+    assert.equal(store.getById(agent.id)!.externalRuntimeBinding?.launch?.state, "WORKSPACE_OBSERVED");
+
+    // 2. F4-PARTIAL-REPLAY-MISSING-PANE: getAgent missing pane_id
+    spy.simulatedAgents.set(plannedAgentName, {
+      name: plannedAgentName,
+      agent: "opencode",
+      workspace_id: "ws-f4-rec",
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+      // Intentionally missing pane_id
+    });
+    await assert.rejects(
+      spy.startExternalAgent({
+        agentId: agent.id,
+        store,
+        attemptKey,
+        dispatchIntentHash: hash,
+        agentKind: "opencode",
+        canonicalWorktreePath: repoPath,
+        workspaceId: "ws-f4",
+      }),
+      /\[OUTCOME_UNKNOWN\]/,
+    );
+
+    // 3. F4-PARTIAL-REPLAY-MISSING-NAME: getAgent missing name
+    spy.simulatedAgents.set(plannedAgentName, {
+      agent: "opencode",
+      workspace_id: "ws-f4-rec",
+      pane_id: "pane-f4-rec",
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+      // Intentionally missing name (must NOT substitute planned name)
+    });
+    await assert.rejects(
+      spy.startExternalAgent({
+        agentId: agent.id,
+        store,
+        attemptKey,
+        dispatchIntentHash: hash,
+        agentKind: "opencode",
+        canonicalWorktreePath: repoPath,
+        workspaceId: "ws-f4",
+      }),
+      /\[OUTCOME_UNKNOWN\]/,
+    );
+
+    // 4. F4-PARTIAL-REPLAY-MISSING-CWD: getAgent missing cwd
+    spy.simulatedAgents.set(plannedAgentName, {
+      name: plannedAgentName,
+      agent: "opencode",
+      workspace_id: "ws-f4-rec",
+      pane_id: "pane-f4-rec",
+      agent_status: "idle",
+      interactive_ready: true,
+      // Intentionally missing cwd and foreground_cwd
+    });
+    await assert.rejects(
+      spy.startExternalAgent({
+        agentId: agent.id,
+        store,
+        attemptKey,
+        dispatchIntentHash: hash,
+        agentKind: "opencode",
+        canonicalWorktreePath: repoPath,
+        workspaceId: "ws-f4",
+      }),
+      /\[OUTCOME_UNKNOWN\]/,
+    );
+
+    // 5. F4-PARTIAL-REPLAY-EXACT: Complete identity present and matching -> succeeds
+    spy.simulatedAgents.set(plannedAgentName, {
+      name: plannedAgentName,
+      agent: "opencode",
+      workspace_id: "ws-f4-rec",
+      pane_id: "pane-f4-rec",
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+    const handle = await spy.startExternalAgent({
+      agentId: agent.id,
+      store,
+      attemptKey,
+      dispatchIntentHash: hash,
+      agentKind: "opencode",
+      canonicalWorktreePath: repoPath,
+      workspaceId: "ws-f4",
+    });
+    assert.equal(handle.herdrAgentIdentity, plannedAgentName);
+    assert.equal(handle.herdrWorkspaceId, "ws-f4-rec");
+    assert.equal(handle.herdrPaneId, "pane-f4-rec");
+    assert.equal(store.getById(agent.id)!.externalRuntimeBinding?.launch?.state, "AGENT_OBSERVED");
+  } finally {
+    store.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repoPath, { recursive: true, force: true });
+  }
+});
+
+test("HerdrThinGateway first-launch final-bind continuity window (Blocker F6, F6-FINAL-BIND-PANE-MISSING, F6-FINAL-BIND-AGENT-MISSING, F6-FINAL-BIND-WRONG-CWD, F6-FINAL-BIND-WRONG-NAME, F6-FINAL-BIND-EXACT, FINAL-BIND-REPRODUCER-F6)", async () => {
+  const { repoPath, headSha } = createIsolatedTestGitRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-f6-matrix-"));
+  const store = new LocalAgentStore(stateDir);
+
+  try {
+    function createF6Agent(attemptKey: string) {
+      const intent = {
+        taskId: `task-${attemptKey}`,
+        attemptId: attemptKey,
+        objective: "Test F6 continuity",
+        roleIntent: "DEEP_ENGINEERING" as const,
+        claimCeiling: "CANDIDATE_READY" as const,
+        context: ["test"],
+        readScope: ["src"],
+        writeScope: ["src"],
+        exclusiveOwnership: true,
+        forbiddenChanges: [],
+        acceptanceCriteria: ["pass"],
+        verificationRequired: true,
+        expectedArtifacts: [],
+      };
+      const hash = hashDispatchIntent(intent);
+      const agent = store.create({
+        workspaceId: "ws-f6",
+        workspaceRoot: repoPath,
+        profileName: "worker",
+        provider: "opencode",
+        startReplay: { key: attemptKey, requestHash: `hash-${attemptKey}` },
+        executionContract: { writePaths: ["src"], dispatchIntent: intent },
+      });
+      return { agent, hash };
+    }
+
+    // 1. F6-FINAL-BIND-PANE-MISSING: Pane disappears after agent.start and wait
+    const attempt1 = `attempt-f6-1-${Date.now()}`;
+    const { agent: agent1, hash: hash1 } = createF6Agent(attempt1);
+    const reg1 = new HerdrGatewayRegistry();
+    const spy1 = new SpyHerdrGateway("/tmp/test.sock", reg1, store);
+    // Hook sendRequest: after agent.start, clear panes
+    const origSend1 = spy1.sendRequest.bind(spy1);
+    spy1.sendRequest = (async (req: any, timeout?: number, sock?: string): Promise<any> => {
+      const res = await origSend1(req, timeout, sock);
+      if (req.method === "agent.start") {
+        // Disappear the pane before final handle binding
+        spy1.simulatedPanes = [];
+      }
+      return res;
+    }) as any;
+
+    await assert.rejects(
+      spy1.startExternalAgent({
+        agentId: agent1.id,
+        store,
+        attemptKey: attempt1,
+        dispatchIntentHash: hash1,
+        agentKind: "opencode",
+        canonicalWorktreePath: repoPath,
+        workspaceId: "ws-f6",
+      }),
+      (err: any) => {
+        assert.match(err.message, /\[OUTCOME_UNKNOWN\] Current live process identity was lost after wait/);
+        return true;
+      },
+    );
+    assert.equal(store.getById(agent1.id)!.externalRuntimeBinding?.handle, undefined, "Zero final handle bindings permitted");
+    assert.equal(reg1.getHandle(attempt1), undefined, "Zero registry insertions permitted");
+
+    // 2. F6-FINAL-BIND-AGENT-MISSING: Agent disappears after agent.start and wait
+    const attempt2 = `attempt-f6-2-${Date.now()}`;
+    const { agent: agent2, hash: hash2 } = createF6Agent(attempt2);
+    const reg2 = new HerdrGatewayRegistry();
+    const spy2 = new SpyHerdrGateway("/tmp/test.sock", reg2, store);
+    const origSend2 = spy2.sendRequest.bind(spy2);
+    spy2.sendRequest = (async (req: any, timeout?: number, sock?: string): Promise<any> => {
+      const res = await origSend2(req, timeout, sock);
+      if (req.method === "agent.start") {
+        spy2.simulatedAgents.clear();
+      }
+      return res;
+    }) as any;
+
+    await assert.rejects(
+      spy2.startExternalAgent({
+        agentId: agent2.id,
+        store,
+        attemptKey: attempt2,
+        dispatchIntentHash: hash2,
+        agentKind: "opencode",
+        canonicalWorktreePath: repoPath,
+        workspaceId: "ws-f6",
+      }),
+      /\[OUTCOME_UNKNOWN\] Current live process identity was lost after wait/,
+    );
+    assert.equal(store.getById(agent2.id)!.externalRuntimeBinding?.handle, undefined);
+    assert.equal(reg2.getHandle(attempt2), undefined);
+
+    // 3. F6-FINAL-BIND-WRONG-CWD: Agent cwd changes after wait
+    const attempt3 = `attempt-f6-3-${Date.now()}`;
+    const { agent: agent3, hash: hash3 } = createF6Agent(attempt3);
+    const reg3 = new HerdrGatewayRegistry();
+    const spy3 = new SpyHerdrGateway("/tmp/test.sock", reg3, store);
+    const origSend3 = spy3.sendRequest.bind(spy3);
+    spy3.sendRequest = (async (req: any, timeout?: number, sock?: string): Promise<any> => {
+      const res = await origSend3(req, timeout, sock);
+      if (req.method === "agent.start") {
+        const agName = req.params.name;
+        const ag = spy3.simulatedAgents.get(agName)!;
+        spy3.simulatedAgents.set(agName, {
+          ...ag,
+          cwd: "/different/worktree",
+          foreground_cwd: "/different/worktree",
+        });
+      }
+      return res;
+    }) as any;
+
+    await assert.rejects(
+      spy3.startExternalAgent({
+        agentId: agent3.id,
+        store,
+        attemptKey: attempt3,
+        dispatchIntentHash: hash3,
+        agentKind: "opencode",
+        canonicalWorktreePath: repoPath,
+        workspaceId: "ws-f6",
+      }),
+      /\[OUTCOME_UNKNOWN\] Current live process identity was lost after wait/,
+    );
+    assert.equal(store.getById(agent3.id)!.externalRuntimeBinding?.handle, undefined);
+
+    // 4. F6-FINAL-BIND-WRONG-NAME: Agent name changes after wait
+    const attempt4 = `attempt-f6-4-${Date.now()}`;
+    const { agent: agent4, hash: hash4 } = createF6Agent(attempt4);
+    const reg4 = new HerdrGatewayRegistry();
+    const spy4 = new SpyHerdrGateway("/tmp/test.sock", reg4, store);
+    const origSend4 = spy4.sendRequest.bind(spy4);
+    spy4.sendRequest = (async (req: any, timeout?: number, sock?: string): Promise<any> => {
+      const res = await origSend4(req, timeout, sock);
+      if (req.method === "agent.start") {
+        const agName = req.params.name;
+        const ag = spy4.simulatedAgents.get(agName)!;
+        spy4.simulatedAgents.delete(agName);
+        spy4.simulatedAgents.set(agName, { ...ag, name: "different-unexpected-name" });
+      }
+      return res;
+    }) as any;
+
+    await assert.rejects(
+      spy4.startExternalAgent({
+        agentId: agent4.id,
+        store,
+        attemptKey: attempt4,
+        dispatchIntentHash: hash4,
+        agentKind: "opencode",
+        canonicalWorktreePath: repoPath,
+        workspaceId: "ws-f6",
+      }),
+      /\[OUTCOME_UNKNOWN\] Current live process identity was lost after wait/,
+    );
+    assert.equal(store.getById(agent4.id)!.externalRuntimeBinding?.handle, undefined);
+
+    // 5. F6-FINAL-BIND-EXACT: Continuity preserved across wait -> succeeds
+    const attempt5 = `attempt-f6-5-${Date.now()}`;
+    const { agent: agent5, hash: hash5 } = createF6Agent(attempt5);
+    const reg5 = new HerdrGatewayRegistry();
+    const spy5 = new SpyHerdrGateway("/tmp/test.sock", reg5, store);
+    const validHandle = await spy5.startExternalAgent({
+      agentId: agent5.id,
+      store,
+      attemptKey: attempt5,
+      dispatchIntentHash: hash5,
+      agentKind: "opencode",
+      canonicalWorktreePath: repoPath,
+      workspaceId: "ws-f6",
+    });
+    assert.ok(validHandle);
+    assert.ok(store.getById(agent5.id)!.externalRuntimeBinding?.handle);
+    assert.ok(reg5.getHandle(attempt5));
   } finally {
     store.close();
     rmSync(stateDir, { recursive: true, force: true });

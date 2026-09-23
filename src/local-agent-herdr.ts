@@ -91,6 +91,88 @@ export interface HerdrExternalHandle {
   enforcementState: HerdrEnforcementState;
 }
 
+export interface NormalizedHerdrHandleAuthority {
+  schemaVersion: number;
+  runtimeKind: string;
+  agentId: string;
+  herdrSocketPath: string;
+  herdrServerIdentity: string | null;
+  herdrWorkspaceId: string;
+  herdrPaneId: string;
+  herdrAgentIdentity: string;
+  herdrAgentKind: string;
+  requestedProvider: string | null;
+  requestedModel: string | null;
+  requestedEffort: string | null;
+  effectiveProvider: string | null;
+  effectiveModel: string | null;
+  effectiveEffort: string | null;
+  nativeProviderSessionId: string | null;
+  launchGeneration: number | null;
+  promptNonce: string;
+  canonicalWorktreePath: string;
+  workspaceId: string;
+  gitHeadBefore: string;
+  attemptKey: string;
+  dispatchIntentHash: string;
+  launchTimestamp: string;
+  enforcementState: string;
+}
+
+export function normalizeHerdrHandleAuthority(handle: HerdrExternalHandle): NormalizedHerdrHandleAuthority {
+  return {
+    schemaVersion: handle.schemaVersion,
+    runtimeKind: handle.runtimeKind,
+    agentId: handle.agentId ?? "",
+    herdrSocketPath: handle.herdrSocketPath,
+    herdrServerIdentity: handle.herdrServerIdentity ?? null,
+    herdrWorkspaceId: handle.herdrWorkspaceId,
+    herdrPaneId: handle.herdrPaneId,
+    herdrAgentIdentity: handle.herdrAgentIdentity,
+    herdrAgentKind: handle.herdrAgentKind,
+    requestedProvider: handle.requestedProvider ?? null,
+    requestedModel: handle.requestedModel ?? null,
+    requestedEffort: handle.requestedEffort ?? null,
+    effectiveProvider: handle.effectiveProvider ?? null,
+    effectiveModel: handle.effectiveModel ?? null,
+    effectiveEffort: handle.effectiveEffort ?? null,
+    nativeProviderSessionId: handle.nativeProviderSessionId ?? null,
+    launchGeneration: handle.launchGeneration ?? null,
+    promptNonce: handle.promptNonce,
+    canonicalWorktreePath: canonicalizePath(handle.canonicalWorktreePath),
+    workspaceId: handle.workspaceId,
+    gitHeadBefore: handle.gitHeadBefore,
+    attemptKey: handle.attemptKey,
+    dispatchIntentHash: handle.dispatchIntentHash,
+    launchTimestamp: handle.launchTimestamp,
+    enforcementState: handle.enforcementState,
+  };
+}
+
+export function assertExactDurableHerdrHandle(
+  callerHandle: HerdrExternalHandle,
+  durableHandle: HerdrExternalHandle,
+  context: string = "operation",
+): void {
+  const callerNorm = normalizeHerdrHandleAuthority(callerHandle);
+  const durableNorm = normalizeHerdrHandleAuthority(durableHandle);
+
+  const mismatchedFields: string[] = [];
+  for (const key of Object.keys(durableNorm) as Array<keyof NormalizedHerdrHandleAuthority>) {
+    if (callerNorm[key] !== durableNorm[key]) {
+      mismatchedFields.push(
+        `${key} (caller '${callerNorm[key]}' != durable '${durableNorm[key]}')`,
+      );
+    }
+  }
+
+  if (mismatchedFields.length > 0) {
+    throw new Error(
+      `[FAIL_CLOSED / DURABLE_HANDLE_AUTHORITY_MISMATCH] Caller-supplied handle does not match exact durable authority in LocalAgentStore for ${context}: ${mismatchedFields.join(", ")}. Zero external effects permitted.`,
+    );
+  }
+}
+
 export interface StartHerdrAgentParams {
   agentId?: string;
   attemptKey: string;
@@ -423,32 +505,33 @@ export class HerdrThinGateway {
   }
 
   /**
-   * Validate physical agent.start response (AgentInfo) against expected launch identity (E1).
-   * Wrong workspace, pane, cwd, or name fails closed.
+   * Validate physical AgentInfo object against expected launch/target identity (E1, F4, Comment 5785928588).
+   * Missing required fields (workspace_id, pane_id, name, cwd) or any contradiction fails closed.
    */
-  validateAgentStartResponse(
+  validateAgentInfoIdentity(
     agent: HerdrAgentInfo | undefined,
     expectations: LiveHandleIdentityExpectations,
+    context: string = "agent",
   ): { valid: boolean; reason?: string } {
     if (!agent || typeof agent !== "object") {
-      return { valid: false, reason: "Missing AgentInfo object in agent.start response" };
+      return { valid: false, reason: `Missing or invalid AgentInfo object in ${context}` };
     }
     if (!agent.workspace_id || agent.workspace_id !== expectations.herdrWorkspaceId) {
       return {
         valid: false,
-        reason: `agent.start response workspace_id '${agent.workspace_id}' does not match expected '${expectations.herdrWorkspaceId}'`,
+        reason: `${context} workspace_id '${agent.workspace_id}' does not match expected '${expectations.herdrWorkspaceId}'`,
       };
     }
     if (!agent.pane_id || agent.pane_id !== expectations.herdrPaneId) {
       return {
         valid: false,
-        reason: `agent.start response pane_id '${agent.pane_id}' does not match expected '${expectations.herdrPaneId}'`,
+        reason: `${context} pane_id '${agent.pane_id}' does not match expected '${expectations.herdrPaneId}'`,
       };
     }
     if (!agent.name || agent.name !== expectations.herdrAgentIdentity) {
       return {
         valid: false,
-        reason: `agent.start response name '${agent.name}' does not match expected '${expectations.herdrAgentIdentity}'`,
+        reason: `${context} name '${agent.name}' does not match expected '${expectations.herdrAgentIdentity}'`,
       };
     }
     const aCwd = agent.cwd ? canonicalizePath(agent.cwd) : undefined;
@@ -456,22 +539,33 @@ export class HerdrThinGateway {
     if (!aCwd && !aFgCwd) {
       return {
         valid: false,
-        reason: `agent.start response has no cwd or foreground_cwd`,
+        reason: `${context} has no cwd or foreground_cwd`,
       };
     }
     if (aCwd !== expectations.canonicalWorktreePath && aFgCwd !== expectations.canonicalWorktreePath) {
       return {
         valid: false,
-        reason: `agent.start response cwd '${aCwd || aFgCwd}' does not match canonical worktree '${expectations.canonicalWorktreePath}'`,
+        reason: `${context} cwd '${aCwd || aFgCwd}' does not match canonical worktree '${expectations.canonicalWorktreePath}'`,
       };
     }
     if (expectations.herdrAgentKind && agent.agent && agent.agent !== expectations.herdrAgentKind) {
       return {
         valid: false,
-        reason: `agent.start response kind '${agent.agent}' does not match expected '${expectations.herdrAgentKind}'`,
+        reason: `${context} kind '${agent.agent}' does not match expected '${expectations.herdrAgentKind}'`,
       };
     }
     return { valid: true };
+  }
+
+  /**
+   * Validate physical agent.start response (AgentInfo) against expected launch identity (E1).
+   * Wrong workspace, pane, cwd, or name fails closed.
+   */
+  validateAgentStartResponse(
+    agent: HerdrAgentInfo | undefined,
+    expectations: LiveHandleIdentityExpectations,
+  ): { valid: boolean; reason?: string } {
+    return this.validateAgentInfoIdentity(agent, expectations, "agent.start response");
   }
 
   /**
@@ -690,7 +784,7 @@ export class HerdrThinGateway {
       }
     }
 
-    // 2. Workspace is known and physically verified; check agent (Section 16, 17, 32, E2)
+    // 2. Workspace is known and physically verified; check agent (Section 16, 17, 32, E2, F4)
     let agentIdentity = launch.herdrAgentIdentity;
     if (!agentIdentity) {
       const agentInfo = await this.getAgent(agentName);
@@ -698,30 +792,23 @@ export class HerdrThinGateway {
         return undefined;
       }
 
-      // Verify physical agent identity:
-      // - agent belongs to recovered workspace_id
-      if (agentInfo.workspace_id && agentInfo.workspace_id !== wsId) {
-        return undefined;
-      }
-      // - agent belongs to recovered pane_id
-      if (agentInfo.pane_id && agentInfo.pane_id !== paneId) {
-        return undefined;
-      }
-      // - agent cwd or foreground_cwd matches canonicalWorktreePath
-      const aCwd = agentInfo.cwd ? canonicalizePath(agentInfo.cwd) : undefined;
-      const aFgCwd = agentInfo.foreground_cwd ? canonicalizePath(agentInfo.foreground_cwd) : undefined;
-      if (aCwd !== canonicalPath && aFgCwd !== canonicalPath) {
-        return undefined;
-      }
-      if (agentInfo.name && agentInfo.name !== agentName) {
+      // F4: Strict identity verification - required fields must be present and match
+      const agentVal = this.validateAgentInfoIdentity(agentInfo, {
+        herdrWorkspaceId: wsId,
+        herdrPaneId: paneId,
+        canonicalWorktreePath: canonicalPath,
+        herdrAgentIdentity: agentName,
+        herdrAgentKind: params.agentKind,
+      }, "reconcileFencedLaunch");
+      if (!agentVal.valid) {
         return undefined;
       }
 
-      agentIdentity = agentName;
+      agentIdentity = agentInfo.name!;
       const agentPersistRes = store.recordExternalRuntimeAgentObservedCAS({
         agentId: record.id,
         attemptKey: params.attemptKey,
-        herdrAgentIdentity: agentName,
+        herdrAgentIdentity: agentIdentity,
       });
 
       // D2 / Section 22: Failed agent persistence must STOP immediately
@@ -729,23 +816,19 @@ export class HerdrThinGateway {
         return undefined;
       }
     } else {
-      // E2: Even if launch.herdrAgentIdentity already exists, current agent must be positively re-observed!
+      // E2 / F4: Even if launch.herdrAgentIdentity already exists, current agent must be positively re-observed!
       const agentInfo = await this.getAgent(agentIdentity);
       if (!agentInfo) {
         return undefined;
       }
-      if (agentInfo.workspace_id && agentInfo.workspace_id !== wsId) {
-        return undefined;
-      }
-      if (agentInfo.pane_id && agentInfo.pane_id !== paneId) {
-        return undefined;
-      }
-      const aCwd = agentInfo.cwd ? canonicalizePath(agentInfo.cwd) : undefined;
-      const aFgCwd = agentInfo.foreground_cwd ? canonicalizePath(agentInfo.foreground_cwd) : undefined;
-      if (aCwd !== canonicalPath && aFgCwd !== canonicalPath) {
-        return undefined;
-      }
-      if (agentInfo.name && agentInfo.name !== agentIdentity) {
+      const agentVal = this.validateAgentInfoIdentity(agentInfo, {
+        herdrWorkspaceId: wsId,
+        herdrPaneId: paneId,
+        canonicalWorktreePath: canonicalPath,
+        herdrAgentIdentity: agentIdentity,
+        herdrAgentKind: params.agentKind,
+      }, "reconcileFencedLaunch");
+      if (!agentVal.valid) {
         return undefined;
       }
     }
@@ -1152,6 +1235,28 @@ export class HerdrThinGateway {
       );
     }
 
+    // F6 / Supplement Comment 5786070980: Re-observe current live identity immediately before final handle binding
+    const finalLiveObs = await this.observeAndValidateLiveHandle({
+      herdrWorkspaceId: wsId,
+      herdrPaneId: paneId,
+      canonicalWorktreePath: canonicalPath,
+      herdrAgentIdentity: agentName,
+      herdrAgentKind: params.agentKind,
+    });
+
+    if (!finalLiveObs.valid) {
+      if (effectiveStore && params.agentId) {
+        effectiveStore.markExternalRuntimeLaunchOutcomeUnknownCAS({
+          agentId: params.agentId,
+          attemptKey: params.attemptKey,
+          reason: `Post-wait live identity lost before final binding: ${finalLiveObs.reason}`,
+        });
+      }
+      throw new Error(
+        `[OUTCOME_UNKNOWN] Current live process identity was lost after wait and before final handle binding: ${finalLiveObs.reason}. Zero final handle bindings permitted.`,
+      );
+    }
+
     const handle: HerdrExternalHandle = {
       schemaVersion: 1,
       runtimeKind: HERDR_RUNTIME_KIND,
@@ -1238,6 +1343,23 @@ export class HerdrThinGateway {
         `[PROMPT_MISSING_AGENT_ID] HerdrExternalHandle must contain exact agentId; fail closed.`,
       );
     }
+
+    // 1. Durable Authority Gate (Blocker F1)
+    const record = effectiveStore.getById(handle.agentId);
+    if (!record) {
+      throw new Error(`[UNKNOWN_AGENT] Agent record '${handle.agentId}' not found in store.`);
+    }
+    const durableBinding = record.externalRuntimeBinding;
+    if (!durableBinding?.handle || typeof durableBinding.handle !== "object") {
+      throw new Error(
+        `[FAIL_CLOSED / NO_DURABLE_HANDLE] Agent '${handle.agentId}' has no durable externalRuntimeBinding.handle in store; zero prompt calls permitted.`,
+      );
+    }
+    assertExactDurableHerdrHandle(
+      handle,
+      durableBinding.handle as unknown as HerdrExternalHandle,
+      "promptExternalAgent",
+    );
 
     // Fast in-memory registry check (Option A / B4)
     if (this.registry.hasPromptSubmitted(handle.attemptKey)) {
@@ -1352,25 +1474,22 @@ export class HerdrThinGateway {
         throw new Error(`HerdR prompt error: ${res.error.message}`);
       }
 
-      // E3: Validate returned AgentInfo from agent.prompt response
+      // E3 / Comment 5785928588: Validate returned AgentInfo from agent.prompt response
       const resAgent = res.result?.agent;
-      if (resAgent) {
-        const canonicalWorktree = canonicalizePath(handle.canonicalWorktreePath);
-        const aCwd = resAgent.cwd ? canonicalizePath(resAgent.cwd) : undefined;
-        const aFgCwd = resAgent.foreground_cwd ? canonicalizePath(resAgent.foreground_cwd) : undefined;
-        const mismatchWs = resAgent.workspace_id && resAgent.workspace_id !== handle.herdrWorkspaceId;
-        const mismatchPane = resAgent.pane_id && resAgent.pane_id !== handle.herdrPaneId;
-        const mismatchName = resAgent.name && resAgent.name !== handle.herdrAgentIdentity;
-        const mismatchCwd = (aCwd && aCwd !== canonicalWorktree) || (aFgCwd && aFgCwd !== canonicalWorktree);
-        const mismatchKind = resAgent.agent && handle.herdrAgentKind && resAgent.agent !== handle.herdrAgentKind;
+      const resAgentVal = this.validateAgentInfoIdentity(resAgent, {
+        herdrWorkspaceId: handle.herdrWorkspaceId,
+        herdrPaneId: handle.herdrPaneId,
+        canonicalWorktreePath: canonicalizePath(handle.canonicalWorktreePath),
+        herdrAgentIdentity: handle.herdrAgentIdentity,
+        herdrAgentKind: handle.herdrAgentKind,
+      }, "agent.prompt response");
 
-        if (mismatchWs || mismatchPane || mismatchName || mismatchCwd || mismatchKind) {
-          return {
-            turnNonce,
-            status: "OUTCOME_UNKNOWN",
-            rawStatus: "PROMPT_RESPONSE_IDENTITY_MISMATCH",
-          };
-        }
+      if (!resAgentVal.valid) {
+        return {
+          turnNonce,
+          status: "OUTCOME_UNKNOWN",
+          rawStatus: "PROMPT_RESPONSE_IDENTITY_INCOMPLETE_OR_MISMATCH",
+        };
       }
 
       const statusStr = resAgent?.agent_status;
@@ -1452,6 +1571,7 @@ export class HerdrThinGateway {
     expectedScope?: string[],
     expectMutation: boolean = true,
     lastPromptResult?: HerdrPromptResult,
+    options: { store?: LocalAgentStore } = {},
   ): Promise<HerdrReconciliationResult> {
     const worktree = handle.canonicalWorktreePath;
 
@@ -1523,7 +1643,48 @@ export class HerdrThinGateway {
       }
     }
 
-    // 2. Execution settlement inspection (A3: separate from physical effect)
+    // 2. Durable Authority Check (Blocker F2, Sections 16-18)
+    const effectiveStore = options.store ?? this.store;
+    let durableAuthorityValid = false;
+    let authorityFailureReason: string | undefined;
+
+    if (!effectiveStore) {
+      authorityFailureReason = "No durable LocalAgentStore provided for reconciliation; execution cannot be attributed.";
+    } else if (!handle.agentId) {
+      authorityFailureReason = "HerdrExternalHandle missing agentId; execution cannot be attributed.";
+    } else {
+      const record = effectiveStore.getById(handle.agentId);
+      if (!record || !record.externalRuntimeBinding?.handle) {
+        authorityFailureReason = `No durable externalRuntimeBinding in store for agentId '${handle.agentId}'; execution cannot be attributed.`;
+      } else {
+        try {
+          assertExactDurableHerdrHandle(
+            handle,
+            record.externalRuntimeBinding.handle as unknown as HerdrExternalHandle,
+            "reconcileExternalAgent",
+          );
+          durableAuthorityValid = true;
+        } catch (err: unknown) {
+          authorityFailureReason = err instanceof Error ? err.message : String(err);
+        }
+      }
+    }
+
+    if (!durableAuthorityValid) {
+      return {
+        settled: false,
+        completionStatus: "OUTCOME_UNKNOWN",
+        executionState: "OUTCOME_UNKNOWN",
+        physicalEffect,
+        changedPaths,
+        unexpectedPaths: [],
+        gitHeadAfter,
+        enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+        reason: `[DURABLE_AUTHORITY_MISSING] ${authorityFailureReason}`,
+      };
+    }
+
+    // 3. Execution settlement inspection (A3: separate from physical effect)
     let executionState: HerdrExecutionState = "OUTCOME_UNKNOWN";
 
     if (lastPromptResult?.status === "OUTCOME_UNKNOWN") {
@@ -1683,25 +1844,22 @@ export class HerdrThinGateway {
       );
     }
     const boundHandle = record.externalRuntimeBinding?.handle as HerdrExternalHandle | undefined;
-    if (
-      !boundHandle ||
-      boundHandle.herdrWorkspaceId !== handle.herdrWorkspaceId ||
-      boundHandle.herdrPaneId !== handle.herdrPaneId ||
-      boundHandle.herdrAgentIdentity !== handle.herdrAgentIdentity ||
-      canonicalizePath(boundHandle.canonicalWorktreePath) !== canonicalizePath(handle.canonicalWorktreePath)
-    ) {
+    if (!boundHandle) {
       throw new Error(
-        `[STOP_DURABLE_MISMATCH] Handle does not match durable store binding; zero workspace.close calls permitted.`,
+        `[STOP_NO_BOUND_HANDLE] Agent '${handle.agentId}' has no bound externalRuntimeBinding.handle; zero workspace.close calls permitted.`,
       );
     }
 
-    // Validate current live identity before closing workspace (E5)
+    // 1. Exact Durable Authority Comparison (Blocker F3)
+    assertExactDurableHerdrHandle(handle, boundHandle, "stopExternalAgent");
+
+    // 2. Validate current live identity before closing workspace (E5)
     const liveObs = await this.observeAndValidateLiveHandle({
-      herdrWorkspaceId: handle.herdrWorkspaceId,
-      herdrPaneId: handle.herdrPaneId,
-      canonicalWorktreePath: canonicalizePath(handle.canonicalWorktreePath),
-      herdrAgentIdentity: handle.herdrAgentIdentity,
-      herdrAgentKind: handle.herdrAgentKind,
+      herdrWorkspaceId: boundHandle.herdrWorkspaceId,
+      herdrPaneId: boundHandle.herdrPaneId,
+      canonicalWorktreePath: canonicalizePath(boundHandle.canonicalWorktreePath),
+      herdrAgentIdentity: boundHandle.herdrAgentIdentity,
+      herdrAgentKind: boundHandle.herdrAgentKind,
     });
 
     if (!liveObs.valid) {
@@ -1710,8 +1868,8 @@ export class HerdrThinGateway {
       );
     }
 
-    await this.closeWorkspace(handle.herdrWorkspaceId);
-    this.registry.releaseHandle(handle.attemptKey);
+    await this.closeWorkspace(boundHandle.herdrWorkspaceId);
+    this.registry.releaseHandle(boundHandle.attemptKey);
   }
 
   /**
