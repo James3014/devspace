@@ -3102,6 +3102,12 @@ export function createMcpServer(
   };
   registerCoreMutationSessionTools(server, workspaces, coreMutationSessions, inspectCoreWriterDomain, {
     recoveryOwnerClientId: config.coreMutationRecoveryOwnerClientId,
+    readDurableAgentRecord: agentSessionManager
+      ? (agentId: string) => {
+          const record = agentSessionManager.getRecordByPrefixOrId(agentId);
+          return record?.id === agentId ? record : undefined;
+        }
+      : undefined,
   });
 
   registerRepositoryIntelligenceTools(server, config, workspaces);

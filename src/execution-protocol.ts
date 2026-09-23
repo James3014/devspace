@@ -253,7 +253,8 @@ export class ExecutionProtocolError extends Error {
       | "INVALID_TOOL_PROJECTION_MANIFEST"
       | "TOOL_MANIFEST_REF_MISMATCH"
       | "EXECUTION_GENERATION_MISMATCH"
-      | "LEGACY_EXECUTION_BINDING_MISSING",
+      | "LEGACY_EXECUTION_BINDING_MISSING"
+      | "INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE",
     message: string,
   ) {
     super(message);
@@ -1012,4 +1013,417 @@ function sortJson(value: unknown): unknown {
     return Object.fromEntries(entries.map(([key, child]) => [key, sortJson(child)]));
   }
   return value;
+}
+
+export const DIRECT_CANDIDATE_EXECUTION_SCHEMA = "devspace.direct_candidate_execution.v1" as const;
+
+export interface DirectCandidateExecutionAuthority {
+  authority_mode: "OWNER_DIRECT";
+  execution_lane: "DIRECT_DELEGATED";
+  task_id: string;
+  attempt_id: string;
+  dispatch_intent: DispatchIntent;
+  dispatch_intent_hash: string;
+  authority_ref: string;
+  core_authority_hash: string;
+}
+
+export interface DirectCandidateExecutionDetails {
+  protocol: typeof EXECUTION_PROTOCOL_VERSION;
+  execution_binding_hash: string;
+  agent_id: string;
+  profile: string;
+  provider: string;
+  model: string | null;
+  effort: string | null;
+  provider_session_id: string | null;
+  execution_generation: ExecutionGenerationBinding;
+  workspace_id: string;
+  workspace_root: string;
+  state: "completed";
+  terminal_reason: "completed";
+  retry_safe: false;
+  reconciliation_required: false;
+  scope_state: "WITHIN_SCOPE";
+  started_at: string;
+  completed_at: string;
+}
+
+export interface DirectCandidateExecutionCoreBinding {
+  session_id: string;
+  binding: Record<string, unknown>;
+  binding_hash: string;
+  acceptance_contract_hash: string;
+}
+
+export interface DirectCandidateExecutionCandidate {
+  present: true;
+  required: true;
+  source_commit: string;
+  source_tree: string;
+  commit_sha: string;
+  tree_sha: string;
+  changed_paths: string[];
+  deleted_paths: string[];
+  diff_hash: string;
+  change_manifest?: {
+    source_tree: string;
+    target_tree: string;
+    entries: Array<{
+      path: string;
+      change_type: "ADD" | "MODIFY" | "DELETE";
+      before_oid: string | null;
+      after_oid: string | null;
+      before_mode: string | null;
+      after_mode: string | null;
+    }>;
+  };
+  provenance_created_at: string;
+}
+
+export interface DirectCandidateExecutionClaim {
+  status: "CANDIDATE_CAPTURED_PENDING_CORE_VERIFICATION_AND_ACCEPTANCE";
+  claim_ceiling: "CANDIDATE_READY";
+  core_verified: false;
+  certified: false;
+  accepted: false;
+  approved: false;
+  merged: false;
+  released: false;
+  deployed: false;
+  public_claim_allowed: false;
+}
+
+export interface DirectCandidateExecutionEvidence {
+  schema: typeof DIRECT_CANDIDATE_EXECUTION_SCHEMA;
+  evidence_id: string;
+  created_at: string;
+  authority: DirectCandidateExecutionAuthority;
+  execution: DirectCandidateExecutionDetails;
+  core_binding: DirectCandidateExecutionCoreBinding;
+  candidate: DirectCandidateExecutionCandidate;
+  claim: DirectCandidateExecutionClaim;
+  integrity: {
+    sha256: string;
+  };
+}
+
+export function computeDirectCandidateEvidenceId(input: {
+  agentId: string;
+  attemptId: string;
+  commitSha: string;
+  diffHash: string;
+}): string {
+  const raw = `${input.agentId}:${input.attemptId}:${input.commitSha}:${input.diffHash}`;
+  return `dce_${sha256(raw).slice(0, 32)}`;
+}
+
+export function computeDispatchIntentHash(intent: DispatchIntent): string {
+  return hashDispatchIntent(intent);
+}
+
+export function computeDirectCandidateEvidenceIntegrity(
+  evidence: Omit<DirectCandidateExecutionEvidence, "integrity"> & {
+    integrity?: { sha256: string };
+  },
+): string {
+  const cloned = {
+    ...evidence,
+    integrity: { sha256: "0".repeat(64) },
+  };
+  return sha256(canonicalJson(cloned));
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function assertExactKeys(
+  record: Record<string, unknown>,
+  expected: readonly string[],
+  prefix: string,
+): void {
+  const actualKeys = Object.keys(record);
+  if (actualKeys.length !== expected.length || !expected.every((k) => Object.prototype.hasOwnProperty.call(record, k))) {
+    throw new ExecutionProtocolError(
+      "INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE",
+      `${prefix} keys mismatch. Expected exact keys: [${expected.join(", ")}], got: [${actualKeys.join(", ")}].`,
+    );
+  }
+}
+
+const HEX40_RE = /^[0-9a-f]{40}$/;
+const HEX64_RE = /^[0-9a-f]{64}$/;
+const CORE_HASH_RE = /^sha256:[0-9a-f]{64}$/;
+
+export function validateDirectCandidateExecutionEvidence(value: unknown): DirectCandidateExecutionEvidence {
+  if (!isRecord(value)) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "Direct evidence must be an object.");
+  }
+
+  assertExactKeys(
+    value,
+    ["schema", "evidence_id", "created_at", "authority", "execution", "core_binding", "candidate", "claim", "integrity"],
+    "Direct candidate execution evidence",
+  );
+
+  if (value.schema !== DIRECT_CANDIDATE_EXECUTION_SCHEMA) {
+    throw new ExecutionProtocolError(
+      "INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE",
+      `Invalid schema: expected ${DIRECT_CANDIDATE_EXECUTION_SCHEMA}, got ${String(value.schema)}.`,
+    );
+  }
+
+  if (typeof value.created_at !== "string" || !Number.isFinite(Date.parse(value.created_at))) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "created_at must be a valid ISO date string.");
+  }
+
+  // 1. Authority
+  const auth = value.authority;
+  if (!isRecord(auth)) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "authority must be an object.");
+  }
+  assertExactKeys(
+    auth,
+    ["authority_mode", "execution_lane", "task_id", "attempt_id", "dispatch_intent", "dispatch_intent_hash", "authority_ref", "core_authority_hash"],
+    "authority",
+  );
+  if (auth.authority_mode !== "OWNER_DIRECT") {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "authority.authority_mode must be OWNER_DIRECT.");
+  }
+  if (auth.execution_lane !== "DIRECT_DELEGATED") {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "authority.execution_lane must be DIRECT_DELEGATED.");
+  }
+  if (typeof auth.task_id !== "string" || !auth.task_id.trim()) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "authority.task_id must be non-empty.");
+  }
+  if (typeof auth.attempt_id !== "string" || !auth.attempt_id.trim()) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "authority.attempt_id must be non-empty.");
+  }
+  const parsedIntent = parseDispatchIntent(auth.dispatch_intent);
+  if (parsedIntent.taskId !== auth.task_id || parsedIntent.attemptId !== auth.attempt_id) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "authority task_id/attempt_id does not match dispatch_intent.");
+  }
+  if (parsedIntent.claimCeiling !== "CANDIDATE_READY") {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "dispatch_intent.claimCeiling must be CANDIDATE_READY.");
+  }
+  const expectedIntentHash = computeDispatchIntentHash(parsedIntent);
+  if (auth.dispatch_intent_hash !== expectedIntentHash) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "authority.dispatch_intent_hash mismatch.");
+  }
+  if (typeof auth.authority_ref !== "string" || !auth.authority_ref.trim()) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "authority.authority_ref must be non-empty.");
+  }
+  if (auth.core_authority_hash !== `sha256:${expectedIntentHash}`) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "authority.core_authority_hash mismatch.");
+  }
+
+  // 2. Execution
+  const exec = value.execution;
+  if (!isRecord(exec)) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution must be an object.");
+  }
+  assertExactKeys(
+    exec,
+    [
+      "protocol",
+      "execution_binding_hash",
+      "agent_id",
+      "profile",
+      "provider",
+      "model",
+      "effort",
+      "provider_session_id",
+      "execution_generation",
+      "workspace_id",
+      "workspace_root",
+      "state",
+      "terminal_reason",
+      "retry_safe",
+      "reconciliation_required",
+      "scope_state",
+      "started_at",
+      "completed_at",
+    ],
+    "execution",
+  );
+  if (exec.protocol !== EXECUTION_PROTOCOL_VERSION) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", `execution.protocol must be ${EXECUTION_PROTOCOL_VERSION}.`);
+  }
+  if (typeof exec.execution_binding_hash !== "string" || !HEX64_RE.test(exec.execution_binding_hash)) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution.execution_binding_hash must be 64-hex.");
+  }
+  for (const field of ["agent_id", "profile", "provider", "workspace_id", "workspace_root"]) {
+    if (typeof exec[field] !== "string" || !(exec[field] as string).trim()) {
+      throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", `execution.${field} must be non-empty string.`);
+    }
+  }
+  for (const field of ["model", "effort", "provider_session_id"]) {
+    if (exec[field] !== null && (typeof exec[field] !== "string" || !(exec[field] as string).trim())) {
+      throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", `execution.${field} must be null or non-empty string.`);
+    }
+  }
+  if (exec.state !== "completed" || exec.terminal_reason !== "completed") {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution state and terminal_reason must be completed.");
+  }
+  if (exec.retry_safe !== false) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution.retry_safe must be false.");
+  }
+  if (exec.reconciliation_required !== false) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution.reconciliation_required must be false.");
+  }
+  if (exec.scope_state !== "WITHIN_SCOPE") {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution.scope_state must be WITHIN_SCOPE.");
+  }
+  if (typeof exec.started_at !== "string" || !Number.isFinite(Date.parse(exec.started_at))) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution.started_at must be valid date.");
+  }
+  if (typeof exec.completed_at !== "string" || !Number.isFinite(Date.parse(exec.completed_at))) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution.completed_at must be valid date.");
+  }
+
+  // Execution generation validation
+  const gen = exec.execution_generation;
+  if (!isRecord(gen)) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution.execution_generation must be an object.");
+  }
+  const requiredGenKeys = ["profileCatalogGeneration", "provider", "executionIdentity", "devspaceBuildId", "devspaceSourceCommit", "capabilitySurfaceDigest", "executionBindingHash"];
+  for (const key of requiredGenKeys) {
+    if (typeof gen[key] !== "string" || !gen[key]) {
+      throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", `execution_generation.${key} must be a non-empty string.`);
+    }
+  }
+  const expectedCapabilityDigest = sha256(canonicalJson({
+    profileCatalogGeneration: gen.profileCatalogGeneration,
+    devspaceBuildId: gen.devspaceBuildId,
+    devspaceSourceCommit: gen.devspaceSourceCommit,
+  }));
+  if (gen.capabilitySurfaceDigest !== expectedCapabilityDigest) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution_generation.capabilitySurfaceDigest mismatch.");
+  }
+  const genPayload: Record<string, unknown> = {
+    profileCatalogGeneration: gen.profileCatalogGeneration,
+    provider: gen.provider,
+    executionIdentity: gen.executionIdentity,
+    devspaceBuildId: gen.devspaceBuildId,
+    devspaceSourceCommit: gen.devspaceSourceCommit,
+    capabilitySurfaceDigest: expectedCapabilityDigest,
+  };
+  if (gen.model !== undefined) genPayload.model = gen.model;
+  if (gen.runtimeVersion !== undefined) genPayload.runtimeVersion = gen.runtimeVersion;
+  const expectedGenHash = sha256(canonicalJson(genPayload));
+  if (gen.executionBindingHash !== expectedGenHash) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution_generation.executionBindingHash mismatch.");
+  }
+  if (gen.executionBindingHash !== exec.execution_binding_hash) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution_generation.executionBindingHash does not match execution.execution_binding_hash.");
+  }
+  if (gen.provider !== exec.provider) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution_generation.provider mismatch.");
+  }
+  if (exec.model !== null && gen.model !== exec.model) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution_generation.model mismatch.");
+  }
+  if (exec.model === null && gen.model !== undefined) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution_generation must omit model when execution.model is null.");
+  }
+
+  // 3. Core binding
+  const core = value.core_binding;
+  if (!isRecord(core)) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "core_binding must be an object.");
+  }
+  assertExactKeys(core, ["session_id", "binding", "binding_hash", "acceptance_contract_hash"], "core_binding");
+  if (typeof core.session_id !== "string" || !/^cms_[0-9a-f]{32}$/.test(core.session_id)) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "core_binding.session_id must match cms_<32 hex>.");
+  }
+  if (!isRecord(core.binding)) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "core_binding.binding must be an object.");
+  }
+  if (typeof core.binding_hash !== "string" || !CORE_HASH_RE.test(core.binding_hash)) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "core_binding.binding_hash must be sha256:<64 hex>.");
+  }
+  if (typeof core.acceptance_contract_hash !== "string" || !CORE_HASH_RE.test(core.acceptance_contract_hash)) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "core_binding.acceptance_contract_hash must be sha256:<64 hex>.");
+  }
+
+  // 4. Candidate
+  const cand = value.candidate;
+  if (!isRecord(cand)) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "candidate must be an object.");
+  }
+  assertExactKeys(
+    cand,
+    ["present", "required", "source_commit", "source_tree", "commit_sha", "tree_sha", "changed_paths", "deleted_paths", "diff_hash", "change_manifest", "provenance_created_at"],
+    "candidate",
+  );
+  if (cand.present !== true || cand.required !== true) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "candidate present and required must be true.");
+  }
+  for (const field of ["source_commit", "source_tree", "commit_sha", "tree_sha"]) {
+    if (typeof cand[field] !== "string" || !HEX40_RE.test(cand[field] as string)) {
+      throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", `candidate.${field} must be 40-hex Git OID.`);
+    }
+  }
+  if (!Array.isArray(cand.changed_paths) || !cand.changed_paths.every((p) => typeof p === "string")) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "candidate.changed_paths must be string array.");
+  }
+  if (!Array.isArray(cand.deleted_paths) || !cand.deleted_paths.every((p) => typeof p === "string")) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "candidate.deleted_paths must be string array.");
+  }
+  if (typeof cand.diff_hash !== "string" || !CORE_HASH_RE.test(cand.diff_hash)) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "candidate.diff_hash must be sha256:<64 hex>.");
+  }
+  if (typeof cand.provenance_created_at !== "string" || !Number.isFinite(Date.parse(cand.provenance_created_at))) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "candidate.provenance_created_at must be valid date.");
+  }
+  if (cand.provenance_created_at !== value.created_at) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "created_at must equal candidate.provenance_created_at.");
+  }
+
+  // 5. Claim
+  const claim = value.claim;
+  if (!isRecord(claim)) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "claim must be an object.");
+  }
+  assertExactKeys(
+    claim,
+    ["status", "claim_ceiling", "core_verified", "certified", "accepted", "approved", "merged", "released", "deployed", "public_claim_allowed"],
+    "claim",
+  );
+  if (claim.status !== "CANDIDATE_CAPTURED_PENDING_CORE_VERIFICATION_AND_ACCEPTANCE") {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "claim.status mismatch.");
+  }
+  if (claim.claim_ceiling !== "CANDIDATE_READY") {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "claim.claim_ceiling must be CANDIDATE_READY.");
+  }
+  for (const flag of ["core_verified", "certified", "accepted", "approved", "merged", "released", "deployed", "public_claim_allowed"]) {
+    if (claim[flag] !== false) {
+      throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", `claim.${flag} must be false.`);
+    }
+  }
+
+  // 6. Evidence ID
+  const expectedEvidenceId = computeDirectCandidateEvidenceId({
+    agentId: exec.agent_id as string,
+    attemptId: auth.attempt_id as string,
+    commitSha: cand.commit_sha as string,
+    diffHash: cand.diff_hash as string,
+  });
+  if (value.evidence_id !== expectedEvidenceId) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", `evidence_id mismatch: expected ${expectedEvidenceId}, got ${String(value.evidence_id)}.`);
+  }
+
+  // 7. Integrity
+  const integrity = value.integrity;
+  if (!isRecord(integrity)) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "integrity must be an object.");
+  }
+  assertExactKeys(integrity, ["sha256"], "integrity");
+  const expectedIntegrity = computeDirectCandidateEvidenceIntegrity(value as unknown as DirectCandidateExecutionEvidence);
+  if (integrity.sha256 !== expectedIntegrity) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", `integrity.sha256 mismatch: expected ${expectedIntegrity}, got ${String(integrity.sha256)}.`);
+  }
+
+  return value as unknown as DirectCandidateExecutionEvidence;
 }

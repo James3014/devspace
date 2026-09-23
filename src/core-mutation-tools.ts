@@ -10,6 +10,7 @@ import {
   parseRepositoryMutationBinding,
   type CoreMutationAdmission,
   type CoreMutationCandidateProvenance,
+  type CoreMutationDurableAgentRecord,
   type CoreMutationPhysicalSnapshot,
   type CoreMutationManagedWriterDomain,
   type CoreMutationOrphanProcessRecoveryEvidence,
@@ -284,7 +285,12 @@ export function registerCoreMutationSessionTools(
     session: NonNullable<ReturnType<CoreMutationSessionStore["getById"]>>,
     domain: CoreMutationManagedWriterDomain,
   ) => Promise<"CLEAR" | "ACTIVE" | "UNKNOWN"> | "CLEAR" | "ACTIVE" | "UNKNOWN",
-  options: { recoveryOwnerClientId?: string } = {},
+  options: {
+    recoveryOwnerClientId?: string;
+    readDurableAgentRecord?: (
+      agentId: string,
+    ) => Promise<CoreMutationDurableAgentRecord | undefined> | CoreMutationDurableAgentRecord | undefined;
+  } = {},
 ): void {
   if (!store) return;
 
@@ -620,6 +626,119 @@ export function registerCoreMutationSessionTools(
         return {
           content: [{ type: "text" as const, text: `Core mutation session ${session.id} closed as ${session.status} (${meaning}).` }],
           structuredContent: publicSession(session),
+        };
+      } catch (error) {
+        throw toolError(error);
+      }
+    },
+  );
+
+  const directEvidenceOutputSchema = z.object({
+    schema: z.literal("devspace.direct_candidate_execution.v1"),
+    evidence_id: z.string(),
+    created_at: z.string(),
+    authority: z.object({
+      authority_mode: z.literal("OWNER_DIRECT"),
+      execution_lane: z.literal("DIRECT_DELEGATED"),
+      task_id: z.string(),
+      attempt_id: z.string(),
+      dispatch_intent: z.record(z.string(), z.unknown()),
+      dispatch_intent_hash: z.string(),
+      authority_ref: z.string(),
+      core_authority_hash: z.string(),
+    }),
+    execution: z.object({
+      protocol: z.string(),
+      execution_binding_hash: z.string(),
+      agent_id: z.string(),
+      profile: z.string(),
+      provider: z.string(),
+      model: z.string().nullable(),
+      effort: z.string().nullable(),
+      provider_session_id: z.string().nullable(),
+      execution_generation: z.record(z.string(), z.unknown()),
+      workspace_id: z.string(),
+      workspace_root: z.string(),
+      state: z.literal("completed"),
+      terminal_reason: z.literal("completed"),
+      retry_safe: z.literal(false),
+      reconciliation_required: z.literal(false),
+      scope_state: z.literal("WITHIN_SCOPE"),
+      started_at: z.string(),
+      completed_at: z.string(),
+    }),
+    core_binding: z.object({
+      session_id: z.string(),
+      binding: z.record(z.string(), z.unknown()),
+      binding_hash: z.string(),
+      acceptance_contract_hash: z.string(),
+    }),
+    candidate: z.object({
+      present: z.literal(true),
+      required: z.literal(true),
+      source_commit: z.string(),
+      source_tree: z.string(),
+      commit_sha: z.string(),
+      tree_sha: z.string(),
+      changed_paths: z.array(z.string()),
+      deleted_paths: z.array(z.string()),
+      diff_hash: z.string(),
+      change_manifest: z.record(z.string(), z.unknown()).optional(),
+      provenance_created_at: z.string(),
+    }),
+    claim: z.object({
+      status: z.literal("CANDIDATE_CAPTURED_PENDING_CORE_VERIFICATION_AND_ACCEPTANCE"),
+      claim_ceiling: z.literal("CANDIDATE_READY"),
+      core_verified: z.literal(false),
+      certified: z.literal(false),
+      accepted: z.literal(false),
+      approved: z.literal(false),
+      merged: z.literal(false),
+      released: z.literal(false),
+      deployed: z.literal(false),
+      public_claim_allowed: z.literal(false),
+    }),
+    integrity: z.object({
+      sha256: z.string(),
+    }),
+  });
+
+  registerAppTool(
+    server,
+    "direct_candidate_execution_evidence",
+    {
+      title: "Direct Candidate execution evidence",
+      description:
+        "Produce cryptographic devspace.direct_candidate_execution.v1 evidence for a completed DIRECT_DELEGATED subagent and its recorded physical Candidate provenance. Fails closed if agent was non-terminal, escaped scope, deleted forbidden paths, or has mismatched Core binding.",
+      inputSchema: {
+        workspaceId: z.string(),
+        sessionId: z.string(),
+        candidateHead: z.string(),
+        agentId: z.string(),
+      },
+      outputSchema: directEvidenceOutputSchema,
+      _meta: {},
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ workspaceId, sessionId, candidateHead, agentId }) => {
+      workspaces.getWorkspace(workspaceId);
+      if (!options.readDurableAgentRecord) {
+        throw new Error("[DURABLE_AGENT_READER_UNAVAILABLE] Durable agent reader is unavailable on this DevSpace runtime.");
+      }
+      try {
+        const evidence = await store.produceDirectCandidateEvidence({
+          workspaceId,
+          sessionId,
+          candidateHead,
+          agentId,
+          agentReader: options.readDurableAgentRecord,
+        });
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Direct candidate execution evidence produced for agent ${agentId} and candidate ${candidateHead}: ${evidence.evidence_id}.`,
+          }],
+          structuredContent: evidence as unknown as Record<string, unknown>,
         };
       } catch (error) {
         throw toolError(error);

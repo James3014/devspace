@@ -44,6 +44,13 @@ import {
   NEXUS_CORE_PROTOCOL_VERSION,
   type RepositoryMutationBinding,
 } from "./core-mutation-session.js";
+import {
+  buildExecutionGenerationBinding,
+  computeDirectCandidateEvidenceId,
+  computeDispatchIntentHash,
+  DIRECT_CANDIDATE_EXECUTION_SCHEMA,
+  validateDirectCandidateExecutionEvidence,
+} from "./execution-protocol.js";
 import { assertCoreMutationRecoveryOwnerClient, CORE_MUTATION_TEST_ONLY_UNTRUSTED_BYPASS } from "./core-mutation-tools.js";
 
 const execFileAsync = promisify(execFile);
@@ -1527,6 +1534,7 @@ async function bindTestCoreSession(input: {
   workspaceMode?: "checkout" | "managed_worktree";
   deletionPolicy?: "FORBID" | "ALLOW";
   identitySuffix?: string;
+  authorityHash?: string;
 }) {
   const store = input.fixture.coreMutationSessions;
   assert.ok(store, "test fixture must enable Core mutation sessions");
@@ -1562,7 +1570,7 @@ async function bindTestCoreSession(input: {
     integration_authority: {
       execution_lane: "DIRECT_DELEGATED",
       authority_ref: "James3014/devspace#135:test",
-      authority_hash: `sha256:${"4".repeat(64)}`,
+      authority_hash: input.authorityHash ?? `sha256:${"4".repeat(64)}`,
     },
     capability_discovery: {
       required: true,
@@ -1624,6 +1632,117 @@ test("Core-bound mutation session tools are registered for durable mutation admi
   assert.ok(tools.tools.some((tool) => tool.name === "core_mutation_session_open"));
   assert.ok(tools.tools.some((tool) => tool.name === "core_mutation_session_status"));
   assert.ok(tools.tools.some((tool) => tool.name === "core_mutation_session_reconcile_synchronous"));
+  assert.ok(tools.tools.some((tool) => tool.name === "direct_candidate_execution_evidence"));
+  const dce = tools.tools.find((tool) => tool.name === "direct_candidate_execution_evidence")!;
+  assert.equal(dce.annotations?.readOnlyHint, true);
+});
+
+test("direct_candidate_execution_evidence tool produces valid evidence through host MCP server", async (t) => {
+  const conversationScopeId = "core-direct-candidate-witness";
+  const conversation = { "openai/session": conversationScopeId };
+  const context = await fixture(t, { git: true, coreMutation: true, subagents: true });
+  await addMutatorProfile(context.project);
+  await execFileAsync("git", ["add", ".devspace/agents/mutator.md"], { cwd: context.project });
+  await execFileAsync("git", ["commit", "-m", "test fixture mutator profile"], { cwd: context.project });
+  const opened = await callOpen(context.client, context.project, conversationScopeId);
+  const workspaceId = structuredContent(opened).workspaceId as string;
+
+  const dispatchIntent = {
+    taskId: `operation-${workspaceId}-dce`,
+    attemptId: `attempt-${workspaceId}-dce`,
+    roleIntent: "DEEP_ENGINEERING" as const,
+    objective: "produce direct evidence through mcp",
+    acceptanceCriteria: ["evidence valid"],
+    claimCeiling: "CANDIDATE_READY" as const,
+    verificationRequired: true,
+    exclusiveOwnership: true,
+    writeScope: ["AGENTS.md"],
+  };
+  const dispatchIntentHash = computeDispatchIntentHash(dispatchIntent);
+
+  const bound = await bindTestCoreSession({
+    fixture: context,
+    workspaceId,
+    workspaceRoot: context.project,
+    conversationScopeId,
+    allowedPaths: ["AGENTS.md"],
+    identitySuffix: "dce",
+    authorityHash: `sha256:${dispatchIntentHash}`,
+  });
+
+  await writeFile(join(context.project, "AGENTS.md"), "updated instructions for candidate\n");
+  await execFileAsync("git", ["add", "AGENTS.md"], { cwd: context.project });
+  await execFileAsync("git", ["commit", "-m", "candidate commit"], { cwd: context.project });
+  const candidateHead = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: context.project })).stdout.trim();
+  const candidateTree = (await execFileAsync("git", ["rev-parse", "HEAD^{tree}"], { cwd: context.project })).stdout.trim();
+
+  const actorKey = `openai:${createHash("sha256").update(conversationScopeId).digest("hex")}`;
+  await context.coreMutationSessions!.recordCandidate({
+    sessionId: bound.session.id,
+    workspaceSessionId: workspaceId,
+    workspaceRoot: context.project,
+    actorKey,
+    candidateHead,
+    candidateTree,
+  });
+
+  const agents = new LocalAgentStore(context.stateDir);
+  let agentId: string;
+  try {
+    const record = agents.create({
+      workspaceId,
+      workspaceRoot: context.project,
+      profileName: "mutator",
+      provider: "codex",
+      executionContract: {
+        coreMutation: {
+          sessionId: bound.session.id,
+          bindingHash: bound.session.bindingHash,
+        },
+        writePaths: ["AGENTS.md"],
+        dispatchIntent,
+      },
+      executionGeneration: buildExecutionGenerationBinding({
+        profileCatalogGeneration: "gen-1",
+        provider: "codex",
+        executionIdentity: "agent:worker-1",
+        runtimeVersion: "1.0.0",
+        devspaceBuildId: "build-123",
+        devspaceSourceCommit: bound.head,
+      }),
+    });
+    agentId = record.id;
+    agents.update(agentId, {
+      status: "stopped",
+      terminalReason: "completed",
+      scopeState: "WITHIN_SCOPE",
+    });
+  } finally {
+    agents.close();
+  }
+
+  const result = await context.client.callTool({
+    name: "direct_candidate_execution_evidence",
+    arguments: {
+      workspaceId,
+      sessionId: bound.session.id,
+      candidateHead,
+      agentId,
+    },
+    _meta: conversation,
+  });
+  assert.equal(result.isError, undefined);
+  const content = structuredContent(result) as any;
+  assert.equal(content.schema, DIRECT_CANDIDATE_EXECUTION_SCHEMA);
+  assert.equal(content.evidence_id, computeDirectCandidateEvidenceId({
+    agentId,
+    attemptId: bound.binding.attempt_id,
+    commitSha: candidateHead,
+    diffHash: content.candidate.diff_hash,
+  }));
+  assert.equal(content.claim.core_verified, false);
+  assert.equal(content.claim.status, "CANDIDATE_CAPTURED_PENDING_CORE_VERIFICATION_AND_ACCEPTANCE");
+  assert.doesNotThrow(() => validateDirectCandidateExecutionEvidence(content));
 });
 
 test("Core orphan PROCESS recovery tool is opt-in and exact-owner-client fenced", async (t) => {

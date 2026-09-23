@@ -6,6 +6,23 @@ import { isAbsolute, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { openDatabase, type DatabaseHandle } from "./db/client.js";
 import type { CapabilityDiscoveryReceipt } from "./capability-discovery.js";
+import {
+  computeDirectCandidateEvidenceId,
+  computeDispatchIntentHash,
+  computeDirectCandidateEvidenceIntegrity,
+  validateDirectCandidateExecutionEvidence,
+  validateDispatchIntent,
+  DIRECT_CANDIDATE_EXECUTION_SCHEMA,
+  EXECUTION_PROTOCOL_VERSION,
+  type DirectCandidateExecutionEvidence,
+  type DirectCandidateExecutionAuthority,
+  type DirectCandidateExecutionDetails,
+  type DirectCandidateExecutionCoreBinding,
+  type DirectCandidateExecutionCandidate,
+  type DirectCandidateExecutionClaim,
+  type DispatchIntent,
+  type ExecutionGenerationBinding,
+} from "./execution-protocol.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -195,7 +212,43 @@ export interface CoreMutationCandidateProvenance {
   changeSetId: string;
   changeSetHash: string;
   changeManifestHash: string;
+  changeManifest?: CoreMutationPhysicalSnapshot["changeManifest"];
   createdAt: string;
+}
+
+export interface CoreMutationDurableAgentRecord {
+  id: string;
+  workspaceId?: string;
+  workspaceRoot: string;
+  profileName: string;
+  provider: string;
+  model?: string;
+  effort?: string;
+  providerSessionId?: string;
+  status: string;
+  terminalReason?: string;
+  scopeState?: string;
+  error?: string;
+  errorCode?: string;
+  executionContract?: unknown;
+  executionGeneration?: unknown;
+  lifecycleState?: unknown;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type CoreMutationDurableAgentReader = (
+  agentId: string,
+) => Promise<CoreMutationDurableAgentRecord | undefined> | CoreMutationDurableAgentRecord | undefined;
+
+export interface ProduceDirectCandidateEvidenceInput {
+  workspaceId: string;
+  sessionId: string;
+  candidateHead: string;
+  agentId: string;
+  actorKey?: string;
+  agentReader?: CoreMutationDurableAgentReader;
+  now?: Date;
 }
 
 export class CoreMutationSessionError extends Error {
@@ -615,6 +668,7 @@ function rowToCandidate(row: Record<string, unknown>): CoreMutationCandidateProv
     changeSetId: String(row.change_set_id),
     changeSetHash: String(row.change_set_hash),
     changeManifestHash: String(row.change_manifest_hash),
+    changeManifest: row.change_manifest_json ? JSON.parse(String(row.change_manifest_json)) : undefined,
     createdAt: String(row.created_at),
   };
 }
@@ -1061,6 +1115,7 @@ export class CoreMutationSessionStore {
       changeSetId: snapshot.changeSetId,
       changeSetHash: snapshot.changeSetHash,
       changeManifestHash: snapshot.changeManifest.manifest_hash,
+      changeManifest: snapshot.changeManifest,
       createdAt: existing?.createdAt ?? (input.now ?? new Date()).toISOString(),
     };
     if (existing) {
@@ -1103,6 +1158,395 @@ export class CoreMutationSessionStore {
       provenance.createdAt,
     );
     return this.getCandidate(input.candidateHead)!;
+  }
+
+  async produceDirectCandidateEvidence(input: {
+    workspaceId: string;
+    sessionId: string;
+    candidateHead: string;
+    agentId: string;
+    actorKey?: string;
+    agentReader?: CoreMutationDurableAgentReader;
+    now?: Date;
+  }): Promise<DirectCandidateExecutionEvidence> {
+    const record = this.getByIdRaw(input.sessionId);
+    if (!record || record.workspaceSessionId !== input.workspaceId) {
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_SESSION_NOT_FOUND",
+        "Core mutation session is not bound to this workspace.",
+      );
+    }
+    if (input.actorKey && record.actorKey !== input.actorKey) {
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_ACTOR_MISMATCH",
+        "Core mutation session belongs to a different caller identity.",
+      );
+    }
+    if (record.status === "ABANDONED") {
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_SESSION_ABANDONED",
+        "Cannot produce candidate execution evidence for an abandoned Core session.",
+      );
+    }
+    if (record.rebindState !== "BOUND_CURRENT") {
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_REBIND_REQUIRED",
+        "Core mutation session requires rebind.",
+      );
+    }
+
+    if (record.writerReconciliationState !== "CLEAR" || record.writerDomains.length !== 0) {
+      throw new CoreMutationSessionError(
+        "DIRECT_EVIDENCE_RECONCILIATION_REQUIRED",
+        `Direct candidate evidence requires reconciled Core writer state (state=${record.writerReconciliationState}, domains=${record.writerDomains.join(",") || "none"}).`,
+      );
+    }
+
+    const lane = record.binding.integration_authority.execution_lane;
+    if (lane !== "DIRECT_DELEGATED") {
+      throw new CoreMutationSessionError(
+        "UNSUPPORTED_EXECUTION_LANE",
+        `Direct candidate execution evidence requires execution_lane DIRECT_DELEGATED, found ${lane}.`,
+      );
+    }
+
+    const candidate = this.getCandidate(input.candidateHead);
+    if (!candidate) {
+      throw new CoreMutationSessionError(
+        "CANDIDATE_NOT_FOUND",
+        `Candidate ${input.candidateHead} not found in Core mutation provenance.`,
+      );
+    }
+    if (candidate.sessionId !== record.id || candidate.workspaceSessionId !== record.workspaceSessionId) {
+      throw new CoreMutationSessionError(
+        "CANDIDATE_SESSION_MISMATCH",
+        `Candidate ${input.candidateHead} belongs to Core session ${candidate.sessionId}, not ${record.id}.`,
+      );
+    }
+    if (candidate.bindingHash !== record.bindingHash) {
+      throw new CoreMutationSessionError(
+        "CANDIDATE_BINDING_MISMATCH",
+        "Candidate bindingHash does not match Core session bindingHash.",
+      );
+    }
+    if (candidate.acceptanceContractHash !== record.binding.core.acceptance_contract_hash) {
+      throw new CoreMutationSessionError(
+        "CANDIDATE_CONTRACT_MISMATCH",
+        "Candidate acceptanceContractHash does not match Core session acceptance contract hash.",
+      );
+    }
+
+    if (!input.agentReader) {
+      throw new CoreMutationSessionError(
+        "DURABLE_AGENT_READER_UNAVAILABLE",
+        "Durable agent reader is unavailable.",
+      );
+    }
+    const agent = await input.agentReader(input.agentId);
+    if (!agent || agent.id !== input.agentId) {
+      throw new CoreMutationSessionError(
+        "DURABLE_AGENT_NOT_FOUND",
+        `Durable agent record ${input.agentId} was not found.`,
+      );
+    }
+
+    if (agent.workspaceId && agent.workspaceId !== record.workspaceSessionId) {
+      throw new CoreMutationSessionError(
+        "AGENT_WORKSPACE_MISMATCH",
+        `Agent workspaceId ${agent.workspaceId} does not match Core workspace ${record.workspaceSessionId}.`,
+      );
+    }
+    if (agent.status !== "stopped") {
+      throw new CoreMutationSessionError(
+        "AGENT_EXECUTION_NOT_TERMINAL",
+        `Agent ${agent.id} is in status ${agent.status}; direct candidate evidence requires terminal stopped agent.`,
+      );
+    }
+    if (agent.terminalReason !== "completed") {
+      throw new CoreMutationSessionError(
+        "AGENT_EXECUTION_FAILED",
+        `Agent ${agent.id} terminal reason is ${agent.terminalReason ?? "unknown"}; direct candidate evidence requires completed execution.`,
+      );
+    }
+    if (agent.scopeState !== "WITHIN_SCOPE") {
+      throw new CoreMutationSessionError(
+        "AGENT_SCOPE_ESCAPE",
+        `Agent ${agent.id} scopeState is ${agent.scopeState}; direct candidate evidence requires WITHIN_SCOPE.`,
+      );
+    }
+
+    const lifecycle = agent.lifecycleState as Record<string, unknown> | undefined;
+    if (lifecycle?.lifecycleCorrupt) {
+      throw new CoreMutationSessionError(
+        "AGENT_LIFECYCLE_CORRUPT",
+        `Agent ${agent.id} lifecycle state is corrupt.`,
+      );
+    }
+    if (lifecycle?.terminationBlocked) {
+      throw new CoreMutationSessionError(
+        "AGENT_TERMINATION_BLOCKED",
+        `Agent ${agent.id} termination was blocked.`,
+      );
+    }
+    const termPending = lifecycle?.terminationPending as Record<string, unknown> | undefined;
+    if (termPending?.pending) {
+      throw new CoreMutationSessionError(
+        "AGENT_TERMINATION_PENDING",
+        `Agent ${agent.id} termination is still pending.`,
+      );
+    }
+
+    const contract = agent.executionContract as Record<string, unknown> | undefined;
+    if (!contract) {
+      throw new CoreMutationSessionError(
+        "AGENT_EXECUTION_CONTRACT_MISSING",
+        `Agent ${agent.id} lacks execution contract.`,
+      );
+    }
+    const agentCoreMutation = contract.coreMutation as { sessionId?: string; bindingHash?: string } | undefined;
+    if (
+      !agentCoreMutation ||
+      agentCoreMutation.sessionId !== record.id ||
+      agentCoreMutation.bindingHash !== record.bindingHash
+    ) {
+      throw new CoreMutationSessionError(
+        "AGENT_CORE_MUTATION_MISMATCH",
+        `Agent ${agent.id} is not bound to Core session ${record.id} with matching binding hash.`,
+      );
+    }
+
+    const dispatchIntent = contract.dispatchIntent as DispatchIntent | undefined;
+    if (!dispatchIntent) {
+      throw new CoreMutationSessionError(
+        "AGENT_DISPATCH_INTENT_MISSING",
+        `Agent ${agent.id} lacks dispatch intent in execution contract.`,
+      );
+    }
+    validateDispatchIntent(dispatchIntent);
+    if (dispatchIntent.taskId !== record.binding.operation_id) {
+      throw new CoreMutationSessionError(
+        "DISPATCH_INTENT_TASK_MISMATCH",
+        `DispatchIntent taskId (${dispatchIntent.taskId}) does not match Core operation_id (${record.binding.operation_id}).`,
+      );
+    }
+    if (dispatchIntent.attemptId !== record.binding.attempt_id) {
+      throw new CoreMutationSessionError(
+        "DISPATCH_INTENT_ATTEMPT_MISMATCH",
+        `DispatchIntent attemptId (${dispatchIntent.attemptId}) does not match Core attempt_id (${record.binding.attempt_id}).`,
+      );
+    }
+    if (dispatchIntent.claimCeiling !== "CANDIDATE_READY") {
+      throw new CoreMutationSessionError(
+        "DISPATCH_INTENT_CLAIM_CEILING_MISMATCH",
+        `DispatchIntent claimCeiling must be CANDIDATE_READY, got ${dispatchIntent.claimCeiling}.`,
+      );
+    }
+
+    const gen = agent.executionGeneration as ExecutionGenerationBinding | undefined;
+    if (!gen || typeof gen !== "object") {
+      throw new CoreMutationSessionError(
+        "AGENT_EXECUTION_GENERATION_MISSING",
+        `Agent ${agent.id} lacks execution generation binding.`,
+      );
+    }
+    if (!gen.executionBindingHash) {
+      throw new CoreMutationSessionError(
+        "AGENT_EXECUTION_GENERATION_MALFORMED",
+        `Agent ${agent.id} execution generation lacks executionBindingHash.`,
+      );
+    }
+
+    const physicalStatus = await runGit(agent.workspaceRoot, ["status", "--porcelain=v1", "--untracked-files=all"]);
+    if (physicalStatus.trim().length > 0) {
+      throw new CoreMutationSessionError(
+        "DIRECT_EVIDENCE_PHYSICAL_WORKTREE_DIRTY",
+        "Direct candidate evidence requires a clean physical workspace at projection time.",
+      );
+    }
+    const physical = await materializeSnapshot(agent.workspaceRoot, record);
+    if (
+      physical.currentHead !== candidate.candidateHead ||
+      physical.currentHeadTree !== `git-tree:${candidate.candidateTree}` ||
+      physical.targetTree !== `git-tree:${candidate.candidateTree}` ||
+      candidate.sourceHead !== record.sourceHead ||
+      candidate.sourceTree !== record.sourceTree ||
+      candidate.diffHash !== physical.diffHash ||
+      candidate.changeSetId !== physical.changeSetId ||
+      candidate.changeSetHash !== physical.changeSetHash ||
+      candidate.changeManifestHash !== physical.changeManifest.manifest_hash ||
+      !sameStringSet(candidate.changedPaths, physical.changedPaths) ||
+      !sameStringSet(candidate.deletedPaths, physical.deletedPaths)
+    ) {
+      throw new CoreMutationSessionError(
+        "DIRECT_EVIDENCE_PHYSICAL_CANDIDATE_MISMATCH",
+        "Current physical HEAD/tree/ChangeSet does not match the exact durable Core Candidate provenance.",
+      );
+    }
+
+    const row = this.database.sqlite
+      .prepare("select change_manifest_json from core_mutation_candidates where candidate_head = ? limit 1")
+      .get(input.candidateHead) as { change_manifest_json?: string } | undefined;
+    const rawManifest = row?.change_manifest_json
+      ? (JSON.parse(row.change_manifest_json) as {
+          source_tree: string;
+          target_tree: string;
+          entries?: Array<{
+            path: unknown;
+            change_type: unknown;
+            before_oid?: unknown;
+            after_oid?: unknown;
+            before_mode?: unknown;
+            after_mode?: unknown;
+          }>;
+        })
+      : candidate.changeManifest;
+    const changeManifest = rawManifest
+      ? {
+          source_tree: rawManifest.source_tree,
+          target_tree: rawManifest.target_tree,
+          entries: (rawManifest.entries ?? []).map((entry) => ({
+            path: String(entry.path),
+            change_type: entry.change_type as "ADD" | "MODIFY" | "DELETE",
+            before_oid: entry.before_oid ? String(entry.before_oid) : null,
+            after_oid: entry.after_oid ? String(entry.after_oid) : null,
+            before_mode: entry.before_mode ? String(entry.before_mode) : null,
+            after_mode: entry.after_mode ? String(entry.after_mode) : null,
+          })),
+        }
+      : undefined;
+
+    const allowedPaths = new Set(record.binding.core.acceptance_contract.allowed_paths);
+    for (const p of candidate.changedPaths) {
+      if (!allowedPaths.has(p)) {
+        throw new CoreMutationSessionError(
+          "CANDIDATE_SCOPE_ESCAPE",
+          `Candidate changed path ${p} escapes Core AcceptanceContract allowed_paths.`,
+        );
+      }
+    }
+    if (
+      record.binding.core.acceptance_contract.deletion_policy === "FORBID" &&
+      candidate.deletedPaths.length > 0
+    ) {
+      throw new CoreMutationSessionError(
+        "CANDIDATE_DELETION_FORBIDDEN",
+        `Candidate deletes paths (${candidate.deletedPaths.join(", ")}) while deletion_policy=FORBID.`,
+      );
+    }
+
+    const createdAt = candidate.createdAt;
+    const diffHash = candidate.diffHash.startsWith("sha256:")
+      ? candidate.diffHash
+      : `sha256:${candidate.diffHash}`;
+
+    const evidenceId = computeDirectCandidateEvidenceId({
+      agentId: agent.id,
+      attemptId: record.binding.attempt_id,
+      commitSha: candidate.candidateHead,
+      diffHash,
+    });
+
+    const dispatchIntentHash = computeDispatchIntentHash(dispatchIntent);
+    if (record.binding.integration_authority.authority_hash !== `sha256:${dispatchIntentHash}`) {
+      throw new CoreMutationSessionError(
+        "CORE_AUTHORITY_HASH_MISMATCH",
+        `Core integration_authority.authority_hash does not match dispatch intent hash (expected sha256:${dispatchIntentHash}, got ${record.binding.integration_authority.authority_hash}).`,
+      );
+    }
+
+    const authority: DirectCandidateExecutionAuthority = {
+      authority_mode: "OWNER_DIRECT",
+      execution_lane: "DIRECT_DELEGATED",
+      task_id: record.binding.operation_id,
+      attempt_id: record.binding.attempt_id,
+      dispatch_intent: dispatchIntent,
+      dispatch_intent_hash: dispatchIntentHash,
+      authority_ref: record.binding.integration_authority.authority_ref,
+      core_authority_hash: record.binding.integration_authority.authority_hash,
+    };
+
+    const execution: DirectCandidateExecutionDetails = {
+      protocol: EXECUTION_PROTOCOL_VERSION,
+      execution_binding_hash: gen.executionBindingHash,
+      agent_id: agent.id,
+      profile: agent.profileName,
+      provider: agent.provider,
+      model: agent.model ?? null,
+      effort: agent.effort ?? null,
+      provider_session_id: agent.providerSessionId ?? null,
+      execution_generation: gen,
+      workspace_id: agent.workspaceId ?? record.workspaceSessionId,
+      workspace_root: agent.workspaceRoot,
+      state: "completed",
+      terminal_reason: "completed",
+      retry_safe: false,
+      reconciliation_required: false,
+      scope_state: "WITHIN_SCOPE",
+      started_at: agent.createdAt,
+      completed_at: agent.updatedAt,
+    };
+
+    const coreBinding: DirectCandidateExecutionCoreBinding = {
+      session_id: record.id,
+      binding: record.binding as unknown as Record<string, unknown>,
+      binding_hash: record.bindingHash,
+      acceptance_contract_hash: record.binding.core.acceptance_contract_hash,
+    };
+
+    const sourceCommit = record.sourceHead.replace(/^git-commit:/, "");
+    const sourceTree = record.sourceTree.replace(/^git-tree:/, "");
+    const candidateHead = candidate.candidateHead.replace(/^git-commit:/, "");
+    const candidateTree = candidate.candidateTree.replace(/^git-tree:/, "");
+
+    const candidatePayload: DirectCandidateExecutionCandidate = {
+      present: true,
+      required: true,
+      source_commit: sourceCommit,
+      source_tree: sourceTree,
+      commit_sha: candidateHead,
+      tree_sha: candidateTree,
+      changed_paths: candidate.changedPaths,
+      deleted_paths: candidate.deletedPaths,
+      diff_hash: diffHash,
+      ...(changeManifest ? { change_manifest: changeManifest } : {}),
+      provenance_created_at: createdAt,
+    };
+
+    const claim: DirectCandidateExecutionClaim = {
+      status: "CANDIDATE_CAPTURED_PENDING_CORE_VERIFICATION_AND_ACCEPTANCE",
+      claim_ceiling: "CANDIDATE_READY",
+      core_verified: false,
+      certified: false,
+      accepted: false,
+      approved: false,
+      merged: false,
+      released: false,
+      deployed: false,
+      public_claim_allowed: false,
+    };
+
+    const unsigned = {
+      schema: DIRECT_CANDIDATE_EXECUTION_SCHEMA,
+      evidence_id: evidenceId,
+      created_at: createdAt,
+      authority,
+      execution,
+      core_binding: coreBinding,
+      candidate: candidatePayload,
+      claim,
+    };
+
+    const integritySha256 = computeDirectCandidateEvidenceIntegrity(unsigned);
+
+    const evidence: DirectCandidateExecutionEvidence = {
+      ...unsigned,
+      integrity: {
+        sha256: integritySha256,
+      },
+    };
+
+    validateDirectCandidateExecutionEvidence(evidence);
+    return evidence;
   }
 
   async recoverOrphanedProcessEffect(input: {
@@ -1358,11 +1802,14 @@ export class CoreMutationSessionStore {
     await input.beforeCloseCas?.();
     const closed = this.database.sqlite.prepare(`
       update core_mutation_sessions
-      set status = ?, writer_reconciliation_state = case when ? = 'COMPLETED' then 'CLEAR' else writer_reconciliation_state end,
+      set status = ?,
+          writer_reconciliation_state = case when ? = 'COMPLETED' then 'CLEAR' else writer_reconciliation_state end,
+          writer_domains_json = case when ? = 'COMPLETED' then '[]' else writer_domains_json end,
           closed_at = ?, updated_at = ?
       where id = ? and status = 'ACTIVE' and updated_at = ? and freshness_state = ?
         and rebind_state = ? and writer_reconciliation_state = ? and writer_domains_json = ?
     `).run(
+      status,
       status,
       status,
       now,
