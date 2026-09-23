@@ -14,6 +14,7 @@ import {
   CoreMutationSessionStore,
   NEXUS_CORE_PROTOCOL_VERSION,
   parseRepositoryMutationBinding,
+  type CoreMutationDurableAgentRecord,
   type RepositoryMutationBinding,
 } from "./core-mutation-session.js";
 import {
@@ -22,6 +23,12 @@ import {
   NEXUS_CAPABILITY_REPOSITORY,
   type CapabilityDiscoveryReceipt,
 } from "./capability-discovery.js";
+import {
+  buildExecutionGenerationBinding,
+  computeDispatchIntentHash,
+  DIRECT_CANDIDATE_EXECUTION_SCHEMA,
+  validateDirectCandidateExecutionEvidence,
+} from "./execution-protocol.js";
 import { createWorkspaceStore } from "./workspace-store.js";
 
 function git(repo: string, ...args: string[]): string {
@@ -69,6 +76,8 @@ function makeBinding(input: {
   allowedPaths?: string[];
   deletionPolicy?: "FORBID" | "ALLOW";
   validUntil?: string | null;
+  executionLane?: "DIRECT_CANONICAL" | "DIRECT_DELEGATED" | "GOVERNED";
+  authorityHash?: string;
 }): RepositoryMutationBinding {
   const receipt = input.receipt ?? discoveryReceipt();
   const contract = {
@@ -92,9 +101,9 @@ function makeBinding(input: {
       workspace_mode: "checkout",
     },
     integration_authority: {
-      execution_lane: "DIRECT_CANONICAL",
+      execution_lane: input.executionLane ?? "DIRECT_CANONICAL",
       authority_ref: "James3014/devspace#135",
-      authority_hash: `sha256:${"4".repeat(64)}`,
+      authority_hash: input.authorityHash ?? `sha256:${"4".repeat(64)}`,
     },
     capability_discovery: {
       required: true,
@@ -617,7 +626,10 @@ test("every durably admitted writer domain must independently reconcile CLEAR", 
         (error: unknown) => error instanceof CoreMutationSessionError && error.code === "CORE_MUTATION_WRITER_RECONCILE_REQUIRED",
       );
     }
-    assert.equal((await store.closeSession({ sessionId: session.id, workspaceSessionId: workspaceId, workspaceRoot: fixture.repo, actorKey: "actor:test", mode: "COMPLETE", inspectWriterDomain: async () => "CLEAR" } as Parameters<CoreMutationSessionStore["closeSession"]>[0])).status, "COMPLETED");
+    const completed = await store.closeSession({ sessionId: session.id, workspaceSessionId: workspaceId, workspaceRoot: fixture.repo, actorKey: "actor:test", mode: "COMPLETE", inspectWriterDomain: async () => "CLEAR" } as Parameters<CoreMutationSessionStore["closeSession"]>[0]);
+    assert.equal(completed.status, "COMPLETED");
+    assert.equal(completed.writerReconciliationState, "CLEAR");
+    assert.deepEqual(completed.writerDomains, []);
   } finally {
     store.close();
     workspaceStore.close?.();
@@ -1328,6 +1340,512 @@ test("Candidate provenance rejects committed scope escape and forbidden deletion
         candidateTree: deletionTree,
       }),
       (error: unknown) => error instanceof CoreMutationSessionError && error.code === "CORE_MUTATION_DELETION_FORBIDDEN",
+    );
+  } finally {
+    store.close();
+    workspaceStore.close?.();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("produceDirectCandidateEvidence produces valid signed evidence matching exact candidate and agent records", async () => {
+  const fixture = makeRepo();
+  const stateDir = join(fixture.root, "state");
+  const workspaceId = "ws-direct-candidate-test";
+  const workspaceStore = createWorkspaceStore(stateDir);
+  workspaceStore.createSession({ id: workspaceId, root: fixture.repo, mode: "checkout" });
+  const store = new CoreMutationSessionStore(stateDir);
+  try {
+    const dispatchIntent = {
+      taskId: "operation-test-1",
+      attemptId: "attempt-test-1",
+      roleIntent: "DEEP_ENGINEERING" as const,
+      objective: "implement direct candidate execution evidence producer",
+      acceptanceCriteria: ["producer passes verification"],
+      claimCeiling: "CANDIDATE_READY" as const,
+      verificationRequired: true,
+      exclusiveOwnership: true,
+      writeScope: ["app.ts"],
+    };
+    const dispatchIntentHash = computeDispatchIntentHash(dispatchIntent);
+
+    const binding = makeBinding({
+      workspaceSessionId: workspaceId,
+      head: fixture.head,
+      tree: fixture.tree,
+      executionLane: "DIRECT_DELEGATED",
+      authorityHash: `sha256:${dispatchIntentHash}`,
+    });
+    const session = await store.open({
+      workspaceSessionId: workspaceId,
+      workspaceRoot: fixture.repo,
+      workspaceMode: "checkout",
+      managed: false,
+      actorKey: "actor:test",
+      binding,
+    });
+
+    writeFileSync(join(fixture.repo, "app.ts"), "export const value = 42;\n");
+    git(fixture.repo, "add", "app.ts");
+    git(fixture.repo, "commit", "-m", "candidate implementation");
+    const candidateHead = git(fixture.repo, "rev-parse", "HEAD");
+    const candidateTree = git(fixture.repo, "rev-parse", "HEAD^{tree}");
+
+    await store.recordCandidate({
+      sessionId: session.id,
+      workspaceSessionId: workspaceId,
+      workspaceRoot: fixture.repo,
+      actorKey: "actor:test",
+      candidateHead,
+      candidateTree,
+    });
+
+    const executionGen = buildExecutionGenerationBinding({
+      profileCatalogGeneration: "gen-1",
+      provider: "anthropic",
+      model: "claude-3-5-sonnet",
+      executionIdentity: "agent:worker-1",
+      runtimeVersion: "1.0.0",
+      devspaceBuildId: "build-123",
+      devspaceSourceCommit: fixture.head,
+    });
+
+    const agentRecord: CoreMutationDurableAgentRecord = {
+      id: "agent-123",
+      workspaceId,
+      workspaceRoot: fixture.repo,
+      profileName: "deep-engineer",
+      provider: "anthropic",
+      model: "claude-3-5-sonnet",
+      status: "stopped",
+      terminalReason: "completed",
+      scopeState: "WITHIN_SCOPE",
+      executionContract: {
+        coreMutation: {
+          sessionId: session.id,
+          bindingHash: session.bindingHash,
+        },
+        dispatchIntent,
+      },
+      executionGeneration: executionGen,
+      createdAt: "2026-09-23T12:00:00.000Z",
+      updatedAt: "2026-09-23T12:05:00.000Z",
+    };
+
+    const evidence = await store.produceDirectCandidateEvidence({
+      workspaceId,
+      sessionId: session.id,
+      candidateHead,
+      agentId: agentRecord.id,
+      agentReader: (id) => (id === agentRecord.id ? agentRecord : undefined),
+    });
+
+    assert.equal(evidence.schema, DIRECT_CANDIDATE_EXECUTION_SCHEMA);
+    assert.match(evidence.evidence_id, /^dce_[0-9a-f]{32}$/);
+    assert.equal(evidence.authority.authority_mode, "OWNER_DIRECT");
+    assert.equal(evidence.authority.execution_lane, "DIRECT_DELEGATED");
+    assert.equal(evidence.authority.task_id, binding.operation_id);
+    assert.equal(evidence.authority.attempt_id, binding.attempt_id);
+    assert.equal(evidence.execution.agent_id, agentRecord.id);
+    assert.equal(evidence.execution.state, "completed");
+    assert.equal(evidence.execution.terminal_reason, "completed");
+    assert.equal(evidence.execution.retry_safe, false);
+    assert.equal(evidence.execution.reconciliation_required, false);
+    assert.equal(evidence.core_binding.session_id, session.id);
+    assert.equal(evidence.core_binding.binding_hash, session.bindingHash);
+    assert.equal(evidence.candidate.commit_sha, candidateHead);
+    assert.equal(evidence.candidate.tree_sha, candidateTree);
+    assert.deepEqual(evidence.candidate.changed_paths, ["app.ts"]);
+    assert.deepEqual(evidence.candidate.deleted_paths, []);
+    assert.equal(evidence.claim.status, "CANDIDATE_CAPTURED_PENDING_CORE_VERIFICATION_AND_ACCEPTANCE");
+    assert.equal(evidence.claim.claim_ceiling, "CANDIDATE_READY");
+    assert.equal(evidence.claim.core_verified, false);
+    assert.equal(evidence.claim.accepted, false);
+    assert.equal(evidence.claim.merged, false);
+
+    assert.doesNotThrow(() => validateDirectCandidateExecutionEvidence(evidence));
+  } finally {
+    store.close();
+    workspaceStore.close?.();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("produceDirectCandidateEvidence rejects unresolved Core writer reconciliation", async () => {
+  const fixture = makeRepo();
+  const stateDir = join(fixture.root, "state");
+  const workspaceId = "ws-direct-candidate-writer-unresolved";
+  const workspaceStore = createWorkspaceStore(stateDir);
+  workspaceStore.createSession({ id: workspaceId, root: fixture.repo, mode: "checkout" });
+  const store = new CoreMutationSessionStore(stateDir);
+  try {
+    const dispatchIntent = {
+      taskId: "operation-writer-unresolved",
+      attemptId: "attempt-writer-unresolved",
+      roleIntent: "DEEP_ENGINEERING" as const,
+      objective: "reject unresolved writer reconciliation",
+      acceptanceCriteria: ["producer fails closed"],
+      claimCeiling: "CANDIDATE_READY" as const,
+      verificationRequired: true,
+      exclusiveOwnership: true,
+      writeScope: ["app.ts"],
+    };
+    const dispatchIntentHash = computeDispatchIntentHash(dispatchIntent);
+    const binding = makeBinding({
+      workspaceSessionId: workspaceId,
+      head: fixture.head,
+      tree: fixture.tree,
+      executionLane: "DIRECT_DELEGATED",
+      authorityHash: `sha256:${dispatchIntentHash}`,
+    });
+    const session = await store.open({
+      workspaceSessionId: workspaceId,
+      workspaceRoot: fixture.repo,
+      workspaceMode: "checkout",
+      managed: false,
+      actorKey: "actor:test",
+      binding,
+    });
+
+    await store.admitEffect({
+      workspaceSessionId: workspaceId,
+      workspaceRoot: fixture.repo,
+      workspaceMode: "checkout",
+      managed: false,
+      actorKey: "actor:test",
+      pointer: { required: true, sessionId: session.id, bindingHash: session.bindingHash },
+      pathContainment: "NOT_PROVEN",
+      writerDomain: "PROCESS",
+    } as Parameters<CoreMutationSessionStore["admitEffect"]>[0]);
+
+    writeFileSync(join(fixture.repo, "app.ts"), "export const value = 77;\n");
+    git(fixture.repo, "add", "app.ts");
+    git(fixture.repo, "commit", "-m", "candidate with unresolved writer");
+    const candidateHead = git(fixture.repo, "rev-parse", "HEAD");
+    const candidateTree = git(fixture.repo, "rev-parse", "HEAD^{tree}");
+
+    await store.recordCandidate({
+      sessionId: session.id,
+      workspaceSessionId: workspaceId,
+      workspaceRoot: fixture.repo,
+      actorKey: "actor:test",
+      candidateHead,
+      candidateTree,
+    });
+
+    const executionGen = buildExecutionGenerationBinding({
+      profileCatalogGeneration: "gen-1",
+      provider: "anthropic",
+      model: "claude-3-5-sonnet",
+      executionIdentity: "agent:writer-unresolved",
+      runtimeVersion: "1.0.0",
+      devspaceBuildId: "build-123",
+      devspaceSourceCommit: fixture.head,
+    });
+
+    const agentRecord: CoreMutationDurableAgentRecord = {
+      id: "agent-writer-unresolved",
+      workspaceId,
+      workspaceRoot: fixture.repo,
+      profileName: "deep-engineer",
+      provider: "anthropic",
+      model: "claude-3-5-sonnet",
+      status: "stopped",
+      terminalReason: "completed",
+      scopeState: "WITHIN_SCOPE",
+      executionContract: {
+        coreMutation: {
+          sessionId: session.id,
+          bindingHash: session.bindingHash,
+        },
+        dispatchIntent,
+      },
+      executionGeneration: executionGen,
+      createdAt: "2026-09-23T12:00:00.000Z",
+      updatedAt: "2026-09-23T12:05:00.000Z",
+    };
+
+    const unresolved = store.getById(session.id);
+    assert.equal(unresolved?.writerReconciliationState, "OUTCOME_UNKNOWN");
+    assert.deepEqual(unresolved?.writerDomains, ["PROCESS"]);
+
+    await assert.rejects(
+      () => store.produceDirectCandidateEvidence({
+        workspaceId,
+        sessionId: session.id,
+        candidateHead,
+        agentId: agentRecord.id,
+        agentReader: () => agentRecord,
+      }),
+      (err: unknown) => err instanceof CoreMutationSessionError && err.code === "DIRECT_EVIDENCE_RECONCILIATION_REQUIRED",
+    );
+  } finally {
+    store.close();
+    workspaceStore.close?.();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("produceDirectCandidateEvidence fails closed on mismatched or invalid invariants", async () => {
+  const fixture = makeRepo();
+  const stateDir = join(fixture.root, "state");
+  const workspaceId = "ws-direct-candidate-neg-test";
+  const workspaceStore = createWorkspaceStore(stateDir);
+  workspaceStore.createSession({ id: workspaceId, root: fixture.repo, mode: "checkout" });
+  const store = new CoreMutationSessionStore(stateDir);
+  try {
+    const dispatchIntent = {
+      taskId: "operation-test-1",
+      attemptId: "attempt-test-1",
+      roleIntent: "DEEP_ENGINEERING" as const,
+      objective: "test negative paths",
+      acceptanceCriteria: ["passes"],
+      claimCeiling: "CANDIDATE_READY" as const,
+      verificationRequired: true,
+      exclusiveOwnership: true,
+      writeScope: ["app.ts"],
+    };
+    const dispatchIntentHash = computeDispatchIntentHash(dispatchIntent);
+
+    const binding = makeBinding({
+      workspaceSessionId: workspaceId,
+      head: fixture.head,
+      tree: fixture.tree,
+      executionLane: "DIRECT_DELEGATED",
+      authorityHash: `sha256:${dispatchIntentHash}`,
+    });
+    const session = await store.open({
+      workspaceSessionId: workspaceId,
+      workspaceRoot: fixture.repo,
+      workspaceMode: "checkout",
+      managed: false,
+      actorKey: "actor:test",
+      binding,
+    });
+
+    writeFileSync(join(fixture.repo, "app.ts"), "export const value = 99;\n");
+    git(fixture.repo, "add", "app.ts");
+    git(fixture.repo, "commit", "-m", "candidate for neg test");
+    const candidateHead = git(fixture.repo, "rev-parse", "HEAD");
+    const candidateTree = git(fixture.repo, "rev-parse", "HEAD^{tree}");
+
+    await store.recordCandidate({
+      sessionId: session.id,
+      workspaceSessionId: workspaceId,
+      workspaceRoot: fixture.repo,
+      actorKey: "actor:test",
+      candidateHead,
+      candidateTree,
+    });
+
+    const executionGen = buildExecutionGenerationBinding({
+      profileCatalogGeneration: "gen-1",
+      provider: "anthropic",
+      model: "claude-3-5-sonnet",
+      executionIdentity: "agent:worker-1",
+      runtimeVersion: "1.0.0",
+      devspaceBuildId: "build-123",
+      devspaceSourceCommit: fixture.head,
+    });
+
+    const baseAgent: CoreMutationDurableAgentRecord = {
+      id: "agent-neg-1",
+      workspaceId,
+      workspaceRoot: fixture.repo,
+      profileName: "deep-engineer",
+      provider: "anthropic",
+      status: "stopped",
+      terminalReason: "completed",
+      scopeState: "WITHIN_SCOPE",
+      executionContract: {
+        coreMutation: {
+          sessionId: session.id,
+          bindingHash: session.bindingHash,
+        },
+        dispatchIntent,
+      },
+      executionGeneration: executionGen,
+      createdAt: "2026-09-23T12:00:00.000Z",
+      updatedAt: "2026-09-23T12:05:00.000Z",
+    };
+
+    // 1. Missing agent reader
+    await assert.rejects(
+      () => store.produceDirectCandidateEvidence({
+        workspaceId,
+        sessionId: session.id,
+        candidateHead,
+        agentId: baseAgent.id,
+      }),
+      (err: unknown) => err instanceof CoreMutationSessionError && err.code === "DURABLE_AGENT_READER_UNAVAILABLE",
+    );
+
+    // 2. Agent not found
+    await assert.rejects(
+      () => store.produceDirectCandidateEvidence({
+        workspaceId,
+        sessionId: session.id,
+        candidateHead,
+        agentId: "nonexistent-agent",
+        agentReader: () => undefined,
+      }),
+      (err: unknown) => err instanceof CoreMutationSessionError && err.code === "DURABLE_AGENT_NOT_FOUND",
+    );
+
+    // 3. Agent still running
+    await assert.rejects(
+      () => store.produceDirectCandidateEvidence({
+        workspaceId,
+        sessionId: session.id,
+        candidateHead,
+        agentId: baseAgent.id,
+        agentReader: () => ({ ...baseAgent, status: "running" }),
+      }),
+      (err: unknown) => err instanceof CoreMutationSessionError && err.code === "AGENT_EXECUTION_NOT_TERMINAL",
+    );
+
+    // 4. Agent failed
+    await assert.rejects(
+      () => store.produceDirectCandidateEvidence({
+        workspaceId,
+        sessionId: session.id,
+        candidateHead,
+        agentId: baseAgent.id,
+        agentReader: () => ({ ...baseAgent, terminalReason: "provider_error" }),
+      }),
+      (err: unknown) => err instanceof CoreMutationSessionError && err.code === "AGENT_EXECUTION_FAILED",
+    );
+
+    // 5. Agent scope escaped
+    await assert.rejects(
+      () => store.produceDirectCandidateEvidence({
+        workspaceId,
+        sessionId: session.id,
+        candidateHead,
+        agentId: baseAgent.id,
+        agentReader: () => ({ ...baseAgent, scopeState: "SCOPE_VIOLATION" }),
+      }),
+      (err: unknown) => err instanceof CoreMutationSessionError && err.code === "AGENT_SCOPE_ESCAPE",
+    );
+
+    // 6. Agent bound to different Core session
+    await assert.rejects(
+      () => store.produceDirectCandidateEvidence({
+        workspaceId,
+        sessionId: session.id,
+        candidateHead,
+        agentId: baseAgent.id,
+        agentReader: () => ({
+          ...baseAgent,
+          executionContract: {
+            ...baseAgent.executionContract as object,
+            coreMutation: { sessionId: "cms_other", bindingHash: session.bindingHash },
+          },
+        }),
+      }),
+      (err: unknown) => err instanceof CoreMutationSessionError && err.code === "AGENT_CORE_MUTATION_MISMATCH",
+    );
+
+    // 7. Dispatch intent task mismatch
+    await assert.rejects(
+      () => store.produceDirectCandidateEvidence({
+        workspaceId,
+        sessionId: session.id,
+        candidateHead,
+        agentId: baseAgent.id,
+        agentReader: () => ({
+          ...baseAgent,
+          executionContract: {
+            ...baseAgent.executionContract as object,
+            dispatchIntent: {
+              ...(baseAgent.executionContract as any).dispatchIntent,
+              taskId: "wrong-task",
+            },
+          },
+        }),
+      }),
+      (err: unknown) => err instanceof CoreMutationSessionError && err.code === "DISPATCH_INTENT_TASK_MISMATCH",
+    );
+
+    // 8. Dispatch intent claim ceiling mismatch
+    await assert.rejects(
+      () => store.produceDirectCandidateEvidence({
+        workspaceId,
+        sessionId: session.id,
+        candidateHead,
+        agentId: baseAgent.id,
+        agentReader: () => ({
+          ...baseAgent,
+          executionContract: {
+            ...baseAgent.executionContract as object,
+            dispatchIntent: {
+              ...(baseAgent.executionContract as any).dispatchIntent,
+              claimCeiling: "RESULT_RETURNED",
+            },
+          },
+        }),
+      }),
+      (err: unknown) => err instanceof CoreMutationSessionError && err.code === "DISPATCH_INTENT_CLAIM_CEILING_MISMATCH",
+    );
+
+    // 9. Candidate head not found
+    await assert.rejects(
+      () => store.produceDirectCandidateEvidence({
+        workspaceId,
+        sessionId: session.id,
+        candidateHead: "1".repeat(40),
+        agentId: baseAgent.id,
+        agentReader: () => baseAgent,
+      }),
+      (err: unknown) => err instanceof CoreMutationSessionError && err.code === "CANDIDATE_NOT_FOUND",
+    );
+
+    // 10. Core authority hash mismatch
+    const alteredIntent = { ...dispatchIntent, objective: "altered objective" };
+    await assert.rejects(
+      () => store.produceDirectCandidateEvidence({
+        workspaceId,
+        sessionId: session.id,
+        candidateHead,
+        agentId: baseAgent.id,
+        agentReader: () => ({
+          ...baseAgent,
+          executionContract: {
+            ...baseAgent.executionContract as object,
+            dispatchIntent: alteredIntent,
+          },
+        }),
+      }),
+      (err: unknown) => err instanceof CoreMutationSessionError && err.code === "CORE_AUTHORITY_HASH_MISMATCH",
+    );
+
+    // 11. Durable Candidate provenance cannot authorize a dirty physical worktree.
+    writeFileSync(join(fixture.repo, "app.ts"), "export const value = 1001;\n");
+    await assert.rejects(
+      () => store.produceDirectCandidateEvidence({
+        workspaceId,
+        sessionId: session.id,
+        candidateHead,
+        agentId: baseAgent.id,
+        agentReader: () => baseAgent,
+      }),
+      (err: unknown) => err instanceof CoreMutationSessionError && err.code === "DIRECT_EVIDENCE_PHYSICAL_WORKTREE_DIRTY",
+    );
+
+    // 12. Durable Candidate provenance cannot authorize evidence after physical HEAD moves.
+    git(fixture.repo, "checkout", "--", "app.ts");
+    writeFileSync(join(fixture.repo, "app.ts"), "export const value = 1002;\n");
+    git(fixture.repo, "add", "app.ts");
+    git(fixture.repo, "commit", "-m", "later physical head");
+    await assert.rejects(
+      () => store.produceDirectCandidateEvidence({
+        workspaceId,
+        sessionId: session.id,
+        candidateHead,
+        agentId: baseAgent.id,
+        agentReader: () => baseAgent,
+      }),
+      (err: unknown) => err instanceof CoreMutationSessionError && err.code === "DIRECT_EVIDENCE_PHYSICAL_CANDIDATE_MISMATCH",
     );
   } finally {
     store.close();

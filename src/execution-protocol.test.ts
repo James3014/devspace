@@ -24,7 +24,13 @@ import {
   renderDispatchIntentForWorker,
   toolProjectionManifestRef,
   validateResolvedNexusExecutionGrant,
+  DIRECT_CANDIDATE_EXECUTION_SCHEMA,
+  computeDirectCandidateEvidenceId,
+  computeDispatchIntentHash,
+  computeDirectCandidateEvidenceIntegrity,
+  validateDirectCandidateExecutionEvidence,
   type DispatchIntent,
+  type DirectCandidateExecutionEvidence,
   type ExecutionBinding,
   type NexusExecutionGrant,
 } from "./execution-protocol.js";
@@ -475,5 +481,227 @@ test("Wave B governed tool authority is grant-hash bound and projection validati
     (error: unknown) => error instanceof ExecutionProtocolError
       && error.code === "INVALID_NEXUS_EXECUTION_GRANT"
       && /exact governed tool-authority fields/.test(error.message),
+  );
+});
+
+function sampleDirectEvidence(): DirectCandidateExecutionEvidence {
+  const intent = controllerIntent();
+  const intentHash = computeDispatchIntentHash(intent);
+  const gen = buildExecutionGenerationBinding({
+    profileCatalogGeneration: "gen-test-1",
+    provider: "gemini",
+    model: "gemini-2.5-pro",
+    executionIdentity: "agt_12345678",
+    runtimeVersion: "1.0.7",
+    devspaceBuildId: "build-1",
+    devspaceSourceCommit: "cd907f81b46781d5a265c748374efeaab93d00cb",
+  });
+  const now = "2026-09-23T12:00:00.000Z";
+  const evidenceWithoutIntegrity: Omit<DirectCandidateExecutionEvidence, "integrity"> = {
+    schema: DIRECT_CANDIDATE_EXECUTION_SCHEMA,
+    evidence_id: computeDirectCandidateEvidenceId({
+      agentId: "agt_12345678",
+      attemptId: intent.attemptId,
+      commitSha: "a".repeat(40),
+      diffHash: `sha256:${"b".repeat(64)}`,
+    }),
+    created_at: now,
+    authority: {
+      authority_mode: "OWNER_DIRECT",
+      execution_lane: "DIRECT_DELEGATED",
+      task_id: intent.taskId,
+      attempt_id: intent.attemptId,
+      dispatch_intent: intent,
+      dispatch_intent_hash: intentHash,
+      authority_ref: "James3014/devspace#231",
+      core_authority_hash: `sha256:${intentHash}`,
+    },
+    execution: {
+      protocol: EXECUTION_PROTOCOL_VERSION,
+      execution_binding_hash: gen.executionBindingHash,
+      agent_id: "agt_12345678",
+      profile: "gemini-pro",
+      provider: "gemini",
+      model: "gemini-2.5-pro",
+      effort: "high",
+      provider_session_id: "sess_123456",
+      execution_generation: gen,
+      workspace_id: "ws_test_1",
+      workspace_root: "/test/workspace",
+      state: "completed",
+      terminal_reason: "completed",
+      retry_safe: false,
+      reconciliation_required: false,
+      scope_state: "WITHIN_SCOPE",
+      started_at: "2026-09-23T11:50:00.000Z",
+      completed_at: now,
+    },
+    core_binding: {
+      session_id: `cms_${"c".repeat(32)}`,
+      binding: {
+        schema: "nexus.repository_mutation_binding.v1",
+        binding_id: "bind-1",
+      },
+      binding_hash: `sha256:${"d".repeat(64)}`,
+      acceptance_contract_hash: `sha256:${"e".repeat(64)}`,
+    },
+    candidate: {
+      present: true,
+      required: true,
+      source_commit: "1".repeat(40),
+      source_tree: "2".repeat(40),
+      commit_sha: "a".repeat(40),
+      tree_sha: "3".repeat(40),
+      changed_paths: ["src/execution-protocol.ts"],
+      deleted_paths: [],
+      diff_hash: `sha256:${"b".repeat(64)}`,
+      change_manifest: {
+        source_tree: `git-tree:${"2".repeat(40)}`,
+        target_tree: `git-tree:${"3".repeat(40)}`,
+        entries: [{
+          path: "src/execution-protocol.ts",
+          change_type: "MODIFY",
+          before_oid: "4".repeat(40),
+          after_oid: "5".repeat(40),
+          before_mode: "100644",
+          after_mode: "100644",
+        }],
+      },
+      provenance_created_at: now,
+    },
+    claim: {
+      status: "CANDIDATE_CAPTURED_PENDING_CORE_VERIFICATION_AND_ACCEPTANCE",
+      claim_ceiling: "CANDIDATE_READY",
+      core_verified: false,
+      certified: false,
+      accepted: false,
+      approved: false,
+      merged: false,
+      released: false,
+      deployed: false,
+      public_claim_allowed: false,
+    },
+  };
+  return {
+    ...evidenceWithoutIntegrity,
+    integrity: {
+      sha256: computeDirectCandidateEvidenceIntegrity(evidenceWithoutIntegrity),
+    },
+  };
+}
+
+test("DirectCandidateExecutionEvidence - valid exact direct evidence, deterministic identity, and integrity validation", () => {
+  const evidence = sampleDirectEvidence();
+  const validated = validateDirectCandidateExecutionEvidence(evidence);
+  assert.equal(validated.schema, DIRECT_CANDIDATE_EXECUTION_SCHEMA);
+  assert.equal(validated.evidence_id, evidence.evidence_id);
+  assert.equal(validated.integrity.sha256, evidence.integrity.sha256);
+
+  // Determinism
+  const second = sampleDirectEvidence();
+  assert.equal(evidence.evidence_id, second.evidence_id);
+  assert.equal(evidence.integrity.sha256, second.integrity.sha256);
+});
+
+test("DirectCandidateExecutionEvidence - tampered integrity rejection", () => {
+  const evidence = sampleDirectEvidence();
+  const tampered = {
+    ...evidence,
+    integrity: { sha256: "0".repeat(64) },
+  };
+  assert.throws(
+    () => validateDirectCandidateExecutionEvidence(tampered),
+    (err: unknown) => err instanceof ExecutionProtocolError && err.code === "INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE" && /integrity\.sha256 mismatch/.test(err.message),
+  );
+});
+
+test("DirectCandidateExecutionEvidence - wrong schema and claim ceiling rejection", () => {
+  const evidence = sampleDirectEvidence();
+  assert.throws(
+    () => validateDirectCandidateExecutionEvidence({ ...evidence, schema: "wrong.schema.v1" }),
+    (err: unknown) => err instanceof ExecutionProtocolError && err.code === "INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE" && /Invalid schema/.test(err.message),
+  );
+
+  const wrongCeiling = sampleDirectEvidence();
+  wrongCeiling.claim.claim_ceiling = "IMPLEMENTED" as any;
+  wrongCeiling.integrity.sha256 = computeDirectCandidateEvidenceIntegrity(wrongCeiling);
+  assert.throws(
+    () => validateDirectCandidateExecutionEvidence(wrongCeiling),
+    (err: unknown) => err instanceof ExecutionProtocolError && err.code === "INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE" && /claim\.claim_ceiling must be CANDIDATE_READY/.test(err.message),
+  );
+});
+
+test("DirectCandidateExecutionEvidence - invalid DispatchIntent and task/attempt mismatch rejection", () => {
+  const evidence = sampleDirectEvidence();
+  const badIntent = sampleDirectEvidence();
+  (badIntent.authority.dispatch_intent as any).claimCeiling = "RESULT_RETURNED";
+  badIntent.authority.dispatch_intent_hash = computeDispatchIntentHash(badIntent.authority.dispatch_intent);
+  badIntent.authority.core_authority_hash = `sha256:${badIntent.authority.dispatch_intent_hash}`;
+  badIntent.integrity.sha256 = computeDirectCandidateEvidenceIntegrity(badIntent);
+  assert.throws(
+    () => validateDirectCandidateExecutionEvidence(badIntent),
+    (err: unknown) => err instanceof ExecutionProtocolError && err.code === "INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE" && /claimCeiling must be CANDIDATE_READY/.test(err.message),
+  );
+
+  const mismatchAttempt = sampleDirectEvidence();
+  mismatchAttempt.authority.attempt_id = "attempt-mismatch";
+  mismatchAttempt.integrity.sha256 = computeDirectCandidateEvidenceIntegrity(mismatchAttempt);
+  assert.throws(
+    () => validateDirectCandidateExecutionEvidence(mismatchAttempt),
+    (err: unknown) => err instanceof ExecutionProtocolError && err.code === "INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE" && /authority task_id\/attempt_id does not match dispatch_intent/.test(err.message),
+  );
+});
+
+test("DirectCandidateExecutionEvidence - malformed execution generation rejection", () => {
+  const evidence = sampleDirectEvidence();
+  const badGen = sampleDirectEvidence();
+  (badGen.execution.execution_generation as any).provider = "tampered-provider";
+  badGen.integrity.sha256 = computeDirectCandidateEvidenceIntegrity(badGen);
+  assert.throws(
+    () => validateDirectCandidateExecutionEvidence(badGen),
+    (err: unknown) => err instanceof ExecutionProtocolError && err.code === "INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE" && /execution_generation\.executionBindingHash mismatch/.test(err.message),
+  );
+});
+
+test("DirectCandidateExecutionEvidence - illegal positive authority flags rejection", () => {
+  const forbiddenFlags: Array<keyof DirectCandidateExecutionEvidence["claim"]> = [
+    "core_verified",
+    "certified",
+    "accepted",
+    "approved",
+    "merged",
+    "released",
+    "deployed",
+    "public_claim_allowed",
+  ];
+
+  for (const flag of forbiddenFlags) {
+    const evidence = sampleDirectEvidence();
+    (evidence.claim as any)[flag] = true;
+    evidence.integrity.sha256 = computeDirectCandidateEvidenceIntegrity(evidence);
+    assert.throws(
+      () => validateDirectCandidateExecutionEvidence(evidence),
+      (err: unknown) => err instanceof ExecutionProtocolError && err.code === "INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE" && err.message.includes(`claim.${flag} must be false`),
+      `Expected claim.${flag} to be rejected when true`,
+    );
+  }
+});
+
+test("DirectCandidateExecutionEvidence - forged or missing Candidate subject rejection", () => {
+  const evidence = sampleDirectEvidence();
+  const missingSubject = sampleDirectEvidence();
+  (missingSubject.candidate as any).present = false;
+  missingSubject.integrity.sha256 = computeDirectCandidateEvidenceIntegrity(missingSubject);
+  assert.throws(
+    () => validateDirectCandidateExecutionEvidence(missingSubject),
+    (err: unknown) => err instanceof ExecutionProtocolError && err.code === "INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE" && /candidate present and required must be true/.test(err.message),
+  );
+
+  const dateMismatch = sampleDirectEvidence();
+  dateMismatch.candidate.provenance_created_at = "2026-09-23T11:00:00.000Z";
+  dateMismatch.integrity.sha256 = computeDirectCandidateEvidenceIntegrity(dateMismatch);
+  assert.throws(
+    () => validateDirectCandidateExecutionEvidence(dateMismatch),
+    (err: unknown) => err instanceof ExecutionProtocolError && err.code === "INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE" && /created_at must equal candidate\.provenance_created_at/.test(err.message),
   );
 });
