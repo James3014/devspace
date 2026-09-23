@@ -12,6 +12,7 @@ import {
   cleanPorcelainPath,
   parsePorcelainChangedPaths,
   buildDeterministicHerdrAgentName,
+  normalizeHerdrSocketPath,
   type HerdrExternalHandle,
   type HerdrSocketRequest,
   type HerdrSocketResponse,
@@ -184,6 +185,9 @@ test("HerdrThinGateway reconciliation enforces N5, N5-COMMIT, N6, N6-COMMIT, N7,
 
     // Mock live gateway to test terminal states
     const liveGateway = new HerdrThinGateway(undefined, undefined, store);
+    (liveGateway as any).sendRequest = async () => ({
+      result: { type: "pong" },
+    });
     (liveGateway as any).getPane = async () => ({
       pane_id: handle.herdrPaneId,
       workspace_id: handle.herdrWorkspaceId,
@@ -837,12 +841,22 @@ class SpyHerdrGateway extends HerdrThinGateway {
   public simulatedPanes: Array<HerdrPaneInfo> = [];
   public simulatedAgents: Map<string, HerdrAgentInfo> = new Map();
   public simulatedAgentStatus: HerdrAgentInfo | undefined;
+  public socketCalls: Map<string, number> = new Map();
+  public lastSocketPath?: string;
+  public receivedSocketRequests: Array<{ method: string; socketPath?: string }> = [];
+  public readPaneCalls = 0;
+  public lastReadPaneSocketPath?: string;
 
   override async sendRequest<T = unknown>(
     req: HerdrSocketRequest,
     timeoutMs: number = 10_000,
     socketPath?: string,
   ): Promise<HerdrSocketResponse<T>> {
+    const effectiveSocket = socketPath || (this as any).socketPath;
+    this.lastSocketPath = effectiveSocket;
+    this.socketCalls.set(effectiveSocket, (this.socketCalls.get(effectiveSocket) || 0) + 1);
+    this.receivedSocketRequests.push({ method: req.method, socketPath: effectiveSocket });
+
     if (req.method === "workspace.create") {
       this.workspaceCreateCalls++;
       if (this.failWorkspaceCreate) {
@@ -1014,10 +1028,16 @@ class SpyHerdrGateway extends HerdrThinGateway {
       };
     }
 
+    if (req.method === "ping") {
+      return { id: req.id, result: { type: "pong" } as unknown as T };
+    }
+
     return { id: req.id, result: {} as unknown as T };
   }
 
-  override async readPane(paneId: string, lines: number = 50): Promise<string> {
+  override async readPane(paneId: string, lines: number = 50, socketPath?: string): Promise<string> {
+    this.readPaneCalls++;
+    this.lastReadPaneSocketPath = socketPath;
     return "Ready prompt\n";
   }
 }
@@ -1941,6 +1961,7 @@ test("HerdrThinGateway agent reconciliation enforces exact workspace, pane, and 
         canonicalWorktreePath: testRepo,
         gitHeadBefore: gitHead,
         agentKind: "opencode",
+        herdrSocketPath: "/tmp/test.sock",
         promptNonce: `NONCE-${attemptKey}`,
         workspaceId: "ws-rec-ag",
       });
@@ -4282,6 +4303,7 @@ test("HerdrThinGateway fenced launch reconciliation strict identity (Blocker F4,
         canonicalWorktreePath: repoPath,
         gitHeadBefore: headSha,
         agentKind: "opencode",
+        herdrSocketPath: "/tmp/test.sock",
         promptNonce,
         workspaceId: "ws-f4",
         plannedAgentName,
@@ -4609,6 +4631,350 @@ test("HerdrThinGateway first-launch final-bind continuity window (Blocker F6, F6
     assert.ok(validHandle);
     assert.ok(store.getById(agent5.id)!.externalRuntimeBinding?.handle);
     assert.ok(reg5.getHandle(attempt5));
+  } finally {
+    store.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repoPath, { recursive: true, force: true });
+  }
+});
+
+test("HerdrThinGateway authority-bound transport endpoint and strict replay equivalence (G1 to G5, Section 24)", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-transport-g-"));
+  const repoPath = mkdtempSync(join(tmpdir(), "devspace-transport-repo-"));
+  const store = new LocalAgentStore(stateDir);
+
+  try {
+    execFileSync("git", ["init", repoPath], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoPath, "config", "user.name", "Test User"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoPath, "config", "user.email", "test@example.com"], { stdio: "ignore" });
+    writeFileSync(join(repoPath, "init.txt"), "hello");
+    execFileSync("git", ["-C", repoPath, "add", "init.txt"], { stdio: "ignore" });
+    execFileSync("git", ["-C", repoPath, "commit", "-m", "init"], { stdio: "ignore" });
+    const headSha = execFileSync("git", ["-C", repoPath, "rev-parse", "HEAD"], { encoding: "utf-8" }).trim();
+
+    const socketA = normalizeHerdrSocketPath("/tmp/herdr-endpoint-a.sock");
+    const socketB = normalizeHerdrSocketPath("/tmp/herdr-endpoint-b.sock");
+    const socketC = normalizeHerdrSocketPath("/tmp/herdr-endpoint-c.sock");
+    const defaultGatewaySocket = normalizeHerdrSocketPath("/tmp/herdr-default-gateway.sock");
+
+    // Helper to create agent and bound handle
+    function createBoundAgent(attemptKey: string, socketPath: string, extra: {
+      workspaceId?: string;
+      requestedModel?: string;
+      requestedEffort?: string;
+    } = {}) {
+      const intent = {
+        taskId: `task-${attemptKey}`,
+        attemptId: attemptKey,
+        objective: "Test G1-G5",
+        roleIntent: "DEEP_ENGINEERING" as const,
+        claimCeiling: "CANDIDATE_READY" as const,
+        context: ["test"],
+        readScope: ["src"],
+        writeScope: ["src"],
+        exclusiveOwnership: true,
+        forbiddenChanges: [],
+        acceptanceCriteria: ["pass"],
+        verificationRequired: true,
+        expectedArtifacts: [],
+      };
+      const hash = hashDispatchIntent(intent);
+      const wsId = extra.workspaceId ?? "ws-g";
+      const agent = store.create({
+        workspaceId: wsId,
+        workspaceRoot: repoPath,
+        profileName: "worker",
+        provider: "opencode",
+        startReplay: { key: attemptKey, requestHash: "hash-g" },
+        executionContract: { writePaths: ["src"], dispatchIntent: intent },
+      });
+
+      const handle: HerdrExternalHandle = {
+        schemaVersion: 1,
+        runtimeKind: HERDR_RUNTIME_KIND,
+        agentId: agent.id,
+        herdrSocketPath: socketPath,
+        herdrWorkspaceId: `ws-${attemptKey}`,
+        herdrPaneId: `pane-${attemptKey}`,
+        herdrAgentIdentity: `agent-${attemptKey}`,
+        herdrAgentKind: "opencode",
+        ...(extra.requestedModel ? { requestedModel: extra.requestedModel } : {}),
+        ...(extra.requestedEffort ? { requestedEffort: extra.requestedEffort } : {}),
+        promptNonce: `NONCE-${attemptKey}`,
+        canonicalWorktreePath: repoPath,
+        workspaceId: wsId,
+        gitHeadBefore: headSha,
+        attemptKey,
+        dispatchIntentHash: hash,
+        launchTimestamp: new Date().toISOString(),
+        enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+      };
+
+      store.bindExternalRuntimeBindingCAS({
+        agentId: agent.id,
+        expectedAttemptKey: attemptKey,
+        expectedDispatchIntentHash: hash,
+        binding: {
+          runtimeKind: HERDR_RUNTIME_KIND,
+          launch: {
+            state: "AGENT_OBSERVED",
+            launchRequestId: `HERDR-LAUNCH:${attemptKey}:${hash.slice(0, 16)}`,
+            attemptKey,
+            dispatchIntentHash: hash,
+            canonicalWorktreePath: repoPath,
+            gitHeadBefore: headSha,
+            agentKind: "opencode",
+            herdrSocketPath: socketPath,
+            ...(extra.requestedModel ? { requestedModel: extra.requestedModel } : {}),
+            ...(extra.requestedEffort ? { requestedEffort: extra.requestedEffort } : {}),
+            promptNonce: `NONCE-${attemptKey}`,
+            workspaceId: wsId,
+            herdrWorkspaceId: `ws-${attemptKey}`,
+            herdrPaneId: `pane-${attemptKey}`,
+            herdrAgentIdentity: `agent-${attemptKey}`,
+            fencedAt: new Date().toISOString(),
+          },
+          handle: handle as unknown as Record<string, unknown>,
+        },
+      });
+
+      return { agent, handle, hash };
+    }
+
+    // 1. TRANSPORT-CROSS-SOCKET-PROMPT: promptExternalAgent directs all socket requests to handle.herdrSocketPath
+    {
+      const attempt1 = `attempt-cross-prompt-${Date.now()}`;
+      const { agent: agent1, handle: handle1 } = createBoundAgent(attempt1, socketA);
+      const registry1 = new HerdrGatewayRegistry();
+      const spy1 = new SpyHerdrGateway(defaultGatewaySocket, registry1, store);
+
+      // Setup simulated agent in spy
+      spy1.simulatedPanes = [
+        { pane_id: handle1.herdrPaneId, workspace_id: handle1.herdrWorkspaceId, cwd: repoPath, foreground_cwd: repoPath },
+      ];
+      spy1.simulatedAgents.set(handle1.herdrAgentIdentity, {
+        name: handle1.herdrAgentIdentity,
+        agent: "opencode",
+        workspace_id: handle1.herdrWorkspaceId,
+        pane_id: handle1.herdrPaneId,
+        cwd: repoPath,
+        foreground_cwd: repoPath,
+        agent_status: "idle",
+        interactive_ready: true,
+      });
+
+      const promptRes = await spy1.promptExternalAgent(handle1, "Execute task");
+      assert.equal(promptRes.status, "done");
+      assert.equal(spy1.socketCalls.get(defaultGatewaySocket) ?? 0, 0, "Zero calls to default gateway socket permitted");
+      assert.ok((spy1.socketCalls.get(socketA) ?? 0) > 0, "Calls must target handle's durable socketA");
+      assert.equal(spy1.lastReadPaneSocketPath, socketA, "readPane must target handle's durable socketA");
+    }
+
+    // 2. TRANSPORT-CROSS-SOCKET-STOP: stopExternalAgent directs close and live checks to handle.herdrSocketPath
+    {
+      const attempt2 = `attempt-cross-stop-${Date.now()}`;
+      const { agent: agent2, handle: handle2 } = createBoundAgent(attempt2, socketB);
+      const registry2 = new HerdrGatewayRegistry();
+      registry2.registerHandle(handle2);
+      const spy2 = new SpyHerdrGateway(defaultGatewaySocket, registry2, store);
+
+      spy2.simulatedPanes = [
+        { pane_id: handle2.herdrPaneId, workspace_id: handle2.herdrWorkspaceId, cwd: repoPath, foreground_cwd: repoPath },
+      ];
+      spy2.simulatedAgents.set(handle2.herdrAgentIdentity, {
+        name: handle2.herdrAgentIdentity,
+        agent: "opencode",
+        workspace_id: handle2.herdrWorkspaceId,
+        pane_id: handle2.herdrPaneId,
+        cwd: repoPath,
+        foreground_cwd: repoPath,
+        agent_status: "idle",
+        interactive_ready: true,
+      });
+
+      await spy2.stopExternalAgent(handle2);
+      assert.equal(spy2.socketCalls.get(defaultGatewaySocket) ?? 0, 0, "Zero calls to default gateway socket permitted");
+      assert.ok((spy2.socketCalls.get(socketB) ?? 0) > 0, "Calls must target handle's durable socketB");
+    }
+
+    // 3. TRANSPORT-CROSS-SOCKET-RECONCILE: reconcileExternalAgent directs ping and live checks to handle.herdrSocketPath
+    {
+      const attempt3 = `attempt-cross-rec-${Date.now()}`;
+      const { agent: agent3, handle: handle3 } = createBoundAgent(attempt3, socketC);
+      const registry3 = new HerdrGatewayRegistry();
+      const spy3 = new SpyHerdrGateway(defaultGatewaySocket, registry3, store);
+
+      spy3.simulatedPanes = [
+        { pane_id: handle3.herdrPaneId, workspace_id: handle3.herdrWorkspaceId, cwd: repoPath, foreground_cwd: repoPath },
+      ];
+      spy3.simulatedAgents.set(handle3.herdrAgentIdentity, {
+        name: handle3.herdrAgentIdentity,
+        agent: "opencode",
+        workspace_id: handle3.herdrWorkspaceId,
+        pane_id: handle3.herdrPaneId,
+        cwd: repoPath,
+        foreground_cwd: repoPath,
+        agent_status: "done",
+        interactive_ready: true,
+      });
+
+      const recRes = await spy3.reconcileExternalAgent(handle3, ["src"], false);
+      assert.equal(recRes.settled, true);
+      assert.equal(spy3.socketCalls.get(defaultGatewaySocket) ?? 0, 0, "Zero calls to default gateway socket permitted");
+      assert.ok((spy3.socketCalls.get(socketC) ?? 0) > 0, "Calls must target handle's durable socketC");
+    }
+
+    // 4. LAUNCH-REPLAY-WRONG-SOCKET: replay with mismatched socket fails closed
+    {
+      const attempt4 = `attempt-replay-sock-${Date.now()}`;
+      const { agent: agent4, hash: hash4 } = createBoundAgent(attempt4, socketA);
+      const spy4 = new SpyHerdrGateway(defaultGatewaySocket, new HerdrGatewayRegistry(), store);
+
+      await assert.rejects(
+        spy4.startExternalAgent({
+          agentId: agent4.id,
+          store,
+          attemptKey: attempt4,
+          dispatchIntentHash: hash4,
+          agentKind: "opencode",
+          canonicalWorktreePath: repoPath,
+          workspaceId: "ws-g",
+          socketPath: socketB, // Mismatch!
+        }),
+        /\[ATTEMPT_REPLAY_CONFLICT\] Replay socketPath/,
+      );
+    }
+
+    // 5. LAUNCH-REPLAY-WRONG-LOCAL-WORKSPACE: replay with mismatched workspaceId fails closed
+    {
+      const attempt5 = `attempt-replay-ws-${Date.now()}`;
+      const { agent: agent5, hash: hash5 } = createBoundAgent(attempt5, socketA, { workspaceId: "ws-expected" });
+      const spy5 = new SpyHerdrGateway(defaultGatewaySocket, new HerdrGatewayRegistry(), store);
+
+      await assert.rejects(
+        spy5.startExternalAgent({
+          agentId: agent5.id,
+          store,
+          attemptKey: attempt5,
+          dispatchIntentHash: hash5,
+          agentKind: "opencode",
+          canonicalWorktreePath: repoPath,
+          workspaceId: "ws-unexpected", // Mismatch!
+          socketPath: socketA,
+        }),
+        /\[ATTEMPT_REPLAY_CONFLICT\] Replay workspaceId/,
+      );
+    }
+
+    // 6. LAUNCH-REPLAY-WRONG-MODEL: replay with mismatched requestedModel fails closed
+    {
+      const attempt6 = `attempt-replay-model-${Date.now()}`;
+      const { agent: agent6, hash: hash6 } = createBoundAgent(attempt6, socketA, { requestedModel: "model-alpha" });
+      const spy6 = new SpyHerdrGateway(defaultGatewaySocket, new HerdrGatewayRegistry(), store);
+
+      await assert.rejects(
+        spy6.startExternalAgent({
+          agentId: agent6.id,
+          store,
+          attemptKey: attempt6,
+          dispatchIntentHash: hash6,
+          agentKind: "opencode",
+          canonicalWorktreePath: repoPath,
+          workspaceId: "ws-g",
+          socketPath: socketA,
+          requestedModel: "model-beta", // Mismatch!
+        }),
+        /\[ATTEMPT_REPLAY_CONFLICT\] Replay requestedModel/,
+      );
+    }
+
+    // 7. LAUNCH-REPLAY-WRONG-EFFORT: replay with mismatched requestedEffort fails closed
+    {
+      const attempt7 = `attempt-replay-effort-${Date.now()}`;
+      const { agent: agent7, hash: hash7 } = createBoundAgent(attempt7, socketA, { requestedEffort: "low" });
+      const spy7 = new SpyHerdrGateway(defaultGatewaySocket, new HerdrGatewayRegistry(), store);
+
+      await assert.rejects(
+        spy7.startExternalAgent({
+          agentId: agent7.id,
+          store,
+          attemptKey: attempt7,
+          dispatchIntentHash: hash7,
+          agentKind: "opencode",
+          canonicalWorktreePath: repoPath,
+          workspaceId: "ws-g",
+          socketPath: socketA,
+          requestedEffort: "high", // Mismatch!
+        }),
+        /\[ATTEMPT_REPLAY_CONFLICT\] Replay requestedEffort/,
+      );
+    }
+
+    // 8. LEGACY-FENCE-NO-ENDPOINT: stored launch fence without herdrSocketPath fails closed with 0 external calls
+    {
+      const attempt8 = `attempt-legacy-fence-${Date.now()}`;
+      const intent8 = {
+        taskId: `task-${attempt8}`,
+        attemptId: attempt8,
+        objective: "Test legacy fence",
+        roleIntent: "DEEP_ENGINEERING" as const,
+        claimCeiling: "CANDIDATE_READY" as const,
+        context: ["test"],
+        readScope: ["src"],
+        writeScope: ["src"],
+        exclusiveOwnership: true,
+        forbiddenChanges: [],
+        acceptanceCriteria: ["pass"],
+        verificationRequired: true,
+        expectedArtifacts: [],
+      };
+      const hash8 = hashDispatchIntent(intent8);
+      const agent8 = store.create({
+        workspaceId: "ws-g",
+        workspaceRoot: repoPath,
+        profileName: "worker",
+        provider: "opencode",
+        startReplay: { key: attempt8, requestHash: "hash-8" },
+        executionContract: { writePaths: ["src"], dispatchIntent: intent8 },
+      });
+
+      // Directly seed a legacy launch fence without herdrSocketPath
+      store.fenceExternalRuntimeLaunchCAS({
+        agentId: agent8.id,
+        attemptKey: attempt8,
+        dispatchIntentHash: hash8,
+        canonicalWorktreePath: repoPath,
+        gitHeadBefore: headSha,
+        agentKind: "opencode",
+        promptNonce: `NONCE-${attempt8}`,
+        workspaceId: "ws-g",
+      });
+
+      const spy8 = new SpyHerdrGateway(defaultGatewaySocket, new HerdrGatewayRegistry(), store);
+      await assert.rejects(
+        spy8.startExternalAgent({
+          agentId: agent8.id,
+          store,
+          attemptKey: attempt8,
+          dispatchIntentHash: hash8,
+          agentKind: "opencode",
+          canonicalWorktreePath: repoPath,
+          workspaceId: "ws-g",
+        }),
+        /\[OUTCOME_UNKNOWN\] Stored launch fence for attemptKey '.*' lacks durable herdrSocketPath endpoint; cannot infer gateway default\. Zero external calls permitted\./,
+      );
+      assert.equal(spy8.workspaceCreateCalls, 0, "Zero external calls permitted on legacy fence without endpoint");
+      assert.equal(spy8.agentStartCalls, 0, "Zero external calls permitted on legacy fence without endpoint");
+    }
+
+    // 9. EXPLICIT-SOCKET-READBACK-FAILURE: readPane on explicit socket throws without CLI fallback
+    {
+      const realGateway = new HerdrThinGateway(defaultGatewaySocket, new HerdrGatewayRegistry(), store);
+      await assert.rejects(
+        realGateway.readPane("pane-nonexistent", 60, "/tmp/nonexistent-readback-probe.sock"),
+        /\[EXPLICIT_SOCKET_READBACK_FAILURE\] Socket pane\.read on explicit socket '\/tmp\/nonexistent-readback-probe\.sock' failed.*CLI fallback forbidden\./,
+      );
+    }
   } finally {
     store.close();
     rmSync(stateDir, { recursive: true, force: true });

@@ -1500,6 +1500,77 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
     promptNonce: "NONCE-LAUNCH-1",
   }).applied, true, "L-IDEMPOTENT-LAUNCH must succeed");
 
+  // L-MISMATCH-SOCKET: different socket path fails closed
+  assert.equal(store.fenceExternalRuntimeLaunchCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    dispatchIntentHash: launchIntentHash,
+    canonicalWorktreePath: join(root, "launch_project"),
+    gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+    agentKind: "opencode",
+    promptNonce: "NONCE-LAUNCH-1",
+    herdrSocketPath: "/different/herdr.sock",
+  }).applied, false, "L-MISMATCH-SOCKET must fail");
+
+  // L-MISMATCH-WORKSPACE: different workspaceId fails closed
+  assert.equal(store.fenceExternalRuntimeLaunchCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    dispatchIntentHash: launchIntentHash,
+    canonicalWorktreePath: join(root, "launch_project"),
+    gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+    agentKind: "opencode",
+    promptNonce: "NONCE-LAUNCH-1",
+    workspaceId: "different-ws",
+  }).applied, false, "L-MISMATCH-WORKSPACE must fail");
+
+  // L-MISMATCH-MODEL: different requestedModel fails closed
+  assert.equal(store.fenceExternalRuntimeLaunchCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    dispatchIntentHash: launchIntentHash,
+    canonicalWorktreePath: join(root, "launch_project"),
+    gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+    agentKind: "opencode",
+    promptNonce: "NONCE-LAUNCH-1",
+    requestedModel: "different-model",
+  }).applied, false, "L-MISMATCH-MODEL must fail");
+
+  // L-MISMATCH-EFFORT: different requestedEffort fails closed
+  assert.equal(store.fenceExternalRuntimeLaunchCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    dispatchIntentHash: launchIntentHash,
+    canonicalWorktreePath: join(root, "launch_project"),
+    gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+    agentKind: "opencode",
+    promptNonce: "NONCE-LAUNCH-1",
+    requestedEffort: "different-effort",
+  }).applied, false, "L-MISMATCH-EFFORT must fail");
+
+  // L-MISMATCH-NONCE: different promptNonce fails closed
+  assert.equal(store.fenceExternalRuntimeLaunchCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    dispatchIntentHash: launchIntentHash,
+    canonicalWorktreePath: join(root, "launch_project"),
+    gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+    agentKind: "opencode",
+    promptNonce: "DIFFERENT-NONCE",
+  }).applied, false, "L-MISMATCH-NONCE must fail");
+
+  // L-MISMATCH-NAME: different plannedAgentName fails closed
+  assert.equal(store.fenceExternalRuntimeLaunchCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    dispatchIntentHash: launchIntentHash,
+    canonicalWorktreePath: join(root, "launch_project"),
+    gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+    agentKind: "opencode",
+    promptNonce: "NONCE-LAUNCH-1",
+    plannedAgentName: "different-name",
+  }).applied, false, "L-MISMATCH-NAME must fail");
+
   // WORKSPACE-CAS-WRONG-CWD: wrong observedCwd fails closed
   const wrongCwdRes = store.recordExternalRuntimeWorkspaceObservedCAS({
     agentId: launchAgent.id,

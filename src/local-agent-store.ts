@@ -98,6 +98,7 @@ export interface ExternalRuntimeLaunchFence {
   canonicalWorktreePath: string;
   gitHeadBefore: string;
   agentKind: string;
+  herdrSocketPath?: string;
   requestedModel?: string;
   requestedEffort?: string;
   promptNonce: string;
@@ -125,6 +126,7 @@ export interface FenceExternalRuntimeLaunchInput {
   canonicalWorktreePath: string;
   gitHeadBefore: string;
   agentKind: string;
+  herdrSocketPath?: string;
   requestedModel?: string;
   requestedEffort?: string;
   promptNonce: string;
@@ -1145,12 +1147,25 @@ export class LocalAgentStore {
         }
         const existingLaunch = current.externalRuntimeBinding.launch;
         if (existingLaunch) {
+          const existingSocket = existingLaunch.herdrSocketPath
+            ? canonicalizePath(existingLaunch.herdrSocketPath)
+            : undefined;
+          const inputSocket = input.herdrSocketPath
+            ? canonicalizePath(input.herdrSocketPath)
+            : undefined;
+
           if (
             existingLaunch.attemptKey === input.attemptKey &&
             existingLaunch.dispatchIntentHash === input.dispatchIntentHash &&
             canonicalizePath(existingLaunch.canonicalWorktreePath) === canonicalizePath(input.canonicalWorktreePath) &&
+            existingLaunch.gitHeadBefore === input.gitHeadBefore &&
             existingLaunch.agentKind === input.agentKind &&
-            existingLaunch.gitHeadBefore === input.gitHeadBefore
+            existingSocket === inputSocket &&
+            (existingLaunch.workspaceId ?? undefined) === (input.workspaceId ?? undefined) &&
+            (existingLaunch.requestedModel ?? undefined) === (input.requestedModel ?? undefined) &&
+            (existingLaunch.requestedEffort ?? undefined) === (input.requestedEffort ?? undefined) &&
+            existingLaunch.promptNonce === input.promptNonce &&
+            (existingLaunch.plannedAgentName ?? undefined) === (input.plannedAgentName ?? undefined)
           ) {
             return { applied: true, previous: current, current };
           }
@@ -1168,6 +1183,7 @@ export class LocalAgentStore {
         canonicalWorktreePath: canonicalizePath(input.canonicalWorktreePath),
         gitHeadBefore: input.gitHeadBefore,
         agentKind: input.agentKind,
+        ...(input.herdrSocketPath ? { herdrSocketPath: input.herdrSocketPath } : {}),
         ...(input.requestedModel ? { requestedModel: input.requestedModel } : {}),
         ...(input.requestedEffort ? { requestedEffort: input.requestedEffort } : {}),
         promptNonce: input.promptNonce,
@@ -2145,6 +2161,7 @@ function readExternalRuntimeLaunchFence(value: unknown): ExternalRuntimeLaunchFe
       canonicalWorktreePath: record.canonicalWorktreePath,
       gitHeadBefore: record.gitHeadBefore,
       agentKind: record.agentKind,
+      ...(typeof record.herdrSocketPath === "string" ? { herdrSocketPath: record.herdrSocketPath } : {}),
       ...(typeof record.requestedModel === "string" ? { requestedModel: record.requestedModel } : {}),
       ...(typeof record.requestedEffort === "string" ? { requestedEffort: record.requestedEffort } : {}),
       promptNonce: record.promptNonce,

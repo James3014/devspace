@@ -46,6 +46,11 @@ export interface LiveHandleIdentityExpectations {
   canonicalWorktreePath: string;
   herdrAgentIdentity: string;
   herdrAgentKind?: HerdrAgentKind;
+  herdrSocketPath?: string;
+}
+
+export function normalizeHerdrSocketPath(socketPath: string): string {
+  return canonicalizePath(socketPath);
 }
 
 export interface LiveHandleObservationResult {
@@ -124,7 +129,7 @@ export function normalizeHerdrHandleAuthority(handle: HerdrExternalHandle): Norm
     schemaVersion: handle.schemaVersion,
     runtimeKind: handle.runtimeKind,
     agentId: handle.agentId ?? "",
-    herdrSocketPath: handle.herdrSocketPath,
+    herdrSocketPath: normalizeHerdrSocketPath(handle.herdrSocketPath),
     herdrServerIdentity: handle.herdrServerIdentity ?? null,
     herdrWorkspaceId: handle.herdrWorkspaceId,
     herdrPaneId: handle.herdrPaneId,
@@ -408,7 +413,7 @@ export class HerdrThinGateway {
   /**
    * List workspaces directly over socket.
    */
-  async listWorkspaces(): Promise<Array<{ workspace_id: string; label?: string }>> {
+  async listWorkspaces(socketPath?: string): Promise<Array<{ workspace_id: string; label?: string }>> {
     const req: HerdrSocketRequest = {
       id: `ws-list-${Date.now()}`,
       method: "workspace.list",
@@ -418,7 +423,7 @@ export class HerdrThinGateway {
       const res = await this.sendRequest<{
         type: string;
         workspaces?: Array<{ workspace_id: string; label?: string }>;
-      }>(req, 3000);
+      }>(req, 3000, socketPath);
       return res.result?.workspaces || [];
     } catch {
       return [];
@@ -428,7 +433,7 @@ export class HerdrThinGateway {
   /**
    * Show a workspace directly over socket.
    */
-  async getWorkspace(workspaceId: string): Promise<{ workspace_id: string; label?: string } | undefined> {
+  async getWorkspace(workspaceId: string, socketPath?: string): Promise<{ workspace_id: string; label?: string } | undefined> {
     const req: HerdrSocketRequest = {
       id: `ws-get-${Date.now()}`,
       method: "workspace.get",
@@ -437,7 +442,7 @@ export class HerdrThinGateway {
     try {
       const res = await this.sendRequest<{
         workspace?: { workspace_id: string; label?: string };
-      }>(req, 3000);
+      }>(req, 3000, socketPath);
       return res.result?.workspace;
     } catch {
       return undefined;
@@ -447,7 +452,7 @@ export class HerdrThinGateway {
   /**
    * List panes directly over socket, optionally filtered by workspace_id.
    */
-  async listPanes(workspaceId?: string): Promise<HerdrPaneInfo[]> {
+  async listPanes(workspaceId?: string, socketPath?: string): Promise<HerdrPaneInfo[]> {
     const req: HerdrSocketRequest = {
       id: `pane-list-${Date.now()}`,
       method: "pane.list",
@@ -457,7 +462,7 @@ export class HerdrThinGateway {
       const res = await this.sendRequest<{
         type: string;
         panes?: HerdrPaneInfo[];
-      }>(req, 3000);
+      }>(req, 3000, socketPath);
       return res.result?.panes || [];
     } catch {
       return [];
@@ -467,7 +472,7 @@ export class HerdrThinGateway {
   /**
    * Show a pane directly over socket.
    */
-  async getPane(paneId: string): Promise<HerdrPaneInfo | undefined> {
+  async getPane(paneId: string, socketPath?: string): Promise<HerdrPaneInfo | undefined> {
     const req: HerdrSocketRequest = {
       id: `pane-get-${Date.now()}`,
       method: "pane.get",
@@ -477,7 +482,7 @@ export class HerdrThinGateway {
       const res = await this.sendRequest<{
         type: string;
         pane?: HerdrPaneInfo;
-      }>(req, 3000);
+      }>(req, 3000, socketPath);
       return res.result?.pane;
     } catch {
       return undefined;
@@ -487,7 +492,7 @@ export class HerdrThinGateway {
   /**
    * Query HerdR agent status directly over socket.
    */
-  async getAgent(agentName: string): Promise<HerdrAgentInfo | undefined> {
+  async getAgent(agentName: string, socketPath?: string): Promise<HerdrAgentInfo | undefined> {
     const req: HerdrSocketRequest = {
       id: `agent-get-${Date.now()}`,
       method: "agent.get",
@@ -497,7 +502,7 @@ export class HerdrThinGateway {
       const res = await this.sendRequest<{
         type: string;
         agent?: HerdrAgentInfo;
-      }>(req, 3000);
+      }>(req, 3000, socketPath);
       return res.result?.agent;
     } catch {
       return undefined;
@@ -581,7 +586,7 @@ export class HerdrThinGateway {
   async observeAndValidateLiveHandle(
     expectations: LiveHandleIdentityExpectations,
   ): Promise<LiveHandleObservationResult> {
-    const pane = await this.getPane(expectations.herdrPaneId);
+    const pane = await this.getPane(expectations.herdrPaneId, expectations.herdrSocketPath);
     if (!pane) {
       return { valid: false, reason: `Pane '${expectations.herdrPaneId}' not found in HerdR` };
     }
@@ -609,7 +614,7 @@ export class HerdrThinGateway {
       };
     }
 
-    const agent = await this.getAgent(expectations.herdrAgentIdentity);
+    const agent = await this.getAgent(expectations.herdrAgentIdentity, expectations.herdrSocketPath);
     if (!agent) {
       return {
         valid: false,
@@ -679,6 +684,13 @@ export class HerdrThinGateway {
     gitHeadBefore: string,
     store: LocalAgentStore,
   ): Promise<HerdrExternalHandle | undefined> {
+    if (!launch.herdrSocketPath) {
+      throw new Error(
+        `[OUTCOME_UNKNOWN] Stored launch fence for attemptKey '${params.attemptKey}' lacks durable herdrSocketPath endpoint; cannot infer gateway default. Zero external calls permitted.`,
+      );
+    }
+    const targetSocket = normalizeHerdrSocketPath(launch.herdrSocketPath);
+
     const wsLabel = `devspace-${params.attemptKey}`;
     const agentName =
       launch.herdrAgentIdentity ||
@@ -691,7 +703,7 @@ export class HerdrThinGateway {
 
     // 1. If workspace not observed, query HerdR to see if workspace was created
     if (!wsId) {
-      const workspaces = await this.listWorkspaces();
+      const workspaces = await this.listWorkspaces(targetSocket);
       const match = workspaces.find((w) => w.label === wsLabel);
       if (!match || !match.workspace_id) {
         return undefined;
@@ -699,7 +711,7 @@ export class HerdrThinGateway {
       wsId = match.workspace_id;
 
       // Find panes restricted to this workspace (Section 10, 11, 14)
-      const panes = await this.listPanes(wsId);
+      const panes = await this.listPanes(wsId, targetSocket);
       const candidatePanes = panes.filter((p) => {
         if (p.workspace_id !== wsId) return false;
         const pCwd = p.cwd ? canonicalizePath(p.cwd) : undefined;
@@ -739,7 +751,7 @@ export class HerdrThinGateway {
       }
     } else if (!paneId) {
       // Workspace ID is already known, but paneId is missing
-      const panes = await this.listPanes(wsId);
+      const panes = await this.listPanes(wsId, targetSocket);
       const candidatePanes = panes.filter((p) => {
         if (p.workspace_id !== wsId) return false;
         const pCwd = p.cwd ? canonicalizePath(p.cwd) : undefined;
@@ -773,7 +785,7 @@ export class HerdrThinGateway {
       }
     } else {
       // Both wsId and paneId already known, verify physical pane exists and cwd matches
-      const paneInfo = await this.getPane(paneId);
+      const paneInfo = await this.getPane(paneId, targetSocket);
       if (!paneInfo) {
         return undefined;
       }
@@ -787,7 +799,7 @@ export class HerdrThinGateway {
     // 2. Workspace is known and physically verified; check agent (Section 16, 17, 32, E2, F4)
     let agentIdentity = launch.herdrAgentIdentity;
     if (!agentIdentity) {
-      const agentInfo = await this.getAgent(agentName);
+      const agentInfo = await this.getAgent(agentName, targetSocket);
       if (!agentInfo) {
         return undefined;
       }
@@ -799,6 +811,7 @@ export class HerdrThinGateway {
         canonicalWorktreePath: canonicalPath,
         herdrAgentIdentity: agentName,
         herdrAgentKind: params.agentKind,
+        herdrSocketPath: targetSocket,
       }, "reconcileFencedLaunch");
       if (!agentVal.valid) {
         return undefined;
@@ -817,7 +830,7 @@ export class HerdrThinGateway {
       }
     } else {
       // E2 / F4: Even if launch.herdrAgentIdentity already exists, current agent must be positively re-observed!
-      const agentInfo = await this.getAgent(agentIdentity);
+      const agentInfo = await this.getAgent(agentIdentity, targetSocket);
       if (!agentInfo) {
         return undefined;
       }
@@ -827,6 +840,7 @@ export class HerdrThinGateway {
         canonicalWorktreePath: canonicalPath,
         herdrAgentIdentity: agentIdentity,
         herdrAgentKind: params.agentKind,
+        herdrSocketPath: targetSocket,
       }, "reconcileFencedLaunch");
       if (!agentVal.valid) {
         return undefined;
@@ -838,7 +852,7 @@ export class HerdrThinGateway {
       schemaVersion: 1,
       runtimeKind: HERDR_RUNTIME_KIND,
       agentId: record.id,
-      herdrSocketPath: params.socketPath || this.socketPath,
+      herdrSocketPath: targetSocket,
       herdrWorkspaceId: wsId,
       herdrPaneId: paneId,
       herdrAgentIdentity: agentIdentity,
@@ -864,6 +878,7 @@ export class HerdrThinGateway {
         launch: {
           ...launch,
           state: "AGENT_OBSERVED",
+          herdrSocketPath: targetSocket,
           herdrWorkspaceId: wsId,
           herdrPaneId: paneId,
           herdrAgentIdentity: agentIdentity,
@@ -919,7 +934,7 @@ export class HerdrThinGateway {
       );
     }
 
-    const herdrSocketPath = params.socketPath || this.socketPath;
+    const herdrSocketPath = normalizeHerdrSocketPath(params.socketPath || this.socketPath);
     let herdrServerIdentity: string | undefined = undefined;
 
     const record = effectiveStore.getById(params.agentId);
@@ -971,6 +986,26 @@ export class HerdrThinGateway {
           `[SOURCE_IDENTITY_DRIFT] Git HEAD '${gitHeadBefore}' drifted from bound gitHeadBefore '${existing.gitHeadBefore}'`,
         );
       }
+      if (normalizeHerdrSocketPath(existing.herdrSocketPath) !== herdrSocketPath) {
+        throw new Error(
+          `[ATTEMPT_REPLAY_CONFLICT] Replay socketPath '${herdrSocketPath}' does not match durable handle socketPath '${existing.herdrSocketPath}'`,
+        );
+      }
+      if (existing.workspaceId !== params.workspaceId) {
+        throw new Error(
+          `[ATTEMPT_REPLAY_CONFLICT] Replay workspaceId '${params.workspaceId}' does not match durable handle workspaceId '${existing.workspaceId}'`,
+        );
+      }
+      if ((existing.requestedModel ?? undefined) !== (params.requestedModel ?? undefined)) {
+        throw new Error(
+          `[ATTEMPT_REPLAY_CONFLICT] Replay requestedModel '${params.requestedModel}' does not match durable handle requestedModel '${existing.requestedModel}'`,
+        );
+      }
+      if ((existing.requestedEffort ?? undefined) !== (params.requestedEffort ?? undefined)) {
+        throw new Error(
+          `[ATTEMPT_REPLAY_CONFLICT] Replay requestedEffort '${params.requestedEffort}' does not match durable handle requestedEffort '${existing.requestedEffort}'`,
+        );
+      }
 
       // E2: Stale durable IDs are not proof of current live process continuity.
       // Returning a usable live handle from replay requires current positive re-observation.
@@ -980,6 +1015,7 @@ export class HerdrThinGateway {
         canonicalWorktreePath: canonicalPath,
         herdrAgentIdentity: existing.herdrAgentIdentity,
         herdrAgentKind: existing.herdrAgentKind,
+        herdrSocketPath: existing.herdrSocketPath,
       });
 
       if (!liveCheck.valid) {
@@ -1014,6 +1050,31 @@ export class HerdrThinGateway {
           `[SOURCE_IDENTITY_DRIFT] Git HEAD '${gitHeadBefore}' drifted from launch fence gitHeadBefore '${launch.gitHeadBefore}'`,
         );
       }
+      if (!launch.herdrSocketPath) {
+        throw new Error(
+          `[OUTCOME_UNKNOWN] Stored launch fence for attemptKey '${params.attemptKey}' lacks durable herdrSocketPath endpoint; cannot infer gateway default. Zero external calls permitted.`,
+        );
+      }
+      if (normalizeHerdrSocketPath(launch.herdrSocketPath) !== herdrSocketPath) {
+        throw new Error(
+          `[ATTEMPT_REPLAY_CONFLICT] Replay socketPath '${herdrSocketPath}' does not match launch fence socketPath '${launch.herdrSocketPath}'`,
+        );
+      }
+      if (launch.workspaceId && launch.workspaceId !== params.workspaceId) {
+        throw new Error(
+          `[ATTEMPT_REPLAY_CONFLICT] Replay workspaceId '${params.workspaceId}' does not match launch fence workspaceId '${launch.workspaceId}'`,
+        );
+      }
+      if ((launch.requestedModel ?? undefined) !== (params.requestedModel ?? undefined)) {
+        throw new Error(
+          `[ATTEMPT_REPLAY_CONFLICT] Replay requestedModel '${params.requestedModel}' does not match launch fence requestedModel '${launch.requestedModel}'`,
+        );
+      }
+      if ((launch.requestedEffort ?? undefined) !== (params.requestedEffort ?? undefined)) {
+        throw new Error(
+          `[ATTEMPT_REPLAY_CONFLICT] Replay requestedEffort '${params.requestedEffort}' does not match launch fence requestedEffort '${launch.requestedEffort}'`,
+        );
+      }
 
       const reconciled = await this.reconcileFencedLaunch(
         params,
@@ -1035,7 +1096,7 @@ export class HerdrThinGateway {
     const wsLabel = `devspace-${params.attemptKey}`;
     const agentName = buildDeterministicHerdrAgentName(params.attemptKey, params.dispatchIntentHash);
 
-    // Pre-effect launch fence (Blocker C2)
+    // Pre-effect launch fence (Blocker C2, G2)
     const fenceRes = effectiveStore.fenceExternalRuntimeLaunchCAS({
       agentId: params.agentId,
       attemptKey: params.attemptKey,
@@ -1043,6 +1104,7 @@ export class HerdrThinGateway {
       canonicalWorktreePath: canonicalPath,
       gitHeadBefore,
       agentKind: params.agentKind,
+      herdrSocketPath,
       requestedModel: params.requestedModel,
       requestedEffort: params.requestedEffort,
       promptNonce,
@@ -1103,7 +1165,7 @@ export class HerdrThinGateway {
 
     // N4: Wrong worktree fail closed
     if (observedCwd !== canonicalPath) {
-      await this.closeWorkspace(wsId).catch(() => {});
+      await this.closeWorkspace(wsId, herdrSocketPath).catch(() => {});
       throw new Error(
         `[N4 Wrong Worktree] Observed cwd '${observedCwd}' does not match canonical worktree '${canonicalPath}'`,
       );
@@ -1163,7 +1225,7 @@ export class HerdrThinGateway {
     }
 
     if (agentRes.error || !agentRes.result) {
-      await this.closeWorkspace(wsId).catch(() => {});
+      await this.closeWorkspace(wsId, herdrSocketPath).catch(() => {});
       if (effectiveStore && params.agentId) {
         effectiveStore.markExternalRuntimeLaunchOutcomeUnknownCAS({
           agentId: params.agentId,
@@ -1184,7 +1246,7 @@ export class HerdrThinGateway {
     });
 
     if (!startVal.valid) {
-      await this.closeWorkspace(wsId).catch(() => {});
+      await this.closeWorkspace(wsId, herdrSocketPath).catch(() => {});
       if (effectiveStore && params.agentId) {
         effectiveStore.markExternalRuntimeLaunchOutcomeUnknownCAS({
           agentId: params.agentId,
@@ -1223,13 +1285,13 @@ export class HerdrThinGateway {
     await this.sendRequest(waitReq, 15_000, herdrSocketPath).catch(() => {});
 
     // Read terminal visible output to fail closed against onboarding / trust / permission dialogs (A5 / N-TRUST / B3)
-    let terminalOutput = await this.readPane(paneId);
+    let terminalOutput = await this.readPane(paneId, 60, herdrSocketPath);
     if (!terminalOutput.trim()) {
       await new Promise((r) => setTimeout(r, 1500));
-      terminalOutput = await this.readPane(paneId);
+      terminalOutput = await this.readPane(paneId, 60, herdrSocketPath);
     }
     if (detectBlockedOnboardingDialog(params.agentKind, terminalOutput)) {
-      await this.closeWorkspace(wsId).catch(() => {});
+      await this.closeWorkspace(wsId, herdrSocketPath).catch(() => {});
       throw new Error(
         `[Fail-Closed / N-TRUST] Agent '${params.agentKind}' is stuck at an unauthenticated onboarding/trust/permission dialog: BLOCKED_ON_PERMISSION_ADMISSION`,
       );
@@ -1242,6 +1304,7 @@ export class HerdrThinGateway {
       canonicalWorktreePath: canonicalPath,
       herdrAgentIdentity: agentName,
       herdrAgentKind: params.agentKind,
+      herdrSocketPath,
     });
 
     if (!finalLiveObs.valid) {
@@ -1294,6 +1357,7 @@ export class HerdrThinGateway {
             canonicalWorktreePath: canonicalPath,
             gitHeadBefore,
             agentKind: params.agentKind,
+            herdrSocketPath,
             ...(params.requestedModel ? { requestedModel: params.requestedModel } : {}),
             ...(params.requestedEffort ? { requestedEffort: params.requestedEffort } : {}),
             promptNonce,
@@ -1368,6 +1432,8 @@ export class HerdrThinGateway {
       );
     }
 
+    const targetSocket = normalizeHerdrSocketPath(handle.herdrSocketPath);
+
     // Pre-fence live identity validation (E3)
     const preFenceLive = await this.observeAndValidateLiveHandle({
       herdrWorkspaceId: handle.herdrWorkspaceId,
@@ -1375,6 +1441,7 @@ export class HerdrThinGateway {
       canonicalWorktreePath: canonicalizePath(handle.canonicalWorktreePath),
       herdrAgentIdentity: handle.herdrAgentIdentity,
       herdrAgentKind: handle.herdrAgentKind,
+      herdrSocketPath: targetSocket,
     });
     if (!preFenceLive.valid) {
       throw new Error(
@@ -1416,6 +1483,7 @@ export class HerdrThinGateway {
       canonicalWorktreePath: canonicalizePath(handle.canonicalWorktreePath),
       herdrAgentIdentity: handle.herdrAgentIdentity,
       herdrAgentKind: handle.herdrAgentKind,
+      herdrSocketPath: targetSocket,
     });
     if (!postFenceLive.valid) {
       throw new Error(
@@ -1458,7 +1526,7 @@ export class HerdrThinGateway {
     try {
       const res = await this.sendRequest<{
         agent?: HerdrAgentInfo;
-      }>(req, timeoutMs + 5000);
+      }>(req, timeoutMs + 5000, targetSocket);
 
       if (res.error) {
         // N3: timeout or stalled prompt maps strictly to OUTCOME_UNKNOWN
@@ -1482,6 +1550,7 @@ export class HerdrThinGateway {
         canonicalWorktreePath: canonicalizePath(handle.canonicalWorktreePath),
         herdrAgentIdentity: handle.herdrAgentIdentity,
         herdrAgentKind: handle.herdrAgentKind,
+        herdrSocketPath: targetSocket,
       }, "agent.prompt response");
 
       if (!resAgentVal.valid) {
@@ -1493,7 +1562,7 @@ export class HerdrThinGateway {
       }
 
       const statusStr = resAgent?.agent_status;
-      const paneOutput = await this.readPane(handle.herdrPaneId);
+      const paneOutput = await this.readPane(handle.herdrPaneId, 60, targetSocket);
 
       // Check if blocked on permission admission or onboarding dialog (B3)
       if (detectBlockedOnboardingDialog(handle.herdrAgentKind, paneOutput)) {
@@ -1535,7 +1604,7 @@ export class HerdrThinGateway {
   /**
    * Read pane output.
    */
-  async readPane(paneId: string, lines: number = 60): Promise<string> {
+  async readPane(paneId: string, lines: number = 60, socketPath?: string): Promise<string> {
     const req: HerdrSocketRequest = {
       id: `pane-read-${Date.now()}`,
       method: "pane.read",
@@ -1551,12 +1620,26 @@ export class HerdrThinGateway {
         read: {
           text: string;
         };
-      }>(req);
+      }>(req, 10_000, socketPath);
       if (res.result?.read?.text !== undefined) {
         return res.result.read.text;
       }
-    } catch {}
-    // Fallback to CLI read if socket read helper differs
+      if (socketPath) {
+        throw new Error(
+          `[EXPLICIT_SOCKET_READBACK_FAILURE] Socket pane.read on explicit socket '${socketPath}' returned no text (error: ${res.error?.message ?? "empty result"}). CLI fallback forbidden.`,
+        );
+      }
+    } catch (err) {
+      if (socketPath) {
+        if (err instanceof Error && err.message.startsWith("[EXPLICIT_SOCKET_READBACK_FAILURE]")) {
+          throw err;
+        }
+        throw new Error(
+          `[EXPLICIT_SOCKET_READBACK_FAILURE] Socket pane.read on explicit socket '${socketPath}' failed: ${String(err)}. CLI fallback forbidden.`,
+        );
+      }
+    }
+    // Fallback to CLI read if socket read helper differs (only diagnostic callers without explicit socketPath)
     return execFileSync("herdr", ["pane", "read", paneId, "--source", "recent-unwrapped", "--lines", String(lines)], {
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],
@@ -1697,10 +1780,12 @@ export class HerdrThinGateway {
     } else if (lastPromptResult?.status === "blocked") {
       executionState = "BLOCKED";
     } else {
+      const targetSocket = normalizeHerdrSocketPath(handle.herdrSocketPath);
+
       // Check HerdR server health and agent status
       let serverAlive = false;
       try {
-        const ping = await this.sendRequest<{ type: string }>({ id: "ping", method: "ping", params: {} }, 2000, this.socketPath);
+        const ping = await this.sendRequest<{ type: string }>({ id: "ping", method: "ping", params: {} }, 2000, targetSocket);
         serverAlive = ping.result?.type === "pong";
       } catch {
         serverAlive = false;
@@ -1717,6 +1802,7 @@ export class HerdrThinGateway {
           canonicalWorktreePath: canonicalizePath(handle.canonicalWorktreePath),
           herdrAgentIdentity: handle.herdrAgentIdentity,
           herdrAgentKind: handle.herdrAgentKind,
+          herdrSocketPath: targetSocket,
         });
 
         if (!liveObs.valid || !liveObs.agent) {
@@ -1858,6 +1944,8 @@ export class HerdrThinGateway {
     // 1. Exact Durable Authority Comparison (Blocker F3)
     assertExactDurableHerdrHandle(handle, boundHandle, "stopExternalAgent");
 
+    const targetSocket = normalizeHerdrSocketPath(boundHandle.herdrSocketPath);
+
     // 2. Validate current live identity before closing workspace (E5)
     const liveObs = await this.observeAndValidateLiveHandle({
       herdrWorkspaceId: boundHandle.herdrWorkspaceId,
@@ -1865,6 +1953,7 @@ export class HerdrThinGateway {
       canonicalWorktreePath: canonicalizePath(boundHandle.canonicalWorktreePath),
       herdrAgentIdentity: boundHandle.herdrAgentIdentity,
       herdrAgentKind: boundHandle.herdrAgentKind,
+      herdrSocketPath: targetSocket,
     });
 
     if (!liveObs.valid) {
@@ -1873,7 +1962,7 @@ export class HerdrThinGateway {
       );
     }
 
-    await this.closeWorkspace(boundHandle.herdrWorkspaceId);
+    await this.closeWorkspace(boundHandle.herdrWorkspaceId, targetSocket);
     this.registry.releaseHandle(boundHandle.attemptKey);
   }
 
@@ -1882,7 +1971,7 @@ export class HerdrThinGateway {
    * Internal helper; private to prevent consequential side-door bypass (E6).
    * Enforces A8: does not swallow close errors.
    */
-  private async closeWorkspace(workspaceId: string): Promise<void> {
+  private async closeWorkspace(workspaceId: string, socketPath?: string): Promise<void> {
     const req: HerdrSocketRequest = {
       id: `ws-close-${Date.now()}`,
       method: "workspace.close",
@@ -1890,7 +1979,7 @@ export class HerdrThinGateway {
         workspace_id: workspaceId,
       },
     };
-    const res = await this.sendRequest<{ type?: string }>(req);
+    const res = await this.sendRequest<{ type?: string }>(req, 10_000, socketPath);
     if (res.error) {
       throw new Error(`HerdR workspace.close failed: ${res.error.message}`);
     }

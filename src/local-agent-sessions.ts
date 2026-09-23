@@ -594,6 +594,7 @@ export class LocalAgentSessionManager {
           canonicalWorktreePath: handle.canonicalWorktreePath,
           gitHeadBefore: handle.gitHeadBefore,
           agentKind: handle.herdrAgentKind,
+          herdrSocketPath: handle.herdrSocketPath,
           promptNonce: handle.promptNonce,
           herdrWorkspaceId: handle.herdrWorkspaceId,
           herdrPaneId: handle.herdrPaneId,
