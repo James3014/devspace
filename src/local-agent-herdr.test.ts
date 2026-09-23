@@ -3866,6 +3866,148 @@ test("HerdrThinGateway prompt exact durable handle authority (Blocker F1, F1-PRO
   }
 });
 
+test("HerdrThinGateway preserves OUTCOME_UNKNOWN and zero re-prompt after effect-before-ack transport loss", async () => {
+  const { repoPath, headSha } = createIsolatedTestGitRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-prompt-lost-ack-"));
+  let store: LocalAgentStore | undefined;
+  let reopenedStore: LocalAgentStore | undefined;
+
+  try {
+    const attemptKey = `attempt-lost-ack-${Date.now()}`;
+    const intent = {
+      taskId: "task-lost-ack",
+      attemptId: attemptKey,
+      objective: "Exercise effect-before-ack ambiguity",
+      roleIntent: "DEEP_ENGINEERING" as const,
+      claimCeiling: "CANDIDATE_READY" as const,
+      context: ["once-adversarial-reference"],
+      readScope: ["src"],
+      writeScope: ["effect.txt"],
+      exclusiveOwnership: true,
+      forbiddenChanges: [],
+      acceptanceCriteria: ["no blind second prompt"],
+      verificationRequired: true,
+      expectedArtifacts: [],
+    };
+    const dispatchIntentHash = hashDispatchIntent(intent);
+
+    store = new LocalAgentStore(stateDir);
+    const agent = store.create({
+      workspaceId: "ws-lost-ack",
+      workspaceRoot: repoPath,
+      profileName: "worker",
+      provider: "opencode",
+      startReplay: { key: attemptKey, requestHash: "request-lost-ack" },
+      executionContract: { writePaths: ["effect.txt"], dispatchIntent: intent },
+    });
+
+    const handle: HerdrExternalHandle = {
+      schemaVersion: 1,
+      runtimeKind: HERDR_RUNTIME_KIND,
+      agentId: agent.id,
+      herdrSocketPath: "/tmp/test.sock",
+      herdrWorkspaceId: "ws-lost-ack-target",
+      herdrPaneId: "pane-lost-ack-target",
+      herdrAgentIdentity: "agent-lost-ack-target",
+      herdrAgentKind: "opencode",
+      promptNonce: `NONCE-${attemptKey}`,
+      canonicalWorktreePath: repoPath,
+      workspaceId: "ws-lost-ack",
+      gitHeadBefore: headSha,
+      attemptKey,
+      dispatchIntentHash,
+      launchTimestamp: new Date().toISOString(),
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    };
+
+    const bind = store.bindExternalRuntimeBindingCAS({
+      agentId: agent.id,
+      expectedAttemptKey: attemptKey,
+      expectedDispatchIntentHash: dispatchIntentHash,
+      binding: {
+        runtimeKind: HERDR_RUNTIME_KIND,
+        handle: handle as unknown as Record<string, unknown>,
+      },
+    });
+    assert.equal(bind.applied, true);
+
+    const firstGateway = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), store);
+    firstGateway.simulatedPanes = [{
+      pane_id: handle.herdrPaneId,
+      workspace_id: handle.herdrWorkspaceId,
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+    }];
+    firstGateway.simulatedAgents.set(handle.herdrAgentIdentity, {
+      name: handle.herdrAgentIdentity,
+      agent: handle.herdrAgentKind,
+      workspace_id: handle.herdrWorkspaceId,
+      pane_id: handle.herdrPaneId,
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+
+    const originalSend = firstGateway.sendRequest.bind(firstGateway);
+    firstGateway.sendRequest = (async (req: HerdrSocketRequest, timeoutMs?: number, socketPath?: string) => {
+      if (req.method === "agent.prompt") {
+        firstGateway.agentPromptCalls++;
+        writeFileSync(join(repoPath, "effect.txt"), "effect happened before acknowledgement\n");
+        const lostAck = Object.assign(
+          new Error("read ECONNRESET after provider accepted prompt"),
+          { code: "ECONNRESET" },
+        );
+        throw lostAck;
+      }
+      return originalSend(req, timeoutMs, socketPath);
+    }) as typeof firstGateway.sendRequest;
+
+    const firstResult = await firstGateway.promptExternalAgent(handle, "perform external effect", { store });
+    assert.equal(firstResult.status, "OUTCOME_UNKNOWN");
+    assert.equal(firstResult.rawStatus, "ECONNRESET");
+    assert.equal(firstGateway.agentPromptCalls, 1);
+    assert.equal(readFileSync(join(repoPath, "effect.txt"), "utf8"), "effect happened before acknowledgement\n");
+    assert.equal(
+      store.getById(agent.id)?.externalRuntimeBinding?.promptState?.consequentialPromptFenced,
+      true,
+    );
+
+    store.close();
+    store = undefined;
+
+    reopenedStore = new LocalAgentStore(stateDir);
+    const replayGateway = new SpyHerdrGateway("/tmp/test.sock", new HerdrGatewayRegistry(), reopenedStore);
+    replayGateway.simulatedPanes = [{
+      pane_id: handle.herdrPaneId,
+      workspace_id: handle.herdrWorkspaceId,
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+    }];
+    replayGateway.simulatedAgents.set(handle.herdrAgentIdentity, {
+      name: handle.herdrAgentIdentity,
+      agent: handle.herdrAgentKind,
+      workspace_id: handle.herdrWorkspaceId,
+      pane_id: handle.herdrPaneId,
+      cwd: repoPath,
+      foreground_cwd: repoPath,
+      agent_status: "idle",
+      interactive_ready: true,
+    });
+
+    await assert.rejects(
+      replayGateway.promptExternalAgent(handle, "blind retry must not happen", { store: reopenedStore }),
+      /\[N-TURN-OPTION-A\]/,
+    );
+    assert.equal(replayGateway.agentPromptCalls, 0);
+  } finally {
+    store?.close();
+    reopenedStore?.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repoPath, { recursive: true, force: true });
+  }
+});
+
 test("HerdrThinGateway reconciliation exact durable authority (Blocker F2, F2-RECONCILE-NO-STORE, F2-RECONCILE-FORGED-HANDLE, F2-RECONCILE-EXACT, RECONCILE-REPRODUCER-F2)", async () => {
   const { repoPath, headSha } = createIsolatedTestGitRepo();
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-f2-matrix-"));

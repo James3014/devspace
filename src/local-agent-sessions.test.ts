@@ -1431,10 +1431,9 @@ test("LocalAgentSessionManager - PROMPT-R1, R2, R3, R4 durable prompt fence surv
 
       // 1. Submit first prompt
       if (c.outcome === "error") {
-        await assert.rejects(
-          async () => spyGateway1.promptExternalAgent(handle, "first prompt", { store: (manager1 as any).store }),
-          /Simulated socket network disconnect/,
-        );
+        const res = await spyGateway1.promptExternalAgent(handle, "first prompt", { store: (manager1 as any).store });
+        assert.equal(res.status, "OUTCOME_UNKNOWN");
+        assert.equal(res.timeout, false);
       } else {
         const res = await spyGateway1.promptExternalAgent(handle, "first prompt", { store: (manager1 as any).store });
         if (c.outcome === "done") assert.equal(res.status, "done");

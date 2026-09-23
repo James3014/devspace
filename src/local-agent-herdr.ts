@@ -1515,15 +1515,20 @@ export class HerdrThinGateway {
         paneOutput,
       };
     } catch (err: unknown) {
+      // The durable prompt fence has already been committed and agent.prompt may have
+      // reached HerdR/provider. Any post-fence transport/observation failure is therefore
+      // ambiguous external-world truth, not proof that the effect was absent.
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes("timed out")) {
-        return {
-          turnNonce,
-          status: "OUTCOME_UNKNOWN",
-          timeout: true,
-        };
-      }
-      throw err;
+      const errorCode =
+        typeof err === "object" && err !== null && "code" in err
+          ? String((err as NodeJS.ErrnoException).code ?? "")
+          : "";
+      return {
+        turnNonce,
+        status: "OUTCOME_UNKNOWN",
+        rawStatus: errorCode || "PROMPT_POST_FENCE_ERROR",
+        timeout: msg.includes("timed out") || errorCode === "ETIMEDOUT",
+      };
     }
   }
 
