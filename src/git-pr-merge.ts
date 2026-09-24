@@ -1420,5 +1420,296 @@ export async function mergePullRequest(
     throw mapTransportError(e, "getPullRequest");
   }
   if (pr.state !== "OPEN") {
+    throw new MergePullRequestError(
+      PR_MERGE_ERROR_CODES.PR_NOT_OPEN,
+      `pull request #${input.prNumber} is ${pr.state}, not open`,
+    );
+  }
+  if (pr.isDraft) {
+    throw new MergePullRequestError(
+      PR_MERGE_ERROR_CODES.PR_IS_DRAFT,
+      `pull request #${input.prNumber} is a draft; it must be marked ready for review before merge`,
+    );
+  }
+  if (pr.baseRefName !== defaultBranch) {
+    throw new MergePullRequestError(
+      PR_MERGE_ERROR_CODES.PR_BASE_MISMATCH,
+      `pull request #${input.prNumber} base branch ${pr.baseRefName} does not match repository default branch ${defaultBranch}`,
+    );
+  }
+  if (pr.baseRefOid && pr.baseRefOid !== input.expectedBaseSha) {
+    throw new MergePullRequestError(
+      PR_MERGE_ERROR_CODES.EXPECTED_BASE_MISMATCH,
+      `pull request base commit ${pr.baseRefOid} does not match expected base ${input.expectedBaseSha}`,
+    );
+  }
+  if (pr.headRefOid !== input.expectedHeadSha) {
+    throw new MergePullRequestError(
+      PR_MERGE_ERROR_CODES.EXPECTED_HEAD_MISMATCH,
+      `pull request head is ${pr.headRefOid}, expected ${input.expectedHeadSha}`,
+    );
+  }
+  if (pr.mergeable !== "MERGEABLE") {
+    throw new MergePullRequestError(
+      PR_MERGE_ERROR_CODES.PR_NOT_MERGEABLE,
+      `pull request mergeable state is ${pr.mergeable} (expected MERGEABLE)`,
+    );
+  }
 
-[Showing lines 1-1422 of 1716 (50.0KB limit). Use offset=1423 to continue.]
+  let baseRef: BranchRefView;
+  try {
+    baseRef = await transport.getBranchRef(repo, defaultBranch);
+  } catch (e) {
+    throw mapTransportError(e, "getBranchRef");
+  }
+  if (baseRef.sha !== input.expectedBaseSha) {
+    throw new MergePullRequestError(
+      PR_MERGE_ERROR_CODES.EXPECTED_BASE_MISMATCH,
+      `remote ${defaultBranch} is ${baseRef.sha}, expected ${input.expectedBaseSha}`,
+    );
+  }
+
+  const checks = await evaluateRequiredChecks(
+    transport,
+    repo,
+    defaultBranch,
+    input.expectedHeadSha,
+  );
+  if (!checks.ok) {
+    throw new MergePullRequestError(checks.code, checks.message);
+  }
+
+  // Last-moment re-verification. Even though the merge call carries the native
+  // exact-head CAS, the base branch has no API-level CAS, so it is re-read
+  // immediately before the merge and the PR is re-read to shrink the TOCTOU
+  // window to a single round trip. Every PR property that was validated during
+  // preflight must still hold: state, draft status, base branch, base commit,
+  // and head commit. A drifted property fails closed with the same
+  // deterministic code used in preflight; the merge API is never called.
+  let observedBase = baseRef.sha;
+  let observedHead = pr.headRefOid;
+  let finalPr = pr;
+  try {
+    const [freshBase, freshPr] = await Promise.all([
+      transport.getBranchRef(repo, defaultBranch),
+      transport.getPullRequest(repo, input.prNumber),
+    ]);
+    if (freshPr.state !== "OPEN") {
+      throw new MergePullRequestError(
+        PR_MERGE_ERROR_CODES.PR_NOT_OPEN,
+        `pull request state changed between validation and merge: ${freshPr.state}`,
+      );
+    }
+    if (freshPr.isDraft) {
+      throw new MergePullRequestError(
+        PR_MERGE_ERROR_CODES.PR_IS_DRAFT,
+        "pull request became a draft between validation and merge",
+      );
+    }
+    if (freshPr.baseRefName !== defaultBranch) {
+      throw new MergePullRequestError(
+        PR_MERGE_ERROR_CODES.PR_BASE_MISMATCH,
+        `pull request base branch changed between validation and merge: ${freshPr.baseRefName}`,
+      );
+    }
+    if (freshPr.baseRefOid !== input.expectedBaseSha) {
+      throw new MergePullRequestError(
+        PR_MERGE_ERROR_CODES.EXPECTED_BASE_MISMATCH,
+        `pull request base commit changed between validation and merge: observed ${freshPr.baseRefOid}, expected ${input.expectedBaseSha}`,
+      );
+    }
+    if (freshPr.headRefOid !== input.expectedHeadSha) {
+      throw new MergePullRequestError(
+        PR_MERGE_ERROR_CODES.EXPECTED_HEAD_MISMATCH,
+        `head drifted between validation and merge: observed ${freshPr.headRefOid}, expected ${input.expectedHeadSha}`,
+      );
+    }
+    if (freshBase.sha !== input.expectedBaseSha) {
+      throw new MergePullRequestError(
+        PR_MERGE_ERROR_CODES.EXPECTED_BASE_MISMATCH,
+        `base drifted between validation and merge: observed ${freshBase.sha}, expected ${input.expectedBaseSha}`,
+      );
+    }
+    observedBase = freshBase.sha;
+    observedHead = freshPr.headRefOid;
+    finalPr = freshPr;
+  } catch (e) {
+    if (e instanceof MergePullRequestError) throw e;
+    throw mapTransportError(e, "final-preflight");
+  }
+
+  if (options.beforeMergeEffect) {
+    try {
+      await options.beforeMergeEffect({
+        gitRoot,
+        repository: repo,
+        defaultBranch,
+        pullRequest: finalPr,
+        expectedBaseSha: input.expectedBaseSha,
+        expectedHeadSha: input.expectedHeadSha,
+      });
+    } catch (e) {
+      if (e instanceof MergePullRequestError) throw e;
+      throw new MergePullRequestError(
+        PR_MERGE_ERROR_CODES.MERGE_LANE_NOT_AUTHORIZED,
+        `pre-merge lane guard rejected the effect: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+
+  let mergeResult: MergeResultView;
+  try {
+    mergeResult = await transport.mergePullRequest(
+      repo,
+      input.prNumber,
+      input.mergeMethod,
+      input.expectedHeadSha,
+    );
+  } catch (e) {
+    throw mapTransportError(e, "merge");
+  }
+  if (!mergeResult.merged) {
+    throw new MergePullRequestError(
+      PR_MERGE_ERROR_CODES.MERGE_REJECTED,
+      mergeResult.message ?? "GitHub rejected the merge request",
+    );
+  }
+
+  let newMainSha: string;
+  let postPr: PullRequestView;
+  try {
+    newMainSha = (await transport.getBranchRef(repo, defaultBranch)).sha;
+    postPr = await transport.getPullRequest(repo, input.prNumber);
+  } catch (e) {
+    throw new MergePullRequestError(
+      PR_MERGE_ERROR_CODES.POST_MERGE_VERIFICATION_FAILED,
+      `post-merge read-back failed: ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+
+  if (newMainSha === observedBase) {
+    throw new MergePullRequestError(
+      PR_MERGE_ERROR_CODES.POST_MERGE_VERIFICATION_FAILED,
+      `remote ${defaultBranch} did not advance after merge (still ${newMainSha})`,
+    );
+  }
+  if (mergeResult.sha && mergeResult.sha !== newMainSha) {
+    throw new MergePullRequestError(
+      PR_MERGE_ERROR_CODES.POST_MERGE_VERIFICATION_FAILED,
+      `post-merge read-back ${newMainSha} does not match the merge result ${mergeResult.sha}`,
+    );
+  }
+  if (!postPr.merged) {
+    throw new MergePullRequestError(
+      PR_MERGE_ERROR_CODES.POST_MERGE_VERIFICATION_FAILED,
+      `pull request #${input.prNumber} is not in a merged state after merge`,
+    );
+  }
+  if (postPr.headRefOid !== input.expectedHeadSha) {
+    throw new MergePullRequestError(
+      PR_MERGE_ERROR_CODES.POST_MERGE_VERIFICATION_FAILED,
+      `pull request head changed after merge (${postPr.headRefOid}), not the expected candidate ${input.expectedHeadSha}`,
+    );
+  }
+
+  return {
+    schema: "nexus.pr_merge_receipt.v1",
+    merged: true,
+    merge_method: input.mergeMethod,
+    repository: repo,
+    remote_name: target.remoteName,
+    pr_number: input.prNumber,
+    pr_title: postPr.title,
+    expected_base_sha: input.expectedBaseSha,
+    observed_base_sha_before_merge: observedBase,
+    expected_head_sha: input.expectedHeadSha,
+    observed_head_sha_before_merge: observedHead,
+    old_main_sha: observedBase,
+    candidate_head_sha: input.expectedHeadSha,
+    new_main_sha: newMainSha,
+    merge_commit_sha: mergeResult.sha ?? postPr.mergeCommitOid ?? newMainSha,
+    default_branch: defaultBranch,
+    remote: sanitizeRemoteUrl(target.remoteUrl),
+    required_checks: checks.required,
+    checks_status: { required: checks.required, checks: checks.statuses },
+    merged_at: postPr.mergedAt ?? null,
+    transport: "github_api",
+  };
+}
+
+// --- MCP tool wrapper ---------------------------------------------------------
+
+export interface MergeToolContext {
+  cwd: string;
+  transport?: GitHubPullRequestTransport;
+  targetResolver?: IntegrationTargetResolver;
+  beforeMergeEffect?: MergeEffectGuard;
+}
+
+function toMcpError(error: unknown): ToolResult {
+  if (error instanceof MergePullRequestError) {
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            { error: error.message, code: error.code },
+            null,
+            2,
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+  return {
+    content: [
+      {
+        type: "text",
+        text: JSON.stringify(
+          {
+            error: error instanceof Error ? error.message : String(error),
+            code: PR_MERGE_ERROR_CODES.INTERNAL_ERROR,
+          },
+          null,
+          2,
+        ),
+      },
+    ],
+    isError: true,
+  };
+}
+
+export async function gitMergePullRequestTool(
+  input: Record<string, unknown>,
+  context: MergeToolContext,
+): Promise<ToolResult> {
+  let parsed: GitMergePullRequestInput;
+  try {
+    parsed = parseMergePullRequestInput(input);
+  } catch (e) {
+    return toMcpError(e);
+  }
+
+  try {
+    const receipt = await mergePullRequest(parsed, {
+      cwd: context.cwd,
+      transport: context.transport ?? defaultGitMergeTransportFactory(),
+      targetResolver: context.targetResolver,
+      beforeMergeEffect: context.beforeMergeEffect,
+    });
+    return {
+      content: [{ type: "text", text: JSON.stringify(receipt, null, 2) }],
+    };
+  } catch (e) {
+    return toMcpError(e);
+  }
+}
+
+function tryParseJson(value: string): unknown {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+}

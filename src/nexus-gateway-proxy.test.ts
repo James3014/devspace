@@ -495,9 +495,7 @@ try {
   }
 
   // C3. The production lane adapter accepts only trusted DIRECT results and
-  // rejects GOVERNED before the physical merge core. The canonical Nexus
-  // validator itself is covered in Nexus-new; this fixture verifies the host
-  // subprocess/result/identity boundary without duplicating its policy.
+  // rejects GOVERNED before the physical merge core.
   {
     const root = mkdtempSync(join(tmpdir(), "nexus-public-lane-guard-"));
     try {
@@ -531,46 +529,23 @@ try {
       await guard({
         ...baseContext,
         pullRequest: {
-          number: 1128,
-          state: "OPEN",
-          isDraft: false,
-          baseRefName: "main",
-          baseRefOid: BASE,
-          headRefName: "direct/test",
-          headRefOid: HEAD,
-          mergeable: "MERGEABLE",
-          mergeStateStatus: "CLEAN",
-          merged: false,
-          mergedAt: null,
-          mergeCommitOid: null,
-          title: "direct",
-          url: "https://github.com/James3014/Nexus-new/pull/1128",
-          body: "DIRECT",
+          number: 1128, state: "OPEN", isDraft: false, baseRefName: "main", baseRefOid: BASE,
+          headRefName: "direct/test", headRefOid: HEAD, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN",
+          merged: false, mergedAt: null, mergeCommitOid: null, title: "direct",
+          url: "https://github.com/James3014/Nexus-new/pull/1128", body: "DIRECT",
         },
       });
       await assert.rejects(
         guard({
           ...baseContext,
           pullRequest: {
-            number: 1129,
-            state: "OPEN",
-            isDraft: false,
-            baseRefName: "main",
-            baseRefOid: BASE,
-            headRefName: "governed/test",
-            headRefOid: HEAD,
-            mergeable: "MERGEABLE",
-            mergeStateStatus: "CLEAN",
-            merged: false,
-            mergedAt: null,
-            mergeCommitOid: null,
-            title: "governed",
-            url: "https://github.com/James3014/Nexus-new/pull/1129",
-            body: "GOVERNED",
+            number: 1129, state: "OPEN", isDraft: false, baseRefName: "main", baseRefOid: BASE,
+            headRefName: "governed/test", headRefOid: HEAD, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN",
+            merged: false, mergedAt: null, mergeCommitOid: null, title: "governed",
+            url: "https://github.com/James3014/Nexus-new/pull/1129", body: "GOVERNED",
           },
         }),
-        (error: unknown) =>
-          error instanceof MergePullRequestError
+        (error: unknown) => error instanceof MergePullRequestError
           && error.code === PR_MERGE_ERROR_CODES.MERGE_LANE_NOT_AUTHORIZED,
       );
     } finally {
