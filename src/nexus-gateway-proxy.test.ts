@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
+import { once } from "node:events";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -12,8 +14,9 @@ import {
   nexusGatewayManifestIdentity,
   nexusGatewayToolManifestSha256,
 } from "./nexus-gateway-proxy.js";
-import type { ServerConfig } from "./config.js";
+import { loadConfig, type ServerConfig } from "./config.js";
 import { createMcpTransportBoundary, MODERN_MCP_PROTOCOL_VERSION } from "./mcp-transport.js";
+import { createServer } from "./server.js";
 import {
   PR_MERGE_ERROR_CODES,
   type GitHubPullRequestTransport,
@@ -549,4 +552,157 @@ try {
   }
 } finally {
   globalThis.fetch = originalFetch;
+}
+
+async function requestHealth(
+  port: number,
+): Promise<{ status: number; body: Record<string, unknown> }> {
+  return await new Promise((resolve, reject) => {
+    const request = httpRequest(
+      { host: "127.0.0.1", port, path: "/healthz", method: "GET" },
+      (response) => {
+        let raw = "";
+        response.setEncoding("utf8");
+        response.on("data", (chunk) => {
+          raw += chunk;
+        });
+        response.on("end", () => {
+          try {
+            resolve({
+              status: response.statusCode ?? 0,
+              body: JSON.parse(raw) as Record<string, unknown>,
+            });
+          } catch (error) {
+            reject(error);
+          }
+        });
+      },
+    );
+    request.on("error", reject);
+    request.end();
+  });
+}
+
+async function startHealthServer(
+  config: ServerConfig,
+): Promise<{
+  running: ReturnType<typeof createServer>;
+  listener: ReturnType<ReturnType<typeof createServer>["app"]["listen"]>;
+  port: number;
+}> {
+  const running = createServer(config);
+  const listener = running.app.listen(0, "127.0.0.1");
+  await once(listener, "listening");
+  const address = listener.address();
+  assert.ok(address && typeof address === "object");
+  return { running, listener, port: address.port };
+}
+
+async function stopHealthServer(
+  running: ReturnType<typeof createServer>,
+  listener: ReturnType<ReturnType<typeof createServer>["app"]["listen"]>,
+): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    listener.close((error) => {
+      if (error) reject(error);
+      else resolve();
+    });
+  });
+  await running.close();
+}
+
+// D2 / #842 hostile witness: after this process registers M1, a fresh inner
+// canonical Gateway manifest M2 must make /healthz fail closed until restart.
+{
+  const healthOriginalFetch = globalThis.fetch;
+  const healthRoot = mkdtempSync(join(tmpdir(), "nexus-proxy-health-convergence-"));
+  let revision = "manifest-m1";
+  let names = ["nexus_gateway_status"];
+  let unavailable = false;
+
+  globalThis.fetch = (async (_input, init) => {
+    if (unavailable) throw new Error("inner gateway unavailable");
+    const body = JSON.parse(String(init?.body));
+    assert.equal(body.method, "tools/list");
+    return new Response(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: body.id,
+        result: {
+          manifest_revision: revision,
+          tools: names.map((name) => ({
+            name,
+            description: `Forward ${name}.`,
+            inputSchema: { type: "object", properties: {} },
+          })),
+        },
+      }),
+      { status: 200, headers: { "content-type": "application/json" } },
+    );
+  }) as typeof fetch;
+
+  try {
+    const healthConfig = loadConfig({
+      DEVSPACE_CONFIG_DIR: join(healthRoot, "config"),
+      DEVSPACE_ALLOWED_ROOTS: healthRoot,
+      DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+      NEXUS_MCP_SURFACE_PROFILE: "canonical_gateway_proxy",
+      NEXUS_GATEWAY_PROXY_URL: "http://127.0.0.1:8766",
+      NEXUS_GATEWAY_PROXY_TOKEN: "gateway-token-that-is-long-enough",
+      MCP_PROTOCOL_MODE: "dual",
+    });
+
+    const first = await startHealthServer(healthConfig);
+    try {
+      const healthyM1 = await requestHealth(first.port);
+      assert.equal(healthyM1.status, 200);
+      assert.equal(healthyM1.body.ok, true);
+      assert.equal(healthyM1.body.manifest_status, "verified");
+
+      revision = "manifest-m2";
+      names = ["nexus_gateway_status", "nexus_owner_standing_grant_issue"];
+
+      const drifted = await requestHealth(first.port);
+      assert.equal(drifted.status, 503);
+      assert.equal(drifted.body.ok, false);
+      assert.equal(drifted.body.manifest_status, "drifted");
+      assert.equal(drifted.body.disposition, "CANONICAL_GATEWAY_MANIFEST_DRIFT");
+      assert.equal(drifted.body.required_action, "PROXY_RESTART_REQUIRED");
+      assert.equal(
+        (drifted.body.registered_manifest as { revision?: string }).revision,
+        "manifest-m1",
+      );
+      assert.equal(
+        (drifted.body.fresh_manifest as { revision?: string }).revision,
+        "manifest-m2",
+      );
+    } finally {
+      await stopHealthServer(first.running, first.listener);
+    }
+
+    const second = await startHealthServer(healthConfig);
+    try {
+      const healthyM2 = await requestHealth(second.port);
+      assert.equal(healthyM2.status, 200);
+      assert.equal(healthyM2.body.ok, true);
+      assert.equal(healthyM2.body.manifest_status, "verified");
+      assert.equal(healthyM2.body.observed_manifest_count, 2);
+      assert.equal(healthyM2.body.observed_manifest_revision, "manifest-m2");
+
+      unavailable = true;
+      const failedClosed = await requestHealth(second.port);
+      assert.equal(failedClosed.status, 503);
+      assert.equal(failedClosed.body.ok, false);
+      assert.equal(failedClosed.body.manifest_status, "unavailable");
+      assert.equal(
+        failedClosed.body.disposition,
+        "CANONICAL_GATEWAY_MANIFEST_UNAVAILABLE",
+      );
+    } finally {
+      await stopHealthServer(second.running, second.listener);
+    }
+  } finally {
+    globalThis.fetch = healthOriginalFetch;
+    rmSync(healthRoot, { recursive: true, force: true });
+  }
 }

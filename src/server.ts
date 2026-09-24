@@ -2095,14 +2095,69 @@ export function createServer(
   app.get("/healthz", async (_req, res) => {
     await gatewayManifestReady;
     const identity = getSurfaceIdentity(config, observedManifest);
-    const ready = !manifestError;
-    res.status(ready ? 200 : 503).json({
-      ok: ready,
+    const build = readPackageBuildIdentity();
+
+    if (manifestError) {
+      res.status(503).json({
+        ok: false,
+        name: identity.proxy_mode ? "nexus-mcp-gateway" : "devspace",
+        ...identity,
+        manifest_status: "unavailable",
+        build,
+        disposition: "PUBLIC_SURFACE_FAIL_CLOSED",
+      });
+      return;
+    }
+
+    if (identity.proxy_mode) {
+      try {
+        const freshManifest = await fetchNexusGatewayToolManifest(config);
+        assertCanonicalGatewayProxyManifestCompatible(freshManifest);
+        const freshManifestIdentity = nexusGatewayManifestIdentity(
+          freshManifest,
+          freshManifest.revision,
+        );
+        const registeredManifestIdentity = observedManifest;
+
+        if (
+          !registeredManifestIdentity ||
+          registeredManifestIdentity.count !== freshManifestIdentity.count ||
+          registeredManifestIdentity.revision !== freshManifestIdentity.revision ||
+          registeredManifestIdentity.sha256 !== freshManifestIdentity.sha256
+        ) {
+          res.status(503).json({
+            ok: false,
+            name: "nexus-mcp-gateway",
+            ...identity,
+            manifest_status: "drifted",
+            build,
+            disposition: "CANONICAL_GATEWAY_MANIFEST_DRIFT",
+            required_action: "PROXY_RESTART_REQUIRED",
+            registered_manifest: registeredManifestIdentity ?? null,
+            fresh_manifest: freshManifestIdentity,
+          });
+          return;
+        }
+      } catch {
+        res.status(503).json({
+          ok: false,
+          name: "nexus-mcp-gateway",
+          ...identity,
+          manifest_status: "unavailable",
+          build,
+          disposition: "CANONICAL_GATEWAY_MANIFEST_UNAVAILABLE",
+          required_action: "PROXY_RESTART_REQUIRED",
+        });
+        return;
+      }
+    }
+
+    res.status(200).json({
+      ok: true,
       name: identity.proxy_mode ? "nexus-mcp-gateway" : "devspace",
       ...identity,
-      manifest_status: ready ? (identity.proxy_mode ? "verified" : "not_applicable") : "unavailable",
-      build: readPackageBuildIdentity(),
-      ...(ready ? {} : { disposition: "PUBLIC_SURFACE_FAIL_CLOSED" }),
+      manifest_status: identity.proxy_mode ? "verified" : "not_applicable",
+      build,
     });
   });
 
