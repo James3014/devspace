@@ -341,6 +341,45 @@ function ownerToolManifest() {
   });
 }
 
+test("execution generation rejects provider/runtime/adapter/auth substitution on the same host", () => {
+  const hostIdentity = buildHostIdentityBinding({
+    environment: { HOME: "/Users/james", PATH: "/opt/homebrew/bin:/usr/bin", DEVSPACE_HOST_ID: "m5" },
+    stateRoot: "/Users/james/.local/share/devspace",
+    devspaceBuildId: "build-1",
+    devspaceSourceCommit: "a".repeat(40),
+    platform: "darwin",
+    arch: "arm64",
+    nodeVersion: "24.8.0",
+  });
+  const base = {
+    profileCatalogGeneration: "catalog-a",
+    provider: "codex",
+    model: "gpt-5.6-sol",
+    executionIdentity: "/opt/codex/bin/codex",
+    runtimeVersion: "0.152.0",
+    devspaceBuildId: "build-1",
+    devspaceSourceCommit: "a".repeat(40),
+    hostIdentity,
+    adapterGeneration: "devspace.herdr-thin-gateway.v1",
+    authReadiness: "unknown" as const,
+  };
+  const stored = buildExecutionGenerationBinding(base);
+  const variants = [
+    buildExecutionGenerationBinding({ ...base, model: "gpt-5.6-codex" }),
+    buildExecutionGenerationBinding({ ...base, executionIdentity: "/usr/local/bin/codex" }),
+    buildExecutionGenerationBinding({ ...base, runtimeVersion: "0.153.0" }),
+    buildExecutionGenerationBinding({ ...base, adapterGeneration: "devspace.herdr-thin-gateway.v2" }),
+    buildExecutionGenerationBinding({ ...base, authReadiness: true }),
+  ];
+  for (const current of variants) {
+    assert.throws(
+      () => assertSameExecutionGeneration(stored, current),
+      (error: unknown) =>
+        error instanceof ExecutionProtocolError && error.code === "EXECUTION_GENERATION_MISMATCH",
+    );
+  }
+});
+
 test("ToolProjectionManifest canonicalizes order-independent sets and hashes deterministically", () => {
   const manifest = ownerToolManifest();
   assert.deepEqual(manifest.authorizedToolCeiling, ["process.execute", "workspace.read", "workspace.search_text"]);
