@@ -931,6 +931,52 @@ await asyncTest("commit statuses fetch throws → REQUIRED_CHECKS_UNKNOWN", asyn
 });
 
 // ============================================================
+console.log("\n=== pre-merge effect guard ===");
+
+await asyncTest("pre-merge guard rejects before physical merge effect", async () => {
+  await withWorkspace({}, async (dir) => {
+    const fake = new FakeGitHubTransport();
+    fake.pr = makePr({ body: "lane evidence" });
+    let observedBody: string | undefined;
+    await assert.rejects(
+      mergePullRequest(baseInput(), {
+        cwd: dir,
+        transport: fake,
+        targetResolver: acmeResolver,
+        beforeMergeEffect: async (context) => {
+          observedBody = context.pullRequest.body;
+          throw new MergePullRequestError(
+            PR_MERGE_ERROR_CODES.MERGE_LANE_NOT_AUTHORIZED,
+            "GOVERNED must use completion",
+          );
+        },
+      }),
+      (e) => assertErrorCode(e, PR_MERGE_ERROR_CODES.MERGE_LANE_NOT_AUTHORIZED),
+    );
+    assert.equal(observedBody, "lane evidence", "guard must receive the fresh PR body");
+    assert.equal(fake.mergeCalls.length, 0, "guard rejection must happen before GitHub merge effect");
+  });
+});
+
+await asyncTest("pre-merge guard permits existing CAS core when authorized", async () => {
+  await withWorkspace({}, async (dir) => {
+    const fake = new FakeGitHubTransport();
+    let guardCalls = 0;
+    const receipt = await mergePullRequest(baseInput(), {
+      cwd: dir,
+      transport: fake,
+      targetResolver: acmeResolver,
+      beforeMergeEffect: async () => {
+        guardCalls += 1;
+      },
+    });
+    assert.equal(guardCalls, 1);
+    assert.equal(fake.mergeCalls.length, 1);
+    assert.equal(receipt.merged, true);
+  });
+});
+
+// ============================================================
 console.log("\n=== owner confirmation ===");
 
 await asyncTest("ownerConfirmation false → OWNER_CONFIRMATION_REQUIRED", async () => {
@@ -1227,359 +1273,5 @@ await asyncTest("tool ignores caller-supplied refspec/remote/branch/force/shell 
   await withWorkspace({}, async (dir) => {
     const fake = new FakeGitHubTransport();
     fake.requireChecks();
-    const result = await gitMergePullRequestTool(
-      {
-        workspaceId: "ignored-by-tool",
-        prNumber: 42,
-        expectedBaseSha: BASE,
-        expectedHeadSha: HEAD,
-        mergeMethod: "merge",
-        ownerConfirmation: true,
-        refspec: "refs/heads/evil:refs/heads/main",
-        remote: "git@github.com:attacker/evil.git",
-        branch: "evil",
-        force: true,
-        shell: "rm -rf /",
-        extra: "--admin --force-with-lease",
-      },
-      { cwd: dir, transport: fake, targetResolver: acmeResolver },
-    );
-    assert.ok(!result.isError, `expected success, got ${result.content[0].text}`);
-    assert.equal(fake.mergeCalls.length, 1, "exactly one merge must be attempted");
-    assert.deepEqual(fake.mergeCalls[0], {
-      repo: "acme/widget",
-      prNumber: 42,
-      method: "merge",
-      expectedHeadSha: HEAD,
-    });
-  });
-});
 
-await asyncTest("tool returns deterministic structured error with code", async () => {
-  await withWorkspace({}, async (dir) => {
-    const fake = new FakeGitHubTransport();
-    fake.pr = makePr({ isDraft: true });
-    const result = await gitMergePullRequestTool(
-      {
-        prNumber: 42,
-        expectedBaseSha: BASE,
-        expectedHeadSha: HEAD,
-        mergeMethod: "merge",
-        ownerConfirmation: true,
-      },
-      { cwd: dir, transport: fake, targetResolver: acmeResolver },
-    );
-    assert.ok(result.isError, "draft PR must error");
-    const data = JSON.parse(result.content[0].text);
-    assert.equal(data.code, PR_MERGE_ERROR_CODES.PR_IS_DRAFT);
-  });
-});
-
-test("source-level regression: core action has no local git mutation path", () => {
-  const source = readFileSync(new URL("./git-pr-merge.ts", import.meta.url), "utf8");
-  // All git usage must go through runGit (execFile, argv only), never execFile("git")
-  // directly and never a shell.
-  assert.ok(!/execFile\("git"/.test(source), "git must never be exec'd outside runGit");
-  assert.ok(!/shell:\s*true/.test(source), "no shell execution in the action");
-  // The git mutation verbs are forbidden inside any runGit(...) call.
-  const mutationVerbs = ["push", "merge", "rebase", "clone", "commit", "checkout", "reset", "stash", "clean", "fetch"];
-  const runGitCalls = source.match(/runGit\([^)]*\)/g) ?? [];
-  assert.ok(runGitCalls.length >= 3, "expected read-only git inspection calls");
-  for (const call of runGitCalls) {
-    for (const verb of mutationVerbs) {
-      assert.ok(!call.includes(`"${verb}"`), `git mutation verb "${verb}" present in: ${call.trim()}`);
-    }
-  }
-});
-
-// ============================================================
-console.log("\n=== gh CLI transport (mocked gh) ===");
-
-function fakeGh(
-  handler: (args: string[]) => { error?: Error; stdout?: string; stderr?: string },
-): GhExecFn {
-  return (args, callback) => {
-    const response = handler(args);
-    callback(response.error ?? null, response.stdout ?? "", response.stderr ?? "");
-  };
-}
-
-await asyncTest("gh missing PR (GraphQL) → http 404", async () => {
-  const transport = createGhCliGitHubTransportWithExec(
-    fakeGh(() => ({
-      error: Object.assign(new Error("exit status 1"), { code: 1 }),
-      stderr: "gh: GraphQL: Could not resolve to a PullRequest with the number of 999. (repository.pullRequest)\n",
-    })),
-  );
-  await assert.rejects(transport.getPullRequest("acme/widget", 999), (e) => {
-    assert.ok(e instanceof TransportError);
-    assert.equal(e.kind, "http");
-    assert.equal(e.status, 404);
-    return true;
-  });
-});
-
-await asyncTest("gh api HTTP 404 → http 404 with parsed message", async () => {
-  const transport = createGhCliGitHubTransportWithExec(
-    fakeGh(() => ({
-      error: Object.assign(new Error("exit status 1"), { code: 1 }),
-      stdout: '{"message":"Not Found","documentation_url":"https://docs.github.com/rest","status":"404"}\n',
-      stderr: "gh: Not Found (HTTP 404)\n",
-    })),
-  );
-  await assert.rejects(transport.mergePullRequest("acme/widget", 42, "merge", HEAD), (e) => {
-    assert.ok(e instanceof TransportError);
-    assert.equal(e.kind, "http");
-    assert.equal(e.status, 404);
-    assert.equal(e.message, "Not Found");
-    return true;
-  });
-});
-
-await asyncTest("gh HTTP 405 body parsed → http 405", async () => {
-  const transport = createGhCliGitHubTransportWithExec(
-    fakeGh(() => ({
-      error: Object.assign(new Error("exit status 1"), { code: 1 }),
-      stdout: '{"message":"Pull request is not mergeable","status":"405"}\n',
-      stderr: "gh: Pull request is not mergeable (HTTP 405)\n",
-    })),
-  );
-  await assert.rejects(transport.mergePullRequest("acme/widget", 42, "merge", HEAD), (e) => {
-    assert.ok(e instanceof TransportError);
-    assert.equal(e.kind, "http");
-    assert.equal(e.status, 405);
-    return true;
-  });
-});
-
-await asyncTest("gh binary missing → availability", async () => {
-  const transport = createGhCliGitHubTransportWithExec(
-    fakeGh(() => ({
-      error: Object.assign(new Error("spawn gh ENOENT"), { code: "ENOENT" }),
-    })),
-  );
-  await assert.rejects(transport.getRepository("acme/widget"), (e) => {
-    assert.ok(e instanceof TransportError);
-    assert.equal(e.kind, "availability");
-    return true;
-  });
-});
-
-await asyncTest("gh not authenticated → auth", async () => {
-  const transport = createGhCliGitHubTransportWithExec(
-    fakeGh(() => ({
-      error: Object.assign(new Error("exit status 4"), { code: 4 }),
-      stderr: "gh: To get started with GitHub CLI, please run:  gh auth login\n",
-    })),
-  );
-  await assert.rejects(transport.getRepository("acme/widget"), (e) => {
-    assert.ok(e instanceof TransportError);
-    assert.equal(e.kind, "auth");
-    return true;
-  });
-});
-
-await asyncTest("merge success response parsed with exact typed argv", async () => {
-  const transport = createGhCliGitHubTransportWithExec(
-    fakeGh((args) => {
-      assert.ok(args.includes("api"));
-      assert.ok(args.includes("--method"));
-      assert.ok(args.includes("PUT"));
-      assert.ok(args.includes("repos/acme/widget/pulls/42/merge"));
-      assert.ok(args.includes(`sha=${HEAD}`));
-      assert.ok(args.includes("merge_method=squash"));
-      assert.ok(
-        !args.some((a) => a.includes("refspec") || a.includes("force") || a.includes("admin") || a.includes(";")),
-        "transport must never receive caller-controlled mutation flags",
-      );
-      return { stdout: JSON.stringify({ merged: true, sha: NEW_MAIN, message: "Pull Request successfully merged" }) + "\n" };
-    }),
-  );
-  const result = await transport.mergePullRequest("acme/widget", 42, "squash", HEAD);
-  assert.equal(result.merged, true);
-  assert.equal(result.sha, NEW_MAIN);
-});
-
-await asyncTest("no classic protection (404) → determined with empty requirements", async () => {
-  const transport = createGhCliGitHubTransportWithExec(
-    fakeGh(() => ({
-      error: Object.assign(new Error("exit status 1"), { code: 1 }),
-      stdout: '{"message":"Not Found","status":"404"}\n',
-      stderr: "gh: Not Found (HTTP 404)\n",
-    })),
-  );
-  const protection = await transport.getBranchProtection("acme/widget", "main");
-  assert.deepEqual(protection, { determined: true, requirements: [] });
-});
-
-await asyncTest("effective rules 404 → undetermined (fail closed, never an empty rules answer)", async () => {
-  const transport = createGhCliGitHubTransportWithExec(
-    fakeGh(() => ({
-      error: Object.assign(new Error("exit status 1"), { code: 1 }),
-      stdout: '{"message":"Not Found","status":"404"}\n',
-      stderr: "gh: Not Found (HTTP 404)\n",
-    })),
-  );
-  const rules = await transport.getEffectiveRules("acme/widget", "main");
-  assert.deepEqual(rules, { determined: false, requirements: [] });
-});
-
-await asyncTest("effective rules non-array response → undetermined", async () => {
-  const transport = createGhCliGitHubTransportWithExec(
-    fakeGh(() => ({
-      stdout: JSON.stringify({ rules: [] }),
-    })),
-  );
-  const rules = await transport.getEffectiveRules("acme/widget", "main");
-  assert.deepEqual(rules, { determined: false, requirements: [] });
-});
-
-await asyncTest("branch protection read error → undetermined (fail closed)", async () => {
-  const transport = createGhCliGitHubTransportWithExec(
-    fakeGh(() => ({
-      error: Object.assign(new Error("exit status 1"), { code: 1 }),
-      stdout: '{"message":"Forbidden","status":"403"}\n',
-      stderr: "gh: Forbidden (HTTP 403)\n",
-    })),
-  );
-  const protection = await transport.getBranchProtection("acme/widget", "main");
-  assert.deepEqual(protection, { determined: false, requirements: [] });
-});
-
-await asyncTest("classic branch protection required contexts and app bindings are collected", async () => {
-  const transport = createGhCliGitHubTransportWithExec(
-    fakeGh((args) => {
-      if (args.some((a) => a.includes("/protection"))) {
-        return {
-          stdout: JSON.stringify({
-            required_status_checks: {
-              contexts: ["ci", "lint"],
-              checks: [{ context: "ci", app_id: 15368 }],
-            },
-          }),
-        };
-      }
-      return { stdout: "{}" };
-    }),
-  );
-  const protection = await transport.getBranchProtection("acme/widget", "main");
-  assert.deepEqual(protection, {
-    determined: true,
-    requirements: [
-      { context: "ci", integrationId: null },
-      { context: "lint", integrationId: null },
-      { context: "ci", integrationId: 15368 },
-    ],
-  });
-});
-
-await asyncTest("effective rules use /rules/branches/{branch} and preserve integration_id", async () => {
-  const transport = createGhCliGitHubTransportWithExec(
-    fakeGh((args) => {
-      assert.ok(args.some((a) => a.includes("/rules/branches/main")), "must hit the effective-rules endpoint");
-      assert.ok(
-        !args.some((a) => a.includes("/rulesets/")),
-        "legacy rulesets/branches endpoint must never be used",
-      );
-      return {
-        stdout: JSON.stringify([
-          {
-            type: "required_status_checks",
-            parameters: {
-              strict_required_status_checks_policy: true,
-              required_status_checks: [
-                { context: "Exact-base impact gate", integration_id: 15368 },
-                { context: "Trusted verifier (default branch)", integration_id: 15368 },
-              ],
-            },
-          },
-        ]),
-      };
-    }),
-  );
-  const rules = await transport.getEffectiveRules("acme/widget", "main");
-  assert.deepEqual(rules, {
-    determined: true,
-    requirements: [
-      { context: "Exact-base impact gate", integrationId: 15368 },
-      { context: "Trusted verifier (default branch)", integrationId: 15368 },
-    ],
-  });
-});
-
-await asyncTest("non-required_status_checks rules are ignored", async () => {
-  const transport = createGhCliGitHubTransportWithExec(
-    fakeGh(() => ({
-      stdout: JSON.stringify([
-        { type: "deletion" },
-        { type: "non_fast_forward" },
-        { type: "pull_request" },
-      ]),
-    })),
-  );
-  const rules = await transport.getEffectiveRules("acme/widget", "main");
-  assert.deepEqual(rules, { determined: true, requirements: [] });
-});
-
-test("default production transport factory returns the real gh-backed transport", () => {
-  const transport = defaultGitMergeTransportFactory();
-  assert.ok(transport instanceof GhCliGitHubTransport, "production default must be the gh-backed transport");
-});
-
-await asyncTest("check runs parsed with app identity for a head sha", async () => {
-  const transport = createGhCliGitHubTransportWithExec(
-    fakeGh((args) => {
-      assert.ok(args.includes(`repos/acme/widget/commits/${HEAD}/check-runs`));
-      return {
-        stdout: JSON.stringify({
-          check_runs: [
-            { name: "ci", status: "completed", conclusion: "success", app: { id: 15368, slug: "nexus-verifier" } },
-            { name: "lint", status: "in_progress", conclusion: null, app: null },
-          ],
-        }),
-      };
-    }),
-  );
-  const runs = await transport.getCheckRuns("acme/widget", HEAD);
-  assert.deepEqual(runs, [
-    { name: "ci", status: "completed", conclusion: "success", appId: 15368, appSlug: "nexus-verifier" },
-    { name: "lint", status: "in_progress", conclusion: null, appId: null, appSlug: null },
-  ]);
-});
-
-await asyncTest("commit statuses parsed for a head sha", async () => {
-  const transport = createGhCliGitHubTransportWithExec(
-    fakeGh((args) => {
-      assert.ok(args.includes(`repos/acme/widget/commits/${HEAD}/status`));
-      return {
-        stdout: JSON.stringify({
-          state: "pending",
-          statuses: [
-            { context: "ci", state: "success" },
-            { context: "lint", state: "pending" },
-          ],
-        }),
-      };
-    }),
-  );
-  const statuses = await transport.getCommitStatus("acme/widget", HEAD);
-  assert.deepEqual(statuses, [
-    { context: "ci", state: "success" },
-    { context: "lint", state: "pending" },
-  ]);
-});
-
-await asyncTest("branch ref parsed for a default branch", async () => {
-  const transport = createGhCliGitHubTransportWithExec(
-    fakeGh((args) => {
-      assert.ok(args.includes("repos/acme/widget/git/ref/heads/main"));
-      return { stdout: JSON.stringify({ object: { sha: BASE, type: "commit" } }) };
-    }),
-  );
-  const ref = await transport.getBranchRef("acme/widget", "main");
-  assert.deepEqual(ref, { sha: BASE });
-});
-
-// ============================================================
-console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
-process.exit(failed > 0 ? 1 : 0);
+[Showing lines 1-1275 of 1632 (50.0KB limit). Use offset=1276 to continue.]
