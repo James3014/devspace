@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { buildHostIdentityBinding, parseHostIdentityBinding, type HostIdentityBinding } from "./host-identity.js";
 
 /**
  * Common execution vocabulary shared by DevSpace adapters.
@@ -238,6 +239,9 @@ export interface ExecutionGenerationBinding {
   runtimeVersion?: string;
   devspaceBuildId: string;
   devspaceSourceCommit: string;
+  hostIdentity: HostIdentityBinding;
+  adapterGeneration: string;
+  authReadiness: boolean | "unknown";
   capabilitySurfaceDigest: string;
   executionBindingHash: string;
 }
@@ -835,13 +839,29 @@ export function assertExecutionAuthority(
   }
 }
 
-export function buildExecutionGenerationBinding(input: Omit<ExecutionGenerationBinding, "capabilitySurfaceDigest" | "executionBindingHash"> & {
+export function buildExecutionGenerationBinding(input: Omit<
+  ExecutionGenerationBinding,
+  "hostIdentity" | "adapterGeneration" | "authReadiness" | "capabilitySurfaceDigest" | "executionBindingHash"
+> & {
+  hostIdentity?: HostIdentityBinding;
+  adapterGeneration?: string;
+  authReadiness?: boolean | "unknown";
   capabilitySurfaceDigest?: string;
 }): ExecutionGenerationBinding {
+  const hostIdentity = input.hostIdentity ?? buildHostIdentityBinding({
+    environment: process.env,
+    stateRoot: process.env.DEVSPACE_STATE_DIR ?? process.cwd(),
+    devspaceBuildId: input.devspaceBuildId,
+    devspaceSourceCommit: input.devspaceSourceCommit,
+  });
+  const adapterGeneration = input.adapterGeneration ?? "devspace.execution-adapter.unspecified.v1";
+  const authReadiness = input.authReadiness ?? "unknown";
   const capabilitySurfaceDigest = input.capabilitySurfaceDigest ?? sha256(canonicalJson({
     profileCatalogGeneration: input.profileCatalogGeneration,
     devspaceBuildId: input.devspaceBuildId,
     devspaceSourceCommit: input.devspaceSourceCommit,
+    hostIdentityHash: hostIdentity.hostIdentityHash,
+    adapterGeneration,
   }));
   const withoutHash = {
     profileCatalogGeneration: input.profileCatalogGeneration,
@@ -851,6 +871,9 @@ export function buildExecutionGenerationBinding(input: Omit<ExecutionGenerationB
     runtimeVersion: input.runtimeVersion,
     devspaceBuildId: input.devspaceBuildId,
     devspaceSourceCommit: input.devspaceSourceCommit,
+    hostIdentity,
+    adapterGeneration,
+    authReadiness,
     capabilitySurfaceDigest,
   };
   return {
@@ -891,10 +914,18 @@ export function deserializeExecutionGenerationBinding(value: string | null | und
       typeof parsed.executionIdentity !== "string" ||
       typeof parsed.devspaceBuildId !== "string" ||
       typeof parsed.devspaceSourceCommit !== "string" ||
+      typeof parsed.adapterGeneration !== "string" ||
+      (parsed.authReadiness !== true && parsed.authReadiness !== false && parsed.authReadiness !== "unknown") ||
       typeof parsed.capabilitySurfaceDigest !== "string" ||
       typeof parsed.executionBindingHash !== "string"
     ) return undefined;
-    return parsed as ExecutionGenerationBinding;
+    let hostIdentity: HostIdentityBinding;
+    try {
+      hostIdentity = parseHostIdentityBinding(parsed.hostIdentity);
+    } catch {
+      return undefined;
+    }
+    return { ...parsed, hostIdentity } as ExecutionGenerationBinding;
   } catch {
     return undefined;
   }
@@ -1287,16 +1318,48 @@ export function validateDirectCandidateExecutionEvidence(value: unknown): Direct
   if (!isRecord(gen)) {
     throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution.execution_generation must be an object.");
   }
-  const requiredGenKeys = ["profileCatalogGeneration", "provider", "executionIdentity", "devspaceBuildId", "devspaceSourceCommit", "capabilitySurfaceDigest", "executionBindingHash"];
+  const requiredGenKeys = [
+    "profileCatalogGeneration",
+    "provider",
+    "executionIdentity",
+    "devspaceBuildId",
+    "devspaceSourceCommit",
+    "adapterGeneration",
+    "capabilitySurfaceDigest",
+    "executionBindingHash",
+  ];
   for (const key of requiredGenKeys) {
     if (typeof gen[key] !== "string" || !gen[key]) {
       throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", `execution_generation.${key} must be a non-empty string.`);
     }
   }
+  if (gen.authReadiness !== true && gen.authReadiness !== false && gen.authReadiness !== "unknown") {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution_generation.authReadiness is invalid.");
+  }
+  let hostIdentity: HostIdentityBinding;
+  try {
+    hostIdentity = parseHostIdentityBinding(gen.hostIdentity);
+  } catch (error) {
+    throw new ExecutionProtocolError(
+      "INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE",
+      `execution_generation.hostIdentity is invalid: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+  if (
+    hostIdentity.devspaceBuildId !== gen.devspaceBuildId ||
+    hostIdentity.devspaceSourceCommit !== gen.devspaceSourceCommit
+  ) {
+    throw new ExecutionProtocolError(
+      "INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE",
+      "execution_generation.hostIdentity build/source do not match execution generation.",
+    );
+  }
   const expectedCapabilityDigest = sha256(canonicalJson({
     profileCatalogGeneration: gen.profileCatalogGeneration,
     devspaceBuildId: gen.devspaceBuildId,
     devspaceSourceCommit: gen.devspaceSourceCommit,
+    hostIdentityHash: hostIdentity.hostIdentityHash,
+    adapterGeneration: gen.adapterGeneration,
   }));
   if (gen.capabilitySurfaceDigest !== expectedCapabilityDigest) {
     throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution_generation.capabilitySurfaceDigest mismatch.");
@@ -1307,6 +1370,9 @@ export function validateDirectCandidateExecutionEvidence(value: unknown): Direct
     executionIdentity: gen.executionIdentity,
     devspaceBuildId: gen.devspaceBuildId,
     devspaceSourceCommit: gen.devspaceSourceCommit,
+    hostIdentity,
+    adapterGeneration: gen.adapterGeneration,
+    authReadiness: gen.authReadiness,
     capabilitySurfaceDigest: expectedCapabilityDigest,
   };
   if (gen.model !== undefined) genPayload.model = gen.model;

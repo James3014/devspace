@@ -4,6 +4,7 @@ import { isAbsolute, relative, resolve } from "node:path";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { registerAppTool } from "@modelcontextprotocol/ext-apps/server";
 import * as z from "zod/v4";
+import { parseHostIdentityBinding, type HostIdentityBinding } from "./host-identity.js";
 
 const MAX_HOSTS = 16;
 const MAX_IDENTITY_BYTES = 128 * 1024;
@@ -17,6 +18,7 @@ export interface PhysicalHostExpectedIdentity {
   sourceCommit: string;
   buildId: string;
   capabilityManifestSha256: string;
+  hostIdentityHash: string;
 }
 
 export interface PhysicalHostDefinition {
@@ -41,6 +43,7 @@ export interface RemoteDevspaceIdentity {
   buildId: string;
   serverInstanceId: string;
   startedAt?: string;
+  hostIdentity: HostIdentityBinding;
   capabilityManifest: RemoteCapabilityManifest;
 }
 
@@ -130,6 +133,7 @@ function parseHost(value: unknown): PhysicalHostDefinition {
         "expected.capabilityManifestSha256",
         SHA256,
       ),
+      hostIdentityHash: exactString(expected.hostIdentityHash, "expected.hostIdentityHash", SHA256),
     },
   };
 }
@@ -198,14 +202,21 @@ function parseRemoteIdentity(value: unknown): RemoteDevspaceIdentity {
   const record = objectRecord(value, "remote identity");
   if (record.product !== "devspace") throw new Error("Remote identity product must be devspace.");
   if (typeof record.sourceDirty !== "boolean") throw new Error("Remote identity sourceDirty must be boolean.");
+  const sourceCommit = exactString(record.sourceCommit, "remote sourceCommit", SOURCE_COMMIT);
+  const buildId = exactString(record.buildId, "remote buildId");
+  const hostIdentity = parseHostIdentityBinding(record.hostIdentity);
+  if (hostIdentity.devspaceSourceCommit !== sourceCommit || hostIdentity.devspaceBuildId !== buildId) {
+    throw new Error("Remote host identity build/source do not match top-level runtime identity.");
+  }
   return {
     product: "devspace",
     version: exactString(record.version, "remote identity version"),
-    sourceCommit: exactString(record.sourceCommit, "remote sourceCommit", SOURCE_COMMIT),
+    sourceCommit,
     sourceDirty: record.sourceDirty,
-    buildId: exactString(record.buildId, "remote buildId"),
+    buildId,
     serverInstanceId: exactString(record.serverInstanceId, "remote serverInstanceId"),
     ...(typeof record.startedAt === "string" ? { startedAt: record.startedAt } : {}),
+    hostIdentity,
     capabilityManifest: parseCapabilityManifest(record.capabilityManifest),
   };
 }
@@ -297,8 +308,12 @@ export class PhysicalHostRegistry {
       }
       const mismatches: string[] = [];
       if (observed.sourceDirty) mismatches.push("sourceDirty");
+      if (observed.hostIdentity.hostId !== host.hostId) mismatches.push("hostId");
       if (observed.sourceCommit !== host.expected.sourceCommit) mismatches.push("sourceCommit");
       if (observed.buildId !== host.expected.buildId) mismatches.push("buildId");
+      if (observed.hostIdentity.hostIdentityHash !== host.expected.hostIdentityHash) {
+        mismatches.push("hostIdentityHash");
+      }
       if (observed.capabilityManifest.manifestSha256 !== host.expected.capabilityManifestSha256) {
         mismatches.push("capabilityManifestSha256");
       }

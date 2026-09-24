@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { buildHostIdentityBinding, type HostIdentityBinding } from "./host-identity.js";
 
 /**
  * Immutable build identity, generated at build time by
@@ -38,6 +39,7 @@ export interface RuntimeBuildIdentity {
   configRoot: string;
   stateRoot: string;
   profileCatalogGeneration: string;
+  hostIdentity?: HostIdentityBinding;
 }
 
 function packageRoot(): string {
@@ -125,5 +127,11 @@ export function describeRuntimeBuildIdentity(input: {
     configRoot: input.configRoot,
     stateRoot: input.stateRoot,
     profileCatalogGeneration: input.profileCatalogGeneration,
+    hostIdentity: buildHostIdentityBinding({
+      environment: input.env ?? process.env,
+      stateRoot: input.stateRoot,
+      devspaceBuildId: file.build_id,
+      devspaceSourceCommit: file.source_commit,
+    }),
   };
 }

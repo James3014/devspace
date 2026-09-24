@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import test from "node:test";
+import { buildHostIdentityBinding } from "./host-identity.js";
 import {
   EXECUTION_PROTOCOL_VERSION,
   NEXUS_TOOL_AUTHORITY_SCHEMA,
@@ -275,6 +276,56 @@ test("execution generation accepts exact generation and rejects substitution or 
     () => assertSameExecutionGeneration(undefined, generation),
     (error: unknown) => error instanceof ExecutionProtocolError && error.code === "LEGACY_EXECUTION_BINDING_MISSING",
   );
+
+  const hostA = buildHostIdentityBinding({
+    environment: { HOME: "/Users/james", PATH: "/opt/homebrew/bin:/usr/bin", DEVSPACE_HOST_ID: "m5" },
+    stateRoot: "/Users/james/.local/share/devspace",
+    devspaceBuildId: "devspace-1.0.7-deadbeef",
+    devspaceSourceCommit: "deadbeef",
+    platform: "darwin",
+    arch: "arm64",
+    nodeVersion: "24.8.0",
+    hostname: "m5.local",
+  });
+  const hostB = buildHostIdentityBinding({
+    environment: { HOME: "/Users/jameschen", PATH: "/usr/local/bin:/usr/bin", DEVSPACE_HOST_ID: "m4" },
+    stateRoot: "/Users/jameschen/.local/share/devspace",
+    devspaceBuildId: "devspace-1.0.7-deadbeef",
+    devspaceSourceCommit: "deadbeef",
+    platform: "darwin",
+    arch: "arm64",
+    nodeVersion: "24.8.0",
+    hostname: "m4.local",
+  });
+  const hostBoundA = buildExecutionGenerationBinding({
+    profileCatalogGeneration: "catalog-a",
+    provider: "codex",
+    model: "gpt-5.6-sol",
+    executionIdentity: "/opt/codex/bin/codex.js",
+    runtimeVersion: "0.152.0",
+    devspaceBuildId: "devspace-1.0.7-deadbeef",
+    devspaceSourceCommit: "deadbeef",
+    hostIdentity: hostA,
+    adapterGeneration: "devspace.herdr-thin-gateway.v1",
+    authReadiness: "unknown",
+  });
+  const hostBoundB = buildExecutionGenerationBinding({
+    profileCatalogGeneration: "catalog-a",
+    provider: "codex",
+    model: "gpt-5.6-sol",
+    executionIdentity: "/opt/codex/bin/codex.js",
+    runtimeVersion: "0.152.0",
+    devspaceBuildId: "devspace-1.0.7-deadbeef",
+    devspaceSourceCommit: "deadbeef",
+    hostIdentity: hostB,
+    adapterGeneration: "devspace.herdr-thin-gateway.v1",
+    authReadiness: "unknown",
+  });
+  assert.notEqual(hostBoundA.hostIdentity.hostIdentityHash, hostBoundB.hostIdentity.hostIdentityHash);
+  assert.throws(
+    () => assertSameExecutionGeneration(hostBoundA, hostBoundB),
+    (error: unknown) => error instanceof ExecutionProtocolError && error.code === "EXECUTION_GENERATION_MISMATCH",
+  );
 });
 
 function ownerToolManifest() {
@@ -289,6 +340,45 @@ function ownerToolManifest() {
     orderingMode: "ORDER_INDEPENDENT",
   });
 }
+
+test("execution generation rejects provider/runtime/adapter/auth substitution on the same host", () => {
+  const hostIdentity = buildHostIdentityBinding({
+    environment: { HOME: "/Users/james", PATH: "/opt/homebrew/bin:/usr/bin", DEVSPACE_HOST_ID: "m5" },
+    stateRoot: "/Users/james/.local/share/devspace",
+    devspaceBuildId: "build-1",
+    devspaceSourceCommit: "a".repeat(40),
+    platform: "darwin",
+    arch: "arm64",
+    nodeVersion: "24.8.0",
+  });
+  const base = {
+    profileCatalogGeneration: "catalog-a",
+    provider: "codex",
+    model: "gpt-5.6-sol",
+    executionIdentity: "/opt/codex/bin/codex",
+    runtimeVersion: "0.152.0",
+    devspaceBuildId: "build-1",
+    devspaceSourceCommit: "a".repeat(40),
+    hostIdentity,
+    adapterGeneration: "devspace.herdr-thin-gateway.v1",
+    authReadiness: "unknown" as const,
+  };
+  const stored = buildExecutionGenerationBinding(base);
+  const variants = [
+    buildExecutionGenerationBinding({ ...base, model: "gpt-5.6-codex" }),
+    buildExecutionGenerationBinding({ ...base, executionIdentity: "/usr/local/bin/codex" }),
+    buildExecutionGenerationBinding({ ...base, runtimeVersion: "0.153.0" }),
+    buildExecutionGenerationBinding({ ...base, adapterGeneration: "devspace.herdr-thin-gateway.v2" }),
+    buildExecutionGenerationBinding({ ...base, authReadiness: true }),
+  ];
+  for (const current of variants) {
+    assert.throws(
+      () => assertSameExecutionGeneration(stored, current),
+      (error: unknown) =>
+        error instanceof ExecutionProtocolError && error.code === "EXECUTION_GENERATION_MISMATCH",
+    );
+  }
+});
 
 test("ToolProjectionManifest canonicalizes order-independent sets and hashes deterministically", () => {
   const manifest = ownerToolManifest();

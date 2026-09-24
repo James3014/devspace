@@ -9,6 +9,7 @@ import { canonicalizePath } from "./roots.js";
 
 export const HERDR_DEFAULT_SOCKET_PATH = process.env.HERDR_SOCKET_PATH || "/Users/james/.config/herdr/herdr.sock";
 export const HERDR_RUNTIME_KIND = "HERDR" as const;
+export const HERDR_ADAPTER_GENERATION = "devspace.herdr-thin-gateway.v1" as const;
 
 export type HerdrAgentKind = "opencode" | "agy" | "codex" | "cline" | "grok";
 
