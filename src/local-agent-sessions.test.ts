@@ -185,6 +185,52 @@ test("LocalAgentSessionManager - startAgent and PROVIDER_UNAVAILABLE", async () 
   }
 });
 
+test("agent preflight and start persist the same host-bound execution generation", async () => {
+  const { manager, spawnedWorkers, clean, stateDir } = setupFixture();
+  try {
+    manager.bindCapabilityManifestSha256("d".repeat(64));
+    const workspaceRoot = stateDir;
+    const preflight = await manager.preflightAgent({
+      workspaceId: "ws_host_generation",
+      workspaceRoot,
+      isolated: true,
+      profileName: "reviewer",
+      profiles: mockProfiles,
+    });
+    const started = await manager.startAgent({
+      workspaceId: "ws_host_generation",
+      workspaceRoot,
+      profileName: "reviewer",
+      prompt: "host generation parity",
+      profiles: mockProfiles,
+    });
+    const record = manager.getRecordByPrefixOrId(started.agentId);
+    assert.ok(record?.executionGeneration);
+    assert.ok(preflight.worker.executionGeneration);
+    assert.equal(
+      preflight.worker.executionGeneration.executionBindingHash,
+      record.executionGeneration.executionBindingHash,
+      "preflight and persisted execution must qualify the exact same generation",
+    );
+    assert.equal(
+      preflight.worker.executionGeneration.hostGeneration?.hostGenerationHash,
+      record.executionGeneration.hostGeneration?.hostGenerationHash,
+    );
+    assert.equal(
+      record.executionGeneration.hostGeneration?.capabilityManifestSha256,
+      "d".repeat(64),
+    );
+    assert.equal(record.executionGeneration.authReadiness, "UNKNOWN");
+
+    if (spawnedWorkers[0]?.promptFile) {
+      try { rmSync(dirname(spawnedWorkers[0].promptFile), { recursive: true, force: true }); } catch {}
+    }
+  } finally {
+    manager.close();
+    clean();
+  }
+});
+
 test("direct provider/model identity survives durable worker reload without a disk profile", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-direct-state-"));
   const workspaceRoot = mkdtempSync(join(tmpdir(), "devspace-direct-workspace-"));

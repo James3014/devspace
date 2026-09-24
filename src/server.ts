@@ -3100,6 +3100,7 @@ export function createMcpServer(
           ? chatSwarmToolInputShapes(config)
           : {},
     );
+  agentSessionManager?.bindCapabilityManifestSha256(capabilityManifest.manifestSha256);
   const server = new McpServer(
     {
       name: "devspace",
@@ -5456,6 +5457,31 @@ export function createMcpServer(
             thinking: z.string().optional(),
             executionIdentity: z.string(),
             runtimeVersion: z.string().optional(),
+            executionGeneration: z.object({
+              profileCatalogGeneration: z.string(),
+              provider: z.string(),
+              model: z.string().optional(),
+              executionIdentity: z.string(),
+              runtimeVersion: z.string().optional(),
+              devspaceBuildId: z.string(),
+              devspaceSourceCommit: z.string(),
+              capabilitySurfaceDigest: z.string(),
+              hostGeneration: z.object({
+                schema: z.literal("devspace.host_generation.v1"),
+                hostId: z.string(),
+                platform: z.string(),
+                arch: z.string(),
+                homeSha256: z.string(),
+                pathSha256: z.string(),
+                nodeMajor: z.string(),
+                stateRootSha256: z.string(),
+                capabilityManifestSha256: z.string(),
+                adapterGeneration: z.string(),
+                hostGenerationHash: z.string(),
+              }).optional(),
+              authReadiness: z.enum(["READY", "NOT_READY", "UNKNOWN"]).optional(),
+              executionBindingHash: z.string(),
+            }).optional(),
           }),
           readiness: z.object({
             profileResolved: z.boolean(),

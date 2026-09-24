@@ -13,6 +13,7 @@ import {
   assertSameExecutionGeneration,
   assertNexusGrantAuthorizesExecution,
   buildExecutionGenerationBinding,
+  buildHostGenerationBinding,
   hashDispatchIntent,
   hashExecutionBinding,
   hashNexusExecutionGrant,
@@ -246,7 +247,18 @@ test("mutating execution binding fails closed without explicit isolation", () =>
   );
 });
 
-test("execution generation accepts exact generation and rejects substitution or legacy absence", () => {
+test("execution generation accepts exact generation and rejects substitution, cross-host continuation, or legacy absence", () => {
+  const hostA = buildHostGenerationBinding({
+    hostName: "m5-control",
+    platform: "darwin",
+    arch: "arm64",
+    homeDir: "/Users/james",
+    pathEnv: "/opt/homebrew/bin:/usr/bin",
+    nodeVersion: "24.8.0",
+    stateRoot: "/Users/james/.devspace",
+    capabilityManifestSha256: "a".repeat(64),
+    adapterGeneration: "local-agent:herdr:v1",
+  });
   const generation = buildExecutionGenerationBinding({
     profileCatalogGeneration: "catalog-a",
     provider: "codex",
@@ -255,6 +267,8 @@ test("execution generation accepts exact generation and rejects substitution or 
     runtimeVersion: "0.152.0",
     devspaceBuildId: "devspace-1.0.7-deadbeef",
     devspaceSourceCommit: "deadbeef",
+    hostGeneration: hostA,
+    authReadiness: "UNKNOWN",
   });
   assert.doesNotThrow(() => assertSameExecutionGeneration(generation, { ...generation }));
 
@@ -266,11 +280,41 @@ test("execution generation accepts exact generation and rejects substitution or 
     runtimeVersion: "0.152.0",
     devspaceBuildId: "devspace-1.0.7-deadbeef",
     devspaceSourceCommit: "deadbeef",
+    hostGeneration: hostA,
+    authReadiness: "UNKNOWN",
   });
   assert.throws(
     () => assertSameExecutionGeneration(generation, changed),
     (error: unknown) => error instanceof ExecutionProtocolError && error.code === "EXECUTION_GENERATION_MISMATCH",
   );
+
+  const hostB = buildHostGenerationBinding({
+    hostName: "m4-console",
+    platform: "darwin",
+    arch: "arm64",
+    homeDir: "/Users/jameschen",
+    pathEnv: "/usr/local/bin:/usr/bin",
+    nodeVersion: "24.8.0",
+    stateRoot: "/Users/jameschen/.devspace",
+    capabilityManifestSha256: "a".repeat(64),
+    adapterGeneration: "local-agent:herdr:v1",
+  });
+  const crossHost = buildExecutionGenerationBinding({
+    profileCatalogGeneration: "catalog-a",
+    provider: "codex",
+    model: "gpt-5.6-sol",
+    executionIdentity: "/opt/codex/bin/codex.js",
+    runtimeVersion: "0.152.0",
+    devspaceBuildId: "devspace-1.0.7-deadbeef",
+    devspaceSourceCommit: "deadbeef",
+    hostGeneration: hostB,
+    authReadiness: "UNKNOWN",
+  });
+  assert.throws(
+    () => assertSameExecutionGeneration(generation, crossHost),
+    (error: unknown) => error instanceof ExecutionProtocolError && error.code === "CROSS_HOST_CONTINUATION_REJECTED",
+  );
+
   assert.throws(
     () => assertSameExecutionGeneration(undefined, generation),
     (error: unknown) => error instanceof ExecutionProtocolError && error.code === "LEGACY_EXECUTION_BINDING_MISSING",
@@ -495,6 +539,18 @@ function sampleDirectEvidence(): DirectCandidateExecutionEvidence {
     runtimeVersion: "1.0.7",
     devspaceBuildId: "build-1",
     devspaceSourceCommit: "cd907f81b46781d5a265c748374efeaab93d00cb",
+    hostGeneration: buildHostGenerationBinding({
+      hostName: "evidence-host",
+      platform: "darwin",
+      arch: "arm64",
+      homeDir: "/Users/evidence",
+      pathEnv: "/usr/bin",
+      nodeVersion: "24.8.0",
+      stateRoot: "/Users/evidence/.devspace",
+      capabilityManifestSha256: "c".repeat(64),
+      adapterGeneration: "local-agent:herdr:v1",
+    }),
+    authReadiness: "UNKNOWN",
   });
   const now = "2026-09-23T12:00:00.000Z";
   const evidenceWithoutIntegrity: Omit<DirectCandidateExecutionEvidence, "integrity"> = {
@@ -653,13 +709,20 @@ test("DirectCandidateExecutionEvidence - invalid DispatchIntent and task/attempt
 });
 
 test("DirectCandidateExecutionEvidence - malformed execution generation rejection", () => {
-  const evidence = sampleDirectEvidence();
   const badGen = sampleDirectEvidence();
   (badGen.execution.execution_generation as any).provider = "tampered-provider";
   badGen.integrity.sha256 = computeDirectCandidateEvidenceIntegrity(badGen);
   assert.throws(
     () => validateDirectCandidateExecutionEvidence(badGen),
     (err: unknown) => err instanceof ExecutionProtocolError && err.code === "INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE" && /execution_generation\.executionBindingHash mismatch/.test(err.message),
+  );
+
+  const badHost = sampleDirectEvidence();
+  (badHost.execution.execution_generation.hostGeneration as any).pathSha256 = "0".repeat(64);
+  badHost.integrity.sha256 = computeDirectCandidateEvidenceIntegrity(badHost);
+  assert.throws(
+    () => validateDirectCandidateExecutionEvidence(badHost),
+    (err: unknown) => err instanceof ExecutionProtocolError && err.code === "INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE" && /hostGeneration is invalid or self-inconsistent/.test(err.message),
   );
 });
 

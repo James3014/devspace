@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdtempSync, unlinkSync, rmdirSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { arch, homedir, hostname, platform, tmpdir } from "node:os";
 import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -64,13 +64,16 @@ import {
   assertNexusGrantAuthorizesExecution,
   assertSameExecutionGeneration,
   buildExecutionGenerationBinding,
+  buildHostGenerationBinding,
   hashDispatchIntent,
   renderDispatchIntentForWorker,
   validateDispatchIntent,
   validateResolvedNexusExecutionGrant,
   type AuthorityValidationEvidence,
   type DispatchIntent,
+  type ExecutionAuthReadiness,
   type ExecutionGenerationBinding,
+  type HostGenerationBinding,
   type NexusExecutionGrant,
   type NexusExecutionGrantRef,
   ExecutionProtocolError,
@@ -354,6 +357,7 @@ export interface AgentPreflightOutput {
     effort?: string;
     executionIdentity: string;
     runtimeVersion?: string;
+    executionGeneration?: ExecutionGenerationBinding;
   };
   readiness: {
     profileResolved: boolean;
@@ -517,6 +521,7 @@ export class LocalAgentSessionManager {
   private readonly terminator: WorkerTerminator;
   private readonly turnRunner?: AgentTurnRunner;
   private readonly runtimeBuildIdentity: RuntimeBuildIdentity;
+  private capabilityManifestSha256?: string;
   private readonly nexusGrantResolver: NexusGrantResolver;
   private readonly clineCatalogService?: ClineCatalogService;
   private readonly opencodeCatalogSource: ReturnType<typeof createMcpOpencodeCatalogSource>;
@@ -554,6 +559,13 @@ export class LocalAgentSessionManager {
       stateRoot: config.stateDir,
       profileCatalogGeneration: "unresolved",
     });
+  }
+
+  bindCapabilityManifestSha256(manifestSha256: string): void {
+    if (!/^[0-9a-f]{64}$/.test(manifestSha256)) {
+      throw new AgentSessionError("INVALID_EXECUTION_CONTRACT", "Capability manifest digest must be lowercase 64-hex.");
+    }
+    this.capabilityManifestSha256 = manifestSha256;
   }
 
   /** Close the manager's durable store. Safe to call from multiple cleanup paths. */
@@ -1806,6 +1818,19 @@ export class LocalAgentSessionManager {
       : allRequiredPositive && readinessSignalsPositive
         ? "READY"
         : "UNKNOWN";
+    const executionGeneration = profile
+      ? buildExecutionGenerationBinding({
+          profileCatalogGeneration: profileCatalog?.generation ?? "unresolved",
+          provider: profile.provider,
+          model: profile.model,
+          executionIdentity,
+          runtimeVersion,
+          devspaceBuildId: this.runtimeBuildIdentity.buildId,
+          devspaceSourceCommit: this.runtimeBuildIdentity.sourceCommit,
+          hostGeneration: this.resolveHostGeneration(),
+          authReadiness: this.normalizeAuthReadiness(authReady),
+        })
+      : undefined;
 
     return {
       workspace,
@@ -1816,6 +1841,7 @@ export class LocalAgentSessionManager {
         effort: profile?.effort,
         executionIdentity,
         runtimeVersion,
+        executionGeneration,
       },
       readiness: {
         profileResolved,
@@ -2094,6 +2120,27 @@ export class LocalAgentSessionManager {
     }
   }
 
+  private normalizeAuthReadiness(value: ReadinessValue): ExecutionAuthReadiness {
+    if (value === true) return "READY";
+    if (value === false) return "NOT_READY";
+    return "UNKNOWN";
+  }
+
+  private resolveHostGeneration(): HostGenerationBinding | undefined {
+    if (!this.capabilityManifestSha256) return undefined;
+    return buildHostGenerationBinding({
+      hostName: hostname(),
+      platform: platform(),
+      arch: arch(),
+      homeDir: process.env.HOME ?? homedir(),
+      pathEnv: process.env.PATH ?? "",
+      nodeVersion: process.versions.node,
+      stateRoot: resolvePath(this.config.stateDir),
+      capabilityManifestSha256: this.capabilityManifestSha256,
+      adapterGeneration: `local-agent:${this.config.agentExecutionBackend === "herdr" ? "herdr" : "legacy"}:v1`,
+    });
+  }
+
   private resolveExecutionGeneration(
     profile: LocalAgentProfile,
     profileCatalogGeneration: string,
@@ -2128,6 +2175,8 @@ export class LocalAgentSessionManager {
       runtimeVersion,
       devspaceBuildId: this.runtimeBuildIdentity.buildId,
       devspaceSourceCommit: this.runtimeBuildIdentity.sourceCommit,
+      hostGeneration: this.resolveHostGeneration(),
+      authReadiness: "UNKNOWN",
     });
   }
 
