@@ -279,11 +279,19 @@ export interface BeginTerminationCasInput extends FenceActiveTurnInput {
   errorRetryable?: boolean;
 }
 
+export interface ClaimExternalRuntimeTurnInput {
+  agentId: string;
+  generation: string;
+  promptNonce: string;
+  scopeBaseline: ScopeBaseline;
+  executionStartedAt?: string;
+}
+
 export interface FinishTurnCasInput {
   agentId: string;
   generation: string;
   workerToken: string;
-  status: "idle" | "error";
+  status: "idle" | "error" | "stopped";
   providerSessionId?: string;
   latestResponse?: string;
   error?: string;
@@ -296,6 +304,8 @@ export interface FinishTurnCasInput {
   turnEndBaseline?: ScopeBaseline;
   effectEnforcementReceipt?: LocalEffectEnforcementReceipt;
 }
+
+export type FinishExternalRuntimeTurnInput = Omit<FinishTurnCasInput, "workerToken">;
 
 export interface CompleteTerminationCasInput {
   agentId: string;
@@ -1042,6 +1052,275 @@ export class LocalAgentStore {
       return { applied: result.changes === 1, previous: current, current: refreshed };
     });
     return bind.immediate();
+  }
+
+  claimExternalRuntimeTurnCAS(input: ClaimExternalRuntimeTurnInput): LifecycleCasResult {
+    const claim = this.database.sqlite.transaction(() => {
+      const current = this.getById(input.agentId);
+      if (!current) return { applied: false };
+      const lifecycle = current.lifecycleState;
+      const activeTurn = lifecycle?.activeTurn;
+      const binding = current.externalRuntimeBinding;
+      const storedHandle = binding?.handle;
+      if (
+        !isDetachedLifecycle(lifecycle) ||
+        current.status !== "starting" ||
+        !activeTurn ||
+        activeTurn.generation !== input.generation ||
+        lifecycle.terminationPending ||
+        lifecycle.lifecycleCorrupt ||
+        binding?.runtimeKind !== "HERDR" ||
+        !storedHandle ||
+        typeof storedHandle !== "object" ||
+        current.workerPid !== undefined ||
+        current.workerToken !== undefined
+      ) {
+        return { applied: false, previous: current, current };
+      }
+
+      const handle = storedHandle as Record<string, unknown>;
+      const attemptKey = current.startReplay?.key;
+      const dispatchIntent = current.executionContract?.dispatchIntent;
+      const dispatchIntentHash = dispatchIntent ? hashDispatchIntent(dispatchIntent) : undefined;
+      if (
+        !attemptKey ||
+        typeof handle.attemptKey !== "string" ||
+        handle.attemptKey !== attemptKey ||
+        !dispatchIntentHash ||
+        typeof handle.dispatchIntentHash !== "string" ||
+        handle.dispatchIntentHash !== dispatchIntentHash ||
+        !input.promptNonce
+      ) {
+        return { applied: false, previous: current, current };
+      }
+
+      const now = input.executionStartedAt ?? new Date().toISOString();
+      const updatedHandle = {
+        ...handle,
+        promptNonce: input.promptNonce,
+      };
+      const updatedBinding: ExternalRuntimeBinding = {
+        ...binding,
+        handle: updatedHandle,
+        promptState: undefined,
+      };
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        activeTurn: {
+          ...activeTurn,
+          launchState: "claimed",
+          executionStartedAt: now,
+          lastActivityAt: now,
+        },
+      };
+      const serialized = serializeStoredExecutionState(
+        current.executionContract,
+        current.startReplay,
+        updatedBinding,
+      );
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set status = 'running', worker_pid = null, worker_token = null,
+          scope_baseline = ?, execution_contract = ?, lifecycle_state = ?, updated_at = ?
+         where id = ? and status = 'starting' and updated_at = ?`,
+      ).run(
+        JSON.stringify(input.scopeBaseline),
+        serialized,
+        JSON.stringify(lifecycleState),
+        now,
+        current.id,
+        current.updatedAt,
+      );
+      const refreshed = this.getById(current.id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return claim.immediate();
+  }
+
+  touchExternalRuntimeActivityCAS(
+    agentId: string,
+    generation: string,
+    activityAt = new Date().toISOString(),
+  ): LifecycleCasResult {
+    const touch = this.database.sqlite.transaction(() => {
+      const current = this.getById(agentId);
+      const lifecycle = current?.lifecycleState;
+      const activeTurn = lifecycle?.activeTurn;
+      if (
+        !current ||
+        !isDetachedLifecycle(lifecycle) ||
+        current.status !== "running" ||
+        !activeTurn ||
+        activeTurn.generation !== generation ||
+        lifecycle.terminationPending ||
+        lifecycle.lifecycleCorrupt ||
+        current.externalRuntimeBinding?.runtimeKind !== "HERDR" ||
+        current.workerPid !== undefined ||
+        current.workerToken !== undefined
+      ) {
+        return { applied: false, previous: current, current };
+      }
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        activeTurn: { ...activeTurn, lastActivityAt: activityAt },
+      };
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set lifecycle_state = ?, updated_at = ?
+         where id = ? and status = 'running' and updated_at = ?`,
+      ).run(JSON.stringify(lifecycleState), activityAt, agentId, current.updatedAt);
+      const refreshed = this.getById(agentId) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return touch.immediate();
+  }
+
+  finishExternalRuntimeTurnCAS(input: FinishExternalRuntimeTurnInput): LifecycleCasResult {
+    const finish = this.database.sqlite.transaction(() => {
+      const current = this.getById(input.agentId);
+      if (!current) return { applied: false };
+      const lifecycle = current.lifecycleState;
+      if (
+        !isDetachedLifecycle(lifecycle) ||
+        current.status !== "running" ||
+        lifecycle?.activeTurn?.generation !== input.generation ||
+        lifecycle.terminationPending ||
+        lifecycle.lifecycleCorrupt ||
+        current.externalRuntimeBinding?.runtimeKind !== "HERDR" ||
+        current.workerPid !== undefined ||
+        current.workerToken !== undefined
+      ) {
+        return { applied: false, previous: current, current };
+      }
+
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        lastExecutionIdlePolicy: lifecycle.activeTurn?.executionIdlePolicy,
+        lastEffectEnforcementReceipt: input.effectEnforcementReceipt,
+        activeTurn: undefined,
+        terminationPending: undefined,
+        lastSettledGeneration: input.generation,
+        cumulativeChangedPaths: input.cumulativeChangedPaths ?? lifecycle.cumulativeChangedPaths,
+        turnEndBaseline: input.turnEndBaseline ?? lifecycle.turnEndBaseline,
+      };
+      const successfulTerminal = input.status === "idle" || input.status === "stopped";
+      const errorCode = successfulTerminal ? null : input.errorCode ?? null;
+      const errorRetryable = successfulTerminal
+        ? null
+        : input.errorRetryable === undefined ? null : String(input.errorRetryable);
+      const errorDetails = successfulTerminal
+        ? null
+        : typeof input.errorDetails === "string"
+          ? input.errorDetails
+          : input.errorDetails ? JSON.stringify(input.errorDetails) : null;
+      const providerSessionId = input.providerSessionId ?? current.providerSessionId;
+      const providerContinuityState: ProviderContinuityState =
+        successfulTerminal
+          ? (lifecycle.lastSettledGeneration ? "RESUME_VERIFIED" : "KNOWN_UNVERIFIED")
+          : (current.providerContinuityState ?? "UNKNOWN");
+      const now = new Date().toISOString();
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set provider_session_id = ?, provider_continuity_state = ?,
+          status = ?, latest_response = ?, error = ?, error_code = ?, error_retryable = ?, error_details = ?,
+          terminal_reason = ?, scope_state = ?, worker_pid = null, worker_token = null,
+          lifecycle_state = ?, updated_at = ?
+         where id = ? and status = 'running' and updated_at = ?`,
+      ).run(
+        providerSessionId ?? null,
+        providerContinuityState,
+        input.status,
+        input.latestResponse ?? null,
+        input.error ?? null,
+        errorCode,
+        errorRetryable,
+        errorDetails,
+        input.terminalReason ?? null,
+        input.scopeState ?? null,
+        JSON.stringify(lifecycleState),
+        now,
+        input.agentId,
+        current.updatedAt,
+      );
+      const refreshed = this.getById(input.agentId) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return finish.immediate();
+  }
+
+  failExternalRuntimeTurnCAS(
+    input: Omit<FinishExternalRuntimeTurnInput, "status">,
+  ): LifecycleCasResult {
+    return this.finishExternalRuntimeTurnCAS({ ...input, status: "error" });
+  }
+
+  failExternalRuntimePreLaunchCAS(
+    agentId: string,
+    generation: string,
+    error: string,
+  ): LifecycleCasResult {
+    const fail = this.database.sqlite.transaction(() => {
+      const current = this.getById(agentId);
+      const lifecycle = current?.lifecycleState;
+      if (
+        !current ||
+        !isDetachedLifecycle(lifecycle) ||
+        current.status !== "starting" ||
+        lifecycle?.activeTurn?.generation !== generation ||
+        lifecycle.terminationPending ||
+        lifecycle.lifecycleCorrupt ||
+        current.workerPid !== undefined ||
+        current.workerToken !== undefined ||
+        current.externalRuntimeBinding?.runtimeKind === "HERDR"
+      ) {
+        return { applied: false, previous: current, current };
+      }
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        activeTurn: undefined,
+        lastSettledGeneration: generation,
+      };
+      const now = new Date().toISOString();
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set status = 'error', error = ?,
+          error_code = 'PROVIDER_EXECUTION_ERROR', error_retryable = 'true',
+          terminal_reason = 'launch_failed', lifecycle_state = ?, updated_at = ?
+         where id = ? and status = 'starting' and updated_at = ?`,
+      ).run(error, JSON.stringify(lifecycleState), now, agentId, current.updatedAt);
+      const refreshed = this.getById(agentId) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return fail.immediate();
+  }
+
+  markExternalRuntimeStoppedCAS(
+    agentId: string,
+    terminalReason: AgentTerminalReason = "cancelled",
+  ): LifecycleCasResult {
+    const stop = this.database.sqlite.transaction(() => {
+      const current = this.getById(agentId);
+      if (!current) return { applied: false };
+      if (
+        !isDetachedLifecycle(current.lifecycleState) ||
+        current.externalRuntimeBinding?.runtimeKind !== "HERDR" ||
+        current.lifecycleState?.activeTurn ||
+        current.lifecycleState?.terminationPending ||
+        current.lifecycleState?.lifecycleCorrupt ||
+        current.workerPid !== undefined ||
+        current.workerToken !== undefined
+      ) {
+        return { applied: false, previous: current, current };
+      }
+      if (current.status === "stopped") {
+        return { applied: true, previous: current, current };
+      }
+      const now = new Date().toISOString();
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set status = 'stopped', terminal_reason = ?,
+          error = null, error_code = null, error_retryable = null, error_details = null, updated_at = ?
+         where id = ? and updated_at = ?`,
+      ).run(terminalReason, now, agentId, current.updatedAt);
+      const refreshed = this.getById(agentId) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return stop.immediate();
   }
 
   bindExternalRuntimeBindingCAS(input: BindExternalRuntimeBindingInput): LifecycleCasResult {
@@ -1876,6 +2155,13 @@ export class LocalAgentStore {
     let reconciled = 0;
     for (const record of this.list()) {
       if (record.status !== "starting" && record.status !== "running") continue;
+      if (record.externalRuntimeBinding?.runtimeKind === "HERDR") {
+        // HerdR owns the physical process/pane and carries durable external
+        // identity. A DevSpace restart must preserve the active logical turn
+        // for live reconciliation instead of fencing it as an orphaned local
+        // child process.
+        continue;
+      }
       if (isDetachedLifecycle(record.lifecycleState)) {
         const result = this.beginTerminationCAS({
           agentId: record.id,

@@ -187,6 +187,7 @@ export interface StartHerdrAgentParams {
   workspaceId: string;
   requestedModel?: string;
   requestedEffort?: string;
+  writeMode?: "read_only" | "allowed";
   socketPath?: string;
   store?: LocalAgentStore;
 }
@@ -194,12 +195,13 @@ export interface StartHerdrAgentParams {
 export interface HerdrPromptOptions {
   timeoutMs?: number;
   until?: string[];
+  waitForCompletion?: boolean;
   store?: LocalAgentStore;
 }
 
 export interface HerdrPromptResult {
   turnNonce?: string;
-  status: "done" | "idle" | "blocked" | "OUTCOME_UNKNOWN";
+  status: "done" | "idle" | "running" | "blocked" | "OUTCOME_UNKNOWN";
   rawStatus?: string;
   paneOutput?: string;
   stalled?: boolean;
@@ -322,7 +324,11 @@ export function detectBlockedOnboardingDialog(agentKind: HerdrAgentKind, termina
  */
 export class HerdrGatewayRegistry {
   private handlesByAttemptKey = new Map<string, HerdrExternalHandle>();
-  private submittedPromptAttemptKeys = new Set<string>();
+  private submittedPromptTurnKeys = new Set<string>();
+
+  private promptTurnKey(attemptKey: string, promptNonce?: string): string {
+    return `${attemptKey}:${promptNonce ?? ""}`;
+  }
 
   getHandle(attemptKey: string): HerdrExternalHandle | undefined {
     return this.handlesByAttemptKey.get(attemptKey);
@@ -341,22 +347,32 @@ export class HerdrGatewayRegistry {
     this.handlesByAttemptKey.set(handle.attemptKey, handle);
   }
 
-  markPromptSubmitted(attemptKey: string): void {
-    this.submittedPromptAttemptKeys.add(attemptKey);
+  markPromptSubmitted(attemptKey: string, promptNonce?: string): void {
+    this.submittedPromptTurnKeys.add(this.promptTurnKey(attemptKey, promptNonce));
   }
 
-  hasPromptSubmitted(attemptKey: string): boolean {
-    return this.submittedPromptAttemptKeys.has(attemptKey);
+  hasPromptSubmitted(attemptKey: string, promptNonce?: string): boolean {
+    if (promptNonce !== undefined) {
+      return this.submittedPromptTurnKeys.has(this.promptTurnKey(attemptKey, promptNonce));
+    }
+    const prefix = `${attemptKey}:`;
+    for (const key of this.submittedPromptTurnKeys) {
+      if (key.startsWith(prefix)) return true;
+    }
+    return false;
   }
 
   releaseHandle(attemptKey: string): void {
     this.handlesByAttemptKey.delete(attemptKey);
-    this.submittedPromptAttemptKeys.delete(attemptKey);
+    const prefix = `${attemptKey}:`;
+    for (const key of this.submittedPromptTurnKeys) {
+      if (key.startsWith(prefix)) this.submittedPromptTurnKeys.delete(key);
+    }
   }
 
   clear(): void {
     this.handlesByAttemptKey.clear();
-    this.submittedPromptAttemptKeys.clear();
+    this.submittedPromptTurnKeys.clear();
   }
 }
 
@@ -408,6 +424,20 @@ export class HerdrThinGateway {
     socketPath?: string,
   ): Promise<HerdrSocketResponse<T>> {
     return sendHerdrSocketRequest<T>(req, socketPath || this.socketPath, timeoutMs);
+  }
+
+  async probeReady(socketPath?: string): Promise<boolean> {
+    try {
+      const targetSocket = socketPath ? normalizeHerdrSocketPath(socketPath) : this.socketPath;
+      const res = await this.sendRequest<{ type: string }>(
+        { id: `ping-${Date.now()}`, method: "ping", params: {} },
+        2_000,
+        targetSocket,
+      );
+      return res.result?.type === "pong";
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -1193,6 +1223,13 @@ export class HerdrThinGateway {
     if (params.agentKind === "opencode") {
       const model = params.requestedModel || "opencode/mimo-v2.6-flash-free";
       args.push("-m", model);
+    } else if (params.agentKind === "agy") {
+      if (params.requestedModel) args.push("--model", params.requestedModel);
+      if (params.requestedEffort && params.requestedModel !== "gemini-3.7-flash-medium") {
+        args.push("--effort", params.requestedEffort);
+      }
+      args.push("--sandbox", "--dangerously-skip-permissions", "--add-dir", canonicalPath);
+      args.push("--mode", params.writeMode === "allowed" ? "accept-edits" : "plan");
     }
 
     const agentReq: HerdrSocketRequest = {
@@ -1426,7 +1463,7 @@ export class HerdrThinGateway {
     );
 
     // Fast in-memory registry check (Option A / B4)
-    if (this.registry.hasPromptSubmitted(handle.attemptKey)) {
+    if (this.registry.hasPromptSubmitted(handle.attemptKey, handle.promptNonce)) {
       throw new Error(
         `[N-TURN-OPTION-A] attemptKey '${handle.attemptKey}' has already submitted a consequential prompt; subsequent prompts on same handle are rejected.`,
       );
@@ -1474,7 +1511,7 @@ export class HerdrThinGateway {
     }
 
     // Mark prompt as submitted under Option A
-    this.registry.markPromptSubmitted(handle.attemptKey);
+    this.registry.markPromptSubmitted(handle.attemptKey, handle.promptNonce);
 
     // Post-fence live identity revalidation immediately before actual prompt (E3)
     const postFenceLive = await this.observeAndValidateLiveHandle({
@@ -1502,6 +1539,7 @@ export class HerdrThinGateway {
     }
 
     const timeoutMs = options.timeoutMs ?? 30_000;
+    const waitForCompletion = options.waitForCompletion ?? true;
     const waitOptions: Record<string, unknown> = {
       timeout_ms: timeoutMs,
     };
@@ -1519,7 +1557,7 @@ export class HerdrThinGateway {
       params: {
         target: handle.herdrAgentIdentity,
         text: boundPrompt,
-        wait: waitOptions,
+        ...(waitForCompletion ? { wait: waitOptions } : {}),
       },
     };
 
@@ -1574,8 +1612,16 @@ export class HerdrThinGateway {
         };
       }
 
-      const normalizedStatus: "done" | "idle" | "blocked" | "OUTCOME_UNKNOWN" =
-        statusStr === "done" ? "done" : statusStr === "idle" ? "idle" : statusStr === "blocked" ? "blocked" : "OUTCOME_UNKNOWN";
+      const normalizedStatus: "done" | "idle" | "running" | "blocked" | "OUTCOME_UNKNOWN" =
+        statusStr === "done"
+          ? "done"
+          : statusStr === "idle"
+            ? "idle"
+            : statusStr === "working" || statusStr === "running" || statusStr === "prompting"
+              ? "running"
+              : statusStr === "blocked"
+                ? "blocked"
+                : "OUTCOME_UNKNOWN";
 
       return {
         turnNonce,

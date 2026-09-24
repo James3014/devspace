@@ -4817,6 +4817,14 @@ export function createMcpServer(
       exclusiveOwnership: z.boolean(),
       intentHash: z.string(),
     });
+    const AGENT_RUNTIME_OUTPUT_SCHEMA = z.object({
+      runtimeKind: z.literal("HERDR"),
+      socketPath: z.string(),
+      workspaceId: z.string(),
+      paneId: z.string(),
+      agentIdentity: z.string(),
+      agentKind: z.enum(["opencode", "agy", "codex", "cline", "grok"]),
+    });
     registerAppTool(
       server,
       "agent_catalog",
@@ -4936,6 +4944,7 @@ export function createMcpServer(
           createdAt: z.string(),
           updatedAt: z.string(),
           executionIdlePolicy: AGENT_IDLE_POLICY_OUTPUT_SCHEMA.optional(),
+          runtime: AGENT_RUNTIME_OUTPUT_SCHEMA.optional(),
           coreMutation: z.record(z.string(), z.unknown()).optional(),
         },
         _meta: {},
@@ -5071,6 +5080,7 @@ export function createMcpServer(
           createdAt: z.string(),
           updatedAt: z.string(),
           executionIdlePolicy: AGENT_IDLE_POLICY_OUTPUT_SCHEMA.optional(),
+          runtime: AGENT_RUNTIME_OUTPUT_SCHEMA.optional(),
           continued: z.boolean(),
           coreMutation: z.record(z.string(), z.unknown()).optional(),
         },
@@ -5184,6 +5194,7 @@ export function createMcpServer(
           changedPaths: z.array(z.string()).optional(),
           terminalReason: z.string().optional(),
           scopeState: z.string().optional(),
+          runtime: AGENT_RUNTIME_OUTPUT_SCHEMA.optional(),
           termination: AGENT_TERMINATION_OUTPUT_SCHEMA.optional(),
         },
         _meta: {},
@@ -5235,6 +5246,7 @@ export function createMcpServer(
           executionIdlePolicy: AGENT_IDLE_POLICY_OUTPUT_SCHEMA.optional(),
           latestResponse: z.string().optional(),
           error: z.string().optional(),
+          runtime: AGENT_RUNTIME_OUTPUT_SCHEMA.optional(),
           termination: AGENT_TERMINATION_OUTPUT_SCHEMA.optional(),
           createdAt: z.string(),
           updatedAt: z.string(),
@@ -5454,6 +5466,7 @@ export function createMcpServer(
           providerState: z.string().optional(),
           providerSessionId: z.string().optional(),
           terminalReason: z.string().optional(),
+          runtime: AGENT_RUNTIME_OUTPUT_SCHEMA.optional(),
           workspace: z.object({ head: z.string().optional(), dirty: z.boolean() }),
           candidate: z.object({
             present: z.boolean(),
