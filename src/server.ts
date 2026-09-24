@@ -1743,6 +1743,7 @@ function registerCutoverMcpTools(
 ): void {
   const cutoverRecordSchema = z.record(z.string(), z.unknown());
   const modeSchema = z.enum(["normal", "drain", "reconcile-only"]);
+  let bootstrapRefreshCatalogGeneration: string | undefined;
 
   registerAppTool(
     server,
@@ -1800,7 +1801,33 @@ function registerCutoverMcpTools(
           : baseSessionConvergence;
 
       let refresh: Record<string, unknown> | undefined;
-      if (requestRefresh !== undefined) {
+      if (requestRefresh === undefined && clientProjectionToolNames === undefined) {
+        const catalogGeneration = baseSessionConvergence?.serverGeneration.catalogGeneration;
+        const alreadyNotified =
+          catalogGeneration !== undefined &&
+          bootstrapRefreshCatalogGeneration === catalogGeneration;
+        const refreshEligible =
+          baseSessionConvergence?.controllerDisposition === "CURRENT" &&
+          catalogGeneration !== undefined &&
+          !alreadyNotified;
+        const notificationSent = refreshEligible
+          ? await control.refreshSessionTools?.(sessionId) ?? false
+          : false;
+        if (notificationSent && catalogGeneration) {
+          bootstrapRefreshCatalogGeneration = catalogGeneration;
+        }
+        refresh = {
+          requested: "implicit-bootstrap",
+          eligible: refreshEligible,
+          notificationSent,
+          sameActorPreserved: notificationSent,
+          alreadyNotified,
+          ...(catalogGeneration ? { catalogGeneration } : {}),
+          nextAction: notificationSent
+            ? "RELIST_TOOLS"
+            : refreshEligible ? "RECONNECT_REQUIRED" : "NONE",
+        };
+      } else if (requestRefresh !== undefined) {
         const refreshEligible =
           requestRefresh === true &&
           baseSessionConvergence?.controllerDisposition === "CURRENT" &&

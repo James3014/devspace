@@ -5393,6 +5393,31 @@ test("Issue #15 Wave 4B: capability convergence resolves the initialized request
     assert.match(session?.sessionSnapshot?.callerIdentityFingerprint ?? "", /^mcp:[0-9a-f]{64}$/);
     assert.match(session?.sessionSnapshot?.conversationIdentityFingerprint ?? "", /^openai:[0-9a-f]{64}$/);
     assert.ok(session?.serverGeneration?.toolNames?.includes("open_workspace"));
+    assert.equal(payload.result?.structuredContent?.refresh?.requested, "implicit-bootstrap");
+    assert.equal(payload.result?.structuredContent?.refresh?.eligible, true);
+    assert.equal(payload.result?.structuredContent?.refresh?.notificationSent, true);
+    assert.equal(payload.result?.structuredContent?.refresh?.sameActorPreserved, true);
+    assert.equal(payload.result?.structuredContent?.refresh?.alreadyNotified, false);
+    assert.equal(payload.result?.structuredContent?.refresh?.nextAction, "RELIST_TOOLS");
+
+    const bootstrapReplay = await post(sessionId!, {
+      jsonrpc: "2.0",
+      id: 19,
+      method: "tools/call",
+      params: {
+        name: "capability_convergence_status",
+        arguments: {},
+        _meta: { "openai/session": "issue-240-caller-a" },
+      },
+    });
+    assert.equal(bootstrapReplay.status, 200);
+    const bootstrapReplayPayload = await parseResponse(bootstrapReplay);
+    assert.equal(bootstrapReplayPayload.result?.structuredContent?.refresh?.requested, "implicit-bootstrap");
+    assert.equal(bootstrapReplayPayload.result?.structuredContent?.refresh?.eligible, false);
+    assert.equal(bootstrapReplayPayload.result?.structuredContent?.refresh?.notificationSent, false);
+    assert.equal(bootstrapReplayPayload.result?.structuredContent?.refresh?.sameActorPreserved, false);
+    assert.equal(bootstrapReplayPayload.result?.structuredContent?.refresh?.alreadyNotified, true);
+    assert.equal(bootstrapReplayPayload.result?.structuredContent?.refresh?.nextAction, "NONE");
 
     const staleProjection = await post(sessionId!, {
       jsonrpc: "2.0",
