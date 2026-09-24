@@ -21,7 +21,12 @@ import { createReviewCheckpointManager } from "./review-checkpoints.js";
 import { ProcessSessionManager } from "./process-sessions.js";
 import { DurableOperationManager } from "./durable-operations.js";
 import { SingleUserOAuthProvider } from "./oauth-provider.js";
-import { createMcpServer, createServer, resolveDurableReconciliationWitnessFromInventory } from "./server.js";
+import {
+  createMcpServer,
+  createServer,
+  permitsCoreCallerRebindGate,
+  resolveDurableReconciliationWitnessFromInventory,
+} from "./server.js";
 import { CutoverStateStore } from "./cutover-state.js";
 import { McpCutoverController } from "./mcp-cutover.js";
 import { LocalAgentStore } from "./local-agent-store.js";
@@ -116,6 +121,15 @@ after(async () => {
   if (originalDependencyRoot === undefined) delete process.env.DEVSPACE_DEPENDENCY_ROOT;
   else process.env.DEVSPACE_DEPENDENCY_ROOT = originalDependencyRoot;
   await rm(codexRuntimeRoot, { recursive: true, force: true });
+});
+
+
+test("Issue #240: caller-rebind request-gate exemption is exact and cannot bypass other stale states", () => {
+  assert.equal(permitsCoreCallerRebindGate("core_mutation_session_rebind", "CALLER_REBIND_REQUIRED"), true);
+  assert.equal(permitsCoreCallerRebindGate("workspace_inspect", "CALLER_REBIND_REQUIRED"), false);
+  assert.equal(permitsCoreCallerRebindGate("core_mutation_session_rebind", "CURRENT"), false);
+  assert.equal(permitsCoreCallerRebindGate("core_mutation_session_rebind", "SERVER_AHEAD_OF_CLIENT"), false);
+  assert.equal(permitsCoreCallerRebindGate("core_mutation_session_rebind", "STALE_RECONNECT_REQUIRED"), false);
 });
 
 test("configures Express with an exact trusted proxy hop count", async () => {
@@ -5436,6 +5450,25 @@ test("Issue #15 Wave 4B: capability convergence resolves the initialized request
       changedPayload.result?.structuredContent?.sessionConvergence?.controllerDisposition,
       "CALLER_REBIND_REQUIRED",
     );
+
+    const callerRebindRequest = await post(sessionId!, {
+      jsonrpc: "2.0",
+      id: 31,
+      method: "tools/call",
+      params: {
+        name: "core_mutation_session_rebind",
+        arguments: {
+          workspaceId: "ws_missing_for_gate_probe",
+          sessionId: "cms_" + "0".repeat(32),
+          bindingHash: "sha256:" + "0".repeat(64),
+          expectedActorKey: "openai:" + "0".repeat(64),
+          evidence: "issue-240-gate-probe",
+        },
+        _meta: { "openai/session": "issue-240-caller-b" },
+      },
+    });
+    assert.notEqual(callerRebindRequest.status, 409, "rebind must cross only the CALLER_REBIND_REQUIRED request gate");
+    assert.equal(callerRebindRequest.status, 200, "request reached the registered Core rebind tool handler");
 
     const blockedDifferentCaller = await post(sessionId!, {
       jsonrpc: "2.0",

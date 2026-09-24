@@ -216,6 +216,16 @@ export interface CoreMutationCandidateProvenance {
   createdAt: string;
 }
 
+export interface CoreMutationSessionRebindRecord {
+  rebindId: string;
+  sessionId: string;
+  bindingHash: string;
+  fromActorKey: string;
+  toActorKey: string;
+  evidence: string;
+  createdAt: string;
+}
+
 export interface CoreMutationDurableAgentRecord {
   id: string;
   workspaceId?: string;
@@ -1859,6 +1869,174 @@ export class CoreMutationSessionStore {
       );
     }
     return this.getByIdRaw(record.id)!;
+  }
+
+
+  async rebindActor(input: {
+    sessionId: string;
+    workspaceSessionId: string;
+    workspaceRoot: string;
+    expectedActorKey: string;
+    newActorKey: string;
+    evidence: string;
+    pointer?: { sessionId?: string; bindingHash?: string };
+    now?: Date;
+  }): Promise<CoreMutationSessionRebindRecord> {
+    const record = this.getByIdRaw(input.sessionId);
+    if (!record || record.workspaceSessionId !== input.workspaceSessionId) {
+      throw new CoreMutationSessionError("CORE_MUTATION_SESSION_NOT_FOUND", "Core mutation session is not bound to this workspace.");
+    }
+    this.assertPointer(record, input.pointer);
+    if (!input.newActorKey || input.newActorKey === input.expectedActorKey) {
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_REBIND_ACTOR_INVALID",
+        "Caller rebind requires a different exact new caller identity.",
+      );
+    }
+    if (!input.evidence || input.evidence.length === 0 || input.evidence !== input.evidence.trim()) {
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_REBIND_EVIDENCE_REQUIRED",
+        "Caller rebind requires audited continuation evidence.",
+      );
+    }
+    if (record.status !== "ACTIVE") {
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_REBIND_TERMINAL",
+        `Caller rebind requires an ACTIVE Core mutation session; session is ${record.status}.`,
+      );
+    }
+
+    const latest = this.rebindsFor(record.id).at(-1);
+    if (record.actorKey === input.newActorKey) {
+      if (
+        latest?.fromActorKey === input.expectedActorKey &&
+        latest.toActorKey === input.newActorKey &&
+        latest.bindingHash === record.bindingHash &&
+        latest.evidence === input.evidence
+      ) {
+        return latest;
+      }
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_REBIND_REPLAY_CONFLICT",
+        "Core session is already bound to the requested new caller, but the latest audited handoff does not exactly match this replay.",
+      );
+    }
+
+    this.assertActor(record, input.expectedActorKey);
+    if (record.writerReconciliationState !== "CLEAR" || record.writerDomains.length !== 0) {
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_REBIND_RECONCILIATION_REQUIRED",
+        "Unresolved Core writer effects must be reconciled before caller rebind (state=" +
+          `${record.writerReconciliationState}, domains=${record.writerDomains.join(",") || "none"}).`,
+      );
+    }
+    if (record.freshnessState !== "FRESH" || record.rebindState !== "BOUND_CURRENT") {
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_REBIND_REQUIRED",
+        "A stale Core mutation session cannot hand off caller identity; it must be rebound to current physical state first.",
+      );
+    }
+
+    await this.assertContinuationLineage(record, input.workspaceRoot);
+    const now = (input.now ?? new Date()).toISOString();
+    const tx = this.database.sqlite.transaction((): CoreMutationSessionRebindRecord => {
+      const rebound = this.database.sqlite.prepare(`
+        update core_mutation_sessions
+        set actor_key = ?, updated_at = ?
+        where id = ? and status = 'ACTIVE' and actor_key = ? and updated_at = ?
+          and freshness_state = 'FRESH' and rebind_state = 'BOUND_CURRENT'
+          and writer_reconciliation_state = 'CLEAR' and writer_domains_json = '[]'
+      `).run(input.newActorKey, now, record.id, input.expectedActorKey, record.updatedAt);
+      if (rebound.changes !== 1) {
+        const currentRow = this.database.sqlite
+          .prepare("select actor_key, binding_hash from core_mutation_sessions where id = ? limit 1")
+          .get(record.id) as { actor_key?: string; binding_hash?: string } | undefined;
+        const latestRow = this.database.sqlite.prepare(`
+          select * from core_mutation_session_rebinds
+          where session_id = ?
+          order by rowid desc
+          limit 1
+        `).get(record.id) as {
+          rebind_id: string;
+          session_id: string;
+          from_actor_key: string;
+          to_actor_key: string;
+          binding_hash: string;
+          evidence: string;
+          created_at: string;
+        } | undefined;
+        if (
+          currentRow?.actor_key === input.newActorKey &&
+          currentRow.binding_hash === record.bindingHash &&
+          latestRow?.from_actor_key === input.expectedActorKey &&
+          latestRow.to_actor_key === input.newActorKey &&
+          latestRow.binding_hash === record.bindingHash &&
+          latestRow.evidence === input.evidence
+        ) {
+          return {
+            rebindId: latestRow.rebind_id,
+            sessionId: latestRow.session_id,
+            bindingHash: latestRow.binding_hash,
+            fromActorKey: latestRow.from_actor_key,
+            toActorKey: latestRow.to_actor_key,
+            evidence: latestRow.evidence,
+            createdAt: latestRow.created_at,
+          };
+        }
+        throw new CoreMutationSessionError(
+          "CORE_MUTATION_REBIND_RACE",
+          "Core session changed during caller rebind inspection; no matching audited handoff was observed.",
+        );
+      }
+
+      const rebindId = `rbr_${randomUUID().replace(/-/g, "")}`;
+      this.database.sqlite.prepare(`
+        insert into core_mutation_session_rebinds (
+          rebind_id, session_id, from_actor_key, to_actor_key, binding_hash, evidence, created_at
+        ) values (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        rebindId,
+        record.id,
+        input.expectedActorKey,
+        input.newActorKey,
+        record.bindingHash,
+        input.evidence,
+        now,
+      );
+      return {
+        rebindId,
+        sessionId: record.id,
+        bindingHash: record.bindingHash,
+        fromActorKey: input.expectedActorKey,
+        toActorKey: input.newActorKey,
+        evidence: input.evidence,
+        createdAt: now,
+      };
+    });
+    return tx.immediate();
+  }
+
+  rebindsFor(sessionId: string): CoreMutationSessionRebindRecord[] {
+    const rows = this.database.sqlite
+      .prepare("select * from core_mutation_session_rebinds where session_id = ? order by rowid asc")
+      .all(sessionId) as Array<{
+        rebind_id: string;
+        session_id: string;
+        from_actor_key: string;
+        to_actor_key: string;
+        binding_hash: string;
+        evidence: string;
+        created_at: string;
+      }>;
+    return rows.map((row) => ({
+      rebindId: String(row.rebind_id),
+      sessionId: String(row.session_id),
+      bindingHash: String(row.binding_hash),
+      fromActorKey: String(row.from_actor_key),
+      toActorKey: String(row.to_actor_key),
+      evidence: String(row.evidence),
+      createdAt: String(row.created_at),
+    }));
   }
 
   async snapshot(input: {

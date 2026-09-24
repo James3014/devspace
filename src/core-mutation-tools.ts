@@ -98,6 +98,24 @@ export function assertCoreMutationRecoveryOwnerClient(
   };
 }
 
+function controllerCallerFingerprints(extra: CoreMutationToolExtra): {
+  callerIdentityFingerprint?: string;
+  conversationIdentityFingerprint?: string;
+} {
+  const conversationScope = openAiConversationScopeId(extra._meta);
+  const conversationIdentityFingerprint = conversationScope
+    ? `openai:${createHash("sha256").update(conversationScope).digest("hex")}`
+    : undefined;
+  const clientId = extra.authInfo?.clientId;
+  const callerIdentityFingerprint = clientId
+    ? `mcp:${createHash("sha256").update(clientId).digest("hex")}`
+    : conversationIdentityFingerprint;
+  return {
+    ...(callerIdentityFingerprint ? { callerIdentityFingerprint } : {}),
+    ...(conversationIdentityFingerprint ? { conversationIdentityFingerprint } : {}),
+  };
+}
+
 function actorKeyRequired(extra: CoreMutationToolExtra): string {
   const value = actorKey(extra);
   if (!value) {
@@ -290,6 +308,13 @@ export function registerCoreMutationSessionTools(
     readDurableAgentRecord?: (
       agentId: string,
     ) => Promise<CoreMutationDurableAgentRecord | undefined> | CoreMutationDurableAgentRecord | undefined;
+    onCallerRebound?: (input: {
+      mcpSessionId?: string;
+      rebindId: string;
+      callerIdentityFingerprint?: string;
+      conversationIdentityFingerprint?: string;
+      reboundAt: string;
+    }) => Promise<void> | void;
   } = {},
 ): void {
   if (!store) return;
@@ -438,6 +463,64 @@ export function registerCoreMutationSessionTools(
         content: [{ type: "text" as const, text: `Core mutation session ${session.id}: ${session.status}.` }],
         structuredContent: publicSession(session),
       };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "core_mutation_session_rebind",
+    {
+      title: "Rebind Core mutation caller",
+      description:
+        "Audit and atomically hand off one exact ACTIVE Core mutation session from its exact prior caller to the current trusted caller. All unresolved writer effects must already be reconciled, physical lineage must still match the bound source or a recorded Candidate, and session/binding identity is preserved. This grants no retry, scope expansion, verification, acceptance, integration, merge, or release authority.",
+      inputSchema: {
+        workspaceId: z.string(),
+        sessionId: z.string(),
+        bindingHash: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+        expectedActorKey: z.string().regex(/^(?:mcp|openai):[0-9a-f]{64}$/),
+        evidence: z.string().min(1).max(4096),
+      },
+      outputSchema: z.object({
+        rebindId: z.string(),
+        sessionId: z.string(),
+        bindingHash: z.string(),
+        fromActorKey: z.string(),
+        toActorKey: z.string(),
+        evidence: z.string(),
+        createdAt: z.string(),
+      }),
+      _meta: {},
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ workspaceId, sessionId, bindingHash, expectedActorKey, evidence }, extra) => {
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const newActorKey = actorKeyRequired(extra);
+      try {
+        const rebound = await store.rebindActor({
+          sessionId,
+          workspaceSessionId: workspaceId,
+          workspaceRoot: workspace.root,
+          expectedActorKey,
+          newActorKey,
+          evidence,
+          pointer: { sessionId, bindingHash },
+        });
+        await options.onCallerRebound?.({
+          mcpSessionId: extra.sessionId,
+          rebindId: rebound.rebindId,
+          ...controllerCallerFingerprints(extra),
+          reboundAt: rebound.createdAt,
+        });
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Core mutation session ${sessionId} caller handoff recorded as ${rebound.rebindId}; session/binding/effect lineage is preserved.`,
+          }],
+          structuredContent: rebound as unknown as Record<string, unknown>,
+        };
+      } catch (error) {
+        throw toolError(error);
+      }
     },
   );
 

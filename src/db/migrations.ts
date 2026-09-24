@@ -83,6 +83,7 @@ const migrations: Migration[] = [
   { version: 18, name: "chat-swarm-carrier-operations", up: migrateChatSwarmCarrierOperations },
   { version: 19, name: "core-mutation-sessions", up: migrateCoreMutationSessions },
   { version: 20, name: "local-agent-provider-continuity", up: migrateLocalAgentProviderContinuity },
+  { version: 21, name: "core-mutation-session-rebinds", up: migrateCoreMutationSessionRebinds },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -485,6 +486,25 @@ function migrateCoreMutationSessions(sqlite: Database.Database): void {
     );
     create index if not exists core_mutation_candidates_binding_idx
       on core_mutation_candidates(binding_hash, created_at desc);
+  `);
+}
+
+function migrateCoreMutationSessionRebinds(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists core_mutation_session_rebinds (
+      rebind_id text primary key,
+      session_id text not null references core_mutation_sessions(id) on delete cascade,
+      from_actor_key text not null,
+      to_actor_key text not null,
+      binding_hash text not null,
+      evidence text not null,
+      created_at text not null
+    );
+    drop index if exists core_mutation_session_rebinds_unique_pair_idx;
+    create index if not exists core_mutation_session_rebinds_transition_idx
+      on core_mutation_session_rebinds(session_id, from_actor_key, to_actor_key, created_at desc);
+    create index if not exists core_mutation_session_rebinds_session_idx
+      on core_mutation_session_rebinds(session_id, created_at desc);
   `);
 }
 

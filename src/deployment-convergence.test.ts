@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  applySessionCallerRebind,
   evaluateClientProjectionConvergence,
   evaluateDeploymentConvergence,
   evaluateSessionConvergence,
@@ -451,6 +452,45 @@ test("MultiRoleConvergence: missing role kind never guesses from connector names
   assert.equal(result.topologyValid, false);
   assert.deepEqual(result.missingRoleKindRoles, ["dev-c"]);
   assert.equal(result.authoritativeProductionRoles.length, 0);
+});
+
+test("caller rebind snapshot application is idempotent by rebindId and preserves ordered transitions", () => {
+  const base = {
+    serverInstanceId: "srv-1",
+    sourceCommit: "commit-1",
+    buildId: "build-1",
+    capabilityManifestSha256: "man-1",
+    catalogGeneration: "gen-1",
+    sessionInitializedAt: "2026-09-24T00:00:00.000Z",
+    callerIdentityFingerprint: "caller-a",
+    conversationIdentityFingerprint: "conversation-a",
+  };
+  const first = applySessionCallerRebind(base, {
+    rebindId: "rbr-1",
+    callerIdentityFingerprint: "caller-b",
+    conversationIdentityFingerprint: "conversation-b",
+    reboundAt: "2026-09-24T00:01:00.000Z",
+  });
+  assert.equal(first.callerIdentityFingerprint, "caller-b");
+  assert.equal(first.callerRebinds?.length, 1);
+  const replay = applySessionCallerRebind(first, {
+    rebindId: "rbr-1",
+    callerIdentityFingerprint: "caller-conflict",
+    conversationIdentityFingerprint: "conversation-conflict",
+    reboundAt: "2026-09-24T00:02:00.000Z",
+  });
+  assert.equal(replay, first);
+  assert.equal(replay.callerIdentityFingerprint, "caller-b");
+  assert.equal(replay.callerRebinds?.length, 1);
+  const second = applySessionCallerRebind(first, {
+    rebindId: "rbr-2",
+    callerIdentityFingerprint: "caller-a",
+    conversationIdentityFingerprint: "conversation-a",
+    reboundAt: "2026-09-24T00:03:00.000Z",
+  });
+  assert.equal(second.callerRebinds?.length, 2);
+  assert.equal(second.callerRebinds?.[1]?.fromCallerIdentityFingerprint, "caller-b");
+  assert.equal(second.callerRebinds?.[1]?.toCallerIdentityFingerprint, "caller-a");
 });
 
 test("MultiRoleConvergence: unknown role kind is also topology-invalid", () => {
