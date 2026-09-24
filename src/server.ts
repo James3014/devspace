@@ -1668,6 +1668,14 @@ type ControllerCallerIdentity = {
   conversationIdentityFingerprint?: string;
 };
 
+export function permitsCoreCallerRebindGate(
+  toolName: string,
+  controllerDisposition: "CURRENT" | "SERVER_AHEAD_OF_CLIENT" | "STALE_RECONNECT_REQUIRED" | "CALLER_REBIND_REQUIRED",
+): boolean {
+  return toolName === "core_mutation_session_rebind" &&
+    controllerDisposition === "CALLER_REBIND_REQUIRED";
+}
+
 function controllerCallerIdentity(input: ControllerCallerIdentityInput): ControllerCallerIdentity {
   const conversationScope = openAiConversationScopeId(input._meta);
   const conversationIdentityFingerprint = conversationScope
@@ -7350,9 +7358,10 @@ export function createServer(
             cutoverMode: cutoverController.mode(),
             reconciliationRequired: cutoverController.mode() !== "normal",
           }, requestCallerIdentity.callerIdentityFingerprint, requestCallerIdentity.conversationIdentityFingerprint);
-          const callerRebindGateSatisfied =
-            toolName === "core_mutation_session_rebind" &&
-            convergence.controllerDisposition === "CALLER_REBIND_REQUIRED";
+          const callerRebindGateSatisfied = permitsCoreCallerRebindGate(
+            toolName,
+            convergence.controllerDisposition,
+          );
           if (convergence.controllerDisposition !== "CURRENT" && !callerRebindGateSatisfied) {
             const disposition = {
               staleSessionState: convergence.state,
