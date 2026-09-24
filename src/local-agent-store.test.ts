@@ -1548,6 +1548,18 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
     requestedEffort: "different-effort",
   }).applied, false, "L-MISMATCH-EFFORT must fail");
 
+  // L-MISMATCH-CLINE-PROVIDER: different requested Cline provider family fails closed
+  assert.equal(store.fenceExternalRuntimeLaunchCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    dispatchIntentHash: launchIntentHash,
+    canonicalWorktreePath: join(root, "launch_project"),
+    gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+    agentKind: "opencode",
+    promptNonce: "NONCE-LAUNCH-1",
+    requestedCliProviderId: "cline-pass",
+  }).applied, false, "L-MISMATCH-CLINE-PROVIDER must fail");
+
   // L-MISMATCH-NONCE: different promptNonce fails closed
   assert.equal(store.fenceExternalRuntimeLaunchCAS({
     agentId: launchAgent.id,
