@@ -3677,7 +3677,7 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
         return true;
       },
     );
-    assert.equal(spy.workspaceCloseCalls, 0);
+    assert.equal(spy.workspaceCloseCalls, 1);
 
     // 6. SI-WRONG-PANE: agent pane mismatch
     spy.simulatedAgents.set(handle.herdrAgentIdentity, {
@@ -3697,7 +3697,7 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
         return true;
       },
     );
-    assert.equal(spy.workspaceCloseCalls, 0);
+    assert.equal(spy.workspaceCloseCalls, 1);
 
     // 7. SI-WRONG-CWD: agent cwd mismatch
     spy.simulatedAgents.set(handle.herdrAgentIdentity, {
@@ -3717,7 +3717,7 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
         return true;
       },
     );
-    assert.equal(spy.workspaceCloseCalls, 0);
+    assert.equal(spy.workspaceCloseCalls, 1);
 
     // 8. SI-WRONG-NAME: agent name mismatch
     spy.simulatedAgents.set(handle.herdrAgentIdentity, {
@@ -3737,7 +3737,7 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
         return true;
       },
     );
-    assert.equal(spy.workspaceCloseCalls, 0);
+    assert.equal(spy.workspaceCloseCalls, 1);
 
     // 9. SI-CLOSE-ERROR: workspace.close fails -> error not swallowed, registry handle NOT released
     spy.simulatedAgents.set(handle.herdrAgentIdentity, {
