@@ -265,6 +265,9 @@ test("SessionConvergence: caller identity drift requires explicit caller rebind 
   const omittedConversation = evaluateSessionConvergence(snapshot, current, "mcp:client-a");
   assert.equal(omittedConversation.controllerDisposition, "CURRENT");
 
+  const omittedCaller = evaluateSessionConvergence(snapshot, current);
+  assert.equal(omittedCaller.controllerDisposition, "CURRENT");
+
   const changedClient = evaluateSessionConvergence(snapshot, current, "mcp:client-b");
   assert.equal(changedClient.controllerDisposition, "CALLER_REBIND_REQUIRED");
 });
