@@ -106,6 +106,7 @@ import {
   planCutoverStart,
   DurableOperationError,
   NEXUS_GATEWAY_RECOVERY_SCHEMA,
+  NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_SCHEMA,
   type DurableOperationRecord,
 } from "./durable-operations.js";
 import { ChatSwarmMigrationCoordinator, chatSwarmMigrationOperationId } from "./chat-swarm-migration.js";
@@ -3524,7 +3525,7 @@ export function createMcpServer(
       operationId: z.string(),
       attemptKey: z.string(),
       requestHash: z.string(),
-      kind: z.enum(["workspace_clone", "dependency_sync", "nexus_gateway_recover", "nexus_gateway_recovery_preflight", "cutover_start", "host_operation", "chat_swarm_reconciliation"]),
+      kind: z.enum(["workspace_clone", "dependency_sync", "nexus_gateway_recover", "nexus_gateway_recovery_preflight", "nexus_gateway_recovery_materialize", "cutover_start", "host_operation", "chat_swarm_reconciliation"]),
       authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]),
       scopeRoot: z.string(),
       workspaceId: z.string().optional(),
@@ -3591,6 +3592,16 @@ export function createMcpServer(
       predecessor_manifest_hash: nexusHash,
       request_hash: nexusHash,
       schema: z.literal(NEXUS_GATEWAY_RECOVERY_SCHEMA),
+    }).strict();
+    const nexusGatewayRecoveryMaterializationRequestSchema = z.object({
+      request_id: nexusSafeId,
+      idempotency_fence: nexusSafeId,
+      operation: z.literal("gateway-recovery-materialize"),
+      effect_class: z.literal("GATEWAY_RECOVERY_MATERIALIZATION"),
+      recovery_authority_id: nexusSafeId,
+      recovery_authority_hash: nexusHash,
+      request_hash: nexusHash,
+      schema: z.literal(NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_SCHEMA),
     }).strict();
 
     registerAppTool(
@@ -3708,6 +3719,48 @@ export function createMcpServer(
           isError: result.status === "error",
           structuredContent: result as unknown as Record<string, unknown>,
         };
+      },
+    );
+
+    registerAppTool(
+      server,
+      "nexus_gateway_recovery_materialize",
+      {
+        title: "Materialize Nexus Gateway Recovery Authority",
+        description:
+          "Durably materialize one exact merged Nexus Gateway recovery authority into the fixed manager-owned host store. The caller supplies only the bounded materialization identity; repository, tracked authority path, authority mirror, fixed state paths, predecessor artifact location, interpreter, and manager are fixed server-side. This operation starts no Gateway, launchd, plist, or process effect. Timeout or uncertain acknowledgement must reconcile the same durable operation before any replay.",
+        inputSchema: {
+          attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
+            .describe("Stable materialization attempt identity. Exact replay returns the same terminal operation; conflicting reuse fails closed."),
+          request: nexusGatewayRecoveryMaterializationRequestSchema,
+        },
+        outputSchema: durableOperationOutputSchema,
+        _meta: {},
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: true,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ attemptKey, request }) => {
+        try {
+          return operationResponse(
+            await durableOperations.nexusGatewayRecoveryMaterialize({
+              attemptKey,
+              request,
+            }),
+          );
+        } catch (error) {
+          if (error instanceof DurableOperationError && error.operation) {
+            return {
+              content: [textBlock(`${error.code}: ${error.message}`)],
+              isError: true,
+              structuredContent: error.operation as unknown as Record<string, unknown>,
+            };
+          }
+          throw error;
+        }
       },
     );
 

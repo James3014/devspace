@@ -20,10 +20,15 @@ import {
   NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256,
   NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE,
   NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE,
+  NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_BRIDGE_CODE,
   buildNexusGatewayRecoveryBridgeCode,
+  buildNexusGatewayRecoveryMaterializationBridgeCode,
   NEXUS_GATEWAY_RECOVERY_SCHEMA,
+  NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_SCHEMA,
+  NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_RECEIPT_SCHEMA,
   type CommandRunner,
   type NexusGatewayRecoveryRequest,
+  type NexusGatewayRecoveryMaterializationRequest,
 } from "./durable-operations.js";
 
 const execFileAsync = promisify(execFile);
@@ -41,6 +46,31 @@ function canonicalHash(value: unknown): string {
     return child;
   };
   return createHash("sha256").update(JSON.stringify(sort(value))).digest("hex");
+}
+
+function materializationRequest(
+  overrides: Partial<NexusGatewayRecoveryMaterializationRequest> = {},
+): NexusGatewayRecoveryMaterializationRequest {
+  const request = {
+    request_id: "materialize-request-1",
+    idempotency_fence: "materialize-fence-1",
+    operation: "gateway-recovery-materialize" as const,
+    effect_class: "GATEWAY_RECOVERY_MATERIALIZATION" as const,
+    recovery_authority_id: "materialize-authority-1",
+    recovery_authority_hash: "9".repeat(64),
+    request_hash: "",
+    schema: NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_SCHEMA,
+    ...overrides,
+  };
+  request.request_hash = canonicalHash({
+    request_id: request.request_id,
+    idempotency_fence: request.idempotency_fence,
+    operation: request.operation,
+    effect_class: request.effect_class,
+    recovery_authority_id: request.recovery_authority_id,
+    recovery_authority_hash: request.recovery_authority_hash,
+  });
+  return request;
 }
 
 function recoveryRequest(overrides: Partial<NexusGatewayRecoveryRequest> = {}): NexusGatewayRecoveryRequest {
@@ -617,6 +647,205 @@ test("nexus_gateway_recover malformed manager output fails closed as uncertain",
   } finally {
     await f.cleanup();
   }
+});
+
+
+test("nexus_gateway_recovery_materialize exact replay is durable and conflicting replay fails closed", async () => {
+  const f = await fixture();
+  try {
+    const calls: NexusGatewayRecoveryMaterializationRequest[] = [];
+    const manager = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      undefined,
+      undefined,
+      undefined,
+      async (request) => {
+        calls.push(structuredClone(request));
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            schema: NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_RECEIPT_SCHEMA,
+            effect_started: false,
+            receipt_hash: "a".repeat(64),
+          }),
+          stderr: "",
+        };
+      },
+    );
+    try {
+      const request = materializationRequest();
+      const first = await manager.nexusGatewayRecoveryMaterialize({
+        attemptKey: "gateway-materialize-1",
+        request,
+      });
+      assert.equal(first.kind, "nexus_gateway_recovery_materialize");
+      assert.equal(first.authorityMode, "NEXUS_GOVERNED");
+      assert.equal(first.status, "succeeded");
+      assert.equal(calls.length, 1);
+
+      const replay = await manager.nexusGatewayRecoveryMaterialize({
+        attemptKey: "gateway-materialize-1",
+        request,
+      });
+      assert.equal(replay.operationId, first.operationId);
+      assert.equal(replay.updatedAt, first.updatedAt);
+      assert.equal(calls.length, 1);
+
+      const conflicting = materializationRequest({ recovery_authority_hash: "8".repeat(64) });
+      await assert.rejects(
+        manager.nexusGatewayRecoveryMaterialize({
+          attemptKey: "gateway-materialize-1",
+          request: conflicting,
+        }),
+        (error: unknown) =>
+          error instanceof DurableOperationError && error.code === "OPERATION_REPLAY_CONFLICT",
+      );
+      assert.equal(calls.length, 1);
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("nexus_gateway_recovery_materialize rejects malformed request before bridge execution", async () => {
+  const f = await fixture();
+  try {
+    let calls = 0;
+    const manager = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      undefined,
+      undefined,
+      undefined,
+      async () => {
+        calls += 1;
+        return { exitCode: 0, stdout: "{}", stderr: "" };
+      },
+    );
+    try {
+      const malformed = {
+        ...materializationRequest(),
+        request_hash: "0".repeat(64),
+      };
+      await assert.rejects(
+        manager.nexusGatewayRecoveryMaterialize({
+          attemptKey: "gateway-materialize-invalid-1",
+          request: malformed,
+        }),
+        (error: unknown) =>
+          error instanceof DurableOperationError && error.code === "NEXUS_GATEWAY_REQUEST_INVALID",
+      );
+      assert.equal(calls, 0);
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("nexus_gateway_recovery_materialize uncertain outcome reconciles only the stored request", async () => {
+  const f = await fixture();
+  try {
+    const calls: NexusGatewayRecoveryMaterializationRequest[] = [];
+    const manager = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      undefined,
+      undefined,
+      undefined,
+      async (request) => {
+        calls.push(structuredClone(request));
+        if (calls.length === 1) {
+          return { exitCode: 1, stdout: "", stderr: "lost acknowledgement" };
+        }
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({
+            schema: NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_RECEIPT_SCHEMA,
+            effect_started: false,
+            receipt_hash: "b".repeat(64),
+          }),
+          stderr: "",
+        };
+      },
+    );
+    try {
+      const request = materializationRequest();
+      const uncertain = await manager.nexusGatewayRecoveryMaterialize({
+        attemptKey: "gateway-materialize-reconcile-1",
+        request,
+      });
+      assert.equal(uncertain.status, "outcome_unknown");
+      assert.equal(uncertain.errorCode, "NEXUS_GATEWAY_MATERIALIZATION_UNCERTAIN");
+
+      await assert.rejects(
+        manager.nexusGatewayRecoveryMaterialize({
+          attemptKey: "gateway-materialize-reconcile-1",
+          request,
+        }),
+        (error: unknown) =>
+          error instanceof DurableOperationError && error.code === "OPERATION_OUTCOME_UNKNOWN",
+      );
+
+      const reconciled = await manager.reconcile(uncertain.operationId);
+      assert.equal(reconciled.status, "succeeded");
+      assert.equal(calls.length, 2);
+      assert.deepEqual(calls[1], calls[0], "reconcile must reuse the original materialization request");
+      assert.equal((reconciled.receipt as Record<string, unknown>).reconciled, true);
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("nexus_gateway_recovery_materialize malformed output remains uncertain and bridge pins authority imports", async () => {
+  const f = await fixture();
+  try {
+    const manager = new DurableOperationManager(
+      f.config,
+      async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+      undefined,
+      undefined,
+      undefined,
+      async () => ({ exitCode: 0, stdout: "not-json", stderr: "" }),
+    );
+    try {
+      const result = await manager.nexusGatewayRecoveryMaterialize({
+        attemptKey: "gateway-materialize-json-1",
+        request: materializationRequest(),
+      });
+      assert.equal(result.status, "outcome_unknown");
+      assert.equal(result.errorCode, "NEXUS_GATEWAY_MATERIALIZATION_UNCERTAIN");
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+
+  assert.equal(
+    NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_BRIDGE_CODE,
+    buildNexusGatewayRecoveryMaterializationBridgeCode(),
+  );
+  assert.match(
+    NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_BRIDGE_CODE,
+    /AUTHORITY_SOURCE_ROOT = pathlib\.Path\("\/Users\/jameschen\/Workspace\/Nexus-new-authority-main"\)/,
+  );
+  assert.match(
+    NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_BRIDGE_CODE,
+    /sys\.path\.insert\(0, str\(AUTHORITY_SOURCE_ROOT\)\)/,
+  );
+  assert.doesNotMatch(
+    NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_BRIDGE_CODE,
+    /ACCEPTED_MANAGER_SHA256/,
+    "pre-authority materialization bridge must not pin the legacy recovery-manager hash",
+  );
 });
 
 test("Nexus Gateway recovery trust roots track the current accepted #526 R2 lineage", () => {
