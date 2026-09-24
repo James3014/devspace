@@ -621,6 +621,27 @@ export class HerdrThinGateway {
     }
   }
 
+  private async confirmAgentAbsent(
+    agentName: string,
+    socketPath: string,
+  ): Promise<boolean> {
+    const req: HerdrSocketRequest = {
+      id: `agent-absence-confirm-${Date.now()}`,
+      method: "agent.get",
+      params: { target: agentName },
+    };
+    const res = await this.sendRequest<{
+      type: string;
+      agent?: HerdrAgentInfo;
+    }>(req, 3000, socketPath);
+    if (res.error) {
+      throw new Error(
+        `[AGENT_ABSENCE_UNVERIFIED] HerdR agent.get failed for '${agentName}': ${res.error.message}`,
+      );
+    }
+    return res.result?.agent === undefined;
+  }
+
   /**
    * Validate physical AgentInfo object against expected launch/target identity (E1, F4, Comment 5785928588).
    * Missing required fields (workspace_id, pane_id, name, cwd) or any contradiction fails closed.
@@ -2074,9 +2095,38 @@ export class HerdrThinGateway {
     });
 
     if (!liveObs.valid) {
-      throw new Error(
-        `[STOP_LIVE_IDENTITY_MISMATCH] Current live process identity could not be verified in HerdR (${liveObs.reason}); zero workspace.close calls permitted.`,
+      const exactPaneStillOwned =
+        Boolean(liveObs.pane) &&
+        liveObs.pane?.workspace_id === boundHandle.herdrWorkspaceId &&
+        (liveObs.pane?.pane_id === boundHandle.herdrPaneId) &&
+        (() => {
+          const paneCwd = liveObs.pane?.cwd ? canonicalizePath(liveObs.pane.cwd) : undefined;
+          const paneForegroundCwd = liveObs.pane?.foreground_cwd
+            ? canonicalizePath(liveObs.pane.foreground_cwd)
+            : undefined;
+          return paneCwd === canonicalizePath(boundHandle.canonicalWorktreePath)
+            || paneForegroundCwd === canonicalizePath(boundHandle.canonicalWorktreePath);
+        })();
+      const missingExactAgent =
+        exactPaneStillOwned &&
+        !liveObs.agent &&
+        liveObs.reason === `Agent '${boundHandle.herdrAgentIdentity}' not found in HerdR`;
+
+      if (!missingExactAgent) {
+        throw new Error(
+          `[STOP_LIVE_IDENTITY_MISMATCH] Current live process identity could not be verified in HerdR (${liveObs.reason}); zero workspace.close calls permitted.`,
+        );
+      }
+
+      const positivelyAbsent = await this.confirmAgentAbsent(
+        boundHandle.herdrAgentIdentity,
+        targetSocket,
       );
+      if (!positivelyAbsent) {
+        throw new Error(
+          `[STOP_LIVE_IDENTITY_MISMATCH] Agent '${boundHandle.herdrAgentIdentity}' reappeared during absence confirmation; zero workspace.close calls permitted.`,
+        );
+      }
     }
 
     await this.closeWorkspace(boundHandle.herdrWorkspaceId, targetSocket);
