@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
@@ -1280,6 +1281,301 @@ test("LocalAgentSessionManager - rejects conflicting replay and enforcement stat
     defaultHerdrGatewayRegistry.releaseHandle("bound-attempt-key");
     defaultHerdrGatewayRegistry.releaseHandle("different-attempt-key");
     clean();
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+class SpyProductionHerdrGateway extends HerdrThinGateway {
+  ready = true;
+  startCalls = 0;
+  promptCalls = 0;
+  stopCalls = 0;
+  nonces: string[] = [];
+  handle?: HerdrExternalHandle;
+
+  override async probeReady(): Promise<boolean> {
+    return this.ready;
+  }
+
+  override async startExternalAgent(params: any): Promise<HerdrExternalHandle> {
+    this.startCalls++;
+    const gitHeadBefore = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: params.canonicalWorktreePath,
+      encoding: "utf8",
+    }).trim();
+    const handle: HerdrExternalHandle = {
+      schemaVersion: 1,
+      runtimeKind: "HERDR",
+      agentId: params.agentId,
+      herdrSocketPath: "/tmp/herdr-public-path.sock",
+      herdrWorkspaceId: `w-${params.attemptKey}`,
+      herdrPaneId: `p-${params.attemptKey}`,
+      herdrAgentIdentity: `ds-${params.attemptKey}`,
+      herdrAgentKind: params.agentKind,
+      requestedModel: params.requestedModel,
+      requestedEffort: params.requestedEffort,
+      promptNonce: `HERDR-DISPATCH-${params.attemptKey}`,
+      canonicalWorktreePath: params.canonicalWorktreePath,
+      workspaceId: params.workspaceId,
+      gitHeadBefore,
+      attemptKey: params.attemptKey,
+      dispatchIntentHash: params.dispatchIntentHash,
+      launchTimestamp: new Date().toISOString(),
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    };
+    this.handle = handle;
+    return handle;
+  }
+
+  override async promptExternalAgent(handle: HerdrExternalHandle, _prompt: string, options: any = {}): Promise<any> {
+    this.promptCalls++;
+    this.nonces.push(handle.promptNonce);
+    this.handle = handle;
+    if (options.store) {
+      const fenced = options.store.fenceConsequentialPromptCAS({
+        agentId: handle.agentId,
+        attemptKey: handle.attemptKey,
+        dispatchIntentHash: handle.dispatchIntentHash,
+        promptNonce: handle.promptNonce,
+      });
+      assert.equal(fenced.applied, true);
+    }
+    return {
+      turnNonce: handle.promptNonce,
+      status: "done",
+      rawStatus: "done",
+      paneOutput: `PUBLIC_HERDR_TURN_${this.promptCalls}`,
+    };
+  }
+
+  override async reconcileExternalAgent(handle: HerdrExternalHandle): Promise<any> {
+    return {
+      settled: true,
+      completionStatus: "COMPLETED",
+      executionState: "SETTLED_TERMINAL",
+      physicalEffect: "ABSENT",
+      changedPaths: [],
+      unexpectedPaths: [],
+      gitHeadAfter: handle.gitHeadBefore,
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    };
+  }
+
+  override async stopExternalAgent(): Promise<void> {
+    this.stopCalls++;
+  }
+}
+
+test("LocalAgentSessionManager - HERDR public lifecycle routes start, continue, status and cancel without legacy launcher", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-herdr-public-state-"));
+  const projectRoot = mkdtempSync(join(tmpdir(), "devspace-herdr-public-repo-"));
+  const gateway = new SpyProductionHerdrGateway();
+  let legacyLaunches = 0;
+  const config = {
+    stateDir,
+    subagents: true,
+    oauth: { scopes: ["devspace"] },
+    agentExecutionBackend: "herdr",
+    allowedRoots: [projectRoot],
+    toolchains: [],
+    agentMaxConcurrent: 4,
+    port: 7676,
+  } as any;
+
+  execFileSync("git", ["init", "--initial-branch=main"], { cwd: projectRoot });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: projectRoot });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd: projectRoot });
+  writeFileSync(join(projectRoot, "README.md"), "herdr public path\n");
+  execFileSync("git", ["add", "."], { cwd: projectRoot });
+  execFileSync("git", ["commit", "-m", "base"], { cwd: projectRoot });
+
+  const manager = new LocalAgentSessionManager(
+    config,
+    async () => { legacyLaunches++; },
+    async () => true,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    gateway,
+  );
+  const attemptKey = "issue242-public-herdr-1";
+  const dispatchIntent = {
+    taskId: "issue242-public-herdr",
+    attemptId: attemptKey,
+    objective: "Prove public lifecycle uses HerdR",
+    roleIntent: "DEEP_ENGINEERING" as const,
+    claimCeiling: "RESULT_RETURNED" as const,
+    context: ["test"],
+    readScope: ["README.md"],
+    writeScope: [],
+    exclusiveOwnership: false,
+    forbiddenChanges: [],
+    acceptanceCriteria: ["HerdR public path"],
+    verificationRequired: true,
+    expectedArtifacts: [],
+  };
+
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_issue242_public",
+      workspaceRoot: projectRoot,
+      profileName: "reviewer",
+      prompt: "first turn",
+      profiles: mockProfiles,
+      attemptKey,
+      executionContract: { dispatchIntent },
+    });
+    assert.equal(started.provider, "agy");
+
+    let first = await manager.getAgentStatus({
+      workspaceId: "ws_issue242_public",
+      workspaceRoot: projectRoot,
+      agentId: started.agentId,
+      waitMs: 1_000,
+    });
+    if (first.status !== "idle") {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      first = await manager.getAgentStatus({
+        workspaceId: "ws_issue242_public",
+        workspaceRoot: projectRoot,
+        agentId: started.agentId,
+        waitMs: 1_000,
+      });
+    }
+
+    assert.equal(legacyLaunches, 0);
+    assert.equal(gateway.startCalls, 1);
+    assert.equal(gateway.promptCalls, 1);
+    assert.equal(first.status, "idle");
+    assert.equal(first.runtime?.runtimeKind, "HERDR");
+    assert.equal(first.runtime?.agentIdentity, `ds-${attemptKey}`);
+    assert.equal(first.latestResponse, "PUBLIC_HERDR_TURN_1");
+
+    await manager.continueAgent({
+      workspaceId: "ws_issue242_public",
+      workspaceRoot: projectRoot,
+      agentId: started.agentId,
+      prompt: "second turn",
+      profiles: mockProfiles,
+    });
+    let second = await manager.getAgentStatus({
+      workspaceId: "ws_issue242_public",
+      workspaceRoot: projectRoot,
+      agentId: started.agentId,
+      waitMs: 1_000,
+    });
+    if (second.status !== "idle") {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      second = await manager.getAgentStatus({
+        workspaceId: "ws_issue242_public",
+        workspaceRoot: projectRoot,
+        agentId: started.agentId,
+        waitMs: 1_000,
+      });
+    }
+
+    assert.equal(gateway.startCalls, 1, "continuation must reuse the same HerdR agent");
+    assert.equal(gateway.promptCalls, 2);
+    assert.notEqual(gateway.nonces[0], gateway.nonces[1], "each consequential turn must have a fresh durable nonce");
+    assert.equal(second.status, "idle");
+    assert.equal(second.runtime?.runtimeKind, "HERDR");
+    assert.equal(second.latestResponse, "PUBLIC_HERDR_TURN_2");
+
+    const reconciled = await manager.reconcileAgent({
+      workspaceId: "ws_issue242_public",
+      workspaceRoot: projectRoot,
+      isolated: true,
+      agentId: started.agentId,
+    });
+    assert.equal(reconciled.runtime?.runtimeKind, "HERDR");
+    assert.equal(reconciled.providerState, "SETTLED_TERMINAL");
+
+    const stopped = await manager.cancelAgent({
+      workspaceId: "ws_issue242_public",
+      workspaceRoot: projectRoot,
+      agentId: started.agentId,
+    });
+    assert.equal(gateway.stopCalls, 1);
+    assert.equal(stopped.status, "stopped");
+    assert.equal(stopped.runtime?.runtimeKind, "HERDR");
+    assert.equal(legacyLaunches, 0);
+  } finally {
+    defaultHerdrGatewayRegistry.releaseHandle(attemptKey);
+    manager.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("LocalAgentSessionManager - HERDR daemon unavailable fails closed before record creation and never launches legacy worker", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-herdr-unavailable-state-"));
+  const projectRoot = mkdtempSync(join(tmpdir(), "devspace-herdr-unavailable-repo-"));
+  const gateway = new SpyProductionHerdrGateway();
+  gateway.ready = false;
+  let legacyLaunches = 0;
+  const config = {
+    stateDir,
+    subagents: true,
+    oauth: { scopes: ["devspace"] },
+    agentExecutionBackend: "herdr",
+    allowedRoots: [projectRoot],
+    toolchains: [],
+    agentMaxConcurrent: 4,
+    port: 7676,
+  } as any;
+  const manager = new LocalAgentSessionManager(
+    config,
+    async () => { legacyLaunches++; },
+    async () => true,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    gateway,
+  );
+  const attemptKey = "issue242-herdr-down";
+  const dispatchIntent = {
+    taskId: "issue242-herdr-down",
+    attemptId: attemptKey,
+    objective: "Fail closed when HerdR is unavailable",
+    roleIntent: "DEEP_ENGINEERING" as const,
+    claimCeiling: "RESULT_RETURNED" as const,
+    context: ["test"],
+    readScope: ["README.md"],
+    writeScope: [],
+    exclusiveOwnership: false,
+    forbiddenChanges: [],
+    acceptanceCriteria: ["no fallback"],
+    verificationRequired: true,
+    expectedArtifacts: [],
+  };
+
+  try {
+    await assert.rejects(
+      manager.startAgent({
+        workspaceId: "ws_issue242_down",
+        workspaceRoot: projectRoot,
+        profileName: "reviewer",
+        prompt: "must not launch",
+        profiles: mockProfiles,
+        attemptKey,
+        executionContract: { dispatchIntent },
+      }),
+      (error: any) => {
+        assert.equal(error.code, "PROVIDER_UNAVAILABLE");
+        assert.match(error.message, /HerdR daemon is unavailable/);
+        return true;
+      },
+    );
+    assert.equal(legacyLaunches, 0);
+    assert.equal(gateway.startCalls, 0);
+    assert.equal(manager.countAllAgentRecords(), 0);
+  } finally {
+    manager.close();
+    rmSync(stateDir, { recursive: true, force: true });
     rmSync(projectRoot, { recursive: true, force: true });
   }
 });

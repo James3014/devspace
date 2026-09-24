@@ -12,6 +12,7 @@ import { parseControlPlaneTopologyManifest, type ControlPlaneInventory } from ".
 
 export type ToolMode = "minimal" | "full" | "codex";
 export type WidgetMode = "off" | "changes" | "full";
+export type AgentExecutionBackend = "legacy" | "herdr";
 const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
 const DEFAULT_OAUTH_REFRESH_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60;
 const DEFAULT_ARTIFACT_MAX_FILE_BYTES = 100 * 1024 * 1024;
@@ -46,6 +47,7 @@ export interface ServerConfig {
   gitCandidatesEnabled: boolean;
   toolchains: ToolchainSpec[];
   agentMaxConcurrent: number;
+  agentExecutionBackend: AgentExecutionBackend;
   codexGoalsEnabled: boolean;
   codexBin?: string;
   mcpSessionIdleTimeoutMs: number;
@@ -159,6 +161,12 @@ function parseToolMode(env: NodeJS.ProcessEnv): ToolMode {
     return parseBoolean(env.DEVSPACE_MINIMAL_TOOLS) ? "minimal" : "full";
   }
   return "minimal";
+}
+
+function parseAgentExecutionBackend(value: string | undefined): AgentExecutionBackend {
+  if (!value || value === "legacy") return "legacy";
+  if (value === "herdr") return "herdr";
+  throw new Error(`Invalid DEVSPACE_AGENT_EXECUTION_BACKEND: ${value}`);
 }
 
 function parseLogLevel(value: string | undefined): LogLevel {
@@ -402,6 +410,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
       4,
       "DEVSPACE_MAX_CONCURRENT_AGENTS",
     ),
+    agentExecutionBackend: parseAgentExecutionBackend(env.DEVSPACE_AGENT_EXECUTION_BACKEND),
     codexGoalsEnabled: parseBoolean(env.DEVSPACE_CODEX_GOALS),
     codexBin: env.DEVSPACE_CODEX_BIN?.trim() || undefined,
     mcpSessionIdleTimeoutMs: parsePositiveInteger(

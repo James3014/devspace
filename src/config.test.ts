@@ -28,6 +28,12 @@ assert.deepEqual(loadConfig(baseEnv).subagents, { enabled: false, providers: [] 
 assert.equal(loadConfig(baseEnv).artifactsEnabled, false);
 assert.equal(loadConfig(baseEnv).artifactMaxFileBytes, 100 * 1024 * 1024);
 assert.equal(loadConfig(baseEnv).agentMaxConcurrent, 4);
+assert.equal(loadConfig(baseEnv).agentExecutionBackend, "legacy");
+assert.equal(loadConfig({ ...baseEnv, DEVSPACE_AGENT_EXECUTION_BACKEND: "herdr" }).agentExecutionBackend, "herdr");
+assert.throws(
+  () => loadConfig({ ...baseEnv, DEVSPACE_AGENT_EXECUTION_BACKEND: "unknown" }),
+  /Invalid DEVSPACE_AGENT_EXECUTION_BACKEND: unknown/,
+);
 assert.equal(loadConfig(baseEnv).chatSwarmEnabled, false);
 assert.equal(loadConfig(baseEnv).chatSwarmMaxWorkers, 16);
 assert.equal(loadConfig(baseEnv).chatSwarmQueueLimit, 1000);

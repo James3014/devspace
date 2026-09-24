@@ -86,7 +86,9 @@ import {
   type WorkerAttribution,
 } from "./workspace-reconciliation.js";
 import {
+  type HerdrAgentKind,
   type HerdrExternalHandle,
+  type HerdrPromptResult,
   HerdrThinGateway,
   defaultHerdrGatewayRegistry,
   HERDR_RUNTIME_KIND,
@@ -235,6 +237,15 @@ export interface DispatchContractOutput {
   intentHash: string;
 }
 
+export interface AgentRuntimeOutput {
+  runtimeKind: "HERDR";
+  socketPath: string;
+  workspaceId: string;
+  paneId: string;
+  agentIdentity: string;
+  agentKind: HerdrAgentKind;
+}
+
 export interface AgentStatusOutput {
   agentId: string;
   workspaceId?: string;
@@ -274,6 +285,7 @@ export interface AgentStatusOutput {
     reason?: string;
   };
   herdrHandle?: HerdrExternalHandle;
+  runtime?: AgentRuntimeOutput;
 }
 
 export interface ReconcileAgentInput {
@@ -286,6 +298,7 @@ export interface ReconcileAgentInput {
 export interface ReconcileAgentOutput {
   agentId: string;
   herdrHandle?: HerdrExternalHandle;
+  runtime?: AgentRuntimeOutput;
   dispatch?: DispatchContractOutput;
   agentState: LocalAgentStatus;
   providerState?: string;
@@ -437,6 +450,7 @@ export interface StartAgentOutput {
   updatedAt: string;
   executionIdlePolicy?: EffectiveExecutionIdlePolicy;
   herdrHandle?: HerdrExternalHandle;
+  runtime?: AgentRuntimeOutput;
 }
 
 export interface ContinueAgentOutput extends StartAgentOutput {
@@ -509,6 +523,7 @@ export class LocalAgentSessionManager {
   private readonly ownsOpencodeCatalogSource: boolean;
   private readonly herdrGateway: HerdrThinGateway;
   private readonly herdrHandles = new Map<string, HerdrExternalHandle>();
+  private readonly herdrTurnTasks = new Map<string, Promise<void>>();
   private closed = false;
   private readonly terminationAttempts = new Map<string, Promise<boolean>>();
 
@@ -623,11 +638,9 @@ export class LocalAgentSessionManager {
    * Enforces Option A / Blocker A: rehydrates durable promptState into gateway registry.
    */
   getHerdrExternalHandle(agentIdOrAttemptKey: string): HerdrExternalHandle | undefined {
-    // 1. Check in-memory map
-    const inMem = this.herdrHandles.get(agentIdOrAttemptKey);
-    if (inMem) return inMem;
-
-    // 2. Recover from durable store record externalRuntimeBinding
+    // Durable store is authoritative. Read it before the in-memory cache so a
+    // continuation turn that rotates promptNonce cannot accidentally reuse a
+    // stale handle from the previous turn.
     const extractHerdrHandle = (rec: LocalAgentRecord | undefined): HerdrExternalHandle | undefined => {
       if (!rec?.externalRuntimeBinding) return undefined;
       const { runtimeKind, handle } = rec.externalRuntimeBinding;
@@ -654,15 +667,269 @@ export class LocalAgentSessionManager {
     if (handle) {
       if (rec?.id) handle.agentId = rec.id;
       defaultHerdrGatewayRegistry.registerHandle(handle);
-      if (rec?.externalRuntimeBinding?.promptState?.consequentialPromptFenced) {
-        defaultHerdrGatewayRegistry.markPromptSubmitted(handle.attemptKey);
+      if (
+        rec?.externalRuntimeBinding?.promptState?.consequentialPromptFenced &&
+        rec.externalRuntimeBinding.promptState.promptNonce === handle.promptNonce
+      ) {
+        defaultHerdrGatewayRegistry.markPromptSubmitted(handle.attemptKey, handle.promptNonce);
       }
       if (rec) this.herdrHandles.set(rec.id, handle);
       this.herdrHandles.set(handle.attemptKey, handle);
       return handle;
     }
 
-    return undefined;
+    return this.herdrHandles.get(agentIdOrAttemptKey);
+  }
+
+  private usesHerdrBackend(): boolean {
+    return this.config.agentExecutionBackend === "herdr";
+  }
+
+  private herdrAgentKind(provider: string): HerdrAgentKind {
+    if (provider === "opencode" || provider === "agy" || provider === "codex" || provider === "cline" || provider === "grok") {
+      return provider;
+    }
+    throw new AgentSessionError(
+      "PROVIDER_UNAVAILABLE",
+      `Provider '${provider}' is not enabled for the HerdR production backend.`,
+    );
+  }
+
+  private runtimeOutput(handle: HerdrExternalHandle): AgentRuntimeOutput {
+    return {
+      runtimeKind: "HERDR",
+      socketPath: handle.herdrSocketPath,
+      workspaceId: handle.herdrWorkspaceId,
+      paneId: handle.herdrPaneId,
+      agentIdentity: handle.herdrAgentIdentity,
+      agentKind: handle.herdrAgentKind,
+    };
+  }
+
+  private herdrPromptTimeoutMs(record: LocalAgentRecord): number {
+    const configured = record.executionContract?.maxExecutionMs ?? record.executionContract?.maxWallMs;
+    return Math.max(30_000, Math.min(configured ?? 300_000, 300_000));
+  }
+
+  private async settleHerdrTurn(
+    record: LocalAgentRecord,
+    handle: HerdrExternalHandle,
+    promptResult?: HerdrPromptResult,
+  ): Promise<boolean> {
+    const generation = record.lifecycleState?.activeTurn?.generation;
+    if (!generation) return true;
+
+    const reconciliation = await this.herdrGateway.reconcileExternalAgent(
+      handle,
+      record.executionContract?.writePaths,
+      false,
+      promptResult,
+      { store: this.store },
+    );
+    if (!reconciliation.settled) {
+      if (reconciliation.executionState === "RUNNING") {
+        this.store.touchExternalRuntimeActivityCAS(record.id, generation);
+        return false;
+      }
+      if (reconciliation.executionState === "BLOCKED") {
+        this.store.failExternalRuntimeTurnCAS({
+          agentId: record.id,
+          generation,
+          error: reconciliation.reason ?? "HerdR agent is blocked.",
+          errorCode: "BLOCKED_ON_PERMISSION_ADMISSION",
+          errorRetryable: false,
+          latestResponse: promptResult?.paneOutput,
+          terminalReason: "provider_error",
+          scopeState: "UNKNOWN",
+        });
+        return true;
+      }
+      throw new AgentSessionError(
+        "PROVIDER_UNAVAILABLE",
+        reconciliation.reason ?? "HerdR execution outcome is unknown; retry is forbidden until reconciliation succeeds.",
+      );
+    }
+
+    const physical = await inspectWorkspacePhysicalState(record.workspaceRoot);
+    const delta = computeWorkerDelta(physical, record.scopeBaseline);
+    const scope = this.classifyWorkerScope(
+      delta.changedPaths,
+      record.executionContract?.writePaths,
+      record.executionContract?.maxFiles,
+      delta.attribution,
+    );
+    const terminalScope = reconciliation.completionStatus === "SCOPE_VIOLATION"
+      ? "SCOPE_VIOLATION"
+      : scope.scopeState;
+    const cumulative = Array.from(new Set([
+      ...(record.lifecycleState?.cumulativeChangedPaths ?? []),
+      ...delta.changedPaths,
+    ])).sort();
+
+    const completed = this.store.finishExternalRuntimeTurnCAS({
+      agentId: record.id,
+      generation,
+      status: terminalScope === "SCOPE_VIOLATION" ? "error" : "idle",
+      providerSessionId: handle.nativeProviderSessionId,
+      latestResponse: promptResult?.paneOutput,
+      error: terminalScope === "SCOPE_VIOLATION"
+        ? `Agent modified paths outside authorized scope: ${scope.unexpectedPaths.join(", ")}`
+        : undefined,
+      errorCode: terminalScope === "SCOPE_VIOLATION" ? "SCOPE_VIOLATION" : undefined,
+      errorRetryable: terminalScope === "SCOPE_VIOLATION" ? false : undefined,
+      terminalReason: terminalScope === "SCOPE_VIOLATION" ? "scope_violation" : undefined,
+      scopeState: terminalScope,
+      cumulativeChangedPaths: cumulative,
+      turnEndBaseline: {
+        changedPaths: physical.changedPaths,
+        head: physical.head ?? null,
+        fingerprints: physical.fingerprints,
+      },
+    });
+    if (!completed.applied) {
+      const current = this.store.getById(record.id);
+      if (!current?.lifecycleState?.activeTurn) return true;
+      throw new AgentSessionError(
+        "AGENT_LIFECYCLE_CORRUPT",
+        `HerdR turn for agent ${record.id} settled physically but durable completion CAS failed.`,
+      );
+    }
+    return true;
+  }
+
+  private async runHerdrTurn(agentId: string, prompt: string): Promise<void> {
+    const initial = this.store.getById(agentId);
+    if (!initial) return;
+    const generation = initial.lifecycleState?.activeTurn?.generation;
+    if (!generation) return;
+
+    try {
+      assertWorkspaceContainment(this.config, initial.workspaceRoot);
+      const baseline = await inspectWorkspacePhysicalState(initial.workspaceRoot);
+      let handle = this.getHerdrExternalHandle(initial.id);
+      if (!handle) {
+        const attemptKey = initial.startReplay?.key;
+        const dispatchIntent = initial.executionContract?.dispatchIntent;
+        if (!attemptKey || !dispatchIntent) {
+          throw new AgentSessionError(
+            "INVALID_EXECUTION_CONTRACT",
+            "HERDR backend requires durable attemptKey and executionContract.dispatchIntent before external launch.",
+          );
+        }
+        if (!await this.herdrGateway.probeReady()) {
+          throw new AgentSessionError(
+            "PROVIDER_UNAVAILABLE",
+            `HerdR daemon is unavailable at ${HERDR_DEFAULT_SOCKET_PATH}; legacy fallback is forbidden.`,
+          );
+        }
+        handle = await this.herdrGateway.startExternalAgent({
+          agentId: initial.id,
+          workspaceId: initial.workspaceId ?? "",
+          attemptKey,
+          dispatchIntentHash: hashDispatchIntent(dispatchIntent),
+          canonicalWorktreePath: initial.workspaceRoot,
+          agentKind: this.herdrAgentKind(initial.provider),
+          requestedModel: initial.model,
+          requestedEffort: initial.effort,
+          writeMode: initial.executionContract?.writePaths?.length ? "allowed" : "read_only",
+          store: this.store,
+        });
+        this.bindHerdrExternalHandle(initial.id, handle);
+      }
+
+      const nonce = handle.promptNonce === `HERDR-DISPATCH-${handle.attemptKey}`
+        && !initial.externalRuntimeBinding?.promptState?.consequentialPromptFenced
+        ? handle.promptNonce
+        : `HERDR-TURN-${generation}`;
+      const claimed = this.store.claimExternalRuntimeTurnCAS({
+        agentId: initial.id,
+        generation,
+        promptNonce: nonce,
+        scopeBaseline: {
+          changedPaths: baseline.changedPaths,
+          head: baseline.head ?? null,
+          fingerprints: baseline.fingerprints,
+        },
+      });
+      if (!claimed.applied) {
+        throw new AgentSessionError(
+          "CONTINUATION_ADMISSION_FAILED",
+          `HerdR turn for agent ${initial.id} lost its durable claim before prompt.`,
+        );
+      }
+      handle = this.getHerdrExternalHandle(initial.id);
+      if (!handle) {
+        throw new AgentSessionError("AGENT_LIFECYCLE_CORRUPT", `HerdR handle disappeared for agent ${initial.id}.`);
+      }
+
+      const result = await this.herdrGateway.promptExternalAgent(
+        handle,
+        prompt,
+        {
+          timeoutMs: this.herdrPromptTimeoutMs(initial),
+          waitForCompletion: true,
+          store: this.store,
+        },
+      );
+      if (result.status === "OUTCOME_UNKNOWN") {
+        throw new AgentSessionError(
+          "PROVIDER_UNAVAILABLE",
+          `HerdR prompt outcome is unknown for agent ${initial.id}; blind resend is forbidden.`,
+        );
+      }
+      await this.settleHerdrTurn(this.store.getById(initial.id) ?? initial, handle, result);
+    } catch (error) {
+      const current = this.store.getById(agentId);
+      const activeGeneration = current?.lifecycleState?.activeTurn?.generation;
+      if (current && activeGeneration === generation && current.externalRuntimeBinding?.runtimeKind === "HERDR") {
+        try {
+          const handle = this.getHerdrExternalHandle(agentId);
+          if (handle) {
+            const reconciliation = await this.herdrGateway.reconcileExternalAgent(
+              handle,
+              current.executionContract?.writePaths,
+              false,
+              undefined,
+              { store: this.store },
+            );
+            if (reconciliation.settled) {
+              await this.settleHerdrTurn(current, handle);
+              return;
+            }
+          }
+        } catch {
+          // Preserve the original failure; the durable prompt/launch fence
+          // prevents blind replay and later status/reconcile may recover.
+        }
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      const latest = this.store.getById(agentId);
+      if (latest?.lifecycleState?.activeTurn?.generation === generation
+        && latest.externalRuntimeBinding?.runtimeKind !== "HERDR") {
+        this.store.failExternalRuntimePreLaunchCAS(agentId, generation, message);
+      }
+    }
+  }
+
+  private startHerdrTurn(agentId: string, prompt: string): void {
+    const existing = this.herdrTurnTasks.get(agentId);
+    if (existing) return;
+    const task = this.runHerdrTurn(agentId, prompt);
+    this.herdrTurnTasks.set(agentId, task);
+    void task.finally(() => {
+      if (this.herdrTurnTasks.get(agentId) === task) this.herdrTurnTasks.delete(agentId);
+    });
+  }
+
+  private async refreshHerdrTurn(agentId: string): Promise<void> {
+    const record = this.store.getById(agentId);
+    if (!record || record.externalRuntimeBinding?.runtimeKind !== "HERDR") return;
+    if (!record.lifecycleState?.activeTurn) return;
+    const handle = this.getHerdrExternalHandle(agentId);
+    if (!handle) {
+      throw new AgentSessionError("AGENT_LIFECYCLE_CORRUPT", `Agent ${agentId} has HERDR runtime state without a durable handle.`);
+    }
+    await this.settleHerdrTurn(record, handle);
   }
 
   /**
@@ -706,6 +973,12 @@ export class LocalAgentSessionManager {
       throw new AgentSessionError(
         "INVALID_ATTEMPT_KEY",
         `dispatchIntent.attemptId '${executionContract.dispatchIntent.attemptId}' must exactly match durable attemptKey '${attemptKey}'.`,
+      );
+    }
+    if (this.usesHerdrBackend() && (!attemptKey || !executionContract?.dispatchIntent)) {
+      throw new AgentSessionError(
+        "INVALID_EXECUTION_CONTRACT",
+        "HERDR production backend requires exact attemptKey and executionContract.dispatchIntent; implicit execution identity is forbidden.",
       );
     }
 
@@ -803,6 +1076,12 @@ export class LocalAgentSessionManager {
         }`,
       );
     }
+    if (this.usesHerdrBackend() && !await this.herdrGateway.probeReady()) {
+      throw new AgentSessionError(
+        "PROVIDER_UNAVAILABLE",
+        `HerdR daemon is unavailable at ${HERDR_DEFAULT_SOCKET_PATH}; legacy fallback is forbidden.`,
+      );
+    }
 
     if (profile.provider === "opencode") {
       const modelValidation = validateOpencodeModelAndVariant(
@@ -867,7 +1146,14 @@ export class LocalAgentSessionManager {
       throw error;
     }
 
-    if (created) await this.launchPrompt(record.id, bindDispatchIntentToPrompt(record.executionContract?.dispatchIntent, prompt));
+    if (created) {
+      const boundPrompt = bindDispatchIntentToPrompt(record.executionContract?.dispatchIntent, prompt);
+      if (this.usesHerdrBackend()) {
+        this.startHerdrTurn(record.id, boundPrompt);
+      } else {
+        await this.launchPrompt(record.id, boundPrompt);
+      }
+    }
     const herdrHandle = attemptKey ? this.getHerdrExternalHandle(attemptKey) : this.getHerdrExternalHandle(record.id);
     return recordToStartOutput(this.store.getById(record.id) ?? record, herdrHandle);
   }
@@ -953,6 +1239,12 @@ export class LocalAgentSessionManager {
         `Agent ${agentId} is currently ${record.status}. Wait for it to complete before continuing.`,
       );
     }
+    if (record.status === "stopped" && record.externalRuntimeBinding?.runtimeKind === "HERDR") {
+      throw new AgentSessionError(
+        "REBIND_REQUIRED",
+        `Agent ${agentId} was explicitly stopped in HerdR; continuation requires a new agent_start attempt.`,
+      );
+    }
     if (record.lifecycleState?.activeTurn) {
       throw new AgentSessionError(
         "AGENT_LIFECYCLE_CORRUPT",
@@ -963,9 +1255,13 @@ export class LocalAgentSessionManager {
     // ── Continuation admission gates (all read-only; run before mutation) ──
     const admissionFailures: string[] = [];
 
+    const herdrBound = record.externalRuntimeBinding?.runtimeKind === "HERDR";
     if (
-      record.providerContinuityState === "LOST" ||
-      (record.provider === "agy" && !record.providerSessionId)
+      !herdrBound &&
+      (
+        record.providerContinuityState === "LOST" ||
+        (record.provider === "agy" && !record.providerSessionId)
+      )
     ) {
       throw new AgentSessionError(
         "REBIND_REQUIRED",
@@ -1045,21 +1341,23 @@ export class LocalAgentSessionManager {
       );
     }
 
-    try {
-      const currentGeneration = this.resolveExecutionGeneration(
-        currentProfile,
-        input.profileCatalog?.generation ?? "unresolved",
-        process.env,
-      );
-      assertSameExecutionGeneration(record.executionGeneration, currentGeneration);
-    } catch (error) {
-      if (error instanceof ExecutionProtocolError || error instanceof AgentSessionError) {
-        throw new AgentSessionError(
-          "REBIND_REQUIRED",
-          `Continuation of agent ${agentId} requires explicit rebind before mutation: ${error.message}`,
+    if (!herdrBound) {
+      try {
+        const currentGeneration = this.resolveExecutionGeneration(
+          currentProfile,
+          input.profileCatalog?.generation ?? "unresolved",
+          process.env,
         );
+        assertSameExecutionGeneration(record.executionGeneration, currentGeneration);
+      } catch (error) {
+        if (error instanceof ExecutionProtocolError || error instanceof AgentSessionError) {
+          throw new AgentSessionError(
+            "REBIND_REQUIRED",
+            `Continuation of agent ${agentId} requires explicit rebind before mutation: ${error.message}`,
+          );
+        }
+        throw error;
       }
-      throw error;
     }
 
     const continuationCapacity = this.executionCapacitySnapshot(workspaceRoot);
@@ -1162,9 +1460,15 @@ export class LocalAgentSessionManager {
       );
     }
 
-    await this.launchPrompt(record.id, bindDispatchIntentToPrompt(record.executionContract?.dispatchIntent, prompt));
+    const boundPrompt = bindDispatchIntentToPrompt(record.executionContract?.dispatchIntent, prompt);
+    if (herdrBound || this.usesHerdrBackend()) {
+      this.startHerdrTurn(record.id, boundPrompt);
+    } else {
+      await this.launchPrompt(record.id, boundPrompt);
+    }
     const updated = this.store.getById(record.id) ?? record;
-    return { ...recordToStartOutput(updated), continued: true as const };
+    const herdrHandle = this.getHerdrExternalHandle(record.id);
+    return { ...recordToStartOutput(updated, herdrHandle), continued: true as const };
   }
 
   /**
@@ -1192,7 +1496,27 @@ export class LocalAgentSessionManager {
       );
     }
 
-    if (waitMs > 0 && occupiesDetachedExecutionSlot(record)) {
+    if (this.usesHerdrBackend() && record.externalRuntimeBinding?.runtimeKind === "HERDR") {
+      const activeTask = this.herdrTurnTasks.get(agentId);
+      if (activeTask) {
+        if (waitMs > 0) {
+          await Promise.race([
+            activeTask,
+            sleep(waitMs),
+          ]);
+        }
+        record = this.store.getById(agentId) ?? record;
+      }
+      if (record.lifecycleState?.activeTurn && !this.herdrTurnTasks.has(agentId)) {
+        const deadline = Date.now() + waitMs;
+        do {
+          await this.refreshHerdrTurn(agentId);
+          record = this.store.getById(agentId) ?? record;
+          if (!record.lifecycleState?.activeTurn || waitMs <= 0 || Date.now() >= deadline) break;
+          await sleep(Math.min(300, Math.max(0, deadline - Date.now())));
+        } while (Date.now() < deadline);
+      }
+    } else if (waitMs > 0 && occupiesDetachedExecutionSlot(record)) {
       const deadline = Date.now() + waitMs;
       while (occupiesDetachedExecutionSlot(record) && Date.now() < deadline) {
         await sleep(Math.min(300, deadline - Date.now()));
@@ -1218,6 +1542,58 @@ export class LocalAgentSessionManager {
     }
 
     const herdrHandle = this.getHerdrExternalHandle(agentId) ?? (record.startReplay?.key ? this.getHerdrExternalHandle(record.startReplay.key) : undefined);
+
+    if (record.externalRuntimeBinding?.runtimeKind === "HERDR" && herdrHandle) {
+      if (record.status === "stopped") {
+        return recordToStatusOutput(record, undefined, herdrHandle);
+      }
+      await this.herdrGateway.stopExternalAgent(herdrHandle, { store: this.store });
+      const activeGeneration = record.lifecycleState?.activeTurn?.generation;
+      if (activeGeneration) {
+        const physical = await inspectWorkspacePhysicalState(record.workspaceRoot);
+        const delta = computeWorkerDelta(physical, record.scopeBaseline);
+        const scope = this.classifyWorkerScope(
+          delta.changedPaths,
+          record.executionContract?.writePaths,
+          record.executionContract?.maxFiles,
+          delta.attribution,
+        );
+        const completed = this.store.finishExternalRuntimeTurnCAS({
+          agentId: record.id,
+          generation: activeGeneration,
+          status: "stopped",
+          latestResponse: record.latestResponse,
+          terminalReason: "cancelled",
+          scopeState: scope.scopeState,
+          cumulativeChangedPaths: Array.from(new Set([
+            ...(record.lifecycleState?.cumulativeChangedPaths ?? []),
+            ...delta.changedPaths,
+          ])).sort(),
+          turnEndBaseline: {
+            changedPaths: physical.changedPaths,
+            head: physical.head ?? null,
+            fingerprints: physical.fingerprints,
+          },
+        });
+        if (!completed.applied) {
+          throw new AgentSessionError(
+            "AGENT_LIFECYCLE_CORRUPT",
+            `HerdR workspace for agent ${agentId} was stopped, but durable stop settlement failed.`,
+          );
+        }
+      } else {
+        const stopped = this.store.markExternalRuntimeStoppedCAS(record.id, "cancelled");
+        if (!stopped.applied) {
+          throw new AgentSessionError(
+            "AGENT_LIFECYCLE_CORRUPT",
+            `HerdR workspace for agent ${agentId} was stopped, but durable idle-session stop CAS failed.`,
+          );
+        }
+        record = stopped.current ?? record;
+      }
+      const current = this.store.getById(agentId) ?? record;
+      return recordToStatusOutput(current, undefined, herdrHandle);
+    }
 
     if (!isDetachedLifecycle(record.lifecycleState) && isActiveStatus(record.status)) {
       record = this.store.reconcileLegacyDetachedActiveCAS(agentId).current ?? record;
@@ -1493,13 +1869,30 @@ export class LocalAgentSessionManager {
 
     const timing = computeSessionTiming(record);
     const herdrHandle = this.getHerdrExternalHandle(record.id) ?? (record.startReplay?.key ? this.getHerdrExternalHandle(record.startReplay.key) : undefined);
+    const herdrReconciliation = herdrHandle && this.usesHerdrBackend()
+      ? await this.herdrGateway.reconcileExternalAgent(
+          herdrHandle,
+          contract?.writePaths,
+          false,
+          undefined,
+          { store: this.store },
+        )
+      : undefined;
+    const reconciledChangedPaths = herdrReconciliation?.changedPaths ?? workerChanged;
+    const reconciledUnexpectedPaths = herdrReconciliation?.unexpectedPaths ?? unexpectedPaths;
+    const reconciledScopeState: ScopeState = herdrReconciliation?.completionStatus === "SCOPE_VIOLATION"
+      ? "SCOPE_VIOLATION"
+      : scopeState;
 
     return {
       agentId: record.id,
       herdrHandle,
+      ...(herdrHandle ? { runtime: herdrRuntimeOutput(herdrHandle) } : {}),
       dispatch: dispatchContractOutput(record.executionContract?.dispatchIntent),
       agentState: record.status,
-      providerState: record.providerContinuityState ?? (record.providerSessionId ? "KNOWN_UNVERIFIED" : "UNKNOWN"),
+      providerState: herdrReconciliation?.executionState
+        ?? record.providerContinuityState
+        ?? (record.providerSessionId ? "KNOWN_UNVERIFIED" : "UNKNOWN"),
       providerSessionId: record.providerSessionId,
       terminalReason: record.terminalReason,
       effectEnforcementReceipt: record.lifecycleState?.lastEffectEnforcementReceipt,
@@ -1508,11 +1901,11 @@ export class LocalAgentSessionManager {
         dirty: physical.dirty,
       },
       candidate: {
-        present: workerChanged.length > 0 || headAdvanced,
-        changedPaths: workerChanged,
-        unexpectedPaths,
+        present: reconciledChangedPaths.length > 0 || headAdvanced,
+        changedPaths: reconciledChangedPaths,
+        unexpectedPaths: reconciledUnexpectedPaths,
         diffHash: physical.diffHash,
-        scopeState,
+        scopeState: reconciledScopeState,
       },
       activity: {
         startedAt: record.createdAt,
@@ -1817,6 +2210,47 @@ export class LocalAgentSessionManager {
     budgetMs?: number,
     terminalStatus: "error" | "stopped" = "error",
   ): Promise<boolean> {
+    const existing = this.store.getById(agentId);
+    if (existing?.externalRuntimeBinding?.runtimeKind === "HERDR") {
+      const handle = this.getHerdrExternalHandle(agentId);
+      if (!handle) return false;
+      try {
+        await this.herdrGateway.stopExternalAgent(handle, { store: this.store });
+        const generation = existing.lifecycleState?.activeTurn?.generation;
+        if (!generation) return true;
+        const physical = await inspectWorkspacePhysicalState(existing.workspaceRoot);
+        const delta = computeWorkerDelta(physical, existing.scopeBaseline);
+        const scope = this.classifyWorkerScope(
+          delta.changedPaths,
+          existing.executionContract?.writePaths,
+          existing.executionContract?.maxFiles,
+          delta.attribution,
+        );
+        const settled = this.store.finishExternalRuntimeTurnCAS({
+          agentId,
+          generation,
+          status: terminalStatus,
+          error: terminalStatus === "error" ? message : undefined,
+          errorCode: terminalStatus === "error" ? "PROVIDER_EXECUTION_ERROR" : undefined,
+          errorRetryable: terminalStatus === "error" ? false : undefined,
+          terminalReason: reason,
+          scopeState: scope.scopeState,
+          cumulativeChangedPaths: Array.from(new Set([
+            ...(existing.lifecycleState?.cumulativeChangedPaths ?? []),
+            ...delta.changedPaths,
+          ])).sort(),
+          turnEndBaseline: {
+            changedPaths: physical.changedPaths,
+            head: physical.head ?? null,
+            fingerprints: physical.fingerprints,
+          },
+        });
+        return settled.applied || !this.store.getById(agentId)?.lifecycleState?.activeTurn;
+      } catch {
+        return false;
+      }
+    }
+
     const fenceResult = this.store.beginTerminationCAS({
       agentId,
       terminalReason: reason,
@@ -2780,7 +3214,10 @@ function recordToStartOutput(record: LocalAgentRecord, herdrHandle?: HerdrExtern
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
   };
-  if (herdrHandle !== undefined) output.herdrHandle = herdrHandle;
+  if (herdrHandle !== undefined) {
+    output.herdrHandle = herdrHandle;
+    output.runtime = herdrRuntimeOutput(herdrHandle);
+  }
   if (record.model !== undefined) output.model = record.model;
   if (record.effort !== undefined) output.effort = record.effort;
   if (record.workspaceId !== undefined) output.workspaceId = record.workspaceId;
@@ -2807,7 +3244,10 @@ function recordToStatusOutput(
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
   };
-  if (herdrHandle !== undefined) output.herdrHandle = herdrHandle;
+  if (herdrHandle !== undefined) {
+    output.herdrHandle = herdrHandle;
+    output.runtime = herdrRuntimeOutput(herdrHandle);
+  }
   if (record.model !== undefined) output.model = record.model;
   if (record.effort !== undefined) output.effort = record.effort;
   if (record.workspaceId !== undefined) output.workspaceId = record.workspaceId;
@@ -2851,6 +3291,17 @@ function recordToStatusOutput(
     if (lifecycle.scopeState !== undefined) output.scopeState = lifecycle.scopeState;
   }
   return output;
+}
+
+function herdrRuntimeOutput(handle: HerdrExternalHandle): AgentRuntimeOutput {
+  return {
+    runtimeKind: "HERDR",
+    socketPath: handle.herdrSocketPath,
+    workspaceId: handle.herdrWorkspaceId,
+    paneId: handle.herdrPaneId,
+    agentIdentity: handle.herdrAgentIdentity,
+    agentKind: handle.herdrAgentKind,
+  };
 }
 
 function recordToSummary(record: LocalAgentRecord): AgentSummary {
