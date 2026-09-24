@@ -101,6 +101,7 @@ export interface ExternalRuntimeLaunchFence {
   herdrSocketPath?: string;
   requestedModel?: string;
   requestedEffort?: string;
+  requestedCliProviderId?: "cline" | "cline-pass";
   promptNonce: string;
   workspaceId?: string;
   herdrWorkspaceId?: string;
@@ -129,6 +130,7 @@ export interface FenceExternalRuntimeLaunchInput {
   herdrSocketPath?: string;
   requestedModel?: string;
   requestedEffort?: string;
+  requestedCliProviderId?: "cline" | "cline-pass";
   promptNonce: string;
   workspaceId?: string;
   plannedAgentName?: string;
@@ -1443,6 +1445,7 @@ export class LocalAgentStore {
             (existingLaunch.workspaceId ?? undefined) === (input.workspaceId ?? undefined) &&
             (existingLaunch.requestedModel ?? undefined) === (input.requestedModel ?? undefined) &&
             (existingLaunch.requestedEffort ?? undefined) === (input.requestedEffort ?? undefined) &&
+            (existingLaunch.requestedCliProviderId ?? undefined) === (input.requestedCliProviderId ?? undefined) &&
             existingLaunch.promptNonce === input.promptNonce &&
             (existingLaunch.plannedAgentName ?? undefined) === (input.plannedAgentName ?? undefined)
           ) {
@@ -1465,6 +1468,7 @@ export class LocalAgentStore {
         ...(input.herdrSocketPath ? { herdrSocketPath: input.herdrSocketPath } : {}),
         ...(input.requestedModel ? { requestedModel: input.requestedModel } : {}),
         ...(input.requestedEffort ? { requestedEffort: input.requestedEffort } : {}),
+        ...(input.requestedCliProviderId ? { requestedCliProviderId: input.requestedCliProviderId } : {}),
         promptNonce: input.promptNonce,
         ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}),
         ...(input.plannedAgentName ? { plannedAgentName: input.plannedAgentName } : {}),
@@ -2450,6 +2454,9 @@ function readExternalRuntimeLaunchFence(value: unknown): ExternalRuntimeLaunchFe
       ...(typeof record.herdrSocketPath === "string" ? { herdrSocketPath: record.herdrSocketPath } : {}),
       ...(typeof record.requestedModel === "string" ? { requestedModel: record.requestedModel } : {}),
       ...(typeof record.requestedEffort === "string" ? { requestedEffort: record.requestedEffort } : {}),
+      ...(record.requestedCliProviderId === "cline" || record.requestedCliProviderId === "cline-pass"
+        ? { requestedCliProviderId: record.requestedCliProviderId }
+        : {}),
       promptNonce: record.promptNonce,
       ...(typeof record.workspaceId === "string" ? { workspaceId: record.workspaceId } : {}),
       ...(typeof record.herdrWorkspaceId === "string" ? { herdrWorkspaceId: record.herdrWorkspaceId } : {}),
