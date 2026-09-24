@@ -981,7 +981,7 @@ export function assertSameHostGeneration(
   if (!stored) {
     throw new ExecutionProtocolError(
       "LEGACY_EXECUTION_BINDING_MISSING",
-      "Durable agent predates host-generation binding and requires explicit rebind instead of silent continuation.",
+      "Durable agent predates execution-generation binding because host-generation evidence is missing; explicit rebind is required instead of silent continuation.",
     );
   }
   if (stored.hostGenerationFingerprint !== current.hostGenerationFingerprint) {
