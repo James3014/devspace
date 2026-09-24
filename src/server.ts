@@ -157,6 +157,7 @@ import { createMcpOpencodeCatalogSource } from "./local-agent-opencode-mcp-catal
 import { ClineCatalogService, isClineCatalogFresh, validateClineModelAndThinking, type ClineCatalogSnapshot } from "./local-agent-cline-catalog.js";
 import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build-identity.js";
 import {
+  applySessionCallerRebind,
   evaluateClientProjectionConvergence,
   evaluateSessionConvergence,
   evaluateMultiRoleConvergence,
@@ -1648,6 +1649,13 @@ export interface RuntimeBuildIdentityContext {
   latestMcpToolCatalogNames?: { value: string[] };
   capabilityManifest?: CapabilityManifest;
   onCatalogGenerationChanged?: () => Promise<number> | number;
+  onCoreCallerRebound?: (input: {
+    mcpSessionId?: string;
+    rebindId: string;
+    callerIdentityFingerprint?: string;
+    conversationIdentityFingerprint?: string;
+    reboundAt: string;
+  }) => Promise<void> | void;
 }
 
 type ControllerCallerIdentityInput = {
@@ -3194,6 +3202,7 @@ export function createMcpServer(
           return record?.id === agentId ? record : undefined;
         }
       : undefined,
+    onCallerRebound: runtimeBuildIdentityContext?.onCoreCallerRebound,
   });
 
   registerRepositoryIntelligenceTools(server, config, workspaces);
@@ -7106,6 +7115,21 @@ export function createServer(
       latestMcpToolCatalogNames,
       capabilityManifest,
       onCatalogGenerationChanged: broadcastToolListChanged,
+      onCoreCallerRebound: ({ mcpSessionId, rebindId, callerIdentityFingerprint, conversationIdentityFingerprint, reboundAt }) => {
+        const sid = mcpSessionId ?? resolveRequestSessionId();
+        if (!sid) return;
+        const sessionSnapshot = transports.getSnapshot(sid);
+        if (!sessionSnapshot) return;
+        const nextSnapshot = applySessionCallerRebind(sessionSnapshot, {
+          rebindId,
+          callerIdentityFingerprint,
+          conversationIdentityFingerprint,
+          reboundAt,
+        });
+        if (nextSnapshot !== sessionSnapshot) {
+          transports.setSnapshot(sid, nextSnapshot);
+        }
+      },
     },
     durableOperations,
     {
@@ -7326,7 +7350,10 @@ export function createServer(
             cutoverMode: cutoverController.mode(),
             reconciliationRequired: cutoverController.mode() !== "normal",
           }, requestCallerIdentity.callerIdentityFingerprint, requestCallerIdentity.conversationIdentityFingerprint);
-          if (convergence.controllerDisposition !== "CURRENT") {
+          const callerRebindGateSatisfied =
+            toolName === "core_mutation_session_rebind" &&
+            convergence.controllerDisposition === "CALLER_REBIND_REQUIRED";
+          if (convergence.controllerDisposition !== "CURRENT" && !callerRebindGateSatisfied) {
             const disposition = {
               staleSessionState: convergence.state,
               controllerDisposition: convergence.controllerDisposition,

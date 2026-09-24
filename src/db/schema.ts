@@ -95,6 +95,30 @@ export const coreMutationCandidates = sqliteTable(
   (table) => [index("core_mutation_candidates_binding_idx").on(table.bindingHash, table.createdAt)],
 );
 
+export const coreMutationSessionRebinds = sqliteTable(
+  "core_mutation_session_rebinds",
+  {
+    rebindId: text("rebind_id").primaryKey(),
+    sessionId: text("session_id")
+      .notNull()
+      .references(() => coreMutationSessions.id, { onDelete: "cascade" }),
+    fromActorKey: text("from_actor_key").notNull(),
+    toActorKey: text("to_actor_key").notNull(),
+    bindingHash: text("binding_hash").notNull(),
+    evidence: text("evidence").notNull(),
+    createdAt: text("created_at").notNull(),
+  },
+  (table) => [
+    index("core_mutation_session_rebinds_transition_idx").on(
+      table.sessionId,
+      table.fromActorKey,
+      table.toActorKey,
+      table.createdAt,
+    ),
+    index("core_mutation_session_rebinds_session_idx").on(table.sessionId, table.createdAt),
+  ],
+);
+
 export const workspaceConversationBindings = sqliteTable(
   "workspace_conversation_bindings",
   {

@@ -36,6 +36,15 @@ export interface ClientProjectionConvergence {
   details: string;
 }
 
+export interface SessionCallerRebindLedgerEntry {
+  rebindId: string;
+  fromCallerIdentityFingerprint?: string;
+  toCallerIdentityFingerprint?: string;
+  fromConversationIdentityFingerprint?: string;
+  toConversationIdentityFingerprint?: string;
+  reboundAt: string;
+}
+
 export interface SessionGenerationSnapshot {
   serverInstanceId: string;
   sourceCommit: string;
@@ -46,6 +55,39 @@ export interface SessionGenerationSnapshot {
   freshness?: string;
   callerIdentityFingerprint?: string;
   conversationIdentityFingerprint?: string;
+  callerRebinds?: SessionCallerRebindLedgerEntry[];
+}
+
+export function applySessionCallerRebind(
+  snapshot: SessionGenerationSnapshot,
+  input: {
+    rebindId: string;
+    callerIdentityFingerprint?: string;
+    conversationIdentityFingerprint?: string;
+    reboundAt: string;
+  },
+): SessionGenerationSnapshot {
+  if ((snapshot.callerRebinds ?? []).some((entry) => entry.rebindId === input.rebindId)) {
+    return snapshot;
+  }
+  return {
+    ...snapshot,
+    callerIdentityFingerprint:
+      input.callerIdentityFingerprint ?? snapshot.callerIdentityFingerprint,
+    conversationIdentityFingerprint:
+      input.conversationIdentityFingerprint ?? snapshot.conversationIdentityFingerprint,
+    callerRebinds: [
+      ...(snapshot.callerRebinds ?? []),
+      {
+        rebindId: input.rebindId,
+        fromCallerIdentityFingerprint: snapshot.callerIdentityFingerprint,
+        toCallerIdentityFingerprint: input.callerIdentityFingerprint,
+        fromConversationIdentityFingerprint: snapshot.conversationIdentityFingerprint,
+        toConversationIdentityFingerprint: input.conversationIdentityFingerprint,
+        reboundAt: input.reboundAt,
+      },
+    ],
+  };
 }
 
 export interface SessionConvergenceEvaluation {
