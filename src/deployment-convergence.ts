@@ -1,4 +1,8 @@
-import { CAPABILITY_MANIFEST_SCHEMA, type CapabilityManifest } from "./capability-manifest.js";
+import {
+  CAPABILITY_MANIFEST_SCHEMA,
+  mcpToolCatalogGeneration,
+  type CapabilityManifest,
+} from "./capability-manifest.js";
 
 export type DeploymentConvergenceState =
   | "INTENTIONALLY_PINNED"
@@ -16,6 +20,22 @@ export type SessionConvergenceState =
   | "RECONNECT_REQUIRED"
   | "RECONCILE_REQUIRED";
 
+export type SessionControllerDisposition =
+  | "CURRENT"
+  | "SERVER_AHEAD_OF_CLIENT"
+  | "STALE_RECONNECT_REQUIRED"
+  | "CALLER_REBIND_REQUIRED";
+
+export interface ClientProjectionConvergence {
+  state: "CURRENT" | "SERVER_AHEAD_OF_CLIENT" | "STALE_RECONNECT_REQUIRED";
+  converged: boolean;
+  clientProjectionGeneration: string;
+  serverCatalogGeneration: string;
+  missingServerTools: string[];
+  extraClientTools: string[];
+  details: string;
+}
+
 export interface SessionGenerationSnapshot {
   serverInstanceId: string;
   sourceCommit: string;
@@ -24,10 +44,13 @@ export interface SessionGenerationSnapshot {
   catalogGeneration: string;
   sessionInitializedAt: string;
   freshness?: string;
+  callerIdentityFingerprint?: string;
+  conversationIdentityFingerprint?: string;
 }
 
 export interface SessionConvergenceEvaluation {
   state: SessionConvergenceState;
+  controllerDisposition: SessionControllerDisposition;
   converged: boolean;
   reconnectRequired: boolean;
   reconciliationRequired: boolean;
@@ -47,6 +70,70 @@ export interface SessionConvergenceEvaluation {
   };
 }
 
+
+export function evaluateClientProjectionConvergence(
+  clientToolNames: readonly string[],
+  serverToolNames: readonly string[],
+  serverCatalogGeneration: string,
+): ClientProjectionConvergence {
+  const normalizedClientTools = [...new Set(clientToolNames)].sort();
+  const normalizedServerTools = [...new Set(serverToolNames)].sort();
+  const clientProjectionGeneration = mcpToolCatalogGeneration(normalizedClientTools);
+  const serverSet = new Set(normalizedServerTools);
+  const clientSet = new Set(normalizedClientTools);
+  const missingServerTools = normalizedServerTools.filter((tool) => !clientSet.has(tool));
+  const extraClientTools = normalizedClientTools.filter((tool) => !serverSet.has(tool));
+
+  if (
+    clientProjectionGeneration === serverCatalogGeneration &&
+    missingServerTools.length === 0 &&
+    extraClientTools.length === 0
+  ) {
+    return {
+      state: "CURRENT",
+      converged: true,
+      clientProjectionGeneration,
+      serverCatalogGeneration,
+      missingServerTools,
+      extraClientTools,
+      details: "Client callable projection matches the live server tool catalog.",
+    };
+  }
+
+  if (extraClientTools.length > 0) {
+    return {
+      state: "STALE_RECONNECT_REQUIRED",
+      converged: false,
+      clientProjectionGeneration,
+      serverCatalogGeneration,
+      missingServerTools,
+      extraClientTools,
+      details: `Client projection contains tools not present in the live server catalog: ${extraClientTools.join(", ")}.`,
+    };
+  }
+
+  if (missingServerTools.length > 0) {
+    return {
+      state: "SERVER_AHEAD_OF_CLIENT",
+      converged: false,
+      clientProjectionGeneration,
+      serverCatalogGeneration,
+      missingServerTools,
+      extraClientTools,
+      details: `Live server advertises tools missing from the client projection: ${missingServerTools.join(", ")}.`,
+    };
+  }
+
+  return {
+    state: "STALE_RECONNECT_REQUIRED",
+    converged: false,
+    clientProjectionGeneration,
+    serverCatalogGeneration,
+    missingServerTools,
+    extraClientTools,
+    details: `Client projection contains tools not present in the live server catalog: ${extraClientTools.join(", ") || "generation mismatch"}.`,
+  };
+}
 
 export interface RemoteMainIdentity {
   commit: string;
@@ -267,6 +354,8 @@ export function evaluateSessionConvergence(
     cutoverMode: string;
     reconciliationRequired: boolean;
   },
+  currentCallerIdentityFingerprint?: string,
+  currentConversationIdentityFingerprint?: string,
 ): SessionConvergenceEvaluation {
   const base = {
     sessionSnapshot,
@@ -278,6 +367,7 @@ export function evaluateSessionConvergence(
     return {
       ...base,
       state: "RECONCILE_REQUIRED",
+      controllerDisposition: "STALE_RECONNECT_REQUIRED",
       converged: false,
       reconnectRequired: false,
       reconciliationRequired: true,
@@ -291,6 +381,7 @@ export function evaluateSessionConvergence(
     return {
       ...base,
       state: "RECONNECT_REQUIRED",
+      controllerDisposition: "STALE_RECONNECT_REQUIRED",
       converged: false,
       reconnectRequired: true,
       reconciliationRequired: false,
@@ -304,6 +395,7 @@ export function evaluateSessionConvergence(
     return {
       ...base,
       state: "STALE_SERVER",
+      controllerDisposition: "STALE_RECONNECT_REQUIRED",
       converged: false,
       reconnectRequired: true,
       reconciliationRequired: false,
@@ -328,6 +420,7 @@ export function evaluateSessionConvergence(
     return {
       ...base,
       state: "STALE_SERVER",
+      controllerDisposition: "STALE_RECONNECT_REQUIRED",
       converged: false,
       reconnectRequired: true,
       reconciliationRequired: false,
@@ -341,6 +434,7 @@ export function evaluateSessionConvergence(
     return {
       ...base,
       state: "STALE_CAPABILITY_MANIFEST",
+      controllerDisposition: "SERVER_AHEAD_OF_CLIENT",
       converged: false,
       reconnectRequired: false,
       reconciliationRequired: false,
@@ -354,6 +448,7 @@ export function evaluateSessionConvergence(
     return {
       ...base,
       state: "STALE_SESSION_CATALOG",
+      controllerDisposition: "SERVER_AHEAD_OF_CLIENT",
       converged: false,
       reconnectRequired: false,
       reconciliationRequired: false,
@@ -362,10 +457,31 @@ export function evaluateSessionConvergence(
     };
   }
 
-  // 6. Fully converged
+  // 6. Generation is current; caller continuity is a separate controller-facing gate.
+  const callerChanged =
+    sessionSnapshot.callerIdentityFingerprint !== undefined &&
+    sessionSnapshot.callerIdentityFingerprint !== currentCallerIdentityFingerprint;
+  const conversationChanged =
+    sessionSnapshot.conversationIdentityFingerprint !== undefined &&
+    currentConversationIdentityFingerprint !== undefined &&
+    sessionSnapshot.conversationIdentityFingerprint !== currentConversationIdentityFingerprint;
+  if (callerChanged || conversationChanged) {
+    return {
+      ...base,
+      state: "CURRENT",
+      controllerDisposition: "CALLER_REBIND_REQUIRED",
+      converged: true,
+      reconnectRequired: false,
+      reconciliationRequired: false,
+      activeDrift: false,
+      details: "Session generation is current, but caller identity differs from the caller bound to this MCP session; explicit caller rebind is required",
+    };
+  }
+
   return {
     ...base,
     state: "CURRENT",
+    controllerDisposition: "CURRENT",
     converged: true,
     reconnectRequired: false,
     reconciliationRequired: false,

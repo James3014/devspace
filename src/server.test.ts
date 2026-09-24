@@ -1710,13 +1710,21 @@ test("direct_candidate_execution_evidence tool produces valid evidence through h
         devspaceBuildId: "build-123",
         devspaceSourceCommit: bound.head,
       }),
+      lifecycleKind: "detached_worker_v2",
     });
     agentId = record.id;
-    agents.update(agentId, {
-      status: "stopped",
+    const generation = record.lifecycleState!.activeTurn!.generation!;
+    const workerToken = "direct-evidence-test-worker";
+    assert.equal(agents.prepareWorkerCAS(agentId, generation, workerToken).applied, true);
+    assert.equal(agents.claimWorkerCAS(agentId, generation, workerToken, process.pid).applied, true);
+    assert.equal(agents.finishTurnCAS({
+      agentId,
+      generation,
+      workerToken,
+      status: "idle",
       terminalReason: "completed",
       scopeState: "WITHIN_SCOPE",
-    });
+    }).applied, true);
   } finally {
     agents.close();
   }
@@ -5264,8 +5272,14 @@ test("Issue #15 Wave 4B: capability convergence resolves the initialized request
   });
   const parseResponse = async (response: globalThis.Response): Promise<Record<string, any>> => {
     const body = await response.text();
-    const dataLine = body.split("\n").find((line) => line.startsWith("data: "));
-    return JSON.parse(dataLine ? dataLine.slice(6) : body) as Record<string, any>;
+    const messages = body
+      .split("\n")
+      .filter((line) => line.startsWith("data: "))
+      .map((line) => JSON.parse(line.slice(6)) as Record<string, any>);
+    if (messages.length > 0) {
+      return messages.find((message) => "result" in message || "error" in message) ?? messages[0]!;
+    }
+    return JSON.parse(body) as Record<string, any>;
   };
 
   const running = createServer(config);
@@ -5286,6 +5300,21 @@ test("Issue #15 Wave 4B: capability convergence resolves the initialized request
     const sessionId = initialized.headers.get("mcp-session-id");
     assert.match(sessionId ?? "", /^[0-9a-f-]{36}$/);
 
+    const secondInitialized = await post("", {
+      jsonrpc: "2.0",
+      id: 10,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "wave4b-client-second-session", version: "1.0.0" },
+      },
+    });
+    assert.equal(secondInitialized.status, 200);
+    const secondSessionId = secondInitialized.headers.get("mcp-session-id");
+    assert.match(secondSessionId ?? "", /^[0-9a-f-]{36}$/);
+    assert.notEqual(secondSessionId, sessionId);
+
     const convergence = await post(sessionId!, {
       jsonrpc: "2.0",
       id: 2,
@@ -5293,21 +5322,136 @@ test("Issue #15 Wave 4B: capability convergence resolves the initialized request
       params: {
         name: "capability_convergence_status",
         arguments: {},
+        _meta: { "openai/session": "issue-240-caller-a" },
       },
     });
     assert.equal(convergence.status, 200);
     const payload = await parseResponse(convergence);
     const session = payload.result?.structuredContent?.sessionConvergence as {
       state?: string;
+      controllerDisposition?: string;
       converged?: boolean;
-      sessionSnapshot?: { serverInstanceId?: string; catalogGeneration?: string };
+      sessionSnapshot?: {
+        serverInstanceId?: string;
+        catalogGeneration?: string;
+        callerIdentityFingerprint?: string;
+        conversationIdentityFingerprint?: string;
+      };
       serverGeneration?: { serverInstanceId?: string; catalogGeneration?: string; toolNames?: string[] };
     } | undefined;
     assert.equal(session?.state, "CURRENT");
+    assert.equal(session?.controllerDisposition, "CURRENT");
     assert.equal(session?.converged, true);
     assert.equal(session?.sessionSnapshot?.serverInstanceId, session?.serverGeneration?.serverInstanceId);
     assert.equal(session?.sessionSnapshot?.catalogGeneration, session?.serverGeneration?.catalogGeneration);
+    assert.match(session?.sessionSnapshot?.callerIdentityFingerprint ?? "", /^mcp:[0-9a-f]{64}$/);
+    assert.match(session?.sessionSnapshot?.conversationIdentityFingerprint ?? "", /^openai:[0-9a-f]{64}$/);
     assert.ok(session?.serverGeneration?.toolNames?.includes("open_workspace"));
+
+    const staleProjection = await post(sessionId!, {
+      jsonrpc: "2.0",
+      id: 20,
+      method: "tools/call",
+      params: {
+        name: "capability_convergence_status",
+        arguments: {
+          clientProjectionToolNames: ["capability_convergence_status", "workspace_inspect"],
+          requestRefresh: true,
+        },
+        _meta: { "openai/session": "issue-240-caller-a" },
+      },
+    });
+    assert.equal(staleProjection.status, 200);
+    const staleProjectionPayload = await parseResponse(staleProjection);
+    assert.equal(
+      staleProjectionPayload.result?.structuredContent?.clientProjectionConvergence?.state,
+      "SERVER_AHEAD_OF_CLIENT",
+    );
+    assert.equal(
+      staleProjectionPayload.result?.structuredContent?.sessionConvergence?.controllerDisposition,
+      "SERVER_AHEAD_OF_CLIENT",
+    );
+    assert.equal(staleProjectionPayload.result?.structuredContent?.refresh?.notificationSent, true);
+    assert.equal(staleProjectionPayload.result?.structuredContent?.refresh?.sameActorPreserved, true);
+    assert.equal(staleProjectionPayload.result?.structuredContent?.refresh?.nextAction, "RELIST_TOOLS");
+
+    const crossSessionRefresh = await post(sessionId!, {
+      jsonrpc: "2.0",
+      id: 22,
+      method: "tools/call",
+      params: {
+        name: "capability_convergence_status",
+        arguments: {
+          sessionId: secondSessionId,
+          clientProjectionToolNames: ["capability_convergence_status", "workspace_inspect"],
+          requestRefresh: true,
+        },
+        _meta: { "openai/session": "issue-240-caller-a" },
+      },
+    });
+    assert.equal(crossSessionRefresh.status, 200);
+    const crossSessionPayload = await parseResponse(crossSessionRefresh);
+    assert.equal(crossSessionPayload.result?.structuredContent?.refresh?.eligible, true);
+    assert.equal(crossSessionPayload.result?.structuredContent?.refresh?.notificationSent, false);
+    assert.equal(crossSessionPayload.result?.structuredContent?.refresh?.sameActorPreserved, false);
+    assert.equal(crossSessionPayload.result?.structuredContent?.refresh?.nextAction, "RECONNECT_REQUIRED");
+
+    const refreshedProjection = await post(sessionId!, {
+      jsonrpc: "2.0",
+      id: 21,
+      method: "tools/call",
+      params: {
+        name: "capability_convergence_status",
+        arguments: {
+          clientProjectionToolNames: session!.serverGeneration!.toolNames!,
+          requestRefresh: false,
+        },
+        _meta: { "openai/session": "issue-240-caller-a" },
+      },
+    });
+    assert.equal(refreshedProjection.status, 200);
+    const refreshedProjectionPayload = await parseResponse(refreshedProjection);
+    assert.equal(
+      refreshedProjectionPayload.result?.structuredContent?.clientProjectionConvergence?.state,
+      "CURRENT",
+    );
+    assert.equal(
+      refreshedProjectionPayload.result?.structuredContent?.sessionConvergence?.controllerDisposition,
+      "CURRENT",
+    );
+
+    const changedCaller = await post(sessionId!, {
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: {
+        name: "capability_convergence_status",
+        arguments: {},
+        _meta: { "openai/session": "issue-240-caller-b" },
+      },
+    });
+    assert.equal(changedCaller.status, 200);
+    const changedPayload = await parseResponse(changedCaller);
+    assert.equal(
+      changedPayload.result?.structuredContent?.sessionConvergence?.controllerDisposition,
+      "CALLER_REBIND_REQUIRED",
+    );
+
+    const blockedDifferentCaller = await post(sessionId!, {
+      jsonrpc: "2.0",
+      id: 4,
+      method: "tools/call",
+      params: {
+        name: "workspace_inspect",
+        arguments: {},
+        _meta: { "openai/session": "issue-240-caller-b" },
+      },
+    });
+    assert.equal(blockedDifferentCaller.status, 409);
+    const blockedPayload = await blockedDifferentCaller.json() as Record<string, any>;
+    assert.match(blockedPayload.error?.message ?? "", /CALLER_REBIND_REQUIRED/);
+    assert.equal(blockedPayload.error?.data?.controllerDisposition, "CALLER_REBIND_REQUIRED");
+    assert.equal(blockedPayload.error?.data?.callerRebindRequired, true);
   } finally {
     await new Promise<void>((resolve) => listener.close(() => resolve()));
     await running.close();

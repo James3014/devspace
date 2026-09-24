@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import {
+  evaluateClientProjectionConvergence,
   evaluateDeploymentConvergence,
   evaluateSessionConvergence,
   evaluateMultiRoleConvergence,
@@ -8,6 +9,7 @@ import {
   DeploymentConvergenceError,
   type DeploymentIdentitySnapshot,
 } from "./deployment-convergence.js";
+import { mcpToolCatalogGeneration } from "./capability-manifest.js";
 
 const REQUIRED_AGENT_START_CAPABILITIES = [
   "agent_start.tool",
@@ -169,6 +171,46 @@ test("Positive test: assertDeploymentCandidateValid accepts valid candidate desc
   assert.doesNotThrow(() => assertDeploymentCandidateValid(validCandidate, currentAccepted));
 });
 
+test("ClientProjectionConvergence proves current, server-ahead, and stale-extra projections", () => {
+  const serverTools = ["git_commit", "read", "capability_convergence_status"];
+  const serverGeneration = mcpToolCatalogGeneration(serverTools);
+
+  const current = evaluateClientProjectionConvergence(
+    ["read", "capability_convergence_status", "git_commit"],
+    serverTools,
+    serverGeneration,
+  );
+  assert.equal(current.state, "CURRENT");
+  assert.equal(current.converged, true);
+  assert.deepEqual(current.missingServerTools, []);
+  assert.deepEqual(current.extraClientTools, []);
+
+  const serverAhead = evaluateClientProjectionConvergence(
+    ["read", "capability_convergence_status"],
+    serverTools,
+    serverGeneration,
+  );
+  assert.equal(serverAhead.state, "SERVER_AHEAD_OF_CLIENT");
+  assert.deepEqual(serverAhead.missingServerTools, ["git_commit"]);
+
+  const staleExtra = evaluateClientProjectionConvergence(
+    [...serverTools, "removed_tool"],
+    serverTools,
+    serverGeneration,
+  );
+  assert.equal(staleExtra.state, "STALE_RECONNECT_REQUIRED");
+  assert.deepEqual(staleExtra.extraClientTools, ["removed_tool"]);
+
+  const mixedDrift = evaluateClientProjectionConvergence(
+    ["read", "removed_tool"],
+    serverTools,
+    serverGeneration,
+  );
+  assert.equal(mixedDrift.state, "STALE_RECONNECT_REQUIRED");
+  assert.deepEqual(mixedDrift.missingServerTools, ["capability_convergence_status", "git_commit"]);
+  assert.deepEqual(mixedDrift.extraClientTools, ["removed_tool"]);
+});
+
 test("SessionConvergence: CURRENT when snapshot matches server identity", () => {
   const current = {
     serverInstanceId: "srv-1",
@@ -189,8 +231,42 @@ test("SessionConvergence: CURRENT when snapshot matches server identity", () => 
   };
   const result = evaluateSessionConvergence(snapshot, current);
   assert.equal(result.state, "CURRENT");
+  assert.equal(result.controllerDisposition, "CURRENT");
   assert.equal(result.converged, true);
   assert.equal(result.reconnectRequired, false);
+});
+
+test("SessionConvergence: caller identity drift requires explicit caller rebind without pretending server drift", () => {
+  const current = {
+    serverInstanceId: "srv-1",
+    sourceCommit: "commit-1",
+    buildId: "build-1",
+    capabilityManifestSha256: "man-1",
+    catalogGeneration: "gen-1",
+    cutoverMode: "normal",
+    reconciliationRequired: false,
+  };
+  const snapshot = {
+    serverInstanceId: "srv-1",
+    sourceCommit: "commit-1",
+    buildId: "build-1",
+    capabilityManifestSha256: "man-1",
+    catalogGeneration: "gen-1",
+    callerIdentityFingerprint: "mcp:client-a",
+    conversationIdentityFingerprint: "openai:caller-a",
+    sessionInitializedAt: new Date().toISOString(),
+  };
+  const result = evaluateSessionConvergence(snapshot, current, "mcp:client-a", "openai:caller-b");
+  assert.equal(result.state, "CURRENT");
+  assert.equal(result.controllerDisposition, "CALLER_REBIND_REQUIRED");
+  assert.equal(result.converged, true);
+  assert.equal(result.reconnectRequired, false);
+
+  const omittedConversation = evaluateSessionConvergence(snapshot, current, "mcp:client-a");
+  assert.equal(omittedConversation.controllerDisposition, "CURRENT");
+
+  const changedClient = evaluateSessionConvergence(snapshot, current, "mcp:client-b");
+  assert.equal(changedClient.controllerDisposition, "CALLER_REBIND_REQUIRED");
 });
 
 test("SessionConvergence: RECONCILE_REQUIRED when server is in cutover drain mode", () => {
@@ -236,6 +312,7 @@ test("SessionConvergence: STALE_SERVER when server instance changed", () => {
   };
   const result = evaluateSessionConvergence(snapshot, current);
   assert.equal(result.state, "STALE_SERVER");
+  assert.equal(result.controllerDisposition, "STALE_RECONNECT_REQUIRED");
   assert.equal(result.reconnectRequired, true);
   assert.equal(result.converged, false);
 });
@@ -260,11 +337,13 @@ test("SessionConvergence: manifest and catalog drift stay stale until tools/list
   };
   const manifestResult = evaluateSessionConvergence(manifestStale, current);
   assert.equal(manifestResult.state, "STALE_CAPABILITY_MANIFEST");
+  assert.equal(manifestResult.controllerDisposition, "SERVER_AHEAD_OF_CLIENT");
   assert.equal(manifestResult.reconnectRequired, false);
 
   const catalogStale = { ...manifestStale, capabilityManifestSha256: "man-2", catalogGeneration: "gen-0" };
   const catalogResult = evaluateSessionConvergence(catalogStale, current);
   assert.equal(catalogResult.state, "STALE_SESSION_CATALOG");
+  assert.equal(catalogResult.controllerDisposition, "SERVER_AHEAD_OF_CLIENT");
   assert.equal(catalogResult.reconnectRequired, false);
 });
 

@@ -1256,10 +1256,10 @@ export class CoreMutationSessionStore {
         `Agent workspaceId ${agent.workspaceId} does not match Core workspace ${record.workspaceSessionId}.`,
       );
     }
-    if (agent.status !== "stopped") {
+    if (agent.status !== "stopped" && agent.status !== "idle") {
       throw new CoreMutationSessionError(
         "AGENT_EXECUTION_NOT_TERMINAL",
-        `Agent ${agent.id} is in status ${agent.status}; direct candidate evidence requires terminal stopped agent.`,
+        `Agent ${agent.id} is in status ${agent.status}; direct candidate evidence requires a settled idle or stopped agent.`,
       );
     }
     if (agent.terminalReason !== "completed") {
@@ -1276,6 +1276,12 @@ export class CoreMutationSessionStore {
     }
 
     const lifecycle = agent.lifecycleState as Record<string, unknown> | undefined;
+    if (lifecycle?.activeTurn) {
+      throw new CoreMutationSessionError(
+        "AGENT_EXECUTION_NOT_TERMINAL",
+        `Agent ${agent.id} still has an active turn; idle/stopped status is not sufficient terminal evidence.`,
+      );
+    }
     if (lifecycle?.lifecycleCorrupt) {
       throw new CoreMutationSessionError(
         "AGENT_LIFECYCLE_CORRUPT",
@@ -1289,7 +1295,7 @@ export class CoreMutationSessionStore {
       );
     }
     const termPending = lifecycle?.terminationPending as Record<string, unknown> | undefined;
-    if (termPending?.pending) {
+    if (termPending) {
       throw new CoreMutationSessionError(
         "AGENT_TERMINATION_PENDING",
         `Agent ${agent.id} termination is still pending.`,
@@ -1757,6 +1763,31 @@ export class CoreMutationSessionStore {
         ] as const));
         const unresolved = states.filter(([, state]) => state !== "CLEAR");
         if (unresolved.length > 0) {
+          const remainingDomains = unresolved.map(([domain]) => domain);
+          if (remainingDomains.length !== record.writerDomains.length) {
+            const narrowedAt = closeTime.toISOString();
+            const narrowed = this.database.sqlite.prepare(`
+              update core_mutation_sessions
+              set writer_domains_json = ?, writer_reconciliation_state = 'OUTCOME_UNKNOWN', updated_at = ?
+              where id = ? and status = 'ACTIVE' and updated_at = ? and freshness_state = ?
+                and rebind_state = ? and writer_reconciliation_state = ? and writer_domains_json = ?
+            `).run(
+              JSON.stringify(remainingDomains),
+              narrowedAt,
+              record.id,
+              record.updatedAt,
+              record.freshnessState,
+              record.rebindState,
+              record.writerReconciliationState,
+              JSON.stringify(record.writerDomains),
+            );
+            if (narrowed.changes !== 1) {
+              throw new CoreMutationSessionError(
+                "CORE_MUTATION_RECONCILE_REQUIRED",
+                "Core writer reconciliation state changed during domain narrowing; CAS lost.",
+              );
+            }
+          }
           throw new CoreMutationSessionError(
             "CORE_MUTATION_WRITER_RECONCILE_REQUIRED",
             `Core-bound writer domains are not all CLEAR (${unresolved.map(([domain, state]) => `${domain}=${state}`).join(", ")}); retained manager evidence must prove every admitted domain terminal before completion.`,
