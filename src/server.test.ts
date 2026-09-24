@@ -2202,6 +2202,58 @@ test("agent continuation rejects changed and historical Core binding identity", 
   assert.match(responseText(historical), /CORE_BOUND_SESSION_REQUIRED/);
 });
 
+test("agent continuation does not retroactively require Core binding for a direct read-only selection", async (t) => {
+  const conversationScopeId = "direct-readonly-continuation";
+  const conversation = { "openai/session": conversationScopeId };
+  const context = await fixture(t, { git: true, coreMutation: true, subagents: true });
+  const opened = await callOpen(context.client, context.project, conversationScopeId);
+  const workspaceId = structuredContent(opened).workspaceId as string;
+
+  const agents = new LocalAgentStore(context.stateDir);
+  let agentId: string;
+  try {
+    const record = agents.create({
+      workspaceId,
+      workspaceRoot: context.project,
+      profileName: "__direct__codex__default__gpt-test__default",
+      provider: "codex",
+      model: "gpt-test",
+      executionContract: {
+        directSelection: {
+          provider: "codex",
+          model: "gpt-test",
+          writeMode: "read_only",
+        },
+      },
+      lifecycleKind: "detached_worker_v2",
+    });
+    agentId = record.id;
+    const generation = record.lifecycleState!.activeTurn!.generation!;
+    const workerToken = "direct-readonly-test-worker";
+    assert.equal(agents.prepareWorkerCAS(agentId, generation, workerToken).applied, true);
+    assert.equal(agents.claimWorkerCAS(agentId, generation, workerToken, process.pid).applied, true);
+    assert.equal(agents.finishTurnCAS({
+      agentId,
+      generation,
+      workerToken,
+      status: "idle",
+      terminalReason: "completed",
+    }).applied, true);
+  } finally {
+    agents.close();
+  }
+
+  const result = await context.client.callTool({
+    name: "agent_continue",
+    arguments: { workspaceId, agentId: agentId!, prompt: "continue read-only direct selection" },
+    _meta: conversation,
+  });
+
+  assert.equal(result.isError, true);
+  assert.doesNotMatch(responseText(result), /CORE_BOUND_SESSION_REQUIRED/);
+  assert.match(responseText(result), /requires explicit rebind/);
+});
+
 test("subagents disabled: agent tools are absent", async (t) => {
   const context = await fixture(t, { subagents: false });
   const tools = await context.client.listTools();

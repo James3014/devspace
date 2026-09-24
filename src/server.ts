@@ -5094,8 +5094,10 @@ export function createMcpServer(
         const currentProfile = currentAgent
           ? profileCatalog.profiles.find((candidate) => candidate.name === currentAgent.profileName)
           : undefined;
+        const currentWriteMode = currentProfile?.write_mode
+          ?? currentAgent?.executionContract?.directSelection?.writeMode;
         let coreAdmission: CoreMutationAdmission | undefined;
-        if (currentProfile?.write_mode !== "read_only") {
+        if (currentWriteMode !== "read_only") {
           await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
           if (coreMutationGuard) {
             const contract = currentAgent?.executionContract;
