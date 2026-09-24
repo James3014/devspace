@@ -376,6 +376,81 @@ try {
         await bound.close();
       }
     }
+
+    // D2: the running proxy must converge from M1 -> M2 in-process. The same
+    // process may never remain health-200 on the stale M1 identity after the
+    // inner Gateway advertises M2, and a later unreadable Gateway fails closed.
+    {
+      let revision = "gateway-revision-m1";
+      let tools = [
+        { name: "nexus_gateway_status", description: "status", inputSchema: { type: "object", properties: {} } },
+      ];
+      let unavailable = false;
+      let toolsListCalls = 0;
+      globalThis.fetch = (async (input, init) => {
+        const url = String(input);
+        if (!url.startsWith("http://127.0.0.1:8766")) {
+          return originalFetch(input, init);
+        }
+        if (unavailable) {
+          throw new Error("inner gateway unavailable");
+        }
+        const bodyText = init ? String(init.body ?? "") : "";
+        const body = bodyText ? JSON.parse(bodyText) as { method?: string; id?: unknown } : undefined;
+        if (body?.method === "tools/list") {
+          toolsListCalls += 1;
+          return new Response(JSON.stringify({
+            jsonrpc: "2.0",
+            id: body.id,
+            result: { manifest_revision: revision, tools },
+          }), { status: 200, headers: { "content-type": "application/json" } });
+        }
+        return new Response(JSON.stringify({ jsonrpc: "2.0", id: "x", result: {} }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }) as typeof fetch;
+
+      const running = await proxyServer(join(readinessRoot, "manifest-rebind"));
+      const bound = await listenOnPort(running);
+      try {
+        const m1 = await fetch(`${bound.baseUrl}/healthz`);
+        assert.equal(m1.status, 200);
+        const m1Body = await m1.json();
+        assert.equal(m1Body.observed_manifest_revision, "gateway-revision-m1");
+        assert.equal(m1Body.observed_manifest_count, 1);
+
+        revision = "gateway-revision-m2";
+        tools = [
+          { name: "nexus_gateway_status", description: "status", inputSchema: { type: "object", properties: {} } },
+          { name: "nexus_owner_standing_grant_issue", description: "issue grant", inputSchema: { type: "object", properties: {} } },
+        ];
+
+        const m2 = await fetch(`${bound.baseUrl}/healthz`);
+        assert.equal(m2.status, 200, "M2 must replace the stale registered M1 boundary in-process");
+        const m2Body = await m2.json();
+        assert.equal(m2Body.observed_manifest_revision, "gateway-revision-m2");
+        assert.equal(m2Body.observed_manifest_count, 2);
+        assert.equal(m2Body.effective_tool_count, 4);
+        assert.ok(toolsListCalls >= 3, "health must fresh-read Gateway identity rather than reuse startup Promise");
+
+        unavailable = true;
+        const failed = await fetch(`${bound.baseUrl}/healthz`);
+        assert.equal(failed.status, 503, "fresh Gateway read failure must fail closed");
+        const failedBody = await failed.json();
+        assert.equal(failedBody.ok, false);
+        assert.equal(failedBody.manifest_status, "unavailable");
+        assert.equal(failedBody.disposition, "PUBLIC_SURFACE_FAIL_CLOSED");
+
+        unavailable = false;
+        const recovered = await fetch(`${bound.baseUrl}/healthz`);
+        assert.equal(recovered.status, 200, "same process must recover after the inner Gateway is readable");
+        const recoveredBody = await recovered.json();
+        assert.equal(recoveredBody.observed_manifest_revision, "gateway-revision-m2");
+      } finally {
+        await bound.close();
+      }
+    }
   } finally {
     globalThis.fetch = originalFetch;
     await rm(readinessRoot, { recursive: true, force: true });
