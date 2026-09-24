@@ -616,17 +616,29 @@ test("every durably admitted writer domain must independently reconcile CLEAR", 
     git(fixture.repo, "commit", "-m", "candidate with two writer domains");
     await store.recordCandidate({ sessionId: session.id, workspaceSessionId: workspaceId, workspaceRoot: fixture.repo, actorKey: "actor:test", candidateHead: git(fixture.repo, "rev-parse", "HEAD"), candidateTree: git(fixture.repo, "rev-parse", "HEAD^{tree}") });
 
-    for (const states of [
-      { PROCESS: "UNKNOWN", AGENT: "CLEAR" },
-      { PROCESS: "CLEAR", AGENT: "UNKNOWN" },
-      { PROCESS: "ACTIVE", AGENT: "CLEAR" },
-    ] as const) {
-      await assert.rejects(
-        () => store.closeSession({ sessionId: session.id, workspaceSessionId: workspaceId, workspaceRoot: fixture.repo, actorKey: "actor:test", mode: "COMPLETE", inspectWriterDomain: async (_record, domain) => states[domain] } as Parameters<CoreMutationSessionStore["closeSession"]>[0]),
-        (error: unknown) => error instanceof CoreMutationSessionError && error.code === "CORE_MUTATION_WRITER_RECONCILE_REQUIRED",
-      );
-    }
-    const completed = await store.closeSession({ sessionId: session.id, workspaceSessionId: workspaceId, workspaceRoot: fixture.repo, actorKey: "actor:test", mode: "COMPLETE", inspectWriterDomain: async () => "CLEAR" } as Parameters<CoreMutationSessionStore["closeSession"]>[0]);
+    await assert.rejects(
+      () => store.closeSession({
+        sessionId: session.id,
+        workspaceSessionId: workspaceId,
+        workspaceRoot: fixture.repo,
+        actorKey: "actor:test",
+        mode: "COMPLETE",
+        inspectWriterDomain: async (_record, domain) => domain === "AGENT" ? "CLEAR" : "UNKNOWN",
+      } as Parameters<CoreMutationSessionStore["closeSession"]>[0]),
+      (error: unknown) => error instanceof CoreMutationSessionError && error.code === "CORE_MUTATION_WRITER_RECONCILE_REQUIRED",
+    );
+    const narrowed = store.getById(session.id);
+    assert.equal(narrowed?.writerReconciliationState, "OUTCOME_UNKNOWN");
+    assert.deepEqual(narrowed?.writerDomains, ["PROCESS"]);
+
+    const completed = await store.closeSession({
+      sessionId: session.id,
+      workspaceSessionId: workspaceId,
+      workspaceRoot: fixture.repo,
+      actorKey: "actor:test",
+      mode: "COMPLETE",
+      inspectWriterDomain: async () => "CLEAR",
+    } as Parameters<CoreMutationSessionStore["closeSession"]>[0]);
     assert.equal(completed.status, "COMPLETED");
     assert.equal(completed.writerReconciliationState, "CLEAR");
     assert.deepEqual(completed.writerDomains, []);
@@ -1417,7 +1429,7 @@ test("produceDirectCandidateEvidence produces valid signed evidence matching exa
       profileName: "deep-engineer",
       provider: "anthropic",
       model: "claude-3-5-sonnet",
-      status: "stopped",
+      status: "idle",
       terminalReason: "completed",
       scopeState: "WITHIN_SCOPE",
       executionContract: {
@@ -1704,7 +1716,44 @@ test("produceDirectCandidateEvidence fails closed on mismatched or invalid invar
       (err: unknown) => err instanceof CoreMutationSessionError && err.code === "AGENT_EXECUTION_NOT_TERMINAL",
     );
 
-    // 4. Agent failed
+    // 4. Idle agent with an active turn is not terminal evidence.
+    await assert.rejects(
+      () => store.produceDirectCandidateEvidence({
+        workspaceId,
+        sessionId: session.id,
+        candidateHead,
+        agentId: baseAgent.id,
+        agentReader: () => ({ ...baseAgent, status: "idle", lifecycleState: { activeTurn: { generation: "g-active" } } }),
+      }),
+      (err: unknown) => err instanceof CoreMutationSessionError && err.code === "AGENT_EXECUTION_NOT_TERMINAL",
+    );
+
+    // 5. Pending termination is not terminal evidence.
+    await assert.rejects(
+      () => store.produceDirectCandidateEvidence({
+        workspaceId,
+        sessionId: session.id,
+        candidateHead,
+        agentId: baseAgent.id,
+        agentReader: () => ({
+          ...baseAgent,
+          status: "idle",
+          lifecycleState: {
+            terminationPending: {
+              generation: "g-termination",
+              requestedAt: "2026-09-23T12:04:00.000Z",
+              reason: "cancelled",
+              terminalStatus: "stopped",
+              previousStatus: "running",
+              launchState: "claimed",
+            },
+          },
+        }),
+      }),
+      (err: unknown) => err instanceof CoreMutationSessionError && err.code === "AGENT_TERMINATION_PENDING",
+    );
+
+    // 6. Agent failed
     await assert.rejects(
       () => store.produceDirectCandidateEvidence({
         workspaceId,

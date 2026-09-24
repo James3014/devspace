@@ -157,6 +157,7 @@ import { createMcpOpencodeCatalogSource } from "./local-agent-opencode-mcp-catal
 import { ClineCatalogService, isClineCatalogFresh, validateClineModelAndThinking, type ClineCatalogSnapshot } from "./local-agent-cline-catalog.js";
 import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build-identity.js";
 import {
+  evaluateClientProjectionConvergence,
   evaluateSessionConvergence,
   evaluateMultiRoleConvergence,
   type SessionGenerationSnapshot,
@@ -1649,6 +1650,31 @@ export interface RuntimeBuildIdentityContext {
   onCatalogGenerationChanged?: () => Promise<number> | number;
 }
 
+type ControllerCallerIdentityInput = {
+  _meta?: unknown;
+  authInfo?: { clientId?: string };
+};
+
+type ControllerCallerIdentity = {
+  callerIdentityFingerprint?: string;
+  conversationIdentityFingerprint?: string;
+};
+
+function controllerCallerIdentity(input: ControllerCallerIdentityInput): ControllerCallerIdentity {
+  const conversationScope = openAiConversationScopeId(input._meta);
+  const conversationIdentityFingerprint = conversationScope
+    ? `openai:${createHash("sha256").update(conversationScope).digest("hex")}`
+    : undefined;
+  const clientId = input.authInfo?.clientId;
+  const callerIdentityFingerprint = clientId
+    ? `mcp:${createHash("sha256").update(clientId).digest("hex")}`
+    : conversationIdentityFingerprint;
+  return {
+    ...(callerIdentityFingerprint ? { callerIdentityFingerprint } : {}),
+    ...(conversationIdentityFingerprint ? { conversationIdentityFingerprint } : {}),
+  };
+}
+
 export interface CutoverMcpControlContext {
   controller: McpCutoverController;
   transportEvidence: () => CutoverDrainEvidence;
@@ -1681,7 +1707,12 @@ export interface CutoverMcpControlContext {
     workspaceId: string;
     agentId: string;
   }) => Promise<DurableCutoverRecord>;
-  sessionConvergence?: (sessionId?: string) => SessionConvergenceEvaluation;
+  sessionConvergence?: (
+    sessionId?: string,
+    callerIdentityFingerprint?: string,
+    conversationIdentityFingerprint?: string,
+  ) => SessionConvergenceEvaluation;
+  refreshSessionTools?: (sessionId?: string) => Promise<boolean>;
   multiRoleEvaluator?: () => MultiRoleDeploymentEvaluation;
   controlPlaneEvaluator?: () => ControlPlaneConvergenceEvaluation;
 }
@@ -1703,30 +1734,85 @@ function registerCutoverMcpTools(
     {
       title: "Capability convergence status",
       description:
-        "Read multi-layer capability generation convergence evaluation across desired source, installed package, running service, capability manifest, and active MCP session tool catalog.",
+        "Read server/session/client-projection convergence. Optionally compare the caller's actual callable DevSpace tool names to the live server catalog and request one same-session tools/list_changed refresh when the server is ahead. Refresh never changes Core actor identity or grants continuation authority.",
       inputSchema: {
         sessionId: z.string().optional().describe("Optional MCP session ID to evaluate session convergence."),
+        clientProjectionToolNames: z.array(z.string().trim().min(1)).max(512).optional()
+          .describe("Bare DevSpace tool names actually callable by this client projection, used to prove client/server catalog convergence."),
+        requestRefresh: z.boolean().optional()
+          .describe("When true and the server is ahead of the same caller's projection, emit one tools/list_changed notification on this exact MCP session."),
       },
       outputSchema: {
         sessionConvergence: z.record(z.string(), z.unknown()).optional(),
+        clientProjectionConvergence: z.record(z.string(), z.unknown()).optional(),
+        refresh: z.record(z.string(), z.unknown()).optional(),
         multiRoleConvergence: z.record(z.string(), z.unknown()).optional(),
         controlPlaneConvergence: z.record(z.string(), z.unknown()).optional(),
         cutoverStatus: z.record(z.string(), z.unknown()),
       },
       _meta: {},
-      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
-    async ({ sessionId }) => {
+    async ({ sessionId, clientProjectionToolNames, requestRefresh }, extra) => {
       const cutoverStatus = control.controller.status(control.transportEvidence());
-      const sessionConvergence = control.sessionConvergence?.(sessionId);
+      const callerIdentity = controllerCallerIdentity(extra as ControllerCallerIdentityInput);
+      const baseSessionConvergence = control.sessionConvergence?.(
+        sessionId,
+        callerIdentity.callerIdentityFingerprint,
+        callerIdentity.conversationIdentityFingerprint,
+      );
+      const clientProjectionConvergence =
+        clientProjectionToolNames && baseSessionConvergence?.serverGeneration.toolNames
+          ? evaluateClientProjectionConvergence(
+              clientProjectionToolNames,
+              baseSessionConvergence.serverGeneration.toolNames,
+              baseSessionConvergence.serverGeneration.catalogGeneration,
+            )
+          : undefined;
+      const sessionConvergence =
+        baseSessionConvergence &&
+        baseSessionConvergence.controllerDisposition === "CURRENT" &&
+        clientProjectionConvergence &&
+        clientProjectionConvergence.state !== "CURRENT"
+          ? {
+              ...baseSessionConvergence,
+              controllerDisposition: clientProjectionConvergence.state,
+              converged: false,
+              activeDrift: true,
+              details: `${baseSessionConvergence.details} ${clientProjectionConvergence.details}`,
+            }
+          : baseSessionConvergence;
+
+      let refresh: Record<string, unknown> | undefined;
+      if (requestRefresh !== undefined) {
+        const refreshEligible =
+          requestRefresh === true &&
+          baseSessionConvergence?.controllerDisposition === "CURRENT" &&
+          clientProjectionConvergence?.state === "SERVER_AHEAD_OF_CLIENT";
+        const notificationSent = refreshEligible
+          ? await control.refreshSessionTools?.(sessionId) ?? false
+          : false;
+        refresh = {
+          requested: requestRefresh,
+          eligible: refreshEligible,
+          notificationSent,
+          sameActorPreserved: notificationSent,
+          nextAction: notificationSent
+            ? "RELIST_TOOLS"
+            : refreshEligible ? "RECONNECT_REQUIRED" : "NONE",
+        };
+      }
+
       const multiRoleConvergence = control.multiRoleEvaluator?.();
       const controlPlaneConvergence = control.controlPlaneEvaluator?.();
       return {
         content: [textBlock(
-          `Capability convergence: session=${sessionConvergence?.state ?? "n/a"}, multiRoleConverged=${String(multiRoleConvergence?.converged ?? true)}, controlPlane=${controlPlaneConvergence?.converged ? "CONVERGED" : controlPlaneConvergence ? "BLOCKED" : "unbound"}, cutoverMode=${String(cutoverStatus.mode)}.`,
+          `Capability convergence: session=${sessionConvergence?.state ?? "n/a"}, controller=${sessionConvergence?.controllerDisposition ?? "n/a"}, clientProjection=${clientProjectionConvergence?.state ?? "unreported"}, multiRoleConverged=${String(multiRoleConvergence?.converged ?? true)}, controlPlane=${controlPlaneConvergence?.converged ? "CONVERGED" : controlPlaneConvergence ? "BLOCKED" : "unbound"}, cutoverMode=${String(cutoverStatus.mode)}.`,
         )],
         structuredContent: {
           sessionConvergence: sessionConvergence as unknown as Record<string, unknown> | undefined,
+          clientProjectionConvergence: clientProjectionConvergence as unknown as Record<string, unknown> | undefined,
+          ...(refresh ? { refresh } : {}),
           multiRoleConvergence: multiRoleConvergence as unknown as Record<string, unknown> | undefined,
           controlPlaneConvergence: controlPlaneConvergence as unknown as Record<string, unknown> | undefined,
           cutoverStatus,
@@ -7035,7 +7121,11 @@ export function createServer(
       executeObservedReplacementRecovery,
       canRepairBinding,
       executeBindingRepair,
-      sessionConvergence: (targetSessionId?: string) => {
+      sessionConvergence: (
+        targetSessionId?: string,
+        callerIdentityFingerprint?: string,
+        conversationIdentityFingerprint?: string,
+      ) => {
         const sid = targetSessionId ?? resolveRequestSessionId();
         const sessionSnapshot = sid ? transports.getSnapshot(sid) : undefined;
         return evaluateSessionConvergence(sessionSnapshot, {
@@ -7048,7 +7138,21 @@ export function createServer(
           freshness: runtimeBuildIdentity.startedAt,
           cutoverMode: cutoverController.mode(),
           reconciliationRequired: cutoverController.mode() !== "normal",
-        });
+        }, callerIdentityFingerprint, conversationIdentityFingerprint);
+      },
+      refreshSessionTools: async (targetSessionId?: string) => {
+        const requestSessionId = resolveRequestSessionId();
+        if (!requestSessionId) return false;
+        if (targetSessionId !== undefined && targetSessionId !== requestSessionId) return false;
+        const sid = requestSessionId;
+        const sessionServer = transports.getServer(sid);
+        if (!sessionServer || typeof sessionServer.sendToolListChanged !== "function") return false;
+        try {
+          await sessionServer.sendToolListChanged();
+          return true;
+        } catch {
+          return false;
+        }
       },
       multiRoleEvaluator: () => {
         const roles: ServiceRoleDeploymentIdentity[] = [
@@ -7182,8 +7286,35 @@ export function createServer(
       }
 
       if (sessionId) {
+        const requestCallerIdentity = controllerCallerIdentity({
+          _meta: req.body?.params?._meta,
+          authInfo: {
+            clientId: (req.auth as { clientId?: string } | undefined)?.clientId,
+          },
+        });
+        let sessionSnapshot = transports.getSnapshot(sessionId);
+        if (sessionSnapshot) {
+          const nextSnapshot = {
+            ...sessionSnapshot,
+            ...(requestCallerIdentity.callerIdentityFingerprint &&
+              sessionSnapshot.callerIdentityFingerprint === undefined
+              ? { callerIdentityFingerprint: requestCallerIdentity.callerIdentityFingerprint }
+              : {}),
+            ...(requestCallerIdentity.conversationIdentityFingerprint &&
+              sessionSnapshot.conversationIdentityFingerprint === undefined
+              ? { conversationIdentityFingerprint: requestCallerIdentity.conversationIdentityFingerprint }
+              : {}),
+          };
+          if (
+            nextSnapshot.callerIdentityFingerprint !== sessionSnapshot.callerIdentityFingerprint ||
+            nextSnapshot.conversationIdentityFingerprint !== sessionSnapshot.conversationIdentityFingerprint
+          ) {
+            sessionSnapshot = nextSnapshot;
+            transports.setSnapshot(sessionId, sessionSnapshot);
+          }
+        }
+
         if (cutoverController.mode() === "normal" && toolName !== "capability_convergence_status" && toolName !== "tools/list") {
-          const sessionSnapshot = transports.getSnapshot(sessionId);
           const convergence = evaluateSessionConvergence(sessionSnapshot, {
             serverInstanceId: runtimeBuildIdentity.serverInstanceId,
             sourceCommit: runtimeBuildIdentity.sourceCommit,
@@ -7194,23 +7325,28 @@ export function createServer(
             freshness: runtimeBuildIdentity.startedAt,
             cutoverMode: cutoverController.mode(),
             reconciliationRequired: cutoverController.mode() !== "normal",
-          });
-          if (convergence.state !== "CURRENT") {
+          }, requestCallerIdentity.callerIdentityFingerprint, requestCallerIdentity.conversationIdentityFingerprint);
+          if (convergence.controllerDisposition !== "CURRENT") {
             const disposition = {
               staleSessionState: convergence.state,
+              controllerDisposition: convergence.controllerDisposition,
               details: convergence.details,
               reconnectRequired: convergence.reconnectRequired,
               reconciliationRequired: convergence.reconciliationRequired,
+              callerRebindRequired: convergence.controllerDisposition === "CALLER_REBIND_REQUIRED",
               currentServerCommit: runtimeBuildIdentity.sourceCommit,
               sessionBoundCommit: sessionSnapshot?.sourceCommit,
               currentCatalogGeneration: latestMcpToolCatalogGeneration.value,
               sessionBoundCatalogGeneration: sessionSnapshot?.catalogGeneration,
             };
+            const errorTag = convergence.controllerDisposition === "CALLER_REBIND_REQUIRED"
+              ? "CALLER_REBIND_REQUIRED"
+              : `STALE_MCP_SESSION:${convergence.state}`;
             res.status(409).json({
               jsonrpc: "2.0",
               error: {
                 code: -32003,
-                message: `[STALE_MCP_SESSION:${convergence.state}] Session generation is not current for tool '${toolName}'. ${convergence.details}. Reconnect required: ${convergence.reconnectRequired}.`,
+                message: `[${errorTag}] Session controller disposition for tool '${toolName}' is ${convergence.controllerDisposition}. ${convergence.details}. Reconnect required: ${convergence.reconnectRequired}.`,
                 data: disposition,
               },
               id: req.body?.id ?? null,
