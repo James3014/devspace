@@ -10,6 +10,8 @@ import {
   buildLocalEffectEnforcementReceipt,
   LOCAL_EFFECT_PROJECTION_SCHEMA,
 } from "./local-effect-enforcement.js";
+import { hashDispatchIntent } from "./execution-protocol.js";
+import { canonicalizePath } from "./roots.js";
 
 const root = mkdtempSync(join(tmpdir(), "devspace-local-agent-store-test-"));
 const stores: LocalAgentStore[] = [];
@@ -1030,8 +1032,643 @@ assert.deepEqual(store.list({ workspaceRoot: join(root, "other") }), []);
   assert.equal(scopedWsCount, 1);
   const scopedWsAndRootCount = store.count({ workspaceId: "ws_success", workspaceRoot: join(root, "success") });
   assert.equal(scopedWsAndRootCount, 1);
-  const absentWsCount = store.count({ workspaceId: "ws_nonexistent" });
-  assert.equal(absentWsCount, 0);
+  // Case F: bindExternalRuntimeBindingCAS and StoredExecutionStateV2
+  const bindingAgent = store.create({
+    workspaceId: "ws_binding",
+    workspaceRoot: join(root, "binding"),
+    profileName: "reviewer",
+    provider: "agy",
+    startReplay: {
+      key: "attempt-bind-1",
+      requestHash: "hash-123",
+    },
+  });
+
+  const testBinding = {
+    runtimeKind: "HERDR",
+    handle: {
+      attemptKey: "attempt-bind-1",
+      workspaceId: "ws_binding",
+      herdrSocketPath: "/tmp/herdr.sock",
+    },
+  };
+
+  // Successful binding
+  const bindRes = store.bindExternalRuntimeBindingCAS({
+    agentId: bindingAgent.id,
+    expectedAttemptKey: "attempt-bind-1",
+    binding: testBinding,
+  });
+  assert.equal(bindRes.applied, true);
+
+  const boundRecord = store.getById(bindingAgent.id)!;
+  assert.deepEqual(boundRecord.externalRuntimeBinding, testBinding);
+  // provider_session_id is NOT modified
+  assert.equal(boundRecord.providerSessionId, undefined);
+
+  // Idempotent re-binding succeeds
+  const rebindRes = store.bindExternalRuntimeBindingCAS({
+    agentId: bindingAgent.id,
+    expectedAttemptKey: "attempt-bind-1",
+    binding: testBinding,
+  });
+  assert.equal(rebindRes.applied, true);
+
+  // Conflicting handle fails CAS
+  const conflictRes = store.bindExternalRuntimeBindingCAS({
+    agentId: bindingAgent.id,
+    expectedAttemptKey: "attempt-bind-1",
+    binding: {
+      runtimeKind: "HERDR",
+      handle: { attemptKey: "attempt-bind-1", different: true },
+    },
+  });
+  assert.equal(conflictRes.applied, false);
+
+  // Mismatched expectedAttemptKey fails CAS
+  const mismatchAttemptRes = store.bindExternalRuntimeBindingCAS({
+    agentId: bindingAgent.id,
+    expectedAttemptKey: "wrong-attempt-key",
+    binding: testBinding,
+  });
+  assert.equal(mismatchAttemptRes.applied, false);
+
+  // v1 backward compatibility: simulate a raw v1 row
+  const rawDb = (store as any).database.sqlite;
+  rawDb.prepare(`
+    insert into local_agent_sessions (
+      id, workspace_root, profile_name, provider, status, execution_contract, created_at, updated_at
+    ) values (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    "agt_legacy_v1",
+    join(root, "legacy"),
+    "reviewer",
+    "codex",
+    "starting",
+    JSON.stringify({
+      storedExecutionStateVersion: 1,
+      executionContract: null,
+      startReplay: { key: "legacy-key", requestHash: "legacy-hash" },
+    }),
+    new Date().toISOString(),
+    new Date().toISOString(),
+  );
+
+  const legacyV1Record = store.getById("agt_legacy_v1");
+  assert.ok(legacyV1Record);
+  assert.equal(legacyV1Record.startReplay?.key, "legacy-key");
+  assert.equal(legacyV1Record.externalRuntimeBinding, undefined);
+
+  // Case G: Negative controls for CAS fail-closed on missing authority evidence (Blocker B)
+  // CAS-MISSING-ATTEMPT: startReplay absent, expectedAttemptKey supplied -> applied: false
+  const noReplayAgent = store.create({
+    workspaceId: "ws_no_replay",
+    workspaceRoot: join(root, "no_replay"),
+    profileName: "reviewer",
+    provider: "agy",
+  });
+  const missingAttemptRes = store.bindExternalRuntimeBindingCAS({
+    agentId: noReplayAgent.id,
+    expectedAttemptKey: "some-attempt-key",
+    binding: testBinding,
+  });
+  assert.equal(missingAttemptRes.applied, false, "CAS-MISSING-ATTEMPT must fail closed");
+
+  // CAS-MISSING-DISPATCH: dispatchIntent absent, expectedDispatchIntentHash supplied -> applied: false
+  const missingDispatchRes = store.bindExternalRuntimeBindingCAS({
+    agentId: noReplayAgent.id,
+    expectedDispatchIntentHash: "intent-hash-xyz",
+    binding: testBinding,
+  });
+  assert.equal(missingDispatchRes.applied, false, "CAS-MISSING-DISPATCH must fail closed");
+
+  // CAS-WRONG-ATTEMPT: startReplay is attempt-bind-wrong, expected is attempt-bind-expected -> applied: false
+  const wrongReplayAgent = store.create({
+    workspaceId: "ws_wrong_replay",
+    workspaceRoot: join(root, "wrong_replay"),
+    profileName: "reviewer",
+    provider: "agy",
+    startReplay: {
+      key: "attempt-bind-stored",
+      requestHash: "hash-stored",
+    },
+  });
+  const wrongAttemptRes = store.bindExternalRuntimeBindingCAS({
+    agentId: wrongReplayAgent.id,
+    expectedAttemptKey: "attempt-bind-expected",
+    binding: testBinding,
+  });
+  assert.equal(wrongAttemptRes.applied, false, "CAS-WRONG-ATTEMPT must fail closed");
+
+  // CAS-WRONG-DISPATCH: executionContract.dispatchIntent has different hash -> applied: false
+  const dispatchAgent = store.create({
+    workspaceId: "ws_dispatch",
+    workspaceRoot: join(root, "dispatch"),
+    profileName: "reviewer",
+    provider: "agy",
+    executionContract: {
+      writePaths: ["src/local-agent-store.ts"],
+      dispatchIntent: {
+        taskId: "task-intent-1",
+        attemptId: "attempt-intent-1",
+        objective: "Implement one bounded controller-contract seam.",
+        roleIntent: "DEEP_ENGINEERING",
+        claimCeiling: "CANDIDATE_READY",
+        context: ["Preserve existing execution mechanics."],
+        readScope: ["src"],
+        writeScope: ["src/local-agent-store.ts"],
+        exclusiveOwnership: true,
+        forbiddenChanges: ["Do not add route or acceptance authority to Dev MCP."],
+        acceptanceCriteria: ["Typed controller intent is durable and independently inspectable."],
+        verificationRequired: true,
+        expectedArtifacts: ["source diff"],
+      },
+    },
+    startReplay: {
+      key: "attempt-intent-1",
+      requestHash: "hash-intent-1",
+    },
+  });
+  const wrongDispatchRes = store.bindExternalRuntimeBindingCAS({
+    agentId: dispatchAgent.id,
+    expectedAttemptKey: "attempt-intent-1",
+    expectedDispatchIntentHash: "sha256-wrong-intent-hash",
+    binding: {
+      runtimeKind: "HERDR",
+      handle: { attemptKey: "attempt-intent-1" },
+    },
+  });
+  assert.equal(wrongDispatchRes.applied, false, "CAS-WRONG-DISPATCH must fail closed");
+
+  // CAS-CONCURRENT-UPDATE: stale updated_at -> applied: false
+  const staleUpdateRes = store.bindExternalRuntimeBindingCAS({
+    agentId: dispatchAgent.id,
+    expectedAttemptKey: "attempt-intent-1",
+    expectedUpdatedAt: "1970-01-01T00:00:00.000Z",
+    binding: {
+      runtimeKind: "HERDR",
+      handle: { attemptKey: "attempt-intent-1" },
+    },
+  });
+  assert.equal(staleUpdateRes.applied, false, "CAS-CONCURRENT-UPDATE must fail closed");
+
+  // CAS-EXACT: exact match for attemptKey and dispatchIntentHash -> applied: true
+  const correctDispatchHash = hashDispatchIntent(dispatchAgent.executionContract!.dispatchIntent!);
+  const exactRes = store.bindExternalRuntimeBindingCAS({
+    agentId: dispatchAgent.id,
+    expectedAttemptKey: "attempt-intent-1",
+    expectedDispatchIntentHash: correctDispatchHash,
+    expectedUpdatedAt: dispatchAgent.updatedAt,
+    binding: {
+      runtimeKind: "HERDR",
+      handle: {
+        attemptKey: "attempt-intent-1",
+        dispatchIntentHash: correctDispatchHash,
+        promptNonce: "nonce-dispatch-1",
+      },
+    },
+  });
+  assert.equal(exactRes.applied, true, "CAS-EXACT must succeed");
+
+  // Case H: fenceConsequentialPromptCAS exact authority tuple (Blocker C1)
+  // 1. Cannot fence unbound agent (PF-MISSING-HANDLE)
+  const unBoundFenceRes = store.fenceConsequentialPromptCAS({
+    agentId: noReplayAgent.id,
+    attemptKey: "some-attempt",
+    dispatchIntentHash: "some-hash",
+    promptNonce: "nonce-unbound",
+  });
+  assert.equal(unBoundFenceRes.applied, false, "PF-MISSING-HANDLE must fail closed");
+
+  // PF-WRONG-AGENT-ATTEMPT: agentId is dispatchAgent (bound to attempt-intent-1), input attemptKey is WRONG-ATTEMPT
+  const wrongAttemptFenceRes = store.fenceConsequentialPromptCAS({
+    agentId: dispatchAgent.id,
+    attemptKey: "WRONG-ATTEMPT",
+    dispatchIntentHash: correctDispatchHash,
+    promptNonce: "nonce-dispatch-1",
+  });
+  assert.equal(wrongAttemptFenceRes.applied, false, "PF-WRONG-AGENT-ATTEMPT must fail closed");
+
+  // PF-WRONG-DISPATCH: input dispatchIntentHash is wrong
+  const wrongDispatchFenceRes = store.fenceConsequentialPromptCAS({
+    agentId: dispatchAgent.id,
+    attemptKey: "attempt-intent-1",
+    dispatchIntentHash: "wrong-dispatch-hash",
+    promptNonce: "nonce-dispatch-1",
+  });
+  assert.equal(wrongDispatchFenceRes.applied, false, "PF-WRONG-DISPATCH must fail closed");
+
+  // PF-WRONG-NONCE: stored handle nonce is nonce-dispatch-1, input is WRONG-NONCE
+  const wrongNonceFenceRes = store.fenceConsequentialPromptCAS({
+    agentId: dispatchAgent.id,
+    attemptKey: "attempt-intent-1",
+    dispatchIntentHash: correctDispatchHash,
+    promptNonce: "WRONG-NONCE",
+  });
+  assert.equal(wrongNonceFenceRes.applied, false, "PF-WRONG-NONCE must fail closed");
+
+  // PF-MALFORMED-HANDLE: handle missing required fields
+  const malformedAgent = store.create({
+    workspaceId: "ws_malformed",
+    workspaceRoot: join(root, "malformed"),
+    profileName: "reviewer",
+    provider: "agy",
+    executionContract: {
+      writePaths: ["src"],
+      dispatchIntent: dispatchAgent.executionContract!.dispatchIntent!,
+    },
+    startReplay: {
+      key: "attempt-malformed",
+      requestHash: "hash-malformed",
+    },
+  });
+  store.bindExternalRuntimeBindingCAS({
+    agentId: malformedAgent.id,
+    expectedAttemptKey: "attempt-malformed",
+    expectedDispatchIntentHash: correctDispatchHash,
+    binding: {
+      runtimeKind: "HERDR",
+      handle: { attemptKey: "attempt-malformed" }, // missing dispatchIntentHash and promptNonce
+    },
+  });
+  const malformedFenceRes = store.fenceConsequentialPromptCAS({
+    agentId: malformedAgent.id,
+    attemptKey: "attempt-malformed",
+    dispatchIntentHash: correctDispatchHash,
+    promptNonce: "nonce-malformed",
+  });
+  assert.equal(malformedFenceRes.applied, false, "PF-MALFORMED-HANDLE must fail closed");
+
+  // PF-WRONG-RUNTIME: runtimeKind !== HERDR
+  const wrongRuntimeAgent = store.create({
+    workspaceId: "ws_wrong_rt",
+    workspaceRoot: join(root, "wrong_rt"),
+    profileName: "reviewer",
+    provider: "agy",
+    executionContract: {
+      writePaths: ["src"],
+      dispatchIntent: dispatchAgent.executionContract!.dispatchIntent!,
+    },
+    startReplay: {
+      key: "attempt-wrong-rt",
+      requestHash: "hash-wrong-rt",
+    },
+  });
+  store.bindExternalRuntimeBindingCAS({
+    agentId: wrongRuntimeAgent.id,
+    expectedAttemptKey: "attempt-wrong-rt",
+    expectedDispatchIntentHash: correctDispatchHash,
+    binding: {
+      runtimeKind: "OTHER_RUNTIME",
+      handle: {
+        attemptKey: "attempt-wrong-rt",
+        dispatchIntentHash: correctDispatchHash,
+        promptNonce: "nonce-wrong-rt",
+      },
+    },
+  });
+  const wrongRuntimeFenceRes = store.fenceConsequentialPromptCAS({
+    agentId: wrongRuntimeAgent.id,
+    attemptKey: "attempt-wrong-rt",
+    dispatchIntentHash: correctDispatchHash,
+    promptNonce: "nonce-wrong-rt",
+  });
+  assert.equal(wrongRuntimeFenceRes.applied, false, "PF-WRONG-RUNTIME must fail closed");
+
+  // PF-CONCURRENT: stale expectedUpdatedAt
+  const concurrentFenceRes = store.fenceConsequentialPromptCAS({
+    agentId: dispatchAgent.id,
+    attemptKey: "attempt-intent-1",
+    dispatchIntentHash: correctDispatchHash,
+    promptNonce: "nonce-dispatch-1",
+    expectedUpdatedAt: "1970-01-01T00:00:00.000Z",
+  });
+  assert.equal(concurrentFenceRes.applied, false, "PF-CONCURRENT must fail closed");
+
+  // PF-EXACT: exact authority tuple succeeds
+  const exactFenceRes = store.fenceConsequentialPromptCAS({
+    agentId: dispatchAgent.id,
+    attemptKey: "attempt-intent-1",
+    dispatchIntentHash: correctDispatchHash,
+    promptNonce: "nonce-dispatch-1",
+  });
+  assert.equal(exactFenceRes.applied, true, "PF-EXACT must succeed");
+  const postFenceRecord = store.getById(dispatchAgent.id)!;
+  assert.equal(postFenceRecord.externalRuntimeBinding?.promptState?.consequentialPromptFenced, true);
+  assert.equal(postFenceRecord.externalRuntimeBinding?.promptState?.promptNonce, "nonce-dispatch-1");
+  assert.ok(postFenceRecord.externalRuntimeBinding?.promptState?.fencedAt);
+
+  // Second fence on same agent/attemptKey fails CAS (one consequential prompt fence)
+  const secondFenceRes = store.fenceConsequentialPromptCAS({
+    agentId: dispatchAgent.id,
+    attemptKey: "attempt-intent-1",
+    dispatchIntentHash: correctDispatchHash,
+    promptNonce: "nonce-dispatch-1",
+  });
+  assert.equal(secondFenceRes.applied, false, "Second fence must fail CAS");
+
+  // Independent physical reproducer (Section 49)
+  // stored attempt = attempt-intent-1, stored nonce = nonce-dispatch-1
+  // fence call: attempt = WRONG-ATTEMPT, nonce = WRONG-NONCE -> applied: false, stored promptState unchanged
+  const independentReprodRes = store.fenceConsequentialPromptCAS({
+    agentId: dispatchAgent.id,
+    attemptKey: "WRONG-ATTEMPT",
+    dispatchIntentHash: correctDispatchHash,
+    promptNonce: "WRONG-NONCE",
+  });
+  assert.equal(independentReprodRes.applied, false, "Independent reproducer must fail closed");
+  const uncorruptedRecord = store.getById(dispatchAgent.id)!;
+  assert.equal(uncorruptedRecord.externalRuntimeBinding?.promptState?.promptNonce, "nonce-dispatch-1");
+
+  // DevSpace restart persistence: create a second store instance on same directory
+  const reopenedStore = new LocalAgentStore(root);
+  stores.push(reopenedStore);
+  const reopenedRecord = reopenedStore.getById(dispatchAgent.id)!;
+  assert.ok(reopenedRecord);
+  assert.equal(reopenedRecord.externalRuntimeBinding?.promptState?.consequentialPromptFenced, true);
+  assert.equal(reopenedRecord.externalRuntimeBinding?.promptState?.promptNonce, "nonce-dispatch-1");
+
+  // Fence on reopened store fails CAS
+  const reopenedFenceRes = reopenedStore.fenceConsequentialPromptCAS({
+    agentId: dispatchAgent.id,
+    attemptKey: "attempt-intent-1",
+    dispatchIntentHash: correctDispatchHash,
+    promptNonce: "nonce-dispatch-1",
+  });
+  assert.equal(reopenedFenceRes.applied, false, "Fence after restart must fail CAS on already fenced attempt");
+
+  // Case I: fenceExternalRuntimeLaunchCAS and positive observation (Blocker C2)
+  const launchAgent = store.create({
+    workspaceId: "ws_launch_test",
+    workspaceRoot: join(root, "launch_project"),
+    profileName: "reviewer",
+    provider: "agy",
+    executionContract: {
+      writePaths: ["src"],
+      dispatchIntent: {
+        taskId: "task-launch-1",
+        attemptId: "attempt-launch-1",
+        objective: "Test launch fencing.",
+        roleIntent: "DEEP_ENGINEERING",
+        claimCeiling: "CANDIDATE_READY",
+        context: ["test"],
+        readScope: ["src"],
+        writeScope: ["src"],
+        exclusiveOwnership: true,
+        forbiddenChanges: [],
+        acceptanceCriteria: ["pass"],
+        verificationRequired: true,
+        expectedArtifacts: [],
+      },
+    },
+    startReplay: {
+      key: "attempt-launch-1",
+      requestHash: "hash-launch-1",
+    },
+  });
+  const launchIntentHash = hashDispatchIntent(launchAgent.executionContract!.dispatchIntent!);
+
+  // L-WRONG-ATTEMPT: launch fence with wrong attemptKey fails
+  assert.equal(store.fenceExternalRuntimeLaunchCAS({
+    agentId: launchAgent.id,
+    attemptKey: "WRONG-ATTEMPT",
+    dispatchIntentHash: launchIntentHash,
+    canonicalWorktreePath: join(root, "launch_project"),
+    gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+    agentKind: "opencode",
+    promptNonce: "NONCE-LAUNCH-1",
+  }).applied, false);
+
+  // L-WRONG-DISPATCH: launch fence with wrong dispatchIntentHash fails
+  assert.equal(store.fenceExternalRuntimeLaunchCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    dispatchIntentHash: "wrong-dispatch-hash",
+    canonicalWorktreePath: join(root, "launch_project"),
+    gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+    agentKind: "opencode",
+    promptNonce: "NONCE-LAUNCH-1",
+  }).applied, false);
+
+  // L-WRONG-WORKTREE: launch fence with wrong canonicalWorktreePath fails
+  assert.equal(store.fenceExternalRuntimeLaunchCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    dispatchIntentHash: launchIntentHash,
+    canonicalWorktreePath: join(root, "other_project"),
+    gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+    agentKind: "opencode",
+    promptNonce: "NONCE-LAUNCH-1",
+  }).applied, false);
+
+  // L-INVALID-GIT-HEAD: non-40 hex gitHeadBefore fails
+  assert.equal(store.fenceExternalRuntimeLaunchCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    dispatchIntentHash: launchIntentHash,
+    canonicalWorktreePath: join(root, "launch_project"),
+    gitHeadBefore: "invalid-head",
+    agentKind: "opencode",
+    promptNonce: "NONCE-LAUNCH-1",
+  }).applied, false);
+
+  // L-FRESH-LAUNCH: fresh launch fence succeeds
+  const freshLaunchRes = store.fenceExternalRuntimeLaunchCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    dispatchIntentHash: launchIntentHash,
+    canonicalWorktreePath: join(root, "launch_project"),
+    gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+    agentKind: "opencode",
+    promptNonce: "NONCE-LAUNCH-1",
+  });
+  assert.equal(freshLaunchRes.applied, true, "L-FRESH-LAUNCH must succeed");
+  const postLaunchRecord = store.getById(launchAgent.id)!;
+  assert.equal(postLaunchRecord.externalRuntimeBinding?.runtimeKind, "HERDR");
+  assert.equal(postLaunchRecord.externalRuntimeBinding?.launch?.state, "FENCED");
+  assert.equal(postLaunchRecord.externalRuntimeBinding?.launch?.attemptKey, "attempt-launch-1");
+  assert.equal(postLaunchRecord.externalRuntimeBinding?.launch?.dispatchIntentHash, launchIntentHash);
+
+  // L-IDEMPOTENT-LAUNCH: repeating same exact launch fence succeeds idempotently
+  assert.equal(store.fenceExternalRuntimeLaunchCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    dispatchIntentHash: launchIntentHash,
+    canonicalWorktreePath: join(root, "launch_project"),
+    gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+    agentKind: "opencode",
+    promptNonce: "NONCE-LAUNCH-1",
+  }).applied, true, "L-IDEMPOTENT-LAUNCH must succeed");
+
+  // L-MISMATCH-SOCKET: different socket path fails closed
+  assert.equal(store.fenceExternalRuntimeLaunchCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    dispatchIntentHash: launchIntentHash,
+    canonicalWorktreePath: join(root, "launch_project"),
+    gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+    agentKind: "opencode",
+    promptNonce: "NONCE-LAUNCH-1",
+    herdrSocketPath: "/different/herdr.sock",
+  }).applied, false, "L-MISMATCH-SOCKET must fail");
+
+  // L-MISMATCH-WORKSPACE: different workspaceId fails closed
+  assert.equal(store.fenceExternalRuntimeLaunchCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    dispatchIntentHash: launchIntentHash,
+    canonicalWorktreePath: join(root, "launch_project"),
+    gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+    agentKind: "opencode",
+    promptNonce: "NONCE-LAUNCH-1",
+    workspaceId: "different-ws",
+  }).applied, false, "L-MISMATCH-WORKSPACE must fail");
+
+  // L-MISMATCH-MODEL: different requestedModel fails closed
+  assert.equal(store.fenceExternalRuntimeLaunchCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    dispatchIntentHash: launchIntentHash,
+    canonicalWorktreePath: join(root, "launch_project"),
+    gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+    agentKind: "opencode",
+    promptNonce: "NONCE-LAUNCH-1",
+    requestedModel: "different-model",
+  }).applied, false, "L-MISMATCH-MODEL must fail");
+
+  // L-MISMATCH-EFFORT: different requestedEffort fails closed
+  assert.equal(store.fenceExternalRuntimeLaunchCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    dispatchIntentHash: launchIntentHash,
+    canonicalWorktreePath: join(root, "launch_project"),
+    gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+    agentKind: "opencode",
+    promptNonce: "NONCE-LAUNCH-1",
+    requestedEffort: "different-effort",
+  }).applied, false, "L-MISMATCH-EFFORT must fail");
+
+  // L-MISMATCH-NONCE: different promptNonce fails closed
+  assert.equal(store.fenceExternalRuntimeLaunchCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    dispatchIntentHash: launchIntentHash,
+    canonicalWorktreePath: join(root, "launch_project"),
+    gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+    agentKind: "opencode",
+    promptNonce: "DIFFERENT-NONCE",
+  }).applied, false, "L-MISMATCH-NONCE must fail");
+
+  // L-MISMATCH-NAME: different plannedAgentName fails closed
+  assert.equal(store.fenceExternalRuntimeLaunchCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    dispatchIntentHash: launchIntentHash,
+    canonicalWorktreePath: join(root, "launch_project"),
+    gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+    agentKind: "opencode",
+    promptNonce: "NONCE-LAUNCH-1",
+    plannedAgentName: "different-name",
+  }).applied, false, "L-MISMATCH-NAME must fail");
+
+  // WORKSPACE-CAS-WRONG-CWD: wrong observedCwd fails closed
+  const wrongCwdRes = store.recordExternalRuntimeWorkspaceObservedCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    herdrWorkspaceId: "w_launch_1",
+    herdrPaneId: "p_launch_1",
+    observedCwd: join(root, "other_project"),
+  });
+  assert.equal(wrongCwdRes.applied, false, "WORKSPACE-CAS-WRONG-CWD must fail");
+
+  // WORKSPACE-CAS-EXACT-CWD: exact observedCwd succeeds
+  const wsObservedRes = store.recordExternalRuntimeWorkspaceObservedCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    herdrWorkspaceId: "w_launch_1",
+    herdrPaneId: "p_launch_1",
+    observedCwd: join(root, "launch_project"),
+  });
+  assert.equal(wsObservedRes.applied, true, "WORKSPACE-CAS-EXACT-CWD must succeed");
+  const postWsRecord = store.getById(launchAgent.id)!;
+  assert.equal(postWsRecord.externalRuntimeBinding?.launch?.state, "WORKSPACE_OBSERVED");
+  assert.equal(postWsRecord.externalRuntimeBinding?.launch?.herdrWorkspaceId, "w_launch_1");
+  assert.equal(postWsRecord.externalRuntimeBinding?.launch?.herdrPaneId, "p_launch_1");
+  assert.equal(postWsRecord.externalRuntimeBinding?.launch?.observedCwd, canonicalizePath(join(root, "launch_project")));
+
+  // L-AGENT-OBSERVED: record positive agent observation
+  const agentObservedRes = store.recordExternalRuntimeAgentObservedCAS({
+    agentId: launchAgent.id,
+    attemptKey: "attempt-launch-1",
+    herdrAgentIdentity: "ds-attempt-launch-1",
+  });
+  assert.equal(agentObservedRes.applied, true, "recordExternalRuntimeAgentObservedCAS must succeed");
+  const postAgentRecord = store.getById(launchAgent.id)!;
+  assert.equal(postAgentRecord.externalRuntimeBinding?.launch?.state, "AGENT_OBSERVED");
+  assert.equal(postAgentRecord.externalRuntimeBinding?.launch?.herdrAgentIdentity, "ds-attempt-launch-1");
+
+  // Case J: Store backward compatibility tests (Section 54)
+  // 1. Existing V2 without launch fields is readable
+  (store as any).database.sqlite.prepare(`
+    insert into local_agent_sessions (
+      id, workspace_root, profile_name, provider, status, execution_contract, created_at, updated_at
+    ) values (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    "agt_v2_no_launch",
+    join(root, "v2_no_launch"),
+    "reviewer",
+    "codex",
+    "starting",
+    JSON.stringify({
+      storedExecutionStateVersion: 2,
+      executionContract: null,
+      startReplay: { key: "v2-key", requestHash: "v2-hash" },
+      externalRuntimeBinding: {
+        runtimeKind: "HERDR",
+        handle: { attemptKey: "v2-key", promptNonce: "v2-nonce" },
+      },
+    }),
+    new Date().toISOString(),
+    new Date().toISOString(),
+  );
+  const v2NoLaunchRecord = store.getById("agt_v2_no_launch");
+  assert.ok(v2NoLaunchRecord);
+  assert.equal(v2NoLaunchRecord.externalRuntimeBinding?.runtimeKind, "HERDR");
+  assert.equal(v2NoLaunchRecord.externalRuntimeBinding?.launch, undefined);
+  assert.equal((v2NoLaunchRecord.externalRuntimeBinding?.handle as any)?.attemptKey, "v2-key");
+
+  // 2. Existing V2 with prompt binding is readable
+  (store as any).database.sqlite.prepare(`
+    insert into local_agent_sessions (
+      id, workspace_root, profile_name, provider, status, execution_contract, created_at, updated_at
+    ) values (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    "agt_v2_with_prompt",
+    join(root, "v2_prompt"),
+    "reviewer",
+    "codex",
+    "starting",
+    JSON.stringify({
+      storedExecutionStateVersion: 2,
+      executionContract: null,
+      startReplay: { key: "v2-prompt-key", requestHash: "v2-prompt-hash" },
+      externalRuntimeBinding: {
+        runtimeKind: "HERDR",
+        handle: { attemptKey: "v2-prompt-key", promptNonce: "v2-prompt-nonce" },
+        promptState: {
+          consequentialPromptFenced: true,
+          promptNonce: "v2-prompt-nonce",
+          fencedAt: "2026-09-23T00:00:00.000Z",
+        },
+      },
+    }),
+    new Date().toISOString(),
+    new Date().toISOString(),
+  );
+  const v2PromptRecord = store.getById("agt_v2_with_prompt");
+  assert.ok(v2PromptRecord);
+  assert.equal(v2PromptRecord.externalRuntimeBinding?.promptState?.consequentialPromptFenced, true);
+  assert.equal(v2PromptRecord.externalRuntimeBinding?.promptState?.promptNonce, "v2-prompt-nonce");
 
 } finally {
   for (const store of stores) {

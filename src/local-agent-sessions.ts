@@ -85,6 +85,13 @@ import {
   readWorkspaceHead,
   type WorkerAttribution,
 } from "./workspace-reconciliation.js";
+import {
+  type HerdrExternalHandle,
+  HerdrThinGateway,
+  defaultHerdrGatewayRegistry,
+  HERDR_RUNTIME_KIND,
+  HERDR_DEFAULT_SOCKET_PATH,
+} from "./local-agent-herdr.js";
 
 function catalogSnapshotIsFresh(fetchedAt: string | undefined, expiresAt: string | undefined): boolean {
   const fetched = Date.parse(fetchedAt ?? "");
@@ -266,6 +273,7 @@ export interface AgentStatusOutput {
     blocked?: boolean;
     reason?: string;
   };
+  herdrHandle?: HerdrExternalHandle;
 }
 
 export interface ReconcileAgentInput {
@@ -277,6 +285,7 @@ export interface ReconcileAgentInput {
 
 export interface ReconcileAgentOutput {
   agentId: string;
+  herdrHandle?: HerdrExternalHandle;
   dispatch?: DispatchContractOutput;
   agentState: LocalAgentStatus;
   providerState?: string;
@@ -427,6 +436,7 @@ export interface StartAgentOutput {
   createdAt: string;
   updatedAt: string;
   executionIdlePolicy?: EffectiveExecutionIdlePolicy;
+  herdrHandle?: HerdrExternalHandle;
 }
 
 export interface ContinueAgentOutput extends StartAgentOutput {
@@ -497,6 +507,8 @@ export class LocalAgentSessionManager {
   private readonly clineCatalogService?: ClineCatalogService;
   private readonly opencodeCatalogSource: ReturnType<typeof createMcpOpencodeCatalogSource>;
   private readonly ownsOpencodeCatalogSource: boolean;
+  private readonly herdrGateway: HerdrThinGateway;
+  private readonly herdrHandles = new Map<string, HerdrExternalHandle>();
   private closed = false;
   private readonly terminationAttempts = new Map<string, Promise<boolean>>();
 
@@ -509,6 +521,7 @@ export class LocalAgentSessionManager {
     nexusGrantResolver?: NexusGrantResolver,
     clineCatalogService?: ClineCatalogService,
     opencodeCatalogSource?: ReturnType<typeof createMcpOpencodeCatalogSource>,
+    herdrGateway?: HerdrThinGateway,
   ) {
     this.store = createLocalAgentStore(config.stateDir);
     this.launcher = testLauncher ?? defaultWorkerLauncher;
@@ -518,6 +531,7 @@ export class LocalAgentSessionManager {
     this.clineCatalogService = clineCatalogService ?? new ClineCatalogServiceImpl();
     this.opencodeCatalogSource = opencodeCatalogSource ?? createMcpOpencodeCatalogSource();
     this.ownsOpencodeCatalogSource = opencodeCatalogSource === undefined;
+    this.herdrGateway = herdrGateway ?? new HerdrThinGateway(HERDR_DEFAULT_SOCKET_PATH, defaultHerdrGatewayRegistry, this.store);
     this.runtimeBuildIdentity = runtimeBuildIdentity ?? describeRuntimeBuildIdentity({
       env: process.env,
       listenPort: config.port,
@@ -533,6 +547,122 @@ export class LocalAgentSessionManager {
     this.closed = true;
     this.store.close();
     if (this.ownsOpencodeCatalogSource) this.opencodeCatalogSource.close();
+  }
+
+
+  /**
+   * Bind an immutable HerdrExternalHandle to an active agent record.
+   * Enforces N1 (duplicate prevention), N2 (conflicting replay prevention),
+   * and N8 (REQUEST_ONLY_NOT_ENFORCED).
+   * Enforces B1 (provider_session_id remains native provider identity)
+   * and B2 (first-class store CAS persistence without private DB bypass).
+   */
+  bindHerdrExternalHandle(agentId: string, handle: HerdrExternalHandle): void {
+    const record = this.store.getById(agentId);
+    if (!record) {
+      throw new AgentSessionError("UNKNOWN_AGENT", `Unknown agent id: ${agentId}`);
+    }
+    if (record.startReplay?.key && record.startReplay.key !== handle.attemptKey) {
+      throw new AgentSessionError(
+        "ATTEMPT_REPLAY_CONFLICT",
+        `Cannot bind handle with attemptKey '${handle.attemptKey}' to agent ${agentId} bound to attemptKey '${record.startReplay.key}'`,
+      );
+    }
+    if ((handle.enforcementState as string) === "PHYSICALLY_ENFORCED") {
+      throw new AgentSessionError(
+        "INVALID_EXECUTION_CONTRACT",
+        `HerdR runtime handle cannot claim PHYSICALLY_ENFORCED; enforcement state must be REQUEST_ONLY_NOT_ENFORCED`,
+      );
+    }
+
+    handle.agentId = agentId;
+
+    // B1 / B2: Durable persistence via store CAS. Fail closed if CAS fails.
+    const existingLaunch = record.externalRuntimeBinding?.launch;
+    const cas = this.store.bindExternalRuntimeBindingCAS({
+      agentId,
+      expectedAttemptKey: handle.attemptKey,
+      expectedDispatchIntentHash: handle.dispatchIntentHash,
+      expectedUpdatedAt: record.updatedAt,
+      binding: {
+        runtimeKind: HERDR_RUNTIME_KIND,
+        launch: existingLaunch ?? {
+          state: "AGENT_OBSERVED",
+          launchRequestId: `HERDR-LAUNCH:${handle.attemptKey}:${handle.dispatchIntentHash.slice(0, 16)}`,
+          attemptKey: handle.attemptKey,
+          dispatchIntentHash: handle.dispatchIntentHash,
+          canonicalWorktreePath: handle.canonicalWorktreePath,
+          gitHeadBefore: handle.gitHeadBefore,
+          agentKind: handle.herdrAgentKind,
+          herdrSocketPath: handle.herdrSocketPath,
+          promptNonce: handle.promptNonce,
+          herdrWorkspaceId: handle.herdrWorkspaceId,
+          herdrPaneId: handle.herdrPaneId,
+          herdrAgentIdentity: handle.herdrAgentIdentity,
+          fencedAt: handle.launchTimestamp,
+        },
+        handle: handle as unknown as Record<string, unknown>,
+      },
+    });
+
+    if (!cas.applied) {
+      throw new AgentSessionError(
+        "ATTEMPT_REPLAY_CONFLICT",
+        `Failed to bind external runtime handle to agent ${agentId} due to durable CAS mismatch.`,
+      );
+    }
+
+    defaultHerdrGatewayRegistry.registerHandle(handle);
+    this.herdrHandles.set(agentId, handle);
+    this.herdrHandles.set(handle.attemptKey, handle);
+  }
+
+  /**
+   * Retrieve a bound HerdrExternalHandle by agentId or attemptKey.
+   * Enforces B1 / B2: re-hydrates from durable store record externalRuntimeBinding if absent in memory.
+   * Enforces Option A / Blocker A: rehydrates durable promptState into gateway registry.
+   */
+  getHerdrExternalHandle(agentIdOrAttemptKey: string): HerdrExternalHandle | undefined {
+    // 1. Check in-memory map
+    const inMem = this.herdrHandles.get(agentIdOrAttemptKey);
+    if (inMem) return inMem;
+
+    // 2. Recover from durable store record externalRuntimeBinding
+    const extractHerdrHandle = (rec: LocalAgentRecord | undefined): HerdrExternalHandle | undefined => {
+      if (!rec?.externalRuntimeBinding) return undefined;
+      const { runtimeKind, handle } = rec.externalRuntimeBinding;
+      if (runtimeKind === HERDR_RUNTIME_KIND && handle && typeof handle === "object" && handle.attemptKey) {
+        return handle as unknown as HerdrExternalHandle;
+      }
+      return undefined;
+    };
+
+    let rec = this.store.getById(agentIdOrAttemptKey);
+    let handle = extractHerdrHandle(rec);
+
+    if (!handle) {
+      const records = this.store.list();
+      const match = records.find(
+        (r) => r.startReplay?.key === agentIdOrAttemptKey || r.id === agentIdOrAttemptKey,
+      );
+      if (match) {
+        rec = match;
+        handle = extractHerdrHandle(match);
+      }
+    }
+
+    if (handle) {
+      if (rec?.id) handle.agentId = rec.id;
+      defaultHerdrGatewayRegistry.registerHandle(handle);
+      if (rec?.externalRuntimeBinding?.promptState?.consequentialPromptFenced) {
+        defaultHerdrGatewayRegistry.markPromptSubmitted(handle.attemptKey);
+      }
+      if (rec) this.herdrHandles.set(rec.id, handle);
+      this.herdrHandles.set(handle.attemptKey, handle);
+      return handle;
+    }
+
+    return undefined;
   }
 
   /**
@@ -582,7 +712,10 @@ export class LocalAgentSessionManager {
     if (replayBinding) {
       try {
         const replay = this.store.resolveStartReplay(workspaceRoot, replayBinding);
-        if (replay) return recordToStartOutput(replay);
+        if (replay) {
+          const herdrHandle = attemptKey ? this.getHerdrExternalHandle(attemptKey) : this.getHerdrExternalHandle(replay.id);
+          return recordToStartOutput(replay, herdrHandle);
+        }
       } catch (error) {
         if (error instanceof LocalAgentReplayConflictError) {
           throw new AgentSessionError(
@@ -735,7 +868,8 @@ export class LocalAgentSessionManager {
     }
 
     if (created) await this.launchPrompt(record.id, bindDispatchIntentToPrompt(record.executionContract?.dispatchIntent, prompt));
-    return recordToStartOutput(this.store.getById(record.id) ?? record);
+    const herdrHandle = attemptKey ? this.getHerdrExternalHandle(attemptKey) : this.getHerdrExternalHandle(record.id);
+    return recordToStartOutput(this.store.getById(record.id) ?? record, herdrHandle);
   }
 
   private async assertExecutionAuthority(profileName: string, contract: ExecutionContract | undefined): Promise<AuthorityValidationEvidence> {
@@ -1066,7 +1200,8 @@ export class LocalAgentSessionManager {
       }
     }
 
-    return recordToStatusOutput(record, await this.buildLifecycleEvidence(record));
+    const herdrHandle = this.getHerdrExternalHandle(agentId) ?? (record.startReplay?.key ? this.getHerdrExternalHandle(record.startReplay.key) : undefined);
+    return recordToStatusOutput(record, await this.buildLifecycleEvidence(record), herdrHandle);
   }
 
   async cancelAgent(input: CancelAgentInput): Promise<AgentStatusOutput> {
@@ -1081,6 +1216,8 @@ export class LocalAgentSessionManager {
         `Agent ${agentId} belongs to workspace root '${record.workspaceRoot}', not '${workspaceRoot}'`,
       );
     }
+
+    const herdrHandle = this.getHerdrExternalHandle(agentId) ?? (record.startReplay?.key ? this.getHerdrExternalHandle(record.startReplay.key) : undefined);
 
     if (!isDetachedLifecycle(record.lifecycleState) && isActiveStatus(record.status)) {
       record = this.store.reconcileLegacyDetachedActiveCAS(agentId).current ?? record;
@@ -1098,7 +1235,7 @@ export class LocalAgentSessionManager {
       );
     }
     if (!isActiveStatus(record.status) && !record.lifecycleState?.terminationPending) {
-      return recordToStatusOutput(record);
+      return recordToStatusOutput(record, undefined, herdrHandle);
     }
     const terminated = await this.terminateActiveAgent(
       agentId,
@@ -1115,7 +1252,7 @@ export class LocalAgentSessionManager {
       );
     }
     const current = this.store.getById(agentId) ?? record;
-    return recordToStatusOutput(current);
+    return recordToStatusOutput(current, undefined, herdrHandle);
   }
 
   /**
@@ -1355,9 +1492,11 @@ export class LocalAgentSessionManager {
     );
 
     const timing = computeSessionTiming(record);
+    const herdrHandle = this.getHerdrExternalHandle(record.id) ?? (record.startReplay?.key ? this.getHerdrExternalHandle(record.startReplay.key) : undefined);
 
     return {
       agentId: record.id,
+      herdrHandle,
       dispatch: dispatchContractOutput(record.executionContract?.dispatchIntent),
       agentState: record.status,
       providerState: record.providerContinuityState ?? (record.providerSessionId ? "KNOWN_UNVERIFIED" : "UNKNOWN"),
@@ -2631,7 +2770,7 @@ function workspacePathsOverlap(left: string, right: string): boolean {
   return a === b || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
 }
 
-function recordToStartOutput(record: LocalAgentRecord): StartAgentOutput {
+function recordToStartOutput(record: LocalAgentRecord, herdrHandle?: HerdrExternalHandle): StartAgentOutput {
   const output: StartAgentOutput = {
     agentId: record.id,
     status: record.status,
@@ -2641,6 +2780,7 @@ function recordToStartOutput(record: LocalAgentRecord): StartAgentOutput {
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
   };
+  if (herdrHandle !== undefined) output.herdrHandle = herdrHandle;
   if (record.model !== undefined) output.model = record.model;
   if (record.effort !== undefined) output.effort = record.effort;
   if (record.workspaceId !== undefined) output.workspaceId = record.workspaceId;
@@ -2655,6 +2795,7 @@ function recordToStartOutput(record: LocalAgentRecord): StartAgentOutput {
 function recordToStatusOutput(
   record: LocalAgentRecord,
   lifecycle?: LifecycleEvidence,
+  herdrHandle?: HerdrExternalHandle,
 ): AgentStatusOutput {
   const output: AgentStatusOutput = {
     agentId: record.id,
@@ -2666,6 +2807,7 @@ function recordToStatusOutput(
     createdAt: record.createdAt,
     updatedAt: record.updatedAt,
   };
+  if (herdrHandle !== undefined) output.herdrHandle = herdrHandle;
   if (record.model !== undefined) output.model = record.model;
   if (record.effort !== undefined) output.effort = record.effort;
   if (record.workspaceId !== undefined) output.workspaceId = record.workspaceId;
