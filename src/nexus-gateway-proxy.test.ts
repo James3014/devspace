@@ -8,6 +8,7 @@ import { join } from "node:path";
 import {
   NexusGatewayProxyError,
   createNexusGatewayProxyServer,
+  createPublicCompletionMergeLaneGuard,
   createPublicDirectMergeLaneGuard,
   createPublicNexusIntegrationTargetResolver,
   fetchNexusGatewayToolManifest,
@@ -548,6 +549,34 @@ try {
         (error: unknown) => error instanceof MergePullRequestError
           && error.code === PR_MERGE_ERROR_CODES.MERGE_LANE_NOT_AUTHORIZED,
       );
+      const completionGuard = createPublicCompletionMergeLaneGuard({
+        ...config,
+        nexusCanonicalSourceRoot: root,
+        nexusPythonBin: "python3",
+      } as ServerConfig);
+      await completionGuard({
+        ...baseContext,
+        pullRequest: {
+          number: 1130, state: "OPEN", isDraft: false, baseRefName: "main", baseRefOid: BASE,
+          headRefName: "governed/completion", headRefOid: HEAD, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN",
+          merged: false, mergedAt: null, mergeCommitOid: null, title: "governed completion",
+          url: "https://github.com/James3014/Nexus-new/pull/1130", body: "GOVERNED",
+        },
+      });
+      await assert.rejects(
+        completionGuard({
+          ...baseContext,
+          pullRequest: {
+            number: 1131, state: "OPEN", isDraft: false, baseRefName: "main", baseRefOid: BASE,
+            headRefName: "direct/completion", headRefOid: HEAD, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN",
+            merged: false, mergedAt: null, mergeCommitOid: null, title: "direct completion",
+            url: "https://github.com/James3014/Nexus-new/pull/1131", body: "DIRECT",
+          },
+        }),
+        (error: unknown) => error instanceof MergePullRequestError
+          && error.code === PR_MERGE_ERROR_CODES.MERGE_LANE_NOT_AUTHORIZED,
+      );
+
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
