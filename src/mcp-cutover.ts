@@ -126,6 +126,7 @@ export const CONSEQUENTIAL_MCP_TOOLS = new Set([
   "dependency_sync",
   "workspace_verify",
   "nexus_gateway_recover",
+  "nexus_gateway_recovery_materialize",
   "codex_goal_start",
   "codex_goal_continue",
   "codex_goal_cancel",

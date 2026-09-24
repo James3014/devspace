@@ -28,7 +28,7 @@ import {
   resolveDurableReconciliationWitnessFromInventory,
 } from "./server.js";
 import { CutoverStateStore } from "./cutover-state.js";
-import { McpCutoverController } from "./mcp-cutover.js";
+import { CONSEQUENTIAL_MCP_TOOLS, CUTOVER_SAFE_TOOLS, McpCutoverController } from "./mcp-cutover.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 import { LocalAgentSessionManager } from "./local-agent-sessions.js";
 import { SqliteWorkspaceStore } from "./workspace-store.js";
@@ -4126,6 +4126,58 @@ test("nexus_gateway_recover exposes only the fixed typed recovery contract", asy
     durableRequestSchema.additionalProperties,
     false,
     "durable preflight must preserve the strict recovery request schema",
+  );
+
+  const materialize = tools.tools.find(
+    (tool) => tool.name === "nexus_gateway_recovery_materialize",
+  );
+  assert.ok(materialize, "typed Gateway recovery materialization tool must be exposed");
+  assert.deepEqual(
+    (materialize as unknown as { annotations?: Record<string, unknown> }).annotations,
+    {
+      readOnlyHint: false,
+      destructiveHint: true,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  );
+  assert.equal(CONSEQUENTIAL_MCP_TOOLS.has("nexus_gateway_recovery_materialize"), true);
+  assert.equal(CUTOVER_SAFE_TOOLS.has("nexus_gateway_recovery_materialize"), false);
+  const materializeSchema = materialize.inputSchema as Record<string, unknown>;
+  const materializeProperties = materializeSchema.properties as Record<string, unknown>;
+  assert.deepEqual(Object.keys(materializeProperties).sort(), ["attemptKey", "request"]);
+  const materializeRequestSchema = materializeProperties.request as Record<string, unknown>;
+  const materializeRequestProperties = materializeRequestSchema.properties as Record<string, unknown>;
+  assert.deepEqual(Object.keys(materializeRequestProperties).sort(), [
+    "effect_class",
+    "idempotency_fence",
+    "operation",
+    "recovery_authority_hash",
+    "recovery_authority_id",
+    "request_hash",
+    "request_id",
+    "schema",
+  ]);
+  for (const forbidden of [
+    "command",
+    "executable",
+    "path",
+    "pid",
+    "service",
+    "launchdLabel",
+    "plist",
+    "root",
+    "managerPath",
+    "authoritySourceRoot",
+    "environment",
+    "timeout",
+  ]) {
+    assert.equal(forbidden in materializeRequestProperties, false, `${forbidden} must not be caller-selectable`);
+  }
+  assert.equal(
+    materializeRequestSchema.additionalProperties,
+    false,
+    "materialization request must reject extra host-control fields",
   );
 
   const invalid = await context.client.callTool({

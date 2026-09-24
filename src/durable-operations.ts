@@ -26,6 +26,7 @@ export type DurableOperationKind =
   | "dependency_sync"
   | "nexus_gateway_recover"
   | "nexus_gateway_recovery_preflight"
+  | "nexus_gateway_recovery_materialize"
   | "cutover_start"
   | "host_operation"
   | "chat_swarm_reconciliation";
@@ -64,6 +65,8 @@ export const NEXUS_GATEWAY_INTERPRETER = "/Users/jameschen/Workspace/Nexus-new/.
 // binds these exact accepted manager bytes; the Gateway contract anchor is unchanged.
 export const NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256 = "3f0c34204bef175fcfad7150c5919d96f6b3735813cea5258bdcd51e37d4baeb";
 export const NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256 = "3cd032639f69349bd44e61dec41551957e9034157febfff83e7fb3c89b5ef798";
+export const NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_SCHEMA = "nexus.gateway.durable_recovery_materialization_request.v1" as const;
+export const NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_RECEIPT_SCHEMA = "nexus.gateway.durable_recovery_materialization_receipt.v1" as const;
 export const NEXUS_GATEWAY_STATE_ROOT = join(homedir(), "Library", "Application Support", "Nexus", "gateway-direct");
 
 export interface NexusGatewayRecoveryRequest {
@@ -102,6 +105,26 @@ export interface NexusGatewayRecoveryPreflightResult {
 
 export type NexusGatewayRecoveryRunner = (
   request: NexusGatewayRecoveryRequest,
+) => Promise<NexusGatewayRecoveryBridgeResult>;
+
+export interface NexusGatewayRecoveryMaterializationRequest {
+  request_id: string;
+  idempotency_fence: string;
+  operation: "gateway-recovery-materialize";
+  effect_class: "GATEWAY_RECOVERY_MATERIALIZATION";
+  recovery_authority_id: string;
+  recovery_authority_hash: string;
+  request_hash: string;
+  schema: typeof NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_SCHEMA;
+}
+
+export interface NexusGatewayRecoveryMaterializationInput {
+  attemptKey: string;
+  request: NexusGatewayRecoveryMaterializationRequest;
+}
+
+export type NexusGatewayRecoveryMaterializationRunner = (
+  request: NexusGatewayRecoveryMaterializationRequest,
 ) => Promise<NexusGatewayRecoveryBridgeResult>;
 
 export interface DurableOperationRecord {
@@ -158,6 +181,8 @@ export class DurableOperationError extends Error {
       | "NEXUS_GATEWAY_PREFLIGHT_FAILED"
       | "NEXUS_GATEWAY_RECOVERY_FAILED"
       | "NEXUS_GATEWAY_RECOVERY_UNCERTAIN"
+      | "NEXUS_GATEWAY_MATERIALIZATION_FAILED"
+      | "NEXUS_GATEWAY_MATERIALIZATION_UNCERTAIN"
       | "RECONCILIATION_REQUIRED",
     message: string,
     readonly operation?: DurableOperationRecord,
@@ -372,6 +397,7 @@ export class DurableOperationManager {
     private readonly runNexusGatewayRecovery: NexusGatewayRecoveryRunner = spawnNexusGatewayRecovery,
     private readonly runNexusGatewayRecoveryPreflight: NexusGatewayRecoveryRunner = spawnNexusGatewayRecoveryPreflight,
     coordination?: ControlPlaneConsumerOptions,
+    private readonly runNexusGatewayRecoveryMaterialize: NexusGatewayRecoveryMaterializationRunner = spawnNexusGatewayRecoveryMaterialize,
   ) {
     this.store = new DurableOperationStore(config.stateDir);
     this.store.markInterruptedUnknown();
@@ -1050,6 +1076,112 @@ export class DurableOperationManager {
     });
   }
 
+  async nexusGatewayRecoveryMaterialize(input: NexusGatewayRecoveryMaterializationInput): Promise<DurableOperationRecord> {
+    assertAttemptKey(input.attemptKey);
+    assertNexusGatewayRecoveryMaterializationRequest(input.request);
+    const scopeRoot = NEXUS_GATEWAY_STATE_ROOT;
+    const request = { materializationRequest: input.request };
+    const requestHash = hashJson(request);
+    const operationId = stableOperationId(
+      "nexus_gateway_recovery_materialize",
+      scopeRoot,
+      input.attemptKey,
+    );
+    const existing = this.store.getByAttempt(scopeRoot, input.attemptKey);
+    if (existing) {
+      if (
+        existing.requestHash !== requestHash
+        || existing.kind !== "nexus_gateway_recovery_materialize"
+      ) {
+        throw new DurableOperationError(
+          "OPERATION_REPLAY_CONFLICT",
+          `attemptKey '${input.attemptKey}' is already bound to a materially different ${existing.kind} request.`,
+          existing,
+        );
+      }
+      return replayResult(existing);
+    }
+
+    const { record, created } = this.store.createOrReplay({
+      operationId,
+      attemptKey: input.attemptKey,
+      requestHash,
+      kind: "nexus_gateway_recovery_materialize",
+      authorityMode: "NEXUS_GOVERNED",
+      scopeRoot,
+      request,
+    });
+    if (!created) return replayResult(record);
+    return await this.executeNexusGatewayRecoveryMaterialize(operationId, input.request, false);
+  }
+
+  private async executeNexusGatewayRecoveryMaterialize(
+    operationId: string,
+    request: NexusGatewayRecoveryMaterializationRequest,
+    reconciled: boolean,
+  ): Promise<DurableOperationRecord> {
+    let bridge: NexusGatewayRecoveryBridgeResult;
+    try {
+      bridge = await this.runNexusGatewayRecoveryMaterialize(request);
+    } catch (error) {
+      return this.store.finish(operationId, {
+        status: "outcome_unknown",
+        retrySafe: false,
+        errorCode: "NEXUS_GATEWAY_MATERIALIZATION_UNCERTAIN",
+        errorMessage: redactSecrets(error instanceof Error ? error.message : String(error)),
+        receipt: { reconciled, bridge: "transport_error" },
+      });
+    }
+
+    if (bridge.exitCode !== 0) {
+      return this.store.finish(operationId, {
+        status: "outcome_unknown",
+        retrySafe: false,
+        errorCode: "NEXUS_GATEWAY_MATERIALIZATION_UNCERTAIN",
+        errorMessage: redactSecrets(
+          bridge.stderr.trim() || `Fixed Nexus Gateway recovery materialization bridge exited ${String(bridge.exitCode)}.`,
+        ),
+        receipt: { reconciled, exitCode: bridge.exitCode },
+      });
+    }
+
+    let outcome: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(bridge.stdout);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("outcome must be an object");
+      outcome = parsed as Record<string, unknown>;
+    } catch (error) {
+      return this.store.finish(operationId, {
+        status: "outcome_unknown",
+        retrySafe: false,
+        errorCode: "NEXUS_GATEWAY_MATERIALIZATION_UNCERTAIN",
+        errorMessage: `Nexus Gateway recovery materialization bridge returned malformed outcome JSON: ${redactSecrets(error instanceof Error ? error.message : String(error))}`,
+        receipt: { reconciled, exitCode: bridge.exitCode },
+      });
+    }
+
+    const receipt = {
+      reconciled,
+      exitCode: bridge.exitCode,
+      nexusOutcome: outcome,
+    };
+    if (
+      outcome.schema === NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_RECEIPT_SCHEMA
+      && outcome.effect_started === false
+      && typeof outcome.receipt_hash === "string"
+      && HEX64.test(outcome.receipt_hash)
+    ) {
+      return this.store.finish(operationId, { status: "succeeded", retrySafe: false, receipt });
+    }
+    return this.store.finish(operationId, {
+      status: "failed",
+      retrySafe: false,
+      errorCode: "NEXUS_GATEWAY_MATERIALIZATION_FAILED",
+      errorMessage: "Nexus Gateway recovery materialization failed closed: receipt must be typed, effect-free, and hash-bound.",
+      receipt,
+    });
+  }
+
   async reconcile(operationId: string, consumerContext?: unknown): Promise<DurableOperationRecord> {
     const record = this.store.getByOperationId(operationId);
     if (!record) throw new DurableOperationError("RECONCILIATION_REQUIRED", `Unknown durable operation: ${operationId}`);
@@ -1085,6 +1217,16 @@ export class DurableOperationManager {
       const recoveryRequest = record.request.recoveryRequest;
       assertNexusGatewayRecoveryRequest(recoveryRequest);
       return await this.executeNexusGatewayRecovery(operationId, recoveryRequest, true);
+    }
+
+    if (record.kind === "nexus_gateway_recovery_materialize") {
+      const materializationRequest = record.request.materializationRequest;
+      assertNexusGatewayRecoveryMaterializationRequest(materializationRequest);
+      return await this.executeNexusGatewayRecoveryMaterialize(
+        operationId,
+        materializationRequest,
+        true,
+      );
     }
 
     if (record.kind === "workspace_clone") {
@@ -1215,6 +1357,57 @@ export function assertNexusGatewayRecoveryRequest(value: unknown): asserts value
   });
   if (request.request_hash !== expectedRequestHash) {
     throw new DurableOperationError("NEXUS_GATEWAY_REQUEST_INVALID", "Nexus Gateway recovery request hash mismatch.");
+  }
+}
+
+export function assertNexusGatewayRecoveryMaterializationRequest(value: unknown): asserts value is NexusGatewayRecoveryMaterializationRequest {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new DurableOperationError("NEXUS_GATEWAY_REQUEST_INVALID", "Nexus Gateway recovery materialization request must be an object.");
+  }
+  const request = value as Record<string, unknown>;
+  const expectedKeys = new Set([
+    "request_id",
+    "idempotency_fence",
+    "operation",
+    "effect_class",
+    "recovery_authority_id",
+    "recovery_authority_hash",
+    "request_hash",
+    "schema",
+  ]);
+  const actualKeys = Object.keys(request);
+  if (actualKeys.length !== expectedKeys.size || actualKeys.some((key) => !expectedKeys.has(key))) {
+    throw new DurableOperationError("NEXUS_GATEWAY_REQUEST_INVALID", "Nexus Gateway recovery materialization request schema mismatch.");
+  }
+  for (const key of ["request_id", "idempotency_fence", "recovery_authority_id"] as const) {
+    if (typeof request[key] !== "string" || !SAFE_NEXUS_ID.test(request[key] as string)) {
+      throw new DurableOperationError("NEXUS_GATEWAY_REQUEST_INVALID", `Invalid Nexus Gateway recovery materialization ${key}.`);
+    }
+  }
+  for (const key of ["recovery_authority_hash", "request_hash"] as const) {
+    if (typeof request[key] !== "string" || !HEX64.test(request[key] as string)) {
+      throw new DurableOperationError("NEXUS_GATEWAY_REQUEST_INVALID", `Invalid Nexus Gateway recovery materialization ${key}.`);
+    }
+  }
+  if (
+    request.operation !== "gateway-recovery-materialize"
+    || request.effect_class !== "GATEWAY_RECOVERY_MATERIALIZATION"
+  ) {
+    throw new DurableOperationError("NEXUS_GATEWAY_REQUEST_INVALID", "Nexus Gateway recovery materialization operation/effect mismatch.");
+  }
+  if (request.schema !== NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_SCHEMA) {
+    throw new DurableOperationError("NEXUS_GATEWAY_REQUEST_INVALID", "Nexus Gateway recovery materialization schema mismatch.");
+  }
+  const expectedRequestHash = hashJson({
+    request_id: request.request_id,
+    idempotency_fence: request.idempotency_fence,
+    operation: request.operation,
+    effect_class: request.effect_class,
+    recovery_authority_id: request.recovery_authority_id,
+    recovery_authority_hash: request.recovery_authority_hash,
+  });
+  if (request.request_hash !== expectedRequestHash) {
+    throw new DurableOperationError("NEXUS_GATEWAY_REQUEST_INVALID", "Nexus Gateway recovery materialization request hash mismatch.");
   }
 }
 
@@ -1745,6 +1938,124 @@ async function spawnNexusGatewayRecoveryPreflight(
       const next = String(chunk);
       if (Buffer.byteLength((target === "stdout" ? stdout : stderr) + next, "utf8") > maxOutputBytes) {
         rejectOnce(new Error("Fixed Nexus Gateway recovery preflight bridge exceeded bounded output."));
+        return;
+      }
+      if (target === "stdout") stdout += next;
+      else stderr += next;
+    };
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk) => appendBounded("stdout", chunk));
+    child.stderr.on("data", (chunk) => appendBounded("stderr", chunk));
+    child.on("error", (error) => rejectOnce(error));
+    child.stdin.on("error", (error) => rejectOnce(error));
+    child.on("close", (exitCode) => {
+      if (settled) return;
+      settled = true;
+      resolvePromise({ exitCode, stdout, stderr });
+    });
+    child.stdin.end(JSON.stringify(request));
+  });
+}
+
+export function buildNexusGatewayRecoveryMaterializationBridgeCode(): string {
+  return String.raw`
+import importlib.util
+import json
+import os
+import pathlib
+import re
+import stat
+import sys
+
+STATE = pathlib.Path.home() / "Library" / "Application Support" / "Nexus" / "gateway-direct"
+MANAGER = STATE / "manager.py"
+AUTHORITY_SOURCE_ROOT = pathlib.Path("/Users/jameschen/Workspace/Nexus-new-authority-main")
+SCHEMA = "nexus.gateway.durable_recovery_materialization_request.v1"
+
+
+def fail(message):
+    raise RuntimeError(message)
+
+
+def secure_file(path, label):
+    if path.is_symlink():
+        fail(label + " must not be a symlink")
+    info = os.lstat(path)
+    if not stat.S_ISREG(info.st_mode):
+        fail(label + " must be a regular file")
+    if info.st_uid != os.getuid() or (stat.S_IMODE(info.st_mode) & 0o022):
+        fail(label + " ownership/mode invalid")
+
+
+try:
+    request = json.load(sys.stdin)
+    if not isinstance(request, dict):
+        fail("materialization request must be an object")
+    if request.get("schema") != SCHEMA:
+        fail("materialization request schema mismatch")
+    if request.get("operation") != "gateway-recovery-materialize" or request.get("effect_class") != "GATEWAY_RECOVERY_MATERIALIZATION":
+        fail("materialization operation/effect mismatch")
+    for key in ("request_id", "idempotency_fence", "recovery_authority_id"):
+        if not isinstance(request.get(key), str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:\-]{0,127}", request[key]):
+            fail("materialization " + key + " invalid")
+    for key in ("recovery_authority_hash", "request_hash"):
+        if not isinstance(request.get(key), str) or not re.fullmatch(r"[0-9a-f]{64}", request[key]):
+            fail("materialization " + key + " invalid")
+    secure_file(MANAGER, "manager artifact")
+    if not AUTHORITY_SOURCE_ROOT.is_dir():
+        fail("materialization authority source root unavailable")
+
+    sys.path.insert(0, str(AUTHORITY_SOURCE_ROOT))
+    spec = importlib.util.spec_from_file_location("nexus_gateway_stable_manager", MANAGER)
+    if spec is None or spec.loader is None:
+        fail("manager import spec unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    outcome = module.gateway_recovery_materialize(request)
+    if isinstance(outcome, dict):
+        print(json.dumps(outcome, sort_keys=True, separators=(",", ":")))
+    elif hasattr(outcome, "model_dump"):
+        print(json.dumps(outcome.model_dump(mode="json"), sort_keys=True, separators=(",", ":")))
+    else:
+        fail("materialization outcome must be a mapping")
+except Exception as exc:
+    print("NEXUS_GATEWAY_BRIDGE_ERROR:" + type(exc).__name__ + ":" + str(exc), file=sys.stderr)
+    raise SystemExit(1)
+`;
+}
+
+export const NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_BRIDGE_CODE = buildNexusGatewayRecoveryMaterializationBridgeCode();
+
+async function spawnNexusGatewayRecoveryMaterialize(
+  request: NexusGatewayRecoveryMaterializationRequest,
+): Promise<NexusGatewayRecoveryBridgeResult> {
+  const maxOutputBytes = 1024 * 1024;
+  return await new Promise((resolvePromise, rejectPromise) => {
+    const child = spawn(NEXUS_GATEWAY_INTERPRETER, ["-I", "-B", "-c", NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_BRIDGE_CODE], {
+      cwd: homedir(),
+      stdio: ["pipe", "pipe", "pipe"],
+      env: {
+        HOME: homedir(),
+        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+        PYTHONNOUSERSITE: "1",
+        PYTHONDONTWRITEBYTECODE: "1",
+      },
+    });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const rejectOnce = (error: Error) => {
+      if (settled) return;
+      settled = true;
+      child.kill("SIGKILL");
+      rejectPromise(error);
+    };
+    const appendBounded = (target: "stdout" | "stderr", chunk: unknown) => {
+      const next = String(chunk);
+      if (Buffer.byteLength((target === "stdout" ? stdout : stderr) + next, "utf8") > maxOutputBytes) {
+        rejectOnce(new Error("Fixed Nexus Gateway recovery materialization bridge exceeded bounded output."));
         return;
       }
       if (target === "stdout") stdout += next;
