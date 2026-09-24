@@ -12,6 +12,7 @@ import {
   cleanPorcelainPath,
   parsePorcelainChangedPaths,
   buildDeterministicHerdrAgentName,
+  buildHerdrAgentArgs,
   normalizeHerdrSocketPath,
   type HerdrExternalHandle,
   type HerdrSocketRequest,
@@ -22,6 +23,30 @@ import {
 import { LocalAgentStore } from "./local-agent-store.js";
 import { hashDispatchIntent } from "./execution-protocol.js";
 import { LocalAgentSessionManager } from "./local-agent-sessions.js";
+
+test("buildHerdrAgentArgs binds requested provider model, effort, and permission mode", () => {
+  const cwd = "/tmp/worktree";
+  assert.deepEqual(
+    buildHerdrAgentArgs({ agentKind: "opencode", requestedModel: "mimo-v2.6-flash-free", writeMode: "read_only" }, cwd),
+    ["-m", "mimo-v2.6-flash-free"],
+  );
+  assert.deepEqual(
+    buildHerdrAgentArgs({ agentKind: "agy", requestedModel: "gemini-3.7-flash-medium", writeMode: "read_only" }, cwd),
+    ["--model", "gemini-3.7-flash-medium", "--sandbox", "--dangerously-skip-permissions", "--add-dir", cwd, "--mode", "plan"],
+  );
+  assert.deepEqual(
+    buildHerdrAgentArgs({ agentKind: "codex", requestedModel: "gpt-5.6-luna", requestedEffort: "high", writeMode: "read_only" }, cwd),
+    ["-m", "gpt-5.6-luna", "-c", 'model_reasoning_effort="high"', "-s", "read-only", "-a", "never", "-C", cwd],
+  );
+  assert.deepEqual(
+    buildHerdrAgentArgs({ agentKind: "grok", requestedModel: "grok-4.6", requestedEffort: "high", writeMode: "allowed" }, cwd),
+    ["-m", "grok-4.6", "--reasoning-effort", "high", "--permission-mode", "acceptEdits", "--cwd", cwd],
+  );
+  assert.deepEqual(
+    buildHerdrAgentArgs({ agentKind: "cline", requestedModel: "cline-pass/glm-5.3-flash", requestedEffort: "medium", requestedCliProviderId: "cline-pass", writeMode: "read_only" }, cwd),
+    ["-P", "cline-pass", "--model", "cline-pass/glm-5.3-flash", "--thinking", "medium", "--plan", "--auto-approve"],
+  );
+});
 
 test("HerdrGatewayRegistry enforces N1 duplicate prevention and N2 conflicting replay", () => {
   const registry = new HerdrGatewayRegistry();
