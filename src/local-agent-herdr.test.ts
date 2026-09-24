@@ -908,6 +908,7 @@ class SpyHerdrGateway extends HerdrThinGateway {
   public failWorkspaceCreate = false;
   public failWorkspaceClose = false;
   public failAgentStart = false;
+  public failAgentGet = false;
   public simulatedWorkspaces: Array<{ workspace_id: string; label?: string }> = [];
   public simulatedPanes: Array<HerdrPaneInfo> = [];
   public simulatedAgents: Map<string, HerdrAgentInfo> = new Map();
@@ -1080,6 +1081,9 @@ class SpyHerdrGateway extends HerdrThinGateway {
 
     if (req.method === "agent.get") {
       this.getAgentCalls++;
+      if (this.failAgentGet) {
+        throw new Error("Simulated agent.get transport failure");
+      }
       const target = (req.params as any)?.target;
       const agent =
         this.simulatedAgents.get(target) ??
@@ -3623,7 +3627,10 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
     );
     assert.equal(spy.workspaceCloseCalls, 0, "Zero workspace.close on missing pane");
 
-    // 4. SI-AGENT-MISSING: agent not in HerdR
+    // 4. SI-AGENT-MISSING: exact pane/workspace/cwd remains owned and
+    // a strict second agent.get positively confirms absence. Explicit operator
+    // stop may reclaim that exact workspace so the durable session cannot leak
+    // a local capacity slot forever.
     spy.simulatedPanes = [
       {
         pane_id: handle.herdrPaneId,
@@ -3632,15 +3639,25 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
         foreground_cwd: repoPath,
       },
     ];
-    spy.simulatedAgents.clear(); // Missing agent!
+    spy.simulatedAgents.clear();
+    await spy.stopExternalAgent(handle);
+    assert.equal(spy.workspaceCloseCalls, 1, "Verified missing agent reclaims exact owned workspace");
+
+    // Re-register for the remaining negative stop cases.
+    registry.registerHandle(handle);
+
+    // 4b. SI-AGENT-LOOKUP-TRANSPORT: a failed strict absence readback must
+    // remain fail-closed and must not close the workspace.
+    spy.failAgentGet = true;
     await assert.rejects(
       spy.stopExternalAgent(handle),
       (err: any) => {
-        assert.match(err.message, /\[STOP_LIVE_IDENTITY_MISMATCH\]/);
+        assert.match(err.message, /Simulated agent\.get transport failure|AGENT_ABSENCE_UNVERIFIED/);
         return true;
       },
     );
-    assert.equal(spy.workspaceCloseCalls, 0, "Zero workspace.close on missing agent");
+    assert.equal(spy.workspaceCloseCalls, 1, "Zero additional workspace.close on unverified absence");
+    spy.failAgentGet = false;
 
     // 5. SI-WRONG-WORKSPACE: agent workspace mismatch
     spy.simulatedAgents.set(handle.herdrAgentIdentity, {
