@@ -229,6 +229,24 @@ export interface ExecutionResult {
   error?: string;
 }
 
+export type ExecutionReadinessObservation = "ready" | "not_ready" | "unknown";
+
+export interface HostGenerationBinding {
+  hostId: string;
+  platform: string;
+  arch: string;
+  osRelease: string;
+  hostnameSha256: string;
+  homeSha256: string;
+  pathSha256: string;
+  nodeMajor: string;
+  configRootSha256: string;
+  stateRootSha256: string;
+  capabilityManifestSha256: string;
+  physicalHostFingerprint: string;
+  hostGenerationFingerprint: string;
+}
+
 /** Material runtime generation pinned to one durable local-agent session. */
 export interface ExecutionGenerationBinding {
   profileCatalogGeneration: string;
@@ -238,6 +256,10 @@ export interface ExecutionGenerationBinding {
   runtimeVersion?: string;
   devspaceBuildId: string;
   devspaceSourceCommit: string;
+  hostGeneration: HostGenerationBinding;
+  adapterGeneration: string;
+  authReadiness: ExecutionReadinessObservation;
+  providerReachability: ExecutionReadinessObservation;
   capabilitySurfaceDigest: string;
   executionBindingHash: string;
 }
@@ -253,6 +275,7 @@ export class ExecutionProtocolError extends Error {
       | "INVALID_TOOL_PROJECTION_MANIFEST"
       | "TOOL_MANIFEST_REF_MISMATCH"
       | "EXECUTION_GENERATION_MISMATCH"
+      | "CROSS_HOST_CONTINUATION_REJECTED"
       | "LEGACY_EXECUTION_BINDING_MISSING"
       | "INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE",
     message: string,
@@ -835,6 +858,122 @@ export function assertExecutionAuthority(
   }
 }
 
+function physicalHostPayload(binding: Pick<
+  HostGenerationBinding,
+  "hostId" | "platform" | "arch" | "hostnameSha256" | "homeSha256"
+>): Record<string, string> {
+  return {
+    hostId: binding.hostId,
+    platform: binding.platform,
+    arch: binding.arch,
+    hostnameSha256: binding.hostnameSha256,
+    homeSha256: binding.homeSha256,
+  };
+}
+
+function hostGenerationPayload(binding: Omit<HostGenerationBinding, "hostGenerationFingerprint">): Record<string, string> {
+  return {
+    hostId: binding.hostId,
+    platform: binding.platform,
+    arch: binding.arch,
+    osRelease: binding.osRelease,
+    hostnameSha256: binding.hostnameSha256,
+    homeSha256: binding.homeSha256,
+    pathSha256: binding.pathSha256,
+    nodeMajor: binding.nodeMajor,
+    configRootSha256: binding.configRootSha256,
+    stateRootSha256: binding.stateRootSha256,
+    capabilityManifestSha256: binding.capabilityManifestSha256,
+    physicalHostFingerprint: binding.physicalHostFingerprint,
+  };
+}
+
+function hostGenerationFromRecord(value: unknown): HostGenerationBinding | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  const keys = [
+    "hostId", "platform", "arch", "osRelease", "hostnameSha256", "homeSha256",
+    "pathSha256", "nodeMajor", "configRootSha256", "stateRootSha256",
+    "capabilityManifestSha256", "physicalHostFingerprint", "hostGenerationFingerprint",
+  ] as const;
+  if (keys.some((key) => typeof record[key] !== "string" || !record[key])) return undefined;
+  const binding = record as unknown as HostGenerationBinding;
+  if (
+    !/^[0-9a-f]{64}$/.test(binding.hostnameSha256) ||
+    !/^[0-9a-f]{64}$/.test(binding.homeSha256) ||
+    !/^[0-9a-f]{64}$/.test(binding.pathSha256) ||
+    !/^[0-9a-f]{64}$/.test(binding.configRootSha256) ||
+    !/^[0-9a-f]{64}$/.test(binding.stateRootSha256) ||
+    !/^[0-9a-f]{64}$/.test(binding.capabilityManifestSha256) ||
+    !/^[0-9a-f]{64}$/.test(binding.physicalHostFingerprint) ||
+    !/^[0-9a-f]{64}$/.test(binding.hostGenerationFingerprint)
+  ) return undefined;
+  const expectedPhysical = sha256(canonicalJson(physicalHostPayload(binding)));
+  if (binding.physicalHostFingerprint !== expectedPhysical) return undefined;
+  const expected = sha256(canonicalJson(hostGenerationPayload(binding)));
+  return binding.hostGenerationFingerprint === expected ? binding : undefined;
+}
+
+function readinessObservation(value: unknown): value is ExecutionReadinessObservation {
+  return value === "ready" || value === "not_ready" || value === "unknown";
+}
+
+export function buildHostGenerationBinding(input: {
+  configuredHostId?: string;
+  hostname: string;
+  platform: string;
+  arch: string;
+  osRelease: string;
+  home: string;
+  path: string;
+  nodeMajor: string;
+  configRoot: string;
+  stateRoot: string;
+  capabilityManifestSha256: string;
+}): HostGenerationBinding {
+  const configuredHostId = input.configuredHostId?.trim();
+  if (configuredHostId && !/^[A-Za-z0-9._:-]{1,128}$/.test(configuredHostId)) {
+    throw new ExecutionProtocolError(
+      "INVALID_EXECUTION_BINDING",
+      "Configured physical host id must be 1-128 characters from [A-Za-z0-9._:-].",
+    );
+  }
+  if (!/^[0-9a-f]{64}$/.test(input.capabilityManifestSha256)) {
+    throw new ExecutionProtocolError(
+      "INVALID_EXECUTION_BINDING",
+      "Host generation requires an exact 64-hex capability manifest digest.",
+    );
+  }
+  const derivedHostIdentity = {
+    hostname: input.hostname,
+    platform: input.platform,
+    arch: input.arch,
+    home: input.home,
+  };
+  const hostId = configuredHostId ?? `derived:${sha256(canonicalJson(derivedHostIdentity))}`;
+  const physicalFields = {
+    hostId,
+    platform: input.platform,
+    arch: input.arch,
+    hostnameSha256: sha256(input.hostname),
+    homeSha256: sha256(input.home),
+  };
+  const withoutFingerprint: Omit<HostGenerationBinding, "hostGenerationFingerprint"> = {
+    ...physicalFields,
+    osRelease: input.osRelease,
+    pathSha256: sha256(input.path),
+    nodeMajor: input.nodeMajor,
+    configRootSha256: sha256(input.configRoot),
+    stateRootSha256: sha256(input.stateRoot),
+    capabilityManifestSha256: input.capabilityManifestSha256,
+    physicalHostFingerprint: sha256(canonicalJson(physicalHostPayload(physicalFields))),
+  };
+  return {
+    ...withoutFingerprint,
+    hostGenerationFingerprint: sha256(canonicalJson(hostGenerationPayload(withoutFingerprint))),
+  };
+}
+
 export function buildExecutionGenerationBinding(input: Omit<ExecutionGenerationBinding, "capabilitySurfaceDigest" | "executionBindingHash"> & {
   capabilitySurfaceDigest?: string;
 }): ExecutionGenerationBinding {
@@ -842,6 +981,8 @@ export function buildExecutionGenerationBinding(input: Omit<ExecutionGenerationB
     profileCatalogGeneration: input.profileCatalogGeneration,
     devspaceBuildId: input.devspaceBuildId,
     devspaceSourceCommit: input.devspaceSourceCommit,
+    hostGenerationFingerprint: input.hostGeneration.hostGenerationFingerprint,
+    adapterGeneration: input.adapterGeneration,
   }));
   const withoutHash = {
     profileCatalogGeneration: input.profileCatalogGeneration,
@@ -851,12 +992,40 @@ export function buildExecutionGenerationBinding(input: Omit<ExecutionGenerationB
     runtimeVersion: input.runtimeVersion,
     devspaceBuildId: input.devspaceBuildId,
     devspaceSourceCommit: input.devspaceSourceCommit,
+    hostGeneration: input.hostGeneration,
+    adapterGeneration: input.adapterGeneration,
+    authReadiness: input.authReadiness,
+    providerReachability: input.providerReachability,
     capabilitySurfaceDigest,
   };
   return {
     ...withoutHash,
     executionBindingHash: sha256(canonicalJson(withoutHash)),
   };
+}
+
+export function assertSameHostGeneration(
+  stored: HostGenerationBinding | undefined,
+  current: HostGenerationBinding,
+): void {
+  if (!stored) {
+    throw new ExecutionProtocolError(
+      "LEGACY_EXECUTION_BINDING_MISSING",
+      "Durable agent predates execution-generation binding because host-generation evidence is missing; explicit rebind is required instead of silent continuation.",
+    );
+  }
+  if (stored.physicalHostFingerprint !== current.physicalHostFingerprint) {
+    throw new ExecutionProtocolError(
+      "CROSS_HOST_CONTINUATION_REJECTED",
+      `Durable physical host changed (stored ${stored.physicalHostFingerprint}, current ${current.physicalHostFingerprint}); cross-host continuation requires explicit rebind.`,
+    );
+  }
+  if (stored.hostGenerationFingerprint !== current.hostGenerationFingerprint) {
+    throw new ExecutionProtocolError(
+      "EXECUTION_GENERATION_MISMATCH",
+      `Durable host generation changed on the same physical host (stored ${stored.hostGenerationFingerprint}, current ${current.hostGenerationFingerprint}); explicit rebind is required.`,
+    );
+  }
 }
 
 export function assertSameExecutionGeneration(
@@ -869,6 +1038,7 @@ export function assertSameExecutionGeneration(
       "Durable agent predates execution-generation binding and requires explicit rebind instead of silent continuation.",
     );
   }
+  assertSameHostGeneration(stored.hostGeneration, current.hostGeneration);
   if (stored.executionBindingHash !== current.executionBindingHash) {
     throw new ExecutionProtocolError(
       "EXECUTION_GENERATION_MISMATCH",
@@ -885,16 +1055,21 @@ export function deserializeExecutionGenerationBinding(value: string | null | und
   if (!value) return undefined;
   try {
     const parsed = JSON.parse(value) as Partial<ExecutionGenerationBinding>;
+    const hostGeneration = hostGenerationFromRecord(parsed.hostGeneration);
     if (
       typeof parsed.profileCatalogGeneration !== "string" ||
       typeof parsed.provider !== "string" ||
       typeof parsed.executionIdentity !== "string" ||
       typeof parsed.devspaceBuildId !== "string" ||
       typeof parsed.devspaceSourceCommit !== "string" ||
+      typeof parsed.adapterGeneration !== "string" ||
+      !readinessObservation(parsed.authReadiness) ||
+      !readinessObservation(parsed.providerReachability) ||
+      !hostGeneration ||
       typeof parsed.capabilitySurfaceDigest !== "string" ||
       typeof parsed.executionBindingHash !== "string"
     ) return undefined;
-    return parsed as ExecutionGenerationBinding;
+    return { ...parsed, hostGeneration } as ExecutionGenerationBinding;
   } catch {
     return undefined;
   }
@@ -1287,16 +1462,42 @@ export function validateDirectCandidateExecutionEvidence(value: unknown): Direct
   if (!isRecord(gen)) {
     throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution.execution_generation must be an object.");
   }
-  const requiredGenKeys = ["profileCatalogGeneration", "provider", "executionIdentity", "devspaceBuildId", "devspaceSourceCommit", "capabilitySurfaceDigest", "executionBindingHash"];
+  const requiredGenKeys = [
+    "profileCatalogGeneration",
+    "provider",
+    "executionIdentity",
+    "devspaceBuildId",
+    "devspaceSourceCommit",
+    "adapterGeneration",
+    "authReadiness",
+    "providerReachability",
+    "capabilitySurfaceDigest",
+    "executionBindingHash",
+  ];
   for (const key of requiredGenKeys) {
     if (typeof gen[key] !== "string" || !gen[key]) {
       throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", `execution_generation.${key} must be a non-empty string.`);
     }
   }
+  const hostGeneration = hostGenerationFromRecord(gen.hostGeneration);
+  if (!hostGeneration) {
+    throw new ExecutionProtocolError(
+      "INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE",
+      "execution_generation.hostGeneration must be a valid host-generation binding.",
+    );
+  }
+  if (!readinessObservation(gen.authReadiness) || !readinessObservation(gen.providerReachability)) {
+    throw new ExecutionProtocolError(
+      "INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE",
+      "execution_generation readiness observations are invalid.",
+    );
+  }
   const expectedCapabilityDigest = sha256(canonicalJson({
     profileCatalogGeneration: gen.profileCatalogGeneration,
     devspaceBuildId: gen.devspaceBuildId,
     devspaceSourceCommit: gen.devspaceSourceCommit,
+    hostGenerationFingerprint: hostGeneration.hostGenerationFingerprint,
+    adapterGeneration: gen.adapterGeneration,
   }));
   if (gen.capabilitySurfaceDigest !== expectedCapabilityDigest) {
     throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution_generation.capabilitySurfaceDigest mismatch.");
@@ -1307,6 +1508,10 @@ export function validateDirectCandidateExecutionEvidence(value: unknown): Direct
     executionIdentity: gen.executionIdentity,
     devspaceBuildId: gen.devspaceBuildId,
     devspaceSourceCommit: gen.devspaceSourceCommit,
+    hostGeneration,
+    adapterGeneration: gen.adapterGeneration,
+    authReadiness: gen.authReadiness,
+    providerReachability: gen.providerReachability,
     capabilitySurfaceDigest: expectedCapabilityDigest,
   };
   if (gen.model !== undefined) genPayload.model = gen.model;

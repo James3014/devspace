@@ -25,11 +25,28 @@ import {
 } from "./capability-discovery.js";
 import {
   buildExecutionGenerationBinding,
+  buildHostGenerationBinding,
   computeDispatchIntentHash,
   DIRECT_CANDIDATE_EXECUTION_SCHEMA,
   validateDirectCandidateExecutionEvidence,
 } from "./execution-protocol.js";
 import { createWorkspaceStore } from "./workspace-store.js";
+
+function testHostGeneration() {
+  return buildHostGenerationBinding({
+    configuredHostId: "core-test-host",
+    hostname: "core-test.local",
+    platform: "darwin",
+    arch: "arm64",
+    osRelease: "25.0.0",
+    home: "/Users/test",
+    path: "/usr/bin:/bin",
+    nodeMajor: "24",
+    configRoot: "/Users/test/.devspace",
+    stateRoot: "/Users/test/.devspace/state",
+    capabilityManifestSha256: "2".repeat(64),
+  });
+}
 
 function git(repo: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
@@ -1420,6 +1437,10 @@ test("produceDirectCandidateEvidence produces valid signed evidence matching exa
       runtimeVersion: "1.0.0",
       devspaceBuildId: "build-123",
       devspaceSourceCommit: fixture.head,
+      hostGeneration: testHostGeneration(),
+      adapterGeneration: "local-agent-adapter-v1",
+      authReadiness: "unknown",
+      providerReachability: "unknown",
     });
 
     const agentRecord: CoreMutationDurableAgentRecord = {
@@ -1553,6 +1574,10 @@ test("produceDirectCandidateEvidence rejects unresolved Core writer reconciliati
       runtimeVersion: "1.0.0",
       devspaceBuildId: "build-123",
       devspaceSourceCommit: fixture.head,
+      hostGeneration: testHostGeneration(),
+      adapterGeneration: "local-agent-adapter-v1",
+      authReadiness: "unknown",
+      providerReachability: "unknown",
     });
 
     const agentRecord: CoreMutationDurableAgentRecord = {
@@ -1658,6 +1683,10 @@ test("produceDirectCandidateEvidence fails closed on mismatched or invalid invar
       runtimeVersion: "1.0.0",
       devspaceBuildId: "build-123",
       devspaceSourceCommit: fixture.head,
+      hostGeneration: testHostGeneration(),
+      adapterGeneration: "local-agent-adapter-v1",
+      authReadiness: "unknown",
+      providerReachability: "unknown",
     });
 
     const baseAgent: CoreMutationDurableAgentRecord = {

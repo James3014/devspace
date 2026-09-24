@@ -13,6 +13,7 @@ import {
   assertSameExecutionGeneration,
   assertNexusGrantAuthorizesExecution,
   buildExecutionGenerationBinding,
+  buildHostGenerationBinding,
   hashDispatchIntent,
   hashExecutionBinding,
   hashNexusExecutionGrant,
@@ -255,6 +256,10 @@ test("execution generation accepts exact generation and rejects substitution or 
     runtimeVersion: "0.152.0",
     devspaceBuildId: "devspace-1.0.7-deadbeef",
     devspaceSourceCommit: "deadbeef",
+    hostGeneration: testHostGeneration(),
+    adapterGeneration: "local-agent-adapter-v1",
+    authReadiness: "unknown",
+    providerReachability: "unknown",
   });
   assert.doesNotThrow(() => assertSameExecutionGeneration(generation, { ...generation }));
 
@@ -266,9 +271,62 @@ test("execution generation accepts exact generation and rejects substitution or 
     runtimeVersion: "0.152.0",
     devspaceBuildId: "devspace-1.0.7-deadbeef",
     devspaceSourceCommit: "deadbeef",
+    hostGeneration: testHostGeneration(),
+    adapterGeneration: "local-agent-adapter-v1",
+    authReadiness: "unknown",
+    providerReachability: "unknown",
   });
   assert.throws(
     () => assertSameExecutionGeneration(generation, changed),
+    (error: unknown) => error instanceof ExecutionProtocolError && error.code === "EXECUTION_GENERATION_MISMATCH",
+  );
+  const changedHost = buildExecutionGenerationBinding({
+    profileCatalogGeneration: generation.profileCatalogGeneration,
+    provider: generation.provider,
+    model: generation.model,
+    executionIdentity: generation.executionIdentity,
+    runtimeVersion: generation.runtimeVersion,
+    devspaceBuildId: generation.devspaceBuildId,
+    devspaceSourceCommit: generation.devspaceSourceCommit,
+    hostGeneration: testHostGeneration("other-host"),
+    adapterGeneration: generation.adapterGeneration,
+    authReadiness: generation.authReadiness,
+    providerReachability: generation.providerReachability,
+  });
+  assert.throws(
+    () => assertSameExecutionGeneration(generation, changedHost),
+    (error: unknown) => error instanceof ExecutionProtocolError && error.code === "CROSS_HOST_CONTINUATION_REJECTED",
+  );
+  const changedPathHost = buildHostGenerationBinding({
+    configuredHostId: "test-host",
+    hostname: "test-host.local",
+    platform: "darwin",
+    arch: "arm64",
+    osRelease: "25.0.0",
+    home: "/Users/test",
+    path: "/custom/bin:/usr/bin:/bin",
+    nodeMajor: "24",
+    configRoot: "/Users/test/.devspace",
+    stateRoot: "/Users/test/.devspace/state",
+    capabilityManifestSha256: "1".repeat(64),
+  });
+  const changedHostGeneration = buildExecutionGenerationBinding({
+    profileCatalogGeneration: generation.profileCatalogGeneration,
+    provider: generation.provider,
+    model: generation.model,
+    executionIdentity: generation.executionIdentity,
+    runtimeVersion: generation.runtimeVersion,
+    devspaceBuildId: generation.devspaceBuildId,
+    devspaceSourceCommit: generation.devspaceSourceCommit,
+    hostGeneration: changedPathHost,
+    adapterGeneration: generation.adapterGeneration,
+    authReadiness: generation.authReadiness,
+    providerReachability: generation.providerReachability,
+  });
+  assert.equal(changedPathHost.physicalHostFingerprint, generation.hostGeneration.physicalHostFingerprint);
+  assert.notEqual(changedPathHost.hostGenerationFingerprint, generation.hostGeneration.hostGenerationFingerprint);
+  assert.throws(
+    () => assertSameExecutionGeneration(generation, changedHostGeneration),
     (error: unknown) => error instanceof ExecutionProtocolError && error.code === "EXECUTION_GENERATION_MISMATCH",
   );
   assert.throws(
@@ -276,6 +334,22 @@ test("execution generation accepts exact generation and rejects substitution or 
     (error: unknown) => error instanceof ExecutionProtocolError && error.code === "LEGACY_EXECUTION_BINDING_MISSING",
   );
 });
+
+function testHostGeneration(hostId = "test-host") {
+  return buildHostGenerationBinding({
+    configuredHostId: hostId,
+    hostname: "test-host.local",
+    platform: "darwin",
+    arch: "arm64",
+    osRelease: "25.0.0",
+    home: "/Users/test",
+    path: "/usr/bin:/bin",
+    nodeMajor: "24",
+    configRoot: "/Users/test/.devspace",
+    stateRoot: "/Users/test/.devspace/state",
+    capabilityManifestSha256: "1".repeat(64),
+  });
+}
 
 function ownerToolManifest() {
   return parseToolProjectionManifest({
@@ -495,6 +569,10 @@ function sampleDirectEvidence(): DirectCandidateExecutionEvidence {
     runtimeVersion: "1.0.7",
     devspaceBuildId: "build-1",
     devspaceSourceCommit: "cd907f81b46781d5a265c748374efeaab93d00cb",
+    hostGeneration: testHostGeneration(),
+    adapterGeneration: "local-agent-adapter-v1",
+    authReadiness: "unknown",
+    providerReachability: "unknown",
   });
   const now = "2026-09-23T12:00:00.000Z";
   const evidenceWithoutIntegrity: Omit<DirectCandidateExecutionEvidence, "integrity"> = {
@@ -654,6 +732,16 @@ test("DirectCandidateExecutionEvidence - invalid DispatchIntent and task/attempt
 
 test("DirectCandidateExecutionEvidence - malformed execution generation rejection", () => {
   const evidence = sampleDirectEvidence();
+  const badHost = sampleDirectEvidence();
+  (badHost.execution.execution_generation.hostGeneration as any).hostId = "other-host";
+  badHost.integrity.sha256 = computeDirectCandidateEvidenceIntegrity(badHost);
+  assert.throws(
+    () => validateDirectCandidateExecutionEvidence(badHost),
+    (err: unknown) => err instanceof ExecutionProtocolError
+      && err.code === "INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE"
+      && /hostGeneration must be a valid host-generation binding/.test(err.message),
+  );
+
   const badGen = sampleDirectEvidence();
   (badGen.execution.execution_generation as any).provider = "tampered-provider";
   badGen.integrity.sha256 = computeDirectCandidateEvidenceIntegrity(badGen);
