@@ -2104,10 +2104,7 @@ export function createServer(
         ...identity,
         manifest_status: "unavailable",
         build,
-        disposition: identity.proxy_mode
-          ? "CANONICAL_GATEWAY_MANIFEST_UNAVAILABLE"
-          : "PUBLIC_SURFACE_FAIL_CLOSED",
-        ...(identity.proxy_mode ? { required_action: "PROXY_RESTART_REQUIRED" } : {}),
+        disposition: "PUBLIC_SURFACE_FAIL_CLOSED",
       });
       return;
     }
