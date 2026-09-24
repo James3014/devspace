@@ -48,6 +48,52 @@ test("buildHerdrAgentArgs binds requested provider model, effort, and permission
   );
 });
 
+test("HerdrGatewayRegistry scopes replay identity by workspace", () => {
+  const registry = new HerdrGatewayRegistry();
+  const base: HerdrExternalHandle = {
+    schemaVersion: 1,
+    runtimeKind: "HERDR",
+    herdrSocketPath: "/tmp/herdr.sock",
+    herdrWorkspaceId: "w-a",
+    herdrPaneId: "w-a:p1",
+    herdrAgentIdentity: "agent-a",
+    herdrAgentKind: "opencode",
+    promptNonce: "nonce-a",
+    canonicalWorktreePath: "/tmp/worktree-a",
+    workspaceId: "ws-a",
+    gitHeadBefore: "a".repeat(40),
+    attemptKey: "shared-attempt",
+    dispatchIntentHash: "hash-a",
+    launchTimestamp: "2026-09-25T00:00:00.000Z",
+    enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+  };
+  const other: HerdrExternalHandle = {
+    ...base,
+    herdrWorkspaceId: "w-b",
+    herdrPaneId: "w-b:p1",
+    herdrAgentIdentity: "agent-b",
+    canonicalWorktreePath: "/tmp/worktree-b",
+    workspaceId: "ws-b",
+    dispatchIntentHash: "hash-b",
+    promptNonce: "nonce-b",
+  };
+
+  registry.registerHandle(base);
+  registry.registerHandle(other);
+
+  assert.equal(registry.getHandle("shared-attempt"), undefined, "ambiguous global lookup must fail closed");
+  assert.equal(registry.getHandle("shared-attempt", "ws-a"), base);
+  assert.equal(registry.getHandle("shared-attempt", "ws-b"), other);
+
+  registry.markPromptSubmitted("shared-attempt", "nonce-a", "ws-a");
+  assert.equal(registry.hasPromptSubmitted("shared-attempt", "nonce-a", "ws-a"), true);
+  assert.equal(registry.hasPromptSubmitted("shared-attempt", "nonce-a", "ws-b"), false);
+
+  registry.releaseHandle("shared-attempt", "ws-a");
+  assert.equal(registry.getHandle("shared-attempt", "ws-a"), undefined);
+  assert.equal(registry.getHandle("shared-attempt", "ws-b"), other);
+});
+
 test("HerdrGatewayRegistry enforces N1 duplicate prevention and N2 conflicting replay", () => {
   const registry = new HerdrGatewayRegistry();
 
