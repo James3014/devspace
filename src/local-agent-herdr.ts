@@ -81,6 +81,7 @@ export interface HerdrExternalHandle {
   requestedProvider?: string;
   requestedModel?: string;
   requestedEffort?: string;
+  requestedCliProviderId?: "cline" | "cline-pass";
   effectiveProvider?: string;
   effectiveModel?: string;
   effectiveEffort?: string;
@@ -109,6 +110,7 @@ export interface NormalizedHerdrHandleAuthority {
   requestedProvider: string | null;
   requestedModel: string | null;
   requestedEffort: string | null;
+  requestedCliProviderId: "cline" | "cline-pass" | null;
   effectiveProvider: string | null;
   effectiveModel: string | null;
   effectiveEffort: string | null;
@@ -138,6 +140,7 @@ export function normalizeHerdrHandleAuthority(handle: HerdrExternalHandle): Norm
     requestedProvider: handle.requestedProvider ?? null,
     requestedModel: handle.requestedModel ?? null,
     requestedEffort: handle.requestedEffort ?? null,
+    requestedCliProviderId: handle.requestedCliProviderId ?? null,
     effectiveProvider: handle.effectiveProvider ?? null,
     effectiveModel: handle.effectiveModel ?? null,
     effectiveEffort: handle.effectiveEffort ?? null,
@@ -187,9 +190,66 @@ export interface StartHerdrAgentParams {
   workspaceId: string;
   requestedModel?: string;
   requestedEffort?: string;
+  requestedCliProviderId?: "cline" | "cline-pass";
   writeMode?: "read_only" | "allowed";
   socketPath?: string;
   store?: LocalAgentStore;
+}
+
+export function buildHerdrAgentArgs(
+  params: Pick<
+    StartHerdrAgentParams,
+    "agentKind" | "requestedModel" | "requestedEffort" | "requestedCliProviderId" | "writeMode"
+  >,
+  canonicalWorktreePath: string,
+): string[] {
+  const args: string[] = [];
+  if (params.agentKind === "opencode") {
+    args.push("-m", params.requestedModel || "opencode/mimo-v2.6-flash-free");
+    return args;
+  }
+  if (params.agentKind === "agy") {
+    if (params.requestedModel) args.push("--model", params.requestedModel);
+    if (params.requestedEffort && params.requestedModel !== "gemini-3.7-flash-medium") {
+      args.push("--effort", params.requestedEffort);
+    }
+    args.push("--sandbox", "--dangerously-skip-permissions", "--add-dir", canonicalWorktreePath);
+    args.push("--mode", params.writeMode === "allowed" ? "accept-edits" : "plan");
+    return args;
+  }
+  if (params.agentKind === "codex") {
+    if (params.requestedModel) args.push("--model", params.requestedModel);
+    if (params.requestedEffort) {
+      args.push("-c", `model_reasoning_effort="${params.requestedEffort}"`);
+    }
+    args.push(
+      "--sandbox", params.writeMode === "allowed" ? "workspace-write" : "read-only",
+      "--ask-for-approval", "never",
+      "--cd", canonicalWorktreePath,
+    );
+    return args;
+  }
+  if (params.agentKind === "cline") {
+    args.push("--provider", params.requestedCliProviderId ?? "cline");
+    if (params.requestedModel) args.push("--model", params.requestedModel);
+    if (params.requestedEffort) args.push("--thinking", params.requestedEffort);
+    if (params.writeMode !== "allowed") args.push("--plan");
+    args.push("--auto-approve", "true", "--cwd", canonicalWorktreePath);
+    return args;
+  }
+  if (params.agentKind === "grok") {
+    if (params.requestedModel) args.push("--model", params.requestedModel);
+    if (params.requestedEffort) args.push("--reasoning-effort", params.requestedEffort);
+    args.push(
+      "--cwd", canonicalWorktreePath,
+      "--permission-mode", params.writeMode === "allowed" ? "acceptEdits" : "plan",
+      "--always-approve",
+      "--no-subagents",
+      "--disable-web-search",
+    );
+    return args;
+  }
+  return args;
 }
 
 export interface HerdrPromptOptions {
@@ -889,6 +949,7 @@ export class HerdrThinGateway {
       herdrAgentKind: params.agentKind,
       ...(params.requestedModel ? { requestedModel: params.requestedModel } : {}),
       ...(params.requestedEffort ? { requestedEffort: params.requestedEffort } : {}),
+      ...(params.requestedCliProviderId ? { requestedCliProviderId: params.requestedCliProviderId } : {}),
       promptNonce: launch.promptNonce,
       canonicalWorktreePath: canonicalPath,
       workspaceId: params.workspaceId,
@@ -1036,6 +1097,11 @@ export class HerdrThinGateway {
           `[ATTEMPT_REPLAY_CONFLICT] Replay requestedEffort '${params.requestedEffort}' does not match durable handle requestedEffort '${existing.requestedEffort}'`,
         );
       }
+      if ((existing.requestedCliProviderId ?? undefined) !== (params.requestedCliProviderId ?? undefined)) {
+        throw new Error(
+          `[ATTEMPT_REPLAY_CONFLICT] Replay requestedCliProviderId '${params.requestedCliProviderId}' does not match durable handle requestedCliProviderId '${existing.requestedCliProviderId}'`,
+        );
+      }
 
       // E2: Stale durable IDs are not proof of current live process continuity.
       // Returning a usable live handle from replay requires current positive re-observation.
@@ -1105,6 +1171,11 @@ export class HerdrThinGateway {
           `[ATTEMPT_REPLAY_CONFLICT] Replay requestedEffort '${params.requestedEffort}' does not match launch fence requestedEffort '${launch.requestedEffort}'`,
         );
       }
+      if ((launch.requestedCliProviderId ?? undefined) !== (params.requestedCliProviderId ?? undefined)) {
+        throw new Error(
+          `[ATTEMPT_REPLAY_CONFLICT] Replay requestedCliProviderId '${params.requestedCliProviderId}' does not match launch fence requestedCliProviderId '${launch.requestedCliProviderId}'`,
+        );
+      }
 
       const reconciled = await this.reconcileFencedLaunch(
         params,
@@ -1137,6 +1208,7 @@ export class HerdrThinGateway {
       herdrSocketPath,
       requestedModel: params.requestedModel,
       requestedEffort: params.requestedEffort,
+      requestedCliProviderId: params.requestedCliProviderId,
       promptNonce,
       workspaceId: params.workspaceId,
       plannedAgentName: agentName,
@@ -1218,19 +1290,9 @@ export class HerdrThinGateway {
       }
     }
 
-    // 2. Start agent in pane
-    const args: string[] = [];
-    if (params.agentKind === "opencode") {
-      const model = params.requestedModel || "opencode/mimo-v2.6-flash-free";
-      args.push("-m", model);
-    } else if (params.agentKind === "agy") {
-      if (params.requestedModel) args.push("--model", params.requestedModel);
-      if (params.requestedEffort && params.requestedModel !== "gemini-3.7-flash-medium") {
-        args.push("--effort", params.requestedEffort);
-      }
-      args.push("--sandbox", "--dangerously-skip-permissions", "--add-dir", canonicalPath);
-      args.push("--mode", params.writeMode === "allowed" ? "accept-edits" : "plan");
-    }
+    // 2. Start agent in pane. Provider/model/effort identity recorded in
+    // the durable handle must be projected into the actual CLI invocation.
+    const args = buildHerdrAgentArgs(params, canonicalPath);
 
     const agentReq: HerdrSocketRequest = {
       id: `HERDR-LAUNCH:${params.attemptKey}:agent`,
@@ -1369,6 +1431,7 @@ export class HerdrThinGateway {
       herdrAgentKind: params.agentKind,
       ...(params.requestedModel ? { requestedModel: params.requestedModel } : {}),
       ...(params.requestedEffort ? { requestedEffort: params.requestedEffort } : {}),
+      ...(params.requestedCliProviderId ? { requestedCliProviderId: params.requestedCliProviderId } : {}),
       promptNonce,
       canonicalWorktreePath: canonicalPath,
       workspaceId: params.workspaceId,
@@ -1397,6 +1460,7 @@ export class HerdrThinGateway {
             herdrSocketPath,
             ...(params.requestedModel ? { requestedModel: params.requestedModel } : {}),
             ...(params.requestedEffort ? { requestedEffort: params.requestedEffort } : {}),
+            ...(params.requestedCliProviderId ? { requestedCliProviderId: params.requestedCliProviderId } : {}),
             promptNonce,
             ...(params.workspaceId ? { workspaceId: params.workspaceId } : {}),
             herdrWorkspaceId: wsId,
