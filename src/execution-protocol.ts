@@ -229,6 +229,24 @@ export interface ExecutionResult {
   error?: string;
 }
 
+export const HOST_GENERATION_SCHEMA = "devspace.host_generation.v1" as const;
+
+export type ExecutionAuthReadiness = "READY" | "NOT_READY" | "UNKNOWN";
+
+export interface HostGenerationBinding {
+  schema: typeof HOST_GENERATION_SCHEMA;
+  hostId: string;
+  platform: string;
+  arch: string;
+  homeSha256: string;
+  pathSha256: string;
+  nodeMajor: string;
+  stateRootSha256: string;
+  capabilityManifestSha256: string;
+  adapterGeneration: string;
+  hostGenerationHash: string;
+}
+
 /** Material runtime generation pinned to one durable local-agent session. */
 export interface ExecutionGenerationBinding {
   profileCatalogGeneration: string;
@@ -239,6 +257,8 @@ export interface ExecutionGenerationBinding {
   devspaceBuildId: string;
   devspaceSourceCommit: string;
   capabilitySurfaceDigest: string;
+  hostGeneration?: HostGenerationBinding;
+  authReadiness?: ExecutionAuthReadiness;
   executionBindingHash: string;
 }
 
@@ -253,6 +273,7 @@ export class ExecutionProtocolError extends Error {
       | "INVALID_TOOL_PROJECTION_MANIFEST"
       | "TOOL_MANIFEST_REF_MISMATCH"
       | "EXECUTION_GENERATION_MISMATCH"
+      | "CROSS_HOST_CONTINUATION_REJECTED"
       | "LEGACY_EXECUTION_BINDING_MISSING"
       | "INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE",
     message: string,
@@ -835,6 +856,73 @@ export function assertExecutionAuthority(
   }
 }
 
+export function buildHostGenerationBinding(input: {
+  hostName: string;
+  platform: string;
+  arch: string;
+  homeDir: string;
+  pathEnv: string;
+  nodeVersion: string;
+  stateRoot: string;
+  capabilityManifestSha256: string;
+  adapterGeneration: string;
+}): HostGenerationBinding {
+  const homeSha256 = sha256(input.homeDir);
+  const pathSha256 = sha256(input.pathEnv);
+  const stateRootSha256 = sha256(input.stateRoot);
+  const nodeMajor = input.nodeVersion.split(".")[0] || input.nodeVersion;
+  const hostId = `local:${sha256(canonicalJson({
+    hostName: input.hostName,
+    platform: input.platform,
+    arch: input.arch,
+    homeSha256,
+    stateRootSha256,
+  }))}`;
+  const withoutHash = {
+    schema: HOST_GENERATION_SCHEMA,
+    hostId,
+    platform: input.platform,
+    arch: input.arch,
+    homeSha256,
+    pathSha256,
+    nodeMajor,
+    stateRootSha256,
+    capabilityManifestSha256: input.capabilityManifestSha256,
+    adapterGeneration: input.adapterGeneration,
+  };
+  return {
+    ...withoutHash,
+    hostGenerationHash: sha256(canonicalJson(withoutHash)),
+  };
+}
+
+function hostGenerationIsValid(value: unknown): value is HostGenerationBinding {
+  if (!isRecord(value)) return false;
+  if (
+    value.schema !== HOST_GENERATION_SCHEMA ||
+    typeof value.hostId !== "string" ||
+    !/^local:[0-9a-f]{64}$/.test(value.hostId) ||
+    typeof value.platform !== "string" ||
+    typeof value.arch !== "string" ||
+    typeof value.homeSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(value.homeSha256) ||
+    typeof value.pathSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(value.pathSha256) ||
+    typeof value.nodeMajor !== "string" ||
+    !/^\d+$/.test(value.nodeMajor) ||
+    typeof value.stateRootSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(value.stateRootSha256) ||
+    typeof value.capabilityManifestSha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(value.capabilityManifestSha256) ||
+    typeof value.adapterGeneration !== "string" ||
+    value.adapterGeneration.length === 0 ||
+    typeof value.hostGenerationHash !== "string" ||
+    !/^[0-9a-f]{64}$/.test(value.hostGenerationHash)
+  ) return false;
+  const { hostGenerationHash: _ignored, ...withoutHash } = value;
+  return value.hostGenerationHash === sha256(canonicalJson(withoutHash));
+}
+
 export function buildExecutionGenerationBinding(input: Omit<ExecutionGenerationBinding, "capabilitySurfaceDigest" | "executionBindingHash"> & {
   capabilitySurfaceDigest?: string;
 }): ExecutionGenerationBinding {
@@ -852,6 +940,8 @@ export function buildExecutionGenerationBinding(input: Omit<ExecutionGenerationB
     devspaceBuildId: input.devspaceBuildId,
     devspaceSourceCommit: input.devspaceSourceCommit,
     capabilitySurfaceDigest,
+    ...(input.hostGeneration ? { hostGeneration: input.hostGeneration } : {}),
+    ...(input.authReadiness ? { authReadiness: input.authReadiness } : {}),
   };
   return {
     ...withoutHash,
@@ -868,6 +958,20 @@ export function assertSameExecutionGeneration(
       "LEGACY_EXECUTION_BINDING_MISSING",
       "Durable agent predates execution-generation binding and requires explicit rebind instead of silent continuation.",
     );
+  }
+  if (current.hostGeneration) {
+    if (!stored.hostGeneration) {
+      throw new ExecutionProtocolError(
+        "CROSS_HOST_CONTINUATION_REJECTED",
+        "Durable execution generation predates host-generation binding; cross-host-equivalent continuation cannot be proven.",
+      );
+    }
+    if (stored.hostGeneration.hostGenerationHash !== current.hostGeneration.hostGenerationHash) {
+      throw new ExecutionProtocolError(
+        "CROSS_HOST_CONTINUATION_REJECTED",
+        `Host generation changed (stored ${stored.hostGeneration.hostGenerationHash}, current ${current.hostGeneration.hostGenerationHash}); explicit rebind required.`,
+      );
+    }
   }
   if (stored.executionBindingHash !== current.executionBindingHash) {
     throw new ExecutionProtocolError(
@@ -893,6 +997,11 @@ export function deserializeExecutionGenerationBinding(value: string | null | und
       typeof parsed.devspaceSourceCommit !== "string" ||
       typeof parsed.capabilitySurfaceDigest !== "string" ||
       typeof parsed.executionBindingHash !== "string"
+    ) return undefined;
+    if (parsed.hostGeneration !== undefined && !hostGenerationIsValid(parsed.hostGeneration)) return undefined;
+    if (
+      parsed.authReadiness !== undefined &&
+      !["READY", "NOT_READY", "UNKNOWN"].includes(parsed.authReadiness)
     ) return undefined;
     return parsed as ExecutionGenerationBinding;
   } catch {
@@ -1301,6 +1410,15 @@ export function validateDirectCandidateExecutionEvidence(value: unknown): Direct
   if (gen.capabilitySurfaceDigest !== expectedCapabilityDigest) {
     throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution_generation.capabilitySurfaceDigest mismatch.");
   }
+  if (gen.hostGeneration !== undefined && !hostGenerationIsValid(gen.hostGeneration)) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution_generation.hostGeneration is invalid or self-inconsistent.");
+  }
+  if (
+    gen.authReadiness !== undefined &&
+    !["READY", "NOT_READY", "UNKNOWN"].includes(String(gen.authReadiness))
+  ) {
+    throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution_generation.authReadiness is invalid.");
+  }
   const genPayload: Record<string, unknown> = {
     profileCatalogGeneration: gen.profileCatalogGeneration,
     provider: gen.provider,
@@ -1311,6 +1429,8 @@ export function validateDirectCandidateExecutionEvidence(value: unknown): Direct
   };
   if (gen.model !== undefined) genPayload.model = gen.model;
   if (gen.runtimeVersion !== undefined) genPayload.runtimeVersion = gen.runtimeVersion;
+  if (gen.hostGeneration !== undefined) genPayload.hostGeneration = gen.hostGeneration;
+  if (gen.authReadiness !== undefined) genPayload.authReadiness = gen.authReadiness;
   const expectedGenHash = sha256(canonicalJson(genPayload));
   if (gen.executionBindingHash !== expectedGenHash) {
     throw new ExecutionProtocolError("INVALID_DIRECT_CANDIDATE_EXECUTION_EVIDENCE", "execution_generation.executionBindingHash mismatch.");
