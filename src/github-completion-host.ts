@@ -11,6 +11,7 @@ import {
   mergePullRequest,
   type GitHubCompletionTransport,
   type IntegrationTargetResolver,
+  type MergeEffectGuard,
   type MergeMethod,
 } from "./git-pr-merge.js";
 
@@ -39,6 +40,7 @@ export interface GitHubCompletionToolOptions {
   pythonBin: string;
   transport?: GitHubCompletionTransport;
   targetResolver?: IntegrationTargetResolver;
+  beforeMergeEffect?: MergeEffectGuard;
   /** Pilot/test seam only. Production proxy callers never supply this hook. */
   onRequiredChecksPending?: (context: {
     headSha: string;
@@ -418,6 +420,7 @@ class CompletionHostPort {
           cwd: this.options.nexusRoot,
           transport: this.transport,
           targetResolver: this.targetResolver,
+          beforeMergeEffect: this.options.beforeMergeEffect,
         },
       );
       return { status: "SUCCESS", merged_sha: receipt.merge_commit_sha ?? receipt.new_main_sha, reason: null };
