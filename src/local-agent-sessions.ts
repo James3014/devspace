@@ -638,9 +638,22 @@ export class LocalAgentSessionManager {
    * unique handle key and must never be used to recover another record's
    * external runtime authority.
    */
-  getHerdrExternalHandle(agentId: string): HerdrExternalHandle | undefined {
-    const rec = this.store.getById(agentId);
-    const binding = rec?.externalRuntimeBinding;
+  getHerdrExternalHandle(agentIdOrAttemptKey: string): HerdrExternalHandle | undefined {
+    let rec = this.store.getById(agentIdOrAttemptKey);
+
+    // Restart/recovery callers may know only attemptKey. That lookup is safe
+    // only when it identifies exactly one durable record. attemptKey is scoped
+    // to a physical workspace, so a multi-workspace collision must fail closed
+    // rather than selecting the first record.
+    if (!rec) {
+      const matches = this.store.list().filter(
+        (candidate) => candidate.startReplay?.key === agentIdOrAttemptKey,
+      );
+      if (matches.length !== 1) return undefined;
+      rec = matches[0];
+    }
+
+    const binding = rec.externalRuntimeBinding;
     const rawHandle =
       binding?.runtimeKind === HERDR_RUNTIME_KIND &&
       binding.handle &&
@@ -651,7 +664,7 @@ export class LocalAgentSessionManager {
 
     if (rawHandle) {
       const handle = rawHandle as unknown as HerdrExternalHandle;
-      handle.agentId = agentId;
+      handle.agentId = rec.id;
       defaultHerdrGatewayRegistry.registerHandle(handle);
       if (
         binding?.promptState?.consequentialPromptFenced &&
@@ -663,11 +676,11 @@ export class LocalAgentSessionManager {
           handle.workspaceId,
         );
       }
-      this.herdrHandles.set(agentId, handle);
+      this.herdrHandles.set(rec.id, handle);
       return handle;
     }
 
-    return this.herdrHandles.get(agentId);
+    return this.herdrHandles.get(rec.id);
   }
 
   private usesHerdrBackend(): boolean {
