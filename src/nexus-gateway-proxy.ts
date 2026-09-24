@@ -1,4 +1,9 @@
+import { execFile } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { promisify } from "node:util";
 import { McpServer, type CallToolResult } from "@modelcontextprotocol/server";
 import * as z from "zod/v4";
 import { CANONICAL_PROXY_LOCAL_PROTECTED_TOOLS, type ServerConfig } from "./config.js";
@@ -6,9 +11,12 @@ import {
   createTrustedIntegrationTargetResolver,
   defaultGitMergeTransportFactory,
   gitMergePullRequestTool,
+  MergePullRequestError,
+  PR_MERGE_ERROR_CODES,
   type GitHubCompletionTransport,
   type GitHubPullRequestTransport,
   type IntegrationTargetResolver,
+  type MergeEffectGuard,
   type TrustedIntegrationTarget,
 } from "./git-pr-merge.js";
 import { runGitHubCompletionTool } from "./github-completion-host.js";
@@ -60,10 +68,95 @@ export function createPublicNexusIntegrationTargetResolver(): IntegrationTargetR
   return createTrustedIntegrationTargetResolver([PUBLIC_NEXUS_TRUSTED_INTEGRATION_TARGET]);
 }
 
+const execFileAsync = promisify(execFile);
+const PUBLIC_DIRECT_MERGE_LANES = new Set(["DIRECT_CANONICAL", "DIRECT_DELEGATED"]);
+
+export function createPublicDirectMergeLaneGuard(config: ServerConfig): MergeEffectGuard {
+  return async (context) => {
+    const nexusRoot = config.nexusCanonicalSourceRoot;
+    const pythonBin = config.nexusPythonBin;
+    if (!nexusRoot || !pythonBin) {
+      throw new MergePullRequestError(
+        PR_MERGE_ERROR_CODES.MERGE_LANE_NOT_AUTHORIZED,
+        "trusted merge-lane validation requires NEXUS_CANONICAL_SOURCE_ROOT and NEXUS_PYTHON_BIN",
+      );
+    }
+
+    const tempRoot = await mkdtemp(join(tmpdir(), "nexus-public-merge-lane-"));
+    const eventPath = join(tempRoot, "event.json");
+    const validatorPath = join(nexusRoot, "scripts", "ops", "trusted_merge_lane_gate.py");
+    try {
+      await writeFile(
+        eventPath,
+        JSON.stringify({
+          event_name: "pull_request_target",
+          repository: { full_name: context.repository },
+          pull_request: {
+            number: context.pullRequest.number,
+            body: context.pullRequest.body ?? "",
+            base: { sha: context.expectedBaseSha },
+            head: { sha: context.expectedHeadSha },
+          },
+        }),
+        { encoding: "utf8", mode: 0o600 },
+      );
+
+      let stdout: string;
+      try {
+        const result = await execFileAsync(
+          pythonBin,
+          [validatorPath, "--event-json", eventPath, "--repo-root", nexusRoot],
+          { cwd: nexusRoot, timeout: 10_000, maxBuffer: 1024 * 1024 },
+        );
+        stdout = String(result.stdout).trim();
+      } catch (error) {
+        const record = error && typeof error === "object"
+          ? error as { stdout?: unknown; message?: unknown }
+          : {};
+        const detail = typeof record.stdout === "string" && record.stdout.trim()
+          ? record.stdout.trim()
+          : typeof record.message === "string"
+            ? record.message
+            : "trusted lane validator failed";
+        throw new MergePullRequestError(
+          PR_MERGE_ERROR_CODES.MERGE_LANE_NOT_AUTHORIZED,
+          `trusted merge-lane validator rejected the PR: ${detail}`,
+        );
+      }
+
+      let result: Record<string, unknown>;
+      try {
+        result = JSON.parse(stdout) as Record<string, unknown>;
+      } catch {
+        throw new MergePullRequestError(
+          PR_MERGE_ERROR_CODES.MERGE_LANE_NOT_AUTHORIZED,
+          "trusted merge-lane validator returned malformed JSON",
+        );
+      }
+      const lane = typeof result.execution_lane === "string" ? result.execution_lane : "";
+      if (
+        result.schema !== "nexus.trusted_merge_lane_gate_result.v1"
+        || result.status !== "PASS"
+        || result.pull_request_number !== context.pullRequest.number
+        || result.head_sha !== context.expectedHeadSha
+        || !PUBLIC_DIRECT_MERGE_LANES.has(lane)
+      ) {
+        throw new MergePullRequestError(
+          PR_MERGE_ERROR_CODES.MERGE_LANE_NOT_AUTHORIZED,
+          `public direct merge requires a trusted DIRECT lane; validator returned ${lane || "no execution lane"}`,
+        );
+      }
+    } finally {
+      await rm(tempRoot, { recursive: true, force: true });
+    }
+  };
+}
+
 export interface NexusGatewayProxyConstructionOptions {
   /** Test seams. Production callers omit them. */
   gitMergeTransportFactory?: () => GitHubPullRequestTransport;
   gitCompletionTransportFactory?: () => GitHubCompletionTransport;
+  directMergeLaneGuardFactory?: (config: ServerConfig) => MergeEffectGuard;
 }
 
 /**
@@ -471,6 +564,9 @@ export async function createNexusGatewayProxyServer(
             cwd: canonicalRoot,
             transport,
             targetResolver: createPublicNexusIntegrationTargetResolver(),
+            beforeMergeEffect:
+              options?.directMergeLaneGuardFactory?.(config)
+              ?? createPublicDirectMergeLaneGuard(config),
           });
           return {
             ...response,

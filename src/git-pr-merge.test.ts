@@ -931,6 +931,52 @@ await asyncTest("commit statuses fetch throws → REQUIRED_CHECKS_UNKNOWN", asyn
 });
 
 // ============================================================
+console.log("\n=== pre-merge effect guard ===");
+
+await asyncTest("pre-merge guard rejects before physical merge effect", async () => {
+  await withWorkspace({}, async (dir) => {
+    const fake = new FakeGitHubTransport();
+    fake.pr = makePr({ body: "lane evidence" });
+    let observedBody: string | undefined;
+    await assert.rejects(
+      mergePullRequest(baseInput(), {
+        cwd: dir,
+        transport: fake,
+        targetResolver: acmeResolver,
+        beforeMergeEffect: async (context) => {
+          observedBody = context.pullRequest.body;
+          throw new MergePullRequestError(
+            PR_MERGE_ERROR_CODES.MERGE_LANE_NOT_AUTHORIZED,
+            "GOVERNED must use completion",
+          );
+        },
+      }),
+      (e) => assertErrorCode(e, PR_MERGE_ERROR_CODES.MERGE_LANE_NOT_AUTHORIZED),
+    );
+    assert.equal(observedBody, "lane evidence", "guard must receive the fresh PR body");
+    assert.equal(fake.mergeCalls.length, 0, "guard rejection must happen before GitHub merge effect");
+  });
+});
+
+await asyncTest("pre-merge guard permits existing CAS core when authorized", async () => {
+  await withWorkspace({}, async (dir) => {
+    const fake = new FakeGitHubTransport();
+    let guardCalls = 0;
+    const receipt = await mergePullRequest(baseInput(), {
+      cwd: dir,
+      transport: fake,
+      targetResolver: acmeResolver,
+      beforeMergeEffect: async () => {
+        guardCalls += 1;
+      },
+    });
+    assert.equal(guardCalls, 1);
+    assert.equal(fake.mergeCalls.length, 1);
+    assert.equal(receipt.merged, true);
+  });
+});
+
+// ============================================================
 console.log("\n=== owner confirmation ===");
 
 await asyncTest("ownerConfirmation false → OWNER_CONFIRMATION_REQUIRED", async () => {

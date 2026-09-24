@@ -56,6 +56,7 @@ export const PR_MERGE_ERROR_CODES = {
   REQUIRED_CHECKS_PENDING: "REQUIRED_CHECKS_PENDING",
   REQUIRED_CHECKS_FAILED: "REQUIRED_CHECKS_FAILED",
   REQUIRED_CHECKS_UNKNOWN: "REQUIRED_CHECKS_UNKNOWN",
+  MERGE_LANE_NOT_AUTHORIZED: "MERGE_LANE_NOT_AUTHORIZED",
   AUTHORIZATION_FAILURE: "AUTHORIZATION_FAILURE",
   TRANSPORT_AVAILABILITY_FAILURE: "TRANSPORT_AVAILABILITY_FAILURE",
   MERGE_REJECTED: "MERGE_REJECTED",
@@ -344,6 +345,7 @@ export interface PullRequestView {
   mergeCommitOid: string | null;
   title: string;
   url: string;
+  body?: string;
 }
 
 export interface BranchRefView {
@@ -533,6 +535,7 @@ export class GhCliGitHubTransport implements GitHubCompletionTransport {
       "mergeCommit",
       "title",
       "url",
+      "body",
     ].join(",");
     let stdout: string;
     try {
@@ -579,6 +582,7 @@ export class GhCliGitHubTransport implements GitHubCompletionTransport {
       mergeCommitOid: mergeCommit && typeof mergeCommit.oid === "string" ? mergeCommit.oid : null,
       title: String(p.title ?? ""),
       url: String(p.url ?? ""),
+      body: String(p.body ?? ""),
     };
   }
 
@@ -1282,10 +1286,22 @@ function runGit(cwd: string, args: string[]): Promise<string> {
 
 // --- merge orchestration ------------------------------------------------------
 
+export interface MergeEffectGuardContext {
+  gitRoot: string;
+  repository: string;
+  defaultBranch: string;
+  pullRequest: PullRequestView;
+  expectedBaseSha: string;
+  expectedHeadSha: string;
+}
+
+export type MergeEffectGuard = (context: MergeEffectGuardContext) => Promise<void>;
+
 export interface MergePullRequestOptions {
   cwd: string;
   transport: GitHubPullRequestTransport;
   targetResolver?: IntegrationTargetResolver;
+  beforeMergeEffect?: MergeEffectGuard;
 }
 
 export interface MergeReceipt {
@@ -1472,6 +1488,7 @@ export async function mergePullRequest(
   // deterministic code used in preflight; the merge API is never called.
   let observedBase = baseRef.sha;
   let observedHead = pr.headRefOid;
+  let finalPr = pr;
   try {
     const [freshBase, freshPr] = await Promise.all([
       transport.getBranchRef(repo, defaultBranch),
@@ -1515,9 +1532,29 @@ export async function mergePullRequest(
     }
     observedBase = freshBase.sha;
     observedHead = freshPr.headRefOid;
+    finalPr = freshPr;
   } catch (e) {
     if (e instanceof MergePullRequestError) throw e;
     throw mapTransportError(e, "final-preflight");
+  }
+
+  if (options.beforeMergeEffect) {
+    try {
+      await options.beforeMergeEffect({
+        gitRoot,
+        repository: repo,
+        defaultBranch,
+        pullRequest: finalPr,
+        expectedBaseSha: input.expectedBaseSha,
+        expectedHeadSha: input.expectedHeadSha,
+      });
+    } catch (e) {
+      if (e instanceof MergePullRequestError) throw e;
+      throw new MergePullRequestError(
+        PR_MERGE_ERROR_CODES.MERGE_LANE_NOT_AUTHORIZED,
+        `pre-merge lane guard rejected the effect: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
   }
 
   let mergeResult: MergeResultView;
@@ -1606,6 +1643,7 @@ export interface MergeToolContext {
   cwd: string;
   transport?: GitHubPullRequestTransport;
   targetResolver?: IntegrationTargetResolver;
+  beforeMergeEffect?: MergeEffectGuard;
 }
 
 function toMcpError(error: unknown): ToolResult {
@@ -1658,6 +1696,7 @@ export async function gitMergePullRequestTool(
       cwd: context.cwd,
       transport: context.transport ?? defaultGitMergeTransportFactory(),
       targetResolver: context.targetResolver,
+      beforeMergeEffect: context.beforeMergeEffect,
     });
     return {
       content: [{ type: "text", text: JSON.stringify(receipt, null, 2) }],

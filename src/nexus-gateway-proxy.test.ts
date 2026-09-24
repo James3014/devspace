@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { execSync } from "node:child_process";
 import { once } from "node:events";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   NexusGatewayProxyError,
   createNexusGatewayProxyServer,
+  createPublicDirectMergeLaneGuard,
   createPublicNexusIntegrationTargetResolver,
   fetchNexusGatewayToolManifest,
   forwardNexusGatewayTool,
@@ -18,6 +19,7 @@ import { loadConfig, type ServerConfig } from "./config.js";
 import { createMcpTransportBoundary, MODERN_MCP_PROTOCOL_VERSION } from "./mcp-transport.js";
 import { createServer } from "./server.js";
 import {
+  MergePullRequestError,
   PR_MERGE_ERROR_CODES,
   type GitHubPullRequestTransport,
   type RepositoryView,
@@ -29,6 +31,7 @@ import {
   type CommitStatusEvidence,
   type CheckRunView,
   type MergeResultView,
+  type MergeEffectGuard,
   type MergeMethod,
 } from "./git-pr-merge.js";
 
@@ -331,6 +334,7 @@ try {
     manifestToRegister: typeof manifest,
     root: string | undefined,
     transport: FakeGitHubTransport,
+    directGuard?: MergeEffectGuard,
   ): Promise<{ executor: NonNullable<RegisteredMergeTool["executor"]>; registered: Record<string, RegisteredMergeTool> }> {
     const proxyConfig = {
       ...config,
@@ -338,6 +342,7 @@ try {
     } as ServerConfig;
     const proxy = await createNexusGatewayProxyServer(proxyConfig, manifestToRegister, {
       gitMergeTransportFactory: () => transport,
+      directMergeLaneGuardFactory: () => directGuard ?? (async () => undefined),
     });
     const registered = (proxy as unknown as { _registeredTools?: Record<string, RegisteredMergeTool> })._registeredTools ?? {};
     assert.ok(registered["git_merge_pull_request"]?.executor, "git_merge_pull_request must be registered on the proxy");
@@ -387,7 +392,7 @@ try {
     for (const requiredKey of ["prNumber", "expectedBaseSha", "expectedHeadSha", "mergeMethod", "ownerConfirmation"]) {
       assert.ok(properties.includes(requiredKey), `public schema must contain ${requiredKey}`);
     }
-    for (const forbiddenKey of ["workspaceId", "cwd", "repo", "repository", "remote", "branch"]) {
+    for (const forbiddenKey of ["workspaceId", "cwd", "repo", "repository", "remote", "branch", "execution_lane", "executionLane", "internal", "completion"]) {
       assert.ok(!properties.includes(forbiddenKey), `public schema must NOT contain ${forbiddenKey}`);
     }
     await schemaBoundary.close();
@@ -459,6 +464,92 @@ try {
       });
     } finally {
       fixture.cleanup();
+    }
+  }
+
+  // C2. The public direct action cannot reach the physical merge effect when
+  // the host-selected lane guard rejects the exact PR as GOVERNED.
+  {
+    const fixture = makeCanonicalFixture();
+    try {
+      const transport = new FakeGitHubTransport();
+      const { executor } = await buildPublicProxy(
+        manifest,
+        fixture.dir,
+        transport,
+        async () => {
+          throw new MergePullRequestError(
+            PR_MERGE_ERROR_CODES.MERGE_LANE_NOT_AUTHORIZED,
+            "GOVERNED must use github_complete_pull_request",
+          );
+        },
+      );
+      const result = await executor(proxyMergeArgs());
+      assert.equal(result.isError, true);
+      const data = JSON.parse(result.content?.[0]?.text ?? "{}");
+      assert.equal(data.code, PR_MERGE_ERROR_CODES.MERGE_LANE_NOT_AUTHORIZED);
+      assert.equal(transport.mergeCalls.length, 0, "GOVERNED direct call must stop before GitHub merge effect");
+    } finally {
+      fixture.cleanup();
+    }
+  }
+
+  // C3. The production lane adapter accepts only trusted DIRECT results and
+  // rejects GOVERNED before the physical merge core.
+  {
+    const root = mkdtempSync(join(tmpdir(), "nexus-public-lane-guard-"));
+    try {
+      const ops = join(root, "scripts", "ops");
+      mkdirSync(ops, { recursive: true });
+      writeFileSync(
+        join(ops, "trusted_merge_lane_gate.py"),
+        [
+          "import json, sys",
+          "p = sys.argv[sys.argv.index('--event-json') + 1]",
+          "event = json.load(open(p, encoding='utf-8'))",
+          "pr = event['pull_request']",
+          "lane = 'GOVERNED' if 'GOVERNED' in pr.get('body', '') else 'DIRECT_CANONICAL'",
+          "print(json.dumps({'schema':'nexus.trusted_merge_lane_gate_result.v1','status':'PASS','pull_request_number':pr['number'],'head_sha':pr['head']['sha'],'execution_lane':lane}))",
+        ].join("\n"),
+        "utf8",
+      );
+
+      const guard = createPublicDirectMergeLaneGuard({
+        ...config,
+        nexusCanonicalSourceRoot: root,
+        nexusPythonBin: "python3",
+      } as ServerConfig);
+      const baseContext = {
+        gitRoot: root,
+        repository: "James3014/Nexus-new",
+        defaultBranch: "main",
+        expectedBaseSha: BASE,
+        expectedHeadSha: HEAD,
+      };
+      await guard({
+        ...baseContext,
+        pullRequest: {
+          number: 1128, state: "OPEN", isDraft: false, baseRefName: "main", baseRefOid: BASE,
+          headRefName: "direct/test", headRefOid: HEAD, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN",
+          merged: false, mergedAt: null, mergeCommitOid: null, title: "direct",
+          url: "https://github.com/James3014/Nexus-new/pull/1128", body: "DIRECT",
+        },
+      });
+      await assert.rejects(
+        guard({
+          ...baseContext,
+          pullRequest: {
+            number: 1129, state: "OPEN", isDraft: false, baseRefName: "main", baseRefOid: BASE,
+            headRefName: "governed/test", headRefOid: HEAD, mergeable: "MERGEABLE", mergeStateStatus: "CLEAN",
+            merged: false, mergedAt: null, mergeCommitOid: null, title: "governed",
+            url: "https://github.com/James3014/Nexus-new/pull/1129", body: "GOVERNED",
+          },
+        }),
+        (error: unknown) => error instanceof MergePullRequestError
+          && error.code === PR_MERGE_ERROR_CODES.MERGE_LANE_NOT_AUTHORIZED,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
     }
   }
 
