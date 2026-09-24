@@ -2711,9 +2711,21 @@ test("subagents: agent_preflight returns structured readiness without secrets", 
   assert.equal(readiness.authReady, "unknown");
   assert.equal(readiness.providerReachable, "unknown");
   assert.equal(readiness.dispatchState, "UNKNOWN");
+  const qualification = preflight.qualification as Record<string, unknown>;
+  assert.ok(qualification);
+  assert.equal(qualification.authReadiness, "unknown");
+  assert.equal(typeof qualification.adapterGeneration, "string");
+  assert.equal(typeof qualification.executionBindingHash, "string");
+  const hostIdentity = qualification.hostIdentity as Record<string, unknown>;
+  assert.equal(hostIdentity.schema, "devspace.host_identity.v1");
+  assert.match(String(hostIdentity.hostIdentityHash), /^[0-9a-f]{64}$/);
+  assert.match(String(hostIdentity.homePathSha256), /^[0-9a-f]{64}$/);
+  assert.match(String(hostIdentity.pathEnvSha256), /^[0-9a-f]{64}$/);
   const serialized = JSON.stringify(preflight);
   assert.ok(!serialized.includes("test-owner-token"));
   assert.ok(!serialized.includes("DEVSPACE_OAUTH"));
+  if (process.env.HOME) assert.ok(!serialized.includes(process.env.HOME));
+  if (process.env.PATH) assert.ok(!serialized.includes(process.env.PATH));
 });
 
 test("subagents: controller dispatchIntent crosses the MCP schema without gaining verification authority", async (t) => {

@@ -97,6 +97,8 @@ import {
   HERDR_DEFAULT_SOCKET_PATH,
 } from "./local-agent-herdr.js";
 
+const LEGACY_AGENT_ADAPTER_GENERATION = "devspace.local-agent-legacy.v1";
+
 function catalogSnapshotIsFresh(fetchedAt: string | undefined, expiresAt: string | undefined): boolean {
   const fetched = Date.parse(fetchedAt ?? "");
   const expires = expiresAt ? Date.parse(expiresAt) : NaN;
@@ -2147,7 +2149,9 @@ export class LocalAgentSessionManager {
         devspaceBuildId: this.runtimeBuildIdentity.buildId,
         devspaceSourceCommit: this.runtimeBuildIdentity.sourceCommit,
       }),
-      adapterGeneration: HERDR_ADAPTER_GENERATION,
+      adapterGeneration: this.config.agentExecutionBackend === "herdr"
+        ? HERDR_ADAPTER_GENERATION
+        : LEGACY_AGENT_ADAPTER_GENERATION,
       authReadiness,
     });
   }

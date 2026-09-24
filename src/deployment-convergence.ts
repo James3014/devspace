@@ -51,6 +51,7 @@ export interface SessionGenerationSnapshot {
   buildId: string;
   capabilityManifestSha256: string;
   catalogGeneration: string;
+  hostIdentityHash?: string;
   sessionInitializedAt: string;
   freshness?: string;
   callerIdentityFingerprint?: string;
@@ -105,6 +106,7 @@ export interface SessionConvergenceEvaluation {
     buildId: string;
     capabilityManifestSha256: string;
     catalogGeneration: string;
+    hostIdentityHash?: string;
     toolNames?: string[];
     freshness?: string;
     cutoverMode: string;
@@ -391,6 +393,7 @@ export function evaluateSessionConvergence(
     buildId: string;
     capabilityManifestSha256: string;
     catalogGeneration: string;
+    hostIdentityHash?: string;
     toolNames?: string[];
     freshness?: string;
     cutoverMode: string;
@@ -457,7 +460,9 @@ export function evaluateSessionConvergence(
     // either side has a freshness marker and the values differ (including an
     // absent marker on the session).
     ((sessionSnapshot.freshness !== undefined || currentServer.freshness !== undefined) &&
-      sessionSnapshot.freshness !== currentServer.freshness)
+      sessionSnapshot.freshness !== currentServer.freshness) ||
+    ((sessionSnapshot.hostIdentityHash !== undefined || currentServer.hostIdentityHash !== undefined) &&
+      sessionSnapshot.hostIdentityHash !== currentServer.hostIdentityHash)
   ) {
     return {
       ...base,
@@ -467,7 +472,7 @@ export function evaluateSessionConvergence(
       reconnectRequired: true,
       reconciliationRequired: false,
       activeDrift: true,
-      details: "Server source/build/freshness identity changed; session reconnect required",
+      details: "Server source/build/freshness/host identity changed; session reconnect required",
     };
   }
 

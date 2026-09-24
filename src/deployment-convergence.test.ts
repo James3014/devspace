@@ -348,6 +348,33 @@ test("SessionConvergence: manifest and catalog drift stay stale until tools/list
   assert.equal(catalogResult.reconnectRequired, false);
 });
 
+test("SessionConvergence: host identity drift is STALE_SERVER even when source/build/catalog match", () => {
+  const current = {
+    serverInstanceId: "srv-1",
+    sourceCommit: "commit-1",
+    buildId: "build-1",
+    capabilityManifestSha256: "man-1",
+    catalogGeneration: "gen-1",
+    hostIdentityHash: "host-m5",
+    cutoverMode: "normal",
+    reconciliationRequired: false,
+  };
+  const snapshot = {
+    serverInstanceId: "srv-1",
+    sourceCommit: "commit-1",
+    buildId: "build-1",
+    capabilityManifestSha256: "man-1",
+    catalogGeneration: "gen-1",
+    hostIdentityHash: "host-m4",
+    sessionInitializedAt: new Date().toISOString(),
+  };
+  const result = evaluateSessionConvergence(snapshot, current);
+  assert.equal(result.state, "STALE_SERVER");
+  assert.equal(result.controllerDisposition, "STALE_RECONNECT_REQUIRED");
+  assert.equal(result.reconnectRequired, true);
+  assert.match(result.details, /host identity/);
+});
+
 test("SessionConvergence: source/build/freshness identity drift is STALE_SERVER", () => {
   const current = {
     serverInstanceId: "srv-1",
