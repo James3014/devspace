@@ -243,6 +243,7 @@ export interface HostGenerationBinding {
   configRootSha256: string;
   stateRootSha256: string;
   capabilityManifestSha256: string;
+  physicalHostFingerprint: string;
   hostGenerationFingerprint: string;
 }
 
@@ -857,6 +858,19 @@ export function assertExecutionAuthority(
   }
 }
 
+function physicalHostPayload(binding: Pick<
+  HostGenerationBinding,
+  "hostId" | "platform" | "arch" | "hostnameSha256" | "homeSha256"
+>): Record<string, string> {
+  return {
+    hostId: binding.hostId,
+    platform: binding.platform,
+    arch: binding.arch,
+    hostnameSha256: binding.hostnameSha256,
+    homeSha256: binding.homeSha256,
+  };
+}
+
 function hostGenerationPayload(binding: Omit<HostGenerationBinding, "hostGenerationFingerprint">): Record<string, string> {
   return {
     hostId: binding.hostId,
@@ -870,6 +884,7 @@ function hostGenerationPayload(binding: Omit<HostGenerationBinding, "hostGenerat
     configRootSha256: binding.configRootSha256,
     stateRootSha256: binding.stateRootSha256,
     capabilityManifestSha256: binding.capabilityManifestSha256,
+    physicalHostFingerprint: binding.physicalHostFingerprint,
   };
 }
 
@@ -879,10 +894,22 @@ function hostGenerationFromRecord(value: unknown): HostGenerationBinding | undef
   const keys = [
     "hostId", "platform", "arch", "osRelease", "hostnameSha256", "homeSha256",
     "pathSha256", "nodeMajor", "configRootSha256", "stateRootSha256",
-    "capabilityManifestSha256", "hostGenerationFingerprint",
+    "capabilityManifestSha256", "physicalHostFingerprint", "hostGenerationFingerprint",
   ] as const;
   if (keys.some((key) => typeof record[key] !== "string" || !record[key])) return undefined;
   const binding = record as unknown as HostGenerationBinding;
+  if (
+    !/^[0-9a-f]{64}$/.test(binding.hostnameSha256) ||
+    !/^[0-9a-f]{64}$/.test(binding.homeSha256) ||
+    !/^[0-9a-f]{64}$/.test(binding.pathSha256) ||
+    !/^[0-9a-f]{64}$/.test(binding.configRootSha256) ||
+    !/^[0-9a-f]{64}$/.test(binding.stateRootSha256) ||
+    !/^[0-9a-f]{64}$/.test(binding.capabilityManifestSha256) ||
+    !/^[0-9a-f]{64}$/.test(binding.physicalHostFingerprint) ||
+    !/^[0-9a-f]{64}$/.test(binding.hostGenerationFingerprint)
+  ) return undefined;
+  const expectedPhysical = sha256(canonicalJson(physicalHostPayload(binding)));
+  if (binding.physicalHostFingerprint !== expectedPhysical) return undefined;
   const expected = sha256(canonicalJson(hostGenerationPayload(binding)));
   return binding.hostGenerationFingerprint === expected ? binding : undefined;
 }
@@ -921,22 +948,25 @@ export function buildHostGenerationBinding(input: {
     hostname: input.hostname,
     platform: input.platform,
     arch: input.arch,
-    osRelease: input.osRelease,
     home: input.home,
-    stateRoot: input.stateRoot,
   };
-  const withoutFingerprint: Omit<HostGenerationBinding, "hostGenerationFingerprint"> = {
-    hostId: configuredHostId ?? `derived:${sha256(canonicalJson(derivedHostIdentity))}`,
+  const hostId = configuredHostId ?? `derived:${sha256(canonicalJson(derivedHostIdentity))}`;
+  const physicalFields = {
+    hostId,
     platform: input.platform,
     arch: input.arch,
-    osRelease: input.osRelease,
     hostnameSha256: sha256(input.hostname),
     homeSha256: sha256(input.home),
+  };
+  const withoutFingerprint: Omit<HostGenerationBinding, "hostGenerationFingerprint"> = {
+    ...physicalFields,
+    osRelease: input.osRelease,
     pathSha256: sha256(input.path),
     nodeMajor: input.nodeMajor,
     configRootSha256: sha256(input.configRoot),
     stateRootSha256: sha256(input.stateRoot),
     capabilityManifestSha256: input.capabilityManifestSha256,
+    physicalHostFingerprint: sha256(canonicalJson(physicalHostPayload(physicalFields))),
   };
   return {
     ...withoutFingerprint,
@@ -984,10 +1014,16 @@ export function assertSameHostGeneration(
       "Durable agent predates execution-generation binding because host-generation evidence is missing; explicit rebind is required instead of silent continuation.",
     );
   }
-  if (stored.hostGenerationFingerprint !== current.hostGenerationFingerprint) {
+  if (stored.physicalHostFingerprint !== current.physicalHostFingerprint) {
     throw new ExecutionProtocolError(
       "CROSS_HOST_CONTINUATION_REJECTED",
-      `Durable host generation changed (stored ${stored.hostGenerationFingerprint}, current ${current.hostGenerationFingerprint}); cross-host continuation requires explicit rebind.`,
+      `Durable physical host changed (stored ${stored.physicalHostFingerprint}, current ${current.physicalHostFingerprint}); cross-host continuation requires explicit rebind.`,
+    );
+  }
+  if (stored.hostGenerationFingerprint !== current.hostGenerationFingerprint) {
+    throw new ExecutionProtocolError(
+      "EXECUTION_GENERATION_MISMATCH",
+      `Durable host generation changed on the same physical host (stored ${stored.hostGenerationFingerprint}, current ${current.hostGenerationFingerprint}); explicit rebind is required.`,
     );
   }
 }

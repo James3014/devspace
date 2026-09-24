@@ -2735,6 +2735,7 @@ test("subagents: agent_preflight returns structured readiness without secrets", 
   const qualification = preflight.qualification as Record<string, unknown>;
   const hostGeneration = qualification.hostGeneration as Record<string, unknown>;
   assert.match(String(hostGeneration.hostId), /^(?:derived:|[A-Za-z0-9._:-]+)$/);
+  assert.match(String(hostGeneration.physicalHostFingerprint), /^[0-9a-f]{64}$/);
   assert.match(String(hostGeneration.hostGenerationFingerprint), /^[0-9a-f]{64}$/);
   assert.match(String(hostGeneration.capabilityManifestSha256), /^[0-9a-f]{64}$/);
   assert.equal(qualification.authReadiness, "unknown");

@@ -5479,6 +5479,7 @@ export function createMcpServer(
               configRootSha256: z.string().regex(/^[0-9a-f]{64}$/),
               stateRootSha256: z.string().regex(/^[0-9a-f]{64}$/),
               capabilityManifestSha256: z.string().regex(/^[0-9a-f]{64}$/),
+              physicalHostFingerprint: z.string().regex(/^[0-9a-f]{64}$/),
               hostGenerationFingerprint: z.string().regex(/^[0-9a-f]{64}$/),
             }),
             adapterGeneration: z.string(),

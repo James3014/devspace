@@ -297,6 +297,38 @@ test("execution generation accepts exact generation and rejects substitution or 
     () => assertSameExecutionGeneration(generation, changedHost),
     (error: unknown) => error instanceof ExecutionProtocolError && error.code === "CROSS_HOST_CONTINUATION_REJECTED",
   );
+  const changedPathHost = buildHostGenerationBinding({
+    configuredHostId: "test-host",
+    hostname: "test-host.local",
+    platform: "darwin",
+    arch: "arm64",
+    osRelease: "25.0.0",
+    home: "/Users/test",
+    path: "/custom/bin:/usr/bin:/bin",
+    nodeMajor: "24",
+    configRoot: "/Users/test/.devspace",
+    stateRoot: "/Users/test/.devspace/state",
+    capabilityManifestSha256: "1".repeat(64),
+  });
+  const changedHostGeneration = buildExecutionGenerationBinding({
+    profileCatalogGeneration: generation.profileCatalogGeneration,
+    provider: generation.provider,
+    model: generation.model,
+    executionIdentity: generation.executionIdentity,
+    runtimeVersion: generation.runtimeVersion,
+    devspaceBuildId: generation.devspaceBuildId,
+    devspaceSourceCommit: generation.devspaceSourceCommit,
+    hostGeneration: changedPathHost,
+    adapterGeneration: generation.adapterGeneration,
+    authReadiness: generation.authReadiness,
+    providerReachability: generation.providerReachability,
+  });
+  assert.equal(changedPathHost.physicalHostFingerprint, generation.hostGeneration.physicalHostFingerprint);
+  assert.notEqual(changedPathHost.hostGenerationFingerprint, generation.hostGeneration.hostGenerationFingerprint);
+  assert.throws(
+    () => assertSameExecutionGeneration(generation, changedHostGeneration),
+    (error: unknown) => error instanceof ExecutionProtocolError && error.code === "EXECUTION_GENERATION_MISMATCH",
+  );
   assert.throws(
     () => assertSameExecutionGeneration(undefined, generation),
     (error: unknown) => error instanceof ExecutionProtocolError && error.code === "LEGACY_EXECUTION_BINDING_MISSING",
