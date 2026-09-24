@@ -1511,5 +1511,734 @@ export async function createMcpServer(
             "Optional directory path relative to workspace root to restrict search scope.",
           ),
         include: z
+          .string()
+          .optional()
+          .describe('Optional file glob (e.g., "*.py").'),
+        max_results: z
+          .number()
+          .optional()
+          .describe("Max results to return (default 100)."),
+      },
+      annotations: NEXUS_READ_ONLY_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await searchTextTool(
+        input as Parameters<typeof searchTextTool>[0],
+        { cwd: workspace.root },
+      );
+      logToolCall(config, {
+        tool: "search_text",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
 
-[Showing lines 1-1513 of 2268 (50.0KB limit). Use offset=1514 to continue.]
+  registerAppTool(
+    server as never,
+    "list_tree",
+    {
+      title: "List tree",
+      description:
+        "List directory tree with file metadata. Read-only. Use open_workspace first and pass workspaceId.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        path: z
+          .string()
+          .optional()
+          .describe("Directory path relative to workspace root."),
+        max_depth: z
+          .number()
+          .optional()
+          .describe("Max depth (default 3)."),
+      },
+      annotations: NEXUS_READ_ONLY_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await listTreeTool(input, { cwd: workspace.root });
+      logToolCall(config, {
+        tool: "list_tree",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server as never,
+    "git_status",
+    {
+      title: "Git status",
+      description:
+        "Return porcelain git status with counts. Read-only. Use open_workspace first and pass workspaceId.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        include_detail: z
+          .boolean()
+          .optional()
+          .describe("Include full file list (default false)."),
+      },
+      annotations: NEXUS_READ_ONLY_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await gitStatusTool(input, { cwd: workspace.root });
+      logToolCall(config, {
+        tool: "git_status",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server as never,
+    "git_diff",
+    {
+      title: "Git diff",
+      description:
+        "Return diff between refs or working tree. Read-only. Use open_workspace first and pass workspaceId.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        ref_a: z
+          .string()
+          .optional()
+          .describe("Base ref (or only ref for working diff)."),
+        ref_b: z.string().optional().describe("Target ref."),
+        path: z
+          .string()
+          .optional()
+          .describe("Path filter relative to workspace root."),
+        stat_only: z
+          .boolean()
+          .optional()
+          .describe("Return only diffstat."),
+      },
+      annotations: NEXUS_READ_ONLY_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await gitDiffTool(input, { cwd: workspace.root });
+      logToolCall(config, {
+        tool: "git_diff",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server as never,
+    "git_log",
+    {
+      title: "Git log",
+      description:
+        "Return commit history. Read-only. Use open_workspace first and pass workspaceId.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        count: z
+          .number()
+          .optional()
+          .describe("Number of commits (default 20)."),
+        path: z
+          .string()
+          .optional()
+          .describe("Path filter relative to workspace root."),
+      },
+      annotations: NEXUS_READ_ONLY_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await gitLogTool(input, { cwd: workspace.root });
+      logToolCall(config, {
+        tool: "git_log",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server as never,
+    "git_show",
+    {
+      title: "Git show",
+      description:
+        "Show commit details or patch. Read-only. Use open_workspace first and pass workspaceId.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        ref: z.string().optional().describe("Git ref (default HEAD)."),
+        format: z
+          .enum(["stat", "patch"])
+          .optional()
+          .describe("Output format (default stat)."),
+      },
+      annotations: NEXUS_READ_ONLY_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await gitShowTool(input, { cwd: workspace.root });
+      logToolCall(config, {
+        tool: "git_show",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server as never,
+    "git_worktrees",
+    {
+      title: "Git worktrees",
+      description:
+        "List managed git worktrees. Read-only. Use open_workspace first and pass workspaceId.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+      },
+      annotations: NEXUS_READ_ONLY_ANNOTATIONS,
+    },
+    async ({ workspaceId }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await gitWorktreesTool({}, { cwd: workspace.root });
+      logToolCall(config, {
+        tool: "git_worktrees",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server as never,
+    "read_task_card",
+    {
+      title: "Read task card",
+      description:
+        "Read a Nexus task card from tasks/ directory. Read-only. Use open_workspace first and pass workspaceId.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        campaign_id: z
+          .string()
+          .describe("Campaign ID (e.g., v24-task)."),
+        card_id: z.string().describe("Card ID (e.g., 01-setup)."),
+      },
+      annotations: NEXUS_READ_ONLY_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await readTaskCardTool(
+        input as Parameters<typeof readTaskCardTool>[0],
+        { cwd: workspace.root },
+      );
+      logToolCall(config, {
+        tool: "read_task_card",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server as never,
+    "read_candidate",
+    {
+      title: "Read candidate",
+      description:
+        "Read a Nexus candidate receipt from .nexus/candidates/. Read-only. Use open_workspace first and pass workspaceId.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        candidate_id: z.string().describe("Candidate ID."),
+      },
+      annotations: NEXUS_READ_ONLY_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await readCandidateTool(
+        input as Parameters<typeof readCandidateTool>[0],
+        { cwd: workspace.root },
+      );
+      logToolCall(config, {
+        tool: "read_candidate",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server as never,
+    "read_receipt",
+    {
+      title: "Read receipt",
+      description:
+        "Read a Nexus execution receipt from .nexus/receipts/. Read-only. Use open_workspace first and pass workspaceId.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        receipt_id: z.string().describe("Receipt ID."),
+      },
+      annotations: NEXUS_READ_ONLY_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const response = await readReceiptTool(
+        input as Parameters<typeof readReceiptTool>[0],
+        { cwd: workspace.root },
+      );
+      logToolCall(config, {
+        tool: "read_receipt",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
+
+  registerAppTool(
+    server as never,
+    "git_merge_pull_request",
+    {
+      title: "Git merge pull request (protected fallback)",
+      description:
+        "Merge ONE exact, independently accepted pull request head into the trusted integration repository's default branch. Primary path remains the GitHub connector merge_pull_request(expected_head_sha=...); this tool is a bounded fallback for when the GitHub connector is unavailable. It is not a generic git merge/push primitive: the integration repository is resolved by a server-controlled trusted target resolver (never a caller-chosen remote/repo/branch/URL), the exact base and head SHAs are re-verified fresh against GitHub, required checks must all be in reliable terminal success (effective branch rules + classic protection, check runs + commit statuses), and only ownerConfirmation=true authorizes execution. Draft PRs are rejected. Refuses (fail closed) on any head/base drift, unreadable required checks, or transport gaps. Call open_workspace first and pass workspaceId.",
+      _meta: {},
+      inputSchema: {
+        workspaceId: z
+          .string()
+          .describe("Workspace identifier returned by open_workspace."),
+        prNumber: z
+          .number()
+          .int()
+          .positive()
+          .describe("Pull request number to merge."),
+        expectedBaseSha: z
+          .string()
+          .regex(/^[0-9a-f]{40}$/)
+          .describe("Exact full 40-hex SHA of the repository default branch at acceptance time."),
+        expectedHeadSha: z
+          .string()
+          .regex(/^[0-9a-f]{40}$/)
+          .describe("Exact full 40-hex SHA of the accepted PR head. This exact head is the only one that may be merged."),
+        mergeMethod: z
+          .enum(["merge", "squash", "rebase"])
+          .describe("GitHub merge method."),
+        ownerConfirmation: z
+          .boolean()
+          .optional()
+          .describe("Must be exactly true to authorize the merge. False or missing is rejected."),
+      },
+      annotations: PR_MERGE_TOOL_ANNOTATIONS,
+    },
+    async ({ workspaceId, ...input }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const transport = overrides?.gitMergeTransportFactory?.();
+      const targetResolver = overrides?.gitMergeTargetResolver?.() ?? defaultIntegrationTargetResolver();
+      const response = await gitMergePullRequestTool(
+        input as Record<string, unknown>,
+        {
+          cwd: workspace.root,
+          ...(transport ? { transport } : {}),
+          targetResolver,
+        },
+      );
+      logToolCall(config, {
+        tool: "git_merge_pull_request",
+        workspaceId,
+        success: !response.isError,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        ...response,
+        structuredContent: { result: contentText(response.content) },
+      };
+    },
+  );
+
+  // Runtime registry-consistency check (G5): the always-on core tools plus the
+  // 11 Nexus tools must match the canonical registry, so tools/list derives
+  // from the same single source of truth as the generator and tests.
+  const registeredTools = (server as unknown as {
+    _registeredTools?: Record<string, unknown>;
+  })._registeredTools;
+  if (registeredTools) {
+    // Always-on core tools resolve via toolNames (short vs legacy); the 12
+    // Nexus tools use fixed registry names independent of naming mode.
+    const NEXUS_FIXED_TOOLS = NEXUS_MCP_TOOL_NAMES.slice(5);
+    const alwaysOn = new Set<string>([
+      "open_workspace",
+      toolNames.read,
+      toolNames.write,
+      toolNames.edit,
+      toolNames.shell,
+      ...NEXUS_FIXED_TOOLS,
+    ]);
+
+    const missing = [...alwaysOn].filter((name) => !registeredTools[name]);
+    if (missing.length > 0) {
+      throw new Error(
+        `Nexus MCP tool surface mismatch: registered tools missing ${missing.join(", ")}`,
+      );
+    }
+    if (alwaysOn.size !== NEXUS_MCP_TOOL_COUNT) {
+      throw new Error(
+        `Nexus MCP tool surface mismatch: expected ${NEXUS_MCP_TOOL_COUNT} always-on tools, got ${alwaysOn.size}`,
+      );
+    }
+  }
+
+  return server;
+}
+
+export function createServer(
+  config = loadConfig(),
+  overrides?: DevSpaceMcpServerOverrides,
+): RunningServer {
+  const allowedHosts = config.allowedHosts.includes("*")
+    ? undefined
+    : Array.from(new Set([config.host, ...config.allowedHosts]));
+  const app = createMcpExpressApp({
+    host: config.host,
+    ...(allowedHosts ? { allowedHosts } : {}),
+  });
+  const mcpUrl = new URL("/mcp", config.publicBaseUrl);
+  const resourceServerUrl = resourceUrlFromServerUrl(mcpUrl);
+  const oauthProvider = new SingleUserOAuthProvider(
+    config.oauth,
+    mcpUrl,
+    join(config.stateDir, "oauth-state.json"),
+  );
+  const bearerAuth = requireBearerAuth({
+    verifier: oauthProvider,
+    requiredScopes: [config.oauth.scopes[0] ?? "devspace"],
+    resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resourceServerUrl),
+  });
+  const workspaceStore = createWorkspaceStore(config.stateDir);
+  const workspaces = new WorkspaceRegistry(config, workspaceStore);
+  const reviewCheckpoints = createReviewCheckpointManager();
+  let observedManifest: ObservedManifestIdentity | undefined;
+  let manifestError: Error | undefined;
+  const gatewayManifestReady: Promise<NexusGatewayToolManifest | undefined> =
+    config.surfaceProfile === "canonical_gateway_proxy"
+      ? fetchNexusGatewayToolManifest(config)
+          .then((manifest) => {
+            // Shared compatibility gate: a Gateway manifest that collides with
+            // the server-local protected extension must fail readiness (and
+            // therefore /healthz) here, before the surface is declared
+            // healthy and before any MCP server construction is attempted.
+            assertCanonicalGatewayProxyManifestCompatible(manifest);
+            observedManifest = nexusGatewayManifestIdentity(manifest, manifest.revision);
+            return manifest;
+          })
+          .catch((error: unknown) => {
+            manifestError = error instanceof Error ? error : new Error(String(error));
+            return undefined;
+          })
+      : Promise.resolve(undefined);
+  const mcpBoundary = createMcpTransportBoundary(
+    async () => {
+      const gatewayManifest = await gatewayManifestReady;
+      if (manifestError) throw manifestError;
+      return createMcpServer(config, workspaces, reviewCheckpoints, gatewayManifest, overrides);
+    },
+    config.protocolMode,
+    (error) => {
+      logEvent(config.logging, "error", "mcp_transport_error", {
+        error: error.message,
+      });
+    },
+  );
+
+  if (config.logging.trustProxyHops > 0) {
+    app.set("trust proxy", config.logging.trustProxyHops);
+  } else {
+    app.set("trust proxy", false);
+  }
+
+  app.use((req, res, next) => {
+    const requestId = randomUUID();
+    const startedAt = performance.now();
+    res.locals.requestId = requestId;
+
+    res.on("finish", () => {
+      const path = requestPath(req);
+      if (!config.logging.requests) return;
+      if (!config.logging.assets && path.startsWith("/mcp-app-assets")) return;
+
+      logEvent(config.logging, "info", "http_request", {
+        requestId,
+        method: req.method,
+        path,
+        status: res.statusCode,
+        durationMs: Math.round(performance.now() - startedAt),
+        ...requestLogFields(req, config),
+      });
+    });
+
+    next();
+  });
+
+  app.use(
+    mcpAuthRouter({
+      provider: oauthProvider,
+      issuerUrl: new URL(config.publicBaseUrl),
+      baseUrl: new URL(config.publicBaseUrl),
+      resourceServerUrl,
+      scopesSupported: config.oauth.scopes,
+      resourceName: config.gatewayProxyUrl ? "Nexus MCP Gateway" : "DevSpace",
+    }),
+  );
+
+  app.options("/mcp-app-assets/{*asset}", (_req, res) => {
+    setAssetHeaders(res);
+    res.sendStatus(204);
+  });
+
+  app.use(
+    "/mcp-app-assets",
+    express.static(uiBuildDirectory(), {
+      immutable: true,
+      maxAge: "1y",
+      fallthrough: false,
+      setHeaders: setAssetHeaders,
+    }),
+  );
+
+  app.get("/healthz", async (_req, res) => {
+    await gatewayManifestReady;
+    const identity = getSurfaceIdentity(config, observedManifest);
+    const build = readPackageBuildIdentity();
+
+    if (manifestError) {
+      res.status(503).json({
+        ok: false,
+        name: identity.proxy_mode ? "nexus-mcp-gateway" : "devspace",
+        ...identity,
+        manifest_status: "unavailable",
+        build,
+        disposition: "PUBLIC_SURFACE_FAIL_CLOSED",
+      });
+      return;
+    }
+
+    if (identity.proxy_mode) {
+      try {
+        const freshManifest = await fetchNexusGatewayToolManifest(config);
+        assertCanonicalGatewayProxyManifestCompatible(freshManifest);
+        const freshManifestIdentity = nexusGatewayManifestIdentity(
+          freshManifest,
+          freshManifest.revision,
+        );
+        const registeredManifestIdentity = observedManifest;
+
+        if (
+          !registeredManifestIdentity ||
+          registeredManifestIdentity.count !== freshManifestIdentity.count ||
+          registeredManifestIdentity.revision !== freshManifestIdentity.revision ||
+          registeredManifestIdentity.sha256 !== freshManifestIdentity.sha256
+        ) {
+          res.status(503).json({
+            ok: false,
+            name: "nexus-mcp-gateway",
+            ...identity,
+            manifest_status: "drifted",
+            build,
+            disposition: "CANONICAL_GATEWAY_MANIFEST_DRIFT",
+            required_action: "PROXY_RESTART_REQUIRED",
+            registered_manifest: registeredManifestIdentity ?? null,
+            fresh_manifest: freshManifestIdentity,
+          });
+          return;
+        }
+      } catch {
+        res.status(503).json({
+          ok: false,
+          name: "nexus-mcp-gateway",
+          ...identity,
+          manifest_status: "unavailable",
+          build,
+          disposition: "CANONICAL_GATEWAY_MANIFEST_UNAVAILABLE",
+          required_action: "PROXY_RESTART_REQUIRED",
+        });
+        return;
+      }
+    }
+
+    res.status(200).json({
+      ok: true,
+      name: identity.proxy_mode ? "nexus-mcp-gateway" : "devspace",
+      ...identity,
+      manifest_status: identity.proxy_mode ? "verified" : "not_applicable",
+      build,
+    });
+  });
+
+  app.all("/mcp", async (req, res) => {
+    const requestId = res.locals.requestId as string | undefined;
+
+    // Process-memory OAuth is intentionally retained in this card. A token
+    // lost on restart receives a typed reauthentication disposition without
+    // weakening the bearer gate or persisting credentials out of scope.
+    res.setHeader("X-Nexus-Auth-Disposition", "REAUTH_REQUIRED");
+    await new Promise<void>((resolve, reject) => {
+      bearerAuth(req, res, (error?: unknown) => {
+        if (error) reject(error);
+        else resolve();
+      });
+    });
+    if (res.headersSent) return;
+    res.removeHeader("X-Nexus-Auth-Disposition");
+
+    if (!req.auth?.resource || !checkResourceAllowed({ requestedResource: req.auth.resource, configuredResource: resourceServerUrl })) {
+      logEvent(config.logging, "warn", "auth_denied", {
+        requestId,
+        method: req.method,
+        path: requestPath(req),
+        reason: "invalid_oauth_resource",
+        ...requestLogFields(req, config),
+      });
+      sendJsonRpcError(res, 401, -32001, "Unauthorized");
+      return;
+    }
+
+    try {
+      const webRequest = await toWebRequest(req, req.body);
+      const trace = extractMcpRequestTraceContext(webRequest, req.body, req.auth as never);
+      logEvent(config.logging, "debug", "mcp_request", {
+        requestId,
+        method: req.method,
+        protocolMode: config.protocolMode,
+        ...trace,
+      });
+      await mcpBoundary.node(req, res, req.body);
+    } catch (error) {
+      logEvent(config.logging, "error", "mcp_request_error", {
+        requestId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      if (!res.headersSent) {
+        sendJsonRpcError(res, 500, -32603, "Internal server error");
+      }
+    }
+  });
+
+  return {
+    app,
+    config,
+    async close(): Promise<void> {
+      await mcpBoundary.close();
+      workspaceStore.close?.();
+    },
+  };
+}
+
+async function isMainModule(): Promise<boolean> {
+  if (!process.argv[1]) return false;
+
+  const modulePath = await realpath(fileURLToPath(import.meta.url));
+  const entrypointPath = await realpath(process.argv[1]);
+  return modulePath === entrypointPath;
+}
+
+if (await isMainModule()) {
+  const { app, config } = createServer();
+  app.listen(config.port, config.host, () => {
+    console.log(
+      `devspace listening on http://${config.host}:${config.port}/mcp`,
+    );
+    console.log(`allowed roots: ${config.allowedRoots.join(", ")}`);
+    console.log("auth: oauth owner-token flow required");
+    console.log(`logging: ${config.logging.level} ${config.logging.format}`);
+    console.log(`request logging: ${config.logging.requests ? "enabled" : "disabled"}`);
+    console.log(`asset logging: ${config.logging.assets ? "enabled" : "disabled"}`);
+    console.log(`trust proxy: ${config.logging.trustProxyHops > 0 ? `${config.logging.trustProxyHops} hop(s)` : "disabled"}`);
+  });
+}
