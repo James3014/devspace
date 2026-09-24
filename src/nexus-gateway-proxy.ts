@@ -70,8 +70,13 @@ export function createPublicNexusIntegrationTargetResolver(): IntegrationTargetR
 
 const execFileAsync = promisify(execFile);
 const PUBLIC_DIRECT_MERGE_LANES = new Set(["DIRECT_CANONICAL", "DIRECT_DELEGATED"]);
+const PUBLIC_COMPLETION_MERGE_LANES = new Set(["GOVERNED"]);
 
-export function createPublicDirectMergeLaneGuard(config: ServerConfig): MergeEffectGuard {
+function createPublicMergeLaneGuard(
+  config: ServerConfig,
+  allowedLanes: ReadonlySet<string>,
+  failurePrefix: string,
+): MergeEffectGuard {
   return async (context) => {
     const nexusRoot = config.nexusCanonicalSourceRoot;
     const pythonBin = config.nexusPythonBin;
@@ -139,11 +144,11 @@ export function createPublicDirectMergeLaneGuard(config: ServerConfig): MergeEff
         || result.status !== "PASS"
         || result.pull_request_number !== context.pullRequest.number
         || result.head_sha !== context.expectedHeadSha
-        || !PUBLIC_DIRECT_MERGE_LANES.has(lane)
+        || !allowedLanes.has(lane)
       ) {
         throw new MergePullRequestError(
           PR_MERGE_ERROR_CODES.MERGE_LANE_NOT_AUTHORIZED,
-          `public direct merge requires a trusted DIRECT lane; validator returned ${lane || "no execution lane"}`,
+          `${failurePrefix}; validator returned ${lane || "no execution lane"}`,
         );
       }
     } finally {
@@ -152,11 +157,28 @@ export function createPublicDirectMergeLaneGuard(config: ServerConfig): MergeEff
   };
 }
 
+export function createPublicDirectMergeLaneGuard(config: ServerConfig): MergeEffectGuard {
+  return createPublicMergeLaneGuard(
+    config,
+    PUBLIC_DIRECT_MERGE_LANES,
+    "public direct merge requires a trusted DIRECT lane",
+  );
+}
+
+export function createPublicCompletionMergeLaneGuard(config: ServerConfig): MergeEffectGuard {
+  return createPublicMergeLaneGuard(
+    config,
+    PUBLIC_COMPLETION_MERGE_LANES,
+    "public completion merge requires a trusted GOVERNED lane",
+  );
+}
+
 export interface NexusGatewayProxyConstructionOptions {
   /** Test seams. Production callers omit them. */
   gitMergeTransportFactory?: () => GitHubPullRequestTransport;
   gitCompletionTransportFactory?: () => GitHubCompletionTransport;
   directMergeLaneGuardFactory?: (config: ServerConfig) => MergeEffectGuard;
+  completionMergeLaneGuardFactory?: (config: ServerConfig) => MergeEffectGuard;
 }
 
 /**
@@ -638,6 +660,9 @@ export async function createNexusGatewayProxyServer(
               ? { transport: options.gitCompletionTransportFactory() }
               : {}),
             targetResolver: createPublicNexusIntegrationTargetResolver(),
+            beforeMergeEffect:
+              options?.completionMergeLaneGuardFactory?.(config)
+              ?? createPublicCompletionMergeLaneGuard(config),
           });
           const text = JSON.stringify(result, null, 2);
           return { content: [{ type: "text", text }], structuredContent: { result: text } };
