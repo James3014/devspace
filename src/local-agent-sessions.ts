@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { mkdtempSync, unlinkSync, rmdirSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { arch, homedir, hostname, platform, release, tmpdir } from "node:os";
 import { basename, dirname, join, resolve as resolvePath } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
@@ -63,7 +63,9 @@ import { canonicalizePath, isPathInsideRoot } from "./roots.js";
 import {
   assertNexusGrantAuthorizesExecution,
   assertSameExecutionGeneration,
+  assertSameHostGeneration,
   buildExecutionGenerationBinding,
+  buildHostGenerationBinding,
   hashDispatchIntent,
   renderDispatchIntentForWorker,
   validateDispatchIntent,
@@ -71,6 +73,8 @@ import {
   type AuthorityValidationEvidence,
   type DispatchIntent,
   type ExecutionGenerationBinding,
+  type ExecutionReadinessObservation,
+  type HostGenerationBinding,
   type NexusExecutionGrant,
   type NexusExecutionGrantRef,
   ExecutionProtocolError,
@@ -364,6 +368,13 @@ export interface AgentPreflightOutput {
     capacityAvailable: boolean;
     dispatchState: DispatchReadinessState;
   };
+  qualification: {
+    hostGeneration: HostGenerationBinding;
+    adapterGeneration: string;
+    authReadiness: ExecutionReadinessObservation;
+    providerReachability: ExecutionReadinessObservation;
+    executionBindingHash?: string;
+  };
   capacity: {
     used: number;
     max?: number;
@@ -517,6 +528,8 @@ export class LocalAgentSessionManager {
   private readonly terminator: WorkerTerminator;
   private readonly turnRunner?: AgentTurnRunner;
   private readonly runtimeBuildIdentity: RuntimeBuildIdentity;
+  private readonly capabilityManifestSha256: string;
+  private readonly physicalHostId?: string;
   private readonly nexusGrantResolver: NexusGrantResolver;
   private readonly clineCatalogService?: ClineCatalogService;
   private readonly opencodeCatalogSource: ReturnType<typeof createMcpOpencodeCatalogSource>;
@@ -537,6 +550,7 @@ export class LocalAgentSessionManager {
     clineCatalogService?: ClineCatalogService,
     opencodeCatalogSource?: ReturnType<typeof createMcpOpencodeCatalogSource>,
     herdrGateway?: HerdrThinGateway,
+    hostQualification?: { capabilityManifestSha256?: string; physicalHostId?: string },
   ) {
     this.store = createLocalAgentStore(config.stateDir);
     this.launcher = testLauncher ?? defaultWorkerLauncher;
@@ -554,6 +568,9 @@ export class LocalAgentSessionManager {
       stateRoot: config.stateDir,
       profileCatalogGeneration: "unresolved",
     });
+    this.capabilityManifestSha256 = hostQualification?.capabilityManifestSha256
+      ?? createHash("sha256").update("unresolved-capability-manifest").digest("hex");
+    this.physicalHostId = hostQualification?.physicalHostId ?? process.env.DEVSPACE_PHYSICAL_HOST_ID?.trim() || undefined;
   }
 
   /** Close the manager's durable store. Safe to call from multiple cleanup paths. */
@@ -1344,23 +1361,24 @@ export class LocalAgentSessionManager {
       );
     }
 
-    if (!herdrBound) {
-      try {
+    try {
+      assertSameHostGeneration(record.executionGeneration?.hostGeneration, this.resolveHostGeneration());
+      if (!herdrBound) {
         const currentGeneration = this.resolveExecutionGeneration(
           currentProfile,
           input.profileCatalog?.generation ?? "unresolved",
           process.env,
         );
         assertSameExecutionGeneration(record.executionGeneration, currentGeneration);
-      } catch (error) {
-        if (error instanceof ExecutionProtocolError || error instanceof AgentSessionError) {
-          throw new AgentSessionError(
-            "REBIND_REQUIRED",
-            `Continuation of agent ${agentId} requires explicit rebind before mutation: ${error.message}`,
-          );
-        }
-        throw error;
       }
+    } catch (error) {
+      if (error instanceof ExecutionProtocolError || error instanceof AgentSessionError) {
+        throw new AgentSessionError(
+          "REBIND_REQUIRED",
+          `Continuation of agent ${agentId} requires explicit rebind before mutation: ${error.message}`,
+        );
+      }
+      throw error;
     }
 
     const continuationCapacity = this.executionCapacitySnapshot(workspaceRoot);
@@ -1806,6 +1824,15 @@ export class LocalAgentSessionManager {
       : allRequiredPositive && readinessSignalsPositive
         ? "READY"
         : "UNKNOWN";
+    const hostGeneration = this.resolveHostGeneration();
+    let preflightExecutionGeneration: ExecutionGenerationBinding | undefined;
+    if (profile && providerConfigured && runtimeReady) {
+      preflightExecutionGeneration = this.resolveExecutionGeneration(
+        profile,
+        input.profileCatalog?.generation ?? "unresolved",
+        providerEnvironment,
+      );
+    }
 
     return {
       workspace,
@@ -1825,6 +1852,15 @@ export class LocalAgentSessionManager {
         runtimeReady,
         capacityAvailable,
         dispatchState,
+      },
+      qualification: {
+        hostGeneration,
+        adapterGeneration: this.resolveAdapterGeneration(),
+        authReadiness: "unknown",
+        providerReachability: "unknown",
+        ...(preflightExecutionGeneration
+          ? { executionBindingHash: preflightExecutionGeneration.executionBindingHash }
+          : {}),
       },
       capacity,
       toolchain: toolchainId
@@ -2094,6 +2130,26 @@ export class LocalAgentSessionManager {
     }
   }
 
+  private resolveHostGeneration(): HostGenerationBinding {
+    return buildHostGenerationBinding({
+      configuredHostId: this.physicalHostId,
+      hostname: hostname(),
+      platform: platform(),
+      arch: arch(),
+      osRelease: release(),
+      home: homedir(),
+      path: process.env.PATH ?? "",
+      nodeMajor: process.versions.node.split(".")[0] ?? "unknown",
+      configRoot: this.runtimeBuildIdentity.configRoot,
+      stateRoot: this.runtimeBuildIdentity.stateRoot,
+      capabilityManifestSha256: this.capabilityManifestSha256,
+    });
+  }
+
+  private resolveAdapterGeneration(): string {
+    return this.usesHerdrBackend() ? "herdr-handle-v1" : "local-agent-adapter-v1";
+  }
+
   private resolveExecutionGeneration(
     profile: LocalAgentProfile,
     profileCatalogGeneration: string,
@@ -2128,6 +2184,10 @@ export class LocalAgentSessionManager {
       runtimeVersion,
       devspaceBuildId: this.runtimeBuildIdentity.buildId,
       devspaceSourceCommit: this.runtimeBuildIdentity.sourceCommit,
+      hostGeneration: this.resolveHostGeneration(),
+      adapterGeneration: this.resolveAdapterGeneration(),
+      authReadiness: "unknown",
+      providerReachability: "unknown",
     });
   }
 

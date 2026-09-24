@@ -5466,6 +5466,26 @@ export function createMcpServer(
             capacityAvailable: z.boolean(),
             dispatchState: z.enum(["READY", "BLOCKED", "UNKNOWN"]),
           }),
+          qualification: z.object({
+            hostGeneration: z.object({
+              hostId: z.string(),
+              platform: z.string(),
+              arch: z.string(),
+              osRelease: z.string(),
+              hostnameSha256: z.string().regex(/^[0-9a-f]{64}$/),
+              homeSha256: z.string().regex(/^[0-9a-f]{64}$/),
+              pathSha256: z.string().regex(/^[0-9a-f]{64}$/),
+              nodeMajor: z.string(),
+              configRootSha256: z.string().regex(/^[0-9a-f]{64}$/),
+              stateRootSha256: z.string().regex(/^[0-9a-f]{64}$/),
+              capabilityManifestSha256: z.string().regex(/^[0-9a-f]{64}$/),
+              hostGenerationFingerprint: z.string().regex(/^[0-9a-f]{64}$/),
+            }),
+            adapterGeneration: z.string(),
+            authReadiness: z.enum(["ready", "not_ready", "unknown"]),
+            providerReachability: z.enum(["ready", "not_ready", "unknown"]),
+            executionBindingHash: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+          }),
           capacity: z.object({
             used: z.number().int().nonnegative(),
             max: z.number().int().positive().optional(),
@@ -6610,18 +6630,32 @@ export function createServer(
   const latestProfileCatalogGeneration = { value: runtimeBuildIdentity.profileCatalogGeneration };
   const latestMcpToolCatalogGeneration = { value: "unresolved" };
   const latestMcpToolCatalogNames = { value: [] as string[] };
-  const agentSessionManager = config.subagents.enabled
-    ? new LocalAgentSessionManager(config, undefined, undefined, undefined, runtimeBuildIdentity, undefined, clineCatalogService, opencodeCatalogSource)
-    : undefined;
-  initializationCleanups.push(() => agentSessionManager?.close());
   const capabilityManifest = deriveLoadedCapabilityManifest(
     {
-      ...(agentSessionManager
+      ...(config.subagents.enabled
         ? { agent_start: createAgentStartInputSchema(), agent_preflight: createAgentPreflightInputSchema(), agent_catalog: createAgentCatalogInputSchema() }
         : {}),
       ...(config.chatSwarmEnabled ? chatSwarmToolInputShapes(config) : {}),
     },
   );
+  const agentSessionManager = config.subagents.enabled
+    ? new LocalAgentSessionManager(
+        config,
+        undefined,
+        undefined,
+        undefined,
+        runtimeBuildIdentity,
+        undefined,
+        clineCatalogService,
+        opencodeCatalogSource,
+        undefined,
+        {
+          capabilityManifestSha256: capabilityManifest.manifestSha256,
+          physicalHostId: process.env.DEVSPACE_PHYSICAL_HOST_ID?.trim() || undefined,
+        },
+      )
+    : undefined;
+  initializationCleanups.push(() => agentSessionManager?.close());
   const cutoverController = new McpCutoverController(
     new CutoverStateStore(config.stateDir),
     {

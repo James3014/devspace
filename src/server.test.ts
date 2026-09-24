@@ -51,6 +51,7 @@ import {
 } from "./core-mutation-session.js";
 import {
   buildExecutionGenerationBinding,
+  buildHostGenerationBinding,
   computeDirectCandidateEvidenceId,
   computeDispatchIntentHash,
   DIRECT_CANDIDATE_EXECUTION_SCHEMA,
@@ -59,6 +60,22 @@ import {
 import { assertCoreMutationRecoveryOwnerClient, CORE_MUTATION_TEST_ONLY_UNTRUSTED_BYPASS } from "./core-mutation-tools.js";
 
 const execFileAsync = promisify(execFile);
+
+function testHostGeneration() {
+  return buildHostGenerationBinding({
+    configuredHostId: "server-test-host",
+    hostname: "server-test.local",
+    platform: "darwin",
+    arch: "arm64",
+    osRelease: "25.0.0",
+    home: "/Users/test",
+    path: "/usr/bin:/bin",
+    nodeMajor: "24",
+    configRoot: "/Users/test/.devspace",
+    stateRoot: "/Users/test/.devspace/state",
+    capabilityManifestSha256: "3".repeat(64),
+  });
+}
 
 function normalizedSchema(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(normalizedSchema);
@@ -1723,6 +1740,10 @@ test("direct_candidate_execution_evidence tool produces valid evidence through h
         runtimeVersion: "1.0.0",
         devspaceBuildId: "build-123",
         devspaceSourceCommit: bound.head,
+        hostGeneration: testHostGeneration(),
+        adapterGeneration: "local-agent-adapter-v1",
+        authReadiness: "unknown",
+        providerReachability: "unknown",
       }),
       lifecycleKind: "detached_worker_v2",
     });
@@ -2711,7 +2732,17 @@ test("subagents: agent_preflight returns structured readiness without secrets", 
   assert.equal(readiness.authReady, "unknown");
   assert.equal(readiness.providerReachable, "unknown");
   assert.equal(readiness.dispatchState, "UNKNOWN");
+  const qualification = preflight.qualification as Record<string, unknown>;
+  const hostGeneration = qualification.hostGeneration as Record<string, unknown>;
+  assert.match(String(hostGeneration.hostId), /^(?:derived:|[A-Za-z0-9._:-]+)$/);
+  assert.match(String(hostGeneration.hostGenerationFingerprint), /^[0-9a-f]{64}$/);
+  assert.match(String(hostGeneration.capabilityManifestSha256), /^[0-9a-f]{64}$/);
+  assert.equal(qualification.authReadiness, "unknown");
+  assert.equal(qualification.providerReachability, "unknown");
+  assert.match(String(qualification.executionBindingHash), /^[0-9a-f]{64}$/);
   const serialized = JSON.stringify(preflight);
+  assert.ok(!serialized.includes(process.env.HOME ?? "__no_home__"));
+  assert.ok(!serialized.includes(process.env.PATH ?? "__no_path__"));
   assert.ok(!serialized.includes("test-owner-token"));
   assert.ok(!serialized.includes("DEVSPACE_OAUTH"));
 });
