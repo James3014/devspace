@@ -2202,6 +2202,53 @@ test("agent continuation rejects changed and historical Core binding identity", 
   assert.match(responseText(historical), /CORE_BOUND_SESSION_REQUIRED/);
 });
 
+test("subagents: read-only direct dispatch continuation does not require Core mutation binding", async (t) => {
+  const context = await fixture(t, {
+    coreMutation: true,
+    subagents: { enabled: true, providers: [{ id: "codex", enabled: true }] },
+  });
+  const opened = await callOpen(context.client, context.project, "chat-direct-readonly-continue");
+  const workspaceId = structuredContent(opened).workspaceId as string;
+  const started = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      provider: "codex",
+      model: "gpt-test",
+      prompt: "read-only direct turn",
+      attemptKey: "direct-readonly-continue-start",
+    },
+  });
+  assert.equal(started.isError, undefined, responseText(started));
+  const agentId = structuredContent(started).agentId as string;
+
+  const store = new LocalAgentStore(context.stateDir);
+  try {
+    const record = store.getById(agentId)!;
+    assert.equal(record.executionContract?.directSelection?.writeMode, "read_only");
+    const generation = record.lifecycleState!.activeTurn!.generation!;
+    const workerToken = record.workerToken!;
+    store.claimWorkerCAS(agentId, generation, workerToken, process.pid);
+    store.finishTurnCAS({
+      agentId,
+      generation,
+      workerToken,
+      status: "idle",
+      terminalReason: "completed",
+    });
+  } finally {
+    store.close();
+  }
+
+  const continued = await context.client.callTool({
+    name: "agent_continue",
+    arguments: { workspaceId, agentId, prompt: "continue read-only direct turn" },
+  });
+  assert.equal(continued.isError, undefined, responseText(continued));
+  assert.equal(structuredContent(continued).agentId, agentId);
+  assert.equal(structuredContent(continued).continued, true);
+});
+
 test("subagents disabled: agent tools are absent", async (t) => {
   const context = await fixture(t, { subagents: false });
   const tools = await context.client.listTools();
