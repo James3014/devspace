@@ -187,9 +187,62 @@ export interface StartHerdrAgentParams {
   workspaceId: string;
   requestedModel?: string;
   requestedEffort?: string;
+  requestedCliProviderId?: "cline" | "cline-pass";
   writeMode?: "read_only" | "allowed";
   socketPath?: string;
   store?: LocalAgentStore;
+}
+
+export function buildHerdrAgentArgs(
+  params: Pick<StartHerdrAgentParams, "agentKind" | "requestedModel" | "requestedEffort" | "requestedCliProviderId" | "writeMode">,
+  canonicalWorktreePath: string,
+): string[] {
+  const args: string[] = [];
+  const readOnly = params.writeMode !== "allowed";
+
+  if (params.agentKind === "opencode") {
+    args.push("-m", params.requestedModel || "opencode/mimo-v2.6-flash-free");
+    return args;
+  }
+
+  if (params.agentKind === "agy") {
+    if (params.requestedModel) args.push("--model", params.requestedModel);
+    if (params.requestedEffort && params.requestedModel !== "gemini-3.7-flash-medium") {
+      args.push("--effort", params.requestedEffort);
+    }
+    args.push("--sandbox", "--dangerously-skip-permissions", "--add-dir", canonicalWorktreePath);
+    args.push("--mode", readOnly ? "plan" : "accept-edits");
+    return args;
+  }
+
+  if (params.agentKind === "codex") {
+    if (params.requestedModel) args.push("-m", params.requestedModel);
+    if (params.requestedEffort) {
+      args.push("-c", `model_reasoning_effort="${params.requestedEffort}"`);
+    }
+    args.push("-s", readOnly ? "read-only" : "workspace-write");
+    args.push("-a", "never", "-C", canonicalWorktreePath);
+    return args;
+  }
+
+  if (params.agentKind === "grok") {
+    if (params.requestedModel) args.push("-m", params.requestedModel);
+    if (params.requestedEffort) args.push("--reasoning-effort", params.requestedEffort);
+    args.push("--permission-mode", readOnly ? "plan" : "acceptEdits");
+    args.push("--cwd", canonicalWorktreePath);
+    return args;
+  }
+
+  if (params.agentKind === "cline") {
+    if (params.requestedCliProviderId) args.push("-P", params.requestedCliProviderId);
+    if (params.requestedModel) args.push("--model", params.requestedModel);
+    if (params.requestedEffort) args.push("--thinking", params.requestedEffort);
+    if (readOnly) args.push("--plan");
+    args.push("--auto-approve");
+    return args;
+  }
+
+  return args;
 }
 
 export interface HerdrPromptOptions {
@@ -1219,18 +1272,7 @@ export class HerdrThinGateway {
     }
 
     // 2. Start agent in pane
-    const args: string[] = [];
-    if (params.agentKind === "opencode") {
-      const model = params.requestedModel || "opencode/mimo-v2.6-flash-free";
-      args.push("-m", model);
-    } else if (params.agentKind === "agy") {
-      if (params.requestedModel) args.push("--model", params.requestedModel);
-      if (params.requestedEffort && params.requestedModel !== "gemini-3.7-flash-medium") {
-        args.push("--effort", params.requestedEffort);
-      }
-      args.push("--sandbox", "--dangerously-skip-permissions", "--add-dir", canonicalPath);
-      args.push("--mode", params.writeMode === "allowed" ? "accept-edits" : "plan");
-    }
+    const args = buildHerdrAgentArgs(params, canonicalPath);
 
     const agentReq: HerdrSocketRequest = {
       id: `HERDR-LAUNCH:${params.attemptKey}:agent`,
