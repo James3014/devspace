@@ -76,6 +76,7 @@ import {
   ExecutionProtocolError,
 } from "./execution-protocol.js";
 import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build-identity.js";
+import { buildHostIdentityBinding } from "./host-identity.js";
 import type { LocalEffectEnforcementReceipt } from "./local-effect-enforcement.js";
 import { devspaceConfigDir } from "./user-config.js";
 import {
@@ -92,6 +93,7 @@ import {
   HerdrThinGateway,
   defaultHerdrGatewayRegistry,
   HERDR_RUNTIME_KIND,
+  HERDR_ADAPTER_GENERATION,
   HERDR_DEFAULT_SOCKET_PATH,
 } from "./local-agent-herdr.js";
 
@@ -379,6 +381,7 @@ export interface AgentPreflightOutput {
   };
   blockers: Array<{ code: string; detail: string }>;
   unknowns: string[];
+  qualification?: ExecutionGenerationBinding;
 }
 
 export function summarizeExecutionCapacity(
@@ -1806,6 +1809,14 @@ export class LocalAgentSessionManager {
       : allRequiredPositive && readinessSignalsPositive
         ? "READY"
         : "UNKNOWN";
+    const qualification = profile && runtimeReady
+      ? this.resolveExecutionGeneration(
+          profile,
+          profileCatalog?.generation ?? "unresolved",
+          providerEnvironment,
+          authReady,
+        )
+      : undefined;
 
     return {
       workspace,
@@ -1832,6 +1843,7 @@ export class LocalAgentSessionManager {
         : { id: "none", available: false },
       blockers,
       unknowns,
+      qualification,
     };
   }
 
@@ -2098,6 +2110,7 @@ export class LocalAgentSessionManager {
     profile: LocalAgentProfile,
     profileCatalogGeneration: string,
     environment: NodeJS.ProcessEnv,
+    authReadiness: ReadinessValue = "unknown",
   ): ExecutionGenerationBinding {
     const availability = checkLocalAgentProviderAvailability(profile.provider, environment);
     if (!availability.available) {
@@ -2128,6 +2141,14 @@ export class LocalAgentSessionManager {
       runtimeVersion,
       devspaceBuildId: this.runtimeBuildIdentity.buildId,
       devspaceSourceCommit: this.runtimeBuildIdentity.sourceCommit,
+      hostIdentity: buildHostIdentityBinding({
+        environment,
+        stateRoot: this.config.stateDir,
+        devspaceBuildId: this.runtimeBuildIdentity.buildId,
+        devspaceSourceCommit: this.runtimeBuildIdentity.sourceCommit,
+      }),
+      adapterGeneration: HERDR_ADAPTER_GENERATION,
+      authReadiness,
     });
   }
 
