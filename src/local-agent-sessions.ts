@@ -831,6 +831,9 @@ export class LocalAgentSessionManager {
           agentKind: this.herdrAgentKind(initial.provider),
           requestedModel: initial.model,
           requestedEffort: initial.effort,
+          requestedCliProviderId:
+            initial.executionContract?.directSelection?.cliProviderId
+            ?? initial.executionContract?.catalogReceipt?.cliProviderId,
           writeMode: initial.executionContract?.writePaths?.length ? "allowed" : "read_only",
           store: this.store,
         });
