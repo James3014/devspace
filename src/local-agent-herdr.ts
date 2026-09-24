@@ -376,55 +376,84 @@ export function detectBlockedOnboardingDialog(agentKind: HerdrAgentKind, termina
  * Enforces Option A (B4): tracks submitted prompts per attemptKey to reject subsequent prompts.
  */
 export class HerdrGatewayRegistry {
-  private handlesByAttemptKey = new Map<string, HerdrExternalHandle>();
+  private handlesByWorkspaceAttempt = new Map<string, HerdrExternalHandle>();
   private submittedPromptTurnKeys = new Set<string>();
 
-  private promptTurnKey(attemptKey: string, promptNonce?: string): string {
-    return `${attemptKey}:${promptNonce ?? ""}`;
+  private handleKey(workspaceId: string, attemptKey: string): string {
+    return `${workspaceId}\u0000${attemptKey}`;
   }
 
-  getHandle(attemptKey: string): HerdrExternalHandle | undefined {
-    return this.handlesByAttemptKey.get(attemptKey);
+  private promptTurnKey(workspaceId: string, attemptKey: string, promptNonce?: string): string {
+    return `${workspaceId}\u0000${attemptKey}\u0000${promptNonce ?? ""}`;
+  }
+
+  getHandle(attemptKey: string, workspaceId?: string): HerdrExternalHandle | undefined {
+    if (workspaceId !== undefined) {
+      return this.handlesByWorkspaceAttempt.get(this.handleKey(workspaceId, attemptKey));
+    }
+    const matches = [...this.handlesByWorkspaceAttempt.values()]
+      .filter((handle) => handle.attemptKey === attemptKey);
+    return matches.length === 1 ? matches[0] : undefined;
   }
 
   registerHandle(handle: HerdrExternalHandle): void {
-    const existing = this.handlesByAttemptKey.get(handle.attemptKey);
+    const key = this.handleKey(handle.workspaceId, handle.attemptKey);
+    const existing = this.handlesByWorkspaceAttempt.get(key);
     if (existing) {
       if (existing.dispatchIntentHash !== handle.dispatchIntentHash) {
         throw new Error(
-          `Conflicting replay for attemptKey '${handle.attemptKey}': existing intent hash '${existing.dispatchIntentHash}' does not match '${handle.dispatchIntentHash}'`,
+          `Conflicting replay for workspace '${handle.workspaceId}' attemptKey '${handle.attemptKey}': existing intent hash '${existing.dispatchIntentHash}' does not match '${handle.dispatchIntentHash}'`,
         );
       }
-      return; // Already registered
+      return;
     }
-    this.handlesByAttemptKey.set(handle.attemptKey, handle);
+    this.handlesByWorkspaceAttempt.set(key, handle);
   }
 
-  markPromptSubmitted(attemptKey: string, promptNonce?: string): void {
-    this.submittedPromptTurnKeys.add(this.promptTurnKey(attemptKey, promptNonce));
+  markPromptSubmitted(attemptKey: string, promptNonce?: string, workspaceId = ""): void {
+    this.submittedPromptTurnKeys.add(this.promptTurnKey(workspaceId, attemptKey, promptNonce));
   }
 
-  hasPromptSubmitted(attemptKey: string, promptNonce?: string): boolean {
-    if (promptNonce !== undefined) {
-      return this.submittedPromptTurnKeys.has(this.promptTurnKey(attemptKey, promptNonce));
+  hasPromptSubmitted(attemptKey: string, promptNonce?: string, workspaceId?: string): boolean {
+    if (workspaceId !== undefined) {
+      if (promptNonce !== undefined) {
+        return this.submittedPromptTurnKeys.has(
+          this.promptTurnKey(workspaceId, attemptKey, promptNonce),
+        );
+      }
+      const prefix = `${workspaceId}\u0000${attemptKey}\u0000`;
+      for (const key of this.submittedPromptTurnKeys) {
+        if (key.startsWith(prefix)) return true;
+      }
+      return false;
     }
-    const prefix = `${attemptKey}:`;
+
+    const marker = `\u0000${attemptKey}\u0000`;
     for (const key of this.submittedPromptTurnKeys) {
-      if (key.startsWith(prefix)) return true;
+      if (!key.includes(marker)) continue;
+      if (promptNonce === undefined || key.endsWith(`\u0000${promptNonce}`)) return true;
     }
     return false;
   }
 
-  releaseHandle(attemptKey: string): void {
-    this.handlesByAttemptKey.delete(attemptKey);
-    const prefix = `${attemptKey}:`;
+  releaseHandle(attemptKey: string, workspaceId?: string): void {
+    let targetWorkspaceId = workspaceId;
+    if (targetWorkspaceId === undefined) {
+      const matches = [...this.handlesByWorkspaceAttempt.values()]
+        .filter((handle) => handle.attemptKey === attemptKey);
+      if (matches.length !== 1) return;
+      targetWorkspaceId = matches[0].workspaceId;
+    }
+
+    this.handlesByWorkspaceAttempt.delete(this.handleKey(targetWorkspaceId, attemptKey));
+    const prefix = `${targetWorkspaceId}\u0000${attemptKey}\u0000`;
     for (const key of this.submittedPromptTurnKeys) {
       if (key.startsWith(prefix)) this.submittedPromptTurnKeys.delete(key);
     }
   }
 
   clear(): void {
-    this.handlesByAttemptKey.clear();
+    this.handlesByWorkspaceAttempt.clear();
     this.submittedPromptTurnKeys.clear();
   }
 }
@@ -1505,7 +1534,7 @@ export class HerdrThinGateway {
     );
 
     // Fast in-memory registry check (Option A / B4)
-    if (this.registry.hasPromptSubmitted(handle.attemptKey, handle.promptNonce)) {
+    if (this.registry.hasPromptSubmitted(handle.attemptKey, handle.promptNonce, handle.workspaceId)) {
       throw new Error(
         `[N-TURN-OPTION-A] attemptKey '${handle.attemptKey}' has already submitted a consequential prompt; subsequent prompts on same handle are rejected.`,
       );
@@ -1553,7 +1582,7 @@ export class HerdrThinGateway {
     }
 
     // Mark prompt as submitted under Option A
-    this.registry.markPromptSubmitted(handle.attemptKey, handle.promptNonce);
+    this.registry.markPromptSubmitted(handle.attemptKey, handle.promptNonce, handle.workspaceId);
 
     // Post-fence live identity revalidation immediately before actual prompt (E3)
     const postFenceLive = await this.observeAndValidateLiveHandle({
@@ -2051,7 +2080,7 @@ export class HerdrThinGateway {
     }
 
     await this.closeWorkspace(boundHandle.herdrWorkspaceId, targetSocket);
-    this.registry.releaseHandle(boundHandle.attemptKey);
+    this.registry.releaseHandle(boundHandle.attemptKey, boundHandle.workspaceId);
   }
 
   /**

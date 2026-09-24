@@ -629,56 +629,58 @@ export class LocalAgentSessionManager {
 
     defaultHerdrGatewayRegistry.registerHandle(handle);
     this.herdrHandles.set(agentId, handle);
-    this.herdrHandles.set(handle.attemptKey, handle);
   }
 
   /**
-   * Retrieve a bound HerdrExternalHandle by agentId or attemptKey.
-   * Enforces B1 / B2: re-hydrates from durable store record externalRuntimeBinding if absent in memory.
-   * Enforces Option A / Blocker A: rehydrates durable promptState into gateway registry.
+   * Retrieve a bound HerdrExternalHandle by exact durable agentId.
+   *
+   * attemptKey is only workspace-scoped replay identity. It is not a globally
+   * unique handle key and must never be used to recover another record's
+   * external runtime authority.
    */
   getHerdrExternalHandle(agentIdOrAttemptKey: string): HerdrExternalHandle | undefined {
-    // Durable store is authoritative. Read it before the in-memory cache so a
-    // continuation turn that rotates promptNonce cannot accidentally reuse a
-    // stale handle from the previous turn.
-    const extractHerdrHandle = (rec: LocalAgentRecord | undefined): HerdrExternalHandle | undefined => {
-      if (!rec?.externalRuntimeBinding) return undefined;
-      const { runtimeKind, handle } = rec.externalRuntimeBinding;
-      if (runtimeKind === HERDR_RUNTIME_KIND && handle && typeof handle === "object" && handle.attemptKey) {
-        return handle as unknown as HerdrExternalHandle;
-      }
-      return undefined;
-    };
-
     let rec = this.store.getById(agentIdOrAttemptKey);
-    let handle = extractHerdrHandle(rec);
 
-    if (!handle) {
-      const records = this.store.list();
-      const match = records.find(
-        (r) => r.startReplay?.key === agentIdOrAttemptKey || r.id === agentIdOrAttemptKey,
+    // Restart/recovery callers may know only attemptKey. That lookup is safe
+    // only when it identifies exactly one durable record. attemptKey is scoped
+    // to a physical workspace, so a multi-workspace collision must fail closed
+    // rather than selecting the first record.
+    if (!rec) {
+      const matches = this.store.list().filter(
+        (candidate) => candidate.startReplay?.key === agentIdOrAttemptKey,
       );
-      if (match) {
-        rec = match;
-        handle = extractHerdrHandle(match);
-      }
+      if (matches.length !== 1) return undefined;
+      rec = matches[0];
     }
 
-    if (handle) {
-      if (rec?.id) handle.agentId = rec.id;
+    const binding = rec.externalRuntimeBinding;
+    const rawHandle =
+      binding?.runtimeKind === HERDR_RUNTIME_KIND &&
+      binding.handle &&
+      typeof binding.handle === "object" &&
+      binding.handle.attemptKey
+        ? binding.handle
+        : undefined;
+
+    if (rawHandle) {
+      const handle = rawHandle as unknown as HerdrExternalHandle;
+      handle.agentId = rec.id;
       defaultHerdrGatewayRegistry.registerHandle(handle);
       if (
-        rec?.externalRuntimeBinding?.promptState?.consequentialPromptFenced &&
-        rec.externalRuntimeBinding.promptState.promptNonce === handle.promptNonce
+        binding?.promptState?.consequentialPromptFenced &&
+        binding.promptState.promptNonce === handle.promptNonce
       ) {
-        defaultHerdrGatewayRegistry.markPromptSubmitted(handle.attemptKey, handle.promptNonce);
+        defaultHerdrGatewayRegistry.markPromptSubmitted(
+          handle.attemptKey,
+          handle.promptNonce,
+          handle.workspaceId,
+        );
       }
-      if (rec) this.herdrHandles.set(rec.id, handle);
-      this.herdrHandles.set(handle.attemptKey, handle);
+      this.herdrHandles.set(rec.id, handle);
       return handle;
     }
 
-    return this.herdrHandles.get(agentIdOrAttemptKey);
+    return this.herdrHandles.get(rec.id);
   }
 
   private usesHerdrBackend(): boolean {
@@ -987,7 +989,7 @@ export class LocalAgentSessionManager {
       try {
         const replay = this.store.resolveStartReplay(workspaceRoot, replayBinding);
         if (replay) {
-          const herdrHandle = attemptKey ? this.getHerdrExternalHandle(attemptKey) : this.getHerdrExternalHandle(replay.id);
+          const herdrHandle = this.getHerdrExternalHandle(replay.id);
           return recordToStartOutput(replay, herdrHandle);
         }
       } catch (error) {
@@ -1155,7 +1157,7 @@ export class LocalAgentSessionManager {
         await this.launchPrompt(record.id, boundPrompt);
       }
     }
-    const herdrHandle = attemptKey ? this.getHerdrExternalHandle(attemptKey) : this.getHerdrExternalHandle(record.id);
+    const herdrHandle = this.getHerdrExternalHandle(record.id);
     return recordToStartOutput(this.store.getById(record.id) ?? record, herdrHandle);
   }
 
@@ -1525,7 +1527,7 @@ export class LocalAgentSessionManager {
       }
     }
 
-    const herdrHandle = this.getHerdrExternalHandle(agentId) ?? (record.startReplay?.key ? this.getHerdrExternalHandle(record.startReplay.key) : undefined);
+    const herdrHandle = this.getHerdrExternalHandle(agentId);
     return recordToStatusOutput(record, await this.buildLifecycleEvidence(record), herdrHandle);
   }
 
@@ -1542,7 +1544,7 @@ export class LocalAgentSessionManager {
       );
     }
 
-    const herdrHandle = this.getHerdrExternalHandle(agentId) ?? (record.startReplay?.key ? this.getHerdrExternalHandle(record.startReplay.key) : undefined);
+    const herdrHandle = this.getHerdrExternalHandle(agentId);
 
     if (record.externalRuntimeBinding?.runtimeKind === "HERDR" && herdrHandle) {
       if (record.status === "stopped") {
@@ -1869,7 +1871,7 @@ export class LocalAgentSessionManager {
     );
 
     const timing = computeSessionTiming(record);
-    const herdrHandle = this.getHerdrExternalHandle(record.id) ?? (record.startReplay?.key ? this.getHerdrExternalHandle(record.startReplay.key) : undefined);
+    const herdrHandle = this.getHerdrExternalHandle(record.id);
     const herdrReconciliation = herdrHandle && this.usesHerdrBackend()
       ? await this.herdrGateway.reconcileExternalAgent(
           herdrHandle,
