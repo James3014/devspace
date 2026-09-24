@@ -281,10 +281,17 @@ test("execution generation accepts exact generation and rejects substitution or 
     (error: unknown) => error instanceof ExecutionProtocolError && error.code === "EXECUTION_GENERATION_MISMATCH",
   );
   const changedHost = buildExecutionGenerationBinding({
-    ...generation,
+    profileCatalogGeneration: generation.profileCatalogGeneration,
+    provider: generation.provider,
+    model: generation.model,
+    executionIdentity: generation.executionIdentity,
+    runtimeVersion: generation.runtimeVersion,
+    devspaceBuildId: generation.devspaceBuildId,
+    devspaceSourceCommit: generation.devspaceSourceCommit,
     hostGeneration: testHostGeneration("other-host"),
-    capabilitySurfaceDigest: undefined,
-    executionBindingHash: undefined as never,
+    adapterGeneration: generation.adapterGeneration,
+    authReadiness: generation.authReadiness,
+    providerReachability: generation.providerReachability,
   });
   assert.throws(
     () => assertSameExecutionGeneration(generation, changedHost),

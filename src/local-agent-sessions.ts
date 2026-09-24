@@ -570,7 +570,9 @@ export class LocalAgentSessionManager {
     });
     this.capabilityManifestSha256 = hostQualification?.capabilityManifestSha256
       ?? createHash("sha256").update("unresolved-capability-manifest").digest("hex");
-    this.physicalHostId = hostQualification?.physicalHostId ?? process.env.DEVSPACE_PHYSICAL_HOST_ID?.trim() || undefined;
+    this.physicalHostId =
+      hostQualification?.physicalHostId
+      ?? (process.env.DEVSPACE_PHYSICAL_HOST_ID?.trim() || undefined);
   }
 
   /** Close the manager's durable store. Safe to call from multiple cleanup paths. */
