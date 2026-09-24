@@ -12,6 +12,7 @@ import {
   cleanPorcelainPath,
   parsePorcelainChangedPaths,
   buildDeterministicHerdrAgentName,
+  buildHerdrAgentArgs,
   normalizeHerdrSocketPath,
   type HerdrExternalHandle,
   type HerdrSocketRequest,
@@ -66,6 +67,35 @@ test("HerdrGatewayRegistry enforces N1 duplicate prevention and N2 conflicting r
   // Release
   registry.releaseHandle("attempt-1");
   assert.equal(registry.getHandle("attempt-1"), undefined);
+});
+
+test("buildHerdrAgentArgs projects exact provider identity and bounded write mode", () => {
+  const root = "/tmp/herdr-provider-breadth";
+  assert.deepEqual(
+    buildHerdrAgentArgs({ agentKind: "opencode", requestedModel: "mimo-v2.6-flash-free", writeMode: "read_only" }, root),
+    ["-m", "mimo-v2.6-flash-free"],
+  );
+  assert.deepEqual(
+    buildHerdrAgentArgs({ agentKind: "agy", requestedModel: "gemini-3.7-flash-medium", writeMode: "read_only" }, root),
+    ["--model", "gemini-3.7-flash-medium", "--sandbox", "--dangerously-skip-permissions", "--add-dir", root, "--mode", "plan"],
+  );
+  assert.deepEqual(
+    buildHerdrAgentArgs({ agentKind: "codex", requestedModel: "gpt-6-sol", requestedEffort: "high", writeMode: "read_only" }, root),
+    ["--model", "gpt-6-sol", "-c", 'model_reasoning_effort="high"', "--sandbox", "read-only", "--ask-for-approval", "never", "--cd", root],
+  );
+  assert.deepEqual(
+    buildHerdrAgentArgs({
+      agentKind: "cline",
+      requestedModel: "cline-free/mimo-v2.6-flash",
+      requestedCliProviderId: "cline",
+      writeMode: "read_only",
+    }, root),
+    ["--provider", "cline", "--model", "cline-free/mimo-v2.6-flash", "--plan", "--auto-approve", "true", "--cwd", root],
+  );
+  assert.deepEqual(
+    buildHerdrAgentArgs({ agentKind: "grok", requestedModel: "grok-4.6", requestedEffort: "low", writeMode: "allowed" }, root),
+    ["--model", "grok-4.6", "--reasoning-effort", "low", "--cwd", root, "--permission-mode", "acceptEdits", "--always-approve", "--no-subagents", "--disable-web-search"],
+  );
 });
 
 test("detectBlockedOnboardingDialog catches onboarding, trust and login menus (A5, N-TRUST)", () => {
@@ -4662,6 +4692,7 @@ test("HerdrThinGateway authority-bound transport endpoint and strict replay equi
       workspaceId?: string;
       requestedModel?: string;
       requestedEffort?: string;
+      requestedCliProviderId?: "cline" | "cline-pass";
     } = {}) {
       const intent = {
         taskId: `task-${attemptKey}`,
@@ -4700,6 +4731,7 @@ test("HerdrThinGateway authority-bound transport endpoint and strict replay equi
         herdrAgentKind: "opencode",
         ...(extra.requestedModel ? { requestedModel: extra.requestedModel } : {}),
         ...(extra.requestedEffort ? { requestedEffort: extra.requestedEffort } : {}),
+        ...(extra.requestedCliProviderId ? { requestedCliProviderId: extra.requestedCliProviderId } : {}),
         promptNonce: `NONCE-${attemptKey}`,
         canonicalWorktreePath: repoPath,
         workspaceId: wsId,
@@ -4727,6 +4759,7 @@ test("HerdrThinGateway authority-bound transport endpoint and strict replay equi
             herdrSocketPath: socketPath,
             ...(extra.requestedModel ? { requestedModel: extra.requestedModel } : {}),
             ...(extra.requestedEffort ? { requestedEffort: extra.requestedEffort } : {}),
+            ...(extra.requestedCliProviderId ? { requestedCliProviderId: extra.requestedCliProviderId } : {}),
             promptNonce: `NONCE-${attemptKey}`,
             workspaceId: wsId,
             herdrWorkspaceId: `ws-${attemptKey}`,
@@ -4908,6 +4941,34 @@ test("HerdrThinGateway authority-bound transport endpoint and strict replay equi
         }),
         /\[ATTEMPT_REPLAY_CONFLICT\] Replay requestedEffort/,
       );
+    }
+
+    // 8. LAUNCH-REPLAY-WRONG-CLINE-PROVIDER: provider-family drift fails closed before external effects
+    {
+      const attempt8 = `attempt-replay-cline-provider-${Date.now()}`;
+      const { agent: agent8, hash: hash8 } = createBoundAgent(attempt8, socketA, {
+        requestedModel: "cline-free/mimo-v2.6-flash",
+        requestedCliProviderId: "cline",
+      });
+      const spy8 = new SpyHerdrGateway(defaultGatewaySocket, new HerdrGatewayRegistry(), store);
+
+      await assert.rejects(
+        spy8.startExternalAgent({
+          agentId: agent8.id,
+          store,
+          attemptKey: attempt8,
+          dispatchIntentHash: hash8,
+          agentKind: "opencode",
+          canonicalWorktreePath: repoPath,
+          workspaceId: "ws-g",
+          socketPath: socketA,
+          requestedModel: "cline-free/mimo-v2.6-flash",
+          requestedCliProviderId: "cline-pass",
+        }),
+        /\[ATTEMPT_REPLAY_CONFLICT\] Replay requestedCliProviderId/,
+      );
+      assert.equal(spy8.workspaceCreateCalls, 0);
+      assert.equal(spy8.agentStartCalls, 0);
     }
 
     // 8. LEGACY-FENCE-NO-ENDPOINT: stored launch fence without herdrSocketPath fails closed with 0 external calls
