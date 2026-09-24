@@ -6,6 +6,8 @@ import test, { after } from "node:test";
 import { LocalAgentSessionManager, AgentSessionError, getWorkerProcessOwnership } from "./local-agent-sessions.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
+import { type HerdrExternalHandle, HerdrThinGateway, defaultHerdrGatewayRegistry } from "./local-agent-herdr.js";
+import { hashDispatchIntent } from "./execution-protocol.js";
 
 const originalAgyCommand = process.env.AGY_COMMAND;
 process.env.AGY_COMMAND = process.execPath;
@@ -982,5 +984,495 @@ test("runWorkerTurnFromFile persists typed AgentProviderFailureError details", a
     assert.equal(manager.countAllAgentRecords(), 1);
   } finally {
     clean();
+  }
+});
+
+test("LocalAgentSessionManager - binds and retrieves HerdrExternalHandle for durable attempt records", async () => {
+  const { manager, clean } = setupFixture();
+  const projectRoot = mkdtempSync(join(tmpdir(), "devspace-herdr-session-test-"));
+
+  try {
+    const dispatchIntent = {
+      taskId: "task-herdr-1",
+      attemptId: "attempt-herdr-1",
+      objective: "Run herdr test",
+      roleIntent: "DEEP_ENGINEERING" as const,
+      claimCeiling: "CANDIDATE_READY" as const,
+      context: ["test"],
+      readScope: ["src"],
+      writeScope: ["src/local-agent-sessions.ts"],
+      exclusiveOwnership: true,
+      forbiddenChanges: [],
+      acceptanceCriteria: ["pass"],
+      verificationRequired: true,
+      expectedArtifacts: [],
+    };
+    const intentHash = hashDispatchIntent(dispatchIntent);
+
+    const store = (manager as any).store;
+    const record = store.create({
+      workspaceId: "ws_herdr_test",
+      workspaceRoot: projectRoot,
+      profileName: "opencode-test",
+      provider: "opencode",
+      lifecycleKind: "detached_worker_v2",
+      startReplay: {
+        key: "attempt-herdr-1",
+        requestHash: "hash-1",
+      },
+      executionContract: {
+        writePaths: ["src/local-agent-sessions.ts"],
+        dispatchIntent,
+      },
+    });
+
+    const handle: HerdrExternalHandle = {
+      schemaVersion: 1,
+      runtimeKind: "HERDR",
+      herdrSocketPath: "/Users/james/.config/herdr/herdr.sock",
+      herdrWorkspaceId: "w_test_1",
+      herdrPaneId: "w_test_1:p1",
+      herdrAgentIdentity: "ds-attempt-herdr-1",
+      herdrAgentKind: "opencode",
+      promptNonce: "HERDR-DISPATCH-1",
+      canonicalWorktreePath: projectRoot,
+      workspaceId: "ws_herdr_test",
+      gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+      attemptKey: "attempt-herdr-1",
+      dispatchIntentHash: intentHash,
+      launchTimestamp: new Date().toISOString(),
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    };
+
+    // Bind handle to agent session
+    manager.bindHerdrExternalHandle(record.id, handle);
+
+    // Retrieve by agentId and attemptKey
+    assert.deepEqual(manager.getHerdrExternalHandle(record.id), handle);
+    assert.deepEqual(manager.getHerdrExternalHandle("attempt-herdr-1"), handle);
+
+    // Status includes herdrHandle
+    const status = await manager.getAgentStatus({
+      workspaceId: "ws_herdr_test",
+      workspaceRoot: projectRoot,
+      agentId: record.id,
+    });
+    assert.deepEqual(status.herdrHandle, handle);
+
+    // Reconcile includes herdrHandle
+    const reconcile = await manager.reconcileAgent({
+      workspaceId: "ws_herdr_test",
+      workspaceRoot: projectRoot,
+      isolated: false,
+      agentId: record.id,
+    });
+    assert.deepEqual(reconcile.herdrHandle, handle);
+    assert.equal(reconcile.herdrHandle?.enforcementState, "REQUEST_ONLY_NOT_ENFORCED"); // N8
+  } finally {
+    defaultHerdrGatewayRegistry.releaseHandle("attempt-herdr-1");
+    clean();
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("LocalAgentSessionManager - persists HerdrExternalHandle across restart and replay (A1, N1-R)", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-herdr-restart-test-"));
+  const config = {
+    stateDir,
+    subagents: true,
+    oauth: { scopes: ["devspace"] },
+  } as any;
+
+  const projectRoot = mkdtempSync(join(tmpdir(), "devspace-herdr-restart-repo-"));
+  const spawnedWorkers1: any[] = [];
+  const spawnedWorkers2: any[] = [];
+
+  try {
+    const manager1 = new LocalAgentSessionManager(
+      config,
+      async (agentId, promptFile, workerToken) => { spawnedWorkers1.push({ agentId }); },
+      async () => true,
+    );
+
+    const dispatchIntent = {
+      taskId: "task-restart-1",
+      attemptId: "attempt-restart-1",
+      objective: "Review restart task",
+      roleIntent: "DEEP_ENGINEERING" as const,
+      claimCeiling: "CANDIDATE_READY" as const,
+      context: ["test"],
+      readScope: ["src"],
+      writeScope: ["src/local-agent-sessions.ts"],
+      exclusiveOwnership: true,
+      forbiddenChanges: [],
+      acceptanceCriteria: ["pass"],
+      verificationRequired: true,
+      expectedArtifacts: [],
+    };
+    const intentHash = hashDispatchIntent(dispatchIntent);
+
+    // Start an agent with attemptKey and dispatchIntent
+    const startRes1 = await manager1.startAgent({
+      workspaceId: "ws_restart_test",
+      workspaceRoot: projectRoot,
+      profileName: "reviewer",
+      prompt: "review task",
+      profiles: mockProfiles,
+      attemptKey: "attempt-restart-1",
+      executionContract: {
+        writePaths: ["src/local-agent-sessions.ts"],
+        dispatchIntent,
+      },
+    });
+
+    const handle: HerdrExternalHandle = {
+      schemaVersion: 1,
+      runtimeKind: "HERDR",
+      herdrSocketPath: "/Users/james/.config/herdr/herdr.sock",
+      herdrWorkspaceId: "w_restart_1",
+      herdrPaneId: "w_restart_1:p1",
+      herdrAgentIdentity: "ds-attempt-restart-1",
+      herdrAgentKind: "agy",
+      promptNonce: "HERDR-DISPATCH-RESTART-1",
+      canonicalWorktreePath: projectRoot,
+      workspaceId: "ws_restart_test",
+      gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+      attemptKey: "attempt-restart-1",
+      dispatchIntentHash: intentHash,
+      launchTimestamp: new Date().toISOString(),
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    };
+
+    // Bind handle in manager 1 (persists to SQLite execution_contract via store CAS)
+    manager1.bindHerdrExternalHandle(startRes1.agentId, handle);
+    assert.deepEqual(manager1.getHerdrExternalHandle("attempt-restart-1"), handle);
+
+    // Simulate DevSpace restart: instantiate a fresh manager2 with same stateDir
+    defaultHerdrGatewayRegistry.releaseHandle("attempt-restart-1");
+    const manager2 = new LocalAgentSessionManager(
+      config,
+      async (agentId, promptFile, workerToken) => { spawnedWorkers2.push({ agentId }); },
+      async () => true,
+    );
+
+    // Instrument spy gateway on manager2 to assert zero HerdR creation calls on replay (N1-R)
+    class SpyHerdrGateway extends HerdrThinGateway {
+      workspaceCreateCount = 0;
+      agentStartCount = 0;
+      override async startExternalAgent(params: any): Promise<any> {
+        this.workspaceCreateCount++;
+        this.agentStartCount++;
+        return super.startExternalAgent(params);
+      }
+    }
+    const spyGateway = new SpyHerdrGateway();
+    (manager2 as any).herdrGateway = spyGateway;
+
+    // N1-R: Manager2 resolves durable handle from store despite empty in-memory map
+    const recoveredHandle = manager2.getHerdrExternalHandle("attempt-restart-1");
+    assert.ok(recoveredHandle);
+    assert.deepEqual(recoveredHandle, handle);
+
+    // Replay startAgent in manager2 with same attemptKey and prompt
+    const replayRes = await manager2.startAgent({
+      workspaceId: "ws_restart_test",
+      workspaceRoot: projectRoot,
+      profileName: "reviewer",
+      prompt: "review task",
+      profiles: mockProfiles,
+      attemptKey: "attempt-restart-1",
+      executionContract: {
+        writePaths: ["src/local-agent-sessions.ts"],
+        dispatchIntent,
+      },
+    });
+
+    // Same durable session and handle returned; 0 new workers launched
+    assert.equal(replayRes.agentId, startRes1.agentId);
+    assert.deepEqual(replayRes.herdrHandle, handle);
+    assert.equal(spawnedWorkers2.length, 0);
+
+    // N1-R: HerdR gateway was NOT called on replay
+    assert.equal(spyGateway.workspaceCreateCount, 0);
+    assert.equal(spyGateway.agentStartCount, 0);
+
+    // B1: Verify providerSessionId was not contaminated and remains undefined
+    const recordInStore = manager2.getRecordByPrefixOrId(startRes1.agentId);
+    assert.equal(recordInStore?.providerSessionId, undefined);
+    assert.ok(recordInStore?.externalRuntimeBinding);
+    assert.equal(recordInStore?.externalRuntimeBinding?.runtimeKind, "HERDR");
+
+    // Replay with conflicting prompt fails closed
+    await assert.rejects(
+      manager2.startAgent({
+        workspaceId: "ws_restart_test",
+        workspaceRoot: projectRoot,
+        profileName: "reviewer",
+        prompt: "DIFFERENT conflicting prompt",
+        profiles: mockProfiles,
+        attemptKey: "attempt-restart-1",
+      }),
+      (err: any) => err instanceof AgentSessionError && err.code === "ATTEMPT_REPLAY_CONFLICT",
+    );
+    assert.equal(spyGateway.workspaceCreateCount, 0);
+    assert.equal(spyGateway.agentStartCount, 0);
+  } finally {
+    defaultHerdrGatewayRegistry.releaseHandle("attempt-restart-1");
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("LocalAgentSessionManager - rejects conflicting replay and enforcement state violations for HerdrExternalHandle", async () => {
+  const { manager, clean } = setupFixture();
+  const projectRoot = mkdtempSync(join(tmpdir(), "devspace-herdr-conflict-test-"));
+
+  try {
+    const store = (manager as any).store;
+    const record = store.create({
+      workspaceId: "ws_conflict_test",
+      workspaceRoot: projectRoot,
+      profileName: "agy-test",
+      provider: "agy",
+      lifecycleKind: "detached_worker_v2",
+      startReplay: {
+        key: "bound-attempt-key",
+        requestHash: "req-hash-1",
+      },
+    });
+
+    // Mismatched attemptKey against record's startReplay key
+    const mismatchedHandle: HerdrExternalHandle = {
+      schemaVersion: 1,
+      runtimeKind: "HERDR",
+      herdrSocketPath: "/Users/james/.config/herdr/herdr.sock",
+      herdrWorkspaceId: "w_test_2",
+      herdrPaneId: "w_test_2:p1",
+      herdrAgentIdentity: "ds-attempt-other",
+      herdrAgentKind: "agy",
+      promptNonce: "HERDR-DISPATCH-2",
+      canonicalWorktreePath: projectRoot,
+      workspaceId: "ws_conflict_test",
+      gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+      attemptKey: "different-attempt-key",
+      dispatchIntentHash: "intent-hash-other",
+      launchTimestamp: new Date().toISOString(),
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    };
+
+    assert.throws(
+      () => manager.bindHerdrExternalHandle(record.id, mismatchedHandle),
+      (err: any) => err instanceof AgentSessionError && err.code === "ATTEMPT_REPLAY_CONFLICT",
+    );
+
+    // Illegal PHYSICALLY_ENFORCED claim (N8 violation) fails closed
+    const illegalEnforcementHandle: HerdrExternalHandle = {
+      ...mismatchedHandle,
+      attemptKey: "bound-attempt-key",
+      enforcementState: "PHYSICALLY_ENFORCED" as any,
+    };
+
+    assert.throws(
+      () => manager.bindHerdrExternalHandle(record.id, illegalEnforcementHandle),
+      (err: any) => err instanceof AgentSessionError && err.code === "INVALID_EXECUTION_CONTRACT",
+    );
+  } finally {
+    defaultHerdrGatewayRegistry.releaseHandle("bound-attempt-key");
+    defaultHerdrGatewayRegistry.releaseHandle("different-attempt-key");
+    clean();
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+class SpyPromptGateway extends HerdrThinGateway {
+  promptCallCount = 0;
+  mockPromptOutcome: "done" | "timeout" | "error" | "blocked" = "done";
+  currentHandle?: HerdrExternalHandle;
+
+  override async getPane(paneId: string): Promise<any> {
+    if (this.currentHandle && paneId === this.currentHandle.herdrPaneId) {
+      return {
+        pane_id: this.currentHandle.herdrPaneId,
+        workspace_id: this.currentHandle.herdrWorkspaceId,
+        cwd: this.currentHandle.canonicalWorktreePath,
+        foreground_cwd: this.currentHandle.canonicalWorktreePath,
+      };
+    }
+    return undefined;
+  }
+
+  override async getAgent(agentName: string): Promise<any> {
+    if (this.currentHandle && agentName === this.currentHandle.herdrAgentIdentity) {
+      return {
+        name: this.currentHandle.herdrAgentIdentity,
+        agent: this.currentHandle.herdrAgentKind,
+        workspace_id: this.currentHandle.herdrWorkspaceId,
+        pane_id: this.currentHandle.herdrPaneId,
+        cwd: this.currentHandle.canonicalWorktreePath,
+        foreground_cwd: this.currentHandle.canonicalWorktreePath,
+        agent_status: "idle",
+        interactive_ready: true,
+      };
+    }
+    return { agent_status: "idle", interactive_ready: true };
+  }
+
+  override async readPane(paneId: string) {
+    if (this.mockPromptOutcome === "blocked") {
+      return "Do you trust the contents of this project?";
+    }
+    return "Output from agent";
+  }
+
+  protected override async sendRequest<T = unknown>(req: any, timeoutMs?: number): Promise<any> {
+    if (req.method === "agent.prompt") {
+      this.promptCallCount++;
+      if (this.mockPromptOutcome === "error") {
+        throw new Error("Simulated socket network disconnect");
+      }
+      if (this.mockPromptOutcome === "timeout") {
+        return {
+          id: req.id,
+          error: { code: "timeout", message: "Prompt timed out after 30000ms" },
+        };
+      }
+      return {
+        id: req.id,
+        result: {
+          agent: {
+            name: this.currentHandle?.herdrAgentIdentity,
+            agent: this.currentHandle?.herdrAgentKind,
+            workspace_id: this.currentHandle?.herdrWorkspaceId,
+            pane_id: this.currentHandle?.herdrPaneId,
+            cwd: this.currentHandle?.canonicalWorktreePath,
+            foreground_cwd: this.currentHandle?.canonicalWorktreePath,
+            agent_status: this.mockPromptOutcome === "blocked" ? "blocked" : "done",
+            interactive_ready: true,
+          },
+        },
+      };
+    }
+    return { id: req.id, result: {} };
+  }
+}
+
+test("LocalAgentSessionManager - PROMPT-R1, R2, R3, R4 durable prompt fence survives DevSpace restart", async () => {
+  const cases: Array<{
+    name: string;
+    attemptKey: string;
+    outcome: "done" | "timeout" | "error" | "blocked";
+  }> = [
+    { name: "PROMPT-R1 (normal settlement)", attemptKey: "attempt-prompt-r1", outcome: "done" },
+    { name: "PROMPT-R2 (timeout OUTCOME_UNKNOWN)", attemptKey: "attempt-prompt-r2", outcome: "timeout" },
+    { name: "PROMPT-R3 (network/socket error)", attemptKey: "attempt-prompt-r3", outcome: "error" },
+    { name: "PROMPT-R4 (blocked onboarding dialog)", attemptKey: "attempt-prompt-r4", outcome: "blocked" },
+  ];
+
+  for (const c of cases) {
+    const stateDir = mkdtempSync(join(tmpdir(), `devspace-fence-${c.attemptKey}-`));
+    const projectRoot = mkdtempSync(join(tmpdir(), `devspace-fence-repo-${c.attemptKey}-`));
+    const config = { stateDir, subagents: true, oauth: { scopes: ["devspace"] } } as any;
+
+    try {
+      const manager1 = new LocalAgentSessionManager(config, async () => {}, async () => true);
+      const dispatchIntent = {
+        taskId: `task-${c.attemptKey}`,
+        attemptId: c.attemptKey,
+        objective: `Test durable fence for ${c.name}`,
+        roleIntent: "DEEP_ENGINEERING" as const,
+        claimCeiling: "CANDIDATE_READY" as const,
+        context: ["test"],
+        readScope: ["src"],
+        writeScope: ["src/local-agent-sessions.ts"],
+        exclusiveOwnership: true,
+        forbiddenChanges: [],
+        acceptanceCriteria: ["pass"],
+        verificationRequired: true,
+        expectedArtifacts: [],
+      };
+      const intentHash = hashDispatchIntent(dispatchIntent);
+
+      const startRes = await manager1.startAgent({
+        workspaceId: "ws_fence_test",
+        workspaceRoot: projectRoot,
+        profileName: "reviewer",
+        prompt: "test fence",
+        profiles: mockProfiles,
+        attemptKey: c.attemptKey,
+        executionContract: {
+          writePaths: ["src/local-agent-sessions.ts"],
+          dispatchIntent,
+        },
+      });
+
+      const handle: HerdrExternalHandle = {
+        schemaVersion: 1,
+        runtimeKind: "HERDR",
+        herdrSocketPath: "/tmp/herdr.sock",
+        herdrWorkspaceId: `w_${c.attemptKey}`,
+        herdrPaneId: `p_${c.attemptKey}`,
+        herdrAgentIdentity: `ds-${c.attemptKey}`,
+        herdrAgentKind: "agy",
+        promptNonce: `NONCE-${c.attemptKey}`,
+        canonicalWorktreePath: projectRoot,
+        workspaceId: "ws_fence_test",
+        gitHeadBefore: "3f8d6c12c4986c0af806944d9aaa7c3427fb0380",
+        attemptKey: c.attemptKey,
+        dispatchIntentHash: intentHash,
+        launchTimestamp: new Date().toISOString(),
+        enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+      };
+
+      manager1.bindHerdrExternalHandle(startRes.agentId, handle);
+
+      const spyGateway1 = new SpyPromptGateway("/tmp/herdr.sock", defaultHerdrGatewayRegistry, (manager1 as any).store);
+      spyGateway1.currentHandle = handle;
+      spyGateway1.mockPromptOutcome = c.outcome;
+
+      // 1. Submit first prompt
+      if (c.outcome === "error") {
+        const res = await spyGateway1.promptExternalAgent(handle, "first prompt", { store: (manager1 as any).store });
+        assert.equal(res.status, "OUTCOME_UNKNOWN");
+        assert.equal(res.timeout, false);
+      } else {
+        const res = await spyGateway1.promptExternalAgent(handle, "first prompt", { store: (manager1 as any).store });
+        if (c.outcome === "done") assert.equal(res.status, "done");
+        if (c.outcome === "timeout") assert.equal(res.status, "OUTCOME_UNKNOWN");
+        if (c.outcome === "blocked") assert.equal(res.status, "blocked");
+      }
+      assert.equal(spyGateway1.promptCallCount, 1, `${c.name}: first prompt must call external agent once`);
+
+      // 2. Simulate DevSpace restart: clear process registry and instantiate fresh manager2
+      defaultHerdrGatewayRegistry.releaseHandle(c.attemptKey);
+      manager1.close();
+
+      const manager2 = new LocalAgentSessionManager(config, async () => {}, async () => true);
+      const recoveredHandle = manager2.getHerdrExternalHandle(c.attemptKey);
+      assert.ok(recoveredHandle, `${c.name}: handle must recover from store`);
+
+      const spyGateway2 = new SpyPromptGateway("/tmp/herdr.sock", defaultHerdrGatewayRegistry, (manager2 as any).store);
+      spyGateway2.currentHandle = recoveredHandle!;
+      assert.equal(spyGateway2.promptCallCount, 0);
+
+      // 3. Second prompt on same attempt after restart MUST fail closed with [N-TURN-OPTION-A]
+      await assert.rejects(
+        async () => spyGateway2.promptExternalAgent(recoveredHandle!, "second prompt after restart", { store: (manager2 as any).store }),
+        /\[N-TURN-OPTION-A\]/,
+        `${c.name}: second prompt must be rejected with [N-TURN-OPTION-A]`,
+      );
+
+      // 4. CRUCIAL ASSERTION: Zero external agent.prompt calls made on the second prompt
+      assert.equal(
+        spyGateway2.promptCallCount,
+        0,
+        `${c.name}: external agent.prompt call count must be 0 on second prompt after restart`,
+      );
+
+      manager2.close();
+    } finally {
+      defaultHerdrGatewayRegistry.releaseHandle(c.attemptKey);
+      rmSync(stateDir, { recursive: true, force: true });
+      rmSync(projectRoot, { recursive: true, force: true });
+    }
   }
 });

@@ -27,6 +27,7 @@ import {
   deserializeExecutionGenerationBinding,
   serializeExecutionGenerationBinding,
   type ExecutionGenerationBinding,
+  hashDispatchIntent,
 } from "./execution-protocol.js";
 import {
   parseLocalEffectEnforcementReceipt,
@@ -77,6 +78,102 @@ export interface PhysicalTerminationState {
   previousWorkerToken?: string;
 }
 
+export interface ExternalRuntimePromptState {
+  consequentialPromptFenced: boolean;
+  promptNonce: string;
+  fencedAt: string;
+}
+
+export type ExternalRuntimeLaunchState =
+  | "FENCED"
+  | "WORKSPACE_OBSERVED"
+  | "AGENT_OBSERVED"
+  | "OUTCOME_UNKNOWN";
+
+export interface ExternalRuntimeLaunchFence {
+  state: ExternalRuntimeLaunchState;
+  launchRequestId: string;
+  attemptKey: string;
+  dispatchIntentHash: string;
+  canonicalWorktreePath: string;
+  gitHeadBefore: string;
+  agentKind: string;
+  herdrSocketPath?: string;
+  requestedModel?: string;
+  requestedEffort?: string;
+  promptNonce: string;
+  workspaceId?: string;
+  herdrWorkspaceId?: string;
+  herdrPaneId?: string;
+  herdrAgentIdentity?: string;
+  plannedAgentName?: string;
+  observedCwd?: string;
+  fencedAt: string;
+  updatedAt?: string;
+}
+
+export interface ExternalRuntimeBinding {
+  runtimeKind: string;
+  launch?: ExternalRuntimeLaunchFence;
+  handle?: Record<string, unknown>;
+  promptState?: ExternalRuntimePromptState;
+}
+
+export interface FenceExternalRuntimeLaunchInput {
+  agentId: string;
+  attemptKey: string;
+  dispatchIntentHash: string;
+  canonicalWorktreePath: string;
+  gitHeadBefore: string;
+  agentKind: string;
+  herdrSocketPath?: string;
+  requestedModel?: string;
+  requestedEffort?: string;
+  promptNonce: string;
+  workspaceId?: string;
+  plannedAgentName?: string;
+  expectedUpdatedAt?: string;
+}
+
+export interface RecordWorkspaceObservedInput {
+  agentId: string;
+  attemptKey: string;
+  herdrWorkspaceId: string;
+  herdrPaneId: string;
+  observedCwd: string;
+  expectedUpdatedAt?: string;
+}
+
+export interface RecordAgentObservedInput {
+  agentId: string;
+  attemptKey: string;
+  herdrAgentIdentity: string;
+  expectedUpdatedAt?: string;
+}
+
+export interface MarkLaunchOutcomeUnknownInput {
+  agentId: string;
+  attemptKey: string;
+  reason?: string;
+  expectedUpdatedAt?: string;
+}
+
+export interface BindExternalRuntimeBindingInput {
+  agentId: string;
+  expectedAttemptKey?: string;
+  expectedDispatchIntentHash?: string;
+  expectedUpdatedAt?: string;
+  binding: ExternalRuntimeBinding;
+}
+
+export interface FenceConsequentialPromptInput {
+  agentId: string;
+  attemptKey: string;
+  dispatchIntentHash: string;
+  promptNonce: string;
+  expectedUpdatedAt?: string;
+}
+
 export interface LocalAgentRecord {
   id: string;
   workspaceId?: string;
@@ -91,6 +188,7 @@ export interface LocalAgentRecord {
   executionContract?: ExecutionContract;
   executionGeneration?: ExecutionGenerationBinding;
   startReplay?: StartReplayBinding;
+  externalRuntimeBinding?: ExternalRuntimeBinding;
   terminalReason?: AgentTerminalReason;
   scopeState?: ScopeState;
   scopeBaseline?: ScopeBaseline;
@@ -117,6 +215,7 @@ export interface CreateLocalAgentRecordInput {
   executionIdlePolicy?: EffectiveExecutionIdlePolicy;
   executionGeneration?: ExecutionGenerationBinding;
   startReplay?: StartReplayBinding;
+  externalRuntimeBinding?: ExternalRuntimeBinding;
   lifecycleKind?: AgentLifecycleKind;
 }
 
@@ -369,6 +468,7 @@ export class LocalAgentStore {
       executionContract: input.executionContract,
       executionGeneration: input.executionGeneration,
       startReplay: input.startReplay,
+      externalRuntimeBinding: input.externalRuntimeBinding,
       lifecycleState: input.lifecycleKind === "detached_worker_v2"
         ? {
             lifecycleKind: "detached_worker_v2",
@@ -416,7 +516,7 @@ export class LocalAgentStore {
         record.model ?? null,
         record.effort ?? null,
         record.providerContinuityState,
-        serializeStoredExecutionState(record.executionContract, record.startReplay),
+        serializeStoredExecutionState(record.executionContract, record.startReplay, record.externalRuntimeBinding),
         serializeExecutionGenerationBinding(record.executionGeneration),
         record.lifecycleState ? JSON.stringify(record.lifecycleState) : null,
         record.status,
@@ -590,7 +690,7 @@ export class LocalAgentStore {
         updatedProviderContinuityState,
         updated.workerPid ?? null,
         updated.workerToken ?? null,
-        serializeStoredExecutionState(updated.executionContract, updated.startReplay),
+        serializeStoredExecutionState(updated.executionContract, updated.startReplay, updated.externalRuntimeBinding),
         serializeExecutionGenerationBinding(updated.executionGeneration),
         updated.terminalReason ?? null,
         updated.scopeState ?? null,
@@ -942,6 +1042,441 @@ export class LocalAgentStore {
       return { applied: result.changes === 1, previous: current, current: refreshed };
     });
     return bind.immediate();
+  }
+
+  bindExternalRuntimeBindingCAS(input: BindExternalRuntimeBindingInput): LifecycleCasResult {
+    const bind = this.database.sqlite.transaction(() => {
+      const current = this.getById(input.agentId);
+      if (!current) return { applied: false };
+
+      if (input.expectedUpdatedAt !== undefined && current.updatedAt !== input.expectedUpdatedAt) {
+        return { applied: false, previous: current, current };
+      }
+
+      // Fail closed on attemptKey consistency
+      if (input.expectedAttemptKey !== undefined) {
+        if (!current.startReplay?.key || current.startReplay.key !== input.expectedAttemptKey) {
+          return { applied: false, previous: current, current };
+        }
+      }
+
+      // Fail closed on dispatchIntentHash consistency
+      if (input.expectedDispatchIntentHash !== undefined) {
+        if (!current.executionContract?.dispatchIntent) {
+          return { applied: false, previous: current, current };
+        }
+        const currentHash = hashDispatchIntent(current.executionContract.dispatchIntent);
+        if (!currentHash || currentHash !== input.expectedDispatchIntentHash) {
+          return { applied: false, previous: current, current };
+        }
+      }
+
+      // Check idempotency if already bound
+      if (current.externalRuntimeBinding?.handle) {
+        const existing = current.externalRuntimeBinding;
+        if (
+          existing.runtimeKind === input.binding.runtimeKind &&
+          JSON.stringify(existing.handle) === JSON.stringify(input.binding.handle)
+        ) {
+          return { applied: true, previous: current, current };
+        }
+        return { applied: false, previous: current, current };
+      }
+
+      const mergedBinding: ExternalRuntimeBinding = {
+        ...input.binding,
+        launch: input.binding.launch ?? current.externalRuntimeBinding?.launch,
+        promptState: input.binding.promptState ?? current.externalRuntimeBinding?.promptState,
+      };
+
+      const serialized = serializeStoredExecutionState(
+        current.executionContract,
+        current.startReplay,
+        mergedBinding,
+      );
+
+      const now = new Date().toISOString();
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set execution_contract = ?, updated_at = ?
+         where id = ? and updated_at = ?`,
+      ).run(serialized, now, current.id, current.updatedAt);
+
+      const refreshed = this.getById(current.id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return bind.immediate();
+  }
+
+  fenceExternalRuntimeLaunchCAS(input: FenceExternalRuntimeLaunchInput): LifecycleCasResult {
+    const fence = this.database.sqlite.transaction(() => {
+      const current = this.getById(input.agentId);
+      if (!current) return { applied: false };
+
+      if (input.expectedUpdatedAt !== undefined && current.updatedAt !== input.expectedUpdatedAt) {
+        return { applied: false, previous: current, current };
+      }
+
+      // 1. Validate exact attemptKey
+      if (!current.startReplay?.key || current.startReplay.key !== input.attemptKey) {
+        return { applied: false, previous: current, current };
+      }
+
+      // 2. Validate exact dispatchIntentHash
+      if (!current.executionContract?.dispatchIntent) {
+        return { applied: false, previous: current, current };
+      }
+      const currentHash = hashDispatchIntent(current.executionContract.dispatchIntent);
+      if (!currentHash || currentHash !== input.dispatchIntentHash) {
+        return { applied: false, previous: current, current };
+      }
+
+      // 3. Validate canonical worktree
+      if (canonicalizePath(current.workspaceRoot) !== canonicalizePath(input.canonicalWorktreePath)) {
+        return { applied: false, previous: current, current };
+      }
+
+      // 4. Validate git head format
+      if (!/^[0-9a-f]{40}$/i.test(input.gitHeadBefore)) {
+        return { applied: false, previous: current, current };
+      }
+
+      // 5. Check existing binding
+      if (current.externalRuntimeBinding) {
+        if (current.externalRuntimeBinding.runtimeKind !== "HERDR") {
+          return { applied: false, previous: current, current };
+        }
+        const existingLaunch = current.externalRuntimeBinding.launch;
+        if (existingLaunch) {
+          const existingSocket = existingLaunch.herdrSocketPath
+            ? canonicalizePath(existingLaunch.herdrSocketPath)
+            : undefined;
+          const inputSocket = input.herdrSocketPath
+            ? canonicalizePath(input.herdrSocketPath)
+            : undefined;
+
+          if (
+            existingLaunch.attemptKey === input.attemptKey &&
+            existingLaunch.dispatchIntentHash === input.dispatchIntentHash &&
+            canonicalizePath(existingLaunch.canonicalWorktreePath) === canonicalizePath(input.canonicalWorktreePath) &&
+            existingLaunch.gitHeadBefore === input.gitHeadBefore &&
+            existingLaunch.agentKind === input.agentKind &&
+            existingSocket === inputSocket &&
+            (existingLaunch.workspaceId ?? undefined) === (input.workspaceId ?? undefined) &&
+            (existingLaunch.requestedModel ?? undefined) === (input.requestedModel ?? undefined) &&
+            (existingLaunch.requestedEffort ?? undefined) === (input.requestedEffort ?? undefined) &&
+            existingLaunch.promptNonce === input.promptNonce &&
+            (existingLaunch.plannedAgentName ?? undefined) === (input.plannedAgentName ?? undefined)
+          ) {
+            return { applied: true, previous: current, current };
+          }
+          return { applied: false, previous: current, current };
+        }
+      }
+
+      const now = new Date().toISOString();
+      const launchRequestId = `HERDR-LAUNCH:${input.attemptKey}:${input.dispatchIntentHash.slice(0, 16)}`;
+      const launchFence: ExternalRuntimeLaunchFence = {
+        state: "FENCED",
+        launchRequestId,
+        attemptKey: input.attemptKey,
+        dispatchIntentHash: input.dispatchIntentHash,
+        canonicalWorktreePath: canonicalizePath(input.canonicalWorktreePath),
+        gitHeadBefore: input.gitHeadBefore,
+        agentKind: input.agentKind,
+        ...(input.herdrSocketPath ? { herdrSocketPath: input.herdrSocketPath } : {}),
+        ...(input.requestedModel ? { requestedModel: input.requestedModel } : {}),
+        ...(input.requestedEffort ? { requestedEffort: input.requestedEffort } : {}),
+        promptNonce: input.promptNonce,
+        ...(input.workspaceId ? { workspaceId: input.workspaceId } : {}),
+        ...(input.plannedAgentName ? { plannedAgentName: input.plannedAgentName } : {}),
+        fencedAt: now,
+      };
+
+      const updatedBinding: ExternalRuntimeBinding = {
+        runtimeKind: "HERDR",
+        ...(current.externalRuntimeBinding ?? {}),
+        launch: launchFence,
+      };
+
+      const serialized = serializeStoredExecutionState(
+        current.executionContract,
+        current.startReplay,
+        updatedBinding,
+      );
+
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set execution_contract = ?, updated_at = ?
+         where id = ? and updated_at = ?`,
+      ).run(serialized, now, current.id, current.updatedAt);
+
+      const refreshed = this.getById(current.id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return fence.immediate();
+  }
+
+  recordExternalRuntimeWorkspaceObservedCAS(input: RecordWorkspaceObservedInput): LifecycleCasResult {
+    const record = this.database.sqlite.transaction(() => {
+      const current = this.getById(input.agentId);
+      if (!current) return { applied: false };
+
+      if (input.expectedUpdatedAt !== undefined && current.updatedAt !== input.expectedUpdatedAt) {
+        return { applied: false, previous: current, current };
+      }
+
+      if (!current.startReplay?.key || current.startReplay.key !== input.attemptKey) {
+        return { applied: false, previous: current, current };
+      }
+
+      const binding = current.externalRuntimeBinding;
+      if (!binding || binding.runtimeKind !== "HERDR" || !binding.launch) {
+        return { applied: false, previous: current, current };
+      }
+
+      if (binding.launch.attemptKey !== input.attemptKey) {
+        return { applied: false, previous: current, current };
+      }
+
+      if (!input.herdrWorkspaceId || !input.herdrPaneId || !input.observedCwd) {
+        return { applied: false, previous: current, current };
+      }
+
+      if (
+        canonicalizePath(input.observedCwd) !==
+        canonicalizePath(binding.launch.canonicalWorktreePath)
+      ) {
+        return { applied: false, previous: current, current };
+      }
+
+      if (
+        binding.launch.herdrWorkspaceId === input.herdrWorkspaceId &&
+        binding.launch.herdrPaneId === input.herdrPaneId
+      ) {
+        return { applied: true, previous: current, current };
+      }
+
+      const now = new Date().toISOString();
+      const updatedLaunch: ExternalRuntimeLaunchFence = {
+        ...binding.launch,
+        state: "WORKSPACE_OBSERVED",
+        herdrWorkspaceId: input.herdrWorkspaceId,
+        herdrPaneId: input.herdrPaneId,
+        observedCwd: canonicalizePath(input.observedCwd),
+        updatedAt: now,
+      };
+
+      const updatedBinding: ExternalRuntimeBinding = {
+        ...binding,
+        launch: updatedLaunch,
+      };
+
+      const serialized = serializeStoredExecutionState(
+        current.executionContract,
+        current.startReplay,
+        updatedBinding,
+      );
+
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set execution_contract = ?, updated_at = ?
+         where id = ? and updated_at = ?`,
+      ).run(serialized, now, current.id, current.updatedAt);
+
+      const refreshed = this.getById(current.id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return record.immediate();
+  }
+
+  recordExternalRuntimeAgentObservedCAS(input: RecordAgentObservedInput): LifecycleCasResult {
+    const record = this.database.sqlite.transaction(() => {
+      const current = this.getById(input.agentId);
+      if (!current) return { applied: false };
+
+      if (input.expectedUpdatedAt !== undefined && current.updatedAt !== input.expectedUpdatedAt) {
+        return { applied: false, previous: current, current };
+      }
+
+      if (!current.startReplay?.key || current.startReplay.key !== input.attemptKey) {
+        return { applied: false, previous: current, current };
+      }
+
+      const binding = current.externalRuntimeBinding;
+      if (!binding || binding.runtimeKind !== "HERDR" || !binding.launch) {
+        return { applied: false, previous: current, current };
+      }
+
+      if (binding.launch.attemptKey !== input.attemptKey) {
+        return { applied: false, previous: current, current };
+      }
+
+      if (binding.launch.herdrAgentIdentity === input.herdrAgentIdentity) {
+        return { applied: true, previous: current, current };
+      }
+
+      const now = new Date().toISOString();
+      const updatedLaunch: ExternalRuntimeLaunchFence = {
+        ...binding.launch,
+        state: "AGENT_OBSERVED",
+        herdrAgentIdentity: input.herdrAgentIdentity,
+        updatedAt: now,
+      };
+
+      const updatedBinding: ExternalRuntimeBinding = {
+        ...binding,
+        launch: updatedLaunch,
+      };
+
+      const serialized = serializeStoredExecutionState(
+        current.executionContract,
+        current.startReplay,
+        updatedBinding,
+      );
+
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set execution_contract = ?, updated_at = ?
+         where id = ? and updated_at = ?`,
+      ).run(serialized, now, current.id, current.updatedAt);
+
+      const refreshed = this.getById(current.id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return record.immediate();
+  }
+
+  markExternalRuntimeLaunchOutcomeUnknownCAS(input: MarkLaunchOutcomeUnknownInput): LifecycleCasResult {
+    const record = this.database.sqlite.transaction(() => {
+      const current = this.getById(input.agentId);
+      if (!current) return { applied: false };
+
+      if (input.expectedUpdatedAt !== undefined && current.updatedAt !== input.expectedUpdatedAt) {
+        return { applied: false, previous: current, current };
+      }
+
+      const binding = current.externalRuntimeBinding;
+      if (!binding || binding.runtimeKind !== "HERDR" || !binding.launch) {
+        return { applied: false, previous: current, current };
+      }
+
+      if (binding.launch.state === "OUTCOME_UNKNOWN") {
+        return { applied: true, previous: current, current };
+      }
+
+      const now = new Date().toISOString();
+      const updatedLaunch: ExternalRuntimeLaunchFence = {
+        ...binding.launch,
+        state: "OUTCOME_UNKNOWN",
+        updatedAt: now,
+      };
+
+      const updatedBinding: ExternalRuntimeBinding = {
+        ...binding,
+        launch: updatedLaunch,
+      };
+
+      const serialized = serializeStoredExecutionState(
+        current.executionContract,
+        current.startReplay,
+        updatedBinding,
+      );
+
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set execution_contract = ?, updated_at = ?
+         where id = ? and updated_at = ?`,
+      ).run(serialized, now, current.id, current.updatedAt);
+
+      const refreshed = this.getById(current.id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return record.immediate();
+  }
+
+  fenceConsequentialPromptCAS(input: FenceConsequentialPromptInput): LifecycleCasResult {
+    const fence = this.database.sqlite.transaction(() => {
+      if (!input.agentId) return { applied: false };
+      const current = this.getById(input.agentId);
+      if (!current) return { applied: false };
+
+      if (input.expectedUpdatedAt !== undefined && current.updatedAt !== input.expectedUpdatedAt) {
+        return { applied: false, previous: current, current };
+      }
+
+      // 1. Exact attemptKey match on durable record
+      if (!current.startReplay?.key || current.startReplay.key !== input.attemptKey) {
+        return { applied: false, previous: current, current };
+      }
+
+      // 2. Exact dispatchIntentHash match on durable record
+      if (!current.executionContract?.dispatchIntent) {
+        return { applied: false, previous: current, current };
+      }
+      const recordHash = hashDispatchIntent(current.executionContract.dispatchIntent);
+      if (!recordHash || recordHash !== input.dispatchIntentHash) {
+        return { applied: false, previous: current, current };
+      }
+
+      // 3. Durable externalRuntimeBinding must exist
+      if (!current.externalRuntimeBinding) {
+        return { applied: false, previous: current, current };
+      }
+
+      // 4. runtimeKind must be HERDR
+      if (current.externalRuntimeBinding.runtimeKind !== "HERDR") {
+        return { applied: false, previous: current, current };
+      }
+
+      // 5. Durable handle must exist and be an object
+      const storedHandle = current.externalRuntimeBinding.handle;
+      if (!storedHandle || typeof storedHandle !== "object") {
+        return { applied: false, previous: current, current };
+      }
+
+      const h = storedHandle as Record<string, unknown>;
+
+      // 6. Handle attemptKey must match input.attemptKey
+      if (typeof h.attemptKey !== "string" || h.attemptKey !== input.attemptKey) {
+        return { applied: false, previous: current, current };
+      }
+
+      // 7. Handle dispatchIntentHash must match input.dispatchIntentHash
+      if (typeof h.dispatchIntentHash !== "string" || h.dispatchIntentHash !== input.dispatchIntentHash) {
+        return { applied: false, previous: current, current };
+      }
+
+      // 8. Handle promptNonce must match input.promptNonce exactly
+      if (typeof h.promptNonce !== "string" || h.promptNonce !== input.promptNonce) {
+        return { applied: false, previous: current, current };
+      }
+
+      // 9. If already fenced, fail closed
+      if (current.externalRuntimeBinding.promptState?.consequentialPromptFenced) {
+        return { applied: false, previous: current, current };
+      }
+
+      const now = new Date().toISOString();
+      const updatedBinding: ExternalRuntimeBinding = {
+        ...current.externalRuntimeBinding,
+        promptState: {
+          consequentialPromptFenced: true,
+          promptNonce: h.promptNonce,
+          fencedAt: now,
+        },
+      };
+
+      const serialized = serializeStoredExecutionState(
+        current.executionContract,
+        current.startReplay,
+        updatedBinding,
+      );
+
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set execution_contract = ?, updated_at = ?
+         where id = ? and updated_at = ?`,
+      ).run(serialized, now, current.id, current.updatedAt);
+
+      const refreshed = this.getById(current.id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return fence.immediate();
   }
 
   finishTurnCAS(input: FinishTurnCasInput): LifecycleCasResult {
@@ -1474,6 +2009,7 @@ function rowToLocalAgentRecord(row: LocalAgentRow): LocalAgentRecord {
     executionContract: storedExecution.executionContract,
     executionGeneration: deserializeExecutionGenerationBinding(row.execution_generation),
     startReplay: storedExecution.startReplay,
+    externalRuntimeBinding: storedExecution.externalRuntimeBinding,
     terminalReason: readTerminalReason(row.terminal_reason),
     scopeState: readScopeState(row.scope_state),
     scopeBaseline: readScopeBaseline(row.scope_baseline),
@@ -1543,36 +2079,120 @@ function storeResult<T>(operation: string, run: () => T): BetterResult<T, AgentS
 function serializeStoredExecutionState(
   executionContract: ExecutionContract | undefined,
   startReplay: StartReplayBinding | undefined,
+  externalRuntimeBinding?: ExternalRuntimeBinding,
 ): string | null {
-  if (!startReplay) return serializeExecutionContract(executionContract);
+  if (!startReplay && !externalRuntimeBinding) return serializeExecutionContract(executionContract);
   return JSON.stringify({
-    storedExecutionStateVersion: 1,
+    storedExecutionStateVersion: 2,
     executionContract: executionContract ?? null,
     startReplay,
+    externalRuntimeBinding,
   });
 }
 
 function readStoredExecutionState(value: string | null | undefined): {
   executionContract?: ExecutionContract;
   startReplay?: StartReplayBinding;
+  externalRuntimeBinding?: ExternalRuntimeBinding;
 } {
   if (!value) return {};
   try {
     const parsed = JSON.parse(value) as Record<string, unknown>;
-    if (parsed.storedExecutionStateVersion !== 1) {
-      return { executionContract: deserializeExecutionContract(value) };
+    if (parsed.storedExecutionStateVersion === 2) {
+      const replay = parsed.startReplay as Record<string, unknown> | undefined;
+      const startReplay = replay && typeof replay.key === "string" && typeof replay.requestHash === "string"
+        ? { key: replay.key, requestHash: replay.requestHash }
+        : undefined;
+      const executionContract = parsed.executionContract === null
+        ? undefined
+        : deserializeExecutionContract(JSON.stringify(parsed.executionContract));
+      const bindingRaw = parsed.externalRuntimeBinding as Record<string, unknown> | undefined;
+      const promptState = readExternalRuntimePromptState(bindingRaw?.promptState);
+      const launch = readExternalRuntimeLaunchFence(bindingRaw?.launch);
+      const handle = bindingRaw?.handle && typeof bindingRaw.handle === "object"
+        ? (bindingRaw.handle as Record<string, unknown>)
+        : undefined;
+      const externalRuntimeBinding: ExternalRuntimeBinding | undefined =
+        bindingRaw && typeof bindingRaw.runtimeKind === "string" && (handle || launch)
+          ? {
+              runtimeKind: bindingRaw.runtimeKind,
+              ...(launch ? { launch } : {}),
+              ...(handle ? { handle } : {}),
+              ...(promptState ? { promptState } : {}),
+            }
+          : undefined;
+      return { executionContract, startReplay, externalRuntimeBinding };
     }
-    const replay = parsed.startReplay as Record<string, unknown> | undefined;
-    const startReplay = replay && typeof replay.key === "string" && typeof replay.requestHash === "string"
-      ? { key: replay.key, requestHash: replay.requestHash }
-      : undefined;
-    const executionContract = parsed.executionContract === null
-      ? undefined
-      : deserializeExecutionContract(JSON.stringify(parsed.executionContract));
-    return { executionContract, startReplay };
+    if (parsed.storedExecutionStateVersion === 1) {
+      const replay = parsed.startReplay as Record<string, unknown> | undefined;
+      const startReplay = replay && typeof replay.key === "string" && typeof replay.requestHash === "string"
+        ? { key: replay.key, requestHash: replay.requestHash }
+        : undefined;
+      const executionContract = parsed.executionContract === null
+        ? undefined
+        : deserializeExecutionContract(JSON.stringify(parsed.executionContract));
+      return { executionContract, startReplay };
+    }
+    return { executionContract: deserializeExecutionContract(value) };
   } catch {
     return {};
   }
+}
+
+function readExternalRuntimeLaunchFence(value: unknown): ExternalRuntimeLaunchFence | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.state === "string" &&
+    typeof record.launchRequestId === "string" &&
+    typeof record.attemptKey === "string" &&
+    typeof record.dispatchIntentHash === "string" &&
+    typeof record.canonicalWorktreePath === "string" &&
+    typeof record.gitHeadBefore === "string" &&
+    typeof record.agentKind === "string" &&
+    typeof record.promptNonce === "string" &&
+    typeof record.fencedAt === "string"
+  ) {
+    return {
+      state: record.state as ExternalRuntimeLaunchState,
+      launchRequestId: record.launchRequestId,
+      attemptKey: record.attemptKey,
+      dispatchIntentHash: record.dispatchIntentHash,
+      canonicalWorktreePath: record.canonicalWorktreePath,
+      gitHeadBefore: record.gitHeadBefore,
+      agentKind: record.agentKind,
+      ...(typeof record.herdrSocketPath === "string" ? { herdrSocketPath: record.herdrSocketPath } : {}),
+      ...(typeof record.requestedModel === "string" ? { requestedModel: record.requestedModel } : {}),
+      ...(typeof record.requestedEffort === "string" ? { requestedEffort: record.requestedEffort } : {}),
+      promptNonce: record.promptNonce,
+      ...(typeof record.workspaceId === "string" ? { workspaceId: record.workspaceId } : {}),
+      ...(typeof record.herdrWorkspaceId === "string" ? { herdrWorkspaceId: record.herdrWorkspaceId } : {}),
+      ...(typeof record.herdrPaneId === "string" ? { herdrPaneId: record.herdrPaneId } : {}),
+      ...(typeof record.herdrAgentIdentity === "string" ? { herdrAgentIdentity: record.herdrAgentIdentity } : {}),
+      ...(typeof record.plannedAgentName === "string" ? { plannedAgentName: record.plannedAgentName } : {}),
+      ...(typeof record.observedCwd === "string" ? { observedCwd: record.observedCwd } : {}),
+      fencedAt: record.fencedAt,
+      ...(typeof record.updatedAt === "string" ? { updatedAt: record.updatedAt } : {}),
+    };
+  }
+  return undefined;
+}
+
+function readExternalRuntimePromptState(value: unknown): ExternalRuntimePromptState | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.consequentialPromptFenced === "boolean" &&
+    typeof record.promptNonce === "string" &&
+    typeof record.fencedAt === "string"
+  ) {
+    return {
+      consequentialPromptFenced: record.consequentialPromptFenced,
+      promptNonce: record.promptNonce,
+      fencedAt: record.fencedAt,
+    };
+  }
+  return undefined;
 }
 
 function readStatus(status: string): LocalAgentStatus {
