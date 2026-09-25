@@ -1577,6 +1577,73 @@ export class LocalAgentSessionManager {
       return recordToStatusOutput(record, undefined, undefined);
     }
 
+    const observedLaunch = record.externalRuntimeBinding?.runtimeKind === "HERDR"
+      ? record.externalRuntimeBinding.launch
+      : undefined;
+    const observedAbsentGeneration =
+      record.status === "starting" &&
+      record.lifecycleState?.activeTurn?.launchState === "not_started" &&
+      record.workerPid === undefined &&
+      record.workerToken === undefined &&
+      record.externalRuntimeBinding?.runtimeKind === "HERDR" &&
+      record.externalRuntimeBinding.handle === undefined &&
+      observedLaunch?.state === "AGENT_OBSERVED" &&
+      observedLaunch.herdrWorkspaceId !== undefined &&
+      observedLaunch.herdrPaneId !== undefined &&
+      observedLaunch.herdrAgentIdentity !== undefined
+        ? record.lifecycleState.activeTurn.generation
+        : undefined;
+    if (observedAbsentGeneration && observedLaunch) {
+      const physical = await inspectWorkspacePhysicalState(record.workspaceRoot);
+      const baseline = record.scopeBaseline;
+      const delta = baseline ? computeWorkerDelta(physical, baseline) : undefined;
+      if (
+        !physical.gitAvailable ||
+        !baseline?.head ||
+        !physical.head ||
+        physical.head !== baseline.head ||
+        !delta ||
+        delta.changedPaths.length !== 0
+      ) {
+        throw new AgentSessionError(
+          "AGENT_LIFECYCLE_CORRUPT",
+          `Agent ${agentId} lost its HerdR handle, but local workspace/base absence could not be proven.`,
+        );
+      }
+
+      let absent = false;
+      try {
+        absent = await this.herdrGateway.confirmObservedLaunchAbsent(observedLaunch);
+      } catch (error) {
+        throw new AgentSessionError(
+          "AGENT_LIFECYCLE_CORRUPT",
+          `Agent ${agentId} lost its HerdR handle and exact external absence could not be proven: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+      }
+      if (!absent) {
+        throw new AgentSessionError(
+          "AGENT_LIFECYCLE_CORRUPT",
+          `Agent ${agentId} still has live HerdR launch identity; refusing stale-slot reclaim.`,
+        );
+      }
+
+      const stopped = this.store.cancelExternalRuntimeObservedAbsentCAS(
+        record.id,
+        observedAbsentGeneration,
+        observedLaunch.launchRequestId,
+      );
+      if (!stopped.applied) {
+        throw new AgentSessionError(
+          "AGENT_LIFECYCLE_CORRUPT",
+          `Agent ${agentId} lost its exact observed-launch generation before cancellation.`,
+        );
+      }
+      record = stopped.current ?? record;
+      return recordToStatusOutput(record, undefined, undefined);
+    }
+
     const herdrHandle = this.getHerdrExternalHandle(agentId);
 
     if (record.externalRuntimeBinding?.runtimeKind === "HERDR" && herdrHandle) {
