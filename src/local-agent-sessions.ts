@@ -1557,6 +1557,26 @@ export class LocalAgentSessionManager {
       );
     }
 
+    const preLaunchGeneration =
+      record.status === "starting" &&
+      record.lifecycleState?.activeTurn?.launchState === "not_started" &&
+      record.workerPid === undefined &&
+      record.workerToken === undefined &&
+      record.externalRuntimeBinding === undefined
+        ? record.lifecycleState.activeTurn.generation
+        : undefined;
+    if (preLaunchGeneration) {
+      const stopped = this.store.cancelExternalRuntimePreLaunchCAS(record.id, preLaunchGeneration);
+      if (!stopped.applied) {
+        throw new AgentSessionError(
+          "AGENT_LIFECYCLE_CORRUPT",
+          `Agent ${agentId} lost its exact pre-launch generation before cancellation.`,
+        );
+      }
+      record = stopped.current ?? record;
+      return recordToStatusOutput(record, undefined, undefined);
+    }
+
     const herdrHandle = this.getHerdrExternalHandle(agentId);
 
     if (record.externalRuntimeBinding?.runtimeKind === "HERDR" && herdrHandle) {
