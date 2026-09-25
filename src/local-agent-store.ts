@@ -1290,6 +1290,47 @@ export class LocalAgentStore {
     return fail.immediate();
   }
 
+  cancelExternalRuntimePreLaunchCAS(
+    agentId: string,
+    generation: string,
+  ): LifecycleCasResult {
+    const cancel = this.database.sqlite.transaction(() => {
+      const current = this.getById(agentId);
+      const lifecycle = current?.lifecycleState;
+      const activeTurn = lifecycle?.activeTurn;
+      if (
+        !current ||
+        !isDetachedLifecycle(lifecycle) ||
+        current.status !== "starting" ||
+        activeTurn?.generation !== generation ||
+        activeTurn.launchState !== "not_started" ||
+        lifecycle.terminationPending ||
+        lifecycle.lifecycleCorrupt ||
+        current.workerPid !== undefined ||
+        current.workerToken !== undefined ||
+        current.externalRuntimeBinding !== undefined
+      ) {
+        return { applied: false, previous: current, current };
+      }
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        activeTurn: undefined,
+        lastSettledGeneration: generation,
+      };
+      const now = new Date().toISOString();
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set status = 'stopped', latest_response = null,
+          error = null, error_code = null, error_retryable = null, error_details = null,
+          terminal_reason = 'cancelled', worker_pid = null, worker_token = null,
+          lifecycle_state = ?, updated_at = ?
+         where id = ? and status = 'starting' and updated_at = ?`,
+      ).run(JSON.stringify(lifecycleState), now, agentId, current.updatedAt);
+      const refreshed = this.getById(agentId) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return cancel.immediate();
+  }
+
   markExternalRuntimeStoppedCAS(
     agentId: string,
     terminalReason: AgentTerminalReason = "cancelled",

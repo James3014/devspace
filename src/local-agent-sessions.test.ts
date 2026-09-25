@@ -585,6 +585,55 @@ test("LocalAgentSessionManager - launch failure fail-closed behavior", async () 
   }
 });
 
+test("LocalAgentSessionManager - cancel reclaims an exact not-started turn without invoking a terminator", async () => {
+  const { manager, terminatedWorkers, clean } = setupFixture();
+  try {
+    const workspaceRoot = "/Users/jameschen/Workspace/prelaunch";
+    const store = (manager as any).store;
+    const record = store.create({
+      workspaceId: "ws_prelaunch",
+      workspaceRoot,
+      profileName: "reviewer",
+      provider: "opencode",
+      lifecycleKind: "detached_worker_v2",
+    });
+    const generation = record.lifecycleState?.activeTurn?.generation;
+    assert.equal(record.lifecycleState?.activeTurn?.launchState, "not_started");
+    assert.ok(generation);
+
+    const cancelled = await manager.cancelAgent({
+      workspaceId: "ws_prelaunch",
+      workspaceRoot,
+      agentId: record.id,
+    });
+    assert.equal(cancelled.status, "stopped");
+    assert.equal(cancelled.terminal, true);
+    assert.equal(terminatedWorkers.length, 0);
+    const readback = store.getById(record.id);
+    assert.equal(readback?.terminalReason, "cancelled");
+    assert.equal(readback?.lifecycleState?.activeTurn, undefined);
+    assert.equal(readback?.lifecycleState?.lastSettledGeneration, generation);
+
+    const launching = store.create({
+      workspaceId: "ws_prelaunch",
+      workspaceRoot,
+      profileName: "reviewer",
+      provider: "opencode",
+      lifecycleKind: "detached_worker_v2",
+    });
+    const launchingGeneration = launching.lifecycleState?.activeTurn?.generation;
+    assert.ok(launchingGeneration);
+    assert.equal(store.prepareWorkerCAS(launching.id, launchingGeneration, "owned-token").applied, true);
+    assert.equal(
+      store.cancelExternalRuntimePreLaunchCAS(launching.id, launchingGeneration).applied,
+      false,
+      "launching/token-bound turns must not use the pre-launch reclaim seam",
+    );
+  } finally {
+    clean();
+  }
+});
+
 test("LocalAgentSessionManager - cancel fences a starting worker before claim", async () => {
   const { manager, spawnedWorkers, terminatedWorkers, clean } = setupFixture();
   try {
