@@ -323,8 +323,13 @@ async function waitForHerdrOpencodeServer(endpoint: string, timeoutMs: number = 
 }
 
 export function isHerdrFreeTierCapacity(agentKind: HerdrAgentKind, terminalText: string): boolean {
-  return agentKind === "cline" &&
-    /daily free model limit reached|free model limit reached|free usage limit|rate limit exceeded/i.test(terminalText);
+  if (agentKind === "cline") {
+    return /daily free model limit reached|free model limit reached|free usage limit|rate limit exceeded/i.test(terminalText);
+  }
+  if (agentKind === "agy") {
+    return /RESOURCE_EXHAUSTED|individual quota reached|quota reached|rate limit exceeded/i.test(terminalText);
+  }
+  return false;
 }
 
 export interface HerdrPromptOptions {
@@ -1883,13 +1888,13 @@ export class HerdrThinGateway {
       if (isHerdrFreeTierCapacity(handle.herdrAgentKind, paneOutput)) {
         throw new AgentProviderFailureError({
           code: "PROVIDER_CAPACITY_ERROR",
-          provider: "cline",
+          provider: handle.herdrAgentKind,
           operation: "run",
           retryable: true,
           errorClass: "QUOTA_CAPACITY",
           model: handle.requestedModel,
           providerMessage: paneOutput.trim(),
-          message: "Cline free-tier quota or capacity is temporarily exhausted.",
+          message: `${handle.herdrAgentKind} quota or capacity is temporarily exhausted.`,
         });
       }
 
