@@ -993,9 +993,20 @@ export class LocalAgentSessionManager {
       }
       const message = error instanceof Error ? error.message : String(error);
       const latest = this.store.getById(agentId);
-      if (latest?.lifecycleState?.activeTurn?.generation === generation
-        && latest.externalRuntimeBinding?.runtimeKind !== "HERDR") {
-        this.store.failExternalRuntimePreLaunchCAS(agentId, generation, message);
+      if (latest?.lifecycleState?.activeTurn?.generation === generation) {
+        const knownHerdrLaunchFailure =
+          latest.externalRuntimeBinding?.runtimeKind === "HERDR" &&
+          !latest.externalRuntimeBinding.handle &&
+          latest.externalRuntimeBinding.launch?.state === "WORKSPACE_OBSERVED" &&
+          message.startsWith("HerdR agent.start failed:");
+        if (latest.externalRuntimeBinding?.runtimeKind !== "HERDR" || knownHerdrLaunchFailure) {
+          this.store.failExternalRuntimePreLaunchCAS(
+            agentId,
+            generation,
+            message,
+            { allowKnownHerdrLaunchFailure: knownHerdrLaunchFailure },
+          );
+        }
       }
     }
   }
