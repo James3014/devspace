@@ -64,7 +64,7 @@ function createMockActuator(fail = false): SelfRestartActuator & { scheduledCoun
       actuator.scheduledCount += 1;
       if (fail) throw new Error("launchctl kickstart mock failure");
       return {
-        scheduled: true,
+        scheduled: true as const,
         actuator: "launchd-self" as const,
         serviceLabel: "com.example.devspace",
         launchdTarget: "gui/501/com.example.devspace",
@@ -255,7 +255,14 @@ test("devspace#263 G3: build-ready missing or probe failure blocks with BUILD_NO
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-cutover-g3-build-"));
   try {
     const f = createOrchestratorFixture(stateDir, {
-      probe: () => ({ buildReady: false, detail: "disk binary missing" }),
+      probe: (expected) => ({
+        buildReady: false,
+        verifiedBy: "build-identity-file",
+        verifiedAt: new Date().toISOString(),
+        expectedSourceCommit: expected.sourceCommit,
+        expectedBuildId: expected.buildId,
+        detail: "disk binary missing",
+      }),
     });
     const cutover = f.oldController.begin(targetIdentity);
     f.oldController.recordDrain(cutover.cutoverId, { activeSessions: 0, oldestAgeMs: 0 });
