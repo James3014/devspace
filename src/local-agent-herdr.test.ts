@@ -11,6 +11,8 @@ import {
   detectBlockedOnboardingDialog,
   cleanPorcelainPath,
   parsePorcelainChangedPaths,
+  parseHerdrOpencodeServerEndpoint,
+  isHerdrFreeTierCapacity,
   buildDeterministicHerdrAgentName,
   buildHerdrAgentArgs,
   buildHerdrWorkspaceEnv,
@@ -28,8 +30,8 @@ import { LocalAgentSessionManager } from "./local-agent-sessions.js";
 test("buildHerdrAgentArgs binds requested provider model, effort, and permission mode", () => {
   const cwd = "/tmp/worktree";
   assert.deepEqual(
-    buildHerdrAgentArgs({ agentKind: "opencode", requestedModel: "mimo-v2.6-flash-free", writeMode: "read_only" }, cwd),
-    ["-m", "mimo-v2.6-flash-free"],
+    buildHerdrAgentArgs({ agentKind: "opencode", requestedModel: "mimo-v2.6-flash-free", writeMode: "read_only" }, cwd, 45678),
+    ["serve", "--hostname=127.0.0.1", "--port=45678"],
   );
   assert.deepEqual(
     buildHerdrAgentArgs({ agentKind: "agy", requestedModel: "gemini-3.7-flash-medium", writeMode: "read_only" }, cwd),
@@ -49,10 +51,12 @@ test("buildHerdrAgentArgs binds requested provider model, effort, and permission
   );
 });
 
-test("buildHerdrWorkspaceEnv preserves DevSpace OpenCode permission authority", () => {
+test("buildHerdrWorkspaceEnv preserves DevSpace OpenCode permission authority without global permission override", () => {
   const readOnly = buildHerdrWorkspaceEnv({ agentKind: "opencode", writeMode: "read_only" });
-  assert.ok(readOnly?.OPENCODE_PERMISSION);
-  assert.deepEqual(JSON.parse(readOnly.OPENCODE_PERMISSION), {
+  assert.equal(readOnly?.OPENCODE_PERMISSION, undefined);
+  assert.ok(readOnly?.OPENCODE_CONFIG_CONTENT);
+  const readOnlyConfig = JSON.parse(readOnly.OPENCODE_CONFIG_CONTENT);
+  assert.deepEqual(readOnlyConfig.agent.devspace_read_only.permission, {
     read: "allow",
     edit: "deny",
     glob: "allow",
@@ -68,8 +72,10 @@ test("buildHerdrWorkspaceEnv preserves DevSpace OpenCode permission authority", 
     writeMode: "allowed",
     selectedToolIntents: ["workspace.read", "workspace.mutate"],
   });
-  assert.ok(selected?.OPENCODE_PERMISSION);
-  assert.deepEqual(JSON.parse(selected.OPENCODE_PERMISSION), {
+  assert.equal(selected?.OPENCODE_PERMISSION, undefined);
+  assert.ok(selected?.OPENCODE_CONFIG_CONTENT);
+  const selectedConfig = JSON.parse(selected.OPENCODE_CONFIG_CONTENT);
+  assert.deepEqual(selectedConfig.agent.devspace_allowed.permission, {
     read: "allow",
     edit: "allow",
     glob: "deny",
@@ -80,6 +86,22 @@ test("buildHerdrWorkspaceEnv preserves DevSpace OpenCode permission authority", 
     external_directory: "deny",
   });
   assert.equal(buildHerdrWorkspaceEnv({ agentKind: "agy", writeMode: "allowed" }), undefined);
+});
+
+test("parseHerdrOpencodeServerEndpoint accepts only observed loopback listener output", () => {
+  assert.equal(
+    parseHerdrOpencodeServerEndpoint("opencode server listening on http://127.0.0.1:61724"),
+    "http://127.0.0.1:61724",
+  );
+  assert.equal(parseHerdrOpencodeServerEndpoint("opencode server listening on http://0.0.0.0:61724"), undefined);
+  assert.equal(parseHerdrOpencodeServerEndpoint("ready"), undefined);
+});
+
+test("isHerdrFreeTierCapacity classifies Cline free quota without broadening other provider errors", () => {
+  assert.equal(isHerdrFreeTierCapacity("cline", "daily free model limit reached"), true);
+  assert.equal(isHerdrFreeTierCapacity("cline", "Rate limit exceeded. Please try again later."), true);
+  assert.equal(isHerdrFreeTierCapacity("opencode", "Rate limit exceeded. Please try again later."), false);
+  assert.equal(isHerdrFreeTierCapacity("cline", "authentication required"), false);
 });
 
 test("HerdrGatewayRegistry scopes replay identity by workspace", () => {
@@ -688,12 +710,25 @@ test("HerdrThinGateway live canary with OpenCode on isolated worktree", async ()
 
     const nonce = `OPENCODE-REAL-MUTATION-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-    // Prompt OpenCode to create a file with exact nonce
-    const promptRes = await gateway.promptExternalAgent(
-      handle,
-      `Create a file named oc_canary.txt containing exact text:\n${nonce}\nDo not ask questions.`,
-      { timeoutMs: 60_000 },
-    );
+    // Prompt OpenCode to create a file with exact nonce. If the account's
+    // shared free quota is exhausted, the canary still proves the regression
+    // is fixed when the provider returns QUOTA_CAPACITY rather than the old
+    // "free tier can only be used from within OpenCode" client-identity 403.
+    let promptRes;
+    try {
+      promptRes = await gateway.promptExternalAgent(
+        handle,
+        `Create a file named oc_canary.txt containing exact text:\n${nonce}\nDo not ask questions.`,
+        { timeoutMs: 60_000 },
+      );
+    } catch (error: any) {
+      if (error?.code !== "PROVIDER_CAPACITY_ERROR") throw error;
+      const providerMessage = String(error?.providerMessage ?? error?.message ?? "");
+      assert.doesNotMatch(providerMessage, /free tier can only be used from within OpenCode/i);
+      assert.match(providerMessage, /FreeUsageLimitError|Rate limit exceeded|Free usage/i);
+      await gateway.stopExternalAgent(handle);
+      return;
+    }
     assert.ok(promptRes.status === "done" || promptRes.status === "idle");
     assert.ok(promptRes.turnNonce);
 

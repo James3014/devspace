@@ -784,8 +784,8 @@ export class LocalAgentSessionManager {
       agentId: record.id,
       generation,
       status: terminalScope === "SCOPE_VIOLATION" ? "error" : "idle",
-      providerSessionId: handle.nativeProviderSessionId,
-      latestResponse: promptResult?.paneOutput,
+      providerSessionId: promptResult?.nativeProviderSessionId ?? handle.nativeProviderSessionId,
+      latestResponse: promptResult?.finalResponse ?? promptResult?.paneOutput,
       error: terminalScope === "SCOPE_VIOLATION"
         ? `Agent modified paths outside authorized scope: ${scope.unexpectedPaths.join(", ")}`
         : undefined,
@@ -895,6 +895,79 @@ export class LocalAgentSessionManager {
       }
       await this.settleHerdrTurn(this.store.getById(initial.id) ?? initial, handle, result);
     } catch (error) {
+      if (isAgentProviderError(error) || error instanceof LocalAgentProviderError) {
+        const latest = this.store.getById(agentId) ?? initial;
+        const physical = await inspectWorkspacePhysicalState(latest.workspaceRoot).catch(() => undefined);
+        const delta = physical ? computeWorkerDelta(physical, latest.scopeBaseline) : undefined;
+        const scope = delta
+          ? this.classifyWorkerScope(
+              delta.changedPaths,
+              latest.executionContract?.writePaths,
+              latest.executionContract?.maxFiles,
+              delta.attribution,
+            )
+          : { scopeState: "UNKNOWN" as ScopeState, unexpectedPaths: [] as string[] };
+        const cumulative = Array.from(new Set([
+          ...(latest.lifecycleState?.cumulativeChangedPaths ?? []),
+          ...(delta?.changedPaths ?? []),
+        ])).sort();
+
+        let providerSessionId: string | undefined;
+        let latestResponse: string | undefined;
+        let errorCode: string | undefined;
+        let errorRetryable: boolean | undefined;
+        let errorDetails: AgentProviderFailureDetails | string | undefined;
+        if (AgentProviderFailureError.is(error)) {
+          errorCode = error.code;
+          errorRetryable = error.retryable;
+          errorDetails = describeAgentProviderError(error);
+          providerSessionId = error.providerSessionId;
+          latestResponse = error.providerMessage === undefined
+            ? undefined
+            : redactSensitiveText(error.providerMessage);
+        } else if (isAgentProviderError(error)) {
+          errorCode = error.code;
+          errorRetryable = error.retryable;
+          errorDetails = describeAgentProviderError(error);
+        } else {
+          providerSessionId = error.providerSessionId;
+          latestResponse = error.finalResponse === undefined
+            ? undefined
+            : redactSensitiveText(error.finalResponse);
+        }
+
+        const failed = this.store.failExternalRuntimeTurnCAS({
+          agentId,
+          generation,
+          providerSessionId,
+          latestResponse,
+          error: redactSensitiveText(error instanceof Error ? error.message : String(error)),
+          errorCode,
+          errorRetryable,
+          errorDetails,
+          terminalReason: "provider_error",
+          scopeState: scope.scopeState,
+          cumulativeChangedPaths: cumulative,
+          turnEndBaseline: physical
+            ? {
+                changedPaths: physical.changedPaths,
+                head: physical.head ?? null,
+                fingerprints: physical.fingerprints,
+              }
+            : undefined,
+        });
+        if (!failed.applied) {
+          const current = this.store.getById(agentId);
+          if (current?.lifecycleState?.activeTurn?.generation === generation) {
+            throw new AgentSessionError(
+              "AGENT_LIFECYCLE_CORRUPT",
+              `HerdR provider error for agent ${agentId} could not be durably settled.`,
+            );
+          }
+        }
+        return;
+      }
+
       const current = this.store.getById(agentId);
       const activeGeneration = current?.lifecycleState?.activeTurn?.generation;
       if (current && activeGeneration === generation && current.externalRuntimeBinding?.runtimeKind === "HERDR") {
@@ -944,6 +1017,16 @@ export class LocalAgentSessionManager {
     const handle = this.getHerdrExternalHandle(agentId);
     if (!handle) {
       throw new AgentSessionError("AGENT_LIFECYCLE_CORRUPT", `Agent ${agentId} has HERDR runtime state without a durable handle.`);
+    }
+    if (
+      handle.herdrAgentKind === "opencode" &&
+      handle.nativeProviderEndpoint !== undefined &&
+      record.externalRuntimeBinding?.promptState?.consequentialPromptFenced
+    ) {
+      // HerdR owns the long-lived OpenCode server process, not the semantic SDK
+      // request. After controller restart, server-idle is not evidence that the
+      // fenced SDK turn completed. Preserve active/unknown truth; never replay.
+      return;
     }
     await this.settleHerdrTurn(record, handle);
   }
@@ -1919,7 +2002,14 @@ export class LocalAgentSessionManager {
 
     const timing = computeSessionTiming(record);
     const herdrHandle = this.getHerdrExternalHandle(record.id);
-    const herdrReconciliation = herdrHandle && this.usesHerdrBackend()
+    const opencodeSemanticOutcomeUnknown = Boolean(
+      herdrHandle?.herdrAgentKind === "opencode" &&
+      herdrHandle.nativeProviderEndpoint !== undefined &&
+      record.lifecycleState?.activeTurn &&
+      record.externalRuntimeBinding?.promptState?.consequentialPromptFenced &&
+      !this.herdrTurnTasks.has(record.id),
+    );
+    const herdrReconciliation = herdrHandle && this.usesHerdrBackend() && !opencodeSemanticOutcomeUnknown
       ? await this.herdrGateway.reconcileExternalAgent(
           herdrHandle,
           contract?.writePaths,
@@ -1940,7 +2030,9 @@ export class LocalAgentSessionManager {
       ...(herdrHandle ? { runtime: herdrRuntimeOutput(herdrHandle) } : {}),
       dispatch: dispatchContractOutput(record.executionContract?.dispatchIntent),
       agentState: record.status,
-      providerState: herdrReconciliation?.executionState
+      providerState: opencodeSemanticOutcomeUnknown
+        ? "OUTCOME_UNKNOWN"
+        : herdrReconciliation?.executionState
         ?? record.providerContinuityState
         ?? (record.providerSessionId ? "KNOWN_UNVERIFIED" : "UNKNOWN"),
       providerSessionId: record.providerSessionId,
