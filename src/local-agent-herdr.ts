@@ -4,7 +4,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { resolve, normalize } from "node:path";
 import { createHash } from "node:crypto";
 import type { LocalAgentStore, ExternalRuntimeLaunchFence, LocalAgentRecord } from "./local-agent-store.js";
-import { hashDispatchIntent } from "./execution-protocol.js";
+import { hashDispatchIntent, type ToolIntentId } from "./execution-protocol.js";
+import { opencodePermissionFor } from "./local-agent-opencode.js";
 import { canonicalizePath } from "./roots.js";
 
 export const HERDR_DEFAULT_SOCKET_PATH = process.env.HERDR_SOCKET_PATH || "/Users/james/.config/herdr/herdr.sock";
@@ -189,6 +190,7 @@ export interface StartHerdrAgentParams {
   requestedEffort?: string;
   requestedCliProviderId?: "cline" | "cline-pass";
   writeMode?: "read_only" | "allowed";
+  selectedToolIntents?: ToolIntentId[];
   socketPath?: string;
   store?: LocalAgentStore;
 }
@@ -243,6 +245,23 @@ export function buildHerdrAgentArgs(
   }
 
   return args;
+}
+
+/**
+ * Project DevSpace's existing OpenCode permission contract into the HerdR
+ * workspace environment before the root pane/agent process is created.
+ * This reuses the canonical legacy-adapter permission mapping instead of
+ * widening the HerdR path with OpenCode's interactive auto-approval mode.
+ */
+export function buildHerdrWorkspaceEnv(
+  params: Pick<StartHerdrAgentParams, "agentKind" | "writeMode" | "selectedToolIntents">,
+): Record<string, string> | undefined {
+  if (params.agentKind !== "opencode") return undefined;
+  return {
+    OPENCODE_PERMISSION: JSON.stringify(
+      opencodePermissionFor(params.writeMode ?? "read_only", params.selectedToolIntents),
+    ),
+  };
 }
 
 export interface HerdrPromptOptions {
@@ -1253,6 +1272,7 @@ export class HerdrThinGateway {
     }
 
     // 1. Create HerdR workspace with exact cwd
+    const workspaceEnv = buildHerdrWorkspaceEnv(params);
     const wsReq: HerdrSocketRequest = {
       id: `HERDR-LAUNCH:${params.attemptKey}:workspace`,
       method: "workspace.create",
@@ -1260,6 +1280,7 @@ export class HerdrThinGateway {
         cwd: canonicalPath,
         label: wsLabel,
         focus: false,
+        ...(workspaceEnv ? { env: workspaceEnv } : {}),
       },
     };
 
