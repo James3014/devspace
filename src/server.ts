@@ -94,7 +94,7 @@ import {
   probeTargetPackage,
   type BuildReadyProbeResult,
 } from "./cutover-build-ready.js";
-import { CutoverOrchestrator, type OrchestrationOutcome } from "./cutover-orchestration.js";
+import { CutoverOrchestrator, type AdvanceOptions, type OrchestrationOutcome } from "./cutover-orchestration.js";
 import {
   createLaunchdSelfRestartActuator,
   type SelfRestartActuator,
@@ -1705,7 +1705,7 @@ export interface CutoverMcpControlContext {
   ) => Promise<BuildReadyProbeResult> | BuildReadyProbeResult;
   inspectWorkspace?: (workspaceId: string) => { session?: WorkspaceSession; loaded: boolean };
   listWorkspaceSessions?: () => WorkspaceSession[];
-  advance?: () => Promise<OrchestrationOutcome>;
+  advance?: (options?: AdvanceOptions) => Promise<OrchestrationOutcome>;
   enumerateReconciliation?: () => Promise<DurableReconciliationWitness>;
   executeObservedReplacementRecovery?: (input: {
     cutoverId: string;
@@ -1766,6 +1766,7 @@ function registerCutoverMcpTools(
         multiRoleConvergence: z.record(z.string(), z.unknown()).optional(),
         controlPlaneConvergence: z.record(z.string(), z.unknown()).optional(),
         cutoverStatus: z.record(z.string(), z.unknown()),
+        physicalClocks: z.record(z.string(), z.unknown()).optional(),
       },
       _meta: {},
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
@@ -1822,6 +1823,31 @@ function registerCutoverMcpTools(
 
       const multiRoleConvergence = control.multiRoleEvaluator?.();
       const controlPlaneConvergence = control.controlPlaneEvaluator?.();
+      const canonicalService = controlPlaneConvergence?.services?.find(
+        (s) => s.role === controlPlaneConvergence.canonicalRole,
+      );
+      const primaryRoleState = multiRoleConvergence?.roleStates
+        ? (multiRoleConvergence.roleStates.primary ?? (
+            multiRoleConvergence.authoritativeRole
+              ? multiRoleConvergence.roleStates[multiRoleConvergence.authoritativeRole]
+              : undefined
+          ))
+        : undefined;
+      const physicalClocks = {
+        fresh_repository_source: canonicalService?.buildIdentity?.sourceCommit
+          ?? primaryRoleState?.snapshot?.remoteMain?.commit
+          ?? control.controller.currentIdentity.sourceCommit,
+        accepted_deployment: primaryRoleState?.snapshot?.acceptedDeployment?.buildId
+          ?? primaryRoleState?.snapshot?.acceptedDeployment?.commit
+          ?? control.controller.currentIdentity.buildId,
+        installed_generation: primaryRoleState?.snapshot?.installedBuild?.buildId
+          ?? control.controller.currentIdentity.buildId,
+        running_generation: `${control.controller.currentIdentity.buildId}@${control.controller.currentIdentity.serverInstanceId}`,
+        session_generation: sessionConvergence?.sessionSnapshot?.catalogGeneration ?? null,
+        client_projection: clientProjectionConvergence?.clientProjectionGeneration ?? null,
+        control_topology: canonicalService ? `${canonicalService.role}:${canonicalService.roleKind}` : null,
+        caller_continuity: callerIdentity.callerIdentityFingerprint ?? null,
+      };
       return {
         content: [textBlock(
           `Capability convergence: session=${sessionConvergence?.state ?? "n/a"}, controller=${sessionConvergence?.controllerDisposition ?? "n/a"}, clientProjection=${clientProjectionConvergence?.state ?? "unreported"}, multiRoleConverged=${String(multiRoleConvergence?.converged ?? true)}, controlPlane=${controlPlaneConvergence?.converged ? "CONVERGED" : controlPlaneConvergence ? "BLOCKED" : "unbound"}, cutoverMode=${String(cutoverStatus.mode)}.`,
@@ -1833,7 +1859,64 @@ function registerCutoverMcpTools(
           multiRoleConvergence: multiRoleConvergence as unknown as Record<string, unknown> | undefined,
           controlPlaneConvergence: controlPlaneConvergence as unknown as Record<string, unknown> | undefined,
           cutoverStatus,
+          physicalClocks,
         },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "cutover_advance",
+    {
+      title: "Advance cutover progression",
+      description:
+        "Derive the single valid next physical step from durable cutover state and execute it with fail-closed semantics. Returns either TERMINAL (closed) or exactly one typed blocker / external decision (AWAITING_EXTERNAL_DRAIN, AWAITING_RESTART_DECISION, AWAITING_RECONNECT, BUILD_NOT_READY, RECONCILIATION_REQUIRED). Survives transport reconnects and caller rebinds.",
+      inputSchema: {
+        dryRun: z.boolean().optional().describe("Rehearse the next step without scheduling a restart or mutating state."),
+        carrierCredential: z.string().optional().describe("Optional approved carrier credential when reconnecting on a fresh MCP session."),
+      },
+      outputSchema: {
+        outcome: z.string(),
+        status: z.enum(["TERMINAL", "BLOCKED", "ADVANCED"]),
+        blocker: z.enum([
+          "AWAITING_EXTERNAL_DRAIN",
+          "AWAITING_RESTART_DECISION",
+          "AWAITING_RECONNECT",
+          "RECONCILIATION_REQUIRED",
+          "BUILD_NOT_READY",
+        ]).optional(),
+        cutover_phase: z.string(),
+        server_generation_relation: z.record(z.string(), z.unknown()).optional(),
+        caller_continuity: z.record(z.string(), z.unknown()).optional(),
+        client_projection_relation: z.record(z.string(), z.unknown()).optional(),
+        reconciliation_required: z.boolean(),
+        reason: z.string(),
+        scheduledFor: z.string().optional(),
+        dryRun: z.boolean().optional(),
+      },
+      _meta: {},
+      annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ dryRun, carrierCredential }, extra) => {
+      if (carrierCredential !== undefined && carrierBindings) {
+        const context = dependencyConsumerContext(extra);
+        carrierBindings.redeem(context, carrierCredential);
+      }
+      if (!control.advance) {
+        throw new CutoverStateError("Cutover orchestration is unavailable in this environment.");
+      }
+      const callerIdentity = controllerCallerIdentity(extra as ControllerCallerIdentityInput);
+      const outcome = await control.advance({
+        dryRun,
+        callerContinuity: {
+          callerIdentityFingerprint: callerIdentity.callerIdentityFingerprint,
+          conversationIdentityFingerprint: callerIdentity.conversationIdentityFingerprint,
+        },
+      });
+      return {
+        content: [textBlock(`Cutover advance: status=${outcome.status}, blocker=${outcome.blocker ?? "none"}, phase=${outcome.cutover_phase}: ${outcome.reason}`)],
+        structuredContent: outcome as unknown as Record<string, unknown>,
       };
     },
   );
@@ -6995,7 +7078,7 @@ export function createServer(
         ...(buildReadyProbe ? { probeBuildReady: buildReadyProbe } : {}),
       })
     : undefined;
-  const advanceCutover = orchestrator ? () => orchestrator.advance() : undefined;
+  const advanceCutover = orchestrator ? (options?: AdvanceOptions) => orchestrator.advance(options) : undefined;
 
   if (orchestrator) {
     void orchestrator.advance({ dryRun: true })

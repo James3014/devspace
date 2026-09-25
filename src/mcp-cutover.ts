@@ -65,6 +65,7 @@ export const CUTOVER_SAFE_TOOLS: ReadonlySet<string> = new Set([
   "cutover_recover",
   "cutover_repair_binding",
   "capability_convergence_status",
+  "cutover_advance",
 
   // Agent inspection & reconciliation
   "agent_status",
@@ -280,6 +281,9 @@ export class McpCutoverController {
       transportEvidence,
       mode: this.mode(),
       reconciliationRequired: Boolean(record && record.phase !== "closed"),
+      cutover_phase: record?.phase ?? "closed",
+      server_generation_relation: record ? compareServerIdentity(record, this.currentIdentity) : undefined,
+      reconciliation_required: Boolean(record && record.phase !== "closed"),
     };
   }
 
