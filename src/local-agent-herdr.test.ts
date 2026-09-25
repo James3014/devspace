@@ -3681,6 +3681,33 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
     // Re-register for the remaining negative stop cases.
     registry.registerHandle(handle);
 
+    // 4a. SI-AGENT-NOT-FOUND-ERROR: HerdR 0.9.x reports exact missing
+    // targets as a structured error rather than an empty successful result.
+    // This exact-target not-found is still positive absence evidence.
+    registry.registerHandle(handle);
+    const originalSendRequest = spy.sendRequest.bind(spy);
+    spy.sendRequest = async function<T = unknown>(
+      req: HerdrSocketRequest,
+      timeoutMs: number = 10_000,
+      socketPath?: string,
+    ): Promise<HerdrSocketResponse<T>> {
+      if (req.method === "agent.get") {
+        return {
+          id: req.id,
+          error: {
+            code: "NOT_FOUND",
+            message: `agent target ${handle.herdrAgentIdentity} not found`,
+          },
+        } as HerdrSocketResponse<T>;
+      }
+      return originalSendRequest<T>(req, timeoutMs, socketPath);
+    };
+    await spy.stopExternalAgent(handle);
+    assert.equal(spy.workspaceCloseCalls, 2, "Exact HerdR agent target not-found reclaims owned workspace");
+
+    // Restore normal spy behavior for remaining negative cases.
+    spy.sendRequest = originalSendRequest;
+
     // 4b. SI-AGENT-LOOKUP-TRANSPORT: a failed strict absence readback must
     // remain fail-closed and must not close the workspace.
     spy.failAgentGet = true;
