@@ -1550,9 +1550,22 @@ export class HerdrThinGateway {
       terminalOutput = await this.readPane(paneId, 60, herdrSocketPath);
     }
     if (detectBlockedOnboardingDialog(params.agentKind, terminalOutput)) {
-      await this.closeWorkspace(wsId, herdrSocketPath).catch(() => {});
+      try {
+        await this.closeWorkspace(wsId, herdrSocketPath);
+      } catch (closeError) {
+        if (effectiveStore && params.agentId) {
+          effectiveStore.markExternalRuntimeLaunchOutcomeUnknownCAS({
+            agentId: params.agentId,
+            attemptKey: params.attemptKey,
+            reason: `Onboarding/trust block was detected but workspace.close could not be confirmed: ${String(closeError)}`,
+          });
+        }
+        throw new Error(
+          `[OUTCOME_UNKNOWN] Agent '${params.agentKind}' was blocked on onboarding/trust, but workspace cleanup could not be confirmed: ${String(closeError)}`,
+        );
+      }
       throw new Error(
-        `[Fail-Closed / N-TRUST] Agent '${params.agentKind}' is stuck at an unauthenticated onboarding/trust/permission dialog: BLOCKED_ON_PERMISSION_ADMISSION`,
+        `HerdR onboarding blocked: Agent '${params.agentKind}' is stuck at an unauthenticated onboarding/trust/permission dialog: BLOCKED_ON_PERMISSION_ADMISSION`,
       );
     }
 

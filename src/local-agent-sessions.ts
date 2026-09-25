@@ -994,11 +994,14 @@ export class LocalAgentSessionManager {
       const message = error instanceof Error ? error.message : String(error);
       const latest = this.store.getById(agentId);
       if (latest?.lifecycleState?.activeTurn?.generation === generation) {
+        const launchState = latest.externalRuntimeBinding?.launch?.state;
         const knownHerdrLaunchFailure =
           latest.externalRuntimeBinding?.runtimeKind === "HERDR" &&
           !latest.externalRuntimeBinding.handle &&
-          latest.externalRuntimeBinding.launch?.state === "WORKSPACE_OBSERVED" &&
-          message.startsWith("HerdR agent.start failed:");
+          (
+            (launchState === "WORKSPACE_OBSERVED" && message.startsWith("HerdR agent.start failed:")) ||
+            (launchState === "AGENT_OBSERVED" && message.startsWith("HerdR onboarding blocked:"))
+          );
         if (latest.externalRuntimeBinding?.runtimeKind !== "HERDR" || knownHerdrLaunchFailure) {
           this.store.failExternalRuntimePreLaunchCAS(
             agentId,
