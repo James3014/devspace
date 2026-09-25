@@ -1072,7 +1072,16 @@ class SpyHerdrGateway extends HerdrThinGateway {
 
     if (req.method === "workspace.get") {
       this.getWorkspaceCalls++;
-      const target = (req.params as any)?.target;
+      const target = (req.params as any)?.workspace_id;
+      if (!target) {
+        return {
+          id: req.id,
+          error: {
+            code: "invalid_request",
+            message: "invalid request: missing field `workspace_id`",
+          },
+        } as HerdrSocketResponse<T>;
+      }
       const ws = this.simulatedWorkspaces.find((w) => w.workspace_id === target) || {
         workspace_id: target,
         label: target,
