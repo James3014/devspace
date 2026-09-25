@@ -1123,39 +1123,6 @@ test("LocalAgentSessionManager - binds and retrieves HerdrExternalHandle for dur
       },
     });
 
-    if (this.knownOnboardingFailure) {
-      const fenced = params.store.fenceExternalRuntimeLaunchCAS({
-        agentId: params.agentId,
-        attemptKey: params.attemptKey,
-        dispatchIntentHash: params.dispatchIntentHash,
-        canonicalWorktreePath: params.canonicalWorktreePath,
-        gitHeadBefore,
-        agentKind: params.agentKind,
-        herdrSocketPath: "/tmp/herdr-public-path.sock",
-        requestedModel: params.requestedModel,
-        requestedEffort: params.requestedEffort,
-        promptNonce: `HERDR-DISPATCH-${params.attemptKey}`,
-        workspaceId: params.workspaceId,
-        plannedAgentName: `ds-${params.attemptKey}`,
-      });
-      assert.equal(fenced.applied, true);
-      const workspaceObserved = params.store.recordExternalRuntimeWorkspaceObservedCAS({
-        agentId: params.agentId,
-        attemptKey: params.attemptKey,
-        herdrWorkspaceId: `w-${params.attemptKey}`,
-        herdrPaneId: `p-${params.attemptKey}`,
-        observedCwd: params.canonicalWorktreePath,
-      });
-      assert.equal(workspaceObserved.applied, true);
-      const agentObserved = params.store.recordExternalRuntimeAgentObservedCAS({
-        agentId: params.agentId,
-        attemptKey: params.attemptKey,
-        herdrAgentIdentity: `ds-${params.attemptKey}`,
-      });
-      assert.equal(agentObserved.applied, true);
-      throw new Error(`HerdR onboarding blocked: ${this.knownOnboardingFailure}`);
-    }
-
     const handle: HerdrExternalHandle = {
       schemaVersion: 1,
       runtimeKind: "HERDR",
@@ -1434,6 +1401,38 @@ class SpyProductionHerdrGateway extends HerdrThinGateway {
       cwd: params.canonicalWorktreePath,
       encoding: "utf8",
     }).trim();
+    if (this.knownOnboardingFailure) {
+      const fenced = params.store.fenceExternalRuntimeLaunchCAS({
+        agentId: params.agentId,
+        attemptKey: params.attemptKey,
+        dispatchIntentHash: params.dispatchIntentHash,
+        canonicalWorktreePath: params.canonicalWorktreePath,
+        gitHeadBefore,
+        agentKind: params.agentKind,
+        herdrSocketPath: "/tmp/herdr-public-path.sock",
+        requestedModel: params.requestedModel,
+        requestedEffort: params.requestedEffort,
+        promptNonce: `HERDR-DISPATCH-${params.attemptKey}`,
+        workspaceId: params.workspaceId,
+        plannedAgentName: `ds-${params.attemptKey}`,
+      });
+      assert.equal(fenced.applied, true);
+      const workspaceObserved = params.store.recordExternalRuntimeWorkspaceObservedCAS({
+        agentId: params.agentId,
+        attemptKey: params.attemptKey,
+        herdrWorkspaceId: `w-${params.attemptKey}`,
+        herdrPaneId: `p-${params.attemptKey}`,
+        observedCwd: params.canonicalWorktreePath,
+      });
+      assert.equal(workspaceObserved.applied, true);
+      const agentObserved = params.store.recordExternalRuntimeAgentObservedCAS({
+        agentId: params.agentId,
+        attemptKey: params.attemptKey,
+        herdrAgentIdentity: `ds-${params.attemptKey}`,
+      });
+      assert.equal(agentObserved.applied, true);
+      throw new Error(`HerdR onboarding blocked: ${this.knownOnboardingFailure}`);
+    }
     const handle: HerdrExternalHandle = {
       schemaVersion: 1,
       runtimeKind: "HERDR",
