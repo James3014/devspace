@@ -568,7 +568,7 @@ export class HerdrThinGateway {
     const req: HerdrSocketRequest = {
       id: `ws-get-${Date.now()}`,
       method: "workspace.get",
-      params: { target: workspaceId },
+      params: { workspace_id: workspaceId },
     };
     try {
       const res = await this.sendRequest<{
@@ -674,7 +674,7 @@ export class HerdrThinGateway {
     const req: HerdrSocketRequest = {
       id: `workspace-absence-confirm-${Date.now()}`,
       method: "workspace.get",
-      params: { target: workspaceId },
+      params: { workspace_id: workspaceId },
     };
     const res = await this.sendRequest<{
       workspace?: { workspace_id: string; label?: string };
