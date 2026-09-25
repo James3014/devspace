@@ -1595,19 +1595,15 @@ export class LocalAgentSessionManager {
         : undefined;
     if (observedAbsentGeneration && observedLaunch) {
       const physical = await inspectWorkspacePhysicalState(record.workspaceRoot);
-      const baseline = record.scopeBaseline;
-      const delta = baseline ? computeWorkerDelta(physical, baseline) : undefined;
       if (
         !physical.gitAvailable ||
-        !baseline?.head ||
         !physical.head ||
-        physical.head !== baseline.head ||
-        !delta ||
-        delta.changedPaths.length !== 0
+        physical.head !== observedLaunch.gitHeadBefore ||
+        physical.changedPaths.length !== 0
       ) {
         throw new AgentSessionError(
           "AGENT_LIFECYCLE_CORRUPT",
-          `Agent ${agentId} lost its HerdR handle, but local workspace/base absence could not be proven.`,
+          `Agent ${agentId} lost its HerdR handle, but the current workspace is not clean at the exact fenced Git base.`,
         );
       }
 
