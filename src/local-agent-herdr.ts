@@ -667,6 +667,31 @@ export class HerdrThinGateway {
     return res.result?.agent === undefined;
   }
 
+  private async confirmWorkspaceAbsent(
+    workspaceId: string,
+    socketPath: string,
+  ): Promise<boolean> {
+    const req: HerdrSocketRequest = {
+      id: `workspace-absence-confirm-${Date.now()}`,
+      method: "workspace.get",
+      params: { target: workspaceId },
+    };
+    const res = await this.sendRequest<{
+      workspace?: { workspace_id: string; label?: string };
+    }>(req, 3000, socketPath);
+    if (res.error) {
+      const message = res.error.message.trim();
+      const exactNotFound =
+        res.error.code === "workspace_not_found" &&
+        message === `workspace ${workspaceId} not found`;
+      if (exactNotFound) return true;
+      throw new Error(
+        `[WORKSPACE_ABSENCE_UNVERIFIED] HerdR workspace.get failed for '${workspaceId}': ${res.error.message}`,
+      );
+    }
+    return res.result?.workspace === undefined;
+  }
+
   /**
    * Validate physical AgentInfo object against expected launch/target identity (E1, F4, Comment 5785928588).
    * Missing required fields (workspace_id, pane_id, name, cwd) or any contradiction fails closed.
@@ -2122,6 +2147,15 @@ export class HerdrThinGateway {
     });
 
     if (!liveObs.valid) {
+      const workspaceAbsent = await this.confirmWorkspaceAbsent(
+        boundHandle.herdrWorkspaceId,
+        targetSocket,
+      );
+      if (workspaceAbsent) {
+        this.registry.releaseHandle(boundHandle.attemptKey, boundHandle.workspaceId);
+        return;
+      }
+
       const exactPaneStillOwned =
         Boolean(liveObs.pane) &&
         liveObs.pane?.workspace_id === boundHandle.herdrWorkspaceId &&
