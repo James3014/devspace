@@ -3828,9 +3828,9 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
 
     // 10. SI-EXACT: valid store and verified live identity -> succeeds, closes workspace, releases handle
     spy.failWorkspaceClose = false;
-    assert.equal(spy.workspaceCloseCalls, 2);
-    await spy.stopExternalAgent(handle);
     assert.equal(spy.workspaceCloseCalls, 3);
+    await spy.stopExternalAgent(handle);
+    assert.equal(spy.workspaceCloseCalls, 4);
     assert.equal(registry.getHandle(attemptKey), undefined, "Registry handle released upon successful close");
 
     // 11. REPRODUCER-5: Consequential side-door elimination
