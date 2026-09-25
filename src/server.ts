@@ -5635,6 +5635,8 @@ export function createMcpServer(
             activeOtherWorkspaces: z.number().int().nonnegative(),
             localState: z.enum(["AVAILABLE", "EXHAUSTED"]),
             providerState: z.literal("UNKNOWN"),
+            liveActive: z.number().int().nonnegative().optional(),
+            unreconciledStale: z.number().int().nonnegative().optional(),
           }),
           conversationSafety: z.object({
             state: z.enum(["ISOLATED_WORKTREE", "SINGLE_CONVERSATION_CHECKOUT", "SHARED_CHECKOUT", "UNSCOPED"]),

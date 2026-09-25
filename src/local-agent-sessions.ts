@@ -96,6 +96,7 @@ import {
   defaultHerdrGatewayRegistry,
   HERDR_RUNTIME_KIND,
   HERDR_DEFAULT_SOCKET_PATH,
+  normalizeHerdrSocketPath,
 } from "./local-agent-herdr.js";
 
 function catalogSnapshotIsFresh(fetchedAt: string | undefined, expiresAt: string | undefined): boolean {
@@ -375,6 +376,8 @@ export interface AgentPreflightOutput {
     activeOtherWorkspaces: number;
     localState: "AVAILABLE" | "EXHAUSTED";
     providerState: "UNKNOWN";
+    liveActive?: number;
+    unreconciledStale?: number;
   };
   toolchain: {
     id: string;
@@ -389,6 +392,8 @@ export function summarizeExecutionCapacity(
   used: number,
   configuredMax: number | undefined | null,
   activeInWorkspace: number,
+  liveActive?: number,
+  unreconciledStale?: number,
 ): AgentPreflightOutput["capacity"] {
   const boundedMax = configuredMax !== undefined && configuredMax !== null && configuredMax > 0
     ? configuredMax
@@ -400,6 +405,8 @@ export function summarizeExecutionCapacity(
     activeOtherWorkspaces: Math.max(0, used - activeInWorkspace),
     localState: boundedMax !== undefined && used >= boundedMax ? "EXHAUSTED" : "AVAILABLE",
     providerState: "UNKNOWN",
+    ...(liveActive !== undefined ? { liveActive } : {}),
+    ...(unreconciledStale !== undefined ? { unreconciledStale } : {}),
   };
 }
 
@@ -1126,7 +1133,11 @@ export class LocalAgentSessionManager {
     await this.assertExecutionAuthority(profileName, executionContract);
     this.assertDispatchOwnershipAvailable(workspaceRoot, executionContract);
 
-    const startCapacity = this.executionCapacitySnapshot(workspaceRoot);
+    let startCapacity = this.executionCapacitySnapshot(workspaceRoot);
+    if (startCapacity.localState === "EXHAUSTED" && this.usesHerdrBackend()) {
+      await this.reconcileStaleHerdRSessions();
+      startCapacity = this.executionCapacitySnapshot(workspaceRoot);
+    }
     if (startCapacity.localState === "EXHAUSTED") {
       throw new AgentSessionError(
         "NO_EXECUTION_CAPACITY",
@@ -1658,11 +1669,10 @@ export class LocalAgentSessionManager {
       record.status === "starting" &&
       record.lifecycleState?.activeTurn?.launchState === "not_started" &&
       record.workerPid === undefined &&
-      record.workerToken === undefined &&
-      record.externalRuntimeBinding === undefined
+      record.workerToken === undefined
         ? record.lifecycleState.activeTurn.generation
         : undefined;
-    if (preLaunchGeneration) {
+    if (preLaunchGeneration && record.externalRuntimeBinding === undefined) {
       const stopped = this.store.cancelExternalRuntimePreLaunchCAS(record.id, preLaunchGeneration);
       if (!stopped.applied) {
         throw new AgentSessionError(
@@ -1671,6 +1681,21 @@ export class LocalAgentSessionManager {
         );
       }
       record = stopped.current ?? record;
+      return recordToStatusOutput(record, undefined, undefined);
+    }
+    if (
+      preLaunchGeneration &&
+      record.externalRuntimeBinding?.runtimeKind === "HERDR" &&
+      !this.getHerdrExternalHandle(agentId)
+    ) {
+      const reconciled = await this.reconcileStaleHerdRSession(record);
+      if (!reconciled) {
+        throw new AgentSessionError(
+          "AGENT_LIFECYCLE_CORRUPT",
+          `Agent ${agentId} has no bound HerdR handle, but exact external absence and physical workspace safety are not both proven; slot remains fenced.`,
+        );
+      }
+      record = this.store.getById(agentId) ?? record;
       return recordToStatusOutput(record, undefined, undefined);
     }
 
@@ -1836,12 +1861,17 @@ export class LocalAgentSessionManager {
       "providerReachable is unknown: no safe readiness probe exists that does not spawn a provider runtime.",
     );
 
+    if (this.usesHerdrBackend()) {
+      await this.reconcileStaleHerdRSessions();
+    }
+
     const capacity = this.executionCapacitySnapshot(workspaceRoot);
     const capacityAvailable = capacity.localState === "AVAILABLE";
     if (!capacityAvailable) {
+      const staleDetail = capacity.unreconciledStale ? ` (${capacity.unreconciledStale} slot(s) are unreconciled/stale HerdR sessions)` : "";
       blockers.push({
         code: "NO_EXECUTION_CAPACITY",
-        detail: `${capacity.used} of ${capacity.max} configured local agent slot(s) are active (${capacity.activeInWorkspace} in this workspace, ${capacity.activeOtherWorkspaces} in other workspaces/conversations). This is local DevSpace capacity, not evidence of provider rate limiting.`,
+        detail: `${capacity.used} of ${capacity.max} configured local agent slot(s) are active (${capacity.activeInWorkspace} in this workspace, ${capacity.activeOtherWorkspaces} in other workspaces/conversations)${staleDetail}. This is local DevSpace capacity, not evidence of provider rate limiting.`,
       });
     }
     unknowns.push(
@@ -2102,6 +2132,10 @@ export class LocalAgentSessionManager {
         continue;
       }
       if (record.status !== "running" && record.status !== "starting") continue;
+      if (record.externalRuntimeBinding?.runtimeKind === "HERDR" && !this.herdrTurnTasks.has(record.id)) {
+        const settled = await this.reconcileStaleHerdRSession(record);
+        if (settled) continue;
+      }
       const contract: ExecutionContract = record.executionContract ?? {};
 
       // Active turn phase timestamps are persisted in `lifecycleState.activeTurn`.
@@ -2211,7 +2245,26 @@ export class LocalAgentSessionManager {
     const activeInWorkspace = canonicalRoot
       ? active.filter((record) => canonicalizePath(record.workspaceRoot) === canonicalRoot).length
       : 0;
-    return summarizeExecutionCapacity(active.length, this.config.agentMaxConcurrent, activeInWorkspace);
+    let liveActive = 0;
+    let unreconciledStale = 0;
+    for (const record of active) {
+      if (record.externalRuntimeBinding?.runtimeKind === "HERDR") {
+        if (this.herdrTurnTasks.has(record.id)) {
+          liveActive++;
+        } else {
+          unreconciledStale++;
+        }
+      } else {
+        liveActive++;
+      }
+    }
+    return summarizeExecutionCapacity(
+      active.length,
+      this.config.agentMaxConcurrent,
+      activeInWorkspace,
+      liveActive,
+      unreconciledStale,
+    );
   }
 
   /** Compatibility predicate backed by the canonical capacity snapshot. */
@@ -2381,6 +2434,210 @@ export class LocalAgentSessionManager {
     return { scopeState: pathResult.scopeState, unexpectedPaths: pathResult.unexpectedPaths };
   }
 
+  private async inspectStaleHerdRReclaimEvidence(
+    record: LocalAgentRecord,
+    exactGitHeadWhenNoBaseline?: string,
+  ) {
+    let physical;
+    try {
+      physical = await inspectWorkspacePhysicalState(record.workspaceRoot);
+    } catch {
+      return undefined;
+    }
+    if (!physical.gitAvailable) return undefined;
+
+    if (!record.scopeBaseline) {
+      if (
+        !exactGitHeadWhenNoBaseline ||
+        physical.head !== exactGitHeadWhenNoBaseline ||
+        physical.changedPaths.length !== 0
+      ) {
+        return undefined;
+      }
+      return {
+        physical,
+        delta: { changedPaths: [] as string[], attribution: "KNOWN" as const },
+        scope: this.classifyWorkerScope(
+          [],
+          record.executionContract?.writePaths,
+          record.executionContract?.maxFiles,
+          "KNOWN",
+        ),
+      };
+    }
+
+    const delta = computeWorkerDelta(physical, record.scopeBaseline);
+    if (delta.attribution !== "KNOWN") return undefined;
+    return {
+      physical,
+      delta,
+      scope: this.classifyWorkerScope(
+        delta.changedPaths,
+        record.executionContract?.writePaths,
+        record.executionContract?.maxFiles,
+        delta.attribution,
+      ),
+    };
+  }
+
+  /**
+   * Reconciles stale/orphaned HerdR agent sessions holding execution slots.
+   * Enforces 5D lifecycle matrix:
+   * - Positive external absence (workspace/agent confirmed absent) -> reclaim slot with physical effect preserved.
+   * - Lost handle -> terminate with error, preserving physical effect.
+   * - Unreachable / identity mismatch -> fail-closed (slot not released, marked unreconciled).
+   */
+  async reconcileStaleHerdRSessions(): Promise<number> {
+    const all = this.store.list();
+    const candidates = all
+      .filter((record) => occupiesDetachedExecutionSlot(record) && record.externalRuntimeBinding?.runtimeKind === "HERDR");
+    let reclaimed = 0;
+    for (const record of candidates) {
+      if (this.herdrTurnTasks.has(record.id)) {
+        continue;
+      }
+      const settled = await this.reconcileStaleHerdRSession(record);
+      if (settled) reclaimed++;
+    }
+    return reclaimed;
+  }
+
+  private async reconcileStaleHerdRSession(record: LocalAgentRecord): Promise<boolean> {
+    const agentId = record.id;
+    const generation = record.lifecycleState?.activeTurn?.generation;
+    const handle = this.getHerdrExternalHandle(agentId);
+
+    // 1. Lost durable handle: reclaim only after exact external absence and
+    // physical workspace state are both proven. Missing evidence stays fenced.
+    if (!handle) {
+      const launch = record.externalRuntimeBinding?.launch;
+      if (
+        !launch ||
+        (launch.state !== "WORKSPACE_OBSERVED" && launch.state !== "AGENT_OBSERVED") ||
+        !launch.herdrSocketPath
+      ) {
+        return false;
+      }
+
+      const targetSocket = normalizeHerdrSocketPath(launch.herdrSocketPath);
+      if (!await this.herdrGateway.pingServer(2000, targetSocket)) {
+        return false;
+      }
+
+      let externallyAbsent = false;
+      try {
+        externallyAbsent = await this.herdrGateway.confirmObservedLaunchAbsent(launch);
+      } catch {
+        return false;
+      }
+      if (!externallyAbsent) return false;
+
+      const evidence = await this.inspectStaleHerdRReclaimEvidence(record, launch.gitHeadBefore);
+      if (!evidence) return false;
+      const { physical, delta, scope } = evidence;
+      const terminalReason: AgentTerminalReason =
+        scope.scopeState === "SCOPE_VIOLATION"
+          ? "scope_violation"
+          : record.status === "starting"
+            ? "launch_failed"
+            : "provider_error";
+      const error =
+        scope.scopeState === "SCOPE_VIOLATION"
+          ? `Worker wrote outside declared scope: ${scope.unexpectedPaths.join(", ")}`
+          : "Lost durable HerdR handle after exact external absence proof; reclaimed stale slot.";
+
+      const settled = this.store.finishExternalRuntimeTurnCAS({
+        agentId,
+        generation: generation ?? record.lifecycleState?.lastSettledGeneration ?? "",
+        status: "error",
+        error,
+        errorCode: scope.scopeState === "SCOPE_VIOLATION"
+          ? "SCOPE_VIOLATION"
+          : "AGENT_LIFECYCLE_CORRUPT",
+        errorRetryable: false,
+        terminalReason,
+        scopeState: scope.scopeState,
+        cumulativeChangedPaths: Array.from(new Set([
+          ...(record.lifecycleState?.cumulativeChangedPaths ?? []),
+          ...delta.changedPaths,
+        ])).sort(),
+        turnEndBaseline: {
+          changedPaths: physical.changedPaths,
+          head: physical.head ?? null,
+          fingerprints: physical.fingerprints,
+        },
+      });
+      return settled.applied;
+    }
+
+    // 2. Durable handle present: observe HerdR live identity
+    const targetSocket = normalizeHerdrSocketPath(handle.herdrSocketPath);
+    const pingOk = await this.herdrGateway.pingServer(2000, targetSocket);
+
+    if (!pingOk) {
+      // HerdR is unreachable -> Fail-closed: do not release capacity or assume absence
+      return false;
+    }
+
+    let liveObs;
+    try {
+      liveObs = await this.herdrGateway.observeAndValidateLiveHandle({
+        herdrWorkspaceId: handle.herdrWorkspaceId,
+        herdrPaneId: handle.herdrPaneId,
+        canonicalWorktreePath: canonicalizePath(handle.canonicalWorktreePath),
+        herdrAgentIdentity: handle.herdrAgentIdentity,
+        herdrAgentKind: handle.herdrAgentKind,
+        herdrSocketPath: targetSocket,
+      });
+    } catch {
+      return false;
+    }
+
+    if (liveObs.valid && liveObs.agent) {
+      if (liveObs.agent.agent_status === "running" || liveObs.agent.agent_status === "prompting") {
+        return false;
+      }
+    }
+
+    const evidence = await this.inspectStaleHerdRReclaimEvidence(record, handle.gitHeadBefore);
+    if (!evidence) return false;
+    const { physical, delta, scope } = evidence;
+
+    try {
+      await this.herdrGateway.stopExternalAgent(handle, { store: this.store });
+    } catch {
+      // Any absence/identity ambiguity remains fail-closed.
+      return false;
+    }
+
+    const terminalStatus = scope.scopeState === "SCOPE_VIOLATION" ? "error" : "stopped";
+    const terminalReason: AgentTerminalReason =
+      scope.scopeState === "SCOPE_VIOLATION" ? "scope_violation" : "cancelled";
+
+    const settled = this.store.finishExternalRuntimeTurnCAS({
+      agentId,
+      generation: generation ?? record.lifecycleState?.lastSettledGeneration ?? "",
+      status: terminalStatus,
+      error: scope.scopeState === "SCOPE_VIOLATION"
+        ? `Worker wrote outside declared scope: ${scope.unexpectedPaths.join(", ")}`
+        : undefined,
+      errorCode: scope.scopeState === "SCOPE_VIOLATION" ? "SCOPE_VIOLATION" : undefined,
+      errorRetryable: false,
+      terminalReason,
+      scopeState: scope.scopeState,
+      cumulativeChangedPaths: delta ? Array.from(new Set([
+        ...(record.lifecycleState?.cumulativeChangedPaths ?? []),
+        ...delta.changedPaths,
+      ])).sort() : record.lifecycleState?.cumulativeChangedPaths,
+      turnEndBaseline: physical ? {
+        changedPaths: physical.changedPaths,
+        head: physical.head ?? null,
+        fingerprints: physical.fingerprints,
+      } : undefined,
+    });
+    return settled.applied;
+  }
+
   private async terminateActiveAgent(
     agentId: string,
     reason: AgentTerminalReason,
@@ -2392,7 +2649,9 @@ export class LocalAgentSessionManager {
     const existing = this.store.getById(agentId);
     if (existing?.externalRuntimeBinding?.runtimeKind === "HERDR") {
       const handle = this.getHerdrExternalHandle(agentId);
-      if (!handle) return false;
+      if (!handle) {
+        return this.reconcileStaleHerdRSession(existing);
+      }
       try {
         await this.herdrGateway.stopExternalAgent(handle, { store: this.store });
         const generation = existing.lifecycleState?.activeTurn?.generation;

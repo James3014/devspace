@@ -7,7 +7,7 @@ import test, { after } from "node:test";
 import { LocalAgentSessionManager, AgentSessionError, getWorkerProcessOwnership } from "./local-agent-sessions.js";
 import { LocalAgentStore } from "./local-agent-store.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
-import { type HerdrExternalHandle, HerdrThinGateway, defaultHerdrGatewayRegistry } from "./local-agent-herdr.js";
+import { type HerdrExternalHandle, type HerdrPromptResult, HerdrThinGateway, defaultHerdrGatewayRegistry } from "./local-agent-herdr.js";
 import { hashDispatchIntent } from "./execution-protocol.js";
 import { AgentProviderFailureError } from "./local-agent-errors.js";
 
@@ -2076,5 +2076,733 @@ test("LocalAgentSessionManager - PROMPT-R1, R2, R3, R4 durable prompt fence surv
       rmSync(stateDir, { recursive: true, force: true });
       rmSync(projectRoot, { recursive: true, force: true });
     }
+  }
+});
+
+test("Issue #256: HerdR stale lifecycle and capacity reconciliation 5D matrix", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-herdr-5d-"));
+  const repoDir = mkdtempSync(join(tmpdir(), "devspace-herdr-repo-"));
+
+  function initTestGitRepo(dir: string): string {
+    execFileSync("git", ["init", "-b", "main"], { cwd: dir, stdio: "ignore" });
+    execFileSync("git", ["config", "user.name", "Test User"], { cwd: dir, stdio: "ignore" });
+    execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: dir, stdio: "ignore" });
+    writeFileSync(join(dir, "README.md"), "# Initial\n");
+    execFileSync("git", ["add", "README.md"], { cwd: dir, stdio: "ignore" });
+    execFileSync("git", ["commit", "-m", "init"], { cwd: dir, stdio: "ignore" });
+    return execFileSync("git", ["rev-parse", "HEAD"], { cwd: dir, encoding: "utf-8" }).trim();
+  }
+
+  const initialHead = initTestGitRepo(repoDir);
+
+  class Mock5DHerdrGateway extends HerdrThinGateway {
+    serverReachable = true;
+    workspaceAbsent = false;
+    agentAbsent = false;
+    liveAgentStatus: "running" | "idle" | "done" | null = "done";
+    liveAgentPresent = true;
+    identityMismatch = false;
+
+    override async probeReady(): Promise<boolean> {
+      return this.serverReachable;
+    }
+
+    override async pingServer(): Promise<boolean> {
+      return this.serverReachable;
+    }
+
+    override async confirmObservedLaunchAbsent(): Promise<boolean> {
+      if (!this.serverReachable || this.identityMismatch) {
+        throw new Error("Exact HerdR absence is unverified.");
+      }
+      return this.workspaceAbsent || this.agentAbsent;
+    }
+
+    override async startExternalAgent(params: any): Promise<HerdrExternalHandle> {
+      const handle: HerdrExternalHandle = {
+        schemaVersion: 1,
+        runtimeKind: "HERDR",
+        herdrSocketPath: "/tmp/mock-herdr.sock",
+        herdrWorkspaceId: `ws-${params.attemptKey}`,
+        herdrPaneId: `pane-${params.attemptKey}`,
+        herdrAgentIdentity: `agent-${params.attemptKey}`,
+        herdrAgentKind: params.agentKind,
+        promptNonce: `nonce-${params.attemptKey}`,
+        canonicalWorktreePath: params.canonicalWorktreePath,
+        workspaceId: params.workspaceId,
+        gitHeadBefore: initialHead,
+        attemptKey: params.attemptKey,
+        dispatchIntentHash: params.dispatchIntentHash,
+        launchTimestamp: new Date().toISOString(),
+        enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+      };
+      return handle;
+    }
+
+    override async observeAndValidateLiveHandle(expectations: any): Promise<any> {
+      if (!this.serverReachable) return { valid: false, reason: "Server unreachable" };
+      if (this.identityMismatch) {
+        return { valid: false, reason: "Live identity mismatch: unexpected foreign agent in pane" };
+      }
+      if (!this.liveAgentPresent || !this.liveAgentStatus) {
+        return {
+          valid: false,
+          reason: `Agent '${expectations.herdrAgentIdentity}' not found in HerdR`,
+          pane: {
+            pane_id: expectations.herdrPaneId,
+            workspace_id: expectations.herdrWorkspaceId,
+            cwd: expectations.canonicalWorktreePath,
+          },
+        };
+      }
+      return {
+        valid: true,
+        agent: {
+          agent_status: this.liveAgentStatus,
+          interactive_ready: true,
+          workspace_id: expectations.herdrWorkspaceId,
+          pane_id: expectations.herdrPaneId,
+          cwd: expectations.canonicalWorktreePath,
+        },
+      };
+    }
+
+    override async stopExternalAgent(handle: HerdrExternalHandle): Promise<void> {
+      if (!this.serverReachable) throw new Error("HerdR server unreachable during stop");
+      if (this.identityMismatch) throw new Error("Live identity mismatch during stop");
+      defaultHerdrGatewayRegistry.releaseHandle(handle.attemptKey, handle.workspaceId);
+    }
+
+    override async promptExternalAgent(handle: HerdrExternalHandle, prompt: string, options?: any): Promise<HerdrPromptResult> {
+      return {
+        status: "done",
+        paneOutput: "mock output",
+        finalResponse: "mock response",
+      };
+    }
+
+    override async reconcileExternalAgent(handle: HerdrExternalHandle, writeScope?: string[], forceClose?: boolean, promptResult?: any, options?: any): Promise<any> {
+      return {
+        settled: true,
+        executionState: "DONE",
+        completionStatus: "CLEAN",
+        changedPaths: [],
+        unexpectedPaths: [],
+      };
+    }
+  }
+
+  try {
+    const config = {
+      stateDir,
+      agentExecutionBackend: "herdr",
+      agentMaxConcurrent: 1,
+      oauth: { scopes: ["devspace"] },
+    } as any;
+
+    const mockGateway = new Mock5DHerdrGateway("/tmp/mock-herdr.sock", defaultHerdrGatewayRegistry);
+    const manager = new LocalAgentSessionManager(
+      config,
+      async () => {},
+      async () => true,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      mockGateway,
+    );
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // CASE 1: Lost Durable Handle + Starting + Clean Workspace (Headless Restart)
+    // ─────────────────────────────────────────────────────────────────────────────
+    {
+      const store = (manager as any).store as LocalAgentStore;
+      const rec = store.create({
+        workspaceId: "ws_lost_start",
+        workspaceRoot: repoDir,
+        profileName: "reviewer",
+        provider: "opencode",
+        lifecycleKind: "detached_worker_v2",
+        executionContract: { writePaths: ["README.md"] },
+      });
+      // Session starts with activeTurn, no handle bound (e.g. crash after launch fence was recorded)
+      store.bindExternalRuntimeBindingCAS({
+        agentId: rec.id,
+        binding: {
+          runtimeKind: "HERDR",
+          launch: {
+            state: "WORKSPACE_OBSERVED",
+            launchRequestId: `HERDR-LAUNCH:attempt-lost-start`,
+            attemptKey: "attempt-lost-start",
+            dispatchIntentHash: "hash-lost-start",
+            canonicalWorktreePath: repoDir,
+            gitHeadBefore: initialHead,
+            agentKind: "opencode",
+            herdrSocketPath: "/tmp/mock-herdr.sock",
+            herdrWorkspaceId: "ws-lost-start-herdr",
+            herdrPaneId: "pane-lost-start-herdr",
+            herdrAgentIdentity: "agent-lost-start-herdr",
+            observedCwd: repoDir,
+            promptNonce: "nonce-lost-start",
+            fencedAt: new Date().toISOString(),
+          },
+        },
+      });
+
+      mockGateway.workspaceAbsent = true;
+      assert.equal(manager.runningCount(), 1, "Slot occupied before reclaim");
+      const preBefore = await manager.preflightAgent({
+        workspaceId: "ws_lost_start",
+        workspaceRoot: repoDir,
+        isolated: false,
+        profileName: "reviewer",
+        profiles: mockProfiles,
+      });
+      assert.equal(preBefore.capacity.localState, "AVAILABLE", "Preflight proactively reclaimed stale lost-handle slot");
+      assert.equal(manager.runningCount(), 0, "Capacity reclaimed after preflight");
+
+      const readback = store.getById(rec.id);
+      assert.equal(readback?.status, "error");
+      assert.equal(readback?.terminalReason, "launch_failed");
+      mockGateway.workspaceAbsent = false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // CASE 2: Lost Durable Handle + Running + Hostile Dirty Candidate Workspace
+    // ─────────────────────────────────────────────────────────────────────────────
+    {
+      const store = (manager as any).store as LocalAgentStore;
+      const rec = store.create({
+        workspaceId: "ws_lost_running",
+        workspaceRoot: repoDir,
+        profileName: "reviewer",
+        provider: "opencode",
+        lifecycleKind: "detached_worker_v2",
+        executionContract: { writePaths: ["authorized.txt"] },
+      });
+      store.bindExternalRuntimeBindingCAS({
+        agentId: rec.id,
+        binding: {
+          runtimeKind: "HERDR",
+          launch: {
+            state: "AGENT_OBSERVED",
+            launchRequestId: `HERDR-LAUNCH:attempt-lost-running`,
+            attemptKey: "attempt-lost-running",
+            dispatchIntentHash: "hash-lost-running",
+            canonicalWorktreePath: repoDir,
+            gitHeadBefore: initialHead,
+            agentKind: "opencode",
+            herdrSocketPath: "/tmp/mock-herdr.sock",
+            herdrWorkspaceId: "ws-lost-running-herdr",
+            herdrPaneId: "pane-lost-running-herdr",
+            herdrAgentIdentity: "agent-lost-running-herdr",
+            observedCwd: repoDir,
+            promptNonce: "nonce-lost-running",
+            fencedAt: new Date().toISOString(),
+          },
+        },
+      });
+      // Model a claimed running turn whose clean physical baseline was durably captured
+      // before the final HerdR handle bind was lost.
+      (store as any).database.sqlite.prepare(
+        "update local_agent_sessions set status = 'running', scope_baseline = ? where id = ?",
+      ).run(JSON.stringify({ changedPaths: [], head: initialHead }), rec.id);
+
+      // Create an unexpected modification outside declared writeScope.
+      writeFileSync(join(repoDir, "hostile_unauthorized.txt"), "hostile payload");
+      mockGateway.workspaceAbsent = true;
+
+      assert.equal(manager.runningCount(), 1);
+      const reclaimed = await manager.reconcileStaleHerdRSessions();
+      assert.equal(reclaimed, 1, "Hostile lost-handle session reclaimed");
+      assert.equal(manager.runningCount(), 0, "Slot freed after terminal classification");
+
+      const readback = store.getById(rec.id);
+      assert.equal(readback?.status, "error");
+      assert.equal(readback?.scopeState, "SCOPE_VIOLATION", "Hostile effects must be recorded as SCOPE_VIOLATION");
+      assert.ok(readback?.lifecycleState?.cumulativeChangedPaths?.includes("hostile_unauthorized.txt"));
+
+      // Clean up the hostile file
+      rmSync(join(repoDir, "hostile_unauthorized.txt"));
+      mockGateway.workspaceAbsent = false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // CASE 3: Unreachable HerdR Server (FAIL-CLOSED: Slot MUST NOT be released)
+    // ─────────────────────────────────────────────────────────────────────────────
+    {
+      const store = (manager as any).store as LocalAgentStore;
+      const handle: HerdrExternalHandle = {
+        schemaVersion: 1,
+        runtimeKind: "HERDR",
+        herdrSocketPath: "/tmp/mock-herdr.sock",
+        herdrWorkspaceId: "ws-unreachable-1",
+        herdrPaneId: "pane-unreachable-1",
+        herdrAgentIdentity: "agent-unreachable-1",
+        herdrAgentKind: "opencode",
+        promptNonce: "nonce-unreachable-1",
+        canonicalWorktreePath: repoDir,
+        workspaceId: "ws_unreachable",
+        gitHeadBefore: initialHead,
+        attemptKey: "attempt-unreachable-1",
+        dispatchIntentHash: "hash-unreachable",
+        launchTimestamp: new Date().toISOString(),
+        enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+      };
+
+      const rec = store.create({
+        workspaceId: "ws_unreachable",
+        workspaceRoot: repoDir,
+        profileName: "reviewer",
+        provider: "opencode",
+        lifecycleKind: "detached_worker_v2",
+        startReplay: { key: "attempt-unreachable-1", requestHash: "p" },
+      });
+      handle.agentId = rec.id;
+      store.bindExternalRuntimeBindingCAS({
+        agentId: rec.id,
+        binding: {
+          runtimeKind: "HERDR",
+          handle: handle as any,
+        },
+      });
+      (store as any).database.sqlite.prepare(
+        "update local_agent_sessions set status = 'running' where id = ?",
+      ).run(rec.id);
+
+      mockGateway.serverReachable = false; // HerdR is dead / connection refused
+
+      const reclaimed = await manager.reconcileStaleHerdRSessions();
+      assert.equal(reclaimed, 0, "Unreachable HerdR MUST NOT reclaim slot (FAIL-CLOSED)");
+      assert.equal(manager.runningCount(), 1, "Slot remains occupied to prevent destructive worker collisions");
+
+      const pre = await manager.preflightAgent({
+        workspaceId: "ws_unreachable",
+        workspaceRoot: repoDir,
+        isolated: false,
+        profileName: "reviewer",
+        profiles: mockProfiles,
+      });
+      assert.equal(pre.capacity.localState, "EXHAUSTED");
+      assert.equal(pre.capacity.unreconciledStale, 1, "Preflight flags slot as unreconciledStale");
+      assert.ok(pre.blockers.some((b: { code: string; detail: string }) => b.detail.includes("unreconciled/stale HerdR sessions")));
+
+      // Restore reachability for subsequent cases
+      mockGateway.serverReachable = true;
+      // Clean up this session via terminateActiveAgent
+      await (manager as any).terminateActiveAgent(rec.id, "cancelled", "cleanup", undefined, undefined, "stopped");
+      assert.equal(manager.runningCount(), 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // CASE 4: Live Identity Mismatch (FAIL-CLOSED: Zero destructive actions)
+    // ─────────────────────────────────────────────────────────────────────────────
+    {
+      const store = (manager as any).store as LocalAgentStore;
+      const handle: HerdrExternalHandle = {
+        schemaVersion: 1,
+        runtimeKind: "HERDR",
+        herdrSocketPath: "/tmp/mock-herdr.sock",
+        herdrWorkspaceId: "ws-mismatch-1",
+        herdrPaneId: "pane-mismatch-1",
+        herdrAgentIdentity: "agent-mismatch-1",
+        herdrAgentKind: "opencode",
+        promptNonce: "nonce-mismatch-1",
+        canonicalWorktreePath: repoDir,
+        workspaceId: "ws_mismatch",
+        gitHeadBefore: initialHead,
+        attemptKey: "attempt-mismatch-1",
+        dispatchIntentHash: "hash-mismatch",
+        launchTimestamp: new Date().toISOString(),
+        enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+      };
+
+      const rec = store.create({
+        workspaceId: "ws_mismatch",
+        workspaceRoot: repoDir,
+        profileName: "reviewer",
+        provider: "opencode",
+        lifecycleKind: "detached_worker_v2",
+        startReplay: { key: "attempt-mismatch-1", requestHash: "p" },
+      });
+      handle.agentId = rec.id;
+      store.bindExternalRuntimeBindingCAS({
+        agentId: rec.id,
+        binding: {
+          runtimeKind: "HERDR",
+          handle: handle as any,
+        },
+      });
+      (store as any).database.sqlite.prepare(
+        "update local_agent_sessions set status = 'running' where id = ?",
+      ).run(rec.id);
+
+      mockGateway.identityMismatch = true; // Pane occupied by someone else
+      mockGateway.agentAbsent = true; // Expected agent is also missing: mismatch must still win fail-closed.
+
+      const reclaimed = await manager.reconcileStaleHerdRSessions();
+      assert.equal(reclaimed, 0, "Identity mismatch MUST NOT reclaim slot (FAIL-CLOSED)");
+      assert.equal(manager.runningCount(), 1, "Slot preserved");
+
+      mockGateway.identityMismatch = false;
+      mockGateway.agentAbsent = false;
+      await (manager as any).terminateActiveAgent(rec.id, "cancelled", "cleanup", undefined, undefined, "stopped");
+      assert.equal(manager.runningCount(), 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // CASE 5: Exact Absent HerdR Workspace (Safe Recovery on Verified Absence)
+    // ─────────────────────────────────────────────────────────────────────────────
+    {
+      const store = (manager as any).store as LocalAgentStore;
+      const handle: HerdrExternalHandle = {
+        schemaVersion: 1,
+        runtimeKind: "HERDR",
+        herdrSocketPath: "/tmp/mock-herdr.sock",
+        herdrWorkspaceId: "ws-absent-1",
+        herdrPaneId: "pane-absent-1",
+        herdrAgentIdentity: "agent-absent-1",
+        herdrAgentKind: "opencode",
+        promptNonce: "nonce-absent-1",
+        canonicalWorktreePath: repoDir,
+        workspaceId: "ws_absent",
+        gitHeadBefore: initialHead,
+        attemptKey: "attempt-absent-1",
+        dispatchIntentHash: "hash-absent",
+        launchTimestamp: new Date().toISOString(),
+        enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+      };
+
+      const rec = store.create({
+        workspaceId: "ws_absent",
+        workspaceRoot: repoDir,
+        profileName: "reviewer",
+        provider: "opencode",
+        lifecycleKind: "detached_worker_v2",
+        startReplay: { key: "attempt-absent-1", requestHash: "p" },
+      });
+      handle.agentId = rec.id;
+      store.bindExternalRuntimeBindingCAS({
+        agentId: rec.id,
+        binding: {
+          runtimeKind: "HERDR",
+          handle: handle as any,
+        },
+      });
+      (store as any).database.sqlite.prepare(
+        "update local_agent_sessions set status = 'running' where id = ?",
+      ).run(rec.id);
+
+      mockGateway.liveAgentPresent = false;
+      mockGateway.workspaceAbsent = true; // Workspace confirmed 404/not_found
+
+      assert.equal(manager.runningCount(), 1);
+      const reclaimed = await manager.reconcileStaleHerdRSessions();
+      assert.equal(reclaimed, 1, "Confirmed absent workspace safely reclaimed");
+      assert.equal(manager.runningCount(), 0, "Capacity available again");
+
+      const readback = store.getById(rec.id);
+      assert.equal(readback?.status, "stopped");
+      assert.equal(readback?.terminalReason, "cancelled");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // CASE 6: JIT Stale Reclaim during startAgent when Capacity is Exhausted
+    // ─────────────────────────────────────────────────────────────────────────────
+    {
+      const store = (manager as any).store as LocalAgentStore;
+      const handle: HerdrExternalHandle = {
+        schemaVersion: 1,
+        runtimeKind: "HERDR",
+        herdrSocketPath: "/tmp/mock-herdr.sock",
+        herdrWorkspaceId: "ws-jit-1",
+        herdrPaneId: "pane-jit-1",
+        herdrAgentIdentity: "agent-jit-1",
+        herdrAgentKind: "opencode",
+        promptNonce: "nonce-jit-1",
+        canonicalWorktreePath: repoDir,
+        workspaceId: "ws_jit",
+        gitHeadBefore: initialHead,
+        attemptKey: "attempt-jit-1",
+        dispatchIntentHash: "hash-jit",
+        launchTimestamp: new Date().toISOString(),
+        enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+      };
+
+      const rec = store.create({
+        workspaceId: "ws_jit",
+        workspaceRoot: repoDir,
+        profileName: "reviewer",
+        provider: "opencode",
+        lifecycleKind: "detached_worker_v2",
+        startReplay: { key: "attempt-jit-1", requestHash: "p" },
+      });
+      handle.agentId = rec.id;
+      store.bindExternalRuntimeBindingCAS({
+        agentId: rec.id,
+        binding: {
+          runtimeKind: "HERDR",
+          handle: handle as any,
+        },
+      });
+      (store as any).database.sqlite.prepare(
+        "update local_agent_sessions set status = 'running' where id = ?",
+      ).run(rec.id);
+
+      // Max concurrent is 1; rec occupies that 1 slot.
+      assert.equal(manager.runningCount(), 1);
+
+      // External workspace confirmed absent
+      mockGateway.liveAgentPresent = false;
+      mockGateway.workspaceAbsent = true;
+
+      // Starting a new agent should JIT reclaim the stale slot and succeed
+      const started = await manager.startAgent({
+        workspaceId: "ws_jit_new",
+        workspaceRoot: repoDir,
+        profileName: "reviewer",
+        prompt: "new task after JIT reclaim",
+        profiles: mockProfiles,
+        attemptKey: "attempt-jit-new",
+        executionContract: {
+          dispatchIntent: {
+            taskId: "task-jit-new",
+            attemptId: "attempt-jit-new",
+            objective: "JIT reclaim test",
+            roleIntent: "DEEP_ENGINEERING",
+            claimCeiling: "RESULT_RETURNED",
+            context: ["test"],
+            readScope: ["README.md"],
+            writeScope: [],
+            exclusiveOwnership: false,
+            forbiddenChanges: [],
+            acceptanceCriteria: ["reclaimed"],
+            verificationRequired: false,
+            expectedArtifacts: [],
+          },
+        },
+      });
+      assert.ok(started.agentId);
+      assert.notEqual(started.agentId, rec.id);
+
+      // Wait for background turn task to settle cleanly before closing manager
+      const status = await manager.getAgentStatus({
+        workspaceId: "ws_jit_new",
+        workspaceRoot: repoDir,
+        agentId: started.agentId,
+        waitMs: 500,
+      });
+      assert.ok(status.terminal || status.status === "idle");
+
+      // Clean up
+      defaultHerdrGatewayRegistry.releaseHandle("attempt-jit-new");
+      mockGateway.workspaceAbsent = false;
+      mockGateway.liveAgentPresent = true;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // CASE 7: Public cancel uses the same exact-absence proof before releasing a
+    // no-handle HerdR starting slot.
+    // ─────────────────────────────────────────────────────────────────────────────
+    {
+      const store = (manager as any).store as LocalAgentStore;
+      const rec = store.create({
+        workspaceId: "ws_cancel_absent",
+        workspaceRoot: repoDir,
+        profileName: "reviewer",
+        provider: "opencode",
+        lifecycleKind: "detached_worker_v2",
+      });
+      store.bindExternalRuntimeBindingCAS({
+        agentId: rec.id,
+        binding: {
+          runtimeKind: "HERDR",
+          launch: {
+            state: "AGENT_OBSERVED",
+            launchRequestId: "HERDR-LAUNCH:attempt-cancel-absent",
+            attemptKey: "attempt-cancel-absent",
+            dispatchIntentHash: "hash-cancel-absent",
+            canonicalWorktreePath: repoDir,
+            gitHeadBefore: initialHead,
+            agentKind: "opencode",
+            herdrSocketPath: "/tmp/mock-herdr.sock",
+            herdrWorkspaceId: "ws-cancel-absent-herdr",
+            herdrPaneId: "pane-cancel-absent-herdr",
+            herdrAgentIdentity: "agent-cancel-absent-herdr",
+            observedCwd: repoDir,
+            promptNonce: "nonce-cancel-absent",
+            fencedAt: new Date().toISOString(),
+          },
+        },
+      });
+      mockGateway.workspaceAbsent = true;
+      const cancelled = await manager.cancelAgent({
+        workspaceId: "ws_cancel_absent",
+        workspaceRoot: repoDir,
+        agentId: rec.id,
+      });
+      assert.equal(cancelled.status, "error");
+      assert.equal(store.getById(rec.id)?.terminalReason, "launch_failed");
+      assert.equal(manager.runningCount(), 0);
+      mockGateway.workspaceAbsent = false;
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // CASE 8: Restart preserves stale no-handle reconciliation and exact absence proof.
+    // ─────────────────────────────────────────────────────────────────────────────
+    {
+      const restartStateDir = mkdtempSync(join(tmpdir(), "devspace-herdr-restart-state-"));
+      const restartGateway = new Mock5DHerdrGateway(
+        "/tmp/mock-herdr-restart.sock",
+        defaultHerdrGatewayRegistry,
+      );
+      const restartConfig = { ...config, stateDir: restartStateDir };
+      const firstManager = new LocalAgentSessionManager(
+        restartConfig,
+        async () => {},
+        async () => true,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        restartGateway,
+      );
+      try {
+        const firstStore = (firstManager as any).store as LocalAgentStore;
+        const rec = firstStore.create({
+          workspaceId: "ws_restart_stale",
+          workspaceRoot: repoDir,
+          profileName: "reviewer",
+          provider: "opencode",
+          lifecycleKind: "detached_worker_v2",
+        });
+        firstStore.bindExternalRuntimeBindingCAS({
+          agentId: rec.id,
+          binding: {
+            runtimeKind: "HERDR",
+            launch: {
+              state: "AGENT_OBSERVED",
+              launchRequestId: "HERDR-LAUNCH:attempt-restart-stale",
+              attemptKey: "attempt-restart-stale",
+              dispatchIntentHash: "hash-restart-stale",
+              canonicalWorktreePath: repoDir,
+              gitHeadBefore: initialHead,
+              agentKind: "opencode",
+              herdrSocketPath: "/tmp/mock-herdr-restart.sock",
+              herdrWorkspaceId: "ws-restart-stale-herdr",
+              herdrPaneId: "pane-restart-stale-herdr",
+              herdrAgentIdentity: "agent-restart-stale-herdr",
+              observedCwd: repoDir,
+              promptNonce: "nonce-restart-stale",
+              fencedAt: new Date().toISOString(),
+            },
+          },
+        });
+        assert.equal(firstManager.runningCount(), 1);
+      } finally {
+        firstManager.close();
+      }
+
+      restartGateway.workspaceAbsent = true;
+      const restartedManager = new LocalAgentSessionManager(
+        restartConfig,
+        async () => {},
+        async () => true,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        restartGateway,
+      );
+      try {
+        assert.equal(restartedManager.runningCount(), 1, "Restart reloads the fenced stale slot");
+        const preflight = await restartedManager.preflightAgent({
+          workspaceId: "ws_restart_stale",
+          workspaceRoot: repoDir,
+          isolated: false,
+          profileName: "reviewer",
+          profiles: mockProfiles,
+        });
+        assert.equal(preflight.capacity.localState, "AVAILABLE");
+        assert.equal(restartedManager.runningCount(), 0, "Restarted manager reclaims only after exact absence proof");
+      } finally {
+        restartedManager.close();
+        rmSync(restartStateDir, { recursive: true, force: true });
+      }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────────
+    // CASE 9: External absence without provable local physical state stays fenced.
+    // ─────────────────────────────────────────────────────────────────────────────
+    {
+      const nonGitDir = mkdtempSync(join(tmpdir(), "devspace-herdr-unknown-physical-"));
+      const store = (manager as any).store as LocalAgentStore;
+      try {
+        const rec = store.create({
+          workspaceId: "ws_unknown_physical",
+          workspaceRoot: nonGitDir,
+          profileName: "reviewer",
+          provider: "opencode",
+          lifecycleKind: "detached_worker_v2",
+        });
+        store.bindExternalRuntimeBindingCAS({
+          agentId: rec.id,
+          binding: {
+            runtimeKind: "HERDR",
+            launch: {
+              state: "WORKSPACE_OBSERVED",
+              launchRequestId: "HERDR-LAUNCH:attempt-unknown-physical",
+              attemptKey: "attempt-unknown-physical",
+              dispatchIntentHash: "hash-unknown-physical",
+              canonicalWorktreePath: nonGitDir,
+              gitHeadBefore: initialHead,
+              agentKind: "opencode",
+              herdrSocketPath: "/tmp/mock-herdr.sock",
+              herdrWorkspaceId: "ws-unknown-physical-herdr",
+              herdrPaneId: "pane-unknown-physical-herdr",
+              herdrAgentIdentity: "agent-unknown-physical-herdr",
+              observedCwd: nonGitDir,
+              promptNonce: "nonce-unknown-physical",
+              fencedAt: new Date().toISOString(),
+            },
+          },
+        });
+        mockGateway.workspaceAbsent = true;
+
+        const reclaimed = await manager.reconcileStaleHerdRSessions();
+        assert.equal(reclaimed, 0, "External absence alone cannot release a slot when physical state is unknown");
+        assert.equal(manager.runningCount(), 1);
+
+        await assert.rejects(
+          manager.cancelAgent({
+            workspaceId: "ws_unknown_physical",
+            workspaceRoot: nonGitDir,
+            agentId: rec.id,
+          }),
+          (error: any) => {
+            assert.equal(error.code, "AGENT_LIFECYCLE_CORRUPT");
+            assert.match(error.message, /slot remains fenced/);
+            return true;
+          },
+        );
+        assert.equal(manager.runningCount(), 1, "Failed cancel must preserve the fenced slot");
+        mockGateway.workspaceAbsent = false;
+      } finally {
+        rmSync(nonGitDir, { recursive: true, force: true });
+      }
+    }
+
+    manager.close();
+  } finally {
+    defaultHerdrGatewayRegistry.releaseHandle("attempt-unreachable-1");
+    defaultHerdrGatewayRegistry.releaseHandle("attempt-mismatch-1");
+    defaultHerdrGatewayRegistry.releaseHandle("attempt-absent-1");
+    defaultHerdrGatewayRegistry.releaseHandle("attempt-jit-1");
+    defaultHerdrGatewayRegistry.releaseHandle("attempt-jit-new");
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repoDir, { recursive: true, force: true });
   }
 });

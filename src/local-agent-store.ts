@@ -1180,7 +1180,7 @@ export class LocalAgentStore {
       const lifecycle = current.lifecycleState;
       if (
         !isDetachedLifecycle(lifecycle) ||
-        current.status !== "running" ||
+        (current.status !== "running" && current.status !== "starting") ||
         lifecycle?.activeTurn?.generation !== input.generation ||
         lifecycle.terminationPending ||
         lifecycle.lifecycleCorrupt ||
@@ -1222,7 +1222,7 @@ export class LocalAgentStore {
           status = ?, latest_response = ?, error = ?, error_code = ?, error_retryable = ?, error_details = ?,
           terminal_reason = ?, scope_state = ?, worker_pid = null, worker_token = null,
           lifecycle_state = ?, updated_at = ?
-         where id = ? and status = 'running' and updated_at = ?`,
+         where id = ? and status in ('running', 'starting') and updated_at = ?`,
       ).run(
         providerSessionId ?? null,
         providerContinuityState,
@@ -1255,7 +1255,10 @@ export class LocalAgentStore {
     agentId: string,
     generation: string,
     error: string,
-    options: { allowKnownHerdrLaunchFailure?: boolean } = {},
+    options: {
+      allowKnownHerdrLaunchFailure?: boolean;
+      terminalReason?: AgentTerminalReason;
+    } = {},
   ): LifecycleCasResult {
     const fail = this.database.sqlite.transaction(() => {
       const current = this.getById(agentId);
@@ -1288,12 +1291,13 @@ export class LocalAgentStore {
         lastSettledGeneration: generation,
       };
       const now = new Date().toISOString();
+      const terminalReason = options.terminalReason ?? "launch_failed";
       const result = this.database.sqlite.prepare(
         `update local_agent_sessions set status = 'error', error = ?,
           error_code = 'PROVIDER_EXECUTION_ERROR', error_retryable = 'true',
-          terminal_reason = 'launch_failed', lifecycle_state = ?, updated_at = ?
+          terminal_reason = ?, lifecycle_state = ?, updated_at = ?
          where id = ? and status = 'starting' and updated_at = ?`,
-      ).run(error, JSON.stringify(lifecycleState), now, agentId, current.updatedAt);
+      ).run(error, terminalReason, JSON.stringify(lifecycleState), now, agentId, current.updatedAt);
       const refreshed = this.getById(agentId) ?? current;
       return { applied: result.changes === 1, previous: current, current: refreshed };
     });

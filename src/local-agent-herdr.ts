@@ -705,6 +705,19 @@ export class HerdrThinGateway {
     }
   }
 
+  async pingServer(timeoutMs: number = 2000, socketPath?: string): Promise<boolean> {
+    try {
+      const res = await this.sendRequest<{ type: string }>(
+        { id: "ping", method: "ping", params: {} },
+        timeoutMs,
+        socketPath,
+      );
+      return res.result?.type === "pong";
+    } catch {
+      return false;
+    }
+  }
+
   private async confirmAgentAbsent(
     agentName: string,
     socketPath: string,
@@ -755,6 +768,70 @@ export class HerdrThinGateway {
       );
     }
     return res.result?.workspace === undefined;
+  }
+
+  /**
+   * Prove that an observed-but-unbound HerdR launch has disappeared without
+   * treating identity mismatch or transport ambiguity as absence.
+   */
+  async confirmObservedLaunchAbsent(launch: ExternalRuntimeLaunchFence): Promise<boolean> {
+    if (
+      !launch.herdrSocketPath ||
+      !launch.herdrWorkspaceId ||
+      !launch.herdrPaneId ||
+      !launch.herdrAgentIdentity ||
+      !launch.canonicalWorktreePath
+    ) {
+      throw new Error(
+        "[LAUNCH_ABSENCE_UNVERIFIED] Exact HerdR socket/workspace/pane/agent/worktree identity is required.",
+      );
+    }
+
+    const allowedKinds: HerdrAgentKind[] = ["opencode", "agy", "codex", "cline", "grok"];
+    if (!allowedKinds.includes(launch.agentKind as HerdrAgentKind)) {
+      throw new Error(
+        `[LAUNCH_ABSENCE_UNVERIFIED] Unsupported HerdR agent kind '${launch.agentKind}'.`,
+      );
+    }
+    const targetSocket = normalizeHerdrSocketPath(launch.herdrSocketPath);
+    const liveObs = await this.observeAndValidateLiveHandle({
+      herdrWorkspaceId: launch.herdrWorkspaceId,
+      herdrPaneId: launch.herdrPaneId,
+      canonicalWorktreePath: canonicalizePath(launch.canonicalWorktreePath),
+      herdrAgentIdentity: launch.herdrAgentIdentity,
+      herdrAgentKind: launch.agentKind as HerdrAgentKind,
+      herdrSocketPath: targetSocket,
+    });
+    if (liveObs.valid) return false;
+
+    if (await this.confirmWorkspaceAbsent(launch.herdrWorkspaceId, targetSocket)) {
+      return true;
+    }
+
+    const exactPaneStillOwned =
+      Boolean(liveObs.pane) &&
+      liveObs.pane?.workspace_id === launch.herdrWorkspaceId &&
+      liveObs.pane?.pane_id === launch.herdrPaneId &&
+      (() => {
+        const paneCwd = liveObs.pane?.cwd ? canonicalizePath(liveObs.pane.cwd) : undefined;
+        const paneForegroundCwd = liveObs.pane?.foreground_cwd
+          ? canonicalizePath(liveObs.pane.foreground_cwd)
+          : undefined;
+        const expected = canonicalizePath(launch.canonicalWorktreePath);
+        return paneCwd === expected || paneForegroundCwd === expected;
+      })();
+    const missingExactAgent =
+      exactPaneStillOwned &&
+      !liveObs.agent &&
+      liveObs.reason === `Agent '${launch.herdrAgentIdentity}' not found in HerdR`;
+
+    if (!missingExactAgent) {
+      throw new Error(
+        `[LAUNCH_ABSENCE_UNVERIFIED] Live HerdR identity mismatch: ${liveObs.reason ?? "unknown observation"}`,
+      );
+    }
+
+    return this.confirmAgentAbsent(launch.herdrAgentIdentity, targetSocket);
   }
 
   /**

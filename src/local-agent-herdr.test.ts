@@ -1196,6 +1196,89 @@ class SpyHerdrGateway extends HerdrThinGateway {
   }
 }
 
+test("HerdrThinGateway observed-launch absence proof is exact and identity-mismatch fail-closed (#256)", async () => {
+  const gateway = new SpyHerdrGateway("/tmp/herdr-256-absence.sock", new HerdrGatewayRegistry());
+  const launch = {
+    state: "AGENT_OBSERVED",
+    launchRequestId: "HERDR-LAUNCH:issue256-observed",
+    attemptKey: "issue256-observed",
+    dispatchIntentHash: "a".repeat(64),
+    canonicalWorktreePath: "/tmp/issue256-worktree",
+    gitHeadBefore: "b".repeat(40),
+    agentKind: "opencode",
+    herdrSocketPath: "/tmp/herdr-256-absence.sock",
+    promptNonce: "nonce-issue256-observed",
+    workspaceId: "ws-local-256",
+    herdrWorkspaceId: "ws-herdr-256",
+    herdrPaneId: "pane-herdr-256",
+    herdrAgentIdentity: "agent-herdr-256",
+    observedCwd: "/tmp/issue256-worktree",
+    fencedAt: new Date().toISOString(),
+  } as any;
+
+  (gateway as any).sendRequest = async (req: HerdrSocketRequest): Promise<HerdrSocketResponse<any>> => {
+    if (req.method === "pane.get") {
+      return { id: req.id, result: { type: "pane_info", pane: undefined } };
+    }
+    if (req.method === "workspace.get") {
+      assert.equal((req.params as any)?.workspace_id, "ws-herdr-256");
+      return {
+        id: req.id,
+        error: { code: "workspace_not_found", message: "workspace ws-herdr-256 not found" },
+      };
+    }
+    throw new Error(`Unexpected request ${req.method}`);
+  };
+  assert.equal(await gateway.confirmObservedLaunchAbsent(launch), true);
+
+  (gateway as any).sendRequest = async (req: HerdrSocketRequest): Promise<HerdrSocketResponse<any>> => {
+    if (req.method === "pane.get") {
+      return {
+        id: req.id,
+        result: {
+          type: "pane_info",
+          pane: {
+            pane_id: "pane-herdr-256",
+            workspace_id: "foreign-workspace",
+            cwd: "/tmp/foreign",
+          },
+        },
+      };
+    }
+    if (req.method === "workspace.get") {
+      return {
+        id: req.id,
+        result: {
+          type: "workspace_info",
+          workspace: { workspace_id: "ws-herdr-256" },
+        },
+      };
+    }
+    throw new Error(`Unexpected request ${req.method}`);
+  };
+  await assert.rejects(
+    gateway.confirmObservedLaunchAbsent(launch),
+    /LAUNCH_ABSENCE_UNVERIFIED/,
+  );
+
+  (gateway as any).sendRequest = async (req: HerdrSocketRequest): Promise<HerdrSocketResponse<any>> => {
+    if (req.method === "pane.get") {
+      return { id: req.id, result: { type: "pane_info", pane: undefined } };
+    }
+    if (req.method === "workspace.get") {
+      return {
+        id: req.id,
+        error: { code: "transport_error", message: "socket reset" },
+      };
+    }
+    throw new Error(`Unexpected request ${req.method}`);
+  };
+  await assert.rejects(
+    gateway.confirmObservedLaunchAbsent(launch),
+    /WORKSPACE_ABSENCE_UNVERIFIED/,
+  );
+});
+
 test("HerdrThinGateway prompt fence negative matrix and zero external calls (C1, PF-WRONG-ATTEMPT, PF-WRONG-DISPATCH, PF-WRONG-NONCE, PF-MISSING-HANDLE, PF-MALFORMED-HANDLE, PF-WRONG-RUNTIME, PF-CONCURRENT, PF-EXACT)", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-pf-matrix-"));
   const store = new LocalAgentStore(stateDir);
