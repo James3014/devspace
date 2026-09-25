@@ -3662,6 +3662,32 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
     );
     assert.equal(spy.workspaceCloseCalls, 0, "Zero workspace.close on missing pane");
 
+    // 3a. SI-WORKSPACE-MISSING: strict workspace.get confirms the exact
+    // durable HerdR workspace no longer exists. No close call is needed; the
+    // already-stopped external runtime can release its registry handle.
+    const originalWorkspaceSendRequest = spy.sendRequest.bind(spy);
+    spy.sendRequest = async function<T = unknown>(
+      req: HerdrSocketRequest,
+      timeoutMs: number = 10_000,
+      socketPath?: string,
+    ): Promise<HerdrSocketResponse<T>> {
+      if (req.method === "workspace.get") {
+        return {
+          id: req.id,
+          error: {
+            code: "workspace_not_found",
+            message: `workspace ${handle.herdrWorkspaceId} not found`,
+          },
+        } as HerdrSocketResponse<T>;
+      }
+      return originalWorkspaceSendRequest<T>(req, timeoutMs, socketPath);
+    };
+    await spy.stopExternalAgent(handle);
+    assert.equal(spy.workspaceCloseCalls, 0, "Absent workspace requires zero workspace.close calls");
+    assert.equal(registry.getHandle(attemptKey), undefined, "Absent exact workspace releases registry handle");
+    spy.sendRequest = originalWorkspaceSendRequest;
+    registry.registerHandle(handle);
+
     // 4. SI-AGENT-MISSING: exact pane/workspace/cwd remains owned and
     // a strict second agent.get positively confirms absence. Explicit operator
     // stop may reclaim that exact workspace so the durable session cannot leak
