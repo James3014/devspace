@@ -1461,6 +1461,176 @@ class SpyProductionHerdrGateway extends HerdrThinGateway {
   }
 }
 
+class SpyVanishedObservedHerdrGateway extends HerdrThinGateway {
+  startCalls = 0;
+  absenceChecks = 0;
+
+  override async probeReady(): Promise<boolean> {
+    return true;
+  }
+
+  override async startExternalAgent(params: any): Promise<HerdrExternalHandle> {
+    this.startCalls++;
+    const store = params.store as LocalAgentStore;
+    const gitHeadBefore = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: params.canonicalWorktreePath,
+      encoding: "utf8",
+    }).trim();
+    const agentName = `ds-${params.attemptKey}`;
+    const promptNonce = `HERDR-DISPATCH-${params.attemptKey}`;
+    assert.equal(store.fenceExternalRuntimeLaunchCAS({
+      agentId: params.agentId,
+      attemptKey: params.attemptKey,
+      dispatchIntentHash: params.dispatchIntentHash,
+      canonicalWorktreePath: params.canonicalWorktreePath,
+      gitHeadBefore,
+      agentKind: params.agentKind,
+      herdrSocketPath: "/tmp/herdr-vanished-observed.sock",
+      requestedModel: params.requestedModel,
+      requestedEffort: params.requestedEffort,
+      promptNonce,
+      workspaceId: params.workspaceId,
+      plannedAgentName: agentName,
+    }).applied, true);
+    assert.equal(store.recordExternalRuntimeWorkspaceObservedCAS({
+      agentId: params.agentId,
+      attemptKey: params.attemptKey,
+      herdrWorkspaceId: "w-vanished",
+      herdrPaneId: "w-vanished:p1",
+      observedCwd: params.canonicalWorktreePath,
+    }).applied, true);
+    assert.equal(store.recordExternalRuntimeAgentObservedCAS({
+      agentId: params.agentId,
+      attemptKey: params.attemptKey,
+      herdrAgentIdentity: agentName,
+    }).applied, true);
+    throw new Error("simulated provider exited before final handle bind");
+  }
+
+  override async confirmObservedLaunchAbsent(): Promise<boolean> {
+    this.absenceChecks++;
+    return true;
+  }
+}
+
+test("LocalAgentSessionManager - cancel releases exact AGENT_OBSERVED no-handle slot only after absence proof", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-herdr-vanished-state-"));
+  const projectRoot = mkdtempSync(join(tmpdir(), "devspace-herdr-vanished-repo-"));
+  const gateway = new SpyVanishedObservedHerdrGateway();
+  const config = {
+    stateDir,
+    subagents: true,
+    oauth: { scopes: ["devspace"] },
+    agentExecutionBackend: "herdr",
+    allowedRoots: [projectRoot],
+    toolchains: [],
+    agentMaxConcurrent: 4,
+    port: 7676,
+  } as any;
+
+  execFileSync("git", ["init", "--initial-branch=main"], { cwd: projectRoot });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: projectRoot });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd: projectRoot });
+  writeFileSync(join(projectRoot, "README.md"), "vanished observed launch\n");
+  execFileSync("git", ["add", "."], { cwd: projectRoot });
+  execFileSync("git", ["commit", "-m", "base"], { cwd: projectRoot });
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: projectRoot, encoding: "utf8" }).trim();
+
+  const manager = new LocalAgentSessionManager(
+    config,
+    async () => { throw new Error("legacy launcher must not run"); },
+    async () => true,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    gateway,
+  );
+  const store = (manager as any).store as LocalAgentStore;
+
+  const startOne = async (attemptKey: string) => {
+    const dispatchIntent = {
+      taskId: "issue256-lost-final-bind",
+      attemptId: attemptKey,
+      objective: "exercise observed launch disappearance",
+      roleIntent: "EVIDENCE_COLLECTOR" as const,
+      claimCeiling: "RESULT_RETURNED" as const,
+      context: ["test"],
+      readScope: ["README.md"],
+      writeScope: [],
+      exclusiveOwnership: false,
+      forbiddenChanges: [],
+      acceptanceCriteria: ["absence proof"],
+      verificationRequired: true,
+      expectedArtifacts: [],
+    };
+    const started = await manager.startAgent({
+      workspaceId: "ws-vanished",
+      workspaceRoot: projectRoot,
+      profileName: "reviewer",
+      prompt: "no-op",
+      profiles: mockProfiles,
+      attemptKey,
+      executionContract: {
+        authorityMode: "OWNER_DIRECT",
+        dispatchIntent,
+        expectedHead: head,
+      },
+    });
+    for (let i = 0; i < 50; i++) {
+      const record = store.getById(started.agentId);
+      if (record?.externalRuntimeBinding?.launch?.state === "AGENT_OBSERVED") break;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    return started;
+  };
+
+  try {
+    const started = await startOne("issue256-lost-final-bind-clean");
+    const before = store.getById(started.agentId)!;
+    assert.equal(before.status, "starting");
+    assert.equal(before.externalRuntimeBinding?.launch?.state, "AGENT_OBSERVED");
+    assert.equal(before.externalRuntimeBinding?.handle, undefined);
+
+    const cancelled = await manager.cancelAgent({
+      workspaceId: "ws-vanished",
+      workspaceRoot: projectRoot,
+      agentId: started.agentId,
+    });
+    assert.equal(cancelled.status, "stopped");
+    assert.equal(cancelled.terminal, true);
+    assert.equal(gateway.absenceChecks, 1);
+    const readback = store.getById(started.agentId)!;
+    assert.equal(readback.lifecycleState?.activeTurn, undefined);
+    assert.equal(readback.terminalReason, "unknown");
+    assert.equal(readback.providerContinuityState, "UNKNOWN");
+
+    const dirty = await startOne("issue256-lost-final-bind-dirty");
+    writeFileSync(join(projectRoot, "dirty.txt"), "foreign physical effect\n");
+    await assert.rejects(
+      manager.cancelAgent({
+        workspaceId: "ws-vanished",
+        workspaceRoot: projectRoot,
+        agentId: dirty.agentId,
+      }),
+      (err: any) => {
+        assert.equal(err.code, "AGENT_LIFECYCLE_CORRUPT");
+        assert.match(err.message, /not clean at the exact fenced Git base/);
+        return true;
+      },
+    );
+    assert.equal(
+      store.getById(dirty.agentId)?.lifecycleState?.activeTurn !== undefined,
+      true,
+      "dirty workspace must keep the slot fenced",
+    );
+  } finally {
+    rmSync(projectRoot, { recursive: true, force: true });
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
 test("LocalAgentSessionManager - HERDR public lifecycle routes start, continue, status and cancel without legacy launcher", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-herdr-public-state-"));
   const projectRoot = mkdtempSync(join(tmpdir(), "devspace-herdr-public-repo-"));
