@@ -502,6 +502,7 @@ export function evaluateSessionConvergence(
   // 6. Generation is current; caller continuity is a separate controller-facing gate.
   const callerChanged =
     sessionSnapshot.callerIdentityFingerprint !== undefined &&
+    currentCallerIdentityFingerprint !== undefined &&
     sessionSnapshot.callerIdentityFingerprint !== currentCallerIdentityFingerprint;
   const conversationChanged =
     sessionSnapshot.conversationIdentityFingerprint !== undefined &&
