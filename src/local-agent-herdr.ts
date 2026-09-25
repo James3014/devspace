@@ -3,9 +3,15 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve, normalize } from "node:path";
 import { createHash } from "node:crypto";
+import { createOpencodeClient } from "@opencode-ai/sdk/v2";
 import type { LocalAgentStore, ExternalRuntimeLaunchFence, LocalAgentRecord } from "./local-agent-store.js";
 import { hashDispatchIntent, type ToolIntentId } from "./execution-protocol.js";
-import { opencodePermissionFor } from "./local-agent-opencode.js";
+import {
+  allocateOpencodeLoopbackPort,
+  opencodeAgentConfig,
+  OpencodeRuntime,
+} from "./local-agent-opencode.js";
+import { AgentProviderFailureError } from "./local-agent-errors.js";
 import { canonicalizePath } from "./roots.js";
 
 export const HERDR_DEFAULT_SOCKET_PATH = process.env.HERDR_SOCKET_PATH || "/Users/james/.config/herdr/herdr.sock";
@@ -86,6 +92,7 @@ export interface HerdrExternalHandle {
   effectiveModel?: string;
   effectiveEffort?: string;
   nativeProviderSessionId?: string;
+  nativeProviderEndpoint?: string;
   launchGeneration?: number;
   promptNonce: string;
   canonicalWorktreePath: string;
@@ -114,6 +121,7 @@ export interface NormalizedHerdrHandleAuthority {
   effectiveModel: string | null;
   effectiveEffort: string | null;
   nativeProviderSessionId: string | null;
+  nativeProviderEndpoint: string | null;
   launchGeneration: number | null;
   promptNonce: string;
   canonicalWorktreePath: string;
@@ -143,6 +151,7 @@ export function normalizeHerdrHandleAuthority(handle: HerdrExternalHandle): Norm
     effectiveModel: handle.effectiveModel ?? null,
     effectiveEffort: handle.effectiveEffort ?? null,
     nativeProviderSessionId: handle.nativeProviderSessionId ?? null,
+    nativeProviderEndpoint: handle.nativeProviderEndpoint ?? null,
     launchGeneration: handle.launchGeneration ?? null,
     promptNonce: handle.promptNonce,
     canonicalWorktreePath: canonicalizePath(handle.canonicalWorktreePath),
@@ -198,12 +207,16 @@ export interface StartHerdrAgentParams {
 export function buildHerdrAgentArgs(
   params: Pick<StartHerdrAgentParams, "agentKind" | "requestedModel" | "requestedEffort" | "requestedCliProviderId" | "writeMode">,
   canonicalWorktreePath: string,
+  opencodeServerPort?: number,
 ): string[] {
   const args: string[] = [];
   const readOnly = params.writeMode !== "allowed";
 
   if (params.agentKind === "opencode") {
-    args.push("-m", params.requestedModel || "opencode/mimo-v2.6-flash-free");
+    if (!Number.isInteger(opencodeServerPort) || (opencodeServerPort ?? 0) <= 0 || (opencodeServerPort ?? 0) > 65_535) {
+      throw new Error("OpenCode HerdR runtime requires an exact loopback server port.");
+    }
+    args.push("serve", "--hostname=127.0.0.1", "--port=" + String(opencodeServerPort));
     return args;
   }
 
@@ -258,10 +271,60 @@ export function buildHerdrWorkspaceEnv(
 ): Record<string, string> | undefined {
   if (params.agentKind !== "opencode") return undefined;
   return {
-    OPENCODE_PERMISSION: JSON.stringify(
-      opencodePermissionFor(params.writeMode ?? "read_only", params.selectedToolIntents),
-    ),
+    // Preserve the legacy DevSpace SDK/server execution shape. HerdR owns the
+    // OpenCode server process; SDK sessions select one bounded primary agent.
+    OPENCODE_CONFIG_CONTENT: JSON.stringify({
+      agent: {
+        devspace_read_only: opencodeAgentConfig("read_only", params.selectedToolIntents),
+        devspace_allowed: opencodeAgentConfig("allowed", params.selectedToolIntents),
+        devspace_full_access: opencodeAgentConfig("full_access", params.selectedToolIntents),
+      },
+    }),
   };
+}
+
+export function parseHerdrOpencodeServerEndpoint(terminalText: string): string | undefined {
+  const matches = [...terminalText.matchAll(/opencode server listening on (http:\/\/127\.0\.0\.1:(\d{1,5}))/g)];
+  const last = matches.at(-1);
+  if (!last?.[1] || !last[2]) return undefined;
+  const port = Number(last[2]);
+  if (!Number.isInteger(port) || port <= 0 || port > 65_535) return undefined;
+  return `http://127.0.0.1:${port}`;
+}
+
+function assertHerdrOpencodeServerEndpoint(endpoint: string | undefined): string {
+  if (!endpoint) {
+    throw new Error("[OPENCODE_SERVER_ENDPOINT_MISSING] HerdR OpenCode handle has no loopback server endpoint.");
+  }
+  const parsed = new URL(endpoint);
+  if (parsed.protocol !== "http:" || parsed.hostname !== "127.0.0.1" || !parsed.port || parsed.pathname !== "/") {
+    throw new Error(`[OPENCODE_SERVER_ENDPOINT_INVALID] Refusing non-loopback OpenCode endpoint '${endpoint}'.`);
+  }
+  return `http://127.0.0.1:${parsed.port}`;
+}
+
+async function waitForHerdrOpencodeServer(endpoint: string, timeoutMs: number = 10_000): Promise<void> {
+  const normalized = assertHerdrOpencodeServerEndpoint(endpoint);
+  const client = createOpencodeClient({ baseUrl: normalized });
+  const deadline = Date.now() + timeoutMs;
+  let lastError: unknown;
+  while (Date.now() < deadline) {
+    try {
+      await client.v2.health.get({ throwOnError: true });
+      return;
+    } catch (error) {
+      lastError = error;
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 100));
+    }
+  }
+  throw new Error(
+    `[OPENCODE_SERVER_NOT_READY] HerdR-owned OpenCode server at '${normalized}' did not become healthy: ${lastError instanceof Error ? lastError.message : String(lastError)}`,
+  );
+}
+
+export function isHerdrFreeTierCapacity(agentKind: HerdrAgentKind, terminalText: string): boolean {
+  return agentKind === "cline" &&
+    /daily free model limit reached|free model limit reached|free usage limit|rate limit exceeded/i.test(terminalText);
 }
 
 export interface HerdrPromptOptions {
@@ -276,6 +339,8 @@ export interface HerdrPromptResult {
   status: "done" | "idle" | "running" | "blocked" | "OUTCOME_UNKNOWN";
   rawStatus?: string;
   paneOutput?: string;
+  finalResponse?: string;
+  nativeProviderSessionId?: string;
   stalled?: boolean;
   timeout?: boolean;
 }
@@ -1030,6 +1095,12 @@ export class HerdrThinGateway {
       }
     }
 
+    const nativeProviderEndpoint = params.agentKind === "opencode"
+      ? parseHerdrOpencodeServerEndpoint(
+          await this.readPane(paneId, 80, targetSocket).catch(() => ""),
+        )
+      : undefined;
+
     // 3. Both are positively observed! Build and bind completed handle
     const handle: HerdrExternalHandle = {
       schemaVersion: 1,
@@ -1042,6 +1113,7 @@ export class HerdrThinGateway {
       herdrAgentKind: params.agentKind,
       ...(params.requestedModel ? { requestedModel: params.requestedModel } : {}),
       ...(params.requestedEffort ? { requestedEffort: params.requestedEffort } : {}),
+      ...(nativeProviderEndpoint ? { nativeProviderEndpoint } : {}),
       promptNonce: launch.promptNonce,
       canonicalWorktreePath: canonicalPath,
       workspaceId: params.workspaceId,
@@ -1119,6 +1191,12 @@ export class HerdrThinGateway {
 
     const herdrSocketPath = normalizeHerdrSocketPath(params.socketPath || this.socketPath);
     let herdrServerIdentity: string | undefined = undefined;
+    const opencodeServerPort = params.agentKind === "opencode"
+      ? await allocateOpencodeLoopbackPort()
+      : undefined;
+    const expectedNativeProviderEndpoint = opencodeServerPort === undefined
+      ? undefined
+      : `http://127.0.0.1:${opencodeServerPort}`;
 
     const record = effectiveStore.getById(params.agentId);
     if (!record) {
@@ -1374,7 +1452,7 @@ export class HerdrThinGateway {
     }
 
     // 2. Start agent in pane
-    const args = buildHerdrAgentArgs(params, canonicalPath);
+    const args = buildHerdrAgentArgs(params, canonicalPath, opencodeServerPort);
 
     const agentReq: HerdrSocketRequest = {
       id: `HERDR-LAUNCH:${params.attemptKey}:agent`,
@@ -1478,6 +1556,11 @@ export class HerdrThinGateway {
       );
     }
 
+    // The exact OpenCode endpoint is deterministically selected before
+    // agent.start and becomes part of the durable handle. SDK prompt admission
+    // performs the positive health/readiness check immediately before use.
+    const nativeProviderEndpoint = expectedNativeProviderEndpoint;
+
     // F6 / Supplement Comment 5786070980: Re-observe current live identity immediately before final handle binding
     const finalLiveObs = await this.observeAndValidateLiveHandle({
       herdrWorkspaceId: wsId,
@@ -1513,6 +1596,7 @@ export class HerdrThinGateway {
       herdrAgentKind: params.agentKind,
       ...(params.requestedModel ? { requestedModel: params.requestedModel } : {}),
       ...(params.requestedEffort ? { requestedEffort: params.requestedEffort } : {}),
+      ...(nativeProviderEndpoint ? { nativeProviderEndpoint } : {}),
       promptNonce,
       canonicalWorktreePath: canonicalPath,
       workspaceId: params.workspaceId,
@@ -1695,6 +1779,43 @@ export class HerdrThinGateway {
     const turnNonce = handle.promptNonce;
     const boundPrompt = `[NEXUS_ATTEMPT_NONCE:${turnNonce}]\n\n${promptText}`;
 
+    if (handle.herdrAgentKind === "opencode") {
+      const observedEndpoint = handle.nativeProviderEndpoint
+        ?? parseHerdrOpencodeServerEndpoint(
+          await this.readPane(handle.herdrPaneId, 80, targetSocket).catch(() => ""),
+        );
+      if (observedEndpoint) {
+        const endpoint = assertHerdrOpencodeServerEndpoint(observedEndpoint);
+        await waitForHerdrOpencodeServer(endpoint, Math.min(timeoutMs, 5_000));
+      const runtime = new OpencodeRuntime(
+        createOpencodeClient({ baseUrl: endpoint }),
+        { close() {} },
+      );
+      try {
+        const result = await runtime.run({
+          prompt: boundPrompt,
+          workspaceRoot: handle.canonicalWorktreePath,
+          providerSessionId: record.providerSessionId,
+          writeMode: record.executionContract?.writePaths?.length ? "allowed" : "read_only",
+          model: handle.requestedModel,
+          effort: handle.requestedEffort,
+          selectedToolIntents: record.executionContract?.toolProjectionManifest?.selectedTools,
+        });
+        if (result.isErr()) throw result.error;
+        return {
+          turnNonce,
+          status: "idle",
+          rawStatus: "OPENCODE_SDK_COMPLETED",
+          paneOutput: result.value.finalResponse,
+          finalResponse: result.value.finalResponse,
+          nativeProviderSessionId: result.value.providerSessionId ?? undefined,
+        };
+      } finally {
+        await runtime.close();
+      }
+      }
+    }
+
     const req: HerdrSocketRequest = {
       id: `prompt-${Date.now()}`,
       method: "agent.prompt",
@@ -1746,6 +1867,19 @@ export class HerdrThinGateway {
       const statusStr = resAgent?.agent_status;
       const paneOutput = await this.readPane(handle.herdrPaneId, 60, targetSocket);
 
+      if (isHerdrFreeTierCapacity(handle.herdrAgentKind, paneOutput)) {
+        throw new AgentProviderFailureError({
+          code: "PROVIDER_CAPACITY_ERROR",
+          provider: "cline",
+          operation: "run",
+          retryable: true,
+          errorClass: "QUOTA_CAPACITY",
+          model: handle.requestedModel,
+          providerMessage: paneOutput.trim(),
+          message: "Cline free-tier quota or capacity is temporarily exhausted.",
+        });
+      }
+
       // Check if blocked on permission admission or onboarding dialog (B3)
       if (detectBlockedOnboardingDialog(handle.herdrAgentKind, paneOutput)) {
         return {
@@ -1774,6 +1908,7 @@ export class HerdrThinGateway {
         paneOutput,
       };
     } catch (err: unknown) {
+      if (AgentProviderFailureError.is(err)) throw err;
       // The durable prompt fence has already been committed and agent.prompt may have
       // reached HerdR/provider. Any post-fence transport/observation failure is therefore
       // ambiguous external-world truth, not proof that the effect was absent.

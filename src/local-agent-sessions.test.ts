@@ -9,6 +9,7 @@ import { LocalAgentStore } from "./local-agent-store.js";
 import type { LocalAgentProfile } from "./local-agent-profiles.js";
 import { type HerdrExternalHandle, HerdrThinGateway, defaultHerdrGatewayRegistry } from "./local-agent-herdr.js";
 import { hashDispatchIntent } from "./execution-protocol.js";
+import { AgentProviderFailureError } from "./local-agent-errors.js";
 
 const originalAgyCommand = process.env.AGY_COMMAND;
 process.env.AGY_COMMAND = process.execPath;
@@ -1387,6 +1388,7 @@ class SpyProductionHerdrGateway extends HerdrThinGateway {
   stopCalls = 0;
   nonces: string[] = [];
   handle?: HerdrExternalHandle;
+  promptFailure?: AgentProviderFailureError;
 
   override async probeReady(): Promise<boolean> {
     return this.ready;
@@ -1435,6 +1437,7 @@ class SpyProductionHerdrGateway extends HerdrThinGateway {
       });
       assert.equal(fenced.applied, true);
     }
+    if (this.promptFailure) throw this.promptFailure;
     return {
       turnNonce: handle.promptNonce,
       status: "done",
@@ -1596,6 +1599,99 @@ test("LocalAgentSessionManager - HERDR public lifecycle routes start, continue, 
     assert.equal(stopped.status, "stopped");
     assert.equal(stopped.runtime?.runtimeKind, "HERDR");
     assert.equal(legacyLaunches, 0);
+  } finally {
+    defaultHerdrGatewayRegistry.releaseHandle(attemptKey);
+    manager.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("LocalAgentSessionManager - HERDR typed provider capacity failure stays durable and is not washed into success", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-herdr-provider-error-state-"));
+  const projectRoot = mkdtempSync(join(tmpdir(), "devspace-herdr-provider-error-repo-"));
+  const gateway = new SpyProductionHerdrGateway();
+  gateway.promptFailure = new AgentProviderFailureError({
+    code: "PROVIDER_CAPACITY_ERROR",
+    provider: "agy",
+    operation: "run",
+    retryable: true,
+    errorClass: "QUOTA_CAPACITY",
+    model: "free-model",
+    providerSessionId: "session_quota",
+    providerMessage: "daily free model limit reached",
+    message: "Provider quota or capacity failure",
+  });
+  let legacyLaunches = 0;
+  const config = {
+    stateDir,
+    subagents: true,
+    oauth: { scopes: ["devspace"] },
+    agentExecutionBackend: "herdr",
+    allowedRoots: [projectRoot],
+    toolchains: [],
+    agentMaxConcurrent: 4,
+    port: 7676,
+  } as any;
+  execFileSync("git", ["init", "--initial-branch=main"], { cwd: projectRoot });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: projectRoot });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd: projectRoot });
+  writeFileSync(join(projectRoot, "README.md"), "herdr provider error\n");
+  execFileSync("git", ["add", "."], { cwd: projectRoot });
+  execFileSync("git", ["commit", "-m", "base"], { cwd: projectRoot });
+
+  const manager = new LocalAgentSessionManager(
+    config,
+    async () => { legacyLaunches++; },
+    async () => true,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    gateway,
+  );
+  const attemptKey = "issue242-herdr-provider-capacity";
+  const dispatchIntent = {
+    taskId: "issue242-herdr-provider-capacity",
+    attemptId: attemptKey,
+    objective: "Preserve provider capacity truth",
+    roleIntent: "DEEP_ENGINEERING" as const,
+    claimCeiling: "RESULT_RETURNED" as const,
+    context: ["test"],
+    readScope: ["README.md"],
+    writeScope: [],
+    exclusiveOwnership: false,
+    forbiddenChanges: [],
+    acceptanceCriteria: ["typed provider capacity stays error"],
+    verificationRequired: true,
+    expectedArtifacts: [],
+  };
+
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_issue242_provider_capacity",
+      workspaceRoot: projectRoot,
+      profileName: "reviewer",
+      prompt: "quota probe",
+      profiles: mockProfiles,
+      attemptKey,
+      executionContract: { dispatchIntent },
+    });
+    const status = await manager.getAgentStatus({
+      workspaceId: "ws_issue242_provider_capacity",
+      workspaceRoot: projectRoot,
+      agentId: started.agentId,
+      waitMs: 1_000,
+    });
+    assert.equal(legacyLaunches, 0);
+    assert.equal(gateway.promptCalls, 1);
+    assert.equal(status.status, "error");
+    assert.equal(status.errorCode, "PROVIDER_CAPACITY_ERROR");
+    assert.equal(status.errorRetryable, true);
+    assert.equal(status.providerSessionId, "session_quota");
+    assert.equal(status.latestResponse, "daily free model limit reached");
+    assert.equal(status.terminalReason, "provider_error");
   } finally {
     defaultHerdrGatewayRegistry.releaseHandle(attemptKey);
     manager.close();
