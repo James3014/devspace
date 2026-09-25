@@ -1123,6 +1123,39 @@ test("LocalAgentSessionManager - binds and retrieves HerdrExternalHandle for dur
       },
     });
 
+    if (this.knownOnboardingFailure) {
+      const fenced = params.store.fenceExternalRuntimeLaunchCAS({
+        agentId: params.agentId,
+        attemptKey: params.attemptKey,
+        dispatchIntentHash: params.dispatchIntentHash,
+        canonicalWorktreePath: params.canonicalWorktreePath,
+        gitHeadBefore,
+        agentKind: params.agentKind,
+        herdrSocketPath: "/tmp/herdr-public-path.sock",
+        requestedModel: params.requestedModel,
+        requestedEffort: params.requestedEffort,
+        promptNonce: `HERDR-DISPATCH-${params.attemptKey}`,
+        workspaceId: params.workspaceId,
+        plannedAgentName: `ds-${params.attemptKey}`,
+      });
+      assert.equal(fenced.applied, true);
+      const workspaceObserved = params.store.recordExternalRuntimeWorkspaceObservedCAS({
+        agentId: params.agentId,
+        attemptKey: params.attemptKey,
+        herdrWorkspaceId: `w-${params.attemptKey}`,
+        herdrPaneId: `p-${params.attemptKey}`,
+        observedCwd: params.canonicalWorktreePath,
+      });
+      assert.equal(workspaceObserved.applied, true);
+      const agentObserved = params.store.recordExternalRuntimeAgentObservedCAS({
+        agentId: params.agentId,
+        attemptKey: params.attemptKey,
+        herdrAgentIdentity: `ds-${params.attemptKey}`,
+      });
+      assert.equal(agentObserved.applied, true);
+      throw new Error(`HerdR onboarding blocked: ${this.knownOnboardingFailure}`);
+    }
+
     const handle: HerdrExternalHandle = {
       schemaVersion: 1,
       runtimeKind: "HERDR",
@@ -1389,6 +1422,7 @@ class SpyProductionHerdrGateway extends HerdrThinGateway {
   nonces: string[] = [];
   handle?: HerdrExternalHandle;
   promptFailure?: AgentProviderFailureError;
+  knownOnboardingFailure?: string;
 
   override async probeReady(): Promise<boolean> {
     return this.ready;
@@ -1601,6 +1635,88 @@ test("LocalAgentSessionManager - HERDR public lifecycle routes start, continue, 
     assert.equal(legacyLaunches, 0);
   } finally {
     defaultHerdrGatewayRegistry.releaseHandle(attemptKey);
+    manager.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("LocalAgentSessionManager - HERDR confirmed onboarding block settles terminal without a durable handle", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-herdr-onboarding-state-"));
+  const projectRoot = mkdtempSync(join(tmpdir(), "devspace-herdr-onboarding-repo-"));
+  const gateway = new SpyProductionHerdrGateway();
+  gateway.knownOnboardingFailure = "Agent 'grok' is stuck at onboarding: BLOCKED_ON_PERMISSION_ADMISSION";
+  let legacyLaunches = 0;
+  const config = {
+    stateDir,
+    subagents: true,
+    oauth: { scopes: ["devspace"] },
+    agentExecutionBackend: "herdr",
+    allowedRoots: [projectRoot],
+    toolchains: [],
+    agentMaxConcurrent: 4,
+    port: 7676,
+  } as any;
+  execFileSync("git", ["init", "--initial-branch=main"], { cwd: projectRoot });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: projectRoot });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd: projectRoot });
+  writeFileSync(join(projectRoot, "README.md"), "herdr onboarding\n");
+  execFileSync("git", ["add", "."], { cwd: projectRoot });
+  execFileSync("git", ["commit", "-m", "base"], { cwd: projectRoot });
+
+  const manager = new LocalAgentSessionManager(
+    config,
+    async () => { legacyLaunches++; },
+    async () => true,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    gateway,
+  );
+  const attemptKey = "issue242-herdr-onboarding";
+  const dispatchIntent = {
+    taskId: "issue242-herdr-onboarding",
+    attemptId: attemptKey,
+    objective: "Settle confirmed HerdR onboarding block",
+    roleIntent: "TEST_VERIFIER" as const,
+    claimCeiling: "RESULT_RETURNED" as const,
+    context: ["test"],
+    readScope: ["README.md"],
+    writeScope: [],
+    exclusiveOwnership: false,
+    forbiddenChanges: [],
+    acceptanceCriteria: ["confirmed onboarding block is terminal"],
+    verificationRequired: true,
+    expectedArtifacts: [],
+  };
+
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_issue242_onboarding",
+      workspaceRoot: projectRoot,
+      profileName: "reviewer",
+      prompt: "onboarding probe",
+      profiles: mockProfiles,
+      attemptKey,
+      executionContract: { dispatchIntent },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    const status = await manager.getAgentStatus({
+      workspaceId: "ws_issue242_onboarding",
+      workspaceRoot: projectRoot,
+      agentId: started.agentId,
+      waitMs: 1_000,
+    });
+    assert.equal(legacyLaunches, 0);
+    assert.equal(status.status, "error");
+    assert.equal(status.terminal, true);
+    assert.equal(status.terminalReason, "launch_failed");
+    assert.equal(status.errorCode, "PROVIDER_EXECUTION_ERROR");
+    assert.match(status.error ?? "", /HerdR onboarding blocked:/);
+    assert.equal(status.runtime, undefined);
+  } finally {
     manager.close();
     rmSync(stateDir, { recursive: true, force: true });
     rmSync(projectRoot, { recursive: true, force: true });
