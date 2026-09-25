@@ -3705,6 +3705,10 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
     await spy.stopExternalAgent(handle);
     assert.equal(spy.workspaceCloseCalls, 2, "Exact HerdR agent target not-found reclaims owned workspace");
 
+    // Successful stop releases the registry handle; restore the fixture for
+    // the remaining negative cases so they keep testing zero-close behavior.
+    registry.registerHandle(handle);
+
     // Restore normal spy behavior for remaining negative cases.
     spy.sendRequest = originalSendRequest;
 
