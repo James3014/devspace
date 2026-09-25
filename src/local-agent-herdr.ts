@@ -640,6 +640,74 @@ export class HerdrThinGateway {
     }
   }
 
+  /**
+   * Prove that an already-observed HerdR launch has fully disappeared before
+   * releasing a durable DevSpace slot. This is intentionally stricter than
+   * getWorkspace/getPane/getAgent: transport errors and ambiguous empty
+   * responses are not absence evidence.
+   */
+  async confirmObservedLaunchAbsent(launch: ExternalRuntimeLaunchFence): Promise<boolean> {
+    if (
+      !launch.herdrSocketPath ||
+      !launch.herdrWorkspaceId ||
+      !launch.herdrPaneId ||
+      !launch.herdrAgentIdentity
+    ) {
+      throw new Error(
+        "[LAUNCH_ABSENCE_UNVERIFIED] Exact HerdR socket/workspace/pane/agent identity is required.",
+      );
+    }
+
+    const targetSocket = normalizeHerdrSocketPath(launch.herdrSocketPath);
+    const probes: Array<{
+      request: HerdrSocketRequest;
+      expectedCode: string;
+      expectedMessage: string;
+    }> = [
+      {
+        request: {
+          id: `workspace-absence-confirm-${Date.now()}`,
+          method: "workspace.get",
+          params: { target: launch.herdrWorkspaceId },
+        },
+        expectedCode: "workspace_not_found",
+        expectedMessage: `workspace ${launch.herdrWorkspaceId} not found`,
+      },
+      {
+        request: {
+          id: `pane-absence-confirm-${Date.now()}`,
+          method: "pane.get",
+          params: { pane_id: launch.herdrPaneId },
+        },
+        expectedCode: "pane_not_found",
+        expectedMessage: `pane ${launch.herdrPaneId} not found`,
+      },
+      {
+        request: {
+          id: `agent-absence-confirm-${Date.now()}`,
+          method: "agent.get",
+          params: { target: launch.herdrAgentIdentity },
+        },
+        expectedCode: "agent_not_found",
+        expectedMessage: `agent target ${launch.herdrAgentIdentity} not found`,
+      },
+    ];
+
+    for (const probe of probes) {
+      const res = await this.sendRequest(probe.request, 3000, targetSocket);
+      if (!res.error) return false;
+      if (
+        res.error.code !== probe.expectedCode ||
+        res.error.message.trim() !== probe.expectedMessage
+      ) {
+        throw new Error(
+          `[LAUNCH_ABSENCE_UNVERIFIED] ${probe.request.method} returned ${res.error.code}: ${res.error.message}`,
+        );
+      }
+    }
+    return true;
+  }
+
   private async confirmAgentAbsent(
     agentName: string,
     socketPath: string,
