@@ -1255,10 +1255,17 @@ export class LocalAgentStore {
     agentId: string,
     generation: string,
     error: string,
+    options: { allowKnownHerdrLaunchFailure?: boolean } = {},
   ): LifecycleCasResult {
     const fail = this.database.sqlite.transaction(() => {
       const current = this.getById(agentId);
       const lifecycle = current?.lifecycleState;
+      const knownHerdrLaunchFailure = Boolean(
+        options.allowKnownHerdrLaunchFailure === true &&
+        current?.externalRuntimeBinding?.runtimeKind === "HERDR" &&
+        !current.externalRuntimeBinding.handle &&
+        current.externalRuntimeBinding.launch?.state === "WORKSPACE_OBSERVED",
+      );
       if (
         !current ||
         !isDetachedLifecycle(lifecycle) ||
@@ -1268,7 +1275,7 @@ export class LocalAgentStore {
         lifecycle.lifecycleCorrupt ||
         current.workerPid !== undefined ||
         current.workerToken !== undefined ||
-        current.externalRuntimeBinding?.runtimeKind === "HERDR"
+        (current.externalRuntimeBinding?.runtimeKind === "HERDR" && !knownHerdrLaunchFailure)
       ) {
         return { applied: false, previous: current, current };
       }
