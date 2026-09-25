@@ -3878,6 +3878,62 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
   }
 });
 
+test("HerdrThinGateway confirms observed launch absence only from exact NOT_FOUND identity", async () => {
+  const gateway = new SpyHerdrGateway("/tmp/herdr-observed-absence.sock", new HerdrGatewayRegistry());
+  const launch = {
+    state: "AGENT_OBSERVED",
+    launchRequestId: "HERDR-LAUNCH:attempt-observed-absence:1234",
+    attemptKey: "attempt-observed-absence",
+    dispatchIntentHash: "a".repeat(64),
+    canonicalWorktreePath: "/tmp/observed-absence",
+    gitHeadBefore: "b".repeat(40),
+    agentKind: "grok",
+    herdrSocketPath: "/tmp/herdr-observed-absence.sock",
+    promptNonce: "nonce-observed-absence",
+    workspaceId: "ws-observed-absence",
+    herdrWorkspaceId: "w88",
+    herdrPaneId: "w88:p1",
+    herdrAgentIdentity: "ds-observed-absence",
+    fencedAt: new Date().toISOString(),
+  } as any;
+
+  (gateway as any).sendRequest = async (req: HerdrSocketRequest): Promise<HerdrSocketResponse<any>> => {
+    if (req.method === "workspace.get") {
+      return {
+        id: req.id,
+        error: { code: "workspace_not_found", message: "workspace w88 not found" },
+      };
+    }
+    if (req.method === "pane.get") {
+      return {
+        id: req.id,
+        error: { code: "pane_not_found", message: "pane w88:p1 not found" },
+      };
+    }
+    if (req.method === "agent.get") {
+      return {
+        id: req.id,
+        error: { code: "agent_not_found", message: "agent target ds-observed-absence not found" },
+      };
+    }
+    throw new Error(`Unexpected request ${req.method}`);
+  };
+
+  assert.equal(await gateway.confirmObservedLaunchAbsent(launch), true);
+
+  (gateway as any).sendRequest = async (req: HerdrSocketRequest): Promise<HerdrSocketResponse<any>> => ({
+    id: req.id,
+    error: { code: "transport_error", message: "socket reset" },
+  });
+  await assert.rejects(
+    gateway.confirmObservedLaunchAbsent(launch),
+    (err: any) => {
+      assert.match(err.message, /LAUNCH_ABSENCE_UNVERIFIED/);
+      return true;
+    },
+  );
+});
+
 test("HerdrThinGateway prompt exact durable handle authority (Blocker F1, F1-PROMPT-FORGED-PHYSICAL-TARGET, F1-PROMPT-WRONG-ATTEMPT, F1-PROMPT-WRONG-DISPATCH, F1-PROMPT-WRONG-NONCE, F1-PROMPT-WRONG-GIT-BASE, F1-PROMPT-WRONG-LOCAL-WORKSPACE, F1-PROMPT-WRONG-AGENT-KIND, PROMPT-REPRODUCER-F1)", async () => {
   const { repoPath, headSha } = createIsolatedTestGitRepo();
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-f1-matrix-"));
