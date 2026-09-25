@@ -1372,7 +1372,7 @@ export class LocalAgentStore {
       const result = this.database.sqlite.prepare(
         `update local_agent_sessions set status = 'stopped', latest_response = null,
           error = null, error_code = null, error_retryable = null, error_details = null,
-          terminal_reason = 'cancelled', worker_pid = null, worker_token = null,
+          terminal_reason = 'unknown', worker_pid = null, worker_token = null,
           lifecycle_state = ?, updated_at = ?
          where id = ? and status = 'starting' and updated_at = ?`,
       ).run(JSON.stringify(lifecycleState), now, agentId, current.updatedAt);
