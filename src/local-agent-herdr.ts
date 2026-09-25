@@ -654,6 +654,12 @@ export class HerdrThinGateway {
       agent?: HerdrAgentInfo;
     }>(req, 3000, socketPath);
     if (res.error) {
+      const message = res.error.message.trim();
+      const exactNotFound =
+        message === `agent target ${agentName} not found` ||
+        message === `agent '${agentName}' not found` ||
+        message === `agent ${agentName} not found`;
+      if (exactNotFound) return true;
       throw new Error(
         `[AGENT_ABSENCE_UNVERIFIED] HerdR agent.get failed for '${agentName}': ${res.error.message}`,
       );

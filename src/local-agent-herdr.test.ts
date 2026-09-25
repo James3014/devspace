@@ -3681,6 +3681,37 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
     // Re-register for the remaining negative stop cases.
     registry.registerHandle(handle);
 
+    // 4a. SI-AGENT-NOT-FOUND-ERROR: HerdR 0.9.x reports exact missing
+    // targets as a structured error rather than an empty successful result.
+    // This exact-target not-found is still positive absence evidence.
+    registry.registerHandle(handle);
+    const originalSendRequest = spy.sendRequest.bind(spy);
+    spy.sendRequest = async function<T = unknown>(
+      req: HerdrSocketRequest,
+      timeoutMs: number = 10_000,
+      socketPath?: string,
+    ): Promise<HerdrSocketResponse<T>> {
+      if (req.method === "agent.get") {
+        return {
+          id: req.id,
+          error: {
+            code: "NOT_FOUND",
+            message: `agent target ${handle.herdrAgentIdentity} not found`,
+          },
+        } as HerdrSocketResponse<T>;
+      }
+      return originalSendRequest<T>(req, timeoutMs, socketPath);
+    };
+    await spy.stopExternalAgent(handle);
+    assert.equal(spy.workspaceCloseCalls, 2, "Exact HerdR agent target not-found reclaims owned workspace");
+
+    // Successful stop releases the registry handle; restore the fixture for
+    // the remaining negative cases so they keep testing zero-close behavior.
+    registry.registerHandle(handle);
+
+    // Restore normal spy behavior for remaining negative cases.
+    spy.sendRequest = originalSendRequest;
+
     // 4b. SI-AGENT-LOOKUP-TRANSPORT: a failed strict absence readback must
     // remain fail-closed and must not close the workspace.
     spy.failAgentGet = true;
@@ -3691,7 +3722,7 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
         return true;
       },
     );
-    assert.equal(spy.workspaceCloseCalls, 1, "Zero additional workspace.close on unverified absence");
+    assert.equal(spy.workspaceCloseCalls, 2, "Zero additional workspace.close on unverified absence");
     spy.failAgentGet = false;
 
     // 5. SI-WRONG-WORKSPACE: agent workspace mismatch
@@ -3712,7 +3743,7 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
         return true;
       },
     );
-    assert.equal(spy.workspaceCloseCalls, 1);
+    assert.equal(spy.workspaceCloseCalls, 2);
 
     // 6. SI-WRONG-PANE: agent pane mismatch
     spy.simulatedAgents.set(handle.herdrAgentIdentity, {
@@ -3732,7 +3763,7 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
         return true;
       },
     );
-    assert.equal(spy.workspaceCloseCalls, 1);
+    assert.equal(spy.workspaceCloseCalls, 2);
 
     // 7. SI-WRONG-CWD: agent cwd mismatch
     spy.simulatedAgents.set(handle.herdrAgentIdentity, {
@@ -3752,7 +3783,7 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
         return true;
       },
     );
-    assert.equal(spy.workspaceCloseCalls, 1);
+    assert.equal(spy.workspaceCloseCalls, 2);
 
     // 8. SI-WRONG-NAME: agent name mismatch
     spy.simulatedAgents.set(handle.herdrAgentIdentity, {
@@ -3772,7 +3803,7 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
         return true;
       },
     );
-    assert.equal(spy.workspaceCloseCalls, 1);
+    assert.equal(spy.workspaceCloseCalls, 2);
 
     // 9. SI-CLOSE-ERROR: workspace.close fails -> error not swallowed, registry handle NOT released
     spy.simulatedAgents.set(handle.herdrAgentIdentity, {
@@ -3797,9 +3828,9 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
 
     // 10. SI-EXACT: valid store and verified live identity -> succeeds, closes workspace, releases handle
     spy.failWorkspaceClose = false;
-    assert.equal(spy.workspaceCloseCalls, 2);
-    await spy.stopExternalAgent(handle);
     assert.equal(spy.workspaceCloseCalls, 3);
+    await spy.stopExternalAgent(handle);
+    assert.equal(spy.workspaceCloseCalls, 4);
     assert.equal(registry.getHandle(attemptKey), undefined, "Registry handle released upon successful close");
 
     // 11. REPRODUCER-5: Consequential side-door elimination
