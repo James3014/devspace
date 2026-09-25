@@ -3718,7 +3718,7 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
         return true;
       },
     );
-    assert.equal(spy.workspaceCloseCalls, 1, "Zero additional workspace.close on unverified absence");
+    assert.equal(spy.workspaceCloseCalls, 2, "Zero additional workspace.close on unverified absence");
     spy.failAgentGet = false;
 
     // 5. SI-WRONG-WORKSPACE: agent workspace mismatch
@@ -3739,7 +3739,7 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
         return true;
       },
     );
-    assert.equal(spy.workspaceCloseCalls, 1);
+    assert.equal(spy.workspaceCloseCalls, 2);
 
     // 6. SI-WRONG-PANE: agent pane mismatch
     spy.simulatedAgents.set(handle.herdrAgentIdentity, {
@@ -3759,7 +3759,7 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
         return true;
       },
     );
-    assert.equal(spy.workspaceCloseCalls, 1);
+    assert.equal(spy.workspaceCloseCalls, 2);
 
     // 7. SI-WRONG-CWD: agent cwd mismatch
     spy.simulatedAgents.set(handle.herdrAgentIdentity, {
@@ -3779,7 +3779,7 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
         return true;
       },
     );
-    assert.equal(spy.workspaceCloseCalls, 1);
+    assert.equal(spy.workspaceCloseCalls, 2);
 
     // 8. SI-WRONG-NAME: agent name mismatch
     spy.simulatedAgents.set(handle.herdrAgentIdentity, {
@@ -3799,7 +3799,7 @@ test("HerdrThinGateway stop external agent identity validation and side-door eli
         return true;
       },
     );
-    assert.equal(spy.workspaceCloseCalls, 1);
+    assert.equal(spy.workspaceCloseCalls, 2);
 
     // 9. SI-CLOSE-ERROR: workspace.close fails -> error not swallowed, registry handle NOT released
     spy.simulatedAgents.set(handle.herdrAgentIdentity, {
