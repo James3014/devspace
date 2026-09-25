@@ -847,6 +847,7 @@ export class LocalAgentSessionManager {
           requestedEffort: initial.effort,
           requestedCliProviderId: initial.executionContract?.directSelection?.cliProviderId,
           writeMode: initial.executionContract?.writePaths?.length ? "allowed" : "read_only",
+          selectedToolIntents: initial.executionContract?.toolProjectionManifest?.selectedTools,
           store: this.store,
         });
         this.bindHerdrExternalHandle(initial.id, handle);

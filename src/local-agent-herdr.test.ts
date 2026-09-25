@@ -13,6 +13,7 @@ import {
   parsePorcelainChangedPaths,
   buildDeterministicHerdrAgentName,
   buildHerdrAgentArgs,
+  buildHerdrWorkspaceEnv,
   normalizeHerdrSocketPath,
   type HerdrExternalHandle,
   type HerdrSocketRequest,
@@ -46,6 +47,39 @@ test("buildHerdrAgentArgs binds requested provider model, effort, and permission
     buildHerdrAgentArgs({ agentKind: "cline", requestedModel: "cline-pass/glm-5.3-flash", requestedEffort: "medium", requestedCliProviderId: "cline-pass", writeMode: "read_only" }, cwd),
     ["-P", "cline-pass", "--model", "cline-pass/glm-5.3-flash", "--thinking", "medium", "--plan", "--auto-approve"],
   );
+});
+
+test("buildHerdrWorkspaceEnv preserves DevSpace OpenCode permission authority", () => {
+  const readOnly = buildHerdrWorkspaceEnv({ agentKind: "opencode", writeMode: "read_only" });
+  assert.ok(readOnly?.OPENCODE_PERMISSION);
+  assert.deepEqual(JSON.parse(readOnly.OPENCODE_PERMISSION), {
+    read: "allow",
+    edit: "deny",
+    glob: "allow",
+    grep: "allow",
+    list: "allow",
+    bash: "deny",
+    task: "deny",
+    external_directory: "deny",
+  });
+
+  const selected = buildHerdrWorkspaceEnv({
+    agentKind: "opencode",
+    writeMode: "allowed",
+    selectedToolIntents: ["workspace.read", "workspace.mutate"],
+  });
+  assert.ok(selected?.OPENCODE_PERMISSION);
+  assert.deepEqual(JSON.parse(selected.OPENCODE_PERMISSION), {
+    read: "allow",
+    edit: "allow",
+    glob: "deny",
+    grep: "deny",
+    list: "deny",
+    bash: "deny",
+    task: "deny",
+    external_directory: "deny",
+  });
+  assert.equal(buildHerdrWorkspaceEnv({ agentKind: "agy", writeMode: "allowed" }), undefined);
 });
 
 test("HerdrGatewayRegistry scopes replay identity by workspace", () => {
@@ -644,6 +678,7 @@ test("HerdrThinGateway live canary with OpenCode on isolated worktree", async ()
       canonicalWorktreePath: worktreePath,
       workspaceId: "canary-ws-oc",
       requestedModel: "opencode/mimo-v2.6-flash-free",
+      writeMode: "allowed",
     });
 
     assert.equal(handle.runtimeKind, HERDR_RUNTIME_KIND);
