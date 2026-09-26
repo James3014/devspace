@@ -187,6 +187,31 @@ export class DurableOperationStore {
       .run(operationId,requestHash,leaseId,exitCode,frozenInputsUnchanged?1:0);
   }
 
+  readDependencyTerminal(operationId: string): {
+    operationId: string;
+    requestHash: string;
+    leaseId: string;
+    exitCode: number;
+    frozenInputsUnchanged: boolean;
+  } | undefined {
+    const row = this.database.sqlite.prepare(
+      "select operation_id,request_hash,lease_id,exit_code,frozen_inputs_unchanged from dependency_terminal_witnesses where operation_id=?",
+    ).get(operationId) as {
+      operation_id: string;
+      request_hash: string;
+      lease_id: string;
+      exit_code: number;
+      frozen_inputs_unchanged: number;
+    } | undefined;
+    return row ? {
+      operationId: row.operation_id,
+      requestHash: row.request_hash,
+      leaseId: row.lease_id,
+      exitCode: row.exit_code,
+      frozenInputsUnchanged: row.frozen_inputs_unchanged === 1,
+    } : undefined;
+  }
+
   markInterruptedUnknown(): number {
     const now = new Date().toISOString();
     const preflight = this.database.sqlite.prepare(`
@@ -344,6 +369,12 @@ export interface DependencySyncInput {
   workspaceRoot: string;
   recipe: DependencySyncRecipe;
   authorityMode?: ExecutionAuthorityMode;
+  /**
+   * Trusted server-side admission only. Callers cannot set this through MCP.
+   * Allows OWNER_DIRECT frozen dependency sync without a carrier only for a
+   * DevSpace-managed isolated worktree already admitted for this conversation.
+   */
+  ownerDirectIsolated?: boolean;
 }
 
 export type CommandRunner = (
@@ -688,6 +719,7 @@ export class DurableOperationManager {
       workspaceRoot,
       recipe: input.recipe,
       frozenInputs: before,
+      ...(input.ownerDirectIsolated === true ? { ownerDirectIsolated: true } : {}),
     };
     const requestHash = hashJson(request);
     const operationId = stableOperationId("dependency_sync", workspaceRoot, input.attemptKey);
@@ -696,64 +728,92 @@ export class DurableOperationManager {
   }
 
   async dependencySync(input: DependencySyncInput, consumerContext?: unknown): Promise<DurableOperationRecord> {
-    if (!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency sync requires a trusted host authority reader");
+    const ownerDirectIsolated = input.ownerDirectIsolated === true;
+    if (!ownerDirectIsolated && !this.consumer) {
+      throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency sync requires a trusted host authority reader");
+    }
     const consumer = this.consumer;
     const {subject, request, workspaceRoot, authorityMode, frozenInputs, before, baseRevision, requestHash, operationId} = await this.planDependencySync(input);
-    const { record, created, binding, pinnedVersion } = this.store.atomic(() => {
-      const binding = consumer.authorize(consumerContext, subject);
+    const directWitnessId = "OWNER_DIRECT_ISOLATED";
+    const prepared = this.store.atomic(() => {
+      if (ownerDirectIsolated) {
+        const value = this.store.createOrReplay({
+          operationId,
+          attemptKey: input.attemptKey,
+          requestHash,
+          kind: "dependency_sync",
+          authorityMode,
+          scopeRoot: workspaceRoot,
+          workspaceId: input.workspaceId,
+          request,
+        });
+        return { ...value, binding: undefined, pinnedVersion: undefined };
+      }
+      const binding = consumer!.authorize(consumerContext, subject);
       const value = this.store.createOrReplay({
-      operationId,
-      attemptKey: input.attemptKey,
-      requestHash,
-      kind: "dependency_sync",
-      authorityMode,
-      scopeRoot: workspaceRoot,
-      workspaceId: input.workspaceId,
-      request,
+        operationId,
+        attemptKey: input.attemptKey,
+        requestHash,
+        kind: "dependency_sync",
+        authorityMode,
+        scopeRoot: workspaceRoot,
+        workspaceId: input.workspaceId,
+        request,
       });
-      const pinnedVersion = value.created ? consumer.pin(consumerContext, subject, binding) : binding.leaseVersion;
-      return {...value, binding, pinnedVersion};
+      const pinnedVersion = value.created ? consumer!.pin(consumerContext, subject, binding) : binding.leaseVersion;
+      return { ...value, binding, pinnedVersion };
     });
+    const { record, created, binding, pinnedVersion } = prepared;
     if (!created) return replayResult(record);
 
     const finish = (patch: Parameters<DurableOperationStore["finish"]>[1]) => this.store.atomic(() => {
-      consumer.finish(consumerContext, subject, binding, pinnedVersion);
+      if (!ownerDirectIsolated) {
+        consumer!.finish(consumerContext, subject, binding!, pinnedVersion!);
+      }
       return this.store.finish(operationId, patch);
     });
     try {
-    if (await readGitHead(workspaceRoot) !== baseRevision || hashJson(await hashFiles(workspaceRoot, frozenInputs)) !== hashJson(before)) {
-      throw new Error("Frozen dependency input or base revision changed before launch");
-    }
-    consumer.assertPinned(consumerContext, subject, binding, pinnedVersion);
-    const command = dependencyCommand(input.recipe);
-    const result = await this.runCommand(command.command, command.args, workspaceRoot);
-    if (result.exitCode === null) throw new Error("Command termination is unconfirmed");
-    const after = await hashFiles(workspaceRoot, frozenInputs);
-    const frozenInputsUnchanged = hashJson(before) === hashJson(after) && await readGitHead(workspaceRoot) === baseRevision;
-    this.store.recordDependencyTerminal(operationId,requestHash,binding.leaseId,result.exitCode,frozenInputsUnchanged);
-    if (!frozenInputsUnchanged) {
+      if (await readGitHead(workspaceRoot) !== baseRevision || hashJson(await hashFiles(workspaceRoot, frozenInputs)) !== hashJson(before)) {
+        throw new Error("Frozen dependency input or base revision changed before launch");
+      }
+      if (!ownerDirectIsolated) {
+        consumer!.assertPinned(consumerContext, subject, binding!, pinnedVersion!);
+      }
+      const command = dependencyCommand(input.recipe);
+      const result = await this.runCommand(command.command, command.args, workspaceRoot);
+      if (result.exitCode === null) throw new Error("Command termination is unconfirmed");
+      const after = await hashFiles(workspaceRoot, frozenInputs);
+      const frozenInputsUnchanged = hashJson(before) === hashJson(after) && await readGitHead(workspaceRoot) === baseRevision;
+      this.store.recordDependencyTerminal(
+        operationId,
+        requestHash,
+        ownerDirectIsolated ? directWitnessId : binding!.leaseId,
+        result.exitCode,
+        frozenInputsUnchanged,
+      );
+      if (!frozenInputsUnchanged) {
+        return finish({
+          status: "failed",
+          retrySafe: false,
+          errorCode: "FROZEN_INPUT_CHANGED",
+          errorMessage: "Dependency specification or lock input changed during a FROZEN dependency sync.",
+          receipt: { recipe: input.recipe, before, after, exitCode: result.exitCode },
+        });
+      }
+      if (result.exitCode !== 0) {
+        return finish({
+          status: "failed",
+          retrySafe: false,
+          errorCode: "DEPENDENCY_SYNC_FAILED",
+          errorMessage: redactSecrets(result.stderr || `${command.command} exited ${result.exitCode}`),
+          receipt: { recipe: input.recipe, frozenInputs: after, exitCode: result.exitCode },
+        });
+      }
       return finish({
-        status: "failed",
+        status: "succeeded",
         retrySafe: false,
-        errorCode: "FROZEN_INPUT_CHANGED",
-        errorMessage: "Dependency specification or lock input changed during a FROZEN dependency sync.",
-        receipt: { recipe: input.recipe, before, after, exitCode: result.exitCode },
-      });
-    }
-    if (result.exitCode !== 0) {
-      return finish({
-        status: "failed",
-        retrySafe: false,
-        errorCode: "DEPENDENCY_SYNC_FAILED",
-        errorMessage: redactSecrets(result.stderr || `${command.command} exited ${result.exitCode}`),
         receipt: { recipe: input.recipe, frozenInputs: after, exitCode: result.exitCode },
       });
-    }
-    return finish({
-      status: "succeeded",
-      retrySafe: false,
-      receipt: { recipe: input.recipe, frozenInputs: after, exitCode: result.exitCode },
-    });
     } catch (error) {
       return this.store.atomic(() => {
         if (JSON.stringify(this.store.getByOperationId(operationId)) !== JSON.stringify(record)) {
@@ -762,6 +822,45 @@ export class DurableOperationManager {
         return this.store.finish(operationId, {status: "outcome_unknown", retrySafe:false, errorCode:"RECONCILIATION_REQUIRED", errorMessage: redactSecrets(error instanceof Error ? error.message : String(error))});
       });
     }
+  }
+
+  reconcileOwnerDirectDependencySync(operationId: string): DurableOperationRecord {
+    return this.store.atomic(() => {
+      const record = this.store.getByOperationId(operationId);
+      if (
+        !record ||
+        record.kind !== "dependency_sync" ||
+        record.authorityMode !== "OWNER_DIRECT" ||
+        record.request.ownerDirectIsolated !== true
+      ) {
+        throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "owner-direct isolated reconciliation is not authorized for this operation");
+      }
+      if (record.status === "succeeded" || record.status === "failed") return record;
+      const witness = this.store.readDependencyTerminal(operationId);
+      if (
+        !witness ||
+        witness.requestHash !== record.requestHash ||
+        witness.leaseId !== "OWNER_DIRECT_ISOLATED"
+      ) {
+        throw new DurableOperationError(
+          "RECONCILIATION_REQUIRED",
+          "No exact terminal witness exists for this owner-direct isolated dependency operation; preserve outcome_unknown and do not replay.",
+          record,
+        );
+      }
+      return this.store.finish(operationId, {
+        status: witness.exitCode === 0 && witness.frozenInputsUnchanged ? "succeeded" : "failed",
+        retrySafe: false,
+        receipt: {
+          reconciliation: {
+            mode: "OWNER_DIRECT_ISOLATED",
+            requestHash: witness.requestHash,
+            exitCode: witness.exitCode,
+            frozenInputsUnchanged: witness.frozenInputsUnchanged,
+          },
+        },
+      });
+    });
   }
 
   reconcileDependencySync(operationId: string, evidence: DependencyReconciliationEvidence, consumerContext?: unknown): DurableOperationRecord {
@@ -806,6 +905,9 @@ export class DurableOperationManager {
     if (!record) throw new DurableOperationError("RECONCILIATION_REQUIRED", `Unknown durable operation: ${operationId}`);
     if (record.kind === "cutover_start") return this.reconcileCutoverStart(operationId,consumerContext);
     if (record.kind === "dependency_sync") {
+      if (record.authorityMode === "OWNER_DIRECT" && record.request.ownerDirectIsolated === true) {
+        return this.reconcileOwnerDirectDependencySync(operationId);
+      }
       if (!this.consumer || typeof record.request.baseRevision !== "string") throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED", "dependency reconciliation requires revision-bound host authority");
       const subject = {operationId, requestHash:record.requestHash, workspaceRoot:record.scopeRoot, baseRevision:record.request.baseRevision, operation:"dependency_sync" as const};
       return this.reconcileDependencySync(operationId, this.consumer.readReconciliation(consumerContext, subject), consumerContext);

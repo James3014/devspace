@@ -4112,9 +4112,14 @@ export function createMcpServer(
       },
       async ({ workspaceId, attemptKey, recipe, authorityMode }, extra) => {
         const { _meta } = extra;
-        const consumerContext = dependencyConsumerContext(extra);
-        await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
+        const safety = await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
         const workspace = workspaces.getWorkspace(workspaceId);
+        const ownerDirectIsolated =
+          authorityMode === "OWNER_DIRECT" &&
+          workspace.mode === "worktree" &&
+          workspace.worktree?.managed === true &&
+          safety.state === "ISOLATED_WORKTREE";
+        const consumerContext = ownerDirectIsolated ? undefined : dependencyConsumerContext(extra);
         try {
           const operation = await durableOperations.dependencySync({
             workspaceId,
@@ -4122,6 +4127,7 @@ export function createMcpServer(
             attemptKey,
             recipe,
             authorityMode,
+            ownerDirectIsolated,
           }, consumerContext);
           return operationResponse(operation);
         } catch (error) {
@@ -4169,8 +4175,12 @@ export function createMcpServer(
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       },
       async ({ operationId }, extra) => {
-        const context = ["dependency_sync", "cutover_start"].includes(durableOperations.store.getByOperationId(operationId)?.kind ?? "")
-          ? dependencyConsumerContext(extra) : undefined;
+        const record = durableOperations.store.getByOperationId(operationId);
+        const context =
+          record?.kind === "cutover_start" ||
+          (record?.kind === "dependency_sync" && record.request.ownerDirectIsolated !== true)
+            ? dependencyConsumerContext(extra)
+            : undefined;
         return operationResponse(await durableOperations.reconcile(operationId, context));
       },
     );
