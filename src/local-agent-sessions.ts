@@ -79,8 +79,7 @@ import {
   ExecutionProtocolError,
 } from "./execution-protocol.js";
 import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build-identity.js";
-import type { LocalEffectEnforcementReceipt } from "./local-effect-enforcement.js";
-import type { ToolExposureReceipt } from "./tool-exposure-receipt.js";
+import type { LocalEffectEnforcementReceipt, ToolExposureReceipt } from "./local-effect-enforcement.js";
 import { devspaceConfigDir } from "./user-config.js";
 import {
   classifyScopeState,
@@ -608,7 +607,8 @@ export class LocalAgentSessionManager {
         `Cannot bind handle with attemptKey '${handle.attemptKey}' to agent ${agentId} bound to attemptKey '${record.startReplay.key}'`,
       );
     }
-    if ((handle.enforcementState as string) === "PHYSICALLY_ENFORCED") {
+    const isOpencodeBridge = handle.herdrAgentKind === "opencode" && handle.toolExposureReceipt?.enforcement_mode === "ENFORCED_MANAGED_BRIDGE";
+    if ((handle.enforcementState as string) === "PHYSICALLY_ENFORCED" && !isOpencodeBridge) {
       throw new AgentSessionError(
         "INVALID_EXECUTION_CONTRACT",
         `HerdR runtime handle cannot claim PHYSICALLY_ENFORCED; enforcement state must be REQUEST_ONLY_NOT_ENFORCED`,
@@ -869,6 +869,9 @@ export class LocalAgentSessionManager {
             candidateTools: initial.executionContract.toolProjectionManifest.candidateTools,
             selectedTools: initial.executionContract.toolProjectionManifest.selectedTools,
           } : undefined,
+          plannerDecisionHash: initial.executionContract?.toolProjectionManifest
+            ? (initial.executionContract.nexusGrant as any)?.toolAuthority?.plannerDecisionHash
+            : undefined,
           store: this.store,
         });
         this.bindHerdrExternalHandle(initial.id, handle);

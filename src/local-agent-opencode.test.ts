@@ -794,3 +794,23 @@ assert.deepEqual(projectedFactoryConfig, {
   });
   assert.equal(projectedKey, `${legacyKey}:tools:workspace.read,workspace.search_text`);
 }
+
+{
+  const { buildHerdrWorkspaceEnv, extractActualExposedToolsFromOpencodeConfig } = await import("./local-agent-herdr.js");
+  const envRo = buildHerdrWorkspaceEnv({
+    agentKind: "opencode",
+    writeMode: "read_only",
+    selectedToolIntents: ["workspace.read", "workspace.mutate", "process.execute", "workspace.search_paths"],
+  });
+  const toolsRo = extractActualExposedToolsFromOpencodeConfig(envRo, "read_only");
+  assert.deepEqual(toolsRo, ["glob", "read"]);
+
+  const envRw = buildHerdrWorkspaceEnv({
+    agentKind: "opencode",
+    writeMode: "allowed",
+    selectedToolIntents: ["workspace.read", "workspace.mutate", "process.execute", "workspace.search_paths"],
+  });
+  const toolsRw = extractActualExposedToolsFromOpencodeConfig(envRw, "allowed");
+  assert.deepEqual(toolsRw, ["bash", "edit", "glob", "read"]);
+}
+
