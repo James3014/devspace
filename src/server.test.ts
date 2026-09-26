@@ -4530,6 +4530,54 @@ test("OWNER_DIRECT workspace_clone works and dependency_sync denies unauthentica
   assert.equal(nexusBlocked.isError, true);
 });
 
+test("OWNER_DIRECT dependency_sync bypasses carrier only for a managed isolated worktree", async (t) => {
+  const context = await fixture(t, { git: true });
+  await writeFile(join(context.project, "package.json"), JSON.stringify({ name: "isolated-fixture", version: "1.0.0" }) + "\n");
+  await writeFile(join(context.project, "package-lock.json"), JSON.stringify({
+    name: "isolated-fixture",
+    version: "1.0.0",
+    lockfileVersion: 3,
+    requires: true,
+    packages: { "": { name: "isolated-fixture", version: "1.0.0" } },
+  }) + "\n");
+  await git(context.project, ["add", "package.json", "package-lock.json"]);
+  await git(context.project, ["commit", "-m", "add dependency fixture"]);
+
+  const isolated = await callOpen(context.client, context.project, "isolated-dependency-sync", "worktree");
+  const isolatedWorkspaceId = structuredContent(isolated).workspaceId as string;
+  const isolatedResult = await context.client.callTool({
+    name: "dependency_sync",
+    arguments: {
+      workspaceId: isolatedWorkspaceId,
+      attemptKey: "isolated-owner-direct-deps",
+      recipe: "npm_ci",
+      authorityMode: "OWNER_DIRECT",
+    },
+    _meta: { "openai/session": "isolated-dependency-sync" },
+  });
+  assert.equal(isolatedResult.isError, undefined, JSON.stringify(isolatedResult));
+  assert.equal(structuredContent(isolatedResult).status, "succeeded");
+  assert.equal(
+    ((structuredContent(isolatedResult).request as Record<string, unknown>) ?? {}).ownerDirectIsolated,
+    true,
+  );
+
+  const checkout = await callOpen(context.client, context.project, "checkout-dependency-sync", "checkout");
+  const checkoutWorkspaceId = structuredContent(checkout).workspaceId as string;
+  const checkoutResult = await context.client.callTool({
+    name: "dependency_sync",
+    arguments: {
+      workspaceId: checkoutWorkspaceId,
+      attemptKey: "checkout-owner-direct-deps",
+      recipe: "npm_ci",
+      authorityMode: "OWNER_DIRECT",
+    },
+    _meta: { "openai/session": "checkout-dependency-sync" },
+  });
+  assert.equal(checkoutResult.isError, true);
+  assert.match(JSON.stringify(checkoutResult), /authenticated MCP client context is required/);
+});
+
 test("command_status metadata annotations and minimal mode visibility", async (t) => {
   // Test minimal mode tools
   const context = await fixture(t, { toolMode: "minimal" });

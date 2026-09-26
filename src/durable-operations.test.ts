@@ -376,6 +376,86 @@ test("dependency_sync frozen recipe succeeds without changing manifest or lock i
   }
 });
 
+test("dependency_sync OWNER_DIRECT isolated mode does not require carrier authority", async () => {
+  const f = await fixture();
+  try {
+    const project = join(f.root, "project");
+    await mkdir(project);
+    await writeFile(join(project, "package.json"), JSON.stringify({ name: "fixture", version: "1.0.0" }) + "\n");
+    await writeFile(join(project, "package-lock.json"), JSON.stringify({ name: "fixture", version: "1.0.0", lockfileVersion: 3, packages: {} }) + "\n");
+    await git(project, "init");
+    await git(project, "config", "user.email", "devspace@example.com");
+    await git(project, "config", "user.name", "DevSpace Test");
+    await git(project, "add", ".");
+    await git(project, "commit", "-m", "fixture");
+    let calls = 0;
+    const runner: CommandRunner = async () => {
+      calls += 1;
+      return { exitCode: 0, stdout: "ok", stderr: "" };
+    };
+    const manager = new DurableOperationManager(f.config, runner);
+    try {
+      const result = await manager.dependencySync({
+        attemptKey: "deps-owner-direct-isolated-1",
+        workspaceId: "ws_isolated",
+        workspaceRoot: project,
+        recipe: "npm_ci",
+        authorityMode: "OWNER_DIRECT",
+        ownerDirectIsolated: true,
+      });
+      assert.equal(result.status, "succeeded");
+      assert.equal(calls, 1);
+      const witness = manager.store.readDependencyTerminal(result.operationId);
+      assert.equal(witness?.leaseId, "OWNER_DIRECT_ISOLATED");
+      assert.equal(witness?.requestHash, result.requestHash);
+      assert.equal(witness?.frozenInputsUnchanged, true);
+      assert.equal((result.request as Record<string, unknown>).ownerDirectIsolated, true);
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("dependency_sync OWNER_DIRECT isolated reconciliation requires its exact terminal witness", async () => {
+  const f = await fixture();
+  try {
+    const project = join(f.root, "project");
+    await mkdir(project);
+    await writeFile(join(project, "package.json"), JSON.stringify({ name: "fixture", version: "1.0.0" }) + "\n");
+    await writeFile(join(project, "package-lock.json"), JSON.stringify({ name: "fixture", version: "1.0.0", lockfileVersion: 3, packages: {} }) + "\n");
+    await git(project, "init");
+    await git(project, "config", "user.email", "devspace@example.com");
+    await git(project, "config", "user.name", "DevSpace Test");
+    await git(project, "add", ".");
+    await git(project, "commit", "-m", "fixture");
+    const manager = new DurableOperationManager(f.config, async () => {
+      throw new Error("simulated unacknowledged dependency process");
+    });
+    try {
+      const result = await manager.dependencySync({
+        attemptKey: "deps-owner-direct-isolated-unknown",
+        workspaceId: "ws_isolated",
+        workspaceRoot: project,
+        recipe: "npm_ci",
+        authorityMode: "OWNER_DIRECT",
+        ownerDirectIsolated: true,
+      });
+      assert.equal(result.status, "outcome_unknown");
+      assert.throws(
+        () => manager.reconcileOwnerDirectDependencySync(result.operationId),
+        /No exact terminal witness exists/,
+      );
+      assert.equal(manager.store.getByOperationId(result.operationId)?.status, "outcome_unknown");
+    } finally {
+      manager.close();
+    }
+  } finally {
+    await f.cleanup();
+  }
+});
+
 test("dependency_sync rejects a changed request before creating an operation or pin", async () => {
   const f = await fixture();
   try {
