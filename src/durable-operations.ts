@@ -602,9 +602,10 @@ export class DurableOperationManager {
       const comparison=compareServerIdentity(file,identity);
       if(!Object.values(comparison).every(Boolean)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","finish replacement runtime identity mismatch");
       const expiredPreparedRecovery=recovery&&file.phase==="prepared"&&!file.drainEvidence&&!file.restartRequest;
-      if(file.phase!=="drained"&&file.phase!=="closed"&&!expiredPreparedRecovery) throw new ControlPlaneOwnershipError("CAS_CONFLICT","bound finish requires drained generation unless exact expired prepared recovery applies");
+      const activePreparedReplacement=!recovery&&file.phase==="prepared"&&!file.drainEvidence&&!file.restartRequest&&Object.values(comparison).every(Boolean);
+      if(file.phase!=="drained"&&file.phase!=="closed"&&!expiredPreparedRecovery&&!activePreparedReplacement) throw new ControlPlaneOwnershipError("CAS_CONFLICT","bound finish requires drained generation unless an exact prepared replacement or expired prepared recovery applies");
       if(replay&&(file.phase!=="closed"||intent.receipt?.terminalRecordHash!==digest(file)||!isDeepStrictEqual(intent.receipt?.lifecycleAction,action))) throw new ControlPlaneOwnershipError("CAS_CONFLICT","terminal replay receipt mismatch");
-      return {file,intent,subject,binding,replay,recovery,expiredPreparedRecovery};
+      return {file,intent,subject,binding,replay,recovery,expiredPreparedRecovery,activePreparedReplacement};
     };
     const validWitness=(w:DurableReconciliationWitness|undefined)=>!!w&&w.workspaceQueryable===true&&w.agentQueryable===true&&w.agentReconciled===true&&w.witnessWorkspaceId===pair.workspaceId&&w.witnessAgentId===pair.agentId;
     const initial=this.store.atomic(readBound);
@@ -616,7 +617,7 @@ export class DurableOperationManager {
       if(current.file.phase!=="closed") {
         if(!validWitness(witness)) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","finish requires positive exact workspace/agent witness");
         const controller=new McpCutoverController(cutoverStore,identity);
-        if(current.expiredPreparedRecovery) controller.finishExpiredPreparedRecoveryWithWitness(cutoverId,witness!);
+        if(current.expiredPreparedRecovery||current.activePreparedReplacement) controller.finishExpiredPreparedRecoveryWithWitness(cutoverId,witness!);
         else controller.finishWithWitness(cutoverId,witness!);
       }
       const closed=cutoverStore.get();const receipt=closed?.reconciliationReceipt;
