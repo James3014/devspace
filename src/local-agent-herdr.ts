@@ -12,7 +12,7 @@ import {
   OpencodeRuntime,
 } from "./local-agent-opencode.js";
 import { AgentProviderFailureError } from "./local-agent-errors.js";
-import { canonicalizePath } from "./roots.js";
+import { canonicalizePath, isSameWorktreePath } from "./roots.js";
 
 export const HERDR_DEFAULT_SOCKET_PATH = process.env.HERDR_SOCKET_PATH || "/Users/james/.config/herdr/herdr.sock";
 export const HERDR_RUNTIME_KIND = "HERDR" as const;
@@ -734,6 +734,7 @@ export class HerdrThinGateway {
     if (res.error) {
       const message = res.error.message.trim();
       const exactNotFound =
+        res.error.code === "agent_not_found" ||
         message === `agent target ${agentName} not found` ||
         message === `agent '${agentName}' not found` ||
         message === `agent ${agentName} not found`;
@@ -760,7 +761,7 @@ export class HerdrThinGateway {
     if (res.error) {
       const message = res.error.message.trim();
       const exactNotFound =
-        res.error.code === "workspace_not_found" &&
+        res.error.code === "workspace_not_found" ||
         message === `workspace ${workspaceId} not found`;
       if (exactNotFound) return true;
       throw new Error(
@@ -818,7 +819,7 @@ export class HerdrThinGateway {
           ? canonicalizePath(liveObs.pane.foreground_cwd)
           : undefined;
         const expected = canonicalizePath(launch.canonicalWorktreePath);
-        return paneCwd === expected || paneForegroundCwd === expected;
+        return isSameWorktreePath(paneCwd, expected) || isSameWorktreePath(paneForegroundCwd, expected);
       })();
     const missingExactAgent =
       exactPaneStillOwned &&
@@ -832,6 +833,41 @@ export class HerdrThinGateway {
     }
 
     return this.confirmAgentAbsent(launch.herdrAgentIdentity, targetSocket);
+  }
+
+  /**
+   * Verify external absence for pre-agent launches (FENCED, WORKSPACE_OBSERVED, OUTCOME_UNKNOWN).
+   * Verifies HerdR daemon connectivity and confirms that neither the planned agent nor orphaned
+   * workspace is active, cleaning up orphaned workspaces if safe.
+   */
+  async confirmPreAgentLaunchAbsent(launch: ExternalRuntimeLaunchFence): Promise<boolean> {
+    if (!launch.herdrSocketPath) {
+      throw new Error("[LAUNCH_ABSENCE_UNVERIFIED] Missing HerdR socket path.");
+    }
+    const targetSocket = normalizeHerdrSocketPath(launch.herdrSocketPath);
+    if (!await this.pingServer(2000, targetSocket)) {
+      return false;
+    }
+
+    const agentName = launch.herdrAgentIdentity ?? launch.plannedAgentName;
+    if (agentName) {
+      const agentAbsent = await this.confirmAgentAbsent(agentName, targetSocket);
+      if (!agentAbsent) return false;
+    }
+
+    if (launch.herdrWorkspaceId) {
+      const wsAbsent = await this.confirmWorkspaceAbsent(launch.herdrWorkspaceId, targetSocket);
+      if (!wsAbsent) {
+        try {
+          await this.closeWorkspace(launch.herdrWorkspaceId, targetSocket);
+        } catch {
+          // If close fails, re-verify absence below
+        }
+        return this.confirmWorkspaceAbsent(launch.herdrWorkspaceId, targetSocket);
+      }
+    }
+
+    return true;
   }
 
   /**
@@ -1295,7 +1331,7 @@ export class HerdrThinGateway {
       }
     }
 
-    if (canonicalizePath(record.workspaceRoot) !== canonicalPath) {
+    if (!isSameWorktreePath(record.workspaceRoot, canonicalPath)) {
       throw new Error(
         `[N4 Wrong Worktree] Record workspaceRoot '${record.workspaceRoot}' does not match canonical worktree '${canonicalPath}'`,
       );
@@ -1309,7 +1345,7 @@ export class HerdrThinGateway {
           `[N2 Conflicting Replay] attemptKey '${params.attemptKey}' already active with different intent hash '${existing.dispatchIntentHash}'`,
         );
       }
-      if (canonicalizePath(existing.canonicalWorktreePath) !== canonicalPath) {
+      if (!isSameWorktreePath(existing.canonicalWorktreePath, canonicalPath)) {
         throw new Error(
           `[N4 Wrong Worktree] Observed cwd '${existing.canonicalWorktreePath}' does not match canonical worktree '${canonicalPath}'`,
         );
@@ -1373,7 +1409,7 @@ export class HerdrThinGateway {
           `[ATTEMPT_REPLAY_CONFLICT] Replay intent hash '${params.dispatchIntentHash}' does not match launch fence intent hash '${launch.dispatchIntentHash}'`,
         );
       }
-      if (canonicalizePath(launch.canonicalWorktreePath) !== canonicalPath) {
+      if (!isSameWorktreePath(launch.canonicalWorktreePath, canonicalPath)) {
         throw new Error(
           `[N4 Wrong Worktree] Observed cwd '${launch.canonicalWorktreePath}' does not match canonical worktree '${canonicalPath}'`,
         );
@@ -1504,7 +1540,7 @@ export class HerdrThinGateway {
     const observedCwd = canonicalizePath(wsRes.result.root_pane.cwd);
 
     // N4: Wrong worktree fail closed
-    if (observedCwd !== canonicalPath) {
+    if (!isSameWorktreePath(observedCwd, canonicalPath)) {
       await this.closeWorkspace(wsId, herdrSocketPath).catch(() => {});
       throw new Error(
         `[N4 Wrong Worktree] Observed cwd '${observedCwd}' does not match canonical worktree '${canonicalPath}'`,
@@ -2390,8 +2426,8 @@ export class HerdrThinGateway {
           const paneForegroundCwd = liveObs.pane?.foreground_cwd
             ? canonicalizePath(liveObs.pane.foreground_cwd)
             : undefined;
-          return paneCwd === canonicalizePath(boundHandle.canonicalWorktreePath)
-            || paneForegroundCwd === canonicalizePath(boundHandle.canonicalWorktreePath);
+          return isSameWorktreePath(paneCwd, boundHandle.canonicalWorktreePath)
+            || isSameWorktreePath(paneForegroundCwd, boundHandle.canonicalWorktreePath);
         })();
       const missingExactAgent =
         exactPaneStillOwned &&

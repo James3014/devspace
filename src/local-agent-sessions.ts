@@ -59,7 +59,7 @@ import { isClineCatalogFresh, type ClineCatalogSnapshot } from "./local-agent-cl
 import type { ClineCatalogService } from "./local-agent-cline-catalog.js";
 import { ClineCatalogService as ClineCatalogServiceImpl } from "./local-agent-cline-catalog.js";
 import { createMcpOpencodeCatalogSource } from "./local-agent-opencode-mcp-catalog.js";
-import { canonicalizePath, isPathInsideRoot } from "./roots.js";
+import { canonicalizePath, isPathInsideRoot, isSameWorktreePath } from "./roots.js";
 import {
   assertNexusGrantAuthorizesExecution,
   assertSameExecutionGeneration,
@@ -1007,6 +1007,7 @@ export class LocalAgentSessionManager {
           latest.externalRuntimeBinding?.runtimeKind === "HERDR" &&
           !latest.externalRuntimeBinding.handle &&
           (
+            launchState === "FENCED" ||
             (launchState === "WORKSPACE_OBSERVED" && message.startsWith("HerdR agent.start failed:")) ||
             (launchState === "AGENT_OBSERVED" && message.startsWith("HerdR onboarding blocked:"))
           );
@@ -1135,7 +1136,7 @@ export class LocalAgentSessionManager {
     this.assertDispatchOwnershipAvailable(workspaceRoot, executionContract);
 
     let startCapacity = this.executionCapacitySnapshot(workspaceRoot);
-    if (startCapacity.localState === "EXHAUSTED" && this.usesHerdrBackend()) {
+    if ((startCapacity.localState === "EXHAUSTED" || (startCapacity.unreconciledStale ?? 0) > 0) && this.usesHerdrBackend()) {
       await this.reconcileStaleHerdRSessions();
       startCapacity = this.executionCapacitySnapshot(workspaceRoot);
     }
@@ -1333,7 +1334,7 @@ export class LocalAgentSessionManager {
       throw new AgentSessionError("UNKNOWN_AGENT", `Unknown agent id: ${agentId}`);
     }
 
-    if (canonicalizePath(record.workspaceRoot) !== canonicalizePath(workspaceRoot)) {
+    if (!isSameWorktreePath(record.workspaceRoot, workspaceRoot)) {
       throw new AgentSessionError(
         "AGENT_WORKSPACE_MISMATCH",
         `Agent ${agentId} belongs to workspace root '${record.workspaceRoot}', not '${workspaceRoot}'`,
@@ -1614,7 +1615,7 @@ export class LocalAgentSessionManager {
       throw new AgentSessionError("UNKNOWN_AGENT", `Unknown agent id: ${agentId}`);
     }
 
-    if (canonicalizePath(record.workspaceRoot) !== canonicalizePath(workspaceRoot)) {
+    if (!isSameWorktreePath(record.workspaceRoot, workspaceRoot)) {
       throw new AgentSessionError(
         "AGENT_WORKSPACE_MISMATCH",
         `Agent ${agentId} belongs to workspace root '${record.workspaceRoot}', not '${workspaceRoot}'`,
@@ -1659,7 +1660,7 @@ export class LocalAgentSessionManager {
     if (!record) {
       throw new AgentSessionError("UNKNOWN_AGENT", `Unknown agent id: ${agentId}`);
     }
-    if (canonicalizePath(record.workspaceRoot) !== canonicalizePath(workspaceRoot)) {
+    if (!isSameWorktreePath(record.workspaceRoot, workspaceRoot)) {
       throw new AgentSessionError(
         "AGENT_WORKSPACE_MISMATCH",
         `Agent ${agentId} belongs to workspace root '${record.workspaceRoot}', not '${workspaceRoot}'`,
@@ -1803,10 +1804,9 @@ export class LocalAgentSessionManager {
       return records.slice(0, effectiveLimit).map(recordToSummary);
     }
 
-    const canonicalCurrent = canonicalizePath(workspaceRoot);
     const records = this.store.list();
     const matched = records.filter(
-      (record) => canonicalizePath(record.workspaceRoot) === canonicalCurrent
+      (record) => isSameWorktreePath(record.workspaceRoot, workspaceRoot)
     );
     return matched.slice(0, effectiveLimit).map(recordToSummary);
   }
@@ -2021,7 +2021,7 @@ export class LocalAgentSessionManager {
     if (!record) {
       throw new AgentSessionError("UNKNOWN_AGENT", `Unknown agent id: ${agentId}`);
     }
-    if (canonicalizePath(record.workspaceRoot) !== canonicalizePath(workspaceRoot)) {
+    if (!isSameWorktreePath(record.workspaceRoot, workspaceRoot)) {
       throw new AgentSessionError(
         "AGENT_WORKSPACE_MISMATCH",
         `Agent ${agentId} belongs to workspace root '${record.workspaceRoot}', not '${workspaceRoot}'`,
@@ -2242,9 +2242,8 @@ export class LocalAgentSessionManager {
 
   private executionCapacitySnapshot(workspaceRoot?: string): AgentPreflightOutput["capacity"] {
     const active = this.store.list().filter(occupiesDetachedExecutionSlot);
-    const canonicalRoot = workspaceRoot ? canonicalizePath(workspaceRoot) : undefined;
-    const activeInWorkspace = canonicalRoot
-      ? active.filter((record) => canonicalizePath(record.workspaceRoot) === canonicalRoot).length
+    const activeInWorkspace = workspaceRoot
+      ? active.filter((record) => isSameWorktreePath(record.workspaceRoot, workspaceRoot)).length
       : 0;
     let liveActive = 0;
     let unreconciledStale = 0;
@@ -2278,10 +2277,9 @@ export class LocalAgentSessionManager {
     const writeScope = contract?.writePaths ?? [];
     if (!intent?.exclusiveOwnership || writeScope.length === 0) return;
 
-    const canonicalRoot = canonicalizePath(workspaceRoot);
     for (const record of this.store.list()) {
       if (!occupiesDetachedExecutionSlot(record)) continue;
-      if (canonicalizePath(record.workspaceRoot) !== canonicalRoot) continue;
+      if (!isSameWorktreePath(record.workspaceRoot, workspaceRoot)) continue;
 
       const activeWriteScope = record.executionContract?.writePaths;
       const activeIntent = record.executionContract?.dispatchIntent;
@@ -2515,7 +2513,10 @@ export class LocalAgentSessionManager {
       const launch = record.externalRuntimeBinding?.launch;
       if (
         !launch ||
-        (launch.state !== "WORKSPACE_OBSERVED" && launch.state !== "AGENT_OBSERVED") ||
+        (launch.state !== "WORKSPACE_OBSERVED" &&
+          launch.state !== "AGENT_OBSERVED" &&
+          launch.state !== "FENCED" &&
+          launch.state !== "OUTCOME_UNKNOWN") ||
         !launch.herdrSocketPath
       ) {
         return false;
@@ -2528,7 +2529,16 @@ export class LocalAgentSessionManager {
 
       let externallyAbsent = false;
       try {
-        externallyAbsent = await this.herdrGateway.confirmObservedLaunchAbsent(launch);
+        if (
+          (launch.state === "AGENT_OBSERVED" || launch.state === "WORKSPACE_OBSERVED") &&
+          launch.herdrAgentIdentity &&
+          launch.herdrWorkspaceId &&
+          launch.herdrPaneId
+        ) {
+          externallyAbsent = await this.herdrGateway.confirmObservedLaunchAbsent(launch);
+        } else {
+          externallyAbsent = await this.herdrGateway.confirmPreAgentLaunchAbsent(launch);
+        }
       } catch {
         return false;
       }

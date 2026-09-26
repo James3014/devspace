@@ -2118,6 +2118,13 @@ test("Issue #256: HerdR stale lifecycle and capacity reconciliation 5D matrix", 
       return this.workspaceAbsent || this.agentAbsent;
     }
 
+    override async confirmPreAgentLaunchAbsent(): Promise<boolean> {
+      if (!this.serverReachable || this.identityMismatch) {
+        throw new Error("Exact HerdR absence is unverified.");
+      }
+      return this.workspaceAbsent || this.agentAbsent;
+    }
+
     override async startExternalAgent(params: any): Promise<HerdrExternalHandle> {
       const handle: HerdrExternalHandle = {
         schemaVersion: 1,
