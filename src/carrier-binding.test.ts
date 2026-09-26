@@ -195,12 +195,12 @@ test("active coordination-bound prepared cutover can terminally reconcile an exa
       expiresAt:new Date(f.clock()+60000).toISOString(),
       restart:{buildReady:{verifiedBy:"independent",verifiedAt:new Date(f.clock()).toISOString(),evidence:"exact package digest"},actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"},
       finish:{workspaceId:"ws_active",agentId:"agt_active"}};
-    f.store.approveLocal(pairing.pendingId,{...f.contract,scope:[f.root],operations:["cutover_start" as const],cutover});
+    const approved=f.store.approveLocal(pairing.pendingId,{...f.contract,scope:[f.root],operations:["cutover_start" as const],cutover});
     f.store.redeem(context,pairing.credential);
     const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
     const manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
     try {
-      f.store.prepareEffect(context,planCutoverStart(f.root,cutover).subject);
+      const acquired=f.store.prepareEffect(context,planCutoverStart(f.root,cutover).subject);
       const start=manager.startCutover(cutover,context),id=start.receipt!.cutoverId as string;
       const replacement={serverInstanceId:"replacement",...cutover.expectedIdentity};
       const witness={workspaceQueryable:true,agentQueryable:true,agentReconciled:true,witnessWorkspaceId:cutover.finish.workspaceId,witnessAgentId:cutover.finish.agentId};
@@ -210,6 +210,31 @@ test("active coordination-bound prepared cutover can terminally reconcile an exa
       assert.equal(closed.restartRequest,undefined);
       assert.equal(f.store.ownership.get(closed.coordinationBinding!.leaseId)?.operationHandle,undefined);
       assert.equal(manager.store.getByOperationId(start.operationId)?.receipt?.lifecycleTerminal,true);
+      const terminalHash=cutoverTerminalRecordHash(closed);
+      const terminalLease=f.store.ownership.get(acquired.leaseId)!;
+      assert.equal(terminalLease.operationState,"finished");
+      assert.equal(terminalLease.terminalState,undefined);
+      const revoked=f.store.revokeLocal(approved.id,1);
+      assert.equal(revoked.version,2);
+      const terminalOperation=manager.store.getByOperationId(start.operationId)!;
+      const exactReceipt=terminalOperation.receipt!;
+      const lifecycleAction=exactReceipt.lifecycleAction as {currentIdentity:typeof replacement};
+      f.db.sqlite.prepare("update durable_operations set receipt_json=? where operation_id=?").run(JSON.stringify({
+        ...exactReceipt,lifecycleAction:{...lifecycleAction,currentIdentity:{...replacement,serverInstanceId:"wrong-replacement"}},
+      }),start.operationId);
+      assert.throws(()=>f.store.releaseClosedCutoverLeaseLocal({
+        cutoverId:id,leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version,
+        carrierId:approved.id,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash,confirmCutoverId:id,
+      }),/positive-witness prepared replacement/i);
+      f.db.sqlite.prepare("update durable_operations set receipt_json=? where operation_id=?").run(JSON.stringify(exactReceipt),start.operationId);
+      const released=f.store.releaseClosedCutoverLeaseLocal({
+        cutoverId:id,leaseId:acquired.leaseId,expectedLeaseVersion:terminalLease.version,
+        carrierId:approved.id,expectedCarrierVersion:2,expectedTerminalRecordHash:terminalHash,confirmCutoverId:id,
+      });
+      assert.equal(released.replayed,false);
+      assert.equal(released.lease.terminalState,"released");
+      assert.equal(released.lease.operationState,"finished");
+      assert.equal(released.lease.operationHandle,undefined);
     } finally {manager.close();}
   } finally {f.close();}
 });
