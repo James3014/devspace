@@ -1985,6 +1985,7 @@ test("repository write and shell sink families reject an unbound caller before e
       workspaceId,
       profile: "mutator",
       prompt: "must not launch without Core binding",
+      attemptKey: "core-unbound-agent-start",
       executionContract: { writePaths: ["AGENTS.md"] },
     },
     _meta: conversation,
@@ -2353,6 +2354,10 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
   assert.ok(startProps.effort, "agent_start must advertise direct effort selection");
   assert.ok(!(startTool.inputSchema.required as string[] | undefined)?.includes("profile"), "profile must be optional for direct dispatch");
   assert.ok(startProps.attemptKey);
+  assert.ok(
+    (startTool.inputSchema.required as string[] | undefined)?.includes("attemptKey"),
+    "agent_start must require a physical replay identity before any provider side effect",
+  );
 
   const continueProps = continueTool.inputSchema.properties as Record<string, any>;
   assert.equal(continueProps.workspaceRoot, undefined);
@@ -2398,16 +2403,17 @@ test("subagents enabled: agent tools are present and functional", async (t) => {
       provider: "codex",
       model: "gpt-test",
       prompt: "invalid selector",
+      attemptKey: "invalid-selector-attempt",
     },
   });
   assert.equal(invalidSelector.isError, true);
   assert.match(responseText(invalidSelector), /either profile|both provider and model/i);
 
   for (const arguments_ of [
-    { workspaceId, prompt: "missing selector" },
-    { workspaceId, provider: "codex", prompt: "missing model" },
-    { workspaceId, profile: "reviewer", effort: "high", prompt: "profile effort mismatch" },
-    { workspaceId, provider: "codex", model: "", prompt: "empty model" },
+    { workspaceId, prompt: "missing selector", attemptKey: "missing-selector-attempt" },
+    { workspaceId, provider: "codex", prompt: "missing model", attemptKey: "missing-model-attempt" },
+    { workspaceId, profile: "reviewer", effort: "high", prompt: "profile effort mismatch", attemptKey: "profile-effort-attempt" },
+    { workspaceId, provider: "codex", model: "", prompt: "empty model", attemptKey: "empty-model-attempt" },
   ]) {
     const rejected = await context.client.callTool({ name: "agent_start", arguments: arguments_ });
     assert.equal(rejected.isError, true);
@@ -2594,7 +2600,7 @@ test("subagents: legacy durable session without execution generation does not si
   const workspaceId = structuredContent(opened).workspaceId as string;
   const start = await context.client.callTool({
     name: "agent_start",
-    arguments: { workspaceId, profile: "reviewer", prompt: "legacy simulation" },
+    arguments: { workspaceId, profile: "reviewer", prompt: "legacy simulation", attemptKey: "legacy-generation-start" },
   });
   const agentId = structuredContent(start).agentId as string;
 
@@ -2642,6 +2648,7 @@ test("subagents: unknown/invalid workspaceId fails closed before durable-agent a
       workspaceId: invalidWorkspaceId,
       profile: "reviewer",
       prompt: "fail prompt",
+      attemptKey: "invalid-workspace-start",
     },
   });
   assert.equal(startRes.isError, true);
@@ -2928,6 +2935,7 @@ test("subagents: agent_start executionContract expectedHead mismatch fails close
       workspaceId,
       profile: "reviewer",
       prompt: "work",
+      attemptKey: "expected-head-stale",
       executionContract: { expectedHead: "a".repeat(40), writePaths: ["src"] },
     },
   });
@@ -2941,6 +2949,7 @@ test("subagents: agent_start executionContract expectedHead mismatch fails close
       workspaceId,
       profile: "reviewer",
       prompt: "work",
+      attemptKey: "expected-head-current",
       executionContract: { expectedHead: head.stdout.trim(), writePaths: ["src"] },
     },
   });
@@ -2955,7 +2964,7 @@ test("subagents: agent_reconcile reports physical diff as candidate evidence", a
 
   const startResult = await context.client.callTool({
     name: "agent_start",
-    arguments: { workspaceId, profile: "reviewer", prompt: "do work" },
+    arguments: { workspaceId, profile: "reviewer", prompt: "do work", attemptKey: "reconcile-physical-diff" },
   });
   const agentId = (structuredContent(startResult) as Record<string, unknown>).agentId as string;
 
@@ -3840,6 +3849,7 @@ test("agent_start MCP transports durable tool authority and projection into the 
       workspaceId,
       profile: "reviewer",
       prompt: "transport the bounded tool projection",
+      attemptKey: "tool-projection-start",
       executionContract: {
         authorityMode: "OWNER_DIRECT",
         authorizedToolCeiling: ["workspace.search_text", "workspace.read"],
@@ -3884,6 +3894,7 @@ test("agent_start MCP transports durable tool authority and projection into the 
       workspaceId,
       profile: "reviewer",
       prompt: "reject provider-native tool id",
+      attemptKey: "provider-native-tool-reject",
       executionContract: {
         authorizedToolCeiling: ["codex.shell"],
       },
@@ -3905,7 +3916,7 @@ test("direct agent selectors reject disabled providers before preflight", async 
   assert.match(responseText(result), /provider 'claude' is disabled/i);
   const start = await context.client.callTool({
     name: "agent_start",
-    arguments: { workspaceId, provider: "claude", model: "claude-test", prompt: "must be rejected" },
+    arguments: { workspaceId, provider: "claude", model: "claude-test", prompt: "must be rejected", attemptKey: "disabled-provider-start" },
   });
   assert.equal(start.isError, true);
   assert.match(responseText(start), /provider 'claude' is disabled/i);
@@ -4318,8 +4329,11 @@ test("command_status metadata annotations and minimal mode visibility", async (t
   const toolsList = await context.client.listTools();
   const toolNames = toolsList.tools.map((t) => t.name);
 
-  // command_status is visible in minimal mode for read-only reconciliation
+  // command_status and native read-only discovery are visible in minimal mode.
   assert.ok(toolNames.includes("command_status"), "command_status should be visible in minimal mode");
+  assert.ok(toolNames.includes("grep"), "grep should be visible in minimal mode");
+  assert.ok(toolNames.includes("glob"), "glob should be visible in minimal mode");
+  assert.ok(toolNames.includes("ls"), "ls should be visible in minimal mode");
 
   // exec_command and write_stdin remain hidden in minimal mode
   assert.ok(!toolNames.includes("exec_command"), "exec_command must stay hidden in minimal mode");

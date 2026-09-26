@@ -456,9 +456,7 @@ function serverInstructions(config: ServerConfig): string {
     return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}${agentToolsInstruction}${gitCandidatesInstruction}${codexGoalsInstruction}${repositoryIntelligenceInstruction}`;
   }
 
-  const inspection = config.toolMode !== "full"
-    ? `In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use ${toolNames.shell} with command-line tools such as grep, rg, find, ls, and tree for search and directory inspection. `
-    : `Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. `;
+  const inspection = `Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for bounded read-only file inspection. Use ${toolNames.shell} only when shell semantics are actually needed. `;
 
   const skills = config.skillsEnabled
     ? `When ${toolNames.openWorkspace} returns available skills and a task matches a skill, use ${toolNames.read} to read that skill's path before proceeding. Skill paths may be outside the workspace, but ${toolNames.read} only permits advertised SKILL.md files and files under already-loaded skill directories. `
@@ -2803,8 +2801,8 @@ function createAgentStartInputSchema() {
     workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
     ...selectorShape.shape,
     prompt: z.string().describe("Task prompt for the agent."),
-    attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/).optional().describe(
-      "Optional physical-workspace-scoped replay identity. Exact request replays reuse one durable agent; conflicting reuse fails closed.",
+    attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/).describe(
+      "Required physical-workspace-scoped replay identity. Exact request replays reuse one durable agent; conflicting reuse fails closed.",
     ),
     executionContract,
   };
@@ -4619,7 +4617,7 @@ export function createMcpServer(
     );
   }
 
-  if (config.toolMode === "full") {
+  if (config.toolMode !== "codex") {
     registerAppTool(
       server,
       toolNames.grep,
@@ -4644,13 +4642,14 @@ export function createMcpServer(
         ...toolWidgetDescriptorMeta(config, "search"),
         annotations: { readOnlyHint: true },
       },
-      async ({ workspaceId, ...input }) => {
+      async ({ workspaceId, ...input }, extra) => {
         const startedAt = performance.now();
         const workspace = workspaces.getWorkspace(workspaceId);
         if (input.path) workspaces.resolvePath(workspace, input.path);
         const response = await grepFilesTool(input, {
           cwd: workspace.root,
           root: workspace.root,
+          signal: extra.signal,
         });
 
         if (response.isError) {
@@ -4714,13 +4713,14 @@ export function createMcpServer(
         ...toolWidgetDescriptorMeta(config, "search"),
         annotations: { readOnlyHint: true },
       },
-      async ({ workspaceId, ...input }) => {
+      async ({ workspaceId, ...input }, extra) => {
         const startedAt = performance.now();
         const workspace = workspaces.getWorkspace(workspaceId);
         if (input.path) workspaces.resolvePath(workspace, input.path);
         const response = await findFilesTool(input, {
           cwd: workspace.root,
           root: workspace.root,
+          signal: extra.signal,
         });
 
         if (response.isError) {
@@ -4784,13 +4784,14 @@ export function createMcpServer(
         ...toolWidgetDescriptorMeta(config, "directory"),
         annotations: { readOnlyHint: true },
       },
-      async ({ workspaceId, ...input }) => {
+      async ({ workspaceId, ...input }, extra) => {
         const startedAt = performance.now();
         const workspace = workspaces.getWorkspace(workspaceId);
         workspaces.resolvePath(workspace, input.path);
         const response = await listDirectoryTool(input, {
           cwd: workspace.root,
           root: workspace.root,
+          signal: extra.signal,
         });
 
         if (response.isError) {
