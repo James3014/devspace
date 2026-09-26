@@ -29,7 +29,10 @@ interface ToolContext {
   cwd: string;
   root: string;
   readRoots?: string[];
+  signal?: AbortSignal;
 }
+
+const DISCOVERY_TIMEOUT_MS = 10_000;
 
 function toMcpContent(result: AgentToolResult<unknown>): McpContent[] {
   return result.content.map((content) => {
@@ -48,6 +51,36 @@ function toMcpContent(result: AgentToolResult<unknown>): McpContent[] {
 function formatToolError(error: unknown): McpContent[] {
   const message = error instanceof Error ? error.message : String(error);
   return [{ type: "text", text: message }];
+}
+
+function discoveryAbortContent(signal: AbortSignal): McpContent[] | undefined {
+  if (!signal.aborted) return undefined;
+  const reason = signal.reason;
+  const name = reason instanceof Error ? reason.name : "";
+  const message = reason instanceof Error ? reason.message : String(reason ?? "aborted");
+  const code = name === "TimeoutError" ? "DISCOVERY_TIMEOUT" : "DISCOVERY_CANCELLED";
+  return [{ type: "text", text: `[${code}] Read-only discovery stopped: ${message}` }];
+}
+
+async function runDiscoveryTool<TInput, TDetails = unknown>(
+  execute: (input: TInput, signal: AbortSignal) => Promise<AgentToolResult<TDetails>>,
+  input: TInput,
+  context: ToolContext,
+): Promise<ToolResponse<TDetails>> {
+  const timeoutSignal = AbortSignal.timeout(DISCOVERY_TIMEOUT_MS);
+  const signal = context.signal ? AbortSignal.any([context.signal, timeoutSignal]) : timeoutSignal;
+  const alreadyAborted = discoveryAbortContent(signal);
+  if (alreadyAborted) return { content: alreadyAborted, isError: true };
+  try {
+    const result = await execute(input, signal);
+    return {
+      content: toMcpContent(result),
+      details: result.details,
+    };
+  } catch (error) {
+    const aborted = discoveryAbortContent(signal);
+    return { content: aborted ?? formatToolError(error), isError: true };
+  }
 }
 
 async function runTool<TInput, TDetails = unknown>(
@@ -101,21 +134,21 @@ export async function grepFilesTool(input: GrepToolInput, context: ToolContext):
   if (input.path) resolveAllowedPath(input.path, context.cwd, [context.root]);
   const tool = createGrepTool(context.cwd);
 
-  return runTool((params) => tool.execute("grep_files", params), input, context);
+  return runDiscoveryTool((params, signal) => tool.execute("grep_files", params, signal), input, context);
 }
 
 export async function findFilesTool(input: FindToolInput, context: ToolContext): Promise<ToolResponse> {
   if (input.path) resolveAllowedPath(input.path, context.cwd, [context.root]);
   const tool = createFindTool(context.cwd);
 
-  return runTool((params) => tool.execute("find_files", params), input, context);
+  return runDiscoveryTool((params, signal) => tool.execute("find_files", params, signal), input, context);
 }
 
 export async function listDirectoryTool(input: LsToolInput, context: ToolContext): Promise<ToolResponse> {
   if (input.path) resolveAllowedPath(input.path, context.cwd, [context.root]);
   const tool = createLsTool(context.cwd);
 
-  return runTool((params) => tool.execute("list_directory", params), input, context);
+  return runDiscoveryTool((params, signal) => tool.execute("list_directory", params, signal), input, context);
 }
 
 export async function runShellTool(input: BashToolInput, context: ToolContext): Promise<ToolResponse> {
