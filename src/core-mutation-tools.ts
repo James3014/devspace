@@ -524,14 +524,14 @@ export function registerCoreMutationSessionTools(
     },
   );
 
-  if (options.recoveryOwnerClientId && inspectWriterDomain) {
+  if (inspectWriterDomain) {
     registerAppTool(
       server,
       "core_mutation_session_recover_orphaned_process",
       {
         title: "Recover orphaned Core PROCESS writer",
         description:
-          "Owner-only administrative recovery for one exact ACTIVE Core session whose original caller identity is unavailable and whose PROCESS writer is OUTCOME_UNKNOWN. Revalidates exact physical Git evidence, refuses live writers, clears only the PROCESS writer pin, preserves the original actor/session/worktree, and grants no retry, Candidate, mutation, completion, integration, merge, or release authority.",
+          "Owner-only administrative recovery for one exact ACTIVE Core session whose original caller identity is unavailable and whose PROCESS writer is OUTCOME_UNKNOWN. The tool remains projected even when owner recovery is disabled so the MCP catalog/schema stays stable; invocation fails closed unless the exact owner client is configured and authenticated. Revalidates exact physical Git evidence, refuses live writers, clears only the PROCESS writer pin, preserves the original actor/session/worktree, and grants no retry, Candidate, mutation, completion, integration, merge, or release authority.",
         inputSchema: {
           workspaceId: z.string(),
           sessionId: z.string(),

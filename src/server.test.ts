@@ -1974,15 +1974,23 @@ test("direct_candidate_execution_evidence tool produces valid evidence through h
   assert.doesNotThrow(() => validateDirectCandidateExecutionEvidence(content));
 });
 
-test("Core orphan PROCESS recovery tool is opt-in and exact-owner-client fenced", async (t) => {
+test("Core orphan PROCESS recovery tool keeps a stable catalog and exact-owner-client fence", async (t) => {
   const disabled = await fixture(t, { coreMutation: true });
   const disabledTools = await disabled.client.listTools();
-  assert.equal(disabledTools.tools.some((tool) => tool.name === "core_mutation_session_recover_orphaned_process"), false);
+  assert.equal(disabledTools.tools.some((tool) => tool.name === "core_mutation_session_recover_orphaned_process"), true);
+  assert.throws(
+    () => assertCoreMutationRecoveryOwnerClient({}, undefined),
+    /CORE_MUTATION_RECOVERY_DISABLED/,
+  );
 
   const ownerClientId = "devspace-core-recovery-owner";
   const enabled = await fixture(t, { coreMutation: true, coreMutationRecoveryOwnerClientId: ownerClientId });
   const enabledTools = await enabled.client.listTools();
   assert.equal(enabledTools.tools.some((tool) => tool.name === "core_mutation_session_recover_orphaned_process"), true);
+  assert.deepEqual(
+    disabledTools.tools.map((tool) => tool.name).sort(),
+    enabledTools.tools.map((tool) => tool.name).sort(),
+  );
 
   assert.throws(
     () => assertCoreMutationRecoveryOwnerClient({}, ownerClientId),
