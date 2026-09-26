@@ -5,7 +5,13 @@ import { resolve, normalize } from "node:path";
 import { createHash } from "node:crypto";
 import { createOpencodeClient } from "@opencode-ai/sdk/v2";
 import type { LocalAgentStore, ExternalRuntimeLaunchFence, LocalAgentRecord } from "./local-agent-store.js";
-import { hashDispatchIntent, type ToolIntentId } from "./execution-protocol.js";
+import {
+  hashDispatchIntent,
+  hashToolProjectionManifest,
+  type ToolIntentId,
+  type ToolProjectionManifest,
+  TOOL_INTENT_IDS,
+} from "./execution-protocol.js";
 import {
   allocateOpencodeLoopbackPort,
   opencodeAgentConfig,
@@ -13,6 +19,11 @@ import {
 } from "./local-agent-opencode.js";
 import { AgentProviderFailureError } from "./local-agent-errors.js";
 import { canonicalizePath } from "./roots.js";
+import {
+  type ToolExposureReceipt,
+  buildToolExposureReceipt,
+  ToolExposureWidenedError,
+} from "./local-effect-enforcement.js";
 
 export const HERDR_DEFAULT_SOCKET_PATH = process.env.HERDR_SOCKET_PATH || "/Users/james/.config/herdr/herdr.sock";
 export const HERDR_RUNTIME_KIND = "HERDR" as const;
@@ -102,6 +113,7 @@ export interface HerdrExternalHandle {
   dispatchIntentHash: string;
   launchTimestamp: string;
   enforcementState: HerdrEnforcementState;
+  toolExposureReceipt?: ToolExposureReceipt;
 }
 
 export interface NormalizedHerdrHandleAuthority {
@@ -131,6 +143,7 @@ export interface NormalizedHerdrHandleAuthority {
   dispatchIntentHash: string;
   launchTimestamp: string;
   enforcementState: string;
+  toolExposureHash: string | null;
 }
 
 export function normalizeHerdrHandleAuthority(handle: HerdrExternalHandle): NormalizedHerdrHandleAuthority {
@@ -161,6 +174,7 @@ export function normalizeHerdrHandleAuthority(handle: HerdrExternalHandle): Norm
     dispatchIntentHash: handle.dispatchIntentHash,
     launchTimestamp: handle.launchTimestamp,
     enforcementState: handle.enforcementState,
+    toolExposureHash: handle.toolExposureReceipt?.exposure_hash ?? null,
   };
 }
 
@@ -200,6 +214,12 @@ export interface StartHerdrAgentParams {
   requestedCliProviderId?: "cline" | "cline-pass";
   writeMode?: "read_only" | "allowed";
   selectedToolIntents?: ToolIntentId[];
+  dispatchIntent?: { taskId: string; attemptId: string };
+  toolProjectionManifest?: {
+    candidateTools: ToolIntentId[];
+    selectedTools: ToolIntentId[];
+  };
+  plannerDecisionHash?: string;
   socketPath?: string;
   store?: LocalAgentStore;
 }
@@ -281,6 +301,141 @@ export function buildHerdrWorkspaceEnv(
       },
     }),
   };
+}
+
+/**
+ * Extracts physically exposed tools by inspecting the generated OPENCODE_CONFIG_CONTENT JSON.
+ * Returns only tools where permission is 'allow' within the active writeMode agent config.
+ */
+export function extractActualExposedToolsFromOpencodeConfig(
+  workspaceEnv: Record<string, string> | undefined,
+  writeMode?: "read_only" | "allowed",
+): string[] {
+  if (!workspaceEnv?.OPENCODE_CONFIG_CONTENT) return [];
+  try {
+    const parsed = JSON.parse(workspaceEnv.OPENCODE_CONFIG_CONTENT);
+    const agentConfigName = writeMode === "read_only" ? "devspace_read_only" : "devspace_allowed";
+    const perms = parsed?.agent?.[agentConfigName]?.permission;
+    if (!perms || typeof perms !== "object") return [];
+    const validNames = ["bash", "edit", "glob", "grep", "list", "read"];
+    const exposed: string[] = [];
+    for (const [tool, perm] of Object.entries(perms)) {
+      if (validNames.includes(tool) && perm === "allow") {
+        exposed.push(tool);
+      }
+    }
+    return exposed.sort();
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Builds the canonical HerdR tool exposure receipt for an agent launch.
+ */
+export function buildHerdrToolExposureReceipt(input: {
+  agentKind: string;
+  attemptKey: string;
+  dispatchIntent?: { taskId: string; attemptId: string };
+  dispatchIntentHash: string;
+  toolProjectionManifest?: {
+    candidateTools: ToolIntentId[];
+    selectedTools: ToolIntentId[];
+  };
+  selectedToolIntents?: ToolIntentId[];
+  writeMode?: "read_only" | "allowed";
+  plannerDecisionHash?: string;
+  workspaceEnv?: Record<string, string>;
+}): ToolExposureReceipt {
+  const {
+    agentKind,
+    attemptKey,
+    dispatchIntent,
+    dispatchIntentHash,
+    toolProjectionManifest,
+    selectedToolIntents,
+    writeMode,
+    plannerDecisionHash,
+    workspaceEnv,
+  } = input;
+
+  const operationId = dispatchIntent?.taskId ?? attemptKey;
+  const attemptId = dispatchIntent?.attemptId ?? attemptKey;
+  const effectivePlannerDecisionHash = plannerDecisionHash ?? "0".repeat(64);
+
+  // Projection hash: use canonical hashToolProjectionManifest if manifest present
+  let projectionHash: string;
+  if (toolProjectionManifest) {
+    projectionHash = hashToolProjectionManifest(toolProjectionManifest as ToolProjectionManifest);
+  } else {
+    projectionHash = createHash("sha256")
+      .update(JSON.stringify({ attemptKey, selectedToolIntents: selectedToolIntents ?? [] }))
+      .digest("hex");
+  }
+
+  // Derive candidate and selected tool lists
+  let candidateTools: string[];
+  let selectedTools: string[];
+
+  if (toolProjectionManifest) {
+    candidateTools = Array.from(new Set(toolProjectionManifest.candidateTools)).sort();
+    selectedTools = Array.from(new Set(toolProjectionManifest.selectedTools)).sort();
+  } else if (selectedToolIntents) {
+    candidateTools = Array.from(new Set(TOOL_INTENT_IDS)).sort();
+    selectedTools = Array.from(new Set(selectedToolIntents)).sort();
+  } else {
+    candidateTools = Array.from(new Set(TOOL_INTENT_IDS)).sort();
+    selectedTools = Array.from(new Set(TOOL_INTENT_IDS)).sort();
+  }
+
+  if (agentKind === "opencode") {
+    const physicalCandidates = ["bash", "edit", "glob", "grep", "list", "read"];
+    const env = workspaceEnv ?? buildHerdrWorkspaceEnv({
+      agentKind: "opencode",
+      writeMode: "allowed",
+      selectedToolIntents: selectedToolIntents ?? toolProjectionManifest?.selectedTools,
+    });
+    // Physical selected tools (all allowed tools under writeMode=allowed)
+    const physicalSelected = extractActualExposedToolsFromOpencodeConfig(env, "allowed")
+      .filter((t) => physicalCandidates.includes(t));
+
+    // Actual exposed tools (respecting current writeMode)
+    const actualEnv = workspaceEnv ?? buildHerdrWorkspaceEnv({
+      agentKind: "opencode",
+      writeMode,
+      selectedToolIntents: selectedToolIntents ?? toolProjectionManifest?.selectedTools,
+    });
+    const actualExposed = extractActualExposedToolsFromOpencodeConfig(actualEnv, writeMode)
+      .filter((t) => physicalSelected.includes(t));
+
+    return buildToolExposureReceipt({
+      operation_id: operationId,
+      attempt_id: attemptId,
+      provider: agentKind,
+      backend_id: "herdr",
+      planner_decision_hash: effectivePlannerDecisionHash,
+      projection_hash: projectionHash,
+      enforcement_mode: "ENFORCED_MANAGED_BRIDGE",
+      candidate_tools: physicalCandidates,
+      selected_tools: physicalSelected,
+      actual_exposed_tools: actualExposed,
+    });
+  }
+
+  // Unsupported or CLI providers (agy, codex, grok, cline)
+  // Fail closed as REQUEST_ONLY_NOT_ENFORCED with actual_exposed_tools = []
+  return buildToolExposureReceipt({
+    operation_id: operationId,
+    attempt_id: attemptId,
+    provider: agentKind,
+    backend_id: "herdr",
+    planner_decision_hash: effectivePlannerDecisionHash,
+    projection_hash: projectionHash,
+    enforcement_mode: "REQUEST_ONLY_NOT_ENFORCED",
+    candidate_tools: candidateTools,
+    selected_tools: selectedTools,
+    actual_exposed_tools: [],
+  });
 }
 
 export function parseHerdrOpencodeServerEndpoint(terminalText: string): string | undefined {
@@ -1178,6 +1333,26 @@ export class HerdrThinGateway {
         )
       : undefined;
 
+    const toolExposureReceipt = buildHerdrToolExposureReceipt({
+      agentKind: params.agentKind,
+      attemptKey: params.attemptKey,
+      dispatchIntent: params.dispatchIntent ?? (record.executionContract?.dispatchIntent ? {
+        taskId: record.executionContract.dispatchIntent.taskId,
+        attemptId: record.executionContract.dispatchIntent.attemptId,
+      } : undefined),
+      dispatchIntentHash: params.dispatchIntentHash,
+      toolProjectionManifest: params.toolProjectionManifest ?? (record.executionContract?.toolProjectionManifest ? {
+        candidateTools: record.executionContract.toolProjectionManifest.candidateTools,
+        selectedTools: record.executionContract.toolProjectionManifest.selectedTools,
+      } : undefined),
+      selectedToolIntents: params.selectedToolIntents ?? record.executionContract?.toolProjectionManifest?.selectedTools,
+      writeMode: params.writeMode ?? (record.executionContract?.writePaths?.length ? "allowed" : "read_only"),
+      plannerDecisionHash: params.plannerDecisionHash,
+      workspaceEnv: buildHerdrWorkspaceEnv(params),
+    });
+
+    const isOpencodeEnforced = params.agentKind === "opencode" && toolExposureReceipt.enforcement_mode === "ENFORCED_MANAGED_BRIDGE";
+
     // 3. Both are positively observed! Build and bind completed handle
     const handle: HerdrExternalHandle = {
       schemaVersion: 1,
@@ -1198,7 +1373,8 @@ export class HerdrThinGateway {
       attemptKey: params.attemptKey,
       dispatchIntentHash: params.dispatchIntentHash,
       launchTimestamp: launch.fencedAt,
-      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+      enforcementState: isOpencodeEnforced ? "PHYSICALLY_ENFORCED" : "REQUEST_ONLY_NOT_ENFORCED",
+      toolExposureReceipt,
     };
 
     const bindRes = store.bindExternalRuntimeBindingCAS({
@@ -1674,6 +1850,26 @@ export class HerdrThinGateway {
       );
     }
 
+    const toolExposureReceipt = buildHerdrToolExposureReceipt({
+      agentKind: params.agentKind,
+      attemptKey: params.attemptKey,
+      dispatchIntent: params.dispatchIntent ?? (record.executionContract?.dispatchIntent ? {
+        taskId: record.executionContract.dispatchIntent.taskId,
+        attemptId: record.executionContract.dispatchIntent.attemptId,
+      } : undefined),
+      dispatchIntentHash: params.dispatchIntentHash,
+      toolProjectionManifest: params.toolProjectionManifest ?? (record.executionContract?.toolProjectionManifest ? {
+        candidateTools: record.executionContract.toolProjectionManifest.candidateTools,
+        selectedTools: record.executionContract.toolProjectionManifest.selectedTools,
+      } : undefined),
+      selectedToolIntents: params.selectedToolIntents ?? record.executionContract?.toolProjectionManifest?.selectedTools,
+      writeMode: params.writeMode ?? (record.executionContract?.writePaths?.length ? "allowed" : "read_only"),
+      plannerDecisionHash: params.plannerDecisionHash,
+      workspaceEnv,
+    });
+
+    const isOpencodeEnforced = params.agentKind === "opencode" && toolExposureReceipt.enforcement_mode === "ENFORCED_MANAGED_BRIDGE";
+
     const handle: HerdrExternalHandle = {
       schemaVersion: 1,
       runtimeKind: HERDR_RUNTIME_KIND,
@@ -1694,7 +1890,8 @@ export class HerdrThinGateway {
       attemptKey: params.attemptKey,
       dispatchIntentHash: params.dispatchIntentHash,
       launchTimestamp: new Date().toISOString(),
-      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+      enforcementState: isOpencodeEnforced ? "PHYSICALLY_ENFORCED" : "REQUEST_ONLY_NOT_ENFORCED",
+      toolExposureReceipt,
     };
 
     if (effectiveStore && params.agentId) {
