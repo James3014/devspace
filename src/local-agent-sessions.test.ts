@@ -2438,12 +2438,35 @@ test("Issue #256: HerdR stale lifecycle and capacity reconciliation 5D matrix", 
         "update local_agent_sessions set status = 'running' where id = ?",
       ).run(rec.id);
 
+      mockGateway.liveAgentStatus = "running";
+      const livePreflight = await manager.preflightAgent({
+        workspaceId: "ws_mismatch",
+        workspaceRoot: repoDir,
+        isolated: false,
+        profileName: "reviewer",
+        profiles: mockProfiles,
+      });
+      assert.equal(livePreflight.capacity.localState, "EXHAUSTED");
+      assert.equal(livePreflight.capacity.liveActive, 1, "Restart-observed live HerdR session counts as liveActive");
+      assert.equal(livePreflight.capacity.unreconciledStale, 0, "Verified live HerdR session is not stale");
+
+      mockGateway.liveAgentStatus = "done";
       mockGateway.identityMismatch = true; // Pane occupied by someone else
       mockGateway.agentAbsent = true; // Expected agent is also missing: mismatch must still win fail-closed.
 
       const reclaimed = await manager.reconcileStaleHerdRSessions();
       assert.equal(reclaimed, 0, "Identity mismatch MUST NOT reclaim slot (FAIL-CLOSED)");
       assert.equal(manager.runningCount(), 1, "Slot preserved");
+
+      const stalePreflight = await manager.preflightAgent({
+        workspaceId: "ws_mismatch",
+        workspaceRoot: repoDir,
+        isolated: false,
+        profileName: "reviewer",
+        profiles: mockProfiles,
+      });
+      assert.equal(stalePreflight.capacity.liveActive, 0, "Identity mismatch clears prior live observation");
+      assert.equal(stalePreflight.capacity.unreconciledStale, 1, "Identity mismatch is reported as unreconciledStale");
 
       mockGateway.identityMismatch = false;
       mockGateway.agentAbsent = false;

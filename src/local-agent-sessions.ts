@@ -536,6 +536,7 @@ export class LocalAgentSessionManager {
   private readonly herdrGateway: HerdrThinGateway;
   private readonly herdrHandles = new Map<string, HerdrExternalHandle>();
   private readonly herdrTurnTasks = new Map<string, Promise<void>>();
+  private readonly herdrVerifiedLive = new Set<string>();
   private closed = false;
   private readonly terminationAttempts = new Map<string, Promise<boolean>>();
 
@@ -2249,7 +2250,7 @@ export class LocalAgentSessionManager {
     let unreconciledStale = 0;
     for (const record of active) {
       if (record.externalRuntimeBinding?.runtimeKind === "HERDR") {
-        if (this.herdrTurnTasks.has(record.id)) {
+        if (this.herdrTurnTasks.has(record.id) || this.herdrVerifiedLive.has(record.id)) {
           liveActive++;
         } else {
           unreconciledStale++;
@@ -2510,6 +2511,7 @@ export class LocalAgentSessionManager {
     // 1. Lost durable handle: reclaim only after exact external absence and
     // physical workspace state are both proven. Missing evidence stays fenced.
     if (!handle) {
+      this.herdrVerifiedLive.delete(agentId);
       const launch = record.externalRuntimeBinding?.launch;
       if (
         !launch ||
@@ -2576,6 +2578,7 @@ export class LocalAgentSessionManager {
 
     if (!pingOk) {
       // HerdR is unreachable -> Fail-closed: do not release capacity or assume absence
+      this.herdrVerifiedLive.delete(agentId);
       return false;
     }
 
@@ -2590,14 +2593,17 @@ export class LocalAgentSessionManager {
         herdrSocketPath: targetSocket,
       });
     } catch {
+      this.herdrVerifiedLive.delete(agentId);
       return false;
     }
 
     if (liveObs.valid && liveObs.agent) {
       if (liveObs.agent.agent_status === "running" || liveObs.agent.agent_status === "prompting") {
+        this.herdrVerifiedLive.add(agentId);
         return false;
       }
     }
+    this.herdrVerifiedLive.delete(agentId);
 
     const evidence = await this.inspectStaleHerdRReclaimEvidence(record, handle.gitHeadBefore);
     if (!evidence) return false;
