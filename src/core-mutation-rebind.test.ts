@@ -250,7 +250,7 @@ test("rebind requires normalized evidence and a different actor", async () => {
   } finally { cleanup(ws); }
 });
 
-test("migration 21 upgrades an already-migrated v20 database", () => {
+test("migrations 21 and 22 upgrade an already-migrated v20 database", () => {
   const sqlite = new Database(":memory:");
   try {
     sqlite.exec(`
@@ -265,8 +265,13 @@ test("migration 21 upgrades an already-migrated v20 database", () => {
     for (let version = 1; version <= 20; version += 1) insert.run(version, `historical-${version}`, "2026-09-24T00:00:00.000Z");
     migrateDatabase(sqlite);
     const table = sqlite.prepare("select name from sqlite_master where type='table' and name='core_mutation_session_rebinds'").get() as { name?: string } | undefined;
-    const migration = sqlite.prepare("select name from devspace_schema_migrations where version=21").get() as { name?: string } | undefined;
+    const migrations = sqlite.prepare(
+      "select version, name from devspace_schema_migrations where version in (21, 22) order by version",
+    ).all() as Array<{ version: number; name: string }>;
     assert.equal(table?.name, "core_mutation_session_rebinds");
-    assert.equal(migration?.name, "core-mutation-session-rebinds");
+    assert.deepEqual(migrations, [
+      { version: 21, name: "core-mutation-caller-rebinds" },
+      { version: 22, name: "core-mutation-session-rebinds" },
+    ]);
   } finally { sqlite.close(); }
 });

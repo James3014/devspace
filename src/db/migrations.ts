@@ -83,7 +83,8 @@ const migrations: Migration[] = [
   { version: 18, name: "chat-swarm-carrier-operations", up: migrateChatSwarmCarrierOperations },
   { version: 19, name: "core-mutation-sessions", up: migrateCoreMutationSessions },
   { version: 20, name: "local-agent-provider-continuity", up: migrateLocalAgentProviderContinuity },
-  { version: 21, name: "core-mutation-session-rebinds", up: migrateCoreMutationSessionRebinds },
+  { version: 21, name: "core-mutation-caller-rebinds", up: migrateCoreMutationCallerRebinds },
+  { version: 22, name: "core-mutation-session-rebinds", up: migrateCoreMutationSessionRebinds },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -489,6 +490,26 @@ function migrateCoreMutationSessions(sqlite: Database.Database): void {
   `);
 }
 
+function migrateCoreMutationCallerRebinds(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists core_mutation_caller_rebinds (
+      id text primary key,
+      session_id text not null references core_mutation_sessions(id) on delete cascade,
+      workspace_session_id text not null,
+      binding_hash text not null,
+      previous_actor_key text not null,
+      new_actor_key text not null,
+      previous_updated_at text not null,
+      new_updated_at text not null,
+      unresolved_effects_reconciled integer not null check (unresolved_effects_reconciled in (0, 1)),
+      candidate_lineage_preserved integer not null check (candidate_lineage_preserved in (0, 1)),
+      created_at text not null
+    );
+    create index if not exists core_mutation_caller_rebinds_session_idx
+      on core_mutation_caller_rebinds(session_id, created_at desc);
+  `);
+}
+
 function migrateCoreMutationSessionRebinds(sqlite: Database.Database): void {
   sqlite.exec(`
     create table if not exists core_mutation_session_rebinds (
@@ -505,6 +526,30 @@ function migrateCoreMutationSessionRebinds(sqlite: Database.Database): void {
       on core_mutation_session_rebinds(session_id, from_actor_key, to_actor_key, created_at desc);
     create index if not exists core_mutation_session_rebinds_session_idx
       on core_mutation_session_rebinds(session_id, created_at desc);
+  `);
+
+  const legacyExists = sqlite.prepare(
+    "select 1 from sqlite_master where type = 'table' and name = 'core_mutation_caller_rebinds' limit 1",
+  ).get();
+  if (!legacyExists) return;
+
+  sqlite.exec(`
+    insert or ignore into core_mutation_session_rebinds (
+      rebind_id, session_id, from_actor_key, to_actor_key, binding_hash, evidence, created_at
+    )
+    select
+      id,
+      session_id,
+      previous_actor_key,
+      new_actor_key,
+      binding_hash,
+      'Migrated legacy caller rebind audit; workspace_session_id=' || workspace_session_id ||
+        '; previous_updated_at=' || previous_updated_at ||
+        '; new_updated_at=' || new_updated_at ||
+        '; unresolved_effects_reconciled=' || unresolved_effects_reconciled ||
+        '; candidate_lineage_preserved=' || candidate_lineage_preserved,
+      created_at
+    from core_mutation_caller_rebinds;
   `);
 }
 
