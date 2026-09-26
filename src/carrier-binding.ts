@@ -55,6 +55,8 @@ export interface CarrierContract {
   maxDepth?: number;
   remainingDepth?: number;
 }
+const MAX_DELEGATION_LINEAGE = 32;
+const MAX_DELEGATION_DEPTH = MAX_DELEGATION_LINEAGE - 1;
 const nonempty=z.string().min(1).max(4096);
 const revision=z.string().regex(/^[a-f0-9]{40,64}$/);
 const timestamp=z.string().datetime();
@@ -1245,7 +1247,7 @@ export class CarrierBindingStore {
     return binding;
   }
   private active(id: string, seen = new Set<string>(), allowExpiredSelf = false): Binding {
-    if(seen.has(id) || seen.size>=32) deny("Invalid delegation lineage");
+    if(seen.has(id) || seen.size>=MAX_DELEGATION_LINEAGE) deny("Invalid delegation lineage");
     seen.add(id);
     const row=this.database.sqlite.prepare("select * from carrier_bindings where id=?").get(id) as BindingRow|undefined;
     if(!row || row.revoked!==0 || row.version!==1) deny("Carrier expired or revoked");
@@ -1304,10 +1306,10 @@ export class CarrierBindingStore {
       !/^[a-f0-9]{40,64}$/.test(input.baseRevision) || !Array.isArray(input.scope) || input.scope.length<1 || input.scope.length>64 ||
       !Array.isArray(input.operations) || input.operations.length<1 || input.operations.some(op=>op!=="dependency_sync" && op!=="cutover_start") ||
       !Number.isFinite(Date.parse(input.expiresAt)) || (requireFuture && Date.parse(input.expiresAt)<=this.now())) deny("Invalid or expired carrier contract");
-    if(input.maxDepth !== undefined && (!Number.isSafeInteger(input.maxDepth) || input.maxDepth < 0 || input.maxDepth > 16)) {
+    if(input.maxDepth !== undefined && (!Number.isSafeInteger(input.maxDepth) || input.maxDepth < 0 || input.maxDepth > MAX_DELEGATION_DEPTH)) {
       deny("Invalid delegation depth");
     }
-    if(input.remainingDepth !== undefined && (!Number.isSafeInteger(input.remainingDepth) || input.remainingDepth < 0 || input.remainingDepth > 16)) {
+    if(input.remainingDepth !== undefined && (!Number.isSafeInteger(input.remainingDepth) || input.remainingDepth < 0 || input.remainingDepth > MAX_DELEGATION_DEPTH)) {
       deny("Invalid remaining delegation depth");
     }
     if(input.maxDepth !== undefined && input.remainingDepth !== undefined && input.remainingDepth > input.maxDepth) {
