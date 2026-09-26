@@ -5657,7 +5657,7 @@ test("Issue #15 Wave 4B: capability convergence resolves the initialized request
     assert.match(session?.sessionSnapshot?.conversationIdentityFingerprint ?? "", /^openai:[0-9a-f]{64}$/);
     assert.ok(session?.serverGeneration?.toolNames?.includes("open_workspace"));
 
-    const stillUnprovenProjection = await post(sessionId!, {
+    const stillUnprovenProjection = await post(secondSessionId!, {
       jsonrpc: "2.0",
       id: 19,
       method: "tools/call",

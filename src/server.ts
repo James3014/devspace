@@ -6720,6 +6720,7 @@ export function createServer(
     idleTimeoutMs: config.mcpSessionIdleTimeoutMs,
     onDispose: (sessionId, transport, reason) => notifyRegistryDisposal(sessionId, transport, reason),
   });
+  const projectionRefreshCatalogByConversation = new Map<string, string>();
   const broadcastToolListChanged = async (): Promise<number> => {
     const servers = transports.getAllServers();
     let sent = 0;
@@ -7365,7 +7366,14 @@ export function createServer(
         }
         const sid = requestSessionId;
         const snapshot = transports.getSnapshot(sid);
-        if (snapshot?.projectionRefreshCatalogGeneration === latestMcpToolCatalogGeneration.value) {
+        const projectionOwner =
+          snapshot?.conversationIdentityFingerprint ??
+          snapshot?.callerIdentityFingerprint;
+        if (
+          snapshot?.projectionRefreshCatalogGeneration === latestMcpToolCatalogGeneration.value ||
+          (projectionOwner &&
+            projectionRefreshCatalogByConversation.get(projectionOwner) === latestMcpToolCatalogGeneration.value)
+        ) {
           return { notificationSent: false, alreadyAttempted: true };
         }
         const sessionServer = transports.getServer(sid);
@@ -7379,6 +7387,12 @@ export function createServer(
               ...snapshot,
               projectionRefreshCatalogGeneration: latestMcpToolCatalogGeneration.value,
             });
+          }
+          if (projectionOwner) {
+            projectionRefreshCatalogByConversation.set(
+              projectionOwner,
+              latestMcpToolCatalogGeneration.value,
+            );
           }
           return { notificationSent: true, alreadyAttempted: false };
         } catch {
