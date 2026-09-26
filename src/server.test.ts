@@ -657,6 +657,214 @@ test("checkout reuse and context suppression survive a registry restart", async 
   }
 });
 
+
+test("Issue #194 G2: conversation workspace and durable agent survive MCP transport replacement and server restart", async () => {
+  const root = await mkdtemp(join(tmpdir(), "devspace-issue194-g2-"));
+  const project = join(root, "project");
+  const stateDir = join(root, ".state");
+  const agentDir = join(root, ".agents");
+  await mkdir(project, { recursive: true });
+  await mkdir(agentDir, { recursive: true });
+  await writeFile(join(project, "AGENTS.md"), "project instructions\n");
+
+  const port = await new Promise<number>((resolvePort, reject) => {
+    const probe = createNetServer();
+    probe.listen(0, "127.0.0.1", () => {
+      const address = probe.address() as AddressInfo;
+      probe.close((error) => error ? reject(error) : resolvePort(address.port));
+    });
+    probe.once("error", reject);
+  });
+  const baseUrl = \`http://127.0.0.1:\${port}\`;
+  const mcpUrl = \`\${baseUrl}/mcp\`;
+  const accessToken = "issue194-g2-access-token";
+
+  const oauthStore = new SqliteOAuthStore(stateDir);
+  const clientsStore = new SqliteOAuthClientsStore(oauthStore, ["127.0.0.1", "localhost"]);
+  const clientRecord = clientsStore.registerClient({
+    redirect_uris: [\`\${baseUrl}/callback\`],
+    client_name: "issue194-g2-client",
+  });
+  oauthStore.saveTokenPair({
+    accessTokenHash: createHash("sha256").update(accessToken).digest("base64url"),
+    accessToken: {
+      clientId: clientRecord.client_id,
+      scopes: ["devspace"],
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      resource: mcpUrl,
+    },
+    refreshTokenHash: createHash("sha256").update("issue194-g2-refresh").digest("base64url"),
+    refreshToken: {
+      clientId: clientRecord.client_id,
+      scopes: ["devspace"],
+      expiresAt: Math.floor(Date.now() / 1000) + 3600,
+      resource: mcpUrl,
+    },
+  });
+  oauthStore.close();
+
+  const loadedConfig = loadConfig({
+    DEVSPACE_CONFIG_DIR: join(root, ".config"),
+    DEVSPACE_ALLOWED_ROOTS: root,
+    DEVSPACE_WORKTREE_ROOT: join(root, ".worktrees"),
+    DEVSPACE_AGENT_DIR: agentDir,
+    DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    DEVSPACE_PUBLIC_BASE_URL: baseUrl,
+    DEVSPACE_TOOL_MODE: "full",
+    PORT: String(port),
+  });
+  const config: ServerConfig = {
+    ...loadedConfig,
+    subagents: {
+      enabled: true,
+      providers: [{ id: "codex", enabled: true }],
+    },
+  };
+
+  const post = (sessionId: string | undefined, body: unknown) => fetch(mcpUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": \`Bearer \${accessToken}\`,
+      "Accept": "application/json, text/event-stream",
+      ...(sessionId ? { "mcp-session-id": sessionId } : {}),
+    },
+    body: JSON.stringify(body),
+  });
+  const parseMcpResponse = async (response: globalThis.Response): Promise<Record<string, any>> => {
+    const raw = await response.text();
+    const dataLine = raw.split("\n").find((line) => line.startsWith("data: "));
+    return JSON.parse(dataLine ? dataLine.slice(6) : raw) as Record<string, any>;
+  };
+  const initialize = async (id: number): Promise<string> => {
+    const response = await post(undefined, {
+      jsonrpc: "2.0",
+      id,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: \`issue194-g2-client-\${id}\`, version: "1.0.0" },
+      },
+    });
+    assert.equal(response.status, 200);
+    const sessionId = response.headers.get("mcp-session-id");
+    assert.ok(sessionId);
+    return sessionId;
+  };
+  const callTool = async (
+    sessionId: string,
+    id: number,
+    name: string,
+    args: Record<string, unknown>,
+  ): Promise<Record<string, any>> => {
+    const response = await post(sessionId, {
+      jsonrpc: "2.0",
+      id,
+      method: "tools/call",
+      params: {
+        _meta: { "openai/session": "issue194-g2-conversation" },
+        name,
+        arguments: args,
+      },
+    });
+    assert.equal(response.status, 200);
+    return parseMcpResponse(response);
+  };
+  const durableCounts = (): { workspaceSessions: number; agents: number } => {
+    const workspaceStore = new SqliteWorkspaceStore(stateDir);
+    const agentStore = new LocalAgentStore(stateDir);
+    try {
+      return {
+        workspaceSessions: workspaceStore.listSessions().length,
+        agents: agentStore.count(),
+      };
+    } finally {
+      agentStore.close();
+      workspaceStore.close();
+    }
+  };
+  const startServer = async () => {
+    const running = createServer(config);
+    const listener = running.app.listen(port, "127.0.0.1");
+    await new Promise<void>((resolveListening, reject) => {
+      listener.once("listening", () => resolveListening());
+      listener.once("error", reject);
+    });
+    return { running, listener };
+  };
+  const stopServer = async (server: Awaited<ReturnType<typeof startServer>>) => {
+    await new Promise<void>((resolveClose) => server.listener.close(() => resolveClose()));
+    await server.running.close();
+  };
+
+  let server = await startServer();
+  let serverRunning = true;
+  try {
+    const firstSession = await initialize(1);
+    const firstOpen = await callTool(firstSession, 2, "open_workspace", { path: project });
+    const firstWorkspaceId = firstOpen.result?.structuredContent?.workspaceId as string | undefined;
+    assert.ok(firstWorkspaceId);
+
+    const seedStore = new LocalAgentStore(stateDir);
+    const seeded = seedStore.create({
+      workspaceId: firstWorkspaceId,
+      workspaceRoot: project,
+      profileName: "continuity-fixture",
+      provider: "codex",
+    });
+    seedStore.update(seeded.id, {
+      status: "idle",
+      terminalReason: "completed",
+      providerContinuityState: "KNOWN_UNVERIFIED",
+      latestResponse: "continuity fixture complete",
+    });
+    seedStore.close();
+
+    const firstStatus = await callTool(firstSession, 3, "agent_status", {
+      workspaceId: firstWorkspaceId,
+      agentId: seeded.id,
+      waitMs: 0,
+    });
+    assert.equal(firstStatus.result?.structuredContent?.agentId, seeded.id);
+    assert.deepEqual(durableCounts(), { workspaceSessions: 1, agents: 1 });
+
+    // Replace only the MCP transport/session. Semantic conversation identity is unchanged.
+    const replacementSession = await initialize(4);
+    assert.notEqual(replacementSession, firstSession);
+    const replacementOpen = await callTool(replacementSession, 5, "open_workspace", { path: project });
+    assert.equal(replacementOpen.result?.structuredContent?.workspaceId, firstWorkspaceId);
+    const replacementStatus = await callTool(replacementSession, 6, "agent_status", {
+      workspaceId: firstWorkspaceId,
+      agentId: seeded.id,
+      waitMs: 0,
+    });
+    assert.equal(replacementStatus.result?.structuredContent?.agentId, seeded.id);
+    assert.deepEqual(durableCounts(), { workspaceSessions: 1, agents: 1 });
+
+    // Restart the server over the same durable state and reconnect again.
+    await stopServer(server);
+    serverRunning = false;
+    server = await startServer();
+    serverRunning = true;
+
+    const restartedSession = await initialize(7);
+    const restartedOpen = await callTool(restartedSession, 8, "open_workspace", { path: project });
+    assert.equal(restartedOpen.result?.structuredContent?.workspaceId, firstWorkspaceId);
+    const restartedStatus = await callTool(restartedSession, 9, "agent_status", {
+      workspaceId: firstWorkspaceId,
+      agentId: seeded.id,
+      waitMs: 0,
+    });
+    assert.equal(restartedStatus.result?.structuredContent?.agentId, seeded.id);
+    assert.deepEqual(durableCounts(), { workspaceSessions: 1, agents: 1 });
+  } finally {
+    if (serverRunning) await stopServer(server);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("late nested instructions fail closed across read/write/edit until explicitly read", async (t) => {
   const context = await fixture(t);
   const opened = await callOpen(context.client, context.project, "chat-1");
