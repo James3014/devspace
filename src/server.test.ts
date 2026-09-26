@@ -5627,6 +5627,7 @@ test("Issue #159: authenticated old session can rebind after server restart thro
       "Content-Type": "application/json",
       "Authorization": `Bearer ${token}`,
       "Accept": "application/json, text/event-stream",
+      "Connection": "close",
       "mcp-protocol-version": "2024-11-05",
       ...(sessionId ? { "mcp-session-id": sessionId } : {}),
     },
@@ -5738,6 +5739,7 @@ test("Issue #159: authenticated old session can rebind after server restart thro
       headers: {
         "Authorization": `Bearer ${accessToken}`,
         "Accept": "application/json, text/event-stream",
+        "Connection": "close",
         "mcp-protocol-version": "2024-11-05",
         "mcp-session-id": reboundSessionId,
       },
