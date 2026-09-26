@@ -56,7 +56,12 @@ import {
   DIRECT_CANDIDATE_EXECUTION_SCHEMA,
   validateDirectCandidateExecutionEvidence,
 } from "./execution-protocol.js";
-import { assertCoreMutationRecoveryOwnerClient, CORE_MUTATION_TEST_ONLY_UNTRUSTED_BYPASS } from "./core-mutation-tools.js";
+import {
+  assertCoreMutationRecoveryOwnerClient,
+  CORE_MUTATION_TEST_ONLY_UNTRUSTED_BYPASS,
+  parseCoreMutationRebindOwnerRecoveryEvidence,
+  recoverOrphanedProcessBeforeRebind,
+} from "./core-mutation-tools.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -2003,6 +2008,159 @@ test("Core orphan PROCESS recovery tool keeps a stable catalog and exact-owner-c
   const owner = assertCoreMutationRecoveryOwnerClient({ authInfo: { clientId: ownerClientId } }, ownerClientId);
   assert.equal(owner.clientId, ownerClientId);
   assert.equal(owner.recoveryActorKey, `mcp:${createHash("sha256").update(ownerClientId).digest("hex")}`);
+});
+
+test("existing rebind surface can owner-recover orphan PROCESS before caller handoff without a new tool schema", async (t) => {
+  const originalConversationScopeId = "core-rebind-owner-recovery-original";
+  const nextConversationScopeId = "core-rebind-owner-recovery-next";
+  const ownerClientId = "devspace-core-recovery-owner";
+  const context = await fixture(t, { git: true, coreMutation: true, coreMutationRecoveryOwnerClientId: ownerClientId });
+  const opened = await callOpen(context.client, context.project, originalConversationScopeId);
+  const workspaceId = structuredContent(opened).workspaceId as string;
+  const bound = await bindTestCoreSession({
+    fixture: context,
+    workspaceId,
+    workspaceRoot: context.project,
+    conversationScopeId: originalConversationScopeId,
+    allowedPaths: ["AGENTS.md"],
+  });
+  const originalActorKey = `openai:${createHash("sha256").update(originalConversationScopeId).digest("hex")}`;
+  const nextActorKey = `openai:${createHash("sha256").update(nextConversationScopeId).digest("hex")}`;
+
+  await context.coreMutationSessions!.admitEffect({
+    workspaceSessionId: workspaceId,
+    workspaceRoot: context.project,
+    workspaceMode: "checkout",
+    managed: false,
+    actorKey: originalActorKey,
+    pointer: { required: true, sessionId: bound.session.id, bindingHash: bound.session.bindingHash },
+    paths: ["AGENTS.md"],
+    pathContainment: "NOT_PROVEN",
+    writerDomain: "PROCESS",
+  });
+  writeFileSync(join(context.project, "AGENTS.md"), "# recovered then rebound\n");
+  const snapshot = await context.coreMutationSessions!.snapshot({
+    sessionId: bound.session.id,
+    workspaceSessionId: workspaceId,
+    workspaceRoot: context.project,
+    actorKey: originalActorKey,
+  });
+  const evidence = JSON.stringify({
+    schema: "devspace.core_mutation_rebind_owner_recovery.v1",
+    auditEvidence: "issue-240 existing rebind surface owner recovery",
+    orphanProcessRecovery: {
+      expectedOriginalActorKey: originalActorKey,
+      expectedSourceHead: bound.head,
+      expectedSourceTree: bound.tree,
+      expectedCurrentHead: snapshot.currentHead,
+      expectedTargetTree: snapshot.targetTree,
+      expectedDiffHash: snapshot.diffHash,
+      expectedChangedPaths: snapshot.changedPaths,
+      expectedDeletedPaths: snapshot.deletedPaths,
+    },
+  });
+  assert.ok(parseCoreMutationRebindOwnerRecoveryEvidence(evidence));
+
+  const recovered = await recoverOrphanedProcessBeforeRebind({
+    store: context.coreMutationSessions!,
+    workspaceSessionId: workspaceId,
+    workspaceRoot: context.project,
+    sessionId: bound.session.id,
+    bindingHash: bound.session.bindingHash,
+    evidence,
+    extra: { authInfo: { clientId: ownerClientId }, _meta: { "openai/session": nextConversationScopeId } },
+    recoveryOwnerClientId: ownerClientId,
+    inspectWriterDomain: () => "CLEAR",
+  });
+  assert.equal(recovered, true);
+  assert.deepEqual(context.coreMutationSessions!.getById(bound.session.id)?.writerDomains, []);
+  assert.equal(context.coreMutationSessions!.getById(bound.session.id)?.writerReconciliationState, "CLEAR");
+
+  const rebound = await context.coreMutationSessions!.rebindActor({
+    sessionId: bound.session.id,
+    workspaceSessionId: workspaceId,
+    workspaceRoot: context.project,
+    expectedActorKey: originalActorKey,
+    newActorKey: nextActorKey,
+    evidence,
+    pointer: { sessionId: bound.session.id, bindingHash: bound.session.bindingHash },
+  });
+  assert.equal(rebound.fromActorKey, originalActorKey);
+  assert.equal(rebound.toActorKey, nextActorKey);
+  assert.equal(context.coreMutationSessions!.getById(bound.session.id)?.actorKey, nextActorKey);
+});
+
+test("rebind owner recovery envelope stays fail-closed for foreign owner client and malformed envelopes", async (t) => {
+  const originalConversationScopeId = "core-rebind-owner-recovery-foreign";
+  const ownerClientId = "devspace-core-recovery-owner";
+  const context = await fixture(t, { git: true, coreMutation: true, coreMutationRecoveryOwnerClientId: ownerClientId });
+  const opened = await callOpen(context.client, context.project, originalConversationScopeId);
+  const workspaceId = structuredContent(opened).workspaceId as string;
+  const bound = await bindTestCoreSession({
+    fixture: context,
+    workspaceId,
+    workspaceRoot: context.project,
+    conversationScopeId: originalConversationScopeId,
+    allowedPaths: ["AGENTS.md"],
+  });
+  const originalActorKey = `openai:${createHash("sha256").update(originalConversationScopeId).digest("hex")}`;
+  await context.coreMutationSessions!.admitEffect({
+    workspaceSessionId: workspaceId,
+    workspaceRoot: context.project,
+    workspaceMode: "checkout",
+    managed: false,
+    actorKey: originalActorKey,
+    pointer: { required: true, sessionId: bound.session.id, bindingHash: bound.session.bindingHash },
+    paths: ["AGENTS.md"],
+    pathContainment: "NOT_PROVEN",
+    writerDomain: "PROCESS",
+  });
+  const snapshot = await context.coreMutationSessions!.snapshot({
+    sessionId: bound.session.id,
+    workspaceSessionId: workspaceId,
+    workspaceRoot: context.project,
+    actorKey: originalActorKey,
+  });
+  const evidence = JSON.stringify({
+    schema: "devspace.core_mutation_rebind_owner_recovery.v1",
+    auditEvidence: "foreign owner must fail closed",
+    orphanProcessRecovery: {
+      expectedOriginalActorKey: originalActorKey,
+      expectedSourceHead: bound.head,
+      expectedSourceTree: bound.tree,
+      expectedCurrentHead: snapshot.currentHead,
+      expectedTargetTree: snapshot.targetTree,
+      expectedDiffHash: snapshot.diffHash,
+      expectedChangedPaths: snapshot.changedPaths,
+      expectedDeletedPaths: snapshot.deletedPaths,
+    },
+  });
+
+  await assert.rejects(
+    () => recoverOrphanedProcessBeforeRebind({
+      store: context.coreMutationSessions!,
+      workspaceSessionId: workspaceId,
+      workspaceRoot: context.project,
+      sessionId: bound.session.id,
+      bindingHash: bound.session.bindingHash,
+      evidence,
+      extra: { authInfo: { clientId: "foreign-client" } },
+      recoveryOwnerClientId: ownerClientId,
+      inspectWriterDomain: () => "CLEAR",
+    }),
+    /CORE_MUTATION_RECOVERY_OWNER_REQUIRED/,
+  );
+  assert.deepEqual(context.coreMutationSessions!.getById(bound.session.id)?.writerDomains, ["PROCESS"]);
+
+  assert.throws(
+    () => parseCoreMutationRebindOwnerRecoveryEvidence(JSON.stringify({
+      schema: "devspace.core_mutation_rebind_owner_recovery.v1",
+      auditEvidence: "malformed",
+      orphanProcessRecovery: {},
+      unexpected: true,
+    })),
+    /CORE_MUTATION_REBIND_RECOVERY_EVIDENCE_INVALID/,
+  );
 });
 
 test("Core mutation snapshot tool returns the physical snapshot over MCP", async (t) => {
