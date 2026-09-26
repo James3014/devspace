@@ -214,6 +214,69 @@ test("active coordination-bound prepared cutover can terminally reconcile an exa
   } finally {f.close();}
 });
 
+test("terminal hygiene releases the exact active prepared-replacement cutover lease after root carrier revocation",async()=>{
+  const f=fixture();
+  let manager:DurableOperationManager|undefined;
+  try {
+    const context={clientId:"shared-oauth",sessionId:"prepared-replacement-terminal-hygiene"};
+    const pairing=f.store.requestPairing(context);
+    const cutover={
+      stateRoot:f.root,
+      attemptKey:"prepared-replacement-terminal-hygiene",
+      currentIdentity:{serverInstanceId:"original",sourceCommit:f.contract.baseRevision,buildId:"old",capabilityManifestSha256:"c".repeat(64)},
+      expectedIdentity:{sourceCommit:"b".repeat(40),buildId:"new",capabilityManifestSha256:"d".repeat(64)},
+      expiresAt:new Date(f.clock()+60000).toISOString(),
+      restart:{buildReady:{verifiedBy:"independent",verifiedAt:new Date(f.clock()).toISOString(),evidence:"exact package digest"},actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"},
+      finish:{workspaceId:"ws_active_cleanup",agentId:"agt_active_cleanup"},
+    };
+    const contract:CarrierContract={...f.contract,scope:[f.root],operations:["cutover_start"],cutover};
+    const approved=f.store.approveLocal(pairing.pendingId,contract);
+    f.store.redeem(context,pairing.credential);
+    const plan=planCutoverStart(f.root,cutover);
+    const acquired=f.store.prepareEffect(context,plan.subject);
+    const config=loadConfig({DEVSPACE_CONFIG_DIR:join(f.root,"config"),DEVSPACE_ALLOWED_ROOTS:f.workspace,DEVSPACE_WORKTREE_ROOT:join(f.root,"worktrees"),DEVSPACE_STATE_DIR:f.root,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",PORT:"1"});
+    manager=new DurableOperationManager(config,undefined,undefined,undefined,f.store.readers);
+    const start=manager.startCutover(cutover,context);
+    const cutoverId=start.receipt!.cutoverId as string;
+    const replacement={serverInstanceId:"replacement",...cutover.expectedIdentity};
+    const witness={workspaceQueryable:true,agentQueryable:true,agentReconciled:true,witnessWorkspaceId:cutover.finish.workspaceId,witnessAgentId:cutover.finish.agentId};
+    await manager.finishCutover(cutoverId,replacement,cutover.finish,async()=>witness,context);
+
+    const closed=new CutoverStateStore(f.root).get()!;
+    assert.equal(closed.phase,"closed");
+    assert.equal(closed.drainEvidence,undefined);
+    assert.equal(closed.restartRequest,undefined);
+    const terminalHash=cutoverTerminalRecordHash(closed);
+    const terminalLease=f.store.ownership.get(acquired.leaseId)!;
+    assert.equal(terminalLease.operationState,"finished");
+    assert.equal(terminalLease.operationHandle,undefined);
+    assert.equal(terminalLease.terminalState,undefined);
+    assert.equal(manager.store.getByOperationId(start.operationId)?.receipt?.terminalRecordHash,terminalHash);
+
+    const revoked=f.store.revokeLocal(approved.id,1);
+    assert.equal(revoked.version,2);
+    f.store.forgetSession(context.sessionId);
+
+    const released=f.store.releaseClosedCutoverLeaseLocal({
+      cutoverId,
+      leaseId:acquired.leaseId,
+      expectedLeaseVersion:terminalLease.version,
+      carrierId:approved.id,
+      expectedCarrierVersion:2,
+      expectedTerminalRecordHash:terminalHash,
+      confirmCutoverId:cutoverId,
+    });
+    assert.equal(released.replayed,false);
+    assert.equal(released.lease.terminalState,"released");
+    assert.equal(released.lease.version,terminalLease.version+1);
+    assert.equal(released.lease.operationState,"finished");
+    assert.equal(released.lease.operationHandle,undefined);
+  } finally {
+    manager?.close();
+    f.close();
+  }
+});
+
 test("expired coordination-bound prepared cutover can terminally reconcile an exact observed replacement",async()=>{
   const f=fixture();
   try {
