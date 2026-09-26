@@ -50,9 +50,10 @@ export function canonicalizePath(path: string): string {
   const missingSegments: string[] = [];
   let candidate = resolve(expandHomePath(path));
 
+  const realpathFn = typeof realpathSync.native === "function" ? realpathSync.native : realpathSync;
   while (true) {
     try {
-      return resolve(realpathSync(candidate), ...missingSegments.slice().reverse());
+      return resolve(realpathFn(candidate), ...missingSegments.slice().reverse());
     } catch (error) {
       const err = error as NodeJS.ErrnoException;
       if (!err || (err.code !== "ENOENT" && err.code !== "ENOTDIR")) {
@@ -65,4 +66,16 @@ export function canonicalizePath(path: string): string {
       candidate = parent;
     }
   }
+}
+
+export function isSameWorktreePath(a: string | undefined, b: string | undefined): boolean {
+  if (!a || !b) return a === b;
+  if (a === b) return true;
+  const ca = canonicalizePath(a);
+  const cb = canonicalizePath(b);
+  if (ca === cb) return true;
+  if (process.platform === "darwin" || process.platform === "win32") {
+    return ca.toLowerCase() === cb.toLowerCase();
+  }
+  return false;
 }

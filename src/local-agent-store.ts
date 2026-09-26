@@ -1268,6 +1268,7 @@ export class LocalAgentStore {
         current?.externalRuntimeBinding?.runtimeKind === "HERDR" &&
         !current.externalRuntimeBinding.handle &&
         (
+          current.externalRuntimeBinding.launch?.state === "FENCED" ||
           current.externalRuntimeBinding.launch?.state === "WORKSPACE_OBSERVED" ||
           current.externalRuntimeBinding.launch?.state === "AGENT_OBSERVED"
         ),

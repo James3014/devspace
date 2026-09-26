@@ -1279,6 +1279,49 @@ test("HerdrThinGateway observed-launch absence proof is exact and identity-misma
   );
 });
 
+test("HerdrThinGateway pre-agent launch absence proof covers FENCED, WORKSPACE_OBSERVED, OUTCOME_UNKNOWN", async () => {
+  const gateway = new SpyHerdrGateway("/tmp/herdr-preagent-absence.sock", new HerdrGatewayRegistry());
+  gateway.pingServer = async () => true;
+
+  const fencedLaunch = {
+    state: "FENCED",
+    launchRequestId: "HERDR-LAUNCH:issue256-fenced",
+    attemptKey: "issue256-fenced",
+    dispatchIntentHash: "a".repeat(64),
+    canonicalWorktreePath: "/tmp/issue256-worktree",
+    gitHeadBefore: "b".repeat(40),
+    agentKind: "opencode",
+    herdrSocketPath: "/tmp/herdr-preagent-absence.sock",
+    promptNonce: "nonce-issue256-fenced",
+    workspaceId: "ws-local-256",
+    plannedAgentName: "ds-planned-agent-1",
+    fencedAt: new Date().toISOString(),
+  } as any;
+
+  (gateway as any).sendRequest = async (req: HerdrSocketRequest): Promise<HerdrSocketResponse<any>> => {
+    if (req.method === "agent.get") {
+      return { id: req.id, error: { code: "agent_not_found", message: "not found" } };
+    }
+    if (req.method === "workspace.get") {
+      return { id: req.id, error: { code: "workspace_not_found", message: "not found" } };
+    }
+    throw new Error(`Unexpected request ${req.method}`);
+  };
+
+  assert.equal(await gateway.confirmPreAgentLaunchAbsent(fencedLaunch), true);
+
+  const observedWorkspaceLaunch = {
+    ...fencedLaunch,
+    state: "WORKSPACE_OBSERVED",
+    herdrWorkspaceId: "ws-preagent-1",
+    herdrPaneId: "pane-preagent-1",
+  };
+  assert.equal(await gateway.confirmPreAgentLaunchAbsent(observedWorkspaceLaunch), true);
+
+  gateway.pingServer = async () => false;
+  assert.equal(await gateway.confirmPreAgentLaunchAbsent(fencedLaunch), false);
+});
+
 test("HerdrThinGateway prompt fence negative matrix and zero external calls (C1, PF-WRONG-ATTEMPT, PF-WRONG-DISPATCH, PF-WRONG-NONCE, PF-MISSING-HANDLE, PF-MALFORMED-HANDLE, PF-WRONG-RUNTIME, PF-CONCURRENT, PF-EXACT)", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-pf-matrix-"));
   const store = new LocalAgentStore(stateDir);

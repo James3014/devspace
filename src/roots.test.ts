@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import { assertAllowedPath, canonicalizePath, expandHomePath, resolveAllowedPath } from "./roots.js";
+import { assertAllowedPath, canonicalizePath, expandHomePath, resolveAllowedPath, isSameWorktreePath } from "./roots.js";
 
 const home = homedir();
 
@@ -50,6 +50,12 @@ try {
   const missingNestedPath = join(symlinkDir, "missing", "sub", "dir");
   const expectedReconstructed = join(realpathSync(realTargetDir), "missing", "sub", "dir");
   assert.equal(canonicalizePath(missingNestedPath), expectedReconstructed);
+
+  // 2b. isSameWorktreePath handles symlinks and platform-dependent casing
+  assert.equal(isSameWorktreePath(symlinkDir, realTargetDir), true);
+  if (process.platform === "darwin" || process.platform === "win32") {
+    assert.equal(isSameWorktreePath(realTargetDir.toUpperCase(), realTargetDir.toLowerCase()), true);
+  }
 
   // 3. unexpected realpath error -> throws / fails closed
   if (process.platform !== "win32") {
