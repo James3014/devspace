@@ -1793,7 +1793,7 @@ function registerCutoverMcpTools(
                 baseSessionConvergence.serverGeneration.catalogGeneration,
               )
           : undefined;
-      const sessionConvergence =
+      let sessionConvergence =
         baseSessionConvergence &&
         baseSessionConvergence.controllerDisposition === "CURRENT" &&
         clientProjectionConvergence &&
@@ -1812,6 +1812,7 @@ function registerCutoverMcpTools(
         clientProjectionConvergence?.state === "CLIENT_PROJECTION_UNPROVEN";
       const refreshRequested = requestRefresh === true || automaticUnprovenRefresh;
       let refresh: Record<string, unknown> | undefined;
+      let projectionRefreshExhausted = false;
       if (requestRefresh !== undefined || automaticUnprovenRefresh) {
         const refreshEligible =
           refreshRequested &&
@@ -1825,6 +1826,7 @@ function registerCutoverMcpTools(
           : undefined;
         const notificationSent = refreshResult?.notificationSent ?? false;
         const alreadyAttempted = refreshResult?.alreadyAttempted ?? false;
+        projectionRefreshExhausted = refreshEligible && alreadyAttempted;
         refresh = {
           requested: requestRefresh ?? "AUTO_UNPROVEN",
           eligible: refreshEligible,
@@ -1836,6 +1838,16 @@ function registerCutoverMcpTools(
             : refreshEligible
               ? "RECONNECT_REQUIRED"
               : "NONE",
+        };
+      }
+      if (sessionConvergence && projectionRefreshExhausted) {
+        sessionConvergence = {
+          ...sessionConvergence,
+          controllerDisposition: "STALE_RECONNECT_REQUIRED",
+          reconnectRequired: true,
+          converged: false,
+          activeDrift: true,
+          details: `${sessionConvergence.details} Client projection refresh was already attempted for this conversation and catalog generation; reconnect is required.`,
         };
       }
 

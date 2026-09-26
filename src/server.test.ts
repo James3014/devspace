@@ -5676,6 +5676,14 @@ test("Issue #15 Wave 4B: capability convergence resolves the initialized request
     assert.equal(stillUnprovenPayload.result?.structuredContent?.refresh?.notificationSent, false);
     assert.equal(stillUnprovenPayload.result?.structuredContent?.refresh?.alreadyAttempted, true);
     assert.equal(stillUnprovenPayload.result?.structuredContent?.refresh?.nextAction, "RECONNECT_REQUIRED");
+    assert.equal(
+      stillUnprovenPayload.result?.structuredContent?.sessionConvergence?.controllerDisposition,
+      "STALE_RECONNECT_REQUIRED",
+    );
+    assert.equal(
+      stillUnprovenPayload.result?.structuredContent?.sessionConvergence?.reconnectRequired,
+      true,
+    );
 
     const staleProjection = await post(sessionId!, {
       jsonrpc: "2.0",
@@ -5698,7 +5706,7 @@ test("Issue #15 Wave 4B: capability convergence resolves the initialized request
     );
     assert.equal(
       staleProjectionPayload.result?.structuredContent?.sessionConvergence?.controllerDisposition,
-      "SERVER_AHEAD_OF_CLIENT",
+      "STALE_RECONNECT_REQUIRED",
     );
     assert.equal(staleProjectionPayload.result?.structuredContent?.refresh?.notificationSent, false);
     assert.equal(staleProjectionPayload.result?.structuredContent?.refresh?.alreadyAttempted, true);
