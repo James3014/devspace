@@ -98,6 +98,92 @@ export function assertCoreMutationRecoveryOwnerClient(
   };
 }
 
+const rebindOwnerRecoveryEnvelopeSchema = z.strictObject({
+  schema: z.literal("devspace.core_mutation_rebind_owner_recovery.v1"),
+  auditEvidence: z.string().min(1).max(1024),
+  orphanProcessRecovery: z.strictObject({
+    expectedOriginalActorKey: z.string().regex(/^(?:mcp|openai):[0-9a-f]{64}$/),
+    expectedSourceHead: z.string().regex(/^[0-9a-f]{40}$/),
+    expectedSourceTree: z.string().regex(/^[0-9a-f]{40}$/),
+    expectedCurrentHead: z.string().regex(/^[0-9a-f]{40}$/),
+    expectedTargetTree: z.string().regex(/^git-tree:[0-9a-f]{40}$/),
+    expectedDiffHash: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+    expectedChangedPaths: z.array(z.string().min(1)).max(100),
+    expectedDeletedPaths: z.array(z.string().min(1)).max(100),
+  }),
+});
+
+type RebindOwnerRecoveryEnvelope = z.infer<typeof rebindOwnerRecoveryEnvelopeSchema>;
+
+export function parseCoreMutationRebindOwnerRecoveryEvidence(
+  evidence: string,
+): RebindOwnerRecoveryEnvelope | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(evidence);
+  } catch {
+    return undefined;
+  }
+  if (
+    !parsed ||
+    typeof parsed !== "object" ||
+    Array.isArray(parsed) ||
+    (parsed as Record<string, unknown>).schema !== "devspace.core_mutation_rebind_owner_recovery.v1"
+  ) {
+    return undefined;
+  }
+  const result = rebindOwnerRecoveryEnvelopeSchema.safeParse(parsed);
+  if (!result.success) {
+    throw new Error(
+      "[CORE_MUTATION_REBIND_RECOVERY_EVIDENCE_INVALID] Owner recovery envelope is malformed or contains unexpected fields.",
+    );
+  }
+  return result.data;
+}
+
+export async function recoverOrphanedProcessBeforeRebind(input: {
+  store: CoreMutationSessionStore;
+  workspaceSessionId: string;
+  workspaceRoot: string;
+  sessionId: string;
+  bindingHash: string;
+  evidence: string;
+  extra: CoreMutationToolExtra;
+  recoveryOwnerClientId?: string;
+  inspectWriterDomain?: (
+    session: NonNullable<ReturnType<CoreMutationSessionStore["getById"]>>,
+    domain: CoreMutationManagedWriterDomain,
+  ) => Promise<"CLEAR" | "ACTIVE" | "UNKNOWN"> | "CLEAR" | "ACTIVE" | "UNKNOWN";
+}): Promise<boolean> {
+  const session = input.store.getById(input.sessionId);
+  const needsRecovery =
+    session?.workspaceSessionId === input.workspaceSessionId &&
+    session.status === "ACTIVE" &&
+    session.writerReconciliationState === "OUTCOME_UNKNOWN" &&
+    session.writerDomains.length === 1 &&
+    session.writerDomains[0] === "PROCESS";
+  if (!needsRecovery) return false;
+
+  const envelope = parseCoreMutationRebindOwnerRecoveryEvidence(input.evidence);
+  if (!envelope) return false;
+  if (!input.inspectWriterDomain) {
+    throw new Error(
+      "[CORE_MUTATION_RECOVERY_DISABLED] PROCESS writer inspection is unavailable on this DevSpace runtime.",
+    );
+  }
+  const owner = assertCoreMutationRecoveryOwnerClient(input.extra, input.recoveryOwnerClientId);
+  await input.store.recoverOrphanedProcessEffect({
+    sessionId: input.sessionId,
+    workspaceSessionId: input.workspaceSessionId,
+    workspaceRoot: input.workspaceRoot,
+    recoveryActorKey: owner.recoveryActorKey,
+    bindingHash: input.bindingHash,
+    evidence: envelope.orphanProcessRecovery as CoreMutationOrphanProcessRecoveryEvidence,
+    inspectProcessWriter: (record) => input.inspectWriterDomain!(record, "PROCESS"),
+  });
+  return true;
+}
+
 function controllerCallerFingerprints(extra: CoreMutationToolExtra): {
   callerIdentityFingerprint?: string;
   conversationIdentityFingerprint?: string;
@@ -496,6 +582,17 @@ export function registerCoreMutationSessionTools(
       const workspace = workspaces.getWorkspace(workspaceId);
       const newActorKey = actorKeyRequired(extra);
       try {
+        await recoverOrphanedProcessBeforeRebind({
+          store,
+          workspaceSessionId: workspaceId,
+          workspaceRoot: workspace.root,
+          sessionId,
+          bindingHash,
+          evidence,
+          extra,
+          recoveryOwnerClientId: options.recoveryOwnerClientId,
+          inspectWriterDomain,
+        });
         const rebound = await store.rebindActor({
           sessionId,
           workspaceSessionId: workspaceId,
