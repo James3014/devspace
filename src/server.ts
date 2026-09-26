@@ -160,6 +160,7 @@ import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build
 import {
   applySessionCallerRebind,
   evaluateClientProjectionConvergence,
+  unprovenClientProjectionConvergence,
   evaluateSessionConvergence,
   evaluateMultiRoleConvergence,
   type SessionGenerationSnapshot,
@@ -1669,7 +1670,7 @@ type ControllerCallerIdentity = {
 
 export function permitsCoreCallerRebindGate(
   toolName: string,
-  controllerDisposition: "CURRENT" | "SERVER_AHEAD_OF_CLIENT" | "STALE_RECONNECT_REQUIRED" | "CALLER_REBIND_REQUIRED",
+  controllerDisposition: "CURRENT" | "CLIENT_PROJECTION_UNPROVEN" | "SERVER_AHEAD_OF_CLIENT" | "STALE_RECONNECT_REQUIRED" | "CALLER_REBIND_REQUIRED",
 ): boolean {
   return toolName === "core_mutation_session_rebind" &&
     controllerDisposition === "CALLER_REBIND_REQUIRED";
@@ -1727,7 +1728,10 @@ export interface CutoverMcpControlContext {
     callerIdentityFingerprint?: string,
     conversationIdentityFingerprint?: string,
   ) => SessionConvergenceEvaluation;
-  refreshSessionTools?: (sessionId?: string) => Promise<boolean>;
+  refreshSessionTools?: (sessionId?: string) => Promise<{
+    notificationSent: boolean;
+    alreadyAttempted: boolean;
+  }>;
   multiRoleEvaluator?: () => MultiRoleDeploymentEvaluation;
   controlPlaneEvaluator?: () => ControlPlaneConvergenceEvaluation;
 }
@@ -1778,12 +1782,16 @@ function registerCutoverMcpTools(
         callerIdentity.conversationIdentityFingerprint,
       );
       const clientProjectionConvergence =
-        clientProjectionToolNames && baseSessionConvergence?.serverGeneration.toolNames
-          ? evaluateClientProjectionConvergence(
-              clientProjectionToolNames,
-              baseSessionConvergence.serverGeneration.toolNames,
-              baseSessionConvergence.serverGeneration.catalogGeneration,
-            )
+        baseSessionConvergence?.serverGeneration.toolNames
+          ? clientProjectionToolNames
+            ? evaluateClientProjectionConvergence(
+                clientProjectionToolNames,
+                baseSessionConvergence.serverGeneration.toolNames,
+                baseSessionConvergence.serverGeneration.catalogGeneration,
+              )
+            : unprovenClientProjectionConvergence(
+                baseSessionConvergence.serverGeneration.catalogGeneration,
+              )
           : undefined;
       const sessionConvergence =
         baseSessionConvergence &&
@@ -1799,23 +1807,35 @@ function registerCutoverMcpTools(
             }
           : baseSessionConvergence;
 
+      const automaticUnprovenRefresh =
+        requestRefresh === undefined &&
+        clientProjectionConvergence?.state === "CLIENT_PROJECTION_UNPROVEN";
+      const refreshRequested = requestRefresh === true || automaticUnprovenRefresh;
       let refresh: Record<string, unknown> | undefined;
-      if (requestRefresh !== undefined) {
+      if (requestRefresh !== undefined || automaticUnprovenRefresh) {
         const refreshEligible =
-          requestRefresh === true &&
+          refreshRequested &&
           baseSessionConvergence?.controllerDisposition === "CURRENT" &&
-          clientProjectionConvergence?.state === "SERVER_AHEAD_OF_CLIENT";
-        const notificationSent = refreshEligible
-          ? await control.refreshSessionTools?.(sessionId) ?? false
-          : false;
+          (
+            clientProjectionConvergence?.state === "SERVER_AHEAD_OF_CLIENT" ||
+            clientProjectionConvergence?.state === "CLIENT_PROJECTION_UNPROVEN"
+          );
+        const refreshResult = refreshEligible
+          ? await control.refreshSessionTools?.(sessionId)
+          : undefined;
+        const notificationSent = refreshResult?.notificationSent ?? false;
+        const alreadyAttempted = refreshResult?.alreadyAttempted ?? false;
         refresh = {
-          requested: requestRefresh,
+          requested: requestRefresh ?? "AUTO_UNPROVEN",
           eligible: refreshEligible,
           notificationSent,
-          sameActorPreserved: notificationSent,
+          alreadyAttempted,
+          sameActorPreserved: notificationSent || alreadyAttempted,
           nextAction: notificationSent
             ? "RELIST_TOOLS"
-            : refreshEligible ? "RECONNECT_REQUIRED" : "NONE",
+            : refreshEligible
+              ? "RECONNECT_REQUIRED"
+              : "NONE",
         };
       }
 
@@ -7339,16 +7359,30 @@ export function createServer(
       },
       refreshSessionTools: async (targetSessionId?: string) => {
         const requestSessionId = resolveRequestSessionId();
-        if (!requestSessionId) return false;
-        if (targetSessionId !== undefined && targetSessionId !== requestSessionId) return false;
+        if (!requestSessionId) return { notificationSent: false, alreadyAttempted: false };
+        if (targetSessionId !== undefined && targetSessionId !== requestSessionId) {
+          return { notificationSent: false, alreadyAttempted: false };
+        }
         const sid = requestSessionId;
+        const snapshot = transports.getSnapshot(sid);
+        if (snapshot?.projectionRefreshCatalogGeneration === latestMcpToolCatalogGeneration.value) {
+          return { notificationSent: false, alreadyAttempted: true };
+        }
         const sessionServer = transports.getServer(sid);
-        if (!sessionServer || typeof sessionServer.sendToolListChanged !== "function") return false;
+        if (!sessionServer || typeof sessionServer.sendToolListChanged !== "function") {
+          return { notificationSent: false, alreadyAttempted: false };
+        }
         try {
           await sessionServer.sendToolListChanged();
-          return true;
+          if (snapshot) {
+            transports.setSnapshot(sid, {
+              ...snapshot,
+              projectionRefreshCatalogGeneration: latestMcpToolCatalogGeneration.value,
+            });
+          }
+          return { notificationSent: true, alreadyAttempted: false };
         } catch {
-          return false;
+          return { notificationSent: false, alreadyAttempted: false };
         }
       },
       multiRoleEvaluator: () => {

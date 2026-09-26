@@ -22,14 +22,15 @@ export type SessionConvergenceState =
 
 export type SessionControllerDisposition =
   | "CURRENT"
+  | "CLIENT_PROJECTION_UNPROVEN"
   | "SERVER_AHEAD_OF_CLIENT"
   | "STALE_RECONNECT_REQUIRED"
   | "CALLER_REBIND_REQUIRED";
 
 export interface ClientProjectionConvergence {
-  state: "CURRENT" | "SERVER_AHEAD_OF_CLIENT" | "STALE_RECONNECT_REQUIRED";
+  state: "CURRENT" | "CLIENT_PROJECTION_UNPROVEN" | "SERVER_AHEAD_OF_CLIENT" | "STALE_RECONNECT_REQUIRED";
   converged: boolean;
-  clientProjectionGeneration: string;
+  clientProjectionGeneration?: string;
   serverCatalogGeneration: string;
   missingServerTools: string[];
   extraClientTools: string[];
@@ -55,6 +56,7 @@ export interface SessionGenerationSnapshot {
   freshness?: string;
   callerIdentityFingerprint?: string;
   conversationIdentityFingerprint?: string;
+  projectionRefreshCatalogGeneration?: string;
   callerRebinds?: SessionCallerRebindLedgerEntry[];
 }
 
@@ -112,6 +114,19 @@ export interface SessionConvergenceEvaluation {
   };
 }
 
+
+export function unprovenClientProjectionConvergence(
+  serverCatalogGeneration: string,
+): ClientProjectionConvergence {
+  return {
+    state: "CLIENT_PROJECTION_UNPROVEN",
+    converged: false,
+    serverCatalogGeneration,
+    missingServerTools: [],
+    extraClientTools: [],
+    details: "Client callable projection was not attested; server/session convergence alone cannot prove actionable tool convergence.",
+  };
+}
 
 export function evaluateClientProjectionConvergence(
   clientToolNames: readonly string[],

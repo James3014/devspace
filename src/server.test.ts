@@ -5642,13 +5642,40 @@ test("Issue #15 Wave 4B: capability convergence resolves the initialized request
       serverGeneration?: { serverInstanceId?: string; catalogGeneration?: string; toolNames?: string[] };
     } | undefined;
     assert.equal(session?.state, "CURRENT");
-    assert.equal(session?.controllerDisposition, "CURRENT");
-    assert.equal(session?.converged, true);
+    assert.equal(session?.controllerDisposition, "CLIENT_PROJECTION_UNPROVEN");
+    assert.equal(session?.converged, false);
+    assert.equal(
+      payload.result?.structuredContent?.clientProjectionConvergence?.state,
+      "CLIENT_PROJECTION_UNPROVEN",
+    );
+    assert.equal(payload.result?.structuredContent?.refresh?.requested, "AUTO_UNPROVEN");
+    assert.equal(payload.result?.structuredContent?.refresh?.notificationSent, true);
+    assert.equal(payload.result?.structuredContent?.refresh?.nextAction, "RELIST_TOOLS");
     assert.equal(session?.sessionSnapshot?.serverInstanceId, session?.serverGeneration?.serverInstanceId);
     assert.equal(session?.sessionSnapshot?.catalogGeneration, session?.serverGeneration?.catalogGeneration);
     assert.match(session?.sessionSnapshot?.callerIdentityFingerprint ?? "", /^mcp:[0-9a-f]{64}$/);
     assert.match(session?.sessionSnapshot?.conversationIdentityFingerprint ?? "", /^openai:[0-9a-f]{64}$/);
     assert.ok(session?.serverGeneration?.toolNames?.includes("open_workspace"));
+
+    const stillUnprovenProjection = await post(sessionId!, {
+      jsonrpc: "2.0",
+      id: 19,
+      method: "tools/call",
+      params: {
+        name: "capability_convergence_status",
+        arguments: {},
+        _meta: { "openai/session": "issue-240-caller-a" },
+      },
+    });
+    assert.equal(stillUnprovenProjection.status, 200);
+    const stillUnprovenPayload = await parseResponse(stillUnprovenProjection);
+    assert.equal(
+      stillUnprovenPayload.result?.structuredContent?.clientProjectionConvergence?.state,
+      "CLIENT_PROJECTION_UNPROVEN",
+    );
+    assert.equal(stillUnprovenPayload.result?.structuredContent?.refresh?.notificationSent, false);
+    assert.equal(stillUnprovenPayload.result?.structuredContent?.refresh?.alreadyAttempted, true);
+    assert.equal(stillUnprovenPayload.result?.structuredContent?.refresh?.nextAction, "RECONNECT_REQUIRED");
 
     const staleProjection = await post(sessionId!, {
       jsonrpc: "2.0",
@@ -5673,9 +5700,10 @@ test("Issue #15 Wave 4B: capability convergence resolves the initialized request
       staleProjectionPayload.result?.structuredContent?.sessionConvergence?.controllerDisposition,
       "SERVER_AHEAD_OF_CLIENT",
     );
-    assert.equal(staleProjectionPayload.result?.structuredContent?.refresh?.notificationSent, true);
+    assert.equal(staleProjectionPayload.result?.structuredContent?.refresh?.notificationSent, false);
+    assert.equal(staleProjectionPayload.result?.structuredContent?.refresh?.alreadyAttempted, true);
     assert.equal(staleProjectionPayload.result?.structuredContent?.refresh?.sameActorPreserved, true);
-    assert.equal(staleProjectionPayload.result?.structuredContent?.refresh?.nextAction, "RELIST_TOOLS");
+    assert.equal(staleProjectionPayload.result?.structuredContent?.refresh?.nextAction, "RECONNECT_REQUIRED");
 
     const crossSessionRefresh = await post(sessionId!, {
       jsonrpc: "2.0",
