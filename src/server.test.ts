@@ -675,14 +675,14 @@ test("Issue #194 G2: conversation workspace and durable agent survive MCP transp
     });
     probe.once("error", reject);
   });
-  const baseUrl = \`http://127.0.0.1:\${port}\`;
-  const mcpUrl = \`\${baseUrl}/mcp\`;
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const mcpUrl = `${baseUrl}/mcp`;
   const accessToken = "issue194-g2-access-token";
 
   const oauthStore = new SqliteOAuthStore(stateDir);
   const clientsStore = new SqliteOAuthClientsStore(oauthStore, ["127.0.0.1", "localhost"]);
   const clientRecord = clientsStore.registerClient({
-    redirect_uris: [\`\${baseUrl}/callback\`],
+    redirect_uris: [`${baseUrl}/callback`],
     client_name: "issue194-g2-client",
   });
   oauthStore.saveTokenPair({
@@ -726,7 +726,7 @@ test("Issue #194 G2: conversation workspace and durable agent survive MCP transp
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "Authorization": \`Bearer \${accessToken}\`,
+      "Authorization": `Bearer ${accessToken}`,
       "Accept": "application/json, text/event-stream",
       ...(sessionId ? { "mcp-session-id": sessionId } : {}),
     },
@@ -745,7 +745,7 @@ test("Issue #194 G2: conversation workspace and durable agent survive MCP transp
       params: {
         protocolVersion: "2024-11-05",
         capabilities: {},
-        clientInfo: { name: \`issue194-g2-client-\${id}\`, version: "1.0.0" },
+        clientInfo: { name: `issue194-g2-client-${id}`, version: "1.0.0" },
       },
     });
     assert.equal(response.status, 200);
