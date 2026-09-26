@@ -52,6 +52,8 @@ export interface CarrierContract {
   operations: Array<"dependency_sync" | "cutover_start">;
   expiresAt: string;
   cutover?: CarrierCutoverContract;
+  maxDepth?: number;
+  remainingDepth?: number;
 }
 const nonempty=z.string().min(1).max(4096);
 const revision=z.string().regex(/^[a-f0-9]{40,64}$/);
@@ -74,7 +76,12 @@ interface PairingRow {
   expires_at: number; binding_id: string | null;
 }
 interface Validity { version: number; expires_at: string; }
-interface Binding { row: BindingRow; contract: CarrierContract; root: BindingRow; validity: Validity; generation: string; }
+interface Binding { row: BindingRow; contract: CarrierContract; root: BindingRow; validity: Validity; generation: string; chain: string[]; }
+function contractRemainingDepth(contract: CarrierContract): number | undefined {
+  if (contract.remainingDepth !== undefined) return contract.remainingDepth;
+  if (contract.maxDepth !== undefined) return contract.maxDepth;
+  return undefined;
+}
 const subjectJson = (s: EffectSubject) => JSON.stringify({operationId:s.operationId,requestHash:s.requestHash,workspaceRoot:s.workspaceRoot,baseRevision:s.baseRevision,operation:s.operation});
 const digest = (value: string) => createHash("sha256").update(value).digest("hex");
 function deny(message = "A current paired carrier is required"): never {
@@ -169,20 +176,57 @@ export class CarrierBindingStore {
           const proof=JSON.parse(previous.evidence_json);
           const detail=JSON.parse(proof.detail??"{}");
           if(proof.ownerThread!==binding.row.id || proof.operationHandle!==subject.operationId || detail.requestHash!==subject.requestHash) return undefined;
+          let receiptAuthority = detail.authorityVersion;
+          let receiptRoot = detail.rootAuthority;
+          if (detail.detail) {
+            try {
+              const inner = typeof detail.detail === "string" ? JSON.parse(detail.detail) : detail.detail;
+              if (inner && typeof inner === "object") {
+                receiptAuthority = receiptAuthority ?? (inner as Record<string, unknown>).authorityVersion;
+                receiptRoot = receiptRoot ?? (inner as Record<string, unknown>).rootAuthority;
+              }
+            } catch {}
+          }
+          if (receiptAuthority !== undefined && receiptAuthority !== binding.generation) return undefined;
+          if (receiptRoot !== undefined && receiptRoot !== binding.root.id) return undefined;
+          if (binding.row.parent_id !== null && (!receiptAuthority || !receiptRoot)) return undefined;
           const {detail:_,...identity}=proof;
-          return {...identity,requestHash:detail.requestHash,exitCode:detail.exitCode,frozenInputsUnchanged:detail.frozenInputsUnchanged};
+          return {
+            ...identity,
+            requestHash:detail.requestHash,
+            exitCode:detail.exitCode,
+            frozenInputsUnchanged:detail.frozenInputsUnchanged,
+            ...(detail.detail !== undefined ? { detail: typeof detail.detail === "string" ? detail.detail : JSON.stringify(detail.detail) } : {}),
+          };
         }
         const witness=this.terminal(subject.operationId);
         if(!witness || witness.request_hash!==subject.requestHash || witness.lease_id!==lease.leaseId) return undefined;
         return {leaseId:lease.leaseId,ownerThread:lease.ownerThread,operationHandle:subject.operationId,operation:subject.operation,baseRevision:subject.baseRevision,leaseVersion:lease.version,
-          state:witness.exit_code===0 && witness.frozen_inputs_unchanged===1 ? "finished" : "failed",requestHash:subject.requestHash,exitCode:witness.exit_code,frozenInputsUnchanged:witness.frozen_inputs_unchanged===1};
+          state:witness.exit_code===0 && witness.frozen_inputs_unchanged===1 ? "finished" : "failed",requestHash:subject.requestHash,exitCode:witness.exit_code,frozenInputsUnchanged:witness.frozen_inputs_unchanged===1,
+          detail:JSON.stringify({authorityVersion:binding.generation,rootAuthority:binding.root.id})};
       },
       verifyDependencyReconciliation: (evidence,subject) => this.verifyTerminal(evidence,subject),
       verifyReconciliationEvidence: (evidence,lease,owner) => {
-        this.active(owner.ownerThread);
+        const binding=this.active(owner.ownerThread);
         if(evidence.operation==="cutover_start") return this.verifyCutoverTerminal(evidence,lease,owner.ownerThread);
-        let detail: {requestHash?:unknown;exitCode?:unknown;frozenInputsUnchanged?:unknown};
+        let detail: {requestHash?:unknown;exitCode?:unknown;frozenInputsUnchanged?:unknown;authorityVersion?:unknown;rootAuthority?:unknown;detail?:unknown};
         try {detail=JSON.parse(evidence.detail??"");} catch {return false;}
+        let authorityVersion = detail.authorityVersion;
+        let rootAuthority = detail.rootAuthority;
+        if(detail.detail) {
+          try {
+            const inner = typeof detail.detail === "string" ? JSON.parse(detail.detail) : detail.detail;
+            if(inner && typeof inner === "object") {
+              authorityVersion = authorityVersion ?? (inner as Record<string,unknown>).authorityVersion;
+              rootAuthority = rootAuthority ?? (inner as Record<string,unknown>).rootAuthority;
+            }
+          } catch {}
+        }
+        if(lease.grant.coordinatorThread !== binding.root.id) return false;
+        if(authorityVersion !== undefined && authorityVersion !== binding.generation) return false;
+        if(rootAuthority !== undefined && rootAuthority !== binding.root.id) return false;
+        if(binding.row.parent_id !== null && (!authorityVersion || !rootAuthority)) return false;
+
         const witness=this.terminal(evidence.operationHandle);
         return !!witness && witness.lease_id===lease.leaseId && lease.ownerThread===owner.ownerThread && evidence.operationHandle===lease.operationHandle &&
           witness.request_hash===detail.requestHash && witness.exit_code===detail.exitCode && (witness.frozen_inputs_unchanged===1)===detail.frozenInputsUnchanged &&
@@ -260,9 +304,35 @@ export class CarrierBindingStore {
     return this.database.sqlite.transaction(()=>{
       const parent=this.current(context);
       if(parent.contract.cutover || contract.cutover || contract.operations.includes("cutover_start")) deny("Cutover authority cannot be delegated");
-      if(parent.contract.role!=="controller") deny("Workers cannot delegate or promote themselves");
       const child=this.validateContract(contract);
       if(child.role!=="worker") deny("Delegation cannot create a controller");
+
+      const parentDepth = contractRemainingDepth(parent.contract);
+      if(parent.contract.role === "controller") {
+        if(parentDepth !== undefined) {
+          if(parentDepth <= 0) deny("Controller delegation depth exceeded");
+          const childDepth = contractRemainingDepth(child);
+          if(childDepth !== undefined && childDepth > parentDepth - 1) {
+            deny("Child delegation depth exceeds parent remaining depth");
+          }
+        } else {
+          const childDepth = contractRemainingDepth(child);
+          if(childDepth !== undefined && childDepth > 0) {
+            deny("Child cannot have delegation depth when parent is unbounded / has no remaining depth");
+          }
+        }
+      } else if(parent.contract.role === "worker") {
+        if(parentDepth === undefined || parentDepth <= 0) {
+          deny("Workers cannot delegate without remaining delegation depth");
+        }
+        const childDepth = contractRemainingDepth(child);
+        if(childDepth !== undefined && childDepth > parentDepth - 1) {
+          deny("Child delegation depth exceeds parent remaining depth");
+        }
+      } else {
+        deny("Unknown role cannot delegate");
+      }
+
       this.assertNarrower(parent.contract,child);
       if(Date.parse(child.expiresAt)>Date.parse(parent.validity.expires_at)) deny("Delegation exceeds current parent validity");
       return this.issue(pendingId,child,parent.row.id);
@@ -1081,7 +1151,9 @@ export class CarrierBindingStore {
   revokeDelegation(context: unknown, id: string, expectedVersion: number) {
     return this.database.sqlite.transaction(()=>{
       const parent=this.current(context), child=this.active(id);
-      if(parent.contract.role!=="controller" || child.row.parent_id!==parent.row.id) deny();
+      const isParent = child.row.parent_id === parent.row.id;
+      const isControllerAncestor = parent.contract.role === "controller" && child.root.id === parent.row.id;
+      if(!isParent && !isControllerAncestor) deny();
       return this.revoke(id,expectedVersion);
     }).immediate();
   }
@@ -1091,6 +1163,16 @@ export class CarrierBindingStore {
       const binding=this.current(context);
       this.assertSubject(binding.contract,subject);
       if(binding.contract.cutover && Date.parse(binding.contract.cutover.expiresAt)<=this.now()) deny("Cutover preparation approval expired");
+      const existingForOp = this.database.sqlite.prepare("select binding_id, subject_json, lease_id from carrier_effect_bindings where operation_id=?").all(subject.operationId) as Array<{binding_id:string;subject_json:string;lease_id:string}>;
+      for (const prior of existingForOp) {
+        if (prior.binding_id !== binding.row.id) {
+          const priorLease = this.ownership.get(prior.lease_id);
+          if (!priorLease || priorLease.terminalState === undefined || priorLease.operationHandle !== undefined || priorLease.operationState === "active") {
+            throw new ControlPlaneOwnershipError("OWNERSHIP_CONFLICT", "Operation is bound to a different delegation chain and requires reconciliation before reassignment");
+          }
+          deny("Operation was previously bound to a different delegation chain");
+        }
+      }
       const transferred=this.effectLease(binding,subject);
       if(transferred) return this.ownership.assertHeld(context,transferred.leaseId,transferred.version,subject.operation,subject.baseRevision);
       const existing=this.database.sqlite.prepare("select subject_json,lease_id from carrier_effect_bindings where binding_id=? and operation_id=?").get(binding.row.id,subject.operationId) as {subject_json:string;lease_id:string}|undefined;
@@ -1172,13 +1254,22 @@ export class CarrierBindingStore {
     const contract=this.validateContract(JSON.parse(row.contract_json) as CarrierContract,false);
     if(JSON.stringify(contract)!==row.contract_json) deny("Persisted contract is not canonical");
     if(row.parent_id) {
-      const parent=this.active(row.parent_id,seen);
-      if(parent.contract.role!=="controller" || contract.role!=="worker") deny();
+      const parent=this.active(row.parent_id,seen,false);
+      if(!["controller","worker"].includes(parent.contract.role) || contract.role!=="worker") deny("Invalid delegation role hierarchy");
+      if(parent.contract.role === "worker") {
+        const parentDepth = contractRemainingDepth(parent.contract);
+        if(parentDepth === undefined || parentDepth <= 0) deny("Worker ancestor lacks delegation authority");
+      }
       this.assertNarrower(parent.contract,contract);
       if(Date.parse(validity.expires_at)>Date.parse(parent.validity.expires_at)) deny("Child validity exceeds parent");
-      return {row,contract,root:parent.root,validity,generation:`${parent.generation}/${id}:${validity.version}`};
+      const rootContract = JSON.parse(parent.root.contract_json) as CarrierContract;
+      if(contract.repository !== rootContract.repository || contract.goal !== rootContract.goal || contract.baseRevision !== rootContract.baseRevision) {
+        deny("Delegation cross-stitching detected");
+      }
+      return {row,contract,root:parent.root,validity,generation:`${parent.generation}/${id}:${validity.version}`,chain:[...parent.chain,id]};
     }
-    return {row,contract,root:row,validity,generation:`${id}:${validity.version}`};
+    if(contract.role !== "controller") deny("Root carrier must be a controller");
+    return {row,contract,root:row,validity,generation:`${id}:${validity.version}`,chain:[id]};
   }
   private issue(pendingId: string, input: CarrierContract, parentId: string|null) {
     const contract=this.validateContract(input);
@@ -1213,10 +1304,19 @@ export class CarrierBindingStore {
       !/^[a-f0-9]{40,64}$/.test(input.baseRevision) || !Array.isArray(input.scope) || input.scope.length<1 || input.scope.length>64 ||
       !Array.isArray(input.operations) || input.operations.length<1 || input.operations.some(op=>op!=="dependency_sync" && op!=="cutover_start") ||
       !Number.isFinite(Date.parse(input.expiresAt)) || (requireFuture && Date.parse(input.expiresAt)<=this.now())) deny("Invalid or expired carrier contract");
+    if(input.maxDepth !== undefined && (!Number.isSafeInteger(input.maxDepth) || input.maxDepth < 0 || input.maxDepth > 16)) {
+      deny("Invalid delegation depth");
+    }
+    if(input.remainingDepth !== undefined && (!Number.isSafeInteger(input.remainingDepth) || input.remainingDepth < 0 || input.remainingDepth > 16)) {
+      deny("Invalid remaining delegation depth");
+    }
+    if(input.maxDepth !== undefined && input.remainingDepth !== undefined && input.remainingDepth > input.maxDepth) {
+      deny("Remaining delegation depth exceeds max depth");
+    }
     let cutover:CarrierCutoverContract|undefined;
     if(input.operations.includes("cutover_start") || input.cutover!==undefined) {
       const parsed=cutoverSchema.safeParse(input.cutover);
-      if(!parsed.success || Object.keys(input).some(key=>!["repository","goal","role","scope","baseRevision","operations","expiresAt","cutover"].includes(key))) deny("Invalid cutover approval");
+      if(!parsed.success || Object.keys(input).some(key=>!["repository","goal","role","scope","baseRevision","operations","expiresAt","cutover","maxDepth","remainingDepth"].includes(key))) deny("Invalid cutover approval");
       cutover=parsed.data;
       if(input.role!=="controller" || input.operations.length!==1 || input.operations[0]!=="cutover_start" || input.scope.length!==1 ||
         physical(cutover.stateRoot)!==physical(this.stateDir) || cutover.stateRoot!==physical(cutover.stateRoot) || physical(input.scope[0]!)!==cutover.stateRoot ||
@@ -1226,12 +1326,29 @@ export class CarrierBindingStore {
     }
     return {repository:normalizeRepositoryKey(input.repository),goal:input.goal,role:input.role,
       scope:[...new Set(input.scope.map(physical))].sort(),baseRevision:input.baseRevision,
-      operations:[...new Set(input.operations)].sort(),expiresAt:new Date(input.expiresAt).toISOString(),...(cutover?{cutover}:{})};
+      operations:[...new Set(input.operations)].sort(),expiresAt:new Date(input.expiresAt).toISOString(),
+      ...(input.maxDepth !== undefined ? { maxDepth: input.maxDepth } : {}),
+      ...(input.remainingDepth !== undefined ? { remainingDepth: input.remainingDepth } : {}),
+      ...(cutover?{cutover}:{})};
   }
   private assertNarrower(parent: CarrierContract, child: CarrierContract) {
     if(parent.repository!==child.repository || parent.goal!==child.goal || parent.baseRevision!==child.baseRevision ||
       child.operations.some(op=>!parent.operations.includes(op)) ||
       child.scope.some(path=>!parent.scope.some(root=>contains(root,path)))) deny("Delegation exceeds parent scope");
+    if(Date.parse(child.expiresAt) > Date.parse(parent.expiresAt)) {
+      deny("Child expiration exceeds parent expiration");
+    }
+    const parentDepth = contractRemainingDepth(parent);
+    const childDepth = contractRemainingDepth(child);
+    if(parent.role === "worker" && (parentDepth === undefined || parentDepth <= 0)) {
+      deny("Worker cannot have children without remaining depth");
+    }
+    if(parentDepth !== undefined && childDepth !== undefined && childDepth > parentDepth - 1) {
+      deny("Child delegation depth exceeds parent remaining depth");
+    }
+    if(parentDepth === undefined && childDepth !== undefined && childDepth > 0) {
+      deny("Child cannot widen delegation depth beyond parent");
+    }
   }
   private assertSubject(contract: CarrierContract, subject: EffectSubject) {
     if(!subject || !/^[a-f0-9]{64}$/.test(subject.requestHash) || !/^[A-Za-z0-9._:-]{1,160}$/.test(subject.operationId) ||

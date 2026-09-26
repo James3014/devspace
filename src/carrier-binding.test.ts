@@ -1617,3 +1617,428 @@ test("terminal hygiene releases only the exact normally closed cutover lease aft
     f.close();
   }
 });
+
+test("NAB-E2 Issue #287: 12 Mandatory Hostile Controls for recursive multi-hop delegation", async () => {
+  const f = fixture();
+  try {
+    const subDir = join(f.workspace, "sub");
+    mkdirSync(subDir, { recursive: true });
+
+    // -------------------------------------------------------------------------
+    // Control 1: valid Main -> Worker -> Subagent narrowed chain succeeds
+    // -------------------------------------------------------------------------
+    const rootContract: CarrierContract = {
+      repository: "James3014/devspace",
+      goal: "issue287",
+      role: "controller",
+      scope: [f.workspace],
+      baseRevision: "a".repeat(40),
+      operations: ["dependency_sync"],
+      expiresAt: new Date(f.clock() + 180000).toISOString(),
+      maxDepth: 2,
+    };
+    const rootPairing = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c1-root" });
+    const rootApproved = f.store.approveLocal(rootPairing.pendingId, rootContract);
+    f.store.redeem({ clientId: "shared-oauth", sessionId: "c1-root" }, rootPairing.credential);
+
+    // Hop 1: Controller -> Worker
+    const workerPairing = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c1-worker" });
+    const workerContract: CarrierContract = {
+      ...rootContract,
+      role: "worker",
+      maxDepth: 1,
+      expiresAt: new Date(f.clock() + 120000).toISOString(),
+    };
+    const workerApproved = f.store.delegate({ clientId: "shared-oauth", sessionId: "c1-root" }, workerPairing.pendingId, workerContract);
+    f.store.redeem({ clientId: "shared-oauth", sessionId: "c1-worker" }, workerPairing.credential);
+
+    // Hop 2: Worker -> Subagent (with narrowed scope to subDir)
+    const subagentPairing = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c1-subagent" });
+    const subagentContract: CarrierContract = {
+      ...workerContract,
+      role: "worker",
+      scope: [subDir],
+      maxDepth: 0,
+      expiresAt: new Date(f.clock() + 60000).toISOString(),
+    };
+    const subagentApproved = f.store.delegate({ clientId: "shared-oauth", sessionId: "c1-worker" }, subagentPairing.pendingId, subagentContract);
+    const subagentActive = f.store.redeem({ clientId: "shared-oauth", sessionId: "c1-subagent" }, subagentPairing.credential);
+
+    // Verify deterministic ancestry chain identity and root authority reference
+    const expectedGeneration = `${rootApproved.id}:1/${workerApproved.id}:1/${subagentApproved.id}:1`;
+    assert.equal(subagentActive.authorityVersion, expectedGeneration);
+    assert.equal(subagentActive.grant.coordinatorThread, rootApproved.id);
+
+    // Subagent executes physical effect
+    const subject1 = {
+      operationId: "c1-op-success",
+      requestHash: "1".repeat(64),
+      workspaceRoot: subDir,
+      baseRevision: rootContract.baseRevision,
+      operation: "dependency_sync" as const,
+    };
+    const lease1 = f.store.prepareEffect({ clientId: "shared-oauth", sessionId: "c1-subagent" }, subject1);
+    assert.equal(lease1.ownerThread, subagentApproved.id);
+    assert.equal(lease1.grant.coordinatorThread, rootApproved.id);
+
+    const pinned1 = f.store.ownership.beginOperation({ clientId: "shared-oauth", sessionId: "c1-subagent" }, lease1.leaseId, lease1.version, subject1.operationId);
+    f.db.sqlite.prepare("insert into dependency_terminal_witnesses values(?,?,?,?,?)")
+      .run(subject1.operationId, subject1.requestHash, lease1.leaseId, 0, 1);
+
+    const evidence1 = f.store.readers.readDependencyReconciliation?.({ clientId: "shared-oauth", sessionId: "c1-subagent" }, subject1);
+    assert.ok(evidence1);
+    assert.equal(evidence1.state, "finished");
+    assert.ok(evidence1.detail);
+    const parsedDetail1 = JSON.parse(evidence1.detail);
+    assert.equal(parsedDetail1.authorityVersion, expectedGeneration);
+    assert.equal(parsedDetail1.rootAuthority, rootApproved.id);
+
+    const { requestHash, exitCode, frozenInputsUnchanged, ...ownershipEvidence1 } = evidence1;
+    const receipt1 = f.store.ownership.reconcile(
+      { clientId: "shared-oauth", sessionId: "c1-subagent" },
+      lease1.leaseId,
+      pinned1.version,
+      {
+        ...ownershipEvidence1,
+        detail: JSON.stringify({ requestHash, exitCode, frozenInputsUnchanged, detail: evidence1.detail }),
+      },
+    );
+    assert.ok(receipt1);
+    assert.equal(receipt1.evidence.state, "finished");
+
+    const replay1 = f.store.readers.readDependencyReconciliation?.({ clientId: "shared-oauth", sessionId: "c1-subagent" }, subject1);
+    assert.ok(replay1);
+    assert.equal(replay1.exitCode, 0);
+    assert.equal(replay1.frozenInputsUnchanged, true);
+
+    // -------------------------------------------------------------------------
+    // Control 2: child action widening rejects pre-effect
+    // -------------------------------------------------------------------------
+    const c2Pairing = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c2-subagent" });
+    const c2ContractWidenedOps: CarrierContract = {
+      ...subagentContract,
+      operations: ["dependency_sync", "cutover_start"],
+    };
+    assert.throws(
+      () => f.store.delegate({ clientId: "shared-oauth", sessionId: "c1-worker" }, c2Pairing.pendingId, c2ContractWidenedOps),
+      /Delegation exceeds parent scope|Cutover authority cannot be delegated/,
+    );
+
+    // -------------------------------------------------------------------------
+    // Control 3: filesystem/scope widening rejects
+    // -------------------------------------------------------------------------
+    const c3Pairing = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c3-subagent" });
+    const c3ContractWidenedScope: CarrierContract = {
+      ...subagentContract,
+      scope: [f.root],
+    };
+    assert.throws(
+      () => f.store.delegate({ clientId: "shared-oauth", sessionId: "c1-worker" }, c3Pairing.pendingId, c3ContractWidenedScope),
+      /Delegation exceeds parent scope/,
+    );
+
+    // -------------------------------------------------------------------------
+    // Control 4: descendant merge/Owner-only authority request rejects
+    // -------------------------------------------------------------------------
+    const c4Pairing1 = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c4-subagent-1" });
+    assert.throws(
+      () => f.store.delegate({ clientId: "shared-oauth", sessionId: "c1-worker" }, c4Pairing1.pendingId, {
+        ...subagentContract,
+        role: "controller",
+      }),
+      /Delegation cannot create a controller/,
+    );
+
+    const c4Pairing2 = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c4-subagent-2" });
+    assert.throws(
+      () => f.store.delegate({ clientId: "shared-oauth", sessionId: "c1-worker" }, c4Pairing2.pendingId, {
+        ...subagentContract,
+        cutover: {
+          stateRoot: f.root,
+          attemptKey: "c4-cutover",
+          currentIdentity: { serverInstanceId: "old", sourceCommit: rootContract.baseRevision, buildId: "b1", capabilityManifestSha256: "0".repeat(64) },
+          expectedIdentity: { sourceCommit: "2".repeat(40), buildId: "b2", capabilityManifestSha256: "3".repeat(64) },
+          expiresAt: new Date(f.clock() + 30000).toISOString(),
+          restart: { buildReady: { verifiedBy: "t", verifiedAt: new Date(f.clock()).toISOString(), evidence: "e" }, actuator: "launchd-self", serviceLabel: "s", launchdTarget: "t" },
+          finish: { workspaceId: "w", agentId: "a" },
+        },
+      }),
+      /Cutover authority cannot be delegated/,
+    );
+
+    // -------------------------------------------------------------------------
+    // Control 5: ancestor revocation fences already-issued descendant
+    // -------------------------------------------------------------------------
+    const c5RootPair = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c5-root" });
+    const c5Root = f.store.approveLocal(c5RootPair.pendingId, rootContract);
+    f.store.redeem({ clientId: "shared-oauth", sessionId: "c5-root" }, c5RootPair.credential);
+
+    const c5WorkerPair = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c5-worker" });
+    const c5Worker = f.store.delegate({ clientId: "shared-oauth", sessionId: "c5-root" }, c5WorkerPair.pendingId, workerContract);
+    f.store.redeem({ clientId: "shared-oauth", sessionId: "c5-worker" }, c5WorkerPair.credential);
+
+    const c5SubPair = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c5-sub" });
+    const c5Sub = f.store.delegate({ clientId: "shared-oauth", sessionId: "c5-worker" }, c5SubPair.pendingId, subagentContract);
+    f.store.redeem({ clientId: "shared-oauth", sessionId: "c5-sub" }, c5SubPair.credential);
+
+    assert.equal(f.store.status({ clientId: "shared-oauth", sessionId: "c5-sub" }).id, c5Sub.id);
+
+    // Revoke intermediate worker
+    f.store.revokeLocal(c5Worker.id, 1);
+    assert.throws(
+      () => f.store.status({ clientId: "shared-oauth", sessionId: "c5-sub" }),
+      /Carrier expired or revoked/,
+    );
+    assert.throws(
+      () => f.store.prepareEffect({ clientId: "shared-oauth", sessionId: "c5-sub" }, {
+        operationId: "c5-op",
+        requestHash: "5".repeat(64),
+        workspaceRoot: subDir,
+        baseRevision: rootContract.baseRevision,
+        operation: "dependency_sync",
+      }),
+      /Carrier expired or revoked/,
+    );
+
+    // Revoke root in a separate chain
+    const c5bRootPair = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c5b-root" });
+    const c5bRoot = f.store.approveLocal(c5bRootPair.pendingId, rootContract);
+    f.store.redeem({ clientId: "shared-oauth", sessionId: "c5b-root" }, c5bRootPair.credential);
+
+    const c5bWorkerPair = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c5b-worker" });
+    const c5bWorker = f.store.delegate({ clientId: "shared-oauth", sessionId: "c5b-root" }, c5bWorkerPair.pendingId, workerContract);
+    f.store.redeem({ clientId: "shared-oauth", sessionId: "c5b-worker" }, c5bWorkerPair.credential);
+
+    const c5bSubPair = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c5b-sub" });
+    const c5bSub = f.store.delegate({ clientId: "shared-oauth", sessionId: "c5b-worker" }, c5bSubPair.pendingId, subagentContract);
+    f.store.redeem({ clientId: "shared-oauth", sessionId: "c5b-sub" }, c5bSubPair.credential);
+
+    f.store.revokeLocal(c5bRoot.id, 1);
+    assert.throws(
+      () => f.store.status({ clientId: "shared-oauth", sessionId: "c5b-sub" }),
+      /Carrier expired or revoked/,
+    );
+
+    // -------------------------------------------------------------------------
+    // Control 6: expired parent with apparently-valid child rejects
+    // -------------------------------------------------------------------------
+    const c6RootPair = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c6-root" });
+    const c6RootContract: CarrierContract = {
+      ...rootContract,
+      expiresAt: new Date(f.clock() + 300000).toISOString(),
+    };
+    f.store.approveLocal(c6RootPair.pendingId, c6RootContract);
+    f.store.redeem({ clientId: "shared-oauth", sessionId: "c6-root" }, c6RootPair.credential);
+
+    const c6WorkerPair = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c6-worker" });
+    const c6WorkerContract: CarrierContract = {
+      ...workerContract,
+      expiresAt: new Date(f.clock() + 40000).toISOString(),
+    };
+    const c6Worker = f.store.delegate({ clientId: "shared-oauth", sessionId: "c6-root" }, c6WorkerPair.pendingId, c6WorkerContract);
+    f.store.redeem({ clientId: "shared-oauth", sessionId: "c6-worker" }, c6WorkerPair.credential);
+
+    const c6SubPair = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c6-sub" });
+    const c6SubContract: CarrierContract = {
+      ...subagentContract,
+      expiresAt: new Date(f.clock() + 30000).toISOString(),
+    };
+    const c6Sub = f.store.delegate({ clientId: "shared-oauth", sessionId: "c6-worker" }, c6SubPair.pendingId, c6SubContract);
+    f.store.redeem({ clientId: "shared-oauth", sessionId: "c6-sub" }, c6SubPair.credential);
+
+    // Alter child validity in database to extend into future
+    f.db.sqlite.prepare("update carrier_validity set expires_at=? where carrier_id=?")
+      .run(new Date(f.clock() + 200000).toISOString(), c6Sub.id);
+
+    // Advance clock past worker expiration
+    f.advance(50000);
+    assert.throws(
+      () => f.store.status({ clientId: "shared-oauth", sessionId: "c6-sub" }),
+      /Carrier validity expired/,
+    );
+
+    // -------------------------------------------------------------------------
+    // Control 7: root-principal substitution rejects
+    // -------------------------------------------------------------------------
+    const rootBPairing = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c7-root-b" });
+    const rootBContract: CarrierContract = {
+      ...rootContract,
+      goal: "issue287-other-root",
+    };
+    const rootB = f.store.approveLocal(rootBPairing.pendingId, rootBContract);
+    f.store.redeem({ clientId: "shared-oauth", sessionId: "c7-root-b" }, rootBPairing.credential);
+
+    // Tamper child's parent_id in DB to point directly to Root B
+    f.db.sqlite.prepare("update carrier_bindings set parent_id=? where id=?")
+      .run(rootB.id, subagentApproved.id);
+
+    assert.throws(
+      () => f.store.status({ clientId: "shared-oauth", sessionId: "c1-subagent" }),
+      /Delegation cross-stitching detected|Delegation exceeds parent scope/,
+    );
+
+    // Restore parent_id
+    f.db.sqlite.prepare("update carrier_bindings set parent_id=? where id=?")
+      .run(workerApproved.id, subagentApproved.id);
+
+    // -------------------------------------------------------------------------
+    // Control 8: cross-repository / cross-goal chain stitching rejects
+    // -------------------------------------------------------------------------
+    const c8Pairing = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c8-subagent" });
+    const c8StitchedRepo: CarrierContract = {
+      ...subagentContract,
+      repository: "James3014/other-repo",
+    };
+    assert.throws(
+      () => f.store.delegate({ clientId: "shared-oauth", sessionId: "c1-worker" }, c8Pairing.pendingId, c8StitchedRepo),
+      /Delegation exceeds parent scope/,
+    );
+    const c8StitchedGoal: CarrierContract = {
+      ...subagentContract,
+      goal: "completely-different-goal",
+    };
+    assert.throws(
+      () => f.store.delegate({ clientId: "shared-oauth", sessionId: "c1-worker" }, c8Pairing.pendingId, c8StitchedGoal),
+      /Delegation exceeds parent scope/,
+    );
+
+    // -------------------------------------------------------------------------
+    // Control 9: same operation with different delegation chain rejects or requires reconciliation
+    // -------------------------------------------------------------------------
+    const worker2Pairing = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c9-worker2" });
+    f.store.delegate({ clientId: "shared-oauth", sessionId: "c1-root" }, worker2Pairing.pendingId, workerContract);
+    f.store.redeem({ clientId: "shared-oauth", sessionId: "c9-worker2" }, worker2Pairing.credential);
+
+    const subagent2Pairing = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c9-subagent2" });
+    f.store.delegate({ clientId: "shared-oauth", sessionId: "c9-worker2" }, subagent2Pairing.pendingId, subagentContract);
+    f.store.redeem({ clientId: "shared-oauth", sessionId: "c9-subagent2" }, subagent2Pairing.credential);
+
+    const sharedSubject = {
+      operationId: "c9-shared-op",
+      requestHash: "9".repeat(64),
+      workspaceRoot: subDir,
+      baseRevision: rootContract.baseRevision,
+      operation: "dependency_sync" as const,
+    };
+
+    const leaseChain1 = f.store.prepareEffect({ clientId: "shared-oauth", sessionId: "c1-subagent" }, sharedSubject);
+    assert.equal(leaseChain1.ownerThread, subagentApproved.id);
+
+    // Chain 2 attempts to prepare the SAME operation before reconciliation
+    assert.throws(
+      () => f.store.prepareEffect({ clientId: "shared-oauth", sessionId: "c9-subagent2" }, sharedSubject),
+      /Operation is bound to a different delegation chain|Operation was previously bound to a different delegation chain/,
+    );
+
+    // -------------------------------------------------------------------------
+    // Control 10: leaf-only / truncated chain cannot satisfy a consequential-effect claim
+    // -------------------------------------------------------------------------
+    const orphanLeafPairing = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c10-orphan" });
+    assert.throws(
+      () => f.store.approveLocal(orphanLeafPairing.pendingId, subagentContract),
+      /Root carrier must be a controller/,
+    );
+
+    const c10Subject = {
+      operationId: "c10-op",
+      requestHash: "a".repeat(64),
+      workspaceRoot: subDir,
+      baseRevision: rootContract.baseRevision,
+      operation: "dependency_sync" as const,
+    };
+    const c10Lease = f.store.prepareEffect({ clientId: "shared-oauth", sessionId: "c1-subagent" }, c10Subject);
+    const c10Pinned = f.store.ownership.beginOperation({ clientId: "shared-oauth", sessionId: "c1-subagent" }, c10Lease.leaseId, c10Lease.version, c10Subject.operationId);
+    f.db.sqlite.prepare("insert into dependency_terminal_witnesses values(?,?,?,?,?)")
+      .run(c10Subject.operationId, c10Subject.requestHash, c10Lease.leaseId, 0, 1);
+
+    // Attacker submits truncated authorityVersion (only leaf)
+    const truncatedEvidence = {
+      leaseId: c10Lease.leaseId,
+      ownerThread: subagentApproved.id,
+      operationHandle: c10Subject.operationId,
+      operation: c10Subject.operation,
+      baseRevision: c10Subject.baseRevision,
+      leaseVersion: c10Pinned.version,
+      state: "finished" as const,
+      detail: JSON.stringify({
+        requestHash: c10Subject.requestHash,
+        exitCode: 0,
+        frozenInputsUnchanged: true,
+        authorityVersion: `${subagentApproved.id}:1`,
+        rootAuthority: rootApproved.id,
+      }),
+    };
+    assert.throws(
+      () => f.store.ownership.reconcile({ clientId: "shared-oauth", sessionId: "c1-subagent" }, c10Lease.leaseId, c10Pinned.version, truncatedEvidence),
+      /trusted terminal effect proof required/,
+    );
+
+    // -------------------------------------------------------------------------
+    // Control 11: existing Controller -> Worker behavior does not regress
+    // -------------------------------------------------------------------------
+    const c11Dir = join(f.workspace, "c11");
+    const c12Dir = join(f.workspace, "c12");
+    mkdirSync(c11Dir, { recursive: true });
+    mkdirSync(c12Dir, { recursive: true });
+
+    const standardRootPairing = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c11-root" });
+    const standardRootContract: CarrierContract = {
+      repository: "James3014/devspace",
+      goal: "c11-regression-check",
+      role: "controller",
+      scope: [c11Dir, c12Dir],
+      baseRevision: "b".repeat(40),
+      operations: ["dependency_sync"],
+      expiresAt: new Date(f.clock() + 120000).toISOString(),
+    };
+    const standardRoot = f.store.approveLocal(standardRootPairing.pendingId, standardRootContract);
+    f.store.redeem({ clientId: "shared-oauth", sessionId: "c11-root" }, standardRootPairing.credential);
+
+    const standardWorkerPairing = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c11-worker" });
+    const standardWorkerContract: CarrierContract = {
+      ...standardRootContract,
+      role: "worker",
+      scope: [c11Dir],
+      expiresAt: new Date(f.clock() + 60000).toISOString(),
+    };
+    const standardWorker = f.store.delegate({ clientId: "shared-oauth", sessionId: "c11-root" }, standardWorkerPairing.pendingId, standardWorkerContract);
+    const standardWorkerActive = f.store.redeem({ clientId: "shared-oauth", sessionId: "c11-worker" }, standardWorkerPairing.credential);
+    assert.equal(standardWorkerActive.id, standardWorker.id);
+    assert.equal(standardWorkerActive.grant.coordinatorThread, standardRoot.id);
+
+    const c11Subject = {
+      operationId: "c11-op",
+      requestHash: "c".repeat(64),
+      workspaceRoot: c11Dir,
+      baseRevision: standardRootContract.baseRevision,
+      operation: "dependency_sync" as const,
+    };
+    const c11Lease = f.store.prepareEffect({ clientId: "shared-oauth", sessionId: "c11-worker" }, c11Subject);
+    assert.equal(c11Lease.ownerThread, standardWorker.id);
+
+    // -------------------------------------------------------------------------
+    // Control 12: no-subdelegation work does not require synthetic meaningless hops
+    // -------------------------------------------------------------------------
+    const directSubject = {
+      operationId: "c12-direct-op",
+      requestHash: "d".repeat(64),
+      workspaceRoot: c12Dir,
+      baseRevision: standardRootContract.baseRevision,
+      operation: "dependency_sync" as const,
+    };
+    const directLease = f.store.prepareEffect({ clientId: "shared-oauth", sessionId: "c11-root" }, directSubject);
+    assert.equal(directLease.ownerThread, standardRoot.id);
+    assert.equal(directLease.grant.coordinatorThread, standardRoot.id);
+
+    const c12SubPairing = f.store.requestPairing({ clientId: "shared-oauth", sessionId: "c12-sub" });
+    assert.throws(
+      () => f.store.delegate({ clientId: "shared-oauth", sessionId: "c11-worker" }, c12SubPairing.pendingId, {
+        ...standardWorkerContract,
+        role: "worker",
+      }),
+      /Workers cannot delegate without remaining delegation depth/,
+    );
+  } finally {
+    f.close();
+  }
+});
