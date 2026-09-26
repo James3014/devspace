@@ -13,6 +13,10 @@ import {
 } from "./local-agent-opencode.js";
 import { AgentProviderFailureError } from "./local-agent-errors.js";
 import { canonicalizePath } from "./roots.js";
+import {
+  type ToolExposureReceipt,
+  buildHerdrToolExposureReceipt,
+} from "./tool-exposure-receipt.js";
 
 export const HERDR_DEFAULT_SOCKET_PATH = process.env.HERDR_SOCKET_PATH || "/Users/james/.config/herdr/herdr.sock";
 export const HERDR_RUNTIME_KIND = "HERDR" as const;
@@ -102,6 +106,7 @@ export interface HerdrExternalHandle {
   dispatchIntentHash: string;
   launchTimestamp: string;
   enforcementState: HerdrEnforcementState;
+  toolExposureReceipt?: ToolExposureReceipt;
 }
 
 export interface NormalizedHerdrHandleAuthority {
@@ -131,6 +136,7 @@ export interface NormalizedHerdrHandleAuthority {
   dispatchIntentHash: string;
   launchTimestamp: string;
   enforcementState: string;
+  toolExposureHash: string | null;
 }
 
 export function normalizeHerdrHandleAuthority(handle: HerdrExternalHandle): NormalizedHerdrHandleAuthority {
@@ -161,6 +167,7 @@ export function normalizeHerdrHandleAuthority(handle: HerdrExternalHandle): Norm
     dispatchIntentHash: handle.dispatchIntentHash,
     launchTimestamp: handle.launchTimestamp,
     enforcementState: handle.enforcementState,
+    toolExposureHash: handle.toolExposureReceipt?.exposure_hash ?? null,
   };
 }
 
@@ -200,6 +207,11 @@ export interface StartHerdrAgentParams {
   requestedCliProviderId?: "cline" | "cline-pass";
   writeMode?: "read_only" | "allowed";
   selectedToolIntents?: ToolIntentId[];
+  dispatchIntent?: { taskId: string; attemptId: string };
+  toolProjectionManifest?: {
+    candidateTools: ToolIntentId[];
+    selectedTools: ToolIntentId[];
+  };
   socketPath?: string;
   store?: LocalAgentStore;
 }
@@ -1178,6 +1190,22 @@ export class HerdrThinGateway {
         )
       : undefined;
 
+    const toolExposureReceipt = buildHerdrToolExposureReceipt({
+      agentKind: params.agentKind,
+      attemptKey: params.attemptKey,
+      dispatchIntent: params.dispatchIntent ?? (record.executionContract?.dispatchIntent ? {
+        taskId: record.executionContract.dispatchIntent.taskId,
+        attemptId: record.executionContract.dispatchIntent.attemptId,
+      } : undefined),
+      dispatchIntentHash: params.dispatchIntentHash,
+      toolProjectionManifest: params.toolProjectionManifest ?? (record.executionContract?.toolProjectionManifest ? {
+        candidateTools: record.executionContract.toolProjectionManifest.candidateTools,
+        selectedTools: record.executionContract.toolProjectionManifest.selectedTools,
+      } : undefined),
+      selectedToolIntents: params.selectedToolIntents ?? record.executionContract?.toolProjectionManifest?.selectedTools,
+      writeMode: params.writeMode ?? (record.executionContract?.writePaths?.length ? "allowed" : "read_only"),
+    });
+
     // 3. Both are positively observed! Build and bind completed handle
     const handle: HerdrExternalHandle = {
       schemaVersion: 1,
@@ -1199,6 +1227,7 @@ export class HerdrThinGateway {
       dispatchIntentHash: params.dispatchIntentHash,
       launchTimestamp: launch.fencedAt,
       enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+      toolExposureReceipt,
     };
 
     const bindRes = store.bindExternalRuntimeBindingCAS({
@@ -1674,6 +1703,22 @@ export class HerdrThinGateway {
       );
     }
 
+    const toolExposureReceipt = buildHerdrToolExposureReceipt({
+      agentKind: params.agentKind,
+      attemptKey: params.attemptKey,
+      dispatchIntent: params.dispatchIntent ?? (record.executionContract?.dispatchIntent ? {
+        taskId: record.executionContract.dispatchIntent.taskId,
+        attemptId: record.executionContract.dispatchIntent.attemptId,
+      } : undefined),
+      dispatchIntentHash: params.dispatchIntentHash,
+      toolProjectionManifest: params.toolProjectionManifest ?? (record.executionContract?.toolProjectionManifest ? {
+        candidateTools: record.executionContract.toolProjectionManifest.candidateTools,
+        selectedTools: record.executionContract.toolProjectionManifest.selectedTools,
+      } : undefined),
+      selectedToolIntents: params.selectedToolIntents ?? record.executionContract?.toolProjectionManifest?.selectedTools,
+      writeMode: params.writeMode ?? (record.executionContract?.writePaths?.length ? "allowed" : "read_only"),
+    });
+
     const handle: HerdrExternalHandle = {
       schemaVersion: 1,
       runtimeKind: HERDR_RUNTIME_KIND,
@@ -1695,6 +1740,7 @@ export class HerdrThinGateway {
       dispatchIntentHash: params.dispatchIntentHash,
       launchTimestamp: new Date().toISOString(),
       enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+      toolExposureReceipt,
     };
 
     if (effectiveStore && params.agentId) {
