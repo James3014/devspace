@@ -936,13 +936,16 @@ export class CarrierBindingStore {
     if(!closed || closed.cutoverId!==input.cutoverId || closed.phase!=="closed" || !closed.coordinationBinding) {
       deny("Terminal lease release requires the exact closed coordination-bound cutover");
     }
+    const positiveWitness=closed.reconciliationReceipt?.workspaceQueryable===true &&
+      closed.reconciliationReceipt.agentQueryable===true &&
+      closed.reconciliationReceipt.agentReconciled===true;
+    const normalCompleted=Boolean(closed.drainEvidence && closed.restartRequest?.restartScheduledAt);
+    const preparedReplacementCompleted=!closed.drainEvidence && !closed.restartRequest;
     if(closed.coordinationBinding.leaseId!==input.leaseId ||
        closed.expiredPreparedNoEffect || closed.capabilityExpectationMismatch || closed.observedReplacement ||
-       closed.supersession || closed.bindingRepair ||
-       !closed.drainEvidence || !closed.restartRequest?.restartScheduledAt ||
-       !closed.reconciliationReceipt?.workspaceQueryable || !closed.reconciliationReceipt.agentQueryable ||
-       !closed.reconciliationReceipt.agentReconciled) {
-      deny("Terminal lease release requires one normally completed cutover generation");
+       closed.supersession || closed.bindingRepair || !positiveWitness ||
+       (!normalCompleted && !preparedReplacementCompleted)) {
+      deny("Terminal lease release requires one exact completed cutover generation");
     }
 
     const row=this.database.sqlite.prepare("select * from carrier_bindings where id=?").get(input.carrierId) as BindingRow|undefined;
@@ -985,6 +988,26 @@ export class CarrierBindingStore {
       const {coordinationBinding,...request}=operation.request;
       if(!isDeepStrictEqual(coordinationBinding,correlation) || !isDeepStrictEqual(request,plan.request)) {
         throw new ControlPlaneOwnershipError("CAS_CONFLICT","Terminal lease release durable operation binding changed");
+      }
+      if(preparedReplacementCompleted) {
+        const action=operation.receipt?.lifecycleAction as {
+          action?:unknown;
+          cutoverId?:unknown;
+          currentIdentity?:unknown;
+          preferredPair?:unknown;
+        }|undefined;
+        const exactReplacement={
+          serverInstanceId:closed.reconciliationReceipt!.closedByServerInstanceId,
+          ...approved.expectedIdentity,
+        };
+        if(!action || action.action!=="finish" || action.cutoverId!==closed.cutoverId ||
+           !isDeepStrictEqual(action.currentIdentity,exactReplacement) ||
+           !isDeepStrictEqual(action.preferredPair,approved.finish) ||
+           closed.reconciliationReceipt!.witnessWorkspaceId!==approved.finish.workspaceId ||
+           closed.reconciliationReceipt!.witnessAgentId!==approved.finish.agentId ||
+           exactReplacement.serverInstanceId===approved.currentIdentity.serverInstanceId) {
+          deny("Terminal lease release requires exact positive-witness prepared replacement evidence");
+        }
       }
 
       const localContext=Object.freeze({});
