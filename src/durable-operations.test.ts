@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { access, chmod, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { ChatSwarmStore } from "./chat-swarm-store.js";
@@ -18,6 +18,7 @@ import {
   DurableOperationStore,
   NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256,
   NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256,
+  NEXUS_GATEWAY_INTERPRETER,
   NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE,
   NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE,
   NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_BRIDGE_CODE,
@@ -915,7 +916,15 @@ test("nexus_gateway_recovery_materialize malformed output remains uncertain and 
   );
   assert.match(
     NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_BRIDGE_CODE,
-    /AUTHORITY_SOURCE_ROOT = pathlib\.Path\("\/Users\/jameschen\/Workspace\/Nexus-new-authority-main"\)/,
+    /AUTHORITY_SOURCE_ROOT = pathlib\.Path\.home\(\) \/ "Workspace" \/ "Nexus-new-authority-main"/,
+  );
+  assert.equal(
+    NEXUS_GATEWAY_INTERPRETER,
+    join(homedir(), "Workspace", "Nexus-new", ".venv", "bin", "python"),
+  );
+  assert.doesNotMatch(
+    NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_BRIDGE_CODE,
+    /\/Users\/jameschen\//,
   );
   assert.match(
     NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_BRIDGE_CODE,
