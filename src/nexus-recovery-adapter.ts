@@ -18,7 +18,7 @@ const SAFE_NEXUS_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const NEXUS_DEPLOYMENT_ID = /^r1-[0-9a-f]{40}$/;
 
 export const NEXUS_GATEWAY_RECOVERY_SCHEMA = "nexus.gateway.durable_recovery_request.v2" as const;
-export const NEXUS_GATEWAY_INTERPRETER = "/Users/jameschen/Workspace/Nexus-new/.venv/bin/python";
+export const NEXUS_GATEWAY_INTERPRETER = join(homedir(), "Workspace", "Nexus-new", ".venv", "bin", "python");
 export const NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256 = "6e4fa4af4ba50eeb956c7b2ed2579c06dbc392576bf5893f4e93505f6120a6ef";
 export const NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256 = "66a1d7cb6a643e1f09f4f2a4ca287a2f1402947decf9d64993177ac5722b9110";
 export const NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_SCHEMA = "nexus.gateway.durable_recovery_materialization_request.v1" as const;
@@ -696,7 +696,7 @@ import sys
 
 STATE = pathlib.Path.home() / "Library" / "Application Support" / "Nexus" / "gateway-direct"
 MANAGER = STATE / "manager.py"
-AUTHORITY_SOURCE_ROOT = pathlib.Path("/Users/jameschen/Workspace/Nexus-new-authority-main")
+AUTHORITY_SOURCE_ROOT = pathlib.Path.home() / "Workspace" / "Nexus-new-authority-main"
 SCHEMA = "nexus.gateway.durable_recovery_materialization_request.v1"
 
 
