@@ -1418,9 +1418,14 @@ export class NexusRecoveryAdapter {
     // Manager-owned durable state is authoritative. A receipt is terminal only
     // when the fixed authority/request stores physically match its declared hashes.
     const initialManagerState = await this.readManagerMaterializationState(request);
-    const initialResult = await finishFromManagerState(initialManagerState, {});
-    if (initialResult) return initialResult;
+    if (initialManagerState.state === "converged" || initialManagerState.state === "invalid") {
+      const initialResult = await finishFromManagerState(initialManagerState, {});
+      if (initialResult) return initialResult;
+    }
 
+    // A valid manager receipt with incomplete fixed stores is resumable manager state,
+    // not terminal adapter truth. Re-enter the exact manager request once so the
+    // manager can complete missing writes or fail closed on conflicting bytes.
     let bridge: NexusGatewayRecoveryBridgeResult;
     try {
       bridge = await this.runMaterializeRunner(request);

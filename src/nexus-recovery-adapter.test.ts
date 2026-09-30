@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -167,7 +167,7 @@ test("devspace#262 G3: Dev MCP disconnect/replacement between submit and readbac
   }
 });
 
-test("devspace#302 G0: receipt-present stale manager store fails closed without duplicate materialization", async () => {
+test("devspace#302 G0: receipt-present stale manager store fails closed after one exact manager reconcile", async () => {
   const f = await createFixture();
   try {
     const request = sampleMaterializationRequest();
@@ -187,13 +187,13 @@ test("devspace#302 G0: receipt-present stale manager store fails closed without 
     const op = await adapter.materialize({ attemptKey: "physical-convergence-g0-1", request });
     assert.equal(op.status, "outcome_unknown");
     assert.equal(op.errorCode, "NEXUS_GATEWAY_MATERIALIZATION_UNCERTAIN");
-    assert.equal(bridgeCalls, 0, "manager receipt with stale fixed store must not trigger duplicate materialization");
+    assert.equal(bridgeCalls, 1, "valid nonconverged manager state may re-enter the exact manager reconciliation once");
   } finally {
     await f.cleanup();
   }
 });
 
-test("devspace#302: stale request store fails closed without duplicate materialization", async () => {
+test("devspace#302: stale request store fails closed after one exact manager reconcile", async () => {
   const f = await createFixture();
   try {
     const request = sampleMaterializationRequest();
@@ -212,7 +212,34 @@ test("devspace#302: stale request store fails closed without duplicate materiali
 
     const op = await adapter.materialize({ attemptKey: "stale-request-1", request });
     assert.equal(op.status, "outcome_unknown");
-    assert.equal(bridgeCalls, 0);
+    assert.equal(bridgeCalls, 1);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("devspace#302: valid receipt with a missing fixed store resumes manager reconciliation to convergence", async () => {
+  const f = await createFixture();
+  try {
+    const request = sampleMaterializationRequest();
+    const receipt = validMaterializationReceipt(request);
+    await writeFile(join(f.materializationsDir, `${request.request_hash}.json`), JSON.stringify(receipt), "utf8");
+    await unlink(f.authorityPath);
+
+    let bridgeCalls = 0;
+    const adapter = new NexusRecoveryAdapter(f.store, {
+      stateRoot: f.managerStateRoot,
+      runMaterialize: async () => {
+        bridgeCalls++;
+        await writeFile(f.authorityPath, DEFAULT_AUTHORITY_BYTES);
+        return { exitCode: 0, stdout: JSON.stringify(receipt), stderr: "" };
+      },
+    });
+
+    const op = await adapter.materialize({ attemptKey: "missing-authority-resume-1", request });
+    assert.equal(op.status, "succeeded");
+    assert.equal(bridgeCalls, 1);
+    assert.equal((op.receipt as Record<string, unknown>).physicalConvergence, true);
   } finally {
     await f.cleanup();
   }
