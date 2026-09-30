@@ -411,6 +411,19 @@ const toolNames = {
   shell: "bash",
 } as const;
 
+const DIRECT_CODING_TOOL_NAMES = new Set<string>([
+  toolNames.openWorkspace,
+  toolNames.read,
+  toolNames.write,
+  toolNames.edit,
+  toolNames.grep,
+  toolNames.glob,
+  toolNames.ls,
+  toolNames.shell,
+  "command_status",
+  "workspace_verify",
+]);
+
 const workspaceIdDescription =
   "Workspace to use. Reuse the current project's workspaceId.";
 
@@ -430,26 +443,27 @@ interface ToolLogFields {
 }
 
 function serverInstructions(config: ServerConfig): string {
-  const artifactInstruction = config.artifactsEnabled && isArtifactDownloadSupportedPlatform()
+  const directCodingMode = config.toolMode === "minimal";
+  const artifactInstruction = !directCodingMode && config.artifactsEnabled && isArtifactDownloadSupportedPlatform()
     ? " When the user supplies or generates a file that is not present on the DevSpace host, use download_artifact with its native file value, the existing workspace ID, and a suitable relative destination path chosen from the user's request and project structure. The tool refuses to overwrite an existing destination and returns the normalized workspace-relative path. Use normal workspace tools when explicit inspection, replacement, movement, renaming, or deletion is needed. Do not recreate binary files with write/edit calls or place signed URLs, native file objects, base64 content, or invented host paths in shell commands or logs."
     : "";
   const showChangesInstruction =
-    config.widgets === "changes"
+    !directCodingMode && config.widgets === "changes"
       ? " If the turn successfully modifies files by creating, editing, overwriting, deleting, moving, or applying patches, call show_changes exactly once for that workspace after the final related file change and before your final response so the user can inspect the aggregate diff for that turn. Do not call it after every individual file change; do not skip it because individual file-change tools already returned diffs."
       : "";
 
-  const agentToolsInstruction = config.subagents
+  const agentToolsInstruction = !directCodingMode && config.subagents.enabled
     ? " Use agent_start to launch an advertised agent profile as a background subagent. Use agent_status to retrieve result or progress. Use agent_continue for evidence-guided repair in the same session. Use agent_cancel to stop the exact owned worker. Use agent_list to inspect current workspace agent sessions. Do NOT use bash to call `devspace agents` when native agent tools are available."
     : "";
 
-  const gitCandidatesInstruction = config.gitCandidatesEnabled
+  const gitCandidatesInstruction = !directCodingMode && config.gitCandidatesEnabled
     ? " Use git_commit to form a scoped Candidate from exact paths. Use git_push to publish Candidate HEAD to a non-default branch. Do not use bash for git mutation."
     : "";
 
-  const codexGoalsInstruction = config.codexGoalsEnabled
+  const codexGoalsInstruction = !directCodingMode && config.codexGoalsEnabled
     ? " When a task should be delegated to the real interactive Codex CLI, use codex_goal_start to launch a /goal session in an open workspace, then poll codex_goal_status, send follow-ups with codex_goal_continue, and stop it with codex_goal_cancel."
     : "";
-  const repositoryIntelligenceInstruction = config.repositoryIntelligenceRoot
+  const repositoryIntelligenceInstruction = !directCodingMode && config.repositoryIntelligenceRoot
     ? " When normalized repository evidence is already available, prefer the typed repository_intelligence_* tools over bash for canonical Repository Intelligence V1 computation. These tools are read-only and do not fetch GitHub or grant approve/merge authority."
     : "";
 
@@ -3235,8 +3249,13 @@ export function createMcpServer(
   const registerMcpTool = server.registerTool.bind(server) as (...args: any[]) => unknown;
   (server as unknown as { registerTool: (...args: any[]) => unknown }).registerTool =
     (name: string, ...args: any[]) => {
+      const registered = registerMcpTool(name, ...args) as { disable?: () => void };
+      if (config.toolMode === "minimal" && !DIRECT_CODING_TOOL_NAMES.has(name)) {
+        registered.disable?.();
+        return registered;
+      }
       registeredMcpToolNames.add(name);
-      return registerMcpTool(name, ...args);
+      return registered;
     };
 
   registerAppTool(
@@ -3299,7 +3318,9 @@ export function createMcpServer(
       };
     },
   );
-  const coreMutationGuard = createCoreMutationGuard(workspaces, coreMutationSessions, coreMutationTestOnlyBypass);
+  const coreMutationGuard = config.toolMode === "minimal"
+    ? undefined
+    : createCoreMutationGuard(workspaces, coreMutationSessions, coreMutationTestOnlyBypass);
   const inspectCoreWriterDomain = (
     session: CoreMutationSessionRecord,
     domain: "PROCESS" | "AGENT",
@@ -3479,28 +3500,33 @@ export function createMcpServer(
         workspace.agentProfiles,
         resolveLocalAgentProviders(),
       );
-      const cardAgentProviders = agentCatalog.providers
-        .filter((provider) => provider.usable)
-        .map((provider) => ({
-          id: provider.id,
-          model: provider.model,
-          effort: provider.effort,
-          note: provider.note,
-        }));
-      const cardAgents = agentCatalog.profiles;
-      const cardProfileStatuses = (workspace.profileCatalogEntries ?? []).map(
-        (entry: ProfileCatalogEntry) => ({
-          name: entry.name,
-          provider: entry.provider,
-          state: entry.state,
-          sources: entry.sources,
-          ...(entry.model ? { model: entry.model } : {}),
-          ...(entry.effort ? { effort: entry.effort } : {}),
-          ...(entry.write_mode ? { write_mode: entry.write_mode } : {}),
-          ...(entry.tracked !== undefined ? { tracked: entry.tracked } : {}),
-          ...(entry.diagnostic ? { diagnostic: entry.diagnostic } : {}),
-        }),
-      );
+      const exposeAgentContext = config.toolMode !== "minimal";
+      const cardAgentProviders = exposeAgentContext
+        ? agentCatalog.providers
+          .filter((provider) => provider.usable)
+          .map((provider) => ({
+            id: provider.id,
+            model: provider.model,
+            effort: provider.effort,
+            note: provider.note,
+          }))
+        : [];
+      const cardAgents = exposeAgentContext ? agentCatalog.profiles : [];
+      const cardProfileStatuses = exposeAgentContext
+        ? (workspace.profileCatalogEntries ?? []).map(
+          (entry: ProfileCatalogEntry) => ({
+            name: entry.name,
+            provider: entry.provider,
+            state: entry.state,
+            sources: entry.sources,
+            ...(entry.model ? { model: entry.model } : {}),
+            ...(entry.effort ? { effort: entry.effort } : {}),
+            ...(entry.write_mode ? { write_mode: entry.write_mode } : {}),
+            ...(entry.tracked !== undefined ? { tracked: entry.tracked } : {}),
+            ...(entry.diagnostic ? { diagnostic: entry.diagnostic } : {}),
+          }),
+        )
+        : [];
       const devspaceBuildReceipt = {
         serverInstanceId: runtimeBuildIdentity.serverInstanceId,
         buildId: runtimeBuildIdentity.buildId,
@@ -4879,13 +4905,11 @@ export function createMcpServer(
     toolNames.shell,
     {
       title: "Bash",
-      description: config.subagents.enabled
-        ? (config.toolMode !== "full"
-          ? `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, search, file discovery, and directory inspection. In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use command-line tools such as grep, rg, find, ls, and tree for those read-only inspection actions. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read} for direct file reads. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication. Do not use bash to call \`devspace agents\` when native agent tools are available.`
-          : `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication. Do not use bash to call \`devspace agents\` when native agent tools are available.`)
-        : (config.toolMode !== "full"
-          ? `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, search, file discovery, and directory inspection. In minimal tool mode, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} are disabled; use command-line tools such as grep, rg, find, ls, and tree for those read-only inspection actions. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read} for direct file reads. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`
-          : `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`),
+      description: config.toolMode === "minimal"
+        ? `Run a shell command inside an open workspace for direct coding tasks such as tests, builds, git inspection, and package scripts. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. Do not use ${toolNames.shell} to create or modify project files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Call open_workspace first and pass workspaceId. Shell runs with the local user's authority and is not a filesystem sandbox.`
+        : config.subagents.enabled
+          ? `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication. Do not use bash to call \`devspace agents\` when native agent tools are available.`
+          : `Run a shell command inside an open workspace. Use only for tests, builds, git inspection, package scripts, and commands that are better executed by the shell. Do not use ${toolNames.shell} to create or modify files. Do not use shell redirection, heredocs, tee, sed -i, perl -i, node/python/ruby scripts, or generated scripts to write project files; use ${toolNames.edit} for targeted changes and ${toolNames.write} for new files or full rewrites. Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for file inspection. Call open_workspace first and pass workspaceId. This is powerful local execution and should only be exposed behind strong authentication.`,
 
       inputSchema: {
         workspaceId: z
@@ -5819,8 +5843,9 @@ export function createMcpServer(
         };
       },
     );
+  }
 
-    registerAppTool(
+  registerAppTool(
       server,
       "workspace_verify",
       {
@@ -5890,7 +5915,6 @@ export function createMcpServer(
         };
       },
     );
-  }
 
   // ── Candidate integration readiness / typed integration (workspace level) ──
   const candidateRangeInputSchema = {

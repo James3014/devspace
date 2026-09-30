@@ -1009,6 +1009,7 @@ test("cutover MCP control exposes bounded lease lifecycle and schedules self res
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_STATE_DIR: stateDir,
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    DEVSPACE_TOOL_MODE: "full",
     PORT: "1",
   });
   const workspaceStore = new SqliteWorkspaceStore(stateDir);
@@ -1181,6 +1182,7 @@ test("cutover restart tool is absent when no bounded self actuator is available"
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_STATE_DIR: stateDir,
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    DEVSPACE_TOOL_MODE: "full",
     PORT: "1",
   });
   const workspaceStore = new SqliteWorkspaceStore(stateDir);
@@ -4745,20 +4747,28 @@ test("OWNER_DIRECT dependency_sync bypasses carrier only for a managed isolated 
 });
 
 test("command_status metadata annotations and minimal mode visibility", async (t) => {
-  // Test minimal mode tools
-  const context = await fixture(t, { toolMode: "minimal" });
+  const context = await fixture(t, {
+    toolMode: "minimal",
+    subagents: true,
+    gitCandidates: true,
+    chatSwarm: true,
+    coreMutation: true,
+  });
   const toolsList = await context.client.listTools();
-  const toolNames = toolsList.tools.map((t) => t.name);
+  const toolNames = toolsList.tools.map((t) => t.name).sort();
 
-  // command_status and native read-only discovery are visible in minimal mode.
-  assert.ok(toolNames.includes("command_status"), "command_status should be visible in minimal mode");
-  assert.ok(toolNames.includes("grep"), "grep should be visible in minimal mode");
-  assert.ok(toolNames.includes("glob"), "glob should be visible in minimal mode");
-  assert.ok(toolNames.includes("ls"), "ls should be visible in minimal mode");
-
-  // exec_command and write_stdin remain hidden in minimal mode
-  assert.ok(!toolNames.includes("exec_command"), "exec_command must stay hidden in minimal mode");
-  assert.ok(!toolNames.includes("write_stdin"), "write_stdin must stay hidden in minimal mode");
+  assert.deepEqual(toolNames, [
+    "bash",
+    "command_status",
+    "edit",
+    "glob",
+    "grep",
+    "ls",
+    "open_workspace",
+    "read",
+    "workspace_verify",
+    "write",
+  ]);
 
   // Verify command_status annotations
   const commandStatusTool = toolsList.tools.find((t) => t.name === "command_status");
@@ -4770,6 +4780,77 @@ test("command_status metadata annotations and minimal mode visibility", async (t
     idempotentHint: true,
     openWorldHint: false,
   });
+});
+
+test("minimal mode is direct coding while full mode keeps Core mutation admission", async (t) => {
+  const direct = await fixture(t, {
+    git: true,
+    toolMode: "minimal",
+    subagents: true,
+    gitCandidates: true,
+    coreMutation: true,
+  });
+  const opened = await callOpen(direct.client, direct.project, "issue300-direct");
+  const workspaceId = structuredContent(opened).workspaceId as string;
+  assert.ok(
+    (structuredContent(opened).agentsFiles as Array<{ path: string }>).some((file) => file.path.endsWith("AGENTS.md")),
+    "Direct Coding must preserve repository instruction loading",
+  );
+  assert.deepEqual(structuredContent(opened).agentProfileStatuses, []);
+  assert.deepEqual(structuredContent(opened).agentProviders, []);
+  assert.deepEqual(structuredContent(opened).agents, []);
+
+  const write = await direct.client.callTool({
+    name: "write",
+    arguments: { workspaceId, path: "direct.txt", content: "first\n" },
+    _meta: { "openai/session": "issue300-direct" },
+  });
+  assert.equal(write.isError, undefined, responseText(write));
+
+  const edit = await direct.client.callTool({
+    name: "edit",
+    arguments: {
+      workspaceId,
+      path: "direct.txt",
+      edits: [{ oldText: "first\n", newText: "second\n" }],
+    },
+    _meta: { "openai/session": "issue300-direct" },
+  });
+  assert.equal(edit.isError, undefined, responseText(edit));
+  assert.equal(readFileSync(join(direct.project, "direct.txt"), "utf8"), "second\n");
+
+  const shell = await direct.client.callTool({
+    name: "bash",
+    arguments: {
+      workspaceId,
+      command: `${JSON.stringify(process.execPath)} -e "process.stdout.write('direct-ok')"`,
+      attemptKey: "issue300-direct-shell",
+    },
+    _meta: { "openai/session": "issue300-direct" },
+  });
+  assert.equal(shell.isError, undefined, responseText(shell));
+  assert.match(responseText(shell), /direct-ok/);
+
+  const escapedPath = join(dirname(direct.project), "issue300-escape.txt");
+  const escaped = await direct.client.callTool({
+    name: "write",
+    arguments: { workspaceId, path: "../issue300-escape.txt", content: "escape\n" },
+    _meta: { "openai/session": "issue300-direct" },
+  });
+  assert.equal(escaped.isError, true);
+  assert.equal(existsSync(escapedPath), false);
+
+  const full = await fixture(t, { git: true, toolMode: "full", coreMutation: true });
+  const fullOpened = await callOpen(full.client, full.project, "issue300-full");
+  const fullWorkspaceId = structuredContent(fullOpened).workspaceId as string;
+  const guardedWrite = await full.client.callTool({
+    name: "write",
+    arguments: { workspaceId: fullWorkspaceId, path: "guarded.txt", content: "blocked\n" },
+    _meta: { "openai/session": "issue300-full" },
+  });
+  assert.equal(guardedWrite.isError, true);
+  assert.match(responseText(guardedWrite), /CORE_BOUND_SESSION_REQUIRED/);
+  assert.equal(existsSync(join(full.project, "guarded.txt")), false);
 });
 
 test("C3 authenticated HTTP MCP uses host-bound worker authority for real dependency execution", async () => {
@@ -4785,7 +4866,7 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
   await writeFile(join(project,"package.json"),'{"name":"fixture","version":"1.0.0"}');
   await writeFile(join(project,"package-lock.json"),'{"lockfileVersion":3,"packages":{}}');
   const base=(await execFileAsync("git",["rev-parse","HEAD"],{cwd:project})).stdout.trim();
-  const config=loadConfig({DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_ALLOWED_ROOTS:root,DEVSPACE_STATE_DIR:join(root,"state"),DEVSPACE_WORKTREE_ROOT:join(root,"worktrees"),DEVSPACE_PUBLIC_BASE_URL:"http://127.0.0.1:1",DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",PORT:"1"});
+  const config=loadConfig({DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_ALLOWED_ROOTS:root,DEVSPACE_STATE_DIR:join(root,"state"),DEVSPACE_WORKTREE_ROOT:join(root,"worktrees"),DEVSPACE_PUBLIC_BASE_URL:"http://127.0.0.1:1",DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",DEVSPACE_TOOL_MODE:"full",PORT:"1"});
   const provider=new SingleUserOAuthProvider(config.oauth,new URL("/mcp",config.publicBaseUrl),config.stateDir);
   const oauthClient=await provider.clientsStore.registerClient!({redirect_uris:["http://localhost/callback"],client_name:"C3 fixture",token_endpoint_auth_method:"none"});
   let redirect="";
@@ -5256,6 +5337,7 @@ test("P0-3: recovery and finish share identical semantics and idempotently rende
       DEVSPACE_ALLOWED_ROOTS: root1,
       DEVSPACE_STATE_DIR: stateDir1,
       DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+      DEVSPACE_TOOL_MODE: "full",
       PORT: "1",
     });
 
@@ -5384,6 +5466,7 @@ test("P0-3: recovery and finish share identical semantics and idempotently rende
       DEVSPACE_ALLOWED_ROOTS: root2,
       DEVSPACE_STATE_DIR: stateDir2,
       DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+      DEVSPACE_TOOL_MODE: "full",
       PORT: "1",
     });
 
@@ -5527,6 +5610,7 @@ test("P0-4: real server /mcp HTTP boundary permits transport reconnect during dr
     DEVSPACE_STATE_DIR: stateDir,
     DEVSPACE_OAUTH_OWNER_TOKEN: ownerToken,
     DEVSPACE_PUBLIC_BASE_URL: baseUrl,
+    DEVSPACE_TOOL_MODE: "full",
     PORT: String(port),
   });
 
@@ -5749,6 +5833,7 @@ test("Issue #15 Wave 4B: capability convergence resolves the initialized request
     DEVSPACE_STATE_DIR: stateDir,
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     DEVSPACE_PUBLIC_BASE_URL: baseUrl,
+    DEVSPACE_TOOL_MODE: "full",
     PORT: String(port),
   });
   const oauthStore = new SqliteOAuthStore(stateDir);
@@ -6496,7 +6581,8 @@ test("prepared finish rejects each wrong replacement identity without durable mu
     const root = await mkdtemp(join(tmpdir(), `devspace-prepared-finish-${mismatch.label}-`));
     const stateDir = join(root, ".state");
     const config = loadConfig({ DEVSPACE_CONFIG_DIR: join(root, ".config"), DEVSPACE_ALLOWED_ROOTS: root,
-      DEVSPACE_STATE_DIR: stateDir, DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough", PORT: "1" });
+      DEVSPACE_STATE_DIR: stateDir, DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+      DEVSPACE_TOOL_MODE: "full", PORT: "1" });
     const wsStore = new SqliteWorkspaceStore(stateDir);
     const workspaces = new WorkspaceRegistry(config, wsStore);
     let sequence = 0;
@@ -6556,7 +6642,8 @@ test("prepared stale-target MCP recovery preserves successor and supersession su
   const root = await mkdtemp(join(tmpdir(), "devspace-stale-recovery-"));
   const stateDir = join(root, ".state");
   const config = loadConfig({ DEVSPACE_CONFIG_DIR: join(root, ".config"), DEVSPACE_ALLOWED_ROOTS: root,
-    DEVSPACE_STATE_DIR: stateDir, DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough", PORT: "1" });
+    DEVSPACE_STATE_DIR: stateDir, DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
+    DEVSPACE_TOOL_MODE: "full", PORT: "1" });
   const wsStore = new SqliteWorkspaceStore(stateDir);
   const workspaces = new WorkspaceRegistry(config, wsStore);
   let sequence = 0;
@@ -6594,7 +6681,7 @@ test("prepared stale-target MCP recovery preserves successor and supersession su
 
 test("C3 bound cutover rejects unfenced automatic advance before its callback",async()=>{
   const root=await mkdtemp(join(tmpdir(),"devspace-bound-advance-"));
-  const config=loadConfig({DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_ALLOWED_ROOTS:root,DEVSPACE_STATE_DIR:join(root,"state"),DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",PORT:"1"});
+  const config=loadConfig({DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_ALLOWED_ROOTS:root,DEVSPACE_STATE_DIR:join(root,"state"),DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",DEVSPACE_TOOL_MODE:"full",PORT:"1"});
   const store=new SqliteWorkspaceStore(config.stateDir);const workspaces=new WorkspaceRegistry(config,store);
   const cutoverStore=new CutoverStateStore(config.stateDir);
   const controller=new McpCutoverController(cutoverStore,{serverInstanceId:"old",sourceCommit:"old",buildId:"old"});

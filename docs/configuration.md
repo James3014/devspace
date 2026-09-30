@@ -95,9 +95,9 @@ MCP clients discover metadata from:
 
 | Value | Behavior |
 | --- | --- |
-| `minimal` | Default. Exposes `open_workspace`, `read`, `write`, `edit`, and `bash`. Clients use `bash` with tools such as `rg`, `find`, and `ls` for inspection. |
-| `full` | Exposes the minimal tools plus dedicated `grep`, `glob`, and `ls` tools. |
-| `codex` | Experimental. Exposes `open_workspace`, `read`, `apply_patch`, `exec_command`, and `write_stdin`. Existing mutation and shell tools are hidden. |
+| `minimal` | Default Direct Coding surface. Exposes exactly `open_workspace`, `read`, `write`, `edit`, `grep`, `glob`, `ls`, `bash`, `command_status`, and `workspace_verify`. It does not project subagent, Candidate, Core-mutation, coordination, cutover, host-operation, or provider-routing tools. Structured file mutations keep workspace/root containment; shell still runs with the local user's authority and is not a filesystem sandbox. |
+| `full` | Full DevSpace control-plane surface. Use this only when the workflow needs delegated workers, durable Core-bound mutation, Candidate/integration, coordination/reconciliation, cutover, or other configured control-plane capabilities. |
+| `codex` | Experimental Codex-compatible coding surface with `apply_patch`, `exec_command`, and `write_stdin` in place of the normal mutation/shell primitives; configured full control-plane capabilities remain available. |
 
 `DEVSPACE_MINIMAL_TOOLS` remains a backward-compatible alias when
 `DEVSPACE_TOOL_MODE` is unset: `1` selects `minimal` and `0` selects `full`.
@@ -116,15 +116,15 @@ sessions.
 the **real interactive Codex CLI** inside an open workspace:
 
 ```bash
-DEVSPACE_CODEX_GOALS=1 DEVSPACE_TOOL_MODE=minimal npx @waishnav/devspace serve
+DEVSPACE_CODEX_GOALS=1 DEVSPACE_TOOL_MODE=full npx @waishnav/devspace serve
 ```
 
 Key properties:
 
-- **This does NOT require `DEVSPACE_TOOL_MODE=codex`.** The server can stay in
-  the default `minimal` tool mode. Minimal mode stays minimal: generic
-  `exec_command` and `write_stdin` remain hidden. The goal tools are a narrow,
-  special-purpose execution surface, not a general shell/PTY capability.
+- **This does NOT require `DEVSPACE_TOOL_MODE=codex`.** Use `full` when the
+  narrow `codex_goal_*` controller surface is required. The default `minimal`
+  mode is reserved for Direct Coding and intentionally suppresses goal/agent
+  orchestration tools.
 - `codex_goal_start` launches the actual `codex` binary (never the Codex SDK)
   inside a PTY in the exact opened workspace, waits for the TUI to become
   ready, then types `/goal <goal>` in bounded chunks so large goals are not
@@ -145,7 +145,7 @@ Key properties:
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `DEVSPACE_CODEX_GOALS` | `0` | Expose the `codex_goal_*` tools in every tool mode. |
+| `DEVSPACE_CODEX_GOALS` | `0` | Expose the `codex_goal_*` tools in `full` or `codex` mode. The default `minimal` Direct Coding surface suppresses them. |
 | `DEVSPACE_CODEX_BIN` | unset | Explicit path to the Codex CLI executable. When unset, DevSpace resolves `codex` from `PATH`, then falls back to `/Applications/ChatGPT.app/Contents/Resources/codex` on macOS. An explicitly configured but invalid path fails closed. |
 
 
