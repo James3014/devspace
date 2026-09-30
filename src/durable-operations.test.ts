@@ -731,7 +731,7 @@ test("nexus_gateway_recover malformed manager output fails closed as uncertain",
 });
 
 
-test("nexus_gateway_recovery_materialize exact replay is durable and conflicting replay fails closed", async () => {
+test("nexus_gateway_recovery_materialize receipt-only transport remains uncertain and conflicting replay fails closed", async () => {
   const f = await fixture();
   try {
     const calls: NexusGatewayRecoveryMaterializationRequest[] = [];
@@ -762,15 +762,18 @@ test("nexus_gateway_recovery_materialize exact replay is durable and conflicting
       });
       assert.equal(first.kind, "nexus_gateway_recovery_materialize");
       assert.equal(first.authorityMode, "NEXUS_GOVERNED");
-      assert.equal(first.status, "succeeded");
+      assert.equal(first.status, "outcome_unknown");
+      assert.equal(first.errorCode, "NEXUS_GATEWAY_MATERIALIZATION_UNCERTAIN");
       assert.equal(calls.length, 1);
 
-      const replay = await manager.nexusGatewayRecoveryMaterialize({
-        attemptKey: "gateway-materialize-1",
-        request,
-      });
-      assert.equal(replay.operationId, first.operationId);
-      assert.equal(replay.updatedAt, first.updatedAt);
+      await assert.rejects(
+        manager.nexusGatewayRecoveryMaterialize({
+          attemptKey: "gateway-materialize-1",
+          request,
+        }),
+        (error: unknown) =>
+          error instanceof DurableOperationError && error.code === "OPERATION_OUTCOME_UNKNOWN",
+      );
       assert.equal(calls.length, 1);
 
       const conflicting = materializationRequest({ recovery_authority_hash: "8".repeat(64) });
@@ -873,7 +876,8 @@ test("nexus_gateway_recovery_materialize uncertain outcome reconciles only the s
       );
 
       const reconciled = await manager.reconcile(uncertain.operationId);
-      assert.equal(reconciled.status, "succeeded");
+      assert.equal(reconciled.status, "outcome_unknown");
+      assert.equal(reconciled.errorCode, "NEXUS_GATEWAY_MATERIALIZATION_UNCERTAIN");
       assert.equal(calls.length, 2);
       assert.deepEqual(calls[1], calls[0], "reconcile must reuse the original materialization request");
       assert.equal((reconciled.receipt as Record<string, unknown>).reconciled, true);
