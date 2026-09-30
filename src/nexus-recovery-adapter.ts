@@ -20,8 +20,8 @@ const NEXUS_DEPLOYMENT_ID = /^r1-[0-9a-f]{40}$/;
 
 export const NEXUS_GATEWAY_RECOVERY_SCHEMA = "nexus.gateway.durable_recovery_request.v2" as const;
 export const NEXUS_GATEWAY_INTERPRETER = join(homedir(), "Workspace", "Nexus-new", ".venv", "bin", "python");
-export const NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256 = "6e4fa4af4ba50eeb956c7b2ed2579c06dbc392576bf5893f4e93505f6120a6ef";
-export const NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256 = "66a1d7cb6a643e1f09f4f2a4ca287a2f1402947decf9d64993177ac5722b9110";
+export const NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256 = "7f93a472870303d44f7c57b02362ac3f7599216576ce620334a847c4ce4a1e0c";
+export const NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256 = "5dd680a914788bef36e5ed16a84558d43cdb2f337503e52c7d81258be4a862a0";
 export const NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_SCHEMA = "nexus.gateway.durable_recovery_materialization_request.v1" as const;
 export const NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_RECEIPT_SCHEMA = "nexus.gateway.durable_recovery_materialization_receipt.v1" as const;
 export const NEXUS_GATEWAY_STATE_ROOT = join(homedir(), "Library", "Application Support", "Nexus", "gateway-direct");
