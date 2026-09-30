@@ -163,7 +163,7 @@ async function goalFixture(t: TestContext, options: GoalFixtureOptions = {}): Pr
     DEVSPACE_CONFIG_DIR: join(rootDir, ".config"),
     DEVSPACE_ALLOWED_ROOTS: rootDir,
     DEVSPACE_STATE_DIR: stateDir,
-    DEVSPACE_TOOL_MODE: options.toolMode ?? "minimal",
+    DEVSPACE_TOOL_MODE: options.toolMode ?? "full",
     DEVSPACE_CODEX_GOALS: options.goalsEnabled === false ? undefined : "1",
     ...(options.codexBinOverride !== undefined
       ? { DEVSPACE_CODEX_BIN: options.codexBinOverride }
@@ -501,11 +501,11 @@ test("feature disabled: no codex_goal tools even when a manager is supplied", as
   }
 });
 
-test("minimal mode with flag: goal tools exposed, generic PTY tools stay hidden", async (t) => {
+test("minimal Direct Coding mode suppresses Codex Goal and generic PTY tools", async (t) => {
   const context = await goalFixture(t, { toolMode: "minimal" });
   const tools = await context.client.listTools();
   for (const name of GOAL_TOOLS) {
-    assert.equal(tools.tools.some((tool) => tool.name === name), true, name);
+    assert.equal(tools.tools.some((tool) => tool.name === name), false, name);
   }
   assert.equal(tools.tools.some((tool) => tool.name === "exec_command"), false);
   assert.equal(tools.tools.some((tool) => tool.name === "write_stdin"), false);

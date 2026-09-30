@@ -191,13 +191,14 @@ minimum version; runtime discovery must not borrow an arbitrary ancestor
 `node_modules`. The CLI version probe is bounded but allows normal cold-start
 latency before failing closed.
 
-For direct interactive Codex Goal Mode, keep `DEVSPACE_TOOL_MODE=minimal` and
+For direct interactive Codex Goal Mode, use `DEVSPACE_TOOL_MODE=full` and
 opt in to the narrow `codex_goal_*` surface with `DEVSPACE_CODEX_GOALS=1`.
 `codex_goal_start` launches the real Codex CLI in a PTY, binds Git workspaces to
 an exact `expectedHead`, requires a clean workspace, and only reports success
 after the TUI physically shows `Pursuing goal`. Use `codex_goal_status`,
 `codex_goal_continue`, and `codex_goal_cancel` to operate the same exact goal
-session. Generic `exec_command`/`write_stdin` remain hidden in minimal mode.
+session. The default `minimal` mode is reserved for ChatGPT Direct Coding and
+does not project goal/agent orchestration tools.
 
 Skill paths may be outside the workspace. DevSpace only permits reading:
 
@@ -214,19 +215,24 @@ sessions for that workspace. `devspace agents cancel <id>` stops an active sessi
 
 ## Tool Names
 
-DevSpace exposes these tool names:
+By default, `DEVSPACE_TOOL_MODE=minimal` is the Direct Coding surface exposed
+to ChatGPT:
 
 - `open_workspace`
 - `read`
 - `write`
 - `edit`
+- `grep`
+- `glob`
+- `ls`
 - `bash`
+- `command_status`
+- `workspace_verify`
 
-By default, DevSpace also runs in `DEVSPACE_TOOL_MODE=minimal`, so dedicated
-`grep`, `glob`, and `ls` tools are hidden. Use `bash` with command-line tools
-such as `rg`, `find`, and `ls` for search and directory inspection.
-
-Use `DEVSPACE_TOOL_MODE=full` to restore dedicated search and directory tools.
+Minimal mode intentionally does not project agent dispatch, Candidate,
+Core-mutation, coordination, cutover, host-operation, provider-routing, or
+other control-plane tool families. Use `DEVSPACE_TOOL_MODE=full` only when a
+workflow explicitly needs those high-control capabilities.
 
 The experimental Codex-style surface is enabled with
 `DEVSPACE_TOOL_MODE=codex`. It exposes:
