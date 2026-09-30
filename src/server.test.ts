@@ -4763,6 +4763,7 @@ test("command_status metadata annotations and minimal mode visibility", async (t
     "edit",
     "glob",
     "grep",
+    "host_capability_snapshot",
     "ls",
     "open_workspace",
     "read",
