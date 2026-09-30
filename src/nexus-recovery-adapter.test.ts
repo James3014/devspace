@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -19,13 +20,24 @@ import {
   type NexusGatewayRecoveryRequest,
 } from "./nexus-recovery-adapter.js";
 
+const DEFAULT_AUTHORITY_BYTES = Buffer.from('{"generation":"authority-v1"}\n', "utf8");
+const DEFAULT_REQUEST_BYTES = Buffer.from('{"generation":"request-v1"}\n', "utf8");
+
+function sha256(value: Uint8Array | string): string {
+  return createHash("sha256").update(value).digest("hex");
+}
+
 async function createFixture() {
   const root = await mkdtemp(join(tmpdir(), "devspace-nexus-adapter-test-"));
   const stateDir = join(root, "state");
   const managerStateRoot = join(root, "manager-state");
   const materializationsDir = join(managerStateRoot, "recovery-materializations");
+  const authorityPath = join(managerStateRoot, "recovery-authority.json");
+  const requestPath = join(managerStateRoot, "request.json");
   await mkdir(stateDir, { recursive: true });
   await mkdir(materializationsDir, { recursive: true });
+  await writeFile(authorityPath, DEFAULT_AUTHORITY_BYTES);
+  await writeFile(requestPath, DEFAULT_REQUEST_BYTES);
 
   const store = new DurableOperationStore(stateDir);
   return {
@@ -33,6 +45,8 @@ async function createFixture() {
     stateDir,
     managerStateRoot,
     materializationsDir,
+    authorityPath,
+    requestPath,
     store,
     cleanup: async () => {
       store.close();
@@ -82,23 +96,26 @@ function sampleRecoveryRequest(overrides?: Partial<NexusGatewayRecoveryRequest>)
 }
 
 function validMaterializationReceipt(request: NexusGatewayRecoveryMaterializationRequest): NexusGatewayRecoveryMaterializationReceipt {
-  return {
+  const values = {
     request_id: request.request_id,
     idempotency_fence: request.idempotency_fence,
-    operation: "gateway-recovery-materialize",
-    effect_class: "GATEWAY_RECOVERY_MATERIALIZATION",
+    operation: "gateway-recovery-materialize" as const,
+    effect_class: "GATEWAY_RECOVERY_MATERIALIZATION" as const,
     recovery_authority_id: request.recovery_authority_id,
     recovery_authority_hash: request.recovery_authority_hash,
     materialization_request_hash: request.request_hash,
     fresh_main: "1".repeat(40),
     fresh_main_tree: "2".repeat(40),
-    materialized_authority_sha256: "3".repeat(64),
-    materialized_request_sha256: "4".repeat(64),
+    materialized_authority_sha256: sha256(DEFAULT_AUTHORITY_BYTES),
+    materialized_request_sha256: sha256(DEFAULT_REQUEST_BYTES),
     predecessor_artifact_sha256: "5".repeat(64),
     predecessor_artifact_size: 1024,
-    effect_started: false,
+    effect_started: false as const,
     schema: NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_RECEIPT_SCHEMA,
-    receipt_hash: "6".repeat(64),
+  };
+  return {
+    ...values,
+    receipt_hash: hashJson(values),
   };
 }
 
@@ -145,6 +162,108 @@ test("devspace#262 G3: Dev MCP disconnect/replacement between submit and readbac
     } finally {
       newStore.close();
     }
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("devspace#302 G0: receipt-present stale manager store fails closed without duplicate materialization", async () => {
+  const f = await createFixture();
+  try {
+    const request = sampleMaterializationRequest();
+    const receipt = validMaterializationReceipt(request);
+    await writeFile(join(f.materializationsDir, `${request.request_hash}.json`), JSON.stringify(receipt), "utf8");
+    await writeFile(f.authorityPath, '{"generation":"stale-authority"}\n', "utf8");
+
+    let bridgeCalls = 0;
+    const adapter = new NexusRecoveryAdapter(f.store, {
+      stateRoot: f.managerStateRoot,
+      runMaterialize: async () => {
+        bridgeCalls++;
+        return { exitCode: 0, stdout: JSON.stringify(receipt), stderr: "" };
+      },
+    });
+
+    const op = await adapter.materialize({ attemptKey: "physical-convergence-g0-1", request });
+    assert.equal(op.status, "outcome_unknown");
+    assert.equal(op.errorCode, "NEXUS_GATEWAY_MATERIALIZATION_UNCERTAIN");
+    assert.equal(bridgeCalls, 0, "manager receipt with stale fixed store must not trigger duplicate materialization");
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("devspace#302: stale request store fails closed without duplicate materialization", async () => {
+  const f = await createFixture();
+  try {
+    const request = sampleMaterializationRequest();
+    const receipt = validMaterializationReceipt(request);
+    await writeFile(join(f.materializationsDir, `${request.request_hash}.json`), JSON.stringify(receipt), "utf8");
+    await writeFile(f.requestPath, '{"generation":"stale-request"}\n', "utf8");
+
+    let bridgeCalls = 0;
+    const adapter = new NexusRecoveryAdapter(f.store, {
+      stateRoot: f.managerStateRoot,
+      runMaterialize: async () => {
+        bridgeCalls++;
+        return { exitCode: 0, stdout: JSON.stringify(receipt), stderr: "" };
+      },
+    });
+
+    const op = await adapter.materialize({ attemptKey: "stale-request-1", request });
+    assert.equal(op.status, "outcome_unknown");
+    assert.equal(bridgeCalls, 0);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("devspace#302: bridge failure plus stale receipt never upgrades to success", async () => {
+  const f = await createFixture();
+  try {
+    const request = sampleMaterializationRequest();
+    const receipt = validMaterializationReceipt(request);
+    let bridgeCalls = 0;
+    const adapter = new NexusRecoveryAdapter(f.store, {
+      stateRoot: f.managerStateRoot,
+      runMaterialize: async () => {
+        bridgeCalls++;
+        await writeFile(join(f.materializationsDir, `${request.request_hash}.json`), JSON.stringify(receipt), "utf8");
+        await writeFile(f.authorityPath, '{"generation":"stale-after-bridge"}\n', "utf8");
+        return { exitCode: 1, stdout: "", stderr: "lost acknowledgement" };
+      },
+    });
+
+    const op = await adapter.materialize({ attemptKey: "bridge-stale-receipt-1", request });
+    assert.equal(op.status, "outcome_unknown");
+    assert.equal(bridgeCalls, 1);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test("devspace#302: hash-tampered manager receipt fails closed without duplicate materialization", async () => {
+  const f = await createFixture();
+  try {
+    const request = sampleMaterializationRequest();
+    const receipt = {
+      ...validMaterializationReceipt(request),
+      receipt_hash: "f".repeat(64),
+    };
+    await writeFile(join(f.materializationsDir, `${request.request_hash}.json`), JSON.stringify(receipt), "utf8");
+
+    let bridgeCalls = 0;
+    const adapter = new NexusRecoveryAdapter(f.store, {
+      stateRoot: f.managerStateRoot,
+      runMaterialize: async () => {
+        bridgeCalls++;
+        return { exitCode: 0, stdout: JSON.stringify(receipt), stderr: "" };
+      },
+    });
+
+    const op = await adapter.materialize({ attemptKey: "tampered-hash-1", request });
+    assert.equal(op.status, "outcome_unknown");
+    assert.equal(bridgeCalls, 0);
   } finally {
     await f.cleanup();
   }

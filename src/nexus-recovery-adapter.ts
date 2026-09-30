@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { lstat, readFile, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import {
@@ -14,6 +14,7 @@ import {
 import type { ExecutionAuthorityMode } from "./execution-protocol.js";
 
 const HEX64 = /^[0-9a-f]{64}$/;
+const HEX40 = /^[0-9a-f]{40}$/;
 const SAFE_NEXUS_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const NEXUS_DEPLOYMENT_ID = /^r1-[0-9a-f]{40}$/;
 
@@ -265,8 +266,28 @@ export function validateNexusGatewayMaterializationReceipt(
   outcome: Record<string, unknown>,
   expectedRequest: NexusGatewayRecoveryMaterializationRequest,
 ): NexusGatewayRecoveryMaterializationReceipt {
+  const expectedKeys = new Set([
+    "request_id",
+    "idempotency_fence",
+    "operation",
+    "effect_class",
+    "recovery_authority_id",
+    "recovery_authority_hash",
+    "materialization_request_hash",
+    "fresh_main",
+    "fresh_main_tree",
+    "materialized_authority_sha256",
+    "materialized_request_sha256",
+    "predecessor_artifact_sha256",
+    "predecessor_artifact_size",
+    "effect_started",
+    "schema",
+    "receipt_hash",
+  ]);
   if (
-    outcome.schema !== NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_RECEIPT_SCHEMA
+    Object.keys(outcome).length !== expectedKeys.size
+    || Object.keys(outcome).some((key) => !expectedKeys.has(key))
+    || outcome.schema !== NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_RECEIPT_SCHEMA
     || outcome.operation !== "gateway-recovery-materialize"
     || outcome.effect_class !== "GATEWAY_RECOVERY_MATERIALIZATION"
     || outcome.request_id !== expectedRequest.request_id
@@ -276,14 +297,44 @@ export function validateNexusGatewayMaterializationReceipt(
     || outcome.recovery_authority_hash !== expectedRequest.recovery_authority_hash
     || outcome.effect_started !== false
     || typeof outcome.fresh_main !== "string"
+    || !HEX40.test(outcome.fresh_main)
     || typeof outcome.fresh_main_tree !== "string"
+    || !HEX40.test(outcome.fresh_main_tree)
     || typeof outcome.materialized_authority_sha256 !== "string"
+    || !HEX64.test(outcome.materialized_authority_sha256)
     || typeof outcome.materialized_request_sha256 !== "string"
+    || !HEX64.test(outcome.materialized_request_sha256)
+    || typeof outcome.predecessor_artifact_sha256 !== "string"
+    || !HEX64.test(outcome.predecessor_artifact_sha256)
+    || !Number.isInteger(outcome.predecessor_artifact_size)
+    || (outcome.predecessor_artifact_size as number) <= 0
     || typeof outcome.receipt_hash !== "string"
+    || !HEX64.test(outcome.receipt_hash)
   ) {
     throw new Error("Fixed Nexus Gateway recovery materialization receipt format invalid.");
   }
-  return outcome as unknown as NexusGatewayRecoveryMaterializationReceipt;
+  const receipt = outcome as unknown as NexusGatewayRecoveryMaterializationReceipt;
+  const expectedReceiptHash = hashJson({
+    request_id: receipt.request_id,
+    idempotency_fence: receipt.idempotency_fence,
+    operation: receipt.operation,
+    effect_class: receipt.effect_class,
+    recovery_authority_id: receipt.recovery_authority_id,
+    recovery_authority_hash: receipt.recovery_authority_hash,
+    materialization_request_hash: receipt.materialization_request_hash,
+    fresh_main: receipt.fresh_main,
+    fresh_main_tree: receipt.fresh_main_tree,
+    materialized_authority_sha256: receipt.materialized_authority_sha256,
+    materialized_request_sha256: receipt.materialized_request_sha256,
+    predecessor_artifact_sha256: receipt.predecessor_artifact_sha256,
+    predecessor_artifact_size: receipt.predecessor_artifact_size,
+    effect_started: receipt.effect_started,
+    schema: receipt.schema,
+  });
+  if (receipt.receipt_hash !== expectedReceiptHash) {
+    throw new Error("Fixed Nexus Gateway recovery materialization receipt hash mismatch.");
+  }
+  return receipt;
 }
 
 export function buildNexusGatewayRecoveryBridgeCode(
@@ -863,6 +914,96 @@ export class NexusRecoveryAdapter {
     }
   }
 
+  private async readSecureManagerFile(relativePath: string, label: string): Promise<Buffer> {
+    const canonicalRoot = await realpath(this.stateRoot);
+    const path = join(this.stateRoot, relativePath);
+    const info = await lstat(path);
+    if (info.isSymbolicLink() || !info.isFile()) {
+      throw new Error(`${label} must be a regular non-symlink file.`);
+    }
+    const uid = process.getuid?.();
+    if ((typeof uid === "number" && info.uid !== uid) || (info.mode & 0o022) !== 0) {
+      throw new Error(`${label} ownership/mode invalid.`);
+    }
+    const canonicalPath = await realpath(path);
+    const expectedPath = join(canonicalRoot, relativePath);
+    if (canonicalPath !== expectedPath) {
+      throw new Error(`${label} escaped fixed manager state root.`);
+    }
+    return await readFile(path);
+  }
+
+  private async readManagerMaterializationState(
+    request: NexusGatewayRecoveryMaterializationRequest,
+  ): Promise<{
+    state: "missing" | "invalid" | "nonconverged" | "converged";
+    receipt?: NexusGatewayRecoveryMaterializationReceipt;
+    detail?: string;
+  }> {
+    const receiptRelativePath = join("recovery-materializations", `${request.request_hash}.json`);
+    let receiptBytes: Buffer;
+    try {
+      receiptBytes = await this.readSecureManagerFile(receiptRelativePath, "materialization receipt");
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (code === "ENOENT") return { state: "missing" };
+      return {
+        state: "invalid",
+        detail: redactSecrets(error instanceof Error ? error.message : String(error)),
+      };
+    }
+
+    let receipt: NexusGatewayRecoveryMaterializationReceipt;
+    try {
+      const parsed = JSON.parse(receiptBytes.toString("utf8"));
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("materialization receipt must be an object");
+      }
+      receipt = validateNexusGatewayMaterializationReceipt(
+        parsed as Record<string, unknown>,
+        request,
+      );
+      if (
+        !HEX64.test(receipt.materialized_authority_sha256)
+        || !HEX64.test(receipt.materialized_request_sha256)
+        || !HEX64.test(receipt.receipt_hash)
+      ) {
+        throw new Error("materialization receipt hash fields are malformed");
+      }
+    } catch (error) {
+      return {
+        state: "invalid",
+        detail: redactSecrets(error instanceof Error ? error.message : String(error)),
+      };
+    }
+
+    try {
+      const [authorityBytes, requestBytes] = await Promise.all([
+        this.readSecureManagerFile("recovery-authority.json", "recovery authority"),
+        this.readSecureManagerFile("request.json", "recovery request"),
+      ]);
+      const authorityHash = createHash("sha256").update(authorityBytes).digest("hex");
+      const requestHash = createHash("sha256").update(requestBytes).digest("hex");
+      if (
+        authorityHash !== receipt.materialized_authority_sha256
+        || requestHash !== receipt.materialized_request_sha256
+      ) {
+        return {
+          state: "nonconverged",
+          receipt,
+          detail: "manager fixed stores do not match receipt-declared materialized hashes",
+        };
+      }
+      return { state: "converged", receipt };
+    } catch (error) {
+      return {
+        state: "nonconverged",
+        receipt,
+        detail: redactSecrets(error instanceof Error ? error.message : String(error)),
+      };
+    }
+  }
+
   async recover(input: {
     attemptKey: string;
     request: NexusGatewayRecoveryRequest;
@@ -1239,53 +1380,57 @@ export class NexusRecoveryAdapter {
     request: NexusGatewayRecoveryMaterializationRequest,
     reconciled: boolean,
   ): Promise<DurableOperationRecord> {
-    // Check manager-owned durable state first (R2 — manager-owned replay & reconciliation)
-    const existingManagerReceipt = await this.readManagerMaterializationReceipt(request.request_hash);
-    if (existingManagerReceipt) {
-      if (
-        existingManagerReceipt.schema === NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_RECEIPT_SCHEMA
-        && existingManagerReceipt.effect_started === false
-        && typeof existingManagerReceipt.receipt_hash === "string"
-        && HEX64.test(existingManagerReceipt.receipt_hash)
-      ) {
-        const receipt = {
-          reconciled: true,
-          exitCode: 0,
-          nexusOutcome: existingManagerReceipt,
-        };
+    const finishFromManagerState = async (
+      managerState: Awaited<ReturnType<NexusRecoveryAdapter["readManagerMaterializationState"]>>,
+      fallback: { exitCode?: number | null; bridge?: string; errorMessage?: string },
+    ): Promise<DurableOperationRecord | null> => {
+      if (managerState.state === "missing") return null;
+      if (managerState.state === "converged" && managerState.receipt) {
         return this.store.finish(operationId, {
           status: "succeeded",
           retrySafe: false,
-          receipt,
+          receipt: {
+            reconciled: true,
+            exitCode: fallback.exitCode ?? 0,
+            nexusOutcome: managerState.receipt,
+            physicalConvergence: true,
+          },
         });
       }
-    }
+      return this.store.finish(operationId, {
+        status: "outcome_unknown",
+        retrySafe: false,
+        errorCode: "NEXUS_GATEWAY_MATERIALIZATION_UNCERTAIN",
+        errorMessage: managerState.detail
+          ?? fallback.errorMessage
+          ?? "Manager materialization receipt exists but physical convergence is not proven.",
+        receipt: {
+          reconciled,
+          exitCode: fallback.exitCode,
+          bridge: fallback.bridge,
+          nexusOutcome: managerState.receipt,
+          physicalConvergence: false,
+          managerState: managerState.state,
+        },
+      });
+    };
+
+    // Manager-owned durable state is authoritative. A receipt is terminal only
+    // when the fixed authority/request stores physically match its declared hashes.
+    const initialManagerState = await this.readManagerMaterializationState(request);
+    const initialResult = await finishFromManagerState(initialManagerState, {});
+    if (initialResult) return initialResult;
 
     let bridge: NexusGatewayRecoveryBridgeResult;
     try {
       bridge = await this.runMaterializeRunner(request);
     } catch (error) {
-      // Check if manager finished writing the receipt before the crash
-      const postCrashReceipt = await this.readManagerMaterializationReceipt(request.request_hash);
-      if (postCrashReceipt) {
-        if (
-          postCrashReceipt.schema === NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_RECEIPT_SCHEMA
-          && postCrashReceipt.effect_started === false
-          && typeof postCrashReceipt.receipt_hash === "string"
-          && HEX64.test(postCrashReceipt.receipt_hash)
-        ) {
-          const receipt = {
-            reconciled: true,
-            exitCode: 0,
-            nexusOutcome: postCrashReceipt,
-          };
-          return this.store.finish(operationId, {
-            status: "succeeded",
-            retrySafe: false,
-            receipt,
-          });
-        }
-      }
+      const postCrashState = await this.readManagerMaterializationState(request);
+      const postCrashResult = await finishFromManagerState(postCrashState, {
+        bridge: "transport_error",
+        errorMessage: redactSecrets(error instanceof Error ? error.message : String(error)),
+      });
+      if (postCrashResult) return postCrashResult;
       return this.store.finish(operationId, {
         status: "outcome_unknown",
         retrySafe: false,
@@ -1295,27 +1440,16 @@ export class NexusRecoveryAdapter {
       });
     }
 
+    const postBridgeState = await this.readManagerMaterializationState(request);
+    const postBridgeResult = await finishFromManagerState(postBridgeState, {
+      exitCode: bridge.exitCode,
+      errorMessage: bridge.stderr.trim()
+        ? redactSecrets(bridge.stderr.trim())
+        : undefined,
+    });
+    if (postBridgeResult) return postBridgeResult;
+
     if (bridge.exitCode !== 0) {
-      const postFailReceipt = await this.readManagerMaterializationReceipt(request.request_hash);
-      if (postFailReceipt) {
-        if (
-          postFailReceipt.schema === NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_RECEIPT_SCHEMA
-          && postFailReceipt.effect_started === false
-          && typeof postFailReceipt.receipt_hash === "string"
-          && HEX64.test(postFailReceipt.receipt_hash)
-        ) {
-          const receipt = {
-            reconciled: true,
-            exitCode: 0,
-            nexusOutcome: postFailReceipt,
-          };
-          return this.store.finish(operationId, {
-            status: "succeeded",
-            retrySafe: false,
-            receipt,
-          });
-        }
-      }
       return this.store.finish(operationId, {
         status: "outcome_unknown",
         retrySafe: false,
@@ -1327,40 +1461,12 @@ export class NexusRecoveryAdapter {
       });
     }
 
-    let outcome: Record<string, unknown>;
-    try {
-      const parsed = JSON.parse(bridge.stdout);
-      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("outcome must be an object");
-      outcome = parsed as Record<string, unknown>;
-    } catch (error) {
-      return this.store.finish(operationId, {
-        status: "outcome_unknown",
-        retrySafe: false,
-        errorCode: "NEXUS_GATEWAY_MATERIALIZATION_UNCERTAIN",
-        errorMessage: `Nexus Gateway recovery materialization bridge returned malformed outcome JSON: ${redactSecrets(error instanceof Error ? error.message : String(error))}`,
-        receipt: { reconciled, exitCode: bridge.exitCode },
-      });
-    }
-
-    const receipt = {
-      reconciled,
-      exitCode: bridge.exitCode,
-      nexusOutcome: outcome,
-    };
-    if (
-      outcome.schema === NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_RECEIPT_SCHEMA
-      && outcome.effect_started === false
-      && typeof outcome.receipt_hash === "string"
-      && HEX64.test(outcome.receipt_hash)
-    ) {
-      return this.store.finish(operationId, { status: "succeeded", retrySafe: false, receipt });
-    }
     return this.store.finish(operationId, {
-      status: "failed",
+      status: "outcome_unknown",
       retrySafe: false,
-      errorCode: "NEXUS_GATEWAY_MATERIALIZATION_FAILED",
-      errorMessage: "Nexus Gateway recovery materialization failed closed: receipt must be typed, effect-free, and hash-bound.",
-      receipt,
+      errorCode: "NEXUS_GATEWAY_MATERIALIZATION_UNCERTAIN",
+      errorMessage: "Nexus Gateway recovery materialization returned without a manager-owned receipt that proves physical fixed-store convergence.",
+      receipt: { reconciled, exitCode: bridge.exitCode },
     });
   }
 }
