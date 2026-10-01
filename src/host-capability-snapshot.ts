@@ -101,8 +101,14 @@ function pathInside(root: string, candidate: string): boolean {
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
-function canonicalWorkspaceRoot(root: string): string {
-  return realpathSync(resolve(root));
+function canonicalWorkspaceRoot(root: string): string | undefined {
+  try {
+    return realpathSync(resolve(root));
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ENOTDIR") return undefined;
+    throw error;
+  }
 }
 
 function resolveIdentityStateDirectory(stateDir: string, workspaceRoots: string[]): string {
@@ -113,7 +119,9 @@ function resolveIdentityStateDirectory(stateDir: string, workspaceRoots: string[
     throw new Error("DevSpace owner state directory must be a real directory, not a symlink.");
   }
   const canonicalOwnerStateDir = realpathSync(ownerStateDir);
-  const canonicalRoots = workspaceRoots.map(canonicalWorkspaceRoot);
+  const canonicalRoots = workspaceRoots
+    .map(canonicalWorkspaceRoot)
+    .filter((root): root is string => root !== undefined);
   if (canonicalRoots.some((root) => pathInside(root, canonicalOwnerStateDir))) {
     throw new Error("Physical host identity state must live outside active workspace roots.");
   }
