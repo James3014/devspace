@@ -216,6 +216,16 @@ export interface CoreMutationCandidateProvenance {
   createdAt: string;
 }
 
+export interface CoreMutationObservationEntry {
+  session: CoreMutationSessionRecord;
+  candidate?: CoreMutationCandidateProvenance;
+}
+
+export interface CoreMutationObservationPage {
+  sessions: CoreMutationObservationEntry[];
+  nextCursor?: string;
+}
+
 export interface CoreMutationSessionRebindRecord {
   rebindId: string;
   sessionId: string;
@@ -745,6 +755,95 @@ export class CoreMutationSessionStore {
       .prepare("select * from core_mutation_candidates where candidate_head = ? limit 1")
       .get(candidateHead) as Record<string, unknown> | undefined;
     return row ? rowToCandidate(row) : undefined;
+  }
+
+  listForObservation(input: {
+    repository: string;
+    createdAtOrAfter: string;
+    limit: number;
+    cursor?: string;
+  }): CoreMutationObservationPage {
+    const repository = input.repository.trim();
+    if (!repository) {
+      throw new CoreMutationSessionError(
+        "INVALID_OBSERVATION_FILTER",
+        "Observation repository must be a non-empty canonical repository identity.",
+      );
+    }
+    const lowerBoundMs = Date.parse(input.createdAtOrAfter);
+    if (!Number.isFinite(lowerBoundMs)) {
+      throw new CoreMutationSessionError(
+        "INVALID_OBSERVATION_FILTER",
+        "Observation lower-bound timestamp is invalid.",
+      );
+    }
+    if (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 200) {
+      throw new CoreMutationSessionError(
+        "INVALID_OBSERVATION_FILTER",
+        "Observation limit must be an integer between 1 and 200.",
+      );
+    }
+
+    let cursorCreatedAt: string | undefined;
+    let cursorId: string | undefined;
+    if (input.cursor !== undefined) {
+      const separator = input.cursor.lastIndexOf("#");
+      if (separator <= 0 || separator === input.cursor.length - 1) {
+        throw new CoreMutationSessionError("INVALID_OBSERVATION_CURSOR", "Observation cursor is malformed.");
+      }
+      cursorCreatedAt = input.cursor.slice(0, separator);
+      cursorId = input.cursor.slice(separator + 1);
+      if (!Number.isFinite(Date.parse(cursorCreatedAt)) || !/^cms_[0-9a-f]{32}$/.test(cursorId)) {
+        throw new CoreMutationSessionError("INVALID_OBSERVATION_CURSOR", "Observation cursor is malformed.");
+      }
+    }
+
+    const params: Array<string | number> = [
+      new Date(lowerBoundMs).toISOString(),
+      repository,
+    ];
+    let cursorClause = "";
+    if (cursorCreatedAt && cursorId) {
+      cursorClause = "and (created_at > ? or (created_at = ? and id > ?))";
+      params.push(cursorCreatedAt, cursorCreatedAt, cursorId);
+    }
+    params.push(input.limit + 1);
+
+    const rows = this.database.sqlite.prepare(`
+      select *
+      from core_mutation_sessions
+      where created_at >= ?
+        and json_extract(binding_json, '$.repository.canonical_id') = ?
+        ${cursorClause}
+      order by created_at asc, id asc
+      limit ?
+    `).all(...params) as Record<string, unknown>[];
+
+    const pageRows = rows.slice(0, input.limit);
+    const sessions = pageRows.map((row) => {
+      const session = rowToRecord(row);
+      const candidateRow = this.database.sqlite
+        .prepare(`
+          select *
+          from core_mutation_candidates
+          where session_id = ?
+          order by created_at desc, candidate_head desc
+          limit 1
+        `)
+        .get(session.id) as Record<string, unknown> | undefined;
+      return {
+        session,
+        candidate: candidateRow ? rowToCandidate(candidateRow) : undefined,
+      };
+    });
+
+    const last = pageRows.at(-1);
+    return {
+      sessions,
+      nextCursor: rows.length > input.limit && last
+        ? `${String(last.created_at)}#${String(last.id)}`
+        : undefined,
+    };
   }
 
   async open(input: {

@@ -78,6 +78,11 @@ function makeBinding(input: {
   validUntil?: string | null;
   executionLane?: "DIRECT_CANONICAL" | "DIRECT_DELEGATED" | "GOVERNED";
   authorityHash?: string;
+  authorityRef?: string;
+  bindingId?: string;
+  operationId?: string;
+  attemptId?: string;
+  createdAt?: string;
 }): RepositoryMutationBinding {
   const receipt = input.receipt ?? discoveryReceipt();
   const contract = {
@@ -89,9 +94,9 @@ function makeBinding(input: {
   };
   const base: Omit<RepositoryMutationBinding, "binding_hash"> = {
     schema: "nexus.repository_mutation_binding.v1",
-    binding_id: "binding-test-1",
-    operation_id: "operation-test-1",
-    attempt_id: "attempt-test-1",
+    binding_id: input.bindingId ?? "binding-test-1",
+    operation_id: input.operationId ?? "operation-test-1",
+    attempt_id: input.attemptId ?? "attempt-test-1",
     repository: {
       canonical_id: "James3014/devspace",
       origin: "https://github.com/James3014/devspace.git",
@@ -102,7 +107,7 @@ function makeBinding(input: {
     },
     integration_authority: {
       execution_lane: input.executionLane ?? "DIRECT_CANONICAL",
-      authority_ref: "James3014/devspace#135",
+      authority_ref: input.authorityRef ?? "James3014/devspace#135",
       authority_hash: input.authorityHash ?? `sha256:${"4".repeat(64)}`,
     },
     capability_discovery: {
@@ -116,7 +121,7 @@ function makeBinding(input: {
       acceptance_contract_hash: acceptanceContractHash(contract),
     },
     freshness: {
-      created_at: "2026-09-14T00:00:00.000Z",
+      created_at: input.createdAt ?? "2026-09-14T00:00:00.000Z",
       valid_until: input.validUntil ?? null,
       revalidate_before_first_effect: true,
     },
@@ -127,6 +132,191 @@ function makeBinding(input: {
   });
   return { ...base, binding_hash: computeRepositoryMutationBindingHash(base) };
 }
+
+test("Core mutation session census is read-only, filtered, paginated, candidate-aware, and restart-safe", async () => {
+  const fixture = makeRepo();
+  const stateDir = join(fixture.root, "state");
+  const workspaceStore = createWorkspaceStore(stateDir);
+  const workspaces = ["ws_census_1", "ws_census_2", "ws_census_3"];
+  for (const id of workspaces) {
+    workspaceStore.createSession({ id, root: fixture.repo, mode: "checkout" });
+  }
+  let store = new CoreMutationSessionStore(stateDir);
+  try {
+    const firstBinding = makeBinding({
+      workspaceSessionId: workspaces[0]!,
+      head: fixture.head,
+      tree: fixture.tree,
+      bindingId: "binding-census-1",
+      operationId: "operation-census-1",
+      attemptId: "attempt-census-1",
+      authorityRef: "James3014/devspace#313",
+      createdAt: "2026-09-14T01:00:00.000Z",
+    });
+    const first = await store.open({
+      workspaceSessionId: workspaces[0]!,
+      workspaceRoot: fixture.repo,
+      workspaceMode: "checkout",
+      managed: false,
+      actorKey: "actor:one",
+      binding: firstBinding,
+      now: new Date("2026-09-14T01:00:01.000Z"),
+    });
+    await store.closeSession({
+      sessionId: first.id,
+      workspaceSessionId: workspaces[0]!,
+      workspaceRoot: fixture.repo,
+      actorKey: "actor:one",
+      mode: "ABANDON",
+    });
+
+    const secondBinding = makeBinding({
+      workspaceSessionId: workspaces[1]!,
+      head: fixture.head,
+      tree: fixture.tree,
+      bindingId: "binding-census-2",
+      operationId: "operation-census-2",
+      attemptId: "attempt-census-2",
+      authorityRef: "James3014/devspace#313",
+      createdAt: "2026-09-14T02:00:00.000Z",
+      validUntil: "2026-09-14T02:30:00.000Z",
+    });
+    const second = await store.open({
+      workspaceSessionId: workspaces[1]!,
+      workspaceRoot: fixture.repo,
+      workspaceMode: "checkout",
+      managed: false,
+      actorKey: "actor:two",
+      binding: secondBinding,
+      now: new Date("2026-09-14T02:00:01.000Z"),
+    });
+
+    const thirdBinding = makeBinding({
+      workspaceSessionId: workspaces[2]!,
+      head: fixture.head,
+      tree: fixture.tree,
+      bindingId: "binding-census-3",
+      operationId: "operation-census-3",
+      attemptId: "attempt-census-3",
+      authorityRef: "James3014/devspace#313",
+      createdAt: "2026-09-14T03:00:00.000Z",
+    });
+    const third = await store.open({
+      workspaceSessionId: workspaces[2]!,
+      workspaceRoot: fixture.repo,
+      workspaceMode: "checkout",
+      managed: false,
+      actorKey: "actor:three",
+      binding: thirdBinding,
+      now: new Date("2026-09-14T03:00:01.000Z"),
+    });
+    await store.admitEffect({
+      workspaceSessionId: workspaces[2]!,
+      workspaceRoot: fixture.repo,
+      workspaceMode: "checkout",
+      managed: false,
+      actorKey: "actor:three",
+      pointer: { required: true, sessionId: third.id, bindingHash: third.bindingHash },
+      paths: ["app.ts"],
+      deletedPaths: [],
+      pathContainment: "STRUCTURED_SINK_ENFORCED",
+      now: new Date("2026-09-14T03:01:00.000Z"),
+    });
+    writeFileSync(join(fixture.repo, "app.ts"), "export const value = 2;\n");
+    git(fixture.repo, "add", "app.ts");
+    git(fixture.repo, "commit", "-m", "candidate");
+    const candidateHead = git(fixture.repo, "rev-parse", "HEAD");
+    const candidateTree = git(fixture.repo, "rev-parse", "HEAD^{tree}");
+    await store.recordCandidate({
+      sessionId: third.id,
+      workspaceSessionId: workspaces[2]!,
+      workspaceRoot: fixture.repo,
+      actorKey: "actor:three",
+      candidateHead,
+      candidateTree,
+      now: new Date("2026-09-14T03:02:00.000Z"),
+    });
+    await store.closeSession({
+      sessionId: third.id,
+      workspaceSessionId: workspaces[2]!,
+      workspaceRoot: fixture.repo,
+      actorKey: "actor:three",
+      mode: "COMPLETE",
+    });
+
+    assert.throws(
+      () => store.listForObservation({
+        repository: "James3014/devspace",
+        createdAtOrAfter: "not-a-time",
+        limit: 2,
+      }),
+      (error: unknown) =>
+        error instanceof CoreMutationSessionError && error.code === "INVALID_OBSERVATION_FILTER",
+    );
+    assert.throws(
+      () => store.listForObservation({
+        repository: "James3014/devspace",
+        createdAtOrAfter: "2026-09-14T00:00:00.000Z",
+        limit: 0,
+      }),
+      (error: unknown) =>
+        error instanceof CoreMutationSessionError && error.code === "INVALID_OBSERVATION_FILTER",
+    );
+    assert.throws(
+      () => store.listForObservation({
+        repository: "James3014/devspace",
+        createdAtOrAfter: "2026-09-14T00:00:00.000Z",
+        limit: 2,
+        cursor: "malformed",
+      }),
+      (error: unknown) =>
+        error instanceof CoreMutationSessionError && error.code === "INVALID_OBSERVATION_CURSOR",
+    );
+
+    const firstPage = store.listForObservation({
+      repository: "James3014/devspace",
+      createdAtOrAfter: "2026-09-14T00:00:00.000Z",
+      limit: 2,
+    });
+    assert.deepEqual(firstPage.sessions.map((entry) => entry.session.id), [first.id, second.id]);
+    assert.equal(firstPage.sessions[1]?.session.freshnessState, "FRESH");
+    assert.ok(firstPage.nextCursor);
+
+    const secondPage = store.listForObservation({
+      repository: "James3014/devspace",
+      createdAtOrAfter: "2026-09-14T00:00:00.000Z",
+      limit: 2,
+      cursor: firstPage.nextCursor,
+    });
+    assert.deepEqual(secondPage.sessions.map((entry) => entry.session.id), [third.id]);
+    assert.equal(secondPage.nextCursor, undefined);
+    assert.equal(secondPage.sessions[0]?.candidate?.candidateHead, candidateHead);
+    assert.equal(secondPage.sessions[0]?.candidate?.candidateTree, candidateTree);
+    assert.deepEqual(secondPage.sessions[0]?.candidate?.changedPaths, ["app.ts"]);
+
+    const wrongRepository = store.listForObservation({
+      repository: "James3014/nexus-core",
+      createdAtOrAfter: "2026-09-14T00:00:00.000Z",
+      limit: 10,
+    });
+    assert.deepEqual(wrongRepository.sessions, []);
+
+    store.close();
+    store = new CoreMutationSessionStore(stateDir);
+    const replay = store.listForObservation({
+      repository: "James3014/devspace",
+      createdAtOrAfter: "2026-09-14T00:00:00.000Z",
+      limit: 10,
+    });
+    assert.deepEqual(replay.sessions.map((entry) => entry.session.id), [first.id, second.id, third.id]);
+    assert.equal(replay.sessions[1]?.session.freshnessState, "FRESH");
+    assert.equal(replay.sessions[2]?.candidate?.candidateHead, candidateHead);
+  } finally {
+    store.close();
+    workspaceStore.close?.();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
 
 test("repository mutation admission requires an active Core-bound session", async () => {
   const fixture = makeRepo();

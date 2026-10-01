@@ -477,6 +477,24 @@ export function registerCoreMutationSessionTools(
     closedAt: z.string().optional(),
     binding: z.record(z.string(), z.unknown()),
   });
+  const observationCandidateSchema = z.object({
+    candidateHead: z.string(),
+    candidateTree: z.string(),
+    sessionId: z.string(),
+    workspaceSessionId: z.string(),
+    bindingHash: z.string(),
+    acceptanceContractHash: z.string(),
+    sourceHead: z.string(),
+    sourceTree: z.string(),
+    changedPaths: z.array(z.string()),
+    deletedPaths: z.array(z.string()),
+    diffHash: z.string(),
+    changeSetId: z.string(),
+    changeSetHash: z.string(),
+    changeManifestHash: z.string(),
+    changeManifest: z.unknown().optional(),
+    createdAt: z.string(),
+  });
   const publicSession = (session: ReturnType<CoreMutationSessionStore["getById"]>) => {
     if (!session) throw new Error("Core mutation session unexpectedly disappeared.");
     const { actorKey: _actorKey, ...rest } = session;
@@ -549,6 +567,56 @@ export function registerCoreMutationSessionTools(
         content: [{ type: "text" as const, text: `Core mutation session ${session.id}: ${session.status}.` }],
         structuredContent: publicSession(session),
       };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "core_mutation_session_list",
+    {
+      title: "Core mutation session census",
+      description:
+        "Read a bounded, sanitized durable census of Core mutation sessions for prospective observation. This is cross-session research metadata only: actor identity is omitted and the result grants no mutation, rebind, verification, acceptance, merge, release, deployment, routing, or production authority.",
+      inputSchema: {
+        repository: z.string().min(1),
+        createdAtOrAfter: z.string().min(1),
+        limit: z.number().int().min(1).max(200).default(100),
+        cursor: z.string().min(1).optional(),
+      },
+      outputSchema: z.object({
+        sessions: z.array(z.object({
+          session: outputSchema,
+          candidate: observationCandidateSchema.optional(),
+        })),
+        nextCursor: z.string().optional(),
+      }),
+      _meta: {},
+      annotations: { readOnlyHint: true, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ repository, createdAtOrAfter, limit, cursor }) => {
+      try {
+        const page = store.listForObservation({
+          repository,
+          createdAtOrAfter,
+          limit,
+          cursor,
+        });
+        return {
+          content: [{
+            type: "text" as const,
+            text: `Observed ${page.sessions.length} Core mutation session(s) for ${repository}.`,
+          }],
+          structuredContent: {
+            sessions: page.sessions.map((entry) => ({
+              session: publicSession(entry.session),
+              ...(entry.candidate ? { candidate: entry.candidate } : {}),
+            })),
+            ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
+          },
+        };
+      } catch (error) {
+        throw toolError(error);
+      }
     },
   );
 

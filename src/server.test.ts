@@ -1859,10 +1859,49 @@ test("Core-bound mutation session tools are registered for durable mutation admi
   const tools = await context.client.listTools();
   assert.ok(tools.tools.some((tool) => tool.name === "core_mutation_session_open"));
   assert.ok(tools.tools.some((tool) => tool.name === "core_mutation_session_status"));
+  assert.ok(tools.tools.some((tool) => tool.name === "core_mutation_session_list"));
   assert.ok(tools.tools.some((tool) => tool.name === "core_mutation_session_reconcile_synchronous"));
   assert.ok(tools.tools.some((tool) => tool.name === "direct_candidate_execution_evidence"));
+  const census = tools.tools.find((tool) => tool.name === "core_mutation_session_list")!;
+  assert.equal(census.annotations?.readOnlyHint, true);
+  assert.equal(census.annotations?.idempotentHint, true);
   const dce = tools.tools.find((tool) => tool.name === "direct_candidate_execution_evidence")!;
   assert.equal(dce.annotations?.readOnlyHint, true);
+});
+
+test("Core mutation session census exposes read-only sanitized durable metadata", async (t) => {
+  const conversationScopeId = "core-census-observer";
+  const conversation = { "openai/session": conversationScopeId };
+  const context = await fixture(t, { git: true, coreMutation: true });
+  const opened = await callOpen(context.client, context.project, conversationScopeId);
+  const workspaceId = structuredContent(opened).workspaceId as string;
+  const bound = await bindTestCoreSession({
+    fixture: context,
+    workspaceId,
+    workspaceRoot: context.project,
+    conversationScopeId,
+    allowedPaths: ["AGENTS.md"],
+  });
+
+  const result = await context.client.callTool({
+    name: "core_mutation_session_list",
+    arguments: {
+      repository: "James3014/devspace",
+      createdAtOrAfter: "1970-01-01T00:00:00.000Z",
+      limit: 10,
+    },
+    _meta: conversation,
+  });
+  assert.equal(result.isError, undefined);
+  const content = structuredContent(result) as {
+    sessions: Array<{ session: Record<string, unknown>; candidate?: Record<string, unknown> }>;
+    nextCursor?: string;
+  };
+  const observed = content.sessions.find((entry) => entry.session.id === bound.session.id);
+  assert.ok(observed);
+  assert.equal("actorKey" in observed.session, false);
+  assert.equal(observed.session.attemptId, bound.binding.attempt_id);
+  assert.equal(observed.session.sourceHead, bound.head);
 });
 
 test("direct_candidate_execution_evidence tool produces valid evidence through host MCP server", async (t) => {
