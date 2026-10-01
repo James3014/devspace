@@ -471,6 +471,85 @@ test("expired prepared recovery crash after cutover close replays only operation
   } finally {DurableOperationStore.prototype.finish=originalFinish;manager?.close();f.close();}
 });
 
+test("host-local expired drained recovery closes only an expired no-restart generation while the exact old runtime remains live",async()=>{
+  const f=fixture();
+  const prepared=await prepareUnexpectedReplacement(f,"expired-drained-no-restart");
+  try {
+    const oldIdentity=prepared.cutover.currentIdentity;
+    assert.throws(()=>f.store.recoverExpiredDrainedNoRestartLocal({
+      cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,
+      confirmCutoverId:prepared.id,observedIdentity:oldIdentity,
+    }),/expired/i);
+    assert.equal(new CutoverStateStore(f.root).get()?.phase,"drained");
+
+    f.advance(120000);
+    assert.throws(()=>f.store.recoverExpiredDrainedNoRestartLocal({
+      cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:2,expectedValidityVersion:1,
+      confirmCutoverId:prepared.id,observedIdentity:oldIdentity,
+    }),/version/i);
+    assert.throws(()=>f.store.recoverExpiredDrainedNoRestartLocal({
+      cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,
+      confirmCutoverId:prepared.id,observedIdentity:{...oldIdentity,serverInstanceId:"different"},
+    }),/original runtime identity/i);
+
+    const recovered=f.store.recoverExpiredDrainedNoRestartLocal({
+      cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,
+      confirmCutoverId:prepared.id,observedIdentity:oldIdentity,
+    });
+    assert.equal(recovered.replayed,false);
+    assert.equal(recovered.cutover.phase,"closed");
+    assert.equal(recovered.cutover.reconciliationReceipt?.terminalReason,"EXPIRED_DRAINED_NO_RESTART");
+    assert.equal(recovered.cutover.reconciliationReceipt?.preRestartDrainObserved,true);
+    assert.equal(recovered.cutover.restartRequest,undefined);
+    assert.deepEqual(recovered.cutover.expiredDrainedNoRestart?.observedIdentity,oldIdentity);
+    assert.equal(recovered.cutover.expiredDrainedNoRestart?.restartRequested,false);
+    assert.equal(recovered.cutover.expiredDrainedNoRestart?.restartScheduled,false);
+    assert.equal(recovered.lease.terminalState,"expired_reconciled");
+    assert.equal(recovered.lease.operationState,"finished");
+    assert.equal(recovered.lease.operationHandle,undefined);
+    assert.equal(recovered.operation.status,"failed");
+    assert.equal(recovered.operation.errorCode,"EXPIRED_DRAINED_NO_RESTART");
+    assert.equal(recovered.operation.receipt?.lifecycleTerminal,true);
+    assert.equal(recovered.operation.receipt?.recoveryKind,"expired_drained_no_restart");
+
+    const replay=f.store.recoverExpiredDrainedNoRestartLocal({
+      cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,
+      confirmCutoverId:prepared.id,observedIdentity:oldIdentity,
+    });
+    assert.equal(replay.replayed,true);
+    assert.deepEqual(replay.cutover,recovered.cutover);
+    assert.deepEqual(replay.reconciliation,recovered.reconciliation);
+  } finally {prepared.manager.close();f.close();}
+});
+
+test("expired drained recovery refuses any restart lineage",async()=>{
+  const f=fixture();
+  const prepared=await prepareUnexpectedReplacement(f,"expired-drained-restart-negative");
+  try {
+    let scheduled=0;
+    await prepared.manager.restartCutover(
+      prepared.id,
+      prepared.cutover.currentIdentity,
+      prepared.cutover.restart.buildReady,
+      async()=>({buildReady:true,detail:"exact original target"}),
+      {
+        actuator:"launchd-self" as const,
+        serviceLabel:"test.service",
+        launchdTarget:"gui/501/test.service",
+        schedule:()=>{scheduled+=1;return {scheduled:true as const,actuator:"launchd-self" as const,serviceLabel:"test.service",launchdTarget:"gui/501/test.service"};},
+      },
+      prepared.context,
+    );
+    assert.equal(scheduled,1);
+    f.advance(120000);
+    assert.throws(()=>f.store.recoverExpiredDrainedNoRestartLocal({
+      cutoverId:prepared.id,carrierId:prepared.approved.id,expectedVersion:1,expectedValidityVersion:1,
+      confirmCutoverId:prepared.id,observedIdentity:prepared.cutover.currentIdentity,
+    }),/restart lineage/i);
+    assert.equal(new CutoverStateStore(f.root).get()?.phase,"drained");
+  } finally {prepared.manager.close();f.close();}
+});
+
 test("host-local unexpected replacement recovery closes only an expired drained no-restart generation",async()=>{
   const f=fixture();
   const prepared=await prepareUnexpectedReplacement(f,"unexpected-replacement");
