@@ -258,6 +258,53 @@ test("missing identity with surviving integrity key fails closed instead of mint
   }
 });
 
+test("missing historical workspace roots do not break persistent host identity containment", () => {
+  const f = fixture();
+  try {
+    const missingWorkspace = join(f.root, "missing-managed-worktree");
+    const fileInsteadOfDirectory = join(f.root, "historical-worktree-file");
+    writeFileSync(fileInsteadOfDirectory, "not a directory\n", "utf8");
+
+    const identity = loadOrCreatePhysicalHostIdentity({
+      stateDir: f.stateDir,
+      workspaceRoots: [
+        f.workspace,
+        missingWorkspace,
+        join(fileInsteadOfDirectory, "child"),
+      ],
+      randomUuid: () => "79797979-7979-4979-8979-797979797979",
+    });
+
+    assert.equal(identity.hostId, "host-79797979-7979-4979-8979-797979797979");
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("a previously missing workspace root is revalidated after it materializes", () => {
+  if (process.platform === "win32") return;
+  const f = fixture();
+  try {
+    const lateWorkspace = join(f.root, "late-managed-worktree");
+    loadOrCreatePhysicalHostIdentity({
+      stateDir: f.stateDir,
+      workspaceRoots: [lateWorkspace],
+      randomUuid: () => "78787878-7878-4878-8878-787878787878",
+    });
+
+    symlinkSync(f.root, lateWorkspace, "dir");
+    assert.throws(
+      () => loadOrCreatePhysicalHostIdentity({
+        stateDir: f.stateDir,
+        workspaceRoots: [lateWorkspace],
+      }),
+      /outside active workspace roots/,
+    );
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
 test("persistent host identity state must remain outside active workspace authority", () => {
   const f = fixture();
   try {
@@ -338,6 +385,29 @@ test("registers the zero-config local snapshot as a read-only MCP tool", async (
     assert.equal(output.structuredContent.static.hostId.startsWith("host-"), true);
     assert.equal(output.structuredContent.verified.devspace.serverInstanceId, "server-tool");
     assert.equal(output.structuredContent.verified.capabilityManifest.manifestSha256, manifest.manifestSha256);
+  } finally {
+    await server.close();
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("registers host capability snapshot when a historical workspace root is missing", async () => {
+  const f = fixture();
+  const server = new McpServer({ name: "host-snapshot-missing-root-test", version: "1" });
+  try {
+    registerHostCapabilitySnapshotTool(server, {
+      stateDir: f.stateDir,
+      workspaceRoots: () => [f.workspace, join(f.root, "missing-historical-worktree")],
+      runtimeIdentity: runtime("server-missing-root"),
+      capabilityManifest: manifest,
+      observeMetrics: () => metrics,
+      now: () => new Date("2026-09-26T00:27:00Z"),
+    });
+    const registered = (server as any)._registeredTools as Record<string, {
+      handler: (input: unknown, extra: unknown) => Promise<any>;
+    }>;
+    const output = await registered.host_capability_snapshot.handler({}, {});
+    assert.equal(output.structuredContent.verified.devspace.serverInstanceId, "server-missing-root");
   } finally {
     await server.close();
     rmSync(f.root, { recursive: true, force: true });
