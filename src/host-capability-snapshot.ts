@@ -231,6 +231,15 @@ export function loadOrCreatePhysicalHostIdentity(options: {
 }): PhysicalHostIdentity {
   const identityDir = resolveIdentityStateDirectory(options.stateDir, options.workspaceRoots ?? []);
   const path = join(identityDir, HOST_IDENTITY_FILE);
+  const keyPath = join(identityDir, HOST_IDENTITY_KEY_FILE);
+  const identityExists = existsSync(path);
+  const keyExists = existsSync(keyPath);
+  if (identityExists && !keyExists) {
+    throw new Error("Physical host identity integrity key is missing; refusing to re-sign existing identity.");
+  }
+  if (!identityExists && keyExists) {
+    throw new Error("Physical host identity is missing while its integrity key remains; refusing to mint a replacement identity.");
+  }
   const integrityKey = loadOrCreateIntegrityKey(identityDir, path);
 
   const readExisting = (): PhysicalHostIdentity => {

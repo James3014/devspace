@@ -235,6 +235,29 @@ test("syntactically valid persistent host identity replacement fails integrity v
   }
 });
 
+test("missing identity with surviving integrity key fails closed instead of minting a replacement", () => {
+  const f = fixture();
+  try {
+    loadOrCreatePhysicalHostIdentity({
+      stateDir: f.stateDir,
+      workspaceRoots: [f.workspace],
+      randomUuid: () => "77777777-7777-4777-8777-777777777777",
+    });
+    const identityPath = join(f.stateDir, "physical-host-identity", "identity.json");
+    rmSync(identityPath);
+    assert.throws(
+      () => loadOrCreatePhysicalHostIdentity({
+        stateDir: f.stateDir,
+        workspaceRoots: [f.workspace],
+        randomUuid: () => "99999999-9999-4999-8999-999999999999",
+      }),
+      /identity is missing.*refusing to mint a replacement identity/i,
+    );
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
 test("persistent host identity state must remain outside active workspace authority", () => {
   const f = fixture();
   try {
