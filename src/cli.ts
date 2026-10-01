@@ -850,6 +850,10 @@ async function runCutoverCommand(args: string[]): Promise<void> {
     runCutoverAbortExpiredPrepared(args.slice(1));
     return;
   }
+  if (subcommand === "recover-expired-drained") {
+    await runCutoverExpiredDrainedRecovery(args.slice(1));
+    return;
+  }
   if (subcommand === "recover-capability-mismatch") {
     await runCutoverCapabilityMismatchRecovery(args.slice(1));
     return;
@@ -870,7 +874,7 @@ async function runCutoverCommand(args: string[]): Promise<void> {
     printCutoverHelp();
     return;
   }
-  throw new Error("Usage: devspace cutover <status|recover|observe|repair|abort-expired-prepared|recover-capability-mismatch|recover-unexpected-replacement|restart-bound|release-terminal-lease>");
+  throw new Error("Usage: devspace cutover <status|recover|observe|repair|abort-expired-prepared|recover-expired-drained|recover-capability-mismatch|recover-unexpected-replacement|restart-bound|release-terminal-lease>");
 }
 
 function printCutoverHelp(): void {
@@ -884,6 +888,7 @@ function printCutoverHelp(): void {
       "  devspace cutover observe --cutover-id <id> --workspace-id <id> --agent-id <id> [--json]",
       "  devspace cutover repair --cutover-id <id> --workspace-id <id> --agent-id <id> [--server-url <url>] [--package-root <path>] [--state-dir <path>] [--json]",
       "  devspace cutover abort-expired-prepared --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--json]",
+      "  devspace cutover recover-expired-drained --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--json]",
       "  devspace cutover recover-capability-mismatch --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --package-root <path> --confirm <id> [--json]",
       "  devspace cutover recover-unexpected-replacement --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --package-root <path> --confirm <id> [--json]",
       "  devspace cutover restart-bound --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --credential-file <owner-private-intent.json> --package-root <path> --confirm <id> [--json]",
@@ -1213,6 +1218,102 @@ function runCutoverAbortExpiredPrepared(args: string[]): void {
       return;
     }
     console.log(`Recovered expired prepared cutover ${result.cutover.cutoverId}: phase=${result.cutover.phase}; lease=${result.lease.terminalState}; replayed=${String(result.replayed)}`);
+  } finally {
+    bindings.close();
+  }
+}
+
+async function runCutoverExpiredDrainedRecovery(args: string[]): Promise<void> {
+  let cutoverId: string | undefined;
+  let carrierId: string | undefined;
+  let version: number | undefined;
+  let validityVersion: number | undefined;
+  let confirmCutoverId: string | undefined;
+  let json = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    const value = (): string => {
+      const next = args[++index];
+      if (!next) throw new Error(`${argument} requires a value.`);
+      return next;
+    };
+    if (argument === "--json") json = true;
+    else if (argument === "--cutover-id") cutoverId = value();
+    else if (argument === "--carrier") carrierId = value();
+    else if (argument === "--version") version = Number(value());
+    else if (argument === "--validity-version") validityVersion = Number(value());
+    else if (argument === "--confirm") confirmCutoverId = value();
+    else throw new Error(`Unknown cutover recover-expired-drained flag: ${argument}`);
+  }
+  if (!cutoverId || !carrierId || !Number.isSafeInteger(version) || !Number.isSafeInteger(validityVersion) ||
+      (version ?? 0) < 1 || (validityVersion ?? 0) < 1 || confirmCutoverId !== cutoverId) {
+    throw new Error("Usage: devspace cutover recover-expired-drained --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--json]");
+  }
+
+  const config = loadConfig();
+  if (!["127.0.0.1", "localhost", "::1"].includes(config.host)) {
+    throw new Error("Expired drained recovery requires a loopback DevSpace host.");
+  }
+  const response = await fetch(new URL("/healthz", `http://${config.host}:${config.port}`), { redirect: "error" });
+  if (!response.ok) throw new Error(`DevSpace /healthz failed with HTTP ${response.status}.`);
+  const health = await response.json() as {
+    ok?: unknown;
+    build?: { source_commit?: unknown; build_id?: unknown };
+    capabilityManifest?: { manifestSha256?: unknown; missing?: unknown };
+    mcp?: {
+      serverInstanceId?: unknown;
+      cutoverMode?: unknown;
+      reconciliationRequired?: unknown;
+    };
+  };
+  const sourceCommit = health.build?.source_commit;
+  const buildId = health.build?.build_id;
+  const capabilityManifestSha256 = health.capabilityManifest?.manifestSha256;
+  const serverInstanceId = health.mcp?.serverInstanceId;
+  if (
+    health.ok !== true ||
+    typeof sourceCommit !== "string" || !/^[0-9a-f]{40}$/.test(sourceCommit) ||
+    typeof buildId !== "string" || !buildId ||
+    typeof capabilityManifestSha256 !== "string" || !/^[0-9a-f]{64}$/.test(capabilityManifestSha256) ||
+    typeof serverInstanceId !== "string" || !serverInstanceId ||
+    !Array.isArray(health.capabilityManifest?.missing) || health.capabilityManifest.missing.length !== 0 ||
+    health.mcp?.cutoverMode !== "drain" ||
+    health.mcp?.reconciliationRequired !== true
+  ) {
+    throw new Error("Live /healthz is not the exact drained runtime required for expired drained recovery.");
+  }
+
+  const activeCutover = new CutoverStateStore(config.stateDir).get();
+  if (!activeCutover || activeCutover.cutoverId !== cutoverId) {
+    throw new Error("Expired drained recovery requires the exact active cutover.");
+  }
+  const observedIdentity = { serverInstanceId, sourceCommit, buildId, capabilityManifestSha256 };
+  if (
+    observedIdentity.serverInstanceId !== activeCutover.oldServerIdentity.serverInstanceId ||
+    observedIdentity.sourceCommit !== activeCutover.oldServerIdentity.sourceCommit ||
+    observedIdentity.buildId !== activeCutover.oldServerIdentity.buildId ||
+    observedIdentity.capabilityManifestSha256 !== activeCutover.oldServerIdentity.capabilityManifestSha256
+  ) {
+    throw new Error("Live /healthz does not match the cutover oldServerIdentity; refusing expired drained recovery.");
+  }
+
+  const bindings = new CarrierBindingStore(config.stateDir);
+  try {
+    const result = bindings.recoverExpiredDrainedNoRestartLocal({
+      cutoverId,
+      carrierId,
+      expectedVersion: version as number,
+      expectedValidityVersion: validityVersion as number,
+      confirmCutoverId,
+      observedIdentity,
+    });
+    if (json) {
+      printJson(result);
+      return;
+    }
+    console.log(
+      `Recovered expired drained cutover ${result.cutover.cutoverId}: phase=${result.cutover.phase}; lease=${result.lease.terminalState}; replayed=${String(result.replayed)}`,
+    );
   } finally {
     bindings.close();
   }

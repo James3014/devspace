@@ -140,7 +140,21 @@ continue through existing durable consumer checks and retain uncertain effects.
 After the cutover deadline, preparation, a new start, drain and restart are denied.
 Only exact persisted reconciliation/finish remains permitted under current carrier
 authority. Carrier reauthorization does not extend the cutover deadline or renew
-an expired resource lease. For an expired pinned cutover, `cutover_finish` uses a
+an expired resource lease.
+
+A coordination-bound cutover that already reached `drained` but expired before
+any restart request has a separate host-local terminal recovery:
+`devspace cutover recover-expired-drained`. It is not a retry or supersession.
+It succeeds only when the original carrier/cutover/operation/lease identities still
+match, both carrier validity and cutover approval are expired, durable drain evidence
+exists, no restart marker or conflicting terminal evidence exists, and fresh
+loopback `/healthz` proves the exact original server/source/build/capability
+identity is still running in `drain` mode with reconciliation required. The
+recovery terminally fails the old operation, reconciles the pinned lease, and
+closes only that exact cutover generation. It never restarts a service, deploys a
+build, changes the expected target, creates a successor, or grants new authority.
+
+For an expired pinned cutover, `cutover_finish` uses a
 terminal-recovery check that preserves the original owner, grant version, resource,
 operation, pin and CAS. It cannot authorize start, drain or restart. After a positive
 replacement/workspace/agent witness, the exact closed file is independently checked

@@ -115,6 +115,21 @@ for (const args of [
 
 
 for (const args of [
+  ["cutover", "recover-expired-drained", "--cutover-id", "c"],
+  ["cutover", "recover-expired-drained", "--cutover-id", "c", "--carrier", "carrier", "--version", "0", "--validity-version", "1", "--confirm", "c"],
+  ["cutover", "recover-expired-drained", "--cutover-id", "c", "--carrier", "carrier", "--version", "1", "--validity-version", "1", "--confirm", "other"],
+  ["cutover", "recover-expired-drained", "--cutover-id", "c", "--carrier", "carrier", "--version", "1", "--validity-version", "1", "--confirm", "c", "--credential", "forbidden"],
+]) {
+  assert.throws(
+    () => execFileSync("node", ["--import", "tsx", "src/cli.ts", ...args], { encoding: "utf8", env: { ...process.env, DEVSPACE_CONFIG_DIR: "/tmp/devspace-cli-invalid-expired-drained-test" } }),
+    (error: unknown) => {
+      const detail = error as { stderr?: string; status?: number };
+      return detail.status !== 0 && /Usage:|Unknown cutover recover-expired-drained flag/.test(detail.stderr ?? "");
+    },
+  );
+}
+
+for (const args of [
   ["cutover", "recover-unexpected-replacement", "--cutover-id", "c"],
   ["cutover", "recover-unexpected-replacement", "--cutover-id", "c", "--carrier", "carrier", "--version", "0", "--validity-version", "1", "--package-root", "/tmp", "--confirm", "c"],
   ["cutover", "recover-unexpected-replacement", "--cutover-id", "c", "--carrier", "carrier", "--version", "1", "--validity-version", "1", "--package-root", "/tmp", "--confirm", "other"],
@@ -148,6 +163,37 @@ for (const args of [
 }
 
 
+
+test("recover-expired-drained requires live drain-mode reconciliation before touching recovery state", async () => {
+  const root=mkdtempSync(join(tmpdir(),"devspace-cli-expired-drained-health-"));
+  const server=createHttpServer((req,res)=>{
+    if(req.url!=="/healthz"){res.statusCode=404;res.end();return;}
+    res.setHeader("content-type","application/json");
+    res.end(JSON.stringify({
+      ok:true,
+      build:{source_commit:"a".repeat(40),build_id:"old"},
+      capabilityManifest:{manifestSha256:"c".repeat(64),missing:[]},
+      mcp:{serverInstanceId:"old-server",cutoverMode:"normal",reconciliationRequired:false},
+    }));
+  });
+  await new Promise<void>((resolve,reject)=>server.listen(0,"127.0.0.1",resolve).once("error",reject));
+  const address=server.address();
+  assert.ok(address && typeof address==="object");
+  try {
+    await assert.rejects(
+      execFileAsync("node",["--import","tsx","src/cli.ts","cutover","recover-expired-drained",
+        "--cutover-id","cutover-test","--carrier","carrier-test","--version","1","--validity-version","1",
+        "--confirm","cutover-test","--json"],{
+        cwd:process.cwd(),timeout:15000,
+        env:{...process.env,DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_ALLOWED_ROOTS:root,DEVSPACE_WORKTREE_ROOT:join(root,"worktrees"),DEVSPACE_STATE_DIR:join(root,"state"),DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-long-enough",HOST:"127.0.0.1",PORT:String(address.port)},
+      }),
+      (error:unknown)=>/exact drained runtime required/i.test((error as {stderr?:string}).stderr??String(error)),
+    );
+  } finally {
+    await new Promise<void>(resolve=>server.close(()=>resolve()));
+    rmSync(root,{recursive:true,force:true});
+  }
+});
 
 test("cutover recover accepts explicit package root and fails closed when target build-manifest attribution is missing", async () => {
   const root=mkdtempSync(join(tmpdir(),"devspace-cli-cutover-target-missing-"));
