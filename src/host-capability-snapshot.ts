@@ -1,13 +1,15 @@
-import { createHash, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import {
   chmodSync,
   closeSync,
   constants,
+  existsSync,
   fstatSync,
   lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
+  realpathSync,
   writeFileSync,
 } from "node:fs";
 import {
@@ -28,11 +30,16 @@ export const PHYSICAL_HOST_IDENTITY_SCHEMA = "devspace.physical_host_identity.v1
 export const HOST_CAPABILITY_SNAPSHOT_SCHEMA = "devspace.host_capability_snapshot.v1" as const;
 const HOST_ID = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const SHA256 = /^[0-9a-f]{64}$/;
+const HOST_IDENTITY_DIRECTORY = "physical-host-identity";
+const HOST_IDENTITY_FILE = "identity.json";
+const HOST_IDENTITY_KEY_FILE = "integrity.key";
+const HOST_IDENTITY_KEY_BYTES = 32;
 
 export interface PhysicalHostIdentity {
   schema: typeof PHYSICAL_HOST_IDENTITY_SCHEMA;
   hostId: string;
   createdAt: string;
+  integrityHmacSha256: string;
 }
 
 export interface HostCapabilityStaticFacts {
@@ -90,23 +97,100 @@ export interface HostMetrics {
 }
 
 function pathInside(root: string, candidate: string): boolean {
-  const rel = relative(resolve(root), resolve(candidate));
+  const rel = relative(root, candidate);
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
 }
 
-function assertPrivateIdentityFile(path: string): void {
+function canonicalWorkspaceRoot(root: string): string {
+  return realpathSync(resolve(root));
+}
+
+function resolveIdentityStateDirectory(stateDir: string, workspaceRoots: string[]): string {
+  const ownerStateDir = resolve(stateDir);
+  mkdirSync(ownerStateDir, { recursive: true });
+  const ownerStateStat = lstatSync(ownerStateDir);
+  if (!ownerStateStat.isDirectory() || ownerStateStat.isSymbolicLink()) {
+    throw new Error("DevSpace owner state directory must be a real directory, not a symlink.");
+  }
+  const canonicalOwnerStateDir = realpathSync(ownerStateDir);
+  const canonicalRoots = workspaceRoots.map(canonicalWorkspaceRoot);
+  if (canonicalRoots.some((root) => pathInside(root, canonicalOwnerStateDir))) {
+    throw new Error("Physical host identity state must live outside active workspace roots.");
+  }
+  const identityDir = join(ownerStateDir, HOST_IDENTITY_DIRECTORY);
+  mkdirSync(identityDir, { recursive: true, mode: 0o700 });
+  const stat = lstatSync(identityDir);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    throw new Error("Physical host identity state directory must be a real directory, not a symlink.");
+  }
+  if (process.platform !== "win32" && (stat.mode & 0o077) !== 0) {
+    throw new Error("Physical host identity state directory must not grant group/other permissions (use chmod 700).");
+  }
+  const canonicalIdentityDir = realpathSync(identityDir);
+  if (canonicalRoots.some((root) => pathInside(root, canonicalIdentityDir))) {
+    throw new Error("Physical host identity state must live outside active workspace roots.");
+  }
+  return canonicalIdentityDir;
+}
+
+function assertPrivateIdentityFile(path: string, label: string): void {
   const stat = lstatSync(path);
   if (!stat.isFile() || stat.isSymbolicLink()) {
-    throw new Error("Physical host identity must be a regular file, not a symlink.");
+    throw new Error(`${label} must be a regular file, not a symlink.`);
   }
   if (process.platform !== "win32") {
     if ((stat.mode & 0o077) !== 0) {
-      throw new Error("Physical host identity must not grant group/other permissions (use chmod 600).");
+      throw new Error(`${label} must not grant group/other permissions (use chmod 600).`);
     }
     if (stat.nlink !== 1) {
-      throw new Error("Physical host identity must be a single-link owner file.");
+      throw new Error(`${label} must be a single-link owner file.`);
     }
   }
+}
+
+function readIntegrityKey(path: string): Buffer {
+  assertPrivateIdentityFile(path, "Physical host identity integrity key");
+  const encoded = readFileSync(path, "utf8").trim();
+  const key = Buffer.from(encoded, "base64url");
+  if (key.length !== HOST_IDENTITY_KEY_BYTES) {
+    throw new Error("Physical host identity integrity key is invalid.");
+  }
+  return key;
+}
+
+function loadOrCreateIntegrityKey(identityDir: string, identityPath: string): Buffer {
+  const keyPath = join(identityDir, HOST_IDENTITY_KEY_FILE);
+  try {
+    return readIntegrityKey(keyPath);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  if (existsSync(identityPath)) {
+    throw new Error("Physical host identity integrity key is missing; refusing to re-sign existing identity.");
+  }
+  const key = randomBytes(HOST_IDENTITY_KEY_BYTES);
+  let fd: number | undefined;
+  try {
+    const flags = constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY
+      | (process.platform === "win32" ? 0 : constants.O_NOFOLLOW);
+    fd = openSync(keyPath, flags, 0o600);
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw new Error("Physical host identity integrity key target is not a regular file.");
+    writeFileSync(fd, `${key.toString("base64url")}\n`, "utf8");
+    if (process.platform !== "win32") chmodSync(keyPath, 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") return readIntegrityKey(keyPath);
+    throw error;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+  return readIntegrityKey(keyPath);
+}
+
+function identityIntegrity(identity: Pick<PhysicalHostIdentity, "schema" | "hostId" | "createdAt">, key: Buffer): string {
+  return createHmac("sha256", key)
+    .update(`${identity.schema}\n${identity.hostId}\n${identity.createdAt}\n`, "utf8")
+    .digest("hex");
 }
 
 function parseIso(value: unknown, field: string): string {
@@ -127,10 +211,15 @@ export function parsePhysicalHostIdentity(value: unknown): PhysicalHostIdentity 
   if (typeof record.hostId !== "string" || !HOST_ID.test(record.hostId)) {
     throw new Error("Invalid physical hostId.");
   }
+  const createdAt = parseIso(record.createdAt, "physical host identity createdAt");
+  if (typeof record.integrityHmacSha256 !== "string" || !SHA256.test(record.integrityHmacSha256)) {
+    throw new Error("Invalid physical host identity integrityHmacSha256.");
+  }
   return {
     schema: PHYSICAL_HOST_IDENTITY_SCHEMA,
     hostId: record.hostId,
-    createdAt: parseIso(record.createdAt, "physical host identity createdAt"),
+    createdAt,
+    integrityHmacSha256: record.integrityHmacSha256,
   };
 }
 
@@ -140,16 +229,23 @@ export function loadOrCreatePhysicalHostIdentity(options: {
   randomUuid?: () => string;
   now?: () => Date;
 }): PhysicalHostIdentity {
-  const stateDir = resolve(options.stateDir);
-  if ((options.workspaceRoots ?? []).some((root) => pathInside(resolve(root), stateDir))) {
-    throw new Error("Physical host identity state must live outside active workspace roots.");
-  }
-  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
-  const path = join(stateDir, "host-identity.json");
+  const identityDir = resolveIdentityStateDirectory(options.stateDir, options.workspaceRoots ?? []);
+  const path = join(identityDir, HOST_IDENTITY_FILE);
+  const integrityKey = loadOrCreateIntegrityKey(identityDir, path);
 
   const readExisting = (): PhysicalHostIdentity => {
-    assertPrivateIdentityFile(path);
-    return parsePhysicalHostIdentity(JSON.parse(readFileSync(path, "utf8")) as unknown);
+    const currentIdentityDir = resolveIdentityStateDirectory(options.stateDir, options.workspaceRoots ?? []);
+    if (currentIdentityDir !== identityDir) {
+      throw new Error("Physical host identity state directory changed after initialization.");
+    }
+    assertPrivateIdentityFile(path, "Physical host identity");
+    const identity = parsePhysicalHostIdentity(JSON.parse(readFileSync(path, "utf8")) as unknown);
+    const expected = Buffer.from(identityIntegrity(identity, integrityKey), "hex");
+    const observed = Buffer.from(identity.integrityHmacSha256, "hex");
+    if (!timingSafeEqual(expected, observed)) {
+      throw new Error("Physical host identity integrity mismatch.");
+    }
+    return identity;
   };
 
   try {
@@ -158,10 +254,14 @@ export function loadOrCreatePhysicalHostIdentity(options: {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
 
-  const identity: PhysicalHostIdentity = {
+  const unsignedIdentity = {
     schema: PHYSICAL_HOST_IDENTITY_SCHEMA,
     hostId: `host-${(options.randomUuid ?? randomUUID)()}`,
     createdAt: (options.now ?? (() => new Date()))().toISOString(),
+  } as const;
+  const identity: PhysicalHostIdentity = {
+    ...unsignedIdentity,
+    integrityHmacSha256: identityIntegrity(unsignedIdentity, integrityKey),
   };
   parsePhysicalHostIdentity(identity);
 
@@ -235,6 +335,9 @@ export function createHostCapabilitySnapshot(input: {
   metrics?: HostMetrics;
   now?: () => Date;
 }): HostCapabilitySnapshot {
+  if (input.identity.hostId === input.runtimeIdentity.serverInstanceId) {
+    throw new Error("Physical hostId must remain distinct from ephemeral serverInstanceId.");
+  }
   const metrics = input.metrics ?? observeHostMetrics();
   const observedAt = (input.now ?? (() => new Date()))().toISOString();
   const staticFacts: HostCapabilityStaticFacts = {
@@ -299,9 +402,7 @@ export function createLocalHostCapabilitySnapshotReader(
     workspaceRoots: currentWorkspaceRoots(),
   });
   return () => {
-    if (currentWorkspaceRoots().some((root) => pathInside(resolve(root), resolve(options.stateDir)))) {
-      throw new Error("Physical host identity state overlaps an active workspace root.");
-    }
+    resolveIdentityStateDirectory(options.stateDir, currentWorkspaceRoots());
     return createHostCapabilitySnapshot({
       identity,
       runtimeIdentity: options.runtimeIdentity,
@@ -392,6 +493,9 @@ export function parseHostCapabilitySnapshot(value: unknown): HostCapabilitySnaps
     typeof devspace.startedAt !== "string"
   ) {
     throw new Error("Invalid verified DevSpace identity.");
+  }
+  if (hostId === devspace.serverInstanceId) {
+    throw new Error("Physical hostId must remain distinct from ephemeral serverInstanceId.");
   }
   if (typeof freshness.telemetrySha256 !== "string" || !SHA256.test(freshness.telemetrySha256)) {
     throw new Error("Invalid host capability telemetry digest.");

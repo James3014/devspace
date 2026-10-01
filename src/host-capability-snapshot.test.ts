@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -185,17 +185,50 @@ test("dynamic telemetry changes snapshot identity without changing capability ma
 test("malformed persistent host identity fails closed instead of minting a replacement", () => {
   const f = fixture();
   try {
-    mkdirSync(f.stateDir, { recursive: true });
-    const path = join(f.stateDir, "host-identity.json");
-    writeFileSync(path, JSON.stringify({ schema: "devspace.physical_host_identity.v1", hostId: "../bad", createdAt: "nope" }));
+    loadOrCreatePhysicalHostIdentity({
+      stateDir: f.stateDir,
+      workspaceRoots: [f.workspace],
+      randomUuid: () => "55555555-5555-4555-8555-555555555555",
+    });
+    const path = join(f.stateDir, "physical-host-identity", "identity.json");
+    const tampered = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    tampered.hostId = "../bad";
+    tampered.createdAt = "nope";
+    writeFileSync(path, `${JSON.stringify(tampered, null, 2)}\n`, "utf8");
     if (process.platform !== "win32") chmodSync(path, 0o600);
     assert.throws(
       () => loadOrCreatePhysicalHostIdentity({
         stateDir: f.stateDir,
         workspaceRoots: [f.workspace],
-        randomUuid: () => "55555555-5555-4555-8555-555555555555",
       }),
       /Invalid physical hostId/,
+    );
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("syntactically valid persistent host identity replacement fails integrity verification", () => {
+  const f = fixture();
+  try {
+    loadOrCreatePhysicalHostIdentity({
+      stateDir: f.stateDir,
+      workspaceRoots: [f.workspace],
+      randomUuid: () => "66666666-6666-4666-8666-666666666666",
+      now: () => new Date("2026-09-26T00:00:00Z"),
+    });
+    const path = join(f.stateDir, "physical-host-identity", "identity.json");
+    const tampered = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    tampered.hostId = "host-77777777-7777-4777-8777-777777777777";
+    tampered.createdAt = "2026-09-26T00:01:00.000Z";
+    writeFileSync(path, `${JSON.stringify(tampered, null, 2)}\n`, "utf8");
+    if (process.platform !== "win32") chmodSync(path, 0o600);
+    assert.throws(
+      () => loadOrCreatePhysicalHostIdentity({
+        stateDir: f.stateDir,
+        workspaceRoots: [f.workspace],
+      }),
+      /integrity mismatch/,
     );
   } finally {
     rmSync(f.root, { recursive: true, force: true });
@@ -212,6 +245,46 @@ test("persistent host identity state must remain outside active workspace author
         workspaceRoots: [f.workspace],
       }),
       /outside active workspace roots/,
+    );
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("stateDir symlink into a workspace cannot bypass owner-state containment", () => {
+  if (process.platform === "win32") return;
+  const f = fixture();
+  try {
+    const stateLink = join(f.root, "owner-state-link");
+    symlinkSync(f.workspace, stateLink, "dir");
+    assert.throws(
+      () => loadOrCreatePhysicalHostIdentity({
+        stateDir: stateLink,
+        workspaceRoots: [f.workspace],
+      }),
+      /real directory, not a symlink|outside active workspace roots/,
+    );
+  } finally {
+    rmSync(f.root, { recursive: true, force: true });
+  }
+});
+
+test("physical host identity cannot equal the ephemeral server instance identity", () => {
+  const f = fixture();
+  try {
+    const identity = loadOrCreatePhysicalHostIdentity({
+      stateDir: f.stateDir,
+      workspaceRoots: [f.workspace],
+      randomUuid: () => "88888888-8888-4888-8888-888888888888",
+    });
+    assert.throws(
+      () => createHostCapabilitySnapshot({
+        identity,
+        runtimeIdentity: runtime(identity.hostId),
+        capabilityManifest: manifest,
+        metrics,
+      }),
+      /distinct from ephemeral serverInstanceId/,
     );
   } finally {
     rmSync(f.root, { recursive: true, force: true });
@@ -262,7 +335,7 @@ test("snapshot reader fails closed if a later workspace overlaps the identity st
     });
     assert.equal(readSnapshot().verified.devspace.serverInstanceId, "server-a");
     roots = [f.root];
-    assert.throws(() => readSnapshot(), /overlaps an active workspace root/);
+    assert.throws(() => readSnapshot(), /outside active workspace roots/);
   } finally {
     rmSync(f.root, { recursive: true, force: true });
   }
