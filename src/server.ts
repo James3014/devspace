@@ -221,6 +221,7 @@ import {
 } from "./repository-intelligence.js";
 import { registerRepositoryIntelligenceArtifactTool } from "./repository-intelligence-artifact.js";
 import { registerPhysicalHostRegistryTools } from "./physical-host-registry.js";
+import { registerHostCapabilitySnapshotTool } from "./host-capability-snapshot.js";
 import { canonicalizePath } from "./roots.js";
 import { applyHostStoragePlan, buildHostStoragePlan, resolveHostStorageRoot } from "./host-storage-retention.js";
 
@@ -422,6 +423,7 @@ const DIRECT_CODING_TOOL_NAMES = new Set<string>([
   toolNames.shell,
   "command_status",
   "workspace_verify",
+  "host_capability_snapshot",
 ]);
 
 const workspaceIdDescription =
@@ -3350,6 +3352,12 @@ export function createMcpServer(
   });
 
   registerRepositoryIntelligenceTools(server, config, workspaces);
+  registerHostCapabilitySnapshotTool(server, {
+    stateDir: config.stateDir,
+    workspaceRoots: () => workspaces.listSessions().map((session) => session.root),
+    runtimeIdentity: runtimeBuildIdentity,
+    capabilityManifest,
+  });
   registerPhysicalHostRegistryTools(server, {
     registryPath: process.env.DEVSPACE_PHYSICAL_HOST_REGISTRY,
     allowedRoots: config.allowedRoots,
