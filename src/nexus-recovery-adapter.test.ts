@@ -11,8 +11,12 @@ import {
   hashJson,
 } from "./durable-operations.js";
 import {
+  NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256,
+  NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256,
+  NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE,
   NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_RECEIPT_SCHEMA,
   NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_SCHEMA,
+  NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE,
   NEXUS_GATEWAY_RECOVERY_SCHEMA,
   NexusRecoveryAdapter,
   type NexusGatewayRecoveryMaterializationReceipt,
@@ -26,6 +30,28 @@ const DEFAULT_REQUEST_BYTES = Buffer.from('{"generation":"request-v1"}\n', "utf8
 function sha256(value: Uint8Array | string): string {
   return createHash("sha256").update(value).digest("hex");
 }
+
+test("Campaign B: recovery bridges pin the current accepted Nexus deployment contract without widening manager trust", () => {
+  assert.equal(
+    NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256,
+    "909879c5719c153f2eb7eeecb5cc080de8824a949c8101b0301a4e6baa598867",
+  );
+  assert.equal(
+    NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256,
+    "7f93a472870303d44f7c57b02362ac3f7599216576ce620334a847c4ce4a1e0c",
+  );
+  for (const bridge of [NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE, NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE]) {
+    assert.match(
+      bridge,
+      /ACCEPTED_CONTRACT_SHA256 = "909879c5719c153f2eb7eeecb5cc080de8824a949c8101b0301a4e6baa598867"/,
+    );
+    assert.match(
+      bridge,
+      /ACCEPTED_MANAGER_SHA256 = "7f93a472870303d44f7c57b02362ac3f7599216576ce620334a847c4ce4a1e0c"/,
+    );
+    assert.match(bridge, /gateway deployment authority contract hash mismatch/);
+  }
+});
 
 async function createFixture() {
   const root = await mkdtemp(join(tmpdir(), "devspace-nexus-adapter-test-"));
