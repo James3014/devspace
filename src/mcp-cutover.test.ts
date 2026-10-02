@@ -519,6 +519,8 @@ test("P0-1: unknown/newly-registered mutation tool fails closed during cutover, 
     }
 
     // 2. Known control/read tools in CUTOVER_SAFE_TOOLS MUST be allowed
+    assert.equal(CUTOVER_SAFE_TOOLS.has("coordination_recovery_request"), true);
+    assert.equal(CONSEQUENTIAL_MCP_TOOLS.has("coordination_recovery_request"), false);
     for (const safeTool of CUTOVER_SAFE_TOOLS) {
       assert.doesNotThrow(
         () => old.assertToolAllowed(safeTool),
