@@ -29,7 +29,8 @@ export type DurableOperationKind =
   | "nexus_gateway_recovery_materialize"
   | "cutover_start"
   | "host_operation"
-  | "chat_swarm_reconciliation";
+  | "chat_swarm_reconciliation"
+  | "core_candidate_acquisition";
 export type DurableOperationStatus = "started" | "succeeded" | "failed" | "outcome_unknown";
 export type DependencySyncRecipe = "npm_ci" | "pnpm_frozen" | "uv_frozen";
 

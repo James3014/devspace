@@ -85,6 +85,8 @@ const migrations: Migration[] = [
   { version: 20, name: "local-agent-provider-continuity", up: migrateLocalAgentProviderContinuity },
   { version: 21, name: "core-mutation-caller-rebinds", up: migrateCoreMutationCallerRebinds },
   { version: 22, name: "core-mutation-session-rebinds", up: migrateCoreMutationSessionRebinds },
+  { version: 23, name: "core-candidate-acquisition-observations", up: migrateCoreCandidateAcquisitionObservations },
+  { version: 24, name: "core-candidate-acquisition-receipt-path", up: migrateCoreCandidateAcquisitionReceiptPath },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -660,4 +662,51 @@ function migrateChatSwarmJoinRequests(sqlite: Database.Database): void {
     create index if not exists chat_swarm_join_requests_status_idx
       on chat_swarm_join_requests(swarm_id, status, expires_at);
   `);
+}
+
+function migrateCoreCandidateAcquisitionObservations(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists core_candidate_acquisition_observations (
+      operation_id text primary key,
+      durable_operation_id text not null unique,
+      session_id text not null,
+      candidate_head text not null,
+      candidate_tree text not null,
+      source_revision text not null,
+      binding_hash text not null,
+      acceptance_contract_hash text not null,
+      change_set_hash text not null,
+      profile_hash text,
+      core_runtime_identity text,
+      acquisition_status text not null,
+      core_invoked integer not null default 0,
+      core_verdict text,
+      core_reason text,
+      receipt_hash text,
+      t_core_detection text,
+      orchestration_runtime_ms integer,
+      missingness_code text,
+      missingness_detail text,
+      request_id text,
+      request_hash text,
+      created_at text not null,
+      updated_at text not null
+    );
+    create index if not exists core_candidate_acq_obs_session_idx
+      on core_candidate_acquisition_observations(session_id, candidate_head);
+    create index if not exists core_candidate_acq_obs_binding_idx
+      on core_candidate_acquisition_observations(binding_hash, created_at desc);
+  `);
+}
+
+function migrateCoreCandidateAcquisitionReceiptPath(sqlite: Database.Database): void {
+  // Additive: add receipt_path column to support safe reconciliation via stored Core receipt path.
+  // Idempotent — addColumnIfMissing is a no-op if the column already exists.
+  const columns = sqlite.prepare(
+    "pragma table_info(core_candidate_acquisition_observations)",
+  ).all() as Array<{ name: string }>;
+  if (columns.some((col) => col.name === "receipt_path")) return;
+  sqlite.exec(
+    "alter table core_candidate_acquisition_observations add column receipt_path text",
+  );
 }

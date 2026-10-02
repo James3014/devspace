@@ -56,6 +56,23 @@ export interface CoreAcceptanceContractWire {
   deletion_policy: "FORBID" | "ALLOW";
 }
 
+/**
+ * Optional verification profile embedded in RepositoryMutationBinding.core.
+ *
+ * When present, participates in binding hash and enforces verifier-id set
+ * match against AcceptanceContract.required_verifier_ids.
+ * Immutable once written; replay with changed fields → BINDING_HASH_MISMATCH.
+ * Legacy bindings without this field preserve exact old hash semantics.
+ */
+export interface CoreVerificationProfileBinding {
+  profile_id: string;
+  verifier_ids: string[];
+  verifier_commands: string[][];
+  timeout_seconds: number;
+  /** sha256:<64 hex> canonical hash of {profile_id, verifier_id_command_pairs (sorted), timeout_seconds} */
+  profile_hash: string;
+}
+
 export interface RepositoryMutationBinding {
   schema: typeof CORE_MUTATION_BINDING_SCHEMA;
   binding_id: string;
@@ -83,6 +100,8 @@ export interface RepositoryMutationBinding {
     protocol_version: string;
     acceptance_contract: CoreAcceptanceContractWire;
     acceptance_contract_hash: string;
+    /** OPTIONAL — when absent, legacy binding-hash semantics apply unchanged. */
+    verification_profile?: CoreVerificationProfileBinding;
   };
   freshness: {
     created_at: string;
@@ -216,9 +235,38 @@ export interface CoreMutationCandidateProvenance {
   createdAt: string;
 }
 
+/**
+ * Minimal shadow-only acquisition observation summary for the census readback.
+ * Mirrors CoreCandidateAcquisitionObservation from core-candidate-acquisition.ts
+ * but typed inline to avoid a circular import (that module imports from this one).
+ * Authority boundary: shadow evidence only; never worker feedback or blocker.
+ */
+export interface CoreAcquisitionObservationSummary {
+  operationId: string;
+  durableOperationId: string;
+  acquisitionStatus: string;
+  coreInvoked: boolean;
+  coreVerdict: string | null;
+  coreReason: string | null;
+  receiptHash: string | null;
+  receiptPath: string | null;
+  tCoreDetection: string | null;
+  orchestrationRuntimeMs: number | null;
+  missingnessCode: string | null;
+  missingnessDetail: string | null;
+  acquisitionRequestId: string | null;
+  requestHash: string | null;
+  profileHash: string | null;
+  coreRuntimeIdentity: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface CoreMutationObservationEntry {
   session: CoreMutationSessionRecord;
   candidate?: CoreMutationCandidateProvenance;
+  /** Shadow-only Core acquisition observation. Never worker feedback or blocker. */
+  coreAcquisitionObservation?: CoreAcquisitionObservationSummary;
 }
 
 export interface CoreMutationObservationPage {
@@ -422,7 +470,14 @@ export function parseRepositoryMutationBinding(input: unknown): RepositoryMutati
   exactKeys(repository, ["canonical_id", "origin", "source_revision", "source_tree", "workspace_identity", "workspace_mode"], "repository");
   exactKeys(authority, ["execution_lane", "authority_ref", "authority_hash"], "integration_authority");
   exactKeys(discovery, ["required", "receipt_hash", "index_revision"], "capability_discovery");
-  exactKeys(core, ["protocol_version", "acceptance_contract", "acceptance_contract_hash"], "core");
+  // core.verification_profile is OPTIONAL (backward-compatible).
+  // Legacy bindings (3 keys) preserve EXACT old binding-hash semantics.
+  // Bindings with profile (4 keys) include it in the hash.
+  const coreHasProfile = "verification_profile" in core;
+  const expectedCoreKeys = coreHasProfile
+    ? ["protocol_version", "acceptance_contract", "acceptance_contract_hash", "verification_profile"]
+    : ["protocol_version", "acceptance_contract", "acceptance_contract_hash"];
+  exactKeys(core, expectedCoreKeys, "core");
   exactKeys(freshness, ["created_at", "valid_until", "revalidate_before_first_effect"], "freshness");
 
   const contractInput = core.acceptance_contract;
@@ -482,6 +537,85 @@ export function parseRepositoryMutationBinding(input: unknown): RepositoryMutati
     throw new CoreMutationSessionError("MALFORMED_BINDING", "freshness.revalidate_before_first_effect must be true.");
   }
 
+  // Parse optional verification_profile from core.
+  // When present, it must be a valid CoreVerificationProfileBinding object.
+  // When absent, the parsed struct omits the field preserving exact legacy hash semantics.
+  let parsedProfile: CoreVerificationProfileBinding | undefined;
+  if (coreHasProfile && core.verification_profile !== undefined) {
+    const profileInput = core.verification_profile;
+    if (!isRecord(profileInput)) {
+      throw new CoreMutationSessionError("MALFORMED_BINDING", "core.verification_profile must be a non-null object.");
+    }
+    exactKeys(profileInput, ["profile_id", "verifier_ids", "verifier_commands", "timeout_seconds", "profile_hash"], "core.verification_profile");
+    const profileId = nonEmptyText(profileInput.profile_id, "core.verification_profile.profile_id");
+    const verifierIds = profileInput.verifier_ids;
+    if (!Array.isArray(verifierIds) || verifierIds.length === 0) {
+      throw new CoreMutationSessionError("MALFORMED_BINDING", "core.verification_profile.verifier_ids must be a non-empty array.");
+    }
+    for (const id of verifierIds) {
+      if (typeof id !== "string" || id.length === 0 || id !== id.trim() || id.includes("\0")) {
+        throw new CoreMutationSessionError("MALFORMED_BINDING", "core.verification_profile.verifier_ids entries must be non-empty normalized strings.");
+      }
+    }
+    if (new Set(verifierIds).size !== verifierIds.length) {
+      throw new CoreMutationSessionError("MALFORMED_BINDING", "core.verification_profile.verifier_ids must not contain duplicates.");
+    }
+    const verifierCommands = profileInput.verifier_commands;
+    if (!Array.isArray(verifierCommands) || verifierCommands.length === 0 || verifierCommands.length !== verifierIds.length) {
+      throw new CoreMutationSessionError("MALFORMED_BINDING", "core.verification_profile.verifier_commands must be a non-empty array with same length as verifier_ids.");
+    }
+    for (let i = 0; i < verifierCommands.length; i++) {
+      const argv = verifierCommands[i];
+      if (!Array.isArray(argv) || argv.length === 0) {
+        throw new CoreMutationSessionError("MALFORMED_BINDING", `core.verification_profile.verifier_commands[${i}] must be a non-empty argv array.`);
+      }
+      for (const arg of argv) {
+        if (typeof arg !== "string" || arg.trim().length === 0 || arg.includes("\0")) {
+          throw new CoreMutationSessionError("MALFORMED_BINDING", `core.verification_profile.verifier_commands[${i}] contains invalid argv entry.`);
+        }
+      }
+    }
+    const timeoutSeconds = profileInput.timeout_seconds;
+    if (typeof timeoutSeconds !== "number" || !Number.isInteger(timeoutSeconds) || timeoutSeconds < 5 || timeoutSeconds > 3600) {
+      throw new CoreMutationSessionError("MALFORMED_BINDING", "core.verification_profile.timeout_seconds must be an integer between 5 and 3600.");
+    }
+    // Validate verifier_id set exactly matches AcceptanceContract required_verifier_ids.
+    const profileIdsSorted = [...new Set(verifierIds as string[])].sort();
+    const requiredSorted = [...new Set(contract.required_verifier_ids)].sort();
+    if (profileIdsSorted.length !== requiredSorted.length || profileIdsSorted.some((id, i) => id !== requiredSorted[i])) {
+      throw new CoreMutationSessionError("MALFORMED_BINDING", "core.verification_profile.verifier_ids must equal the AcceptanceContract required_verifier_ids set exactly.");
+    }
+    const profileHashSupplied = hashText(profileInput.profile_hash, "core.verification_profile.profile_hash");
+    const canonicalPairs = (verifierIds as string[])
+      .map((id, index) => [id, verifierCommands[index] as string[]] as [string, string[]])
+      .sort((left, right) => left[0].localeCompare(right[0]));
+    const expectedProfileHash = coreCanonicalHash({
+      profile_id: profileId,
+      verifier_id_command_pairs: canonicalPairs,
+      timeout_seconds: timeoutSeconds,
+    });
+    if (profileHashSupplied !== expectedProfileHash) {
+      throw new CoreMutationSessionError(
+        "CORE_PROFILE_HASH_MISMATCH",
+        "core.verification_profile.profile_hash does not match canonical nexus-core serialization.",
+      );
+    }
+    parsedProfile = {
+      profile_id: profileId,
+      verifier_ids: verifierIds as string[],
+      verifier_commands: verifierCommands as string[][],
+      timeout_seconds: timeoutSeconds,
+      profile_hash: expectedProfileHash,
+    };
+  }
+
+  const coreField: RepositoryMutationBinding["core"] = {
+    protocol_version: protocolVersion,
+    acceptance_contract: contract,
+    acceptance_contract_hash: contractHash,
+    ...(parsedProfile ? { verification_profile: parsedProfile } : {}),
+  };
+
   const parsedWithoutHash: Omit<RepositoryMutationBinding, "binding_hash"> = {
     schema: CORE_MUTATION_BINDING_SCHEMA,
     binding_id: nonEmptyText(input.binding_id, "binding_id"),
@@ -505,11 +639,7 @@ export function parseRepositoryMutationBinding(input: unknown): RepositoryMutati
       receipt_hash: hashText(discovery.receipt_hash, "capability_discovery.receipt_hash"),
       index_revision: indexRevision,
     },
-    core: {
-      protocol_version: protocolVersion,
-      acceptance_contract: contract,
-      acceptance_contract_hash: contractHash,
-    },
+    core: coreField,
     freshness: {
       created_at: createdAt,
       valid_until: validUntil,
@@ -820,6 +950,14 @@ export class CoreMutationSessionStore {
     `).all(...params) as Record<string, unknown>[];
 
     const pageRows = rows.slice(0, input.limit);
+    // Check if the observations table exists (created in migration 24; older DBs lack it).
+    let hasObservationsTable = false;
+    try {
+      this.database.sqlite.prepare("select 1 from core_candidate_acquisition_observations limit 0").run();
+      hasObservationsTable = true;
+    } catch {
+      hasObservationsTable = false;
+    }
     const sessions = pageRows.map((row) => {
       const session = rowToRecord(row);
       const candidateRow = this.database.sqlite
@@ -831,9 +969,45 @@ export class CoreMutationSessionStore {
           limit 1
         `)
         .get(session.id) as Record<string, unknown> | undefined;
+      // REQ-6: include shadow acquisition observation when available.
+      // Shadow-only: never surfaced as worker feedback or session blocker.
+      let coreAcquisitionObservation: CoreAcquisitionObservationSummary | undefined;
+      if (hasObservationsTable && candidateRow) {
+        const obsRow = this.database.sqlite
+          .prepare(`
+            select *
+            from core_candidate_acquisition_observations
+            where session_id = ? and candidate_head = ?
+            limit 1
+          `)
+          .get(session.id, String(candidateRow.candidate_head)) as Record<string, unknown> | undefined;
+        if (obsRow) {
+          coreAcquisitionObservation = {
+            operationId: String(obsRow.operation_id),
+            durableOperationId: String(obsRow.durable_operation_id),
+            acquisitionStatus: String(obsRow.acquisition_status),
+            coreInvoked: obsRow.core_invoked === 1 || obsRow.core_invoked === true,
+            coreVerdict: obsRow.core_verdict != null ? String(obsRow.core_verdict) : null,
+            coreReason: obsRow.core_reason != null ? String(obsRow.core_reason) : null,
+            receiptHash: obsRow.receipt_hash != null ? String(obsRow.receipt_hash) : null,
+            receiptPath: obsRow.receipt_path != null ? String(obsRow.receipt_path) : null,
+            tCoreDetection: obsRow.t_core_detection != null ? String(obsRow.t_core_detection) : null,
+            orchestrationRuntimeMs: obsRow.orchestration_runtime_ms != null ? Number(obsRow.orchestration_runtime_ms) : null,
+            missingnessCode: obsRow.missingness_code != null ? String(obsRow.missingness_code) : null,
+            missingnessDetail: obsRow.missingness_detail != null ? String(obsRow.missingness_detail) : null,
+            acquisitionRequestId: obsRow.request_id != null ? String(obsRow.request_id) : null,
+            requestHash: obsRow.request_hash != null ? String(obsRow.request_hash) : null,
+            profileHash: obsRow.profile_hash != null ? String(obsRow.profile_hash) : null,
+            coreRuntimeIdentity: obsRow.core_runtime_identity != null ? String(obsRow.core_runtime_identity) : null,
+            createdAt: String(obsRow.created_at),
+            updatedAt: String(obsRow.updated_at),
+          };
+        }
+      }
       return {
         session,
         candidate: candidateRow ? rowToCandidate(candidateRow) : undefined,
+        ...(coreAcquisitionObservation ? { coreAcquisitionObservation } : {}),
       };
     });
 

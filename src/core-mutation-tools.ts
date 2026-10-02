@@ -495,6 +495,28 @@ export function registerCoreMutationSessionTools(
     changeManifest: z.unknown().optional(),
     createdAt: z.string(),
   });
+  // REQ-6: Shadow acquisition observation schema for the census readback.
+  // authority: CORE_EVIDENCE_TRUST_COMPLETION_ONLY — never worker feedback or blocker.
+  const acquisitionObservationSchema = z.object({
+    operationId: z.string(),
+    durableOperationId: z.string(),
+    acquisitionStatus: z.string(),
+    coreInvoked: z.boolean(),
+    coreVerdict: z.string().nullable(),
+    coreReason: z.string().nullable(),
+    receiptHash: z.string().nullable(),
+    receiptPath: z.string().nullable(),
+    tCoreDetection: z.string().nullable(),
+    orchestrationRuntimeMs: z.number().nullable(),
+    missingnessCode: z.string().nullable(),
+    missingnessDetail: z.string().nullable(),
+    acquisitionRequestId: z.string().nullable(),
+    requestHash: z.string().nullable(),
+    profileHash: z.string().nullable(),
+    coreRuntimeIdentity: z.string().nullable(),
+    createdAt: z.string(),
+    updatedAt: z.string(),
+  });
   const publicSession = (session: ReturnType<CoreMutationSessionStore["getById"]>) => {
     if (!session) throw new Error("Core mutation session unexpectedly disappeared.");
     const { actorKey: _actorKey, ...rest } = session;
@@ -587,6 +609,8 @@ export function registerCoreMutationSessionTools(
         sessions: z.array(z.object({
           session: outputSchema,
           candidate: observationCandidateSchema.optional(),
+          // REQ-6: shadow-only Core acquisition observation. Never worker feedback or blocker.
+          coreAcquisitionObservation: acquisitionObservationSchema.optional(),
         })),
         nextCursor: z.string().optional(),
       }),
@@ -610,6 +634,7 @@ export function registerCoreMutationSessionTools(
             sessions: page.sessions.map((entry) => ({
               session: publicSession(entry.session),
               ...(entry.candidate ? { candidate: entry.candidate } : {}),
+              ...(entry.coreAcquisitionObservation ? { coreAcquisitionObservation: entry.coreAcquisitionObservation } : {}),
             })),
             ...(page.nextCursor ? { nextCursor: page.nextCursor } : {}),
           },
@@ -619,6 +644,7 @@ export function registerCoreMutationSessionTools(
       }
     },
   );
+
 
   registerAppTool(
     server,

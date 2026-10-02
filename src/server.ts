@@ -4,7 +4,7 @@ import { ControlPlaneOwnershipError } from "./control-plane-ownership.js";
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { access, realpath } from "node:fs/promises";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
@@ -140,6 +140,11 @@ import {
   registerCoreMutationSessionTools,
   type CoreMutationGuard,
 } from "./core-mutation-tools.js";
+import {
+  CoreCandidateAcquisitionObservationStore,
+  orchestrateCoreCandidateAcquisition,
+  validateCoreRuntimeConfigSync,
+} from "./core-candidate-acquisition.js";
 import { formatAgentsPath, WorkspaceRegistry } from "./workspaces.js";
 import {
   summarizeLocalAgentProfile,
@@ -3351,6 +3356,19 @@ export function createMcpServer(
     onCallerRebound: runtimeBuildIdentityContext?.onCoreCallerRebound,
   });
 
+  // REQ-4/REQ-5: Core candidate acquisition durable projection plus a
+  // synchronously bound runtime identity. Physical executable bytes are
+  // re-read and hashed inside each acquisition only after its durable intent
+  // and observation exist, so there is no worker-return restart window.
+  const coreObservationStore = new CoreCandidateAcquisitionObservationStore(config.stateDir);
+  const coreRuntimeValidationConfig = {
+    coreAcquisitionExecutable: config.coreAcquisitionExecutable,
+    coreAcquisitionExpectedSourceRevision: config.coreAcquisitionExpectedSourceRevision,
+    coreAcquisitionRuntimeDigest: config.coreAcquisitionRuntimeDigest,
+  };
+  const coreRuntimeBinding = validateCoreRuntimeConfigSync(coreRuntimeValidationConfig);
+  const coreReceiptDirectory = join(config.stateDir, "core-candidate-acquisition-receipts");
+
   registerRepositoryIntelligenceTools(server, config, workspaces);
   registerHostCapabilitySnapshotTool(server, {
     stateDir: config.stateDir,
@@ -6367,6 +6385,56 @@ export function createMcpServer(
           const coreCandidate = coreAdmission?.bound && coreMutationGuard
             ? await coreMutationGuard.recordCandidate({ workspaceId, extra, candidateHead: result.commitSha, candidateTree: result.treeSha })
             : undefined;
+
+          // REQ-4: After recordCandidate() succeeds, launch Core candidate acquisition asynchronously.
+          // (A) The durable operation + pending observation are created synchronously before git_commit returns.
+          // (B) Core CLI is not awaited — launched as a background fire-and-forget (void).
+          // (D) Core verdict is NEVER included in the worker-facing git_commit response (shadow evidence only).
+          if (coreCandidate && coreAdmission?.bound && durableOperations) {
+            const candidateSession = coreMutationSessions?.getById(coreAdmission.sessionId);
+            if (candidateSession) {
+              const binding = candidateSession.binding;
+              const verificationProfileBinding = binding.core.verification_profile;
+              // Build CoreVerificationProfile from binding if present
+              const coreProfile = verificationProfileBinding
+                ? {
+                    profile_id: verificationProfileBinding.profile_id,
+                    verifier_id_command_pairs: verificationProfileBinding.verifier_ids.map((id, i) => ({
+                      verifier_id: id,
+                      argv: verificationProfileBinding.verifier_commands[i] ?? [],
+                    })),
+                    timeout_seconds: verificationProfileBinding.timeout_seconds,
+                    profile_hash: verificationProfileBinding.profile_hash,
+                  }
+                : null;
+              // REQ-4-A: direct invocation executes synchronously until the
+              // orchestrator's first await, creating the durable operation and
+              // observation before this git_commit handler can return. Physical
+              // executable hashing and the Core CLI remain background work.
+              void orchestrateCoreCandidateAcquisition({
+                stateDir: config.stateDir,
+                durableStore: durableOperations.store,
+                sessionId: candidateSession.id,
+                candidateHead: coreCandidate.candidateHead,
+                candidateTree: coreCandidate.candidateTree,
+                sourceRevision: binding.repository.source_revision,
+                bindingHash: coreCandidate.bindingHash,
+                acceptanceContract: binding.core.acceptance_contract as unknown as Record<string, unknown>,
+                acceptanceContractHash: coreCandidate.acceptanceContractHash,
+                changeSetHash: coreCandidate.changeSetHash,
+                profile: coreProfile,
+                coreRuntime: coreRuntimeBinding,
+                coreRuntimeValidationConfig,
+                scopeRoot: workspace.root,
+                receiptDirectory: coreReceiptDirectory,
+                observationStore: coreObservationStore,
+              }).catch(() => {
+                // Shadow observer failures never convert an already-recorded
+                // Candidate into a worker-facing mutation failure.
+              });
+            }
+          }
+
           return {
             content: [textBlock(`Successfully created Candidate commit ${result.commitSha}`)],
             structuredContent: {
@@ -6383,6 +6451,7 @@ export function createMcpServer(
                 : coreAdmission?.bound ? { coreMutation: coreMutationAdmissionOutput(coreAdmission) } : {}),
             },
           };
+
         } catch (err: any) {
           if (committed && /CORE_MUTATION_POST_EFFECT_(?:SCOPE_ESCAPE|DELETION_FORBIDDEN)/.test(String(err?.message))) {
             throw new Error(`${err.message} PATH_LEVEL_PREWRITE_CONTAINMENT_NOT_PROVEN. Commit ${committed.commitSha} already exists at HEAD; reconcile the exact Core session and do not retry or create a replacement attempt.`);
