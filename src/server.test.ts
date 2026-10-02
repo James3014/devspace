@@ -4620,6 +4620,59 @@ test("nexus_gateway_recover exposes only the fixed typed recovery contract", asy
     "materialization request must reject extra host-control fields",
   );
 
+  const materializationReconcile = tools.tools.find(
+    (tool) => tool.name === "nexus_gateway_recovery_materialization_reconcile",
+  );
+  assert.ok(
+    materializationReconcile,
+    "effect-free materialization-only reconcile tool must be exposed",
+  );
+  assert.deepEqual(
+    (materializationReconcile as unknown as { annotations?: Record<string, unknown> }).annotations,
+    {
+      readOnlyHint: false,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: false,
+    },
+  );
+  assert.match(String(materializationReconcile.description), /only one exact existing/);
+  assert.match(String(materializationReconcile.description), /cannot enter Gateway recovery/);
+  const materializationReconcileSchema =
+    materializationReconcile.inputSchema as Record<string, unknown>;
+  assert.deepEqual(
+    Object.keys(materializationReconcileSchema.properties as Record<string, unknown>).sort(),
+    ["operationId"],
+  );
+
+  const unknownMaterialization = await context.client.callTool({
+    name: "nexus_gateway_recovery_materialization_reconcile",
+    arguments: { operationId: "op_missing_materialization" },
+  });
+  assert.equal(unknownMaterialization.isError, true);
+  assert.match(responseText(unknownMaterialization), /Unknown durable operation/);
+
+  const wrongKindDestination = join(context.project, "..", "materialization-reconcile-wrong-kind");
+  const wrongKindSource = await context.client.callTool({
+    name: "workspace_clone",
+    arguments: {
+      attemptKey: "materialization-reconcile-wrong-kind-source",
+      remote: context.project,
+      destination: wrongKindDestination,
+      authorityMode: "OWNER_DIRECT",
+    },
+  });
+  assert.equal(wrongKindSource.isError, undefined);
+  const wrongKind = await context.client.callTool({
+    name: "nexus_gateway_recovery_materialization_reconcile",
+    arguments: { operationId: structuredContent(wrongKindSource).operationId },
+  });
+  assert.equal(wrongKind.isError, true);
+  assert.match(
+    responseText(wrongKind),
+    /Materialization-only reconcile refuses durable operation kind workspace_clone/,
+  );
+
   const invalid = await context.client.callTool({
     name: "nexus_gateway_recover",
     arguments: {

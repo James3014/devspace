@@ -3914,6 +3914,42 @@ export function createMcpServer(
 
     registerAppTool(
       server,
+      "nexus_gateway_recovery_materialization_reconcile",
+      {
+        title: "Reconcile Nexus Gateway Recovery Materialization",
+        description:
+          "Reconcile only one exact existing Nexus Gateway recovery materialization operation after timeout or lost acknowledgement. The operation must already be nexus_gateway_recovery_materialize; the stored request and idempotency fence are reused exactly. This action cannot enter Gateway recovery, process, launchd, retry, failover, or caller-selected host-control paths.",
+        inputSchema: { operationId: z.string().min(1) },
+        outputSchema: durableOperationOutputSchema,
+        _meta: {},
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ operationId }) => {
+        const record = durableOperations.store.getByOperationId(operationId);
+        if (!record) {
+          throw new DurableOperationError(
+            "RECONCILIATION_REQUIRED",
+            `Unknown durable operation: ${operationId}`,
+          );
+        }
+        if (record.kind !== "nexus_gateway_recovery_materialize") {
+          throw new DurableOperationError(
+            "RECONCILIATION_REQUIRED",
+            `Materialization-only reconcile refuses durable operation kind ${record.kind}.`,
+            record,
+          );
+        }
+        return operationResponse(await durableOperations.reconcile(operationId, undefined));
+      },
+    );
+
+    registerAppTool(
+      server,
       "workspace_clone",
       {
         title: "Clone workspace",
