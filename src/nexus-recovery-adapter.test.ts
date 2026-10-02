@@ -38,7 +38,7 @@ test("Campaign B: recovery bridges pin the current accepted Nexus deployment con
   );
   assert.equal(
     NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256,
-    "7f93a472870303d44f7c57b02362ac3f7599216576ce620334a847c4ce4a1e0c",
+    "8813426ee9acef45c2a5c126e356b3ad35949cd012bce5c3a27cede3832c7504",
   );
   for (const bridge of [NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE, NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE]) {
     assert.match(
@@ -47,7 +47,7 @@ test("Campaign B: recovery bridges pin the current accepted Nexus deployment con
     );
     assert.match(
       bridge,
-      /ACCEPTED_MANAGER_SHA256 = "7f93a472870303d44f7c57b02362ac3f7599216576ce620334a847c4ce4a1e0c"/,
+      /ACCEPTED_MANAGER_SHA256 = "8813426ee9acef45c2a5c126e356b3ad35949cd012bce5c3a27cede3832c7504"/,
     );
     assert.match(bridge, /gateway deployment authority contract hash mismatch/);
   }
