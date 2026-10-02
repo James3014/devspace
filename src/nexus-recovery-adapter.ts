@@ -20,6 +20,7 @@ const NEXUS_DEPLOYMENT_ID = /^r1-[0-9a-f]{40}$/;
 
 export const NEXUS_GATEWAY_RECOVERY_SCHEMA = "nexus.gateway.durable_recovery_request.v2" as const;
 export const NEXUS_GATEWAY_INTERPRETER = join(homedir(), "workspace", "Nexus-new", ".venv", "bin", "python");
+export const NEXUS_GATEWAY_PLIST = join(homedir(), "Library", "LaunchAgents", "com.nexus.mcp.gateway.direct.plist");
 export const NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256 = "8813426ee9acef45c2a5c126e356b3ad35949cd012bce5c3a27cede3832c7504";
 export const NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256 = "909879c5719c153f2eb7eeecb5cc080de8824a949c8101b0301a4e6baa598867";
 export const NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_SCHEMA = "nexus.gateway.durable_recovery_materialization_request.v1" as const;
@@ -636,6 +637,16 @@ export const NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE = buildNexusGatewayRec
   NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256,
 );
 
+export function nexusGatewayRecoveryEnvironment(): NodeJS.ProcessEnv {
+  return {
+    HOME: homedir(),
+    PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+    PYTHONNOUSERSITE: "1",
+    PYTHONDONTWRITEBYTECODE: "1",
+    NEXUS_GATEWAY_PLIST,
+  };
+}
+
 export async function spawnNexusGatewayRecovery(
   request: NexusGatewayRecoveryRequest,
 ): Promise<NexusGatewayRecoveryBridgeResult> {
@@ -644,12 +655,7 @@ export async function spawnNexusGatewayRecovery(
     const child = spawn(NEXUS_GATEWAY_INTERPRETER, ["-I", "-B", "-c", NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE], {
       cwd: homedir(),
       stdio: ["pipe", "pipe", "pipe"],
-      env: {
-        HOME: homedir(),
-        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
-        PYTHONNOUSERSITE: "1",
-        PYTHONDONTWRITEBYTECODE: "1",
-      },
+      env: nexusGatewayRecoveryEnvironment(),
     });
     let stdout = "";
     let stderr = "";
@@ -692,12 +698,7 @@ export async function spawnNexusGatewayRecoveryPreflight(
     const child = spawn(NEXUS_GATEWAY_INTERPRETER, ["-I", "-B", "-c", NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE], {
       cwd: homedir(),
       stdio: ["pipe", "pipe", "pipe"],
-      env: {
-        HOME: homedir(),
-        PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
-        PYTHONNOUSERSITE: "1",
-        PYTHONDONTWRITEBYTECODE: "1",
-      },
+      env: nexusGatewayRecoveryEnvironment(),
     });
     let stdout = "";
     let stderr = "";

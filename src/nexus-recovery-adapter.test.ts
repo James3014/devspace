@@ -14,12 +14,14 @@ import {
   NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256,
   NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256,
   NEXUS_GATEWAY_INTERPRETER,
+  NEXUS_GATEWAY_PLIST,
   NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE,
   NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_RECEIPT_SCHEMA,
   NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_SCHEMA,
   NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE,
   NEXUS_GATEWAY_RECOVERY_SCHEMA,
   NexusRecoveryAdapter,
+  nexusGatewayRecoveryEnvironment,
   type NexusGatewayRecoveryMaterializationReceipt,
   type NexusGatewayRecoveryMaterializationRequest,
   type NexusGatewayRecoveryRequest,
@@ -37,6 +39,17 @@ test("Campaign B: recovery bridges pin the current accepted Nexus deployment con
     NEXUS_GATEWAY_INTERPRETER,
     join(homedir(), "workspace", "Nexus-new", ".venv", "bin", "python"),
   );
+  assert.equal(
+    NEXUS_GATEWAY_PLIST,
+    join(homedir(), "Library", "LaunchAgents", "com.nexus.mcp.gateway.direct.plist"),
+  );
+  assert.deepEqual(nexusGatewayRecoveryEnvironment(), {
+    HOME: homedir(),
+    PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
+    PYTHONNOUSERSITE: "1",
+    PYTHONDONTWRITEBYTECODE: "1",
+    NEXUS_GATEWAY_PLIST,
+  });
   assert.equal(
     NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256,
     "909879c5719c153f2eb7eeecb5cc080de8824a949c8101b0301a4e6baa598867",
