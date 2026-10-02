@@ -91,6 +91,7 @@ export const CUTOVER_SAFE_TOOLS: ReadonlySet<string> = new Set([
 
   // Operation & command inspection
   "coordination_resume", // Existing credential only; never issues authority.
+  "coordination_recovery_request", // Creates only a possession-recovery verifier; grants no authority.
   "coordination_carrier_status",
   "coordination_lease_read",
   "coordination_handoff_readback",
