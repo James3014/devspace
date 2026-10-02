@@ -19,7 +19,7 @@ const SAFE_NEXUS_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
 const NEXUS_DEPLOYMENT_ID = /^r1-[0-9a-f]{40}$/;
 
 export const NEXUS_GATEWAY_RECOVERY_SCHEMA = "nexus.gateway.durable_recovery_request.v2" as const;
-export const NEXUS_GATEWAY_INTERPRETER = join(homedir(), "Workspace", "Nexus-new", ".venv", "bin", "python");
+export const NEXUS_GATEWAY_INTERPRETER = join(homedir(), "workspace", "Nexus-new", ".venv", "bin", "python");
 export const NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256 = "8813426ee9acef45c2a5c126e356b3ad35949cd012bce5c3a27cede3832c7504";
 export const NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256 = "909879c5719c153f2eb7eeecb5cc080de8824a949c8101b0301a4e6baa598867";
 export const NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_SCHEMA = "nexus.gateway.durable_recovery_materialization_request.v1" as const;

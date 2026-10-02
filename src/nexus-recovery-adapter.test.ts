@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, unlink, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { loadConfig } from "./config.js";
@@ -13,6 +13,7 @@ import {
 import {
   NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256,
   NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256,
+  NEXUS_GATEWAY_INTERPRETER,
   NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE,
   NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_RECEIPT_SCHEMA,
   NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_SCHEMA,
@@ -32,6 +33,10 @@ function sha256(value: Uint8Array | string): string {
 }
 
 test("Campaign B: recovery bridges pin the current accepted Nexus deployment contract without widening manager trust", () => {
+  assert.equal(
+    NEXUS_GATEWAY_INTERPRETER,
+    join(homedir(), "workspace", "Nexus-new", ".venv", "bin", "python"),
+  );
   assert.equal(
     NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256,
     "909879c5719c153f2eb7eeecb5cc080de8824a949c8101b0301a4e6baa598867",
