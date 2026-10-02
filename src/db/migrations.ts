@@ -87,6 +87,7 @@ const migrations: Migration[] = [
   { version: 22, name: "core-mutation-session-rebinds", up: migrateCoreMutationSessionRebinds },
   { version: 23, name: "core-candidate-acquisition-observations", up: migrateCoreCandidateAcquisitionObservations },
   { version: 24, name: "core-candidate-acquisition-receipt-path", up: migrateCoreCandidateAcquisitionReceiptPath },
+  { version: 25, name: "work-resume-registry", up: migrateWorkResumeRegistry },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -591,7 +592,7 @@ function migrateLocalAgentEffortRename(sqlite: Database.Database): void {
 
 function addColumnIfMissing(
   sqlite: Database.Database,
-  table: "workspace_sessions" | "local_agent_sessions",
+  table: "workspace_sessions" | "local_agent_sessions" | "work_resume_registry",
   column: string,
   definition: string,
 ): void {
@@ -709,4 +710,49 @@ function migrateCoreCandidateAcquisitionReceiptPath(sqlite: Database.Database): 
   sqlite.exec(
     "alter table core_candidate_acquisition_observations add column receipt_path text",
   );
+}
+
+/**
+ * P0 Resume / writer-lease: projection tables.
+ *
+ * work_resume_registry: maps a stable semantic work_key to the idempotency key
+ *   and lease_id used in control_plane_resource_leases.  Non-authoritative
+ *   projection only – the lease in control_plane_resource_leases is the single
+ *   source of writer-ownership truth.
+ *
+ * work_resume_terminal_receipts: caches reconciliation receipts for completed
+ *   work so successor conversations can replay cheaply without re-reading the
+ *   full ownership store.
+ */
+function migrateWorkResumeRegistry(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists work_resume_registry (
+      work_key         text primary key,
+      idempotency_key  text not null,
+      lease_id         text not null,
+      repository_key   text not null,
+      owner_issue_id   text not null,
+      base_revision    text not null,
+      worktree_path    text not null,
+      scope_json       text not null,
+      contract_purpose text not null,
+      effect_kind       text,
+      effect_key        text,
+      effect_handle     text,
+      registered_at    text not null,
+      updated_at       text not null
+    );
+    create index if not exists work_resume_registry_lease_idx
+      on work_resume_registry(lease_id);
+
+    create table if not exists work_resume_terminal_receipts (
+      work_key    text primary key,
+      receipt_id  text not null,
+      receipt_json text not null,
+      recorded_at text not null
+    );
+  `);
+  addColumnIfMissing(sqlite, "work_resume_registry", "effect_kind", "text");
+  addColumnIfMissing(sqlite, "work_resume_registry", "effect_key", "text");
+  addColumnIfMissing(sqlite, "work_resume_registry", "effect_handle", "text");
 }

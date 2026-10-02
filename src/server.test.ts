@@ -732,6 +732,9 @@ test("Issue #194 G2: conversation workspace and durable agent survive MCP transp
       "Content-Type": "application/json",
       "Authorization": `Bearer ${accessToken}`,
       "Accept": "application/json, text/event-stream",
+      // This raw-fetch fixture models a new transport across restart. Keeping
+      // a pooled socket here would test Undici reuse rather than server state.
+      "Connection": "close",
       ...(sessionId ? { "mcp-session-id": sessionId } : {}),
     },
     body: JSON.stringify(body),

@@ -18,6 +18,10 @@ import {
   parseLocalEffectProjection,
   type LocalEffectProjection,
 } from "./local-effect-enforcement.js";
+import {
+  parseResumableWorkPointer,
+  type ResumableWorkPointer,
+} from "./work-resume.js";
 
 /**
  * Structured execution contract for a DevSpace subagent turn.
@@ -111,8 +115,16 @@ export interface ExecutionContract {
   maxFiles?: number;
   /** Toolchain id used to resolve verifier executables outside the model prompt. */
   toolchainId?: string;
+  /**
+   * P0 resumable-work pointer.  When supplied, all write-capable sinks MUST
+   * call centralAdmissionCheck with this pointer before launching any provider,
+   * file, git, or process effect.  Legacy callers that do not supply this field
+   * remain fully compatible and bypass the P0 fencing lane.
+   */
+  resumableWork?: ResumableWorkPointer;
   /** Optional wall-clock bound for the whole agent turn (turn start -> terminal). */
   maxWallMs?: number;
+
   /** Optional wall-clock bound for the startup/readiness phase (turn start -> execution started). */
   maxStartupMs?: number;
   /** Optional wall-clock bound for semantic provider execution (execution started -> terminal). */
@@ -325,6 +337,17 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
       throw new Error("executionContract.toolchainId must be a non-empty string.");
     }
     contract.toolchainId = record.toolchainId.trim();
+  }
+
+  if (record.resumableWork !== undefined) {
+    try {
+      const ptr = parseResumableWorkPointer(record.resumableWork);
+      if (ptr) contract.resumableWork = ptr;
+    } catch (err) {
+      throw new Error(
+        `executionContract.resumableWork is invalid: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   if (record.maxWallMs !== undefined) {

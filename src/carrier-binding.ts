@@ -49,7 +49,7 @@ export interface CarrierContract {
   role: "controller" | "worker";
   scope: string[];
   baseRevision: string;
-  operations: Array<"dependency_sync" | "cutover_start">;
+  operations: Array<"dependency_sync" | "cutover_start" | "worktree_write">;
   expiresAt: string;
   cutover?: CarrierCutoverContract;
   maxDepth?: number;
@@ -239,7 +239,7 @@ export class CarrierBindingStore {
         if(sender.contract.cutover || recipient.contract.cutover || lease.operation==="cutover_start") deny("Cutover authority cannot be transferred");
         if (sender.contract.role !== "controller" || sender.contract.repository !== recipient.contract.repository || sender.contract.goal !== recipient.contract.goal || sender.contract.baseRevision !== recipient.contract.baseRevision) deny();
         if(lease.ownerThread!==sender.row.id || lease.baseRevision!==recipient.contract.baseRevision ||
-          !recipient.contract.operations.includes(lease.operation as "dependency_sync") ||
+          !recipient.contract.operations.includes(lease.operation as "dependency_sync" | "worktree_write") ||
           lease.scope.some(path=>!recipient.contract.scope.some(root=>contains(root,physical(path)))) ||
           Date.parse(receipt.expiresAt)>Date.parse(recipient.validity.expires_at)) deny("Transferred lease exceeds recipient authority");
         const proof = Object.freeze({});
@@ -1368,7 +1368,7 @@ export class CarrierBindingStore {
 
   readLease(context: unknown, leaseId: string) {
     const binding=this.current(context), lease=this.ownership.get(leaseId);
-    if(!lease || lease.ownerThread!==binding.row.id || lease.baseRevision!==binding.contract.baseRevision || !binding.contract.operations.includes(lease.operation as "dependency_sync") || lease.scope.some(path=>!binding.contract.scope.some(root=>contains(root,physical(path))))) deny("Lease is outside this carrier authority");
+    if(!lease || lease.ownerThread!==binding.row.id || lease.baseRevision!==binding.contract.baseRevision || !binding.contract.operations.includes(lease.operation as "dependency_sync" | "worktree_write") || lease.scope.some(path=>!binding.contract.scope.some(root=>contains(root,physical(path))))) deny("Lease is outside this carrier authority");
     return lease;
   }
   releaseLease(context: unknown, leaseId: string, expectedVersion: number) {
@@ -1425,7 +1425,11 @@ export class CarrierBindingStore {
       if(owned.length>1) deny("Ambiguous owned resource");
       const held=owned[0] ? this.ownership.get(owned[0].lease_id) : undefined;
       if(held?.operationHandle) deny("Reconcile the pinned operation before preparing another");
-      const lease=held ? this.ownership.assertHeld(context,held.leaseId,held.version,subject.operation,subject.baseRevision) : this.ownership.acquire(context,{
+      const reusableHeld = held && (
+        subject.operation !== "worktree_write" ||
+        held.idempotencyKey === subject.operationId
+      ) ? held : undefined;
+      const lease=reusableHeld ? this.ownership.assertHeld(context,reusableHeld.leaseId,reusableHeld.version,subject.operation,subject.baseRevision) : this.ownership.acquire(context,{
         repositoryKey:binding.contract.repository,resourceKind:"filesystem",resourceId:subject.workspaceRoot,
         resource:subject.workspaceRoot,scope:[subject.workspaceRoot],operation:subject.operation,
         baseRevision:subject.baseRevision,expiresAt:binding.validity.expires_at,idempotencyKey:subject.operationId,grant,
@@ -1540,7 +1544,7 @@ export class CarrierBindingStore {
   private validateContract(input: CarrierContract, requireFuture = true): CarrierContract {
     if(!input || !["controller","worker"].includes(input.role) || typeof input.goal!=="string" || !input.goal.trim() || input.goal.length>160 ||
       !/^[a-f0-9]{40,64}$/.test(input.baseRevision) || !Array.isArray(input.scope) || input.scope.length<1 || input.scope.length>64 ||
-      !Array.isArray(input.operations) || input.operations.length<1 || input.operations.some(op=>op!=="dependency_sync" && op!=="cutover_start") ||
+      !Array.isArray(input.operations) || input.operations.length<1 || input.operations.some(op=>op!=="dependency_sync" && op!=="cutover_start" && op!=="worktree_write") ||
       !Number.isFinite(Date.parse(input.expiresAt)) || (requireFuture && Date.parse(input.expiresAt)<=this.now())) deny("Invalid or expired carrier contract");
     if(input.maxDepth !== undefined && (!Number.isSafeInteger(input.maxDepth) || input.maxDepth < 0 || input.maxDepth > MAX_DELEGATION_DEPTH)) {
       deny("Invalid delegation depth");
