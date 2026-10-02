@@ -35,6 +35,7 @@ import {
   computeVerificationProfileHash,
   computeAcquisitionOperationId,
   computeAcquisitionRequestHash,
+  computeCoreAcquisitionChangeSetHash,
   validateCoreRuntimeConfig,
   validateCoreRuntimeConfigSync,
   buildCoreRuntimeIdentity,
@@ -151,6 +152,9 @@ function makeOrchestrationInput(stateDir: string, overrides: {
     acceptanceContract: contract,
     acceptanceContractHash: contractHash,
     changeSetHash,
+    changeManifestHash: "sha256:" + "2".repeat(64),
+    changedPaths: ["src/example.ts"],
+    deletedPaths: [],
     profile: overrides.profile !== undefined ? overrides.profile : null,
     coreRuntime: overrides.coreRuntime !== undefined ? overrides.coreRuntime : null,
     scopeRoot: stateDir,
@@ -246,6 +250,27 @@ test("2. Core-compatible profile hash: coreCanonicalHash object (no prefix array
   ] as unknown as Parameters<typeof coreCanonicalHash>[0]);
 
   assert.notEqual(actual, oldStyleHash, "Old DevSpace-prefix hash must differ from the new Core-compatible hash");
+});
+
+test("2b. Core acquisition ChangeSet hash matches the physical #321 canary and nexus-core#77", () => {
+  const actual = computeCoreAcquisitionChangeSetHash({
+    acquisitionRequestId: "cca_4247e6a4f06eb91ccf8a111eb2f457d4",
+    sourceIdentity: "9e756740ff7ef69f4289545a2c5894551155a5a6",
+    candidateTree: "0aa285b02105b0901630d7687f21425a55ec285e",
+    changeManifestHash: "sha256:d9c55fe85ed5a8e677063b40bad180787e4b9f72ae7a178061cf57ccba1e938c",
+    changedPaths: ["docs/issue321-canary-v4.txt"],
+    deletedPaths: [],
+  });
+
+  assert.equal(
+    actual,
+    "sha256:d734e103d3c86d68470b4c945c6823074f74e3eef2bcfefe4fb7dbc053481300",
+  );
+  assert.notEqual(
+    actual,
+    "sha256:9481e3eb512856b69872a4f6b344c15bee8d40408fdd2fdb024205a948b5061a",
+    "DevSpace Candidate ChangeSet hash must not be reused as the Core acquisition ChangeSet hash",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -1070,6 +1095,14 @@ test("12. restart: started durable op becomes outcome_unknown; orchestrate does 
       changeSetHash: input.changeSetHash,
       coreRuntimeIdentity: runtimeIdentity,
     });
+    const coreAcquisitionChangeSetHash = computeCoreAcquisitionChangeSetHash({
+      acquisitionRequestId: operationId,
+      sourceIdentity,
+      candidateTree: input.candidateTree,
+      changeManifestHash: input.changeManifestHash,
+      changedPaths: input.changedPaths,
+      deletedPaths: input.deletedPaths,
+    });
     const requestHash = computeAcquisitionRequestHash({
       acquisition_request_id: operationId,
       candidate_head: input.candidateHead,
@@ -1077,7 +1110,7 @@ test("12. restart: started durable op becomes outcome_unknown; orchestrate does 
       expected_source_identity: sourceIdentity,
       expected_contract_hash: input.acceptanceContractHash,
       expected_profile_hash: profileHash,
-      expected_change_set_hash: input.changeSetHash,
+      expected_change_set_hash: coreAcquisitionChangeSetHash,
     });
     input.durableStore.createOrReplay({
       operationId,
@@ -1480,6 +1513,7 @@ test("18. sibling module imports resolve cleanly (smoke check)", async () => {
   assert.equal(typeof computeVerificationProfileHash, "function");
   assert.equal(typeof computeAcquisitionOperationId, "function");
   assert.equal(typeof computeAcquisitionRequestHash, "function");
+  assert.equal(typeof computeCoreAcquisitionChangeSetHash, "function");
   assert.equal(typeof validateCoreRuntimeConfig, "function");
   assert.equal(typeof validateCoreRuntimeConfigSync, "function");
   assert.equal(typeof buildCoreRuntimeIdentity, "function");

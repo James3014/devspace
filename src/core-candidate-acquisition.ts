@@ -383,6 +383,46 @@ export function computeAcquisitionRequestHash(request: {
   return coreCanonicalHash(request as unknown as Parameters<typeof coreCanonicalHash>[0]);
 }
 
+/**
+ * Compute the exact acquisition-scoped ChangeSet hash re-derived by nexus-core#77.
+ *
+ * This is intentionally NOT the DevSpace Candidate ChangeSet hash. The Core
+ * acquisition producer uses an acquisition-scoped change_set_id and binds the
+ * target tree rather than the Candidate commit:
+ *
+ *   [
+ *     "acq-change-" + acquisition_request_id[:16],
+ *     "git-commit:" + source_commit,
+ *     "git-tree:" + candidate_tree,
+ *     change_manifest_hash,
+ *     sorted(paths),
+ *     sorted(deleted_paths) // only when non-empty
+ *   ]
+ *
+ * The conditional deleted-path item preserves nexus-core's legacy/no-deletion
+ * compatibility rule.
+ */
+export function computeCoreAcquisitionChangeSetHash(input: {
+  acquisitionRequestId: string;
+  sourceIdentity: string;
+  candidateTree: string;
+  changeManifestHash: string;
+  changedPaths: readonly string[];
+  deletedPaths: readonly string[];
+}): string {
+  const canonical: unknown[] = [
+    `acq-change-${input.acquisitionRequestId.slice(0, 16)}`,
+    `git-commit:${input.sourceIdentity}`,
+    `git-tree:${input.candidateTree}`,
+    input.changeManifestHash,
+    [...input.changedPaths].sort(),
+  ];
+  if (input.deletedPaths.length > 0) {
+    canonical.push([...input.deletedPaths].sort());
+  }
+  return coreCanonicalHash(canonical as Parameters<typeof coreCanonicalHash>[0]);
+}
+
 // ---------------------------------------------------------------------------
 // Core runtime identity
 // ---------------------------------------------------------------------------
@@ -1003,8 +1043,14 @@ export interface CoreCandidateAcquisitionInput {
   acceptanceContract: Record<string, unknown>;
   /** AcceptanceContract hash (sha256:...). */
   acceptanceContractHash: string;
-  /** ChangeSet hash (sha256:...). */
+  /** DevSpace Candidate ChangeSet hash (sha256:...), retained for stable effect identity. */
   changeSetHash: string;
+  /** Candidate change-manifest hash, used to reproduce nexus-core's acquisition ChangeSet hash. */
+  changeManifestHash: string;
+  /** Candidate paths from the durable physical manifest. */
+  changedPaths: string[];
+  /** Candidate deleted paths from the durable physical manifest. */
+  deletedPaths: string[];
   /** Verification profile, or null if no profile was bound. */
   profile: CoreVerificationProfile | null;
   /** Synchronously bound runtime identity. Null = unavailable/mismatched config. */
@@ -1099,6 +1145,14 @@ export async function orchestrateCoreCandidateAcquisition(
   // The Core request identity is deterministic for the exact durable effect.
   // This prevents a replay from manufacturing a different request_hash.
   const acquisitionRequestId = operationId;
+  const coreAcquisitionChangeSetHash = computeCoreAcquisitionChangeSetHash({
+    acquisitionRequestId,
+    sourceIdentity,
+    candidateTree: input.candidateTree,
+    changeManifestHash: input.changeManifestHash,
+    changedPaths: input.changedPaths,
+    deletedPaths: input.deletedPaths,
+  });
   const requestHash = computeAcquisitionRequestHash({
     acquisition_request_id: acquisitionRequestId,
     candidate_head: input.candidateHead,
@@ -1106,7 +1160,7 @@ export async function orchestrateCoreCandidateAcquisition(
     expected_source_identity: sourceIdentity,
     expected_contract_hash: input.acceptanceContractHash,
     expected_profile_hash: profileHash,
-    expected_change_set_hash: input.changeSetHash,
+    expected_change_set_hash: coreAcquisitionChangeSetHash,
   });
   const requestPayload: Record<string, unknown> = {
     candidate_head: input.candidateHead,
@@ -1124,7 +1178,7 @@ export async function orchestrateCoreCandidateAcquisition(
         }
       : null,
     expected_profile_hash: profileHash,
-    expected_change_set_hash: input.changeSetHash,
+    expected_change_set_hash: coreAcquisitionChangeSetHash,
     acquisition_request_id: acquisitionRequestId,
     request_hash: requestHash,
     repo_path: input.scopeRoot,
