@@ -51,6 +51,21 @@ test("Campaign B: recovery bridges pin the current accepted Nexus deployment con
     );
     assert.match(bridge, /gateway deployment authority contract hash mismatch/);
   }
+
+  assert.match(
+    NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE,
+    /authority_source_root = pathlib\.Path\.home\(\) \/ "workspace" \/ "Nexus-new-authority-main"/,
+  );
+  assert.match(
+    NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE,
+    /contract_path = authority_root \/ "nexus" \/ "contracts" \/ "gateway_deployment\.py"/,
+  );
+  assert.match(NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE, /outcome = module\.gateway_recover\(request\)/);
+  assert.doesNotMatch(NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE, /desired_root_path\.resolve\(strict=True\)/);
+  assert.doesNotMatch(NEXUS_GATEWAY_RECOVERY_PREFLIGHT_BRIDGE_CODE, /module\._gateway_recover_live\(request\)/);
+
+  assert.match(NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE, /desired_root_path\.resolve\(strict=True\)/);
+  assert.match(NEXUS_GATEWAY_RECOVERY_BRIDGE_CODE, /module\._gateway_recover_live\(request\)/);
 });
 
 async function createFixture() {
