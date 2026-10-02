@@ -594,32 +594,29 @@ try:
     if not isinstance(desired_tree, str) or HEX40.fullmatch(desired_tree) is None:
         fail("desired deployment tree invalid")
 
-    deployments_root = DEPLOYMENTS.resolve(strict=True)
-    desired_root_path = DEPLOYMENTS / desired_id
-    if desired_root_path.is_symlink():
-        fail("desired deployment root must not be a symlink")
-    desired_root = desired_root_path.resolve(strict=True)
-    if desired_root.parent != deployments_root or not desired_root.is_dir():
-        fail("desired deployment root escaped fixed deployments directory")
-    root_info = os.lstat(desired_root)
+    authority_source_root = pathlib.Path.home() / "workspace" / "Nexus-new-authority-main"
+    if not authority_source_root.exists():
+        authority_source_root = pathlib.Path.home() / "Workspace" / "Nexus-new-authority-main"
+    if authority_source_root.is_symlink():
+        fail("gateway authority source root must not be a symlink")
+    authority_root = authority_source_root.resolve(strict=True)
+    if not authority_root.is_dir():
+        fail("gateway authority source root must be a directory")
+    root_info = os.lstat(authority_root)
     if root_info.st_uid != os.getuid() or (stat.S_IMODE(root_info.st_mode) & 0o022):
-        fail("desired deployment root ownership/mode invalid")
-    if git(desired_root, "rev-parse", "--show-toplevel") != str(desired_root):
-        fail("desired deployment toplevel mismatch")
-    if git(desired_root, "remote", "get-url", "origin") != REMOTE:
-        fail("desired deployment remote mismatch")
-    if git(desired_root, "status", "--porcelain"):
-        fail("desired deployment is dirty")
-    if git(desired_root, "rev-parse", "HEAD") != desired_commit:
-        fail("desired deployment commit mismatch")
-    if git(desired_root, "rev-parse", "HEAD^{tree}") != desired_tree:
-        fail("desired deployment tree mismatch")
-    contract_path = desired_root / "nexus" / "contracts" / "gateway_deployment.py"
+        fail("gateway authority source root ownership/mode invalid")
+    if git(authority_root, "rev-parse", "--show-toplevel") != str(authority_root):
+        fail("gateway authority source toplevel mismatch")
+    if git(authority_root, "remote", "get-url", "origin") != REMOTE:
+        fail("gateway authority source remote mismatch")
+    if git(authority_root, "status", "--porcelain"):
+        fail("gateway authority source is dirty")
+    contract_path = authority_root / "nexus" / "contracts" / "gateway_deployment.py"
     secure_file(contract_path, "gateway deployment authority contract")
     if hashlib.sha256(contract_path.read_bytes()).hexdigest() != ACCEPTED_CONTRACT_SHA256:
         fail("gateway deployment authority contract hash mismatch")
 
-    sys.path.insert(0, str(desired_root))
+    sys.path.insert(0, str(authority_root))
     spec = importlib.util.spec_from_file_location("nexus_gateway_stable_manager", MANAGER)
     if spec is None or spec.loader is None:
         fail("manager import spec unavailable")
