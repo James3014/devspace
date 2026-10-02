@@ -369,3 +369,53 @@ export type ChatSwarmTaskRow = typeof chatSwarmTasks.$inferSelect;
 export type NewChatSwarmTaskRow = typeof chatSwarmTasks.$inferInsert;
 export type ChatSwarmAttemptRow = typeof chatSwarmAttempts.$inferSelect;
 export type NewChatSwarmAttemptRow = typeof chatSwarmAttempts.$inferInsert;
+
+/**
+ * Durable shadow observation for one core_candidate_acquisition durable operation.
+ * Shadow-only: never surfaced as worker feedback or blocker.
+ * Linked to session + candidate + durable operation.
+ */
+export const coreCandidateAcquisitionObservations = sqliteTable(
+  "core_candidate_acquisition_observations",
+  {
+    /** Stable operation id derived from session + candidate + source + contract/profile/changeset hashes + runtime identity */
+    operationId: text("operation_id").primaryKey(),
+    /** Foreign key to durable_operations.operation_id */
+    durableOperationId: text("durable_operation_id").notNull().unique(),
+    sessionId: text("session_id").notNull(),
+    candidateHead: text("candidate_head").notNull(),
+    candidateTree: text("candidate_tree").notNull(),
+    sourceRevision: text("source_revision").notNull(),
+    bindingHash: text("binding_hash").notNull(),
+    acceptanceContractHash: text("acceptance_contract_hash").notNull(),
+    changeSetHash: text("change_set_hash").notNull(),
+    /** null when no profile was bound at session open time */
+    profileHash: text("profile_hash"),
+    /** Identity of the Core runtime used: "<executable>@<digest>" or null if unavailable */
+    coreRuntimeIdentity: text("core_runtime_identity"),
+    /** Acquisition status: PENDING | CORE_INVOKED | VERDICT_RECORDED | MISSINGNESS | ERROR */
+    acquisitionStatus: text("acquisition_status").notNull(),
+    coreInvoked: integer("core_invoked", { mode: "boolean" }).notNull().default(false),
+    /** nexus-core verdict vocabulary from producer (e.g. VERIFIED, REJECTED) or null */
+    coreVerdict: text("core_verdict"),
+    coreReason: text("core_reason"),
+    receiptHash: text("receipt_hash"),
+    /** Path to the Core-persisted receipt file (for safe reconciliation) */
+    receiptPath: text("receipt_path"),
+    /** ISO timestamp Core-side detection event (from response started_at) */
+    tCoreDetection: text("t_core_detection"),
+    orchestrationRuntimeMs: integer("orchestration_runtime_ms"),
+    /** Structured missingness/error code when Core was not reachable or result unparseable */
+    missingnessCode: text("missingness_code"),
+    missingnessDetail: text("missingness_detail"),
+    /** acquisition_request_id and request_hash sent to Core CLI */
+    requestId: text("request_id"),
+    requestHash: text("request_hash"),
+    createdAt: text("created_at").notNull(),
+    updatedAt: text("updated_at").notNull(),
+  },
+  (table) => [
+    index("core_candidate_acq_obs_session_idx").on(table.sessionId, table.candidateHead),
+    index("core_candidate_acq_obs_binding_idx").on(table.bindingHash, table.createdAt),
+  ],
+);

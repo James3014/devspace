@@ -76,6 +76,21 @@ export interface ServerConfig {
   hostOperationMaxIdleMs?: number;
   hostOperationAllowLongLived?: boolean;
   coreMutationRecoveryOwnerClientId?: string;
+  /**
+   * Explicit Core CLI executable path for candidate acquisition.
+   * No PATH guessing, no fallback. Missing or mismatched → CORE_RUNTIME_UNAVAILABLE_OR_MISMATCH (nonblocking).
+   */
+  coreAcquisitionExecutable?: string;
+  /**
+   * Expected nexus-core source revision the installed runtime must match.
+   * Must be the exact 40-character lowercase hex SHA of the production-merged commit.
+   */
+  coreAcquisitionExpectedSourceRevision?: string;
+  /**
+   * Immutable installed runtime package digest (e.g. sha256:<hex> of the binary or package).
+   * Bound at startup; runtime identity mismatch → CORE_RUNTIME_UNAVAILABLE_OR_MISMATCH.
+   */
+  coreAcquisitionRuntimeDigest?: string;
 }
 
 function parsePort(value: string | number | undefined): number {
@@ -483,7 +498,19 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     hostOperationMaxIdleMs: env.DEVSPACE_HOST_OPERATION_MAX_IDLE_MS ? parsePositiveInteger(env.DEVSPACE_HOST_OPERATION_MAX_IDLE_MS, 30_000, "DEVSPACE_HOST_OPERATION_MAX_IDLE_MS", 120_000) : undefined,
     hostOperationAllowLongLived: parseBoolean(env.DEVSPACE_HOST_OPERATION_ALLOW_LONG_LIVED),
     coreMutationRecoveryOwnerClientId: env.DEVSPACE_CORE_MUTATION_RECOVERY_OWNER_CLIENT_ID?.trim() || undefined,
+    coreAcquisitionExecutable: env.DEVSPACE_CORE_ACQUISITION_EXECUTABLE?.trim() || undefined,
+    coreAcquisitionExpectedSourceRevision: parseCoreAcquisitionRevision(env.DEVSPACE_CORE_ACQUISITION_EXPECTED_SOURCE_REVISION),
+    coreAcquisitionRuntimeDigest: env.DEVSPACE_CORE_ACQUISITION_RUNTIME_DIGEST?.trim() || undefined,
   };
+}
+
+function parseCoreAcquisitionRevision(value: string | undefined): string | undefined {
+  const raw = value?.trim();
+  if (!raw) return undefined;
+  if (!/^[0-9a-f]{40}$/.test(raw)) {
+    throw new Error(`Invalid DEVSPACE_CORE_ACQUISITION_EXPECTED_SOURCE_REVISION: must be 40-character lowercase hex, got: ${raw}`);
+  }
+  return raw;
 }
 
 function parseHostOperationArgv(value: string | undefined): string[] | undefined {
