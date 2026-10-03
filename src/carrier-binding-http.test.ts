@@ -29,7 +29,7 @@ test("CLI completion-only startup preserves pairing and rejects altered or mixed
   await new Promise<void>(resolve=>socket.listen(0,"127.0.0.1",resolve));
   const port=(socket.address() as {port:number}).port;
   await new Promise<void>(resolve=>socket.close(()=>resolve()));
-  const env={...process.env,DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_STATE_DIR:join(root,"state"),DEVSPACE_ALLOWED_ROOTS:workspace,DEVSPACE_WORKTREE_ROOT:join(root,"worktrees"),DEVSPACE_SUBAGENTS:"false",DEVSPACE_PUBLIC_BASE_URL:`http://127.0.0.1:${port}`,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",PORT:String(port)};
+  const env={...process.env,DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_STATE_DIR:join(root,"state"),DEVSPACE_ALLOWED_ROOTS:workspace,DEVSPACE_WORKTREE_ROOT:join(root,"worktrees"),DEVSPACE_SUBAGENTS:"false",DEVSPACE_TOOL_MODE:"full",DEVSPACE_PUBLIC_BASE_URL:`http://127.0.0.1:${port}`,DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",PORT:String(port)};
   const config=loadConfig(env);
   const provider=new SingleUserOAuthProvider(config.oauth,new URL("/mcp",config.publicBaseUrl),config.stateDir);
   const oauthClient=await provider.clientsStore.registerClient!({redirect_uris:["http://localhost/callback"],client_name:"CLI fixture",token_endpoint_auth_method:"none"});
@@ -171,7 +171,8 @@ test("real HTTP clients sharing OAuth pair independently, delegate, resume, exec
   writeFileSync(join(vendor,"witness.txt"),"ISSUE62_INSTALLED_DEPENDENCY_CANARY");
   writeFileSync(join(project,"package.json"),JSON.stringify({name:"carrier-canary",version:"1.0.0",dependencies:{"canary-local":"file:vendor/canary-local"}}));
   writeFileSync(join(project,"package-lock.json"),JSON.stringify({name:"carrier-canary",version:"1.0.0",lockfileVersion:3,packages:{"":{name:"carrier-canary",version:"1.0.0",dependencies:{"canary-local":"file:vendor/canary-local"}},"node_modules/canary-local":{resolved:"vendor/canary-local",link:true},"vendor/canary-local":{version:"1.0.0"}}}));
-  const config=loadConfig({DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_ALLOWED_ROOTS:root,DEVSPACE_STATE_DIR:join(root,"state"),DEVSPACE_WORKTREE_ROOT:join(root,"worktrees"),DEVSPACE_SUBAGENTS:"false",DEVSPACE_PUBLIC_BASE_URL:"http://127.0.0.1:1",DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",PORT:"1"});
+  const agentDir=join(root,"agents");mkdirSync(agentDir,{recursive:true});writeFileSync(join(agentDir,"AGENTS.md"),"carrier http fixture\n");
+  const config=loadConfig({DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_ALLOWED_ROOTS:root,DEVSPACE_STATE_DIR:join(root,"state"),DEVSPACE_WORKTREE_ROOT:join(root,"worktrees"),DEVSPACE_AGENT_DIR:agentDir,DEVSPACE_SUBAGENTS:"true",DEVSPACE_TOOL_MODE:"full",DEVSPACE_PUBLIC_BASE_URL:"http://127.0.0.1:1",DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",PORT:"1"});
   const provider=new SingleUserOAuthProvider(config.oauth,new URL("/mcp",config.publicBaseUrl),config.stateDir);
   const oauthClient=await provider.clientsStore.registerClient!({redirect_uris:["http://localhost/callback"],client_name:"shared carrier fixture",token_endpoint_auth_method:"none"});
   let redirect="";
@@ -201,7 +202,7 @@ test("real HTTP clients sharing OAuth pair independently, delegate, resume, exec
   try {
     const controller=await connect("controller"), worker=await connect("worker");
     const request=data(await controller.callTool({name:"coordination_pair",arguments:{}}));
-    const contract:CarrierContract={repository:"James3014/devspace",goal:"issue62",role:"controller",scope:[root],baseRevision:base,operations:["dependency_sync"],expiresAt:new Date(Date.now()+120000).toISOString()};
+    const contract:CarrierContract={repository:"James3014/devspace",goal:"issue62",role:"controller",scope:[root],baseRevision:base,operations:["dependency_sync","worktree_write"],expiresAt:new Date(Date.now()+120000).toISOString()};
     localOwner.approveLocal(request.pendingId,contract);
     data(await controller.callTool({name:"coordination_resume",arguments:{credential:request.credential}}));
     const completion=()=>controller.callTool({name:"coordination_completion_read",arguments:selection});
@@ -222,6 +223,62 @@ test("real HTTP clients sharing OAuth pair independently, delegate, resume, exec
     assert.ok(refreshedTools.tools.some(tool=>tool.name==="coordination_delegate"));
     const refreshedControllerTools=await controller.listTools();
     assert.ok(refreshedControllerTools.tools.some(tool=>tool.name==="coordination_revoke_worker"));
+
+    // P0 public lifecycle: authenticated #62 carrier prepares exactly one
+    // worktree-writer lease; exact replay returns the same lease/workKey and
+    // read-only status projects the same durable identity.
+    assert.ok(refreshedTools.tools.some(tool=>tool.name==="work_resume_prepare"));
+    assert.ok(refreshedTools.tools.some(tool=>tool.name==="work_resume_status"));
+    const p0Prepared=data(await worker.callTool({
+      name:"work_resume_prepare",
+      arguments:{workspaceId:opened.workspaceId,contractPurpose:"carrier-http-p0"},
+    }));
+    const p0Replay=data(await worker.callTool({
+      name:"work_resume_prepare",
+      arguments:{workspaceId:opened.workspaceId,contractPurpose:"carrier-http-p0"},
+    }));
+    assert.equal(p0Replay.workKey,p0Prepared.workKey);
+    assert.equal(p0Replay.leaseId,p0Prepared.leaseId);
+    assert.equal(p0Replay.leaseVersion,p0Prepared.leaseVersion);
+    const p0Status=data(await worker.callTool({
+      name:"work_resume_status",
+      arguments:{workspaceId:opened.workspaceId,workKey:p0Prepared.workKey},
+    }));
+    assert.equal(p0Status.leaseId,p0Prepared.leaseId);
+    assert.equal(p0Status.disposition,"RUNNING");
+
+    // Interrupted-turn/new MCP session: recover the same durable carrier, reopen
+    // the same physical workspace, and rediscover/reprepare the same work key.
+    // This must rendezvous to the existing lease rather than create a writer.
+    const p0Reconnect=await connect("p0-reconnect");
+    data(await p0Reconnect.callTool({name:"coordination_resume",arguments:{credential:pending.credential}}));
+    const p0Opened=data(await p0Reconnect.callTool({name:"open_workspace",arguments:{path:project,mode:"checkout"}}));
+    const p0ReconnectStatus=data(await p0Reconnect.callTool({
+      name:"work_resume_status",
+      arguments:{workspaceId:p0Opened.workspaceId,workKey:p0Prepared.workKey},
+    }));
+    assert.equal(p0ReconnectStatus.leaseId,p0Prepared.leaseId);
+    assert.equal(p0ReconnectStatus.disposition,"RUNNING");
+    const p0ReconnectPrepare=data(await p0Reconnect.callTool({
+      name:"work_resume_prepare",
+      arguments:{workspaceId:p0Opened.workspaceId,contractPurpose:"carrier-http-p0"},
+    }));
+    assert.equal(p0ReconnectPrepare.workKey,p0Prepared.workKey);
+    assert.equal(p0ReconnectPrepare.leaseId,p0Prepared.leaseId);
+    assert.equal(p0ReconnectPrepare.leaseVersion,p0Prepared.leaseVersion);
+
+    // Release the unpinned P0 lease before exercising dependency_sync, which
+    // legitimately needs the same physical workspace under a different effect.
+    data(await worker.callTool({
+      name:"coordination_lease_release",
+      arguments:{leaseId:p0Prepared.leaseId,expectedVersion:p0Prepared.leaseVersion},
+    }));
+    const p0Terminal=data(await worker.callTool({
+      name:"work_resume_status",
+      arguments:{workspaceId:opened.workspaceId,workKey:p0Prepared.workKey},
+    }));
+    assert.equal(p0Terminal.disposition,"TERMINAL");
+
     const args={workspaceId:opened.workspaceId,attemptKey:"carrier-real-npm",recipe:"npm_ci"};
     const imposter=await connect("same-client-imposter");
     const before=snapshot();
@@ -323,6 +380,7 @@ test("approved cutover credential survives fresh MCP sessions for prepare and st
     DEVSPACE_STATE_DIR: stateDir,
     DEVSPACE_WORKTREE_ROOT: join(root, "worktrees"),
     DEVSPACE_SUBAGENTS: "false",
+    DEVSPACE_TOOL_MODE: "full",
     DEVSPACE_PUBLIC_BASE_URL: "http://127.0.0.1:1",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     PORT: "1",

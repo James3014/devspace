@@ -8,7 +8,7 @@ export interface EffectSubject {
   requestHash: string;
   workspaceRoot: string;
   baseRevision: string;
-  operation: "dependency_sync" | "cutover_start";
+  operation: "dependency_sync" | "cutover_start" | "worktree_write";
 }
 export interface EffectBinding {
   /** Trusted authority generation; changes fence in-flight completion. */

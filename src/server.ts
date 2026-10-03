@@ -1,6 +1,14 @@
 import { CarrierBindingStore, type CarrierCompletionBinding } from "./carrier-binding.js";
 import type { ControlPlaneConsumerOptions } from "./control-plane-consumer.js";
 import { ControlPlaneOwnershipError } from "./control-plane-ownership.js";
+import {
+  centralAdmissionCheck,
+  computeWorkKey,
+  computeWorkRequestHash,
+  createWorkResumeStore,
+  resolveCanonicalPath,
+  WorkResumeStore,
+} from "./work-resume.js";
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { access, realpath } from "node:fs/promises";
@@ -23,6 +31,7 @@ import type { NextFunction, Request, Response } from "express";
 import * as z from "zod/v4";
 import { applyPatch, parsePatch } from "./apply-patch.js";
 import { commitCandidate, pushCandidate, GitCandidateError } from "./git-candidate.js";
+import { git as runGit } from "./git.js";
 import {
   integrateCandidate,
   inspectIntegrationReadiness,
@@ -229,6 +238,7 @@ import { registerPhysicalHostRegistryTools } from "./physical-host-registry.js";
 import { registerHostCapabilitySnapshotTool } from "./host-capability-snapshot.js";
 import { canonicalizePath } from "./roots.js";
 import { applyHostStoragePlan, buildHostStoragePlan, resolveHostStorageRoot } from "./host-storage-retention.js";
+import { openDatabase } from "./db/client.js";
 
 type Transport = StreamableHTTPServerTransport;
 class ReboundTransport extends StreamableHTTPServerTransport {
@@ -292,6 +302,17 @@ const REPOSITORY_INTELLIGENCE_TOOL_ANNOTATIONS = {
   idempotentHint: true,
   openWorldHint: false,
 };
+
+/** Zod schema for the P0 resumable-work pointer carried by write-capable tool inputs. */
+function resumableWorkSchema() {
+  return z.object({
+    workKey: z.string().regex(/^wk_[0-9a-f]{32}$/),
+    leaseId: z.string().min(1),
+    expectedLeaseVersion: z.number().int().positive(),
+    baseRevisionSha: z.string().regex(/^[0-9a-f]{40}$/),
+    effectHandle: z.string().optional(),
+  });
+}
 
 type AgentSelector = {
   profile?: string;
@@ -2823,6 +2844,9 @@ function createAgentStartInputSchema() {
     }).strict().describe(
       "Exact pointer to an already-open Core-bound mutation session. Carries provenance only; it grants no route, acceptance, merge, or release authority.",
     ),
+    resumableWork: resumableWorkSchema().describe(
+      "P0 resumable-work pointer. For agent_start, effectHandle must exactly equal attemptKey so reconnect/replay can recover the same durable agent effect.",
+    ),
     expectedHead: z.string().describe(
       "40-character commit SHA. If supplied, agent_start fails closed when workspace HEAD no longer matches.",
     ),
@@ -3100,6 +3124,13 @@ export function createMcpServer(
   controlPlaneInventoryReader?: () => ControlPlaneInventory,
   coreMutationSessions?: CoreMutationSessionStore,
   coreMutationTestOnlyBypass?: typeof CORE_MUTATION_TEST_ONLY_UNTRUSTED_BYPASS,
+  /**
+   * P0 WorkResumeStore.  When supplied, write-capable tool handlers that
+   * carry a resumableWork pointer call centralAdmissionCheck before any
+   * provider launch, file write, git mutation, or process spawn.
+   * Legacy callers without a resumableWork pointer are unaffected.
+   */
+  workResumeStore?: WorkResumeStore,
 ): McpServer {
   const runtimeBuildIdentity = runtimeBuildIdentityContext?.identity
     ?? describeRuntimeBuildIdentity({
@@ -4015,7 +4046,7 @@ export function createMcpServer(
     );
 
     if (carrierBindings) {
-      const contractSchema=z.object({repository:z.string(),goal:z.string(),role:z.enum(["controller","worker"]),scope:z.array(z.string()),baseRevision:z.string(),operations:z.array(z.literal("dependency_sync")),expiresAt:z.string()}).strict();
+      const contractSchema=z.object({repository:z.string(),goal:z.string(),role:z.enum(["controller","worker"]),scope:z.array(z.string()),baseRevision:z.string(),operations:z.array(z.enum(["dependency_sync","worktree_write"])),expiresAt:z.string()}).strict();
       const registration={annotations:{readOnlyHint:false,destructiveHint:false,idempotentHint:false,openWorldHint:false},_meta:{}};
       const result=(value:unknown)=>({content:[textBlock(JSON.stringify(value))]});
       registerAppTool(server,"coordination_pair",{...registration,title:"Request a carrier pairing",description:"Request local Owner approval for new bounded authority. Save the returned pendingId; once approved locally by the Owner via CLI, resume the carrier using coordination_resume with the pendingId.",inputSchema:{}},async(_,extra)=>result(carrierBindings.requestPairing(dependencyConsumerContext(extra))));
@@ -4398,12 +4429,15 @@ export function createMcpServer(
           .string()
           .describe("File path to write, relative to the workspace root."),
         content: z.string().describe("Complete new file content."),
+        resumableWork: resumableWorkSchema().optional().describe(
+          "P0 resumable-work pointer.  When supplied, the write is admitted only if the exact lease is currently held by the caller.",
+        ),
       },
       outputSchema: resultOutputSchema({ coreMutation: z.record(z.string(), z.unknown()).optional() }),
       ...toolWidgetDescriptorMeta(config, "write"),
       annotations: WRITE_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, ...input }, extra) => {
+    async ({ workspaceId, resumableWork: p0Pointer, ...input }, extra) => {
       const startedAt = performance.now();
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
@@ -4418,6 +4452,16 @@ export function createMcpServer(
             ...instructionPaths.map((path, index) => `  ${index + 1}. ${path}`),
           ].join("\n"))],
         };
+      }
+      // ── P0 writer admission ──────────────────────────────────────────────
+      if (p0Pointer && workResumeStore) {
+        await centralAdmissionCheck({
+          store: workResumeStore,
+          pointer: p0Pointer,
+          ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+          worktreeRealpath: workspace.root,
+          operation: "write",
+        });
       }
       const coreAdmission = coreMutationGuard
         ? await coreMutationGuard.admit({ workspaceId, extra, paths: [input.path], pathContainment: "STRUCTURED_SINK_ENFORCED" })
@@ -4500,6 +4544,9 @@ export function createMcpServer(
             }),
           )
           .min(1),
+        resumableWork: resumableWorkSchema().optional().describe(
+          "P0 resumable-work pointer.  When supplied, the edit is admitted only if the exact lease is currently held by the caller.",
+        ),
       },
       outputSchema: resultOutputSchema({
         status: z.literal("applied"),
@@ -4508,7 +4555,7 @@ export function createMcpServer(
       ...toolWidgetDescriptorMeta(config, "edit"),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, ...input }, extra) => {
+    async ({ workspaceId, resumableWork: p0Pointer, ...input }, extra) => {
       const startedAt = performance.now();
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
@@ -4523,6 +4570,16 @@ export function createMcpServer(
             ...instructionPaths.map((path, index) => `  ${index + 1}. ${path}`),
           ].join("\n"))],
         };
+      }
+      // ── P0 writer admission ──────────────────────────────────────────────
+      if (p0Pointer && workResumeStore) {
+        await centralAdmissionCheck({
+          store: workResumeStore,
+          pointer: p0Pointer,
+          ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+          worktreeRealpath: workspace.root,
+          operation: "edit",
+        });
       }
       const coreAdmission = coreMutationGuard
         ? await coreMutationGuard.admit({ workspaceId, extra, paths: [input.path], pathContainment: "STRUCTURED_SINK_ENFORCED" })
@@ -5014,18 +5071,38 @@ export function createMcpServer(
           .max(100_000)
           .optional()
           .describe("Approximate output token budget. Defaults to 10000."),
+        resumableWork: resumableWorkSchema().optional().describe(
+          "P0 resumable-work pointer.  When supplied and the command is write-capable, the spawn is admitted only if the exact lease is currently held by the caller.  Read-only commands ignore this field.",
+        ),
       },
       outputSchema: processOutputSchema(),
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, workingDirectory, command, timeout, attemptKey, yieldTimeMs, maxOutputTokens }, extra) => {
+    async ({ workspaceId, workingDirectory, command, timeout, attemptKey, yieldTimeMs, maxOutputTokens, resumableWork: p0Pointer }, extra) => {
       const startedAt = performance.now();
       const mutationCapable = !isRepositoryReadOnlyShellCommand(command);
       if (mutationCapable) {
         await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       }
       const workspace = workspaces.getWorkspace(workspaceId);
+      // ── P0 writer admission ──────────────────────────────────────────────
+      // Checked only for write-capable commands; read-only commands skip.
+      if (p0Pointer && workResumeStore && mutationCapable) {
+        try {
+          await centralAdmissionCheck({
+            store: workResumeStore,
+            pointer: p0Pointer,
+            ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+            worktreeRealpath: workspace.root,
+            operation: "shell",
+          });
+        } catch (err) {
+          throw new Error(
+            `[P0_WRITER_ADMISSION_FAILED] ${err instanceof Error ? err.message : String(err)}`,
+          );
+        }
+      }
       const coreAdmission = mutationCapable && coreMutationGuard
         ? await coreMutationGuard.admit({ workspaceId, extra, pathContainment: "NOT_PROVEN", writerDomain: "PROCESS" })
         : undefined;
@@ -5392,6 +5469,37 @@ export function createMcpServer(
             ? { catalogReceipt: catalogReceiptForProfile(selectedProfile, opencodeCatalog, clineCatalog) }
             : {}),
         };
+        // ── P0 writer admission ──────────────────────────────────────────────
+        // Must happen BEFORE provider launch.  No-op for legacy callers without
+        // a resumableWork pointer; fails closed when the pointer is present but
+        // assertHeld fails (version drift, expired, already terminal, etc.).
+        if (contract?.resumableWork && workResumeStore) {
+          try {
+            if (contract.resumableWork.effectHandle !== attemptKey) {
+              throw new Error(
+                "P0 agent_start requires resumableWork.effectHandle to exactly equal attemptKey.",
+              );
+            }
+            await centralAdmissionCheck({
+              store: workResumeStore,
+              pointer: contract.resumableWork,
+              ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+              worktreeRealpath: workspace.root,
+              operation: "agent_start",
+            });
+            workResumeStore.bindEffectIdentity({
+              workKey: contract.resumableWork.workKey,
+              leaseId: contract.resumableWork.leaseId,
+              effectKind: "agent",
+              effectKey: attemptKey,
+            });
+          } catch (err) {
+            throw new AgentSessionError(
+              "INVALID_EXECUTION_CONTRACT",
+              `P0_WRITER_ADMISSION_FAILED: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
         const output = await agentSessionManager.startAgent({
           workspaceId,
           workspaceRoot: workspace.root,
@@ -5402,6 +5510,14 @@ export function createMcpServer(
           attemptKey,
           executionContract: boundContract,
         });
+        if (contract?.resumableWork && workResumeStore) {
+          workResumeStore.bindEffectHandle({
+            workKey: contract.resumableWork.workKey,
+            effectKind: "agent",
+            effectKey: attemptKey,
+            effectHandle: output.agentId,
+          });
+        }
         logToolCall(config, {
           tool: "agent_start",
           workspaceId,
@@ -5491,6 +5607,25 @@ export function createMcpServer(
             }
           }
         }
+        // ── P0 writer admission ──────────────────────────────────────────────
+        // Reads the resumableWork pointer from the persisted contract stored at
+        // agent_start time.  No-op for legacy agents without a P0 pointer.
+        const resumableWorkForContinue = currentAgent?.executionContract?.resumableWork;
+        if (resumableWorkForContinue && workResumeStore) {
+          try {
+            await centralAdmissionCheck({
+              store: workResumeStore,
+              pointer: resumableWorkForContinue,
+              ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+              worktreeRealpath: workspace.root,
+            });
+          } catch (err) {
+            throw new AgentSessionError(
+              "INVALID_EXECUTION_CONTRACT",
+              `P0_WRITER_ADMISSION_FAILED: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
         const output = await agentSessionManager.continueAgent({
           workspaceId,
           workspaceRoot: workspace.root,
@@ -5514,6 +5649,349 @@ export function createMcpServer(
           structuredContent: {
             ...(output as unknown as Record<string, unknown>),
             ...(coreAdmission?.bound ? { coreMutation: coreMutationAdmissionOutput(coreAdmission) } : {}),
+          },
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
+      "work_resume_prepare",
+      {
+        title: "Prepare resumable work",
+        description:
+          "Create or exactly replay one P0 work identity and exclusive writer lease using the current authenticated #62 carrier. Repository, base SHA, scope and expiry come from that carrier; this prepares ownership only and starts no effect.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          contractPurpose: z.string().min(1).max(512).describe(
+            "Stable purpose identity within the already-approved carrier goal. Repository, goal, base SHA, scope and expiry come only from that carrier.",
+          ),
+        },
+        outputSchema: {
+          schema: z.literal("devspace.work_resume.v1"),
+          workKey: z.string(),
+          leaseId: z.string(),
+          leaseVersion: z.number().int(),
+          disposition: z.enum(["RUNNING", "TERMINAL", "RECONCILE_REQUIRED", "NO_EXISTING_ATTEMPT"]),
+          baseRevisionSha: z.string(),
+          worktreeRealpath: z.string(),
+          writeScope: z.array(z.string()),
+          expiresAt: z.string(),
+          resumableWork: resumableWorkSchema(),
+        },
+        _meta: {},
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ workspaceId, contractPurpose }, extra) => {
+        if (!workResumeStore || !carrierBindings) {
+          throw new AgentSessionError(
+            "INVALID_EXECUTION_CONTRACT",
+            "P0 work-resume preparation requires the canonical #62 carrier/ownership authority.",
+          );
+        }
+        const context = dependencyConsumerContext(extra);
+        const carrier = carrierBindings.status(context);
+        if (!carrier.contract.operations.includes("worktree_write")) {
+          throw new AgentSessionError(
+            "INVALID_EXECUTION_CONTRACT",
+            "Current carrier contract does not authorize worktree_write.",
+          );
+        }
+
+        const conversationScope = openAiConversationScopeId(extra._meta);
+        await workspaces.assertConversationMutationAllowed(workspaceId, conversationScope);
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const canonicalRoot = resolveCanonicalPath(workspace.root);
+        const currentHead = (await runGit(canonicalRoot, ["rev-parse", "HEAD"])).stdout.trim().toLowerCase();
+        if (currentHead !== carrier.contract.baseRevision) {
+          throw new AgentSessionError(
+            "STALE_WORKSPACE",
+            `P0 carrier base ${carrier.contract.baseRevision} does not match current workspace HEAD ${currentHead}.`,
+          );
+        }
+
+        const material = {
+          repositoryKey: carrier.contract.repository,
+          ownerIssueId: carrier.contract.goal,
+          baseRevisionSha: currentHead,
+          worktreeRealpath: canonicalRoot,
+          writeScope: [canonicalRoot],
+          contractPurpose,
+        };
+        const workKey = computeWorkKey(material);
+        const subject = {
+          operationId: `wresume:${workKey}`,
+          requestHash: computeWorkRequestHash(material),
+          workspaceRoot: canonicalRoot,
+          baseRevision: currentHead,
+          operation: "worktree_write" as const,
+        };
+        const lease = carrierBindings.prepareEffect(context, subject);
+        const prepared = workResumeStore.prepare({ material, lease });
+        const resumableWork = {
+          workKey: prepared.workKey,
+          leaseId: prepared.lease.leaseId,
+          expectedLeaseVersion: prepared.lease.version,
+          baseRevisionSha: prepared.material.baseRevisionSha,
+        };
+        return {
+          content: [textBlock(
+            `Prepared resumable work ${prepared.workKey} on lease ${prepared.lease.leaseId} v${prepared.lease.version}. Before agent_start, set resumableWork.effectHandle to that exact attemptKey.`,
+          )],
+          structuredContent: {
+            schema: "devspace.work_resume.v1" as const,
+            workKey: prepared.workKey,
+            leaseId: prepared.lease.leaseId,
+            leaseVersion: prepared.lease.version,
+            disposition: prepared.status.disposition,
+            baseRevisionSha: prepared.material.baseRevisionSha,
+            worktreeRealpath: prepared.material.worktreeRealpath,
+            writeScope: [...prepared.material.writeScope],
+            expiresAt: prepared.lease.expiresAt,
+            resumableWork,
+          },
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
+      "work_resume_status",
+      {
+        title: "Work resume status",
+        description:
+          "Read one P0 durable work identity before dispatch. Returns the exact lease/effect identity and, when bound to an agent, its durable agent handle/status. This is read-only and never starts or retries work.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          workKey: z.string().regex(/^wk_[0-9a-f]{32}$/).describe("Stable P0 work key."),
+        },
+        outputSchema: {
+          schema: z.literal("devspace.work_resume.v1"),
+          workKey: z.string(),
+          disposition: z.enum(["RUNNING", "TERMINAL", "RECONCILE_REQUIRED", "NO_EXISTING_ATTEMPT"]),
+          leaseId: z.string().optional(),
+          leaseVersion: z.number().int().optional(),
+          operationHandle: z.string().optional(),
+          operationStatus: z.string().optional(),
+          baseRevisionSha: z.string().optional(),
+          worktreeRealpath: z.string().optional(),
+          idempotencyKey: z.string().optional(),
+          effectKind: z.string().optional(),
+          effectKey: z.string().optional(),
+          effectHandle: z.string().optional(),
+          terminalReceipt: z.record(z.string(), z.unknown()).optional(),
+          agent: z.object({
+            agentId: z.string(),
+            status: z.string(),
+            terminal: z.boolean(),
+            updatedAt: z.string(),
+          }).optional(),
+          message: z.string(),
+        },
+        _meta: {},
+        annotations: {
+          readOnlyHint: true,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ workspaceId, workKey }) => {
+        if (!workResumeStore) {
+          throw new AgentSessionError(
+            "INVALID_EXECUTION_CONTRACT",
+            "P0 work-resume store is unavailable on this server generation.",
+          );
+        }
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const status = workResumeStore.disposition(workKey);
+        if (status.worktreeRealpath) {
+          const canonicalWorkspace = await realpath(workspace.root);
+          if (canonicalWorkspace !== status.worktreeRealpath) {
+            throw new AgentSessionError(
+              "INVALID_EXECUTION_CONTRACT",
+              "P0 work key belongs to a different physical worktree.",
+            );
+          }
+        }
+
+        let agent: { agentId: string; status: string; terminal: boolean; updatedAt: string } | undefined;
+        if (status.effectKind === "agent" && status.effectHandle) {
+          try {
+            const agentStatus = await agentSessionManager.getAgentStatus({
+              workspaceId,
+              workspaceRoot: workspace.root,
+              agentId: status.effectHandle,
+              waitMs: 0,
+            });
+            agent = {
+              agentId: agentStatus.agentId,
+              status: agentStatus.status,
+              terminal: agentStatus.terminal,
+              updatedAt: agentStatus.updatedAt,
+            };
+          } catch {
+            // The durable effect handle remains useful even if the agent-status
+            // projection is temporarily unavailable; never invent absence.
+          }
+        }
+
+        const structuredContent = {
+          ...status,
+          ...(agent ? { agent } : {}),
+        };
+        return {
+          content: [textBlock(
+            `Work ${workKey}: ${status.disposition}${status.effectHandle ? ` (handle ${status.effectHandle})` : ""}.`,
+          )],
+          structuredContent,
+        };
+      },
+    );
+
+    registerAppTool(
+      server,
+      "work_resume_reconcile_agent",
+      {
+        title: "Reconcile terminal resumable agent",
+        description:
+          "Close one P0 worktree writer lease only after the exact bound agent is durably terminal and physical agent reconciliation succeeds. Never retries or starts an agent.",
+        inputSchema: {
+          workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          workKey: z.string().regex(/^wk_[0-9a-f]{32}$/),
+          agentId: z.string().min(1),
+        },
+        outputSchema: {
+          schema: z.literal("devspace.work_resume.v1"),
+          workKey: z.string(),
+          disposition: z.enum(["RUNNING", "TERMINAL", "RECONCILE_REQUIRED", "NO_EXISTING_ATTEMPT"]),
+          leaseId: z.string().optional(),
+          leaseVersion: z.number().int().optional(),
+          operationHandle: z.string().optional(),
+          operationStatus: z.string().optional(),
+          baseRevisionSha: z.string().optional(),
+          worktreeRealpath: z.string().optional(),
+          effectKind: z.string().optional(),
+          effectKey: z.string().optional(),
+          effectHandle: z.string().optional(),
+          released: z.boolean(),
+          agent: z.object({
+            agentId: z.string(),
+            status: z.string(),
+            terminal: z.boolean(),
+            updatedAt: z.string(),
+          }),
+          message: z.string(),
+        },
+        _meta: {},
+        annotations: {
+          readOnlyHint: false,
+          destructiveHint: false,
+          idempotentHint: true,
+          openWorldHint: false,
+        },
+      },
+      async ({ workspaceId, workKey, agentId }, extra) => {
+        if (!workResumeStore) {
+          throw new AgentSessionError(
+            "INVALID_EXECUTION_CONTRACT",
+            "P0 work-resume store is unavailable on this server generation.",
+          );
+        }
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const before = workResumeStore.disposition(workKey);
+        if (
+          before.effectKind !== "agent" ||
+          !before.effectKey ||
+          before.effectHandle !== agentId ||
+          !before.leaseId
+        ) {
+          throw new AgentSessionError(
+            "INVALID_EXECUTION_CONTRACT",
+            "P0 work identity is not bound to the requested durable agent.",
+          );
+        }
+        if (before.worktreeRealpath && resolveCanonicalPath(workspace.root) !== before.worktreeRealpath) {
+          throw new AgentSessionError(
+            "INVALID_EXECUTION_CONTRACT",
+            "P0 work key belongs to a different physical worktree.",
+          );
+        }
+
+        const record = agentSessionManager.getRecordByPrefixOrId(agentId);
+        if (
+          !record ||
+          record.workspaceId !== workspaceId ||
+          record.startReplay?.key !== before.effectKey ||
+          record.executionContract?.resumableWork?.workKey !== workKey
+        ) {
+          throw new AgentSessionError(
+            "ATTEMPT_REPLAY_CONFLICT",
+            "Durable agent record does not match the P0 work/effect binding.",
+          );
+        }
+
+        const agentStatus = await agentSessionManager.getAgentStatus({
+          workspaceId,
+          workspaceRoot: workspace.root,
+          agentId,
+          waitMs: 0,
+        });
+        const agent = {
+          agentId: agentStatus.agentId,
+          status: agentStatus.status,
+          terminal: agentStatus.terminal,
+          updatedAt: agentStatus.updatedAt,
+        };
+        if (!agentStatus.terminal) {
+          return {
+            content: [textBlock(
+              `Work ${workKey} remains RUNNING; agent ${agentId} is not terminal.`,
+            )],
+            structuredContent: {
+              ...before,
+              released: false,
+              agent,
+              message: "Exact agent is still non-terminal; lease remains pinned.",
+            },
+          };
+        }
+
+        const physical = await agentSessionManager.reconcileAgent({
+          workspaceId,
+          workspaceRoot: workspace.root,
+          isolated: workspace.mode === "worktree",
+          agentId,
+        });
+        if (physical.agentId !== agentId) {
+          throw new AgentSessionError(
+            "ATTEMPT_REPLAY_CONFLICT",
+            "Physical agent reconciliation returned a different durable agent.",
+          );
+        }
+
+        const after = before.disposition === "TERMINAL"
+          ? before
+          : workResumeStore.completeBoundEffect(
+              carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+              workKey,
+              "agent",
+              agentId,
+            );
+        return {
+          content: [textBlock(
+            `Work ${workKey}: ${after.disposition}; terminal agent ${agentId} reconciled without replay.`,
+          )],
+          structuredContent: {
+            ...after,
+            released: before.disposition !== "TERMINAL",
+            agent,
+            message: "Exact terminal agent reconciled; no provider effect was replayed.",
           },
         };
       },
@@ -6184,6 +6662,9 @@ export function createMcpServer(
           expectedBuildId: z.string().min(1),
           expectedCapabilityManifestSha256: z.string().regex(/^[0-9a-f]{64}$/),
           confirmPromote: z.boolean(),
+          resumableWork: resumableWorkSchema().optional().describe(
+            "P0 resumable-work pointer for the destination worktree. When supplied, promotion is admitted only if the exact writer lease is held.",
+          ),
         },
         outputSchema: {
           success: z.boolean(),
@@ -6222,14 +6703,32 @@ export function createMcpServer(
         expectedBuildId,
         expectedCapabilityManifestSha256,
         confirmPromote,
+        resumableWork: p0Pointer,
       }, extra) => {
+        const source = workspaces.getWorkspace(sourceWorkspaceId);
+        const destination = workspaces.getWorkspace(destinationWorkspaceId);
+        if (confirmPromote && p0Pointer && workResumeStore) {
+          try {
+            await centralAdmissionCheck({
+              store: workResumeStore,
+              pointer: p0Pointer,
+              ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+              worktreeRealpath: destination.root,
+              operation: "git_promote_candidate",
+            });
+          } catch (err) {
+            throw new Error(
+              `[P0_WRITER_ADMISSION_FAILED] ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
+        }
         let coreAdmission: CoreMutationAdmission | undefined;
         let coreCandidate: ReturnType<CoreMutationGuard["candidate"]>;
         const destinationCore = confirmPromote && coreMutationGuard
           ? coreMutationGuard.require({ workspaceId: destinationWorkspaceId, extra })
           : undefined;
         if (confirmPromote && coreMutationGuard && destinationCore) {
-          const readiness = await inspectIntegrationReadiness({ sourceWorkspaceRoot: workspaces.getWorkspace(sourceWorkspaceId).root, candidateBase, candidateHead, destinationWorkspaceRoot: workspaces.getWorkspace(destinationWorkspaceId).root, expectedDestinationHead, dirtyPolicy: "pristine" });
+          const readiness = await inspectIntegrationReadiness({ sourceWorkspaceRoot: source.root, candidateBase, candidateHead, destinationWorkspaceRoot: destination.root, expectedDestinationHead, dirtyPolicy: "pristine" });
           if (!readiness.technicallyReadyToApply) throw new Error(`[CANDIDATE_PROMOTION_NOT_READY] ${readiness.blockers.map((blocker) => blocker.code).join(", ") || "readiness unknown"}`);
           coreCandidate = requireCoreCandidateProvenance(coreMutationGuard, readiness);
           coreAdmission = await coreMutationGuard.admit({
@@ -6241,8 +6740,6 @@ export function createMcpServer(
             pathContainment: "STRUCTURED_SINK_ENFORCED",
           });
         }
-        const source = workspaces.getWorkspace(sourceWorkspaceId);
-        const destination = workspaces.getWorkspace(destinationWorkspaceId);
         const output = await promoteCandidate({
           sourceWorkspaceRoot: source.root,
           candidateBase,
@@ -6296,6 +6793,9 @@ export function createMcpServer(
             .min(1)
             .max(100)
             .describe("Workspace-relative file paths to stage and commit."),
+          resumableWork: resumableWorkSchema().optional().describe(
+            "P0 resumable-work pointer.  When supplied, the commit is admitted only if the exact lease is currently held by the caller.",
+          ),
         },
         outputSchema: {
           workspaceId: z.string(),
@@ -6316,12 +6816,28 @@ export function createMcpServer(
           openWorldHint: false,
         },
       },
-      async ({ workspaceId, expectedHead, message, paths }, extra) => {
+      async ({ workspaceId, expectedHead, message, paths, resumableWork: p0Pointer }, extra) => {
         const workspace = workspaces.getWorkspace(workspaceId);
         if (workspace.mode !== "worktree" || !workspace.worktree?.managed) {
           throw new Error(
             "[GIT_MANAGED_WORKTREE_REQUIRED] Git candidate mutations are only allowed on DevSpace-managed worktrees.",
           );
+        }
+        // ── P0 writer admission ──────────────────────────────────────────────
+        if (p0Pointer && workResumeStore) {
+          try {
+            await centralAdmissionCheck({
+              store: workResumeStore,
+              pointer: p0Pointer,
+              ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+              worktreeRealpath: workspace.root,
+              operation: "git_commit",
+            });
+          } catch (err) {
+            throw new Error(
+              `[P0_WRITER_ADMISSION_FAILED] ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
         }
         let committed: Awaited<ReturnType<typeof commitCandidate>> | undefined;
         let coreAdmission: CoreMutationAdmission | undefined;
@@ -6511,6 +7027,9 @@ export function createMcpServer(
             .describe("Exact 40-character Git commit hash expected at current HEAD."),
           remote: z.string().describe("Configured Git remote name (e.g. 'origin')."),
           branch: z.string().describe("Name of the target non-default remote branch to push to."),
+          resumableWork: resumableWorkSchema().optional().describe(
+            "P0 resumable-work pointer.  When supplied, the push is admitted only if the exact lease is currently held by the caller.",
+          ),
         },
         outputSchema: {
           remote: z.string(),
@@ -6526,12 +7045,28 @@ export function createMcpServer(
           openWorldHint: true,
         },
       },
-      async ({ workspaceId, expectedHead, remote, branch }, extra) => {
+      async ({ workspaceId, expectedHead, remote, branch, resumableWork: p0Pointer }, extra) => {
         const workspace = workspaces.getWorkspace(workspaceId);
         if (workspace.mode !== "worktree" || !workspace.worktree?.managed) {
           throw new Error(
             "[GIT_MANAGED_WORKTREE_REQUIRED] Git candidate mutations are only allowed on DevSpace-managed worktrees.",
           );
+        }
+        // ── P0 writer admission ──────────────────────────────────────────────
+        if (p0Pointer && workResumeStore) {
+          try {
+            await centralAdmissionCheck({
+              store: workResumeStore,
+              pointer: p0Pointer,
+              ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+              worktreeRealpath: workspace.root,
+              operation: "git_push",
+            });
+          } catch (err) {
+            throw new Error(
+              `[P0_WRITER_ADMISSION_FAILED] ${err instanceof Error ? err.message : String(err)}`,
+            );
+          }
         }
         let pushed: Awaited<ReturnType<typeof pushCandidate>> | undefined;
         let coreAdmission: CoreMutationAdmission | undefined;
@@ -6921,6 +7456,20 @@ export function createServer(
   if (carrierBindings) initializationCleanups.push(() => carrierBindings.close());
   const durableOperations = new DurableOperationManager(config, undefined, undefined, undefined, options.coordination ?? carrierBindings?.readers);
   initializationCleanups.push(() => durableOperations.close());
+  // P0 WorkResumeStore — uses its own SQLite connection (same devspace.sqlite,
+  // WAL mode allows concurrent readers + one writer).
+  const workResumeDb = openDatabase(config.stateDir);
+  initializationCleanups.push(() => workResumeDb.close());
+  const { store: workResumeStore } = createWorkResumeStore(
+    workResumeDb.sqlite,
+    // Test/injected fallback only. Production binds directly to the exact #62
+    // CarrierBindingStore ownership instance so owner/CAS/grant semantics are
+    // identical to coordination leases rather than re-derived from chat ids.
+    (context) => typeof context === "string" && context.length > 0
+      ? { ownerThread: context }
+      : undefined,
+    carrierBindings?.ownership,
+  );
   const hostOperations = config.hostOperationsEnabled && config.hostOperationExecutable && config.hostOperationExecutableSha256 && config.hostOperationOwnerClientId && config.hostOperationCwd
     ? new HostOperationRegistrar(durableOperations.store, {
       enabled: true,
@@ -7593,6 +8142,8 @@ export function createServer(
     options.controlPlaneInventory,
     controlPlaneInventoryReader,
     coreMutationSessions,
+    undefined, // coreMutationTestOnlyBypass — production never set
+    workResumeStore,
   );
 
   const reboundSessionIds = new Set<string>();
