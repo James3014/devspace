@@ -417,7 +417,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     logging: parseLoggingConfig(env),
     gitCandidatesEnabled:
       env.DEVSPACE_GIT_CANDIDATES === undefined
-        ? false
+        ? true
         : parseBoolean(env.DEVSPACE_GIT_CANDIDATES),
     toolchains: parseToolchains(env.DEVSPACE_TOOLCHAINS),
     agentMaxConcurrent: parsePositiveInteger(

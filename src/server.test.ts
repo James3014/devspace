@@ -2352,50 +2352,53 @@ test("terminal agent CLEAR cannot launder required PROCESS UNKNOWN", async (t) =
   assert.equal(context.coreMutationSessions!.getById(bound.session.id)?.status, "ACTIVE");
 });
 
-test("repository write and shell sink families reject an unbound caller before effect", async (t) => {
-  const conversation = { "openai/session": "core-unbound-sinks" };
+test("fresh direct workspace can edit and test without Core mutation session", async (t) => {
+  const conversation = { "openai/session": "direct-workspace-sinks" };
   const full = await fixture(t, { coreMutation: true, subagents: true });
   await addMutatorProfile(full.project);
   const opened = await callOpen(full.client, full.project, conversation["openai/session"]);
   const workspaceId = structuredContent(opened).workspaceId as string;
 
-  const bashMarker = join(full.project, "bash-unbound.txt");
+  const bashMarker = join(full.project, "bash-direct.txt");
   const bash = await full.client.callTool({
     name: "bash",
     arguments: {
       workspaceId,
-      command: `${JSON.stringify(process.execPath)} -e "require('node:fs').writeFileSync('bash-unbound.txt','bad')"`,
-      attemptKey: "core-unbound-bash",
+      command: `${JSON.stringify(process.execPath)} -e "require('node:fs').writeFileSync('bash-direct.txt','ok')"`,
+      attemptKey: "direct-bash",
     },
     _meta: conversation,
   });
-  assert.equal(bash.isError, true);
-  assert.match(responseText(bash), /CORE_BOUND_SESSION_REQUIRED/);
-  assert.equal(existsSync(bashMarker), false, "unbound bash must not spawn or write");
+  assert.equal(bash.isError, undefined, responseText(bash));
+  assert.doesNotMatch(responseText(bash), /CORE_BOUND_SESSION_REQUIRED/);
+  assert.equal(existsSync(bashMarker), true, "direct bash must spawn and write");
+  assert.equal(structuredContent(bash).coreMutation, undefined);
 
   const write = await full.client.callTool({
     name: "write",
-    arguments: { workspaceId, path: "write-unbound.txt", content: "bad\n" },
+    arguments: { workspaceId, path: "write-direct.txt", content: "ok\n" },
     _meta: conversation,
   });
-  assert.equal(write.isError, true);
-  assert.match(responseText(write), /CORE_BOUND_SESSION_REQUIRED/);
-  assert.equal(existsSync(join(full.project, "write-unbound.txt")), false);
+  assert.equal(write.isError, undefined, responseText(write));
+  assert.doesNotMatch(responseText(write), /CORE_BOUND_SESSION_REQUIRED/);
+  assert.equal(readFileSync(join(full.project, "write-direct.txt"), "utf8"), "ok\n");
+  assert.equal(structuredContent(write).coreMutation, undefined);
 
-  const beforeAgents = readFileSync(join(full.project, "AGENTS.md"), "utf8");
   const edit = await full.client.callTool({
     name: "edit",
     arguments: {
       workspaceId,
       path: "AGENTS.md",
-      edits: [{ oldText: "project instructions", newText: "unbound mutation" }],
+      edits: [{ oldText: "project instructions", newText: "direct mutation" }],
     },
     _meta: conversation,
   });
-  assert.equal(edit.isError, true);
-  assert.match(responseText(edit), /CORE_BOUND_SESSION_REQUIRED/);
-  assert.equal(readFileSync(join(full.project, "AGENTS.md"), "utf8"), beforeAgents);
+  assert.equal(edit.isError, undefined, responseText(edit));
+  assert.doesNotMatch(responseText(edit), /CORE_BOUND_SESSION_REQUIRED/);
+  assert.match(readFileSync(join(full.project, "AGENTS.md"), "utf8"), /direct mutation/);
+  assert.equal(structuredContent(edit).coreMutation, undefined);
 
+  // Delegated subagent execution requires explicit contract
   const agent = await full.client.callTool({
     name: "agent_start",
     arguments: {
@@ -2418,47 +2421,47 @@ test("repository write and shell sink families reject an unbound caller before e
     name: "apply_patch",
     arguments: {
       workspaceId: codexWorkspaceId,
-      patch: "*** Begin Patch\n*** Add File: patch-unbound.txt\n+bad\n*** End Patch",
+      patch: "*** Begin Patch\n*** Add File: patch-direct.txt\n+ok\n*** End Patch",
     },
     _meta: conversation,
   });
-  assert.equal(patch.isError, true);
-  assert.match(responseText(patch), /CORE_BOUND_SESSION_REQUIRED/);
-  assert.equal(existsSync(join(codex.project, "patch-unbound.txt")), false);
+  assert.equal(patch.isError, undefined, responseText(patch));
+  assert.doesNotMatch(responseText(patch), /CORE_BOUND_SESSION_REQUIRED/);
+  assert.equal(readFileSync(join(codex.project, "patch-direct.txt"), "utf8"), "ok\n");
 
-  const execMarker = join(codex.project, "exec-unbound.txt");
+  const execMarker = join(codex.project, "exec-direct.txt");
   const execResult = await codex.client.callTool({
     name: "exec_command",
     arguments: {
       workspaceId: codexWorkspaceId,
-      cmd: `${JSON.stringify(process.execPath)} -e "require('node:fs').writeFileSync('exec-unbound.txt','bad')"`,
-      attemptKey: "core-unbound-exec",
+      cmd: `${JSON.stringify(process.execPath)} -e "require('node:fs').writeFileSync('exec-direct.txt','ok')"`,
+      attemptKey: "direct-exec",
     },
     _meta: conversation,
   });
-  assert.equal(execResult.isError, true);
-  assert.match(responseText(execResult), /CORE_BOUND_SESSION_REQUIRED/);
-  assert.equal(existsSync(execMarker), false, "unbound exec_command must not spawn or write");
+  assert.equal(execResult.isError, undefined, responseText(execResult));
+  assert.doesNotMatch(responseText(execResult), /CORE_BOUND_SESSION_REQUIRED/);
+  assert.equal(existsSync(execMarker), true, "direct exec_command must spawn and write");
 
-  const historical = await codex.processSessions.start({
+  const directProc = await codex.processSessions.start({
     workspaceId: codexWorkspaceId,
     workspaceRoot: codex.project,
     cwd: codex.project,
-    command: `${JSON.stringify(process.execPath)} -e "process.stdin.once('data',()=>require('node:fs').writeFileSync('stdin-unbound.txt','bad'));setInterval(()=>{},1000)"`,
+    command: `${JSON.stringify(process.execPath)} -e "process.stdin.once('data',()=>require('node:fs').writeFileSync('stdin-direct.txt','ok'));setInterval(()=>{},1000)"`,
     yieldTimeMs: 10,
   });
-  assert.ok(historical.sessionId);
+  assert.ok(directProc.sessionId);
   try {
     const stdin = await codex.client.callTool({
       name: "write_stdin",
-      arguments: { workspaceId: codexWorkspaceId, sessionId: historical.sessionId, chars: "go\n" },
+      arguments: { workspaceId: codexWorkspaceId, sessionId: directProc.sessionId, chars: "go\n" },
       _meta: conversation,
     });
-    assert.equal(stdin.isError, true);
-    assert.match(responseText(stdin), /CORE_BOUND_SESSION_REQUIRED/);
-    assert.equal(existsSync(join(codex.project, "stdin-unbound.txt")), false);
+    assert.equal(stdin.isError, undefined, responseText(stdin));
+    assert.doesNotMatch(responseText(stdin), /CORE_BOUND_SESSION_REQUIRED/);
+    assert.equal(existsSync(join(codex.project, "stdin-direct.txt")), true);
   } finally {
-    codex.processSessions.terminate(codexWorkspaceId, historical.sessionId!);
+    codex.processSessions.terminate(codexWorkspaceId, directProc.sessionId!);
   }
 });
 
@@ -2501,69 +2504,61 @@ test("shell scope escape cannot become trusted Core completion while read-only s
 });
 
 test("read-only shell classification cannot bypass Core through mutating options", async (t) => {
-  const conversation = { "openai/session": "core-shell-classification" };
-  const context = await fixture(t, { git: true, coreMutation: true });
-  const opened = await callOpen(context.client, context.project, conversation["openai/session"]);
-  const workspaceId = structuredContent(opened).workspaceId as string;
-  const victim = join(context.project, "classification-victim.txt");
-  await writeFile(victim, "preserve\n");
-  const findDelete = await context.client.callTool({
-    name: "bash",
-    arguments: {
+  const assertMutatingCommandBlocked = async (
+    command: string,
+    attemptKey: string,
+    options: { victimFile?: string; allowedPaths?: string[]; expectedError: RegExp },
+  ) => {
+    const conversationScopeId = `core-shell-${attemptKey}`;
+    const conversation = { "openai/session": conversationScopeId };
+    const context = await fixture(t, { git: true, coreMutation: true });
+    if (options.victimFile) {
+      const victim = join(context.project, options.victimFile);
+      await writeFile(victim, "preserve\n");
+      await execFileAsync("git", ["add", options.victimFile], { cwd: context.project });
+      await execFileAsync("git", ["commit", "-m", `add ${options.victimFile}`], { cwd: context.project });
+    }
+    const opened = await callOpen(context.client, context.project, conversationScopeId);
+    const workspaceId = structuredContent(opened).workspaceId as string;
+    await bindTestCoreSession({
+      fixture: context,
       workspaceId,
-      command: "find . -name classification-victim.txt -delete",
-      attemptKey: "core-find-delete",
-    },
-    _meta: conversation,
-  });
-  assert.equal(findDelete.isError, true);
-  assert.match(responseText(findDelete), /CORE_BOUND_SESSION_REQUIRED/);
-  assert.equal(existsSync(victim), true);
-
-  const diffOutput = join(context.project, "diff-output.txt");
-  const gitDiffOutput = await context.client.callTool({
-    name: "bash",
-    arguments: {
-      workspaceId,
-      command: "git diff --output=diff-output.txt",
-      attemptKey: "core-git-diff-output",
-    },
-    _meta: conversation,
-  });
-  assert.equal(gitDiffOutput.isError, true);
-  assert.match(responseText(gitDiffOutput), /CORE_BOUND_SESSION_REQUIRED/);
-  assert.equal(existsSync(diffOutput), false);
-
-  for (const [index, token] of ["\"-delete\"", "'-delete'", "\\-delete"].entries()) {
-    const quotedVictim = join(context.project, `quoted-victim-${index}.txt`);
-    await writeFile(quotedVictim, "preserve\n");
-    const quotedDelete = await context.client.callTool({
+      workspaceRoot: context.project,
+      conversationScopeId,
+      allowedPaths: options.allowedPaths ?? (options.victimFile ? [options.victimFile] : ["safe.txt"]),
+    });
+    const result = await context.client.callTool({
       name: "bash",
       arguments: {
         workspaceId,
-        command: `find . -name quoted-victim-${index}.txt ${token}`,
-        attemptKey: `core-find-delete-quoted-${index}`,
+        command,
+        attemptKey,
       },
       _meta: conversation,
     });
-    assert.equal(quotedDelete.isError, true);
-    assert.match(responseText(quotedDelete), /CORE_BOUND_SESSION_REQUIRED/);
-    assert.equal(existsSync(quotedVictim), true, `quoted mutation token ${token} must not reach shell spawn`);
+    assert.equal(result.isError, true, `Expected command '${command}' to fail under Core governance, but got: ${responseText(result)}`);
+    assert.match(responseText(result), options.expectedError);
+  };
+
+  await assertMutatingCommandBlocked("find . -name classification-victim.txt -delete", "core-find-delete", {
+    victimFile: "classification-victim.txt",
+    expectedError: /CORE_MUTATION_POST_EFFECT_DELETION_FORBIDDEN/,
+  });
+
+  await assertMutatingCommandBlocked("git diff --output=diff-output.txt", "core-git-diff-output", {
+    expectedError: /CORE_MUTATION_POST_EFFECT_SCOPE_ESCAPE/,
+  });
+
+  for (const [index, token] of ["\"-delete\"", "'-delete'", "\\-delete"].entries()) {
+    await assertMutatingCommandBlocked(`find . -name quoted-victim-${index}.txt ${token}`, `core-find-delete-quoted-${index}`, {
+      victimFile: `quoted-victim-${index}.txt`,
+      expectedError: /CORE_MUTATION_POST_EFFECT_DELETION_FORBIDDEN/,
+    });
   }
 
-  const quotedDiffOutput = join(context.project, "quoted-diff-output.txt");
-  const quotedGitDiff = await context.client.callTool({
-    name: "bash",
-    arguments: {
-      workspaceId,
-      command: "git diff \"--output=quoted-diff-output.txt\"",
-      attemptKey: "core-git-diff-output-quoted",
-    },
-    _meta: conversation,
+  await assertMutatingCommandBlocked("git diff \"--output=quoted-diff-output.txt\"", "core-git-diff-output-quoted", {
+    expectedError: /CORE_MUTATION_POST_EFFECT_SCOPE_ESCAPE/,
   });
-  assert.equal(quotedGitDiff.isError, true);
-  assert.match(responseText(quotedGitDiff), /CORE_BOUND_SESSION_REQUIRED/);
-  assert.equal(existsSync(quotedDiffOutput), false);
 });
 
 test("agent continuation rejects changed and historical Core binding identity", async (t) => {
@@ -3592,43 +3587,51 @@ test("gitCandidates enabled: git tools are present with schema validation", asyn
 test("Git publication and integration sinks require Core binding and provenance", async (t) => {
   const conversation = { "openai/session": "core-unbound-git-sinks" };
   const context = await fixture(t, { git: true, gitCandidates: true, coreMutation: true });
+  const bare = join(dirname(context.project), "direct-remote.git");
+  await execFileAsync("git", ["init", "--bare", bare]);
+  await execFileAsync("git", ["remote", "add", "origin", bare], { cwd: context.project });
+
   const opened = await callOpen(context.client, context.project, conversation["openai/session"], "worktree");
   const workspace = structuredContent(opened) as Record<string, any>;
   const workspaceId = workspace.workspaceId as string;
   const worktreeRoot = workspace.root as string;
   const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: worktreeRoot })).stdout.trim();
 
-  const push = await context.client.callTool({
-    name: "git_push",
-    arguments: { workspaceId, expectedHead: head, remote: "origin", branch: "core-unbound" },
-    _meta: conversation,
-  });
-  assert.equal(push.isError, true);
-  assert.match(responseText(push), /CORE_BOUND_SESSION_REQUIRED/);
-
-  await writeFile(join(worktreeRoot, "core-unbound-commit.txt"), "must remain uncommitted\n");
+  // Direct git_commit and git_push do not require Core binding
+  await writeFile(join(worktreeRoot, "direct-commit.txt"), "direct commit\n");
   const commit = await context.client.callTool({
     name: "git_commit",
     arguments: {
       workspaceId,
       expectedHead: head,
-      message: "must not commit",
-      paths: ["core-unbound-commit.txt"],
+      message: "direct commit without core binding",
+      paths: ["direct-commit.txt"],
     },
     _meta: conversation,
   });
-  assert.equal(commit.isError, true);
-  assert.match(responseText(commit), /CORE_BOUND_SESSION_REQUIRED/);
-  assert.equal((await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: worktreeRoot })).stdout.trim(), head);
+  assert.equal(commit.isError, undefined, responseText(commit));
+  assert.equal(structuredContent(commit).created, true);
+  assert.equal(structuredContent(commit).coreMutation, undefined);
+  const commitSha = structuredContent(commit).commitSha as string;
 
+  const push = await context.client.callTool({
+    name: "git_push",
+    arguments: { workspaceId, expectedHead: commitSha, remote: "origin", branch: "direct-branch" },
+    _meta: conversation,
+  });
+  assert.equal(push.isError, undefined, responseText(push));
+  assert.equal(structuredContent(push).coreMutation, undefined);
+  assert.equal(structuredContent(push).branch, "direct-branch");
+
+  // Governed integration and promotion still require Core binding
   const integrate = await context.client.callTool({
     name: "candidate_integrate",
     arguments: {
       sourceWorkspaceId: workspaceId,
       candidateBase: head,
-      candidateHead: head,
+      candidateHead: commitSha,
       destinationWorkspaceId: workspaceId,
-      expectedDestinationHead: head,
+      expectedDestinationHead: commitSha,
       dirtyPolicy: "pristine",
       confirmApply: true,
     },
@@ -3642,11 +3645,11 @@ test("Git publication and integration sinks require Core binding and provenance"
     arguments: {
       sourceWorkspaceId: workspaceId,
       candidateBase: head,
-      candidateHead: head,
+      candidateHead: commitSha,
       candidateTree: (await execFileAsync("git", ["rev-parse", "HEAD^{tree}"], { cwd: worktreeRoot })).stdout.trim(),
       destinationWorkspaceId: workspaceId,
       expectedDestinationBranch: "main",
-      expectedDestinationHead: head,
+      expectedDestinationHead: commitSha,
       expectedServerInstanceId: "unbound",
       expectedSourceCommit: "unbound",
       expectedBuildId: "unbound",
@@ -5048,6 +5051,8 @@ test("command_status metadata annotations and minimal mode visibility", async (t
     "bash",
     "command_status",
     "edit",
+    "git_commit",
+    "git_push",
     "glob",
     "grep",
     "host_capability_snapshot",
@@ -5131,14 +5136,29 @@ test("minimal mode is direct coding while full mode keeps Core mutation admissio
   const full = await fixture(t, { git: true, toolMode: "full", coreMutation: true });
   const fullOpened = await callOpen(full.client, full.project, "issue300-full");
   const fullWorkspaceId = structuredContent(fullOpened).workspaceId as string;
+  const bound = await bindTestCoreSession({
+    fixture: full,
+    workspaceId: fullWorkspaceId,
+    workspaceRoot: full.project,
+    conversationScopeId: "issue300-full",
+    allowedPaths: ["AGENTS.md"],
+  });
   const guardedWrite = await full.client.callTool({
     name: "write",
     arguments: { workspaceId: fullWorkspaceId, path: "guarded.txt", content: "blocked\n" },
     _meta: { "openai/session": "issue300-full" },
   });
   assert.equal(guardedWrite.isError, true);
-  assert.match(responseText(guardedWrite), /CORE_BOUND_SESSION_REQUIRED/);
+  assert.match(responseText(guardedWrite), /CORE_MUTATION_SCOPE_ESCAPE/);
   assert.equal(existsSync(join(full.project, "guarded.txt")), false);
+
+  const allowedWrite = await full.client.callTool({
+    name: "write",
+    arguments: { workspaceId: fullWorkspaceId, path: "AGENTS.md", content: "allowed\n" },
+    _meta: { "openai/session": "issue300-full" },
+  });
+  assert.equal(allowedWrite.isError, undefined);
+  assert.ok(structuredContent(allowedWrite).coreMutation);
 });
 
 test("C3 authenticated HTTP MCP uses host-bound worker authority for real dependency execution", async () => {
@@ -6982,4 +7002,165 @@ test("C3 bound cutover rejects unfenced automatic advance before its callback",a
     const result=await client.callTool({name:"cutover_reconcile",arguments:{}});
     assert.equal(result.isError,true);assert.equal(advances,0);assert.equal(JSON.stringify(cutoverStore.get()),before);
   } finally {await client.close();await server.close();store.close();}
+});
+
+test("Issue #338: Direct Coding canary completes open -> inspect -> edit -> test -> commit -> push without Core mutation tool calls", async (t) => {
+  const conversation = { "openai/session": "chatgpt-direct-coding-canary" };
+  const context = await fixture(t, {
+    git: true,
+    gitCandidates: true,
+    coreMutation: true,
+    toolMode: "minimal",
+  });
+
+  const bare = join(dirname(context.project), "canary-remote.git");
+  await execFileAsync("git", ["init", "--bare", "--initial-branch=main", bare]);
+  await execFileAsync("git", ["remote", "add", "origin", bare], { cwd: context.project });
+  await execFileAsync("git", ["push", "origin", "main"], { cwd: context.project });
+
+  // 1. open_workspace (worktree mode)
+  const opened = await callOpen(context.client, context.project, conversation["openai/session"], "worktree");
+  assert.equal(opened.isError, undefined);
+  const workspace = structuredContent(opened) as Record<string, any>;
+  const workspaceId = workspace.workspaceId as string;
+  const worktreeRoot = workspace.root as string;
+  assert.ok(workspaceId);
+  const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: worktreeRoot })).stdout.trim();
+
+  // 2. inspect (read)
+  const readRes = await context.client.callTool({
+    name: "read",
+    arguments: { workspaceId, path: "README.md" },
+    _meta: conversation,
+  });
+  assert.equal(readRes.isError, undefined);
+  assert.match(responseText(readRes), /hello/);
+
+  // 3. edit / write (bounded file mutation)
+  const writeRes = await context.client.callTool({
+    name: "write",
+    arguments: { workspaceId, path: "feature.js", content: "module.exports = { version: 1 };\n" },
+    _meta: conversation,
+  });
+  assert.equal(writeRes.isError, undefined);
+  assert.equal(structuredContent(writeRes).coreMutation, undefined);
+
+  const editRes = await context.client.callTool({
+    name: "edit",
+    arguments: {
+      workspaceId,
+      path: "feature.js",
+      edits: [{ oldText: "version: 1", newText: "version: 2" }],
+    },
+    _meta: conversation,
+  });
+  assert.equal(editRes.isError, undefined);
+  assert.equal(structuredContent(editRes).coreMutation, undefined);
+  assert.equal(readFileSync(join(worktreeRoot, "feature.js"), "utf8"), "module.exports = { version: 2 };\n");
+
+  // 4. test (bash execution, exitCode 0)
+  const testRes = await context.client.callTool({
+    name: "bash",
+    arguments: {
+      workspaceId,
+      command: `${JSON.stringify(process.execPath)} -e "const f = require('./feature.js'); if (f.version !== 2) process.exit(1); console.log('PASS');"`,
+      attemptKey: "canary-test-run",
+    },
+    _meta: conversation,
+  });
+  assert.equal(testRes.isError, undefined);
+  assert.equal(structuredContent(testRes).coreMutation, undefined);
+  assert.equal(structuredContent(testRes).exitCode, 0);
+
+  // Negative control: wrong expectedHead blocks commit
+  const badCommit = await context.client.callTool({
+    name: "git_commit",
+    arguments: {
+      workspaceId,
+      expectedHead: "0".repeat(40),
+      message: "bad commit",
+      paths: ["feature.js"],
+    },
+    _meta: conversation,
+  });
+  assert.equal(badCommit.isError, true);
+  assert.match(responseText(badCommit), /expected/i);
+
+  // Negative control: out of root file write blocks
+  const badWrite = await context.client.callTool({
+    name: "write",
+    arguments: { workspaceId, path: "../outside.txt", content: "escape\n" },
+    _meta: conversation,
+  });
+  assert.equal(badWrite.isError, true);
+
+  // 5. git_commit (with expectedHead)
+  const commitRes = await context.client.callTool({
+    name: "git_commit",
+    arguments: {
+      workspaceId,
+      expectedHead: head,
+      message: "feat: add feature module",
+      paths: ["feature.js"],
+    },
+    _meta: conversation,
+  });
+  assert.equal(commitRes.isError, undefined, responseText(commitRes));
+  const commitData = structuredContent(commitRes) as Record<string, any>;
+  assert.equal(commitData.created, true);
+  assert.equal(commitData.coreMutation, undefined);
+  const commitSha = commitData.commitSha as string;
+  assert.ok(commitSha);
+
+  // Negative control: wrong expectedHead blocks push
+  const badPush = await context.client.callTool({
+    name: "git_push",
+    arguments: {
+      workspaceId,
+      expectedHead: "0".repeat(40),
+      remote: "origin",
+      branch: "feat/canary-branch",
+    },
+    _meta: conversation,
+  });
+  assert.equal(badPush.isError, true);
+  assert.match(responseText(badPush), /expected/i);
+
+  // Negative control: push to default branch is blocked
+  const defaultBranchPush = await context.client.callTool({
+    name: "git_push",
+    arguments: {
+      workspaceId,
+      expectedHead: commitSha,
+      remote: "origin",
+      branch: "main",
+    },
+    _meta: conversation,
+  });
+  assert.equal(defaultBranchPush.isError, true);
+  assert.match(responseText(defaultBranchPush), /default branch/i);
+
+  // 6. git_push (to non-default branch)
+  const pushRes = await context.client.callTool({
+    name: "git_push",
+    arguments: {
+      workspaceId,
+      expectedHead: commitSha,
+      remote: "origin",
+      branch: "feat/canary-branch",
+    },
+    _meta: conversation,
+  });
+  assert.equal(pushRes.isError, undefined, responseText(pushRes));
+  const pushData = structuredContent(pushRes) as Record<string, any>;
+  assert.equal(pushData.branch, "feat/canary-branch");
+  assert.equal(pushData.pushedSha, commitSha);
+  assert.equal(pushData.coreMutation, undefined);
+
+  // Verify the push reached the remote bare repository
+  const remoteSha = (await execFileAsync("git", ["rev-parse", "refs/heads/feat/canary-branch"], { cwd: bare })).stdout.trim();
+  assert.equal(remoteSha, commitSha);
+
+  // Verify no Core mutation sessions were ever created or used
+  assert.equal(context.coreMutationSessions?.getActive(workspaceId), undefined);
 });
