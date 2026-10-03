@@ -639,8 +639,9 @@ test("R2 semantic attemptId must exactly match durable attemptKey", async () => 
         },
       }),
       (error: any) => error instanceof AgentSessionError &&
-        error.code === "INVALID_ATTEMPT_KEY" &&
-        /must exactly match durable attemptKey/.test(error.message),
+        error.code === "DISPATCH_CONTRACT_REJECTED" &&
+        /attemptKey.*does not match dispatchIntent\.attemptId/.test(error.message) &&
+        /provider_effect=false/.test(error.message),
     );
     assert.equal(manager.listAgents({ workspaceId: "ws_r2_attempt_match" }).length, 0);
   } finally {
