@@ -1626,6 +1626,26 @@ await asyncTest("branch ref parsed for a default branch", async () => {
   assert.deepEqual(ref, { sha: BASE });
 });
 
+await asyncTest("Issue state uses the bounded GitHub API path and returns only open or closed", async () => {
+  const transport = createGhCliGitHubTransportWithExec(
+    fakeGh((args) => {
+      assert.deepEqual(args, ["api", "repos/acme/widget/issues/1209"]);
+      return { stdout: JSON.stringify({ number: 1209, state: "open" }) };
+    }),
+  );
+  assert.equal(await transport.getIssueState("acme/widget", 1209), "open");
+});
+
+await asyncTest("Issue state fails closed on an unrecognized GitHub state", async () => {
+  const transport = createGhCliGitHubTransportWithExec(
+    fakeGh(() => ({ stdout: JSON.stringify({ number: 1209, state: "UNKNOWN" }) })),
+  );
+  await assert.rejects(
+    transport.getIssueState("acme/widget", 1209),
+    /ISSUE_STATE_INVALID:UNKNOWN/,
+  );
+});
+
 // ============================================================
 console.log(`\n=== Results: ${passed} passed, ${failed} failed ===`);
 process.exit(failed > 0 ? 1 : 0);

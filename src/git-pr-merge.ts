@@ -409,6 +409,7 @@ export interface GitHubCompletionTransport extends GitHubPullRequestTransport {
   getBlobShaAtRef(repo: string, refSha: string, path: string): Promise<string>;
   compareChangedFiles(repo: string, oldSha: string, newSha: string): Promise<string[]>;
   getPullRequestReviewState(repo: string, prNumber: number): Promise<PullRequestReviewState>;
+  getIssueState(repo: string, issueNumber: number): Promise<"open" | "closed">;
   isPlatformApprovalRequired(repo: string, branch: string): Promise<boolean>;
 }
 
@@ -770,6 +771,16 @@ export class GhCliGitHubTransport implements GitHubCompletionTransport {
     return files
       .map((file) => file && typeof file === "object" ? (file as { filename?: unknown }).filename : undefined)
       .filter((name): name is string => typeof name === "string" && name.length > 0);
+  }
+
+  async getIssueState(repo: string, issueNumber: number): Promise<"open" | "closed"> {
+    const body = await this.apiJson(["api", `repos/${repo}/issues/${issueNumber}`]);
+    const record = body && !Array.isArray(body) ? body : {};
+    const state = record.state;
+    if (state !== "open" && state !== "closed") {
+      throw new Error(`ISSUE_STATE_INVALID:${String(state ?? "missing")}`);
+    }
+    return state;
   }
 
   async getPullRequestReviewState(repo: string, prNumber: number): Promise<PullRequestReviewState> {

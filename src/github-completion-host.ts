@@ -148,6 +148,7 @@ function transportWithCompletion(
     "getBlobShaAtRef",
     "compareChangedFiles",
     "getPullRequestReviewState",
+    "getIssueState",
     "isPlatformApprovalRequired",
   ] as const;
   for (const name of required) {
@@ -162,7 +163,7 @@ function bridgeScriptPath(): string {
   return fileURLToPath(new URL("../scripts/github_completion_bridge.py", import.meta.url));
 }
 
-class CompletionHostPort {
+export class CompletionHostPort {
   constructor(
     private readonly input: GitHubCompletionToolInput,
     private readonly options: GitHubCompletionToolOptions,
@@ -258,6 +259,37 @@ class CompletionHostPort {
       case "is_platform_approval_required": {
         const required = await this.transport.isPlatformApprovalRequired(REPOSITORY, DEFAULT_BRANCH);
         return { required };
+      }
+      case "read_final_merge_fields": {
+        if (params.repository !== REPOSITORY) throw new Error("COMPLETION_REPOSITORY_MISMATCH");
+        const requestedPr = positiveInt(params.pull_request_number, "pull_request_number", Number.MAX_SAFE_INTEGER);
+        if (requestedPr !== this.prNumber) throw new Error("COMPLETION_PR_NUMBER_MISMATCH");
+        const pr = await this.transport.getPullRequest(REPOSITORY, this.prNumber);
+        if (pr.number !== this.prNumber) throw new Error("COMPLETION_PR_IDENTITY_MISMATCH");
+        return {
+          schema: "nexus.final_merge_fields.v1",
+          merge_method: this.input.mergeMethod,
+          pr_body: typeof pr.body === "string" ? pr.body : null,
+          commit_title: null,
+          commit_message: null,
+          pr_number: pr.number,
+          head_sha: normalizeSha(pr.headRefOid, "final_pr_head_sha"),
+          base_sha: normalizeSha(pr.baseRefOid, "final_pr_base_sha"),
+        };
+      }
+      case "read_issue_states": {
+        if (params.repository !== REPOSITORY) throw new Error("COMPLETION_REPOSITORY_MISMATCH");
+        if (!Array.isArray(params.issue_numbers)) throw new Error("ISSUE_NUMBERS_INVALID");
+        const issueNumbers = [...new Set(params.issue_numbers.map((value) =>
+          positiveInt(value, "issue_number", Number.MAX_SAFE_INTEGER)
+        ))];
+        const states: Record<string, "open" | "closed"> = {};
+        for (const issueNumber of issueNumbers) {
+          const state = await this.transport.getIssueState(REPOSITORY, issueNumber);
+          if (state !== "open" && state !== "closed") throw new Error(`ISSUE_STATE_INVALID:${issueNumber}`);
+          states[String(issueNumber)] = state;
+        }
+        return { states };
       }
       case "cas_merge":
         return await this.casMerge(params);
