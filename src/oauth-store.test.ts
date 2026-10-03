@@ -63,6 +63,9 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 20, name: "local-agent-provider-continuity" },
       { version: 21, name: "core-mutation-caller-rebinds" },
       { version: 22, name: "core-mutation-session-rebinds" },
+      { version: 23, name: "core-candidate-acquisition-observations" },
+      { version: 24, name: "core-candidate-acquisition-receipt-path" },
+      { version: 25, name: "work-resume-registry" },
     ]);
   } finally {
     database.close();
