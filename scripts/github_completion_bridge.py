@@ -44,6 +44,7 @@ def main() -> int:
         CasMergeResult,
         CasMergeStatus,
         DimensionRevalidationReceipt,
+        FinalMergeFields,
         IntegrationMaterializationResult,
         PostMergeReconciliationResult,
         make_dimension_revalidation_receipt,
@@ -162,6 +163,36 @@ def main() -> int:
                 {"repository": repository, "pull_request_number": pull_request_number},
             )
             return bool(result["required"])
+
+        def read_final_merge_fields(self, *, repository, pull_request_number):
+            result = self._call(
+                "read_final_merge_fields",
+                {"repository": repository, "pull_request_number": pull_request_number},
+            )
+            return FinalMergeFields.model_validate(result)
+
+        def read_issue_states(self, *, repository, issue_numbers):
+            result = self._call(
+                "read_issue_states",
+                {"repository": repository, "issue_numbers": list(issue_numbers)},
+            )
+            states = result.get("states") if isinstance(result, dict) else None
+            if not isinstance(states, dict):
+                raise RuntimeError("HOST_ISSUE_STATES_INVALID")
+            expected = {int(number) for number in issue_numbers}
+            parsed: dict[int, str] = {}
+            for raw_number, raw_state in states.items():
+                try:
+                    number = int(raw_number)
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError("HOST_ISSUE_NUMBER_INVALID") from exc
+                state = str(raw_state)
+                if number not in expected or state not in {"open", "closed"}:
+                    raise RuntimeError("HOST_ISSUE_STATE_INVALID")
+                parsed[number] = state
+            if set(parsed) != expected:
+                raise RuntimeError("HOST_ISSUE_STATES_INCOMPLETE")
+            return parsed
 
         def cas_merge(self, *, repository, pull_request_number, expected_base_sha, expected_head_sha):
             result = self._call(
