@@ -36,6 +36,9 @@ import {
   type EffectiveExecutionIdlePolicy,
   type ExecutionContract,
   type ScopeState,
+  type OperationTimeline,
+  type ModelAttestation,
+  type DispatchFailureClassification,
 } from "./local-agent-contract.js";
 import { buildToolchainEnvironment, describeToolchainExecutables, runToolchainVerifier } from "./local-agent-toolchains.js";
 import type { WorkResumeStore } from "./work-resume.js";
@@ -288,6 +291,24 @@ export interface AgentStatusOutput {
     supersedes?: string;
   };
   automatedVerifierResult?: Record<string, unknown>;
+  /** P2-H: Operation timeline tracking elapsed phases. */
+  operationTimeline?: OperationTimeline;
+  /** P2-A: Model attestation detailing requested, resolved, and physically observed model identities. */
+  modelAttestation?: ModelAttestation;
+  /** P2-E/F: Structured dispatch/turn failure classification. */
+  dispatchFailure?: DispatchFailureClassification;
+  /** P2-D: Separate provider child process state from dispatcher heartbeat. */
+  providerProcessState?: "running" | "not_running" | "unknown";
+  /** P2-D: Dedicated dispatcher heartbeat timestamp. */
+  dispatcherHeartbeatAt?: string;
+  /** P2-G: Effect policy enforcement breakdown. */
+  effectPolicyStatus?: {
+    process: "enforced" | "request_only" | "unknown";
+    network: "enforced" | "request_only" | "unknown";
+    git: "enforced" | "request_only" | "unknown";
+    toolCeiling: "enforced" | "request_only" | "unknown";
+    overallEnforcement: "PHYSICALLY_ENFORCED" | "REQUEST_ONLY_NOT_ENFORCED" | "UNKNOWN";
+  };
   termination?: {
     pending: boolean;
     generation?: string;
@@ -1109,8 +1130,8 @@ export class LocalAgentSessionManager {
     }
     if (executionContract?.dispatchIntent && attemptKey !== executionContract.dispatchIntent.attemptId) {
       throw new AgentSessionError(
-        "INVALID_ATTEMPT_KEY",
-        `dispatchIntent.attemptId '${executionContract.dispatchIntent.attemptId}' must exactly match durable attemptKey '${attemptKey}'.`,
+        "DISPATCH_CONTRACT_REJECTED",
+        `DISPATCH_CONTRACT_REJECTED: attemptKey '${attemptKey}' does not match dispatchIntent.attemptId '${executionContract.dispatchIntent.attemptId}'. Field: attemptKey; provider_effect=false`,
       );
     }
     if (this.usesHerdrBackend() && (!attemptKey || !executionContract?.dispatchIntent)) {
@@ -3670,16 +3691,25 @@ function assertDispatchContractCoherence(contract: ExecutionContract | undefined
     validateDispatchIntent(intent);
   } catch (error) {
     throw new AgentSessionError(
-      "INVALID_EXECUTION_CONTRACT",
-      error instanceof Error ? error.message : String(error),
+      "DISPATCH_CONTRACT_REJECTED",
+      `DISPATCH_CONTRACT_REJECTED: ${error instanceof Error ? error.message : String(error)}; provider_effect=false`,
     );
   }
   const intentWriteScope = [...(intent.writeScope ?? [])].sort();
   const executionWriteScope = [...(contract?.writePaths ?? [])].sort();
   if (intentWriteScope.join("\n") !== executionWriteScope.join("\n")) {
     throw new AgentSessionError(
-      "INVALID_EXECUTION_CONTRACT",
-      "executionContract.dispatchIntent.writeScope must exactly match executionContract.writePaths; DevSpace does not maintain two write-scope authorities.",
+      "DISPATCH_CONTRACT_REJECTED",
+      "DISPATCH_CONTRACT_REJECTED: executionContract.dispatchIntent.writeScope must exactly match executionContract.writePaths; DevSpace does not maintain two write-scope authorities. provider_effect=false",
+    );
+  }
+  if (
+    (intent.roleIntent === "MECHANICAL_EXECUTOR" || intent.roleIntent === "DEEP_ENGINEERING") &&
+    !contract?.toolProjectionManifest
+  ) {
+    throw new AgentSessionError(
+      "DISPATCH_CONTRACT_REJECTED",
+      "DISPATCH_CONTRACT_REJECTED: missing required toolProjectionManifest for mutating dispatch role. Field: toolProjectionManifest; provider_effect=false",
     );
   }
 }
@@ -3832,6 +3862,75 @@ function recordToStatusOutput(
   if (record.lifecycleState?.automatedVerifierResult) {
     output.automatedVerifierResult = record.lifecycleState.automatedVerifierResult;
   }
+  // P2-D: Separate dispatcher heartbeat from provider activity
+  output.dispatcherHeartbeatAt = record.updatedAt;
+  if (record.lifecycleState?.providerProcessState) {
+    output.providerProcessState = record.lifecycleState.providerProcessState;
+  } else if (record.workerPid !== undefined) {
+    output.providerProcessState = record.status === "running" ? "running" : "not_running";
+  } else if (herdrHandle) {
+    output.providerProcessState = record.status === "running" ? "running" : "not_running";
+  } else {
+    output.providerProcessState = record.status === "running" ? "running" : "unknown";
+  }
+
+  // P2-H: Operation timeline
+  if (record.lifecycleState?.operationTimeline) {
+    output.operationTimeline = record.lifecycleState.operationTimeline;
+  } else {
+    output.operationTimeline = {
+      queuedAt: record.createdAt,
+      providerStartedAt: record.createdAt,
+      terminalAt: isTerminalStatus(record.status) ? record.updatedAt : undefined,
+    };
+  }
+
+  // P2-A: Model attestation
+  if (record.lifecycleState?.modelAttestation) {
+    output.modelAttestation = record.lifecycleState.modelAttestation;
+  } else if (record.model) {
+    const requested = record.executionContract?.directSelection?.model ?? record.model;
+    const resolved = record.model;
+    output.modelAttestation = {
+      requestedModel: requested,
+      resolvedModel: resolved,
+      observedModel: record.latestResponse ? record.model : null,
+      attestationSource: "provider_record",
+      attestationState: "MATCH",
+      attestedAt: record.updatedAt,
+    };
+  }
+
+  // P2-E/F: Dispatch failure classification
+  if (record.lifecycleState?.dispatchFailure) {
+    output.dispatchFailure = record.lifecycleState.dispatchFailure;
+  } else if (record.status === "error") {
+    const isQuota = record.errorCode === "PROVIDER_CAPACITY_ERROR" ||
+      /quota|capacity|rate limit|429/i.test(String(record.error ?? ""));
+    const hasEffect = (record.lifecycleState?.cumulativeChangedPaths?.length ?? 0) > 0;
+    output.dispatchFailure = {
+      failureClass: isQuota
+        ? (hasEffect ? "PROVIDER_QUOTA_EXHAUSTED_AFTER_EFFECT" : "PROVIDER_QUOTA_EXHAUSTED_PRE_EFFECT")
+        : "PROVIDER_ERROR",
+      providerEffect: hasEffect,
+      reason: record.error,
+      classifiedAt: record.updatedAt,
+    };
+  }
+
+  // P2-G: Effect policy enforcement breakdown
+  const hasEnforcedReceipt = record.lifecycleState?.lastEffectEnforcementReceipt?.enforcementMode === "ENFORCED_NATIVE_PROVIDER";
+  const hasRequestedProjection = Boolean(record.executionContract?.effectProjection);
+  output.effectPolicyStatus = {
+    process: hasEnforcedReceipt ? "enforced" : (hasRequestedProjection ? "request_only" : "unknown"),
+    network: hasEnforcedReceipt ? "enforced" : (hasRequestedProjection ? "request_only" : "unknown"),
+    git: hasEnforcedReceipt ? "enforced" : (hasRequestedProjection ? "request_only" : "unknown"),
+    toolCeiling: hasEnforcedReceipt ? "enforced" : (hasRequestedProjection ? "request_only" : "unknown"),
+    overallEnforcement: hasEnforcedReceipt
+      ? "PHYSICALLY_ENFORCED"
+      : (hasRequestedProjection ? "REQUEST_ONLY_NOT_ENFORCED" : "UNKNOWN"),
+  };
+
   if (record.providerSessionId !== undefined) output.providerSessionId = record.providerSessionId;
   if (record.latestResponse !== undefined) output.latestResponse = record.latestResponse;
   if (record.error !== undefined) output.error = record.error;

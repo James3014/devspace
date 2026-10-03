@@ -188,6 +188,58 @@ export interface ActiveTurnState {
   /** Durable effective execution-idle policy for this exact turn. */
   executionIdlePolicy?: EffectiveExecutionIdlePolicy;
   launchState?: AgentTurnLaunchState;
+  /** P2-H: Last timestamp the provider stream emitted output/tool event. */
+  providerStreamLastActivityAt?: string;
+  /** P2-H: First timestamp a durable file/git/process side-effect was observed. */
+  firstEffectAt?: string | null;
+}
+
+/**
+ * P2-H: Durable operation timeline for one agent turn.
+ */
+export interface OperationTimeline {
+  queuedAt: string;
+  providerStartedAt?: string;
+  firstStreamActivityAt?: string;
+  firstEffectAt?: string;
+  terminalAt?: string;
+  reconciledAt?: string;
+}
+
+/**
+ * P2-A: Model identity attestation for one agent turn.
+ */
+export type ModelAttestationState =
+  | "MATCH"
+  | "MODEL_ATTESTATION_MISMATCH"
+  | "ATTESTATION_UNAVAILABLE"
+  | "ATTESTATION_PENDING";
+
+export interface ModelAttestation {
+  requestedModel?: string;
+  resolvedModel?: string;
+  observedModel?: string | null;
+  attestationSource?: string;
+  attestedAt?: string;
+  attestationState: ModelAttestationState;
+}
+
+/**
+ * P2-E/F: Classifies why a turn terminated or was rejected.
+ */
+export type DispatchFailureClass =
+  | "DISPATCH_CONTRACT_REJECTED"
+  | "PROVIDER_QUOTA_EXHAUSTED_PRE_EFFECT"
+  | "PROVIDER_QUOTA_EXHAUSTED_AFTER_EFFECT"
+  | "PROVIDER_ERROR"
+  | "COMPLETED"
+  | "UNKNOWN";
+
+export interface DispatchFailureClassification {
+  failureClass: DispatchFailureClass;
+  providerEffect: boolean;
+  reason?: string;
+  classifiedAt: string;
 }
 
 export interface TerminationPendingState {
