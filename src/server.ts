@@ -450,6 +450,8 @@ const DIRECT_CODING_TOOL_NAMES = new Set<string>([
   "command_status",
   "workspace_verify",
   "host_capability_snapshot",
+  "git_commit",
+  "git_push",
 ]);
 
 const workspaceIdDescription =
@@ -484,7 +486,7 @@ function serverInstructions(config: ServerConfig): string {
     ? " Use agent_start to launch an advertised agent profile as a background subagent. Use agent_status to retrieve result or progress. Use agent_continue for evidence-guided repair in the same session. Use agent_cancel to stop the exact owned worker. Use agent_list to inspect current workspace agent sessions. Do NOT use bash to call `devspace agents` when native agent tools are available."
     : "";
 
-  const gitCandidatesInstruction = !directCodingMode && config.gitCandidatesEnabled
+  const gitCandidatesInstruction = config.gitCandidatesEnabled
     ? " Use git_commit to form a scoped Candidate from exact paths. Use git_push to publish Candidate HEAD to a non-default branch. Do not use bash for git mutation."
     : "";
 
@@ -1160,17 +1162,20 @@ function registerCodexProcessTools(
       workspaces.getWorkspace(workspaceId);
       let coreAdmission: CoreMutationAdmission | undefined;
       if (chars && chars.length > 0 && coreMutation) {
+        const active = coreMutation.active(workspaceId);
         const original = processSessions.getCoreMutationBinding(workspaceId, sessionId);
-        if (!original) {
+        if (active && !original) {
           throw new Error("[CORE_BOUND_SESSION_REQUIRED] Historical unbound process input cannot receive retroactive Core provenance.");
         }
-        coreAdmission = await coreMutation.admit({
-          workspaceId,
-          extra,
-          pointer: { required: true, ...original },
-          pathContainment: "NOT_PROVEN",
-          writerDomain: "PROCESS",
-        });
+        if (original) {
+          coreAdmission = await coreMutation.admit({
+            workspaceId,
+            extra,
+            pointer: { required: true, ...original },
+            pathContainment: "NOT_PROVEN",
+            writerDomain: "PROCESS",
+          });
+        }
       }
       const snapshot = await processSessions.write({
         workspaceId,
@@ -1443,17 +1448,20 @@ function registerCodexGoalTools(
       workspaces.getWorkspace(workspaceId);
       let coreAdmission: CoreMutationAdmission | undefined;
       if (coreMutation) {
+        const active = coreMutation.active(workspaceId);
         const original = goals.getCoreMutationBinding(workspaceId, goalId);
-        if (!original) {
+        if (active && !original) {
           throw new Error("[CORE_BOUND_SESSION_REQUIRED] Historical unbound Codex goal cannot receive retroactive Core provenance.");
         }
-        coreAdmission = await coreMutation.admit({
-          workspaceId,
-          extra,
-          pointer: { required: true, ...original },
-          pathContainment: "NOT_PROVEN",
-          writerDomain: "PROCESS",
-        });
+        if (original) {
+          coreAdmission = await coreMutation.admit({
+            workspaceId,
+            extra,
+            pointer: { required: true, ...original },
+            pathContainment: "NOT_PROVEN",
+            writerDomain: "PROCESS",
+          });
+        }
       }
       const state = await goals.continue(workspaceId, goalId, message);
       await assertCoreGoalCompletion(coreMutation, workspaceId, extra, state);
@@ -3365,9 +3373,7 @@ export function createMcpServer(
       };
     },
   );
-  const coreMutationGuard = config.toolMode === "minimal"
-    ? undefined
-    : createCoreMutationGuard(workspaces, coreMutationSessions, coreMutationTestOnlyBypass);
+  const coreMutationGuard = createCoreMutationGuard(workspaces, coreMutationSessions, coreMutationTestOnlyBypass);
   const inspectCoreWriterDomain = (
     session: CoreMutationSessionRecord,
     domain: "PROCESS" | "AGENT",
@@ -6862,7 +6868,7 @@ export function createMcpServer(
         let committed: Awaited<ReturnType<typeof commitCandidate>> | undefined;
         let coreAdmission: CoreMutationAdmission | undefined;
         try {
-          const activeCore = coreMutationGuard?.require({ workspaceId, extra });
+          const activeCore = coreMutationGuard?.active(workspaceId);
           if (activeCore && coreMutationGuard) {
             const before = await coreMutationGuard.snapshot({
               workspaceId,
@@ -7090,13 +7096,14 @@ export function createMcpServer(
         }
         let pushed: Awaited<ReturnType<typeof pushCandidate>> | undefined;
         let coreAdmission: CoreMutationAdmission | undefined;
+        let coreCandidate: ReturnType<CoreMutationGuard["candidate"]> | undefined;
+        let publicationContinuity: "PRODUCER_SESSION" | "TERMINAL_CANDIDATE_HANDOFF" | undefined;
         try {
-          const activeCore = coreMutationGuard?.require({ workspaceId, extra });
-          const coreCandidate = coreMutationGuard?.candidate(expectedHead.toLowerCase());
-          if (coreMutationGuard && !coreCandidate) throw new Error("[CORE_CANDIDATE_PROVENANCE_REQUIRED] Core-bound workspace cannot publish an unbound Candidate HEAD.");
+          const activeCore = coreMutationGuard?.active(workspaceId);
+          if (activeCore && coreMutationGuard) {
+            coreCandidate = coreMutationGuard.candidate(expectedHead.toLowerCase());
+            if (!coreCandidate) throw new Error("[CORE_CANDIDATE_PROVENANCE_REQUIRED] Core-bound workspace cannot publish an unbound Candidate HEAD.");
 
-          let publicationContinuity: "PRODUCER_SESSION" | "TERMINAL_CANDIDATE_HANDOFF" | undefined;
-          if (activeCore && coreCandidate) {
             const sameProducerSession =
               coreCandidate.bindingHash === activeCore.bindingHash &&
               coreCandidate.sessionId === activeCore.id;
@@ -7116,11 +7123,15 @@ export function createMcpServer(
               }
               publicationContinuity = "TERMINAL_CANDIDATE_HANDOFF";
             }
-          }
 
-          coreAdmission = activeCore && coreMutationGuard
-            ? await coreMutationGuard.admit({ workspaceId, extra, pointer: { required: true, sessionId: activeCore.id, bindingHash: activeCore.bindingHash }, pathContainment: "NOT_PROVEN", synchronousPostEffectCheck: true })
-            : undefined;
+            coreAdmission = await coreMutationGuard.admit({
+              workspaceId,
+              extra,
+              pointer: { required: true, sessionId: activeCore.id, bindingHash: activeCore.bindingHash },
+              pathContainment: "NOT_PROVEN",
+              synchronousPostEffectCheck: true,
+            });
+          }
           const result = await pushCandidate({
             workspaceRoot: workspace.root,
             expectedHead,

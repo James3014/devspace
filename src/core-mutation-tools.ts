@@ -47,7 +47,7 @@ export interface CoreMutationGuard {
     pathContainment: "STRUCTURED_SINK_ENFORCED" | "NOT_PROVEN";
     writerDomain?: CoreMutationManagedWriterDomain;
     synchronousPostEffectCheck?: true;
-  }): Promise<CoreMutationAdmission>;
+  }): Promise<CoreMutationAdmission | undefined>;
   active(workspaceId: string): { id: string; bindingHash: string } | undefined;
   candidate(candidateHead: string): CoreMutationCandidateProvenance | undefined;
   snapshot(input: {
@@ -360,6 +360,16 @@ export function createCoreMutationGuard(
     },
     admit: async (input) => {
       const workspace = workspaces.getWorkspace(input.workspaceId);
+      const active = store.getActive(input.workspaceId);
+      if (!active) {
+        if (input.pointer?.required) {
+          throw new CoreMutationSessionError(
+            "CORE_BOUND_SESSION_REQUIRED",
+            "Repository mutation requires one active Core-bound mutation session for this workspace.",
+          );
+        }
+        return undefined;
+      }
       try {
         return await store.admitEffect({
           workspaceSessionId: input.workspaceId,
