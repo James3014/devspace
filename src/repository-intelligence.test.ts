@@ -200,6 +200,7 @@ test("native tools are opt-in and exactly read-only when enabled", async () => {
       DEVSPACE_STATE_DIR: join(root, ".state"),
       DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
       DEVSPACE_SUBAGENTS: "0",
+      DEVSPACE_TOOL_MODE: "full",
     } as NodeJS.ProcessEnv;
 
     const disabled = loadConfig(baseEnv);

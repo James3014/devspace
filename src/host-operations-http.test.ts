@@ -1,6 +1,5 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
@@ -23,13 +22,20 @@ function structured(result: ToolResult): Record<string, any> {
   return JSON.parse(text);
 }
 
-function requestFor(root: string, executable: string, script: string, marker: string, workspaceRoot?: string, readPaths = [script]) {
+function requestFor(
+  root: string,
+  executable: string,
+  argv: string[],
+  writePaths: string[],
+  workspaceRoot?: string,
+  readPaths: string[] = [],
+) {
   return {
     attemptKey: "host-http-attempt",
     executablePath: executable,
-    argv: [script, marker],
+    argv,
     cwd: root,
-    allowedPaths: { write: [root], read: readPaths },
+    allowedPaths: { write: writePaths, read: readPaths },
     maxWallMs: 8_000,
     maxIdleMs: 8_000,
     allowLongLivedProcess: true,
@@ -37,8 +43,25 @@ function requestFor(root: string, executable: string, script: string, marker: st
   };
 }
 
-function fixtureRuntimeReadPaths(script: string): string[] {
-  return [script, "/opt/homebrew/etc/openssl@3/openssl.cnf", "/opt/homebrew/opt/libuv/lib/libuv.1.dylib"].filter((path) => path === script || existsSync(path));
+function buildFixtureExecutable(root: string, name: string): string {
+  const source = join(root, `${name}.c`);
+  const executable = join(root, name);
+  writeFileSync(source, [
+    "#include <fcntl.h>",
+    "#include <stdlib.h>",
+    "#include <unistd.h>",
+    "int main(int argc, char **argv) {",
+    "  if (argc < 2) return 2;",
+    "  int fd = open(argv[1], O_WRONLY | O_CREAT | O_APPEND, 0600);",
+    "  if (fd < 0) return 3;",
+    "  if (write(fd, \"x\\n\", 2) != 2) { close(fd); return 4; }",
+    "  close(fd);",
+    "  if (argc >= 3) sleep((unsigned int)strtoul(argv[2], 0, 10));",
+    "  return 0;",
+    "}",
+  ].join("\n"));
+  execFileSync("cc", [source, "-O2", "-o", executable], { stdio: "ignore" });
+  return executable;
 }
 
 async function assertDead(pid: number): Promise<void> {
@@ -97,8 +120,6 @@ test("HTTP host operation tools enforce owner binding and exact long-lived lifec
   const root = await mkdtemp(join(tmpdir(), "devspace-host-http-"));
   const configRoot = join(root, "config");
   const stateRoot = join(root, "state");
-  const script = join(root, "fixture.mjs");
-  const runtimeReadPaths = fixtureRuntimeReadPaths(script);
   const effectsRoot = join(root, "effects");
   const workspaceRoot = join(root, "workspace");
   const marker = join(effectsRoot, "marker.txt");
@@ -107,15 +128,16 @@ test("HTTP host operation tools enforce owner binding and exact long-lived lifec
   execFileSync("git", ["init", "-q", workspaceRoot]);
   execFileSync("git", ["-C", workspaceRoot, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.test", "commit", "--allow-empty", "-m", "fixture"], { stdio: "ignore" });
   const baseHead = execFileSync("git", ["-C", workspaceRoot, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
-  const executable = process.execPath;
+  const executable = buildFixtureExecutable(root, "host-fixture");
   const executableSha256 = createHash("sha256").update(await readFile(executable)).digest("hex");
-  writeFileSync(script, `import { appendFileSync } from "node:fs";\nappendFileSync(process.argv[2], "x\\n");\nsetInterval(() => {}, 1000);\nsetTimeout(() => process.exit(0), 8000);\n`);
+  const fixtureArgv = [marker, "8"];
   const config = loadConfig({
     DEVSPACE_CONFIG_DIR: configRoot,
     DEVSPACE_STATE_DIR: stateRoot,
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_WORKTREE_ROOT: join(root, "worktrees"),
     DEVSPACE_SUBAGENTS: "false",
+    DEVSPACE_TOOL_MODE: "full",
     DEVSPACE_PUBLIC_BASE_URL: "http://127.0.0.1:1",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
   });
@@ -126,10 +148,10 @@ test("HTTP host operation tools enforce owner binding and exact long-lived lifec
     hostOperationExecutable: executable,
     hostOperationExecutableSha256: executableSha256,
     hostOperationAllowedPaths: [effectsRoot],
-    hostOperationReadPaths: runtimeReadPaths,
+    hostOperationReadPaths: [],
     hostOperationOwnerClientId: owner.clientId,
     hostOperationCwd: root,
-    hostOperationArgv: [script, marker],
+    hostOperationArgv: fixtureArgv,
     hostOperationMaxWallMs: 8_000,
     hostOperationMaxIdleMs: 8_000,
     hostOperationAllowLongLived: true,
@@ -147,9 +169,8 @@ test("HTTP host operation tools enforce owner binding and exact long-lived lifec
   }));
   const workspaceId = String(openedWorkspace.workspaceId);
   const request = {
-    ...requestFor(root, executable, script, marker, workspaceRoot, runtimeReadPaths),
+    ...requestFor(root, executable, fixtureArgv, [effectsRoot], workspaceRoot),
     workspaceId,
-    allowedPaths: { write: [effectsRoot], read: runtimeReadPaths },
     clientId: foreign.clientId,
     authorityMode: "NEXUS_GOVERNED",
   } as any;
@@ -219,7 +240,7 @@ test("HTTP host operation tools enforce owner binding and exact long-lived lifec
     ];
     for (const result of await Promise.all(foreignCalls)) assert.equal(result.isError, true, "foreign authenticated client must be denied");
 
-    const differentArgv = { ...request, attemptKey: "different-argv", argv: [script, join(root, "other-marker.txt")] };
+    const differentArgv = { ...request, attemptKey: "different-argv", argv: [join(root, "other-marker.txt"), "8"] };
     assert.equal((await ownerClient.callTool({ name: "host_operation_preflight", arguments: differentArgv })).isError, true);
 
     const missingWorkspaceId = { ...request, attemptKey: "missing-workspace-id" };
@@ -258,6 +279,7 @@ test("HTTP host operation preflight binds exact workspace identity before effect
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_WORKTREE_ROOT: join(root, "worktrees"),
     DEVSPACE_SUBAGENTS: "false",
+    DEVSPACE_TOOL_MODE: "full",
     DEVSPACE_PUBLIC_BASE_URL: "http://127.0.0.1:1",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
   });
@@ -337,6 +359,7 @@ test("HTTP server omits host operation tools when startup capability is disabled
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_WORKTREE_ROOT: join(root, "worktrees"),
     DEVSPACE_SUBAGENTS: "false",
+    DEVSPACE_TOOL_MODE: "full",
     DEVSPACE_PUBLIC_BASE_URL: "http://127.0.0.1:1",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
   });
@@ -360,18 +383,18 @@ test("HTTP server omits host operation tools when startup capability is disabled
 
 test("HTTP completed host operation replay returns the recorded effect without rerunning it", { skip: process.platform !== "darwin" }, async () => {
   const root = await mkdtemp(join(tmpdir(), "devspace-host-http-replay-"));
-  const script = join(root, "short-fixture.mjs");
-  const runtimeReadPaths = fixtureRuntimeReadPaths(script);
   const marker = join(root, "marker.txt");
-  const executable = process.execPath;
+  writeFileSync(marker, "");
+  const executable = buildFixtureExecutable(root, "host-short-fixture");
   const executableSha256 = createHash("sha256").update(await readFile(executable)).digest("hex");
-  writeFileSync(script, `import { appendFileSync } from "node:fs";\nappendFileSync(process.argv[2], "x\\n");\n`);
+  const fixtureArgv = [marker];
   const config = loadConfig({
     DEVSPACE_CONFIG_DIR: join(root, "config"),
     DEVSPACE_STATE_DIR: join(root, "state"),
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_WORKTREE_ROOT: join(root, "worktrees"),
     DEVSPACE_SUBAGENTS: "false",
+    DEVSPACE_TOOL_MODE: "full",
     DEVSPACE_PUBLIC_BASE_URL: "http://127.0.0.1:1",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
   });
@@ -381,11 +404,11 @@ test("HTTP completed host operation replay returns the recorded effect without r
     hostOperationsEnabled: true,
     hostOperationExecutable: executable,
     hostOperationExecutableSha256: executableSha256,
-    hostOperationAllowedPaths: [root],
-    hostOperationReadPaths: runtimeReadPaths,
+    hostOperationAllowedPaths: [marker],
+    hostOperationReadPaths: [],
     hostOperationOwnerClientId: owner.clientId,
     hostOperationCwd: root,
-    hostOperationArgv: [script, marker],
+    hostOperationArgv: fixtureArgv,
     hostOperationMaxWallMs: 8_000,
     hostOperationMaxIdleMs: 8_000,
     hostOperationAllowLongLived: false,
@@ -394,7 +417,7 @@ test("HTTP completed host operation replay returns the recorded effect without r
   const listener = running.app.listen(0, "127.0.0.1");
   await new Promise<void>((resolve) => listener.once("listening", resolve));
   const client = await connect(new URL(`http://127.0.0.1:${(listener.address() as { port: number }).port}/mcp`), owner.accessToken, "host-replay-http");
-  const request = requestFor(root, executable, script, marker, undefined, runtimeReadPaths);
+  const request = requestFor(root, executable, fixtureArgv, [marker]);
   const shortRequest = { ...request, allowLongLivedProcess: false };
   try {
     const first = structured(await client.callTool({ name: "host_operation_start", arguments: shortRequest }));

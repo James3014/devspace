@@ -188,6 +188,70 @@ export interface ActiveTurnState {
   /** Durable effective execution-idle policy for this exact turn. */
   executionIdlePolicy?: EffectiveExecutionIdlePolicy;
   launchState?: AgentTurnLaunchState;
+  /** P2-H: Last timestamp the provider stream emitted output/tool event. */
+  providerStreamLastActivityAt?: string;
+  /** P2-H: First timestamp a durable file/git/process side-effect was observed. */
+  firstEffectAt?: string | null;
+}
+
+/**
+ * P2-H: Durable operation timeline for one agent turn.
+ */
+export interface OperationTimeline {
+  queuedAt: string;
+  providerStartedAt?: string;
+  firstStreamActivityAt?: string;
+  firstEffectAt?: string;
+  terminalAt?: string;
+  reconciledAt?: string;
+}
+
+/**
+ * P2-A: Model identity attestation for one agent turn.
+ */
+export type ModelAttestationState =
+  | "MATCH"
+  | "MODEL_ATTESTATION_MISMATCH"
+  | "ATTESTATION_UNAVAILABLE"
+  | "ATTESTATION_PENDING";
+
+export interface ModelAttestation {
+  requestedModel?: string;
+  resolvedModel?: string;
+  observedModel?: string | null;
+  attestationSource?: string;
+  attestedAt?: string;
+  attestationState: ModelAttestationState;
+}
+
+/**
+ * P2-E/F: Classifies why a turn terminated or was rejected.
+ */
+export type DispatchFailureClass =
+  | "COORDINATOR_INTERRUPTED"
+  | "CLIENT_STATUS_PROJECTION_STALE"
+  | "PROVIDER_RUNNING"
+  | "PROVIDER_QUOTA_EXHAUSTED_PRE_EFFECT"
+  | "PROVIDER_QUOTA_EXHAUSTED_AFTER_EFFECT"
+  | "PROVIDER_AUTH_ERROR"
+  | "PROVIDER_STARTUP_FAILED"
+  | "PROVIDER_EXECUTION_FAILED"
+  | "SCOPE_OR_PERMISSION_ERROR"
+  | "TRANSPORT_LOST_ACK"
+  | "EFFECT_OUTCOME_UNKNOWN"
+  | "WORKTREE_LEASE_CONFLICT"
+  | "DUPLICATE_EFFECT_SUPPRESSED"
+  | "VERIFIER_FAILED"
+  | "DISPATCH_CONTRACT_REJECTED"
+  | "INTERNAL_CONTROL_PLANE_ERROR"
+  | "COMPLETED"
+  | "UNKNOWN";
+
+export interface DispatchFailureClassification {
+  failureClass: DispatchFailureClass;
+  providerEffect: boolean;
+  reason?: string;
+  classifiedAt: string;
 }
 
 export interface TerminationPendingState {

@@ -20,6 +20,9 @@ import {
   type ScopeBaseline,
   type ScopeState,
   type TerminationPendingState,
+  type OperationTimeline,
+  type ModelAttestation,
+  type DispatchFailureClassification,
   deserializeExecutionContract,
   serializeExecutionContract,
 } from "./local-agent-contract.js";
@@ -69,6 +72,14 @@ export interface AgentLifecycleState {
   };
   /** Automated mechanical verifier execution result on worker terminal. */
   automatedVerifierResult?: Record<string, unknown>;
+  /** P2-H: Operation timeline tracking elapsed phases. */
+  operationTimeline?: OperationTimeline;
+  /** P2-A: Model attestation state. */
+  modelAttestation?: ModelAttestation;
+  /** P2-E/F: Dispatch failure classification. */
+  dispatchFailure?: DispatchFailureClassification;
+  /** P2-D: Separate provider child process state. */
+  providerProcessState?: "running" | "not_running" | "unknown";
 }
 
 export interface PhysicalTerminationState {
@@ -2664,6 +2675,18 @@ function readLifecycleState(value: string | null | undefined): AgentLifecycleSta
     if (parsed.automatedVerifierResult && typeof parsed.automatedVerifierResult === "object") {
       state.automatedVerifierResult = parsed.automatedVerifierResult as Record<string, unknown>;
     }
+    if (parsed.operationTimeline && typeof parsed.operationTimeline === "object") {
+      state.operationTimeline = parsed.operationTimeline as OperationTimeline;
+    }
+    if (parsed.modelAttestation && typeof parsed.modelAttestation === "object") {
+      state.modelAttestation = parsed.modelAttestation as ModelAttestation;
+    }
+    if (parsed.dispatchFailure && typeof parsed.dispatchFailure === "object") {
+      state.dispatchFailure = parsed.dispatchFailure as DispatchFailureClassification;
+    }
+    if (typeof parsed.providerProcessState === "string") {
+      state.providerProcessState = parsed.providerProcessState as "running" | "not_running" | "unknown";
+    }
     if (!detached) {
       const legacyActiveTurn = readLegacyActiveTurnState(parsed.activeTurn);
       if (legacyActiveTurn) state.activeTurn = legacyActiveTurn;
@@ -2751,6 +2774,12 @@ function readActiveTurnState(value: unknown): ActiveTurnState | undefined {
     lastActivityAt: typeof record.lastActivityAt === "string" && Number.isFinite(Date.parse(record.lastActivityAt))
       ? record.lastActivityAt
       : undefined,
+    providerStreamLastActivityAt: typeof record.providerStreamLastActivityAt === "string" && Number.isFinite(Date.parse(record.providerStreamLastActivityAt))
+      ? record.providerStreamLastActivityAt
+      : undefined,
+    firstEffectAt: typeof record.firstEffectAt === "string" && Number.isFinite(Date.parse(record.firstEffectAt))
+      ? record.firstEffectAt
+      : (record.firstEffectAt === null ? null : undefined),
     executionIdlePolicy,
     launchState,
   };

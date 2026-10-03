@@ -283,7 +283,7 @@ test("Codex goal sessions retain the exact Core binding for continuation", async
   );
 });
 
-test("codex_goal_start rejects an unbound workspace before spawning Codex", async (t) => {
+test("codex_goal_start allows direct unbound execution without minting Core provenance", async (t) => {
   const fixture = await goalFixture(t, { coreMutation: true });
   const conversation = { "openai/session": "core-unbound-goal" };
   const opened = await fixture.client.callTool({
@@ -295,12 +295,12 @@ test("codex_goal_start rejects an unbound workspace before spawning Codex", asyn
   const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: fixture.projectA })).stdout.trim();
   const result = await fixture.client.callTool({
     name: "codex_goal_start",
-    arguments: { workspaceId, goal: "must not spawn", expectedHead: head },
+    arguments: { workspaceId, goal: "direct goal without core", expectedHead: head },
     _meta: conversation,
   });
-  assert.equal(result.isError, true);
-  assert.match(String((result.content as Array<{ text?: string }> | undefined)?.[0]?.text), /CORE_BOUND_SESSION_REQUIRED/);
-  assert.equal(existsSync(fixture.spawnLogPath), false, "unbound goal admission must precede Codex spawn");
+  assert.equal(result.isError, undefined);
+  assert.ok(structured(result).goalId, "direct unbound goal should return one durable goal handle");
+  assert.equal(structured(result).coreMutation, undefined, "direct goal must not mint Core provenance");
 });
 
 test("terminal codex_goal_status rejects out-of-scope Core mutation", async (t) => {
