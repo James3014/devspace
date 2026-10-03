@@ -37,7 +37,8 @@ import {
   type ExecutionContract,
   type ScopeState,
 } from "./local-agent-contract.js";
-import { buildToolchainEnvironment, describeToolchainExecutables } from "./local-agent-toolchains.js";
+import { buildToolchainEnvironment, describeToolchainExecutables, runToolchainVerifier } from "./local-agent-toolchains.js";
+import type { WorkResumeStore } from "./work-resume.js";
 import { inspectCodexRuntime, type CodexRuntimeIdentity } from "./codex-runtime.js";
 import {
   cleanupProviderScratch,
@@ -136,7 +137,9 @@ export type AgentErrorCode =
   | "ATTEMPT_REPLAY_CONFLICT"
   | "CONTINUATION_ADMISSION_FAILED"
   | "NEXUS_AUTHORITY_REJECTED"
-  | "REBIND_REQUIRED";
+  | "REBIND_REQUIRED"
+  | "DISPATCH_CONTRACT_REJECTED"
+  | "MODEL_ATTESTATION_MISMATCH";
 
 export class AgentSessionError extends Error {
   constructor(
@@ -279,6 +282,12 @@ export interface AgentStatusOutput {
   dispatch?: DispatchContractOutput;
   executionIdlePolicy?: EffectiveExecutionIdlePolicy;
   effectEnforcementReceipt?: LocalEffectEnforcementReceipt;
+  lineage?: {
+    role?: "IMPLEMENT" | "REPAIR" | "VERIFY" | "RECONCILE";
+    parentEffectKey?: string;
+    supersedes?: string;
+  };
+  automatedVerifierResult?: Record<string, unknown>;
   termination?: {
     pending: boolean;
     generation?: string;
@@ -539,6 +548,7 @@ export class LocalAgentSessionManager {
   private readonly herdrVerifiedLive = new Set<string>();
   private closed = false;
   private readonly terminationAttempts = new Map<string, Promise<boolean>>();
+  private workResumeStore?: WorkResumeStore;
 
   constructor(
     private readonly config: ServerConfig,
@@ -550,6 +560,7 @@ export class LocalAgentSessionManager {
     clineCatalogService?: ClineCatalogService,
     opencodeCatalogSource?: ReturnType<typeof createMcpOpencodeCatalogSource>,
     herdrGateway?: HerdrThinGateway,
+    workResumeStore?: WorkResumeStore,
   ) {
     this.store = createLocalAgentStore(config.stateDir);
     this.launcher = testLauncher ?? defaultWorkerLauncher;
@@ -560,6 +571,7 @@ export class LocalAgentSessionManager {
     this.opencodeCatalogSource = opencodeCatalogSource ?? createMcpOpencodeCatalogSource();
     this.ownsOpencodeCatalogSource = opencodeCatalogSource === undefined;
     this.herdrGateway = herdrGateway ?? new HerdrThinGateway(HERDR_DEFAULT_SOCKET_PATH, defaultHerdrGatewayRegistry, this.store);
+    this.workResumeStore = workResumeStore;
     this.runtimeBuildIdentity = runtimeBuildIdentity ?? describeRuntimeBuildIdentity({
       env: process.env,
       listenPort: config.port,
@@ -567,6 +579,10 @@ export class LocalAgentSessionManager {
       stateRoot: config.stateDir,
       profileCatalogGeneration: "unresolved",
     });
+  }
+
+  setWorkResumeStore(workResumeStore: WorkResumeStore): void {
+    this.workResumeStore = workResumeStore;
   }
 
   bindCapabilityManifestSha256(manifestSha256: string): void {
@@ -2984,6 +3000,52 @@ export class LocalAgentSessionManager {
       const scopeViolated = scope.scopeState === "SCOPE_VIOLATION";
       const cumulative = new Set(this.store.getById(claimed.id)?.lifecycleState?.cumulativeChangedPaths ?? []);
       for (const path of scope.workerChangedPaths ?? []) cumulative.add(path);
+
+      let automatedVerifierResult: Record<string, unknown> | undefined;
+      const contract = claimed.executionContract;
+      const toolchainId = contract?.toolchainId ?? (this.config.toolchains.length > 0 ? this.config.toolchains[0]?.id : undefined);
+      if (toolchainId && (contract?.role === "IMPLEMENT" || contract?.role === "REPAIR" || contract?.toolchainId)) {
+        const toolchain = this.config.toolchains.find((candidate) => candidate.id === toolchainId);
+        const verifierName = Object.keys(toolchain?.verifiers ?? {})[0];
+        if (toolchain && verifierName) {
+          try {
+            const vRes = await runToolchainVerifier({
+              toolchains: this.config.toolchains,
+              toolchainId,
+              verifier: verifierName,
+              args: [],
+              cwd: claimed.workspaceRoot,
+            });
+            automatedVerifierResult = {
+              toolchainId,
+              verifier: verifierName,
+              exitCode: vRes.exitCode,
+              passed: vRes.exitCode === 0,
+              durationMs: vRes.durationMs,
+              timedOut: vRes.timedOut,
+              launchFailed: Boolean(vRes.launchError),
+              stdout: vRes.stdout,
+              stderr: vRes.stderr,
+            };
+          } catch (err) {
+            automatedVerifierResult = {
+              toolchainId,
+              verifier: verifierName,
+              passed: false,
+              error: err instanceof Error ? err.message : String(err),
+            };
+          }
+        }
+      }
+
+      if (contract?.resumableWork?.workKey && this.workResumeStore && automatedVerifierResult) {
+        try {
+          this.workResumeStore.recordAutomatedVerifierResult(contract.resumableWork.workKey, automatedVerifierResult);
+        } catch {
+          // ignore
+        }
+      }
+
       this.store.finishTurnCAS({
         agentId,
         generation,
@@ -2999,6 +3061,7 @@ export class LocalAgentSessionManager {
         cumulativeChangedPaths: [...cumulative].sort(),
         turnEndBaseline,
         effectEnforcementReceipt: result.effectEnforcementReceipt,
+        automatedVerifierResult,
       });
     } catch (error) {
       const originalMessage = error instanceof Error ? error.message : String(error);
@@ -3037,6 +3100,51 @@ export class LocalAgentSessionManager {
         latestResponse = error.finalResponse === undefined ? undefined : redactSensitiveText(error.finalResponse);
       }
 
+      let automatedVerifierResult: Record<string, unknown> | undefined;
+      const contract = claimed.executionContract;
+      const toolchainId = contract?.toolchainId ?? (this.config.toolchains.length > 0 ? this.config.toolchains[0]?.id : undefined);
+      if (toolchainId && (contract?.role === "IMPLEMENT" || contract?.role === "REPAIR" || contract?.toolchainId)) {
+        const toolchain = this.config.toolchains.find((candidate) => candidate.id === toolchainId);
+        const verifierName = Object.keys(toolchain?.verifiers ?? {})[0];
+        if (toolchain && verifierName) {
+          try {
+            const vRes = await runToolchainVerifier({
+              toolchains: this.config.toolchains,
+              toolchainId,
+              verifier: verifierName,
+              args: [],
+              cwd: claimed.workspaceRoot,
+            });
+            automatedVerifierResult = {
+              toolchainId,
+              verifier: verifierName,
+              exitCode: vRes.exitCode,
+              passed: vRes.exitCode === 0,
+              durationMs: vRes.durationMs,
+              timedOut: vRes.timedOut,
+              launchFailed: Boolean(vRes.launchError),
+              stdout: vRes.stdout,
+              stderr: vRes.stderr,
+            };
+          } catch (err) {
+            automatedVerifierResult = {
+              toolchainId,
+              verifier: verifierName,
+              passed: false,
+              error: err instanceof Error ? err.message : String(err),
+            };
+          }
+        }
+      }
+
+      if (contract?.resumableWork?.workKey && this.workResumeStore && automatedVerifierResult) {
+        try {
+          this.workResumeStore.recordAutomatedVerifierResult(contract.resumableWork.workKey, automatedVerifierResult);
+        } catch {
+          // ignore
+        }
+      }
+
       this.store.failTurnCAS({
         agentId,
         generation,
@@ -3062,6 +3170,7 @@ export class LocalAgentSessionManager {
               fingerprints: endState.fingerprints,
             }
           : undefined,
+        automatedVerifierResult,
       });
     } finally {
       cleanupOwnedPromptFile(promptFile);
@@ -3713,6 +3822,16 @@ function recordToStatusOutput(
   }
   const dispatch = dispatchContractOutput(record.executionContract?.dispatchIntent);
   if (dispatch) output.dispatch = dispatch;
+  if (record.executionContract?.role || record.executionContract?.parentEffectKey || record.executionContract?.supersedes) {
+    output.lineage = {
+      ...(record.executionContract.role ? { role: record.executionContract.role } : {}),
+      ...(record.executionContract.parentEffectKey ? { parentEffectKey: record.executionContract.parentEffectKey } : {}),
+      ...(record.executionContract.supersedes ? { supersedes: record.executionContract.supersedes } : {}),
+    };
+  }
+  if (record.lifecycleState?.automatedVerifierResult) {
+    output.automatedVerifierResult = record.lifecycleState.automatedVerifierResult;
+  }
   if (record.providerSessionId !== undefined) output.providerSessionId = record.providerSessionId;
   if (record.latestResponse !== undefined) output.latestResponse = record.latestResponse;
   if (record.error !== undefined) output.error = record.error;

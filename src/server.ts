@@ -2870,6 +2870,15 @@ function createAgentStartInputSchema() {
     idleTimeoutMs: z.number().int().min(1).describe(
       "Explicit hard no-provider-activity timeout for this turn. Requires idleTimeoutMode=EXPLICIT_OVERRIDE and must satisfy the profile/provider policy; when valid, the agent is terminated after this interval with no provider activity. Generic callers should normally omit it and use the profile default.",
     ),
+    role: z.enum(["IMPLEMENT", "REPAIR", "VERIFY", "RECONCILE"]).describe(
+      "P1 Operation lineage graph role for this turn.",
+    ),
+    parentEffectKey: z.string().describe(
+      "Exact effect key / attempt key of the parent turn in the lineage graph.",
+    ),
+    supersedes: z.string().describe(
+      "Exact effect key or agentId superseded by this turn.",
+    ),
   }).partial().optional().describe(
     "Optional structured execution contract. Records and enforces where/how the worker may run.",
   );
@@ -5492,6 +5501,11 @@ export function createMcpServer(
               leaseId: contract.resumableWork.leaseId,
               effectKind: "agent",
               effectKey: attemptKey,
+              lineage: (contract.role || contract.parentEffectKey || contract.supersedes) ? {
+                role: contract.role,
+                parentEffectKey: contract.parentEffectKey,
+                supersedes: contract.supersedes,
+              } : undefined,
             });
           } catch (err) {
             throw new AgentSessionError(
@@ -6045,6 +6059,12 @@ export function createMcpServer(
           scopeState: z.string().optional(),
           runtime: AGENT_RUNTIME_OUTPUT_SCHEMA.optional(),
           termination: AGENT_TERMINATION_OUTPUT_SCHEMA.optional(),
+          lineage: z.object({
+            role: z.string().optional(),
+            parentEffectKey: z.string().optional(),
+            supersedes: z.string().optional(),
+          }).optional(),
+          automatedVerifierResult: z.record(z.string(), z.unknown()).optional(),
         },
         _meta: {},
         annotations: { readOnlyHint: true },
@@ -7508,7 +7528,7 @@ export function createServer(
   const latestMcpToolCatalogGeneration = { value: "unresolved" };
   const latestMcpToolCatalogNames = { value: [] as string[] };
   const agentSessionManager = config.subagents.enabled
-    ? new LocalAgentSessionManager(config, undefined, undefined, undefined, runtimeBuildIdentity, undefined, clineCatalogService, opencodeCatalogSource)
+    ? new LocalAgentSessionManager(config, undefined, undefined, undefined, runtimeBuildIdentity, undefined, clineCatalogService, opencodeCatalogSource, undefined, workResumeStore)
     : undefined;
   initializationCleanups.push(() => agentSessionManager?.close());
   const capabilityManifest = deriveLoadedCapabilityManifest(

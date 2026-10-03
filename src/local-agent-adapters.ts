@@ -441,6 +441,14 @@ function isPathWithin(candidate: string, root: string): boolean {
   return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
 }
 
+export function canonicalizeAgyModel(model: string | undefined): string | undefined {
+  if (!model) return undefined;
+  if (model === "claude-opus-4-6" || model === "claude-opus") {
+    return "claude-opus-4-6-thinking";
+  }
+  return model;
+}
+
 class AgyLocalAgentAdapter implements LocalAgentAdapter {
   readonly provider = "agy" as const;
   // Agy --print can remain silent until the final response. Raw-byte touches are useful
@@ -465,7 +473,7 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
       args.push("--new-project");
     }
     if (input.model) {
-      args.push("--model", input.model);
+      args.push("--model", canonicalizeAgyModel(input.model)!);
     }
     // Agy 1.1.18 rejects a separate --effort for this preset model because
     // the reasoning tier is already encoded in the model identity.

@@ -168,6 +168,14 @@ export type WorkDisposition =
   | "RECONCILE_REQUIRED"
   | "NO_EXISTING_ATTEMPT";
 
+export type WorkOperationRole = "IMPLEMENT" | "REPAIR" | "VERIFY" | "RECONCILE";
+
+export interface WorkLineage {
+  role?: WorkOperationRole;
+  parentEffectKey?: string;
+  supersedes?: string;
+}
+
 export interface WorkResumeStatus {
   schema: typeof WORK_RESUME_SCHEMA;
   workKey: string;
@@ -192,6 +200,10 @@ export interface WorkResumeStatus {
   effectKey?: string;
   /** Concrete durable handle returned by the effect owner (for agents: agentId). */
   effectHandle?: string;
+  /** P1 operation lineage graph info */
+  lineage?: WorkLineage;
+  /** Mechanical automated verifier execution result on worker terminal */
+  automatedVerifierResult?: Record<string, unknown>;
   /**
    * Terminal reconciliation receipt when disposition is TERMINAL.
    * Derived from canonical #62 store; cache is read-only projection only.
@@ -280,6 +292,18 @@ export function initializeWorkResumeDatabase(sqlite: Database.Database): void {
   if (!registryColumns.has("effect_handle")) {
     sqlite.exec("alter table work_resume_registry add column effect_handle text");
   }
+  if (!registryColumns.has("role")) {
+    sqlite.exec("alter table work_resume_registry add column role text");
+  }
+  if (!registryColumns.has("parent_effect")) {
+    sqlite.exec("alter table work_resume_registry add column parent_effect text");
+  }
+  if (!registryColumns.has("supersedes")) {
+    sqlite.exec("alter table work_resume_registry add column supersedes text");
+  }
+  if (!registryColumns.has("verifier_result")) {
+    sqlite.exec("alter table work_resume_registry add column verifier_result text");
+  }
 }
 
 // ─── Registry row type ────────────────────────────────────────────────────────
@@ -297,6 +321,10 @@ interface RegistryRow {
   effect_kind: string | null;
   effect_key: string | null;
   effect_handle: string | null;
+  role?: string | null;
+  parent_effect?: string | null;
+  supersedes?: string | null;
+  verifier_result?: string | null;
   registered_at: string;
   updated_at: string;
 }
@@ -614,6 +642,23 @@ export class WorkResumeStore {
       };
     }
 
+    const lineage: WorkLineage | undefined = (row.role || row.parent_effect || row.supersedes)
+      ? {
+          ...(row.role ? { role: row.role as WorkOperationRole } : {}),
+          ...(row.parent_effect ? { parentEffectKey: row.parent_effect } : {}),
+          ...(row.supersedes ? { supersedes: row.supersedes } : {}),
+        }
+      : undefined;
+
+    let automatedVerifierResult: Record<string, unknown> | undefined;
+    if (row.verifier_result) {
+      try {
+        automatedVerifierResult = JSON.parse(row.verifier_result) as Record<string, unknown>;
+      } catch {
+        automatedVerifierResult = undefined;
+      }
+    }
+
     // Look up the live lease (canonical authority — always checked first)
     const lease = this.ownership.get(row.lease_id);
     if (!lease) {
@@ -628,6 +673,8 @@ export class WorkResumeStore {
         ...(row.effect_kind ? { effectKind: row.effect_kind } : {}),
         ...(row.effect_key ? { effectKey: row.effect_key } : {}),
         ...(row.effect_handle ? { effectHandle: row.effect_handle } : {}),
+        ...(lineage ? { lineage } : {}),
+        ...(automatedVerifierResult ? { automatedVerifierResult } : {}),
         message: "Registered lease is no longer present in ownership store.",
       };
     }
@@ -659,6 +706,8 @@ export class WorkResumeStore {
         ...(row.effect_kind ? { effectKind: row.effect_kind } : {}),
         ...(row.effect_key ? { effectKey: row.effect_key } : {}),
         ...(row.effect_handle ? { effectHandle: row.effect_handle } : {}),
+        ...(lineage ? { lineage } : {}),
+        ...(automatedVerifierResult ? { automatedVerifierResult } : {}),
         ...(terminalReceipt ? { terminalReceipt } : {}),
         message: `Lease terminal: ${lease.terminalState}`,
       };
@@ -688,6 +737,8 @@ export class WorkResumeStore {
       ...(row.effect_kind ? { effectKind: row.effect_kind } : {}),
       ...(row.effect_key ? { effectKey: row.effect_key } : {}),
       ...(row.effect_handle ? { effectHandle: row.effect_handle } : {}),
+      ...(lineage ? { lineage } : {}),
+      ...(automatedVerifierResult ? { automatedVerifierResult } : {}),
       message: `Disposition: ${disposition}`,
     };
   }
@@ -770,6 +821,7 @@ export class WorkResumeStore {
     leaseId: string;
     effectKind: string;
     effectKey: string;
+    lineage?: WorkLineage;
   }): WorkResumeStatus {
     bounded(input.workKey, "workKey");
     bounded(input.leaseId, "leaseId");
@@ -797,14 +849,46 @@ export class WorkResumeStore {
       }
 
       this.sqlite.prepare(
-        "update work_resume_registry set effect_kind=?, effect_key=?, updated_at=? where work_key=?",
+        "update work_resume_registry set effect_kind=?, effect_key=?, role=?, parent_effect=?, supersedes=?, updated_at=? where work_key=?",
       ).run(
         input.effectKind,
         input.effectKey,
+        input.lineage?.role ?? null,
+        input.lineage?.parentEffectKey ?? null,
+        input.lineage?.supersedes ?? null,
         new Date(this.now()).toISOString(),
         input.workKey,
       );
       return this.disposition(input.workKey);
+    }).immediate();
+  }
+
+  /**
+   * Record automated mechanical verifier execution result on the durable work key.
+   */
+  recordAutomatedVerifierResult(
+    workKey: string,
+    result: Record<string, unknown>,
+  ): WorkResumeStatus {
+    bounded(workKey, "workKey");
+    return this.sqlite.transaction(() => {
+      const row = this.sqlite.prepare(
+        "select * from work_resume_registry where work_key=?",
+      ).get(workKey) as RegistryRow | undefined;
+      if (!row) {
+        throw new WorkResumeError(
+          "INVALID_INPUT",
+          `No registered work key ${workKey}; verifier result cannot be recorded.`,
+        );
+      }
+      this.sqlite.prepare(
+        "update work_resume_registry set verifier_result=?, updated_at=? where work_key=?",
+      ).run(
+        JSON.stringify(result),
+        new Date(this.now()).toISOString(),
+        workKey,
+      );
+      return this.disposition(workKey);
     }).immediate();
   }
 

@@ -188,6 +188,13 @@ function makeAgentManagerSpy() {
         workspaceId: input.workspaceId ?? record?.workspaceId ?? "ws",
         createdAt: record?.createdAt ?? new Date().toISOString(),
         updatedAt: record?.updatedAt ?? new Date().toISOString(),
+        lineage: (record?.executionContract?.role || record?.executionContract?.parentEffectKey || record?.executionContract?.supersedes)
+          ? {
+              ...(record?.executionContract?.role ? { role: record.executionContract.role } : {}),
+              ...(record?.executionContract?.parentEffectKey ? { parentEffectKey: record.executionContract.parentEffectKey } : {}),
+              ...(record?.executionContract?.supersedes ? { supersedes: record.executionContract.supersedes } : {}),
+            }
+          : undefined,
       };
     },
     cancelAgent: async (input: any) => ({ agentId: input.agentId, status: "stopped", terminal: true, profileName: "reviewer", provider: "codex", workspaceRoot: input.workspaceRoot ?? "/fake", workspaceId: input.workspaceId ?? "ws", createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() }),
@@ -1250,3 +1257,115 @@ test("I-12: ControlPlaneOwnershipStore core semantics unchanged by P0 additions"
     db.close();
   }
 });
+
+// ─── I-P1: operation lineage graph bound and queried via work_resume_status ───
+
+test("I-P1: agent_start binds operation lineage and work_resume_status preserves it across reconnection", async (t) => {
+  const fix = await makeFixture();
+  t.after(() => fix.close());
+
+  const { workKey, leaseId, leaseVersion } = acquireAndRegister(
+    fix.ownership,
+    fix.store,
+    fix.projectRoot,
+    OWNER_SESSION,
+  );
+  const attemptKey = "issue329-p1-lineage-attempt";
+  const argumentsPayload = {
+    workspaceId: fix.workspaceId,
+    profile: "reviewer",
+    prompt: "P1 lineage witness test",
+    attemptKey,
+    executionContract: {
+      role: "REPAIR",
+      parentEffectKey: "att_implement_initial",
+      supersedes: "agyop_prior_attempt",
+      resumableWork: buildPointer({
+        workKey,
+        leaseId,
+        leaseVersion,
+        effectHandle: attemptKey,
+      }),
+    },
+  };
+
+  const started = await fix.client.callTool({
+    name: "agent_start",
+    arguments: argumentsPayload,
+    _meta: SESSION_META,
+  });
+  const startedContent = started.structuredContent as Record<string, unknown>;
+  const agentId = startedContent.agentId as string;
+  assert.ok(agentId);
+
+  // 1. work_resume_status exposes lineage graph
+  const resumeStatus = await fix.client.callTool({
+    name: "work_resume_status",
+    arguments: { workspaceId: fix.workspaceId, workKey },
+    _meta: SESSION_META,
+  });
+  const resumeParsed = resumeStatus.structuredContent as Record<string, unknown>;
+  assert.deepEqual(resumeParsed.lineage, {
+    role: "REPAIR",
+    parentEffectKey: "att_implement_initial",
+    supersedes: "agyop_prior_attempt",
+  });
+
+  // 2. agent_status exposes lineage graph
+  const agentStatus = await fix.client.callTool({
+    name: "agent_status",
+    arguments: { workspaceId: fix.workspaceId, agentId },
+    _meta: SESSION_META,
+  });
+  const agentParsed = agentStatus.structuredContent as Record<string, unknown>;
+  assert.deepEqual(agentParsed.lineage, {
+    role: "REPAIR",
+    parentEffectKey: "att_implement_initial",
+    supersedes: "agyop_prior_attempt",
+  });
+});
+
+test("I-P1b: automated verifier result is recorded on terminal and queryable via work_resume_status", async (t) => {
+  const fix = await makeFixture();
+  t.after(() => fix.close());
+
+  const { workKey, leaseId, leaseVersion } = acquireAndRegister(
+    fix.ownership,
+    fix.store,
+    fix.projectRoot,
+    OWNER_SESSION,
+  );
+  const attemptKey = "issue329-p1b-verifier-attempt";
+
+  // Bind effect
+  fix.store.bindEffectIdentity({
+    workKey,
+    leaseId,
+    effectKind: "agent",
+    effectKey: attemptKey,
+    lineage: { role: "IMPLEMENT" },
+  });
+
+  // Simulate terminal verifier execution recording
+  const verifierResult = {
+    toolchainId: "test-toolchain",
+    verifier: "typecheck",
+    exitCode: 0,
+    passed: true,
+    durationMs: 82,
+    stdout: "Typecheck passed: 0 errors",
+    stderr: "",
+  };
+  fix.store.recordAutomatedVerifierResult(workKey, verifierResult);
+
+  // work_resume_status returns automatedVerifierResult
+  const resumeStatus = await fix.client.callTool({
+    name: "work_resume_status",
+    arguments: { workspaceId: fix.workspaceId, workKey },
+    _meta: SESSION_META,
+  });
+  const parsed = resumeStatus.structuredContent as Record<string, unknown>;
+  assert.deepEqual(parsed.automatedVerifierResult, verifierResult);
+});
+
+

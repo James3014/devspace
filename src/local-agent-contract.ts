@@ -135,6 +135,14 @@ export interface ExecutionContract {
    */
   idleTimeoutMs?: number;
   idleTimeoutMode?: "EXPLICIT_OVERRIDE";
+  /**
+   * P1 Lineage graph role for this operation.
+   */
+  role?: "IMPLEMENT" | "REPAIR" | "VERIFY" | "RECONCILE";
+  /** Exact effect key / attempt key of the parent turn in the lineage graph. */
+  parentEffectKey?: string;
+  /** Exact effect key or agentId superseded by this turn. */
+  supersedes?: string;
 }
 
 /**
@@ -388,6 +396,27 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
     contract.idleTimeoutMs = record.idleTimeoutMs;
   } else if (contract.idleTimeoutMode === "EXPLICIT_OVERRIDE") {
     throw new Error("executionContract.idleTimeoutMode=EXPLICIT_OVERRIDE requires idleTimeoutMs.");
+  }
+
+  if (record.role !== undefined) {
+    if (typeof record.role !== "string" || !["IMPLEMENT", "REPAIR", "VERIFY", "RECONCILE"].includes(record.role)) {
+      throw new Error("executionContract.role must be IMPLEMENT, REPAIR, VERIFY, or RECONCILE.");
+    }
+    contract.role = record.role as "IMPLEMENT" | "REPAIR" | "VERIFY" | "RECONCILE";
+  }
+
+  if (record.parentEffectKey !== undefined) {
+    if (typeof record.parentEffectKey !== "string" || !record.parentEffectKey.trim()) {
+      throw new Error("executionContract.parentEffectKey must be a non-empty string.");
+    }
+    contract.parentEffectKey = record.parentEffectKey.trim();
+  }
+
+  if (record.supersedes !== undefined) {
+    if (typeof record.supersedes !== "string" || !record.supersedes.trim()) {
+      throw new Error("executionContract.supersedes must be a non-empty string.");
+    }
+    contract.supersedes = record.supersedes.trim();
   }
 
   const authorityMode = contract.authorityMode ?? "OWNER_DIRECT";

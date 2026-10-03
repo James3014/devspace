@@ -635,3 +635,72 @@ test("buildWorktreeLeaseInput: idempotency key is stable and prefixed", () => {
   const input2 = buildWorktreeLeaseInput(workKey, BASE_MATERIAL, BASE_GRANT, new Date(Date.now() + 90_000).toISOString());
   assert.equal(input.idempotencyKey, input2.idempotencyKey, "idempotency key must be stable across calls");
 });
+
+// ─── P1 Lineage & Automated Verifier ──────────────────────────────────────────
+
+test("P1: bindEffectIdentity persists lineage graph (role, parentEffectKey, supersedes)", () => {
+  const { sqlite, ownership, store } = setup();
+  try {
+    const { workKey, lease } = acquireLease(ownership, store);
+    const bound = store.bindEffectIdentity({
+      workKey,
+      leaseId: lease.leaseId,
+      effectKind: "agent",
+      effectKey: "att_implement_001",
+      lineage: {
+        role: "REPAIR",
+        parentEffectKey: "att_implement_000",
+        supersedes: "agy_prior_worker",
+      },
+    });
+
+    assert.ok(bound.lineage);
+    assert.equal(bound.lineage.role, "REPAIR");
+    assert.equal(bound.lineage.parentEffectKey, "att_implement_000");
+    assert.equal(bound.lineage.supersedes, "agy_prior_worker");
+
+    const query = store.disposition(workKey);
+    assert.ok(query.lineage);
+    assert.equal(query.lineage.role, "REPAIR");
+    assert.equal(query.lineage.parentEffectKey, "att_implement_000");
+    assert.equal(query.lineage.supersedes, "agy_prior_worker");
+  } finally {
+    sqlite.close();
+  }
+});
+
+test("P1: recordAutomatedVerifierResult records verifier outcome on durable work key", () => {
+  const { sqlite, ownership, store } = setup();
+  try {
+    const { workKey, lease } = acquireLease(ownership, store);
+    store.bindEffectIdentity({
+      workKey,
+      leaseId: lease.leaseId,
+      effectKind: "agent",
+      effectKey: "att_verify_001",
+    });
+
+    const verifierOutcome = {
+      toolchainId: "test-toolchain",
+      verifier: "pytest",
+      exitCode: 0,
+      passed: true,
+      durationMs: 45,
+      stdout: "1 passed in 0.04s",
+      stderr: "",
+    };
+
+    const recorded = store.recordAutomatedVerifierResult(workKey, verifierOutcome);
+    assert.ok(recorded.automatedVerifierResult);
+    assert.equal(recorded.automatedVerifierResult.passed, true);
+    assert.equal(recorded.automatedVerifierResult.verifier, "pytest");
+
+    const queried = store.disposition(workKey);
+    assert.ok(queried.automatedVerifierResult);
+    assert.equal(queried.automatedVerifierResult.exitCode, 0);
+    assert.equal(queried.automatedVerifierResult.stdout, "1 passed in 0.04s");
+  } finally {
+    sqlite.close();
+  }
+});
+
