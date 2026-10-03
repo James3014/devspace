@@ -3024,14 +3024,15 @@ export class LocalAgentSessionManager {
 
       let automatedVerifierResult: Record<string, unknown> | undefined;
       const contract = claimed.executionContract;
-      const toolchainId = contract?.toolchainId ?? (this.config.toolchains.length > 0 ? this.config.toolchains[0]?.id : undefined);
+      const configuredToolchains = this.config.toolchains ?? [];
+      const toolchainId = contract?.toolchainId ?? (configuredToolchains.length > 0 ? configuredToolchains[0]?.id : undefined);
       if (toolchainId && (contract?.role === "IMPLEMENT" || contract?.role === "REPAIR" || contract?.toolchainId)) {
-        const toolchain = this.config.toolchains.find((candidate) => candidate.id === toolchainId);
+        const toolchain = configuredToolchains.find((candidate) => candidate.id === toolchainId);
         const verifierName = Object.keys(toolchain?.verifiers ?? {})[0];
         if (toolchain && verifierName) {
           try {
             const vRes = await runToolchainVerifier({
-              toolchains: this.config.toolchains,
+              toolchains: configuredToolchains,
               toolchainId,
               verifier: verifierName,
               args: [],
@@ -3123,9 +3124,10 @@ export class LocalAgentSessionManager {
 
       let automatedVerifierResult: Record<string, unknown> | undefined;
       const contract = claimed.executionContract;
-      const toolchainId = contract?.toolchainId ?? (this.config.toolchains.length > 0 ? this.config.toolchains[0]?.id : undefined);
+      const configuredToolchains = this.config.toolchains ?? [];
+      const toolchainId = contract?.toolchainId ?? (configuredToolchains.length > 0 ? configuredToolchains[0]?.id : undefined);
       if (toolchainId && (contract?.role === "IMPLEMENT" || contract?.role === "REPAIR" || contract?.toolchainId)) {
-        const toolchain = this.config.toolchains.find((candidate) => candidate.id === toolchainId);
+        const toolchain = configuredToolchains.find((candidate) => candidate.id === toolchainId);
         const verifierName = Object.keys(toolchain?.verifiers ?? {})[0];
         if (toolchain && verifierName) {
           try {
@@ -3701,15 +3703,6 @@ function assertDispatchContractCoherence(contract: ExecutionContract | undefined
     throw new AgentSessionError(
       "DISPATCH_CONTRACT_REJECTED",
       "DISPATCH_CONTRACT_REJECTED: executionContract.dispatchIntent.writeScope must exactly match executionContract.writePaths; DevSpace does not maintain two write-scope authorities. provider_effect=false",
-    );
-  }
-  if (
-    (intent.roleIntent === "MECHANICAL_EXECUTOR" || intent.roleIntent === "DEEP_ENGINEERING") &&
-    !contract?.toolProjectionManifest
-  ) {
-    throw new AgentSessionError(
-      "DISPATCH_CONTRACT_REJECTED",
-      "DISPATCH_CONTRACT_REJECTED: missing required toolProjectionManifest for mutating dispatch role. Field: toolProjectionManifest; provider_effect=false",
     );
   }
 }

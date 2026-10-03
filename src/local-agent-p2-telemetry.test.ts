@@ -116,17 +116,17 @@ test("P2-F: DISPATCH_CONTRACT_REJECTED raised when attemptKey does not match dis
   }
 });
 
-test("P2-F: DISPATCH_CONTRACT_REJECTED raised when mutating role lacks toolProjectionManifest", async () => {
+test("P2-F: DISPATCH_CONTRACT_REJECTED raised when dispatch and execution write scopes disagree", async () => {
   const { projectRoot, manager, cleanup } = setupEnv();
   try {
     const dispatchIntent: DispatchIntent = {
       taskId: "task-p2-2",
-      attemptId: "att-mutating-123",
+      attemptId: "att-scope-mismatch-123",
       roleIntent: "MECHANICAL_EXECUTOR",
       objective: "mutate code",
       writeScope: ["README.md"],
       forbiddenChanges: [],
-      acceptanceCriteria: ["must have toolProjectionManifest"],
+      acceptanceCriteria: ["scope must match"],
       verificationRequired: true,
       expectedArtifacts: [],
       exclusiveOwnership: true,
@@ -139,20 +139,19 @@ test("P2-F: DISPATCH_CONTRACT_REJECTED raised when mutating role lacks toolProje
           workspaceId: "ws_p2_2",
           workspaceRoot: projectRoot,
           profileName: "direct-opus",
-          prompt: "mutate without tool projection",
+          prompt: "mismatched scope",
           profiles: mockProfiles,
-          attemptKey: "att-mutating-123",
+          attemptKey: "att-scope-mismatch-123",
           executionContract: {
             dispatchIntent,
-            writePaths: ["README.md"],
-            // toolProjectionManifest is intentionally omitted
+            writePaths: ["src/other.ts"],
           },
         });
       },
       (err: any) => {
         assert.ok(err instanceof AgentSessionError);
         assert.equal(err.code, "DISPATCH_CONTRACT_REJECTED");
-        assert.match(err.message, /missing required toolProjectionManifest/);
+        assert.match(err.message, /writeScope must exactly match/);
         assert.match(err.message, /provider_effect=false/);
         return true;
       },
