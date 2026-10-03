@@ -3749,6 +3749,198 @@ test("Core-bound structured write forms and publishes physical Candidate provena
   assert.equal(readFileSync(join(context.project, "core-positive.txt"), "utf8"), "Core physical bytes\n");
 });
 
+test("terminal Core Candidate can be published by a later exact Candidate-bound session", async (t) => {
+  const conversationScopeId = "core-terminal-candidate-publication";
+  const conversation = { "openai/session": conversationScopeId };
+  const context = await fixture(t, { git: true, gitCandidates: true, coreMutation: true });
+  const bare = join(dirname(context.project), "terminal-publication-remote.git");
+  await execFileAsync("git", ["init", "--bare", bare]);
+  await execFileAsync("git", ["remote", "add", "origin", bare], { cwd: context.project });
+
+  const opened = await callOpen(context.client, context.project, conversationScopeId, "worktree");
+  const workspace = structuredContent(opened) as Record<string, any>;
+  const workspaceId = workspace.workspaceId as string;
+  const workspaceRoot = workspace.root as string;
+
+  const producer = await bindTestCoreSession({
+    fixture: context,
+    workspaceId,
+    workspaceRoot,
+    conversationScopeId,
+    allowedPaths: ["terminal-publication.txt"],
+    workspaceMode: "managed_worktree",
+    identitySuffix: "producer",
+  });
+
+  const write = await context.client.callTool({
+    name: "write",
+    arguments: {
+      workspaceId,
+      path: "terminal-publication.txt",
+      content: "durable candidate\n",
+    },
+    _meta: conversation,
+  });
+  assert.equal(write.isError, undefined, responseText(write));
+
+  const commit = await context.client.callTool({
+    name: "git_commit",
+    arguments: {
+      workspaceId,
+      expectedHead: producer.head,
+      message: "test: terminal Candidate publication",
+      paths: ["terminal-publication.txt"],
+    },
+    _meta: conversation,
+  });
+  assert.equal(commit.isError, undefined, responseText(commit));
+  const candidate = structuredContent(commit);
+  const candidateHead = candidate.commitSha as string;
+  const candidateTree = candidate.treeSha as string;
+  const candidateCore = candidate.coreMutation as Record<string, unknown>;
+
+  const closed = await context.client.callTool({
+    name: "core_mutation_session_close",
+    arguments: {
+      workspaceId,
+      sessionId: producer.session.id,
+      mode: "COMPLETE",
+    },
+    _meta: conversation,
+  });
+  assert.equal(closed.isError, undefined, responseText(closed));
+  assert.equal(context.coreMutationSessions!.getById(producer.session.id)?.status, "COMPLETED");
+
+  const publication = await bindTestCoreSession({
+    fixture: context,
+    workspaceId,
+    workspaceRoot,
+    conversationScopeId,
+    allowedPaths: ["terminal-publication.txt"],
+    workspaceMode: "managed_worktree",
+    identitySuffix: "publication",
+  });
+  assert.equal(publication.head, candidateHead);
+  assert.equal(publication.tree, candidateTree);
+  assert.notEqual(publication.session.id, producer.session.id);
+  assert.notEqual(publication.session.bindingHash, producer.session.bindingHash);
+
+  const push = await context.client.callTool({
+    name: "git_push",
+    arguments: {
+      workspaceId,
+      expectedHead: candidateHead,
+      remote: "origin",
+      branch: "terminal-publication",
+    },
+    _meta: conversation,
+  });
+  assert.equal(push.isError, undefined, responseText(push));
+
+  const pushCore = structuredContent(push).coreMutation as Record<string, unknown>;
+  assert.equal(pushCore.sessionId, producer.session.id);
+  assert.equal(pushCore.bindingHash, candidateCore.bindingHash);
+  assert.equal(pushCore.publicationSessionId, publication.session.id);
+  assert.equal(pushCore.publicationBindingHash, publication.session.bindingHash);
+  assert.equal(pushCore.publicationContinuity, "TERMINAL_CANDIDATE_HANDOFF");
+
+  const published = (
+    await execFileAsync("git", ["rev-parse", "refs/heads/terminal-publication"], {
+      cwd: bare,
+    })
+  ).stdout.trim();
+  assert.equal(published, candidateHead);
+});
+
+test("terminal Candidate publication rejects a session bound to a different HEAD and tree", async (t) => {
+  const conversationScopeId = "core-terminal-candidate-publication-mismatch";
+  const conversation = { "openai/session": conversationScopeId };
+  const context = await fixture(t, { git: true, gitCandidates: true, coreMutation: true });
+  const bare = join(dirname(context.project), "terminal-publication-mismatch-remote.git");
+  await execFileAsync("git", ["init", "--bare", bare]);
+  await execFileAsync("git", ["remote", "add", "origin", bare], { cwd: context.project });
+
+  const opened = await callOpen(context.client, context.project, conversationScopeId, "worktree");
+  const workspace = structuredContent(opened) as Record<string, any>;
+  const workspaceId = workspace.workspaceId as string;
+  const workspaceRoot = workspace.root as string;
+
+  const producer = await bindTestCoreSession({
+    fixture: context,
+    workspaceId,
+    workspaceRoot,
+    conversationScopeId,
+    allowedPaths: ["terminal-mismatch.txt"],
+    workspaceMode: "managed_worktree",
+    identitySuffix: "producer-mismatch",
+  });
+
+  const write = await context.client.callTool({
+    name: "write",
+    arguments: {
+      workspaceId,
+      path: "terminal-mismatch.txt",
+      content: "candidate\n",
+    },
+    _meta: conversation,
+  });
+  assert.equal(write.isError, undefined, responseText(write));
+
+  const commit = await context.client.callTool({
+    name: "git_commit",
+    arguments: {
+      workspaceId,
+      expectedHead: producer.head,
+      message: "test: terminal Candidate mismatch",
+      paths: ["terminal-mismatch.txt"],
+    },
+    _meta: conversation,
+  });
+  assert.equal(commit.isError, undefined, responseText(commit));
+  const candidateHead = structuredContent(commit).commitSha as string;
+
+  const closed = await context.client.callTool({
+    name: "core_mutation_session_close",
+    arguments: {
+      workspaceId,
+      sessionId: producer.session.id,
+      mode: "COMPLETE",
+    },
+    _meta: conversation,
+  });
+  assert.equal(closed.isError, undefined, responseText(closed));
+
+  await writeFile(join(workspaceRoot, "later-head.txt"), "later head\n");
+  await execFileAsync("git", ["add", "later-head.txt"], { cwd: workspaceRoot });
+  await execFileAsync("git", ["commit", "-m", "test: move beyond candidate"], {
+    cwd: workspaceRoot,
+  });
+
+  const publication = await bindTestCoreSession({
+    fixture: context,
+    workspaceId,
+    workspaceRoot,
+    conversationScopeId,
+    allowedPaths: ["later-head.txt"],
+    workspaceMode: "managed_worktree",
+    identitySuffix: "publication-mismatch",
+  });
+  assert.notEqual(publication.head, candidateHead);
+
+  const push = await context.client.callTool({
+    name: "git_push",
+    arguments: {
+      workspaceId,
+      expectedHead: candidateHead,
+      remote: "origin",
+      branch: "must-not-publish",
+    },
+    _meta: conversation,
+  });
+  assert.equal(push.isError, true);
+  assert.match(responseText(push), /CORE_CANDIDATE_PROVENANCE_CONFLICT/);
+});
+
 test("post-commit hook scope escape reports existing commit and durably blocks retry", async (t) => {
   const conversationScopeId = "core-post-commit-hook-escape";
   const conversation = { "openai/session": conversationScopeId };

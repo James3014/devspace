@@ -7074,7 +7074,30 @@ export function createMcpServer(
           const activeCore = coreMutationGuard?.require({ workspaceId, extra });
           const coreCandidate = coreMutationGuard?.candidate(expectedHead.toLowerCase());
           if (coreMutationGuard && !coreCandidate) throw new Error("[CORE_CANDIDATE_PROVENANCE_REQUIRED] Core-bound workspace cannot publish an unbound Candidate HEAD.");
-          if (activeCore && coreCandidate && (coreCandidate.bindingHash !== activeCore.bindingHash || coreCandidate.sessionId !== activeCore.id)) throw new Error("[CORE_CANDIDATE_PROVENANCE_CONFLICT] Candidate provenance does not match active Core binding.");
+
+          let publicationContinuity: "PRODUCER_SESSION" | "TERMINAL_CANDIDATE_HANDOFF" | undefined;
+          if (activeCore && coreCandidate) {
+            const sameProducerSession =
+              coreCandidate.bindingHash === activeCore.bindingHash &&
+              coreCandidate.sessionId === activeCore.id;
+            if (sameProducerSession) {
+              publicationContinuity = "PRODUCER_SESSION";
+            } else {
+              const producerSession = coreMutationSessions?.getById(coreCandidate.sessionId);
+              const publicationSession = coreMutationSessions?.getById(activeCore.id);
+              const exactTerminalCandidateHandoff =
+                producerSession?.status === "COMPLETED" &&
+                coreCandidate.workspaceSessionId === workspaceId &&
+                publicationSession?.workspaceSessionId === workspaceId &&
+                publicationSession.sourceHead === coreCandidate.candidateHead &&
+                publicationSession.sourceTree === coreCandidate.candidateTree;
+              if (!exactTerminalCandidateHandoff) {
+                throw new Error("[CORE_CANDIDATE_PROVENANCE_CONFLICT] Candidate provenance does not match the active Core publication binding.");
+              }
+              publicationContinuity = "TERMINAL_CANDIDATE_HANDOFF";
+            }
+          }
+
           coreAdmission = activeCore && coreMutationGuard
             ? await coreMutationGuard.admit({ workspaceId, extra, pointer: { required: true, sessionId: activeCore.id, bindingHash: activeCore.bindingHash }, pathContainment: "NOT_PROVEN", synchronousPostEffectCheck: true })
             : undefined;
@@ -7101,7 +7124,21 @@ export function createMcpServer(
               branch: result.branch,
               pushedSha: result.pushedSha,
               ...(coreCandidate
-                ? { coreMutation: { ...coreMutationCandidateOutput(coreCandidate), pathContainment: "NOT_PROVEN", pathContainmentEvidence: "PATH_LEVEL_PREWRITE_CONTAINMENT_NOT_PROVEN", trustedEngineeringCompletion: false } }
+                ? {
+                    coreMutation: {
+                      ...coreMutationCandidateOutput(coreCandidate),
+                      ...(activeCore
+                        ? {
+                            publicationSessionId: activeCore.id,
+                            publicationBindingHash: activeCore.bindingHash,
+                            publicationContinuity,
+                          }
+                        : {}),
+                      pathContainment: "NOT_PROVEN",
+                      pathContainmentEvidence: "PATH_LEVEL_PREWRITE_CONTAINMENT_NOT_PROVEN",
+                      trustedEngineeringCompletion: false,
+                    },
+                  }
                 : coreAdmission?.bound ? { coreMutation: coreMutationAdmissionOutput(coreAdmission) } : {}),
             },
           };
