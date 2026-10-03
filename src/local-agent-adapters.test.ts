@@ -12,6 +12,7 @@ import {
   extractPiProviderError,
   resolveAcpModelConfigUpdate,
   resolveAcpEffortConfigUpdate,
+  canonicalizeAgyModel,
 } from "./local-agent-adapters.js";
 import { removeDevspaceNodeModulesBinFromPath } from "./local-agent-path.js";
 import type { LocalAgentProvider } from "./local-agent-profiles.js";
@@ -54,6 +55,13 @@ for (const provider of providers) {
     "grok",
     "cline",
   ]);
+}
+
+{
+  assert.equal(canonicalizeAgyModel("claude-opus-4-6"), "claude-opus-4-6-thinking");
+  assert.equal(canonicalizeAgyModel("claude-opus"), "claude-opus-4-6-thinking");
+  assert.equal(canonicalizeAgyModel("gemini-3.7-flash-medium"), "gemini-3.7-flash-medium");
+  assert.equal(canonicalizeAgyModel(undefined), undefined);
 }
 
 assert.deepEqual(

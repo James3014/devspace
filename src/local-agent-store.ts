@@ -67,6 +67,8 @@ export interface AgentLifecycleState {
     detectedAt: string;
     reason: string;
   };
+  /** Automated mechanical verifier execution result on worker terminal. */
+  automatedVerifierResult?: Record<string, unknown>;
 }
 
 export interface PhysicalTerminationState {
@@ -303,6 +305,7 @@ export interface FinishTurnCasInput {
   cumulativeChangedPaths?: string[];
   turnEndBaseline?: ScopeBaseline;
   effectEnforcementReceipt?: LocalEffectEnforcementReceipt;
+  automatedVerifierResult?: Record<string, unknown>;
 }
 
 export type FinishExternalRuntimeTurnInput = Omit<FinishTurnCasInput, "workerToken">;
@@ -1838,6 +1841,7 @@ export class LocalAgentStore {
         lastSettledGeneration: input.generation,
         cumulativeChangedPaths: input.cumulativeChangedPaths ?? lifecycle.cumulativeChangedPaths,
         turnEndBaseline: input.turnEndBaseline ?? lifecycle.turnEndBaseline,
+        ...(input.automatedVerifierResult !== undefined ? { automatedVerifierResult: input.automatedVerifierResult } : (lifecycle.automatedVerifierResult !== undefined ? { automatedVerifierResult: lifecycle.automatedVerifierResult } : {})),
       };
       const errorCode = input.status === "idle" ? null : input.errorCode ?? null;
       const errorRetryable = input.status === "idle" ? null : input.errorRetryable === undefined ? null : String(input.errorRetryable);
@@ -2656,6 +2660,9 @@ function readLifecycleState(value: string | null | undefined): AgentLifecycleSta
     );
     if (lastEffectEnforcementReceipt) {
       state.lastEffectEnforcementReceipt = lastEffectEnforcementReceipt;
+    }
+    if (parsed.automatedVerifierResult && typeof parsed.automatedVerifierResult === "object") {
+      state.automatedVerifierResult = parsed.automatedVerifierResult as Record<string, unknown>;
     }
     if (!detached) {
       const legacyActiveTurn = readLegacyActiveTurnState(parsed.activeTurn);
