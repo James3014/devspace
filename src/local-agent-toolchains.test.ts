@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -447,8 +447,11 @@ test("runToolchainVerifier preserves literal argv and separates launch failure f
     const executable = join(root, process.platform === "win32" ? "node.exe" : "node");
     const script = join(root, "argv-verifier.mjs");
     const expectedArgs = ["value with spaces", "literal;$(touch SHOULD_NOT_EXIST)", "quote'\"value"];
-    copyFileSync(process.execPath, executable);
-    chmodSync(executable, 0o755);
+    if (process.platform === "win32") {
+      copyFileSync(process.execPath, executable);
+    } else {
+      symlinkSync(process.execPath, executable);
+    }
     writeFileSync(script, `
       const [mode, ...args] = process.argv.slice(2);
       const expected = ${JSON.stringify(expectedArgs)};
