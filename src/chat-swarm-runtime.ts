@@ -2258,28 +2258,46 @@ export class CdpMacWebDriver implements MacWebDriver {
       await this.pageCommand(target, "Input.insertText", { text: prompt });
     }
 
-    let sendReady = false;
+    let sendPoint: { x: number; y: number } | undefined;
     while (Date.now() < Date.parse(deadlineAt)) {
-      const readiness = await this.evaluate<{ ready: boolean; reason?: string }>(
+      const readiness = await this.evaluate<{
+        ready: boolean;
+        reason?: string;
+        x?: number;
+        y?: number;
+      }>(
         target,
-        `(() => { const expectedUrl=${expectedUrl}; if(expectedUrl && location.href !== expectedUrl) return {ready:false,reason:'CHATGPT_CONVERSATION_IDENTITY_DRIFT'}; const button=document.querySelector('[data-testid="send-button"]') || [...document.querySelectorAll('button')].find(b => /send/i.test((b.getAttribute('aria-label')||b.textContent||''))); return {ready:Boolean(button && !button.disabled)}; })()`,
+        `(() => { const expectedUrl=${expectedUrl}; if(expectedUrl && location.href !== expectedUrl) return {ready:false,reason:'CHATGPT_CONVERSATION_IDENTITY_DRIFT'}; const button=document.querySelector('[data-testid="send-button"]') || [...document.querySelectorAll('button')].find(b => /send/i.test((b.getAttribute('aria-label')||b.textContent||''))); if(!button || button.disabled) return {ready:false}; const rect=button.getBoundingClientRect(); const style=getComputedStyle(button); if(rect.width <= 0 || rect.height <= 0 || style.display === 'none' || style.visibility === 'hidden') return {ready:false}; return {ready:true,x:rect.left + rect.width / 2,y:rect.top + rect.height / 2}; })()`,
       );
       if (readiness?.reason) throw new Error(readiness.reason);
-      if (readiness?.ready) {
-        sendReady = true;
+      if (
+        readiness?.ready &&
+        typeof readiness.x === "number" &&
+        Number.isFinite(readiness.x) &&
+        typeof readiness.y === "number" &&
+        Number.isFinite(readiness.y)
+      ) {
+        sendPoint = { x: readiness.x, y: readiness.y };
         break;
       }
       await new Promise((resolvePromise) => setTimeout(resolvePromise, 50));
     }
-    if (!sendReady) throw new Error("send_button_missing_or_disabled");
+    if (!sendPoint) throw new Error("send_button_missing_or_disabled");
 
-    const sent = await this.evaluate<{ ok: boolean; reason?: string }>(
-      target,
-      `(() => { const expectedUrl=${expectedUrl}; if(expectedUrl && location.href !== expectedUrl) return {ok:false,reason:'CHATGPT_CONVERSATION_IDENTITY_DRIFT'}; const button=document.querySelector('[data-testid="send-button"]') || [...document.querySelectorAll('button')].find(b => /send/i.test((b.getAttribute('aria-label')||b.textContent||''))); if(!button || button.disabled) return {ok:false,reason:'send_button_missing_or_disabled'}; button.click(); return {ok:true}; })()`,
-    );
-    if (!sent?.ok) {
-      throw new Error(sent?.reason ?? "ChatGPT prompt delivery failed");
-    }
+    await this.pageCommand(target, "Input.dispatchMouseEvent", {
+      type: "mousePressed",
+      x: sendPoint.x,
+      y: sendPoint.y,
+      button: "left",
+      clickCount: 1,
+    });
+    await this.pageCommand(target, "Input.dispatchMouseEvent", {
+      type: "mouseReleased",
+      x: sendPoint.x,
+      y: sendPoint.y,
+      button: "left",
+      clickCount: 1,
+    });
     if (Date.now() > Date.parse(deadlineAt)) {
       throw new Error("prompt delivery exceeded deadline");
     }

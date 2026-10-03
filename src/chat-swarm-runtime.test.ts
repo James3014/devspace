@@ -214,7 +214,7 @@ test("CDP prompt delivery uses exact-target Input commands for visible editable 
   (driver as any).evaluate = async (_target: unknown, candidate: string) => {
     expressions.push(candidate);
     if (candidate.includes("const editable=")) return { ok: true, kind: "editable" };
-    if (candidate.includes("return {ready:Boolean")) return { ready: true };
+    if (candidate.includes("const button=")) return { ready: true, x: 320, y: 48 };
     return { ok: true };
   };
   (driver as any).pageCommand = async (
@@ -242,21 +242,31 @@ test("CDP prompt delivery uses exact-target Input commands for visible editable 
     { method: "Input.dispatchKeyEvent", params: { type: "keyDown", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8 } },
     { method: "Input.dispatchKeyEvent", params: { type: "keyUp", key: "Backspace", code: "Backspace", windowsVirtualKeyCode: 8 } },
     { method: "Input.insertText", params: { text: "probe" } },
+    { method: "Input.dispatchMouseEvent", params: { type: "mousePressed", x: 320, y: 48, button: "left", clickCount: 1 } },
+    { method: "Input.dispatchMouseEvent", params: { type: "mouseReleased", x: 320, y: 48, button: "left", clickCount: 1 } },
   ]);
-  assert.match(expressions.at(-1)!, /button\.click\(\)/);
+  assert.doesNotMatch(expressions.join("\n"), /button\.click\(\)/);
+  assert.match(expressions.at(-1)!, /getBoundingClientRect/);
 });
 
 test("CDP prompt delivery keeps textarea fallback on the DOM value/input path", async () => {
   const driver = cdpDriverForSelectorTest();
   const expressions: string[] = [];
-  let pageCommands = 0;
+  const commands: Array<{ method: string; params: Record<string, unknown> }> = [];
   (driver as any).evaluate = async (_target: unknown, candidate: string) => {
     expressions.push(candidate);
     if (candidate.includes("const editable=")) return { ok: true, kind: "textarea" };
-    if (candidate.includes("return {ready:Boolean")) return { ready: true };
+    if (candidate.includes("const button=")) return { ready: true, x: 160, y: 72 };
     return { ok: true };
   };
-  (driver as any).pageCommand = async () => { pageCommands += 1; };
+  (driver as any).pageCommand = async (
+    _target: unknown,
+    method: string,
+    params: Record<string, unknown>,
+  ) => {
+    commands.push({ method, params });
+    return {};
+  };
   await (driver as any).sendPromptToTarget(
     { id: "target-1", url: "https://chatgpt.com/" },
     "probe",
@@ -265,7 +275,11 @@ test("CDP prompt delivery keeps textarea fallback on the DOM value/input path", 
   assert.match(expressions[0]!, /HTMLTextAreaElement\.prototype/);
   assert.match(expressions[0]!, /setter\.call\(textarea,prompt\)/);
   assert.match(expressions[0]!, /textarea\.dispatchEvent\(new Event\('input'/);
-  assert.equal(pageCommands, 0);
+  assert.deepEqual(commands, [
+    { method: "Input.dispatchMouseEvent", params: { type: "mousePressed", x: 160, y: 72, button: "left", clickCount: 1 } },
+    { method: "Input.dispatchMouseEvent", params: { type: "mouseReleased", x: 160, y: 72, button: "left", clickCount: 1 } },
+  ]);
+  assert.doesNotMatch(expressions.join("\n"), /button\.click\(\)/);
 });
 
 test("CDP managed conversation waits for the initialization turn to become idle before exposing identity", async () => {
