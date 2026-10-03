@@ -924,7 +924,7 @@ test("nexus_gateway_recovery_materialize malformed output remains uncertain and 
   );
   assert.equal(
     NEXUS_GATEWAY_INTERPRETER,
-    join(homedir(), "Workspace", "Nexus-new", ".venv", "bin", "python"),
+    join(homedir(), "workspace", "Nexus-new", ".venv", "bin", "python"),
   );
   assert.doesNotMatch(
     NEXUS_GATEWAY_RECOVERY_MATERIALIZATION_BRIDGE_CODE,
@@ -944,11 +944,11 @@ test("nexus_gateway_recovery_materialize malformed output remains uncertain and 
 test("Nexus Gateway recovery trust roots track the current accepted #526 R2 lineage", () => {
   assert.equal(
     NEXUS_GATEWAY_ACCEPTED_MANAGER_SHA256,
-    "7f93a472870303d44f7c57b02362ac3f7599216576ce620334a847c4ce4a1e0c",
+    "8813426ee9acef45c2a5c126e356b3ad35949cd012bce5c3a27cede3832c7504",
   );
   assert.equal(
     NEXUS_GATEWAY_ACCEPTED_CONTRACT_SHA256,
-    "5dd680a914788bef36e5ed16a84558d43cdb2f337503e52c7d81258be4a862a0",
+    "909879c5719c153f2eb7eeecb5cc080de8824a949c8101b0301a4e6baa598867",
   );
 });
 
