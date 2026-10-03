@@ -3866,12 +3866,10 @@ function recordToStatusOutput(
   output.dispatcherHeartbeatAt = record.updatedAt;
   if (record.lifecycleState?.providerProcessState) {
     output.providerProcessState = record.lifecycleState.providerProcessState;
-  } else if (record.workerPid !== undefined) {
-    output.providerProcessState = record.status === "running" ? "running" : "not_running";
-  } else if (herdrHandle) {
-    output.providerProcessState = record.status === "running" ? "running" : "not_running";
   } else {
-    output.providerProcessState = record.status === "running" ? "running" : "unknown";
+    // Durable session status / heartbeat is not physical provider-process evidence.
+    // Without a positive runtime probe, remain unknown rather than fabricating running.
+    output.providerProcessState = "unknown";
   }
 
   // P2-H: Operation timeline
@@ -3880,7 +3878,6 @@ function recordToStatusOutput(
   } else {
     output.operationTimeline = {
       queuedAt: record.createdAt,
-      providerStartedAt: record.createdAt,
       terminalAt: isTerminalStatus(record.status) ? record.updatedAt : undefined,
     };
   }
@@ -3888,15 +3885,17 @@ function recordToStatusOutput(
   // P2-A: Model attestation
   if (record.lifecycleState?.modelAttestation) {
     output.modelAttestation = record.lifecycleState.modelAttestation;
-  } else if (record.model) {
-    const requested = record.executionContract?.directSelection?.model ?? record.model;
+  } else if (record.model || record.executionContract?.directSelection?.model) {
+    const requested = record.executionContract?.directSelection?.model;
     const resolved = record.model;
+    // Requested/resolved model metadata is not physical provider attestation.
+    // Until a provider-observed identity is durably recorded, fail closed as unavailable.
     output.modelAttestation = {
       requestedModel: requested,
       resolvedModel: resolved,
-      observedModel: record.latestResponse ? record.model : null,
-      attestationSource: "provider_record",
-      attestationState: "MATCH",
+      observedModel: null,
+      attestationSource: "metadata_only",
+      attestationState: "ATTESTATION_UNAVAILABLE",
       attestedAt: record.updatedAt,
     };
   }
@@ -3905,13 +3904,45 @@ function recordToStatusOutput(
   if (record.lifecycleState?.dispatchFailure) {
     output.dispatchFailure = record.lifecycleState.dispatchFailure;
   } else if (record.status === "error") {
-    const isQuota = record.errorCode === "PROVIDER_CAPACITY_ERROR" ||
-      /quota|capacity|rate limit|429/i.test(String(record.error ?? ""));
+    const message = String(record.error ?? "");
+    const code = String(record.errorCode ?? "");
     const hasEffect = (record.lifecycleState?.cumulativeChangedPaths?.length ?? 0) > 0;
+    let failureClass: DispatchFailureClassification["failureClass"] = "UNKNOWN";
+
+    if (code === "DISPATCH_CONTRACT_REJECTED") {
+      failureClass = "DISPATCH_CONTRACT_REJECTED";
+    } else if (code === "WORKTREE_LEASE_CONFLICT" || /writer lease|lease conflict/i.test(message)) {
+      failureClass = "WORKTREE_LEASE_CONFLICT";
+    } else if (code === "DUPLICATE_EFFECT_SUPPRESSED" || /duplicate effect suppressed/i.test(message)) {
+      failureClass = "DUPLICATE_EFFECT_SUPPRESSED";
+    } else if (code === "RECONCILIATION_REQUIRED" || /outcome[_ -]?unknown|lost ack/i.test(message)) {
+      failureClass = hasEffect ? "EFFECT_OUTCOME_UNKNOWN" : "TRANSPORT_LOST_ACK";
+    } else if (code === "PROVIDER_CAPACITY_ERROR" || /quota|capacity|rate limit|429/i.test(message)) {
+      failureClass = hasEffect
+        ? "PROVIDER_QUOTA_EXHAUSTED_AFTER_EFFECT"
+        : "PROVIDER_QUOTA_EXHAUSTED_PRE_EFFECT";
+    } else if (/auth|unauthori[sz]ed|forbidden|401|403/i.test(message)) {
+      failureClass = "PROVIDER_AUTH_ERROR";
+    } else if (/startup|failed to start|spawn|launch failed/i.test(message)) {
+      failureClass = "PROVIDER_STARTUP_FAILED";
+    } else if (/scope|permission|outside write|denied/i.test(message)) {
+      failureClass = "SCOPE_OR_PERMISSION_ERROR";
+    } else if (/verifier|verification failed/i.test(message)) {
+      failureClass = "VERIFIER_FAILED";
+    } else if (/coordinator interrupted|controller interrupted/i.test(message)) {
+      failureClass = "COORDINATOR_INTERRUPTED";
+    } else if (/status projection stale|projection stale/i.test(message)) {
+      failureClass = "CLIENT_STATUS_PROJECTION_STALE";
+    } else if (/provider.*running/i.test(message)) {
+      failureClass = "PROVIDER_RUNNING";
+    } else if (code.startsWith("PROVIDER_") || /provider/i.test(message)) {
+      failureClass = "PROVIDER_EXECUTION_FAILED";
+    } else if (code.startsWith("INTERNAL_") || /internal control plane/i.test(message)) {
+      failureClass = "INTERNAL_CONTROL_PLANE_ERROR";
+    }
+
     output.dispatchFailure = {
-      failureClass: isQuota
-        ? (hasEffect ? "PROVIDER_QUOTA_EXHAUSTED_AFTER_EFFECT" : "PROVIDER_QUOTA_EXHAUSTED_PRE_EFFECT")
-        : "PROVIDER_ERROR",
+      failureClass,
       providerEffect: hasEffect,
       reason: record.error,
       classifiedAt: record.updatedAt,

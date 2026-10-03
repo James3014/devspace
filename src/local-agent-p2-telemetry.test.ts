@@ -162,7 +162,7 @@ test("P2-F: DISPATCH_CONTRACT_REJECTED raised when mutating role lacks toolProje
   }
 });
 
-test("P2-A: Model attestation is present in agent status", async () => {
+test("P2-A: requested/resolved metadata is not fabricated as physical model attestation", async () => {
   const { projectRoot, manager, cleanup } = setupEnv();
   try {
     const started = await manager.startAgent({
@@ -190,6 +190,9 @@ test("P2-A: Model attestation is present in agent status", async () => {
     assert.ok(status.modelAttestation);
     assert.equal(status.modelAttestation.requestedModel, "claude-opus-4-6");
     assert.equal(status.modelAttestation.resolvedModel, "claude-opus-4-6");
+    assert.equal(status.modelAttestation.observedModel, null);
+    assert.equal(status.modelAttestation.attestationSource, "metadata_only");
+    assert.equal(status.modelAttestation.attestationState, "ATTESTATION_UNAVAILABLE");
   } finally {
     cleanup();
   }
@@ -214,9 +217,10 @@ test("P2-D: Dispatcher heartbeat is separated from providerProcessState and time
     });
 
     assert.ok(status.dispatcherHeartbeatAt, "dispatcherHeartbeatAt must be populated");
-    assert.ok(status.providerProcessState, "providerProcessState must be populated");
+    assert.equal(status.providerProcessState, "unknown", "heartbeat/status must not fabricate physical provider liveness");
     assert.ok(status.operationTimeline, "operationTimeline must be populated");
     assert.ok(status.operationTimeline.queuedAt, "queuedAt must be populated");
+    assert.equal(status.operationTimeline.providerStartedAt, undefined, "createdAt is not provider-start evidence");
   } finally {
     cleanup();
   }
@@ -268,6 +272,57 @@ test("P2-E: Quota exhaustion failure classification distinguishes pre-effect fro
     assert.ok(status.dispatchFailure);
     assert.equal(status.dispatchFailure.failureClass, "PROVIDER_QUOTA_EXHAUSTED_AFTER_EFFECT");
     assert.equal(status.dispatchFailure.providerEffect, true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("P2-E2: failure taxonomy preserves distinct control-plane/provider states", async () => {
+  const { projectRoot, manager, cleanup } = setupEnv();
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws_p2_taxonomy",
+      workspaceRoot: projectRoot,
+      profileName: "reviewer",
+      prompt: "taxonomy check",
+      profiles: mockProfiles,
+      attemptKey: "att-taxonomy-check",
+    });
+    const store = (manager as any).store as LocalAgentStore;
+    const sqlite = (store as any).database.sqlite;
+
+    const cases = [
+      ["WORKTREE_LEASE_CONFLICT", "writer lease conflict", false, "WORKTREE_LEASE_CONFLICT"],
+      ["DUPLICATE_EFFECT_SUPPRESSED", "duplicate effect suppressed", false, "DUPLICATE_EFFECT_SUPPRESSED"],
+      ["RECONCILIATION_REQUIRED", "transport lost ack", false, "TRANSPORT_LOST_ACK"],
+      ["RECONCILIATION_REQUIRED", "outcome unknown after write", true, "EFFECT_OUTCOME_UNKNOWN"],
+      ["PROVIDER_AUTH_FAILURE", "401 Unauthorized provider auth", false, "PROVIDER_AUTH_ERROR"],
+      ["PROVIDER_START_FAILURE", "provider launch failed", false, "PROVIDER_STARTUP_FAILED"],
+      ["SCOPE_VIOLATION", "scope permission denied", false, "SCOPE_OR_PERMISSION_ERROR"],
+      ["VERIFIER_ERROR", "verifier failed", false, "VERIFIER_FAILED"],
+      ["CONTROL_INTERRUPTED", "coordinator interrupted", false, "COORDINATOR_INTERRUPTED"],
+      ["STATUS_STALE", "status projection stale", false, "CLIENT_STATUS_PROJECTION_STALE"],
+      ["PROVIDER_BUSY", "provider still running", false, "PROVIDER_RUNNING"],
+      ["PROVIDER_PROTOCOL_ERROR", "provider execution protocol failed", false, "PROVIDER_EXECUTION_FAILED"],
+      ["INTERNAL_STATE_ERROR", "internal control plane state error", false, "INTERNAL_CONTROL_PLANE_ERROR"],
+    ] as const;
+
+    for (const [errorCode, error, hasEffect, expectedClass] of cases) {
+      const lifecycle = JSON.stringify({
+        cumulativeChangedPaths: hasEffect ? ["src/partial.ts"] : [],
+      });
+      sqlite.prepare(
+        "update local_agent_sessions set status='error', error_code=?, error=?, lifecycle_state=? where id=?",
+      ).run(errorCode, error, lifecycle, started.agentId);
+      const status = await manager.getAgentStatus({
+        workspaceId: "ws_p2_taxonomy",
+        workspaceRoot: projectRoot,
+        agentId: started.agentId,
+      });
+      assert.ok(status.dispatchFailure, expectedClass);
+      assert.equal(status.dispatchFailure.failureClass, expectedClass);
+      assert.equal(status.dispatchFailure.providerEffect, hasEffect);
+    }
   } finally {
     cleanup();
   }
