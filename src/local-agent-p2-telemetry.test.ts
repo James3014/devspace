@@ -9,7 +9,6 @@ import {
   LocalAgentSessionManager,
   AgentSessionError,
   computeModelAttestation,
-  probeProcessRunning,
 } from "./local-agent-sessions.js";
 import { buildLocalEffectEnforcementReceipt } from "./local-effect-enforcement.js";
 import type { ExecutionContract } from "./local-agent-contract.js";
@@ -588,23 +587,21 @@ test("P2 follow-up (Item H): stream activity and first effect update activeTurn 
   }
 });
 
-test("P2 follow-up (Item D): providerProcessState probes live workerPid and dispatcherHeartbeatAt remains separated", async () => {
+test("P2 follow-up (Item D/H): supervisor writes heartbeat/effect evidence without treating workerPid as providerPid", async () => {
   const { projectRoot, manager, cleanup } = setupEnv();
   try {
     const store = (manager as any).store as LocalAgentStore;
-
-    // 1. Positive live process probe (using our own running node process pid)
-    assert.equal(probeProcessRunning(process.pid), "running");
-    // Non-existent PID probe
-    assert.equal(probeProcessRunning(9999999), "not_running");
-
     const started = await manager.startAgent({
       workspaceId: "ws_p2_proc",
       workspaceRoot: projectRoot,
-      profileName: "reviewer",
-      prompt: "proc probe test",
+      profileName: "direct-opus",
+      prompt: "proc/effect evidence test",
       profiles: mockProfiles,
       attemptKey: "att-proc-probe-test",
+      executionContract: {
+        writePaths: ["README.md"],
+        maxFiles: 1,
+      },
     });
 
     const current = store.getById(started.agentId)!;
@@ -620,26 +617,34 @@ test("P2 follow-up (Item D): providerProcessState probes live workerPid and disp
       workspaceRoot: projectRoot,
       agentId: started.agentId,
     });
-    assert.equal(status.providerProcessState, "running");
+    assert.equal(
+      status.providerProcessState,
+      "unknown",
+      "DevSpace workerPid is not positive evidence of the provider process",
+    );
     assert.equal(status.dispatcherHeartbeatAt, undefined);
 
-    // Dispatcher heartbeat touches dispatcherHeartbeatAt independently
-    store.touchDispatcherHeartbeatCAS(started.agentId);
+    writeFileSync(join(projectRoot, "README.md"), "# P2 Telemetry Test\nprovider effect\n");
+    await manager.superviseActiveAgents();
+
     status = await manager.getAgentStatus({
       workspaceId: "ws_p2_proc",
       workspaceRoot: projectRoot,
       agentId: started.agentId,
     });
-    assert.ok(status.dispatcherHeartbeatAt, "dispatcherHeartbeatAt must be set");
-    assert.equal(status.providerProcessState, "running", "heartbeat does not override process probe");
+    assert.ok(status.dispatcherHeartbeatAt, "supervision must write a real dispatcher heartbeat");
+    assert.ok(status.operationTimeline?.firstEffectAt, "physical source delta must write firstEffectAt");
+    assert.equal(
+      status.providerProcessState,
+      "unknown",
+      "heartbeat/source evidence must not fabricate provider process liveness",
+    );
 
-    // Settle turn: worker is stopped
     store.finishTurnCAS({
       agentId: started.agentId,
       generation,
       workerToken,
       status: "idle",
-      providerProcessState: "not_running",
     });
 
     status = await manager.getAgentStatus({
@@ -647,7 +652,7 @@ test("P2 follow-up (Item D): providerProcessState probes live workerPid and disp
       workspaceRoot: projectRoot,
       agentId: started.agentId,
     });
-    assert.equal(status.providerProcessState, "not_running");
+    assert.equal(status.providerProcessState, "unknown");
   } finally {
     cleanup();
   }
