@@ -213,6 +213,10 @@ export async function runOmpAcpLocalAgent(
     windowsHide: true,
   });
   assertPipedChild(child);
+  await callbacks?.onProviderProcessState?.("running");
+  child.once("exit", () => {
+    void callbacks?.onProviderProcessState?.("not_running");
+  });
 
   let stderr = "";
   child.stderr.on("data", (chunk: Buffer) => {
@@ -243,6 +247,7 @@ export async function runOmpAcpLocalAgent(
         const notification = context.params;
         if (activeSessionId && notification.sessionId !== activeSessionId) return;
         void callbacks?.onActivity?.();
+        void callbacks?.onStreamActivity?.();
         items.push(notification);
         const update = notification.update;
         if (update.sessionUpdate !== "agent_message_chunk") return;

@@ -513,6 +513,7 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
     });
 
     assertPipedChild(child);
+    await callbacks?.onProviderProcessState?.("running");
 
     const stdoutCapture = new BoundedUtf8Capture(AGY_MAX_STDOUT_BYTES);
     const stderrCapture = new BoundedUtf8Capture(AGY_MAX_STDERR_BYTES);
@@ -523,18 +524,24 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
     // worker. Throttled because every touch persists to the session store.
     const notifyActivity = bestEffortActivityNotifier(callbacks?.onActivity);
     const activityTouch = createThrottledActivityTouch(notifyActivity);
+    const streamActivityTouch = createThrottledActivityTouch(() => {
+      void callbacks?.onStreamActivity?.();
+    });
 
     child.stdout.on("data", (chunk: Buffer) => {
       stdoutCapture.append(chunk);
       activityTouch.touch();
+      streamActivityTouch.touch();
     });
     child.stderr.on("data", (chunk: Buffer) => {
       stderrCapture.append(chunk);
       activityTouch.touch();
+      streamActivityTouch.touch();
     });
 
     const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
       child.on("exit", (code, signal) => {
+        void callbacks?.onProviderProcessState?.("not_running");
         resolve({ code, signal });
       });
     });
@@ -664,11 +671,21 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
       stderr: stderrCapture.metadata(),
     } : undefined;
 
+    const observedModel = typeof parsed.model === "string"
+      ? parsed.model
+      : typeof parsed.observed_model === "string"
+        ? parsed.observed_model
+        : typeof parsed.resolved_model === "string"
+          ? parsed.resolved_model
+          : undefined;
+
     return {
       provider: this.provider,
       providerSessionId: conversation_id,
       finalResponse: response.trim(),
       items: outputMetadata ? [parsed, outputMetadata] : [parsed],
+      observedModel,
+      attestationSource: observedModel ? "agy_json_output" : undefined,
     };
   }
 }

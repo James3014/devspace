@@ -80,7 +80,10 @@ export class PiSessionRuntime implements LocalAgentRuntime {
           });
         }
         await callbacks?.onSessionId?.(this.session.sessionId);
-        this.activityCallback = callbacks?.onActivity;
+        this.activityCallback = () => {
+          void callbacks?.onActivity?.();
+          void callbacks?.onStreamActivity?.();
+        };
         await this.applyOverrides(input);
         this.events = [];
         const messageStart = this.session.messages.length;

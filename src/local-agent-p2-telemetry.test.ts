@@ -8,6 +8,7 @@ import { LocalAgentStore } from "./local-agent-store.js";
 import {
   LocalAgentSessionManager,
   AgentSessionError,
+  computeModelAttestation,
 } from "./local-agent-sessions.js";
 import { buildLocalEffectEnforcementReceipt } from "./local-effect-enforcement.js";
 import type { ExecutionContract } from "./local-agent-contract.js";
@@ -421,6 +422,317 @@ test("P2-G: Effect policy enforcement status accurately distinguishes request_on
     assert.equal(status.effectPolicyStatus.process, "enforced");
     assert.equal(status.effectPolicyStatus.network, "enforced");
     assert.equal(status.effectPolicyStatus.git, "enforced");
+  } finally {
+    cleanup();
+  }
+});
+
+test("P2 follow-up (Item A): model attestation asserts MODEL_ATTESTATION_MISMATCH when observed differs from requested", async () => {
+  const { projectRoot, manager, cleanup } = setupEnv();
+  try {
+    // 1. Pure function tests
+    const mismatch = computeModelAttestation({
+      requestedModel: "claude-opus-4-6",
+      resolvedModel: "claude-opus-4-6",
+      observedModel: "gemini-3.8-flash",
+      attestationSource: "agy_json_output",
+      attestedAt: "2026-10-05T00:00:00.000Z",
+    });
+    assert.equal(mismatch.attestationState, "MODEL_ATTESTATION_MISMATCH");
+    assert.equal(mismatch.observedModel, "gemini-3.8-flash");
+    assert.equal(mismatch.requestedModel, "claude-opus-4-6");
+    assert.equal(mismatch.attestationSource, "agy_json_output");
+
+    const match = computeModelAttestation({
+      requestedModel: "claude-opus-4-6",
+      resolvedModel: "claude-opus-4-6",
+      observedModel: "claude-opus-4-6",
+      attestationSource: "claude_stream",
+    });
+    assert.equal(match.attestationState, "MATCH");
+    assert.equal(match.observedModel, "claude-opus-4-6");
+
+    const unavailable = computeModelAttestation({
+      requestedModel: "claude-opus-4-6",
+      resolvedModel: "claude-opus-4-6",
+      observedModel: null,
+    });
+    assert.equal(unavailable.attestationState, "ATTESTATION_UNAVAILABLE");
+
+    // 2. Integration via store finishTurnCAS
+    const store = (manager as any).store as LocalAgentStore;
+    const started = await manager.startAgent({
+      workspaceId: "ws_p2_attest",
+      workspaceRoot: projectRoot,
+      profileName: "direct-opus",
+      prompt: "attestation test",
+      profiles: mockProfiles,
+      attemptKey: "att-attest-test",
+    });
+
+    const current = store.getById(started.agentId)!;
+    const generation = current.lifecycleState?.activeTurn?.generation;
+    assert.ok(generation);
+    const workerToken = "tok-attest";
+    store.prepareWorkerCAS(started.agentId, generation, workerToken);
+    store.claimWorkerCAS(started.agentId, generation, workerToken, 99999);
+    store.markExecutionStarted(started.agentId, workerToken);
+    store.finishTurnCAS({
+      agentId: started.agentId,
+      generation,
+      workerToken,
+      status: "idle",
+      modelAttestation: mismatch,
+      providerProcessState: "not_running",
+    });
+
+    const status = await manager.getAgentStatus({
+      workspaceId: "ws_p2_attest",
+      workspaceRoot: projectRoot,
+      agentId: started.agentId,
+    });
+
+    assert.ok(status.modelAttestation);
+    assert.equal(status.modelAttestation.attestationState, "MODEL_ATTESTATION_MISMATCH");
+    assert.equal(status.modelAttestation.observedModel, "gemini-3.8-flash");
+    assert.equal(status.modelAttestation.requestedModel, "claude-opus-4-6");
+    assert.equal(status.modelAttestation.attestationSource, "agy_json_output");
+  } finally {
+    cleanup();
+  }
+});
+
+test("P2 follow-up (Item H): stream activity and first effect update activeTurn and persist to operationTimeline", async () => {
+  const { projectRoot, manager, cleanup } = setupEnv();
+  try {
+    const store = (manager as any).store as LocalAgentStore;
+    const started = await manager.startAgent({
+      workspaceId: "ws_p2_stream",
+      workspaceRoot: projectRoot,
+      profileName: "reviewer",
+      prompt: "stream timeline test",
+      profiles: mockProfiles,
+      attemptKey: "att-stream-timeline-test",
+    });
+
+    // Before execution started
+    let rec = store.getById(started.agentId)!;
+    assert.ok(rec.lifecycleState?.operationTimeline?.queuedAt);
+    assert.equal(rec.lifecycleState?.operationTimeline?.providerStartedAt, undefined);
+
+    const generation = rec.lifecycleState?.activeTurn?.generation;
+    assert.ok(generation);
+    const workerToken = "tok-stream";
+    store.prepareWorkerCAS(started.agentId, generation, workerToken);
+    store.claimWorkerCAS(started.agentId, generation, workerToken, process.pid);
+
+    // Provider started
+    store.markExecutionStarted(started.agentId, workerToken);
+    rec = store.getById(started.agentId)!;
+    assert.ok(rec.lifecycleState?.operationTimeline?.providerStartedAt);
+    const startedAt = rec.lifecycleState!.operationTimeline!.providerStartedAt;
+
+    // Stream activity
+    store.touchStreamActivityCAS(started.agentId, generation, workerToken);
+    rec = store.getById(started.agentId)!;
+    assert.ok(rec.lifecycleState?.operationTimeline?.firstStreamActivityAt);
+    assert.ok(rec.lifecycleState?.activeTurn?.providerStreamLastActivityAt);
+    const streamAt = rec.lifecycleState!.operationTimeline!.firstStreamActivityAt;
+
+    // Subsequent stream activity touches lastActivityAt without overriding firstStreamActivityAt
+    store.touchStreamActivityCAS(started.agentId, generation, workerToken);
+    rec = store.getById(started.agentId)!;
+    assert.equal(rec.lifecycleState!.operationTimeline!.firstStreamActivityAt, streamAt);
+
+    // First effect
+    store.recordFirstEffectCAS(started.agentId, generation, workerToken);
+    rec = store.getById(started.agentId)!;
+    assert.ok(rec.lifecycleState?.operationTimeline?.firstEffectAt);
+    assert.ok(rec.lifecycleState?.activeTurn?.firstEffectAt);
+    const effectAt = rec.lifecycleState!.operationTimeline!.firstEffectAt;
+
+    // Subsequent effect calls do not overwrite firstEffectAt
+    store.recordFirstEffectCAS(started.agentId, generation, workerToken);
+    rec = store.getById(started.agentId)!;
+    assert.equal(rec.lifecycleState!.operationTimeline!.firstEffectAt, effectAt);
+
+    // Reconciled
+    store.recordReconciledAtCAS(started.agentId);
+    rec = store.getById(started.agentId)!;
+    assert.ok(rec.lifecycleState?.operationTimeline?.reconciledAt);
+
+    // Terminal finish
+    store.finishTurnCAS({
+      agentId: started.agentId,
+      generation,
+      workerToken,
+      status: "idle",
+      providerProcessState: "not_running",
+    });
+
+    const status = await manager.getAgentStatus({
+      workspaceId: "ws_p2_stream",
+      workspaceRoot: projectRoot,
+      agentId: started.agentId,
+    });
+
+    assert.ok(status.operationTimeline);
+    assert.equal(status.operationTimeline.providerStartedAt, startedAt);
+    assert.equal(status.operationTimeline.firstStreamActivityAt, streamAt);
+    assert.equal(status.operationTimeline.firstEffectAt, effectAt);
+    assert.ok(status.operationTimeline.reconciledAt);
+    assert.ok(status.operationTimeline.terminalAt);
+  } finally {
+    cleanup();
+  }
+});
+
+test("P2 follow-up (Item D/H): supervisor writes heartbeat/effect evidence without treating workerPid as providerPid", async () => {
+  const { projectRoot, manager, cleanup } = setupEnv();
+  try {
+    const store = (manager as any).store as LocalAgentStore;
+    const started = await manager.startAgent({
+      workspaceId: "ws_p2_proc",
+      workspaceRoot: projectRoot,
+      profileName: "direct-opus",
+      prompt: "proc/effect evidence test",
+      profiles: mockProfiles,
+      attemptKey: "att-proc-probe-test",
+      executionContract: {
+        writePaths: ["README.md"],
+        maxFiles: 1,
+      },
+    });
+
+    const current = store.getById(started.agentId)!;
+    const generation = current.lifecycleState?.activeTurn?.generation;
+    assert.ok(generation);
+    const workerToken = "tok-proc";
+    store.prepareWorkerCAS(started.agentId, generation, workerToken);
+    store.claimWorkerCAS(started.agentId, generation, workerToken, process.pid);
+    store.markExecutionStarted(started.agentId, workerToken);
+    const baselineHead = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: projectRoot,
+      encoding: "utf8",
+    }).trim();
+    store.updateTurnEvidenceCAS(started.agentId, generation, workerToken, {
+      scopeBaseline: {
+        changedPaths: [],
+        head: baselineHead,
+        fingerprints: {},
+      },
+    });
+
+    let status = await manager.getAgentStatus({
+      workspaceId: "ws_p2_proc",
+      workspaceRoot: projectRoot,
+      agentId: started.agentId,
+    });
+    assert.equal(
+      status.providerProcessState,
+      "unknown",
+      "DevSpace workerPid is not positive evidence of the provider process",
+    );
+    assert.equal(status.dispatcherHeartbeatAt, undefined);
+
+    writeFileSync(join(projectRoot, "README.md"), "# P2 Telemetry Test\nprovider effect\n");
+    await manager.superviseActiveAgents();
+
+    status = await manager.getAgentStatus({
+      workspaceId: "ws_p2_proc",
+      workspaceRoot: projectRoot,
+      agentId: started.agentId,
+    });
+    assert.ok(status.dispatcherHeartbeatAt, "supervision must write a real dispatcher heartbeat");
+    assert.ok(status.operationTimeline?.firstEffectAt, "physical source delta must write firstEffectAt");
+    assert.equal(
+      status.providerProcessState,
+      "unknown",
+      "heartbeat/source evidence must not fabricate provider process liveness",
+    );
+
+    store.finishTurnCAS({
+      agentId: started.agentId,
+      generation,
+      workerToken,
+      status: "idle",
+    });
+
+    status = await manager.getAgentStatus({
+      workspaceId: "ws_p2_proc",
+      workspaceRoot: projectRoot,
+      agentId: started.agentId,
+    });
+    assert.equal(status.providerProcessState, "unknown");
+  } finally {
+    cleanup();
+  }
+});
+
+test("P2 follow-up (Item E): durable dispatchFailure is persisted into database record at settlement", async () => {
+  const { projectRoot, manager, cleanup } = setupEnv();
+  try {
+    const store = (manager as any).store as LocalAgentStore;
+    const started = await manager.startAgent({
+      workspaceId: "ws_p2_fail",
+      workspaceRoot: projectRoot,
+      profileName: "reviewer",
+      prompt: "fail check",
+      profiles: mockProfiles,
+      attemptKey: "att-fail-persist-check",
+    });
+
+    const current = store.getById(started.agentId)!;
+    const generation = current.lifecycleState?.activeTurn?.generation;
+    assert.ok(generation);
+    const workerToken = "tok-fail";
+    store.prepareWorkerCAS(started.agentId, generation, workerToken);
+    store.claimWorkerCAS(started.agentId, generation, workerToken, 99999);
+    store.markExecutionStarted(started.agentId, workerToken);
+
+    const dispatchFailure = {
+      failureCode: "PROVIDER_CAPACITY_ERROR",
+      failureClass: "PROVIDER_QUOTA_EXHAUSTED_AFTER_EFFECT" as const,
+      retryable: false,
+      providerEffect: true,
+      phase: "execution" as const,
+      detail: "Daily quota exhausted after modifying code",
+      classifiedAt: new Date().toISOString(),
+    };
+
+    store.failTurnCAS({
+      agentId: started.agentId,
+      generation,
+      workerToken,
+      error: "Daily quota exhausted after modifying code",
+      errorCode: "PROVIDER_CAPACITY_ERROR",
+      errorRetryable: false,
+      dispatchFailure,
+      providerProcessState: "not_running",
+    });
+
+    // 1. Verify on LocalAgentRecord
+    const record = store.getById(started.agentId)!;
+    assert.ok(record.lifecycleState?.dispatchFailure);
+    assert.deepEqual(record.lifecycleState.dispatchFailure, dispatchFailure);
+
+    // 2. Verify in raw SQLite database row
+    const row = (store as any).database.sqlite.prepare(
+      "select lifecycle_state from local_agent_sessions where id=?"
+    ).get(started.agentId) as { lifecycle_state: string };
+    const parsed = JSON.parse(row.lifecycle_state);
+    assert.ok(parsed.dispatchFailure);
+    assert.equal(parsed.dispatchFailure.failureClass, "PROVIDER_QUOTA_EXHAUSTED_AFTER_EFFECT");
+    assert.equal(parsed.dispatchFailure.providerEffect, true);
+
+    // 3. Verify in getAgentStatus
+    const status = await manager.getAgentStatus({
+      workspaceId: "ws_p2_fail",
+      workspaceRoot: projectRoot,
+      agentId: started.agentId,
+    });
+    assert.ok(status.dispatchFailure);
+    assert.deepEqual(status.dispatchFailure, dispatchFailure);
   } finally {
     cleanup();
   }

@@ -45,6 +45,12 @@ export interface LocalAgentRunResult {
   items: unknown[];
   /** Derived evidence of the provider-native effect controls constructed for this turn. */
   effectEnforcementReceipt?: LocalEffectEnforcementReceipt;
+  /** P2-A: Observed model identity reported by provider adapter or runtime. */
+  observedModel?: string | null;
+  /** P2-A: Source or mechanism of attestation (e.g. "provider_reported", "metadata_only"). */
+  attestationSource?: string;
+  /** P2-A: Timestamp when model identity was attested. */
+  attestedAt?: string;
 }
 
 export interface LocalAgentRunCallbacks {
@@ -61,6 +67,18 @@ export interface LocalAgentRunCallbacks {
   onExecutionStarted?: () => void | Promise<void>;
   /** Called for each trustworthy provider/runtime event during execution. */
   onActivity?: () => void | Promise<void>;
+  /** P2-H: Called when provider stream emits output/chunk/event. */
+  onStreamActivity?: (timestamp?: string) => void | Promise<void>;
+  /** P2-H: Called when provider side-effect is detected. */
+  onEffect?: (timestamp?: string) => void | Promise<void>;
+  /** P2-A: Called when provider reports or updates observed model identity during turn execution. */
+  onModelAttestation?: (attestation: {
+    observedModel: string | null;
+    attestationSource?: string;
+    attestedAt?: string;
+  }) => void | Promise<void>;
+  /** P2-D: Called only from provider/runtime surfaces with positive process evidence. */
+  onProviderProcessState?: (state: "running" | "not_running" | "unknown") => void | Promise<void>;
 }
 
 export interface LocalAgentRuntimeContext {

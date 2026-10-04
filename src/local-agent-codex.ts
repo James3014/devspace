@@ -129,6 +129,7 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
             message: "Codex app-server is not running.",
           });
         }
+        await callbacks?.onProviderProcessState?.("running");
         const threadResponse = await this.rpc.request(
           input.providerSessionId ? "thread/resume" : "thread/start",
           threadParams(input),
@@ -146,7 +147,10 @@ export class CodexAppServerRuntime implements LocalAgentRuntime {
         }
 
         await callbacks?.onSessionId?.(threadId);
-        const completed = await this.rpc.runTurn(threadId, turnParams(input, threadId), callbacks?.onActivity);
+        const completed = await this.rpc.runTurn(threadId, turnParams(input, threadId), () => {
+          void callbacks?.onActivity?.();
+          void callbacks?.onStreamActivity?.();
+        });
         const parsed = parseCompletedTurn(completed.event.params, completed.items);
         if (parsed.failure) {
           throw new AgentProviderExecutionError({
