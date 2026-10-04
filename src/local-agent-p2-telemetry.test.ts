@@ -611,6 +611,17 @@ test("P2 follow-up (Item D/H): supervisor writes heartbeat/effect evidence witho
     store.prepareWorkerCAS(started.agentId, generation, workerToken);
     store.claimWorkerCAS(started.agentId, generation, workerToken, process.pid);
     store.markExecutionStarted(started.agentId, workerToken);
+    const baselineHead = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: projectRoot,
+      encoding: "utf8",
+    }).trim();
+    store.updateTurnEvidenceCAS(started.agentId, generation, workerToken, {
+      scopeBaseline: {
+        changedPaths: [],
+        head: baselineHead,
+        fingerprints: {},
+      },
+    });
 
     let status = await manager.getAgentStatus({
       workspaceId: "ws_p2_proc",
