@@ -828,7 +828,6 @@ export class LocalAgentSessionManager {
           terminalReason: "provider_error",
           scopeState: "UNKNOWN",
           dispatchFailure: failureClassification,
-          providerProcessState: "not_running",
         });
         return true;
       }
@@ -922,7 +921,6 @@ export class LocalAgentSessionManager {
       automatedVerifierResult,
       modelAttestation,
       dispatchFailure: failureClassification,
-      providerProcessState: "not_running",
     });
     if (!completed.applied) {
       const current = this.store.getById(record.id);
@@ -1644,7 +1642,6 @@ export class LocalAgentSessionManager {
               }
             : undefined,
           dispatchFailure: failureClassification,
-          providerProcessState: "not_running",
         });
         if (!failed.applied) {
           const current = this.store.getById(agentId);
@@ -3703,6 +3700,9 @@ export class LocalAgentSessionManager {
           });
           this.store.updateModelAttestationCAS(claimed.id, generation, workerToken, computed);
         },
+        onProviderProcessState: (state) => {
+          this.store.updateProviderProcessStateCAS(claimed.id, generation, workerToken, state);
+        },
         onSessionId: (providerSessionId) => {
           const bound = this.store.bindProviderSessionCAS(
             claimed.id,
@@ -3823,8 +3823,7 @@ export class LocalAgentSessionManager {
         automatedVerifierResult,
         modelAttestation,
         dispatchFailure: failureClassification,
-        providerProcessState: "not_running",
-      });
+        });
     } catch (error) {
       const originalMessage = error instanceof Error ? error.message : String(error);
       const message = redactSensitiveText(originalMessage);
@@ -3952,8 +3951,7 @@ export class LocalAgentSessionManager {
         automatedVerifierResult,
         modelAttestation,
         dispatchFailure: failureClassification,
-        providerProcessState: "not_running",
-      });
+        });
     } finally {
       cleanupOwnedPromptFile(promptFile);
       if (scratch) {
@@ -4627,21 +4625,6 @@ export function computeModelAttestation(params: {
   };
 }
 
-/**
- * P2-D: Probes whether a process is running on the host without fabricating liveness.
- */
-export function probeProcessRunning(pid: number): "running" | "not_running" | "unknown" {
-  try {
-    process.kill(pid, 0);
-    return "running";
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ESRCH") return "not_running";
-    if (code === "EPERM") return "running";
-    return "unknown";
-  }
-}
-
 /** Classifies a failed record from its structured errorCode only; never from free-form message text. */
 function classifyDispatchFailure(record: LocalAgentRecord): DispatchFailureClassification {
   const code = record.errorCode ?? "";
@@ -4773,17 +4756,9 @@ function recordToStatusOutput(
   if (record.lifecycleState?.dispatcherHeartbeatAt) {
     output.dispatcherHeartbeatAt = record.lifecycleState.dispatcherHeartbeatAt;
   }
-  if (record.workerPid !== null && record.workerPid !== undefined) {
-    output.providerProcessState = probeProcessRunning(record.workerPid);
-  } else if (record.lifecycleState?.providerProcessState) {
-    output.providerProcessState = record.lifecycleState.providerProcessState;
-  } else if (isTerminalStatus(record.status)) {
-    output.providerProcessState = "not_running";
-  } else {
-    // Durable session status / heartbeat is not physical provider-process evidence.
-    // Without a positive runtime probe, remain unknown rather than fabricating running.
-    output.providerProcessState = "unknown";
-  }
+  // workerPid identifies the DevSpace worker wrapper, not necessarily the provider
+  // process. Only provider/runtime callbacks may populate providerProcessState.
+  output.providerProcessState = record.lifecycleState?.providerProcessState ?? "unknown";
 
   // P2-H: Operation timeline. Only durably-recorded timestamps are reported;
   // unobserved phases stay absent instead of being estimated.
