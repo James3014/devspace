@@ -653,5 +653,3 @@ test("Issue #344 - Criteria 6: end-to-end dogfood flow (open/sync -> inspect -> 
   assert.equal(pushData.pushedSha, candidateHead);
   assert.equal(pushData.branch, "feat/dogfood-pr");
 });
-
-
