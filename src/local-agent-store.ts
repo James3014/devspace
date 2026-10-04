@@ -1587,7 +1587,7 @@ export class LocalAgentStore {
         operationTimeline: timeline,
         modelAttestation: input.modelAttestation ?? lifecycle.modelAttestation,
         dispatchFailure: input.dispatchFailure ?? lifecycle.dispatchFailure,
-        providerProcessState: input.providerProcessState ?? "not_running",
+        providerProcessState: input.providerProcessState ?? lifecycle.providerProcessState ?? "unknown",
       };
       const successfulTerminal = input.status === "idle" || input.status === "stopped";
       const errorCode = successfulTerminal ? null : input.errorCode ?? null;
@@ -2476,7 +2476,7 @@ export class LocalAgentStore {
         operationTimeline: timeline,
         modelAttestation: input.modelAttestation ?? lifecycle.modelAttestation,
         dispatchFailure: input.dispatchFailure ?? lifecycle.dispatchFailure,
-        providerProcessState: input.providerProcessState ?? "not_running",
+        providerProcessState: input.providerProcessState ?? lifecycle.providerProcessState ?? "unknown",
       };
       const errorCode = input.status === "idle" ? null : input.errorCode ?? null;
       const errorRetryable = input.status === "idle" ? null : input.errorRetryable === undefined ? null : String(input.errorRetryable);
@@ -2585,7 +2585,7 @@ export class LocalAgentStore {
           reason: error,
           classifiedAt: now,
         },
-        providerProcessState: "not_running",
+        providerProcessState: current.lifecycleState?.providerProcessState ?? "unknown",
       };
       const result = this.database.sqlite.prepare(
         `update local_agent_sessions set status = 'error', worker_pid = null, worker_token = null,
@@ -2766,7 +2766,7 @@ export class LocalAgentStore {
         cumulativeChangedPaths: input.cumulativeChangedPaths ?? current.lifecycleState?.cumulativeChangedPaths,
         turnEndBaseline: input.turnEndBaseline,
         operationTimeline: timeline,
-        providerProcessState: "not_running",
+        providerProcessState: current.lifecycleState?.providerProcessState ?? "unknown",
       };
       const result = this.database.sqlite.prepare(
         `update local_agent_sessions set worker_pid = null, worker_token = null,
