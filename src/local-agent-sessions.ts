@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { constants, mkdtempSync, unlinkSync, rmdirSync, writeFileSync } from "node:fs";
+import { closeSync, constants, fsyncSync, mkdirSync, mkdtempSync, openSync, readFileSync, renameSync, unlinkSync, rmdirSync, writeFileSync } from "node:fs";
 import { copyFile, cp, mkdtemp, readFile, readdir, realpath, rm } from "node:fs/promises";
 import { arch, homedir, hostname, platform, tmpdir } from "node:os";
 import { basename, dirname, join, resolve as resolvePath, sep } from "node:path";
@@ -1052,7 +1052,7 @@ export class LocalAgentSessionManager {
       if (existingBoundEffect.effectState !== "RUNNING") return existingBoundEffect;
       const inFlight = this.herdrVerifierTasks.get(`${record.id}:${boundEffectKey}`);
       if (inFlight) return inFlight;
-      return this.settleUnknownHerdrVerifier(record.id, generation, existingBoundEffect, existingBoundEffect);
+      return this.reconcileOrSettleHerdrVerifier(record.id, generation, existingBoundEffect);
     }
 
     // Older records may have persisted RUNNING before candidate binding existed.
@@ -1064,7 +1064,7 @@ export class LocalAgentSessionManager {
       && effect.effectState === "RUNNING",
     );
     if (unboundRunningEffect) {
-      return this.settleUnknownHerdrVerifier(record.id, generation, unboundRunningEffect, unboundRunningEffect);
+      return this.reconcileOrSettleHerdrVerifier(record.id, generation, unboundRunningEffect);
     }
     const physicalSnapshot = {
       head: physical.head ?? null,
@@ -1172,7 +1172,7 @@ export class LocalAgentSessionManager {
       if (existing.effectState !== "RUNNING") return existing;
       const inFlight = this.herdrVerifierTasks.get(taskKey);
       if (inFlight) return inFlight;
-      return this.settleUnknownHerdrVerifier(record.id, generation, identity, existing);
+      return this.reconcileOrSettleHerdrVerifier(record.id, generation, existing);
     }
 
     const unresolved = Object.values(ledger).find((effect) =>
@@ -1237,7 +1237,7 @@ export class LocalAgentSessionManager {
       const inFlight = this.herdrVerifierTasks.get(taskKey);
       if (durable?.effectKey === effectKey && inFlight) return inFlight;
       if (durable?.effectKey === effectKey && durable.effectState === "RUNNING") {
-        return this.settleUnknownHerdrVerifier(record.id, generation, identity, durable);
+        return this.reconcileOrSettleHerdrVerifier(record.id, generation, durable);
       }
       throw new AgentSessionError(
         "AGENT_LIFECYCLE_CORRUPT",
@@ -1249,7 +1249,7 @@ export class LocalAgentSessionManager {
       const inFlight = this.herdrVerifierTasks.get(taskKey);
       if (inFlight) return inFlight;
       if (durable.effectState !== "RUNNING") return durable;
-      return this.settleUnknownHerdrVerifier(record.id, generation, identity, durable);
+      return this.reconcileOrSettleHerdrVerifier(record.id, generation, durable);
     }
 
     this.persistHerdrVerifierResult(record, pending);
@@ -1298,6 +1298,16 @@ export class LocalAgentSessionManager {
         };
       }
 
+      // A restart between executable exit and the database CAS must reconcile
+      // the same completed effect from this fsynced receipt, never rerun it.
+      try {
+        this.writeHerdrVerifierReceipt(record.id, generation, effectKey, result);
+      } catch (error) {
+        return this.settleUnknownHerdrVerifier(record.id, generation, identity, {
+          ...pending,
+          reason: `Verifier ran but its durable receipt could not be written: ${error instanceof Error ? error.message : String(error)}`,
+        });
+      }
       const completed = this.store.finishExternalRuntimeVerifierCAS({
         agentId: record.id,
         generation,
@@ -1321,6 +1331,77 @@ export class LocalAgentSessionManager {
     } finally {
       if (this.herdrVerifierTasks.get(taskKey) === task) this.herdrVerifierTasks.delete(taskKey);
     }
+  }
+
+  private herdrVerifierReceiptPath(agentId: string, effectKey: string): { directory: string; path: string } {
+    const directory = join(this.config.stateDir, "herdr-verifier-receipts");
+    const name = createHash("sha256").update(JSON.stringify([agentId, effectKey])).digest("hex");
+    return { directory, path: join(directory, `${name}.json`) };
+  }
+
+  private writeHerdrVerifierReceipt(
+    agentId: string,
+    generation: string,
+    effectKey: string,
+    result: Record<string, unknown>,
+  ): void {
+    const { directory, path } = this.herdrVerifierReceiptPath(agentId, effectKey);
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const resultJson = JSON.stringify(result);
+    const receipt = JSON.stringify({
+      schema: "devspace.herdr_verifier_receipt.v1",
+      agentId,
+      generation,
+      effectKey,
+      result,
+      resultSha256: createHash("sha256").update(resultJson).digest("hex"),
+    });
+    const temporary = join(directory, `.${randomUUID()}.tmp`);
+    try {
+      writeFileSync(temporary, receipt, { flag: "wx", mode: 0o600 });
+      const file = openSync(temporary, "r");
+      try { fsyncSync(file); } finally { closeSync(file); }
+      renameSync(temporary, path);
+      const parent = openSync(directory, "r");
+      try { fsyncSync(parent); } finally { closeSync(parent); }
+    } finally {
+      try { unlinkSync(temporary); } catch { /* rename consumed the temporary file */ }
+    }
+  }
+
+  private reconcileOrSettleHerdrVerifier(
+    agentId: string,
+    generation: string,
+    pending: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const effectKey = String(pending.effectKey);
+    const { path } = this.herdrVerifierReceiptPath(agentId, effectKey);
+    let receipt: Record<string, unknown> | undefined;
+    try {
+      receipt = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    } catch { /* absent or malformed receipt leaves the effect unknown */ }
+    const result = receipt?.result;
+    if (
+      receipt?.schema === "devspace.herdr_verifier_receipt.v1"
+      && receipt.agentId === agentId
+      && receipt.generation === generation
+      && receipt.effectKey === effectKey
+      && result && typeof result === "object" && !Array.isArray(result)
+      && (result as Record<string, unknown>).effectState === "COMPLETED"
+      && receipt.resultSha256 === createHash("sha256").update(JSON.stringify(result)).digest("hex")
+    ) {
+      const completed = this.store.finishExternalRuntimeVerifierCAS({
+        agentId,
+        generation,
+        effectKey,
+        result: result as Record<string, unknown>,
+      });
+      if (completed.applied) {
+        if (completed.current) this.persistHerdrVerifierResult(completed.current, result as Record<string, unknown>);
+        return result as Record<string, unknown>;
+      }
+    }
+    return this.settleUnknownHerdrVerifier(agentId, generation, pending, pending);
   }
 
   private settleUnknownHerdrVerifier(

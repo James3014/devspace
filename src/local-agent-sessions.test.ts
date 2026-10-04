@@ -1968,6 +1968,67 @@ test("HerdR terminal verifier is a durable VERIFY effect and an unfinished claim
     assert.match(multiRecord.error ?? "", /alpha-fail/);
     assert.equal(multiRecord.lifecycleState?.automatedVerifierResult?.verifier, "beta-pass");
     assert.equal(multiRecord.lifecycleState?.automatedVerifierResult?.passed, true);
+
+    // Simulate process death after the fsynced receipt but before terminal CAS.
+    // Replay must reconcile the exact result without a second verifier launch.
+    config.toolchains[0].verifiers = { typecheck: "/configured/typecheck" };
+    writeFileSync(join(workspaceRoot, "effect.txt"), "receipt recovery candidate\n");
+    const receiptReplay = makeActiveHerdrRecord("attempt-herdr-verifier-receipt-recovery");
+    const receiptGeneration = receiptReplay.record.lifecycleState!.activeTurn!.generation!;
+    const receiptPhysical = await inspectWorkspacePhysicalState(workspaceRoot);
+    const callsBeforeReceipt = verifierCalls.length;
+    const originalFinish = store.finishExternalRuntimeVerifierCAS.bind(store);
+    let interrupted = false;
+    (store as any).finishExternalRuntimeVerifierCAS = (input: any) => {
+      if (!interrupted && input.result.effectState === "COMPLETED") {
+        interrupted = true;
+        throw new Error("simulated crash after verifier receipt");
+      }
+      return originalFinish(input);
+    };
+    await assert.rejects(
+      (manager as any).runHerdrTerminalVerifier(receiptReplay.record, receiptGeneration, receiptPhysical),
+      /simulated crash after verifier receipt/,
+    );
+    (store as any).finishExternalRuntimeVerifierCAS = originalFinish;
+    const recovered = await (manager as any).runHerdrTerminalVerifier(
+      receiptReplay.record, receiptGeneration, receiptPhysical,
+    );
+    assert.equal(recovered.effectState, "COMPLETED");
+    assert.equal(recovered.passed, true);
+    assert.equal(verifierCalls.length, callsBeforeReceipt + 1);
+    assert.deepEqual(
+      store.getById(receiptReplay.record.id)?.lifecycleState?.automatedVerifierEffects?.[String(recovered.effectKey)],
+      recovered,
+    );
+
+    const tampered = makeActiveHerdrRecord("attempt-herdr-verifier-tampered-receipt");
+    const tamperedGeneration = tampered.record.lifecycleState!.activeTurn!.generation!;
+    interrupted = false;
+    (store as any).finishExternalRuntimeVerifierCAS = (input: any) => {
+      if (!interrupted && input.result.effectState === "COMPLETED") {
+        interrupted = true;
+        throw new Error("simulated crash before terminal CAS");
+      }
+      return originalFinish(input);
+    };
+    await assert.rejects(
+      (manager as any).runHerdrTerminalVerifier(tampered.record, tamperedGeneration, receiptPhysical),
+      /simulated crash before terminal CAS/,
+    );
+    (store as any).finishExternalRuntimeVerifierCAS = originalFinish;
+    const tamperedEffect = store.getById(tampered.record.id)?.lifecycleState?.automatedVerifierResult;
+    assert.ok(tamperedEffect);
+    const receiptPath = (manager as any).herdrVerifierReceiptPath(
+      tampered.record.id, String(tamperedEffect.effectKey),
+    ).path as string;
+    writeFileSync(receiptPath, JSON.stringify({ schema: "devspace.herdr_verifier_receipt.v1", result: { passed: true } }));
+    const callsBeforeTamperReplay = verifierCalls.length;
+    const rejectedReceipt = await (manager as any).runHerdrTerminalVerifier(
+      tampered.record, tamperedGeneration, receiptPhysical,
+    );
+    assert.equal(rejectedReceipt.effectState, "OUTCOME_UNKNOWN");
+    assert.equal(verifierCalls.length, callsBeforeTamperReplay);
   } finally {
     manager.close();
     rmSync(stateDir, { recursive: true, force: true });
