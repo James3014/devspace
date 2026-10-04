@@ -5670,41 +5670,65 @@ export function createMcpServer(
         let discoveryContext: string | undefined;
         if (selectedProfile?.write_mode !== "read_only") {
           await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
-          if (coreMutationGuard && (!contract?.coreMutation || !contract.writePaths || contract.writePaths.length === 0)) {
-            throw new AgentSessionError(
-              "INVALID_EXECUTION_CONTRACT",
-              "CORE_MUTATION_POINTER_REQUIRED: write-capable agent_start requires exact executionContract.coreMutation sessionId/bindingHash and writePaths before provider launch.",
-            );
-          }
-          if (!contract?.capabilityDiscovery) {
-            throw new AgentSessionError(
-              "INVALID_EXECUTION_CONTRACT",
-              "CAPABILITY_DISCOVERY_REQUIRED: write-capable delegated execution requires a current Nexus capability discovery receipt before worker launch.",
-            );
-          }
-          try {
-            const verifiedDiscovery = await verifyCapabilityDiscoveryReceipt(contract.capabilityDiscovery);
-            discoveryContext = renderCapabilityDiscoveryForWorker(verifiedDiscovery);
-            if (coreMutationGuard) {
-              const corePointer = contract.coreMutation;
-              if (!corePointer) {
-                throw new Error("CORE_MUTATION_POINTER_REQUIRED: write-capable execution lost its Core pointer before admission.");
-              }
-              coreMutationGuard.assertDiscovery(workspaceId, verifiedDiscovery.receipt);
-              coreAdmission = await coreMutationGuard.admit({
-                workspaceId,
-                extra,
-                pointer: { required: true, sessionId: corePointer.sessionId, bindingHash: corePointer.bindingHash },
-                paths: contract.writePaths,
-                pathContainment: "NOT_PROVEN",
-                writerDomain: "AGENT",
-              });
+          const authorityMode = contract?.authorityMode ?? "OWNER_DIRECT";
+          const coreBound = contract?.coreMutation !== undefined;
+          const ownerDirect = authorityMode === "OWNER_DIRECT" && !coreBound;
+
+          if (ownerDirect) {
+            if (coreMutationGuard?.active(workspaceId)) {
+              throw new AgentSessionError(
+                "INVALID_EXECUTION_CONTRACT",
+                "CORE_ACTIVE_SESSION_CONFLICT: OWNER_DIRECT write-capable dispatch cannot bypass an active Core mutation session.",
+              );
             }
-          } catch (error) {
-            throw new AgentSessionError(
-              "INVALID_EXECUTION_CONTRACT",
-              error instanceof Error ? error.message : String(error),
-            );
+            if (contract?.capabilityDiscovery) {
+              try {
+                const verifiedDiscovery = await verifyCapabilityDiscoveryReceipt(contract.capabilityDiscovery);
+                discoveryContext = renderCapabilityDiscoveryForWorker(verifiedDiscovery);
+              } catch (error) {
+                throw new AgentSessionError(
+                  "INVALID_EXECUTION_CONTRACT",
+                  error instanceof Error ? error.message : String(error),
+                );
+              }
+            }
+          } else {
+            if (coreMutationGuard && (!contract?.coreMutation || !contract.writePaths || contract.writePaths.length === 0)) {
+              throw new AgentSessionError(
+                "INVALID_EXECUTION_CONTRACT",
+                "CORE_MUTATION_POINTER_REQUIRED: write-capable governed agent_start requires exact executionContract.coreMutation sessionId/bindingHash and writePaths before provider launch.",
+              );
+            }
+            if (!contract?.capabilityDiscovery) {
+              throw new AgentSessionError(
+                "INVALID_EXECUTION_CONTRACT",
+                "CAPABILITY_DISCOVERY_REQUIRED: write-capable governed execution requires a current Nexus capability discovery receipt before worker launch.",
+              );
+            }
+            try {
+              const verifiedDiscovery = await verifyCapabilityDiscoveryReceipt(contract.capabilityDiscovery);
+              discoveryContext = renderCapabilityDiscoveryForWorker(verifiedDiscovery);
+              if (coreMutationGuard) {
+                const corePointer = contract.coreMutation;
+                if (!corePointer) {
+                  throw new Error("CORE_MUTATION_POINTER_REQUIRED: write-capable governed execution lost its Core pointer before admission.");
+                }
+                coreMutationGuard.assertDiscovery(workspaceId, verifiedDiscovery.receipt);
+                coreAdmission = await coreMutationGuard.admit({
+                  workspaceId,
+                  extra,
+                  pointer: { required: true, sessionId: corePointer.sessionId, bindingHash: corePointer.bindingHash },
+                  paths: contract.writePaths,
+                  pathContainment: "NOT_PROVEN",
+                  writerDomain: "AGENT",
+                });
+              }
+            } catch (error) {
+              throw new AgentSessionError(
+                "INVALID_EXECUTION_CONTRACT",
+                error instanceof Error ? error.message : String(error),
+              );
+            }
           }
         }
         const boundContractBase = selection.directSelection
@@ -5836,8 +5860,19 @@ export function createMcpServer(
         let coreAdmission: CoreMutationAdmission | undefined;
         if (currentWriteMode !== "read_only") {
           await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
-          if (coreMutationGuard) {
-            const contract = currentAgent?.executionContract;
+          const contract = currentAgent?.executionContract;
+          const authorityMode = contract?.authorityMode ?? "OWNER_DIRECT";
+          const coreBound = contract?.coreMutation !== undefined;
+          const ownerDirect = authorityMode === "OWNER_DIRECT" && !coreBound;
+
+          if (ownerDirect) {
+            if (coreMutationGuard?.active(workspaceId)) {
+              throw new AgentSessionError(
+                "INVALID_EXECUTION_CONTRACT",
+                "CORE_ACTIVE_SESSION_CONFLICT: OWNER_DIRECT write-capable continuation cannot bypass an active Core mutation session.",
+              );
+            }
+          } else if (coreMutationGuard) {
             const active = coreMutationGuard.active(workspaceId);
             if (contract?.coreMutation) {
               if (!contract.writePaths || contract.writePaths.length === 0) {
@@ -5854,7 +5889,7 @@ export function createMcpServer(
             } else {
               throw new AgentSessionError(
                 "INVALID_EXECUTION_CONTRACT",
-                `CORE_BOUND_SESSION_REQUIRED: historical unbound agent cannot continue${active ? " inside a newer active Core mutation session" : " as trusted repository mutation"}.`,
+                `CORE_BOUND_SESSION_REQUIRED: governed agent cannot continue${active ? " inside a newer active Core mutation session" : " without its persisted Core binding"}.`,
               );
             }
           }
