@@ -367,6 +367,31 @@ export function describeToolchainExecutables(
   return executables;
 }
 
+export interface ToolchainVerifierEntry {
+  name: string;
+  available: boolean;
+}
+
+export interface ToolchainCatalogEntry {
+  toolchainId: string;
+  verifiers: ToolchainVerifierEntry[];
+}
+
+/**
+ * List all configured toolchains and their verifier availability.
+ * Used by workspace_list_verifiers so GPT can discover toolchainId and
+ * verifier names without prior knowledge of the server configuration.
+ */
+export function listToolchainCatalog(toolchains: ToolchainSpec[]): ToolchainCatalogEntry[] {
+  return toolchains.map((toolchain) => ({
+    toolchainId: toolchain.id,
+    verifiers: Object.keys(toolchain.verifiers).map((name) => ({
+      name,
+      available: resolveToolchainExecutable(toolchains, toolchain.id, name) !== undefined,
+    })),
+  }));
+}
+
 /**
  * Run one allowlisted verifier executable with a bounded cwd, bounded timeout,
  * and structured output. No shell, no redirection, no environment mutation,

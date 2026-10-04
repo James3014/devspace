@@ -11,7 +11,7 @@ import {
 } from "./work-resume.js";
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { access, realpath } from "node:fs/promises";
+import { access, lstat, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -29,8 +29,9 @@ import {
 import express from "express";
 import type { NextFunction, Request, Response } from "express";
 import * as z from "zod/v4";
-import { applyPatch, parsePatch } from "./apply-patch.js";
+import { applyPatch, parsePatch, replaceFile } from "./apply-patch.js";
 import { commitCandidate, pushCandidate, GitCandidateError } from "./git-candidate.js";
+import { fetchRemoteBranchRef } from "./git-worktrees.js";
 import { git as runGit } from "./git.js";
 import {
   integrateCandidate,
@@ -228,7 +229,7 @@ import {
   renderCapabilityDiscoveryForWorker,
   verifyCapabilityDiscoveryReceipt,
 } from "./capability-discovery.js";
-import { runToolchainVerifier, resolveToolchainExecutable } from "./local-agent-toolchains.js";
+import { runToolchainVerifier, resolveToolchainExecutable, listToolchainCatalog } from "./local-agent-toolchains.js";
 import {
   runRepositoryIntelligenceOperation,
   type RepositoryIntelligenceOperation,
@@ -236,7 +237,7 @@ import {
 import { registerRepositoryIntelligenceArtifactTool } from "./repository-intelligence-artifact.js";
 import { registerPhysicalHostRegistryTools } from "./physical-host-registry.js";
 import { registerHostCapabilitySnapshotTool } from "./host-capability-snapshot.js";
-import { canonicalizePath } from "./roots.js";
+import { assertAllowedPath, canonicalizePath, isPathInsideRoot } from "./roots.js";
 import { applyHostStoragePlan, buildHostStoragePlan, resolveHostStorageRoot } from "./host-storage-retention.js";
 import { openDatabase } from "./db/client.js";
 
@@ -447,8 +448,12 @@ const DIRECT_CODING_TOOL_NAMES = new Set<string>([
   toolNames.glob,
   toolNames.ls,
   toolNames.shell,
+  "apply_patch",
   "command_status",
   "workspace_verify",
+  "workspace_list_verifiers",
+  "workspace_copy_file",
+  "git_fetch_ref",
   "host_capability_snapshot",
   "git_commit",
   "git_push",
@@ -499,6 +504,10 @@ function serverInstructions(config: ServerConfig): string {
 
   if (config.toolMode === "codex") {
     return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree, then keep using its workspaceId. During continued work in the same project or worktree, do not call ${toolNames.openWorkspace} again. Open another workspace only when changing projects, switching checkout/worktree mode, creating another isolated worktree, or when the current workspaceId is rejected. Use ${toolNames.read} for direct file reads, apply_patch for all file modifications, exec_command for inspection, tests, builds, and other commands, and write_stdin to poll or interact with running processes. Follow instructions returned by ${toolNames.openWorkspace}; read applicable instruction and skill files before working in their scope.${artifactInstruction}${showChangesInstruction}${agentToolsInstruction}${gitCandidatesInstruction}${codexGoalsInstruction}${repositoryIntelligenceInstruction}`;
+  }
+
+  if (config.toolMode === "minimal") {
+    return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree and keep reusing its workspaceId. If a remote branch is not yet local, open the repository checkout, call git_fetch_ref explicitly, then open the isolated worktree with the returned localRef. Use ${toolNames.read} for file inspection; structuredContent contains exact source text and pagination metadata is separate. Use apply_patch for structured multi-hunk changes, ${toolNames.edit} for targeted single-hunk changes, and ${toolNames.write} only for new files or complete rewrites. Use workspace_copy_file for exact cross-workspace regular-file transfer with SHA-256/CAS checks. Use workspace_list_verifiers before workspace_verify. Use ${toolNames.shell} only for tests, builds, git inspection, and package scripts — never to create or modify files.${gitCandidatesInstruction}`;
   }
 
   const inspection = `Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for bounded read-only file inspection. Use ${toolNames.shell} only when shell semantics are actually needed. `;
@@ -778,6 +787,66 @@ function contentLineCount(content: string): number {
     ? content.slice(0, -1).split("\n").length
     : content.split("\n").length;
 }
+
+interface ReadPaginationInfo {
+  truncated: boolean;
+  offset: number;
+  limit?: number;
+  returnedLines: number;
+  totalLines: number;
+  remainingLines: number;
+  nextOffset?: number;
+  notice?: string;
+}
+
+async function readExactTextRange(
+  path: string,
+  inputOffset: number = 1,
+  inputLimit?: number,
+): Promise<{
+  exactContent: string;
+  fileSha256: string;
+  totalLines: number;
+  pagination?: ReadPaginationInfo;
+}> {
+  const bytes = await readFile(path);
+  const text = bytes.toString("utf8");
+  const lines = text.split("\n");
+  const offset = Math.max(1, inputOffset);
+  const startIndex = Math.min(lines.length, offset - 1);
+  const endIndex = inputLimit === undefined
+    ? lines.length
+    : Math.min(lines.length, startIndex + inputLimit);
+  const selected = lines.slice(startIndex, endIndex);
+  const exactContent = selected.join("\n");
+  const returnedLines = selected.length;
+  const remainingLines = Math.max(0, lines.length - endIndex);
+  const nextOffset = remainingLines > 0 ? endIndex + 1 : undefined;
+  const fileSha256 = createHash("sha256").update(bytes).digest("hex");
+
+  return {
+    exactContent,
+    fileSha256,
+    totalLines: lines.length,
+    ...(inputLimit !== undefined || offset !== 1
+      ? {
+          pagination: {
+            truncated: remainingLines > 0,
+            offset,
+            limit: inputLimit,
+            returnedLines,
+            totalLines: lines.length,
+            remainingLines,
+            nextOffset,
+            ...(nextOffset
+              ? { notice: `${remainingLines} more lines in file. Use offset=${nextOffset} to continue.` }
+              : {}),
+          },
+        }
+      : {}),
+  };
+}
+
 
 function countDiffStats(diff: string | undefined): DiffStats {
   if (!diff) return { additions: 0, removals: 0 };
@@ -3732,6 +3801,63 @@ export function createMcpServer(
     },
   );
 
+  if (config.toolMode === "minimal") {
+  registerAppTool(
+    server,
+    "git_fetch_ref",
+    {
+      title: "Fetch Git remote branch",
+      description:
+        "Explicitly fetch one branch from an already-configured Git remote into the repository's local remote-tracking ref. This changes Git ref metadata only: it does not checkout, merge, rebase, reset, commit, or push. Use this when open_workspace(worktree) reports GIT_BASE_REF_NOT_LOCAL.",
+      inputSchema: {
+        workspaceId: z.string().describe(workspaceIdDescription),
+        remote: z.string().default("origin").describe("Configured Git remote name. Raw URLs are not accepted."),
+        branch: z.string().describe("Remote branch name, for example feat/fix-123 or refs/heads/feat/fix-123."),
+      },
+      outputSchema: {
+        remote: z.string(),
+        branch: z.string(),
+        localRef: z.string(),
+        previousSha: z.string().optional(),
+        fetchedSha: z.string(),
+        changed: z.boolean(),
+      },
+      _meta: {},
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async ({ workspaceId, remote, branch }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const sourcePath = workspace.sourceRoot ?? workspace.root;
+      const result = await fetchRemoteBranchRef({
+        sourcePath,
+        remote,
+        branch,
+        config,
+      });
+      logToolCall(config, {
+        tool: "git_fetch_ref",
+        workspaceId,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        content: [
+          textBlock(
+            `Fetched ${result.remote}/${result.branch} -> ${result.localRef} @ ${result.fetchedSha}.`,
+          ),
+        ],
+        structuredContent: result as unknown as Record<string, unknown>,
+      };
+    },
+  );
+  }
+
   if (durableOperations) {
     const durableOperationOutputSchema = {
       operationId: z.string(),
@@ -4359,7 +4485,23 @@ export function createMcpServer(
           .optional()
           .describe("Maximum number of lines to read."),
       },
-      outputSchema: resultOutputSchema(),
+      outputSchema: resultOutputSchema({
+        content: z.string().optional().describe("Exact requested UTF-8 file content without navigation prose."),
+        fileSha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
+        pagination: z
+          .object({
+            truncated: z.boolean(),
+            offset: z.number().int().positive(),
+            limit: z.number().int().positive().optional(),
+            returnedLines: z.number().int().nonnegative(),
+            totalLines: z.number().int().nonnegative(),
+            remainingLines: z.number().int().nonnegative(),
+            nextOffset: z.number().int().positive().optional(),
+            notice: z.string().optional(),
+          })
+          .optional()
+          .describe("Machine-derived pagination metadata computed from file bytes, never parsed from display prose."),
+      }),
       ...toolWidgetDescriptorMeta(config, "read"),
       annotations: { readOnlyHint: true },
     },
@@ -4397,6 +4539,36 @@ export function createMcpServer(
       }
       workspaces.markReadPathLoaded(workspace, readPath);
 
+      const exactRead = await readExactTextRange(
+        readPath.absolutePath,
+        input.offset ?? 1,
+        input.limit,
+      );
+      let exactContent = exactRead.exactContent;
+      let pagination = exactRead.pagination;
+      const truncation = response.details?.truncation;
+      if (truncation?.truncated) {
+        exactContent = truncation.content;
+        const offset = input.offset ?? 1;
+        const returnedLines = truncation.firstLineExceedsLimit ? 0 : truncation.outputLines;
+        const consumedThrough = (offset - 1) + returnedLines;
+        const remainingLines = Math.max(0, exactRead.totalLines - consumedThrough);
+        const rawText = contentText(response.content);
+        const notice = rawText.slice(truncation.content.length).trim() || undefined;
+        pagination = {
+          truncated: true,
+          offset,
+          limit: input.limit,
+          returnedLines,
+          totalLines: exactRead.totalLines,
+          remainingLines,
+          nextOffset: !truncation.firstLineExceedsLimit && remainingLines > 0
+            ? offset + returnedLines
+            : undefined,
+          notice,
+        };
+      }
+
       const summary = {
         ...textSummary(response.content),
         offset: input.offset ?? 1,
@@ -4422,7 +4594,10 @@ export function createMcpServer(
           },
         },
         structuredContent: {
-          result: contentText(response.content),
+          result: exactContent,
+          content: exactContent,
+          fileSha256: exactRead.fileSha256,
+          ...(pagination ? { pagination } : {}),
         },
       };
     },
@@ -4660,7 +4835,7 @@ export function createMcpServer(
   );
   }
 
-  if (config.toolMode === "codex") {
+  if (config.toolMode === "codex" || config.toolMode === "minimal") {
     registerAppTool(
       server,
       "apply_patch",
@@ -6558,6 +6733,306 @@ export function createMcpServer(
         };
       },
     );
+
+    registerAppTool(
+      server,
+      "workspace_list_verifiers",
+      {
+        title: "List workspace verifiers",
+        description:
+          "Discover configured toolchain IDs, verifier names, and whether each verifier is currently available. Host filesystem paths remain internal. Use this to find the right toolchainId and verifier before calling workspace_verify.",
+        inputSchema: {
+          workspaceId: z.string().describe(workspaceIdDescription),
+        },
+        outputSchema: resultOutputSchema({
+          toolchains: z.array(
+            z.object({
+              toolchainId: z.string(),
+              verifiers: z.array(
+                z.object({
+                  name: z.string(),
+                  available: z.boolean(),
+                }),
+              ),
+            }),
+          ),
+        }),
+        _meta: {},
+        annotations: { readOnlyHint: true },
+      },
+      async ({ workspaceId }) => {
+        const startedAt = performance.now();
+        workspaces.getWorkspace(workspaceId);
+        const catalog = listToolchainCatalog(config.toolchains);
+        const summaryLines = catalog.map((tc) => {
+          const verifierList = tc.verifiers
+            .map((v) => `${v.name} (${v.available ? "available" : "not found"})`)
+            .join(", ");
+          return `- Toolchain "${tc.toolchainId}": ${verifierList || "no verifiers"}`;
+        });
+        const result = catalog.length === 0
+          ? "No toolchains configured on this DevSpace instance."
+          : `Configured toolchains:\n${summaryLines.join("\n")}`;
+
+        logToolCall(config, {
+          tool: "workspace_list_verifiers",
+          workspaceId,
+          success: true,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
+
+        return {
+          content: [textBlock(result)],
+          _meta: {
+            tool: "workspace_list_verifiers",
+            card: {
+              workspaceId,
+              toolchains: catalog,
+            },
+          },
+          structuredContent: {
+            result,
+            toolchains: catalog,
+          },
+        };
+      },
+    );
+
+    if (config.toolMode === "minimal") {
+    registerAppTool(
+      server,
+      "workspace_copy_file",
+      {
+        title: "Copy file between workspaces",
+        description:
+          "Copy a regular file from a source workspace to a destination workspace (or within the same workspace) with exact cryptographic hash preservation. Zero model-mediated reconstruction. Bounded inside allowed roots, blocks symlink path escape, supports CAS destination hash checking and overwrite protection.",
+        inputSchema: {
+          sourceWorkspaceId: z
+            .string()
+            .describe("Workspace containing the source file."),
+          sourcePath: z
+            .string()
+            .describe("Path to the source file, relative to the source workspace root."),
+          destinationWorkspaceId: z
+            .string()
+            .describe("Workspace to copy the file into. Can be the same workspace or an isolated worktree."),
+          destinationPath: z
+            .string()
+            .describe("Path where the file should be copied, relative to the destination workspace root."),
+          expectedSourceSha256: z
+            .string()
+            .regex(/^[0-9a-fA-F]{64}$/)
+            .optional()
+            .describe("Optional expected SHA-256 hex digest of the source file. If specified and different, copy is aborted."),
+          expectedDestinationSha256: z
+            .string()
+            .regex(/^[0-9a-fA-F]{64}$/)
+            .optional()
+            .describe("Optional expected SHA-256 hex digest of the existing destination file for CAS overwrite protection."),
+          expectedDestinationAbsent: z
+            .boolean()
+            .optional()
+            .describe("When true, fail if the destination already exists. Mutually exclusive with expectedDestinationSha256."),
+          overwrite: z
+            .boolean()
+            .default(false)
+            .describe("Whether to overwrite an existing destination file. Defaults to false."),
+        },
+        outputSchema: resultOutputSchema({
+          sourcePath: z.string(),
+          destinationPath: z.string(),
+          bytes: z.number().int().nonnegative(),
+          sha256: z.string(),
+          overwritten: z.boolean(),
+        }),
+        _meta: {},
+        annotations: WRITE_TOOL_ANNOTATIONS,
+      },
+      async (
+        {
+          sourceWorkspaceId,
+          sourcePath,
+          destinationWorkspaceId,
+          destinationPath,
+          expectedSourceSha256,
+          expectedDestinationSha256,
+          expectedDestinationAbsent,
+          overwrite,
+        },
+        extra,
+      ) => {
+        const startedAt = performance.now();
+        await workspaces.assertConversationMutationAllowed(
+          destinationWorkspaceId,
+          openAiConversationScopeId(extra._meta),
+        );
+        const sourceWorkspace = workspaces.getWorkspace(sourceWorkspaceId);
+        const destinationWorkspace = workspaces.getWorkspace(destinationWorkspaceId);
+
+        const resolvedSource = workspaces.resolveReadPath(sourceWorkspace, sourcePath);
+        if (resolvedSource.nestedInstructionRebindRequired) {
+          const { instructionPaths } = resolvedSource.nestedInstructionRebindRequired;
+          return {
+            isError: true,
+            content: [textBlock([
+              `NESTED_INSTRUCTION_REBIND_REQUIRED: Nested repository instruction file(s) must be read before copying '${sourcePath}'.`,
+              "Read each instruction file below in order, then retry the copy:",
+              ...instructionPaths.map((path, index) => `  ${index + 1}. ${path}`),
+            ].join("\n"))],
+          };
+        }
+        const sourceAbsolutePath = resolvedSource.absolutePath;
+        const sourceRootCanonical = canonicalizePath(sourceWorkspace.root);
+        const sourceCanonicalPath = canonicalizePath(sourceAbsolutePath);
+        if (!isPathInsideRoot(sourceCanonicalPath, sourceRootCanonical)) {
+          return {
+            isError: true,
+            content: [textBlock(`SOURCE_PATH_ESCAPE: canonical source path leaves the source workspace: ${sourcePath}`)],
+          };
+        }
+        const sourceStats = await lstat(sourceAbsolutePath).catch(() => null);
+        if (!sourceStats || !sourceStats.isFile() || sourceStats.isSymbolicLink()) {
+          return {
+            isError: true,
+            content: [textBlock(`Source file does not exist, is not a regular file, or is a symbolic link: ${sourcePath}`)],
+          };
+        }
+
+        // Compute source hash and verify expected preimage.
+        const sourceBytes = await readFile(sourceCanonicalPath);
+        const sourceSha = createHash("sha256").update(sourceBytes).digest("hex");
+        if (expectedSourceSha256 && sourceSha.toLowerCase() !== expectedSourceSha256.toLowerCase()) {
+          return {
+            isError: true,
+            content: [textBlock(`SOURCE_HASH_MISMATCH: expected source SHA-256 ${expectedSourceSha256}, got ${sourceSha}`)],
+          };
+        }
+
+        const destinationAbsolutePath = workspaces.resolvePath(destinationWorkspace, destinationPath);
+        const destinationRootCanonical = canonicalizePath(destinationWorkspace.root);
+        const destinationCanonicalPath = canonicalizePath(destinationAbsolutePath);
+        if (!isPathInsideRoot(destinationCanonicalPath, destinationRootCanonical)) {
+          return {
+            isError: true,
+            content: [textBlock(`DESTINATION_PATH_ESCAPE: canonical destination path leaves the destination workspace: ${destinationPath}`)],
+          };
+        }
+
+        const lexicalDestinationStats = await lstat(destinationAbsolutePath).catch(() => null);
+        if (lexicalDestinationStats?.isSymbolicLink()) {
+          return {
+            isError: true,
+            content: [textBlock(`DESTINATION_SYMLINK_BLOCKED: destination must not be a symbolic link: ${destinationPath}`)],
+          };
+        }
+
+        // Check for nested instruction rebind requirement at the physical destination.
+        const instructionPaths = workspaces.preOperationAncestorCheck(
+          destinationWorkspace,
+          destinationCanonicalPath,
+        );
+        if (instructionPaths.length > 0) {
+          return {
+            isError: true,
+            content: [textBlock([
+              `NESTED_INSTRUCTION_REBIND_REQUIRED: Nested repository instruction file(s) must be read before writing '${destinationPath}'.`,
+              "Read each instruction file below in order, then retry the copy:",
+              ...instructionPaths.map((path, index) => `  ${index + 1}. ${path}`),
+            ].join("\n"))],
+          };
+        }
+
+        if (expectedDestinationSha256 && expectedDestinationAbsent) {
+          return {
+            isError: true,
+            content: [textBlock("DESTINATION_PREIMAGE_CONFLICT: expectedDestinationSha256 and expectedDestinationAbsent are mutually exclusive.")],
+          };
+        }
+
+        // Check destination existence & CAS preimage.
+        const destStats = await lstat(destinationCanonicalPath).catch(() => null);
+        let overwritten = false;
+        if (destStats) {
+          if (expectedDestinationAbsent) {
+            return {
+              isError: true,
+              content: [textBlock(`DESTINATION_PREIMAGE_EXISTS: destination already exists: ${destinationPath}`)],
+            };
+          }
+          if (!destStats.isFile() || destStats.isSymbolicLink()) {
+            return {
+              isError: true,
+              content: [textBlock(`Destination exists and is not a regular non-symlink file: ${destinationPath}`)],
+            };
+          }
+          if (!overwrite) {
+            return {
+              isError: true,
+              content: [textBlock(`DESTINATION_EXISTS: destination file already exists and overwrite is false: ${destinationPath}`)],
+            };
+          }
+          if (expectedDestinationSha256) {
+            const destBytes = await readFile(destinationCanonicalPath);
+            const destSha = createHash("sha256").update(destBytes).digest("hex");
+            if (destSha.toLowerCase() !== expectedDestinationSha256.toLowerCase()) {
+              return {
+                isError: true,
+                content: [textBlock(`DESTINATION_CAS_MISMATCH: expected destination SHA-256 ${expectedDestinationSha256}, got ${destSha}`)],
+              };
+            }
+          }
+          overwritten = true;
+        } else if (expectedDestinationSha256) {
+          return {
+            isError: true,
+            content: [textBlock(`DESTINATION_PREIMAGE_MISSING: expected destination SHA-256 ${expectedDestinationSha256}, but destination does not exist.`)],
+          };
+        }
+
+        // Atomically copy to the canonical physical destination.
+        await mkdir(dirname(destinationCanonicalPath), { recursive: true });
+        const temporaryDest = `${destinationCanonicalPath}.devspace-copy-${process.pid}-${randomUUID()}`;
+        try {
+          await writeFile(temporaryDest, sourceBytes, { mode: sourceStats.mode });
+          await replaceFile(temporaryDest, destinationCanonicalPath, overwritten);
+        } catch (error) {
+          await rm(temporaryDest, { force: true }).catch(() => {});
+          throw error;
+        }
+        workspaces.invalidateInstructionPath(destinationWorkspace, destinationAbsolutePath);
+
+        const result = `Copied ${sourcePath} -> ${destinationPath} (${sourceBytes.length} bytes, sha256=${sourceSha})`;
+        logToolCall(config, {
+          tool: "workspace_copy_file",
+          workspaceId: destinationWorkspaceId,
+          path: destinationPath,
+          success: true,
+          durationMs: Math.round(performance.now() - startedAt),
+        });
+
+        return {
+          content: [textBlock(result)],
+          _meta: {
+            tool: "workspace_copy_file",
+            card: {
+              workspaceId: destinationWorkspaceId,
+              path: destinationPath,
+              summary: { bytes: sourceBytes.length, sha256: sourceSha, overwritten },
+            },
+          },
+          structuredContent: {
+            result,
+            sourcePath,
+            destinationPath,
+            bytes: sourceBytes.length,
+            sha256: sourceSha,
+            overwritten,
+          },
+        };
+      },
+    );
+    }
+
 
   // ── Candidate integration readiness / typed integration (workspace level) ──
   const candidateRangeInputSchema = {

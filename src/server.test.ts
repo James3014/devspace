@@ -5048,10 +5048,12 @@ test("command_status metadata annotations and minimal mode visibility", async (t
   const toolNames = toolsList.tools.map((t) => t.name).sort();
 
   assert.deepEqual(toolNames, [
+    "apply_patch",
     "bash",
     "command_status",
     "edit",
     "git_commit",
+    "git_fetch_ref",
     "git_push",
     "glob",
     "grep",
@@ -5059,6 +5061,8 @@ test("command_status metadata annotations and minimal mode visibility", async (t
     "ls",
     "open_workspace",
     "read",
+    "workspace_copy_file",
+    "workspace_list_verifiers",
     "workspace_verify",
     "write",
   ]);
