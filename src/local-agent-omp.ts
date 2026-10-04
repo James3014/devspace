@@ -213,6 +213,10 @@ export async function runOmpAcpLocalAgent(
     windowsHide: true,
   });
   assertPipedChild(child);
+  await callbacks?.onProviderProcessState?.("running");
+  child.once("exit", () => {
+    void callbacks?.onProviderProcessState?.("not_running");
+  });
 
   let stderr = "";
   child.stderr.on("data", (chunk: Buffer) => {
