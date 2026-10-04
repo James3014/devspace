@@ -77,6 +77,7 @@ export class OpencodeRuntime implements LocalAgentRuntime {
         }
         try {
           const notifyActivity = bestEffortActivityNotifier(callbacks?.onActivity);
+          const notifyStreamActivity = bestEffortActivityNotifier(callbacks?.onStreamActivity);
           await assertOpencodeHealthy(this.client);
           notifyActivity();
           const resumed = Boolean(input.providerSessionId);
@@ -111,7 +112,14 @@ export class OpencodeRuntime implements LocalAgentRuntime {
               message: "OpenCode did not acknowledge the current prompt with a message id.",
             });
           }
-          await waitForOpencodeSession(this.client, sessionId, promptResult, notifyActivity, modelInfo);
+          await waitForOpencodeSession(
+            this.client,
+            sessionId,
+            promptResult,
+            notifyActivity,
+            notifyStreamActivity,
+            modelInfo,
+          );
           const messages = await readOpencodeMessages(this.client, sessionId, promptId);
           const finalResponse = requireFinalResponse(
             extractOpenCodeFinalResponseForPrompt(messages, promptId),
@@ -398,6 +406,7 @@ async function waitForOpencodeSession(
   sessionId: string,
   promptResult: unknown,
   onActivity?: () => void,
+  onStreamActivity?: () => void,
   modelInfo: { model?: string; variant?: string } = {},
 ): Promise<void> {
   // OpenCode 1.18 accepts the prompt before its foreground drain is ready.
@@ -434,6 +443,7 @@ async function waitForOpencodeSession(
     if (activityFingerprint !== previousActivityFingerprint) {
       previousActivityFingerprint = activityFingerprint;
       onActivity?.();
+      onStreamActivity?.();
     }
 
     const completed = hasCompletedOpenCodeTurn(messages, promptId);
