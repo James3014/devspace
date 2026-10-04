@@ -72,6 +72,10 @@ export interface AgentLifecycleState {
   };
   /** Automated mechanical verifier execution result on worker terminal. */
   automatedVerifierResult?: Record<string, unknown>;
+  /** Append-only-by-effect-key verifier evidence; latest result remains above for compatibility. */
+  automatedVerifierEffects?: Record<string, Record<string, unknown>>;
+  /** Verifier obligation durably established before a HerdR provider effect begins. */
+  automatedVerifierPlan?: Record<string, unknown>;
   /** P2-H: Operation timeline tracking elapsed phases. */
   operationTimeline?: OperationTimeline;
   /** P2-A: Model attestation state. */
@@ -274,6 +278,11 @@ export interface LifecycleCasResult {
   current?: LocalAgentRecord;
 }
 
+export interface BeginExternalRuntimeVerifierCasResult extends LifecycleCasResult {
+  /** True only for the CAS that durably claimed the verifier effect before execution. */
+  started?: boolean;
+}
+
 export interface LocalAgentStoreTestHooks {
   beforeGenericUpdateLock?: (snapshot: LocalAgentRecord) => void;
 }
@@ -317,6 +326,8 @@ export interface FinishTurnCasInput {
   turnEndBaseline?: ScopeBaseline;
   effectEnforcementReceipt?: LocalEffectEnforcementReceipt;
   automatedVerifierResult?: Record<string, unknown>;
+  automatedVerifierEffects?: Record<string, Record<string, unknown>>;
+  automatedVerifierPlan?: Record<string, unknown>;
 }
 
 export type FinishExternalRuntimeTurnInput = Omit<FinishTurnCasInput, "workerToken">;
@@ -1214,6 +1225,19 @@ export class LocalAgentStore {
         lastSettledGeneration: input.generation,
         cumulativeChangedPaths: input.cumulativeChangedPaths ?? lifecycle.cumulativeChangedPaths,
         turnEndBaseline: input.turnEndBaseline ?? lifecycle.turnEndBaseline,
+        ...(input.automatedVerifierResult !== undefined
+          ? {
+              automatedVerifierResult: input.automatedVerifierResult,
+              automatedVerifierEffects: {
+                ...(lifecycle.automatedVerifierEffects ?? {}),
+                ...(typeof input.automatedVerifierResult.effectKey === "string"
+                  ? { [input.automatedVerifierResult.effectKey]: input.automatedVerifierResult }
+                  : {}),
+              },
+            }
+          : (lifecycle.automatedVerifierResult !== undefined
+            ? { automatedVerifierResult: lifecycle.automatedVerifierResult }
+            : {})),
       };
       const successfulTerminal = input.status === "idle" || input.status === "stopped";
       const errorCode = successfulTerminal ? null : input.errorCode ?? null;
@@ -1253,6 +1277,212 @@ export class LocalAgentStore {
         input.agentId,
         current.updatedAt,
       );
+      const refreshed = this.getById(input.agentId) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return finish.immediate();
+  }
+
+  /** Record the verifier obligation before any external HerdR prompt can run. */
+  prepareExternalRuntimeVerifierCAS(input: {
+    agentId: string;
+    generation: string;
+    plan: Record<string, unknown>;
+  }): LifecycleCasResult {
+    const prepare = this.database.sqlite.transaction(() => {
+      const current = this.getById(input.agentId);
+      const lifecycle = current?.lifecycleState;
+      const existing = lifecycle?.automatedVerifierPlan;
+      if (
+        !current ||
+        !isDetachedLifecycle(lifecycle) ||
+        current.status !== "starting" ||
+        lifecycle?.activeTurn?.generation !== input.generation ||
+        lifecycle.terminationPending ||
+        lifecycle.lifecycleCorrupt ||
+        (current.externalRuntimeBinding !== undefined && current.externalRuntimeBinding.runtimeKind !== "HERDR") ||
+        current.workerPid !== undefined ||
+        current.workerToken !== undefined
+      ) {
+        return { applied: false, previous: current, current };
+      }
+      if (
+        existing?.planKey === input.plan.planKey &&
+        existing?.turnGeneration === input.plan.turnGeneration
+      ) {
+        return { applied: true, previous: current, current };
+      }
+
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        automatedVerifierPlan: input.plan,
+      };
+      const now = new Date().toISOString();
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set lifecycle_state = ?, updated_at = ?
+         where id = ? and status = 'starting' and updated_at = ?`,
+      ).run(JSON.stringify(lifecycleState), now, input.agentId, current.updatedAt);
+      const refreshed = this.getById(input.agentId) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return prepare.immediate();
+  }
+
+  /** Bind the immutable candidate material and semantic effect key before launch. */
+  bindExternalRuntimeVerifierCandidateCAS(input: {
+    agentId: string;
+    generation: string;
+    planKey: string;
+    candidate: Record<string, unknown>;
+  }): LifecycleCasResult {
+    const bind = this.database.sqlite.transaction(() => {
+      const current = this.getById(input.agentId);
+      const lifecycle = current?.lifecycleState;
+      const plan = lifecycle?.automatedVerifierPlan;
+      if (
+        !current ||
+        !isDetachedLifecycle(lifecycle) ||
+        (current.status !== "running" && current.status !== "starting") ||
+        lifecycle?.activeTurn?.generation !== input.generation ||
+        lifecycle.terminationPending ||
+        lifecycle.lifecycleCorrupt ||
+        current.externalRuntimeBinding?.runtimeKind !== "HERDR" ||
+        current.workerPid !== undefined ||
+        current.workerToken !== undefined ||
+        plan?.planKey !== input.planKey ||
+        plan?.turnGeneration !== input.generation
+      ) {
+        return { applied: false, previous: current, current };
+      }
+      const boundEffectKey = plan.boundCandidate && typeof plan.boundCandidate === "object"
+        ? (plan.boundCandidate as Record<string, unknown>).effectKey
+        : undefined;
+      if (boundEffectKey !== undefined) {
+        const same = boundEffectKey === input.candidate.effectKey;
+        return { applied: same, previous: current, current };
+      }
+
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        automatedVerifierPlan: { ...plan, boundCandidate: input.candidate },
+      };
+      const now = new Date().toISOString();
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set lifecycle_state = ?, updated_at = ?
+         where id = ? and status in ('running', 'starting') and updated_at = ?`,
+      ).run(JSON.stringify(lifecycleState), now, input.agentId, current.updatedAt);
+      const refreshed = this.getById(input.agentId) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return bind.immediate();
+  }
+
+  /**
+   * Persist a distinct verifier effect identity before its command can run.
+   * A matching RUNNING record is an already-claimed effect and must never be
+   * treated as permission to launch the command again after reconnect.
+   */
+  beginExternalRuntimeVerifierCAS(input: {
+    agentId: string;
+    generation: string;
+    effectKey: string;
+    result: Record<string, unknown>;
+  }): BeginExternalRuntimeVerifierCasResult {
+    const begin = this.database.sqlite.transaction(() => {
+      const current = this.getById(input.agentId);
+      const lifecycle = current?.lifecycleState;
+      const existing = lifecycle?.automatedVerifierEffects?.[input.effectKey]
+        ?? (lifecycle?.automatedVerifierResult?.effectKey === input.effectKey
+          ? lifecycle.automatedVerifierResult
+          : undefined);
+      if (
+        !current ||
+        !isDetachedLifecycle(lifecycle) ||
+        (current.status !== "running" && current.status !== "starting") ||
+        lifecycle?.activeTurn?.generation !== input.generation ||
+        lifecycle.terminationPending ||
+        lifecycle.lifecycleCorrupt ||
+        current.externalRuntimeBinding?.runtimeKind !== "HERDR" ||
+        current.workerPid !== undefined ||
+        current.workerToken !== undefined
+      ) {
+        return { applied: false, previous: current, current };
+      }
+
+      if (existing?.effectKey === input.effectKey) {
+        return { applied: true, started: false, previous: current, current };
+      }
+      if (existing?.effectState === "RUNNING") {
+        return { applied: false, previous: current, current };
+      }
+
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        automatedVerifierResult: input.result,
+        automatedVerifierEffects: {
+          ...(lifecycle.automatedVerifierEffects ?? {}),
+          [input.effectKey]: input.result,
+        },
+      };
+      const now = new Date().toISOString();
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set lifecycle_state = ?, updated_at = ?
+         where id = ? and status in ('running', 'starting') and updated_at = ?`,
+      ).run(JSON.stringify(lifecycleState), now, input.agentId, current.updatedAt);
+      const refreshed = this.getById(input.agentId) ?? current;
+      return {
+        applied: result.changes === 1,
+        started: result.changes === 1 && input.result.effectState === "RUNNING",
+        previous: current,
+        current: refreshed,
+      };
+    });
+    return begin.immediate();
+  }
+
+  /** Persist one terminal verifier outcome against the exact preclaimed effect. */
+  finishExternalRuntimeVerifierCAS(input: {
+    agentId: string;
+    generation: string;
+    effectKey: string;
+    result: Record<string, unknown>;
+  }): LifecycleCasResult {
+    const finish = this.database.sqlite.transaction(() => {
+      const current = this.getById(input.agentId);
+      const lifecycle = current?.lifecycleState;
+      const existing = lifecycle?.automatedVerifierEffects?.[input.effectKey]
+        ?? (lifecycle?.automatedVerifierResult?.effectKey === input.effectKey
+          ? lifecycle.automatedVerifierResult
+          : undefined);
+      if (
+        !current ||
+        !isDetachedLifecycle(lifecycle) ||
+        (current.status !== "running" && current.status !== "starting") ||
+        lifecycle?.activeTurn?.generation !== input.generation ||
+        lifecycle.terminationPending ||
+        lifecycle.lifecycleCorrupt ||
+        current.externalRuntimeBinding?.runtimeKind !== "HERDR" ||
+        existing?.effectKey !== input.effectKey ||
+        existing?.effectState !== "RUNNING" ||
+        current.workerPid !== undefined ||
+        current.workerToken !== undefined
+      ) {
+        return { applied: false, previous: current, current };
+      }
+
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        automatedVerifierResult: input.result,
+        automatedVerifierEffects: {
+          ...(lifecycle.automatedVerifierEffects ?? {}),
+          [input.effectKey]: input.result,
+        },
+      };
+      const now = new Date().toISOString();
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set lifecycle_state = ?, updated_at = ?
+         where id = ? and status in ('running', 'starting') and updated_at = ?`,
+      ).run(JSON.stringify(lifecycleState), now, input.agentId, current.updatedAt);
       const refreshed = this.getById(input.agentId) ?? current;
       return { applied: result.changes === 1, previous: current, current: refreshed };
     });
@@ -2674,6 +2904,12 @@ function readLifecycleState(value: string | null | undefined): AgentLifecycleSta
     }
     if (parsed.automatedVerifierResult && typeof parsed.automatedVerifierResult === "object") {
       state.automatedVerifierResult = parsed.automatedVerifierResult as Record<string, unknown>;
+    }
+    if (parsed.automatedVerifierEffects && typeof parsed.automatedVerifierEffects === "object" && !Array.isArray(parsed.automatedVerifierEffects)) {
+      state.automatedVerifierEffects = parsed.automatedVerifierEffects as Record<string, Record<string, unknown>>;
+    }
+    if (parsed.automatedVerifierPlan && typeof parsed.automatedVerifierPlan === "object" && !Array.isArray(parsed.automatedVerifierPlan)) {
+      state.automatedVerifierPlan = parsed.automatedVerifierPlan as Record<string, unknown>;
     }
     if (parsed.operationTimeline && typeof parsed.operationTimeline === "object") {
       state.operationTimeline = parsed.operationTimeline as OperationTimeline;

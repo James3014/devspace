@@ -1348,6 +1348,10 @@ test("I-P1b: automated verifier result is recorded on terminal and queryable via
 
   // Simulate terminal verifier execution recording
   const verifierResult = {
+    effectKey: "verify:integration-semantic-effect",
+    effectState: "COMPLETED",
+    role: "VERIFY",
+    parentEffectKey: attemptKey,
     toolchainId: "test-toolchain",
     verifier: "typecheck",
     exitCode: 0,
@@ -1366,6 +1370,8 @@ test("I-P1b: automated verifier result is recorded on terminal and queryable via
   });
   const parsed = resumeStatus.structuredContent as Record<string, unknown>;
   assert.deepEqual(parsed.automatedVerifierResult, verifierResult);
+  assert.deepEqual(parsed.automatedVerifierEffects, {
+    "verify:integration-semantic-effect": verifierResult,
+  });
 });
-
 

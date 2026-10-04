@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -10,6 +11,7 @@ import type { LocalAgentProfile } from "./local-agent-profiles.js";
 import { type HerdrExternalHandle, type HerdrPromptResult, HerdrThinGateway, defaultHerdrGatewayRegistry } from "./local-agent-herdr.js";
 import { hashDispatchIntent } from "./execution-protocol.js";
 import { AgentProviderFailureError } from "./local-agent-errors.js";
+import { inspectWorkspacePhysicalState } from "./workspace-reconciliation.js";
 
 const originalAgyCommand = process.env.AGY_COMMAND;
 process.env.AGY_COMMAND = process.execPath;
@@ -1637,6 +1639,301 @@ test("LocalAgentSessionManager - HERDR public lifecycle routes start, continue, 
     manager.close();
     rmSync(stateDir, { recursive: true, force: true });
     rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("HerdR terminal verifier is a durable VERIFY effect and an unfinished claim is never replayed", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-herdr-verifier-state-"));
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "devspace-herdr-verifier-repo-"));
+  execFileSync("git", ["init", "--initial-branch=main"], { cwd: workspaceRoot });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: workspaceRoot });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd: workspaceRoot });
+  writeFileSync(join(workspaceRoot, "README.md"), "verifier fixture\n");
+  execFileSync("git", ["add", "."], { cwd: workspaceRoot });
+  execFileSync("git", ["commit", "-m", "base"], { cwd: workspaceRoot });
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: workspaceRoot, encoding: "utf8" }).trim();
+  const verifierCalls: Array<{ toolchainId: string; verifier: string }> = [];
+  const gateway = {
+    reconcileExternalAgent: async () => ({
+      settled: true,
+      completionStatus: "COMPLETED",
+      executionState: "SETTLED_TERMINAL",
+      physicalEffect: "PRESENT",
+      changedPaths: ["effect.txt"],
+      unexpectedPaths: [],
+      gitHeadAfter: head,
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    }),
+  } as unknown as HerdrThinGateway;
+  const config = {
+    stateDir,
+    agentExecutionBackend: "herdr",
+    toolchains: [{ id: "wave2-329", root: workspaceRoot, verifiers: { typecheck: "/configured/typecheck" } }],
+    oauth: { scopes: ["devspace"] },
+  } as any;
+  const manager = new LocalAgentSessionManager(
+    config,
+    async () => {},
+    async () => true,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    gateway,
+    undefined,
+    async ({ toolchainId, verifier }) => {
+      verifierCalls.push({ toolchainId, verifier });
+      writeFileSync(join(workspaceRoot, "effect.txt"), "verifier wrote this\n");
+      const exitCode = verifierCalls.length === 2 ? 1 : 0;
+      return {
+        toolchainId,
+        verifier,
+        executable: "/configured/typecheck",
+        exitCode,
+        timedOut: false,
+        durationMs: 8,
+        stdout: "typecheck passed",
+        stderr: "",
+      };
+    },
+  );
+
+  const store = (manager as any).store as LocalAgentStore;
+  const makeActiveHerdrRecord = (attemptKey: string, prepareVerifierPlan = true) => {
+    const dispatchIntent = {
+      taskId: `task-${attemptKey}`,
+      attemptId: attemptKey,
+      objective: "verify HerdR terminal effects",
+      roleIntent: "DEEP_ENGINEERING" as const,
+      claimCeiling: "CANDIDATE_READY" as const,
+      context: ["HerdR verifier regression"],
+      readScope: ["."],
+      writeScope: ["effect.txt"],
+      exclusiveOwnership: true,
+      forbiddenChanges: [],
+      acceptanceCriteria: ["verifier evidence is durable"],
+      verificationRequired: true,
+      expectedArtifacts: [],
+    };
+    const dispatchIntentHash = hashDispatchIntent(dispatchIntent);
+    const created = store.create({
+      workspaceId: `ws-${attemptKey}`,
+      workspaceRoot,
+      profileName: "implementer",
+      provider: "agy",
+      startReplay: { key: attemptKey, requestHash: `request-${attemptKey}` },
+      executionContract: {
+        role: "IMPLEMENT",
+        toolchainId: "wave2-329",
+        writePaths: ["effect.txt"],
+        dispatchIntent,
+      },
+      lifecycleKind: "detached_worker_v2",
+    });
+    const handle: HerdrExternalHandle = {
+      schemaVersion: 1,
+      runtimeKind: "HERDR",
+      agentId: created.id,
+      herdrSocketPath: "/tmp/mock-herdr.sock",
+      herdrWorkspaceId: `herdr-${attemptKey}`,
+      herdrPaneId: `pane-${attemptKey}`,
+      herdrAgentIdentity: `agent-${attemptKey}`,
+      herdrAgentKind: "agy",
+      promptNonce: `nonce-${attemptKey}`,
+      canonicalWorktreePath: workspaceRoot,
+      workspaceId: `ws-${attemptKey}`,
+      gitHeadBefore: head,
+      attemptKey,
+      dispatchIntentHash,
+      launchTimestamp: new Date().toISOString(),
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    };
+    store.bindExternalRuntimeBindingCAS({
+      agentId: created.id,
+      binding: { runtimeKind: "HERDR", handle: handle as unknown as Record<string, unknown> },
+    });
+    const generation = created.lifecycleState!.activeTurn!.generation!;
+    if (prepareVerifierPlan) {
+      const plan = (manager as any).buildHerdrVerifierPlan(created, generation) as Record<string, unknown>;
+      assert.ok(plan);
+      assert.equal(store.prepareExternalRuntimeVerifierCAS({ agentId: created.id, generation, plan }).applied, true);
+    }
+    const claimed = store.claimExternalRuntimeTurnCAS({
+      agentId: created.id,
+      generation,
+      promptNonce: handle.promptNonce,
+      scopeBaseline: { changedPaths: [], head, fingerprints: {} },
+    });
+    assert.equal(claimed.applied, true);
+    return { record: claimed.current!, handle };
+  };
+
+  try {
+    writeFileSync(join(workspaceRoot, "effect.txt"), "worker effect\n");
+    const first = makeActiveHerdrRecord("attempt-herdr-verifier-completed");
+    const firstGeneration = first.record.lifecycleState!.activeTurn!.generation!;
+    assert.equal(await (manager as any).settleHerdrTurn(first.record, first.handle, {
+      status: "done",
+      finalResponse: "implemented the effect",
+    }), true);
+
+    const completed = store.getById(first.record.id)!.lifecycleState!.automatedVerifierResult!;
+    assert.equal(verifierCalls.length, 1, JSON.stringify({
+      plan: store.getById(first.record.id)?.lifecycleState?.automatedVerifierPlan,
+      result: store.getById(first.record.id)?.lifecycleState?.automatedVerifierResult,
+    }));
+    assert.equal(verifierCalls[0]?.toolchainId, "wave2-329");
+    assert.equal(verifierCalls[0]?.verifier, "typecheck");
+    assert.equal(completed.effectKind, "toolchain-verifier");
+    assert.equal(completed.role, "VERIFY");
+    assert.equal(completed.parentEffectKey, "attempt-herdr-verifier-completed");
+    assert.notEqual(completed.effectKey, completed.parentEffectKey);
+    assert.match(String(completed.effectKey), /^verify:[0-9a-f]{40}$/);
+    assert.equal(completed.turnGeneration, firstGeneration);
+    assert.equal(completed.effectState, "COMPLETED");
+    assert.equal(completed.passed, true);
+    assert.equal(completed.stdout, "typecheck passed");
+    assert.equal(store.getById(first.record.id)?.lifecycleState?.automatedVerifierEffects?.[String(completed.effectKey)]?.passed, true);
+    const boundCandidate = store.getById(first.record.id)?.lifecycleState?.automatedVerifierPlan?.boundCandidate as Record<string, unknown>;
+    assert.equal(boundCandidate.effectKey, completed.effectKey);
+    assert.ok(boundCandidate.sourceSnapshot);
+    assert.equal(store.getById(first.record.id)?.status, "idle");
+    const firstPhysical = await inspectWorkspacePhysicalState(workspaceRoot);
+    assert.ok(firstPhysical.changedPaths.includes("effect.txt"));
+    assert.deepEqual(await (manager as any).runHerdrTerminalVerifier(first.record, firstGeneration, firstPhysical), completed);
+    assert.equal(verifierCalls.length, 1, "a verifier side effect after candidate binding must not create a second run on replay");
+
+    const continuation = store.beginContinuationCAS({
+      agentId: first.record.id,
+      expectedPreviousGeneration: firstGeneration,
+    });
+    assert.equal(continuation.applied, true);
+    const secondGeneration = continuation.current!.lifecycleState!.activeTurn!.generation!;
+    const secondPlan = (manager as any).buildHerdrVerifierPlan(continuation.current!, secondGeneration) as Record<string, unknown>;
+    assert.equal(store.prepareExternalRuntimeVerifierCAS({
+      agentId: first.record.id,
+      generation: secondGeneration,
+      plan: secondPlan,
+    }).applied, true);
+    const beforeSecondTurn = await inspectWorkspacePhysicalState(workspaceRoot);
+    const secondTurn = store.claimExternalRuntimeTurnCAS({
+      agentId: first.record.id,
+      generation: secondGeneration,
+      promptNonce: first.handle.promptNonce,
+      scopeBaseline: {
+        changedPaths: beforeSecondTurn.changedPaths,
+        head: beforeSecondTurn.head ?? null,
+        fingerprints: beforeSecondTurn.fingerprints,
+      },
+    });
+    assert.equal(secondTurn.applied, true);
+    writeFileSync(join(workspaceRoot, "effect.txt"), "worker produced candidate B\n");
+    assert.equal(await (manager as any).settleHerdrTurn(secondTurn.current, first.handle, {
+      status: "done",
+      finalResponse: "second turn changed the implementation candidate",
+    }), true);
+    const failedRecord = store.getById(first.record.id)!;
+    assert.equal(failedRecord.lifecycleState?.automatedVerifierResult?.passed, false);
+    assert.notEqual(failedRecord.lifecycleState?.automatedVerifierResult?.effectKey, completed.effectKey);
+    assert.equal(verifierCalls.length, 2, "a new turn with changed candidate material gets its own verifier effect");
+    assert.equal(
+      Object.keys(failedRecord.lifecycleState?.automatedVerifierEffects ?? {}).length,
+      2,
+      "the first turn's verifier evidence remains in the lineage ledger",
+    );
+    assert.equal(failedRecord.status, "error", "a completed failing verifier must not be projected as an idle success");
+    assert.equal(failedRecord.errorCode, "VERIFIER_FAILED");
+
+    const replay = makeActiveHerdrRecord("attempt-herdr-verifier-unknown");
+    const generation = replay.record.lifecycleState!.activeTurn!.generation!;
+    const parentEffectKey = "attempt-herdr-verifier-unknown";
+    const physical = await inspectWorkspacePhysicalState(workspaceRoot);
+    const sourceSnapshot = {
+      head: physical.head ?? null,
+      diffHash: physical.diffHash ?? null,
+      changedPaths: [...physical.changedPaths].sort(),
+      fingerprints: physical.fingerprints ?? {},
+    };
+    const semanticEffectMaterial = {
+      role: "VERIFY",
+      planKey: (manager as any).buildHerdrVerifierPlan(replay.record, generation).planKey,
+      parentEffectKey,
+      parentRole: "IMPLEMENT",
+      toolchainId: "wave2-329",
+      verifier: "typecheck",
+      toolchainRoot: workspaceRoot,
+      executable: "/configured/typecheck",
+      args: [],
+      sourceSnapshot,
+    };
+    const effectKey = `verify:${createHash("sha256")
+      .update(JSON.stringify(semanticEffectMaterial))
+      .digest("hex")
+      .slice(0, 40)}`;
+    const pending = {
+      effectKind: "toolchain-verifier",
+      effectKey,
+      role: "VERIFY",
+      planKey: (manager as any).buildHerdrVerifierPlan(replay.record, generation).planKey,
+      parentEffectKey,
+      parentRole: "IMPLEMENT",
+      turnGeneration: generation,
+      toolchainId: "wave2-329",
+      verifier: "typecheck",
+      toolchainRoot: workspaceRoot,
+      executable: "/configured/typecheck",
+      args: [],
+      sourceSnapshotSha256: createHash("sha256").update(JSON.stringify(sourceSnapshot)).digest("hex"),
+      workspaceHead: sourceSnapshot.head,
+      diffHash: sourceSnapshot.diffHash,
+      changedPaths: sourceSnapshot.changedPaths,
+      effectState: "RUNNING",
+      startedAt: new Date().toISOString(),
+    };
+    const claimed = store.beginExternalRuntimeVerifierCAS({
+      agentId: replay.record.id,
+      generation,
+      effectKey,
+      result: pending,
+    });
+    assert.equal(claimed.applied, true);
+    assert.equal(claimed.started, true);
+
+    assert.equal(await (manager as any).settleHerdrTurn(replay.record, replay.handle, {
+      status: "done",
+      finalResponse: "implemented before reconnect",
+    }), true);
+    const unknown = store.getById(replay.record.id)!.lifecycleState!.automatedVerifierResult!;
+    assert.equal(unknown.effectKey, effectKey);
+    assert.equal(unknown.role, "VERIFY");
+    assert.equal(unknown.effectState, "OUTCOME_UNKNOWN");
+    assert.equal(unknown.passed, undefined, "unknown is never projected as terminal PASS");
+    assert.equal(verifierCalls.length, 2, "a persisted RUNNING verifier claim after reconnect must never be replayed");
+    assert.equal(store.getById(replay.record.id)?.status, "error");
+    await assert.rejects(
+      manager.continueAgent({ workspaceId: replay.record.workspaceId!, workspaceRoot, agentId: replay.record.id, prompt: "successor" }),
+      (error: any) => {
+        assert.equal(error.code, "CONTINUATION_ADMISSION_FAILED");
+        assert.match(error.message, /OUTCOME_UNKNOWN/);
+        return true;
+      },
+    );
+
+    const noPlan = makeActiveHerdrRecord("attempt-herdr-verifier-no-plan", false);
+    assert.equal(await (manager as any).settleHerdrTurn(noPlan.record, noPlan.handle, {
+      status: "done",
+      finalResponse: "legacy terminal record without verifier obligation",
+    }), true);
+    const noPlanResult = store.getById(noPlan.record.id)!.lifecycleState!.automatedVerifierResult!;
+    assert.equal(noPlanResult.effectState, "OUTCOME_UNKNOWN");
+    assert.match(String(noPlanResult.reason), /absence does not establish/);
+    assert.equal(verifierCalls.length, 2, "a terminal record without a pre-effect verifier obligation is not assumed safe to launch");
+    assert.equal(store.getById(noPlan.record.id)?.status, "error");
+  } finally {
+    manager.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(workspaceRoot, { recursive: true, force: true });
   }
 });
 

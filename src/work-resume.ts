@@ -204,6 +204,8 @@ export interface WorkResumeStatus {
   lineage?: WorkLineage;
   /** Mechanical automated verifier execution result on worker terminal */
   automatedVerifierResult?: Record<string, unknown>;
+  /** Append-only per-effect verifier outcomes, keyed by semantic effect identity. */
+  automatedVerifierEffects?: Record<string, Record<string, unknown>>;
   /**
    * Terminal reconciliation receipt when disposition is TERMINAL.
    * Derived from canonical #62 store; cache is read-only projection only.
@@ -304,6 +306,9 @@ export function initializeWorkResumeDatabase(sqlite: Database.Database): void {
   if (!registryColumns.has("verifier_result")) {
     sqlite.exec("alter table work_resume_registry add column verifier_result text");
   }
+  if (!registryColumns.has("verifier_effects")) {
+    sqlite.exec("alter table work_resume_registry add column verifier_effects text");
+  }
 }
 
 // ─── Registry row type ────────────────────────────────────────────────────────
@@ -325,6 +330,7 @@ interface RegistryRow {
   parent_effect?: string | null;
   supersedes?: string | null;
   verifier_result?: string | null;
+  verifier_effects?: string | null;
   registered_at: string;
   updated_at: string;
 }
@@ -658,6 +664,17 @@ export class WorkResumeStore {
         automatedVerifierResult = undefined;
       }
     }
+    let automatedVerifierEffects: Record<string, Record<string, unknown>> | undefined;
+    if (row.verifier_effects) {
+      try {
+        const parsed = JSON.parse(row.verifier_effects) as unknown;
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          automatedVerifierEffects = parsed as Record<string, Record<string, unknown>>;
+        }
+      } catch {
+        automatedVerifierEffects = undefined;
+      }
+    }
 
     // Look up the live lease (canonical authority — always checked first)
     const lease = this.ownership.get(row.lease_id);
@@ -675,6 +692,7 @@ export class WorkResumeStore {
         ...(row.effect_handle ? { effectHandle: row.effect_handle } : {}),
         ...(lineage ? { lineage } : {}),
         ...(automatedVerifierResult ? { automatedVerifierResult } : {}),
+        ...(automatedVerifierEffects ? { automatedVerifierEffects } : {}),
         message: "Registered lease is no longer present in ownership store.",
       };
     }
@@ -708,6 +726,7 @@ export class WorkResumeStore {
         ...(row.effect_handle ? { effectHandle: row.effect_handle } : {}),
         ...(lineage ? { lineage } : {}),
         ...(automatedVerifierResult ? { automatedVerifierResult } : {}),
+        ...(automatedVerifierEffects ? { automatedVerifierEffects } : {}),
         ...(terminalReceipt ? { terminalReceipt } : {}),
         message: `Lease terminal: ${lease.terminalState}`,
       };
@@ -739,6 +758,7 @@ export class WorkResumeStore {
       ...(row.effect_handle ? { effectHandle: row.effect_handle } : {}),
       ...(lineage ? { lineage } : {}),
       ...(automatedVerifierResult ? { automatedVerifierResult } : {}),
+      ...(automatedVerifierEffects ? { automatedVerifierEffects } : {}),
       message: `Disposition: ${disposition}`,
     };
   }
@@ -881,10 +901,32 @@ export class WorkResumeStore {
           `No registered work key ${workKey}; verifier result cannot be recorded.`,
         );
       }
+      const effects: Record<string, Record<string, unknown>> = {};
+      if (row.verifier_effects) {
+        try {
+          Object.assign(effects, JSON.parse(row.verifier_effects) as Record<string, Record<string, unknown>>);
+        } catch {
+          throw new WorkResumeError("MATERIAL_CONFLICT", "Stored verifier lineage is malformed; refusing to overwrite it.");
+        }
+      }
+      const effectKey = typeof result.effectKey === "string" ? result.effectKey : undefined;
+      if (effectKey) {
+        const previous = effects[effectKey];
+        const terminal = (value: Record<string, unknown> | undefined) =>
+          value !== undefined && value.effectState !== "RUNNING";
+        if (previous && terminal(previous) && terminal(result) && JSON.stringify(previous) !== JSON.stringify(result)) {
+          throw new WorkResumeError("MATERIAL_CONFLICT", `Verifier effect ${effectKey} already has a terminal outcome.`);
+        }
+        if (!previous && Object.keys(effects).length >= 256) {
+          throw new WorkResumeError("MATERIAL_CONFLICT", "Verifier lineage reached its 256-effect limit; refusing to discard evidence.");
+        }
+        effects[effectKey] = result;
+      }
       this.sqlite.prepare(
-        "update work_resume_registry set verifier_result=?, updated_at=? where work_key=?",
+        "update work_resume_registry set verifier_result=?, verifier_effects=?, updated_at=? where work_key=?",
       ).run(
         JSON.stringify(result),
+        JSON.stringify(effects),
         new Date(this.now()).toISOString(),
         workKey,
       );

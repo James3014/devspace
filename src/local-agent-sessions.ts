@@ -40,7 +40,12 @@ import {
   type ModelAttestation,
   type DispatchFailureClassification,
 } from "./local-agent-contract.js";
-import { buildToolchainEnvironment, describeToolchainExecutables, runToolchainVerifier } from "./local-agent-toolchains.js";
+import {
+  buildToolchainEnvironment,
+  describeToolchainExecutables,
+  runToolchainVerifier,
+  type ToolchainVerificationResult,
+} from "./local-agent-toolchains.js";
 import type { WorkResumeStore } from "./work-resume.js";
 import { inspectCodexRuntime, type CodexRuntimeIdentity } from "./codex-runtime.js";
 import {
@@ -291,6 +296,8 @@ export interface AgentStatusOutput {
     supersedes?: string;
   };
   automatedVerifierResult?: Record<string, unknown>;
+  automatedVerifierEffects?: Record<string, Record<string, unknown>>;
+  automatedVerifierPlan?: Record<string, unknown>;
   /** P2-H: Operation timeline tracking elapsed phases. */
   operationTimeline?: OperationTimeline;
   /** P2-A: Model attestation detailing requested, resolved, and physically observed model identities. */
@@ -566,10 +573,12 @@ export class LocalAgentSessionManager {
   private readonly herdrGateway: HerdrThinGateway;
   private readonly herdrHandles = new Map<string, HerdrExternalHandle>();
   private readonly herdrTurnTasks = new Map<string, Promise<void>>();
+  private readonly herdrVerifierTasks = new Map<string, Promise<Record<string, unknown>>>();
   private readonly herdrVerifiedLive = new Set<string>();
   private closed = false;
   private readonly terminationAttempts = new Map<string, Promise<boolean>>();
   private workResumeStore?: WorkResumeStore;
+  private readonly toolchainVerifier: typeof runToolchainVerifier;
 
   constructor(
     private readonly config: ServerConfig,
@@ -582,6 +591,7 @@ export class LocalAgentSessionManager {
     opencodeCatalogSource?: ReturnType<typeof createMcpOpencodeCatalogSource>,
     herdrGateway?: HerdrThinGateway,
     workResumeStore?: WorkResumeStore,
+    testToolchainVerifier?: typeof runToolchainVerifier,
   ) {
     this.store = createLocalAgentStore(config.stateDir);
     this.launcher = testLauncher ?? defaultWorkerLauncher;
@@ -593,6 +603,7 @@ export class LocalAgentSessionManager {
     this.ownsOpencodeCatalogSource = opencodeCatalogSource === undefined;
     this.herdrGateway = herdrGateway ?? new HerdrThinGateway(HERDR_DEFAULT_SOCKET_PATH, defaultHerdrGatewayRegistry, this.store);
     this.workResumeStore = workResumeStore;
+    this.toolchainVerifier = testToolchainVerifier ?? runToolchainVerifier;
     this.runtimeBuildIdentity = runtimeBuildIdentity ?? describeRuntimeBuildIdentity({
       env: process.env,
       listenPort: config.port,
@@ -825,18 +836,32 @@ export class LocalAgentSessionManager {
       ...delta.changedPaths,
     ])).sort();
 
+    const automatedVerifierResult = await this.runHerdrTerminalVerifier(record, generation, physical);
+    const verifierUnknown = automatedVerifierResult?.effectState === "OUTCOME_UNKNOWN"
+      || automatedVerifierResult?.effectState === "RUNNING";
+    const verifierFailed = automatedVerifierResult?.effectState === "COMPLETED"
+      && automatedVerifierResult.passed === false;
+
     const completed = this.store.finishExternalRuntimeTurnCAS({
       agentId: record.id,
       generation,
-      status: terminalScope === "SCOPE_VIOLATION" ? "error" : "idle",
+      status: terminalScope === "SCOPE_VIOLATION" || verifierUnknown || verifierFailed ? "error" : "idle",
       providerSessionId: promptResult?.nativeProviderSessionId ?? handle.nativeProviderSessionId,
       latestResponse: promptResult?.finalResponse ?? promptResult?.paneOutput,
       error: terminalScope === "SCOPE_VIOLATION"
         ? `Agent modified paths outside authorized scope: ${scope.unexpectedPaths.join(", ")}`
+        : verifierUnknown
+          ? `Automated verifier effect ${String(automatedVerifierResult?.effectKey ?? "unknown")} has OUTCOME_UNKNOWN; continuation is blocked until that exact effect is reconciled.`
+          : verifierFailed
+            ? `Automated verifier ${String(automatedVerifierResult?.verifier ?? "unknown")} failed for effect ${String(automatedVerifierResult?.effectKey ?? "unknown")}.`
         : undefined,
-      errorCode: terminalScope === "SCOPE_VIOLATION" ? "SCOPE_VIOLATION" : undefined,
-      errorRetryable: terminalScope === "SCOPE_VIOLATION" ? false : undefined,
-      terminalReason: terminalScope === "SCOPE_VIOLATION" ? "scope_violation" : undefined,
+      errorCode: terminalScope === "SCOPE_VIOLATION"
+        ? "SCOPE_VIOLATION"
+        : verifierUnknown ? "VERIFIER_OUTCOME_UNKNOWN" : verifierFailed ? "VERIFIER_FAILED" : undefined,
+      errorRetryable: terminalScope === "SCOPE_VIOLATION" || verifierUnknown || verifierFailed ? false : undefined,
+      terminalReason: terminalScope === "SCOPE_VIOLATION"
+        ? "scope_violation"
+        : verifierUnknown ? "unknown" : verifierFailed ? "provider_error" : undefined,
       scopeState: terminalScope,
       cumulativeChangedPaths: cumulative,
       turnEndBaseline: {
@@ -844,6 +869,7 @@ export class LocalAgentSessionManager {
         head: physical.head ?? null,
         fingerprints: physical.fingerprints,
       },
+      automatedVerifierResult,
     });
     if (!completed.applied) {
       const current = this.store.getById(record.id);
@@ -854,6 +880,381 @@ export class LocalAgentSessionManager {
       );
     }
     return true;
+  }
+
+  /**
+   * Run HerdR's mechanical verifier as its own durable VERIFY effect. The
+   * RUNNING identity is committed before invoking the executable, so restart
+   * after that fence reports OUTCOME_UNKNOWN and cannot rerun the command.
+   */
+  private buildHerdrVerifierPlan(
+    record: LocalAgentRecord,
+    generation: string,
+  ): Record<string, unknown> | undefined {
+    const contract = record.executionContract;
+    const configuredToolchains = this.config.toolchains ?? [];
+    const toolchainId = contract?.toolchainId
+      ?? (configuredToolchains.length > 0 ? configuredToolchains[0]?.id : undefined);
+    if (!toolchainId || !(contract?.role === "IMPLEMENT" || contract?.role === "REPAIR" || contract?.toolchainId)) {
+      return undefined;
+    }
+    const toolchain = configuredToolchains.find((candidate) => candidate.id === toolchainId);
+    const verifier = Object.keys(toolchain?.verifiers ?? {})[0];
+    if (!toolchain || !verifier) return undefined;
+
+    const parentEffectKey = record.startReplay?.key ?? contract.dispatchIntent?.attemptId;
+    if (!parentEffectKey) {
+      throw new AgentSessionError(
+        "AGENT_LIFECYCLE_CORRUPT",
+        `HerdR verifier for agent ${record.id} has no durable parent effect identity.`,
+      );
+    }
+    const executable = toolchain.verifiers[verifier];
+    const parentRole = contract.role ?? "IMPLEMENT";
+    const planKey = `verify-plan:${createHash("sha256")
+      .update(JSON.stringify([parentEffectKey, parentRole, toolchainId, verifier, toolchain.root, executable]))
+      .digest("hex")
+      .slice(0, 40)}`;
+    return {
+      planKey,
+      role: "VERIFY",
+      parentEffectKey,
+      parentRole,
+      toolchainId,
+      verifier,
+      toolchainRoot: toolchain.root,
+      executable,
+      args: [],
+      turnGeneration: generation,
+    };
+  }
+
+  private async runHerdrTerminalVerifier(
+    record: LocalAgentRecord,
+    generation: string,
+    physical: Awaited<ReturnType<typeof inspectWorkspacePhysicalState>>,
+  ): Promise<Record<string, unknown> | undefined> {
+    const plan = this.buildHerdrVerifierPlan(record, generation);
+    if (!plan) return undefined;
+
+    const parentEffectKey = String(plan.parentEffectKey);
+    const toolchainId = String(plan.toolchainId);
+    const verifier = String(plan.verifier);
+    const configuredToolchains = this.config.toolchains ?? [];
+    const current = this.store.getById(record.id);
+    const currentPlan = current?.lifecycleState?.automatedVerifierPlan;
+    const ledger = current?.lifecycleState?.automatedVerifierEffects ?? {};
+    const planMatches = currentPlan?.planKey === plan.planKey
+      && currentPlan?.turnGeneration === generation
+      && currentPlan?.parentEffectKey === parentEffectKey
+      && currentPlan?.toolchainId === toolchainId
+      && currentPlan?.verifier === verifier;
+    const boundCandidate = planMatches && currentPlan?.boundCandidate && typeof currentPlan.boundCandidate === "object"
+      ? currentPlan.boundCandidate as Record<string, unknown>
+      : undefined;
+    const boundEffectKey = typeof boundCandidate?.effectKey === "string" ? boundCandidate.effectKey : undefined;
+    const existingBoundEffect = boundEffectKey
+      ? ledger[boundEffectKey]
+        ?? (current?.lifecycleState?.automatedVerifierResult?.effectKey === boundEffectKey
+          ? current.lifecycleState.automatedVerifierResult
+          : undefined)
+      : undefined;
+    if (existingBoundEffect) {
+      if (existingBoundEffect.effectState !== "RUNNING") return existingBoundEffect;
+      const inFlight = this.herdrVerifierTasks.get(`${record.id}:${boundEffectKey}`);
+      if (inFlight) return inFlight;
+      return this.settleUnknownHerdrVerifier(record.id, generation, existingBoundEffect, existingBoundEffect);
+    }
+
+    // Older records may have persisted RUNNING before candidate binding existed.
+    // Only the same durable turn generation can be classified from that record;
+    // completed effects from earlier turns do not suppress a new candidate.
+    const unboundRunningEffect = Object.values(ledger).find((effect) =>
+      effect.planKey === plan.planKey
+      && effect.turnGeneration === generation
+      && effect.effectState === "RUNNING",
+    );
+    if (unboundRunningEffect) {
+      return this.settleUnknownHerdrVerifier(record.id, generation, unboundRunningEffect, unboundRunningEffect);
+    }
+    const physicalSnapshot = {
+      head: physical.head ?? null,
+      diffHash: physical.diffHash ?? null,
+      changedPaths: [...physical.changedPaths].sort(),
+      fingerprints: physical.fingerprints ?? {},
+    };
+    let sourceSnapshot = physicalSnapshot;
+    let effectKey: string;
+    if (planMatches) {
+      const stored = currentPlan?.boundCandidate;
+      if (stored && typeof stored === "object" && typeof (stored as Record<string, unknown>).effectKey === "string") {
+        sourceSnapshot = (stored as Record<string, unknown>).sourceSnapshot as typeof physicalSnapshot;
+        effectKey = String((stored as Record<string, unknown>).effectKey);
+      } else {
+        const candidateSourceHash = createHash("sha256").update(JSON.stringify(physicalSnapshot)).digest("hex");
+        const material = {
+          role: "VERIFY",
+          planKey: plan.planKey,
+          parentEffectKey,
+          parentRole: plan.parentRole,
+          toolchainId,
+          verifier,
+          toolchainRoot: plan.toolchainRoot,
+          executable: plan.executable,
+          args: plan.args,
+          sourceSnapshot: physicalSnapshot,
+        };
+        const candidateKey = `verify:${createHash("sha256")
+          .update(JSON.stringify(material))
+          .digest("hex")
+          .slice(0, 40)}`;
+        const candidate = {
+          effectKey: candidateKey,
+          sourceSnapshot: physicalSnapshot,
+          sourceSnapshotSha256: candidateSourceHash,
+          semanticMaterialSha256: createHash("sha256").update(JSON.stringify(material)).digest("hex"),
+        };
+        const bound = this.store.bindExternalRuntimeVerifierCandidateCAS({
+          agentId: record.id,
+          generation,
+          planKey: String(plan.planKey),
+          candidate,
+        });
+        const afterBind = bound.current?.lifecycleState?.automatedVerifierPlan;
+        const persisted = afterBind?.boundCandidate;
+        if (!bound.applied || !persisted || typeof persisted !== "object") {
+          throw new AgentSessionError(
+            "AGENT_LIFECYCLE_CORRUPT",
+            `HerdR verifier candidate for plan ${String(plan.planKey)} could not be durably bound before launch.`,
+          );
+        }
+        sourceSnapshot = (persisted as Record<string, unknown>).sourceSnapshot as typeof physicalSnapshot;
+        effectKey = String((persisted as Record<string, unknown>).effectKey);
+      }
+    } else {
+      const material = {
+        role: "VERIFY",
+        planKey: plan.planKey,
+        parentEffectKey,
+        parentRole: plan.parentRole,
+        toolchainId,
+        verifier,
+        toolchainRoot: plan.toolchainRoot,
+        executable: plan.executable,
+        args: plan.args,
+        sourceSnapshot: physicalSnapshot,
+      };
+      effectKey = `verify:${createHash("sha256")
+        .update(JSON.stringify(material))
+        .digest("hex")
+        .slice(0, 40)}`;
+    }
+    const sourceSnapshotSha256 = createHash("sha256").update(JSON.stringify(sourceSnapshot)).digest("hex");
+    const taskKey = `${record.id}:${effectKey}`;
+    const identity = {
+      effectKind: "toolchain-verifier",
+      effectKey,
+      role: "VERIFY",
+      planKey: plan.planKey,
+      parentEffectKey,
+      parentRole: plan.parentRole,
+      turnGeneration: generation,
+      toolchainId,
+      verifier,
+      toolchainRoot: plan.toolchainRoot,
+      executable: plan.executable,
+      args: plan.args,
+      sourceSnapshotSha256,
+      workspaceHead: sourceSnapshot.head,
+      diffHash: sourceSnapshot.diffHash,
+      changedPaths: sourceSnapshot.changedPaths,
+    };
+    const existing = ledger[effectKey]
+      ?? (current?.lifecycleState?.automatedVerifierResult?.effectKey === effectKey
+        ? current.lifecycleState.automatedVerifierResult
+        : undefined);
+    if (existing) {
+      if (existing.effectState !== "RUNNING") return existing;
+      const inFlight = this.herdrVerifierTasks.get(taskKey);
+      if (inFlight) return inFlight;
+      return this.settleUnknownHerdrVerifier(record.id, generation, identity, existing);
+    }
+
+    const unresolved = Object.values(ledger).find((effect) =>
+      effect.effectState === "RUNNING" || effect.effectState === "OUTCOME_UNKNOWN");
+    if (unresolved) {
+      const blocked = {
+        ...identity,
+        effectState: "OUTCOME_UNKNOWN",
+        completedAt: new Date().toISOString(),
+        reason: `A prior verifier effect ${String(unresolved.effectKey ?? "unknown")} remains unresolved; no verifier command was launched.`,
+      };
+      const recorded = this.store.beginExternalRuntimeVerifierCAS({
+        agentId: record.id,
+        generation,
+        effectKey,
+        result: blocked,
+      });
+      if (recorded.applied) this.persistHerdrVerifierResult(record, blocked);
+      return recorded.current?.lifecycleState?.automatedVerifierEffects?.[effectKey] ?? blocked;
+    }
+
+    const pending = {
+      ...identity,
+      effectState: "RUNNING",
+      startedAt: new Date().toISOString(),
+    };
+    if (!planMatches) {
+      const unknown = {
+        ...identity,
+        effectState: "OUTCOME_UNKNOWN",
+        completedAt: new Date().toISOString(),
+        reason: "No matching durable verifier obligation was recorded before provider execution; absence does not establish that the verifier did not run.",
+      };
+      const recorded = this.store.beginExternalRuntimeVerifierCAS({
+        agentId: record.id,
+        generation,
+        effectKey,
+        result: unknown,
+      });
+      if (!recorded.applied) {
+        const durable = this.store.getById(record.id)?.lifecycleState?.automatedVerifierEffects?.[effectKey];
+        if (durable) return durable;
+        throw new AgentSessionError(
+          "AGENT_LIFECYCLE_CORRUPT",
+          `HerdR verifier effect ${effectKey} lacks its pre-execution obligation and could not be durably marked unknown.`,
+        );
+      }
+      this.persistHerdrVerifierResult(record, unknown);
+      return unknown;
+    }
+
+    const claimed = this.store.beginExternalRuntimeVerifierCAS({
+      agentId: record.id,
+      generation,
+      effectKey,
+      result: pending,
+    });
+    if (!claimed.applied) {
+      const latest = this.store.getById(record.id);
+      const durable = latest?.lifecycleState?.automatedVerifierResult;
+      if (durable?.effectKey === effectKey && durable.effectState !== "RUNNING") return durable;
+      const inFlight = this.herdrVerifierTasks.get(taskKey);
+      if (durable?.effectKey === effectKey && inFlight) return inFlight;
+      if (durable?.effectKey === effectKey && durable.effectState === "RUNNING") {
+        return this.settleUnknownHerdrVerifier(record.id, generation, identity, durable);
+      }
+      throw new AgentSessionError(
+        "AGENT_LIFECYCLE_CORRUPT",
+        `HerdR verifier effect ${effectKey} could not be durably claimed; command was not started.`,
+      );
+    }
+    if (!claimed.started) {
+      const durable = claimed.current?.lifecycleState?.automatedVerifierResult ?? pending;
+      const inFlight = this.herdrVerifierTasks.get(taskKey);
+      if (inFlight) return inFlight;
+      if (durable.effectState !== "RUNNING") return durable;
+      return this.settleUnknownHerdrVerifier(record.id, generation, identity, durable);
+    }
+
+    this.persistHerdrVerifierResult(record, pending);
+    const task = (async (): Promise<Record<string, unknown>> => {
+      let result: Record<string, unknown>;
+      try {
+        const verification: ToolchainVerificationResult = await this.toolchainVerifier({
+          toolchains: configuredToolchains,
+          toolchainId,
+          verifier,
+          args: [],
+          cwd: record.workspaceRoot,
+        });
+        result = {
+          ...identity,
+          effectState: "COMPLETED",
+          completedAt: new Date().toISOString(),
+          exitCode: verification.exitCode,
+          passed: verification.exitCode === 0,
+          durationMs: verification.durationMs,
+          timedOut: verification.timedOut,
+          launchFailed: Boolean(verification.launchError),
+          stdout: verification.stdout,
+          stderr: verification.stderr,
+        };
+      } catch (error) {
+        result = {
+          ...identity,
+          effectState: "COMPLETED",
+          completedAt: new Date().toISOString(),
+          passed: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+
+      const completed = this.store.finishExternalRuntimeVerifierCAS({
+        agentId: record.id,
+        generation,
+        effectKey,
+        result,
+      });
+      if (!completed.applied) {
+        const durable = this.store.getById(record.id)?.lifecycleState?.automatedVerifierResult;
+        if (durable?.effectKey === effectKey && durable.effectState !== "RUNNING") return durable;
+        throw new AgentSessionError(
+          "AGENT_LIFECYCLE_CORRUPT",
+          `HerdR verifier ${effectKey} ran but its terminal outcome could not be durably recorded.`,
+        );
+      }
+      this.persistHerdrVerifierResult(record, result);
+      return result;
+    })();
+    this.herdrVerifierTasks.set(taskKey, task);
+    try {
+      return await task;
+    } finally {
+      if (this.herdrVerifierTasks.get(taskKey) === task) this.herdrVerifierTasks.delete(taskKey);
+    }
+  }
+
+  private settleUnknownHerdrVerifier(
+    agentId: string,
+    generation: string,
+    identity: Record<string, unknown>,
+    pending: Record<string, unknown>,
+  ): Record<string, unknown> {
+    const unknown = {
+      ...identity,
+      ...pending,
+      effectState: "OUTCOME_UNKNOWN",
+      completedAt: new Date().toISOString(),
+      reason: "A durable verifier start exists without a terminal result; command replay is forbidden.",
+    };
+    const settled = this.store.finishExternalRuntimeVerifierCAS({
+      agentId,
+      generation,
+      effectKey: String(identity.effectKey),
+      result: unknown,
+    });
+    if (settled.applied) {
+      if (settled.current) this.persistHerdrVerifierResult(settled.current, unknown);
+      return unknown;
+    }
+    const durable = this.store.getById(agentId)?.lifecycleState?.automatedVerifierResult;
+    if (durable && durable.effectKey === identity.effectKey && durable.effectState !== "RUNNING") return durable;
+    throw new AgentSessionError(
+      "AGENT_LIFECYCLE_CORRUPT",
+      `HerdR verifier ${String(identity.effectKey)} is unresolved and could not be recorded as unknown.`,
+    );
+  }
+
+  private persistHerdrVerifierResult(record: LocalAgentRecord, result: Record<string, unknown>): void {
+    const workKey = record.executionContract?.resumableWork?.workKey;
+    if (!workKey || !this.workResumeStore) return;
+    try {
+      this.workResumeStore.recordAutomatedVerifierResult(workKey, result);
+    } catch {
+      // The lifecycle CAS is canonical for this external runtime. Preserve the
+      // work-resume projection's existing best-effort behavior.
+    }
   }
 
   private async runHerdrTurn(agentId: string, prompt: string): Promise<void> {
@@ -1063,6 +1464,34 @@ export class LocalAgentSessionManager {
   private startHerdrTurn(agentId: string, prompt: string): void {
     const existing = this.herdrTurnTasks.get(agentId);
     if (existing) return;
+    const initial = this.store.getById(agentId);
+    const generation = initial?.lifecycleState?.activeTurn?.generation;
+    if (!initial || !generation) return;
+    const verifierPlan = this.buildHerdrVerifierPlan(initial, generation);
+    if (verifierPlan) {
+      const prepared = this.store.prepareExternalRuntimeVerifierCAS({
+        agentId,
+        generation,
+        plan: verifierPlan,
+      });
+      if (!prepared.applied) {
+        const error = "HerdR verifier obligation could not be durably recorded before provider execution.";
+        if (initial.externalRuntimeBinding?.runtimeKind === "HERDR") {
+          this.store.failExternalRuntimeTurnCAS({
+            agentId,
+            generation,
+            error,
+            errorCode: "VERIFIER_PLAN_PERSIST_FAILED",
+            errorRetryable: false,
+            terminalReason: "unknown",
+            scopeState: "UNKNOWN",
+          });
+        } else {
+          this.store.failExternalRuntimePreLaunchCAS(agentId, generation, error, { terminalReason: "unknown" });
+        }
+        return;
+      }
+    }
     const task = this.runHerdrTurn(agentId, prompt);
     this.herdrTurnTasks.set(agentId, task);
     void task.finally(() => {
@@ -1412,6 +1841,18 @@ export class LocalAgentSessionManager {
       throw new AgentSessionError(
         "AGENT_LIFECYCLE_CORRUPT",
         `Agent ${agentId} has a terminal status with an unsettled active turn; continuation is blocked.`,
+      );
+    }
+    const unresolvedVerifier = Object.values(record.lifecycleState?.automatedVerifierEffects ?? {})
+      .find((effect) => effect.effectState === "RUNNING" || effect.effectState === "OUTCOME_UNKNOWN")
+      ?? (record.lifecycleState?.automatedVerifierResult?.effectState === "RUNNING"
+        || record.lifecycleState?.automatedVerifierResult?.effectState === "OUTCOME_UNKNOWN"
+        ? record.lifecycleState.automatedVerifierResult
+        : undefined);
+    if (unresolvedVerifier) {
+      throw new AgentSessionError(
+        "CONTINUATION_ADMISSION_FAILED",
+        `Agent ${agentId} has unresolved verifier effect ${String(unresolvedVerifier.effectKey ?? "unknown")} (${String(unresolvedVerifier.effectState)}); reconcile that exact effect before starting a successor.`,
       );
     }
 
@@ -3854,6 +4295,12 @@ function recordToStatusOutput(
   }
   if (record.lifecycleState?.automatedVerifierResult) {
     output.automatedVerifierResult = record.lifecycleState.automatedVerifierResult;
+  }
+  if (record.lifecycleState?.automatedVerifierEffects) {
+    output.automatedVerifierEffects = record.lifecycleState.automatedVerifierEffects;
+  }
+  if (record.lifecycleState?.automatedVerifierPlan) {
+    output.automatedVerifierPlan = record.lifecycleState.automatedVerifierPlan;
   }
   // P2-D: Separate dispatcher heartbeat from provider activity
   output.dispatcherHeartbeatAt = record.updatedAt;
