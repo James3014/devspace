@@ -1415,7 +1415,9 @@ export class LocalAgentSessionManager {
       ...pending,
       effectState: "OUTCOME_UNKNOWN",
       completedAt: new Date().toISOString(),
-      reason: "A durable verifier start exists without a terminal result; command replay is forbidden.",
+      reason: typeof pending.reason === "string"
+        ? pending.reason
+        : "A durable verifier start exists without a terminal result; command replay is forbidden.",
     };
     const settled = this.store.finishExternalRuntimeVerifierCAS({
       agentId,
