@@ -200,6 +200,9 @@ export class AcpRuntime implements LocalAgentRuntime {
             message: `${this.provider} ACP runtime is not running.`,
           });
         }
+        if (this.child && this.child.exitCode === null && !this.child.killed) {
+          await callbacks?.onProviderProcessState?.("running");
+        }
         const sessionId = await this.openSession(input, callbacks);
         if (this.activeSessions.has(sessionId)) {
           throw new TypeError(`${this.provider} ACP session ${sessionId} already has an active turn.`);
