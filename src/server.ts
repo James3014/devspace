@@ -19,7 +19,8 @@ import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { isInitializeRequest, type ServerNotification, type ServerRequest } from "@modelcontextprotocol/sdk/types.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import { checkResourceAllowed, resourceUrlFromServerUrl } from "@modelcontextprotocol/sdk/shared/auth-utils.js";
 import {
   registerAppResource,
@@ -459,6 +460,19 @@ const DIRECT_CODING_TOOL_NAMES = new Set<string>([
   "git_push",
 ]);
 
+const DIRECT_DISPATCH_TOOL_NAMES = new Set<string>([
+  toolNames.openWorkspace,
+  toolNames.read,
+  "agent_catalog",
+  "agent_preflight",
+  "agent_start",
+  "agent_status",
+  "agent_continue",
+  "agent_reconcile",
+  "agent_cancel",
+  "agent_list",
+]);
+
 const workspaceIdDescription =
   "Workspace to use. Reuse the current project's workspaceId.";
 
@@ -479,6 +493,10 @@ interface ToolLogFields {
 
 function serverInstructions(config: ServerConfig): string {
   const directCodingMode = config.toolMode === "minimal";
+  const directDispatchMode = config.toolMode === "dispatch";
+  if (directDispatchMode) {
+    return "Use DevSpace only for direct worker dispatch. Call open_workspace once for the project checkout or isolated worktree, then reuse its workspaceId. Use read only for bounded instruction or result inspection. Use agent_catalog when exact provider/model catalog membership matters, then agent_preflight before launch. Start exactly one worker with agent_start using a stable attemptKey and authorityMode OWNER_DIRECT. For write-capable work, provide expectedHead when known, bounded writePaths, and maxFiles. Poll the same agent with agent_status. Use agent_continue only for one evidence-guided follow-up on that same agentId. After a timeout, disconnect, or ambiguous response, query the same agentId and use agent_reconcile; never redispatch the logical task under a new attemptKey until the original effect is reconciled. Use agent_list to recover durable sessions and agent_cancel only for the exact worker that must be stopped. This surface grants no acceptance, merge, release, or production authority.";
+  }
   const artifactInstruction = !directCodingMode && config.artifactsEnabled && isArtifactDownloadSupportedPlatform()
     ? " When the user supplies or generates a file that is not present on the DevSpace host, use download_artifact with its native file value, the existing workspace ID, and a suitable relative destination path chosen from the user's request and project structure. The tool refuses to overwrite an existing destination and returns the normalized workspace-relative path. Use normal workspace tools when explicit inspection, replacement, movement, renaming, or deletion is needed. Do not recreate binary files with write/edit calls or place signed URLs, native file objects, base64 content, or invented host paths in shell commands or logs."
     : "";
@@ -2820,6 +2838,20 @@ function describeOutcome(outcome: OrchestrationOutcome): string {
   }
 }
 
+type AgentStartToolInput = {
+  workspaceId: string;
+  profile?: string;
+  provider?: LocalAgentProvider;
+  model?: string;
+  effort?: string;
+  cliProviderId?: "cline" | "cline-pass";
+  prompt: string;
+  attemptKey: string;
+  executionContract?: unknown;
+};
+
+type McpRequestHandlerExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
+
 function createAgentStartInputSchema() {
   const dispatchIntent = z.object({
     taskId: z.string().min(1),
@@ -2966,6 +2998,53 @@ function createAgentStartInputSchema() {
     prompt: z.string().describe("Task prompt for the agent."),
     attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/).describe(
       "Required physical-workspace-scoped replay identity. Exact request replays reuse one durable agent; conflicting reuse fails closed.",
+    ),
+    executionContract,
+  };
+}
+
+function createDirectDispatchAgentStartInputSchema() {
+  const executionContract = z.object({
+    authorityMode: z.literal("OWNER_DIRECT").optional().describe(
+      "Optional explicit direct-execution lane. Omit it to use OWNER_DIRECT.",
+    ),
+    expectedHead: z.string().regex(/^[0-9a-f]{40}$/).optional().describe(
+      "Optional exact repository HEAD fence. The worker is not launched if the workspace HEAD differs.",
+    ),
+    writePaths: z.array(z.string().min(1)).min(1).optional().describe(
+      "Required for write-capable workers. Canonical writable path scope relative to the workspace root.",
+    ),
+    maxFiles: z.number().int().min(1).optional().describe(
+      "Optional maximum number of files the worker may change.",
+    ),
+    toolchainId: z.string().optional().describe(
+      "Optional configured toolchain used for verifier execution. DevSpace does not install toolchains.",
+    ),
+    maxWallMs: z.number().int().min(1).optional().describe(
+      "Optional wall-clock bound for the whole agent turn.",
+    ),
+    maxStartupMs: z.number().int().min(1).optional().describe(
+      "Optional wall-clock bound for startup/readiness.",
+    ),
+    maxExecutionMs: z.number().int().min(1).optional().describe(
+      "Optional wall-clock bound for provider execution.",
+    ),
+    idleTimeoutMode: z.literal("EXPLICIT_OVERRIDE").optional().describe(
+      "Marks idleTimeoutMs as an explicit task-contract override.",
+    ),
+    idleTimeoutMs: z.number().int().min(1).optional().describe(
+      "Optional hard no-provider-activity timeout. Requires idleTimeoutMode=EXPLICIT_OVERRIDE.",
+    ),
+  }).strict().optional().describe(
+    "Optional direct-dispatch execution-safety contract. Write-capable workers must provide writePaths.",
+  );
+
+  return {
+    workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+    ...agentSelectorShape().shape,
+    prompt: z.string().describe("Bounded task prompt for the worker."),
+    attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/).describe(
+      "Required physical-workspace-scoped replay identity. Exact request replays reuse one durable worker effect.",
     ),
     executionContract,
   };
@@ -3232,7 +3311,9 @@ export function createMcpServer(
     ?? { value: "unresolved" };
   const latestMcpToolCatalogNames = runtimeBuildIdentityContext?.latestMcpToolCatalogNames
     ?? { value: [] as string[] };
-  const agentStartInputSchema = createAgentStartInputSchema();
+  const agentStartInputSchema = config.toolMode === "dispatch"
+    ? createDirectDispatchAgentStartInputSchema()
+    : createAgentStartInputSchema();
   const agentPreflightInputSchema = createAgentPreflightInputSchema();
 
   const hostStorageInput = () => {
@@ -3370,11 +3451,16 @@ export function createMcpServer(
   // registerTool entry point. registerAppTool and sibling registrars all
   // converge here, so this avoids a second hand-maintained tool inventory.
   const registeredMcpToolNames = new Set<string>();
+  const projectedToolNames = config.toolMode === "minimal"
+    ? DIRECT_CODING_TOOL_NAMES
+    : config.toolMode === "dispatch"
+      ? DIRECT_DISPATCH_TOOL_NAMES
+      : undefined;
   const registerMcpTool = server.registerTool.bind(server) as (...args: any[]) => unknown;
   (server as unknown as { registerTool: (...args: any[]) => unknown }).registerTool =
     (name: string, ...args: any[]) => {
       const registered = registerMcpTool(name, ...args) as { disable?: () => void };
-      if (config.toolMode === "minimal" && !DIRECT_CODING_TOOL_NAMES.has(name)) {
+      if (projectedToolNames && !projectedToolNames.has(name)) {
         registered.disable?.();
         return registered;
       }
@@ -5643,7 +5729,10 @@ export function createMcpServer(
         _meta: {},
         annotations: AGENT_TOOL_ANNOTATIONS_WRITE,
       },
-      async ({ workspaceId, profile, provider, model, effort, cliProviderId, prompt, attemptKey, executionContract }, extra) => {
+      async (
+        { workspaceId, profile, provider, model, effort, cliProviderId, prompt, attemptKey, executionContract }: AgentStartToolInput,
+        extra: McpRequestHandlerExtra,
+      ) => {
         const selectorError = validateAgentSelector({ profile, provider, model, effort, cliProviderId });
         if (selectorError) throw new AgentSessionError("UNKNOWN_PROFILE", selectorError);
         const workspace = workspaces.getWorkspace(workspaceId);
@@ -5675,6 +5764,12 @@ export function createMcpServer(
           const ownerDirect = authorityMode === "OWNER_DIRECT" && !coreBound;
 
           if (ownerDirect) {
+            if (config.toolMode === "dispatch" && (!contract?.writePaths || contract.writePaths.length === 0)) {
+              throw new AgentSessionError(
+                "INVALID_EXECUTION_CONTRACT",
+                "DIRECT_DISPATCH_WRITE_SCOPE_REQUIRED: write-capable direct dispatch requires bounded executionContract.writePaths.",
+              );
+            }
             if (coreMutationGuard?.active(workspaceId)) {
               throw new AgentSessionError(
                 "INVALID_EXECUTION_CONTRACT",

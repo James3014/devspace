@@ -1318,7 +1318,7 @@ async function fixture(
     subagents?: boolean | SubagentsConfig;
     gitCandidates?: boolean;
     toolchains?: string;
-    toolMode?: "full" | "minimal" | "codex";
+    toolMode?: "full" | "minimal" | "codex" | "dispatch";
     chatSwarm?: boolean;
     controlPlaneInventory?: ControlPlaneInventory;
     coreMutation?: boolean | "enforced_missing";
@@ -5098,6 +5098,109 @@ test("command_status metadata annotations and minimal mode visibility", async (t
     idempotentHint: true,
     openWorldHint: false,
   });
+});
+
+test("dispatch mode exposes only the direct worker lifecycle and simple instructions", async (t) => {
+  const context = await fixture(t, {
+    git: true,
+    toolMode: "dispatch",
+    subagents: true,
+    gitCandidates: true,
+    chatSwarm: true,
+    coreMutation: true,
+  });
+  const toolsList = await context.client.listTools();
+  const names = toolsList.tools.map((tool) => tool.name).sort();
+
+  assert.deepEqual(names, [
+    "agent_cancel",
+    "agent_catalog",
+    "agent_continue",
+    "agent_list",
+    "agent_preflight",
+    "agent_reconcile",
+    "agent_start",
+    "agent_status",
+    "open_workspace",
+    "read",
+  ]);
+  assert.equal(names.length, 10);
+  assert.deepEqual(
+    names.filter((name) => /core|coordination|cutover|host_operation|candidate|repository_intelligence|^bash$|^write$|^edit$|apply_patch|^git_/.test(name)),
+    [],
+  );
+
+  const agentStart = toolsList.tools.find((tool) => tool.name === "agent_start");
+  assert.ok(agentStart);
+  const agentStartSchema = JSON.stringify(agentStart.inputSchema);
+  assert.match(agentStartSchema, /attemptKey/);
+  assert.match(agentStartSchema, /expectedHead/);
+  assert.match(agentStartSchema, /writePaths/);
+  assert.doesNotMatch(
+    agentStartSchema,
+    /nexusGrant|coreMutation|capabilityDiscovery|authorizedToolCeiling|toolProjectionManifest|effectProjection/,
+  );
+
+  const instructions = context.client.getInstructions() ?? "";
+  assert.match(instructions, /open_workspace/);
+  assert.match(instructions, /agent_catalog/);
+  assert.match(instructions, /agent_preflight/);
+  assert.match(instructions, /agent_start/);
+  assert.match(instructions, /OWNER_DIRECT/);
+  assert.match(instructions, /attemptKey/);
+  assert.match(instructions, /agent_status/);
+  assert.match(instructions, /agent_reconcile/);
+  assert.match(instructions, /read/);
+  assert.doesNotMatch(instructions, /Core|Nexus|coordination|cutover|host.?operation/i);
+});
+
+test("dispatch mode requires bounded write scope and launches OWNER_DIRECT without governance inputs", async (t) => {
+  const conversationScopeId = "issue350-dispatch-worker";
+  const context = await fixture(t, {
+    git: true,
+    toolMode: "dispatch",
+    subagents: true,
+    coreMutation: true,
+  });
+  await addMutatorProfile(context.project);
+  await execFileAsync("git", ["add", ".devspace/agents/mutator.md"], { cwd: context.project });
+  await execFileAsync("git", ["commit", "-m", "test fixture mutator profile"], { cwd: context.project });
+  const opened = await callOpen(context.client, context.project, conversationScopeId);
+  const workspaceId = structuredContent(opened).workspaceId as string;
+  const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: context.project })).stdout.trim();
+
+  const unbounded = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "mutator",
+      prompt: "perform one bounded direct change",
+      attemptKey: "issue350-dispatch-unbounded",
+    },
+    _meta: { "openai/session": conversationScopeId },
+  });
+  assert.equal(unbounded.isError, true);
+  assert.match(responseText(unbounded), /DIRECT_DISPATCH_WRITE_SCOPE_REQUIRED/);
+
+  const started = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "mutator",
+      prompt: "perform one bounded direct change",
+      attemptKey: "issue350-dispatch-bounded",
+      executionContract: {
+        authorityMode: "OWNER_DIRECT",
+        expectedHead: head,
+        writePaths: ["src"],
+        maxFiles: 2,
+      },
+    },
+    _meta: { "openai/session": conversationScopeId },
+  });
+  assert.equal(started.isError, undefined, responseText(started));
+  assert.ok(structuredContent(started).agentId);
+  assert.equal(structuredContent(started).coreMutation, undefined);
 });
 
 test("minimal mode is direct coding while full mode keeps Core mutation admission", async (t) => {

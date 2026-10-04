@@ -96,13 +96,15 @@ MCP clients discover metadata from:
 | Value | Behavior |
 | --- | --- |
 | `minimal` | Default Direct Coding surface. Exposes exactly `open_workspace`, `read`, `write`, `edit`, `grep`, `glob`, `ls`, `bash`, `command_status`, and `workspace_verify`. It does not project subagent, Candidate, Core-mutation, coordination, cutover, host-operation, or provider-routing tools. Structured file mutations keep workspace/root containment; shell still runs with the local user's authority and is not a filesystem sandbox. |
+| `dispatch` | Direct Worker Dispatch surface. Exposes exactly `open_workspace`, `read`, `agent_catalog`, `agent_preflight`, `agent_start`, `agent_status`, `agent_continue`, `agent_reconcile`, `agent_cancel`, and `agent_list`. The `agent_start` schema is narrowed to OWNER_DIRECT worker selection plus execution-safety bounds; write-capable workers require bounded `writePaths`. This surface does not project coding mutation commands or the broad control plane. |
 | `full` | Full DevSpace control-plane surface. Use this only when the workflow needs delegated workers, durable Core-bound mutation, Candidate/integration, coordination/reconciliation, cutover, or other configured control-plane capabilities. |
 | `codex` | Experimental Codex-compatible coding surface with `apply_patch`, `exec_command`, and `write_stdin` in place of the normal mutation/shell primitives; configured full control-plane capabilities remain available. |
 
 `DEVSPACE_MINIMAL_TOOLS` remains a backward-compatible alias when
 `DEVSPACE_TOOL_MODE` is unset: `1` selects `minimal` and `0` selects `full`.
-The `codex` mode must be selected through `DEVSPACE_TOOL_MODE` and always uses
-its fixed short tool names regardless of `DEVSPACE_TOOL_NAMING`.
+The `dispatch` and `codex` modes must be selected through
+`DEVSPACE_TOOL_MODE`. The `codex` mode always uses its fixed short tool names
+regardless of `DEVSPACE_TOOL_NAMING`.
 
 Codex-mode commands run without a PTY by default. Set `tty: true` on
 `exec_command` for interactive terminal programs. PTY support uses the optional
