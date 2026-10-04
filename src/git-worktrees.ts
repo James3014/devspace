@@ -15,6 +15,7 @@ export class GitWorktreeError extends Error {
       | "GIT_REPOSITORY_NOT_FOUND"
       | "GIT_REPOSITORY_HAS_NO_COMMITS"
       | "GIT_INVALID_BASE_REF"
+      | "GIT_REMOTE_REF_NOT_FOUND"
       | "GIT_WORKTREE_CREATE_FAILED",
     message: string,
   ) {
@@ -167,22 +168,62 @@ async function assertGitRootAllowed(gitRoot: string, allowedRoots: string[]): Pr
 }
 
 async function resolveBaseCommit(sourceRoot: string, baseRef: string): Promise<string> {
-  try {
-    return (await git(["rev-parse", "--verify", `${baseRef}^{commit}`], sourceRoot)).trim();
-  } catch (error) {
-    if (baseRef === "HEAD") {
-      throw new GitWorktreeError(
-        "GIT_REPOSITORY_HAS_NO_COMMITS",
-        "Cannot open workspace in worktree mode because the repository has no commits yet. Create an initial commit first, or use mode=\"checkout\".",
-      );
-    }
+  // Fast path: resolve from local ref namespace.
+  const localSha = await tryRevParse(sourceRoot, baseRef);
+  if (localSha) return localSha;
 
+  if (baseRef === "HEAD") {
     throw new GitWorktreeError(
-      "GIT_INVALID_BASE_REF",
-      `Cannot open workspace in worktree mode because baseRef ${JSON.stringify(baseRef)} does not resolve to a commit.`,
+      "GIT_REPOSITORY_HAS_NO_COMMITS",
+      "Cannot open workspace in worktree mode because the repository has no commits yet. Create an initial commit first, or use mode=\"checkout\".",
     );
   }
+
+  // Slow path: the ref may exist on the remote but not yet be in the local ref
+  // namespace. Perform a bounded single-ref fetch (read-only network; no push,
+  // no merge, no rebase) and retry.
+  const branchName = baseRef.replace(/^origin\//, "").replace(/^refs\/heads\//, "");
+  let fetched = false;
+  try {
+    await git(["fetch", "--depth=1", "origin", `+refs/heads/${branchName}:refs/remotes/origin/${branchName}`], sourceRoot);
+    fetched = true;
+  } catch {
+    try {
+      await git(["fetch", "--depth=1", "origin", baseRef], sourceRoot);
+      fetched = true;
+    } catch {
+      // Fetch failed — fall through to produce a clean error message below.
+    }
+  }
+
+  const candidateRefs = [
+    baseRef,
+    `origin/${baseRef}`,
+    `origin/${branchName}`,
+    `refs/remotes/origin/${branchName}`,
+    ...(fetched ? ["FETCH_HEAD"] : []),
+  ];
+
+  for (const ref of candidateRefs) {
+    const sha = await tryRevParse(sourceRoot, ref);
+    if (sha) return sha;
+  }
+
+  throw new GitWorktreeError(
+    "GIT_REMOTE_REF_NOT_FOUND",
+    `Cannot open workspace in worktree mode: baseRef ${JSON.stringify(baseRef)} does not resolve locally and could not be fetched from origin.`,
+  );
 }
+
+async function tryRevParse(sourceRoot: string, ref: string): Promise<string | null> {
+  try {
+    const sha = (await git(["rev-parse", "--verify", `${ref}^{commit}`], sourceRoot)).trim();
+    return sha || null;
+  } catch {
+    return null;
+  }
+}
+
 
 function managedWorktreePath(input: { worktreeRoot: string; repoRoot: string }): string {
   const repoName = sanitizePathSegment(basename(input.repoRoot)) || "repo";
