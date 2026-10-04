@@ -119,6 +119,7 @@ export class ClaudeQueryRuntime implements LocalAgentRuntime {
         });
 
         const items: unknown[] = [];
+        let observedModel: string | undefined;
         for (;;) {
           let next: IteratorResult<unknown>;
           try {
@@ -147,8 +148,16 @@ export class ClaudeQueryRuntime implements LocalAgentRuntime {
           }
           const message = next.value;
           await callbacks?.onActivity?.();
+          await callbacks?.onStreamActivity?.();
           items.push(message);
           const record = asRecord(message);
+          if (typeof record?.model === "string" && !observedModel) {
+            observedModel = record.model;
+            void callbacks?.onModelAttestation?.({
+              observedModel,
+              attestationSource: "claude_stream",
+            });
+          }
           if (typeof record?.session_id === "string") {
             const previousSessionId = this.providerSessionId;
             this.providerSessionId = record.session_id;
@@ -184,6 +193,8 @@ export class ClaudeQueryRuntime implements LocalAgentRuntime {
             providerSessionId: this.providerSessionId ?? null,
             finalResponse,
             items,
+            observedModel,
+            attestationSource: observedModel ? "claude_stream" : undefined,
           };
         }
       },

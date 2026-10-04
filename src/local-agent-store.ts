@@ -105,6 +105,8 @@ export interface AgentLifecycleState {
   dispatchFailure?: DispatchFailureClassification;
   /** P2-D: Separate provider child process state. */
   providerProcessState?: "running" | "not_running" | "unknown";
+  /** P2-D: Dedicated dispatcher heartbeat timestamp. */
+  dispatcherHeartbeatAt?: string;
 }
 
 export interface PhysicalTerminationState {
@@ -349,6 +351,14 @@ export interface FinishTurnCasInput {
   automatedVerifierResult?: Record<string, unknown>;
   automatedVerifierEffects?: Record<string, Record<string, unknown>>;
   automatedVerifierPlan?: Record<string, unknown>;
+  /** P2-H: Operation timeline tracking elapsed phases. */
+  operationTimeline?: OperationTimeline;
+  /** P2-A: Model attestation state. */
+  modelAttestation?: ModelAttestation;
+  /** P2-E/F: Dispatch failure classification. */
+  dispatchFailure?: DispatchFailureClassification;
+  /** P2-D: Provider process state. */
+  providerProcessState?: "running" | "not_running" | "unknown";
 }
 
 export type FinishExternalRuntimeTurnInput = Omit<FinishTurnCasInput, "workerToken">;
@@ -528,6 +538,10 @@ export class LocalAgentStore {
       lifecycleState: input.lifecycleKind === "detached_worker_v2"
         ? {
             lifecycleKind: "detached_worker_v2",
+            operationTimeline: {
+              queuedAt: now,
+            },
+            providerProcessState: "unknown",
             activeTurn: {
               generation: randomUUID(),
               turnStartedAt: now,
@@ -803,6 +817,12 @@ export class LocalAgentStore {
       const now = input.turnStartedAt ?? new Date().toISOString();
       const updatedLifecycle: AgentLifecycleState = {
         ...lifecycle,
+        operationTimeline: {
+          queuedAt: now,
+        },
+        modelAttestation: undefined,
+        dispatchFailure: undefined,
+        providerProcessState: "unknown",
         activeTurn: {
           generation: randomUUID(),
           turnStartedAt: now,
@@ -961,6 +981,11 @@ export class LocalAgentStore {
       const lifecycleState: AgentLifecycleState = {
         ...current.lifecycleState,
         activeTurn: { ...activeTurn, executionStartedAt, lastActivityAt: executionStartedAt },
+        operationTimeline: {
+          queuedAt: current.lifecycleState?.operationTimeline?.queuedAt ?? current.createdAt,
+          ...current.lifecycleState?.operationTimeline,
+          providerStartedAt: executionStartedAt,
+        },
       };
       const now = new Date().toISOString();
       const result = this.database.sqlite.prepare(
@@ -1010,6 +1035,201 @@ export class LocalAgentStore {
       return { applied: result.changes === 1, previous: current, current: refreshed };
     });
     return touch.immediate();
+  }
+
+  /** P2-H: Persist provider stream activity and record first stream activity. */
+  touchStreamActivityCAS(
+    id: string,
+    generation: string,
+    workerToken: string,
+    activityAt = new Date().toISOString(),
+  ): LifecycleCasResult {
+    const touch = this.database.sqlite.transaction(() => {
+      const current = this.getById(id);
+      const lifecycle = current?.lifecycleState;
+      const activeTurn = lifecycle?.activeTurn;
+      if (
+        !current ||
+        !isDetachedLifecycle(lifecycle) ||
+        !activeTurn ||
+        activeTurn.generation !== generation ||
+        lifecycle.terminationPending ||
+        lifecycle.lifecycleCorrupt ||
+        current.workerToken !== workerToken ||
+        (current.status !== "starting" && current.status !== "running")
+      ) {
+        return { applied: false, previous: current, current };
+      }
+      const operationTimeline: OperationTimeline = {
+        queuedAt: lifecycle.operationTimeline?.queuedAt ?? current.createdAt,
+        providerStartedAt: lifecycle.operationTimeline?.providerStartedAt ?? activeTurn.executionStartedAt,
+        firstStreamActivityAt: lifecycle.operationTimeline?.firstStreamActivityAt ?? activityAt,
+        firstEffectAt: lifecycle.operationTimeline?.firstEffectAt ?? (activeTurn.firstEffectAt ? activeTurn.firstEffectAt : undefined),
+      };
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        operationTimeline,
+        activeTurn: {
+          ...activeTurn,
+          lastActivityAt: activityAt,
+          providerStreamLastActivityAt: activityAt,
+        },
+      };
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set lifecycle_state = ?, updated_at = ?
+         where id = ? and worker_token = ? and updated_at = ?`,
+      ).run(JSON.stringify(lifecycleState), activityAt, id, workerToken, current.updatedAt);
+      const refreshed = this.getById(id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return touch.immediate();
+  }
+
+  /** P2-H: Persist the first observable side-effect timestamp. */
+  recordFirstEffectCAS(
+    id: string,
+    generation: string,
+    workerToken: string,
+    effectAt = new Date().toISOString(),
+  ): LifecycleCasResult {
+    const record = this.database.sqlite.transaction(() => {
+      const current = this.getById(id);
+      const lifecycle = current?.lifecycleState;
+      const activeTurn = lifecycle?.activeTurn;
+      if (
+        !current ||
+        !isDetachedLifecycle(lifecycle) ||
+        !activeTurn ||
+        activeTurn.generation !== generation ||
+        lifecycle.terminationPending ||
+        lifecycle.lifecycleCorrupt ||
+        current.workerToken !== workerToken ||
+        (current.status !== "starting" && current.status !== "running")
+      ) {
+        return { applied: false, previous: current, current };
+      }
+      if (activeTurn.firstEffectAt) {
+        return { applied: true, previous: current, current };
+      }
+      const operationTimeline: OperationTimeline = {
+        queuedAt: lifecycle.operationTimeline?.queuedAt ?? current.createdAt,
+        providerStartedAt: lifecycle.operationTimeline?.providerStartedAt ?? activeTurn.executionStartedAt,
+        firstStreamActivityAt: lifecycle.operationTimeline?.firstStreamActivityAt,
+        firstEffectAt: lifecycle.operationTimeline?.firstEffectAt ?? effectAt,
+      };
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        operationTimeline,
+        activeTurn: {
+          ...activeTurn,
+          firstEffectAt: effectAt,
+          lastActivityAt: effectAt,
+        },
+      };
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set lifecycle_state = ?, updated_at = ?
+         where id = ? and worker_token = ? and updated_at = ?`,
+      ).run(JSON.stringify(lifecycleState), effectAt, id, workerToken, current.updatedAt);
+      const refreshed = this.getById(id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return record.immediate();
+  }
+
+  /** P2-A: Update model attestation during active execution. */
+  updateModelAttestationCAS(
+    id: string,
+    generation: string,
+    workerToken: string,
+    modelAttestation: ModelAttestation,
+  ): LifecycleCasResult {
+    const updateAttestation = this.database.sqlite.transaction(() => {
+      const current = this.getById(id);
+      const lifecycle = current?.lifecycleState;
+      const activeTurn = lifecycle?.activeTurn;
+      if (
+        !current ||
+        !isDetachedLifecycle(lifecycle) ||
+        !activeTurn ||
+        activeTurn.generation !== generation ||
+        lifecycle.terminationPending ||
+        lifecycle.lifecycleCorrupt ||
+        current.workerToken !== workerToken ||
+        (current.status !== "starting" && current.status !== "running")
+      ) {
+        return { applied: false, previous: current, current };
+      }
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        modelAttestation,
+      };
+      const now = new Date().toISOString();
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set lifecycle_state = ?, updated_at = ?
+         where id = ? and worker_token = ? and updated_at = ?`,
+      ).run(JSON.stringify(lifecycleState), now, id, workerToken, current.updatedAt);
+      const refreshed = this.getById(id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return updateAttestation.immediate();
+  }
+
+  /** P2-D: Dedicated dispatcher heartbeat touch. */
+  touchDispatcherHeartbeatCAS(
+    id: string,
+    heartbeatAt = new Date().toISOString(),
+  ): LifecycleCasResult {
+    const touch = this.database.sqlite.transaction(() => {
+      const current = this.getById(id);
+      const lifecycle = current?.lifecycleState;
+      if (!current || !isDetachedLifecycle(lifecycle)) {
+        return { applied: false, previous: current, current };
+      }
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        dispatcherHeartbeatAt: heartbeatAt,
+      };
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set lifecycle_state = ?, updated_at = ?
+         where id = ? and updated_at = ?`,
+      ).run(JSON.stringify(lifecycleState), heartbeatAt, id, current.updatedAt);
+      const refreshed = this.getById(id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return touch.immediate();
+  }
+
+  /** P2-H: Record terminal reconciliation timestamp. */
+  recordReconciledAtCAS(
+    id: string,
+    reconciledAt = new Date().toISOString(),
+  ): LifecycleCasResult {
+    const record = this.database.sqlite.transaction(() => {
+      const current = this.getById(id);
+      const lifecycle = current?.lifecycleState;
+      if (!current || !isDetachedLifecycle(lifecycle)) {
+        return { applied: false, previous: current, current };
+      }
+      const operationTimeline: OperationTimeline = {
+        queuedAt: lifecycle.operationTimeline?.queuedAt ?? current.createdAt,
+        providerStartedAt: lifecycle.operationTimeline?.providerStartedAt,
+        firstStreamActivityAt: lifecycle.operationTimeline?.firstStreamActivityAt,
+        firstEffectAt: lifecycle.operationTimeline?.firstEffectAt,
+        terminalAt: lifecycle.operationTimeline?.terminalAt,
+        reconciledAt,
+      };
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        operationTimeline,
+      };
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set lifecycle_state = ?, updated_at = ?
+         where id = ? and updated_at = ?`,
+      ).run(JSON.stringify(lifecycleState), reconciledAt, id, current.updatedAt);
+      const refreshed = this.getById(id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return record.immediate();
   }
 
   updateTurnEvidenceCAS(
@@ -1158,6 +1378,11 @@ export class LocalAgentStore {
           executionStartedAt: now,
           lastActivityAt: now,
         },
+        operationTimeline: {
+          queuedAt: lifecycle.operationTimeline?.queuedAt ?? current.createdAt,
+          ...lifecycle.operationTimeline,
+          providerStartedAt: now,
+        },
       };
       const serialized = serializeStoredExecutionState(
         current.executionContract,
@@ -1219,6 +1444,55 @@ export class LocalAgentStore {
     return touch.immediate();
   }
 
+  /** P2-H: Persist external runtime stream activity. */
+  touchExternalRuntimeStreamActivityCAS(
+    agentId: string,
+    generation: string,
+    activityAt = new Date().toISOString(),
+  ): LifecycleCasResult {
+    const touch = this.database.sqlite.transaction(() => {
+      const current = this.getById(agentId);
+      const lifecycle = current?.lifecycleState;
+      const activeTurn = lifecycle?.activeTurn;
+      if (
+        !current ||
+        !isDetachedLifecycle(lifecycle) ||
+        current.status !== "running" ||
+        !activeTurn ||
+        activeTurn.generation !== generation ||
+        lifecycle.terminationPending ||
+        lifecycle.lifecycleCorrupt ||
+        current.externalRuntimeBinding?.runtimeKind !== "HERDR" ||
+        current.workerPid !== undefined ||
+        current.workerToken !== undefined
+      ) {
+        return { applied: false, previous: current, current };
+      }
+      const operationTimeline: OperationTimeline = {
+        queuedAt: lifecycle.operationTimeline?.queuedAt ?? current.createdAt,
+        providerStartedAt: lifecycle.operationTimeline?.providerStartedAt ?? activeTurn.executionStartedAt,
+        firstStreamActivityAt: lifecycle.operationTimeline?.firstStreamActivityAt ?? activityAt,
+        firstEffectAt: lifecycle.operationTimeline?.firstEffectAt ?? (activeTurn.firstEffectAt ? activeTurn.firstEffectAt : undefined),
+      };
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        operationTimeline,
+        activeTurn: {
+          ...activeTurn,
+          lastActivityAt: activityAt,
+          providerStreamLastActivityAt: activityAt,
+        },
+      };
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set lifecycle_state = ?, updated_at = ?
+         where id = ? and status = 'running' and updated_at = ?`,
+      ).run(JSON.stringify(lifecycleState), activityAt, agentId, current.updatedAt);
+      const refreshed = this.getById(agentId) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return touch.immediate();
+  }
+
   finishExternalRuntimeTurnCAS(input: FinishExternalRuntimeTurnInput): LifecycleCasResult {
     const finish = this.database.sqlite.transaction(() => {
       const current = this.getById(input.agentId);
@@ -1236,6 +1510,19 @@ export class LocalAgentStore {
       ) {
         return { applied: false, previous: current, current };
       }
+
+      const now = new Date().toISOString();
+      const currentTimeline = lifecycle.operationTimeline;
+      const timeline: OperationTimeline = input.operationTimeline ?? {
+        queuedAt: currentTimeline?.queuedAt ?? current.createdAt,
+        providerStartedAt: currentTimeline?.providerStartedAt ?? lifecycle.activeTurn?.executionStartedAt,
+        firstStreamActivityAt: currentTimeline?.firstStreamActivityAt ?? lifecycle.activeTurn?.providerStreamLastActivityAt,
+        firstEffectAt: currentTimeline?.firstEffectAt
+          ?? (typeof lifecycle.activeTurn?.firstEffectAt === "string" ? lifecycle.activeTurn.firstEffectAt : undefined)
+          ?? (input.turnEndBaseline && (input.cumulativeChangedPaths?.length ?? 0) > 0 ? now : undefined),
+        reconciledAt: currentTimeline?.reconciledAt,
+        terminalAt: currentTimeline?.terminalAt ?? now,
+      };
 
       const lifecycleState: AgentLifecycleState = {
         ...lifecycle,
@@ -1259,6 +1546,10 @@ export class LocalAgentStore {
           : (lifecycle.automatedVerifierResult !== undefined
             ? { automatedVerifierResult: lifecycle.automatedVerifierResult }
             : {})),
+        operationTimeline: timeline,
+        modelAttestation: input.modelAttestation ?? lifecycle.modelAttestation,
+        dispatchFailure: input.dispatchFailure ?? lifecycle.dispatchFailure,
+        providerProcessState: input.providerProcessState ?? "not_running",
       };
       const successfulTerminal = input.status === "idle" || input.status === "stopped";
       const errorCode = successfulTerminal ? null : input.errorCode ?? null;
@@ -1275,7 +1566,6 @@ export class LocalAgentStore {
         successfulTerminal
           ? (lifecycle.lastSettledGeneration ? "RESUME_VERIFIED" : "KNOWN_UNVERIFIED")
           : (current.providerContinuityState ?? "UNKNOWN");
-      const now = new Date().toISOString();
       const result = this.database.sqlite.prepare(
         `update local_agent_sessions set provider_session_id = ?, provider_continuity_state = ?,
           status = ?, latest_response = ?, error = ?, error_code = ?, error_retryable = ?, error_details = ?,
@@ -2122,6 +2412,19 @@ export class LocalAgentStore {
       ) {
         return { applied: false, previous: current, current };
       }
+      const now = new Date().toISOString();
+      const currentTimeline = lifecycle.operationTimeline;
+      const timeline: OperationTimeline = input.operationTimeline ?? {
+        queuedAt: currentTimeline?.queuedAt ?? current.createdAt,
+        providerStartedAt: currentTimeline?.providerStartedAt ?? lifecycle.activeTurn?.executionStartedAt,
+        firstStreamActivityAt: currentTimeline?.firstStreamActivityAt ?? lifecycle.activeTurn?.providerStreamLastActivityAt,
+        firstEffectAt: currentTimeline?.firstEffectAt
+          ?? (typeof lifecycle.activeTurn?.firstEffectAt === "string" ? lifecycle.activeTurn.firstEffectAt : undefined)
+          ?? (input.turnEndBaseline && (input.cumulativeChangedPaths?.length ?? 0) > 0 ? now : undefined),
+        reconciledAt: currentTimeline?.reconciledAt,
+        terminalAt: currentTimeline?.terminalAt ?? now,
+      };
+
       const lifecycleState: AgentLifecycleState = {
         ...lifecycle,
         lastExecutionIdlePolicy: lifecycle.activeTurn?.executionIdlePolicy,
@@ -2132,6 +2435,10 @@ export class LocalAgentStore {
         cumulativeChangedPaths: input.cumulativeChangedPaths ?? lifecycle.cumulativeChangedPaths,
         turnEndBaseline: input.turnEndBaseline ?? lifecycle.turnEndBaseline,
         ...(input.automatedVerifierResult !== undefined ? { automatedVerifierResult: input.automatedVerifierResult } : (lifecycle.automatedVerifierResult !== undefined ? { automatedVerifierResult: lifecycle.automatedVerifierResult } : {})),
+        operationTimeline: timeline,
+        modelAttestation: input.modelAttestation ?? lifecycle.modelAttestation,
+        dispatchFailure: input.dispatchFailure ?? lifecycle.dispatchFailure,
+        providerProcessState: input.providerProcessState ?? "not_running",
       };
       const errorCode = input.status === "idle" ? null : input.errorCode ?? null;
       const errorRetryable = input.status === "idle" ? null : input.errorRetryable === undefined ? null : String(input.errorRetryable);
@@ -2165,7 +2472,6 @@ export class LocalAgentStore {
         providerContinuityState = "LOST";
       }
 
-      const now = new Date().toISOString();
       const result = this.database.sqlite.prepare(
         `update local_agent_sessions set provider_session_id = ?, provider_continuity_state = ?,
           status = ?, latest_response = ?, error = ?, error_code = ?, error_retryable = ?, error_details = ?,
@@ -2219,13 +2525,30 @@ export class LocalAgentStore {
       ) {
         return { applied: false, previous: current, current };
       }
+      const now = new Date().toISOString();
+      const currentTimeline = lifecycle.operationTimeline;
+      const timeline: OperationTimeline = {
+        queuedAt: currentTimeline?.queuedAt ?? current.createdAt,
+        providerStartedAt: currentTimeline?.providerStartedAt,
+        firstStreamActivityAt: currentTimeline?.firstStreamActivityAt,
+        firstEffectAt: currentTimeline?.firstEffectAt,
+        reconciledAt: currentTimeline?.reconciledAt,
+        terminalAt: now,
+      };
       const lifecycleState: AgentLifecycleState = {
         ...lifecycle,
         lastExecutionIdlePolicy: lifecycle.activeTurn?.executionIdlePolicy,
         activeTurn: undefined,
         lastSettledGeneration: generation,
+        operationTimeline: timeline,
+        dispatchFailure: {
+          failureClass: "PROVIDER_STARTUP_FAILED",
+          providerEffect: false,
+          reason: error,
+          classifiedAt: now,
+        },
+        providerProcessState: "not_running",
       };
-      const now = new Date().toISOString();
       const result = this.database.sqlite.prepare(
         `update local_agent_sessions set status = 'error', worker_pid = null, worker_token = null,
           error = ?, terminal_reason = 'launch_failed', lifecycle_state = ?, updated_at = ?
@@ -2390,6 +2713,12 @@ export class LocalAgentStore {
       ) {
         return { applied: false, previous: current, current };
       }
+      const now = new Date().toISOString();
+      const currentTimeline = current.lifecycleState?.operationTimeline;
+      const timeline: OperationTimeline | undefined = currentTimeline ? {
+        ...currentTimeline,
+        terminalAt: currentTimeline.terminalAt ?? now,
+      } : undefined;
       const lifecycleState: AgentLifecycleState = {
         ...current.lifecycleState,
         terminationPending: undefined,
@@ -2398,8 +2727,9 @@ export class LocalAgentStore {
         lastSettledGeneration: input.generation,
         cumulativeChangedPaths: input.cumulativeChangedPaths ?? current.lifecycleState?.cumulativeChangedPaths,
         turnEndBaseline: input.turnEndBaseline,
+        operationTimeline: timeline,
+        providerProcessState: "not_running",
       };
-      const now = new Date().toISOString();
       const result = this.database.sqlite.prepare(
         `update local_agent_sessions set worker_pid = null, worker_token = null,
           scope_state = ?, lifecycle_state = ?, updated_at = ?
@@ -2974,6 +3304,9 @@ function readLifecycleState(value: string | null | undefined): AgentLifecycleSta
     }
     if (typeof parsed.providerProcessState === "string") {
       state.providerProcessState = parsed.providerProcessState as "running" | "not_running" | "unknown";
+    }
+    if (typeof parsed.dispatcherHeartbeatAt === "string") {
+      state.dispatcherHeartbeatAt = parsed.dispatcherHeartbeatAt;
     }
     if (!detached) {
       const legacyActiveTurn = readLegacyActiveTurnState(parsed.activeTurn);

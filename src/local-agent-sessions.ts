@@ -803,15 +803,27 @@ export class LocalAgentSessionManager {
         return false;
       }
       if (reconciliation.executionState === "BLOCKED") {
+        const error = reconciliation.reason ?? "HerdR agent is blocked.";
+        const errorCode = "BLOCKED_ON_PERMISSION_ADMISSION";
+        const failureClassification = classifyDispatchFailure({
+          ...record,
+          status: "error",
+          error,
+          errorCode,
+          scopeState: "UNKNOWN",
+          updatedAt: new Date().toISOString(),
+        });
         this.store.failExternalRuntimeTurnCAS({
           agentId: record.id,
           generation,
-          error: reconciliation.reason ?? "HerdR agent is blocked.",
-          errorCode: "BLOCKED_ON_PERMISSION_ADMISSION",
+          error,
+          errorCode,
           errorRetryable: false,
           latestResponse: promptResult?.paneOutput,
           terminalReason: "provider_error",
           scopeState: "UNKNOWN",
+          dispatchFailure: failureClassification,
+          providerProcessState: "not_running",
         });
         return true;
       }
@@ -854,23 +866,44 @@ export class LocalAgentSessionManager {
     const verifierFailed = blockingVerifierResult?.effectState === "COMPLETED"
       && blockingVerifierResult.passed === false;
 
+    const isError = terminalScope === "SCOPE_VIOLATION" || verifierUnknown || verifierFailed;
+    const herdrErrorMessage = terminalScope === "SCOPE_VIOLATION"
+      ? `Agent modified paths outside authorized scope: ${scope.unexpectedPaths.join(", ")}`
+      : verifierUnknown
+        ? `Automated verifier effect ${String(blockingVerifierResult?.effectKey ?? "unknown")} has OUTCOME_UNKNOWN; continuation is blocked until that exact effect is reconciled.`
+        : verifierFailed
+          ? `Automated verifier ${String(blockingVerifierResult?.verifier ?? "unknown")} failed for effect ${String(blockingVerifierResult?.effectKey ?? "unknown")}.`
+      : undefined;
+    const herdrErrorCode = terminalScope === "SCOPE_VIOLATION"
+      ? "SCOPE_VIOLATION"
+      : verifierUnknown ? "VERIFIER_OUTCOME_UNKNOWN" : verifierFailed ? "VERIFIER_FAILED" : undefined;
+    const requestedModel = record.executionContract?.directSelection?.model;
+    const resolvedModel = record.model ?? undefined;
+    const observedModel = (promptResult as any)?.observedModel ?? (handle as any)?.observedModel ?? null;
+    const modelAttestation = computeModelAttestation({
+      requestedModel,
+      resolvedModel,
+      observedModel,
+      attestationSource: observedModel ? "herdr_observed" : undefined,
+    });
+    const failureClassification = isError ? classifyDispatchFailure({
+      ...record,
+      status: "error",
+      error: herdrErrorMessage,
+      errorCode: herdrErrorCode,
+      scopeState: terminalScope,
+      updatedAt: new Date().toISOString(),
+    }) : undefined;
+
     const completed = this.store.finishExternalRuntimeTurnCAS({
       agentId: record.id,
       generation,
-      status: terminalScope === "SCOPE_VIOLATION" || verifierUnknown || verifierFailed ? "error" : "idle",
+      status: isError ? "error" : "idle",
       providerSessionId: promptResult?.nativeProviderSessionId ?? handle.nativeProviderSessionId,
       latestResponse: promptResult?.finalResponse ?? promptResult?.paneOutput,
-      error: terminalScope === "SCOPE_VIOLATION"
-        ? `Agent modified paths outside authorized scope: ${scope.unexpectedPaths.join(", ")}`
-        : verifierUnknown
-          ? `Automated verifier effect ${String(blockingVerifierResult?.effectKey ?? "unknown")} has OUTCOME_UNKNOWN; continuation is blocked until that exact effect is reconciled.`
-          : verifierFailed
-            ? `Automated verifier ${String(blockingVerifierResult?.verifier ?? "unknown")} failed for effect ${String(blockingVerifierResult?.effectKey ?? "unknown")}.`
-        : undefined,
-      errorCode: terminalScope === "SCOPE_VIOLATION"
-        ? "SCOPE_VIOLATION"
-        : verifierUnknown ? "VERIFIER_OUTCOME_UNKNOWN" : verifierFailed ? "VERIFIER_FAILED" : undefined,
-      errorRetryable: terminalScope === "SCOPE_VIOLATION" || verifierUnknown || verifierFailed ? false : undefined,
+      error: herdrErrorMessage,
+      errorCode: herdrErrorCode,
+      errorRetryable: isError ? false : undefined,
       terminalReason: terminalScope === "SCOPE_VIOLATION"
         ? "scope_violation"
         : verifierUnknown ? "unknown" : verifierFailed ? "provider_error" : undefined,
@@ -882,6 +915,9 @@ export class LocalAgentSessionManager {
         fingerprints: physical.fingerprints,
       },
       automatedVerifierResult,
+      modelAttestation,
+      dispatchFailure: failureClassification,
+      providerProcessState: "not_running",
     });
     if (!completed.applied) {
       const current = this.store.getById(record.id);
@@ -1573,12 +1609,22 @@ export class LocalAgentSessionManager {
             : redactSensitiveText(error.finalResponse);
         }
 
+        const herdrErrorMessage = redactSensitiveText(error instanceof Error ? error.message : String(error));
+        const failureClassification = classifyDispatchFailure({
+          ...latest,
+          status: "error",
+          error: herdrErrorMessage,
+          errorCode,
+          scopeState: scope.scopeState,
+          updatedAt: new Date().toISOString(),
+        });
+
         const failed = this.store.failExternalRuntimeTurnCAS({
           agentId,
           generation,
           providerSessionId,
           latestResponse,
-          error: redactSensitiveText(error instanceof Error ? error.message : String(error)),
+          error: herdrErrorMessage,
           errorCode,
           errorRetryable,
           errorDetails,
@@ -1592,6 +1638,8 @@ export class LocalAgentSessionManager {
                 fingerprints: physical.fingerprints,
               }
             : undefined,
+          dispatchFailure: failureClassification,
+          providerProcessState: "not_running",
         });
         if (!failed.applied) {
           const current = this.store.getById(agentId);
@@ -2738,6 +2786,8 @@ export class LocalAgentSessionManager {
       ? "SCOPE_VIOLATION"
       : scopeState;
 
+    this.store.recordReconciledAtCAS(record.id);
+
     return {
       agentId: record.id,
       herdrHandle,
@@ -3607,12 +3657,31 @@ export class LocalAgentSessionManager {
         || (profile.cliProviderId ?? undefined) !== (catalogReceipt.cliProviderId ?? undefined))) {
         throw new Error("Reloaded profile identity does not match the durable catalog receipt; refusing execution.");
       }
+      const requestedModel = claimed.executionContract?.directSelection?.model;
+      const resolvedModel = claimed.model ?? undefined;
+
       const callbacks: LocalAgentRunCallbacks = {
         onActivity: () => {
           this.store.touchActivityCAS(claimed.id, generation, workerToken);
         },
         onExecutionStarted: () => {
           this.store.markExecutionStarted(claimed.id, workerToken, undefined, generation);
+        },
+        onStreamActivity: (timestamp = new Date().toISOString()) => {
+          this.store.touchStreamActivityCAS(claimed.id, generation, workerToken, timestamp);
+        },
+        onEffect: (timestamp = new Date().toISOString()) => {
+          this.store.recordFirstEffectCAS(claimed.id, generation, workerToken, timestamp);
+        },
+        onModelAttestation: (attestation) => {
+          const computed = computeModelAttestation({
+            requestedModel,
+            resolvedModel,
+            observedModel: attestation.observedModel,
+            attestationSource: attestation.attestationSource,
+            attestedAt: attestation.attestedAt,
+          });
+          this.store.updateModelAttestationCAS(claimed.id, generation, workerToken, computed);
         },
         onSessionId: (providerSessionId) => {
           const bound = this.store.bindProviderSessionCAS(
@@ -3700,6 +3769,22 @@ export class LocalAgentSessionManager {
         }
       }
 
+      const modelAttestation = computeModelAttestation({
+        requestedModel,
+        resolvedModel,
+        observedModel: result.observedModel,
+        attestationSource: result.attestationSource,
+        attestedAt: result.attestedAt,
+      });
+
+      const failureClassification = scopeViolated ? classifyDispatchFailure({
+        ...claimed,
+        status: "error",
+        error: `Agent wrote outside the declared write scope. Offending paths: ${scope.unexpectedPaths.join(", ")}`,
+        scopeState: scope.scopeState,
+        updatedAt: new Date().toISOString(),
+      }) : undefined;
+
       this.store.finishTurnCAS({
         agentId,
         generation,
@@ -3716,6 +3801,9 @@ export class LocalAgentSessionManager {
         turnEndBaseline,
         effectEnforcementReceipt: result.effectEnforcementReceipt,
         automatedVerifierResult,
+        modelAttestation,
+        dispatchFailure: failureClassification,
+        providerProcessState: "not_running",
       });
     } catch (error) {
       const originalMessage = error instanceof Error ? error.message : String(error);
@@ -3800,6 +3888,22 @@ export class LocalAgentSessionManager {
         }
       }
 
+      const modelAttestation = computeModelAttestation({
+        requestedModel: claimed.executionContract?.directSelection?.model,
+        resolvedModel: claimed.model ?? undefined,
+        observedModel: (error as any)?.observedModel ?? null,
+        attestationSource: (error as any)?.attestationSource,
+      });
+
+      const failureClassification = classifyDispatchFailure({
+        ...claimed,
+        status: "error",
+        error: message,
+        errorCode,
+        scopeState: scope.scopeState,
+        updatedAt: new Date().toISOString(),
+      });
+
       this.store.failTurnCAS({
         agentId,
         generation,
@@ -3826,6 +3930,9 @@ export class LocalAgentSessionManager {
             }
           : undefined,
         automatedVerifierResult,
+        modelAttestation,
+        dispatchFailure: failureClassification,
+        providerProcessState: "not_running",
       });
     } finally {
       cleanupOwnedPromptFile(promptFile);
@@ -4462,6 +4569,59 @@ function providerEffectKnowledge(record: LocalAgentRecord): ProviderEffectKnowle
   return "unknown";
 }
 
+/**
+ * P2-A: Computes model attestation state comparing requested/resolved model to physically observed model.
+ */
+export function computeModelAttestation(params: {
+  requestedModel?: string;
+  resolvedModel?: string;
+  observedModel?: string | null;
+  attestationSource?: string;
+  attestedAt?: string;
+}): ModelAttestation {
+  const { requestedModel, resolvedModel, observedModel, attestationSource, attestedAt } = params;
+  const now = attestedAt ?? new Date().toISOString();
+  if (observedModel === undefined || observedModel === null) {
+    return {
+      requestedModel,
+      resolvedModel,
+      observedModel: null,
+      attestationSource: attestationSource ?? "metadata_only",
+      attestationState: "ATTESTATION_UNAVAILABLE",
+      attestedAt: now,
+    };
+  }
+
+  const expected = resolvedModel ?? requestedModel;
+  const matches = expected !== undefined
+    ? observedModel.trim().toLowerCase() === expected.trim().toLowerCase()
+    : true;
+
+  return {
+    requestedModel,
+    resolvedModel,
+    observedModel,
+    attestationSource: attestationSource ?? "provider_reported",
+    attestationState: matches ? "MATCH" : "MODEL_ATTESTATION_MISMATCH",
+    attestedAt: now,
+  };
+}
+
+/**
+ * P2-D: Probes whether a process is running on the host without fabricating liveness.
+ */
+export function probeProcessRunning(pid: number): "running" | "not_running" | "unknown" {
+  try {
+    process.kill(pid, 0);
+    return "running";
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return "not_running";
+    if (code === "EPERM") return "running";
+    return "unknown";
+  }
+}
+
 /** Classifies a failed record from its structured errorCode only; never from free-form message text. */
 function classifyDispatchFailure(record: LocalAgentRecord): DispatchFailureClassification {
   const code = record.errorCode ?? "";
@@ -4590,10 +4750,15 @@ function recordToStatusOutput(
     output.automatedVerifierPlans = record.lifecycleState.automatedVerifierPlans;
   }
   // P2-D: Provider process state is reported separately from dispatcher liveness.
-  // No dedicated dispatcher heartbeat is persisted, so dispatcherHeartbeatAt is
-  // intentionally omitted rather than aliased to the generic updatedAt.
-  if (record.lifecycleState?.providerProcessState) {
+  if (record.lifecycleState?.dispatcherHeartbeatAt) {
+    output.dispatcherHeartbeatAt = record.lifecycleState.dispatcherHeartbeatAt;
+  }
+  if (record.workerPid !== null && record.workerPid !== undefined) {
+    output.providerProcessState = probeProcessRunning(record.workerPid);
+  } else if (record.lifecycleState?.providerProcessState) {
     output.providerProcessState = record.lifecycleState.providerProcessState;
+  } else if (isTerminalStatus(record.status)) {
+    output.providerProcessState = "not_running";
   } else {
     // Durable session status / heartbeat is not physical provider-process evidence.
     // Without a positive runtime probe, remain unknown rather than fabricating running.
@@ -4610,7 +4775,8 @@ function recordToStatusOutput(
     };
     const providerStartedAt = persisted?.providerStartedAt ?? activeTurn?.executionStartedAt;
     if (providerStartedAt) timeline.providerStartedAt = providerStartedAt;
-    if (persisted?.firstStreamActivityAt) timeline.firstStreamActivityAt = persisted.firstStreamActivityAt;
+    const firstStreamActivityAt = persisted?.firstStreamActivityAt ?? activeTurn?.providerStreamLastActivityAt;
+    if (firstStreamActivityAt) timeline.firstStreamActivityAt = firstStreamActivityAt;
     const firstEffectAt = persisted?.firstEffectAt
       ?? (typeof activeTurn?.firstEffectAt === "string" ? activeTurn.firstEffectAt : undefined);
     if (firstEffectAt) timeline.firstEffectAt = firstEffectAt;
@@ -4626,16 +4792,13 @@ function recordToStatusOutput(
   } else if (record.model || record.executionContract?.directSelection?.model) {
     const requested = record.executionContract?.directSelection?.model;
     const resolved = record.model;
-    // Requested/resolved model metadata is not physical provider attestation.
-    // Until a provider-observed identity is durably recorded, fail closed as unavailable.
-    output.modelAttestation = {
+    output.modelAttestation = computeModelAttestation({
       requestedModel: requested,
       resolvedModel: resolved,
       observedModel: null,
       attestationSource: "metadata_only",
-      attestationState: "ATTESTATION_UNAVAILABLE",
       attestedAt: record.updatedAt,
-    };
+    });
   }
 
   // P2-E/F: Dispatch failure classification

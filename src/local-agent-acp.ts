@@ -153,6 +153,7 @@ export class AcpRuntime implements LocalAgentRuntime {
   private readonly activityCallbacks: Map<string, () => void | Promise<void>>;
   private readonly stderrTail?: () => string;
   private readonly diagnosticObserver?: (observation: AcpDiagnosticObservation) => void;
+  private readonly sessionModels = new Map<string, string>();
 
   constructor(options: AcpRuntimeOptions, connection: AcpConnectionLike) {
     this.provider = options.provider;
@@ -210,7 +211,13 @@ export class AcpRuntime implements LocalAgentRuntime {
         const activityTouch = createThrottledActivityTouch(() => {
           void callbacks?.onActivity?.();
         });
-        const onProviderBytes = () => activityTouch.touch();
+        const streamActivityTouch = createThrottledActivityTouch(() => {
+          void callbacks?.onStreamActivity?.();
+        });
+        const onProviderBytes = () => {
+          activityTouch.touch();
+          streamActivityTouch.touch();
+        };
         this.child?.stdout?.on("data", onProviderBytes);
         this.child?.stderr?.on("data", onProviderBytes);
         const queue = this.queues.get(sessionId) ?? { values: [] };
@@ -303,10 +310,14 @@ export class AcpRuntime implements LocalAgentRuntime {
           const requiredAssistantItem = queue.requiredOutputParts?.length
             ? [{ update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: finalResponse } } }]
             : [];
+          const observedModel = this.sessionModels.get(sessionId) ?? null;
           return {
             provider: this.provider,
             providerSessionId: sessionId,
             finalResponse,
+            observedModel,
+            attestationSource: observedModel ? "acp_session_metadata" : undefined,
+            attestedAt: observedModel ? new Date().toISOString() : undefined,
             // Items are bounded provider evidence for callers that retain them;
             // durable finalResponse persistence remains the authoritative sink.
             items: [...(queue.requiredEvidence ?? []), ...updates, ...requiredAssistantItem, ...retentionItem],
@@ -351,6 +362,7 @@ export class AcpRuntime implements LocalAgentRuntime {
     this.liveSessions.delete(providerSessionId);
     this.sessionWriteModes.delete(providerSessionId);
     this.sessionMetadata.delete(providerSessionId);
+    this.sessionModels.delete(providerSessionId);
     if (!this.capabilities.close || !this.isAlive()) return;
     await this.connection.agent.request("session/close", { sessionId: providerSessionId });
   }
@@ -367,6 +379,7 @@ export class AcpRuntime implements LocalAgentRuntime {
     this.liveSessions.clear();
     this.sessionWriteModes.clear();
     this.sessionMetadata.clear();
+    this.sessionModels.clear();
     this.activeSessions.clear();
     this.activityCallbacks.clear();
     this.grokCompletionRegistry?.rejectAll(new Error(`${this.provider} ACP runtime closed.`));
@@ -489,6 +502,18 @@ export class AcpRuntime implements LocalAgentRuntime {
     if (input.model) {
       const config = resolveAcpModelConfigUpdate(metadata, input.model, this.provider, sessionId);
       await this.connection.agent.request("session/set_config_option", config);
+      this.sessionModels.set(sessionId, input.model);
+    } else {
+      const record = asRecord(metadata);
+      const resp = asRecord(record?.newSessionResponse) ?? record;
+      const configOptions = readArray(resp, "configOptions") ?? [];
+      const modelConfig = configOptions
+        .map(asRecord)
+        .find((option) => option?.type === "select" && option.category === "model");
+      const currentVal = directString(modelConfig?.currentValue);
+      if (currentVal) {
+        this.sessionModels.set(sessionId, currentVal);
+      }
     }
     if (input.effort) {
       const config = resolveAcpEffortConfigUpdate(metadata, input.effort, this.provider, sessionId);
@@ -523,11 +548,19 @@ export class AcpRuntime implements LocalAgentRuntime {
         throw clineSelectionError(`provider readback '${current.provider ?? "unknown"}' did not match requested '${requestedProvider}'.`);
       }
     }
-    if (!input.model) return;
+    if (!input.model) {
+      if (current.model) {
+        this.sessionModels.set(sessionId, current.model);
+      }
+      return;
+    }
     if (!current.models.includes(input.model)) {
       throw clineSelectionError(`model '${input.model}' is not advertised by the ACP session.`);
     }
-    if (current.model === input.model) return;
+    if (current.model === input.model) {
+      this.sessionModels.set(sessionId, current.model);
+      return;
+    }
     const modelConfig = current.modelConfig;
     if (!modelConfig) throw clineSelectionError("Cline ACP did not advertise a model config option.");
     const modelConfigId = directString(modelConfig.id);
@@ -543,6 +576,9 @@ export class AcpRuntime implements LocalAgentRuntime {
     }
     if (readback.model !== input.model) {
       throw clineSelectionError(`model readback '${readback.model ?? "unknown"}' did not match requested '${input.model}'.`);
+    }
+    if (readback.model) {
+      this.sessionModels.set(sessionId, readback.model);
     }
   }
 
@@ -574,6 +610,9 @@ export class AcpRuntime implements LocalAgentRuntime {
     const requestedModel = input.model
       ? resolveGrokModelId(input.model, state)
       : currentModel ?? state.availableModels[0]?.id ?? GROK_DEFAULT_MODEL;
+    if (requestedModel) {
+      this.sessionModels.set(sessionId, requestedModel);
+    }
     const effort = input.effort
       ? resolveGrokEffort(input.effort, state, requestedModel)
       : undefined;

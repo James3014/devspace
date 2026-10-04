@@ -523,14 +523,19 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
     // worker. Throttled because every touch persists to the session store.
     const notifyActivity = bestEffortActivityNotifier(callbacks?.onActivity);
     const activityTouch = createThrottledActivityTouch(notifyActivity);
+    const streamActivityTouch = createThrottledActivityTouch(() => {
+      void callbacks?.onStreamActivity?.();
+    });
 
     child.stdout.on("data", (chunk: Buffer) => {
       stdoutCapture.append(chunk);
       activityTouch.touch();
+      streamActivityTouch.touch();
     });
     child.stderr.on("data", (chunk: Buffer) => {
       stderrCapture.append(chunk);
       activityTouch.touch();
+      streamActivityTouch.touch();
     });
 
     const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
@@ -664,11 +669,21 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
       stderr: stderrCapture.metadata(),
     } : undefined;
 
+    const observedModel = typeof parsed.model === "string"
+      ? parsed.model
+      : typeof parsed.observed_model === "string"
+        ? parsed.observed_model
+        : typeof parsed.resolved_model === "string"
+          ? parsed.resolved_model
+          : undefined;
+
     return {
       provider: this.provider,
       providerSessionId: conversation_id,
       finalResponse: response.trim(),
       items: outputMetadata ? [parsed, outputMetadata] : [parsed],
+      observedModel,
+      attestationSource: observedModel ? "agy_json_output" : undefined,
     };
   }
 }
