@@ -735,6 +735,64 @@ export function registerCoreMutationSessionTools(
   if (inspectWriterDomain) {
     registerAppTool(
       server,
+      "core_mutation_session_reconcile_process",
+      {
+        title: "Reconcile terminal Core PROCESS writer",
+        description:
+          "Reconcile one exact same-caller Core PROCESS writer after retained process evidence proves it terminal. ACTIVE and UNKNOWN fail closed. Revalidates physical scope/deletion state, clears only the PROCESS writer pin, and grants no retry, Candidate, completion, integration, merge, or release authority.",
+        inputSchema: {
+          workspaceId: z.string(),
+          sessionId: z.string(),
+          bindingHash: z.string().regex(/^sha256:[0-9a-f]{64}$/),
+        },
+        outputSchema: z.object({
+          session: outputSchema,
+          snapshot: snapshotOutputSchema,
+          observedWriterState: z.literal("CLEAR"),
+          alreadyReconciled: z.boolean(),
+          claim: z.literal("CORE_PROCESS_RECONCILED"),
+          retryAuthorityGranted: z.literal(false),
+          mutationAuthorityGranted: z.literal(false),
+          completionAuthorityGranted: z.literal(false),
+        }),
+        _meta: {},
+        annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+      },
+      async ({ workspaceId, sessionId, bindingHash }, extra) => {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        try {
+          const reconciled = await store.reconcileProcessEffect({
+            sessionId,
+            workspaceSessionId: workspaceId,
+            workspaceRoot: workspace.root,
+            actorKey: actorKeyRequired(extra),
+            bindingHash,
+            inspectProcessWriter: (session) => inspectWriterDomain(session, "PROCESS"),
+          });
+          return {
+            content: [{
+              type: "text" as const,
+              text: `Core terminal PROCESS writer reconciled for ${sessionId}; no process, Git, Candidate, or retry effect was replayed.`,
+            }],
+            structuredContent: {
+              session: publicSession(reconciled.session),
+              snapshot: reconciled.snapshot as unknown as Record<string, unknown>,
+              observedWriterState: reconciled.observedWriterState,
+              alreadyReconciled: reconciled.alreadyReconciled,
+              claim: "CORE_PROCESS_RECONCILED" as const,
+              retryAuthorityGranted: false as const,
+              mutationAuthorityGranted: false as const,
+              completionAuthorityGranted: false as const,
+            },
+          };
+        } catch (error) {
+          throw toolError(error);
+        }
+      },
+    );
+
+    registerAppTool(
+      server,
       "core_mutation_session_recover_orphaned_process",
       {
         title: "Recover orphaned Core PROCESS writer",

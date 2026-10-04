@@ -209,6 +209,13 @@ export interface CoreMutationOrphanProcessRecoveryEvidence {
   expectedDeletedPaths: string[];
 }
 
+export interface CoreMutationProcessReconciliationResult {
+  session: CoreMutationSessionRecord;
+  snapshot: CoreMutationPhysicalSnapshot;
+  observedWriterState: "CLEAR";
+  alreadyReconciled: boolean;
+}
+
 export interface CoreMutationOrphanProcessRecoveryResult {
   session: CoreMutationSessionRecord;
   snapshot: CoreMutationPhysicalSnapshot;
@@ -1850,6 +1857,116 @@ export class CoreMutationSessionStore {
 
     validateDirectCandidateExecutionEvidence(evidence);
     return evidence;
+  }
+
+  async reconcileProcessEffect(input: {
+    sessionId: string;
+    workspaceSessionId: string;
+    workspaceRoot: string;
+    actorKey: string;
+    bindingHash: string;
+    inspectProcessWriter: (session: CoreMutationSessionRecord) => Promise<"CLEAR" | "ACTIVE" | "UNKNOWN"> | "CLEAR" | "ACTIVE" | "UNKNOWN";
+    now?: Date;
+  }): Promise<CoreMutationProcessReconciliationResult> {
+    const record = this.getByIdRaw(input.sessionId);
+    if (!record || record.workspaceSessionId !== input.workspaceSessionId) {
+      throw new CoreMutationSessionError("CORE_MUTATION_SESSION_NOT_FOUND", "Core mutation session is not bound to this workspace.");
+    }
+    this.assertActor(record, input.actorKey);
+    this.assertPointer(record, { sessionId: input.sessionId, bindingHash: input.bindingHash });
+    if (record.freshnessState !== "FRESH" || record.rebindState !== "BOUND_CURRENT") {
+      throw new CoreMutationSessionError("CORE_MUTATION_REBIND_REQUIRED", "PROCESS reconciliation requires a fresh, currently bound Core session.");
+    }
+    const processOnly = record.writerDomains.length === 1 && record.writerDomains[0] === "PROCESS";
+    const alreadyReconciled = record.writerReconciliationState === "CLEAR" && record.writerDomains.length === 0;
+    if (record.status !== "ACTIVE" || (!processOnly && !alreadyReconciled)) {
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_PROCESS_RECONCILE_NOT_APPLICABLE",
+        "PROCESS reconciliation applies only to an ACTIVE PROCESS-only OUTCOME_UNKNOWN session or an exact idempotent replay after reconciliation.",
+      );
+    }
+    if (processOnly && record.writerReconciliationState !== "OUTCOME_UNKNOWN") {
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_PROCESS_RECONCILE_NOT_APPLICABLE",
+        "PROCESS reconciliation requires OUTCOME_UNKNOWN writer state.",
+      );
+    }
+
+    if (alreadyReconciled) {
+      const snapshot = await materializeSnapshot(input.workspaceRoot, record);
+      if (snapshot.scopeEscapePaths.length > 0) {
+        this.markRebindRequired(record.id);
+        throw new CoreMutationSessionError(
+          "CORE_MUTATION_POST_EFFECT_SCOPE_ESCAPE",
+          `Reconciled PROCESS effect changed paths outside AcceptanceContract: ${snapshot.scopeEscapePaths.join(", ")}.`,
+        );
+      }
+      if (snapshot.deletionViolation) {
+        this.markRebindRequired(record.id);
+        throw new CoreMutationSessionError(
+          "CORE_MUTATION_POST_EFFECT_DELETION_FORBIDDEN",
+          `Reconciled PROCESS effect deleted forbidden paths: ${snapshot.deletedPaths.join(", ")}.`,
+        );
+      }
+      return { session: record, snapshot, observedWriterState: "CLEAR", alreadyReconciled: true };
+    }
+
+    const observedWriterState = await input.inspectProcessWriter(record);
+    if (observedWriterState === "ACTIVE") {
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_PROCESS_WRITER_ACTIVE",
+        "A matching PROCESS writer is still active; reconciliation is not permitted.",
+      );
+    }
+    if (observedWriterState === "UNKNOWN") {
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_PROCESS_WRITER_UNKNOWN",
+        "No retained PROCESS evidence proves this writer terminal; reconciliation fails closed.",
+      );
+    }
+
+    const snapshot = await materializeSnapshot(input.workspaceRoot, record);
+    if (snapshot.scopeEscapePaths.length > 0) {
+      this.markRebindRequired(record.id);
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_POST_EFFECT_SCOPE_ESCAPE",
+        `Reconciled PROCESS effect changed paths outside AcceptanceContract: ${snapshot.scopeEscapePaths.join(", ")}.`,
+      );
+    }
+    if (snapshot.deletionViolation) {
+      this.markRebindRequired(record.id);
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_POST_EFFECT_DELETION_FORBIDDEN",
+        `Reconciled PROCESS effect deleted forbidden paths: ${snapshot.deletedPaths.join(", ")}.`,
+      );
+    }
+
+    const now = (input.now ?? new Date()).toISOString();
+    const reconciled = this.database.sqlite.prepare(`
+      update core_mutation_sessions
+      set writer_domains_json = '[]', writer_reconciliation_state = 'CLEAR', updated_at = ?
+      where id = ? and status = 'ACTIVE' and actor_key = ? and binding_hash = ?
+        and updated_at = ? and freshness_state = 'FRESH' and rebind_state = 'BOUND_CURRENT'
+        and writer_reconciliation_state = 'OUTCOME_UNKNOWN' and writer_domains_json = '["PROCESS"]'
+    `).run(
+      now,
+      record.id,
+      record.actorKey,
+      record.bindingHash,
+      record.updatedAt,
+    );
+    if (reconciled.changes !== 1) {
+      throw new CoreMutationSessionError(
+        "CORE_MUTATION_RECONCILE_REQUIRED",
+        "Core session changed during PROCESS reconciliation inspection; reconciliation CAS lost.",
+      );
+    }
+    return {
+      session: this.getByIdRaw(record.id)!,
+      snapshot,
+      observedWriterState: "CLEAR",
+      alreadyReconciled: false,
+    };
   }
 
   async recoverOrphanedProcessEffect(input: {
