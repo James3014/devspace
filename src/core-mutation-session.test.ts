@@ -942,6 +942,216 @@ test("synchronous reconciliation never clears required PROCESS evidence", async 
   }
 });
 
+test("same caller reconciles only a retained terminal PROCESS writer", async () => {
+  const fixture = makeRepo();
+  const stateDir = join(fixture.root, "state");
+  const workspaceId = "ws_core_process_reconcile";
+  const workspaceStore = createWorkspaceStore(stateDir);
+  workspaceStore.createSession({ id: workspaceId, root: fixture.repo, mode: "checkout" });
+  const store = new CoreMutationSessionStore(stateDir);
+  const actor = "actor:process-reconcile";
+  try {
+    const binding = makeBinding({ workspaceSessionId: workspaceId, head: fixture.head, tree: fixture.tree });
+    const session = await store.open({
+      workspaceSessionId: workspaceId,
+      workspaceRoot: fixture.repo,
+      workspaceMode: "checkout",
+      managed: false,
+      actorKey: actor,
+      binding,
+    });
+    await store.admitEffect({
+      workspaceSessionId: workspaceId,
+      workspaceRoot: fixture.repo,
+      workspaceMode: "checkout",
+      managed: false,
+      actorKey: actor,
+      pointer: { required: true, sessionId: session.id, bindingHash: session.bindingHash },
+      pathContainment: "NOT_PROVEN",
+      writerDomain: "PROCESS",
+    });
+    writeFileSync(join(fixture.repo, "app.ts"), "export const value = 2;\n");
+
+    await assert.rejects(
+      () => store.reconcileProcessEffect({
+        sessionId: session.id,
+        workspaceSessionId: workspaceId,
+        workspaceRoot: fixture.repo,
+        actorKey: actor,
+        bindingHash: session.bindingHash,
+        inspectProcessWriter: () => "ACTIVE",
+      }),
+      (error: unknown) => error instanceof CoreMutationSessionError && error.code === "CORE_MUTATION_PROCESS_WRITER_ACTIVE",
+    );
+    await assert.rejects(
+      () => store.reconcileProcessEffect({
+        sessionId: session.id,
+        workspaceSessionId: workspaceId,
+        workspaceRoot: fixture.repo,
+        actorKey: actor,
+        bindingHash: session.bindingHash,
+        inspectProcessWriter: () => "UNKNOWN",
+      }),
+      (error: unknown) => error instanceof CoreMutationSessionError && error.code === "CORE_MUTATION_PROCESS_WRITER_UNKNOWN",
+    );
+    await assert.rejects(
+      () => store.reconcileProcessEffect({
+        sessionId: session.id,
+        workspaceSessionId: workspaceId,
+        workspaceRoot: fixture.repo,
+        actorKey: "actor:other",
+        bindingHash: session.bindingHash,
+        inspectProcessWriter: () => "CLEAR",
+      }),
+      (error: unknown) => error instanceof CoreMutationSessionError && error.code === "CORE_MUTATION_ACTOR_MISMATCH",
+    );
+    await assert.rejects(
+      () => store.reconcileProcessEffect({
+        sessionId: session.id,
+        workspaceSessionId: workspaceId,
+        workspaceRoot: fixture.repo,
+        actorKey: actor,
+        bindingHash: `sha256:${"f".repeat(64)}`,
+        inspectProcessWriter: () => "CLEAR",
+      }),
+      (error: unknown) => error instanceof CoreMutationSessionError && error.code === "CORE_MUTATION_BINDING_MISMATCH",
+    );
+
+    const reconciled = await store.reconcileProcessEffect({
+      sessionId: session.id,
+      workspaceSessionId: workspaceId,
+      workspaceRoot: fixture.repo,
+      actorKey: actor,
+      bindingHash: session.bindingHash,
+      inspectProcessWriter: () => "CLEAR",
+    });
+    assert.equal(reconciled.observedWriterState, "CLEAR");
+    assert.equal(reconciled.alreadyReconciled, false);
+    assert.deepEqual(reconciled.session.writerDomains, []);
+    assert.equal(reconciled.session.writerReconciliationState, "CLEAR");
+    assert.deepEqual(reconciled.snapshot.changedPaths, ["app.ts"]);
+    assert.equal(reconciled.snapshot.deletionViolation, false);
+    assert.deepEqual(reconciled.snapshot.scopeEscapePaths, []);
+
+    const replay = await store.reconcileProcessEffect({
+      sessionId: session.id,
+      workspaceSessionId: workspaceId,
+      workspaceRoot: fixture.repo,
+      actorKey: actor,
+      bindingHash: session.bindingHash,
+      inspectProcessWriter: () => "CLEAR",
+    });
+    assert.equal(replay.alreadyReconciled, true);
+    assert.deepEqual(replay.session.writerDomains, []);
+    assert.equal(replay.session.writerReconciliationState, "CLEAR");
+  } finally {
+    store.close();
+    workspaceStore.close?.();
+    rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
+test("same caller PROCESS reconciliation preserves scope and deletion fail-closed checks", async () => {
+  const scopeFixture = makeRepo();
+  const scopeStateDir = join(scopeFixture.root, "state");
+  const scopeWorkspaceId = "ws_core_process_scope_escape";
+  const scopeWorkspaceStore = createWorkspaceStore(scopeStateDir);
+  scopeWorkspaceStore.createSession({ id: scopeWorkspaceId, root: scopeFixture.repo, mode: "checkout" });
+  const scopeStore = new CoreMutationSessionStore(scopeStateDir);
+  try {
+    const binding = makeBinding({
+      workspaceSessionId: scopeWorkspaceId,
+      head: scopeFixture.head,
+      tree: scopeFixture.tree,
+      allowedPaths: ["app.ts"],
+    });
+    const session = await scopeStore.open({
+      workspaceSessionId: scopeWorkspaceId,
+      workspaceRoot: scopeFixture.repo,
+      workspaceMode: "checkout",
+      managed: false,
+      actorKey: "actor:scope",
+      binding,
+    });
+    await scopeStore.admitEffect({
+      workspaceSessionId: scopeWorkspaceId,
+      workspaceRoot: scopeFixture.repo,
+      workspaceMode: "checkout",
+      managed: false,
+      actorKey: "actor:scope",
+      pointer: { required: true, sessionId: session.id, bindingHash: session.bindingHash },
+      pathContainment: "NOT_PROVEN",
+      writerDomain: "PROCESS",
+    });
+    writeFileSync(join(scopeFixture.repo, "outside.ts"), "export const outside = true;\n");
+    await assert.rejects(
+      () => scopeStore.reconcileProcessEffect({
+        sessionId: session.id,
+        workspaceSessionId: scopeWorkspaceId,
+        workspaceRoot: scopeFixture.repo,
+        actorKey: "actor:scope",
+        bindingHash: session.bindingHash,
+        inspectProcessWriter: () => "CLEAR",
+      }),
+      (error: unknown) => error instanceof CoreMutationSessionError && error.code === "CORE_MUTATION_POST_EFFECT_SCOPE_ESCAPE",
+    );
+  } finally {
+    scopeStore.close();
+    scopeWorkspaceStore.close?.();
+    rmSync(scopeFixture.root, { recursive: true, force: true });
+  }
+
+  const deletionFixture = makeRepo();
+  const deletionStateDir = join(deletionFixture.root, "state");
+  const deletionWorkspaceId = "ws_core_process_deletion";
+  const deletionWorkspaceStore = createWorkspaceStore(deletionStateDir);
+  deletionWorkspaceStore.createSession({ id: deletionWorkspaceId, root: deletionFixture.repo, mode: "checkout" });
+  const deletionStore = new CoreMutationSessionStore(deletionStateDir);
+  try {
+    const binding = makeBinding({
+      workspaceSessionId: deletionWorkspaceId,
+      head: deletionFixture.head,
+      tree: deletionFixture.tree,
+      allowedPaths: ["app.ts"],
+      deletionPolicy: "FORBID",
+    });
+    const session = await deletionStore.open({
+      workspaceSessionId: deletionWorkspaceId,
+      workspaceRoot: deletionFixture.repo,
+      workspaceMode: "checkout",
+      managed: false,
+      actorKey: "actor:deletion",
+      binding,
+    });
+    await deletionStore.admitEffect({
+      workspaceSessionId: deletionWorkspaceId,
+      workspaceRoot: deletionFixture.repo,
+      workspaceMode: "checkout",
+      managed: false,
+      actorKey: "actor:deletion",
+      pointer: { required: true, sessionId: session.id, bindingHash: session.bindingHash },
+      pathContainment: "NOT_PROVEN",
+      writerDomain: "PROCESS",
+    });
+    unlinkSync(join(deletionFixture.repo, "app.ts"));
+    await assert.rejects(
+      () => deletionStore.reconcileProcessEffect({
+        sessionId: session.id,
+        workspaceSessionId: deletionWorkspaceId,
+        workspaceRoot: deletionFixture.repo,
+        actorKey: "actor:deletion",
+        bindingHash: session.bindingHash,
+        inspectProcessWriter: () => "CLEAR",
+      }),
+      (error: unknown) => error instanceof CoreMutationSessionError && error.code === "CORE_MUTATION_POST_EFFECT_DELETION_FORBIDDEN",
+    );
+  } finally {
+    deletionStore.close();
+    deletionWorkspaceStore.close?.();
+    rmSync(deletionFixture.root, { recursive: true, force: true });
+  }
+});
+
 test("owner recovery clears only an exact orphaned PROCESS writer after physical evidence", async () => {
   const fixture = makeRepo();
   const stateDir = join(fixture.root, "state");
