@@ -988,6 +988,8 @@ class SpyHerdrGateway extends HerdrThinGateway {
   public receivedSocketRequests: Array<{ method: string; socketPath?: string }> = [];
   public readPaneCalls = 0;
   public lastReadPaneSocketPath?: string;
+  public readPaneResponses: string[] = [];
+  public readPaneFallback = "~/project %\n";
 
   override async sendRequest<T = unknown>(
     req: HerdrSocketRequest,
@@ -1192,9 +1194,107 @@ class SpyHerdrGateway extends HerdrThinGateway {
   override async readPane(paneId: string, lines: number = 50, socketPath?: string): Promise<string> {
     this.readPaneCalls++;
     this.lastReadPaneSocketPath = socketPath;
-    return "Ready prompt\n";
+    this.receivedSocketRequests.push({ method: "pane.read", socketPath });
+    return this.readPaneResponses.shift() ?? this.readPaneFallback;
   }
 }
+
+test("HerdR launch waits for root shell readiness and records timeout as unknown without agent.start", async () => {
+  const { repoPath, headSha } = createIsolatedTestGitRepo();
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-herdr-root-ready-"));
+  const store = new LocalAgentStore(stateDir);
+  const makeAgent = (attemptKey: string) => {
+    const dispatchIntent = {
+      taskId: "task-" + attemptKey,
+      attemptId: attemptKey,
+      objective: "test HerdR root pane readiness",
+      roleIntent: "DEEP_ENGINEERING" as const,
+      claimCeiling: "CANDIDATE_READY" as const,
+      context: ["root pane readiness regression"],
+      readScope: ["test.txt"],
+      writeScope: ["test.txt"],
+      exclusiveOwnership: true,
+      forbiddenChanges: [],
+      acceptanceCriteria: ["agent.start waits for an interactive shell"],
+      verificationRequired: true,
+      expectedArtifacts: [],
+    };
+    const dispatchIntentHash = hashDispatchIntent(dispatchIntent);
+    const agent = store.create({
+      workspaceId: "ws-root-ready",
+      workspaceRoot: repoPath,
+      profileName: "worker",
+      provider: "agy",
+      startReplay: { key: attemptKey, requestHash: "request-" + attemptKey },
+      executionContract: { writePaths: ["test.txt"], dispatchIntent },
+    });
+    return { agent, attemptKey, dispatchIntentHash };
+  };
+
+  try {
+    const delayed = makeAgent("root-shell-delayed-ready");
+    const delayedGateway = new SpyHerdrGateway(
+      "/tmp/root-shell-delayed.sock",
+      new HerdrGatewayRegistry(),
+      store,
+      100,
+      1,
+    );
+    delayedGateway.readPaneResponses = ["Starting login shell...\n", "~/devspace %\n"];
+    const delayedHandle = await delayedGateway.startExternalAgent({
+      agentId: delayed.agent.id,
+      store,
+      attemptKey: delayed.attemptKey,
+      dispatchIntentHash: delayed.dispatchIntentHash,
+      agentKind: "agy",
+      canonicalWorktreePath: repoPath,
+      workspaceId: "ws-root-ready",
+    });
+    assert.ok(delayedHandle);
+    assert.equal(delayedGateway.agentStartCalls, 1);
+    assert.equal(delayedGateway.readPaneCalls, 3, "two pre-start polls plus the ordinary post-start read");
+    const delayedMethods = delayedGateway.receivedSocketRequests.map(({ method }) => method);
+    const delayedStartIndex = delayedMethods.indexOf("agent.start");
+    assert.ok(delayedStartIndex >= 2);
+    assert.deepEqual(delayedMethods.slice(0, delayedStartIndex).filter((method) => method === "pane.read").length, 2);
+
+    const timedOut = makeAgent("root-shell-never-ready");
+    const timeoutGateway = new SpyHerdrGateway(
+      "/tmp/root-shell-timeout.sock",
+      new HerdrGatewayRegistry(),
+      store,
+      20,
+      1,
+    );
+    timeoutGateway.readPaneFallback = "Starting login shell...\n";
+    await assert.rejects(timeoutGateway.startExternalAgent({
+      agentId: timedOut.agent.id,
+      store,
+      attemptKey: timedOut.attemptKey,
+      dispatchIntentHash: timedOut.dispatchIntentHash,
+      agentKind: "agy",
+      canonicalWorktreePath: repoPath,
+      workspaceId: "ws-root-ready",
+    }), (error: Error) => {
+      assert.match(error.message, /OUTCOME_UNKNOWN/);
+      assert.match(error.message, /agent\.start was not attempted/);
+      return true;
+    });
+    assert.equal(timeoutGateway.workspaceCreateCalls, 1);
+    assert.ok(timeoutGateway.readPaneCalls > 0);
+    assert.equal(timeoutGateway.agentStartCalls, 0, "shell readiness timeout must never call agent.start");
+    assert.equal(timeoutGateway.workspaceCloseCalls, 0, "the observed workspace is retained for reconciliation");
+    assert.equal(
+      store.getById(timedOut.agent.id)?.externalRuntimeBinding?.launch?.state,
+      "OUTCOME_UNKNOWN",
+    );
+    assert.equal(timeoutGateway.receivedSocketRequests.some(({ method }) => method === "agent.start"), false);
+  } finally {
+    store.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(repoPath, { recursive: true, force: true });
+  }
+});
 
 test("HerdrThinGateway observed-launch absence proof is exact and identity-mismatch fail-closed (#256)", async () => {
   const gateway = new SpyHerdrGateway("/tmp/herdr-256-absence.sock", new HerdrGatewayRegistry());
