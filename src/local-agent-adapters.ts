@@ -513,6 +513,7 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
     });
 
     assertPipedChild(child);
+    await callbacks?.onProviderProcessState?.("running");
 
     const stdoutCapture = new BoundedUtf8Capture(AGY_MAX_STDOUT_BYTES);
     const stderrCapture = new BoundedUtf8Capture(AGY_MAX_STDERR_BYTES);
@@ -540,6 +541,7 @@ class AgyLocalAgentAdapter implements LocalAgentAdapter {
 
     const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
       child.on("exit", (code, signal) => {
+        void callbacks?.onProviderProcessState?.("not_running");
         resolve({ code, signal });
       });
     });
