@@ -501,8 +501,14 @@ export class AcpRuntime implements LocalAgentRuntime {
     }
     if (input.model) {
       const config = resolveAcpModelConfigUpdate(metadata, input.model, this.provider, sessionId);
-      await this.connection.agent.request("session/set_config_option", config);
-      this.sessionModels.set(sessionId, input.model);
+      const modelResponse = await this.connection.agent.request("session/set_config_option", config);
+      const responseRecord = asRecord(modelResponse);
+      const responseOptions = readArray(responseRecord, "configOptions") ?? [];
+      const responseModel = responseOptions
+        .map(asRecord)
+        .find((option) => option?.type === "select" && option.category === "model");
+      const observedModel = directString(responseModel?.currentValue);
+      if (observedModel) this.sessionModels.set(sessionId, observedModel);
     } else {
       const record = asRecord(metadata);
       const resp = asRecord(record?.newSessionResponse) ?? record;
@@ -610,9 +616,6 @@ export class AcpRuntime implements LocalAgentRuntime {
     const requestedModel = input.model
       ? resolveGrokModelId(input.model, state)
       : currentModel ?? state.availableModels[0]?.id ?? GROK_DEFAULT_MODEL;
-    if (requestedModel) {
-      this.sessionModels.set(sessionId, requestedModel);
-    }
     const effort = input.effort
       ? resolveGrokEffort(input.effort, state, requestedModel)
       : undefined;
@@ -620,11 +623,14 @@ export class AcpRuntime implements LocalAgentRuntime {
     if (!shouldSetModel) return;
 
     try {
-      await this.connection.agent.request("session/set_model", {
+      const modelResponse = await this.connection.agent.request("session/set_model", {
         sessionId,
         modelId: requestedModel,
         ...(effort ? { _meta: { reasoningEffort: effort } } : {}),
       });
+      const readback = readGrokSessionState(modelResponse);
+      const observedModel = readback?.currentModelId;
+      if (observedModel) this.sessionModels.set(sessionId, observedModel);
     } catch (cause) {
       throw new AgentProviderProtocolError({
         code: "PROVIDER_PROTOCOL_ERROR",
