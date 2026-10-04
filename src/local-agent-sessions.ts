@@ -473,15 +473,20 @@ interface LifecycleEvidence {
 
 function computeSessionTiming(record: LocalAgentRecord, now = Date.now()): { wallMs: number; idleMs: number } {
   const createdAtMs = Date.parse(record.createdAt);
-  const updatedAtMs = Date.parse(record.updatedAt);
   const terminalStable = isTerminalStatus(record.status) &&
     !record.lifecycleState?.terminationPending &&
     !record.lifecycleState?.lifecycleCorrupt &&
     !record.lifecycleState?.terminationBlocked;
-  const referenceMs = terminalStable ? updatedAtMs : now;
+  // updatedAt is the row-mutation clock, not an execution clock: reconciliation
+  // and dispatcher-heartbeat writes may legitimately advance it after a turn is
+  // terminal. Use explicit lifecycle clocks when available and keep updatedAt
+  // only as a compatibility fallback for legacy rows.
+  const terminalAtMs = Date.parse(record.lifecycleState?.operationTimeline?.terminalAt ?? record.updatedAt);
+  const lastActivityAtMs = Date.parse(record.lifecycleState?.activeTurn?.lastActivityAt ?? record.updatedAt);
+  const referenceMs = terminalStable ? terminalAtMs : now;
   return {
     wallMs: Math.max(0, referenceMs - createdAtMs),
-    idleMs: terminalStable ? 0 : Math.max(0, now - updatedAtMs),
+    idleMs: terminalStable ? 0 : Math.max(0, now - lastActivityAtMs),
   };
 }
 
@@ -2852,6 +2857,8 @@ export class LocalAgentSessionManager {
         continue;
       }
       if (record.status !== "running" && record.status !== "starting") continue;
+      const supervisorObservedAt = new Date(now).toISOString();
+      this.store.touchDispatcherHeartbeatCAS(record.id, supervisorObservedAt);
       if (record.externalRuntimeBinding?.runtimeKind === "HERDR" && !this.herdrTurnTasks.has(record.id)) {
         const settled = await this.reconcileStaleHerdRSession(record);
         if (settled) continue;
@@ -2933,6 +2940,19 @@ export class LocalAgentSessionManager {
           const physical = await inspectWorkspacePhysicalState(record.workspaceRoot);
           if (physical.gitAvailable) {
             const delta = computeWorkerDelta(physical, baseline);
+            const headAdvanced = Boolean(baseline.head && physical.head && baseline.head !== physical.head);
+            if (
+              (delta.changedPaths.length > 0 || headAdvanced) &&
+              activeTurn?.generation &&
+              record.workerToken
+            ) {
+              this.store.recordFirstEffectCAS(
+                record.id,
+                activeTurn.generation,
+                record.workerToken,
+                supervisorObservedAt,
+              );
+            }
             const { scopeState, unexpectedPaths } = this.classifyWorkerScope(
               delta.changedPaths,
               contract.writePaths,
