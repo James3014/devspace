@@ -4770,8 +4770,9 @@ function recordToStatusOutput(
     };
     const providerStartedAt = persisted?.providerStartedAt ?? activeTurn?.executionStartedAt;
     if (providerStartedAt) timeline.providerStartedAt = providerStartedAt;
-    const firstStreamActivityAt = persisted?.firstStreamActivityAt ?? activeTurn?.providerStreamLastActivityAt;
-    if (firstStreamActivityAt) timeline.firstStreamActivityAt = firstStreamActivityAt;
+    if (persisted?.firstStreamActivityAt) {
+      timeline.firstStreamActivityAt = persisted.firstStreamActivityAt;
+    }
     const firstEffectAt = persisted?.firstEffectAt
       ?? (typeof activeTurn?.firstEffectAt === "string" ? activeTurn.firstEffectAt : undefined);
     if (firstEffectAt) timeline.firstEffectAt = firstEffectAt;
