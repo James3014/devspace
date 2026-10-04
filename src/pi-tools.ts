@@ -12,6 +12,7 @@ import {
   type FindToolInput,
   type GrepToolInput,
   type LsToolInput,
+  type ReadToolDetails,
   type ReadToolInput,
   type WriteToolInput,
   type AgentToolResult,
@@ -99,7 +100,10 @@ async function runTool<TInput, TDetails = unknown>(
   }
 }
 
-export async function readFileTool(input: ReadToolInput, context: ToolContext): Promise<ToolResponse> {
+export async function readFileTool(
+  input: ReadToolInput,
+  context: ToolContext,
+): Promise<ToolResponse<ReadToolDetails>> {
   const path = resolveAllowedPath(input.path, context.cwd, context.readRoots ?? [context.root]);
   const tool = createReadTool(context.cwd);
 

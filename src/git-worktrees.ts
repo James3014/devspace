@@ -7,6 +7,23 @@ import type { ServerConfig } from "./config.js";
 import { assertAllowedPath, isPathInsideRoot } from "./roots.js";
 
 const execFileAsync = promisify(execFile);
+const REMOTE_FETCH_TIMEOUT_MS = 30_000;
+
+interface GitExecOptions {
+  timeoutMs?: number;
+  disableTerminalPrompt?: boolean;
+}
+
+class GitExecError extends Error {
+  constructor(
+    message: string,
+    readonly exitCode?: number | string,
+    readonly timedOut = false,
+  ) {
+    super(message);
+    this.name = "GitExecError";
+  }
+}
 
 export class GitWorktreeError extends Error {
   constructor(
@@ -18,6 +35,8 @@ export class GitWorktreeError extends Error {
       | "GIT_BASE_REF_NOT_LOCAL"
       | "GIT_REMOTE_NOT_CONFIGURED"
       | "GIT_REMOTE_REF_NOT_FOUND"
+      | "GIT_REMOTE_FETCH_FAILED"
+      | "GIT_REMOTE_FETCH_TIMEOUT"
       | "GIT_WORKTREE_CREATE_FAILED",
     message: string,
   ) {
@@ -197,12 +216,18 @@ export interface GitFetchRefResult {
   changed: boolean;
 }
 
-export async function fetchRemoteBranchRef(input: {
-  sourcePath: string;
-  remote: string;
-  branch: string;
-  config: ServerConfig;
-}): Promise<GitFetchRefResult> {
+export async function fetchRemoteBranchRef(
+  input: {
+    sourcePath: string;
+    remote: string;
+    branch: string;
+    config: ServerConfig;
+  },
+  options: {
+    fetchTimeoutMs?: number;
+    runFetch?: typeof git;
+  } = {},
+): Promise<GitFetchRefResult> {
   const sourcePath = assertAllowedPath(input.sourcePath, input.config.allowedRoots);
   const sourceRoot = await resolveGitRoot(sourcePath, input.config.allowedRoots);
   const remote = input.remote.trim();
@@ -248,9 +273,11 @@ export async function fetchRemoteBranchRef(input: {
 
   const localRef = "refs/remotes/" + remote + "/" + branch;
   const previousSha = (await tryRevParse(sourceRoot, localRef)) ?? undefined;
+  const runFetch = options.runFetch ?? git;
+  const fetchTimeoutMs = options.fetchTimeoutMs ?? REMOTE_FETCH_TIMEOUT_MS;
   try {
     await withRepoWorktreeLock(sourceRoot, () =>
-      git(
+      runFetch(
         [
           "fetch",
           "--depth=1",
@@ -259,13 +286,33 @@ export async function fetchRemoteBranchRef(input: {
           "+refs/heads/" + branch + ":" + localRef,
         ],
         sourceRoot,
+        {
+          timeoutMs: fetchTimeoutMs,
+          disableTerminalPrompt: true,
+        },
       ),
     );
-  } catch {
+  } catch (error) {
+    if (isGitTimeout(error)) {
+      throw new GitWorktreeError(
+        "GIT_REMOTE_FETCH_TIMEOUT",
+        "[GIT_REMOTE_FETCH_TIMEOUT] Timed out while fetching remote branch " +
+          JSON.stringify(branch) + " from configured remote " + JSON.stringify(remote) + ".",
+      );
+    }
+    const message = error instanceof Error ? error.message : String(error);
+    if (/couldn['’]t find remote ref|remote ref .* not found/i.test(message)) {
+      throw new GitWorktreeError(
+        "GIT_REMOTE_REF_NOT_FOUND",
+        "[GIT_REMOTE_REF_NOT_FOUND] Remote branch " + JSON.stringify(branch) +
+          " does not exist on configured remote " + JSON.stringify(remote) + ".",
+      );
+    }
     throw new GitWorktreeError(
-      "GIT_REMOTE_REF_NOT_FOUND",
-      "[GIT_REMOTE_REF_NOT_FOUND] Remote branch " + JSON.stringify(branch) +
-        " could not be fetched from configured remote " + JSON.stringify(remote) + ".",
+      "GIT_REMOTE_FETCH_FAILED",
+      "[GIT_REMOTE_FETCH_FAILED] Could not fetch remote branch " + JSON.stringify(branch) +
+        " from configured remote " + JSON.stringify(remote) +
+        ". Check network/authentication and retry the exact fetch.",
     );
   }
 
@@ -310,11 +357,15 @@ function sanitizePathSegment(value: string): string {
     .slice(0, 80);
 }
 
-async function git(args: string[], cwd: string): Promise<string> {
+async function git(args: string[], cwd: string, options: GitExecOptions = {}): Promise<string> {
   try {
     const { stdout } = await execFileAsync("git", args, {
       cwd,
       maxBuffer: 10 * 1024 * 1024,
+      ...(options.timeoutMs ? { timeout: options.timeoutMs } : {}),
+      env: options.disableTerminalPrompt
+        ? { ...process.env, GIT_TERMINAL_PROMPT: "0" }
+        : process.env,
     });
     return stdout;
   } catch (error) {
@@ -327,8 +378,27 @@ async function git(args: string[], cwd: string): Promise<string> {
       ? String((error as { stdout?: unknown }).stdout ?? "").trim()
       : "";
     const details = stderr || stdout || (error instanceof Error ? error.message : String(error));
-    throw new Error(details);
+    const exitCode = typeof error === "object" && error && "code" in error
+      ? (error as { code?: number | string }).code
+      : undefined;
+    const timedOut = Boolean(
+      typeof error === "object" &&
+      error &&
+      (("killed" in error && (error as { killed?: unknown }).killed === true) ||
+        exitCode === "ETIMEDOUT"),
+    );
+    throw new GitExecError(details, exitCode, timedOut);
   }
+}
+
+function isGitTimeout(error: unknown): boolean {
+  return Boolean(
+    typeof error === "object" &&
+    error &&
+    (("timedOut" in error && (error as { timedOut?: unknown }).timedOut === true) ||
+      ("killed" in error && (error as { killed?: unknown }).killed === true) ||
+      ("code" in error && (error as { code?: unknown }).code === "ETIMEDOUT")),
+  );
 }
 
 function isGitUnavailable(error: unknown): boolean {

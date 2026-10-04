@@ -806,11 +806,12 @@ async function readExactTextRange(
 ): Promise<{
   exactContent: string;
   fileSha256: string;
+  totalLines: number;
   pagination?: ReadPaginationInfo;
 }> {
   const bytes = await readFile(path);
   const text = bytes.toString("utf8");
-  const lines = text.length === 0 ? [] : text.split("\n");
+  const lines = text.split("\n");
   const offset = Math.max(1, inputOffset);
   const startIndex = Math.min(lines.length, offset - 1);
   const endIndex = inputLimit === undefined
@@ -826,6 +827,7 @@ async function readExactTextRange(
   return {
     exactContent,
     fileSha256,
+    totalLines: lines.length,
     ...(inputLimit !== undefined || offset !== 1
       ? {
           pagination: {
@@ -4537,11 +4539,35 @@ export function createMcpServer(
       }
       workspaces.markReadPathLoaded(workspace, readPath);
 
-      const { exactContent, fileSha256, pagination } = await readExactTextRange(
+      const exactRead = await readExactTextRange(
         readPath.absolutePath,
         input.offset ?? 1,
         input.limit,
       );
+      let exactContent = exactRead.exactContent;
+      let pagination = exactRead.pagination;
+      const truncation = response.details?.truncation;
+      if (truncation?.truncated) {
+        exactContent = truncation.content;
+        const offset = input.offset ?? 1;
+        const returnedLines = truncation.firstLineExceedsLimit ? 0 : truncation.outputLines;
+        const consumedThrough = (offset - 1) + returnedLines;
+        const remainingLines = Math.max(0, exactRead.totalLines - consumedThrough);
+        const rawText = contentText(response.content);
+        const notice = rawText.slice(truncation.content.length).trim() || undefined;
+        pagination = {
+          truncated: true,
+          offset,
+          limit: input.limit,
+          returnedLines,
+          totalLines: exactRead.totalLines,
+          remainingLines,
+          nextOffset: !truncation.firstLineExceedsLimit && remainingLines > 0
+            ? offset + returnedLines
+            : undefined,
+          notice,
+        };
+      }
 
       const summary = {
         ...textSummary(response.content),
@@ -4570,7 +4596,7 @@ export function createMcpServer(
         structuredContent: {
           result: exactContent,
           content: exactContent,
-          fileSha256,
+          fileSha256: exactRead.fileSha256,
           ...(pagination ? { pagination } : {}),
         },
       };
@@ -6844,6 +6870,17 @@ export function createMcpServer(
         const destinationWorkspace = workspaces.getWorkspace(destinationWorkspaceId);
 
         const resolvedSource = workspaces.resolveReadPath(sourceWorkspace, sourcePath);
+        if (resolvedSource.nestedInstructionRebindRequired) {
+          const { instructionPaths } = resolvedSource.nestedInstructionRebindRequired;
+          return {
+            isError: true,
+            content: [textBlock([
+              `NESTED_INSTRUCTION_REBIND_REQUIRED: Nested repository instruction file(s) must be read before copying '${sourcePath}'.`,
+              "Read each instruction file below in order, then retry the copy:",
+              ...instructionPaths.map((path, index) => `  ${index + 1}. ${path}`),
+            ].join("\n"))],
+          };
+        }
         const sourceAbsolutePath = resolvedSource.absolutePath;
         const sourceRootCanonical = canonicalizePath(sourceWorkspace.root);
         const sourceCanonicalPath = canonicalizePath(sourceAbsolutePath);

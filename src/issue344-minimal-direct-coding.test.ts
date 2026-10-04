@@ -399,6 +399,42 @@ test("Issue #344 - Criteria 3: workspace_copy_file transfers >=5,000 line file w
   });
   assert.equal((missingPreimage as { isError?: boolean }).isError, true);
   assert.match(JSON.stringify(missingPreimage), /DESTINATION_PREIMAGE_MISSING/);
+
+  // Negative control 6: source-side nested instructions must be loaded before copy reads the file.
+  await mkdir(join(env.repoDir, "guarded"), { recursive: true });
+  await writeFile(join(env.repoDir, "guarded", "AGENTS.md"), "# guarded source instructions\n");
+  await writeFile(join(env.repoDir, "guarded", "source.txt"), "guarded payload\n");
+  const guardedBlocked = await env.client.callTool({
+    name: "workspace_copy_file",
+    arguments: {
+      sourceWorkspaceId: wsAId,
+      sourcePath: "guarded/source.txt",
+      destinationWorkspaceId: wsBId,
+      destinationPath: "guarded-copy.txt",
+    },
+  });
+  assert.equal((guardedBlocked as { isError?: boolean }).isError, true);
+  assert.match(JSON.stringify(guardedBlocked), /NESTED_INSTRUCTION_REBIND_REQUIRED/);
+
+  const guardedInstructions = await env.client.callTool({
+    name: "read",
+    arguments: {
+      workspaceId: wsAId,
+      path: "guarded/AGENTS.md",
+    },
+  });
+  assert.equal((guardedInstructions as { isError?: boolean }).isError, undefined);
+
+  const guardedCopy = await env.client.callTool({
+    name: "workspace_copy_file",
+    arguments: {
+      sourceWorkspaceId: wsAId,
+      sourcePath: "guarded/source.txt",
+      destinationWorkspaceId: wsBId,
+      destinationPath: "guarded-copy.txt",
+    },
+  });
+  assert.equal((guardedCopy as { isError?: boolean }).isError, undefined);
 });
 
 
@@ -462,6 +498,26 @@ test("Issue #344 - Criteria 4: bounded read returns exact content separately fro
   assert.equal(literalStructured.result, literalNotice);
   assert.equal(literalStructured.content, literalNotice);
   assert.equal(literalStructured.pagination, undefined);
+
+  // Existing Pi read byte bounds remain authoritative for pathological long lines.
+  const hugeLine = "x".repeat(60 * 1024);
+  await writeFile(join(env.repoDir, "huge-line.txt"), hugeLine);
+  const hugeRead = await env.client.callTool({
+    name: "read",
+    arguments: {
+      workspaceId: wsId,
+      path: "huge-line.txt",
+    },
+  });
+  const hugeStructured = structuredContent(hugeRead);
+  assert.equal(hugeStructured.result, "");
+  assert.equal(hugeStructured.content, "");
+  assert.match(String(hugeStructured.fileSha256), /^[0-9a-f]{64}$/);
+  const hugePagination = hugeStructured.pagination as Record<string, unknown>;
+  assert.equal(hugePagination.truncated, true);
+  assert.equal(hugePagination.returnedLines, 0);
+  assert.equal(hugePagination.nextOffset, undefined);
+  assert.match(String(hugePagination.notice), /exceeds .* limit/);
 });
 
 test("Issue #344 - Criteria 5: discover verifiers and invoke workspace_verify without prior knowledge of toolchainId", async (t) => {

@@ -4,7 +4,13 @@ import { execFileSync } from "node:child_process";
 import { mkdtemp, mkdir, readlink, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createManagedWorktree, repoWorktreeLockCount, withRepoWorktreeLock } from "./git-worktrees.js";
+import {
+  createManagedWorktree,
+  fetchRemoteBranchRef,
+  GitWorktreeError,
+  repoWorktreeLockCount,
+  withRepoWorktreeLock,
+} from "./git-worktrees.js";
 
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void;
@@ -53,6 +59,70 @@ test("worktree lock keeps a pending successor as the current owner", async () =>
   await Promise.all([first, second, third]);
   assert.deepEqual(events, ["first", "second", "third"]);
   assert.equal(repoWorktreeLockCount(), 0);
+});
+
+test("fetchRemoteBranchRef bounds remote I/O and preserves timeout/failure classes", async () => {
+  const tempDir = await mkdtemp(join(tmpdir(), "worktree-fetch-test-"));
+  const repoDir = join(tempDir, "repo");
+  const remoteDir = join(tempDir, "remote.git");
+  const worktreeRootDir = join(tempDir, "worktrees");
+  await mkdir(repoDir, { recursive: true });
+  execFileSync("git", ["init", "--bare", remoteDir]);
+  execFileSync("git", ["init"], { cwd: repoDir });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: repoDir });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd: repoDir });
+  execFileSync("git", ["remote", "add", "origin", remoteDir], { cwd: repoDir });
+  execFileSync("git", ["commit", "--allow-empty", "-m", "initial commit"], { cwd: repoDir });
+
+  const config = {
+    allowedRoots: [tempDir],
+    worktreeRoot: worktreeRootDir,
+  } as any;
+
+  try {
+    await assert.rejects(
+      fetchRemoteBranchRef(
+        {
+          sourcePath: repoDir,
+          remote: "origin",
+          branch: "feat/timeout",
+          config,
+        },
+        {
+          fetchTimeoutMs: 123,
+          runFetch: async (_args, _cwd, options) => {
+            assert.equal(options?.timeoutMs, 123);
+            assert.equal(options?.disableTerminalPrompt, true);
+            throw Object.assign(new Error("simulated timeout"), { timedOut: true });
+          },
+        },
+      ),
+      (error: unknown) =>
+        error instanceof GitWorktreeError &&
+        error.code === "GIT_REMOTE_FETCH_TIMEOUT",
+    );
+
+    await assert.rejects(
+      fetchRemoteBranchRef(
+        {
+          sourcePath: repoDir,
+          remote: "origin",
+          branch: "feat/auth-failure",
+          config,
+        },
+        {
+          runFetch: async () => {
+            throw new Error("simulated authentication failure");
+          },
+        },
+      ),
+      (error: unknown) =>
+        error instanceof GitWorktreeError &&
+        error.code === "GIT_REMOTE_FETCH_FAILED",
+    );
+  } finally {
+    await rm(tempDir, { recursive: true, force: true });
+  }
 });
 
 test("createManagedWorktree automatically links parent node_modules when present", async () => {
