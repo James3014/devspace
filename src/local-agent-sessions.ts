@@ -4447,6 +4447,99 @@ function recordToStartOutput(record: LocalAgentRecord, herdrHandle?: HerdrExtern
   return output;
 }
 
+type ProviderEffectKnowledge = "present" | "none" | "unknown";
+
+/**
+ * Whether the failed turn may have produced a source effect. "none" requires
+ * positive evidence (a known scope state with no changed paths); anything else
+ * is "unknown" and must be treated as a possible effect so callers never
+ * blind-retry into a duplicate mutation.
+ */
+function providerEffectKnowledge(record: LocalAgentRecord): ProviderEffectKnowledge {
+  if ((record.lifecycleState?.cumulativeChangedPaths?.length ?? 0) > 0) return "present";
+  if (record.scopeState === "SCOPE_VIOLATION") return "present";
+  if (record.scopeState === "WITHIN_SCOPE") return "none";
+  return "unknown";
+}
+
+/** Classifies a failed record from its structured errorCode only; never from free-form message text. */
+function classifyDispatchFailure(record: LocalAgentRecord): DispatchFailureClassification {
+  const code = record.errorCode ?? "";
+  const knowledge = providerEffectKnowledge(record);
+  let failureClass: DispatchFailureClassification["failureClass"];
+  let providerEffect = knowledge !== "none";
+
+  switch (code) {
+    case "DISPATCH_CONTRACT_REJECTED":
+      // Pre-provider admission rejection: the provider was never invoked.
+      failureClass = "DISPATCH_CONTRACT_REJECTED";
+      providerEffect = false;
+      break;
+    case "WORKTREE_LEASE_CONFLICT":
+      failureClass = "WORKTREE_LEASE_CONFLICT";
+      break;
+    case "DUPLICATE_EFFECT_SUPPRESSED":
+      failureClass = "DUPLICATE_EFFECT_SUPPRESSED";
+      break;
+    case "RECONCILIATION_REQUIRED":
+      failureClass = knowledge === "none" ? "TRANSPORT_LOST_ACK" : "EFFECT_OUTCOME_UNKNOWN";
+      break;
+    case "PROVIDER_CAPACITY_ERROR":
+      failureClass = knowledge === "none"
+        ? "PROVIDER_QUOTA_EXHAUSTED_PRE_EFFECT"
+        : "PROVIDER_QUOTA_EXHAUSTED_AFTER_EFFECT";
+      break;
+    case "PROVIDER_AUTH_ERROR":
+      failureClass = "PROVIDER_AUTH_ERROR";
+      break;
+    case "WORKER_LAUNCH_FAILED":
+      failureClass = "PROVIDER_STARTUP_FAILED";
+      break;
+    case "PROVIDER_TIMEOUT":
+    case "PROVIDER_MODEL_UNAVAILABLE":
+    case "PROVIDER_VARIANT_UNAVAILABLE":
+    case "PROVIDER_EXECUTION_ERROR":
+    case "PROVIDER_UNAVAILABLE":
+      failureClass = "PROVIDER_EXECUTION_FAILED";
+      break;
+    case "VERIFIER_PLAN_PERSIST_FAILED":
+      failureClass = "INTERNAL_CONTROL_PLANE_ERROR";
+      break;
+    default:
+      failureClass = record.scopeState === "SCOPE_VIOLATION" ? "SCOPE_OR_PERMISSION_ERROR" : "UNKNOWN";
+  }
+
+  const classification: DispatchFailureClassification = {
+    failureClass,
+    providerEffect,
+    classifiedAt: record.updatedAt,
+  };
+  if (record.error !== undefined) classification.reason = record.error;
+  return classification;
+}
+
+/** Per-axis effect policy status derived from the physical enforcement receipt; request-only otherwise. */
+function deriveEffectPolicyStatus(record: LocalAgentRecord): NonNullable<AgentStatusOutput["effectPolicyStatus"]> {
+  const receipt = record.lifecycleState?.lastEffectEnforcementReceipt;
+  const enforced = receipt?.enforcementMode === "ENFORCED_NATIVE_PROVIDER";
+  const requested = record.executionContract?.effectProjection;
+  const axis = (receiptHas: boolean, requestedHas: boolean): "enforced" | "request_only" | "unknown" => {
+    if (enforced && receiptHas) return "enforced";
+    return requestedHas ? "request_only" : "unknown";
+  };
+  const process = axis(Boolean(receipt?.process), Boolean(requested?.process));
+  const network = axis(Boolean(receipt?.network), Boolean(requested?.network));
+  const git = axis(Boolean(receipt?.git), Boolean(requested?.git));
+  const toolCeiling = axis(Array.isArray(receipt?.selectedToolIntents), Boolean(requested));
+  const axes = [process, network, git, toolCeiling];
+  const overallEnforcement = axes.every((state) => state === "enforced")
+    ? "PHYSICALLY_ENFORCED"
+    : axes.some((state) => state === "request_only" || state === "enforced")
+      ? "REQUEST_ONLY_NOT_ENFORCED"
+      : "UNKNOWN";
+  return { process, network, git, toolCeiling, overallEnforcement };
+}
+
 function recordToStatusOutput(
   record: LocalAgentRecord,
   lifecycle?: LifecycleEvidence,
@@ -4496,8 +4589,9 @@ function recordToStatusOutput(
   if (record.lifecycleState?.automatedVerifierPlans) {
     output.automatedVerifierPlans = record.lifecycleState.automatedVerifierPlans;
   }
-  // P2-D: Separate dispatcher heartbeat from provider activity
-  output.dispatcherHeartbeatAt = record.updatedAt;
+  // P2-D: Provider process state is reported separately from dispatcher liveness.
+  // No dedicated dispatcher heartbeat is persisted, so dispatcherHeartbeatAt is
+  // intentionally omitted rather than aliased to the generic updatedAt.
   if (record.lifecycleState?.providerProcessState) {
     output.providerProcessState = record.lifecycleState.providerProcessState;
   } else {
@@ -4506,14 +4600,24 @@ function recordToStatusOutput(
     output.providerProcessState = "unknown";
   }
 
-  // P2-H: Operation timeline
-  if (record.lifecycleState?.operationTimeline) {
-    output.operationTimeline = record.lifecycleState.operationTimeline;
-  } else {
-    output.operationTimeline = {
-      queuedAt: record.createdAt,
-      terminalAt: isTerminalStatus(record.status) ? record.updatedAt : undefined,
+  // P2-H: Operation timeline. Only durably-recorded timestamps are reported;
+  // unobserved phases stay absent instead of being estimated.
+  {
+    const activeTurn = record.lifecycleState?.activeTurn;
+    const persisted = record.lifecycleState?.operationTimeline;
+    const timeline: OperationTimeline = {
+      queuedAt: persisted?.queuedAt ?? record.createdAt,
     };
+    const providerStartedAt = persisted?.providerStartedAt ?? activeTurn?.executionStartedAt;
+    if (providerStartedAt) timeline.providerStartedAt = providerStartedAt;
+    if (persisted?.firstStreamActivityAt) timeline.firstStreamActivityAt = persisted.firstStreamActivityAt;
+    const firstEffectAt = persisted?.firstEffectAt
+      ?? (typeof activeTurn?.firstEffectAt === "string" ? activeTurn.firstEffectAt : undefined);
+    if (firstEffectAt) timeline.firstEffectAt = firstEffectAt;
+    const terminalAt = persisted?.terminalAt ?? (isTerminalStatus(record.status) ? record.updatedAt : undefined);
+    if (terminalAt) timeline.terminalAt = terminalAt;
+    if (persisted?.reconciledAt) timeline.reconciledAt = persisted.reconciledAt;
+    output.operationTimeline = timeline;
   }
 
   // P2-A: Model attestation
@@ -4538,63 +4642,11 @@ function recordToStatusOutput(
   if (record.lifecycleState?.dispatchFailure) {
     output.dispatchFailure = record.lifecycleState.dispatchFailure;
   } else if (record.status === "error") {
-    const message = String(record.error ?? "");
-    const code = String(record.errorCode ?? "");
-    const hasEffect = (record.lifecycleState?.cumulativeChangedPaths?.length ?? 0) > 0;
-    let failureClass: DispatchFailureClassification["failureClass"] = "UNKNOWN";
-
-    if (code === "DISPATCH_CONTRACT_REJECTED") {
-      failureClass = "DISPATCH_CONTRACT_REJECTED";
-    } else if (code === "WORKTREE_LEASE_CONFLICT" || /writer lease|lease conflict/i.test(message)) {
-      failureClass = "WORKTREE_LEASE_CONFLICT";
-    } else if (code === "DUPLICATE_EFFECT_SUPPRESSED" || /duplicate effect suppressed/i.test(message)) {
-      failureClass = "DUPLICATE_EFFECT_SUPPRESSED";
-    } else if (code === "RECONCILIATION_REQUIRED" || /outcome[_ -]?unknown|lost ack/i.test(message)) {
-      failureClass = hasEffect ? "EFFECT_OUTCOME_UNKNOWN" : "TRANSPORT_LOST_ACK";
-    } else if (code === "PROVIDER_CAPACITY_ERROR" || /quota|capacity|rate limit|429/i.test(message)) {
-      failureClass = hasEffect
-        ? "PROVIDER_QUOTA_EXHAUSTED_AFTER_EFFECT"
-        : "PROVIDER_QUOTA_EXHAUSTED_PRE_EFFECT";
-    } else if (/auth|unauthori[sz]ed|forbidden|401|403/i.test(message)) {
-      failureClass = "PROVIDER_AUTH_ERROR";
-    } else if (/startup|failed to start|spawn|launch failed/i.test(message)) {
-      failureClass = "PROVIDER_STARTUP_FAILED";
-    } else if (/scope|permission|outside write|denied/i.test(message)) {
-      failureClass = "SCOPE_OR_PERMISSION_ERROR";
-    } else if (/verifier|verification failed/i.test(message)) {
-      failureClass = "VERIFIER_FAILED";
-    } else if (/coordinator interrupted|controller interrupted/i.test(message)) {
-      failureClass = "COORDINATOR_INTERRUPTED";
-    } else if (/status projection stale|projection stale/i.test(message)) {
-      failureClass = "CLIENT_STATUS_PROJECTION_STALE";
-    } else if (/provider.*running/i.test(message)) {
-      failureClass = "PROVIDER_RUNNING";
-    } else if (code.startsWith("PROVIDER_") || /provider/i.test(message)) {
-      failureClass = "PROVIDER_EXECUTION_FAILED";
-    } else if (code.startsWith("INTERNAL_") || /internal control plane/i.test(message)) {
-      failureClass = "INTERNAL_CONTROL_PLANE_ERROR";
-    }
-
-    output.dispatchFailure = {
-      failureClass,
-      providerEffect: hasEffect,
-      reason: record.error,
-      classifiedAt: record.updatedAt,
-    };
+    output.dispatchFailure = classifyDispatchFailure(record);
   }
 
   // P2-G: Effect policy enforcement breakdown
-  const hasEnforcedReceipt = record.lifecycleState?.lastEffectEnforcementReceipt?.enforcementMode === "ENFORCED_NATIVE_PROVIDER";
-  const hasRequestedProjection = Boolean(record.executionContract?.effectProjection);
-  output.effectPolicyStatus = {
-    process: hasEnforcedReceipt ? "enforced" : (hasRequestedProjection ? "request_only" : "unknown"),
-    network: hasEnforcedReceipt ? "enforced" : (hasRequestedProjection ? "request_only" : "unknown"),
-    git: hasEnforcedReceipt ? "enforced" : (hasRequestedProjection ? "request_only" : "unknown"),
-    toolCeiling: hasEnforcedReceipt ? "enforced" : (hasRequestedProjection ? "request_only" : "unknown"),
-    overallEnforcement: hasEnforcedReceipt
-      ? "PHYSICALLY_ENFORCED"
-      : (hasRequestedProjection ? "REQUEST_ONLY_NOT_ENFORCED" : "UNKNOWN"),
-  };
+  output.effectPolicyStatus = deriveEffectPolicyStatus(record);
 
   if (record.providerSessionId !== undefined) output.providerSessionId = record.providerSessionId;
   if (record.latestResponse !== undefined) output.latestResponse = record.latestResponse;

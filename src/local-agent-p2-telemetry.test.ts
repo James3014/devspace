@@ -215,7 +215,7 @@ test("P2-D: Dispatcher heartbeat is separated from providerProcessState and time
       agentId: started.agentId,
     });
 
-    assert.ok(status.dispatcherHeartbeatAt, "dispatcherHeartbeatAt must be populated");
+    assert.equal(status.dispatcherHeartbeatAt, undefined, "updatedAt must not be aliased as a dispatcher heartbeat");
     assert.equal(status.providerProcessState, "unknown", "heartbeat/status must not fabricate physical provider liveness");
     assert.ok(status.operationTimeline, "operationTimeline must be populated");
     assert.ok(status.operationTimeline.queuedAt, "queuedAt must be populated");
@@ -239,9 +239,9 @@ test("P2-E: Quota exhaustion failure classification distinguishes pre-effect fro
 
     const store = (manager as any).store as LocalAgentStore;
 
-    // Simulate quota error without source effect using raw db update on local_agent_sessions
+    // Positive no-effect evidence (WITHIN_SCOPE, no changed paths) => safe pre-effect classification
     (store as any).database.sqlite.prepare(
-      "update local_agent_sessions set status='error', error_code='PROVIDER_CAPACITY_ERROR', error='429 Rate limit exceeded / daily quota exhausted' where id=?"
+      "update local_agent_sessions set status='error', error_code='PROVIDER_CAPACITY_ERROR', error='429 Rate limit exceeded / daily quota exhausted', scope_state='WITHIN_SCOPE' where id=?"
     ).run(started.agentId);
 
     let status = await manager.getAgentStatus({
@@ -253,6 +253,18 @@ test("P2-E: Quota exhaustion failure classification distinguishes pre-effect fro
     assert.ok(status.dispatchFailure);
     assert.equal(status.dispatchFailure.failureClass, "PROVIDER_QUOTA_EXHAUSTED_PRE_EFFECT");
     assert.equal(status.dispatchFailure.providerEffect, false);
+
+    // Unknown scope: no proof of "no effect" => must NOT be offered as a clean retry
+    (store as any).database.sqlite.prepare(
+      "update local_agent_sessions set scope_state='UNKNOWN' where id=?"
+    ).run(started.agentId);
+    status = await manager.getAgentStatus({
+      workspaceId: "ws_p2_5",
+      workspaceRoot: projectRoot,
+      agentId: started.agentId,
+    });
+    assert.equal(status.dispatchFailure?.failureClass, "PROVIDER_QUOTA_EXHAUSTED_AFTER_EFFECT");
+    assert.equal(status.dispatchFailure?.providerEffect, true);
 
     // Now simulate quota error with source effect (after mutating files)
     const lifecycle = JSON.stringify({
@@ -290,37 +302,39 @@ test("P2-E2: failure taxonomy preserves distinct control-plane/provider states",
     const store = (manager as any).store as LocalAgentStore;
     const sqlite = (store as any).database.sqlite;
 
+    // [errorCode, message, effect knowledge, expected class, expected providerEffect]
+    // Messages deliberately contain misleading keywords: classification must use errorCode only.
     const cases = [
-      ["WORKTREE_LEASE_CONFLICT", "writer lease conflict", false, "WORKTREE_LEASE_CONFLICT"],
-      ["DUPLICATE_EFFECT_SUPPRESSED", "duplicate effect suppressed", false, "DUPLICATE_EFFECT_SUPPRESSED"],
-      ["RECONCILIATION_REQUIRED", "transport lost ack", false, "TRANSPORT_LOST_ACK"],
-      ["RECONCILIATION_REQUIRED", "outcome unknown after write", true, "EFFECT_OUTCOME_UNKNOWN"],
-      ["PROVIDER_AUTH_FAILURE", "401 Unauthorized provider auth", false, "PROVIDER_AUTH_ERROR"],
-      ["PROVIDER_START_FAILURE", "provider launch failed", false, "PROVIDER_STARTUP_FAILED"],
-      ["SCOPE_VIOLATION", "scope permission denied", false, "SCOPE_OR_PERMISSION_ERROR"],
-      ["VERIFIER_ERROR", "verifier failed", false, "VERIFIER_FAILED"],
-      ["CONTROL_INTERRUPTED", "coordinator interrupted", false, "COORDINATOR_INTERRUPTED"],
-      ["STATUS_STALE", "status projection stale", false, "CLIENT_STATUS_PROJECTION_STALE"],
-      ["PROVIDER_BUSY", "provider still running", false, "PROVIDER_RUNNING"],
-      ["PROVIDER_PROTOCOL_ERROR", "provider execution protocol failed", false, "PROVIDER_EXECUTION_FAILED"],
-      ["INTERNAL_STATE_ERROR", "internal control plane state error", false, "INTERNAL_CONTROL_PLANE_ERROR"],
+      ["WORKTREE_LEASE_CONFLICT", "anything", "none", "WORKTREE_LEASE_CONFLICT", false],
+      ["DUPLICATE_EFFECT_SUPPRESSED", "anything", "none", "DUPLICATE_EFFECT_SUPPRESSED", false],
+      ["RECONCILIATION_REQUIRED", "anything", "none", "TRANSPORT_LOST_ACK", false],
+      ["RECONCILIATION_REQUIRED", "anything", "present", "EFFECT_OUTCOME_UNKNOWN", true],
+      ["RECONCILIATION_REQUIRED", "anything", "unknown", "EFFECT_OUTCOME_UNKNOWN", true],
+      ["PROVIDER_AUTH_ERROR", "author field", "none", "PROVIDER_AUTH_ERROR", false],
+      ["WORKER_LAUNCH_FAILED", "anything", "none", "PROVIDER_STARTUP_FAILED", false],
+      ["PROVIDER_TIMEOUT", "permission denied scope", "none", "PROVIDER_EXECUTION_FAILED", false],
+      ["PROVIDER_EXECUTION_ERROR", "quota", "none", "PROVIDER_EXECUTION_FAILED", false],
+      ["VERIFIER_PLAN_PERSIST_FAILED", "anything", "none", "INTERNAL_CONTROL_PLANE_ERROR", false],
+      ["SOME_UNMAPPED_CODE", "provider quota 429 auth denied", "none", "UNKNOWN", false],
+      ["SOME_UNMAPPED_CODE", "anything", "unknown", "UNKNOWN", true],
     ] as const;
 
-    for (const [errorCode, error, hasEffect, expectedClass] of cases) {
+    for (const [errorCode, error, effect, expectedClass, expectedEffect] of cases) {
       const lifecycle = JSON.stringify({
-        cumulativeChangedPaths: hasEffect ? ["src/partial.ts"] : [],
+        cumulativeChangedPaths: effect === "present" ? ["src/partial.ts"] : [],
       });
+      const scopeState = effect === "none" ? "WITHIN_SCOPE" : effect === "unknown" ? "UNKNOWN" : "WITHIN_SCOPE";
       sqlite.prepare(
-        "update local_agent_sessions set status='error', error_code=?, error=?, lifecycle_state=? where id=?",
-      ).run(errorCode, error, lifecycle, started.agentId);
+        "update local_agent_sessions set status='error', error_code=?, error=?, lifecycle_state=?, scope_state=? where id=?",
+      ).run(errorCode, error, lifecycle, scopeState, started.agentId);
       const status = await manager.getAgentStatus({
         workspaceId: "ws_p2_taxonomy",
         workspaceRoot: projectRoot,
         agentId: started.agentId,
       });
-      assert.ok(status.dispatchFailure, expectedClass);
-      assert.equal(status.dispatchFailure.failureClass, expectedClass);
-      assert.equal(status.dispatchFailure.providerEffect, hasEffect);
+      assert.ok(status.dispatchFailure, `${errorCode}/${effect}`);
+      assert.equal(status.dispatchFailure.failureClass, expectedClass, `${errorCode}/${effect}`);
+      assert.equal(status.dispatchFailure.providerEffect, expectedEffect, `${errorCode}/${effect}`);
     }
   } finally {
     cleanup();
