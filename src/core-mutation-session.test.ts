@@ -30,6 +30,7 @@ import {
   validateDirectCandidateExecutionEvidence,
 } from "./execution-protocol.js";
 import { createWorkspaceStore } from "./workspace-store.js";
+import { CoreCandidateAcquisitionObservationStore } from "./core-candidate-acquisition.js";
 
 function git(repo: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd: repo, encoding: "utf8" }).trim();
@@ -227,7 +228,7 @@ test("Core mutation session census is read-only, filtered, paginated, candidate-
     git(fixture.repo, "commit", "-m", "candidate");
     const candidateHead = git(fixture.repo, "rev-parse", "HEAD");
     const candidateTree = git(fixture.repo, "rev-parse", "HEAD^{tree}");
-    await store.recordCandidate({
+    const candidate = await store.recordCandidate({
       sessionId: third.id,
       workspaceSessionId: workspaces[2]!,
       workspaceRoot: fixture.repo,
@@ -236,6 +237,23 @@ test("Core mutation session census is read-only, filtered, paginated, candidate-
       candidateTree,
       now: new Date("2026-09-14T03:02:00.000Z"),
     });
+    const acquisitionStore = new CoreCandidateAcquisitionObservationStore(stateDir);
+    acquisitionStore.createPending({
+      operationId: "cca_" + "3".repeat(32),
+      durableOperationId: "cca_" + "3".repeat(32),
+      sessionId: third.id,
+      candidateHead,
+      candidateTree,
+      sourceRevision: third.sourceHead,
+      bindingHash: third.bindingHash,
+      acceptanceContractHash: candidate.acceptanceContractHash,
+      changeSetHash: candidate.changeSetHash,
+      profileHash: null,
+      coreRuntimeIdentity: null,
+      acquisitionRequestId: "acq-third",
+      requestHash: "sha256:" + "4".repeat(64),
+    });
+    acquisitionStore.close();
     await store.closeSession({
       sessionId: third.id,
       workspaceSessionId: workspaces[2]!,
@@ -293,6 +311,26 @@ test("Core mutation session census is read-only, filtered, paginated, candidate-
     assert.equal(secondPage.sessions[0]?.candidate?.candidateHead, candidateHead);
     assert.equal(secondPage.sessions[0]?.candidate?.candidateTree, candidateTree);
     assert.deepEqual(secondPage.sessions[0]?.candidate?.changedPaths, ["app.ts"]);
+    assert.deepEqual(
+      secondPage.sessions[0]?.coreAcquisitionObservation && {
+        sessionId: secondPage.sessions[0].coreAcquisitionObservation.sessionId,
+        candidateHead: secondPage.sessions[0].coreAcquisitionObservation.candidateHead,
+        candidateTree: secondPage.sessions[0].coreAcquisitionObservation.candidateTree,
+        sourceRevision: secondPage.sessions[0].coreAcquisitionObservation.sourceRevision,
+        bindingHash: secondPage.sessions[0].coreAcquisitionObservation.bindingHash,
+        acceptanceContractHash: secondPage.sessions[0].coreAcquisitionObservation.acceptanceContractHash,
+        changeSetHash: secondPage.sessions[0].coreAcquisitionObservation.changeSetHash,
+      },
+      {
+        sessionId: third.id,
+        candidateHead,
+        candidateTree,
+        sourceRevision: third.sourceHead,
+        bindingHash: third.bindingHash,
+        acceptanceContractHash: candidate.acceptanceContractHash,
+        changeSetHash: candidate.changeSetHash,
+      },
+    );
 
     const wrongRepository = store.listForObservation({
       repository: "James3014/nexus-core",
@@ -311,6 +349,7 @@ test("Core mutation session census is read-only, filtered, paginated, candidate-
     assert.deepEqual(replay.sessions.map((entry) => entry.session.id), [first.id, second.id, third.id]);
     assert.equal(replay.sessions[1]?.session.freshnessState, "FRESH");
     assert.equal(replay.sessions[2]?.candidate?.candidateHead, candidateHead);
+    assert.equal(replay.sessions[2]?.coreAcquisitionObservation?.candidateHead, candidateHead);
   } finally {
     store.close();
     workspaceStore.close?.();

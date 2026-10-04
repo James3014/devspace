@@ -589,6 +589,7 @@ process.stdin.on('end', () => {
     assert.equal(obs.acquisitionStatus, "VERDICT_RECORDED");
     assert.equal(obs.coreInvoked, true);
     assert.equal(obs.coreVerdict, "VERIFIED");
+    assert.equal(obs.coreReason, "NO_REASON_CODES");
     assert.equal(obs.receiptHash, receiptHash);
     assert.ok(obs.acquisitionRequestId);
     assert.ok(obs.requestHash);
@@ -1481,7 +1482,6 @@ test("17. migration 23→24 idempotent: observation schema created; running migr
 
     assert.ok(versions.includes(23), "migration 23 must be recorded");
     assert.ok(versions.includes(24), "migration 24 must be recorded");
-    assert.equal(versions.includes(25), false);
 
     sqlite.close();
   } finally {

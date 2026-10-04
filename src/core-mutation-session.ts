@@ -244,6 +244,13 @@ export interface CoreMutationCandidateProvenance {
 export interface CoreAcquisitionObservationSummary {
   operationId: string;
   durableOperationId: string;
+  sessionId: string;
+  candidateHead: string;
+  candidateTree: string;
+  sourceRevision: string;
+  bindingHash: string;
+  acceptanceContractHash: string;
+  changeSetHash: string;
   acquisitionStatus: string;
   coreInvoked: boolean;
   coreVerdict: string | null;
@@ -985,6 +992,13 @@ export class CoreMutationSessionStore {
           coreAcquisitionObservation = {
             operationId: String(obsRow.operation_id),
             durableOperationId: String(obsRow.durable_operation_id),
+            sessionId: String(obsRow.session_id),
+            candidateHead: String(obsRow.candidate_head),
+            candidateTree: String(obsRow.candidate_tree),
+            sourceRevision: String(obsRow.source_revision),
+            bindingHash: String(obsRow.binding_hash),
+            acceptanceContractHash: String(obsRow.acceptance_contract_hash),
+            changeSetHash: String(obsRow.change_set_hash),
             acquisitionStatus: String(obsRow.acquisition_status),
             coreInvoked: obsRow.core_invoked === 1 || obsRow.core_invoked === true,
             coreVerdict: obsRow.core_verdict != null ? String(obsRow.core_verdict) : null,

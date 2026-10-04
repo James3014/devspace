@@ -1372,7 +1372,11 @@ export async function orchestrateCoreCandidateAcquisition(
   }
 
   // Record the verdict (could be VERIFIED, REJECTED, or any producer vocabulary).
-  const reasonSummary = parsed.core_reason_codes.length > 0 ? parsed.core_reason_codes.join(",") : null;
+  // A successful Core verdict with no reason codes still has an explicit
+  // reason observation for G2 terminal completeness; null means unobserved.
+  const reasonSummary = parsed.core_reason_codes.length > 0
+    ? parsed.core_reason_codes.join(",")
+    : "NO_REASON_CODES";
   const obs = input.observationStore.recordVerdict({
     operationId,
     verdict: parsed.core_verdict as CoreCandidateAcquisitionVerdict,
