@@ -144,6 +144,7 @@ test("Issue #344 - Criteria 1: apply_patch is available in DEVSPACE_TOOL_MODE=mi
   assert.ok(toolNames.includes("workspace_verify"), "workspace_verify must be present");
   assert.ok(toolNames.includes("workspace_list_verifiers"), "workspace_list_verifiers must be present");
   assert.ok(toolNames.includes("workspace_copy_file"), "workspace_copy_file must be present");
+  assert.ok(toolNames.includes("git_fetch_ref"), "git_fetch_ref must be present");
 
   // Open workspace
   const openRes = await env.client.callTool({
@@ -183,7 +184,7 @@ test("Issue #344 - Criteria 1: apply_patch is available in DEVSPACE_TOOL_MODE=mi
   assert.equal(hello, "Hello World\nLine 2\n");
 });
 
-test("Issue #344 - Criteria 2: open_workspace(worktree) auto-fetches remote branch not yet in local ref namespace", async (t) => {
+test("Issue #344 - Criteria 2: explicit git_fetch_ref syncs one configured remote branch before worktree open", async (t) => {
   const env = await setupMinimalEnvironment(t);
 
   // Push a new branch directly to the bare remote repo from another clone
@@ -197,9 +198,8 @@ test("Issue #344 - Criteria 2: open_workspace(worktree) auto-fetches remote bran
   execFileSync("git", ["commit", "-m", "Remote PR branch commit"], { cwd: secondClone });
   execFileSync("git", ["push", "-u", "origin", "feat/remote-pr-branch"], { cwd: secondClone });
 
-  // In env.repoDir, the local repo has NEVER fetched feat/remote-pr-branch yet.
-  // Calling open_workspace with baseRef="feat/remote-pr-branch" must automatically fetch and succeed!
-  const openRes = await env.client.callTool({
+  // The remote branch is not local yet. open_workspace must fail without hidden network/ref mutation.
+  const missingLocalRef = await env.client.callTool({
     name: "open_workspace",
     arguments: {
       path: env.repoDir,
@@ -207,31 +207,68 @@ test("Issue #344 - Criteria 2: open_workspace(worktree) auto-fetches remote bran
       baseRef: "feat/remote-pr-branch",
     },
   });
+  assert.equal((missingLocalRef as { isError?: boolean }).isError, true);
+  assert.match(JSON.stringify(missingLocalRef), /GIT_BASE_REF_NOT_LOCAL/);
+  assert.throws(
+    () => execFileSync("git", ["show-ref", "--verify", "refs/remotes/origin/feat/remote-pr-branch"], { cwd: env.repoDir }),
+  );
+
+  // Open the physical checkout, explicitly sync exactly one configured remote branch, then open by returned localRef.
+  const checkoutRes = await env.client.callTool({
+    name: "open_workspace",
+    arguments: { path: env.repoDir, mode: "checkout" },
+  });
+  const checkoutId = structuredContent(checkoutRes).workspaceId as string;
+  const fetchRes = await env.client.callTool({
+    name: "git_fetch_ref",
+    arguments: {
+      workspaceId: checkoutId,
+      remote: "origin",
+      branch: "feat/remote-pr-branch",
+    },
+  });
+  const fetchData = structuredContent(fetchRes);
+  assert.equal(fetchData.remote, "origin");
+  assert.equal(fetchData.branch, "feat/remote-pr-branch");
+  assert.equal(fetchData.localRef, "refs/remotes/origin/feat/remote-pr-branch");
+  assert.match(String(fetchData.fetchedSha), /^[0-9a-f]{40}$/);
+
+  const openRes = await env.client.callTool({
+    name: "open_workspace",
+    arguments: {
+      path: env.repoDir,
+      mode: "worktree",
+      baseRef: fetchData.localRef,
+    },
+  });
 
   const structured = structuredContent(openRes);
   assert.equal(structured.mode, "worktree");
   const worktreeRoot = structured.root as string;
-  assert.ok(worktreeRoot);
-
-  // Check that the PR feature file is present in the isolated worktree
   const prContent = await readFile(join(worktreeRoot, "pr-feature.txt"), "utf8");
   assert.equal(prContent, "Remote PR feature content\n");
 
-  // Negative control: non-existent remote ref fails cleanly with GIT_REMOTE_REF_NOT_FOUND
-  try {
-    const failedOpen = await env.client.callTool({
-      name: "open_workspace",
-      arguments: {
-        path: env.repoDir,
-        mode: "worktree",
-        baseRef: "non-existent-pr-branch-9999",
-      },
-    });
-    assert.equal((failedOpen as { isError?: boolean }).isError, true);
-    assert.match(JSON.stringify(failedOpen), /GIT_REMOTE_REF_NOT_FOUND/);
-  } catch (error) {
-    assert.match(String(error), /GIT_REMOTE_REF_NOT_FOUND/);
-  }
+  const missingRemoteRef = await env.client.callTool({
+    name: "git_fetch_ref",
+    arguments: {
+      workspaceId: checkoutId,
+      remote: "origin",
+      branch: "non-existent-pr-branch-9999",
+    },
+  });
+  assert.equal((missingRemoteRef as { isError?: boolean }).isError, true);
+  assert.match(JSON.stringify(missingRemoteRef), /GIT_REMOTE_REF_NOT_FOUND/);
+
+  const unconfiguredRemote = await env.client.callTool({
+    name: "git_fetch_ref",
+    arguments: {
+      workspaceId: checkoutId,
+      remote: env.remoteDir,
+      branch: "feat/remote-pr-branch",
+    },
+  });
+  assert.equal((unconfiguredRemote as { isError?: boolean }).isError, true);
+  assert.match(JSON.stringify(unconfiguredRemote), /GIT_REMOTE_NOT_CONFIGURED/);
 });
 
 
@@ -312,7 +349,7 @@ test("Issue #344 - Criteria 3: workspace_copy_file transfers >=5,000 line file w
   assert.equal((blockedCas as { isError?: boolean }).isError, true);
   assert.match(JSON.stringify(blockedCas), /DESTINATION_CAS_MISMATCH/);
 
-  // Negative control 3: path escape outside allowed root -> blocked
+  // Negative control 3: lexical path escape outside workspace root -> blocked.
   try {
     const escapedRes = await env.client.callTool({
       name: "workspace_copy_file",
@@ -329,6 +366,39 @@ test("Issue #344 - Criteria 3: workspace_copy_file transfers >=5,000 line file w
   } catch (error) {
     assert.match(String(error), /outside workspace root|AccessDeniedError|outside an allowed root/);
   }
+
+  // Negative control 4: a parent-directory symlink cannot redirect writes outside the destination workspace.
+  const outsideDir = join(env.tempDir, "outside-copy-target");
+  await mkdir(outsideDir, { recursive: true });
+  await symlink(outsideDir, join(wsBRoot, "escape-link"));
+  const symlinkEscape = await env.client.callTool({
+    name: "workspace_copy_file",
+    arguments: {
+      sourceWorkspaceId: wsAId,
+      sourcePath: "large_source.txt",
+      destinationWorkspaceId: wsBId,
+      destinationPath: "escape-link/escaped.txt",
+      overwrite: true,
+    },
+  });
+  assert.equal((symlinkEscape as { isError?: boolean }).isError, true);
+  assert.match(JSON.stringify(symlinkEscape), /DESTINATION_PATH_ESCAPE/);
+  await assert.rejects(readFile(join(outsideDir, "escaped.txt")));
+
+  // Negative control 5: CAS preimage cannot silently degrade to create-if-missing.
+  const missingPreimage = await env.client.callTool({
+    name: "workspace_copy_file",
+    arguments: {
+      sourceWorkspaceId: wsAId,
+      sourcePath: "large_source.txt",
+      destinationWorkspaceId: wsBId,
+      destinationPath: "nested/missing-preimage.txt",
+      expectedDestinationSha256: "1".repeat(64),
+      overwrite: true,
+    },
+  });
+  assert.equal((missingPreimage as { isError?: boolean }).isError, true);
+  assert.match(JSON.stringify(missingPreimage), /DESTINATION_PREIMAGE_MISSING/);
 });
 
 
@@ -376,6 +446,22 @@ test("Issue #344 - Criteria 4: bounded read returns exact content separately fro
   assert.equal(pagination.remainingLines, 91);
   assert.equal(pagination.nextOffset, 11);
   assert.ok(String(pagination.notice).includes("91 more lines in file. Use offset=11 to continue."));
+  assert.match(String(structured.fileSha256), /^[0-9a-f]{64}$/);
+
+  // Source text that literally resembles the old pagination prose must remain source text.
+  const literalNotice = "payload\n\n[91 more lines in file. Use offset=11 to continue.]";
+  await writeFile(join(env.repoDir, "literal-notice.txt"), literalNotice);
+  const literalRead = await env.client.callTool({
+    name: "read",
+    arguments: {
+      workspaceId: wsId,
+      path: "literal-notice.txt",
+    },
+  });
+  const literalStructured = structuredContent(literalRead);
+  assert.equal(literalStructured.result, literalNotice);
+  assert.equal(literalStructured.content, literalNotice);
+  assert.equal(literalStructured.pagination, undefined);
 });
 
 test("Issue #344 - Criteria 5: discover verifiers and invoke workspace_verify without prior knowledge of toolchainId", async (t) => {
@@ -396,7 +482,7 @@ test("Issue #344 - Criteria 5: discover verifiers and invoke workspace_verify wi
   const structured = structuredContent(listRes);
   const toolchains = structured.toolchains as Array<{
     toolchainId: string;
-    verifiers: Array<{ name: string; available: boolean; executable: string }>;
+    verifiers: Array<{ name: string; available: boolean }>;
   }>;
   assert.ok(Array.isArray(toolchains));
   assert.equal(toolchains.length, 1);
@@ -445,13 +531,27 @@ test("Issue #344 - Criteria 6: end-to-end dogfood flow (open/sync -> inspect -> 
   execFileSync("git", ["commit", "-m", "WIP broken service"], { cwd: secondClone });
   execFileSync("git", ["push", "-u", "origin", "feat/dogfood-pr"], { cwd: secondClone });
 
-  // 2. Open / Sync exact workspace in worktree mode with baseRef="feat/dogfood-pr" (auto-fetches!)
+  // 2. Open the repository checkout, explicitly sync the remote branch, then open the isolated worktree.
+  const checkoutRes = await env.client.callTool({
+    name: "open_workspace",
+    arguments: { path: env.repoDir, mode: "checkout" },
+  });
+  const checkoutId = structuredContent(checkoutRes).workspaceId as string;
+  const fetchRes = await env.client.callTool({
+    name: "git_fetch_ref",
+    arguments: {
+      workspaceId: checkoutId,
+      remote: "origin",
+      branch: "feat/dogfood-pr",
+    },
+  });
+  const localRef = structuredContent(fetchRes).localRef as string;
   const openRes = await env.client.callTool({
     name: "open_workspace",
     arguments: {
       path: env.repoDir,
       mode: "worktree",
-      baseRef: "feat/dogfood-pr",
+      baseRef: localRef,
     },
   });
   const openData = structuredContent(openRes);

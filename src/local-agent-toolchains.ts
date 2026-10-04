@@ -370,12 +370,10 @@ export function describeToolchainExecutables(
 export interface ToolchainVerifierEntry {
   name: string;
   available: boolean;
-  executable: string;
 }
 
 export interface ToolchainCatalogEntry {
   toolchainId: string;
-  root: string;
   verifiers: ToolchainVerifierEntry[];
 }
 
@@ -387,15 +385,10 @@ export interface ToolchainCatalogEntry {
 export function listToolchainCatalog(toolchains: ToolchainSpec[]): ToolchainCatalogEntry[] {
   return toolchains.map((toolchain) => ({
     toolchainId: toolchain.id,
-    root: toolchain.root,
-    verifiers: Object.entries(toolchain.verifiers).map(([name, configured]) => {
-      const resolved = resolveToolchainExecutable(toolchains, toolchain.id, name);
-      return {
-        name,
-        available: resolved !== undefined,
-        executable: resolved?.executable ?? configured,
-      };
-    }),
+    verifiers: Object.keys(toolchain.verifiers).map((name) => ({
+      name,
+      available: resolveToolchainExecutable(toolchains, toolchain.id, name) !== undefined,
+    })),
   }));
 }
 

@@ -11,7 +11,7 @@ import {
 } from "./work-resume.js";
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
-import { access, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
+import { access, lstat, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -31,6 +31,7 @@ import type { NextFunction, Request, Response } from "express";
 import * as z from "zod/v4";
 import { applyPatch, parsePatch, replaceFile } from "./apply-patch.js";
 import { commitCandidate, pushCandidate, GitCandidateError } from "./git-candidate.js";
+import { fetchRemoteBranchRef } from "./git-worktrees.js";
 import { git as runGit } from "./git.js";
 import {
   integrateCandidate,
@@ -236,7 +237,7 @@ import {
 import { registerRepositoryIntelligenceArtifactTool } from "./repository-intelligence-artifact.js";
 import { registerPhysicalHostRegistryTools } from "./physical-host-registry.js";
 import { registerHostCapabilitySnapshotTool } from "./host-capability-snapshot.js";
-import { assertAllowedPath, canonicalizePath } from "./roots.js";
+import { assertAllowedPath, canonicalizePath, isPathInsideRoot } from "./roots.js";
 import { applyHostStoragePlan, buildHostStoragePlan, resolveHostStorageRoot } from "./host-storage-retention.js";
 import { openDatabase } from "./db/client.js";
 
@@ -452,6 +453,7 @@ const DIRECT_CODING_TOOL_NAMES = new Set<string>([
   "workspace_verify",
   "workspace_list_verifiers",
   "workspace_copy_file",
+  "git_fetch_ref",
   "host_capability_snapshot",
   "git_commit",
   "git_push",
@@ -505,7 +507,7 @@ function serverInstructions(config: ServerConfig): string {
   }
 
   if (config.toolMode === "minimal") {
-    return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree — use baseRef to open a worktree from a remote branch (auto-fetched if not yet local). Keep reusing the workspaceId for the same project. Use ${toolNames.read} for file inspection (offset/limit for large files; content is always in the structured result field, never mixed with pagination prose). Use apply_patch for all structured multi-hunk file modifications — prefer it over ${toolNames.edit} or ${toolNames.write} for any change touching more than one hunk. Use workspace_copy_file to copy a file across workspaces with exact SHA-256 preimage verification. Use workspace_list_verifiers to discover configured toolchainIds and verifier names before calling workspace_verify. Use ${toolNames.shell} only for test runs, builds, git inspection, and package scripts — never to create or modify files. Use ${toolNames.edit} for targeted single-hunk changes, ${toolNames.write} only for new files or complete rewrites.${gitCandidatesInstruction}`;
+    return `Use DevSpace for coding work. Call ${toolNames.openWorkspace} once for each project folder or isolated worktree and keep reusing its workspaceId. If a remote branch is not yet local, open the repository checkout, call git_fetch_ref explicitly, then open the isolated worktree with the returned localRef. Use ${toolNames.read} for file inspection; structuredContent contains exact source text and pagination metadata is separate. Use apply_patch for structured multi-hunk changes, ${toolNames.edit} for targeted single-hunk changes, and ${toolNames.write} only for new files or complete rewrites. Use workspace_copy_file for exact cross-workspace regular-file transfer with SHA-256/CAS checks. Use workspace_list_verifiers before workspace_verify. Use ${toolNames.shell} only for tests, builds, git inspection, and package scripts — never to create or modify files.${gitCandidatesInstruction}`;
   }
 
   const inspection = `Prefer ${toolNames.read}, ${toolNames.grep}, ${toolNames.glob}, and ${toolNames.ls} for bounded read-only file inspection. Use ${toolNames.shell} only when shell semantics are actually needed. `;
@@ -791,88 +793,56 @@ interface ReadPaginationInfo {
   offset: number;
   limit?: number;
   returnedLines: number;
-  totalLines?: number;
-  remainingLines?: number;
+  totalLines: number;
+  remainingLines: number;
   nextOffset?: number;
   notice?: string;
 }
 
-function extractReadPagination(
-  rawText: string,
+async function readExactTextRange(
+  path: string,
   inputOffset: number = 1,
   inputLimit?: number,
-): {
+): Promise<{
   exactContent: string;
+  fileSha256: string;
   pagination?: ReadPaginationInfo;
-} {
-  // Pattern 1: [Showing lines X-Y of Z. Use offset=W to continue.]
-  const showingLinesRegex = /\n\n\[Showing lines (\d+)-(\d+) of (\d+)(?: \([^)]+\))?\. Use offset=(\d+) to continue\.\]$/;
-  const matchShowing = rawText.match(showingLinesRegex);
-  if (matchShowing && matchShowing.index !== undefined) {
-    const startLine = Number(matchShowing[1]);
-    const endLine = Number(matchShowing[2]);
-    const totalLines = Number(matchShowing[3]);
-    const nextOffset = Number(matchShowing[4]);
-    const exactContent = rawText.slice(0, matchShowing.index);
-    const returnedLines = endLine >= startLine ? endLine - startLine + 1 : 0;
-    return {
-      exactContent,
-      pagination: {
-        truncated: true,
-        offset: startLine,
-        limit: inputLimit,
-        returnedLines,
-        totalLines,
-        remainingLines: Math.max(0, totalLines - endLine),
-        nextOffset,
-        notice: matchShowing[0].trim(),
-      },
-    };
-  }
+}> {
+  const bytes = await readFile(path);
+  const text = bytes.toString("utf8");
+  const lines = text.length === 0 ? [] : text.split("\n");
+  const offset = Math.max(1, inputOffset);
+  const startIndex = Math.min(lines.length, offset - 1);
+  const endIndex = inputLimit === undefined
+    ? lines.length
+    : Math.min(lines.length, startIndex + inputLimit);
+  const selected = lines.slice(startIndex, endIndex);
+  const exactContent = selected.join("\n");
+  const returnedLines = selected.length;
+  const remainingLines = Math.max(0, lines.length - endIndex);
+  const nextOffset = remainingLines > 0 ? endIndex + 1 : undefined;
+  const fileSha256 = createHash("sha256").update(bytes).digest("hex");
 
-  // Pattern 2: [N more lines in file. Use offset=W to continue.]
-  const moreLinesRegex = /\n\n\[(\d+) more lines in file\. Use offset=(\d+) to continue\.\]$/;
-  const matchMore = rawText.match(moreLinesRegex);
-  if (matchMore && matchMore.index !== undefined) {
-    const remainingLines = Number(matchMore[1]);
-    const nextOffset = Number(matchMore[2]);
-    const exactContent = rawText.slice(0, matchMore.index);
-    const returnedLines = exactContent.length === 0 ? 0 : exactContent.split("\n").length;
-    const totalLines = (inputOffset - 1) + returnedLines + remainingLines;
-    return {
-      exactContent,
-      pagination: {
-        truncated: true,
-        offset: inputOffset,
-        limit: inputLimit,
-        returnedLines,
-        totalLines,
-        remainingLines,
-        nextOffset,
-        notice: matchMore[0].trim(),
-      },
-    };
-  }
-
-  // Pattern 3: [Line X is Y, exceeds Z limit. Use bash: ...]
-  const firstLineRegex = /^\[Line (\d+) is [^,]+, exceeds [^ ]+ limit\. Use bash: [^\]]+\]$/;
-  const matchFirstLine = rawText.match(firstLineRegex);
-  if (matchFirstLine) {
-    const line = Number(matchFirstLine[1]);
-    return {
-      exactContent: "",
-      pagination: {
-        truncated: true,
-        offset: line,
-        limit: inputLimit,
-        returnedLines: 0,
-        nextOffset: line,
-        notice: rawText.trim(),
-      },
-    };
-  }
-
-  return { exactContent: rawText };
+  return {
+    exactContent,
+    fileSha256,
+    ...(inputLimit !== undefined || offset !== 1
+      ? {
+          pagination: {
+            truncated: remainingLines > 0,
+            offset,
+            limit: inputLimit,
+            returnedLines,
+            totalLines: lines.length,
+            remainingLines,
+            nextOffset,
+            ...(nextOffset
+              ? { notice: `${remainingLines} more lines in file. Use offset=${nextOffset} to continue.` }
+              : {}),
+          },
+        }
+      : {}),
+  };
 }
 
 
@@ -3829,6 +3799,63 @@ export function createMcpServer(
     },
   );
 
+  if (config.toolMode === "minimal") {
+  registerAppTool(
+    server,
+    "git_fetch_ref",
+    {
+      title: "Fetch Git remote branch",
+      description:
+        "Explicitly fetch one branch from an already-configured Git remote into the repository's local remote-tracking ref. This changes Git ref metadata only: it does not checkout, merge, rebase, reset, commit, or push. Use this when open_workspace(worktree) reports GIT_BASE_REF_NOT_LOCAL.",
+      inputSchema: {
+        workspaceId: z.string().describe(workspaceIdDescription),
+        remote: z.string().default("origin").describe("Configured Git remote name. Raw URLs are not accepted."),
+        branch: z.string().describe("Remote branch name, for example feat/fix-123 or refs/heads/feat/fix-123."),
+      },
+      outputSchema: {
+        remote: z.string(),
+        branch: z.string(),
+        localRef: z.string(),
+        previousSha: z.string().optional(),
+        fetchedSha: z.string(),
+        changed: z.boolean(),
+      },
+      _meta: {},
+      annotations: {
+        readOnlyHint: false,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: true,
+      },
+    },
+    async ({ workspaceId, remote, branch }) => {
+      const startedAt = performance.now();
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const sourcePath = workspace.sourceRoot ?? workspace.root;
+      const result = await fetchRemoteBranchRef({
+        sourcePath,
+        remote,
+        branch,
+        config,
+      });
+      logToolCall(config, {
+        tool: "git_fetch_ref",
+        workspaceId,
+        success: true,
+        durationMs: Math.round(performance.now() - startedAt),
+      });
+      return {
+        content: [
+          textBlock(
+            `Fetched ${result.remote}/${result.branch} -> ${result.localRef} @ ${result.fetchedSha}.`,
+          ),
+        ],
+        structuredContent: result as unknown as Record<string, unknown>,
+      };
+    },
+  );
+  }
+
   if (durableOperations) {
     const durableOperationOutputSchema = {
       operationId: z.string(),
@@ -4457,20 +4484,21 @@ export function createMcpServer(
           .describe("Maximum number of lines to read."),
       },
       outputSchema: resultOutputSchema({
-        content: z.string().optional().describe("Exact file content without pagination notes."),
+        content: z.string().optional().describe("Exact requested UTF-8 file content without navigation prose."),
+        fileSha256: z.string().regex(/^[0-9a-f]{64}$/).optional(),
         pagination: z
           .object({
             truncated: z.boolean(),
             offset: z.number().int().positive(),
             limit: z.number().int().positive().optional(),
             returnedLines: z.number().int().nonnegative(),
-            totalLines: z.number().int().positive().optional(),
-            remainingLines: z.number().int().nonnegative().optional(),
+            totalLines: z.number().int().nonnegative(),
+            remainingLines: z.number().int().nonnegative(),
             nextOffset: z.number().int().positive().optional(),
             notice: z.string().optional(),
           })
           .optional()
-          .describe("Pagination metadata when the file exceeds limit or buffer capacity."),
+          .describe("Machine-derived pagination metadata computed from file bytes, never parsed from display prose."),
       }),
       ...toolWidgetDescriptorMeta(config, "read"),
       annotations: { readOnlyHint: true },
@@ -4509,20 +4537,14 @@ export function createMcpServer(
       }
       workspaces.markReadPathLoaded(workspace, readPath);
 
-      const rawText = contentText(response.content);
-      const { exactContent, pagination } = extractReadPagination(
-        rawText,
+      const { exactContent, fileSha256, pagination } = await readExactTextRange(
+        readPath.absolutePath,
         input.offset ?? 1,
         input.limit,
       );
 
-      const mcpContent: ToolContent[] = [textBlock(exactContent)];
-      if (pagination?.notice) {
-        mcpContent.push(textBlock(pagination.notice));
-      }
-
       const summary = {
-        ...textSummary(mcpContent),
+        ...textSummary(response.content),
         offset: input.offset ?? 1,
         limited: input.limit !== undefined,
       };
@@ -4536,19 +4558,19 @@ export function createMcpServer(
 
       return {
         ...response,
-        content: mcpContent,
         _meta: {
           tool: toolNames.read,
           card: {
             workspaceId,
             path: input.path,
             summary,
-            payload: { content: mcpContent },
+            payload: { content: response.content },
           },
         },
         structuredContent: {
           result: exactContent,
           content: exactContent,
+          fileSha256,
           ...(pagination ? { pagination } : {}),
         },
       };
@@ -4787,7 +4809,7 @@ export function createMcpServer(
   );
   }
 
-  if (config.toolMode === "codex" || config.toolMode === "minimal" || config.toolMode === "full") {
+  if (config.toolMode === "codex" || config.toolMode === "minimal") {
     registerAppTool(
       server,
       "apply_patch",
@@ -6692,7 +6714,7 @@ export function createMcpServer(
       {
         title: "List workspace verifiers",
         description:
-          "Discover configured toolchains and their verifiers for this workspace. Returns toolchain IDs, root paths, verifier names, and whether each verifier executable is currently available on the host. Use this to find the right toolchainId and verifier before calling workspace_verify.",
+          "Discover configured toolchain IDs, verifier names, and whether each verifier is currently available. Host filesystem paths remain internal. Use this to find the right toolchainId and verifier before calling workspace_verify.",
         inputSchema: {
           workspaceId: z.string().describe(workspaceIdDescription),
         },
@@ -6700,12 +6722,10 @@ export function createMcpServer(
           toolchains: z.array(
             z.object({
               toolchainId: z.string(),
-              root: z.string(),
               verifiers: z.array(
                 z.object({
                   name: z.string(),
                   available: z.boolean(),
-                  executable: z.string(),
                 }),
               ),
             }),
@@ -6752,6 +6772,7 @@ export function createMcpServer(
       },
     );
 
+    if (config.toolMode === "minimal") {
     registerAppTool(
       server,
       "workspace_copy_file",
@@ -6782,6 +6803,10 @@ export function createMcpServer(
             .regex(/^[0-9a-fA-F]{64}$/)
             .optional()
             .describe("Optional expected SHA-256 hex digest of the existing destination file for CAS overwrite protection."),
+          expectedDestinationAbsent: z
+            .boolean()
+            .optional()
+            .describe("When true, fail if the destination already exists. Mutually exclusive with expectedDestinationSha256."),
           overwrite: z
             .boolean()
             .default(false)
@@ -6805,6 +6830,7 @@ export function createMcpServer(
           destinationPath,
           expectedSourceSha256,
           expectedDestinationSha256,
+          expectedDestinationAbsent,
           overwrite,
         },
         extra,
@@ -6817,21 +6843,26 @@ export function createMcpServer(
         const sourceWorkspace = workspaces.getWorkspace(sourceWorkspaceId);
         const destinationWorkspace = workspaces.getWorkspace(destinationWorkspaceId);
 
-        // Resolve and validate source path inside allowed roots (including managed worktree root)
-        const allowedRoots = [...config.allowedRoots, config.worktreeRoot];
         const resolvedSource = workspaces.resolveReadPath(sourceWorkspace, sourcePath);
         const sourceAbsolutePath = resolvedSource.absolutePath;
-        assertAllowedPath(sourceAbsolutePath, allowedRoots);
-        const sourceStats = await stat(sourceAbsolutePath).catch(() => null);
-        if (!sourceStats || !sourceStats.isFile()) {
+        const sourceRootCanonical = canonicalizePath(sourceWorkspace.root);
+        const sourceCanonicalPath = canonicalizePath(sourceAbsolutePath);
+        if (!isPathInsideRoot(sourceCanonicalPath, sourceRootCanonical)) {
           return {
             isError: true,
-            content: [textBlock(`Source file does not exist or is not a regular file: ${sourcePath}`)],
+            content: [textBlock(`SOURCE_PATH_ESCAPE: canonical source path leaves the source workspace: ${sourcePath}`)],
+          };
+        }
+        const sourceStats = await lstat(sourceAbsolutePath).catch(() => null);
+        if (!sourceStats || !sourceStats.isFile() || sourceStats.isSymbolicLink()) {
+          return {
+            isError: true,
+            content: [textBlock(`Source file does not exist, is not a regular file, or is a symbolic link: ${sourcePath}`)],
           };
         }
 
-        // Compute source hash and verify expected preimage
-        const sourceBytes = await readFile(sourceAbsolutePath);
+        // Compute source hash and verify expected preimage.
+        const sourceBytes = await readFile(sourceCanonicalPath);
         const sourceSha = createHash("sha256").update(sourceBytes).digest("hex");
         if (expectedSourceSha256 && sourceSha.toLowerCase() !== expectedSourceSha256.toLowerCase()) {
           return {
@@ -6840,15 +6871,28 @@ export function createMcpServer(
           };
         }
 
-        // Resolve and validate destination path inside allowed roots
         const destinationAbsolutePath = workspaces.resolvePath(destinationWorkspace, destinationPath);
-        assertAllowedPath(destinationAbsolutePath, allowedRoots);
+        const destinationRootCanonical = canonicalizePath(destinationWorkspace.root);
+        const destinationCanonicalPath = canonicalizePath(destinationAbsolutePath);
+        if (!isPathInsideRoot(destinationCanonicalPath, destinationRootCanonical)) {
+          return {
+            isError: true,
+            content: [textBlock(`DESTINATION_PATH_ESCAPE: canonical destination path leaves the destination workspace: ${destinationPath}`)],
+          };
+        }
 
+        const lexicalDestinationStats = await lstat(destinationAbsolutePath).catch(() => null);
+        if (lexicalDestinationStats?.isSymbolicLink()) {
+          return {
+            isError: true,
+            content: [textBlock(`DESTINATION_SYMLINK_BLOCKED: destination must not be a symbolic link: ${destinationPath}`)],
+          };
+        }
 
-        // Check for nested instruction rebind requirement at destination
+        // Check for nested instruction rebind requirement at the physical destination.
         const instructionPaths = workspaces.preOperationAncestorCheck(
           destinationWorkspace,
-          destinationAbsolutePath,
+          destinationCanonicalPath,
         );
         if (instructionPaths.length > 0) {
           return {
@@ -6861,14 +6905,27 @@ export function createMcpServer(
           };
         }
 
-        // Check destination existence & CAS preimage
-        const destStats = await stat(destinationAbsolutePath).catch(() => null);
+        if (expectedDestinationSha256 && expectedDestinationAbsent) {
+          return {
+            isError: true,
+            content: [textBlock("DESTINATION_PREIMAGE_CONFLICT: expectedDestinationSha256 and expectedDestinationAbsent are mutually exclusive.")],
+          };
+        }
+
+        // Check destination existence & CAS preimage.
+        const destStats = await lstat(destinationCanonicalPath).catch(() => null);
         let overwritten = false;
         if (destStats) {
-          if (!destStats.isFile()) {
+          if (expectedDestinationAbsent) {
             return {
               isError: true,
-              content: [textBlock(`Destination exists and is not a regular file: ${destinationPath}`)],
+              content: [textBlock(`DESTINATION_PREIMAGE_EXISTS: destination already exists: ${destinationPath}`)],
+            };
+          }
+          if (!destStats.isFile() || destStats.isSymbolicLink()) {
+            return {
+              isError: true,
+              content: [textBlock(`Destination exists and is not a regular non-symlink file: ${destinationPath}`)],
             };
           }
           if (!overwrite) {
@@ -6878,7 +6935,7 @@ export function createMcpServer(
             };
           }
           if (expectedDestinationSha256) {
-            const destBytes = await readFile(destinationAbsolutePath);
+            const destBytes = await readFile(destinationCanonicalPath);
             const destSha = createHash("sha256").update(destBytes).digest("hex");
             if (destSha.toLowerCase() !== expectedDestinationSha256.toLowerCase()) {
               return {
@@ -6888,18 +6945,24 @@ export function createMcpServer(
             }
           }
           overwritten = true;
+        } else if (expectedDestinationSha256) {
+          return {
+            isError: true,
+            content: [textBlock(`DESTINATION_PREIMAGE_MISSING: expected destination SHA-256 ${expectedDestinationSha256}, but destination does not exist.`)],
+          };
         }
 
-        // Atomically copy file using temporary file and replaceFile
-        await mkdir(dirname(destinationAbsolutePath), { recursive: true });
-        const temporaryDest = `${destinationAbsolutePath}.devspace-copy-${process.pid}-${randomUUID()}`;
+        // Atomically copy to the canonical physical destination.
+        await mkdir(dirname(destinationCanonicalPath), { recursive: true });
+        const temporaryDest = `${destinationCanonicalPath}.devspace-copy-${process.pid}-${randomUUID()}`;
         try {
           await writeFile(temporaryDest, sourceBytes, { mode: sourceStats.mode });
-          await replaceFile(temporaryDest, destinationAbsolutePath, overwritten);
+          await replaceFile(temporaryDest, destinationCanonicalPath, overwritten);
         } catch (error) {
           await rm(temporaryDest, { force: true }).catch(() => {});
           throw error;
         }
+        workspaces.invalidateInstructionPath(destinationWorkspace, destinationAbsolutePath);
 
         const result = `Copied ${sourcePath} -> ${destinationPath} (${sourceBytes.length} bytes, sha256=${sourceSha})`;
         logToolCall(config, {
@@ -6931,6 +6994,7 @@ export function createMcpServer(
         };
       },
     );
+    }
 
 
   // ── Candidate integration readiness / typed integration (workspace level) ──

@@ -15,6 +15,8 @@ export class GitWorktreeError extends Error {
       | "GIT_REPOSITORY_NOT_FOUND"
       | "GIT_REPOSITORY_HAS_NO_COMMITS"
       | "GIT_INVALID_BASE_REF"
+      | "GIT_BASE_REF_NOT_LOCAL"
+      | "GIT_REMOTE_NOT_CONFIGURED"
       | "GIT_REMOTE_REF_NOT_FOUND"
       | "GIT_WORKTREE_CREATE_FAILED",
     message: string,
@@ -168,7 +170,6 @@ async function assertGitRootAllowed(gitRoot: string, allowedRoots: string[]): Pr
 }
 
 async function resolveBaseCommit(sourceRoot: string, baseRef: string): Promise<string> {
-  // Fast path: resolve from local ref namespace.
   const localSha = await tryRevParse(sourceRoot, baseRef);
   if (localSha) return localSha;
 
@@ -179,40 +180,111 @@ async function resolveBaseCommit(sourceRoot: string, baseRef: string): Promise<s
     );
   }
 
-  // Slow path: the ref may exist on the remote but not yet be in the local ref
-  // namespace. Perform a bounded single-ref fetch (read-only network; no push,
-  // no merge, no rebase) and retry.
-  const branchName = baseRef.replace(/^origin\//, "").replace(/^refs\/heads\//, "");
-  let fetched = false;
-  try {
-    await git(["fetch", "--depth=1", "origin", `+refs/heads/${branchName}:refs/remotes/origin/${branchName}`], sourceRoot);
-    fetched = true;
-  } catch {
-    try {
-      await git(["fetch", "--depth=1", "origin", baseRef], sourceRoot);
-      fetched = true;
-    } catch {
-      // Fetch failed — fall through to produce a clean error message below.
-    }
-  }
-
-  const candidateRefs = [
-    baseRef,
-    `origin/${baseRef}`,
-    `origin/${branchName}`,
-    `refs/remotes/origin/${branchName}`,
-    ...(fetched ? ["FETCH_HEAD"] : []),
-  ];
-
-  for (const ref of candidateRefs) {
-    const sha = await tryRevParse(sourceRoot, ref);
-    if (sha) return sha;
-  }
-
   throw new GitWorktreeError(
-    "GIT_REMOTE_REF_NOT_FOUND",
-    `Cannot open workspace in worktree mode: baseRef ${JSON.stringify(baseRef)} does not resolve locally and could not be fetched from origin.`,
+    "GIT_BASE_REF_NOT_LOCAL",
+    "[GIT_BASE_REF_NOT_LOCAL] Cannot open workspace in worktree mode because baseRef " +
+      JSON.stringify(baseRef) +
+      " is not present in the local Git ref namespace. Open the repository in checkout mode, call git_fetch_ref explicitly, then retry with the returned localRef.",
   );
+}
+
+export interface GitFetchRefResult {
+  remote: string;
+  branch: string;
+  localRef: string;
+  previousSha?: string;
+  fetchedSha: string;
+  changed: boolean;
+}
+
+export async function fetchRemoteBranchRef(input: {
+  sourcePath: string;
+  remote: string;
+  branch: string;
+  config: ServerConfig;
+}): Promise<GitFetchRefResult> {
+  const sourcePath = assertAllowedPath(input.sourcePath, input.config.allowedRoots);
+  const sourceRoot = await resolveGitRoot(sourcePath, input.config.allowedRoots);
+  const remote = input.remote.trim();
+  if (!/^[A-Za-z0-9][A-Za-z0-9._/-]{0,127}$/.test(remote) || remote.startsWith("-")) {
+    throw new GitWorktreeError(
+      "GIT_REMOTE_NOT_CONFIGURED",
+      "[GIT_REMOTE_NOT_CONFIGURED] Invalid Git remote name: " + JSON.stringify(input.remote) + ".",
+    );
+  }
+
+  const configuredRemotes = (await git(["remote"], sourceRoot))
+    .split("\n")
+    .map((value) => value.trim())
+    .filter(Boolean);
+  if (!configuredRemotes.includes(remote)) {
+    throw new GitWorktreeError(
+      "GIT_REMOTE_NOT_CONFIGURED",
+      "[GIT_REMOTE_NOT_CONFIGURED] Git remote " + JSON.stringify(remote) + " is not configured for this repository.",
+    );
+  }
+
+  let branch = input.branch.trim();
+  if (branch.startsWith("refs/heads/")) branch = branch.slice("refs/heads/".length);
+  const remotePrefix = remote + "/";
+  const remoteRefPrefix = "refs/remotes/" + remote + "/";
+  if (branch.startsWith(remoteRefPrefix)) branch = branch.slice(remoteRefPrefix.length);
+  else if (branch.startsWith(remotePrefix)) branch = branch.slice(remotePrefix.length);
+
+  if (!branch || branch.startsWith("-")) {
+    throw new GitWorktreeError(
+      "GIT_REMOTE_REF_NOT_FOUND",
+      "[GIT_REMOTE_REF_NOT_FOUND] Invalid remote branch: " + JSON.stringify(input.branch) + ".",
+    );
+  }
+  try {
+    await git(["check-ref-format", "--branch", branch], sourceRoot);
+  } catch {
+    throw new GitWorktreeError(
+      "GIT_REMOTE_REF_NOT_FOUND",
+      "[GIT_REMOTE_REF_NOT_FOUND] Invalid remote branch: " + JSON.stringify(input.branch) + ".",
+    );
+  }
+
+  const localRef = "refs/remotes/" + remote + "/" + branch;
+  const previousSha = (await tryRevParse(sourceRoot, localRef)) ?? undefined;
+  try {
+    await withRepoWorktreeLock(sourceRoot, () =>
+      git(
+        [
+          "fetch",
+          "--depth=1",
+          "--no-tags",
+          remote,
+          "+refs/heads/" + branch + ":" + localRef,
+        ],
+        sourceRoot,
+      ),
+    );
+  } catch {
+    throw new GitWorktreeError(
+      "GIT_REMOTE_REF_NOT_FOUND",
+      "[GIT_REMOTE_REF_NOT_FOUND] Remote branch " + JSON.stringify(branch) +
+        " could not be fetched from configured remote " + JSON.stringify(remote) + ".",
+    );
+  }
+
+  const fetchedSha = await tryRevParse(sourceRoot, localRef);
+  if (!fetchedSha) {
+    throw new GitWorktreeError(
+      "GIT_REMOTE_REF_NOT_FOUND",
+      "[GIT_REMOTE_REF_NOT_FOUND] Fetched remote branch " + JSON.stringify(branch) + " did not resolve to a commit.",
+    );
+  }
+
+  return {
+    remote,
+    branch,
+    localRef,
+    previousSha,
+    fetchedSha,
+    changed: previousSha !== fetchedSha,
+  };
 }
 
 async function tryRevParse(sourceRoot: string, ref: string): Promise<string | null> {
