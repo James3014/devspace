@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import test, { after } from "node:test";
@@ -1682,14 +1682,15 @@ test("HerdR terminal verifier is a durable VERIFY effect and an unfinished claim
     undefined,
     gateway,
     undefined,
-    async ({ toolchainId, verifier }) => {
+    async ({ toolchainId, verifier, cwd, denyWriteRoots }) => {
       verifierCalls.push({ toolchainId, verifier });
-      writeFileSync(join(workspaceRoot, "effect.txt"), "verifier wrote this\n");
-      const exitCode = verifierCalls.length === 2 ? 1 : 0;
+      assert.deepEqual(denyWriteRoots, [workspaceRoot]);
+      writeFileSync(join(cwd, "effect.txt"), "verifier wrote this in isolation\n");
+      const exitCode = verifierCalls.length === 2 || verifier === "alpha-fail" ? 1 : 0;
       return {
         toolchainId,
         verifier,
-        executable: "/configured/typecheck",
+        executable: config.toolchains[0].verifiers[verifier],
         exitCode,
         timedOut: false,
         durationMs: 8,
@@ -1755,9 +1756,11 @@ test("HerdR terminal verifier is a durable VERIFY effect and an unfinished claim
     });
     const generation = created.lifecycleState!.activeTurn!.generation!;
     if (prepareVerifierPlan) {
-      const plan = (manager as any).buildHerdrVerifierPlan(created, generation) as Record<string, unknown>;
-      assert.ok(plan);
-      assert.equal(store.prepareExternalRuntimeVerifierCAS({ agentId: created.id, generation, plan }).applied, true);
+      const plans = (manager as any).buildHerdrVerifierPlans(created, generation) as Record<string, unknown>[];
+      assert.ok(plans.length > 0);
+      for (const plan of plans) {
+        assert.equal(store.prepareExternalRuntimeVerifierCAS({ agentId: created.id, generation, plan }).applied, true);
+      }
     }
     const claimed = store.claimExternalRuntimeTurnCAS({
       agentId: created.id,
@@ -1794,6 +1797,9 @@ test("HerdR terminal verifier is a durable VERIFY effect and an unfinished claim
     assert.equal(completed.effectState, "COMPLETED");
     assert.equal(completed.passed, true);
     assert.equal(completed.stdout, "typecheck passed");
+    assert.equal(completed.sourceIsolation, "ISOLATED_COPY_SANDBOXED_ORIGINAL");
+    assert.equal(completed.sourceMutationDetected, false);
+    assert.equal(readFileSync(join(workspaceRoot, "effect.txt"), "utf8"), "worker effect\n");
     assert.equal(store.getById(first.record.id)?.lifecycleState?.automatedVerifierEffects?.[String(completed.effectKey)]?.passed, true);
     const boundCandidate = store.getById(first.record.id)?.lifecycleState?.automatedVerifierPlan?.boundCandidate as Record<string, unknown>;
     assert.equal(boundCandidate.effectKey, completed.effectKey);
@@ -1899,6 +1905,13 @@ test("HerdR terminal verifier is a durable VERIFY effect and an unfinished claim
     });
     assert.equal(claimed.applied, true);
     assert.equal(claimed.started, true);
+    const conflicting = store.beginExternalRuntimeVerifierCAS({
+      agentId: replay.record.id,
+      generation,
+      effectKey,
+      result: { ...pending, verifier: "different-material" },
+    });
+    assert.equal(conflicting.applied, false, "same verifier effect key cannot rendezvous with different material");
 
     assert.equal(await (manager as any).settleHerdrTurn(replay.record, replay.handle, {
       status: "done",
@@ -1930,6 +1943,31 @@ test("HerdR terminal verifier is a durable VERIFY effect and an unfinished claim
     assert.match(String(noPlanResult.reason), /absence does not establish/);
     assert.equal(verifierCalls.length, 2, "a terminal record without a pre-effect verifier obligation is not assumed safe to launch");
     assert.equal(store.getById(noPlan.record.id)?.status, "error");
+
+    // Every configured verifier has a separate pre-effect plan and durable
+    // effect. A later PASS cannot hide an earlier failure in the turn status.
+    config.toolchains[0].verifiers = {
+      "alpha-fail": "/configured/alpha-fail",
+      "beta-pass": "/configured/beta-pass",
+    };
+    writeFileSync(join(workspaceRoot, "effect.txt"), "worker multi-verifier effect\n");
+    const multi = makeActiveHerdrRecord("attempt-herdr-multi-verifier");
+    assert.equal(await (manager as any).settleHerdrTurn(multi.record, multi.handle, {
+      status: "done",
+      finalResponse: "multi-verifier candidate",
+    }), true);
+    const multiRecord = store.getById(multi.record.id)!;
+    const multiEffects = Object.values(multiRecord.lifecycleState?.automatedVerifierEffects ?? {});
+    assert.equal(multiEffects.length, 2);
+    assert.deepEqual(multiEffects.map((effect) => effect.verifier).sort(), ["alpha-fail", "beta-pass"]);
+    assert.equal(new Set(multiEffects.map((effect) => effect.effectKey)).size, 2);
+    assert.equal(Object.keys(multiRecord.lifecycleState?.automatedVerifierPlans ?? {}).length, 2);
+    assert.deepEqual(verifierCalls.slice(2).map((call) => call.verifier), ["alpha-fail", "beta-pass"]);
+    assert.equal(multiRecord.status, "error");
+    assert.equal(multiRecord.errorCode, "VERIFIER_FAILED");
+    assert.match(multiRecord.error ?? "", /alpha-fail/);
+    assert.equal(multiRecord.lifecycleState?.automatedVerifierResult?.verifier, "beta-pass");
+    assert.equal(multiRecord.lifecycleState?.automatedVerifierResult?.passed, true);
   } finally {
     manager.close();
     rmSync(stateDir, { recursive: true, force: true });

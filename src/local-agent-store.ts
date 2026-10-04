@@ -40,6 +40,25 @@ import {
 export type LocalAgentStatus = "starting" | "running" | "idle" | "error" | "stopped";
 export type ProviderContinuityState = "KNOWN_UNVERIFIED" | "RESUME_VERIFIED" | "LOST" | "UNKNOWN";
 
+const VERIFIER_PLAN_IDENTITY_FIELDS = [
+  "planKey", "role", "parentEffectKey", "parentRole", "toolchainId",
+  "verifier", "toolchainRoot", "executable", "args", "turnGeneration",
+] as const;
+const VERIFIER_EFFECT_IDENTITY_FIELDS = [
+  "effectKind", "effectKey", "role", "planKey", "parentEffectKey",
+  "parentRole", "turnGeneration", "toolchainId", "verifier",
+  "toolchainRoot", "executable", "args", "sourceSnapshotSha256",
+  "workspaceHead", "diffHash", "changedPaths",
+] as const;
+
+function sameVerifierIdentity(
+  left: Record<string, unknown>,
+  right: Record<string, unknown>,
+  fields: readonly string[],
+): boolean {
+  return fields.every((field) => JSON.stringify(left[field] ?? null) === JSON.stringify(right[field] ?? null));
+}
+
 /**
  * Durable cross-turn scope lifecycle evidence persisted beside the baseline.
  *
@@ -76,6 +95,8 @@ export interface AgentLifecycleState {
   automatedVerifierEffects?: Record<string, Record<string, unknown>>;
   /** Verifier obligation durably established before a HerdR provider effect begins. */
   automatedVerifierPlan?: Record<string, unknown>;
+  /** Every verifier obligation for the turn, keyed by immutable plan identity. */
+  automatedVerifierPlans?: Record<string, Record<string, unknown>>;
   /** P2-H: Operation timeline tracking elapsed phases. */
   operationTimeline?: OperationTimeline;
   /** P2-A: Model attestation state. */
@@ -1292,7 +1313,10 @@ export class LocalAgentStore {
     const prepare = this.database.sqlite.transaction(() => {
       const current = this.getById(input.agentId);
       const lifecycle = current?.lifecycleState;
-      const existing = lifecycle?.automatedVerifierPlan;
+      const existing = lifecycle?.automatedVerifierPlans?.[String(input.plan.planKey)]
+        ?? (lifecycle?.automatedVerifierPlan?.planKey === input.plan.planKey
+          ? lifecycle?.automatedVerifierPlan
+          : undefined);
       if (
         !current ||
         !isDetachedLifecycle(lifecycle) ||
@@ -1307,15 +1331,24 @@ export class LocalAgentStore {
         return { applied: false, previous: current, current };
       }
       if (
-        existing?.planKey === input.plan.planKey &&
-        existing?.turnGeneration === input.plan.turnGeneration
+        existing &&
+        existing.planKey === input.plan.planKey &&
+        existing.turnGeneration === input.plan.turnGeneration
       ) {
-        return { applied: true, previous: current, current };
+        return {
+          applied: sameVerifierIdentity(existing, input.plan, VERIFIER_PLAN_IDENTITY_FIELDS),
+          previous: current,
+          current,
+        };
       }
 
       const lifecycleState: AgentLifecycleState = {
         ...lifecycle,
         automatedVerifierPlan: input.plan,
+        automatedVerifierPlans: {
+          ...(lifecycle.automatedVerifierPlans ?? {}),
+          [String(input.plan.planKey)]: input.plan,
+        },
       };
       const now = new Date().toISOString();
       const result = this.database.sqlite.prepare(
@@ -1338,7 +1371,10 @@ export class LocalAgentStore {
     const bind = this.database.sqlite.transaction(() => {
       const current = this.getById(input.agentId);
       const lifecycle = current?.lifecycleState;
-      const plan = lifecycle?.automatedVerifierPlan;
+      const plan = lifecycle?.automatedVerifierPlans?.[input.planKey]
+        ?? (lifecycle?.automatedVerifierPlan?.planKey === input.planKey
+          ? lifecycle.automatedVerifierPlan
+          : undefined);
       if (
         !current ||
         !isDetachedLifecycle(lifecycle) ||
@@ -1358,13 +1394,20 @@ export class LocalAgentStore {
         ? (plan.boundCandidate as Record<string, unknown>).effectKey
         : undefined;
       if (boundEffectKey !== undefined) {
-        const same = boundEffectKey === input.candidate.effectKey;
+        const same = boundEffectKey === input.candidate.effectKey
+          && JSON.stringify(plan.boundCandidate) === JSON.stringify(input.candidate);
         return { applied: same, previous: current, current };
       }
 
       const lifecycleState: AgentLifecycleState = {
         ...lifecycle,
-        automatedVerifierPlan: { ...plan, boundCandidate: input.candidate },
+        ...(lifecycle.automatedVerifierPlan?.planKey === input.planKey
+          ? { automatedVerifierPlan: { ...plan, boundCandidate: input.candidate } }
+          : {}),
+        automatedVerifierPlans: {
+          ...(lifecycle.automatedVerifierPlans ?? {}),
+          [input.planKey]: { ...plan, boundCandidate: input.candidate },
+        },
       };
       const now = new Date().toISOString();
       const result = this.database.sqlite.prepare(
@@ -1410,7 +1453,12 @@ export class LocalAgentStore {
       }
 
       if (existing?.effectKey === input.effectKey) {
-        return { applied: true, started: false, previous: current, current };
+        return {
+          applied: sameVerifierIdentity(existing, input.result, VERIFIER_EFFECT_IDENTITY_FIELDS),
+          started: false,
+          previous: current,
+          current,
+        };
       }
       if (existing?.effectState === "RUNNING") {
         return { applied: false, previous: current, current };
@@ -1464,6 +1512,7 @@ export class LocalAgentStore {
         current.externalRuntimeBinding?.runtimeKind !== "HERDR" ||
         existing?.effectKey !== input.effectKey ||
         existing?.effectState !== "RUNNING" ||
+        !sameVerifierIdentity(existing, input.result, VERIFIER_EFFECT_IDENTITY_FIELDS) ||
         current.workerPid !== undefined ||
         current.workerToken !== undefined
       ) {
@@ -2910,6 +2959,9 @@ function readLifecycleState(value: string | null | undefined): AgentLifecycleSta
     }
     if (parsed.automatedVerifierPlan && typeof parsed.automatedVerifierPlan === "object" && !Array.isArray(parsed.automatedVerifierPlan)) {
       state.automatedVerifierPlan = parsed.automatedVerifierPlan as Record<string, unknown>;
+    }
+    if (parsed.automatedVerifierPlans && typeof parsed.automatedVerifierPlans === "object" && !Array.isArray(parsed.automatedVerifierPlans)) {
+      state.automatedVerifierPlans = parsed.automatedVerifierPlans as Record<string, Record<string, unknown>>;
     }
     if (parsed.operationTimeline && typeof parsed.operationTimeline === "object") {
       state.operationTimeline = parsed.operationTimeline as OperationTimeline;

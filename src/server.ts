@@ -6043,6 +6043,7 @@ export function createMcpServer(
           }).optional(),
           automatedVerifierResult: z.record(z.string(), z.unknown()).optional(),
           automatedVerifierEffects: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
+          automatedVerifierPlans: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
           terminalReceipt: z.record(z.string(), z.unknown()).optional(),
           agent: z.object({
             agentId: z.string(),
@@ -6312,6 +6313,7 @@ export function createMcpServer(
           automatedVerifierResult: z.record(z.string(), z.unknown()).optional(),
           automatedVerifierEffects: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
           automatedVerifierPlan: z.record(z.string(), z.unknown()).optional(),
+          automatedVerifierPlans: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
           effectEnforcementReceipt: z.record(z.string(), z.unknown()).optional(),
           operationTimeline: AGENT_OPERATION_TIMELINE_OUTPUT_SCHEMA.optional(),
           modelAttestation: AGENT_MODEL_ATTESTATION_OUTPUT_SCHEMA.optional(),
@@ -6388,6 +6390,7 @@ export function createMcpServer(
           automatedVerifierResult: z.record(z.string(), z.unknown()).optional(),
           automatedVerifierEffects: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
           automatedVerifierPlan: z.record(z.string(), z.unknown()).optional(),
+          automatedVerifierPlans: z.record(z.string(), z.record(z.string(), z.unknown())).optional(),
         },
         _meta: {},
         annotations: {

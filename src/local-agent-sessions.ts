@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from "node:crypto";
-import { mkdtempSync, unlinkSync, rmdirSync, writeFileSync } from "node:fs";
-import { readFile } from "node:fs/promises";
+import { constants, mkdtempSync, unlinkSync, rmdirSync, writeFileSync } from "node:fs";
+import { copyFile, cp, mkdtemp, readFile, readdir, realpath, rm } from "node:fs/promises";
 import { arch, homedir, hostname, platform, tmpdir } from "node:os";
-import { basename, dirname, join, resolve as resolvePath } from "node:path";
-import { spawn, spawnSync } from "node:child_process";
+import { basename, dirname, join, resolve as resolvePath, sep } from "node:path";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { ServerConfig } from "./config.js";
 import {
@@ -298,6 +298,7 @@ export interface AgentStatusOutput {
   automatedVerifierResult?: Record<string, unknown>;
   automatedVerifierEffects?: Record<string, Record<string, unknown>>;
   automatedVerifierPlan?: Record<string, unknown>;
+  automatedVerifierPlans?: Record<string, Record<string, unknown>>;
   /** P2-H: Operation timeline tracking elapsed phases. */
   operationTimeline?: OperationTimeline;
   /** P2-A: Model attestation detailing requested, resolved, and physically observed model identities. */
@@ -836,11 +837,22 @@ export class LocalAgentSessionManager {
       ...delta.changedPaths,
     ])).sort();
 
-    const automatedVerifierResult = await this.runHerdrTerminalVerifier(record, generation, physical);
-    const verifierUnknown = automatedVerifierResult?.effectState === "OUTCOME_UNKNOWN"
-      || automatedVerifierResult?.effectState === "RUNNING";
-    const verifierFailed = automatedVerifierResult?.effectState === "COMPLETED"
-      && automatedVerifierResult.passed === false;
+    const automatedVerifierResults: Record<string, unknown>[] = [];
+    for (const plan of this.buildHerdrVerifierPlans(record, generation)) {
+      const result = await this.runHerdrTerminalVerifier(record, generation, physical, plan);
+      if (!result) continue;
+      automatedVerifierResults.push(result);
+      if (result.effectState === "OUTCOME_UNKNOWN" || result.effectState === "RUNNING") break;
+    }
+    const automatedVerifierResult = automatedVerifierResults.at(-1);
+    const blockingVerifierResult = automatedVerifierResults.find((result) =>
+      result.effectState === "OUTCOME_UNKNOWN" || result.effectState === "RUNNING")
+      ?? automatedVerifierResults.find((result) =>
+        result.effectState === "COMPLETED" && result.passed === false);
+    const verifierUnknown = blockingVerifierResult?.effectState === "OUTCOME_UNKNOWN"
+      || blockingVerifierResult?.effectState === "RUNNING";
+    const verifierFailed = blockingVerifierResult?.effectState === "COMPLETED"
+      && blockingVerifierResult.passed === false;
 
     const completed = this.store.finishExternalRuntimeTurnCAS({
       agentId: record.id,
@@ -851,9 +863,9 @@ export class LocalAgentSessionManager {
       error: terminalScope === "SCOPE_VIOLATION"
         ? `Agent modified paths outside authorized scope: ${scope.unexpectedPaths.join(", ")}`
         : verifierUnknown
-          ? `Automated verifier effect ${String(automatedVerifierResult?.effectKey ?? "unknown")} has OUTCOME_UNKNOWN; continuation is blocked until that exact effect is reconciled.`
+          ? `Automated verifier effect ${String(blockingVerifierResult?.effectKey ?? "unknown")} has OUTCOME_UNKNOWN; continuation is blocked until that exact effect is reconciled.`
           : verifierFailed
-            ? `Automated verifier ${String(automatedVerifierResult?.verifier ?? "unknown")} failed for effect ${String(automatedVerifierResult?.effectKey ?? "unknown")}.`
+            ? `Automated verifier ${String(blockingVerifierResult?.verifier ?? "unknown")} failed for effect ${String(blockingVerifierResult?.effectKey ?? "unknown")}.`
         : undefined,
       errorCode: terminalScope === "SCOPE_VIOLATION"
         ? "SCOPE_VIOLATION"
@@ -891,16 +903,24 @@ export class LocalAgentSessionManager {
     record: LocalAgentRecord,
     generation: string,
   ): Record<string, unknown> | undefined {
+    return this.buildHerdrVerifierPlans(record, generation)[0];
+  }
+
+  private buildHerdrVerifierPlans(
+    record: LocalAgentRecord,
+    generation: string,
+  ): Record<string, unknown>[] {
     const contract = record.executionContract;
     const configuredToolchains = this.config.toolchains ?? [];
     const toolchainId = contract?.toolchainId
       ?? (configuredToolchains.length > 0 ? configuredToolchains[0]?.id : undefined);
-    if (!toolchainId || !(contract?.role === "IMPLEMENT" || contract?.role === "REPAIR" || contract?.toolchainId)) {
-      return undefined;
+    if (!toolchainId || !contract?.toolchainId ||
+      (contract.role !== undefined && contract.role !== "IMPLEMENT" && contract.role !== "REPAIR")) {
+      return [];
     }
     const toolchain = configuredToolchains.find((candidate) => candidate.id === toolchainId);
-    const verifier = Object.keys(toolchain?.verifiers ?? {})[0];
-    if (!toolchain || !verifier) return undefined;
+    const verifiers = Object.keys(toolchain?.verifiers ?? {}).sort();
+    if (!toolchain || verifiers.length === 0) return [];
 
     const parentEffectKey = record.startReplay?.key ?? contract.dispatchIntent?.attemptId;
     if (!parentEffectKey) {
@@ -909,32 +929,96 @@ export class LocalAgentSessionManager {
         `HerdR verifier for agent ${record.id} has no durable parent effect identity.`,
       );
     }
-    const executable = toolchain.verifiers[verifier];
     const parentRole = contract.role ?? "IMPLEMENT";
-    const planKey = `verify-plan:${createHash("sha256")
-      .update(JSON.stringify([parentEffectKey, parentRole, toolchainId, verifier, toolchain.root, executable]))
-      .digest("hex")
-      .slice(0, 40)}`;
-    return {
-      planKey,
-      role: "VERIFY",
-      parentEffectKey,
-      parentRole,
-      toolchainId,
-      verifier,
-      toolchainRoot: toolchain.root,
-      executable,
-      args: [],
-      turnGeneration: generation,
-    };
+    return verifiers.map((verifier) => {
+      const executable = toolchain.verifiers[verifier];
+      const planKey = `verify-plan:${createHash("sha256")
+        .update(JSON.stringify([parentEffectKey, parentRole, toolchainId, verifier, toolchain.root, executable]))
+        .digest("hex")
+        .slice(0, 40)}`;
+      return {
+        planKey,
+        role: "VERIFY",
+        parentEffectKey,
+        parentRole,
+        toolchainId,
+        verifier,
+        toolchainRoot: toolchain.root,
+        executable,
+        args: [],
+        turnGeneration: generation,
+      };
+    });
+  }
+
+  /** Materialize the exact terminal candidate away from the worker's source. */
+  private async prepareIsolatedHerdrVerifierWorkspace(
+    record: LocalAgentRecord,
+    physical: Awaited<ReturnType<typeof inspectWorkspacePhysicalState>>,
+  ): Promise<{ root: string; directory: string }> {
+    const sourceRoot = await realpath(record.workspaceRoot);
+    const stateRoot = await realpath(this.config.stateDir);
+    if (stateRoot === sourceRoot || stateRoot.startsWith(`${sourceRoot}${sep}`)) {
+      throw new AgentSessionError(
+        "AGENT_LIFECYCLE_CORRUPT",
+        "Verifier state directory must be outside the source workspace.",
+      );
+    }
+    if (!physical.head || !physical.diffHash) {
+      throw new AgentSessionError(
+        "AGENT_LIFECYCLE_CORRUPT",
+        "Verifier candidate is missing an exact Git head or physical diff hash.",
+      );
+    }
+    const directory = await mkdtemp(join(stateRoot, "herdr-verifier-"));
+    const root = join(directory, "candidate");
+    try {
+      execFileSync("git", ["clone", "--quiet", "--local", "--shared", "--no-checkout", sourceRoot, root], {
+        encoding: "utf8",
+        timeout: 30_000,
+      });
+      execFileSync("git", ["-C", root, "update-ref", "HEAD", physical.head], { timeout: 15_000 });
+      const sourceIndex = execFileSync(
+        "git", ["-C", sourceRoot, "rev-parse", "--path-format=absolute", "--git-path", "index"],
+        { encoding: "utf8", timeout: 15_000 },
+      ).trim();
+      await copyFile(sourceIndex, join(root, ".git", "index"), constants.COPYFILE_FICLONE);
+      for (const name of await readdir(sourceRoot)) {
+        if (name === ".git") continue;
+        await cp(join(sourceRoot, name), join(root, name), {
+          recursive: true,
+          verbatimSymlinks: true,
+          mode: constants.COPYFILE_FICLONE,
+        });
+      }
+      const [original, isolated] = await Promise.all([
+        inspectWorkspacePhysicalState(sourceRoot),
+        inspectWorkspacePhysicalState(root),
+      ]);
+      if (
+        original.head !== physical.head || original.diffHash !== physical.diffHash ||
+        isolated.head !== physical.head || isolated.diffHash !== physical.diffHash ||
+        JSON.stringify(isolated.changedPaths) !== JSON.stringify(physical.changedPaths)
+      ) {
+        throw new AgentSessionError(
+          "AGENT_LIFECYCLE_CORRUPT",
+          "Verifier isolation copy does not match the exact terminal candidate snapshot.",
+        );
+      }
+      return { root, directory };
+    } catch (error) {
+      await rm(directory, { recursive: true, force: true });
+      throw error;
+    }
   }
 
   private async runHerdrTerminalVerifier(
     record: LocalAgentRecord,
     generation: string,
     physical: Awaited<ReturnType<typeof inspectWorkspacePhysicalState>>,
+    planned?: Record<string, unknown>,
   ): Promise<Record<string, unknown> | undefined> {
-    const plan = this.buildHerdrVerifierPlan(record, generation);
+    const plan = planned ?? this.buildHerdrVerifierPlan(record, generation);
     if (!plan) return undefined;
 
     const parentEffectKey = String(plan.parentEffectKey);
@@ -942,7 +1026,10 @@ export class LocalAgentSessionManager {
     const verifier = String(plan.verifier);
     const configuredToolchains = this.config.toolchains ?? [];
     const current = this.store.getById(record.id);
-    const currentPlan = current?.lifecycleState?.automatedVerifierPlan;
+    const currentPlan = current?.lifecycleState?.automatedVerifierPlans?.[String(plan.planKey)]
+      ?? (current?.lifecycleState?.automatedVerifierPlan?.planKey === plan.planKey
+        ? current?.lifecycleState?.automatedVerifierPlan
+        : undefined);
     const ledger = current?.lifecycleState?.automatedVerifierEffects ?? {};
     const planMatches = currentPlan?.planKey === plan.planKey
       && currentPlan?.turnGeneration === generation
@@ -1020,7 +1107,10 @@ export class LocalAgentSessionManager {
           planKey: String(plan.planKey),
           candidate,
         });
-        const afterBind = bound.current?.lifecycleState?.automatedVerifierPlan;
+        const afterBind = bound.current?.lifecycleState?.automatedVerifierPlans?.[String(plan.planKey)]
+          ?? (bound.current?.lifecycleState?.automatedVerifierPlan?.planKey === plan.planKey
+            ? bound.current?.lifecycleState?.automatedVerifierPlan
+            : undefined);
         const persisted = afterBind?.boundCandidate;
         if (!bound.applied || !persisted || typeof persisted !== "object") {
           throw new AgentSessionError(
@@ -1050,6 +1140,9 @@ export class LocalAgentSessionManager {
         .slice(0, 40)}`;
     }
     const sourceSnapshotSha256 = createHash("sha256").update(JSON.stringify(sourceSnapshot)).digest("hex");
+    if (effectKey === parentEffectKey) {
+      throw new AgentSessionError("AGENT_LIFECYCLE_CORRUPT", "Verifier lineage cycle: effectKey equals parentEffectKey.");
+    }
     const taskKey = `${record.id}:${effectKey}`;
     const identity = {
       effectKind: "toolchain-verifier",
@@ -1161,22 +1254,35 @@ export class LocalAgentSessionManager {
     const task = (async (): Promise<Record<string, unknown>> => {
       let result: Record<string, unknown>;
       try {
-        const verification: ToolchainVerificationResult = await this.toolchainVerifier({
-          toolchains: configuredToolchains,
-          toolchainId,
-          verifier,
-          args: [],
-          cwd: record.workspaceRoot,
-        });
+        const isolated = await this.prepareIsolatedHerdrVerifierWorkspace(record, physical);
+        let verification: ToolchainVerificationResult;
+        try {
+          verification = await this.toolchainVerifier({
+            toolchains: configuredToolchains,
+            toolchainId,
+            verifier,
+            args: [],
+            cwd: isolated.root,
+            denyWriteRoots: [record.workspaceRoot],
+          });
+        } finally {
+          await rm(isolated.directory, { recursive: true, force: true });
+        }
+        const sourceAfter = await inspectWorkspacePhysicalState(record.workspaceRoot);
+        const sourceMutationDetected = sourceAfter.head !== sourceSnapshot.head
+          || sourceAfter.diffHash !== sourceSnapshot.diffHash
+          || JSON.stringify(sourceAfter.changedPaths) !== JSON.stringify(sourceSnapshot.changedPaths);
         result = {
           ...identity,
           effectState: "COMPLETED",
           completedAt: new Date().toISOString(),
           exitCode: verification.exitCode,
-          passed: verification.exitCode === 0,
+          passed: verification.exitCode === 0 && !sourceMutationDetected,
           durationMs: verification.durationMs,
           timedOut: verification.timedOut,
           launchFailed: Boolean(verification.launchError),
+          sourceIsolation: "ISOLATED_COPY_SANDBOXED_ORIGINAL",
+          sourceMutationDetected,
           stdout: verification.stdout,
           stderr: verification.stderr,
         };
@@ -1467,8 +1573,8 @@ export class LocalAgentSessionManager {
     const initial = this.store.getById(agentId);
     const generation = initial?.lifecycleState?.activeTurn?.generation;
     if (!initial || !generation) return;
-    const verifierPlan = this.buildHerdrVerifierPlan(initial, generation);
-    if (verifierPlan) {
+    const verifierPlans = this.buildHerdrVerifierPlans(initial, generation);
+    for (const verifierPlan of verifierPlans) {
       const prepared = this.store.prepareExternalRuntimeVerifierCAS({
         agentId,
         generation,
@@ -4301,6 +4407,9 @@ function recordToStatusOutput(
   }
   if (record.lifecycleState?.automatedVerifierPlan) {
     output.automatedVerifierPlan = record.lifecycleState.automatedVerifierPlan;
+  }
+  if (record.lifecycleState?.automatedVerifierPlans) {
+    output.automatedVerifierPlans = record.lifecycleState.automatedVerifierPlans;
   }
   // P2-D: Separate dispatcher heartbeat from provider activity
   output.dispatcherHeartbeatAt = record.updatedAt;
