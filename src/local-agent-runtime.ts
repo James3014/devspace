@@ -77,6 +77,8 @@ export interface LocalAgentRunCallbacks {
     attestationSource?: string;
     attestedAt?: string;
   }) => void | Promise<void>;
+  /** P2-D: Called only from provider/runtime surfaces with positive process evidence. */
+  onProviderProcessState?: (state: "running" | "not_running" | "unknown") => void | Promise<void>;
 }
 
 export interface LocalAgentRuntimeContext {
