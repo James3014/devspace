@@ -510,6 +510,13 @@ export function registerCoreMutationSessionTools(
   const acquisitionObservationSchema = z.object({
     operationId: z.string(),
     durableOperationId: z.string(),
+    sessionId: z.string(),
+    candidateHead: z.string(),
+    candidateTree: z.string(),
+    sourceRevision: z.string(),
+    bindingHash: z.string(),
+    acceptanceContractHash: z.string(),
+    changeSetHash: z.string(),
     acquisitionStatus: z.string(),
     coreInvoked: z.boolean(),
     coreVerdict: z.string().nullable(),
