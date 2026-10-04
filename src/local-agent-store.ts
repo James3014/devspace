@@ -1174,6 +1174,44 @@ export class LocalAgentStore {
     return updateAttestation.immediate();
   }
 
+  /** P2-D: Persist provider process state only from a provider/runtime evidence writer. */
+  updateProviderProcessStateCAS(
+    id: string,
+    generation: string,
+    workerToken: string,
+    providerProcessState: "running" | "not_running" | "unknown",
+  ): LifecycleCasResult {
+    const updateState = this.database.sqlite.transaction(() => {
+      const current = this.getById(id);
+      const lifecycle = current?.lifecycleState;
+      const activeTurn = lifecycle?.activeTurn;
+      if (
+        !current ||
+        !isDetachedLifecycle(lifecycle) ||
+        !activeTurn ||
+        activeTurn.generation !== generation ||
+        lifecycle.terminationPending ||
+        lifecycle.lifecycleCorrupt ||
+        current.workerToken !== workerToken ||
+        (current.status !== "starting" && current.status !== "running")
+      ) {
+        return { applied: false, previous: current, current };
+      }
+      const lifecycleState: AgentLifecycleState = {
+        ...lifecycle,
+        providerProcessState,
+      };
+      const now = new Date().toISOString();
+      const result = this.database.sqlite.prepare(
+        `update local_agent_sessions set lifecycle_state = ?, updated_at = ?
+         where id = ? and worker_token = ? and updated_at = ?`,
+      ).run(JSON.stringify(lifecycleState), now, id, workerToken, current.updatedAt);
+      const refreshed = this.getById(id) ?? current;
+      return { applied: result.changes === 1, previous: current, current: refreshed };
+    });
+    return updateState.immediate();
+  }
+
   /** P2-D: Dedicated dispatcher heartbeat touch. */
   touchDispatcherHeartbeatCAS(
     id: string,
