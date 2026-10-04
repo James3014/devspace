@@ -681,6 +681,10 @@ test("P1: recordAutomatedVerifierResult records verifier outcome on durable work
     });
 
     const verifierOutcome = {
+      effectKey: "verify:semantic-implement",
+      effectState: "COMPLETED",
+      role: "VERIFY",
+      parentEffectKey: "attempt-implement",
       toolchainId: "test-toolchain",
       verifier: "pytest",
       exitCode: 0,
@@ -699,8 +703,24 @@ test("P1: recordAutomatedVerifierResult records verifier outcome on durable work
     assert.ok(queried.automatedVerifierResult);
     assert.equal(queried.automatedVerifierResult.exitCode, 0);
     assert.equal(queried.automatedVerifierResult.stdout, "1 passed in 0.04s");
+
+    const repairOutcome = {
+      effectKey: "verify:semantic-repair",
+      effectState: "COMPLETED",
+      role: "VERIFY",
+      parentEffectKey: "attempt-repair",
+      passed: false,
+      verifier: "pytest",
+      exitCode: 1,
+    };
+    store.recordAutomatedVerifierResult(workKey, repairOutcome);
+    const withLineage = store.disposition(workKey);
+    assert.deepEqual(withLineage.automatedVerifierEffects, {
+      "verify:semantic-implement": verifierOutcome,
+      "verify:semantic-repair": repairOutcome,
+    });
+    assert.deepEqual(withLineage.automatedVerifierResult, repairOutcome);
   } finally {
     sqlite.close();
   }
 });
-

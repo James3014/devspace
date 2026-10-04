@@ -404,6 +404,8 @@ export function runToolchainVerifier(input: {
   args: string[];
   cwd: string;
   timeoutMs?: number;
+  /** Physical source roots that the verifier process and children cannot write. */
+  denyWriteRoots?: string[];
 }): Promise<ToolchainVerificationResult> {
   const resolved = resolveToolchainExecutable(input.toolchains, input.toolchainId, input.verifier);
   if (!resolved) {
@@ -426,6 +428,19 @@ export function runToolchainVerifier(input: {
   } catch (error) {
     return Promise.reject(error);
   }
+  let command = resolved.executable;
+  let commandArgs = input.args;
+  if (input.denyWriteRoots?.length) {
+    if (process.platform !== "darwin" || !existsSync("/usr/bin/sandbox-exec")) {
+      return Promise.reject(new Error("Verifier source-write sandbox is unavailable on this host."));
+    }
+    const roots = input.denyWriteRoots.map((root) => realpathSync(root));
+    const policy = `(version 1)(allow default)${roots
+      .map((root) => `(deny file-write* (subpath ${JSON.stringify(root)}))`)
+      .join("")}`;
+    command = "/usr/bin/sandbox-exec";
+    commandArgs = ["-p", policy, resolved.executable, ...input.args];
+  }
   return new Promise((resolvePromise) => {
     const startedAt = Date.now();
     let completed = false;
@@ -433,8 +448,8 @@ export function runToolchainVerifier(input: {
     let timer: NodeJS.Timeout | undefined;
 
     const child = execFile(
-      resolved.executable,
-      input.args,
+      command,
+      commandArgs,
       {
         cwd: input.cwd,
         timeout: timeoutMs,

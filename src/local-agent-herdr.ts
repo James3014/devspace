@@ -16,6 +16,8 @@ import { canonicalizePath, isSameWorktreePath } from "./roots.js";
 
 export const HERDR_DEFAULT_SOCKET_PATH = process.env.HERDR_SOCKET_PATH || "/Users/james/.config/herdr/herdr.sock";
 export const HERDR_RUNTIME_KIND = "HERDR" as const;
+export const HERDR_ROOT_PANE_READY_TIMEOUT_MS = 5_000;
+export const HERDR_ROOT_PANE_READY_POLL_INTERVAL_MS = 100;
 
 export type HerdrAgentKind = "opencode" | "agy" | "codex" | "cline" | "grok";
 
@@ -73,6 +75,21 @@ export function buildDeterministicHerdrAgentName(attemptKey: string, dispatchInt
   const hashInput = `${attemptKey}:${dispatchIntentHash ?? ""}`;
   const suffix = createHash("sha256").update(hashInput).digest("hex").slice(0, 8);
   return `${prefix}-${suffix}`;
+}
+
+function hasInteractiveShellPrompt(output: string): boolean {
+  const withoutAnsi = output.replace(/\u001b\[[0-9;?]*[A-Za-z]/g, "");
+  const lastLine = withoutAnsi.split(/\r?\n/).map((line) => line.trim()).filter(Boolean).at(-1);
+  if (!lastLine) return false;
+  if (/^(?:[$%#❯➜λ]|>)$/.test(lastLine)) return true;
+  if (/^PS\s+[A-Za-z]:\\[^\n]*>$/i.test(lastLine)) return true;
+  const marker = lastLine.at(-1);
+  if (!marker || !"$%#❯➜λ".includes(marker)) return false;
+  if (marker === "%" && /\d%$/.test(lastLine)) return false;
+  // Accept common user/host, path, and short-directory prompts. Plain startup
+  // banners and command output do not establish that a shell is interactive.
+  const prefix = lastLine.slice(0, -1).trim();
+  return /^(?:(?:[\w.-]+@[\w.-]+)(?:[: ].*)?|~(?:\/.*)?|\/.*|[\w.-]+|\([^)]*\)\s*[\w./~-]*)$/.test(prefix);
 }
 
 export interface HerdrExternalHandle {
@@ -582,6 +599,8 @@ export class HerdrThinGateway {
     private readonly socketPath: string = HERDR_DEFAULT_SOCKET_PATH,
     private readonly registry: HerdrGatewayRegistry = defaultHerdrGatewayRegistry,
     private readonly store?: LocalAgentStore,
+    private readonly rootPaneReadyTimeoutMs: number = HERDR_ROOT_PANE_READY_TIMEOUT_MS,
+    private readonly rootPaneReadyPollIntervalMs: number = HERDR_ROOT_PANE_READY_POLL_INTERVAL_MS,
   ) {}
 
   protected async sendRequest<T = unknown>(
@@ -1564,6 +1583,20 @@ export class HerdrThinGateway {
       }
     }
 
+    try {
+      await this.waitForRootPaneInteractiveShell(paneId, herdrSocketPath);
+    } catch (err) {
+      const reason = "Root pane interactive shell readiness was not established before agent.start: " + String(err);
+      if (effectiveStore && params.agentId) {
+        effectiveStore.markExternalRuntimeLaunchOutcomeUnknownCAS({
+          agentId: params.agentId,
+          attemptKey: params.attemptKey,
+          reason,
+        });
+      }
+      throw new Error("[OUTCOME_UNKNOWN] " + reason + " The workspace is retained for reconciliation; agent.start was not attempted.");
+    }
+
     // 2. Start agent in pane
     const args = buildHerdrAgentArgs(params, canonicalPath, opencodeServerPort);
 
@@ -2055,7 +2088,12 @@ export class HerdrThinGateway {
   /**
    * Read pane output.
    */
-  async readPane(paneId: string, lines: number = 60, socketPath?: string): Promise<string> {
+  async readPane(
+    paneId: string,
+    lines: number = 60,
+    socketPath?: string,
+    timeoutMs: number = 10_000,
+  ): Promise<string> {
     const req: HerdrSocketRequest = {
       id: `pane-read-${Date.now()}`,
       method: "pane.read",
@@ -2071,7 +2109,7 @@ export class HerdrThinGateway {
         read: {
           text: string;
         };
-      }>(req, 10_000, socketPath);
+      }>(req, timeoutMs, socketPath);
       if (res.result?.read?.text !== undefined) {
         return res.result.read.text;
       }
@@ -2095,6 +2133,30 @@ export class HerdrThinGateway {
       encoding: "utf-8",
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
+  }
+
+  private async waitForRootPaneInteractiveShell(paneId: string, socketPath: string): Promise<void> {
+    const timeoutMs = Math.max(1, this.rootPaneReadyTimeoutMs);
+    const deadline = Date.now() + timeoutMs;
+    let lastReadError: string | undefined;
+    let reads = 0;
+    while (Date.now() < deadline) {
+      const remainingMs = deadline - Date.now();
+      try {
+        reads += 1;
+        const output = await this.readPane(paneId, 40, socketPath, Math.max(1, Math.min(1_000, remainingMs)));
+        if (hasInteractiveShellPrompt(output)) return;
+      } catch (err) {
+        lastReadError = err instanceof Error ? err.message : String(err);
+      }
+
+      const delayMs = Math.min(this.rootPaneReadyPollIntervalMs, deadline - Date.now());
+      if (delayMs > 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, delayMs));
+    }
+    const suffix = lastReadError ? "; last read failed: " + lastReadError : "";
+    throw new Error(
+      "Timed out after " + timeoutMs + "ms waiting for an interactive shell prompt in root pane '" + paneId + "' (" + reads + " pane reads" + suffix + ").",
+    );
   }
 
   /**
