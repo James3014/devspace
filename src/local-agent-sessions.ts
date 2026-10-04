@@ -970,7 +970,9 @@ export class LocalAgentSessionManager {
         "Verifier candidate is missing an exact Git head or physical diff hash.",
       );
     }
-    const directory = await mkdtemp(join(stateRoot, "herdr-verifier-"));
+    // The verifier may write its isolated Candidate copy, so keep that copy
+    // outside durable state before denying writes to the state directory.
+    const directory = await mkdtemp(join(tmpdir(), "herdr-verifier-"));
     const root = join(directory, "candidate");
     try {
       execFileSync("git", ["clone", "--quiet", "--local", "--shared", "--no-checkout", sourceRoot, root], {
@@ -1263,7 +1265,7 @@ export class LocalAgentSessionManager {
             verifier,
             args: [],
             cwd: isolated.root,
-            denyWriteRoots: [record.workspaceRoot],
+            denyWriteRoots: [record.workspaceRoot, this.config.stateDir],
           });
         } finally {
           await rm(isolated.directory, { recursive: true, force: true });

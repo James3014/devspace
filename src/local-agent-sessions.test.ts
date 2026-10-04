@@ -1684,7 +1684,7 @@ test("HerdR terminal verifier is a durable VERIFY effect and an unfinished claim
     undefined,
     async ({ toolchainId, verifier, cwd, denyWriteRoots }) => {
       verifierCalls.push({ toolchainId, verifier });
-      assert.deepEqual(denyWriteRoots, [workspaceRoot]);
+      assert.deepEqual(denyWriteRoots, [workspaceRoot, stateDir]);
       writeFileSync(join(cwd, "effect.txt"), "verifier wrote this in isolation\n");
       const exitCode = verifierCalls.length === 2 || verifier === "alpha-fail" ? 1 : 0;
       return {

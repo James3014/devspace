@@ -440,11 +440,12 @@ test("runToolchainVerifier runs allowlisted executable with bounded cwd and stru
   }
 });
 
-test("runToolchainVerifier permits isolated output but denies writes to the original source", {
+test("runToolchainVerifier permits isolated output but denies writes to source and durable state", {
   skip: process.platform !== "darwin",
 }, async () => {
   const source = mkdtempSync(join(tmpdir(), "devspace-verifier-source-"));
   const isolated = mkdtempSync(join(tmpdir(), "devspace-verifier-isolated-"));
+  const state = mkdtempSync(join(tmpdir(), "devspace-verifier-state-"));
   const toolchainRoot = mkdtempSync(join(tmpdir(), "devspace-verifier-toolchain-"));
   try {
     const executable = join(toolchainRoot, "probe.sh");
@@ -452,24 +453,27 @@ test("runToolchainVerifier permits isolated output but denies writes to the orig
       "#!/bin/sh",
       'touch "$PWD/isolated.txt" || exit 2',
       'if touch "$1/forbidden.txt"; then exit 3; fi',
-      'echo "SOURCE_WRITE_DENIED"',
+      'if touch "$2/forbidden.txt"; then exit 4; fi',
+      'echo "SOURCE_AND_STATE_WRITES_DENIED"',
     ].join("\n"), { mode: 0o755 });
     const result = await runToolchainVerifier({
       toolchains: [{ id: "source-isolation", root: toolchainRoot, verifiers: { probe: executable } }],
       toolchainId: "source-isolation",
       verifier: "probe",
-      args: [source],
+      args: [source, state],
       cwd: isolated,
-      denyWriteRoots: [source],
+      denyWriteRoots: [source, state],
       timeoutMs: 5000,
     });
     assert.equal(result.exitCode, 0, result.stderr);
-    assert.match(result.stdout, /SOURCE_WRITE_DENIED/);
+    assert.match(result.stdout, /SOURCE_AND_STATE_WRITES_DENIED/);
     assert.equal(existsSync(join(isolated, "isolated.txt")), true);
     assert.equal(existsSync(join(source, "forbidden.txt")), false);
+    assert.equal(existsSync(join(state, "forbidden.txt")), false);
   } finally {
     rmSync(source, { recursive: true, force: true });
     rmSync(isolated, { recursive: true, force: true });
+    rmSync(state, { recursive: true, force: true });
     rmSync(toolchainRoot, { recursive: true, force: true });
   }
 });
