@@ -231,8 +231,31 @@ to ChatGPT:
 
 Minimal mode intentionally does not project agent dispatch, Candidate,
 Core-mutation, coordination, cutover, host-operation, provider-routing, or
-other control-plane tool families. Use `DEVSPACE_TOOL_MODE=full` only when a
-workflow explicitly needs those high-control capabilities.
+other control-plane tool families.
+
+For ChatGPT -> coding-worker delegation, use
+`DEVSPACE_TOOL_MODE=dispatch`. It exposes only:
+
+- `open_workspace`
+- `read`
+- `agent_catalog`
+- `agent_preflight`
+- `agent_start`
+- `agent_status`
+- `agent_continue`
+- `agent_reconcile`
+- `agent_cancel`
+- `agent_list`
+
+The normal flow is `open_workspace -> agent_preflight -> agent_start ->
+agent_status`. Use a stable `attemptKey`; write-capable workers must provide
+bounded `writePaths`. Continue the same `agentId` for a bounded repair, and
+after an ambiguous transport result use `agent_status` / `agent_reconcile`
+instead of redispatching. The dispatch surface is execution transport only and
+does not grant acceptance, merge, release, or production authority.
+
+Use `DEVSPACE_TOOL_MODE=full` only when a workflow explicitly needs the broad
+control plane.
 
 The experimental Codex-style surface is enabled with
 `DEVSPACE_TOOL_MODE=codex`. It exposes:

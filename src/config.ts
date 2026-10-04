@@ -10,7 +10,7 @@ import { devspaceAgentsDir, devspaceSkillsDir, loadDevspaceFiles } from "./user-
 import { resolveSubagentsConfig, type SubagentsConfig } from "./local-agent-config.js";
 import { parseControlPlaneTopologyManifest, type ControlPlaneInventory } from "./control-plane-convergence.js";
 
-export type ToolMode = "minimal" | "full" | "codex";
+export type ToolMode = "minimal" | "full" | "codex" | "dispatch";
 export type WidgetMode = "off" | "changes" | "full";
 export type AgentExecutionBackend = "legacy" | "herdr";
 const DEFAULT_OAUTH_ACCESS_TOKEN_TTL_SECONDS = 60 * 60;
@@ -169,7 +169,7 @@ function parseTrustProxy(env: NodeJS.ProcessEnv): boolean | number {
 
 function parseToolMode(env: NodeJS.ProcessEnv): ToolMode {
   const mode = env.DEVSPACE_TOOL_MODE;
-  if (mode === "minimal" || mode === "full" || mode === "codex") return mode;
+  if (mode === "minimal" || mode === "full" || mode === "codex" || mode === "dispatch") return mode;
   if (mode) throw new Error(`Invalid DEVSPACE_TOOL_MODE: ${mode}`);
 
   if (env.DEVSPACE_MINIMAL_TOOLS !== undefined) {

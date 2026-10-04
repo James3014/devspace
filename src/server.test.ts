@@ -1318,7 +1318,7 @@ async function fixture(
     subagents?: boolean | SubagentsConfig;
     gitCandidates?: boolean;
     toolchains?: string;
-    toolMode?: "full" | "minimal" | "codex";
+    toolMode?: "full" | "minimal" | "codex" | "dispatch";
     chatSwarm?: boolean;
     controlPlaneInventory?: ControlPlaneInventory;
     coreMutation?: boolean | "enforced_missing";
@@ -2398,20 +2398,21 @@ test("fresh direct workspace can edit and test without Core mutation session", a
   assert.match(readFileSync(join(full.project, "AGENTS.md"), "utf8"), /direct mutation/);
   assert.equal(structuredContent(edit).coreMutation, undefined);
 
-  // Delegated subagent execution requires explicit contract
+  // OWNER_DIRECT delegated work keeps execution safety without requiring Core governance.
   const agent = await full.client.callTool({
     name: "agent_start",
     arguments: {
       workspaceId,
       profile: "mutator",
-      prompt: "must not launch without Core binding",
+      prompt: "launch bounded direct worker",
       attemptKey: "core-unbound-agent-start",
-      executionContract: { writePaths: ["AGENTS.md"] },
+      executionContract: { authorityMode: "OWNER_DIRECT", writePaths: ["AGENTS.md"] },
     },
     _meta: conversation,
   });
-  assert.equal(agent.isError, true);
-  assert.match(responseText(agent), /CORE_(?:MUTATION_POINTER|BOUND_SESSION)_REQUIRED/);
+  assert.equal(agent.isError, undefined, responseText(agent));
+  assert.ok(structuredContent(agent).agentId);
+  assert.equal(structuredContent(agent).coreMutation, undefined);
 
   const codex = await fixture(t, { coreMutation: true, toolMode: "codex" });
   const codexOpened = await callOpen(codex.client, codex.project, conversation["openai/session"]);
@@ -2634,7 +2635,7 @@ test("agent continuation rejects changed and historical Core binding identity", 
     _meta: conversation,
   });
   assert.equal(historical.isError, true);
-  assert.match(responseText(historical), /CORE_BOUND_SESSION_REQUIRED/);
+  assert.match(responseText(historical), /CORE_ACTIVE_SESSION_CONFLICT/);
 });
 
 test("agent continuation does not retroactively require Core binding for a direct read-only selection", async (t) => {
@@ -3203,72 +3204,92 @@ test("subagents: controller dispatchIntent crosses the MCP schema without gainin
   assert.equal(invalidClaim.isError, true);
 });
 
-test("subagents: write-capable direct dispatch requires capability discovery before launch", async (t) => {
-  const context = await fixture(t, {
-    git: true,
-    subagents: { enabled: true, providers: [{ id: "codex", enabled: true }] },
-  });
-  const openResult = await callOpen(context.client, context.project, "chat-capability-discovery-required");
+test("subagents: OWNER_DIRECT write-capable start does not require Core or capability discovery", async (t) => {
+  const conversationScopeId = "issue350-owner-direct-start";
+  const context = await fixture(t, { git: true, coreMutation: true, subagents: true });
+  await addMutatorProfile(context.project);
+  await execFileAsync("git", ["add", ".devspace/agents/mutator.md"], { cwd: context.project });
+  await execFileAsync("git", ["commit", "-m", "test fixture mutator profile"], { cwd: context.project });
+  const openResult = await callOpen(context.client, context.project, conversationScopeId);
   const workspaceId = structuredContent(openResult).workspaceId as string;
-  const intent = {
-    taskId: "task-discovery-required",
-    attemptId: "attempt-discovery-required",
-    objective: "Perform one bounded implementation only after existing capability discovery.",
-    roleIntent: "DEEP_ENGINEERING",
-    readScope: ["src"],
-    writeScope: ["src"],
-    exclusiveOwnership: true,
-    acceptanceCriteria: ["Mutation never starts without a current discovery receipt."],
-    verificationRequired: true,
-    claimCeiling: "CANDIDATE_READY",
-  };
 
-  const missing = await context.client.callTool({
+  const started = await context.client.callTool({
     name: "agent_start",
     arguments: {
       workspaceId,
-      provider: "codex",
-      model: "gpt-test",
-      prompt: "must not launch",
-      attemptKey: intent.attemptId,
-      executionContract: { dispatchIntent: intent, writePaths: ["src"] },
-    },
-  });
-  assert.equal(missing.isError, true);
-  assert.match(responseText(missing), /CAPABILITY_DISCOVERY_REQUIRED/i);
-
-  const blocked = await context.client.callTool({
-    name: "agent_start",
-    arguments: {
-      workspaceId,
-      provider: "codex",
-      model: "gpt-test",
-      prompt: "must still not launch",
-      attemptKey: "attempt-discovery-blocked",
+      profile: "mutator",
+      prompt: "perform one bounded owner-direct change",
+      attemptKey: "issue350-owner-direct-start",
       executionContract: {
-        dispatchIntent: { ...intent, attemptId: "attempt-discovery-blocked" },
+        authorityMode: "OWNER_DIRECT",
         writePaths: ["src"],
-        capabilityDiscovery: {
-          schema: "nexus.capability_discovery_receipt.v1",
-          repository: "James3014/Nexus-new",
-          indexRevision: "a".repeat(40),
-          indexPath: "docs/agents/CAPABILITY_DISCOVERY_INDEX.v1.json",
-          indexSha256: "b".repeat(64),
-          intent: "Discovery is incomplete.",
-          disposition: "BLOCKED_UNKNOWN",
-          matchedCapabilityIds: [],
-          evidence: {
-            architecture: ["searched architecture"],
-            source: ["searched source"],
-            history: ["searched history"],
-            runtime: ["searched runtime"],
-          },
-        },
       },
     },
+    _meta: { "openai/session": conversationScopeId },
   });
-  assert.equal(blocked.isError, true);
-  assert.match(responseText(blocked), /BLOCKED_UNKNOWN|complete discovery/i);
+
+  assert.equal(started.isError, undefined, responseText(started));
+  assert.ok(structuredContent(started).agentId);
+  assert.equal(structuredContent(started).coreMutation, undefined);
+});
+
+test("subagents: OWNER_DIRECT write-capable continuation does not require Core binding", async (t) => {
+  const conversationScopeId = "issue350-owner-direct-continue";
+  const context = await fixture(t, { git: true, coreMutation: true, subagents: true });
+  await addMutatorProfile(context.project);
+  await execFileAsync("git", ["add", ".devspace/agents/mutator.md"], { cwd: context.project });
+  await execFileAsync("git", ["commit", "-m", "test fixture mutator profile"], { cwd: context.project });
+  const openResult = await callOpen(context.client, context.project, conversationScopeId);
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+
+  const started = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "mutator",
+      prompt: "perform one bounded owner-direct change",
+      attemptKey: "issue350-owner-direct-continue",
+      executionContract: {
+        authorityMode: "OWNER_DIRECT",
+        writePaths: ["src"],
+      },
+    },
+    _meta: { "openai/session": conversationScopeId },
+  });
+  assert.equal(started.isError, undefined, responseText(started));
+  const agentId = structuredContent(started).agentId as string;
+
+  const agents = new LocalAgentStore(context.stateDir);
+  try {
+    const record = agents.getById(agentId)!;
+    const generation = record.lifecycleState!.activeTurn!.generation!;
+    const workerToken = record.workerToken!;
+    agents.claimWorkerCAS(agentId, generation, workerToken, process.pid);
+    agents.finishTurnCAS({
+      agentId,
+      generation,
+      workerToken,
+      status: "idle",
+      terminalReason: "completed",
+    });
+  } finally {
+    agents.close();
+  }
+
+  const continued = await context.client.callTool({
+    name: "agent_continue",
+    arguments: {
+      workspaceId,
+      agentId,
+      prompt: "continue the same bounded owner-direct task",
+    },
+    _meta: { "openai/session": conversationScopeId },
+  });
+
+  assert.equal(continued.isError, undefined, responseText(continued));
+  assert.equal(structuredContent(continued).agentId, agentId);
+  assert.equal(structuredContent(continued).continued, true);
+  assert.equal(structuredContent(continued).coreMutation, undefined);
 });
 
 test("subagents: NEXUS_GOVERNED fails closed at the MCP boundary without complete canonical grant evidence", async (t) => {
@@ -5077,6 +5098,109 @@ test("command_status metadata annotations and minimal mode visibility", async (t
     idempotentHint: true,
     openWorldHint: false,
   });
+});
+
+test("dispatch mode exposes only the direct worker lifecycle and simple instructions", async (t) => {
+  const context = await fixture(t, {
+    git: true,
+    toolMode: "dispatch",
+    subagents: true,
+    gitCandidates: true,
+    chatSwarm: true,
+    coreMutation: true,
+  });
+  const toolsList = await context.client.listTools();
+  const names = toolsList.tools.map((tool) => tool.name).sort();
+
+  assert.deepEqual(names, [
+    "agent_cancel",
+    "agent_catalog",
+    "agent_continue",
+    "agent_list",
+    "agent_preflight",
+    "agent_reconcile",
+    "agent_start",
+    "agent_status",
+    "open_workspace",
+    "read",
+  ]);
+  assert.equal(names.length, 10);
+  assert.deepEqual(
+    names.filter((name) => /core|coordination|cutover|host_operation|candidate|repository_intelligence|^bash$|^write$|^edit$|apply_patch|^git_/.test(name)),
+    [],
+  );
+
+  const agentStart = toolsList.tools.find((tool) => tool.name === "agent_start");
+  assert.ok(agentStart);
+  const agentStartSchema = JSON.stringify(agentStart.inputSchema);
+  assert.match(agentStartSchema, /attemptKey/);
+  assert.match(agentStartSchema, /expectedHead/);
+  assert.match(agentStartSchema, /writePaths/);
+  assert.doesNotMatch(
+    agentStartSchema,
+    /nexusGrant|coreMutation|capabilityDiscovery|authorizedToolCeiling|toolProjectionManifest|effectProjection/,
+  );
+
+  const instructions = context.client.getInstructions() ?? "";
+  assert.match(instructions, /open_workspace/);
+  assert.match(instructions, /agent_catalog/);
+  assert.match(instructions, /agent_preflight/);
+  assert.match(instructions, /agent_start/);
+  assert.match(instructions, /OWNER_DIRECT/);
+  assert.match(instructions, /attemptKey/);
+  assert.match(instructions, /agent_status/);
+  assert.match(instructions, /agent_reconcile/);
+  assert.match(instructions, /read/);
+  assert.doesNotMatch(instructions, /Core|Nexus|coordination|cutover|host.?operation/i);
+});
+
+test("dispatch mode requires bounded write scope and launches OWNER_DIRECT without governance inputs", async (t) => {
+  const conversationScopeId = "issue350-dispatch-worker";
+  const context = await fixture(t, {
+    git: true,
+    toolMode: "dispatch",
+    subagents: true,
+    coreMutation: true,
+  });
+  await addMutatorProfile(context.project);
+  await execFileAsync("git", ["add", ".devspace/agents/mutator.md"], { cwd: context.project });
+  await execFileAsync("git", ["commit", "-m", "test fixture mutator profile"], { cwd: context.project });
+  const opened = await callOpen(context.client, context.project, conversationScopeId);
+  const workspaceId = structuredContent(opened).workspaceId as string;
+  const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: context.project })).stdout.trim();
+
+  const unbounded = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "mutator",
+      prompt: "perform one bounded direct change",
+      attemptKey: "issue350-dispatch-unbounded",
+    },
+    _meta: { "openai/session": conversationScopeId },
+  });
+  assert.equal(unbounded.isError, true);
+  assert.match(responseText(unbounded), /DIRECT_DISPATCH_WRITE_SCOPE_REQUIRED/);
+
+  const started = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "mutator",
+      prompt: "perform one bounded direct change",
+      attemptKey: "issue350-dispatch-bounded",
+      executionContract: {
+        authorityMode: "OWNER_DIRECT",
+        expectedHead: head,
+        writePaths: ["src"],
+        maxFiles: 2,
+      },
+    },
+    _meta: { "openai/session": conversationScopeId },
+  });
+  assert.equal(started.isError, undefined, responseText(started));
+  assert.ok(structuredContent(started).agentId);
+  assert.equal(structuredContent(started).coreMutation, undefined);
 });
 
 test("minimal mode is direct coding while full mode keeps Core mutation admission", async (t) => {
