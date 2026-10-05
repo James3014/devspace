@@ -1112,6 +1112,8 @@ function registerCodexProcessTools(
   workspaces: WorkspaceRegistry,
   processSessions: ProcessSessionManager,
   coreMutation?: CoreMutationGuard,
+  workResumeStore?: WorkResumeStore,
+  carrierBindings?: CarrierBindingStore,
 ): void {
   registerAppTool(
     server,
@@ -1363,6 +1365,8 @@ function registerCodexGoalTools(
   workspaces: WorkspaceRegistry,
   goals: CodexGoalSessionManager,
   coreMutation?: CoreMutationGuard,
+  workResumeStore?: WorkResumeStore,
+  carrierBindings?: CarrierBindingStore,
 ): void {
   const GOAL_START_ANNOTATIONS = {
     readOnlyHint: false,
@@ -4481,6 +4485,9 @@ export function createMcpServer(
           recipe: z.enum(["npm_ci", "pnpm_frozen", "uv_frozen"]),
           authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).default("OWNER_DIRECT")
             .describe("NEXUS_GOVERNED remains fail-closed until an external Nexus grant validator is wired."),
+          resumableWork: resumableWorkSchema().optional().describe(
+            "Nexus writer-admission pointer. Required for dependency effects in enrolled repositories.",
+          ),
         },
         outputSchema: durableOperationOutputSchema,
         _meta: {},
@@ -5545,14 +5552,14 @@ export function createMcpServer(
   );
 
   if (config.toolMode === "codex") {
-    registerCodexProcessTools(server, config, workspaces, processSessions, coreMutationGuard);
+    registerCodexProcessTools(server, config, workspaces, processSessions, coreMutationGuard, workResumeStore, carrierBindings);
   }
 
   // Narrow opt-in Codex Goal capability. Available in every tool mode, but it
   // exposes only special-purpose goal actions; generic exec_command/write_stdin
   // stay hidden outside codex mode.
   if (config.codexGoalsEnabled && codexGoals) {
-    registerCodexGoalTools(server, config, workspaces, codexGoals, coreMutationGuard);
+    registerCodexGoalTools(server, config, workspaces, codexGoals, coreMutationGuard, workResumeStore, carrierBindings);
   }
 
   if (config.artifactsEnabled && isArtifactDownloadSupportedPlatform()) {
