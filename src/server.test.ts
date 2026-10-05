@@ -2560,6 +2560,12 @@ test("shell scope escape cannot become trusted Core completion while read-only s
     conversationScopeId,
     allowedPaths: ["allowed.txt"],
   });
+  const mutationAdmission = await writeTestMutationAdmission({
+    stateRoot: context.nexusMutationAdmissionStateDir!,
+    workspaceRoot: context.project,
+    operationId: "devspace:test:core-shell-scope-escape",
+    allowedPaths: ["outside.txt"],
+  });
 
   const escaped = await context.client.callTool({
     name: "bash",
@@ -2567,6 +2573,7 @@ test("shell scope escape cannot become trusted Core completion while read-only s
       workspaceId,
       command: `${JSON.stringify(process.execPath)} -e "require('node:fs').writeFileSync('outside.txt','escaped')"`,
       attemptKey: "core-shell-scope-escape",
+      mutationAdmission,
     },
     _meta: conversation,
   });
@@ -2589,7 +2596,7 @@ test("read-only shell classification cannot bypass Core through mutating options
   const assertMutatingCommandBlocked = async (
     command: string,
     attemptKey: string,
-    options: { victimFile?: string; allowedPaths?: string[]; expectedError: RegExp },
+    options: { victimFile?: string; allowedPaths?: string[]; admissionPaths: string[]; expectedError: RegExp },
   ) => {
     const conversationScopeId = `core-shell-${attemptKey}`;
     const conversation = { "openai/session": conversationScopeId };
@@ -2609,12 +2616,19 @@ test("read-only shell classification cannot bypass Core through mutating options
       conversationScopeId,
       allowedPaths: options.allowedPaths ?? (options.victimFile ? [options.victimFile] : ["safe.txt"]),
     });
+    const mutationAdmission = await writeTestMutationAdmission({
+      stateRoot: context.nexusMutationAdmissionStateDir!,
+      workspaceRoot: context.project,
+      operationId: `devspace:test:${attemptKey}`,
+      allowedPaths: options.admissionPaths,
+    });
     const result = await context.client.callTool({
       name: "bash",
       arguments: {
         workspaceId,
         command,
         attemptKey,
+        mutationAdmission,
       },
       _meta: conversation,
     });
@@ -2624,21 +2638,25 @@ test("read-only shell classification cannot bypass Core through mutating options
 
   await assertMutatingCommandBlocked("find . -name classification-victim.txt -delete", "core-find-delete", {
     victimFile: "classification-victim.txt",
+    admissionPaths: ["classification-victim.txt"],
     expectedError: /CORE_MUTATION_POST_EFFECT_DELETION_FORBIDDEN/,
   });
 
   await assertMutatingCommandBlocked("git diff --output=diff-output.txt", "core-git-diff-output", {
+    admissionPaths: ["diff-output.txt"],
     expectedError: /CORE_MUTATION_POST_EFFECT_SCOPE_ESCAPE/,
   });
 
   for (const [index, token] of ["\"-delete\"", "'-delete'", "\\-delete"].entries()) {
     await assertMutatingCommandBlocked(`find . -name quoted-victim-${index}.txt ${token}`, `core-find-delete-quoted-${index}`, {
       victimFile: `quoted-victim-${index}.txt`,
+      admissionPaths: [`quoted-victim-${index}.txt`],
       expectedError: /CORE_MUTATION_POST_EFFECT_DELETION_FORBIDDEN/,
     });
   }
 
   await assertMutatingCommandBlocked("git diff \"--output=quoted-diff-output.txt\"", "core-git-diff-output-quoted", {
+    admissionPaths: ["quoted-diff-output.txt"],
     expectedError: /CORE_MUTATION_POST_EFFECT_SCOPE_ESCAPE/,
   });
 });
@@ -2660,6 +2678,12 @@ test("agent continuation rejects changed and historical Core binding identity", 
     allowedPaths: ["AGENTS.md"],
     identitySuffix: "first",
   });
+  const mutationAdmission = await writeTestMutationAdmission({
+    stateRoot: context.nexusMutationAdmissionStateDir!,
+    workspaceRoot: context.project,
+    operationId: "devspace:test:core-agent-continuation",
+    allowedPaths: ["AGENTS.md"],
+  });
   const agents = new LocalAgentStore(context.stateDir);
   let boundAgentId: string;
   let historicalAgentId: string;
@@ -2671,6 +2695,7 @@ test("agent continuation rejects changed and historical Core binding identity", 
       provider: "codex",
       executionContract: {
         coreMutation: { sessionId: first.session.id, bindingHash: first.session.bindingHash },
+        mutationAdmission,
         writePaths: ["AGENTS.md"],
       },
     }).id;
@@ -2679,7 +2704,7 @@ test("agent continuation rejects changed and historical Core binding identity", 
       workspaceRoot: context.project,
       profileName: "mutator",
       provider: "codex",
-      executionContract: { writePaths: ["AGENTS.md"] },
+      executionContract: { mutationAdmission, writePaths: ["AGENTS.md"] },
     }).id;
   } finally {
     agents.close();
