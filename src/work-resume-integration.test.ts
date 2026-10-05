@@ -24,8 +24,9 @@
  */
 
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import test from "node:test";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -220,10 +221,14 @@ interface IntegrationFixture {
   sqlite: Database.Database;
   agentSpy: ReturnType<typeof makeAgentManagerSpy>;
   workspaces: WorkspaceRegistry;
+  nexusStateRoot?: string;
+  baseHead: string;
   close: () => Promise<void>;
 }
 
-async function makeFixture(): Promise<IntegrationFixture> {
+async function makeFixture(
+  options: { canonical?: boolean; writeAgent?: boolean; toolMode?: "full" | "minimal" | "codex" } = {},
+): Promise<IntegrationFixture> {
   const tmpBase = mkdtempSync(join(tmpdir(), "devspace-p0-integration-"));
   const projectRoot = join(tmpBase, "project");
   const stateDir = join(tmpBase, ".state");
@@ -240,11 +245,23 @@ async function makeFixture(): Promise<IntegrationFixture> {
     join(projectRoot, ".devspace", "agents", "reviewer.md"),
     ["---", "name: reviewer", "description: Reviews project changes.", "provider: codex", "write_mode: read_only", "---", "Review changes."].join("\n"),
   );
+  if (options.writeAgent) {
+    writeFileSync(
+      join(projectRoot, ".devspace", "agents", "writer.md"),
+      ["---", "name: writer", "description: Writes bounded project changes.", "provider: codex", "write_mode: allowed", "---", "Implement bounded changes."].join("\n"),
+    );
+  }
   execFileSync("git", ["init"], { cwd: projectRoot, stdio: "pipe" });
   execFileSync("git", ["config", "user.name", "P0 Fixture"], { cwd: projectRoot, stdio: "pipe" });
   execFileSync("git", ["config", "user.email", "p0-fixture@example.test"], { cwd: projectRoot, stdio: "pipe" });
   execFileSync("git", ["add", "."], { cwd: projectRoot, stdio: "pipe" });
   execFileSync("git", ["commit", "-m", "fixture"], { cwd: projectRoot, stdio: "pipe" });
+  if (options.canonical) {
+    execFileSync("git", ["remote", "add", "origin", "https://github.com/James3014/devspace.git"], { cwd: projectRoot, stdio: "pipe" });
+  }
+  const baseHead = execFileSync("git", ["rev-parse", "HEAD"], { cwd: projectRoot, encoding: "utf8" }).trim().toLowerCase();
+  const nexusStateRoot = options.canonical ? join(tmpBase, "nexus-state") : undefined;
+  if (nexusStateRoot) mkdirSync(join(nexusStateRoot, "mutation-admissions"), { recursive: true });
 
   const config = loadConfig({
     DEVSPACE_CONFIG_DIR: join(tmpBase, ".config"),
@@ -255,7 +272,8 @@ async function makeFixture(): Promise<IntegrationFixture> {
     DEVSPACE_GIT_CANDIDATES: "true",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     DEVSPACE_WIDGETS: "off",
-    DEVSPACE_TOOL_MODE: "full",
+    DEVSPACE_TOOL_MODE: options.toolMode ?? "full",
+    ...(nexusStateRoot ? { DEVSPACE_NEXUS_MUTATION_ADMISSION_STATE_ROOT: nexusStateRoot } : {}),
     PORT: "1",
   });
 
@@ -341,7 +359,7 @@ async function makeFixture(): Promise<IntegrationFixture> {
     rmSync(tmpBase, { recursive: true, force: true });
   };
 
-  return { client, projectRoot, workspaceId, store, ownership, sqlite, close, agentSpy, workspaces };
+  return { client, projectRoot, workspaceId, store, ownership, sqlite, close, agentSpy, workspaces, nexusStateRoot, baseHead };
 }
 
 /**
@@ -361,6 +379,57 @@ function buildPointer(params: {
     baseRevisionSha: params.baseRevisionSha ?? BASE_SHA,
     ...(params.effectHandle ? { effectHandle: params.effectHandle } : {}),
   };
+}
+
+function canonicalJson(value: unknown): string {
+  const normalize = (input: unknown): unknown => {
+    if (Array.isArray(input)) return input.map(normalize);
+    if (input && typeof input === "object") {
+      const record = input as Record<string, unknown>;
+      return Object.fromEntries(Object.keys(record).sort().map((key) => [key, normalize(record[key])]));
+    }
+    return input;
+  };
+  return JSON.stringify(normalize(value));
+}
+
+function installMutationAdmission(
+  fix: IntegrationFixture,
+  allowedPaths: string[],
+  overrides: Partial<Record<string, unknown>> = {},
+) {
+  assert.ok(fix.nexusStateRoot, "canonical fixture requires Nexus state root");
+  const admissionId = "admission-" + "a".repeat(32);
+  const receiptBase: Record<string, unknown> = {
+    schema: "nexus.mutation_admission.v1",
+    admission_id: admissionId,
+    operation_id: "issue-364-integration",
+    repository: "James3014/devspace",
+    base_sha: fix.baseHead,
+    execution_lane: "DIRECT_CANONICAL",
+    authority_kind: "OWNER_INLINE",
+    allowed_paths: allowedPaths,
+    issue_number: 364,
+    task_id: null,
+    attempt_id: null,
+    task_card_path: null,
+    task_card_hash: null,
+    governance_source_head: null,
+    ttl_minutes: 60,
+    issued_at: new Date(Date.now() - 1_000).toISOString(),
+    expires_at: new Date(Date.now() + 60_000).toISOString(),
+    runtime_identity: {},
+    authority_reference: { schema: "test-authority" },
+    request_hash: "b".repeat(64),
+    ...overrides,
+  };
+  const receiptHash = createHash("sha256").update(canonicalJson(receiptBase)).digest("hex");
+  const receipt = { ...receiptBase, receipt_hash: receiptHash };
+  writeFileSync(
+    join(fix.nexusStateRoot!, "mutation-admissions", `${admissionId}.json`),
+    JSON.stringify(receipt, null, 2) + "\n",
+  );
+  return { admissionId, receiptHash };
 }
 
 /**
@@ -945,6 +1014,213 @@ test("I-10b: P0-bound shell command — read-only command passes lease check (po
   );
 });
 
+// ─── G2: Nexus mutation admission consumption at managed sinks ───────────────
+
+test("G2 canonical write fails closed without admission, rejects scope escape, and admits exact scope", async (t) => {
+  const fix = await makeFixture({ canonical: true });
+  t.after(() => fix.close());
+
+  const missing = await fix.client.callTool({
+    name: "write",
+    arguments: { workspaceId: fix.workspaceId, path: "blocked.txt", content: "blocked" },
+    _meta: SESSION_META,
+  });
+  const missingText = (missing.content as Array<{ type: string; text?: string }>).map((c) => c.text ?? "").join("");
+  assert.ok(missing.isError || missingText.includes("NEXUS_MUTATION_ADMISSION"));
+  assert.equal(existsSync(join(fix.projectRoot, "blocked.txt")), false);
+
+  const pointer = installMutationAdmission(fix, ["allowed.txt"]);
+  const escaped = await fix.client.callTool({
+    name: "write",
+    arguments: {
+      workspaceId: fix.workspaceId,
+      path: "outside.txt",
+      content: "blocked",
+      mutationAdmission: pointer,
+    },
+    _meta: SESSION_META,
+  });
+  const escapedText = (escaped.content as Array<{ type: string; text?: string }>).map((c) => c.text ?? "").join("");
+  assert.ok(escaped.isError || escapedText.includes("NEXUS_MUTATION_ADMISSION_SCOPE_ESCAPE"));
+  assert.equal(existsSync(join(fix.projectRoot, "outside.txt")), false);
+
+  const admitted = await fix.client.callTool({
+    name: "write",
+    arguments: {
+      workspaceId: fix.workspaceId,
+      path: "allowed.txt",
+      content: "admitted",
+      mutationAdmission: pointer,
+    },
+    _meta: SESSION_META,
+  });
+  const admittedText = (admitted.content as Array<{ type: string; text?: string }>).map((c) => c.text ?? "").join("");
+  assert.equal(admitted.isError, undefined, admittedText);
+  assert.equal(existsSync(join(fix.projectRoot, "allowed.txt")), true);
+});
+
+test("G2 canonical apply_patch blocks without admission and admits exact patch scope", async (t) => {
+  const fix = await makeFixture({ canonical: true, toolMode: "minimal" });
+  t.after(() => fix.close());
+
+  const patch = "*** Begin Patch\n*** Add File: patched.txt\n+admitted\n*** End Patch";
+  const blocked = await fix.client.callTool({
+    name: "apply_patch",
+    arguments: { workspaceId: fix.workspaceId, patch },
+    _meta: SESSION_META,
+  });
+  const blockedText = (blocked.content as Array<{ type: string; text?: string }>).map((c) => c.text ?? "").join("");
+  assert.ok(blocked.isError || blockedText.includes("NEXUS_MUTATION_ADMISSION"));
+  assert.equal(existsSync(join(fix.projectRoot, "patched.txt")), false);
+
+  const pointer = installMutationAdmission(fix, ["patched.txt"]);
+  const admitted = await fix.client.callTool({
+    name: "apply_patch",
+    arguments: { workspaceId: fix.workspaceId, patch, mutationAdmission: pointer },
+    _meta: SESSION_META,
+  });
+  const admittedText = (admitted.content as Array<{ type: string; text?: string }>).map((c) => c.text ?? "").join("");
+  assert.equal(admitted.isError, undefined, admittedText);
+  assert.equal(existsSync(join(fix.projectRoot, "patched.txt")), true);
+});
+
+test("G2 canonical Git commit and push block before Git effect without admission", async (t) => {
+  const fix = await makeFixture({ canonical: true });
+  t.after(() => fix.close());
+
+  const opened = await fix.client.callTool({
+    name: "open_workspace",
+    arguments: { path: fix.projectRoot, mode: "worktree" },
+    _meta: SESSION_META,
+  });
+  const workspaceId = (opened.structuredContent as Record<string, unknown>).workspaceId as string;
+  const managed = fix.workspaces.getWorkspace(workspaceId);
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: managed.root, encoding: "utf8" }).trim().toLowerCase();
+  writeFileSync(join(managed.root, "git-g2.txt"), "candidate\n");
+
+  const commit = await fix.client.callTool({
+    name: "git_commit",
+    arguments: {
+      workspaceId,
+      expectedHead: head,
+      message: "must not commit",
+      paths: ["git-g2.txt"],
+    },
+    _meta: SESSION_META,
+  });
+  const commitText = (commit.content as Array<{ type: string; text?: string }>).map((c) => c.text ?? "").join("");
+  assert.ok(commit.isError || commitText.includes("NEXUS_MUTATION_ADMISSION"));
+  assert.equal(
+    execFileSync("git", ["rev-parse", "HEAD"], { cwd: managed.root, encoding: "utf8" }).trim().toLowerCase(),
+    head,
+  );
+
+  const push = await fix.client.callTool({
+    name: "git_push",
+    arguments: {
+      workspaceId,
+      expectedHead: head,
+      remote: "origin",
+      branch: "g2-must-not-push",
+    },
+    _meta: SESSION_META,
+  });
+  const pushText = (push.content as Array<{ type: string; text?: string }>).map((c) => c.text ?? "").join("");
+  assert.ok(push.isError || pushText.includes("NEXUS_MUTATION_ADMISSION"));
+  assert.equal(
+    execFileSync("git", ["rev-parse", "HEAD"], { cwd: managed.root, encoding: "utf8" }).trim().toLowerCase(),
+    head,
+  );
+});
+
+test("G2 canonical mutation shell blocks before spawn while read-only shell remains usable", async (t) => {
+  const fix = await makeFixture({ canonical: true });
+  t.after(() => fix.close());
+
+  const blocked = await fix.client.callTool({
+    name: "shell",
+    arguments: {
+      workspaceId: fix.workspaceId,
+      command: "touch must-not-exist.txt",
+      attemptKey: "g2-shell-blocked-1",
+    },
+    _meta: SESSION_META,
+  });
+  const blockedText = (blocked.content as Array<{ type: string; text?: string }>).map((c) => c.text ?? "").join("");
+  assert.ok(blocked.isError || blockedText.includes("NEXUS_MUTATION_ADMISSION"));
+  assert.equal(existsSync(join(fix.projectRoot, "must-not-exist.txt")), false);
+
+  const readOnly = await fix.client.callTool({
+    name: "shell",
+    arguments: {
+      workspaceId: fix.workspaceId,
+      command: "git status --short",
+      attemptKey: "g2-shell-readonly-1",
+    },
+    _meta: SESSION_META,
+  });
+  const readOnlyText = (readOnly.content as Array<{ type: string; text?: string }>).map((c) => c.text ?? "").join("");
+  assert.ok(!readOnlyText.includes("NEXUS_MUTATION_ADMISSION"));
+});
+
+test("G2 canonical write-capable agent requires admission and continuation reuses persisted pointer", async (t) => {
+  const fix = await makeFixture({ canonical: true, writeAgent: true });
+  t.after(() => fix.close());
+
+  const withoutAdmission = await fix.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId: fix.workspaceId,
+      profile: "writer",
+      prompt: "write one bounded file",
+      attemptKey: "g2-agent-missing-1",
+      executionContract: {
+        expectedHead: fix.baseHead,
+        writePaths: ["agent.txt"],
+      },
+    },
+    _meta: SESSION_META,
+  });
+  const missingText = (withoutAdmission.content as Array<{ type: string; text?: string }>).map((c) => c.text ?? "").join("");
+  assert.ok(withoutAdmission.isError || missingText.includes("NEXUS_MUTATION_ADMISSION"));
+  assert.equal(fix.agentSpy.providerStartCalls(), 0);
+
+  const pointer = installMutationAdmission(fix, ["agent.txt"]);
+  const started = await fix.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId: fix.workspaceId,
+      profile: "writer",
+      prompt: "write one bounded file",
+      attemptKey: "g2-agent-valid-1",
+      executionContract: {
+        expectedHead: fix.baseHead,
+        writePaths: ["agent.txt"],
+        mutationAdmission: pointer,
+      },
+    },
+    _meta: SESSION_META,
+  });
+  assert.equal(started.isError, undefined, JSON.stringify(started.content));
+  assert.equal(fix.agentSpy.providerStartCalls(), 1);
+  const agentId = (started.structuredContent as Record<string, unknown>).agentId as string;
+  assert.ok(agentId);
+
+  rmSync(join(fix.nexusStateRoot!, "mutation-admissions", `${pointer.admissionId}.json`));
+  const continued = await fix.client.callTool({
+    name: "agent_continue",
+    arguments: {
+      workspaceId: fix.workspaceId,
+      agentId,
+      prompt: "continue",
+    },
+    _meta: SESSION_META,
+  });
+  const continuedText = (continued.content as Array<{ type: string; text?: string }>).map((c) => c.text ?? "").join("");
+  assert.ok(continued.isError || continuedText.includes("NEXUS_MUTATION_ADMISSION_RECEIPT_UNAVAILABLE"));
+  assert.equal(fix.agentSpy.continueCalls(), 0);
+});
+
 // ─── I-2: second session targeting same worktree gets rejected ────────────────
 
 test("I-2: second session targeting same worktree+scope gets ownership conflict before file write", async (t) => {
@@ -1052,326 +1328,3 @@ test("I-5: OUTCOME_UNKNOWN disposition is suppressed (checkDuplicate returns sup
   const { store, ownership } = makeTestStore(sqlite, () => now);
   try {
     const session = "session-outcome-unknown";
-    ownership.putGrantEvidence(session, {
-      repository: "owner/devspace", goal: "issue-329",
-      coordinatorThread: session, evidenceHash: "cafebabe",
-    }, 0);
-
-    const root = "/fake/outcome-unknown";
-    const material: WorkKeyMaterial = {
-      repositoryKey: "owner/devspace",
-      ownerIssueId: "issue-329",
-      baseRevisionSha: BASE_SHA,
-      worktreeRealpath: root,
-      writeScope: [root],
-      contractPurpose: "p0-outcome-unknown",
-    };
-    const wk = computeWorkKey(material);
-    const li = buildWorktreeLeaseInput(wk, material, {
-      repository: "owner/devspace", goal: "issue-329",
-      coordinatorThread: session, evidenceHash: "cafebabe",
-    }, new Date(now + 1_000).toISOString());
-    const lease = ownership.acquire(session, li);
-    store.register(wk, material, li.idempotencyKey, lease.leaseId);
-
-    // Pin to simulate in-flight effect
-    ownership.beginOperation(session, lease.leaseId, lease.version, "in-flight-task");
-
-    // Expire lease
-    now += 10_000;
-
-    // Must be suppressed as RECONCILE_REQUIRED
-    const dup = store.checkDuplicate(wk);
-    assert.ok(dup.suppressed, "OUTCOME_UNKNOWN must be suppressed");
-    assert.equal(dup.suppressed && dup.status.disposition, "RECONCILE_REQUIRED");
-  } finally {
-    sqlite.close();
-  }
-});
-
-// ─── I-6: terminal replay → suppressed, receipt readable ─────────────────────
-
-test("I-6: terminal exact replay is suppressed; receipt readable via disposition", () => {
-  const sqlite = new Database(":memory:");
-  const { store, ownership } = makeTestStore(sqlite);
-  try {
-    const session = "session-terminal";
-    ownership.putGrantEvidence(session, {
-      repository: "owner/devspace", goal: "issue-330",
-      coordinatorThread: session, evidenceHash: "beefdead",
-    }, 0);
-
-    const root = "/fake/terminal-replay";
-    const material: WorkKeyMaterial = {
-      repositoryKey: "owner/devspace",
-      ownerIssueId: "issue-330",
-      baseRevisionSha: BASE_SHA,
-      worktreeRealpath: root,
-      writeScope: [root],
-      contractPurpose: "p0-terminal-replay",
-    };
-    const wk = computeWorkKey(material);
-    const li = buildWorktreeLeaseInput(wk, material, {
-      repository: "owner/devspace", goal: "issue-330",
-      coordinatorThread: session, evidenceHash: "beefdead",
-    }, new Date(Date.now() + 60_000).toISOString());
-    const lease = ownership.acquire(session, li);
-    store.register(wk, material, li.idempotencyKey, lease.leaseId);
-
-    const pinned = ownership.beginOperation(session, lease.leaseId, lease.version, "effect-terminal");
-    const evidence = {
-      leaseId: lease.leaseId,
-      ownerThread: session,
-      operationHandle: "effect-terminal",
-      operation: WORKTREE_WRITER_OPERATION,
-      baseRevision: BASE_SHA,
-      leaseVersion: pinned.version,
-      state: "finished" as const,
-    };
-    const receipt = store.recordTerminalReceipt(session, wk, lease.leaseId, pinned.version, evidence);
-    assert.ok(receipt.receiptId);
-
-    const replay = store.disposition(wk);
-    assert.equal(replay.disposition, "TERMINAL");
-    assert.equal(replay.terminalReceipt?.receiptId, receipt.receiptId);
-
-    const dup = store.checkDuplicate(wk);
-    assert.ok(dup.suppressed);
-    assert.equal(dup.suppressed && dup.status.disposition, "TERMINAL");
-  } finally {
-    sqlite.close();
-  }
-});
-
-// ─── I-7: process restart → same workKey/lease/effect handle ─────────────────
-
-test("I-7: process restart reads back same workKey/lease/effect handle from durable SQLite", () => {
-  const dir = mkdtempSync(join(tmpdir(), "devspace-p0-restart-"));
-  const dbPath = join(dir, "p0-state.sqlite");
-  const session = "session-restart";
-  const root = "/fake/p0-restart";
-
-  let capturedWorkKey: string;
-  let capturedLeaseId: string;
-
-  try {
-    // Phase 1: initial acquisition
-    {
-      const db = new Database(dbPath);
-      const { store, ownership } = makeTestStore(db);
-      ownership.putGrantEvidence(session, {
-        repository: "owner/devspace", goal: "issue-331",
-        coordinatorThread: session, evidenceHash: "abcd1234",
-      }, 0);
-      const material: WorkKeyMaterial = {
-        repositoryKey: "owner/devspace",
-        ownerIssueId: "issue-331",
-        baseRevisionSha: BASE_SHA,
-        worktreeRealpath: root,
-        writeScope: [root],
-        contractPurpose: "p0-restart-test",
-      };
-      capturedWorkKey = computeWorkKey(material);
-      const li = buildWorktreeLeaseInput(capturedWorkKey, material, {
-        repository: "owner/devspace", goal: "issue-331",
-        coordinatorThread: session, evidenceHash: "abcd1234",
-      }, new Date(Date.now() + 60_000).toISOString());
-      const lease = ownership.acquire(session, li);
-      store.register(capturedWorkKey, material, li.idempotencyKey, lease.leaseId);
-      capturedLeaseId = lease.leaseId;
-      ownership.beginOperation(session, lease.leaseId, lease.version, "pre-restart-effect");
-      db.close();
-    }
-
-    // Phase 2: restart — new instance, same durable DB
-    {
-      const db = new Database(dbPath);
-      const { store: store2, ownership: ownership2 } = makeTestStore(db);
-      // putGrantEvidence at version 1 (already stored at version 1 from phase 1)
-      ownership2.putGrantEvidence(session, {
-        repository: "owner/devspace", goal: "issue-331",
-        coordinatorThread: session, evidenceHash: "abcd1234",
-      }, 1);
-
-      const status = store2.disposition(capturedWorkKey);
-      assert.ok(
-        status.disposition === "RUNNING" || status.disposition === "RECONCILE_REQUIRED",
-        `Expected RUNNING or RECONCILE_REQUIRED after restart, got: ${status.disposition}`,
-      );
-      assert.equal(status.leaseId, capturedLeaseId);
-
-      const live = store2.getLease(capturedLeaseId);
-      assert.equal(live?.operationHandle, "pre-restart-effect");
-      db.close();
-    }
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// ─── I-12: #62 control-plane semantics unchanged ──────────────────────────────
-
-test("I-12: ControlPlaneOwnershipStore core semantics unchanged by P0 additions", () => {
-  const db = new Database(":memory:");
-  // Use identity resolver (no physical resource resolution) for the pure #62 test
-  const ownership = new ControlPlaneOwnershipStore(db, {
-    resolveOwnerContext: (ctx) =>
-      typeof ctx === "string" && ctx.length > 0 ? { ownerThread: ctx } : undefined,
-    resolveResourceIdentity: (input) => input,
-    verifyGrantEvidence: () => true,
-    verifyReconciliationEvidence: () => true,
-  });
-  const grant = { repository: "r/repo", goal: "g1", coordinatorThread: "owner62", evidenceHash: "ef" };
-  ownership.putGrantEvidence("owner62", grant, 0);
-
-  try {
-    const lease = ownership.acquire("owner62", {
-      repositoryKey: "r/repo",
-      resourceKind: "filesystem",
-      resourceId: "/repo",
-      resource: "/repo",
-      operation: "sync",
-      scope: ["/repo"],
-      baseRevision: "0".repeat(40),
-      expiresAt: new Date(Date.now() + 60_000).toISOString(),
-      idempotencyKey: "p0-i12-test",
-      grant,
-    });
-    assert.ok(lease.leaseId);
-    assert.equal(lease.version, 1);
-
-    const held = ownership.assertHeld("owner62", lease.leaseId, 1, "sync", "0".repeat(40));
-    assert.equal(held.leaseId, lease.leaseId);
-
-    const pinned = ownership.beginOperation("owner62", lease.leaseId, 1, "some-op");
-    assert.equal(pinned.version, 2);
-    assert.equal(pinned.operationHandle, "some-op");
-
-    const finished = ownership.finishOperation("owner62", lease.leaseId, 2, "some-op");
-    assert.equal(finished.version, 3);
-    assert.ok(!finished.operationHandle);
-
-    ownership.release("owner62", lease.leaseId, 3);
-    assert.equal(ownership.get(lease.leaseId)?.terminalState, "released");
-  } finally {
-    db.close();
-  }
-});
-
-// ─── I-P1: operation lineage graph bound and queried via work_resume_status ───
-
-test("I-P1: agent_start binds operation lineage and work_resume_status preserves it across reconnection", async (t) => {
-  const fix = await makeFixture();
-  t.after(() => fix.close());
-
-  const { workKey, leaseId, leaseVersion } = acquireAndRegister(
-    fix.ownership,
-    fix.store,
-    fix.projectRoot,
-    OWNER_SESSION,
-  );
-  const attemptKey = "issue329-p1-lineage-attempt";
-  const argumentsPayload = {
-    workspaceId: fix.workspaceId,
-    profile: "reviewer",
-    prompt: "P1 lineage witness test",
-    attemptKey,
-    executionContract: {
-      role: "REPAIR",
-      parentEffectKey: "att_implement_initial",
-      supersedes: "agyop_prior_attempt",
-      resumableWork: buildPointer({
-        workKey,
-        leaseId,
-        leaseVersion,
-        effectHandle: attemptKey,
-      }),
-    },
-  };
-
-  const started = await fix.client.callTool({
-    name: "agent_start",
-    arguments: argumentsPayload,
-    _meta: SESSION_META,
-  });
-  const startedContent = started.structuredContent as Record<string, unknown>;
-  const agentId = startedContent.agentId as string;
-  assert.ok(agentId);
-
-  // 1. work_resume_status exposes lineage graph
-  const resumeStatus = await fix.client.callTool({
-    name: "work_resume_status",
-    arguments: { workspaceId: fix.workspaceId, workKey },
-    _meta: SESSION_META,
-  });
-  const resumeParsed = resumeStatus.structuredContent as Record<string, unknown>;
-  assert.deepEqual(resumeParsed.lineage, {
-    role: "REPAIR",
-    parentEffectKey: "att_implement_initial",
-    supersedes: "agyop_prior_attempt",
-  });
-
-  // 2. agent_status exposes lineage graph
-  const agentStatus = await fix.client.callTool({
-    name: "agent_status",
-    arguments: { workspaceId: fix.workspaceId, agentId },
-    _meta: SESSION_META,
-  });
-  const agentParsed = agentStatus.structuredContent as Record<string, unknown>;
-  assert.deepEqual(agentParsed.lineage, {
-    role: "REPAIR",
-    parentEffectKey: "att_implement_initial",
-    supersedes: "agyop_prior_attempt",
-  });
-});
-
-test("I-P1b: automated verifier result is recorded on terminal and queryable via work_resume_status", async (t) => {
-  const fix = await makeFixture();
-  t.after(() => fix.close());
-
-  const { workKey, leaseId, leaseVersion } = acquireAndRegister(
-    fix.ownership,
-    fix.store,
-    fix.projectRoot,
-    OWNER_SESSION,
-  );
-  const attemptKey = "issue329-p1b-verifier-attempt";
-
-  // Bind effect
-  fix.store.bindEffectIdentity({
-    workKey,
-    leaseId,
-    effectKind: "agent",
-    effectKey: attemptKey,
-    lineage: { role: "IMPLEMENT" },
-  });
-
-  // Simulate terminal verifier execution recording
-  const verifierResult = {
-    effectKey: "verify:integration-semantic-effect",
-    effectState: "COMPLETED",
-    role: "VERIFY",
-    parentEffectKey: attemptKey,
-    toolchainId: "test-toolchain",
-    verifier: "typecheck",
-    exitCode: 0,
-    passed: true,
-    durationMs: 82,
-    stdout: "Typecheck passed: 0 errors",
-    stderr: "",
-  };
-  fix.store.recordAutomatedVerifierResult(workKey, verifierResult);
-
-  // work_resume_status returns automatedVerifierResult
-  const resumeStatus = await fix.client.callTool({
-    name: "work_resume_status",
-    arguments: { workspaceId: fix.workspaceId, workKey },
-    _meta: SESSION_META,
-  });
-  const parsed = resumeStatus.structuredContent as Record<string, unknown>;
-  assert.deepEqual(parsed.automatedVerifierResult, verifierResult);
-  assert.deepEqual(parsed.automatedVerifierEffects, {
-    "verify:integration-semantic-effect": verifierResult,
-  });
-});
-

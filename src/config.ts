@@ -91,6 +91,11 @@ export interface ServerConfig {
    * Bound at startup; runtime identity mismatch → CORE_RUNTIME_UNAVAILABLE_OR_MISMATCH.
    */
   coreAcquisitionRuntimeDigest?: string;
+  /**
+   * Explicit Nexus-owned canonical state root used only to consume durable
+   * mutation-admission receipts. DevSpace never mints or mutates this state.
+   */
+  nexusMutationAdmissionStateRoot?: string;
 }
 
 function parsePort(value: string | number | undefined): number {
@@ -501,6 +506,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     coreAcquisitionExecutable: env.DEVSPACE_CORE_ACQUISITION_EXECUTABLE?.trim() || undefined,
     coreAcquisitionExpectedSourceRevision: parseCoreAcquisitionRevision(env.DEVSPACE_CORE_ACQUISITION_EXPECTED_SOURCE_REVISION),
     coreAcquisitionRuntimeDigest: env.DEVSPACE_CORE_ACQUISITION_RUNTIME_DIGEST?.trim() || undefined,
+    nexusMutationAdmissionStateRoot: env.DEVSPACE_NEXUS_MUTATION_ADMISSION_STATE_ROOT?.trim()
+      ? resolve(expandHomePath(env.DEVSPACE_NEXUS_MUTATION_ADMISSION_STATE_ROOT.trim()))
+      : undefined,
   };
 }
 

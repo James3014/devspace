@@ -22,6 +22,10 @@ import {
   parseResumableWorkPointer,
   type ResumableWorkPointer,
 } from "./work-resume.js";
+import {
+  parseNexusMutationAdmissionPointer,
+  type NexusMutationAdmissionPointer,
+} from "./nexus-mutation-admission.js";
 
 /**
  * Structured execution contract for a DevSpace subagent turn.
@@ -101,6 +105,11 @@ export interface ExecutionContract {
   /** Exact pointer to an already-open Core-bound mutation session. */
   coreMutation?: { sessionId: string; bindingHash: string };
   /**
+   * Exact pointer to a Nexus-owned durable mutation admission. Consumers
+   * re-read canonical Nexus state; this pointer grants no authority by itself.
+   */
+  mutationAdmission?: NexusMutationAdmissionPointer;
+  /**
    * If supplied, agent_start fails closed when the workspace HEAD no longer
    * matches before any worker mutation.
    */
@@ -116,10 +125,10 @@ export interface ExecutionContract {
   /** Toolchain id used to resolve verifier executables outside the model prompt. */
   toolchainId?: string;
   /**
-   * P0 resumable-work pointer.  When supplied, all write-capable sinks MUST
+   * P0 resumable-work pointer. When supplied, all write-capable sinks MUST
    * call centralAdmissionCheck with this pointer before launching any provider,
-   * file, git, or process effect.  Legacy callers that do not supply this field
-   * remain fully compatible and bypass the P0 fencing lane.
+   * file, git, or process effect. This remains writer lease/replay authority;
+   * it is separate from Nexus mutation admission.
    */
   resumableWork?: ResumableWorkPointer;
   /** Optional wall-clock bound for the whole agent turn (turn start -> terminal). */
@@ -375,6 +384,17 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
       throw new Error("executionContract.coreMutation requires exact sessionId and bindingHash.");
     }
     contract.coreMutation = { sessionId: coreMutation.sessionId, bindingHash: coreMutation.bindingHash };
+  }
+
+  if (record.mutationAdmission !== undefined) {
+    try {
+      const pointer = parseNexusMutationAdmissionPointer(record.mutationAdmission);
+      if (pointer) contract.mutationAdmission = pointer;
+    } catch (err) {
+      throw new Error(
+        `executionContract.mutationAdmission is invalid: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   if (record.expectedHead !== undefined) {
