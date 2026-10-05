@@ -10,6 +10,11 @@ import {
   WorkResumeStore,
 } from "./work-resume.js";
 import { createHash, randomUUID } from "node:crypto";
+import {
+  NexusMutationAdmissionError,
+  NexusMutationAdmissionResolver,
+  type NexusMutationAdmissionBinding,
+} from "./nexus-mutation-admission.js";
 import { readFileSync } from "node:fs";
 import { access, lstat, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
@@ -475,6 +480,11 @@ const DIRECT_DISPATCH_TOOL_NAMES = new Set<string>([
 
 const workspaceIdDescription =
   "Workspace to use. Reuse the current project's workspaceId.";
+
+const mutationAdmissionBindingSchema = () => z.object({
+  admissionId: z.string().regex(/^admission-[0-9a-f]{32}$/),
+  receiptHash: z.string().regex(/^[0-9a-f]{64}$/),
+}).strict();
 
 interface ToolLogFields {
   tool: string;
@@ -3315,6 +3325,49 @@ export function createMcpServer(
     ? createDirectDispatchAgentStartInputSchema()
     : createAgentStartInputSchema();
   const agentPreflightInputSchema = createAgentPreflightInputSchema();
+  const nexusMutationAdmissions = new NexusMutationAdmissionResolver(
+    config.nexusMutationAdmissionStateDir,
+  );
+
+  const currentWorkspaceHead = async (workspaceRoot: string): Promise<string | undefined> => {
+    try {
+      const head = (await runGit(workspaceRoot, ["rev-parse", "HEAD"])).stdout.trim().toLowerCase();
+      return /^[0-9a-f]{40}$/.test(head) ? head : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const authorizeNexusMutation = async (input: {
+    workspaceRoot: string;
+    binding?: NexusMutationAdmissionBinding;
+    requestedPaths?: string[];
+    expectedBase?: string;
+    publicationHead?: string;
+  }): Promise<void> => {
+    try {
+      if (input.publicationHead) {
+        await nexusMutationAdmissions.authorizePublication({
+          workspaceRoot: input.workspaceRoot,
+          binding: input.binding,
+          candidateHead: input.publicationHead.toLowerCase(),
+        });
+        return;
+      }
+      const expectedBase = input.expectedBase ?? await currentWorkspaceHead(input.workspaceRoot);
+      await nexusMutationAdmissions.authorizeWorkspaceMutation({
+        workspaceRoot: input.workspaceRoot,
+        binding: input.binding,
+        expectedBase,
+        requestedPaths: input.requestedPaths,
+      });
+    } catch (error) {
+      if (error instanceof NexusMutationAdmissionError) {
+        throw new Error(`[NEXUS_MUTATION_ADMISSION_FAILED:${error.code}] ${error.message}`);
+      }
+      throw error;
+    }
+  };
 
   const hostStorageInput = () => {
     const workspaceSessions = workspaces.listSessions();
