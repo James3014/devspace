@@ -1307,6 +1307,7 @@ interface ServerFixture {
   stateDir: string;
   processSessions: ProcessSessionManager;
   coreMutationSessions?: CoreMutationSessionStore;
+  nexusMutationAdmissionStateDir?: string;
   close: () => Promise<void>;
 }
 
@@ -1323,14 +1324,21 @@ async function fixture(
     controlPlaneInventory?: ControlPlaneInventory;
     coreMutation?: boolean | "enforced_missing";
     coreMutationRecoveryOwnerClientId?: string;
+    nexusMutationAdmission?: boolean;
   } = {},
 ): Promise<ServerFixture> {
   const root = await mkdtemp(join(tmpdir(), "devspace-server-test-"));
   const project = join(root, "project");
   const agentDir = join(root, "agent");
   const stateDir = join(root, ".state");
+  const nexusMutationAdmissionStateDir = options.nexusMutationAdmission
+    ? join(root, ".nexus-state")
+    : undefined;
 
   await mkdir(join(project, ".devspace", "agents"), { recursive: true });
+  if (nexusMutationAdmissionStateDir) {
+    await mkdir(join(nexusMutationAdmissionStateDir, "mutation-admissions"), { recursive: true });
+  }
   await mkdir(agentDir, { recursive: true });
   await writeFile(join(agentDir, "AGENTS.md"), "global instructions\n");
   await writeFile(join(project, "AGENTS.md"), "project instructions\n");
@@ -1373,6 +1381,7 @@ async function fixture(
     DEVSPACE_TOOLCHAINS: options.toolchains,
     DEVSPACE_CHAT_SWARM: options.chatSwarm ? "1" : "0",
     DEVSPACE_CORE_MUTATION_RECOVERY_OWNER_CLIENT_ID: options.coreMutationRecoveryOwnerClientId,
+    DEVSPACE_NEXUS_MUTATION_ADMISSION_STATE_DIR: nexusMutationAdmissionStateDir,
   });
   let config: ServerConfig = {
     ...loadedConfig,
@@ -1464,7 +1473,16 @@ async function fixture(
     await rm(root, { recursive: true, force: true });
   });
 
-  return { client, project, config, stateDir, processSessions, coreMutationSessions, close };
+  return {
+    client,
+    project,
+    config,
+    stateDir,
+    processSessions,
+    coreMutationSessions,
+    nexusMutationAdmissionStateDir,
+    close,
+  };
 }
 
 function testControlPlaneInventory(): ControlPlaneInventory {
@@ -1703,6 +1721,69 @@ test("enabled server startup explicitly reconciles a previously claimed task", a
 
 async function git(cwd: string, args: string[]): Promise<void> {
   await execFileAsync("git", args, { cwd });
+}
+
+function canonicalAdmissionJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalAdmissionJson).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalAdmissionJson(record[key])}`).join(",")}}`;
+}
+
+async function writeTestMutationAdmission(input: {
+  stateRoot: string;
+  workspaceRoot: string;
+  operationId: string;
+  allowedPaths: string[];
+}): Promise<{ admissionId: string; operationId: string; receiptHash: string }> {
+  const base = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: input.workspaceRoot })).stdout.trim().toLowerCase();
+  const admissionId = "admission-" + createHash("sha256").update(input.operationId).digest("hex").slice(0, 32);
+  const issued = new Date(Date.now() - 60_000);
+  const expires = new Date(Date.now() + 3_600_000);
+  const request = {
+    operation_id: input.operationId,
+    repository: "James3014/devspace",
+    base_sha: base,
+    execution_lane: "DIRECT_CANONICAL",
+    authority_kind: "OWNER_INLINE",
+    allowed_paths: input.allowedPaths,
+    issue_number: 362,
+    task_id: null,
+    attempt_id: null,
+    task_card_path: null,
+    task_card_hash: null,
+    governance_source_head: null,
+    ttl_minutes: 60,
+  };
+  const requestHash = createHash("sha256").update(canonicalAdmissionJson(request)).digest("hex");
+  const payload: Record<string, unknown> = {
+    schema: "nexus.mutation_admission.v1",
+    admission_id: admissionId,
+    ...request,
+    issued_at: issued.toISOString(),
+    expires_at: expires.toISOString(),
+    runtime_identity: { test: true },
+    authority_reference: {
+      schema: "nexus.standing_grant_effect_authorization.v1",
+      owner_id: "James3014",
+      action: "TASK_SUBMIT",
+      mutation_authorized: true,
+    },
+    request_hash: requestHash,
+    receipt_hash: "",
+  };
+  const hashPayload = { ...payload };
+  delete hashPayload.receipt_hash;
+  const receiptHash = createHash("sha256")
+    .update(canonicalAdmissionJson(hashPayload))
+    .digest("hex");
+  payload.receipt_hash = receiptHash;
+  await writeFile(
+    join(input.stateRoot, "mutation-admissions", `${admissionId}.json`),
+    JSON.stringify(payload, null, 2) + "\n",
+    "utf8",
+  );
+  return { admissionId, operationId: input.operationId, receiptHash };
 }
 
 async function callOpen(
@@ -3534,6 +3615,146 @@ test("Issue #238: MCP tool catalog identity changes with conditional Git Candida
     mcpToolCatalogGeneration(withoutTools),
     mcpToolCatalogGeneration(withTools),
   );
+});
+
+test("canonical managed mutation sinks consume Nexus mutation admission", async (t) => {
+  const context = await fixture(t, {
+    git: true,
+    gitCandidates: true,
+    nexusMutationAdmission: true,
+  });
+  assert.ok(context.nexusMutationAdmissionStateDir);
+  await git(context.project, ["remote", "add", "origin", "https://github.com/James3014/devspace.git"]);
+  const bare = join(dirname(context.project), "admission-remote.git");
+  await execFileAsync("git", ["init", "--bare", bare]);
+  await git(context.project, ["remote", "add", "test", bare]);
+
+  const conversation = { "openai/session": "issue362-admission" };
+  const opened = await callOpen(context.client, context.project, "issue362-admission", "worktree");
+  const workspaceId = structuredContent(opened).workspaceId as string;
+  const workspaceRoot = structuredContent(opened).root as string;
+  const base = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspaceRoot })).stdout.trim();
+
+  const readOnly = await context.client.callTool({
+    name: "read",
+    arguments: { workspaceId, path: "README.md" },
+    _meta: conversation,
+  });
+  assert.equal(readOnly.isError, undefined, responseText(readOnly));
+
+  const blockedWrite = await context.client.callTool({
+    name: "write",
+    arguments: { workspaceId, path: "admitted.txt", content: "admitted\n" },
+    _meta: conversation,
+  });
+  assert.equal(blockedWrite.isError, true);
+  assert.match(responseText(blockedWrite), /NEXUS_MUTATION_ADMISSION_REQUIRED/);
+
+  const mutationAdmission = await writeTestMutationAdmission({
+    stateRoot: context.nexusMutationAdmissionStateDir!,
+    workspaceRoot,
+    operationId: "devspace:issue362:mcp-managed-mutation",
+    allowedPaths: ["admitted.txt"],
+  });
+
+  const written = await context.client.callTool({
+    name: "write",
+    arguments: { workspaceId, path: "admitted.txt", content: "admitted\n", mutationAdmission },
+    _meta: conversation,
+  });
+  assert.equal(written.isError, undefined, responseText(written));
+
+  const blockedCommit = await context.client.callTool({
+    name: "git_commit",
+    arguments: {
+      workspaceId,
+      expectedHead: base,
+      message: "test: blocked without Nexus admission",
+      paths: ["admitted.txt"],
+    },
+    _meta: conversation,
+  });
+  assert.equal(blockedCommit.isError, true);
+  assert.match(responseText(blockedCommit), /NEXUS_MUTATION_ADMISSION_REQUIRED/);
+
+  const committed = await context.client.callTool({
+    name: "git_commit",
+    arguments: {
+      workspaceId,
+      expectedHead: base,
+      message: "test: admitted Candidate",
+      paths: ["admitted.txt"],
+      mutationAdmission,
+    },
+    _meta: conversation,
+  });
+  assert.equal(committed.isError, undefined, responseText(committed));
+  const candidateHead = structuredContent(committed).commitSha as string;
+  const candidateTree = structuredContent(committed).treeSha as string;
+
+  const blockedPush = await context.client.callTool({
+    name: "git_push",
+    arguments: {
+      workspaceId,
+      expectedHead: candidateHead,
+      remote: "test",
+      branch: "issue362-blocked",
+    },
+    _meta: conversation,
+  });
+  assert.equal(blockedPush.isError, true);
+  assert.match(responseText(blockedPush), /NEXUS_MUTATION_ADMISSION_REQUIRED/);
+
+  const pushed = await context.client.callTool({
+    name: "git_push",
+    arguments: {
+      workspaceId,
+      expectedHead: candidateHead,
+      remote: "test",
+      branch: "issue362-admitted",
+      mutationAdmission,
+    },
+    _meta: conversation,
+  });
+  assert.equal(pushed.isError, undefined, responseText(pushed));
+  assert.equal(structuredContent(pushed).pushedSha, candidateHead);
+
+  const blockedIntegrate = await context.client.callTool({
+    name: "candidate_integrate",
+    arguments: {
+      sourceWorkspaceId: workspaceId,
+      candidateBase: base,
+      candidateHead,
+      destinationWorkspaceId: workspaceId,
+      expectedDestinationHead: candidateHead,
+      dirtyPolicy: "pristine",
+      confirmApply: true,
+    },
+    _meta: conversation,
+  });
+  assert.equal(blockedIntegrate.isError, true);
+  assert.match(responseText(blockedIntegrate), /NEXUS_MUTATION_ADMISSION_REQUIRED/);
+
+  const blockedPromote = await context.client.callTool({
+    name: "git_promote_candidate",
+    arguments: {
+      sourceWorkspaceId: workspaceId,
+      candidateBase: base,
+      candidateHead,
+      candidateTree,
+      destinationWorkspaceId: workspaceId,
+      expectedDestinationBranch: "main",
+      expectedDestinationHead: candidateHead,
+      expectedServerInstanceId: "test-server",
+      expectedSourceCommit: "test-source",
+      expectedBuildId: "test-build",
+      expectedCapabilityManifestSha256: "a".repeat(64),
+      confirmPromote: true,
+    },
+    _meta: conversation,
+  });
+  assert.equal(blockedPromote.isError, true);
+  assert.match(responseText(blockedPromote), /NEXUS_MUTATION_ADMISSION_REQUIRED/);
 });
 
 test("gitCandidates enabled: git tools are present with schema validation", async (t) => {
