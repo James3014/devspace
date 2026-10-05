@@ -1360,6 +1360,13 @@ function registerCodexGoalTools(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
   goals: CodexGoalSessionManager,
+  authorizeNexusMutation: (input: {
+    workspaceRoot: string;
+    binding?: NexusMutationAdmissionBinding;
+    requestedPaths?: string[];
+    expectedBase?: string;
+    publicationHead?: string;
+  }) => Promise<void>,
   coreMutation?: CoreMutationGuard,
 ): void {
   const GOAL_START_ANNOTATIONS = {
@@ -1393,6 +1400,9 @@ function registerCodexGoalTools(
           .regex(/^[0-9a-fA-F]{40}$/, "expectedHead must be a valid 40-character commit SHA.")
           .optional()
           .describe("Exact 40-character Git HEAD the workspace must be at before launch. Required for Git workspaces; start fails closed when missing or mismatched."),
+        mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+          "Nexus-owned mutation admission pointer. Required for canonical-repository Codex mutation.",
+        ),
       },
       outputSchema: {
         goalId: z.string(),
@@ -1416,10 +1426,15 @@ function registerCodexGoalTools(
       _meta: {},
       annotations: GOAL_START_ANNOTATIONS,
     },
-    async ({ workspaceId, goal, model, reasoningEffort, expectedHead }, extra) => {
+    async ({ workspaceId, goal, model, reasoningEffort, expectedHead, mutationAdmission }, extra) => {
       const startedAt = performance.now();
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
+      await authorizeNexusMutation({
+        workspaceRoot: workspace.root,
+        binding: mutationAdmission,
+        expectedBase: expectedHead,
+      });
       const coreAdmission = coreMutation
         ? await coreMutation.admit({ workspaceId, extra, pathContainment: "NOT_PROVEN", writerDomain: "PROCESS" })
         : undefined;
@@ -1432,6 +1447,7 @@ function registerCodexGoalTools(
           ...(model ? { model } : {}),
           ...(reasoningEffort ? { reasoningEffort } : {}),
           ...(expectedHead ? { expectedHead } : {}),
+          ...(mutationAdmission ? { mutationAdmission } : {}),
           ...(coreAdmission?.bound
             ? { coreMutation: { sessionId: coreAdmission.sessionId!, bindingHash: coreAdmission.bindingHash! } }
             : {}),
@@ -1542,7 +1558,12 @@ function registerCodexGoalTools(
     },
     async ({ workspaceId, goalId, message }, extra) => {
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
-      workspaces.getWorkspace(workspaceId);
+      const workspace = workspaces.getWorkspace(workspaceId);
+      await authorizeNexusMutation({
+        workspaceRoot: workspace.root,
+        binding: goals.getMutationAdmissionBinding(workspaceId, goalId),
+        expectedBase: goals.getBaseHead(workspaceId, goalId),
+      });
       let coreAdmission: CoreMutationAdmission | undefined;
       if (coreMutation) {
         const active = coreMutation.active(workspaceId);
@@ -5597,7 +5618,7 @@ export function createMcpServer(
   // exposes only special-purpose goal actions; generic exec_command/write_stdin
   // stay hidden outside codex mode.
   if (config.codexGoalsEnabled && codexGoals) {
-    registerCodexGoalTools(server, config, workspaces, codexGoals, coreMutationGuard);
+    registerCodexGoalTools(server, config, workspaces, codexGoals, authorizeNexusMutation, coreMutationGuard);
   }
 
   if (config.artifactsEnabled && isArtifactDownloadSupportedPlatform()) {
