@@ -46,6 +46,7 @@ const executableDownloadHooks: Pick<ArtifactDownloadInput, "testHooks"> =
 try {
   testOneToolContract();
   testPlatformSupportContract();
+  await testNexusAdmissionPrecedesAdapterOpen(join(root, "nexus-admission"));
   await testCoreAdmissionPrecedesAdapterOpen(join(root, "core-admission"));
   if (!isArtifactDownloadSupportedPlatform()) {
     await testUnsupportedPlatform(join(root, "unsupported-platform"));
@@ -85,13 +86,17 @@ function testOneToolContract(): void {
       logging: { toolCalls: false },
     } as never,
     workspaces: {} as never,
+    authorizeNexusMutation: async () => {},
   });
 
   assert.deepEqual([...registered.keys()], ["download_artifact"]);
   const descriptor = registered.get("download_artifact")?.descriptor;
   assert.ok(descriptor);
   assert.deepEqual(descriptor._meta, { "openai/fileParams": ["file"] });
-  assert.deepEqual(Object.keys(descriptor.inputSchema as object).sort(), ["file", "path", "workspaceId"]);
+  assert.deepEqual(
+    Object.keys(descriptor.inputSchema as object).sort(),
+    ["file", "mutationAdmission", "path", "workspaceId"],
+  );
   assert.deepEqual(Object.keys(descriptor.outputSchema as object).sort(), ["coreMutation", "path"]);
   assert.equal((descriptor.annotations as { destructiveHint?: boolean }).destructiveHint, false);
 
@@ -112,6 +117,61 @@ function testOneToolContract(): void {
   });
   assert.equal(rejected.success, false);
   assert.equal(JSON.stringify(rejected).includes(sensitiveExtraValue), false);
+}
+
+async function testNexusAdmissionPrecedesAdapterOpen(testRoot: string): Promise<void> {
+  const workspaceRoot = join(testRoot, "workspace");
+  const stateDir = join(testRoot, "state");
+  await mkdir(workspaceRoot, { recursive: true });
+  let adapterOpenCount = 0;
+  let coreAdmissionCount = 0;
+  let requestedPaths: readonly string[] | undefined;
+  let callback: ((input: Record<string, unknown>, extra: Record<string, unknown>) => Promise<unknown>) | undefined;
+  const server = {
+    registerTool(
+      _name: string,
+      _descriptor: Record<string, unknown>,
+      handler: (input: Record<string, unknown>, extra: Record<string, unknown>) => Promise<unknown>,
+    ) {
+      callback = handler;
+      return {};
+    },
+  };
+  const adapter: IncomingArtifactAdapter = {
+    id: "counting-adapter",
+    canHandle: () => true,
+    async open() {
+      adapterOpenCount += 1;
+      return { name: "blocked.txt", stream: Readable.from(["must not open"]) };
+    },
+  };
+  registerArtifactTools(server as never, {
+    config: { stateDir, artifactMaxFileBytes: 1024, logging: { toolCalls: false } } as never,
+    workspaces: {
+      getWorkspace: () => ({ id: "ws_nexus_unbound_artifact", root: workspaceRoot }),
+    } as never,
+    incomingArtifactAdapters: [adapter],
+    authorizeNexusMutation: async (request) => {
+      requestedPaths = request.requestedPaths;
+      throw new Error("[NEXUS_MUTATION_ADMISSION_FAILED:NEXUS_MUTATION_ADMISSION_REQUIRED] binding required before download");
+    },
+    coreMutation: {
+      admit: async () => {
+        coreAdmissionCount += 1;
+        return undefined;
+      },
+    } as never,
+  });
+  assert.ok(callback);
+  await assert.rejects(
+    callback!({ workspaceId: "ws_nexus_unbound_artifact", file: { native: true }, path: "nested/./blocked.txt" }, {}),
+    /NEXUS_MUTATION_ADMISSION_REQUIRED/,
+  );
+  assert.deepEqual(requestedPaths, ["nested/blocked.txt"]);
+  assert.equal(coreAdmissionCount, 0, "Nexus admission must run before Core mutation admission");
+  assert.equal(adapterOpenCount, 0, "unadmitted download must not open the source adapter");
+  assert.deepEqual(await readdir(workspaceRoot), [], "unadmitted download must not create destination bytes");
+  await assert.rejects(stat(stateDir), { code: "ENOENT" });
 }
 
 async function testCoreAdmissionPrecedesAdapterOpen(testRoot: string): Promise<void> {
@@ -145,6 +205,7 @@ async function testCoreAdmissionPrecedesAdapterOpen(testRoot: string): Promise<v
       getWorkspace: () => ({ id: "ws_unbound_artifact", root: workspaceRoot }),
     } as never,
     incomingArtifactAdapters: [adapter],
+    authorizeNexusMutation: async () => {},
     coreMutation: {
       admit: async (request: { paths: readonly string[] }) => {
         admittedPaths = request.paths;
