@@ -4604,10 +4604,16 @@ test("stranded session with SYNCHRONOUS_GIT is physically reconciled on retry an
     allowedPaths: ["recovery.txt"],
     workspaceMode: "managed_worktree",
   });
+  const mutationAdmission = await writeTestMutationAdmission({
+    stateRoot: context.nexusMutationAdmissionStateDir!,
+    workspaceRoot,
+    operationId: "devspace:test:core-stranded-reconcile",
+    allowedPaths: ["recovery.txt"],
+  });
 
   await context.client.callTool({
     name: "write",
-    arguments: { workspaceId, path: "recovery.txt", content: "recoverable content\n" },
+    arguments: { workspaceId, path: "recovery.txt", content: "recoverable content\n", mutationAdmission },
     _meta: conversation,
   });
 
@@ -4632,7 +4638,7 @@ test("stranded session with SYNCHRONOUS_GIT is physically reconciled on retry an
   // First call to git_commit: fails closed with CORE_MUTATION_RECONCILED_RETRY_REQUIRED and does NOT commit
   const firstAttempt = await context.client.callTool({
     name: "git_commit",
-    arguments: { workspaceId, expectedHead: bound.head, message: "attempt commit on stranded session", paths: ["recovery.txt"] },
+    arguments: { workspaceId, expectedHead: bound.head, message: "attempt commit on stranded session", paths: ["recovery.txt"], mutationAdmission },
     _meta: conversation,
   });
   assert.equal(firstAttempt.isError, true);
@@ -4648,7 +4654,7 @@ test("stranded session with SYNCHRONOUS_GIT is physically reconciled on retry an
   // Second call to git_commit: now succeeds cleanly!
   const secondAttempt = await context.client.callTool({
     name: "git_commit",
-    arguments: { workspaceId, expectedHead: bound.head, message: "retry commit after reconciliation", paths: ["recovery.txt"] },
+    arguments: { workspaceId, expectedHead: bound.head, message: "retry commit after reconciliation", paths: ["recovery.txt"], mutationAdmission },
     _meta: conversation,
   });
   assert.equal(secondAttempt.isError, undefined, responseText(secondAttempt));
@@ -4672,11 +4678,17 @@ test("pre-effect scope escape violation fails closed without creating commit", a
     allowedPaths: ["allowed.txt"],
     workspaceMode: "managed_worktree",
   });
+  const mutationAdmission = await writeTestMutationAdmission({
+    stateRoot: context.nexusMutationAdmissionStateDir!,
+    workspaceRoot,
+    operationId: "devspace:test:core-pre-effect-scope",
+    allowedPaths: ["allowed.txt", "untrusted-escape.txt"],
+  });
 
   // Write to allowed path
   await context.client.callTool({
     name: "write",
-    arguments: { workspaceId, path: "allowed.txt", content: "allowed content\n" },
+    arguments: { workspaceId, path: "allowed.txt", content: "allowed content\n", mutationAdmission },
     _meta: conversation,
   });
 
@@ -4685,7 +4697,7 @@ test("pre-effect scope escape violation fails closed without creating commit", a
 
   const commit = await context.client.callTool({
     name: "git_commit",
-    arguments: { workspaceId, expectedHead: bound.head, message: "must fail scope escape", paths: ["allowed.txt"] },
+    arguments: { workspaceId, expectedHead: bound.head, message: "must fail scope escape", paths: ["allowed.txt"], mutationAdmission },
     _meta: conversation,
   });
   assert.equal(commit.isError, true);
@@ -4718,13 +4730,19 @@ test("pre-effect deletion violation fails closed when AcceptanceContract forbids
     deletionPolicy: "FORBID",
     workspaceMode: "managed_worktree",
   });
+  const mutationAdmission = await writeTestMutationAdmission({
+    stateRoot: context.nexusMutationAdmissionStateDir!,
+    workspaceRoot,
+    operationId: "devspace:test:core-deletion-forbidden",
+    allowedPaths: ["existing-file.txt"],
+  });
 
   // Delete the file from workspace
   await rm(join(workspaceRoot, "existing-file.txt"));
 
   const commit = await context.client.callTool({
     name: "git_commit",
-    arguments: { workspaceId, expectedHead: newBaseHead, message: "must fail deletion", paths: ["existing-file.txt"] },
+    arguments: { workspaceId, expectedHead: newBaseHead, message: "must fail deletion", paths: ["existing-file.txt"], mutationAdmission },
     _meta: conversation,
   });
   assert.equal(commit.isError, true);
@@ -4749,16 +4767,22 @@ test("Core-bound Candidate records full cryptographic provenance in structuredCo
     allowedPaths: ["prov.txt"],
     workspaceMode: "managed_worktree",
   });
+  const mutationAdmission = await writeTestMutationAdmission({
+    stateRoot: context.nexusMutationAdmissionStateDir!,
+    workspaceRoot,
+    operationId: "devspace:test:core-provenance",
+    allowedPaths: ["prov.txt"],
+  });
 
   await context.client.callTool({
     name: "write",
-    arguments: { workspaceId, path: "prov.txt", content: "provenance bytes\n" },
+    arguments: { workspaceId, path: "prov.txt", content: "provenance bytes\n", mutationAdmission },
     _meta: conversation,
   });
 
   const commit = await context.client.callTool({
     name: "git_commit",
-    arguments: { workspaceId, expectedHead: bound.head, message: "test: provenance", paths: ["prov.txt"] },
+    arguments: { workspaceId, expectedHead: bound.head, message: "test: provenance", paths: ["prov.txt"], mutationAdmission },
     _meta: conversation,
   });
   assert.equal(commit.isError, undefined, responseText(commit));
@@ -5630,9 +5654,15 @@ test("minimal mode is direct coding while full mode keeps Core mutation admissio
     conversationScopeId: "issue300-full",
     allowedPaths: ["AGENTS.md"],
   });
+  const mutationAdmission = await writeTestMutationAdmission({
+    stateRoot: full.nexusMutationAdmissionStateDir!,
+    workspaceRoot: full.project,
+    operationId: "devspace:test:issue300-full",
+    allowedPaths: ["AGENTS.md", "guarded.txt"],
+  });
   const guardedWrite = await full.client.callTool({
     name: "write",
-    arguments: { workspaceId: fullWorkspaceId, path: "guarded.txt", content: "blocked\n" },
+    arguments: { workspaceId: fullWorkspaceId, path: "guarded.txt", content: "blocked\n", mutationAdmission },
     _meta: { "openai/session": "issue300-full" },
   });
   assert.equal(guardedWrite.isError, true);
@@ -5641,7 +5671,7 @@ test("minimal mode is direct coding while full mode keeps Core mutation admissio
 
   const allowedWrite = await full.client.callTool({
     name: "write",
-    arguments: { workspaceId: fullWorkspaceId, path: "AGENTS.md", content: "allowed\n" },
+    arguments: { workspaceId: fullWorkspaceId, path: "AGENTS.md", content: "allowed\n", mutationAdmission },
     _meta: { "openai/session": "issue300-full" },
   });
   assert.equal(allowedWrite.isError, undefined);
