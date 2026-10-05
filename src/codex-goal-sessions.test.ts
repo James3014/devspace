@@ -126,6 +126,7 @@ interface GoalFixtureOptions {
   emitGoalMarker?: boolean;
   startupTimeoutMs?: number;
   coreMutation?: boolean;
+  canonical?: boolean;
   writePathOnGoal?: string;
   exitAfterGoalMs?: number;
 }
@@ -147,7 +148,13 @@ async function goalFixture(t: TestContext, options: GoalFixtureOptions = {}): Pr
     await execFileAsync("git", ["config", "user.name", "DevSpace Test"], { cwd: project });
     await execFileAsync("git", ["add", "."], { cwd: project });
     await execFileAsync("git", ["commit", "-m", "Initial commit"], { cwd: project });
+    if (options.canonical) {
+      await execFileAsync("git", ["remote", "add", "origin", "https://github.com/James3014/devspace.git"], { cwd: project });
+    }
   }
+
+  const nexusStateRoot = options.canonical ? join(rootDir, "nexus-state") : undefined;
+  if (nexusStateRoot) await mkdir(join(nexusStateRoot, "mutation-admissions"), { recursive: true });
 
   const spawnLogPath = join(rootDir, "fake-codex-spawns.log");
   const fakeBin = join(binDir, "codex-fake");
@@ -168,6 +175,7 @@ async function goalFixture(t: TestContext, options: GoalFixtureOptions = {}): Pr
     ...(options.codexBinOverride !== undefined
       ? { DEVSPACE_CODEX_BIN: options.codexBinOverride }
       : {}),
+    ...(nexusStateRoot ? { DEVSPACE_NEXUS_MUTATION_ADMISSION_STATE_ROOT: nexusStateRoot } : {}),
     DEVSPACE_OAUTH_OWNER_TOKEN: OWNER_TOKEN,
     PORT: "1",
   });
@@ -593,6 +601,20 @@ test("malformed expectedHead rejected before any Git or process work", async (t)
   });
   assert.equal(result.isError, true);
   assert.match(textOf(result), /40-character commit SHA/);
+  assert.equal(spawnCount(context.spawnLogPath), 0);
+});
+
+test("G2 canonical codex_goal_start requires Nexus mutation admission before spawning Codex", async (t) => {
+  const context = await goalFixture(t, { canonical: true });
+  const workspaceId = await openWorkspace(context.client, context.projectA);
+
+  const result = await callTool(context.client, "codex_goal_start", {
+    workspaceId,
+    goal: "must not start without Nexus mutation admission",
+    expectedHead: await headSha(context.projectA),
+  });
+  assert.equal(result.isError, true);
+  assert.match(textOf(result), /NEXUS_MUTATION_ADMISSION/);
   assert.equal(spawnCount(context.spawnLogPath), 0);
 });
 

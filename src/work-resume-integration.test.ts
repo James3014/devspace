@@ -1084,6 +1084,89 @@ test("G2 canonical apply_patch blocks without admission and admits exact patch s
   assert.equal(existsSync(join(fix.projectRoot, "patched.txt")), true);
 });
 
+test("G2 canonical workspace_copy_file blocks without admission and admits exact destination scope", async (t) => {
+  const fix = await makeFixture({ canonical: true, toolMode: "minimal" });
+  t.after(() => fix.close());
+
+  writeFileSync(join(fix.projectRoot, "copy-source.txt"), "payload\n");
+  const blocked = await fix.client.callTool({
+    name: "workspace_copy_file",
+    arguments: {
+      sourceWorkspaceId: fix.workspaceId,
+      sourcePath: "copy-source.txt",
+      destinationWorkspaceId: fix.workspaceId,
+      destinationPath: "copy-target.txt",
+      expectedDestinationAbsent: true,
+    },
+    _meta: SESSION_META,
+  });
+  const blockedText = (blocked.content as Array<{ type: string; text?: string }>).map((c) => c.text ?? "").join("");
+  assert.ok(blocked.isError || blockedText.includes("NEXUS_MUTATION_ADMISSION"));
+  assert.equal(existsSync(join(fix.projectRoot, "copy-target.txt")), false);
+
+  const pointer = installMutationAdmission(fix, ["copy-target.txt"]);
+  const admitted = await fix.client.callTool({
+    name: "workspace_copy_file",
+    arguments: {
+      sourceWorkspaceId: fix.workspaceId,
+      sourcePath: "copy-source.txt",
+      destinationWorkspaceId: fix.workspaceId,
+      destinationPath: "copy-target.txt",
+      expectedDestinationAbsent: true,
+      mutationAdmission: pointer,
+    },
+    _meta: SESSION_META,
+  });
+  const admittedText = (admitted.content as Array<{ type: string; text?: string }>).map((c) => c.text ?? "").join("");
+  assert.equal(admitted.isError, undefined, admittedText);
+  assert.equal(existsSync(join(fix.projectRoot, "copy-target.txt")), true);
+});
+
+test("G2 canonical Codex exec_command blocks mutation before spawn while read-only execution remains usable", async (t) => {
+  const fix = await makeFixture({ canonical: true, toolMode: "codex" });
+  t.after(() => fix.close());
+
+  const blocked = await fix.client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId: fix.workspaceId,
+      cmd: "touch codex-process-bypass.txt",
+      attemptKey: "g2-codex-exec-blocked-1",
+    },
+    _meta: SESSION_META,
+  });
+  const blockedText = (blocked.content as Array<{ type: string; text?: string }>).map((c) => c.text ?? "").join("");
+  assert.ok(blocked.isError || blockedText.includes("NEXUS_MUTATION_ADMISSION"));
+  assert.equal(existsSync(join(fix.projectRoot, "codex-process-bypass.txt")), false);
+
+  const pointer = installMutationAdmission(fix, ["codex-process-bypass.txt"]);
+  const pathProofBlocked = await fix.client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId: fix.workspaceId,
+      cmd: "touch codex-process-bypass.txt",
+      attemptKey: "g2-codex-exec-path-proof-1",
+      mutationAdmission: pointer,
+    },
+    _meta: SESSION_META,
+  });
+  const pathProofText = (pathProofBlocked.content as Array<{ type: string; text?: string }>).map((c) => c.text ?? "").join("");
+  assert.ok(pathProofBlocked.isError || pathProofText.includes("NEXUS_MUTATION_ADMISSION_PATH_PROOF_REQUIRED"));
+  assert.equal(existsSync(join(fix.projectRoot, "codex-process-bypass.txt")), false);
+
+  const readOnly = await fix.client.callTool({
+    name: "exec_command",
+    arguments: {
+      workspaceId: fix.workspaceId,
+      cmd: "git status --short",
+      attemptKey: "g2-codex-exec-readonly-1",
+    },
+    _meta: SESSION_META,
+  });
+  const readOnlyText = (readOnly.content as Array<{ type: string; text?: string }>).map((c) => c.text ?? "").join("");
+  assert.ok(!readOnlyText.includes("NEXUS_MUTATION_ADMISSION"));
+});
+
 test("G2 canonical Git commit and push block before Git effect without admission", async (t) => {
   const fix = await makeFixture({ canonical: true });
   t.after(() => fix.close());

@@ -1170,18 +1170,33 @@ function registerCodexProcessTools(
           .max(300)
           .optional()
           .describe("Command execution deadline in seconds. Defaults to unbounded if omitted."),
+        mutationAdmission: mutationAdmissionSchema().optional().describe(
+          "Required before mutation-capable process execution in canonical Nexus repositories. Process execution remains blocked when exact path containment cannot be proven.",
+        ),
       },
       outputSchema: processOutputSchema(),
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens, attemptKey, timeout }, extra) => {
+    async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens, attemptKey, timeout, mutationAdmission }, extra) => {
       const startedAt = performance.now();
       const mutationCapable = !isRepositoryReadOnlyShellCommand(cmd);
       if (mutationCapable) {
         await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       }
       const workspace = workspaces.getWorkspace(workspaceId);
+      if (mutationCapable) {
+        const nexusAdmission = await assertNexusMutationAdmission({
+          stateRoot: config.nexusMutationAdmissionStateRoot,
+          workspaceRoot: workspace.root,
+          pointer: mutationAdmission as NexusMutationAdmissionPointer | undefined,
+        });
+        if (nexusAdmission.required) {
+          throw new Error(
+            "[NEXUS_MUTATION_ADMISSION_PATH_PROOF_REQUIRED] Mutation-capable process execution in a canonical Nexus repository has no pre-effect exact path-containment seam; use structured write/edit/copy or a bounded agent execution instead.",
+          );
+        }
+      }
       const coreAdmission = mutationCapable && coreMutation
         ? await coreMutation.admit({ workspaceId, extra, pathContainment: "NOT_PROVEN", writerDomain: "PROCESS" })
         : undefined;
@@ -1251,16 +1266,33 @@ function registerCodexProcessTools(
           .max(100_000)
           .optional()
           .describe("Approximate output token budget. Defaults to 10000."),
+        mutationAdmission: mutationAdmissionSchema().optional().describe(
+          "Required before sending potentially mutating input to a process in a canonical Nexus repository. Polling and Ctrl-C cancellation remain admission-free.",
+        ),
       },
       outputSchema: processOutputSchema(),
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, sessionId, chars, columns, rows, yieldTimeMs, maxOutputTokens }, extra) => {
+    async ({ workspaceId, sessionId, chars, columns, rows, yieldTimeMs, maxOutputTokens, mutationAdmission }, extra) => {
       const startedAt = performance.now();
-      workspaces.getWorkspace(workspaceId);
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const hasMutatingInput = Boolean(chars && chars.length > 0 && chars !== "\u0003");
+      if (hasMutatingInput) {
+        await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
+        const nexusAdmission = await assertNexusMutationAdmission({
+          stateRoot: config.nexusMutationAdmissionStateRoot,
+          workspaceRoot: workspace.root,
+          pointer: mutationAdmission as NexusMutationAdmissionPointer | undefined,
+        });
+        if (nexusAdmission.required) {
+          throw new Error(
+            "[NEXUS_MUTATION_ADMISSION_PATH_PROOF_REQUIRED] Process stdin in a canonical Nexus repository has no pre-effect exact path-containment seam; use a bounded structured mutation instead.",
+          );
+        }
+      }
       let coreAdmission: CoreMutationAdmission | undefined;
-      if (chars && chars.length > 0 && coreMutation) {
+      if (hasMutatingInput && coreMutation) {
         const active = coreMutation.active(workspaceId);
         const original = processSessions.getCoreMutationBinding(workspaceId, sessionId);
         if (active && !original) {
@@ -1395,6 +1427,9 @@ function registerCodexGoalTools(
           .regex(/^[0-9a-fA-F]{40}$/, "expectedHead must be a valid 40-character commit SHA.")
           .optional()
           .describe("Exact 40-character Git HEAD the workspace must be at before launch. Required for Git workspaces; start fails closed when missing or mismatched."),
+        mutationAdmission: mutationAdmissionSchema().optional().describe(
+          "Required before Codex Goal execution in canonical Nexus repositories. Goal execution remains blocked when exact path containment cannot be proven.",
+        ),
       },
       outputSchema: {
         goalId: z.string(),
@@ -1418,10 +1453,21 @@ function registerCodexGoalTools(
       _meta: {},
       annotations: GOAL_START_ANNOTATIONS,
     },
-    async ({ workspaceId, goal, model, reasoningEffort, expectedHead }, extra) => {
+    async ({ workspaceId, goal, model, reasoningEffort, expectedHead, mutationAdmission }, extra) => {
       const startedAt = performance.now();
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
+      const nexusAdmission = await assertNexusMutationAdmission({
+        stateRoot: config.nexusMutationAdmissionStateRoot,
+        workspaceRoot: workspace.root,
+        pointer: mutationAdmission as NexusMutationAdmissionPointer | undefined,
+        expectedBase: expectedHead,
+      });
+      if (nexusAdmission.required) {
+        throw new Error(
+          "[NEXUS_MUTATION_ADMISSION_PATH_PROOF_REQUIRED] Codex Goal execution in a canonical Nexus repository has no pre-effect exact path-containment seam; use a bounded agent execution instead.",
+        );
+      }
       const coreAdmission = coreMutation
         ? await coreMutation.admit({ workspaceId, extra, pathContainment: "NOT_PROVEN", writerDomain: "PROCESS" })
         : undefined;
@@ -1514,6 +1560,9 @@ function registerCodexGoalTools(
         workspaceId: z.string().describe("Workspace identifier used to start the goal."),
         goalId: z.string().describe("Exact goal ID returned by codex_goal_start."),
         message: z.string().min(1).max(20_000).describe("Follow-up message for the active goal."),
+        mutationAdmission: mutationAdmissionSchema().optional().describe(
+          "Required before continuing a Codex Goal in canonical Nexus repositories. Continuation remains blocked when exact path containment cannot be proven.",
+        ),
       },
       outputSchema: {
         goalId: z.string(),
@@ -1542,9 +1591,19 @@ function registerCodexGoalTools(
         openWorldHint: true,
       },
     },
-    async ({ workspaceId, goalId, message }, extra) => {
+    async ({ workspaceId, goalId, message, mutationAdmission }, extra) => {
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
-      workspaces.getWorkspace(workspaceId);
+      const workspace = workspaces.getWorkspace(workspaceId);
+      const nexusAdmission = await assertNexusMutationAdmission({
+        stateRoot: config.nexusMutationAdmissionStateRoot,
+        workspaceRoot: workspace.root,
+        pointer: mutationAdmission as NexusMutationAdmissionPointer | undefined,
+      });
+      if (nexusAdmission.required) {
+        throw new Error(
+          "[NEXUS_MUTATION_ADMISSION_PATH_PROOF_REQUIRED] Codex Goal continuation in a canonical Nexus repository has no pre-effect exact path-containment seam; use a bounded agent execution instead.",
+        );
+      }
       let coreAdmission: CoreMutationAdmission | undefined;
       if (coreMutation) {
         const active = coreMutation.active(workspaceId);
@@ -7067,6 +7126,9 @@ export function createMcpServer(
             .boolean()
             .default(false)
             .describe("Whether to overwrite an existing destination file. Defaults to false."),
+          mutationAdmission: mutationAdmissionSchema().optional().describe(
+            "Required before copying into a canonical Nexus repository. DevSpace re-reads the Nexus-owned durable receipt and binds the destination path before the file effect.",
+          ),
         },
         outputSchema: resultOutputSchema({
           sourcePath: z.string(),
@@ -7088,6 +7150,7 @@ export function createMcpServer(
           expectedDestinationSha256,
           expectedDestinationAbsent,
           overwrite,
+          mutationAdmission,
         },
         extra,
       ) => {
@@ -7147,6 +7210,13 @@ export function createMcpServer(
             content: [textBlock(`DESTINATION_PATH_ESCAPE: canonical destination path leaves the destination workspace: ${destinationPath}`)],
           };
         }
+
+        await assertNexusMutationAdmission({
+          stateRoot: config.nexusMutationAdmissionStateRoot,
+          workspaceRoot: destinationWorkspace.root,
+          pointer: mutationAdmission as NexusMutationAdmissionPointer | undefined,
+          requestedPaths: [destinationPath],
+        });
 
         const lexicalDestinationStats = await lstat(destinationAbsolutePath).catch(() => null);
         if (lexicalDestinationStats?.isSymbolicLink()) {
