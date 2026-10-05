@@ -4315,13 +4315,19 @@ test("post-commit hook scope escape reports existing commit and durably blocks r
   const workspaceId = workspace.workspaceId as string;
   const workspaceRoot = workspace.root as string;
   const bound = await bindTestCoreSession({ fixture: context, workspaceId, workspaceRoot, conversationScopeId, allowedPaths: ["hook-allowed.txt"], workspaceMode: "managed_worktree" });
-  const write = await context.client.callTool({ name: "write", arguments: { workspaceId, path: "hook-allowed.txt", content: "allowed\n" }, _meta: conversation });
+  const mutationAdmission = await writeTestMutationAdmission({
+    stateRoot: context.nexusMutationAdmissionStateDir!,
+    workspaceRoot,
+    operationId: "devspace:test:core-post-commit-hook-escape",
+    allowedPaths: ["hook-allowed.txt", "hook-escape.txt"],
+  });
+  const write = await context.client.callTool({ name: "write", arguments: { workspaceId, path: "hook-allowed.txt", content: "allowed\n", mutationAdmission }, _meta: conversation });
   assert.equal(write.isError, undefined, responseText(write));
   await installGitHook(workspaceRoot, "post-commit", "printf 'hook escape\\n' > hook-escape.txt");
 
   const committed = await context.client.callTool({
     name: "git_commit",
-    arguments: { workspaceId, expectedHead: bound.head, message: "test: hook escape", paths: ["hook-allowed.txt"] },
+    arguments: { workspaceId, expectedHead: bound.head, message: "test: hook escape", paths: ["hook-allowed.txt"], mutationAdmission },
     _meta: conversation,
   });
   const committedHead = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspaceRoot })).stdout.trim();
@@ -4333,7 +4339,7 @@ test("post-commit hook scope escape reports existing commit and durably blocks r
 
   const retry = await context.client.callTool({
     name: "git_commit",
-    arguments: { workspaceId, expectedHead: committedHead, message: "must not retry", paths: ["hook-allowed.txt"] },
+    arguments: { workspaceId, expectedHead: committedHead, message: "must not retry", paths: ["hook-allowed.txt"], mutationAdmission },
     _meta: conversation,
   });
   assert.equal(retry.isError, true);
@@ -4386,19 +4392,25 @@ test("failing pre-commit hook scope escape takes Core precedence and blocks retr
   const workspaceId = workspace.workspaceId as string;
   const workspaceRoot = workspace.root as string;
   const bound = await bindTestCoreSession({ fixture: context, workspaceId, workspaceRoot, conversationScopeId, allowedPaths: ["precommit-allowed.txt"], workspaceMode: "managed_worktree" });
-  await context.client.callTool({ name: "write", arguments: { workspaceId, path: "precommit-allowed.txt", content: "allowed\n" }, _meta: conversation });
+  const mutationAdmission = await writeTestMutationAdmission({
+    stateRoot: context.nexusMutationAdmissionStateDir!,
+    workspaceRoot,
+    operationId: "devspace:test:core-failing-precommit-hook",
+    allowedPaths: ["precommit-allowed.txt", "precommit-hook-escape.txt"],
+  });
+  await context.client.callTool({ name: "write", arguments: { workspaceId, path: "precommit-allowed.txt", content: "allowed\n", mutationAdmission }, _meta: conversation });
   await installGitHook(workspaceRoot, "post-commit", "exit 0");
   const hooksDirectory = (await execFileAsync("git", ["config", "--local", "--get", "core.hooksPath"], { cwd: workspaceRoot })).stdout.trim();
   const preCommitHook = join(hooksDirectory, "pre-commit");
   await writeFile(preCommitHook, "#!/bin/sh\nprintf 'escape\\n' > precommit-hook-escape.txt\nexit 17\n", { mode: 0o755 });
   chmodSync(preCommitHook, 0o755);
-  const result = await context.client.callTool({ name: "git_commit", arguments: { workspaceId, expectedHead: bound.head, message: "must fail", paths: ["precommit-allowed.txt"] }, _meta: conversation });
+  const result = await context.client.callTool({ name: "git_commit", arguments: { workspaceId, expectedHead: bound.head, message: "must fail", paths: ["precommit-allowed.txt"], mutationAdmission }, _meta: conversation });
   assert.equal(result.isError, true);
   assert.match(responseText(result), /CORE_MUTATION_POST_EFFECT_SCOPE_ESCAPE.*precommit-hook-escape\.txt/is);
   assert.match(responseText(result), /Git command failed|exit 17|hook/i);
   assert.equal((await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: workspaceRoot })).stdout.trim(), bound.head);
   assert.equal(context.coreMutationSessions!.getById(bound.session.id)?.rebindState, "REBIND_REQUIRED");
-  const retry = await context.client.callTool({ name: "git_commit", arguments: { workspaceId, expectedHead: bound.head, message: "no retry", paths: ["precommit-allowed.txt"] }, _meta: conversation });
+  const retry = await context.client.callTool({ name: "git_commit", arguments: { workspaceId, expectedHead: bound.head, message: "no retry", paths: ["precommit-allowed.txt"], mutationAdmission }, _meta: conversation });
   assert.equal(retry.isError, true);
   assert.match(responseText(retry), /CORE_MUTATION_REBIND_REQUIRED/);
 });
@@ -4514,18 +4526,24 @@ test("two-clock candidate path set incomplete failure does not wedge session", a
     allowedPaths: ["clock1.txt", "clock2.txt"],
     workspaceMode: "managed_worktree",
   });
+  const mutationAdmission = await writeTestMutationAdmission({
+    stateRoot: context.nexusMutationAdmissionStateDir!,
+    workspaceRoot,
+    operationId: "devspace:test:core-two-clock",
+    allowedPaths: ["clock1.txt", "clock2.txt"],
+  });
 
   // Write clock1 file
   await context.client.callTool({
     name: "write",
-    arguments: { workspaceId, path: "clock1.txt", content: "clock1 content\n" },
+    arguments: { workspaceId, path: "clock1.txt", content: "clock1 content\n", mutationAdmission },
     _meta: conversation,
   });
 
   // Commit clock1 (Clock 1 formation)
   const commit1 = await context.client.callTool({
     name: "git_commit",
-    arguments: { workspaceId, expectedHead: bound.head, message: "commit clock1", paths: ["clock1.txt"] },
+    arguments: { workspaceId, expectedHead: bound.head, message: "commit clock1", paths: ["clock1.txt"], mutationAdmission },
     _meta: conversation,
   });
   assert.equal(commit1.isError, undefined, responseText(commit1));
@@ -4534,19 +4552,19 @@ test("two-clock candidate path set incomplete failure does not wedge session", a
   // Modify clock1.txt and write clock2.txt (Clock 2 changes)
   await context.client.callTool({
     name: "write",
-    arguments: { workspaceId, path: "clock1.txt", content: "clock1 updated\n" },
+    arguments: { workspaceId, path: "clock1.txt", content: "clock1 updated\n", mutationAdmission },
     _meta: conversation,
   });
   await context.client.callTool({
     name: "write",
-    arguments: { workspaceId, path: "clock2.txt", content: "clock2 content\n" },
+    arguments: { workspaceId, path: "clock2.txt", content: "clock2 content\n", mutationAdmission },
     _meta: conversation,
   });
 
   // Call git_commit with incomplete paths (passing only clock1.txt, omitting clock2.txt)
   const incompleteCommit = await context.client.callTool({
     name: "git_commit",
-    arguments: { workspaceId, expectedHead: head1, message: "incomplete candidate", paths: ["clock1.txt"] },
+    arguments: { workspaceId, expectedHead: head1, message: "incomplete candidate", paths: ["clock1.txt"], mutationAdmission },
     _meta: conversation,
   });
   assert.equal(incompleteCommit.isError, true);
@@ -4562,7 +4580,7 @@ test("two-clock candidate path set incomplete failure does not wedge session", a
   // Call git_commit with complete paths -> succeeds!
   const commit2 = await context.client.callTool({
     name: "git_commit",
-    arguments: { workspaceId, expectedHead: head1, message: "commit both clocks", paths: ["clock1.txt", "clock2.txt"] },
+    arguments: { workspaceId, expectedHead: head1, message: "commit both clocks", paths: ["clock1.txt", "clock2.txt"], mutationAdmission },
     _meta: conversation,
   });
   assert.equal(commit2.isError, undefined, responseText(commit2));
