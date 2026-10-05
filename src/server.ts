@@ -4758,6 +4758,9 @@ export function createMcpServer(
           .string()
           .describe("File path to write, relative to the workspace root."),
         content: z.string().describe("Complete new file content."),
+        mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+          "Nexus-owned mutation admission pointer. Required for canonical-repository mutation.",
+        ),
         resumableWork: resumableWorkSchema().optional().describe(
           "P0 resumable-work pointer.  When supplied, the write is admitted only if the exact lease is currently held by the caller.",
         ),
@@ -4766,7 +4769,7 @@ export function createMcpServer(
       ...toolWidgetDescriptorMeta(config, "write"),
       annotations: WRITE_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, resumableWork: p0Pointer, ...input }, extra) => {
+    async ({ workspaceId, mutationAdmission, resumableWork: p0Pointer, ...input }, extra) => {
       const startedAt = performance.now();
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
@@ -4782,6 +4785,11 @@ export function createMcpServer(
           ].join("\n"))],
         };
       }
+      await authorizeNexusMutation({
+        workspaceRoot: workspace.root,
+        binding: mutationAdmission,
+        requestedPaths: [input.path],
+      });
       // ── P0 writer admission ──────────────────────────────────────────────
       if (p0Pointer && workResumeStore) {
         await centralAdmissionCheck({
@@ -4873,6 +4881,9 @@ export function createMcpServer(
             }),
           )
           .min(1),
+        mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+          "Nexus-owned mutation admission pointer. Required for canonical-repository mutation.",
+        ),
         resumableWork: resumableWorkSchema().optional().describe(
           "P0 resumable-work pointer.  When supplied, the edit is admitted only if the exact lease is currently held by the caller.",
         ),
@@ -4884,7 +4895,7 @@ export function createMcpServer(
       ...toolWidgetDescriptorMeta(config, "edit"),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, resumableWork: p0Pointer, ...input }, extra) => {
+    async ({ workspaceId, mutationAdmission, resumableWork: p0Pointer, ...input }, extra) => {
       const startedAt = performance.now();
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
@@ -4900,6 +4911,11 @@ export function createMcpServer(
           ].join("\n"))],
         };
       }
+      await authorizeNexusMutation({
+        workspaceRoot: workspace.root,
+        binding: mutationAdmission,
+        requestedPaths: [input.path],
+      });
       // ── P0 writer admission ──────────────────────────────────────────────
       if (p0Pointer && workResumeStore) {
         await centralAdmissionCheck({
@@ -4989,6 +5005,9 @@ export function createMcpServer(
           patch: z
             .string()
             .describe("Patch text enclosed by *** Begin Patch and *** End Patch markers."),
+          mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+            "Nexus-owned mutation admission pointer. Required for canonical-repository mutation.",
+          ),
         },
           outputSchema: resultOutputSchema({
           additions: z.number(),
@@ -5005,7 +5024,7 @@ export function createMcpServer(
         ...toolWidgetDescriptorMeta(config, "edit"),
         annotations: EDIT_TOOL_ANNOTATIONS,
       },
-      async ({ workspaceId, patch }, extra) => {
+      async ({ workspaceId, patch, mutationAdmission }, extra) => {
         const startedAt = performance.now();
         await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
         const workspace = workspaces.getWorkspace(workspaceId);
@@ -5029,6 +5048,11 @@ export function createMcpServer(
             ].join("\n"))],
           };
         }
+        await authorizeNexusMutation({
+          workspaceRoot: workspace.root,
+          binding: mutationAdmission,
+          requestedPaths: mutationPaths,
+        });
         const coreAdmission = coreMutationGuard
           ? await coreMutationGuard.admit({ workspaceId, extra, paths: mutationPaths, deletedPaths, pathContainment: "STRUCTURED_SINK_ENFORCED" })
           : undefined;
@@ -5400,6 +5424,9 @@ export function createMcpServer(
           .max(100_000)
           .optional()
           .describe("Approximate output token budget. Defaults to 10000."),
+        mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+          "Nexus-owned mutation admission pointer. Required only when this command can mutate a canonical repository.",
+        ),
         resumableWork: resumableWorkSchema().optional().describe(
           "P0 resumable-work pointer.  When supplied and the command is write-capable, the spawn is admitted only if the exact lease is currently held by the caller.  Read-only commands ignore this field.",
         ),
@@ -5408,13 +5435,19 @@ export function createMcpServer(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, workingDirectory, command, timeout, attemptKey, yieldTimeMs, maxOutputTokens, resumableWork: p0Pointer }, extra) => {
+    async ({ workspaceId, workingDirectory, command, timeout, attemptKey, yieldTimeMs, maxOutputTokens, mutationAdmission, resumableWork: p0Pointer }, extra) => {
       const startedAt = performance.now();
       const mutationCapable = !isRepositoryReadOnlyShellCommand(command);
       if (mutationCapable) {
         await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       }
       const workspace = workspaces.getWorkspace(workspaceId);
+      if (mutationCapable) {
+        await authorizeNexusMutation({
+          workspaceRoot: workspace.root,
+          binding: mutationAdmission,
+        });
+      }
       // ── P0 writer admission ──────────────────────────────────────────────
       // Checked only for write-capable commands; read-only commands skip.
       if (p0Pointer && workResumeStore && mutationCapable) {
@@ -7034,6 +7067,9 @@ export function createMcpServer(
             .boolean()
             .default(false)
             .describe("Whether to overwrite an existing destination file. Defaults to false."),
+          mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+            "Nexus-owned mutation admission pointer for the destination canonical repository.",
+          ),
         },
         outputSchema: resultOutputSchema({
           sourcePath: z.string(),
@@ -7055,6 +7091,7 @@ export function createMcpServer(
           expectedDestinationSha256,
           expectedDestinationAbsent,
           overwrite,
+          mutationAdmission,
         },
         extra,
       ) => {
@@ -7106,6 +7143,11 @@ export function createMcpServer(
         }
 
         const destinationAbsolutePath = workspaces.resolvePath(destinationWorkspace, destinationPath);
+        await authorizeNexusMutation({
+          workspaceRoot: destinationWorkspace.root,
+          binding: mutationAdmission,
+          requestedPaths: [destinationPath],
+        });
         const destinationRootCanonical = canonicalizePath(destinationWorkspace.root);
         const destinationCanonicalPath = canonicalizePath(destinationAbsolutePath);
         if (!isPathInsideRoot(destinationCanonicalPath, destinationRootCanonical)) {
