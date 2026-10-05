@@ -2,7 +2,6 @@ import { CarrierBindingStore, type CarrierCompletionBinding } from "./carrier-bi
 import type { ControlPlaneConsumerOptions } from "./control-plane-consumer.js";
 import { ControlPlaneOwnershipError } from "./control-plane-ownership.js";
 import {
-  centralAdmissionCheck,
   computeWorkKey,
   computeWorkRequestHash,
   createWorkResumeStore,
@@ -10,6 +9,7 @@ import {
   WorkResumeStore,
 } from "./work-resume.js";
 import { createHash, randomUUID } from "node:crypto";
+import { enforceNexusWriterAdmission } from "./nexus-mutation-admission.js";
 import { readFileSync } from "node:fs";
 import { access, lstat, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
@@ -1112,6 +1112,8 @@ function registerCodexProcessTools(
   workspaces: WorkspaceRegistry,
   processSessions: ProcessSessionManager,
   coreMutation?: CoreMutationGuard,
+  workResumeStore?: WorkResumeStore,
+  carrierBindings?: CarrierBindingStore,
 ): void {
   registerAppTool(
     server,
@@ -1158,18 +1160,30 @@ function registerCodexProcessTools(
           .max(300)
           .optional()
           .describe("Command execution deadline in seconds. Defaults to unbounded if omitted."),
+        resumableWork: resumableWorkSchema().optional().describe(
+          "Nexus writer-admission pointer. Required for write-capable commands in enrolled repositories.",
+        ),
       },
       outputSchema: processOutputSchema(),
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens, attemptKey, timeout }, extra) => {
+    async ({ workspaceId, cmd, tty, columns, rows, workingDirectory, yieldTimeMs, maxOutputTokens, attemptKey, timeout, resumableWork: p0Pointer }, extra) => {
       const startedAt = performance.now();
       const mutationCapable = !isRepositoryReadOnlyShellCommand(cmd);
       if (mutationCapable) {
         await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       }
       const workspace = workspaces.getWorkspace(workspaceId);
+      if (mutationCapable) {
+        enforceNexusWriterAdmission({
+          workspaceRoot: workspace.root,
+          pointer: p0Pointer,
+          store: workResumeStore,
+          ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+          operation: "exec_command",
+        });
+      }
       const coreAdmission = mutationCapable && coreMutation
         ? await coreMutation.admit({ workspaceId, extra, pathContainment: "NOT_PROVEN", writerDomain: "PROCESS" })
         : undefined;
@@ -1351,6 +1365,8 @@ function registerCodexGoalTools(
   workspaces: WorkspaceRegistry,
   goals: CodexGoalSessionManager,
   coreMutation?: CoreMutationGuard,
+  workResumeStore?: WorkResumeStore,
+  carrierBindings?: CarrierBindingStore,
 ): void {
   const GOAL_START_ANNOTATIONS = {
     readOnlyHint: false,
@@ -1383,6 +1399,9 @@ function registerCodexGoalTools(
           .regex(/^[0-9a-fA-F]{40}$/, "expectedHead must be a valid 40-character commit SHA.")
           .optional()
           .describe("Exact 40-character Git HEAD the workspace must be at before launch. Required for Git workspaces; start fails closed when missing or mismatched."),
+        resumableWork: resumableWorkSchema().optional().describe(
+          "Nexus writer-admission pointer. Required in enrolled repositories before Codex Goal can mutate.",
+        ),
       },
       outputSchema: {
         goalId: z.string(),
@@ -1406,10 +1425,17 @@ function registerCodexGoalTools(
       _meta: {},
       annotations: GOAL_START_ANNOTATIONS,
     },
-    async ({ workspaceId, goal, model, reasoningEffort, expectedHead }, extra) => {
+    async ({ workspaceId, goal, model, reasoningEffort, expectedHead, resumableWork: p0Pointer }, extra) => {
       const startedAt = performance.now();
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
+      enforceNexusWriterAdmission({
+        workspaceRoot: workspace.root,
+        pointer: p0Pointer,
+        store: workResumeStore,
+        ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+        operation: "codex_goal_start",
+      });
       const coreAdmission = coreMutation
         ? await coreMutation.admit({ workspaceId, extra, pathContainment: "NOT_PROVEN", writerDomain: "PROCESS" })
         : undefined;
@@ -1502,6 +1528,9 @@ function registerCodexGoalTools(
         workspaceId: z.string().describe("Workspace identifier used to start the goal."),
         goalId: z.string().describe("Exact goal ID returned by codex_goal_start."),
         message: z.string().min(1).max(20_000).describe("Follow-up message for the active goal."),
+        resumableWork: resumableWorkSchema().optional().describe(
+          "Nexus writer-admission pointer. Required in enrolled repositories before continuing a mutating Codex Goal.",
+        ),
       },
       outputSchema: {
         goalId: z.string(),
@@ -1530,9 +1559,16 @@ function registerCodexGoalTools(
         openWorldHint: true,
       },
     },
-    async ({ workspaceId, goalId, message }, extra) => {
+    async ({ workspaceId, goalId, message, resumableWork: p0Pointer }, extra) => {
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
-      workspaces.getWorkspace(workspaceId);
+      const workspace = workspaces.getWorkspace(workspaceId);
+      enforceNexusWriterAdmission({
+        workspaceRoot: workspace.root,
+        pointer: p0Pointer,
+        store: workResumeStore,
+        ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+        operation: "codex_goal_continue",
+      });
       let coreAdmission: CoreMutationAdmission | undefined;
       if (coreMutation) {
         const active = coreMutation.active(workspaceId);
@@ -4239,6 +4275,9 @@ export function createMcpServer(
           ref: z.string().min(1).optional().describe("Optional branch or tag to clone as a single branch."),
           authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).default("OWNER_DIRECT")
             .describe("NEXUS_GOVERNED remains fail-closed until an external Nexus grant validator is wired."),
+          resumableWork: resumableWorkSchema().optional().describe(
+            "Nexus writer-admission pointer. Required for dependency effects in enrolled repositories.",
+          ),
         },
         outputSchema: durableOperationOutputSchema,
         _meta: {},
@@ -4446,6 +4485,9 @@ export function createMcpServer(
           recipe: z.enum(["npm_ci", "pnpm_frozen", "uv_frozen"]),
           authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]).default("OWNER_DIRECT")
             .describe("NEXUS_GOVERNED remains fail-closed until an external Nexus grant validator is wired."),
+          resumableWork: resumableWorkSchema().optional().describe(
+            "Nexus writer-admission pointer. Required for dependency effects in enrolled repositories.",
+          ),
         },
         outputSchema: durableOperationOutputSchema,
         _meta: {},
@@ -4456,10 +4498,17 @@ export function createMcpServer(
           openWorldHint: true,
         },
       },
-      async ({ workspaceId, attemptKey, recipe, authorityMode }, extra) => {
+      async ({ workspaceId, attemptKey, recipe, authorityMode, resumableWork: p0Pointer }, extra) => {
         const { _meta } = extra;
         const safety = await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(_meta));
         const workspace = workspaces.getWorkspace(workspaceId);
+        enforceNexusWriterAdmission({
+          workspaceRoot: workspace.root,
+          pointer: p0Pointer,
+          store: workResumeStore,
+          ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(_meta),
+          operation: "dependency_sync",
+        });
         const ownerDirectIsolated =
           authorityMode === "OWNER_DIRECT" &&
           workspace.mode === "worktree" &&
@@ -4729,16 +4778,14 @@ export function createMcpServer(
           ].join("\n"))],
         };
       }
-      // ── P0 writer admission ──────────────────────────────────────────────
-      if (p0Pointer && workResumeStore) {
-        await centralAdmissionCheck({
-          store: workResumeStore,
-          pointer: p0Pointer,
-          ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-          worktreeRealpath: workspace.root,
-          operation: "write",
-        });
-      }
+      // Nexus-enrolled repositories fail closed without canonical admission.
+      enforceNexusWriterAdmission({
+        workspaceRoot: workspace.root,
+        pointer: p0Pointer,
+        store: workResumeStore,
+        ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+        operation: "write",
+      });
       const coreAdmission = coreMutationGuard
         ? await coreMutationGuard.admit({ workspaceId, extra, paths: [input.path], pathContainment: "STRUCTURED_SINK_ENFORCED" })
         : undefined;
@@ -4847,16 +4894,14 @@ export function createMcpServer(
           ].join("\n"))],
         };
       }
-      // ── P0 writer admission ──────────────────────────────────────────────
-      if (p0Pointer && workResumeStore) {
-        await centralAdmissionCheck({
-          store: workResumeStore,
-          pointer: p0Pointer,
-          ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-          worktreeRealpath: workspace.root,
-          operation: "edit",
-        });
-      }
+      // Nexus-enrolled repositories fail closed without canonical admission.
+      enforceNexusWriterAdmission({
+        workspaceRoot: workspace.root,
+        pointer: p0Pointer,
+        store: workResumeStore,
+        ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+        operation: "edit",
+      });
       const coreAdmission = coreMutationGuard
         ? await coreMutationGuard.admit({ workspaceId, extra, paths: [input.path], pathContainment: "STRUCTURED_SINK_ENFORCED" })
         : undefined;
@@ -4936,6 +4981,9 @@ export function createMcpServer(
           patch: z
             .string()
             .describe("Patch text enclosed by *** Begin Patch and *** End Patch markers."),
+          resumableWork: resumableWorkSchema().optional().describe(
+            "Nexus writer-admission pointer. Required for patches in enrolled repositories.",
+          ),
         },
           outputSchema: resultOutputSchema({
           additions: z.number(),
@@ -4952,10 +5000,17 @@ export function createMcpServer(
         ...toolWidgetDescriptorMeta(config, "edit"),
         annotations: EDIT_TOOL_ANNOTATIONS,
       },
-      async ({ workspaceId, patch }, extra) => {
+      async ({ workspaceId, patch, resumableWork: p0Pointer }, extra) => {
         const startedAt = performance.now();
         await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
         const workspace = workspaces.getWorkspace(workspaceId);
+        enforceNexusWriterAdmission({
+          workspaceRoot: workspace.root,
+          pointer: p0Pointer,
+          store: workResumeStore,
+          ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+          operation: "apply_patch",
+        });
         const actions = parsePatch(patch);
         const mutationPaths = actions.flatMap((action) => action.kind === "update" && action.moveTo ? [action.path, action.moveTo] : [action.path]);
         const deletedPaths = actions.flatMap((action) => action.kind === "delete" || (action.kind === "update" && action.moveTo) ? [action.path] : []);
@@ -5362,15 +5417,14 @@ export function createMcpServer(
         await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       }
       const workspace = workspaces.getWorkspace(workspaceId);
-      // ── P0 writer admission ──────────────────────────────────────────────
       // Checked only for write-capable commands; read-only commands skip.
-      if (p0Pointer && workResumeStore && mutationCapable) {
+      if (mutationCapable) {
         try {
-          await centralAdmissionCheck({
-            store: workResumeStore,
+          enforceNexusWriterAdmission({
+            workspaceRoot: workspace.root,
             pointer: p0Pointer,
+            store: workResumeStore,
             ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-            worktreeRealpath: workspace.root,
             operation: "shell",
           });
         } catch (err) {
@@ -5498,14 +5552,14 @@ export function createMcpServer(
   );
 
   if (config.toolMode === "codex") {
-    registerCodexProcessTools(server, config, workspaces, processSessions, coreMutationGuard);
+    registerCodexProcessTools(server, config, workspaces, processSessions, coreMutationGuard, workResumeStore, carrierBindings);
   }
 
   // Narrow opt-in Codex Goal capability. Available in every tool mode, but it
   // exposes only special-purpose goal actions; generic exec_command/write_stdin
   // stay hidden outside codex mode.
   if (config.codexGoalsEnabled && codexGoals) {
-    registerCodexGoalTools(server, config, workspaces, codexGoals, coreMutationGuard);
+    registerCodexGoalTools(server, config, workspaces, codexGoals, coreMutationGuard, workResumeStore, carrierBindings);
   }
 
   if (config.artifactsEnabled && isArtifactDownloadSupportedPlatform()) {
@@ -5835,35 +5889,36 @@ export function createMcpServer(
             ? { catalogReceipt: catalogReceiptForProfile(selectedProfile, opencodeCatalog, clineCatalog) }
             : {}),
         };
-        // ── P0 writer admission ──────────────────────────────────────────────
-        // Must happen BEFORE provider launch.  No-op for legacy callers without
-        // a resumableWork pointer; fails closed when the pointer is present but
-        // assertHeld fails (version drift, expired, already terminal, etc.).
-        if (contract?.resumableWork && workResumeStore) {
+        // Must happen BEFORE provider launch for every write-capable worker in
+        // an enrolled repository. Non-enrolled repositories preserve legacy behavior.
+        if (selectedProfile?.write_mode !== "read_only") {
           try {
-            if (contract.resumableWork.effectHandle !== attemptKey) {
+            const pointer = contract?.resumableWork;
+            if (pointer?.effectHandle !== undefined && pointer.effectHandle !== attemptKey) {
               throw new Error(
                 "P0 agent_start requires resumableWork.effectHandle to exactly equal attemptKey.",
               );
             }
-            await centralAdmissionCheck({
+            enforceNexusWriterAdmission({
+              workspaceRoot: workspace.root,
+              pointer,
               store: workResumeStore,
-              pointer: contract.resumableWork,
               ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-              worktreeRealpath: workspace.root,
               operation: "agent_start",
             });
-            workResumeStore.bindEffectIdentity({
-              workKey: contract.resumableWork.workKey,
-              leaseId: contract.resumableWork.leaseId,
-              effectKind: "agent",
-              effectKey: attemptKey,
-              lineage: (contract.role || contract.parentEffectKey || contract.supersedes) ? {
-                role: contract.role,
-                parentEffectKey: contract.parentEffectKey,
-                supersedes: contract.supersedes,
-              } : undefined,
-            });
+            if (pointer && workResumeStore) {
+              workResumeStore.bindEffectIdentity({
+                workKey: pointer.workKey,
+                leaseId: pointer.leaseId,
+                effectKind: "agent",
+                effectKey: attemptKey,
+                lineage: (contract?.role || contract?.parentEffectKey || contract?.supersedes) ? {
+                  role: contract?.role,
+                  parentEffectKey: contract?.parentEffectKey,
+                  supersedes: contract?.supersedes,
+                } : undefined,
+              });
+            }
           } catch (err) {
             throw new AgentSessionError(
               "INVALID_EXECUTION_CONTRACT",
@@ -5989,17 +6044,16 @@ export function createMcpServer(
             }
           }
         }
-        // ── P0 writer admission ──────────────────────────────────────────────
-        // Reads the resumableWork pointer from the persisted contract stored at
-        // agent_start time.  No-op for legacy agents without a P0 pointer.
+        // Revalidate the persisted admission before every write-capable continuation.
         const resumableWorkForContinue = currentAgent?.executionContract?.resumableWork;
-        if (resumableWorkForContinue && workResumeStore) {
+        if (currentWriteMode !== "read_only") {
           try {
-            await centralAdmissionCheck({
-              store: workResumeStore,
+            enforceNexusWriterAdmission({
+              workspaceRoot: workspace.root,
               pointer: resumableWorkForContinue,
+              store: workResumeStore,
               ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-              worktreeRealpath: workspace.root,
+              operation: "agent_continue",
             });
           } catch (err) {
             throw new AgentSessionError(
@@ -6981,6 +7035,9 @@ export function createMcpServer(
             .boolean()
             .default(false)
             .describe("Whether to overwrite an existing destination file. Defaults to false."),
+          resumableWork: resumableWorkSchema().optional().describe(
+            "Nexus writer-admission pointer. Required when the destination repository is enrolled.",
+          ),
         },
         outputSchema: resultOutputSchema({
           sourcePath: z.string(),
@@ -7002,6 +7059,7 @@ export function createMcpServer(
           expectedDestinationSha256,
           expectedDestinationAbsent,
           overwrite,
+          resumableWork: p0Pointer,
         },
         extra,
       ) => {
@@ -7012,6 +7070,13 @@ export function createMcpServer(
         );
         const sourceWorkspace = workspaces.getWorkspace(sourceWorkspaceId);
         const destinationWorkspace = workspaces.getWorkspace(destinationWorkspaceId);
+        enforceNexusWriterAdmission({
+          workspaceRoot: destinationWorkspace.root,
+          pointer: p0Pointer,
+          store: workResumeStore,
+          ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+          operation: "workspace_copy_file",
+        });
 
         const resolvedSource = workspaces.resolveReadPath(sourceWorkspace, sourcePath);
         if (resolvedSource.nestedInstructionRebindRequired) {
@@ -7262,6 +7327,9 @@ export function createMcpServer(
         confirmApply: z
           .boolean()
           .describe("Must be true to apply. Without it the operation stays read-only preparation."),
+        resumableWork: resumableWorkSchema().optional().describe(
+          "Nexus writer-admission pointer for the destination. Required when applying into an enrolled repository.",
+        ),
       },
       outputSchema: candidateIntegrateOutputSchema,
       _meta: {},
@@ -7272,12 +7340,21 @@ export function createMcpServer(
         openWorldHint: false,
       },
     },
-    async ({ sourceWorkspaceId, candidateBase, candidateHead, destinationWorkspaceId, expectedDestinationHead, dirtyPolicy, confirmApply }, extra) => {
+    async ({ sourceWorkspaceId, candidateBase, candidateHead, destinationWorkspaceId, expectedDestinationHead, dirtyPolicy, confirmApply, resumableWork: p0Pointer }, extra) => {
       if (confirmApply) {
         await workspaces.assertConversationMutationAllowed(destinationWorkspaceId, openAiConversationScopeId(extra._meta));
       }
       const source = workspaces.getWorkspace(sourceWorkspaceId);
       const destination = workspaces.getWorkspace(destinationWorkspaceId);
+      if (confirmApply) {
+        enforceNexusWriterAdmission({
+          workspaceRoot: destination.root,
+          pointer: p0Pointer,
+          store: workResumeStore,
+          ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+          operation: "candidate_integrate",
+        });
+      }
       let coreAdmission: CoreMutationAdmission | undefined;
       let coreCandidate: ReturnType<CoreMutationGuard["candidate"]>;
       const destinationCore = confirmApply && coreMutationGuard
@@ -7429,13 +7506,13 @@ export function createMcpServer(
       }, extra) => {
         const source = workspaces.getWorkspace(sourceWorkspaceId);
         const destination = workspaces.getWorkspace(destinationWorkspaceId);
-        if (confirmPromote && p0Pointer && workResumeStore) {
+        if (confirmPromote) {
           try {
-            await centralAdmissionCheck({
-              store: workResumeStore,
+            enforceNexusWriterAdmission({
+              workspaceRoot: destination.root,
               pointer: p0Pointer,
+              store: workResumeStore,
               ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-              worktreeRealpath: destination.root,
               operation: "git_promote_candidate",
             });
           } catch (err) {
@@ -7545,21 +7622,19 @@ export function createMcpServer(
             "[GIT_MANAGED_WORKTREE_REQUIRED] Git candidate mutations are only allowed on DevSpace-managed worktrees.",
           );
         }
-        // ── P0 writer admission ──────────────────────────────────────────────
-        if (p0Pointer && workResumeStore) {
-          try {
-            await centralAdmissionCheck({
-              store: workResumeStore,
-              pointer: p0Pointer,
-              ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-              worktreeRealpath: workspace.root,
-              operation: "git_commit",
-            });
-          } catch (err) {
-            throw new Error(
-              `[P0_WRITER_ADMISSION_FAILED] ${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
+        // Nexus-enrolled repositories cannot form Candidates without admission.
+        try {
+          enforceNexusWriterAdmission({
+            workspaceRoot: workspace.root,
+            pointer: p0Pointer,
+            store: workResumeStore,
+            ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+            operation: "git_commit",
+          });
+        } catch (err) {
+          throw new Error(
+            `[P0_WRITER_ADMISSION_FAILED] ${err instanceof Error ? err.message : String(err)}`,
+          );
         }
         let committed: Awaited<ReturnType<typeof commitCandidate>> | undefined;
         let coreAdmission: CoreMutationAdmission | undefined;
@@ -7774,21 +7849,19 @@ export function createMcpServer(
             "[GIT_MANAGED_WORKTREE_REQUIRED] Git candidate mutations are only allowed on DevSpace-managed worktrees.",
           );
         }
-        // ── P0 writer admission ──────────────────────────────────────────────
-        if (p0Pointer && workResumeStore) {
-          try {
-            await centralAdmissionCheck({
-              store: workResumeStore,
-              pointer: p0Pointer,
-              ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
-              worktreeRealpath: workspace.root,
-              operation: "git_push",
-            });
-          } catch (err) {
-            throw new Error(
-              `[P0_WRITER_ADMISSION_FAILED] ${err instanceof Error ? err.message : String(err)}`,
-            );
-          }
+        // Nexus-enrolled repositories cannot publish Candidates without admission.
+        try {
+          enforceNexusWriterAdmission({
+            workspaceRoot: workspace.root,
+            pointer: p0Pointer,
+            store: workResumeStore,
+            ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+            operation: "git_push",
+          });
+        } catch (err) {
+          throw new Error(
+            `[P0_WRITER_ADMISSION_FAILED] ${err instanceof Error ? err.message : String(err)}`,
+          );
         }
         let pushed: Awaited<ReturnType<typeof pushCandidate>> | undefined;
         let coreAdmission: CoreMutationAdmission | undefined;

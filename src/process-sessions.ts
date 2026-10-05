@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { withInstalledNexusCertifyOnPath } from "./local-agent-path.js";
 import { realpathSync } from "node:fs";
 import { StringDecoder } from "node:string_decoder";
 import {
@@ -319,7 +320,9 @@ export function processEnvironment(
   },
 ): Record<string, string> {
   const source = Object.fromEntries(
-    Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
+    Object.entries(withInstalledNexusCertifyOnPath(process.env)).filter(
+      (entry): entry is [string, string] => entry[1] !== undefined,
+    ),
   );
   const base = policy === "sanitized"
     ? selectSanitizedEnvironment(source)
