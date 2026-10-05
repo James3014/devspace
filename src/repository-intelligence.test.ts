@@ -292,10 +292,10 @@ test("native tools are opt-in and exactly read-only when enabled", async () => {
   } finally { cleanupDir(root); }
 });
 
-const EXTRACTED_ENGINE_ROOT = "/Users/jameschen/Workspace/repository-intelligence-engine";
-const EXTRACTED_ENGINE_HEAD = "282e26255577dde2c4d542f75ee12628c9b55490";
+const EXTRACTED_ENGINE_ROOT = process.env.DEVSPACE_TEST_REPOSITORY_INTELLIGENCE_ROOT;
+const EXTRACTED_ENGINE_HEAD = process.env.DEVSPACE_TEST_REPOSITORY_INTELLIGENCE_EXPECTED_HEAD;
 
-if (existsSync(join(EXTRACTED_ENGINE_ROOT, ".git"))) {
+if (EXTRACTED_ENGINE_ROOT && EXTRACTED_ENGINE_HEAD) {
   test("live integration binds the productized Repository Intelligence engine HEAD", async () => {
     const result = await runRepositoryIntelligenceOperation(
       {
