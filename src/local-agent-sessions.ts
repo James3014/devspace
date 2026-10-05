@@ -88,6 +88,7 @@ import {
   ExecutionProtocolError,
 } from "./execution-protocol.js";
 import { describeRuntimeBuildIdentity, type RuntimeBuildIdentity } from "./build-identity.js";
+import { withInstalledNexusCertifyOnPath } from "./local-agent-path.js";
 import type { LocalEffectEnforcementReceipt } from "./local-effect-enforcement.js";
 import { devspaceConfigDir } from "./user-config.js";
 import {
@@ -1855,7 +1856,7 @@ export class LocalAgentSessionManager {
     }
 
     // Optional structured execution contract (execution-control only).
-    let providerEnvironment = process.env;
+    let providerEnvironment = withInstalledNexusCertifyOnPath(process.env);
     if (executionContract?.toolchainId) {
       const toolchain = this.config.toolchains.find((candidate) => candidate.id === executionContract.toolchainId);
       if (!toolchain) {
@@ -2600,7 +2601,7 @@ export class LocalAgentSessionManager {
 
     let toolchainAvailable = false;
     let executables: Record<string, string> | undefined;
-    let providerEnvironment = process.env;
+    let providerEnvironment = withInstalledNexusCertifyOnPath(process.env);
     if (toolchainId) {
       const toolchain = this.config.toolchains.find((candidate) => candidate.id === toolchainId);
       if (!toolchain) {
@@ -4435,7 +4436,7 @@ function providerEnvironment(
   record: LocalAgentRecord,
   scratch?: ScratchHandle,
 ): NodeJS.ProcessEnv {
-  let environment: NodeJS.ProcessEnv = process.env;
+  let environment: NodeJS.ProcessEnv = withInstalledNexusCertifyOnPath(process.env);
   if (record.executionContract?.toolchainId) {
     try {
       environment = buildToolchainEnvironment(
@@ -4446,7 +4447,7 @@ function providerEnvironment(
     } catch {
       // The turn proceeds with the server environment; the toolchain bridge was
       // already validated at start/preflight. Verification will surface drift.
-      environment = { ...process.env };
+      environment = withInstalledNexusCertifyOnPath(process.env);
     }
   }
   return scratch
