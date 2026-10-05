@@ -24,6 +24,7 @@ import {
 import { logEvent } from "./logger.js";
 import type { WorkspaceRegistry } from "./workspaces.js";
 import type { CoreMutationGuard } from "./core-mutation-tools.js";
+import type { NexusMutationAdmissionBinding } from "./nexus-mutation-admission.js";
 
 const ARTIFACT_WRITE_ANNOTATIONS = {
   readOnlyHint: false,
@@ -54,6 +55,11 @@ export interface ArtifactToolRegistrationOptions {
   workspaces: WorkspaceRegistry;
   incomingArtifactAdapters?: readonly IncomingArtifactAdapter[];
   coreMutation?: CoreMutationGuard;
+  authorizeNexusMutation(input: {
+    workspaceRoot: string;
+    binding?: NexusMutationAdmissionBinding;
+    requestedPaths?: string[];
+  }): Promise<void>;
 }
 
 export interface DownloadIncomingArtifactInput {
@@ -124,6 +130,7 @@ export function registerArtifactTools(
     workspaces,
     incomingArtifactAdapters = [],
     coreMutation,
+    authorizeNexusMutation,
   }: ArtifactToolRegistrationOptions,
 ): void {
   const incomingRegistry = new IncomingArtifactAdapterRegistry(incomingArtifactAdapters);
@@ -145,6 +152,13 @@ export function registerArtifactTools(
         path: z.string().min(1).describe(
           "Relative destination path inside the selected workspace. The destination must not already exist.",
         ),
+        mutationAdmission: z.object({
+          admissionId: z.string().regex(/^admission-[0-9a-f]{32}$/),
+          operationId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/),
+          receiptHash: z.string().regex(/^[0-9a-f]{64}$/),
+        }).strict().optional().describe(
+          "Nexus-owned mutation admission pointer required when the destination is a canonical Nexus repository.",
+        ),
       },
       outputSchema: {
         path: z.string(),
@@ -156,6 +170,11 @@ export function registerArtifactTools(
     async (input, extra) => executeArtifactTool(config, input, async () => {
       const destination = normalizeArtifactDestination(input.path);
       const workspace = workspaces.getWorkspace(input.workspaceId);
+      await authorizeNexusMutation({
+        workspaceRoot: workspace.root,
+        binding: input.mutationAdmission,
+        requestedPaths: [destination.path],
+      });
       const admission = coreMutation
         ? await coreMutation.admit({
             workspaceId: input.workspaceId,
