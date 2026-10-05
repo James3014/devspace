@@ -6428,13 +6428,23 @@ test("Issue #15 Wave 4B: capability convergence resolves the initialized request
       session?.sessionSnapshot?.conversationIdentityFingerprint,
     );
 
-    const acknowledgedToolsList = await post(secondSessionId!, {
-      jsonrpc: "2.0",
-      id: 23,
-      method: "tools/list",
-      params: {},
+    const failedToolsListAcknowledgement = await fetch(mcpUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${accessToken}`,
+        "Accept": "application/json",
+        "mcp-protocol-version": "2024-11-05",
+        "mcp-session-id": secondSessionId!,
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 23,
+        method: "tools/list",
+        params: {},
+      }),
     });
-    assert.equal(acknowledgedToolsList.status, 200);
+    assert.equal(failedToolsListAcknowledgement.status, 406);
 
     const thirdInitialized = await post("", {
       jsonrpc: "2.0",
@@ -6450,9 +6460,49 @@ test("Issue #15 Wave 4B: capability convergence resolves the initialized request
     const thirdSessionId = thirdInitialized.headers.get("mcp-session-id");
     assert.match(thirdSessionId ?? "", /^[0-9a-f-]{36}$/);
 
-    const acknowledgedConversationRefresh = await post(thirdSessionId!, {
+    const stillUnacknowledgedConversationRefresh = await post(thirdSessionId!, {
       jsonrpc: "2.0",
       id: 25,
+      method: "tools/call",
+      params: {
+        name: "capability_convergence_status",
+        arguments: {},
+        _meta: { "openai/session": "issue-240-caller-a" },
+      },
+    });
+    assert.equal(stillUnacknowledgedConversationRefresh.status, 200);
+    const stillUnacknowledgedConversationPayload = await parseResponse(stillUnacknowledgedConversationRefresh);
+    assert.equal(stillUnacknowledgedConversationPayload.result?.structuredContent?.refresh?.notificationSent, true);
+    assert.equal(stillUnacknowledgedConversationPayload.result?.structuredContent?.refresh?.alreadyAttempted, false);
+    assert.equal(stillUnacknowledgedConversationPayload.result?.structuredContent?.refresh?.nextAction, "RELIST_TOOLS");
+
+    const batchedToolsListAcknowledgement = await post(thirdSessionId!, [
+      {
+        jsonrpc: "2.0",
+        id: 26,
+        method: "tools/list",
+        params: {},
+      },
+    ]);
+    assert.equal(batchedToolsListAcknowledgement.status, 200);
+
+    const fourthInitialized = await post("", {
+      jsonrpc: "2.0",
+      id: 27,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "wave4b-client-fourth-session", version: "1.0.0" },
+      },
+    });
+    assert.equal(fourthInitialized.status, 200);
+    const fourthSessionId = fourthInitialized.headers.get("mcp-session-id");
+    assert.match(fourthSessionId ?? "", /^[0-9a-f-]{36}$/);
+
+    const acknowledgedConversationRefresh = await post(fourthSessionId!, {
+      jsonrpc: "2.0",
+      id: 28,
       method: "tools/call",
       params: {
         name: "capability_convergence_status",

@@ -9220,11 +9220,21 @@ export function createServer(
         registryRequestBegun = transports.beginRequest(registrySessionId);
       }
       try {
+        const toolsListRequested =
+          req.method === "POST" &&
+          (
+            req.body?.method === "tools/list" ||
+            (
+              Array.isArray(req.body) &&
+              req.body.some((message) => message?.method === "tools/list")
+            )
+          );
         await transport.handleRequest(req, res, req.body);
         if (
           registrySessionId &&
-          req.method === "POST" &&
-          req.body?.method === "tools/list" &&
+          toolsListRequested &&
+          res.statusCode >= 200 &&
+          res.statusCode < 300 &&
           cutoverController.mode() === "normal"
         ) {
           const beforeAcknowledgement = transports.getSnapshot(registrySessionId);
