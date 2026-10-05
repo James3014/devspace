@@ -1773,7 +1773,12 @@ async function bindTestCoreSession(input: {
   try {
     origin = (await execFileAsync("git", ["remote", "get-url", "origin"], { cwd: input.workspaceRoot })).stdout.trim();
   } catch {
-    origin = "https://github.com/James3014/devspace.git";
+    // This helper isolates Core mutation semantics. Give synthetic workspaces a
+    // non-Nexus physical Git origin so G2's canonical-repository pre-effect
+    // admission gate does not preempt the Core behavior under test. The Core
+    // binding below intentionally keeps its James3014/devspace repository
+    // identity for tests that query Core state by canonical repository.
+    origin = "https://github.com/example/devspace.git";
     await execFileAsync("git", ["remote", "add", "origin", origin], { cwd: input.workspaceRoot });
   }
   const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: input.workspaceRoot })).stdout.trim();
