@@ -7688,6 +7688,9 @@ export function createMcpServer(
             .min(1)
             .max(100)
             .describe("Workspace-relative file paths to stage and commit."),
+          mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+            "Nexus-owned mutation admission pointer required for canonical-repository Candidate formation.",
+          ),
           resumableWork: resumableWorkSchema().optional().describe(
             "P0 resumable-work pointer.  When supplied, the commit is admitted only if the exact lease is currently held by the caller.",
           ),
@@ -7711,13 +7714,19 @@ export function createMcpServer(
           openWorldHint: false,
         },
       },
-      async ({ workspaceId, expectedHead, message, paths, resumableWork: p0Pointer }, extra) => {
+      async ({ workspaceId, expectedHead, message, paths, mutationAdmission, resumableWork: p0Pointer }, extra) => {
         const workspace = workspaces.getWorkspace(workspaceId);
         if (workspace.mode !== "worktree" || !workspace.worktree?.managed) {
           throw new Error(
             "[GIT_MANAGED_WORKTREE_REQUIRED] Git candidate mutations are only allowed on DevSpace-managed worktrees.",
           );
         }
+        await authorizeNexusMutation({
+          workspaceRoot: workspace.root,
+          binding: mutationAdmission,
+          expectedBase: expectedHead,
+          requestedPaths: paths,
+        });
         // ── P0 writer admission ──────────────────────────────────────────────
         if (p0Pointer && workResumeStore) {
           try {
@@ -7922,6 +7931,9 @@ export function createMcpServer(
             .describe("Exact 40-character Git commit hash expected at current HEAD."),
           remote: z.string().describe("Configured Git remote name (e.g. 'origin')."),
           branch: z.string().describe("Name of the target non-default remote branch to push to."),
+          mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+            "Nexus-owned mutation admission pointer required for canonical-repository Candidate publication.",
+          ),
           resumableWork: resumableWorkSchema().optional().describe(
             "P0 resumable-work pointer.  When supplied, the push is admitted only if the exact lease is currently held by the caller.",
           ),
@@ -7940,13 +7952,18 @@ export function createMcpServer(
           openWorldHint: true,
         },
       },
-      async ({ workspaceId, expectedHead, remote, branch, resumableWork: p0Pointer }, extra) => {
+      async ({ workspaceId, expectedHead, remote, branch, mutationAdmission, resumableWork: p0Pointer }, extra) => {
         const workspace = workspaces.getWorkspace(workspaceId);
         if (workspace.mode !== "worktree" || !workspace.worktree?.managed) {
           throw new Error(
             "[GIT_MANAGED_WORKTREE_REQUIRED] Git candidate mutations are only allowed on DevSpace-managed worktrees.",
           );
         }
+        await authorizeNexusMutation({
+          workspaceRoot: workspace.root,
+          binding: mutationAdmission,
+          publicationHead: expectedHead,
+        });
         // ── P0 writer admission ──────────────────────────────────────────────
         if (p0Pointer && workResumeStore) {
           try {
