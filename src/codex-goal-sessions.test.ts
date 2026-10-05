@@ -379,7 +379,10 @@ async function bindGoalCoreSession(
   assert.ok(fixture.coreMutationSessions);
   const head = await headSha(fixture.projectA);
   const tree = (await execFileAsync("git", ["rev-parse", "HEAD^{tree}"], { cwd: fixture.projectA })).stdout.trim();
-  const origin = "https://github.com/James3014/devspace.git";
+  // This fixture isolates Core post-effect scope enforcement. Use a non-Nexus
+  // synthetic repository so G2's canonical Nexus pre-effect admission gate does
+  // not replace the Core behavior this test is specifically asserting.
+  const origin = "https://github.com/example/devspace.git";
   await execFileAsync("git", ["remote", "add", "origin", origin], { cwd: fixture.projectA });
   const contract = {
     contract_id: "codex-goal-core-test",
@@ -394,7 +397,7 @@ async function bindGoalCoreSession(
     operation_id: "operation-codex-goal-core",
     attempt_id: "attempt-codex-goal-core",
     repository: {
-      canonical_id: "James3014/devspace",
+      canonical_id: "example/devspace",
       origin,
       source_revision: `git-commit:${head}`,
       source_tree: `git-tree:${tree}`,
@@ -403,7 +406,7 @@ async function bindGoalCoreSession(
     },
     integration_authority: {
       execution_lane: "DIRECT_DELEGATED",
-      authority_ref: "James3014/devspace#135:test",
+      authority_ref: "example/devspace#135:test",
       authority_hash: `sha256:${"4".repeat(64)}`,
     },
     capability_discovery: {
