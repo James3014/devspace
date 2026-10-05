@@ -7437,6 +7437,9 @@ export function createMcpServer(
       }
       const source = workspaces.getWorkspace(sourceWorkspaceId);
       const destination = workspaces.getWorkspace(destinationWorkspaceId);
+      const destinationCore = confirmApply && coreMutationGuard
+        ? coreMutationGuard.require({ workspaceId: destinationWorkspaceId, extra })
+        : undefined;
       const integrationReadiness = confirmApply
         ? await inspectIntegrationReadiness({
             sourceWorkspaceRoot: source.root,
@@ -7461,9 +7464,6 @@ export function createMcpServer(
       }
       let coreAdmission: CoreMutationAdmission | undefined;
       let coreCandidate: ReturnType<CoreMutationGuard["candidate"]>;
-      const destinationCore = confirmApply && coreMutationGuard
-        ? coreMutationGuard.require({ workspaceId: destinationWorkspaceId, extra })
-        : undefined;
       if (confirmApply && coreMutationGuard && destinationCore && integrationReadiness) {
         coreCandidate = requireCoreCandidateProvenance(coreMutationGuard, integrationReadiness);
         coreAdmission = await coreMutationGuard.admit({
@@ -7605,6 +7605,9 @@ export function createMcpServer(
       }, extra) => {
         const source = workspaces.getWorkspace(sourceWorkspaceId);
         const destination = workspaces.getWorkspace(destinationWorkspaceId);
+        const destinationCore = confirmPromote && coreMutationGuard
+          ? coreMutationGuard.require({ workspaceId: destinationWorkspaceId, extra })
+          : undefined;
         if (confirmPromote && p0Pointer && workResumeStore) {
           try {
             await centralAdmissionCheck({
@@ -7637,9 +7640,6 @@ export function createMcpServer(
         }
         let coreAdmission: CoreMutationAdmission | undefined;
         let coreCandidate: ReturnType<CoreMutationGuard["candidate"]>;
-        const destinationCore = confirmPromote && coreMutationGuard
-          ? coreMutationGuard.require({ workspaceId: destinationWorkspaceId, extra })
-          : undefined;
         if (confirmPromote && coreMutationGuard && destinationCore && promotionReadiness) {
           coreCandidate = requireCoreCandidateProvenance(coreMutationGuard, promotionReadiness);
           coreAdmission = await coreMutationGuard.admit({
