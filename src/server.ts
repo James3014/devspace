@@ -483,6 +483,7 @@ const workspaceIdDescription =
 
 const mutationAdmissionBindingSchema = () => z.object({
   admissionId: z.string().regex(/^admission-[0-9a-f]{32}$/),
+  operationId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/),
   receiptHash: z.string().regex(/^[0-9a-f]{64}$/),
 }).strict();
 
@@ -3378,6 +3379,9 @@ export function createMcpServer(
           workspaceRoot: input.workspaceRoot,
           binding: input.binding,
           candidateHead: input.publicationHead.toLowerCase(),
+          expectedBase: input.expectedBase,
+          requestedPaths: input.requestedPaths,
+          operationId: input.binding?.operationId,
         });
         return;
       }
@@ -3387,6 +3391,7 @@ export function createMcpServer(
         binding: input.binding,
         expectedBase,
         requestedPaths: input.requestedPaths,
+        operationId: input.binding?.operationId,
       });
     } catch (error) {
       if (error instanceof NexusMutationAdmissionError) {
