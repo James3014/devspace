@@ -7401,6 +7401,9 @@ export function createMcpServer(
         confirmApply: z
           .boolean()
           .describe("Must be true to apply. Without it the operation stays read-only preparation."),
+        mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+          "Nexus-owned mutation admission pointer for the destination canonical repository.",
+        ),
       },
       outputSchema: candidateIntegrateOutputSchema,
       _meta: {},
@@ -7411,26 +7414,36 @@ export function createMcpServer(
         openWorldHint: false,
       },
     },
-    async ({ sourceWorkspaceId, candidateBase, candidateHead, destinationWorkspaceId, expectedDestinationHead, dirtyPolicy, confirmApply }, extra) => {
+    async ({ sourceWorkspaceId, candidateBase, candidateHead, destinationWorkspaceId, expectedDestinationHead, dirtyPolicy, confirmApply, mutationAdmission }, extra) => {
       if (confirmApply) {
         await workspaces.assertConversationMutationAllowed(destinationWorkspaceId, openAiConversationScopeId(extra._meta));
       }
       const source = workspaces.getWorkspace(sourceWorkspaceId);
       const destination = workspaces.getWorkspace(destinationWorkspaceId);
+      const readiness = confirmApply
+        ? await inspectIntegrationReadiness({
+            sourceWorkspaceRoot: source.root,
+            candidateBase,
+            candidateHead,
+            destinationWorkspaceRoot: destination.root,
+            expectedDestinationHead,
+            dirtyPolicy,
+          })
+        : undefined;
+      if (confirmApply && readiness) {
+        await authorizeNexusMutation({
+          workspaceRoot: destination.root,
+          binding: mutationAdmission,
+          expectedBase: expectedDestinationHead,
+          requestedPaths: readiness.candidateChangedPaths,
+        });
+      }
       let coreAdmission: CoreMutationAdmission | undefined;
       let coreCandidate: ReturnType<CoreMutationGuard["candidate"]>;
       const destinationCore = confirmApply && coreMutationGuard
         ? coreMutationGuard.require({ workspaceId: destinationWorkspaceId, extra })
         : undefined;
-      if (confirmApply && coreMutationGuard && destinationCore) {
-        const readiness = await inspectIntegrationReadiness({
-          sourceWorkspaceRoot: source.root,
-          candidateBase,
-          candidateHead,
-          destinationWorkspaceRoot: destination.root,
-          expectedDestinationHead,
-          dirtyPolicy,
-        });
+      if (confirmApply && coreMutationGuard && destinationCore && readiness) {
         if (!readiness.technicallyReadyToApply) throw new Error(`[CANDIDATE_INTEGRATION_NOT_READY] ${readiness.blockers.map((blocker) => blocker.code).join(", ") || "readiness unknown"}`);
         coreCandidate = requireCoreCandidateProvenance(coreMutationGuard, readiness);
         coreAdmission = await coreMutationGuard.admit({
