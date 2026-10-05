@@ -3357,15 +3357,6 @@ export function createMcpServer(
     config.nexusMutationAdmissionStateDir,
   );
 
-  const currentWorkspaceHead = async (workspaceRoot: string): Promise<string | undefined> => {
-    try {
-      const head = (await runGit(workspaceRoot, ["rev-parse", "HEAD"])).stdout.trim().toLowerCase();
-      return /^[0-9a-f]{40}$/.test(head) ? head : undefined;
-    } catch {
-      return undefined;
-    }
-  };
-
   const authorizeNexusMutation = async (input: {
     workspaceRoot: string;
     binding?: NexusMutationAdmissionBinding;
@@ -3385,11 +3376,10 @@ export function createMcpServer(
         });
         return;
       }
-      const expectedBase = input.expectedBase ?? await currentWorkspaceHead(input.workspaceRoot);
       await nexusMutationAdmissions.authorizeWorkspaceMutation({
         workspaceRoot: input.workspaceRoot,
         binding: input.binding,
-        expectedBase,
+        expectedBase: input.expectedBase,
         requestedPaths: input.requestedPaths,
         operationId: input.binding?.operationId,
       });
@@ -7724,7 +7714,6 @@ export function createMcpServer(
         await authorizeNexusMutation({
           workspaceRoot: workspace.root,
           binding: mutationAdmission,
-          expectedBase: expectedHead,
           requestedPaths: paths,
         });
         // ── P0 writer admission ──────────────────────────────────────────────
