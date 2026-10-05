@@ -1331,7 +1331,7 @@ async function fixture(
   const project = join(root, "project");
   const agentDir = join(root, "agent");
   const stateDir = join(root, ".state");
-  const nexusMutationAdmissionStateDir = options.nexusMutationAdmission
+  const nexusMutationAdmissionStateDir = (options.nexusMutationAdmission || options.coreMutation === true)
     ? join(root, ".nexus-state")
     : undefined;
 
