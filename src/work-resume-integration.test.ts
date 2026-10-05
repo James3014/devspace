@@ -1328,3 +1328,325 @@ test("I-5: OUTCOME_UNKNOWN disposition is suppressed (checkDuplicate returns sup
   const { store, ownership } = makeTestStore(sqlite, () => now);
   try {
     const session = "session-outcome-unknown";
+    ownership.putGrantEvidence(session, {
+      repository: "owner/devspace", goal: "issue-329",
+      coordinatorThread: session, evidenceHash: "cafebabe",
+    }, 0);
+
+    const root = "/fake/outcome-unknown";
+    const material: WorkKeyMaterial = {
+      repositoryKey: "owner/devspace",
+      ownerIssueId: "issue-329",
+      baseRevisionSha: BASE_SHA,
+      worktreeRealpath: root,
+      writeScope: [root],
+      contractPurpose: "p0-outcome-unknown",
+    };
+    const wk = computeWorkKey(material);
+    const li = buildWorktreeLeaseInput(wk, material, {
+      repository: "owner/devspace", goal: "issue-329",
+      coordinatorThread: session, evidenceHash: "cafebabe",
+    }, new Date(now + 1_000).toISOString());
+    const lease = ownership.acquire(session, li);
+    store.register(wk, material, li.idempotencyKey, lease.leaseId);
+
+    // Pin to simulate in-flight effect
+    ownership.beginOperation(session, lease.leaseId, lease.version, "in-flight-task");
+
+    // Expire lease
+    now += 10_000;
+
+    // Must be suppressed as RECONCILE_REQUIRED
+    const dup = store.checkDuplicate(wk);
+    assert.ok(dup.suppressed, "OUTCOME_UNKNOWN must be suppressed");
+    assert.equal(dup.suppressed && dup.status.disposition, "RECONCILE_REQUIRED");
+  } finally {
+    sqlite.close();
+  }
+});
+
+// ─── I-6: terminal replay → suppressed, receipt readable ─────────────────────
+
+test("I-6: terminal exact replay is suppressed; receipt readable via disposition", () => {
+  const sqlite = new Database(":memory:");
+  const { store, ownership } = makeTestStore(sqlite);
+  try {
+    const session = "session-terminal";
+    ownership.putGrantEvidence(session, {
+      repository: "owner/devspace", goal: "issue-330",
+      coordinatorThread: session, evidenceHash: "beefdead",
+    }, 0);
+
+    const root = "/fake/terminal-replay";
+    const material: WorkKeyMaterial = {
+      repositoryKey: "owner/devspace",
+      ownerIssueId: "issue-330",
+      baseRevisionSha: BASE_SHA,
+      worktreeRealpath: root,
+      writeScope: [root],
+      contractPurpose: "p0-terminal-replay",
+    };
+    const wk = computeWorkKey(material);
+    const li = buildWorktreeLeaseInput(wk, material, {
+      repository: "owner/devspace", goal: "issue-330",
+      coordinatorThread: session, evidenceHash: "beefdead",
+    }, new Date(Date.now() + 60_000).toISOString());
+    const lease = ownership.acquire(session, li);
+    store.register(wk, material, li.idempotencyKey, lease.leaseId);
+
+    const pinned = ownership.beginOperation(session, lease.leaseId, lease.version, "effect-terminal");
+    const evidence = {
+      leaseId: lease.leaseId,
+      ownerThread: session,
+      operationHandle: "effect-terminal",
+      operation: WORKTREE_WRITER_OPERATION,
+      baseRevision: BASE_SHA,
+      leaseVersion: pinned.version,
+      state: "finished" as const,
+    };
+    const receipt = store.recordTerminalReceipt(session, wk, lease.leaseId, pinned.version, evidence);
+    assert.ok(receipt.receiptId);
+
+    const replay = store.disposition(wk);
+    assert.equal(replay.disposition, "TERMINAL");
+    assert.equal(replay.terminalReceipt?.receiptId, receipt.receiptId);
+
+    const dup = store.checkDuplicate(wk);
+    assert.ok(dup.suppressed);
+    assert.equal(dup.suppressed && dup.status.disposition, "TERMINAL");
+  } finally {
+    sqlite.close();
+  }
+});
+
+// ─── I-7: process restart → same workKey/lease/effect handle ─────────────────
+
+test("I-7: process restart reads back same workKey/lease/effect handle from durable SQLite", () => {
+  const dir = mkdtempSync(join(tmpdir(), "devspace-p0-restart-"));
+  const dbPath = join(dir, "p0-state.sqlite");
+  const session = "session-restart";
+  const root = "/fake/p0-restart";
+
+  let capturedWorkKey: string;
+  let capturedLeaseId: string;
+
+  try {
+    // Phase 1: initial acquisition
+    {
+      const db = new Database(dbPath);
+      const { store, ownership } = makeTestStore(db);
+      ownership.putGrantEvidence(session, {
+        repository: "owner/devspace", goal: "issue-331",
+        coordinatorThread: session, evidenceHash: "abcd1234",
+      }, 0);
+      const material: WorkKeyMaterial = {
+        repositoryKey: "owner/devspace",
+        ownerIssueId: "issue-331",
+        baseRevisionSha: BASE_SHA,
+        worktreeRealpath: root,
+        writeScope: [root],
+        contractPurpose: "p0-restart-test",
+      };
+      capturedWorkKey = computeWorkKey(material);
+      const li = buildWorktreeLeaseInput(capturedWorkKey, material, {
+        repository: "owner/devspace", goal: "issue-331",
+        coordinatorThread: session, evidenceHash: "abcd1234",
+      }, new Date(Date.now() + 60_000).toISOString());
+      const lease = ownership.acquire(session, li);
+      store.register(capturedWorkKey, material, li.idempotencyKey, lease.leaseId);
+      capturedLeaseId = lease.leaseId;
+      ownership.beginOperation(session, lease.leaseId, lease.version, "pre-restart-effect");
+      db.close();
+    }
+
+    // Phase 2: restart — new instance, same durable DB
+    {
+      const db = new Database(dbPath);
+      const { store: store2, ownership: ownership2 } = makeTestStore(db);
+      // putGrantEvidence at version 1 (already stored at version 1 from phase 1)
+      ownership2.putGrantEvidence(session, {
+        repository: "owner/devspace", goal: "issue-331",
+        coordinatorThread: session, evidenceHash: "abcd1234",
+      }, 1);
+
+      const status = store2.disposition(capturedWorkKey);
+      assert.ok(
+        status.disposition === "RUNNING" || status.disposition === "RECONCILE_REQUIRED",
+        `Expected RUNNING or RECONCILE_REQUIRED after restart, got: ${status.disposition}`,
+      );
+      assert.equal(status.leaseId, capturedLeaseId);
+
+      const live = store2.getLease(capturedLeaseId);
+      assert.equal(live?.operationHandle, "pre-restart-effect");
+      db.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ─── I-12: #62 control-plane semantics unchanged ──────────────────────────────
+
+test("I-12: ControlPlaneOwnershipStore core semantics unchanged by P0 additions", () => {
+  const db = new Database(":memory:");
+  // Use identity resolver (no physical resource resolution) for the pure #62 test
+  const ownership = new ControlPlaneOwnershipStore(db, {
+    resolveOwnerContext: (ctx) =>
+      typeof ctx === "string" && ctx.length > 0 ? { ownerThread: ctx } : undefined,
+    resolveResourceIdentity: (input) => input,
+    verifyGrantEvidence: () => true,
+    verifyReconciliationEvidence: () => true,
+  });
+  const grant = { repository: "r/repo", goal: "g1", coordinatorThread: "owner62", evidenceHash: "ef" };
+  ownership.putGrantEvidence("owner62", grant, 0);
+
+  try {
+    const lease = ownership.acquire("owner62", {
+      repositoryKey: "r/repo",
+      resourceKind: "filesystem",
+      resourceId: "/repo",
+      resource: "/repo",
+      operation: "sync",
+      scope: ["/repo"],
+      baseRevision: "0".repeat(40),
+      expiresAt: new Date(Date.now() + 60_000).toISOString(),
+      idempotencyKey: "p0-i12-test",
+      grant,
+    });
+    assert.ok(lease.leaseId);
+    assert.equal(lease.version, 1);
+
+    const held = ownership.assertHeld("owner62", lease.leaseId, 1, "sync", "0".repeat(40));
+    assert.equal(held.leaseId, lease.leaseId);
+
+    const pinned = ownership.beginOperation("owner62", lease.leaseId, 1, "some-op");
+    assert.equal(pinned.version, 2);
+    assert.equal(pinned.operationHandle, "some-op");
+
+    const finished = ownership.finishOperation("owner62", lease.leaseId, 2, "some-op");
+    assert.equal(finished.version, 3);
+    assert.ok(!finished.operationHandle);
+
+    ownership.release("owner62", lease.leaseId, 3);
+    assert.equal(ownership.get(lease.leaseId)?.terminalState, "released");
+  } finally {
+    db.close();
+  }
+});
+
+// ─── I-P1: operation lineage graph bound and queried via work_resume_status ───
+
+test("I-P1: agent_start binds operation lineage and work_resume_status preserves it across reconnection", async (t) => {
+  const fix = await makeFixture();
+  t.after(() => fix.close());
+
+  const { workKey, leaseId, leaseVersion } = acquireAndRegister(
+    fix.ownership,
+    fix.store,
+    fix.projectRoot,
+    OWNER_SESSION,
+  );
+  const attemptKey = "issue329-p1-lineage-attempt";
+  const argumentsPayload = {
+    workspaceId: fix.workspaceId,
+    profile: "reviewer",
+    prompt: "P1 lineage witness test",
+    attemptKey,
+    executionContract: {
+      role: "REPAIR",
+      parentEffectKey: "att_implement_initial",
+      supersedes: "agyop_prior_attempt",
+      resumableWork: buildPointer({
+        workKey,
+        leaseId,
+        leaseVersion,
+        effectHandle: attemptKey,
+      }),
+    },
+  };
+
+  const started = await fix.client.callTool({
+    name: "agent_start",
+    arguments: argumentsPayload,
+    _meta: SESSION_META,
+  });
+  const startedContent = started.structuredContent as Record<string, unknown>;
+  const agentId = startedContent.agentId as string;
+  assert.ok(agentId);
+
+  // 1. work_resume_status exposes lineage graph
+  const resumeStatus = await fix.client.callTool({
+    name: "work_resume_status",
+    arguments: { workspaceId: fix.workspaceId, workKey },
+    _meta: SESSION_META,
+  });
+  const resumeParsed = resumeStatus.structuredContent as Record<string, unknown>;
+  assert.deepEqual(resumeParsed.lineage, {
+    role: "REPAIR",
+    parentEffectKey: "att_implement_initial",
+    supersedes: "agyop_prior_attempt",
+  });
+
+  // 2. agent_status exposes lineage graph
+  const agentStatus = await fix.client.callTool({
+    name: "agent_status",
+    arguments: { workspaceId: fix.workspaceId, agentId },
+    _meta: SESSION_META,
+  });
+  const agentParsed = agentStatus.structuredContent as Record<string, unknown>;
+  assert.deepEqual(agentParsed.lineage, {
+    role: "REPAIR",
+    parentEffectKey: "att_implement_initial",
+    supersedes: "agyop_prior_attempt",
+  });
+});
+
+test("I-P1b: automated verifier result is recorded on terminal and queryable via work_resume_status", async (t) => {
+  const fix = await makeFixture();
+  t.after(() => fix.close());
+
+  const { workKey, leaseId, leaseVersion } = acquireAndRegister(
+    fix.ownership,
+    fix.store,
+    fix.projectRoot,
+    OWNER_SESSION,
+  );
+  const attemptKey = "issue329-p1b-verifier-attempt";
+
+  // Bind effect
+  fix.store.bindEffectIdentity({
+    workKey,
+    leaseId,
+    effectKind: "agent",
+    effectKey: attemptKey,
+    lineage: { role: "IMPLEMENT" },
+  });
+
+  // Simulate terminal verifier execution recording
+  const verifierResult = {
+    effectKey: "verify:integration-semantic-effect",
+    effectState: "COMPLETED",
+    role: "VERIFY",
+    parentEffectKey: attemptKey,
+    toolchainId: "test-toolchain",
+    verifier: "typecheck",
+    exitCode: 0,
+    passed: true,
+    durationMs: 82,
+    stdout: "Typecheck passed: 0 errors",
+    stderr: "",
+  };
+  fix.store.recordAutomatedVerifierResult(workKey, verifierResult);
+
+  // work_resume_status returns automatedVerifierResult
+  const resumeStatus = await fix.client.callTool({
+    name: "work_resume_status",
+    arguments: { workspaceId: fix.workspaceId, workKey },
+    _meta: SESSION_META,
+  });
+  const parsed = resumeStatus.structuredContent as Record<string, unknown>;
+  assert.deepEqual(parsed.automatedVerifierResult, verifierResult);
+  assert.deepEqual(parsed.automatedVerifierEffects, {
+    "verify:integration-semantic-effect": verifierResult,
+  });
+});
