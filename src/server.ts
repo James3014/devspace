@@ -8181,7 +8181,7 @@ export function createServer(
     idleTimeoutMs: config.mcpSessionIdleTimeoutMs,
     onDispose: (sessionId, transport, reason) => notifyRegistryDisposal(sessionId, transport, reason),
   });
-  const projectionRefreshCatalogByConversation = new Map<string, string>();
+  const projectionRefreshAcknowledgedCatalogByConversation = new Map<string, string>();
   const broadcastToolListChanged = async (): Promise<number> => {
     const servers = transports.getAllServers();
     let sent = 0;
@@ -8847,7 +8847,7 @@ export function createServer(
         if (
           snapshot?.projectionRefreshCatalogGeneration === latestMcpToolCatalogGeneration.value ||
           (projectionOwner &&
-            projectionRefreshCatalogByConversation.get(projectionOwner) === latestMcpToolCatalogGeneration.value)
+            projectionRefreshAcknowledgedCatalogByConversation.get(projectionOwner) === latestMcpToolCatalogGeneration.value)
         ) {
           return { notificationSent: false, alreadyAttempted: true };
         }
@@ -8862,12 +8862,6 @@ export function createServer(
               ...snapshot,
               projectionRefreshCatalogGeneration: latestMcpToolCatalogGeneration.value,
             });
-          }
-          if (projectionOwner) {
-            projectionRefreshCatalogByConversation.set(
-              projectionOwner,
-              latestMcpToolCatalogGeneration.value,
-            );
           }
           return { notificationSent: true, alreadyAttempted: false };
         } catch {
@@ -9233,7 +9227,8 @@ export function createServer(
           req.body?.method === "tools/list" &&
           cutoverController.mode() === "normal"
         ) {
-          transports.acknowledgeToolsList(registrySessionId, {
+          const beforeAcknowledgement = transports.getSnapshot(registrySessionId);
+          const acknowledged = transports.acknowledgeToolsList(registrySessionId, {
             serverInstanceId: runtimeBuildIdentity.serverInstanceId,
             sourceCommit: runtimeBuildIdentity.sourceCommit,
             buildId: runtimeBuildIdentity.buildId,
@@ -9242,6 +9237,20 @@ export function createServer(
             freshness: runtimeBuildIdentity.startedAt,
             sessionInitializedAt: new Date().toISOString(),
           });
+          if (
+            acknowledged &&
+            beforeAcknowledgement?.projectionRefreshCatalogGeneration === latestMcpToolCatalogGeneration.value
+          ) {
+            const projectionOwner =
+              beforeAcknowledgement.conversationIdentityFingerprint ??
+              beforeAcknowledgement.callerIdentityFingerprint;
+            if (projectionOwner) {
+              projectionRefreshAcknowledgedCatalogByConversation.set(
+                projectionOwner,
+                latestMcpToolCatalogGeneration.value,
+              );
+            }
+          }
         }
       } finally {
         if (registrySessionId && registryRequestBegun) await transports.endRequest(registrySessionId);

@@ -6408,17 +6408,63 @@ test("Issue #15 Wave 4B: capability convergence resolves the initialized request
       stillUnprovenPayload.result?.structuredContent?.clientProjectionConvergence?.state,
       "CLIENT_PROJECTION_UNPROVEN",
     );
-    assert.equal(stillUnprovenPayload.result?.structuredContent?.refresh?.notificationSent, false);
-    assert.equal(stillUnprovenPayload.result?.structuredContent?.refresh?.alreadyAttempted, true);
-    assert.equal(stillUnprovenPayload.result?.structuredContent?.refresh?.nextAction, "RECONNECT_REQUIRED");
+    assert.equal(stillUnprovenPayload.result?.structuredContent?.refresh?.notificationSent, true);
+    assert.equal(stillUnprovenPayload.result?.structuredContent?.refresh?.alreadyAttempted, false);
+    assert.equal(stillUnprovenPayload.result?.structuredContent?.refresh?.nextAction, "RELIST_TOOLS");
     assert.equal(
       stillUnprovenPayload.result?.structuredContent?.sessionConvergence?.controllerDisposition,
-      "STALE_RECONNECT_REQUIRED",
+      "CLIENT_PROJECTION_UNPROVEN",
     );
     assert.equal(
       stillUnprovenPayload.result?.structuredContent?.sessionConvergence?.reconnectRequired,
-      true,
+      false,
     );
+    assert.equal(
+      stillUnprovenPayload.result?.structuredContent?.sessionConvergence?.sessionSnapshot?.callerIdentityFingerprint,
+      session?.sessionSnapshot?.callerIdentityFingerprint,
+    );
+    assert.equal(
+      stillUnprovenPayload.result?.structuredContent?.sessionConvergence?.sessionSnapshot?.conversationIdentityFingerprint,
+      session?.sessionSnapshot?.conversationIdentityFingerprint,
+    );
+
+    const acknowledgedToolsList = await post(secondSessionId!, {
+      jsonrpc: "2.0",
+      id: 23,
+      method: "tools/list",
+      params: {},
+    });
+    assert.equal(acknowledgedToolsList.status, 200);
+
+    const thirdInitialized = await post("", {
+      jsonrpc: "2.0",
+      id: 24,
+      method: "initialize",
+      params: {
+        protocolVersion: "2024-11-05",
+        capabilities: {},
+        clientInfo: { name: "wave4b-client-third-session", version: "1.0.0" },
+      },
+    });
+    assert.equal(thirdInitialized.status, 200);
+    const thirdSessionId = thirdInitialized.headers.get("mcp-session-id");
+    assert.match(thirdSessionId ?? "", /^[0-9a-f-]{36}$/);
+
+    const acknowledgedConversationRefresh = await post(thirdSessionId!, {
+      jsonrpc: "2.0",
+      id: 25,
+      method: "tools/call",
+      params: {
+        name: "capability_convergence_status",
+        arguments: {},
+        _meta: { "openai/session": "issue-240-caller-a" },
+      },
+    });
+    assert.equal(acknowledgedConversationRefresh.status, 200);
+    const acknowledgedConversationPayload = await parseResponse(acknowledgedConversationRefresh);
+    assert.equal(acknowledgedConversationPayload.result?.structuredContent?.refresh?.notificationSent, false);
+    assert.equal(acknowledgedConversationPayload.result?.structuredContent?.refresh?.alreadyAttempted, true);
+    assert.equal(acknowledgedConversationPayload.result?.structuredContent?.refresh?.nextAction, "RECONNECT_REQUIRED");
 
     const staleProjection = await post(sessionId!, {
       jsonrpc: "2.0",
