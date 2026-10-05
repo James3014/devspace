@@ -300,6 +300,30 @@ export class NexusMutationAdmissionResolver {
     if (input.expectedBase && receipt.base_sha !== input.expectedBase.toLowerCase()) {
       throw new NexusMutationAdmissionError("NEXUS_MUTATION_ADMISSION_BASE_MISMATCH", "Admission base does not match the requested mutation base.");
     }
+    let currentHead: string;
+    try {
+      currentHead = (await git(input.workspaceRoot, ["rev-parse", "HEAD"])).stdout.trim().toLowerCase();
+      await git(input.workspaceRoot, ["merge-base", "--is-ancestor", receipt.base_sha, currentHead]);
+    } catch {
+      throw new NexusMutationAdmissionError(
+        "NEXUS_MUTATION_ADMISSION_BASE_MISMATCH",
+        "Admission base is not an ancestor of the current workspace HEAD.",
+      );
+    }
+    const committedPaths = (await git(input.workspaceRoot, [
+      "diff",
+      "--name-only",
+      "--no-renames",
+      `${receipt.base_sha}..${currentHead}`,
+    ])).stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    for (const path of committedPaths) {
+      if (!pathWithinAdmission(path, receipt.allowed_paths)) {
+        throw new NexusMutationAdmissionError(
+          "NEXUS_MUTATION_ADMISSION_SCOPE_MISMATCH",
+          `Existing committed change is outside admitted scope: ${path}`,
+        );
+      }
+    }
     if (input.operationId && receipt.operation_id !== input.operationId) {
       throw new NexusMutationAdmissionError("NEXUS_MUTATION_ADMISSION_OPERATION_MISMATCH", "Admission operation identity does not match.");
     }
