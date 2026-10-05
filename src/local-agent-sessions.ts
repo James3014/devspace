@@ -847,7 +847,7 @@ export class LocalAgentSessionManager {
     );
     const terminalScope = reconciliation.completionStatus === "SCOPE_VIOLATION"
       ? "SCOPE_VIOLATION"
-      : scope.scopeState;
+      : reportableHerdrScopeState(scope.scopeState, reconciliation.enforcementState);
     const cumulative = Array.from(new Set([
       ...(record.lifecycleState?.cumulativeChangedPaths ?? []),
       ...delta.changedPaths,
@@ -2782,11 +2782,21 @@ export class LocalAgentSessionManager {
           { store: this.store },
         )
       : undefined;
-    const reconciledChangedPaths = herdrReconciliation?.changedPaths ?? workerChanged;
-    const reconciledUnexpectedPaths = herdrReconciliation?.unexpectedPaths ?? unexpectedPaths;
-    const reconciledScopeState: ScopeState = herdrReconciliation?.completionStatus === "SCOPE_VIOLATION"
+    const reconciledChangedPaths = Array.from(new Set([
+      ...workerChanged,
+      ...(herdrReconciliation?.changedPaths ?? []),
+    ])).sort();
+    const reconciledUnexpectedPaths = Array.from(new Set([
+      ...unexpectedPaths,
+      ...(herdrReconciliation?.unexpectedPaths ?? []),
+    ])).sort();
+    const observedScopeState: ScopeState = herdrReconciliation?.completionStatus === "SCOPE_VIOLATION"
       ? "SCOPE_VIOLATION"
       : scopeState;
+    const reconciledScopeState = reportableHerdrScopeState(
+      observedScopeState,
+      herdrReconciliation?.enforcementState ?? herdrHandle?.enforcementState,
+    );
 
     this.store.recordReconciledAtCAS(record.id);
 
@@ -4682,7 +4692,10 @@ function classifyDispatchFailure(record: LocalAgentRecord): DispatchFailureClass
 }
 
 /** Per-axis effect policy status derived from the physical enforcement receipt; request-only otherwise. */
-function deriveEffectPolicyStatus(record: LocalAgentRecord): NonNullable<AgentStatusOutput["effectPolicyStatus"]> {
+function deriveEffectPolicyStatus(
+  record: LocalAgentRecord,
+  herdrHandle?: HerdrExternalHandle,
+): NonNullable<AgentStatusOutput["effectPolicyStatus"]> {
   const receipt = record.lifecycleState?.lastEffectEnforcementReceipt;
   const enforced = receipt?.enforcementMode === "ENFORCED_NATIVE_PROVIDER";
   const requested = record.executionContract?.effectProjection;
@@ -4697,10 +4710,18 @@ function deriveEffectPolicyStatus(record: LocalAgentRecord): NonNullable<AgentSt
   const axes = [process, network, git, toolCeiling];
   const overallEnforcement = axes.every((state) => state === "enforced")
     ? "PHYSICALLY_ENFORCED"
-    : axes.some((state) => state === "request_only" || state === "enforced")
+    : herdrHandle?.enforcementState === "REQUEST_ONLY_NOT_ENFORCED" || axes.some((state) => state === "request_only" || state === "enforced")
       ? "REQUEST_ONLY_NOT_ENFORCED"
       : "UNKNOWN";
   return { process, network, git, toolCeiling, overallEnforcement };
+}
+
+function reportableHerdrScopeState(
+  scopeState: ScopeState,
+  enforcementState: HerdrExternalHandle["enforcementState"] | undefined,
+): ScopeState {
+  if (scopeState === "SCOPE_VIOLATION") return scopeState;
+  return enforcementState === "REQUEST_ONLY_NOT_ENFORCED" ? "UNKNOWN" : scopeState;
 }
 
 function recordToStatusOutput(
@@ -4805,7 +4826,7 @@ function recordToStatusOutput(
   }
 
   // P2-G: Effect policy enforcement breakdown
-  output.effectPolicyStatus = deriveEffectPolicyStatus(record);
+  output.effectPolicyStatus = deriveEffectPolicyStatus(record, herdrHandle);
 
   if (record.providerSessionId !== undefined) output.providerSessionId = record.providerSessionId;
   if (record.latestResponse !== undefined) output.latestResponse = record.latestResponse;
@@ -4836,7 +4857,9 @@ function recordToStatusOutput(
     output.idleMs = lifecycle.idleMs;
     if (lifecycle.changedPaths !== undefined) output.changedPaths = lifecycle.changedPaths;
     if (lifecycle.terminalReason !== undefined) output.terminalReason = lifecycle.terminalReason;
-    if (lifecycle.scopeState !== undefined) output.scopeState = lifecycle.scopeState;
+    if (lifecycle.scopeState !== undefined) {
+      output.scopeState = reportableHerdrScopeState(lifecycle.scopeState, herdrHandle?.enforcementState);
+    }
   }
   return output;
 }
