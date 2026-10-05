@@ -7028,6 +7028,9 @@ export function createMcpServer(
             .boolean()
             .default(false)
             .describe("Whether to overwrite an existing destination file. Defaults to false."),
+          resumableWork: resumableWorkSchema().optional().describe(
+            "Nexus writer-admission pointer. Required when the destination repository is enrolled.",
+          ),
         },
         outputSchema: resultOutputSchema({
           sourcePath: z.string(),
@@ -7049,6 +7052,7 @@ export function createMcpServer(
           expectedDestinationSha256,
           expectedDestinationAbsent,
           overwrite,
+          resumableWork: p0Pointer,
         },
         extra,
       ) => {
@@ -7059,6 +7063,13 @@ export function createMcpServer(
         );
         const sourceWorkspace = workspaces.getWorkspace(sourceWorkspaceId);
         const destinationWorkspace = workspaces.getWorkspace(destinationWorkspaceId);
+        enforceNexusWriterAdmission({
+          workspaceRoot: destinationWorkspace.root,
+          pointer: p0Pointer,
+          store: workResumeStore,
+          ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+          operation: "workspace_copy_file",
+        });
 
         const resolvedSource = workspaces.resolveReadPath(sourceWorkspace, sourcePath);
         if (resolvedSource.nestedInstructionRebindRequired) {
@@ -7309,6 +7320,9 @@ export function createMcpServer(
         confirmApply: z
           .boolean()
           .describe("Must be true to apply. Without it the operation stays read-only preparation."),
+        resumableWork: resumableWorkSchema().optional().describe(
+          "Nexus writer-admission pointer for the destination. Required when applying into an enrolled repository.",
+        ),
       },
       outputSchema: candidateIntegrateOutputSchema,
       _meta: {},
@@ -7319,12 +7333,21 @@ export function createMcpServer(
         openWorldHint: false,
       },
     },
-    async ({ sourceWorkspaceId, candidateBase, candidateHead, destinationWorkspaceId, expectedDestinationHead, dirtyPolicy, confirmApply }, extra) => {
+    async ({ sourceWorkspaceId, candidateBase, candidateHead, destinationWorkspaceId, expectedDestinationHead, dirtyPolicy, confirmApply, resumableWork: p0Pointer }, extra) => {
       if (confirmApply) {
         await workspaces.assertConversationMutationAllowed(destinationWorkspaceId, openAiConversationScopeId(extra._meta));
       }
       const source = workspaces.getWorkspace(sourceWorkspaceId);
       const destination = workspaces.getWorkspace(destinationWorkspaceId);
+      if (confirmApply) {
+        enforceNexusWriterAdmission({
+          workspaceRoot: destination.root,
+          pointer: p0Pointer,
+          store: workResumeStore,
+          ownerContext: carrierBindings ? dependencyConsumerContext(extra) : openAiConversationScopeId(extra._meta),
+          operation: "candidate_integrate",
+        });
+      }
       let coreAdmission: CoreMutationAdmission | undefined;
       let coreCandidate: ReturnType<CoreMutationGuard["candidate"]>;
       const destinationCore = confirmApply && coreMutationGuard
