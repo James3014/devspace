@@ -647,7 +647,19 @@ export class ProcessSessionManager {
 
   private resolveSession(workspaceId: string, workspaceRoot: string | undefined, sessionId?: number, attemptKey?: string): ProcessSession {
     if (sessionId !== undefined) {
-      return this.getOwnedSession(workspaceId, sessionId, workspaceRoot);
+      const session = this.getOwnedSession(workspaceId, sessionId, workspaceRoot);
+      if (attemptKey !== undefined) {
+        const canonicalRoot = this.canonicalWorkspaceRoot(workspaceRoot);
+        const attemptSessionId = this.attemptKeyToSessionId.get(
+          this.attemptIndexKey(workspaceId, canonicalRoot, attemptKey),
+        );
+        if (attemptSessionId !== session.id) {
+          throw new Error(
+            `PROCESS_SESSION_IDENTITY_CONFLICT: sessionId ${sessionId} and attemptKey '${attemptKey}' do not identify the same process session.`,
+          );
+        }
+      }
+      return session;
     }
     if (attemptKey !== undefined) {
       const canonicalRoot = this.canonicalWorkspaceRoot(workspaceRoot);

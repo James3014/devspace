@@ -661,7 +661,33 @@ try {
     assert.match(status.output, /testG_idempotent/);
   }
 
-  // Test H: Short command compatibility
+  // Test H: conflicting sessionId + attemptKey identity fails closed
+  const dualIdentityA = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: `${node} -e "setTimeout(() => process.exit(0), 300)"`,
+    yieldTimeMs: 10,
+    attemptKey: "matrix:dual-identity-a",
+  });
+  const dualIdentityB = await g2Manager.start({
+    workspaceId: "ws_g2",
+    cwd: process.cwd(),
+    command: `${node} -e "setTimeout(() => process.exit(0), 300)"`,
+    yieldTimeMs: 10,
+    attemptKey: "matrix:dual-identity-b",
+  });
+  assert.ok(dualIdentityA.sessionId);
+  assert.ok(dualIdentityB.sessionId);
+  await assert.rejects(
+    g2Manager.getStatus({
+      workspaceId: "ws_g2",
+      sessionId: dualIdentityA.sessionId,
+      attemptKey: "matrix:dual-identity-b",
+    }),
+    /PROCESS_SESSION_IDENTITY_CONFLICT/,
+  );
+
+  // Test I: Short command compatibility
   const shortCommand = await g2Manager.start({
     workspaceId: "ws_g2",
     cwd: process.cwd(),
