@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
@@ -95,6 +95,14 @@ async function fixture(options: {
 
 const now = () => new Date("2026-10-05T06:00:00.000Z");
 
+function binding(f: { admissionId: string; operationId: string; receiptHash: string }) {
+  return {
+    admissionId: f.admissionId,
+    operationId: f.operationId,
+    receiptHash: f.receiptHash,
+  };
+}
+
 test("canonical repository mutation requires admission binding", async () => {
   const f = await fixture();
   const resolver = new NexusMutationAdmissionResolver(f.stateRoot, now);
@@ -110,7 +118,7 @@ test("canonical mutation fails closed when resolver state root is unavailable", 
   await assert.rejects(
     resolver.authorizeWorkspaceMutation({
       workspaceRoot: f.repo,
-      binding: { admissionId: f.admissionId, receiptHash: f.receiptHash },
+      binding: binding(f),
       expectedBase: f.base,
       requestedPaths: ["allowed.txt"],
     }),
@@ -123,7 +131,7 @@ test("valid canonical admission authorizes exact base and bounded scope", async 
   const resolver = new NexusMutationAdmissionResolver(f.stateRoot, now);
   const result = await resolver.authorizeWorkspaceMutation({
     workspaceRoot: f.repo,
-    binding: { admissionId: f.admissionId, receiptHash: f.receiptHash },
+    binding: binding(f),
     expectedBase: f.base,
     requestedPaths: ["allowed.txt", "src/owned"],
     operationId: f.operationId,
@@ -137,10 +145,62 @@ test("caller cannot smuggle receipt payload through the binding", () => {
   assert.throws(
     () => parseNexusMutationAdmissionBinding({
       admissionId: "admission-" + "a".repeat(32),
+      operationId: "forged-operation",
       receiptHash: "b".repeat(64),
       allowed_paths: ["**"],
     }),
     (error: unknown) => error instanceof NexusMutationAdmissionError && error.code === "NEXUS_MUTATION_ADMISSION_BINDING_INVALID",
+  );
+});
+
+test("binding cannot detach admission id from operation identity", async () => {
+  const f = await fixture();
+  const resolver = new NexusMutationAdmissionResolver(f.stateRoot, now);
+  await assert.rejects(
+    resolver.authorizeWorkspaceMutation({
+      workspaceRoot: f.repo,
+      binding: { ...binding(f), operationId: "different-operation" },
+      expectedBase: f.base,
+      requestedPaths: ["allowed.txt"],
+    }),
+    (error: unknown) => error instanceof NexusMutationAdmissionError
+      && error.code === "NEXUS_MUTATION_ADMISSION_OPERATION_MISMATCH",
+  );
+});
+
+test("existing dirty workspace mutation outside admitted scope fails closed", async () => {
+  const f = await fixture({ allowedPaths: ["allowed.txt"] });
+  await writeFile(join(f.repo, "outside.txt"), "dirty\n", "utf8");
+
+  await assert.rejects(
+    new NexusMutationAdmissionResolver(f.stateRoot, now).authorizeWorkspaceMutation({
+      workspaceRoot: f.repo,
+      binding: binding(f),
+      expectedBase: f.base,
+      requestedPaths: ["allowed.txt"],
+    }),
+    (error: unknown) => error instanceof NexusMutationAdmissionError
+      && error.code === "NEXUS_MUTATION_ADMISSION_SCOPE_MISMATCH",
+  );
+});
+
+test("admission directory symlink cannot escape configured state root", async () => {
+  const f = await fixture();
+  const escaped = join(f.root, "escaped-state");
+  await mkdir(escaped, { recursive: true });
+  const linkedRoot = join(f.root, "linked-state");
+  await mkdir(linkedRoot, { recursive: true });
+  await symlink(escaped, join(linkedRoot, "mutation-admissions"));
+
+  await assert.rejects(
+    new NexusMutationAdmissionResolver(linkedRoot, now).authorizeWorkspaceMutation({
+      workspaceRoot: f.repo,
+      binding: binding(f),
+      expectedBase: f.base,
+      requestedPaths: ["allowed.txt"],
+    }),
+    (error: unknown) => error instanceof NexusMutationAdmissionError
+      && error.code === "NEXUS_MUTATION_ADMISSION_INVALID",
   );
 });
 
@@ -151,7 +211,7 @@ test("hash, expiry, repository, base and scope mismatches fail closed", async ()
   await assert.rejects(
     resolver.authorizeWorkspaceMutation({
       workspaceRoot: f.repo,
-      binding: { admissionId: f.admissionId, receiptHash: "f".repeat(64) },
+      binding: { ...binding(f), receiptHash: "f".repeat(64) },
       expectedBase: f.base,
       requestedPaths: ["allowed.txt"],
     }),
@@ -161,7 +221,7 @@ test("hash, expiry, repository, base and scope mismatches fail closed", async ()
   await assert.rejects(
     resolver.authorizeWorkspaceMutation({
       workspaceRoot: f.repo,
-      binding: { admissionId: f.admissionId, receiptHash: f.receiptHash },
+      binding: binding(f),
       expectedBase: "f".repeat(40),
       requestedPaths: ["allowed.txt"],
     }),
@@ -171,7 +231,7 @@ test("hash, expiry, repository, base and scope mismatches fail closed", async ()
   await assert.rejects(
     resolver.authorizeWorkspaceMutation({
       workspaceRoot: f.repo,
-      binding: { admissionId: f.admissionId, receiptHash: f.receiptHash },
+      binding: binding(f),
       expectedBase: f.base,
       requestedPaths: ["outside.txt"],
     }),
@@ -182,7 +242,7 @@ test("hash, expiry, repository, base and scope mismatches fail closed", async ()
   await assert.rejects(
     new NexusMutationAdmissionResolver(wrongRepo.stateRoot, now).authorizeWorkspaceMutation({
       workspaceRoot: wrongRepo.repo,
-      binding: { admissionId: wrongRepo.admissionId, receiptHash: wrongRepo.receiptHash },
+      binding: binding(wrongRepo),
       expectedBase: wrongRepo.base,
       requestedPaths: ["allowed.txt"],
     }),
@@ -193,7 +253,7 @@ test("hash, expiry, repository, base and scope mismatches fail closed", async ()
   await assert.rejects(
     new NexusMutationAdmissionResolver(expired.stateRoot, now).authorizeWorkspaceMutation({
       workspaceRoot: expired.repo,
-      binding: { admissionId: expired.admissionId, receiptHash: expired.receiptHash },
+      binding: binding(expired),
       expectedBase: expired.base,
       requestedPaths: ["allowed.txt"],
     }),
@@ -211,7 +271,7 @@ test("publication verifies admitted base ancestry and physical changed paths", a
   const resolver = new NexusMutationAdmissionResolver(f.stateRoot, now);
   const result = await resolver.authorizePublication({
     workspaceRoot: f.repo,
-    binding: { admissionId: f.admissionId, receiptHash: f.receiptHash },
+    binding: binding(f),
     candidateHead: head,
   });
   assert.equal(result.required, true);
@@ -224,7 +284,7 @@ test("publication verifies admitted base ancestry and physical changed paths", a
   await assert.rejects(
     new NexusMutationAdmissionResolver(outside.stateRoot, now).authorizePublication({
       workspaceRoot: outside.repo,
-      binding: { admissionId: outside.admissionId, receiptHash: outside.receiptHash },
+      binding: binding(outside),
       candidateHead: outsideHead,
     }),
     (error: unknown) => error instanceof NexusMutationAdmissionError && error.code === "NEXUS_MUTATION_ADMISSION_SCOPE_MISMATCH",
