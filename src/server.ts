@@ -7536,6 +7536,9 @@ export function createMcpServer(
           expectedBuildId: z.string().min(1),
           expectedCapabilityManifestSha256: z.string().regex(/^[0-9a-f]{64}$/),
           confirmPromote: z.boolean(),
+          mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+            "Nexus-owned mutation admission pointer for the destination canonical repository.",
+          ),
           resumableWork: resumableWorkSchema().optional().describe(
             "P0 resumable-work pointer for the destination worktree. When supplied, promotion is admitted only if the exact writer lease is held.",
           ),
@@ -7577,10 +7580,29 @@ export function createMcpServer(
         expectedBuildId,
         expectedCapabilityManifestSha256,
         confirmPromote,
+        mutationAdmission,
         resumableWork: p0Pointer,
       }, extra) => {
         const source = workspaces.getWorkspace(sourceWorkspaceId);
         const destination = workspaces.getWorkspace(destinationWorkspaceId);
+        const promotionReadiness = confirmPromote
+          ? await inspectIntegrationReadiness({
+              sourceWorkspaceRoot: source.root,
+              candidateBase,
+              candidateHead,
+              destinationWorkspaceRoot: destination.root,
+              expectedDestinationHead,
+              dirtyPolicy: "pristine",
+            })
+          : undefined;
+        if (confirmPromote && promotionReadiness) {
+          await authorizeNexusMutation({
+            workspaceRoot: destination.root,
+            binding: mutationAdmission,
+            expectedBase: expectedDestinationHead,
+            requestedPaths: promotionReadiness.candidateChangedPaths,
+          });
+        }
         if (confirmPromote && p0Pointer && workResumeStore) {
           try {
             await centralAdmissionCheck({
@@ -7601,16 +7623,15 @@ export function createMcpServer(
         const destinationCore = confirmPromote && coreMutationGuard
           ? coreMutationGuard.require({ workspaceId: destinationWorkspaceId, extra })
           : undefined;
-        if (confirmPromote && coreMutationGuard && destinationCore) {
-          const readiness = await inspectIntegrationReadiness({ sourceWorkspaceRoot: source.root, candidateBase, candidateHead, destinationWorkspaceRoot: destination.root, expectedDestinationHead, dirtyPolicy: "pristine" });
-          if (!readiness.technicallyReadyToApply) throw new Error(`[CANDIDATE_PROMOTION_NOT_READY] ${readiness.blockers.map((blocker) => blocker.code).join(", ") || "readiness unknown"}`);
-          coreCandidate = requireCoreCandidateProvenance(coreMutationGuard, readiness);
+        if (confirmPromote && coreMutationGuard && destinationCore && promotionReadiness) {
+          if (!promotionReadiness.technicallyReadyToApply) throw new Error(`[CANDIDATE_PROMOTION_NOT_READY] ${promotionReadiness.blockers.map((blocker) => blocker.code).join(", ") || "readiness unknown"}`);
+          coreCandidate = requireCoreCandidateProvenance(coreMutationGuard, promotionReadiness);
           coreAdmission = await coreMutationGuard.admit({
             workspaceId: destinationWorkspaceId,
             extra,
             pointer: { required: true, sessionId: destinationCore.id, bindingHash: destinationCore.bindingHash },
-            paths: readiness.candidateChangedPaths,
-            deletedPaths: readiness.candidateDeletedPaths,
+            paths: promotionReadiness.candidateChangedPaths,
+            deletedPaths: promotionReadiness.candidateDeletedPaths,
             pathContainment: "STRUCTURED_SINK_ENFORCED",
           });
         }
