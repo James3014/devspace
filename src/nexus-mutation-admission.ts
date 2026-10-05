@@ -21,6 +21,7 @@ export const NEXUS_CANONICAL_REPOSITORIES = new Set([
 
 export interface NexusMutationAdmissionBinding {
   admissionId: string;
+  operationId: string;
   receiptHash: string;
 }
 
@@ -107,10 +108,21 @@ function validateBinding(value: NexusMutationAdmissionBinding | undefined): Nexu
       "Canonical repository mutation requires a Nexus mutation admission binding.",
     );
   }
-  if (!ADMISSION_ID.test(value.admissionId) || !SHA64.test(value.receiptHash)) {
+  if (
+    !ADMISSION_ID.test(value.admissionId)
+    || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(value.operationId)
+    || !SHA64.test(value.receiptHash)
+  ) {
     throw new NexusMutationAdmissionError(
       "NEXUS_MUTATION_ADMISSION_BINDING_INVALID",
-      "Mutation admission binding must contain an exact admissionId and receiptHash.",
+      "Mutation admission binding must contain exact admissionId, operationId, and receiptHash identities.",
+    );
+  }
+  const expectedAdmissionId = "admission-" + sha256(value.operationId).slice(0, 32);
+  if (value.admissionId !== expectedAdmissionId) {
+    throw new NexusMutationAdmissionError(
+      "NEXUS_MUTATION_ADMISSION_OPERATION_MISMATCH",
+      "Admission id is not derived from the supplied operation identity.",
     );
   }
   return value;
@@ -270,6 +282,12 @@ export class NexusMutationAdmissionResolver {
       if (receipt.admission_id !== validated.admissionId) {
         throw new NexusMutationAdmissionError("NEXUS_MUTATION_ADMISSION_ID_MISMATCH", "Admission id does not match canonical record.");
       }
+      if (receipt.operation_id !== validated.operationId) {
+        throw new NexusMutationAdmissionError(
+          "NEXUS_MUTATION_ADMISSION_OPERATION_MISMATCH",
+          "Admission operation identity does not match the requested binding.",
+        );
+      }
       return receipt;
     } catch (error) {
       if (error instanceof NexusMutationAdmissionError) throw error;
@@ -339,11 +357,15 @@ export class NexusMutationAdmissionResolver {
     workspaceRoot: string;
     binding?: NexusMutationAdmissionBinding;
     candidateHead: string;
+    expectedBase?: string;
+    requestedPaths?: string[];
     operationId?: string;
   }): Promise<NexusMutationAdmissionDecision> {
     const decision = await this.authorizeWorkspaceMutation({
       workspaceRoot: input.workspaceRoot,
       binding: input.binding,
+      expectedBase: input.expectedBase,
+      requestedPaths: input.requestedPaths,
       operationId: input.operationId,
     });
     if (!decision.required || !decision.receipt) return decision;
@@ -370,11 +392,15 @@ export function parseNexusMutationAdmissionBinding(value: unknown): NexusMutatio
   }
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record).sort().join(",");
-  if (keys !== "admissionId,receiptHash") {
-    throw new NexusMutationAdmissionError("NEXUS_MUTATION_ADMISSION_BINDING_INVALID", "mutationAdmission must contain only admissionId and receiptHash.");
+  if (keys !== "admissionId,operationId,receiptHash") {
+    throw new NexusMutationAdmissionError(
+      "NEXUS_MUTATION_ADMISSION_BINDING_INVALID",
+      "mutationAdmission must contain only admissionId, operationId, and receiptHash.",
+    );
   }
   return validateBinding({
     admissionId: String(record.admissionId ?? ""),
+    operationId: String(record.operationId ?? ""),
     receiptHash: String(record.receiptHash ?? ""),
   });
 }
