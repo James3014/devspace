@@ -12,6 +12,11 @@ import { type HerdrExternalHandle, type HerdrPromptResult, HerdrThinGateway, def
 import { hashDispatchIntent } from "./execution-protocol.js";
 import { AgentProviderFailureError } from "./local-agent-errors.js";
 import { inspectWorkspacePhysicalState } from "./workspace-reconciliation.js";
+import {
+  buildLocalEffectEnforcementReceipt,
+  LOCAL_EFFECT_PROJECTION_SCHEMA,
+  type LocalEffectEnforcementReceipt,
+} from "./local-effect-enforcement.js";
 
 const originalAgyCommand = process.env.AGY_COMMAND;
 process.env.AGY_COMMAND = process.execPath;
@@ -75,6 +80,8 @@ function settleAgent(
     providerSessionId?: string;
     error?: string;
     terminalReason?: "completed" | "provider_error";
+    scopeState?: "WITHIN_SCOPE" | "SCOPE_VIOLATION" | "UNKNOWN";
+    effectEnforcementReceipt?: LocalEffectEnforcementReceipt;
   } = {},
 ): void {
   const store = (manager as any).store as LocalAgentStore;
@@ -1169,6 +1176,288 @@ test("LocalAgentSessionManager - binds and retrieves HerdrExternalHandle for dur
     assert.equal(reconcile.herdrHandle?.enforcementState, "REQUEST_ONLY_NOT_ENFORCED"); // N8
   } finally {
     defaultHerdrGatewayRegistry.releaseHandle("attempt-herdr-1");
+    clean();
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("HerdR request-only execution never reports proven scope or unknown overall enforcement", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-herdr-request-only-state-"));
+  const projectRoot = mkdtempSync(join(tmpdir(), "devspace-herdr-request-only-repo-"));
+  execFileSync("git", ["init", "--initial-branch=main"], { cwd: projectRoot, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: projectRoot });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd: projectRoot });
+  writeFileSync(join(projectRoot, "README.md"), "request-only fixture\n");
+  execFileSync("git", ["add", "."], { cwd: projectRoot });
+  execFileSync("git", ["commit", "-m", "base"], { cwd: projectRoot, stdio: "ignore" });
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: projectRoot, encoding: "utf8" }).trim();
+  const gateway = {
+    reconcileExternalAgent: async () => ({
+      settled: true,
+      completionStatus: "COMPLETED",
+      executionState: "SETTLED_TERMINAL",
+      physicalEffect: "ABSENT",
+      changedPaths: [],
+      unexpectedPaths: [],
+      gitHeadAfter: head,
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    }),
+  } as unknown as HerdrThinGateway;
+  const manager = new LocalAgentSessionManager(
+    {
+      stateDir,
+      subagents: true,
+      oauth: { scopes: ["devspace"] },
+      agentExecutionBackend: "herdr",
+      toolchains: [],
+    } as any,
+    async () => {},
+    async () => true,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    gateway,
+  );
+  const store = (manager as any).store as LocalAgentStore;
+  const attemptKey = "attempt-herdr-request-only";
+  const dispatchIntent = {
+    taskId: "task-herdr-request-only",
+    attemptId: attemptKey,
+    objective: "exercise truthful request-only scope reporting",
+    roleIntent: "DEEP_ENGINEERING" as const,
+    claimCeiling: "CANDIDATE_READY" as const,
+    context: ["Issue #355 regression"],
+    readScope: ["."],
+    writeScope: ["src/message.txt"],
+    exclusiveOwnership: true,
+    forbiddenChanges: [],
+    acceptanceCriteria: ["request-only scope remains unproven"],
+    verificationRequired: true,
+    expectedArtifacts: [],
+  };
+  const dispatchIntentHash = hashDispatchIntent(dispatchIntent);
+  const record = store.create({
+    workspaceId: "ws-herdr-request-only",
+    workspaceRoot: projectRoot,
+    profileName: "implementer",
+    provider: "agy",
+    startReplay: { key: attemptKey, requestHash: "request-herdr-request-only" },
+    executionContract: {
+      writePaths: ["src/message.txt"],
+      maxFiles: 1,
+      dispatchIntent,
+    },
+    lifecycleKind: "detached_worker_v2",
+  });
+  const handle: HerdrExternalHandle = {
+    schemaVersion: 1,
+    runtimeKind: "HERDR",
+    agentId: record.id,
+    herdrSocketPath: "/tmp/mock-herdr.sock",
+    herdrWorkspaceId: "herdr-request-only",
+    herdrPaneId: "pane-request-only",
+    herdrAgentIdentity: "agy-request-only",
+    herdrAgentKind: "agy",
+    promptNonce: `HERDR-DISPATCH-${attemptKey}`,
+    canonicalWorktreePath: projectRoot,
+    workspaceId: "ws-herdr-request-only",
+    gitHeadBefore: head,
+    attemptKey,
+    dispatchIntentHash,
+    launchTimestamp: new Date().toISOString(),
+    enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+  };
+
+  try {
+    manager.bindHerdrExternalHandle(record.id, handle);
+    const generation = record.lifecycleState!.activeTurn!.generation!;
+    const claimed = store.claimExternalRuntimeTurnCAS({
+      agentId: record.id,
+      generation,
+      promptNonce: handle.promptNonce,
+      scopeBaseline: { changedPaths: [], head, fingerprints: {} },
+    });
+    assert.equal(claimed.applied, true);
+    assert.equal(await (manager as any).settleHerdrTurn(claimed.current, handle, {
+      status: "done",
+      finalResponse: "no repository changes",
+    }), true);
+
+    const status = await manager.getAgentStatus({
+      workspaceId: "ws-herdr-request-only",
+      workspaceRoot: projectRoot,
+      agentId: record.id,
+    });
+    assert.equal(status.status, "idle");
+    assert.equal(status.scopeState, "UNKNOWN");
+    assert.equal(status.effectPolicyStatus?.overallEnforcement, "REQUEST_ONLY_NOT_ENFORCED");
+
+    const clean = await manager.reconcileAgent({
+      workspaceId: "ws-herdr-request-only",
+      workspaceRoot: projectRoot,
+      isolated: true,
+      agentId: record.id,
+    });
+    assert.equal(clean.candidate.scopeState, "UNKNOWN");
+
+    writeFileSync(join(projectRoot, "outside.txt"), "observed repository violation\n");
+    const violated = await manager.reconcileAgent({
+      workspaceId: "ws-herdr-request-only",
+      workspaceRoot: projectRoot,
+      isolated: true,
+      agentId: record.id,
+    });
+    assert.equal(violated.candidate.scopeState, "SCOPE_VIOLATION");
+    assert.deepEqual(violated.candidate.unexpectedPaths, ["outside.txt"]);
+  } finally {
+    defaultHerdrGatewayRegistry.releaseHandle(attemptKey);
+    manager.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("direct Agy without native enforcement reports unproven clean scope and request-only effects", async () => {
+  const { manager, clean } = setupFixture();
+  const projectRoot = mkdtempSync(join(tmpdir(), "devspace-direct-agy-request-only-"));
+  execFileSync("git", ["init", "--initial-branch=main"], { cwd: projectRoot, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: projectRoot });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd: projectRoot });
+  writeFileSync(join(projectRoot, "README.md"), "direct Agy fixture\n");
+  execFileSync("git", ["add", "."], { cwd: projectRoot });
+  execFileSync("git", ["commit", "-m", "base"], { cwd: projectRoot, stdio: "ignore" });
+
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws-direct-agy-request-only",
+      workspaceRoot: projectRoot,
+      profileName: "implementer",
+      prompt: "read only",
+      profiles: mockProfiles,
+      executionContract: { writePaths: ["src/message.txt"], maxFiles: 1 },
+    });
+    settleAgent(manager, started.agentId, { scopeState: "WITHIN_SCOPE" });
+
+    const status = await manager.getAgentStatus({
+      workspaceId: "ws-direct-agy-request-only",
+      workspaceRoot: projectRoot,
+      agentId: started.agentId,
+    });
+    assert.equal(status.scopeState, "UNKNOWN");
+    assert.equal(status.effectPolicyStatus?.overallEnforcement, "REQUEST_ONLY_NOT_ENFORCED");
+
+    const reconciled = await manager.reconcileAgent({
+      workspaceId: "ws-direct-agy-request-only",
+      workspaceRoot: projectRoot,
+      isolated: false,
+      agentId: started.agentId,
+    });
+    assert.equal(reconciled.herdrHandle, undefined);
+    assert.equal(reconciled.candidate.scopeState, "UNKNOWN");
+  } finally {
+    manager.close();
+    clean();
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("direct Agy preserves observed out-of-scope repository violations", async () => {
+  const { manager, clean } = setupFixture();
+  const projectRoot = mkdtempSync(join(tmpdir(), "devspace-direct-agy-violation-"));
+  execFileSync("git", ["init", "--initial-branch=main"], { cwd: projectRoot, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: projectRoot });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd: projectRoot });
+  writeFileSync(join(projectRoot, "README.md"), "direct Agy violation fixture\n");
+  execFileSync("git", ["add", "."], { cwd: projectRoot });
+  execFileSync("git", ["commit", "-m", "base"], { cwd: projectRoot, stdio: "ignore" });
+
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws-direct-agy-violation",
+      workspaceRoot: projectRoot,
+      profileName: "implementer",
+      prompt: "write only the allowed file",
+      profiles: mockProfiles,
+      executionContract: { writePaths: ["src/message.txt"], maxFiles: 1 },
+    });
+    settleAgent(manager, started.agentId, { scopeState: "WITHIN_SCOPE" });
+    writeFileSync(join(projectRoot, "outside.txt"), "observed violation\n");
+
+    const reconciled = await manager.reconcileAgent({
+      workspaceId: "ws-direct-agy-violation",
+      workspaceRoot: projectRoot,
+      isolated: false,
+      agentId: started.agentId,
+    });
+    assert.equal(reconciled.candidate.scopeState, "SCOPE_VIOLATION");
+    assert.deepEqual(reconciled.candidate.unexpectedPaths, ["outside.txt"]);
+  } finally {
+    manager.close();
+    clean();
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("non-Agy native enforcement preserves physically enforced scope semantics", async () => {
+  const { manager, clean } = setupFixture();
+  const projectRoot = mkdtempSync(join(tmpdir(), "devspace-native-enforced-scope-"));
+  execFileSync("git", ["init", "--initial-branch=main"], { cwd: projectRoot, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: projectRoot });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd: projectRoot });
+  writeFileSync(join(projectRoot, "README.md"), "native enforcement fixture\n");
+  execFileSync("git", ["add", "."], { cwd: projectRoot });
+  execFileSync("git", ["commit", "-m", "base"], { cwd: projectRoot, stdio: "ignore" });
+  const previousOmpCommand = process.env.OMP_COMMAND;
+  process.env.OMP_COMMAND = process.execPath;
+  const receipt = buildLocalEffectEnforcementReceipt({
+    provider: "omp",
+    writeMode: "read_only",
+    selectedToolIntents: ["workspace.read"],
+    effectProjection: {
+      schema: LOCAL_EFFECT_PROJECTION_SCHEMA,
+      process: { mode: "DENY" },
+      network: { egress: "DENY" },
+      git: { mode: "DENY" },
+    },
+    enforcementSurface: { tools: "read", process: "deny", network: "deny", git: "deny" },
+  });
+  const nativeProfile: LocalAgentProfile = {
+    name: "native-enforced",
+    description: "native enforcement fixture",
+    provider: "omp",
+    disabled: false,
+    filePath: "native-enforced.md",
+    body: "",
+    write_mode: "read_only",
+  };
+
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws-native-enforced",
+      workspaceRoot: projectRoot,
+      profileName: nativeProfile.name,
+      prompt: "read only",
+      profiles: [nativeProfile],
+      executionContract: { writePaths: ["src/message.txt"], maxFiles: 1 },
+    });
+    settleAgent(manager, started.agentId, {
+      scopeState: "WITHIN_SCOPE",
+      effectEnforcementReceipt: receipt,
+    });
+
+    const status = await manager.getAgentStatus({
+      workspaceId: "ws-native-enforced",
+      workspaceRoot: projectRoot,
+      agentId: started.agentId,
+    });
+    assert.equal(status.scopeState, "WITHIN_SCOPE");
+    assert.equal(status.effectPolicyStatus?.overallEnforcement, "PHYSICALLY_ENFORCED");
+  } finally {
+    if (previousOmpCommand === undefined) delete process.env.OMP_COMMAND;
+    else process.env.OMP_COMMAND = previousOmpCommand;
+    manager.close();
     clean();
     rmSync(projectRoot, { recursive: true, force: true });
   }
