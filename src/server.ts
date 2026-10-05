@@ -5622,6 +5622,7 @@ export function createMcpServer(
       workspaces,
       incomingArtifactAdapters,
       coreMutation: coreMutationGuard,
+      authorizeNexusMutation,
     });
   }
 
