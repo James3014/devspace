@@ -3373,6 +3373,101 @@ test("subagents: OWNER_DIRECT write-capable continuation does not require Core b
   assert.equal(structuredContent(continued).coreMutation, undefined);
 });
 
+test("subagents: canonical write-capable continuation revalidates persisted Nexus admission", async (t) => {
+  const conversationScopeId = "issue362-agent-continuation";
+  const context = await fixture(t, {
+    git: true,
+    subagents: true,
+    nexusMutationAdmission: true,
+  });
+  assert.ok(context.nexusMutationAdmissionStateDir);
+  await addMutatorProfile(context.project);
+  await execFileAsync("git", ["add", ".devspace/agents/mutator.md"], { cwd: context.project });
+  await execFileAsync("git", ["commit", "-m", "test fixture mutator profile"], { cwd: context.project });
+  await execFileAsync("git", ["remote", "add", "origin", "https://github.com/James3014/devspace.git"], { cwd: context.project });
+  const openResult = await callOpen(context.client, context.project, conversationScopeId);
+  const workspaceId = structuredContent(openResult).workspaceId as string;
+  const head = (await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: context.project })).stdout.trim();
+  const mutationAdmission = await writeTestMutationAdmission({
+    stateRoot: context.nexusMutationAdmissionStateDir!,
+    workspaceRoot: context.project,
+    operationId: "devspace:issue362:agent-continuation",
+    allowedPaths: ["src/**"],
+  });
+
+  const blockedStart = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "mutator",
+      prompt: "must not launch without Nexus admission",
+      attemptKey: "issue362-agent-continuation-blocked",
+      executionContract: {
+        authorityMode: "OWNER_DIRECT",
+        expectedHead: head,
+        writePaths: ["src"],
+      },
+    },
+    _meta: { "openai/session": conversationScopeId },
+  });
+  assert.equal(blockedStart.isError, true);
+  assert.match(responseText(blockedStart), /NEXUS_MUTATION_ADMISSION_REQUIRED/);
+
+  const started = await context.client.callTool({
+    name: "agent_start",
+    arguments: {
+      workspaceId,
+      profile: "mutator",
+      prompt: "perform one admitted bounded change",
+      attemptKey: "issue362-agent-continuation",
+      executionContract: {
+        authorityMode: "OWNER_DIRECT",
+        mutationAdmission,
+        expectedHead: head,
+        writePaths: ["src"],
+      },
+    },
+    _meta: { "openai/session": conversationScopeId },
+  });
+  assert.equal(started.isError, undefined, responseText(started));
+  const agentId = structuredContent(started).agentId as string;
+
+  const agents = new LocalAgentStore(context.stateDir);
+  try {
+    const record = agents.getById(agentId)!;
+    assert.deepEqual(record.executionContract?.mutationAdmission, mutationAdmission);
+    const generation = record.lifecycleState!.activeTurn!.generation!;
+    const workerToken = record.workerToken!;
+    agents.claimWorkerCAS(agentId, generation, workerToken, process.pid);
+    agents.finishTurnCAS({
+      agentId,
+      generation,
+      workerToken,
+      status: "idle",
+      terminalReason: "completed",
+    });
+  } finally {
+    agents.close();
+  }
+
+  await rm(
+    join(context.nexusMutationAdmissionStateDir!, "mutation-admissions", `${mutationAdmission.admissionId}.json`),
+    { force: true },
+  );
+
+  const continued = await context.client.callTool({
+    name: "agent_continue",
+    arguments: {
+      workspaceId,
+      agentId,
+      prompt: "must revalidate the persisted admission before continuing",
+    },
+    _meta: { "openai/session": conversationScopeId },
+  });
+  assert.equal(continued.isError, true);
+  assert.match(responseText(continued), /NEXUS_MUTATION_ADMISSION_NOT_FOUND/);
+});
+
 test("subagents: NEXUS_GOVERNED fails closed at the MCP boundary without complete canonical grant evidence", async (t) => {
   const context = await fixture(t, { git: true, subagents: true });
   const openResult = await callOpen(context.client, context.project, "chat-nexus-governed-missing-grant");
