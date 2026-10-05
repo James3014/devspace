@@ -4672,10 +4672,14 @@ function classifyDispatchFailure(record: LocalAgentRecord): DispatchFailureClass
     case "PROVIDER_TIMEOUT":
     case "PROVIDER_MODEL_UNAVAILABLE":
     case "PROVIDER_VARIANT_UNAVAILABLE":
+    case "PROVIDER_CANCELLED":
     case "PROVIDER_PROTOCOL_ERROR":
     case "PROVIDER_EXECUTION_ERROR":
     case "PROVIDER_UNAVAILABLE":
       failureClass = "PROVIDER_EXECUTION_FAILED";
+      break;
+    case "CLINEPASS_ENTITLEMENT_REQUIRED":
+      failureClass = "PROVIDER_AUTH_ERROR";
       break;
     case "VERIFIER_PLAN_PERSIST_FAILED":
       failureClass = "INTERNAL_CONTROL_PLANE_ERROR";
