@@ -1174,6 +1174,144 @@ test("LocalAgentSessionManager - binds and retrieves HerdrExternalHandle for dur
   }
 });
 
+test("HerdR request-only execution never reports proven scope or unknown overall enforcement", async () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-herdr-request-only-state-"));
+  const projectRoot = mkdtempSync(join(tmpdir(), "devspace-herdr-request-only-repo-"));
+  execFileSync("git", ["init", "--initial-branch=main"], { cwd: projectRoot, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: projectRoot });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd: projectRoot });
+  writeFileSync(join(projectRoot, "README.md"), "request-only fixture\n");
+  execFileSync("git", ["add", "."], { cwd: projectRoot });
+  execFileSync("git", ["commit", "-m", "base"], { cwd: projectRoot, stdio: "ignore" });
+  const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: projectRoot, encoding: "utf8" }).trim();
+  const gateway = {
+    reconcileExternalAgent: async () => ({
+      settled: true,
+      completionStatus: "COMPLETED",
+      executionState: "SETTLED_TERMINAL",
+      physicalEffect: "ABSENT",
+      changedPaths: [],
+      unexpectedPaths: [],
+      gitHeadAfter: head,
+      enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+    }),
+  } as unknown as HerdrThinGateway;
+  const manager = new LocalAgentSessionManager(
+    {
+      stateDir,
+      subagents: true,
+      oauth: { scopes: ["devspace"] },
+      agentExecutionBackend: "herdr",
+      toolchains: [],
+    } as any,
+    async () => {},
+    async () => true,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    undefined,
+    gateway,
+  );
+  const store = (manager as any).store as LocalAgentStore;
+  const attemptKey = "attempt-herdr-request-only";
+  const dispatchIntent = {
+    taskId: "task-herdr-request-only",
+    attemptId: attemptKey,
+    objective: "exercise truthful request-only scope reporting",
+    roleIntent: "DEEP_ENGINEERING" as const,
+    claimCeiling: "CANDIDATE_READY" as const,
+    context: ["Issue #355 regression"],
+    readScope: ["."],
+    writeScope: ["src/message.txt"],
+    exclusiveOwnership: true,
+    forbiddenChanges: [],
+    acceptanceCriteria: ["request-only scope remains unproven"],
+    verificationRequired: true,
+    expectedArtifacts: [],
+  };
+  const dispatchIntentHash = hashDispatchIntent(dispatchIntent);
+  const record = store.create({
+    workspaceId: "ws-herdr-request-only",
+    workspaceRoot: projectRoot,
+    profileName: "implementer",
+    provider: "agy",
+    startReplay: { key: attemptKey, requestHash: "request-herdr-request-only" },
+    executionContract: {
+      writePaths: ["src/message.txt"],
+      maxFiles: 1,
+      dispatchIntent,
+    },
+    lifecycleKind: "detached_worker_v2",
+  });
+  const handle: HerdrExternalHandle = {
+    schemaVersion: 1,
+    runtimeKind: "HERDR",
+    agentId: record.id,
+    herdrSocketPath: "/tmp/mock-herdr.sock",
+    herdrWorkspaceId: "herdr-request-only",
+    herdrPaneId: "pane-request-only",
+    herdrAgentIdentity: "agy-request-only",
+    herdrAgentKind: "agy",
+    promptNonce: `HERDR-DISPATCH-${attemptKey}`,
+    canonicalWorktreePath: projectRoot,
+    workspaceId: "ws-herdr-request-only",
+    gitHeadBefore: head,
+    attemptKey,
+    dispatchIntentHash,
+    launchTimestamp: new Date().toISOString(),
+    enforcementState: "REQUEST_ONLY_NOT_ENFORCED",
+  };
+
+  try {
+    manager.bindHerdrExternalHandle(record.id, handle);
+    const generation = record.lifecycleState!.activeTurn!.generation!;
+    const claimed = store.claimExternalRuntimeTurnCAS({
+      agentId: record.id,
+      generation,
+      promptNonce: handle.promptNonce,
+      scopeBaseline: { changedPaths: [], head, fingerprints: {} },
+    });
+    assert.equal(claimed.applied, true);
+    assert.equal(await (manager as any).settleHerdrTurn(claimed.current, handle, {
+      status: "done",
+      finalResponse: "no repository changes",
+    }), true);
+
+    const status = await manager.getAgentStatus({
+      workspaceId: "ws-herdr-request-only",
+      workspaceRoot: projectRoot,
+      agentId: record.id,
+    });
+    assert.equal(status.status, "idle");
+    assert.equal(status.scopeState, "UNKNOWN");
+    assert.equal(status.effectPolicyStatus?.overallEnforcement, "REQUEST_ONLY_NOT_ENFORCED");
+
+    const clean = await manager.reconcileAgent({
+      workspaceId: "ws-herdr-request-only",
+      workspaceRoot: projectRoot,
+      isolated: true,
+      agentId: record.id,
+    });
+    assert.equal(clean.candidate.scopeState, "UNKNOWN");
+
+    writeFileSync(join(projectRoot, "outside.txt"), "observed repository violation\n");
+    const violated = await manager.reconcileAgent({
+      workspaceId: "ws-herdr-request-only",
+      workspaceRoot: projectRoot,
+      isolated: true,
+      agentId: record.id,
+    });
+    assert.equal(violated.candidate.scopeState, "SCOPE_VIOLATION");
+    assert.deepEqual(violated.candidate.unexpectedPaths, ["outside.txt"]);
+  } finally {
+    defaultHerdrGatewayRegistry.releaseHandle(attemptKey);
+    manager.close();
+    rmSync(stateDir, { recursive: true, force: true });
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
 test("LocalAgentSessionManager - persists HerdrExternalHandle across restart and replay (A1, N1-R)", async () => {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-herdr-restart-test-"));
   const config = {
