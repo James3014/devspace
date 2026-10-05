@@ -2963,6 +2963,9 @@ function createAgentStartInputSchema() {
     }).strict().describe(
       "Exact pointer to an already-open Core-bound mutation session. Carries provenance only; it grants no route, acceptance, merge, or release authority.",
     ),
+    mutationAdmission: mutationAdmissionBindingSchema().describe(
+      "Pointer to the Nexus-owned mutation admission receipt. DevSpace independently resolves and verifies it before write-capable execution.",
+    ),
     resumableWork: resumableWorkSchema().describe(
       "P0 resumable-work pointer. For agent_start, effectHandle must exactly equal attemptKey so reconnect/replay can recover the same durable agent effect.",
     ),
@@ -3017,6 +3020,9 @@ function createDirectDispatchAgentStartInputSchema() {
   const executionContract = z.object({
     authorityMode: z.literal("OWNER_DIRECT").optional().describe(
       "Optional explicit direct-execution lane. Omit it to use OWNER_DIRECT.",
+    ),
+    mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+      "Pointer to the Nexus-owned mutation admission receipt. Required for write-capable canonical-repository execution.",
     ),
     expectedHead: z.string().regex(/^[0-9a-f]{40}$/).optional().describe(
       "Optional exact repository HEAD fence. The worker is not launched if the workspace HEAD differs.",
@@ -5845,6 +5851,12 @@ export function createMcpServer(
         let discoveryContext: string | undefined;
         if (selectedProfile?.write_mode !== "read_only") {
           await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
+          await authorizeNexusMutation({
+            workspaceRoot: workspace.root,
+            binding: contract?.mutationAdmission,
+            expectedBase: contract?.expectedHead,
+            requestedPaths: contract?.writePaths,
+          });
           const authorityMode = contract?.authorityMode ?? "OWNER_DIRECT";
           const coreBound = contract?.coreMutation !== undefined;
           const ownerDirect = authorityMode === "OWNER_DIRECT" && !coreBound;
@@ -6042,6 +6054,12 @@ export function createMcpServer(
         if (currentWriteMode !== "read_only") {
           await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
           const contract = currentAgent?.executionContract;
+          await authorizeNexusMutation({
+            workspaceRoot: workspace.root,
+            binding: contract?.mutationAdmission,
+            expectedBase: contract?.expectedHead,
+            requestedPaths: contract?.writePaths,
+          });
           const authorityMode = contract?.authorityMode ?? "OWNER_DIRECT";
           const coreBound = contract?.coreMutation !== undefined;
           const ownerDirect = authorityMode === "OWNER_DIRECT" && !coreBound;
