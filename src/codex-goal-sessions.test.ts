@@ -115,6 +115,7 @@ interface GoalFixture {
   goals: CodexGoalSessionManager;
   spawnLogPath: string;
   stateDir: string;
+  nexusMutationAdmissionStateDir: string;
   coreMutationSessions?: CoreMutationSessionStore;
   close: () => Promise<void>;
 }
@@ -136,8 +137,10 @@ async function goalFixture(t: TestContext, options: GoalFixtureOptions = {}): Pr
   const projectB = join(rootDir, "project-b");
   const binDir = join(rootDir, "bin");
   const stateDir = join(rootDir, ".state");
+  const nexusMutationAdmissionStateDir = join(rootDir, ".nexus-state");
   await mkdir(binDir, { recursive: true });
   await mkdir(stateDir, { recursive: true });
+  await mkdir(join(nexusMutationAdmissionStateDir, "mutation-admissions"), { recursive: true });
 
   for (const project of [projectA, projectB]) {
     await mkdir(project, { recursive: true });
@@ -163,6 +166,7 @@ async function goalFixture(t: TestContext, options: GoalFixtureOptions = {}): Pr
     DEVSPACE_CONFIG_DIR: join(rootDir, ".config"),
     DEVSPACE_ALLOWED_ROOTS: rootDir,
     DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_NEXUS_MUTATION_ADMISSION_STATE_DIR: nexusMutationAdmissionStateDir,
     DEVSPACE_TOOL_MODE: options.toolMode ?? "full",
     DEVSPACE_CODEX_GOALS: options.goalsEnabled === false ? undefined : "1",
     ...(options.codexBinOverride !== undefined
@@ -225,7 +229,19 @@ async function goalFixture(t: TestContext, options: GoalFixtureOptions = {}): Pr
   };
   t.after(close);
 
-  return { client, projectA, projectB, config, processes, goals, spawnLogPath, stateDir, coreMutationSessions, close };
+  return {
+    client,
+    projectA,
+    projectB,
+    config,
+    processes,
+    goals,
+    spawnLogPath,
+    stateDir,
+    nexusMutationAdmissionStateDir,
+    coreMutationSessions,
+    close,
+  };
 }
 
 async function callTool(
@@ -314,9 +330,19 @@ test("terminal codex_goal_status rejects out-of-scope Core mutation", async (t) 
   const opened = await fixture.client.callTool({ name: "open_workspace", arguments: { path: fixture.projectA }, _meta: conversation });
   const workspaceId = structured(opened).workspaceId as string;
   const session = await bindGoalCoreSession(fixture, workspaceId, conversationScopeId, ["allowed.txt"]);
+  const mutationAdmission = await writeGoalMutationAdmission(
+    fixture,
+    "devspace:issue362:codex-core-scope-negative",
+    ["outside.txt"],
+  );
   const started = await fixture.client.callTool({
     name: "codex_goal_start",
-    arguments: { workspaceId, goal: "write outside then exit", expectedHead: await headSha(fixture.projectA) },
+    arguments: {
+      workspaceId,
+      goal: "write outside then exit",
+      expectedHead: await headSha(fixture.projectA),
+      mutationAdmission,
+    },
     _meta: conversation,
   });
   assert.equal(started.isError, undefined, textOf(started));
@@ -360,6 +386,59 @@ async function openWorkspace(client: Client, path: string): Promise<string> {
 async function headSha(project: string): Promise<string> {
   const { stdout } = await execFileAsync("git", ["rev-parse", "HEAD"], { cwd: project });
   return stdout.trim();
+}
+
+function canonicalAdmissionJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalAdmissionJson).join(",")}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${canonicalAdmissionJson(record[key])}`).join(",")}}`;
+}
+
+async function writeGoalMutationAdmission(
+  fixture: GoalFixture,
+  operationId: string,
+  allowedPaths: string[],
+): Promise<{ admissionId: string; operationId: string; receiptHash: string }> {
+  const base = await headSha(fixture.projectA);
+  const admissionId = "admission-" + createHash("sha256").update(operationId).digest("hex").slice(0, 32);
+  const request = {
+    operation_id: operationId,
+    repository: "James3014/devspace",
+    base_sha: base,
+    execution_lane: "DIRECT_DELEGATED",
+    authority_kind: "OWNER_INLINE",
+    allowed_paths: allowedPaths,
+    issue_number: 362,
+    task_id: null,
+    attempt_id: null,
+    task_card_path: null,
+    task_card_hash: null,
+    governance_source_head: null,
+    ttl_minutes: 60,
+  };
+  const requestHash = createHash("sha256").update(canonicalAdmissionJson(request)).digest("hex");
+  const payload: Record<string, unknown> = {
+    schema: "nexus.mutation_admission.v1",
+    admission_id: admissionId,
+    ...request,
+    issued_at: new Date(Date.now() - 60_000).toISOString(),
+    expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+    runtime_identity: { test: true },
+    authority_reference: { test: true },
+    request_hash: requestHash,
+    receipt_hash: "",
+  };
+  const hashPayload = { ...payload };
+  delete hashPayload.receipt_hash;
+  const receiptHash = createHash("sha256").update(canonicalAdmissionJson(hashPayload)).digest("hex");
+  payload.receipt_hash = receiptHash;
+  await writeFile(
+    join(fixture.nexusMutationAdmissionStateDir, "mutation-admissions", `${admissionId}.json`),
+    JSON.stringify(payload, null, 2) + "\n",
+    "utf8",
+  );
+  return { admissionId, operationId, receiptHash };
 }
 
 async function bindGoalCoreSession(
