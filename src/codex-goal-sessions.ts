@@ -10,6 +10,7 @@ import {
   type StartCommandInput,
   type WriteStdinInput,
 } from "./process-sessions.js";
+import type { NexusMutationAdmissionBinding } from "./nexus-mutation-admission.js";
 import {
   inspectWorkspacePhysicalState,
   isInsideGitRepository,
@@ -50,6 +51,7 @@ export interface CodexGoalStartInput {
   reasoningEffort?: string;
   expectedHead?: string;
   coreMutation?: CoreMutationProcessBinding;
+  mutationAdmission?: NexusMutationAdmissionBinding;
 }
 
 export interface CodexGoalState {
@@ -81,6 +83,7 @@ interface GoalSession {
   reasoningEffort?: string;
   baseHead?: string;
   coreMutation?: CoreMutationProcessBinding;
+  mutationAdmission?: NexusMutationAdmissionBinding;
   startedAt: number;
   goalActiveObserved: boolean;
   trustDialogObserved: boolean;
@@ -893,6 +896,15 @@ export class CodexGoalSessionManager {
     return binding ? { ...binding } : undefined;
   }
 
+  getMutationAdmissionBinding(workspaceId: string, goalId: string): NexusMutationAdmissionBinding | undefined {
+    const binding = this.getOwnedSession(workspaceId, goalId).mutationAdmission;
+    return binding ? { ...binding } : undefined;
+  }
+
+  getBaseHead(workspaceId: string, goalId: string): string | undefined {
+    return this.getOwnedSession(workspaceId, goalId).baseHead;
+  }
+
   async start(input: CodexGoalStartInput): Promise<CodexGoalState> {
     const { session, goal } = await this.createSession(input);
     session.activationPending = true;
@@ -1025,6 +1037,7 @@ export class CodexGoalSessionManager {
       reasoningEffort: input.reasoningEffort,
       baseHead,
       coreMutation: input.coreMutation ? { ...input.coreMutation } : undefined,
+      mutationAdmission: input.mutationAdmission ? { ...input.mutationAdmission } : undefined,
       startedAt: Date.now(),
       goalActiveObserved: false,
       trustDialogObserved: false,

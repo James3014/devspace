@@ -77,6 +77,11 @@ export interface ServerConfig {
   hostOperationAllowLongLived?: boolean;
   coreMutationRecoveryOwnerClientId?: string;
   /**
+   * Canonical Nexus self-hosted state root used only to resolve mutation-admission
+   * receipts. Callers never supply receipt bytes or arbitrary paths.
+   */
+  nexusMutationAdmissionStateDir?: string;
+  /**
    * Explicit Core CLI executable path for candidate acquisition.
    * No PATH guessing, no fallback. Missing or mismatched → CORE_RUNTIME_UNAVAILABLE_OR_MISMATCH (nonblocking).
    */
@@ -498,6 +503,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     hostOperationMaxIdleMs: env.DEVSPACE_HOST_OPERATION_MAX_IDLE_MS ? parsePositiveInteger(env.DEVSPACE_HOST_OPERATION_MAX_IDLE_MS, 30_000, "DEVSPACE_HOST_OPERATION_MAX_IDLE_MS", 120_000) : undefined,
     hostOperationAllowLongLived: parseBoolean(env.DEVSPACE_HOST_OPERATION_ALLOW_LONG_LIVED),
     coreMutationRecoveryOwnerClientId: env.DEVSPACE_CORE_MUTATION_RECOVERY_OWNER_CLIENT_ID?.trim() || undefined,
+    nexusMutationAdmissionStateDir: env.DEVSPACE_NEXUS_MUTATION_ADMISSION_STATE_DIR?.trim()
+      ? resolve(expandHomePath(env.DEVSPACE_NEXUS_MUTATION_ADMISSION_STATE_DIR.trim()))
+      : undefined,
     coreAcquisitionExecutable: env.DEVSPACE_CORE_ACQUISITION_EXECUTABLE?.trim() || undefined,
     coreAcquisitionExpectedSourceRevision: parseCoreAcquisitionRevision(env.DEVSPACE_CORE_ACQUISITION_EXPECTED_SOURCE_REVISION),
     coreAcquisitionRuntimeDigest: env.DEVSPACE_CORE_ACQUISITION_RUNTIME_DIGEST?.trim() || undefined,

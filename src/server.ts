@@ -10,6 +10,11 @@ import {
   WorkResumeStore,
 } from "./work-resume.js";
 import { createHash, randomUUID } from "node:crypto";
+import {
+  NexusMutationAdmissionError,
+  NexusMutationAdmissionResolver,
+  type NexusMutationAdmissionBinding,
+} from "./nexus-mutation-admission.js";
 import { readFileSync } from "node:fs";
 import { access, lstat, mkdir, readFile, realpath, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
@@ -475,6 +480,12 @@ const DIRECT_DISPATCH_TOOL_NAMES = new Set<string>([
 
 const workspaceIdDescription =
   "Workspace to use. Reuse the current project's workspaceId.";
+
+const mutationAdmissionBindingSchema = () => z.object({
+  admissionId: z.string().regex(/^admission-[0-9a-f]{32}$/),
+  operationId: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/),
+  receiptHash: z.string().regex(/^[0-9a-f]{64}$/),
+}).strict();
 
 interface ToolLogFields {
   tool: string;
@@ -1350,6 +1361,13 @@ function registerCodexGoalTools(
   config: ServerConfig,
   workspaces: WorkspaceRegistry,
   goals: CodexGoalSessionManager,
+  authorizeNexusMutation: (input: {
+    workspaceRoot: string;
+    binding?: NexusMutationAdmissionBinding;
+    requestedPaths?: string[];
+    expectedBase?: string;
+    publicationHead?: string;
+  }) => Promise<void>,
   coreMutation?: CoreMutationGuard,
 ): void {
   const GOAL_START_ANNOTATIONS = {
@@ -1383,6 +1401,9 @@ function registerCodexGoalTools(
           .regex(/^[0-9a-fA-F]{40}$/, "expectedHead must be a valid 40-character commit SHA.")
           .optional()
           .describe("Exact 40-character Git HEAD the workspace must be at before launch. Required for Git workspaces; start fails closed when missing or mismatched."),
+        mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+          "Nexus-owned mutation admission pointer. Required for canonical-repository Codex mutation.",
+        ),
       },
       outputSchema: {
         goalId: z.string(),
@@ -1406,10 +1427,15 @@ function registerCodexGoalTools(
       _meta: {},
       annotations: GOAL_START_ANNOTATIONS,
     },
-    async ({ workspaceId, goal, model, reasoningEffort, expectedHead }, extra) => {
+    async ({ workspaceId, goal, model, reasoningEffort, expectedHead, mutationAdmission }, extra) => {
       const startedAt = performance.now();
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
+      await authorizeNexusMutation({
+        workspaceRoot: workspace.root,
+        binding: mutationAdmission,
+        expectedBase: expectedHead,
+      });
       const coreAdmission = coreMutation
         ? await coreMutation.admit({ workspaceId, extra, pathContainment: "NOT_PROVEN", writerDomain: "PROCESS" })
         : undefined;
@@ -1422,6 +1448,7 @@ function registerCodexGoalTools(
           ...(model ? { model } : {}),
           ...(reasoningEffort ? { reasoningEffort } : {}),
           ...(expectedHead ? { expectedHead } : {}),
+          ...(mutationAdmission ? { mutationAdmission } : {}),
           ...(coreAdmission?.bound
             ? { coreMutation: { sessionId: coreAdmission.sessionId!, bindingHash: coreAdmission.bindingHash! } }
             : {}),
@@ -1532,7 +1559,12 @@ function registerCodexGoalTools(
     },
     async ({ workspaceId, goalId, message }, extra) => {
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
-      workspaces.getWorkspace(workspaceId);
+      const workspace = workspaces.getWorkspace(workspaceId);
+      await authorizeNexusMutation({
+        workspaceRoot: workspace.root,
+        binding: goals.getMutationAdmissionBinding(workspaceId, goalId),
+        expectedBase: goals.getBaseHead(workspaceId, goalId),
+      });
       let coreAdmission: CoreMutationAdmission | undefined;
       if (coreMutation) {
         const active = coreMutation.active(workspaceId);
@@ -2953,6 +2985,9 @@ function createAgentStartInputSchema() {
     }).strict().describe(
       "Exact pointer to an already-open Core-bound mutation session. Carries provenance only; it grants no route, acceptance, merge, or release authority.",
     ),
+    mutationAdmission: mutationAdmissionBindingSchema().describe(
+      "Pointer to the Nexus-owned mutation admission receipt. DevSpace independently resolves and verifies it before write-capable execution.",
+    ),
     resumableWork: resumableWorkSchema().describe(
       "P0 resumable-work pointer. For agent_start, effectHandle must exactly equal attemptKey so reconnect/replay can recover the same durable agent effect.",
     ),
@@ -3007,6 +3042,9 @@ function createDirectDispatchAgentStartInputSchema() {
   const executionContract = z.object({
     authorityMode: z.literal("OWNER_DIRECT").optional().describe(
       "Optional explicit direct-execution lane. Omit it to use OWNER_DIRECT.",
+    ),
+    mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+      "Pointer to the Nexus-owned mutation admission receipt. Required for write-capable canonical-repository execution.",
     ),
     expectedHead: z.string().regex(/^[0-9a-f]{40}$/).optional().describe(
       "Optional exact repository HEAD fence. The worker is not launched if the workspace HEAD differs.",
@@ -3315,6 +3353,43 @@ export function createMcpServer(
     ? createDirectDispatchAgentStartInputSchema()
     : createAgentStartInputSchema();
   const agentPreflightInputSchema = createAgentPreflightInputSchema();
+  const nexusMutationAdmissions = new NexusMutationAdmissionResolver(
+    config.nexusMutationAdmissionStateDir,
+  );
+
+  const authorizeNexusMutation = async (input: {
+    workspaceRoot: string;
+    binding?: NexusMutationAdmissionBinding;
+    requestedPaths?: string[];
+    expectedBase?: string;
+    publicationHead?: string;
+  }): Promise<void> => {
+    try {
+      if (input.publicationHead) {
+        await nexusMutationAdmissions.authorizePublication({
+          workspaceRoot: input.workspaceRoot,
+          binding: input.binding,
+          candidateHead: input.publicationHead.toLowerCase(),
+          expectedBase: input.expectedBase,
+          requestedPaths: input.requestedPaths,
+          operationId: input.binding?.operationId,
+        });
+        return;
+      }
+      await nexusMutationAdmissions.authorizeWorkspaceMutation({
+        workspaceRoot: input.workspaceRoot,
+        binding: input.binding,
+        expectedBase: input.expectedBase,
+        requestedPaths: input.requestedPaths,
+        operationId: input.binding?.operationId,
+      });
+    } catch (error) {
+      if (error instanceof NexusMutationAdmissionError) {
+        throw new Error(`[NEXUS_MUTATION_ADMISSION_FAILED:${error.code}] ${error.message}`);
+      }
+      throw error;
+    }
+  };
 
   const hostStorageInput = () => {
     const workspaceSessions = workspaces.listSessions();
@@ -4705,6 +4780,9 @@ export function createMcpServer(
           .string()
           .describe("File path to write, relative to the workspace root."),
         content: z.string().describe("Complete new file content."),
+        mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+          "Nexus-owned mutation admission pointer. Required for canonical-repository mutation.",
+        ),
         resumableWork: resumableWorkSchema().optional().describe(
           "P0 resumable-work pointer.  When supplied, the write is admitted only if the exact lease is currently held by the caller.",
         ),
@@ -4713,7 +4791,7 @@ export function createMcpServer(
       ...toolWidgetDescriptorMeta(config, "write"),
       annotations: WRITE_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, resumableWork: p0Pointer, ...input }, extra) => {
+    async ({ workspaceId, mutationAdmission, resumableWork: p0Pointer, ...input }, extra) => {
       const startedAt = performance.now();
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
@@ -4729,6 +4807,11 @@ export function createMcpServer(
           ].join("\n"))],
         };
       }
+      await authorizeNexusMutation({
+        workspaceRoot: workspace.root,
+        binding: mutationAdmission,
+        requestedPaths: [input.path],
+      });
       // ── P0 writer admission ──────────────────────────────────────────────
       if (p0Pointer && workResumeStore) {
         await centralAdmissionCheck({
@@ -4820,6 +4903,9 @@ export function createMcpServer(
             }),
           )
           .min(1),
+        mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+          "Nexus-owned mutation admission pointer. Required for canonical-repository mutation.",
+        ),
         resumableWork: resumableWorkSchema().optional().describe(
           "P0 resumable-work pointer.  When supplied, the edit is admitted only if the exact lease is currently held by the caller.",
         ),
@@ -4831,7 +4917,7 @@ export function createMcpServer(
       ...toolWidgetDescriptorMeta(config, "edit"),
       annotations: EDIT_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, resumableWork: p0Pointer, ...input }, extra) => {
+    async ({ workspaceId, mutationAdmission, resumableWork: p0Pointer, ...input }, extra) => {
       const startedAt = performance.now();
       await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       const workspace = workspaces.getWorkspace(workspaceId);
@@ -4847,6 +4933,11 @@ export function createMcpServer(
           ].join("\n"))],
         };
       }
+      await authorizeNexusMutation({
+        workspaceRoot: workspace.root,
+        binding: mutationAdmission,
+        requestedPaths: [input.path],
+      });
       // ── P0 writer admission ──────────────────────────────────────────────
       if (p0Pointer && workResumeStore) {
         await centralAdmissionCheck({
@@ -4936,6 +5027,9 @@ export function createMcpServer(
           patch: z
             .string()
             .describe("Patch text enclosed by *** Begin Patch and *** End Patch markers."),
+          mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+            "Nexus-owned mutation admission pointer. Required for canonical-repository mutation.",
+          ),
         },
           outputSchema: resultOutputSchema({
           additions: z.number(),
@@ -4952,7 +5046,7 @@ export function createMcpServer(
         ...toolWidgetDescriptorMeta(config, "edit"),
         annotations: EDIT_TOOL_ANNOTATIONS,
       },
-      async ({ workspaceId, patch }, extra) => {
+      async ({ workspaceId, patch, mutationAdmission }, extra) => {
         const startedAt = performance.now();
         await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
         const workspace = workspaces.getWorkspace(workspaceId);
@@ -4976,6 +5070,11 @@ export function createMcpServer(
             ].join("\n"))],
           };
         }
+        await authorizeNexusMutation({
+          workspaceRoot: workspace.root,
+          binding: mutationAdmission,
+          requestedPaths: mutationPaths,
+        });
         const coreAdmission = coreMutationGuard
           ? await coreMutationGuard.admit({ workspaceId, extra, paths: mutationPaths, deletedPaths, pathContainment: "STRUCTURED_SINK_ENFORCED" })
           : undefined;
@@ -5347,6 +5446,9 @@ export function createMcpServer(
           .max(100_000)
           .optional()
           .describe("Approximate output token budget. Defaults to 10000."),
+        mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+          "Nexus-owned mutation admission pointer. Required only when this command can mutate a canonical repository.",
+        ),
         resumableWork: resumableWorkSchema().optional().describe(
           "P0 resumable-work pointer.  When supplied and the command is write-capable, the spawn is admitted only if the exact lease is currently held by the caller.  Read-only commands ignore this field.",
         ),
@@ -5355,13 +5457,19 @@ export function createMcpServer(
       ...toolWidgetDescriptorMeta(config, "shell"),
       annotations: SHELL_TOOL_ANNOTATIONS,
     },
-    async ({ workspaceId, workingDirectory, command, timeout, attemptKey, yieldTimeMs, maxOutputTokens, resumableWork: p0Pointer }, extra) => {
+    async ({ workspaceId, workingDirectory, command, timeout, attemptKey, yieldTimeMs, maxOutputTokens, mutationAdmission, resumableWork: p0Pointer }, extra) => {
       const startedAt = performance.now();
       const mutationCapable = !isRepositoryReadOnlyShellCommand(command);
       if (mutationCapable) {
         await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
       }
       const workspace = workspaces.getWorkspace(workspaceId);
+      if (mutationCapable) {
+        await authorizeNexusMutation({
+          workspaceRoot: workspace.root,
+          binding: mutationAdmission,
+        });
+      }
       // ── P0 writer admission ──────────────────────────────────────────────
       // Checked only for write-capable commands; read-only commands skip.
       if (p0Pointer && workResumeStore && mutationCapable) {
@@ -5505,7 +5613,7 @@ export function createMcpServer(
   // exposes only special-purpose goal actions; generic exec_command/write_stdin
   // stay hidden outside codex mode.
   if (config.codexGoalsEnabled && codexGoals) {
-    registerCodexGoalTools(server, config, workspaces, codexGoals, coreMutationGuard);
+    registerCodexGoalTools(server, config, workspaces, codexGoals, authorizeNexusMutation, coreMutationGuard);
   }
 
   if (config.artifactsEnabled && isArtifactDownloadSupportedPlatform()) {
@@ -5514,6 +5622,7 @@ export function createMcpServer(
       workspaces,
       incomingArtifactAdapters,
       coreMutation: coreMutationGuard,
+      authorizeNexusMutation,
     });
   }
 
@@ -5759,6 +5868,12 @@ export function createMcpServer(
         let discoveryContext: string | undefined;
         if (selectedProfile?.write_mode !== "read_only") {
           await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
+          await authorizeNexusMutation({
+            workspaceRoot: workspace.root,
+            binding: contract?.mutationAdmission,
+            expectedBase: contract?.expectedHead,
+            requestedPaths: contract?.writePaths,
+          });
           const authorityMode = contract?.authorityMode ?? "OWNER_DIRECT";
           const coreBound = contract?.coreMutation !== undefined;
           const ownerDirect = authorityMode === "OWNER_DIRECT" && !coreBound;
@@ -5956,6 +6071,12 @@ export function createMcpServer(
         if (currentWriteMode !== "read_only") {
           await workspaces.assertConversationMutationAllowed(workspaceId, openAiConversationScopeId(extra._meta));
           const contract = currentAgent?.executionContract;
+          await authorizeNexusMutation({
+            workspaceRoot: workspace.root,
+            binding: contract?.mutationAdmission,
+            expectedBase: contract?.expectedHead,
+            requestedPaths: contract?.writePaths,
+          });
           const authorityMode = contract?.authorityMode ?? "OWNER_DIRECT";
           const coreBound = contract?.coreMutation !== undefined;
           const ownerDirect = authorityMode === "OWNER_DIRECT" && !coreBound;
@@ -6981,6 +7102,9 @@ export function createMcpServer(
             .boolean()
             .default(false)
             .describe("Whether to overwrite an existing destination file. Defaults to false."),
+          mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+            "Nexus-owned mutation admission pointer for the destination canonical repository.",
+          ),
         },
         outputSchema: resultOutputSchema({
           sourcePath: z.string(),
@@ -7002,6 +7126,7 @@ export function createMcpServer(
           expectedDestinationSha256,
           expectedDestinationAbsent,
           overwrite,
+          mutationAdmission,
         },
         extra,
       ) => {
@@ -7053,6 +7178,11 @@ export function createMcpServer(
         }
 
         const destinationAbsolutePath = workspaces.resolvePath(destinationWorkspace, destinationPath);
+        await authorizeNexusMutation({
+          workspaceRoot: destinationWorkspace.root,
+          binding: mutationAdmission,
+          requestedPaths: [destinationPath],
+        });
         const destinationRootCanonical = canonicalizePath(destinationWorkspace.root);
         const destinationCanonicalPath = canonicalizePath(destinationAbsolutePath);
         if (!isPathInsideRoot(destinationCanonicalPath, destinationRootCanonical)) {
@@ -7262,6 +7392,9 @@ export function createMcpServer(
         confirmApply: z
           .boolean()
           .describe("Must be true to apply. Without it the operation stays read-only preparation."),
+        mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+          "Nexus-owned mutation admission pointer for the destination canonical repository.",
+        ),
       },
       outputSchema: candidateIntegrateOutputSchema,
       _meta: {},
@@ -7272,26 +7405,36 @@ export function createMcpServer(
         openWorldHint: false,
       },
     },
-    async ({ sourceWorkspaceId, candidateBase, candidateHead, destinationWorkspaceId, expectedDestinationHead, dirtyPolicy, confirmApply }, extra) => {
+    async ({ sourceWorkspaceId, candidateBase, candidateHead, destinationWorkspaceId, expectedDestinationHead, dirtyPolicy, confirmApply, mutationAdmission }, extra) => {
       if (confirmApply) {
         await workspaces.assertConversationMutationAllowed(destinationWorkspaceId, openAiConversationScopeId(extra._meta));
       }
       const source = workspaces.getWorkspace(sourceWorkspaceId);
       const destination = workspaces.getWorkspace(destinationWorkspaceId);
+      const readiness = confirmApply
+        ? await inspectIntegrationReadiness({
+            sourceWorkspaceRoot: source.root,
+            candidateBase,
+            candidateHead,
+            destinationWorkspaceRoot: destination.root,
+            expectedDestinationHead,
+            dirtyPolicy,
+          })
+        : undefined;
+      if (confirmApply && readiness) {
+        await authorizeNexusMutation({
+          workspaceRoot: destination.root,
+          binding: mutationAdmission,
+          expectedBase: expectedDestinationHead,
+          requestedPaths: readiness.candidateChangedPaths,
+        });
+      }
       let coreAdmission: CoreMutationAdmission | undefined;
       let coreCandidate: ReturnType<CoreMutationGuard["candidate"]>;
       const destinationCore = confirmApply && coreMutationGuard
         ? coreMutationGuard.require({ workspaceId: destinationWorkspaceId, extra })
         : undefined;
-      if (confirmApply && coreMutationGuard && destinationCore) {
-        const readiness = await inspectIntegrationReadiness({
-          sourceWorkspaceRoot: source.root,
-          candidateBase,
-          candidateHead,
-          destinationWorkspaceRoot: destination.root,
-          expectedDestinationHead,
-          dirtyPolicy,
-        });
+      if (confirmApply && coreMutationGuard && destinationCore && readiness) {
         if (!readiness.technicallyReadyToApply) throw new Error(`[CANDIDATE_INTEGRATION_NOT_READY] ${readiness.blockers.map((blocker) => blocker.code).join(", ") || "readiness unknown"}`);
         coreCandidate = requireCoreCandidateProvenance(coreMutationGuard, readiness);
         coreAdmission = await coreMutationGuard.admit({
@@ -7384,6 +7527,9 @@ export function createMcpServer(
           expectedBuildId: z.string().min(1),
           expectedCapabilityManifestSha256: z.string().regex(/^[0-9a-f]{64}$/),
           confirmPromote: z.boolean(),
+          mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+            "Nexus-owned mutation admission pointer for the destination canonical repository.",
+          ),
           resumableWork: resumableWorkSchema().optional().describe(
             "P0 resumable-work pointer for the destination worktree. When supplied, promotion is admitted only if the exact writer lease is held.",
           ),
@@ -7425,10 +7571,29 @@ export function createMcpServer(
         expectedBuildId,
         expectedCapabilityManifestSha256,
         confirmPromote,
+        mutationAdmission,
         resumableWork: p0Pointer,
       }, extra) => {
         const source = workspaces.getWorkspace(sourceWorkspaceId);
         const destination = workspaces.getWorkspace(destinationWorkspaceId);
+        const promotionReadiness = confirmPromote
+          ? await inspectIntegrationReadiness({
+              sourceWorkspaceRoot: source.root,
+              candidateBase,
+              candidateHead,
+              destinationWorkspaceRoot: destination.root,
+              expectedDestinationHead,
+              dirtyPolicy: "pristine",
+            })
+          : undefined;
+        if (confirmPromote && promotionReadiness) {
+          await authorizeNexusMutation({
+            workspaceRoot: destination.root,
+            binding: mutationAdmission,
+            expectedBase: expectedDestinationHead,
+            requestedPaths: promotionReadiness.candidateChangedPaths,
+          });
+        }
         if (confirmPromote && p0Pointer && workResumeStore) {
           try {
             await centralAdmissionCheck({
@@ -7449,16 +7614,15 @@ export function createMcpServer(
         const destinationCore = confirmPromote && coreMutationGuard
           ? coreMutationGuard.require({ workspaceId: destinationWorkspaceId, extra })
           : undefined;
-        if (confirmPromote && coreMutationGuard && destinationCore) {
-          const readiness = await inspectIntegrationReadiness({ sourceWorkspaceRoot: source.root, candidateBase, candidateHead, destinationWorkspaceRoot: destination.root, expectedDestinationHead, dirtyPolicy: "pristine" });
-          if (!readiness.technicallyReadyToApply) throw new Error(`[CANDIDATE_PROMOTION_NOT_READY] ${readiness.blockers.map((blocker) => blocker.code).join(", ") || "readiness unknown"}`);
-          coreCandidate = requireCoreCandidateProvenance(coreMutationGuard, readiness);
+        if (confirmPromote && coreMutationGuard && destinationCore && promotionReadiness) {
+          if (!promotionReadiness.technicallyReadyToApply) throw new Error(`[CANDIDATE_PROMOTION_NOT_READY] ${promotionReadiness.blockers.map((blocker) => blocker.code).join(", ") || "readiness unknown"}`);
+          coreCandidate = requireCoreCandidateProvenance(coreMutationGuard, promotionReadiness);
           coreAdmission = await coreMutationGuard.admit({
             workspaceId: destinationWorkspaceId,
             extra,
             pointer: { required: true, sessionId: destinationCore.id, bindingHash: destinationCore.bindingHash },
-            paths: readiness.candidateChangedPaths,
-            deletedPaths: readiness.candidateDeletedPaths,
+            paths: promotionReadiness.candidateChangedPaths,
+            deletedPaths: promotionReadiness.candidateDeletedPaths,
             pathContainment: "STRUCTURED_SINK_ENFORCED",
           });
         }
@@ -7515,6 +7679,9 @@ export function createMcpServer(
             .min(1)
             .max(100)
             .describe("Workspace-relative file paths to stage and commit."),
+          mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+            "Nexus-owned mutation admission pointer required for canonical-repository Candidate formation.",
+          ),
           resumableWork: resumableWorkSchema().optional().describe(
             "P0 resumable-work pointer.  When supplied, the commit is admitted only if the exact lease is currently held by the caller.",
           ),
@@ -7538,13 +7705,18 @@ export function createMcpServer(
           openWorldHint: false,
         },
       },
-      async ({ workspaceId, expectedHead, message, paths, resumableWork: p0Pointer }, extra) => {
+      async ({ workspaceId, expectedHead, message, paths, mutationAdmission, resumableWork: p0Pointer }, extra) => {
         const workspace = workspaces.getWorkspace(workspaceId);
         if (workspace.mode !== "worktree" || !workspace.worktree?.managed) {
           throw new Error(
             "[GIT_MANAGED_WORKTREE_REQUIRED] Git candidate mutations are only allowed on DevSpace-managed worktrees.",
           );
         }
+        await authorizeNexusMutation({
+          workspaceRoot: workspace.root,
+          binding: mutationAdmission,
+          requestedPaths: paths,
+        });
         // ── P0 writer admission ──────────────────────────────────────────────
         if (p0Pointer && workResumeStore) {
           try {
@@ -7749,6 +7921,9 @@ export function createMcpServer(
             .describe("Exact 40-character Git commit hash expected at current HEAD."),
           remote: z.string().describe("Configured Git remote name (e.g. 'origin')."),
           branch: z.string().describe("Name of the target non-default remote branch to push to."),
+          mutationAdmission: mutationAdmissionBindingSchema().optional().describe(
+            "Nexus-owned mutation admission pointer required for canonical-repository Candidate publication.",
+          ),
           resumableWork: resumableWorkSchema().optional().describe(
             "P0 resumable-work pointer.  When supplied, the push is admitted only if the exact lease is currently held by the caller.",
           ),
@@ -7767,13 +7942,18 @@ export function createMcpServer(
           openWorldHint: true,
         },
       },
-      async ({ workspaceId, expectedHead, remote, branch, resumableWork: p0Pointer }, extra) => {
+      async ({ workspaceId, expectedHead, remote, branch, mutationAdmission, resumableWork: p0Pointer }, extra) => {
         const workspace = workspaces.getWorkspace(workspaceId);
         if (workspace.mode !== "worktree" || !workspace.worktree?.managed) {
           throw new Error(
             "[GIT_MANAGED_WORKTREE_REQUIRED] Git candidate mutations are only allowed on DevSpace-managed worktrees.",
           );
         }
+        await authorizeNexusMutation({
+          workspaceRoot: workspace.root,
+          binding: mutationAdmission,
+          publicationHead: expectedHead,
+        });
         // ── P0 writer admission ──────────────────────────────────────────────
         if (p0Pointer && workResumeStore) {
           try {
