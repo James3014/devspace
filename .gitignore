@@ -6,3 +6,7 @@ generated/
 *.log
 *.tgz
 
+
+# Nexus Core local evidence/bindings
+.nexus-core/receipts/
+.nexus-core/issues/
