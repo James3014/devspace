@@ -270,9 +270,24 @@ export class NexusMutationAdmissionResolver {
       );
     }
     const root = await realpath(resolve(this.stateRoot));
-    const expected = resolve(root, "mutation-admissions", `${validated.admissionId}.json`);
-    if (!(expected === root || expected.startsWith(root + sep))) {
-      throw new NexusMutationAdmissionError("NEXUS_MUTATION_ADMISSION_INVALID", "Admission path escapes canonical state root.");
+    let admissionsRoot: string;
+    try {
+      admissionsRoot = await realpath(resolve(root, "mutation-admissions"));
+    } catch (error) {
+      throw new NexusMutationAdmissionError(
+        "NEXUS_MUTATION_ADMISSION_NOT_FOUND",
+        `Canonical admission directory could not be resolved: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    if (!(admissionsRoot === root || admissionsRoot.startsWith(root + sep))) {
+      throw new NexusMutationAdmissionError(
+        "NEXUS_MUTATION_ADMISSION_INVALID",
+        "Canonical admission directory escapes the configured Nexus state root.",
+      );
+    }
+    const expected = resolve(admissionsRoot, `${validated.admissionId}.json`);
+    if (!(expected === admissionsRoot || expected.startsWith(admissionsRoot + sep))) {
+      throw new NexusMutationAdmissionError("NEXUS_MUTATION_ADMISSION_INVALID", "Admission path escapes canonical admission directory.");
     }
     let handle;
     try {
@@ -339,6 +354,33 @@ export class NexusMutationAdmissionResolver {
         throw new NexusMutationAdmissionError(
           "NEXUS_MUTATION_ADMISSION_SCOPE_MISMATCH",
           `Existing committed change is outside admitted scope: ${path}`,
+        );
+      }
+    }
+    let dirtyPaths: string[];
+    try {
+      const [unstaged, staged, untracked] = await Promise.all([
+        git(input.workspaceRoot, ["diff", "--name-only", "--no-renames"]),
+        git(input.workspaceRoot, ["diff", "--cached", "--name-only", "--no-renames"]),
+        git(input.workspaceRoot, ["ls-files", "--others", "--exclude-standard"]),
+      ]);
+      dirtyPaths = Array.from(new Set(
+        [unstaged.stdout, staged.stdout, untracked.stdout]
+          .flatMap((value) => value.split(/\r?\n/))
+          .map((path) => path.trim())
+          .filter(Boolean),
+      ));
+    } catch (error) {
+      throw new NexusMutationAdmissionError(
+        "NEXUS_MUTATION_ADMISSION_WORKSPACE_STATE_UNKNOWN",
+        `Unable to inspect workspace mutation state: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+    for (const path of dirtyPaths) {
+      if (!pathWithinAdmission(path, receipt.allowed_paths)) {
+        throw new NexusMutationAdmissionError(
+          "NEXUS_MUTATION_ADMISSION_SCOPE_MISMATCH",
+          `Existing workspace mutation is outside admitted scope: ${path}`,
         );
       }
     }
