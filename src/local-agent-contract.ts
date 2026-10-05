@@ -22,6 +22,10 @@ import {
   parseResumableWorkPointer,
   type ResumableWorkPointer,
 } from "./work-resume.js";
+import {
+  parseNexusMutationAdmissionBinding,
+  type NexusMutationAdmissionBinding,
+} from "./nexus-mutation-admission.js";
 
 /**
  * Structured execution contract for a DevSpace subagent turn.
@@ -100,6 +104,12 @@ export interface ExecutionContract {
   capabilityDiscovery?: CapabilityDiscoveryReceipt;
   /** Exact pointer to an already-open Core-bound mutation session. */
   coreMutation?: { sessionId: string; bindingHash: string };
+  /**
+   * Pointer to one canonical Nexus mutation-admission receipt. This pointer is
+   * not authority by itself; DevSpace resolves and verifies the Nexus-owned
+   * durable receipt before each managed mutation/publication effect.
+   */
+  mutationAdmission?: NexusMutationAdmissionBinding;
   /**
    * If supplied, agent_start fails closed when the workspace HEAD no longer
    * matches before any worker mutation.
@@ -361,6 +371,16 @@ export function parseExecutionContract(value: unknown): ExecutionContract | unde
 
   if (record.capabilityDiscovery !== undefined) {
     contract.capabilityDiscovery = parseCapabilityDiscoveryReceipt(record.capabilityDiscovery);
+  }
+
+  if (record.mutationAdmission !== undefined) {
+    try {
+      contract.mutationAdmission = parseNexusMutationAdmissionBinding(record.mutationAdmission);
+    } catch (err) {
+      throw new Error(
+        `executionContract.mutationAdmission is invalid: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
   }
 
   if (record.coreMutation !== undefined) {
