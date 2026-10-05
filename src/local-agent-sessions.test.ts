@@ -12,6 +12,11 @@ import { type HerdrExternalHandle, type HerdrPromptResult, HerdrThinGateway, def
 import { hashDispatchIntent } from "./execution-protocol.js";
 import { AgentProviderFailureError } from "./local-agent-errors.js";
 import { inspectWorkspacePhysicalState } from "./workspace-reconciliation.js";
+import {
+  buildLocalEffectEnforcementReceipt,
+  LOCAL_EFFECT_PROJECTION_SCHEMA,
+  type LocalEffectEnforcementReceipt,
+} from "./local-effect-enforcement.js";
 
 const originalAgyCommand = process.env.AGY_COMMAND;
 process.env.AGY_COMMAND = process.execPath;
@@ -75,6 +80,8 @@ function settleAgent(
     providerSessionId?: string;
     error?: string;
     terminalReason?: "completed" | "provider_error";
+    scopeState?: "WITHIN_SCOPE" | "SCOPE_VIOLATION" | "UNKNOWN";
+    effectEnforcementReceipt?: LocalEffectEnforcementReceipt;
   } = {},
 ): void {
   const store = (manager as any).store as LocalAgentStore;
@@ -1308,6 +1315,150 @@ test("HerdR request-only execution never reports proven scope or unknown overall
     defaultHerdrGatewayRegistry.releaseHandle(attemptKey);
     manager.close();
     rmSync(stateDir, { recursive: true, force: true });
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("direct Agy without native enforcement reports unproven clean scope and request-only effects", async () => {
+  const { manager, clean } = setupFixture();
+  const projectRoot = mkdtempSync(join(tmpdir(), "devspace-direct-agy-request-only-"));
+  execFileSync("git", ["init", "--initial-branch=main"], { cwd: projectRoot, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: projectRoot });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd: projectRoot });
+  writeFileSync(join(projectRoot, "README.md"), "direct Agy fixture\n");
+  execFileSync("git", ["add", "."], { cwd: projectRoot });
+  execFileSync("git", ["commit", "-m", "base"], { cwd: projectRoot, stdio: "ignore" });
+
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws-direct-agy-request-only",
+      workspaceRoot: projectRoot,
+      profileName: "implementer",
+      prompt: "read only",
+      profiles: mockProfiles,
+      executionContract: { writePaths: ["src/message.txt"], maxFiles: 1 },
+    });
+    settleAgent(manager, started.agentId, { scopeState: "WITHIN_SCOPE" });
+
+    const status = await manager.getAgentStatus({
+      workspaceId: "ws-direct-agy-request-only",
+      workspaceRoot: projectRoot,
+      agentId: started.agentId,
+    });
+    assert.equal(status.scopeState, "UNKNOWN");
+    assert.equal(status.effectPolicyStatus?.overallEnforcement, "REQUEST_ONLY_NOT_ENFORCED");
+
+    const reconciled = await manager.reconcileAgent({
+      workspaceId: "ws-direct-agy-request-only",
+      workspaceRoot: projectRoot,
+      isolated: false,
+      agentId: started.agentId,
+    });
+    assert.equal(reconciled.herdrHandle, undefined);
+    assert.equal(reconciled.candidate.scopeState, "UNKNOWN");
+  } finally {
+    manager.close();
+    clean();
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("direct Agy preserves observed out-of-scope repository violations", async () => {
+  const { manager, clean } = setupFixture();
+  const projectRoot = mkdtempSync(join(tmpdir(), "devspace-direct-agy-violation-"));
+  execFileSync("git", ["init", "--initial-branch=main"], { cwd: projectRoot, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: projectRoot });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd: projectRoot });
+  writeFileSync(join(projectRoot, "README.md"), "direct Agy violation fixture\n");
+  execFileSync("git", ["add", "."], { cwd: projectRoot });
+  execFileSync("git", ["commit", "-m", "base"], { cwd: projectRoot, stdio: "ignore" });
+
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws-direct-agy-violation",
+      workspaceRoot: projectRoot,
+      profileName: "implementer",
+      prompt: "write only the allowed file",
+      profiles: mockProfiles,
+      executionContract: { writePaths: ["src/message.txt"], maxFiles: 1 },
+    });
+    settleAgent(manager, started.agentId, { scopeState: "WITHIN_SCOPE" });
+    writeFileSync(join(projectRoot, "outside.txt"), "observed violation\n");
+
+    const reconciled = await manager.reconcileAgent({
+      workspaceId: "ws-direct-agy-violation",
+      workspaceRoot: projectRoot,
+      isolated: false,
+      agentId: started.agentId,
+    });
+    assert.equal(reconciled.candidate.scopeState, "SCOPE_VIOLATION");
+    assert.deepEqual(reconciled.candidate.unexpectedPaths, ["outside.txt"]);
+  } finally {
+    manager.close();
+    clean();
+    rmSync(projectRoot, { recursive: true, force: true });
+  }
+});
+
+test("non-Agy native enforcement preserves physically enforced scope semantics", async () => {
+  const { manager, clean } = setupFixture();
+  const projectRoot = mkdtempSync(join(tmpdir(), "devspace-native-enforced-scope-"));
+  execFileSync("git", ["init", "--initial-branch=main"], { cwd: projectRoot, stdio: "ignore" });
+  execFileSync("git", ["config", "user.email", "test@example.com"], { cwd: projectRoot });
+  execFileSync("git", ["config", "user.name", "Test User"], { cwd: projectRoot });
+  writeFileSync(join(projectRoot, "README.md"), "native enforcement fixture\n");
+  execFileSync("git", ["add", "."], { cwd: projectRoot });
+  execFileSync("git", ["commit", "-m", "base"], { cwd: projectRoot, stdio: "ignore" });
+  const previousOmpCommand = process.env.OMP_COMMAND;
+  process.env.OMP_COMMAND = process.execPath;
+  const receipt = buildLocalEffectEnforcementReceipt({
+    provider: "omp",
+    writeMode: "read_only",
+    selectedToolIntents: ["workspace.read"],
+    effectProjection: {
+      schema: LOCAL_EFFECT_PROJECTION_SCHEMA,
+      process: { mode: "DENY" },
+      network: { egress: "DENY" },
+      git: { mode: "DENY" },
+    },
+    enforcementSurface: { tools: "read", process: "deny", network: "deny", git: "deny" },
+  });
+  const nativeProfile: LocalAgentProfile = {
+    name: "native-enforced",
+    description: "native enforcement fixture",
+    provider: "omp",
+    disabled: false,
+    filePath: "native-enforced.md",
+    body: "",
+    write_mode: "read_only",
+  };
+
+  try {
+    const started = await manager.startAgent({
+      workspaceId: "ws-native-enforced",
+      workspaceRoot: projectRoot,
+      profileName: nativeProfile.name,
+      prompt: "read only",
+      profiles: [nativeProfile],
+      executionContract: { writePaths: ["src/message.txt"], maxFiles: 1 },
+    });
+    settleAgent(manager, started.agentId, {
+      scopeState: "WITHIN_SCOPE",
+      effectEnforcementReceipt: receipt,
+    });
+
+    const status = await manager.getAgentStatus({
+      workspaceId: "ws-native-enforced",
+      workspaceRoot: projectRoot,
+      agentId: started.agentId,
+    });
+    assert.equal(status.scopeState, "WITHIN_SCOPE");
+    assert.equal(status.effectPolicyStatus?.overallEnforcement, "PHYSICALLY_ENFORCED");
+  } finally {
+    if (previousOmpCommand === undefined) delete process.env.OMP_COMMAND;
+    else process.env.OMP_COMMAND = previousOmpCommand;
+    manager.close();
+    clean();
     rmSync(projectRoot, { recursive: true, force: true });
   }
 });

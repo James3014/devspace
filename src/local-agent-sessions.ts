@@ -2793,7 +2793,8 @@ export class LocalAgentSessionManager {
     const observedScopeState: ScopeState = herdrReconciliation?.completionStatus === "SCOPE_VIOLATION"
       ? "SCOPE_VIOLATION"
       : scopeState;
-    const reconciledScopeState = reportableHerdrScopeState(
+    const reconciledScopeState = reportableScopeState(
+      record,
       observedScopeState,
       herdrReconciliation?.enforcementState ?? herdrHandle?.enforcementState,
     );
@@ -4710,10 +4711,25 @@ function deriveEffectPolicyStatus(
   const axes = [process, network, git, toolCeiling];
   const overallEnforcement = axes.every((state) => state === "enforced")
     ? "PHYSICALLY_ENFORCED"
-    : herdrHandle?.enforcementState === "REQUEST_ONLY_NOT_ENFORCED" || axes.some((state) => state === "request_only" || state === "enforced")
+    : record.provider === "agy" ||
+        herdrHandle?.enforcementState === "REQUEST_ONLY_NOT_ENFORCED" ||
+        axes.some((state) => state === "request_only" || state === "enforced")
       ? "REQUEST_ONLY_NOT_ENFORCED"
       : "UNKNOWN";
   return { process, network, git, toolCeiling, overallEnforcement };
+}
+
+function reportableScopeState(
+  record: LocalAgentRecord,
+  scopeState: ScopeState,
+  enforcementState: HerdrExternalHandle["enforcementState"] | undefined,
+): ScopeState {
+  if (scopeState === "SCOPE_VIOLATION") return scopeState;
+  if (record.lifecycleState?.lastEffectEnforcementReceipt?.enforcementMode === "ENFORCED_NATIVE_PROVIDER") {
+    return scopeState;
+  }
+  if (record.provider === "agy") return "UNKNOWN";
+  return reportableHerdrScopeState(scopeState, enforcementState);
 }
 
 function reportableHerdrScopeState(
@@ -4858,7 +4874,7 @@ function recordToStatusOutput(
     if (lifecycle.changedPaths !== undefined) output.changedPaths = lifecycle.changedPaths;
     if (lifecycle.terminalReason !== undefined) output.terminalReason = lifecycle.terminalReason;
     if (lifecycle.scopeState !== undefined) {
-      output.scopeState = reportableHerdrScopeState(lifecycle.scopeState, herdrHandle?.enforcementState);
+      output.scopeState = reportableScopeState(record, lifecycle.scopeState, herdrHandle?.enforcementState);
     }
   }
   return output;
