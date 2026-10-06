@@ -4582,7 +4582,7 @@ export function createMcpServer(
           const preview=ownerApprovalPreview(pendingId,contract as CarrierContract,extra);
           return result({...preview,canonical:undefined,contractJson:undefined,expiresAtMs:undefined});
         });
-        registerAppTool(server,"coordination_owner_approval_status",{...registration,annotations:{...registration.annotations,readOnlyHint:true,idempotentHint:true},title:"Read Owner carrier approval status",description:"Read durable pending/approved/rejected/expired approval state for one pairing from the authenticated OAuth client. Does not bind the current session or grant authority.",inputSchema:{pendingId:z.string()}},async({pendingId},extra)=>{
+        registerAppTool(server,"coordination_owner_approval_status",{...registration,annotations:{...registration.annotations,readOnlyHint:false,idempotentHint:true},title:"Read/reconcile Owner carrier approval status",description:"Read durable pending/approved/rejected/expired approval state for one pairing from the authenticated OAuth client. May reconcile the derived receipt from authoritative carrier state after a lost acknowledgement; never mints a carrier, binds the current session, or grants authority.",inputSchema:{pendingId:z.string()}},async({pendingId},extra)=>{
           const context=dependencyConsumerContext(extra);
           const receipt=ownerApprovalReceipts.read(pendingId);
           const pending=ownerApprovalReceipts.pairing(pendingId);
