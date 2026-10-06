@@ -5,6 +5,7 @@
 - RepoLearn: `ENABLED`.
 - Canonical source: `James3014/repo-learning`.
 - Capability: `repo-learning`.
+- Expected contract: `g5-learning-control-loop-v3` / `8fa154f05bb3a5a1652d8a0b8388e718ce685257a2da26e2121c2ce52a9855ac`.
 - Mode: `guided`.
 - If RepoLearn or its learning-state backend is unavailable, continue normal engineering without weakening this repository's authority or verification requirements.
 - This pointer activates/references canonical RepoLearn only; it does not redefine trigger, assessment, mastery, persistence, or cue-fading policy.
