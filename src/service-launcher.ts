@@ -11,7 +11,7 @@ function stableServiceRoot(): string {
   return resolve(dirname(fileURLToPath(import.meta.url)), "..");
 }
 
-function main(): never {
+function main(): void {
   const serviceRoot = stableServiceRoot();
   const pointerPath = join(serviceRoot, CUTOVER_RELEASE_POINTER_FILENAME);
   if (!existsSync(pointerPath)) {
