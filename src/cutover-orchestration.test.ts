@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import {
+  CUTOVER_ACTIVATION_BINDING_SCHEMA,
   CutoverStateStore,
   type CutoverServerIdentity,
   type ExpectedCutoverIdentity,
@@ -41,6 +42,21 @@ const badWitness: DurableReconciliationWitness = {
   agentQueryable: true,
   agentReconciled: false,
 };
+
+function bindActivation(stateDir: string, controller: McpCutoverController): void {
+  const record = controller.record();
+  assert.ok(record);
+  new CutoverStateStore(stateDir).recordActivationBinding(record.cutoverId, {
+    schema: CUTOVER_ACTIVATION_BINDING_SCHEMA,
+    cutoverId: record.cutoverId,
+    sourceCommit: record.expectedNewIdentity.sourceCommit,
+    buildId: record.expectedNewIdentity.buildId,
+    releaseSha256: "e".repeat(64),
+    releasePath: join(stateDir, "releases", "release-target"),
+    pointerPath: join(stateDir, "current-release.json"),
+    boundAt: new Date().toISOString(),
+  });
+}
 
 function makeActuator(failOnSchedule = false): SelfRestartActuator & { calls: number } {
   const actuator: SelfRestartActuator & { calls: number } = {
@@ -188,6 +204,7 @@ test("advance schedules a gated restart exactly once and durably records the mar
     const cutoverId = old.record()!.cutoverId;
     old.recordDrain(cutoverId, { activeSessions: 0, oldestAgeMs: 0 });
     old.requestRestart(cutoverId, { verifiedBy: "op", verifiedAt: new Date().toISOString() });
+    bindActivation(stateDir, old);
 
     const first = await orchestrator(old, { actuator }).advance();
     assert.equal(first.outcome, "restart_scheduled");
@@ -211,6 +228,7 @@ test("dry-run rehearsal never schedules or mutates durable state", async () => {
     const cutoverId = old.record()!.cutoverId;
     old.recordDrain(cutoverId, { activeSessions: 0, oldestAgeMs: 0 });
     old.requestRestart(cutoverId, { verifiedBy: "op", verifiedAt: new Date().toISOString() });
+    bindActivation(stateDir, old);
 
     const rehearsed = await orchestrator(old, { actuator }).advance({ dryRun: true });
     assert.equal(rehearsed.outcome, "restart_scheduled");
@@ -235,6 +253,7 @@ test("advance blocks with CUTOVER_ACTUATOR_UNAVAILABLE and never re-schedules af
     const cutoverId = old.record()!.cutoverId;
     old.recordDrain(cutoverId, { activeSessions: 0, oldestAgeMs: 0 });
     old.requestRestart(cutoverId, { verifiedBy: "op", verifiedAt: new Date().toISOString() });
+    bindActivation(stateDir, old);
 
     const blocked = await orchestrator(old, { actuator }).advance();
     assert.equal(blocked.outcome, "blocked");
