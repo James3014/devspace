@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -235,7 +235,7 @@ test("stable launchd binding rejects legacy cli entrypoint and fences deferred d
       inspectLaunchdTarget: () => ({ status: 0, stdout: stableOutput }),
     });
     assert.ok(inspected);
-    assert.equal(inspected.serviceRoot, serviceRoot);
+    assert.equal(inspected.serviceRoot, realpathSync.native(serviceRoot));
 
     assert.equal(
       inspectBoundStableLaunchdService({
