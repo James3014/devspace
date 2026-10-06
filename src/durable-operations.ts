@@ -783,6 +783,7 @@ export class DurableOperationManager {
         if(!current.intent.receipt?.restartAction) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart marker lacks bound action; reconciliation required");
         return {...current,replay:true};
       }
+      if(!current.file.activationBinding) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart requires an exact durable activation binding before any restart effect");
       this.store.finish(current.intent.operationId,{status:"succeeded",retrySafe:false,receipt:{...current.intent.receipt,restartAction:action,restartState:"requested"}});
       new McpCutoverController(cutoverStore,identity).requestRestart(cutoverId,ready);
       return {...readBound(),replay:false};
