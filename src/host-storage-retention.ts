@@ -1063,10 +1063,12 @@ async function inspectReleases(input: HostStorageRetentionInput): Promise<HostSt
 
   const artifacts = owned.map<HostStorageArtifact>((entry) => {
     const releaseRevision = entry.name.slice("release-".length);
+    const activeRevision =
+      releaseRevision.match(/^([0-9a-f]{7,40})(?:-[0-9a-f]{16})?$/u)?.[1];
     if (
       input.activeSourceCommit &&
-      /^[0-9a-f]{7,40}$/u.test(releaseRevision) &&
-      input.activeSourceCommit.startsWith(releaseRevision)
+      activeRevision &&
+      input.activeSourceCommit.startsWith(activeRevision)
     ) {
       return {
         id: `release:${entry.name}`,
