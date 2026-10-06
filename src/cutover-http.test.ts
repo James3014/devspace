@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { CutoverStateStore } from "./cutover-state.js";
+import { CUTOVER_ACTIVATION_BINDING_SCHEMA, CutoverStateStore } from "./cutover-state.js";
 import type { OrchestrationOutcome } from "./cutover-orchestration.js";
 import type { SelfRestartActuator } from "./cutover-restart.js";
 import { McpCutoverController, registerCutoverHttpRoutes } from "./mcp-cutover.js";
@@ -118,6 +118,22 @@ test("restart route gates on attestation and probe and schedules exactly once; a
         agentReconciled: true,
       }),
       restartSelf: actuator,
+      ensureActivationBound: (cutoverId) => {
+        const current=old.record();
+        assert.ok(current);
+        if(current.activationBinding) return current.activationBinding;
+        const binding={
+          schema:CUTOVER_ACTIVATION_BINDING_SCHEMA,
+          cutoverId,
+          sourceCommit:current.expectedNewIdentity.sourceCommit,
+          buildId:current.expectedNewIdentity.buildId,
+          releaseSha256:"e".repeat(64),
+          releasePath:join(stateDir,"releases","release-target"),
+          pointerPath:join(stateDir,"current-release.json"),
+          boundAt:"2026-10-06T00:00:00.000Z",
+        };
+        return new CutoverStateStore(stateDir).recordActivationBinding(cutoverId,binding).record.activationBinding!;
+      },
       probeBuildReady: (expected) => ({
         buildReady: probeBuildReady,
         verifiedBy: "build-identity-file",
@@ -237,7 +253,7 @@ test("advance and restart routes fail closed when their dependencies are unavail
       buildReady: { verifiedBy: "op", verifiedAt: new Date().toISOString() },
     });
     assert.equal(ungated.statusCode, 409);
-    assert.match(ungated.body.error.message, /unavailable in this environment/);
+    assert.match(ungated.body.error.message, /activation-binding owner|unavailable in this environment/);
 
     const advance = await invoke(routes.get("POST /api/cutover/advance")!, {});
     assert.equal(advance.statusCode, 409);
