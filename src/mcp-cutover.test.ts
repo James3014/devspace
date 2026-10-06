@@ -22,7 +22,6 @@ test("old instance drains and replacement instance is reconcile-only across rest
     old.begin({ sourceCommit: "new-source", buildId: "new-build", capabilityManifestSha256: "cap" },undefined,binding);
     assert.deepEqual(old.record()?.coordinationBinding,binding);
     assert.equal(old.mode(), "drain");
-    assert.doesNotThrow(() => old.assertToolAllowed("coordination_handoff_readback"));
     assert.doesNotThrow(() => old.assertToolAllowed("write"));
     assert.doesNotThrow(() => old.assertToolAllowed("workspace_verify"));
     assert.doesNotThrow(() => old.assertToolAllowed("read"));
@@ -48,7 +47,6 @@ test("old instance drains and replacement instance is reconcile-only across rest
     );
     assert.equal(replacement.mode(), "reconcile-only");
     assert.deepEqual(replacement.record()?.coordinationBinding,binding);
-    assert.doesNotThrow(() => replacement.assertToolAllowed("coordination_handoff_readback"));
     assert.equal(replacement.canInitializeTransport(), true);
     assert.throws(
       () => replacement.recordDrain("cutover-one", { activeSessions: 0, oldestAgeMs: 0 }),
@@ -375,7 +373,6 @@ test("#386 reconnect during drain admits new transport, control tools, and unrel
     assert.doesNotThrow(() => old.assertToolAllowed("workspace_inspect"));
     assert.doesNotThrow(() => old.assertToolAllowed("storage_inventory"));
     assert.doesNotThrow(() => old.assertToolAllowed("host_capability_snapshot"));
-    assert.doesNotThrow(() => old.assertToolAllowed("coordination_continuation_latest"));
     assert.doesNotThrow(() => old.assertToolAllowed("read"));
 
     // Unrelated mutations remain governed by their own authority instead of
@@ -565,9 +562,12 @@ test("#386: cutover fencing is deployment-effect scoped while unrelated mutation
     }));
 
     // Known control/read tools remain reachable so the exact deployment effect
-    // can be reconciled or terminalized.
-    assert.equal(CUTOVER_SAFE_TOOLS.has("coordination_recovery_request"), true);
-    assert.equal(CONSEQUENTIAL_MCP_TOOLS.has("coordination_recovery_request"), false);
+    // can be reconciled or terminalized. Removed governance tools must not remain
+    // as dead cutover allowlist entries.
+    for (const removedTool of ["coordination_recovery_request", "coordination_handoff_readback"]) {
+      assert.equal(CUTOVER_SAFE_TOOLS.has(removedTool), false);
+      assert.equal(CONSEQUENTIAL_MCP_TOOLS.has(removedTool), false);
+    }
     for (const safeTool of CUTOVER_SAFE_TOOLS) {
       assert.doesNotThrow(
         () => old.assertToolAllowed(safeTool),

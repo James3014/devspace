@@ -3394,19 +3394,9 @@ test("dispatch mode exposes only the direct worker lifecycle and simple instruct
     "host_operation_external_status",
     "open_workspace",
     "read",
-    "work_resume_prepare",
   ]);
-  assert.equal(names.length, 13);
-
-  const resumePrepare = toolsList.tools.find((tool) => tool.name === "work_resume_prepare");
-  assert.ok(resumePrepare);
-  const resumePrepareSchema = JSON.stringify(resumePrepare);
-  assert.match(resumePrepareSchema, /carrierCredential/);
-  assert.doesNotMatch(
-    resumePrepareSchema,
-    /Core|Nexus|coordination|cutover|host.?operation|#62|P0/i,
-    "direct-dispatch admission metadata must stay implementation-neutral",
-  );
+  assert.equal(names.length, 12);
+  assert.equal(names.includes("work_resume_prepare"), false);
 
   assert.deepEqual(
     names.filter(
@@ -3445,9 +3435,8 @@ test("dispatch mode exposes only the direct worker lifecycle and simple instruct
   assert.match(instructions, /git_fetch_ref/);
   assert.match(instructions, /agent_catalog/);
   assert.match(instructions, /agent_preflight/);
-  assert.match(instructions, /work_resume_prepare/);
+  assert.doesNotMatch(instructions, /work_resume_prepare|carrierCredential|resumableWork/);
   assert.match(instructions, /agent_start/);
-  assert.match(instructions, /OWNER_DIRECT/);
   assert.match(instructions, /attemptKey/);
   assert.match(instructions, /agent_status/);
   assert.match(instructions, /agent_reconcile/);
@@ -3470,9 +3459,8 @@ test("git_fetch_ref recovery is projected in every worktree-capable tool mode", 
   }
 });
 
-test("dispatch mode rebinds an approved writer credential and admits enrolled agent_start", async () => {
+test("dispatch mode ignores Nexus enrollment and admits bounded direct agent_start without carrier", async () => {
   const { StreamableHTTPClientTransport } = await import("@modelcontextprotocol/sdk/client/streamableHttp.js");
-  const { CarrierBindingStore } = await import("./carrier-binding.js");
   const root = await realpath(await mkdtemp(join(tmpdir(), "devspace-dispatch-admission-http-")));
   const project = join(root, "project");
   const stateDir = join(root, "state");
@@ -3545,66 +3533,16 @@ test("dispatch mode rebinds an approved writer credential and admits enrolled ag
     { requestInit: { headers: { Authorization: `Bearer ${tokens.access_token}` } } },
   );
   const client = new Client({ name: "dispatch-admission-fixture", version: "1" });
-  let approver: InstanceType<typeof CarrierBindingStore> | undefined;
   try {
     await client.connect(transport);
-    const conversationScopeId = "issue396-dispatch-admission";
+    const conversationScopeId = "issue413-dispatch-enrollment-neutral";
     const opened = await callOpen(client, project, conversationScopeId);
     const workspaceId = structuredContent(opened).workspaceId as string;
     const tools = await client.listTools();
-    const prepareTool = tools.tools.find((tool) => tool.name === "work_resume_prepare");
-    assert.ok(prepareTool);
-    assert.ok(
-      (prepareTool.inputSchema as { properties?: Record<string, unknown> }).properties?.carrierCredential,
-      "direct dispatch must expose only the narrow credential-rebind input on work_resume_prepare",
-    );
-    assert.equal(tools.tools.some((tool) => tool.name === "coordination_resume"), false);
+    assert.equal(tools.tools.some((tool) => tool.name === "work_resume_prepare"), false);
+    assert.equal(tools.tools.some((tool) => tool.name.startsWith("coordination_")), false);
 
-    const unbound = await client.callTool({
-      name: "work_resume_prepare",
-      arguments: { workspaceId, contractPurpose: "issue396-positive-admission" },
-      _meta: { "openai/session": conversationScopeId },
-    });
-    assert.equal(unbound.isError, true);
-    assert.match(responseText(unbound), /current paired carrier is required/i);
-
-    assert.ok(transport.sessionId);
-    approver = new CarrierBindingStore(stateDir);
-    const pairing = approver.requestPairing({
-      clientId: oauthClient.client_id,
-      sessionId: transport.sessionId,
-    });
-    approver.approveLocal(pairing.pendingId, {
-      repository: "James3014/devspace",
-      goal: "issue-396",
-      role: "controller",
-      scope: [project],
-      baseRevision: head,
-      operations: ["worktree_write"],
-      expiresAt: new Date(Date.now() + 60_000).toISOString(),
-    });
-
-    const prepared = await client.callTool({
-      name: "work_resume_prepare",
-      arguments: {
-        workspaceId,
-        contractPurpose: "issue396-positive-admission",
-        carrierCredential: pairing.credential,
-      },
-      _meta: { "openai/session": conversationScopeId },
-    });
-    assert.equal(prepared.isError, undefined, responseText(prepared));
-    assert.doesNotMatch(JSON.stringify(prepared), new RegExp(pairing.credential));
-    const resumableWork = structuredContent(prepared).resumableWork as {
-      workKey: string;
-      leaseId: string;
-      expectedLeaseVersion: number;
-      baseRevisionSha: string;
-    };
-    assert.match(resumableWork.workKey, /^wk_[0-9a-f]{32}$/);
-    assert.equal(resumableWork.baseRevisionSha, head);
-
-    const attemptKey = "issue396-positive-agent";
+    const attemptKey = "issue413-enrolled-direct-agent";
     const started = await client.callTool({
       name: "agent_start",
       arguments: {
@@ -3616,7 +3554,6 @@ test("dispatch mode rebinds an approved writer credential and admits enrolled ag
           authorityMode: "OWNER_DIRECT",
           expectedHead: head,
           writePaths: ["README.md"],
-          resumableWork: { ...resumableWork, effectHandle: attemptKey },
           maxFiles: 1,
         },
       },
@@ -3629,7 +3566,6 @@ test("dispatch mode rebinds an approved writer credential and admits enrolled ag
     await client.close().catch(() => {});
     await new Promise<void>((resolve) => listener.close(() => resolve()));
     await running.close();
-    approver?.close();
     await rm(root, { recursive: true, force: true });
   }
 });

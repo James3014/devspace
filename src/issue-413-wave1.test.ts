@@ -233,6 +233,10 @@ test("Test 3: Agent attemptKey replay is idempotent for identical requests and f
   const remote = join(env.tempDir, "remote-replay.git");
   initGitRepo(repo, remote);
 
+  // Nexus enrollment must not change direct worker-dispatch admission.
+  await mkdir(join(repo, ".nexus-core"), { recursive: true });
+  await writeFile(join(repo, ".nexus-core", "config.toml"), "schema_version = 1\n");
+
   // Add mutator agent profile
   await mkdir(join(repo, ".devspace", "agents"), { recursive: true });
   await writeFile(
@@ -478,6 +482,7 @@ test("Test 8: Tool modes (minimal, dispatch, codex, full) surface separation is 
   assert.ok(dispatchTools.includes("agent_status"));
   assert.ok(dispatchTools.includes("agent_reconcile"));
   assert.ok(dispatchTools.includes("agent_cancel"));
+  assert.equal(dispatchTools.includes("work_resume_prepare"), false, "dispatch mode must not expose carrier-backed governance choreography");
   assert.equal(dispatchTools.includes("write"), false, "dispatch mode must not include write");
   assert.equal(dispatchTools.includes("edit"), false, "dispatch mode must not include edit");
   assert.equal(dispatchTools.includes("bash"), false, "dispatch mode must not include bash");

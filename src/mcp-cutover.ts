@@ -95,14 +95,6 @@ export const CUTOVER_SAFE_TOOLS: ReadonlySet<string> = new Set([
   "chat_swarm_cancel",
 
   // Operation & command inspection
-  "coordination_resume", // Existing credential only; never issues authority.
-  "coordination_recovery_request", // Creates only a possession-recovery verifier; grants no authority.
-  "coordination_carrier_status",
-  "coordination_lease_read",
-  "coordination_handoff_readback",
-  "coordination_continuation_latest",
-  "coordination_completion_read",
-  "coordination_handoff", // Existing lease only; no new effect or grant.
   "operation_status",
   "operation_reconcile",
   "command_status",

@@ -1300,4 +1300,3 @@ async function spawnCommand(
     child.on("close", (exitCode) => resolvePromise({ exitCode, stdout, stderr }));
   });
 }
-
