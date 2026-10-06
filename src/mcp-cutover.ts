@@ -7,6 +7,7 @@ import type {
   BuildReadyReceipt,
   CutoverCoordinationBinding,
   CutoverBindingRepairReceipt,
+  CutoverActivationBinding,
   CutoverDrainEvidence,
   CutoverReconciliationReceipt,
   CutoverServerIdentity,
@@ -597,6 +598,7 @@ export interface CutoverHttpDependencies {
     agentId: string;
   }) => Promise<DurableReconciliationWitness>;
   restartSelf?: SelfRestartActuator;
+  ensureActivationBound?: (cutoverId: string) => CutoverActivationBinding;
   probeBuildReady?: (
     expected: ExpectedCutoverIdentity,
   ) => Promise<BuildReadyProbeResult> | BuildReadyProbeResult;
@@ -619,6 +621,7 @@ export function registerCutoverHttpRoutes(
     transportEvidence,
     reconcileDurableState,
     restartSelf,
+    ensureActivationBound,
     probeBuildReady,
     advance,
   } = dependencies;
@@ -668,6 +671,12 @@ export function registerCutoverHttpRoutes(
         throw new CutoverBuildNotReadyError(`Restart request ${cutoverId} lacks a build-ready attestation.`);
       }
       const buildReady = buildReadyReceipt(body.buildReady);
+      if (!ensureActivationBound) {
+        throw new CutoverStateError(
+          "Cutover restart is unavailable without a canonical activation-binding owner.",
+        );
+      }
+      ensureActivationBound(cutoverId);
       const request = controller.requestRestart(cutoverId, buildReady);
       const restart = request.record.restartRequest;
       if (!restart?.buildReady) {
