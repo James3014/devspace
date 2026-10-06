@@ -45,7 +45,10 @@ export interface LocalBoundCutoverRestartDependencies {
     options: InspectStableLaunchdServiceOptions,
   ) => StableLaunchdServiceBinding | undefined;
   bindActivation?: (input: BindCutoverActivationInput) => ReturnType<typeof bindCutoverActivation>;
-  verifyActivation?: typeof verifyActivationBinding;
+  verifyActivation?: (
+    binding: ReturnType<typeof bindCutoverActivation>,
+    serviceRoot: string,
+  ) => unknown;
 }
 
 export interface LocalBoundCutoverRestartInput {
