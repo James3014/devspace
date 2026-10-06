@@ -6281,6 +6281,80 @@ test("#386: real server /mcp keeps unrelated workspace mutation usable during dr
     const openJson = (await parseMcpResponse(openRes)) as { result?: { isError?: boolean; structuredContent?: { workspaceId?: string } } };
     assert.equal(openJson.result?.isError, undefined);
     assert.equal(typeof openJson.result?.structuredContent?.workspaceId, "string");
+    const projectWorkspaceId = openJson.result?.structuredContent?.workspaceId as string;
+
+    const unrelatedWriteRes = await fetch(mcpUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${testAccessToken}`,
+        "mcp-session-id": session2Id,
+        "Accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 121,
+        method: "tools/call",
+        params: {
+          name: "write",
+          arguments: { workspaceId: projectWorkspaceId, path: "unrelated.txt", content: "still usable\n" },
+        },
+      }),
+    });
+    assert.equal(unrelatedWriteRes.status, 200, "Unrelated file mutation must remain usable during drain");
+    const unrelatedWriteJson = (await parseMcpResponse(unrelatedWriteRes)) as { result?: { isError?: boolean } };
+    assert.equal(unrelatedWriteJson.result?.isError, undefined);
+
+    // A workspace may legitimately cover a broad allowed root. The cutover
+    // fence therefore needs the exact physical mutation target, not merely the
+    // tool name or workspace id: unrelated paths stay usable, but mutation of
+    // the cutover evidence root is blocked before the write handler executes.
+    const rootOpenRes = await fetch(mcpUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${testAccessToken}`,
+        "mcp-session-id": session2Id,
+        "Accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 122,
+        method: "tools/call",
+        params: { name: "open_workspace", arguments: { path: root } },
+      }),
+    });
+    assert.equal(rootOpenRes.status, 200);
+    const rootOpenJson = (await parseMcpResponse(rootOpenRes)) as { result?: { structuredContent?: { workspaceId?: string } } };
+    const rootWorkspaceId = rootOpenJson.result?.structuredContent?.workspaceId;
+    assert.equal(typeof rootWorkspaceId, "string");
+
+    const evidenceWriteRes = await fetch(mcpUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${testAccessToken}`,
+        "mcp-session-id": session2Id,
+        "Accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 123,
+        method: "tools/call",
+        params: {
+          name: "write",
+          arguments: {
+            workspaceId: rootWorkspaceId,
+            path: ".state/reconciliation-probe.txt",
+            content: "must never be written\n",
+          },
+        },
+      }),
+    });
+    assert.equal(evidenceWriteRes.status, 409, "Mutation of cutover evidence must remain fenced");
+    const evidenceWriteJson = (await parseMcpResponse(evidenceWriteRes)) as { error?: { code?: number; message?: string } };
+    assert.equal(evidenceWriteJson.error?.code, -32002);
+    assert.match(evidenceWriteJson.error?.message ?? "", /CUTOVER_RECONCILIATION_REQUIRED/);
 
     // 6. A release-retention mutation can destroy exact deployment evidence,
     // so it stays fenced before its own handler sees the request.

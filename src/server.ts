@@ -91,10 +91,12 @@ import {
 
 import {
   CutoverBlockedError,
+  CONSEQUENTIAL_MCP_TOOLS,
   assertLegacyCutoverUnbound,
   McpCutoverController,
   compareServerIdentity,
   registerCutoverHttpRoutes,
+  type CutoverEffectTarget,
   type CutoverMode,
   type DurableReconciliationWitness,
 } from "./mcp-cutover.js";
@@ -9311,6 +9313,89 @@ export function createServer(
       closedReboundSessionIds.delete(oldest);
     }
   };
+
+  const cutoverProtectedPaths = (): string[] => {
+    const record = cutoverController.record();
+    const candidates = [
+      config.stateDir,
+      config.mcpCutoverBuildReadyRoot,
+      process.env.DEVSPACE_PACKAGE_ROOT,
+      process.env.DEVSPACE_STABLE_SERVICE_ROOT,
+      runtimeBuildIdentity.activeReleasePath,
+      record?.activationBinding?.releasePath,
+      record?.activationBinding?.pointerPath,
+      record?.activationBinding?.previousReleasePath,
+    ];
+    const result = new Set<string>();
+    for (const candidate of candidates) {
+      if (!candidate) continue;
+      try {
+        result.add(canonicalizePath(candidate));
+      } catch {
+        result.add(resolve(candidate));
+      }
+    }
+    return [...result];
+  };
+
+  const cutoverEffectTarget = (
+    toolName: string,
+    rawArguments: unknown,
+  ): CutoverEffectTarget => {
+    const protectedPaths = cutoverProtectedPaths();
+    if (!rawArguments || typeof rawArguments !== "object" || Array.isArray(rawArguments)) {
+      return { protectedPaths };
+    }
+    const args = rawArguments as Record<string, unknown>;
+    const workspaceId = typeof args.workspaceId === "string" ? args.workspaceId : undefined;
+
+    try {
+      if (
+        workspaceId &&
+        (toolName === toolNames.write || toolName === toolNames.edit) &&
+        typeof args.path === "string"
+      ) {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        return {
+          protectedPaths,
+          mutationPaths: [workspaces.resolvePath(workspace, args.path)],
+        };
+      }
+
+      if (workspaceId && toolName === "apply_patch" && typeof args.patch === "string") {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        const actions = parsePatch(args.patch);
+        const mutationPaths = actions.flatMap((action) =>
+          action.kind === "update" && action.moveTo
+            ? [action.path, action.moveTo]
+            : [action.path],
+        ).map((path) => workspaces.resolvePath(workspace, path));
+        return { protectedPaths, mutationPaths };
+      }
+
+      if (toolName === "workspace_clone" && typeof args.destination === "string") {
+        return {
+          protectedPaths,
+          mutationPaths: [resolve(args.destination)],
+        };
+      }
+
+      if (workspaceId && CONSEQUENTIAL_MCP_TOOLS.has(toolName)) {
+        const workspace = workspaces.getWorkspace(workspaceId);
+        return {
+          protectedPaths,
+          workspaceRoot: workspace.root,
+          broadWorkspaceMutation: true,
+        };
+      }
+    } catch {
+      // Preserve the owning tool's existing validation/error semantics. An
+      // unresolvable workspace/path/patch cannot be treated as positive
+      // deployment-conflict evidence by this outer admission layer.
+    }
+    return { protectedPaths };
+  };
+
   const setTransportCloseHandler = (
     transport: Transport,
     registrySessionId?: string,
@@ -9373,7 +9458,10 @@ export function createServer(
     ) {
       const toolName = req.body.params.name;
       try {
-        cutoverController.assertToolAllowed(toolName);
+        cutoverController.assertToolAllowed(
+          toolName,
+          cutoverEffectTarget(toolName, req.body?.params?.arguments),
+        );
       } catch (error) {
         if (error instanceof CutoverBlockedError) {
           sendJsonRpcError(res, 409, -32002, error.message);

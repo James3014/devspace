@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import test from "node:test";
 import { CutoverStateStore } from "./cutover-state.js";
 import { CUTOVER_SAFE_TOOLS, CONSEQUENTIAL_MCP_TOOLS, classifyCutoverEffect, McpCutoverController, type DurableReconciliationWitness } from "./mcp-cutover.js";
@@ -523,6 +523,38 @@ test("#386: cutover fencing is deployment-effect scoped while unrelated mutation
       assert.equal(classifyCutoverEffect(tool), "INDEPENDENT");
       assert.doesNotThrow(() => old.assertToolAllowed(tool));
     }
+
+    // Structured workspace mutations are independent only when their physical
+    // target stays outside the exact deployment/state evidence domain.
+    const unrelatedPath = join(dirname(stateDir), "project", "note.txt");
+    const protectedPath = join(stateDir, "cutover", "active.json");
+    assert.equal(
+      classifyCutoverEffect("write", {
+        mutationPaths: [unrelatedPath],
+        protectedPaths: [stateDir],
+      }),
+      "INDEPENDENT",
+    );
+    assert.equal(
+      classifyCutoverEffect("write", {
+        mutationPaths: [protectedPath],
+        protectedPaths: [stateDir],
+      }),
+      "DEPLOYMENT_CONFLICT",
+    );
+    assert.doesNotThrow(() => old.assertToolAllowed("write", {
+      mutationPaths: [unrelatedPath],
+      protectedPaths: [stateDir],
+    }));
+    assert.throws(() => old.assertToolAllowed("write", {
+      mutationPaths: [protectedPath],
+      protectedPaths: [stateDir],
+    }), /CUTOVER_RECONCILIATION_REQUIRED/);
+    assert.throws(() => old.assertToolAllowed("agent_start", {
+      workspaceRoot: dirname(stateDir),
+      broadWorkspaceMutation: true,
+      protectedPaths: [stateDir],
+    }), /CUTOVER_RECONCILIATION_REQUIRED/);
 
     // Known control/read tools remain reachable so the exact deployment effect
     // can be reconciled or terminalized.
