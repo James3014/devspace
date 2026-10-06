@@ -83,6 +83,7 @@ import {
   CUTOVER_BINDING_REPAIR_SCHEMA,
   CUTOVER_BINDING_REPAIR_REASON,
   type CutoverBindingRepairReceipt,
+  type CutoverActivationBinding,
   type CutoverDrainEvidence,
   type DurableCutoverRecord,
   type ExpectedCutoverIdentity,
@@ -1877,6 +1878,7 @@ export interface CutoverMcpControlContext {
     agentId: string;
   }) => Promise<DurableReconciliationWitness>;
   restartSelf?: SelfRestartActuator;
+  ensureActivationBound?: (cutoverId: string) => CutoverActivationBinding;
   probeBuildReady?: (
     expected: ExpectedCutoverIdentity,
   ) => Promise<BuildReadyProbeResult> | BuildReadyProbeResult;
@@ -2418,7 +2420,12 @@ function registerCutoverMcpTools(
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
       },
       async ({ cutoverId, buildReady, carrierCredential }, extra) => {
-        const activationBinding=ensureCutoverActivationBound(cutoverId);
+        if(!control.ensureActivationBound) {
+          throw new CutoverStateError(
+            "Cutover restart is unavailable without a canonical activation-binding owner.",
+          );
+        }
+        const activationBinding=control.ensureActivationBound(cutoverId);
         if(control.controller.record()?.coordinationBinding) {
           if(!durableOperations) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","restart requires trusted coordination");
           const context=dependencyConsumerContext(extra);
@@ -9178,6 +9185,7 @@ export function createServer(
       transportEvidence: () => transports.metrics(),
       reconcileDurableState: reconcileCutoverDurableState,
       ...(restartSelfActuator ? { restartSelf: restartSelfActuator } : {}),
+      ...(restartSelfActuator ? { ensureActivationBound: ensureCutoverActivationBound } : {}),
       ...(buildReadyProbe ? { probeBuildReady: buildReadyProbe } : {}),
       inspectWorkspace: (workspaceId) => workspaces.inspectWorkspace(workspaceId),
       listWorkspaceSessions: () => workspaceStore.listSessions(),
