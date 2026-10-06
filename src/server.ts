@@ -9143,6 +9143,7 @@ export function createServer(
     transportEvidence: () => transports.metrics(),
     reconcileDurableState: reconcileCutoverDurableState,
     ...(restartSelfActuator ? { restartSelf: restartSelfActuator } : {}),
+    ...(restartSelfActuator ? { ensureActivationBound: ensureCutoverActivationBound } : {}),
     ...(buildReadyProbe ? { probeBuildReady: buildReadyProbe } : {}),
     ...(advanceCutover ? { advance: advanceCutover } : {}),
   });
