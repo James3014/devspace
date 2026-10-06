@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -212,17 +212,105 @@ test("readExternalHostOperationStatus reads canonical operations, redacts identi
       status: "COMPLETED",
       phase: "TERMINAL",
       exit_code: 0,
-      account_alias_hash: "residual_acct",
-      lease_id_hash: "residual_lease_hash",
+      account_alias_hash: "abcdef123456",
+      lease_id_hash: "123456abcdef",
     }),
   );
-  // Write active receipt for residual_acct with matching lease_id_hash
+  // Write active receipt with matching canonical hash identities.
   writeFileSync(
-    join(leasesDir, "residual_acct.receipt.json"),
+    join(leasesDir, "abcdef123456.receipt.json"),
     JSON.stringify({
-      account_alias_hash: "residual_acct",
-      lease_id_hash: "residual_lease_hash",
+      account_alias_hash: "abcdef123456",
+      lease_id_hash: "123456abcdef",
       pid: process.pid,
+    }),
+  );
+
+  // 6. Terminal FAILED operation whose canonical journal explicitly proves source-scoped retry safety.
+  const retrySafeDir = join(opRoot, "operations", "agyop_retry_safe_source_proof");
+  await mkdir(retrySafeDir, { recursive: true });
+  writeFileSync(
+    join(retrySafeDir, "operation.json"),
+    JSON.stringify({
+      schema: "nexus.agy_operation.v1",
+      operation_id: "agyop_retry_safe_source_proof",
+      status: "FAILED",
+      phase: "TERMINAL",
+      exit_code: 1,
+      reconciliation: {
+        result: "SOURCE_NO_DURABLE_EFFECT_PROVEN",
+        reconciliation_scope: "SOURCE_ONLY",
+        retry_permitted: true,
+      },
+    }),
+  );
+
+  // 7. Sparse canonical record: missing observations must stay unknown rather than defaulting false/0/[].
+  const sparseDir = join(opRoot, "operations", "agyop_sparse_evidence");
+  await mkdir(sparseDir, { recursive: true });
+  writeFileSync(
+    join(sparseDir, "operation.json"),
+    JSON.stringify({
+      schema: "nexus.agy_operation.v1",
+      operation_id: "agyop_sparse_evidence",
+      status: "RUNNING",
+      phase: "EXECUTING",
+    }),
+  );
+
+  // 8. Tampered identity/schema records must fail closed.
+  const mismatchDir = join(opRoot, "operations", "agyop_identity_mismatch");
+  await mkdir(mismatchDir, { recursive: true });
+  writeFileSync(
+    join(mismatchDir, "operation.json"),
+    JSON.stringify({
+      schema: "nexus.agy_operation.v1",
+      operation_id: "agyop_different_identity",
+      status: "COMPLETED",
+      phase: "TERMINAL",
+    }),
+  );
+  const schemaDir = join(opRoot, "operations", "agyop_schema_mismatch");
+  await mkdir(schemaDir, { recursive: true });
+  writeFileSync(
+    join(schemaDir, "operation.json"),
+    JSON.stringify({
+      schema: "nexus.other_operation.v1",
+      operation_id: "agyop_schema_mismatch",
+      status: "COMPLETED",
+      phase: "TERMINAL",
+    }),
+  );
+
+  // 9. Malformed hash material must never become a lease filesystem path.
+  const badHashDir = join(opRoot, "operations", "agyop_bad_hash_material");
+  await mkdir(badHashDir, { recursive: true });
+  writeFileSync(
+    join(badHashDir, "operation.json"),
+    JSON.stringify({
+      schema: "nexus.agy_operation.v1",
+      operation_id: "agyop_bad_hash_material",
+      status: "RUNNING",
+      phase: "EXECUTING",
+      account_alias_hash: "../../escape",
+      lease_id_hash: "not-a-hash",
+    }),
+  );
+
+  // 10. A journal-controlled log symlink may not project content outside the operation directory.
+  const symlinkDir = join(opRoot, "operations", "agyop_log_symlink_escape");
+  await mkdir(symlinkDir, { recursive: true });
+  const secretPath = join(root, "outside-secret.txt");
+  writeFileSync(secretPath, "secret=must-not-project\n");
+  await symlink(secretPath, join(symlinkDir, "stdout.log"));
+  writeFileSync(
+    join(symlinkDir, "operation.json"),
+    JSON.stringify({
+      schema: "nexus.agy_operation.v1",
+      operation_id: "agyop_log_symlink_escape",
+      status: "COMPLETED",
+      phase: "TERMINAL",
+      stdout_path: join(symlinkDir, "stdout.log"),
     }),
   );
 
@@ -280,6 +368,7 @@ test("readExternalHostOperationStatus reads canonical operations, redacts identi
     assert.equal(res4.found, true);
     assert.equal(res4.status, "OUTCOME_UNKNOWN");
     assert.equal(res4.retry_safety.retry_permitted, false);
+    assert.equal(res4.retry_safety.journal_retry_permitted, false);
     assert.equal(res4.retry_safety.reconciliation_required, true);
 
     // Test 5: Residual lease state check (Criterion 4)
@@ -292,7 +381,61 @@ test("readExternalHostOperationStatus reads canonical operations, redacts identi
     assert.equal(res5.lease_state.residual, true); // Terminal operation with active receipt -> residual is true!
     assert.equal(res5.lease_state.holder_alive, true);
 
-    // Test 6: Unknown / missing operation fails closed (Criterion 6)
+    // Test 6: Canonical retry-safe evidence is projected but this read-only tool grants no retry authority.
+    const retrySafe = (await readExternalHostOperationStatus(
+      "agyop_retry_safe_source_proof",
+      { operationRoot: opRoot, leasesDir },
+    )) as HostOperationExternalStatusSuccess;
+    assert.equal(retrySafe.found, true);
+    assert.equal(retrySafe.retry_safety.journal_retry_permitted, true);
+    assert.equal(retrySafe.retry_safety.retry_permitted, false);
+    assert.equal(retrySafe.retry_safety.reconciliation_required, false);
+
+    // Test 7: Missing evidence remains unknown, never false/zero/empty by default.
+    const sparse = (await readExternalHostOperationStatus(
+      "agyop_sparse_evidence",
+      { operationRoot: opRoot, leasesDir },
+    )) as HostOperationExternalStatusSuccess;
+    assert.equal(sparse.found, true);
+    assert.equal(sparse.rotations, null);
+    assert.equal(sparse.has_unresolved_external_effect, null);
+    assert.equal(sparse.tool_event_count, null);
+    assert.equal(sparse.observed_changed_paths, null);
+
+    // Test 8: Canonical record identity and schema are integrity-bound.
+    const identityMismatch = await readExternalHostOperationStatus(
+      "agyop_identity_mismatch",
+      { operationRoot: opRoot, leasesDir },
+    );
+    assert.equal(identityMismatch.found, false);
+    assert.equal(identityMismatch.status, "CORRUPTED");
+
+    const schemaMismatch = await readExternalHostOperationStatus(
+      "agyop_schema_mismatch",
+      { operationRoot: opRoot, leasesDir },
+    );
+    assert.equal(schemaMismatch.found, false);
+    assert.equal(schemaMismatch.status, "CORRUPTED");
+
+    // Test 9: Malformed hash fields cannot escape the lease directory.
+    const badHash = (await readExternalHostOperationStatus(
+      "agyop_bad_hash_material",
+      { operationRoot: opRoot, leasesDir },
+    )) as HostOperationExternalStatusSuccess;
+    assert.equal(badHash.found, true);
+    assert.equal(badHash.account_alias_hash, null);
+    assert.equal(badHash.lease_id_hash, null);
+    assert.equal(badHash.lease_state.status, "unknown");
+
+    // Test 10: Symlinked logs are not projected.
+    const symlinkEscape = (await readExternalHostOperationStatus(
+      "agyop_log_symlink_escape",
+      { operationRoot: opRoot, leasesDir },
+    )) as HostOperationExternalStatusSuccess;
+    assert.equal(symlinkEscape.found, true);
+    assert.equal(symlinkEscape.output_projection.stdout, null);
+
+    // Test 11: Unknown / missing operation fails closed (Criterion 6)
     const resNotFound = (await readExternalHostOperationStatus(
       "agyop_nonexistent_1234567890",
       { operationRoot: opRoot, leasesDir },
@@ -301,7 +444,7 @@ test("readExternalHostOperationStatus reads canonical operations, redacts identi
     assert.equal(resNotFound.status, "NOT_FOUND");
     assert.equal(resNotFound.retry_safety.retry_permitted, false);
 
-    // Test 7: Invalid operation ID format fails closed
+    // Test 12: Invalid operation ID format fails closed
     const resInvalid = (await readExternalHostOperationStatus(
       "../../etc/passwd",
       { operationRoot: opRoot, leasesDir },
@@ -310,7 +453,7 @@ test("readExternalHostOperationStatus reads canonical operations, redacts identi
     assert.equal(resInvalid.status, "INVALID_OPERATION_ID");
     assert.equal(resInvalid.retry_safety.retry_permitted, false);
 
-    // Test 8: Replaying reads is side-effect free (Criterion 7)
+    // Test 13: Replaying reads is side-effect free (Criterion 7)
     const replay1 = await readExternalHostOperationStatus(
       "agyop_a5d29c430378469da9a8fa79d6fe84a8",
       { operationRoot: opRoot, leasesDir },
@@ -402,7 +545,7 @@ test("MCP HTTP host_operation_external_status tool covers DSH-wave scenario and 
     DEVSPACE_ALLOWED_ROOTS: workspaceRoot, // opRoot and leasesDir are OUTSIDE allowed roots!
     DEVSPACE_WORKTREE_ROOT: join(root, "worktrees"),
     DEVSPACE_SUBAGENTS: "false",
-    DEVSPACE_TOOL_MODE: "full",
+    DEVSPACE_TOOL_MODE: "dispatch",
     DEVSPACE_PUBLIC_BASE_URL: "http://127.0.0.1:1",
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     NEXUS_AGY_OPERATION_ROOT: opRoot,
@@ -429,7 +572,12 @@ test("MCP HTTP host_operation_external_status tool covers DSH-wave scenario and 
     const tools = await client.listTools();
     assert.ok(
       tools.tools.some((t) => t.name === "host_operation_external_status"),
-      "host_operation_external_status tool must be listed",
+      "host_operation_external_status tool must be listed in dispatch mode",
+    );
+    assert.equal(
+      tools.tools.some((t) => t.name === "host_operation_start"),
+      false,
+      "read-only external status must not depend on the host mutation actuator",
     );
 
     // Acceptance criterion 1, 2, 3, 4, 9:
@@ -496,7 +644,10 @@ test("MCP HTTP host_operation_external_status tool covers DSH-wave scenario and 
   }
 });
 
-test("Live host journal readback verifies actual DSH operations on the current machine", async () => {
+test(
+  "Live host journal readback verifies actual DSH operations on the current machine",
+  { skip: process.env.DEVSPACE_RUN_LIVE_AGY_JOURNAL_TEST !== "1" },
+  async () => {
   const liveOp1 = "agyop_a5d29c430378469da9a8fa79d6fe84a8";
   const liveOp2 = "agyop_67c6950aaff347eb95e3357ed498c39a";
   const liveOp3 = "agyop_452a8b4217b24fc58118a3e6439a5f8f";
@@ -535,5 +686,6 @@ test("Live host journal readback verifies actual DSH operations on the current m
   assert.equal(res3.account_alias_hash, "d034504225b1");
   assert.equal(res3.lease_state.status, "released");
   assert.equal(res3.retry_safety.retry_permitted, false);
-});
+  },
+);
 
