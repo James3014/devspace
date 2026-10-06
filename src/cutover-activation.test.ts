@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readlinkSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -151,6 +151,30 @@ test("activation binding stays idempotent after restart intent but before schedu
   }
 });
 
+
+test("activation preserves relative in-tree npm bin symlinks", () => {
+  const f = fixture();
+  try {
+    mkdirSync(join(f.packageRoot, "node_modules", ".bin"), { recursive: true });
+    symlinkSync(
+      "../fixture/index.js",
+      join(f.packageRoot, "node_modules", ".bin", "fixture"),
+    );
+    const binding = bindCutoverActivation({
+      cutoverId: "cutover-relative-link",
+      packageRoot: f.packageRoot,
+      serviceRoot: f.serviceRoot,
+      expected: { sourceCommit: f.sourceCommit, buildId: f.buildId },
+    });
+    assert.equal(
+      readlinkSync(join(binding.releasePath, "node_modules", ".bin", "fixture")),
+      "../fixture/index.js",
+    );
+    verifyActivationBinding(binding, f.serviceRoot);
+  } finally {
+    f.cleanup();
+  }
+});
 
 test("activation rejects a release tree with an external physical symlink target", () => {
   const f = fixture();
