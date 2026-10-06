@@ -1,8 +1,15 @@
 import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, realpathSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
-import { join, resolve } from "node:path";
-import { assertAllowedPath, canonicalizePath, expandHomePath, resolveAllowedPath, isSameWorktreePath } from "./roots.js";
+import { basename, dirname, join, resolve } from "node:path";
+import {
+  assertAllowedPath,
+  canonicalizePath,
+  expandHomePath,
+  isPathInsideRoot,
+  isSameWorktreePath,
+  resolveAllowedPath,
+} from "./roots.js";
 
 const home = homedir();
 
@@ -51,10 +58,22 @@ try {
   const expectedReconstructed = join(realpathSync(realTargetDir), "missing", "sub", "dir");
   assert.equal(canonicalizePath(missingNestedPath), expectedReconstructed);
 
-  // 2b. isSameWorktreePath handles symlinks and platform-dependent casing
+  // 2b. worktree identity handles symlinks, while allowed-root containment
+  // additionally recognizes only physically proven case aliases on case-insensitive filesystems.
   assert.equal(isSameWorktreePath(symlinkDir, realTargetDir), true);
+
   if (process.platform === "darwin" || process.platform === "win32") {
     assert.equal(isSameWorktreePath(realTargetDir.toUpperCase(), realTargetDir.toLowerCase()), true);
+
+    const caseVariant = join(dirname(realTargetDir), basename(realTargetDir).toUpperCase());
+    try {
+      if (realpathSync(caseVariant) === realpathSync(realTargetDir)) {
+        assert.equal(isPathInsideRoot(caseVariant, realTargetDir), true);
+        assert.equal(assertAllowedPath(caseVariant, [realTargetDir]), resolve(caseVariant));
+      }
+    } catch {
+      // Case-sensitive volumes do not provide a physical casing alias.
+    }
   }
 
   // 3. unexpected realpath error -> throws / fails closed

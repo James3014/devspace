@@ -18,11 +18,8 @@ export function expandHomePath(path: string): string {
   return path;
 }
 
-export function isPathInsideRoot(path: string, root: string): boolean {
-  const resolvedPath = resolve(expandHomePath(path));
-  const resolvedRoot = resolve(expandHomePath(root));
+function resolvedPathInsideRoot(resolvedPath: string, resolvedRoot: string): boolean {
   const relationship = relative(resolvedRoot, resolvedPath);
-
   return (
     relationship === "" ||
     (!isAbsolute(relationship) &&
@@ -30,6 +27,24 @@ export function isPathInsideRoot(path: string, root: string): boolean {
       relationship !== ".." &&
       !relationship.includes(`..${sep}`))
   );
+}
+
+export function isPathInsideRoot(path: string, root: string): boolean {
+  const resolvedPath = resolve(expandHomePath(path));
+  const resolvedRoot = resolve(expandHomePath(root));
+  if (resolvedPathInsideRoot(resolvedPath, resolvedRoot)) return true;
+
+  if (process.platform !== "darwin" && process.platform !== "win32") return false;
+
+  const foldedPath = resolvedPath.toLowerCase();
+  const foldedRoot = resolvedRoot.toLowerCase();
+  if (!resolvedPathInsideRoot(foldedPath, foldedRoot)) return false;
+
+  try {
+    return resolvedPathInsideRoot(canonicalizePath(resolvedPath), canonicalizePath(resolvedRoot));
+  } catch {
+    return false;
+  }
 }
 
 export function assertAllowedPath(path: string, allowedRoots: string[]): string {
