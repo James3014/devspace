@@ -522,11 +522,6 @@ export class CutoverStateStore {
         `Cutover ${cutoverId} must be drained before restart can be requested.`,
       );
     }
-    if (!record.activationBinding) {
-      throw new CutoverStateError(
-        `Cutover ${cutoverId} must have an exact activation binding before restart can be requested.`,
-      );
-    }
     if (record.restartRequest) {
       return { record, newlyRequested: false };
     }
@@ -566,11 +561,6 @@ export class CutoverStateStore {
     if (record.phase !== "drained") {
       throw new CutoverStateError(
         `Cutover ${cutoverId} restart scheduling requires a drained cutover.`,
-      );
-    }
-    if (!record.activationBinding) {
-      throw new CutoverStateError(
-        `Restart scheduling requires an exact activation binding; refusing cutover ${cutoverId}.`,
       );
     }
     if (!record.restartRequest?.buildReady) {
@@ -678,9 +668,9 @@ export class CutoverStateStore {
       }
       return { record, newlyBound: false };
     }
-    if (record.phase !== "drained" || record.restartRequest) {
+    if (record.phase !== "drained" || record.restartRequest?.restartScheduledAt) {
       throw new CutoverStateError(
-        "Activation binding requires a drained cutover before any restart request.",
+        "Activation binding requires a drained cutover before restart scheduling.",
       );
     }
     try {
