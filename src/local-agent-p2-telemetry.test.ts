@@ -432,7 +432,7 @@ test("P2-G: Effect policy enforcement status accurately distinguishes request_on
   }
 });
 
-test("P2 follow-up (Item A): model attestation asserts MODEL_ATTESTATION_MISMATCH when observed differs from requested", async () => {
+test("P2 follow-up (Item A): model attestation compares provider-reported identity with requested model", async () => {
   const { projectRoot, manager, cleanup } = setupEnv();
   try {
     // 1. Pure function tests
@@ -440,13 +440,13 @@ test("P2 follow-up (Item A): model attestation asserts MODEL_ATTESTATION_MISMATC
       requestedModel: "claude-opus-4-6",
       resolvedModel: "claude-opus-4-6",
       observedModel: "gemini-3.8-flash",
-      attestationSource: "agy_json_output",
+      attestationSource: "provider_reported",
       attestedAt: "2026-10-05T00:00:00.000Z",
     });
     assert.equal(mismatch.attestationState, "MODEL_ATTESTATION_MISMATCH");
     assert.equal(mismatch.observedModel, "gemini-3.8-flash");
     assert.equal(mismatch.requestedModel, "claude-opus-4-6");
-    assert.equal(mismatch.attestationSource, "agy_json_output");
+    assert.equal(mismatch.attestationSource, "provider_reported");
 
     const match = computeModelAttestation({
       requestedModel: "claude-opus-4-6",
@@ -501,7 +501,7 @@ test("P2 follow-up (Item A): model attestation asserts MODEL_ATTESTATION_MISMATC
     assert.equal(status.modelAttestation.attestationState, "MODEL_ATTESTATION_MISMATCH");
     assert.equal(status.modelAttestation.observedModel, "gemini-3.8-flash");
     assert.equal(status.modelAttestation.requestedModel, "claude-opus-4-6");
-    assert.equal(status.modelAttestation.attestationSource, "agy_json_output");
+    assert.equal(status.modelAttestation.attestationSource, "provider_reported");
   } finally {
     cleanup();
   }
