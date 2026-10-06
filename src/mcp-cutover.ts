@@ -73,8 +73,10 @@ export const CUTOVER_SAFE_TOOLS: ReadonlySet<string> = new Set([
   "agent_list",
   "agent_preflight",
 
-  // Workspace & file inspection (read-only)
+  // Workspace, host, storage, and file inspection (read-only)
   "workspace_inspect",
+  "storage_inventory",
+  "host_capability_snapshot",
   "read",
   "grep",
   "glob",
@@ -95,6 +97,7 @@ export const CUTOVER_SAFE_TOOLS: ReadonlySet<string> = new Set([
   "coordination_carrier_status",
   "coordination_lease_read",
   "coordination_handoff_readback",
+  "coordination_continuation_latest",
   "coordination_completion_read",
   "coordination_handoff", // Existing lease only; no new effect or grant.
   "operation_status",

@@ -1918,6 +1918,58 @@ function registerCutoverMcpTools(
   hostOperations?: HostOperationRegistrar,
 ): void {
   const cutoverRecordSchema = z.record(z.string(), z.unknown());
+
+  const bindExactCutoverCarrier = (
+    extra: { authInfo?: { clientId: string; scopes: string[] }; sessionId?: string },
+    carrierCredential?: string,
+  ): void => {
+    const record = control.controller.record();
+    if (!record?.coordinationBinding) return;
+    if (!carrierBindings) {
+      throw new ControlPlaneOwnershipError(
+        "AUTHORITY_REQUIRED",
+        "coordination-bound cutover recovery requires trusted carrier binding",
+      );
+    }
+    const context = dependencyConsumerContext(extra);
+    if (carrierCredential !== undefined) carrierBindings.redeem(context, carrierCredential);
+    const carrier = carrierBindings.status(context);
+    const approved = carrier.contract.cutover;
+    if (
+      carrier.id !== record.coordinationBinding.ownerThread ||
+      carrier.parentId !== null ||
+      carrier.contract.role !== "controller" ||
+      carrier.contract.operations.length !== 1 ||
+      carrier.contract.operations[0] !== "cutover_start" ||
+      !approved
+    ) {
+      throw new ControlPlaneOwnershipError(
+        "AUTHORITY_REQUIRED",
+        "paired carrier does not own the exact active cutover authority",
+      );
+    }
+    const plan = planCutoverStart(approved.stateRoot, approved);
+    if (
+      plan.operationId !== record.coordinationBinding.operationHandle ||
+      plan.requestHash !== record.coordinationBinding.requestHash
+    ) {
+      throw new ControlPlaneOwnershipError(
+        "CAS_CONFLICT",
+        "active cutover generation differs from the paired carrier contract",
+      );
+    }
+    const lease = carrierBindings.readLease(context, record.coordinationBinding.leaseId);
+    if (
+      lease.version !== record.coordinationBinding.pinnedLeaseVersion ||
+      lease.ownerThread !== record.coordinationBinding.ownerThread ||
+      lease.operationHandle !== record.coordinationBinding.operationHandle
+    ) {
+      throw new ControlPlaneOwnershipError(
+        "CAS_CONFLICT",
+        "active cutover lease no longer matches its pinned coordination binding",
+      );
+    }
+  };
   const modeSchema = z.enum(["normal", "drain", "reconcile-only"]);
 
   registerAppTool(
@@ -2102,10 +2154,7 @@ function registerCutoverMcpTools(
       annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async ({ dryRun, carrierCredential }, extra) => {
-      if (carrierCredential !== undefined && carrierBindings) {
-        const context = dependencyConsumerContext(extra);
-        carrierBindings.redeem(context, carrierCredential);
-      }
+      bindExactCutoverCarrier(extra, carrierCredential);
       if (!control.advance) {
         throw new CutoverStateError("Cutover orchestration is unavailable in this environment.");
       }
@@ -2644,15 +2693,19 @@ function registerCutoverMcpTools(
         title: "Reconcile cutover",
         description:
           "Drive exactly one fail-closed cutover step: schedule a verified restart on the old instance exactly once, or close the cutover on the replacement instance only after a fully positive durable reconciliation witness. Never drains automatically and never re-schedules an already-scheduled restart.",
-        inputSchema: {},
+        inputSchema: {
+          carrierCredential: z.string().optional().describe(
+            "Optional approved carrier credential for this exact reconciliation when reconnecting on a fresh MCP session.",
+          ),
+        },
         outputSchema: {
           outcome: z.record(z.string(), z.unknown()),
         },
         _meta: {},
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       },
-      async () => {
-        if(control.controller.record()?.coordinationBinding) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","coordination-bound automatic advance is unavailable; use explicitly authorized lifecycle actions");
+      async ({ carrierCredential }, extra) => {
+        bindExactCutoverCarrier(extra, carrierCredential);
         const outcome = await control.advance!();
         return {
           content: [textBlock(describeOutcome(outcome))],
@@ -4332,8 +4385,16 @@ export function createMcpServer(
           throw error;
         }
       });
-      registerAppTool(server,"coordination_carrier_status",{...registration,annotations:{...registration.annotations,readOnlyHint:true},title:"Read paired carrier",description:"Read current bounded authority, including parent revocation. Contains no credential.",inputSchema:{}},async(_,extra)=>result(carrierBindings.status(dependencyConsumerContext(extra))));
-      registerAppTool(server,"coordination_lease_read",{...registration,annotations:{...registration.annotations,readOnlyHint:true},title:"Read an owned resource lease",description:"Read the exact owned lease version, expiry and operation pin. Does not renew or release it.",inputSchema:{leaseId:z.string()}},async({leaseId},extra)=>result(carrierBindings.readLease(dependencyConsumerContext(extra),leaseId)));
+      registerAppTool(server,"coordination_carrier_status",{...registration,annotations:{...registration.annotations,readOnlyHint:true},title:"Read paired carrier",description:"Read current bounded authority, including parent revocation. A fresh MCP session may present the existing carrier credential inline; this rebinds only that exact carrier and returns no credential.",inputSchema:{carrierCredential:z.string().optional()}},async({carrierCredential},extra)=>{
+        const context=dependencyConsumerContext(extra);
+        if(carrierCredential!==undefined) carrierBindings.redeem(context,carrierCredential);
+        return result(carrierBindings.status(context));
+      });
+      registerAppTool(server,"coordination_lease_read",{...registration,annotations:{...registration.annotations,readOnlyHint:true},title:"Read an owned resource lease",description:"Read the exact owned lease version, expiry and operation pin. A fresh MCP session may present the existing carrier credential inline. Does not renew or release it.",inputSchema:{leaseId:z.string(),carrierCredential:z.string().optional()}},async({leaseId,carrierCredential},extra)=>{
+        const context=dependencyConsumerContext(extra);
+        if(carrierCredential!==undefined) carrierBindings.redeem(context,carrierCredential);
+        return result(carrierBindings.readLease(context,leaseId));
+      });
       registerAppTool(server,"coordination_lease_release",{...registration,title:"Release an unpinned owned lease",description:"Explicitly release an owned lease by exact version. Active or unknown operation pins must be reconciled first.",inputSchema:{leaseId:z.string(),expectedVersion:z.number().int().positive()}},async({leaseId,expectedVersion},extra)=>result(carrierBindings.releaseLease(dependencyConsumerContext(extra),leaseId,expectedVersion)));
       registerAppTool(server,"coordination_delegate",{...registration,title:"Delegate bounded work",description:"Approve a worker's pending pairing within the current controller's scope and expiry. Cannot create controller authority.",inputSchema:{pendingId:z.string(),contract:contractSchema}},async({pendingId,contract},extra)=>result(carrierBindings.delegate(dependencyConsumerContext(extra),pendingId,contract)));
       registerAppTool(server,"coordination_revoke_worker",{...registration,title:"Revoke delegated worker",description:"Revoke an exact child authority version. Existing unknown effects remain pinned and require reconciliation.",inputSchema:{carrierId:z.string(),expectedVersion:z.number().int().positive()}},async({carrierId,expectedVersion},extra)=>result(carrierBindings.revokeDelegation(dependencyConsumerContext(extra),carrierId,expectedVersion)));
@@ -4387,12 +4448,14 @@ export function createMcpServer(
       {
         title: "Read handoff receipt",
         description: "Recover one existing handoff receipt under current authenticated recipient and lease-version checks. Returns historical receipt and current lease separately. This read does not transfer ownership, renew a lease, or authorize execution.",
-        inputSchema: {leaseId:z.string().min(1),previousVersion:z.number().int().positive(),expectedCurrentVersion:z.number().int().positive()},
+        inputSchema: {leaseId:z.string().min(1),previousVersion:z.number().int().positive(),expectedCurrentVersion:z.number().int().positive(),carrierCredential:z.string().optional()},
         annotations: {readOnlyHint:true,destructiveHint:false,idempotentHint:true,openWorldHint:false},
         _meta: {},
       },
-      async ({leaseId,previousVersion,expectedCurrentVersion}, extra) => {
-        const result = durableOperations.readHandoff(leaseId, previousVersion, expectedCurrentVersion, dependencyConsumerContext(extra));
+      async ({leaseId,previousVersion,expectedCurrentVersion,carrierCredential}, extra) => {
+        const context=dependencyConsumerContext(extra);
+        if(carrierCredential!==undefined) carrierBindings?.redeem(context,carrierCredential);
+        const result = durableOperations.readHandoff(leaseId, previousVersion, expectedCurrentVersion, context);
         return {content:[textBlock(JSON.stringify(result))],structuredContent:result};
       },
     );
@@ -4402,14 +4465,16 @@ export function createMcpServer(
       "coordination_continuation_latest",
       {
         title: "Discover latest unfinished continuation",
-        description: "Discover the latest eligible continuation for context rollover. Returns structured status (TAKEOVER_ELIGIBLE, NO_CONTINUATION, etc.).",
-        inputSchema: {},
+        description: "Discover the latest eligible continuation for context rollover. A fresh MCP session may present the existing carrier credential inline. Returns structured status (TAKEOVER_ELIGIBLE, NO_CONTINUATION, etc.).",
+        inputSchema: { carrierCredential: z.string().optional() },
         outputSchema: { status: z.string(), message: z.string().optional() },
         _meta: {},
         annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
       },
-      async (_, extra) => {
-        const result = durableOperations.latestContinuation(dependencyConsumerContext(extra));
+      async ({ carrierCredential }, extra) => {
+        const context=dependencyConsumerContext(extra);
+        if(carrierCredential!==undefined) carrierBindings?.redeem(context,carrierCredential);
+        const result = durableOperations.latestContinuation(context);
         return { content: [textBlock(JSON.stringify(result, null, 2))], structuredContent: result as unknown as Record<string, unknown> };
       },
     );

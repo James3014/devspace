@@ -474,6 +474,7 @@ test("approved cutover credential survives fresh MCP sessions for prepare and st
     localOwner.approveLocal(pending.pendingId, contract);
     const resumed = await resumedSession.callTool({ name: "coordination_resume", arguments: { credential: pending.credential } });
     assert.equal(resumed.isError, undefined, JSON.stringify(resumed));
+    const resumedCarrier = data(resumed);
     assert.equal(JSON.stringify(resumed).includes(pending.credential), false);
 
     const wrongSession = await connect("cutover-wrong-credential");
@@ -509,6 +510,29 @@ test("approved cutover credential survives fresh MCP sessions for prepare and st
     assert.equal(JSON.stringify([started, replayed]).includes(pending.credential), false);
     assert.equal((database.sqlite.prepare("select count(*) as count from durable_operations where kind='cutover_start'").get() as { count: number }).count, 1);
 
+    const recoveryReadSession = await connect("cutover-recovery-read-fresh-session");
+    const reboundCarrier = data(await recoveryReadSession.callTool({
+      name: "coordination_carrier_status",
+      arguments: { carrierCredential: pending.credential },
+    }));
+    assert.equal(reboundCarrier.id, resumedCarrier.id);
+    const cutoverBinding = started.cutover.coordinationBinding;
+    assert.ok(cutoverBinding);
+    const reboundLease = data(await recoveryReadSession.callTool({
+      name: "coordination_lease_read",
+      arguments: { leaseId: cutoverBinding.leaseId, carrierCredential: pending.credential },
+    }));
+    assert.equal(reboundLease.leaseId, cutoverBinding.leaseId);
+    assert.equal(reboundLease.version, cutoverBinding.pinnedLeaseVersion);
+    const continuation = await recoveryReadSession.callTool({
+      name: "coordination_continuation_latest",
+      arguments: { carrierCredential: pending.credential },
+    });
+    assert.equal(continuation.isError, undefined, JSON.stringify(continuation));
+    const inventory = await recoveryReadSession.callTool({ name: "storage_inventory", arguments: {} });
+    assert.equal(inventory.isError, undefined, JSON.stringify(inventory));
+    const hostSnapshot = await recoveryReadSession.callTool({ name: "host_capability_snapshot", arguments: {} });
+    assert.equal(hostSnapshot.isError, undefined, JSON.stringify(hostSnapshot));
     const finishSession = await connect("cutover-finish-fresh-session");
     const beforeWrongFinish = snapshot();
     const wrongFinish = await finishSession.callTool({ name: "cutover_finish", arguments: {

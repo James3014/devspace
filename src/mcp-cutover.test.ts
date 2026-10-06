@@ -370,6 +370,9 @@ test("Test 1 — reconnect during drain admits new transport, allows control too
     assert.doesNotThrow(() => old.assertToolAllowed("agent_status"));
     assert.doesNotThrow(() => old.assertToolAllowed("agent_reconcile"));
     assert.doesNotThrow(() => old.assertToolAllowed("workspace_inspect"));
+    assert.doesNotThrow(() => old.assertToolAllowed("storage_inventory"));
+    assert.doesNotThrow(() => old.assertToolAllowed("host_capability_snapshot"));
+    assert.doesNotThrow(() => old.assertToolAllowed("coordination_continuation_latest"));
     assert.doesNotThrow(() => old.assertToolAllowed("read"));
 
     // Consequential mutations must remain blocked fail-closed
