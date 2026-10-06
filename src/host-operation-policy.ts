@@ -416,19 +416,19 @@ function parseMachORpaths(binaryPath: string): string[] {
   return rpaths;
 }
 
-function expandRpath(entry: string, binaryDir: string, executableDir: string): { normalized: string; rawPath: string } {
-  if (entry.startsWith("@loader_path")) {
+function expandRpath(entry: string, binaryDir: string, executableDir: string): { normalized: string; rawPath: string } | undefined {
+  if (entry === "@loader_path" || entry.startsWith("@loader_path/")) {
     const sub = entry.slice("@loader_path".length).replace(/^[\/\\]/, "");
     return { normalized: resolve(binaryDir, sub), rawPath: join(binaryDir, sub) };
   }
-  if (entry.startsWith("@executable_path")) {
+  if (entry === "@executable_path" || entry.startsWith("@executable_path/")) {
     const sub = entry.slice("@executable_path".length).replace(/^[\/\\]/, "");
     return { normalized: resolve(executableDir, sub), rawPath: join(executableDir, sub) };
   }
   if (entry.startsWith("/")) {
     return { normalized: resolve(entry), rawPath: entry };
   }
-  return { normalized: resolve(binaryDir, entry), rawPath: join(binaryDir, entry) };
+  return undefined;
 }
 
 function linkedLibraryPaths(executablePath: string): string[] {
@@ -443,7 +443,7 @@ function linkedLibraryPaths(executablePath: string): string[] {
     const rpaths: Array<{ normalized: string; rawPath: string }> = [];
     for (const raw of parseMachORpaths(binaryPath)) {
       const expanded = expandRpath(raw, binaryDir, executableDir);
-      if (!expanded.normalized || expanded.normalized === "/" || expanded.normalized === resolve(homedir())) continue;
+      if (!expanded || expanded.normalized === "/" || expanded.normalized === resolve(homedir())) continue;
       if (!rpaths.some((item) => item.normalized === expanded.normalized && item.rawPath === expanded.rawPath)) {
         rpaths.push(expanded);
       }
@@ -455,8 +455,8 @@ function linkedLibraryPaths(executablePath: string): string[] {
     if (depth > 4 || seen.has(path)) return;
     if (seen.size >= 128 || Date.now() - startedAt > 5_000) deny("HOST_OPERATION_SANDBOX_UNAVAILABLE", "Executable dependency scan exceeded its bounded limit.");
     seen.add(path);
-    const activeRpaths = [...inheritedRpaths];
-    for (const item of getRpathsFor(path)) {
+    const activeRpaths: Array<{ normalized: string; rawPath: string }> = [];
+    for (const item of [...getRpathsFor(path), ...inheritedRpaths]) {
       if (!activeRpaths.some((existing) => existing.normalized === item.normalized && existing.rawPath === item.rawPath)) {
         activeRpaths.push(item);
       }

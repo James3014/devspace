@@ -324,7 +324,7 @@ if (process.platform !== "darwin") {
     await writeFile(libBDepSrc, "int get_b_dep(void) { return 20; }\n");
     await writeFile(libASrc, "int get_a_dep(void); int get_a(void) { return get_a_dep(); }\n");
     await writeFile(libBSrc, "int get_b_dep(void); int get_b(void) { return get_b_dep(); }\n");
-    await writeFile(siblingRunnerSrc, "int get_a(void); int main(void) { return get_a() == 10 ? 0 : 1; }\n");
+    await writeFile(siblingRunnerSrc, "int get_a(void); int get_b(void); int main(void) { return (get_a() == 10 && get_b() == 20) ? 0 : 1; }\n");
 
     const siblingRunnerPath = join(siblingBinDir, "sibling_runner");
     const libAPath = join(siblingLibADir, "liba.dylib");
@@ -350,6 +350,9 @@ if (process.platform !== "darwin") {
     const ccSiblingRunner = ccSpawnSync("clang", ["-o", siblingRunnerPath, siblingRunnerSrc, `-L${siblingLibADir}`, "-la", `-L${siblingLibBDir}`, "-lb", "-Wl,-rpath,@loader_path/../libA", "-Wl,-rpath,@loader_path/../libB"], { encoding: "utf8" });
     assert.equal(ccSiblingRunner.status, 0, ccSiblingRunner.stderr);
     await chmod(siblingRunnerPath, 0o755);
+    const siblingLoadCommands = ccSpawnSync("/usr/bin/otool", ["-L", siblingRunnerPath], { encoding: "utf8" });
+    assert.equal(siblingLoadCommands.status, 0, siblingLoadCommands.stderr);
+    assert.match(siblingLoadCommands.stdout, /@rpath\/libb\.dylib/, "fixture must prove sibling libB is a direct load dependency");
 
     const canonicalSiblingRunner = await realpath(siblingRunnerPath);
     const canonicalLibADep = await realpath(libADepPath);
@@ -382,6 +385,111 @@ if (process.platform !== "darwin") {
     assert.ok(siblingProfile.includes(canonicalLibADep), "sandbox profile must include exact carveout for libA's dependency");
     // Sibling B must NOT resolve libb_dep through sibling A's privateA LC_RPATH
     assert.ok(!siblingProfile.includes(canonicalLibBDep), "sibling B must not resolve libb_dep via sibling A's LC_RPATH");
+
+    // Regression test: current image LC_RPATH must win over inherited ancestor rpaths.
+    const precedenceFixtureDir = join(root, "rpath-precedence-regression");
+    const precedenceBinDir = join(precedenceFixtureDir, "bin");
+    const precedenceChildDir = join(precedenceFixtureDir, "child");
+    const precedenceChildPrivateDir = join(precedenceChildDir, "private");
+    const precedenceAncestorDir = join(precedenceFixtureDir, "ancestor");
+    await mkdir(precedenceBinDir, { recursive: true });
+    await mkdir(precedenceChildPrivateDir, { recursive: true });
+    await mkdir(precedenceAncestorDir, { recursive: true });
+
+    const precedenceChoiceSrc = join(precedenceFixtureDir, "choice.c");
+    const precedenceChildSrc = join(precedenceFixtureDir, "child.c");
+    const precedenceRunnerSrc = join(precedenceFixtureDir, "runner.c");
+    const precedenceChildChoice = join(precedenceChildPrivateDir, "libchoice.dylib");
+    const precedenceAncestorChoice = join(precedenceAncestorDir, "libchoice.dylib");
+    const precedenceChild = join(precedenceChildDir, "libchild.dylib");
+    const precedenceRunner = join(precedenceBinDir, "runner");
+    await writeFile(precedenceChoiceSrc, "int choice(void) { return 7; }\\n");
+    await writeFile(precedenceChildSrc, "int choice(void); int child_value(void) { return choice(); }\\n");
+    await writeFile(precedenceRunnerSrc, "int child_value(void); int main(void) { return child_value() == 7 ? 0 : 1; }\\n");
+
+    const ccChildChoice = ccSpawnSync("clang", ["-shared", "-o", precedenceChildChoice, precedenceChoiceSrc, "-install_name", "@rpath/libchoice.dylib"], { encoding: "utf8" });
+    assert.equal(ccChildChoice.status, 0, ccChildChoice.stderr);
+    const ccAncestorChoice = ccSpawnSync("clang", ["-shared", "-o", precedenceAncestorChoice, precedenceChoiceSrc, "-install_name", "@rpath/libchoice.dylib"], { encoding: "utf8" });
+    assert.equal(ccAncestorChoice.status, 0, ccAncestorChoice.stderr);
+    const ccPrecedenceChild = ccSpawnSync("clang", ["-shared", "-o", precedenceChild, precedenceChildSrc, "-install_name", "@rpath/libchild.dylib", \`-L\${precedenceChildPrivateDir}\`, "-lchoice", "-Wl,-rpath,@loader_path/private"], { encoding: "utf8" });
+    assert.equal(ccPrecedenceChild.status, 0, ccPrecedenceChild.stderr);
+    const ccPrecedenceRunner = ccSpawnSync("clang", ["-o", precedenceRunner, precedenceRunnerSrc, \`-L\${precedenceChildDir}\`, "-lchild", "-Wl,-rpath,@loader_path/../child", "-Wl,-rpath,@loader_path/../ancestor"], { encoding: "utf8" });
+    assert.equal(ccPrecedenceRunner.status, 0, ccPrecedenceRunner.stderr);
+    await chmod(precedenceRunner, 0o755);
+
+    const canonicalPrecedenceRunner = await realpath(precedenceRunner);
+    const canonicalChildChoice = await realpath(precedenceChildChoice);
+    const canonicalAncestorChoice = await realpath(precedenceAncestorChoice);
+    const precedenceRunnerHash = createHash("sha256").update(await readFile(canonicalPrecedenceRunner)).digest("hex");
+    const precedencePolicy: HostOperationPolicy = {
+      ...basePolicy,
+      executablePath: canonicalPrecedenceRunner,
+      executableSha256: precedenceRunnerHash,
+      argv: [],
+      allowedPaths: { write: [allowed], read: [] },
+    };
+    const precedenceRequest: HostOperationRequest = {
+      attemptKey: "rpath-precedence-regression-test",
+      clientId: "owner-client",
+      executablePath: canonicalPrecedenceRunner,
+      argv: [],
+      cwd: allowed,
+      allowedPaths: { write: [allowed], read: [] },
+      maxWallMs: 2_000,
+      maxIdleMs: 1_000,
+      allowLongLivedProcess: false,
+    };
+    const boundPrecedence = await bindHostOperation(precedencePolicy, precedenceRequest, "owner-client");
+    const wrappedPrecedence = await prepareHostOperationSandbox(boundPrecedence);
+    const precedenceProfile = wrappedPrecedence.argv.join("\\n");
+    assert.ok(precedenceProfile.includes(canonicalChildChoice), "current image LC_RPATH must resolve its own child-private dylib first");
+    assert.ok(!precedenceProfile.includes(canonicalAncestorChoice), "inherited ancestor LC_RPATH must not shadow the current image LC_RPATH");
+
+    // Regression test: unsupported relative LC_RPATH entries must not create carveouts.
+    const relativeFixtureDir = join(root, "relative-rpath-regression");
+    const relativeBinDir = join(relativeFixtureDir, "bin");
+    const relativePrivateDir = join(relativeBinDir, "relative-private");
+    await mkdir(relativePrivateDir, { recursive: true });
+    const relativeLibSrc = join(relativeFixtureDir, "relative-lib.c");
+    const relativeRunnerSrc = join(relativeFixtureDir, "relative-runner.c");
+    const relativeLib = join(relativePrivateDir, "librelative.dylib");
+    const relativeRunner = join(relativeBinDir, "runner");
+    await writeFile(relativeLibSrc, "int relative_value(void) { return 9; }\\n");
+    await writeFile(relativeRunnerSrc, "int relative_value(void); int main(void) { return relative_value() == 9 ? 0 : 1; }\\n");
+    const ccRelativeLib = ccSpawnSync("clang", ["-shared", "-o", relativeLib, relativeLibSrc, "-install_name", "@rpath/librelative.dylib"], { encoding: "utf8" });
+    assert.equal(ccRelativeLib.status, 0, ccRelativeLib.stderr);
+    const ccRelativeRunner = ccSpawnSync("clang", ["-o", relativeRunner, relativeRunnerSrc, \`-L\${relativePrivateDir}\`, "-lrelative", "-Wl,-rpath,relative-private"], { encoding: "utf8" });
+    assert.equal(ccRelativeRunner.status, 0, ccRelativeRunner.stderr);
+    await chmod(relativeRunner, 0o755);
+    const relativeRpaths = ccSpawnSync("/usr/bin/otool", ["-l", relativeRunner], { encoding: "utf8" });
+    assert.equal(relativeRpaths.status, 0, relativeRpaths.stderr);
+    assert.match(relativeRpaths.stdout, /path relative-private \\(offset \\d+\\)/, "fixture must contain the unsupported relative LC_RPATH");
+
+    const canonicalRelativeRunner = await realpath(relativeRunner);
+    const canonicalRelativeLib = await realpath(relativeLib);
+    const relativeRunnerHash = createHash("sha256").update(await readFile(canonicalRelativeRunner)).digest("hex");
+    const relativePolicy: HostOperationPolicy = {
+      ...basePolicy,
+      executablePath: canonicalRelativeRunner,
+      executableSha256: relativeRunnerHash,
+      argv: [],
+      allowedPaths: { write: [allowed], read: [] },
+    };
+    const relativeRequest: HostOperationRequest = {
+      attemptKey: "relative-rpath-regression-test",
+      clientId: "owner-client",
+      executablePath: canonicalRelativeRunner,
+      argv: [],
+      cwd: allowed,
+      allowedPaths: { write: [allowed], read: [] },
+      maxWallMs: 2_000,
+      maxIdleMs: 1_000,
+      allowLongLivedProcess: false,
+    };
+    const boundRelative = await bindHostOperation(relativePolicy, relativeRequest, "owner-client");
+    const wrappedRelative = await prepareHostOperationSandbox(boundRelative);
+    const relativeProfile = wrappedRelative.argv.join("\\n");
+    assert.ok(!relativeProfile.includes(canonicalRelativeLib), "unsupported relative LC_RPATH must not create an exact dylib carveout");
   } finally {
     await SandboxManager.reset().catch(() => undefined);
     await rm(root, { recursive: true, force: true });
