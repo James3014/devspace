@@ -3,7 +3,7 @@ import type { SelfRestartActuator } from "./cutover-restart.js";
 import type { CompletionSelection } from "./current-completion-matrix.js";
 import { isDeepStrictEqual } from "node:util";
 import { McpCutoverController, compareServerIdentity, type DurableReconciliationWitness } from "./mcp-cutover.js";
-import { CutoverStateStore, type CutoverServerIdentity, type CutoverDrainEvidence, type BuildReadyReceipt, type ExpectedCutoverIdentity, type CutoverCoordinationBinding } from "./cutover-state.js";
+import { CutoverStateStore, type CutoverServerIdentity, type CutoverDrainEvidence, type BuildReadyReceipt, type ExpectedCutoverIdentity, type CutoverCoordinationBinding, type CutoverActivationBinding } from "./cutover-state.js";
 import { ControlPlaneConsumer, type ControlPlaneConsumerOptions, type DependencyReconciliationEvidence } from "./control-plane-consumer.js";
 import { ControlPlaneOwnershipError, ControlPlaneOwnershipStore, type HandoffInput, type TakeoverInput, type ReconciliationReceipt } from "./control-plane-ownership.js";
 import { createHash } from "node:crypto";
@@ -757,7 +757,7 @@ export class DurableOperationManager {
     });
   }
 
-  async restartCutover(cutoverId:string, currentIdentity:CutoverServerIdentity, buildReady:BuildReadyReceipt, probe:(expected:ExpectedCutoverIdentity)=>{buildReady:boolean;detail:string}|Promise<{buildReady:boolean;detail:string}>, actuator:SelfRestartActuator, context?:unknown) {
+  async restartCutover(cutoverId:string, currentIdentity:CutoverServerIdentity, buildReady:BuildReadyReceipt, probe:(expected:ExpectedCutoverIdentity)=>{buildReady:boolean;detail:string}|Promise<{buildReady:boolean;detail:string}>, actuator:SelfRestartActuator, context?:unknown, activationBinding?:CutoverActivationBinding) {
     if(!this.consumer) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","restart requires trusted host authority");
     const consumer=this.consumer,identity=Object.freeze({...currentIdentity});
     const target=Object.freeze({actuator:actuator.actuator,serviceLabel:actuator.serviceLabel,launchdTarget:actuator.launchdTarget});
@@ -767,6 +767,7 @@ export class DurableOperationManager {
     const readBound=()=>{
       const file=cutoverStore.get();
       if(!file?.coordinationBinding||file.cutoverId!==cutoverId||file.phase!=="drained"||!isDeepStrictEqual(file.oldServerIdentity,identity)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart requires exact drained original runtime binding");
+      if(activationBinding!==undefined && !isDeepStrictEqual(file.activationBinding,activationBinding)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","restart activation binding changed or is missing");
       const intent=this.reconcileCutoverStart(file.coordinationBinding.operationHandle,context);
       const subject={operationId:intent.operationId,requestHash:intent.requestHash,workspaceRoot:intent.scopeRoot,baseRevision:intent.request.baseRevision as string,operation:"cutover_start" as const};
       const binding=consumer.authorizeCutoverLifecycle(context,subject,action);
