@@ -1971,6 +1971,81 @@ function registerCutoverMcpTools(
       );
     }
   };
+  const coordinationBoundReconcileDisposition = () => {
+    const record = control.controller.record();
+    if (!record?.coordinationBinding) return undefined;
+    const comparison = compareServerIdentity(record, control.controller.currentIdentity);
+    const base = {
+      coordinationBound: true,
+      cutoverId: record.cutoverId,
+      cutoverPhase: record.phase,
+      mode: control.controller.mode(),
+      serverGenerationRelation: comparison,
+      reconciliationRequired: record.phase !== "closed",
+    };
+    if (record.phase === "closed") {
+      return {
+        ...base,
+        outcome: "terminal",
+        status: "TERMINAL",
+        nextAction: "NONE",
+        reason: "Coordination-bound cutover is already terminal; no lifecycle effect is required.",
+      };
+    }
+    if (record.phase === "prepared") {
+      return {
+        ...base,
+        outcome: "explicit_lifecycle_required",
+        status: "BLOCKED",
+        nextAction: "CUTOVER_DRAIN",
+        reason: "Coordination-bound cutover remains prepared; explicit drain authority is required.",
+      };
+    }
+    if (record.phase === "superseded") {
+      return {
+        ...base,
+        outcome: "recovery_required",
+        status: "BLOCKED",
+        nextAction: "CUTOVER_RECOVER_OR_SUCCESSOR",
+        reason: "Coordination-bound cutover was superseded; resume its durable recovery/successor path.",
+      };
+    }
+    if (!record.restartRequest) {
+      return {
+        ...base,
+        outcome: "explicit_lifecycle_required",
+        status: "BLOCKED",
+        nextAction: "CUTOVER_RESTART",
+        reason: "Coordination-bound cutover is drained; explicit restart authority is required.",
+      };
+    }
+    if (!record.restartRequest.restartScheduledAt) {
+      return {
+        ...base,
+        outcome: "recovery_required",
+        status: "BLOCKED",
+        nextAction: "RECONCILE_RESTART_REQUEST",
+        reason: "Restart was requested but no durable schedule marker exists; reconcile the exact restart effect before any retry.",
+      };
+    }
+    if (comparison.sourceMatches && comparison.buildMatches && comparison.capabilityManifestMatches) {
+      return {
+        ...base,
+        outcome: "replacement_observed",
+        status: "BLOCKED",
+        nextAction: "CUTOVER_FINISH",
+        reason: "Expected replacement identity is live; explicit finish authority plus durable workspace/agent witness is required.",
+      };
+    }
+    return {
+      ...base,
+      outcome: "awaiting_reconnect",
+      status: "BLOCKED",
+      nextAction: "RECONNECT_AND_RECONCILE",
+      reason: "Restart is durably scheduled but the expected replacement identity is not yet the current server generation.",
+    };
+  };
+
   const modeSchema = z.enum(["normal", "drain", "reconcile-only"]);
 
   registerAppTool(
@@ -2156,6 +2231,12 @@ function registerCutoverMcpTools(
     },
     async ({ dryRun, carrierCredential }, extra) => {
       bindExactCutoverCarrier(extra, carrierCredential);
+      if (control.controller.record()?.coordinationBinding) {
+        throw new ControlPlaneOwnershipError(
+          "AUTHORITY_REQUIRED",
+          "coordination-bound automatic advance is unavailable; use explicit drain/restart/finish lifecycle actions",
+        );
+      }
       if (!control.advance) {
         throw new CutoverStateError("Cutover orchestration is unavailable in this environment.");
       }
@@ -2686,8 +2767,7 @@ function registerCutoverMcpTools(
     );
   }
 
-  if (control.advance) {
-    registerAppTool(
+  registerAppTool(
       server,
       "cutover_reconcile",
       {
@@ -2707,14 +2787,25 @@ function registerCutoverMcpTools(
       },
       async ({ carrierCredential }, extra) => {
         bindExactCutoverCarrier(extra, carrierCredential);
-        const outcome = await control.advance!();
+        const boundDisposition = coordinationBoundReconcileDisposition();
+        if (boundDisposition) {
+          return {
+            content: [textBlock(
+              `Coordination-bound cutover reconcile: status=${boundDisposition.status}, next=${boundDisposition.nextAction}: ${boundDisposition.reason}`,
+            )],
+            structuredContent: { outcome: boundDisposition as unknown as Record<string, unknown> },
+          };
+        }
+        if (!control.advance) {
+          throw new CutoverStateError("Legacy cutover orchestration is unavailable in this environment.");
+        }
+        const outcome = await control.advance();
         return {
           content: [textBlock(describeOutcome(outcome))],
           structuredContent: { outcome: outcome as unknown as Record<string, unknown> },
         };
       },
     );
-  }
 }
 
 function registerControlPlaneMigrationTools(
