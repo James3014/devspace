@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -146,6 +146,30 @@ test("activation binding stays idempotent after restart intent but before schedu
     assert.equal(store.recordActivationBinding(record.cutoverId, binding).newlyBound, true);
     assert.equal(store.recordActivationBinding(record.cutoverId, binding).newlyBound, false);
     assert.deepEqual(store.get()?.activationBinding, binding);
+  } finally {
+    f.cleanup();
+  }
+});
+
+
+test("activation rejects a release tree with an external physical symlink target", () => {
+  const f = fixture();
+  try {
+    const external = join(f.root, "external.js");
+    writeFileSync(external, "mutable external content\n");
+    symlinkSync(
+      external,
+      join(f.packageRoot, "node_modules", "fixture", "external.js"),
+    );
+    assert.throws(
+      () => bindCutoverActivation({
+        cutoverId: "cutover-external-link",
+        packageRoot: f.packageRoot,
+        serviceRoot: f.serviceRoot,
+        expected: { sourceCommit: f.sourceCommit, buildId: f.buildId },
+      }),
+      /symlink escapes the immutable release root/i,
+    );
   } finally {
     f.cleanup();
   }
