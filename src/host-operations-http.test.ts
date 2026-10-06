@@ -371,7 +371,9 @@ test("HTTP server omits host operation tools when startup capability is disabled
   const client = await connect(new URL(`http://127.0.0.1:${(listener.address() as { port: number }).port}/mcp`), owner.accessToken, "host-disabled-http");
   try {
     const names = (await client.listTools()).tools.map((tool) => tool.name);
-    assert.equal(names.some((name) => name.startsWith("host_operation_")), false);
+    const actuatorNames = ["host_operation_preflight", "host_operation_start", "host_operation_status", "host_operation_reconcile", "host_operation_cancel"];
+    assert.equal(names.some((name) => actuatorNames.includes(name)), false);
+    assert.equal(names.includes("host_operation_external_status"), true);
   } finally {
     await client.close().catch(() => {});
     await running.close();
