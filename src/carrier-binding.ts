@@ -61,9 +61,15 @@ const nonempty=z.string().min(1).max(4096);
 const revision=z.string().regex(/^[a-f0-9]{40,64}$/);
 const timestamp=z.string().datetime();
 const targetIdentity=z.object({sourceCommit:revision,buildId:nonempty,capabilityManifestSha256:z.string().regex(/^[a-f0-9]{64}$/)}).strict();
+const currentCutoverIdentity=targetIdentity.extend({
+  serverInstanceId:nonempty,
+  releaseSha256:z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  releasePath:nonempty.optional(),
+  activationCutoverId:nonempty.optional(),
+}).strict();
 const cutoverSchema=z.object({
   stateRoot:nonempty,attemptKey:nonempty,
-  currentIdentity:targetIdentity.extend({serverInstanceId:nonempty}).strict(),
+  currentIdentity:currentCutoverIdentity,
   expectedIdentity:targetIdentity,expiresAt:timestamp,
   restart:z.object({buildReady:z.object({verifiedBy:nonempty,verifiedAt:timestamp,evidence:nonempty}).strict(),actuator:z.literal("launchd-self"),serviceLabel:nonempty,launchdTarget:nonempty}).strict(),
   finish:z.object({workspaceId:nonempty,agentId:nonempty}).strict(),

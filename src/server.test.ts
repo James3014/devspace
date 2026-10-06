@@ -3535,11 +3535,11 @@ test("subagents: workspace_verify executes a configured verifier normally", asyn
   }
 });
 
-test("gitCandidates disabled: git tools are absent", async (t) => {
+test("gitCandidates disabled hides candidate mutations but keeps explicit ref-fetch recovery", async (t) => {
   const context = await fixture(t, { gitCandidates: false });
   const tools = await context.client.listTools();
   const gitTools = tools.tools.filter((tool) => tool.name.startsWith("git_"));
-  assert.equal(gitTools.length, 0);
+  assert.deepEqual(gitTools.map((tool) => tool.name).sort(), ["git_fetch_ref"]);
 });
 
 test("Issue #238: MCP tool catalog identity changes with conditional Git Candidate actions", async (t) => {
@@ -3561,15 +3561,24 @@ test("gitCandidates enabled: git tools are present with schema validation", asyn
   const context = await fixture(t, { git: true, gitCandidates: true });
   const tools = await context.client.listTools();
   const gitTools = tools.tools.filter((tool) => tool.name.startsWith("git_"));
-  assert.equal(gitTools.length, 3);
+  assert.equal(gitTools.length, 4);
 
+  const fetchTool = gitTools.find((tool) => tool.name === "git_fetch_ref");
   const commitTool = gitTools.find((tool) => tool.name === "git_commit");
   const pushTool = gitTools.find((tool) => tool.name === "git_push");
   const promoteTool = gitTools.find((tool) => tool.name === "git_promote_candidate");
 
+  assert.ok(fetchTool);
   assert.ok(commitTool);
   assert.ok(pushTool);
   assert.ok(promoteTool);
+
+  assert.deepEqual(fetchTool.annotations, {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: true,
+  });
 
   const promoteProps = promoteTool.inputSchema.properties as Record<string, any>;
   assert.equal(promoteProps.canonicalRemote, undefined);
@@ -5147,12 +5156,13 @@ test("dispatch mode exposes only the direct worker lifecycle and simple instruct
     "agent_reconcile",
     "agent_start",
     "agent_status",
+    "git_fetch_ref",
     "host_operation_external_status",
     "open_workspace",
     "read",
     "work_resume_prepare",
   ]);
-  assert.equal(names.length, 12);
+  assert.equal(names.length, 13);
 
   const resumePrepare = toolsList.tools.find((tool) => tool.name === "work_resume_prepare");
   assert.ok(resumePrepare);
@@ -5167,11 +5177,20 @@ test("dispatch mode exposes only the direct worker lifecycle and simple instruct
   assert.deepEqual(
     names.filter(
       (name) =>
-        /core|coordination|cutover|candidate|repository_intelligence|^bash$|^write$|^edit$|apply_patch|^git_/.test(name) ||
+        /core|coordination|cutover|candidate|repository_intelligence|^bash$|^write$|^edit$|apply_patch|^git_(?!fetch_ref$)/.test(name) ||
         (name.startsWith("host_operation") && name !== "host_operation_external_status"),
     ),
     [],
   );
+
+  const gitFetchRef = toolsList.tools.find((tool) => tool.name === "git_fetch_ref");
+  assert.ok(gitFetchRef);
+  assert.deepEqual(gitFetchRef.annotations, {
+    readOnlyHint: false,
+    destructiveHint: false,
+    idempotentHint: true,
+    openWorldHint: true,
+  });
 
   const agentStart = toolsList.tools.find((tool) => tool.name === "agent_start");
   assert.ok(agentStart);
@@ -5188,6 +5207,8 @@ test("dispatch mode exposes only the direct worker lifecycle and simple instruct
 
   const instructions = context.client.getInstructions() ?? "";
   assert.match(instructions, /open_workspace/);
+  assert.match(instructions, /GIT_BASE_REF_NOT_LOCAL/);
+  assert.match(instructions, /git_fetch_ref/);
   assert.match(instructions, /agent_catalog/);
   assert.match(instructions, /agent_preflight/);
   assert.match(instructions, /work_resume_prepare/);
@@ -5198,6 +5219,21 @@ test("dispatch mode exposes only the direct worker lifecycle and simple instruct
   assert.match(instructions, /agent_reconcile/);
   assert.match(instructions, /read/);
   assert.doesNotMatch(instructions, /Core|Nexus|coordination|cutover|host.?operation/i);
+});
+
+test("git_fetch_ref recovery is projected in every worktree-capable tool mode", async (t) => {
+  for (const toolMode of ["minimal", "dispatch", "codex", "full"] as const) {
+    const context = await fixture(t, { git: true, toolMode });
+    const toolsList = await context.client.listTools();
+    const names = toolsList.tools.map((tool) => tool.name);
+    assert.ok(
+      names.includes("git_fetch_ref"),
+      `git_fetch_ref must be callable when ${toolMode} mode can emit GIT_BASE_REF_NOT_LOCAL`,
+    );
+    const instructions = context.client.getInstructions() ?? "";
+    assert.match(instructions, /GIT_BASE_REF_NOT_LOCAL/);
+    assert.match(instructions, /git_fetch_ref/);
+  }
 });
 
 test("dispatch mode rebinds an approved writer credential and admits enrolled agent_start", async () => {
