@@ -138,6 +138,20 @@ test("CLI completion-only startup preserves pairing and rejects altered or mixed
           await assert.rejects(reconnect.callTool(request),/CUTOVER_RECONCILIATION_REQUIRED/);
         }
       } finally {await reconnect.close().catch(()=>{});}
+
+      const reconcileFresh = new Client({name:"drained-reconcile-fresh-session",version:"1"});
+      try {
+        await reconcileFresh.connect(new StreamableHTTPClientTransport(new URL("/mcp",config.publicBaseUrl),{requestInit:{headers:{Authorization:`Bearer ${tokens.access_token}`}}}));
+        const reconciled = data(await reconcileFresh.callTool({
+          name:"cutover_reconcile",
+          arguments:{carrierCredential:pendingCutover.credential},
+        })).outcome;
+        assert.equal(reconciled.coordinationBound,true);
+        assert.equal(reconciled.cutoverId,started.cutover.cutoverId);
+        assert.equal(reconciled.cutoverPhase,"drained");
+        assert.equal(reconciled.status,"BLOCKED");
+        assert.equal(reconciled.nextAction,"CUTOVER_RESTART");
+      } finally {await reconcileFresh.close().catch(()=>{});}
       }
     } finally {await cutoverClient.close().catch(()=>{});}
   } finally {
