@@ -627,7 +627,7 @@ test("Owner-facing elicitation approves exactly one bounded carrier without Term
     clients.push(client);
     if(withElicitation) {
       client.setRequestHandler(ElicitRequestSchema,async(request)=>{
-        assert.match(request.params.message,/James3014\/devspace/);
+        assert.match(request.params.message,/james3014\/devspace/);
         assert.match(request.params.message,/contractSha256=[0-9a-f]{64}/);
         if(approval==="cancel") return {action:"cancel" as const};
         if(approval==="decline") return {action:"decline" as const};
