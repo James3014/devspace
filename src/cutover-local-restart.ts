@@ -9,9 +9,17 @@ import {
 } from "./cutover-build-ready.js";
 import {
   createBoundLaunchdRestartActuator,
+  inspectBoundStableLaunchdService,
   type BoundLaunchdRestartOptions,
+  type InspectStableLaunchdServiceOptions,
   type SelfRestartActuator,
+  type StableLaunchdServiceBinding,
 } from "./cutover-restart.js";
+import {
+  bindCutoverActivation,
+  verifyActivationBinding,
+  type BindCutoverActivationInput,
+} from "./cutover-activation.js";
 import {
   CutoverStateError,
   CutoverStateStore,
@@ -33,6 +41,11 @@ export interface LocalBoundCutoverRestartDependencies {
     expected: ExpectedCutoverIdentity,
   ) => Promise<{ buildReady: boolean; detail: string }> | { buildReady: boolean; detail: string };
   createActuator?: (options: BoundLaunchdRestartOptions) => SelfRestartActuator | undefined;
+  inspectStableService?: (
+    options: InspectStableLaunchdServiceOptions,
+  ) => StableLaunchdServiceBinding | undefined;
+  bindActivation?: (input: BindCutoverActivationInput) => ReturnType<typeof bindCutoverActivation>;
+  verifyActivation?: typeof verifyActivationBinding;
 }
 
 export interface LocalBoundCutoverRestartInput {
@@ -145,14 +158,43 @@ export async function performLocalBoundCutoverRestart(
     const preflight=await probe(packageRoot,approved.expectedIdentity);
     if(preflight.buildReady!==true) throw new CutoverBuildNotReadyError(preflight.detail);
 
+    const inspectStableService =
+      dependencies.inspectStableService ?? inspectBoundStableLaunchdService;
+    const stableService = inspectStableService({
+      livePid:health.pid,
+      serviceLabel:approved.restart.serviceLabel,
+      launchdTarget:approved.restart.launchdTarget,
+    });
+    if(!stableService) {
+      throw new CutoverStateError(
+        "Approved launchd target is not bound to the canonical stable DevSpace service launcher.",
+      );
+    }
+
+    const bindActivation = dependencies.bindActivation ?? bindCutoverActivation;
+    const verifyActivation = dependencies.verifyActivation ?? verifyActivationBinding;
+    const activationBinding = bindActivation({
+      cutoverId:input.cutoverId,
+      packageRoot,
+      serviceRoot:stableService.serviceRoot,
+      expected:approved.expectedIdentity,
+    });
+    const stateStore = new CutoverStateStore(input.config.stateDir);
+    stateStore.recordActivationBinding(input.cutoverId, activationBinding);
+    verifyActivation(activationBinding, stableService.serviceRoot);
+
     const createActuator=dependencies.createActuator ?? createBoundLaunchdRestartActuator;
     const actuator=createActuator({
       livePid:health.pid,
       serviceLabel:approved.restart.serviceLabel,
       launchdTarget:approved.restart.launchdTarget,
+      expectedStableServiceRoot:stableService.serviceRoot,
+      verifyActivation:()=>verifyActivation(activationBinding,stableService.serviceRoot),
     });
     if(!actuator) {
-      throw new CutoverStateError("Approved launchd target does not own the live drained DevSpace PID.");
+      throw new CutoverStateError(
+        "Approved launchd target does not own the live drained PID through the canonical stable launcher.",
+      );
     }
 
     const outcome=await manager.restartCutover(
@@ -163,7 +205,13 @@ export async function performLocalBoundCutoverRestart(
       actuator,
       local.context,
     );
-    return { ...outcome, liveIdentity:health.identity, packageRoot };
+    return {
+      ...outcome,
+      liveIdentity:health.identity,
+      packageRoot,
+      stableServiceRoot:stableService.serviceRoot,
+      activationBinding,
+    };
   } finally {
     manager.close();
     bindings.close();
