@@ -1097,6 +1097,12 @@ test("cutover MCP control exposes bounded lease lifecycle and schedules self res
       (restartTool.inputSchema as { properties?: Record<string, unknown> }).properties?.carrierCredential,
       "cutover_restart_self must expose inline carrierCredential for fresh-session rebind",
     );
+    const reconcileTool = tools.tools.find((tool) => tool.name === "cutover_reconcile");
+    assert.ok(reconcileTool);
+    assert.ok(
+      (reconcileTool.inputSchema as { properties?: Record<string, unknown> }).properties?.carrierCredential,
+      "cutover_reconcile must expose inline carrierCredential for fresh-session rebind",
+    );
 
     const deniedStart = await client.callTool({
       name: "cutover_start",
@@ -7211,7 +7217,7 @@ test("prepared stale-target MCP recovery preserves successor and supersession su
   }
 });
 
-test("C3 bound cutover rejects unfenced automatic advance before its callback",async()=>{
+test("Issue #378: coordination-bound cutover reconcile remains fail-closed without carrier binding",async()=>{
   const root=await mkdtemp(join(tmpdir(),"devspace-bound-advance-"));
   const config=loadConfig({DEVSPACE_CONFIG_DIR:join(root,"config"),DEVSPACE_ALLOWED_ROOTS:root,DEVSPACE_STATE_DIR:join(root,"state"),DEVSPACE_OAUTH_OWNER_TOKEN:"test-owner-token-that-is-long-enough",DEVSPACE_TOOL_MODE:"full",PORT:"1"});
   const store=new SqliteWorkspaceStore(config.stateDir);const workspaces=new WorkspaceRegistry(config,store);
