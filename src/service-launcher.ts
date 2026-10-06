@@ -31,6 +31,7 @@ function main(): void {
     DEVSPACE_ACTIVATION_CUTOVER_ID: pointer.cutoverId,
   };
 
+  process.chdir(pointer.releasePath);
   if (typeof process.execve !== "function") {
     throw new Error(
       "DevSpace stable service launcher requires Node process.execve support.",
