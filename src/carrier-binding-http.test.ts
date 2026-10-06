@@ -613,7 +613,8 @@ test("Owner-facing elicitation approves exactly one bounded carrier without Term
     {req:{method:"POST",body:{owner_token:config.oauth.ownerToken}},redirect:(_status:number,url:string)=>{redirect=url;}} as never,
   );
   const tokens=await provider.exchangeAuthorizationCode(oauthClient,new URL(redirect).searchParams.get("code")!);
-  const running=createServer(config);
+  let carrierClock=Date.now();
+  const running=createServer(config,{carrierClock:()=>carrierClock});
   const listener=running.app.listen(0,"127.0.0.1");
   await new Promise<void>((resolve,reject)=>{listener.once("listening",resolve);listener.once("error",reject);});
   const url=new URL(`http://127.0.0.1:${(listener.address() as {port:number}).port}/mcp`);
@@ -679,7 +680,7 @@ test("Owner-facing elicitation approves exactly one bounded carrier without Term
     assert.equal(replay.carrierId,carrierId);
 
     const mismatch=data(await owner.callTool({
-      name:"coordination_owner_approval_status",
+      name:"coordination_owner_approval_prepare",
       arguments:{pendingId:pending.pendingId,contract:{...contract,goal:"issue407-changed"}},
     }));
     assert.equal(mismatch.status,"CONTRACT_MISMATCH");
@@ -687,9 +688,9 @@ test("Owner-facing elicitation approves exactly one bounded carrier without Term
     const fresh=await connect("fresh-status",false);
     const durable=data(await fresh.callTool({
       name:"coordination_owner_approval_status",
-      arguments:{pendingId:pending.pendingId,contract},
+      arguments:{pendingId:pending.pendingId},
     }));
-    assert.equal(durable.status,"ALREADY_APPROVED_SAME_CONTRACT");
+    assert.equal(durable.status,"APPROVED");
     assert.equal(durable.carrierId,carrierId);
     const hijack=await fresh.callTool({
       name:"coordination_owner_approve",
@@ -705,6 +706,12 @@ test("Owner-facing elicitation approves exactly one bounded carrier without Term
     }));
     assert.equal(declined.status,"REJECTED");
     assert.equal((await owner.callTool({name:"coordination_resume",arguments:{pendingId:declinedPending.pendingId}})).isError,true);
+    const declinedFresh=await connect("declined-status",false);
+    const declinedDurable=data(await declinedFresh.callTool({
+      name:"coordination_owner_approval_status",
+      arguments:{pendingId:declinedPending.pendingId},
+    }));
+    assert.equal(declinedDurable.status,"REJECTED");
 
     approval="cancel";
     const cancelledPending=data(await owner.callTool({name:"coordination_pair",arguments:{}}));
@@ -715,6 +722,28 @@ test("Owner-facing elicitation approves exactly one bounded carrier without Term
     assert.equal(cancelled.status,"PENDING_OWNER_APPROVAL");
     assert.equal(cancelled.elicitationAction,"cancel");
     assert.equal((await owner.callTool({name:"coordination_resume",arguments:{pendingId:cancelledPending.pendingId}})).isError,true);
+    const cancelledFresh=await connect("cancelled-status",false);
+    const cancelledDurable=data(await cancelledFresh.callTool({
+      name:"coordination_owner_approval_status",
+      arguments:{pendingId:cancelledPending.pendingId},
+    }));
+    assert.equal(cancelledDurable.status,"PENDING_OWNER_APPROVAL");
+
+    const expiringPending=data(await owner.callTool({name:"coordination_pair",arguments:{}}));
+    const expiringContract:CarrierContract={...contract,goal:"issue407-expiring",expiresAt:new Date(carrierClock+1000).toISOString()};
+    const expiring=data(await owner.callTool({
+      name:"coordination_owner_approve",
+      arguments:{pendingId:expiringPending.pendingId,contract:expiringContract},
+    }));
+    assert.equal(expiring.status,"PENDING_OWNER_APPROVAL");
+    carrierClock+=2000;
+    const expiredFresh=await connect("expired-status",false);
+    const expired=data(await expiredFresh.callTool({
+      name:"coordination_owner_approval_status",
+      arguments:{pendingId:expiringPending.pendingId},
+    }));
+    assert.equal(expired.status,"EXPIRED");
+    assert.equal((await owner.callTool({name:"coordination_resume",arguments:{pendingId:expiringPending.pendingId}})).isError,true);
   } finally {
     for(const client of clients.reverse()) await client.close().catch(()=>{});
     await new Promise<void>(resolve=>listener.close(()=>resolve()));
