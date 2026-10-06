@@ -258,6 +258,7 @@ test("initialize rejects explicitly when every resident MCP session is in flight
     DEVSPACE_CONFIG_DIR: join(root, ".config"),
     DEVSPACE_ALLOWED_ROOTS: root,
     DEVSPACE_STATE_DIR: stateDir,
+    DEVSPACE_WORKTREE_ROOT: join(root, ".worktrees"),
     DEVSPACE_OAUTH_OWNER_TOKEN: "test-owner-token-that-is-long-enough",
     DEVSPACE_PUBLIC_BASE_URL: baseUrl,
     DEVSPACE_TOOL_MODE: "codex",
