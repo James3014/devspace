@@ -12,6 +12,7 @@ export interface OwnerApprovalPairingProjection {
   clientId: string;
   sessionId: string;
   expiresAtMs: number;
+  expired: boolean;
   carrierId?: string;
 }
 
@@ -67,6 +68,7 @@ export class OwnerCarrierApprovalReceiptStore {
       clientId: row.client_id,
       sessionId: row.session_id,
       expiresAtMs: row.expires_at,
+      expired: row.expires_at <= this.now(),
       ...(row.binding_id ? { carrierId: row.binding_id } : {}),
     };
   }
