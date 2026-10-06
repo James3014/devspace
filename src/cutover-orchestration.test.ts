@@ -155,6 +155,7 @@ test("advance blocks un-gated restarts with CUTOVER_BUILD_NOT_READY and never sc
     const cutoverId = old.record()!.cutoverId;
     old.recordDrain(cutoverId, { activeSessions: 0, oldestAgeMs: 0 });
     old.requestRestart(cutoverId);
+    bindActivation(stateDir, old);
     const outcome = await orchestrator(old, { actuator }).advance();
     assert.equal(outcome.outcome, "blocked");
     assert.equal(outcome.code, "CUTOVER_BUILD_NOT_READY");
@@ -173,6 +174,7 @@ test("advance refuses to schedule when the build-ready probe fails closed", asyn
     const cutoverId = old.record()!.cutoverId;
     old.recordDrain(cutoverId, { activeSessions: 0, oldestAgeMs: 0 });
     old.requestRestart(cutoverId, { verifiedBy: "op", verifiedAt: new Date().toISOString() });
+    bindActivation(stateDir, old);
     const outcome = await orchestrator(old, {
       actuator,
       probe: () => ({
@@ -371,6 +373,7 @@ for (const changeDuringProbe of [false, true]) {
       const id = old.record()!.cutoverId;
       old.recordDrain(id, { activeSessions: 0, oldestAgeMs: 0 });
       old.requestRestart(id, { verifiedBy: "op", verifiedAt: new Date().toISOString() });
+      bindActivation(stateDir, old);
       let probes = 0;
       const originalRecord = old.record.bind(old);
       const run = orchestrator(old, { actuator, probe: () => {
@@ -395,6 +398,7 @@ test("orchestrator rejects an unbound generation changed during probe without sc
     const id = old.record()!.cutoverId;
     old.recordDrain(id, { activeSessions: 0, oldestAgeMs: 0 });
     old.requestRestart(id, { verifiedBy: "op", verifiedAt: new Date().toISOString() });
+    bindActivation(stateDir, old);
     const originalRecord = old.record.bind(old);
     const outcome = await orchestrator(old, { actuator, probe: () => {
       old.record = () => ({ ...originalRecord()!, cutoverId: "different-generation" });
