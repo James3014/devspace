@@ -668,11 +668,6 @@ export class CutoverStateStore {
     binding: CutoverActivationBinding,
   ): { record: DurableCutoverRecord; newlyBound: boolean } {
     const record = this.requireExact(cutoverId);
-    if (record.phase !== "drained" || record.restartRequest) {
-      throw new CutoverStateError(
-        "Activation binding requires a drained cutover before any restart request.",
-      );
-    }
     assertValidActivationBinding(binding, record);
     const markers = this.markerPaths(record);
     if (record.activationBinding) {
@@ -682,6 +677,11 @@ export class CutoverStateStore {
         );
       }
       return { record, newlyBound: false };
+    }
+    if (record.phase !== "drained" || record.restartRequest) {
+      throw new CutoverStateError(
+        "Activation binding requires a drained cutover before any restart request.",
+      );
     }
     try {
       writeExclusiveDurable(
