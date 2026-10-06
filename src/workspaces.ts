@@ -10,7 +10,7 @@ import { mkdir, opendir, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { loadProjectContextFiles } from "@earendil-works/pi-coding-agent";
 import type { ServerConfig } from "./config.js";
-import { createManagedWorktree } from "./git-worktrees.js";
+import { createManagedWorktree, resolveManagedWorktreeIdentity } from "./git-worktrees.js";
 import {
   AccessDeniedError,
   assertAllowedPath,
@@ -122,7 +122,7 @@ type DirectoryOps = {
 
 export class WorkspaceRegistry {
   private readonly workspaces = new Map<string, Workspace>();
-  private readonly pendingCheckoutOpens = new Map<string, Promise<WorkspaceContext>>();
+  private readonly pendingConversationOpens = new Map<string, Promise<WorkspaceContext>>();
 
   constructor(
     private readonly config: ServerConfig,
@@ -139,20 +139,20 @@ export class WorkspaceRegistry {
       return this.openNewWorkspace(workspaceInput);
     }
 
-    const projectKey = await this.conversationProjectKey(workspaceInput);
     const mode = workspaceInput.mode ?? "checkout";
-    if (mode === "worktree") {
-      const context = await this.openWorktreeWorkspace(workspaceInput.path, workspaceInput.baseRef);
-      return {
-        ...context,
-        // A new worktree always has its own workspace-specific context.
-        includeBootstrapContext: true,
-      };
-    }
-
-    const targetKey = this.conversationCheckoutTargetKey(projectKey);
+    const projectKey = await this.conversationProjectKey(workspaceInput);
+    const worktreeIdentity = mode === "worktree"
+      ? await resolveManagedWorktreeIdentity({
+          sourcePath: workspaceInput.path,
+          baseRef: workspaceInput.baseRef,
+          config: this.config,
+        })
+      : undefined;
+    const targetKey = worktreeIdentity
+      ? this.conversationWorktreeTargetKey(worktreeIdentity.sourceRoot, worktreeIdentity.baseSha)
+      : this.conversationCheckoutTargetKey(projectKey);
     const operationKey = JSON.stringify([conversationScopeId, targetKey]);
-    const pending = this.pendingCheckoutOpens.get(operationKey);
+    const pending = this.pendingConversationOpens.get(operationKey);
     if (pending) {
       const context = await pending;
       return {
@@ -162,18 +162,25 @@ export class WorkspaceRegistry {
       };
     }
 
-    const open = this.openConversationCheckout(
-      workspaceInput,
-      conversationScopeId,
-      targetKey,
-    );
-    this.pendingCheckoutOpens.set(operationKey, open);
+    const open = mode === "worktree"
+      ? this.openConversationWorktree(
+          workspaceInput,
+          conversationScopeId,
+          targetKey,
+          worktreeIdentity!,
+        )
+      : this.openConversationCheckout(
+          workspaceInput,
+          conversationScopeId,
+          targetKey,
+        );
+    this.pendingConversationOpens.set(operationKey, open);
 
     try {
       return await open;
     } finally {
-      if (this.pendingCheckoutOpens.get(operationKey) === open) {
-        this.pendingCheckoutOpens.delete(operationKey);
+      if (this.pendingConversationOpens.get(operationKey) === open) {
+        this.pendingConversationOpens.delete(operationKey);
       }
     }
   }
@@ -182,10 +189,50 @@ export class WorkspaceRegistry {
     const mode = options.mode ?? "checkout";
 
     if (mode === "worktree") {
+      this.assertManagedWorktreeSourceNotNested(options.path);
       return this.openWorktreeWorkspace(options.path, options.baseRef);
     }
 
     return this.openCheckoutWorkspace(options.path);
+  }
+
+  private async openConversationWorktree(
+    input: OpenWorkspaceInput,
+    conversationScopeId: string,
+    targetKey: string,
+    identity: { sourceRoot: string; baseRef: string; baseSha: string },
+  ): Promise<WorkspaceContext> {
+    this.assertManagedWorktreeSourceNotNested(input.path);
+    const binding = this.store?.getConversationBinding(conversationScopeId, targetKey);
+    if (binding) {
+      const reusableWorkspace = await this.findReusableWorktreeWorkspace(
+        binding,
+        identity.sourceRoot,
+        identity.baseSha,
+      );
+      if (reusableWorkspace) {
+        const context = await this.reusedWorkspaceContext(reusableWorkspace);
+        this.store?.touchConversationBinding(conversationScopeId, targetKey);
+        return {
+          ...context,
+          includeBootstrapContext: false,
+        };
+      }
+
+      this.workspaces.delete(binding.workspaceSessionId);
+      this.store?.deleteConversationBinding(conversationScopeId, targetKey);
+    }
+
+    const context = await this.openWorktreeWorkspace(input.path, input.baseRef);
+    this.store?.setConversationBinding({
+      conversationScopeId,
+      targetKey,
+      workspaceSessionId: context.workspace.id,
+    });
+    return {
+      ...context,
+      includeBootstrapContext: true,
+    };
   }
 
   private async openConversationCheckout(
@@ -220,6 +267,42 @@ export class WorkspaceRegistry {
       ...context,
       includeBootstrapContext: true,
     };
+  }
+
+  private async findReusableWorktreeWorkspace(
+    binding: WorkspaceConversationBinding,
+    sourceRoot: string,
+    baseSha: string,
+  ): Promise<Workspace | undefined> {
+    const session = this.store?.getSession(binding.workspaceSessionId);
+    if (!session || session.status !== "active" || session.mode !== "worktree" || !session.managed) {
+      return undefined;
+    }
+    if (!session.sourceRoot || await canonicalPath(session.sourceRoot) !== await canonicalPath(sourceRoot)) {
+      return undefined;
+    }
+    if (session.baseSha !== baseSha) {
+      return undefined;
+    }
+
+    let root: string;
+    try {
+      root = this.assertWorkspaceRootAllowed(session.root, session.mode, session.sourceRoot);
+      const rootStats = await stat(root);
+      if (!rootStats.isDirectory()) return undefined;
+    } catch (error) {
+      if (
+        error instanceof AccessDeniedError ||
+        (isErrnoException(error) && (error.code === "ENOENT" || error.code === "ENOTDIR"))
+      ) {
+        return undefined;
+      }
+      throw error;
+    }
+
+    const workspace = this.getWorkspace(binding.workspaceSessionId);
+    if (workspace.mode !== "worktree" || workspace.root !== root) return undefined;
+    return workspace;
   }
 
   private async findReusableCheckoutWorkspace(
@@ -258,6 +341,20 @@ export class WorkspaceRegistry {
 
   private conversationCheckoutTargetKey(projectKey: string): string {
     return JSON.stringify(["checkout", projectKey, null]);
+  }
+
+  private conversationWorktreeTargetKey(sourceRoot: string, baseSha: string): string {
+    return JSON.stringify(["worktree", canonicalizePath(sourceRoot), baseSha]);
+  }
+
+  private assertManagedWorktreeSourceNotNested(path: string): void {
+    const requested = canonicalizePath(assertAllowedPath(path, this.config.allowedRoots));
+    const worktreeRoot = canonicalizePath(this.config.worktreeRoot);
+    if (isPathInsideRoot(requested, worktreeRoot)) {
+      throw new Error(
+        "A DevSpace-managed worktree cannot be used as the source for another managed worktree. Re-open the owning source repository instead.",
+      );
+    }
   }
 
   private async reusedWorkspaceContext(workspace: Workspace): Promise<WorkspaceContext> {
@@ -390,6 +487,11 @@ export class WorkspaceRegistry {
         `Unknown workspaceId: ${workspaceId}. Open the target project or worktree again and continue with the new workspaceId.`,
       );
     }
+    if (session.status !== "active") {
+      throw new Error(
+        `Workspace ${workspaceId} is not active (status=${session.status}) and cannot be restored.`,
+      );
+    }
 
     const root = this.assertWorkspaceRootAllowed(session.root, session.mode, session.sourceRoot);
     const restoredWorkspace: Workspace = {
@@ -424,6 +526,16 @@ export class WorkspaceRegistry {
 
   listConversationBindings(): WorkspaceConversationBinding[] {
     return this.store?.listConversationBindings?.() ?? [];
+  }
+
+  claimDurableSessionForGc(workspaceId: string, expectedLastUsedAt: string): void {
+    const claimed = this.store?.claimSessionForGc?.(workspaceId, expectedLastUsedAt);
+    if (claimed !== true) {
+      throw new Error(
+        `STORAGE_PLAN_STALE: workspace ${workspaceId} was reused, changed state, or disappeared after inventory.`,
+      );
+    }
+    this.workspaces.delete(workspaceId);
   }
 
   assertDurableSessionUnloaded(workspaceId: string): void {
