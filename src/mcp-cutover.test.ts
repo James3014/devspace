@@ -555,6 +555,14 @@ test("#386: cutover fencing is deployment-effect scoped while unrelated mutation
       broadWorkspaceMutation: true,
       protectedPaths: [stateDir],
     }), /CUTOVER_RECONCILIATION_REQUIRED/);
+    assert.throws(() => old.assertToolAllowed("host_operation_start", {
+      mutationPaths: [join(stateDir, "host-effect.txt")],
+      protectedPaths: [stateDir],
+    }), /CUTOVER_RECONCILIATION_REQUIRED/);
+    assert.doesNotThrow(() => old.assertToolAllowed("host_operation_start", {
+      mutationPaths: [join(dirname(stateDir), "other-host-effect.txt")],
+      protectedPaths: [stateDir],
+    }));
 
     // Known control/read tools remain reachable so the exact deployment effect
     // can be reconciled or terminalized.

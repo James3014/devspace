@@ -9351,6 +9351,18 @@ export function createServer(
 
     try {
       if (
+        toolName === "workspace_copy_file" &&
+        typeof args.destinationWorkspaceId === "string" &&
+        typeof args.destinationPath === "string"
+      ) {
+        const destinationWorkspace = workspaces.getWorkspace(args.destinationWorkspaceId);
+        return {
+          protectedPaths,
+          mutationPaths: [workspaces.resolvePath(destinationWorkspace, args.destinationPath)],
+        };
+      }
+
+      if (
         workspaceId &&
         (toolName === toolNames.write || toolName === toolNames.edit) &&
         typeof args.path === "string"
@@ -9378,6 +9390,19 @@ export function createServer(
           protectedPaths,
           mutationPaths: [resolve(args.destination)],
         };
+      }
+
+      if (toolName === "host_operation_start") {
+        const allowedPaths = args.allowedPaths;
+        if (allowedPaths && typeof allowedPaths === "object" && !Array.isArray(allowedPaths)) {
+          const writePaths = (allowedPaths as { write?: unknown }).write;
+          if (Array.isArray(writePaths) && writePaths.every((path) => typeof path === "string")) {
+            return {
+              protectedPaths,
+              mutationPaths: writePaths.map((path) => resolve(path)),
+            };
+          }
+        }
       }
 
       if (workspaceId && CONSEQUENTIAL_MCP_TOOLS.has(toolName)) {
