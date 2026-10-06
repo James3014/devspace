@@ -3590,7 +3590,8 @@ test("gitCandidates enabled: git tools are present with schema validation", asyn
 
   assert.equal(pushTool.annotations?.readOnlyHint, false);
   assert.equal(pushTool.annotations?.destructiveHint, true);
-  assert.equal(pushTool.annotations?.idempotentHint, false);
+  assert.equal(pushTool.annotations?.idempotentHint, true);
+  assert.ok(pushProps.attemptKey);
   assert.equal(pushTool.annotations?.openWorldHint, true);
 
   // Open workspace in default checkout mode
@@ -3643,7 +3644,7 @@ test("Git publication and integration sinks require Core binding and provenance"
 
   const push = await context.client.callTool({
     name: "git_push",
-    arguments: { workspaceId, expectedHead: commitSha, remote: "origin", branch: "direct-branch" },
+    arguments: { workspaceId, attemptKey: "direct-push", expectedHead: commitSha, remote: "origin", branch: "direct-branch" },
     _meta: conversation,
   });
   assert.equal(push.isError, undefined, responseText(push));
@@ -3738,6 +3739,7 @@ test("Core-bound structured write forms and publishes physical Candidate provena
     name: "git_push",
     arguments: {
       workspaceId,
+      attemptKey: "core-positive-push",
       expectedHead: candidate.commitSha,
       remote: "origin",
       branch: "core-positive",
@@ -3859,6 +3861,7 @@ test("terminal Core Candidate can be published by a later exact Candidate-bound 
     name: "git_push",
     arguments: {
       workspaceId,
+      attemptKey: "terminal-publication-push",
       expectedHead: candidateHead,
       remote: "origin",
       branch: "terminal-publication",
@@ -3961,6 +3964,7 @@ test("terminal Candidate publication rejects a session bound to a different HEAD
     name: "git_push",
     arguments: {
       workspaceId,
+      attemptKey: "publication-mismatch-push",
       expectedHead: candidateHead,
       remote: "origin",
       branch: "must-not-publish",
@@ -4027,7 +4031,7 @@ test("pre-push hook scope escape reports confirmed remote effect and blocks retr
 
   const pushed = await context.client.callTool({
     name: "git_push",
-    arguments: { workspaceId, expectedHead: candidateHead, remote: "origin", branch: "hook-escape" },
+    arguments: { workspaceId, attemptKey: "hook-escape-push", expectedHead: candidateHead, remote: "origin", branch: "hook-escape" },
     _meta: conversation,
   });
   assert.equal(pushed.isError, true);
@@ -4037,7 +4041,7 @@ test("pre-push hook scope escape reports confirmed remote effect and blocks retr
   assert.equal(remoteHead, candidateHead, "remote readback proves push completed before scope escape was reported");
   assert.equal(context.coreMutationSessions!.getById(bound.session.id)?.rebindState, "REBIND_REQUIRED");
 
-  const retry = await context.client.callTool({ name: "git_push", arguments: { workspaceId, expectedHead: candidateHead, remote: "origin", branch: "hook-escape" }, _meta: conversation });
+  const retry = await context.client.callTool({ name: "git_push", arguments: { workspaceId, attemptKey: "hook-escape-push", expectedHead: candidateHead, remote: "origin", branch: "hook-escape" }, _meta: conversation });
   assert.equal(retry.isError, true);
   assert.match(responseText(retry), /CORE_MUTATION_REBIND_REQUIRED/);
 });
@@ -4085,12 +4089,12 @@ test("failing pre-push hook scope escape takes Core precedence with confirmed no
   assert.equal(commit.isError, undefined, responseText(commit));
   const candidateHead = structuredContent(commit).commitSha as string;
   await installGitHook(workspaceRoot, "pre-push", "printf 'escape\\n' > prepush-hook-escape.txt\nexit 19");
-  const result = await context.client.callTool({ name: "git_push", arguments: { workspaceId, expectedHead: candidateHead, remote: "origin", branch: "failing-hook" }, _meta: conversation });
+  const result = await context.client.callTool({ name: "git_push", arguments: { workspaceId, attemptKey: "failing-hook-push", expectedHead: candidateHead, remote: "origin", branch: "failing-hook" }, _meta: conversation });
   assert.equal(result.isError, true);
   assert.match(responseText(result), /CORE_MUTATION_POST_EFFECT_SCOPE_ESCAPE.*prepush-hook-escape\.txt/is);
   assert.equal((await execFileAsync("git", ["ls-remote", "--heads", bare, "refs/heads/failing-hook"])).stdout.trim(), "");
   assert.equal(context.coreMutationSessions!.getById(bound.session.id)?.rebindState, "REBIND_REQUIRED");
-  const retry = await context.client.callTool({ name: "git_push", arguments: { workspaceId, expectedHead: candidateHead, remote: "origin", branch: "failing-hook" }, _meta: conversation });
+  const retry = await context.client.callTool({ name: "git_push", arguments: { workspaceId, attemptKey: "failing-hook-push", expectedHead: candidateHead, remote: "origin", branch: "failing-hook" }, _meta: conversation });
   assert.equal(retry.isError, true);
   assert.match(responseText(retry), /CORE_MUTATION_REBIND_REQUIRED/);
 });
@@ -4621,6 +4625,7 @@ test("git candidates tools - MCP managed worktree end-to-end integration test", 
     name: "git_push",
     arguments: {
       workspaceId,
+      attemptKey: "mcp-test-push",
       expectedHead: commitSha,
       remote: "origin",
       branch: "candidate/mcp-test-1",
@@ -7307,6 +7312,7 @@ test("Issue #338: Direct Coding canary completes open -> inspect -> edit -> test
     name: "git_commit",
     arguments: {
       workspaceId,
+      attemptKey: "canary-bad-head-push",
       expectedHead: "0".repeat(40),
       message: "bad commit",
       paths: ["feature.js"],
@@ -7361,6 +7367,7 @@ test("Issue #338: Direct Coding canary completes open -> inspect -> edit -> test
     name: "git_push",
     arguments: {
       workspaceId,
+      attemptKey: "canary-default-branch-push",
       expectedHead: commitSha,
       remote: "origin",
       branch: "main",
@@ -7375,6 +7382,7 @@ test("Issue #338: Direct Coding canary completes open -> inspect -> edit -> test
     name: "git_push",
     arguments: {
       workspaceId,
+      attemptKey: "canary-valid-push",
       expectedHead: commitSha,
       remote: "origin",
       branch: "feat/canary-branch",

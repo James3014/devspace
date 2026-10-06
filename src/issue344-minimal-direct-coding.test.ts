@@ -700,6 +700,7 @@ test("Issue #344 - Criteria 6: end-to-end dogfood flow (open/sync -> inspect -> 
     name: "git_push",
     arguments: {
       workspaceId: wsId,
+      attemptKey: "issue344-dogfood-push",
       expectedHead: candidateHead,
       remote: "origin",
       branch: "feat/dogfood-pr",

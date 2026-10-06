@@ -4038,7 +4038,7 @@ export function createMcpServer(
       operationId: z.string(),
       attemptKey: z.string(),
       requestHash: z.string(),
-      kind: z.enum(["workspace_clone", "dependency_sync", "nexus_gateway_recover", "nexus_gateway_recovery_preflight", "nexus_gateway_recovery_materialize", "cutover_start", "host_operation", "chat_swarm_reconciliation"]),
+      kind: z.enum(["workspace_clone", "git_push", "dependency_sync", "nexus_gateway_recover", "nexus_gateway_recovery_preflight", "nexus_gateway_recovery_materialize", "cutover_start", "host_operation", "chat_swarm_reconciliation"]),
       authorityMode: z.enum(["OWNER_DIRECT", "NEXUS_GOVERNED"]),
       scopeRoot: z.string(),
       workspaceId: z.string().optional(),
@@ -7883,6 +7883,9 @@ export function createMcpServer(
           "Publish current Candidate HEAD from a managed DevSpace worktree to a non-default remote branch. Repository hooks remain enabled, so path-level prewrite containment is NOT_PROVEN and Core performs immediate physical post-effect reconciliation.",
         inputSchema: {
           workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
+          attemptKey: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/).describe(
+            "Stable publication-effect identity. Exact replay never re-pushes; after uncertainty reconcile the returned operationId.",
+          ),
           expectedHead: z
             .string()
             .regex(/^[0-9a-fA-F]{40}$/)
@@ -7897,17 +7900,22 @@ export function createMcpServer(
           remote: z.string(),
           branch: z.string(),
           pushedSha: z.string(),
+          operationId: z.string(),
+          attemptKey: z.string(),
           coreMutation: z.record(z.string(), z.unknown()).optional(),
         },
         _meta: {},
         annotations: {
           readOnlyHint: false,
           destructiveHint: true,
-          idempotentHint: false,
+          idempotentHint: true,
           openWorldHint: true,
         },
       },
-      async ({ workspaceId, expectedHead, remote, branch, resumableWork: p0Pointer }, extra) => {
+      async ({ workspaceId, attemptKey, expectedHead, remote, branch, resumableWork: p0Pointer }, extra) => {
+        if (!durableOperations) {
+          throw new Error("[DURABLE_OPERATION_STORE_REQUIRED] git_push requires the durable operation ledger.");
+        }
         const workspace = workspaces.getWorkspace(workspaceId);
         if (workspace.mode !== "worktree" || !workspace.worktree?.managed) {
           throw new Error(
@@ -7929,6 +7937,7 @@ export function createMcpServer(
           );
         }
         let pushed: Awaited<ReturnType<typeof pushCandidate>> | undefined;
+        let publication: DurableOperationRecord | undefined;
         let coreAdmission: CoreMutationAdmission | undefined;
         let coreCandidate: ReturnType<CoreMutationGuard["candidate"]> | undefined;
         let publicationContinuity: "PRODUCER_SESSION" | "TERMINAL_CANDIDATE_HANDOFF" | undefined;
@@ -7966,20 +7975,52 @@ export function createMcpServer(
               synchronousPostEffectCheck: true,
             });
           }
-          const result = await pushCandidate({
+          publication = await durableOperations.gitPush({
+            attemptKey,
+            workspaceId,
             workspaceRoot: workspace.root,
             expectedHead,
             remote,
             branch,
           });
-          pushed = result;
-          if (coreAdmission?.bound && coreMutationGuard) {
-            await coreMutationGuard.reconcileSynchronousEffect({
-              workspaceId,
-              extra,
-              pointer: { sessionId: coreAdmission.sessionId, bindingHash: coreAdmission.bindingHash },
-            });
+          if (publication.status === "succeeded") {
+            pushed = {
+              remote,
+              branch,
+              pushedSha: String(publication.receipt?.pushedSha ?? expectedHead),
+            };
           }
+          if (coreAdmission?.bound && coreMutationGuard) {
+            if (publication.status === "outcome_unknown") {
+              const physical = await coreMutationGuard.snapshot({
+                workspaceId,
+                extra,
+                pointer: { required: true, sessionId: coreAdmission.sessionId, bindingHash: coreAdmission.bindingHash },
+              });
+              const violation = synchronousGitViolation(physical, "push");
+              if (violation) {
+                throw new Error(
+                  `${violation.message} Git publication ${publication.operationId} remains outcome_unknown; reconcile both the Core session and the same publication operation before any retry.`,
+                );
+              }
+            } else {
+              await coreMutationGuard.reconcileSynchronousEffect({
+                workspaceId,
+                extra,
+                pointer: { sessionId: coreAdmission.sessionId, bindingHash: coreAdmission.bindingHash },
+              });
+            }
+          }
+          if (publication.status !== "succeeded") {
+            return {
+              content: [textBlock(
+                `${publication.errorCode ?? "GIT_PUBLICATION_NOT_SUCCEEDED"}: ${publication.errorMessage ?? `Git publication ${publication.operationId} is ${publication.status}.` } Reconcile publication ${publication.operationId} before any retry.`,
+              )],
+              isError: true,
+              structuredContent: publication as unknown as Record<string, unknown>,
+            };
+          }
+          const result = pushed!;
           return {
             content: [
               textBlock(`Successfully pushed ${result.pushedSha} to ${result.remote}/${result.branch}`),
@@ -7988,6 +8029,8 @@ export function createMcpServer(
               remote: result.remote,
               branch: result.branch,
               pushedSha: result.pushedSha,
+              operationId: publication.operationId,
+              attemptKey: publication.attemptKey,
               ...(coreCandidate
                 ? {
                     coreMutation: {
@@ -8038,6 +8081,13 @@ export function createMcpServer(
             throw new Error(`[${err.code}] ${err.message} ${evidence}`);
           }
           const code = err instanceof GitCandidateError ? err.code : "GIT_EXECUTION_ERROR";
+          if (err instanceof DurableOperationError && err.operation) {
+            return {
+              content: [textBlock(`${err.code}: ${err.message}`)],
+              isError: true,
+              structuredContent: err.operation as unknown as Record<string, unknown>,
+            };
+          }
           throw new Error(`[${code}] ${err.message}`);
         }
       },
