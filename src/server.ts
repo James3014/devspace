@@ -6281,7 +6281,10 @@ export function createMcpServer(
         inputSchema: {
           workspaceId: z.string().describe("Workspace identifier returned by open_workspace."),
           contractPurpose: z.string().min(1).max(512).describe(
-            "Stable purpose identity within the already-approved carrier goal. Repository, goal, base SHA, scope and expiry come only from that carrier.",
+            "Stable purpose identity within the already-approved writer goal. Repository, base SHA, scope and expiry come only from that authority.",
+          ),
+          carrierCredential: z.string().optional().describe(
+            "Optional credential for an already-approved writer authority when reconnecting on a fresh session. Rebinds only that exact authority and never widens scope.",
           ),
         },
         outputSchema: {
@@ -6304,7 +6307,7 @@ export function createMcpServer(
           openWorldHint: false,
         },
       },
-      async ({ workspaceId, contractPurpose }, extra) => {
+      async ({ workspaceId, contractPurpose, carrierCredential }, extra) => {
         if (!workResumeStore || !carrierBindings) {
           throw new AgentSessionError(
             "INVALID_EXECUTION_CONTRACT",
@@ -6312,6 +6315,7 @@ export function createMcpServer(
           );
         }
         const context = dependencyConsumerContext(extra);
+        if (carrierCredential !== undefined) carrierBindings.redeem(context, carrierCredential);
         const carrier = carrierBindings.status(context);
         if (!carrier.contract.operations.includes("worktree_write")) {
           throw new AgentSessionError(
