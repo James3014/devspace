@@ -4539,7 +4539,7 @@ export function createMcpServer(
       registerAppTool(server,"coordination_pair",{...registration,title:"Request a carrier pairing",description:"Request explicit Owner approval for new bounded authority. Save the returned pendingId; an Owner-facing client may approve the exact contract with coordination_owner_approve before coordination_resume.",inputSchema:{}},async(_,extra)=>result(carrierBindings.requestPairing(dependencyConsumerContext(extra))));
       if (ownerApprovalReceipts) {
         const ownerApprovalRoots=[...config.allowedRoots,config.worktreeRoot];
-        const ownerApprovalPreview=(pendingId:string,contract:CarrierContract,extra:{authInfo?:{clientId:string;scopes:string[]};sessionId?:string},sameSession=true)=>{
+        const ownerApprovalPreview=(pendingId:string,contract:CarrierContract,extra:{authInfo?:{clientId:string;scopes:string[]};sessionId?:string},sameSession=true,reconcileApproved=false)=>{
           const context=dependencyConsumerContext(extra);
           const pending=ownerApprovalReceipts.pairing(pendingId);
           if(!pending) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","Pairing request not found");
@@ -4560,17 +4560,19 @@ export function createMcpServer(
             const approvedJson=JSON.stringify(approved.contract);
             const approvedHash=createHash("sha256").update(approvedJson).digest("hex");
             if(approvedHash!==contractHash) return {status:"CONTRACT_MISMATCH" as const,pendingId,contractHash,approvedContractHash:approvedHash,expiresAt:new Date(pending.expiresAtMs).toISOString(),canonical};
-            const receipt=ownerApprovalReceipts.reconcileApproved({
-              pendingId,
-              clientId:pending.clientId,
-              sessionId:pending.sessionId,
-              contractHash,
-              contractJson,
-              expiresAtMs:Math.min(pending.expiresAtMs,Date.parse(canonical.expiresAt)),
-              carrierId:approved.id,
-            });
-            if(receipt.status==="CONTRACT_MISMATCH") return {status:"CONTRACT_MISMATCH" as const,pendingId,contractHash,expectedContractHash:receipt.contractHash,expiresAt:new Date(receipt.expiresAtMs).toISOString(),canonical};
-            return {status:"ALREADY_APPROVED_SAME_CONTRACT" as const,pendingId,contractHash,carrierId:approved.id,expiresAt:new Date(receipt.expiresAtMs).toISOString(),canonical};
+            const receipt=reconcileApproved
+              ? ownerApprovalReceipts.reconcileApproved({
+                  pendingId,
+                  clientId:pending.clientId,
+                  sessionId:pending.sessionId,
+                  contractHash,
+                  contractJson,
+                  expiresAtMs:Math.min(pending.expiresAtMs,Date.parse(canonical.expiresAt)),
+                  carrierId:approved.id,
+                })
+              : existingReceipt;
+            if(receipt?.status==="CONTRACT_MISMATCH") return {status:"CONTRACT_MISMATCH" as const,pendingId,contractHash,expectedContractHash:receipt.contractHash,expiresAt:new Date(receipt.expiresAtMs).toISOString(),canonical};
+            return {status:"ALREADY_APPROVED_SAME_CONTRACT" as const,pendingId,contractHash,carrierId:approved.id,expiresAt:new Date(receipt?.expiresAtMs??Math.min(pending.expiresAtMs,Date.parse(canonical.expiresAt))).toISOString(),canonical};
           }
           if(existingReceipt?.status==="REJECTED") return {status:"REJECTED" as const,pendingId,contractHash,expiresAt:new Date(existingReceipt.expiresAtMs).toISOString(),canonical};
           if(existingReceipt?.status==="EXPIRED" || pending.expired) return {status:"EXPIRED" as const,pendingId,contractHash,expiresAt:new Date(existingReceipt?.expiresAtMs??pending.expiresAtMs).toISOString(),canonical};
@@ -4583,8 +4585,27 @@ export function createMcpServer(
         registerAppTool(server,"coordination_owner_approval_status",{...registration,annotations:{...registration.annotations,readOnlyHint:true,idempotentHint:true},title:"Read Owner carrier approval status",description:"Read durable pending/approved/rejected/expired approval state for one pairing from the authenticated OAuth client. Does not bind the current session or grant authority.",inputSchema:{pendingId:z.string()}},async({pendingId},extra)=>{
           const context=dependencyConsumerContext(extra);
           const receipt=ownerApprovalReceipts.read(pendingId);
+          const pending=ownerApprovalReceipts.pairing(pendingId);
           if(receipt) {
             if(receipt.clientId!==context.clientId) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","Approval receipt belongs to a different authenticated client");
+            if(pending?.carrierId) {
+              const approved=carrierBindings.inspectLocal(pending.carrierId);
+              const approvedJson=JSON.stringify(approved.contract);
+              const approvedHash=createHash("sha256").update(approvedJson).digest("hex");
+              if(approvedHash!==receipt.contractHash || approvedJson!==receipt.contractJson) {
+                return result({status:"CONTRACT_MISMATCH",pendingId,contractHash:receipt.contractHash,approvedContractHash:approvedHash,expiresAt:new Date(receipt.expiresAtMs).toISOString()});
+              }
+              const reconciled=ownerApprovalReceipts.reconcileApproved({
+                pendingId,
+                clientId:pending.clientId,
+                sessionId:pending.sessionId,
+                contractHash:receipt.contractHash,
+                contractJson:receipt.contractJson,
+                expiresAtMs:receipt.expiresAtMs,
+                carrierId:approved.id,
+              });
+              return result({status:"APPROVED",pendingId,contractHash:reconciled.contractHash,carrierId:approved.id,expiresAt:new Date(reconciled.expiresAtMs).toISOString(),decidedAt:reconciled.decidedAt});
+            }
             return result({
               status:receipt.status,
               pendingId,
@@ -4594,7 +4615,6 @@ export function createMcpServer(
               decidedAt:receipt.decidedAt,
             });
           }
-          const pending=ownerApprovalReceipts.pairing(pendingId);
           if(!pending || pending.clientId!==context.clientId) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","Pairing request not found");
           if(pending.carrierId) {
             const approved=carrierBindings.inspectLocal(pending.carrierId);
@@ -4615,7 +4635,7 @@ export function createMcpServer(
         });
         registerAppTool(server,"coordination_owner_approve",{...registration,title:"Request explicit Owner carrier approval",description:"Ask the connected human Owner to approve one exact pending carrier contract through MCP elicitation. Tool arguments alone cannot approve it; decline, cancel, unsupported elicitation, drift, or expiry grants no authority.",inputSchema:{pendingId:z.string(),contract:ownerContractSchema}},async({pendingId,contract},extra)=>{
           const exact=contract as CarrierContract;
-          const preview=ownerApprovalPreview(pendingId,exact,extra);
+          const preview=ownerApprovalPreview(pendingId,exact,extra,true,true);
           if(preview.status!=="PENDING_OWNER_APPROVAL") return result({...preview,canonical:undefined,contractJson:undefined,expiresAtMs:undefined});
           const context=dependencyConsumerContext(extra);
           const receipt=ownerApprovalReceipts.ensurePending({
