@@ -210,6 +210,27 @@ test("symbolic HEAD worktree reuse is fenced by the resolved base SHA", async (t
   assert.notEqual(second.workspace.worktree?.baseSha, first.workspace.worktree?.baseSha);
 });
 
+test("GC claim uses last-used CAS and makes the claimed workspace non-restorable", async (t) => {
+  const context = await fixture(t, { git: true });
+  const opened = await context.registry.openWorkspace(
+    { path: context.project, mode: "worktree" },
+    { conversationScopeId: "chat-gc-cas" },
+  );
+  const workspaceId = opened.workspace.id;
+  const session = context.store.getSession(workspaceId);
+  assert.ok(session);
+
+  assert.throws(
+    () => context.registry.claimDurableSessionForGc(workspaceId, "2000-01-01T00:00:00.000Z"),
+    /STORAGE_PLAN_STALE/,
+  );
+  assert.equal(context.store.getSession(workspaceId)?.status, "active");
+
+  context.registry.claimDurableSessionForGc(workspaceId, session.lastUsedAt);
+  assert.equal(context.store.getSession(workspaceId)?.status, "gc_pending");
+  assert.throws(() => context.registry.getWorkspace(workspaceId), /not active/);
+});
+
 test("managed worktree reuse survives a registry restart", async (t) => {
   const context = await fixture(t, { git: true });
   const input = { path: context.project, mode: "worktree" as const };
