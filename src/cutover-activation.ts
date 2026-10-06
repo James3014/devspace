@@ -264,6 +264,7 @@ function materializeRelease(
         recursive: true,
         dereference: false,
         preserveTimestamps: true,
+        verbatimSymlinks: true,
       });
     }
 
