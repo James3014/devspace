@@ -272,18 +272,25 @@ test("real HTTP clients sharing OAuth pair independently, delegate, resume, exec
     // the same physical workspace, and rediscover/reprepare the same work key.
     // This must rendezvous to the existing lease rather than create a writer.
     const p0Reconnect=await connect("p0-reconnect");
-    data(await p0Reconnect.callTool({name:"coordination_resume",arguments:{credential:pending.credential}}));
     const p0Opened=data(await p0Reconnect.callTool({name:"open_workspace",arguments:{path:project,mode:"checkout"}}));
+    assert.equal((await p0Reconnect.callTool({
+      name:"work_resume_prepare",
+      arguments:{workspaceId:p0Opened.workspaceId,contractPurpose:"carrier-http-p0"},
+    })).isError,true);
+    assert.equal((await p0Reconnect.callTool({
+      name:"work_resume_prepare",
+      arguments:{workspaceId:p0Opened.workspaceId,contractPurpose:"carrier-http-p0",carrierCredential:"x".repeat(43)},
+    })).isError,true);
+    const p0ReconnectPrepare=data(await p0Reconnect.callTool({
+      name:"work_resume_prepare",
+      arguments:{workspaceId:p0Opened.workspaceId,contractPurpose:"carrier-http-p0",carrierCredential:pending.credential},
+    }));
     const p0ReconnectStatus=data(await p0Reconnect.callTool({
       name:"work_resume_status",
       arguments:{workspaceId:p0Opened.workspaceId,workKey:p0Prepared.workKey},
     }));
     assert.equal(p0ReconnectStatus.leaseId,p0Prepared.leaseId);
     assert.equal(p0ReconnectStatus.disposition,"RUNNING");
-    const p0ReconnectPrepare=data(await p0Reconnect.callTool({
-      name:"work_resume_prepare",
-      arguments:{workspaceId:p0Opened.workspaceId,contractPurpose:"carrier-http-p0"},
-    }));
     assert.equal(p0ReconnectPrepare.workKey,p0Prepared.workKey);
     assert.equal(p0ReconnectPrepare.leaseId,p0Prepared.leaseId);
     assert.equal(p0ReconnectPrepare.leaseVersion,p0Prepared.leaseVersion);
