@@ -2418,13 +2418,13 @@ function registerCutoverMcpTools(
         annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false },
       },
       async ({ cutoverId, buildReady, carrierCredential }, extra) => {
-        ensureCutoverActivationBound(cutoverId);
+        const activationBinding=ensureCutoverActivationBound(cutoverId);
         if(control.controller.record()?.coordinationBinding) {
           if(!durableOperations) throw new ControlPlaneOwnershipError("AUTHORITY_REQUIRED","restart requires trusted coordination");
           const context=dependencyConsumerContext(extra);
           if(carrierCredential!==undefined && carrierBindings) carrierBindings.redeem(context,carrierCredential);
           const actuator=control.restartSelf!;
-          const outcome=await durableOperations.restartCutover(cutoverId,control.controller.currentIdentity,buildReady,control.probeBuildReady??(async()=>({buildReady:true,detail:"trusted attestation only"})),actuator,context);
+          const outcome=await durableOperations.restartCutover(cutoverId,control.controller.currentIdentity,buildReady,control.probeBuildReady??(async()=>({buildReady:true,detail:"trusted attestation only"})),actuator,context,activationBinding);
           return {content:[textBlock("Restart scheduling intent is recorded; execution remains unconfirmed and must not be replayed.")],structuredContent:{cutover:outcome.record as unknown as Record<string,unknown>,mode:control.controller.mode(),restart:{scheduled:outcome.scheduled,alreadyRequested:!outcome.scheduled,scheduleBlocked:false,actuator:"launchd-self" as const,serviceLabel:actuator.serviceLabel,launchdTarget:actuator.launchdTarget}}};
         }
         const request = control.controller.requestRestart(cutoverId, buildReady);
