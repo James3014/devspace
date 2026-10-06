@@ -6356,6 +6356,39 @@ test("#386: real server /mcp keeps unrelated workspace mutation usable during dr
     assert.equal(evidenceWriteJson.error?.code, -32002);
     assert.match(evidenceWriteJson.error?.message ?? "", /CUTOVER_RECONCILIATION_REQUIRED/);
 
+    const evidenceCopyRes = await fetch(mcpUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${testAccessToken}`,
+        "mcp-session-id": session2Id,
+        "Accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 124,
+        method: "tools/call",
+        params: {
+          name: "workspace_copy_file",
+          arguments: {
+            sourceWorkspaceId: projectWorkspaceId,
+            sourcePath: "unrelated.txt",
+            destinationWorkspaceId: rootWorkspaceId,
+            destinationPath: ".state/reconciliation-copy.txt",
+            expectedDestinationAbsent: true,
+          },
+        },
+      }),
+    });
+    assert.equal(
+      evidenceCopyRes.status,
+      409,
+      "workspace_copy_file must not mutate cutover evidence through a destination-only workspace id",
+    );
+    const evidenceCopyJson = (await parseMcpResponse(evidenceCopyRes)) as { error?: { code?: number; message?: string } };
+    assert.equal(evidenceCopyJson.error?.code, -32002);
+    assert.match(evidenceCopyJson.error?.message ?? "", /CUTOVER_RECONCILIATION_REQUIRED/);
+
     // 6. A release-retention mutation can destroy exact deployment evidence,
     // so it stays fenced before its own handler sees the request.
     const gcRes = await fetch(mcpUrl, {
