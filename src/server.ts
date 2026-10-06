@@ -130,6 +130,10 @@ import {
 import { ChatSwarmMigrationCoordinator, chatSwarmMigrationOperationId } from "./chat-swarm-migration.js";
 import { HostOperationError, HostOperationRegistrar } from "./host-operations.js";
 import {
+  hostOperationExternalOutputSchema,
+  readExternalHostOperationStatus,
+} from "./host-operation-external.js";
+import {
   CodexGoalSessionManager,
   type CodexGoalState,
 } from "./codex-goal-sessions.js";
@@ -479,6 +483,7 @@ const DIRECT_DISPATCH_TOOL_NAMES = new Set<string>([
   "agent_reconcile",
   "agent_cancel",
   "agent_list",
+  "host_operation_external_status",
 ]);
 
 const workspaceIdDescription =
@@ -3730,6 +3735,39 @@ export function createMcpServer(
           ),
         ],
         structuredContent: { result: result as unknown as Record<string, unknown> },
+      };
+    },
+  );
+
+  registerAppTool(
+    server,
+    "host_operation_external_status",
+    {
+      title: "Host operation external status",
+      description:
+        "Bounded read-only projection of externally created durable host operations and residual lease state. Reads only through registered canonical journals; does not widen workspace roots, dispatch, retry, or mutate state.",
+      inputSchema: {
+        kind: z.literal("nexus_agy").default("nexus_agy").describe("Canonical operation backend kind (default: nexus_agy)."),
+        operation_id: z.string().optional().describe("Durable operation ID (e.g. agyop_...)"),
+        operationId: z.string().optional().describe("Durable operation ID (e.g. agyop_...)"),
+      },
+      outputSchema: hostOperationExternalOutputSchema,
+      _meta: {},
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (input) => {
+      const opId = input.operation_id ?? input.operationId;
+      if (!opId) {
+        throw new Error("Missing required argument: operation_id or operationId");
+      }
+      const result = await readExternalHostOperationStatus(opId, {
+        kind: input.kind,
+        operationRoot: config.nexusAgyOperationRoot,
+        leasesDir: config.nexusAgyLeasesDir,
+      });
+      return {
+        content: [textBlock(JSON.stringify(result, null, 2))],
+        structuredContent: result as unknown as Record<string, unknown>,
       };
     },
   );
