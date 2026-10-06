@@ -5386,7 +5386,7 @@ export function createMcpServer(
           .string()
           .regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/)
           .describe(
-            "Required physical-workspace-scoped command execution identity. Establish before spawn so transport failures (e.g. 502/timeouts) can be safely reconciled. Exact request replays reuse the existing running or completed command session; conflicting reuse fails closed. After transport uncertainty, use command_status with this attemptKey; do not issue a new attemptKey to retry an uncertain execution.",
+            "Required physical-workspace-scoped command execution identity. Establish before spawn so transport failures (e.g. 502/timeouts) can be safely reconciled. Exact request replays reuse the existing running or retained completed command session; conflicting reuse fails closed. After terminal evidence retention expires, the attempt remains consumed and fails closed instead of spawning again. Process-restart durability is not claimed for command sessions. After transport uncertainty, use command_status with this attemptKey; do not issue a new attemptKey to retry an uncertain execution.",
           ),
         yieldTimeMs: z
           .number()
