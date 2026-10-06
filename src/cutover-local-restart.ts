@@ -69,6 +69,7 @@ function record(value: unknown): Record<string, unknown> {
 export function parseLiveCutoverHealth(value: unknown): LiveCutoverHealth {
   const root=record(value), build=record(root.build), capability=record(root.capabilityManifest), mcp=record(root.mcp);
   const sourceCommit=build.source_commit, buildId=build.build_id, pid=build.pid;
+  const releaseSha256=build.release_sha256, releasePath=build.release_path, activationCutoverId=build.activation_cutover_id;
   const capabilityManifestSha256=capability.manifestSha256;
   const serverInstanceId=mcp.serverInstanceId, cutoverMode=mcp.cutoverMode;
   const reconciliationRequired=mcp.reconciliationRequired;
@@ -76,6 +77,9 @@ export function parseLiveCutoverHealth(value: unknown): LiveCutoverHealth {
     typeof buildId!=="string" || !buildId ||
     !Number.isSafeInteger(pid) || (pid as number)<=0 ||
     typeof capabilityManifestSha256!=="string" || !/^[a-f0-9]{64}$/.test(capabilityManifestSha256) ||
+    (releaseSha256!==undefined && (typeof releaseSha256!=="string" || !/^[a-f0-9]{64}$/.test(releaseSha256))) ||
+    (releasePath!==undefined && (typeof releasePath!=="string" || !releasePath.startsWith("/"))) ||
+    (activationCutoverId!==undefined && (typeof activationCutoverId!=="string" || !activationCutoverId)) ||
     typeof serverInstanceId!=="string" || !serverInstanceId ||
     typeof cutoverMode!=="string" || typeof reconciliationRequired!=="boolean") {
     throw new CutoverStateError("Live DevSpace health payload lacks exact runtime identity.");
@@ -86,6 +90,9 @@ export function parseLiveCutoverHealth(value: unknown): LiveCutoverHealth {
       sourceCommit,
       buildId,
       capabilityManifestSha256,
+      ...(typeof releaseSha256==="string" ? {releaseSha256} : {}),
+      ...(typeof releasePath==="string" ? {releasePath} : {}),
+      ...(typeof activationCutoverId==="string" ? {activationCutoverId} : {}),
     },
     pid:pid as number,
     cutoverMode,
