@@ -1,7 +1,8 @@
 #!/usr/bin/env node
-import { existsSync, lstatSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync, realpathSync, unlinkSync, writeFileSync } from "node:fs";
 import { randomBytes } from "node:crypto";
 import { CarrierBindingStore, type CarrierContract } from "./carrier-binding.js";
+import { hashReleaseTree } from "./cutover-activation.js";
 import { canonicalizePath, isPathInsideRoot } from "./roots.js";
 import { createRequire } from "node:module";
 import { stdin as input, stdout as output } from "node:process";
@@ -858,6 +859,10 @@ async function runCutoverCommand(args: string[]): Promise<void> {
     await runCutoverCapabilityMismatchRecovery(args.slice(1));
     return;
   }
+  if (subcommand === "recover-failed-activation") {
+    await runCutoverFailedActivationRecovery(args.slice(1));
+    return;
+  }
   if (subcommand === "recover-unexpected-replacement") {
     await runCutoverUnexpectedReplacementRecovery(args.slice(1));
     return;
@@ -874,7 +879,7 @@ async function runCutoverCommand(args: string[]): Promise<void> {
     printCutoverHelp();
     return;
   }
-  throw new Error("Usage: devspace cutover <status|recover|observe|repair|abort-expired-prepared|recover-expired-drained|recover-capability-mismatch|recover-unexpected-replacement|restart-bound|release-terminal-lease>");
+  throw new Error("Usage: devspace cutover <status|recover|observe|repair|abort-expired-prepared|recover-expired-drained|recover-capability-mismatch|recover-failed-activation|recover-unexpected-replacement|restart-bound|release-terminal-lease>");
 }
 
 function printCutoverHelp(): void {
@@ -890,6 +895,7 @@ function printCutoverHelp(): void {
       "  devspace cutover abort-expired-prepared --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--json]",
       "  devspace cutover recover-expired-drained --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --confirm <id> [--json]",
       "  devspace cutover recover-capability-mismatch --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --package-root <path> --confirm <id> [--json]",
+      "  devspace cutover recover-failed-activation --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --package-root <path> --confirm <id> [--json]",
       "  devspace cutover recover-unexpected-replacement --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --package-root <path> --confirm <id> [--json]",
       "  devspace cutover restart-bound --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --credential-file <owner-private-intent.json> --package-root <path> --confirm <id> [--json]",
       "  devspace cutover release-terminal-lease --cutover-id <id> --lease-id <id> --lease-version <n> --carrier <id> --carrier-version <n> --terminal-record-hash <sha256> --confirm <id> [--json]",
@@ -1405,6 +1411,137 @@ async function runCutoverCapabilityMismatchRecovery(args: string[]): Promise<voi
     }
     console.log(
       `Recovered failed capability expectation cutover ${result.cutover.cutoverId}: phase=${result.cutover.phase}; lease=${result.lease.terminalState}; replayed=${String(result.replayed)}`,
+    );
+  } finally {
+    bindings.close();
+  }
+}
+
+async function runCutoverFailedActivationRecovery(args: string[]): Promise<void> {
+  let cutoverId: string | undefined;
+  let carrierId: string | undefined;
+  let version: number | undefined;
+  let validityVersion: number | undefined;
+  let confirmCutoverId: string | undefined;
+  let packageRoot: string | undefined;
+  let json = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    const value = (): string => {
+      const next = args[++index];
+      if (!next) throw new Error(`${argument} requires a value.`);
+      return next;
+    };
+    if (argument === "--json") json = true;
+    else if (argument === "--cutover-id") cutoverId = value();
+    else if (argument === "--carrier") carrierId = value();
+    else if (argument === "--version") version = Number(value());
+    else if (argument === "--validity-version") validityVersion = Number(value());
+    else if (argument === "--confirm") confirmCutoverId = value();
+    else if (argument === "--package-root") packageRoot = resolve(value());
+    else throw new Error(`Unknown cutover recover-failed-activation flag: ${argument}`);
+  }
+  if (!cutoverId || !carrierId || !Number.isSafeInteger(version) || !Number.isSafeInteger(validityVersion) ||
+      (version ?? 0) < 1 || (validityVersion ?? 0) < 1 || confirmCutoverId !== cutoverId || !packageRoot) {
+    throw new Error("Usage: devspace cutover recover-failed-activation --cutover-id <id> --carrier <id> --version <n> --validity-version <n> --package-root <path> --confirm <id> [--json]");
+  }
+
+  const config = loadConfig();
+  if (!["127.0.0.1", "localhost", "::1"].includes(config.host)) {
+    throw new Error("Failed activation recovery requires a loopback DevSpace host.");
+  }
+  const response = await fetch(new URL("/healthz", `http://${config.host}:${config.port}`), { redirect: "error" });
+  if (!response.ok) throw new Error(`DevSpace /healthz failed with HTTP ${response.status}.`);
+  const health = await response.json() as {
+    ok?: unknown;
+    build?: {
+      source_commit?: unknown;
+      build_id?: unknown;
+      release_sha256?: unknown;
+      release_path?: unknown;
+      activation_cutover_id?: unknown;
+    };
+    capabilityManifest?: { manifestSha256?: unknown; missing?: unknown };
+    mcp?: { serverInstanceId?: unknown; cutoverMode?: unknown; reconciliationRequired?: unknown };
+  };
+  const sourceCommit = health.build?.source_commit;
+  const buildId = health.build?.build_id;
+  const releaseSha256 = health.build?.release_sha256;
+  const releasePath = health.build?.release_path;
+  const activationCutoverId = health.build?.activation_cutover_id;
+  const capabilityManifestSha256 = health.capabilityManifest?.manifestSha256;
+  const serverInstanceId = health.mcp?.serverInstanceId;
+  if (
+    health.ok !== true ||
+    typeof sourceCommit !== "string" || !/^[0-9a-f]{40}$/.test(sourceCommit) ||
+    typeof buildId !== "string" || !buildId ||
+    typeof capabilityManifestSha256 !== "string" || !/^[0-9a-f]{64}$/.test(capabilityManifestSha256) ||
+    typeof serverInstanceId !== "string" || !serverInstanceId ||
+    (releaseSha256 !== undefined && (typeof releaseSha256 !== "string" || !/^[0-9a-f]{64}$/.test(releaseSha256))) ||
+    (releasePath !== undefined && (typeof releasePath !== "string" || !releasePath.startsWith("/"))) ||
+    (activationCutoverId !== undefined && (typeof activationCutoverId !== "string" || !activationCutoverId)) ||
+    !Array.isArray(health.capabilityManifest?.missing) || health.capabilityManifest.missing.length !== 0 ||
+    health.mcp?.cutoverMode !== "reconcile-only" || health.mcp?.reconciliationRequired !== true
+  ) {
+    throw new Error("Live /healthz is not an exact reconciliation-required replacement runtime; refusing failed activation recovery.");
+  }
+
+  const activeCutover = new CutoverStateStore(config.stateDir).get();
+  if (!activeCutover || activeCutover.cutoverId !== cutoverId || activeCutover.phase !== "drained" ||
+      !activeCutover.restartRequest?.restartScheduledAt) {
+    throw new Error("Failed activation recovery requires the exact drained cutover with a consumed restart marker.");
+  }
+  const observedIdentity = {
+    serverInstanceId,
+    sourceCommit,
+    buildId,
+    capabilityManifestSha256,
+    ...(typeof releaseSha256 === "string" ? { releaseSha256 } : {}),
+    ...(typeof releasePath === "string" ? { releasePath } : {}),
+    ...(typeof activationCutoverId === "string" ? { activationCutoverId } : {}),
+  };
+  const sourceBuildCapabilityMatches =
+    sourceCommit === activeCutover.expectedNewIdentity.sourceCommit &&
+    buildId === activeCutover.expectedNewIdentity.buildId &&
+    (activeCutover.expectedNewIdentity.capabilityManifestSha256 === undefined ||
+      capabilityManifestSha256 === activeCutover.expectedNewIdentity.capabilityManifestSha256);
+  const releaseMatches = activeCutover.activationBinding === undefined || (
+    releaseSha256 === activeCutover.activationBinding.releaseSha256 &&
+    releasePath === activeCutover.activationBinding.releasePath &&
+    activationCutoverId === activeCutover.cutoverId
+  );
+  if (sourceBuildCapabilityMatches && releaseMatches) {
+    throw new Error("Live replacement matches the approved deployment target; use normal cutover completion.");
+  }
+
+  const canonicalPackageRoot = realpathSync.native(packageRoot);
+  const targetPackage = probeTargetPackage(canonicalPackageRoot);
+  if (targetPackage.sourceCommit !== sourceCommit || targetPackage.buildId !== buildId) {
+    throw new Error("Running package identity does not match the live observed replacement source/build; refusing failed activation recovery.");
+  }
+  if (typeof releasePath === "string" && realpathSync.native(releasePath) !== canonicalPackageRoot) {
+    throw new Error("Live release path does not match --package-root; refusing failed activation recovery.");
+  }
+  if (typeof releaseSha256 === "string" && hashReleaseTree(canonicalPackageRoot) !== releaseSha256) {
+    throw new Error("Live release digest does not match --package-root; refusing failed activation recovery.");
+  }
+
+  const bindings = new CarrierBindingStore(config.stateDir);
+  try {
+    const result = bindings.recoverFailedActivationLocal({
+      cutoverId,
+      carrierId,
+      expectedVersion: version as number,
+      expectedValidityVersion: validityVersion as number,
+      confirmCutoverId,
+      observedIdentity,
+    });
+    if (json) {
+      printJson(result);
+      return;
+    }
+    console.log(
+      `Recovered failed activation ${result.cutover.cutoverId}: phase=${result.cutover.phase}; lease=${result.lease.terminalState}; retryAllowed=${String(result.cutover.failedActivation?.retryAllowed)}; successorRequired=${String(result.cutover.failedActivation?.successorRequired)}; replayed=${String(result.replayed)}`,
     );
   } finally {
     bindings.close();

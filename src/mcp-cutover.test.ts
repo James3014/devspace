@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { CutoverStateStore } from "./cutover-state.js";
-import { CUTOVER_SAFE_TOOLS, CONSEQUENTIAL_MCP_TOOLS, McpCutoverController, type DurableReconciliationWitness } from "./mcp-cutover.js";
+import { CUTOVER_SAFE_TOOLS, CONSEQUENTIAL_MCP_TOOLS, classifyCutoverEffect, McpCutoverController, type DurableReconciliationWitness } from "./mcp-cutover.js";
 
 const identity = (serverInstanceId: string, sourceCommit: string, buildId: string, capability = "cap") => ({
   serverInstanceId,
@@ -23,16 +23,18 @@ test("old instance drains and replacement instance is reconcile-only across rest
     assert.deepEqual(old.record()?.coordinationBinding,binding);
     assert.equal(old.mode(), "drain");
     assert.doesNotThrow(() => old.assertToolAllowed("coordination_handoff_readback"));
-    assert.throws(() => old.assertToolAllowed("write"), /CUTOVER_RECONCILIATION_REQUIRED/);
-    assert.throws(() => old.assertToolAllowed("workspace_verify"), /CUTOVER_RECONCILIATION_REQUIRED/);
+    assert.doesNotThrow(() => old.assertToolAllowed("write"));
+    assert.doesNotThrow(() => old.assertToolAllowed("workspace_verify"));
     assert.doesNotThrow(() => old.assertToolAllowed("read"));
     assert.doesNotThrow(() => old.assertToolAllowed("cutover_status"));
     assert.doesNotThrow(() => old.assertToolAllowed("agent_status"));
     assert.doesNotThrow(() => old.assertToolAllowed("agent_reconcile"));
     assert.doesNotThrow(() => old.assertToolAllowed("remote_writability_probe"));
     for (const tool of ["chat_swarm_create", "chat_swarm_join", "chat_swarm_dispatch", "chat_swarm_close"]) {
-      assert.throws(() => old.assertToolAllowed(tool), /CUTOVER_RECONCILIATION_REQUIRED/);
+      assert.doesNotThrow(() => old.assertToolAllowed(tool));
     }
+    assert.throws(() => old.assertToolAllowed("storage_gc"), /CUTOVER_RECONCILIATION_REQUIRED/);
+    assert.throws(() => old.assertToolAllowed("deployment_activate_next"), /CUTOVER_RECONCILIATION_REQUIRED/);
     // `next` is admitted to the handler because it must distinguish a
     // worker's already-owned task from a new claim.
     assert.doesNotThrow(() => old.assertToolAllowed("chat_swarm_next"));
@@ -52,9 +54,10 @@ test("old instance drains and replacement instance is reconcile-only across rest
       () => replacement.recordDrain("cutover-one", { activeSessions: 0, oldestAgeMs: 0 }),
       /only the old server instance/i,
     );
-    assert.throws(() => replacement.assertToolAllowed("agent_start"), /CUTOVER_RECONCILIATION_REQUIRED/);
+    assert.doesNotThrow(() => replacement.assertToolAllowed("agent_start"));
     assert.throws(() => replacement.assertToolAllowed("bash"), /CUTOVER_RECONCILIATION_REQUIRED/);
-    assert.throws(() => replacement.assertToolAllowed("chat_swarm_create"), /CUTOVER_RECONCILIATION_REQUIRED/);
+    assert.doesNotThrow(() => replacement.assertToolAllowed("chat_swarm_create"));
+    assert.throws(() => replacement.assertToolAllowed("storage_gc"), /CUTOVER_RECONCILIATION_REQUIRED/);
     assert.doesNotThrow(() => replacement.assertToolAllowed("chat_swarm_next"));
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
@@ -350,7 +353,7 @@ test("recoverCutover rejects a closed cutover with no supersession lineage", asy
   }
 });
 
-test("Test 1 — reconnect during drain admits new transport, allows control tools, and blocks consequential mutation", () => {
+test("#386 reconnect during drain admits new transport, control tools, and unrelated independently-governed mutation", () => {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-mcp-reconnect-drain-"));
   try {
     const store = new CutoverStateStore(stateDir, { newId: () => "cutover-reconnect" });
@@ -375,20 +378,23 @@ test("Test 1 — reconnect during drain admits new transport, allows control too
     assert.doesNotThrow(() => old.assertToolAllowed("coordination_continuation_latest"));
     assert.doesNotThrow(() => old.assertToolAllowed("read"));
 
-    // Consequential mutations must remain blocked fail-closed
+    // Unrelated mutations remain governed by their own authority instead of
+    // inheriting a global deployment outage.
     const consequential = [
       "open_workspace", "workspace_clone", "write", "edit", "apply_patch",
-      "bash", "exec_command", "dependency_sync", "agent_start", "agent_continue",
+      "dependency_sync", "agent_start", "agent_continue",
       "codex_goal_start", "candidate_integrate", "git_commit", "git_push",
       "chat_swarm_create", "chat_swarm_join", "chat_swarm_dispatch",
     ];
     for (const tool of consequential) {
-      assert.throws(
-        () => old.assertToolAllowed(tool),
-        /CUTOVER_RECONCILIATION_REQUIRED/,
-        `Expected consequential tool ${tool} to be blocked during drain`,
-      );
+      assert.doesNotThrow(() => old.assertToolAllowed(tool));
     }
+    for (const tool of ["bash", "exec_command", "write_stdin"]) {
+      assert.equal(classifyCutoverEffect(tool), "DEPLOYMENT_CONFLICT");
+      assert.throws(() => old.assertToolAllowed(tool), /CUTOVER_RECONCILIATION_REQUIRED/);
+    }
+    assert.throws(() => old.assertToolAllowed("storage_gc"), /CUTOVER_RECONCILIATION_REQUIRED/);
+    assert.throws(() => old.assertToolAllowed("release_delete"), /CUTOVER_RECONCILIATION_REQUIRED/);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }
@@ -497,7 +503,7 @@ test("Test 7 (controller) — recoverCutover without witness fails closed", () =
   }
 });
 
-test("P0-1: unknown/newly-registered mutation tool fails closed during cutover, while known safe tools are allowed", () => {
+test("#386: cutover fencing is deployment-effect scoped while unrelated mutation keeps its own authority", () => {
   const stateDir = mkdtempSync(join(tmpdir(), "devspace-mcp-allowlist-"));
   try {
     const store = new CutoverStateStore(stateDir, { newId: () => "cutover-allowlist" });
@@ -506,22 +512,20 @@ test("P0-1: unknown/newly-registered mutation tool fails closed during cutover, 
 
     assert.equal(old.mode(), "drain");
 
-    // 1. Unknown / newly registered mutation tools MUST fail closed (not in allowlist)
-    const unknownTools = [
+    // Unknown / newly registered unrelated tools do not inherit deployment
+    // authority merely because they mutate something elsewhere.
+    const unrelatedTools = [
       "some_unregistered_mutation_tool",
-      "future_cloud_deploy_tool",
-      "arbitrary_exec_tool",
+      "future_workspace_mutation_tool",
       "delete_workspace_database",
     ];
-    for (const tool of unknownTools) {
-      assert.throws(
-        () => old.assertToolAllowed(tool),
-        /CUTOVER_RECONCILIATION_REQUIRED/,
-        `Expected unknown tool ${tool} to fail closed during drain`,
-      );
+    for (const tool of unrelatedTools) {
+      assert.equal(classifyCutoverEffect(tool), "INDEPENDENT");
+      assert.doesNotThrow(() => old.assertToolAllowed(tool));
     }
 
-    // 2. Known control/read tools in CUTOVER_SAFE_TOOLS MUST be allowed
+    // Known control/read tools remain reachable so the exact deployment effect
+    // can be reconciled or terminalized.
     assert.equal(CUTOVER_SAFE_TOOLS.has("coordination_recovery_request"), true);
     assert.equal(CONSEQUENTIAL_MCP_TOOLS.has("coordination_recovery_request"), false);
     for (const safeTool of CUTOVER_SAFE_TOOLS) {
@@ -531,13 +535,21 @@ test("P0-1: unknown/newly-registered mutation tool fails closed during cutover, 
       );
     }
 
-    // 3. Known consequential tools MUST be blocked
+    // Previously blanket-blocked workspace/Git/agent/process operations now
+    // stay governed by their own normal authority instead of this cutover.
     for (const consequentialTool of CONSEQUENTIAL_MCP_TOOLS) {
-      assert.throws(
-        () => old.assertToolAllowed(consequentialTool),
-        /CUTOVER_RECONCILIATION_REQUIRED/,
-        `Expected consequential tool ${consequentialTool} to be blocked during drain`,
-      );
+      if (classifyCutoverEffect(consequentialTool) === "DEPLOYMENT_CONFLICT") {
+        assert.throws(() => old.assertToolAllowed(consequentialTool), /CUTOVER_RECONCILIATION_REQUIRED/);
+      } else {
+        assert.doesNotThrow(() => old.assertToolAllowed(consequentialTool));
+      }
+    }
+
+    // Deployment/release namespaces and retention that can destroy exact
+    // deployment evidence remain fenced, including future unknown primitives.
+    for (const tool of ["storage_gc", "deployment_activate_next", "release_delete", "activation_switch", "cutover_future_mutation"]) {
+      assert.equal(classifyCutoverEffect(tool), "DEPLOYMENT_CONFLICT");
+      assert.throws(() => old.assertToolAllowed(tool), /CUTOVER_RECONCILIATION_REQUIRED/);
     }
 
     // 4. In normal mode, everything is allowed
@@ -547,6 +559,88 @@ test("P0-1: unknown/newly-registered mutation tool fails closed during cutover, 
     assert.doesNotThrow(() => normal.assertToolAllowed("some_unregistered_mutation_tool"));
     assert.doesNotThrow(() => normal.assertToolAllowed("bash"));
     assert.doesNotThrow(() => normal.assertToolAllowed("write"));
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("#386: consumed wrong-generation restart terminalizes as FAILED_ACTIVATION with retry permanently disabled", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-mcp-failed-activation-"));
+  try {
+    const store = new CutoverStateStore(stateDir, { newId: () => "cutover-failed-activation" });
+    const oldIdentity = identity("old-inst", "a".repeat(40), "old-build", "c".repeat(64));
+    const expected = { sourceCommit: "b".repeat(40), buildId: "target-build", capabilityManifestSha256: "d".repeat(64) };
+    const binding = { leaseId: "lease_failed", pinnedLeaseVersion: 2, operationHandle: "op_failed", requestHash: "e".repeat(64), ownerThread: "carrier_failed" };
+    const record = store.begin({ oldServerIdentity: oldIdentity, expectedNewIdentity: expected, coordinationBinding: binding });
+    store.recordDrain(record.cutoverId, { activeSessions: 0, oldestAgeMs: 0 });
+    store.recordRestartRequest(record.cutoverId, {
+      actuator: "launchd-self",
+      requestedByServerInstanceId: oldIdentity.serverInstanceId,
+      buildReady: { verifiedBy: "test", verifiedAt: new Date().toISOString() },
+    });
+    store.recordRestartScheduled(record.cutoverId, oldIdentity.serverInstanceId);
+
+    const observed = identity("replacement-inst", "f".repeat(40), "wrong-build", "c".repeat(64));
+    const recovered = store.recoverFailedActivation({ cutoverId: record.cutoverId, recoveredBy: binding.ownerThread, observedIdentity: observed });
+    assert.equal(recovered.newlyRecovered, true);
+    assert.equal(recovered.record.phase, "closed");
+    assert.equal(recovered.record.failedActivation?.terminalReason, "FAILED_ACTIVATION");
+    assert.equal(recovered.record.failedActivation?.restartConsumed, true);
+    assert.equal(recovered.record.failedActivation?.retryAllowed, false);
+    assert.equal(recovered.record.failedActivation?.successorRequired, true);
+    assert.deepEqual(recovered.record.failedActivation?.approvedTarget, expected);
+    assert.deepEqual(recovered.record.failedActivation?.observedIdentity, observed);
+    assert.ok(recovered.record.restartRequest?.restartScheduledAt);
+
+    const current = new McpCutoverController(new CutoverStateStore(stateDir), observed);
+    assert.equal(current.mode(), "normal");
+    assert.doesNotThrow(() => current.assertToolAllowed("git_commit"));
+
+    const replay = store.recoverFailedActivation({ cutoverId: record.cutoverId, recoveredBy: binding.ownerThread, observedIdentity: observed });
+    assert.equal(replay.newlyRecovered, false);
+    assert.equal(replay.record.failedActivation?.retryAllowed, false);
+  } finally {
+    rmSync(stateDir, { recursive: true, force: true });
+  }
+});
+
+test("#386: failed activation also captures a replacement with the right source/build but wrong bound release", () => {
+  const stateDir = mkdtempSync(join(tmpdir(), "devspace-mcp-failed-release-"));
+  try {
+    const store = new CutoverStateStore(stateDir, { newId: () => "cutover-failed-release" });
+    const oldIdentity = identity("old-inst", "a".repeat(40), "old-build", "c".repeat(64));
+    const expected = { sourceCommit: "b".repeat(40), buildId: "target-build", capabilityManifestSha256: "d".repeat(64) };
+    const binding = { leaseId: "lease_release", pinnedLeaseVersion: 2, operationHandle: "op_release", requestHash: "e".repeat(64), ownerThread: "carrier_release" };
+    const record = store.begin({ oldServerIdentity: oldIdentity, expectedNewIdentity: expected, coordinationBinding: binding });
+    store.recordDrain(record.cutoverId, { activeSessions: 0, oldestAgeMs: 0 });
+    const activation = store.recordActivationBinding(record.cutoverId, {
+      schema: "devspace.cutover_activation_binding.v1",
+      cutoverId: record.cutoverId,
+      sourceCommit: expected.sourceCommit,
+      buildId: expected.buildId,
+      releaseSha256: "1".repeat(64),
+      releasePath: join(stateDir, "releases", "target"),
+      pointerPath: join(stateDir, "current-release.json"),
+      boundAt: new Date().toISOString(),
+    }).record.activationBinding!;
+    store.recordRestartRequest(record.cutoverId, {
+      actuator: "launchd-self",
+      requestedByServerInstanceId: oldIdentity.serverInstanceId,
+      buildReady: { verifiedBy: "test", verifiedAt: new Date().toISOString() },
+    });
+    store.recordRestartScheduled(record.cutoverId, oldIdentity.serverInstanceId);
+
+    const observed = {
+      ...identity("replacement-inst", expected.sourceCommit, expected.buildId, expected.capabilityManifestSha256),
+      releaseSha256: "2".repeat(64),
+      releasePath: join(stateDir, "releases", "wrong"),
+      activationCutoverId: activation.cutoverId,
+    };
+    const recovered = store.recoverFailedActivation({ cutoverId: record.cutoverId, recoveredBy: binding.ownerThread, observedIdentity: observed });
+    assert.equal(recovered.record.phase, "closed");
+    assert.equal(recovered.record.failedActivation?.terminalReason, "FAILED_ACTIVATION");
+    assert.deepEqual(recovered.record.activationBinding, activation);
+    assert.deepEqual(recovered.record.failedActivation?.observedIdentity, observed);
   } finally {
     rmSync(stateDir, { recursive: true, force: true });
   }

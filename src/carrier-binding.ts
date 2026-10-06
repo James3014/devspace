@@ -1235,6 +1235,159 @@ export class CarrierBindingStore {
   }
 
   /**
+   * Host-local terminal recovery for one coordination-bound DRAINED cutover
+   * whose restart was durably consumed by a replacement generation that is not
+   * the approved target. The original cutover_start operation becomes a
+   * terminal failed effect, its lease is reconciled/released, and no restart or
+   * retarget is authorized.
+   */
+  recoverFailedActivationLocal(input: {
+    cutoverId: string;
+    carrierId: string;
+    expectedVersion: number;
+    expectedValidityVersion: number;
+    confirmCutoverId: string;
+    observedIdentity: CutoverServerIdentity;
+  }) {
+    if(input.confirmCutoverId!==input.cutoverId) deny("Failed activation recovery confirmation must equal the exact cutover id");
+    const cutoverStore=new CutoverStateStore(this.stateDir,{now:this.now});
+    const before=cutoverStore.get();
+    if(!before || before.cutoverId!==input.cutoverId || !before.coordinationBinding) deny("Exact coordination-bound cutover is required");
+    const binding=this.active(input.carrierId,new Set(),true);
+    if(binding.row.id!==before.coordinationBinding.ownerThread || binding.row.version!==input.expectedVersion || binding.validity.version!==input.expectedValidityVersion) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Failed activation recovery carrier identity or version changed");
+    const authorityGeneration=binding.generation;
+    const authorityContract=structuredClone(binding.contract);
+    const grant=this.grant(binding);
+    const assertRecoveryAuthorityCurrent=()=>{
+      const current=this.active(input.carrierId,new Set(),true);
+      if(current.row.id!==binding.row.id || current.row.version!==input.expectedVersion || current.validity.version!==input.expectedValidityVersion ||
+         current.generation!==authorityGeneration || !isDeepStrictEqual(current.contract,authorityContract) || !isDeepStrictEqual(this.grant(current),grant)) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT","Failed activation recovery carrier authority changed");
+      }
+      return current;
+    };
+    if(binding.row.parent_id || binding.contract.role!=="controller" || !binding.contract.cutover || binding.contract.operations.length!==1 || binding.contract.operations[0]!=="cutover_start") deny("Failed activation recovery requires the exact root controller cutover authority");
+    const approved=binding.contract.cutover;
+    if(physical(approved.stateRoot)!==physical(this.stateDir) || !isDeepStrictEqual(before.oldServerIdentity,approved.currentIdentity) || !isDeepStrictEqual(before.expectedNewIdentity,approved.expectedIdentity) || before.expiresAt!==approved.expiresAt) deny("Failed activation recovery contract does not match the durable cutover generation");
+    if(before.phase!=="drained" && !(before.phase==="closed" && before.failedActivation)) deny("Failed activation recovery requires the drained generation");
+    if(!before.drainEvidence || !before.restartRequest?.restartScheduledAt || !before.restartRequest.restartScheduledForServerInstanceId) deny("Failed activation recovery requires durable drain and scheduled restart evidence");
+    if(before.observedReplacement || before.expiredPreparedNoEffect || before.expiredDrainedNoRestart || before.capabilityExpectationMismatch || before.unexpectedReplacement || before.supersession || before.bindingRepair) deny("Failed activation recovery refuses conflicting terminal or repair evidence");
+    if(input.observedIdentity.serverInstanceId===approved.currentIdentity.serverInstanceId) deny("Failed activation recovery requires a replacement server instance");
+    const sourceBuildCapabilityMatches =
+      input.observedIdentity.sourceCommit===approved.expectedIdentity.sourceCommit &&
+      input.observedIdentity.buildId===approved.expectedIdentity.buildId &&
+      (approved.expectedIdentity.capabilityManifestSha256===undefined ||
+        input.observedIdentity.capabilityManifestSha256===approved.expectedIdentity.capabilityManifestSha256);
+    const releaseMatches = before.activationBinding===undefined || (
+      input.observedIdentity.releaseSha256===before.activationBinding.releaseSha256 &&
+      input.observedIdentity.releasePath===before.activationBinding.releasePath &&
+      input.observedIdentity.activationCutoverId===before.cutoverId
+    );
+    if(sourceBuildCapabilityMatches && releaseMatches) deny("Observed replacement matches the approved deployment target; use normal cutover completion");
+    if(before.restartRequest.requestedByServerInstanceId!==approved.currentIdentity.serverInstanceId ||
+       before.restartRequest.restartScheduledForServerInstanceId!==approved.currentIdentity.serverInstanceId) deny("Failed activation recovery restart lineage changed");
+
+    const plan=planCutoverStart(this.stateDir,approved);
+    const correlation=before.coordinationBinding;
+    if(plan.subject.operationId!==correlation.operationHandle || plan.requestHash!==correlation.requestHash) deny("Failed activation recovery operation correlation changed");
+
+    const operations=new DurableOperationStore(this.stateDir);
+    try {
+      const operation=operations.getByOperationId(correlation.operationHandle);
+      const terminalReplay=operation?.status==="failed" && operation.receipt?.lifecycleTerminal===true && operation.receipt?.recoveryKind==="failed_activation";
+      if(!operation || operation.kind!=="cutover_start" || (operation.status!=="succeeded" && !terminalReplay) || operation.requestHash!==correlation.requestHash || operation.scopeRoot!==physical(this.stateDir)) deny("Failed activation recovery requires the exact successful cutover_start intent or its exact terminal replay");
+      const {coordinationBinding,...request}=operation.request;
+      const expectedActuator={actuator:approved.restart.actuator,serviceLabel:approved.restart.serviceLabel,launchdTarget:approved.restart.launchdTarget};
+      const restartAction=operation.receipt?.restartAction as {action?:unknown;cutoverId?:unknown;currentIdentity?:unknown;buildReady?:unknown;actuator?:unknown}|undefined;
+      if(!isDeepStrictEqual(coordinationBinding,correlation) || !isDeepStrictEqual(request,plan.request) || operation.receipt?.cutoverId!==before.cutoverId || operation.receipt?.startVerified!==true ||
+         !restartAction || restartAction.action!=="restart" || restartAction.cutoverId!==before.cutoverId ||
+         !isDeepStrictEqual(restartAction.currentIdentity,approved.currentIdentity) ||
+         !isDeepStrictEqual(restartAction.buildReady,approved.restart.buildReady) ||
+         !isDeepStrictEqual(restartAction.actuator,expectedActuator) || operation.receipt?.restartState!=="requested") deny("Failed activation recovery durable restart binding changed");
+
+      const localContext=Object.freeze({});
+      const recoveryDetail=JSON.stringify({kind:"cutover_failed_activation",cutoverId:input.cutoverId,requestHash:correlation.requestHash,approvedTarget:before.expectedNewIdentity,observedIdentity:input.observedIdentity,restartConsumed:true,retryAllowed:false,successorRequired:true});
+      const localOwnership=operations.createOwnershipStore({
+        now:this.now,
+        resolveOwnerContext: context=>context===localContext?{ownerThread:binding.row.id}:undefined,
+        resolveEffectBinding: ()=>undefined,
+        verifyGrantEvidence: (candidate,owner)=>{
+          assertRecoveryAuthorityCurrent();
+          return owner.ownerThread===binding.row.id && isDeepStrictEqual(candidate,grant);
+        },
+        verifyReconciliationEvidence: (evidence,lease,owner)=>{
+          assertRecoveryAuthorityCurrent();
+          const current=cutoverStore.get();
+          if(!current || current.cutoverId!==input.cutoverId || !current.coordinationBinding) return false;
+          if(current.phase!=="drained" && !(current.phase==="closed" && current.failedActivation)) return false;
+          return owner.ownerThread===binding.row.id && lease.leaseId===correlation.leaseId && lease.ownerThread===binding.row.id && lease.operation==="cutover_start" &&
+            lease.baseRevision===binding.contract.baseRevision && lease.operationHandle===correlation.operationHandle &&
+            evidence.leaseId===lease.leaseId && evidence.ownerThread===lease.ownerThread && evidence.operationHandle===correlation.operationHandle &&
+            evidence.operation==="cutover_start" && evidence.baseRevision===lease.baseRevision && evidence.leaseVersion===correlation.pinnedLeaseVersion &&
+            evidence.state==="failed" && evidence.detail===recoveryDetail;
+        },
+      });
+      let lease=localOwnership.get(correlation.leaseId);
+      if(!lease || lease.ownerThread!==binding.row.id || lease.operation!=="cutover_start" || lease.baseRevision!==binding.contract.baseRevision ||
+         lease.resource!==physical(this.stateDir) || lease.scope.length!==1 || lease.scope[0]!==physical(this.stateDir)) deny("Failed activation recovery lease binding changed");
+      const replayedReconciliation=lease.version===correlation.pinnedLeaseVersion+1 && lease.operationState==="finished" && lease.operationHandle===undefined;
+      const alreadyReleased=lease.version===correlation.pinnedLeaseVersion+2 && lease.operationState==="finished" && lease.operationHandle===undefined && lease.terminalState==="released";
+      const expiredReconciled=lease.version===correlation.pinnedLeaseVersion+1 && lease.operationState==="finished" && lease.operationHandle===undefined && lease.terminalState==="expired_reconciled";
+      if(lease.version===correlation.pinnedLeaseVersion) {
+        if(lease.terminalState || lease.operationState!=="active" || lease.operationHandle!==correlation.operationHandle) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Failed activation recovery requires the original active pin");
+      } else if(!replayedReconciliation && !alreadyReleased && !expiredReconciled) {
+        throw new ControlPlaneOwnershipError("CAS_CONFLICT","Failed activation recovery lease version changed");
+      }
+
+      const evidence:ReconciliationEvidence={leaseId:correlation.leaseId,ownerThread:binding.row.id,operationHandle:correlation.operationHandle,operation:"cutover_start",baseRevision:binding.contract.baseRevision,leaseVersion:correlation.pinnedLeaseVersion,state:"failed",detail:recoveryDetail};
+      const reconciliation=localOwnership.reconcile(localContext,correlation.leaseId,correlation.pinnedLeaseVersion,evidence);
+      const afterLease=cutoverStore.get();
+      if(!afterLease || afterLease.cutoverId!==before.cutoverId || (before.phase==="drained" && !isDeepStrictEqual(afterLease,before)) || (before.phase==="closed" && !isDeepStrictEqual(afterLease,before))) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Failed activation recovery cutover changed after lease reconciliation");
+
+      const recovered=operations.atomic(()=>{
+        assertRecoveryAuthorityCurrent();
+        const currentCutover=cutoverStore.get();
+        if(!currentCutover || currentCutover.cutoverId!==afterLease.cutoverId || !isDeepStrictEqual(currentCutover,afterLease)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Failed activation recovery cutover changed before terminal close");
+        return cutoverStore.recoverFailedActivation({cutoverId:input.cutoverId,recoveredBy:binding.row.id,observedIdentity:input.observedIdentity});
+      });
+      const canonicalClosed=cutoverStore.get();
+      if(!canonicalClosed || canonicalClosed.cutoverId!==input.cutoverId || canonicalClosed.phase!=="closed" || !canonicalClosed.failedActivation) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Failed activation recovery canonical cutover readback is incomplete");
+      const terminalHash=cutoverTerminalRecordHash(canonicalClosed);
+      operations.atomic(()=>{
+        assertRecoveryAuthorityCurrent();
+        const current=operations.getByOperationId(correlation.operationHandle);
+        if(!current || current.requestHash!==operation.requestHash || !isDeepStrictEqual(current.request,operation.request)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Failed activation recovery durable intent changed");
+        if(current.receipt?.lifecycleTerminal===true) {
+          if(current.receipt?.terminalRecordHash!==terminalHash || current.receipt?.recoveryKind!=="failed_activation" || !isDeepStrictEqual(current.receipt?.failedLeaseRecovery,reconciliation)) throw new ControlPlaneOwnershipError("CAS_CONFLICT","Failed activation recovery terminal receipt changed");
+        } else {
+          operations.finish(correlation.operationHandle,{status:"failed",retrySafe:false,receipt:{...current.receipt,lifecycleTerminal:true,terminalRecordHash:terminalHash,recoveryKind:"failed_activation",failedLeaseRecovery:reconciliation},errorCode:"FAILED_ACTIVATION",errorMessage:"The scheduled restart was consumed by a replacement generation that did not match the approved deployment target; retry is forbidden and an explicit successor is required."});
+        }
+      });
+
+      lease=localOwnership.get(correlation.leaseId)!;
+      if(!lease.terminalState) lease=localOwnership.release(localContext,correlation.leaseId,lease.version);
+      if(lease.terminalState!=="released" && lease.terminalState!=="expired_reconciled") throw new ControlPlaneOwnershipError("CAS_CONFLICT","Failed activation recovery lease did not become terminal");
+
+      const finalOperation=operations.getByOperationId(correlation.operationHandle)!;
+      const finalCutover=cutoverStore.get()!;
+      const finalChecks={
+        cutoverClosed:finalCutover.phase==="closed",
+        failedActivationReceipt:Boolean(finalCutover.failedActivation),
+        terminalReason:finalCutover.reconciliationReceipt?.terminalReason==="FAILED_ACTIVATION",
+        retryForbidden:finalCutover.failedActivation?.retryAllowed===false,
+        successorRequired:finalCutover.failedActivation?.successorRequired===true,
+        leaseUnpinned:lease.operationHandle===undefined,
+        leaseFinished:lease.operationState==="finished",
+        operationFailed:finalOperation.status==="failed",
+        operationTerminal:finalOperation.receipt?.lifecycleTerminal===true,
+        terminalHash:finalOperation.receipt?.terminalRecordHash===cutoverTerminalRecordHash(finalCutover),
+      };
+      if(Object.values(finalChecks).some(value=>!value)) throw new ControlPlaneOwnershipError("CAS_CONFLICT",`Failed activation recovery final readback is incomplete: ${JSON.stringify(finalChecks)}`);
+      return {cutover:finalCutover,lease,reconciliation,operation:finalOperation,replayed:!recovered.newlyRecovered};
+    } finally {operations.close();}
+  }
+
+  /**
    * Host-local terminal hygiene for one successfully closed coordination-bound cutover
    * whose original root carrier has already been revoked. This can only destroy the
    * stale lease. It never revives carrier authority, transfers ownership, changes the

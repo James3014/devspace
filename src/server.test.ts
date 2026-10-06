@@ -5531,11 +5531,20 @@ test("C3 authenticated HTTP MCP uses host-bound worker authority for real depend
       assert.equal((await otherClient.callTool({name:"operation_reconcile",arguments:{operationId}})).isError,undefined);
       // The rejected recipient still has no cutover authority.
       assert.equal((await client.callTool({name:"operation_reconcile",arguments:{operationId}})).isError,true);
-      await assert.rejects(otherClient.callTool({name:"dependency_sync",arguments:input}),/CUTOVER_RECONCILIATION_REQUIRED/);
+      // The cutover no longer owns this decision. This fixture deliberately
+      // does not project the dependency effect binding to the successor OAuth
+      // client, so the request must reach its normal authority gate and fail
+      // there rather than being globally rejected by cutover state.
+      const successorDependencyDuringCutover=await otherClient.callTool({name:"dependency_sync",arguments:input});
+      assert.equal(successorDependencyDuringCutover.isError,true);
+      assert.match(JSON.stringify(successorDependencyDuringCutover),/trusted effect binding required/);
+      assert.doesNotMatch(JSON.stringify(successorDependencyDuringCutover),/CUTOVER_RECONCILIATION_REQUIRED/);
 
     } finally {await otherClient.close();}
 
-    await assert.rejects(client.callTool({name:"dependency_sync",arguments:input}),/CUTOVER_RECONCILIATION_REQUIRED/);
+    const formerOwnerDuringCutover=await client.callTool({name:"dependency_sync",arguments:input});
+    assert.equal(formerOwnerDuringCutover.isError,true);
+    assert.doesNotMatch(JSON.stringify(formerOwnerDuringCutover),/CUTOVER_RECONCILIATION_REQUIRED/);
   } finally {
     await client.close(); await running.close(); manager.close(); provider.close();
     await new Promise<void>((resolve,reject)=>listener.close(e=>e?reject(e):resolve()));
@@ -6052,7 +6061,7 @@ test("P0-3: recovery and finish share identical semantics and idempotently rende
   await rm(root, { recursive: true, force: true });
 });
 
-test("P0-4: real server /mcp HTTP boundary permits transport reconnect during drain, allows safe tools, blocks consequential tools", async () => {
+test("#386: real server /mcp keeps unrelated workspace mutation usable during drain while deployment-conflicting effects stay fenced", async () => {
   const root = await mkdtemp(join(tmpdir(), "devspace-p0-4-http-"));
   const project = join(root, "project");
   const stateDir = join(root, ".state");
@@ -6248,7 +6257,8 @@ test("P0-4: real server /mcp HTTP boundary permits transport reconnect during dr
     const drainJson = (await parseMcpResponse(drainRes)) as { result?: { structuredContent?: { cutover?: { phase?: string } } } };
     assert.equal(drainJson.result?.structuredContent?.cutover?.phase, "drained");
 
-    // 5. Client 2 calls consequential mutation tool (open_workspace) -> BLOCKED with 409
+    // 5. An unrelated workspace operation keeps its own admission/authority and
+    // is not converted into a global deployment outage.
     const openRes = await fetch(mcpUrl, {
       method: "POST",
       headers: {
@@ -6267,10 +6277,35 @@ test("P0-4: real server /mcp HTTP boundary permits transport reconnect during dr
         },
       }),
     });
-    assert.equal(openRes.status, 409, "Consequential tool must be blocked with 409 during drain");
-    const openJson = (await parseMcpResponse(openRes)) as { error?: { code?: number; message?: string } };
-    assert.equal(openJson.error?.code, -32002);
-    assert.ok(openJson.error?.message?.includes("CUTOVER_RECONCILIATION_REQUIRED"));
+    assert.equal(openRes.status, 200, "Unrelated workspace operation must remain reachable during drain");
+    const openJson = (await parseMcpResponse(openRes)) as { result?: { isError?: boolean; structuredContent?: { workspaceId?: string } } };
+    assert.equal(openJson.result?.isError, undefined);
+    assert.equal(typeof openJson.result?.structuredContent?.workspaceId, "string");
+
+    // 6. A release-retention mutation can destroy exact deployment evidence,
+    // so it stays fenced before its own handler sees the request.
+    const gcRes = await fetch(mcpUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Authorization": `Bearer ${testAccessToken}`,
+        "mcp-session-id": session2Id,
+        "Accept": "application/json, text/event-stream",
+      },
+      body: JSON.stringify({
+        jsonrpc: "2.0",
+        id: 13,
+        method: "tools/call",
+        params: {
+          name: "storage_gc",
+          arguments: { expectedPlanId: `sha256:${"0".repeat(64)}`, confirm: true },
+        },
+      }),
+    });
+    assert.equal(gcRes.status, 409, "Deployment-conflicting storage GC must remain fenced during drain");
+    const gcJson = (await parseMcpResponse(gcRes)) as { error?: { code?: number; message?: string } };
+    assert.equal(gcJson.error?.code, -32002);
+    assert.ok(gcJson.error?.message?.includes("CUTOVER_RECONCILIATION_REQUIRED"));
   } finally {
     await new Promise<void>((res) => httpServer.close(() => res()));
     await running.close();
