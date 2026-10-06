@@ -66,6 +66,7 @@ async function testDatabaseConfiguration(stateDir: string): Promise<void> {
       { version: 23, name: "core-candidate-acquisition-observations" },
       { version: 24, name: "core-candidate-acquisition-receipt-path" },
       { version: 25, name: "work-resume-registry" },
+      { version: 26, name: "carrier-owner-approval-receipts" },
     ]);
   } finally {
     database.close();
