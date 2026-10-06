@@ -5168,6 +5168,7 @@ test("dispatch mode exposes only the direct worker lifecycle and simple instruct
     agentStartSchema,
     /nexusGrant|coreMutation|capabilityDiscovery|authorizedToolCeiling|toolProjectionManifest|effectProjection/,
   );
+  assert.doesNotMatch(agentStartSchema, /Core|Nexus|coordination|cutover|host.?operation/i);
 
   const instructions = context.client.getInstructions() ?? "";
   assert.match(instructions, /open_workspace/);
