@@ -75,6 +75,8 @@ export interface ServerConfig {
   hostOperationMaxWallMs?: number;
   hostOperationMaxIdleMs?: number;
   hostOperationAllowLongLived?: boolean;
+  nexusAgyOperationRoot?: string;
+  nexusAgyLeasesDir?: string;
   coreMutationRecoveryOwnerClientId?: string;
   /**
    * Explicit Core CLI executable path for candidate acquisition.
@@ -497,6 +499,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): ServerConfig {
     hostOperationMaxWallMs: env.DEVSPACE_HOST_OPERATION_MAX_WALL_MS ? parsePositiveInteger(env.DEVSPACE_HOST_OPERATION_MAX_WALL_MS, 30_000, "DEVSPACE_HOST_OPERATION_MAX_WALL_MS", 120_000) : undefined,
     hostOperationMaxIdleMs: env.DEVSPACE_HOST_OPERATION_MAX_IDLE_MS ? parsePositiveInteger(env.DEVSPACE_HOST_OPERATION_MAX_IDLE_MS, 30_000, "DEVSPACE_HOST_OPERATION_MAX_IDLE_MS", 120_000) : undefined,
     hostOperationAllowLongLived: parseBoolean(env.DEVSPACE_HOST_OPERATION_ALLOW_LONG_LIVED),
+    nexusAgyOperationRoot: env.NEXUS_AGY_OPERATION_ROOT?.trim() || env.DEVSPACE_NEXUS_AGY_OPERATION_ROOT?.trim() || undefined,
+    nexusAgyLeasesDir: env.NEXUS_AGY_LEASES_DIR?.trim() || env.DEVSPACE_NEXUS_AGY_LEASES_DIR?.trim() || undefined,
     coreMutationRecoveryOwnerClientId: env.DEVSPACE_CORE_MUTATION_RECOVERY_OWNER_CLIENT_ID?.trim() || undefined,
     coreAcquisitionExecutable: env.DEVSPACE_CORE_ACQUISITION_EXECUTABLE?.trim() || undefined,
     coreAcquisitionExpectedSourceRevision: parseCoreAcquisitionRevision(env.DEVSPACE_CORE_ACQUISITION_EXPECTED_SOURCE_REVISION),
