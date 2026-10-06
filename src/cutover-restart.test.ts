@@ -201,7 +201,7 @@ test("bound restart actuator records an asynchronous PID-race error and does not
   callback?.();
   assert.equal(launches, 0);
   assert.equal(errors.length, 1);
-  assert.match(errors[0]!.message, /PID changed/i);
+  assert.match(errors[0]!.message, /PID or stable launch binding changed/i);
 });
 
 
