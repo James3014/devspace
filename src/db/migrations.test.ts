@@ -120,3 +120,36 @@ test("v22 repairs a database that already recorded the legacy v21 migration", ()
     sqlite.close();
   }
 });
+
+
+test("v26 adds durable Owner carrier approval receipts without replacing carrier authority", () => {
+  const sqlite = new Database(":memory:");
+  try {
+    migrateDatabase(sqlite);
+    const migration = sqlite.prepare(
+      "select name from devspace_schema_migrations where version = 26",
+    ).get() as { name: string };
+    assert.equal(migration.name, "carrier-owner-approval-receipts");
+    const columns = sqlite.prepare(
+      "pragma table_info(carrier_owner_approval_receipts)",
+    ).all() as Array<{ name: string }>;
+    assert.deepEqual(
+      columns.map((column) => column.name),
+      [
+        "pending_id",
+        "client_id",
+        "session_id",
+        "contract_hash",
+        "contract_json",
+        "expires_at",
+        "status",
+        "carrier_id",
+        "created_at",
+        "updated_at",
+        "decided_at",
+      ],
+    );
+  } finally {
+    sqlite.close();
+  }
+});

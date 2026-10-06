@@ -88,6 +88,7 @@ const migrations: Migration[] = [
   { version: 23, name: "core-candidate-acquisition-observations", up: migrateCoreCandidateAcquisitionObservations },
   { version: 24, name: "core-candidate-acquisition-receipt-path", up: migrateCoreCandidateAcquisitionReceiptPath },
   { version: 25, name: "work-resume-registry", up: migrateWorkResumeRegistry },
+  { version: 26, name: "carrier-owner-approval-receipts", up: migrateCarrierOwnerApprovalReceipts },
 ];
 
 export function migrateDatabase(sqlite: Database.Database): void {
@@ -755,4 +756,25 @@ function migrateWorkResumeRegistry(sqlite: Database.Database): void {
   addColumnIfMissing(sqlite, "work_resume_registry", "effect_kind", "text");
   addColumnIfMissing(sqlite, "work_resume_registry", "effect_key", "text");
   addColumnIfMissing(sqlite, "work_resume_registry", "effect_handle", "text");
+}
+
+
+function migrateCarrierOwnerApprovalReceipts(sqlite: Database.Database): void {
+  sqlite.exec(`
+    create table if not exists carrier_owner_approval_receipts (
+      pending_id text primary key,
+      client_id text not null,
+      session_id text not null,
+      contract_hash text not null check(length(contract_hash) = 64),
+      contract_json text not null,
+      expires_at integer not null,
+      status text not null check(status in ('PENDING', 'APPROVED', 'REJECTED')),
+      carrier_id text,
+      created_at text not null,
+      updated_at text not null,
+      decided_at text
+    );
+    create index if not exists carrier_owner_approval_receipts_client_idx
+      on carrier_owner_approval_receipts(client_id, updated_at desc);
+  `);
 }
