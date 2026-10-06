@@ -43,6 +43,7 @@ export interface WorkspaceStore {
   getSession(id: string): WorkspaceSession | undefined;
   listSessions(): WorkspaceSession[];
   touchSession(id: string): void;
+  claimSessionForGc?(id: string, expectedLastUsedAt: string): boolean;
   deleteSession?(id: string): void;
   getConversationBinding(
     conversationScopeId: string,
@@ -131,8 +132,28 @@ export class SqliteWorkspaceStore implements WorkspaceStore {
     this.database.db
       .update(workspaceSessions)
       .set({ lastUsedAt: new Date().toISOString() })
-      .where(eq(workspaceSessions.id, id))
+      .where(
+        and(
+          eq(workspaceSessions.id, id),
+          eq(workspaceSessions.status, "active"),
+        ),
+      )
       .run();
+  }
+
+  claimSessionForGc(id: string, expectedLastUsedAt: string): boolean {
+    const result = this.database.db
+      .update(workspaceSessions)
+      .set({ status: "gc_pending" })
+      .where(
+        and(
+          eq(workspaceSessions.id, id),
+          eq(workspaceSessions.status, "active"),
+          eq(workspaceSessions.lastUsedAt, expectedLastUsedAt),
+        ),
+      )
+      .run();
+    return result.changes === 1;
   }
 
   deleteSession(id: string): void {
