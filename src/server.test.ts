@@ -5147,13 +5147,18 @@ test("dispatch mode exposes only the direct worker lifecycle and simple instruct
     "agent_reconcile",
     "agent_start",
     "agent_status",
+    "host_operation_external_status",
     "open_workspace",
     "read",
     "work_resume_prepare",
   ]);
-  assert.equal(names.length, 11);
+  assert.equal(names.length, 12);
   assert.deepEqual(
-    names.filter((name) => /core|coordination|cutover|host_operation|candidate|repository_intelligence|^bash$|^write$|^edit$|apply_patch|^git_/.test(name)),
+    names.filter(
+      (name) =>
+        /core|coordination|cutover|candidate|repository_intelligence|^bash$|^write$|^edit$|apply_patch|^git_/.test(name) ||
+        (name.startsWith("host_operation") && name !== "host_operation_external_status"),
+    ),
     [],
   );
 
